@@ -595,6 +595,43 @@ impl AsyncMempool {
     pub async fn update_chain_view(&self, view: ChainView) {
         self.state.lock().await.view = view;
     }
+
+    /// Serialized owner-auth proof bytes for the given admitted tx body
+    /// hashes — the byte-exact objects this pool cryptographically verified
+    /// at admission. Block acceptance uses them as a re-verification fast
+    /// path: a block-carried proof that serializes to the same bytes needs
+    /// no second verification; anything else falls back to the full check.
+    pub async fn verified_authorization_proof_bytes(
+        &self,
+        hashes: &[TxBodyHash],
+    ) -> std::collections::HashMap<[u8; 32], Vec<u8>> {
+        use noid_gkr::WalletAuthorizationBundle;
+        let intents: Vec<Vec<u8>> = {
+            let st = self.state.lock().await;
+            hashes
+                .iter()
+                .filter_map(|hash| st.pool.get(hash))
+                .map(|entry| entry.intent_bytes.clone())
+                .collect()
+        };
+        let mut out = std::collections::HashMap::with_capacity(intents.len());
+        for intent_bytes in intents {
+            let Ok(intent) = TxIntent::from_bytes(&intent_bytes) else {
+                continue;
+            };
+            let Ok(bundle) = WalletAuthorizationBundle::from_bytes_for_shape(
+                &intent.authorization_bytes,
+                intent.tx_body.shape,
+            ) else {
+                continue;
+            };
+            let Some(proof_bytes) = bundle.proof_wire_bytes() else {
+                continue;
+            };
+            out.insert(intent.tx_body_hash.0, proof_bytes);
+        }
+        out
+    }
 }
 
 // ---------------------------------------------------------------------------

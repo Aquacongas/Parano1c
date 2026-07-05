@@ -133,6 +133,42 @@ impl AuthorizationVerifier for OwnerAuthAuthorizationVerifier {
     }
 }
 
+/// [`AuthorizationVerifier`] with a byte-exact fast path over authorizations
+/// this node already verified — at mempool admission. A hit requires the
+/// serialized proof to EQUAL the bytes verified earlier for the same tx body
+/// hash, so proof validity stays consensus-exact (a block carrying any other
+/// proof for the same statement falls back to full verification); the
+/// statement's remaining fields are reconstructed from the block body by the
+/// caller either way.
+pub struct PreverifiedAuthorizationVerifier<'a> {
+    /// tx body hash -> the serialized proof verified at admission.
+    pub verified_proof_bytes: &'a std::collections::HashMap<[u8; 32], Vec<u8>>,
+}
+
+impl AuthorizationVerifier for PreverifiedAuthorizationVerifier<'_> {
+    fn verify(
+        &self,
+        statement: &CanonicalAuthorizationStatement,
+        proof: &AuthorizationProof,
+    ) -> Result<VerifiedAuthorization, VerifyBlockError> {
+        let mut body_hash = [0u8; 32];
+        body_hash[..16].copy_from_slice(&statement.tx_body_hash[0].0.to_le_bytes());
+        body_hash[16..].copy_from_slice(&statement.tx_body_hash[1].0.to_le_bytes());
+        if let Some(known) = self.verified_proof_bytes.get(&body_hash) {
+            if let Some(bytes) = noid_gkr::authorization_proof_wire_bytes(proof) {
+                if bytes == *known {
+                    return Ok(VerifiedAuthorization {
+                        tx_index: statement.tx_index,
+                        owner_count: statement.public.layout.owner_count,
+                        live_input_count: statement.public.live_input_positions.len(),
+                    });
+                }
+            }
+        }
+        OwnerAuthAuthorizationVerifier.verify(statement, proof)
+    }
+}
+
 /// Map [`VerifyAuthorizationError`] to the block-level error exactly as the
 /// production `AcceptBlock` authorization step reports it. Shared by every
 /// [`AuthorizationVerifier`] implementation so error semantics cannot drift.
@@ -611,6 +647,37 @@ pub fn accept_block_with_artifacts(
         anchor,
         state,
         &OwnerAuthAuthorizationVerifier,
+    )
+}
+
+/// [`accept_block_with_artifacts`] with a caller-supplied authorization
+/// verifier (the node injects the mempool-preverified fast path here).
+#[allow(clippy::too_many_arguments)]
+pub fn accept_block_with_artifacts_with_auth_verifier<V: AuthorizationVerifier>(
+    block: &Block,
+    block_proof_bytes: &[u8],
+    block_auth_sidecar_bytes: &[u8],
+    parent: &BlockHeader,
+    prev_timestamps: &[u64],
+    prev_active_counts: &[u64],
+    local_time: u64,
+    anchor: &AnchorInfo,
+    pre_state: &SegmentedFriState,
+    state: &mut ChainState,
+    auth_verifier: &V,
+) -> Result<AcceptedBlockRawValidationOutput, FullValidationError> {
+    let _ = pre_state;
+    accept_block_inner_with_artifacts(
+        block,
+        block_proof_bytes,
+        block_auth_sidecar_bytes,
+        parent,
+        prev_timestamps,
+        prev_active_counts,
+        TimestampPolicy::Live(local_time),
+        anchor,
+        state,
+        auth_verifier,
     )
 }
 

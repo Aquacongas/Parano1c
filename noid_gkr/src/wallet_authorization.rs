@@ -52,6 +52,13 @@ impl WalletAuthorizationBundle {
             .map_err(|e| AuthorizationEncodeError::Bincode(e.to_string()))
     }
 
+    /// Canonical wire bytes of the bundled proof alone — the byte-exact
+    /// identity used to recognize an already-verified authorization when
+    /// the same proof reappears in a block sidecar.
+    pub fn proof_wire_bytes(&self) -> Option<Vec<u8>> {
+        authorization_proof_wire_bytes(&self.proof)
+    }
+
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, AuthorizationDecodeError> {
         if bytes.len() > MAX_AUTHORIZATION_BUNDLE_BYTES {
             return Err(AuthorizationDecodeError::TooLarge {
@@ -219,6 +226,13 @@ pub fn canonical_authorization_statement_from_body(
         tx_body_hash,
         public,
     })
+}
+
+/// Canonical wire bytes of one owner-auth proof (the encoding block
+/// sidecars use). Both sides of the verified-authorization fast path —
+/// mempool admission and block acceptance — compare these bytes.
+pub fn authorization_proof_wire_bytes(proof: &OwnerAuthProofKillShot) -> Option<Vec<u8>> {
+    bincode_options().serialize(proof).ok()
 }
 
 pub fn verify_authorization_statement_proof(

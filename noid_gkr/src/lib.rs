@@ -206,7 +206,8 @@ pub use tx_body_layout::{
     TREE_LEAF_OUTPUT_BASE, TXBODY_N_INPUT_LEAVES, TXBODY_N_OUTPUT_LEAVES,
 };
 pub use wallet_authorization::{
-    canonical_authorization_statement_from_body, max_authorization_bytes_for_shape,
+    authorization_proof_wire_bytes, canonical_authorization_statement_from_body,
+    max_authorization_bytes_for_shape,
     prove_wallet_authorization, verify_authorization_statement_proof, verify_wallet_authorization,
     verify_wallet_authorization_proof, AuthorizationDecodeError, AuthorizationEncodeError,
     CanonicalAuthorizationStatement, ProveAuthorizationError, VerifiedAuthorization,

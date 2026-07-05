@@ -44,6 +44,7 @@ use crate::consensus::{
 use crate::state::ChainState;
 
 /// Parameters needed for header chain validation.
+#[derive(Debug, Clone)]
 pub struct AnchorInfo {
     /// Height of the ASERT anchor block.
     pub anchor_height: u64,

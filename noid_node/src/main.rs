@@ -1160,24 +1160,61 @@ fn map_acceptance_artifact_error(
     )
 }
 
+/// Inputs of the accepted-block certificate record build, captured under the
+/// chain write lock and proved after it is released (the receipt-projection
+/// prove takes tens of milliseconds and needs no chain state).
+struct CertificateRecordInputs {
+    parent: noid_chain::BlockHeader,
+    prev_timestamps: Vec<u64>,
+    prev_active_counts: Vec<u64>,
+    anchor: noid_chain::consensus::validation::AnchorInfo,
+    artifacts: noid_block::AcceptedBlockValidationArtifacts,
+}
+
+/// Owner-auth proof bytes this node already verified at mempool admission
+/// for the block's transactions — the byte-exact fast path for AcceptBlock.
+async fn preverified_authorization_bytes(
+    mempool: &AsyncMempool,
+    block: &noid_chain::block::Block,
+) -> std::collections::HashMap<[u8; 32], Vec<u8>> {
+    let hashes: Vec<_> = block
+        .transactions
+        .iter()
+        .filter(|tx| !tx.body.is_coinbase)
+        .map(|tx| tx.tx_body_hash)
+        .collect();
+    if hashes.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    mempool.verified_authorization_proof_bytes(&hashes).await
+}
+
 /// Verify and apply a single P2P block off the tokio executor.
 ///
 /// User-transaction blocks take the proof-native path: verify the full
 /// exact `BlockProof` against the pre-state, apply the proven state transition,
 /// then atomically commit to MDBX. Coinbase-only blocks carry no block proof.
+/// `preverified_auth` holds mempool-verified proof bytes per tx body hash;
+/// matching sidecar proofs skip cryptographic re-verification. The
+/// certificate record (receipt-projection prove) is built after the chain
+/// write lock is released and stored under a read lock.
 async fn apply_p2p_block_offthread(
     chain: &Arc<RwLock<MdbxChainContext>>,
     block: noid_chain::block::Block,
     block_proof_bytes: Vec<u8>,
     block_auth_sidecar_bytes: Vec<u8>,
     local_time: u64,
+    preverified_auth: std::collections::HashMap<[u8; 32], Vec<u8>>,
 ) -> Result<([u8; 32], ChainView), noid_chain::storage::MdbxContextError> {
     let chain = chain.clone();
     tokio::task::spawn_blocking(move || {
-        let mut ctx = chain.blocking_write();
         let block_height = block.header.height;
         let is_coinbase_only = block.transactions.iter().all(|tx| tx.body.is_coinbase);
-        let (mut history_claim_bytes, mut certificate_record_bytes) = if is_coinbase_only {
+        let mut history_claim_bytes = None;
+        let mut certificate_inputs: Option<CertificateRecordInputs> = None;
+
+        let mut ctx = chain.blocking_write();
+        if is_coinbase_only {
             let parent = *ctx.tip_header();
             let prev_timestamps = ctx.prev_timestamps();
             let prev_active_counts = ctx.prev_active_counts();
@@ -1185,28 +1222,18 @@ async fn apply_p2p_block_offthread(
             let artifacts =
                 noid_block::derive_no_user_tx_validation_artifacts(&block, &parent, &ctx.state)
                     .map_err(map_acceptance_artifact_error)?;
-            (
-                Some(
-                    history_claim_fields_bytes(&block, &parent, &artifacts)
-                        .map_err(map_acceptance_artifact_error)?,
-                ),
-                Some(
-                    accepted_block_certificate_record_bytes(
-                        &block,
-                        &parent,
-                        &prev_timestamps,
-                        &prev_active_counts,
-                        &anchor,
-                        &block_proof_bytes,
-                        &block_auth_sidecar_bytes,
-                        &artifacts,
-                    )
+            history_claim_bytes = Some(
+                history_claim_fields_bytes(&block, &parent, &artifacts)
                     .map_err(map_acceptance_artifact_error)?,
-                ),
-            )
-        } else {
-            (None, None)
-        };
+            );
+            certificate_inputs = Some(CertificateRecordInputs {
+                parent,
+                prev_timestamps,
+                prev_active_counts,
+                anchor,
+                artifacts,
+            });
+        }
         let hash = ctx.apply_next_block(
             &block,
             &block_proof_bytes,
@@ -1222,7 +1249,10 @@ async fn apply_p2p_block_offthread(
              anchor,
              pre_state,
              state| {
-                let output = noid_block::accept_block_with_artifacts(
+                let auth_verifier = noid_block::PreverifiedAuthorizationVerifier {
+                    verified_proof_bytes: &preverified_auth,
+                };
+                let output = noid_block::accept_block_with_artifacts_with_auth_verifier(
                     block,
                     proof_bytes,
                     auth_sidecar_bytes,
@@ -1233,22 +1263,20 @@ async fn apply_p2p_block_offthread(
                     anchor,
                     pre_state,
                     state,
+                    &auth_verifier,
                 )?;
                 history_claim_bytes = Some(history_claim_fields_bytes(
                     block,
                     parent,
                     &output.artifacts,
                 )?);
-                certificate_record_bytes = Some(accepted_block_certificate_record_bytes(
-                    block,
-                    parent,
-                    prev_timestamps,
-                    prev_active_counts,
-                    anchor,
-                    proof_bytes,
-                    auth_sidecar_bytes,
-                    &output.artifacts,
-                )?);
+                certificate_inputs = Some(CertificateRecordInputs {
+                    parent: *parent,
+                    prev_timestamps: prev_timestamps.to_vec(),
+                    prev_active_counts: prev_active_counts.to_vec(),
+                    anchor: anchor.clone(),
+                    artifacts: output.artifacts.clone(),
+                });
                 Ok::<[u8; 32], noid_block::FullValidationError>(output.state_root)
             },
         )?;
@@ -1256,19 +1284,6 @@ async fn apply_p2p_block_offthread(
             if let Err(e) = ctx.store.put_history_claim(block_height, bytes) {
                 tracing::warn!(height = block_height, err = %e, "failed to store history claim fields");
             }
-        }
-        if let Some(bytes) = &certificate_record_bytes {
-            if let Err(e) = ctx
-                .store
-                .put_accepted_block_certificate(block_height, bytes)
-            {
-                tracing::warn!(height = block_height, err = %e, "failed to store accepted-block certificate record");
-            }
-        } else {
-            tracing::warn!(
-                height = block_height,
-                "accepted block committed without certificate record bytes"
-            );
         }
         if !block_proof_bytes.is_empty() {
             if let Err(e) = ctx.store.put_block_proof(block_height, &block_proof_bytes) {
@@ -1282,6 +1297,43 @@ async fn apply_p2p_block_offthread(
             }
         }
         let view = ChainView::from_mdbx(&ctx);
+        drop(ctx);
+
+        // The certificate record (receipt-projection prove) runs after the
+        // write lock is released; the store put only needs a read guard.
+        match certificate_inputs {
+            Some(inputs) => {
+                match accepted_block_certificate_record_bytes(
+                    &block,
+                    &inputs.parent,
+                    &inputs.prev_timestamps,
+                    &inputs.prev_active_counts,
+                    &inputs.anchor,
+                    &block_proof_bytes,
+                    &block_auth_sidecar_bytes,
+                    &inputs.artifacts,
+                ) {
+                    Ok(bytes) => {
+                        let ctx = chain.blocking_read();
+                        if let Err(e) = ctx
+                            .store
+                            .put_accepted_block_certificate(block_height, &bytes)
+                        {
+                            tracing::warn!(height = block_height, err = %e, "failed to store accepted-block certificate record");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(height = block_height, err = %e, "accepted-block certificate record build failed");
+                    }
+                }
+            }
+            None => {
+                tracing::warn!(
+                    height = block_height,
+                    "accepted block committed without certificate record inputs"
+                );
+            }
+        }
         Ok((hash, view))
     })
     .await
@@ -2318,12 +2370,15 @@ async fn handle_p2p_events(
                             }
                         }
 
+                        let preverified_auth =
+                            preverified_authorization_bytes(&mempool, &block).await;
                         let apply_result = apply_p2p_block_offthread(
                             &chain,
                             block.clone(),
                             block_proof_bytes.clone(),
                             block_auth_sidecar_bytes.clone(),
                             local_time,
+                            preverified_auth,
                         )
                         .await;
 
@@ -2389,12 +2444,16 @@ async fn handle_p2p_events(
                                     let orphan_auth_sidecar_bytes = orphan.block_auth_sidecar_bytes;
                                     next_hash =
                                         noid_chain::consensus::pow::block_id(&orphan_block.header);
+                                    let orphan_preverified =
+                                        preverified_authorization_bytes(&mempool, &orphan_block)
+                                            .await;
                                     let orphan_result = apply_p2p_block_offthread(
                                         &chain,
                                         orphan_block.clone(),
                                         orphan_proof_bytes.clone(),
                                         orphan_auth_sidecar_bytes.clone(),
                                         orphan_local_time,
+                                        orphan_preverified,
                                     )
                                     .await;
                                     match orphan_result {
@@ -3997,12 +4056,14 @@ async fn replay_prefetched_snapshot_suffix(
             .iter()
             .map(|tx| tx.tx_body_hash)
             .collect();
+        let preverified_auth = preverified_authorization_bytes(mempool, &item.block).await;
         let (_hash, view) = apply_p2p_block_offthread(
             chain,
             item.block.clone(),
             item.block_proof_bytes,
             item.block_auth_sidecar_bytes,
             unix_now(),
+            preverified_auth,
         )
         .await
         .map_err(|e| format!("prefetched suffix apply failed h={expected_height}: {e:?}"))?;
