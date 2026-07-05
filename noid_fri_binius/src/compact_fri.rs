@@ -839,6 +839,150 @@ pub(crate) fn verify_batched_merkle_proof(
     Ok(())
 }
 
+/// One query's INDEPENDENT Merkle path, expanded from the dedup'd batched
+/// (octopus) proof. Each path carries its own full sibling list, so a
+/// per-query verifier's shape depends only on `(query_count, depth)` — a
+/// class constant — rather than on the proof-dependent dedup schedule. This
+/// is the shape-fixed form the deep-chain region layer replays via one
+/// `MerklePathFamily` (the same per-query-independent-path trade the
+/// proof-core PCS took to close its fixed matrix).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndependentMerklePath {
+    pub leaf_index: usize,
+    pub leaf_hash: HashOutput,
+    /// Sibling digests bottom to top, one per level (`depth` entries).
+    pub siblings: Vec<HashOutput>,
+    /// `directions[d] == true` iff the path node at level `d` is a RIGHT
+    /// child (sibling on the left).
+    pub directions: Vec<bool>,
+}
+
+/// Expand a batched (octopus) Merkle proof into one independent full path
+/// per query. Mirrors [`verify_batched_merkle_proof`]'s reconstruction — the
+/// SAME layer-by-layer, `sorted_unique_parents` order, consuming
+/// `batch.siblings` in the SAME order — while recording every node hash it
+/// learns (computed parents AND consumed siblings) so each query's siblings
+/// can be read off directly.
+///
+/// The expansion is a prover-side convenience: correctness is not assumed,
+/// it is proven downstream by verifying each independent path against the
+/// root. Returns one path per DISTINCT leaf index (deduped, sorted).
+pub fn expand_batched_merkle_proof(
+    batch: &BatchedMerkleProof,
+    depth: usize,
+    leaf_indices: &[usize],
+    leaf_hashes: &[HashOutput],
+    hasher: &dyn CryptographicHasher,
+) -> Result<Vec<IndependentMerklePath>, String> {
+    use std::collections::HashMap;
+    if leaf_indices.len() != leaf_hashes.len() {
+        return Err("leaf index/hash count mismatch".into());
+    }
+    let (mut known_indices, mut known_hashes) =
+        sorted_unique_leaf_hashes(leaf_indices, leaf_hashes)
+            .map_err(|idx| format!("inconsistent leaf hashes for index {idx}"))?;
+
+    // Per-level index -> hash for every node touched (known + siblings).
+    let mut levels: Vec<HashMap<usize, HashOutput>> = Vec::with_capacity(depth + 1);
+    let leaf_map: HashMap<usize, HashOutput> = known_indices
+        .iter()
+        .copied()
+        .zip(known_hashes.iter().copied())
+        .collect();
+    levels.push(leaf_map);
+
+    let mut sib_cursor = 0usize;
+    for d in 0..depth {
+        let mut this_level = std::mem::take(&mut levels[d]);
+        let mut next_indices = Vec::new();
+        let mut next_hashes = Vec::new();
+        let mut cursor = 0usize;
+        while cursor < known_indices.len() {
+            let parent = known_indices[cursor] >> 1;
+            let left_child = parent * 2;
+            let right_child = left_child + 1;
+            let mut left = None;
+            let mut right = None;
+            while cursor < known_indices.len() && (known_indices[cursor] >> 1) == parent {
+                let idx = known_indices[cursor];
+                if idx == left_child {
+                    left = Some(known_hashes[cursor]);
+                } else if idx == right_child {
+                    right = Some(known_hashes[cursor]);
+                } else {
+                    return Err(format!("bad child index {idx} at layer {d}"));
+                }
+                cursor += 1;
+            }
+            let parent_hash = match (left, right) {
+                (Some(l), Some(r)) => hasher.compress(&l, &r),
+                (Some(l), None) => {
+                    let r = *batch
+                        .siblings
+                        .get(sib_cursor)
+                        .ok_or_else(|| format!("insufficient siblings at layer {d}"))?;
+                    sib_cursor += 1;
+                    this_level.insert(right_child, r);
+                    hasher.compress(&l, &r)
+                }
+                (None, Some(r)) => {
+                    let l = *batch
+                        .siblings
+                        .get(sib_cursor)
+                        .ok_or_else(|| format!("insufficient siblings at layer {d}"))?;
+                    sib_cursor += 1;
+                    this_level.insert(left_child, l);
+                    hasher.compress(&l, &r)
+                }
+                (None, None) => return Err(format!("orphan parent at layer {d} idx {parent}")),
+            };
+            next_indices.push(parent);
+            next_hashes.push(parent_hash);
+        }
+        levels[d] = this_level;
+        let next_map: HashMap<usize, HashOutput> = next_indices
+            .iter()
+            .copied()
+            .zip(next_hashes.iter().copied())
+            .collect();
+        levels.push(next_map);
+        known_indices = next_indices;
+        known_hashes = next_hashes;
+    }
+    if sib_cursor != batch.siblings.len() {
+        return Err(format!(
+            "unused siblings: consumed {sib_cursor}, total {}",
+            batch.siblings.len()
+        ));
+    }
+
+    // Extract one independent path per distinct leaf.
+    let (leaf_idx, leaf_hash) = sorted_unique_leaf_hashes(leaf_indices, leaf_hashes)
+        .map_err(|idx| format!("inconsistent leaf hashes for index {idx}"))?;
+    let mut out = Vec::with_capacity(leaf_idx.len());
+    for (li, lh) in leaf_idx.into_iter().zip(leaf_hash) {
+        let mut siblings = Vec::with_capacity(depth);
+        let mut directions = Vec::with_capacity(depth);
+        let mut node = li;
+        for d in 0..depth {
+            let sib_idx = node ^ 1;
+            let sib = *levels[d]
+                .get(&sib_idx)
+                .ok_or_else(|| format!("missing sibling {sib_idx} at layer {d}"))?;
+            siblings.push(sib);
+            directions.push(node & 1 == 1);
+            node >>= 1;
+        }
+        out.push(IndependentMerklePath {
+            leaf_index: li,
+            leaf_hash: lh,
+            siblings,
+            directions,
+        });
+    }
+    Ok(out)
+}
+
 fn sorted_unique_usize(values: &[usize]) -> Vec<usize> {
     let mut out = values.to_vec();
     out.sort_unstable();
@@ -986,4 +1130,97 @@ fn fold_evals_in_place(evals: &mut Vec<Block128>, r: Block128) {
         }
     }
     evals.truncate(half);
+}
+
+#[cfg(test)]
+mod path_expansion_tests {
+    use super::*;
+    use noid_poseidon2b::Poseidon2bSponge;
+
+    fn tree_and_queries() -> (MerkleTree, HashOutput, Vec<HashOutput>, usize) {
+        let hasher = Poseidon2bSponge::new();
+        let depth = 5;
+        let n = 1usize << depth;
+        let leaves: Vec<HashOutput> = (0..n)
+            .map(|i| {
+                let mut b = [0u8; 32];
+                b[0] = i as u8;
+                b[1] = ((i * 7) as u8) ^ 0xA5;
+                b
+            })
+            .collect();
+        let tree = MerkleTree::new_parallel(leaves.clone(), &hasher);
+        let root = tree.get_root();
+        (tree, root, leaves, depth)
+    }
+
+    /// The batched octopus proof expands into independent per-query paths,
+    /// each of which folds up to the same root — the shape-fixed form the
+    /// region layer replays. Deduplication and a repeated query index are
+    /// handled.
+    #[test]
+    fn expand_batched_proof_yields_independent_paths() {
+        let hasher = Poseidon2bSponge::new();
+        let (tree, root, leaves, depth) = tree_and_queries();
+
+        // Distinct + a duplicate query index.
+        let query_indices = vec![3usize, 3, 10, 21, 0, 31];
+        let query_leaves: Vec<HashOutput> =
+            query_indices.iter().map(|&i| leaves[i]).collect();
+
+        let batch = build_batched_merkle_proof(&tree, &query_indices, depth);
+        verify_batched_merkle_proof(&root, &batch, depth, &query_indices, &query_leaves, &hasher)
+            .expect("native batched verify");
+
+        let paths =
+            expand_batched_merkle_proof(&batch, depth, &query_indices, &query_leaves, &hasher)
+                .expect("expansion");
+        // Five distinct leaves {0, 3, 10, 21, 31}.
+        assert_eq!(paths.len(), 5);
+        for p in &paths {
+            assert_eq!(p.siblings.len(), depth);
+            assert_eq!(p.directions.len(), depth);
+            assert_eq!(p.leaf_hash, leaves[p.leaf_index]);
+            // Fold the independent path up to the root.
+            let mut node = p.leaf_hash;
+            for d in 0..depth {
+                node = if p.directions[d] {
+                    hasher.compress(&p.siblings[d], &node)
+                } else {
+                    hasher.compress(&node, &p.siblings[d])
+                };
+            }
+            assert_eq!(node, root, "leaf {} path missed the root", p.leaf_index);
+        }
+    }
+
+    /// A corrupted batch sibling makes at least one expanded path miss the
+    /// root — independent verification catches what the dedup hid.
+    #[test]
+    fn corrupted_sibling_breaks_a_path() {
+        let hasher = Poseidon2bSponge::new();
+        let (tree, root, leaves, depth) = tree_and_queries();
+        let query_indices = vec![3usize, 10, 21];
+        let query_leaves: Vec<HashOutput> =
+            query_indices.iter().map(|&i| leaves[i]).collect();
+        let mut batch = build_batched_merkle_proof(&tree, &query_indices, depth);
+        assert!(!batch.siblings.is_empty());
+        batch.siblings[0][0] ^= 0xFF;
+
+        let paths =
+            expand_batched_merkle_proof(&batch, depth, &query_indices, &query_leaves, &hasher)
+                .expect("expansion still structurally valid");
+        let any_bad = paths.iter().any(|p| {
+            let mut node = p.leaf_hash;
+            for d in 0..depth {
+                node = if p.directions[d] {
+                    hasher.compress(&p.siblings[d], &node)
+                } else {
+                    hasher.compress(&node, &p.siblings[d])
+                };
+            }
+            node != root
+        });
+        assert!(any_bad, "corrupted sibling not caught by any path");
+    }
 }
