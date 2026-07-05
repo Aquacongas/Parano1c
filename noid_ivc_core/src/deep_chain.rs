@@ -39,6 +39,7 @@
 pub mod family;
 pub mod relations;
 pub mod schedule;
+pub mod source_tree;
 
 use crate::challenger::Challenger;
 use crate::field::F128;
