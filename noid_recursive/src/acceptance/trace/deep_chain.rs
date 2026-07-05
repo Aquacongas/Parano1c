@@ -287,14 +287,21 @@ fn absorb_relation_header_trace(
         lanes.push(t.coeff.clone());
         lanes.push(lane(t.factors.len() as u64, 0));
         for f in &t.factors {
-            let (kind, idx) = match f {
-                ColRef::Committed(i) => (0u64, *i as u64),
-                ColRef::CommittedShift(i) => (1, *i as u64),
-                ColRef::Internal(i) => (2, *i as u64),
-                ColRef::Fixed(i) => (3, *i as u64),
-                ColRef::CommittedShift2(i) => (4, *i as u64),
-            };
-            lanes.push(lane(kind, idx));
+            match f {
+                ColRef::Committed(i) => lanes.push(lane(0, *i as u64)),
+                ColRef::CommittedShift(i) => lanes.push(lane(1, *i as u64)),
+                ColRef::Internal(i) => lanes.push(lane(2, *i as u64)),
+                ColRef::Fixed(i) => lanes.push(lane(3, *i as u64)),
+                ColRef::CommittedShift2(i) => lanes.push(lane(4, *i as u64)),
+                ColRef::Window {
+                    col,
+                    stride_log,
+                    offset,
+                } => {
+                    lanes.push(lane(5, *col as u64));
+                    lanes.push(lane(*stride_log as u64, *offset as u64));
+                }
+            }
         }
     }
     ch.observe_f128_slice(b, &lanes);

@@ -495,7 +495,10 @@ pub fn run_family<Ch: Challenger>(
                 assert_eq!(*c, C);
                 shift_target = Some(*v);
             }
-            ColRef::Internal(_) | ColRef::Fixed(_) | ColRef::CommittedShift2(_) => {
+            ColRef::Internal(_)
+            | ColRef::Fixed(_)
+            | ColRef::CommittedShift2(_)
+            | ColRef::Window { .. } => {
                 unreachable!("substitution touches committed data only")
             }
         }

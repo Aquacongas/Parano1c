@@ -65,6 +65,21 @@ pub enum ColRef {
     /// chains. Discharged by [`prove_shift_discharge_pow2`] with
     /// `shift_log = 1`.
     CommittedShift2(usize),
+    /// A committed column read at a strided, offset position:
+    /// `col(2^stride_log · w + offset)`, `offset < 2^stride_log`. This is
+    /// the fan-in-2 tree wiring — a level-`ℓ` node at slot `w` reads its
+    /// two children at slots `2w` and `2w+1` of the level-`ℓ+1` column via
+    /// `Window { stride_log: 1, offset: 0 }` and `{..offset: 1}`. The child
+    /// column has `2^stride_log` times the relation's slot count. Unlike a
+    /// shift, the low `stride_log` index bits are FIXED constants, so the
+    /// terminal claim is a plain MLE evaluation of the child column at the
+    /// re-indexed point [`window_discharge_point`] — no successor kernel,
+    /// discharged directly at the PCS like a [`ColRef::Committed`].
+    Window {
+        col: usize,
+        stride_log: usize,
+        offset: usize,
+    },
     /// An internal (uncommitted) column — its terminal claim must feed a
     /// walk claim group or another relation's target.
     Internal(usize),
@@ -170,6 +185,27 @@ pub fn claimed_refs(terms: &[RelationTerm]) -> Vec<ColRef> {
         .collect()
 }
 
+/// The point at which a [`ColRef::Window`] terminal claim reads its CHILD
+/// column: the `offset`'s low `stride_log` bits (little-endian, `point[0]`
+/// = LSB) prepended to the relation's derived `point`. The window value
+/// `Σ_w eq(point,w)·col(2^stride_log·w + offset)` equals the plain MLE
+/// `col~(window_discharge_point(offset, stride_log, point))` exactly (the
+/// fixed low bits select the coset; the high coordinates are `point`), so
+/// the caller discharges it directly as a PCS opening — no shift kernel.
+pub fn window_discharge_point(offset: usize, stride_log: usize, point: &[F128]) -> Vec<F128> {
+    debug_assert!(offset < (1usize << stride_log), "window offset outside stride");
+    let mut out = Vec::with_capacity(stride_log + point.len());
+    for j in 0..stride_log {
+        out.push(if (offset >> j) & 1 == 1 {
+            F128::ONE
+        } else {
+            F128::ZERO
+        });
+    }
+    out.extend_from_slice(point);
+    out
+}
+
 /// The columns backing a relation instance, prover side. `fixed` is also
 /// consumed by the verifier (protocol constants, not witness).
 pub struct RelationColumns<'a> {
@@ -195,6 +231,17 @@ impl RelationColumns<'_> {
                 shifted[2..].copy_from_slice(&col[..w - 2]);
                 shifted
             }
+            ColRef::Window {
+                col,
+                stride_log,
+                offset,
+            } => {
+                let child = self.committed[col];
+                let stride = 1usize << stride_log;
+                assert!(offset < stride, "window offset outside stride");
+                assert_eq!(child.len(), w << stride_log, "window child length");
+                (0..w).map(|i| child[(i << stride_log) + offset]).collect()
+            }
             ColRef::Fixed(i) => self.fixed[i].materialize(w),
         }
     }
@@ -217,17 +264,26 @@ fn absorb_relation_header<Ch: Challenger>(
         lanes.push(t.coeff);
         lanes.push(lane(t.factors.len() as u64, 0));
         for f in &t.factors {
-            let (kind, idx) = match f {
-                ColRef::Committed(i) => (0u64, *i as u64),
-                ColRef::CommittedShift(i) => (1, *i as u64),
-                ColRef::Internal(i) => (2, *i as u64),
+            match f {
+                ColRef::Committed(i) => lanes.push(lane(0, *i as u64)),
+                ColRef::CommittedShift(i) => lanes.push(lane(1, *i as u64)),
+                ColRef::Internal(i) => lanes.push(lane(2, *i as u64)),
                 // Fixed pattern CONTENT is a protocol constant on both
                 // sides (like the term structure itself) — only the
                 // reference is bound.
-                ColRef::Fixed(i) => (3, *i as u64),
-                ColRef::CommittedShift2(i) => (4, *i as u64),
-            };
-            lanes.push(lane(kind, idx));
+                ColRef::Fixed(i) => lanes.push(lane(3, *i as u64)),
+                ColRef::CommittedShift2(i) => lanes.push(lane(4, *i as u64)),
+                // Window carries three integers; bind the column reference
+                // plus a second lane for the strided-offset layout.
+                ColRef::Window {
+                    col,
+                    stride_log,
+                    offset,
+                } => {
+                    lanes.push(lane(5, *col as u64));
+                    lanes.push(lane(*stride_log as u64, *offset as u64));
+                }
+            }
         }
     }
     challenger.observe_f128_slice(&lanes);
@@ -1008,6 +1064,142 @@ mod tests {
             }
         }
         assert!(survivors.is_empty(), "relation mutation survivors: {survivors:?}");
+    }
+
+    /// Windowed reads: fan-in-2 tree wiring. A parent-level relation reads
+    /// its two children at slots `2w`/`2w+1` of a child column twice its
+    /// length; each window's terminal value must equal a PLAIN MLE of the
+    /// child at [`window_discharge_point`] (offset bit prepended), with no
+    /// shift kernel. Roundtrip + terminal-claim correctness + the
+    /// re-indexing identity + a mutation sweep.
+    #[test]
+    fn window_read_roundtrip_and_claims() {
+        let mut rng = Rng(0x5177);
+        let w_log = 4; // parent (relation) domain
+        let stride_log = 1; // fan-in-2
+        let w = 1usize << w_log;
+        let child_len = w << stride_log; // 2^(w_log+stride_log)
+        let child = random_col(&mut rng, child_len);
+        let sel: Vec<F128> = (0..w).map(|_| rng.bit()).collect();
+        let committed: Vec<&[F128]> = vec![&sel, &child];
+        let columns = RelationColumns {
+            committed: &committed,
+            internal: &[],
+            fixed: &[],
+        };
+
+        // relation(w) = sel(w)·child(2w) + 9·child(2w+1)
+        let left = ColRef::Window {
+            col: 1,
+            stride_log,
+            offset: 0,
+        };
+        let right = ColRef::Window {
+            col: 1,
+            stride_log,
+            offset: 1,
+        };
+        let terms = vec![
+            RelationTerm {
+                coeff: F128::ONE,
+                factors: vec![ColRef::Committed(0), left],
+            },
+            RelationTerm {
+                coeff: f128_of_usize(9),
+                factors: vec![right],
+            },
+        ];
+        let eq_point: Vec<F128> = (0..w_log).map(|_| rng.f128()).collect();
+        let eq = build_eq_table(&eq_point);
+        let mut target = F128::ZERO;
+        for i in 0..w {
+            let c0 = child[i << stride_log];
+            let c1 = child[(i << stride_log) + 1];
+            target += eq[i] * (sel[i] * c0 + f128_of_usize(9) * c1);
+        }
+
+        let mut ch_p = FsLaneChallenger::new(b"window-test");
+        let (proof, point_p, _) =
+            prove_column_relation(target, &eq_point, &terms, &columns, &mut ch_p);
+        let mut ch_v = FsLaneChallenger::new(b"window-test");
+        let point_v =
+            verify_column_relation(w_log, target, &eq_point, &terms, &[], &proof, &mut ch_v)
+                .expect("honest window relation");
+        assert_eq!(point_p, point_v);
+        assert_eq!(ch_p.sample_f128(), ch_v.sample_f128());
+
+        // Each terminal claim is a PLAIN MLE of the child at the re-indexed
+        // point — offset bit prepended, no kernel. This is the whole point.
+        for (r, v) in claimed_refs(&terms).iter().zip(proof.final_values.iter()) {
+            let expected = match r {
+                ColRef::Committed(0) => mle_eval(&sel, &point_v),
+                ColRef::Window {
+                    col: 1,
+                    stride_log: s,
+                    offset,
+                } => {
+                    let pt = window_discharge_point(*offset, *s, &point_v);
+                    mle_eval(&child, &pt)
+                }
+                _ => unreachable!(),
+            };
+            assert_eq!(*v, expected, "terminal claim for {r:?}");
+        }
+
+        // The re-indexing identity in isolation: folding the windowed table
+        // equals the plain child MLE at the prepended point, for BOTH cosets.
+        for offset in 0..(1usize << stride_log) {
+            let win: Vec<F128> = (0..w).map(|i| child[(i << stride_log) + offset]).collect();
+            let pt = window_discharge_point(offset, stride_log, &point_v);
+            assert_eq!(mle_eval(&win, &point_v), mle_eval(&child, &pt), "offset {offset}");
+        }
+
+        // Forged target and every wire mutation rejected (or land on a false
+        // terminal claim after a shifted derived point).
+        let mut ch = FsLaneChallenger::new(b"window-test");
+        assert!(verify_column_relation(
+            w_log,
+            target + F128::ONE,
+            &eq_point,
+            &terms,
+            &[],
+            &proof,
+            &mut ch
+        )
+        .is_err());
+
+        let mut survivors = Vec::new();
+        for round in 0..w_log {
+            for c in 0..RELATION_DEGREE {
+                let mut bad = proof.clone();
+                bad.rounds[round][c] += F128::ONE;
+                let mut ch = FsLaneChallenger::new(b"window-test");
+                match verify_column_relation(w_log, target, &eq_point, &terms, &[], &bad, &mut ch) {
+                    Err(_) => {}
+                    Ok(pt) => {
+                        let all_true = claimed_refs(&terms)
+                            .iter()
+                            .zip(bad.final_values.iter())
+                            .all(|(r, v)| match r {
+                                ColRef::Committed(0) => mle_eval(&sel, &pt) == *v,
+                                ColRef::Window {
+                                    col: 1,
+                                    stride_log: s,
+                                    offset,
+                                } => {
+                                    let q = window_discharge_point(*offset, *s, &pt);
+                                    mle_eval(&child, &q) == *v
+                                }
+                                _ => unreachable!(),
+                            });
+                        if all_true {
+                            survivors.push((round, c));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(survivors.is_empty(), "window mutation survivors: {survivors:?}");
     }
 
     /// Fixed patterns: a periodic selector gating a 3-factor term. The
