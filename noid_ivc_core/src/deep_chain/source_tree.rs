@@ -348,6 +348,10 @@ pub fn source_tree_fixed_patterns(tree: &SourceTree, iv_flat: [F128; 2]) -> Vec<
 
 /// Per-lane `m_j = Σ_e α^{e+1}·MDS_FULL[e][j]` (flat basis) — the walk's
 /// α-batched `initial_mds` weights, shared by every family's substitution.
+pub fn mds_weights_pub(alpha: F128) -> [F128; STATE_SIZE] {
+    mds_weights(alpha)
+}
+
 fn mds_weights(alpha: F128) -> [F128; STATE_SIZE] {
     let mut alphas = [F128::ZERO; STATE_SIZE];
     let mut p = F128::ONE;

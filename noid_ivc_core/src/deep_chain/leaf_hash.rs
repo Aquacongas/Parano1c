@@ -97,6 +97,9 @@ pub struct SourceLeafColumns {
     pub c: [Vec<F128>; STATE_SIZE],
     pub s0: [Vec<F128>; STATE_SIZE],
     pub s_out: [Vec<F128>; STATE_SIZE],
+    /// The two `hash_pair` input lanes at each hash-pair slot (0 elsewhere) —
+    /// the committed `IN0/IN1` columns the substitution reads.
+    pub in_: [Vec<F128>; 2],
     pub digest: [F128; 2],
 }
 
@@ -199,14 +202,156 @@ pub fn build_source_leaf_columns(
         );
     }
 
+    // The committed hash_pair input columns (0 outside hash-pair slots).
+    let mut in_: [Vec<F128>; 2] = std::array::from_fn(|_| vec![F128::ZERO; w]);
+    in_[0][0] = flat_lane(SOURCE_LEAF_DOMAIN);
+    in_[1][0] = flat_lane(log_rows as u128);
+    in_[0][1] = flat_lane(chain.n_cols as u128);
+    in_[1][1] = flat_lane(leaf_index as u128);
+    for k in 0..chain.n_cols {
+        let hp = 4 + 3 * k;
+        in_[0][hp] = symbols[2 * k];
+        in_[1][hp] = symbols[2 * k + 1];
+    }
+
     let d = chain.digest_slot();
     let digest = [c[0][d], c[1][d]];
     SourceLeafColumns {
         c,
         s0,
         s_out,
+        in_,
         digest,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Region wiring: refs, fixed patterns, substitution terms
+// ---------------------------------------------------------------------------
+
+use crate::deep_chain::relations::{ColRef, FixedPattern, RelationTerm};
+use crate::deep_chain::source_tree::mds_weights_pub;
+
+/// Column/pattern indices of one source-leaf chain. Committed column order
+/// `IN0, IN1, C0..C3`; pattern order `HP, EVEN, ODD, IV0, IV1`.
+#[derive(Clone, Copy, Debug)]
+pub struct SourceLeafRefs {
+    pub in_: [usize; 2],
+    pub c: [usize; STATE_SIZE],
+    pub hp: usize,
+    pub even: usize,
+    pub odd: usize,
+    pub iv: [usize; 2],
+}
+
+pub fn source_leaf_refs(col_base: usize, fixed_base: usize) -> SourceLeafRefs {
+    SourceLeafRefs {
+        in_: [col_base, col_base + 1],
+        c: std::array::from_fn(|i| col_base + 2 + i),
+        hp: fixed_base,
+        even: fixed_base + 1,
+        odd: fixed_base + 2,
+        iv: [fixed_base + 3, fixed_base + 4],
+    }
+}
+
+/// Role of a slot in the per-leaf schedule.
+fn slot_role(chain: &SourceLeafChain, slot: usize) -> u8 {
+    // 0 = hash_pair, 1 = compress even, 2 = compress odd, 3 = ghost.
+    if slot < 2 {
+        0
+    } else if slot == 2 {
+        1
+    } else if slot == 3 {
+        2
+    } else if slot < chain.slots() {
+        match (slot - 4) % 3 {
+            0 => 0,
+            1 => 1,
+            _ => 2,
+        }
+    } else {
+        3
+    }
+}
+
+/// The schedule selector/constant patterns over one `stride` period. `HP`,
+/// `EVEN`, `ODD` mark the slot roles; `IV0/IV1` carry the compress capacity
+/// IV at even slots. One period tiles per leaf, so the verifier's pattern
+/// cost is leaf-count independent.
+pub fn source_leaf_fixed_patterns(chain: &SourceLeafChain, iv_flat: [F128; 2]) -> Vec<FixedPattern> {
+    let period = chain.stride();
+    let low_log = period.trailing_zeros() as usize;
+    let mut hp = vec![F128::ZERO; period];
+    let mut even = vec![F128::ZERO; period];
+    let mut odd = vec![F128::ZERO; period];
+    let mut iv0 = vec![F128::ZERO; period];
+    let mut iv1 = vec![F128::ZERO; period];
+    for slot in 0..period {
+        match slot_role(chain, slot) {
+            0 => hp[slot] = F128::ONE,
+            1 => {
+                even[slot] = F128::ONE;
+                iv0[slot] = iv_flat[0];
+                iv1[slot] = iv_flat[1];
+            }
+            2 => odd[slot] = F128::ONE,
+            _ => {}
+        }
+    }
+    vec![
+        FixedPattern::new(low_log, hp),
+        FixedPattern::new(low_log, even),
+        FixedPattern::new(low_log, odd),
+        FixedPattern::new(low_log, iv0),
+        FixedPattern::new(low_log, iv1),
+    ]
+}
+
+/// Wiring substitution `Σ_j m_j·raw_j(w)` for the α-batched walk terminal.
+/// The carry is uniformly two slots back (see [`build_source_leaf_columns`]):
+///
+/// ```text
+///   raw_0 = HP·IN0 + EVEN·C0(w−2) + ODD·[C0(w−1) + C0(w−2)]
+///   raw_1 = HP·IN1 + EVEN·C1(w−2) + ODD·[C1(w−1) + C1(w−2)]
+///   raw_2 = IV0_pat + ODD·C2(w−1)
+///   raw_3 = IV1_pat + ODD·C3(w−1)
+/// ```
+///
+/// (`hash_pair` absorbs `IN0/IN1` on zero capacity; the compress even slot
+/// absorbs the running acc `C(w−2)` on a fresh IV; the odd slot feeds the
+/// even output `C(w−1)` forward and absorbs `C(w−2)` — the meta / column
+/// hash.)
+pub fn source_leaf_substitution_terms(refs: &SourceLeafRefs, alpha: F128) -> Vec<RelationTerm> {
+    let m = mds_weights_pub(alpha);
+    let mut terms = Vec::new();
+    for i in 0..2 {
+        let in_col = ColRef::Committed(refs.in_[i]);
+        let c_sh = ColRef::CommittedShift(refs.c[i]);
+        let c_sh2 = ColRef::CommittedShift2(refs.c[i]);
+        for factors in [
+            vec![ColRef::Fixed(refs.hp), in_col],
+            vec![ColRef::Fixed(refs.even), c_sh2],
+            vec![ColRef::Fixed(refs.odd), c_sh],
+            vec![ColRef::Fixed(refs.odd), c_sh2],
+        ] {
+            terms.push(RelationTerm {
+                coeff: m[i],
+                factors,
+            });
+        }
+    }
+    for j in 2..STATE_SIZE {
+        terms.push(RelationTerm {
+            coeff: m[j],
+            factors: vec![ColRef::Fixed(refs.iv[j - 2])],
+        });
+        terms.push(RelationTerm {
+            coeff: m[j],
+            factors: vec![ColRef::Fixed(refs.odd), ColRef::CommittedShift(refs.c[j])],
+        });
+    }
+    terms
 }
 
 #[cfg(test)]
@@ -245,6 +390,172 @@ mod tests {
                     assert_eq!(cols.c[j][slot], cols.s_out[j][slot]);
                 }
             }
+        }
+    }
+
+    /// The full region DAG for one source-leaf chain: carry-selection seeds
+    /// the walk from the committed digests, the walk verifies every slot's
+    /// permutation, the substitution ties the walk input to the distance-2
+    /// chain wiring (hash-pair inputs read plainly, acc and column-hash read
+    /// two slots back, feed-forward one slot back), and the digest pins to
+    /// C0/C1 at the final slot. Honest run discharges every claim true; a
+    /// corrupted input / output lane is caught.
+    #[test]
+    fn source_leaf_region_dag_roundtrip_and_negatives() {
+        use crate::challenger::{Challenger, FsLaneChallenger};
+        use crate::deep_chain::relations::{
+            claimed_refs, prove_column_relation, prove_shift_discharge,
+            prove_shift_discharge_pow2, verify_column_relation, verify_shift_discharge,
+            verify_shift_discharge_pow2, ColRef, RelationColumns,
+        };
+        use crate::deep_chain::schedule::carry_selection_terms;
+        use crate::deep_chain::source_tree::compress_iv_flat;
+        use crate::deep_chain::{prove_deep_chain_walk, verify_deep_chain_walk, LaneClaimGroup};
+        use crate::lincheck::build_eq_table;
+
+        fn mle(col: &[F128], point: &[F128]) -> F128 {
+            let eq = build_eq_table(point);
+            let mut acc = F128::ZERO;
+            for (v, e) in col.iter().zip(eq.iter()) {
+                acc += *v * *e;
+            }
+            acc
+        }
+
+        let n_cols = 3usize;
+        let chain = SourceLeafChain { n_cols };
+        let w_log = chain.stride().trailing_zeros() as usize;
+        let w = 1usize << w_log;
+        let (log_rows, leaf_index) = (6usize, 5usize);
+        let iv = compress_iv_flat();
+
+        let mut seed = 0xA5A5u64;
+        let mut next = || {
+            seed = seed.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = seed;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z ^= z >> 31;
+            F128 { lo: z, hi: z.rotate_left(29) }
+        };
+        let symbols: Vec<F128> = (0..n_cols * 2).map(|_| next()).collect();
+        let cols = build_source_leaf_columns(&chain, log_rows, leaf_index, &symbols, w_log);
+        let fixed = source_leaf_fixed_patterns(&chain, iv);
+        let refs = source_leaf_refs(0, 0);
+
+        let d = chain.digest_slot();
+        let digest_point: Vec<F128> = (0..w_log)
+            .map(|bb| if (d >> bb) & 1 == 1 { F128::ONE } else { F128::ZERO })
+            .collect();
+
+        let run = |in0: &[F128], in1: &[F128], c: &[Vec<F128>; STATE_SIZE]| -> Result<(), String> {
+            let committed: Vec<&[F128]> =
+                vec![in0, in1, &c[0], &c[1], &c[2], &c[3]];
+            let internal: Vec<&[F128]> = cols.s_out.iter().map(|c| c.as_slice()).collect();
+            let mut ch_p = FsLaneChallenger::new(b"source-leaf-dag");
+            let mut ch_v = FsLaneChallenger::new(b"source-leaf-dag");
+            let mut pending: Vec<(usize, Vec<F128>, F128)> = Vec::new();
+
+            // carry selection → walk group.
+            let beta = ch_p.sample_f128();
+            assert_eq!(beta, ch_v.sample_f128());
+            let sel_terms = carry_selection_terms(&refs.c, beta);
+            let rho: Vec<F128> = ch_p.sample_f128_vec(w_log);
+            let _ = ch_v.sample_f128_vec(w_log);
+            let (sp, _, _) = prove_column_relation(
+                F128::ZERO,
+                &rho,
+                &sel_terms,
+                &RelationColumns { committed: &committed, internal: &internal, fixed: &fixed },
+                &mut ch_p,
+            );
+            let sel_point =
+                verify_column_relation(w_log, F128::ZERO, &rho, &sel_terms, &fixed, &sp, &mut ch_v)
+                    .map_err(|e| format!("selection: {e}"))?;
+            let mut group_values = [F128::ZERO; STATE_SIZE];
+            for (r, v) in claimed_refs(&sel_terms).iter().zip(sp.final_values.iter()) {
+                match r {
+                    ColRef::Committed(cc) => pending.push((*cc, sel_point.clone(), *v)),
+                    ColRef::Internal(j) => group_values[*j] = *v,
+                    _ => unreachable!(),
+                }
+            }
+
+            // walk.
+            let groups = vec![LaneClaimGroup { point: sel_point.clone(), values: group_values }];
+            let (wp, _) = prove_deep_chain_walk(&cols.s0, &groups, &mut ch_p);
+            let terminal = verify_deep_chain_walk(w_log, &groups, &wp, &mut ch_v)
+                .map_err(|e| format!("walk: {e}"))?;
+
+            // substitution.
+            let alpha = ch_p.sample_f128();
+            assert_eq!(alpha, ch_v.sample_f128());
+            let sub_terms = source_leaf_substitution_terms(&refs, alpha);
+            let mut target = F128::ZERO;
+            let mut p = F128::ONE;
+            for e in 0..STATE_SIZE {
+                p = p * alpha;
+                target += p * terminal.values[e];
+            }
+            let (subp, _, _) = prove_column_relation(
+                target,
+                &terminal.point,
+                &sub_terms,
+                &RelationColumns { committed: &committed, internal: &[], fixed: &fixed },
+                &mut ch_p,
+            );
+            let sub_point = verify_column_relation(
+                w_log, target, &terminal.point, &sub_terms, &fixed, &subp, &mut ch_v,
+            )
+            .map_err(|e| format!("substitution: {e}"))?;
+            for (r, v) in claimed_refs(&sub_terms).iter().zip(subp.final_values.iter()) {
+                match r {
+                    ColRef::Committed(cc) => pending.push((*cc, sub_point.clone(), *v)),
+                    ColRef::CommittedShift(cc) => {
+                        let (pr, _) = prove_shift_discharge(committed[*cc], &sub_point, *v, &mut ch_p);
+                        let pt = verify_shift_discharge(w_log, &sub_point, *v, &pr, &mut ch_v)
+                            .map_err(|e| format!("shift: {e}"))?;
+                        pending.push((*cc, pt, pr.final_value));
+                    }
+                    ColRef::CommittedShift2(cc) => {
+                        let (pr, _) =
+                            prove_shift_discharge_pow2(committed[*cc], &sub_point, *v, 1, &mut ch_p);
+                        let pt = verify_shift_discharge_pow2(w_log, &sub_point, *v, 1, &pr, &mut ch_v)
+                            .map_err(|e| format!("shift2: {e}"))?;
+                        pending.push((*cc, pt, pr.final_value));
+                    }
+                    _ => unreachable!(),
+                }
+            }
+
+            assert_eq!(ch_p.sample_f128(), ch_v.sample_f128(), "lockstep");
+
+            for (cc, pt, v) in &pending {
+                if mle(committed[*cc], pt) != *v {
+                    return Err(format!("claim on column {cc} is false"));
+                }
+            }
+            // Digest pin.
+            if mle(&c[0], &digest_point) != cols.digest[0]
+                || mle(&c[1], &digest_point) != cols.digest[1]
+            {
+                return Err("digest pin mismatch".into());
+            }
+            Ok(())
+        };
+
+        run(&cols.in_[0], &cols.in_[1], &cols.c).expect("honest source leaf DAG verifies");
+
+        // A corrupted symbol input breaks a claim.
+        {
+            let mut bad = cols.in_[0].clone();
+            bad[4] += F128::ONE; // first column hash_pair input
+            assert!(run(&bad, &cols.in_[1], &cols.c).is_err(), "corrupted IN accepted");
+        }
+        // A corrupted output digest lane breaks the walk/digest.
+        {
+            let mut bad = cols.c.clone();
+            bad[0][chain.digest_slot()] += F128::ONE;
+            assert!(run(&cols.in_[0], &cols.in_[1], &bad).is_err(), "corrupted C accepted");
         }
     }
 }
