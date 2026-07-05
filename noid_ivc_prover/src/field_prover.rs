@@ -9,6 +9,7 @@ use noid_ivc_core::field_r1cs::FieldR1cs;
 use noid_ivc_core::lincheck::{self, QuirkyPoint};
 use noid_ivc_core::pcs::{self, Commitment, PcsParams, QuirkyDirectClaim};
 use noid_ivc_core::proof::{FieldR1csProof, R1csClaim, ZClaim, bind_statement_field};
+use noid_ivc_core::public_io::{PublicIoSpec, assert_witness_matches_io, bind_public_io};
 use noid_ivc_core::zerocheck;
 
 /// Prove a FieldR1cs instance on a witness of `2^m` F128 elements.
@@ -24,6 +25,32 @@ pub fn prove_field<Ch: Challenger>(
     r1cs: &FieldR1cs,
     z: &[F128],
     pcs_params: &PcsParams,
+    challenger: &mut Ch,
+) -> (FieldR1csProof, Commitment, R1csClaim) {
+    prove_field_inner(r1cs, z, pcs_params, None, challenger)
+}
+
+/// [`prove_field`] with a public-IO envelope: right after the statement
+/// binding, absorb the spec + envelope lanes, sample the binding point, and
+/// append the IO claims to the batched PCS opening (see
+/// `noid_ivc_core::public_io`). The witness must hold the envelope lanes in
+/// the spec's IO slice (zero-padded) — asserted here.
+pub fn prove_field_with_public_io<Ch: Challenger>(
+    r1cs: &FieldR1cs,
+    z: &[F128],
+    pcs_params: &PcsParams,
+    spec: &PublicIoSpec,
+    io: &[F128],
+    challenger: &mut Ch,
+) -> (FieldR1csProof, Commitment, R1csClaim) {
+    prove_field_inner(r1cs, z, pcs_params, Some((spec, io)), challenger)
+}
+
+fn prove_field_inner<Ch: Challenger>(
+    r1cs: &FieldR1cs,
+    z: &[F128],
+    pcs_params: &PcsParams,
+    public_io: Option<(&PublicIoSpec, &[F128])>,
     challenger: &mut Ch,
 ) -> (FieldR1csProof, Commitment, R1csClaim) {
     r1cs.validate_shape();
@@ -58,6 +85,15 @@ pub fn prove_field<Ch: Challenger>(
 
     // ---- Bind the FS transcript to the statement.
     bind_statement_field(challenger, r1cs, &commitment);
+
+    // ---- Public-IO envelope binding (before any sub-protocol challenge).
+    let io_claims: Vec<QuirkyDirectClaim> = match public_io {
+        Some((spec, io)) => {
+            assert_witness_matches_io(z, spec, io);
+            bind_public_io(challenger, spec, io, r1cs.m)
+        }
+        None => Vec::new(),
+    };
 
     // ---- a = A·z, b = B·z over F128; c aliases z (C = I).
     let a = r1cs.apply_a(z);
@@ -116,7 +152,7 @@ pub fn prove_field<Ch: Challenger>(
         v.extend_from_slice(&zc.point.x_outer);
         v
     };
-    let claims = [
+    let mut claims = vec![
         QuirkyDirectClaim {
             z_skip: ab.point.z_skip,
             k_skip: r1cs.k_skip,
@@ -130,6 +166,7 @@ pub fn prove_field<Ch: Challenger>(
             value: c.value,
         },
     ];
+    claims.extend(io_claims);
     let pcs_open = pcs::open_batch_quirky_direct(z, &prover_data, &commitment, &claims, challenger);
     lap("pcs open", &mut t);
 

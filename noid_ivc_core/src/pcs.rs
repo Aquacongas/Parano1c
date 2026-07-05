@@ -197,40 +197,29 @@ pub fn open_batch_quirky_direct<Ch: Challenger>(
 
     // b_combined[i] = Σ_k γ_k · L_{i_skip}(z_skip_k) · eq(x_rest_k, i_rest).
     // γ_k is baked into the (tiny) Lagrange table; the outer eq tables are
-    // built once per claim.
-    let per_claim: Vec<(Vec<F128>, Vec<F128>, usize)> = claims
-        .iter()
-        .zip(gammas.iter())
-        .map(|(c, g)| {
-            let mut weights =
-                crate::zerocheck::multilinear::lagrange_weights_naive(c.k_skip, c.z_skip);
-            for w in weights.iter_mut() {
-                *w *= *g;
-            }
-            let eq_rest = crate::lincheck::build_eq_table(&c.x_rest);
-            (weights, eq_rest, 1usize << c.k_skip)
-        })
-        .collect();
-    let block = per_claim[0].2;
-    debug_assert!(per_claim.iter().all(|p| p.2 == block));
+    // built once per claim. Claims may carry DIFFERENT k_skip (quirky
+    // sub-protocol claims at K_SKIP next to plain k_skip = 0 point claims),
+    // so each claim is accumulated at its own block granularity.
     let mut b_combined: Vec<F128> = crate::scratch::take_f128(l);
-    b_combined
-        .par_chunks_mut(block)
-        .enumerate()
-        .for_each(|(hi, out_block)| {
-            for (ci, (weights, eq_rest, _)) in per_claim.iter().enumerate() {
+    b_combined.par_iter_mut().for_each(|slot| *slot = F128::ZERO);
+    for (c, g) in claims.iter().zip(gammas.iter()) {
+        let mut weights =
+            crate::zerocheck::multilinear::lagrange_weights_naive(c.k_skip, c.z_skip);
+        for w in weights.iter_mut() {
+            *w *= *g;
+        }
+        let eq_rest = crate::lincheck::build_eq_table(&c.x_rest);
+        let block = 1usize << c.k_skip;
+        b_combined
+            .par_chunks_mut(block)
+            .enumerate()
+            .for_each(|(hi, out_block)| {
                 let e_hi = eq_rest[hi];
-                if ci == 0 {
-                    for (slot, w) in out_block.iter_mut().zip(weights.iter()) {
-                        *slot = *w * e_hi;
-                    }
-                } else {
-                    for (slot, w) in out_block.iter_mut().zip(weights.iter()) {
-                        *slot += *w * e_hi;
-                    }
+                for (slot, w) in out_block.iter_mut().zip(weights.iter()) {
+                    *slot += *w * e_hi;
                 }
-            }
-        });
+            });
+    }
 
     let ntt = crate::ntt::AdditiveNttF128::standard(commitment.params.k_code());
     basefold::prove(

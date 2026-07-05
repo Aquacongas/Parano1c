@@ -328,13 +328,32 @@ pub fn verify_field<Ch: Challenger>(
     proof: &crate::proof::FieldR1csProof,
     challenger: &mut Ch,
 ) -> Result<R1csClaim, VerifyError> {
-    verifier_pool().install(move || verify_field_inner(r1cs, commitment, proof, challenger))
+    verifier_pool().install(move || verify_field_inner(r1cs, commitment, proof, None, challenger))
+}
+
+/// [`verify_field`] with a public-IO envelope: mirrors
+/// `prove_field_with_public_io` — absorbs the spec + envelope lanes right
+/// after the statement binding, samples the binding point, and checks the
+/// appended IO claims in the batched PCS opening (see
+/// [`crate::public_io`]). The spec is a verification-key constant; the
+/// envelope lanes are the proof's public values.
+pub fn verify_field_with_public_io<Ch: Challenger>(
+    r1cs: &crate::field_r1cs::FieldR1cs,
+    commitment: &Commitment,
+    proof: &crate::proof::FieldR1csProof,
+    spec: &crate::public_io::PublicIoSpec,
+    io: &[crate::field::F128],
+    challenger: &mut Ch,
+) -> Result<R1csClaim, VerifyError> {
+    verifier_pool()
+        .install(move || verify_field_inner(r1cs, commitment, proof, Some((spec, io)), challenger))
 }
 
 fn verify_field_inner<Ch: Challenger>(
     r1cs: &crate::field_r1cs::FieldR1cs,
     commitment: &Commitment,
     proof: &crate::proof::FieldR1csProof,
+    public_io: Option<(&crate::public_io::PublicIoSpec, &[crate::field::F128])>,
     challenger: &mut Ch,
 ) -> Result<R1csClaim, VerifyError> {
     // The commitment must be sized for THIS instance (one committed F128
@@ -348,6 +367,12 @@ fn verify_field_inner<Ch: Challenger>(
 
     // ---- Bind the FS transcript to the statement (mirrors prove_field).
     crate::proof::bind_statement_field(challenger, r1cs, commitment);
+
+    // ---- Public-IO envelope binding (mirrors prove_field_with_public_io).
+    let io_claims: Vec<pcs::QuirkyDirectClaim> = match public_io {
+        Some((spec, io)) => crate::public_io::bind_public_io(challenger, spec, io, r1cs.m),
+        None => Vec::new(),
+    };
 
     // ---- Field zerocheck.
     let zc_claim = zerocheck::field::verify(r1cs.m, &proof.zerocheck, challenger)
@@ -399,7 +424,7 @@ fn verify_field_inner<Ch: Challenger>(
     };
     let ab_rest = x_rest_of(&ab);
     let c_rest = x_rest_of(&c);
-    let refs = [
+    let mut refs = vec![
         pcs::QuirkyDirectClaimRef {
             z_skip: ab.point.z_skip,
             k_skip: r1cs.k_skip,
@@ -413,6 +438,12 @@ fn verify_field_inner<Ch: Challenger>(
             value: c.value,
         },
     ];
+    refs.extend(io_claims.iter().map(|cl| pcs::QuirkyDirectClaimRef {
+        z_skip: cl.z_skip,
+        k_skip: cl.k_skip,
+        x_rest: &cl.x_rest,
+        value: cl.value,
+    }));
     pcs::verify_opening_batch_quirky_direct(commitment, &refs, &proof.pcs_open, challenger)
         .map_err(VerifyError::PcsAb)?;
 

@@ -1450,6 +1450,62 @@ impl FieldR1csProofTrace {
     }
 }
 
+/// Trace twin of `public_io::bind_public_io`: absorb the spec constants and
+/// the envelope-lane wires, sample the binding point, and derive the claim
+/// list appended to the batched opening. The spec is a protocol constant of
+/// the verified instance; the envelope lanes are witness wires (the caller
+/// pins them to whatever carries the verified proof's public values).
+pub fn bind_public_io_trace(
+    b: &mut FieldR1csBuilder,
+    ch: &mut FsChannelTrace,
+    spec: &noid_ivc_core::public_io::PublicIoSpec,
+    io: &[LinExpr],
+    total_vars: usize,
+) -> Vec<QuirkyDirectClaimTrace> {
+    spec.validate(total_vars);
+    assert_eq!(io.len(), spec.io_len, "envelope length must match the spec");
+
+    ch.observe_label(b, b"history-public-io-v0");
+    let spec_lanes: Vec<LinExpr> = spec
+        .transcript_lanes()
+        .iter()
+        .map(|v| LinExpr::constant(*v))
+        .collect();
+    ch.observe_f128_slice(b, &spec_lanes);
+    ch.observe_f128_slice(b, io);
+    let y = ch.sample_f128_vec(b, spec.io_slice.log2_len);
+
+    let eq = super::eq_ind_partial_eval_trace(b, &y);
+    let io_value = dot_trace(b, &eq[..io.len()], io);
+    let prefix = |slice: &noid_ivc_core::public_io::WitnessSlice| -> Vec<LinExpr> {
+        slice
+            .prefix_coords(total_vars)
+            .into_iter()
+            .map(LinExpr::constant)
+            .collect()
+    };
+    let mut x_rest = y;
+    x_rest.extend(prefix(&spec.io_slice));
+    let mut claims = vec![QuirkyDirectClaimTrace {
+        z_skip: LinExpr::zero(),
+        k_skip: 0,
+        x_rest,
+        value: io_value,
+    }];
+
+    for c in &spec.claims {
+        let mut x_rest: Vec<LinExpr> = io[c.point.clone()].to_vec();
+        x_rest.extend(prefix(&c.slice));
+        claims.push(QuirkyDirectClaimTrace {
+            z_skip: LinExpr::zero(),
+            k_skip: 0,
+            x_rest,
+            value: io[c.value].clone(),
+        });
+    }
+    claims
+}
+
 /// Trace twin of `verifier::verify_field` — the [R] slot body. The verified
 /// instance and its PCS parameters are protocol constants; the commitment
 /// root and every proof field are witness. Statement binding → field
@@ -1463,6 +1519,43 @@ pub fn verify_field_trace(
     commitment_root: &FlatDigestExpr,
     proof: &FieldR1csProofTrace,
 ) -> R1csClaimTrace {
+    verify_field_trace_inner(b, ch, r1cs, pcs_params, commitment_root, proof, None)
+}
+
+/// Trace twin of `verifier::verify_field_with_public_io` — [`verify_field_trace`]
+/// plus the envelope binding and its appended opening claims. `io` wires
+/// carry the verified proof's public values; the spec is that instance's
+/// protocol constant.
+pub fn verify_field_trace_with_public_io(
+    b: &mut FieldR1csBuilder,
+    ch: &mut FsChannelTrace,
+    r1cs: &FieldR1cs,
+    pcs_params: &PcsParams,
+    commitment_root: &FlatDigestExpr,
+    proof: &FieldR1csProofTrace,
+    spec: &noid_ivc_core::public_io::PublicIoSpec,
+    io: &[LinExpr],
+) -> R1csClaimTrace {
+    verify_field_trace_inner(
+        b,
+        ch,
+        r1cs,
+        pcs_params,
+        commitment_root,
+        proof,
+        Some((spec, io)),
+    )
+}
+
+fn verify_field_trace_inner(
+    b: &mut FieldR1csBuilder,
+    ch: &mut FsChannelTrace,
+    r1cs: &FieldR1cs,
+    pcs_params: &PcsParams,
+    commitment_root: &FlatDigestExpr,
+    proof: &FieldR1csProofTrace,
+    public_io: Option<(&noid_ivc_core::public_io::PublicIoSpec, &[LinExpr])>,
+) -> R1csClaimTrace {
     assert_eq!(
         pcs_params.m,
         r1cs.m + LOG_PACKING,
@@ -1471,6 +1564,12 @@ pub fn verify_field_trace(
 
     // ---- Bind the FS transcript to the statement.
     bind_statement_field_trace(b, ch, r1cs, pcs_params, commitment_root);
+
+    // ---- Public-IO envelope binding (mirrors verify_field_with_public_io).
+    let io_claims: Vec<QuirkyDirectClaimTrace> = match public_io {
+        Some((spec, io)) => bind_public_io_trace(b, ch, spec, io, r1cs.m),
+        None => Vec::new(),
+    };
 
     // ---- Field zerocheck.
     let zc_claim = zerocheck_field_verify_trace(b, ch, r1cs.m, &proof.zerocheck);
@@ -1513,7 +1612,7 @@ pub fn verify_field_trace(
         v.extend_from_slice(&zc.x_outer);
         v
     };
-    let claims = [
+    let mut claims = vec![
         QuirkyDirectClaimTrace {
             z_skip: ab.z_skip.clone(),
             k_skip: r1cs.k_skip,
@@ -1527,6 +1626,7 @@ pub fn verify_field_trace(
             value: c.value.clone(),
         },
     ];
+    claims.extend(io_claims);
     verify_opening_batch_quirky_direct_trace(
         b,
         ch,
@@ -2236,6 +2336,141 @@ mod tests {
         assert!(
             survivors.is_empty(),
             "[R] mutation survivors: {survivors:?}"
+        );
+    }
+
+    /// Public-IO lockstep gate: the extended verifier replay (envelope
+    /// binding + appended opening claims) accepts an honest
+    /// `prove_field_with_public_io` proof in transcript lockstep, and
+    /// flipping ANY envelope-lane wire or proof wire leaves the trace
+    /// unsatisfiable.
+    #[test]
+    fn verify_field_replay_with_public_io_lockstep_and_mutations() {
+        use noid_ivc_core::field_r1cs::SparseFieldMatrix;
+        use noid_ivc_core::public_io::{IoClaimSpec, PublicIoSpec, WitnessSlice};
+        use noid_ivc_prover::field_prover::prove_field_with_public_io;
+        use rayon::prelude::*;
+
+        // A verified instance whose non-constant rows are free
+        // (`z_i = z_i · z_0`), so the io lanes and the claim target can be
+        // placed anywhere.
+        let (m, k_log) = (7usize, 7usize);
+        let k = 1usize << k_log;
+        let inner = FieldR1cs {
+            m,
+            k_log,
+            k_skip: K_SKIP,
+            useful_rows: k,
+            a_0: SparseFieldMatrix {
+                num_rows: k,
+                num_cols: k,
+                rows: (0..k)
+                    .map(|r| vec![(if r == 0 { 0 } else { r as u32 }, F128::ONE)])
+                    .collect(),
+            },
+            b_0: SparseFieldMatrix {
+                num_rows: k,
+                num_cols: k,
+                rows: (0..k).map(|_| vec![(0u32, F128::ONE)]).collect(),
+            },
+            const_pin: Some(0),
+            digest_cache: std::sync::OnceLock::new(),
+            csc_cache: std::sync::OnceLock::new(),
+        };
+        let mut rng = Rng(0x10CA11);
+        let mut z: Vec<F128> = (0..1usize << m).map(|_| rng.next_f128()).collect();
+        for blk in 0..(1usize << (m - k_log)) {
+            z[blk * k] = F128::ONE;
+        }
+
+        let spec = PublicIoSpec {
+            io_slice: WitnessSlice {
+                log2_len: 3,
+                index: 2,
+            },
+            io_len: 4,
+            claims: vec![IoClaimSpec {
+                slice: WitnessSlice {
+                    log2_len: 2,
+                    index: 9,
+                },
+                point: 0..2,
+                value: 2,
+            }],
+        };
+        let p = [rng.next_f128(), rng.next_f128()];
+        let eq = noid_ivc_core::lincheck::build_eq_table(&p);
+        let mut v = F128::ZERO;
+        for (t, e) in eq.iter().enumerate() {
+            v += z[36 + t] * *e;
+        }
+        let io = vec![p[0], p[1], v, rng.next_f128()];
+        for (t, lane) in io.iter().enumerate() {
+            z[16 + t] = *lane;
+        }
+        for t in io.len()..8 {
+            z[16 + t] = F128::ZERO;
+        }
+        assert!(inner.satisfies(&z));
+
+        let params = PcsParams {
+            m: m + LOG_PACKING,
+            log_inv_rate: 2,
+            log_batch_size: 2,
+            profile: Default::default(),
+        };
+        let mut ch_p = FsLaneChallenger::new(b"self-verify-io-test");
+        let (proof, commitment, _) =
+            prove_field_with_public_io(&inner, &z, &params, &spec, &io, &mut ch_p);
+
+        // Native lockstep reference.
+        let mut ch_native = FsLaneChallenger::new(b"self-verify-io-test");
+        noid_ivc_core::verifier::verify_field_with_public_io(
+            &inner,
+            &commitment,
+            &proof,
+            &spec,
+            &io,
+            &mut ch_native,
+        )
+        .expect("native verify accepts the honest public-io proof");
+
+        // Trace replay.
+        let mut b = FieldR1csBuilder::new();
+        let mut ch = FsChannelTrace::new(&mut b, b"self-verify-io-test");
+        let mutation_start = b.num_wires();
+        let root = alloc_flat_digest(&mut b, &commitment.root);
+        let io_wires: Vec<LinExpr> = io
+            .iter()
+            .map(|&lane| LinExpr::from_wire(b.alloc_f128(lane)))
+            .collect();
+        let proof_e = FieldR1csProofTrace::alloc(&mut b, &proof, &inner, &params);
+        let mutation_end = b.num_wires();
+        let _ = verify_field_trace_with_public_io(
+            &mut b, &mut ch, &inner, &params, &root, &proof_e, &spec, &io_wires,
+        );
+        let c_n = ch_native.sample_f128();
+        let c_t = ch.sample_f128(&mut b);
+        assert_eq!(
+            c_t.eval(b.values()),
+            c_n,
+            "post-verify challenge diverged (public-io)"
+        );
+
+        let (out_r1cs, out_z) = b.build();
+        assert!(out_r1cs.satisfies(&out_z), "honest public-io trace unsat");
+
+        let survivors: Vec<usize> = (mutation_start..mutation_end)
+            .into_par_iter()
+            .filter(|&target| {
+                let mut bad = out_z.clone();
+                bad[target] += F128::ONE;
+                out_r1cs.satisfies(&bad)
+            })
+            .collect();
+        assert!(
+            survivors.is_empty(),
+            "public-io mutation survivors: {survivors:?}"
         );
     }
 
