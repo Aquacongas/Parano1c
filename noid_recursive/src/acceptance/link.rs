@@ -56,7 +56,27 @@ use super::trace::self_verify::{
     alloc_flat_digest, flat_digest_lanes, lagrange_weights_window_trace,
     verify_field_trace_deferred, FieldR1csProofTrace, FlatDigestExpr,
 };
-use super::trace::{mul, pin_eq};
+use super::trace::accepted_claim_batch::digest_lanes;
+use super::trace::{flat_of, mul, pin_eq};
+use super::block_slots::{build_block_slots_with_config, BlockSlots, BlockSlotsConfig};
+use crate::accumulator::ChainAccumulator;
+use crate::block_certificate_backend::{
+    AcceptedBlockBatchComponentInputs, AcceptedBlockBatchComponentProof,
+};
+use noid_core::Block128;
+
+/// The block chain accumulator as flat IO lanes, in the layout's order.
+fn block_acc_lanes(acc: &ChainAccumulator) -> [F128; 5] {
+    let sr = digest_lanes(&acc.state_root);
+    let ch = digest_lanes(&acc.chain_hash);
+    [
+        flat_of(Block128::from(acc.height)),
+        flat_of(sr[0]),
+        flat_of(sr[1]),
+        flat_of(ch[0]),
+        flat_of(ch[1]),
+    ]
+}
 
 /// The genesis dummy instance: the link class's SHAPE with all real
 /// constraints inside the single top-left `2^k_skip × 2^k_skip` block
@@ -115,30 +135,59 @@ pub fn genesis_witness(shape: &FieldShape) -> Vec<F128> {
 }
 
 /// IO lane offsets within the class IO vector.
+///
+/// The recursion lanes (`w_d`, `g`, the matrix-claim accumulator) are
+/// always present. A BLOCK-BEARING class appends the block chain
+/// accumulator `acc_h` (height, state_root, chain_hash) so the decider can
+/// anchor the tip against local headers and successive links can chain
+/// `start == prev.end`.
 #[derive(Clone, Copy, Debug)]
 pub struct LinkIoLayout {
     pub w_d: usize,
     pub g: usize,
     pub acc_point: usize,
     pub acc_value: usize,
+    pub block_bearing: bool,
+    /// Block chain accumulator lanes (only meaningful when block_bearing).
+    pub block_height: usize,
+    pub block_state_root: usize,
+    pub block_chain_hash: usize,
     pub len: usize,
 }
 
 pub fn link_io_layout(k_log: usize) -> LinkIoLayout {
+    link_io_layout_for(k_log, false)
+}
+
+pub fn link_io_layout_for(k_log: usize, block_bearing: bool) -> LinkIoLayout {
     let acc_len = 2 * k_log + 1;
+    let recursion_len = 4 + acc_len;
+    let block_height = recursion_len;
     LinkIoLayout {
         w_d: 0,
         g: 2,
         acc_point: 3,
         acc_value: 3 + acc_len,
-        len: 4 + acc_len,
+        block_bearing,
+        block_height,
+        block_state_root: block_height + 1,
+        block_chain_hash: block_height + 3,
+        len: if block_bearing {
+            recursion_len + 5
+        } else {
+            recursion_len
+        },
     }
 }
 
 /// The class IO spec: one dyadic slice right after the padding head,
 /// no derived claims (the chain pins read lanes as wires directly).
 pub fn link_io_spec(k_log: usize) -> PublicIoSpec {
-    let layout = link_io_layout(k_log);
+    link_io_spec_for(k_log, false)
+}
+
+pub fn link_io_spec_for(k_log: usize, block_bearing: bool) -> PublicIoSpec {
+    let layout = link_io_layout_for(k_log, block_bearing);
     let log2_len = layout.len.next_power_of_two().trailing_zeros() as usize;
     PublicIoSpec {
         io_slice: WitnessSlice { log2_len, index: 1 },
@@ -154,20 +203,68 @@ pub struct LinkClass {
     pub spec: PublicIoSpec,
     pub genesis: FieldR1cs,
     pub genesis_digest: [u8; 32],
+    /// True when links in this class carry an accepted block ([B] slots +
+    /// the block chain accumulator IO lanes).
+    pub block_bearing: bool,
+    /// The block accumulator a genesis link starts from (canonical for a
+    /// block-bearing class; unused otherwise).
+    pub genesis_block_accumulator: ChainAccumulator,
 }
 
 impl LinkClass {
     pub fn new(shape: FieldShape, pcs_params: PcsParams) -> Self {
+        let zero_acc = ChainAccumulator {
+            height: 0,
+            state_root: [0u8; 32],
+            chain_hash: [0u8; 32],
+        };
+        Self::new_configured(shape, pcs_params, false, zero_acc)
+    }
+
+    /// A block-bearing class: links carry [B] block slots and chain the
+    /// block accumulator, with `genesis_block_accumulator` as the height-0
+    /// start the genesis link pins.
+    pub fn new_block_bearing(
+        shape: FieldShape,
+        pcs_params: PcsParams,
+        genesis_block_accumulator: ChainAccumulator,
+    ) -> Self {
+        Self::new_configured(shape, pcs_params, true, genesis_block_accumulator)
+    }
+
+    fn new_configured(
+        shape: FieldShape,
+        pcs_params: PcsParams,
+        block_bearing: bool,
+        genesis_block_accumulator: ChainAccumulator,
+    ) -> Self {
         let genesis = genesis_instance(&shape);
         let genesis_digest = genesis.statement_digest();
         Self {
             shape,
             pcs_params,
-            spec: link_io_spec(shape.k_log),
+            spec: link_io_spec_for(shape.k_log, block_bearing),
             genesis,
             genesis_digest,
+            block_bearing,
+            genesis_block_accumulator,
         }
     }
+
+    fn layout(&self) -> LinkIoLayout {
+        link_io_layout_for(self.shape.k_log, self.block_bearing)
+    }
+}
+
+/// The block content a block-bearing link verifies: the single-block
+/// component objects plus the block's accumulator boundary. The [R] leg
+/// is unchanged; this is the [B] leg.
+pub struct LinkBlock<'a> {
+    pub start_accumulator: &'a ChainAccumulator,
+    pub end_accumulator: &'a ChainAccumulator,
+    pub inputs: &'a AcceptedBlockBatchComponentInputs,
+    pub proof: &'a AcceptedBlockBatchComponentProof,
+    pub config: BlockSlotsConfig,
 }
 
 /// Everything a link exposes to its successor.
@@ -188,6 +285,9 @@ pub struct LinkInput<'a> {
     /// native fold prover (T for the genesis link, the class matrix for
     /// regular links). Never enters the trace.
     pub fold_matrix: &'a FieldR1cs,
+    /// The accepted block this link verifies (required for a block-bearing
+    /// class, `None` for a pure-recursion stub class).
+    pub block: Option<LinkBlock<'a>>,
 }
 
 fn alloc_expr(b: &mut FieldR1csBuilder, v: F128) -> LinExpr {
@@ -244,9 +344,14 @@ pub struct BuiltLink {
 /// the accumulator-fold twin pinned back to the IO cells.
 pub fn build_link(class: &LinkClass, input: &LinkInput<'_>) -> BuiltLink {
     let k_log = class.shape.k_log;
-    let layout = link_io_layout(k_log);
+    let layout = class.layout();
     assert_eq!(class.spec.io_len, layout.len);
     assert_eq!(input.prev.io.len(), layout.len, "previous envelope IO");
+    assert_eq!(
+        input.block.is_some(),
+        class.block_bearing,
+        "block presence must match the class"
+    );
 
     // ---- Native pass: deferred verify of the previous proof, then the
     // accumulator fold. Every IO value is known before the trace starts.
@@ -285,6 +390,14 @@ pub fn build_link(class: &LinkClass, input: &LinkInput<'_>) -> BuiltLink {
     io[layout.g] = if g_own { F128::ONE } else { F128::ZERO };
     io[layout.acc_point..layout.acc_value].copy_from_slice(&acc_out.point);
     io[layout.acc_value] = acc_out.value;
+    if let Some(block) = &input.block {
+        let lanes = block_acc_lanes(block.end_accumulator);
+        io[layout.block_height] = lanes[0];
+        io[layout.block_state_root] = lanes[1];
+        io[layout.block_state_root + 1] = lanes[2];
+        io[layout.block_chain_hash] = lanes[3];
+        io[layout.block_chain_hash + 1] = lanes[4];
+    }
 
     // ---- Trace pass.
     let mut b = FieldR1csBuilder::new();
@@ -386,6 +499,64 @@ pub fn build_link(class: &LinkClass, input: &LinkInput<'_>) -> BuiltLink {
     }
     pin_eq(&mut b, &acc_e.value, &io_cells[layout.acc_value]);
 
+    // ---- Block [B] slots (block-bearing class only).
+    if let Some(block) = &input.block {
+        let slots: BlockSlots = build_block_slots_with_config(
+            &mut b,
+            block.start_accumulator,
+            block.end_accumulator,
+            block.inputs,
+            block.proof,
+            block.config,
+        );
+        // The block's end accumulator IS this link's exposed block_acc.
+        let end_lanes = [
+            &slots.end_acc.height,
+            &slots.end_acc.state_root[0],
+            &slots.end_acc.state_root[1],
+            &slots.end_acc.chain_hash[0],
+            &slots.end_acc.chain_hash[1],
+        ];
+        let io_end = [
+            layout.block_height,
+            layout.block_state_root,
+            layout.block_state_root + 1,
+            layout.block_chain_hash,
+            layout.block_chain_hash + 1,
+        ];
+        for (w, &cell) in end_lanes.iter().zip(io_end.iter()) {
+            pin_eq(&mut b, w, &io_cells[cell]);
+        }
+        // Chain the block start accumulator:
+        //   genesis (g = 1): start == the class genesis block accumulator;
+        //   otherwise:       start == the PREVIOUS link's exposed block_acc.
+        let start_lanes = [
+            &slots.start_acc.height,
+            &slots.start_acc.state_root[0],
+            &slots.start_acc.state_root[1],
+            &slots.start_acc.chain_hash[0],
+            &slots.start_acc.chain_hash[1],
+        ];
+        let genesis_start = block_acc_lanes(&class.genesis_block_accumulator);
+        let prev_block_io = [
+            layout.block_height,
+            layout.block_state_root,
+            layout.block_state_root + 1,
+            layout.block_chain_hash,
+            layout.block_chain_hash + 1,
+        ];
+        for (i, sw) in start_lanes.iter().enumerate() {
+            // g · (start - genesis_const) = 0.
+            let to_genesis = (*sw).add(&LinExpr::constant(genesis_start[i]));
+            let g_gated = mul(&mut b, &g, &to_genesis);
+            pin_eq(&mut b, &g_gated, &LinExpr::zero());
+            // (1 + g) · (start - prev_block_acc) = 0.
+            let to_prev = (*sw).add(&prev_io_wires[prev_block_io[i]]);
+            let ng_gated = mul(&mut b, &not_g, &to_prev);
+            pin_eq(&mut b, &ng_gated, &LinExpr::zero());
+        }
+    }
+
     // ---- Pad to the class size (the fixed point: the trace of a class
     // verifier must itself fit the class shape).
     let target = 1usize << class.shape.m;
@@ -414,7 +585,7 @@ pub fn decide_tip(
     class_r1cs: &FieldR1cs,
     tip: &LinkEnvelope,
 ) -> Result<(), String> {
-    let layout = link_io_layout(class.shape.k_log);
+    let layout = class.layout();
     let mut ch = FsLaneChallenger::new(b"history-link-v0");
     noid_ivc_core::verifier::verify_field_with_public_io(
         class_r1cs,
@@ -441,4 +612,38 @@ pub fn decide_tip(
         return Err("accumulated matrix claim is false".into());
     }
     Ok(())
+}
+
+/// The tip's exposed block chain accumulator (block-bearing class only) —
+/// the value a fresh peer anchors against its locally validated headers
+/// (I8). Returns `None` for a non-block-bearing class.
+pub fn tip_block_accumulator(class: &LinkClass, tip: &LinkEnvelope) -> Option<ChainAccumulator> {
+    if !class.block_bearing {
+        return None;
+    }
+    let layout = class.layout();
+    let lane_bytes = |a: F128, b: F128| -> [u8; 32] {
+        let mut out = [0u8; 32];
+        out[..16].copy_from_slice(&flat_to_block(a).to_le_bytes());
+        out[16..].copy_from_slice(&flat_to_block(b).to_le_bytes());
+        out
+    };
+    Some(ChainAccumulator {
+        height: flat_to_block(tip.io[layout.block_height]) as u64,
+        state_root: lane_bytes(
+            tip.io[layout.block_state_root],
+            tip.io[layout.block_state_root + 1],
+        ),
+        chain_hash: lane_bytes(
+            tip.io[layout.block_chain_hash],
+            tip.io[layout.block_chain_hash + 1],
+        ),
+    })
+}
+
+/// Recover the u128 a flat IO lane encodes (the inverse of `flat_of` on an
+/// integer/digest-lane `Block128`).
+fn flat_to_block(v: F128) -> u128 {
+    use noid_core::hardware::flat_to_tower_u128;
+    flat_to_tower_u128((v.lo as u128) | ((v.hi as u128) << 64))
 }

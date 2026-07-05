@@ -75,6 +75,7 @@ fn recursion_fixed_point_two_links() {
             verified_digest: class.genesis_digest,
             genesis: true,
             fold_matrix: &class.genesis,
+            block: None,
         },
     );
     eprintln!(
@@ -116,6 +117,7 @@ fn recursion_fixed_point_two_links() {
                 verified_digest: class_digest,
                 genesis: false,
                 fold_matrix: &class_r1cs,
+                block: None,
             },
         );
         let build_t = t0.elapsed();

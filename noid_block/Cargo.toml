@@ -18,3 +18,4 @@ bincode = "1"
 
 [dev-dependencies]
 noid-ivc-core = { path = "../noid_ivc_core" }
+noid-ivc-prover = { path = "../noid_ivc_prover" }

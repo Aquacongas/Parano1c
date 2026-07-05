@@ -1957,6 +1957,238 @@ mod tests {
         units
     }
 
+    /// THE stage-2 payoff: a CLOSED recursion over REAL blocks. π₀ (genesis
+    /// link over block 0) → π₁ (verifies π₀, block 1) → π₂ (verifies π₁,
+    /// block 2), one fixed block-bearing class, decider accepts the tip, the
+    /// tip's block accumulator anchors to block 2's end (I8), and both the
+    /// chain-continuity and the recursion terminals reject tampering.
+    ///
+    /// The wallet-capsule PCS opening is OFF (the one component whose trace
+    /// structure is proof-dependent — the region-layer target); everything
+    /// else about each block is verified in-trace and chained. This closes
+    /// the recursion over real block content; flipping the config to ON once
+    /// the region-layer wallet-PCS lands makes each link a complete proof.
+    #[test]
+    fn recursion_over_real_blocks_recursion_ready() {
+        use noid_ivc_core::challenger::FsLaneChallenger;
+        use noid_ivc_core::field::F128;
+        use noid_ivc_core::field_r1cs::FieldR1cs;
+        use noid_ivc_core::pcs::{self, PcsParams};
+        use noid_ivc_core::proof::FieldShape;
+        use noid_ivc_core::zerocheck::K_SKIP;
+        use noid_ivc_prover::field_prover::prove_field_with_public_io;
+        use noid_recursive::acceptance::block_slots::BlockSlotsConfig;
+        use noid_recursive::acceptance::link::{
+            build_link, decide_tip, genesis_witness, link_io_layout_for, tip_block_accumulator,
+            LinkBlock, LinkClass, LinkEnvelope, LinkInput,
+        };
+        use std::time::Instant;
+
+        const CLASS_M: usize = 23;
+        let shape = FieldShape {
+            m: CLASS_M,
+            k_log: CLASS_M,
+            k_skip: K_SKIP,
+            const_pin: Some(0),
+        };
+        let params = PcsParams {
+            m: CLASS_M + pcs::LOG_PACKING,
+            log_inv_rate: 2,
+            log_batch_size: 5,
+            profile: Default::default(),
+        };
+        let no_pcs = BlockSlotsConfig {
+            discharge_wallet_pcs: false,
+        };
+        let layout = link_io_layout_for(shape.k_log, true);
+
+        let units = chained_std_tx_blocks(3);
+        let class = LinkClass::new_block_bearing(
+            shape,
+            params.clone(),
+            units[0].start_accumulator.clone(),
+        );
+
+        fn mk_block(u: &BlockUnit, config: BlockSlotsConfig) -> LinkBlock<'_> {
+            LinkBlock {
+                start_accumulator: &u.start_accumulator,
+                end_accumulator: &u.end_accumulator,
+                inputs: &u.inputs,
+                proof: &u.proof,
+                config,
+            }
+        }
+
+        // Genesis dummy T + its proof (class-shaped, exists without the class).
+        let t_witness = genesis_witness(&shape);
+        let t_io = vec![F128::ZERO; class.spec.io_len];
+        let mut ch = FsLaneChallenger::new(b"history-link-v0");
+        let (t_proof, t_commitment, _) = prove_field_with_public_io(
+            &class.genesis,
+            &t_witness,
+            &params,
+            &class.spec,
+            &t_io,
+            &mut ch,
+        );
+        let env_t = LinkEnvelope {
+            proof: t_proof,
+            commitment: t_commitment,
+            io: t_io,
+        };
+
+        // π₀: genesis link over block 0. Building its trace CREATES the class.
+        let t0 = Instant::now();
+        let built0 = build_link(
+            &class,
+            &LinkInput {
+                prev: &env_t,
+                verified_digest: class.genesis_digest,
+                genesis: true,
+                fold_matrix: &class.genesis,
+                block: Some(mk_block(&units[0], no_pcs)),
+            },
+        );
+        eprintln!(
+            "[recursion-blocks] pi_0 (block h=1) build: {:.1?}, {} wires -> 2^{}",
+            t0.elapsed(),
+            built0.witness.len(),
+            built0.r1cs.k_log
+        );
+        let class_r1cs: FieldR1cs = built0.r1cs;
+        let class_digest = class_r1cs.statement_digest();
+        let mut ch = FsLaneChallenger::new(b"history-link-v0");
+        let (p0, c0, _) = prove_field_with_public_io(
+            &class_r1cs,
+            &built0.witness,
+            &params,
+            &class.spec,
+            &built0.io,
+            &mut ch,
+        );
+        let mut prev = LinkEnvelope {
+            proof: p0,
+            commitment: c0,
+            io: built0.io,
+        };
+
+        // π₁, π₂ over blocks 1, 2 — the SAME class must come out every time.
+        let mut last_battery: Option<(FieldR1cs, Vec<F128>)> = None;
+        for step in 1..=2usize {
+            let t0 = Instant::now();
+            let built = build_link(
+                &class,
+                &LinkInput {
+                    prev: &prev,
+                    verified_digest: class_digest,
+                    genesis: false,
+                    fold_matrix: &class_r1cs,
+                    block: Some(mk_block(&units[step], no_pcs)),
+                },
+            );
+            assert_eq!(
+                built.r1cs.a_0.rows, class_r1cs.a_0.rows,
+                "link {step}: class A matrix drifted"
+            );
+            assert_eq!(
+                built.r1cs.b_0.rows, class_r1cs.b_0.rows,
+                "link {step}: class B matrix drifted"
+            );
+            let mut ch = FsLaneChallenger::new(b"history-link-v0");
+            let (proof, commitment, _) = prove_field_with_public_io(
+                &class_r1cs,
+                &built.witness,
+                &params,
+                &class.spec,
+                &built.io,
+                &mut ch,
+            );
+            eprintln!(
+                "[recursion-blocks] pi_{step} (block h={}) build+prove: {:.1?}",
+                step + 1,
+                t0.elapsed()
+            );
+            if step == 1 {
+                last_battery = Some((class_r1cs.clone(), built.witness.clone()));
+            }
+            prev = LinkEnvelope {
+                proof,
+                commitment,
+                io: built.io,
+            };
+        }
+
+        // Decider accepts the tip and the block accumulator anchors to block 2.
+        decide_tip(&class, &class_r1cs, &prev).expect("decider accepts the block-chain tip");
+        let tip_acc = tip_block_accumulator(&class, &prev).expect("block-bearing class");
+        assert_eq!(
+            tip_acc, units[2].end_accumulator,
+            "tip block accumulator must anchor to block 2's end (I8)"
+        );
+        eprintln!(
+            "[recursion-blocks] RECURSION CLOSED over real blocks: pi_2(h=3) -> pi_1(h=2) -> pi_0(h=1); \
+             tip acc height {}",
+            tip_acc.height
+        );
+
+        // I5 flip battery over π₁'s full witness — 0 survivors beyond the
+        // pin-helper class (the block slots + chain pins + [R] together).
+        let (r1cs_b, z_b) = last_battery.expect("captured pi_1");
+        let mut battery = r1cs_b.flip_battery(&z_b);
+        let survivors = battery.survivors_excluding_pin_helpers(0..z_b.len());
+        assert!(
+            survivors.is_empty(),
+            "pi_1 flip-battery survivors: {} (first {:?})",
+            survivors.len(),
+            &survivors[..survivors.len().min(8)]
+        );
+        eprintln!("[recursion-blocks] I5 flip battery over pi_1: 0 survivors");
+
+        // Negatives at the decider.
+        // (a) tampered exposed block accumulator (I8 anchor lane).
+        {
+            let mut bad = LinkEnvelope {
+                proof: prev.proof.clone(),
+                commitment: prev.commitment.clone(),
+                io: prev.io.clone(),
+            };
+            bad.io[layout.block_state_root] += F128::ONE;
+            assert!(
+                decide_tip(&class, &class_r1cs, &bad).is_err(),
+                "tampered block accumulator accepted"
+            );
+        }
+        // (b) a genesis link is not a valid tip.
+        {
+            let mut bad_io = prev.io.clone();
+            bad_io[layout.g] = F128::ONE;
+            let bad = LinkEnvelope {
+                proof: prev.proof.clone(),
+                commitment: prev.commitment.clone(),
+                io: bad_io,
+            };
+            assert!(
+                decide_tip(&class, &class_r1cs, &bad).is_err(),
+                "genesis tip accepted"
+            );
+        }
+        // (c) tampered proof bytes.
+        {
+            let mut bad = LinkEnvelope {
+                proof: prev.proof.clone(),
+                commitment: prev.commitment.clone(),
+                io: prev.io.clone(),
+            };
+            if let Some(w) = bad.proof.lincheck.rounds.first_mut() {
+                w.0 += F128::ONE;
+            }
+            assert!(
+                decide_tip(&class, &class_r1cs, &bad).is_err(),
+                "tampered tip proof accepted"
+            );
+        }
+    }
+
     /// The block-bearing recursion class needs two DIFFERENT real blocks of
     /// the same tier to assemble to the SAME FieldR1cs matrix (I1). This
     /// test establishes the exact shape-fixity boundary: with the
