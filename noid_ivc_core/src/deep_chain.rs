@@ -36,6 +36,7 @@
 //! (the linear coefficient is reconstructed from the running claim, so
 //! `p(0) + p(1) = claim` holds by construction).
 
+pub mod encode_kernel;
 pub mod family;
 pub mod relations;
 pub mod schedule;
