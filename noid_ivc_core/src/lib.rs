@@ -27,6 +27,7 @@ pub mod field;
 pub mod field_circuit;
 pub mod field_r1cs;
 pub mod lincheck;
+pub mod matrix_claim;
 pub mod merkle;
 pub mod ntt;
 pub mod pcs;

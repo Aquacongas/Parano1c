@@ -57,10 +57,42 @@ pub fn bind_statement_field<Ch: Challenger>(
     r1cs: &crate::field_r1cs::FieldR1cs,
     commitment: &Commitment,
 ) {
+    bind_statement_field_parts(challenger, &r1cs.statement_digest(), commitment);
+}
+
+/// [`bind_statement_field`] with the instance digest supplied directly —
+/// the entry the self-verification chain uses, where the digest of the
+/// verified instance is data (an IO lane), not a baked constant.
+pub fn bind_statement_field_parts<Ch: Challenger>(
+    challenger: &mut Ch,
+    statement_digest: &[u8; 32],
+    commitment: &Commitment,
+) {
     challenger.observe_label(b"history-field-r1cs");
-    challenger.observe_bytes(&r1cs.statement_digest());
+    challenger.observe_bytes(statement_digest);
     challenger.observe_bytes(&pcs_params_statement_bytes(&commitment.params));
     challenger.observe_bytes(&commitment.root);
+}
+
+/// The structural parameters of a FieldR1cs class — everything a
+/// matrix-free verifier needs besides the statement digest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FieldShape {
+    pub m: usize,
+    pub k_log: usize,
+    pub k_skip: usize,
+    pub const_pin: Option<usize>,
+}
+
+impl FieldShape {
+    pub fn of(r1cs: &crate::field_r1cs::FieldR1cs) -> Self {
+        Self {
+            m: r1cs.m,
+            k_log: r1cs.k_log,
+            k_skip: r1cs.k_skip,
+            const_pin: r1cs.const_pin,
+        }
+    }
 }
 
 /// A claim of the form `ẑ(point) = value` for the witness `z`.

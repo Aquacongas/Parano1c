@@ -349,6 +349,108 @@ pub fn verify_field_with_public_io<Ch: Challenger>(
         .install(move || verify_field_inner(r1cs, commitment, proof, Some((spec, io)), challenger))
 }
 
+/// Matrix-free verification for the self-verification chain: transcript-
+/// identical to [`verify_field_with_public_io`], but the lincheck final
+/// consistency is DEFERRED — the function returns the bilinear claim the
+/// instance matrices must satisfy (see [`crate::matrix_claim`]) instead of
+/// checking it against them. The statement enters through its digest and
+/// shape parameters only, so a trace twin of this function can verify
+/// proofs of its own class. The caller MUST fold + eventually discharge
+/// the returned claim; acceptance here alone binds the proof to SOME
+/// matrices, not to the instance's.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_field_deferred_matrix<Ch: Challenger>(
+    shape: &crate::proof::FieldShape,
+    statement_digest: &[u8; 32],
+    commitment: &Commitment,
+    proof: &crate::proof::FieldR1csProof,
+    spec: &crate::public_io::PublicIoSpec,
+    io: &[crate::field::F128],
+    challenger: &mut Ch,
+) -> Result<(R1csClaim, crate::matrix_claim::FreshLincheckClaim), VerifyError> {
+    verifier_pool().install(move || {
+        if commitment.params.m != shape.m + pcs::LOG_PACKING
+            || commitment.params.log_batch_size + pcs::LOG_PACKING > commitment.params.m
+        {
+            return Err(VerifyError::ParamsMismatch);
+        }
+
+        crate::proof::bind_statement_field_parts(challenger, statement_digest, commitment);
+        let io_claims = crate::public_io::bind_public_io(challenger, spec, io, shape.m);
+
+        let zc_claim = zerocheck::field::verify(shape.m, &proof.zerocheck, challenger)
+            .map_err(VerifyError::Zerocheck)?;
+
+        let inner_rest_len = shape.k_log - shape.k_skip;
+        let x_ab = QuirkyPoint {
+            z_skip: zc_claim.z,
+            x_inner_rest: zc_claim.mlv_challenges[..inner_rest_len].to_vec(),
+            x_outer: zc_claim.mlv_challenges[inner_rest_len..].to_vec(),
+        };
+        let (lc_claim, fresh) = lincheck::verify_deferred(
+            shape.m,
+            shape.k_log,
+            shape.k_skip,
+            shape.const_pin,
+            &x_ab,
+            zc_claim.a_eval,
+            zc_claim.b_eval,
+            &proof.lincheck,
+            challenger,
+        )
+        .map_err(VerifyError::Lincheck)?;
+
+        let ab = ZClaim {
+            point: QuirkyPoint {
+                z_skip: lc_claim.r_inner_skip,
+                x_inner_rest: lc_claim.r_inner_rest.clone(),
+                x_outer: x_ab.x_outer.clone(),
+            },
+            value: lc_claim.w,
+        };
+        let c = ZClaim {
+            point: QuirkyPoint {
+                z_skip: zc_claim.z,
+                x_inner_rest: zc_claim.r_rest[..inner_rest_len].to_vec(),
+                x_outer: zc_claim.r_rest[inner_rest_len..].to_vec(),
+            },
+            value: zc_claim.c_eval,
+        };
+
+        let x_rest_of = |zc: &ZClaim| -> Vec<F128> {
+            let mut v = zc.point.x_inner_rest.clone();
+            v.extend_from_slice(&zc.point.x_outer);
+            v
+        };
+        let ab_rest = x_rest_of(&ab);
+        let c_rest = x_rest_of(&c);
+        let mut refs = vec![
+            pcs::QuirkyDirectClaimRef {
+                z_skip: ab.point.z_skip,
+                k_skip: shape.k_skip,
+                x_rest: &ab_rest,
+                value: ab.value,
+            },
+            pcs::QuirkyDirectClaimRef {
+                z_skip: c.point.z_skip,
+                k_skip: shape.k_skip,
+                x_rest: &c_rest,
+                value: c.value,
+            },
+        ];
+        refs.extend(io_claims.iter().map(|cl| pcs::QuirkyDirectClaimRef {
+            z_skip: cl.z_skip,
+            k_skip: cl.k_skip,
+            x_rest: &cl.x_rest,
+            value: cl.value,
+        }));
+        pcs::verify_opening_batch_quirky_direct(commitment, &refs, &proof.pcs_open, challenger)
+            .map_err(VerifyError::PcsAb)?;
+
+        Ok((R1csClaim { ab, c }, fresh))
+    })
+}
+
 fn verify_field_inner<Ch: Challenger>(
     r1cs: &crate::field_r1cs::FieldR1cs,
     commitment: &Commitment,

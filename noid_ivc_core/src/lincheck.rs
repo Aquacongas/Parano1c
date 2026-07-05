@@ -1919,6 +1919,127 @@ pub fn verify<Ch: Challenger>(
     })
 }
 
+/// Matrix-free lincheck verification for the self-verification chain:
+/// identical transcript to [`verify`] (same absorbs, same samples, same
+/// shape checks), but instead of building `comb_vec` from the circuit and
+/// checking the final consistency against the matrices, it DERIVES the
+/// deferred bilinear claim the matrices would have to satisfy:
+///
+/// ```text
+///   fresh.value = running_after_rounds
+///               + β·z_partial[pin mod 2^k_skip]·eq(r_inner_rest)[pin div 2^k_skip]
+/// ```
+///
+/// (the β pin term is matrix-independent and peeled off here, so
+/// `fresh.value` is exactly `Σ (α·A + B)[r,c]·u[r]·v[c]` — see
+/// [`crate::matrix_claim`], which folds it into the chain accumulator).
+/// The caller MUST discharge the returned claim; a proof accepted by this
+/// function alone is only bound to SOME matrices, not the instance's.
+pub fn verify_deferred<Ch: Challenger>(
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    const_pin: Option<usize>,
+    x_ab: &QuirkyPoint,
+    v_a: F128,
+    v_b: F128,
+    proof: &LincheckProof,
+    challenger: &mut Ch,
+) -> Result<(LincheckClaim, crate::matrix_claim::FreshLincheckClaim), VerifyError> {
+    let n_log = m - k_log;
+    if k_skip > k_log {
+        return Err(VerifyError::KSkipExceedsKLog { k_skip, k_log });
+    }
+    let inner_rest_len = k_log - k_skip;
+    let n_skip = 1usize << k_skip;
+    if x_ab.x_inner_rest.len() != inner_rest_len {
+        return Err(VerifyError::BadInnerRestLength {
+            which: "x_ab",
+            expected: inner_rest_len,
+            got: x_ab.x_inner_rest.len(),
+        });
+    }
+    if x_ab.x_outer.len() != n_log {
+        return Err(VerifyError::BadOuterLength {
+            which: "x_ab",
+            expected: n_log,
+            got: x_ab.x_outer.len(),
+        });
+    }
+    if proof.rounds.len() != inner_rest_len {
+        return Err(VerifyError::BadVectorLength {
+            which: "rounds",
+            expected: inner_rest_len,
+            got: proof.rounds.len(),
+        });
+    }
+    if proof.z_partial.len() != n_skip {
+        return Err(VerifyError::BadVectorLength {
+            which: "z_partial",
+            expected: n_skip,
+            got: proof.z_partial.len(),
+        });
+    }
+
+    challenger.observe_label(b"history-lincheck-v0");
+
+    // Mirrors verify(): α, then β if the instance pins a constant wire.
+    let alpha = challenger.sample_f128();
+    let mut target = alpha * v_a + v_b;
+    let mut beta = None;
+    if const_pin.is_some() {
+        let b = challenger.sample_f128();
+        target += b;
+        beta = Some(b);
+    }
+
+    let mut running = target;
+    let mut r_rounds = Vec::with_capacity(inner_rest_len);
+    for &(e1, einf) in &proof.rounds {
+        challenger.observe_f128(e1);
+        challenger.observe_f128(einf);
+        let r = challenger.sample_f128();
+        let e0 = running + e1;
+        let c1 = e0 + e1 + einf;
+        running = einf * r * r + c1 * r + e0;
+        r_rounds.push(r);
+    }
+
+    challenger.observe_f128_slice(&proof.z_partial);
+
+    let mut r_inner_rest = r_rounds;
+    r_inner_rest.reverse();
+
+    // Peel the matrix-independent β pin term off the running claim.
+    let mut fresh_value = running;
+    if let (Some(beta), Some(col)) = (beta, const_pin) {
+        let q_tensor = build_eq_table(&r_inner_rest);
+        let mask = n_skip - 1;
+        fresh_value += beta * proof.z_partial[col & mask] * q_tensor[col >> k_skip];
+    }
+    let fresh = crate::matrix_claim::FreshLincheckClaim {
+        alpha,
+        z_skip: x_ab.z_skip,
+        x_inner_rest: x_ab.x_inner_rest.clone(),
+        r_inner_rest: r_inner_rest.clone(),
+        z_partial: proof.z_partial.clone(),
+        value: fresh_value,
+    };
+
+    let r_inner_skip = challenger.sample_f128();
+    let lambda = lagrange_weights_naive(k_skip, r_inner_skip);
+    let w = inner_product(&lambda, &proof.z_partial);
+
+    Ok((
+        LincheckClaim {
+            r_inner_skip,
+            r_inner_rest,
+            w,
+        },
+        fresh,
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
