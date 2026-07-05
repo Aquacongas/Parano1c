@@ -696,31 +696,52 @@ pub fn build_checkpoint_poseidon_slot(
     chain_inputs: &ChainAccumulatorBatchInputs,
     padded_blocks: usize,
 ) -> (Vec<HeaderHashInputsTrace>, ChainAccumulatorBatchInputsTrace) {
-    assert_eq!(proof.n_blocks, header_inputs.len());
-    assert_eq!(header_inputs.len(), chain_inputs.items.len());
-
     let header_inputs_t: Vec<HeaderHashInputsTrace> = header_inputs
         .iter()
         .map(|i| HeaderHashInputsTrace::alloc(b, i))
         .collect();
     let chain_inputs_t = ChainAccumulatorBatchInputsTrace::alloc(b, chain_inputs);
+    build_checkpoint_poseidon_slot_with_inputs(
+        b,
+        proof,
+        &header_inputs_t,
+        &chain_inputs_t,
+        padded_blocks,
+    );
+    (header_inputs_t, chain_inputs_t)
+}
+
+/// The killshot replays over CALLER-OWNED statement wires — the block
+/// assembly shares one header-statement allocation between this slot, the
+/// claim-hash pins and the accumulator fold, and builds the chain items
+/// from those same wires (the trace image of
+/// `chain_accumulator_proof_inputs` deriving both from one witness).
+pub fn build_checkpoint_poseidon_slot_with_inputs(
+    b: &mut FieldR1csBuilder,
+    proof: &crate::checkpoint::CheckpointPoseidonProof,
+    header_inputs_t: &[HeaderHashInputsTrace],
+    chain_inputs_t: &ChainAccumulatorBatchInputsTrace,
+    padded_blocks: usize,
+) {
+    assert_eq!(proof.n_blocks, header_inputs_t.len());
+    assert_eq!(header_inputs_t.len(), chain_inputs_t.items.len());
 
     let header_proof_t =
-        HeaderHashProofTrace::alloc(b, &proof.header_hash, header_inputs.len(), padded_blocks);
+        HeaderHashProofTrace::alloc(b, &proof.header_hash, header_inputs_t.len(), padded_blocks);
     let mut ch_header = RawChannelTrace::new();
     let header_reds = verify_header_hash_killshot_padded_trace(
         b,
         &mut ch_header,
         &header_proof_t,
-        &header_inputs_t,
+        header_inputs_t,
         padded_blocks,
     );
-    discharge_header_hash_padded_trace(b, &header_inputs_t, &header_reds, padded_blocks);
+    discharge_header_hash_padded_trace(b, header_inputs_t, &header_reds, padded_blocks);
 
     let chain_proof_t = ChainAccumulatorProofTrace::alloc(
         b,
         &proof.chain_accumulator,
-        chain_inputs.items.len(),
+        chain_inputs_t.items.len(),
         padded_blocks,
     );
     let mut ch_chain = RawChannelTrace::new();
@@ -728,12 +749,10 @@ pub fn build_checkpoint_poseidon_slot(
         b,
         &mut ch_chain,
         &chain_proof_t,
-        &chain_inputs_t,
+        chain_inputs_t,
         padded_blocks,
     );
-    discharge_chain_accumulator_padded_trace(b, &chain_inputs_t, &chain_reds, padded_blocks);
-
-    (header_inputs_t, chain_inputs_t)
+    discharge_chain_accumulator_padded_trace(b, chain_inputs_t, &chain_reds, padded_blocks);
 }
 
 // ---------------------------------------------------------------------------

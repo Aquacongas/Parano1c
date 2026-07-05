@@ -405,6 +405,32 @@ impl<'a> FlipBattery<'a> {
     pub fn survivors(&mut self, range: std::ops::Range<usize>) -> Vec<usize> {
         range.filter(|&w| self.survives_flip(w)).collect()
     }
+
+    /// Whether `w` is a pin-row helper: the free wire `pin_f128`
+    /// materializes so its row can constrain an expression SUM. Such a
+    /// wire appears with coefficient one in its own A row (where it
+    /// cancels against the `C = I` right-hand side in char 2), that row's
+    /// B side is the constant-one wire, and nothing else reads it —
+    /// flipping it is satisfiability-neutral BY CONSTRUCTION, so mutation
+    /// batteries exclude exactly this shape.
+    pub fn is_pin_helper(&self, w: usize) -> bool {
+        let i = w & ((1usize << self.r1cs.k_log) - 1);
+        self.cols_b[i].is_empty()
+            && self.cols_a[i].len() == 1
+            && self.cols_a[i][0] == (i as u32, F128::ONE)
+            && self.r1cs.b_0.rows[i].as_slice() == [(0u32, F128::ONE)]
+    }
+
+    /// [`Self::survivors`] minus the pin-helper class — the standard gate
+    /// for assembled traces where pin rows interleave with allocations.
+    pub fn survivors_excluding_pin_helpers(
+        &mut self,
+        range: std::ops::Range<usize>,
+    ) -> Vec<usize> {
+        range
+            .filter(|&w| !self.is_pin_helper(w) && self.survives_flip(w))
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------

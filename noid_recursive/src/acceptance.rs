@@ -28,6 +28,7 @@
 //!     (this is the [B] slot of the trace), and
 //!   * [`shape`] — measured verifier statistics that size the trace.
 
+pub mod block_slots;
 pub mod link;
 pub mod region;
 pub mod shape;
