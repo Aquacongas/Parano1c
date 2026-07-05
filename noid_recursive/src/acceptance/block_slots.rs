@@ -33,13 +33,31 @@
 //! - the exact-state composite roots pin to the claim's parent/child state
 //!   roots and `log_slots` lanes.
 //!
-//! NOT yet bound here (explicit residue, tracked in roadmap): the
-//! exact-state INTERNAL wiring (slot leaves ↔ state paths ↔ utxo/guard
-//! roots — natively guaranteed by `derive_exact_state_killshot_inputs`
-//! re-deriving inputs from the validated block) and public transaction
-//! logic — both land with the region layer's per-tx algebra. A proof
-//! assembled from these slots binds the hashing work and the statement
-//! skeleton, not yet the full transition semantics.
+//! NOT bound here (audited residue, each correctly scoped to another
+//! layer, none a hole in what this file claims):
+//! - exact-state INTERNAL wiring (slot leaves ↔ state paths ↔ utxo/guard
+//!   roots): each of the five killshots self-binds its own hash chain, but
+//!   the cross-killshot gluing (state-path root == composite utxo_root, and
+//!   likewise for guard) is a free witness pair here — natively guaranteed
+//!   by `derive_exact_state_killshot_inputs` re-deriving every input from
+//!   the one validated block. Lands with the region layer's per-tx algebra.
+//! - public transaction logic — likewise a region-layer per-tx obligation.
+//! - the parent header's `active_slot_count` / `alloc_counter` (they feed
+//!   only the claim hash and there is no accumulator wire to pin them
+//!   against): these are consensus-continuity lanes the LINK binds by
+//!   exposing the previous link's child consensus. Header PoW/ASERT/MTP
+//!   fields (timestamp, miner, nonce, target) are deliberately out of π's
+//!   scope — a fresh peer validates its own header chain.
+//! - the wallet-capsule PCS opening: replayed by `discharge_auth_pcs_
+//!   obligation` when [`BlockSlotsConfig::discharge_wallet_pcs`] is set, but
+//!   its trace STRUCTURE is proof-dependent (compact-FRI query positions /
+//!   Merkle schedule), so it is the SOLE obstacle to a fixed class matrix
+//!   across different blocks — everything else here is already class-fixed.
+//!   Its class-fixed form is a region-layer ([G]) obligation.
+//!
+//! A proof assembled from these slots binds the block's hashing work and
+//! the full statement skeleton; the transition-semantics gluing and the
+//! shape-fixed wallet-PCS are the region-layer remainder.
 
 use noid_core::Block128;
 use noid_gkr::merkle_circuit::MerkleCircuit;
@@ -58,7 +76,10 @@ use super::trace::exact_state::{build_exact_state_slot, ExactStateSlotWires};
 use super::trace::merkle_path::{build_batched_merkle_slot, MerklePathInputsTrace};
 use super::trace::owner_auth::{build_owner_auth_slot, OwnerAuthPublicInputsTrace};
 use super::trace::tx_body_spine::{build_standard_tx_body_slot, SpineInputsTrace};
-use super::trace::{alloc_block, const_block, pin_eq, pin_zero, FieldR1csBuilder, LinExpr, RawChannelTrace};
+use super::trace::{
+    alloc_block, const_block, flat_const, mul, pin_eq, pin_zero, range_check_bits, FieldR1csBuilder,
+    LinExpr, RawChannelTrace, F128,
+};
 use crate::accumulator::ChainAccumulator;
 use crate::block_certificate_backend::{
     AcceptedBlockBatchComponentInputs, AcceptedBlockBatchComponentProof,
@@ -137,6 +158,34 @@ fn pin_eq2(b: &mut FieldR1csBuilder, a: &[LinExpr; 2], c: &[LinExpr; 2]) {
     pin_eq(b, &a[1], &c[1]);
 }
 
+/// Pin `child == parent + 1` as u64 INTEGERS (not field/XOR): a
+/// ripple-carry increment over the tower-bit decomposition of `parent`.
+/// In char 2 the field ops ARE the bit ops — `bit_i XOR carry_i` is
+/// `+`, `bit_i AND carry_i` is `*` — so the incrementer is exact and the
+/// no-overflow guard pins the final carry to zero.
+fn pin_u64_successor(b: &mut FieldR1csBuilder, parent: &LinExpr, child: &LinExpr) {
+    const N: usize = 64;
+    let parent_bits = range_check_bits(b, parent, N);
+    let mut carry = LinExpr::constant(F128::ONE);
+    let mut recon = LinExpr::zero();
+    let mut terms: Vec<LinExpr> = Vec::with_capacity(N);
+    for (i, &bit) in parent_bits.iter().enumerate() {
+        let p_i = LinExpr::from_wire(bit);
+        // child_i = p_i XOR carry_i.
+        let child_i = p_i.add(&carry);
+        terms.push(child_i.scale(flat_const(1u128 << i)));
+        // carry_{i+1} = p_i AND carry_i.
+        carry = mul(b, &p_i, &carry);
+    }
+    // Assemble the reconstruction once (avoid the quadratic add loop).
+    for t in &terms {
+        recon = recon.add(t);
+    }
+    // No u64 overflow: the successor stays in range.
+    pin_zero(b, &carry);
+    pin_eq(b, child, &recon);
+}
+
 fn pin_pair_at(b: &mut FieldR1csBuilder, fields: &[LinExpr], at: usize, to: &[LinExpr; 2]) {
     pin_eq(b, &fields[at], &to[0]);
     pin_eq(b, &fields[at + 1], &to[1]);
@@ -199,6 +248,28 @@ impl BlockSlots {
     }
 }
 
+/// Assembly options.
+#[derive(Clone, Copy, Debug)]
+pub struct BlockSlotsConfig {
+    /// Replay the wallet-capsule PCS opening in-trace (the compact-FRI
+    /// `discharge_auth_pcs_obligation`). This is the ONE component whose
+    /// trace STRUCTURE is proof-dependent (query positions / Merkle
+    /// schedule), so it is the sole obstacle to a fixed class matrix
+    /// across different blocks and the region layer's replacement target.
+    /// With it off, the owner-auth GKR statement is still replayed but its
+    /// reduced PCS claim is left undischarged — for shape experiments and
+    /// the region-layer transition, never for a complete proof.
+    pub discharge_wallet_pcs: bool,
+}
+
+impl Default for BlockSlotsConfig {
+    fn default() -> Self {
+        Self {
+            discharge_wallet_pcs: true,
+        }
+    }
+}
+
 /// Assemble the single-block component replay. `inputs`/`proof` are the
 /// native component objects; `start/end_accumulator` the block's
 /// accumulator boundary. The current class shape is a pure-standard tier
@@ -209,6 +280,25 @@ pub fn build_block_slots(
     end_accumulator: &ChainAccumulator,
     inputs: &AcceptedBlockBatchComponentInputs,
     proof: &AcceptedBlockBatchComponentProof,
+) -> BlockSlots {
+    build_block_slots_with_config(
+        b,
+        start_accumulator,
+        end_accumulator,
+        inputs,
+        proof,
+        BlockSlotsConfig::default(),
+    )
+}
+
+/// [`build_block_slots`] with explicit assembly options.
+pub fn build_block_slots_with_config(
+    b: &mut FieldR1csBuilder,
+    start_accumulator: &ChainAccumulator,
+    end_accumulator: &ChainAccumulator,
+    inputs: &AcceptedBlockBatchComponentInputs,
+    proof: &AcceptedBlockBatchComponentProof,
+    config: BlockSlotsConfig,
 ) -> BlockSlots {
     // validate_component_shape + the single-block batch shape, as asserts.
     let witness = &inputs.accepted_claim_witness;
@@ -298,12 +388,11 @@ pub fn build_block_slots(
         );
     }
     pin_eq(b, &claim.fields[parent + hc::HEIGHT], &start_acc.height);
-    // First block height = start height + 1 (char 2: a + b + 1 = 0).
-    let one = const_block(Block128::from(1u128));
-    pin_zero(
-        b,
-        &header.fields[hf::HEIGHT].add(&start_acc.height).add(&one),
-    );
+    // First block height = start height + 1 (INTEGER successor). Field
+    // addition is XOR, so a naive `child + parent + 1 = 0` would only be
+    // the integer increment when the parent height is even; this is a
+    // proper ripple-carry increment over the tower-bit decompositions.
+    pin_u64_successor(b, &start_acc.height, &header.fields[hf::HEIGHT]);
 
     // ---- tx_body standard spine component.
     let (spine_inputs, tx_hashes) = if inputs.tx_body_standard_inputs.is_empty() {
@@ -384,7 +473,9 @@ pub fn build_block_slots(
         // Native `verify_authorization_statement_proof` statement check.
         assert_eq!(input.tx_body_hash, input.public.tx_body_hash);
         let (inputs_t, obligation) = build_owner_auth_slot(b, witness_proof, &input.public);
-        discharge_auth_pcs_obligation(b, &obligation, &witness_proof.pcs);
+        if config.discharge_wallet_pcs {
+            discharge_auth_pcs_obligation(b, &obligation, &witness_proof.pcs);
+        }
         pin_eq2(b, &inputs_t.tx_body_hash, &tx_hashes[input.tx_index]);
         owner_sum = owner_sum.add(&inputs_t.owner_count);
         live_sum = live_sum.add(&inputs_t.live_len);

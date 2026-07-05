@@ -1726,6 +1726,331 @@ mod tests {
         )
     }
 
+    /// One accepted block plus everything the single-block component
+    /// verifier consumes, in per-block form (the shape a recursion link
+    /// ingests — K = 1 structural).
+    #[allow(dead_code)]
+    struct BlockUnit {
+        start_accumulator: ChainAccumulator,
+        end_accumulator: ChainAccumulator,
+        inputs: RecursiveBlockBatchComponentInputs,
+        proof: RetainedFullAcceptedBlockBatchProof,
+        block_header: BlockHeader,
+    }
+
+    /// Build one single-standard-tx block spending `input_slot` (owned by
+    /// `secret`, holding `input_value`) into `output_slot`, mirroring
+    /// `user_block_fixture`'s block construction but parameterized so a
+    /// chain of same-tier blocks can be produced.
+    fn make_std_tx_block_item(
+        start_state: &ChainState,
+        start_parent: &BlockHeader,
+        anchor: &AnchorInfo,
+        input_slot: u32,
+        output_slot: u32,
+        secret: &SpendSecret,
+        input_value: u64,
+    ) -> (FullAcceptedBlockBatchItem, BlockHeader, u64) {
+        let owner = derive_address(secret);
+        let mut body = TxBody {
+            shape: TxShape::Standard4x8,
+            epoch_anchor: [0x42; 32],
+            fee: 0,
+            inputs: vec![TxInput {
+                slot_index: input_slot,
+                value: input_value,
+                owner,
+                spend_secret: secret.clone(),
+                valid: true,
+            }],
+            outputs: vec![TxOutput {
+                slot_index: output_slot,
+                value: input_value,
+                owner,
+                valid: true,
+            }],
+            is_coinbase: false,
+        };
+        let required_fee =
+            required_fee_for_tx_body(&body, start_parent.active_slot_count, start_parent.log_slots);
+        body.fee = required_fee as u128;
+        body.outputs[0].value = input_value.saturating_sub(required_fee);
+        let tx = tx_from_body(body.clone());
+        let txs = vec![tx];
+
+        let height = start_parent.height + 1;
+        let parent_cache = {
+            let mut tmp = start_state.clone();
+            tmp.exact_sparse_cache().unwrap()
+        };
+        let claims = vec![noid_tx::compute_claims_commitment(&body.inputs, &body.outputs)];
+        let surface = build_exact_action_surface(&start_state.state, &[body.clone()], &claims)
+            .expect("exact action surface");
+        let state_transition = crate::build_exact_state_transition_proof(
+            &parent_cache,
+            &surface,
+            &start_state.reuse_guard,
+            height,
+        )
+        .expect("exact proof");
+
+        let mut child_state = start_state.clone();
+        apply_tx(&mut child_state, &body).expect("native tx apply");
+        let mut child_guard = start_state.reuse_guard.clone();
+        child_guard
+            .apply_spends(height, &surface.spent_slots)
+            .expect("guard spend apply");
+        let child_state_root = composite_state_root(
+            start_parent.log_slots,
+            child_state.utxo_root,
+            child_guard.root(),
+        );
+        let mut header = BlockHeader {
+            prev_block_hash: hash_block_header(start_parent),
+            state_root: child_state_root,
+            tx_root: compute_tx_root(&txs),
+            timestamp: start_parent.timestamp + BLOCK_TIME,
+            height: start_parent.height + 1,
+            miner_address: Address([0x22; 32]),
+            nonce: 0,
+            difficulty_target: next_target(
+                anchor.anchor_height,
+                anchor.anchor_timestamp,
+                &anchor.anchor_target,
+                start_parent.height + 1,
+                start_parent.timestamp + BLOCK_TIME,
+            ),
+            log_slots: start_parent.log_slots,
+            active_slot_count: start_state.active_slot_count,
+            alloc_counter: start_state.alloc_counter + 1,
+        };
+        header.nonce = search_pow(&header, 0, 1_000_000).expect("easy test target mines");
+        let block = Block {
+            header: header.clone(),
+            transactions: txs,
+        };
+        let block_proof = crate::BlockProof::minimal(
+            start_parent.state_root,
+            block.header.state_root,
+            1,
+            state_transition,
+        );
+        let auth_sidecar = crate::BlockAuthSidecar {
+            tx_auth: vec![auth_proof_for_body(&body)],
+        };
+        let surviving_value = body.outputs[0].value;
+        (
+            FullAcceptedBlockBatchItem {
+                block,
+                block_proof_bytes: bincode::serialize(&block_proof).unwrap(),
+                block_auth_sidecar_bytes: bincode::serialize(&auth_sidecar).unwrap(),
+            },
+            header,
+            surviving_value,
+        )
+    }
+
+    /// Produce a chain of `n` same-tier (1 standard tx, 1 owner) blocks,
+    /// each spending the previous block's output slot, in per-block link
+    /// form. Block 1 spends a premined slot; block i≥2 spends block i−1's
+    /// output. Same secret throughout, so every block is one owner / one
+    /// input / one output — a fixed class tier.
+    fn chained_std_tx_blocks(n: usize) -> Vec<BlockUnit> {
+        assert!(n >= 1);
+        let secret = spend_secret(7);
+        let owner = derive_address(&secret);
+        // Large enough that a chain of same-tier blocks stays solvent: each
+        // block burns a fixed ~fee, and the surviving value flows forward.
+        let input_value = 10_000_000u64;
+
+        let mut state = ChainState::with_log_slots(4);
+        let first_input_slot = 2u32;
+        state
+            .state
+            .set_slot(
+                first_input_slot,
+                SlotValue {
+                    value: Block128::from(input_value as u128),
+                    owner_hi: owner.as_fields()[0],
+                    owner_lo: owner.as_fields()[1],
+                },
+            )
+            .unwrap();
+        state.rebuild_exact_utxo_root_loaded().unwrap();
+        state.active_slot_count = 1;
+        state.alloc_counter = 2;
+
+        let mut parent = BlockHeader {
+            prev_block_hash: [0u8; 32],
+            state_root: state.cached_state_root(),
+            tx_root: compute_tx_root(&[]),
+            timestamp: 1_767_225_600,
+            height: 0,
+            miner_address: Address([0x11; 32]),
+            nonce: 0,
+            difficulty_target: MAX_TARGET,
+            log_slots: state.state.log_slots() as u32,
+            active_slot_count: state.active_slot_count,
+            alloc_counter: state.alloc_counter,
+        };
+        let mut consensus = RecursiveConsensusState::from_header(
+            &parent,
+            block_work(&parent.difficulty_target),
+            0,
+            parent.timestamp,
+            parent.difficulty_target,
+            &[parent.timestamp],
+            &[parent.active_slot_count],
+        );
+        let mut accumulator = ChainAccumulator {
+            height: parent.height,
+            state_root: parent.state_root,
+            chain_hash: [0u8; 32],
+        };
+
+        let mut units = Vec::with_capacity(n);
+        let mut input_slot = first_input_slot;
+        let mut value = input_value;
+        for i in 0..n {
+            let output_slot = input_slot + 3; // stay inside the log_slots-4 space
+            let anchor = AnchorInfo {
+                anchor_height: consensus.asert_anchor_height,
+                anchor_timestamp: consensus.asert_anchor_timestamp,
+                anchor_target: consensus.asert_anchor_target,
+            };
+            let (item, header, surviving_value) = make_std_tx_block_item(
+                &state,
+                &parent,
+                &anchor,
+                input_slot,
+                output_slot,
+                &secret,
+                value,
+            );
+            let witness = FullAcceptedBlockBatchWitness {
+                items: vec![item],
+            };
+            let (output, proof) = prove_retained_full_accepted_block_batch_proof(
+                &consensus,
+                &accumulator,
+                &parent,
+                &state,
+                &witness,
+            )
+            .unwrap_or_else(|e| panic!("block {i} proves: {e:?}"));
+
+            units.push(BlockUnit {
+                start_accumulator: accumulator.clone(),
+                end_accumulator: output.accepted_claim_batch.accumulator.clone(),
+                inputs: output.proof_components.component_inputs.clone(),
+                proof,
+                block_header: header.clone(),
+            });
+
+            state = output.end_state;
+            consensus = output.accepted_claim_batch.consensus_state;
+            accumulator = output.accepted_claim_batch.accumulator;
+            parent = header;
+            input_slot = output_slot;
+            value = surviving_value;
+        }
+        units
+    }
+
+    /// The block-bearing recursion class needs two DIFFERENT real blocks of
+    /// the same tier to assemble to the SAME FieldR1cs matrix (I1). This
+    /// test establishes the exact shape-fixity boundary: with the
+    /// wallet-capsule PCS discharge OFF, everything else — [K]/[D] killshots,
+    /// owner-auth GKR, exact-state, the accumulator fold, and the integer
+    /// height successor (block 1 is at height 2, parent height 1, ODD,
+    /// which the ripple-carry increment must accept) — is class-fixed across
+    /// blocks. The wallet-capsule PCS opening is the SOLE remaining drift
+    /// (proof-dependent compact-FRI structure), localized here and left to
+    /// the region layer.
+    #[test]
+    fn block_slots_fixed_shape_across_two_real_blocks() {
+        use noid_ivc_core::field_circuit::FieldR1csBuilder;
+        use noid_recursive::acceptance::block_slots::{
+            build_block_slots, build_block_slots_with_config, BlockSlotsConfig,
+        };
+
+        let units = chained_std_tx_blocks(2);
+        let build = |u: &BlockUnit, cfg: BlockSlotsConfig, label: &str| {
+            let mut b = FieldR1csBuilder::new();
+            let _ = build_block_slots_with_config(
+                &mut b,
+                &u.start_accumulator,
+                &u.end_accumulator,
+                &u.inputs,
+                &u.proof,
+                cfg,
+            );
+            let (r, z) = b.build();
+            assert!(r.satisfies(&z), "{label} satisfies");
+            r
+        };
+
+        // Recursion-ready part (wallet-PCS off): the matrices must be
+        // byte-identical across two different real blocks.
+        let no_pcs = BlockSlotsConfig {
+            discharge_wallet_pcs: false,
+        };
+        let r0 = build(&units[0], no_pcs, "block 0 (height 1, no wallet-PCS)");
+        let r1 = build(&units[1], no_pcs, "block 1 (height 2, no wallet-PCS)");
+        assert_eq!(r0.m, r1.m, "class m drifted between blocks");
+        assert_eq!(r0.k_log, r1.k_log, "k_log drifted");
+        assert_eq!(
+            r0.a_0.rows, r1.a_0.rows,
+            "A matrix drifted between blocks (recursion-ready part must be class-fixed)"
+        );
+        assert_eq!(r0.b_0.rows, r1.b_0.rows, "B matrix drifted between blocks");
+        eprintln!(
+            "[block-slots] recursion-ready shape FIXED across 2 real blocks (heights 1,2): 2^{} rows",
+            r0.k_log
+        );
+
+        // With the wallet-PCS ON, the full block still satisfies for each
+        // block, but the matrices drift — localizing the ONE unfixed
+        // component (the region-layer target).
+        let full0 = build(&units[0], BlockSlotsConfig::default(), "block 0 full");
+        let full1 = build(&units[1], BlockSlotsConfig::default(), "block 1 full");
+        let _ = build_block_slots; // keep the default-config entry point exercised elsewhere
+        assert_ne!(
+            full0.a_0.rows, full1.a_0.rows,
+            "wallet-PCS was expected to be the drift source; if this now matches, \
+             the fixity boundary moved — update the region-layer obligation"
+        );
+        eprintln!("[block-slots] wallet-PCS confirmed as the sole shape-drift source");
+
+        // Height-successor NEGATIVE: block 1 is at child height 2. The old
+        // XOR proxy accepted the wrong parent 3 (2 XOR 3 XOR 1 = 0, a height
+        // DECREMENT); the integer incrementer must reject it. Tamper the
+        // start accumulator's height to 3 and require unsatisfiability.
+        let mut bad_unit = BlockUnit {
+            start_accumulator: units[1].start_accumulator.clone(),
+            end_accumulator: units[1].end_accumulator.clone(),
+            inputs: units[1].inputs.clone(),
+            proof: units[1].proof.clone(),
+            block_header: units[1].block_header.clone(),
+        };
+        bad_unit.start_accumulator.height = 3;
+        let mut b = FieldR1csBuilder::new();
+        let _ = build_block_slots_with_config(
+            &mut b,
+            &bad_unit.start_accumulator,
+            &bad_unit.end_accumulator,
+            &bad_unit.inputs,
+            &bad_unit.proof,
+            no_pcs,
+        );
+        let (rbad, zbad) = b.build();
+        assert!(
+            !rbad.satisfies(&zbad),
+            "XOR-passing wrong parent height (3 -> child 2) must be rejected by the incrementer"
+        );
+        eprintln!("[block-slots] integer height successor rejects the XOR-decrement attack");
+    }
+
     /// The [B] block-slot assembly gate: the single-block component
     /// verifier, replayed as a FieldR1cs trace, is satisfied by the honest
     /// witness, its cross-component pins survive a full flip battery
