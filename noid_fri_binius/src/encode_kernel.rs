@@ -39,28 +39,42 @@ fn eq2(z_hi: &[Block128], c: usize) -> Block128 {
     e
 }
 
-/// The single message-index kernel weight `K_i(z)` (see module docs). `z`
-/// must have exactly `n_rounds + 2` coordinates.
-pub fn encode_kernel_weight(z: &[Block128], i: usize, n_rounds: usize) -> Block128 {
+/// The kernel weight evaluated at a CONTINUOUS message point `x` (the
+/// multilinear extension in the message coordinates): `K(z, x) = Σ_c
+/// eq₂(z_hi;c)·Π_l [1 + z_l·(1 + x_l + 2^{c+l})]`. The per-bit factor is
+/// affine in `x_l`, so this is the genuine MLE — used by the source-binding
+/// sumcheck's terminal check at its derived point. `x.len() == n_rounds`.
+pub fn encode_kernel_weight_at(z: &[Block128], x: &[Block128], n_rounds: usize) -> Block128 {
     assert_eq!(z.len(), n_rounds + 2, "encode kernel point arity");
+    assert_eq!(x.len(), n_rounds, "message point arity");
     let z_pos = &z[..n_rounds];
     let z_hi = &z[n_rounds..];
     let mut total = Block128::ZERO;
     for c in 0..4usize {
         let mut prod = Block128::ONE;
-        for (l, &z_l) in z_pos.iter().enumerate() {
-            let i_l = if (i >> l) & 1 == 1 {
-                Block128::ONE
-            } else {
-                Block128::ZERO
-            };
+        for (l, (&z_l, &x_l)) in z_pos.iter().zip(x.iter()).enumerate() {
             let two = Block128::from(1u128 << (c + l));
-            // M(b)[p_l][i_l] = 1 + z_l·(1 + i_l + b)
-            prod *= Block128::ONE + z_l * (Block128::ONE + i_l + two);
+            // M(b)[·][x_l] extended: 1 + z_l·(1 + x_l + b)
+            prod *= Block128::ONE + z_l * (Block128::ONE + x_l + two);
         }
         total += eq2(z_hi, c) * prod;
     }
     total
+}
+
+/// The single message-index kernel weight `K_i(z)` (see module docs). `z`
+/// must have exactly `n_rounds + 2` coordinates.
+pub fn encode_kernel_weight(z: &[Block128], i: usize, n_rounds: usize) -> Block128 {
+    let x: Vec<Block128> = (0..n_rounds)
+        .map(|l| {
+            if (i >> l) & 1 == 1 {
+                Block128::ONE
+            } else {
+                Block128::ZERO
+            }
+        })
+        .collect();
+    encode_kernel_weight_at(z, &x, n_rounds)
 }
 
 /// All `2^n_rounds` kernel weights at `z`, sharing the per-coset structure.
