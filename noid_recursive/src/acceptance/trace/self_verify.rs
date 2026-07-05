@@ -32,7 +32,7 @@ use noid_ivc_core::pcs::{self, compute_fri_arities, default_fri_queries, PcsPara
 use noid_ivc_core::zerocheck::{self, K_SKIP};
 use noid_poseidon2b::native::{capacity_iv_flat, DomainTag};
 
-use super::{mul, pin_eq, poseidon2b_permute, FieldR1csBuilder, LinExpr, F128};
+use super::{evaluate_slice_trace, mul, pin_eq, poseidon2b_permute, FieldR1csBuilder, LinExpr, F128};
 
 /// A 32-byte digest as two little-endian **flat** u128 lanes (see module
 /// docs — this is NOT the φ-mapped `fri_pcs::DigestExpr` convention).
@@ -769,15 +769,14 @@ pub fn lincheck_verify_trace(
 // BaseFold PCS verify replay
 // ---------------------------------------------------------------------------
 
-/// Witness allocation of one `basefold::QueryOpening`. The query `position`
-/// is trace STRUCTURE (it selects Merkle path directions and coset offsets);
-/// soundness of the binding is the pinned bit decomposition of the squeezed
-/// position challenge in [`basefold_verify_trace`]. Structure derived from
-/// proof data is interim until the shape-freeze pass turns index bits into
-/// witness selectors (the recursion needs protocol-constant matrices) —
-/// same caveat as the wallet-capsule `gen_compact_queries_trace`. The
-/// per-query independent paths already make the HASHING schedule a pure
-/// function of the shape (query count × fixed tree depths).
+/// Witness allocation of one `basefold::QueryOpening`. The query replay is
+/// fully shape-fixed: Merkle directions, coset offsets, twiddles and the
+/// tail slot are all driven by the transcript-bound position bits (witness
+/// booleans pinned to the squeezed lanes in [`basefold_verify_trace`]);
+/// the hashing schedule is query count × fixed tree depths. `position` is
+/// kept only as builder-input data — bool witness values and the
+/// build-time desync assert; it shapes nothing. (The wallet-capsule
+/// `gen_compact_queries_trace` still carries the old interim caveat.)
 pub struct QueryOpeningTrace {
     pub position: usize,
     pub initial_leaf: Vec<LinExpr>,
@@ -953,34 +952,48 @@ impl BaseFoldProofTrace {
 /// `lane = Σ_w Σ_{i<k_code} pos_w[i]·2^{w·k_code+i} + Σ leftover b_j·2^j`
 /// with the used windows' position bits as structural constants and every
 /// bit outside them as a witness boolean (flat-basis powers — NOT φ(2^i):
-/// the native rule reads flat bits). Returns the structural indices.
+/// the native rule reads flat bits).
+///
+/// EVERY lane bit is a witness boolean; the used windows' bits are returned
+/// per query, LSB-first, and drive the Merkle direction muxes, the coset
+/// offset selections and the affine twiddles downstream — the query-loop
+/// trace structure no longer depends on the sampled positions. The native
+/// window value rides along for build-time desync asserts only.
 fn bind_query_positions_lane_trace(
     b: &mut FieldR1csBuilder,
     lane: &LinExpr,
     k_code: usize,
     n_used: usize,
-) -> Vec<usize> {
+) -> (Vec<(usize, Vec<LinExpr>)>, std::ops::Range<usize>) {
     let per_lane = 128 / k_code;
     assert!(n_used >= 1 && n_used <= per_lane, "window count off shape");
     let raw = expr_flat_u128(b, lane);
     let mask = (1u128 << k_code) - 1;
     let mut sum = LinExpr::zero();
-    let mut positions = Vec::with_capacity(n_used);
+    let mut out = Vec::with_capacity(n_used);
+    let bits_start = b.num_wires();
     for w in 0..n_used {
-        let pos = ((raw >> (w * k_code)) & mask) as usize;
-        positions.push(pos);
+        let base = w * k_code;
+        let pos = ((raw >> base) & mask) as usize;
+        let mut bits = Vec::with_capacity(k_code);
         for i in 0..k_code {
-            if (pos >> i) & 1 == 1 {
-                sum = sum.add_const(f128_from_u128(1u128 << (w * k_code + i)));
-            }
+            let bit = b.alloc_bool((raw >> (base + i)) & 1 == 1);
+            let e = LinExpr::from_wire(bit);
+            sum = sum.add(&e.scale(f128_from_u128(1u128 << (base + i))));
+            bits.push(e);
         }
+        out.push((pos, bits));
     }
     for j in (n_used * k_code)..128 {
         let bit = b.alloc_bool((raw >> j) & 1 == 1);
         sum = sum.add(&LinExpr::from_wire(bit).scale(f128_from_u128(1u128 << j)));
     }
+    // The gated range covers exactly the bit wires; the pin below
+    // materializes a helper wire whose row constrains the SUM, and a dead
+    // helper wire legitimately survives a flip.
+    let bits_range = bits_start..b.num_wires();
     super::pin_zero(b, &sum.add(lane));
-    positions
+    (out, bits_range)
 }
 
 /// Trace twin of `basefold::row_batch_fold_one` (nested per-round folds of
@@ -1008,7 +1021,8 @@ fn row_batch_fold_one_trace(
 /// Trace twin of `basefold::fri_fold_coset`. `fold_pair` with a constant
 /// twiddle is affine up to the challenge product:
 /// `v = v_in + u_in; u = u_in + v·t; out = u + r·(u + v)` — one
-/// multiplication per pair.
+/// multiplication per pair. Used where the coset index is structural (the
+/// once-per-proof plaintext-tail fold, indexed by final-layer slot).
 fn fri_fold_coset_trace(
     b: &mut FieldR1csBuilder,
     coset: &[LinExpr],
@@ -1037,29 +1051,76 @@ fn fri_fold_coset_trace(
     buf.pop().unwrap()
 }
 
+/// Per-query variant of [`fri_fold_coset_trace`]: the coset index is given
+/// as transcript-bound witness bits (LSB-first), so the trace structure is
+/// independent of the sampled position. The additive-NTT twiddle is
+/// F_2-linear in the position bits —
+/// `twiddle(l, b) = Σ_j bit_j(b)·Ŵ(β_j)` — so the twiddle at
+/// `pos = coset_idx·n + j` is an affine expression in the coset bits
+/// (constants from `ntt.twiddle` at single-bit blocks) and the fold costs
+/// two multiplications per pair (`v·t` and the challenge product).
+fn fri_fold_coset_bits_trace(
+    b: &mut FieldR1csBuilder,
+    coset: &[LinExpr],
+    challenges: &[LinExpr],
+    ntt: &AdditiveNttF128,
+    input_layer: usize,
+    coset_idx_bits: &[LinExpr],
+) -> LinExpr {
+    assert_eq!(coset.len(), 1usize << challenges.len());
+    let mut buf = coset.to_vec();
+    for (k, r) in challenges.iter().enumerate() {
+        let post_fold_layer = input_layer - k - 1;
+        let n = buf.len() / 2;
+        let log_n = n.trailing_zeros() as usize;
+        // Affine twiddle basis for this layer: the structural intra-coset
+        // part contributes constants; each coset bit contributes
+        // twiddle(layer, 2^(log_n + i)).
+        let bit_coeffs: Vec<F128> = (0..coset_idx_bits.len())
+            .map(|i| ntt.twiddle(post_fold_layer, 1usize << (log_n + i)))
+            .collect();
+        let mut next = Vec::with_capacity(n);
+        for j in 0..n {
+            let u_in = &buf[2 * j];
+            let v_in = &buf[2 * j + 1];
+            let mut twiddle = LinExpr::constant(ntt.twiddle(post_fold_layer, j));
+            for (bit, &coeff) in coset_idx_bits.iter().zip(&bit_coeffs) {
+                twiddle = twiddle.add(&bit.scale(coeff));
+            }
+            let v = v_in.add(u_in);
+            let u = u_in.add(&mul(b, &v, &twiddle));
+            next.push(u.add(&mul(b, r, &u.add(&v))));
+        }
+        buf = next;
+    }
+    buf.pop().unwrap()
+}
+
 /// Trace twin of `merkle::verify_merkle_proof`: fold the leaf hash up its
-/// own full-depth path and pin the reconstructed root. The hashing schedule
-/// (`path.len()` compressions per query) is a pure function of the
-/// commitment shape; only the per-level left/right order is still trace
-/// structure derived from the (position-bound) leaf index — interim until
-/// the shape-freeze pass replaces it with witness-bit selectors.
+/// own full-depth path and pin the reconstructed root. Fully shape-fixed:
+/// the hashing schedule is `path.len()` compressions, and the per-level
+/// left/right order is a mux on the transcript-bound position bit
+/// (`dir_bits[d]` = bit `d` of the leaf index; bit = 1 → our node is the
+/// RIGHT child). Two multiplications per level (one shared mux product per
+/// digest lane).
 fn verify_merkle_path_trace(
     b: &mut FieldR1csBuilder,
     root: &FlatDigestExpr,
     leaf_hash: &FlatDigestExpr,
-    index: usize,
+    dir_bits: &[LinExpr],
     path: &[FlatDigestExpr],
 ) {
+    assert_eq!(dir_bits.len(), path.len(), "direction bits off shape");
     let mut acc = leaf_hash.clone();
-    let mut idx = index;
-    for sibling in path {
-        let (left, right) = if idx & 1 == 0 {
-            (acc, sibling.clone())
-        } else {
-            (sibling.clone(), acc)
-        };
+    for (bit, sibling) in dir_bits.iter().zip(path) {
+        let mut left = [LinExpr::zero(), LinExpr::zero()];
+        let mut right = [LinExpr::zero(), LinExpr::zero()];
+        for lane in 0..2 {
+            let t = mul(b, bit, &acc[lane].add(&sibling[lane]));
+            left[lane] = acc[lane].add(&t);
+            right[lane] = sibling[lane].add(&t);
+        }
         acc = merkle_hash_pair_trace(b, &left, &right);
-        idx >>= 1;
     }
     pin_flat_digest_eq(b, &acc, root);
 }
@@ -1067,9 +1128,11 @@ fn verify_merkle_path_trace(
 /// Trace twin of `basefold::verify`. Replays the sumcheck/commit transcript
 /// on the lane channel, binds resampled query positions, replays every
 /// query's leaf hashing / row-batch fold / FRI coset folds / final-codeword
-/// check, and batch-verifies the per-tree Merkle multi-proofs. Native value
-/// rejections → pins; shape rejections were alloc asserts. Returns the
-/// sumcheck challenges.
+/// check, and verifies every query's independent Merkle paths with
+/// witness-bit direction muxes. Native value rejections → pins; shape
+/// rejections were alloc asserts. Returns the sumcheck challenges plus the
+/// wire ranges of the transcript-bound position bits (for the mutation
+/// gate: those bits are verifier-internal witness, not proof wires).
 pub fn basefold_verify_trace(
     b: &mut FieldR1csBuilder,
     ch: &mut FsChannelTrace,
@@ -1077,7 +1140,7 @@ pub fn basefold_verify_trace(
     proof: &BaseFoldProofTrace,
     initial_codeword_root: &FlatDigestExpr,
     params: &PcsParams,
-) -> Vec<LinExpr> {
+) -> (Vec<LinExpr>, Vec<std::ops::Range<usize>>) {
     let log_msg_len = params.m - LOG_PACKING;
     let log_batch_size = params.log_batch_size;
     let log_inv_rate = params.log_inv_rate;
@@ -1144,34 +1207,41 @@ pub fn basefold_verify_trace(
     pin_eq(b, constant, &proof.final_a);
 
     // ---- Grinding check, then resample query positions with one vector
-    // squeeze; bind each to its allocated structure.
+    // squeeze. Every position bit becomes a transcript-bound witness
+    // boolean; the whole per-query replay below is driven by those bits,
+    // so its structure is a pure function of the shape.
     ch.verify_pow_trace(b, &proof.pow_nonce, pcs::QUERY_GRIND_BITS);
     let n_queries = proof.queries.len();
     let per_lane = 128 / k_code;
     let lanes = ch.sample_f128_vec(b, n_queries.div_ceil(per_lane));
-    let mut qi = 0usize;
+    let mut query_bits: Vec<Vec<LinExpr>> = Vec::with_capacity(n_queries);
+    let mut bit_ranges: Vec<std::ops::Range<usize>> = Vec::with_capacity(lanes.len());
     for lane in &lanes {
-        let used = per_lane.min(n_queries - qi);
-        for position in bind_query_positions_lane_trace(b, lane, k_code, used) {
-            // Native `q.position != positions[qi]` → the allocated structure
-            // must match the transcript-derived index (build-time assert).
+        let used = per_lane.min(n_queries - query_bits.len());
+        let (bound, range) = bind_query_positions_lane_trace(b, lane, k_code, used);
+        bit_ranges.push(range);
+        for (position, bits) in bound {
+            // Build-time sanity: the proof's query must carry the
+            // transcript-derived position (native `q.position !=
+            // positions[qi]` reject); soundness is the lane pin.
             assert_eq!(
-                proof.queries[qi].position, position,
+                proof.queries[query_bits.len()].position,
+                position,
                 "query position desynced from transcript"
             );
-            qi += 1;
+            query_bits.push(bits);
         }
     }
-    assert_eq!(qi, n_queries, "query positions exhausted off shape");
+    assert_eq!(query_bits.len(), n_queries, "query positions off shape");
 
     // ---- Per-query fold replay + per-query independent Merkle paths.
-    for q in &proof.queries {
+    for (q, bits) in proof.queries.iter().zip(&query_bits) {
         let initial_leaf_hash = merkle_hash_leaf_lanes_trace(b, &q.initial_leaf);
         verify_merkle_path_trace(
             b,
             initial_codeword_root,
             &initial_leaf_hash,
-            q.position,
+            bits,
             &q.initial_path,
         );
 
@@ -1185,71 +1255,70 @@ pub fn basefold_verify_trace(
         if arities.is_empty() {
             expected = post_row_batch_value;
         } else {
-            let post_leaf_idx = q.position >> arity_0;
             let post_leaf_hash = merkle_hash_leaf_lanes_trace(b, &q.post_row_batch_leaf);
             verify_merkle_path_trace(
                 b,
                 &proof.post_row_batch_commit,
                 &post_leaf_hash,
-                post_leaf_idx,
+                &bits[arity_0..],
                 &q.post_row_batch_path,
             );
 
-            // Cross-check T2 against the row-batch fold (value check → pin).
-            let inner_offset = q.position & ((1usize << arity_0) - 1);
-            pin_eq(b, &q.post_row_batch_leaf[inner_offset], &post_row_batch_value);
+            // Cross-check T2 against the row-batch fold: select the leaf
+            // slot by the offset bits (eq-tensor dot; value check → pin).
+            let at_offset = evaluate_slice_trace(b, &q.post_row_batch_leaf, &bits[..arity_0]);
+            pin_eq(b, &at_offset, &post_row_batch_value);
 
-            expected = fri_fold_coset_trace(
+            expected = fri_fold_coset_bits_trace(
                 b,
                 &q.post_row_batch_leaf,
                 &challenges[fri_challenge_start..fri_challenge_start + arity_0],
                 &ntt,
                 k_code,
-                post_leaf_idx,
+                &bits[arity_0..],
             );
         }
 
         for i in 0..num_fri_commits {
             let leaf = &q.epoch_leaves[i];
             let next_arity = arities[i + 1];
-            let p_at_this_layer = q.position >> cum_arity;
-            let leaf_idx = p_at_this_layer >> next_arity;
-            let offset = p_at_this_layer & ((1usize << next_arity) - 1);
 
             let epoch_leaf_hash = merkle_hash_leaf_lanes_trace(b, leaf);
             verify_merkle_path_trace(
                 b,
                 &proof.round_commitments[i],
                 &epoch_leaf_hash,
-                leaf_idx,
+                &bits[cum_arity + next_arity..],
                 &q.epoch_paths[i],
             );
 
-            pin_eq(b, &leaf[offset], &expected);
+            let at_offset =
+                evaluate_slice_trace(b, leaf, &bits[cum_arity..cum_arity + next_arity]);
+            pin_eq(b, &at_offset, &expected);
 
             let input_layer = k_code - cum_arity;
-            expected = fri_fold_coset_trace(
+            expected = fri_fold_coset_bits_trace(
                 b,
                 leaf,
                 &challenges[fri_challenge_start + cum_arity
                     ..fri_challenge_start + cum_arity + next_arity],
                 &ntt,
                 input_layer,
-                leaf_idx,
+                &bits[cum_arity + next_arity..],
             );
             cum_arity += next_arity;
         }
 
-        // Final per-query check: against the plaintext tail when one
-        // exists (the tail folds to the final codeword once, below), else
-        // directly against the final codeword.
+        // Final per-query check: select the tail slot by the remaining
+        // position bits when a tail exists (the tail folds to the final
+        // codeword once, below); else pin against the final codeword,
+        // whose constancy is already pinned — any slot equals slot 0.
         if let Some((_, tail_cum)) = tail_layout {
             assert_eq!(cum_arity, tail_cum, "tail layer offset off shape");
-            let p_tail = q.position >> cum_arity;
-            pin_eq(b, &proof.plaintext_tail[p_tail], &expected);
+            let at_tail = evaluate_slice_trace(b, &proof.plaintext_tail, &bits[cum_arity..]);
+            pin_eq(b, &at_tail, &expected);
         } else {
-            let p_final = q.position >> cum_arity;
-            pin_eq(b, &proof.final_codeword[p_final], &expected);
+            pin_eq(b, &proof.final_codeword[0], &expected);
         }
     }
 
@@ -1276,7 +1345,7 @@ pub fn basefold_verify_trace(
         }
     }
 
-    challenges
+    (challenges, bit_ranges)
 }
 
 // ---------------------------------------------------------------------------
@@ -1304,7 +1373,7 @@ pub fn verify_opening_batch_quirky_direct_trace(
     claims: &[QuirkyDirectClaimTrace],
     proof: &BaseFoldProofTrace,
     params: &PcsParams,
-) {
+) -> Vec<std::ops::Range<usize>> {
     assert!(!claims.is_empty(), "need at least one claim");
     let l_log = params.m - LOG_PACKING;
     for c in claims {
@@ -1323,7 +1392,7 @@ pub fn verify_opening_batch_quirky_direct_trace(
         target_combined = target_combined.add(&mul(b, g, &c.value));
     }
 
-    let challenges =
+    let (challenges, query_bit_ranges) =
         basefold_verify_trace(b, ch, &target_combined, proof, commitment_root, params);
     assert_eq!(challenges.len(), l_log);
 
@@ -1338,6 +1407,7 @@ pub fn verify_opening_batch_quirky_direct_trace(
         expected_final_b = expected_final_b.add(&mul(b, &term, &eq_rest));
     }
     pin_eq(b, &expected_final_b, &proof.final_b);
+    query_bit_ranges
 }
 
 // ---------------------------------------------------------------------------
@@ -1964,7 +2034,7 @@ mod tests {
         commitment: &pcs::Commitment,
         claims: &[pcs::QuirkyDirectClaim],
         proof: &pcs::BaseFoldProof,
-    ) -> (FieldR1cs, Vec<F128>, std::ops::Range<usize>) {
+    ) -> (FieldR1cs, Vec<F128>, Vec<std::ops::Range<usize>>) {
         let mut b = FieldR1csBuilder::new();
         let mut ch = FsChannelTrace::new(&mut b, b"self-verify-pcs-test");
 
@@ -1986,7 +2056,12 @@ mod tests {
         let proof_e = BaseFoldProofTrace::alloc(&mut b, proof, params);
         let mutation_end = b.num_wires();
 
-        verify_opening_batch_quirky_direct_trace(&mut b, &mut ch, &root, &claims_e, &proof_e, params);
+        // The transcript-bound query position bits are verifier-internal
+        // witness (not proof wires); gate them too — a bit flipped off its
+        // lane pin must never satisfy the trace.
+        let query_bit_ranges = verify_opening_batch_quirky_direct_trace(
+            &mut b, &mut ch, &root, &claims_e, &proof_e, params,
+        );
 
         // Native/trace transcript lockstep after the full replay.
         let mut ch_native = FsLaneChallenger::new(b"self-verify-pcs-test");
@@ -2006,7 +2081,9 @@ mod tests {
         assert_eq!(c_t.eval(b.values()), c_n, "post-verify challenge diverged");
 
         let (r1cs, z) = b.build();
-        (r1cs, z, mutation_start..mutation_end)
+        let mut ranges = vec![mutation_start..mutation_end];
+        ranges.extend(query_bit_ranges);
+        (r1cs, z, ranges)
     }
 
     /// THE PCS lockstep gate: honest quirky-direct openings replay to a
@@ -2029,11 +2106,11 @@ mod tests {
     #[test]
     fn pcs_replay_rejects_mutations() {
         let (params, commitment, claims, proof) = pcs_fixture(6, 2, 2, 4, 0xC3);
-        let (r1cs, z, range) = build_pcs_trace(&params, &commitment, &claims, &proof);
+        let (r1cs, z, ranges) = build_pcs_trace(&params, &commitment, &claims, &proof);
         assert!(r1cs.satisfies(&z));
 
         let mut survivors = Vec::new();
-        for target in range {
+        for target in ranges.into_iter().flatten() {
             let mut bad = z.clone();
             bad[target] += F128::ONE;
             if r1cs.satisfies(&bad) {
