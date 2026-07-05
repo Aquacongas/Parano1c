@@ -36,16 +36,12 @@ use crate::accepted_batch::{
     AcceptedClaimBatchOutput, AcceptedClaimBatchWitness,
 };
 use crate::accumulator::ChainAccumulator;
-use crate::authorization::{AuthorizationVerifierTrace, FiatShamirTraceOp};
+use crate::authorization::AuthorizationVerifierTrace;
 use crate::block_certificate::{
     accepted_block_certificate_chain_claim, AcceptedBlockCertificateStatement,
 };
 use crate::checkpoint::{
     verify_checkpoint_poseidon, CheckpointPoseidonError, CheckpointPoseidonProof,
-};
-use crate::fs_transcript::{
-    discharge_fiat_shamir_transcript_batch_reductions_native,
-    verify_fiat_shamir_transcript_batch_killshot, FiatShamirTranscriptBatchProofKillShot,
 };
 use crate::header_integer::HeaderIntegerBatchTrace;
 use crate::pow_header::RecursiveConsensusState;
@@ -119,7 +115,6 @@ pub struct AcceptedBlockBatchComponentProof {
     pub tx_root: Option<BatchedMerkleProofKillShot>,
     pub checkpoint_poseidon: CheckpointPoseidonProof,
     pub exact_state: Vec<ExactStateKillShotProof>,
-    pub authorization_transcripts: Vec<FiatShamirTranscriptBatchProofKillShot>,
 }
 
 impl AcceptedBlockBatchComponentProof {
@@ -143,11 +138,6 @@ impl AcceptedBlockBatchComponentProof {
                 .iter()
                 .zip(inputs.exact_state_killshot_inputs.iter())
                 .map(|(proof, inputs)| proof.byte_len(inputs))
-                .sum::<usize>()
-            + self
-                .authorization_transcripts
-                .iter()
-                .map(FiatShamirTranscriptBatchProofKillShot::byte_len)
                 .sum::<usize>()
     }
 }
@@ -176,10 +166,6 @@ pub enum AcceptedBlockBatchComponentError {
         index: usize,
         tx_index: usize,
     },
-    AuthorizationTranscriptRejected {
-        chunk_index: usize,
-        tx_index: usize,
-    },
     AcceptedClaimBatch(AcceptedClaimBatchError),
     CheckpointPoseidon(CheckpointPoseidonError),
     ExactState {
@@ -206,7 +192,7 @@ pub fn verify_accepted_block_batch_components(
         (claim_hash_result, (standard_result, sweep_result)),
         (
             (tx_root_result, authorization_result),
-            (transcript_result, (claim_batch_result, (checkpoint_result, exact_state_result))),
+            (claim_batch_result, (checkpoint_result, exact_state_result)),
         ),
     ) = rayon::join(
         || {
@@ -230,20 +216,17 @@ pub fn verify_accepted_block_batch_components(
                 },
                 || {
                     rayon::join(
-                        || verify_authorization_transcript_components(inputs, proof),
+                        || {
+                            verify_accepted_claim_batch_with_header_trace(
+                                start_consensus,
+                                start_accumulator,
+                                &inputs.accepted_claim_witness,
+                                &inputs.header_integer_trace,
+                            )
+                            .map_err(AcceptedBlockBatchComponentError::AcceptedClaimBatch)
+                        },
                         || {
                             rayon::join(
-                                || {
-                                    verify_accepted_claim_batch_with_header_trace(
-                                        start_consensus,
-                                        start_accumulator,
-                                        &inputs.accepted_claim_witness,
-                                        &inputs.header_integer_trace,
-                                    )
-                                    .map_err(AcceptedBlockBatchComponentError::AcceptedClaimBatch)
-                                },
-                                || {
-                                    rayon::join(
                                         || {
                                             verify_checkpoint_poseidon(
                                                 start_accumulator,
@@ -270,8 +253,6 @@ pub fn verify_accepted_block_batch_components(
                                                             }
                                                         })
                                                 })
-                                        },
-                                    )
                                 },
                             )
                         },
@@ -286,7 +267,6 @@ pub fn verify_accepted_block_batch_components(
     sweep_result?;
     tx_root_result?;
     authorization_result?;
-    transcript_result?;
     let accepted_claim_batch = claim_batch_result?;
     if accepted_claim_batch.accumulator != *end_accumulator {
         return Err(AcceptedBlockBatchComponentError::ComponentShapeMismatch);
@@ -434,7 +414,6 @@ fn validate_component_shape(
     if inputs.exact_state_killshot_inputs.len() != proof.exact_state.len()
         || inputs.authorization_inputs.len() != inputs.authorization_witnesses.len()
         || inputs.authorization_traces.len() != inputs.authorization_witnesses.len()
-        || inputs.authorization_traces.is_empty() != proof.authorization_transcripts.is_empty()
         || inputs.accepted_claim_hash_inputs.len()
             != inputs.accepted_claim_witness.accepted_block_claims.len()
         || inputs.tx_body_standard_inputs.len() != inputs.tx_body_standard_hashes.len()
@@ -636,66 +615,6 @@ fn verify_authorization_components(
         return Err(AcceptedBlockBatchComponentError::ComponentShapeMismatch);
     }
     Ok(())
-}
-
-fn verify_authorization_transcript_components(
-    inputs: &AcceptedBlockBatchComponentInputs,
-    proof: &AcceptedBlockBatchComponentProof,
-) -> Result<(), AcceptedBlockBatchComponentError> {
-    let chunks = authorization_transcript_chunks(inputs)?;
-    if chunks.len() != proof.authorization_transcripts.len() {
-        return Err(AcceptedBlockBatchComponentError::ComponentShapeMismatch);
-    }
-    chunks
-        .par_iter()
-        .zip(proof.authorization_transcripts.par_iter())
-        .enumerate()
-        .try_for_each(
-            |(chunk_index, ((tx_index, traces), auth_transcript_proof))| {
-                let mut channel = Poseidon2bChannel::new();
-                let reductions = verify_fiat_shamir_transcript_batch_killshot(
-                    traces,
-                    auth_transcript_proof,
-                    &mut channel,
-                )
-                .map_err(|_| {
-                    AcceptedBlockBatchComponentError::AuthorizationTranscriptRejected {
-                        chunk_index,
-                        tx_index: *tx_index,
-                    }
-                })?;
-                if discharge_fiat_shamir_transcript_batch_reductions_native(traces, &reductions) {
-                    Ok(())
-                } else {
-                    Err(
-                        AcceptedBlockBatchComponentError::AuthorizationTranscriptRejected {
-                            chunk_index,
-                            tx_index: *tx_index,
-                        },
-                    )
-                }
-            },
-        )
-}
-
-fn authorization_transcript_chunks(
-    inputs: &AcceptedBlockBatchComponentInputs,
-) -> Result<Vec<(usize, Vec<Vec<FiatShamirTraceOp>>)>, AcceptedBlockBatchComponentError> {
-    if inputs.authorization_traces.len() != inputs.authorization_witnesses.len() {
-        return Err(AcceptedBlockBatchComponentError::ComponentShapeMismatch);
-    }
-    Ok(inputs
-        .authorization_traces
-        .chunks(crate::FIAT_SHAMIR_TRANSCRIPT_MAX_TRACES_PER_BATCH)
-        .map(|chunk| {
-            let tx_index = chunk[0].tx_index;
-            let traces = chunk
-                .iter()
-                .map(|trace| trace.transcript.clone())
-                .collect::<Vec<_>>();
-            (tx_index, traces)
-        })
-        .collect())
 }
 
 fn validate_exact_state_inputs(

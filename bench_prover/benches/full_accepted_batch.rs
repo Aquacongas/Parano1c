@@ -668,10 +668,9 @@ where
         fmt_bytes(certificate_receipt_bytes)
     );
     println!(
-        "    components claim_hashes={} exact_state={} auth_traces={} standard_spines={} sweep_spines={} tx_root_paths={}",
+        "    components claim_hashes={} exact_state={} standard_spines={} sweep_spines={} tx_root_paths={}",
         out.proof_components.component_inputs.accepted_claim_hash_inputs.len(),
         proof.exact_state.len(),
-        proof.authorization_transcripts.len(),
         usize::from(proof.tx_body_standard.is_some()),
         usize::from(proof.tx_body_sweep.is_some()),
         out.proof_components.component_inputs.tx_root_inputs.len()

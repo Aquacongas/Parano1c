@@ -22,7 +22,7 @@
 //! The wrap digests are bound to the `tx_body_hashes` wires by the killshot's
 //! own `tx_hash_pins` linear relation, exactly as native.
 
-use noid_core::{Block128, TowerField};
+use noid_core::Block128;
 use noid_gkr::block_spine::{
     num_vars_for, BlockSpineProof, BLOCK_SPINE_TX_HASH_PIN_TAG,
 };
@@ -597,6 +597,7 @@ mod tests {
         discharge_sweep_block_spine_reductions_native, prove_sweep_block_spine_killshot,
         verify_sweep_block_spine_killshot, SweepBlockSpineMle,
     };
+    use noid_core::TowerField;
     use noid_gkr::spine_sumcheck::reconstruct_slot_states;
     use noid_gkr::spine_sumcheck_sweep::reconstruct_sweep_spine_slot_states;
     use noid_poseidon2b::channel::Poseidon2bChannel;

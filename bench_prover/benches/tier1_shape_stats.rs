@@ -52,11 +52,10 @@ use noid_poseidon2b::channel::Poseidon2bChannel;
 use noid_poseidon2b::native::domain::{TAG_EXSTNOD, TAG_RGDNODE};
 use noid_poseidon2b::primitives::{derive_address, Address, SpendSecret};
 use noid_recursive::{
-    chain_accumulator_proof_inputs, discharge_fiat_shamir_transcript_batch_reductions_native,
+    chain_accumulator_proof_inputs,
     header_hash_proof_inputs, prove_accepted_block_certificate_receipt_projection_proof,
-    verify_fiat_shamir_transcript_batch_killshot, verify_pow_header_witness_batch_native,
+    verify_pow_header_witness_batch_native,
     ChainAccumulator, HeaderWitness, RecursiveConsensusState,
-    FIAT_SHAMIR_TRANSCRIPT_MAX_TRACES_PER_BATCH,
 };
 use noid_tx::{
     hash_tx_body_for_shape, validate_public_tx_logic, Transaction, TxBody, TxInput, TxOutput,
@@ -776,26 +775,6 @@ fn replay_components(
         });
     }
 
-    for (chunk_index, (chunk, transcript_proof)) in components
-        .component_inputs.authorization_traces
-        .chunks(FIAT_SHAMIR_TRANSCRIPT_MAX_TRACES_PER_BATCH)
-        .zip(proof.authorization_transcripts.iter())
-        .enumerate()
-    {
-        let traces: Vec<_> = chunk.iter().map(|trace| trace.transcript.clone()).collect();
-        let trace_ops: usize = traces.iter().map(Vec::len).sum();
-        let mut ch = CountingChannel::new();
-        let ok =
-            verify_fiat_shamir_transcript_batch_killshot(&traces, transcript_proof, &mut ch).is_ok();
-        assert!(ok, "authorization FS-transcript verifier rejected (chunk {chunk_index})");
-        rows.push(Row {
-            name: format!("auth_fs_transcripts[{chunk_index}]"),
-            stats: ch.stats(),
-            proof_bytes: transcript_proof.byte_len(),
-            note: format!("traces={} ops={}", traces.len(), trace_ops),
-        });
-    }
-
     {
         let witness = &components.component_inputs.accepted_claim_witness;
         let padded_blocks = witness.headers.len();
@@ -1135,28 +1114,6 @@ fn profile_component_leaves(
         }
     });
 
-    let mut fs_verify_total = Duration::ZERO;
-    let mut fs_discharge_total = Duration::ZERO;
-    for (chunk, transcript_proof) in components
-        .component_inputs
-        .authorization_traces
-        .chunks(FIAT_SHAMIR_TRANSCRIPT_MAX_TRACES_PER_BATCH)
-        .zip(proof.authorization_transcripts.iter())
-    {
-        let traces: Vec<_> = chunk.iter().map(|trace| trace.transcript.clone()).collect();
-        let mut ch = Poseidon2bChannel::new();
-        let (verify_time, reductions) = time_once(|| {
-            verify_fiat_shamir_transcript_batch_killshot(&traces, transcript_proof, &mut ch)
-                .expect("component leaf probe: auth-FS killshot verifies")
-        });
-        let (discharge_time, discharged) = time_once(|| {
-            discharge_fiat_shamir_transcript_batch_reductions_native(&traces, &reductions)
-        });
-        assert!(discharged, "component leaf probe: auth-FS discharge holds");
-        fs_verify_total += verify_time;
-        fs_discharge_total += discharge_time;
-    }
-
     let mut state_paths_total = Duration::ZERO;
     for (inputs, es_proof) in components
         .component_inputs
@@ -1174,11 +1131,9 @@ fn profile_component_leaves(
     }
 
     println!(
-        "  component leaf probe: owner_auth_seq_total={} (txs={}) auth_fs_verify={} auth_fs_discharge={} state_paths={}",
+        "  component leaf probe: owner_auth_seq_total={} (txs={}) state_paths={}",
         fmt_ms(owner_auth_total),
         components.component_inputs.authorization_inputs.len(),
-        fmt_ms(fs_verify_total),
-        fmt_ms(fs_discharge_total),
         fmt_ms(state_paths_total),
     );
 }

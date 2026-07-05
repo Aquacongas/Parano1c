@@ -41,7 +41,7 @@ use noid_recursive::{
     advance_history_checkpoint_head_native, build_header_integer_trace,
     history_checkpoint_head_from_boundary,
     prove_accepted_block_certificate_receipt_projection_proof, prove_checkpoint_poseidon,
-    prove_fiat_shamir_transcript_batch_killshot, prove_history_checkpoint_recursive_head_record,
+    prove_history_checkpoint_recursive_head_record,
     prove_history_checkpoint_step_proof_with_ivc_chunk_certificate_proof_components,
     verify_accepted_block_certificate_proof_checkpoint,
     verify_accepted_block_certificate_receipt_projection,
@@ -53,12 +53,12 @@ use noid_recursive::{
     AcceptedBlockCertificateReceiptError, AcceptedBlockReceiptProjectionHandle,
     AcceptedBlockReceiptProjectionHandleError, AcceptedClaimBatchError, AcceptedClaimBatchOutput,
     AcceptedClaimBatchWitness, AuthorizationVerifierTrace, BlockProofAcceptanceReceipt,
-    ChainAccumulator, CheckpointPoseidonError, CheckpointPoseidonProof, FiatShamirTraceOp,
-    FiatShamirTranscriptBatchProofKillShot, HeaderIntegerTraceError,
+    ChainAccumulator, CheckpointPoseidonError, CheckpointPoseidonProof,
+    HeaderIntegerTraceError,
     HeaderWitness, HistoryCheckpointBatchSummary, HistoryCheckpointHead, HistoryCheckpointProof,
     HistoryCheckpointProofError, HistoryCheckpointStepProof, HistoryCheckpointStepProofError,
     HistoryCheckpointStepStatement, PowHeaderBatchError, RecursiveConsensusState,
-    FIAT_SHAMIR_TRANSCRIPT_MAX_TRACES_PER_BATCH, HISTORY_CHECKPOINT_BATCH_TARGET_BLOCKS,
+    HISTORY_CHECKPOINT_BATCH_TARGET_BLOCKS,
 };
 
 use crate::validate::map_verify_authorization_error;
@@ -582,13 +582,12 @@ pub(crate) fn prove_full_accepted_block_batch_components(
             Option<BatchedMerkleProofKillShot>,
             CheckpointPoseidonProof,
             Vec<ExactStateKillShotProof>,
-            Vec<FiatShamirTranscriptBatchProofKillShot>,
         ),
         FullAcceptedBlockBatchError,
     > {
         let (
             (tx_body_standard, tx_body_sweep),
-            (tx_root, ((checkpoint_poseidon, exact_state), authorization_transcripts)),
+            (tx_root, (checkpoint_poseidon, exact_state)),
         ) = rayon::join(
                 || {
                     rayon::join(
@@ -602,21 +601,14 @@ pub(crate) fn prove_full_accepted_block_batch_components(
                         || {
                             rayon::join(
                                 || {
-                                    rayon::join(
-                                        || {
-                                            prove_checkpoint_poseidon(
-                                                start_accumulator,
-                                                end_accumulator,
-                                                &components.component_inputs.accepted_claim_witness,
-                                            )
-                                            .map_err(
-                                                FullAcceptedBlockBatchError::CheckpointPoseidon,
-                                            )
-                                        },
-                                        || prove_exact_state_components(components),
+                                    prove_checkpoint_poseidon(
+                                        start_accumulator,
+                                        end_accumulator,
+                                        &components.component_inputs.accepted_claim_witness,
                                     )
+                                    .map_err(FullAcceptedBlockBatchError::CheckpointPoseidon)
                                 },
-                                || prove_authorization_transcript_components(components),
+                                || prove_exact_state_components(components),
                             )
                         },
                     )
@@ -629,20 +621,12 @@ pub(crate) fn prove_full_accepted_block_batch_components(
             tx_root?,
             checkpoint_poseidon?,
             exact_state?,
-            authorization_transcripts?,
         ))
     };
 
     let (accepted_claim_hash, rest) = rayon::join(claim_result, rest_result);
     let accepted_claim_hash = accepted_claim_hash?;
-    let (
-        tx_body_standard,
-        tx_body_sweep,
-        tx_root,
-        checkpoint_poseidon,
-        exact_state,
-        authorization_transcripts,
-    ) = rest?;
+    let (tx_body_standard, tx_body_sweep, tx_root, checkpoint_poseidon, exact_state) = rest?;
 
     Ok(RetainedFullAcceptedBlockBatchProof {
         accepted_claim_hash,
@@ -651,7 +635,6 @@ pub(crate) fn prove_full_accepted_block_batch_components(
         tx_root,
         checkpoint_poseidon,
         exact_state,
-        authorization_transcripts,
     })
 }
 
@@ -1257,11 +1240,9 @@ fn map_recursive_component_error(
         RecursiveBlockBatchComponentError::TxRootProofRejected => {
             FullAcceptedBlockBatchError::TxRootComponent
         }
-        RecursiveBlockBatchComponentError::AuthorizationProofRejected { index, tx_index }
-        | RecursiveBlockBatchComponentError::AuthorizationTranscriptRejected {
-            chunk_index: index,
-            tx_index,
-        } => FullAcceptedBlockBatchError::AuthorizationComponent { index, tx_index },
+        RecursiveBlockBatchComponentError::AuthorizationProofRejected { index, tx_index } => {
+            FullAcceptedBlockBatchError::AuthorizationComponent { index, tx_index }
+        }
         RecursiveBlockBatchComponentError::AcceptedClaimBatch(source) => {
             FullAcceptedBlockBatchError::AcceptedClaimBatch(source)
         }
@@ -1309,49 +1290,6 @@ fn prove_exact_state_components(
             crate::prove_exact_state_killshot(inputs).map_err(|source| {
                 FullAcceptedBlockBatchError::ExactStateComponent { index, source }
             })
-        })
-        .collect()
-}
-
-fn authorization_transcript_chunks(
-    components: &FullAcceptedBlockBatchProofComponents,
-) -> Result<Vec<(usize, Vec<Vec<FiatShamirTraceOp>>)>, FullAcceptedBlockBatchError> {
-    if components.component_inputs.authorization_traces.len() != components.component_inputs.authorization_witnesses.len() {
-        return Err(FullAcceptedBlockBatchError::ComponentShapeMismatch);
-    }
-    Ok(components
-        .component_inputs
-            .authorization_traces
-        .chunks(FIAT_SHAMIR_TRANSCRIPT_MAX_TRACES_PER_BATCH)
-        .map(|chunk| {
-            let tx_index = chunk[0].tx_index;
-            let traces = chunk
-                .iter()
-                .map(|trace| trace.transcript.clone())
-                .collect::<Vec<_>>();
-            (tx_index, traces)
-        })
-        .collect())
-}
-
-fn prove_authorization_transcript_components(
-    components: &FullAcceptedBlockBatchProofComponents,
-) -> Result<Vec<FiatShamirTranscriptBatchProofKillShot>, FullAcceptedBlockBatchError> {
-    let chunks = authorization_transcript_chunks(components)?;
-    if chunks.is_empty() {
-        return Ok(Vec::new());
-    }
-    chunks
-        .par_iter()
-        .enumerate()
-        .map(|(chunk_index, (tx_index, traces))| {
-            let mut channel = noid_poseidon2b::channel::Poseidon2bChannel::new();
-            prove_fiat_shamir_transcript_batch_killshot(traces, &mut channel)
-                .map(|(proof, _)| proof)
-                .map_err(|_| FullAcceptedBlockBatchError::AuthorizationComponent {
-                    index: chunk_index,
-                    tx_index: *tx_index,
-                })
         })
         .collect()
 }
@@ -2191,7 +2129,6 @@ mod tests {
         )
         .expect("component proof proves");
         assert!(component_proof.byte_len(&out.proof_components.component_inputs) > 0);
-        assert_eq!(component_proof.authorization_transcripts.len(), 1);
         let verified_components = verify_full_accepted_block_batch_components(
             &start_consensus,
             &start_accumulator,
@@ -2386,20 +2323,6 @@ mod tests {
                 &component_proof,
             ),
             Err(FullAcceptedBlockBatchError::ComponentShapeMismatch)
-        ));
-
-        let mut bad_component_proof = component_proof.clone();
-        bad_component_proof.authorization_transcripts[0].n_ops += 1;
-        assert!(matches!(
-            verify_full_accepted_block_batch_components(
-                &start_consensus,
-                &start_accumulator,
-                &verified_components.accumulator,
-                &out.proof_components,
-                &bad_component_proof,
-            ),
-            Err(FullAcceptedBlockBatchError::AuthorizationComponent { .. })
-                | Err(FullAcceptedBlockBatchError::ComponentShapeMismatch)
         ));
 
         let mut bad_sidecar =

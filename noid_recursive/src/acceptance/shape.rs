@@ -13,6 +13,10 @@
 //! killshot verifier that `verify_accepted_block_batch_components` runs for a
 //! real accepted block was replayed with a counting Fiat-Shamir channel
 //! (exact production challenge stream; exact Poseidon2b permutation counts).
+//! The auth-FS transcript killshot was DELETED from the certificate
+//! (2026-07-05): replaying the owner-auth verifier directly is ~3.9x
+//! cheaper than verifying the killshot that attests its transcript
+//! hashing, so the totals below are the whole replay.
 //!
 //! These are *measured statistics*, not yet the frozen protocol shape: the
 //! final padding maxima and loop bounds (the real `shape_digest` of the
@@ -72,16 +76,11 @@ impl CaseStats {
         self.total_perms() * PERM_TRACE_CONSTRAINTS as u64
     }
 
-    /// [K] perms excluding the auth-FS-transcript killshot, which has negative
-    /// leverage inside the trace: replaying
-    /// the owner-auth verifier directly is ~3.9x cheaper than verifying the
-    /// killshot that proves its transcript hashing.
+    /// Historical alias from when the auth-FS transcript killshot was part
+    /// of the certificate; the killshot is deleted, so this equals
+    /// [`CaseStats::total_perms`].
     pub fn perms_without_auth_fs(&self) -> u64 {
-        self.components
-            .iter()
-            .filter(|c| c.name != AUTH_FS_TRANSCRIPTS)
-            .map(|c| c.perms as u64)
-            .sum()
+        self.total_perms()
     }
 }
 
@@ -90,7 +89,6 @@ pub const TX_BODY_STANDARD_SPINE: &str = "tx_body_standard_spine";
 pub const TX_BODY_SWEEP_SPINE: &str = "tx_body_sweep_spine";
 pub const TX_ROOT_MERKLE: &str = "tx_root_merkle";
 pub const OWNER_AUTH: &str = "owner_auth";
-pub const AUTH_FS_TRANSCRIPTS: &str = "auth_fs_transcripts";
 pub const CHECKPOINT_HEADER_HASH: &str = "checkpoint_header_hash";
 pub const CHECKPOINT_CHAIN_ACCUMULATOR: &str = "checkpoint_chain_accumulator";
 pub const EXACT_STATE_SLOT_LEAVES: &str = "exact_state.slot_leaves";
@@ -119,7 +117,6 @@ pub const CASE_USER_TXS_1: CaseStats = CaseStats {
         ComponentStats { name: TX_BODY_STANDARD_SPINE, instances: 1, absorbs: 265, squeezes: 82, perms: 213 },
         ComponentStats { name: TX_ROOT_MERKLE, instances: 1, absorbs: 198, squeezes: 57, perms: 154 },
         ComponentStats { name: OWNER_AUTH, instances: 1, absorbs: 308, squeezes: 48, perms: 200 },
-        ComponentStats { name: AUTH_FS_TRANSCRIPTS, instances: 1, absorbs: 1008, squeezes: 92, perms: 595 },
         ComponentStats { name: CHECKPOINT_HEADER_HASH, instances: 1, absorbs: 272, squeezes: 77, perms: 211 },
         ComponentStats { name: CHECKPOINT_CHAIN_ACCUMULATOR, instances: 1, absorbs: 214, squeezes: 62, perms: 168 },
         ComponentStats { name: EXACT_STATE_SLOT_LEAVES, instances: 1, absorbs: 240, squeezes: 67, perms: 185 },
@@ -139,7 +136,6 @@ pub const CASE_USER_TXS_4: CaseStats = CaseStats {
         ComponentStats { name: TX_BODY_STANDARD_SPINE, instances: 1, absorbs: 301, squeezes: 92, perms: 241 },
         ComponentStats { name: TX_ROOT_MERKLE, instances: 1, absorbs: 275, squeezes: 72, perms: 208 },
         ComponentStats { name: OWNER_AUTH, instances: 4, absorbs: 1232, squeezes: 192, perms: 800 },
-        ComponentStats { name: AUTH_FS_TRANSCRIPTS, instances: 1, absorbs: 3177, squeezes: 102, perms: 1689 },
         ComponentStats { name: CHECKPOINT_HEADER_HASH, instances: 1, absorbs: 272, squeezes: 77, perms: 211 },
         ComponentStats { name: CHECKPOINT_CHAIN_ACCUMULATOR, instances: 1, absorbs: 214, squeezes: 62, perms: 168 },
         ComponentStats { name: EXACT_STATE_SLOT_LEAVES, instances: 1, absorbs: 330, squeezes: 77, perms: 240 },
@@ -159,7 +155,6 @@ pub const CASE_USER_TXS_16: CaseStats = CaseStats {
         ComponentStats { name: TX_BODY_STANDARD_SPINE, instances: 1, absorbs: 355, squeezes: 102, perms: 278 },
         ComponentStats { name: TX_ROOT_MERKLE, instances: 1, absorbs: 504, squeezes: 87, perms: 337 },
         ComponentStats { name: OWNER_AUTH, instances: 16, absorbs: 4928, squeezes: 768, perms: 3200 },
-        ComponentStats { name: AUTH_FS_TRANSCRIPTS, instances: 1, absorbs: 11763, squeezes: 112, perms: 5992 },
         ComponentStats { name: CHECKPOINT_HEADER_HASH, instances: 1, absorbs: 272, squeezes: 77, perms: 211 },
         ComponentStats { name: CHECKPOINT_CHAIN_ACCUMULATOR, instances: 1, absorbs: 214, squeezes: 62, perms: 168 },
         ComponentStats { name: EXACT_STATE_SLOT_LEAVES, instances: 1, absorbs: 600, squeezes: 87, perms: 385 },
@@ -180,7 +175,6 @@ pub const CASE_SWEEP_TXS_1: CaseStats = CaseStats {
         ComponentStats { name: TX_BODY_SWEEP_SPINE, instances: 1, absorbs: 295, squeezes: 92, perms: 238 },
         ComponentStats { name: TX_ROOT_MERKLE, instances: 1, absorbs: 198, squeezes: 57, perms: 154 },
         ComponentStats { name: OWNER_AUTH, instances: 1, absorbs: 508, squeezes: 73, perms: 322 },
-        ComponentStats { name: AUTH_FS_TRANSCRIPTS, instances: 1, absorbs: 1473, squeezes: 97, perms: 832 },
         ComponentStats { name: CHECKPOINT_HEADER_HASH, instances: 1, absorbs: 272, squeezes: 77, perms: 211 },
         ComponentStats { name: CHECKPOINT_CHAIN_ACCUMULATOR, instances: 1, absorbs: 214, squeezes: 62, perms: 168 },
         ComponentStats { name: EXACT_STATE_SLOT_LEAVES, instances: 1, absorbs: 550, squeezes: 87, perms: 360 },
@@ -201,7 +195,6 @@ pub const CASE_SWEEP_TXS_4: CaseStats = CaseStats {
         ComponentStats { name: TX_BODY_SWEEP_SPINE, instances: 1, absorbs: 331, squeezes: 102, perms: 266 },
         ComponentStats { name: TX_ROOT_MERKLE, instances: 1, absorbs: 275, squeezes: 72, perms: 208 },
         ComponentStats { name: OWNER_AUTH, instances: 4, absorbs: 2032, squeezes: 292, perms: 1288 },
-        ComponentStats { name: AUTH_FS_TRANSCRIPTS, instances: 1, absorbs: 4992, squeezes: 107, perms: 2601 },
         ComponentStats { name: CHECKPOINT_HEADER_HASH, instances: 1, absorbs: 272, squeezes: 77, perms: 211 },
         ComponentStats { name: CHECKPOINT_CHAIN_ACCUMULATOR, instances: 1, absorbs: 214, squeezes: 62, perms: 168 },
         ComponentStats { name: EXACT_STATE_SLOT_LEAVES, instances: 1, absorbs: 1390, squeezes: 97, perms: 790 },
@@ -221,23 +214,22 @@ pub const MEASURED_CASES: &[&CaseStats] = &[
     &CASE_SWEEP_TXS_4,
 ];
 
-/// Marginal verifier-FS permutations per standard tx, full replay:
-/// (12398 - 634) / 16, floored. (Pre-freeze-diet value: 1,104.)
-pub const MARGINAL_PERMS_PER_STANDARD_TX_FULL: u32 = 735;
+/// Marginal verifier-FS permutations per standard tx (the auth-FS
+/// transcript killshot no longer exists): (6406 - 634) / 16, floored.
+pub const MARGINAL_PERMS_PER_STANDARD_TX_FULL: u32 = 360;
 
-/// Marginal perms per standard tx once the auth-FS-transcript killshot is
-/// dropped from the trace: (12398 - 5992 - 634) / 16, floored.
-/// (Pre-freeze-diet value: 656.)
-pub const MARGINAL_PERMS_PER_STANDARD_TX_NO_AUTH_FS: u32 = 360;
+/// Historical alias — equals the full marginal now.
+pub const MARGINAL_PERMS_PER_STANDARD_TX_NO_AUTH_FS: u32 =
+    MARGINAL_PERMS_PER_STANDARD_TX_FULL;
 
-/// Marginal verifier-FS permutations per full Sweep25x2 tx, full replay:
-/// (9123 - 634) / 4, floored.
-pub const MARGINAL_PERMS_PER_SWEEP_TX_FULL: u32 = 2_122;
+/// Marginal verifier-FS permutations per full Sweep25x2 tx:
+/// (6522 - 634) / 4. Dominated by the exact-state Merkle path batch
+/// (27 touched slots per sweep vs 2 per standard tx).
+pub const MARGINAL_PERMS_PER_SWEEP_TX_FULL: u32 = 1_472;
 
-/// Marginal perms per full Sweep25x2 tx (auth-FS-transcript killshot
-/// dropped): (9123 - 2601 - 634) / 4. Dominated by the exact-state Merkle
-/// path batch (27 touched slots per sweep vs 2 per standard tx).
-pub const MARGINAL_PERMS_PER_SWEEP_TX_NO_AUTH_FS: u32 = 1_472;
+/// Historical alias — equals the full marginal now.
+pub const MARGINAL_PERMS_PER_SWEEP_TX_NO_AUTH_FS: u32 =
+    MARGINAL_PERMS_PER_SWEEP_TX_FULL;
 
 /// Consensus block maxima (source of truth: `noid_chain::consensus::params`).
 /// 255 standard user txs + coinbase, or 40 full Sweep25x2 txs.
@@ -250,9 +242,9 @@ pub const BLOCK_MAX_FULL_SWEEP_TXS: usize =
 ///
 /// Linear extrapolation of the 16-tx measurement — a conservative UPPER
 /// bound: the env-gated 255-tx run (`NOID_SHAPE_MAX_STD=1`, 2026-07-05,
-/// post-freeze-diet) measured 71,459 perms (no auth-FS) vs 92,434 projected
-/// (−23%), because batched-killshot round/terminal costs amortize with batch
-/// size while this projection scales them linearly.
+/// post-freeze-diet) measured 71,459 perms vs 92,434 projected (−23%),
+/// because batched-killshot round/terminal costs amortize with batch size
+/// while this projection scales them linearly.
 pub fn projected_perms_std_txs_no_auth_fs(n: usize) -> u64 {
     CASE_COINBASE_ONLY.total_perms() + n as u64 * MARGINAL_PERMS_PER_STANDARD_TX_NO_AUTH_FS as u64
 }
@@ -266,9 +258,8 @@ pub fn projected_perms_sweep_txs_no_auth_fs(n: usize) -> u64 {
 }
 
 /// Conservative [K] perms upper bound for the consensus-max standard block
-/// (255 user txs). Measured post-freeze-diet @255: 71,459 perms without
-/// auth-FS (166,975 full replay, ~2^25.8 constraints full / ~2^24.6
-/// without).
+/// (255 user txs). Measured post-freeze-diet @255: 71,459 perms
+/// (~2^24.6 trace constraints; the auth-FS killshot is deleted).
 pub fn projected_perms_max_standard_block_no_auth_fs() -> u64 {
     projected_perms_std_txs_no_auth_fs(BLOCK_MAX_STANDARD_USER_TXS)
 }
@@ -279,7 +270,7 @@ pub fn projected_perms_max_sweep_block_no_auth_fs() -> u64 {
     projected_perms_sweep_txs_no_auth_fs(BLOCK_MAX_FULL_SWEEP_TXS)
 }
 
-const SHAPE_STATS_DOMAIN: &[u8] = b"NOID-TIER1-SHAPE-STATS-P05-V3";
+const SHAPE_STATS_DOMAIN: &[u8] = b"NOID-TIER1-SHAPE-STATS-P05-V4";
 
 /// Digest pinning this (post-squeeze-diet) measurement snapshot, so
 /// downstream consumers can detect a stale table. NOT the protocol
@@ -311,34 +302,24 @@ mod tests {
     #[test]
     fn case_totals_match_measurement() {
         assert_eq!(CASE_COINBASE_ONLY.total_perms(), 634);
-        assert_eq!(CASE_USER_TXS_1.total_perms(), 2_782);
-        assert_eq!(CASE_USER_TXS_4.total_perms(), 4_812);
-        assert_eq!(CASE_USER_TXS_16.total_perms(), 12_398);
-        assert_eq!(CASE_USER_TXS_16.total_absorbs(), 21_506);
-        assert_eq!(CASE_USER_TXS_16.total_squeezes(), 1_695);
-        assert_eq!(CASE_USER_TXS_16.perms_without_auth_fs(), 6_406);
-        assert_eq!(CASE_SWEEP_TXS_1.total_perms(), 4_007);
-        assert_eq!(CASE_SWEEP_TXS_1.total_absorbs(), 6_169);
-        assert_eq!(CASE_SWEEP_TXS_1.total_squeezes(), 945);
-        assert_eq!(CASE_SWEEP_TXS_4.total_perms(), 9_123);
-        assert_eq!(CASE_SWEEP_TXS_4.total_absorbs(), 15_864);
-        assert_eq!(CASE_SWEEP_TXS_4.total_squeezes(), 1_229);
-        assert_eq!(CASE_SWEEP_TXS_4.perms_without_auth_fs(), 6_522);
+        assert_eq!(CASE_USER_TXS_1.total_perms(), 2_187);
+        assert_eq!(CASE_USER_TXS_4.total_perms(), 3_123);
+        assert_eq!(CASE_USER_TXS_16.total_perms(), 6_406);
+        assert_eq!(CASE_USER_TXS_16.total_absorbs(), 9_743);
+        assert_eq!(CASE_USER_TXS_16.total_squeezes(), 1_583);
+        assert_eq!(CASE_SWEEP_TXS_1.total_perms(), 3_175);
+        assert_eq!(CASE_SWEEP_TXS_1.total_absorbs(), 4_696);
+        assert_eq!(CASE_SWEEP_TXS_1.total_squeezes(), 848);
+        assert_eq!(CASE_SWEEP_TXS_4.total_perms(), 6_522);
+        assert_eq!(CASE_SWEEP_TXS_4.total_absorbs(), 10_872);
+        assert_eq!(CASE_SWEEP_TXS_4.total_squeezes(), 1_122);
         assert_eq!(
             MARGINAL_PERMS_PER_STANDARD_TX_FULL as u64,
             (CASE_USER_TXS_16.total_perms() - CASE_COINBASE_ONLY.total_perms()) / 16
         );
         assert_eq!(
-            MARGINAL_PERMS_PER_STANDARD_TX_NO_AUTH_FS as u64,
-            (CASE_USER_TXS_16.perms_without_auth_fs() - CASE_COINBASE_ONLY.total_perms()) / 16
-        );
-        assert_eq!(
             MARGINAL_PERMS_PER_SWEEP_TX_FULL as u64,
             (CASE_SWEEP_TXS_4.total_perms() - CASE_COINBASE_ONLY.total_perms()) / 4
-        );
-        assert_eq!(
-            MARGINAL_PERMS_PER_SWEEP_TX_NO_AUTH_FS as u64,
-            (CASE_SWEEP_TXS_4.perms_without_auth_fs() - CASE_COINBASE_ONLY.total_perms()) / 4
         );
     }
 
