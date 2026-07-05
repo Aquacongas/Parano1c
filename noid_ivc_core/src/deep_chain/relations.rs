@@ -767,6 +767,130 @@ pub fn verify_shift_discharge_pow2<Ch: Challenger>(
     Ok(point)
 }
 
+// ---------------------------------------------------------------------------
+// Weighted-sum discharge (closed-form kernel)
+// ---------------------------------------------------------------------------
+
+/// Proof wires of one weighted-sum discharge (degree-2 rounds `[c_0, c_2]`
+/// plus the terminal plain MLE value of the committed column).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WeightedSumProof {
+    pub rounds: Vec<[F128; 2]>,
+    pub final_value: F128,
+}
+
+/// Prove `target = Σ_i weights[i]·col[i]` as a product-of-two-multilinears
+/// sumcheck, reducing it to a plain claim `col~(point) = final_value`. The
+/// weight sequence is a CLOSED-FORM kernel (e.g. the additive-NTT encode
+/// kernel times `eq(right, ·)`): the prover materializes it here, but the
+/// verifier never does — it re-derives `weights~(point)` in O(n) from the
+/// kernel's closed form (passed to [`verify_weighted_sum`]). This is the
+/// source-binding reduction `codeword~(z) = Σ_i K_i(z)·eq(right,i)·H[i]`.
+pub fn prove_weighted_sum<Ch: Challenger>(
+    col: &[F128],
+    weights: &[F128],
+    target: F128,
+    challenger: &mut Ch,
+) -> (WeightedSumProof, Vec<F128>) {
+    let w = col.len();
+    assert_eq!(weights.len(), w, "weight length");
+    assert!(w.is_power_of_two());
+    let w_log = w.trailing_zeros() as usize;
+
+    absorb_weighted_header(challenger, target);
+
+    let mut wt = weights.to_vec();
+    let mut col_t = col.to_vec();
+    let mut claim = target;
+    let mut rounds = Vec::with_capacity(w_log);
+    let mut point = Vec::with_capacity(w_log);
+    for _round in 0..w_log {
+        let half = wt.len() / 2;
+        let evals = (0..half)
+            .into_par_iter()
+            .fold(
+                || [F128::ZERO; 3],
+                |mut acc, p| {
+                    let wb = wt[2 * p];
+                    let wd = wt[2 * p] + wt[2 * p + 1];
+                    let cb = col_t[2 * p];
+                    let cd = col_t[2 * p] + col_t[2 * p + 1];
+                    for (t, slot) in acc.iter_mut().enumerate() {
+                        let t_f = f128_of_usize(t);
+                        *slot += (wb + t_f * wd) * (cb + t_f * cd);
+                    }
+                    acc
+                },
+            )
+            .reduce(
+                || [F128::ZERO; 3],
+                |mut a, b| {
+                    for (x, y) in a.iter_mut().zip(b.iter()) {
+                        *x += *y;
+                    }
+                    a
+                },
+            );
+        let full = interpolate_deg2(&evals);
+        debug_assert_eq!(full[1] + full[2], claim);
+        let wire = [full[0], full[2]];
+        challenger.observe_f128_slice(&wire);
+        let r = challenger.sample_f128();
+        claim = (full[2] * r + full[1]) * r + full[0];
+        point.push(r);
+        rounds.push(wire);
+        fold_table(&mut wt, r);
+        fold_table(&mut col_t, r);
+    }
+    let final_value = col_t[0];
+    challenger.observe_f128(final_value);
+    debug_assert_eq!(wt[0] * final_value, claim);
+    (
+        WeightedSumProof {
+            rounds,
+            final_value,
+        },
+        point,
+    )
+}
+
+/// Verify a weighted-sum discharge; returns the derived point. `weight_eval`
+/// computes `weights~(derived point)` from the kernel's CLOSED FORM (the
+/// derived point is only known inside the sumcheck, so it is a callback):
+/// the terminal check is `weights~(point)·final_value = claim`. Pair
+/// `(point, final_value)` as the column's plain PCS opening claim.
+pub fn verify_weighted_sum<Ch: Challenger, W: Fn(&[F128]) -> F128>(
+    w_log: usize,
+    weight_eval: W,
+    target: F128,
+    proof: &WeightedSumProof,
+    challenger: &mut Ch,
+) -> Result<Vec<F128>, RelationError> {
+    if proof.rounds.len() != w_log {
+        return Err(RelationError::Shape);
+    }
+    absorb_weighted_header(challenger, target);
+    let mut claim = target;
+    let mut point = Vec::with_capacity(w_log);
+    for wire in &proof.rounds {
+        challenger.observe_f128_slice(wire);
+        let c1 = claim + wire[1];
+        let r = challenger.sample_f128();
+        claim = (wire[1] * r + c1) * r + wire[0];
+        point.push(r);
+    }
+    challenger.observe_f128(proof.final_value);
+    if weight_eval(&point) * proof.final_value != claim {
+        return Err(RelationError::FinalMismatch);
+    }
+    Ok(point)
+}
+
+fn absorb_weighted_header<Ch: Challenger>(challenger: &mut Ch, target: F128) {
+    challenger.observe_label(b"history-deep-chain-weighted-v0");
+    challenger.observe_f128(target);
+}
+
 fn interpolate_deg2(evals: &[F128; 3]) -> [F128; 3] {
     // Nodes 0, 1, 2 (flat basis). c_0 = p(0). Solve the 2×2 system for
     // c_1, c_2 (char-2 exact): p(1) = c_0 + c_1 + c_2;
@@ -1064,6 +1188,74 @@ mod tests {
             }
         }
         assert!(survivors.is_empty(), "relation mutation survivors: {survivors:?}");
+    }
+
+    /// Weighted-sum discharge with a tensor-product closed-form weight (the
+    /// shape of `K_i(z)·eq(right,i)` in the source binding): the sumcheck
+    /// reduces `Σ_i w_i·col_i = target` to a plain `col~(point)` claim, and
+    /// the terminal check uses `weights~(point)` from the closed form.
+    #[test]
+    fn weighted_sum_discharge_roundtrip_and_mutations() {
+        let mut rng = Rng(0x8E19);
+        let w_log = 5;
+        let w = 1usize << w_log;
+        let col = random_col(&mut rng, w);
+        // A rank-1 tensor weight w_i = Π_l f_l(i_l) — the encode-kernel shape.
+        let f0: Vec<F128> = (0..w_log).map(|_| rng.f128()).collect();
+        let f1: Vec<F128> = (0..w_log).map(|_| rng.f128()).collect();
+        let weights: Vec<F128> = (0..w)
+            .map(|i| {
+                let mut p = F128::ONE;
+                for l in 0..w_log {
+                    p = p * if (i >> l) & 1 == 1 { f1[l] } else { f0[l] };
+                }
+                p
+            })
+            .collect();
+        // Closed-form MLE of the tensor weight at a point.
+        let weight_eval = |pt: &[F128]| -> F128 {
+            let mut p = F128::ONE;
+            for l in 0..w_log {
+                p = p * (f0[l] * (F128::ONE + pt[l]) + f1[l] * pt[l]);
+            }
+            p
+        };
+        let mut target = F128::ZERO;
+        for i in 0..w {
+            target += weights[i] * col[i];
+        }
+
+        let mut ch_p = FsLaneChallenger::new(b"wsum-test");
+        let (proof, point_p) = prove_weighted_sum(&col, &weights, target, &mut ch_p);
+        let mut ch_v = FsLaneChallenger::new(b"wsum-test");
+        let point_v = verify_weighted_sum(w_log, weight_eval, target, &proof, &mut ch_v)
+            .expect("honest weighted sum");
+        assert_eq!(point_p, point_v);
+        assert_eq!(mle_eval(&col, &point_v), proof.final_value);
+        // The closed-form weight matches the materialized weight's MLE.
+        assert_eq!(weight_eval(&point_v), mle_eval(&weights, &point_v));
+        assert_eq!(ch_p.sample_f128(), ch_v.sample_f128());
+
+        // Forged target rejected.
+        let mut ch = FsLaneChallenger::new(b"wsum-test");
+        assert!(verify_weighted_sum(w_log, weight_eval, target + F128::ONE, &proof, &mut ch).is_err());
+
+        // Wire mutations rejected or land on a false plain claim.
+        for round in 0..w_log {
+            for c in 0..2 {
+                let mut bad = proof.clone();
+                bad.rounds[round][c] += F128::ONE;
+                let mut ch = FsLaneChallenger::new(b"wsum-test");
+                match verify_weighted_sum(w_log, weight_eval, target, &bad, &mut ch) {
+                    Err(_) => {}
+                    Ok(pt) => assert_ne!(
+                        mle_eval(&col, &pt),
+                        bad.final_value,
+                        "mutation {round}/{c} survived"
+                    ),
+                }
+            }
+        }
     }
 
     /// Windowed reads: fan-in-2 tree wiring. A parent-level relation reads
