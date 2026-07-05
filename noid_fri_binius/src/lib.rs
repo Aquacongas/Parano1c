@@ -36,6 +36,7 @@
 //! 128-bit Johnson) would roughly double the opening bytes.
 
 pub mod compact_fri;
+pub mod encode_kernel;
 pub mod interleaved_commit;
 pub mod mixed_open;
 
