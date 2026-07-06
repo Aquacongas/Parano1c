@@ -427,7 +427,17 @@ fn push_u64(out: &mut Vec<u8>, value: u64) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
-/// Block-diagonal `(I ⊗ M_0) · z` over F128, parallel over blocks.
+/// Block-diagonal `(I ⊗ M_0) · z` over F128.
+///
+/// Parallel over the Kronecker blocks AND, within each block, over row chunks.
+/// Block-only parallelism (one task per `k`-sized block) starves when there
+/// are few large blocks: the recursion link commits ONE block of `2^k_log`
+/// rows, so a block-parallel loop is a single serial task walking millions of
+/// rows (measured ~6.5 s at `k_log = 24`). Nesting a row-chunk `par_chunks_mut`
+/// restores full core utilization there and is a no-op for the many-small-block
+/// regime (a block shorter than `ROW_CHUNK` yields one inner chunk). The
+/// per-row work and its accumulation order are unchanged, so the output is
+/// bit-identical to the serial form.
 pub fn apply_block_diag_field(m_0: &SparseFieldMatrix, z: &[F128], k_log: usize) -> Vec<F128> {
     use rayon::prelude::*;
 
@@ -436,17 +446,24 @@ pub fn apply_block_diag_field(m_0: &SparseFieldMatrix, z: &[F128], k_log: usize)
     assert_eq!(m_0.num_cols, k);
     assert_eq!(z.len() % k, 0);
 
+    const ROW_CHUNK: usize = 4096;
     let mut out = vec![F128::ZERO; z.len()];
     out.par_chunks_mut(k)
         .zip(z.par_chunks(k))
         .for_each(|(out_block, z_block)| {
-            for r in 0..m_0.num_rows {
-                let mut acc = F128::ZERO;
-                for (c, coeff) in m_0.row(r) {
-                    acc += coeff * z_block[c as usize];
-                }
-                out_block[r] = acc;
-            }
+            out_block
+                .par_chunks_mut(ROW_CHUNK)
+                .enumerate()
+                .for_each(|(ci, out_rows)| {
+                    let r0 = ci * ROW_CHUNK;
+                    for (j, o) in out_rows.iter_mut().enumerate() {
+                        let mut acc = F128::ZERO;
+                        for (c, coeff) in m_0.row(r0 + j) {
+                            acc += coeff * z_block[c as usize];
+                        }
+                        *o = acc;
+                    }
+                });
         });
     out
 }
