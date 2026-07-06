@@ -185,8 +185,20 @@ impl LinExpr {
 /// all-ones, excluding the `z_0 = 0` root).
 pub struct FieldR1csBuilder {
     values: Vec<F128>,
-    rows_a: Vec<Vec<(u32, F128)>>,
-    rows_b: Vec<Vec<(u32, F128)>>,
+    /// A/B constraint matrices in CSR-under-construction form. Rows are filled
+    /// strictly in wire order — every allocation appends exactly one row, set
+    /// once — so entries and one offset per wire are appended as they are
+    /// built, never a `Vec<Vec>` of per-row heap allocations. At the m=24
+    /// block-bearing class the `Vec<Vec>` form was a ~7.6 GB transient during
+    /// trace construction (32 B/nonzero + a 24 B `Vec` header per row); CSR
+    /// here is 20 B/nonzero + 8 B/row and moves straight into the
+    /// `SparseFieldMatrix` at `build`, with no flatten pass.
+    a_cols: Vec<u32>,
+    a_vals: Vec<F128>,
+    a_offsets: Vec<usize>,
+    b_cols: Vec<u32>,
+    b_vals: Vec<F128>,
+    b_offsets: Vec<usize>,
     /// `(wire, value)` pairs registered through [`Self::alloc_public_f128`].
     publics: Vec<(u32, F128)>,
 }
@@ -201,15 +213,17 @@ impl FieldR1csBuilder {
     pub fn new() -> Self {
         let mut b = Self {
             values: Vec::new(),
-            rows_a: Vec::new(),
-            rows_b: Vec::new(),
+            a_cols: Vec::new(),
+            a_vals: Vec::new(),
+            a_offsets: vec![0],
+            b_cols: Vec::new(),
+            b_vals: Vec::new(),
+            b_offsets: vec![0],
             publics: Vec::new(),
         };
         // Wire 0: the constant-one wire, z_0 = z_0 · z_0.
-        let w = b.push_wire(F128::ONE);
+        let w = b.commit_wire(F128::ONE, &[(0, F128::ONE)], &[(0, F128::ONE)]);
         debug_assert_eq!(w.0, 0);
-        b.rows_a[0] = vec![(0, F128::ONE)];
-        b.rows_b[0] = vec![(0, F128::ONE)];
         b
     }
 
@@ -222,12 +236,29 @@ impl FieldR1csBuilder {
         self.values.len()
     }
 
-    fn push_wire(&mut self, value: F128) -> Wire {
+    /// Index the next allocation will assign.
+    #[inline]
+    fn next_wire(&self) -> u32 {
+        self.values.len() as u32
+    }
+
+    /// Append one wire: its witness value and its A/B matrix rows (entries in
+    /// the order they were built — the per-row order every consumer and the
+    /// statement digest depend on).
+    fn commit_wire(&mut self, value: F128, a_row: &[(u32, F128)], b_row: &[(u32, F128)]) -> Wire {
         let idx = self.values.len();
         assert!(idx < u32::MAX as usize);
         self.values.push(value);
-        self.rows_a.push(Vec::new());
-        self.rows_b.push(Vec::new());
+        for &(c, v) in a_row {
+            self.a_cols.push(c);
+            self.a_vals.push(v);
+        }
+        self.a_offsets.push(self.a_cols.len());
+        for &(c, v) in b_row {
+            self.b_cols.push(c);
+            self.b_vals.push(v);
+        }
+        self.b_offsets.push(self.b_cols.len());
         Wire(idx as u32)
     }
 
@@ -252,10 +283,8 @@ impl FieldR1csBuilder {
 
     /// Free (unconstrained) input wire: tautology row `z_i = z_i · 1`.
     pub fn alloc_f128(&mut self, value: F128) -> Wire {
-        let w = self.push_wire(value);
-        self.rows_a[w.0 as usize] = vec![(w.0, F128::ONE)];
-        self.rows_b[w.0 as usize] = vec![(0, F128::ONE)];
-        w
+        let w = self.next_wire();
+        self.commit_wire(value, &[(w, F128::ONE)], &[(0, F128::ONE)])
     }
 
     /// Public-input wire: row forces `z_i = value` (`A_i = value·col_0`,
@@ -263,31 +292,31 @@ impl FieldR1csBuilder {
     /// The pinned value is part of the statement (it lives in the matrix,
     /// which the statement digest covers).
     pub fn alloc_public_f128(&mut self, value: F128) -> Wire {
-        let w = self.push_wire(value);
-        if value != F128::ZERO {
-            self.rows_a[w.0 as usize] = vec![(0, value)];
-        }
-        self.rows_b[w.0 as usize] = vec![(0, F128::ONE)];
-        self.publics.push((w.0, value));
-        w
+        let w = self.next_wire();
+        let a_row: Vec<(u32, F128)> = if value != F128::ZERO {
+            vec![(0, value)]
+        } else {
+            Vec::new()
+        };
+        let wire = self.commit_wire(value, &a_row, &[(0, F128::ONE)]);
+        self.publics.push((w, value));
+        wire
     }
 
     /// Boolean wire: row `z_i = z_i · z_i` ⇒ `z_i ∈ {0, 1}` (the only
     /// idempotents of a field). Zero multiplication cost beyond the row.
     pub fn alloc_bool(&mut self, bit: bool) -> Wire {
-        let w = self.push_wire(if bit { F128::ONE } else { F128::ZERO });
-        self.rows_a[w.0 as usize] = vec![(w.0, F128::ONE)];
-        self.rows_b[w.0 as usize] = vec![(w.0, F128::ONE)];
-        w
+        let w = self.next_wire();
+        let v = if bit { F128::ONE } else { F128::ZERO };
+        self.commit_wire(v, &[(w, F128::ONE)], &[(w, F128::ONE)])
     }
 
     /// One multiplication constraint: new wire `w = x · y`.
     pub fn mul(&mut self, x: &LinExpr, y: &LinExpr) -> Wire {
         let value = x.eval(&self.values) * y.eval(&self.values);
-        let w = self.push_wire(value);
-        self.rows_a[w.0 as usize] = Self::expr_to_row(x);
-        self.rows_b[w.0 as usize] = Self::expr_to_row(y);
-        w
+        let a_row = Self::expr_to_row(x);
+        let b_row = Self::expr_to_row(y);
+        self.commit_wire(value, &a_row, &b_row)
     }
 
     /// Materialize an expression into a single wire (`w = expr · 1`).
@@ -298,17 +327,15 @@ impl FieldR1csBuilder {
     /// Assert `expr == expected` (one wire, self-cancelling row:
     /// `z_w = (z_w + expr + expected) · 1` ⇒ `expr + expected = 0`).
     pub fn pin_f128(&mut self, expr: &LinExpr, expected: F128) {
-        let w = self.push_wire(F128::ZERO);
-        let full = expr
-            .add(&LinExpr::from_wire(w))
-            .add_const(expected);
-        self.rows_a[w.0 as usize] = Self::expr_to_row(&full);
-        self.rows_b[w.0 as usize] = vec![(0, F128::ONE)];
+        let w = self.next_wire();
+        let full = expr.add(&LinExpr::from_wire(Wire(w))).add_const(expected);
+        let a_row = Self::expr_to_row(&full);
         debug_assert_eq!(
             expr.eval(&self.values),
             expected,
             "pin_f128: witness does not satisfy the pinned equality"
         );
+        self.commit_wire(F128::ZERO, &a_row, &[(0, F128::ONE)]);
     }
 
     /// Finish: pad to the next power of two (≥ 2^7 — the zerocheck needs
@@ -322,10 +349,16 @@ impl FieldR1csBuilder {
             .max(7) as usize;
         let k = 1usize << k_log;
 
-        let mut rows_a = self.rows_a;
-        let mut rows_b = self.rows_b;
-        rows_a.resize(k, Vec::new());
-        rows_b.resize(k, Vec::new());
+        // Pad to k rows: the extra rows are empty, so their offset just repeats
+        // the current entry count (row r spans [offsets[r], offsets[r+1])).
+        let a_cols = self.a_cols;
+        let a_vals = self.a_vals;
+        let mut a_offsets = self.a_offsets;
+        a_offsets.resize(k + 1, a_cols.len());
+        let b_cols = self.b_cols;
+        let b_vals = self.b_vals;
+        let mut b_offsets = self.b_offsets;
+        b_offsets.resize(k + 1, b_cols.len());
         let mut values = self.values;
         values.resize(k, F128::ZERO);
 
@@ -334,8 +367,20 @@ impl FieldR1csBuilder {
             k_log,
             k_skip: crate::zerocheck::K_SKIP,
             useful_rows: n_wires,
-            a_0: SparseFieldMatrix::from_rows(k, rows_a),
-            b_0: SparseFieldMatrix::from_rows(k, rows_b),
+            a_0: SparseFieldMatrix {
+                num_rows: k,
+                num_cols: k,
+                col_indices: a_cols,
+                values: a_vals,
+                row_offsets: a_offsets,
+            },
+            b_0: SparseFieldMatrix {
+                num_rows: k,
+                num_cols: k,
+                col_indices: b_cols,
+                values: b_vals,
+                row_offsets: b_offsets,
+            },
             const_pin: Some(0),
             digest_cache: std::sync::OnceLock::new(),
             csc_cache: std::sync::OnceLock::new(),
