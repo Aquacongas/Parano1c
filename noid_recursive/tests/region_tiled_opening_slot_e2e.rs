@@ -51,6 +51,25 @@ use noid_recursive::acceptance::trace::deep_chain::{
 };
 use noid_recursive::acceptance::trace::{mul, pin_eq};
 
+// FRI-round grand-leg (3i) extra imports: the real FRICHANL channel + fold.
+use noid_core::{AdditiveNTT, Block128};
+use noid_fri::code::LOG_RATE;
+use noid_fri_binius::compact_fri::{
+    compute_round_depth, expand_batched_merkle_proof, BatchedMerkleProof,
+};
+use noid_fri_binius::mixed_open::{high_pair_tree_depth, MIXED_OPEN_TAG, MIXED_SOURCE_BINDING_TAG};
+use noid_fri_binius::{COMPACT_NUM_QUERIES, COMPACT_TAU};
+use noid_gkr::auth_pcs::{commit_auth_mle_column, open_auth_mle_committed, AuthMleOpeningProof};
+use noid_gkr::batch_eval::BatchEvalReduction;
+use noid_poseidon2b::hasher::CryptographicHasher;
+use noid_poseidon2b::Poseidon2bSponge;
+use noid_recursive::acceptance::trace::alloc_blocks;
+use noid_recursive::acceptance::trace::auth_pcs::{absorb_cap_trace, MixedOpeningProofTrace};
+use noid_recursive::acceptance::trace::eq_ind_partial_eval_trace;
+use noid_recursive::acceptance::trace::fri_pcs::{
+    fold_trace, gen_compact_queries_trace, FriChannelTrace,
+};
+
 struct Rng(u64);
 impl Rng {
     fn next_u64(&mut self) -> u64 {
@@ -1364,4 +1383,287 @@ fn region_tiled_fri_round_opening_slot_end_to_end() {
     // Corrupt a sibling of Merkle path 2.
     let b_stride = family.stride();
     assert!(flip(6 + 2, 2 * b_stride + 2), "flipped FRI merkle sibling accepted");
+}
+
+// ===========================================================================
+// FRI-round grand leg (3i): the compact-FRI query phase composed with the REAL
+// FRICHANL channel. Drives FriChannelTrace through the full sumcheck + source
+// binding absorbs to the FRI query draw (3h), then discharges round 0 via the
+// pair-leaf + Merkle families, folding the queried symbols with fold_trace off
+// the sumcheck's own random challenge (the second channel<->algebra join:
+// random_point -> fold, query indices -> family selection). The symbols the
+// fold consumes are pinned to the pair-leaf family's committed IN columns.
+// ===========================================================================
+
+fn phi(b: Block128) -> F128 {
+    flat_of_tower_u128(b.0)
+}
+fn lanes_flat(d: &[u8; 32]) -> [F128; 2] {
+    [
+        phi(Block128::from(u128::from_le_bytes(d[..16].try_into().unwrap()))),
+        phi(Block128::from(u128::from_le_bytes(d[16..].try_into().unwrap()))),
+    ]
+}
+impl Rng {
+    fn f128_block(&mut self) -> Block128 {
+        Block128::from(((self.next_u64() as u128) << 64) | self.next_u64() as u128)
+    }
+}
+fn capsule_fixture(
+    num_vars: usize,
+    seed: u64,
+) -> (Vec<Block128>, BatchEvalReduction, AuthMleOpeningProof) {
+    use noid_core::mle::evaluate::evaluate_slice;
+    let mut rng = Rng(seed);
+    let column: Vec<Block128> = (0..(1usize << num_vars)).map(|_| rng.f128_block()).collect();
+    let point: Vec<Block128> = (0..num_vars).map(|_| rng.f128_block()).collect();
+    let value = evaluate_slice(&column, &point);
+    let reduction = BatchEvalReduction { point: point.clone(), value };
+    let mut committed = commit_auth_mle_column(&column, num_vars);
+    let proof = open_auth_mle_committed(&mut committed, num_vars, &reduction);
+    (point, reduction, proof)
+}
+
+#[test]
+fn region_fri_round_grand() {
+    let num_vars = 9usize; // tau = 8, n_rounds = 1 -> a single FRI round
+    let (point, _red, proof) = capsule_fixture(num_vars, 0x3F1_9A1E);
+    let log_n = proof.commitment.log_rows;
+    let tau = COMPACT_TAU.min(log_n);
+    let n_rounds = log_n - tau;
+    let ntt = AdditiveNTT::<Block128>::new(num_vars + LOG_RATE);
+    let hasher = Poseidon2bSponge::new();
+    let opening = &proof.opening;
+
+    let mut b = FieldR1csBuilder::new();
+    // All proof wires (phi-flat).
+    let op = MixedOpeningProofTrace::alloc(&mut b, opening, log_n, 1, 0, COMPACT_NUM_QUERIES);
+    let point_w = alloc_blocks(&mut b, &point);
+    let cap_lanes: Vec<[LinExpr; 2]> =
+        proof.commitment.cap.hashes.iter().map(|h| alloc_digest_local(&mut b, h)).collect();
+
+    // ---- Drive FriChannelTrace through 3h (the FRI query draw).
+    let mut ch = FriChannelTrace::new();
+    absorb_cap_trace(&mut b, &mut ch, &cap_lanes);
+    ch.observe_const_tower(&mut b, MIXED_OPEN_TAG as u128);
+    ch.observe_field_elems(&mut b, &op.all_openings);
+    let _gamma = ch.squeeze(&mut b);
+    let batched_claim = op.all_openings[0].clone();
+
+    ch.observe_field_elems(&mut b, &point_w); // 3a
+    let (_right_w, left_w) = point_w.split_at(n_rounds);
+    let left_eq = eq_ind_partial_eval_trace(&mut b, left_w);
+    let mut derived = LinExpr::zero();
+    for (l, u) in left_eq.iter().zip(op.fri_proof.upper_partial_evals.iter()) {
+        derived = derived.add(&mul(&mut b, l, u));
+    }
+    pin_eq(&mut b, &derived, &batched_claim); // 3c
+    ch.observe_field_elem(&mut b, &batched_claim);
+    let beta = ch.squeeze_n(&mut b, tau); // 3d
+    let batching_eq = eq_ind_partial_eval_trace(&mut b, &beta);
+    let mut claim = LinExpr::zero();
+    for (u, be) in op.fri_proof.upper_partial_evals.iter().zip(batching_eq.iter()) {
+        claim = claim.add(&mul(&mut b, u, be));
+    }
+    // 3e sumcheck rounds.
+    let mut random_point = Vec::with_capacity(n_rounds);
+    for round in 0..n_rounds {
+        let [c0, c1] = &op.fri_proof.sum_check_oracles[round];
+        pin_eq(&mut b, c1, &claim);
+        ch.observe_field_elem(&mut b, c0);
+        ch.observe_field_elem(&mut b, c1);
+        let depth = compute_round_depth(n_rounds, round);
+        ch.observe_vector_commitment(&mut b, &op.fri_proof.fri_roots[round], depth);
+        let r = ch.squeeze(&mut b);
+        claim = c0.add(&mul(&mut b, c1, &r));
+        random_point.push(r);
+    }
+    ch.observe_field_elems(&mut b, &op.fri_proof.final_codeword); // 3f
+    // SB2 source-binding absorbs.
+    ch.observe_const_tower(&mut b, MIXED_SOURCE_BINDING_TAG);
+    ch.observe_field_elems(&mut b, &op.source_proof.h_evals);
+    for (i, root) in op.source_proof.folded_roots.iter().enumerate() {
+        ch.observe_vector_commitment(&mut b, root, high_pair_tree_depth(log_n - 1 - i));
+    }
+    // SB3 source query draw (positions unused by the FRI leg; drives the channel).
+    let _sq = gen_compact_queries_trace(&mut b, &mut ch, log_n + LOG_RATE, COMPACT_NUM_QUERIES);
+    // 3h FRI query draw.
+    let fri_queries = gen_compact_queries_trace(&mut b, &mut ch, n_rounds + LOG_RATE, COMPACT_NUM_QUERIES);
+    let nq = fri_queries.len();
+
+    // ---- Round 0 discharge via the pair-leaf + Merkle families.
+    let round = 0usize;
+    let symbols_w = &op.fri_proof.fri_queried_symbols[round];
+    assert_eq!(symbols_w.len(), nq);
+    let native_syms = &opening.fri_proof.fri_queried_symbols[round];
+    let pairs: Vec<(F128, F128)> =
+        symbols_w.iter().map(|(s0, s1)| (s0.eval(b.values()), s1.eval(b.values()))).collect();
+    let a_wlog = nq.next_power_of_two().trailing_zeros() as usize;
+    let (a_cols, tile_digests) = build_pair_leaf_columns(&pairs, a_wlog);
+    let a_native = run_pair_leaf_native(&a_cols, a_wlog, b"fri-grand-pair");
+
+    // Native Merkle path expansion for round 0.
+    let pair_indices: Vec<usize> = fri_queries.iter().map(|&qi| (qi >> round) >> 1).collect();
+    let native_leaves: Vec<[u8; 32]> =
+        native_syms.iter().map(|(s0, s1)| hasher.hash_pair(s0, s1)).collect();
+    let batch = BatchedMerkleProof { siblings: opening.fri_proof.fri_merkle_batch[round].siblings.clone() };
+    let depth = compute_round_depth(n_rounds, round);
+    let paths = expand_batched_merkle_proof(&batch, depth, &pair_indices, &native_leaves, &hasher)
+        .expect("fri round path expansion");
+    let family = MerklePathFamily { depth, n_paths: paths.len() };
+    let b_wlog = family.n_slots().next_power_of_two().trailing_zeros() as usize;
+
+    // Pair-leaf family slices (base 0), then Merkle slices (base 6).
+    let mut slices = Vec::new();
+    for col in [&a_cols.in_[0], &a_cols.in_[1], &a_cols.c[0], &a_cols.c[1], &a_cols.c[2], &a_cols.c[3]] {
+        slices.push(alloc_column_slice(&mut b, col, a_wlog).0);
+    }
+    let a_base = 0usize;
+
+    // Merkle witnesses: entry p == the pair-leaf digest at that leaf index.
+    let mut idx_of = std::collections::HashMap::new();
+    for (q, &li) in pair_indices.iter().enumerate() {
+        idx_of.entry(li).or_insert(q);
+    }
+    let mut witnesses = Vec::with_capacity(paths.len());
+    let mut entry_q = Vec::with_capacity(paths.len());
+    for p in &paths {
+        let q = idx_of[&p.leaf_index];
+        assert_eq!(tile_digests[q], lanes_flat(&p.leaf_hash), "pair-leaf digest != phi(native leaf)");
+        witnesses.push(MerklePathWitness {
+            entry: tile_digests[q],
+            siblings: p.siblings.iter().map(lanes_flat).collect(),
+            directions: p.directions.clone(),
+        });
+        entry_q.push(q);
+    }
+    let b_cols = build_merkle_path_columns(&family, iv_flat(), &witnesses, b_wlog);
+    let b_native = run_merkle_native(&family, &b_cols, b_wlog, b"fri-grand-merkle");
+    let committed_roots: Vec<[F128; 2]> = (0..paths.len()).map(|_| lanes_flat(&opening.fri_proof.fri_roots[round])).collect();
+    for col in [
+        &b_cols.e[0], &b_cols.e[1], &b_cols.sib[0], &b_cols.sib[1], &b_cols.d, &b_cols.c[0],
+        &b_cols.c[1], &b_cols.c[2], &b_cols.c[3],
+    ] {
+        slices.push(alloc_column_slice(&mut b, col, b_wlog).0);
+    }
+    let b_base = 6usize;
+
+    // Discharge both families.
+    let (mut claims, digest_wires) =
+        discharge_pair_leaf(&mut b, a_wlog, b"fri-grand-pair", &a_native, a_base, &tile_digests);
+    // Merkle entry wires per path (== the pair-leaf digest wire of that query).
+    let entry_wires: Vec<[LinExpr; 2]> = entry_q.iter().map(|&q| digest_wires[q].clone()).collect();
+    let entry_vals: Vec<[F128; 2]> = entry_q.iter().map(|&q| tile_digests[q]).collect();
+    let mk_claims = discharge_multipath_merkle(
+        &mut b, &family, &b_cols, b_wlog, b"fri-grand-merkle", &b_native, b_base, &entry_wires,
+        &entry_vals, &committed_roots,
+    );
+    claims.extend(mk_claims);
+
+    // ---- The fold join: symbols the fold consumes == the pair-leaf IN columns.
+    for q in 0..nq {
+        let (pt_lin, pt_nat) = slot_point(q, a_wlog);
+        let sym_wires = [symbols_w[q].0.clone(), symbols_w[q].1.clone()];
+        let sym_vals = [pairs[q].0, pairs[q].1];
+        for lane in 0..2 {
+            claims.push(Claim {
+                slice: a_base + lane, // IN0 / IN1
+                point: pt_lin.clone(),
+                value: sym_wires[lane].clone(),
+                native_point: pt_nat.clone(),
+                native_value: sym_vals[lane],
+            });
+        }
+    }
+
+    // ---- Fold each query with fold_trace(random_point[0]) and pin to the final
+    // codeword (round 0: no fold-consistency against a previous round).
+    let final_len = op.fri_proof.final_codeword.len();
+    for q in 0..nq {
+        let pair_idx = (fri_queries[q] >> round) >> 1;
+        let folded = fold_trace(&mut b, &random_point[round], round, pair_idx, &symbols_w[q].0, &symbols_w[q].1, &ntt);
+        let final_idx = (fri_queries[q] >> n_rounds) % final_len;
+        pin_eq(&mut b, &folded, &op.fri_proof.final_codeword[final_idx]);
+    }
+
+    // ---- ONE public-IO discharge.
+    let max_arity = claims.iter().map(|c| c.point.len()).max().unwrap();
+    let lanes_per = max_arity + 1;
+    let io_len = claims.len() * lanes_per;
+    let io_log = io_len.next_power_of_two().trailing_zeros() as usize;
+    let mut io_values = Vec::with_capacity(io_len);
+    for c in &claims {
+        for k in 0..max_arity {
+            io_values.push(if k < c.native_point.len() { c.native_point[k] } else { F128::ZERO });
+        }
+        io_values.push(c.native_value);
+    }
+    let (io_slice, io_wires) = alloc_column_slice(&mut b, &io_values, io_log);
+    for (ci, c) in claims.iter().enumerate() {
+        let g = ci * lanes_per;
+        for (k, p) in c.point.iter().enumerate() {
+            pin_eq(&mut b, p, &io_wires[g + k]);
+        }
+        pin_eq(&mut b, &c.value, &io_wires[g + max_arity]);
+    }
+    let spec = PublicIoSpec {
+        io_slice,
+        io_len,
+        claims: claims
+            .iter()
+            .enumerate()
+            .map(|(ci, c)| IoClaimSpec {
+                slice: slices[c.slice],
+                point: ci * lanes_per..ci * lanes_per + c.point.len(),
+                value: ci * lanes_per + max_arity,
+            })
+            .collect(),
+    };
+
+    let (r1cs, z) = b.build();
+    assert!(r1cs.satisfies(&z), "honest FRI-round grand trace unsatisfiable");
+    let params = PcsParams {
+        m: r1cs.m + pcs::LOG_PACKING,
+        log_inv_rate: 2,
+        log_batch_size: 2,
+        profile: Default::default(),
+    };
+    let mut chp = FsLaneChallenger::new(b"region-fri-grand");
+    let (pf, commitment, _) = noid_ivc_prover::field_prover::prove_field_with_public_io(
+        &r1cs, &z, &params, &spec, &io_values, &mut chp,
+    );
+    let mut chv = FsLaneChallenger::new(b"region-fri-grand");
+    noid_ivc_core::verifier::verify_field_with_public_io(&r1cs, &commitment, &pf, &spec, &io_values, &mut chv)
+        .expect("FRI-round grand composition verifies");
+    eprintln!(
+        "[region-fri-grand] rows = {} (m = {}), num_vars = {}, queries = {}, claims = {}",
+        z.len(),
+        r1cs.m,
+        num_vars,
+        nq,
+        spec.claims.len()
+    );
+
+    // Negative: flip a pair-leaf IN symbol -> the fold uses it AND the leaf
+    // hashes it, so the join / Merkle authentication breaks.
+    let flip = |slice_idx: usize, off: usize| {
+        let mut bad = z.clone();
+        bad[slices[slice_idx].start() + off] += F128::ONE;
+        assert!(r1cs.satisfies(&bad), "columns are free wires");
+        let mut chp = FsLaneChallenger::new(b"region-fri-grand");
+        let (bp, bc, _) = noid_ivc_prover::field_prover::prove_field_with_public_io(
+            &r1cs, &bad, &params, &spec, &io_values, &mut chp,
+        );
+        let mut chv = FsLaneChallenger::new(b"region-fri-grand");
+        noid_ivc_core::verifier::verify_field_with_public_io(&r1cs, &bc, &bp, &spec, &io_values, &mut chv).is_err()
+    };
+    assert!(flip(0, 0), "flipped pair-leaf IN0 accepted");
+    assert!(flip(6 + 5, 3), "flipped merkle C0 accepted");
+}
+
+// helper: alloc a digest (2 flat lanes) from a HashOutput.
+fn alloc_digest_local(b: &mut FieldR1csBuilder, d: &[u8; 32]) -> [LinExpr; 2] {
+    let lo = flat_of_tower_u128(u128::from_le_bytes(d[..16].try_into().unwrap()));
+    let hi = flat_of_tower_u128(u128::from_le_bytes(d[16..].try_into().unwrap()));
+    [LinExpr::from_wire(b.alloc_f128(lo)), LinExpr::from_wire(b.alloc_f128(hi))]
 }
