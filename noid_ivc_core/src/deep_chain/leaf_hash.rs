@@ -499,6 +499,89 @@ pub fn build_high_pair_leaf_columns(
     }
 }
 
+// ---------------------------------------------------------------------------
+// The bare hash-pair leaf family (compact-FRI round openings, step 3i)
+// ---------------------------------------------------------------------------
+//
+// The compact-FRI query phase authenticates each round's two queried codeword
+// symbols under a Merkle leaf `hash_pair(s0, s1)` — a SINGLE permutation with
+// zero capacity, unlike the source/high-pair leaves (domain + meta + compress
+// chain). One slot per query, no compress carry and no selectors: the whole
+// family is `raw = [IN0, IN1, 0, 0]` at every slot. Tiling `[query | 0]` at
+// stride 1 folds every query of every round of every tx into ONE walk + ONE
+// substitution (there are no fixed patterns to tile — the relation is uniform).
+
+/// Column indices of a bare hash-pair leaf family. Committed column order
+/// `IN0, IN1, C0..C3`; there are no fixed patterns.
+#[derive(Clone, Copy, Debug)]
+pub struct PairLeafRefs {
+    pub in_: [usize; 2],
+    pub c: [usize; STATE_SIZE],
+}
+
+pub fn pair_leaf_refs(col_base: usize) -> PairLeafRefs {
+    PairLeafRefs {
+        in_: [col_base, col_base + 1],
+        c: std::array::from_fn(|i| col_base + 2 + i),
+    }
+}
+
+/// Fill the columns for `pairs.len()` bare hash-pair leaves, one per slot
+/// (`pairs[t]` at slot `t`). `w_log` must cover `pairs.len()`; unused slots run
+/// the ghost permutation on `raw = 0`. Returns the columns and each leaf's
+/// digest (`C0/C1` at its slot); leaf `t`'s digest matches `flat_hash_pair`.
+pub fn build_pair_leaf_columns(
+    pairs: &[(F128, F128)],
+    w_log: usize,
+) -> (SourceLeafColumns, Vec<[F128; 2]>) {
+    let w = 1usize << w_log;
+    assert!(pairs.len() <= w, "slot domain below the pair count");
+    let mut c: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; w]);
+    let mut s0: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; w]);
+    let mut s_out: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; w]);
+    let mut in_: [Vec<F128>; 2] = std::array::from_fn(|_| vec![F128::ZERO; w]);
+
+    let mut store = |slot: usize,
+                     s0v: [F128; STATE_SIZE],
+                     outv: [F128; STATE_SIZE],
+                     c: &mut [Vec<F128>; STATE_SIZE]| {
+        for j in 0..STATE_SIZE {
+            s0[j][slot] = s0v[j];
+            s_out[j][slot] = outv[j];
+            c[j][slot] = outv[j];
+        }
+    };
+
+    // Ghost fill (raw = 0), one perm broadcast; active slots overwritten below.
+    let (ghost_s0, ghost_out) = run_perm([F128::ZERO; STATE_SIZE]);
+    for slot in 0..w {
+        store(slot, ghost_s0, ghost_out, &mut c);
+    }
+
+    let mut digests = Vec::with_capacity(pairs.len());
+    for (t, &(sym0, sym1)) in pairs.iter().enumerate() {
+        let (a, b) = run_perm([sym0, sym1, F128::ZERO, F128::ZERO]);
+        store(t, a, b, &mut c);
+        in_[0][t] = sym0;
+        in_[1][t] = sym1;
+        digests.push([c[0][t], c[1][t]]);
+    }
+
+    let digest = digests.first().copied().unwrap_or([F128::ZERO; 2]);
+    (SourceLeafColumns { c, s0, s_out, in_, digest }, digests)
+}
+
+/// Wiring substitution for the bare hash-pair family: `raw = [IN0, IN1, 0, 0]`,
+/// so `Σ_j m_j·raw_j = m_0·IN0 + m_1·IN1` — two committed terms, no patterns,
+/// no shifts (the capacity lanes are zero, contributing nothing).
+pub fn pair_leaf_substitution_terms(refs: &PairLeafRefs, alpha: F128) -> Vec<RelationTerm> {
+    let m = mds_weights_pub(alpha);
+    vec![
+        RelationTerm { coeff: m[0], factors: vec![ColRef::Committed(refs.in_[0])] },
+        RelationTerm { coeff: m[1], factors: vec![ColRef::Committed(refs.in_[1])] },
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -520,6 +603,136 @@ mod tests {
             acc += *v * *e;
         }
         acc
+    }
+
+    /// The bare hash-pair family's per-tile digest equals `flat_hash_pair`
+    /// (hence native `hash_pair` under φ), which is exactly the FRI Merkle leaf.
+    #[test]
+    fn pair_leaf_digest_matches_flat_hash_pair() {
+        use crate::deep_chain::source_tree::flat_hash_pair;
+        let mut seed = 0x9A1Eu64;
+        let mut next = || {
+            seed = seed.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = seed;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z ^= z >> 31;
+            F128 { lo: z, hi: z.rotate_left(29) }
+        };
+        let pairs: Vec<(F128, F128)> = (0..6).map(|_| (next(), next())).collect();
+        let w_log = 3; // 8 slots cover 6 pairs
+        let (cols, digests) = build_pair_leaf_columns(&pairs, w_log);
+        for (t, &(s0, s1)) in pairs.iter().enumerate() {
+            assert_eq!(digests[t], flat_hash_pair(s0, s1), "pair-leaf digest {t}");
+            assert_eq!([cols.c[0][t], cols.c[1][t]], flat_hash_pair(s0, s1), "column digest {t}");
+        }
+    }
+
+    /// The bare hash-pair family's region DAG: carry-selection seeds the walk,
+    /// the walk verifies every slot's single permutation, the substitution ties
+    /// each raw input to `IN0/IN1` (no patterns, no shifts). Honest run
+    /// discharges every claim true; a corrupted input symbol is caught by the
+    /// substitution claim, a corrupted digest by the pin.
+    #[test]
+    fn pair_leaf_region_dag_roundtrip_and_negatives() {
+        let n = 8usize; // power-of-two tile count fills the domain
+        let w_log = n.trailing_zeros() as usize;
+        let mut seed = 0x77E1u64;
+        let mut next = || {
+            seed = seed.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = seed;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z ^= z >> 31;
+            F128 { lo: z, hi: z.rotate_left(17) }
+        };
+        let pairs: Vec<(F128, F128)> = (0..n).map(|_| (next(), next())).collect();
+        let (cols, digests) = build_pair_leaf_columns(&pairs, w_log);
+        let refs = pair_leaf_refs(0);
+
+        let run = |in0: &[F128], in1: &[F128], c: &[Vec<F128>; STATE_SIZE]| -> Result<(), String> {
+            let committed: Vec<&[F128]> = vec![in0, in1, &c[0], &c[1], &c[2], &c[3]];
+            let internal: Vec<&[F128]> = cols.s_out.iter().map(|c| c.as_slice()).collect();
+            let mut ch_p = FsLaneChallenger::new(b"pair-leaf-dag");
+            let mut ch_v = FsLaneChallenger::new(b"pair-leaf-dag");
+            let mut pending: Vec<(usize, Vec<F128>, F128)> = Vec::new();
+
+            let beta = ch_p.sample_f128();
+            assert_eq!(beta, ch_v.sample_f128());
+            let sel_terms = carry_selection_terms(&refs.c, beta);
+            let rho: Vec<F128> = ch_p.sample_f128_vec(w_log);
+            let _ = ch_v.sample_f128_vec(w_log);
+            let (sp, _, _) = prove_column_relation(
+                F128::ZERO,
+                &rho,
+                &sel_terms,
+                &RelationColumns { committed: &committed, internal: &internal, fixed: &[] },
+                &mut ch_p,
+            );
+            let sel_point = verify_column_relation(w_log, F128::ZERO, &rho, &sel_terms, &[], &sp, &mut ch_v)
+                .map_err(|e| format!("selection: {e}"))?;
+            let mut gv = [F128::ZERO; STATE_SIZE];
+            for (r, v) in claimed_refs(&sel_terms).iter().zip(sp.final_values.iter()) {
+                match r {
+                    ColRef::Committed(cc) => pending.push((*cc, sel_point.clone(), *v)),
+                    ColRef::Internal(j) => gv[*j] = *v,
+                    _ => unreachable!(),
+                }
+            }
+            let groups = vec![LaneClaimGroup { point: sel_point.clone(), values: gv }];
+            let (wp, _) = prove_deep_chain_walk(&cols.s0, &groups, &mut ch_p);
+            let terminal = verify_deep_chain_walk(w_log, &groups, &wp, &mut ch_v)
+                .map_err(|e| format!("walk: {e}"))?;
+
+            let alpha = ch_p.sample_f128();
+            assert_eq!(alpha, ch_v.sample_f128());
+            let sub_terms = pair_leaf_substitution_terms(&refs, alpha);
+            let mut target = F128::ZERO;
+            let mut p = F128::ONE;
+            for e in 0..STATE_SIZE {
+                p = p * alpha;
+                target += p * terminal.values[e];
+            }
+            let (subp, _, _) = prove_column_relation(
+                target,
+                &terminal.point,
+                &sub_terms,
+                &RelationColumns { committed: &committed, internal: &[], fixed: &[] },
+                &mut ch_p,
+            );
+            let sub_point = verify_column_relation(w_log, target, &terminal.point, &sub_terms, &[], &subp, &mut ch_v)
+                .map_err(|e| format!("substitution: {e}"))?;
+            for (r, v) in claimed_refs(&sub_terms).iter().zip(subp.final_values.iter()) {
+                match r {
+                    ColRef::Committed(cc) => pending.push((*cc, sub_point.clone(), *v)),
+                    _ => unreachable!(),
+                }
+            }
+            assert_eq!(ch_p.sample_f128(), ch_v.sample_f128(), "lockstep");
+            for (cc, pt, v) in &pending {
+                if mle(committed[*cc], pt) != *v {
+                    return Err(format!("claim on column {cc} is false"));
+                }
+            }
+            for (t, dig) in digests.iter().enumerate() {
+                let dp: Vec<F128> =
+                    (0..w_log).map(|bb| if (t >> bb) & 1 == 1 { F128::ONE } else { F128::ZERO }).collect();
+                if mle(&c[0], &dp) != dig[0] || mle(&c[1], &dp) != dig[1] {
+                    return Err(format!("digest pin mismatch at tile {t}"));
+                }
+            }
+            Ok(())
+        };
+
+        run(&cols.in_[0], &cols.in_[1], &cols.c).expect("honest pair-leaf DAG verifies");
+        {
+            let mut bad = cols.in_[0].clone();
+            bad[5] += F128::ONE;
+            assert!(run(&bad, &cols.in_[1], &cols.c).is_err(), "corrupted input symbol accepted");
+        }
+        {
+            let mut bad = cols.c.clone();
+            bad[0][5] += F128::ONE;
+            assert!(run(&cols.in_[0], &cols.in_[1], &bad).is_err(), "corrupted digest accepted");
+        }
     }
 
     /// Run the full region DAG for one or more tiled leaf chains of the given
