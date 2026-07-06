@@ -530,9 +530,20 @@ pub fn prove_with_precomputed_round0_prime<Ch: Challenger>(
     let mut a_len = a_init.len();
     let mut b_scratch: Vec<F128> = crate::scratch::take_f128(b.len());
     let mut b_len = b.len();
-    let mut codeword_active: Vec<F128> = crate::scratch::take_f128(initial_codeword.len());
-    let mut codeword_scratch: Vec<F128> = crate::scratch::take_f128(initial_codeword.len());
-    let mut cw_len = initial_codeword.len();
+    // The ping-pong codeword buffers only ever hold POST-row-batch data: the
+    // row-batch fold reads the borrowed `initial_codeword` and writes at most
+    // `n_positions = 2^k_code` elements, and every FRI round shrinks from
+    // there. Sizing them at `initial_codeword.len() = n_positions * num_ntts`
+    // over-allocates by `num_ntts` (32x at log_batch_size=5 — ~2 GB of unused
+    // codeword buffer at the block-bearing class). Size to `n_positions`; when
+    // log_batch_size == 0 this equals `initial_codeword.len()` (the FRI-from-
+    // round-0 path reads `initial_codeword` directly), so that case is
+    // unaffected. The row-batch rounds (round < log_batch_size) never index
+    // these buffers before `row_batch_fold_all` resets `cw_len`.
+    let n_positions = 1usize << k_code;
+    let mut codeword_active: Vec<F128> = crate::scratch::take_f128(n_positions);
+    let mut codeword_scratch: Vec<F128> = crate::scratch::take_f128(n_positions);
+    let mut cw_len = n_positions;
     let mut current_lanes = num_ntts;
     let upfront_alloc_ms = t_alloc.elapsed().as_secs_f64() * 1e3;
 
