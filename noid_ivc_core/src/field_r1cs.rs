@@ -722,13 +722,21 @@ impl LincheckCircuit for FieldRowCircuit<'_> {
 
         // Parallel scatter: split the rows into row-chunks, each producing a
         // private width-`n` partial comb, reduced with field addition (char-2,
-        // associative ⇒ value-identical to any other order). The chunk count is
-        // bounded by `rows / chunk`, so only ~O(threads) partials are live at
-        // once (well below the CSC copy this replaces). Preserves the CSC
-        // fold's column-parallelism without materializing a transpose.
+        // associative ⇒ value-identical to any other order).
+        //
+        // Chunk count = `threads` (ONE contiguous chunk per worker), NOT a
+        // multiple of it: each partial comb is `n = n_cols` F128 (256 MB at
+        // the m=24 block-bearing class), so `4 * threads` chunks made the fold
+        // a multi-GB transient — VmHWM showed a +266 MB spike at m=19
+        // (n_cols = 8 MB), i.e. ~8.5 GB at m=24 (n_cols = 256 MB), the single
+        // largest prover transient and invisible to lap-boundary RSS. One
+        // chunk per worker caps the live combs at ~`threads` (uniform row
+        // density load-balances the equal ranges), trading a little
+        // work-steal slack for the memory. Preserves the CSC fold's
+        // column-parallelism without materializing a transpose.
         let threads = rayon::current_num_threads().max(1);
         let fold_matrix = |m: &SparseFieldMatrix, weight: F128| -> Vec<F128> {
-            let chunk = (m.num_rows / (threads * 4)).max(256);
+            let chunk = (m.num_rows / threads).max(256);
             let n_chunks = m.num_rows.div_ceil(chunk);
             (0..n_chunks)
                 .into_par_iter()

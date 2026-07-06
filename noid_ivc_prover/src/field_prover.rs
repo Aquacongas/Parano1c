@@ -12,19 +12,25 @@ use noid_ivc_core::proof::{FieldR1csProof, R1csClaim, ZClaim, bind_statement_fie
 use noid_ivc_core::public_io::{PublicIoSpec, assert_witness_matches_io, bind_public_io};
 use noid_ivc_core::zerocheck;
 
-/// Current resident set size in MiB (Linux `/proc/self/status` `VmRSS`), for the
-/// env-gated per-phase memory column. Returns 0 where unavailable.
-fn vmrss_mb() -> u64 {
+/// Resident set size in MiB (Linux `/proc/self/status`) for the env-gated
+/// per-phase memory column: `(current VmRSS, peak VmHWM)`. VmHWM is the
+/// high-water mark since process start — monotone, so a jump between two lap
+/// prints reveals an intra-phase transient (e.g. the lincheck parallel fold's
+/// per-thread combs) that the lap-boundary VmRSS misses. Returns `(0, 0)` where
+/// unavailable.
+fn vmrss_mb() -> (u64, u64) {
+    let field = |s: &str, key: &str| -> u64 {
+        s.lines()
+            .find(|l| l.starts_with(key))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|kb| kb.parse::<u64>().ok())
+            .map(|kb| kb / 1024)
+            .unwrap_or(0)
+    };
     std::fs::read_to_string("/proc/self/status")
         .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("VmRSS:"))
-                .and_then(|l| l.split_whitespace().nth(1))
-                .and_then(|kb| kb.parse::<u64>().ok())
-        })
-        .map(|kb| kb / 1024)
-        .unwrap_or(0)
+        .map(|s| (field(&s, "VmRSS:"), field(&s, "VmHWM:")))
+        .unwrap_or((0, 0))
 }
 
 /// Prove a FieldR1cs instance on a witness of `2^m` F128 elements.
@@ -89,10 +95,10 @@ fn prove_field_inner<Ch: Challenger>(
     let mut t = std::time::Instant::now();
     let lap = move |label: &str, t: &mut std::time::Instant| {
         if timing {
+            let (rss, peak) = vmrss_mb();
             eprintln!(
-                "[field-prove] {label}: {:.2} ms, RSS {} MB",
+                "[field-prove] {label}: {:.2} ms, RSS {rss} MB (peak {peak} MB)",
                 t.elapsed().as_secs_f64() * 1e3,
-                vmrss_mb()
             );
         }
         *t = std::time::Instant::now();
@@ -114,13 +120,13 @@ fn prove_field_inner<Ch: Challenger>(
         let mb = |b: usize| b / (1024 * 1024);
         let csr = nnz * 20 + rows * 8 * 2;
         let vecvec = nnz * 32 + rows * 24 * 2;
+        let (rss, peak) = vmrss_mb();
         eprintln!(
             "[field-prove] matrix @entry: a_nnz={a_nnz} b_nnz={b_nnz} rows={rows} | \
-             CSR≈{}MB (former VecVec≈{}MB, saved≈{}MB), RSS {}MB",
+             CSR≈{}MB (former VecVec≈{}MB, saved≈{}MB), RSS {rss}MB (peak {peak}MB)",
             mb(csr),
             mb(vecvec),
             mb(vecvec.saturating_sub(csr)),
-            vmrss_mb()
         );
     }
 
