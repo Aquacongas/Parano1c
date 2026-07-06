@@ -611,6 +611,15 @@ impl FieldCscCircuit {
 /// Same rayon-dispatch threshold as the boolean `CscCircuit`.
 const FIELD_FOLD_PAR_THRESHOLD: usize = 1usize << 12;
 
+/// Peak-memory budget for the lincheck fold's per-chunk partial combs. Each
+/// parallel chunk holds one width-`n_cols` F128 comb; at the m=24 block-bearing
+/// class `n_cols = 2^24` (256 MB/comb), so one comb per worker was a multi-GB
+/// transient (the largest at that scale). The chunk count is capped so the live
+/// combs stay under this budget, trading a little fold parallelism (the fold is
+/// a small fraction of prove time) for a bounded footprint. Small instances
+/// have small combs, so the cap only binds at large `m`.
+const FOLD_COMB_BUDGET_BYTES: usize = 1usize << 30;
+
 impl LincheckCircuit for FieldCscCircuit {
     fn n_cols(&self) -> usize {
         self.n_cols
@@ -735,8 +744,16 @@ impl LincheckCircuit for FieldRowCircuit<'_> {
         // work-steal slack for the memory. Preserves the CSC fold's
         // column-parallelism without materializing a transpose.
         let threads = rayon::current_num_threads().max(1);
+        // Cap the chunk count so the live per-chunk combs fit the memory budget
+        // (see FOLD_COMB_BUDGET_BYTES): one comb per worker was ~threads * n_cols
+        // F128, and `reduce`'s per-segment identity seed doubled that. Bound the
+        // chunks by the budget and use `reduce_with` (no identity comb — it
+        // folds the map outputs directly, the first as seed).
+        let comb_bytes = n * std::mem::size_of::<F128>();
+        let max_chunks = (FOLD_COMB_BUDGET_BYTES / comb_bytes.max(1)).max(1);
         let fold_matrix = |m: &SparseFieldMatrix, weight: F128| -> Vec<F128> {
-            let chunk = (m.num_rows / threads).max(256);
+            let target_chunks = threads.min(max_chunks).max(1);
+            let chunk = m.num_rows.div_ceil(target_chunks).max(256);
             let n_chunks = m.num_rows.div_ceil(chunk);
             (0..n_chunks)
                 .into_par_iter()
@@ -752,15 +769,13 @@ impl LincheckCircuit for FieldRowCircuit<'_> {
                     }
                     comb
                 })
-                .reduce(
-                    || vec![F128::ZERO; n],
-                    |mut acc, part| {
-                        for (x, y) in acc.iter_mut().zip(part) {
-                            *x += y;
-                        }
-                        acc
-                    },
-                )
+                .reduce_with(|mut acc, part| {
+                    for (x, y) in acc.iter_mut().zip(part) {
+                        *x += y;
+                    }
+                    acc
+                })
+                .unwrap_or_else(|| vec![F128::ZERO; n])
         };
 
         let mut comb = fold_matrix(self.a_0, alpha);
