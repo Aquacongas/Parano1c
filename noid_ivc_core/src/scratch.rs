@@ -18,7 +18,7 @@
 //! e.g. after the last prove of a batch.
 
 use crate::field::F128;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 static POOL: Mutex<Vec<Vec<F128>>> = Mutex::new(Vec::new());
 
@@ -32,6 +32,27 @@ static POOL: Mutex<Vec<Vec<F128>>> = Mutex::new(Vec::new());
 /// the page reuse it would otherwise get from the freed early-phase
 /// buffers) — measured as a +24% open_batch regression on M4 before this.
 const MAX_POOLED: usize = 24;
+
+/// Max TOTAL capacity retained across pooled buffers, in bytes. A count cap
+/// alone is not enough at the block-bearing class: one prove's working set is
+/// several GB (the codeword alone is 1 GB at pcs.m=31), and back-to-back
+/// proves accumulate up to `MAX_POOLED` such buffers — GBs that sit resident
+/// while the next prove runs (it reuses only a subset) and stack on the
+/// resident constraint matrix, busting a memory-constrained node's ceiling.
+/// The pool recycles the largest buffers (the costly ones to re-fault) up to
+/// this budget and drops the rest, which are re-faulted next prove — a few
+/// tens of ms, affordable inside the block time. Override with
+/// `NOIDH_POOL_MAX_MB` (benchmarks may want it large; a node small).
+fn max_pooled_bytes() -> usize {
+    static CAP: OnceLock<usize> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("NOIDH_POOL_MAX_MB")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|mb| mb << 20)
+            .unwrap_or(2usize << 30) // 2 GiB
+    })
+}
 
 /// Take a length-`n` `F128` vector, preferring a pooled buffer (smallest
 /// capacity ≥ `n`); falls back to a fresh uninitialized allocation.
@@ -81,7 +102,19 @@ pub fn give_f128(v: Vec<F128>) {
     }
     let mut pool = POOL.lock().unwrap();
     pool.push(v);
-    if pool.len() > MAX_POOLED {
+    // Evict smallest-first until BOTH the count and the total-byte budget are
+    // met (keep the biggest buffers — the costly ones to re-fault). Keep at
+    // least one buffer even if it alone exceeds the byte budget: it is the one
+    // the next prove most wants recycled.
+    let cap_bytes = max_pooled_bytes();
+    while pool.len() > 1 {
+        let total: usize = pool
+            .iter()
+            .map(|v| v.capacity() * std::mem::size_of::<F128>())
+            .sum();
+        if pool.len() <= MAX_POOLED && total <= cap_bytes {
+            break;
+        }
         let smallest = pool
             .iter()
             .enumerate()
