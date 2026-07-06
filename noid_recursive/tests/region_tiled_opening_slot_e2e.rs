@@ -20,8 +20,9 @@
 use noid_ivc_core::challenger::{Challenger, FsLaneChallenger};
 use noid_ivc_core::deep_chain::flat_mds;
 use noid_ivc_core::deep_chain::leaf_hash::{
-    build_high_pair_leaf_columns, build_source_leaf_columns, high_pair_leaf_chain,
-    source_leaf_fixed_patterns, source_leaf_refs, source_leaf_substitution_terms, SourceLeafChain,
+    build_high_pair_leaf_columns, build_pair_leaf_columns, build_source_leaf_columns,
+    high_pair_leaf_chain, pair_leaf_refs, pair_leaf_substitution_terms, source_leaf_fixed_patterns,
+    source_leaf_refs, source_leaf_substitution_terms, PairLeafRefs, SourceLeafChain,
     SourceLeafColumns, SourceLeafRefs,
 };
 use noid_ivc_core::deep_chain::relations::{
@@ -1034,4 +1035,333 @@ fn region_tiled_high_pair_opening_slot_end_to_end() {
     // so its opening claim breaks; the single relation set covers all tiles.
     let a_stride = chain.stride();
     assert!(flip(1, 5 * a_stride + 2), "flipped high-pair tile symbol accepted");
+}
+
+// ---------------------------------------------------------------------------
+// FRI-round bare hash-pair family (3i): one slot per query, no fixed patterns,
+// no shifts.
+// ---------------------------------------------------------------------------
+
+struct PairNative {
+    sel_proof: ColumnRelationProof,
+    walk_proof: DeepChainWalkProof,
+    sub_proof: ColumnRelationProof,
+    pending: Vec<(usize, Vec<F128>, F128)>,
+}
+
+fn run_pair_leaf_native(cols: &SourceLeafColumns, w_log: usize, domain: &[u8]) -> PairNative {
+    let refs = pair_leaf_refs(0);
+    let committed: Vec<&[F128]> =
+        vec![&cols.in_[0], &cols.in_[1], &cols.c[0], &cols.c[1], &cols.c[2], &cols.c[3]];
+    let internal: Vec<&[F128]> = cols.s_out.iter().map(|c| c.as_slice()).collect();
+    let mut ch_p = FsLaneChallenger::new(domain);
+    let mut ch_v = FsLaneChallenger::new(domain);
+    let mut pending = Vec::new();
+
+    let beta = ch_p.sample_f128();
+    assert_eq!(beta, ch_v.sample_f128());
+    let sel_terms = carry_selection_terms(&refs.c, beta);
+    let rho = ch_p.sample_f128_vec(w_log);
+    let _ = ch_v.sample_f128_vec(w_log);
+    let (sel_proof, _, _) = prove_column_relation(
+        F128::ZERO,
+        &rho,
+        &sel_terms,
+        &RelationColumns { committed: &committed, internal: &internal, fixed: &[] },
+        &mut ch_p,
+    );
+    let sel_point =
+        verify_column_relation(w_log, F128::ZERO, &rho, &sel_terms, &[], &sel_proof, &mut ch_v).unwrap();
+    let mut gv = [F128::ZERO; STATE_SIZE];
+    for (r, v) in claimed_refs(&sel_terms).iter().zip(sel_proof.final_values.iter()) {
+        match r {
+            ColRef::Committed(c) => pending.push((*c, sel_point.clone(), *v)),
+            ColRef::Internal(j) => gv[*j] = *v,
+            _ => unreachable!(),
+        }
+    }
+    let groups = vec![LaneClaimGroup { point: sel_point, values: gv }];
+    let (walk_proof, _) = prove_deep_chain_walk(&cols.s0, &groups, &mut ch_p);
+    let terminal = verify_deep_chain_walk(w_log, &groups, &walk_proof, &mut ch_v).unwrap();
+
+    let alpha = ch_p.sample_f128();
+    assert_eq!(alpha, ch_v.sample_f128());
+    let sub_terms = pair_leaf_substitution_terms(&refs, alpha);
+    let mut target = F128::ZERO;
+    let mut p = F128::ONE;
+    for e in 0..STATE_SIZE {
+        p = p * alpha;
+        target += p * terminal.values[e];
+    }
+    let (sub_proof, _, _) = prove_column_relation(
+        target,
+        &terminal.point,
+        &sub_terms,
+        &RelationColumns { committed: &committed, internal: &[], fixed: &[] },
+        &mut ch_p,
+    );
+    let sub_point =
+        verify_column_relation(w_log, target, &terminal.point, &sub_terms, &[], &sub_proof, &mut ch_v).unwrap();
+    for (r, v) in claimed_refs(&sub_terms).iter().zip(sub_proof.final_values.iter()) {
+        match r {
+            ColRef::Committed(c) => pending.push((*c, sub_point.clone(), *v)),
+            _ => unreachable!(),
+        }
+    }
+    assert_eq!(ch_p.sample_f128(), ch_v.sample_f128());
+    PairNative { sel_proof, walk_proof, sub_proof, pending }
+}
+
+fn pair_sub_terms_trace(
+    b: &mut FieldR1csBuilder,
+    refs: &PairLeafRefs,
+    alpha: &LinExpr,
+) -> Vec<RelationTermTrace> {
+    let mds = flat_mds(true);
+    let mut ap = Vec::with_capacity(STATE_SIZE);
+    let mut acc = LinExpr::constant(F128::ONE);
+    for _ in 0..STATE_SIZE {
+        acc = mul(b, &acc, alpha);
+        ap.push(acc.clone());
+    }
+    let m: Vec<LinExpr> = (0..2)
+        .map(|j| {
+            let mut a = LinExpr::zero();
+            for e in 0..STATE_SIZE {
+                a = a.add(&ap[e].scale(mds[e][j]));
+            }
+            a
+        })
+        .collect();
+    vec![
+        RelationTermTrace { coeff: m[0].clone(), factors: vec![ColRef::Committed(refs.in_[0])] },
+        RelationTermTrace { coeff: m[1].clone(), factors: vec![ColRef::Committed(refs.in_[1])] },
+    ]
+}
+
+fn discharge_pair_leaf(
+    b: &mut FieldR1csBuilder,
+    w_log: usize,
+    domain: &[u8],
+    native: &PairNative,
+    base: usize,
+    tile_digests: &[[F128; 2]],
+) -> (Vec<Claim>, Vec<[LinExpr; 2]>) {
+    let refs = pair_leaf_refs(0);
+    let mut ch = FsChannelTrace::new(b, domain);
+    let mut out: Vec<Claim> = Vec::new();
+    let np = &native.pending;
+    let mut np_cursor = 0usize;
+    let zero = LinExpr::zero();
+
+    let beta = ch.sample_f128(b);
+    let mut bp = LinExpr::constant(F128::ONE);
+    let mut sel_e_terms = Vec::new();
+    for j in 0..STATE_SIZE {
+        bp = mul(b, &bp, &beta);
+        sel_e_terms.push(RelationTermTrace { coeff: bp.clone(), factors: vec![ColRef::Committed(refs.c[j])] });
+        sel_e_terms.push(RelationTermTrace { coeff: bp.clone(), factors: vec![ColRef::Internal(j)] });
+    }
+    let rho = ch.sample_f128_vec(b, w_log);
+    let sel_e = ColumnRelationProofTrace::alloc(b, &native.sel_proof, w_log, 2 * STATE_SIZE);
+    let sel_point = verify_column_relation_trace(b, &mut ch, w_log, &zero, &rho, &sel_e_terms, &[], &sel_e);
+    let sel_claimed = claimed_refs(&carry_selection_terms(&refs.c, F128::ONE));
+    let mut gv: [LinExpr; STATE_SIZE] = std::array::from_fn(|_| LinExpr::zero());
+    for (r, v) in sel_claimed.iter().zip(sel_e.final_values.iter()) {
+        match r {
+            ColRef::Committed(c) => {
+                let (_, npt, nval) = &np[np_cursor];
+                np_cursor += 1;
+                out.push(Claim {
+                    slice: base + *c,
+                    point: sel_point.clone(),
+                    value: v.clone(),
+                    native_point: npt.clone(),
+                    native_value: *nval,
+                });
+            }
+            ColRef::Internal(j) => gv[*j] = v.clone(),
+            _ => unreachable!(),
+        }
+    }
+    let groups_e = vec![LaneClaimGroupTrace { point: sel_point, values: gv }];
+    let walk_e = DeepChainWalkProofTrace::alloc(b, &native.walk_proof, w_log);
+    let terminal = verify_deep_chain_walk_trace(b, &mut ch, w_log, &groups_e, &walk_e);
+
+    let alpha = ch.sample_f128(b);
+    let sub_native = pair_leaf_substitution_terms(&refs, F128::ONE);
+    let sub_e_terms = pair_sub_terms_trace(b, &refs, &alpha);
+    // target = Σ_e ap[e]·terminal[e] (ap = α powers, recomputed here).
+    let mut ap = Vec::with_capacity(STATE_SIZE);
+    let mut acc = LinExpr::constant(F128::ONE);
+    for _ in 0..STATE_SIZE {
+        acc = mul(b, &acc, &alpha);
+        ap.push(acc.clone());
+    }
+    let mut target = LinExpr::zero();
+    for e in 0..STATE_SIZE {
+        target = target.add(&mul(b, &ap[e], &terminal.values[e]));
+    }
+    let sub_e = ColumnRelationProofTrace::alloc(b, &native.sub_proof, w_log, claimed_refs(&sub_native).len());
+    let sub_point = verify_column_relation_trace(b, &mut ch, w_log, &target, &terminal.point, &sub_e_terms, &[], &sub_e);
+    for (r, v) in claimed_refs(&sub_native).iter().zip(sub_e.final_values.iter()) {
+        match r {
+            ColRef::Committed(c) => {
+                let (_, npt, nval) = &np[np_cursor];
+                np_cursor += 1;
+                out.push(Claim {
+                    slice: base + *c,
+                    point: sub_point.clone(),
+                    value: v.clone(),
+                    native_point: npt.clone(),
+                    native_value: *nval,
+                });
+            }
+            _ => unreachable!(),
+        }
+    }
+    assert_eq!(np_cursor, np.len(), "pair-leaf pending lockstep");
+
+    // Per-tile digest claims: C0/C1 at slot t (stride 1).
+    let mut digest_wires = Vec::with_capacity(tile_digests.len());
+    for (t, dig) in tile_digests.iter().enumerate() {
+        let (pt_lin, pt_nat) = slot_point(t, w_log);
+        let mut wires: [LinExpr; 2] = [LinExpr::zero(), LinExpr::zero()];
+        for lane in 0..2 {
+            let value = LinExpr::from_wire(b.alloc_f128(dig[lane]));
+            out.push(Claim {
+                slice: base + 2 + lane,
+                point: pt_lin.clone(),
+                value: value.clone(),
+                native_point: pt_nat.clone(),
+                native_value: dig[lane],
+            });
+            wires[lane] = value;
+        }
+        digest_wires.push(wires);
+    }
+    (out, digest_wires)
+}
+
+/// 3i shape: K FRI-round pair leaves (bare hash_pair) tiled at stride 1 → K
+/// digests → K Merkle paths → per-round root pins. Same tiled discharge as
+/// SB6/SB8, the simplest leaf.
+#[test]
+fn region_tiled_fri_round_opening_slot_end_to_end() {
+    let mut rng = Rng(0x3F1_C0DE);
+
+    let num_queries = 8usize;
+    let a_wlog = num_queries.trailing_zeros() as usize; // stride 1
+    let pairs: Vec<(F128, F128)> = (0..num_queries).map(|_| (rng.f128(), rng.f128())).collect();
+    let (a_cols, tile_digests) = build_pair_leaf_columns(&pairs, a_wlog);
+    let a_native = run_pair_leaf_native(&a_cols, a_wlog, b"tiled-fri-pair");
+
+    let depth = 4usize;
+    let family = MerklePathFamily { depth, n_paths: num_queries };
+    let b_wlog = family.n_slots().next_power_of_two().trailing_zeros() as usize;
+    let paths: Vec<MerklePathWitness> = (0..num_queries)
+        .map(|p| MerklePathWitness {
+            entry: tile_digests[p],
+            siblings: (0..depth).map(|_| [rng.f128(), rng.f128()]).collect(),
+            directions: (0..depth).map(|_| rng.next_u64() & 1 == 1).collect(),
+        })
+        .collect();
+    let b_cols = build_merkle_path_columns(&family, iv_flat(), &paths, b_wlog);
+    let b_native = run_merkle_native(&family, &b_cols, b_wlog, b"tiled-fri-merkle");
+    let committed_roots = b_cols.roots.clone();
+
+    let mut b = FieldR1csBuilder::new();
+    let mut slices = Vec::new();
+    for col in [&a_cols.in_[0], &a_cols.in_[1], &a_cols.c[0], &a_cols.c[1], &a_cols.c[2], &a_cols.c[3]] {
+        slices.push(alloc_column_slice(&mut b, col, a_wlog).0);
+    }
+    let a_base = 0usize;
+    for col in [
+        &b_cols.e[0], &b_cols.e[1], &b_cols.sib[0], &b_cols.sib[1], &b_cols.d, &b_cols.c[0],
+        &b_cols.c[1], &b_cols.c[2], &b_cols.c[3],
+    ] {
+        slices.push(alloc_column_slice(&mut b, col, b_wlog).0);
+    }
+    let b_base = 6usize;
+
+    let (mut claims, digest_wires) =
+        discharge_pair_leaf(&mut b, a_wlog, b"tiled-fri-pair", &a_native, a_base, &tile_digests);
+    let mk_claims = discharge_multipath_merkle(
+        &mut b, &family, &b_cols, b_wlog, b"tiled-fri-merkle", &b_native, b_base, &digest_wires,
+        &tile_digests, &committed_roots,
+    );
+    claims.extend(mk_claims);
+
+    let max_arity = claims.iter().map(|c| c.point.len()).max().unwrap();
+    let lanes_per = max_arity + 1;
+    let io_len = claims.len() * lanes_per;
+    let io_log = io_len.next_power_of_two().trailing_zeros() as usize;
+    let mut io_values = Vec::with_capacity(io_len);
+    for c in &claims {
+        for k in 0..max_arity {
+            io_values.push(if k < c.native_point.len() { c.native_point[k] } else { F128::ZERO });
+        }
+        io_values.push(c.native_value);
+    }
+    let (io_slice, io_wires) = alloc_column_slice(&mut b, &io_values, io_log);
+    for (ci, c) in claims.iter().enumerate() {
+        let g = ci * lanes_per;
+        for (k, p) in c.point.iter().enumerate() {
+            pin_eq(&mut b, p, &io_wires[g + k]);
+        }
+        pin_eq(&mut b, &c.value, &io_wires[g + max_arity]);
+    }
+    let spec = PublicIoSpec {
+        io_slice,
+        io_len,
+        claims: claims
+            .iter()
+            .enumerate()
+            .map(|(ci, c)| IoClaimSpec {
+                slice: slices[c.slice],
+                point: ci * lanes_per..ci * lanes_per + c.point.len(),
+                value: ci * lanes_per + max_arity,
+            })
+            .collect(),
+    };
+
+    let (r1cs, z) = b.build();
+    assert!(r1cs.satisfies(&z), "honest FRI-round tiled opening unsatisfiable");
+    let params = PcsParams {
+        m: r1cs.m + pcs::LOG_PACKING,
+        log_inv_rate: 2,
+        log_batch_size: 2,
+        profile: Default::default(),
+    };
+    let mut chp = FsLaneChallenger::new(b"region-tiled-fri");
+    let (proof, commitment, _) = noid_ivc_prover::field_prover::prove_field_with_public_io(
+        &r1cs, &z, &params, &spec, &io_values, &mut chp,
+    );
+    let mut chv = FsLaneChallenger::new(b"region-tiled-fri");
+    noid_ivc_core::verifier::verify_field_with_public_io(&r1cs, &commitment, &proof, &spec, &io_values, &mut chv)
+        .expect("FRI-round tiled opening verifies");
+    eprintln!(
+        "[region-tiled-fri] rows = {} (m = {}), queries = {}, claims = {}",
+        z.len(),
+        r1cs.m,
+        num_queries,
+        spec.claims.len()
+    );
+
+    let flip = |slice_idx: usize, off: usize| {
+        let mut bad = z.clone();
+        bad[slices[slice_idx].start() + off] += F128::ONE;
+        assert!(r1cs.satisfies(&bad), "columns are free wires");
+        let mut chp = FsLaneChallenger::new(b"region-tiled-fri");
+        let (bp, bc, _) = noid_ivc_prover::field_prover::prove_field_with_public_io(
+            &r1cs, &bad, &params, &spec, &io_values, &mut chp,
+        );
+        let mut chv = FsLaneChallenger::new(b"region-tiled-fri");
+        noid_ivc_core::verifier::verify_field_with_public_io(&r1cs, &bc, &bp, &spec, &io_values, &mut chv).is_err()
+    };
+    // Corrupt query 5's first symbol (IN0 at slot 5).
+    assert!(flip(0, 5), "flipped FRI queried symbol accepted");
+    // Corrupt a sibling of Merkle path 2.
+    let b_stride = family.stride();
+    assert!(flip(6 + 2, 2 * b_stride + 2), "flipped FRI merkle sibling accepted");
 }
