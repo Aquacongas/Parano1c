@@ -58,6 +58,27 @@ fn mle_eval(vals: &[F128], z: &[F128]) -> F128 {
     acc
 }
 
+/// φ of a 32-byte tower digest into two flat lanes.
+fn digest_to_flat(d: [u8; 32]) -> [F128; 2] {
+    [
+        flat_of_tower_u128(u128::from_le_bytes(d[..16].try_into().unwrap())),
+        flat_of_tower_u128(u128::from_le_bytes(d[16..].try_into().unwrap())),
+    ]
+}
+
+/// eq(right, i) over the tower basis for i in 0..2^right.len().
+fn eq_table_tower(right: &[Block128]) -> Vec<Block128> {
+    let mut t = vec![Block128::ONE; 1usize << right.len()];
+    for (i, slot) in t.iter_mut().enumerate() {
+        let mut e = Block128::ONE;
+        for (l, &r) in right.iter().enumerate() {
+            e = e * if (i >> l) & 1 == 1 { r } else { Block128::ONE + r };
+        }
+        *slot = e;
+    }
+    t
+}
+
 /// The flat encode kernel reproduces the MLE of the φ-mapped REAL tower
 /// codeword at a native flat point — the field-iso identity the whole
 /// source binding rests on, cross-checked against `Code::new_parallel`.
@@ -190,4 +211,119 @@ fn source_binding_reduces_to_h_openings() {
 
     // Lockstep sanity across both channels.
     assert_eq!(ch_p.sample_f128(), ch_v.sample_f128());
+}
+
+/// SB1.2 composed: the region `source_tree` rebuild of `Code(H·eq_right)` has
+/// its root == the native committed root (the `fri_roots[0]` pin), and its
+/// committed CODE columns, opened at a random `z`, satisfy the encode
+/// reduction `codeword~(z) = Σ_i K_i(z)·eq(right,i)·H[i]` — so the tree's
+/// codeword IS `Code(H·eq_right)`, tying the FRI round-0 oracle to H. This
+/// composes three separately-gated legs (source_tree root, encode reduction,
+/// H-claim) into the SB1.2 binding, natively.
+#[test]
+fn sb1_2_code_tree_binds_encode_reduction() {
+    use noid_fri::merkle::MerkleTree;
+    use noid_ivc_core::deep_chain::source_tree::{build_source_tree_columns, SourceTree};
+    use noid_poseidon2b::hasher::CryptographicHasher;
+    use noid_poseidon2b::Poseidon2bSponge;
+
+    let mut rng = Rng(0x5B12_C0DE);
+    let n_rounds = 3usize;
+    let ntt = AdditiveNTT::<Block128>::new(n_rounds + LOG_RATE);
+    let hasher = Poseidon2bSponge::new();
+
+    // H (tower), right (tower). g = H·eq(right); codeword = Code(g).
+    let h_tower: Vec<Block128> = (0..(1usize << n_rounds)).map(|_| rng.block()).collect();
+    let right_tower: Vec<Block128> = (0..n_rounds).map(|_| rng.block()).collect();
+    let eq_right_tower = eq_table_tower(&right_tower);
+    let g_tower: Vec<Block128> = h_tower
+        .iter()
+        .zip(eq_right_tower.iter())
+        .map(|(&h, &e)| h * e)
+        .collect();
+    let codeword_tower = Code::new_parallel(&g_tower, &ntt);
+
+    // Native SB1.2 root: Merkle tree over hash_pair(codeword pairs). In the
+    // real proof this root is pinned to fri_roots[0].
+    let leaf_hashes: Vec<[u8; 32]> = codeword_tower
+        .encoding
+        .chunks_exact(2)
+        .map(|p| hasher.hash_pair(&p[0], &p[1]))
+        .collect();
+    let native_root = MerkleTree::new_parallel(leaf_hashes, &hasher).get_root();
+
+    // Region source_tree over φ(codeword): root pin == φ(native root).
+    let codeword_flat: Vec<F128> = codeword_tower.encoding.iter().map(|&b| phi(b)).collect();
+    let leaf_log = n_rounds + 1; // code_len 2^(leaf_log+1) = 2^(n_rounds+2)
+    let tree = SourceTree { leaf_log };
+    assert_eq!(tree.code_len(), codeword_flat.len(), "code length");
+    let w_log = tree.slots_log();
+    let cols = build_source_tree_columns(&tree, &codeword_flat, w_log);
+    assert_eq!(
+        cols.root,
+        digest_to_flat(native_root),
+        "source-tree root != φ(fri_roots[0])"
+    );
+
+    // The committed CODE columns == codeword; open at z; the encode reduction
+    // ties codeword~(z) to an H opening (weight K_i(z)·eq(right,i)).
+    let z: Vec<F128> = (0..n_rounds + 2).map(|_| rng.f128()).collect();
+    let cw_at_z = mle_eval(&codeword_flat, &z);
+    let h_flat: Vec<F128> = h_tower.iter().map(|&b| phi(b)).collect();
+    let right_flat: Vec<F128> = right_tower.iter().map(|&b| phi(b)).collect();
+    let weights: Vec<F128> = (0..(1usize << n_rounds))
+        .map(|i| {
+            let x: Vec<F128> = (0..n_rounds)
+                .map(|l| if (i >> l) & 1 == 1 { F128::ONE } else { F128::ZERO })
+                .collect();
+            source_weight_at(&z, &right_flat, &x, n_rounds)
+        })
+        .collect();
+    let mut ch_p = FsLaneChallenger::new(b"sb1.2");
+    let (proof, _) = prove_weighted_sum(&h_flat, &weights, cw_at_z, &mut ch_p);
+    let mut ch_v = FsLaneChallenger::new(b"sb1.2");
+    let pt = verify_weighted_sum(
+        n_rounds,
+        |p: &[F128]| source_weight_at(&z, &right_flat, p, n_rounds),
+        cw_at_z,
+        &proof,
+        &mut ch_v,
+    )
+    .expect("encode binding: codeword~(z) reduces to an H opening");
+    assert_eq!(mle_eval(&h_flat, &pt), proof.final_value, "H opening at reduced point");
+
+    // A codeword NOT of the form Code(H·eq_right) fails the encode binding at z.
+    {
+        let mut bad = codeword_flat.clone();
+        bad[1] += F128::ONE;
+        let bad_at_z = mle_eval(&bad, &z);
+        let mut ch = FsLaneChallenger::new(b"sb1.2");
+        assert!(
+            verify_weighted_sum(
+                n_rounds,
+                |p: &[F128]| source_weight_at(&z, &right_flat, p, n_rounds),
+                bad_at_z,
+                &proof,
+                &mut ch,
+            )
+            .is_err(),
+            "a non-Code(H) codeword passed the encode binding"
+        );
+    }
+
+    // SB1.1 H-claim: H~(right) == initial_sumcheck_claim (eq(right,·) weight).
+    let claim = mle_eval(&h_flat, &right_flat);
+    let eq_weights = build_eq_table(&right_flat);
+    let mut ch_p = FsLaneChallenger::new(b"sb1.1");
+    let (h_proof, _) = prove_weighted_sum(&h_flat, &eq_weights, claim, &mut ch_p);
+    let mut ch_v = FsLaneChallenger::new(b"sb1.1");
+    let h_pt = verify_weighted_sum(
+        n_rounds,
+        |p: &[F128]| eq_at(&right_flat, p),
+        claim,
+        &h_proof,
+        &mut ch_v,
+    )
+    .expect("H-claim discharge");
+    assert_eq!(mle_eval(&h_flat, &h_pt), h_proof.final_value, "H-claim opening");
 }
