@@ -1726,6 +1726,105 @@ mod tests {
         )
     }
 
+    /// Cheap probe (no proving): the REAL 1-std-tx block's region wallet-PCS
+    /// discharge shape (claim count, arities, standalone wire cost) at a few
+    /// `RegionDischargeParams`, to size the region-mode block-bearing class.
+    #[test]
+    fn region_wallet_pcs_shape_probe() {
+        use noid_ivc_core::field_circuit::FieldR1csBuilder;
+        use noid_recursive::acceptance::block_slots::{
+            build_block_slots_with_config, BlockSlotsConfig,
+        };
+        use noid_recursive::acceptance::trace::region_source_binding::RegionDischargeParams;
+
+        let units = chained_std_tx_blocks(1);
+        for (nq, sb8) in [(4usize, 2usize), (2usize, 1usize)] {
+            let cfg = BlockSlotsConfig {
+                discharge_wallet_pcs: true,
+                wallet_pcs_region: Some(RegionDischargeParams {
+                    nq,
+                    sb8_auth_layers: sb8,
+                }),
+            };
+            let mut b = FieldR1csBuilder::new();
+            let slots = build_block_slots_with_config(
+                &mut b,
+                &units[0].start_accumulator,
+                &units[0].end_accumulator,
+                &units[0].inputs,
+                &units[0].proof,
+                cfg,
+            );
+            let claims = &slots.pending_wallet_pcs;
+            let max_arity = claims.iter().map(|c| c.point.len()).max().unwrap_or(0);
+            eprintln!(
+                "[probe] nq={nq} sb8={sb8}: block-slot wires={}, claims={}, max_arity={}, \
+                 tail_lanes={}",
+                b.num_wires(),
+                claims.len(),
+                max_arity,
+                claims.len() * (max_arity + 1)
+            );
+        }
+    }
+
+    /// Size the region-mode block-bearing link: run the freeze (which prints
+    /// the full link's used-wire count via build_link's eprintln) at a couple
+    /// of `(nq, sb8)` at a given class m, tolerating the class-shape assert so
+    /// the printed size is visible even when a choice does not fit.
+    #[test]
+    #[ignore = "measurement helper; run explicitly to size the region link"]
+    fn region_link_size_measure() {
+        use noid_ivc_core::pcs::{self, PcsParams};
+        use noid_ivc_core::proof::FieldShape;
+        use noid_ivc_core::zerocheck::K_SKIP;
+        use noid_recursive::acceptance::block_slots::BlockSlotsConfig;
+        use noid_recursive::acceptance::link::{LinkBlock, LinkClass};
+        use noid_recursive::acceptance::trace::region_source_binding::RegionDischargeParams;
+
+        const CLASS_M: usize = 23;
+        let shape = FieldShape {
+            m: CLASS_M,
+            k_log: CLASS_M,
+            k_skip: K_SKIP,
+            const_pin: Some(0),
+        };
+        let params = PcsParams {
+            m: CLASS_M + pcs::LOG_PACKING,
+            log_inv_rate: 2,
+            log_batch_size: 5,
+            profile: Default::default(),
+        };
+        let units = chained_std_tx_blocks(1);
+        for (nq, sb8) in [(1usize, 1usize)] {
+            let rp = RegionDischargeParams { nq, sb8_auth_layers: sb8 };
+            let cfg = BlockSlotsConfig { discharge_wallet_pcs: true, wallet_pcs_region: Some(rp) };
+            let sample = LinkBlock {
+                start_accumulator: &units[0].start_accumulator,
+                end_accumulator: &units[0].end_accumulator,
+                inputs: &units[0].inputs,
+                proof: &units[0].proof,
+                config: cfg,
+            };
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let class = LinkClass::new_region_block_bearing(
+                    shape,
+                    params.clone(),
+                    units[0].start_accumulator.clone(),
+                    rp,
+                    &sample,
+                );
+                (class.region_claims.len(), class.region_max_arity, class.spec.io_len)
+            }));
+            match r {
+                Ok((n, ma, io)) => eprintln!(
+                    "[size] nq={nq} sb8={sb8} @m={CLASS_M}: FIT  claims={n} max_arity={ma} io_len={io}"
+                ),
+                Err(_) => eprintln!("[size] nq={nq} sb8={sb8} @m={CLASS_M}: (see wire count above)"),
+            }
+        }
+    }
+
     /// One accepted block plus everything the single-block component
     /// verifier consumes, in per-block form (the shape a recursion link
     /// ingests — K = 1 structural).
@@ -2188,6 +2287,264 @@ mod tests {
                 "tampered tip proof accepted"
             );
         }
+    }
+
+    /// [G] item 5b step 3b — the COMPLETE block-bearing recursion link: the
+    /// wallet-capsule PCS opening is discharged in the shape-fixed region layer
+    /// and its committed-column opening claims are THREADED through the link's
+    /// public IO (`class.spec.claims` + the region tail lanes). This is the
+    /// piece that turns a recursion-ready block link (wallet-PCS off) into a
+    /// complete block proof (no shape drift) — the `discharge_wallet_pcs` region
+    /// path flipped on and the resulting opening claims carried by the link IO.
+    ///
+    /// - π₀: a genesis link over block h=1 with the region discharge ON is a
+    ///   COMPLETE block proof and VERIFIES;
+    /// - NEGATIVE: flipping one region committed-column lane in π₀'s witness
+    ///   keeps the trace satisfiable (committed columns are free wires) but
+    ///   breaks that column's opening claim → the verifier rejects — proving
+    ///   the region claims are genuinely bound through the link IO;
+    /// - π₁: a regular link that verifies π₀ opens π₀'s region columns
+    ///   GENERICALLY via the same public-IO mechanism (no extra trace code),
+    ///   and the decider accepts the tip.
+    ///
+    /// Class m = 24: the region link is ~9–11M wires (measured > 2^23 at every
+    /// param point), so it self-hosts at 2^24. `RegionDischargeParams` are kept
+    /// tiny — the discharge flatness and full soundness are gated separately in
+    /// `region_source_binding_full_e2e`; here we test only the IO threading.
+    #[test]
+    #[ignore = "heavy (m=24, several 2^24 proofs + one class digest); run explicitly"]
+    fn region_complete_block_bearing_link_e2e() {
+        use noid_ivc_core::challenger::FsLaneChallenger;
+        use noid_ivc_core::field::F128;
+        use noid_ivc_core::field_r1cs::FieldR1cs;
+        use noid_ivc_core::pcs::{self, PcsParams};
+        use noid_ivc_core::proof::FieldShape;
+        use noid_ivc_core::verifier::verify_field_with_public_io;
+        use noid_ivc_core::zerocheck::K_SKIP;
+        use noid_ivc_prover::field_prover::prove_field_with_public_io;
+        use noid_recursive::acceptance::block_slots::BlockSlotsConfig;
+        use noid_recursive::acceptance::link::{
+            build_link, decide_tip, genesis_witness, link_io_layout_for, LinkBlock, LinkClass,
+            LinkEnvelope, LinkInput,
+        };
+        use noid_recursive::acceptance::trace::region_source_binding::RegionDischargeParams;
+        use std::time::Instant;
+
+        const CLASS_M: usize = 24;
+        // Kept tiny for memory: a region link self-hosts at 2^24, and this gate
+        // proves several 2^24 instances sequentially. π₀'s COMPLETE-proof verify
+        // is separately confirmed at nq=4/sb8=2; the discharge soundness /
+        // flatness are gated in region_source_binding_full_e2e. Here nq=2/sb8=1
+        // keeps the per-proof footprint down so the negative + recursion fit.
+        let region_params = RegionDischargeParams {
+            nq: 2,
+            sb8_auth_layers: 1,
+        };
+        let shape = FieldShape {
+            m: CLASS_M,
+            k_log: CLASS_M,
+            k_skip: K_SKIP,
+            const_pin: Some(0),
+        };
+        let params = PcsParams {
+            m: CLASS_M + pcs::LOG_PACKING,
+            log_inv_rate: 2,
+            log_batch_size: 5,
+            profile: Default::default(),
+        };
+        let layout = link_io_layout_for(shape.k_log, true);
+        let region_cfg = BlockSlotsConfig {
+            discharge_wallet_pcs: true,
+            wallet_pcs_region: Some(region_params),
+        };
+
+        let units = chained_std_tx_blocks(2);
+        fn mk(u: &BlockUnit, config: BlockSlotsConfig) -> LinkBlock<'_> {
+            LinkBlock {
+                start_accumulator: &u.start_accumulator,
+                end_accumulator: &u.end_accumulator,
+                inputs: &u.inputs,
+                proof: &u.proof,
+                config,
+            }
+        }
+
+        // ---- Freeze the COMPLETE region class on block 0.
+        let t0 = Instant::now();
+        let class = LinkClass::new_region_block_bearing(
+            shape,
+            params.clone(),
+            units[0].start_accumulator.clone(),
+            region_params,
+            &mk(&units[0], region_cfg),
+        );
+        eprintln!(
+            "[region-link] class frozen in {:.1?}: region_claims={}, max_arity={}, io_len={}",
+            t0.elapsed(),
+            class.region_claims.len(),
+            class.region_max_arity,
+            class.spec.io_len,
+        );
+        assert!(!class.region_claims.is_empty());
+
+        // ---- Genesis dummy T + proof (real region spec, all-zero IO: every
+        // region claim opens an all-zero column of T to zero — satisfied by the
+        // single-block genesis witness).
+        let t_witness = genesis_witness(&shape);
+        let t_io = vec![F128::ZERO; class.spec.io_len];
+        let mut ch = FsLaneChallenger::new(b"history-link-v0");
+        let (t_proof, t_commitment, _) = prove_field_with_public_io(
+            &class.genesis,
+            &t_witness,
+            &params,
+            &class.spec,
+            &t_io,
+            &mut ch,
+        );
+        let env_t = LinkEnvelope {
+            proof: t_proof,
+            commitment: t_commitment,
+            io: t_io,
+        };
+
+        // ---- π₀: genesis link over block 0 — a COMPLETE block proof.
+        let t0 = Instant::now();
+        let built0 = build_link(
+            &class,
+            &LinkInput {
+                prev: &env_t,
+                verified_digest: class.genesis_digest,
+                genesis: true,
+                fold_matrix: &class.genesis,
+                block: Some(mk(&units[0], region_cfg)),
+            },
+        );
+        let class_r1cs: FieldR1cs = built0.r1cs;
+        let pi0_io = built0.io;
+        let pi0_witness = built0.witness;
+        let n_region = built0.region_claims.len();
+        assert_eq!(
+            n_region,
+            class.region_claims.len(),
+            "π₀ live region claim count matches the frozen shape"
+        );
+        drop(env_t); // the genesis dummy proof is no longer needed after π₀'s build.
+        eprintln!(
+            "[region-link] π₀ build {:.1?}: {} wires -> 2^{}, region_claims={}",
+            t0.elapsed(),
+            pi0_witness.len(),
+            class_r1cs.k_log,
+            n_region,
+        );
+        let class_digest = class_r1cs.statement_digest();
+
+        // Prove π₀ and directly verify — the COMPLETE region block proof.
+        let mut ch = FsLaneChallenger::new(b"history-link-v0");
+        let (p0, c0, _) = prove_field_with_public_io(
+            &class_r1cs,
+            &pi0_witness,
+            &params,
+            &class.spec,
+            &pi0_io,
+            &mut ch,
+        );
+        let mut chv = FsLaneChallenger::new(b"history-link-v0");
+        verify_field_with_public_io(&class_r1cs, &c0, &p0, &class.spec, &pi0_io, &mut chv)
+            .expect("π₀ COMPLETE region block proof verifies");
+        eprintln!("[region-link] π₀ COMPLETE region block proof VERIFIES (region discharge ON)");
+
+        // ---- NEGATIVE: flip ONE region committed-column lane in π₀'s witness.
+        // The trace stays satisfiable (committed columns are free wires bound
+        // only by the region opening claims) and the envelope is unchanged, but
+        // that column's opening claim is now false → the PCS layer rejects.
+        {
+            let bad_slice = class.region_claims[0].slice;
+            let mut bad_w = pi0_witness.clone();
+            bad_w[bad_slice.start()] += F128::ONE;
+            let mut ch = FsLaneChallenger::new(b"history-link-v0");
+            let (bp, bc, _) = prove_field_with_public_io(
+                &class_r1cs,
+                &bad_w,
+                &params,
+                &class.spec,
+                &pi0_io,
+                &mut ch,
+            );
+            let mut chv = FsLaneChallenger::new(b"history-link-v0");
+            assert!(
+                verify_field_with_public_io(&class_r1cs, &bc, &bp, &class.spec, &pi0_io, &mut chv)
+                    .is_err(),
+                "tampered region committed-column lane must break its opening claim"
+            );
+            eprintln!("[region-link] NEGATIVE: tampered region committed column rejected");
+        }
+
+        let env0 = LinkEnvelope {
+            proof: p0,
+            commitment: c0,
+            io: pi0_io,
+        };
+        drop(pi0_witness);
+
+        // ---- π₁: a regular link verifying π₀. Its in-trace [R] replay opens
+        // π₀'s region columns via class.spec.claims — the region claims threaded
+        // through the LINK's public IO, with NO extra trace code.
+        let t0 = Instant::now();
+        let built1 = build_link(
+            &class,
+            &LinkInput {
+                prev: &env0,
+                verified_digest: class_digest,
+                genesis: false,
+                fold_matrix: &class_r1cs,
+                block: Some(mk(&units[1], region_cfg)),
+            },
+        );
+        assert_eq!(
+            built1.r1cs.a_0.rows, class_r1cs.a_0.rows,
+            "π₁ class A matrix drifted"
+        );
+        assert_eq!(
+            built1.r1cs.b_0.rows, class_r1cs.b_0.rows,
+            "π₁ class B matrix drifted"
+        );
+        let mut ch = FsLaneChallenger::new(b"history-link-v0");
+        let (p1, c1, _) = prove_field_with_public_io(
+            &class_r1cs,
+            &built1.witness,
+            &params,
+            &class.spec,
+            &built1.io,
+            &mut ch,
+        );
+        eprintln!(
+            "[region-link] π₁ (verifies π₀) build+prove {:.1?}",
+            t0.elapsed()
+        );
+        let env1 = LinkEnvelope {
+            proof: p1,
+            commitment: c1,
+            io: built1.io,
+        };
+        decide_tip(&class, &class_r1cs, &env1).expect("decider accepts π₁ over π₀");
+        eprintln!(
+            "[region-link] RECURSION over COMPLETE region blocks: π₁ ⊳ π₀; decider accepts the tip"
+        );
+
+        // ---- Decider negative: a tampered exposed block accumulator lane.
+        {
+            let mut bad = LinkEnvelope {
+                proof: env1.proof.clone(),
+                commitment: env1.commitment.clone(),
+                io: env1.io.clone(),
+            };
+            bad.io[layout.block_state_root] += F128::ONE;
+            assert!(
+                decide_tip(&class, &class_r1cs, &bad).is_err(),
+                "tampered block accumulator accepted"
+            );
+        }
+        eprintln!("[region-link] decider negative rejects; COMPLETE region link e2e OK");
     }
 
     /// The block-bearing recursion class needs two DIFFERENT real blocks of

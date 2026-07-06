@@ -46,7 +46,7 @@ use noid_ivc_core::field_r1cs::{FieldR1cs, SparseFieldMatrix};
 use noid_ivc_core::matrix_claim::{prove_matrix_claim_fold, MatrixAccClaim};
 use noid_ivc_core::pcs::{self, PcsParams};
 use noid_ivc_core::proof::{FieldR1csProof, FieldShape};
-use noid_ivc_core::public_io::{PublicIoSpec, WitnessSlice};
+use noid_ivc_core::public_io::{IoClaimSpec, PublicIoSpec, WitnessSlice};
 
 use super::trace::matrix_fold::{
     verify_matrix_claim_fold_trace, FreshLincheckClaimTrace, MatrixAccClaimTrace,
@@ -56,9 +56,11 @@ use super::trace::self_verify::{
     alloc_flat_digest, flat_digest_lanes, lagrange_weights_window_trace,
     verify_field_trace_deferred, FieldR1csProofTrace, FlatDigestExpr,
 };
+use super::trace::region_source_binding::{RegionDischargeParams, RegionPcsClaim};
 use super::trace::accepted_claim_batch::digest_lanes;
 use super::trace::{flat_of, mul, pin_eq};
 use super::block_slots::{build_block_slots_with_config, BlockSlots, BlockSlotsConfig};
+use noid_ivc_prover::field_prover::prove_field_with_public_io;
 use crate::accumulator::ChainAccumulator;
 use crate::block_certificate_backend::{
     AcceptedBlockBatchComponentInputs, AcceptedBlockBatchComponentProof,
@@ -152,17 +154,62 @@ pub struct LinkIoLayout {
     pub block_height: usize,
     pub block_state_root: usize,
     pub block_chain_hash: usize,
+    /// First IO lane of the region wallet-PCS opening-claim tail (== `len`
+    /// when there is no region tail).
+    pub region_tail_offset: usize,
+    /// Number of IO lanes in the region tail (0 when no region tail).
+    pub region_len: usize,
     pub len: usize,
 }
 
+/// A frozen region wallet-PCS opening-claim descriptor: the committed column
+/// slice and the claim point's arity (== `slice.log2_len`). The absolute slice
+/// positions are class-deterministic (same params + block structure ⇒ same
+/// wire layout), so one freeze is valid for every link in the class;
+/// [`build_link`] asserts the live discharge reproduces exactly this shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RegionFrozenClaim {
+    pub slice: WitnessSlice,
+    pub arity: usize,
+}
+
+/// Region-tail sizing: the number of opening claims and the maximum claim
+/// arity, from which every tail lane position is derived.
+#[derive(Clone, Copy, Debug)]
+pub struct RegionIoShape {
+    pub n_claims: usize,
+    pub max_arity: usize,
+}
+
 pub fn link_io_layout(k_log: usize) -> LinkIoLayout {
-    link_io_layout_for(k_log, false)
+    link_io_layout_region(k_log, false, None)
 }
 
 pub fn link_io_layout_for(k_log: usize, block_bearing: bool) -> LinkIoLayout {
+    link_io_layout_region(k_log, block_bearing, None)
+}
+
+/// The full IO layout, with an optional region wallet-PCS opening-claim tail
+/// appended after the recursion + block lanes. Each claim occupies
+/// `max_arity + 1` lanes (point coordinates padded to `max_arity`, then the
+/// opened value). `region = None` reproduces the non-region layout exactly.
+pub fn link_io_layout_region(
+    k_log: usize,
+    block_bearing: bool,
+    region: Option<RegionIoShape>,
+) -> LinkIoLayout {
     let acc_len = 2 * k_log + 1;
     let recursion_len = 4 + acc_len;
     let block_height = recursion_len;
+    let base_len = if block_bearing {
+        recursion_len + 5
+    } else {
+        recursion_len
+    };
+    let region_len = match region {
+        Some(s) => s.n_claims * (s.max_arity + 1),
+        None => 0,
+    };
     LinkIoLayout {
         w_d: 0,
         g: 2,
@@ -172,11 +219,9 @@ pub fn link_io_layout_for(k_log: usize, block_bearing: bool) -> LinkIoLayout {
         block_height,
         block_state_root: block_height + 1,
         block_chain_hash: block_height + 3,
-        len: if block_bearing {
-            recursion_len + 5
-        } else {
-            recursion_len
-        },
+        region_tail_offset: base_len,
+        region_len,
+        len: base_len + region_len,
     }
 }
 
@@ -196,6 +241,46 @@ pub fn link_io_spec_for(k_log: usize, block_bearing: bool) -> PublicIoSpec {
     }
 }
 
+/// The region-mode spec: the base spec plus one derived opening claim per
+/// frozen region claim, reading its point coordinates and value out of the
+/// region tail lanes. `max_arity` sizes the per-claim lane stride (each
+/// point range is only `claim.arity` lanes; the surplus up to `max_arity`
+/// is canonical-zero padding the binding claim also constrains).
+pub fn link_io_spec_region(
+    k_log: usize,
+    block_bearing: bool,
+    frozen: &[RegionFrozenClaim],
+    max_arity: usize,
+) -> PublicIoSpec {
+    let layout = link_io_layout_region(
+        k_log,
+        block_bearing,
+        Some(RegionIoShape {
+            n_claims: frozen.len(),
+            max_arity,
+        }),
+    );
+    let log2_len = layout.len.next_power_of_two().trailing_zeros() as usize;
+    let stride = max_arity + 1;
+    let claims = frozen
+        .iter()
+        .enumerate()
+        .map(|(ci, fc)| {
+            let base = layout.region_tail_offset + ci * stride;
+            IoClaimSpec {
+                slice: fc.slice,
+                point: base..base + fc.arity,
+                value: base + max_arity,
+            }
+        })
+        .collect();
+    PublicIoSpec {
+        io_slice: WitnessSlice { log2_len, index: 1 },
+        io_len: layout.len,
+        claims,
+    }
+}
+
 /// The link class constants.
 pub struct LinkClass {
     pub shape: FieldShape,
@@ -209,6 +294,19 @@ pub struct LinkClass {
     /// The block accumulator a genesis link starts from (canonical for a
     /// block-bearing class; unused otherwise).
     pub genesis_block_accumulator: ChainAccumulator,
+    /// When `Some`, the block [B] slots discharge the wallet-capsule PCS via
+    /// the shape-fixed region layer with these parameters, and the resulting
+    /// committed-column opening claims are threaded through this class's
+    /// public IO (`spec.claims` + the region tail lanes). `None` = no region
+    /// discharge (the recursion-ready or pure-stub classes).
+    pub region_params: Option<RegionDischargeParams>,
+    /// The frozen region opening-claim shape (empty unless `region_params`).
+    /// Every link in the class reproduces exactly these `(slice, arity)`
+    /// pairs; [`build_link`] asserts it.
+    pub region_claims: Vec<RegionFrozenClaim>,
+    /// The maximum region claim arity (the per-claim lane stride is
+    /// `region_max_arity + 1`).
+    pub region_max_arity: usize,
 }
 
 impl LinkClass {
@@ -248,11 +346,66 @@ impl LinkClass {
             genesis_digest,
             block_bearing,
             genesis_block_accumulator,
+            region_params: None,
+            region_claims: Vec::new(),
+            region_max_arity: 0,
         }
     }
 
+    /// A COMPLETE block-bearing class: like [`Self::new_block_bearing`] but the
+    /// wallet-capsule PCS opening is discharged in the shape-fixed region layer
+    /// and its committed-column opening claims are threaded through the class's
+    /// public IO, so every link is a complete (no shape-drift) block proof.
+    ///
+    /// The region claim SHAPE (how many claims, their column slices and
+    /// arities) is frozen ONCE here by building one sample block-bearing link
+    /// trace and reading its live discharge. `sample_block` must be a block of
+    /// the same tier every link in the class carries; its accumulators/config
+    /// are otherwise unused (the discharge config is forced to the region
+    /// path). The freeze runs a full link build (including a genesis dummy
+    /// proof over the class shape) — the caller runs this off any block; the
+    /// resulting class is reused for the whole chain.
+    pub fn new_region_block_bearing(
+        shape: FieldShape,
+        pcs_params: PcsParams,
+        genesis_block_accumulator: ChainAccumulator,
+        region_params: RegionDischargeParams,
+        sample_block: &LinkBlock<'_>,
+    ) -> Self {
+        freeze_region_block_bearing(
+            shape,
+            pcs_params,
+            genesis_block_accumulator,
+            region_params,
+            sample_block,
+        )
+    }
+
+    /// The full IO layout, region tail included when this is a region class.
+    /// Derived from `spec.io_len` so it is correct in every construction phase
+    /// (the freeze uses a placeholder-claim spec of the same size).
     fn layout(&self) -> LinkIoLayout {
-        link_io_layout_for(self.shape.k_log, self.block_bearing)
+        let mut l = link_io_layout_for(self.shape.k_log, self.block_bearing);
+        if self.region_params.is_some() {
+            // The region tail is everything in `spec.io_len` past the base
+            // recursion + block lanes.
+            l.region_tail_offset = l.len;
+            l.region_len = self.spec.io_len - l.len;
+            l.len = self.spec.io_len;
+        }
+        l
+    }
+
+    /// The block-slot config a region class forces on every link: the region
+    /// wallet-PCS discharge with the class parameters.
+    fn block_config(&self, block: &LinkBlock<'_>) -> BlockSlotsConfig {
+        match self.region_params {
+            Some(params) => BlockSlotsConfig {
+                discharge_wallet_pcs: true,
+                wallet_pcs_region: Some(params),
+            },
+            None => block.config,
+        }
     }
 }
 
@@ -335,6 +488,11 @@ pub struct BuiltLink {
     pub r1cs: FieldR1cs,
     pub witness: Vec<F128>,
     pub io: Vec<F128>,
+    /// The live region wallet-PCS opening claims produced by the block-slot
+    /// discharge (empty for non-region classes). The region freeze reads their
+    /// slices; a region-mode `build_link` also asserts they match the frozen
+    /// shape and pins them to the region IO tail.
+    pub region_claims: Vec<RegionPcsClaim>,
 }
 
 /// Assemble one link. Runs the NATIVE deferred verification + fold
@@ -342,7 +500,41 @@ pub struct BuiltLink {
 /// slice cells first (they ARE the exposed wires), the deferred [R]
 /// replay of the previous proof, the genesis arm, the chain pins, and
 /// the accumulator-fold twin pinned back to the IO cells.
+///
+/// For a REGION-MODE class (`region_params` set + a frozen `region_claims`
+/// shape) the block-slot wallet-PCS discharge is class-fixed and its
+/// committed-column opening claims are threaded through the public-IO tail:
+/// each claim's `(point, value)` wires are pinned to the tail IO cells, and
+/// `class.spec.claims` (a class constant) turns them into opening claims on
+/// the previous link's committed columns when the NEXT link replays this one.
 pub fn build_link(class: &LinkClass, input: &LinkInput<'_>) -> BuiltLink {
+    build_link_inner(class, input, false)
+}
+
+/// Assert the live region discharge matches the frozen class shape by count
+/// and arity (used by the throwaway native pre-pass, whose builder context —
+/// hence slice indices — differs from the real trace).
+fn assert_region_count_arity(live: &[RegionPcsClaim], frozen: &[RegionFrozenClaim], phase: &str) {
+    assert_eq!(
+        live.len(),
+        frozen.len(),
+        "region claim count drift ({phase}): live {} vs frozen {}",
+        live.len(),
+        frozen.len()
+    );
+    for (i, (l, f)) in live.iter().zip(frozen).enumerate() {
+        assert_eq!(l.point.len(), f.arity, "region claim {i} arity drift ({phase})");
+    }
+}
+
+/// [`build_link`] core. `freeze = true` is the region shape-freeze pass: the
+/// class carries `region_params` but an empty `region_claims`, so the live
+/// discharge is captured and RETURNED (`BuiltLink::region_claims`) WITHOUT the
+/// frozen-shape assert or the region IO-tail pinning (the tail lanes stay
+/// zero). The caller reads the live claim slices to build the class's frozen
+/// shape and its real spec.
+fn build_link_inner(class: &LinkClass, input: &LinkInput<'_>, freeze: bool) -> BuiltLink {
+    let region_mode = class.region_params.is_some();
     let k_log = class.shape.k_log;
     let layout = class.layout();
     assert_eq!(class.spec.io_len, layout.len);
@@ -397,6 +589,44 @@ pub fn build_link(class: &LinkClass, input: &LinkInput<'_>) -> BuiltLink {
         io[layout.block_state_root + 1] = lanes[2];
         io[layout.block_chain_hash] = lanes[3];
         io[layout.block_chain_hash + 1] = lanes[4];
+    }
+
+    // ---- Region wallet-PCS opening claims: NATIVE values into the IO tail.
+    // The tail IO cells must hold exactly the region opening claims'
+    // (point, value) that the in-trace discharge produces, so the tail pins
+    // below are satisfiable. Those values are a deterministic function of the
+    // block content (independent of the builder), so a throwaway discharge in
+    // a scratch builder recovers them before the real trace allocates the IO
+    // cells. Only in REAL region mode; the freeze leaves the tail zero.
+    if region_mode && !freeze {
+        let block = input.block.as_ref().expect("region class requires a block");
+        let cfg = class.block_config(block);
+        let region_native: Vec<(Vec<F128>, F128)> = {
+            let mut pb = FieldR1csBuilder::new();
+            let slots = build_block_slots_with_config(
+                &mut pb,
+                block.start_accumulator,
+                block.end_accumulator,
+                block.inputs,
+                block.proof,
+                cfg,
+            );
+            assert_region_count_arity(&slots.pending_wallet_pcs, &class.region_claims, "pre-pass");
+            slots
+                .pending_wallet_pcs
+                .iter()
+                .map(|c| (c.native_point.clone(), c.native_value))
+                .collect()
+        };
+        let stride = class.region_max_arity + 1;
+        for (ci, (np, nv)) in region_native.iter().enumerate() {
+            let base = layout.region_tail_offset + ci * stride;
+            assert!(np.len() <= class.region_max_arity, "region claim arity over max");
+            for (kk, &p) in np.iter().enumerate() {
+                io[base + kk] = p;
+            }
+            io[base + class.region_max_arity] = *nv;
+        }
     }
 
     // ---- Trace pass.
@@ -500,15 +730,18 @@ pub fn build_link(class: &LinkClass, input: &LinkInput<'_>) -> BuiltLink {
     pin_eq(&mut b, &acc_e.value, &io_cells[layout.acc_value]);
 
     // ---- Block [B] slots (block-bearing class only).
+    let mut live_region: Vec<RegionPcsClaim> = Vec::new();
     if let Some(block) = &input.block {
-        let slots: BlockSlots = build_block_slots_with_config(
+        let cfg = class.block_config(block);
+        let mut slots: BlockSlots = build_block_slots_with_config(
             &mut b,
             block.start_accumulator,
             block.end_accumulator,
             block.inputs,
             block.proof,
-            block.config,
+            cfg,
         );
+        live_region = std::mem::take(&mut slots.pending_wallet_pcs);
         // The block's end accumulator IS this link's exposed block_acc.
         let end_lanes = [
             &slots.end_acc.height,
@@ -555,25 +788,199 @@ pub fn build_link(class: &LinkClass, input: &LinkInput<'_>) -> BuiltLink {
             let ng_gated = mul(&mut b, &not_g, &to_prev);
             pin_eq(&mut b, &ng_gated, &LinExpr::zero());
         }
+
+        // ---- Region wallet-PCS opening claims → the public-IO tail. Assert
+        // the live discharge reproduces the frozen class shape (slices AND
+        // arities — same builder context as the freeze), then pin each claim's
+        // point/value wires to the tail IO cells. `class.spec.claims` (a class
+        // constant) turns those tail lanes into opening claims on THIS link's
+        // committed columns when its successor replays it. Skipped in the
+        // freeze pass (which only reads the live slices).
+        if region_mode && !freeze {
+            assert_eq!(
+                live_region.len(),
+                class.region_claims.len(),
+                "region claim count drift (trace): live {} vs frozen {}",
+                live_region.len(),
+                class.region_claims.len()
+            );
+            let stride = class.region_max_arity + 1;
+            for (ci, c) in live_region.iter().enumerate() {
+                let fc = &class.region_claims[ci];
+                assert_eq!(c.slice, fc.slice, "region claim {ci} slice drift (trace)");
+                assert_eq!(c.point.len(), fc.arity, "region claim {ci} arity drift (trace)");
+                let base = layout.region_tail_offset + ci * stride;
+                for (kk, p) in c.point.iter().enumerate() {
+                    pin_eq(&mut b, p, &io_cells[base + kk]);
+                }
+                pin_eq(&mut b, &c.value, &io_cells[base + class.region_max_arity]);
+            }
+        }
     }
 
     // ---- Pad to the class size (the fixed point: the trace of a class
     // verifier must itself fit the class shape).
     let target = 1usize << class.shape.m;
-    assert!(
-        b.num_wires() <= target,
-        "link trace outgrew the class shape: {} > {}",
-        b.num_wires(),
-        target
-    );
     let used = b.num_wires();
+    eprintln!(
+        "[link] build_link: {used} wires (region_mode={region_mode}, freeze={freeze}, \
+         region_claims={})",
+        live_region.len()
+    );
+    if region_mode {
+        // Memory guard: a region block-bearing link must stay well under 2^24
+        // wires (a runaway combined trace once OOM'd at ~30 GB).
+        assert!(used < (1usize << 24), "region link wire guard: {used} >= 2^24");
+    }
+    assert!(
+        used <= target,
+        "link trace outgrew the class shape: {used} > {target}"
+    );
     while b.num_wires() < target {
         b.alloc_f128(F128::ZERO);
     }
     let (r1cs, witness) = b.build();
     assert_eq!(r1cs.m, class.shape.m, "class shape mismatch after padding");
-    let _ = used;
-    BuiltLink { r1cs, witness, io }
+    BuiltLink {
+        r1cs,
+        witness,
+        io,
+        region_claims: live_region,
+    }
+}
+
+/// Freeze the region opening-claim shape for a COMPLETE block-bearing class.
+///
+/// The region discharge's claim COUNT and ARITIES are class constants
+/// (functions of the wallet-proof shape + `region_params`, not the block
+/// content), so a cheap standalone discharge recovers them. But the absolute
+/// column SLICES depend on the whole link wire layout, so we build one full
+/// link (a genesis link over `sample_block`, in freeze mode against a
+/// placeholder-claim spec of the correct size) and read the live discharge
+/// slices. The placeholder spec has the SAME claim COUNT and IO-slice size as
+/// the final spec, so the link wire layout — hence every region slice — is
+/// identical to every real build in the class; [`build_link`] re-asserts it.
+fn freeze_region_block_bearing(
+    shape: FieldShape,
+    pcs_params: PcsParams,
+    genesis_block_accumulator: ChainAccumulator,
+    region_params: RegionDischargeParams,
+    sample_block: &LinkBlock<'_>,
+) -> LinkClass {
+    let region_cfg = BlockSlotsConfig {
+        discharge_wallet_pcs: true,
+        wallet_pcs_region: Some(region_params),
+    };
+
+    // ---- Probe: a standalone discharge reveals the claim count + arities.
+    let (n_claims, arities, max_arity) = {
+        let mut pb = FieldR1csBuilder::new();
+        let slots = build_block_slots_with_config(
+            &mut pb,
+            sample_block.start_accumulator,
+            sample_block.end_accumulator,
+            sample_block.inputs,
+            sample_block.proof,
+            region_cfg,
+        );
+        let arities: Vec<usize> = slots.pending_wallet_pcs.iter().map(|c| c.point.len()).collect();
+        let max_arity = arities.iter().copied().max().unwrap_or(0);
+        (arities.len(), arities, max_arity)
+    };
+    assert!(n_claims > 0, "region discharge produced no opening claims");
+
+    let genesis_digest = genesis_instance(&shape).statement_digest();
+
+    // ---- Placeholder spec: N claims of the right arities, pointing at safe
+    // all-zero columns of the genesis dummy (index 1 excludes the const-one
+    // wire 0). It shares the final spec's claim count + IO-slice size, so the
+    // freeze build reproduces the real link's wire layout exactly.
+    let placeholders: Vec<RegionFrozenClaim> = arities
+        .iter()
+        .map(|&a| RegionFrozenClaim {
+            slice: WitnessSlice { log2_len: a, index: 1 },
+            arity: a,
+        })
+        .collect();
+    let freeze_spec = link_io_spec_region(shape.k_log, true, &placeholders, max_arity);
+
+    let freeze_class = LinkClass {
+        shape,
+        pcs_params: pcs_params.clone(),
+        spec: freeze_spec,
+        genesis: genesis_instance(&shape),
+        genesis_digest,
+        block_bearing: true,
+        genesis_block_accumulator: genesis_block_accumulator.clone(),
+        region_params: Some(region_params),
+        region_claims: Vec::new(),
+        region_max_arity: max_arity,
+    };
+
+    // ---- Genesis dummy T + its proof over the placeholder spec (all-zero IO,
+    // so every placeholder claim opens an all-zero column to zero — satisfied
+    // by the single-block genesis witness).
+    let t_witness = genesis_witness(&shape);
+    let t_io = vec![F128::ZERO; freeze_class.spec.io_len];
+    let mut ch = FsLaneChallenger::new(b"history-link-v0");
+    let (t_proof, t_commitment, _) = prove_field_with_public_io(
+        &freeze_class.genesis,
+        &t_witness,
+        &pcs_params,
+        &freeze_class.spec,
+        &t_io,
+        &mut ch,
+    );
+    let env_t = LinkEnvelope {
+        proof: t_proof,
+        commitment: t_commitment,
+        io: t_io,
+    };
+
+    // ---- Freeze build: a genesis link over the sample block, freeze mode.
+    let freeze_block = LinkBlock {
+        start_accumulator: sample_block.start_accumulator,
+        end_accumulator: sample_block.end_accumulator,
+        inputs: sample_block.inputs,
+        proof: sample_block.proof,
+        config: region_cfg,
+    };
+    let built = build_link_inner(
+        &freeze_class,
+        &LinkInput {
+            prev: &env_t,
+            verified_digest: genesis_digest,
+            genesis: true,
+            fold_matrix: &freeze_class.genesis,
+            block: Some(freeze_block),
+        },
+        true,
+    );
+    let frozen: Vec<RegionFrozenClaim> = built
+        .region_claims
+        .iter()
+        .map(|c| RegionFrozenClaim {
+            slice: c.slice,
+            arity: c.point.len(),
+        })
+        .collect();
+    assert_eq!(frozen.len(), n_claims, "freeze claim count mismatch");
+    drop(built);
+
+    // ---- The real spec (frozen slices) + the final class.
+    let real_spec = link_io_spec_region(shape.k_log, true, &frozen, max_arity);
+    LinkClass {
+        shape,
+        pcs_params,
+        spec: real_spec,
+        genesis: genesis_instance(&shape),
+        genesis_digest,
+        block_bearing: true,
+        genesis_block_accumulator,
+        region_params: Some(region_params),
+        region_claims: frozen,
+        region_max_arity: max_arity,
+    }
 }
 
 /// The decider: natively verify the tip envelope against the class and
