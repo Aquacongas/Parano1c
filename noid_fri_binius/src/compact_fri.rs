@@ -753,6 +753,43 @@ pub fn build_batched_merkle_proof(
     BatchedMerkleProof { siblings }
 }
 
+/// [`build_batched_merkle_proof`] to a Merkle CAP: emit siblings for only the
+/// `tree_depth - cap_depth` levels of the walk, so the surviving nodes are the
+/// cap nodes at level `cap_depth` from the root (`get_node_at_depth(cap_depth,
+/// idx)`). `cap_depth = 0` recovers the single-root proof.
+pub fn build_batched_merkle_proof_to_cap(
+    tree: &MerkleTree,
+    leaf_indices: &[usize],
+    tree_depth: usize,
+    cap_depth: usize,
+) -> BatchedMerkleProof {
+    assert!(cap_depth <= tree_depth, "cap depth exceeds tree depth");
+    let walk_depth = tree_depth - cap_depth;
+    let mut siblings = Vec::new();
+    let mut known = sorted_unique_usize(leaf_indices);
+    for d in 0..walk_depth {
+        let parents = sorted_unique_parents(&known);
+        let mut next = Vec::with_capacity(parents.len());
+        for &parent in &parents {
+            let left_child = parent * 2;
+            let right_child = parent * 2 + 1;
+            let left_known = known.binary_search(&left_child).is_ok();
+            let right_known = known.binary_search(&right_child).is_ok();
+            if left_known && right_known {
+            } else if left_known {
+                siblings.push(tree.get_node_at_depth(tree_depth - d, right_child));
+            } else if right_known {
+                siblings.push(tree.get_node_at_depth(tree_depth - d, left_child));
+            }
+            if left_known || right_known {
+                next.push(parent);
+            }
+        }
+        known = next;
+    }
+    BatchedMerkleProof { siblings }
+}
+
 /// Verify a batched Merkle proof against a known root.
 pub(crate) fn verify_batched_merkle_proof(
     root: &HashOutput,
@@ -874,7 +911,28 @@ pub fn expand_batched_merkle_proof(
     leaf_hashes: &[HashOutput],
     hasher: &dyn CryptographicHasher,
 ) -> Result<Vec<IndependentMerklePath>, String> {
+    expand_batched_merkle_proof_to_cap(batch, depth, 0, leaf_indices, leaf_hashes, hasher)
+}
+
+/// [`expand_batched_merkle_proof`] to a Merkle CAP: fold only `depth -
+/// cap_depth` levels, so each independent path ends at the cap node
+/// `leaf_index >> (depth - cap_depth)` (the caller pins it to the committed
+/// cap). `cap_depth = 0` recovers the single-root expansion. Mirrors
+/// `interleaved_commit::verify_source_batched_merkle_proof_to_cap`'s
+/// reconstruction (the SB6 source-tree opening shape).
+pub fn expand_batched_merkle_proof_to_cap(
+    batch: &BatchedMerkleProof,
+    depth: usize,
+    cap_depth: usize,
+    leaf_indices: &[usize],
+    leaf_hashes: &[HashOutput],
+    hasher: &dyn CryptographicHasher,
+) -> Result<Vec<IndependentMerklePath>, String> {
     use std::collections::HashMap;
+    if cap_depth > depth {
+        return Err("cap depth exceeds tree depth".into());
+    }
+    let walk_depth = depth - cap_depth;
     if leaf_indices.len() != leaf_hashes.len() {
         return Err("leaf index/hash count mismatch".into());
     }
@@ -883,7 +941,7 @@ pub fn expand_batched_merkle_proof(
             .map_err(|idx| format!("inconsistent leaf hashes for index {idx}"))?;
 
     // Per-level index -> hash for every node touched (known + siblings).
-    let mut levels: Vec<HashMap<usize, HashOutput>> = Vec::with_capacity(depth + 1);
+    let mut levels: Vec<HashMap<usize, HashOutput>> = Vec::with_capacity(walk_depth + 1);
     let leaf_map: HashMap<usize, HashOutput> = known_indices
         .iter()
         .copied()
@@ -892,7 +950,7 @@ pub fn expand_batched_merkle_proof(
     levels.push(leaf_map);
 
     let mut sib_cursor = 0usize;
-    for d in 0..depth {
+    for d in 0..walk_depth {
         let mut this_level = std::mem::take(&mut levels[d]);
         let mut next_indices = Vec::new();
         let mut next_hashes = Vec::new();
@@ -961,10 +1019,10 @@ pub fn expand_batched_merkle_proof(
         .map_err(|idx| format!("inconsistent leaf hashes for index {idx}"))?;
     let mut out = Vec::with_capacity(leaf_idx.len());
     for (li, lh) in leaf_idx.into_iter().zip(leaf_hash) {
-        let mut siblings = Vec::with_capacity(depth);
-        let mut directions = Vec::with_capacity(depth);
+        let mut siblings = Vec::with_capacity(walk_depth);
+        let mut directions = Vec::with_capacity(walk_depth);
         let mut node = li;
-        for d in 0..depth {
+        for d in 0..walk_depth {
             let sib_idx = node ^ 1;
             let sib = *levels[d]
                 .get(&sib_idx)

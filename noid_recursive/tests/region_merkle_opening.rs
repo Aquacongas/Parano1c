@@ -11,19 +11,26 @@
 //! Each is the same shape-fixed composition of three already-gated pieces:
 //!   - the region leaf digest (item 3 `flat_source_leaf_hash` /
 //!     `flat_high_pair_leaf_hash`, or the plain `flat_hash_pair`),
-//!   - item 2 `expand_batched_merkle_proof` (octopus → independent paths),
-//!   - `MerklePathFamily` (per-query path replay → recomputed root).
-//! The region leaf digest is asserted == φ(native leaf), fed as the path
-//! entry with the expanded siblings/directions; every distinct query's path
-//! folds to the SAME native committed root under φ. The path shape
-//! `(query_count, depth)` is a class constant, so ONE family covers every
-//! query of every tx of a class — this is what replaces the proof-dependent
-//! octopus schedule.
+//!   - item 2 `expand_batched_merkle_proof[_to_cap]` (octopus → independent
+//!     paths),
+//!   - `MerklePathFamily` (per-query path replay → recomputed digest).
+//! The region leaf digest is asserted == φ(native leaf), fed as the path entry
+//! with the expanded siblings/directions. The path shape `(query_count,
+//! depth)` is a class constant, so ONE family covers every query of every tx.
+//!
+//! Two authentication shapes: 3i (FRI rounds, against `fri_roots[round]`) and
+//! SB8 (high-fold layers, `cap_depth = 0`) fold FULL depth to a SINGLE root;
+//! SB6 (source tree) authenticates against a CAP — the `2^cap_depth` committed
+//! nodes at partial depth — so its paths fold only `depth - cap_depth` levels
+//! and each surviving node pins to `cap[leaf_index >> (depth - cap_depth)]`.
+//! A single-root fold cannot represent SB6 (different queries reach different
+//! cap nodes, and no single source root is committed).
 
 use noid_core::Block128;
 use noid_fri::merkle::MerkleTree;
 use noid_fri_binius::compact_fri::{
-    build_batched_merkle_proof, expand_batched_merkle_proof, IndependentMerklePath,
+    build_batched_merkle_proof, build_batched_merkle_proof_to_cap, expand_batched_merkle_proof,
+    expand_batched_merkle_proof_to_cap, IndependentMerklePath,
 };
 use noid_fri_binius::interleaved_commit::{source_leaf_hash, CommitmentHashBackend};
 use noid_fri_binius::mixed_open::high_pair_leaf_hash_for_trace;
@@ -126,13 +133,78 @@ fn check_region_opening(leaves: &[[u8; 32]], region_entries: &[[F128; 2]], depth
 
 const QUERIES: &[usize] = &[3, 3, 10, 21, 0, 31];
 
-/// SB6 — the source-tree opening. Region source-leaf digests reconstruct the
-/// native committed source-tree root under φ.
+/// The SB6 shared check: unlike 3i/SB8 (single root), the source-tree opening
+/// authenticates against a CAP — the `2^cap_depth` committed nodes at level
+/// `cap_depth` from the root. Each independent path folds only `tree_depth -
+/// cap_depth` levels through `MerklePathFamily`, and the surviving node is
+/// pinned to the cap node `leaf_index >> (tree_depth - cap_depth)`. This
+/// mirrors verify_source_batched_merkle_proof_to_cap (multiple cap nodes,
+/// partial depth), which a single-root fold cannot represent.
+fn check_region_opening_to_cap(
+    leaves: &[[u8; 32]],
+    region_entries: &[[F128; 2]],
+    tree_depth: usize,
+    cap_depth: usize,
+    queries: &[usize],
+) {
+    let hasher = Poseidon2bSponge::new();
+    let tree = MerkleTree::new_parallel(leaves.to_vec(), &hasher);
+    let walk_depth = tree_depth - cap_depth;
+    // The committed cap: the nodes at level cap_depth from the root.
+    let cap: Vec<[F128; 2]> = (0..(1usize << cap_depth))
+        .map(|idx| lanes(&tree.get_node_at_depth(cap_depth, idx)))
+        .collect();
+
+    let query_leaves: Vec<[u8; 32]> = queries.iter().map(|&i| leaves[i]).collect();
+    let batch = build_batched_merkle_proof_to_cap(&tree, queries, tree_depth, cap_depth);
+    let paths = expand_batched_merkle_proof_to_cap(&batch, tree_depth, cap_depth, queries, &query_leaves, &hasher)
+        .expect("octopus expands to independent to-cap paths");
+
+    let iv_tower = capacity_iv(TAG_COMPRESS);
+    let iv_flat = [
+        flat_of_tower_u128(iv_tower[0].0),
+        flat_of_tower_u128(iv_tower[1].0),
+    ];
+    let family = MerklePathFamily { depth: walk_depth, n_paths: paths.len() };
+    let w_log = family.n_slots().next_power_of_two().trailing_zeros() as usize;
+
+    let to_witness = |p: &IndependentMerklePath| -> MerklePathWitness {
+        assert_eq!(p.siblings.len(), walk_depth, "to-cap path is walk-depth long");
+        assert_eq!(region_entries[p.leaf_index], lanes(&p.leaf_hash), "region leaf != phi(native)");
+        MerklePathWitness {
+            entry: region_entries[p.leaf_index],
+            siblings: p.siblings.iter().map(lanes).collect(),
+            directions: p.directions.clone(),
+        }
+    };
+    let witnesses: Vec<MerklePathWitness> = paths.iter().map(to_witness).collect();
+    let cols = build_merkle_path_columns(&family, iv_flat, &witnesses, w_log);
+    // Distinct queries genuinely reach DIFFERENT cap nodes.
+    let mut reached: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    for (p, r) in paths.iter().zip(cols.roots.iter()) {
+        let cap_idx = p.leaf_index >> walk_depth;
+        reached.insert(cap_idx);
+        assert_eq!(*r, cap[cap_idx], "region cap node for leaf {} != phi(committed cap[{}])", p.leaf_index, cap_idx);
+    }
+    assert!(reached.len() >= 2, "gate must exercise multiple distinct cap nodes");
+
+    // Negative: corrupt one sibling — that path misses its cap node.
+    let mut bad = witnesses.clone();
+    bad[0].siblings[0][0] += F128::ONE;
+    let cols = build_merkle_path_columns(&family, iv_flat, &bad, w_log);
+    let cap_idx0 = paths[0].leaf_index >> walk_depth;
+    assert_ne!(cols.roots[0], cap[cap_idx0], "a corrupted sibling still reached the cap");
+}
+
+/// SB6 — the source-tree opening authenticates against the committed CAP.
+/// Region source-leaf digests + to-cap independent paths reconstruct the
+/// native committed cap nodes under φ (multiple distinct cap nodes exercised).
 #[test]
 fn source_tree_opening_via_region_families() {
     let hasher = Poseidon2bSponge::new();
-    let depth = 5usize;
-    let n = 1usize << depth;
+    let tree_depth = 6usize;
+    let cap_depth = 2usize; // 4 cap nodes; walk_depth = 4
+    let n = 1usize << tree_depth;
     let (log_rows, n_cols) = (9usize, 1usize); // wallet shape: n_cols = 1
 
     let mut rng = Rng(0x50E_AF01);
@@ -150,7 +222,9 @@ fn source_tree_opening_via_region_families() {
             flat_source_leaf_hash(log_rows, n_cols, i, &sym_flat)
         })
         .collect();
-    check_region_opening(&leaves, &region_entries, depth, QUERIES);
+    // Queries spanning all four cap subtrees (leaf >> 4 in {0,1,2,3}).
+    let queries = [3usize, 21, 40, 60, 3];
+    check_region_opening_to_cap(&leaves, &region_entries, tree_depth, cap_depth, &queries);
 }
 
 /// Step 3i — the per-round FRI openings. The leaf is a plain
