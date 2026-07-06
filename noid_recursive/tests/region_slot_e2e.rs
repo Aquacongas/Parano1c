@@ -317,7 +317,10 @@ fn region_slot_end_to_end() {
                 value: v.clone(),
             }),
             ColRef::CommittedShift(_) => shift_target = Some(v.clone()),
-            ColRef::Internal(_) | ColRef::Fixed(_) | ColRef::CommittedShift2(_) => unreachable!(),
+            ColRef::Internal(_)
+            | ColRef::Fixed(_)
+            | ColRef::CommittedShift2(_)
+            | ColRef::Window { .. } => unreachable!(),
         }
     }
 
