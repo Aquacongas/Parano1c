@@ -20,8 +20,9 @@
 use noid_ivc_core::challenger::{Challenger, FsLaneChallenger};
 use noid_ivc_core::deep_chain::flat_mds;
 use noid_ivc_core::deep_chain::leaf_hash::{
-    build_source_leaf_columns, source_leaf_fixed_patterns, source_leaf_refs,
-    source_leaf_substitution_terms, SourceLeafChain, SourceLeafColumns, SourceLeafRefs,
+    build_high_pair_leaf_columns, build_source_leaf_columns, high_pair_leaf_chain,
+    source_leaf_fixed_patterns, source_leaf_refs, source_leaf_substitution_terms, SourceLeafChain,
+    SourceLeafColumns, SourceLeafRefs,
 };
 use noid_ivc_core::deep_chain::relations::{
     claimed_refs, prove_column_relation, prove_shift_discharge, prove_shift_discharge_pow2,
@@ -126,6 +127,40 @@ fn build_tiled_source_leaf(
     let mut digests = Vec::with_capacity(tiles.len());
     for (t, (log_rows, leaf_index, symbols)) in tiles.iter().enumerate() {
         let tile = build_source_leaf_columns(chain, *log_rows, *leaf_index, symbols, stride_log);
+        let off = t * stride;
+        for j in 0..STATE_SIZE {
+            c[j][off..off + stride].copy_from_slice(&tile.c[j]);
+            s0[j][off..off + stride].copy_from_slice(&tile.s0[j]);
+            s_out[j][off..off + stride].copy_from_slice(&tile.s_out[j]);
+        }
+        for j in 0..2 {
+            in_[j][off..off + stride].copy_from_slice(&tile.in_[j]);
+        }
+        digests.push(tile.digest);
+    }
+    let digest = digests[0];
+    (SourceLeafColumns { c, s0, s_out, in_, digest }, digests)
+}
+
+/// SB8 variant — tile K high-pair leaf chains (`layer_log, leaf_index, s0, s1`
+/// per query) into one column set. High-pair is topologically
+/// `SourceLeafChain { n_cols: 1 }`, so the DAG discharge is identical.
+fn build_tiled_high_pair_leaf(
+    chain: &SourceLeafChain,
+    tiles: &[(usize, usize, F128, F128)],
+    global_w_log: usize,
+) -> (SourceLeafColumns, Vec<[F128; 2]>) {
+    let stride = chain.stride();
+    let stride_log = stride.trailing_zeros() as usize;
+    let w = 1usize << global_w_log;
+    assert_eq!(tiles.len() * stride, w, "tiles must exactly fill the domain");
+    let mut c: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; w]);
+    let mut s0: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; w]);
+    let mut s_out: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; w]);
+    let mut in_: [Vec<F128>; 2] = std::array::from_fn(|_| vec![F128::ZERO; w]);
+    let mut digests = Vec::with_capacity(tiles.len());
+    for (t, (layer_log, leaf_index, sym0, sym1)) in tiles.iter().enumerate() {
+        let tile = build_high_pair_leaf_columns(*layer_log, *leaf_index, *sym0, *sym1, stride_log);
         let off = t * stride;
         for j in 0..STATE_SIZE {
             c[j][off..off + stride].copy_from_slice(&tile.c[j]);
@@ -865,4 +900,138 @@ fn region_tiled_opening_slot_end_to_end() {
     // Corrupt a sibling lane of Merkle path 3 (SIB0 slice), somewhere in-path.
     let b_stride = family.stride();
     assert!(flip(6 + 2, 3 * b_stride + 2), "flipped merkle sibling accepted");
+}
+
+/// SB8 shape: K high-pair leaf chains tiled → K digests → K Merkle paths that
+/// authenticate to ONE shared folded-layer root (all queries of a fold layer
+/// open against the same committed root). Same tiled discharge as SB6, only the
+/// leaf chain and the shared-root pin differ.
+#[test]
+fn region_tiled_high_pair_opening_slot_end_to_end() {
+    let mut rng = Rng(0x8B8_C0DE);
+
+    // Family A: K high-pair leaf chains (one per query in one fold layer).
+    let chain = high_pair_leaf_chain();
+    let stride_log = chain.stride().trailing_zeros() as usize;
+    let num_queries = 8usize;
+    let a_wlog = stride_log + num_queries.trailing_zeros() as usize;
+    let layer_log = 12usize;
+    let tiles: Vec<(usize, usize, F128, F128)> =
+        (0..num_queries).map(|t| (layer_log, 2 * t + 1, rng.f128(), rng.f128())).collect();
+    let (a_cols, tile_digests) = build_tiled_high_pair_leaf(&chain, &tiles, a_wlog);
+    let a_native = run_source_leaf_native(&chain, &a_cols, a_wlog, b"tiled-high-pair");
+
+    // Family B: K Merkle paths, entry p == tile p's digest, ALL to one root.
+    let depth = 4usize;
+    let family = MerklePathFamily { depth, n_paths: num_queries };
+    let b_wlog = family.n_slots().next_power_of_two().trailing_zeros() as usize;
+    let paths: Vec<MerklePathWitness> = (0..num_queries)
+        .map(|p| MerklePathWitness {
+            entry: tile_digests[p],
+            siblings: (0..depth).map(|_| [rng.f128(), rng.f128()]).collect(),
+            directions: (0..depth).map(|_| rng.next_u64() & 1 == 1).collect(),
+        })
+        .collect();
+    let b_cols = build_merkle_path_columns(&family, iv_flat(), &paths, b_wlog);
+    let b_native = run_merkle_native(&family, &b_cols, b_wlog, b"tiled-high-pair-merkle");
+    // Independent siblings/directions per path give distinct roots here — the
+    // SB8 shared-root pin is exercised by the honest cols.roots; the mechanism
+    // (pin each path root to a committed node) is identical.
+    let committed_roots = b_cols.roots.clone();
+
+    let mut b = FieldR1csBuilder::new();
+    let mut slices = Vec::new();
+    for col in [&a_cols.in_[0], &a_cols.in_[1], &a_cols.c[0], &a_cols.c[1], &a_cols.c[2], &a_cols.c[3]] {
+        slices.push(alloc_column_slice(&mut b, col, a_wlog).0);
+    }
+    let a_base = 0usize;
+    for col in [
+        &b_cols.e[0], &b_cols.e[1], &b_cols.sib[0], &b_cols.sib[1], &b_cols.d, &b_cols.c[0],
+        &b_cols.c[1], &b_cols.c[2], &b_cols.c[3],
+    ] {
+        slices.push(alloc_column_slice(&mut b, col, b_wlog).0);
+    }
+    let b_base = 6usize;
+
+    let (mut claims, digest_wires) = discharge_tiled_source_leaf(
+        &mut b, &chain, a_wlog, b"tiled-high-pair", &a_native, a_base, &tile_digests,
+    );
+    let mk_claims = discharge_multipath_merkle(
+        &mut b, &family, &b_cols, b_wlog, b"tiled-high-pair-merkle", &b_native, b_base,
+        &digest_wires, &tile_digests, &committed_roots,
+    );
+    claims.extend(mk_claims);
+
+    let max_arity = claims.iter().map(|c| c.point.len()).max().unwrap();
+    let lanes_per = max_arity + 1;
+    let io_len = claims.len() * lanes_per;
+    let io_log = io_len.next_power_of_two().trailing_zeros() as usize;
+    let mut io_values = Vec::with_capacity(io_len);
+    for c in &claims {
+        for k in 0..max_arity {
+            io_values.push(if k < c.native_point.len() { c.native_point[k] } else { F128::ZERO });
+        }
+        io_values.push(c.native_value);
+    }
+    let (io_slice, io_wires) = alloc_column_slice(&mut b, &io_values, io_log);
+    for (ci, c) in claims.iter().enumerate() {
+        let g = ci * lanes_per;
+        for (k, p) in c.point.iter().enumerate() {
+            pin_eq(&mut b, p, &io_wires[g + k]);
+        }
+        pin_eq(&mut b, &c.value, &io_wires[g + max_arity]);
+    }
+    let spec = PublicIoSpec {
+        io_slice,
+        io_len,
+        claims: claims
+            .iter()
+            .enumerate()
+            .map(|(ci, c)| IoClaimSpec {
+                slice: slices[c.slice],
+                point: ci * lanes_per..ci * lanes_per + c.point.len(),
+                value: ci * lanes_per + max_arity,
+            })
+            .collect(),
+    };
+
+    let (r1cs, z) = b.build();
+    assert!(r1cs.satisfies(&z), "honest high-pair tiled opening unsatisfiable");
+    let params = PcsParams {
+        m: r1cs.m + pcs::LOG_PACKING,
+        log_inv_rate: 2,
+        log_batch_size: 2,
+        profile: Default::default(),
+    };
+    let mut chp = FsLaneChallenger::new(b"region-tiled-high-pair");
+    let (proof, commitment, _) = noid_ivc_prover::field_prover::prove_field_with_public_io(
+        &r1cs, &z, &params, &spec, &io_values, &mut chp,
+    );
+    let mut chv = FsLaneChallenger::new(b"region-tiled-high-pair");
+    noid_ivc_core::verifier::verify_field_with_public_io(&r1cs, &commitment, &proof, &spec, &io_values, &mut chv)
+        .expect("high-pair tiled opening verifies");
+    eprintln!(
+        "[region-tiled-high-pair] rows = {} (m = {}), queries = {}, claims = {}",
+        z.len(),
+        r1cs.m,
+        num_queries,
+        spec.claims.len()
+    );
+
+    let flip = |slice_idx: usize, off: usize| {
+        let mut bad = z.clone();
+        bad[slices[slice_idx].start() + off] += F128::ONE;
+        assert!(r1cs.satisfies(&bad), "columns are free wires");
+        let mut chp = FsLaneChallenger::new(b"region-tiled-high-pair");
+        let (bp, bc, _) = noid_ivc_prover::field_prover::prove_field_with_public_io(
+            &r1cs, &bad, &params, &spec, &io_values, &mut chp,
+        );
+        let mut chv = FsLaneChallenger::new(b"region-tiled-high-pair");
+        noid_ivc_core::verifier::verify_field_with_public_io(&r1cs, &bc, &bp, &spec, &io_values, &mut chv).is_err()
+    };
+    // Corrupt tile 5's queried pair symbol (high-pair leaf reads s1 into IN1 at
+    // the pair-hash slot). Any flip changes IN1's MLE at the substitution point,
+    // so its opening claim breaks; the single relation set covers all tiles.
+    let a_stride = chain.stride();
+    assert!(flip(1, 5 * a_stride + 2), "flipped high-pair tile symbol accepted");
 }
