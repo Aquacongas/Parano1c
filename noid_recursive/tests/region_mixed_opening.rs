@@ -1,24 +1,31 @@
-//! [G] item 5b — the wallet-capsule source-binding HALF of verify_mixed_opening
-//! reproduced via the region families against a REAL capsule opening.
+//! [G] item 5b — the WHOLE wallet-capsule `verify_mixed_opening` reproduced via
+//! the region families against a REAL capsule opening, returning the same
+//! opening value the native verifier does.
 //!
 //! Reproduces, driving the SAME FRICHANL channel as the native verifier:
-//! steps 1-2 (γ), the compact-FRI fold rounds (3a-3f: eval consistency,
-//! τ tensor-batching draw β, per-round sumcheck + fri-root absorbs, final
-//! codeword), then the source binding SB1-SB9 with every hash delegated to a
-//! region family:
+//! steps 1-2 (γ, batched claim); the compact-FRI fold rounds (3a-3f: eval
+//! consistency, τ tensor-batching draw β, per-round sumcheck + fri-root
+//! absorbs, final codeword); the source binding SB1-SB9; then the FRI query
+//! phase (3h-3j). Every hash is delegated to a region family:
 //!   - SB1.1/SB1.2  H-claim + source_tree(Code(H·eq_right)) root == fri_roots[0]
 //!   - SB2/SB3      source-binding commitment absorbs + source query draw
 //!   - SB6          source leaves (flat_source_leaf_hash) + to-cap Merkle family
 //!   - SB7/SB8/SB9  the fold chain: source pair → τ layers of
-//!                  tensor_high_fold_pair (with high_pair leaf + Merkle
-//!                  family per layer, parity pins) → folded == h_code
-//! Honest-accept validates the transcript↔algebra JOIN (a wrong β/query draw
-//! from a diverged channel would make SB6/SB9 fail against the committed
-//! symbols) AND the fold chain; tampering a source or folded symbol is caught.
+//!                  tensor_high_fold_pair (high_pair leaf + Merkle family per
+//!                  layer, parity pins) → folded == h_code
+//!   - 3i/3j        per-round FRI openings (flat_hash_pair leaf + Merkle
+//!                  family) + noid_fri::code::fold → folded == final_codeword
+//! The private helpers (eq_ind_partial_eval, compute_batched_claim_flat for
+//! n_cols=1, observe_source_binding_commitments) are reproduced — no internal
+//! exposure. Honest-accept returns the SAME opening as native (validating the
+//! transcript↔algebra JOIN: a diverged channel would make the openings /
+//! codeword checks fail against the committed symbols); tampering a source,
+//! folded, or FRI symbol is caught. This is the native reference the in-trace
+//! `discharge_auth_pcs_obligation_via_region` will shadow.
 
 use noid_core::mle::evaluate::evaluate_slice;
 use noid_core::{AdditiveNTT, Block128, TowerField};
-use noid_fri::code::{Code, LOG_RATE};
+use noid_fri::code::{fold, Code, LOG_RATE};
 use noid_fri::merkle::VectorCommitment;
 use noid_fri::Channel;
 use noid_fri_binius::compact_fri::{
@@ -40,7 +47,7 @@ use noid_ivc_core::deep_chain::leaf_hash::{flat_high_pair_leaf_hash, flat_source
 use noid_ivc_core::deep_chain::schedule::{
     build_merkle_path_columns, flat_of_tower_u128, MerklePathFamily, MerklePathWitness,
 };
-use noid_ivc_core::deep_chain::source_tree::{build_source_tree_columns, SourceTree};
+use noid_ivc_core::deep_chain::source_tree::{build_source_tree_columns, flat_hash_pair, SourceTree};
 use noid_ivc_core::field::F128;
 use noid_poseidon2b::hasher::CryptographicHasher;
 use noid_poseidon2b::native::domain::{capacity_iv, TAG_COMPRESS};
@@ -191,7 +198,7 @@ fn region_merkle_to_cap(
 /// with every hash delegated to a region family, driving the real channel.
 /// Returns the primary opening on success.
 #[allow(clippy::too_many_arguments)]
-fn verify_source_half_via_region(
+fn verify_mixed_opening_via_region(
     proof: &AuthMleOpeningProof,
     primary_point: &[Block128],
     ntt: &AdditiveNTT<Block128>,
@@ -243,6 +250,7 @@ fn verify_source_half_via_region(
 
     // 3e: sumcheck rounds → random_point; absorb fri roots.
     let n_rounds = right.len();
+    let mut random_point = Vec::with_capacity(n_rounds);
     for round in 0..n_rounds {
         let [c0, c1] = fri.sum_check_oracles[round];
         if c1 != claim {
@@ -253,6 +261,7 @@ fn verify_source_half_via_region(
         let depth = compute_round_depth(n_rounds, round);
         channel.observe_vector_commitment(&VectorCommitment { root: fri.fri_roots[round], depth });
         let r = channel.get_random_point();
+        random_point.push(r);
         claim = c0 + c1 * r;
     }
     // 3f: absorb final codeword.
@@ -382,6 +391,61 @@ fn verify_source_half_via_region(
         }
     }
 
+    // ---- 3h-3j: the FRI query phase (drawn AFTER the source query), with the
+    // per-round openings delegated to region Merkle families and the fold via
+    // noid_fri::code::fold.
+    let fri_queries = gen_compact_queries(channel, n_rounds + LOG_RATE, num_queries);
+    let nq = fri_queries.len();
+    let mut folded_syms: Vec<Option<Block128>> = vec![None; nq];
+    for round in 0..n_rounds {
+        let symbols = &fri.fri_queried_symbols[round];
+        if symbols.len() != nq {
+            return Err(format!("fri symbol count round {round}"));
+        }
+        // Fold-consistency against the previous round.
+        for (i, &(s0, s1)) in symbols.iter().enumerate() {
+            if round > 0 {
+                let parity = (fri_queries[i] >> round) & 1;
+                let expected = if parity == 1 { s1 } else { s0 };
+                if folded_syms[i] != Some(expected) {
+                    return Err(format!("fri fold-consistency at query {i} round {round}"));
+                }
+            }
+        }
+        let pair_indices: Vec<usize> =
+            fri_queries.iter().map(|&qi| (qi >> round) >> 1).collect();
+        let mut native_leaves = Vec::with_capacity(nq);
+        let mut region_leaves = Vec::with_capacity(nq);
+        for &(s0, s1) in symbols {
+            native_leaves.push(hasher.hash_pair(&s0, &s1));
+            region_leaves.push(flat_hash_pair(phi(s0), phi(s1)));
+        }
+        region_merkle_to_root(
+            &native_leaves,
+            &region_leaves,
+            &BatchedMerkleProof { siblings: fri.fri_merkle_batch[round].siblings.clone() },
+            compute_round_depth(n_rounds, round),
+            &pair_indices,
+            hasher,
+            lanes(&fri.fri_roots[round]),
+        )?;
+        // Fold.
+        for (i, &(s0, s1)) in symbols.iter().enumerate() {
+            let pair_idx = (fri_queries[i] >> round) >> 1;
+            folded_syms[i] = Some(fold(random_point[round], round, pair_idx, s0, s1, ntt));
+        }
+    }
+    // 3j: final codeword.
+    let final_len = fri.final_codeword.len();
+    for (i, sym) in folded_syms.iter().enumerate() {
+        if let Some(s) = sym {
+            let final_idx = fri_queries[i] >> n_rounds;
+            if *s != fri.final_codeword[final_idx % final_len] {
+                return Err(format!("final codeword mismatch at query {i}"));
+            }
+        }
+    }
+
     Ok(opening.all_openings[0])
 }
 
@@ -390,7 +454,7 @@ fn verify_source_half_via_region(
 /// channel / fold chain would fail, and tampering a source or folded symbol is
 /// caught.
 #[test]
-fn source_half_via_region_matches_native() {
+fn mixed_opening_via_region_matches_native() {
     for (num_vars, seed) in [(9usize, 0xA9u64), (11, 0xB11)] {
         let (point, reduction, proof) = capsule_fixture(num_vars, seed);
         let ntt = AdditiveNTT::<Block128>::new(num_vars + LOG_RATE);
@@ -409,8 +473,8 @@ fn source_half_via_region_matches_native() {
         // Region source half: honest accepts, returns the same opening.
         let mut ch = Channel::new();
         noid_fri_binius::absorb_cap(&mut ch, &proof.commitment.cap);
-        let got = verify_source_half_via_region(&proof, &point, &ntt, &mut ch, &hasher, nq)
-            .expect("region source half accepts honest opening");
+        let got = verify_mixed_opening_via_region(&proof, &point, &ntt, &mut ch, &hasher, nq)
+            .expect("region full opening accepts honest proof");
         assert_eq!(got, reduction.value, "nv={num_vars}");
 
         // Negative: tamper one source symbol -> SB6 (leaf) / SB9 breaks.
@@ -420,7 +484,7 @@ fn source_half_via_region_matches_native() {
             let mut ch = Channel::new();
             noid_fri_binius::absorb_cap(&mut ch, &bad.commitment.cap);
             assert!(
-                verify_source_half_via_region(&bad, &point, &ntt, &mut ch, &hasher, nq).is_err(),
+                verify_mixed_opening_via_region(&bad, &point, &ntt, &mut ch, &hasher, nq).is_err(),
                 "nv={num_vars}: tampered source symbol accepted"
             );
         }
@@ -433,11 +497,23 @@ fn source_half_via_region_matches_native() {
             let mut ch = Channel::new();
             noid_fri_binius::absorb_cap(&mut ch, &bad.commitment.cap);
             assert!(
-                verify_source_half_via_region(&bad, &point, &ntt, &mut ch, &hasher, nq).is_err(),
+                verify_mixed_opening_via_region(&bad, &point, &ntt, &mut ch, &hasher, nq).is_err(),
                 "nv={num_vars}: tampered folded symbol accepted"
             );
         }
+        // Negative: tamper a FRI-round queried symbol -> the round-0 Merkle
+        // opening (region family) / fold-consistency / final codeword breaks.
+        {
+            let mut bad = proof.clone();
+            bad.opening.fri_proof.fri_queried_symbols[0][0].0 += Block128::from(1u128);
+            let mut ch = Channel::new();
+            noid_fri_binius::absorb_cap(&mut ch, &bad.commitment.cap);
+            assert!(
+                verify_mixed_opening_via_region(&bad, &point, &ntt, &mut ch, &hasher, nq).is_err(),
+                "nv={num_vars}: tampered FRI symbol accepted"
+            );
+        }
 
-        eprintln!("[region-mixed-source] nv={num_vars}: tau={}, n_rounds={}", COMPACT_TAU.min(num_vars), num_vars - COMPACT_TAU.min(num_vars));
+        eprintln!("[region-mixed-opening] nv={num_vars}: tau={}, n_rounds={}", COMPACT_TAU.min(num_vars), num_vars - COMPACT_TAU.min(num_vars));
     }
 }
