@@ -68,6 +68,9 @@ use super::trace::accepted_claim_batch::{
 };
 use super::trace::accepted_claim_hash::{build_accepted_claim_hash_slot, AcceptedClaimHashInputsTrace};
 use super::trace::auth_pcs::discharge_auth_pcs_obligation;
+use super::trace::region_source_binding::{
+    discharge_auth_pcs_obligation_via_region, RegionDischargeParams, RegionPcsClaim,
+};
 use super::trace::checkpoint_poseidon::{
     build_checkpoint_poseidon_slot_with_inputs, ChainAccumulatorBatchInputsTrace,
     ChainAccumulatorItemTrace, HeaderHashInputsTrace,
@@ -223,6 +226,10 @@ pub struct BlockSlots {
     pub tx_root_paths: Vec<MerklePathInputsTrace>,
     pub auth_inputs: Vec<OwnerAuthPublicInputsTrace>,
     pub exact_state: ExactStateSlotWires,
+    /// Committed-column opening claims emitted by the region wallet-PCS
+    /// discharge (empty unless `BlockSlotsConfig::wallet_pcs_region` was set).
+    /// The link threads these into its public-IO (`spec.claims` + `io`).
+    pub pending_wallet_pcs: Vec<RegionPcsClaim>,
 }
 
 impl BlockSlots {
@@ -260,12 +267,21 @@ pub struct BlockSlotsConfig {
     /// reduced PCS claim is left undischarged — for shape experiments and
     /// the region-layer transition, never for a complete proof.
     pub discharge_wallet_pcs: bool,
+    /// When `Some`, discharge the wallet-PCS via the SHAPE-FIXED region layer
+    /// (`discharge_auth_pcs_obligation_via_region`) instead of the inline
+    /// compact-FRI replay. The region discharge is class-fixed (its trace
+    /// structure does NOT drift with the proof), and it emits committed-column
+    /// opening claims collected into [`BlockSlots::pending_wallet_pcs`] for the
+    /// link to thread through public-IO. `None` = the inline discharge. Only
+    /// consulted when `discharge_wallet_pcs` is true.
+    pub wallet_pcs_region: Option<RegionDischargeParams>,
 }
 
 impl Default for BlockSlotsConfig {
     fn default() -> Self {
         Self {
             discharge_wallet_pcs: true,
+            wallet_pcs_region: None,
         }
     }
 }
@@ -462,6 +478,7 @@ pub fn build_block_slots_with_config(
     // ---- authorization components (per user tx): owner-auth killshot +
     // wallet-PCS discharge, tx_body_hash pinned to the spine hash.
     let mut auth_inputs = Vec::with_capacity(inputs.authorization_inputs.len());
+    let mut pending_wallet_pcs: Vec<RegionPcsClaim> = Vec::new();
     let mut owner_sum = LinExpr::zero();
     let mut live_sum = LinExpr::zero();
     for (input, witness_proof) in inputs
@@ -474,7 +491,20 @@ pub fn build_block_slots_with_config(
         assert_eq!(input.tx_body_hash, input.public.tx_body_hash);
         let (inputs_t, obligation) = build_owner_auth_slot(b, witness_proof, &input.public);
         if config.discharge_wallet_pcs {
-            discharge_auth_pcs_obligation(b, &obligation, &witness_proof.pcs);
+            match config.wallet_pcs_region {
+                // Inline compact-FRI replay (proof-dependent shape).
+                None => discharge_auth_pcs_obligation(b, &obligation, &witness_proof.pcs),
+                // Shape-fixed region discharge: collect its opening claims for
+                // the link to thread through public-IO.
+                Some(params) => pending_wallet_pcs.extend(
+                    discharge_auth_pcs_obligation_via_region(
+                        b,
+                        &obligation,
+                        &witness_proof.pcs,
+                        params,
+                    ),
+                ),
+            }
         }
         pin_eq2(b, &inputs_t.tx_body_hash, &tx_hashes[input.tx_index]);
         owner_sum = owner_sum.add(&inputs_t.owner_count);
@@ -564,5 +594,6 @@ pub fn build_block_slots_with_config(
         tx_root_paths,
         auth_inputs,
         exact_state,
+        pending_wallet_pcs,
     }
 }

@@ -1999,6 +1999,7 @@ mod tests {
         };
         let no_pcs = BlockSlotsConfig {
             discharge_wallet_pcs: false,
+            wallet_pcs_region: None,
         };
         let layout = link_io_layout_for(shape.k_log, true);
 
@@ -2226,6 +2227,7 @@ mod tests {
         // byte-identical across two different real blocks.
         let no_pcs = BlockSlotsConfig {
             discharge_wallet_pcs: false,
+            wallet_pcs_region: None,
         };
         let r0 = build(&units[0], no_pcs, "block 0 (height 1, no wallet-PCS)");
         let r1 = build(&units[1], no_pcs, "block 1 (height 2, no wallet-PCS)");
