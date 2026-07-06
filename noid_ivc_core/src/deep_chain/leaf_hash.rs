@@ -123,10 +123,13 @@ pub fn build_source_leaf_columns(
     let mut s0: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; w]);
     let mut s_out: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; w]);
 
+    // Copy-only store: the permutation is run by the caller, so the ghost
+    // fill runs `perm([0;4])` ONCE (not per slot) and active slots are permed
+    // exactly once each (single-pass, matching `source_tree`).
     let mut store = |slot: usize,
-                     raw: [F128; STATE_SIZE],
+                     s0v: [F128; STATE_SIZE],
+                     outv: [F128; STATE_SIZE],
                      c: &mut [Vec<F128>; STATE_SIZE]| {
-        let (s0v, outv) = run_perm(raw);
         for j in 0..STATE_SIZE {
             s0[j][slot] = s0v[j];
             s_out[j][slot] = outv[j];
@@ -134,72 +137,61 @@ pub fn build_source_leaf_columns(
         }
     };
 
-    // Ghost default so the walk stays consistent on unused slots (raw = 0).
+    // Ghost default so the walk stays consistent on unused slots (raw = 0):
+    // one perm, broadcast to every slot; active slots overwritten below.
+    let (ghost_s0, ghost_out) = run_perm([F128::ZERO; STATE_SIZE]);
     for slot in 0..w {
-        store(slot, [F128::ZERO; STATE_SIZE], &mut c);
+        store(slot, ghost_s0, ghost_out, &mut c);
     }
 
     // Initial block.
-    store(
-        0,
-        [
-            flat_lane(SOURCE_LEAF_DOMAIN),
-            flat_lane(log_rows as u128),
-            F128::ZERO,
-            F128::ZERO,
-        ],
-        &mut c,
-    );
-    store(
-        1,
-        [
-            flat_lane(chain.n_cols as u128),
-            flat_lane(leaf_index as u128),
-            F128::ZERO,
-            F128::ZERO,
-        ],
-        &mut c,
-    );
+    let (a, b) = run_perm([
+        flat_lane(SOURCE_LEAF_DOMAIN),
+        flat_lane(log_rows as u128),
+        F128::ZERO,
+        F128::ZERO,
+    ]);
+    store(0, a, b, &mut c);
+    let (a, b) = run_perm([
+        flat_lane(chain.n_cols as u128),
+        flat_lane(leaf_index as u128),
+        F128::ZERO,
+        F128::ZERO,
+    ]);
+    store(1, a, b, &mut c);
     // compress(acc0 = C(0), meta = C(1)).
     let acc0 = [c[0][0], c[1][0]];
-    store(2, [acc0[0], acc0[1], iv[0], iv[1]], &mut c);
+    let (a, b) = run_perm([acc0[0], acc0[1], iv[0], iv[1]]);
+    store(2, a, b, &mut c);
     let even_out: [F128; STATE_SIZE] = std::array::from_fn(|j| c[j][2]);
     let meta = [c[0][1], c[1][1]];
-    store(
-        3,
-        [
-            even_out[0] + meta[0],
-            even_out[1] + meta[1],
-            even_out[2],
-            even_out[3],
-        ],
-        &mut c,
-    );
+    let (a, b) = run_perm([
+        even_out[0] + meta[0],
+        even_out[1] + meta[1],
+        even_out[2],
+        even_out[3],
+    ]);
+    store(3, a, b, &mut c);
 
     // Per-column steps.
     for k in 0..chain.n_cols {
         let hp = 4 + 3 * k;
         let ev = 5 + 3 * k;
         let od = 6 + 3 * k;
-        store(
-            hp,
-            [symbols[2 * k], symbols[2 * k + 1], F128::ZERO, F128::ZERO],
-            &mut c,
-        );
+        let (a, b) = run_perm([symbols[2 * k], symbols[2 * k + 1], F128::ZERO, F128::ZERO]);
+        store(hp, a, b, &mut c);
         let acc = [c[0][ev - 2], c[1][ev - 2]]; // running acc, two slots back
-        store(ev, [acc[0], acc[1], iv[0], iv[1]], &mut c);
+        let (a, b) = run_perm([acc[0], acc[1], iv[0], iv[1]]);
+        store(ev, a, b, &mut c);
         let even_out: [F128; STATE_SIZE] = std::array::from_fn(|j| c[j][ev]);
         let ph = [c[0][od - 2], c[1][od - 2]]; // ph_k = the hash_pair output, two slots back
-        store(
-            od,
-            [
-                even_out[0] + ph[0],
-                even_out[1] + ph[1],
-                even_out[2],
-                even_out[3],
-            ],
-            &mut c,
-        );
+        let (a, b) = run_perm([
+            even_out[0] + ph[0],
+            even_out[1] + ph[1],
+            even_out[2],
+            even_out[3],
+        ]);
+        store(od, a, b, &mut c);
     }
 
     // The committed hash_pair input columns (0 outside hash-pair slots).
@@ -427,10 +419,12 @@ pub fn build_high_pair_leaf_columns(
     let mut s0c: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; w]);
     let mut s_out: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; w]);
 
+    // Copy-only store (see build_source_leaf_columns): single-pass, the ghost
+    // perm runs once and active slots are permed exactly once each.
     let mut store = |slot: usize,
-                     raw: [F128; STATE_SIZE],
+                     s0v: [F128; STATE_SIZE],
+                     outv: [F128; STATE_SIZE],
                      c: &mut [Vec<F128>; STATE_SIZE]| {
-        let (s0v, outv) = run_perm(raw);
         for j in 0..STATE_SIZE {
             s0c[j][slot] = s0v[j];
             s_out[j][slot] = outv[j];
@@ -438,60 +432,52 @@ pub fn build_high_pair_leaf_columns(
         }
     };
 
-    // Ghost default (raw = 0) so the walk stays consistent on unused slots.
+    // Ghost default (raw = 0): one perm, broadcast; active slots overwritten.
+    let (ghost_s0, ghost_out) = run_perm([F128::ZERO; STATE_SIZE]);
     for slot in 0..w {
-        store(slot, [F128::ZERO; STATE_SIZE], &mut c);
+        store(slot, ghost_s0, ghost_out, &mut c);
     }
 
     // acc = hash_pair(HIGH_PAIR_DOMAIN, layer_log).
-    store(
-        0,
-        [
-            flat_lane(HIGH_PAIR_LEAF_DOMAIN),
-            flat_lane(layer_log as u128),
-            F128::ZERO,
-            F128::ZERO,
-        ],
-        &mut c,
-    );
+    let (a, b) = run_perm([
+        flat_lane(HIGH_PAIR_LEAF_DOMAIN),
+        flat_lane(layer_log as u128),
+        F128::ZERO,
+        F128::ZERO,
+    ]);
+    store(0, a, b, &mut c);
     // meta = hash_pair(leaf_index, s0).
-    store(
-        1,
-        [flat_lane(leaf_index as u128), s0, F128::ZERO, F128::ZERO],
-        &mut c,
-    );
+    let (a, b) = run_perm([flat_lane(leaf_index as u128), s0, F128::ZERO, F128::ZERO]);
+    store(1, a, b, &mut c);
     // compress(acc0 = C(0), meta = C(1)).
     let acc0 = [c[0][0], c[1][0]];
-    store(2, [acc0[0], acc0[1], iv[0], iv[1]], &mut c);
+    let (a, b) = run_perm([acc0[0], acc0[1], iv[0], iv[1]]);
+    store(2, a, b, &mut c);
     let even_out: [F128; STATE_SIZE] = std::array::from_fn(|j| c[j][2]);
     let meta = [c[0][1], c[1][1]];
-    store(
-        3,
-        [
-            even_out[0] + meta[0],
-            even_out[1] + meta[1],
-            even_out[2],
-            even_out[3],
-        ],
-        &mut c,
-    );
+    let (a, b) = run_perm([
+        even_out[0] + meta[0],
+        even_out[1] + meta[1],
+        even_out[2],
+        even_out[3],
+    ]);
+    store(3, a, b, &mut c);
     // pair = hash_pair(s0, s1).
-    store(4, [s0, s1, F128::ZERO, F128::ZERO], &mut c);
+    let (a, b) = run_perm([s0, s1, F128::ZERO, F128::ZERO]);
+    store(4, a, b, &mut c);
     // compress(acc = C(3), pair = C(4)).
     let acc = [c[0][3], c[1][3]];
-    store(5, [acc[0], acc[1], iv[0], iv[1]], &mut c);
+    let (a, b) = run_perm([acc[0], acc[1], iv[0], iv[1]]);
+    store(5, a, b, &mut c);
     let even_out: [F128; STATE_SIZE] = std::array::from_fn(|j| c[j][5]);
     let pair = [c[0][4], c[1][4]];
-    store(
-        6,
-        [
-            even_out[0] + pair[0],
-            even_out[1] + pair[1],
-            even_out[2],
-            even_out[3],
-        ],
-        &mut c,
-    );
+    let (a, b) = run_perm([
+        even_out[0] + pair[0],
+        even_out[1] + pair[1],
+        even_out[2],
+        even_out[3],
+    ]);
+    store(6, a, b, &mut c);
 
     // The committed hash_pair input columns (0 outside hash-pair slots).
     let mut in_: [Vec<F128>; 2] = std::array::from_fn(|_| vec![F128::ZERO; w]);

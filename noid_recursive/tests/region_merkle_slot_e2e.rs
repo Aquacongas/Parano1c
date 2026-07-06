@@ -222,7 +222,7 @@ fn merkle_substitution_terms_trace(
     b: &mut FieldR1csBuilder,
     refs: &MerkleFamilyRefs,
     alpha: &LinExpr,
-) -> Vec<RelationTermTrace> {
+) -> (Vec<RelationTermTrace>, Vec<LinExpr>) {
     let mds = flat_mds(true);
     let mut alpha_pows = Vec::with_capacity(STATE_SIZE);
     let mut acc = LinExpr::constant(F128::ONE);
@@ -277,7 +277,7 @@ fn merkle_substitution_terms_trace(
             factors: vec![ColRef::Fixed(refs.iv[j - 2])],
         });
     }
-    terms
+    (terms, alpha_pows)
 }
 
 struct PendingClaimTrace {
@@ -363,12 +363,12 @@ fn region_merkle_slot_end_to_end() {
     // Substitution through the compress wiring (α-power coefficients).
     let alpha = ch.sample_f128(&mut b);
     let sub_terms_native = merkle_substitution_terms(&refs, F128::ONE); // claimed-ref shape
-    let sub_terms_e = merkle_substitution_terms_trace(&mut b, &refs, &alpha);
+    // The substitution twin returns the α-power wires (α^1..α^STATE_SIZE) so
+    // the target reuses them instead of rebuilding the chain.
+    let (sub_terms_e, alpha_pows) = merkle_substitution_terms_trace(&mut b, &refs, &alpha);
     let mut target = LinExpr::zero();
-    let mut alpha_pow = LinExpr::constant(F128::ONE);
     for e in 0..STATE_SIZE {
-        alpha_pow = mul(&mut b, &alpha_pow, &alpha);
-        target = target.add(&mul(&mut b, &alpha_pow, &terminal.values[e]));
+        target = target.add(&mul(&mut b, &alpha_pows[e], &terminal.values[e]));
     }
     let n_sub_claims = claimed_refs(&sub_terms_native).len();
     let sub_e = ColumnRelationProofTrace::alloc(&mut b, &native.sub_proof, w_log, n_sub_claims);
