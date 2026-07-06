@@ -59,7 +59,9 @@ use super::trace::self_verify::{
 use super::trace::region_source_binding::{RegionDischargeParams, RegionPcsClaim};
 use super::trace::accepted_claim_batch::digest_lanes;
 use super::trace::{flat_of, mul, pin_eq};
-use super::block_slots::{build_block_slots_with_config, BlockSlots, BlockSlotsConfig};
+use super::block_slots::{
+    build_block_slots_with_config, region_wallet_pcs_native, BlockSlots, BlockSlotsConfig,
+};
 use noid_ivc_prover::field_prover::prove_field_with_public_io;
 use crate::accumulator::ChainAccumulator;
 use crate::block_certificate_backend::{
@@ -511,22 +513,6 @@ pub fn build_link(class: &LinkClass, input: &LinkInput<'_>) -> BuiltLink {
     build_link_inner(class, input, false)
 }
 
-/// Assert the live region discharge matches the frozen class shape by count
-/// and arity (used by the throwaway native pre-pass, whose builder context —
-/// hence slice indices — differs from the real trace).
-fn assert_region_count_arity(live: &[RegionPcsClaim], frozen: &[RegionFrozenClaim], phase: &str) {
-    assert_eq!(
-        live.len(),
-        frozen.len(),
-        "region claim count drift ({phase}): live {} vs frozen {}",
-        live.len(),
-        frozen.len()
-    );
-    for (i, (l, f)) in live.iter().zip(frozen).enumerate() {
-        assert_eq!(l.point.len(), f.arity, "region claim {i} arity drift ({phase})");
-    }
-}
-
 /// [`build_link`] core. `freeze = true` is the region shape-freeze pass: the
 /// class carries `region_params` but an empty `region_claims`, so the live
 /// discharge is captured and RETURNED (`BuiltLink::region_claims`) WITHOUT the
@@ -600,24 +586,20 @@ fn build_link_inner(class: &LinkClass, input: &LinkInput<'_>, freeze: bool) -> B
     // cells. Only in REAL region mode; the freeze leaves the tail zero.
     if region_mode && !freeze {
         let block = input.block.as_ref().expect("region class requires a block");
-        let cfg = class.block_config(block);
-        let region_native: Vec<(Vec<F128>, F128)> = {
-            let mut pb = FieldR1csBuilder::new();
-            let slots = build_block_slots_with_config(
-                &mut pb,
-                block.start_accumulator,
-                block.end_accumulator,
-                block.inputs,
-                block.proof,
-                cfg,
-            );
-            assert_region_count_arity(&slots.pending_wallet_pcs, &class.region_claims, "pre-pass");
-            slots
-                .pending_wallet_pcs
-                .iter()
-                .map(|c| (c.native_point.clone(), c.native_value))
-                .collect()
-        };
+        let params = class.region_params.expect("region mode has params");
+        // Recover the region claims' native (point, value) via an auth-only
+        // scratch discharge (NOT the whole block slots — the block-[B] killshots
+        // are irrelevant to the region values). The count must match the frozen
+        // class shape; the full trace pass below re-derives the same claims with
+        // their wires + slices and asserts the complete shape.
+        let region_native = region_wallet_pcs_native(block.inputs, params);
+        assert_eq!(
+            region_native.len(),
+            class.region_claims.len(),
+            "region native claim count {} != frozen {}",
+            region_native.len(),
+            class.region_claims.len()
+        );
         let stride = class.region_max_arity + 1;
         for (ci, (np, nv)) in region_native.iter().enumerate() {
             let base = layout.region_tail_offset + ci * stride;

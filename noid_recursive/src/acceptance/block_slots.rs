@@ -597,3 +597,39 @@ pub fn build_block_slots_with_config(
         pending_wallet_pcs,
     }
 }
+
+/// The region wallet-PCS opening claims' native `(point, value)` per claim, via
+/// a lightweight scratch discharge over ONLY the per-tx owner-auth slots + the
+/// region discharge — SKIPPING the block-[B] killshots (~2.7M wires @1 tx),
+/// which do not affect the region native values.
+///
+/// The link fills its public-IO envelope from these BEFORE the real trace
+/// allocates the fixed-position IO cells; the claim WIRES + committed-column
+/// SLICES come from the real (full) build. The region discharge is driven
+/// solely by each tx's owner-auth obligation (`commitment_cap_lanes` +
+/// `reduction`), so the native `(point, value)` here are identical to the
+/// full-block build — only the committed-column slices differ (supplied by the
+/// real build, not here). This is what lets the link recover the IO values
+/// without building the whole block slots twice (the block-[B] half is no
+/// longer duplicated; only the region discharge is, and that is unavoidable
+/// while the IO cells sit at a fixed early position).
+pub fn region_wallet_pcs_native(
+    inputs: &AcceptedBlockBatchComponentInputs,
+    params: RegionDischargeParams,
+) -> Vec<(Vec<F128>, F128)> {
+    let mut pb = FieldR1csBuilder::new();
+    let mut out = Vec::new();
+    for (input, witness_proof) in inputs
+        .authorization_inputs
+        .iter()
+        .zip(inputs.authorization_witnesses.iter())
+    {
+        let (_inputs_t, obligation) = build_owner_auth_slot(&mut pb, witness_proof, &input.public);
+        for c in
+            discharge_auth_pcs_obligation_via_region(&mut pb, &obligation, &witness_proof.pcs, params)
+        {
+            out.push((c.native_point, c.native_value));
+        }
+    }
+    out
+}
