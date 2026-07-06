@@ -105,28 +105,31 @@ fn prove_field_inner<Ch: Challenger>(
     };
 
     if timing {
-        // Constraint-matrix residency. The matrix is now CSR (parallel
-        // `col_indices: u32` + `values: F128` + `usize` row offsets): 20 B/nnz
-        // + 8 B/row across both matrices, no per-entry padding, no per-row
-        // headers. For contrast, the former `Vec<Vec<(u32,F128)>>` cost 32 B
-        // per nonzero (the tuple padded to 32 B: F128 is 16-aligned) plus a
-        // 24 B `Vec` header per row (both matrices, including empty padding
-        // rows) plus capacity slack — roughly double, and the single largest
-        // resident prover buffer at block-bearing sizes.
+        // Constraint-matrix residency. Dictionary-encoded CSR: per nonzero a
+        // u32 column index + a u32 value-table index (8 B), plus 8 B/row
+        // offsets and a tiny value table (the matrix is a protocol constant
+        // with a few hundred distinct coefficients). The plain-CSR `Vec<F128>`
+        // was 20 B/nonzero; the original `Vec<Vec<(u32,F128)>>` 32 B/nonzero +
+        // a 24 B row header. The matrix is the largest resident prover buffer
+        // at block-bearing sizes.
         let a_nnz = r1cs.a_0.nnz();
         let b_nnz = r1cs.b_0.nnz();
         let nnz = a_nnz + b_nnz;
+        let a_dist = r1cs.a_0.distinct_values();
+        let b_dist = r1cs.b_0.distinct_values();
         let rows = 1usize << r1cs.k_log;
         let mb = |b: usize| b / (1024 * 1024);
+        let dict = nnz * 8 + rows * 8 * 2 + (a_dist + b_dist) * 16;
         let csr = nnz * 20 + rows * 8 * 2;
         let vecvec = nnz * 32 + rows * 24 * 2;
         let (rss, peak) = vmrss_mb();
         eprintln!(
-            "[field-prove] matrix @entry: a_nnz={a_nnz} b_nnz={b_nnz} rows={rows} | \
-             CSR≈{}MB (former VecVec≈{}MB, saved≈{}MB), RSS {rss}MB (peak {peak}MB)",
+            "[field-prove] matrix @entry: a_nnz={a_nnz} b_nnz={b_nnz} rows={rows} \
+             distinct={a_dist}+{b_dist} | dict≈{}MB (plainCSR≈{}MB, VecVec≈{}MB), \
+             RSS {rss}MB (peak {peak}MB)",
+            mb(dict),
             mb(csr),
             mb(vecvec),
-            mb(vecvec.saturating_sub(csr)),
         );
     }
 

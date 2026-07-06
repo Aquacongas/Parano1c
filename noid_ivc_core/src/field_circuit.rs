@@ -185,20 +185,24 @@ impl LinExpr {
 /// all-ones, excluding the `z_0 = 0` root).
 pub struct FieldR1csBuilder {
     values: Vec<F128>,
-    /// A/B constraint matrices in CSR-under-construction form. Rows are filled
-    /// strictly in wire order — every allocation appends exactly one row, set
-    /// once — so entries and one offset per wire are appended as they are
-    /// built, never a `Vec<Vec>` of per-row heap allocations. At the m=24
-    /// block-bearing class the `Vec<Vec>` form was a ~7.6 GB transient during
-    /// trace construction (32 B/nonzero + a 24 B `Vec` header per row); CSR
-    /// here is 20 B/nonzero + 8 B/row and moves straight into the
-    /// `SparseFieldMatrix` at `build`, with no flatten pass.
+    /// A/B constraint matrices in dictionary-encoded CSR-under-construction
+    /// form. Rows are filled strictly in wire order — every allocation appends
+    /// exactly one row, set once — so column and value-table indices plus one
+    /// offset per wire are appended as they are built, never a `Vec<Vec>` of
+    /// per-row heap allocations. Coefficients are interned into `value_table`
+    /// on the fly (the matrix is a protocol constant with a few hundred
+    /// distinct values), so the builder holds a `u32` index — not a 16 B
+    /// `F128` — per nonzero. At the m=24 block-bearing class the old `Vec<Vec>`
+    /// was a ~7.6 GB transient during construction; this is ~1.7 GB, and it
+    /// moves straight into `SparseFieldMatrix` at `build` with no flatten.
     a_cols: Vec<u32>,
-    a_vals: Vec<F128>,
+    a_value_indices: Vec<u32>,
     a_offsets: Vec<usize>,
     b_cols: Vec<u32>,
-    b_vals: Vec<F128>,
+    b_value_indices: Vec<u32>,
     b_offsets: Vec<usize>,
+    value_table: Vec<F128>,
+    value_map: std::collections::HashMap<u128, u32>,
     /// `(wire, value)` pairs registered through [`Self::alloc_public_f128`].
     publics: Vec<(u32, F128)>,
 }
@@ -214,11 +218,13 @@ impl FieldR1csBuilder {
         let mut b = Self {
             values: Vec::new(),
             a_cols: Vec::new(),
-            a_vals: Vec::new(),
+            a_value_indices: Vec::new(),
             a_offsets: vec![0],
             b_cols: Vec::new(),
-            b_vals: Vec::new(),
+            b_value_indices: Vec::new(),
             b_offsets: vec![0],
+            value_table: Vec::new(),
+            value_map: std::collections::HashMap::new(),
             publics: Vec::new(),
         };
         // Wire 0: the constant-one wire, z_0 = z_0 · z_0.
@@ -242,21 +248,36 @@ impl FieldR1csBuilder {
         self.values.len() as u32
     }
 
+    /// Intern a coefficient into the value table, returning its index.
+    #[inline]
+    fn intern_value(&mut self, v: F128) -> u32 {
+        let key = ((v.hi as u128) << 64) | v.lo as u128;
+        let table = &mut self.value_table;
+        *self.value_map.entry(key).or_insert_with(|| {
+            let idx = table.len() as u32;
+            table.push(v);
+            idx
+        })
+    }
+
     /// Append one wire: its witness value and its A/B matrix rows (entries in
     /// the order they were built — the per-row order every consumer and the
-    /// statement digest depend on).
+    /// statement digest depend on). Coefficients are interned into the value
+    /// table.
     fn commit_wire(&mut self, value: F128, a_row: &[(u32, F128)], b_row: &[(u32, F128)]) -> Wire {
         let idx = self.values.len();
         assert!(idx < u32::MAX as usize);
         self.values.push(value);
         for &(c, v) in a_row {
             self.a_cols.push(c);
-            self.a_vals.push(v);
+            let vi = self.intern_value(v);
+            self.a_value_indices.push(vi);
         }
         self.a_offsets.push(self.a_cols.len());
         for &(c, v) in b_row {
             self.b_cols.push(c);
-            self.b_vals.push(v);
+            let vi = self.intern_value(v);
+            self.b_value_indices.push(vi);
         }
         self.b_offsets.push(self.b_cols.len());
         Wire(idx as u32)
@@ -352,35 +373,32 @@ impl FieldR1csBuilder {
         // Pad to k rows: the extra rows are empty, so their offset just repeats
         // the current entry count (row r spans [offsets[r], offsets[r+1])).
         let a_cols = self.a_cols;
-        let a_vals = self.a_vals;
+        let a_value_indices = self.a_value_indices;
         let mut a_offsets = self.a_offsets;
         a_offsets.resize(k + 1, a_cols.len());
         let b_cols = self.b_cols;
-        let b_vals = self.b_vals;
+        let b_value_indices = self.b_value_indices;
         let mut b_offsets = self.b_offsets;
         b_offsets.resize(k + 1, b_cols.len());
         let mut values = self.values;
         values.resize(k, F128::ZERO);
+        // A and B interned into ONE table (a few hundred entries); each matrix
+        // takes its own copy — negligible bytes, and keeps them independent.
+        let value_table = self.value_table;
 
         let r1cs = FieldR1cs {
             m: k_log,
             k_log,
             k_skip: crate::zerocheck::K_SKIP,
             useful_rows: n_wires,
-            a_0: SparseFieldMatrix {
-                num_rows: k,
-                num_cols: k,
-                col_indices: a_cols,
-                values: a_vals,
-                row_offsets: a_offsets,
-            },
-            b_0: SparseFieldMatrix {
-                num_rows: k,
-                num_cols: k,
-                col_indices: b_cols,
-                values: b_vals,
-                row_offsets: b_offsets,
-            },
+            a_0: SparseFieldMatrix::from_dict(
+                k,
+                a_cols,
+                a_value_indices,
+                value_table.clone(),
+                a_offsets,
+            ),
+            b_0: SparseFieldMatrix::from_dict(k, b_cols, b_value_indices, value_table, b_offsets),
             const_pin: Some(0),
             digest_cache: std::sync::OnceLock::new(),
             csc_cache: std::sync::OnceLock::new(),

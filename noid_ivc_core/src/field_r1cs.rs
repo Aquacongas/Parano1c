@@ -23,50 +23,95 @@
 use crate::field::F128;
 use crate::lincheck::LincheckCircuit;
 
-/// Sparse matrix over F_{2^128} in **CSR** form. Row `r`'s nonzero entries are
-/// `col_indices[row_offsets[r]..row_offsets[r + 1]]` with the matching
-/// coefficients at the same positions in `values`; absent columns are zero.
-/// Per-row entry order is preserved from construction — both
-/// [`FieldR1cs::statement_digest`] and the lincheck column fold depend on it,
-/// so builders keep columns in a fixed order. Coefficients must be nonzero (a
-/// zero coefficient is representable but wasteful and forbidden by convention:
-/// the digest would distinguish it, so builders must simply not emit zeros).
+/// Interns F128 coefficients into a dedup'd table + `u32` indices, preserving
+/// first-seen order (deterministic for a fixed construction sequence).
+#[derive(Default)]
+pub(crate) struct ValueInterner {
+    table: Vec<F128>,
+    map: std::collections::HashMap<u128, u32>,
+}
+
+impl ValueInterner {
+    #[inline]
+    pub(crate) fn intern(&mut self, v: F128) -> u32 {
+        let key = ((v.hi as u128) << 64) | v.lo as u128;
+        *self.map.entry(key).or_insert_with(|| {
+            let idx = self.table.len() as u32;
+            self.table.push(v);
+            idx
+        })
+    }
+    pub(crate) fn into_table(self) -> Vec<F128> {
+        self.table
+    }
+}
+
+/// Sparse matrix over F_{2^128} in **dictionary-encoded CSR** form. Row `r`'s
+/// nonzero columns are `col_indices[row_offsets[r]..row_offsets[r + 1]]`; each
+/// nonzero's coefficient is `value_table[value_indices[i]]` at the matching
+/// position. Absent columns are zero. Per-row entry order is preserved from
+/// construction — both [`FieldR1cs::statement_digest`] and the lincheck column
+/// fold depend on it. Coefficients must be nonzero (a zero coefficient is
+/// representable but wasteful and forbidden by convention).
 ///
-/// CSR replaces the former `Vec<Vec<(u32, F128)>>`. That layout wasted ~40% of
-/// the constraint matrix: `(u32, F128)` pads to 32 B (F128 is 16-aligned, so
-/// the u32 costs 16 B), and every row — including the many empty padding rows —
-/// carried a 24 B `Vec` header. CSR is 20 B/nnz + 8 B/row with no per-entry
-/// padding and no per-row headers, roughly halving the resident matrix — the
-/// single largest prover buffer at block-bearing (2^23–2^24) sizes.
-#[derive(Clone, Debug, PartialEq)]
+/// The matrix is a **protocol constant**, so its coefficients are a small fixed
+/// set — a few hundred distinct values (MDS entries, round constants,
+/// additive-NTT twiddles) heavily repeated across millions of nonzeros. Storing
+/// a `u32` index (4 B) into a tiny table instead of a 16 B `F128` per nonzero
+/// roughly halves the matrix vs the plain-CSR `Vec<F128>` (12 B saved per
+/// nonzero) — which itself already halved the former `Vec<Vec<(u32, F128)>>`
+/// (32 B/nonzero + a 24 B `Vec` header per row). The matrix is the single
+/// largest resident prover buffer at block-bearing (2^23–2^24) sizes.
+#[derive(Clone, Debug)]
 pub struct SparseFieldMatrix {
     pub num_rows: usize,
     pub num_cols: usize,
     /// Column index of each nonzero, grouped by row per `row_offsets`.
     pub col_indices: Vec<u32>,
-    /// Coefficient of each nonzero, parallel to `col_indices`.
-    pub values: Vec<F128>,
+    /// Coefficient-table index of each nonzero, parallel to `col_indices`.
+    pub value_indices: Vec<u32>,
+    /// Distinct coefficient values; `value_table[value_indices[i]]` is the
+    /// coefficient of nonzero `i`.
+    pub value_table: Vec<F128>,
     /// Row boundaries: length `num_rows + 1`, monotone non-decreasing,
     /// `row_offsets[0] == 0` and `row_offsets[num_rows] == col_indices.len()`.
     pub row_offsets: Vec<usize>,
 }
 
+/// Compared by DECODED content: two matrices are equal iff their columns,
+/// offsets and per-nonzero coefficient VALUES match — independent of the
+/// interning order of `value_table` (the drift-check gates rely on this).
+impl PartialEq for SparseFieldMatrix {
+    fn eq(&self, other: &Self) -> bool {
+        self.num_rows == other.num_rows
+            && self.num_cols == other.num_cols
+            && self.row_offsets == other.row_offsets
+            && self.col_indices == other.col_indices
+            && self.value_indices.len() == other.value_indices.len()
+            && self
+                .value_indices
+                .iter()
+                .zip(&other.value_indices)
+                .all(|(&a, &b)| self.value_table[a as usize] == other.value_table[b as usize])
+    }
+}
+
 impl SparseFieldMatrix {
     /// Build from a row-major `(column, coefficient)` list — the natural
-    /// builder output. Flattens by value so each inner `Vec` frees as it is
-    /// consumed (no transient doubling of the matrix), preserving per-row
-    /// entry order. `num_rows` is inferred from `rows.len()`.
+    /// builder output. Interns coefficients into the value table as it flattens
+    /// (each inner `Vec` frees as consumed), preserving per-row entry order.
     pub fn from_rows(num_cols: usize, rows: Vec<Vec<(u32, F128)>>) -> Self {
         let num_rows = rows.len();
         let nnz: usize = rows.iter().map(|r| r.len()).sum();
         let mut col_indices = Vec::with_capacity(nnz);
-        let mut values = Vec::with_capacity(nnz);
+        let mut value_indices = Vec::with_capacity(nnz);
         let mut row_offsets = Vec::with_capacity(num_rows + 1);
+        let mut interner = ValueInterner::default();
         row_offsets.push(0);
         for row in rows {
             for (c, v) in row {
                 col_indices.push(c);
-                values.push(v);
+                value_indices.push(interner.intern(v));
             }
             row_offsets.push(col_indices.len());
         }
@@ -74,7 +119,26 @@ impl SparseFieldMatrix {
             num_rows,
             num_cols,
             col_indices,
-            values,
+            value_indices,
+            value_table: interner.into_table(),
+            row_offsets,
+        }
+    }
+
+    /// Assemble directly from dictionary-encoded arrays (the builder's output).
+    pub fn from_dict(
+        num_cols: usize,
+        col_indices: Vec<u32>,
+        value_indices: Vec<u32>,
+        value_table: Vec<F128>,
+        row_offsets: Vec<usize>,
+    ) -> Self {
+        Self {
+            num_rows: row_offsets.len() - 1,
+            num_cols,
+            col_indices,
+            value_indices,
+            value_table,
             row_offsets,
         }
     }
@@ -85,7 +149,8 @@ impl SparseFieldMatrix {
             num_rows: k,
             num_cols: k,
             col_indices: (0..k as u32).collect(),
-            values: vec![F128::ONE; k],
+            value_indices: vec![0u32; k],
+            value_table: vec![F128::ONE],
             row_offsets: (0..=k).collect(),
         }
     }
@@ -96,16 +161,22 @@ impl SparseFieldMatrix {
             num_rows: k,
             num_cols: k,
             col_indices: Vec::new(),
-            values: Vec::new(),
+            value_indices: Vec::new(),
+            value_table: Vec::new(),
             row_offsets: vec![0usize; k + 1],
         }
     }
 
     pub fn nnz(&self) -> usize {
-        self.values.len()
+        self.value_indices.len()
     }
 
-    /// Entry-index range `[start, end)` of row `r` in `col_indices`/`values`.
+    /// Number of distinct coefficient values (the dictionary size).
+    pub fn distinct_values(&self) -> usize {
+        self.value_table.len()
+    }
+
+    /// Entry-index range `[start, end)` of row `r`.
     #[inline]
     pub fn row_range(&self, r: usize) -> std::ops::Range<usize> {
         self.row_offsets[r]..self.row_offsets[r + 1]
@@ -117,25 +188,27 @@ impl SparseFieldMatrix {
         &self.col_indices[self.row_range(r)]
     }
 
-    /// Coefficients of row `r` (parallel to [`Self::row_cols`]).
-    #[inline]
-    pub fn row_vals(&self, r: usize) -> &[F128] {
-        &self.values[self.row_range(r)]
-    }
-
     /// Number of nonzero entries in row `r`.
     #[inline]
     pub fn row_len(&self, r: usize) -> usize {
         self.row_offsets[r + 1] - self.row_offsets[r]
     }
 
-    /// `(column, coefficient)` pairs of row `r`, in stored order.
+    /// `(column, coefficient)` pairs of row `r`, in stored order (coefficients
+    /// decoded through the value table). This is the primary accessor — the
+    /// dictionary encoding is transparent to callers.
     #[inline]
     pub fn row(&self, r: usize) -> impl Iterator<Item = (u32, F128)> + '_ {
-        self.row_cols(r)
+        let range = self.row_range(r);
+        let table = &self.value_table;
+        self.col_indices[range.clone()]
             .iter()
             .copied()
-            .zip(self.row_vals(r).iter().copied())
+            .zip(
+                self.value_indices[range]
+                    .iter()
+                    .map(move |&vi| table[vi as usize]),
+            )
     }
 }
 
@@ -369,10 +442,8 @@ pub fn apply_block_diag_field(m_0: &SparseFieldMatrix, z: &[F128], k_log: usize)
         .for_each(|(out_block, z_block)| {
             for r in 0..m_0.num_rows {
                 let mut acc = F128::ZERO;
-                let cols = m_0.row_cols(r);
-                let vals = m_0.row_vals(r);
-                for i in 0..cols.len() {
-                    acc += vals[i] * z_block[cols[i] as usize];
+                for (c, coeff) in m_0.row(r) {
+                    acc += coeff * z_block[c as usize];
                 }
                 out_block[r] = acc;
             }
@@ -504,7 +575,7 @@ impl<'a> FlipBattery<'a> {
             && self.cols_a[i].len() == 1
             && self.cols_a[i][0] == (i as u32, F128::ONE)
             && self.r1cs.b_0.row_cols(i) == [0u32]
-            && self.r1cs.b_0.row_vals(i) == [F128::ONE]
+            && self.r1cs.b_0.row(i).next().map(|(_, v)| v) == Some(F128::ONE)
     }
 
     /// [`Self::survivors`] minus the pin-helper class — the standard gate
@@ -570,13 +641,11 @@ fn field_csc_from_rows(m: &SparseFieldMatrix) -> (Vec<u32>, Vec<u32>, Vec<F128>)
     let mut rows_flat = vec![0u32; nnz];
     let mut coeffs_flat = vec![F128::ZERO; nnz];
     for r in 0..m.num_rows {
-        let cols = m.row_cols(r);
-        let vals = m.row_vals(r);
-        for i in 0..cols.len() {
-            let c = cols[i] as usize;
+        for (c, coeff) in m.row(r) {
+            let c = c as usize;
             let slot = next[c] as usize;
             rows_flat[slot] = r as u32;
-            coeffs_flat[slot] = vals[i];
+            coeffs_flat[slot] = coeff;
             next[c] += 1;
         }
     }
@@ -1002,14 +1071,15 @@ mod tests {
         let (r1cs_b, _) = random_satisfiable(8, 4, 11);
         assert_ne!(r1cs_a.statement_digest(), r1cs_b.statement_digest());
 
-        // Coefficient change flips the digest (mutate the first stored entry;
-        // `clone` resets the digest cache, so it is re-hashed).
+        // Coefficient change flips the digest (perturb a table entry — every
+        // nonzero mapping to it decodes to the new value; `clone` resets the
+        // digest cache, so it is re-hashed).
         let mut r1cs_c = r1cs_a.clone();
         *r1cs_c
             .a_0
-            .values
+            .value_table
             .first_mut()
-            .expect("matrix has at least one entry") += F128::ONE;
+            .expect("matrix has at least one distinct value") += F128::ONE;
         assert_ne!(r1cs_a.statement_digest(), r1cs_c.statement_digest());
 
         // Same content → same digest (cache-independent).
@@ -1028,8 +1098,13 @@ mod tests {
         for &row in &[1usize, DIGEST_SPAN_ROWS - 1, DIGEST_SPAN_ROWS, r1cs.k() - 1] {
             let mut mutated = r1cs.clone();
             assert!(mutated.b_0.row_len(row) > 0, "synthetic rows are nonempty");
+            // Perturb exactly this one nonzero: point it at a fresh table entry
+            // holding (old value + 1), leaving all other nonzeros untouched.
             let entry = mutated.b_0.row_offsets[row];
-            mutated.b_0.values[entry] += F128::ONE;
+            let old = mutated.b_0.value_table[mutated.b_0.value_indices[entry] as usize];
+            let new_idx = mutated.b_0.value_table.len() as u32;
+            mutated.b_0.value_table.push(old + F128::ONE);
+            mutated.b_0.value_indices[entry] = new_idx;
             assert_ne!(
                 base,
                 mutated.statement_digest(),
