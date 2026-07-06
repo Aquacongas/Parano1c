@@ -1331,6 +1331,27 @@ fn high_pair_leaf_hash(
     hasher.compress(&acc, &pair)
 }
 
+/// The high-pair leaf hash, exposed so the in-circuit trace twin
+/// (`noid_ivc_core::deep_chain::leaf_hash::flat_high_pair_leaf_hash`) can be
+/// validated against it under φ. Any change to `high_pair_leaf_hash` must
+/// change the twin in the same commit.
+pub fn high_pair_leaf_hash_for_trace(
+    layer_log: usize,
+    leaf_index: usize,
+    s0: Block128,
+    s1: Block128,
+    hasher: &dyn CryptographicHasher,
+) -> SourceHash {
+    high_pair_leaf_hash(
+        CommitmentHashBackend::Arithmetic,
+        layer_log,
+        leaf_index,
+        s0,
+        s1,
+        hasher,
+    )
+}
+
 fn build_high_pair_tree(
     code: &Code,
     layer_log: usize,
