@@ -290,30 +290,53 @@ pub fn gen_compact_queries_trace(
     log_max_len: usize,
     num_queries: usize,
 ) -> Vec<usize> {
+    gen_compact_queries_trace_with_bits(b, ch, log_max_len, num_queries).0
+}
+
+/// [`gen_compact_queries_trace`] that also returns, per query, the low
+/// `log_max_len` position bits as witness wires (LSB first). Downstream FRI /
+/// high-fold gadgets that need a query-position bit (a fold twiddle's coset, a
+/// pair's parity selector) must consume these WIRES rather than re-deriving the
+/// bit from the native index and baking it as a matrix constant — the latter
+/// drifts the shape between blocks with different query positions, breaking
+/// class fixity (the recursion invariant). The bits are transcript-bound: the
+/// full 128-bit decomposition is pinned equal to the squeezed challenge and
+/// each bit is booleanity-constrained.
+pub fn gen_compact_queries_trace_with_bits(
+    b: &mut FieldR1csBuilder,
+    ch: &mut FriChannelTrace,
+    log_max_len: usize,
+    num_queries: usize,
+) -> (Vec<usize>, Vec<Vec<LinExpr>>) {
     assert!(log_max_len < usize::BITS as usize);
     let domain_size = 1usize << log_max_len;
     let n_queries = num_queries.min(domain_size);
     let bit_mask = (domain_size - 1) as u128;
     let random_elems = ch.squeeze_n(b, n_queries);
-    random_elems
-        .iter()
-        .map(|e| {
-            let tower = expr_tower_value(b, e).0;
-            let idx = (tower & bit_mask) as usize;
-            let mut sum = LinExpr::zero();
-            for i in 0..log_max_len {
-                if (idx >> i) & 1 == 1 {
-                    sum = sum.add_const(flat_const(1u128 << i));
-                }
+    let mut indices = Vec::with_capacity(n_queries);
+    let mut all_bits = Vec::with_capacity(n_queries);
+    for e in &random_elems {
+        let tower = expr_tower_value(b, e).0;
+        let idx = (tower & bit_mask) as usize;
+        // Decompose ALL 128 bits into witness booleans (not just the high bits
+        // past the position mask): baking the low position bits as `add_const`
+        // constants put the query position into the pinning row's constant term
+        // and drifted the matrix across blocks. `pin_zero(sum + e)` binds the
+        // decomposition to the squeezed challenge, booleanity pins each bit.
+        let mut sum = LinExpr::zero();
+        let mut bits = Vec::with_capacity(log_max_len);
+        for i in 0..128 {
+            let bit = LinExpr::from_wire(b.alloc_bool((tower >> i) & 1 == 1));
+            sum = sum.add(&bit.scale(flat_const(1u128 << i)));
+            if i < log_max_len {
+                bits.push(bit);
             }
-            for i in log_max_len..128 {
-                let bit = b.alloc_bool((tower >> i) & 1 == 1);
-                sum = sum.add(&LinExpr::from_wire(bit).scale(flat_const(1u128 << i)));
-            }
-            pin_zero(b, &sum.add(e));
-            idx
-        })
-        .collect()
+        }
+        pin_zero(b, &sum.add(e));
+        indices.push(idx);
+        all_bits.push(bits);
+    }
+    (indices, all_bits)
 }
 
 // ---------------------------------------------------------------------------
@@ -516,6 +539,35 @@ pub fn fold_trace(
     let twiddle = ntt.get_subspace_eval(round, idx);
     let x1 = v0.add(v1);
     let x0 = v0.add(&x1.scale(flat_const(twiddle.0)));
+    x0.add(&mul(b, r, &x0.add(&x1)))
+}
+
+/// [`fold_trace`] with the fold coset carried as WITNESS bits instead of a
+/// native index. `get_subspace_eval(round, idx) = Σ_{j<round} idx_bit_j ·
+/// basis[j]` is F2-linear in `idx` with no offset, so the twiddle is an affine
+/// expression `Σ_j idx_bits[j]·basis[j]` over the (transcript-bound) query
+/// bits — the fold stays class-fixed. `fold_trace`'s native-index form bakes
+/// the twiddle as a matrix constant and drifts the shape between blocks with
+/// different query positions; the region (recursion) path must use this form.
+/// `idx_bits` must expose at least `round` bits (LSB first).
+pub fn fold_trace_bits(
+    b: &mut FieldR1csBuilder,
+    r: &LinExpr,
+    round: usize,
+    idx_bits: &[LinExpr],
+    v0: &LinExpr,
+    v1: &LinExpr,
+    ntt: &AdditiveNTT<Block128>,
+) -> LinExpr {
+    let mut twiddle = LinExpr::zero();
+    for j in 0..round {
+        let basis_j = ntt.get_subspace_eval(round, 1usize << j);
+        twiddle = twiddle.add(&idx_bits[j].scale(flat_const(basis_j.0)));
+    }
+    let x1 = v0.add(v1);
+    // `x1 · twiddle` is a wire product now (twiddle is a wire), not a constant
+    // scaling — one extra multiplication versus `fold_trace`.
+    let x0 = v0.add(&mul(b, &x1, &twiddle));
     x0.add(&mul(b, r, &x0.add(&x1)))
 }
 

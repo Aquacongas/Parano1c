@@ -73,8 +73,8 @@ use noid_fri_binius::interleaved_commit::{
     CommitmentHashBackend,
 };
 use noid_fri_binius::mixed_open::{
-    high_pair_leaf_hash_for_trace, high_pair_leaf_index, high_pair_parity, high_pair_tree_depth,
-    MIXED_OPEN_TAG, MIXED_SOURCE_BINDING_TAG,
+    high_pair_leaf_hash_for_trace, high_pair_leaf_index, high_pair_tree_depth, MIXED_OPEN_TAG,
+    MIXED_SOURCE_BINDING_TAG,
 };
 use noid_fri_binius::{COMPACT_NUM_QUERIES, COMPACT_TAU, MERKLE_CAP_DEPTH};
 use noid_gkr::auth_pcs::AuthMleOpeningProof;
@@ -117,8 +117,8 @@ use super::deep_chain::{
     ShiftDischargeProofTrace,
 };
 use super::fri_pcs::{
-    alloc_digest, code_new_trace, fold_trace, gen_compact_queries_trace, mle_evaluate_small_trace,
-    FriChannelTrace,
+    alloc_digest, code_new_trace, fold_trace_bits, gen_compact_queries_trace_with_bits,
+    mle_evaluate_small_trace, FriChannelTrace,
 };
 use super::owner_auth::PendingAuthPcsObligation;
 use super::{alloc_blocks, eq_ind_partial_eval_trace, flat_of, mul, pin_eq};
@@ -321,9 +321,11 @@ pub fn discharge_auth_pcs_obligation_via_region(
         ch.observe_vector_commitment(b, root_w, high_pair_tree_depth(log_n - 1 - i));
     }
     // SB3 source query draw; 3h FRI query draw.
-    let query_indices = gen_compact_queries_trace(b, &mut ch, log_n + LOG_RATE, COMPACT_NUM_QUERIES);
+    let (query_indices, query_bits) =
+        gen_compact_queries_trace_with_bits(b, &mut ch, log_n + LOG_RATE, COMPACT_NUM_QUERIES);
     assert!(query_indices.len() >= nq, "need at least nq source queries");
-    let fri_queries = gen_compact_queries_trace(b, &mut ch, n_rounds + LOG_RATE, COMPACT_NUM_QUERIES);
+    let (fri_queries, fri_query_bits) =
+        gen_compact_queries_trace_with_bits(b, &mut ch, n_rounds + LOG_RATE, COMPACT_NUM_QUERIES);
     assert!(fri_queries.len() >= nq, "need at least nq FRI queries");
     // Cross-check the in-trace draws against the REAL noid_fri::Channel.
     let (native_source_queries, native_fri_queries) =
@@ -372,9 +374,15 @@ pub fn discharge_auth_pcs_obligation_via_region(
         s_out[j][0..st_slots].copy_from_slice(&st_cols.s_out[j]);
     }
 
-    // Source query -> source pair indices; source symbols.
+    // Source query -> source pair indices; source symbols. The bit-wire twin
+    // of `high_pair_leaf_index` tracks the transcript-bound position bits in
+    // lockstep, so the fold chain's coset/parity selectors are witness wires
+    // (not native constants that would drift the shape).
     let source_pair_indices: Vec<usize> =
         query_indices.iter().map(|&qi| high_pair_leaf_index(qi, log_n)).collect();
+    let source_pair_bits: Vec<Vec<LinExpr>> = (0..nq)
+        .map(|q| high_pair_leaf_index_bits(&query_bits[q], log_n))
+        .collect();
 
     // SB6 source-leaf family (family 0): nq tiles.
     let sb6_base = leaf_base(0);
@@ -554,16 +562,24 @@ pub fn discharge_auth_pcs_obligation_via_region(
             native_point: pt_nat,
             native_value: sb6_syms[q][1],
         });
-        let folded =
-            tensor_high_fold_pair_trace(b, &beta[tau - 1], log_n, source_pair_indices[q], &s0w, &s1w);
+        let folded = tensor_high_fold_pair_trace(
+            b,
+            &beta[tau - 1],
+            log_n,
+            &source_pair_bits[q][log_n - 1..],
+            &s0w,
+            &s1w,
+        );
         folded_w.push(folded);
     }
 
     let mut cur_idx = current.clone();
+    let mut cur_bits = source_pair_bits.clone();
     for (layer, ld) in layers.iter().enumerate() {
         let base = leaf_base(layer + 1);
         let r = &beta[tau - 2 - layer];
         let mut next_w: Vec<LinExpr> = Vec::with_capacity(nq);
+        let mut next_bits: Vec<Vec<LinExpr>> = Vec::with_capacity(nq);
         for q in 0..nq {
             let (s0v, s1v) = ld.syms[q];
             let s0f = phi(s0v);
@@ -586,21 +602,42 @@ pub fn discharge_auth_pcs_obligation_via_region(
                 native_point: pt_nat,
                 native_value: s1f,
             });
-            let parity = high_pair_parity(cur_idx[q], ld.layer_log);
-            let expected = if parity == 1 { &s1w } else { &s0w };
-            pin_eq(b, &folded_w[q], expected);
-            let folded = tensor_high_fold_pair_trace(b, r, ld.layer_log, ld.pair_indices[q], &s0w, &s1w);
+            // Continuity: the prior fold equals THIS pair's symbol at the query
+            // parity (bit `layer_log−1` of the propagated index). Select via the
+            // witness parity bit `s0 + p·(s0+s1)` — a native `if parity` pick of
+            // s0/s1 reads a different wire per block and drifts the shape.
+            let parity_bit = &cur_bits[q][ld.layer_log - 1];
+            let sel = s0w.add(&mul(b, parity_bit, &s0w.add(&s1w)));
+            pin_eq(b, &folded_w[q], &sel);
+            let pair_bits = high_pair_leaf_index_bits(&cur_bits[q], ld.layer_log);
+            let folded = tensor_high_fold_pair_trace(
+                b,
+                r,
+                ld.layer_log,
+                &pair_bits[ld.layer_log - 1..],
+                &s0w,
+                &s1w,
+            );
             next_w.push(folded);
+            next_bits.push(pair_bits);
         }
         folded_w = next_w;
         cur_idx = ld.pair_indices.clone();
+        cur_bits = next_bits;
     }
 
-    // SB9: the closed fold == h_code[current[q]].
+    // SB9: the closed fold == h_code[cur_idx[q]]. Select the h_code entry with
+    // the propagated index BITS (`cur_bits[q]`, transcript-bound) via a mux, not
+    // a native `h_code_w[idx]` read whose column would drift with the query
+    // position. `cur_idx[q] < h_code_w.len()` so its low `n_idx_bits` bits (the
+    // rest are zero) address the code.
+    assert!(h_code_w.len().is_power_of_two(), "h_code length power of two");
+    let n_idx_bits = h_code_w.len().trailing_zeros() as usize;
     for q in 0..nq {
-        let idx = cur_idx[q];
-        assert!(idx < h_code_w.len(), "SB9 index in range");
-        pin_eq(b, &folded_w[q], &h_code_w[idx]);
+        assert!(cur_idx[q] < h_code_w.len(), "SB9 index in range");
+        assert!(cur_bits[q].len() >= n_idx_bits, "SB9 index bit width");
+        let selected = select_by_bits(b, &cur_bits[q][..n_idx_bits], &h_code_w);
+        pin_eq(b, &folded_w[q], &selected);
     }
     let _ = &h_code;
     let _ = current.as_slice();
@@ -814,6 +851,22 @@ pub fn discharge_auth_pcs_obligation_via_region(
         .expect("SB6 source octopus expand");
         all_expands_ok &= !paths.is_empty();
         let cap_start = 1usize << MERKLE_CAP_DEPTH;
+        // Source-cap lanes selected by `cap_idx = li >> sb6_walk_depth` — a
+        // block-dependent query position. A native `commitment_cap_lanes[cap_start
+        // + cap_idx]` makes the SB6 root wire (and the claim opened to it)
+        // reference a position-dependent WIRE, which drifts the LINK matrix (the
+        // claim's value LinExpr is pinned to the IO tail only in the link, so it
+        // escapes the block-slot matrix check). Select via a witness-bit mux over
+        // the `2^cap_depth` source-cap lanes instead; `cap_idx`'s bits are the
+        // high bits of the transcript-bound `source_pair_bits[q]`.
+        let cap_depth = source_cap_depth(log_n);
+        let n_cap = 1usize << cap_depth;
+        let cap_lane0: Vec<LinExpr> = (0..n_cap)
+            .map(|i| obligation.commitment_cap_lanes[cap_start + i][0].clone())
+            .collect();
+        let cap_lane1: Vec<LinExpr> = (0..n_cap)
+            .map(|i| obligation.commitment_cap_lanes[cap_start + i][1].clone())
+            .collect();
         let mut witnesses = Vec::with_capacity(nq);
         let mut entry_vals = Vec::with_capacity(nq);
         let mut committed_roots = Vec::with_capacity(nq);
@@ -832,8 +885,17 @@ pub fn discharge_auth_pcs_obligation_via_region(
             entry_vals.push(leaf_flat);
             let cap_idx = li >> sb6_walk_depth;
             committed_roots.push(cap_flat[cap_idx]);
-            // TRANSCRIPT-BINDING: root == the FS-observed source-cap lane wire.
-            root_wires.push(obligation.commitment_cap_lanes[cap_start + cap_idx].clone());
+            // TRANSCRIPT-BINDING: root == the FS-observed source-cap lane, muxed
+            // by the query-position bits (value-identical to the native index).
+            assert!(
+                source_pair_bits[q].len() >= sb6_walk_depth + cap_depth,
+                "SB6 cap index bit width"
+            );
+            let cap_bits = &source_pair_bits[q][sb6_walk_depth..sb6_walk_depth + cap_depth];
+            root_wires.push([
+                select_by_bits(b, cap_bits, &cap_lane0),
+                select_by_bits(b, cap_bits, &cap_lane1),
+            ]);
         }
         let family = MerklePathFamily { depth, n_paths: nq };
         let mcols = build_merkle_path_columns(&family, iv_b, &witnesses, fam_wlog);
@@ -958,6 +1020,8 @@ pub fn discharge_auth_pcs_obligation_via_region(
     // FRI fold-join: the queried symbols == the pair-leaf IN columns, folded to
     // the final codeword (round 0: no previous-round fold consistency).
     let final_len = fri.final_codeword.len();
+    assert!(final_len.is_power_of_two(), "final codeword length power of two");
+    let final_bits = final_len.trailing_zeros() as usize;
     for q in 0..nq {
         let (s0v, s1v) = fri.fri_queried_symbols[round][q];
         let s0w = LinExpr::from_wire(b.alloc_f128(phi(s0v)));
@@ -977,10 +1041,29 @@ pub fn discharge_auth_pcs_obligation_via_region(
             native_point: pt_nat,
             native_value: phi(s1v),
         });
-        let folded =
-            fold_trace(b, &random_point[round], round, fri_pair_indices[q], &s0w, &s1w, &ntt);
-        let final_idx = (fri_queries[q] >> n_rounds) % final_len;
-        pin_eq(b, &folded, &final_cw[final_idx]);
+        let folded = fold_trace_bits(
+            b,
+            &random_point[round],
+            round,
+            &fri_query_bits[q][round + 1..],
+            &s0w,
+            &s1w,
+            &ntt,
+        );
+        // final_idx = (fri_queries[q] >> n_rounds) % final_len — the low
+        // `final_bits` bits of (fri_queries[q] >> n_rounds), i.e. position bits
+        // [n_rounds .. n_rounds+final_bits]. Select via those witness bits (was
+        // a native `final_cw[final_idx]` read whose column drifts).
+        assert!(
+            fri_query_bits[q].len() >= n_rounds + final_bits,
+            "fold-join index bit width"
+        );
+        let sel = select_by_bits(
+            b,
+            &fri_query_bits[q][n_rounds..n_rounds + final_bits],
+            &final_cw,
+        );
+        pin_eq(b, &folded, &sel);
     }
 
     // Merge walk B into the global slice/claim tables.
@@ -1086,18 +1169,80 @@ fn flat_mds_entry(e: usize, j: usize) -> F128 {
 
 /// `basis + ONE + r` factor of `tensor_high_fold_pair`, char-2 (local twin of
 /// the private `auth_pcs::tensor_high_fold_pair_trace`).
+/// High-fold pair fold `s1 + s0·(r + twiddle)`, where the additive-NTT
+/// twiddle is `flat_of(2^(coset + layer_log − 1)) XOR 1`. The fold coset is
+/// `leaf_index >> (layer_log − 1)` — the RS-code coset, which never folds, so
+/// it is exactly `LOG_RATE` bits. Baking the twiddle as a native constant made
+/// the mul gate's constant term depend on the query position and drifted the
+/// matrix between blocks; here the coset is a witness-bit mux over the
+/// `2^LOG_RATE` protocol-constant twiddles, so the constraint is class-fixed
+/// and the block-dependence lives only in the boolean `coset_bits` values.
+/// `coset_bits` are the position bits at index `layer_log−1 ..` (LSB first),
+/// threaded from the transcript-bound query decomposition.
 fn tensor_high_fold_pair_trace(
     b: &mut FieldR1csBuilder,
     r: &LinExpr,
     layer_log: usize,
-    leaf_index: usize,
+    coset_bits: &[LinExpr],
     s0: &LinExpr,
     s1: &LinExpr,
 ) -> LinExpr {
-    let coset = leaf_index >> (layer_log - 1);
-    let basis_idx = coset + layer_log - 1;
-    let factor = r.add_const(flat_of(Block128::from((1u128 << basis_idx) ^ 1)));
+    // eq tensor of the coset bits (2^LOG_RATE entries: entry c = eq(bits, c)).
+    let mut tensor = vec![LinExpr::constant(F128::ONE)];
+    for bit in coset_bits {
+        let his: Vec<LinExpr> = tensor.iter().map(|t| mul(b, t, bit)).collect();
+        let mut next = Vec::with_capacity(tensor.len() * 2);
+        for (t, h) in tensor.iter().zip(his.iter()) {
+            next.push(t.add(h));
+        }
+        next.extend(his);
+        tensor = next;
+    }
+    // twiddle = Σ_c eq(coset_bits, c) · [flat_of(2^(c + layer_log − 1)) XOR 1].
+    let mut twiddle = LinExpr::zero();
+    for (c, t) in tensor.iter().enumerate() {
+        let basis_idx = c + layer_log - 1;
+        let tw = flat_of(Block128::from((1u128 << basis_idx) ^ 1));
+        twiddle = twiddle.add(&t.scale(tw));
+    }
+    let factor = r.add(&twiddle);
     s1.add(&mul(b, s0, &factor))
+}
+
+/// Mirror `high_pair_leaf_index` on a query's position bit wires: drop the
+/// parity bit (index `layer_log − 1` of the low `layer_log` bits) and keep the
+/// rest in order. Pure wire reindexing (no constraints) — it stays aligned
+/// with the native `high_pair_leaf_index` applied to the same index, so the
+/// bit at any position of the result is the transcript-bound query bit.
+fn high_pair_leaf_index_bits(bits: &[LinExpr], layer_log: usize) -> Vec<LinExpr> {
+    let mut out = bits[..layer_log - 1].to_vec();
+    out.extend_from_slice(&bits[layer_log..]);
+    out
+}
+
+/// `arr[idx]` selected by the witness bits of `idx` (LSB first):
+/// `Σ_c eq(bits, c)·arr[c]`. Reads every `arr` wire with a class-fixed
+/// coefficient structure — the block-dependence lives only in the boolean bit
+/// values — so it replaces a native `arr[native_idx]` read whose selected wire
+/// (and thus the constraint's column) drifts with the query position.
+/// `arr.len()` must equal `2^bits.len()`.
+fn select_by_bits(b: &mut FieldR1csBuilder, bits: &[LinExpr], arr: &[LinExpr]) -> LinExpr {
+    debug_assert_eq!(arr.len(), 1usize << bits.len(), "select_by_bits arity");
+    let mut tensor = vec![LinExpr::constant(F128::ONE)];
+    for bit in bits {
+        let his: Vec<LinExpr> = tensor.iter().map(|t| mul(b, t, bit)).collect();
+        let mut next = Vec::with_capacity(tensor.len() * 2);
+        for (t, h) in tensor.iter().zip(his.iter()) {
+            next.push(t.add(h));
+        }
+        next.extend(his);
+        tensor = next;
+    }
+    let mut acc = LinExpr::zero();
+    for (t, a) in tensor.iter().zip(arr.iter()) {
+        acc = acc.add(&mul(b, t, a));
+    }
+    acc
 }
 
 /// Trace α-power MDS weights `m[j] = Σ_e α^{e+1}·flat(MDS[e][j])`.

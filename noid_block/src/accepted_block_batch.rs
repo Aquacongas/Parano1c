@@ -2500,6 +2500,48 @@ mod tests {
                 block: Some(mk(&units[1], region_cfg)),
             },
         );
+        // Localize any link-level drift (block-slot matrix is class-fixed by
+        // `region_block_slots_class_fixed_across_two_blocks`, so a link drift is
+        // in the [R] replay or the region claim threading, not the discharge).
+        if built1.r1cs.a_0 != class_r1cs.a_0 {
+            let (m0, m1) = (&class_r1cs.a_0, &built1.r1cs.a_0);
+            let mut n_diff = 0usize;
+            let mut shown = 0usize;
+            for r in 0..m0.num_rows {
+                let r0: Vec<(u32, F128)> = m0.row(r).collect();
+                let r1: Vec<(u32, F128)> = m1.row(r).collect();
+                if r0 != r1 {
+                    n_diff += 1;
+                    if shown < 4 {
+                        shown += 1;
+                        use std::collections::BTreeMap;
+                        let a: BTreeMap<u32, F128> = r0.iter().copied().collect();
+                        let bb: BTreeMap<u32, F128> = r1.iter().copied().collect();
+                        let mut cols: Vec<u32> = a.keys().chain(bb.keys()).copied().collect();
+                        cols.sort_unstable();
+                        cols.dedup();
+                        eprintln!(
+                            "[link-diff] A-row {r} ({} vs {} entries), k_log={}, useful_rows={}",
+                            r0.len(),
+                            r1.len(),
+                            built1.r1cs.k_log,
+                            built1.r1cs.useful_rows
+                        );
+                        for c in cols {
+                            let (v0, v1) = (a.get(&c).copied(), bb.get(&c).copied());
+                            if v0 != v1 {
+                                eprintln!(
+                                    "[link-diff]   col {c}: class={:?} pi1={:?}",
+                                    v0.map(|v| (v.lo, v.hi)),
+                                    v1.map(|v| (v.lo, v.hi)),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            eprintln!("[link-diff] TOTAL A-rows differing: {n_diff}");
+        }
         assert!(
             built1.r1cs.a_0 == class_r1cs.a_0,
             "π₁ class A matrix drifted"
@@ -2640,6 +2682,120 @@ mod tests {
             "XOR-passing wrong parent height (3 -> child 2) must be rejected by the incrementer"
         );
         eprintln!("[block-slots] integer height successor rejects the XOR-decrement attack");
+    }
+
+    /// Class-fixity gate for the REGION wallet-PCS discharge
+    /// (`discharge_wallet_pcs` via `wallet_pcs_region`). Two DIFFERENT real
+    /// blocks of the same tier must assemble to a byte-identical FieldR1cs
+    /// matrix — the recursion invariant a block-bearing link rests on. The
+    /// region discharge derives its structure from the wallet proof's query
+    /// positions; every position-derived value (a fold coset/parity, an
+    /// index-selected codeword entry, an NTT fold twiddle) must be a witness
+    /// bit, not a native constant baked into the matrix, or the shape drifts.
+    /// This fast gate (two block-slot builds, NO proving) guards that without
+    /// the heavy full-link prove in `region_complete_block_bearing_link_e2e`.
+    /// On drift it prints the first divergent row/column to localize the leak.
+    #[test]
+    #[ignore = "heavy (two region-ON block-slot builds); run explicitly"]
+    fn region_block_slots_class_fixed_across_two_blocks() {
+        use noid_ivc_core::field::F128;
+        use noid_ivc_core::field_circuit::{FieldR1csBuilder, LinExpr};
+        use noid_recursive::acceptance::block_slots::{
+            build_block_slots_with_config, BlockSlotsConfig,
+        };
+        use noid_recursive::acceptance::trace::region_source_binding::RegionDischargeParams;
+
+        let units = chained_std_tx_blocks(2);
+        let region_cfg = BlockSlotsConfig {
+            discharge_wallet_pcs: true,
+            wallet_pcs_region: Some(RegionDischargeParams {
+                nq: 2,
+                sb8_auth_layers: 1,
+            }),
+        };
+        // Each claim's point/value must be class-fixed too — they are NOT part
+        // of the block-slot matrix (they are pinned to the IO tail only in the
+        // link), so a claim whose point/value LinExpr references a
+        // block-dependent WIRE passes the matrix check yet drifts the LINK.
+        #[allow(clippy::type_complexity)]
+        let build = |u: &BlockUnit, label: &str| -> (_, Vec<(usize, usize, Vec<LinExpr>, LinExpr)>) {
+            let mut b = FieldR1csBuilder::new();
+            let slots = build_block_slots_with_config(
+                &mut b,
+                &u.start_accumulator,
+                &u.end_accumulator,
+                &u.inputs,
+                &u.proof,
+                region_cfg,
+            );
+            let claims: Vec<(usize, usize, Vec<LinExpr>, LinExpr)> = slots
+                .pending_wallet_pcs
+                .iter()
+                .map(|c| (c.slice.start(), c.slice.len(), c.point.clone(), c.value.clone()))
+                .collect();
+            let (r, z) = b.build();
+            assert!(r.satisfies(&z), "{label} satisfies");
+            (r, claims)
+        };
+
+        let (r0, claims0) = build(&units[0], "block 0 (height 1) region-ON");
+        let (r1, claims1) = build(&units[1], "block 1 (height 2) region-ON");
+
+        // Claim STRUCTURE + point/value wire references must be class-fixed.
+        assert_eq!(claims0.len(), claims1.len(), "region claim count drifted");
+        for (ci, (c0, c1)) in claims0.iter().zip(claims1.iter()).enumerate() {
+            if c0 != c1 {
+                eprintln!("[region-claim-diff] claim {ci} drifts:");
+                eprintln!("[region-claim-diff]   slice: {:?} vs {:?}", (c0.0, c0.1), (c1.0, c1.1));
+                for (k, (p0, p1)) in c0.2.iter().zip(c1.2.iter()).enumerate() {
+                    if p0 != p1 {
+                        eprintln!("[region-claim-diff]   point[{k}]: {:?} vs {:?}", p0.terms, p1.terms);
+                    }
+                }
+                if c0.3 != c1.3 {
+                    eprintln!("[region-claim-diff]   value: {:?} vs {:?}", c0.3.terms, c1.3.terms);
+                }
+                panic!("region wallet-PCS claim {ci} point/value drifted between blocks");
+            }
+        }
+        assert_eq!(r0.k_log, r1.k_log, "k_log drifted");
+        assert_eq!(r0.a_0.num_rows, r1.a_0.num_rows, "row count drifted");
+
+        // On drift, localize the first divergent row/column before failing.
+        let localize = |m0: &noid_ivc_core::field_r1cs::SparseFieldMatrix,
+                        m1: &noid_ivc_core::field_r1cs::SparseFieldMatrix,
+                        which: &str| {
+            for r in 0..m0.num_rows {
+                let row0: Vec<(u32, F128)> = m0.row(r).collect();
+                let row1: Vec<(u32, F128)> = m1.row(r).collect();
+                if row0 != row1 {
+                    use std::collections::BTreeMap;
+                    let a: BTreeMap<u32, F128> = row0.iter().copied().collect();
+                    let bb: BTreeMap<u32, F128> = row1.iter().copied().collect();
+                    let mut cols: Vec<u32> = a.keys().chain(bb.keys()).copied().collect();
+                    cols.sort_unstable();
+                    cols.dedup();
+                    for c in cols {
+                        let (v0, v1) = (a.get(&c).copied(), bb.get(&c).copied());
+                        if v0 != v1 {
+                            panic!(
+                                "{which} matrix drifted at row {r} col {c}: \
+                                 block0={:?} block1={:?} (a position-derived value leaked \
+                                 into the class matrix — see region_source_binding)",
+                                v0.map(|v| (v.lo, v.hi)),
+                                v1.map(|v| (v.lo, v.hi)),
+                            );
+                        }
+                    }
+                }
+            }
+        };
+        if r0.a_0 != r1.a_0 {
+            localize(&r0.a_0, &r1.a_0, "A");
+        }
+        if r0.b_0 != r1.b_0 {
+            localize(&r0.b_0, &r1.b_0, "B");
+        }
     }
 
     /// The [B] block-slot assembly gate: the single-block component
