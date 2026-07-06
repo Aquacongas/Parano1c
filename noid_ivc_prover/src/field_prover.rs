@@ -5,7 +5,7 @@
 
 use noid_ivc_core::challenger::Challenger;
 use noid_ivc_core::field::F128;
-use noid_ivc_core::field_r1cs::FieldR1cs;
+use noid_ivc_core::field_r1cs::{FieldR1cs, FieldRowCircuit};
 use noid_ivc_core::lincheck::{self, QuirkyPoint};
 use noid_ivc_core::pcs::{self, Commitment, PcsParams, QuirkyDirectClaim};
 use noid_ivc_core::proof::{FieldR1csProof, R1csClaim, ZClaim, bind_statement_field};
@@ -122,7 +122,13 @@ fn prove_field_inner<Ch: Challenger>(
         r1cs.k_log,
         r1cs.k_skip,
         r1cs.useful_rows,
-        r1cs.csc_lincheck_circuit(),
+        // Fold lincheck off the row-major `a_0`/`b_0` the caller already owns,
+        // rather than materializing (and caching) a transposed CSC copy. This
+        // keeps only ONE constraint-matrix representation resident through the
+        // lincheck+open peak (~halving matrix RAM). The fold is value-identical
+        // to `csc_lincheck_circuit()` (same `comb_vec`), so the proof is
+        // byte-identical. The CSC path stays for the verifier / trace twin.
+        &FieldRowCircuit::new(&r1cs.a_0, &r1cs.b_0, r1cs.const_pin),
         &x_ab,
         challenger,
     );

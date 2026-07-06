@@ -558,6 +558,124 @@ impl LincheckCircuit for FieldCscCircuit {
     }
 }
 
+/// Borrowing, **row-major** [`LincheckCircuit`] over a pair of
+/// F128-coefficient matrices `(a_0, b_0)`.
+///
+/// It folds directly off the row-major [`SparseFieldMatrix`] storage the
+/// prover already owns, so — unlike [`FieldCscCircuit`] — it allocates **no**
+/// transposed CSC copy. During the prover's lincheck+open window only ONE
+/// matrix representation (the un-droppable row-major `a_0`/`b_0`) stays
+/// resident, roughly halving constraint-matrix RAM.
+///
+/// `fold_alpha_batched` is **value-identical** to
+/// [`FieldCscCircuit::fold_alpha_batched`]: it computes the same
+///
+///   `comb[c] = α · Σ_{r} A_0[r,c]·eq[r] + Σ_{r} B_0[r,c]·eq[r]`
+///
+/// by scattering `α·coeff·eq[r]` (matrix A) and `coeff·eq[r]` (matrix B) into
+/// `comb[c]`. GF(2^128) addition is exact, associative and commutative, so the
+/// scatter/accumulation order is irrelevant to the result (the
+/// `csc_fold_matches_direct` test asserts this scatter form equals the CSC
+/// fold bit-for-bit). Identical `comb_vec` ⇒ identical Fiat-Shamir transcript
+/// ⇒ byte-identical proof.
+pub struct FieldRowCircuit<'a> {
+    a_0: &'a SparseFieldMatrix,
+    b_0: &'a SparseFieldMatrix,
+    const_pin: Option<usize>,
+}
+
+impl<'a> FieldRowCircuit<'a> {
+    pub fn new(
+        a_0: &'a SparseFieldMatrix,
+        b_0: &'a SparseFieldMatrix,
+        const_pin: Option<usize>,
+    ) -> Self {
+        debug_assert_eq!(a_0.num_rows, b_0.num_rows);
+        debug_assert_eq!(a_0.num_cols, b_0.num_cols);
+        Self {
+            a_0,
+            b_0,
+            const_pin,
+        }
+    }
+}
+
+impl LincheckCircuit for FieldRowCircuit<'_> {
+    fn n_cols(&self) -> usize {
+        self.a_0.num_cols
+    }
+    fn const_pin_col(&self) -> Option<usize> {
+        self.const_pin
+    }
+    fn fold_alpha_batched(&self, alpha: F128, eq_inner: &[F128]) -> Vec<F128> {
+        use rayon::prelude::*;
+        let n = self.a_0.num_cols;
+        assert_eq!(eq_inner.len(), n);
+
+        let nnz = self.a_0.nnz() + self.b_0.nnz();
+
+        // Serial scatter for small instances: one output comb, `comb[c] +=
+        // weight·coeff·eq[r]` over each matrix's rows (weight α for A, 1 for B).
+        if nnz < FIELD_FOLD_PAR_THRESHOLD {
+            let mut comb = vec![F128::ZERO; n];
+            for (r, row) in self.a_0.rows.iter().enumerate() {
+                let er = eq_inner[r];
+                for &(c, coeff) in row {
+                    comb[c as usize] += alpha * coeff * er;
+                }
+            }
+            for (r, row) in self.b_0.rows.iter().enumerate() {
+                let er = eq_inner[r];
+                for &(c, coeff) in row {
+                    comb[c as usize] += coeff * er;
+                }
+            }
+            return comb;
+        }
+
+        // Parallel scatter: split the rows into row-chunks, each producing a
+        // private width-`n` partial comb, reduced with field addition (char-2,
+        // associative ⇒ value-identical to any other order). The chunk count is
+        // bounded by `rows / chunk`, so only ~O(threads) partials are live at
+        // once (well below the CSC copy this replaces). Preserves the CSC
+        // fold's column-parallelism without materializing a transpose.
+        let threads = rayon::current_num_threads().max(1);
+        let fold_matrix = |m: &SparseFieldMatrix, weight: F128| -> Vec<F128> {
+            let chunk = (m.num_rows / (threads * 4)).max(256);
+            m.rows
+                .par_chunks(chunk)
+                .enumerate()
+                .map(|(ci, span)| {
+                    let base = ci * chunk;
+                    let mut comb = vec![F128::ZERO; n];
+                    for (i, row) in span.iter().enumerate() {
+                        let er = eq_inner[base + i];
+                        for &(c, coeff) in row {
+                            comb[c as usize] += weight * coeff * er;
+                        }
+                    }
+                    comb
+                })
+                .reduce(
+                    || vec![F128::ZERO; n],
+                    |mut acc, part| {
+                        for (x, y) in acc.iter_mut().zip(part) {
+                            *x += y;
+                        }
+                        acc
+                    },
+                )
+        };
+
+        let mut comb = fold_matrix(self.a_0, alpha);
+        let b_comb = fold_matrix(self.b_0, F128::ONE);
+        for (x, y) in comb.iter_mut().zip(b_comb) {
+            *x += y;
+        }
+        comb
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Synthetic instances (tests + the substrate throughput bench)
 // ---------------------------------------------------------------------------
