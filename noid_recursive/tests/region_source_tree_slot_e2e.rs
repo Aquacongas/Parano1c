@@ -39,7 +39,20 @@ use noid_recursive::acceptance::trace::deep_chain::{
     ColumnRelationProofTrace, DeepChainWalkProofTrace, LaneClaimGroupTrace, RelationTermTrace,
     ShiftDischargeProofTrace,
 };
-use noid_recursive::acceptance::trace::{mul, pin_eq};
+use noid_recursive::acceptance::trace::{alloc_blocks, mul, pin_eq};
+
+// SB1.2 grand-slice extra imports (the real FRICHANL channel + capsule).
+use noid_core::{AdditiveNTT, Block128, TowerField};
+use noid_fri::code::{Code, LOG_RATE};
+use noid_fri_binius::mixed_open::MIXED_OPEN_TAG;
+use noid_fri_binius::COMPACT_TAU;
+use noid_gkr::auth_pcs::{commit_auth_mle_column, open_auth_mle_committed, AuthMleOpeningProof};
+use noid_gkr::batch_eval::BatchEvalReduction;
+use noid_recursive::acceptance::trace::auth_pcs::absorb_cap_trace;
+use noid_recursive::acceptance::trace::eq_ind_partial_eval_trace;
+use noid_recursive::acceptance::trace::fri_pcs::{
+    alloc_digest, code_new_trace, mle_evaluate_small_trace, FriChannelTrace,
+};
 
 struct Rng(u64);
 impl Rng {
@@ -565,4 +578,262 @@ fn region_source_tree_slot_end_to_end() {
     // Corrupt a CODE lane (leaf symbol) -> substitution claim breaks.
     let leaf_slot = 2 * tree.leaf_count() + 1;
     assert!(flip(0, leaf_slot), "flipped CODE lane accepted");
+}
+
+// ===========================================================================
+// SB1.2 grand slice: the source-binding root check composed in-trace with the
+// REAL FRICHANL channel. Drives FriChannelTrace through step 3d to derive the
+// initial sumcheck claim, pins H(right) == that claim (SB1.1), computes the
+// codeword g_code = Code(H·eq_right) in-trace via code_new_trace, binds it to
+// the source_tree family's committed CODE columns, and pins the family root to
+// fri_roots[0] -- replacing the inline merkle_root_trace with the region tree.
+// This is the first grand-assembly leg: the FRICHANL channel joined to a region
+// family in ONE trace, discharged through public-IO.
+// ===========================================================================
+
+fn phi(b: Block128) -> F128 {
+    noid_ivc_core::deep_chain::schedule::flat_of_tower_u128(b.0)
+}
+
+fn lanes_flat(d: &[u8; 32]) -> [F128; 2] {
+    [
+        phi(Block128::from(u128::from_le_bytes(d[..16].try_into().unwrap()))),
+        phi(Block128::from(u128::from_le_bytes(d[16..].try_into().unwrap()))),
+    ]
+}
+
+fn eq_tensor_tower(point: &[Block128]) -> Vec<Block128> {
+    let mut t = vec![Block128::ONE; 1usize << point.len()];
+    for (i, slot) in t.iter_mut().enumerate() {
+        let mut e = Block128::ONE;
+        for (l, &p) in point.iter().enumerate() {
+            e = e * if (i >> l) & 1 == 1 { p } else { Block128::ONE + p };
+        }
+        *slot = e;
+    }
+    t
+}
+
+fn capsule_fixture(
+    num_vars: usize,
+    seed: u64,
+) -> (Vec<Block128>, BatchEvalReduction, AuthMleOpeningProof) {
+    use noid_core::mle::evaluate::evaluate_slice;
+    let mut rng = Rng(seed);
+    let column: Vec<Block128> = (0..(1usize << num_vars)).map(|_| rng.f128_block()).collect();
+    let point: Vec<Block128> = (0..num_vars).map(|_| rng.f128_block()).collect();
+    let value = evaluate_slice(&column, &point);
+    let reduction = BatchEvalReduction { point: point.clone(), value };
+    let mut committed = commit_auth_mle_column(&column, num_vars);
+    let proof = open_auth_mle_committed(&mut committed, num_vars, &reduction);
+    (point, reduction, proof)
+}
+
+impl Rng {
+    fn f128_block(&mut self) -> Block128 {
+        Block128::from(((self.next_u64() as u128) << 64) | self.next_u64() as u128)
+    }
+}
+
+/// SB1.1 + SB1.2 composed in-trace with the real channel; honest verifies, and
+/// tampering H, the codeword, or the tree columns breaks a claim.
+#[test]
+fn region_sb12_source_binding_grand() {
+    let num_vars = 9usize; // tau = 8, n_rounds = 1 -> a tiny source tree
+    let (point, _reduction, proof) = capsule_fixture(num_vars, 0x5B12_9A1E);
+    let log_n = proof.commitment.log_rows;
+    assert_eq!(log_n, num_vars);
+    let n_cols = proof.commitment.n_cols;
+    assert_eq!(n_cols, 1);
+    let tau = COMPACT_TAU.min(log_n);
+    let n_rounds = log_n - tau;
+    let ntt = AdditiveNTT::<Block128>::new(num_vars + LOG_RATE);
+
+    let opening = &proof.opening;
+    let fri = &opening.fri_proof;
+    let src = &opening.source_proof;
+    let right_tower = &point[..n_rounds];
+    let left = &point[n_rounds..];
+
+    // ---- Native codeword + source tree (φ into the flat basis).
+    let eq_r = eq_tensor_tower(right_tower);
+    let g: Vec<Block128> = src.h_evals.iter().zip(eq_r.iter()).map(|(&h, &e)| h * e).collect();
+    let g_code = Code::new_parallel(&g, &ntt);
+    let g_code_flat: Vec<F128> = g_code.encoding.iter().map(|&b| phi(b)).collect();
+    let tree = SourceTree { leaf_log: n_rounds + 1 };
+    assert_eq!(tree.code_len(), g_code_flat.len(), "codeword length matches tree");
+    let w_log = tree.slots_log();
+    let cols = build_source_tree_columns(&tree, &g_code_flat, w_log);
+    let code_cols = build_source_code_columns(&tree, &g_code_flat, w_log);
+    // The region tree root IS the real FRI round-0 root (the binding SB1.2 pins).
+    let fri_root0 = lanes_flat(&fri.fri_roots[0]);
+    assert_eq!(cols.root, fri_root0, "region tree root != φ(fri_roots[0])");
+
+    // ---- Trace.
+    let mut b = FieldR1csBuilder::new();
+
+    // Family committed slices (base 0): CODE0,CODE1, KID0,KID1, C0..3.
+    let mut slices = Vec::new();
+    for col in [
+        &code_cols[0], &code_cols[1], &cols.kid[0], &cols.kid[1], &cols.c[0], &cols.c[1], &cols.c[2],
+        &cols.c[3],
+    ] {
+        slices.push(alloc_column_slice(&mut b, col, w_log).0);
+    }
+    let base = 0usize;
+
+    // Proof wires + the FRICHANL channel through step 3d.
+    let cap_lanes: Vec<[LinExpr; 2]> =
+        proof.commitment.cap.hashes.iter().map(|h| alloc_digest(&mut b, h)).collect();
+    let all_openings = alloc_blocks(&mut b, &opening.all_openings);
+    let upper = alloc_blocks(&mut b, &fri.upper_partial_evals);
+    let h_evals_w = alloc_blocks(&mut b, &src.h_evals);
+    let point_w = alloc_blocks(&mut b, &point);
+    let fri_root0_w = alloc_digest(&mut b, &fri.fri_roots[0]);
+
+    let mut ch = FriChannelTrace::new();
+    absorb_cap_trace(&mut b, &mut ch, &cap_lanes);
+    ch.observe_const_tower(&mut b, MIXED_OPEN_TAG as u128);
+    ch.observe_field_elems(&mut b, &all_openings);
+    let _gamma = ch.squeeze(&mut b);
+    let batched_claim = all_openings[0].clone(); // n_cols = 1
+
+    ch.observe_field_elems(&mut b, &point_w); // 3a
+    let (right_w, left_w) = point_w.split_at(n_rounds);
+    assert_eq!(left_w.len(), left.len());
+    // 3c: eval consistency Σ eq(left,i)·upper == batched_claim.
+    let left_eq = eq_ind_partial_eval_trace(&mut b, left_w);
+    let mut derived = LinExpr::zero();
+    for (l, u) in left_eq.iter().zip(upper.iter()) {
+        derived = derived.add(&mul(&mut b, l, u));
+    }
+    pin_eq(&mut b, &derived, &batched_claim);
+    ch.observe_field_elem(&mut b, &batched_claim);
+    // 3d: tensor batching β, initial sumcheck claim.
+    let beta = ch.squeeze_n(&mut b, tau);
+    let batching_eq = eq_ind_partial_eval_trace(&mut b, &beta);
+    let mut initial_claim = LinExpr::zero();
+    for (u, be) in upper.iter().zip(batching_eq.iter()) {
+        initial_claim = initial_claim.add(&mul(&mut b, u, be));
+    }
+
+    // SB1.1: H(right) == initial sumcheck claim.
+    let h_at_right = mle_evaluate_small_trace(&mut b, &h_evals_w, right_w);
+    pin_eq(&mut b, &h_at_right, &initial_claim);
+
+    // SB1.2: g_code = Code(H·eq_right), computed in-trace.
+    let eq_right_w = eq_ind_partial_eval_trace(&mut b, right_w);
+    let mut g_evals_w = Vec::with_capacity(h_evals_w.len());
+    for (h, e) in h_evals_w.iter().zip(eq_right_w.iter()) {
+        g_evals_w.push(mul(&mut b, h, e));
+    }
+    let g_code_w = code_new_trace(&g_evals_w);
+    assert_eq!(g_code_w.len(), g_code_flat.len());
+
+    // ---- Discharge the source tree family; collect its DAG claims.
+    let native = run_source_tree_native(&tree, &cols, &code_cols, w_log, base, b"sb12-source-tree");
+    let mut claims = discharge_source_tree(&mut b, &tree, &cols, w_log, b"sb12-source-tree", &native);
+
+    // Join: the committed CODE columns at each leaf odd slot equal the in-trace
+    // codeword derived from H (binds the tree leaves to H, not arbitrary code).
+    let l = tree.leaf_count();
+    for i in 0..l {
+        let slot = 2 * (l + i) + 1;
+        let (pt_lin, pt_nat) = slot_point(slot, w_log);
+        for lane in 0..2 {
+            claims.push(Claim {
+                slice: base + lane, // CODE0 / CODE1
+                point: pt_lin.clone(),
+                value: g_code_w[2 * i + lane].clone(),
+                native_point: pt_nat.clone(),
+                native_value: g_code_flat[2 * i + lane],
+            });
+        }
+    }
+    // Root pin: C0/C1 at slot 3 (heap node 1 odd) == fri_roots[0].
+    let (rp_lin, rp_nat) = slot_point(3, w_log);
+    for lane in 0..2 {
+        claims.push(Claim {
+            slice: base + 4 + lane, // C0 / C1
+            point: rp_lin.clone(),
+            value: fri_root0_w[lane].clone(),
+            native_point: rp_nat.clone(),
+            native_value: fri_root0[lane],
+        });
+    }
+
+    // ---- ONE public-IO discharge over all claims.
+    let max_arity = claims.iter().map(|c| c.point.len()).max().unwrap();
+    let lanes_per = max_arity + 1;
+    let io_len = claims.len() * lanes_per;
+    let io_log = io_len.next_power_of_two().trailing_zeros() as usize;
+    let mut io_values = Vec::with_capacity(io_len);
+    for c in &claims {
+        for k in 0..max_arity {
+            io_values.push(if k < c.native_point.len() { c.native_point[k] } else { F128::ZERO });
+        }
+        io_values.push(c.native_value);
+    }
+    let (io_slice, io_wires) = alloc_column_slice(&mut b, &io_values, io_log);
+    for (ci, c) in claims.iter().enumerate() {
+        let g = ci * lanes_per;
+        for (k, p) in c.point.iter().enumerate() {
+            pin_eq(&mut b, p, &io_wires[g + k]);
+        }
+        pin_eq(&mut b, &c.value, &io_wires[g + max_arity]);
+    }
+    let spec = PublicIoSpec {
+        io_slice,
+        io_len,
+        claims: claims
+            .iter()
+            .enumerate()
+            .map(|(ci, c)| IoClaimSpec {
+                slice: slices[c.slice],
+                point: ci * lanes_per..ci * lanes_per + c.point.len(),
+                value: ci * lanes_per + max_arity,
+            })
+            .collect(),
+    };
+
+    let (r1cs, z) = b.build();
+    assert!(r1cs.satisfies(&z), "honest SB1.2 grand trace unsatisfiable");
+    let params = PcsParams {
+        m: r1cs.m + pcs::LOG_PACKING,
+        log_inv_rate: 2,
+        log_batch_size: 2,
+        profile: Default::default(),
+    };
+    let mut chp = FsLaneChallenger::new(b"region-sb12-grand");
+    let (pf, commitment, _) = noid_ivc_prover::field_prover::prove_field_with_public_io(
+        &r1cs, &z, &params, &spec, &io_values, &mut chp,
+    );
+    let mut chv = FsLaneChallenger::new(b"region-sb12-grand");
+    noid_ivc_core::verifier::verify_field_with_public_io(&r1cs, &commitment, &pf, &spec, &io_values, &mut chv)
+        .expect("SB1.2 grand composition verifies");
+    eprintln!(
+        "[region-sb12-grand] rows = {} (m = {}), num_vars = {}, n_rounds = {}, claims = {}",
+        z.len(),
+        r1cs.m,
+        num_vars,
+        n_rounds,
+        spec.claims.len()
+    );
+
+    // Negative: flip a committed CODE lane -> the tree root diverges from
+    // fri_roots[0] AND the H-join claim breaks -> BaseFold rejects.
+    let flip = |slice_idx: usize, off: usize| {
+        let mut bad = z.clone();
+        bad[slices[slice_idx].start() + off] += F128::ONE;
+        assert!(r1cs.satisfies(&bad), "columns are free wires");
+        let mut chp = FsLaneChallenger::new(b"region-sb12-grand");
+        let (bp, bc, _) = noid_ivc_prover::field_prover::prove_field_with_public_io(
+            &r1cs, &bad, &params, &spec, &io_values, &mut chp,
+        );
+        let mut chv = FsLaneChallenger::new(b"region-sb12-grand");
+        noid_ivc_core::verifier::verify_field_with_public_io(&r1cs, &bc, &bp, &spec, &io_values, &mut chv).is_err()
+    };
+    let first_leaf = 2 * l + 1;
+    assert!(flip(0, first_leaf), "flipped CODE leaf accepted");
+    assert!(flip(4, 5), "flipped C node accepted");
 }
