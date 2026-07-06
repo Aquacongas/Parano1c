@@ -30,10 +30,9 @@ fn params_for(m_elems: usize) -> PcsParams {
 /// constant wire, every other row is `z_i·z_0 = z_i`.
 fn free_instance(m: usize, k_log: usize, seed: u64) -> (FieldR1cs, Vec<F128>) {
     let k = 1usize << k_log;
-    let a_0 = SparseFieldMatrix {
-        num_rows: k,
-        num_cols: k,
-        rows: (0..k)
+    let a_0 = SparseFieldMatrix::from_rows(
+        k,
+        (0..k)
             .map(|r| {
                 if r == 0 {
                     vec![(0u32, F128::ONE)]
@@ -42,12 +41,11 @@ fn free_instance(m: usize, k_log: usize, seed: u64) -> (FieldR1cs, Vec<F128>) {
                 }
             })
             .collect(),
-    };
-    let b_0 = SparseFieldMatrix {
-        num_rows: k,
-        num_cols: k,
-        rows: (0..k).map(|_| vec![(0u32, F128::ONE)]).collect(),
-    };
+    );
+    let b_0 = SparseFieldMatrix::from_rows(
+        k,
+        (0..k).map(|_| vec![(0u32, F128::ONE)]).collect(),
+    );
     let r1cs = FieldR1cs {
         m,
         k_log,

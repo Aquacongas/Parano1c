@@ -2186,12 +2186,12 @@ mod tests {
                     block: Some(mk_block(&units[step], no_pcs)),
                 },
             );
-            assert_eq!(
-                built.r1cs.a_0.rows, class_r1cs.a_0.rows,
+            assert!(
+                built.r1cs.a_0 == class_r1cs.a_0,
                 "link {step}: class A matrix drifted"
             );
-            assert_eq!(
-                built.r1cs.b_0.rows, class_r1cs.b_0.rows,
+            assert!(
+                built.r1cs.b_0 == class_r1cs.b_0,
                 "link {step}: class B matrix drifted"
             );
             let mut ch = FsLaneChallenger::new(b"history-link-v0");
@@ -2500,12 +2500,12 @@ mod tests {
                 block: Some(mk(&units[1], region_cfg)),
             },
         );
-        assert_eq!(
-            built1.r1cs.a_0.rows, class_r1cs.a_0.rows,
+        assert!(
+            built1.r1cs.a_0 == class_r1cs.a_0,
             "π₁ class A matrix drifted"
         );
-        assert_eq!(
-            built1.r1cs.b_0.rows, class_r1cs.b_0.rows,
+        assert!(
+            built1.r1cs.b_0 == class_r1cs.b_0,
             "π₁ class B matrix drifted"
         );
         let mut ch = FsLaneChallenger::new(b"history-link-v0");
@@ -2590,11 +2590,11 @@ mod tests {
         let r1 = build(&units[1], no_pcs, "block 1 (height 2, no wallet-PCS)");
         assert_eq!(r0.m, r1.m, "class m drifted between blocks");
         assert_eq!(r0.k_log, r1.k_log, "k_log drifted");
-        assert_eq!(
-            r0.a_0.rows, r1.a_0.rows,
+        assert!(
+            r0.a_0 == r1.a_0,
             "A matrix drifted between blocks (recursion-ready part must be class-fixed)"
         );
-        assert_eq!(r0.b_0.rows, r1.b_0.rows, "B matrix drifted between blocks");
+        assert!(r0.b_0 == r1.b_0, "B matrix drifted between blocks");
         eprintln!(
             "[block-slots] recursion-ready shape FIXED across 2 real blocks (heights 1,2): 2^{} rows",
             r0.k_log
@@ -2606,8 +2606,8 @@ mod tests {
         let full0 = build(&units[0], BlockSlotsConfig::default(), "block 0 full");
         let full1 = build(&units[1], BlockSlotsConfig::default(), "block 1 full");
         let _ = build_block_slots; // keep the default-config entry point exercised elsewhere
-        assert_ne!(
-            full0.a_0.rows, full1.a_0.rows,
+        assert!(
+            full0.a_0 != full1.a_0,
             "wallet-PCS was expected to be the drift source; if this now matches, \
              the fixity boundary moved — update the region-layer obligation"
         );

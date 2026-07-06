@@ -616,9 +616,9 @@ fn lincheck_final_sum_trace(
     let mut blocks_b: BTreeMap<(usize, usize), Block> = BTreeMap::new();
     let k_skip = r1cs.k_skip;
     let mask = ell - 1;
-    for (rows, blocks) in [(&r1cs.a_0.rows, &mut blocks_a), (&r1cs.b_0.rows, &mut blocks_b)] {
-        for (r, row) in rows.iter().enumerate() {
-            for &(c, kappa) in row {
+    for (m, blocks) in [(&r1cs.a_0, &mut blocks_a), (&r1cs.b_0, &mut blocks_b)] {
+        for r in 0..m.num_rows {
+            for (c, kappa) in m.row(r) {
                 let c = c as usize;
                 blocks
                     .entry((r >> k_skip, c >> k_skip))
@@ -2583,18 +2583,16 @@ mod tests {
             k_log,
             k_skip: K_SKIP,
             useful_rows: k,
-            a_0: SparseFieldMatrix {
-                num_rows: k,
-                num_cols: k,
-                rows: (0..k)
+            a_0: SparseFieldMatrix::from_rows(
+                k,
+                (0..k)
                     .map(|r| vec![(if r == 0 { 0 } else { r as u32 }, F128::ONE)])
                     .collect(),
-            },
-            b_0: SparseFieldMatrix {
-                num_rows: k,
-                num_cols: k,
-                rows: (0..k).map(|_| vec![(0u32, F128::ONE)]).collect(),
-            },
+            ),
+            b_0: SparseFieldMatrix::from_rows(
+                k,
+                (0..k).map(|_| vec![(0u32, F128::ONE)]).collect(),
+            ),
             const_pin: Some(0),
             digest_cache: std::sync::OnceLock::new(),
             csc_cache: std::sync::OnceLock::new(),
@@ -2719,18 +2717,16 @@ mod tests {
             k_log,
             k_skip: K_SKIP,
             useful_rows: k,
-            a_0: SparseFieldMatrix {
-                num_rows: k,
-                num_cols: k,
-                rows: (0..k)
+            a_0: SparseFieldMatrix::from_rows(
+                k,
+                (0..k)
                     .map(|r| vec![(if r == 0 { 0 } else { r as u32 }, F128::ONE)])
                     .collect(),
-            },
-            b_0: SparseFieldMatrix {
-                num_rows: k,
-                num_cols: k,
-                rows: (0..k).map(|_| vec![(0u32, F128::ONE)]).collect(),
-            },
+            ),
+            b_0: SparseFieldMatrix::from_rows(
+                k,
+                (0..k).map(|_| vec![(0u32, F128::ONE)]).collect(),
+            ),
             const_pin: Some(0),
             digest_cache: std::sync::OnceLock::new(),
             csc_cache: std::sync::OnceLock::new(),

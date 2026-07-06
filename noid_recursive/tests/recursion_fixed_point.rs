@@ -121,12 +121,12 @@ fn recursion_fixed_point_two_links() {
             },
         );
         let build_t = t0.elapsed();
-        assert_eq!(
-            built.r1cs.a_0.rows, class_r1cs.a_0.rows,
+        assert!(
+            built.r1cs.a_0 == class_r1cs.a_0,
             "link {step}: class A matrix drifted"
         );
-        assert_eq!(
-            built.r1cs.b_0.rows, class_r1cs.b_0.rows,
+        assert!(
+            built.r1cs.b_0 == class_r1cs.b_0,
             "link {step}: class B matrix drifted"
         );
         let t0 = Instant::now();

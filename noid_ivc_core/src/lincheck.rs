@@ -2691,17 +2691,18 @@ mod tests {
         ] {
             let k = 1usize << k_log;
             let mut rng = Rng::new(0xF1E1D ^ seed);
-            let gen_matrix = |rng: &mut Rng| SparseFieldMatrix {
-                num_rows: k,
-                num_cols: k,
-                rows: (0..k)
-                    .map(|_| {
-                        let n_nonzero = 1 + (rng.next_u64() % 4) as usize;
-                        (0..n_nonzero)
-                            .map(|_| ((rng.next_u64() as usize % k) as u32, rng.f128()))
-                            .collect()
-                    })
-                    .collect(),
+            let gen_matrix = |rng: &mut Rng| {
+                SparseFieldMatrix::from_rows(
+                    k,
+                    (0..k)
+                        .map(|_| {
+                            let n_nonzero = 1 + (rng.next_u64() % 4) as usize;
+                            (0..n_nonzero)
+                                .map(|_| ((rng.next_u64() as usize % k) as u32, rng.f128()))
+                                .collect()
+                        })
+                        .collect(),
+                )
             };
             let a_0 = gen_matrix(&mut rng);
             let b_0 = gen_matrix(&mut rng);
@@ -2777,17 +2778,18 @@ mod tests {
         let k = 1usize << k_log;
         let useful = 100usize; // < k = 128
         let mut rng = Rng::new(0xDAD5EED);
-        let gen_matrix = |rng: &mut Rng| SparseFieldMatrix {
-            num_rows: k,
-            num_cols: k,
-            rows: (0..k)
-                .map(|r| {
-                    if r >= useful {
-                        return Vec::new();
-                    }
-                    vec![((rng.next_u64() as usize % k) as u32, rng.f128())]
-                })
-                .collect(),
+        let gen_matrix = |rng: &mut Rng| {
+            SparseFieldMatrix::from_rows(
+                k,
+                (0..k)
+                    .map(|r| {
+                        if r >= useful {
+                            return Vec::new();
+                        }
+                        vec![((rng.next_u64() as usize % k) as u32, rng.f128())]
+                    })
+                    .collect(),
+            )
         };
         let a_0 = gen_matrix(&mut rng);
         let b_0 = gen_matrix(&mut rng);

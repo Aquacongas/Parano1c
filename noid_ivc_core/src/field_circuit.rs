@@ -334,16 +334,8 @@ impl FieldR1csBuilder {
             k_log,
             k_skip: crate::zerocheck::K_SKIP,
             useful_rows: n_wires,
-            a_0: SparseFieldMatrix {
-                num_rows: k,
-                num_cols: k,
-                rows: rows_a,
-            },
-            b_0: SparseFieldMatrix {
-                num_rows: k,
-                num_cols: k,
-                rows: rows_b,
-            },
+            a_0: SparseFieldMatrix::from_rows(k, rows_a),
+            b_0: SparseFieldMatrix::from_rows(k, rows_b),
             const_pin: Some(0),
             digest_cache: std::sync::OnceLock::new(),
             csc_cache: std::sync::OnceLock::new(),

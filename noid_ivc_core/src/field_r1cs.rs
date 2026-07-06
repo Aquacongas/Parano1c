@@ -23,25 +23,70 @@
 use crate::field::F128;
 use crate::lincheck::LincheckCircuit;
 
-/// Sparse matrix over F_{2^128}. `rows[i]` lists `(column, coefficient)`
-/// pairs; absent columns are zero. Coefficients must be nonzero (a zero
-/// coefficient is representable but wasteful and forbidden by convention —
-/// [`FieldR1cs::statement_digest`] would distinguish it, so builders must
-/// simply not emit zeros).
-#[derive(Clone, Debug)]
+/// Sparse matrix over F_{2^128} in **CSR** form. Row `r`'s nonzero entries are
+/// `col_indices[row_offsets[r]..row_offsets[r + 1]]` with the matching
+/// coefficients at the same positions in `values`; absent columns are zero.
+/// Per-row entry order is preserved from construction — both
+/// [`FieldR1cs::statement_digest`] and the lincheck column fold depend on it,
+/// so builders keep columns in a fixed order. Coefficients must be nonzero (a
+/// zero coefficient is representable but wasteful and forbidden by convention:
+/// the digest would distinguish it, so builders must simply not emit zeros).
+///
+/// CSR replaces the former `Vec<Vec<(u32, F128)>>`. That layout wasted ~40% of
+/// the constraint matrix: `(u32, F128)` pads to 32 B (F128 is 16-aligned, so
+/// the u32 costs 16 B), and every row — including the many empty padding rows —
+/// carried a 24 B `Vec` header. CSR is 20 B/nnz + 8 B/row with no per-entry
+/// padding and no per-row headers, roughly halving the resident matrix — the
+/// single largest prover buffer at block-bearing (2^23–2^24) sizes.
+#[derive(Clone, Debug, PartialEq)]
 pub struct SparseFieldMatrix {
     pub num_rows: usize,
     pub num_cols: usize,
-    pub rows: Vec<Vec<(u32, F128)>>,
+    /// Column index of each nonzero, grouped by row per `row_offsets`.
+    pub col_indices: Vec<u32>,
+    /// Coefficient of each nonzero, parallel to `col_indices`.
+    pub values: Vec<F128>,
+    /// Row boundaries: length `num_rows + 1`, monotone non-decreasing,
+    /// `row_offsets[0] == 0` and `row_offsets[num_rows] == col_indices.len()`.
+    pub row_offsets: Vec<usize>,
 }
 
 impl SparseFieldMatrix {
+    /// Build from a row-major `(column, coefficient)` list — the natural
+    /// builder output. Flattens by value so each inner `Vec` frees as it is
+    /// consumed (no transient doubling of the matrix), preserving per-row
+    /// entry order. `num_rows` is inferred from `rows.len()`.
+    pub fn from_rows(num_cols: usize, rows: Vec<Vec<(u32, F128)>>) -> Self {
+        let num_rows = rows.len();
+        let nnz: usize = rows.iter().map(|r| r.len()).sum();
+        let mut col_indices = Vec::with_capacity(nnz);
+        let mut values = Vec::with_capacity(nnz);
+        let mut row_offsets = Vec::with_capacity(num_rows + 1);
+        row_offsets.push(0);
+        for row in rows {
+            for (c, v) in row {
+                col_indices.push(c);
+                values.push(v);
+            }
+            row_offsets.push(col_indices.len());
+        }
+        Self {
+            num_rows,
+            num_cols,
+            col_indices,
+            values,
+            row_offsets,
+        }
+    }
+
     /// Identity matrix of side `k`.
     pub fn identity(k: usize) -> Self {
         Self {
             num_rows: k,
             num_cols: k,
-            rows: (0..k).map(|i| vec![(i as u32, F128::ONE)]).collect(),
+            col_indices: (0..k as u32).collect(),
+            values: vec![F128::ONE; k],
+            row_offsets: (0..=k).collect(),
         }
     }
 
@@ -50,12 +95,47 @@ impl SparseFieldMatrix {
         Self {
             num_rows: k,
             num_cols: k,
-            rows: vec![Vec::new(); k],
+            col_indices: Vec::new(),
+            values: Vec::new(),
+            row_offsets: vec![0usize; k + 1],
         }
     }
 
     pub fn nnz(&self) -> usize {
-        self.rows.iter().map(|r| r.len()).sum()
+        self.values.len()
+    }
+
+    /// Entry-index range `[start, end)` of row `r` in `col_indices`/`values`.
+    #[inline]
+    pub fn row_range(&self, r: usize) -> std::ops::Range<usize> {
+        self.row_offsets[r]..self.row_offsets[r + 1]
+    }
+
+    /// Column indices of row `r`.
+    #[inline]
+    pub fn row_cols(&self, r: usize) -> &[u32] {
+        &self.col_indices[self.row_range(r)]
+    }
+
+    /// Coefficients of row `r` (parallel to [`Self::row_cols`]).
+    #[inline]
+    pub fn row_vals(&self, r: usize) -> &[F128] {
+        &self.values[self.row_range(r)]
+    }
+
+    /// Number of nonzero entries in row `r`.
+    #[inline]
+    pub fn row_len(&self, r: usize) -> usize {
+        self.row_offsets[r + 1] - self.row_offsets[r]
+    }
+
+    /// `(column, coefficient)` pairs of row `r`, in stored order.
+    #[inline]
+    pub fn row(&self, r: usize) -> impl Iterator<Item = (u32, F128)> + '_ {
+        self.row_cols(r)
+            .iter()
+            .copied()
+            .zip(self.row_vals(r).iter().copied())
     }
 }
 
@@ -245,14 +325,17 @@ const DIGEST_SPAN_ROWS: usize = 2048;
 /// length-prefixed rows of `(column, coeff.lo, coeff.hi)` u64 triples.
 fn matrix_span_digests(m: &SparseFieldMatrix) -> Vec<[u8; 32]> {
     use rayon::prelude::*;
-    m.rows
-        .par_chunks(DIGEST_SPAN_ROWS)
-        .map(|span| {
-            let payload: usize = span.iter().map(|row| 8 + 24 * row.len()).sum();
+    let n_spans = m.num_rows.div_ceil(DIGEST_SPAN_ROWS);
+    (0..n_spans)
+        .into_par_iter()
+        .map(|s| {
+            let r0 = s * DIGEST_SPAN_ROWS;
+            let r1 = ((s + 1) * DIGEST_SPAN_ROWS).min(m.num_rows);
+            let payload: usize = (r0..r1).map(|r| 8 + 24 * m.row_len(r)).sum();
             let mut bytes = Vec::with_capacity(payload);
-            for row in span {
-                push_u64(&mut bytes, row.len() as u64);
-                for &(col, coeff) in row {
+            for r in r0..r1 {
+                push_u64(&mut bytes, m.row_len(r) as u64);
+                for (col, coeff) in m.row(r) {
                     push_u64(&mut bytes, col as u64);
                     push_u64(&mut bytes, coeff.lo);
                     push_u64(&mut bytes, coeff.hi);
@@ -284,10 +367,12 @@ pub fn apply_block_diag_field(m_0: &SparseFieldMatrix, z: &[F128], k_log: usize)
     out.par_chunks_mut(k)
         .zip(z.par_chunks(k))
         .for_each(|(out_block, z_block)| {
-            for (r, row) in m_0.rows.iter().enumerate() {
+            for r in 0..m_0.num_rows {
                 let mut acc = F128::ZERO;
-                for &(c, coeff) in row {
-                    acc += coeff * z_block[c as usize];
+                let cols = m_0.row_cols(r);
+                let vals = m_0.row_vals(r);
+                for i in 0..cols.len() {
+                    acc += vals[i] * z_block[cols[i] as usize];
                 }
                 out_block[r] = acc;
             }
@@ -332,8 +417,8 @@ impl<'a> FlipBattery<'a> {
         );
         let transpose = |m: &SparseFieldMatrix| {
             let mut cols: Vec<Vec<(u32, F128)>> = vec![Vec::new(); m.num_cols];
-            for (r, row) in m.rows.iter().enumerate() {
-                for &(c, coeff) in row {
+            for r in 0..m.num_rows {
+                for (c, coeff) in m.row(r) {
                     cols[c as usize].push((r as u32, coeff));
                 }
             }
@@ -418,7 +503,8 @@ impl<'a> FlipBattery<'a> {
         self.cols_b[i].is_empty()
             && self.cols_a[i].len() == 1
             && self.cols_a[i][0] == (i as u32, F128::ONE)
-            && self.r1cs.b_0.rows[i].as_slice() == [(0u32, F128::ONE)]
+            && self.r1cs.b_0.row_cols(i) == [0u32]
+            && self.r1cs.b_0.row_vals(i) == [F128::ONE]
     }
 
     /// [`Self::survivors`] minus the pin-helper class — the standard gate
@@ -473,10 +559,8 @@ fn field_csc_from_rows(m: &SparseFieldMatrix) -> (Vec<u32>, Vec<u32>, Vec<F128>)
     assert!(m.num_rows <= u32::MAX as usize);
     assert!(m.num_cols <= u32::MAX as usize);
     let mut col_ptr = vec![0u32; m.num_cols + 1];
-    for row in &m.rows {
-        for &(c, _) in row {
-            col_ptr[c as usize + 1] += 1;
-        }
+    for &c in &m.col_indices {
+        col_ptr[c as usize + 1] += 1;
     }
     for c in 0..m.num_cols {
         col_ptr[c + 1] += col_ptr[c];
@@ -485,12 +569,15 @@ fn field_csc_from_rows(m: &SparseFieldMatrix) -> (Vec<u32>, Vec<u32>, Vec<F128>)
     let nnz = *col_ptr.last().unwrap() as usize;
     let mut rows_flat = vec![0u32; nnz];
     let mut coeffs_flat = vec![F128::ZERO; nnz];
-    for (r, row) in m.rows.iter().enumerate() {
-        for &(c, coeff) in row {
-            let slot = next[c as usize] as usize;
+    for r in 0..m.num_rows {
+        let cols = m.row_cols(r);
+        let vals = m.row_vals(r);
+        for i in 0..cols.len() {
+            let c = cols[i] as usize;
+            let slot = next[c] as usize;
             rows_flat[slot] = r as u32;
-            coeffs_flat[slot] = coeff;
-            next[c as usize] += 1;
+            coeffs_flat[slot] = vals[i];
+            next[c] += 1;
         }
     }
     (col_ptr, rows_flat, coeffs_flat)
@@ -618,15 +705,15 @@ impl LincheckCircuit for FieldRowCircuit<'_> {
         // weight·coeff·eq[r]` over each matrix's rows (weight α for A, 1 for B).
         if nnz < FIELD_FOLD_PAR_THRESHOLD {
             let mut comb = vec![F128::ZERO; n];
-            for (r, row) in self.a_0.rows.iter().enumerate() {
+            for r in 0..self.a_0.num_rows {
                 let er = eq_inner[r];
-                for &(c, coeff) in row {
+                for (c, coeff) in self.a_0.row(r) {
                     comb[c as usize] += alpha * coeff * er;
                 }
             }
-            for (r, row) in self.b_0.rows.iter().enumerate() {
+            for r in 0..self.b_0.num_rows {
                 let er = eq_inner[r];
-                for &(c, coeff) in row {
+                for (c, coeff) in self.b_0.row(r) {
                     comb[c as usize] += coeff * er;
                 }
             }
@@ -642,15 +729,16 @@ impl LincheckCircuit for FieldRowCircuit<'_> {
         let threads = rayon::current_num_threads().max(1);
         let fold_matrix = |m: &SparseFieldMatrix, weight: F128| -> Vec<F128> {
             let chunk = (m.num_rows / (threads * 4)).max(256);
-            m.rows
-                .par_chunks(chunk)
-                .enumerate()
-                .map(|(ci, span)| {
-                    let base = ci * chunk;
+            let n_chunks = m.num_rows.div_ceil(chunk);
+            (0..n_chunks)
+                .into_par_iter()
+                .map(|ci| {
+                    let r0 = ci * chunk;
+                    let r1 = ((ci + 1) * chunk).min(m.num_rows);
                     let mut comb = vec![F128::ZERO; n];
-                    for (i, row) in span.iter().enumerate() {
-                        let er = eq_inner[base + i];
-                        for &(c, coeff) in row {
+                    for r in r0..r1 {
+                        let er = eq_inner[r];
+                        for (c, coeff) in m.row(r) {
                             comb[c as usize] += weight * coeff * er;
                         }
                     }
@@ -714,10 +802,9 @@ pub fn synthetic_satisfiable(m: usize, k_log: usize, seed: u64) -> (FieldR1cs, V
     let gen_matrix = |rng: &mut dyn FnMut() -> u64,
                           coeff: &mut dyn FnMut() -> F128|
      -> SparseFieldMatrix {
-        SparseFieldMatrix {
-            num_rows: k,
-            num_cols: k,
-            rows: (0..k)
+        SparseFieldMatrix::from_rows(
+            k,
+            (0..k)
                 .map(|r| {
                     if r == 0 {
                         // Constant-wire row: z_0 · z_0 = z_0.
@@ -729,7 +816,7 @@ pub fn synthetic_satisfiable(m: usize, k_log: usize, seed: u64) -> (FieldR1cs, V
                         .collect()
                 })
                 .collect(),
-        }
+        )
     };
     let mut rng_a = {
         let mut s = seed ^ 0xA;
@@ -761,14 +848,14 @@ pub fn synthetic_satisfiable(m: usize, k_log: usize, seed: u64) -> (FieldR1cs, V
         let base = blk * k;
         z[base] = F128::ONE; // the constant wire
         for r in 1..k {
-            let dot = |rows: &[Vec<(u32, F128)>]| {
+            let dot = |m: &SparseFieldMatrix| {
                 let mut acc = F128::ZERO;
-                for &(c, coeff) in &rows[r] {
+                for (c, coeff) in m.row(r) {
                     acc += coeff * z[base + c as usize];
                 }
                 acc
             };
-            z[base + r] = dot(&a_0.rows) * dot(&b_0.rows);
+            z[base + r] = dot(&a_0) * dot(&b_0);
         }
     }
 
@@ -873,13 +960,13 @@ mod tests {
         let got = circuit.fold_alpha_batched(alpha, &eq_inner);
 
         let mut expected = vec![F128::ZERO; k];
-        for (r, row) in r1cs.a_0.rows.iter().enumerate() {
-            for &(c, coeff) in row {
+        for r in 0..r1cs.a_0.num_rows {
+            for (c, coeff) in r1cs.a_0.row(r) {
                 expected[c as usize] += alpha * coeff * eq_inner[r];
             }
         }
-        for (r, row) in r1cs.b_0.rows.iter().enumerate() {
-            for &(c, coeff) in row {
+        for r in 0..r1cs.b_0.num_rows {
+            for (c, coeff) in r1cs.b_0.row(r) {
                 expected[c as usize] += coeff * eq_inner[r];
             }
         }
@@ -892,14 +979,14 @@ mod tests {
         let (r1cs_b, _) = random_satisfiable(8, 4, 11);
         assert_ne!(r1cs_a.statement_digest(), r1cs_b.statement_digest());
 
-        // Coefficient change flips the digest.
+        // Coefficient change flips the digest (mutate the first stored entry;
+        // `clone` resets the digest cache, so it is re-hashed).
         let mut r1cs_c = r1cs_a.clone();
-        for row in r1cs_c.a_0.rows.iter_mut() {
-            if let Some(first) = row.first_mut() {
-                first.1 += F128::ONE;
-                break;
-            }
-        }
+        *r1cs_c
+            .a_0
+            .values
+            .first_mut()
+            .expect("matrix has at least one entry") += F128::ONE;
         assert_ne!(r1cs_a.statement_digest(), r1cs_c.statement_digest());
 
         // Same content → same digest (cache-independent).
@@ -917,10 +1004,9 @@ mod tests {
 
         for &row in &[1usize, DIGEST_SPAN_ROWS - 1, DIGEST_SPAN_ROWS, r1cs.k() - 1] {
             let mut mutated = r1cs.clone();
-            let entry = mutated.b_0.rows[row]
-                .first_mut()
-                .expect("synthetic rows are nonempty");
-            entry.1 += F128::ONE;
+            assert!(mutated.b_0.row_len(row) > 0, "synthetic rows are nonempty");
+            let entry = mutated.b_0.row_offsets[row];
+            mutated.b_0.values[entry] += F128::ONE;
             assert_ne!(
                 base,
                 mutated.statement_digest(),
@@ -993,9 +1079,9 @@ mod tests {
         // Per-block manual apply must match.
         for blk in 0..r1cs.n_outer() {
             let base = blk * k;
-            for (r, row) in r1cs.a_0.rows.iter().enumerate() {
+            for r in 0..r1cs.a_0.num_rows {
                 let mut acc = F128::ZERO;
-                for &(c, coeff) in row {
+                for (c, coeff) in r1cs.a_0.row(r) {
                     acc += coeff * z[base + c as usize];
                 }
                 assert_eq!(a_full[base + r], acc, "blk={blk} r={r}");

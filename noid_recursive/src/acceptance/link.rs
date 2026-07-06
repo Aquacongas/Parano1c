@@ -91,10 +91,9 @@ fn block_acc_lanes(acc: &ChainAccumulator) -> [F128; 5] {
 pub fn genesis_instance(shape: &FieldShape) -> FieldR1cs {
     let k = 1usize << shape.k_log;
     let ell = 1usize << shape.k_skip;
-    let a_0 = SparseFieldMatrix {
-        num_rows: k,
-        num_cols: k,
-        rows: (0..k)
+    let a_0 = SparseFieldMatrix::from_rows(
+        k,
+        (0..k)
             .map(|r| {
                 if r == 0 {
                     vec![(0u32, F128::ONE)]
@@ -105,14 +104,13 @@ pub fn genesis_instance(shape: &FieldShape) -> FieldR1cs {
                 }
             })
             .collect(),
-    };
-    let b_0 = SparseFieldMatrix {
-        num_rows: k,
-        num_cols: k,
-        rows: (0..k)
+    );
+    let b_0 = SparseFieldMatrix::from_rows(
+        k,
+        (0..k)
             .map(|r| if r < ell { vec![(0u32, F128::ONE)] } else { vec![] })
             .collect(),
-    };
+    );
     FieldR1cs {
         m: shape.m,
         k_log: shape.k_log,

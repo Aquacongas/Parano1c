@@ -321,10 +321,10 @@ pub fn prove_matrix_claim_fold<Ch: Challenger>(
             .take(k)
             .enumerate()
             .for_each(|(r, (gv, ge))| {
-                if r < m.rows.len() {
+                if r < m.num_rows {
                     let mut av = F128::ZERO;
                     let mut ae = F128::ZERO;
-                    for &(c, kappa) in &m.rows[r] {
+                    for (c, kappa) in m.row(r) {
                         av += kappa * v_table[c as usize];
                         ae += kappa * e_c[c as usize];
                     }
@@ -378,12 +378,12 @@ pub fn prove_matrix_claim_fold<Ch: Challenger>(
             .par_iter()
             .map(|(m, off)| {
                 let mut acc = vec![F128::ZERO; k];
-                for (r, row) in m.rows.iter().enumerate() {
+                for r in 0..m.num_rows {
                     let w = eq_rho[off + r];
                     if w == F128::ZERO {
                         continue;
                     }
-                    for &(c, kappa) in row {
+                    for (c, kappa) in m.row(r) {
                         acc[c as usize] += kappa * w;
                     }
                 }
@@ -519,12 +519,11 @@ pub fn stacked_matrix_mle_eval(r1cs: &FieldR1cs, claim: &MatrixAccClaim) -> F128
     halves
         .par_iter()
         .map(|(m, w_b)| {
-            m.rows
-                .par_iter()
-                .enumerate()
-                .map(|(r, row)| {
+            (0..m.num_rows)
+                .into_par_iter()
+                .map(|r| {
                     let mut acc = F128::ZERO;
-                    for &(c, kappa) in row {
+                    for (c, kappa) in m.row(r) {
                         acc += kappa * eq_col[c as usize];
                     }
                     acc * eq_row[r]
@@ -548,13 +547,12 @@ pub fn fresh_claim_value(r1cs: &FieldR1cs, fresh: &FreshLincheckClaim) -> F128 {
     halves
         .par_iter()
         .map(|(m, w)| {
-            m.rows
-                .par_iter()
-                .enumerate()
-                .map(|(r, row)| {
+            (0..m.num_rows)
+                .into_par_iter()
+                .map(|r| {
                     let u = lambda[r & mask] * e_tensor[r >> k_skip];
                     let mut acc = F128::ZERO;
-                    for &(c, kappa) in row {
+                    for (c, kappa) in m.row(r) {
                         let c = c as usize;
                         acc += kappa * fresh.z_partial[c & mask] * q_tensor[c >> k_skip];
                     }
@@ -591,16 +589,17 @@ mod tests {
 
     fn random_instance(rng: &mut Rng, k_log: usize, nnz_per_row: usize) -> FieldR1cs {
         let k = 1usize << k_log;
-        let mut mk = |rng: &mut Rng| SparseFieldMatrix {
-            num_rows: k,
-            num_cols: k,
-            rows: (0..k)
-                .map(|_| {
-                    (0..nnz_per_row)
-                        .map(|_| ((rng.next_u64() as usize % k) as u32, rng.f128()))
-                        .collect()
-                })
-                .collect(),
+        let mk = |rng: &mut Rng| {
+            SparseFieldMatrix::from_rows(
+                k,
+                (0..k)
+                    .map(|_| {
+                        (0..nnz_per_row)
+                            .map(|_| ((rng.next_u64() as usize % k) as u32, rng.f128()))
+                            .collect()
+                    })
+                    .collect(),
+            )
         };
         FieldR1cs {
             m: k_log,

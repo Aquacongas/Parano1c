@@ -62,9 +62,9 @@ fn measure(label: &str, r1cs: &FieldR1cs, z: &[F128], lir: usize, lb: usize) {
     let block_count = {
         use std::collections::BTreeSet;
         let mut blocks: BTreeSet<(usize, usize)> = BTreeSet::new();
-        for rows in [&r1cs.a_0.rows, &r1cs.b_0.rows] {
-            for (r, row) in rows.iter().enumerate() {
-                for &(c, _) in row {
+        for m in [&r1cs.a_0, &r1cs.b_0] {
+            for r in 0..m.num_rows {
+                for (c, _) in m.row(r) {
                     blocks.insert((r >> r1cs.k_skip, (c as usize) >> r1cs.k_skip));
                 }
             }

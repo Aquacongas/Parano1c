@@ -251,16 +251,17 @@ mod tests {
 
     fn random_instance(rng: &mut Rng, k_log: usize) -> FieldR1cs {
         let k = 1usize << k_log;
-        let mut mk = |rng: &mut Rng| SparseFieldMatrix {
-            num_rows: k,
-            num_cols: k,
-            rows: (0..k)
-                .map(|_| {
-                    (0..3)
-                        .map(|_| ((rng.next_u64() as usize % k) as u32, rng.f128()))
-                        .collect()
-                })
-                .collect(),
+        let mk = |rng: &mut Rng| {
+            SparseFieldMatrix::from_rows(
+                k,
+                (0..k)
+                    .map(|_| {
+                        (0..3)
+                            .map(|_| ((rng.next_u64() as usize % k) as u32, rng.f128()))
+                            .collect()
+                    })
+                    .collect(),
+            )
         };
         FieldR1cs {
             m: k_log,

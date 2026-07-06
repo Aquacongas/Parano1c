@@ -12,6 +12,21 @@ use noid_ivc_core::proof::{FieldR1csProof, R1csClaim, ZClaim, bind_statement_fie
 use noid_ivc_core::public_io::{PublicIoSpec, assert_witness_matches_io, bind_public_io};
 use noid_ivc_core::zerocheck;
 
+/// Current resident set size in MiB (Linux `/proc/self/status` `VmRSS`), for the
+/// env-gated per-phase memory column. Returns 0 where unavailable.
+fn vmrss_mb() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("VmRSS:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|kb| kb.parse::<u64>().ok())
+        })
+        .map(|kb| kb / 1024)
+        .unwrap_or(0)
+}
+
 /// Prove a FieldR1cs instance on a witness of `2^m` F128 elements.
 ///
 /// `pcs_params.m` counts **bits** (the PCS packing convention), so it must be
@@ -66,18 +81,48 @@ fn prove_field_inner<Ch: Challenger>(
         "the field zerocheck is hardwired to K_SKIP"
     );
 
-    // Phase timings, env-gated (mirrors NOIDH_ZC_TIMING's pattern).
+    // Phase timings + resident-set size, env-gated (mirrors NOIDH_ZC_TIMING's
+    // pattern). The RSS column shows where the prover's memory grows — commit
+    // (codeword + Merkle tree), lincheck (constraint matrix), open — so the
+    // dominant buffer is visible without an external profiler.
     let timing = std::env::var_os("NOIDH_FIELD_PROVE_TIMING").is_some();
     let mut t = std::time::Instant::now();
     let lap = move |label: &str, t: &mut std::time::Instant| {
         if timing {
             eprintln!(
-                "[field-prove] {label}: {:.2} ms",
-                t.elapsed().as_secs_f64() * 1e3
+                "[field-prove] {label}: {:.2} ms, RSS {} MB",
+                t.elapsed().as_secs_f64() * 1e3,
+                vmrss_mb()
             );
         }
         *t = std::time::Instant::now();
     };
+
+    if timing {
+        // Constraint-matrix residency. The matrix is now CSR (parallel
+        // `col_indices: u32` + `values: F128` + `usize` row offsets): 20 B/nnz
+        // + 8 B/row across both matrices, no per-entry padding, no per-row
+        // headers. For contrast, the former `Vec<Vec<(u32,F128)>>` cost 32 B
+        // per nonzero (the tuple padded to 32 B: F128 is 16-aligned) plus a
+        // 24 B `Vec` header per row (both matrices, including empty padding
+        // rows) plus capacity slack — roughly double, and the single largest
+        // resident prover buffer at block-bearing sizes.
+        let a_nnz = r1cs.a_0.nnz();
+        let b_nnz = r1cs.b_0.nnz();
+        let nnz = a_nnz + b_nnz;
+        let rows = 1usize << r1cs.k_log;
+        let mb = |b: usize| b / (1024 * 1024);
+        let csr = nnz * 20 + rows * 8 * 2;
+        let vecvec = nnz * 32 + rows * 24 * 2;
+        eprintln!(
+            "[field-prove] matrix @entry: a_nnz={a_nnz} b_nnz={b_nnz} rows={rows} | \
+             CSR≈{}MB (former VecVec≈{}MB, saved≈{}MB), RSS {}MB",
+            mb(csr),
+            mb(vecvec),
+            mb(vecvec.saturating_sub(csr)),
+            vmrss_mb()
+        );
+    }
 
     // ---- PCS commit to the element witness (no repacking).
     let (commitment, prover_data) = pcs::commit(z, pcs_params);
