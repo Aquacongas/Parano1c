@@ -69,7 +69,7 @@ use super::trace::accepted_claim_batch::{
 use super::trace::accepted_claim_hash::{build_accepted_claim_hash_slot, AcceptedClaimHashInputsTrace};
 use super::trace::auth_pcs::discharge_auth_pcs_obligation;
 use super::trace::region_source_binding::{
-    discharge_auth_pcs_obligation_via_region, RegionDischargeParams, RegionPcsClaim,
+    discharge_auth_pcs_obligations_via_region, RegionDischargeParams, RegionPcsClaim,
 };
 use super::trace::checkpoint_poseidon::{
     build_checkpoint_poseidon_slot_with_inputs, ChainAccumulatorBatchInputsTrace,
@@ -479,6 +479,13 @@ pub fn build_block_slots_with_config(
     // wallet-PCS discharge, tx_body_hash pinned to the spine hash.
     let mut auth_inputs = Vec::with_capacity(inputs.authorization_inputs.len());
     let mut pending_wallet_pcs: Vec<RegionPcsClaim> = Vec::new();
+    // Region path: collect every tx's obligation; the whole block's wallet-PCS
+    // discharges in ONE tiled plural call after the loop (all txs' capsule
+    // families tile into one walk A/B/C, opening claims flat in tx count) so the
+    // link IO tail stays class-fixed regardless of tx count. The inline path
+    // (compact-FRI replay) stays per-tx.
+    let mut region_obligations = Vec::new();
+    let mut region_natives = Vec::new();
     let mut owner_sum = LinExpr::zero();
     let mut live_sum = LinExpr::zero();
     for (input, witness_proof) in inputs
@@ -494,22 +501,32 @@ pub fn build_block_slots_with_config(
             match config.wallet_pcs_region {
                 // Inline compact-FRI replay (proof-dependent shape).
                 None => discharge_auth_pcs_obligation(b, &obligation, &witness_proof.pcs),
-                // Shape-fixed region discharge: collect its opening claims for
-                // the link to thread through public-IO.
-                Some(params) => pending_wallet_pcs.extend(
-                    discharge_auth_pcs_obligation_via_region(
-                        b,
-                        &obligation,
-                        &witness_proof.pcs,
-                        params,
-                    ),
-                ),
+                // Shape-fixed region discharge: defer to ONE tiled call below.
+                Some(_) => {
+                    region_obligations.push(obligation);
+                    region_natives.push(witness_proof.pcs.clone());
+                }
             }
         }
         pin_eq2(b, &inputs_t.tx_body_hash, &tx_hashes[input.tx_index]);
         owner_sum = owner_sum.add(&inputs_t.owner_count);
         live_sum = live_sum.add(&inputs_t.live_len);
         auth_inputs.push(inputs_t);
+    }
+    // ONE tiled plural discharge for the whole block (region path): the K txs'
+    // wallet-capsule families tile into one walk A/B/C and the returned committed-
+    // column opening claims are flat in tx count, threading through the link's
+    // public IO. `k` = tx count must be a power of two (the plural asserts it; a
+    // tier pads its real txs to next_pow2 with ghost obligations).
+    if let Some(params) = config.wallet_pcs_region {
+        if !region_obligations.is_empty() {
+            pending_wallet_pcs = discharge_auth_pcs_obligations_via_region(
+                b,
+                &region_obligations,
+                &region_natives,
+                params,
+            );
+        }
     }
     // Totals: per-slot sums AND the claim's resource lanes agree
     // (`verify_authorization_components` + the transcript encoding).
@@ -618,18 +635,27 @@ pub fn region_wallet_pcs_native(
     params: RegionDischargeParams,
 ) -> Vec<(Vec<F128>, F128)> {
     let mut pb = FieldR1csBuilder::new();
-    let mut out = Vec::new();
+    let mut obligations = Vec::new();
+    let mut natives = Vec::new();
     for (input, witness_proof) in inputs
         .authorization_inputs
         .iter()
         .zip(inputs.authorization_witnesses.iter())
     {
         let (_inputs_t, obligation) = build_owner_auth_slot(&mut pb, witness_proof, &input.public);
-        for c in
-            discharge_auth_pcs_obligation_via_region(&mut pb, &obligation, &witness_proof.pcs, params)
-        {
-            out.push((c.native_point, c.native_value));
-        }
+        obligations.push(obligation);
+        natives.push(witness_proof.pcs.clone());
     }
-    out
+    if obligations.is_empty() {
+        return Vec::new();
+    }
+    // ONE tiled plural discharge -- the same call the real block-slots build makes.
+    // The region `(point, value)` depend only on each tx's obligation + native
+    // proof (not on the wire positions or the [B] killshots), so they are
+    // identical to the full build; only the committed-column SLICES differ (the
+    // link takes those from the real build).
+    discharge_auth_pcs_obligations_via_region(&mut pb, &obligations, &natives, params)
+        .into_iter()
+        .map(|c| (c.native_point, c.native_value))
+        .collect()
 }
