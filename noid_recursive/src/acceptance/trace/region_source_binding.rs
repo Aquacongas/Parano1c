@@ -2571,6 +2571,125 @@ mod stage1_leaf_union_tests {
         assert!(!claims.is_empty());
     }
 
+    /// The multi-tile leaf union discharged through the REAL outer PCS: every
+    /// tile's committed columns live as witness slices, the union's whole claim
+    /// DAG is replayed in-trace, and `prove/verify_field_with_public_io` turns
+    /// each pending terminal into an opening claim against the committed witness.
+    /// A committed lane the prover flips afterward makes exactly one opening
+    /// claim false — the BaseFold layer rejects it. This is the in-trace
+    /// analogue of `region_merkle_slot_e2e` for the data-parallel leaf union:
+    /// the discharge→PCS path the multi-tx wallet-PCS assembly rests on, proven
+    /// end to end at multi-tile (multi-tx) scale.
+    #[test]
+    fn leaf_union_slot_end_to_end() {
+        use noid_ivc_core::challenger::FsLaneChallenger;
+        use noid_ivc_core::pcs::{self, PcsParams};
+        use noid_ivc_core::public_io::{IoClaimSpec, PublicIoSpec};
+        use noid_ivc_core::verifier::verify_field_with_public_io;
+        use noid_ivc_prover::field_prover::prove_field_with_public_io;
+
+        const OUTER: &[u8] = b"leaf-union-slot-outer";
+        let tiles = mixed_tiles(4); // 4 tiles = a multi-tx leaf union (2 source, 2 high-pair)
+        let u = build_leaf_union(&tiles);
+        let native = run_leaf_union_native(&u, b"leaf-union-slot");
+        let w_log = u.w_log;
+
+        let mut b = FieldR1csBuilder::new();
+        let col_data: [&[F128]; 6] = [
+            &u.cols.in_[0],
+            &u.cols.in_[1],
+            &u.cols.c[0],
+            &u.cols.c[1],
+            &u.cols.c[2],
+            &u.cols.c[3],
+        ];
+        let slices: Vec<WitnessSlice> =
+            col_data.iter().map(|c| alloc_column_slice(&mut b, c, w_log).0).collect();
+        let (claims, _digest_wires) =
+            discharge_leaf_union(&mut b, w_log, b"leaf-union-slot", &native, 0, &u.digests);
+
+        // IO slice: (native_point ‖ native_value) per claim; the trace's replayed
+        // (point, value) wires pin to it, and the spec derives one opening claim
+        // per entry against the claim's committed column slice.
+        let lanes_per_claim = w_log + 1;
+        let io_len = claims.len() * lanes_per_claim;
+        let io_log = io_len.next_power_of_two().trailing_zeros() as usize;
+        let mut io_values = Vec::with_capacity(io_len);
+        for c in &claims {
+            assert_eq!(c.native_point.len(), w_log, "claim point arity");
+            io_values.extend_from_slice(&c.native_point);
+            io_values.push(c.native_value);
+        }
+        let (io_slice, io_wires) = alloc_column_slice(&mut b, &io_values, io_log);
+        for (ci, c) in claims.iter().enumerate() {
+            let base = ci * lanes_per_claim;
+            for (k, p) in c.point.iter().enumerate() {
+                pin_eq(&mut b, p, &io_wires[base + k]);
+            }
+            pin_eq(&mut b, &c.value, &io_wires[base + w_log]);
+        }
+        let spec = PublicIoSpec {
+            io_slice,
+            io_len,
+            claims: claims
+                .iter()
+                .enumerate()
+                .map(|(ci, c)| IoClaimSpec {
+                    slice: slices[c.slice],
+                    point: ci * lanes_per_claim..ci * lanes_per_claim + w_log,
+                    value: ci * lanes_per_claim + w_log,
+                })
+                .collect(),
+        };
+
+        let (r1cs, z) = b.build();
+        assert!(r1cs.satisfies(&z), "honest leaf-union trace unsatisfiable");
+        let params = PcsParams {
+            m: r1cs.m + pcs::LOG_PACKING,
+            log_inv_rate: 2,
+            log_batch_size: 2,
+            profile: Default::default(),
+        };
+        let mut ch_p = FsLaneChallenger::new(OUTER);
+        let (proof, commitment, _) =
+            prove_field_with_public_io(&r1cs, &z, &params, &spec, &io_values, &mut ch_p);
+        let mut ch_v = FsLaneChallenger::new(OUTER);
+        verify_field_with_public_io(&r1cs, &commitment, &proof, &spec, &io_values, &mut ch_v)
+            .expect("the leaf-union slot proof verifies");
+        eprintln!(
+            "[leaf-union-slot] tiles={}, rows={} (m={}), opening claims={}",
+            tiles.len(),
+            z.len(),
+            r1cs.m,
+            spec.claims.len()
+        );
+
+        // The money negative: flip ONE committed C0 lane. The trace stays
+        // satisfiable (columns are free wires, bound only by opening claims) and
+        // the envelope is unchanged, but the opening claim against the flipped
+        // column is now FALSE — the PCS layer must reject.
+        let mut bad_z = z.clone();
+        let c0 = slices[2]; // C0
+        bad_z[c0.start() + 5] += F128::ONE;
+        assert!(r1cs.satisfies(&bad_z), "committed columns are free wires");
+        let mut ch_p = FsLaneChallenger::new(OUTER);
+        let (bad_proof, bad_commitment, _) =
+            prove_field_with_public_io(&r1cs, &bad_z, &params, &spec, &io_values, &mut ch_p);
+        let mut ch_v = FsLaneChallenger::new(OUTER);
+        assert!(
+            verify_field_with_public_io(
+                &r1cs,
+                &bad_commitment,
+                &bad_proof,
+                &spec,
+                &io_values,
+                &mut ch_v
+            )
+            .is_err(),
+            "a flipped committed column lane must break its opening claim"
+        );
+    }
+
     /// Transaction-count independence: doubling the tile count raises the domain
     /// by one bit, so the ONE walk gains exactly one sumcheck round —
     /// logarithmic, not the K-fold of K separate per-tx walks.
