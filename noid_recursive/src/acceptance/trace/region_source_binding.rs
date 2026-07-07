@@ -210,77 +210,154 @@ pub fn discharge_auth_pcs_obligations_via_region(
     assert!(!obligations.is_empty(), "at least one obligation");
     // TODO(step 4 Stage 1): generalize the body below to K txs (tile walk A/B at
     // common-period offsets, K exposures, per-tx algebra loop). Currently K = 1.
-    assert_eq!(obligations.len(), 1, "multi-tx plural discharge not yet generalized");
-    let obligation = &obligations[0];
-    let native = &natives[0];
-    let num_vars = obligation.num_vars;
-    let proof = native;
-    // Shape checks (same contract as the inline discharge).
-    assert_eq!(proof.commitment.log_rows, num_vars);
-    assert_eq!(proof.commitment.n_cols, 1);
-    assert_eq!(obligation.reduction.point.len(), num_vars);
-    assert_eq!(
-        obligation.commitment_cap_lanes.len(),
-        proof.commitment.cap.hashes.len()
-    );
+    let k = obligations.len();
 
-    // Recover the NATIVE reduction point (tower) from the obligation wires — the
-    // wallet-PCS was opened at exactly this point, so the source binding below
-    // reproduces the proof's roots (asserted). The wires carry φ(point); φ⁻¹ is
-    // flat->tower.
-    let point: Vec<Block128> = obligation
-        .reduction
-        .point
-        .iter()
-        .map(|e| {
-            let f = e.eval(b.values());
-            let flat = (f.lo as u128) | ((f.hi as u128) << 64);
-            Block128::from(flat_to_tower_u128(flat))
-        })
-        .collect();
-
+    // ===================================================================
+    // Class-level shapes (identical across the block's txs; the class is
+    // shape-fixed, so tx 0 defines the whole layout).
+    // ===================================================================
+    let num_vars = obligations[0].num_vars;
     let nq = params.nq;
-    let log_n = proof.commitment.log_rows;
+    let log_n = natives[0].commitment.log_rows;
     let tau = COMPACT_TAU.min(log_n);
     let n_rounds = log_n - tau;
     let ntt = AdditiveNTT::<Block128>::new(num_vars + LOG_RATE);
-
-    let opening = &proof.opening;
-    let fri = &opening.fri_proof;
-    let src = &opening.source_proof;
-    let right_tower = &point[..n_rounds];
-
-    // Source tree (SB1.2): Code(H·eq_right) → φ into the flat basis.
-    let eq_r = eq_tensor_tower(right_tower);
-    let g: Vec<Block128> = src.h_evals.iter().zip(eq_r.iter()).map(|(&h, &e)| h * e).collect();
-    let g_code = Code::new_parallel(&g, &ntt);
-    let g_code_flat: Vec<F128> = g_code.encoding.iter().map(|&bb| phi(bb)).collect();
-    let tree = SourceTree { leaf_log: n_rounds + 1 };
-    assert_eq!(tree.code_len(), g_code_flat.len());
-    let st_wlog = tree.slots_log();
-    let st_slots = tree.n_slots();
-    let st_cols = build_source_tree_columns(&tree, &g_code_flat, st_wlog);
-    let st_code_cols = build_source_code_columns(&tree, &g_code_flat, st_wlog);
-    let fri_root0 = lanes_flat(&fri.fri_roots[0]);
-    assert_eq!(st_cols.root, fri_root0, "region tree root != φ(fri_roots[0])");
-
-    // -------------------------------------------------------------------
-    // Family layout in ONE meta domain (all clean-start; source_tree at 0).
-    // -------------------------------------------------------------------
     let leaf_chain = SourceLeafChain { n_cols: 1 };
     let hp_chain = high_pair_leaf_chain();
     let leaf_stride = leaf_chain.stride();
     let leaf_stride_log = leaf_stride.trailing_zeros() as usize;
     assert_eq!(leaf_stride, hp_chain.stride());
-
     let n_layers = tau.saturating_sub(1);
     let n_leaf_families = 1 + n_layers;
     let leaf_family_slots = nq * leaf_stride;
+    let tree = SourceTree { leaf_log: n_rounds + 1 };
+    let st_wlog = tree.slots_log();
+    let st_slots = tree.n_slots();
+    let l = tree.leaf_count();
 
-    let total = st_slots + n_leaf_families * leaf_family_slots;
-    let w_log = total.next_power_of_two().trailing_zeros() as usize;
+    // Walk-A domain: `[tx_hi | within-tx block]`. Every tx's source tree +
+    // leaf families occupy one power-of-two block; the K blocks tile the domain,
+    // so common-period patterns (period = the block) cover every tx.
+    let per_tx_a = st_slots + n_leaf_families * leaf_family_slots;
+    let block_log_a = per_tx_a.next_power_of_two().trailing_zeros() as usize;
+    let per_tx_block_a = 1usize << block_log_a;
+    let w_log = (k * per_tx_block_a).next_power_of_two().trailing_zeros() as usize;
     let p = 1usize << w_log;
-    let leaf_base = |f: usize| st_slots + f * leaf_family_slots;
+    let leaf_base = |f: usize| st_slots + f * leaf_family_slots; // within a tx block
+
+    // Walk-B leg layout (class constant): the 3i pair-leaf at `[0, nq)`, then the
+    // legs at `meta_bases[f]`, all within a per-tx block.
+    let round = 0usize;
+    let sb6_walk_depth = source_tree_depth(log_n) - source_cap_depth(log_n);
+    assert!(params.sb8_auth_layers <= n_layers, "sb8_auth_layers exceeds available fold layers");
+    let sb8_auth_layers: Vec<usize> = (0..params.sb8_auth_layers).map(|kk| n_layers - 1 - kk).collect();
+    let mut leg_depths: Vec<usize> = vec![compute_round_depth(n_rounds, round), sb6_walk_depth];
+    for &layer in &sb8_auth_layers {
+        leg_depths.push(high_pair_tree_depth(log_n - 1 - layer));
+    }
+    let n_legs = leg_depths.len();
+    let mut meta_bases = Vec::with_capacity(n_legs);
+    let mut acc = nq;
+    for &d in &leg_depths {
+        meta_bases.push(acc);
+        acc += nq * (2 * d).next_power_of_two();
+    }
+    let per_tx_b = acc;
+    let block_log_b = per_tx_b.next_power_of_two().trailing_zeros() as usize;
+    let per_tx_block_b = 1usize << block_log_b;
+    let w_log_b = (k * per_tx_block_b).next_power_of_two().trailing_zeros() as usize;
+    let pb = 1usize << w_log_b;
+    let n_committed_b = 6 + 5 * n_legs;
+    let region_pair = 0usize;
+    let pair_refs = pair_leaf_refs(0);
+    let iv_b = compress_iv_flat();
+    let hasher = Poseidon2bSponge::new();
+
+    // ===================================================================
+    // Shared columns (K-wide), ghost-filled once with perm([0;4]).
+    // ===================================================================
+    let mut cols: Vec<Vec<F128>> = (0..N_COMMITTED).map(|_| vec![F128::ZERO; p]).collect();
+    let mut s0: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; p]);
+    let mut s_out: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; p]);
+    let (ghost_s0, ghost_out) =
+        noid_ivc_core::deep_chain::source_tree::run_perm([F128::ZERO; STATE_SIZE]);
+    for slot in 0..p {
+        for j in 0..STATE_SIZE {
+            s0[j][slot] = ghost_s0[j];
+            s_out[j][slot] = ghost_out[j];
+            cols[C0 + j][slot] = ghost_out[j];
+        }
+    }
+    let mut cb: Vec<Vec<F128>> = (0..n_committed_b).map(|_| vec![F128::ZERO; pb]).collect();
+    let mut s0b: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; pb]);
+    let mut soutb: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; pb]);
+    let (ghb0, ghbo) = noid_ivc_core::deep_chain::source_tree::run_perm([F128::ZERO; STATE_SIZE]);
+    for slot in 0..pb {
+        for j in 0..STATE_SIZE {
+            s0b[j][slot] = ghb0[j];
+            soutb[j][slot] = ghbo[j];
+            cb[2 + j][slot] = ghbo[j];
+        }
+    }
+
+    // ===================================================================
+    // Accumulators filled by the per-tx loop, assembled after it.
+    // ===================================================================
+    let mut claims: Vec<Claim> = Vec::new(); // walk-A-indexed
+    let mut claims_b: Vec<Claim> = Vec::new(); // walk-B-indexed (fold join)
+    let mut expo_specs: Vec<ExpoSpec> = Vec::new();
+    let mut expo_store: Vec<[Vec<F128>; 4]> = Vec::new();
+    // Per-leg-type walk-B accumulators (each grows to K*nq across the loop).
+    let mut acc_entry_vals: Vec<Vec<[F128; 2]>> = vec![Vec::new(); n_legs];
+    let mut acc_committed_roots: Vec<Vec<[F128; 2]>> = vec![Vec::new(); n_legs];
+    let mut acc_recomputed_roots: Vec<Vec<[F128; 2]>> = vec![Vec::new(); n_legs];
+    let mut acc_entry_wires: Vec<Vec<[LinExpr; 2]>> = vec![Vec::new(); n_legs];
+    let mut acc_root_wires: Vec<Vec<[LinExpr; 2]>> = vec![Vec::new(); n_legs];
+    let mut acc_path_slots: Vec<Vec<usize>> = vec![Vec::new(); n_legs];
+    let mut acc_pair_map: Vec<usize> = Vec::new(); // leg 0 (3i): path -> pair index
+    let mut pair_digests: Vec<[F128; 2]> = Vec::new();
+    let mut pair_slots: Vec<usize> = Vec::new();
+    let mut all_expands_ok = true;
+
+    for tx in 0..k {
+        let obligation = &obligations[tx];
+        let native = &natives[tx];
+        let proof = native;
+        let tx_off_a = tx * per_tx_block_a;
+        let tx_off_b = tx * per_tx_block_b;
+        // Shape checks (same contract as the inline discharge).
+        assert_eq!(proof.commitment.log_rows, num_vars);
+        assert_eq!(proof.commitment.n_cols, 1);
+        assert_eq!(obligation.reduction.point.len(), num_vars);
+        assert_eq!(obligation.commitment_cap_lanes.len(), proof.commitment.cap.hashes.len());
+
+        // Recover the NATIVE reduction point (tower) from the obligation wires.
+        let point: Vec<Block128> = obligation
+            .reduction
+            .point
+            .iter()
+            .map(|e| {
+                let f = e.eval(b.values());
+                let flat = (f.lo as u128) | ((f.hi as u128) << 64);
+                Block128::from(flat_to_tower_u128(flat))
+            })
+            .collect();
+
+        let opening = &proof.opening;
+        let fri = &opening.fri_proof;
+        let src = &opening.source_proof;
+        let right_tower = &point[..n_rounds];
+
+        // Source tree (SB1.2): Code(H·eq_right) → φ into the flat basis.
+        let eq_r = eq_tensor_tower(right_tower);
+        let g: Vec<Block128> = src.h_evals.iter().zip(eq_r.iter()).map(|(&h, &e)| h * e).collect();
+        let g_code = Code::new_parallel(&g, &ntt);
+        let g_code_flat: Vec<F128> = g_code.encoding.iter().map(|&bb| phi(bb)).collect();
+        assert_eq!(tree.code_len(), g_code_flat.len());
+        let st_cols = build_source_tree_columns(&tree, &g_code_flat, st_wlog);
+        let st_code_cols = build_source_code_columns(&tree, &g_code_flat, st_wlog);
+        let fri_root0 = lanes_flat(&fri.fri_roots[0]);
+        assert_eq!(st_cols.root, fri_root0, "region tree root != φ(fri_roots[0])");
 
     // -------------------------------------------------------------------
     // Drive the REAL FRICHANL channel from the obligation's absorbed cap +
@@ -378,30 +455,18 @@ pub fn discharge_auth_pcs_obligations_via_region(
     assert_eq!(h_code_w.len(), h_code.encoding.len());
 
     // -------------------------------------------------------------------
-    // Build the meta committed columns from the real source binding.
+    // Fill this tx's meta columns (source_tree at the tx block start, leaves
+    // after it) into the shared K-wide walk-A columns.
     // -------------------------------------------------------------------
-    let mut cols: Vec<Vec<F128>> = (0..N_COMMITTED).map(|_| vec![F128::ZERO; p]).collect();
-    let mut s0: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; p]);
-    let mut s_out: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; p]);
-    let (ghost_s0, ghost_out) =
-        noid_ivc_core::deep_chain::source_tree::run_perm([F128::ZERO; STATE_SIZE]);
-    for slot in 0..p {
-        for j in 0..STATE_SIZE {
-            s0[j][slot] = ghost_s0[j];
-            s_out[j][slot] = ghost_out[j];
-            cols[C0 + j][slot] = ghost_out[j];
-        }
-    }
-
-    // Source_tree at [0, st_slots).
+    // Source_tree at [tx_off_a, tx_off_a + st_slots).
     for j in 0..2 {
-        cols[CODE0 + j][0..st_slots].copy_from_slice(&st_code_cols[j]);
-        cols[KID0 + j][0..st_slots].copy_from_slice(&st_cols.kid[j]);
+        cols[CODE0 + j][tx_off_a..tx_off_a + st_slots].copy_from_slice(&st_code_cols[j]);
+        cols[KID0 + j][tx_off_a..tx_off_a + st_slots].copy_from_slice(&st_cols.kid[j]);
     }
     for j in 0..STATE_SIZE {
-        cols[C0 + j][0..st_slots].copy_from_slice(&st_cols.c[j]);
-        s0[j][0..st_slots].copy_from_slice(&st_cols.s0[j]);
-        s_out[j][0..st_slots].copy_from_slice(&st_cols.s_out[j]);
+        cols[C0 + j][tx_off_a..tx_off_a + st_slots].copy_from_slice(&st_cols.c[j]);
+        s0[j][tx_off_a..tx_off_a + st_slots].copy_from_slice(&st_cols.s0[j]);
+        s_out[j][tx_off_a..tx_off_a + st_slots].copy_from_slice(&st_cols.s_out[j]);
     }
 
     // Source query -> source pair indices; source symbols. The bit-wire twin
@@ -414,8 +479,8 @@ pub fn discharge_auth_pcs_obligations_via_region(
         .map(|q| high_pair_leaf_index_bits(&query_bits[q], log_n))
         .collect();
 
-    // SB6 source-leaf family (family 0): nq tiles.
-    let sb6_base = leaf_base(0);
+    // SB6 source-leaf family (family 0): nq tiles at this tx's block.
+    let sb6_base = tx_off_a + leaf_base(0);
     let mut sb6_syms: Vec<[F128; 2]> = Vec::with_capacity(nq);
     let mut sb6_digest_vals: Vec<[F128; 2]> = Vec::with_capacity(nq);
     for q in 0..nq {
@@ -460,7 +525,7 @@ pub fn discharge_auth_pcs_obligations_via_region(
 
     let mut sb8_digest_vals: Vec<Vec<[F128; 2]>> = Vec::with_capacity(n_layers);
     for (layer, ld) in layers.iter().enumerate() {
-        let base = leaf_base(layer + 1);
+        let base = tx_off_a + leaf_base(layer + 1);
         let mut layer_digests: Vec<[F128; 2]> = Vec::with_capacity(nq);
         for q in 0..nq {
             let (s0v, s1v) = ld.syms[q];
@@ -485,77 +550,25 @@ pub fn discharge_auth_pcs_obligations_via_region(
         sb8_digest_vals.push(layer_digests);
     }
 
-    // -------------------------------------------------------------------
-    // Fixed patterns (localized) + refs.
-    // -------------------------------------------------------------------
-    let iv = compress_iv_flat();
-    let mut fixed: Vec<FixedPattern> = Vec::new();
-    for pat in source_tree_fixed_patterns(&tree, iv) {
-        fixed.push(localize(&pat.table, 0, w_log));
-    }
-    for f in 0..n_leaf_families {
-        let base = leaf_base(f);
-        for pat in source_leaf_fixed_patterns(&leaf_chain, iv) {
-            fixed.push(localize_tiled(&pat.table, base, nq, w_log));
-        }
-    }
-
-    let st_refs = SourceTreeRefs {
-        code: [CODE0, CODE0 + 1],
-        kid: [KID0, KID0 + 1],
-        c: std::array::from_fn(|i| C0 + i),
-        even_int: 0,
-        odd_int: 1,
-        leafodd: 2,
-        iv: [3, 4],
-    };
-    let leaf_refs: Vec<SourceLeafRefs> = (0..n_leaf_families)
-        .map(|f| SourceLeafRefs {
-            in_: [IN0, IN0 + 1],
-            c: std::array::from_fn(|i| C0 + i),
-            hp: 5 + f * 5,
-            even: 5 + f * 5 + 1,
-            odd: 5 + f * 5 + 2,
-            iv: [5 + f * 5 + 3, 5 + f * 5 + 4],
-        })
-        .collect();
-
-    // -------------------------------------------------------------------
-    // Native union DAG (exposure over source_tree's own 16-view).
-    // -------------------------------------------------------------------
+    // Accumulate this tx's source-tree exposure (bound after the loop, in walk
+    // A). The high point bits place its KID/C claims in this tx's block:
+    // zeros(block_log_a - st_wlog) then the tx-index bits.
     let half = 1usize << (st_wlog - 1);
     let kid_lo0: Vec<F128> = st_cols.kid[0][..half].to_vec();
     let kid_lo1: Vec<F128> = st_cols.kid[1][..half].to_vec();
-    let committed: Vec<&[F128]> = cols.iter().map(|c| c.as_slice()).collect();
-    // K = 1: one source tree at block 0, so the exposure's high point bits are all
-    // zeros (the plural discharge sets them to each tx's block index).
-    let expo_specs = vec![ExpoSpec {
-        kid_meta: [KID0, KID0 + 1],
-        c_meta: [C0, C0 + 1],
-        high_bits: vec![F128::ZERO; w_log - st_wlog],
-    }];
-    let native_u = {
-        let expo_cols: [&[F128]; 4] = [&kid_lo0, &kid_lo1, &st_cols.c[0], &st_cols.c[1]];
-        let expos_run = vec![(expo_specs[0].clone(), expo_cols)];
-        run_union_native(
-            &committed, &s0, &s_out, &fixed, &st_refs, &leaf_refs, w_log, &expos_run, st_wlog,
-        )
-    };
+    let mut high_bits = vec![F128::ZERO; block_log_a - st_wlog];
+    for bit in 0..(w_log - block_log_a) {
+        high_bits.push(if (tx >> bit) & 1 == 1 { F128::ONE } else { F128::ZERO });
+    }
+    expo_specs.push(ExpoSpec { kid_meta: [KID0, KID0 + 1], c_meta: [C0, C0 + 1], high_bits });
+    expo_store.push([kid_lo0, kid_lo1, st_cols.c[0].clone(), st_cols.c[1].clone()]);
 
     // -------------------------------------------------------------------
-    // Allocate the walk-A committed slices, then discharge.
+    // Grand pins: SB1.2 CODE + root; SB7->SB9 fold chain (walk-A-indexed
+    // claims, accumulated per tx). Slots are absolute (tx block offset).
     // -------------------------------------------------------------------
-    let mut slices: Vec<WitnessSlice> =
-        cols.iter().map(|c| alloc_column_slice(b, c, w_log).0).collect();
-
-    let mut claims = discharge_union(b, &fixed, &st_refs, &leaf_refs, w_log, st_wlog, &expo_specs, &native_u);
-
-    // -------------------------------------------------------------------
-    // Grand pins: SB1.2 CODE + root; SB7->SB9 fold chain.
-    // -------------------------------------------------------------------
-    let l = tree.leaf_count();
     for i in 0..l {
-        let slot = 2 * (l + i) + 1;
+        let slot = tx_off_a + 2 * (l + i) + 1;
         let (pt_lin, pt_nat) = slot_point(slot, w_log);
         for lane in 0..2 {
             claims.push(Claim {
@@ -567,7 +580,7 @@ pub fn discharge_auth_pcs_obligations_via_region(
             });
         }
     }
-    let (rp_lin, rp_nat) = slot_point(3, w_log);
+    let (rp_lin, rp_nat) = slot_point(tx_off_a + 3, w_log);
     for lane in 0..2 {
         claims.push(Claim {
             slice: C0 + lane,
@@ -613,7 +626,7 @@ pub fn discharge_auth_pcs_obligations_via_region(
     let mut cur_idx = current.clone();
     let mut cur_bits = source_pair_bits.clone();
     for (layer, ld) in layers.iter().enumerate() {
-        let base = leaf_base(layer + 1);
+        let base = tx_off_a + leaf_base(layer + 1);
         let r = &beta[tau - 2 - layer];
         let mut next_w: Vec<LinExpr> = Vec::with_capacity(nq);
         let mut next_bits: Vec<Vec<LinExpr>> = Vec::with_capacity(nq);
@@ -710,7 +723,7 @@ pub fn discharge_auth_pcs_obligations_via_region(
         (0..params.sb8_auth_layers).map(|k| n_layers - 1 - k).collect();
     let mut sb8_digest_wires: Vec<Vec<[LinExpr; 2]>> = Vec::new();
     for &layer in &sb8_auth_layers {
-        let base = leaf_base(layer + 1);
+        let base = tx_off_a + leaf_base(layer + 1);
         let mut lw = Vec::with_capacity(nq);
         for q in 0..nq {
             let slot = base + q * leaf_stride + digest_slot;
@@ -733,13 +746,10 @@ pub fn discharge_auth_pcs_obligations_via_region(
     }
 
     // ===================================================================
-    // WALK B — the merkle-union: 3i / SB6-to-cap / SB8 legs. Root claim VALUES
-    // are the FS-OBSERVED root wires (transcript-bound).
+    // WALK B (per tx): pair-leaf at [tx_off_b, tx_off_b + nq), the three Merkle
+    // legs at tx_off_b + meta_base(f); accumulate per-leg-type across txs. Root
+    // claim VALUES are the FS-observed root wires (transcript-bound).
     // ===================================================================
-    let hasher = Poseidon2bSponge::new();
-    let iv_b = compress_iv_flat();
-    let round = 0usize;
-
     let fri_pair_indices: Vec<usize> =
         fri_queries[..nq].iter().map(|&qi| (qi >> round) >> 1).collect();
     let fri_pairs: Vec<(F128, F128)> = (0..nq)
@@ -749,49 +759,19 @@ pub fn discharge_auth_pcs_obligations_via_region(
         })
         .collect();
     let pair_wlog = nq.trailing_zeros() as usize;
-    let (pair_cols, pair_digests) = build_pair_leaf_columns(&fri_pairs, pair_wlog);
-
-    let sb6_walk_depth = source_tree_depth(log_n) - source_cap_depth(log_n);
-    let mut leg_depths: Vec<usize> = vec![compute_round_depth(n_rounds, round), sb6_walk_depth];
-    for &layer in &sb8_auth_layers {
-        leg_depths.push(high_pair_tree_depth(log_n - 1 - layer));
-    }
-    let n_legs = leg_depths.len();
-
-    let mut meta_bases = Vec::with_capacity(n_legs);
-    let mut acc = nq;
-    for &d in &leg_depths {
-        meta_bases.push(acc);
-        acc += nq * (2 * d).next_power_of_two();
-    }
-    let w_log_b = acc.next_power_of_two().trailing_zeros() as usize;
-    let pb = 1usize << w_log_b;
-    let n_committed_b = 6 + 5 * n_legs;
-    let region_pair = 0usize;
-    let pair_refs = pair_leaf_refs(0);
-
-    let mut cb: Vec<Vec<F128>> = (0..n_committed_b).map(|_| vec![F128::ZERO; pb]).collect();
-    let mut s0b: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; pb]);
-    let mut soutb: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; pb]);
-    let (ghb0, ghbo) = noid_ivc_core::deep_chain::source_tree::run_perm([F128::ZERO; STATE_SIZE]);
-    for slot in 0..pb {
-        for j in 0..STATE_SIZE {
-            s0b[j][slot] = ghb0[j];
-            soutb[j][slot] = ghbo[j];
-            cb[2 + j][slot] = ghbo[j];
-        }
-    }
+    let (pair_cols, tx_pair_digests) = build_pair_leaf_columns(&fri_pairs, pair_wlog);
     for j in 0..2 {
-        cb[j][0..nq].copy_from_slice(&pair_cols.in_[j][0..nq]);
+        cb[j][tx_off_b..tx_off_b + nq].copy_from_slice(&pair_cols.in_[j][0..nq]);
     }
     for j in 0..STATE_SIZE {
-        cb[2 + j][0..nq].copy_from_slice(&pair_cols.c[j][0..nq]);
-        s0b[j][0..nq].copy_from_slice(&pair_cols.s0[j][0..nq]);
-        soutb[j][0..nq].copy_from_slice(&pair_cols.s_out[j][0..nq]);
+        cb[2 + j][tx_off_b..tx_off_b + nq].copy_from_slice(&pair_cols.c[j][0..nq]);
+        s0b[j][tx_off_b..tx_off_b + nq].copy_from_slice(&pair_cols.s0[j][0..nq]);
+        soutb[j][tx_off_b..tx_off_b + nq].copy_from_slice(&pair_cols.s_out[j][0..nq]);
     }
-
-    let mut legs: Vec<MerkleLeg> = Vec::new();
-    let mut all_expands_ok = true;
+    for q in 0..nq {
+        pair_digests.push(tx_pair_digests[q]);
+        pair_slots.push(tx_off_b + q);
+    }
 
     // Leg 0: 3i FRI-round openings (single per-round root == fri_roots_w[round]).
     {
@@ -799,8 +779,6 @@ pub fn discharge_auth_pcs_obligations_via_region(
         let depth = leg_depths[f];
         let meta_base = meta_bases[f];
         let col_base = 6 + 5 * f;
-        let fixed_base = 1 + 9 * f;
-        let region = fixed_base + 8;
         let stride = (2 * depth).next_power_of_two();
         let n_slots = nq * stride;
         let fam_wlog = n_slots.trailing_zeros() as usize;
@@ -815,41 +793,28 @@ pub fn discharge_auth_pcs_obligations_via_region(
         all_expands_ok &= !paths.is_empty();
         let root_flat = lanes_flat(&fri.fri_roots[round]);
         let mut witnesses = Vec::with_capacity(nq);
-        let mut entry_vals = Vec::with_capacity(nq);
-        let mut committed_roots = Vec::with_capacity(nq);
         for q in 0..nq {
             let path = paths
                 .iter()
                 .find(|p| p.leaf_index == fri_pair_indices[q])
                 .expect("3i FRI path");
             let leaf_flat = lanes_flat(&path.leaf_hash);
-            assert_eq!(pair_digests[q], leaf_flat, "3i pair-leaf digest != φ(native leaf)");
+            assert_eq!(tx_pair_digests[q], leaf_flat, "3i pair-leaf digest != φ(native leaf)");
             witnesses.push(MerklePathWitness {
                 entry: leaf_flat,
                 siblings: path.siblings.iter().map(lanes_flat).collect(),
                 directions: path.directions.clone(),
             });
-            entry_vals.push(leaf_flat);
-            committed_roots.push(root_flat);
+            acc_entry_vals[f].push(leaf_flat);
+            acc_committed_roots[f].push(root_flat);
+            acc_root_wires[f].push(fri_roots_w[round].clone());
+            acc_path_slots[f].push(tx_off_b + meta_base + q * stride);
+            acc_pair_map.push(tx * nq + q);
         }
         let family = MerklePathFamily { depth, n_paths: nq };
         let mcols = build_merkle_path_columns(&family, iv_b, &witnesses, fam_wlog);
-        place_merkle(&mut cb, &mut s0b, &mut soutb, &mcols, col_base, meta_base, n_slots);
-        // TRANSCRIPT-BINDING: root == the FS-observed round root wire.
-        let root_wires: Vec<[LinExpr; 2]> = (0..nq).map(|_| fri_roots_w[round].clone()).collect();
-        legs.push(MerkleLeg {
-            family,
-            refs: union_merkle_refs(col_base, fixed_base),
-            region,
-            meta_base,
-            cols: mcols,
-            entry_vals,
-            committed_roots,
-            entry_wires: Vec::new(),
-            pair_entry_map: Some((0..nq).collect()),
-            root_wires,
-            path_slots: (0..nq).map(|q| meta_base + q * stride).collect(),
-        });
+        place_merkle(&mut cb, &mut s0b, &mut soutb, &mcols, col_base, tx_off_b + meta_base, n_slots);
+        acc_recomputed_roots[f].extend(mcols.roots.iter().copied());
     }
 
     // Leg 1: SB6 source-tree opening (authenticated to the committed CAP; the
@@ -859,8 +824,6 @@ pub fn discharge_auth_pcs_obligations_via_region(
         let depth = leg_depths[f];
         let meta_base = meta_bases[f];
         let col_base = 6 + 5 * f;
-        let fixed_base = 1 + 9 * f;
-        let region = fixed_base + 8;
         let stride = (2 * depth).next_power_of_two();
         let n_slots = nq * stride;
         let fam_wlog = n_slots.trailing_zeros() as usize;
@@ -906,9 +869,6 @@ pub fn discharge_auth_pcs_obligations_via_region(
             .map(|i| obligation.commitment_cap_lanes[cap_start + i][1].clone())
             .collect();
         let mut witnesses = Vec::with_capacity(nq);
-        let mut entry_vals = Vec::with_capacity(nq);
-        let mut committed_roots = Vec::with_capacity(nq);
-        let mut root_wires = Vec::with_capacity(nq);
         for q in 0..nq {
             let li = source_pair_indices[q];
             let path = paths.iter().find(|p| p.leaf_index == li).expect("SB6 source path");
@@ -920,9 +880,9 @@ pub fn discharge_auth_pcs_obligations_via_region(
                 siblings: path.siblings.iter().map(lanes_flat).collect(),
                 directions: path.directions.clone(),
             });
-            entry_vals.push(leaf_flat);
+            acc_entry_vals[f].push(leaf_flat);
             let cap_idx = li >> sb6_walk_depth;
-            committed_roots.push(cap_flat[cap_idx]);
+            acc_committed_roots[f].push(cap_flat[cap_idx]);
             // TRANSCRIPT-BINDING: root == the FS-observed source-cap lane, muxed
             // by the query-position bits (value-identical to the native index).
             assert!(
@@ -930,38 +890,26 @@ pub fn discharge_auth_pcs_obligations_via_region(
                 "SB6 cap index bit width"
             );
             let cap_bits = &source_pair_bits[q][sb6_walk_depth..sb6_walk_depth + cap_depth];
-            root_wires.push([
+            acc_root_wires[f].push([
                 select_by_bits(b, cap_bits, &cap_lane0),
                 select_by_bits(b, cap_bits, &cap_lane1),
             ]);
+            acc_entry_wires[f].push(sb6_digest_wires[q].clone());
+            acc_path_slots[f].push(tx_off_b + meta_base + q * stride);
         }
         let family = MerklePathFamily { depth, n_paths: nq };
         let mcols = build_merkle_path_columns(&family, iv_b, &witnesses, fam_wlog);
-        place_merkle(&mut cb, &mut s0b, &mut soutb, &mcols, col_base, meta_base, n_slots);
-        legs.push(MerkleLeg {
-            family,
-            refs: union_merkle_refs(col_base, fixed_base),
-            region,
-            meta_base,
-            cols: mcols,
-            entry_vals,
-            committed_roots,
-            entry_wires: sb6_digest_wires.clone(),
-            pair_entry_map: None,
-            root_wires,
-            path_slots: (0..nq).map(|q| meta_base + q * stride).collect(),
-        });
+        place_merkle(&mut cb, &mut s0b, &mut soutb, &mcols, col_base, tx_off_b + meta_base, n_slots);
+        acc_recomputed_roots[f].extend(mcols.roots.iter().copied());
     }
 
     // Legs 2..: SB8 high-fold layer openings (root == the FS-observed
     // folded_roots_w[layer] wire, absorbed before the source query draw).
-    for (k, &layer) in sb8_auth_layers.iter().enumerate() {
-        let f = 2 + k;
+    for (kk, &layer) in sb8_auth_layers.iter().enumerate() {
+        let f = 2 + kk;
         let depth = leg_depths[f];
         let meta_base = meta_bases[f];
         let col_base = 6 + 5 * f;
-        let fixed_base = 1 + 9 * f;
-        let region = fixed_base + 8;
         let stride = (2 * depth).next_power_of_two();
         let n_slots = nq * stride;
         let fam_wlog = n_slots.trailing_zeros() as usize;
@@ -990,8 +938,6 @@ pub fn discharge_auth_pcs_obligations_via_region(
         let root_flat = lanes_flat(&src.folded_roots[layer]);
         let chosen: Vec<usize> = layers[layer].pair_indices[..nq].to_vec();
         let mut witnesses = Vec::with_capacity(nq);
-        let mut entry_vals = Vec::with_capacity(nq);
-        let mut committed_roots = Vec::with_capacity(nq);
         for q in 0..nq {
             let li = chosen[q];
             let path = paths.iter().find(|p| p.leaf_index == li).expect("SB8 path");
@@ -1002,65 +948,22 @@ pub fn discharge_auth_pcs_obligations_via_region(
                 siblings: path.siblings.iter().map(lanes_flat).collect(),
                 directions: path.directions.clone(),
             });
-            entry_vals.push(leaf_flat);
-            committed_roots.push(root_flat);
+            acc_entry_vals[f].push(leaf_flat);
+            acc_committed_roots[f].push(root_flat);
+            // TRANSCRIPT-BINDING: root == the FS-observed folded-layer root wire.
+            acc_root_wires[f].push(folded_roots_w[layer].clone());
+            acc_entry_wires[f].push(sb8_digest_wires[kk][q].clone());
+            acc_path_slots[f].push(tx_off_b + meta_base + q * stride);
         }
         let family = MerklePathFamily { depth, n_paths: nq };
         let mcols = build_merkle_path_columns(&family, iv_b, &witnesses, fam_wlog);
-        place_merkle(&mut cb, &mut s0b, &mut soutb, &mcols, col_base, meta_base, n_slots);
-        // TRANSCRIPT-BINDING: root == the FS-observed folded-layer root wire.
-        let root_wires: Vec<[LinExpr; 2]> = (0..nq).map(|_| folded_roots_w[layer].clone()).collect();
-        legs.push(MerkleLeg {
-            family,
-            refs: union_merkle_refs(col_base, fixed_base),
-            region,
-            meta_base,
-            cols: mcols,
-            entry_vals,
-            committed_roots,
-            entry_wires: sb8_digest_wires[k].clone(),
-            pair_entry_map: None,
-            root_wires,
-            path_slots: (0..nq).map(|q| meta_base + q * stride).collect(),
-        });
+        place_merkle(&mut cb, &mut s0b, &mut soutb, &mcols, col_base, tx_off_b + meta_base, n_slots);
+        acc_recomputed_roots[f].extend(mcols.roots.iter().copied());
     }
 
-    // Fixed patterns: region_pair (0) + per leg [8 merkle patterns, region].
-    let mut fixed_b: Vec<FixedPattern> = Vec::new();
-    {
-        let mut t = vec![F128::ZERO; pb];
-        for s in 0..nq {
-            t[s] = F128::ONE;
-        }
-        fixed_b.push(FixedPattern::new(w_log_b, t));
-    }
-    for leg in &legs {
-        let n_slots = leg.family.n_slots();
-        for pat in merkle_fixed_patterns(&leg.family, iv_b) {
-            fixed_b.push(localize_tiled(&pat.table, leg.meta_base, leg.family.n_paths, w_log_b));
-        }
-        let mut t = vec![F128::ZERO; pb];
-        for s in leg.meta_base..leg.meta_base + n_slots {
-            t[s] = F128::ONE;
-        }
-        fixed_b.push(FixedPattern::new(w_log_b, t));
-    }
-
-    let committed_b: Vec<&[F128]> = cb.iter().map(|c| c.as_slice()).collect();
-    let native_b = run_merkle_union_native(
-        &committed_b, &s0b, &soutb, &fixed_b, &pair_refs, region_pair, &legs, w_log_b, DOMAIN_B,
-    );
-    let n_slices_a = slices.len();
-    let slices_b: Vec<WitnessSlice> =
-        cb.iter().map(|c| alloc_column_slice(b, c, w_log_b).0).collect();
-    let pair_slots: Vec<usize> = (0..nq).collect();
-    let (mut claims_b, _pair_digest_wires) = discharge_merkle_union(
-        b, &fixed_b, &pair_refs, region_pair, &legs, w_log_b, &native_b, &pair_digests, &pair_slots,
-        DOMAIN_B,
-    );
-
-    // FRI fold-join: the queried symbols == the pair-leaf IN columns, folded to
-    // the final codeword (round 0: no previous-round fold consistency).
+    // FRI fold-join (walk-B-indexed claims, per tx): the queried symbols == the
+    // pair-leaf IN columns, folded to the final codeword (round 0: no
+    // previous-round fold consistency).
     let final_len = fri.final_codeword.len();
     assert!(final_len.is_power_of_two(), "final codeword length power of two");
     let final_bits = final_len.trailing_zeros() as usize;
@@ -1068,7 +971,7 @@ pub fn discharge_auth_pcs_obligations_via_region(
         let (s0v, s1v) = fri.fri_queried_symbols[round][q];
         let s0w = LinExpr::from_wire(b.alloc_f128(phi(s0v)));
         let s1w = LinExpr::from_wire(b.alloc_f128(phi(s1v)));
-        let (pt_lin, pt_nat) = slot_point(q, w_log_b);
+        let (pt_lin, pt_nat) = slot_point(tx_off_b + q, w_log_b);
         claims_b.push(Claim {
             slice: pair_refs.in_[0],
             point: pt_lin.clone(),
@@ -1108,17 +1011,113 @@ pub fn discharge_auth_pcs_obligations_via_region(
         pin_eq(b, &folded, &sel);
     }
 
-    // Merge walk B into the global slice/claim tables.
-    for c in claims_b.iter_mut() {
+        // Close this tx's discharge contract: the batched primary opening ==
+        // the value the owner-auth killshot reduced to.
+        pin_eq(b, &all_openings[0], &obligation.reduction.value);
+    } // end `for tx in 0..k`
+
+    // ===================================================================
+    // Walk A (once): source_tree + leaf families over ALL K txs, common-period
+    // patterns, K per-tree exposures. The walk/substitution flatten; the K
+    // exposures are the only per-tx source-tree residual.
+    // ===================================================================
+    let iv = compress_iv_flat();
+    let mut fixed: Vec<FixedPattern> = Vec::new();
+    for pat in source_tree_fixed_patterns(&tree, iv) {
+        fixed.push(common_period_pattern(&pat.table, 0, 1, block_log_a));
+    }
+    for f in 0..n_leaf_families {
+        for pat in source_leaf_fixed_patterns(&leaf_chain, iv) {
+            fixed.push(common_period_pattern(&pat.table, leaf_base(f), nq, block_log_a));
+        }
+    }
+    let st_refs = SourceTreeRefs {
+        code: [CODE0, CODE0 + 1],
+        kid: [KID0, KID0 + 1],
+        c: std::array::from_fn(|i| C0 + i),
+        even_int: 0,
+        odd_int: 1,
+        leafodd: 2,
+        iv: [3, 4],
+    };
+    let leaf_refs: Vec<SourceLeafRefs> = (0..n_leaf_families)
+        .map(|f| SourceLeafRefs {
+            in_: [IN0, IN0 + 1],
+            c: std::array::from_fn(|i| C0 + i),
+            hp: 5 + f * 5,
+            even: 5 + f * 5 + 1,
+            odd: 5 + f * 5 + 2,
+            iv: [5 + f * 5 + 3, 5 + f * 5 + 4],
+        })
+        .collect();
+    let committed: Vec<&[F128]> = cols.iter().map(|c| c.as_slice()).collect();
+    let expos_run: Vec<(ExpoSpec, [&[F128]; 4])> = expo_specs
+        .iter()
+        .zip(expo_store.iter())
+        .map(|(s, c)| (s.clone(), [c[0].as_slice(), c[1].as_slice(), c[2].as_slice(), c[3].as_slice()]))
+        .collect();
+    let native_u = run_union_native(
+        &committed, &s0, &s_out, &fixed, &st_refs, &leaf_refs, w_log, &expos_run, st_wlog,
+    );
+    let mut slices: Vec<WitnessSlice> =
+        cols.iter().map(|c| alloc_column_slice(b, c, w_log).0).collect();
+    claims.extend(discharge_union(b, &fixed, &st_refs, &leaf_refs, w_log, st_wlog, &expo_specs, &native_u));
+
+    // ===================================================================
+    // Walk B (once): pair-leaf + the three Merkle legs over ALL K txs,
+    // common-period patterns. ONE MerkleLeg per leg-type from the accumulated
+    // K*nq paths.
+    // ===================================================================
+    let mut legs: Vec<MerkleLeg> = Vec::with_capacity(n_legs);
+    for f in 0..n_legs {
+        let depth = leg_depths[f];
+        let col_base = 6 + 5 * f;
+        let fixed_base = 1 + 9 * f;
+        legs.push(MerkleLeg {
+            family: MerklePathFamily { depth, n_paths: nq },
+            refs: union_merkle_refs(col_base, fixed_base),
+            region: fixed_base + 8,
+            entry_vals: std::mem::take(&mut acc_entry_vals[f]),
+            committed_roots: std::mem::take(&mut acc_committed_roots[f]),
+            entry_wires: std::mem::take(&mut acc_entry_wires[f]),
+            pair_entry_map: if f == 0 { Some(std::mem::take(&mut acc_pair_map)) } else { None },
+            root_wires: std::mem::take(&mut acc_root_wires[f]),
+            path_slots: std::mem::take(&mut acc_path_slots[f]),
+            recomputed_roots: std::mem::take(&mut acc_recomputed_roots[f]),
+        });
+    }
+    // Common-period patterns: pair-leaf region at [0, nq), then each leg's 8
+    // merkle patterns + a region selector at meta_bases[f], all periodic over the
+    // tx block.
+    let mut fixed_b: Vec<FixedPattern> = Vec::new();
+    fixed_b.push(common_period_ones(0, nq, block_log_b));
+    for f in 0..n_legs {
+        let family = MerklePathFamily { depth: leg_depths[f], n_paths: nq };
+        for pat in merkle_fixed_patterns(&family, iv_b) {
+            fixed_b.push(common_period_pattern(&pat.table, meta_bases[f], nq, block_log_b));
+        }
+        fixed_b.push(common_period_ones(meta_bases[f], family.n_slots(), block_log_b));
+    }
+    let committed_b: Vec<&[F128]> = cb.iter().map(|c| c.as_slice()).collect();
+    let native_b = run_merkle_union_native(
+        &committed_b, &s0b, &soutb, &fixed_b, &pair_refs, region_pair, &legs, w_log_b, DOMAIN_B,
+    );
+    let n_slices_a = slices.len();
+    let slices_b: Vec<WitnessSlice> =
+        cb.iter().map(|c| alloc_column_slice(b, c, w_log_b).0).collect();
+    let (mut wb_claims, _pair_digest_wires) = discharge_merkle_union(
+        b, &fixed_b, &pair_refs, region_pair, &legs, w_log_b, &native_b, &pair_digests, &pair_slots,
+        DOMAIN_B,
+    );
+    // Merge walk-B discharge claims + the per-tx fold-join claims (both
+    // walk-B-indexed) into the global tables.
+    wb_claims.extend(claims_b);
+    for c in wb_claims.iter_mut() {
         c.slice += n_slices_a;
     }
     slices.extend(slices_b);
-    claims.extend(claims_b);
+    claims.extend(wb_claims);
     assert!(all_expands_ok, "all real-sibling octopus expands returned non-empty paths");
-
-    // Close the discharge contract: the batched primary opening == the value the
-    // owner-auth killshot reduced to (inline discharge line 813-814).
-    pin_eq(b, &all_openings[0], &obligation.reduction.value);
 
     // Resolve each claim's column index into its committed WitnessSlice.
     claims
@@ -1143,9 +1142,13 @@ pub fn discharge_auth_pcs_obligations_via_region(
 // (`[tx_hi | schedule_lo]`). Columns (all length P): IN0=0, IN1=1, C0=2..C3=5.
 // ===========================================================================
 
-/// A leaf tile to place in the shared leaf-union domain.
-// Consumed by the multi-tx plural discharge (Stage 1 production integration,
-// landing next); `#[allow(dead_code)]` until that caller is wired.
+/// A leaf tile to place in the shared leaf-union domain. These
+/// (`build_leaf_union` / `run_leaf_union_native` / `discharge_leaf_union`) are
+/// the standalone leaf-ONLY union path — the plural discharge unions leaves WITH
+/// the source tree via `run_union_native`, so they are exercised only by the
+/// leaf-union unit gates (`leaf_union_slot_end_to_end` proves the discharge→PCS
+/// path in isolation); `#[allow(dead_code)]` marks them test-only in a release
+/// build.
 #[allow(dead_code)]
 pub(crate) enum LeafTile {
     /// SB6 source leaf: the `hash`/`compress` chain over two column-hash symbols.
@@ -1547,20 +1550,37 @@ fn slot_point(s: usize, w_log: usize) -> (Vec<LinExpr>, Vec<F128>) {
 /// Rebuild a per-family stride-period pattern as a META-period table by
 /// repeating its stride table `n_tiles` times starting at `base`, zero
 /// elsewhere; `low_log = meta_p_log` localizes it to `[base, base + n·stride)`.
-fn localize_tiled(stride_table: &[F128], base: usize, n_tiles: usize, meta_p_log: usize) -> FixedPattern {
-    let p = 1usize << meta_p_log;
+/// A COMMON-PERIOD pattern for the multi-tx tiling: place `stride_table`
+/// `n_tiles` times at `offset` within ONE per-tx block of `2^block_log` slots,
+/// `low_log = block_log`. Because the pattern is periodic over the tx block, it
+/// fires in every tx for free and its MLE cost is `O(2^block_log)` (flat in the
+/// tx count) — NOT the `O(2^w_log)` of a full-domain [`localize`].
+fn common_period_pattern(
+    stride_table: &[F128],
+    offset: usize,
+    n_tiles: usize,
+    block_log: usize,
+) -> FixedPattern {
+    let block = 1usize << block_log;
     let stride = stride_table.len();
-    let mut t = vec![F128::ZERO; p];
-    for tile in 0..n_tiles {
-        let off = base + tile * stride;
+    let mut t = vec![F128::ZERO; block];
+    for q in 0..n_tiles {
+        let off = offset + q * stride;
         t[off..off + stride].copy_from_slice(stride_table);
     }
-    FixedPattern::new(meta_p_log, t)
+    FixedPattern::new(block_log, t)
 }
 
-/// Localize a full-range (non-tiled) table into a META-period table at `base`.
-fn localize(table: &[F128], base: usize, meta_p_log: usize) -> FixedPattern {
-    localize_tiled(table, base, 1, meta_p_log)
+/// A common-period selector: `1` over `[offset, offset + len)` within a per-tx
+/// block of `2^block_log` slots, `low_log = block_log` (a region selector that
+/// fires in every tx).
+fn common_period_ones(offset: usize, len: usize, block_log: usize) -> FixedPattern {
+    let block = 1usize << block_log;
+    let mut t = vec![F128::ZERO; block];
+    for s in offset..offset + len {
+        t[s] = F128::ONE;
+    }
+    FixedPattern::new(block_log, t)
 }
 
 fn flat_mds_entry(e: usize, j: usize) -> F128 {
@@ -2059,8 +2079,6 @@ struct MerkleLeg {
     family: MerklePathFamily,
     refs: MerkleFamilyRefs,
     region: usize,
-    meta_base: usize,
-    cols: MerklePathColumns,
     entry_vals: Vec<[F128; 2]>,
     committed_roots: Vec<[F128; 2]>,
     entry_wires: Vec<[LinExpr; 2]>,
@@ -2076,6 +2094,10 @@ struct MerkleLeg {
     /// blocks (`tx*per_tx_block_B + meta_base + q*stride`), so the entry/root
     /// claim slots read from here rather than a contiguous `meta_base + p*stride`.
     path_slots: Vec<usize>,
+    /// The chain-replay-recomputed root per path (from `build_merkle_path_columns`),
+    /// asserted == `committed_roots` (native consistency of the path replay).
+    /// Accumulated across txs in the plural discharge.
+    recomputed_roots: Vec<[F128; 2]>,
 }
 
 fn union_bool_terms(legs: &[MerkleLeg]) -> Vec<RelationTerm> {
@@ -2509,7 +2531,7 @@ fn discharge_merkle_union(
             let (rpl, rpn) = slot_point(root_slot, w_log);
             for lane in 0..2 {
                 // Sanity: the family's recomputed root equals the committed one.
-                assert_eq!(leg.cols.roots[path][lane], leg.committed_roots[path][lane]);
+                assert_eq!(leg.recomputed_roots[path][lane], leg.committed_roots[path][lane]);
                 // TRANSCRIPT-BINDING: the root claim VALUE is the FS-observed
                 // root wire (`leg.root_wires`), NOT a fresh alloc of the root
                 // value. The recomputed root column at `root_slot` is thus opened
