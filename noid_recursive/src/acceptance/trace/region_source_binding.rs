@@ -318,8 +318,21 @@ pub fn discharge_auth_pcs_obligations_via_region(
     // resolve against `slices`; walk-B (fold-join) against `slices[n_slices_a+col]`.
     let mut cell_pins_a: Vec<(usize, usize, LinExpr)> = Vec::new();
     let mut cell_pins_b: Vec<(usize, usize, LinExpr)> = Vec::new();
-    let mut expo_specs: Vec<ExpoSpec> = Vec::new();
-    let mut expo_store: Vec<[Vec<F128>; 4]> = Vec::new();
+    // Tiled source-tree exposure: each tx appends its `kid_lo` (2^(st_wlog-1)) and
+    // full C (2^st_wlog) into these 4 columns; ONE sumcheck after the loop
+    // discharges every tree (`Window(C,1,1)` tiles since C's period is 2× KID's),
+    // re-pointing 4 terminal claims into walk-A — flat (O(1)) in tx count. Requires
+    // a power-of-two obligation count so the tiled tx bits align with walk-A's (the
+    // discharge pads a tier's real txs to next_pow2 with ghost obligations).
+    assert!(
+        k.is_power_of_two(),
+        "wallet-PCS region discharge expects a power-of-two obligation count \
+         (pad the tier's real txs with ghost obligations); got {k}"
+    );
+    let mut expo_kid0: Vec<F128> = Vec::new();
+    let mut expo_kid1: Vec<F128> = Vec::new();
+    let mut expo_c0: Vec<F128> = Vec::new();
+    let mut expo_c1: Vec<F128> = Vec::new();
     // Per-leg-type walk-B accumulators (each grows to K*nq across the loop).
     let mut acc_committed_roots: Vec<Vec<[F128; 2]>> = vec![Vec::new(); n_legs];
     let mut acc_recomputed_roots: Vec<Vec<[F128; 2]>> = vec![Vec::new(); n_legs];
@@ -632,18 +645,15 @@ pub fn discharge_auth_pcs_obligations_via_region(
         sb8_digest_vals.push(layer_digests);
     }
 
-    // Accumulate this tx's source-tree exposure (bound after the loop, in walk
-    // A). The high point bits place its KID/C claims in this tx's block:
-    // zeros(block_log_a - st_wlog) then the tx-index bits.
+    // Append this tx's source-tree exposure slice into the tiled columns (ONE
+    // sumcheck after the loop). `kid_lo` = the 2^(st_wlog-1) node digests; the
+    // full C carries them at odd slots (`Window(C,1,1)[w] = C[2w+1]`). Concatenated
+    // in tx order, the K trees tile at KID period 2L / C period 4L.
     let half = 1usize << (st_wlog - 1);
-    let kid_lo0: Vec<F128> = st_cols.kid[0][..half].to_vec();
-    let kid_lo1: Vec<F128> = st_cols.kid[1][..half].to_vec();
-    let mut high_bits = vec![F128::ZERO; block_log_a - st_wlog];
-    for bit in 0..(w_log - block_log_a) {
-        high_bits.push(if (tx >> bit) & 1 == 1 { F128::ONE } else { F128::ZERO });
-    }
-    expo_specs.push(ExpoSpec { kid_meta: [KID0, KID0 + 1], c_meta: [C0, C0 + 1], high_bits });
-    expo_store.push([kid_lo0, kid_lo1, st_cols.c[0].clone(), st_cols.c[1].clone()]);
+    expo_kid0.extend_from_slice(&st_cols.kid[0][..half]);
+    expo_kid1.extend_from_slice(&st_cols.kid[1][..half]);
+    expo_c0.extend_from_slice(&st_cols.c[0]);
+    expo_c1.extend_from_slice(&st_cols.c[1]);
 
     // -------------------------------------------------------------------
     // Grand pins: SB1.2 CODE + root; SB7->SB9 fold chain (walk-A-indexed
@@ -1063,17 +1073,22 @@ pub fn discharge_auth_pcs_obligations_via_region(
         })
         .collect();
     let committed: Vec<&[F128]> = cols.iter().map(|c| c.as_slice()).collect();
-    let expos_run: Vec<(ExpoSpec, [&[F128]; 4])> = expo_specs
-        .iter()
-        .zip(expo_store.iter())
-        .map(|(s, c)| (s.clone(), [c[0].as_slice(), c[1].as_slice(), c[2].as_slice(), c[3].as_slice()]))
-        .collect();
+    let expo_tiled = ExpoTiledSpec {
+        kid_meta: [KID0, KID0 + 1],
+        c_meta: [C0, C0 + 1],
+        tx_log: k.trailing_zeros() as usize,
+    };
+    let expo_cols: [&[F128]; 4] =
+        [expo_kid0.as_slice(), expo_kid1.as_slice(), expo_c0.as_slice(), expo_c1.as_slice()];
     let native_u = run_union_native(
-        &committed, &s0, &s_out, &fixed, &st_refs, &leaf_refs, w_log, &expos_run, st_wlog,
+        &committed, &s0, &s_out, &fixed, &st_refs, &leaf_refs, w_log, &expo_tiled, &expo_cols, st_wlog,
+        block_log_a,
     );
     let mut slices: Vec<WitnessSlice> =
         cols.iter().map(|c| alloc_column_slice(b, c, w_log).0).collect();
-    claims.extend(discharge_union(b, &fixed, &st_refs, &leaf_refs, w_log, st_wlog, &expo_specs, &native_u));
+    claims.extend(discharge_union(
+        b, &fixed, &st_refs, &leaf_refs, w_log, st_wlog, block_log_a, &expo_tiled, &native_u,
+    ));
 
     // ===================================================================
     // Walk B (once): pair-leaf + the three Merkle legs over ALL K txs,
@@ -1773,22 +1788,25 @@ struct UnionNative {
     walk_proof: DeepChainWalkProof,
     sub_proof: ColumnRelationProof,
     shifts: Vec<(usize, usize, ShiftDischargeProof)>,
-    /// One exposure proof per source tree (one per tx in the plural discharge).
-    expo_proofs: Vec<ColumnRelationProof>,
+    /// ONE tiled exposure proof over all K source trees (see [`ExpoTiledSpec`]).
+    expo_proof: ColumnRelationProof,
     pending: Vec<(usize, Vec<F128>, F128)>,
-    /// Exposure claims, all trees concatenated in tree order.
+    /// The 4 re-pointed exposure claims (KID0/1, C0/1), flat in tx count.
     expo_pending: Vec<(usize, Vec<F128>, F128)>,
 }
 
-/// One source-tree exposure's binding into the SHARED walk-A columns: which
-/// KID / C columns it opens, and the high point bits (positions `st_wlog..w_log`)
-/// that place its claims in this tree's tx block — `zeros(block_log − st_wlog)`
-/// then the tx-index bits. For K = 1 this is all zeros (the singular discharge).
-#[derive(Clone)]
-struct ExpoSpec {
+/// The tiled source-tree exposure binding into the SHARED walk-A columns. The K
+/// trees' `kid_lo` (period `2^(st_wlog-1)`) and full `C` (period `2^st_wlog`) are
+/// concatenated in tx order into ONE relation domain; `Window(C,1,1)[tx·2L+local]
+/// = C[tx·4L+2local+1]` tiles because C's period is 2× KID's. ONE sumcheck
+/// discharges all trees and its 4 terminal claims (KID0/1 plain, C0/1 via window)
+/// re-point into the shared walk-A KID/C columns at zero-bit-inserted points
+/// `[rho_local, ZERO, zeros(block_log_a − st_wlog), rho_tx]` — flat (O(1)) in tx
+/// count. `tx_log` = `log2` of the power-of-two tree count (= walk-A's tx bits).
+struct ExpoTiledSpec {
     kid_meta: [usize; 2],
     c_meta: [usize; 2],
-    high_bits: Vec<F128>,
+    tx_log: usize,
 }
 
 fn union_native_terms(
@@ -1812,8 +1830,10 @@ fn run_union_native(
     st_refs: &SourceTreeRefs,
     leaf_refs: &[SourceLeafRefs],
     w_log: usize,
-    expos: &[(ExpoSpec, [&[F128]; 4])],
+    expo: &ExpoTiledSpec,
+    expo_cols: &[&[F128]; 4],
     expo_wlog: usize,
+    block_log_a: usize,
 ) -> UnionNative {
     let internal: Vec<&[F128]> = s_out.iter().map(|c| c.as_slice()).collect();
     let mut ch_p = FsLaneChallenger::new(DOMAIN);
@@ -1896,49 +1916,52 @@ fn run_union_native(
         }
     }
 
-    // One exposure per source tree (per tx). Each runs on the tree's own
-    // kid_lo/C slice; its claims open the SHARED KID/C columns, the high point
-    // bits placing them in the tree's tx block.
-    let mut expo_proofs: Vec<ColumnRelationProof> = Vec::with_capacity(expos.len());
+    // ONE tiled exposure over all K source trees. The tiled KID/C columns
+    // (kid_lo period 2L, full C period 4L) discharge in a single sumcheck;
+    // `Window(C,1,1)` tiles because C's period is 2× KID's. The 4 terminal claims
+    // re-point into the shared walk-A KID/C columns via zero-bit insertion
+    // `[rho_local, ZERO, zeros(block_pad), rho_tx]` (window offset bits prepended
+    // for C) — one claim per lane, flat in tx count.
+    let expo_tiled_wlog = expo.tx_log + (expo_wlog - 1);
+    let block_pad = block_log_a - expo_wlog;
+    let gamma = ch_p.sample_f128();
+    assert_eq!(gamma, ch_v.sample_f128());
+    let expo_terms = source_tree_exposure_terms([0, 1], [2, 3], gamma);
+    let rho_e = ch_p.sample_f128_vec(expo_tiled_wlog);
+    let _ = ch_v.sample_f128_vec(expo_tiled_wlog);
+    let (expo_proof, _, _) = prove_column_relation(
+        F128::ZERO,
+        &rho_e,
+        &expo_terms,
+        &RelationColumns { committed: expo_cols, internal: &[], fixed: &[] },
+        &mut ch_p,
+    );
+    let expo_point =
+        verify_column_relation(expo_tiled_wlog, F128::ZERO, &rho_e, &expo_terms, &[], &expo_proof, &mut ch_v)
+            .expect("native tiled exposure");
+    let (rho_local, rho_tx) = expo_point.split_at(expo_wlog - 1);
     let mut expo_pending: Vec<(usize, Vec<F128>, F128)> = Vec::new();
-    for (spec, cols) in expos {
-        let gamma = ch_p.sample_f128();
-        assert_eq!(gamma, ch_v.sample_f128());
-        let expo_terms = source_tree_exposure_terms([0, 1], [2, 3], gamma);
-        let rho_e = ch_p.sample_f128_vec(expo_wlog - 1);
-        let _ = ch_v.sample_f128_vec(expo_wlog - 1);
-        let expo_committed: [&[F128]; 4] = *cols;
-        let (expo_proof, _, _) = prove_column_relation(
-            F128::ZERO,
-            &rho_e,
-            &expo_terms,
-            &RelationColumns { committed: &expo_committed, internal: &[], fixed: &[] },
-            &mut ch_p,
-        );
-        let expo_point =
-            verify_column_relation(expo_wlog - 1, F128::ZERO, &rho_e, &expo_terms, &[], &expo_proof, &mut ch_v)
-                .expect("native exposure");
-        for (r, v) in claimed_refs(&expo_terms).iter().zip(expo_proof.final_values.iter()) {
-            match r {
-                ColRef::Committed(ll) => {
-                    let mut pt = expo_point.clone();
-                    pt.push(F128::ZERO);
-                    pt.extend_from_slice(&spec.high_bits);
-                    expo_pending.push((spec.kid_meta[*ll], pt, *v));
-                }
-                ColRef::Window { col, stride_log, offset } => {
-                    let mut pt = window_discharge_point(*offset, *stride_log, &expo_point);
-                    pt.extend_from_slice(&spec.high_bits);
-                    expo_pending.push((spec.c_meta[*col - 2], pt, *v));
-                }
-                _ => unreachable!(),
+    for (r, v) in claimed_refs(&expo_terms).iter().zip(expo_proof.final_values.iter()) {
+        match r {
+            ColRef::Committed(ll) => {
+                let mut pt = rho_local.to_vec();
+                pt.push(F128::ZERO);
+                pt.extend(std::iter::repeat(F128::ZERO).take(block_pad));
+                pt.extend_from_slice(rho_tx);
+                expo_pending.push((expo.kid_meta[*ll], pt, *v));
             }
+            ColRef::Window { col, stride_log, offset } => {
+                let mut pt = window_discharge_point(*offset, *stride_log, rho_local);
+                pt.extend(std::iter::repeat(F128::ZERO).take(block_pad));
+                pt.extend_from_slice(rho_tx);
+                expo_pending.push((expo.c_meta[*col - 2], pt, *v));
+            }
+            _ => unreachable!(),
         }
-        expo_proofs.push(expo_proof);
     }
 
     assert_eq!(ch_p.sample_f128(), ch_v.sample_f128(), "native lockstep");
-    UnionNative { sel_proof, walk_proof, sub_proof, shifts, expo_proofs, pending, expo_pending }
+    UnionNative { sel_proof, walk_proof, sub_proof, shifts, expo_proof, pending, expo_pending }
 }
 
 /// Trace twin of `union_native_terms` with α-power MDS coefficients.
@@ -2005,7 +2028,8 @@ fn discharge_union(
     leaf_refs: &[SourceLeafRefs],
     w_log: usize,
     expo_wlog: usize,
-    expos: &[ExpoSpec],
+    block_log_a: usize,
+    expo: &ExpoTiledSpec,
     native: &UnionNative,
 ) -> Vec<Claim> {
     let mut ch = FsChannelTrace::new(b, DOMAIN);
@@ -2076,47 +2100,55 @@ fn discharge_union(
     assert_eq!(shift_cursor, native.shifts.len(), "all shifts consumed");
     assert_eq!(cur, np.len(), "union pending lockstep");
 
+    // ONE tiled source-tree exposure (mirror of `run_union_native`). The 4
+    // terminal claims re-point into walk-A KID/C by splitting the tiled point into
+    // `[rho_local | rho_tx]` and inserting `ZERO + zeros(block_pad)` between them
+    // (window offset bits prepended for C) — flat (O(1)) in tx count.
     let expo_ref = source_tree_exposure_terms([0, 1], [2, 3], F128::ZERO);
+    let expo_tiled_wlog = expo.tx_log + (expo_wlog - 1);
+    let block_pad = block_log_a - expo_wlog;
+    let gamma = ch.sample_f128(b);
+    let mut gp = LinExpr::constant(F128::ONE);
+    let mut expo_terms: Vec<RelationTermTrace> = Vec::new();
+    for i in 0..2 {
+        gp = mul(b, &gp, &gamma);
+        expo_terms.push(RelationTermTrace { coeff: gp.clone(), factors: vec![ColRef::Committed(i)] });
+        expo_terms.push(RelationTermTrace {
+            coeff: gp.clone(),
+            factors: vec![ColRef::Window { col: 2 + i, stride_log: 1, offset: 1 }],
+        });
+    }
+    let rho_e = ch.sample_f128_vec(b, expo_tiled_wlog);
+    let expo_e =
+        ColumnRelationProofTrace::alloc(b, &native.expo_proof, expo_tiled_wlog, claimed_refs(&expo_ref).len());
+    let expo_point = verify_column_relation_trace(b, &mut ch, expo_tiled_wlog, &zero, &rho_e, &expo_terms, &[], &expo_e);
+    let (rho_local, rho_tx) = expo_point.split_at(expo_wlog - 1);
     let mut ec = 0usize;
-    for (ei, spec) in expos.iter().enumerate() {
-        let gamma = ch.sample_f128(b);
-        let mut gp = LinExpr::constant(F128::ONE);
-        let mut expo_terms: Vec<RelationTermTrace> = Vec::new();
-        for i in 0..2 {
-            gp = mul(b, &gp, &gamma);
-            expo_terms.push(RelationTermTrace { coeff: gp.clone(), factors: vec![ColRef::Committed(i)] });
-            expo_terms.push(RelationTermTrace {
-                coeff: gp.clone(),
-                factors: vec![ColRef::Window { col: 2 + i, stride_log: 1, offset: 1 }],
-            });
-        }
-        let rho_e = ch.sample_f128_vec(b, expo_wlog - 1);
-        let expo_e =
-            ColumnRelationProofTrace::alloc(b, &native.expo_proofs[ei], expo_wlog - 1, claimed_refs(&expo_ref).len());
-        let expo_point = verify_column_relation_trace(b, &mut ch, expo_wlog - 1, &zero, &rho_e, &expo_terms, &[], &expo_e);
-        // The high point bits (positions st_wlog..w_log) place this tree's claims
-        // in its tx block; the native point in expo_pending already carries them.
-        let high_lin: Vec<LinExpr> = spec.high_bits.iter().map(|&h| LinExpr::constant(h)).collect();
-        for (r, v) in claimed_refs(&expo_ref).iter().zip(expo_e.final_values.iter()) {
-            let (col, npt, nval) = &native.expo_pending[ec];
-            ec += 1;
-            match r {
-                ColRef::Committed(_) => {
-                    let mut pt = expo_point.clone();
+    for (r, v) in claimed_refs(&expo_ref).iter().zip(expo_e.final_values.iter()) {
+        let (col, npt, nval) = &native.expo_pending[ec];
+        ec += 1;
+        match r {
+            ColRef::Committed(_) => {
+                let mut pt = rho_local.to_vec();
+                pt.push(LinExpr::constant(F128::ZERO));
+                for _ in 0..block_pad {
                     pt.push(LinExpr::constant(F128::ZERO));
-                    pt.extend(high_lin.clone());
-                    out.push(Claim { slice: *col, point: pt, value: v.clone(), native_point: npt.clone(), native_value: *nval });
                 }
-                ColRef::Window { offset, stride_log, .. } => {
-                    let mut pt: Vec<LinExpr> = (0..*stride_log)
-                        .map(|jb| LinExpr::constant(if (offset >> jb) & 1 == 1 { F128::ONE } else { F128::ZERO }))
-                        .collect();
-                    pt.extend(expo_point.clone());
-                    pt.extend(high_lin.clone());
-                    out.push(Claim { slice: *col, point: pt, value: v.clone(), native_point: npt.clone(), native_value: *nval });
-                }
-                _ => unreachable!(),
+                pt.extend_from_slice(rho_tx);
+                out.push(Claim { slice: *col, point: pt, value: v.clone(), native_point: npt.clone(), native_value: *nval });
             }
+            ColRef::Window { offset, stride_log, .. } => {
+                let mut pt: Vec<LinExpr> = (0..*stride_log)
+                    .map(|jb| LinExpr::constant(if (offset >> jb) & 1 == 1 { F128::ONE } else { F128::ZERO }))
+                    .collect();
+                pt.extend_from_slice(rho_local);
+                for _ in 0..block_pad {
+                    pt.push(LinExpr::constant(F128::ZERO));
+                }
+                pt.extend_from_slice(rho_tx);
+                out.push(Claim { slice: *col, point: pt, value: v.clone(), native_point: npt.clone(), native_value: *nval });
+            }
+            _ => unreachable!(),
         }
     }
     assert_eq!(ec, native.expo_pending.len(), "exposure pending lockstep");

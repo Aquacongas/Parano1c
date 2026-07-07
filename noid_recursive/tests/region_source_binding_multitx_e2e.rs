@@ -185,4 +185,34 @@ fn region_source_binding_multitx_end_to_end() {
         .is_err()
     };
     assert!(caught, "a flipped committed column lane must be caught");
+
+    // Tiling coverage: the ONE tiled source-tree exposure sumcheck must catch a
+    // corruption in ANY tree, not just tx 0. walk-A columns are allocated first
+    // and in order (CODE0, CODE1, KID0, ..), so sorting the distinct claim slices
+    // by start() puts KID0 at global index 2. Flip its node-1 cell in tx 1's tree
+    // block (the upper half of the walk-A domain for k=2): the tiled exposure
+    // (KID == C[2w+1] over ALL trees) no longer holds, so its re-pointed KID0
+    // opening breaks and the PCS rejects.
+    let mut uniq: Vec<WitnessSlice> = claims.iter().map(|c| c.slice).collect();
+    uniq.sort_by_key(|s| s.start());
+    uniq.dedup_by_key(|s| s.start());
+    let kid0 = uniq[2];
+    let p_col = 1usize << kid0.log2_len;
+    let tree1_node1 = kid0.start() + p_col / 2 + 1; // tx 1's tree, KID node slot 1
+    let mut bad2 = z.clone();
+    bad2[tree1_node1] += F128::ONE;
+    let caught2 = if !r1cs.satisfies(&bad2) {
+        true
+    } else {
+        let mut chp = FsLaneChallenger::new(OUTER);
+        let (bp, bc, _) = noid_ivc_prover::field_prover::prove_field_with_public_io(
+            &r1cs, &bad2, &params_pcs, &spec, &io_values, &mut chp,
+        );
+        let mut chv = FsLaneChallenger::new(OUTER);
+        noid_ivc_core::verifier::verify_field_with_public_io(
+            &r1cs, &bc, &bp, &spec, &io_values, &mut chv,
+        )
+        .is_err()
+    };
+    assert!(caught2, "the tiled exposure must catch a corrupted second-tree KID lane");
 }
