@@ -1818,6 +1818,7 @@ mod tests {
                     units[0].start_accumulator.clone(),
                     rp,
                     &sample,
+                    false,
                 );
                 (class.region_claims.len(), class.region_max_arity, class.spec.io_len)
             }));
@@ -2763,9 +2764,16 @@ mod tests {
     /// π₀'s region columns via `spec.claims`) + the decider + its negative.
     /// Parameterized over the block units (single-tx or multi-tx tier) and the
     /// discharge params, so the SAME logic gates every tier.
+    ///
+    /// `owner_auth_region` also verifies each block's owner-authorization
+    /// killshots in the region (the transaction-count-flat KSCHANNL walk-C
+    /// discharge): the frozen class then carries the owner-auth walk-C opening
+    /// claims as a prefix in its region tail (a strictly larger, distinct class),
+    /// so a COMPLETE region block proof has BOTH owner-auth and wallet-PCS flat.
     fn run_region_block_bearing_gate(
         units: &[BlockUnit],
         region_params: noid_recursive::acceptance::trace::region_source_binding::RegionDischargeParams,
+        owner_auth_region: bool,
     ) {
         use noid_ivc_core::challenger::FsLaneChallenger;
         use noid_ivc_core::field::F128;
@@ -2775,7 +2783,7 @@ mod tests {
         use noid_ivc_core::verifier::verify_field_with_public_io;
         use noid_ivc_core::zerocheck::K_SKIP;
         use noid_ivc_prover::field_prover::prove_field_with_public_io;
-        use noid_recursive::acceptance::block_slots::BlockSlotsConfig;
+        use noid_recursive::acceptance::block_slots::{region_wallet_pcs_native, BlockSlotsConfig};
         use noid_recursive::acceptance::link::{
             build_link, decide_tip, genesis_witness, link_io_layout_for, LinkBlock, LinkClass,
             LinkEnvelope, LinkInput,
@@ -2803,7 +2811,7 @@ mod tests {
         let region_cfg = BlockSlotsConfig {
             discharge_wallet_pcs: true,
             wallet_pcs_region: Some(region_params),
-            owner_auth_region: false,
+            owner_auth_region,
         };
 
         fn mk(u: &BlockUnit, config: BlockSlotsConfig) -> LinkBlock<'_> {
@@ -2824,15 +2832,44 @@ mod tests {
             units[0].start_accumulator.clone(),
             region_params,
             &mk(&units[0], region_cfg),
+            owner_auth_region,
         );
         eprintln!(
-            "[region-link] class frozen in {:.1?}: region_claims={}, max_arity={}, io_len={}",
+            "[region-link] class frozen in {:.1?}: owner_auth_region={owner_auth_region}, \
+             region_claims={}, max_arity={}, io_len={}",
             t0.elapsed(),
             class.region_claims.len(),
             class.region_max_arity,
             class.spec.io_len,
         );
         assert!(!class.region_claims.is_empty());
+
+        // Witness the owner-auth region delta CHEAPLY (no prove): the frozen
+        // region tail grows over the wallet-PCS-only class by exactly the
+        // owner-auth walk-C opening claims. `region_wallet_pcs_native` mirrors the
+        // real build's `pending_wallet_pcs` for each mode, so its lengths are the
+        // frozen claim counts. This also confirms the two classes are DISTINCT
+        // (different claim count -> different IO layout -> different matrix).
+        if owner_auth_region {
+            let lb = mk(&units[0], region_cfg);
+            let wallet_only = region_wallet_pcs_native(lb.inputs, region_params, false).len();
+            let with_owner_auth = region_wallet_pcs_native(lb.inputs, region_params, true).len();
+            eprintln!(
+                "[region-link] owner-auth region delta: wallet-PCS-only={wallet_only} claims, \
+                 with-owner-auth={with_owner_auth} claims (+{} walk-C); frozen={}",
+                with_owner_auth - wallet_only,
+                class.region_claims.len(),
+            );
+            assert_eq!(
+                with_owner_auth,
+                class.region_claims.len(),
+                "frozen region claim count must match the native mirror (owner-auth mode)"
+            );
+            assert!(
+                with_owner_auth > wallet_only,
+                "owner-auth region must ADD walk-C opening claims over the wallet-PCS-only class"
+            );
+        }
 
         // ---- Genesis dummy T + proof (real region spec, all-zero IO: every
         // region claim opens an all-zero column of T to zero — satisfied by the
@@ -3052,7 +3089,11 @@ mod tests {
     fn region_complete_block_bearing_link_e2e() {
         use noid_recursive::acceptance::trace::region_source_binding::RegionDischargeParams;
         let units = chained_std_tx_blocks(2);
-        run_region_block_bearing_gate(&units, RegionDischargeParams { nq: 2, sb8_auth_layers: 1 });
+        run_region_block_bearing_gate(
+            &units,
+            RegionDischargeParams { nq: 2, sb8_auth_layers: 1 },
+            false,
+        );
     }
 
     /// COMPLETE region block-bearing recursion at a MULTI-tx tier (2 std txs per
@@ -3066,7 +3107,33 @@ mod tests {
     fn region_complete_block_bearing_link_multitx_e2e() {
         use noid_recursive::acceptance::trace::region_source_binding::RegionDischargeParams;
         let units = chained_multi_tx_blocks(2, 2);
-        run_region_block_bearing_gate(&units, RegionDischargeParams { nq: 2, sb8_auth_layers: 1 });
+        run_region_block_bearing_gate(
+            &units,
+            RegionDischargeParams { nq: 2, sb8_auth_layers: 1 },
+            false,
+        );
+    }
+
+    /// COMPLETE region block-bearing recursion with owner-auth ALSO discharged in
+    /// the region (the transaction-count-flat KSCHANNL walk-C), at the single-tx
+    /// tier. This is the [G] capability with owner-auth flat: π₀ is a COMPLETE
+    /// block-bearing proof whose OWNER-AUTH and wallet-PCS are BOTH verified in
+    /// the region, π₁ ⊳ π₀ opens π₀'s region columns (owner-auth walk-C claims
+    /// first, then wallet-PCS) through the link IO, and the decider accepts the
+    /// tip. Same shared gate body as `region_complete_block_bearing_link_e2e`;
+    /// the ONLY difference is `owner_auth_region = true`, which grows the frozen
+    /// region claim shape by the owner-auth walk-C claims — a DISTINCT, larger
+    /// class (a different class matrix + digest than the wallet-PCS-only class).
+    #[test]
+    #[ignore = "heavy (m=24, several 2^24 proofs + one class digest); run explicitly"]
+    fn region_complete_block_bearing_owner_auth_link_e2e() {
+        use noid_recursive::acceptance::trace::region_source_binding::RegionDischargeParams;
+        let units = chained_std_tx_blocks(2);
+        run_region_block_bearing_gate(
+            &units,
+            RegionDischargeParams { nq: 2, sb8_auth_layers: 1 },
+            true,
+        );
     }
 
     /// The block-bearing recursion class needs two DIFFERENT real blocks of

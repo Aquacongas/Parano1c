@@ -307,6 +307,17 @@ pub struct LinkClass {
     /// The maximum region claim arity (the per-claim lane stride is
     /// `region_max_arity + 1`).
     pub region_max_arity: usize,
+    /// When true, this block-bearing region class verifies each block's
+    /// owner-authorization killshots via the shape-fixed KSCHANNL walk-C
+    /// discharge (`discharge_owner_auth_killshots_via_region`) — one tiled
+    /// data-parallel walk over all K transcripts, so owner-auth verification
+    /// is transaction-count flat — instead of the inline per-tx channel replay.
+    /// The frozen `region_claims` then include the owner-auth walk-C opening
+    /// claims as a PREFIX (before the wallet-PCS claims), so the region IO tail
+    /// carries both. Only meaningful when `region_params` is `Some` (the region
+    /// owner-auth discharge produces the obligations the wallet-PCS discharge
+    /// then consumes).
+    pub owner_auth_region: bool,
 }
 
 impl LinkClass {
@@ -349,6 +360,7 @@ impl LinkClass {
             region_params: None,
             region_claims: Vec::new(),
             region_max_arity: 0,
+            owner_auth_region: false,
         }
     }
 
@@ -365,12 +377,20 @@ impl LinkClass {
     /// path). The freeze runs a full link build (including a genesis dummy
     /// proof over the class shape) — the caller runs this off any block; the
     /// resulting class is reused for the whole chain.
+    ///
+    /// `owner_auth_region` selects whether each block's owner-authorization
+    /// killshots are ALSO verified in the region (the transaction-count-flat
+    /// KSCHANNL walk-C discharge) rather than the inline per-tx replay. When
+    /// true, the frozen region claim shape gains the owner-auth walk-C opening
+    /// claims (a prefix before the wallet-PCS claims), so the freeze probe
+    /// captures the FULL claim count and every link discharges owner-auth flatly.
     pub fn new_region_block_bearing(
         shape: FieldShape,
         pcs_params: PcsParams,
         genesis_block_accumulator: ChainAccumulator,
         region_params: RegionDischargeParams,
         sample_block: &LinkBlock<'_>,
+        owner_auth_region: bool,
     ) -> Self {
         freeze_region_block_bearing(
             shape,
@@ -378,6 +398,7 @@ impl LinkClass {
             genesis_block_accumulator,
             region_params,
             sample_block,
+            owner_auth_region,
         )
     }
 
@@ -403,7 +424,7 @@ impl LinkClass {
             Some(params) => BlockSlotsConfig {
                 discharge_wallet_pcs: true,
                 wallet_pcs_region: Some(params),
-                owner_auth_region: false,
+                owner_auth_region: self.owner_auth_region,
             },
             None => block.config,
         }
@@ -848,11 +869,12 @@ fn freeze_region_block_bearing(
     genesis_block_accumulator: ChainAccumulator,
     region_params: RegionDischargeParams,
     sample_block: &LinkBlock<'_>,
+    owner_auth_region: bool,
 ) -> LinkClass {
     let region_cfg = BlockSlotsConfig {
         discharge_wallet_pcs: true,
         wallet_pcs_region: Some(region_params),
-        owner_auth_region: false,
+        owner_auth_region,
     };
 
     // ---- Probe: a standalone discharge reveals the claim count + arities.
@@ -898,6 +920,7 @@ fn freeze_region_block_bearing(
         region_params: Some(region_params),
         region_claims: Vec::new(),
         region_max_arity: max_arity,
+        owner_auth_region,
     };
 
     // ---- Genesis dummy T + its proof over the placeholder spec (all-zero IO,
@@ -963,6 +986,7 @@ fn freeze_region_block_bearing(
         region_params: Some(region_params),
         region_claims: frozen,
         region_max_arity: max_arity,
+        owner_auth_region,
     }
 }
 
