@@ -848,6 +848,7 @@ pub fn discharge_auth_pcs_obligations_via_region(
             entry_wires: Vec::new(),
             pair_entry_map: Some((0..nq).collect()),
             root_wires,
+            path_slots: (0..nq).map(|q| meta_base + q * stride).collect(),
         });
     }
 
@@ -948,6 +949,7 @@ pub fn discharge_auth_pcs_obligations_via_region(
             entry_wires: sb6_digest_wires.clone(),
             pair_entry_map: None,
             root_wires,
+            path_slots: (0..nq).map(|q| meta_base + q * stride).collect(),
         });
     }
 
@@ -1019,6 +1021,7 @@ pub fn discharge_auth_pcs_obligations_via_region(
             entry_wires: sb8_digest_wires[k].clone(),
             pair_entry_map: None,
             root_wires,
+            path_slots: (0..nq).map(|q| meta_base + q * stride).collect(),
         });
     }
 
@@ -1050,8 +1053,10 @@ pub fn discharge_auth_pcs_obligations_via_region(
     let n_slices_a = slices.len();
     let slices_b: Vec<WitnessSlice> =
         cb.iter().map(|c| alloc_column_slice(b, c, w_log_b).0).collect();
+    let pair_slots: Vec<usize> = (0..nq).collect();
     let (mut claims_b, _pair_digest_wires) = discharge_merkle_union(
-        b, &fixed_b, &pair_refs, region_pair, &legs, w_log_b, &native_b, &pair_digests, DOMAIN_B,
+        b, &fixed_b, &pair_refs, region_pair, &legs, w_log_b, &native_b, &pair_digests, &pair_slots,
+        DOMAIN_B,
     );
 
     // FRI fold-join: the queried symbols == the pair-leaf IN columns, folded to
@@ -2066,6 +2071,11 @@ struct MerkleLeg {
     /// root — a prover cannot authenticate against a root chosen after the query
     /// positions are known.
     root_wires: Vec<[LinExpr; 2]>,
+    /// The slot base of each path in the shared walk-B domain. Single tx: just
+    /// `meta_base + path*stride`; the plural discharge tiles paths across tx
+    /// blocks (`tx*per_tx_block_B + meta_base + q*stride`), so the entry/root
+    /// claim slots read from here rather than a contiguous `meta_base + p*stride`.
+    path_slots: Vec<usize>,
 }
 
 fn union_bool_terms(legs: &[MerkleLeg]) -> Vec<RelationTerm> {
@@ -2330,6 +2340,7 @@ fn discharge_merkle_union(
     w_log: usize,
     native: &MerkleUnionNative,
     pair_digest_vals: &[[F128; 2]],
+    pair_slots: &[usize],
     domain: &[u8],
 ) -> (Vec<Claim>, Vec<[LinExpr; 2]>) {
     let mut ch = FsChannelTrace::new(b, domain);
@@ -2458,7 +2469,7 @@ fn discharge_merkle_union(
     // Pair-leaf per-tile digest claims (feed the 3i Merkle entries).
     let mut pair_digest_wires = Vec::with_capacity(pair_digest_vals.len());
     for (t, dig) in pair_digest_vals.iter().enumerate() {
-        let (pt_lin, pt_nat) = slot_point(t, w_log);
+        let (pt_lin, pt_nat) = slot_point(pair_slots[t], w_log);
         let mut wires: [LinExpr; 2] = [LinExpr::zero(), LinExpr::zero()];
         for lane in 0..2 {
             let value = LinExpr::from_wire(b.alloc_f128(dig[lane]));
@@ -2477,14 +2488,13 @@ fn discharge_merkle_union(
     // Per-leg entry (E == shared leaf digest wire) and root (C0/C1 == the
     // FS-OBSERVED root wire — transcript-bound, not a fresh alloc) pins.
     for leg in legs {
-        let stride = leg.family.stride();
         let root_slot_local = 2 * (leg.family.depth - 1) + 1;
-        for path in 0..leg.family.n_paths {
+        for path in 0..leg.path_slots.len() {
             let entry_wire: [LinExpr; 2] = match &leg.pair_entry_map {
                 Some(map) => pair_digest_wires[map[path]].clone(),
                 None => leg.entry_wires[path].clone(),
             };
-            let entry_slot = leg.meta_base + path * stride;
+            let entry_slot = leg.path_slots[path];
             let (epl, epn) = slot_point(entry_slot, w_log);
             for lane in 0..2 {
                 out.push(Claim {
@@ -2495,7 +2505,7 @@ fn discharge_merkle_union(
                     native_value: leg.entry_vals[path][lane],
                 });
             }
-            let root_slot = leg.meta_base + path * stride + root_slot_local;
+            let root_slot = leg.path_slots[path] + root_slot_local;
             let (rpl, rpn) = slot_point(root_slot, w_log);
             for lane in 0..2 {
                 // Sanity: the family's recomputed root equals the committed one.
