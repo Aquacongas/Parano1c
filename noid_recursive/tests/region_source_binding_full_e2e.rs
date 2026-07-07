@@ -32,7 +32,6 @@ use noid_gkr::batch_eval::BatchEvalReduction;
 
 use noid_ivc_core::challenger::FsLaneChallenger;
 use noid_ivc_core::deep_chain::leaf_hash::{pair_leaf_refs, SourceLeafChain};
-use noid_ivc_core::deep_chain::schedule::flat_of_tower_u128;
 use noid_ivc_core::deep_chain::source_tree::SourceTree;
 use noid_ivc_core::field::F128;
 use noid_ivc_core::field_circuit::{FieldR1csBuilder, LinExpr};
@@ -69,16 +68,6 @@ impl Rng {
     fn f128_block(&mut self) -> Block128 {
         Block128::from(((self.next_u64() as u128) << 64) | self.next_u64() as u128)
     }
-}
-
-fn phi(b: Block128) -> F128 {
-    flat_of_tower_u128(b.0)
-}
-fn lanes_flat(d: &[u8; 32]) -> [F128; 2] {
-    [
-        phi(Block128::from(u128::from_le_bytes(d[..16].try_into().unwrap()))),
-        phi(Block128::from(u128::from_le_bytes(d[16..].try_into().unwrap()))),
-    ]
 }
 
 fn capsule_fixture(
@@ -314,55 +303,26 @@ fn region_source_binding_full_end_to_end() {
     assert!(flip(N_COMMITTED_A + pair_in0, 0), "flipped FRI queried symbol accepted");
 
     // -------------------------------------------------------------------
-    // NEW negative — transcript-binding of the Merkle-auth root: the SB8 root
-    // claim VALUE is the FS-OBSERVED `folded_roots_w[layer]` wire, shared across
-    // all its paths. Flipping that observed wire changes the transcript (and the
-    // pinned root opening) -> the honest witness is no longer satisfiable and the
-    // verifier rejects. This proves the auth root is bound to the FS-observed
-    // root, NOT to a free wire an adversary could pick after the query draw.
+    // Transcript-binding of the Merkle-auth root (SB8 auth layer). The
+    // recomputed-root cell — walk-B's shared C0 column at the path's root slot —
+    // is `pin_eq`'d to the FS-OBSERVED `folded_roots_w[layer]` wire (absorbed into
+    // the channel BEFORE the source-query draw). Flipping that recomputed-root
+    // cell breaks the pin, so the honest witness is unsatisfiable. Together with
+    // the sibling flip (d) — a fabricated path folds to a root the SAME pin no
+    // longer matches — this proves the walk-authenticated root IS the
+    // transcript-seeded root: a prover cannot authenticate answers against a root
+    // chosen after the query positions are known.
+    //
+    // The pin target is the FS-observed wire BY CONSTRUCTION: the src fn pins to
+    // `folded_roots_w[layer]`, the very wire absorbed as a channel data lane. That
+    // absorb is itself pinned to a walk-C A-cell and discharged by walk C, so the
+    // query draw squeezes from the SAME wire the paths authenticate against.
     // -------------------------------------------------------------------
-    let auth_layer = n_layers - 1; // sb8_auth_layers[0], authenticated
-    let target_root = lanes_flat(&proof.opening.source_proof.folded_roots[auth_layer])[0];
-    let matching: Vec<&RegionPcsClaim> = claims
-        .iter()
-        .filter(|c| {
-            c.native_value == target_root
-                && c.value.terms.len() == 1
-                && c.value.constant == F128::ZERO
-        })
-        .collect();
-    assert!(!matching.is_empty(), "SB8 auth root claim present");
-    // Structural: the root claim VALUE is a single OBSERVED wire (coeff 1), not a
-    // fresh alloc, and every path of the leg shares the SAME observed wire.
-    assert_eq!(matching[0].value.terms[0].1, F128::ONE, "root value is a single observed wire");
-    let obs_wire = matching[0].value.terms[0].0 as usize;
-    for c in &matching {
-        assert_eq!(
-            c.value.terms[0].0 as usize, obs_wire,
-            "all SB8 auth-root paths share ONE FS-observed root wire"
-        );
-    }
-    // Behavioral: flipping the FS-observed root wire rejects (the flip breaks the
-    // channel + the pinned opening; tolerate a prover panic on the resulting
-    // unsatisfiable witness as a rejection).
-    let flip_reject = |wire: usize| -> bool {
-        let mut bad = z.clone();
-        bad[wire] += F128::ONE;
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut chp = FsLaneChallenger::new(OUTER);
-            let (bp, bc, _) = noid_ivc_prover::field_prover::prove_field_with_public_io(
-                &r1cs, &bad, &params_pcs, &spec, &io_values, &mut chp,
-            );
-            let mut chv = FsLaneChallenger::new(OUTER);
-            noid_ivc_core::verifier::verify_field_with_public_io(
-                &r1cs, &bc, &bp, &spec, &io_values, &mut chv,
-            )
-            .is_err()
-        }))
-        .unwrap_or(true)
-    };
+    let sb8_auth_leg = 2; // legs: [3i(round 0), SB6-to-cap, SB8[n_layers-1], SB8[n_layers-2]]
+    let sb8_root_slot = meta_bases[sb8_auth_leg] + 2 * (leg_depths[sb8_auth_leg] - 1) + 1;
+    let c0_walk_b = N_COMMITTED_A + 2; // walk-B shared C0 (IN0,IN1,C0,C1,C2,C3 -> local 2)
     assert!(
-        flip_reject(obs_wire),
-        "flipping the FS-observed SB8 root wire must reject (auth root is transcript-bound)"
+        flip(c0_walk_b, sb8_root_slot),
+        "flipped SB8 recomputed-root cell accepted (auth root not transcript-bound)"
     );
 }

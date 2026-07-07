@@ -36,8 +36,8 @@
 //! bound to the Fiat-Shamir-OBSERVED root wire, not a fresh alloc, so a prover
 //! cannot draw honest queries from the observed root yet authenticate fabricated
 //! answers against a root chosen AFTER the query positions are known. Here every
-//! Merkle leg's per-path root claim VALUE is the observed digest wire that
-//! seeded the query draws:
+//! Merkle leg's per-path recomputed-root cell is `pin_eq`'d to the observed
+//! digest wire that seeded the query draws:
 //!   - 3i FRI leg (round r): the `fri_roots_w[r]` digest wire, observed via
 //!     `observe_vector_commitment` inside the FRI sumcheck BEFORE the FRI query
 //!     draw (all paths of a round share it).
@@ -47,8 +47,10 @@
 //!     `commitment_cap_lanes` — `commitment_cap_lanes[(1<<MERKLE_CAP_DEPTH) +
 //!     (leaf >> walk_depth)]`, absorbed by `absorb_cap` at the transcript start.
 //! Because the recomputed root (in the Merkle family's C column at the root
-//! slot) is opened == this observed wire, the walk-authenticated root IS the
-//! transcript-seeded root — the auth is FS-bound.
+//! slot, its whole MLE bound by the walk's random-point opening) is pinned ==
+//! this observed wire, the walk-authenticated root IS the transcript-seeded root
+//! — the auth is FS-bound, and the pin is an R1CS row (not an IO claim) so the
+//! binding stays flat in tx count.
 //!
 //! ## Scope (matches the proven gate `region_source_binding_full_e2e`)
 //! The 3i FRI leg + FRI fold-join authenticate round 0 (n_rounds == 1 at the
@@ -2149,10 +2151,10 @@ struct MerkleLeg {
     entry_wires: Vec<[LinExpr; 2]>,
     pair_entry_map: Option<Vec<usize>>,
     /// TRANSCRIPT-BINDING: the FS-observed root wire per path (== the wire
-    /// absorbed into the channel BEFORE the query draw). The root claim's VALUE
-    /// is this wire, so the walk-recomputed root is opened == the transcript
-    /// root — a prover cannot authenticate against a root chosen after the query
-    /// positions are known.
+    /// absorbed into the channel BEFORE the query draw). The walk-recomputed root
+    /// cell is `pin_eq`'d to this wire, so the authenticated root is the
+    /// transcript-seeded root — a prover cannot authenticate against a root chosen
+    /// after the query positions are known.
     root_wires: Vec<[LinExpr; 2]>,
     /// The slot base of each path in the shared walk-B domain. Single tx: just
     /// `meta_base + path*stride`; the plural discharge tiles paths across tx
@@ -2570,8 +2572,9 @@ fn discharge_merkle_union(
         pair_digest_wires.push(wires);
     }
 
-    // Per-leg entry pins (E == shared leaf digest wire, pin_eq) + root openings
-    // (C0/C1 == the FS-OBSERVED root wire, kept as an IO claim; see below).
+    // Per-leg entry pins (E == shared leaf digest wire) + recomputed-root pins
+    // (C0/C1 at the root slot == the FS-OBSERVED root wire) -- both pin_eq, no
+    // IO claims (flat in tx count; see the per-path block below).
     for leg in legs {
         let root_slot_local = 2 * (leg.family.depth - 1) + 1;
         for path in 0..leg.path_slots.len() {
@@ -2583,24 +2586,20 @@ fn discharge_merkle_union(
             for lane in 0..2 {
                 cell_pins.push((leg.refs.e[lane], entry_slot, entry_wire[lane].clone()));
             }
-            // The ROOT stays an OPENING CLAIM (not a pin) so the transcript-binding
-            // negative can observe it: the root claim VALUE is the FS-observed root
-            // wire (`leg.root_wires`), shared across every path of the leg, and the
-            // recomputed-root column cell at `root_slot` is opened == it. (Pinning
-            // the root is a deferred flatness step -- it would need the negative
-            // reworked to flip the recomputed-root cell rather than the observed
-            // wire, which the claim currently exposes.)
+            // TRANSCRIPT-BINDING (flat): the recomputed-root column cell at
+            // `root_slot` is `pin_eq`'d to the FS-OBSERVED root wire
+            // (`leg.root_wires`, absorbed into the channel BEFORE the query draw).
+            // The C column is opened at a random point by the Merkle walk
+            // (selection + compress shift discharges bind its whole MLE), so the
+            // cell is bound; the pin is an R1CS ROW, not an IO claim -- it keeps
+            // the auth root FS-bound WITHOUT growing the claim vector (flat in tx
+            // count). A prover cannot authenticate a path against a root chosen
+            // after the query positions are known: the walk-recomputed root is
+            // forced == the transcript-seeded root.
             let root_slot = leg.path_slots[path] + root_slot_local;
-            let (rpl, rpn) = slot_point(root_slot, w_log);
             for lane in 0..2 {
                 assert_eq!(leg.recomputed_roots[path][lane], leg.committed_roots[path][lane]);
-                out.push(Claim {
-                    slice: leg.refs.c[lane],
-                    point: rpl.clone(),
-                    value: leg.root_wires[path][lane].clone(),
-                    native_point: rpn.clone(),
-                    native_value: leg.committed_roots[path][lane],
-                });
+                cell_pins.push((leg.refs.c[lane], root_slot, leg.root_wires[path][lane].clone()));
             }
         }
     }
