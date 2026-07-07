@@ -97,9 +97,10 @@ use noid_ivc_core::deep_chain::relations::{
     RelationTerm, ShiftDischargeProof,
 };
 use noid_ivc_core::deep_chain::schedule::{
-    build_merkle_path_columns, carry_selection_terms, flat_of_tower_u128, merkle_booleanity_terms,
-    merkle_fixed_patterns, merkle_substitution_terms, MerkleFamilyRefs, MerklePathColumns,
-    MerklePathFamily, MerklePathWitness,
+    build_duplex_columns, build_merkle_path_columns, carry_selection_terms, duplex_family_refs,
+    duplex_fixed_patterns, duplex_substitution_terms, flat_of_tower_u128, merkle_booleanity_terms,
+    merkle_fixed_patterns, merkle_substitution_terms, DuplexFamilyRefs, DuplexLayout,
+    MerkleFamilyRefs, MerklePathColumns, MerklePathFamily, MerklePathWitness,
 };
 use noid_ivc_core::deep_chain::source_tree::{
     build_source_code_columns, build_source_tree_columns, compress_iv_flat,
@@ -2599,6 +2600,361 @@ fn derive_queries(
     (source_queries, fri_queries)
 }
 
+// ===========================================================================
+// WALK C — the duplex-channel union (the [G] step 4 Stage 1 channel-flatness
+// mechanism).
+//
+// Each transaction's wallet-PCS transcript channel (a Poseidon2b duplex) is one
+// permutation chain, just like the leaf / Merkle families. The K channels tile a
+// common per-tx block period, so ONE carry-selection + ONE deep-chain walk + ONE
+// substitution discharge them all — the walk is logarithmic in the tiled domain,
+// so the channel verification cost is transaction-count flat. The squeezed
+// challenges are read out of the walk-discharged carry cells via opening claims
+// (the same digest-read pattern the leaf families use); the absorbed data cells
+// bind to the caller's proof wires the same way. This is what moves the ~311
+// inline channel permutations per tx off the inline replay and onto a flat walk.
+//
+// Columns (all length P): A0=0, A1=1, C0=2..C3=5.
+//
+// The helpers below are validated in isolation by `stage1_duplex_union_tests`;
+// the plural discharge wires them into the lib path when the inline
+// `FriChannelTrace` is swapped for this union, so they are `#[allow(dead_code)]`
+// (test-exercised) in a release build until then.
+// ===========================================================================
+#[cfg_attr(not(test), allow(dead_code))]
+struct DuplexUnion {
+    committed: [Vec<F128>; 6],
+    s0: [Vec<F128>; STATE_SIZE],
+    s_out: [Vec<F128>; STATE_SIZE],
+    fixed: Vec<FixedPattern>,
+    refs: DuplexFamilyRefs,
+    layout: DuplexLayout,
+    w_log: usize,
+    block_log: usize,
+    /// One squeezed-challenge stream per real tx (schedule order).
+    challenges: Vec<Vec<F128>>,
+}
+
+/// Tile `data.len()` transactions' duplex channels into ONE walk-C domain at a
+/// common per-tx block period. `data[t]` is tx `t`'s absorbed-data stream (flat,
+/// length `layout.n_data`). The tile count is padded to a power of two with
+/// CANONICAL GHOST channel blocks (IV-seeded, zero-data channels) — NOT
+/// `perm([0;4])` ghost slots: the duplex substitution's leading carry term is
+/// ungated, so every block must be a valid IV-seeded chain (the START pattern
+/// cancels the cross-block carry in char 2, re-seeding each block).
+#[cfg_attr(not(test), allow(dead_code))]
+fn build_duplex_union(layout: &DuplexLayout, iv_flat: [F128; 2], data: &[Vec<F128>]) -> DuplexUnion {
+    let per_tx = layout.slots.len().next_power_of_two();
+    let block_log = per_tx.trailing_zeros() as usize;
+    let k = data.len();
+    let w_log = (k.max(1) * per_tx).next_power_of_two().trailing_zeros() as usize;
+    let p = 1usize << w_log;
+    let n_blocks = p / per_tx;
+
+    let mut committed: [Vec<F128>; 6] = std::array::from_fn(|_| vec![F128::ZERO; p]);
+    let mut s0: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; p]);
+    let mut s_out: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; p]);
+    let mut challenges = Vec::with_capacity(k);
+    let zero_data = vec![F128::ZERO; layout.n_data];
+
+    for blk in 0..n_blocks {
+        let d = data.get(blk).unwrap_or(&zero_data);
+        let cols = build_duplex_columns(layout, iv_flat, d, block_log);
+        let off = blk * per_tx;
+        for j in 0..2 {
+            committed[j][off..off + per_tx].copy_from_slice(&cols.a[j]);
+        }
+        for j in 0..STATE_SIZE {
+            committed[2 + j][off..off + per_tx].copy_from_slice(&cols.c[j]);
+            s0[j][off..off + per_tx].copy_from_slice(&cols.s0[j]);
+            s_out[j][off..off + per_tx].copy_from_slice(&cols.s_out[j]);
+        }
+        if blk < k {
+            challenges.push(cols.challenges);
+        }
+    }
+    let fixed = duplex_fixed_patterns(layout, iv_flat, block_log);
+    let refs = duplex_family_refs(0, 0);
+    DuplexUnion {
+        committed,
+        s0,
+        s_out,
+        fixed,
+        refs,
+        layout: layout.clone(),
+        w_log,
+        block_log,
+        challenges,
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+struct DuplexUnionNative {
+    sel_proof: ColumnRelationProof,
+    walk_proof: DeepChainWalkProof,
+    sub_proof: ColumnRelationProof,
+    shifts: Vec<(usize, usize, ShiftDischargeProof)>,
+    pending: Vec<(usize, Vec<F128>, F128)>,
+}
+
+/// Native discharge of the whole channel union in ONE walk (mirror of
+/// `run_leaf_union_native` with the duplex family's terms).
+#[cfg_attr(not(test), allow(dead_code))]
+fn run_duplex_union_native(u: &DuplexUnion, domain: &[u8]) -> DuplexUnionNative {
+    let committed: Vec<&[F128]> = u.committed.iter().map(|c| c.as_slice()).collect();
+    let internal: Vec<&[F128]> = u.s_out.iter().map(|c| c.as_slice()).collect();
+    let fixed = &u.fixed;
+    let refs = &u.refs;
+    let w_log = u.w_log;
+    let mut ch_p = FsLaneChallenger::new(domain);
+    let mut ch_v = FsLaneChallenger::new(domain);
+    let mut pending = Vec::new();
+
+    let beta = ch_p.sample_f128();
+    assert_eq!(beta, ch_v.sample_f128());
+    let sel_terms = carry_selection_terms(&refs.c, beta);
+    let rho = ch_p.sample_f128_vec(w_log);
+    let _ = ch_v.sample_f128_vec(w_log);
+    let (sel_proof, _, _) = prove_column_relation(
+        F128::ZERO,
+        &rho,
+        &sel_terms,
+        &RelationColumns { committed: &committed, internal: &internal, fixed },
+        &mut ch_p,
+    );
+    let sel_point =
+        verify_column_relation(w_log, F128::ZERO, &rho, &sel_terms, fixed, &sel_proof, &mut ch_v)
+            .expect("native duplex selection");
+    let mut gv = [F128::ZERO; STATE_SIZE];
+    for (r, v) in claimed_refs(&sel_terms).iter().zip(sel_proof.final_values.iter()) {
+        match r {
+            ColRef::Committed(c) => pending.push((*c, sel_point.clone(), *v)),
+            ColRef::Internal(j) => gv[*j] = *v,
+            _ => unreachable!(),
+        }
+    }
+    let groups = vec![LaneClaimGroup { point: sel_point, values: gv }];
+    let (walk_proof, _) = prove_deep_chain_walk(&u.s0, &groups, &mut ch_p);
+    let terminal =
+        verify_deep_chain_walk(w_log, &groups, &walk_proof, &mut ch_v).expect("native duplex walk");
+
+    let alpha = ch_p.sample_f128();
+    assert_eq!(alpha, ch_v.sample_f128());
+    let sub_terms = duplex_substitution_terms(refs, alpha);
+    let mut target = F128::ZERO;
+    let mut p = F128::ONE;
+    for e in 0..STATE_SIZE {
+        p = p * alpha;
+        target += p * terminal.values[e];
+    }
+    let (sub_proof, _, _) = prove_column_relation(
+        target,
+        &terminal.point,
+        &sub_terms,
+        &RelationColumns { committed: &committed, internal: &[], fixed },
+        &mut ch_p,
+    );
+    let sub_point =
+        verify_column_relation(w_log, target, &terminal.point, &sub_terms, fixed, &sub_proof, &mut ch_v)
+            .expect("native duplex substitution");
+    let mut shifts = Vec::new();
+    for (r, v) in claimed_refs(&sub_terms).iter().zip(sub_proof.final_values.iter()) {
+        match r {
+            ColRef::Committed(c) => pending.push((*c, sub_point.clone(), *v)),
+            ColRef::CommittedShift(c) => {
+                let (pr, _) = prove_shift_discharge(committed[*c], &sub_point, *v, &mut ch_p);
+                let pt =
+                    verify_shift_discharge(w_log, &sub_point, *v, &pr, &mut ch_v).expect("shift");
+                pending.push((*c, pt, pr.final_value));
+                shifts.push((0usize, *c, pr));
+            }
+            _ => unreachable!(),
+        }
+    }
+    assert_eq!(ch_p.sample_f128(), ch_v.sample_f128(), "native duplex-union lockstep");
+    DuplexUnionNative { sel_proof, walk_proof, sub_proof, shifts, pending }
+}
+
+/// Trace twin of `duplex_substitution_terms`: the α-batched walk-terminal wiring
+/// `Σ_j m_j·[C_j(w−1) + START·C_j(w−1) + ABS_j·A_j + CONST_j]` (rate-lane absorbs
+/// on j ∈ {0,1}), with `m_j = Σ_e α^{e+1}·flat(MDS[e][j])` built in-trace.
+#[cfg_attr(not(test), allow(dead_code))]
+fn duplex_sub_terms_trace(
+    b: &mut FieldR1csBuilder,
+    refs: &DuplexFamilyRefs,
+    alpha: &LinExpr,
+) -> (Vec<RelationTermTrace>, Vec<LinExpr>) {
+    let (m, ap) = mds_alpha_weights(b, alpha);
+    let mut terms = Vec::new();
+    for j in 0..STATE_SIZE {
+        terms.push(RelationTermTrace {
+            coeff: m[j].clone(),
+            factors: vec![ColRef::CommittedShift(refs.c[j])],
+        });
+        terms.push(RelationTermTrace {
+            coeff: m[j].clone(),
+            factors: vec![ColRef::Fixed(refs.start), ColRef::CommittedShift(refs.c[j])],
+        });
+        if j < 2 {
+            terms.push(RelationTermTrace {
+                coeff: m[j].clone(),
+                factors: vec![ColRef::Fixed(refs.abs[j]), ColRef::Committed(refs.a[j])],
+            });
+        }
+        terms.push(RelationTermTrace {
+            coeff: m[j].clone(),
+            factors: vec![ColRef::Fixed(refs.consts[j])],
+        });
+    }
+    (terms, ap)
+}
+
+/// Discharge the shared channel union in-trace (mirror of `discharge_leaf_union`
+/// for the duplex family). Column claims are offset by `base` in the caller's
+/// global slice table. Returns the pending terminal claims on the A/C columns.
+#[cfg_attr(not(test), allow(dead_code))]
+fn discharge_duplex_union(
+    b: &mut FieldR1csBuilder,
+    u: &DuplexUnion,
+    domain: &[u8],
+    native: &DuplexUnionNative,
+    base: usize,
+) -> Vec<Claim> {
+    let refs = &u.refs;
+    let fixed = &u.fixed;
+    let w_log = u.w_log;
+    let mut ch = FsChannelTrace::new(b, domain);
+    let mut out: Vec<Claim> = Vec::new();
+    let np = &native.pending;
+    let mut np_cursor = 0usize;
+    let zero = LinExpr::zero();
+
+    let beta = ch.sample_f128(b);
+    let mut bp = LinExpr::constant(F128::ONE);
+    let mut sel_e_terms = Vec::new();
+    for j in 0..STATE_SIZE {
+        bp = mul(b, &bp, &beta);
+        sel_e_terms
+            .push(RelationTermTrace { coeff: bp.clone(), factors: vec![ColRef::Committed(refs.c[j])] });
+        sel_e_terms
+            .push(RelationTermTrace { coeff: bp.clone(), factors: vec![ColRef::Internal(j)] });
+    }
+    let rho = ch.sample_f128_vec(b, w_log);
+    let sel_e = ColumnRelationProofTrace::alloc(b, &native.sel_proof, w_log, 2 * STATE_SIZE);
+    let sel_point =
+        verify_column_relation_trace(b, &mut ch, w_log, &zero, &rho, &sel_e_terms, fixed, &sel_e);
+    let sel_claimed = claimed_refs(&carry_selection_terms(&refs.c, F128::ONE));
+    let mut gv: [LinExpr; STATE_SIZE] = std::array::from_fn(|_| LinExpr::zero());
+    for (r, v) in sel_claimed.iter().zip(sel_e.final_values.iter()) {
+        match r {
+            ColRef::Committed(c) => {
+                let (_, npt, nval) = &np[np_cursor];
+                np_cursor += 1;
+                out.push(Claim {
+                    slice: base + *c,
+                    point: sel_point.clone(),
+                    value: v.clone(),
+                    native_point: npt.clone(),
+                    native_value: *nval,
+                });
+            }
+            ColRef::Internal(j) => gv[*j] = v.clone(),
+            _ => unreachable!(),
+        }
+    }
+    let groups_e = vec![LaneClaimGroupTrace { point: sel_point, values: gv }];
+    let walk_e = DeepChainWalkProofTrace::alloc(b, &native.walk_proof, w_log);
+    let terminal = verify_deep_chain_walk_trace(b, &mut ch, w_log, &groups_e, &walk_e);
+
+    let alpha = ch.sample_f128(b);
+    let sub_native = duplex_substitution_terms(refs, F128::ONE);
+    let (sub_e_terms, ap) = duplex_sub_terms_trace(b, refs, &alpha);
+    let mut target = LinExpr::zero();
+    for e in 0..STATE_SIZE {
+        target = target.add(&mul(b, &ap[e], &terminal.values[e]));
+    }
+    let sub_e =
+        ColumnRelationProofTrace::alloc(b, &native.sub_proof, w_log, claimed_refs(&sub_native).len());
+    let sub_point = verify_column_relation_trace(
+        b,
+        &mut ch,
+        w_log,
+        &target,
+        &terminal.point,
+        &sub_e_terms,
+        fixed,
+        &sub_e,
+    );
+    let mut shift_cursor = 0usize;
+    for (r, v) in claimed_refs(&sub_native).iter().zip(sub_e.final_values.iter()) {
+        match r {
+            ColRef::Committed(c) => {
+                let (_, npt, nval) = &np[np_cursor];
+                np_cursor += 1;
+                out.push(Claim {
+                    slice: base + *c,
+                    point: sub_point.clone(),
+                    value: v.clone(),
+                    native_point: npt.clone(),
+                    native_value: *nval,
+                });
+            }
+            ColRef::CommittedShift(_) => {
+                let (sl, col, ns) = &native.shifts[shift_cursor];
+                shift_cursor += 1;
+                let se = ShiftDischargeProofTrace::alloc(b, ns, w_log);
+                let pt = verify_shift_discharge_trace(b, &mut ch, w_log, &sub_point, v, *sl, &se);
+                let (_, npt, nval) = &np[np_cursor];
+                np_cursor += 1;
+                out.push(Claim {
+                    slice: base + *col,
+                    point: pt,
+                    value: se.final_value.clone(),
+                    native_point: npt.clone(),
+                    native_value: *nval,
+                });
+            }
+            _ => unreachable!(),
+        }
+    }
+    assert_eq!(np_cursor, np.len(), "duplex-union pending lockstep");
+    out
+}
+
+/// Read tx `t`'s squeezed challenges out of the walk-C carry cells: one opening
+/// claim per challenge binding a fresh wire to carry column `C_lane` at the
+/// challenge's slot (the digest-read pattern). Returns the challenge wires in
+/// schedule order; the emitted claims are appended to `out`. Because the C
+/// columns are opened by the walk (proving they ARE the chain output) and each
+/// challenge claim opens `C_lane` at the exact slot, the returned wire is bound
+/// to the correct squeezed challenge — the prover cannot use a different value.
+#[cfg_attr(not(test), allow(dead_code))]
+fn read_duplex_challenges(
+    b: &mut FieldR1csBuilder,
+    u: &DuplexUnion,
+    t: usize,
+    base: usize,
+    out: &mut Vec<Claim>,
+) -> Vec<LinExpr> {
+    let per_tx = 1usize << u.block_log;
+    let mut wires = Vec::with_capacity(u.layout.challenges.len());
+    for (k, &(slot, lane)) in u.layout.challenges.iter().enumerate() {
+        let gslot = t * per_tx + slot;
+        let (pt_lin, pt_nat) = slot_point(gslot, u.w_log);
+        let val = u.challenges[t][k];
+        let w = LinExpr::from_wire(b.alloc_f128(val));
+        out.push(Claim {
+            slice: base + u.refs.c[lane],
+            point: pt_lin,
+            value: w.clone(),
+            native_point: pt_nat,
+            native_value: val,
+        });
+        wires.push(w);
+    }
+    wires
+}
+
 #[cfg(test)]
 mod stage1_leaf_union_tests {
     use super::*;
@@ -2791,5 +3147,205 @@ mod stage1_leaf_union_tests {
         let r2 = rounds(2);
         assert_eq!(rounds(4), r2 + 1, "K:2->4 adds one walk round");
         assert_eq!(rounds(8), r2 + 2, "K:2->8 adds two walk rounds");
+    }
+}
+
+#[cfg(test)]
+mod stage1_duplex_union_tests {
+    use super::*;
+    use noid_ivc_core::deep_chain::schedule::{compile_duplex, TranscriptOp};
+    use noid_poseidon2b::native::domain::{capacity_iv, TAG_FRICHANL};
+
+    fn iv_flat() -> [F128; 2] {
+        let iv = capacity_iv(TAG_FRICHANL);
+        [flat_of_tower_u128(iv[0].0), flat_of_tower_u128(iv[1].0)]
+    }
+
+    /// A representative channel schedule exercising every duplex feature: a
+    /// three-lane absorb (a full slot + a pending lane), a constant-lane absorb,
+    /// a two-challenge squeeze (read + pending + the eager permutation), an
+    /// absorb-after-squeeze reset, and a pad-flush squeeze.
+    fn channel_ops() -> Vec<TranscriptOp> {
+        const TAG: u128 = 0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10;
+        vec![
+            TranscriptOp::Absorb(vec![None, None, None]),
+            TranscriptOp::Absorb(vec![Some(TAG)]),
+            TranscriptOp::Squeeze(2),
+            TranscriptOp::Absorb(vec![None, None]),
+            TranscriptOp::Absorb(vec![None]),
+            TranscriptOp::Squeeze(3),
+        ]
+    }
+
+    fn tx_data(layout: &DuplexLayout, seed: u64) -> Vec<F128> {
+        let mut r = seed;
+        (0..layout.n_data)
+            .map(|_| {
+                r = r.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(0x1234_5);
+                F128 { lo: r, hi: r.rotate_left(29) ^ 0xA5A5 }
+            })
+            .collect()
+    }
+
+    /// The channel union discharges K txs' duplex chains in ONE walk: native
+    /// verify (inside `run_duplex_union_native`) + trace satisfiability + the
+    /// per-tx challenge wires (read from the carry cells) carry exactly the
+    /// native squeezed challenges. Distinct tx data ⇒ distinct challenges, all
+    /// recovered from the ONE tiled walk.
+    #[test]
+    fn duplex_union_native_and_trace() {
+        let layout = compile_duplex(&channel_ops());
+        let data: Vec<Vec<F128>> =
+            (0..2).map(|t| tx_data(&layout, 0xABCD_0000 + t as u64)).collect();
+        let u = build_duplex_union(&layout, iv_flat(), &data);
+        assert_ne!(u.challenges[0], u.challenges[1], "per-tx channels squeeze distinct challenges");
+        let native = run_duplex_union_native(&u, b"duplex-union-unit");
+
+        let mut b = FieldR1csBuilder::new();
+        for col in u.committed.iter() {
+            alloc_column_slice(&mut b, col, u.w_log);
+        }
+        let mut claims = discharge_duplex_union(&mut b, &u, b"duplex-union-unit", &native, 0);
+        let ch0 = read_duplex_challenges(&mut b, &u, 0, 0, &mut claims);
+        let ch1 = read_duplex_challenges(&mut b, &u, 1, 0, &mut claims);
+        let (r1cs, z) = b.build();
+        assert!(r1cs.satisfies(&z), "duplex-union trace unsatisfiable");
+        for (k, w) in ch0.iter().enumerate() {
+            assert_eq!(w.eval(&z), u.challenges[0][k], "tx0 challenge wire");
+        }
+        for (k, w) in ch1.iter().enumerate() {
+            assert_eq!(w.eval(&z), u.challenges[1][k], "tx1 challenge wire");
+        }
+        assert!(!claims.is_empty());
+    }
+
+    /// The channel union discharged through the REAL outer PCS: the 6 committed
+    /// columns live as witness slices, the whole claim DAG (selection → walk →
+    /// substitution → carry shifts) is replayed in-trace, and every terminal +
+    /// every squeezed-challenge read becomes an opening claim against the
+    /// committed witness. Flipping the committed carry cell that a challenge is
+    /// read from makes exactly that opening claim false — the BaseFold layer
+    /// rejects, proving the squeezed challenge is bound to the walk-proven
+    /// carry cell (not a value the prover is free to choose).
+    #[test]
+    fn duplex_union_slot_end_to_end() {
+        use noid_ivc_core::challenger::FsLaneChallenger;
+        use noid_ivc_core::pcs::{self, PcsParams};
+        use noid_ivc_core::public_io::{IoClaimSpec, PublicIoSpec};
+        use noid_ivc_core::verifier::verify_field_with_public_io;
+        use noid_ivc_prover::field_prover::prove_field_with_public_io;
+
+        const OUTER: &[u8] = b"duplex-union-slot-outer";
+        let layout = compile_duplex(&channel_ops());
+        let k = 2usize;
+        let data: Vec<Vec<F128>> =
+            (0..k).map(|t| tx_data(&layout, 0xC0FE_0000 + t as u64)).collect();
+        let u = build_duplex_union(&layout, iv_flat(), &data);
+        let native = run_duplex_union_native(&u, b"duplex-union-slot");
+        let w_log = u.w_log;
+
+        let mut b = FieldR1csBuilder::new();
+        let slices: Vec<WitnessSlice> =
+            u.committed.iter().map(|c| alloc_column_slice(&mut b, c, w_log).0).collect();
+        let mut claims = discharge_duplex_union(&mut b, &u, b"duplex-union-slot", &native, 0);
+        for t in 0..k {
+            let _ = read_duplex_challenges(&mut b, &u, t, 0, &mut claims);
+        }
+
+        let lanes_per_claim = w_log + 1;
+        let io_len = claims.len() * lanes_per_claim;
+        let io_log = io_len.next_power_of_two().trailing_zeros() as usize;
+        let mut io_values = Vec::with_capacity(io_len);
+        for c in &claims {
+            assert_eq!(c.native_point.len(), w_log, "claim point arity");
+            io_values.extend_from_slice(&c.native_point);
+            io_values.push(c.native_value);
+        }
+        let (io_slice, io_wires) = alloc_column_slice(&mut b, &io_values, io_log);
+        for (ci, c) in claims.iter().enumerate() {
+            let base = ci * lanes_per_claim;
+            for (k, p) in c.point.iter().enumerate() {
+                pin_eq(&mut b, p, &io_wires[base + k]);
+            }
+            pin_eq(&mut b, &c.value, &io_wires[base + w_log]);
+        }
+        let spec = PublicIoSpec {
+            io_slice,
+            io_len,
+            claims: claims
+                .iter()
+                .enumerate()
+                .map(|(ci, c)| IoClaimSpec {
+                    slice: slices[c.slice],
+                    point: ci * lanes_per_claim..ci * lanes_per_claim + w_log,
+                    value: ci * lanes_per_claim + w_log,
+                })
+                .collect(),
+        };
+
+        let (r1cs, z) = b.build();
+        assert!(r1cs.satisfies(&z), "honest duplex-union trace unsatisfiable");
+        let params = PcsParams {
+            m: r1cs.m + pcs::LOG_PACKING,
+            log_inv_rate: 2,
+            log_batch_size: 2,
+            profile: Default::default(),
+        };
+        let mut ch_p = FsLaneChallenger::new(OUTER);
+        let (proof, commitment, _) =
+            prove_field_with_public_io(&r1cs, &z, &params, &spec, &io_values, &mut ch_p);
+        let mut ch_v = FsLaneChallenger::new(OUTER);
+        verify_field_with_public_io(&r1cs, &commitment, &proof, &spec, &io_values, &mut ch_v)
+            .expect("the duplex-union slot proof verifies");
+        eprintln!(
+            "[duplex-union-slot] K={}, rows={} (m={}), opening claims={}",
+            k,
+            z.len(),
+            r1cs.m,
+            spec.claims.len()
+        );
+
+        // Money negative: flip the committed carry cell that tx 0's first
+        // squeezed challenge is read from. The trace stays satisfiable (columns
+        // are free wires) but that challenge's opening claim is now false.
+        let (chal_slot, chal_lane) = u.layout.challenges[0];
+        let col = slices[u.refs.c[chal_lane]];
+        let mut bad_z = z.clone();
+        bad_z[col.start() + chal_slot] += F128::ONE;
+        assert!(r1cs.satisfies(&bad_z), "committed columns are free wires");
+        let mut ch_p = FsLaneChallenger::new(OUTER);
+        let (bad_proof, bad_commitment, _) =
+            prove_field_with_public_io(&r1cs, &bad_z, &params, &spec, &io_values, &mut ch_p);
+        let mut ch_v = FsLaneChallenger::new(OUTER);
+        assert!(
+            verify_field_with_public_io(
+                &r1cs,
+                &bad_commitment,
+                &bad_proof,
+                &spec,
+                &io_values,
+                &mut ch_v
+            )
+            .is_err(),
+            "flipping a challenge's carry cell must break its opening claim"
+        );
+    }
+
+    /// Transaction-count independence: doubling K raises the tiled domain by one
+    /// bit, so the ONE channel walk gains exactly one sumcheck round —
+    /// logarithmic, not the K-fold of K inline channel replays.
+    #[test]
+    fn duplex_union_walk_is_flat() {
+        let layout = compile_duplex(&channel_ops());
+        let rounds = |k: usize| {
+            let data: Vec<Vec<F128>> =
+                (0..k).map(|t| tx_data(&layout, 0xF1A7_0000 + t as u64)).collect();
+            let u = build_duplex_union(&layout, iv_flat(), &data);
+            run_duplex_union_native(&u, b"flat").walk_proof.layers[0].round_coeffs.len()
+        };
+        let r1 = rounds(1);
+        assert_eq!(rounds(2), r1 + 1, "K:1->2 adds one walk round");
+        assert_eq!(rounds(4), r1 + 2, "K:1->4 adds two walk rounds");
+        assert_eq!(rounds(8), r1 + 3, "K:1->8 adds three walk rounds");
     }
 }
