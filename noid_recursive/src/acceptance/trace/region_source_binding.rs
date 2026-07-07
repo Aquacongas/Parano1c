@@ -83,15 +83,18 @@ use noid_poseidon2b::native::permutation::STATE_SIZE;
 use noid_poseidon2b::Poseidon2bSponge;
 
 use noid_ivc_core::challenger::{Challenger, FsLaneChallenger};
+use noid_ivc_core::deep_chain::flat_mds;
 use noid_ivc_core::deep_chain::leaf_hash::{
     build_high_pair_leaf_columns, build_pair_leaf_columns, build_source_leaf_columns,
     high_pair_leaf_chain, pair_leaf_refs, pair_leaf_substitution_terms, source_leaf_fixed_patterns,
-    source_leaf_substitution_terms, PairLeafRefs, SourceLeafChain, SourceLeafRefs,
+    source_leaf_refs, source_leaf_substitution_terms, PairLeafRefs, SourceLeafChain,
+    SourceLeafColumns, SourceLeafRefs,
 };
 use noid_ivc_core::deep_chain::relations::{
-    claimed_refs, prove_column_relation, prove_shift_discharge, verify_column_relation,
-    verify_shift_discharge, window_discharge_point, ColRef, ColumnRelationProof, FixedPattern,
-    RelationColumns, RelationTerm, ShiftDischargeProof,
+    claimed_refs, prove_column_relation, prove_shift_discharge, prove_shift_discharge_pow2,
+    verify_column_relation, verify_shift_discharge, verify_shift_discharge_pow2,
+    window_discharge_point, ColRef, ColumnRelationProof, FixedPattern, RelationColumns,
+    RelationTerm, ShiftDischargeProof,
 };
 use noid_ivc_core::deep_chain::schedule::{
     build_merkle_path_columns, carry_selection_terms, flat_of_tower_u128, merkle_booleanity_terms,
@@ -1092,6 +1095,364 @@ pub fn discharge_auth_pcs_obligation_via_region(
 }
 
 // ===========================================================================
+// [G] step 4 Stage 1 — the SHARED leaf-union walk (all K txs' leaf tiles, ONE
+// family). Every SB6 source-leaf and SB8 high-pair tile of EVERY transaction is
+// ONE structure (high-pair discharges with `source_leaf_substitution_terms` —
+// the topologically identical n_cols=1 chain), so a single periodic-pattern
+// family covers them all in ONE carry-selection + ONE walk + ONE substitution.
+// The walk is logarithmic in the tiled domain ⇒ transaction-count independent
+// (`[tx_hi | schedule_lo]`). Columns (all length P): IN0=0, IN1=1, C0=2..C3=5.
+// ===========================================================================
+
+/// A leaf tile to place in the shared leaf-union domain.
+// Consumed by the multi-tx plural discharge (Stage 1 production integration,
+// landing next); `#[allow(dead_code)]` until that caller is wired.
+#[allow(dead_code)]
+pub(crate) enum LeafTile {
+    /// SB6 source leaf: the `hash`/`compress` chain over two column-hash symbols.
+    Source { log_rows: usize, leaf_index: usize, syms: [F128; 2] },
+    /// SB8 high-pair leaf: the queried fold pair `(s0, s1)`.
+    HighPair { layer_log: usize, leaf_index: usize, s0: F128, s1: F128 },
+}
+
+#[allow(dead_code)]
+pub(crate) struct LeafUnion {
+    pub cols: SourceLeafColumns,
+    pub digests: Vec<[F128; 2]>,
+    pub w_log: usize,
+}
+
+/// Tile every leaf into ONE column set, stride-aligned. The tile count is
+/// padded to a power of two with CANONICAL GHOST leaf tiles (a zero-input
+/// source-leaf chain) — NOT `perm([0;4])` ghost SLOTS: the periodic patterns
+/// (period = stride) fire at every slot, so every slot must be a valid chain
+/// tile, else the substitution rejects. Real-tile digests are returned; the
+/// ghost tiles pad the domain to a power of two only.
+#[allow(dead_code)]
+pub(crate) fn build_leaf_union(tiles: &[LeafTile]) -> LeafUnion {
+    let chain = SourceLeafChain { n_cols: 1 };
+    let stride = chain.stride();
+    let stride_log = stride.trailing_zeros() as usize;
+    let n_pad = tiles.len().max(1).next_power_of_two();
+    let w_log = (n_pad * stride).trailing_zeros() as usize;
+    let p = 1usize << w_log;
+    let mut c: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; p]);
+    let mut s0: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; p]);
+    let mut s_out: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; p]);
+    let mut in_: [Vec<F128>; 2] = std::array::from_fn(|_| vec![F128::ZERO; p]);
+    let mut digests = Vec::with_capacity(tiles.len());
+    for t in 0..n_pad {
+        let tc = match tiles.get(t) {
+            Some(LeafTile::Source { log_rows, leaf_index, syms }) => {
+                build_source_leaf_columns(&chain, *log_rows, *leaf_index, syms, stride_log)
+            }
+            Some(LeafTile::HighPair { layer_log, leaf_index, s0: a, s1: bb }) => {
+                build_high_pair_leaf_columns(*layer_log, *leaf_index, *a, *bb, stride_log)
+            }
+            // Ghost padding tile: a valid zero-input source-leaf chain.
+            None => build_source_leaf_columns(&chain, 0, 0, &[F128::ZERO, F128::ZERO], stride_log),
+        };
+        let off = t * stride;
+        for j in 0..STATE_SIZE {
+            c[j][off..off + stride].copy_from_slice(&tc.c[j]);
+            s0[j][off..off + stride].copy_from_slice(&tc.s0[j]);
+            s_out[j][off..off + stride].copy_from_slice(&tc.s_out[j]);
+        }
+        for j in 0..2 {
+            in_[j][off..off + stride].copy_from_slice(&tc.in_[j]);
+        }
+        if t < tiles.len() {
+            digests.push(tc.digest);
+        }
+    }
+    let digest = digests.first().copied().unwrap_or([F128::ZERO; 2]);
+    LeafUnion { cols: SourceLeafColumns { c, s0, s_out, in_, digest }, digests, w_log }
+}
+
+#[allow(dead_code)]
+pub(crate) struct LeafUnionNative {
+    sel_proof: ColumnRelationProof,
+    walk_proof: DeepChainWalkProof,
+    sub_proof: ColumnRelationProof,
+    shifts: Vec<(usize, usize, ShiftDischargeProof)>,
+    pending: Vec<(usize, Vec<F128>, F128)>,
+}
+
+#[allow(dead_code)]
+pub(crate) fn run_leaf_union_native(u: &LeafUnion, domain: &[u8]) -> LeafUnionNative {
+    let chain = SourceLeafChain { n_cols: 1 };
+    let fixed = source_leaf_fixed_patterns(&chain, compress_iv_flat());
+    let refs = source_leaf_refs(0, 0);
+    let cols = &u.cols;
+    let committed: Vec<&[F128]> =
+        vec![&cols.in_[0], &cols.in_[1], &cols.c[0], &cols.c[1], &cols.c[2], &cols.c[3]];
+    let internal: Vec<&[F128]> = cols.s_out.iter().map(|c| c.as_slice()).collect();
+    let w_log = u.w_log;
+    let mut ch_p = FsLaneChallenger::new(domain);
+    let mut ch_v = FsLaneChallenger::new(domain);
+    let mut pending = Vec::new();
+
+    let beta = ch_p.sample_f128();
+    assert_eq!(beta, ch_v.sample_f128());
+    let sel_terms = carry_selection_terms(&refs.c, beta);
+    let rho = ch_p.sample_f128_vec(w_log);
+    let _ = ch_v.sample_f128_vec(w_log);
+    let (sel_proof, _, _) = prove_column_relation(
+        F128::ZERO,
+        &rho,
+        &sel_terms,
+        &RelationColumns { committed: &committed, internal: &internal, fixed: &fixed },
+        &mut ch_p,
+    );
+    let sel_point =
+        verify_column_relation(w_log, F128::ZERO, &rho, &sel_terms, &fixed, &sel_proof, &mut ch_v)
+            .expect("native leaf selection");
+    let mut gv = [F128::ZERO; STATE_SIZE];
+    for (r, v) in claimed_refs(&sel_terms).iter().zip(sel_proof.final_values.iter()) {
+        match r {
+            ColRef::Committed(c) => pending.push((*c, sel_point.clone(), *v)),
+            ColRef::Internal(j) => gv[*j] = *v,
+            _ => unreachable!(),
+        }
+    }
+    let groups = vec![LaneClaimGroup { point: sel_point, values: gv }];
+    let (walk_proof, _) = prove_deep_chain_walk(&cols.s0, &groups, &mut ch_p);
+    let terminal =
+        verify_deep_chain_walk(w_log, &groups, &walk_proof, &mut ch_v).expect("native leaf walk");
+
+    let alpha = ch_p.sample_f128();
+    assert_eq!(alpha, ch_v.sample_f128());
+    let sub_terms = source_leaf_substitution_terms(&refs, alpha);
+    let mut target = F128::ZERO;
+    let mut p = F128::ONE;
+    for e in 0..STATE_SIZE {
+        p = p * alpha;
+        target += p * terminal.values[e];
+    }
+    let (sub_proof, _, _) = prove_column_relation(
+        target,
+        &terminal.point,
+        &sub_terms,
+        &RelationColumns { committed: &committed, internal: &[], fixed: &fixed },
+        &mut ch_p,
+    );
+    let sub_point = verify_column_relation(
+        w_log,
+        target,
+        &terminal.point,
+        &sub_terms,
+        &fixed,
+        &sub_proof,
+        &mut ch_v,
+    )
+    .expect("native leaf substitution");
+    let mut shifts = Vec::new();
+    for (r, v) in claimed_refs(&sub_terms).iter().zip(sub_proof.final_values.iter()) {
+        match r {
+            ColRef::Committed(c) => pending.push((*c, sub_point.clone(), *v)),
+            ColRef::CommittedShift(c) => {
+                let (pr, _) = prove_shift_discharge(committed[*c], &sub_point, *v, &mut ch_p);
+                let pt = verify_shift_discharge(w_log, &sub_point, *v, &pr, &mut ch_v).expect("shift");
+                pending.push((*c, pt, pr.final_value));
+                shifts.push((0usize, *c, pr));
+            }
+            ColRef::CommittedShift2(c) => {
+                let (pr, _) = prove_shift_discharge_pow2(committed[*c], &sub_point, *v, 1, &mut ch_p);
+                let pt = verify_shift_discharge_pow2(w_log, &sub_point, *v, 1, &pr, &mut ch_v)
+                    .expect("shift2");
+                pending.push((*c, pt, pr.final_value));
+                shifts.push((1usize, *c, pr));
+            }
+            _ => unreachable!(),
+        }
+    }
+    assert_eq!(ch_p.sample_f128(), ch_v.sample_f128(), "native leaf-union lockstep");
+    LeafUnionNative { sel_proof, walk_proof, sub_proof, shifts, pending }
+}
+
+fn leaf_sub_terms_trace(
+    b: &mut FieldR1csBuilder,
+    refs: &SourceLeafRefs,
+    alpha: &LinExpr,
+) -> (Vec<RelationTermTrace>, Vec<LinExpr>) {
+    let mds = flat_mds(true);
+    let mut ap = Vec::with_capacity(STATE_SIZE);
+    let mut acc = LinExpr::constant(F128::ONE);
+    for _ in 0..STATE_SIZE {
+        acc = mul(b, &acc, alpha);
+        ap.push(acc.clone());
+    }
+    let m: Vec<LinExpr> = (0..STATE_SIZE)
+        .map(|j| {
+            let mut a = LinExpr::zero();
+            for e in 0..STATE_SIZE {
+                a = a.add(&ap[e].scale(mds[e][j]));
+            }
+            a
+        })
+        .collect();
+    let mut terms = Vec::new();
+    for i in 0..2 {
+        let in_col = ColRef::Committed(refs.in_[i]);
+        let c_sh = ColRef::CommittedShift(refs.c[i]);
+        let c_sh2 = ColRef::CommittedShift2(refs.c[i]);
+        for factors in [
+            vec![ColRef::Fixed(refs.hp), in_col],
+            vec![ColRef::Fixed(refs.even), c_sh2],
+            vec![ColRef::Fixed(refs.odd), c_sh],
+            vec![ColRef::Fixed(refs.odd), c_sh2],
+        ] {
+            terms.push(RelationTermTrace { coeff: m[i].clone(), factors });
+        }
+    }
+    for j in 2..STATE_SIZE {
+        terms.push(RelationTermTrace {
+            coeff: m[j].clone(),
+            factors: vec![ColRef::Fixed(refs.iv[j - 2])],
+        });
+        terms.push(RelationTermTrace {
+            coeff: m[j].clone(),
+            factors: vec![ColRef::Fixed(refs.odd), ColRef::CommittedShift(refs.c[j])],
+        });
+    }
+    (terms, ap)
+}
+
+/// Discharge the shared leaf-union in-trace; returns the pending claims plus one
+/// `digest_wires` pair per tile (C0/C1 at the tile's digest slot) for wiring
+/// into the Merkle entries. Column claims are offset by `base` (the tx-slice
+/// base in the caller's global slice table).
+#[allow(dead_code)]
+pub(crate) fn discharge_leaf_union(
+    b: &mut FieldR1csBuilder,
+    w_log: usize,
+    domain: &[u8],
+    native: &LeafUnionNative,
+    base: usize,
+    tile_digests: &[[F128; 2]],
+) -> (Vec<Claim>, Vec<[LinExpr; 2]>) {
+    let chain = SourceLeafChain { n_cols: 1 };
+    let fixed = source_leaf_fixed_patterns(&chain, compress_iv_flat());
+    let refs = source_leaf_refs(0, 0);
+    let mut ch = FsChannelTrace::new(b, domain);
+    let mut out: Vec<Claim> = Vec::new();
+    let np = &native.pending;
+    let mut np_cursor = 0usize;
+    let zero = LinExpr::zero();
+
+    let beta = ch.sample_f128(b);
+    let mut bp = LinExpr::constant(F128::ONE);
+    let mut sel_e_terms = Vec::new();
+    for j in 0..STATE_SIZE {
+        bp = mul(b, &bp, &beta);
+        sel_e_terms
+            .push(RelationTermTrace { coeff: bp.clone(), factors: vec![ColRef::Committed(refs.c[j])] });
+        sel_e_terms
+            .push(RelationTermTrace { coeff: bp.clone(), factors: vec![ColRef::Internal(j)] });
+    }
+    let rho = ch.sample_f128_vec(b, w_log);
+    let sel_e = ColumnRelationProofTrace::alloc(b, &native.sel_proof, w_log, 2 * STATE_SIZE);
+    let sel_point =
+        verify_column_relation_trace(b, &mut ch, w_log, &zero, &rho, &sel_e_terms, &fixed, &sel_e);
+    let sel_claimed = claimed_refs(&carry_selection_terms(&refs.c, F128::ONE));
+    let mut gv: [LinExpr; STATE_SIZE] = std::array::from_fn(|_| LinExpr::zero());
+    for (r, v) in sel_claimed.iter().zip(sel_e.final_values.iter()) {
+        match r {
+            ColRef::Committed(c) => {
+                let (_, npt, nval) = &np[np_cursor];
+                np_cursor += 1;
+                out.push(Claim {
+                    slice: base + *c,
+                    point: sel_point.clone(),
+                    value: v.clone(),
+                    native_point: npt.clone(),
+                    native_value: *nval,
+                });
+            }
+            ColRef::Internal(j) => gv[*j] = v.clone(),
+            _ => unreachable!(),
+        }
+    }
+    let groups_e = vec![LaneClaimGroupTrace { point: sel_point, values: gv }];
+    let walk_e = DeepChainWalkProofTrace::alloc(b, &native.walk_proof, w_log);
+    let terminal = verify_deep_chain_walk_trace(b, &mut ch, w_log, &groups_e, &walk_e);
+
+    let alpha = ch.sample_f128(b);
+    let sub_native = source_leaf_substitution_terms(&refs, F128::ONE);
+    let (sub_e_terms, ap) = leaf_sub_terms_trace(b, &refs, &alpha);
+    let mut target = LinExpr::zero();
+    for e in 0..STATE_SIZE {
+        target = target.add(&mul(b, &ap[e], &terminal.values[e]));
+    }
+    let sub_e =
+        ColumnRelationProofTrace::alloc(b, &native.sub_proof, w_log, claimed_refs(&sub_native).len());
+    let sub_point = verify_column_relation_trace(
+        b,
+        &mut ch,
+        w_log,
+        &target,
+        &terminal.point,
+        &sub_e_terms,
+        &fixed,
+        &sub_e,
+    );
+    let mut shift_cursor = 0usize;
+    for (r, v) in claimed_refs(&sub_native).iter().zip(sub_e.final_values.iter()) {
+        match r {
+            ColRef::Committed(c) => {
+                let (_, npt, nval) = &np[np_cursor];
+                np_cursor += 1;
+                out.push(Claim {
+                    slice: base + *c,
+                    point: sub_point.clone(),
+                    value: v.clone(),
+                    native_point: npt.clone(),
+                    native_value: *nval,
+                });
+            }
+            ColRef::CommittedShift(_) | ColRef::CommittedShift2(_) => {
+                let (sl, col, ns) = &native.shifts[shift_cursor];
+                shift_cursor += 1;
+                let se = ShiftDischargeProofTrace::alloc(b, ns, w_log);
+                let pt = verify_shift_discharge_trace(b, &mut ch, w_log, &sub_point, v, *sl, &se);
+                let (_, npt, nval) = &np[np_cursor];
+                np_cursor += 1;
+                out.push(Claim {
+                    slice: base + *col,
+                    point: pt,
+                    value: se.final_value.clone(),
+                    native_point: npt.clone(),
+                    native_value: *nval,
+                });
+            }
+            _ => unreachable!(),
+        }
+    }
+    assert_eq!(np_cursor, np.len(), "leaf-union pending lockstep");
+
+    let stride = chain.stride();
+    let mut digest_wires = Vec::with_capacity(tile_digests.len());
+    for (t, dig) in tile_digests.iter().enumerate() {
+        let slot = t * stride + chain.digest_slot();
+        let (pt_lin, pt_nat) = slot_point(slot, w_log);
+        let mut wires: [LinExpr; 2] = [LinExpr::zero(), LinExpr::zero()];
+        for lane in 0..2 {
+            let value = LinExpr::from_wire(b.alloc_f128(dig[lane]));
+            out.push(Claim {
+                slice: base + 2 + lane,
+                point: pt_lin.clone(),
+                value: value.clone(),
+                native_point: pt_nat.clone(),
+                native_value: dig[lane],
+            });
+            wires[lane] = value;
+        }
+        digest_wires.push(wires);
+    }
+    (out, digest_wires)
+}
+
+// ===========================================================================
 // Basis + small helpers (private; shadow the proven gate).
 // ===========================================================================
 
@@ -1269,12 +1630,12 @@ fn mds_alpha_weights(b: &mut FieldR1csBuilder, alpha: &LinExpr) -> (Vec<LinExpr>
 // Internal claim record (global column index; resolved to a WitnessSlice at the
 // end into a RegionPcsClaim).
 // ---------------------------------------------------------------------------
-struct Claim {
-    slice: usize,
-    point: Vec<LinExpr>,
-    value: LinExpr,
-    native_point: Vec<F128>,
-    native_value: F128,
+pub(crate) struct Claim {
+    pub(crate) slice: usize,
+    pub(crate) point: Vec<LinExpr>,
+    pub(crate) value: LinExpr,
+    pub(crate) native_point: Vec<F128>,
+    pub(crate) native_value: F128,
 }
 
 // ===========================================================================
@@ -2148,4 +2509,80 @@ fn derive_queries(
     let source_queries = gen_compact_queries(&mut channel, log_n + LOG_RATE, num_queries);
     let fri_queries = gen_compact_queries(&mut channel, n_rounds + LOG_RATE, num_queries);
     (source_queries, fri_queries)
+}
+
+#[cfg(test)]
+mod stage1_leaf_union_tests {
+    use super::*;
+
+    fn mixed_tiles(n: usize) -> Vec<LeafTile> {
+        (0..n)
+            .map(|i| {
+                let i = i as u64;
+                if i % 2 == 0 {
+                    LeafTile::Source {
+                        log_rows: 9,
+                        leaf_index: (3 * i + 1) as usize,
+                        syms: [F128 { lo: i + 1, hi: 2 }, F128 { lo: 3, hi: i + 4 }],
+                    }
+                } else {
+                    LeafTile::HighPair {
+                        layer_log: 12,
+                        leaf_index: (2 * i + 1) as usize,
+                        s0: F128 { lo: 5, hi: i + 6 },
+                        s1: F128 { lo: i + 7, hi: 8 },
+                    }
+                }
+            })
+            .collect()
+    }
+
+    /// The shared leaf-union discharges mixed SB6 + SB8 tiles in ONE walk:
+    /// native verify (inside `run_leaf_union_native`) + trace satisfiability +
+    /// per-tile digest wires match the native digests. Confirms high-pair and
+    /// source-leaf coexist as ONE family in a single periodic-pattern walk.
+    #[test]
+    fn leaf_union_mixed_native_and_trace() {
+        let tiles = mixed_tiles(6);
+        let u = build_leaf_union(&tiles);
+        let native = run_leaf_union_native(&u, b"leaf-union-unit"); // native verifies internally
+
+        let mut b = FieldR1csBuilder::new();
+        for col in [
+            &u.cols.in_[0],
+            &u.cols.in_[1],
+            &u.cols.c[0],
+            &u.cols.c[1],
+            &u.cols.c[2],
+            &u.cols.c[3],
+        ] {
+            alloc_column_slice(&mut b, col, u.w_log);
+        }
+        let (claims, digest_wires) =
+            discharge_leaf_union(&mut b, u.w_log, b"leaf-union-unit", &native, 0, &u.digests);
+        let (r1cs, z) = b.build();
+        assert!(r1cs.satisfies(&z), "leaf-union trace unsatisfiable");
+        assert_eq!(digest_wires.len(), tiles.len(), "one digest wire per tile");
+        for (t, dw) in digest_wires.iter().enumerate() {
+            for lane in 0..2 {
+                assert_eq!(dw[lane].eval(&z), u.digests[t][lane], "digest wire value");
+            }
+        }
+        assert!(!claims.is_empty());
+    }
+
+    /// Transaction-count independence: doubling the tile count raises the domain
+    /// by one bit, so the ONE walk gains exactly one sumcheck round —
+    /// logarithmic, not the K-fold of K separate per-tx walks.
+    #[test]
+    fn leaf_union_walk_is_flat() {
+        let rounds = |n: usize| {
+            run_leaf_union_native(&build_leaf_union(&mixed_tiles(n)), b"flat").walk_proof.layers[0]
+                .round_coeffs
+                .len()
+        };
+        let r2 = rounds(2);
+        assert_eq!(rounds(4), r2 + 1, "K:2->4 adds one walk round");
+        assert_eq!(rounds(8), r2 + 2, "K:2->8 adds two walk rounds");
+    }
 }
