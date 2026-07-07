@@ -319,7 +319,6 @@ pub fn discharge_auth_pcs_obligations_via_region(
     let mut expo_specs: Vec<ExpoSpec> = Vec::new();
     let mut expo_store: Vec<[Vec<F128>; 4]> = Vec::new();
     // Per-leg-type walk-B accumulators (each grows to K*nq across the loop).
-    let mut acc_entry_vals: Vec<Vec<[F128; 2]>> = vec![Vec::new(); n_legs];
     let mut acc_committed_roots: Vec<Vec<[F128; 2]>> = vec![Vec::new(); n_legs];
     let mut acc_recomputed_roots: Vec<Vec<[F128; 2]>> = vec![Vec::new(); n_legs];
     let mut acc_entry_wires: Vec<Vec<[LinExpr; 2]>> = vec![Vec::new(); n_legs];
@@ -832,7 +831,6 @@ pub fn discharge_auth_pcs_obligations_via_region(
                 siblings: path.siblings.iter().map(lanes_flat).collect(),
                 directions: path.directions.clone(),
             });
-            acc_entry_vals[f].push(leaf_flat);
             acc_committed_roots[f].push(root_flat);
             acc_root_wires[f].push(fri_roots_w[round].clone());
             acc_path_slots[f].push(tx_off_b + meta_base + q * stride);
@@ -907,7 +905,6 @@ pub fn discharge_auth_pcs_obligations_via_region(
                 siblings: path.siblings.iter().map(lanes_flat).collect(),
                 directions: path.directions.clone(),
             });
-            acc_entry_vals[f].push(leaf_flat);
             let cap_idx = li >> sb6_walk_depth;
             acc_committed_roots[f].push(cap_flat[cap_idx]);
             // TRANSCRIPT-BINDING: root == the FS-observed source-cap lane, muxed
@@ -975,7 +972,6 @@ pub fn discharge_auth_pcs_obligations_via_region(
                 siblings: path.siblings.iter().map(lanes_flat).collect(),
                 directions: path.directions.clone(),
             });
-            acc_entry_vals[f].push(leaf_flat);
             acc_committed_roots[f].push(root_flat);
             // TRANSCRIPT-BINDING: root == the FS-observed folded-layer root wire.
             acc_root_wires[f].push(folded_roots_w[layer].clone());
@@ -1091,7 +1087,6 @@ pub fn discharge_auth_pcs_obligations_via_region(
             family: MerklePathFamily { depth, n_paths: nq },
             refs: union_merkle_refs(col_base, fixed_base),
             region: fixed_base + 8,
-            entry_vals: std::mem::take(&mut acc_entry_vals[f]),
             committed_roots: std::mem::take(&mut acc_committed_roots[f]),
             entry_wires: std::mem::take(&mut acc_entry_wires[f]),
             pair_entry_map: if f == 0 { Some(std::mem::take(&mut acc_pair_map)) } else { None },
@@ -1119,7 +1114,7 @@ pub fn discharge_auth_pcs_obligations_via_region(
     let n_slices_a = slices.len();
     let slices_b: Vec<WitnessSlice> =
         cb.iter().map(|c| alloc_column_slice(b, c, w_log_b).0).collect();
-    let (mut wb_claims, _pair_digest_wires) = discharge_merkle_union(
+    let (mut wb_claims, wb_cell_pins, _pair_digest_wires) = discharge_merkle_union(
         b, &fixed_b, &pair_refs, region_pair, &legs, w_log_b, &native_b, &pair_digests, &pair_slots,
         DOMAIN_B,
     );
@@ -1128,6 +1123,9 @@ pub fn discharge_auth_pcs_obligations_via_region(
     }
     slices.extend(slices_b);
     claims.extend(wb_claims);
+    // The merkle discharge's per-cell pins (pair-leaf digests, leg entries/roots)
+    // join the walk-B cell pins (both index the walk-B slices).
+    cell_pins_b.extend(wb_cell_pins);
     assert!(all_expands_ok, "all real-sibling octopus expands returned non-empty paths");
 
     // Stage 2: resolve the per-cell reads/pins to R1CS constraints (pin_eq), NOT
@@ -2147,7 +2145,6 @@ struct MerkleLeg {
     family: MerklePathFamily,
     refs: MerkleFamilyRefs,
     region: usize,
-    entry_vals: Vec<[F128; 2]>,
     committed_roots: Vec<[F128; 2]>,
     entry_wires: Vec<[LinExpr; 2]>,
     pair_entry_map: Option<Vec<usize>>,
@@ -2432,9 +2429,14 @@ fn discharge_merkle_union(
     pair_digest_vals: &[[F128; 2]],
     pair_slots: &[usize],
     domain: &[u8],
-) -> (Vec<Claim>, Vec<[LinExpr; 2]>) {
+) -> (Vec<Claim>, Vec<(usize, usize, LinExpr)>, Vec<[LinExpr; 2]>) {
     let mut ch = FsChannelTrace::new(b, domain);
     let mut out: Vec<Claim> = Vec::new();
+    // Stage 2: the per-cell reads/pins (pair-leaf digests, leg entries, leg
+    // roots) resolve to pin_eq of the wire to the committed cell -- R1CS rows,
+    // not link-IO claims. Every column is opened by this walk's booleanity /
+    // selection / substitution (random point), so the cells are bound.
+    let mut cell_pins: Vec<(usize, usize, LinExpr)> = Vec::new();
     let np = &native.pending;
     let mut cur = 0usize;
     let zero = LinExpr::zero();
@@ -2559,24 +2561,17 @@ fn discharge_merkle_union(
     // Pair-leaf per-tile digest claims (feed the 3i Merkle entries).
     let mut pair_digest_wires = Vec::with_capacity(pair_digest_vals.len());
     for (t, dig) in pair_digest_vals.iter().enumerate() {
-        let (pt_lin, pt_nat) = slot_point(pair_slots[t], w_log);
         let mut wires: [LinExpr; 2] = [LinExpr::zero(), LinExpr::zero()];
         for lane in 0..2 {
             let value = LinExpr::from_wire(b.alloc_f128(dig[lane]));
-            out.push(Claim {
-                slice: pair_refs.c[lane],
-                point: pt_lin.clone(),
-                value: value.clone(),
-                native_point: pt_nat.clone(),
-                native_value: dig[lane],
-            });
+            cell_pins.push((pair_refs.c[lane], pair_slots[t], value.clone()));
             wires[lane] = value;
         }
         pair_digest_wires.push(wires);
     }
 
-    // Per-leg entry (E == shared leaf digest wire) and root (C0/C1 == the
-    // FS-OBSERVED root wire — transcript-bound, not a fresh alloc) pins.
+    // Per-leg entry pins (E == shared leaf digest wire, pin_eq) + root openings
+    // (C0/C1 == the FS-OBSERVED root wire, kept as an IO claim; see below).
     for leg in legs {
         let root_slot_local = 2 * (leg.family.depth - 1) + 1;
         for path in 0..leg.path_slots.len() {
@@ -2585,30 +2580,24 @@ fn discharge_merkle_union(
                 None => leg.entry_wires[path].clone(),
             };
             let entry_slot = leg.path_slots[path];
-            let (epl, epn) = slot_point(entry_slot, w_log);
             for lane in 0..2 {
-                out.push(Claim {
-                    slice: leg.refs.e[lane],
-                    point: epl.clone(),
-                    value: entry_wire[lane].clone(),
-                    native_point: epn.clone(),
-                    native_value: leg.entry_vals[path][lane],
-                });
+                cell_pins.push((leg.refs.e[lane], entry_slot, entry_wire[lane].clone()));
             }
+            // The ROOT stays an OPENING CLAIM (not a pin) so the transcript-binding
+            // negative can observe it: the root claim VALUE is the FS-observed root
+            // wire (`leg.root_wires`), shared across every path of the leg, and the
+            // recomputed-root column cell at `root_slot` is opened == it. (Pinning
+            // the root is a deferred flatness step -- it would need the negative
+            // reworked to flip the recomputed-root cell rather than the observed
+            // wire, which the claim currently exposes.)
             let root_slot = leg.path_slots[path] + root_slot_local;
             let (rpl, rpn) = slot_point(root_slot, w_log);
             for lane in 0..2 {
-                // Sanity: the family's recomputed root equals the committed one.
                 assert_eq!(leg.recomputed_roots[path][lane], leg.committed_roots[path][lane]);
-                // TRANSCRIPT-BINDING: the root claim VALUE is the FS-observed
-                // root wire (`leg.root_wires`), NOT a fresh alloc of the root
-                // value. The recomputed root column at `root_slot` is thus opened
-                // == the transcript-seeded root.
-                let rv = leg.root_wires[path][lane].clone();
                 out.push(Claim {
                     slice: leg.refs.c[lane],
                     point: rpl.clone(),
-                    value: rv,
+                    value: leg.root_wires[path][lane].clone(),
                     native_point: rpn.clone(),
                     native_value: leg.committed_roots[path][lane],
                 });
@@ -2616,7 +2605,7 @@ fn discharge_merkle_union(
         }
     }
 
-    (out, pair_digest_wires)
+    (out, cell_pins, pair_digest_wires)
 }
 
 /// Drive the REAL noid_fri::Channel through the whole `verify_mixed_opening`
