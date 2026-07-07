@@ -9,9 +9,12 @@
 //! as [`super::source_tree`] (φ only at the symbol/digest boundary, every
 //! interior lane a plain flat wire).
 
-use crate::deep_chain::source_tree::{compress_iv_flat, flat_compress, flat_hash_pair, run_perm};
+use crate::deep_chain::source_tree::{
+    compress_iv_flat, flat_compress, flat_hash_pair, permute_flat_state, run_perm,
+};
 use crate::deep_chain::schedule::flat_of_tower_u128;
 use crate::field::F128;
+use noid_poseidon2b::native::domain::{capacity_iv_flat, TAG_EXSTSLT};
 use noid_poseidon2b::native::permutation::STATE_SIZE;
 
 /// Domain tag for encoded-source leaf hashes — the flat image of
@@ -582,6 +585,265 @@ pub fn pair_leaf_substitution_terms(refs: &PairLeafRefs, alpha: F128) -> Vec<Rel
     ]
 }
 
+// ---------------------------------------------------------------------------
+// The exact-state slot-leaf sponge family ([D] migration)
+// ---------------------------------------------------------------------------
+//
+// The exact-state UTXO commitment hashes each slot leaf with a rate-2
+// Poseidon2b sponge on `capacity_iv(TAG_EXSTSLT)`, absorbing the slot's public
+// statement data over TWO permutations (the native `slot_leaf_hash` in
+// `noid_chain::exact_state_hash`, whose per-permutation form is
+// `noid_gkr::state_leaf_killshot::evaluate_slot_leaf`):
+//
+// ```text
+//   state = [0, 0, iv_hi, iv_lo]                    // iv = capacity_iv(TAG_EXSTSLT)
+//   perm0: state[0] += amount;  state[1] += owner_hi;  state = permute(state)
+//   perm1: state[0] += owner_lo; state[1] += PAD;      state = permute(state)
+//   leaf  = state[0..2]
+// ```
+//
+// where `PAD = pad_after_one_field()` is the sponge padding after three
+// absorbed fields (`0x80` at byte 0, `0x01` at byte 15). Block0 = `[amount,
+// owner_hi]`, block1 = `[owner_lo, PAD]`; two permutations, digest = two output
+// lanes.
+//
+// This is a STRICT SIMPLIFICATION of the source-leaf family: no `hash_pair`
+// sub-structure and a DISTANCE-1 carry (perm1 feeds directly off perm0's full
+// output state one slot back), where the source leaf's two-permutation
+// `compress` nodes carry two slots back. Only the SLOT-LEAF hash is a new
+// schedule; everything else in the [D] migration reuses `MerklePathFamily`.
+//
+// # Basis
+//
+// Same single-basis convention as [`super::source_tree`] / the other leaf
+// families: `permute_mut = flat→tower ∘ permute_flat ∘ tower→flat` and φ is
+// F2-linear, so the whole sponge runs in the flat basis with φ applied only at
+// the input/output boundary — every absorbed lane and digest lane a plain flat
+// wire. The absorbed data is public UTXO-slot statement (amount / owner); no
+// wallet secret ever enters these columns.
+
+/// Permutation slots per sponge leaf (perm0 = even slot, perm1 = odd slot).
+pub const SPONGE_LEAF_SLOTS: usize = 2;
+/// The slot holding a leaf's digest (perm1's output `C0/C1`), relative to the
+/// leaf's tile base.
+pub const SPONGE_LEAF_DIGEST_SLOT: usize = 1;
+
+/// The flat-basis capacity IV for the exact-state slot leaf (`TAG_EXSTSLT`),
+/// as F128 lanes. Lane 0 = φ(iv_hi), lane 1 = φ(iv_lo), matching
+/// `capacity_iv(TAG_EXSTSLT) = [iv_hi, iv_lo]` placed in capacity lanes 2/3.
+pub fn slot_leaf_iv_flat() -> [F128; 2] {
+    let iv = capacity_iv_flat(TAG_EXSTSLT);
+    [
+        F128 {
+            lo: iv[0] as u64,
+            hi: (iv[0] >> 64) as u64,
+        },
+        F128 {
+            lo: iv[1] as u64,
+            hi: (iv[1] >> 64) as u64,
+        },
+    ]
+}
+
+/// The flat lane of the sponge padding `pad_after_one_field` (`0x80` at byte
+/// 0, `0x01` at byte 15) — the final block's second rate lane. Constructed
+/// byte-for-byte from the native padding, then mapped through φ.
+pub fn slot_leaf_pad_flat() -> F128 {
+    let mut bytes = [0u8; 16];
+    bytes[0] = 0x80;
+    bytes[15] = 0x01;
+    flat_lane(u128::from_le_bytes(bytes))
+}
+
+/// Flat-basis replay of the native `slot_leaf_hash(amount, owner_hi,
+/// owner_lo)`: the rate-2 `TAG_EXSTSLT` sponge over two permutations.
+///
+/// ```text
+///   s = permute([amount, owner_hi, iv0, iv1])       // absorb block0
+///   s = permute([s0 + owner_lo, s1 + PAD, s2, s3])  // absorb block1
+///   digest = (s0, s1)
+/// ```
+///
+/// `amount`, `owner_hi`, `owner_lo` are the slot's public statement lanes
+/// already in the flat basis (`amount = φ(Block128::from(u64))`). Matches the
+/// native tower slot-leaf hash under φ. Returns the leaf digest's two flat
+/// lanes.
+pub fn flat_sponge_leaf_hash(amount: F128, owner_hi: F128, owner_lo: F128) -> [F128; 2] {
+    let iv = slot_leaf_iv_flat();
+    let pad = slot_leaf_pad_flat();
+    // perm0: absorb block0 = [amount, owner_hi] on the IV capacity.
+    let s = permute_flat_state([amount, owner_hi, iv[0], iv[1]]);
+    // perm1: feed the full perm0 output forward, absorb block1 = [owner_lo, PAD].
+    let s = permute_flat_state([s[0] + owner_lo, s[1] + pad, s[2], s[3]]);
+    [s[0], s[1]]
+}
+
+/// Fill the region columns for `leaves.len()` slot-leaf sponge chains tiled at
+/// stride [`SPONGE_LEAF_SLOTS`] (leaf `t` at slots `2t`/`2t+1`). `leaves[t] =
+/// (amount, owner_hi, owner_lo)` in the flat basis. `w_log` must cover the
+/// tiles (`2^w_log` a multiple of the stride, `≥ 2·leaves.len()`); any tile
+/// past `leaves.len()` is a CANONICAL GHOST sponge leaf (`amount = owner_hi =
+/// owner_lo = 0`, still absorbing the same PAD) — NOT a `perm([0;4])` slot,
+/// because the periodic fixed patterns fire at every even/odd slot and must be
+/// satisfied by a real sponge run. Every slot in the domain is thus perm-active
+/// (even or odd of some tile), so `IN0/IN1` are read PLAINLY by the
+/// substitution (no absorb selector). Returns the columns and each REAL leaf's
+/// digest (`C0/C1` at its odd slot `2t+1`); leaf `t`'s digest matches
+/// [`flat_sponge_leaf_hash`] (hence native `slot_leaf_hash` under φ).
+///
+/// Reuses the [`SourceLeafColumns`] layout: `IN0/IN1` are the two rate-absorb
+/// lanes at each slot (`[amount, owner_hi]` at the even slot, `[owner_lo, PAD]`
+/// at the odd slot); `c/s0/s_out` are every slot's permutation.
+pub fn build_sponge_leaf_columns(
+    leaves: &[(F128, F128, F128)],
+    w_log: usize,
+) -> (SourceLeafColumns, Vec<[F128; 2]>) {
+    let w = 1usize << w_log;
+    assert_eq!(w % SPONGE_LEAF_SLOTS, 0, "domain not a multiple of the tile");
+    let num_tiles = w / SPONGE_LEAF_SLOTS;
+    assert!(leaves.len() <= num_tiles, "more leaves than tiles");
+    let iv = slot_leaf_iv_flat();
+    let pad = slot_leaf_pad_flat();
+
+    let mut c: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; w]);
+    let mut s0: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; w]);
+    let mut s_out: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; w]);
+    let mut in_: [Vec<F128>; 2] = std::array::from_fn(|_| vec![F128::ZERO; w]);
+
+    let mut store = |slot: usize,
+                     s0v: [F128; STATE_SIZE],
+                     outv: [F128; STATE_SIZE],
+                     c: &mut [Vec<F128>; STATE_SIZE]| {
+        for j in 0..STATE_SIZE {
+            s0[j][slot] = s0v[j];
+            s_out[j][slot] = outv[j];
+            c[j][slot] = outv[j];
+        }
+    };
+
+    // Every slot is active; a tile past `leaves.len()` is the canonical ghost
+    // sponge leaf (0, 0, 0) — a real two-permutation run, so the periodic
+    // even/odd patterns stay satisfied.
+    let mut digests = Vec::with_capacity(leaves.len());
+    for t in 0..num_tiles {
+        let (amount, owner_hi, owner_lo) = if t < leaves.len() {
+            leaves[t]
+        } else {
+            (F128::ZERO, F128::ZERO, F128::ZERO)
+        };
+        let even = SPONGE_LEAF_SLOTS * t;
+        let odd = even + 1;
+        // perm0: absorb block0 = [amount, owner_hi] on the IV capacity.
+        let (a, b) = run_perm([amount, owner_hi, iv[0], iv[1]]);
+        store(even, a, b, &mut c);
+        // perm1: feed the full perm0 output forward, absorb block1 = [owner_lo, PAD].
+        let p0: [F128; STATE_SIZE] = std::array::from_fn(|j| c[j][even]);
+        let (a, b) = run_perm([p0[0] + owner_lo, p0[1] + pad, p0[2], p0[3]]);
+        store(odd, a, b, &mut c);
+        // Committed absorb (rate) lanes at each slot.
+        in_[0][even] = amount;
+        in_[1][even] = owner_hi;
+        in_[0][odd] = owner_lo;
+        in_[1][odd] = pad;
+        if t < leaves.len() {
+            digests.push([c[0][odd], c[1][odd]]);
+        }
+    }
+
+    let digest = digests.first().copied().unwrap_or([F128::ZERO; 2]);
+    (
+        SourceLeafColumns {
+            c,
+            s0,
+            s_out,
+            in_,
+            digest,
+        },
+        digests,
+    )
+}
+
+/// Column/pattern indices of one slot-leaf sponge family. Committed column
+/// order `IN0, IN1, C0..C3`; pattern order `ODD, IV0, IV1`.
+#[derive(Clone, Copy, Debug)]
+pub struct SpongeLeafRefs {
+    pub in_: [usize; 2],
+    pub c: [usize; STATE_SIZE],
+    pub odd: usize,
+    pub iv: [usize; 2],
+}
+
+pub fn sponge_leaf_refs(col_base: usize, fixed_base: usize) -> SpongeLeafRefs {
+    SpongeLeafRefs {
+        in_: [col_base, col_base + 1],
+        c: std::array::from_fn(|i| col_base + 2 + i),
+        odd: fixed_base,
+        iv: [fixed_base + 1, fixed_base + 2],
+    }
+}
+
+/// The schedule patterns over one [`SPONGE_LEAF_SLOTS`]-slot period. `ODD`
+/// marks the perm1 (odd) slot; `IV0/IV1` carry the sponge capacity IV at the
+/// perm0 (even) slot (zero at the odd slot). No `EVEN`/absorb selector is
+/// needed: every slot absorbs a rate block, so `IN0/IN1` are read plainly, and
+/// the `IV0/IV1` patterns are themselves even-gated by construction. One period
+/// tiles per leaf, so the verifier's pattern cost is leaf-count independent.
+pub fn sponge_leaf_fixed_patterns(iv_flat: [F128; 2]) -> Vec<FixedPattern> {
+    let low_log = SPONGE_LEAF_SLOTS.trailing_zeros() as usize;
+    // slot 0 = perm0 (even), slot 1 = perm1 (odd).
+    let odd = vec![F128::ZERO, F128::ONE];
+    let iv0 = vec![iv_flat[0], F128::ZERO];
+    let iv1 = vec![iv_flat[1], F128::ZERO];
+    vec![
+        FixedPattern::new(low_log, odd),
+        FixedPattern::new(low_log, iv0),
+        FixedPattern::new(low_log, iv1),
+    ]
+}
+
+/// Wiring substitution `Σ_j m_j·raw_j(w)` for the α-batched walk terminal. The
+/// carry is uniformly one slot back (perm1 feeds off perm0's full output):
+///
+/// ```text
+///   raw_0 = IN0      + ODD·C0(w−1)
+///   raw_1 = IN1      + ODD·C1(w−1)
+///   raw_2 = IV0_pat  + ODD·C2(w−1)
+///   raw_3 = IV1_pat  + ODD·C3(w−1)
+/// ```
+///
+/// At the even slot `ODD = 0`: `raw = [amount, owner_hi, iv0, iv1]` (the fresh
+/// sponge absorb on the IV capacity). At the odd slot `ODD = 1` and the
+/// `IV_pat` are zero: `raw = [owner_lo + C0(w−1), PAD + C1(w−1), C2(w−1),
+/// C3(w−1)]` (the full perm0 output fed forward, block1 absorbed into the
+/// rate). `IN0/IN1` read plainly because every slot absorbs a rate block.
+pub fn sponge_leaf_substitution_terms(refs: &SpongeLeafRefs, alpha: F128) -> Vec<RelationTerm> {
+    let m = mds_weights_pub(alpha);
+    let mut terms = Vec::new();
+    // Rate lanes 0/1: the absorbed block read plainly + the odd-gated carry.
+    for i in 0..2 {
+        terms.push(RelationTerm {
+            coeff: m[i],
+            factors: vec![ColRef::Committed(refs.in_[i])],
+        });
+        terms.push(RelationTerm {
+            coeff: m[i],
+            factors: vec![ColRef::Fixed(refs.odd), ColRef::CommittedShift(refs.c[i])],
+        });
+    }
+    // Capacity lanes 2/3: the even-gated IV pattern + the odd-gated carry.
+    for j in 2..STATE_SIZE {
+        terms.push(RelationTerm {
+            coeff: m[j],
+            factors: vec![ColRef::Fixed(refs.iv[j - 2])],
+        });
+        terms.push(RelationTerm {
+            coeff: m[j],
+            factors: vec![ColRef::Fixed(refs.odd), ColRef::CommittedShift(refs.c[j])],
+        });
+    }
+    terms
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1106,6 +1368,277 @@ mod tests {
             bad[1][chain.digest_slot()] += F128::ONE;
             assert!(
                 run_leaf_dag(&chain, &cols.in_[0], &cols.in_[1], &bad, &cols.s0, &cols.s_out, &[(chain.digest_slot(), cols.digest)], w_log)
+                    .is_err(),
+                "corrupted digest accepted"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Exact-state slot-leaf sponge family gates
+    // -----------------------------------------------------------------------
+
+    /// The φ anchor: the flat-basis [`flat_sponge_leaf_hash`] reproduces the
+    /// native tower `slot_leaf_hash` (rate-2 `TAG_EXSTSLT` sponge —
+    /// `noid_chain::exact_state_hash::slot_leaf_hash` /
+    /// `state_leaf_killshot::evaluate_slot_leaf`) under φ, across random
+    /// (amount, owner_hi, owner_lo). Gated FIRST, before the region DAG.
+    #[test]
+    fn sponge_leaf_digest_matches_native_slot_leaf_hash() {
+        use noid_core::Block128;
+        use noid_poseidon2b::native::compression::Poseidon2bSponge;
+        use noid_poseidon2b::native::domain::{capacity_iv, TAG_EXSTSLT};
+
+        // φ: tower Block128 → flat F128 lane (per 16-byte lane).
+        let tower_flat = |b: Block128| -> F128 {
+            let f = noid_core::hardware::tower_to_flat_u128(b.0);
+            F128 {
+                lo: f as u64,
+                hi: (f >> 64) as u64,
+            }
+        };
+
+        // The native tower slot-leaf hash, exactly `slot_leaf_hash`: a rate-2
+        // TAG_EXSTSLT sponge absorbing amount then the owner pair.
+        let native_leaf = |amount: u64, owner_hi: Block128, owner_lo: Block128| -> [Block128; 2] {
+            let mut s = Poseidon2bSponge::with_iv(capacity_iv(TAG_EXSTSLT));
+            s.absorb(Block128::from(amount));
+            s.absorb_pair(owner_hi, owner_lo);
+            let hash = s.finalize();
+            let mut lo = [0u8; 16];
+            let mut hi = [0u8; 16];
+            lo.copy_from_slice(&hash[..16]);
+            hi.copy_from_slice(&hash[16..]);
+            [
+                Block128::from(u128::from_le_bytes(lo)),
+                Block128::from(u128::from_le_bytes(hi)),
+            ]
+        };
+
+        let mut seed = 0x513Eu64;
+        let mut next = || {
+            seed = seed.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = seed;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            z ^ (z >> 31)
+        };
+        for _ in 0..16 {
+            let amount = next();
+            let owner_hi = Block128::from(((next() as u128) << 64) | next() as u128);
+            let owner_lo = Block128::from(((next() as u128) << 64) | next() as u128);
+
+            let want = native_leaf(amount, owner_hi, owner_lo);
+            let got = flat_sponge_leaf_hash(
+                tower_flat(Block128::from(amount)),
+                tower_flat(owner_hi),
+                tower_flat(owner_lo),
+            );
+            assert_eq!(got[0], tower_flat(want[0]), "slot-leaf digest lane 0 diverges under phi");
+            assert_eq!(got[1], tower_flat(want[1]), "slot-leaf digest lane 1 diverges under phi");
+        }
+    }
+
+    /// The chain column replay's recomputed digest (from the distance-1 carry
+    /// slot layout) equals the direct [`flat_sponge_leaf_hash`] (hence native
+    /// `slot_leaf_hash` under φ) for every tiled leaf, and `c == s_out` (the
+    /// digest columns are the walk outputs). Validates the slot layout the
+    /// region DAG wires.
+    #[test]
+    fn sponge_leaf_columns_digest_matches() {
+        let mut seed = 0x5107u64;
+        let mut next = || {
+            seed = seed.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = seed;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            z ^= z >> 31;
+            F128 {
+                lo: z,
+                hi: z.rotate_left(13),
+            }
+        };
+        let k = 4usize; // power of two, exact fill
+        let w_log = SPONGE_LEAF_SLOTS.trailing_zeros() as usize + k.trailing_zeros() as usize;
+        let leaves: Vec<(F128, F128, F128)> = (0..k).map(|_| (next(), next(), next())).collect();
+        let (cols, digests) = build_sponge_leaf_columns(&leaves, w_log);
+
+        for (t, &(amount, owner_hi, owner_lo)) in leaves.iter().enumerate() {
+            let direct = flat_sponge_leaf_hash(amount, owner_hi, owner_lo);
+            assert_eq!(digests[t], direct, "chain digest {t} != flat_sponge_leaf_hash");
+            let odd = SPONGE_LEAF_SLOTS * t + SPONGE_LEAF_DIGEST_SLOT;
+            assert_eq!([cols.c[0][odd], cols.c[1][odd]], direct, "column digest {t}");
+        }
+        for slot in 0..(1usize << w_log) {
+            for j in 0..STATE_SIZE {
+                assert_eq!(cols.c[j][slot], cols.s_out[j][slot]);
+            }
+        }
+    }
+
+    /// Run the full region DAG for the tiled slot-leaf sponge chains:
+    /// carry-selection seeds the walk from the committed digests, the walk
+    /// verifies every slot's permutation, the substitution ties the walk input
+    /// to the distance-1 sponge wiring (`IN0/IN1` read plainly, capacity IV
+    /// even-gated, perm0 output fed forward one slot at the odd slot), and each
+    /// tile's digest pins to `C0/C1` at its odd slot. ONE carry-selection, ONE
+    /// walk and ONE substitution cover every tile.
+    fn run_sponge_leaf_dag(
+        in0: &[F128],
+        in1: &[F128],
+        c: &[Vec<F128>; STATE_SIZE],
+        s0: &[Vec<F128>; STATE_SIZE],
+        s_out: &[Vec<F128>; STATE_SIZE],
+        pins: &[(usize, [F128; 2])],
+        w_log: usize,
+    ) -> Result<(), String> {
+        let iv = slot_leaf_iv_flat();
+        let fixed = sponge_leaf_fixed_patterns(iv);
+        let refs = sponge_leaf_refs(0, 0);
+
+        let committed: Vec<&[F128]> = vec![in0, in1, &c[0], &c[1], &c[2], &c[3]];
+        let internal: Vec<&[F128]> = s_out.iter().map(|c| c.as_slice()).collect();
+        let mut ch_p = FsLaneChallenger::new(b"sponge-leaf-dag");
+        let mut ch_v = FsLaneChallenger::new(b"sponge-leaf-dag");
+        let mut pending: Vec<(usize, Vec<F128>, F128)> = Vec::new();
+
+        // carry selection → walk group.
+        let beta = ch_p.sample_f128();
+        assert_eq!(beta, ch_v.sample_f128());
+        let sel_terms = carry_selection_terms(&refs.c, beta);
+        let rho: Vec<F128> = ch_p.sample_f128_vec(w_log);
+        let _ = ch_v.sample_f128_vec(w_log);
+        let (sp, _, _) = prove_column_relation(
+            F128::ZERO,
+            &rho,
+            &sel_terms,
+            &RelationColumns { committed: &committed, internal: &internal, fixed: &fixed },
+            &mut ch_p,
+        );
+        let sel_point =
+            verify_column_relation(w_log, F128::ZERO, &rho, &sel_terms, &fixed, &sp, &mut ch_v)
+                .map_err(|e| format!("selection: {e}"))?;
+        let mut group_values = [F128::ZERO; STATE_SIZE];
+        for (r, v) in claimed_refs(&sel_terms).iter().zip(sp.final_values.iter()) {
+            match r {
+                ColRef::Committed(cc) => pending.push((*cc, sel_point.clone(), *v)),
+                ColRef::Internal(j) => group_values[*j] = *v,
+                _ => unreachable!(),
+            }
+        }
+
+        // walk.
+        let groups = vec![LaneClaimGroup { point: sel_point.clone(), values: group_values }];
+        let (wp, _) = prove_deep_chain_walk(s0, &groups, &mut ch_p);
+        let terminal = verify_deep_chain_walk(w_log, &groups, &wp, &mut ch_v)
+            .map_err(|e| format!("walk: {e}"))?;
+
+        // substitution.
+        let alpha = ch_p.sample_f128();
+        assert_eq!(alpha, ch_v.sample_f128());
+        let sub_terms = sponge_leaf_substitution_terms(&refs, alpha);
+        let mut target = F128::ZERO;
+        let mut p = F128::ONE;
+        for e in 0..STATE_SIZE {
+            p = p * alpha;
+            target += p * terminal.values[e];
+        }
+        let (subp, _, _) = prove_column_relation(
+            target,
+            &terminal.point,
+            &sub_terms,
+            &RelationColumns { committed: &committed, internal: &[], fixed: &fixed },
+            &mut ch_p,
+        );
+        let sub_point =
+            verify_column_relation(w_log, target, &terminal.point, &sub_terms, &fixed, &subp, &mut ch_v)
+                .map_err(|e| format!("substitution: {e}"))?;
+        for (r, v) in claimed_refs(&sub_terms).iter().zip(subp.final_values.iter()) {
+            match r {
+                ColRef::Committed(cc) => pending.push((*cc, sub_point.clone(), *v)),
+                ColRef::CommittedShift(cc) => {
+                    let (pr, _) = prove_shift_discharge(committed[*cc], &sub_point, *v, &mut ch_p);
+                    let pt = verify_shift_discharge(w_log, &sub_point, *v, &pr, &mut ch_v)
+                        .map_err(|e| format!("shift: {e}"))?;
+                    pending.push((*cc, pt, pr.final_value));
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        assert_eq!(ch_p.sample_f128(), ch_v.sample_f128(), "lockstep");
+
+        for (cc, pt, v) in &pending {
+            if mle(committed[*cc], pt) != *v {
+                return Err(format!("claim on column {cc} is false"));
+            }
+        }
+        // Per-tile digest pins.
+        for (slot, dig) in pins {
+            let digest_point: Vec<F128> = (0..w_log)
+                .map(|bb| if (slot >> bb) & 1 == 1 { F128::ONE } else { F128::ZERO })
+                .collect();
+            if mle(&c[0], &digest_point) != dig[0] || mle(&c[1], &digest_point) != dig[1] {
+                return Err(format!("digest pin mismatch at slot {slot}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// The slot-leaf sponge region DAG over tiled leaves: honest run discharges
+    /// every claim true, and each of a corrupted absorb input (amount, owner)
+    /// and a corrupted output digest breaks the DAG (relation terminal false /
+    /// digest pin mismatch).
+    #[test]
+    fn sponge_leaf_region_dag_roundtrip_and_negatives() {
+        let k = 4usize; // power of two, exact fill
+        let w_log = SPONGE_LEAF_SLOTS.trailing_zeros() as usize + k.trailing_zeros() as usize;
+
+        let mut seed = 0x5A17u64;
+        let mut next = || {
+            seed = seed.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = seed;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z ^= z >> 31;
+            F128 { lo: z, hi: z.rotate_left(29) }
+        };
+        let leaves: Vec<(F128, F128, F128)> = (0..k).map(|_| (next(), next(), next())).collect();
+        let (cols, digests) = build_sponge_leaf_columns(&leaves, w_log);
+        let pins: Vec<(usize, [F128; 2])> = digests
+            .iter()
+            .enumerate()
+            .map(|(t, &d)| (SPONGE_LEAF_SLOTS * t + SPONGE_LEAF_DIGEST_SLOT, d))
+            .collect();
+
+        run_sponge_leaf_dag(&cols.in_[0], &cols.in_[1], &cols.c, &cols.s0, &cols.s_out, &pins, w_log)
+            .expect("honest sponge-leaf DAG verifies");
+
+        // Corrupt leaf 2's absorbed amount (IN0 at its even slot).
+        {
+            let mut bad = cols.in_[0].clone();
+            bad[SPONGE_LEAF_SLOTS * 2] += F128::ONE;
+            assert!(
+                run_sponge_leaf_dag(&bad, &cols.in_[1], &cols.c, &cols.s0, &cols.s_out, &pins, w_log)
+                    .is_err(),
+                "corrupted amount accepted"
+            );
+        }
+        // Corrupt leaf 1's absorbed owner_hi (IN1 at its even slot).
+        {
+            let mut bad = cols.in_[1].clone();
+            bad[SPONGE_LEAF_SLOTS * 1] += F128::ONE;
+            assert!(
+                run_sponge_leaf_dag(&cols.in_[0], &bad, &cols.c, &cols.s0, &cols.s_out, &pins, w_log)
+                    .is_err(),
+                "corrupted owner accepted"
+            );
+        }
+        // Corrupt leaf 3's output digest lane (C0 at its odd slot).
+        {
+            let mut bad = cols.c.clone();
+            bad[0][SPONGE_LEAF_SLOTS * 3 + SPONGE_LEAF_DIGEST_SLOT] += F128::ONE;
+            assert!(
+                run_sponge_leaf_dag(&cols.in_[0], &cols.in_[1], &bad, &cols.s0, &cols.s_out, &pins, w_log)
                     .is_err(),
                 "corrupted digest accepted"
             );
