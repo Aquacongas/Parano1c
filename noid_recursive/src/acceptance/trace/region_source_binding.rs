@@ -113,7 +113,7 @@ use noid_ivc_core::deep_chain::{
     prove_deep_chain_walk, verify_deep_chain_walk, DeepChainWalkProof, LaneClaimGroup,
 };
 use noid_ivc_core::field::F128;
-use noid_ivc_core::field_circuit::{FieldR1csBuilder, FsChannelTrace, LinExpr};
+use noid_ivc_core::field_circuit::{FieldR1csBuilder, FsChannelTrace, LinExpr, Wire};
 use noid_ivc_core::public_io::WitnessSlice;
 
 use super::deep_chain::{
@@ -1206,12 +1206,27 @@ pub fn discharge_auth_pcs_obligations_via_region(
     let slices_c: Vec<WitnessSlice> =
         u_c.committed.iter().map(|c| alloc_column_slice(b, c, u_c.w_log).0).collect();
     let mut wc_claims = discharge_duplex_union(b, &u_c, DOMAIN_C, &native_c, 0);
-    for tx in 0..k {
-        bind_duplex_challenges(&u_c, tx, 0, &chan_chal_wires[tx], &mut wc_claims);
-        bind_duplex_absorbs(&u_c, tx, 0, &chan_data_positions, &chan_data_wires[tx], &mut wc_claims);
-    }
     for c in wc_claims.iter_mut() {
         c.slice += n_slices_ab;
+    }
+    // Stage 2: the per-tx channel absorbs + squeezed challenges are tied to the
+    // walk-C A/C cells by R1CS constraint (`pin_eq`), NOT per-cell opening
+    // claims. Every A/C column is opened by the walk-C discharge's
+    // selection/substitution (O(1) per column, already in `wc_claims`), so its
+    // MLE — hence every cell — is bound; pinning the algebra wire to the cell
+    // binds it too. This keeps the O(K·(n_data+n_chal)) channel bindings out of
+    // the link IO entirely (they become ~K·(n_data+n_chal) R1CS rows, the
+    // accepted per-tx algebra cost), so the channel is tx-flat in the IO.
+    let per_tx_c = 1usize << u_c.block_log;
+    for tx in 0..k {
+        for (kk, &(slot, lane)) in u_c.layout.challenges.iter().enumerate() {
+            let cell = slot_cell(&slices_c[u_c.refs.c[lane]], tx * per_tx_c + slot);
+            pin_eq(b, &chan_chal_wires[tx][kk], &cell);
+        }
+        for (kk, &(slot, lane)) in chan_data_positions.iter().enumerate() {
+            let cell = slot_cell(&slices_c[u_c.refs.a[lane]], tx * per_tx_c + slot);
+            pin_eq(b, &chan_data_wires[tx][kk], &cell);
+        }
     }
     slices.extend(slices_c);
     claims.extend(wc_claims);
@@ -1642,6 +1657,13 @@ fn slot_point(s: usize, w_log: usize) -> (Vec<LinExpr>, Vec<F128>) {
         .collect();
     let nat = (0..w_log).map(|bb| if (s >> bb) & 1 == 1 { F128::ONE } else { F128::ZERO }).collect();
     (lin, nat)
+}
+
+/// The committed cell at `slot` of `slice`, as a raw wire read. Bound by the
+/// column's walk opening (Stage 2: pin an algebra wire to a cell instead of
+/// emitting a per-cell opening claim — an R1CS row, not a link-IO lane).
+fn slot_cell(slice: &WitnessSlice, slot: usize) -> LinExpr {
+    LinExpr::from_wire(Wire((slice.start() + slot) as u32))
 }
 
 /// Rebuild a per-family stride-period pattern as a META-period table by
@@ -3070,35 +3092,6 @@ fn duplex_data_positions(layout: &DuplexLayout) -> Vec<(usize, usize)> {
         }
     }
     pos
-}
-
-/// Bind tx `t`'s absorbed-data wires (the algebra's proof wires, in schedule
-/// order) to the walk-C A-lane cells: one opening claim per data lane on absorb
-/// column `A_lane` at the absorb slot. This ties the channel's transcript INPUT
-/// to the real proof data the algebra checks — without it a prover could drive
-/// the channel with a fabricated transcript to steer the squeezed challenges.
-fn bind_duplex_absorbs(
-    u: &DuplexUnion,
-    t: usize,
-    base: usize,
-    data_positions: &[(usize, usize)],
-    data_wires: &[LinExpr],
-    out: &mut Vec<Claim>,
-) {
-    let per_tx = 1usize << u.block_log;
-    assert_eq!(data_wires.len(), data_positions.len(), "absorb wire count");
-    for (k, &(slot, lane)) in data_positions.iter().enumerate() {
-        let gslot = t * per_tx + slot;
-        let (pt_lin, pt_nat) = slot_point(gslot, u.w_log);
-        let nval = u.committed[u.refs.a[lane]][gslot];
-        out.push(Claim {
-            slice: base + u.refs.a[lane],
-            point: pt_lin,
-            value: data_wires[k].clone(),
-            native_point: pt_nat,
-            native_value: nval,
-        });
-    }
 }
 
 #[cfg(test)]
