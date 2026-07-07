@@ -1841,49 +1841,61 @@ mod tests {
     /// `secret`, holding `input_value`) into `output_slot`, mirroring
     /// `user_block_fixture`'s block construction but parameterized so a
     /// chain of same-tier blocks can be produced.
+    /// Build ONE block carrying `specs.len()` standard txs (one owner, each
+    /// spending `input_slot` -> `output_slot`, shape `Standard4x8`). A single tx
+    /// (`specs.len() == 1`) reproduces the former single-tx builder exactly; a
+    /// multi-tx block is the same block with N independent txs (the class tier =
+    /// N). Returns the item, its header, and each tx's surviving output value.
     fn make_std_tx_block_item(
         start_state: &ChainState,
         start_parent: &BlockHeader,
         anchor: &AnchorInfo,
-        input_slot: u32,
-        output_slot: u32,
         secret: &SpendSecret,
-        input_value: u64,
-    ) -> (FullAcceptedBlockBatchItem, BlockHeader, u64) {
+        specs: &[(u32, u32, u64)],
+    ) -> (FullAcceptedBlockBatchItem, BlockHeader, Vec<u64>) {
         let owner = derive_address(secret);
-        let mut body = TxBody {
-            shape: TxShape::Standard4x8,
-            epoch_anchor: [0x42; 32],
-            fee: 0,
-            inputs: vec![TxInput {
-                slot_index: input_slot,
-                value: input_value,
-                owner,
-                spend_secret: secret.clone(),
-                valid: true,
-            }],
-            outputs: vec![TxOutput {
-                slot_index: output_slot,
-                value: input_value,
-                owner,
-                valid: true,
-            }],
-            is_coinbase: false,
-        };
-        let required_fee =
-            required_fee_for_tx_body(&body, start_parent.active_slot_count, start_parent.log_slots);
-        body.fee = required_fee as u128;
-        body.outputs[0].value = input_value.saturating_sub(required_fee);
-        let tx = tx_from_body(body.clone());
-        let txs = vec![tx];
+        let mut bodies = Vec::with_capacity(specs.len());
+        for &(input_slot, output_slot, input_value) in specs {
+            let mut body = TxBody {
+                shape: TxShape::Standard4x8,
+                epoch_anchor: [0x42; 32],
+                fee: 0,
+                inputs: vec![TxInput {
+                    slot_index: input_slot,
+                    value: input_value,
+                    owner,
+                    spend_secret: secret.clone(),
+                    valid: true,
+                }],
+                outputs: vec![TxOutput {
+                    slot_index: output_slot,
+                    value: input_value,
+                    owner,
+                    valid: true,
+                }],
+                is_coinbase: false,
+            };
+            let required_fee = required_fee_for_tx_body(
+                &body,
+                start_parent.active_slot_count,
+                start_parent.log_slots,
+            );
+            body.fee = required_fee as u128;
+            body.outputs[0].value = input_value.saturating_sub(required_fee);
+            bodies.push(body);
+        }
+        let txs: Vec<_> = bodies.iter().map(|b| tx_from_body(b.clone())).collect();
 
         let height = start_parent.height + 1;
         let parent_cache = {
             let mut tmp = start_state.clone();
             tmp.exact_sparse_cache().unwrap()
         };
-        let claims = vec![noid_tx::compute_claims_commitment(&body.inputs, &body.outputs)];
-        let surface = build_exact_action_surface(&start_state.state, &[body.clone()], &claims)
+        let claims: Vec<_> = bodies
+            .iter()
+            .map(|b| noid_tx::compute_claims_commitment(&b.inputs, &b.outputs))
+            .collect();
+        let surface = build_exact_action_surface(&start_state.state, &bodies, &claims)
             .expect("exact action surface");
         let state_transition = crate::build_exact_state_transition_proof(
             &parent_cache,
@@ -1894,7 +1906,9 @@ mod tests {
         .expect("exact proof");
 
         let mut child_state = start_state.clone();
-        apply_tx(&mut child_state, &body).expect("native tx apply");
+        for body in &bodies {
+            apply_tx(&mut child_state, body).expect("native tx apply");
+        }
         let mut child_guard = start_state.reuse_guard.clone();
         child_guard
             .apply_spends(height, &surface.spent_slots)
@@ -1921,7 +1935,7 @@ mod tests {
             ),
             log_slots: start_parent.log_slots,
             active_slot_count: start_state.active_slot_count,
-            alloc_counter: start_state.alloc_counter + 1,
+            alloc_counter: start_state.alloc_counter + specs.len() as u64,
         };
         header.nonce = search_pow(&header, 0, 1_000_000).expect("easy test target mines");
         let block = Block {
@@ -1931,13 +1945,13 @@ mod tests {
         let block_proof = crate::BlockProof::minimal(
             start_parent.state_root,
             block.header.state_root,
-            1,
+            specs.len() as u32,
             state_transition,
         );
         let auth_sidecar = crate::BlockAuthSidecar {
-            tx_auth: vec![auth_proof_for_body(&body)],
+            tx_auth: bodies.iter().map(auth_proof_for_body).collect(),
         };
-        let surviving_value = body.outputs[0].value;
+        let surviving_values: Vec<u64> = bodies.iter().map(|b| b.outputs[0].value).collect();
         (
             FullAcceptedBlockBatchItem {
                 block,
@@ -1945,7 +1959,7 @@ mod tests {
                 block_auth_sidecar_bytes: bincode::serialize(&auth_sidecar).unwrap(),
             },
             header,
-            surviving_value,
+            surviving_values,
         )
     }
 
@@ -2017,15 +2031,14 @@ mod tests {
                 anchor_timestamp: consensus.asert_anchor_timestamp,
                 anchor_target: consensus.asert_anchor_target,
             };
-            let (item, header, surviving_value) = make_std_tx_block_item(
+            let (item, header, surviving) = make_std_tx_block_item(
                 &state,
                 &parent,
                 &anchor,
-                input_slot,
-                output_slot,
                 &secret,
-                value,
+                &[(input_slot, output_slot, value)],
             );
+            let surviving_value = surviving[0];
             let witness = FullAcceptedBlockBatchWitness {
                 items: vec![item],
             };
@@ -2054,6 +2067,195 @@ mod tests {
             value = surviving_value;
         }
         units
+    }
+
+    /// A chain of `n_blocks` same-tier blocks, each carrying `tx_per_block`
+    /// standard txs (one owner). Block 1 spends the premined slots; block i+1
+    /// spends block i's outputs (fresh monotone output slots avoid the reuse
+    /// guard). Every block is the same class tier (`tx_per_block` standard txs),
+    /// so the region discharge sees `k = tx_per_block` obligations -- this is what
+    /// exercises the MULTI-tx wallet-PCS region discharge end to end.
+    fn chained_multi_tx_blocks(n_blocks: usize, tx_per_block: usize) -> Vec<BlockUnit> {
+        assert!(n_blocks >= 1 && tx_per_block >= 1);
+        let secret = spend_secret(7);
+        let owner = derive_address(&secret);
+        let input_value = 10_000_000u64;
+
+        // Slot space must hold the premined inputs + every block's fresh outputs.
+        let needed = 2 + tx_per_block * (n_blocks + 1);
+        let log_slots = needed.next_power_of_two().trailing_zeros().max(4) as usize;
+        let mut state = ChainState::with_log_slots(log_slots);
+        let mut current_slots: Vec<u32> = (0..tx_per_block as u32).map(|i| 2 + i).collect();
+        for &s in &current_slots {
+            state
+                .state
+                .set_slot(
+                    s,
+                    SlotValue {
+                        value: Block128::from(input_value as u128),
+                        owner_hi: owner.as_fields()[0],
+                        owner_lo: owner.as_fields()[1],
+                    },
+                )
+                .unwrap();
+        }
+        state.rebuild_exact_utxo_root_loaded().unwrap();
+        state.active_slot_count = tx_per_block as u64;
+        state.alloc_counter = 2 + tx_per_block as u64;
+
+        let mut parent = BlockHeader {
+            prev_block_hash: [0u8; 32],
+            state_root: state.cached_state_root(),
+            tx_root: compute_tx_root(&[]),
+            timestamp: 1_767_225_600,
+            height: 0,
+            miner_address: Address([0x11; 32]),
+            nonce: 0,
+            difficulty_target: MAX_TARGET,
+            log_slots: state.state.log_slots() as u32,
+            active_slot_count: state.active_slot_count,
+            alloc_counter: state.alloc_counter,
+        };
+        let mut consensus = RecursiveConsensusState::from_header(
+            &parent,
+            block_work(&parent.difficulty_target),
+            0,
+            parent.timestamp,
+            parent.difficulty_target,
+            &[parent.timestamp],
+            &[parent.active_slot_count],
+        );
+        let mut accumulator = ChainAccumulator {
+            height: parent.height,
+            state_root: parent.state_root,
+            chain_hash: [0u8; 32],
+        };
+
+        let mut units = Vec::with_capacity(n_blocks);
+        let mut values: Vec<u64> = vec![input_value; tx_per_block];
+        let mut next_free = 2 + tx_per_block as u32;
+        for i in 0..n_blocks {
+            let output_slots: Vec<u32> =
+                (0..tx_per_block as u32).map(|j| next_free + j).collect();
+            next_free += tx_per_block as u32;
+            let specs: Vec<(u32, u32, u64)> = (0..tx_per_block)
+                .map(|j| (current_slots[j], output_slots[j], values[j]))
+                .collect();
+            let anchor = AnchorInfo {
+                anchor_height: consensus.asert_anchor_height,
+                anchor_timestamp: consensus.asert_anchor_timestamp,
+                anchor_target: consensus.asert_anchor_target,
+            };
+            let (item, header, surviving) =
+                make_std_tx_block_item(&state, &parent, &anchor, &secret, &specs);
+            let witness = FullAcceptedBlockBatchWitness { items: vec![item] };
+            let (output, proof) = prove_retained_full_accepted_block_batch_proof(
+                &consensus,
+                &accumulator,
+                &parent,
+                &state,
+                &witness,
+            )
+            .unwrap_or_else(|e| panic!("multi-tx block {i} proves: {e:?}"));
+
+            units.push(BlockUnit {
+                start_accumulator: accumulator.clone(),
+                end_accumulator: output.accepted_claim_batch.accumulator.clone(),
+                inputs: output.proof_components.component_inputs.clone(),
+                proof,
+                block_header: header.clone(),
+            });
+
+            state = output.end_state;
+            consensus = output.accepted_claim_batch.consensus_state;
+            accumulator = output.accepted_claim_batch.accumulator;
+            parent = header;
+            current_slots = output_slots;
+            values = surviving;
+        }
+        units
+    }
+
+    /// Fixture check: a chain of 2-tx-per-block standard blocks proves NATIVELY
+    /// (the `prove_retained_*` call inside the builder validates each multi-tx
+    /// block), and each block's component inputs carry 2 authorization inputs.
+    /// Light (native accept only, no recursion) -- de-risks the multi-tx region
+    /// gate before its heavy m=24 proves.
+    #[test]
+    fn multi_tx_block_fixture_natively_valid() {
+        let units = chained_multi_tx_blocks(2, 2);
+        assert_eq!(units.len(), 2, "two chained multi-tx blocks");
+        for (i, u) in units.iter().enumerate() {
+            assert_eq!(
+                u.inputs.authorization_inputs.len(),
+                2,
+                "block {i} carries 2 authorization inputs (2 std txs)"
+            );
+            assert_eq!(u.inputs.authorization_totals.user_tx_count, 2, "block {i} user_tx_count");
+        }
+        eprintln!("[multi-tx] 2 blocks x 2 std txs proved natively; 2 auth inputs each");
+    }
+
+    /// The link prefills its region IO envelope from `region_wallet_pcs_native`
+    /// (a scratch owner-auth-only discharge) and pins the real block-slots
+    /// discharge WIRES to those cells, so the two MUST agree on every claim's
+    /// native (point, value) -- else π₀ fails to verify. Compare them for a 2-tx
+    /// block. Light (block-slots build only, no m=24 prove) -- localizes any
+    /// multi-tx link-threading divergence fast.
+    #[test]
+    fn region_native_matches_real_build_multitx() {
+        use noid_ivc_core::field_circuit::FieldR1csBuilder;
+        use noid_recursive::acceptance::block_slots::{
+            build_block_slots_with_config, region_wallet_pcs_native, BlockSlotsConfig,
+        };
+        use noid_recursive::acceptance::trace::region_source_binding::RegionDischargeParams;
+        let region_params = RegionDischargeParams { nq: 2, sb8_auth_layers: 1 };
+        let units = chained_multi_tx_blocks(1, 2);
+        let u = &units[0];
+        let scratch = region_wallet_pcs_native(&u.inputs, region_params);
+        let cfg = BlockSlotsConfig {
+            discharge_wallet_pcs: true,
+            wallet_pcs_region: Some(region_params),
+        };
+        let mut b = FieldR1csBuilder::new();
+        let slots = build_block_slots_with_config(
+            &mut b,
+            &u.start_accumulator,
+            &u.end_accumulator,
+            &u.inputs,
+            &u.proof,
+            cfg,
+        );
+        let real = &slots.pending_wallet_pcs;
+        eprintln!("[region-native] scratch claims={} real claims={}", scratch.len(), real.len());
+        assert_eq!(scratch.len(), real.len(), "claim count matches (scratch vs real)");
+        let mut mism = 0usize;
+        for (i, (s, r)) in scratch.iter().zip(real.iter()).enumerate() {
+            let point_eq = s.0 == r.native_point;
+            let value_eq = s.1 == r.native_value;
+            if !point_eq || !value_eq {
+                mism += 1;
+                if mism <= 8 {
+                    eprintln!(
+                        "[region-native] MISMATCH claim {i}: point_eq={point_eq} (len {}/{}), value_eq={value_eq}",
+                        s.0.len(),
+                        r.native_point.len()
+                    );
+                }
+            }
+        }
+        assert_eq!(mism, 0, "region_wallet_pcs_native must match the real discharge (2-tx)");
+        eprintln!("[region-native] scratch == real for {} claims (2-tx)", scratch.len());
+
+        // The whole block_slots(2-tx) trace is satisfiable (region columns are
+        // free wires bound only by the opening claims; the [K]/block pins -- incl.
+        // the integer count summation -- all hold at this tier).
+        let (r1cs, z) = b.build();
+        assert!(
+            r1cs.satisfies(&z),
+            "block_slots(2-tx) trace must be satisfiable (a [K]/block pin fails at this tier)"
+        );
+        eprintln!("[region-native] block_slots(2-tx) IS satisfiable ({} wires)", z.len());
     }
 
     /// THE stage-2 payoff: a CLOSED recursion over REAL blocks. π₀ (genesis
@@ -2311,9 +2513,16 @@ mod tests {
     /// param point), so it self-hosts at 2^24. `RegionDischargeParams` are kept
     /// tiny — the discharge flatness and full soundness are gated separately in
     /// `region_source_binding_full_e2e`; here we test only the IO threading.
-    #[test]
-    #[ignore = "heavy (m=24, several 2^24 proofs + one class digest); run explicitly"]
-    fn region_complete_block_bearing_link_e2e() {
+    /// Shared body of the COMPLETE region block-bearing recursion gate: freeze the
+    /// class on `units[0]`, prove π₀ (a complete region block proof) + its negative
+    /// (a tampered region committed column), then π₁ ⊳ π₀ (a regular link opening
+    /// π₀'s region columns via `spec.claims`) + the decider + its negative.
+    /// Parameterized over the block units (single-tx or multi-tx tier) and the
+    /// discharge params, so the SAME logic gates every tier.
+    fn run_region_block_bearing_gate(
+        units: &[BlockUnit],
+        region_params: noid_recursive::acceptance::trace::region_source_binding::RegionDischargeParams,
+    ) {
         use noid_ivc_core::challenger::FsLaneChallenger;
         use noid_ivc_core::field::F128;
         use noid_ivc_core::field_r1cs::FieldR1cs;
@@ -2327,19 +2536,13 @@ mod tests {
             build_link, decide_tip, genesis_witness, link_io_layout_for, LinkBlock, LinkClass,
             LinkEnvelope, LinkInput,
         };
-        use noid_recursive::acceptance::trace::region_source_binding::RegionDischargeParams;
         use std::time::Instant;
 
+        // A region link self-hosts at 2^24; this gate proves several 2^24
+        // instances sequentially, so the caller keeps nq/sb8 small to fit the
+        // per-proof footprint (the discharge soundness/flatness are gated in
+        // region_source_binding_full_e2e; here we test the IO threading + tier).
         const CLASS_M: usize = 24;
-        // Kept tiny for memory: a region link self-hosts at 2^24, and this gate
-        // proves several 2^24 instances sequentially. π₀'s COMPLETE-proof verify
-        // is separately confirmed at nq=4/sb8=2; the discharge soundness /
-        // flatness are gated in region_source_binding_full_e2e. Here nq=2/sb8=1
-        // keeps the per-proof footprint down so the negative + recursion fit.
-        let region_params = RegionDischargeParams {
-            nq: 2,
-            sb8_auth_layers: 1,
-        };
         let shape = FieldShape {
             m: CLASS_M,
             k_log: CLASS_M,
@@ -2358,7 +2561,6 @@ mod tests {
             wallet_pcs_region: Some(region_params),
         };
 
-        let units = chained_std_tx_blocks(2);
         fn mk(u: &BlockUnit, config: BlockSlotsConfig) -> LinkBlock<'_> {
             LinkBlock {
                 start_accumulator: &u.start_accumulator,
@@ -2438,6 +2640,13 @@ mod tests {
         );
         let class_digest = class_r1cs.statement_digest();
 
+        // Separate an unsatisfiable trace (a bad block/region constraint at this
+        // tier) from a PCS/opening failure -- checked before the expensive prove.
+        assert!(
+            class_r1cs.satisfies(&pi0_witness),
+            "π₀ trace is unsatisfiable at this tier (a block/region constraint fails)"
+        );
+
         // Prove π₀ and directly verify — the COMPLETE region block proof.
         let mut ch = FsLaneChallenger::new(b"history-link-v0");
         let (p0, c0, _) = prove_field_with_public_io(
@@ -2449,8 +2658,11 @@ mod tests {
             &mut ch,
         );
         let mut chv = FsLaneChallenger::new(b"history-link-v0");
-        verify_field_with_public_io(&class_r1cs, &c0, &p0, &class.spec, &pi0_io, &mut chv)
-            .expect("π₀ COMPLETE region block proof verifies");
+        if let Err(e) =
+            verify_field_with_public_io(&class_r1cs, &c0, &p0, &class.spec, &pi0_io, &mut chv)
+        {
+            panic!("π₀ COMPLETE region block proof verify FAILED: {e:?}");
+        }
         eprintln!("[region-link] π₀ COMPLETE region block proof VERIFIES (region discharge ON)");
 
         // ---- NEGATIVE: flip ONE region committed-column lane in π₀'s witness.
@@ -2587,6 +2799,29 @@ mod tests {
             );
         }
         eprintln!("[region-link] decider negative rejects; COMPLETE region link e2e OK");
+    }
+
+    /// COMPLETE region block-bearing recursion at the SINGLE-tx tier (1 std tx).
+    #[test]
+    #[ignore = "heavy (m=24, several 2^24 proofs + one class digest); run explicitly"]
+    fn region_complete_block_bearing_link_e2e() {
+        use noid_recursive::acceptance::trace::region_source_binding::RegionDischargeParams;
+        let units = chained_std_tx_blocks(2);
+        run_region_block_bearing_gate(&units, RegionDischargeParams { nq: 2, sb8_auth_layers: 1 });
+    }
+
+    /// COMPLETE region block-bearing recursion at a MULTI-tx tier (2 std txs per
+    /// block): the whole block's wallet-PCS discharges in ONE tiled plural call
+    /// (k=2 obligations) and the flat region claims thread through the link IO the
+    /// same way -- proving block_slots -> plural(k>1) -> link -> recursion end to
+    /// end. Same shared gate body as the single-tx tier; only the block units
+    /// (carrying 2 authorization inputs each) differ.
+    #[test]
+    #[ignore = "heavy (m=24, several 2^24 proofs + one class digest); run explicitly"]
+    fn region_complete_block_bearing_link_multitx_e2e() {
+        use noid_recursive::acceptance::trace::region_source_binding::RegionDischargeParams;
+        let units = chained_multi_tx_blocks(2, 2);
+        run_region_block_bearing_gate(&units, RegionDischargeParams { nq: 2, sb8_auth_layers: 1 });
     }
 
     /// The block-bearing recursion class needs two DIFFERENT real blocks of

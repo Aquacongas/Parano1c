@@ -189,6 +189,53 @@ fn pin_u64_successor(b: &mut FieldR1csBuilder, parent: &LinExpr, child: &LinExpr
     pin_eq(b, child, &recon);
 }
 
+/// `a + c` as an INTEGER (ripple-carry full adder over `n` tower bits). Both
+/// operands are range-checked `< 2^n` and the final carry is pinned to zero (no
+/// overflow), so the reconstruction is exactly the integer sum. Field addition
+/// alone is XOR in GF(2^128), which is NOT integer addition once a carry occurs.
+fn u64_add(b: &mut FieldR1csBuilder, a: &LinExpr, c: &LinExpr, n: usize) -> LinExpr {
+    let a_bits = range_check_bits(b, a, n);
+    let c_bits = range_check_bits(b, c, n);
+    let mut carry = LinExpr::zero();
+    let mut terms: Vec<LinExpr> = Vec::with_capacity(n);
+    for i in 0..n {
+        let ai = LinExpr::from_wire(a_bits[i]);
+        let ci = LinExpr::from_wire(c_bits[i]);
+        // sum_i = a_i XOR c_i XOR carry_i.
+        let sum_i = ai.add(&ci).add(&carry);
+        terms.push(sum_i.scale(flat_const(1u128 << i)));
+        // carry_{i+1} = a_i·c_i + carry_i·(a_i XOR c_i)  (the full-adder majority;
+        // the two products are never both 1, so the char-2 add IS the OR).
+        let ai_ci = mul(b, &ai, &ci);
+        let axc = ai.add(&ci);
+        let carry_axc = mul(b, &carry, &axc);
+        carry = ai_ci.add(&carry_axc);
+    }
+    pin_zero(b, &carry);
+    let mut recon = LinExpr::zero();
+    for t in &terms {
+        recon = recon.add(t);
+    }
+    recon
+}
+
+/// `Σ terms` as an INTEGER. A single term is returned unchanged (no adder wires),
+/// so a single-tx block reproduces the former single-count path exactly; K terms
+/// cost K−1 ripple-carry adds. 16 bits hold any block total (≤ 255·255 < 2^16).
+fn pin_u64_sum(b: &mut FieldR1csBuilder, terms: &[LinExpr]) -> LinExpr {
+    const N: usize = 16;
+    match terms.split_first() {
+        None => LinExpr::zero(),
+        Some((first, rest)) => {
+            let mut acc = first.clone();
+            for t in rest {
+                acc = u64_add(b, &acc, t, N);
+            }
+            acc
+        }
+    }
+}
+
 fn pin_pair_at(b: &mut FieldR1csBuilder, fields: &[LinExpr], at: usize, to: &[LinExpr; 2]) {
     pin_eq(b, &fields[at], &to[0]);
     pin_eq(b, &fields[at + 1], &to[1]);
@@ -486,8 +533,10 @@ pub fn build_block_slots_with_config(
     // (compact-FRI replay) stays per-tx.
     let mut region_obligations = Vec::new();
     let mut region_natives = Vec::new();
-    let mut owner_sum = LinExpr::zero();
-    let mut live_sum = LinExpr::zero();
+    // Per-tx owner / live-input counts, summed as INTEGERS after the loop (field
+    // addition would be XOR -- wrong for >1 tx).
+    let mut owner_counts: Vec<LinExpr> = Vec::new();
+    let mut live_lens: Vec<LinExpr> = Vec::new();
     for (input, witness_proof) in inputs
         .authorization_inputs
         .iter()
@@ -509,8 +558,8 @@ pub fn build_block_slots_with_config(
             }
         }
         pin_eq2(b, &inputs_t.tx_body_hash, &tx_hashes[input.tx_index]);
-        owner_sum = owner_sum.add(&inputs_t.owner_count);
-        live_sum = live_sum.add(&inputs_t.live_len);
+        owner_counts.push(inputs_t.owner_count.clone());
+        live_lens.push(inputs_t.live_len.clone());
         auth_inputs.push(inputs_t);
     }
     // ONE tiled plural discharge for the whole block (region path): the K txs'
@@ -528,13 +577,18 @@ pub fn build_block_slots_with_config(
             );
         }
     }
-    // Totals: per-slot sums AND the claim's resource lanes agree
-    // (`verify_authorization_components` + the transcript encoding).
+    // Totals: the per-slot counts sum to the claim's resource lanes
+    // (`verify_authorization_components`). The per-tx counts sum as INTEGERS
+    // (ripple-carry over tower bits), NOT field addition -- GF(2^128) add is XOR,
+    // so a field sum of >1 count is wrong (e.g. 1 + 1 = 0, not 2). A single-tx
+    // block sums one term, reproducing the former single-count pin exactly.
     let totals = &inputs.authorization_totals;
     let user_tx_count = const_block(Block128::from(totals.user_tx_count as u128));
     pin_eq(b, &claim.fields[claim_layout::USER_TX_COUNT], &user_tx_count);
+    let live_sum = pin_u64_sum(b, &live_lens);
     pin_eq(b, &claim.fields[claim_layout::LIVE_INPUT_COUNT], &live_sum);
     let owner_total = alloc_block(b, Block128::from(totals.owner_count_total as u128));
+    let owner_sum = pin_u64_sum(b, &owner_counts);
     pin_eq(b, &owner_total, &owner_sum);
     let tx_count = const_block(Block128::from(tx_hashes.len() as u128));
     pin_eq(b, &claim.fields[claim_layout::TX_COUNT], &tx_count);
