@@ -3477,6 +3477,113 @@ mod stage1_duplex_union_tests {
         );
     }
 
+    /// [G] step 4 Stage 2 SOUNDNESS: a RAW-READ committed cell is bound by its
+    /// column's single walk opening — no per-cell opening claim needed. This is
+    /// the invariant the Stage-2 claim collapse rests on: the walk selection
+    /// opens each carry column at ONE random point (Schwartz–Zippel binds every
+    /// cell), so the per-tx challenge/absorb reads can drop their per-cell claims
+    /// and read the committed cell directly. Here we discharge ONLY the walk
+    /// (no `read_duplex_challenges`), raw-read a squeezed challenge straight out
+    /// of its carry cell, and show: honest verifies + the raw-read carries the
+    /// native challenge value; flipping that carry cell leaves the trace
+    /// satisfiable (the cell is unconstrained by the trace — no per-cell claim)
+    /// yet breaks the column's selection opening → the PCS rejects. So the
+    /// raw-read value is provably the correct squeezed challenge.
+    #[test]
+    fn duplex_union_raw_read_binding() {
+        use noid_ivc_core::challenger::FsLaneChallenger;
+        use noid_ivc_core::pcs::{self, PcsParams};
+        use noid_ivc_core::public_io::{IoClaimSpec, PublicIoSpec};
+        use noid_ivc_core::verifier::verify_field_with_public_io;
+        use noid_ivc_prover::field_prover::prove_field_with_public_io;
+
+        const OUTER: &[u8] = b"duplex-raw-read-outer";
+        let layout = compile_duplex(&channel_ops());
+        let data: Vec<Vec<F128>> =
+            (0..2).map(|t| tx_data(&layout, 0x5EED_0000 + t as u64)).collect();
+        let u = build_duplex_union(&layout, iv_flat(), &data);
+        let native = run_duplex_union_native(&u, b"duplex-raw-read");
+        let w_log = u.w_log;
+
+        let mut b = FieldR1csBuilder::new();
+        let slices: Vec<WitnessSlice> =
+            u.committed.iter().map(|c| alloc_column_slice(&mut b, c, w_log).0).collect();
+        // Discharge ONLY the walk (selection -> walk -> substitution -> shifts).
+        // NO per-cell challenge reads: the Stage-2 pattern raw-reads instead.
+        let claims = discharge_duplex_union(&mut b, &u, b"duplex-raw-read", &native, 0);
+
+        // RAW-READ tx 0's first squeezed challenge straight out of its carry cell
+        // (no fresh wire, no per-cell claim): the cell wire IS the challenge.
+        let (chal_slot, chal_lane) = u.layout.challenges[0];
+        let c_col = slices[u.refs.c[chal_lane]];
+        let chal = LinExpr::from_wire(noid_ivc_core::field_circuit::Wire(
+            (c_col.start() + chal_slot) as u32,
+        ));
+
+        // Wire the walk claims into the PCS (uniform w_log-arity points).
+        let lanes_per = w_log + 1;
+        let io_len = claims.len() * lanes_per;
+        let io_log = io_len.next_power_of_two().trailing_zeros() as usize;
+        let mut io_values = Vec::with_capacity(io_len);
+        for c in &claims {
+            io_values.extend_from_slice(&c.native_point);
+            io_values.push(c.native_value);
+        }
+        let (io_slice, io_wires) = alloc_column_slice(&mut b, &io_values, io_log);
+        for (ci, c) in claims.iter().enumerate() {
+            let base = ci * lanes_per;
+            for (kk, p) in c.point.iter().enumerate() {
+                pin_eq(&mut b, p, &io_wires[base + kk]);
+            }
+            pin_eq(&mut b, &c.value, &io_wires[base + w_log]);
+        }
+        let spec = PublicIoSpec {
+            io_slice,
+            io_len,
+            claims: claims
+                .iter()
+                .enumerate()
+                .map(|(ci, c)| IoClaimSpec {
+                    slice: slices[c.slice],
+                    point: ci * lanes_per..ci * lanes_per + w_log,
+                    value: ci * lanes_per + w_log,
+                })
+                .collect(),
+        };
+
+        let (r1cs, z) = b.build();
+        assert!(r1cs.satisfies(&z), "honest raw-read trace unsatisfiable");
+        // The raw-read cell carries exactly the native squeezed challenge.
+        assert_eq!(chal.eval(&z), u.challenges[0][0], "raw-read == native challenge");
+        let params = PcsParams {
+            m: r1cs.m + pcs::LOG_PACKING,
+            log_inv_rate: 2,
+            log_batch_size: 2,
+            profile: Default::default(),
+        };
+        let mut ch_p = FsLaneChallenger::new(OUTER);
+        let (proof, commitment, _) =
+            prove_field_with_public_io(&r1cs, &z, &params, &spec, &io_values, &mut ch_p);
+        let mut ch_v = FsLaneChallenger::new(OUTER);
+        verify_field_with_public_io(&r1cs, &commitment, &proof, &spec, &io_values, &mut ch_v)
+            .expect("honest raw-read proof verifies");
+
+        // Flip the raw-read carry cell: the trace stays satisfiable (no per-cell
+        // claim constrains it) but the column's selection opening is now false.
+        let mut bad_z = z.clone();
+        bad_z[c_col.start() + chal_slot] += F128::ONE;
+        assert!(r1cs.satisfies(&bad_z), "the raw-read cell is unconstrained by the trace");
+        let mut ch_p = FsLaneChallenger::new(OUTER);
+        let (bad_proof, bad_commitment, _) =
+            prove_field_with_public_io(&r1cs, &bad_z, &params, &spec, &io_values, &mut ch_p);
+        let mut ch_v = FsLaneChallenger::new(OUTER);
+        assert!(
+            verify_field_with_public_io(&r1cs, &bad_commitment, &bad_proof, &spec, &io_values, &mut ch_v)
+                .is_err(),
+            "flipping a raw-read carry cell must break the column's walk opening"
+        );
+    }
+
     /// Transaction-count independence: doubling K raises the tiled domain by one
     /// bit, so the ONE channel walk gains exactly one sumcheck round —
     /// logarithmic, not the K-fold of K inline channel replays.
