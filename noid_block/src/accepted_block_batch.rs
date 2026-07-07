@@ -1745,6 +1745,7 @@ mod tests {
                     nq,
                     sb8_auth_layers: sb8,
                 }),
+                owner_auth_region: false,
             };
             let mut b = FieldR1csBuilder::new();
             let slots = build_block_slots_with_config(
@@ -1798,7 +1799,11 @@ mod tests {
         let units = chained_std_tx_blocks(1);
         for (nq, sb8) in [(1usize, 1usize)] {
             let rp = RegionDischargeParams { nq, sb8_auth_layers: sb8 };
-            let cfg = BlockSlotsConfig { discharge_wallet_pcs: true, wallet_pcs_region: Some(rp) };
+            let cfg = BlockSlotsConfig {
+                discharge_wallet_pcs: true,
+                wallet_pcs_region: Some(rp),
+                owner_auth_region: false,
+            };
             let sample = LinkBlock {
                 start_accumulator: &units[0].start_accumulator,
                 end_accumulator: &units[0].end_accumulator,
@@ -2212,10 +2217,11 @@ mod tests {
         let region_params = RegionDischargeParams { nq: 2, sb8_auth_layers: 1 };
         let units = chained_multi_tx_blocks(1, 2);
         let u = &units[0];
-        let scratch = region_wallet_pcs_native(&u.inputs, region_params);
+        let scratch = region_wallet_pcs_native(&u.inputs, region_params, false);
         let cfg = BlockSlotsConfig {
             discharge_wallet_pcs: true,
             wallet_pcs_region: Some(region_params),
+            owner_auth_region: false,
         };
         let mut b = FieldR1csBuilder::new();
         let slots = build_block_slots_with_config(
@@ -2256,6 +2262,243 @@ mod tests {
             "block_slots(2-tx) trace must be satisfiable (a [K]/block pin fails at this tier)"
         );
         eprintln!("[region-native] block_slots(2-tx) IS satisfiable ({} wires)", z.len());
+    }
+
+    /// Owner-auth region-vs-inline OBLIGATION PARITY on a REAL block's auth data.
+    /// The shape-fixed region KSCHANNL walk-C discharge
+    /// (`discharge_owner_auth_killshots_via_region`, the `owner_auth_region=true`
+    /// path) must produce the SAME `PendingAuthPcsObligation` (reduced r_B /
+    /// b_final + commitment cap lanes) the inline per-tx replay
+    /// (`build_owner_auth_slot`, the `owner_auth_region=false` path) does — the
+    /// invariant the flag rests on, since the region path feeds these obligations
+    /// to the wallet-PCS discharge UNCHANGED. Light (no wallet-PCS discharge, no
+    /// block-[B] killshots), so it runs in CI.
+    #[test]
+    fn region_owner_auth_obligation_parity_real_block() {
+        use noid_ivc_core::field_circuit::FieldR1csBuilder;
+        use noid_recursive::acceptance::trace::owner_auth::{
+            build_owner_auth_slot, OwnerAuthProofTrace, OwnerAuthPublicInputsTrace,
+        };
+        use noid_recursive::acceptance::trace::region_source_binding::discharge_owner_auth_killshots_via_region;
+
+        let units = chained_std_tx_blocks(1);
+        let u = &units[0];
+        let auth = &u.inputs.authorization_inputs;
+        let wit = &u.inputs.authorization_witnesses;
+        assert!(!auth.is_empty(), "the std-tx block carries at least one auth input");
+
+        let mut b = FieldR1csBuilder::new();
+        // Inline obligations (the canonical per-tx replay).
+        let inline_obs: Vec<_> = auth
+            .iter()
+            .zip(wit.iter())
+            .map(|(inp, wp)| build_owner_auth_slot(&mut b, wp, &inp.public).1)
+            .collect();
+        // Region obligations on freshly-allocated trace proof/inputs (the SAME
+        // alloc the block-slots region path does).
+        let proof_ts: Vec<OwnerAuthProofTrace> = auth
+            .iter()
+            .zip(wit.iter())
+            .map(|(inp, wp)| OwnerAuthProofTrace::alloc(&mut b, wp, inp.public.layout))
+            .collect();
+        let input_ts: Vec<OwnerAuthPublicInputsTrace> = auth
+            .iter()
+            .map(|inp| OwnerAuthPublicInputsTrace::alloc(&mut b, &inp.public))
+            .collect();
+        let natives: Vec<_> = wit.iter().cloned().collect();
+        let native_inputs: Vec<_> = auth.iter().map(|i| i.public.clone()).collect();
+        let (region_obs, oa_claims) = discharge_owner_auth_killshots_via_region(
+            &mut b,
+            &proof_ts,
+            &input_ts,
+            &natives,
+            &native_inputs,
+        );
+        assert!(!oa_claims.is_empty(), "region discharge produced no walk-C opening claims");
+
+        let (r1cs, z) = b.build();
+        assert!(
+            r1cs.satisfies(&z),
+            "combined inline+region owner-auth trace must be satisfiable"
+        );
+
+        assert_eq!(region_obs.len(), inline_obs.len(), "obligation count");
+        for (i, (ro, io)) in region_obs.iter().zip(inline_obs.iter()).enumerate() {
+            assert_eq!(ro.num_vars, io.num_vars, "obligation {i} num_vars");
+            assert_eq!(
+                ro.reduction.point.len(),
+                io.reduction.point.len(),
+                "obligation {i} point arity"
+            );
+            for (pr, pi) in ro.reduction.point.iter().zip(io.reduction.point.iter()) {
+                assert_eq!(pr.eval(&z), pi.eval(&z), "obligation {i} r_B mismatch (region vs inline)");
+            }
+            assert_eq!(
+                ro.reduction.value.eval(&z),
+                io.reduction.value.eval(&z),
+                "obligation {i} b_final mismatch (region vs inline)"
+            );
+            assert_eq!(
+                ro.commitment_cap_lanes.len(),
+                io.commitment_cap_lanes.len(),
+                "obligation {i} cap lane count"
+            );
+            for (lr, li) in ro.commitment_cap_lanes.iter().zip(io.commitment_cap_lanes.iter()) {
+                assert_eq!(lr[0].eval(&z), li[0].eval(&z), "obligation {i} cap lane 0");
+                assert_eq!(lr[1].eval(&z), li[1].eval(&z), "obligation {i} cap lane 1");
+            }
+        }
+        eprintln!(
+            "[owner-auth-region] real-block obligation parity: {} obligation(s), {} walk-C claims, {} wires",
+            region_obs.len(),
+            oa_claims.len(),
+            z.len()
+        );
+    }
+
+    /// MEMORY / SHAPE measurement for `BlockSlotsConfig::owner_auth_region`.
+    /// Build the FULL complete block-bearing slots (region wallet-PCS discharge
+    /// ON) at 1 std tx with owner-auth INLINE vs owner-auth REGION, and report
+    /// each build's matrix `m` + wire count. This is the key number for the
+    /// separate-vs-combined walk-C decision: if the region path stays at the same
+    /// `m`, a standalone owner-auth walk-C fits alongside the wallet-PCS region
+    /// discharge; if `m` grows, the combined `build_combined_duplex_union`
+    /// primitive is needed. Also asserts BOTH builds satisfy and that the region
+    /// path's wallet-PCS claim natives (the suffix of `pending_wallet_pcs`)
+    /// exactly reproduce the inline path's (end-to-end obligation parity, the
+    /// owner-auth walk-C claims being the added prefix). Heavy (two full
+    /// block-slot builds, no proving); run explicitly and report.
+    #[test]
+    #[ignore = "measurement (two full block-slot builds); run explicitly to size owner-auth region"]
+    fn region_owner_auth_full_block_memory_measure() {
+        use noid_ivc_core::field_circuit::FieldR1csBuilder;
+        use noid_recursive::acceptance::block_slots::{
+            build_block_slots_with_config, region_wallet_pcs_native, BlockSlotsConfig,
+        };
+        use noid_recursive::acceptance::trace::region_source_binding::RegionDischargeParams;
+
+        let region_params = RegionDischargeParams { nq: 2, sb8_auth_layers: 1 };
+        let units = chained_std_tx_blocks(1);
+        let u = &units[0];
+
+        let cfg_inline = BlockSlotsConfig {
+            discharge_wallet_pcs: true,
+            wallet_pcs_region: Some(region_params),
+            owner_auth_region: false,
+        };
+        let cfg_region = BlockSlotsConfig {
+            discharge_wallet_pcs: true,
+            wallet_pcs_region: Some(region_params),
+            owner_auth_region: true,
+        };
+
+        // Inline-owner-auth path: build, extract numbers + wallet-PCS claim
+        // natives, then drop the (r, z) before the region build to cap peak RAM.
+        let (m_inline, wires_inline, sat_inline, pcs_inline) = {
+            let mut b = FieldR1csBuilder::new();
+            let slots = build_block_slots_with_config(
+                &mut b,
+                &u.start_accumulator,
+                &u.end_accumulator,
+                &u.inputs,
+                &u.proof,
+                cfg_inline,
+            );
+            let pcs: Vec<_> = slots
+                .pending_wallet_pcs
+                .iter()
+                .map(|c| (c.native_point.clone(), c.native_value))
+                .collect();
+            let nw = b.num_wires();
+            let (r, z) = b.build();
+            (r.m, nw, r.satisfies(&z), pcs)
+        };
+        eprintln!(
+            "[owner-auth-region] INLINE owner-auth: m={m_inline} wires={wires_inline} sat={sat_inline} wallet_pcs_claims={}",
+            pcs_inline.len()
+        );
+
+        // Region-owner-auth path (adds the owner-auth KSCHANNL walk-C).
+        let (m_region, wires_region, sat_region, pcs_region_all) = {
+            let mut b = FieldR1csBuilder::new();
+            let slots = build_block_slots_with_config(
+                &mut b,
+                &u.start_accumulator,
+                &u.end_accumulator,
+                &u.inputs,
+                &u.proof,
+                cfg_region,
+            );
+            let all: Vec<_> = slots
+                .pending_wallet_pcs
+                .iter()
+                .map(|c| (c.native_point.clone(), c.native_value))
+                .collect();
+            let nw = b.num_wires();
+            let (r, z) = b.build();
+            (r.m, nw, r.satisfies(&z), all)
+        };
+        let n_all = pcs_region_all.len();
+        eprintln!(
+            "[owner-auth-region] REGION owner-auth: m={m_region} wires={wires_region} sat={sat_region} total_claims={n_all}"
+        );
+        eprintln!(
+            "[owner-auth-region] delta: m {m_inline} -> {m_region} ({}), wires {wires_inline} -> {wires_region} (+{})",
+            if m_region == m_inline {
+                "SAME class m (a standalone owner-auth walk-C fits)"
+            } else {
+                "m INCREASED (a combined duplex union may be needed)"
+            },
+            wires_region as i64 - wires_inline as i64,
+        );
+
+        assert!(sat_inline, "inline-owner-auth complete block must be satisfiable");
+        assert!(sat_region, "region-owner-auth complete block must be satisfiable");
+
+        // End-to-end parity: `pending_wallet_pcs` in the region path is
+        // [owner-auth walk-C claims ... , wallet-PCS claims ...]; the wallet-PCS
+        // SUFFIX must byte-match the inline path's wallet-PCS claims (identical
+        // obligations -> identical wallet-PCS claims). The prefix is the owner-auth
+        // transcript binding the region path adds.
+        assert!(
+            n_all > pcs_inline.len(),
+            "region path must ADD owner-auth walk-C claims (got {n_all}, inline {})",
+            pcs_inline.len()
+        );
+        let n_wallet = pcs_inline.len();
+        let suffix = &pcs_region_all[n_all - n_wallet..];
+        for (i, (sr, si)) in suffix.iter().zip(pcs_inline.iter()).enumerate() {
+            assert_eq!(sr.0, si.0, "wallet-PCS claim {i} point drift (region vs inline)");
+            assert_eq!(sr.1, si.1, "wallet-PCS claim {i} value drift (region vs inline)");
+        }
+        eprintln!(
+            "[owner-auth-region] wallet-PCS suffix ({n_wallet} claims) parity OK; owner-auth added {} walk-C claims",
+            n_all - n_wallet
+        );
+
+        // The link recovers the region IO envelope via `region_wallet_pcs_native`
+        // (an auth-only scratch discharge) BEFORE the real trace allocates the IO
+        // cells; its output MUST match the real build's `pending_wallet_pcs`
+        // natives, in ORDER, for the owner-auth-region path too (the mirror). Gate
+        // it directly against the real region build above.
+        let scratch = region_wallet_pcs_native(&u.inputs, region_params, true);
+        assert_eq!(
+            scratch.len(),
+            pcs_region_all.len(),
+            "region_wallet_pcs_native(true) claim count must match the real region build"
+        );
+        for (i, (s, r)) in scratch.iter().zip(pcs_region_all.iter()).enumerate() {
+            assert_eq!(s.0, r.0, "scratch-vs-real region claim {i} point drift (owner-auth region)");
+            assert_eq!(s.1, r.1, "scratch-vs-real region claim {i} value drift (owner-auth region)");
+        }
+        eprintln!(
+            "[owner-auth-region] region_wallet_pcs_native(true) == real build for {} claims (mirror OK)",
+            scratch.len()
+        );
+
+        // Guard against an accidental blow-up (region walk-C discharges are
+        // ~1M rows each; two in one build must stay bounded).
+        assert!(m_region <= 24, "region owner-auth block-slot m exceeded 2^24 guard: {m_region}");
     }
 
     /// THE stage-2 payoff: a CLOSED recursion over REAL blocks. π₀ (genesis
@@ -2301,6 +2544,7 @@ mod tests {
         let no_pcs = BlockSlotsConfig {
             discharge_wallet_pcs: false,
             wallet_pcs_region: None,
+            owner_auth_region: false,
         };
         let layout = link_io_layout_for(shape.k_log, true);
 
@@ -2559,6 +2803,7 @@ mod tests {
         let region_cfg = BlockSlotsConfig {
             discharge_wallet_pcs: true,
             wallet_pcs_region: Some(region_params),
+            owner_auth_region: false,
         };
 
         fn mk(u: &BlockUnit, config: BlockSlotsConfig) -> LinkBlock<'_> {
@@ -2862,6 +3107,7 @@ mod tests {
         let no_pcs = BlockSlotsConfig {
             discharge_wallet_pcs: false,
             wallet_pcs_region: None,
+            owner_auth_region: false,
         };
         let r0 = build(&units[0], no_pcs, "block 0 (height 1, no wallet-PCS)");
         let r1 = build(&units[1], no_pcs, "block 1 (height 2, no wallet-PCS)");
@@ -2947,6 +3193,7 @@ mod tests {
                 nq: 2,
                 sb8_auth_layers: 1,
             }),
+            owner_auth_region: false,
         };
         // Each claim's point/value must be class-fixed too — they are NOT part
         // of the block-slot matrix (they are pinned to the IO tail only in the

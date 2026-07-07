@@ -69,7 +69,8 @@ use super::trace::accepted_claim_batch::{
 use super::trace::accepted_claim_hash::{build_accepted_claim_hash_slot, AcceptedClaimHashInputsTrace};
 use super::trace::auth_pcs::discharge_auth_pcs_obligation;
 use super::trace::region_source_binding::{
-    discharge_auth_pcs_obligations_via_region, RegionDischargeParams, RegionPcsClaim,
+    discharge_auth_pcs_obligations_via_region, discharge_owner_auth_killshots_via_region,
+    RegionDischargeParams, RegionPcsClaim,
 };
 use super::trace::checkpoint_poseidon::{
     build_checkpoint_poseidon_slot_with_inputs, ChainAccumulatorBatchInputsTrace,
@@ -77,7 +78,9 @@ use super::trace::checkpoint_poseidon::{
 };
 use super::trace::exact_state::{build_exact_state_slot, ExactStateSlotWires};
 use super::trace::merkle_path::{build_batched_merkle_slot, MerklePathInputsTrace};
-use super::trace::owner_auth::{build_owner_auth_slot, OwnerAuthPublicInputsTrace};
+use super::trace::owner_auth::{
+    build_owner_auth_slot, OwnerAuthProofTrace, OwnerAuthPublicInputsTrace,
+};
 use super::trace::tx_body_spine::{build_standard_tx_body_slot, SpineInputsTrace};
 use super::trace::{
     alloc_block, const_block, flat_const, mul, pin_eq, pin_zero, range_check_bits, FieldR1csBuilder,
@@ -322,6 +325,21 @@ pub struct BlockSlotsConfig {
     /// link to thread through public-IO. `None` = the inline discharge. Only
     /// consulted when `discharge_wallet_pcs` is true.
     pub wallet_pcs_region: Option<RegionDischargeParams>,
+    /// When true, verify the block's owner-authorization killshots via the
+    /// SHAPE-FIXED region KSCHANNL walk-C discharge
+    /// (`discharge_owner_auth_killshots_via_region`) instead of the inline
+    /// per-tx channel replay (`build_owner_auth_slot`). This replays all K
+    /// KSCHANNL transcripts on ONE tiled data-parallel walk, so owner-auth
+    /// verification (the dominant per-tx [K] piece) is transaction-count flat.
+    ///
+    /// REQUIRES `wallet_pcs_region.is_some()`: the region owner-auth discharge
+    /// PRODUCES the [`super::trace::owner_auth::PendingAuthPcsObligation`]s that
+    /// the wallet-PCS region discharge then CONSUMES, and its own walk-C
+    /// committed-column opening claims (which bind the owner-auth transcript)
+    /// are collected into [`BlockSlots::pending_wallet_pcs`] (BEFORE the
+    /// wallet-PCS claims) for the link to thread through public-IO, so both must
+    /// be discharged for a complete proof. `false` = the inline per-tx replay.
+    pub owner_auth_region: bool,
 }
 
 impl Default for BlockSlotsConfig {
@@ -329,6 +347,7 @@ impl Default for BlockSlotsConfig {
         Self {
             discharge_wallet_pcs: true,
             wallet_pcs_region: None,
+            owner_auth_region: false,
         }
     }
 }
@@ -533,6 +552,16 @@ pub fn build_block_slots_with_config(
     // (compact-FRI replay) stays per-tx.
     let mut region_obligations = Vec::new();
     let mut region_natives = Vec::new();
+    // Region owner-auth path (`config.owner_auth_region`): the inline per-tx
+    // KSCHANNL replay is skipped; instead every tx's trace proof/inputs and
+    // native objects are collected and the whole block's owner-auth killshots
+    // discharge in ONE tiled data-parallel walk-C AFTER the loop
+    // (transaction-count flat). That discharge produces the same PCS obligations
+    // the inline replay does (which the wallet-PCS discharge consumes) plus the
+    // walk-C opening claims that bind the transcript.
+    let mut oa_trace_proofs: Vec<OwnerAuthProofTrace> = Vec::new();
+    let mut oa_natives = Vec::new();
+    let mut oa_native_inputs = Vec::new();
     // Per-tx owner / live-input counts, summed as INTEGERS after the loop (field
     // addition would be XOR -- wrong for >1 tx).
     let mut owner_counts: Vec<LinExpr> = Vec::new();
@@ -545,22 +574,65 @@ pub fn build_block_slots_with_config(
         assert_eq!(input.block_index, 0, "one block per link");
         // Native `verify_authorization_statement_proof` statement check.
         assert_eq!(input.tx_body_hash, input.public.tx_body_hash);
-        let (inputs_t, obligation) = build_owner_auth_slot(b, witness_proof, &input.public);
-        if config.discharge_wallet_pcs {
-            match config.wallet_pcs_region {
-                // Inline compact-FRI replay (proof-dependent shape).
-                None => discharge_auth_pcs_obligation(b, &obligation, &witness_proof.pcs),
-                // Shape-fixed region discharge: defer to ONE tiled call below.
-                Some(_) => {
-                    region_obligations.push(obligation);
-                    region_natives.push(witness_proof.pcs.clone());
+        if config.owner_auth_region {
+            // Region path: alloc the two trace objects EXACTLY as the inline slot
+            // (`build_owner_auth_slot`) does, but do NOT run the inline killshot —
+            // the KSCHANNL transcript is replayed by the shared walk-C discharge
+            // after the loop. The statement bindings (tx_body_hash pin, owner /
+            // live-input counts) are identical to the inline path.
+            let inputs_t = OwnerAuthPublicInputsTrace::alloc(b, &input.public);
+            let proof_t = OwnerAuthProofTrace::alloc(b, witness_proof, input.public.layout);
+            pin_eq2(b, &inputs_t.tx_body_hash, &tx_hashes[input.tx_index]);
+            owner_counts.push(inputs_t.owner_count.clone());
+            live_lens.push(inputs_t.live_len.clone());
+            oa_trace_proofs.push(proof_t);
+            oa_natives.push(witness_proof.clone());
+            oa_native_inputs.push(input.public.clone());
+            // The wallet-PCS discharge still consumes each tx's capsule proof.
+            region_natives.push(witness_proof.pcs.clone());
+            auth_inputs.push(inputs_t);
+        } else {
+            // Inline per-tx owner-auth killshot replay.
+            let (inputs_t, obligation) = build_owner_auth_slot(b, witness_proof, &input.public);
+            if config.discharge_wallet_pcs {
+                match config.wallet_pcs_region {
+                    // Inline compact-FRI replay (proof-dependent shape).
+                    None => discharge_auth_pcs_obligation(b, &obligation, &witness_proof.pcs),
+                    // Shape-fixed region discharge: defer to ONE tiled call below.
+                    Some(_) => {
+                        region_obligations.push(obligation);
+                        region_natives.push(witness_proof.pcs.clone());
+                    }
                 }
             }
+            pin_eq2(b, &inputs_t.tx_body_hash, &tx_hashes[input.tx_index]);
+            owner_counts.push(inputs_t.owner_count.clone());
+            live_lens.push(inputs_t.live_len.clone());
+            auth_inputs.push(inputs_t);
         }
-        pin_eq2(b, &inputs_t.tx_body_hash, &tx_hashes[input.tx_index]);
-        owner_counts.push(inputs_t.owner_count.clone());
-        live_lens.push(inputs_t.live_len.clone());
-        auth_inputs.push(inputs_t);
+    }
+    // Region owner-auth discharge (once, after the loop): ONE tiled walk-C
+    // replays all K KSCHANNL transcripts (transaction-count flat), producing the
+    // SAME `PendingAuthPcsObligation`s the inline per-tx replay does plus the
+    // walk-C committed-column opening claims. The obligations feed the wallet-PCS
+    // discharge below UNCHANGED; the walk-C claims bind the owner-auth transcript
+    // and MUST be threaded through the link IO, so they come FIRST in
+    // `pending_wallet_pcs`. Requires the region wallet-PCS path so the obligations
+    // are actually discharged (a complete proof).
+    if config.owner_auth_region {
+        assert!(
+            config.wallet_pcs_region.is_some(),
+            "owner_auth_region requires wallet_pcs_region (the produced obligation must be discharged)"
+        );
+        let (obligations, oa_claims) = discharge_owner_auth_killshots_via_region(
+            b,
+            &oa_trace_proofs,
+            &auth_inputs,
+            &oa_natives,
+            &oa_native_inputs,
+        );
+        region_obligations = obligations;
+        pending_wallet_pcs.extend(oa_claims);
     }
     // ONE tiled plural discharge for the whole block (region path): the K txs'
     // wallet-capsule families tile into one walk A/B/C and the returned committed-
@@ -569,12 +641,14 @@ pub fn build_block_slots_with_config(
     // tier pads its real txs to next_pow2 with ghost obligations).
     if let Some(params) = config.wallet_pcs_region {
         if !region_obligations.is_empty() {
-            pending_wallet_pcs = discharge_auth_pcs_obligations_via_region(
+            // extend (not assign): the owner-auth region path may have already
+            // pushed its walk-C opening claims, which must be kept.
+            pending_wallet_pcs.extend(discharge_auth_pcs_obligations_via_region(
                 b,
                 &region_obligations,
                 &region_natives,
                 params,
-            );
+            ));
         }
     }
     // Totals: the per-slot counts sum to the claim's resource lanes
@@ -669,47 +743,98 @@ pub fn build_block_slots_with_config(
     }
 }
 
-/// The region wallet-PCS opening claims' native `(point, value)` per claim, via
-/// a lightweight scratch discharge over ONLY the per-tx owner-auth slots + the
-/// region discharge — SKIPPING the block-[B] killshots (~2.7M wires @1 tx),
-/// which do not affect the region native values.
+/// The region opening claims' native `(point, value)` per claim, in
+/// [`BlockSlots::pending_wallet_pcs`] ORDER, via a lightweight scratch discharge
+/// over ONLY the owner-auth slots + the region discharge(s) — SKIPPING the
+/// block-[B] killshots (~2.7M wires @1 tx), which do not affect the region
+/// native values.
 ///
 /// The link fills its public-IO envelope from these BEFORE the real trace
 /// allocates the fixed-position IO cells; the claim WIRES + committed-column
-/// SLICES come from the real (full) build. The region discharge is driven
-/// solely by each tx's owner-auth obligation (`commitment_cap_lanes` +
-/// `reduction`), so the native `(point, value)` here are identical to the
-/// full-block build — only the committed-column slices differ (supplied by the
-/// real build, not here). This is what lets the link recover the IO values
-/// without building the whole block slots twice (the block-[B] half is no
-/// longer duplicated; only the region discharge is, and that is unavoidable
-/// while the IO cells sit at a fixed early position).
+/// SLICES come from the real (full) build. The region native `(point, value)`
+/// are driven solely by each tx's owner-auth obligation (`commitment_cap_lanes`
+/// + `reduction`) and — with `owner_auth_region` — the class-fixed KSCHANNL
+/// channel schedule, both content-determined and independent of the wire
+/// positions / the [B] killshots, so the values here are identical to the
+/// full-block build (only the committed-column slices differ, supplied by the
+/// real build). This is what lets the link recover the IO values without
+/// building the whole block slots twice.
+///
+/// `owner_auth_region` MUST match the real build's
+/// [`BlockSlotsConfig::owner_auth_region`]: when true, the walk-C owner-auth
+/// opening claims precede the wallet-PCS claims (mirroring the real build's
+/// `pending_wallet_pcs` ordering), and the wallet-PCS obligations are produced
+/// by the SAME scratch owner-auth region discharge (parity with the inline
+/// obligations is separately gated).
 pub fn region_wallet_pcs_native(
     inputs: &AcceptedBlockBatchComponentInputs,
     params: RegionDischargeParams,
+    owner_auth_region: bool,
 ) -> Vec<(Vec<F128>, F128)> {
-    let mut pb = FieldR1csBuilder::new();
-    let mut obligations = Vec::new();
-    let mut natives = Vec::new();
-    for (input, witness_proof) in inputs
-        .authorization_inputs
-        .iter()
-        .zip(inputs.authorization_witnesses.iter())
-    {
-        let (_inputs_t, obligation) = build_owner_auth_slot(&mut pb, witness_proof, &input.public);
-        obligations.push(obligation);
-        natives.push(witness_proof.pcs.clone());
-    }
-    if obligations.is_empty() {
+    if inputs.authorization_inputs.is_empty() {
         return Vec::new();
     }
-    // ONE tiled plural discharge -- the same call the real block-slots build makes.
-    // The region `(point, value)` depend only on each tx's obligation + native
-    // proof (not on the wire positions or the [B] killshots), so they are
-    // identical to the full build; only the committed-column SLICES differ (the
-    // link takes those from the real build).
-    discharge_auth_pcs_obligations_via_region(&mut pb, &obligations, &natives, params)
-        .into_iter()
-        .map(|c| (c.native_point, c.native_value))
-        .collect()
+    let mut pb = FieldR1csBuilder::new();
+    let mut out: Vec<(Vec<F128>, F128)> = Vec::new();
+    // Produce the wallet-PCS obligations + natives the SAME way the real build
+    // does for this `owner_auth_region` mode.
+    let (obligations, natives) = if owner_auth_region {
+        // Scratch owner-auth region discharge (mirror of the real build): its
+        // walk-C opening claims come FIRST in `pending_wallet_pcs`, so prefill
+        // their natives before the wallet-PCS claims below.
+        let oa_trace_proofs: Vec<OwnerAuthProofTrace> = inputs
+            .authorization_inputs
+            .iter()
+            .zip(inputs.authorization_witnesses.iter())
+            .map(|(input, wp)| OwnerAuthProofTrace::alloc(&mut pb, wp, input.public.layout))
+            .collect();
+        let oa_trace_inputs: Vec<OwnerAuthPublicInputsTrace> = inputs
+            .authorization_inputs
+            .iter()
+            .map(|input| OwnerAuthPublicInputsTrace::alloc(&mut pb, &input.public))
+            .collect();
+        let oa_natives: Vec<_> = inputs.authorization_witnesses.iter().cloned().collect();
+        let oa_native_inputs: Vec<_> =
+            inputs.authorization_inputs.iter().map(|i| i.public.clone()).collect();
+        let (obligations, oa_claims) = discharge_owner_auth_killshots_via_region(
+            &mut pb,
+            &oa_trace_proofs,
+            &oa_trace_inputs,
+            &oa_natives,
+            &oa_native_inputs,
+        );
+        for c in &oa_claims {
+            out.push((c.native_point.clone(), c.native_value));
+        }
+        let natives: Vec<_> =
+            inputs.authorization_witnesses.iter().map(|wp| wp.pcs.clone()).collect();
+        (obligations, natives)
+    } else {
+        // Inline per-tx owner-auth obligations.
+        let mut obligations = Vec::new();
+        let mut natives = Vec::new();
+        for (input, witness_proof) in inputs
+            .authorization_inputs
+            .iter()
+            .zip(inputs.authorization_witnesses.iter())
+        {
+            let (_inputs_t, obligation) =
+                build_owner_auth_slot(&mut pb, witness_proof, &input.public);
+            obligations.push(obligation);
+            natives.push(witness_proof.pcs.clone());
+        }
+        (obligations, natives)
+    };
+    if obligations.is_empty() {
+        return out;
+    }
+    // ONE tiled plural wallet-PCS discharge -- the same call the real block-slots
+    // build makes. The region `(point, value)` depend only on each tx's
+    // obligation + native proof (not on the wire positions or the [B] killshots),
+    // so they are identical to the full build; only the committed-column SLICES
+    // differ (the link takes those from the real build).
+    for c in discharge_auth_pcs_obligations_via_region(&mut pb, &obligations, &natives, params) {
+        out.push((c.native_point, c.native_value));
+    }
+    out
 }

@@ -403,6 +403,7 @@ impl LinkClass {
             Some(params) => BlockSlotsConfig {
                 discharge_wallet_pcs: true,
                 wallet_pcs_region: Some(params),
+                owner_auth_region: false,
             },
             None => block.config,
         }
@@ -590,7 +591,8 @@ fn build_link_inner(class: &LinkClass, input: &LinkInput<'_>, freeze: bool) -> B
         // are irrelevant to the region values). The count must match the frozen
         // class shape; the full trace pass below re-derives the same claims with
         // their wires + slices and asserts the complete shape.
-        let region_native = region_wallet_pcs_native(block.inputs, params);
+        let region_native =
+            region_wallet_pcs_native(block.inputs, params, class.block_config(block).owner_auth_region);
         assert_eq!(
             region_native.len(),
             class.region_claims.len(),
@@ -850,6 +852,7 @@ fn freeze_region_block_bearing(
     let region_cfg = BlockSlotsConfig {
         discharge_wallet_pcs: true,
         wallet_pcs_region: Some(region_params),
+        owner_auth_region: false,
     };
 
     // ---- Probe: a standalone discharge reveals the claim count + arities.
