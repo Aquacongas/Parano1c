@@ -341,10 +341,10 @@ fn absorb_auth_mle_commitment_trace(
 // Unified sumcheck
 // ---------------------------------------------------------------------------
 
-struct OwnerUnifiedReductionTrace {
-    r_prime: Vec<LinExpr>,
-    state_at_r: LinExpr,
-    state_lane_dec_at_r: [LinExpr; STATE_SIZE],
+pub(crate) struct OwnerUnifiedReductionTrace {
+    pub(crate) r_prime: Vec<LinExpr>,
+    pub(crate) state_at_r: LinExpr,
+    pub(crate) state_lane_dec_at_r: [LinExpr; STATE_SIZE],
 }
 
 /// Factored final evaluations for `verify_owner_auth_unified`: the public
@@ -353,7 +353,12 @@ struct OwnerUnifiedReductionTrace {
 /// rho-dependent `u` table factors exactly like the block spine's
 /// (`fast_eval_block_schedules`). Values are identical to the native
 /// full-table `evaluate_flat`/`evaluate_preflat` calls.
-fn owner_unified_final_evals(
+///
+/// Channel-independent (challenges are parameters), so the region-layer
+/// discharge ([`super::region_source_binding::discharge_owner_auth_killshots_via_region`])
+/// reuses it verbatim while sourcing `rho`/`r_prime` from the walk-C carry
+/// cells instead of an inline transcript.
+pub(crate) fn owner_unified_final_evals(
     b: &mut FieldR1csBuilder,
     slot_live: &[LinExpr],
     rho: &[LinExpr],
@@ -515,8 +520,9 @@ fn weighted_state_rounds_trace(
     (r, expected)
 }
 
-/// Trace twin of `owner_combined_target`.
-fn owner_combined_target_trace(
+/// Trace twin of `owner_combined_target`. Channel-independent (reused by the
+/// region-layer discharge with `delta` from the walk-C carry cells).
+pub(crate) fn owner_combined_target_trace(
     b: &mut FieldR1csBuilder,
     red: &OwnerUnifiedReductionTrace,
     delta: &LinExpr,
@@ -535,8 +541,9 @@ fn owner_combined_target_trace(
 
 /// W(r'') of the shift weights (`build_owner_combined_weights` evaluated at
 /// r'' — the factored form of the block spine's combined-weight evaluation,
-/// state column only).
-fn owner_shift_weights_at_point(
+/// state column only). Channel-independent (reused by the region-layer
+/// discharge with `delta`/`r2` from the walk-C carry cells).
+pub(crate) fn owner_shift_weights_at_point(
     b: &mut FieldR1csBuilder,
     layout: OwnerAuthLayout,
     r_prime: &[LinExpr],
@@ -612,30 +619,33 @@ fn verify_owner_auth_shift_trace(
     (r_double_prime, proof.shift_state_at_r2.clone())
 }
 
-/// Trace twin of `verify_owner_auth_boundary` (constraints from
-/// `owner_auth_boundary_constraints`: per owner, the two capacity-IV pre
-/// pins through the inverse MDS and the two address output pins).
-fn verify_owner_auth_boundary_trace(
-    b: &mut FieldR1csBuilder,
-    ch: &mut RawChannelTrace,
-    proof: &OwnerAuthProofTrace,
-    layout: OwnerAuthLayout,
-    inputs: &OwnerAuthPublicInputsTrace,
-) -> (Vec<LinExpr>, LinExpr) {
-    assert_eq!(proof.boundary_round_polys.len(), layout.num_vars);
+/// One boundary constraint: an α-batched public linear relation over the
+/// spine cells (`terms`) equal to a witness-dependent right-hand side
+/// (`constant`). Channel-independent; shared by the inline twin and the
+/// region-layer discharge.
+pub(crate) struct ConstraintTrace {
+    pub(crate) terms: Vec<(usize, Block128)>,
+    pub(crate) constant: LinExpr,
+}
 
-    // Boundary constraints over every PADDED slot (term structure is
-    // slot-uniform; ghost slots differ only in the right-hand side, which
-    // the liveness selector zeroes): capacity-IV constants become
-    // `g_s · iv` (affine in the selector, no rows), address constants
-    // `g_s · address_wire` (one multiplication each). The constraint count
-    // and every term coefficient are functions of the class alone.
+/// Rebuild the boundary constraints (from `owner_auth_boundary_constraints`)
+/// over every PADDED slot: per owner, the two capacity-IV pre pins through the
+/// inverse MDS and the two address output pins.
+///
+/// Term structure is slot-uniform; ghost slots differ only in the right-hand
+/// side, which the liveness selector zeroes: capacity-IV constants become
+/// `g_s · iv` (affine in the selector, no rows), address constants
+/// `g_s · address_wire` (one multiplication each). The constraint count and
+/// every term coefficient are functions of the class alone. Channel-independent
+/// so both the inline `verify_owner_auth_boundary_trace` and the region-layer
+/// discharge rebuild identical constraints.
+pub(crate) fn owner_boundary_constraints(
+    b: &mut FieldR1csBuilder,
+    inputs: &OwnerAuthPublicInputsTrace,
+    layout: OwnerAuthLayout,
+) -> Vec<ConstraintTrace> {
     let inv = mds_full_inverse_flat();
     let iv_addr = capacity_iv(TAG_ADDRFIX);
-    struct ConstraintTrace {
-        terms: Vec<(usize, Block128)>,
-        constant: LinExpr,
-    }
     let mut constraints: Vec<ConstraintTrace> = Vec::new();
     for slot in 0..layout.padded_slots {
         let base = slot * OWNER_AUTH_SLOTS_PER_OWNER;
@@ -664,22 +674,32 @@ fn verify_owner_auth_boundary_trace(
             });
         }
     }
+    constraints
+}
 
-    ch.absorb_const_tower(b, OWNER_AUTH_BOUNDARY_DOMAIN_TAG);
-    ch.absorb_const_tower(b, constraints.len() as u128);
-    let alphas = squeeze_alphas_trace(b, ch, constraints.len());
-
-    // target = Σ α_c · constant_c.
+/// The α-batched boundary target `Σ_c α_c · constant_c` (`α_0 = 1` folds free).
+/// Channel-independent; shared by the inline twin and the region discharge.
+pub(crate) fn owner_boundary_target(
+    b: &mut FieldR1csBuilder,
+    constraints: &[ConstraintTrace],
+    alphas: &[LinExpr],
+) -> LinExpr {
     let mut target = constraints[0].constant.clone();
     for (c, a) in constraints.iter().zip(alphas.iter()).skip(1) {
         target = target.add(&mul(b, a, &c.constant));
     }
+    target
+}
 
-    let (point, expected) =
-        weighted_state_rounds_trace(b, ch, &proof.boundary_round_polys, target);
-
-    // W(r) = Σ_c α_c · Σ_terms coeff · eq_cell(r).
-    let mut eq_cache = BooleanPointEqCache::new(&point);
+/// The boundary weight `W(point) = Σ_c α_c · Σ_terms coeff · eq_cell(point)`.
+/// Channel-independent; shared by the inline twin and the region discharge.
+pub(crate) fn owner_boundary_w(
+    b: &mut FieldR1csBuilder,
+    constraints: &[ConstraintTrace],
+    alphas: &[LinExpr],
+    point: &[LinExpr],
+) -> LinExpr {
+    let mut eq_cache = BooleanPointEqCache::new(point);
     let mut w_at = LinExpr::zero();
     for (c, a) in constraints.iter().zip(alphas.iter()) {
         let mut inner = LinExpr::zero();
@@ -693,6 +713,33 @@ fn verify_owner_auth_boundary_trace(
             w_at = w_at.add(&mul(b, a, &inner));
         }
     }
+    w_at
+}
+
+/// Trace twin of `verify_owner_auth_boundary` (constraints from
+/// `owner_auth_boundary_constraints`: per owner, the two capacity-IV pre
+/// pins through the inverse MDS and the two address output pins).
+fn verify_owner_auth_boundary_trace(
+    b: &mut FieldR1csBuilder,
+    ch: &mut RawChannelTrace,
+    proof: &OwnerAuthProofTrace,
+    layout: OwnerAuthLayout,
+    inputs: &OwnerAuthPublicInputsTrace,
+) -> (Vec<LinExpr>, LinExpr) {
+    assert_eq!(proof.boundary_round_polys.len(), layout.num_vars);
+
+    let constraints = owner_boundary_constraints(b, inputs, layout);
+
+    ch.absorb_const_tower(b, OWNER_AUTH_BOUNDARY_DOMAIN_TAG);
+    ch.absorb_const_tower(b, constraints.len() as u128);
+    let alphas = squeeze_alphas_trace(b, ch, constraints.len());
+
+    let target = owner_boundary_target(b, &constraints, &alphas);
+
+    let (point, expected) =
+        weighted_state_rounds_trace(b, ch, &proof.boundary_round_polys, target);
+
+    let w_at = owner_boundary_w(b, &constraints, &alphas, &point);
     let rhs = mul(b, &w_at, &proof.boundary_state_at_r);
     pin_zero(b, &expected.add(&rhs));
     ch.absorb(b, &proof.boundary_state_at_r);

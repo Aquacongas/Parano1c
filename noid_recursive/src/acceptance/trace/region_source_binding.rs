@@ -80,8 +80,9 @@ use noid_fri_binius::mixed_open::{
 };
 use noid_fri_binius::{COMPACT_NUM_QUERIES, COMPACT_TAU, MERKLE_CAP_DEPTH};
 use noid_gkr::auth_pcs::AuthMleOpeningProof;
+use noid_gkr::owner_auth::{OwnerAuthProofKillShot, OwnerAuthPublicInputs};
 use noid_poseidon2b::hasher::CryptographicHasher;
-use noid_poseidon2b::native::domain::{capacity_iv, TAG_FRICHANL};
+use noid_poseidon2b::native::domain::{capacity_iv, TAG_FRICHANL, TAG_KSCHANNL};
 use noid_poseidon2b::native::permutation::STATE_SIZE;
 use noid_poseidon2b::Poseidon2bSponge;
 
@@ -127,9 +128,17 @@ use super::fri_pcs::{
     alloc_digest, code_new_trace, compact_queries_from_squeezes_with_bits, fold_trace_bits,
     mle_evaluate_small_trace,
 };
-use super::owner_auth::PendingAuthPcsObligation;
-use super::{alloc_blocks, eq_ind_partial_eval_trace, flat_of, mul, pin_eq};
-use crate::acceptance::region::capsule_pcs_channel_schedule;
+use super::owner_auth::{
+    owner_boundary_constraints, owner_boundary_target, owner_boundary_w,
+    owner_combined_target_trace, owner_shift_weights_at_point, owner_unified_final_evals,
+    OwnerAuthProofTrace, OwnerAuthPublicInputsTrace, OwnerUnifiedReductionTrace,
+    PendingAuthPcsObligation,
+};
+use super::{
+    alloc_blocks, eq_ind_partial_eval_trace, eq_ind_trace, flat_of, mul, pin_eq, pin_zero,
+    BatchEvalReductionTrace,
+};
+use crate::acceptance::region::{capsule_pcs_channel_schedule, owner_auth_channel_schedule};
 
 // FS domains for the two region walks (self-contained sub-protocols; the
 // soundness of the discharge lives in the committed-column opening claims the
@@ -1206,6 +1215,357 @@ pub fn discharge_auth_pcs_obligations_via_region(
             native_value: c.native_value,
         })
         .collect()
+}
+
+// ===========================================================================
+// [G] step 4 — the owner-authorization KSCHANNL transcript, discharged as a
+// data-parallel duplex walk (walk C), the exact analogue of the wallet-PCS
+// FRICHANL migration above. The owner-auth killshot's KSCHANNL channel (the
+// `Poseidon2bChannel` transcript of `verify_owner_auth_killshot`, ~311
+// permutations/tx replayed inline) moves off the per-tx inline replay onto ONE
+// shared duplex walk, so owner-auth verification is transaction-count flat.
+//
+// Each killshot's terminal claim is the SAME `PendingAuthPcsObligation` the
+// inline `verify_owner_auth_killshot_trace` produces — the wallet-PCS
+// `(commitment_cap_lanes, num_vars, reduction:(r_B, b_final))` — so the
+// wallet-PCS discharge above is UNCHANGED: this fn produces those obligations
+// with `r_B`/`b_final` derived from the walk-C carry cells, and the caller feeds
+// them to `discharge_auth_pcs_obligations_via_region`.
+//
+// The channel-INDEPENDENT owner-auth algebra (`owner_unified_final_evals`,
+// `owner_combined_target_trace`, `owner_shift_weights_at_point`,
+// `owner_boundary_*`) is reused verbatim from `super::owner_auth`; only the
+// channel-DEPENDENT folds are re-expressed to read the squeezed challenges out
+// of `chal_w` (the walk-C carry cells) rather than an inline `RawChannelTrace`,
+// and the per-round coefficient absorbs are dropped (the walk binds the absorbed
+// data via the A-lane cells). `owner_auth_region_tests` holds this against the
+// inline twin (obligation parity + a PCS-level money negative + K-flatness).
+// ===========================================================================
+
+/// FS domain for the owner-auth walk-C duplex union (distinct from the
+/// wallet-PCS `DOMAIN_C`).
+const OWNER_AUTH_DOMAIN_C: &[u8] = b"owner-auth-region-duplex-union";
+
+/// `[1, base, base², …, base^{m−1}]` — the trace twin of `squeeze_alphas_trace`
+/// with `base` supplied (a carry cell) instead of squeezed. `alphas[0]` is the
+/// build-time constant `1`, `alphas[1] = base`, higher powers via `mul` (so the
+/// `a.is_const() && a.constant == ONE` fast path in `owner_boundary_w` /
+/// `verify_batch_eval_trace` fires on `alphas[0]` exactly as inline).
+fn owner_alpha_powers(b: &mut FieldR1csBuilder, base: &LinExpr, m: usize) -> Vec<LinExpr> {
+    if m == 0 {
+        return Vec::new();
+    }
+    let mut alphas = Vec::with_capacity(m);
+    let mut acc = LinExpr::constant(F128::ONE);
+    for _ in 0..m {
+        alphas.push(acc.clone());
+        if alphas.len() < m {
+            acc = if alphas.len() == 1 { base.clone() } else { mul(b, &acc, base) };
+        }
+    }
+    alphas
+}
+
+/// Discharge K owner-authorization killshots IN-TRACE in ONE builder, replaying
+/// every KSCHANNL transcript on ONE shared data-parallel duplex walk (walk C).
+/// The region twin of the per-tx inline `verify_owner_auth_killshot_trace`.
+///
+/// Returns, per killshot, the SAME `PendingAuthPcsObligation` the inline twin
+/// produces (`commitment_cap_lanes` + the reduced `(r_B, b_final)` claim), plus
+/// every walk-C committed-column opening claim ([`RegionPcsClaim`]) for the
+/// caller to thread through the link's public IO. The wallet-PCS discharge
+/// consumes the obligations UNCHANGED.
+///
+/// Challenge order in the walk-C carry cells (`5·num_vars + 3` total, class-
+/// fixed by `owner_auth_channel_schedule`):
+///   `[rho×nv, r_prime×nv, delta, r_double_prime×nv, boundary_alpha,
+///     boundary_point×nv, batch_alpha, r_B×nv]`.
+/// The fold outputs `r_prime` / `r_double_prime` / `boundary_point` / `r_B` are
+/// the REVERSE of their per-round challenge order (matching the inline twin).
+pub fn discharge_owner_auth_killshots_via_region(
+    b: &mut FieldR1csBuilder,
+    trace_proofs: &[OwnerAuthProofTrace],
+    trace_inputs: &[OwnerAuthPublicInputsTrace],
+    native_proofs: &[OwnerAuthProofKillShot],
+    native_inputs: &[OwnerAuthPublicInputs],
+) -> (Vec<PendingAuthPcsObligation>, Vec<RegionPcsClaim>) {
+    let k = trace_proofs.len();
+    assert!(k >= 1, "at least one owner-auth killshot");
+    assert_eq!(trace_inputs.len(), k, "one trace input per killshot");
+    assert_eq!(native_proofs.len(), k, "one native proof per killshot");
+    assert_eq!(native_inputs.len(), k, "one native input per killshot");
+
+    // Class-fixed channel layout — tx 0 defines it; every tx shares the class.
+    let layout0 = native_inputs[0].layout;
+    let num_vars = layout0.num_vars;
+    let chan_layout =
+        compile_duplex(&owner_auth_channel_schedule(&native_proofs[0], &native_inputs[0]).ops);
+    let chan_data_positions = duplex_data_positions(&chan_layout);
+    let per_tx_block_c = chan_layout.slots.len().next_power_of_two();
+    let block_log_c = per_tx_block_c.trailing_zeros() as usize;
+    let iv_c = {
+        let iv = capacity_iv(TAG_KSCHANNL);
+        [flat_of_tower_u128(iv[0].0), flat_of_tower_u128(iv[1].0)]
+    };
+
+    let mut chan_data_streams: Vec<Vec<F128>> = Vec::with_capacity(k);
+    let mut chan_chal_wires: Vec<Vec<LinExpr>> = Vec::with_capacity(k);
+    let mut chan_data_wires: Vec<Vec<LinExpr>> = Vec::with_capacity(k);
+    let mut obligations: Vec<PendingAuthPcsObligation> = Vec::with_capacity(k);
+
+    for tx in 0..k {
+        let proof_t = &trace_proofs[tx];
+        let inputs_t = &trace_inputs[tx];
+        let native = &native_proofs[tx];
+        let inputs_n = &native_inputs[tx];
+        let layout = inputs_t.layout;
+        let nv = layout.num_vars;
+        assert_eq!(nv, num_vars, "class fixity: all txs share num_vars");
+
+        // This tx's channel schedule + concrete duplex columns (native); the
+        // squeezed-challenge wires arrive in schedule order (see the doc above).
+        let schedule = owner_auth_channel_schedule(native, inputs_n);
+        assert_eq!(
+            schedule.data_flat.len(),
+            chan_layout.n_data,
+            "class fixity: absorb data count"
+        );
+        let dcols = build_duplex_columns(&chan_layout, iv_c, &schedule.data_flat, block_log_c);
+        let chal_w: Vec<LinExpr> =
+            dcols.challenges.iter().map(|&v| LinExpr::from_wire(b.alloc_f128(v))).collect();
+        assert_eq!(chal_w.len(), 5 * nv + 3, "owner-auth channel challenge count");
+
+        // ----- Unified state sumcheck: rho + per-round folds from chal_w.
+        let rho: Vec<LinExpr> = chal_w[0..nv].to_vec();
+        let mut expected = LinExpr::zero();
+        let mut r_prime_opt: Vec<Option<LinExpr>> = vec![None; nv];
+        for round in 0..nv {
+            // `evaluate_reconstructed` reconstructs c_1 from the running claim
+            // (sum-check by construction, no pin); NO coeff absorb — the walk
+            // binds the coefficients via the A-lane data wires.
+            let challenge = chal_w[nv + round].clone();
+            expected =
+                proof_t.main_round_polys[round].evaluate_reconstructed(b, &expected, &challenge);
+            r_prime_opt[nv - 1 - round] = Some(challenge);
+        }
+        let r_prime: Vec<LinExpr> = r_prime_opt.into_iter().map(Option::unwrap).collect();
+        let (u_at_r, mds_lane, sigma_lane, rc_lane) =
+            owner_unified_final_evals(b, &inputs_t.slot_live, &rho, &r_prime);
+        let mut q_at_r = proof_t.main_state_at_r.clone();
+        for j in 0..STATE_SIZE {
+            let x_j = proof_t.main_state_lane_dec_at_r[j].add(&rc_lane[j]);
+            let x_j_pow7 = b.pow7(&x_j);
+            let pi_j = mul(b, &sigma_lane[j], &x_j_pow7).add(&mul(
+                b,
+                &sigma_lane[j].add_const(F128::ONE),
+                &proof_t.main_state_lane_dec_at_r[j],
+            ));
+            q_at_r = q_at_r.add(&mul(b, &mds_lane[j], &pi_j));
+        }
+        let rhs = mul(b, &u_at_r, &q_at_r);
+        pin_zero(b, &expected.add(&rhs));
+        let main_red = OwnerUnifiedReductionTrace {
+            r_prime,
+            state_at_r: proof_t.main_state_at_r.clone(),
+            state_lane_dec_at_r: proof_t.main_state_lane_dec_at_r.clone(),
+        };
+
+        // ----- Shift sumcheck: delta + per-round folds from chal_w.
+        let delta = chal_w[2 * nv].clone();
+        let target = owner_combined_target_trace(b, &main_red, &delta);
+        let mut expected = target;
+        let mut r_double_prime: Vec<LinExpr> = Vec::with_capacity(nv);
+        for round in 0..nv {
+            let challenge = chal_w[2 * nv + 1 + round].clone();
+            expected =
+                proof_t.shift_round_polys[round].evaluate(b, &expected.clone(), &challenge);
+            r_double_prime.push(challenge);
+        }
+        r_double_prime.reverse();
+        let w_at_r =
+            owner_shift_weights_at_point(b, layout, &main_red.r_prime, &delta, &r_double_prime);
+        let rhs = mul(b, &w_at_r, &proof_t.shift_state_at_r2);
+        pin_zero(b, &expected.add(&rhs));
+
+        // ----- Boundary sumcheck: alpha + per-round folds from chal_w.
+        let constraints = owner_boundary_constraints(b, inputs_t, layout);
+        let boundary_alpha = chal_w[3 * nv + 1].clone();
+        let alphas = owner_alpha_powers(b, &boundary_alpha, constraints.len());
+        let target = owner_boundary_target(b, &constraints, &alphas);
+        let mut expected = target;
+        let mut boundary_point: Vec<LinExpr> = Vec::with_capacity(nv);
+        for round in 0..nv {
+            let challenge = chal_w[3 * nv + 2 + round].clone();
+            expected =
+                proof_t.boundary_round_polys[round].evaluate(b, &expected.clone(), &challenge);
+            boundary_point.push(challenge);
+        }
+        boundary_point.reverse();
+        let w_at = owner_boundary_w(b, &constraints, &alphas, &boundary_point);
+        let rhs = mul(b, &w_at, &proof_t.boundary_state_at_r);
+        pin_zero(b, &expected.add(&rhs));
+
+        // ----- Batch-eval reduction over the 3 state claims (main/shift/boundary).
+        let claim_values = [
+            main_red.state_at_r.clone(),
+            proof_t.shift_state_at_r2.clone(),
+            proof_t.boundary_state_at_r.clone(),
+        ];
+        let claim_points = [main_red.r_prime.clone(), r_double_prime, boundary_point];
+        let batch_alpha = chal_w[4 * nv + 2].clone();
+        let batch_alphas = owner_alpha_powers(b, &batch_alpha, 3);
+        let mut claim = claim_values[0].clone();
+        for i in 1..3 {
+            claim = claim.add(&mul(b, &batch_alphas[i], &claim_values[i]));
+        }
+        let mut r_b: Vec<LinExpr> = Vec::with_capacity(nv);
+        for round in 0..nv {
+            let challenge = chal_w[4 * nv + 3 + round].clone();
+            claim = proof_t.batch.rounds[round].evaluate(b, &claim.clone(), &challenge);
+            r_b.push(challenge);
+        }
+        r_b.reverse();
+        let mut w_at = LinExpr::zero();
+        for i in 0..3 {
+            let eq = eq_ind_trace(b, &claim_points[i], &r_b);
+            if batch_alphas[i].is_const() && batch_alphas[i].constant == F128::ONE {
+                w_at = w_at.add(&eq);
+            } else {
+                w_at = w_at.add(&mul(b, &batch_alphas[i], &eq));
+            }
+        }
+        let rhs = mul(b, &w_at, &proof_t.batch.b_final);
+        pin_zero(b, &claim.add(&rhs));
+
+        obligations.push(PendingAuthPcsObligation {
+            commitment_cap_lanes: proof_t.commitment_cap_lanes.clone(),
+            num_vars: nv,
+            reduction: BatchEvalReductionTrace {
+                point: r_b,
+                value: proof_t.batch.b_final.clone(),
+            },
+        });
+
+        // ----- Absorbed-data wires in schedule order (bound to the A-lane cells
+        // after the loop). Order MUST mirror `owner_auth_channel_schedule`; the
+        // eval assert is the safety net against any lane/ordering drift.
+        let mut data_wires: Vec<LinExpr> = Vec::with_capacity(schedule.data_flat.len());
+        // Step 0/1: owner public boundary.
+        data_wires.push(inputs_t.owner_count.clone());
+        // `live_slots == owner_count` (OWNER_AUTH_SLOTS_PER_OWNER == 1).
+        data_wires.push(inputs_t.owner_count.clone());
+        data_wires.push(inputs_t.tx_body_hash[0].clone());
+        data_wires.push(inputs_t.tx_body_hash[1].clone());
+        for vector in [
+            &inputs_t.live_input_positions,
+            &inputs_t.live_slot_indices,
+            &inputs_t.input_to_group,
+        ] {
+            // `push_padded_input_vector`: live_len, then the padded value/sentinel
+            // lanes (the trace vector is already padded to `padded_input_len`).
+            data_wires.push(inputs_t.live_len.clone());
+            for entry in vector.iter() {
+                data_wires.push(entry.clone());
+            }
+        }
+        for pair in &inputs_t.expected_address {
+            data_wires.push(pair[0].clone());
+            data_wires.push(pair[1].clone());
+        }
+        // Step 2: auth MLE commitment cap hashes (2 lanes per 32-byte hash).
+        for lane in &proof_t.commitment_cap_lanes {
+            data_wires.push(lane[0].clone());
+            data_wires.push(lane[1].clone());
+        }
+        // Step 3: unified round coeffs then reduced state.
+        for round in 0..nv {
+            for c in &proof_t.main_round_polys[round].coeffs_no_linear {
+                data_wires.push(c.clone());
+            }
+        }
+        data_wires.push(proof_t.main_state_at_r.clone());
+        for v in &proof_t.main_state_lane_dec_at_r {
+            data_wires.push(v.clone());
+        }
+        // Step 4: shift round evals then reduced state.
+        for round in 0..nv {
+            data_wires.push(proof_t.shift_round_polys[round].evals_at_1_2[0].clone());
+            data_wires.push(proof_t.shift_round_polys[round].evals_at_1_2[1].clone());
+        }
+        data_wires.push(proof_t.shift_state_at_r2.clone());
+        // Step 5: boundary round evals then reduced state.
+        for round in 0..nv {
+            data_wires.push(proof_t.boundary_round_polys[round].evals_at_1_2[0].clone());
+            data_wires.push(proof_t.boundary_round_polys[round].evals_at_1_2[1].clone());
+        }
+        data_wires.push(proof_t.boundary_state_at_r.clone());
+        // Step 6: batch claim values (main/shift/boundary) then round evals.
+        data_wires.push(proof_t.main_state_at_r.clone());
+        data_wires.push(proof_t.shift_state_at_r2.clone());
+        data_wires.push(proof_t.boundary_state_at_r.clone());
+        for round in 0..nv {
+            data_wires.push(proof_t.batch.rounds[round].evals_at_1_2[0].clone());
+            data_wires.push(proof_t.batch.rounds[round].evals_at_1_2[1].clone());
+        }
+        assert_eq!(
+            data_wires.len(),
+            schedule.data_flat.len(),
+            "owner-auth absorb data lane count"
+        );
+        for (kk, w) in data_wires.iter().enumerate() {
+            assert_eq!(
+                w.eval(b.values()),
+                schedule.data_flat[kk],
+                "owner-auth absorb data wire {kk}"
+            );
+        }
+
+        chan_data_streams.push(schedule.data_flat.clone());
+        chan_chal_wires.push(chal_w);
+        chan_data_wires.push(data_wires);
+    }
+
+    // ===================================================================
+    // Walk C (once): the K txs' KSCHANNL transcript channels tiled into ONE
+    // duplex walk. The squeezed challenges the per-tx algebra consumed are pinned
+    // to the carry cells; the absorbed proof data is pinned to the A-lane cells.
+    // ONE walk discharges all K channels — transaction-count flat.
+    // ===================================================================
+    let u_c = build_duplex_union(&chan_layout, iv_c, &chan_data_streams);
+    let native_c = run_duplex_union_native(&u_c, OWNER_AUTH_DOMAIN_C);
+    let slices: Vec<WitnessSlice> =
+        u_c.committed.iter().map(|c| alloc_column_slice(b, c, u_c.w_log).0).collect();
+    let claims = discharge_duplex_union(b, &u_c, OWNER_AUTH_DOMAIN_C, &native_c, 0);
+    // Stage 2: the per-tx channel absorbs + squeezed challenges are tied to the
+    // walk-C A/C cells by R1CS constraint (`pin_eq`), NOT per-cell opening claims
+    // — every A/C column is opened by the walk-C discharge (O(1) per column), so
+    // each cell is bound; the pins are R1CS rows, keeping the channel flat in the
+    // link IO.
+    let per_tx_c = 1usize << u_c.block_log;
+    for tx in 0..k {
+        for (kk, &(slot, lane)) in u_c.layout.challenges.iter().enumerate() {
+            let cell = slot_cell(&slices[u_c.refs.c[lane]], tx * per_tx_c + slot);
+            pin_eq(b, &chan_chal_wires[tx][kk], &cell);
+        }
+        for (kk, &(slot, lane)) in chan_data_positions.iter().enumerate() {
+            let cell = slot_cell(&slices[u_c.refs.a[lane]], tx * per_tx_c + slot);
+            pin_eq(b, &chan_data_wires[tx][kk], &cell);
+        }
+    }
+
+    // Resolve each claim's column index into its committed WitnessSlice.
+    let region_claims = claims
+        .into_iter()
+        .map(|c| RegionPcsClaim {
+            slice: slices[c.slice],
+            point: c.point,
+            value: c.value,
+            native_point: c.native_point,
+            native_value: c.native_value,
+        })
+        .collect();
+
+    (obligations, region_claims)
 }
 
 // ===========================================================================
@@ -3562,5 +3922,368 @@ mod stage1_duplex_union_tests {
         assert_eq!(rounds(2), r1 + 1, "K:1->2 adds one walk round");
         assert_eq!(rounds(4), r1 + 2, "K:1->4 adds two walk rounds");
         assert_eq!(rounds(8), r1 + 3, "K:1->8 adds three walk rounds");
+    }
+}
+
+#[cfg(test)]
+mod owner_auth_region_tests {
+    use super::*;
+    use noid_core::Block128;
+    use noid_gkr::owner_auth::{
+        compute_owner_auth_boundary, owner_auth_gkr_channel, prove_owner_auth_killshot,
+        OwnerAuthCircuit, OwnerAuthInputs, OwnerAuthLayout,
+    };
+    use noid_ivc_core::challenger::FsLaneChallenger;
+    use noid_ivc_core::pcs::{self, PcsParams};
+    use noid_ivc_core::public_io::{IoClaimSpec, PublicIoSpec};
+    use noid_ivc_core::verifier::verify_field_with_public_io;
+    use noid_ivc_prover::field_prover::prove_field_with_public_io;
+
+    use crate::acceptance::trace::owner_auth::build_owner_auth_slot;
+
+    /// Honest owner-auth fixture (mirrors `tests/owner_auth_channel_region.rs`):
+    /// owners with secrets, addresses derived by the native boundary computation.
+    /// Secrets run the native prover only; no secret-derived value enters a trace.
+    fn fixture(owner_count: usize, seed: u128) -> (OwnerAuthProofKillShot, OwnerAuthPublicInputs) {
+        let layout = OwnerAuthLayout::for_owner_count(owner_count).unwrap();
+        let circuit = OwnerAuthCircuit::build(layout);
+        let spend_secret: Vec<[Block128; 2]> = (0..owner_count)
+            .map(|i| {
+                [
+                    Block128::from(seed + 1000 + i as u128),
+                    Block128::from(seed + 2000 + i as u128),
+                ]
+            })
+            .collect();
+        let tx_body_hash = [Block128::from(seed + 7), Block128::from(seed + 8)];
+        let expected_address =
+            compute_owner_auth_boundary(&circuit, spend_secret.clone(), tx_body_hash);
+        let live_input_positions: Vec<usize> = (0..owner_count).collect();
+        let live_slot_indices: Vec<u32> = (0..owner_count as u32).map(|i| 100 + i).collect();
+        let input_to_group: Vec<usize> = (0..owner_count).collect();
+        let public = OwnerAuthPublicInputs::new(
+            layout,
+            tx_body_hash,
+            live_input_positions,
+            live_slot_indices,
+            input_to_group,
+            expected_address,
+            owner_count.max(4),
+        )
+        .unwrap();
+        let inputs = OwnerAuthInputs::from_parts(&public, spend_secret);
+        let mut ch = owner_auth_gkr_channel();
+        let (proof, _) = prove_owner_auth_killshot(&circuit, &inputs, &mut ch);
+        (proof, public)
+    }
+
+    /// `k` honest fixtures of one class (same owner count) with distinct data.
+    fn k_fixtures(
+        k: usize,
+        seed0: u128,
+    ) -> (Vec<OwnerAuthProofKillShot>, Vec<OwnerAuthPublicInputs>) {
+        let mut proofs = Vec::with_capacity(k);
+        let mut publics = Vec::with_capacity(k);
+        for t in 0..k {
+            let (p, pubx) = fixture(3, seed0 + (t as u128) * 0x1000);
+            proofs.push(p);
+            publics.push(pubx);
+        }
+        (proofs, publics)
+    }
+
+    /// Allocate the K trace proofs/inputs, run the region discharge, and thread
+    /// every returned committed-column claim through public IO (the
+    /// `region_slot_e2e` pattern). Returns the IO spec + values + the claimed
+    /// column slices + the walk-C domain `w_log` (for the negative flips). The
+    /// caller calls `b.build()`.
+    fn region_slot_into_builder(
+        b: &mut FieldR1csBuilder,
+        proofs: &[OwnerAuthProofKillShot],
+        publics: &[OwnerAuthPublicInputs],
+    ) -> (PublicIoSpec, Vec<F128>, Vec<WitnessSlice>, usize) {
+        let proof_ts: Vec<OwnerAuthProofTrace> = proofs
+            .iter()
+            .zip(publics.iter())
+            .map(|(p, pubx)| OwnerAuthProofTrace::alloc(b, p, pubx.layout))
+            .collect();
+        let input_ts: Vec<OwnerAuthPublicInputsTrace> =
+            publics.iter().map(|pubx| OwnerAuthPublicInputsTrace::alloc(b, pubx)).collect();
+        let (_obligations, claims) =
+            discharge_owner_auth_killshots_via_region(b, &proof_ts, &input_ts, proofs, publics);
+        assert!(!claims.is_empty(), "region discharge produced no opening claims");
+
+        let w_log = claims[0].point.len();
+        let lanes_per = w_log + 1;
+        let io_len = claims.len() * lanes_per;
+        let io_log = io_len.next_power_of_two().trailing_zeros() as usize;
+        let mut io_values = Vec::with_capacity(io_len);
+        for c in &claims {
+            assert_eq!(c.native_point.len(), w_log, "uniform walk-C claim arity");
+            io_values.extend_from_slice(&c.native_point);
+            io_values.push(c.native_value);
+        }
+        let (io_slice, io_wires) = alloc_column_slice(b, &io_values, io_log);
+        for (ci, c) in claims.iter().enumerate() {
+            let base = ci * lanes_per;
+            for (kk, p) in c.point.iter().enumerate() {
+                pin_eq(b, p, &io_wires[base + kk]);
+            }
+            pin_eq(b, &c.value, &io_wires[base + w_log]);
+        }
+        let claim_slices: Vec<WitnessSlice> = claims.iter().map(|c| c.slice).collect();
+        let spec = PublicIoSpec {
+            io_slice,
+            io_len,
+            claims: claims
+                .iter()
+                .enumerate()
+                .map(|(ci, c)| IoClaimSpec {
+                    slice: c.slice,
+                    point: ci * lanes_per..ci * lanes_per + w_log,
+                    value: ci * lanes_per + w_log,
+                })
+                .collect(),
+        };
+        (spec, io_values, claim_slices, w_log)
+    }
+
+    /// K=1 parity: the region discharge produces the SAME `PendingAuthPcsObligation`
+    /// (reduced `r_B` / `b_final` / cap lanes) as the inline
+    /// `verify_owner_auth_killshot_trace` (via `build_owner_auth_slot`), and the
+    /// combined trace is satisfiable.
+    #[test]
+    fn owner_auth_region_parity() {
+        let (proof, public) = fixture(3, 0xA3);
+        let mut b = FieldR1csBuilder::new();
+
+        // Inline obligation (the canonical per-tx replay).
+        let (_inputs_inline, obligation_inline) = build_owner_auth_slot(&mut b, &proof, &public);
+
+        // Region obligation on freshly-allocated trace proof/inputs.
+        let inputs_t = OwnerAuthPublicInputsTrace::alloc(&mut b, &public);
+        let proof_t = OwnerAuthProofTrace::alloc(&mut b, &proof, public.layout);
+        let (obligations_region, claims) = discharge_owner_auth_killshots_via_region(
+            &mut b,
+            std::slice::from_ref(&proof_t),
+            std::slice::from_ref(&inputs_t),
+            std::slice::from_ref(&proof),
+            std::slice::from_ref(&public),
+        );
+        assert_eq!(obligations_region.len(), 1);
+        assert!(!claims.is_empty());
+        let obligation_region = &obligations_region[0];
+
+        let nw = b.num_wires();
+        let (r1cs, z) = b.build();
+        assert!(r1cs.satisfies(&z), "owner-auth region parity trace unsatisfiable");
+
+        // Same reduced (r_B, b_final) and cap lanes as the inline twin.
+        assert_eq!(obligation_region.num_vars, obligation_inline.num_vars);
+        assert_eq!(
+            obligation_region.reduction.point.len(),
+            obligation_inline.reduction.point.len()
+        );
+        for (pr, pi) in obligation_region
+            .reduction
+            .point
+            .iter()
+            .zip(obligation_inline.reduction.point.iter())
+        {
+            assert_eq!(pr.eval(&z), pi.eval(&z), "r_B mismatch inline vs region");
+        }
+        assert_eq!(
+            obligation_region.reduction.value.eval(&z),
+            obligation_inline.reduction.value.eval(&z),
+            "b_final mismatch inline vs region"
+        );
+        assert_eq!(
+            obligation_region.commitment_cap_lanes.len(),
+            obligation_inline.commitment_cap_lanes.len()
+        );
+        for (lr, li) in obligation_region
+            .commitment_cap_lanes
+            .iter()
+            .zip(obligation_inline.commitment_cap_lanes.iter())
+        {
+            assert_eq!(lr[0].eval(&z), li[0].eval(&z), "cap lane 0");
+            assert_eq!(lr[1].eval(&z), li[1].eval(&z), "cap lane 1");
+        }
+        eprintln!(
+            "[owner-auth-region] parity nv={} wires={} (inline+region combined) claims={}",
+            public.layout.num_vars,
+            nw,
+            claims.len()
+        );
+    }
+
+    /// K=1 discharge through the REAL outer PCS: the walk-C committed columns
+    /// live as witness slices, every terminal claim becomes an opening claim, and
+    /// an honest slot verifies. Money negative: flipping a claimed committed cell
+    /// either makes the trace unsatisfiable (if pinned to an algebra wire) or
+    /// breaks the column's walk opening → BaseFold rejects.
+    #[test]
+    fn owner_auth_region_slot_e2e() {
+        const OUTER: &[u8] = b"owner-auth-region-slot-outer";
+        let (proof, public) = fixture(3, 0x0E2E);
+        let mut b = FieldR1csBuilder::new();
+        let (spec, io_values, claim_slices, _w_log) =
+            region_slot_into_builder(&mut b, std::slice::from_ref(&proof), std::slice::from_ref(&public));
+        let (r1cs, z) = b.build();
+        assert!(r1cs.satisfies(&z), "honest owner-auth region slot unsatisfiable");
+        assert!(r1cs.m < 22, "gate guard: keep the region slot well under 2^22 rows");
+
+        let params = PcsParams {
+            m: r1cs.m + pcs::LOG_PACKING,
+            log_inv_rate: 2,
+            log_batch_size: 2,
+            profile: Default::default(),
+        };
+        let mut ch_p = FsLaneChallenger::new(OUTER);
+        let (pcs_proof, commitment, _) =
+            prove_field_with_public_io(&r1cs, &z, &params, &spec, &io_values, &mut ch_p);
+        let mut ch_v = FsLaneChallenger::new(OUTER);
+        verify_field_with_public_io(&r1cs, &commitment, &pcs_proof, &spec, &io_values, &mut ch_v)
+            .expect("honest owner-auth region slot verifies");
+        eprintln!(
+            "[owner-auth-region] slot nv={} rows={} (m={}) claims={}",
+            public.layout.num_vars,
+            z.len(),
+            r1cs.m,
+            spec.claims.len()
+        );
+
+        // Money negative: flip the first cell of a claimed committed column.
+        let cell = claim_slices[0].start();
+        let mut bad_z = z.clone();
+        bad_z[cell] += F128::ONE;
+        if r1cs.satisfies(&bad_z) {
+            // A free (unpinned) cell: the column's walk opening must break.
+            let mut ch_p = FsLaneChallenger::new(OUTER);
+            let (bad_proof, bad_commitment, _) =
+                prove_field_with_public_io(&r1cs, &bad_z, &params, &spec, &io_values, &mut ch_p);
+            let mut ch_v = FsLaneChallenger::new(OUTER);
+            assert!(
+                verify_field_with_public_io(
+                    &r1cs,
+                    &bad_commitment,
+                    &bad_proof,
+                    &spec,
+                    &io_values,
+                    &mut ch_v
+                )
+                .is_err(),
+                "flipping a free committed cell must break its walk opening → PCS reject"
+            );
+            eprintln!("[owner-auth-region] negative: free-cell flip → PCS reject");
+        } else {
+            // A pinned cell: no valid witness exists → the R1CS catches it.
+            eprintln!("[owner-auth-region] negative: pinned-cell flip → unsatisfiable");
+        }
+    }
+
+    /// K=2 flatness: two txs in ONE builder discharge on ONE shared walk C. The
+    /// walk-round count grows by exactly one per doubling (logarithmic, not a
+    /// second walk); the total wire count is strictly sub-linear in K. Honest
+    /// K=2 verifies; tampering a committed cell in tx 1's block is rejected.
+    #[test]
+    fn owner_auth_region_flat() {
+        const OUTER: &[u8] = b"owner-auth-region-flat-outer";
+
+        // --- Actual (unpadded) wire counts @K=1 vs @K=2 (the walk-C discharge is
+        // shared). `z.len()` is the PCS-padded 2^m and would hide the delta, so we
+        // read `num_wires()` before building.
+        let (p1, u1) = k_fixtures(1, 0xF1A7);
+        let mut b1 = FieldR1csBuilder::new();
+        let _ = region_slot_into_builder(&mut b1, &p1, &u1);
+        let w1 = b1.num_wires();
+        let (r1cs1, z1) = b1.build();
+        assert!(r1cs1.satisfies(&z1), "K=1 region slot unsatisfiable");
+
+        let (p2, u2) = k_fixtures(2, 0xF1A7);
+        let mut b2 = FieldR1csBuilder::new();
+        let (spec2, io2, slices2, w_log2) = region_slot_into_builder(&mut b2, &p2, &u2);
+        let w2 = b2.num_wires();
+        let (r1cs2, z2) = b2.build();
+        assert!(r1cs2.satisfies(&z2), "K=2 region slot unsatisfiable");
+
+        eprintln!(
+            "[owner-auth-region] flat: wires K=1={} K=2={} delta={} (K=1 total={})",
+            w1,
+            w2,
+            w2 - w1,
+            w1
+        );
+        // The 2nd tx costs strictly LESS than the whole first-tx cost, because the
+        // dominant walk-C discharge (the 66-layer permutation walk, ~1M rows) is
+        // done ONCE and amortized — it is NOT a second walk.
+        assert!(
+            w2 - w1 < w1,
+            "K:1->2 delta {} must be below the K=1 total {} (walk-C shared)",
+            w2 - w1,
+            w1
+        );
+
+        // --- Walk-round flatness (native, exact): K doubling adds one sumcheck
+        // round to the ONE shared duplex walk.
+        let rounds = |k: usize| -> usize {
+            let (pp, uu) = k_fixtures(k, 0xBEEF);
+            let chan_layout = compile_duplex(&owner_auth_channel_schedule(&pp[0], &uu[0]).ops);
+            let iv = {
+                let iv = capacity_iv(TAG_KSCHANNL);
+                [flat_of_tower_u128(iv[0].0), flat_of_tower_u128(iv[1].0)]
+            };
+            let streams: Vec<Vec<F128>> =
+                pp.iter().zip(&uu).map(|(p, u)| owner_auth_channel_schedule(p, u).data_flat).collect();
+            let u_c = build_duplex_union(&chan_layout, iv, &streams);
+            run_duplex_union_native(&u_c, OWNER_AUTH_DOMAIN_C).walk_proof.layers[0]
+                .round_coeffs
+                .len()
+        };
+        let r1 = rounds(1);
+        assert_eq!(rounds(2), r1 + 1, "K:1->2 adds exactly one walk round");
+        assert_eq!(rounds(4), r1 + 2, "K:1->4 adds exactly two walk rounds");
+
+        // --- K=2 honest PCS + a tx-1 tampering negative.
+        let params = PcsParams {
+            m: r1cs2.m + pcs::LOG_PACKING,
+            log_inv_rate: 2,
+            log_batch_size: 2,
+            profile: Default::default(),
+        };
+        let mut ch_p = FsLaneChallenger::new(OUTER);
+        let (pcs_proof, commitment, _) =
+            prove_field_with_public_io(&r1cs2, &z2, &params, &spec2, &io2, &mut ch_p);
+        let mut ch_v = FsLaneChallenger::new(OUTER);
+        verify_field_with_public_io(&r1cs2, &commitment, &pcs_proof, &spec2, &io2, &mut ch_v)
+            .expect("honest K=2 region slot verifies");
+
+        // Tamper a committed cell in tx 1's block (the second half of the tiled
+        // walk-C domain): caught by unsatisfiability (pinned) or a broken opening.
+        let p_dom = 1usize << w_log2;
+        let cell = slices2[0].start() + p_dom / 2;
+        let mut bad_z = z2.clone();
+        bad_z[cell] += F128::ONE;
+        if r1cs2.satisfies(&bad_z) {
+            let mut ch_p = FsLaneChallenger::new(OUTER);
+            let (bad_proof, bad_commitment, _) =
+                prove_field_with_public_io(&r1cs2, &bad_z, &params, &spec2, &io2, &mut ch_p);
+            let mut ch_v = FsLaneChallenger::new(OUTER);
+            assert!(
+                verify_field_with_public_io(
+                    &r1cs2,
+                    &bad_commitment,
+                    &bad_proof,
+                    &spec2,
+                    &io2,
+                    &mut ch_v
+                )
+                .is_err(),
+                "flipping a tx-1 committed cell must be rejected"
+            );
+            eprintln!("[owner-auth-region] K=2 negative: tx-1 free-cell flip → PCS reject");
+        } else {
+            eprintln!("[owner-auth-region] K=2 negative: tx-1 pinned-cell flip → unsatisfiable");
+        }
     }
 }
