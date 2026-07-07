@@ -72,6 +72,55 @@ fn alloc_column_slice(b: &mut FieldR1csBuilder, col: &[F128], log2_len: usize) -
     (WitnessSlice { log2_len, index }, wires)
 }
 
+/// FLATNESS: the region wallet-PCS discharge yields the SAME number of opening
+/// claims regardless of the tx count -- the K txs' capsule families tile into ONE
+/// walk A/B/C (cost O(log domain)) and every terminal claim is class-fixed. This
+/// is the non-negotiable "the proof must not depend on the tx count": 1 tx, up to
+/// 255 standard (4x8) or up to 40 sweep (25x2). Build-only (no PCS prove): scan
+/// K = 1..256 and assert the claim count is CONSTANT.
+///
+/// Measured (num_vars=9, nq=2): claims = 75 at every K; wires 4.11M @K=1 ->
+/// 12.39M @K=256 -- only ~3x for a 256x tx increase (sublinear, near-log; the
+/// walk discharges are flat, so only the per-tx capsule tiles + ~4k-row/tx
+/// algebra grow). That is the design's "attack proof ~2-3x typical, bounded", a
+/// 35x reduction from the inline replay (433M rows @255). The constant claim
+/// count is the recursion/[R] flatness the O(1) snapshot sync rests on.
+#[test]
+fn region_discharge_claims_flat_in_tx_count() {
+    let num_vars = 9usize;
+    let params = RegionDischargeParams { nq: 2, sb8_auth_layers: 1 };
+    let mut ref_claims: Option<usize> = None;
+    for &k in &[1usize, 2, 4, 8, 16, 64, 256] {
+        let fixtures: Vec<(Vec<Block128>, BatchEvalReduction, AuthMleOpeningProof)> = (0..k)
+            .map(|tx| capsule_fixture(num_vars, 0xA55E_C0DE + tx as u64 * 0x1111))
+            .collect();
+        let mut b = FieldR1csBuilder::new();
+        let mut obligations: Vec<PendingAuthPcsObligation> = Vec::with_capacity(k);
+        let natives: Vec<AuthMleOpeningProof> = fixtures.iter().map(|(_, _, p)| p.clone()).collect();
+        for (point, red, proof) in &fixtures {
+            let cap_lanes: Vec<[LinExpr; 2]> =
+                proof.commitment.cap.hashes.iter().map(|h| alloc_digest(&mut b, h)).collect();
+            let point_w = alloc_blocks(&mut b, point);
+            let value_w = alloc_block(&mut b, red.value);
+            obligations.push(PendingAuthPcsObligation {
+                commitment_cap_lanes: cap_lanes,
+                num_vars,
+                reduction: BatchEvalReductionTrace { point: point_w, value: value_w },
+            });
+        }
+        let claims = discharge_auth_pcs_obligations_via_region(&mut b, &obligations, &natives, params);
+        eprintln!("[flatness] K={k:>2}: claims={} wires={}", claims.len(), b.num_wires());
+        match ref_claims {
+            None => ref_claims = Some(claims.len()),
+            Some(r) => assert_eq!(
+                claims.len(),
+                r,
+                "region discharge claim count must be FLAT in tx count (K={k})"
+            ),
+        }
+    }
+}
+
 #[test]
 fn region_source_binding_multitx_end_to_end() {
     let num_vars = 9usize;
