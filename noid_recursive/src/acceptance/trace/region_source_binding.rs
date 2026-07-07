@@ -308,8 +308,14 @@ pub fn discharge_auth_pcs_obligations_via_region(
     // ===================================================================
     // Accumulators filled by the per-tx loop, assembled after it.
     // ===================================================================
-    let mut claims: Vec<Claim> = Vec::new(); // walk-A-indexed
-    let mut claims_b: Vec<Claim> = Vec::new(); // walk-B-indexed (fold join)
+    let mut claims: Vec<Claim> = Vec::new(); // walk-A/B/C discharge openings (IO)
+    // Stage 2: per-cell reads/pins (grand pins, symbols, digests, fold-join) are
+    // R1CS constraints, NOT IO opening claims -- the columns are opened by the
+    // walk discharges (random point), so every cell is bound. Collected as
+    // (col, slot, wire) and resolved post-loop as pin_eq(wire, cell). Walk-A cols
+    // resolve against `slices`; walk-B (fold-join) against `slices[n_slices_a+col]`.
+    let mut cell_pins_a: Vec<(usize, usize, LinExpr)> = Vec::new();
+    let mut cell_pins_b: Vec<(usize, usize, LinExpr)> = Vec::new();
     let mut expo_specs: Vec<ExpoSpec> = Vec::new();
     let mut expo_store: Vec<[Vec<F128>; 4]> = Vec::new();
     // Per-leg-type walk-B accumulators (each grows to K*nq across the loop).
@@ -644,26 +650,12 @@ pub fn discharge_auth_pcs_obligations_via_region(
     // -------------------------------------------------------------------
     for i in 0..l {
         let slot = tx_off_a + 2 * (l + i) + 1;
-        let (pt_lin, pt_nat) = slot_point(slot, w_log);
         for lane in 0..2 {
-            claims.push(Claim {
-                slice: CODE0 + lane,
-                point: pt_lin.clone(),
-                value: g_code_w[2 * i + lane].clone(),
-                native_point: pt_nat.clone(),
-                native_value: g_code_flat[2 * i + lane],
-            });
+            cell_pins_a.push((CODE0 + lane, slot, g_code_w[2 * i + lane].clone()));
         }
     }
-    let (rp_lin, rp_nat) = slot_point(tx_off_a + 3, w_log);
     for lane in 0..2 {
-        claims.push(Claim {
-            slice: C0 + lane,
-            point: rp_lin.clone(),
-            value: fri_root0_w[lane].clone(),
-            native_point: rp_nat.clone(),
-            native_value: fri_root0[lane],
-        });
+        cell_pins_a.push((C0 + lane, tx_off_a + 3, fri_root0_w[lane].clone()));
     }
 
     // SB7 + SB8 fold chain, source symbols pinned to SB6 IN columns.
@@ -672,21 +664,8 @@ pub fn discharge_auth_pcs_obligations_via_region(
         let s0w = LinExpr::from_wire(b.alloc_f128(sb6_syms[q][0]));
         let s1w = LinExpr::from_wire(b.alloc_f128(sb6_syms[q][1]));
         let off = sb6_base + q * leaf_stride + 4;
-        let (pt_lin, pt_nat) = slot_point(off, w_log);
-        claims.push(Claim {
-            slice: IN0,
-            point: pt_lin.clone(),
-            value: s0w.clone(),
-            native_point: pt_nat.clone(),
-            native_value: sb6_syms[q][0],
-        });
-        claims.push(Claim {
-            slice: IN0 + 1,
-            point: pt_lin,
-            value: s1w.clone(),
-            native_point: pt_nat,
-            native_value: sb6_syms[q][1],
-        });
+        cell_pins_a.push((IN0, off, s0w.clone()));
+        cell_pins_a.push((IN0 + 1, off, s1w.clone()));
         let folded = tensor_high_fold_pair_trace(
             b,
             &beta[tau - 1],
@@ -712,21 +691,8 @@ pub fn discharge_auth_pcs_obligations_via_region(
             let s0w = LinExpr::from_wire(b.alloc_f128(s0f));
             let s1w = LinExpr::from_wire(b.alloc_f128(s1f));
             let off = base + q * leaf_stride + 4;
-            let (pt_lin, pt_nat) = slot_point(off, w_log);
-            claims.push(Claim {
-                slice: IN0,
-                point: pt_lin.clone(),
-                value: s0w.clone(),
-                native_point: pt_nat.clone(),
-                native_value: s0f,
-            });
-            claims.push(Claim {
-                slice: IN0 + 1,
-                point: pt_lin,
-                value: s1w.clone(),
-                native_point: pt_nat,
-                native_value: s1f,
-            });
+            cell_pins_a.push((IN0, off, s0w.clone()));
+            cell_pins_a.push((IN0 + 1, off, s1w.clone()));
             // Continuity: the prior fold equals THIS pair's symbol at the query
             // parity (bit `layer_log−1` of the propagated index). Select via the
             // witness parity bit `s0 + p·(s0+s1)` — a native `if parity` pick of
@@ -774,17 +740,10 @@ pub fn discharge_auth_pcs_obligations_via_region(
     let mut sb6_digest_wires: Vec<[LinExpr; 2]> = Vec::with_capacity(nq);
     for q in 0..nq {
         let slot = sb6_base + q * leaf_stride + digest_slot;
-        let (pt_lin, pt_nat) = slot_point(slot, w_log);
         let mut wires = [LinExpr::zero(), LinExpr::zero()];
         for lane in 0..2 {
             let v = LinExpr::from_wire(b.alloc_f128(sb6_digest_vals[q][lane]));
-            claims.push(Claim {
-                slice: C0 + lane,
-                point: pt_lin.clone(),
-                value: v.clone(),
-                native_point: pt_nat.clone(),
-                native_value: sb6_digest_vals[q][lane],
-            });
+            cell_pins_a.push((C0 + lane, slot, v.clone()));
             wires[lane] = v;
         }
         sb6_digest_wires.push(wires);
@@ -802,17 +761,10 @@ pub fn discharge_auth_pcs_obligations_via_region(
         let mut lw = Vec::with_capacity(nq);
         for q in 0..nq {
             let slot = base + q * leaf_stride + digest_slot;
-            let (pt_lin, pt_nat) = slot_point(slot, w_log);
             let mut wires = [LinExpr::zero(), LinExpr::zero()];
             for lane in 0..2 {
                 let v = LinExpr::from_wire(b.alloc_f128(sb8_digest_vals[layer][q][lane]));
-                claims.push(Claim {
-                    slice: C0 + lane,
-                    point: pt_lin.clone(),
-                    value: v.clone(),
-                    native_point: pt_nat.clone(),
-                    native_value: sb8_digest_vals[layer][q][lane],
-                });
+                cell_pins_a.push((C0 + lane, slot, v.clone()));
                 wires[lane] = v;
             }
             lw.push(wires);
@@ -1046,21 +998,8 @@ pub fn discharge_auth_pcs_obligations_via_region(
         let (s0v, s1v) = fri.fri_queried_symbols[round][q];
         let s0w = LinExpr::from_wire(b.alloc_f128(phi(s0v)));
         let s1w = LinExpr::from_wire(b.alloc_f128(phi(s1v)));
-        let (pt_lin, pt_nat) = slot_point(tx_off_b + q, w_log_b);
-        claims_b.push(Claim {
-            slice: pair_refs.in_[0],
-            point: pt_lin.clone(),
-            value: s0w.clone(),
-            native_point: pt_nat.clone(),
-            native_value: phi(s0v),
-        });
-        claims_b.push(Claim {
-            slice: pair_refs.in_[1],
-            point: pt_lin,
-            value: s1w.clone(),
-            native_point: pt_nat,
-            native_value: phi(s1v),
-        });
+        cell_pins_b.push((pair_refs.in_[0], tx_off_b + q, s0w.clone()));
+        cell_pins_b.push((pair_refs.in_[1], tx_off_b + q, s1w.clone()));
         let folded = fold_trace_bits(
             b,
             &random_point[round],
@@ -1184,15 +1123,25 @@ pub fn discharge_auth_pcs_obligations_via_region(
         b, &fixed_b, &pair_refs, region_pair, &legs, w_log_b, &native_b, &pair_digests, &pair_slots,
         DOMAIN_B,
     );
-    // Merge walk-B discharge claims + the per-tx fold-join claims (both
-    // walk-B-indexed) into the global tables.
-    wb_claims.extend(claims_b);
     for c in wb_claims.iter_mut() {
         c.slice += n_slices_a;
     }
     slices.extend(slices_b);
     claims.extend(wb_claims);
     assert!(all_expands_ok, "all real-sibling octopus expands returned non-empty paths");
+
+    // Stage 2: resolve the per-cell reads/pins to R1CS constraints (pin_eq), NOT
+    // link-IO opening claims. Each column is opened by its walk discharge (random
+    // point), so every cell is bound (Schwartz-Zippel); pinning the algebra wire
+    // to the cell binds it too, keeping the O(K) per-cell bindings out of the IO.
+    // Walk-A cols index `slices` directly; walk-B (fold-join) cols are offset by
+    // `n_slices_a`.
+    for (col, slot, wire) in &cell_pins_a {
+        pin_eq(b, wire, &slot_cell(&slices[*col], *slot));
+    }
+    for (col, slot, wire) in &cell_pins_b {
+        pin_eq(b, wire, &slot_cell(&slices[n_slices_a + *col], *slot));
+    }
 
     // ===================================================================
     // Walk C (once): the K txs' FRICHANL transcript channels, tiled into ONE

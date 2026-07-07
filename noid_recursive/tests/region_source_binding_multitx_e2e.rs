@@ -165,22 +165,24 @@ fn region_source_binding_multitx_end_to_end() {
     );
 
     // Money negative: flip one committed lane of the FIRST claim's column. The
-    // trace stays satisfiable (committed columns are free wires) but that
-    // column's opening claim breaks -> the PCS layer rejects.
+    // tampering is caught either at the trace level (a Stage-2 pin_eq binds that
+    // cell to an algebra wire) or at the PCS level (a free cell whose column
+    // opening claim breaks) -- both are rejections.
     let bad_col = claims[0].slice;
     let mut bad_z = z.clone();
     bad_z[bad_col.start() + 5] += F128::ONE;
-    assert!(r1cs.satisfies(&bad_z), "committed columns are free wires");
-    let mut chp = FsLaneChallenger::new(OUTER);
-    let (bp, bc, _) = noid_ivc_prover::field_prover::prove_field_with_public_io(
-        &r1cs, &bad_z, &params_pcs, &spec, &io_values, &mut chp,
-    );
-    let mut chv = FsLaneChallenger::new(OUTER);
-    assert!(
+    let caught = if !r1cs.satisfies(&bad_z) {
+        true
+    } else {
+        let mut chp = FsLaneChallenger::new(OUTER);
+        let (bp, bc, _) = noid_ivc_prover::field_prover::prove_field_with_public_io(
+            &r1cs, &bad_z, &params_pcs, &spec, &io_values, &mut chp,
+        );
+        let mut chv = FsLaneChallenger::new(OUTER);
         noid_ivc_core::verifier::verify_field_with_public_io(
             &r1cs, &bc, &bp, &spec, &io_values, &mut chv,
         )
-        .is_err(),
-        "a flipped committed column lane must break its opening claim"
-    );
+        .is_err()
+    };
+    assert!(caught, "a flipped committed column lane must be caught");
 }

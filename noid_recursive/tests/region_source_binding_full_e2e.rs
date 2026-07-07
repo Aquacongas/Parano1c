@@ -276,13 +276,18 @@ fn region_source_binding_full_end_to_end() {
     let col_slice = |g: usize| uniq[g];
 
     // -------------------------------------------------------------------
-    // Negatives: flip a committed lane -> the trace stays satisfiable (free
-    // wires) but that column's opening claim breaks -> BaseFold rejects.
+    // Negatives: flip a committed lane -> the tampering is CAUGHT. A cell reached
+    // by a Stage-2 `pin_eq` (symbols, digests, CODE, channel absorbs/challenges)
+    // is trace-bound, so the flip breaks satisfiability; a cell touched only by a
+    // walk discharge (e.g. a Merkle sibling) stays a free wire, so the flip breaks
+    // that column's opening claim and the PCS rejects. Either path is a rejection.
     // -------------------------------------------------------------------
-    let flip = |g: usize, off: usize| {
+    let flip = |g: usize, off: usize| -> bool {
         let mut bad = z.clone();
         bad[col_slice(g).start() + off] += F128::ONE;
-        assert!(r1cs.satisfies(&bad), "columns are free wires");
+        if !r1cs.satisfies(&bad) {
+            return true; // pin_eq-bound cell: tampering breaks the trace itself
+        }
         let mut chp = FsLaneChallenger::new(OUTER);
         let (bp, bc, _) = noid_ivc_prover::field_prover::prove_field_with_public_io(
             &r1cs, &bad, &params_pcs, &spec, &io_values, &mut chp,
