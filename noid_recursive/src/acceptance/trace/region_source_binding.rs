@@ -79,6 +79,7 @@ use noid_fri_binius::mixed_open::{
 use noid_fri_binius::{COMPACT_NUM_QUERIES, COMPACT_TAU, MERKLE_CAP_DEPTH};
 use noid_gkr::auth_pcs::AuthMleOpeningProof;
 use noid_poseidon2b::hasher::CryptographicHasher;
+use noid_poseidon2b::native::domain::{capacity_iv, TAG_FRICHANL};
 use noid_poseidon2b::native::permutation::STATE_SIZE;
 use noid_poseidon2b::Poseidon2bSponge;
 
@@ -97,10 +98,11 @@ use noid_ivc_core::deep_chain::relations::{
     RelationTerm, ShiftDischargeProof,
 };
 use noid_ivc_core::deep_chain::schedule::{
-    build_duplex_columns, build_merkle_path_columns, carry_selection_terms, duplex_family_refs,
-    duplex_fixed_patterns, duplex_substitution_terms, flat_of_tower_u128, merkle_booleanity_terms,
-    merkle_fixed_patterns, merkle_substitution_terms, DuplexFamilyRefs, DuplexLayout,
-    MerkleFamilyRefs, MerklePathColumns, MerklePathFamily, MerklePathWitness,
+    build_duplex_columns, build_merkle_path_columns, carry_selection_terms, compile_duplex,
+    duplex_family_refs, duplex_fixed_patterns, duplex_substitution_terms, flat_of_tower_u128,
+    merkle_booleanity_terms, merkle_fixed_patterns, merkle_substitution_terms, DuplexFamilyRefs,
+    DuplexLayout, LaneSource, MerkleFamilyRefs, MerklePathColumns, MerklePathFamily,
+    MerklePathWitness,
 };
 use noid_ivc_core::deep_chain::source_tree::{
     build_source_code_columns, build_source_tree_columns, compress_iv_flat,
@@ -114,24 +116,25 @@ use noid_ivc_core::field::F128;
 use noid_ivc_core::field_circuit::{FieldR1csBuilder, FsChannelTrace, LinExpr};
 use noid_ivc_core::public_io::WitnessSlice;
 
-use super::auth_pcs::absorb_cap_trace;
 use super::deep_chain::{
     verify_column_relation_trace, verify_deep_chain_walk_trace, verify_shift_discharge_trace,
     ColumnRelationProofTrace, DeepChainWalkProofTrace, LaneClaimGroupTrace, RelationTermTrace,
     ShiftDischargeProofTrace,
 };
 use super::fri_pcs::{
-    alloc_digest, code_new_trace, fold_trace_bits, gen_compact_queries_trace_with_bits,
-    mle_evaluate_small_trace, FriChannelTrace,
+    alloc_digest, code_new_trace, compact_queries_from_squeezes_with_bits, fold_trace_bits,
+    mle_evaluate_small_trace,
 };
 use super::owner_auth::PendingAuthPcsObligation;
 use super::{alloc_blocks, eq_ind_partial_eval_trace, flat_of, mul, pin_eq};
+use crate::acceptance::region::capsule_pcs_channel_schedule;
 
 // FS domains for the two region walks (self-contained sub-protocols; the
 // soundness of the discharge lives in the committed-column opening claims the
 // caller threads through the outer PCS, not in these transcripts).
 const DOMAIN: &[u8] = b"source-binding-full-leaf-union";
 const DOMAIN_B: &[u8] = b"source-binding-full-merkle-union";
+const DOMAIN_C: &[u8] = b"source-binding-full-duplex-union";
 
 // Meta committed column order (all length P):
 //   CODE0=0, CODE1=1, KID0=2, KID1=3, IN0=4, IN1=5, C0=6..C3=9.
@@ -209,8 +212,9 @@ pub fn discharge_auth_pcs_obligations_via_region(
 ) -> Vec<RegionPcsClaim> {
     assert_eq!(obligations.len(), natives.len(), "one native proof per obligation");
     assert!(!obligations.is_empty(), "at least one obligation");
-    // TODO(step 4 Stage 1): generalize the body below to K txs (tile walk A/B at
-    // common-period offsets, K exposures, per-tx algebra loop). Currently K = 1.
+    // The K txs' families tile ONE walk A (source tree + leaves) + ONE walk B
+    // (pair-leaf + merkle legs) + ONE walk C (FRICHANL channels) at common-period
+    // offsets, with K per-tree source-tree exposures and a per-tx algebra loop.
     let k = obligations.len();
 
     // ===================================================================
@@ -320,6 +324,35 @@ pub fn discharge_auth_pcs_obligations_via_region(
     let mut pair_slots: Vec<usize> = Vec::new();
     let mut all_expands_ok = true;
 
+    // -------------------------------------------------------------------
+    // Walk C (the FRICHANL channel union) class-level setup. The channel op
+    // schedule is class-fixed (a function of the shape, not the proof values),
+    // so tx 0 defines the layout, domain, IV, and per-tx query counts; each tx
+    // fills its own duplex columns + challenge/absorb wires in the loop.
+    // -------------------------------------------------------------------
+    let point0: Vec<Block128> = obligations[0]
+        .reduction
+        .point
+        .iter()
+        .map(|e| {
+            let f = e.eval(b.values());
+            Block128::from(flat_to_tower_u128((f.lo as u128) | ((f.hi as u128) << 64)))
+        })
+        .collect();
+    let chan_layout = compile_duplex(&capsule_pcs_channel_schedule(&natives[0], num_vars, &point0, COMPACT_NUM_QUERIES).ops);
+    let chan_data_positions = duplex_data_positions(&chan_layout);
+    let per_tx_block_c = chan_layout.slots.len().next_power_of_two();
+    let block_log_c = per_tx_block_c.trailing_zeros() as usize;
+    let iv_c = {
+        let iv = capacity_iv(TAG_FRICHANL);
+        [flat_of_tower_u128(iv[0].0), flat_of_tower_u128(iv[1].0)]
+    };
+    let n_source_q = COMPACT_NUM_QUERIES.min(1usize << (num_vars + LOG_RATE));
+    let n_fri_q = COMPACT_NUM_QUERIES.min(1usize << (n_rounds + LOG_RATE));
+    let mut chan_data_streams: Vec<Vec<F128>> = Vec::with_capacity(k);
+    let mut chan_chal_wires: Vec<Vec<LinExpr>> = Vec::with_capacity(k);
+    let mut chan_data_wires: Vec<Vec<LinExpr>> = Vec::with_capacity(k);
+
     for tx in 0..k {
         let obligation = &obligations[tx];
         let native = &natives[tx];
@@ -361,8 +394,12 @@ pub fn discharge_auth_pcs_obligations_via_region(
         assert_eq!(st_cols.root, fri_root0, "region tree root != φ(fri_roots[0])");
 
     // -------------------------------------------------------------------
-    // Drive the REAL FRICHANL channel from the obligation's absorbed cap +
-    // reduction point (no fresh alloc — these wires bind to the killshot).
+    // Walk-C channel: the FRICHANL transcript is discharged as a data-parallel
+    // duplex chain (see the WALK C section). Here we extract this tx's
+    // class-fixed schedule + concrete duplex columns, allocate the
+    // squeezed-challenge wires the per-tx algebra consumes, and collect the
+    // absorbed-data wires in schedule order. The permutations move onto the
+    // shared walk C — no inline channel replay.
     // -------------------------------------------------------------------
     let all_openings = alloc_blocks(b, &opening.all_openings);
     let upper = alloc_blocks(b, &fri.upper_partial_evals);
@@ -371,75 +408,112 @@ pub fn discharge_auth_pcs_obligations_via_region(
     let fri_root0_w = fri_roots_w[0].clone();
     let folded_roots_w: Vec<[LinExpr; 2]> =
         src.folded_roots.iter().map(|r| alloc_digest(b, r)).collect();
-
     let point_w = &obligation.reduction.point;
 
-    let mut ch = FriChannelTrace::new();
-    absorb_cap_trace(b, &mut ch, &obligation.commitment_cap_lanes);
-    ch.observe_const_tower(b, MIXED_OPEN_TAG as u128);
-    ch.observe_field_elems(b, &all_openings);
-    let _gamma = ch.squeeze(b);
-    let batched_claim = all_openings[0].clone();
+    // This tx's channel schedule + duplex columns (native); the squeezed
+    // challenge wires in schedule order are
+    // [gamma, beta×tau, r×n_rounds, source_sq×n_source_q, fri_sq×n_fri_q]
+    // (gamma = chal_w[0] is unused, exactly as the inline channel discards it).
+    let schedule = capsule_pcs_channel_schedule(proof, num_vars, &point, COMPACT_NUM_QUERIES);
+    let dcols = build_duplex_columns(&chan_layout, iv_c, &schedule.data_flat, block_log_c);
+    let chal_w: Vec<LinExpr> =
+        dcols.challenges.iter().map(|&v| LinExpr::from_wire(b.alloc_f128(v))).collect();
+    assert_eq!(chal_w.len(), 1 + tau + n_rounds + n_source_q + n_fri_q, "channel challenge count");
+    let beta: Vec<LinExpr> = chal_w[1..1 + tau].to_vec();
+    let random_point: Vec<LinExpr> = chal_w[1 + tau..1 + tau + n_rounds].to_vec();
+    let source_sq: Vec<LinExpr> = chal_w[1 + tau + n_rounds..1 + tau + n_rounds + n_source_q].to_vec();
+    let fri_sq: Vec<LinExpr> = chal_w[1 + tau + n_rounds + n_source_q..].to_vec();
 
-    ch.observe_field_elems(b, point_w); // 3a
+    let batched_claim = all_openings[0].clone();
     let (right_w, left_w) = point_w.split_at(n_rounds);
-    let left_eq = eq_ind_partial_eval_trace(b, left_w); // 3c
+    // 3c: the derived batched claim == the absorbed claim (== openings[0]).
+    let left_eq = eq_ind_partial_eval_trace(b, left_w);
     let mut derived = LinExpr::zero();
     for (l, u) in left_eq.iter().zip(upper.iter()) {
         derived = derived.add(&mul(b, l, u));
     }
     pin_eq(b, &derived, &batched_claim);
-    ch.observe_field_elem(b, &batched_claim);
 
-    let beta = ch.squeeze_n(b, tau); // 3d
+    // 3d: tensor-batching claim from beta.
     let batching_eq = eq_ind_partial_eval_trace(b, &beta);
     let mut claim = LinExpr::zero();
     for (u, be) in upper.iter().zip(batching_eq.iter()) {
         claim = claim.add(&mul(b, u, be));
     }
     let initial_claim = claim.clone();
-
     // SB1.1: H(right) == initial sumcheck claim.
     let h_at_right = mle_evaluate_small_trace(b, &h_evals_w, right_w);
     pin_eq(b, &h_at_right, &initial_claim);
 
-    // 3e sumcheck rounds. Collect the challenges — the channel<->algebra join
-    // (random_point -> fold_trace) for the 3i FRI leg.
-    let mut random_point: Vec<LinExpr> = Vec::with_capacity(n_rounds);
+    // 3e sumcheck rounds: c1 == running claim; fold via the walk-C challenge r.
+    // The oracle/root absorbs are captured in `data_wires` (bound to the A-lane
+    // cells after the loop); r arrives from the carry cells.
+    let mut c0_w: Vec<LinExpr> = Vec::with_capacity(n_rounds);
+    let mut c1_w: Vec<LinExpr> = Vec::with_capacity(n_rounds);
     for round in 0..n_rounds {
         let c0 = alloc_blocks(b, std::slice::from_ref(&fri.sum_check_oracles[round][0]))[0].clone();
         let c1 = alloc_blocks(b, std::slice::from_ref(&fri.sum_check_oracles[round][1]))[0].clone();
         pin_eq(b, &c1, &claim);
-        ch.observe_field_elem(b, &c0);
-        ch.observe_field_elem(b, &c1);
-        let depth = compute_round_depth(n_rounds, round);
-        ch.observe_vector_commitment(b, &fri_roots_w[round], depth);
-        let r = ch.squeeze(b);
-        claim = c0.add(&mul(b, &c1, &r));
-        random_point.push(r);
+        claim = c0.add(&mul(b, &c1, &random_point[round]));
+        c0_w.push(c0);
+        c1_w.push(c1);
     }
     // 3f final codeword.
     let final_cw = alloc_blocks(b, &fri.final_codeword);
-    ch.observe_field_elems(b, &final_cw);
 
-    // SB2 source-binding absorbs.
-    ch.observe_const_tower(b, MIXED_SOURCE_BINDING_TAG);
-    ch.observe_field_elems(b, &h_evals_w);
-    for (i, root_w) in folded_roots_w.iter().enumerate() {
-        ch.observe_vector_commitment(b, root_w, high_pair_tree_depth(log_n - 1 - i));
-    }
-    // SB3 source query draw; 3h FRI query draw.
+    // SB3 source query draw + 3h FRI query draw, from the walk-C carry-cell
+    // squeezes (positions derived identically to the inline channel).
     let (query_indices, query_bits) =
-        gen_compact_queries_trace_with_bits(b, &mut ch, log_n + LOG_RATE, COMPACT_NUM_QUERIES);
+        compact_queries_from_squeezes_with_bits(b, &source_sq, log_n + LOG_RATE);
     assert!(query_indices.len() >= nq, "need at least nq source queries");
     let (fri_queries, fri_query_bits) =
-        gen_compact_queries_trace_with_bits(b, &mut ch, n_rounds + LOG_RATE, COMPACT_NUM_QUERIES);
+        compact_queries_from_squeezes_with_bits(b, &fri_sq, n_rounds + LOG_RATE);
     assert!(fri_queries.len() >= nq, "need at least nq FRI queries");
-    // Cross-check the in-trace draws against the REAL noid_fri::Channel.
+    // Cross-check the walk-C draws against the REAL noid_fri::Channel.
     let (native_source_queries, native_fri_queries) =
         derive_queries(proof, &point, COMPACT_NUM_QUERIES);
-    assert_eq!(query_indices, native_source_queries, "in-trace source queries match native");
-    assert_eq!(fri_queries, native_fri_queries, "in-trace FRI queries match native");
+    assert_eq!(query_indices, native_source_queries, "walk-C source queries match native");
+    assert_eq!(fri_queries, native_fri_queries, "walk-C FRI queries match native");
+
+    // Absorbed-data wires in schedule order (bound to the A-lane cells after the
+    // loop). Order MUST mirror `capsule_pcs_channel_schedule`; the eval assert is
+    // the safety net against any lane-convention or ordering drift.
+    let mut data_wires: Vec<LinExpr> = Vec::with_capacity(schedule.data_flat.len());
+    for lane in &obligation.commitment_cap_lanes {
+        data_wires.push(lane[0].clone());
+        data_wires.push(lane[1].clone());
+    }
+    for w in &all_openings {
+        data_wires.push(w.clone());
+    }
+    for w in point_w.iter() {
+        data_wires.push(w.clone());
+    }
+    data_wires.push(all_openings[0].clone());
+    for round in 0..n_rounds {
+        data_wires.push(c0_w[round].clone());
+        data_wires.push(c1_w[round].clone());
+        data_wires.push(fri_roots_w[round][0].clone());
+        data_wires.push(fri_roots_w[round][1].clone());
+    }
+    for w in &final_cw {
+        data_wires.push(w.clone());
+    }
+    for w in &h_evals_w {
+        data_wires.push(w.clone());
+    }
+    for r in &folded_roots_w {
+        data_wires.push(r[0].clone());
+        data_wires.push(r[1].clone());
+    }
+    assert_eq!(data_wires.len(), schedule.data_flat.len(), "absorb data lane count");
+    for (kk, w) in data_wires.iter().enumerate() {
+        assert_eq!(w.eval(b.values()), schedule.data_flat[kk], "absorb data wire {kk}");
+    }
+
+    chan_data_streams.push(schedule.data_flat.clone());
+    chan_chal_wires.push(chal_w);
+    chan_data_wires.push(data_wires);
 
     // SB1.2: g_code = Code(H·eq_right) computed in-trace.
     let eq_right_w = eq_ind_partial_eval_trace(b, right_w);
@@ -1119,6 +1193,28 @@ pub fn discharge_auth_pcs_obligations_via_region(
     slices.extend(slices_b);
     claims.extend(wb_claims);
     assert!(all_expands_ok, "all real-sibling octopus expands returned non-empty paths");
+
+    // ===================================================================
+    // Walk C (once): the K txs' FRICHANL transcript channels, tiled into ONE
+    // duplex walk. The squeezed challenges the per-tx algebra consumed are bound
+    // to the carry cells; the absorbed proof data is bound to the A-lane cells.
+    // The permutations are discharged by ONE walk — transaction-count flat.
+    // ===================================================================
+    let u_c = build_duplex_union(&chan_layout, iv_c, &chan_data_streams);
+    let native_c = run_duplex_union_native(&u_c, DOMAIN_C);
+    let n_slices_ab = slices.len();
+    let slices_c: Vec<WitnessSlice> =
+        u_c.committed.iter().map(|c| alloc_column_slice(b, c, u_c.w_log).0).collect();
+    let mut wc_claims = discharge_duplex_union(b, &u_c, DOMAIN_C, &native_c, 0);
+    for tx in 0..k {
+        bind_duplex_challenges(&u_c, tx, 0, &chan_chal_wires[tx], &mut wc_claims);
+        bind_duplex_absorbs(&u_c, tx, 0, &chan_data_positions, &chan_data_wires[tx], &mut wc_claims);
+    }
+    for c in wc_claims.iter_mut() {
+        c.slice += n_slices_ab;
+    }
+    slices.extend(slices_c);
+    claims.extend(wc_claims);
 
     // Resolve each claim's column index into its committed WitnessSlice.
     claims
@@ -2616,12 +2712,12 @@ fn derive_queries(
 //
 // Columns (all length P): A0=0, A1=1, C0=2..C3=5.
 //
-// The helpers below are validated in isolation by `stage1_duplex_union_tests`;
-// the plural discharge wires them into the lib path when the inline
-// `FriChannelTrace` is swapped for this union, so they are `#[allow(dead_code)]`
-// (test-exercised) in a release build until then.
+// The plural discharge drives these: it extracts each tx's channel schedule via
+// `capsule_pcs_channel_schedule`, fills the duplex columns, and after the loop
+// discharges the union walk and binds the squeezed challenges / absorbed data
+// back to the per-tx algebra. `stage1_duplex_union_tests` gates the mechanism in
+// isolation (native+trace, a full-PCS binding negative, K-flatness).
 // ===========================================================================
-#[cfg_attr(not(test), allow(dead_code))]
 struct DuplexUnion {
     committed: [Vec<F128>; 6],
     s0: [Vec<F128>; STATE_SIZE],
@@ -2642,7 +2738,6 @@ struct DuplexUnion {
 /// `perm([0;4])` ghost slots: the duplex substitution's leading carry term is
 /// ungated, so every block must be a valid IV-seeded chain (the START pattern
 /// cancels the cross-block carry in char 2, re-seeding each block).
-#[cfg_attr(not(test), allow(dead_code))]
 fn build_duplex_union(layout: &DuplexLayout, iv_flat: [F128; 2], data: &[Vec<F128>]) -> DuplexUnion {
     let per_tx = layout.slots.len().next_power_of_two();
     let block_log = per_tx.trailing_zeros() as usize;
@@ -2688,7 +2783,6 @@ fn build_duplex_union(layout: &DuplexLayout, iv_flat: [F128; 2], data: &[Vec<F12
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 struct DuplexUnionNative {
     sel_proof: ColumnRelationProof,
     walk_proof: DeepChainWalkProof,
@@ -2699,7 +2793,6 @@ struct DuplexUnionNative {
 
 /// Native discharge of the whole channel union in ONE walk (mirror of
 /// `run_leaf_union_native` with the duplex family's terms).
-#[cfg_attr(not(test), allow(dead_code))]
 fn run_duplex_union_native(u: &DuplexUnion, domain: &[u8]) -> DuplexUnionNative {
     let committed: Vec<&[F128]> = u.committed.iter().map(|c| c.as_slice()).collect();
     let internal: Vec<&[F128]> = u.s_out.iter().map(|c| c.as_slice()).collect();
@@ -2778,7 +2871,6 @@ fn run_duplex_union_native(u: &DuplexUnion, domain: &[u8]) -> DuplexUnionNative 
 /// Trace twin of `duplex_substitution_terms`: the α-batched walk-terminal wiring
 /// `Σ_j m_j·[C_j(w−1) + START·C_j(w−1) + ABS_j·A_j + CONST_j]` (rate-lane absorbs
 /// on j ∈ {0,1}), with `m_j = Σ_e α^{e+1}·flat(MDS[e][j])` built in-trace.
-#[cfg_attr(not(test), allow(dead_code))]
 fn duplex_sub_terms_trace(
     b: &mut FieldR1csBuilder,
     refs: &DuplexFamilyRefs,
@@ -2812,7 +2904,6 @@ fn duplex_sub_terms_trace(
 /// Discharge the shared channel union in-trace (mirror of `discharge_leaf_union`
 /// for the duplex family). Column claims are offset by `base` in the caller's
 /// global slice table. Returns the pending terminal claims on the A/C columns.
-#[cfg_attr(not(test), allow(dead_code))]
 fn discharge_duplex_union(
     b: &mut FieldR1csBuilder,
     u: &DuplexUnion,
@@ -2921,13 +3012,37 @@ fn discharge_duplex_union(
     out
 }
 
-/// Read tx `t`'s squeezed challenges out of the walk-C carry cells: one opening
-/// claim per challenge binding a fresh wire to carry column `C_lane` at the
-/// challenge's slot (the digest-read pattern). Returns the challenge wires in
-/// schedule order; the emitted claims are appended to `out`. Because the C
-/// columns are opened by the walk (proving they ARE the chain output) and each
-/// challenge claim opens `C_lane` at the exact slot, the returned wire is bound
-/// to the correct squeezed challenge — the prover cannot use a different value.
+/// Bind tx `t`'s already-allocated squeezed-challenge wires to the walk-C carry
+/// cells: one opening claim per challenge on carry column `C_lane` at the
+/// challenge's slot (the digest-read pattern). Because the C columns are opened
+/// by the walk (proving they ARE the chain output) and each claim opens `C_lane`
+/// at the exact slot, the bound wire is forced to the correct squeezed challenge
+/// — the prover cannot use a different value. The plural uses this to bind the
+/// in-loop challenge wires the per-tx algebra consumed.
+fn bind_duplex_challenges(
+    u: &DuplexUnion,
+    t: usize,
+    base: usize,
+    chal_wires: &[LinExpr],
+    out: &mut Vec<Claim>,
+) {
+    let per_tx = 1usize << u.block_log;
+    assert_eq!(chal_wires.len(), u.layout.challenges.len(), "challenge wire count");
+    for (k, &(slot, lane)) in u.layout.challenges.iter().enumerate() {
+        let gslot = t * per_tx + slot;
+        let (pt_lin, pt_nat) = slot_point(gslot, u.w_log);
+        out.push(Claim {
+            slice: base + u.refs.c[lane],
+            point: pt_lin,
+            value: chal_wires[k].clone(),
+            native_point: pt_nat,
+            native_value: u.challenges[t][k],
+        });
+    }
+}
+
+/// Read tx `t`'s squeezed challenges into FRESH wires (allocate + bind). Used by
+/// the isolated gate; the plural binds its own in-loop wires directly.
 #[cfg_attr(not(test), allow(dead_code))]
 fn read_duplex_challenges(
     b: &mut FieldR1csBuilder,
@@ -2936,23 +3051,54 @@ fn read_duplex_challenges(
     base: usize,
     out: &mut Vec<Claim>,
 ) -> Vec<LinExpr> {
+    let wires: Vec<LinExpr> = (0..u.layout.challenges.len())
+        .map(|k| LinExpr::from_wire(b.alloc_f128(u.challenges[t][k])))
+        .collect();
+    bind_duplex_challenges(u, t, base, &wires, out);
+    wires
+}
+
+/// The `(slot, lane)` where each data lane `k` is absorbed, read off the compiled
+/// layout — a class constant used to place each tx's absorb-binding claims.
+fn duplex_data_positions(layout: &DuplexLayout) -> Vec<(usize, usize)> {
+    let mut pos = vec![(0usize, 0usize); layout.n_data];
+    for (slot, ds) in layout.slots.iter().enumerate() {
+        for (lane, src) in ds.lanes.iter().enumerate() {
+            if let Some(LaneSource::Data(k)) = src {
+                pos[*k] = (slot, lane);
+            }
+        }
+    }
+    pos
+}
+
+/// Bind tx `t`'s absorbed-data wires (the algebra's proof wires, in schedule
+/// order) to the walk-C A-lane cells: one opening claim per data lane on absorb
+/// column `A_lane` at the absorb slot. This ties the channel's transcript INPUT
+/// to the real proof data the algebra checks — without it a prover could drive
+/// the channel with a fabricated transcript to steer the squeezed challenges.
+fn bind_duplex_absorbs(
+    u: &DuplexUnion,
+    t: usize,
+    base: usize,
+    data_positions: &[(usize, usize)],
+    data_wires: &[LinExpr],
+    out: &mut Vec<Claim>,
+) {
     let per_tx = 1usize << u.block_log;
-    let mut wires = Vec::with_capacity(u.layout.challenges.len());
-    for (k, &(slot, lane)) in u.layout.challenges.iter().enumerate() {
+    assert_eq!(data_wires.len(), data_positions.len(), "absorb wire count");
+    for (k, &(slot, lane)) in data_positions.iter().enumerate() {
         let gslot = t * per_tx + slot;
         let (pt_lin, pt_nat) = slot_point(gslot, u.w_log);
-        let val = u.challenges[t][k];
-        let w = LinExpr::from_wire(b.alloc_f128(val));
+        let nval = u.committed[u.refs.a[lane]][gslot];
         out.push(Claim {
-            slice: base + u.refs.c[lane],
+            slice: base + u.refs.a[lane],
             point: pt_lin,
-            value: w.clone(),
+            value: data_wires[k].clone(),
             native_point: pt_nat,
-            native_value: val,
+            native_value: nval,
         });
-        wires.push(w);
     }
-    wires
 }
 
 #[cfg(test)]

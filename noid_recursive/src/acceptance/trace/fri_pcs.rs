@@ -311,32 +311,65 @@ pub fn gen_compact_queries_trace_with_bits(
     assert!(log_max_len < usize::BITS as usize);
     let domain_size = 1usize << log_max_len;
     let n_queries = num_queries.min(domain_size);
-    let bit_mask = (domain_size - 1) as u128;
     let random_elems = ch.squeeze_n(b, n_queries);
     let mut indices = Vec::with_capacity(n_queries);
     let mut all_bits = Vec::with_capacity(n_queries);
     for e in &random_elems {
-        let tower = expr_tower_value(b, e).0;
-        let idx = (tower & bit_mask) as usize;
-        // Decompose ALL 128 bits into witness booleans (not just the high bits
-        // past the position mask): baking the low position bits as `add_const`
-        // constants put the query position into the pinning row's constant term
-        // and drifted the matrix across blocks. `pin_zero(sum + e)` binds the
-        // decomposition to the squeezed challenge, booleanity pins each bit.
-        let mut sum = LinExpr::zero();
-        let mut bits = Vec::with_capacity(log_max_len);
-        for i in 0..128 {
-            let bit = LinExpr::from_wire(b.alloc_bool((tower >> i) & 1 == 1));
-            sum = sum.add(&bit.scale(flat_const(1u128 << i)));
-            if i < log_max_len {
-                bits.push(bit);
-            }
-        }
-        pin_zero(b, &sum.add(e));
+        let (idx, bits) = decompose_query_squeeze(b, e, log_max_len);
         indices.push(idx);
         all_bits.push(bits);
     }
     (indices, all_bits)
+}
+
+/// [`gen_compact_queries_trace_with_bits`] driven from PRE-SQUEEZED challenge
+/// wires (the region path reads them from walk-C carry cells) instead of
+/// squeezing from an inline channel. `squeezes.len()` must be the already-clamped
+/// query count (`num_queries.min(domain)`), i.e. exactly the channel schedule's
+/// `Squeeze(query_count)` op — every squeeze becomes one query. Position
+/// derivation is byte-identical (the shared [`decompose_query_squeeze`]).
+pub fn compact_queries_from_squeezes_with_bits(
+    b: &mut FieldR1csBuilder,
+    squeezes: &[LinExpr],
+    log_max_len: usize,
+) -> (Vec<usize>, Vec<Vec<LinExpr>>) {
+    assert!(log_max_len < usize::BITS as usize);
+    let mut indices = Vec::with_capacity(squeezes.len());
+    let mut all_bits = Vec::with_capacity(squeezes.len());
+    for e in squeezes {
+        let (idx, bits) = decompose_query_squeeze(b, e, log_max_len);
+        indices.push(idx);
+        all_bits.push(bits);
+    }
+    (indices, all_bits)
+}
+
+/// Decompose one squeezed challenge wire `e` into its query index (low
+/// `log_max_len` bits of the tower value) and the low `log_max_len` position
+/// bits as witness wires (LSB first). Decomposes ALL 128 bits into booleans
+/// (not just the high bits past the mask): baking the low position bits as
+/// `add_const` constants would put the query position into the pinning row's
+/// constant term and drift the matrix across blocks. `pin_zero(sum + e)` binds
+/// the decomposition to the squeeze; booleanity pins each bit.
+fn decompose_query_squeeze(
+    b: &mut FieldR1csBuilder,
+    e: &LinExpr,
+    log_max_len: usize,
+) -> (usize, Vec<LinExpr>) {
+    let bit_mask = ((1u128 << log_max_len) - 1) as u128;
+    let tower = expr_tower_value(b, e).0;
+    let idx = (tower & bit_mask) as usize;
+    let mut sum = LinExpr::zero();
+    let mut bits = Vec::with_capacity(log_max_len);
+    for i in 0..128 {
+        let bit = LinExpr::from_wire(b.alloc_bool((tower >> i) & 1 == 1));
+        sum = sum.add(&bit.scale(flat_const(1u128 << i)));
+        if i < log_max_len {
+            bits.push(bit);
+        }
+    }
+    pin_zero(b, &sum.add(e));
+    (idx, bits)
 }
 
 // ---------------------------------------------------------------------------

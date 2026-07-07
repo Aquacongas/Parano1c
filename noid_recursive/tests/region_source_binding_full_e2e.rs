@@ -183,10 +183,13 @@ fn region_source_binding_full_end_to_end() {
             .collect(),
     };
 
-    // Memory guard: with TWO union walks this must stay under 2^22 wires.
+    // Memory guard: with THREE union walks (A source-tree+leaves, B merkle, C
+    // the FRICHANL channel duplex) this must stay under 2^23 wires. Walk C adds a
+    // fixed ~1.3M-row channel discharge that replaces the inline permutations —
+    // bigger than inline at one tx, but flat in tx count (28M@255 -> ~flat).
     let n_wires = b.num_wires();
     eprintln!("[src-full] wires before build = {n_wires}, claims = {}", claims.len());
-    assert!(n_wires < (1usize << 22), "wire guard {n_wires}");
+    assert!(n_wires < (1usize << 23), "wire guard {n_wires}");
 
     let (r1cs, z) = b.build();
     assert!(r1cs.satisfies(&z), "honest source-binding-full trace unsatisfiable");
@@ -254,17 +257,20 @@ fn region_source_binding_full_end_to_end() {
     }
     let n_committed_b = 6 + 5 * n_legs;
     const N_COMMITTED_A: usize = 10; // CODE0,1 KID0,1 IN0,1 C0..C3
+    const N_COMMITTED_C: usize = 6; // A0,A1 C0..C3 (walk-C FRICHANL channel duplex)
     let pair_in0 = pair_leaf_refs(0).in_[0]; // walk-B col 0
 
     // Global column -> WitnessSlice: committed slices are allocated strictly in
-    // order (walk-A cols 0..9 then walk-B cols 0..), so sorting the distinct
-    // claim slices by start() recovers the global column index.
+    // order (walk-A cols 0..9, then walk-B cols 0.., then walk-C cols 0..5), so
+    // sorting the distinct claim slices by start() recovers the global column
+    // index. The walk-B negatives below target columns < N_COMMITTED_A +
+    // n_committed_b, so appending walk C at the end leaves them unaffected.
     let mut uniq: Vec<WitnessSlice> = claims.iter().map(|c| c.slice).collect();
     uniq.sort_by_key(|s| s.start());
     uniq.dedup_by_key(|s| s.start());
     assert_eq!(
         uniq.len(),
-        N_COMMITTED_A + n_committed_b,
+        N_COMMITTED_A + n_committed_b + N_COMMITTED_C,
         "every committed column appears in an opening claim"
     );
     let col_slice = |g: usize| uniq[g];
