@@ -104,7 +104,7 @@ use noid_ivc_core::deep_chain::schedule::{
     build_duplex_columns, build_merkle_path_columns, carry_selection_terms, compile_duplex,
     duplex_family_refs, duplex_fixed_patterns, duplex_substitution_terms, flat_of_tower_u128,
     merkle_booleanity_terms, merkle_fixed_patterns, merkle_substitution_terms, DuplexFamilyRefs,
-    DuplexLayout, LaneSource, MerkleFamilyRefs, MerklePathColumns, MerklePathFamily,
+    DuplexLayout, DuplexSlot, LaneSource, MerkleFamilyRefs, MerklePathColumns, MerklePathFamily,
     MerklePathWitness,
 };
 use noid_ivc_core::deep_chain::source_tree::{
@@ -3423,6 +3423,231 @@ fn duplex_data_positions(layout: &DuplexLayout) -> Vec<(usize, usize)> {
     pos
 }
 
+// ===========================================================================
+// HETEROGENEOUS walk-C union: N DIFFERENT duplex channels per tx, ONE walk.
+//
+// The homogeneous `build_duplex_union` tiles K copies of ONE channel schedule.
+// This variant tiles K transactions each carrying N DIFFERENT channels (distinct
+// IVs, distinct op layouts) into ONE data-parallel walk. It is the memory
+// optimization that lets the owner-auth KSCHANNL channel and the wallet-PCS
+// FRICHANL channel share ONE walk-C (~1.1M rows) instead of two: the substitution
+// wiring `raw_j(w) = (1+START(w))·C_j(w−1) + ABS_j(w)·A_j(w) + CONST_j(w)` is
+// UNIFORM across the whole slot domain, so as long as the fixed patterns place
+// each channel's START / IV / absorb-selector / rate-constant lanes at the right
+// slots, ONE `duplex_substitution_terms` relation discharges every channel of
+// every tx — and `run_duplex_union_native` / `discharge_duplex_union` (which read
+// only the 6 committed columns, the 7 fixed patterns, the refs and s0/s_out, and
+// NEVER the layout) work UNCHANGED on the combined [`DuplexUnion`].
+//
+// Layout — common-S sub-block tiling: sub-channel `i` occupies the power-of-two
+// sub-block `[i·S, (i+1)·S)` of every per-tx block, where
+// `S = next_pow2(max_i subs[i].slots.len())`; the per-tx period is `N·S` (N padded
+// to a power of two with canonical IV-seeded ghost sub-channels). Sub-block `i` of
+// tx `t` sits at global offset `t·N·S + i·S`.
+//
+// Carry reset (THE correctness crux): the combined START pattern has a `1` at
+// EVERY sub-channel's slot 0 (`i·S` for all i), so the substitution's
+// `(1+START)·C_j(w−1)` term zeroes there — each sub-channel re-seeds its OWN IV and
+// does NOT inherit the previous sub-channel's final carry. That is exactly what
+// makes the N channels within one tiled block independent (proven by
+// `combined_duplex_union_tests::combined_correctness_vs_separate`).
+// ===========================================================================
+
+/// One heterogeneous sub-channel of a combined walk-C union: its compiled duplex
+/// schedule and its capacity IV. Different sub-channels may have DIFFERENT
+/// schedules AND DIFFERENT IVs (e.g. FRICHANL vs KSCHANNL), yet still share ONE
+/// data-parallel walk.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone)]
+struct SubChannel {
+    layout: DuplexLayout,
+    iv_flat: [F128; 2],
+}
+
+/// The 7 duplex fixed patterns (`start, abs0, abs1, const0..const3`) over the
+/// combined per-tx period `N·S`, with sub-channel `i` placed at offset `i·S`.
+/// Mirrors `duplex_fixed_patterns` per sub-block: `start[i·S]=1` (the carry reset),
+/// the capacity IV on `const2/const3` at `i·S`, and each real slot's absorb
+/// selectors / rate constants at `i·S + sl`. Ghost sub-block slots (past a sub's
+/// real length) carry START=0 and no constants — they just continue the chain, and
+/// `build_duplex_columns` fills the matching continuing-chain tail per sub-block.
+#[cfg_attr(not(test), allow(dead_code))]
+fn combined_duplex_fixed_patterns(subs: &[SubChannel], s_log: usize) -> Vec<FixedPattern> {
+    let s = 1usize << s_log;
+    let per_tx = subs.len() * s;
+    let block_log = per_tx.trailing_zeros() as usize;
+    let mut start = vec![F128::ZERO; per_tx];
+    let mut abs: [Vec<F128>; 2] = std::array::from_fn(|_| vec![F128::ZERO; per_tx]);
+    let mut consts: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; per_tx]);
+    for (i, sub) in subs.iter().enumerate() {
+        let off = i * s;
+        assert!(sub.layout.slots.len() <= s, "sub schedule exceeds the common S");
+        // Carry reset + IV seed at this sub-channel's slot 0.
+        start[off] = F128::ONE;
+        consts[2][off] = sub.iv_flat[0];
+        consts[3][off] = sub.iv_flat[1];
+        for (sl, ds) in sub.layout.slots.iter().enumerate() {
+            for (j, lane) in ds.lanes.iter().enumerate() {
+                match lane {
+                    Some(LaneSource::Data(_)) => abs[j][off + sl] = F128::ONE,
+                    Some(LaneSource::Const(cv)) => consts[j][off + sl] = flat_of_tower_u128(*cv),
+                    None => {}
+                }
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(3 + STATE_SIZE);
+    out.push(FixedPattern::new(block_log, start));
+    for pat in abs {
+        out.push(FixedPattern::new(block_log, pat));
+    }
+    for pat in consts {
+        out.push(FixedPattern::new(block_log, pat));
+    }
+    out
+}
+
+/// The combined [`DuplexLayout`] over the per-tx period `N·S`: each sub-channel's
+/// slots placed at offset `i·S` with Data lane indices RENUMBERED to the flattened
+/// `[sub0 data ++ sub1 data ++ ...]` global stream, and challenges concatenated in
+/// sub order with slots shifted by `i·S` (matching the per-tx challenge stream). By
+/// construction `duplex_data_positions(&combined_duplex_layout(subs, s_log))` ==
+/// [`combined_duplex_data_positions`]`(subs, s_log)`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn combined_duplex_layout(subs: &[SubChannel], s_log: usize) -> DuplexLayout {
+    let s = 1usize << s_log;
+    let per_tx = subs.len() * s;
+    let mut slots = vec![DuplexSlot { lanes: [None, None] }; per_tx];
+    let mut challenges = Vec::new();
+    let mut data_off = 0usize;
+    for (i, sub) in subs.iter().enumerate() {
+        let off = i * s;
+        for (sl, ds) in sub.layout.slots.iter().enumerate() {
+            let lanes = std::array::from_fn(|lane| match ds.lanes[lane] {
+                Some(LaneSource::Data(k)) => Some(LaneSource::Data(data_off + k)),
+                other => other,
+            });
+            slots[off + sl] = DuplexSlot { lanes };
+        }
+        for &(slot, lane) in &sub.layout.challenges {
+            challenges.push((off + slot, lane));
+        }
+        data_off += sub.layout.n_data;
+    }
+    DuplexLayout { slots, challenges, n_data: data_off }
+}
+
+/// Each data lane's `(slot, lane)` in the combined per-tx block, in the flattened
+/// `[sub0 data ++ sub1 data ++ ...]` order — sub `i`'s `duplex_data_positions` with
+/// slot shifted by `i·S`. The per-tx algebra reads each channel's absorbed data at
+/// these positions; agrees with `duplex_data_positions(&combined_duplex_layout(..))`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn combined_duplex_data_positions(subs: &[SubChannel], s_log: usize) -> Vec<(usize, usize)> {
+    let s = 1usize << s_log;
+    let mut out = Vec::new();
+    for (i, sub) in subs.iter().enumerate() {
+        let off = i * s;
+        for (slot, lane) in duplex_data_positions(&sub.layout) {
+            out.push((off + slot, lane));
+        }
+    }
+    out
+}
+
+/// Tile `data.len()` transactions, each carrying `subs.len()` DIFFERENT duplex
+/// sub-channels, into ONE walk-C domain. `data[t][i]` is sub-channel `i`'s
+/// absorbed-data stream for tx `t` (flat, length `subs[i].layout.n_data`).
+///
+/// The result is a drop-in [`DuplexUnion`]: `run_duplex_union_native` and
+/// `discharge_duplex_union` are AGNOSTIC to how many sub-channels a block holds
+/// (they walk the 6 committed columns and open each at ONE random point), so ONE
+/// carry-selection + ONE walk + ONE substitution discharges every sub-channel of
+/// every tx. The per-tx challenge stream `challenges[t]` is the sub-channels'
+/// squeezed challenges CONCATENATED in sub order.
+///
+/// Padding: `N` is padded to a power of two with canonical IV-seeded ghost
+/// sub-channels (empty schedules → pure IV chains, no absorbs, no challenges); `K`
+/// is padded to a power of two with ghost TILES (zero-data channel blocks). Both
+/// pads are valid chains re-seeded by the START pattern — never `perm([0;4])` ghost
+/// slots (the duplex substitution's leading carry term is ungated, so every block
+/// must be a genuine IV-seeded chain).
+#[cfg_attr(not(test), allow(dead_code))]
+fn build_combined_duplex_union(subs: &[SubChannel], data: &[Vec<Vec<F128>>]) -> DuplexUnion {
+    assert!(!subs.is_empty(), "need at least one sub-channel");
+    let n_real = subs.len();
+    let n = n_real.next_power_of_two();
+    // Common S = smallest power-of-two slot capacity across all sub-channels.
+    let s = subs
+        .iter()
+        .map(|c| c.layout.slots.len())
+        .max()
+        .unwrap()
+        .max(1)
+        .next_power_of_two();
+    let s_log = s.trailing_zeros() as usize;
+    let per_tx = n * s;
+    let block_log = per_tx.trailing_zeros() as usize;
+    let k = data.len();
+    let w_log = (k.max(1) * per_tx).next_power_of_two().trailing_zeros() as usize;
+    let p = 1usize << w_log;
+    let n_tx_blocks = p / per_tx;
+
+    // Validate the caller's data shape against the real sub-channels.
+    for (t, row) in data.iter().enumerate() {
+        assert_eq!(row.len(), n_real, "data row {t} width must equal the sub-channel count");
+        for (i, stream) in row.iter().enumerate() {
+            assert_eq!(stream.len(), subs[i].layout.n_data, "data[{t}][{i}] length");
+        }
+    }
+
+    // Pad N up to a power of two with canonical ghost sub-channels (an empty
+    // schedule seeds a pure zero-IV chain in its S-block — no absorbs, no
+    // challenges). For the N=2 wallet use this is a no-op.
+    let ghost = SubChannel {
+        layout: DuplexLayout { slots: Vec::new(), challenges: Vec::new(), n_data: 0 },
+        iv_flat: [F128::ZERO, F128::ZERO],
+    };
+    let subs_padded: Vec<SubChannel> =
+        (0..n).map(|i| if i < n_real { subs[i].clone() } else { ghost.clone() }).collect();
+
+    let mut committed: [Vec<F128>; 6] = std::array::from_fn(|_| vec![F128::ZERO; p]);
+    let mut s0: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; p]);
+    let mut s_out: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; p]);
+    let mut challenges: Vec<Vec<F128>> = Vec::with_capacity(k);
+
+    for blk in 0..n_tx_blocks {
+        let mut tx_challenges: Vec<F128> = Vec::new();
+        for (i, sub) in subs_padded.iter().enumerate() {
+            let zero_data = vec![F128::ZERO; sub.layout.n_data];
+            let d: &[F128] = if blk < k && i < n_real { &data[blk][i] } else { &zero_data };
+            // Each sub-block is a STANDARD S-slot homogeneous block: slot 0 is
+            // IV-seeded, later slots carry, and the tail past the real schedule is
+            // the continuing chain fill — copied wholesale into the tiled domain.
+            let cols = build_duplex_columns(&sub.layout, sub.iv_flat, d, s_log);
+            let off = blk * per_tx + i * s;
+            for j in 0..2 {
+                committed[j][off..off + s].copy_from_slice(&cols.a[j]);
+            }
+            for j in 0..STATE_SIZE {
+                committed[2 + j][off..off + s].copy_from_slice(&cols.c[j]);
+                s0[j][off..off + s].copy_from_slice(&cols.s0[j]);
+                s_out[j][off..off + s].copy_from_slice(&cols.s_out[j]);
+            }
+            if blk < k {
+                tx_challenges.extend_from_slice(&cols.challenges);
+            }
+        }
+        if blk < k {
+            challenges.push(tx_challenges);
+        }
+    }
+
+    let fixed = combined_duplex_fixed_patterns(&subs_padded, s_log);
+    let layout = combined_duplex_layout(&subs_padded, s_log);
+    let refs = duplex_family_refs(0, 0);
+    DuplexUnion { committed, s0, s_out, fixed, refs, layout, w_log, block_log, challenges }
+}
+
 #[cfg(test)]
 mod stage1_leaf_union_tests {
     use super::*;
@@ -3922,6 +4147,442 @@ mod stage1_duplex_union_tests {
         assert_eq!(rounds(2), r1 + 1, "K:1->2 adds one walk round");
         assert_eq!(rounds(4), r1 + 2, "K:1->4 adds two walk rounds");
         assert_eq!(rounds(8), r1 + 3, "K:1->8 adds three walk rounds");
+    }
+}
+
+/// [G] step 4 — the HETEROGENEOUS duplex-union walk C: K txs, each carrying N
+/// DIFFERENT Poseidon2b channels (different IVs, different op layouts), tiled into
+/// ONE data-parallel walk and discharged ONCE. This is the memory optimization
+/// that lets the owner-auth KSCHANNL and the wallet-PCS FRICHANL channels share
+/// ONE walk-C instead of two.
+#[cfg(test)]
+mod combined_duplex_union_tests {
+    use super::*;
+    use noid_ivc_core::deep_chain::schedule::TranscriptOp;
+    use noid_poseidon2b::native::domain::DomainTag;
+
+    fn iv_flat(tag: DomainTag) -> [F128; 2] {
+        let iv = capacity_iv(tag);
+        [flat_of_tower_u128(iv[0].0), flat_of_tower_u128(iv[1].0)]
+    }
+
+    /// Channel 0 (FRICHANL-shaped): 7 slots, 6 data lanes, 5 squeezed challenges —
+    /// a three-lane absorb, a constant-lane absorb, a two-challenge squeeze, an
+    /// absorb-after-squeeze reset, and a pad-flush squeeze.
+    fn channel0_ops() -> Vec<TranscriptOp> {
+        const TAG: u128 = 0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10;
+        vec![
+            TranscriptOp::Absorb(vec![None, None, None]),
+            TranscriptOp::Absorb(vec![Some(TAG)]),
+            TranscriptOp::Squeeze(2),
+            TranscriptOp::Absorb(vec![None, None]),
+            TranscriptOp::Absorb(vec![None]),
+            TranscriptOp::Squeeze(3),
+        ]
+    }
+
+    /// Channel 1 (KSCHANNL-shaped, deliberately DIFFERENT counts): 4 slots, 3 data
+    /// lanes, 3 challenges — a two-lane absorb, a one-challenge squeeze, then an
+    /// absorb + pad-flush two-challenge squeeze.
+    fn channel1_ops() -> Vec<TranscriptOp> {
+        vec![
+            TranscriptOp::Absorb(vec![None, None]),
+            TranscriptOp::Squeeze(1),
+            TranscriptOp::Absorb(vec![None]),
+            TranscriptOp::Squeeze(2),
+        ]
+    }
+
+    /// Channel 2 (a THIRD distinct shape, for the N=3→4 ghost-sub padding test): 3
+    /// slots, 4 data lanes, 2 challenges.
+    fn channel2_ops() -> Vec<TranscriptOp> {
+        vec![
+            TranscriptOp::Absorb(vec![None, None, None, None]),
+            TranscriptOp::Squeeze(2),
+        ]
+    }
+
+    fn tx_data(layout: &DuplexLayout, seed: u64) -> Vec<F128> {
+        let mut r = seed;
+        (0..layout.n_data)
+            .map(|_| {
+                r = r.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(0x1234_5);
+                F128 { lo: r, hi: r.rotate_left(29) ^ 0xA5A5 }
+            })
+            .collect()
+    }
+
+    fn s_log_of(subs: &[SubChannel]) -> usize {
+        subs.iter()
+            .map(|c| c.layout.slots.len())
+            .max()
+            .unwrap()
+            .max(1)
+            .next_power_of_two()
+            .trailing_zeros() as usize
+    }
+
+    /// CORRECTNESS vs SEPARATE (the carry-reset proof): building two DIFFERENT
+    /// channels into ONE combined union yields, per tx, EXACTLY the challenges each
+    /// channel squeezes when tiled alone. That is only possible if each
+    /// sub-channel re-seeds its own IV at `i·S` (START=1 there) and does NOT inherit
+    /// the previous sub-channel's final carry — i.e. zero cross-channel bleed. Also
+    /// checks the data-position map agrees with the combined layout and the
+    /// heterogeneous native walk discharges.
+    #[test]
+    fn combined_correctness_vs_separate() {
+        let ch0 = compile_duplex(&channel0_ops());
+        let ch1 = compile_duplex(&channel1_ops());
+        assert_eq!((ch0.slots.len(), ch0.n_data, ch0.challenges.len()), (7, 6, 5));
+        assert_eq!((ch1.slots.len(), ch1.n_data, ch1.challenges.len()), (4, 3, 3));
+        let iv0 = iv_flat(TAG_FRICHANL);
+        let iv1 = iv_flat(TAG_KSCHANNL);
+        assert_ne!(iv0, iv1, "the two channels must carry different IVs");
+        let subs = vec![
+            SubChannel { layout: ch0.clone(), iv_flat: iv0 },
+            SubChannel { layout: ch1.clone(), iv_flat: iv1 },
+        ];
+        let k = 2usize;
+        let data: Vec<Vec<Vec<F128>>> = (0..k)
+            .map(|t| vec![tx_data(&ch0, 0x1000 + t as u64), tx_data(&ch1, 0x2000 + t as u64)])
+            .collect();
+        let u = build_combined_duplex_union(&subs, &data);
+
+        // Homogeneous unions for each channel ALONE (same per-tx data streams).
+        let data0: Vec<Vec<F128>> = (0..k).map(|t| tx_data(&ch0, 0x1000 + t as u64)).collect();
+        let data1: Vec<Vec<F128>> = (0..k).map(|t| tx_data(&ch1, 0x2000 + t as u64)).collect();
+        let h0 = build_duplex_union(&ch0, iv0, &data0);
+        let h1 = build_duplex_union(&ch1, iv1, &data1);
+
+        let (n0, n1) = (ch0.challenges.len(), ch1.challenges.len());
+        assert_eq!(u.challenges.len(), k);
+        for t in 0..k {
+            assert_eq!(u.challenges[t].len(), n0 + n1, "concatenated challenge count");
+            assert_eq!(
+                &u.challenges[t][0..n0],
+                h0.challenges[t].as_slice(),
+                "channel 0 squeezes exactly its standalone challenges (no cross-channel bleed)"
+            );
+            assert_eq!(
+                &u.challenges[t][n0..n0 + n1],
+                h1.challenges[t].as_slice(),
+                "channel 1 squeezes exactly its standalone challenges (no cross-channel bleed)"
+            );
+        }
+        assert_ne!(u.challenges[0], u.challenges[1], "distinct tx data ⇒ distinct challenges");
+
+        // Data-position self-consistency: the separate helper agrees with reading
+        // the combined layout directly (Data indices renumbered to the global
+        // flattened stream).
+        let s_log = s_log_of(&subs);
+        assert_eq!(
+            combined_duplex_data_positions(&subs, s_log),
+            duplex_data_positions(&u.layout),
+            "data positions agree with the combined layout"
+        );
+        assert_eq!(
+            combined_duplex_data_positions(&subs, s_log).len(),
+            ch0.n_data + ch1.n_data,
+            "one position per real data lane"
+        );
+
+        // The heterogeneous walk discharges natively (soundness of the shared DAG).
+        let _ = run_duplex_union_native(&u, b"combined-correctness");
+    }
+
+    /// GHOST padding: N=3 (padded to 4 with a canonical IV-seeded ghost sub-channel)
+    /// AND K=3 (padded to 4 tx-blocks with zero-data ghost tiles) still recovers
+    /// each real channel's standalone challenges and discharges natively — the pads
+    /// are valid chains, re-seeded by START, not `perm([0;4])` ghost slots.
+    #[test]
+    fn combined_ghost_padding() {
+        let ch0 = compile_duplex(&channel0_ops());
+        let ch1 = compile_duplex(&channel1_ops());
+        let ch2 = compile_duplex(&channel2_ops());
+        let iv0 = iv_flat(TAG_FRICHANL);
+        let iv1 = iv_flat(TAG_KSCHANNL);
+        let iv2 = [
+            flat_of_tower_u128(0xA5A5_5A5A_1234_5678_9ABC_DEF0_0F1E_2D3C),
+            flat_of_tower_u128(0x5A5A_A5A5_8765_4321_0FED_CBA9_C3D2_E1F0),
+        ];
+        let subs = vec![
+            SubChannel { layout: ch0.clone(), iv_flat: iv0 },
+            SubChannel { layout: ch1.clone(), iv_flat: iv1 },
+            SubChannel { layout: ch2.clone(), iv_flat: iv2 },
+        ];
+        let k = 3usize; // K=3 -> padded to 4 tx-blocks (ghost tile).
+        let data: Vec<Vec<Vec<F128>>> = (0..k)
+            .map(|t| {
+                vec![
+                    tx_data(&ch0, 0x11 + t as u64),
+                    tx_data(&ch1, 0x22 + t as u64),
+                    tx_data(&ch2, 0x33 + t as u64),
+                ]
+            })
+            .collect();
+        let u = build_combined_duplex_union(&subs, &data);
+
+        // N padded to 4 → per-tx period = 4·S.
+        let s = 1usize << s_log_of(&subs);
+        assert_eq!(1usize << u.block_log, 4 * s, "N padded to a power of two");
+
+        let mk = |layout: &DuplexLayout, iv: [F128; 2], base: u64| {
+            let d: Vec<Vec<F128>> = (0..k).map(|t| tx_data(layout, base + t as u64)).collect();
+            build_duplex_union(layout, iv, &d)
+        };
+        let h0 = mk(&ch0, iv0, 0x11);
+        let h1 = mk(&ch1, iv1, 0x22);
+        let h2 = mk(&ch2, iv2, 0x33);
+        let (n0, n1, n2) = (ch0.challenges.len(), ch1.challenges.len(), ch2.challenges.len());
+        assert_eq!(u.challenges.len(), k, "K real tx challenge streams (ghost tile excluded)");
+        for t in 0..k {
+            assert_eq!(u.challenges[t].len(), n0 + n1 + n2);
+            assert_eq!(&u.challenges[t][0..n0], h0.challenges[t].as_slice());
+            assert_eq!(&u.challenges[t][n0..n0 + n1], h1.challenges[t].as_slice());
+            assert_eq!(&u.challenges[t][n0 + n1..n0 + n1 + n2], h2.challenges[t].as_slice());
+        }
+        // The padded (ghost sub + ghost tile) domain still discharges natively.
+        let _ = run_duplex_union_native(&u, b"combined-ghost");
+    }
+
+    /// The carry reset is LOAD-BEARING (the correctness crux, verified — not just
+    /// reasoned). First, structurally: START=1 lands EXACTLY at each sub-channel's
+    /// boundary `i·S` and the capacity IV is seeded on the const2/const3 lanes there.
+    /// Then, behaviourally: removing the START=1 at the SECOND sub-channel's boundary
+    /// makes the heterogeneous discharge NO LONGER verify — the substitution wiring
+    /// `(1+START)·C(w−1)` then reads the previous channel's final carry instead of
+    /// the IV reset the columns actually used, so the terminal claim is false and
+    /// `run_duplex_union_native`'s internal verify panics.
+    #[test]
+    fn carry_reset_is_load_bearing() {
+        let ch0 = compile_duplex(&channel0_ops());
+        let ch1 = compile_duplex(&channel1_ops());
+        let iv0 = iv_flat(TAG_FRICHANL);
+        let iv1 = iv_flat(TAG_KSCHANNL);
+        let subs = vec![
+            SubChannel { layout: ch0.clone(), iv_flat: iv0 },
+            SubChannel { layout: ch1.clone(), iv_flat: iv1 },
+        ];
+        let data: Vec<Vec<Vec<F128>>> = (0..2)
+            .map(|t| vec![tx_data(&ch0, 0x900 + t as u64), tx_data(&ch1, 0xA00 + t as u64)])
+            .collect();
+        let u = build_combined_duplex_union(&subs, &data);
+        let s = 1usize << s_log_of(&subs);
+
+        // Structural: START is ONE exactly at the two sub-channel boundaries {0, S}.
+        let start = &u.fixed[u.refs.start];
+        let ones: Vec<usize> = start
+            .table
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| **v == F128::ONE)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(ones, vec![0, s], "START resets each sub-channel's carry at i·S");
+        // Structural: each boundary seeds its OWN channel's capacity IV.
+        assert_eq!(u.fixed[u.refs.consts[2]].table[0], iv0[0]);
+        assert_eq!(u.fixed[u.refs.consts[3]].table[0], iv0[1]);
+        assert_eq!(u.fixed[u.refs.consts[2]].table[s], iv1[0]);
+        assert_eq!(u.fixed[u.refs.consts[3]].table[s], iv1[1]);
+
+        // Honest discharge verifies.
+        let _ = run_duplex_union_native(&u, b"carry-reset");
+
+        // Behavioural: remove the reset at sub-channel 1's boundary → the shared
+        // discharge must fail (substitution terminal is now false).
+        let mut bad = build_combined_duplex_union(&subs, &data);
+        bad.fixed[bad.refs.start].table[s] = F128::ZERO;
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // silence the expected panic log
+        let broke = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = run_duplex_union_native(&bad, b"carry-reset");
+        }));
+        std::panic::set_hook(prev);
+        assert!(broke.is_err(), "removing the carry reset must break the heterogeneous discharge");
+    }
+
+    /// ONE discharge binds BOTH channels through the REAL outer PCS. The 6 committed
+    /// columns live as witness slices; ONE selection → walk → substitution → shift
+    /// discharge opens every A/C column at ONE random point; each tx's squeezed
+    /// challenges are read from the carry cells as opening claims. Honest verifies;
+    /// flipping a channel-0 carry cell breaks that column's opening (reject), and so
+    /// does flipping a channel-1 carry cell — BOTH bound by the ONE walk.
+    #[test]
+    fn combined_one_discharge_binds_both() {
+        use noid_ivc_core::challenger::FsLaneChallenger;
+        use noid_ivc_core::pcs::{self, PcsParams};
+        use noid_ivc_core::public_io::{IoClaimSpec, PublicIoSpec};
+        use noid_ivc_core::verifier::verify_field_with_public_io;
+        use noid_ivc_prover::field_prover::prove_field_with_public_io;
+
+        const DOM: &[u8] = b"combined-duplex-binds-both";
+        const OUTER: &[u8] = b"combined-duplex-binds-both-outer";
+        let ch0 = compile_duplex(&channel0_ops());
+        let ch1 = compile_duplex(&channel1_ops());
+        let iv0 = iv_flat(TAG_FRICHANL);
+        let iv1 = iv_flat(TAG_KSCHANNL);
+        let subs = vec![
+            SubChannel { layout: ch0.clone(), iv_flat: iv0 },
+            SubChannel { layout: ch1.clone(), iv_flat: iv1 },
+        ];
+        let k = 2usize;
+        let data: Vec<Vec<Vec<F128>>> = (0..k)
+            .map(|t| vec![tx_data(&ch0, 0xC0FE_0000 + t as u64), tx_data(&ch1, 0xBEEF_0000 + t as u64)])
+            .collect();
+        let u = build_combined_duplex_union(&subs, &data);
+        let native = run_duplex_union_native(&u, DOM);
+        let w_log = u.w_log;
+
+        // Build the trace: 6 committed columns as slices, ONE union discharge, and
+        // each tx's challenges read from the carry cells.
+        let mut b = FieldR1csBuilder::new();
+        let slices: Vec<WitnessSlice> =
+            u.committed.iter().map(|c| alloc_column_slice(&mut b, c, w_log).0).collect();
+        let mut claims = discharge_duplex_union(&mut b, &u, DOM, &native, 0);
+        for t in 0..k {
+            let _ = read_duplex_challenges(&mut b, &u, t, 0, &mut claims);
+        }
+
+        // Wire every claim into the outer PCS public IO (uniform w_log-arity points).
+        let lanes_per = w_log + 1;
+        let io_len = claims.len() * lanes_per;
+        let io_log = io_len.next_power_of_two().trailing_zeros() as usize;
+        let mut io_values = Vec::with_capacity(io_len);
+        for c in &claims {
+            assert_eq!(c.native_point.len(), w_log, "claim point arity");
+            io_values.extend_from_slice(&c.native_point);
+            io_values.push(c.native_value);
+        }
+        let (io_slice, io_wires) = alloc_column_slice(&mut b, &io_values, io_log);
+        for (ci, c) in claims.iter().enumerate() {
+            let base = ci * lanes_per;
+            for (kk, p) in c.point.iter().enumerate() {
+                pin_eq(&mut b, p, &io_wires[base + kk]);
+            }
+            pin_eq(&mut b, &c.value, &io_wires[base + w_log]);
+        }
+        let spec = PublicIoSpec {
+            io_slice,
+            io_len,
+            claims: claims
+                .iter()
+                .enumerate()
+                .map(|(ci, c)| IoClaimSpec {
+                    slice: slices[c.slice],
+                    point: ci * lanes_per..ci * lanes_per + w_log,
+                    value: ci * lanes_per + w_log,
+                })
+                .collect(),
+        };
+
+        let (r1cs, z) = b.build();
+        assert!(r1cs.satisfies(&z), "honest combined-union trace unsatisfiable");
+        assert!(z.len() < (1usize << 21), "wire-count guard");
+        let params = PcsParams {
+            m: r1cs.m + pcs::LOG_PACKING,
+            log_inv_rate: 2,
+            log_batch_size: 2,
+            profile: Default::default(),
+        };
+        let mut ch_p = FsLaneChallenger::new(OUTER);
+        let (proof, commitment, _) =
+            prove_field_with_public_io(&r1cs, &z, &params, &spec, &io_values, &mut ch_p);
+        let mut ch_v = FsLaneChallenger::new(OUTER);
+        verify_field_with_public_io(&r1cs, &commitment, &proof, &spec, &io_values, &mut ch_v)
+            .expect("honest combined-union proof verifies");
+        eprintln!(
+            "[combined-duplex] N=2 K={k} rows={} (m={}) claims={} — ONE walk binds both channels",
+            z.len(),
+            r1cs.m,
+            spec.claims.len()
+        );
+
+        // The two channels' challenge slots (channel 0 first, channel 1 after) —
+        // both in tx 0's tiled block.
+        let (n0, _n1) = (ch0.challenges.len(), ch1.challenges.len());
+        let reject_flip = |slot_lane: (usize, usize), label: &str| {
+            let (slot, lane) = slot_lane;
+            let col = slices[u.refs.c[lane]];
+            let mut bad_z = z.clone();
+            bad_z[col.start() + slot] += F128::ONE;
+            assert!(r1cs.satisfies(&bad_z), "committed columns are free wires ({label})");
+            let mut ch_p = FsLaneChallenger::new(OUTER);
+            let (bad_proof, bad_commitment, _) =
+                prove_field_with_public_io(&r1cs, &bad_z, &params, &spec, &io_values, &mut ch_p);
+            let mut ch_v = FsLaneChallenger::new(OUTER);
+            assert!(
+                verify_field_with_public_io(
+                    &r1cs,
+                    &bad_commitment,
+                    &bad_proof,
+                    &spec,
+                    &io_values,
+                    &mut ch_v
+                )
+                .is_err(),
+                "flipping a {label} carry cell must break its opening claim"
+            );
+        };
+        // NEGATIVE A: a channel-0 carry cell (its first squeezed challenge slot).
+        reject_flip(u.layout.challenges[0], "channel-0");
+        // NEGATIVE B: a channel-1 carry cell (its first squeezed challenge slot,
+        // in the i=1 sub-block).
+        reject_flip(u.layout.challenges[n0], "channel-1");
+    }
+
+    /// FLATNESS: doubling K raises the tiled domain by one bit, so the ONE shared
+    /// walk gains exactly ONE sumcheck round — not a second walk. Prints the K=1 vs
+    /// K=2 full-trace wire counts (they grow only by the per-tx tiles + one round).
+    #[test]
+    fn combined_walk_is_flat() {
+        let ch0 = compile_duplex(&channel0_ops());
+        let ch1 = compile_duplex(&channel1_ops());
+        let iv0 = iv_flat(TAG_FRICHANL);
+        let iv1 = iv_flat(TAG_KSCHANNL);
+        let subs = vec![
+            SubChannel { layout: ch0.clone(), iv_flat: iv0 },
+            SubChannel { layout: ch1.clone(), iv_flat: iv1 },
+        ];
+
+        // Walk rounds (layer 0 sumcheck rounds) grow by exactly one per K-doubling.
+        let walk_rounds = |k: usize| {
+            let data: Vec<Vec<Vec<F128>>> = (0..k)
+                .map(|t| vec![tx_data(&ch0, 0xF00D + t as u64), tx_data(&ch1, 0xBA5E + t as u64)])
+                .collect();
+            let u = build_combined_duplex_union(&subs, &data);
+            run_duplex_union_native(&u, b"combined-flat").walk_proof.layers[0].round_coeffs.len()
+        };
+        let r1 = walk_rounds(1);
+        assert_eq!(walk_rounds(2), r1 + 1, "K:1->2 adds exactly one shared-walk round");
+        assert_eq!(walk_rounds(4), r1 + 2, "K:1->4 adds exactly two shared-walk rounds");
+
+        // Full-trace RAW wire counts (discharge + per-tx challenge reads), taken
+        // BEFORE `build()` rounds up to a power of two — the padded `z.len()` would
+        // hide the sub-linear growth (both K land in the same 2^m block).
+        let trace_wires = |k: usize| -> usize {
+            let data: Vec<Vec<Vec<F128>>> = (0..k)
+                .map(|t| vec![tx_data(&ch0, 0xF00D + t as u64), tx_data(&ch1, 0xBA5E + t as u64)])
+                .collect();
+            let u = build_combined_duplex_union(&subs, &data);
+            let native = run_duplex_union_native(&u, b"combined-flat");
+            let mut b = FieldR1csBuilder::new();
+            for c in u.committed.iter() {
+                alloc_column_slice(&mut b, c, u.w_log);
+            }
+            let mut claims = discharge_duplex_union(&mut b, &u, b"combined-flat", &native, 0);
+            for t in 0..k {
+                let _ = read_duplex_challenges(&mut b, &u, t, 0, &mut claims);
+            }
+            b.num_wires()
+        };
+        let w1 = trace_wires(1);
+        let w2 = trace_wires(2);
+        eprintln!(
+            "[combined-duplex-flat] raw wires K=1: {w1}, K=2: {w2} (Δ={}) — shared walk, NOT a second walk (Δ ≪ w1)",
+            w2 - w1
+        );
+        assert!(w2 < 2 * w1, "K=2 must NOT be a second walk (sub-linear wire growth)");
+        assert!(w2 - w1 < w1 / 2, "K-doubling grows the trace by ≪ a full walk");
     }
 }
 
