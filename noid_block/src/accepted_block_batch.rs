@@ -1748,6 +1748,7 @@ mod tests {
                 owner_auth_region: false,
                 exact_state_region: false,
                 tx_root_region: false,
+                spine_region: false,
             };
             let mut b = FieldR1csBuilder::new();
             let slots = build_block_slots_with_config(
@@ -1807,6 +1808,7 @@ mod tests {
                 owner_auth_region: false,
                 exact_state_region: false,
                 tx_root_region: false,
+                spine_region: false,
             };
             let sample = LinkBlock {
                 start_accumulator: &units[0].start_accumulator,
@@ -1822,6 +1824,7 @@ mod tests {
                     units[0].start_accumulator.clone(),
                     rp,
                     &sample,
+                    false,
                     false,
                     false,
                     false,
@@ -2224,13 +2227,14 @@ mod tests {
         let region_params = RegionDischargeParams { nq: 2, sb8_auth_layers: 1 };
         let units = chained_multi_tx_blocks(1, 2);
         let u = &units[0];
-        let scratch = region_wallet_pcs_native(&u.inputs, region_params, false, false, false);
+        let scratch = region_wallet_pcs_native(&u.inputs, region_params, false, false, false, false);
         let cfg = BlockSlotsConfig {
             discharge_wallet_pcs: true,
             wallet_pcs_region: Some(region_params),
             owner_auth_region: false,
             exact_state_region: false,
             tx_root_region: false,
+            spine_region: false,
         };
         let mut b = FieldR1csBuilder::new();
         let slots = build_block_slots_with_config(
@@ -2403,6 +2407,7 @@ mod tests {
             owner_auth_region: true,
             exact_state_region: true,
             tx_root_region: true,
+            spine_region: true,
         };
         let mut b = FieldR1csBuilder::new();
         let slots = build_block_slots_with_config(
@@ -2491,8 +2496,9 @@ mod tests {
             bad[wire_of(&slots.exact_state.state_roots[1].utxo_root[0])] += F128::ONE;
             assert!(!r1cs.satisfies(&bad), "flipped utxo-root wire accepted");
         }
-        // 4. Spine tx-hash wire — the tx-root leaf closure: bound to the
-        //    walk-B tx-root leg's entry cell (and the spine killshot).
+        // 4. Spine tx-hash wire — the tx-root leaf closure AND the spine wrap
+        //    closure: bound to the walk-B tx-root leg's entry cell and to the
+        //    walk-A wrap digest cell (region mode has no inline spine slot).
         {
             let mut bad = z.clone();
             bad[wire_of(&slots.tx_hashes[0][0])] += F128::ONE;
@@ -2506,7 +2512,79 @@ mod tests {
             bad[wire_of(&slots.header.fields[header_fields::TX_ROOT])] += F128::ONE;
             assert!(!r1cs.satisfies(&bad), "flipped header tx_root wire accepted");
         }
-        eprintln!("[es-region] all five one-flip negatives rejected");
+        // 6. Spine input payload lane — in region mode its ONLY hash binding is
+        //    the walk-A tile absorb cell pin; the flip must be rejected there.
+        {
+            let mut bad = z.clone();
+            bad[wire_of(&slots.spine_inputs[0].input_leaves[0][1])] += F128::ONE;
+            assert!(!r1cs.satisfies(&bad), "flipped spine payload wire accepted");
+        }
+        // 7. Epoch-anchor lane — bound ONLY by the spine tree's KID leaf-cell
+        //    pin (tree leaf L0) in region mode.
+        {
+            let mut bad = z.clone();
+            bad[wire_of(&slots.spine_inputs[0].epoch_anchor[0])] += F128::ONE;
+            assert!(!r1cs.satisfies(&bad), "flipped epoch-anchor wire accepted");
+        }
+        eprintln!("[es-region] all seven one-flip negatives rejected");
+    }
+
+    /// Multi-tx spine-region parity: a 2-user-tx block (k = 2 obligations,
+    /// 2 spine instances — the fixture blocks carry no coinbase) exercises
+    /// the CHUNKED spine layout end-to-end: per-block capacity 1, so tx
+    /// block 0 carries instance 0 and tx block 1 carries instance 1, with
+    /// all region flags on. (The capacity-2 + ghost-instance + instance-
+    /// coordinate re-point path is gated separately in
+    /// `region_spine_families_multitx_with_ghosts`.) The build must satisfy
+    /// (every cell pin lands) and flipping a spine tx-hash wire must break
+    /// the wrap-digest cell pin.
+    #[test]
+    fn region_spine_multitx_block_slots_parity() {
+        use noid_ivc_core::field::F128;
+        use noid_ivc_core::field_circuit::{FieldR1csBuilder, LinExpr};
+        use noid_recursive::acceptance::block_slots::{
+            build_block_slots_with_config, BlockSlotsConfig,
+        };
+        use noid_recursive::acceptance::trace::region_source_binding::RegionDischargeParams;
+
+        let wire_of = |e: &LinExpr| -> usize {
+            assert_eq!(e.terms.len(), 1, "statement wire expected");
+            e.terms[0].0 as usize
+        };
+        let units = chained_multi_tx_blocks(1, 2);
+        let u = &units[0];
+        let cfg = BlockSlotsConfig {
+            discharge_wallet_pcs: true,
+            wallet_pcs_region: Some(RegionDischargeParams { nq: 2, sb8_auth_layers: 1 }),
+            owner_auth_region: true,
+            exact_state_region: true,
+            tx_root_region: true,
+            spine_region: true,
+        };
+        let mut b = FieldR1csBuilder::new();
+        let slots = build_block_slots_with_config(
+            &mut b,
+            &u.start_accumulator,
+            &u.end_accumulator,
+            &u.inputs,
+            &u.proof,
+            cfg,
+        );
+        assert_eq!(slots.tx_hashes.len(), 2, "two user txs, no coinbase in the fixture");
+        let (r1cs, z) = b.build();
+        assert!(r1cs.satisfies(&z), "multi-tx spine-region block slots must satisfy");
+        // The LAST tx's hash lives in tx block 1's chunk — its wrap-digest
+        // cell pin must still bind it.
+        let last = slots.tx_hashes.len() - 1;
+        let mut bad = z.clone();
+        bad[wire_of(&slots.tx_hashes[last][0])] += F128::ONE;
+        assert!(!r1cs.satisfies(&bad), "flipped chunked spine tx-hash accepted");
+        eprintln!(
+            "[spine-region] multitx parity OK: {} wires, {} claims, {} instances",
+            z.len(),
+            slots.pending_wallet_pcs.len(),
+            slots.tx_hashes.len()
+        );
     }
 
     /// MEMORY / SHAPE measurement for `BlockSlotsConfig::owner_auth_region`.
@@ -2540,6 +2618,7 @@ mod tests {
             owner_auth_region: false,
             exact_state_region: false,
             tx_root_region: false,
+            spine_region: false,
         };
         let cfg_region = BlockSlotsConfig {
             discharge_wallet_pcs: true,
@@ -2547,6 +2626,7 @@ mod tests {
             owner_auth_region: true,
             exact_state_region: false,
             tx_root_region: false,
+            spine_region: false,
         };
 
         // Inline-owner-auth path: build, extract numbers + wallet-PCS claim
@@ -2638,7 +2718,7 @@ mod tests {
         // cells; its output MUST match the real build's `pending_wallet_pcs`
         // natives, in ORDER, for the owner-auth-region path too (the mirror). Gate
         // it directly against the real region build above.
-        let scratch = region_wallet_pcs_native(&u.inputs, region_params, true, false, false);
+        let scratch = region_wallet_pcs_native(&u.inputs, region_params, true, false, false, false);
         assert_eq!(
             scratch.len(),
             pcs_region_all.len(),
@@ -2704,6 +2784,7 @@ mod tests {
             owner_auth_region: false,
             exact_state_region: false,
             tx_root_region: false,
+            spine_region: false,
         };
         let layout = link_io_layout_for(shape.k_log, true);
 
@@ -2934,6 +3015,7 @@ mod tests {
         owner_auth_region: bool,
         exact_state_region: bool,
         tx_root_region: bool,
+        spine_region: bool,
     ) {
         use noid_ivc_core::challenger::FsLaneChallenger;
         use noid_ivc_core::field::F128;
@@ -2974,6 +3056,7 @@ mod tests {
             owner_auth_region,
             exact_state_region,
             tx_root_region,
+            spine_region,
         };
 
         fn mk(u: &BlockUnit, config: BlockSlotsConfig) -> LinkBlock<'_> {
@@ -2997,6 +3080,7 @@ mod tests {
             owner_auth_region,
             exact_state_region,
             tx_root_region,
+            spine_region,
         );
         eprintln!(
             "[region-link] class frozen in {:.1?}: owner_auth_region={owner_auth_region}, \
@@ -3022,6 +3106,7 @@ mod tests {
                 false,
                 exact_state_region,
                 tx_root_region,
+                spine_region,
             )
             .len();
             let with_owner_auth = region_wallet_pcs_native(
@@ -3030,6 +3115,7 @@ mod tests {
                 true,
                 exact_state_region,
                 tx_root_region,
+                spine_region,
             )
             .len();
             eprintln!(
@@ -3273,6 +3359,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
     }
 
@@ -3290,6 +3377,7 @@ mod tests {
         run_region_block_bearing_gate(
             &units,
             RegionDischargeParams { nq: 2, sb8_auth_layers: 1 },
+            false,
             false,
             false,
             false,
@@ -3317,6 +3405,7 @@ mod tests {
             true,
             false,
             false,
+            false,
         );
     }
 
@@ -3340,6 +3429,7 @@ mod tests {
             true,
             true,
             false,
+            false,
         );
     }
 
@@ -3360,6 +3450,32 @@ mod tests {
         run_region_block_bearing_gate(
             &units,
             RegionDischargeParams { nq: 2, sb8_auth_layers: 1 },
+            true,
+            true,
+            true,
+            false,
+        );
+    }
+
+    /// COMPLETE region block-bearing recursion with the TX-BODY SPINE ALSO
+    /// discharged in the region (task 4e.2): every transaction's
+    /// 59-permutation body hash rides walk A (the 32-slot leaf/wrap tile +
+    /// the 64-slot compress tree with the gated internal-child exposure), on
+    /// top of owner-auth (walk C), exact-state (walk A tiles + walk B legs)
+    /// and tx-root (walk B leg) — the LAST per-tx-growing [K] hashing family
+    /// moves off the inline replay. π₀ is a COMPLETE block-bearing proof;
+    /// π₁ ⊳ π₀; the decider accepts. A DISTINCT, larger class than the
+    /// tx-root one (the spine tiled exposure adds 4 frozen claims — a
+    /// different class matrix + digest).
+    #[test]
+    #[ignore = "heavy (m=24, several 2^24 proofs + one class digest); run explicitly"]
+    fn region_complete_block_bearing_spine_link_e2e() {
+        use noid_recursive::acceptance::trace::region_source_binding::RegionDischargeParams;
+        let units = chained_std_tx_blocks(2);
+        run_region_block_bearing_gate(
+            &units,
+            RegionDischargeParams { nq: 2, sb8_auth_layers: 1 },
+            true,
             true,
             true,
             true,
@@ -3407,6 +3523,7 @@ mod tests {
             owner_auth_region: false,
             exact_state_region: false,
             tx_root_region: false,
+            spine_region: false,
         };
         let r0 = build(&units[0], no_pcs, "block 0 (height 1, no wallet-PCS)");
         let r1 = build(&units[1], no_pcs, "block 1 (height 2, no wallet-PCS)");
@@ -3489,6 +3606,7 @@ mod tests {
             owner_auth_region: false,
             exact_state_region: false,
             tx_root_region: false,
+            spine_region: false,
         });
     }
 
@@ -3512,6 +3630,7 @@ mod tests {
             owner_auth_region: false,
             exact_state_region: true,
             tx_root_region: false,
+            spine_region: false,
         });
     }
 
@@ -3535,6 +3654,31 @@ mod tests {
             owner_auth_region: false,
             exact_state_region: true,
             tx_root_region: true,
+            spine_region: false,
+        });
+    }
+
+    /// Class-fixity gate for the SPINE region families (task 4e.2): the same
+    /// two-real-blocks matrix + claim-structure comparison with
+    /// `spine_region = true` (exact-state + tx-root ON too — the production
+    /// stack). The spine tile/tree layout, cell pins and the gated tiled
+    /// exposure's re-point constants must be a pure function of
+    /// (tx count, K) — any block-content-derived index drifts here.
+    #[test]
+    #[ignore = "heavy (two region-ON block-slot builds); run explicitly"]
+    fn region_spine_class_fixed_across_two_blocks() {
+        use noid_recursive::acceptance::block_slots::BlockSlotsConfig;
+        use noid_recursive::acceptance::trace::region_source_binding::RegionDischargeParams;
+        run_region_class_fixity_gate(BlockSlotsConfig {
+            discharge_wallet_pcs: true,
+            wallet_pcs_region: Some(RegionDischargeParams {
+                nq: 2,
+                sb8_auth_layers: 1,
+            }),
+            owner_auth_region: false,
+            exact_state_region: true,
+            tx_root_region: true,
+            spine_region: true,
         });
     }
 

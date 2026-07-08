@@ -334,6 +334,12 @@ pub struct LinkClass {
     /// positions + padding rim const-cell-pinned) instead of the inline
     /// batched killshot. Only meaningful when `region_params` is `Some`.
     pub tx_root_region: bool,
+    /// When true, this block-bearing region class verifies every
+    /// transaction's tx-body spine on the shared walk A (the leaf/wrap tile
+    /// + compress-tree families; the wrap digest pins to the tx-hash
+    /// statement wires) instead of the inline batched killshot. Only
+    /// meaningful when `region_params` is `Some`.
+    pub spine_region: bool,
 }
 
 impl LinkClass {
@@ -379,6 +385,7 @@ impl LinkClass {
             owner_auth_region: false,
             exact_state_region: false,
             tx_root_region: false,
+            spine_region: false,
         }
     }
 
@@ -411,6 +418,7 @@ impl LinkClass {
         owner_auth_region: bool,
         exact_state_region: bool,
         tx_root_region: bool,
+        spine_region: bool,
     ) -> Self {
         freeze_region_block_bearing(
             shape,
@@ -421,6 +429,7 @@ impl LinkClass {
             owner_auth_region,
             exact_state_region,
             tx_root_region,
+            spine_region,
         )
     }
 
@@ -449,6 +458,7 @@ impl LinkClass {
                 owner_auth_region: self.owner_auth_region,
                 exact_state_region: self.exact_state_region,
                 tx_root_region: self.tx_root_region,
+                spine_region: self.spine_region,
             },
             None => block.config,
         }
@@ -643,6 +653,7 @@ fn build_link_inner(class: &LinkClass, input: &LinkInput<'_>, freeze: bool) -> B
             block_cfg.owner_auth_region,
             block_cfg.exact_state_region,
             block_cfg.tx_root_region,
+            block_cfg.spine_region,
         );
         assert_eq!(
             region_native.len(),
@@ -902,6 +913,7 @@ fn freeze_region_block_bearing(
     owner_auth_region: bool,
     exact_state_region: bool,
     tx_root_region: bool,
+    spine_region: bool,
 ) -> LinkClass {
     let region_cfg = BlockSlotsConfig {
         discharge_wallet_pcs: true,
@@ -909,6 +921,7 @@ fn freeze_region_block_bearing(
         owner_auth_region,
         exact_state_region,
         tx_root_region,
+        spine_region,
     };
 
     // ---- Probe: a standalone discharge reveals the claim count + arities.
@@ -957,6 +970,7 @@ fn freeze_region_block_bearing(
         owner_auth_region,
         exact_state_region,
         tx_root_region,
+        spine_region,
     };
 
     // ---- Genesis dummy T + its proof over the placeholder spec (all-zero IO,
@@ -1025,6 +1039,7 @@ fn freeze_region_block_bearing(
         owner_auth_region,
         exact_state_region,
         tx_root_region,
+        spine_region,
     }
 }
 

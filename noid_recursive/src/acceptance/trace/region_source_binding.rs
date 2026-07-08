@@ -116,6 +116,13 @@ use noid_ivc_core::deep_chain::source_tree::{
     source_tree_exposure_terms, source_tree_fixed_patterns, source_tree_substitution_terms,
     SourceTree, SourceTreeRefs,
 };
+use noid_ivc_core::deep_chain::spine::{
+    build_spine_instance_columns, spine_input_digest_slot, spine_output_digest_slot,
+    spine_pad_absorb_flat, spine_tile_fixed_patterns, spine_tree_exposure_terms,
+    spine_tree_fixed_patterns, spine_tree_internal_child_pattern, SpineInstanceFlat,
+    SPINE_N_INPUT_LEAVES, SPINE_N_OUTPUT_LEAVES, SPINE_TILE_SLOTS, SPINE_TILE_WRAP_SLOT,
+    SPINE_TREE_KID_LEAF_BASE, SPINE_TREE_SLOTS,
+};
 use noid_ivc_core::deep_chain::{
     prove_deep_chain_walk, verify_deep_chain_walk, DeepChainWalkProof, LaneClaimGroup,
 };
@@ -210,6 +217,7 @@ pub fn discharge_auth_pcs_obligation_via_region(
         params,
         None,
         None,
+        None,
     )
 }
 
@@ -243,6 +251,20 @@ pub fn discharge_auth_pcs_obligation_via_region(
 /// path's right-hand sibling cells are const-pinned to the zero-subtree
 /// padding constants (exactly the bindings the inline slot pinned on its
 /// statement wires).
+///
+/// `spine` (tx-body spine region handoff, [`SpineRegionData`]): when `Some`,
+/// every transaction's 59-permutation tx-body hash rides walk A as TWO more
+/// families — the 32-slot leaf/wrap TILE (the 12 leaf sub-sponges + the wrap,
+/// a region-gated sponge-shape family) and the 64-slot compress TREE (the
+/// source-tree heap shape with a zero `LEAFODD` pattern and a GATED
+/// internal-child exposure). Joins are cell pins: leaf payload statement
+/// wires → tile `IN` cells (the input pad flush is a const pin), chain
+/// digests → tile `C` cells AND tree KID leaf cells (shared wires), the
+/// statement lanes (anchor / fee / coinbase / pad) → the remaining KID leaf
+/// cells, the tree root → the wrap `IN` cells, and the wrap digest → the
+/// `tx_hashes` statement wires (which the tx-root leg and the owner-auth
+/// statements already consume). Instances are chunked `ceil(n/K)` per tx
+/// block with canonical GHOST spines (the zero body) past the real count.
 pub fn discharge_auth_pcs_obligations_via_region(
     b: &mut FieldR1csBuilder,
     obligations: &[PendingAuthPcsObligation],
@@ -250,6 +272,7 @@ pub fn discharge_auth_pcs_obligations_via_region(
     params: RegionDischargeParams,
     es: Option<&ExactStateRegionData>,
     txr: Option<&TxRootRegionData>,
+    spine: Option<&SpineRegionData>,
 ) -> Vec<RegionPcsClaim> {
     assert_eq!(obligations.len(), natives.len(), "one native proof per obligation");
     assert!(!obligations.is_empty(), "at least one obligation");
@@ -292,7 +315,25 @@ pub fn discharge_auth_pcs_obligations_via_region(
     // function of (2T, K).
     let es_leaf_base = st_slots + n_leaf_families * leaf_family_slots; // within a tx block
     let es_leaf_cap = es.map_or(0, |e| e.leaves.len().div_ceil(k));
-    let per_tx_a = es_leaf_base + es_leaf_cap * SPONGE_LEAF_SLOTS;
+    let es_end = es_leaf_base + es_leaf_cap * SPONGE_LEAF_SLOTS;
+    // Spine extension: `spine_cap = ceil(n_instances/K)` tree+tile pairs per tx
+    // block, trees first. The tree run must start at a multiple of
+    // `SPINE_TREE_SLOTS · spine_cap` so the gated exposure's window claims
+    // re-point into walk A with constant offset bits (the same zero-bit
+    // insertion trick as the wallet trees, plus the instance coordinates);
+    // `spine_cap` must be a power of two for the instance bits to split.
+    let spine_cap = spine.map_or(0, |s| s.instances.len().div_ceil(k));
+    assert!(
+        spine_cap == 0 || spine_cap.is_power_of_two(),
+        "spine per-block capacity must be a power of two (got {spine_cap})"
+    );
+    let spine_tree_base = if spine_cap > 0 {
+        es_end.next_multiple_of(SPINE_TREE_SLOTS * spine_cap)
+    } else {
+        es_end
+    };
+    let spine_tile_base = spine_tree_base + spine_cap * SPINE_TREE_SLOTS;
+    let per_tx_a = spine_tile_base + spine_cap * SPINE_TILE_SLOTS;
     let block_log_a = per_tx_a.next_power_of_two().trailing_zeros() as usize;
     let per_tx_block_a = 1usize << block_log_a;
     let w_log = (k * per_tx_block_a).next_power_of_two().trailing_zeros() as usize;
@@ -410,6 +451,14 @@ pub fn discharge_auth_pcs_obligations_via_region(
     let mut expo_kid1: Vec<F128> = Vec::new();
     let mut expo_c0: Vec<F128> = Vec::new();
     let mut expo_c1: Vec<F128> = Vec::new();
+    // Tiled SPINE-tree exposure: every instance (real + ghost, block-major)
+    // appends its KID low half (2L cells) and full C (4L cells); ONE gated
+    // sumcheck after the loop discharges every spine tree, re-pointing 4
+    // terminal claims into walk A — flat (O(1)) in tx count.
+    let mut spine_expo_kid0: Vec<F128> = Vec::new();
+    let mut spine_expo_kid1: Vec<F128> = Vec::new();
+    let mut spine_expo_c0: Vec<F128> = Vec::new();
+    let mut spine_expo_c1: Vec<F128> = Vec::new();
     // Per-leg-type walk-B accumulators (each grows to K*nq across the loop).
     let mut acc_committed_roots: Vec<Vec<[F128; 2]>> = vec![Vec::new(); n_legs];
     let mut acc_recomputed_roots: Vec<Vec<[F128; 2]>> = vec![Vec::new(); n_legs];
@@ -1333,6 +1382,134 @@ pub fn discharge_auth_pcs_obligations_via_region(
     }
 
     // ===================================================================
+    // Tx-body spine (block-level, chunked like the exact-state families):
+    // per instance, one 32-slot leaf/wrap tile + one 64-slot compress tree
+    // fill walk A's spine region. Real instances pin their statement wires
+    // (payload lanes → IN cells, pad flush = const pin), share their chain
+    // digest wires between the tile C cells and the tree KID leaf cells,
+    // pin the statement lanes to the remaining KID leaf cells, feed the
+    // tree root into the wrap IN cells, and pin the wrap digest to the
+    // tx-hash statement wires. Ghost instances (past the real count) are
+    // canonical zero-body spines — valid chains satisfying the periodic
+    // patterns, nothing downstream reads them.
+    // ===================================================================
+    if let Some(sp) = spine {
+        let n_inst = sp.instances.len();
+        let pad_absorb = spine_pad_absorb_flat();
+        for blk in 0..k {
+            for i in 0..spine_cap {
+                let g = blk * spine_cap + i;
+                let inst_flat = sp
+                    .instances
+                    .get(g)
+                    .map(|inst| inst.flat.clone())
+                    .unwrap_or_else(SpineInstanceFlat::ghost);
+                let icols = build_spine_instance_columns(&inst_flat);
+                let tree_abs = blk * per_tx_block_a + spine_tree_base + i * SPINE_TREE_SLOTS;
+                let tile_abs = blk * per_tx_block_a + spine_tile_base + i * SPINE_TILE_SLOTS;
+                for j in 0..STATE_SIZE {
+                    cols[C0 + j][tree_abs..tree_abs + SPINE_TREE_SLOTS]
+                        .copy_from_slice(&icols.tree_c[j]);
+                    s0[j][tree_abs..tree_abs + SPINE_TREE_SLOTS]
+                        .copy_from_slice(&icols.tree_s0[j]);
+                    s_out[j][tree_abs..tree_abs + SPINE_TREE_SLOTS]
+                        .copy_from_slice(&icols.tree_s_out[j]);
+                    cols[C0 + j][tile_abs..tile_abs + SPINE_TILE_SLOTS]
+                        .copy_from_slice(&icols.tile_c[j]);
+                    s0[j][tile_abs..tile_abs + SPINE_TILE_SLOTS]
+                        .copy_from_slice(&icols.tile_s0[j]);
+                    s_out[j][tile_abs..tile_abs + SPINE_TILE_SLOTS]
+                        .copy_from_slice(&icols.tile_s_out[j]);
+                }
+                for lane in 0..2 {
+                    cols[KID0 + lane][tree_abs..tree_abs + SPINE_TREE_SLOTS]
+                        .copy_from_slice(&icols.tree_kid[lane]);
+                    cols[IN0 + lane][tile_abs..tile_abs + SPINE_TILE_SLOTS]
+                        .copy_from_slice(&icols.tile_in[lane]);
+                }
+                let kid_half = SPINE_TREE_SLOTS / 2;
+                spine_expo_kid0.extend_from_slice(&icols.tree_kid[0][..kid_half]);
+                spine_expo_kid1.extend_from_slice(&icols.tree_kid[1][..kid_half]);
+                spine_expo_c0.extend_from_slice(&icols.tree_c[0]);
+                spine_expo_c1.extend_from_slice(&icols.tree_c[1]);
+
+                if g >= n_inst {
+                    continue; // ghost: no statement, no pins
+                }
+                let inst = &sp.instances[g];
+                assert_eq!(
+                    icols.tx_hash, inst.tx_hash_flat,
+                    "spine instance {g}: region tx-body hash != the statement wires"
+                );
+                // Input chains: payload lanes → IN cells; pad flush const.
+                for c4 in 0..SPINE_N_INPUT_LEAVES {
+                    let head = tile_abs + 3 * c4;
+                    let w4 = &inst.input_leaves_w[c4];
+                    cell_pins_a.push((IN0, head, w4[0].clone()));
+                    cell_pins_a.push((IN0 + 1, head, w4[1].clone()));
+                    cell_pins_a.push((IN0, head + 1, w4[2].clone()));
+                    cell_pins_a.push((IN0 + 1, head + 1, w4[3].clone()));
+                    cell_pins_a.push((IN0, head + 2, LinExpr::constant(pad_absorb[0])));
+                    cell_pins_a.push((IN0 + 1, head + 2, LinExpr::constant(pad_absorb[1])));
+                }
+                // Output chains: payload lanes → IN cells.
+                for o8 in 0..SPINE_N_OUTPUT_LEAVES {
+                    let head = tile_abs + 3 * SPINE_N_INPUT_LEAVES + 2 * o8;
+                    let w4 = &inst.output_leaves_w[o8];
+                    cell_pins_a.push((IN0, head, w4[0].clone()));
+                    cell_pins_a.push((IN0 + 1, head, w4[1].clone()));
+                    cell_pins_a.push((IN0, head + 1, w4[2].clone()));
+                    cell_pins_a.push((IN0 + 1, head + 1, w4[3].clone()));
+                }
+                // Chain digests: ONE wire pinned to BOTH the tile C cell and
+                // the tree KID leaf cell (the leaf join).
+                for t in 0..SPINE_N_INPUT_LEAVES + SPINE_N_OUTPUT_LEAVES {
+                    let dslot = tile_abs
+                        + if t < SPINE_N_INPUT_LEAVES {
+                            spine_input_digest_slot(t)
+                        } else {
+                            spine_output_digest_slot(t - SPINE_N_INPUT_LEAVES)
+                        };
+                    let kslot = tree_abs + SPINE_TREE_KID_LEAF_BASE + 2 + t;
+                    for lane in 0..2 {
+                        let w =
+                            LinExpr::from_wire(b.alloc_f128(icols.chain_digests[t][lane]));
+                        cell_pins_a.push((C0 + lane, dslot, w.clone()));
+                        cell_pins_a.push((KID0 + lane, kslot, w));
+                    }
+                }
+                // Statement lanes → the non-chain KID leaf cells
+                // (L0 anchor, L1 fee, L14 coinbase, L15 pad).
+                for (leaf, wpair) in [
+                    (0usize, &inst.anchor_w),
+                    (1, &inst.fee_w),
+                    (14, &inst.coinbase_w),
+                    (15, &inst.pad_w),
+                ] {
+                    let kslot = tree_abs + SPINE_TREE_KID_LEAF_BASE + leaf;
+                    cell_pins_a.push((KID0, kslot, wpair[0].clone()));
+                    cell_pins_a.push((KID0 + 1, kslot, wpair[1].clone()));
+                }
+                // Tree root → wrap IN (shared wire; the root cell is the
+                // tree's C0/C1 at heap node 1's odd slot, index 3).
+                for lane in 0..2 {
+                    let w = LinExpr::from_wire(b.alloc_f128(icols.root[lane]));
+                    cell_pins_a.push((C0 + lane, tree_abs + 3, w.clone()));
+                    cell_pins_a.push((IN0 + lane, tile_abs + SPINE_TILE_WRAP_SLOT, w));
+                }
+                // Wrap digest → the tx-hash statement wires.
+                for lane in 0..2 {
+                    cell_pins_a.push((
+                        C0 + lane,
+                        tile_abs + SPINE_TILE_WRAP_SLOT,
+                        inst.tx_hash_w[lane].clone(),
+                    ));
+                }
+            }
+        }
+    }
+
+    // ===================================================================
     // Walk A (once): source_tree + leaf families over ALL K txs, common-period
     // patterns, K per-tree exposures. The walk/substitution flatten; the K
     // exposures are the only per-tx source-tree residual.
@@ -1372,6 +1549,38 @@ pub fn discharge_auth_pcs_obligations_via_region(
             base,
         )
     });
+    // Spine families: the tree rides the SOURCE-TREE term shape on the shared
+    // CODE/KID/C columns with its own patterns (LEAFODD identically zero — the
+    // leaf level is external, its slots ghost); the tile rides the SPONGE term
+    // shape (CHAIN as the carry selector, the per-slot IV table carrying all
+    // three head tags) gated by its own region-ones pattern.
+    let spine_refs: Option<(SourceTreeRefs, SpongeLeafRefs, usize)> = spine.map(|_| {
+        let base = fixed.len();
+        for pat in spine_tree_fixed_patterns() {
+            fixed.push(common_period_pattern(&pat.table, spine_tree_base, spine_cap, block_log_a));
+        }
+        for pat in spine_tile_fixed_patterns() {
+            fixed.push(common_period_pattern(&pat.table, spine_tile_base, spine_cap, block_log_a));
+        }
+        (
+            SourceTreeRefs {
+                code: [CODE0, CODE0 + 1],
+                kid: [KID0, KID0 + 1],
+                c: std::array::from_fn(|i| C0 + i),
+                even_int: base,
+                odd_int: base + 1,
+                leafodd: base + 2,
+                iv: [base + 3, base + 4],
+            },
+            SpongeLeafRefs {
+                in_: [IN0, IN0 + 1],
+                c: std::array::from_fn(|i| C0 + i),
+                odd: base + 6, // the CHAIN carry selector
+                iv: [base + 7, base + 8],
+            },
+            base + 5, // the tile REGION gate
+        )
+    });
     let st_refs = SourceTreeRefs {
         code: [CODE0, CODE0 + 1],
         kid: [KID0, KID0 + 1],
@@ -1399,15 +1608,35 @@ pub fn discharge_auth_pcs_obligations_via_region(
     };
     let expo_cols: [&[F128]; 4] =
         [expo_kid0.as_slice(), expo_kid1.as_slice(), expo_c0.as_slice(), expo_c1.as_slice()];
+    let spine_union_spec: Option<SpineUnionSpec> =
+        spine_refs.map(|(tree_refs, tile_refs, tile_region)| SpineUnionSpec {
+            tree_refs,
+            tile_refs,
+            tile_region,
+            kid_meta: [KID0, KID0 + 1],
+            c_meta: [C0, C0 + 1],
+            cap_log: spine_cap.trailing_zeros() as usize,
+            tx_log: k.trailing_zeros() as usize,
+            tree_base: spine_tree_base,
+            block_log_a,
+        });
+    let spine_expo_cols: [&[F128]; 4] = [
+        spine_expo_kid0.as_slice(),
+        spine_expo_kid1.as_slice(),
+        spine_expo_c0.as_slice(),
+        spine_expo_c1.as_slice(),
+    ];
     let native_u = run_union_native(
-        &committed, &s0, &s_out, &fixed, &st_refs, &leaf_refs, es_sponge.as_ref(), w_log,
-        &expo_tiled, &expo_cols, st_wlog, block_log_a,
+        &committed, &s0, &s_out, &fixed, &st_refs, &leaf_refs, es_sponge.as_ref(),
+        spine_union_spec.as_ref(),
+        spine_union_spec.as_ref().map(|_| &spine_expo_cols),
+        w_log, &expo_tiled, &expo_cols, st_wlog, block_log_a,
     );
     let mut slices: Vec<WitnessSlice> =
         cols.iter().map(|c| alloc_column_slice(b, c, w_log).0).collect();
     claims.extend(discharge_union(
-        b, &fixed, &st_refs, &leaf_refs, es_sponge.as_ref(), w_log, st_wlog, block_log_a,
-        &expo_tiled, &native_u,
+        b, &fixed, &st_refs, &leaf_refs, es_sponge.as_ref(), spine_union_spec.as_ref(), w_log,
+        st_wlog, block_log_a, &expo_tiled, &native_u,
     ));
 
     // ===================================================================
@@ -2288,6 +2517,30 @@ pub struct TxRootPathRegion {
     pub siblings: Vec<[F128; 2]>,
 }
 
+/// The tx-body spine region handoff: every transaction's 59-permutation
+/// spine hashed by the walk-A tile+tree families instead of the inline
+/// killshot replay. One instance per block transaction (coinbase included),
+/// in tx order.
+pub struct SpineRegionData {
+    pub instances: Vec<SpineInstanceRegion>,
+}
+
+/// One transaction's spine handoff: the statement's flat lanes (driving the
+/// column fill) plus the statement WIRES the cell pins bind — the leaf
+/// payload lanes, the four non-chain tree leaves and the tx-body-hash pair
+/// (the same wires the tx-root leg and the owner-auth statements consume).
+pub struct SpineInstanceRegion {
+    pub flat: SpineInstanceFlat,
+    pub input_leaves_w: Vec<[LinExpr; 4]>,
+    pub output_leaves_w: Vec<[LinExpr; 4]>,
+    pub anchor_w: [LinExpr; 2],
+    pub fee_w: [LinExpr; 2],
+    pub coinbase_w: [LinExpr; 2],
+    pub pad_w: [LinExpr; 2],
+    pub tx_hash_w: [LinExpr; 2],
+    pub tx_hash_flat: [F128; 2],
+}
+
 /// The flat-basis capacity IV of a consensus domain tag (mirror of the
 /// TAG_FRICHANL conversion at the walk-C setup: `[φ(iv_hi), φ(iv_lo)]`).
 fn iv_flat_of_tag(tag: DomainTag) -> [F128; 2] {
@@ -2581,6 +2834,82 @@ struct UnionNative {
     pending: Vec<(usize, Vec<F128>, F128)>,
     /// The 4 re-pointed exposure claims (KID0/1, C0/1), flat in tx count.
     expo_pending: Vec<(usize, Vec<F128>, F128)>,
+    /// ONE gated tiled exposure over all spine trees + its 4 re-pointed
+    /// claims (present iff the spine families ride this union).
+    spine_expo_proof: Option<ColumnRelationProof>,
+    spine_expo_pending: Vec<(usize, Vec<F128>, F128)>,
+}
+
+/// The spine families' union wiring: the tree rides the source-tree term
+/// shape (own patterns, zero LEAFODD), the tile the region-gated sponge
+/// shape, and the gated tiled exposure re-points into walk A through the
+/// class-constant layout below.
+struct SpineUnionSpec {
+    tree_refs: SourceTreeRefs,
+    tile_refs: SpongeLeafRefs,
+    tile_region: usize,
+    /// Walk-A columns the 4 exposure claims re-point into.
+    kid_meta: [usize; 2],
+    c_meta: [usize; 2],
+    /// `log2` of the per-block instance capacity / the tx count.
+    cap_log: usize,
+    tx_log: usize,
+    /// In-block offset of instance 0's tree (a multiple of
+    /// `SPINE_TREE_SLOTS << cap_log`).
+    tree_base: usize,
+    block_log_a: usize,
+}
+
+impl SpineUnionSpec {
+    fn local_log(&self) -> usize {
+        (SPINE_TREE_SLOTS / 2).trailing_zeros() as usize
+    }
+    fn expo_wlog(&self) -> usize {
+        self.local_log() + self.cap_log + self.tx_log
+    }
+    /// The constant high in-block bits selecting the spine-tree run:
+    /// `tree_base >> (log2(SPINE_TREE_SLOTS) + cap_log)`, emitted LSB-first
+    /// up to `block_log_a`.
+    fn base_bits(&self) -> Vec<F128> {
+        let start = self.local_log() + 1 + self.cap_log;
+        assert_eq!(self.tree_base % (1usize << start), 0, "spine tree base alignment");
+        let s = self.tree_base >> start;
+        (start..self.block_log_a)
+            .map(|bit| {
+                if (s >> (bit - start)) & 1 == 1 {
+                    F128::ONE
+                } else {
+                    F128::ZERO
+                }
+            })
+            .collect()
+    }
+    /// Re-point a KID claim: `[rho_local, 0, rho_i, base bits, rho_tx]`.
+    fn repoint_kid(&self, expo_point: &[F128]) -> Vec<F128> {
+        let (rho_local, rest) = expo_point.split_at(self.local_log());
+        let (rho_i, rho_tx) = rest.split_at(self.cap_log);
+        let mut pt = rho_local.to_vec();
+        pt.push(F128::ZERO);
+        pt.extend_from_slice(rho_i);
+        pt.extend(self.base_bits());
+        pt.extend_from_slice(rho_tx);
+        pt
+    }
+    /// Re-point a C window claim: `[1, rho_local, rho_i, base bits, rho_tx]`.
+    fn repoint_c(&self, expo_point: &[F128]) -> Vec<F128> {
+        let (rho_local, rest) = expo_point.split_at(self.local_log());
+        let (rho_i, rho_tx) = rest.split_at(self.cap_log);
+        let mut pt = vec![F128::ONE];
+        pt.extend_from_slice(rho_local);
+        pt.extend_from_slice(rho_i);
+        pt.extend(self.base_bits());
+        pt.extend_from_slice(rho_tx);
+        pt
+    }
+    /// The internal-child gate over the tiled exposure domain.
+    fn gate_pattern(&self) -> FixedPattern {
+        spine_tree_internal_child_pattern()
+    }
 }
 
 /// The tiled source-tree exposure binding into the SHARED walk-A columns. The K
@@ -2601,6 +2930,7 @@ fn union_native_terms(
     st_refs: &SourceTreeRefs,
     leaf_refs: &[SourceLeafRefs],
     es_sponge: Option<&(SpongeLeafRefs, usize)>,
+    spine: Option<&SpineUnionSpec>,
     alpha: F128,
 ) -> Vec<RelationTerm> {
     let mut terms = source_tree_substitution_terms(st_refs, alpha);
@@ -2623,6 +2953,21 @@ fn union_native_terms(
         }
         terms.extend(t);
     }
+    // Spine families: the tree is the SOURCE-TREE shape on the shared
+    // CODE/KID/C columns with its own patterns (LEAFODD ≡ 0, so the
+    // `LEAFODD·CODE` terms vanish identically); the tile is the region-gated
+    // sponge shape. Every committed ref is already claimed above, so the
+    // union's claimed-ref set (and claim count) is again unchanged.
+    if let Some(sp) = spine {
+        terms.extend(source_tree_substitution_terms(&sp.tree_refs, alpha));
+        let mut t = sponge_leaf_substitution_terms(&sp.tile_refs, alpha);
+        for term in t.iter_mut() {
+            if !term.factors.iter().any(|f| matches!(f, ColRef::Fixed(_))) {
+                term.factors.insert(0, ColRef::Fixed(sp.tile_region));
+            }
+        }
+        terms.extend(t);
+    }
     terms
 }
 
@@ -2635,12 +2980,15 @@ fn run_union_native(
     st_refs: &SourceTreeRefs,
     leaf_refs: &[SourceLeafRefs],
     es_sponge: Option<&(SpongeLeafRefs, usize)>,
+    spine: Option<&SpineUnionSpec>,
+    spine_expo_cols: Option<&[&[F128]; 4]>,
     w_log: usize,
     expo: &ExpoTiledSpec,
     expo_cols: &[&[F128]; 4],
     expo_wlog: usize,
     block_log_a: usize,
 ) -> UnionNative {
+    assert_eq!(spine.is_some(), spine_expo_cols.is_some(), "spine expo columns");
     let internal: Vec<&[F128]> = s_out.iter().map(|c| c.as_slice()).collect();
     let mut ch_p = FsLaneChallenger::new(DOMAIN);
     let mut ch_v = FsLaneChallenger::new(DOMAIN);
@@ -2676,7 +3024,7 @@ fn run_union_native(
 
     let alpha = ch_p.sample_f128();
     assert_eq!(alpha, ch_v.sample_f128());
-    let sub_terms = union_native_terms(st_refs, leaf_refs, es_sponge, alpha);
+    let sub_terms = union_native_terms(st_refs, leaf_refs, es_sponge, spine, alpha);
     let mut target = F128::ZERO;
     let mut p = F128::ONE;
     for e in 0..STATE_SIZE {
@@ -2766,18 +3114,69 @@ fn run_union_native(
         }
     }
 
+    // ONE gated tiled exposure over all spine trees (present iff the spine
+    // families ride this union): `0 = Σ eq·GATE·Σ γ^{i+1}·[KID_lo + C(2w+1)]`
+    // over the (K·cap)-instance tiled domain; the 4 terminal claims re-point
+    // into walk A's KID/C at the class-constant spine layout — flat in tx
+    // count. Ghost instances satisfy the relation (their KID low half IS the
+    // window image at internal children by construction).
+    let mut spine_expo_proof = None;
+    let mut spine_expo_pending: Vec<(usize, Vec<F128>, F128)> = Vec::new();
+    if let (Some(sp), Some(se_cols)) = (spine, spine_expo_cols) {
+        let gamma = ch_p.sample_f128();
+        assert_eq!(gamma, ch_v.sample_f128());
+        let expo_terms = spine_tree_exposure_terms([0, 1], [2, 3], 0, gamma);
+        let expo_fixed = vec![sp.gate_pattern()];
+        let rho_e = ch_p.sample_f128_vec(sp.expo_wlog());
+        let _ = ch_v.sample_f128_vec(sp.expo_wlog());
+        let (proof, _, _) = prove_column_relation(
+            F128::ZERO,
+            &rho_e,
+            &expo_terms,
+            &RelationColumns { committed: se_cols, internal: &[], fixed: &expo_fixed },
+            &mut ch_p,
+        );
+        let expo_point = verify_column_relation(
+            sp.expo_wlog(),
+            F128::ZERO,
+            &rho_e,
+            &expo_terms,
+            &expo_fixed,
+            &proof,
+            &mut ch_v,
+        )
+        .expect("native spine tiled exposure");
+        for (r, v) in claimed_refs(&expo_terms).iter().zip(proof.final_values.iter()) {
+            match r {
+                ColRef::Committed(ll) => {
+                    spine_expo_pending.push((sp.kid_meta[*ll], sp.repoint_kid(&expo_point), *v));
+                }
+                ColRef::Window { col, .. } => {
+                    spine_expo_pending.push((sp.c_meta[*col - 2], sp.repoint_c(&expo_point), *v));
+                }
+                _ => unreachable!(),
+            }
+        }
+        spine_expo_proof = Some(proof);
+    }
+
     assert_eq!(ch_p.sample_f128(), ch_v.sample_f128(), "native lockstep");
-    UnionNative { sel_proof, walk_proof, sub_proof, shifts, expo_proof, pending, expo_pending }
+    UnionNative {
+        sel_proof,
+        walk_proof,
+        sub_proof,
+        shifts,
+        expo_proof,
+        pending,
+        expo_pending,
+        spine_expo_proof,
+        spine_expo_pending,
+    }
 }
 
-/// Trace twin of `union_native_terms` with α-power MDS coefficients.
-fn union_trace_terms(
-    m: &[LinExpr],
-    st_refs: &SourceTreeRefs,
-    leaf_refs: &[SourceLeafRefs],
-    es_sponge: Option<&(SpongeLeafRefs, usize)>,
-) -> Vec<RelationTermTrace> {
-    let mut terms = Vec::new();
+/// One source-tree-shaped trace term block (shared by the wallet tree and
+/// the spine tree, which differ only in their pattern indices).
+fn tree_trace_terms(m: &[LinExpr], st_refs: &SourceTreeRefs, terms: &mut Vec<RelationTermTrace>) {
     for i in 0..2 {
         let kid = ColRef::Committed(st_refs.kid[i]);
         let c_sh = ColRef::CommittedShift(st_refs.c[i]);
@@ -2798,6 +3197,48 @@ fn union_trace_terms(
             factors: vec![ColRef::Fixed(st_refs.odd_int), ColRef::CommittedShift(st_refs.c[j])],
         });
     }
+}
+
+/// One region-gated sponge-shaped trace term block (shared by the
+/// exact-state sponge tiles and the spine leaf/wrap tile).
+fn gated_sponge_trace_terms(
+    m: &[LinExpr],
+    sr: &SpongeLeafRefs,
+    region: usize,
+    terms: &mut Vec<RelationTermTrace>,
+) {
+    for i in 0..2 {
+        terms.push(RelationTermTrace {
+            coeff: m[i].clone(),
+            factors: vec![ColRef::Fixed(region), ColRef::Committed(sr.in_[i])],
+        });
+        terms.push(RelationTermTrace {
+            coeff: m[i].clone(),
+            factors: vec![ColRef::Fixed(sr.odd), ColRef::CommittedShift(sr.c[i])],
+        });
+    }
+    for j in 2..STATE_SIZE {
+        terms.push(RelationTermTrace {
+            coeff: m[j].clone(),
+            factors: vec![ColRef::Fixed(sr.iv[j - 2])],
+        });
+        terms.push(RelationTermTrace {
+            coeff: m[j].clone(),
+            factors: vec![ColRef::Fixed(sr.odd), ColRef::CommittedShift(sr.c[j])],
+        });
+    }
+}
+
+/// Trace twin of `union_native_terms` with α-power MDS coefficients.
+fn union_trace_terms(
+    m: &[LinExpr],
+    st_refs: &SourceTreeRefs,
+    leaf_refs: &[SourceLeafRefs],
+    es_sponge: Option<&(SpongeLeafRefs, usize)>,
+    spine: Option<&SpineUnionSpec>,
+) -> Vec<RelationTermTrace> {
+    let mut terms = Vec::new();
+    tree_trace_terms(m, st_refs, &mut terms);
     for lr in leaf_refs {
         for i in 0..2 {
             let in_col = ColRef::Committed(lr.in_[i]);
@@ -2824,26 +3265,13 @@ fn union_trace_terms(
     // `sponge_leaf_substitution_terms` (region-ones inserted on the plain IN
     // reads; the ODD-gated carries and IV patterns carry their own gate).
     if let Some((sr, region)) = es_sponge {
-        for i in 0..2 {
-            terms.push(RelationTermTrace {
-                coeff: m[i].clone(),
-                factors: vec![ColRef::Fixed(*region), ColRef::Committed(sr.in_[i])],
-            });
-            terms.push(RelationTermTrace {
-                coeff: m[i].clone(),
-                factors: vec![ColRef::Fixed(sr.odd), ColRef::CommittedShift(sr.c[i])],
-            });
-        }
-        for j in 2..STATE_SIZE {
-            terms.push(RelationTermTrace {
-                coeff: m[j].clone(),
-                factors: vec![ColRef::Fixed(sr.iv[j - 2])],
-            });
-            terms.push(RelationTermTrace {
-                coeff: m[j].clone(),
-                factors: vec![ColRef::Fixed(sr.odd), ColRef::CommittedShift(sr.c[j])],
-            });
-        }
+        gated_sponge_trace_terms(m, sr, *region, &mut terms);
+    }
+    // Spine families — the shadow of the native spine blocks (tree shape on
+    // its own patterns, then the region-gated tile).
+    if let Some(sp) = spine {
+        tree_trace_terms(m, &sp.tree_refs, &mut terms);
+        gated_sponge_trace_terms(m, &sp.tile_refs, sp.tile_region, &mut terms);
     }
     terms
 }
@@ -2852,8 +3280,9 @@ fn union_ref_terms(
     st_refs: &SourceTreeRefs,
     leaf_refs: &[SourceLeafRefs],
     es_sponge: Option<&(SpongeLeafRefs, usize)>,
+    spine: Option<&SpineUnionSpec>,
 ) -> Vec<RelationTerm> {
-    union_native_terms(st_refs, leaf_refs, es_sponge, F128::ONE)
+    union_native_terms(st_refs, leaf_refs, es_sponge, spine, F128::ONE)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2863,6 +3292,7 @@ fn discharge_union(
     st_refs: &SourceTreeRefs,
     leaf_refs: &[SourceLeafRefs],
     es_sponge: Option<&(SpongeLeafRefs, usize)>,
+    spine: Option<&SpineUnionSpec>,
     w_log: usize,
     expo_wlog: usize,
     block_log_a: usize,
@@ -2906,8 +3336,8 @@ fn discharge_union(
 
     let alpha = ch.sample_f128(b);
     let (m, ap) = mds_alpha_weights(b, &alpha);
-    let sub_terms = union_trace_terms(&m, st_refs, leaf_refs, es_sponge);
-    let ref_terms = union_ref_terms(st_refs, leaf_refs, es_sponge);
+    let sub_terms = union_trace_terms(&m, st_refs, leaf_refs, es_sponge, spine);
+    let ref_terms = union_ref_terms(st_refs, leaf_refs, es_sponge, spine);
     let mut target = LinExpr::zero();
     for e in 0..STATE_SIZE {
         target = target.add(&mul(b, &ap[e], &terminal.values[e]));
@@ -2989,6 +3419,87 @@ fn discharge_union(
         }
     }
     assert_eq!(ec, native.expo_pending.len(), "exposure pending lockstep");
+
+    // ONE gated tiled SPINE exposure (mirror of `run_union_native`): the 4
+    // terminal claims re-point into walk A's KID/C through the class-constant
+    // spine layout — `[rho_local, 0, rho_i, base bits, rho_tx]` for KID and
+    // `[1, rho_local, rho_i, base bits, rho_tx]` for the C window.
+    if let Some(sp) = spine {
+        let sp_native = native
+            .spine_expo_proof
+            .as_ref()
+            .expect("spine union carries a spine exposure proof");
+        let gamma = ch.sample_f128(b);
+        let mut gp = LinExpr::constant(F128::ONE);
+        let mut expo_terms: Vec<RelationTermTrace> = Vec::new();
+        for i in 0..2 {
+            gp = mul(b, &gp, &gamma);
+            expo_terms.push(RelationTermTrace {
+                coeff: gp.clone(),
+                factors: vec![ColRef::Fixed(0), ColRef::Committed(i)],
+            });
+            expo_terms.push(RelationTermTrace {
+                coeff: gp.clone(),
+                factors: vec![
+                    ColRef::Fixed(0),
+                    ColRef::Window { col: 2 + i, stride_log: 1, offset: 1 },
+                ],
+            });
+        }
+        let expo_ref = spine_tree_exposure_terms([0, 1], [2, 3], 0, F128::ZERO);
+        let expo_fixed = vec![sp.gate_pattern()];
+        let rho_e = ch.sample_f128_vec(b, sp.expo_wlog());
+        let expo_e = ColumnRelationProofTrace::alloc(
+            b,
+            sp_native,
+            sp.expo_wlog(),
+            claimed_refs(&expo_ref).len(),
+        );
+        let expo_point = verify_column_relation_trace(
+            b,
+            &mut ch,
+            sp.expo_wlog(),
+            &zero,
+            &rho_e,
+            &expo_terms,
+            &expo_fixed,
+            &expo_e,
+        );
+        let (rho_local, rest) = expo_point.split_at(sp.local_log());
+        let (rho_i, rho_tx) = rest.split_at(sp.cap_log);
+        let base_bits = sp.base_bits();
+        let mut ec2 = 0usize;
+        for (r, v) in claimed_refs(&expo_ref).iter().zip(expo_e.final_values.iter()) {
+            let (col, npt, nval) = &native.spine_expo_pending[ec2];
+            ec2 += 1;
+            let mut pt: Vec<LinExpr> = match r {
+                ColRef::Committed(_) => {
+                    let mut pt = rho_local.to_vec();
+                    pt.push(LinExpr::constant(F128::ZERO));
+                    pt
+                }
+                ColRef::Window { .. } => {
+                    let mut pt = vec![LinExpr::constant(F128::ONE)];
+                    pt.extend_from_slice(rho_local);
+                    pt
+                }
+                _ => unreachable!(),
+            };
+            pt.extend_from_slice(rho_i);
+            for bit in &base_bits {
+                pt.push(LinExpr::constant(*bit));
+            }
+            pt.extend_from_slice(rho_tx);
+            out.push(Claim {
+                slice: *col,
+                point: pt,
+                value: v.clone(),
+                native_point: npt.clone(),
+                native_value: *nval,
+            });
+        }
+        assert_eq!(ec2, native.spine_expo_pending.len(), "spine exposure pending lockstep");
+    }
     out
 }
 

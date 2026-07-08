@@ -42,6 +42,7 @@ pub mod leaf_hash;
 pub mod relations;
 pub mod schedule;
 pub mod source_tree;
+pub mod spine;
 
 use crate::challenger::Challenger;
 use crate::field::F128;

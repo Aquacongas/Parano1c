@@ -75,8 +75,11 @@ use super::trace::accepted_claim_hash::{build_accepted_claim_hash_slot, Accepted
 use super::trace::auth_pcs::discharge_auth_pcs_obligation;
 use super::trace::region_source_binding::{
     discharge_auth_pcs_obligations_via_region, discharge_owner_auth_killshots_via_region,
-    RegionDischargeParams, RegionPcsClaim, TxRootPathRegion, TxRootRegionData,
+    RegionDischargeParams, RegionPcsClaim, SpineInstanceRegion, SpineRegionData,
+    TxRootPathRegion, TxRootRegionData,
 };
+use noid_gkr::SpineInputs;
+use noid_ivc_core::deep_chain::spine::SpineInstanceFlat;
 use super::trace::checkpoint_poseidon::{
     build_checkpoint_poseidon_slot_with_inputs, ChainAccumulatorBatchInputsTrace,
     ChainAccumulatorItemTrace, HeaderHashInputsTrace,
@@ -367,6 +370,104 @@ fn scratch_tx_root_region_data(
     tx_root_region_data_from_wires(pb, tx_root_inputs, root_w, &entry_ws)
 }
 
+/// The flat image of one native `SpineInputs` statement (φ lane by lane).
+fn spine_instance_flat(n: &SpineInputs) -> SpineInstanceFlat {
+    SpineInstanceFlat {
+        epoch_anchor: std::array::from_fn(|i| flat_of(n.epoch_anchor[i])),
+        fee_leaf: std::array::from_fn(|i| flat_of(n.fee_leaf[i])),
+        input_leaves: std::array::from_fn(|c| {
+            std::array::from_fn(|i| flat_of(n.input_leaves[c][i]))
+        }),
+        output_leaves: std::array::from_fn(|o| {
+            std::array::from_fn(|i| flat_of(n.output_leaves[o][i]))
+        }),
+        is_coinbase_leaf: std::array::from_fn(|i| flat_of(n.is_coinbase_leaf[i])),
+        pad_leaf: std::array::from_fn(|i| flat_of(n.pad_leaf[i])),
+    }
+}
+
+/// Assemble the tx-body spine region handoff from already-allocated
+/// statement wires — the real build passes the spine statement wires + the
+/// tx-hash wires; the scratch mirror passes throwaway allocs of the same
+/// natives. Every wire is asserted to carry its native flat value at build
+/// time (a pure transliteration; the region cell pins do the binding).
+fn spine_region_data_from_wires(
+    b: &FieldR1csBuilder,
+    natives: &[SpineInputs],
+    native_hashes: &[[Block128; 2]],
+    inputs_t: &[SpineInputsTrace],
+    tx_hashes: &[[LinExpr; 2]],
+) -> SpineRegionData {
+    assert_eq!(natives.len(), inputs_t.len(), "one wire set per spine instance");
+    assert_eq!(natives.len(), native_hashes.len(), "one hash per spine instance");
+    assert_eq!(natives.len(), tx_hashes.len(), "one hash wire pair per instance");
+    let assert_pair = |w: &[LinExpr; 2], n: &[Block128; 2], what: &str| {
+        for lane in 0..2 {
+            assert_eq!(w[lane].eval(b.values()), flat_of(n[lane]), "{what} lane {lane}");
+        }
+    };
+    let instances = natives
+        .iter()
+        .zip(native_hashes.iter())
+        .zip(inputs_t.iter().zip(tx_hashes.iter()))
+        .map(|((n, h), (t, hw))| {
+            assert_eq!(t.input_leaves.len(), n.input_leaves.len());
+            assert_eq!(t.output_leaves.len(), n.output_leaves.len());
+            for (c, w4) in t.input_leaves.iter().enumerate() {
+                for i in 0..4 {
+                    assert_eq!(
+                        w4[i].eval(b.values()),
+                        flat_of(n.input_leaves[c][i]),
+                        "spine input leaf wire"
+                    );
+                }
+            }
+            for (o, w4) in t.output_leaves.iter().enumerate() {
+                for i in 0..4 {
+                    assert_eq!(
+                        w4[i].eval(b.values()),
+                        flat_of(n.output_leaves[o][i]),
+                        "spine output leaf wire"
+                    );
+                }
+            }
+            assert_pair(&t.epoch_anchor, &n.epoch_anchor, "spine anchor");
+            assert_pair(&t.fee_leaf, &n.fee_leaf, "spine fee");
+            assert_pair(&t.is_coinbase_leaf, &n.is_coinbase_leaf, "spine coinbase");
+            assert_pair(&t.pad_leaf, &n.pad_leaf, "spine pad");
+            assert_pair(hw, h, "spine tx hash");
+            SpineInstanceRegion {
+                flat: spine_instance_flat(n),
+                input_leaves_w: t.input_leaves.clone(),
+                output_leaves_w: t.output_leaves.clone(),
+                anchor_w: t.epoch_anchor.clone(),
+                fee_w: t.fee_leaf.clone(),
+                coinbase_w: t.is_coinbase_leaf.clone(),
+                pad_w: t.pad_leaf.clone(),
+                tx_hash_w: hw.clone(),
+                tx_hash_flat: [flat_of(h[0]), flat_of(h[1])],
+            }
+        })
+        .collect();
+    SpineRegionData { instances }
+}
+
+/// Spine region handoff on THROWAWAY wires — the `region_wallet_pcs_native`
+/// mirror.
+fn scratch_spine_region_data(
+    pb: &mut FieldR1csBuilder,
+    natives: &[SpineInputs],
+    native_hashes: &[[Block128; 2]],
+) -> SpineRegionData {
+    let inputs_t: Vec<SpineInputsTrace> =
+        natives.iter().map(|i| SpineInputsTrace::alloc(pb, i)).collect();
+    let tx_hashes: Vec<[LinExpr; 2]> = native_hashes
+        .iter()
+        .map(|h| std::array::from_fn(|i| alloc_block(pb, h[i])))
+        .collect();
+    spine_region_data_from_wires(pb, natives, native_hashes, &inputs_t, &tx_hashes)
+}
+
 // ---------------------------------------------------------------------------
 // Assembly
 // ---------------------------------------------------------------------------
@@ -474,6 +575,21 @@ pub struct BlockSlotsConfig {
     /// REQUIRES `wallet_pcs_region.is_some()` (the leg rides walk B).
     /// `false` = the inline killshot replay.
     pub tx_root_region: bool,
+    /// When true, verify every transaction's 59-permutation tx-body spine via
+    /// the shared region walks instead of the inline batched killshot: each
+    /// instance's 12 leaf sub-sponges + wrap ride walk A as a 32-slot
+    /// region-gated sponge tile and its 16-leaf compress tree as a 64-slot
+    /// source-tree-shaped family (zero LEAFODD, gated internal-child
+    /// exposure). The leaf payload statement wires pin to the tile absorb
+    /// cells, the chain digests join the tree KID leaf cells as shared wires,
+    /// the statement lanes (anchor/fee/coinbase/pad) pin the remaining KID
+    /// leaves, and the wrap digest pins to the `tx_hashes` statement wires —
+    /// the same wires the tx-root leg and the owner-auth statements consume,
+    /// so downstream bindings are untouched.
+    ///
+    /// REQUIRES `wallet_pcs_region.is_some()` (the families ride walk A).
+    /// `false` = the inline killshot replay.
+    pub spine_region: bool,
 }
 
 impl Default for BlockSlotsConfig {
@@ -484,6 +600,7 @@ impl Default for BlockSlotsConfig {
             owner_auth_region: false,
             exact_state_region: false,
             tx_root_region: false,
+            spine_region: false,
         }
     }
 }
@@ -551,6 +668,11 @@ pub fn build_block_slots_with_config(
         !config.tx_root_region || config.wallet_pcs_region.is_some(),
         "tx_root_region requires wallet_pcs_region (the tx-root leg rides the \
          wallet-PCS region walk B; a new walk is never spawned)"
+    );
+    assert!(
+        !config.spine_region || config.wallet_pcs_region.is_some(),
+        "spine_region requires wallet_pcs_region (the spine families ride the \
+         wallet-PCS region walk A; a new walk is never spawned)"
     );
 
     // ---- Primary statement wires: header, claim, accumulator boundary.
@@ -622,10 +744,37 @@ pub fn build_block_slots_with_config(
     // proper ripple-carry increment over the tower-bit decompositions.
     pin_u64_successor(b, &start_acc.height, &header.fields[hf::HEIGHT]);
 
-    // ---- tx_body standard spine component.
+    // ---- tx_body standard spine component. Region mode moves the whole
+    // 59-permutation-per-tx replay onto the shared walk A (leaf/wrap tile +
+    // compress tree): only the statement wires are allocated here — the SAME
+    // wire vectors the inline slot returns, so every downstream consumer
+    // (tx-root leaves, owner-auth tx_body_hash pins, claim lanes) is
+    // untouched — and the handoff carries them into the plural discharge.
+    // The inline killshot proof is not consumed in-trace (nodes still verify
+    // it natively; π proves the statement directly).
+    let mut spine_region_data: Option<SpineRegionData> = None;
     let (spine_inputs, tx_hashes) = if inputs.tx_body_standard_inputs.is_empty() {
         assert!(proof.tx_body_standard.is_none());
         (Vec::new(), Vec::new())
+    } else if config.spine_region {
+        let inputs_t: Vec<SpineInputsTrace> = inputs
+            .tx_body_standard_inputs
+            .iter()
+            .map(|i| SpineInputsTrace::alloc(b, i))
+            .collect();
+        let hashes_t: Vec<[LinExpr; 2]> = inputs
+            .tx_body_standard_hashes
+            .iter()
+            .map(|h| std::array::from_fn(|i| alloc_block(b, h[i])))
+            .collect();
+        spine_region_data = Some(spine_region_data_from_wires(
+            b,
+            &inputs.tx_body_standard_inputs,
+            &inputs.tx_body_standard_hashes,
+            &inputs_t,
+            &hashes_t,
+        ));
+        (inputs_t, hashes_t)
     } else {
         build_standard_tx_body_slot(
             b,
@@ -835,15 +984,16 @@ pub fn build_block_slots_with_config(
     // public IO. `k` = tx count must be a power of two (the plural asserts it; a
     // tier pads its real txs to next_pow2 with ghost obligations).
     if let Some(params) = config.wallet_pcs_region {
-        if config.exact_state_region || config.tx_root_region {
-            // The exact-state / tx-root families ride the plural discharge's
-            // walks; a block-bearing region class always carries at least one
-            // tx, so an empty obligation set (which would skip the plural and
-            // leave that hashing undischarged) is unreachable by construction.
+        if config.exact_state_region || config.tx_root_region || config.spine_region {
+            // The exact-state / tx-root / spine families ride the plural
+            // discharge's walks; a block-bearing region class always carries
+            // at least one tx, so an empty obligation set (which would skip
+            // the plural and leave that hashing undischarged) is unreachable
+            // by construction.
             assert!(
                 !region_obligations.is_empty(),
-                "exact_state_region/tx_root_region with no wallet-PCS obligations \
-                 (a block-bearing region class always has txs)"
+                "exact_state_region/tx_root_region/spine_region with no wallet-PCS \
+                 obligations (a block-bearing region class always has txs)"
             );
         }
         if !region_obligations.is_empty() {
@@ -856,6 +1006,7 @@ pub fn build_block_slots_with_config(
                 params,
                 es_region_data.as_ref(),
                 tx_root_region_data.as_ref(),
+                spine_region_data.as_ref(),
             ));
         }
     }
@@ -949,13 +1100,15 @@ pub fn build_block_slots_with_config(
 /// a scratch exact-state region handoff (fresh wires, same native values) is
 /// threaded into the plural discharge, so the walk-A/B columns — hence every
 /// native claim `(point, value)` — mirror the real build exactly.
-/// `tx_root_region` is the same contract for the tx-root walk-B leg.
+/// `tx_root_region` is the same contract for the tx-root walk-B leg, and
+/// `spine_region` for the walk-A spine tile+tree families.
 pub fn region_wallet_pcs_native(
     inputs: &AcceptedBlockBatchComponentInputs,
     params: RegionDischargeParams,
     owner_auth_region: bool,
     exact_state_region: bool,
     tx_root_region: bool,
+    spine_region: bool,
 ) -> Vec<(Vec<F128>, F128)> {
     if inputs.authorization_inputs.is_empty() {
         return Vec::new();
@@ -967,6 +1120,13 @@ pub fn region_wallet_pcs_native(
     });
     let scratch_txr = (tx_root_region && !inputs.tx_root_inputs.is_empty())
         .then(|| scratch_tx_root_region_data(&mut pb, &inputs.tx_root_inputs));
+    let scratch_spine = (spine_region && !inputs.tx_body_standard_inputs.is_empty()).then(|| {
+        scratch_spine_region_data(
+            &mut pb,
+            &inputs.tx_body_standard_inputs,
+            &inputs.tx_body_standard_hashes,
+        )
+    });
     // Produce the wallet-PCS obligations + natives the SAME way the real build
     // does for this `owner_auth_region` mode.
     let (obligations, natives) = if owner_auth_region {
@@ -1032,6 +1192,7 @@ pub fn region_wallet_pcs_native(
         params,
         scratch_es.as_ref(),
         scratch_txr.as_ref(),
+        scratch_spine.as_ref(),
     ) {
         out.push((c.native_point, c.native_value));
     }
