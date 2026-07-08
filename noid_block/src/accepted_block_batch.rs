@@ -1535,7 +1535,7 @@ mod tests {
             active_slot_count: parent.active_slot_count,
             alloc_counter: parent.alloc_counter,
         };
-        header.nonce = search_pow(&header, 0, 1_000_000).expect("easy test target mines");
+        header.nonce = search_pow(&header, 0, 64_000_000).expect("easy test target mines");
         Block {
             header,
             transactions: vec![],
@@ -1682,7 +1682,7 @@ mod tests {
             active_slot_count: start_state.active_slot_count,
             alloc_counter: start_state.alloc_counter + 1,
         };
-        header.nonce = search_pow(&header, 0, 1_000_000).expect("easy test target mines");
+        header.nonce = search_pow(&header, 0, 64_000_000).expect("easy test target mines");
         let block = Block {
             header,
             transactions: txs,
@@ -1749,6 +1749,7 @@ mod tests {
                 exact_state_region: false,
                 tx_root_region: false,
                 spine_region: false,
+                tier_user_tx_capacity: None,
             };
             let mut b = FieldR1csBuilder::new();
             let slots = build_block_slots_with_config(
@@ -1809,6 +1810,7 @@ mod tests {
                 exact_state_region: false,
                 tx_root_region: false,
                 spine_region: false,
+                tier_user_tx_capacity: None,
             };
             let sample = LinkBlock {
                 start_accumulator: &units[0].start_accumulator,
@@ -1828,6 +1830,7 @@ mod tests {
                     false,
                     false,
                     false,
+                    None,
                 );
                 (class.region_claims.len(), class.region_max_arity, class.spec.io_len)
             }));
@@ -1952,7 +1955,7 @@ mod tests {
             active_slot_count: start_state.active_slot_count,
             alloc_counter: start_state.alloc_counter + specs.len() as u64,
         };
-        header.nonce = search_pow(&header, 0, 1_000_000).expect("easy test target mines");
+        header.nonce = search_pow(&header, 0, 64_000_000).expect("easy test target mines");
         let block = Block {
             header: header.clone(),
             transactions: txs,
@@ -2227,7 +2230,7 @@ mod tests {
         let region_params = RegionDischargeParams { nq: 2, sb8_auth_layers: 1 };
         let units = chained_multi_tx_blocks(1, 2);
         let u = &units[0];
-        let scratch = region_wallet_pcs_native(&u.inputs, region_params, false, false, false, false);
+        let scratch = region_wallet_pcs_native(&u.inputs, region_params, false, false, false, false, None);
         let cfg = BlockSlotsConfig {
             discharge_wallet_pcs: true,
             wallet_pcs_region: Some(region_params),
@@ -2235,6 +2238,7 @@ mod tests {
             exact_state_region: false,
             tx_root_region: false,
             spine_region: false,
+            tier_user_tx_capacity: None,
         };
         let mut b = FieldR1csBuilder::new();
         let slots = build_block_slots_with_config(
@@ -2408,6 +2412,7 @@ mod tests {
             exact_state_region: true,
             tx_root_region: true,
             spine_region: true,
+            tier_user_tx_capacity: None,
         };
         let mut b = FieldR1csBuilder::new();
         let slots = build_block_slots_with_config(
@@ -2560,6 +2565,7 @@ mod tests {
             exact_state_region: true,
             tx_root_region: true,
             spine_region: true,
+            tier_user_tx_capacity: None,
         };
         let mut b = FieldR1csBuilder::new();
         let slots = build_block_slots_with_config(
@@ -2619,6 +2625,7 @@ mod tests {
             exact_state_region: false,
             tx_root_region: false,
             spine_region: false,
+            tier_user_tx_capacity: None,
         };
         let cfg_region = BlockSlotsConfig {
             discharge_wallet_pcs: true,
@@ -2627,6 +2634,7 @@ mod tests {
             exact_state_region: false,
             tx_root_region: false,
             spine_region: false,
+            tier_user_tx_capacity: None,
         };
 
         // Inline-owner-auth path: build, extract numbers + wallet-PCS claim
@@ -2718,7 +2726,7 @@ mod tests {
         // cells; its output MUST match the real build's `pending_wallet_pcs`
         // natives, in ORDER, for the owner-auth-region path too (the mirror). Gate
         // it directly against the real region build above.
-        let scratch = region_wallet_pcs_native(&u.inputs, region_params, true, false, false, false);
+        let scratch = region_wallet_pcs_native(&u.inputs, region_params, true, false, false, false, None);
         assert_eq!(
             scratch.len(),
             pcs_region_all.len(),
@@ -2785,6 +2793,7 @@ mod tests {
             exact_state_region: false,
             tx_root_region: false,
             spine_region: false,
+            tier_user_tx_capacity: None,
         };
         let layout = link_io_layout_for(shape.k_log, true);
 
@@ -3016,6 +3025,7 @@ mod tests {
         exact_state_region: bool,
         tx_root_region: bool,
         spine_region: bool,
+        tier_user_tx_capacity: Option<usize>,
     ) {
         use noid_ivc_core::challenger::FsLaneChallenger;
         use noid_ivc_core::field::F128;
@@ -3057,6 +3067,7 @@ mod tests {
             exact_state_region,
             tx_root_region,
             spine_region,
+            tier_user_tx_capacity,
         };
 
         fn mk(u: &BlockUnit, config: BlockSlotsConfig) -> LinkBlock<'_> {
@@ -3081,6 +3092,7 @@ mod tests {
             exact_state_region,
             tx_root_region,
             spine_region,
+            tier_user_tx_capacity,
         );
         eprintln!(
             "[region-link] class frozen in {:.1?}: owner_auth_region={owner_auth_region}, \
@@ -3098,7 +3110,7 @@ mod tests {
         // real build's `pending_wallet_pcs` for each mode, so its lengths are the
         // frozen claim counts. This also confirms the two classes are DISTINCT
         // (different claim count -> different IO layout -> different matrix).
-        if owner_auth_region {
+        if owner_auth_region && tier_user_tx_capacity.is_none() {
             let lb = mk(&units[0], region_cfg);
             let wallet_only = region_wallet_pcs_native(
                 lb.inputs,
@@ -3107,6 +3119,7 @@ mod tests {
                 exact_state_region,
                 tx_root_region,
                 spine_region,
+                None,
             )
             .len();
             let with_owner_auth = region_wallet_pcs_native(
@@ -3116,6 +3129,7 @@ mod tests {
                 exact_state_region,
                 tx_root_region,
                 spine_region,
+                tier_user_tx_capacity,
             )
             .len();
             eprintln!(
@@ -3360,6 +3374,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         );
     }
 
@@ -3381,6 +3396,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         );
     }
 
@@ -3406,6 +3422,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         );
     }
 
@@ -3430,6 +3447,7 @@ mod tests {
             true,
             false,
             false,
+            None,
         );
     }
 
@@ -3454,6 +3472,7 @@ mod tests {
             true,
             true,
             false,
+            None,
         );
     }
 
@@ -3479,6 +3498,31 @@ mod tests {
             true,
             true,
             true,
+            None,
+        );
+    }
+
+    /// COMPLETE region block-bearing recursion AT TIER CAPACITY (task 4e.3):
+    /// tier-4 blocks carrying 3 REAL user txs assemble with one ghost
+    /// authorization slot, one ghost spine instance, one dead padded-tree
+    /// leaf, per-slot liveness bits and liveness-derived count lanes — the
+    /// tier-fixity machinery end to end through the link: π₀ COMPLETE at
+    /// capacity, π₁ ⊳ π₀, decider + negatives. (Same-tier class identity
+    /// across DIFFERENT real counts is gated by
+    /// `region_tier_fixity_across_different_tx_counts`.)
+    #[test]
+    #[ignore = "heavy (m=24, several 2^24 proofs + one class digest); run explicitly"]
+    fn region_complete_block_bearing_tier_capacity_link_e2e() {
+        use noid_recursive::acceptance::trace::region_source_binding::RegionDischargeParams;
+        let units = chained_multi_tx_blocks(2, 3);
+        run_region_block_bearing_gate(
+            &units,
+            RegionDischargeParams { nq: 2, sb8_auth_layers: 1 },
+            true,
+            true,
+            true,
+            true,
+            Some(4),
         );
     }
 
@@ -3524,6 +3568,7 @@ mod tests {
             exact_state_region: false,
             tx_root_region: false,
             spine_region: false,
+            tier_user_tx_capacity: None,
         };
         let r0 = build(&units[0], no_pcs, "block 0 (height 1, no wallet-PCS)");
         let r1 = build(&units[1], no_pcs, "block 1 (height 2, no wallet-PCS)");
@@ -3607,6 +3652,7 @@ mod tests {
             exact_state_region: false,
             tx_root_region: false,
             spine_region: false,
+            tier_user_tx_capacity: None,
         });
     }
 
@@ -3631,6 +3677,7 @@ mod tests {
             exact_state_region: true,
             tx_root_region: false,
             spine_region: false,
+            tier_user_tx_capacity: None,
         });
     }
 
@@ -3655,6 +3702,7 @@ mod tests {
             exact_state_region: true,
             tx_root_region: true,
             spine_region: false,
+            tier_user_tx_capacity: None,
         });
     }
 
@@ -3679,7 +3727,113 @@ mod tests {
             exact_state_region: true,
             tx_root_region: true,
             spine_region: true,
+            tier_user_tx_capacity: None,
         });
+    }
+
+    /// Tier-capacity parity (task 4e.3): a 3-real-user-tx block assembled at
+    /// its consensus tier capacity 4 — one GHOST authorization slot (the
+    /// protocol `ghost_authorization()`), one ghost spine instance, one dead
+    /// padded-tree leaf — must satisfy, and the liveness machinery must
+    /// reject one-flip tampering: a dead→live bit flip (breaks the
+    /// USER_TX_COUNT liveness sum), a live→dead flip on a real slot (breaks
+    /// monotonicity/sum), and a flipped ghost tx-hash wire (breaks the ghost
+    /// spine wrap-digest cell pin).
+    #[test]
+    fn region_tier_capacity_block_slots_parity() {
+        use noid_ivc_core::field::F128;
+        use noid_ivc_core::field_circuit::{FieldR1csBuilder, LinExpr};
+        use noid_recursive::acceptance::block_slots::{
+            build_block_slots_with_config, BlockSlotsConfig,
+        };
+        use noid_recursive::acceptance::trace::region_source_binding::RegionDischargeParams;
+
+        let wire_of = |e: &LinExpr| -> usize {
+            assert_eq!(e.terms.len(), 1, "statement wire expected");
+            e.terms[0].0 as usize
+        };
+        let units = chained_multi_tx_blocks(1, 3);
+        let u = &units[0];
+        let cfg = BlockSlotsConfig {
+            discharge_wallet_pcs: true,
+            wallet_pcs_region: Some(RegionDischargeParams { nq: 2, sb8_auth_layers: 1 }),
+            owner_auth_region: true,
+            exact_state_region: true,
+            tx_root_region: true,
+            spine_region: true,
+            tier_user_tx_capacity: Some(4),
+        };
+        let mut b = FieldR1csBuilder::new();
+        let slots = build_block_slots_with_config(
+            &mut b,
+            &u.start_accumulator,
+            &u.end_accumulator,
+            &u.inputs,
+            &u.proof,
+            cfg,
+        );
+        assert_eq!(slots.tx_hashes.len(), 4, "capacity tx-hash vector");
+        assert_eq!(slots.auth_inputs.len(), 4, "capacity auth slots");
+        assert_eq!(slots.live_bits.len(), 4, "capacity liveness vector");
+        let (r1cs, z) = b.build();
+        assert!(r1cs.satisfies(&z), "tier-capacity block slots must satisfy");
+        eprintln!(
+            "[tier-cap] parity OK: {} wires, {} claims, 3 real + 1 ghost slot",
+            z.len(),
+            slots.pending_wallet_pcs.len()
+        );
+
+        // Negative 1: raise the ghost's liveness bit — the USER_TX_COUNT
+        // liveness sum no longer matches the claim lane.
+        {
+            let mut bad = z.clone();
+            bad[wire_of(&slots.live_bits[3])] += F128::ONE;
+            assert!(!r1cs.satisfies(&bad), "raised ghost live bit accepted");
+        }
+        // Negative 2: kill a real slot's liveness bit — monotonicity and the
+        // liveness sum both break.
+        {
+            let mut bad = z.clone();
+            bad[wire_of(&slots.live_bits[0])] += F128::ONE;
+            assert!(!r1cs.satisfies(&bad), "killed real live bit accepted");
+        }
+        // Negative 3: flip the ghost tx-hash wire — the ghost spine wrap
+        // digest cell pin breaks.
+        {
+            let mut bad = z.clone();
+            bad[wire_of(&slots.tx_hashes[3][0])] += F128::ONE;
+            assert!(!r1cs.satisfies(&bad), "flipped ghost tx-hash accepted");
+        }
+        eprintln!("[tier-cap] all three liveness negatives rejected");
+    }
+
+    /// THE 4e money gate: two blocks of the SAME consensus tier (standard
+    /// tier 4) with DIFFERENT real user-tx counts (3 vs 4) assemble at tier
+    /// capacity to ONE class — byte-identical matrices and identical claim
+    /// structures. The 3-real block carries one ghost authorization slot,
+    /// one ghost spine instance and one dead padded-tree leaf; every
+    /// count that reaches the claim lanes is liveness-gated, so no real
+    /// count leaks into the matrix.
+    #[test]
+    #[ignore = "heavy (two region-ON tier-capacity block-slot builds); run explicitly"]
+    fn region_tier_fixity_across_different_tx_counts() {
+        use noid_recursive::acceptance::block_slots::BlockSlotsConfig;
+        use noid_recursive::acceptance::trace::region_source_binding::RegionDischargeParams;
+        let a = chained_multi_tx_blocks(1, 3);
+        let b = chained_multi_tx_blocks(1, 4);
+        run_region_class_fixity_gate_on(
+            &a[0],
+            &b[0],
+            BlockSlotsConfig {
+                discharge_wallet_pcs: true,
+                wallet_pcs_region: Some(RegionDischargeParams { nq: 2, sb8_auth_layers: 1 }),
+                owner_auth_region: true,
+                exact_state_region: true,
+                tx_root_region: true,
+                spine_region: true,
+                tier_user_tx_capacity: Some(4),
+            },
+        );
     }
 
     /// Shared body of the region class-fixity gates: two DIFFERENT real blocks
@@ -3688,11 +3842,20 @@ mod tests {
     fn run_region_class_fixity_gate(
         region_cfg: noid_recursive::acceptance::block_slots::BlockSlotsConfig,
     ) {
+        let units = chained_std_tx_blocks(2);
+        run_region_class_fixity_gate_on(&units[0], &units[1], region_cfg);
+    }
+
+    /// [`run_region_class_fixity_gate`] over two caller-supplied blocks (the
+    /// tier-fixity money gate compares blocks with DIFFERENT real tx counts).
+    fn run_region_class_fixity_gate_on(
+        unit0: &BlockUnit,
+        unit1: &BlockUnit,
+        region_cfg: noid_recursive::acceptance::block_slots::BlockSlotsConfig,
+    ) {
         use noid_ivc_core::field::F128;
         use noid_ivc_core::field_circuit::{FieldR1csBuilder, LinExpr};
         use noid_recursive::acceptance::block_slots::build_block_slots_with_config;
-
-        let units = chained_std_tx_blocks(2);
         // Each claim's point/value must be class-fixed too — they are NOT part
         // of the block-slot matrix (they are pinned to the IO tail only in the
         // link), so a claim whose point/value LinExpr references a
@@ -3718,8 +3881,8 @@ mod tests {
             (r, claims)
         };
 
-        let (r0, claims0) = build(&units[0], "block 0 (height 1) region-ON");
-        let (r1, claims1) = build(&units[1], "block 1 (height 2) region-ON");
+        let (r0, claims0) = build(unit0, "block 0 region-ON");
+        let (r1, claims1) = build(unit1, "block 1 region-ON");
 
         // Claim STRUCTURE + point/value wire references must be class-fixed.
         assert_eq!(claims0.len(), claims1.len(), "region claim count drifted");

@@ -1319,7 +1319,14 @@ pub fn discharge_auth_pcs_obligations_via_region(
         let d_col = 6 + 5 * txr_leg + 4;
         let sib_cols = [6 + 5 * txr_leg + 2, 6 + 5 * txr_leg + 3];
         let n_paths = t.paths.len();
-        assert_eq!(t.rim_flat.len(), t.depth, "one rim constant per level");
+        // Tier-capacity handoffs authenticate EVERY padded-tree leaf and carry
+        // no rim constants (the padding leaves are proven zero directly);
+        // exact-count handoffs carry one rim constant per level for the last
+        // real path's right-hand siblings.
+        assert!(
+            t.rim_flat.is_empty() || t.rim_flat.len() == t.depth,
+            "one rim constant per level (or none at tier capacity)"
+        );
         for blk in 0..k {
             let lo = (blk * cap).min(n_paths);
             let hi = ((blk + 1) * cap).min(n_paths);
@@ -1364,7 +1371,7 @@ pub fn discharge_auth_pcs_obligations_via_region(
                         LinExpr::constant(if bit { F128::ONE } else { F128::ZERO }),
                     ));
                 }
-                if j == n_paths - 1 {
+                if !t.rim_flat.is_empty() && j == n_paths - 1 {
                     for level in 0..t.depth {
                         if (j >> level) & 1 == 0 {
                             for lane in 0..2 {

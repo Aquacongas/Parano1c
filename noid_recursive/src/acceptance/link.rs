@@ -340,6 +340,13 @@ pub struct LinkClass {
     /// statement wires) instead of the inline batched killshot. Only
     /// meaningful when `region_params` is `Some`.
     pub spine_region: bool,
+    /// When `Some(cap)`, every block in this class assembles at its
+    /// consensus-tier USER-TX CAPACITY (ghost authorization slots +
+    /// liveness-gated count lanes + capacity spine/tx-root structures), so
+    /// same-tier blocks with different real usage share the ONE class
+    /// matrix. Requires the full region stack; `cap` must be the consensus
+    /// standard tier of every block the class carries.
+    pub tier_user_tx_capacity: Option<usize>,
 }
 
 impl LinkClass {
@@ -386,6 +393,7 @@ impl LinkClass {
             exact_state_region: false,
             tx_root_region: false,
             spine_region: false,
+            tier_user_tx_capacity: None,
         }
     }
 
@@ -419,6 +427,7 @@ impl LinkClass {
         exact_state_region: bool,
         tx_root_region: bool,
         spine_region: bool,
+        tier_user_tx_capacity: Option<usize>,
     ) -> Self {
         freeze_region_block_bearing(
             shape,
@@ -430,6 +439,7 @@ impl LinkClass {
             exact_state_region,
             tx_root_region,
             spine_region,
+            tier_user_tx_capacity,
         )
     }
 
@@ -459,6 +469,7 @@ impl LinkClass {
                 exact_state_region: self.exact_state_region,
                 tx_root_region: self.tx_root_region,
                 spine_region: self.spine_region,
+                tier_user_tx_capacity: self.tier_user_tx_capacity,
             },
             None => block.config,
         }
@@ -654,6 +665,7 @@ fn build_link_inner(class: &LinkClass, input: &LinkInput<'_>, freeze: bool) -> B
             block_cfg.exact_state_region,
             block_cfg.tx_root_region,
             block_cfg.spine_region,
+            block_cfg.tier_user_tx_capacity,
         );
         assert_eq!(
             region_native.len(),
@@ -914,6 +926,7 @@ fn freeze_region_block_bearing(
     exact_state_region: bool,
     tx_root_region: bool,
     spine_region: bool,
+    tier_user_tx_capacity: Option<usize>,
 ) -> LinkClass {
     let region_cfg = BlockSlotsConfig {
         discharge_wallet_pcs: true,
@@ -922,6 +935,7 @@ fn freeze_region_block_bearing(
         exact_state_region,
         tx_root_region,
         spine_region,
+        tier_user_tx_capacity,
     };
 
     // ---- Probe: a standalone discharge reveals the claim count + arities.
@@ -971,6 +985,7 @@ fn freeze_region_block_bearing(
         exact_state_region,
         tx_root_region,
         spine_region,
+        tier_user_tx_capacity,
     };
 
     // ---- Genesis dummy T + its proof over the placeholder spec (all-zero IO,
@@ -1040,6 +1055,7 @@ fn freeze_region_block_bearing(
         exact_state_region,
         tx_root_region,
         spine_region,
+        tier_user_tx_capacity,
     }
 }
 
