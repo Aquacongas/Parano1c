@@ -191,10 +191,14 @@ pub struct RegionPcsClaim {
 /// unit gate can keep them small while the link passes the full values.
 #[derive(Clone, Copy, Debug)]
 pub struct RegionDischargeParams {
-    /// Number of distinct queries AUTHENTICATED per leg (a subset of
-    /// `COMPACT_NUM_QUERIES`; the channel is still driven with the full count,
-    /// so the transcript is faithful). The flatness — that this cost is
-    /// query-count independent — is proven separately.
+    /// Number of distinct SOURCE-side queries AUTHENTICATED per leg (a subset
+    /// of `COMPACT_NUM_QUERIES`; the channel is still driven with the full
+    /// count, so the transcript is faithful). The FRI-side legs (round-0
+    /// pair leaves + the 3i Merkle leg + the fold-join) saturate at the
+    /// folded-domain query count the channel actually draws
+    /// (`min(COMPACT_NUM_QUERIES, 2^(n_rounds + LOG_RATE))`), so passing the
+    /// full `COMPACT_NUM_QUERIES` authenticates EVERY query on both sides —
+    /// the production setting.
     pub nq: usize,
     /// Number of DEEPEST SB8 high-fold layers authenticated. The leaf fold chain
     /// in walk A always spans ALL `tau-1` layers to close SB9 regardless.
@@ -290,6 +294,12 @@ pub fn discharge_auth_pcs_obligations_via_region(
     let log_n = natives[0].commitment.log_rows;
     let tau = COMPACT_TAU.min(log_n);
     let n_rounds = log_n - tau;
+    // The FRI-side legs (round-0 pair leaves, the 3i Merkle leg, the
+    // fold-join) SATURATE at the folded domain: the channel only draws
+    // `min(COMPACT_NUM_QUERIES, 2^(n_rounds + LOG_RATE))` FRI queries (at the
+    // wallet shape that is 8 — every position of the folded codeword), so the
+    // full-production `nq = COMPACT_NUM_QUERIES` authenticates ALL of them.
+    let nq_fri = nq.min(COMPACT_NUM_QUERIES.min(1usize << (n_rounds + LOG_RATE)));
     let ntt = AdditiveNTT::<Block128>::new(num_vars + LOG_RATE);
     let leaf_chain = SourceLeafChain { n_cols: 1 };
     let hp_chain = high_pair_leaf_chain();
@@ -340,7 +350,7 @@ pub fn discharge_auth_pcs_obligations_via_region(
     let p = 1usize << w_log;
     let leaf_base = |f: usize| st_slots + f * leaf_family_slots; // within a tx block
 
-    // Walk-B leg layout (class constant): the 3i pair-leaf at `[0, nq)`, then the
+    // Walk-B leg layout (class constant): the 3i pair-leaf at `[0, nq_fri)`, then the
     // legs at `meta_bases[f]`, all within a per-tx block.
     let round = 0usize;
     let sb6_walk_depth = source_tree_depth(log_n) - source_cap_depth(log_n);
@@ -357,6 +367,8 @@ pub fn discharge_auth_pcs_obligations_via_region(
     // in ONE walk B).
     let n_wallet_legs = leg_depths.len();
     let mut leg_caps: Vec<usize> = vec![nq; n_wallet_legs];
+    // Leg 0 (the 3i FRI round leg) opens the FRI-side queries — saturated.
+    leg_caps[0] = nq_fri;
     let mut leg_ivs: Vec<[F128; 2]> = vec![compress_iv_flat(); n_wallet_legs];
     let es_state_leg = leg_depths.len();
     let mut es_guard_leg = usize::MAX;
@@ -382,7 +394,7 @@ pub fn discharge_auth_pcs_obligations_via_region(
     }
     let n_legs = leg_depths.len();
     let mut meta_bases = Vec::with_capacity(n_legs);
-    let mut acc = nq;
+    let mut acc = nq_fri;
     for f in 0..n_legs {
         meta_bases.push(acc);
         acc += leg_caps[f] * (2 * leg_depths[f]).next_power_of_two();
@@ -614,7 +626,7 @@ pub fn discharge_auth_pcs_obligations_via_region(
     assert!(query_indices.len() >= nq, "need at least nq source queries");
     let (fri_queries, fri_query_bits) =
         compact_queries_from_squeezes_with_bits(b, &fri_sq, n_rounds + LOG_RATE);
-    assert!(fri_queries.len() >= nq, "need at least nq FRI queries");
+    assert!(fri_queries.len() >= nq_fri, "need at least nq_fri FRI queries");
     // Cross-check the walk-C draws against the REAL noid_fri::Channel.
     let (native_source_queries, native_fri_queries) =
         derive_queries(proof, &point, COMPACT_NUM_QUERIES);
@@ -915,24 +927,24 @@ pub fn discharge_auth_pcs_obligations_via_region(
     // claim VALUES are the FS-observed root wires (transcript-bound).
     // ===================================================================
     let fri_pair_indices: Vec<usize> =
-        fri_queries[..nq].iter().map(|&qi| (qi >> round) >> 1).collect();
-    let fri_pairs: Vec<(F128, F128)> = (0..nq)
+        fri_queries[..nq_fri].iter().map(|&qi| (qi >> round) >> 1).collect();
+    let fri_pairs: Vec<(F128, F128)> = (0..nq_fri)
         .map(|q| {
             let (s0v, s1v) = fri.fri_queried_symbols[round][q];
             (phi(s0v), phi(s1v))
         })
         .collect();
-    let pair_wlog = nq.trailing_zeros() as usize;
+    let pair_wlog = nq_fri.trailing_zeros() as usize;
     let (pair_cols, tx_pair_digests) = build_pair_leaf_columns(&fri_pairs, pair_wlog);
     for j in 0..2 {
-        cb[j][tx_off_b..tx_off_b + nq].copy_from_slice(&pair_cols.in_[j][0..nq]);
+        cb[j][tx_off_b..tx_off_b + nq_fri].copy_from_slice(&pair_cols.in_[j][0..nq_fri]);
     }
     for j in 0..STATE_SIZE {
-        cb[2 + j][tx_off_b..tx_off_b + nq].copy_from_slice(&pair_cols.c[j][0..nq]);
-        s0b[j][tx_off_b..tx_off_b + nq].copy_from_slice(&pair_cols.s0[j][0..nq]);
-        soutb[j][tx_off_b..tx_off_b + nq].copy_from_slice(&pair_cols.s_out[j][0..nq]);
+        cb[2 + j][tx_off_b..tx_off_b + nq_fri].copy_from_slice(&pair_cols.c[j][0..nq_fri]);
+        s0b[j][tx_off_b..tx_off_b + nq_fri].copy_from_slice(&pair_cols.s0[j][0..nq_fri]);
+        soutb[j][tx_off_b..tx_off_b + nq_fri].copy_from_slice(&pair_cols.s_out[j][0..nq_fri]);
     }
-    for q in 0..nq {
+    for q in 0..nq_fri {
         pair_digests.push(tx_pair_digests[q]);
         pair_slots.push(tx_off_b + q);
     }
@@ -944,7 +956,7 @@ pub fn discharge_auth_pcs_obligations_via_region(
         let meta_base = meta_bases[f];
         let col_base = 6 + 5 * f;
         let stride = (2 * depth).next_power_of_two();
-        let n_slots = nq * stride;
+        let n_slots = nq_fri * stride;
         let fam_wlog = n_slots.trailing_zeros() as usize;
         let all_pi: Vec<usize> = fri_queries.iter().map(|&qi| (qi >> round) >> 1).collect();
         let all_leaves: Vec<[u8; 32]> = fri.fri_queried_symbols[round]
@@ -956,8 +968,8 @@ pub fn discharge_auth_pcs_obligations_via_region(
             .expect("3i FRI octopus expand");
         all_expands_ok &= !paths.is_empty();
         let root_flat = lanes_flat(&fri.fri_roots[round]);
-        let mut witnesses = Vec::with_capacity(nq);
-        for q in 0..nq {
+        let mut witnesses = Vec::with_capacity(nq_fri);
+        for q in 0..nq_fri {
             let path = paths
                 .iter()
                 .find(|p| p.leaf_index == fri_pair_indices[q])
@@ -972,9 +984,9 @@ pub fn discharge_auth_pcs_obligations_via_region(
             acc_committed_roots[f].push(root_flat);
             acc_root_wires[f].push(fri_roots_w[round].clone());
             acc_path_slots[f].push(tx_off_b + meta_base + q * stride);
-            acc_pair_map.push(tx * nq + q);
+            acc_pair_map.push(tx * nq_fri + q);
         }
-        let family = MerklePathFamily { depth, n_paths: nq };
+        let family = MerklePathFamily { depth, n_paths: nq_fri };
         let mcols = build_merkle_path_columns(&family, iv_b, &witnesses, fam_wlog);
         place_merkle(&mut cb, &mut s0b, &mut soutb, &mcols, col_base, tx_off_b + meta_base, n_slots);
         acc_recomputed_roots[f].extend(mcols.roots.iter().copied());
@@ -1128,7 +1140,7 @@ pub fn discharge_auth_pcs_obligations_via_region(
     let final_len = fri.final_codeword.len();
     assert!(final_len.is_power_of_two(), "final codeword length power of two");
     let final_bits = final_len.trailing_zeros() as usize;
-    for q in 0..nq {
+    for q in 0..nq_fri {
         let (s0v, s1v) = fri.fri_queried_symbols[round][q];
         let s0w = LinExpr::from_wire(b.alloc_f128(phi(s0v)));
         let s1w = LinExpr::from_wire(b.alloc_f128(phi(s1v)));
@@ -1673,7 +1685,7 @@ pub fn discharge_auth_pcs_obligations_via_region(
     // tx block. The IV patterns are per-leg (the exact-state legs run on their
     // own consensus tree tags).
     let mut fixed_b: Vec<FixedPattern> = Vec::new();
-    fixed_b.push(common_period_ones(0, nq, block_log_b));
+    fixed_b.push(common_period_ones(0, nq_fri, block_log_b));
     for f in 0..n_legs {
         let family = MerklePathFamily { depth: leg_depths[f], n_paths: leg_caps[f] };
         for pat in merkle_fixed_patterns(&family, leg_ivs[f]) {
