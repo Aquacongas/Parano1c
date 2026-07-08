@@ -92,7 +92,7 @@ use noid_ivc_core::challenger::{Challenger, FsLaneChallenger};
 use noid_ivc_core::deep_chain::flat_mds;
 use noid_ivc_core::deep_chain::leaf_hash::{
     build_high_pair_leaf_columns, build_pair_leaf_columns, build_source_leaf_columns,
-    build_sponge_leaf_columns, high_pair_leaf_chain, pair_leaf_refs, pair_leaf_substitution_terms,
+    build_sponge_leaf_columns, high_pair_leaf_chain, pair_leaf_substitution_terms,
     slot_leaf_iv_flat, slot_leaf_pad_flat, source_leaf_fixed_patterns, source_leaf_refs,
     source_leaf_substitution_terms, sponge_leaf_fixed_patterns, sponge_leaf_substitution_terms,
     PairLeafRefs, SourceLeafChain, SourceLeafColumns, SourceLeafRefs, SpongeLeafRefs,
@@ -412,13 +412,16 @@ pub fn discharge_auth_pcs_obligations_via_region(
     // disjoint, every relation term is gated by a leg-specific fixed pattern
     // (zero outside its own slots), and the only cross-boundary shifted reads
     // (`c_sh` at path-start slots) are cancelled by the START patterns — so
-    // ALL legs share ONE physical {E0,E1,SIB0,SIB1,D} column set at [6..11)
-    // next to the shared pair-IN [0..2) and C0..C3 [2..6). Committed lanes
-    // per leg were the production-shape wall (6 + 5·n_legs columns × the
-    // k-tiled domain); the shared set is 11 columns regardless of leg count.
-    let n_committed_b = 6 + 5;
+    // ALL legs share ONE physical {E0,E1,SIB0,SIB1,D} column set, and the
+    // pair-leaf IN lanes RIDE the shared E columns (pair slots [0, nq_fri)
+    // are disjoint from every leg's path cells, which start at
+    // meta_bases[0] = nq_fri). Column order: C0..C3 = [0..4), E0,E1 = [4..6)
+    // (pair-IN aliases E), SIB0,SIB1 = [6..8), D = 8. Committed lanes per
+    // leg were the production-shape wall (6 + 5·n_legs columns × the
+    // k-tiled domain); the shared set is 9 columns regardless of leg count.
+    let n_committed_b = 9;
     let region_pair = 0usize;
-    let pair_refs = pair_leaf_refs(0);
+    let pair_refs = PairLeafRefs { in_: [4, 5], c: std::array::from_fn(|i| i) };
     let iv_b = compress_iv_flat();
     let hasher = Poseidon2bSponge::new();
 
@@ -445,7 +448,7 @@ pub fn discharge_auth_pcs_obligations_via_region(
         for j in 0..STATE_SIZE {
             s0b[j][slot] = ghb0[j];
             soutb[j][slot] = ghbo[j];
-            cb[2 + j][slot] = ghbo[j];
+            cb[j][slot] = ghbo[j];
         }
     }
 
@@ -949,10 +952,10 @@ pub fn discharge_auth_pcs_obligations_via_region(
     let pair_wlog = nq_fri.trailing_zeros() as usize;
     let (pair_cols, tx_pair_digests) = build_pair_leaf_columns(&fri_pairs, pair_wlog);
     for j in 0..2 {
-        cb[j][tx_off_b..tx_off_b + nq_fri].copy_from_slice(&pair_cols.in_[j][0..nq_fri]);
+        cb[4 + j][tx_off_b..tx_off_b + nq_fri].copy_from_slice(&pair_cols.in_[j][0..nq_fri]);
     }
     for j in 0..STATE_SIZE {
-        cb[2 + j][tx_off_b..tx_off_b + nq_fri].copy_from_slice(&pair_cols.c[j][0..nq_fri]);
+        cb[j][tx_off_b..tx_off_b + nq_fri].copy_from_slice(&pair_cols.c[j][0..nq_fri]);
         s0b[j][tx_off_b..tx_off_b + nq_fri].copy_from_slice(&pair_cols.s0[j][0..nq_fri]);
         soutb[j][tx_off_b..tx_off_b + nq_fri].copy_from_slice(&pair_cols.s_out[j][0..nq_fri]);
     }
@@ -966,7 +969,7 @@ pub fn discharge_auth_pcs_obligations_via_region(
         let f = 0usize;
         let depth = leg_depths[f];
         let meta_base = meta_bases[f];
-        let col_base = 6;
+        let col_base = 4;
         let stride = (2 * depth).next_power_of_two();
         let n_slots = nq_fri * stride;
         let fam_wlog = n_slots.trailing_zeros() as usize;
@@ -1010,7 +1013,7 @@ pub fn discharge_auth_pcs_obligations_via_region(
         let f = 1usize;
         let depth = leg_depths[f];
         let meta_base = meta_bases[f];
-        let col_base = 6;
+        let col_base = 4;
         let stride = (2 * depth).next_power_of_two();
         let n_slots = nq * stride;
         let fam_wlog = n_slots.trailing_zeros() as usize;
@@ -1095,7 +1098,7 @@ pub fn discharge_auth_pcs_obligations_via_region(
         let f = 2 + kk;
         let depth = leg_depths[f];
         let meta_base = meta_bases[f];
-        let col_base = 6;
+        let col_base = 4;
         let stride = (2 * depth).next_power_of_two();
         let n_slots = nq * stride;
         let fam_wlog = n_slots.trailing_zeros() as usize;
@@ -1281,7 +1284,7 @@ pub fn discharge_auth_pcs_obligations_via_region(
                 e.d_state,
                 state_cap,
                 leg_ivs[es_state_leg],
-                6,
+                4,
                 blk * per_tx_block_b + meta_bases[es_state_leg],
                 &state_paths,
             );
@@ -1318,7 +1321,7 @@ pub fn discharge_auth_pcs_obligations_via_region(
                     gd.depth,
                     cap,
                     leg_ivs[es_guard_leg],
-                    6,
+                    4,
                     blk * per_tx_block_b + meta_bases[es_guard_leg],
                     &guard_paths,
                 );
@@ -1340,8 +1343,8 @@ pub fn discharge_auth_pcs_obligations_via_region(
     if let Some(t) = txr {
         let cap = leg_caps[txr_leg];
         let stride = (2 * t.depth).next_power_of_two();
-        let d_col = 10;
-        let sib_cols = [8, 9];
+        let d_col = 8;
+        let sib_cols = [6, 7];
         let n_paths = t.paths.len();
         // Tier-capacity handoffs authenticate EVERY padded-tree leaf and carry
         // no rim constants (the padding leaves are proven zero directly);
@@ -1381,7 +1384,7 @@ pub fn discharge_auth_pcs_obligations_via_region(
                 t.depth,
                 cap,
                 leg_ivs[txr_leg],
-                6,
+                4,
                 region_base,
                 &real,
             );
@@ -3538,10 +3541,10 @@ fn discharge_union(
 // ===========================================================================
 fn union_merkle_refs(fixed_base: usize) -> MerkleFamilyRefs {
     MerkleFamilyRefs {
-        e: [6, 7],
-        sib: [8, 9],
-        d: 10,
-        c: std::array::from_fn(|i| 2 + i),
+        e: [4, 5],
+        sib: [6, 7],
+        d: 8,
+        c: std::array::from_fn(|i| i),
         even: fixed_base,
         evenns: fixed_base + 1,
         evenstart: fixed_base + 2,
@@ -3699,7 +3702,7 @@ fn place_merkle(
     }
     cb[col_base + 4][rng.clone()].copy_from_slice(&cols.d[0..n_slots]);
     for j in 0..STATE_SIZE {
-        cb[2 + j][rng.clone()].copy_from_slice(&cols.c[j][0..n_slots]);
+        cb[j][rng.clone()].copy_from_slice(&cols.c[j][0..n_slots]);
         s0b[j][rng.clone()].copy_from_slice(&cols.s0[j][0..n_slots]);
         soutb[j][rng.clone()].copy_from_slice(&cols.s_out[j][0..n_slots]);
     }
