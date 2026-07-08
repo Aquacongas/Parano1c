@@ -302,15 +302,15 @@ pub fn owner_auth_channel_schedule(
     let lane = s.data_lane(proof.kill_shot.shift.state_at_r2);
     s.absorb_lanes(vec![lane]);
 
-    // Step 5: boundary sumcheck. domain tag + constraint count, one alpha
-    // draw (squeeze_alphas m>0 => 1 squeeze), per round: 2 evals + fold,
-    // state_at_r.
+    // Step 5: boundary sumcheck. domain tag + constraint count, the RLC
+    // level draws (`rlc_levels(m)` squeezes — 1 at every standard class),
+    // per round: 2 evals + fold, state_at_r.
     let constraints_len = layout.padded_slots * 4;
     s.absorb_lanes(vec![
         Some(OWNER_AUTH_BOUNDARY_DOMAIN_TAG),
         Some(constraints_len as u128),
     ]);
-    s.ops.push(TranscriptOp::Squeeze(1));
+    s.ops.push(TranscriptOp::Squeeze(noid_gkr::batch_eval::rlc_levels(constraints_len)));
     for r in &proof.boundary.round_polys {
         let round_lanes: Vec<Option<u128>> =
             r.evals_at_1_2.iter().map(|&e| s.data_lane(e)).collect();
@@ -322,7 +322,8 @@ pub fn owner_auth_channel_schedule(
 
     // Step 6: batch-eval reduction over the 3 state claims (main/shift/
     // boundary). absorb_claims binds each claim's point LENGTH (num_vars,
-    // Const) and VALUE (data); one alpha draw; per round: 2 evals + fold.
+    // Const) and VALUE (data); one RLC draw (`rlc_levels(3) = 1`); per
+    // round: 2 evals + fold.
     let claim_values = [
         proof.kill_shot.main.state_at_r,
         proof.kill_shot.shift.state_at_r2,

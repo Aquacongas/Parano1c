@@ -178,32 +178,67 @@ pub struct LinearEvalClaimTrace {
 // Shared transcript pieces
 // ---------------------------------------------------------------------------
 
-/// Trace twin of `batch_eval::squeeze_alphas`: ONE squeezed challenge, powers
-/// `(1, α, α², …)` (the O3 squeeze diet). `m − 2` multiplications.
+/// Trace twin of `batch_eval::squeeze_alphas` — the MULTI-LEVEL RLC:
+/// `rlc_levels(m)` squeezed challenges, `weight[i] = Π_j c_j^{digit_j(i)}`
+/// over the base-64 digits of `i` (soundness note on the native fn). For
+/// `m ≤ 64` this is the single-α power ladder (`m − 2` multiplications,
+/// wire-identical to the pre-upgrade rule); larger batches cost the level
+/// power tables plus `m·(levels−1)` digit-product multiplications.
 pub fn squeeze_alphas_trace(
     b: &mut FieldR1csBuilder,
     ch: &mut RawChannelTrace,
     m: usize,
 ) -> Vec<LinExpr> {
+    use noid_gkr::batch_eval::{rlc_levels, RLC_LEVEL_BASE};
     if m == 0 {
         return Vec::new();
     }
-    let alpha = ch.squeeze(b);
-    let mut alphas = Vec::with_capacity(m);
-    let mut acc = LinExpr::constant(F128::ONE);
-    for _ in 0..m {
-        alphas.push(acc.clone());
-        // `acc *= alpha` — the value pushed NEXT iteration; the final
-        // multiply is skipped (native computes it and discards).
-        if alphas.len() < m {
-            acc = if alphas.len() == 1 {
-                alpha.clone()
-            } else {
-                mul(b, &acc, &alpha)
-            };
+    let levels = rlc_levels(m);
+    let cs: Vec<LinExpr> = (0..levels).map(|_| ch.squeeze(b)).collect();
+    if levels == 1 {
+        let mut alphas = Vec::with_capacity(m);
+        let mut acc = LinExpr::constant(F128::ONE);
+        for _ in 0..m {
+            alphas.push(acc.clone());
+            // `acc *= alpha` — the value pushed NEXT iteration; the final
+            // multiply is skipped (native computes it and discards).
+            if alphas.len() < m {
+                acc = if alphas.len() == 1 {
+                    cs[0].clone()
+                } else {
+                    mul(b, &acc, &cs[0])
+                };
+            }
         }
+        return alphas;
     }
-    alphas
+    let mut tables: Vec<Vec<LinExpr>> = Vec::with_capacity(levels);
+    for (j, c) in cs.iter().enumerate() {
+        let digits = RLC_LEVEL_BASE.min((m - 1) / RLC_LEVEL_BASE.pow(j as u32) + 1);
+        let mut table = Vec::with_capacity(digits);
+        let mut acc = LinExpr::constant(F128::ONE);
+        for k in 0..digits {
+            table.push(acc.clone());
+            if k + 1 < digits {
+                acc = if k == 0 { c.clone() } else { mul(b, &acc, c) };
+            }
+        }
+        tables.push(table);
+    }
+    (0..m)
+        .map(|i| {
+            let mut w = tables[0][i % RLC_LEVEL_BASE].clone();
+            let mut x = i / RLC_LEVEL_BASE;
+            for table in &tables[1..] {
+                let d = x % RLC_LEVEL_BASE;
+                x /= RLC_LEVEL_BASE;
+                if d > 0 {
+                    w = mul(b, &w, &table[d]);
+                }
+            }
+            w
+        })
+        .collect()
 }
 
 /// Trace twin of the native prebound claim binding: point LENGTH + VALUE

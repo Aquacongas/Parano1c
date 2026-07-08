@@ -466,25 +466,38 @@ fn eq_at_boolean_index(index: usize, n: usize, r: &[Block128]) -> Block128 {
     acc
 }
 
-/// RLC batching weights for `m` claims: the powers `(1, α, α², …, α^{m−1})`
-/// of ONE squeezed challenge α (the squeeze-diet transcript rule; previously
-/// one squeeze per claim).
+/// Base-64 digits of `m − 1` (≥ 1) — the number of squeezed challenge
+/// LEVELS the multi-level RLC below uses for an `m`-claim batch. Shared by
+/// the native helper, the trace twin and the channel schedule extractors so
+/// every transcript agrees on the squeeze count by construction.
+pub fn rlc_levels(m: usize) -> usize {
+    let mut levels = 1usize;
+    let mut top = m.saturating_sub(1) / RLC_LEVEL_BASE;
+    while top > 0 {
+        levels += 1;
+        top /= RLC_LEVEL_BASE;
+    }
+    levels
+}
+
+/// Per-level digit base of the multi-level RLC (digit degree ≤ 63).
+pub const RLC_LEVEL_BASE: usize = 64;
+
+/// MULTI-LEVEL RLC batching weights for `m` claims: with `L = rlc_levels(m)`
+/// challenges `c_0, …, c_{L−1}` squeezed in order,
+/// `weight[i] = Π_j c_j^{digit_j(i)}` over the base-64 digits of `i`.
+/// For `m ≤ 64` this is exactly the single-α power ladder
+/// `(1, α, α², …, α^{m−1})` — one squeeze, transcripts unchanged.
 ///
-/// Soundness: for a nonzero claim-error vector `e`, the batched check only
-/// vanishes if the degree-(m−1) polynomial `Σ eᵢ·xⁱ` vanishes at the random
-/// α, so the batching error is ≤ (m−1)/2^128 (Schwartz–Zippel) instead of
-/// 2^-128 with independent challenges. Largest batches in the protocol:
-/// the auth-FS transcript chain ≈ 2^15 claims @16 txs (native-only path,
-/// retired with the legacy checkpoint path) and the batched Merkle path
-/// chains ≈ 2^17 claims at the
-/// 255-tx max shape ⇒ worst-case batching error ≈ 2^-111. This is the
-/// accepted trade for removing ~1 FS permutation per claim from every
-/// verifier transcript (and ~360 constraints per claim from the in-circuit
-/// trace replay).
-/// If a pre-mainnet audit requires a strict ≥ 120-bit batching term, the
-/// localized upgrade is two-level batching (α-powers inside fixed-size
-/// chunks, β-powers across chunks) at one extra squeeze — decide before
-/// transcripts freeze.
+/// Soundness: a nonzero claim-error vector `e` survives the batch only if
+/// the multivariate polynomial `Σ eᵢ·Π_j x_j^{digit_j(i)}` vanishes at the
+/// random `(c_0, …, c_{L−1})`; by Schwartz–Zippel that happens with
+/// probability ≤ (Σ_j d_j)/2^128 where every per-level degree `d_j ≤ 63`.
+/// Largest batch in the protocol (the batched Merkle path chains ≈ 2^17
+/// claims at the 255-tx max shape) takes L = 3 levels ⇒ error ≤ 189/2^128
+/// ≈ 2^-120.4 — the ≥ 120-bit batching term the §7.1 ledger budgets (the
+/// old single-α rule bottomed at ≈ 2^-111 there). Small batches keep the
+/// squeeze diet: one FS permutation per batch, not per claim.
 ///
 /// The prover and the verifier derive the weights through this same helper,
 /// so the channel stays in lockstep by construction.
@@ -495,14 +508,42 @@ pub(crate) fn squeeze_alphas<T: FiatShamir<Block128>>(
     if m == 0 {
         return Vec::new();
     }
-    let alpha = channel.squeeze();
-    let mut alphas = Vec::with_capacity(m);
-    let mut acc = Block128::ONE;
-    for _ in 0..m {
-        alphas.push(acc);
-        acc *= alpha;
+    let levels = rlc_levels(m);
+    let cs: Vec<Block128> = (0..levels).map(|_| channel.squeeze()).collect();
+    if levels == 1 {
+        // The single-α power ladder (byte-identical to the pre-upgrade rule).
+        let mut alphas = Vec::with_capacity(m);
+        let mut acc = Block128::ONE;
+        for _ in 0..m {
+            alphas.push(acc);
+            acc *= cs[0];
+        }
+        return alphas;
     }
-    alphas
+    // Per-level power tables over the digit range each level takes, then
+    // the digit products (level 0 rolls fastest).
+    let mut tables: Vec<Vec<Block128>> = Vec::with_capacity(levels);
+    for (j, c) in cs.iter().enumerate() {
+        let digits = RLC_LEVEL_BASE.min((m - 1) / RLC_LEVEL_BASE.pow(j as u32) + 1);
+        let mut table = Vec::with_capacity(digits);
+        let mut acc = Block128::ONE;
+        for _ in 0..digits {
+            table.push(acc);
+            acc *= *c;
+        }
+        tables.push(table);
+    }
+    (0..m)
+        .map(|i| {
+            let mut w = tables[0][i % RLC_LEVEL_BASE];
+            let mut x = i / RLC_LEVEL_BASE;
+            for table in &tables[1..] {
+                w *= table[x % RLC_LEVEL_BASE];
+                x /= RLC_LEVEL_BASE;
+            }
+            w
+        })
+        .collect()
 }
 
 /// Bind the batched claims to the channel so `α_i` are tied to the exact
@@ -1401,5 +1442,80 @@ mod tests {
         let mut c2 = fresh_channel(21);
         let (p2, _) = prove_batch_eval(&b, &claims, &mut c2);
         assert_eq!(p1, p2);
+    }
+
+    /// The multi-level RLC weights are exactly the digit products
+    /// `Π_j c_j^{digit_j(i)}` of the sequentially squeezed level
+    /// challenges, one squeeze per level, and `m ≤ 64` stays the
+    /// single-α power ladder.
+    #[test]
+    fn multi_level_rlc_weights_match_digit_products() {
+        fn pow(c: Block128, e: usize) -> Block128 {
+            let mut acc = Block128::ONE;
+            for _ in 0..e {
+                acc *= c;
+            }
+            acc
+        }
+        for m in [1usize, 3, 64, 65, 100, 4096, 4097, 70_000] {
+            let levels = rlc_levels(m);
+            assert_eq!(
+                levels,
+                match m {
+                    0..=64 => 1,
+                    65..=4096 => 2,
+                    _ => 3,
+                },
+                "levels at m = {m}"
+            );
+            // Replay the squeezes on a lockstep channel to recover the
+            // level challenges the helper drew.
+            let mut ch = fresh_channel(33);
+            let weights = squeeze_alphas(&mut ch, m);
+            let mut ch2 = fresh_channel(33);
+            let cs: Vec<Block128> = (0..levels).map(|_| ch2.squeeze()).collect();
+            for (i, w) in weights.iter().enumerate() {
+                let mut expect = Block128::ONE;
+                let mut x = i;
+                for c in &cs {
+                    expect *= pow(*c, x % RLC_LEVEL_BASE);
+                    x /= RLC_LEVEL_BASE;
+                }
+                assert_eq!(*w, expect, "weight {i} of m = {m}");
+            }
+            // Post-state lockstep: both channels drew the same squeezes.
+            assert_eq!(ch.squeeze(), ch2.squeeze(), "channel lockstep at m = {m}");
+        }
+    }
+
+    /// A > 64-claim batch (two RLC levels) roundtrips and rejects a
+    /// tampered claim value — the level-1 weights carry real soundness
+    /// (a mutant dropping the second level cannot verify).
+    #[test]
+    fn two_level_batch_roundtrip_and_rejects_tamper() {
+        let mut rng = StdRng::seed_from_u64(77);
+        let n = 8;
+        let b = rand_vec(&mut rng, 1 << n);
+        let claims: Vec<EvalClaim> = (0..100)
+            .map(|_| {
+                let point = rand_vec(&mut rng, n);
+                let value = evaluate_slice(&b, &point);
+                EvalClaim { point, value }
+            })
+            .collect();
+
+        let mut cp = fresh_channel(41);
+        let (proof, red) = prove_batch_eval(&b, &claims, &mut cp);
+        let mut cv = fresh_channel(41);
+        let got = verify_batch_eval(&proof, &claims, n, &mut cv).expect("two-level batch verifies");
+        assert_eq!(got.point, red.point);
+        assert_eq!(got.value, red.value);
+
+        // Tamper with a claim in the SECOND chunk (index ≥ 64): only the
+        // level-1 weight separates it from the first chunk's claims.
+        let mut bad = claims.clone();
+        bad[80].value += Block128::from(1u128);
+        let mut cv2 = fresh_channel(41);
+        assert!(verify_batch_eval(&proof, &bad, n, &mut cv2).is_none());
     }
 }

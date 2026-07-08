@@ -1513,24 +1513,53 @@ pub fn discharge_auth_pcs_obligations_via_region(
 /// wallet-PCS `DOMAIN_C`).
 const OWNER_AUTH_DOMAIN_C: &[u8] = b"owner-auth-region-duplex-union";
 
-/// `[1, base, base², …, base^{m−1}]` — the trace twin of `squeeze_alphas_trace`
-/// with `base` supplied (a carry cell) instead of squeezed. `alphas[0]` is the
-/// build-time constant `1`, `alphas[1] = base`, higher powers via `mul` (so the
-/// `a.is_const() && a.constant == ONE` fast path in `owner_boundary_w` /
-/// `verify_batch_eval_trace` fires on `alphas[0]` exactly as inline).
-fn owner_alpha_powers(b: &mut FieldR1csBuilder, base: &LinExpr, m: usize) -> Vec<LinExpr> {
+/// The multi-level RLC weights of `squeeze_alphas_trace` with the level
+/// challenges SUPPLIED (walk-C carry cells) instead of squeezed:
+/// `weight[i] = Π_j bases[j]^{digit_j(i)}` over the base-64 digits of `i`,
+/// `bases.len() == rlc_levels(m)`. `weights[0]` is the build-time constant
+/// `1` (so the `is_const() && constant == ONE` fast path in
+/// `owner_boundary_w` / `verify_batch_eval_trace` fires exactly as inline);
+/// for `m ≤ 64` this is the single-base power ladder.
+fn owner_rlc_weights(b: &mut FieldR1csBuilder, bases: &[LinExpr], m: usize) -> Vec<LinExpr> {
+    use noid_gkr::batch_eval::{rlc_levels, RLC_LEVEL_BASE};
     if m == 0 {
         return Vec::new();
     }
-    let mut alphas = Vec::with_capacity(m);
-    let mut acc = LinExpr::constant(F128::ONE);
-    for _ in 0..m {
-        alphas.push(acc.clone());
-        if alphas.len() < m {
-            acc = if alphas.len() == 1 { base.clone() } else { mul(b, &acc, base) };
+    assert_eq!(bases.len(), rlc_levels(m), "one carry cell per RLC level");
+    let mut tables: Vec<Vec<LinExpr>> = Vec::with_capacity(bases.len());
+    for (j, c) in bases.iter().enumerate() {
+        let digits = if bases.len() == 1 {
+            m
+        } else {
+            RLC_LEVEL_BASE.min((m - 1) / RLC_LEVEL_BASE.pow(j as u32) + 1)
+        };
+        let mut table = Vec::with_capacity(digits);
+        let mut acc = LinExpr::constant(F128::ONE);
+        for k in 0..digits {
+            table.push(acc.clone());
+            if k + 1 < digits {
+                acc = if k == 0 { c.clone() } else { mul(b, &acc, c) };
+            }
         }
+        tables.push(table);
     }
-    alphas
+    if bases.len() == 1 {
+        return tables.pop().expect("single level");
+    }
+    (0..m)
+        .map(|i| {
+            let mut w = tables[0][i % RLC_LEVEL_BASE].clone();
+            let mut x = i / RLC_LEVEL_BASE;
+            for table in &tables[1..] {
+                let d = x % RLC_LEVEL_BASE;
+                x /= RLC_LEVEL_BASE;
+                if d > 0 {
+                    w = mul(b, &w, &table[d]);
+                }
+            }
+            w
+        })
+        .collect()
 }
 
 /// Discharge K owner-authorization killshots IN-TRACE in ONE builder, replaying
@@ -1543,9 +1572,10 @@ fn owner_alpha_powers(b: &mut FieldR1csBuilder, base: &LinExpr, m: usize) -> Vec
 /// caller to thread through the link's public IO. The wallet-PCS discharge
 /// consumes the obligations UNCHANGED.
 ///
-/// Challenge order in the walk-C carry cells (`5·num_vars + 3` total, class-
-/// fixed by `owner_auth_channel_schedule`):
-///   `[rho×nv, r_prime×nv, delta, r_double_prime×nv, boundary_alpha,
+/// Challenge order in the walk-C carry cells (`5·num_vars + 2 + L_b` total
+/// with `L_b = rlc_levels(boundary constraints)`, class-fixed by
+/// `owner_auth_channel_schedule`):
+///   `[rho×nv, r_prime×nv, delta, r_double_prime×nv, boundary_bases×L_b,
 ///     boundary_point×nv, batch_alpha, r_B×nv]`.
 /// The fold outputs `r_prime` / `r_double_prime` / `boundary_point` / `r_B` are
 /// the REVERSE of their per-round challenge order (matching the inline twin).
@@ -1600,7 +1630,15 @@ pub fn discharge_owner_auth_killshots_via_region(
         let dcols = build_duplex_columns(&chan_layout, iv_c, &schedule.data_flat, block_log_c);
         let chal_w: Vec<LinExpr> =
             dcols.challenges.iter().map(|&v| LinExpr::from_wire(b.alloc_f128(v))).collect();
-        assert_eq!(chal_w.len(), 5 * nv + 3, "owner-auth channel challenge count");
+        // The boundary constraint count is the class parameter
+        // `padded_slots · 4` (the schedule extractor draws the same count).
+        let lb_expected =
+            noid_gkr::batch_eval::rlc_levels(trace_inputs[tx].layout.padded_slots * 4);
+        assert_eq!(
+            chal_w.len(),
+            5 * nv + 2 + lb_expected,
+            "owner-auth channel challenge count"
+        );
 
         // ----- Unified state sumcheck: rho + per-round folds from chal_w.
         let rho: Vec<LinExpr> = chal_w[0..nv].to_vec();
@@ -1654,15 +1692,18 @@ pub fn discharge_owner_auth_killshots_via_region(
         let rhs = mul(b, &w_at_r, &proof_t.shift_state_at_r2);
         pin_zero(b, &expected.add(&rhs));
 
-        // ----- Boundary sumcheck: alpha + per-round folds from chal_w.
+        // ----- Boundary sumcheck: the RLC level draws + per-round folds
+        // from chal_w (rlc_levels(constraints) cells — 1 at every standard
+        // class, 2 once a class exceeds 64 boundary constraints).
         let constraints = owner_boundary_constraints(b, inputs_t, layout);
-        let boundary_alpha = chal_w[3 * nv + 1].clone();
-        let alphas = owner_alpha_powers(b, &boundary_alpha, constraints.len());
+        let lb = noid_gkr::batch_eval::rlc_levels(constraints.len());
+        let boundary_bases: Vec<LinExpr> = (0..lb).map(|j| chal_w[3 * nv + 1 + j].clone()).collect();
+        let alphas = owner_rlc_weights(b, &boundary_bases, constraints.len());
         let target = owner_boundary_target(b, &constraints, &alphas);
         let mut expected = target;
         let mut boundary_point: Vec<LinExpr> = Vec::with_capacity(nv);
         for round in 0..nv {
-            let challenge = chal_w[3 * nv + 2 + round].clone();
+            let challenge = chal_w[3 * nv + 1 + lb + round].clone();
             expected =
                 proof_t.boundary_round_polys[round].evaluate(b, &expected.clone(), &challenge);
             boundary_point.push(challenge);
@@ -1679,15 +1720,15 @@ pub fn discharge_owner_auth_killshots_via_region(
             proof_t.boundary_state_at_r.clone(),
         ];
         let claim_points = [main_red.r_prime.clone(), r_double_prime, boundary_point];
-        let batch_alpha = chal_w[4 * nv + 2].clone();
-        let batch_alphas = owner_alpha_powers(b, &batch_alpha, 3);
+        let batch_alpha = chal_w[4 * nv + 1 + lb].clone();
+        let batch_alphas = owner_rlc_weights(b, std::slice::from_ref(&batch_alpha), 3);
         let mut claim = claim_values[0].clone();
         for i in 1..3 {
             claim = claim.add(&mul(b, &batch_alphas[i], &claim_values[i]));
         }
         let mut r_b: Vec<LinExpr> = Vec::with_capacity(nv);
         for round in 0..nv {
-            let challenge = chal_w[4 * nv + 3 + round].clone();
+            let challenge = chal_w[4 * nv + 2 + lb + round].clone();
             claim = proof_t.batch.rounds[round].evaluate(b, &claim.clone(), &challenge);
             r_b.push(challenge);
         }
