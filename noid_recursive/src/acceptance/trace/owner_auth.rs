@@ -203,8 +203,6 @@ pub struct OwnerAuthProofTrace {
     /// killshot channel and consumed by the pending PCS obligation.
     pub commitment_cap_lanes: Vec<[LinExpr; 2]>,
     pub commitment_log_rows: usize,
-    pub commitment_n_cols: usize,
-    pub commitment_hash_backend: u128,
 }
 
 impl OwnerAuthProofTrace {
@@ -221,10 +219,9 @@ impl OwnerAuthProofTrace {
             layout.num_vars,
             "proof off shape"
         );
-        // Native rejects `hash_backend != Arithmetic` / wrong log_rows —
-        // shape-assert here (they are absorbed as constants below).
+        // Native rejects a wrong log_rows — shape-assert here (it is
+        // absorbed as a constant below).
         assert_eq!(native.pcs.commitment.log_rows, layout.num_vars, "proof off shape");
-        assert_eq!(native.pcs.commitment.n_cols, 1, "proof off shape");
         Self {
             main_round_polys: main
                 .round_polys
@@ -249,6 +246,9 @@ impl OwnerAuthProofTrace {
                 .collect(),
             boundary_state_at_r: alloc_block(b, native.boundary.state_at_r),
             batch: BatchEvalProofTrace::alloc(b, &native.batch, layout.num_vars),
+            // Capsule digests are FLAT-basis lanes absorbed flat→tower by
+            // the native channel, so each wire's flat value IS the raw
+            // digest half (== the region tree column cell).
             commitment_cap_lanes: native
                 .pcs
                 .commitment
@@ -256,14 +256,16 @@ impl OwnerAuthProofTrace {
                 .hashes
                 .iter()
                 .map(|h| {
-                    let lo = Block128::from(u128::from_le_bytes(h[..16].try_into().unwrap()));
-                    let hi = Block128::from(u128::from_le_bytes(h[16..].try_into().unwrap()));
-                    [alloc_block(b, lo), alloc_block(b, hi)]
+                    use noid_core::hardware::flat_to_tower_u128;
+                    let lo = flat_to_tower_u128(u128::from_le_bytes(h[..16].try_into().unwrap()));
+                    let hi = flat_to_tower_u128(u128::from_le_bytes(h[16..].try_into().unwrap()));
+                    [
+                        alloc_block(b, Block128::from(lo)),
+                        alloc_block(b, Block128::from(hi)),
+                    ]
                 })
                 .collect(),
             commitment_log_rows: native.pcs.commitment.log_rows,
-            commitment_n_cols: native.pcs.commitment.n_cols,
-            commitment_hash_backend: native.pcs.commitment.hash_backend.as_u128(),
         }
     }
 }
@@ -328,8 +330,6 @@ fn absorb_auth_mle_commitment_trace(
     const AUTH_PCS_COMMIT_TAG: u128 = 0xA07D_6B12_C011_17ED_u128;
     ch.absorb_const_tower(b, AUTH_PCS_COMMIT_TAG);
     ch.absorb_const_tower(b, proof.commitment_log_rows as u128);
-    ch.absorb_const_tower(b, proof.commitment_n_cols as u128);
-    ch.absorb_const_tower(b, proof.commitment_hash_backend);
     ch.absorb_const_tower(b, proof.commitment_cap_lanes.len() as u128);
     for lanes in &proof.commitment_cap_lanes {
         ch.absorb(b, &lanes[0]);

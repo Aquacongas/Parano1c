@@ -38,6 +38,8 @@
 
 pub mod encode_kernel;
 pub mod family;
+pub mod capsule_leaf;
+pub mod ff_merkle;
 pub mod leaf_hash;
 pub mod relations;
 pub mod schedule;

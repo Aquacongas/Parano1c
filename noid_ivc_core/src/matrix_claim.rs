@@ -751,7 +751,7 @@ mod tests {
         let mut ch = FsLaneChallenger::new(b"fold-mut");
         let (proof, _) = prove_matrix_claim_fold(&r1cs, &fresh, &acc_in, true, &mut ch);
 
-        let mut check = |bad: &MatrixFoldProof| {
+        let check = |bad: &MatrixFoldProof| {
             let mut ch = FsLaneChallenger::new(b"fold-mut");
             match verify_matrix_claim_fold(7, 6, &fresh, &acc_in, F128::ONE, bad, &mut ch) {
                 Err(_) => true,

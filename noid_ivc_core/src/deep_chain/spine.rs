@@ -444,7 +444,7 @@ mod tests {
         verify_shift_discharge, window_discharge_point, RelationColumns,
     };
     use crate::deep_chain::schedule::carry_selection_terms;
-    use crate::deep_chain::source_tree::{source_tree_refs, source_tree_substitution_terms};
+    use crate::deep_chain::source_tree::source_tree_substitution_terms;
     use crate::deep_chain::{prove_deep_chain_walk, verify_deep_chain_walk, LaneClaimGroup};
     use crate::lincheck::build_eq_table;
     use noid_core::{Block128, TowerField};

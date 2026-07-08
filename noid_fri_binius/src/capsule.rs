@@ -55,7 +55,7 @@
 //! layer is the same higher-arity round the proof-core PCS uses
 //! (`LOG_FRI_ARITY = 4`).
 
-use noid_core::hardware::tower_to_flat_u128;
+use noid_core::hardware::{flat_to_tower_u128, tower_to_flat_u128};
 use noid_core::mle::eq::eq_ind_partial_eval;
 use noid_core::mle::evaluate::evaluate_slice;
 use noid_core::{AdditiveNTT, Block128, TowerField};
@@ -289,7 +289,8 @@ pub fn capsule_tree_depth(msg_log: usize) -> usize {
 
 /// Flat-sponge leaf hash over one 16-symbol coset: absorbs the message
 /// log-size and leaf index as one meta block, then the symbols as flat
-/// lanes.
+/// lanes. The schedule is fixed-length (always 9 rate blocks) and the
+/// capacity IV is the dedicated leaf tag, so no padding flush is needed.
 pub fn capsule_leaf_hash(msg_log: usize, leaf_index: usize, syms: &[Block128]) -> SourceHash {
     debug_assert_eq!(syms.len(), CAPSULE_LEAF_SYMBOLS);
     let mut sponge = Poseidon2bFlatSponge::with_tag(TAG_CAPSLEAF);
@@ -298,7 +299,7 @@ pub fn capsule_leaf_hash(msg_log: usize, leaf_index: usize, syms: &[Block128]) -
     for s in syms {
         sponge.update(&tower_to_flat_u128(s.0).to_le_bytes());
     }
-    sponge.finalize()
+    sponge.finalize_no_pad()
 }
 
 fn build_capsule_tree(codeword: &[Block128], msg_log: usize) -> SourceHashMerkleTree {
@@ -323,11 +324,18 @@ fn build_capsule_tree(codeword: &[Block128], msg_log: usize) -> SourceHashMerkle
 // Transcript helpers
 // ---------------------------------------------------------------------------
 
+/// Absorb one 32-byte tree digest as two FIELD ELEMENTS. Capsule digests are
+/// FLAT-basis lanes (the flat sponge/compress state words), so each 16-byte
+/// half is converted flat→tower before entering the tower-lane channel: the
+/// absorbed element IS the digest lane, not its bit pattern re-read in the
+/// other basis. (The region twin replays the channel in the flat basis, where
+/// this element's lane equals the tree column cell — no per-digest basis
+/// bridge in-trace.)
 fn absorb_digest(channel: &mut Channel, h: &SourceHash) {
     let lo = u128::from_le_bytes(h[..16].try_into().unwrap());
     let hi = u128::from_le_bytes(h[16..].try_into().unwrap());
-    channel.observe_field_elem(Block128::from(lo));
-    channel.observe_field_elem(Block128::from(hi));
+    channel.observe_field_elem(Block128::from(flat_to_tower_u128(lo)));
+    channel.observe_field_elem(Block128::from(flat_to_tower_u128(hi)));
 }
 
 /// Absorb a capsule commitment (tag, shape, cap lanes) — the analogue of
@@ -395,12 +403,12 @@ pub fn capsule_commit(column: &[Block128], nv: usize) -> (CapsuleCommitment, Cap
     )
 }
 
-/// Open the committed column at `point`; `value` must equal the column's
-/// MLE evaluation there. Consumes the prover state (one opening per
-/// commitment, matching the wallet's single-use flow).
+/// Open the committed column at `point`. The caller owns the prover
+/// state's lifecycle (the wallet wipes the secret-derived encoding after
+/// its single opening).
 pub fn capsule_open(
     column: &[Block128],
-    state: CapsuleProverState,
+    state: &CapsuleProverState,
     commitment: &CapsuleCommitment,
     point: &[Block128],
     channel: &mut Channel,
@@ -776,7 +784,7 @@ mod tests {
             let point = rng_point(nv, 600 + nv as u64);
             let (commitment, state) = capsule_commit(&column, nv);
             let mut ch = Channel::new();
-            let proof = capsule_open(&column, state, &commitment, &point, &mut ch);
+            let proof = capsule_open(&column, &state, &commitment, &point, &mut ch);
             let mut chv = Channel::new();
             let got = capsule_verify(&commitment, &point, &proof, &mut chv)
                 .unwrap_or_else(|e| panic!("nv={nv} verify: {e}"));
@@ -791,7 +799,7 @@ mod tests {
         let point = rng_point(nv, 43);
         let (commitment, state) = capsule_commit(&column, nv);
         let mut ch = Channel::new();
-        let proof = capsule_open(&column, state, &commitment, &point, &mut ch);
+        let proof = capsule_open(&column, &state, &commitment, &point, &mut ch);
         assert_eq!(proof.value, evaluate_slice(&column, &point));
 
         let mut chv = Channel::new();
@@ -801,7 +809,7 @@ mod tests {
         // Determinism: byte-identical proofs on re-prove.
         let (c2, s2) = capsule_commit(&column, nv);
         let mut ch2 = Channel::new();
-        let p2 = capsule_open(&column, s2, &c2, &point, &mut ch2);
+        let p2 = capsule_open(&column, &s2, &c2, &point, &mut ch2);
         assert_eq!(proof.value, p2.value);
         assert_eq!(proof.upper_partial_evals, p2.upper_partial_evals);
         assert_eq!(proof.h_evals, p2.h_evals);
@@ -820,7 +828,7 @@ mod tests {
         let point = rng_point(nv, 78);
         let (commitment, state) = capsule_commit(&column, nv);
         let mut ch = Channel::new();
-        let proof = capsule_open(&column, state, &commitment, &point, &mut ch);
+        let proof = capsule_open(&column, &state, &commitment, &point, &mut ch);
 
         let verify = |p: &CapsuleOpeningProof| {
             let mut chv = Channel::new();

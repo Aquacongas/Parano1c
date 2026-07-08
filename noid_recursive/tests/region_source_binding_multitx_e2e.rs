@@ -22,7 +22,6 @@ use noid_ivc_core::field_circuit::{FieldR1csBuilder, LinExpr};
 use noid_ivc_core::pcs::{self, PcsParams};
 use noid_ivc_core::public_io::{IoClaimSpec, PublicIoSpec, WitnessSlice};
 
-use noid_recursive::acceptance::trace::fri_pcs::alloc_digest;
 use noid_recursive::acceptance::trace::owner_auth::PendingAuthPcsObligation;
 use noid_recursive::acceptance::trace::region_source_binding::{
     discharge_auth_pcs_obligations_via_region, RegionDischargeParams, RegionPcsClaim,
@@ -31,7 +30,6 @@ use noid_recursive::acceptance::trace::region_source_binding::{
 use noid_recursive::acceptance::trace::{alloc_block, alloc_blocks, BatchEvalReductionTrace};
 
 const NQ: usize = 4;
-const SB8_AUTH_LAYERS: usize = 2;
 const OUTER: &[u8] = b"region-source-binding-multitx-e2e";
 
 struct Rng(u64);
@@ -73,6 +71,18 @@ fn alloc_column_slice(b: &mut FieldR1csBuilder, col: &[F128], log2_len: usize) -
     (WitnessSlice { log2_len, index }, wires)
 }
 
+/// Allocate one raw-flat digest lane pair (the capsule cap lanes carry the
+/// raw flat digest halves under the flat→tower absorb convention).
+fn alloc_digest_raw(b: &mut FieldR1csBuilder, d: &[u8; 32]) -> [LinExpr; 2] {
+    let lo = u128::from_le_bytes(d[..16].try_into().unwrap());
+    let hi = u128::from_le_bytes(d[16..].try_into().unwrap());
+    let lane = |v: u128| F128 { lo: v as u64, hi: (v >> 64) as u64 };
+    [
+        LinExpr::from_wire(b.alloc_f128(lane(lo))),
+        LinExpr::from_wire(b.alloc_f128(lane(hi))),
+    ]
+}
+
 /// FLATNESS: the region wallet-PCS discharge yields the SAME number of opening
 /// claims regardless of the tx count -- the K txs' capsule families tile into ONE
 /// walk A/B/C (cost O(log domain)) and every terminal claim is class-fixed. This
@@ -80,16 +90,12 @@ fn alloc_column_slice(b: &mut FieldR1csBuilder, col: &[F128], log2_len: usize) -
 /// 255 standard (4x8) or up to 40 sweep (25x2). Build-only (no PCS prove): scan
 /// K = 1..256 and assert the claim count is CONSTANT.
 ///
-/// Measured (num_vars=9, nq=2): claims = 75 at every K; wires 4.11M @K=1 ->
-/// 12.39M @K=256 -- only ~3x for a 256x tx increase (sublinear, near-log; the
-/// walk discharges are flat, so only the per-tx capsule tiles + ~4k-row/tx
-/// algebra grow). That is the design's "attack proof ~2-3x typical, bounded", a
-/// 35x reduction from the inline replay (433M rows @255). The constant claim
-/// count is the recursion/[R] flatness the O(1) snapshot sync rests on.
+/// The constant claim count is the recursion/[R] flatness the O(1) snapshot
+/// sync rests on (wire counts are printed for the layout probe to fit).
 #[test]
 fn region_discharge_claims_flat_in_tx_count() {
     let num_vars = 9usize;
-    let params = RegionDischargeParams { nq: 2, sb8_auth_layers: 1 };
+    let params = RegionDischargeParams { nq: 2 };
     let mut ref_claims: Option<usize> = None;
     for &k in &[1usize, 2, 4, 8, 16, 64, 256] {
         let fixtures: Vec<(Vec<Block128>, BatchEvalReduction, AuthMleOpeningProof)> = (0..k)
@@ -100,7 +106,7 @@ fn region_discharge_claims_flat_in_tx_count() {
         let natives: Vec<AuthMleOpeningProof> = fixtures.iter().map(|(_, _, p)| p.clone()).collect();
         for (point, red, proof) in &fixtures {
             let cap_lanes: Vec<[LinExpr; 2]> =
-                proof.commitment.cap.hashes.iter().map(|h| alloc_digest(&mut b, h)).collect();
+                proof.commitment.cap.hashes.iter().map(|h| alloc_digest_raw(&mut b, h)).collect();
             let point_w = alloc_blocks(&mut b, point);
             let value_w = alloc_block(&mut b, red.value);
             obligations.push(PendingAuthPcsObligation {
@@ -139,7 +145,7 @@ fn region_source_binding_multitx_end_to_end() {
     for (point, red, proof) in &fixtures {
         assert_eq!(proof.commitment.log_rows, num_vars);
         let cap_lanes: Vec<[LinExpr; 2]> =
-            proof.commitment.cap.hashes.iter().map(|h| alloc_digest(&mut b, h)).collect();
+            proof.commitment.cap.hashes.iter().map(|h| alloc_digest_raw(&mut b, h)).collect();
         let point_w = alloc_blocks(&mut b, point);
         let value_w = alloc_block(&mut b, red.value);
         obligations.push(PendingAuthPcsObligation {
@@ -148,7 +154,7 @@ fn region_source_binding_multitx_end_to_end() {
             reduction: BatchEvalReductionTrace { point: point_w, value: value_w },
         });
     }
-    let params = RegionDischargeParams { nq: NQ, sb8_auth_layers: SB8_AUTH_LAYERS };
+    let params = RegionDischargeParams { nq: NQ };
 
     // ONE plural call: discharge all K txs, collect opening claims.
     let claims: Vec<RegionPcsClaim> =
@@ -237,21 +243,21 @@ fn region_source_binding_multitx_end_to_end() {
     };
     assert!(caught, "a flipped committed column lane must be caught");
 
-    // Tiling coverage: the ONE tiled source-tree exposure sumcheck must catch a
-    // corruption in ANY tree, not just tx 0. walk-A columns are allocated first
-    // and in order (CODE0, CODE1, KID0, ..), so sorting the distinct claim slices
-    // by start() puts KID0 at global index 2. Flip its node-1 cell in tx 1's tree
-    // block (the upper half of the walk-A domain for k=2): the tiled exposure
-    // (KID == C[2w+1] over ALL trees) no longer holds, so its re-pointed KID0
-    // opening breaks and the PCS rejects.
+    // Tiling coverage: the walk-B discharge must catch a corruption in ANY
+    // tx block, not just tx 0. Claimed columns sort as walk A {IN0, IN1,
+    // C0..C3} (KID unclaimed without the spine handoff), then walk B
+    // {C0..C3, E0, E1, SIB0, SIB1, D} — SIB0 is global index 12. Flip a
+    // source-leg sibling cell in TX 1's walk-B block (leg S path 0 node 0):
+    // that path no longer folds to its pinned cap lane, so the walk-B
+    // substitution's opening claim breaks and the PCS rejects.
     let mut uniq: Vec<WitnessSlice> = claims.iter().map(|c| c.slice).collect();
     uniq.sort_by_key(|s| s.start());
     uniq.dedup_by_key(|s| s.start());
-    let kid0 = uniq[2];
-    let p_col = 1usize << kid0.log2_len;
-    let tree1_node1 = kid0.start() + p_col / 2 + 1; // tx 1's tree, KID node slot 1
+    let sib0 = uniq[12];
+    let p_col = 1usize << sib0.log2_len;
+    let tx1_leg_s_node0 = sib0.start() + p_col / 2; // tx 1's walk-B block start
     let mut bad2 = z.clone();
-    bad2[tree1_node1] += F128::ONE;
+    bad2[tx1_leg_s_node0] += F128::ONE;
     let caught2 = if !r1cs.satisfies(&bad2) {
         true
     } else {
@@ -265,7 +271,7 @@ fn region_source_binding_multitx_end_to_end() {
         )
         .is_err()
     };
-    assert!(caught2, "the tiled exposure must catch a corrupted second-tree KID lane");
+    assert!(caught2, "a corrupted second-tx path sibling must be caught");
 }
 
 /// SPINE families at per-block capacity 2 WITH a ghost instance: K = 2
@@ -295,7 +301,7 @@ fn region_spine_families_multitx_with_ghosts() {
     let natives: Vec<AuthMleOpeningProof> = fixtures.iter().map(|(_, _, p)| p.clone()).collect();
     for (point, red, proof) in &fixtures {
         let cap_lanes: Vec<[LinExpr; 2]> =
-            proof.commitment.cap.hashes.iter().map(|h| alloc_digest(&mut b, h)).collect();
+            proof.commitment.cap.hashes.iter().map(|h| alloc_digest_raw(&mut b, h)).collect();
         let point_w = alloc_blocks(&mut b, point);
         let value_w = alloc_block(&mut b, red.value);
         obligations.push(PendingAuthPcsObligation {
@@ -308,7 +314,7 @@ fn region_spine_families_multitx_with_ghosts() {
     // Three synthetic spine instances (random flat statement lanes; the
     // builder is separately gated against the native tower spine).
     let mut rng = Rng(0xF00D);
-    let mut f = |rng: &mut Rng| -> F128 {
+    let f = |rng: &mut Rng| -> F128 {
         F128 { lo: rng.next_u64(), hi: rng.next_u64() }
     };
     let instances: Vec<SpineInstanceRegion> = (0..n_inst)
@@ -343,7 +349,7 @@ fn region_spine_families_multitx_with_ghosts() {
         .collect();
     let spine = SpineRegionData { instances };
 
-    let params = RegionDischargeParams { nq: 2, sb8_auth_layers: 1 };
+    let params = RegionDischargeParams { nq: 2 };
     let claims: Vec<RegionPcsClaim> = discharge_auth_pcs_obligations_via_region(
         &mut b,
         &obligations,

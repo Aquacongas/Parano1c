@@ -65,71 +65,47 @@ struct CoreAccumResult {
 #[derive(Debug, Default, Clone, Copy)]
 struct PcsPayloadStats {
     commitment_bytes: usize,
-    opening_values_bytes: usize,
-    fri_bytes: usize,
-    source_bytes: usize,
-    fri_roots: usize,
-    fri_query_pairs: usize,
-    fri_merkle_siblings: usize,
-    source_h_evals: usize,
+    opening_bytes: usize,
+    upper_evals: usize,
+    h_evals: usize,
     source_symbols: usize,
-    source_merkle_siblings: usize,
-    source_folded_roots: usize,
-    source_folded_query_pairs: usize,
-    source_folded_merkle_siblings: usize,
+    source_siblings: usize,
+    mid_symbols: usize,
+    mid_siblings: usize,
 }
 
 impl PcsPayloadStats {
     fn from_proof(proof: &OwnerAuthProofKillShot) -> Self {
-        let commitment_bytes = proof.pcs.commitment.cap.hashes.len() * 32;
-        let opening_values_bytes = proof.pcs.opening.all_openings.len() * 16;
-        let fri_bytes = proof.pcs.opening.fri_proof.byte_len();
-        let source_bytes = proof.pcs.opening.source_proof.byte_len();
-        let fri = &proof.pcs.opening.fri_proof;
-        let source = &proof.pcs.opening.source_proof;
+        let opening = &proof.pcs.opening;
         Self {
-            commitment_bytes,
-            opening_values_bytes,
-            fri_bytes,
-            source_bytes,
-            fri_roots: fri.fri_roots.len(),
-            fri_query_pairs: fri.fri_queried_symbols.iter().map(Vec::len).sum(),
-            fri_merkle_siblings: fri.fri_merkle_batch.iter().map(|b| b.siblings.len()).sum(),
-            source_h_evals: source.h_evals.len(),
-            source_symbols: source.source_symbols.len(),
-            source_merkle_siblings: source.source_merkle_batch.siblings.len(),
-            source_folded_roots: source.folded_roots.len(),
-            source_folded_query_pairs: source.folded_queried_symbols.iter().map(Vec::len).sum(),
-            source_folded_merkle_siblings: source
-                .folded_merkle_batch
-                .iter()
-                .map(|b| b.siblings.len())
-                .sum(),
+            commitment_bytes: proof.pcs.commitment.cap.hashes.len() * 32,
+            opening_bytes: opening.byte_len(),
+            upper_evals: opening.upper_partial_evals.len(),
+            h_evals: opening.h_evals.len(),
+            source_symbols: opening.source_symbols.len(),
+            source_siblings: opening.source_batch.siblings.len(),
+            mid_symbols: opening.mid_symbols.len(),
+            mid_siblings: opening.mid_batch.siblings.len(),
         }
     }
+
 
     fn add(self, other: Self) -> Self {
         Self {
             commitment_bytes: self.commitment_bytes + other.commitment_bytes,
-            opening_values_bytes: self.opening_values_bytes + other.opening_values_bytes,
-            fri_bytes: self.fri_bytes + other.fri_bytes,
-            source_bytes: self.source_bytes + other.source_bytes,
-            fri_roots: self.fri_roots + other.fri_roots,
-            fri_query_pairs: self.fri_query_pairs + other.fri_query_pairs,
-            fri_merkle_siblings: self.fri_merkle_siblings + other.fri_merkle_siblings,
-            source_h_evals: self.source_h_evals + other.source_h_evals,
+            opening_bytes: self.opening_bytes + other.opening_bytes,
+            upper_evals: self.upper_evals + other.upper_evals,
+            h_evals: self.h_evals + other.h_evals,
             source_symbols: self.source_symbols + other.source_symbols,
-            source_merkle_siblings: self.source_merkle_siblings + other.source_merkle_siblings,
-            source_folded_roots: self.source_folded_roots + other.source_folded_roots,
-            source_folded_query_pairs: self.source_folded_query_pairs
-                + other.source_folded_query_pairs,
-            source_folded_merkle_siblings: self.source_folded_merkle_siblings
-                + other.source_folded_merkle_siblings,
+            source_siblings: self.source_siblings + other.source_siblings,
+            mid_symbols: self.mid_symbols + other.mid_symbols,
+            mid_siblings: self.mid_siblings + other.mid_siblings,
         }
     }
 
+
     fn opening_payload_bytes(self) -> usize {
-        self.opening_values_bytes + self.fri_bytes + self.source_bytes
+        self.opening_bytes
     }
 }
 
@@ -302,8 +278,6 @@ fn absorb_pcs_commitment_to_channel(
 ) {
     let commitment = &proof.pcs.commitment;
     channel.absorb(Block128::from(commitment.log_rows as u128));
-    channel.absorb(Block128::from(commitment.n_cols as u128));
-    channel.absorb(Block128::from(commitment.hash_backend.as_u128()));
     channel.absorb(Block128::from(commitment.cap.hashes.len() as u128));
     for hash in &commitment.cap.hashes {
         channel_absorb_hash(channel, hash);
@@ -396,8 +370,6 @@ fn absorb_gkr_proof_fields<S: FieldSink>(sink: &mut S, proof: &OwnerAuthProofKil
 fn absorb_pcs_commitment_fields<S: FieldSink>(sink: &mut S, proof: &OwnerAuthProofKillShot) {
     let commitment = &proof.pcs.commitment;
     sink.absorb_usize(commitment.log_rows);
-    sink.absorb_usize(commitment.n_cols);
-    sink.absorb(Block128::from(commitment.hash_backend.as_u128()));
     sink.absorb_usize(commitment.cap.hashes.len());
     for hash in &commitment.cap.hashes {
         sink.absorb_hash(hash);
@@ -406,76 +378,32 @@ fn absorb_pcs_commitment_fields<S: FieldSink>(sink: &mut S, proof: &OwnerAuthPro
 
 fn absorb_pcs_opening_witness_fields<S: FieldSink>(sink: &mut S, proof: &OwnerAuthProofKillShot) {
     let opening = &proof.pcs.opening;
-    sink.absorb_usize(opening.all_openings.len());
-    for &value in &opening.all_openings {
+    sink.absorb(opening.value);
+    sink.absorb_usize(opening.upper_partial_evals.len());
+    for &value in &opening.upper_partial_evals {
         sink.absorb(value);
     }
-
-    let fri = &opening.fri_proof;
-    sink.absorb_usize(fri.upper_partial_evals.len());
-    for &value in &fri.upper_partial_evals {
+    sink.absorb_usize(opening.h_evals.len());
+    for &value in &opening.h_evals {
         sink.absorb(value);
     }
-    sink.absorb_usize(fri.sum_check_oracles.len());
-    for oracle in &fri.sum_check_oracles {
-        sink.absorb(oracle[0]);
-        sink.absorb(oracle[1]);
-    }
-    sink.absorb_usize(fri.fri_roots.len());
-    for root in &fri.fri_roots {
-        sink.absorb_hash(root);
-    }
-    sink.absorb_usize(fri.fri_queried_symbols.len());
-    for round in &fri.fri_queried_symbols {
-        sink.absorb_usize(round.len());
-        for &(left, right) in round {
-            sink.absorb(left);
-            sink.absorb(right);
-        }
-    }
-    sink.absorb_usize(fri.fri_merkle_batch.len());
-    for batch in &fri.fri_merkle_batch {
-        sink.absorb_usize(batch.siblings.len());
-        for sibling in &batch.siblings {
-            sink.absorb_hash(sibling);
-        }
-    }
-    sink.absorb_usize(fri.final_codeword.len());
-    for &value in &fri.final_codeword {
+    sink.absorb_hash(&opening.mid_root);
+    sink.absorb(Block128::from(opening.grind_nonce as u128));
+    sink.absorb_usize(opening.source_symbols.len());
+    for &value in &opening.source_symbols {
         sink.absorb(value);
     }
-
-    let source = &opening.source_proof;
-    sink.absorb_usize(source.h_evals.len());
-    for &value in &source.h_evals {
-        sink.absorb(value);
-    }
-    sink.absorb_usize(source.folded_roots.len());
-    for root in &source.folded_roots {
-        sink.absorb_hash(root);
-    }
-    sink.absorb_usize(source.source_symbols.len());
-    for &value in &source.source_symbols {
-        sink.absorb(value);
-    }
-    sink.absorb_usize(source.source_merkle_batch.siblings.len());
-    for sibling in &source.source_merkle_batch.siblings {
+    sink.absorb_usize(opening.source_batch.siblings.len());
+    for sibling in &opening.source_batch.siblings {
         sink.absorb_hash(sibling);
     }
-    sink.absorb_usize(source.folded_queried_symbols.len());
-    for layer in &source.folded_queried_symbols {
-        sink.absorb_usize(layer.len());
-        for &(left, right) in layer {
-            sink.absorb(left);
-            sink.absorb(right);
-        }
+    sink.absorb_usize(opening.mid_symbols.len());
+    for &value in &opening.mid_symbols {
+        sink.absorb(value);
     }
-    sink.absorb_usize(source.folded_merkle_batch.len());
-    for batch in &source.folded_merkle_batch {
-        sink.absorb_usize(batch.siblings.len());
-        for sibling in &batch.siblings {
-            sink.absorb_hash(sibling);
-        }
+    sink.absorb_usize(opening.mid_batch.siblings.len());
+    for sibling in &opening.mid_batch.siblings {
+        sink.absorb_hash(sibling);
     }
 }
 
@@ -691,23 +619,18 @@ fn print_accum_row(case: CaseKind, n: usize, run_equivalence_check: bool) {
         digest = accum.digest.to_u128(),
     );
     println!(
-        "      pcs split: commitment={} openings={} fri={} source={}",
+        "      pcs split: commitment={} opening={}",
         fmt_bytes(pcs_payload.commitment_bytes),
-        fmt_bytes(pcs_payload.opening_values_bytes),
-        fmt_bytes(pcs_payload.fri_bytes),
-        fmt_bytes(pcs_payload.source_bytes),
+        fmt_bytes(pcs_payload.opening_bytes),
     );
     println!(
-        "      pcs shape: fri_roots={} fri_pairs={} fri_siblings={} source_h={} source_symbols={} source_siblings={} folded_roots={} folded_pairs={} folded_siblings={}",
-        pcs_payload.fri_roots,
-        pcs_payload.fri_query_pairs,
-        pcs_payload.fri_merkle_siblings,
-        pcs_payload.source_h_evals,
+        "      pcs shape: upper={} h={} source_symbols={} source_siblings={} mid_symbols={} mid_siblings={}",
+        pcs_payload.upper_evals,
+        pcs_payload.h_evals,
         pcs_payload.source_symbols,
-        pcs_payload.source_merkle_siblings,
-        pcs_payload.source_folded_roots,
-        pcs_payload.source_folded_query_pairs,
-        pcs_payload.source_folded_merkle_siblings,
+        pcs_payload.source_siblings,
+        pcs_payload.mid_symbols,
+        pcs_payload.mid_siblings,
     );
     println!(
         "      per tx: core_accum={} full_scan={}",

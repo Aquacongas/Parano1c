@@ -2547,7 +2547,6 @@ mod tests {
     /// unsatisfiable. 0 survivors.
     #[test]
     fn verify_field_replay_rejects_all_proof_mutations() {
-        use rayon::prelude::*;
 
         let (r1cs, params, commitment, proof, _) = field_proof_fixture(7, 2, 43);
         let (out_r1cs, out_z, range, _, _) =
@@ -2571,7 +2570,6 @@ mod tests {
         use noid_ivc_core::field_r1cs::SparseFieldMatrix;
         use noid_ivc_core::public_io::{IoClaimSpec, PublicIoSpec, WitnessSlice};
         use noid_ivc_prover::field_prover::prove_field_with_public_io;
-        use rayon::prelude::*;
 
         // A verified instance whose non-constant rows are free
         // (`z_i = z_i · z_0`), so the io lanes and the claim target can be
@@ -2704,7 +2702,6 @@ mod tests {
         use noid_ivc_core::proof::FieldShape;
         use noid_ivc_core::public_io::{PublicIoSpec, WitnessSlice};
         use noid_ivc_prover::field_prover::prove_field_with_public_io;
-        use rayon::prelude::*;
 
         use crate::acceptance::trace::matrix_fold::{
             verify_matrix_claim_fold_trace, MatrixAccClaimTrace, MatrixFoldProofTrace,

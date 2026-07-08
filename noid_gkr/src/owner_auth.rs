@@ -2253,7 +2253,7 @@ mod tests {
         );
 
         let mut bad_pcs = proof;
-        bad_pcs.pcs.opening.all_openings[0] += Block128::ONE;
+        bad_pcs.pcs.opening.value += Block128::ONE;
         let mut ch_v = owner_auth_gkr_channel();
         assert!(
             verify_owner_auth_killshot(&bad_pcs, &circuit, &inputs.to_public(), &mut ch_v)

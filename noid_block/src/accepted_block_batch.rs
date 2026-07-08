@@ -1738,13 +1738,10 @@ mod tests {
         use noid_recursive::acceptance::trace::region_source_binding::RegionDischargeParams;
 
         let units = chained_std_tx_blocks(1);
-        for (nq, sb8) in [(4usize, 2usize), (2usize, 1usize)] {
+        for nq in [4usize, 2usize] {
             let cfg = BlockSlotsConfig {
                 discharge_wallet_pcs: true,
-                wallet_pcs_region: Some(RegionDischargeParams {
-                    nq,
-                    sb8_auth_layers: sb8,
-                }),
+                wallet_pcs_params: RegionDischargeParams { nq },
                 owner_auth_region: false,
                 exact_state_region: false,
                 tx_root_region: false,
@@ -1763,7 +1760,7 @@ mod tests {
             let claims = &slots.pending_wallet_pcs;
             let max_arity = claims.iter().map(|c| c.point.len()).max().unwrap_or(0);
             eprintln!(
-                "[probe] nq={nq} sb8={sb8}: block-slot wires={}, claims={}, max_arity={}, \
+                "[probe] nq={nq}: block-slot wires={}, claims={}, max_arity={}, \
                  tail_lanes={}",
                 b.num_wires(),
                 claims.len(),
@@ -1775,7 +1772,7 @@ mod tests {
 
     /// Size the region-mode block-bearing link: run the freeze (which prints
     /// the full link's used-wire count via build_link's eprintln) at a couple
-    /// of `(nq, sb8)` at a given class m, tolerating the class-shape assert so
+    /// of `nq` at a given class m, tolerating the class-shape assert so
     /// the printed size is visible even when a choice does not fit.
     #[test]
     #[ignore = "measurement helper; run explicitly to size the region link"]
@@ -1801,11 +1798,11 @@ mod tests {
             profile: Default::default(),
         };
         let units = chained_std_tx_blocks(1);
-        for (nq, sb8) in [(1usize, 1usize)] {
-            let rp = RegionDischargeParams { nq, sb8_auth_layers: sb8 };
+        for nq in [1usize] {
+            let rp = RegionDischargeParams { nq };
             let cfg = BlockSlotsConfig {
                 discharge_wallet_pcs: true,
-                wallet_pcs_region: Some(rp),
+                wallet_pcs_params: rp,
                 owner_auth_region: false,
                 exact_state_region: false,
                 tx_root_region: false,
@@ -1836,9 +1833,9 @@ mod tests {
             }));
             match r {
                 Ok((n, ma, io)) => eprintln!(
-                    "[size] nq={nq} sb8={sb8} @m={CLASS_M}: FIT  claims={n} max_arity={ma} io_len={io}"
+                    "[size] nq={nq} @m={CLASS_M}: FIT  claims={n} max_arity={ma} io_len={io}"
                 ),
-                Err(_) => eprintln!("[size] nq={nq} sb8={sb8} @m={CLASS_M}: (see wire count above)"),
+                Err(_) => eprintln!("[size] nq={nq} @m={CLASS_M}: (see wire count above)"),
             }
         }
     }
@@ -2227,13 +2224,13 @@ mod tests {
             build_block_slots_with_config, region_wallet_pcs_native, BlockSlotsConfig,
         };
         use noid_recursive::acceptance::trace::region_source_binding::RegionDischargeParams;
-        let region_params = RegionDischargeParams { nq: 2, sb8_auth_layers: 1 };
+        let region_params = RegionDischargeParams { nq: 2 };
         let units = chained_multi_tx_blocks(1, 2);
         let u = &units[0];
         let scratch = region_wallet_pcs_native(&u.inputs, region_params, false, false, false, false, None);
         let cfg = BlockSlotsConfig {
             discharge_wallet_pcs: true,
-            wallet_pcs_region: Some(region_params),
+            wallet_pcs_params: region_params,
             owner_auth_region: false,
             exact_state_region: false,
             tx_root_region: false,
@@ -2407,7 +2404,7 @@ mod tests {
         let u = &units[0];
         let cfg = BlockSlotsConfig {
             discharge_wallet_pcs: true,
-            wallet_pcs_region: Some(RegionDischargeParams { nq: 2, sb8_auth_layers: 1 }),
+            wallet_pcs_params: RegionDischargeParams { nq: 2 },
             owner_auth_region: true,
             exact_state_region: true,
             tx_root_region: true,
@@ -2560,7 +2557,7 @@ mod tests {
         let u = &units[0];
         let cfg = BlockSlotsConfig {
             discharge_wallet_pcs: true,
-            wallet_pcs_region: Some(RegionDischargeParams { nq: 2, sb8_auth_layers: 1 }),
+            wallet_pcs_params: RegionDischargeParams { nq: 2 },
             owner_auth_region: true,
             exact_state_region: true,
             tx_root_region: true,
@@ -2614,13 +2611,13 @@ mod tests {
         };
         use noid_recursive::acceptance::trace::region_source_binding::RegionDischargeParams;
 
-        let region_params = RegionDischargeParams { nq: 2, sb8_auth_layers: 1 };
+        let region_params = RegionDischargeParams { nq: 2 };
         let units = chained_std_tx_blocks(1);
         let u = &units[0];
 
         let cfg_inline = BlockSlotsConfig {
             discharge_wallet_pcs: true,
-            wallet_pcs_region: Some(region_params),
+            wallet_pcs_params: region_params,
             owner_auth_region: false,
             exact_state_region: false,
             tx_root_region: false,
@@ -2629,7 +2626,7 @@ mod tests {
         };
         let cfg_region = BlockSlotsConfig {
             discharge_wallet_pcs: true,
-            wallet_pcs_region: Some(region_params),
+            wallet_pcs_params: region_params,
             owner_auth_region: true,
             exact_state_region: false,
             tx_root_region: false,
@@ -2788,7 +2785,10 @@ mod tests {
         };
         let no_pcs = BlockSlotsConfig {
             discharge_wallet_pcs: false,
-            wallet_pcs_region: None,
+            wallet_pcs_params:
+                noid_recursive::acceptance::trace::region_source_binding::RegionDischargeParams {
+                    nq: 2,
+                },
             owner_auth_region: false,
             exact_state_region: false,
             tx_root_region: false,
@@ -3043,7 +3043,7 @@ mod tests {
         use std::time::Instant;
 
         // A region link self-hosts at 2^24; this gate proves several 2^24
-        // instances sequentially, so the caller keeps nq/sb8 small to fit the
+        // instances sequentially, so the caller keeps nq small to fit the
         // per-proof footprint (the discharge soundness/flatness are gated in
         // region_source_binding_full_e2e; here we test the IO threading + tier).
         const CLASS_M: usize = 24;
@@ -3062,7 +3062,7 @@ mod tests {
         let layout = link_io_layout_for(shape.k_log, true);
         let region_cfg = BlockSlotsConfig {
             discharge_wallet_pcs: true,
-            wallet_pcs_region: Some(region_params),
+            wallet_pcs_params: region_params,
             owner_auth_region,
             exact_state_region,
             tx_root_region,
@@ -3369,7 +3369,7 @@ mod tests {
         let units = chained_std_tx_blocks(2);
         run_region_block_bearing_gate(
             &units,
-            RegionDischargeParams { nq: 2, sb8_auth_layers: 1 },
+            RegionDischargeParams { nq: 2 },
             false,
             false,
             false,
@@ -3391,7 +3391,7 @@ mod tests {
         let units = chained_multi_tx_blocks(2, 2);
         run_region_block_bearing_gate(
             &units,
-            RegionDischargeParams { nq: 2, sb8_auth_layers: 1 },
+            RegionDischargeParams { nq: 2 },
             false,
             false,
             false,
@@ -3417,7 +3417,7 @@ mod tests {
         let units = chained_std_tx_blocks(2);
         run_region_block_bearing_gate(
             &units,
-            RegionDischargeParams { nq: 2, sb8_auth_layers: 1 },
+            RegionDischargeParams { nq: 2 },
             true,
             false,
             false,
@@ -3442,7 +3442,7 @@ mod tests {
         let units = chained_std_tx_blocks(2);
         run_region_block_bearing_gate(
             &units,
-            RegionDischargeParams { nq: 2, sb8_auth_layers: 1 },
+            RegionDischargeParams { nq: 2 },
             true,
             true,
             false,
@@ -3467,7 +3467,7 @@ mod tests {
         let units = chained_std_tx_blocks(2);
         run_region_block_bearing_gate(
             &units,
-            RegionDischargeParams { nq: 2, sb8_auth_layers: 1 },
+            RegionDischargeParams { nq: 2 },
             true,
             true,
             true,
@@ -3493,7 +3493,7 @@ mod tests {
         let units = chained_std_tx_blocks(2);
         run_region_block_bearing_gate(
             &units,
-            RegionDischargeParams { nq: 2, sb8_auth_layers: 1 },
+            RegionDischargeParams { nq: 2 },
             true,
             true,
             true,
@@ -3517,7 +3517,7 @@ mod tests {
         let units = chained_multi_tx_blocks(2, 3);
         run_region_block_bearing_gate(
             &units,
-            RegionDischargeParams { nq: 2, sb8_auth_layers: 1 },
+            RegionDischargeParams { nq: 2 },
             true,
             true,
             true,
@@ -3563,7 +3563,10 @@ mod tests {
         // byte-identical across two different real blocks.
         let no_pcs = BlockSlotsConfig {
             discharge_wallet_pcs: false,
-            wallet_pcs_region: None,
+            wallet_pcs_params:
+                noid_recursive::acceptance::trace::region_source_binding::RegionDischargeParams {
+                    nq: 2,
+                },
             owner_auth_region: false,
             exact_state_region: false,
             tx_root_region: false,
@@ -3584,16 +3587,19 @@ mod tests {
             r0.k_log
         );
 
-        // With the wallet-PCS ON, the full block still satisfies for each
-        // block, but the matrices drift — localizing the ONE unfixed
-        // component (the region-layer target).
+        // With the wallet-PCS ON (the REGION discharge — the only mode since
+        // the capsule regeometry), the FULL default-config block is also
+        // class-fixed: the region discharge derives no matrix structure from
+        // the proof's query positions. This assert used to be inverted (the
+        // deleted inline replay drifted); the whole 1-tx block trace is now
+        // one class matrix.
         let full0 = build(&units[0], BlockSlotsConfig::default(), "block 0 full");
         let full1 = build(&units[1], BlockSlotsConfig::default(), "block 1 full");
         let _ = build_block_slots; // keep the default-config entry point exercised elsewhere
         assert!(
-            full0.a_0 != full1.a_0,
-            "wallet-PCS was expected to be the drift source; if this now matches, \
-             the fixity boundary moved — update the region-layer obligation"
+            full0.a_0 == full1.a_0 && full0.b_0 == full1.b_0,
+            "full block (region wallet-PCS) matrix drifted between two real blocks — \
+             a position-derived value leaked into the class matrix"
         );
         eprintln!("[block-slots] wallet-PCS confirmed as the sole shape-drift source");
 
@@ -3627,7 +3633,7 @@ mod tests {
     }
 
     /// Class-fixity gate for the REGION wallet-PCS discharge
-    /// (`discharge_wallet_pcs` via `wallet_pcs_region`). Two DIFFERENT real
+    /// (`discharge_wallet_pcs`, region params). Two DIFFERENT real
     /// blocks of the same tier must assemble to a byte-identical FieldR1cs
     /// matrix — the recursion invariant a block-bearing link rests on. The
     /// region discharge derives its structure from the wallet proof's query
@@ -3644,10 +3650,7 @@ mod tests {
         use noid_recursive::acceptance::trace::region_source_binding::RegionDischargeParams;
         run_region_class_fixity_gate(BlockSlotsConfig {
             discharge_wallet_pcs: true,
-            wallet_pcs_region: Some(RegionDischargeParams {
-                nq: 2,
-                sb8_auth_layers: 1,
-            }),
+            wallet_pcs_params: RegionDischargeParams { nq: 2 },
             owner_auth_region: false,
             exact_state_region: false,
             tx_root_region: false,
@@ -3669,10 +3672,7 @@ mod tests {
         use noid_recursive::acceptance::trace::region_source_binding::RegionDischargeParams;
         run_region_class_fixity_gate(BlockSlotsConfig {
             discharge_wallet_pcs: true,
-            wallet_pcs_region: Some(RegionDischargeParams {
-                nq: 2,
-                sb8_auth_layers: 1,
-            }),
+            wallet_pcs_params: RegionDischargeParams { nq: 2 },
             owner_auth_region: false,
             exact_state_region: true,
             tx_root_region: false,
@@ -3694,10 +3694,7 @@ mod tests {
         use noid_recursive::acceptance::trace::region_source_binding::RegionDischargeParams;
         run_region_class_fixity_gate(BlockSlotsConfig {
             discharge_wallet_pcs: true,
-            wallet_pcs_region: Some(RegionDischargeParams {
-                nq: 2,
-                sb8_auth_layers: 1,
-            }),
+            wallet_pcs_params: RegionDischargeParams { nq: 2 },
             owner_auth_region: false,
             exact_state_region: true,
             tx_root_region: true,
@@ -3719,10 +3716,7 @@ mod tests {
         use noid_recursive::acceptance::trace::region_source_binding::RegionDischargeParams;
         run_region_class_fixity_gate(BlockSlotsConfig {
             discharge_wallet_pcs: true,
-            wallet_pcs_region: Some(RegionDischargeParams {
-                nq: 2,
-                sb8_auth_layers: 1,
-            }),
+            wallet_pcs_params: RegionDischargeParams { nq: 2 },
             owner_auth_region: false,
             exact_state_region: true,
             tx_root_region: true,
@@ -3756,7 +3750,7 @@ mod tests {
         let u = &units[0];
         let cfg = BlockSlotsConfig {
             discharge_wallet_pcs: true,
-            wallet_pcs_region: Some(RegionDischargeParams { nq: 2, sb8_auth_layers: 1 }),
+            wallet_pcs_params: RegionDischargeParams { nq: 2 },
             owner_auth_region: true,
             exact_state_region: true,
             tx_root_region: true,
@@ -3826,7 +3820,7 @@ mod tests {
             &b[0],
             BlockSlotsConfig {
                 discharge_wallet_pcs: true,
-                wallet_pcs_region: Some(RegionDischargeParams { nq: 2, sb8_auth_layers: 1 }),
+                wallet_pcs_params: RegionDischargeParams { nq: 2 },
                 owner_auth_region: true,
                 exact_state_region: true,
                 tx_root_region: true,
@@ -3947,10 +3941,19 @@ mod tests {
     /// (0 surviving mutants beyond the pin-helper class), and every
     /// statement-anchor corruption breaks it — the assembled trace binds
     /// the same relation the native verifier checks.
+    ///
+    /// The wallet-PCS discharge is OFF here: the region discharge (the only
+    /// mode) binds its committed columns through link-IO opening claims, not
+    /// block-local R1CS rows, so a block-local flip battery cannot see them
+    /// — its mutation coverage lives in the dedicated region gates
+    /// (`region_source_binding_full_e2e` / `..._multitx_e2e`, which check
+    /// the claims through the actual PCS).
     #[test]
     fn block_slots_assembly_matches_native_and_rejects_mutations() {
         use noid_ivc_core::field_circuit::FieldR1csBuilder;
-        use noid_recursive::acceptance::block_slots::build_block_slots;
+        use noid_recursive::acceptance::block_slots::{
+            build_block_slots_with_config, BlockSlotsConfig,
+        };
         use noid_recursive::block_certificate_backend::verify_accepted_block_batch_components;
 
         let (start_consensus, start_accumulator, start_parent, start_state, witness) =
@@ -3976,9 +3979,20 @@ mod tests {
         )
         .expect("native component verify accepts the fixture");
 
-        // Trace assembly of the same batch.
+        // Trace assembly of the same batch (wallet-PCS off — see the doc).
+        let no_pcs = BlockSlotsConfig {
+            discharge_wallet_pcs: false,
+            ..BlockSlotsConfig::default()
+        };
         let mut b = FieldR1csBuilder::new();
-        let slots = build_block_slots(&mut b, &start_accumulator, end_accumulator, inputs, &proof);
+        let slots = build_block_slots_with_config(
+            &mut b,
+            &start_accumulator,
+            end_accumulator,
+            inputs,
+            &proof,
+            no_pcs,
+        );
         // The projection lanes are the receipt↔header anchors the link
         // exposes; sanity-check the count.
         assert_eq!(slots.projection_lanes().len(), 12);
@@ -4008,7 +4022,14 @@ mod tests {
         bad_end.chain_hash[0] ^= 0xA5;
         bad_end.chain_hash[17] ^= 0x5A;
         let mut b2 = FieldR1csBuilder::new();
-        let _ = build_block_slots(&mut b2, &start_accumulator, &bad_end, inputs, &proof);
+        let _ = build_block_slots_with_config(
+            &mut b2,
+            &start_accumulator,
+            &bad_end,
+            inputs,
+            &proof,
+            no_pcs,
+        );
         let (r1cs2, z2) = b2.build();
         assert!(
             !r1cs2.satisfies(&z2),

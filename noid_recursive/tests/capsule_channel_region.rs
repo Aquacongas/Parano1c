@@ -10,17 +10,15 @@
 //!    columns' challenge cells carry the same values in the flat basis.
 
 use noid_core::mle::evaluate::evaluate_slice;
-use noid_core::{AdditiveNTT, Block128};
+use noid_core::Block128;
 use noid_fri::Channel;
-use noid_fri_binius::verify_mixed_opening;
-use noid_fri_binius::COMPACT_NUM_QUERIES;
+use noid_fri_binius::capsule::capsule_verify;
 use noid_gkr::auth_pcs::{commit_auth_mle_column, open_auth_mle_committed};
 use noid_gkr::batch_eval::BatchEvalReduction;
 use noid_ivc_core::deep_chain::schedule::{
     build_duplex_columns, compile_duplex, flat_of_tower_u128, LaneSource, TranscriptOp,
 };
 use noid_ivc_core::field::F128;
-use noid_poseidon2b::native::compression::Poseidon2bSponge;
 use noid_poseidon2b::native::domain::{capacity_iv, TAG_FRICHANL};
 use noid_recursive::acceptance::region::capsule_pcs_channel_schedule;
 
@@ -137,35 +135,27 @@ fn capsule_fixture(num_vars: usize, seed: u64) -> (BatchEvalReduction, noid_gkr:
 }
 
 /// The extractor's op list replayed on a fresh channel reaches the same
-/// post-state as the REAL `verify_mixed_opening` run — same absorb bytes,
-/// same squeeze count — and the region chain squeezes the same
-/// challenges. Two capsule shapes (n_rounds = 1 and 3).
+/// post-state as the REAL `capsule_verify` run — same absorb bytes, same
+/// squeeze count — and the region chain squeezes the same challenges. Two
+/// capsule shapes (low_vars = 1 and 3).
 #[test]
-fn capsule_schedule_matches_verify_mixed_opening() {
+fn capsule_schedule_matches_capsule_verify() {
     for (num_vars, seed) in [(9usize, 0xA9u64), (11, 0xB11)] {
         let (reduction, proof) = capsule_fixture(num_vars, seed);
 
         // The real verifier path (mirrors verify_auth_mle_opening).
-        let ntt = AdditiveNTT::<Block128>::new(num_vars + noid_fri::code::LOG_RATE);
-        let hasher = Poseidon2bSponge::new();
         let mut real_channel = Channel::new();
-        noid_fri_binius::absorb_cap(&mut real_channel, &proof.commitment.cap);
-        let openings = verify_mixed_opening(
+        let value = capsule_verify(
             &proof.commitment,
             &reduction.point,
-            &[],
             &proof.opening,
-            &ntt,
             &mut real_channel,
-            &hasher,
-            COMPACT_NUM_QUERIES,
         )
         .expect("honest capsule opening verifies");
-        assert_eq!(openings, vec![reduction.value]);
+        assert_eq!(value, reduction.value);
 
         // The extracted schedule replayed on a fresh channel.
-        let schedule =
-            capsule_pcs_channel_schedule(&proof, num_vars, &reduction.point, COMPACT_NUM_QUERIES);
+        let schedule = capsule_pcs_channel_schedule(&proof, num_vars, &reduction.point);
         let replay_challenges = {
             let mut channel = Channel::new();
             let mut cursor = 0usize;
@@ -196,7 +186,7 @@ fn capsule_schedule_matches_verify_mixed_opening() {
             assert_eq!(
                 channel.get_random_point(),
                 real_channel.get_random_point(),
-                "nv={num_vars}: schedule diverged from verify_mixed_opening"
+                "nv={num_vars}: schedule diverged from capsule_verify"
             );
             challenges
         };
@@ -262,8 +252,7 @@ fn capsule_schedule_matches_verify_mixed_opening() {
 #[test]
 fn capsule_layout_shape_facts() {
     let (reduction, proof) = capsule_fixture(9, 0xFAC7);
-    let schedule =
-        capsule_pcs_channel_schedule(&proof, 9, &reduction.point, COMPACT_NUM_QUERIES);
+    let schedule = capsule_pcs_channel_schedule(&proof, 9, &reduction.point);
     let layout = compile_duplex(&schedule.ops);
     // Every challenge maps to lane 0 or 1 of some slot.
     for &(slot, lane) in &layout.challenges {

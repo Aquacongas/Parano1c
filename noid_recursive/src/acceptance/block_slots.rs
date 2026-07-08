@@ -72,7 +72,6 @@ use super::trace::accepted_claim_batch::{
     build_accepted_claim_batch_claim_slot, digest_lanes, AccumulatorWires, ClaimBatchStepWires,
 };
 use super::trace::accepted_claim_hash::{build_accepted_claim_hash_slot, AcceptedClaimHashInputsTrace};
-use super::trace::auth_pcs::discharge_auth_pcs_obligation;
 use super::trace::region_source_binding::{
     discharge_auth_pcs_obligations_via_region, discharge_owner_auth_killshots_via_region,
     RegionDischargeParams, RegionPcsClaim, SpineInstanceRegion, SpineRegionData,
@@ -673,7 +672,7 @@ pub struct BlockSlots {
     pub live_bits: Vec<LinExpr>,
     pub exact_state: ExactStateSlotWires,
     /// Committed-column opening claims emitted by the region wallet-PCS
-    /// discharge (empty unless `BlockSlotsConfig::wallet_pcs_region` was set).
+    /// discharge (empty unless `BlockSlotsConfig::discharge_wallet_pcs` was set).
     /// The link threads these into its public-IO (`spec.claims` + `io`).
     pub pending_wallet_pcs: Vec<RegionPcsClaim>,
 }
@@ -713,14 +712,15 @@ pub struct BlockSlotsConfig {
     /// reduced PCS claim is left undischarged — for shape experiments and
     /// the region-layer transition, never for a complete proof.
     pub discharge_wallet_pcs: bool,
-    /// When `Some`, discharge the wallet-PCS via the SHAPE-FIXED region layer
-    /// (`discharge_auth_pcs_obligation_via_region`) instead of the inline
-    /// compact-FRI replay. The region discharge is class-fixed (its trace
-    /// structure does NOT drift with the proof), and it emits committed-column
-    /// opening claims collected into [`BlockSlots::pending_wallet_pcs`] for the
-    /// link to thread through public-IO. `None` = the inline discharge. Only
-    /// consulted when `discharge_wallet_pcs` is true.
-    pub wallet_pcs_region: Option<RegionDischargeParams>,
+    /// Parameters of the SHAPE-FIXED region wallet-PCS discharge
+    /// (`discharge_auth_pcs_obligation_via_region`) — the ONLY wallet-PCS
+    /// mode (the inline compact-FRI replay was deleted with the capsule
+    /// regeometry). The region discharge is class-fixed (its trace structure
+    /// does NOT drift with the proof), and it emits committed-column opening
+    /// claims collected into [`BlockSlots::pending_wallet_pcs`] for the link
+    /// to thread through public-IO. Only consulted when
+    /// `discharge_wallet_pcs` is true.
+    pub wallet_pcs_params: RegionDischargeParams,
     /// When true, verify the block's owner-authorization killshots via the
     /// SHAPE-FIXED region KSCHANNL walk-C discharge
     /// (`discharge_owner_auth_killshots_via_region`) instead of the inline
@@ -728,7 +728,7 @@ pub struct BlockSlotsConfig {
     /// KSCHANNL transcripts on ONE tiled data-parallel walk, so owner-auth
     /// verification (the dominant per-tx [K] piece) is transaction-count flat.
     ///
-    /// REQUIRES `wallet_pcs_region.is_some()`: the region owner-auth discharge
+    /// REQUIRES `discharge_wallet_pcs`: the region owner-auth discharge
     /// PRODUCES the [`super::trace::owner_auth::PendingAuthPcsObligation`]s that
     /// the wallet-PCS region discharge then CONSUMES, and its own walk-C
     /// committed-column opening claims (which bind the owner-auth transcript)
@@ -745,7 +745,7 @@ pub struct BlockSlotsConfig {
     /// inline. Region mode ALSO closes the exact-state internal-wiring residue
     /// (leaf↔path↔root — see the module doc).
     ///
-    /// REQUIRES `wallet_pcs_region.is_some()`: the exact-state families ride
+    /// REQUIRES `discharge_wallet_pcs`: the exact-state families ride
     /// the wallet-PCS region walks (a new walk is never spawned), so the plural
     /// discharge must run. `false` = the inline killshot replays.
     pub exact_state_region: bool,
@@ -757,7 +757,7 @@ pub struct BlockSlotsConfig {
     /// path's right-hand sibling cells to the zero-subtree constants — exactly
     /// the bindings the inline slot pins on its statement wires.
     ///
-    /// REQUIRES `wallet_pcs_region.is_some()` (the leg rides walk B).
+    /// REQUIRES `discharge_wallet_pcs` (the leg rides walk B).
     /// `false` = the inline killshot replay.
     pub tx_root_region: bool,
     /// When true, verify every transaction's 59-permutation tx-body spine via
@@ -772,7 +772,7 @@ pub struct BlockSlotsConfig {
     /// the same wires the tx-root leg and the owner-auth statements consume,
     /// so downstream bindings are untouched.
     ///
-    /// REQUIRES `wallet_pcs_region.is_some()` (the families ride walk A).
+    /// REQUIRES `discharge_wallet_pcs` (the families ride walk A).
     /// `false` = the inline killshot replay.
     pub spine_region: bool,
     /// When `Some(cap)`, assemble the block at its consensus-tier USER-TX
@@ -801,7 +801,9 @@ impl Default for BlockSlotsConfig {
     fn default() -> Self {
         Self {
             discharge_wallet_pcs: true,
-            wallet_pcs_region: None,
+            wallet_pcs_params: RegionDischargeParams {
+                nq: noid_fri_binius::capsule::CAPSULE_NUM_QUERIES,
+            },
             owner_auth_region: false,
             exact_state_region: false,
             tx_root_region: false,
@@ -866,23 +868,23 @@ pub fn build_block_slots_with_config(
         inputs.authorization_totals.user_tx_count
     );
     assert!(
-        !config.exact_state_region || config.wallet_pcs_region.is_some(),
-        "exact_state_region requires wallet_pcs_region (the exact-state families \
+        !config.exact_state_region || config.discharge_wallet_pcs,
+        "exact_state_region requires the wallet-PCS discharge (the exact-state families \
          ride the wallet-PCS region walks; a new walk is never spawned)"
     );
     assert!(
-        !config.tx_root_region || config.wallet_pcs_region.is_some(),
-        "tx_root_region requires wallet_pcs_region (the tx-root leg rides the \
+        !config.tx_root_region || config.discharge_wallet_pcs,
+        "tx_root_region requires the wallet-PCS discharge (the tx-root leg rides the \
          wallet-PCS region walk B; a new walk is never spawned)"
     );
     assert!(
-        !config.spine_region || config.wallet_pcs_region.is_some(),
-        "spine_region requires wallet_pcs_region (the spine families ride the \
+        !config.spine_region || config.discharge_wallet_pcs,
+        "spine_region requires the wallet-PCS discharge (the spine families ride the \
          wallet-PCS region walk A; a new walk is never spawned)"
     );
     if let Some(cap) = config.tier_user_tx_capacity {
         assert!(
-            config.wallet_pcs_region.is_some()
+            config.discharge_wallet_pcs
                 && config.owner_auth_region
                 && config.exact_state_region
                 && config.tx_root_region
@@ -1256,15 +1258,10 @@ pub fn build_block_slots_with_config(
             // the config assert requires the full region stack).
             let (inputs_t, obligation) = build_owner_auth_slot(b, witness_proof, public_native);
             if config.discharge_wallet_pcs {
-                match config.wallet_pcs_region {
-                    // Inline compact-FRI replay (proof-dependent shape).
-                    None => discharge_auth_pcs_obligation(b, &obligation, &witness_proof.pcs),
-                    // Shape-fixed region discharge: defer to ONE tiled call below.
-                    Some(_) => {
-                        region_obligations.push(obligation);
-                        region_natives.push(witness_proof.pcs.clone());
-                    }
-                }
+                // Shape-fixed region discharge: defer to ONE tiled call below
+                // (the region layer is the ONLY wallet-PCS mode).
+                region_obligations.push(obligation);
+                region_natives.push(witness_proof.pcs.clone());
             }
             pin_eq2(b, &inputs_t.tx_body_hash, &tx_hashes[hash_idx]);
             owner_counts.push(inputs_t.owner_count.clone());
@@ -1282,8 +1279,8 @@ pub fn build_block_slots_with_config(
     // are actually discharged (a complete proof).
     if config.owner_auth_region {
         assert!(
-            config.wallet_pcs_region.is_some(),
-            "owner_auth_region requires wallet_pcs_region (the produced obligation must be discharged)"
+            config.discharge_wallet_pcs,
+            "owner_auth_region requires the wallet-PCS discharge (the produced obligation must be discharged)"
         );
         let (obligations, oa_claims) = discharge_owner_auth_killshots_via_region(
             b,
@@ -1300,7 +1297,8 @@ pub fn build_block_slots_with_config(
     // column opening claims are flat in tx count, threading through the link's
     // public IO. `k` = tx count must be a power of two (the plural asserts it; a
     // tier pads its real txs to next_pow2 with ghost obligations).
-    if let Some(params) = config.wallet_pcs_region {
+    if config.discharge_wallet_pcs {
+        let params = config.wallet_pcs_params;
         if config.exact_state_region || config.tx_root_region || config.spine_region {
             // The exact-state / tx-root / spine families ride the plural
             // discharge's walks; a block-bearing region class always carries

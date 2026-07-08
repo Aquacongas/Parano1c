@@ -464,7 +464,7 @@ impl LinkClass {
         match self.region_params {
             Some(params) => BlockSlotsConfig {
                 discharge_wallet_pcs: true,
-                wallet_pcs_region: Some(params),
+                wallet_pcs_params: params,
                 owner_auth_region: self.owner_auth_region,
                 exact_state_region: self.exact_state_region,
                 tx_root_region: self.tx_root_region,
@@ -930,7 +930,7 @@ fn freeze_region_block_bearing(
 ) -> LinkClass {
     let region_cfg = BlockSlotsConfig {
         discharge_wallet_pcs: true,
-        wallet_pcs_region: Some(region_params),
+        wallet_pcs_params: region_params,
         owner_auth_region,
         exact_state_region,
         tx_root_region,

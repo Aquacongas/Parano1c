@@ -2,11 +2,11 @@
 // Copyright (C) 2026 Paranoid Zero.
 
 //! Wallet-PCS region-discharge LAYOUT PROBE: exact wire/claim costs of the
-//! plural discharge at the TEST parameters the heavy gates run
-//! (`nq = 2, sb8_auth_layers = 1`) versus the PRODUCTION parameters the link
-//! must ship (`nq = COMPACT_NUM_QUERIES, sb8_auth_layers = tau - 1` — every
-//! capsule query and every high-fold layer authenticated; anything less
-//! leaves unauthenticated openings a fake-history prover can forge).
+//! plural discharge at the TEST parameters the heavy gates run (`nq = 2`)
+//! versus the PRODUCTION parameters the link must ship
+//! (`nq = CAPSULE_NUM_QUERIES` — every capsule query authenticated on both
+//! trees; anything less leaves unauthenticated openings a fake-history
+//! prover can forge).
 //!
 //! Measures REAL builds at k = 1 / 2 / 4 obligations and fits the exact cost
 //! model (committed walk columns + per-tx pins are LINEAR in k; the three
@@ -23,13 +23,12 @@
 //! ```
 
 use noid_core::Block128;
-use noid_fri_binius::{COMPACT_NUM_QUERIES, COMPACT_TAU};
+use noid_fri_binius::capsule::{CAPSULE_NUM_QUERIES, CAPSULE_TAU};
 use noid_gkr::auth_pcs::{commit_auth_mle_column, open_auth_mle_committed, AuthMleOpeningProof};
 use noid_gkr::batch_eval::BatchEvalReduction;
 
 use noid_ivc_core::field_circuit::{FieldR1csBuilder, LinExpr};
 
-use noid_recursive::acceptance::trace::fri_pcs::alloc_digest;
 use noid_recursive::acceptance::trace::owner_auth::PendingAuthPcsObligation;
 use noid_recursive::acceptance::trace::region_source_binding::{
     discharge_auth_pcs_obligations_via_region, RegionDischargeParams,
@@ -39,6 +38,19 @@ use noid_recursive::acceptance::trace::{alloc_block, alloc_blocks, BatchEvalRedu
 /// The real wallet auth-MLE width (`AUTH_PCS_BASE_LOG`): standard txs commit
 /// a 2^9 column, so the capsule shape here IS the production shape.
 const WALLET_NUM_VARS: usize = 9;
+
+/// Allocate one raw-flat digest lane pair (the capsule cap lanes carry the
+/// raw flat digest halves under the flat→tower absorb convention).
+fn alloc_digest_raw(b: &mut FieldR1csBuilder, d: &[u8; 32]) -> [LinExpr; 2] {
+    use noid_ivc_core::field::F128;
+    let lo = u128::from_le_bytes(d[..16].try_into().unwrap());
+    let hi = u128::from_le_bytes(d[16..].try_into().unwrap());
+    let lane = |v: u128| F128 { lo: v as u64, hi: (v >> 64) as u64 };
+    [
+        LinExpr::from_wire(b.alloc_f128(lane(lo))),
+        LinExpr::from_wire(b.alloc_f128(lane(hi))),
+    ]
+}
 
 struct Rng(u64);
 impl Rng {
@@ -84,7 +96,7 @@ fn measure(k: usize, params: RegionDischargeParams) -> Measured {
     let mut natives = Vec::with_capacity(k);
     for (point, red, proof) in &fixtures {
         let cap_lanes: Vec<[LinExpr; 2]> =
-            proof.commitment.cap.hashes.iter().map(|h| alloc_digest(&mut b, h)).collect();
+            proof.commitment.cap.hashes.iter().map(|h| alloc_digest_raw(&mut b, h)).collect();
         let point_w = alloc_blocks(&mut b, point);
         let value_w = alloc_block(&mut b, red.value);
         obligations.push(PendingAuthPcsObligation {
@@ -149,18 +161,15 @@ fn fit_and_report(label: &str, ms: &[Measured]) {
 #[test]
 #[ignore = "layout probe (multi-million-wire builds at the production point); run explicitly"]
 fn region_4f_layout_probe() {
-    let tau = COMPACT_TAU.min(WALLET_NUM_VARS);
-    let full_layers = tau - 1;
-    let test_params = RegionDischargeParams { nq: 2, sb8_auth_layers: 1 };
-    let prod_params =
-        RegionDischargeParams { nq: COMPACT_NUM_QUERIES, sb8_auth_layers: full_layers };
+    let test_params = RegionDischargeParams { nq: 2 };
+    let prod_params = RegionDischargeParams { nq: CAPSULE_NUM_QUERIES };
     println!(
-        "[probe] wallet num_vars = {WALLET_NUM_VARS}, tau = {tau}; TEST params: nq = {}, \
-         sb8 = {}; PRODUCTION params: nq = {}, sb8 = {} (all queries + all fold layers)",
-        test_params.nq, test_params.sb8_auth_layers, prod_params.nq, prod_params.sb8_auth_layers
+        "[probe] wallet num_vars = {WALLET_NUM_VARS}, tau = {CAPSULE_TAU}; TEST params: nq = {}; \
+         PRODUCTION params: nq = {} (all queries, both trees)",
+        test_params.nq, prod_params.nq
     );
 
-    for (label, params) in [("test-nq2-sb1", test_params), ("PROD-nq64-sb7", prod_params)] {
+    for (label, params) in [("test-nq2", test_params), ("PROD-nq-full", prod_params)] {
         let mut ms = Vec::new();
         for k in [1usize, 2, 4] {
             let t0 = std::time::Instant::now();

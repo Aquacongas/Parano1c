@@ -18,11 +18,9 @@
 //! deep-chain walk replays the same permutation on flat values.
 
 use noid_core::Block128;
-use noid_fri_binius::compact_fri::compute_round_depth;
-use noid_fri_binius::mixed_open::{
-    high_pair_tree_depth, use_direct_source_expansion, MIXED_OPEN_TAG, MIXED_SOURCE_BINDING_TAG,
+use noid_fri_binius::capsule::{
+    CAPSULE_CAP_DEPTH, CAPSULE_NUM_QUERIES, CAPSULE_TAU,
 };
-use noid_fri_binius::COMPACT_TAU;
 use noid_gkr::auth_pcs::AuthMleOpeningProof;
 use noid_gkr::owner_auth::{
     OwnerAuthProofKillShot, OwnerAuthPublicInputs, OWNER_AUTH_BOUNDARY_DOMAIN_TAG,
@@ -59,114 +57,97 @@ impl ChannelSchedule {
         None
     }
 
+    /// Two data lanes of one 32-byte capsule tree digest. Capsule digests
+    /// are FLAT-basis lanes and the native channels absorb them converted
+    /// flat→tower (the absorbed element IS the digest lane), so the flat
+    /// data stream carries the raw digest halves — equal to the tree
+    /// column cells, with no per-digest basis bridge in-trace.
     fn hash_lanes(&mut self, h: &[u8; 32]) -> [Option<u128>; 2] {
-        let a = Block128::from(u128::from_le_bytes(h[..16].try_into().unwrap()));
-        let b = Block128::from(u128::from_le_bytes(h[16..].try_into().unwrap()));
+        use noid_core::hardware::flat_to_tower_u128;
+        let lo = u128::from_le_bytes(h[..16].try_into().unwrap());
+        let hi = u128::from_le_bytes(h[16..].try_into().unwrap());
+        let a = Block128::from(flat_to_tower_u128(lo));
+        let b = Block128::from(flat_to_tower_u128(hi));
         [self.data_lane(a), self.data_lane(b)]
     }
 }
 
+/// Domain tags mirrored from `noid_fri_binius::capsule` (private there:
+/// `absorb_capsule_commitment`'s commit tag and the opening tag). A change
+/// to a native constant changes these in the same commit; the differential
+/// gate catches any divergence.
+pub(crate) const CAPSULE_COMMIT_TAG: u128 = 0xCA95_C0DE_C011_1701;
+pub(crate) const CAPSULE_OPEN_TAG: u128 = 0xCA95_01E0_0AE4_1102;
+
 /// The wallet-capsule PCS channel schedule (`verify_auth_mle_opening`'s
-/// transcript): `Channel::new()` + `absorb_cap` + `verify_mixed_opening`
-/// over one committed column (`n_cols = 1`, no secondary claims).
+/// transcript): `Channel::new()` + `capsule_verify` over one committed
+/// column.
 ///
-/// Mirrors, in order: the cap absorb; the mixed-opening tag + openings +
-/// γ draw; compact FRI's statement absorb (`eval_point`, batched claim),
-/// τ tensor-batching draws, per-round sumcheck/root/depth absorbs and
-/// fold draws, final-codeword absorb; the source-binding commitments
-/// (tag, H table, high-fold roots+depths) and its query draw; compact
-/// FRI's query draw. Tree depths and domain tags are protocol constants
-/// of the shape class; everything else is witness data.
+/// Mirrors, in order: the commitment absorb (commit tag, `log_rows`, cap
+/// length, cap hash lanes); the claim absorb (opening tag, value, point,
+/// the 256 upper partial evals); the τ = 8 beta draws; the mid-layer root
+/// absorb; the `h` table absorb; the grind nonce absorb + the ground
+/// squeeze (its low [`noid_fri_binius::capsule::CAPSULE_GRIND_BITS`] bits
+/// are zero — enforced by the discharge, not the schedule); the query
+/// draw over `nv + CAPSULE_LOG_RATE` bits. Domain tags, `log_rows` and
+/// the cap length are protocol constants of the shape class; everything
+/// else is witness data.
 pub fn capsule_pcs_channel_schedule(
     proof: &AuthMleOpeningProof,
     num_vars: usize,
     reduction_point: &[Block128],
-    num_queries: usize,
 ) -> ChannelSchedule {
     let commitment = &proof.commitment;
     let opening = &proof.opening;
     assert_eq!(commitment.log_rows, num_vars);
-    assert_eq!(commitment.n_cols, 1);
     assert_eq!(reduction_point.len(), num_vars);
-    let tau = COMPACT_TAU.min(num_vars);
-    let n_rounds = num_vars - tau;
-    assert_eq!(opening.fri_proof.sum_check_oracles.len(), n_rounds);
-    assert_eq!(opening.fri_proof.fri_roots.len(), n_rounds);
-    assert!(
-        !use_direct_source_expansion(1, tau, num_vars),
-        "capsule shapes use the folded source-binding path"
-    );
-    assert_eq!(
-        opening.source_proof.folded_roots.len(),
-        tau.saturating_sub(1)
-    );
-    assert_eq!(opening.all_openings.len(), 1);
+    assert!(num_vars > CAPSULE_TAU, "capsule column below the tau fold");
+    let low_len = 1usize << (num_vars - CAPSULE_TAU);
+    assert_eq!(opening.upper_partial_evals.len(), 1usize << CAPSULE_TAU);
+    assert_eq!(opening.h_evals.len(), low_len);
+    assert_eq!(commitment.cap.hashes.len(), 1usize << CAPSULE_CAP_DEPTH);
 
     let mut s = ChannelSchedule::new();
 
-    // absorb_cap: every cap hash as two 16-byte lanes.
-    let mut cap_lanes = Vec::with_capacity(commitment.cap.hashes.len() * 2);
+    // absorb_capsule_commitment: tag, shape constants, cap hash lanes.
+    let mut lanes = vec![
+        Some(CAPSULE_COMMIT_TAG),
+        Some(commitment.log_rows as u128),
+        Some(commitment.cap.hashes.len() as u128),
+    ];
     for h in &commitment.cap.hashes {
-        cap_lanes.extend(s.hash_lanes(h));
-    }
-    s.absorb_lanes(cap_lanes);
-
-    // Mixed-opening tag + all openings, then γ.
-    let mut lanes = vec![Some(MIXED_OPEN_TAG as u128)];
-    for &v in &opening.all_openings {
-        lanes.push(s.data_lane(v));
+        lanes.extend(s.hash_lanes(h));
     }
     s.absorb_lanes(lanes);
-    s.ops.push(TranscriptOp::Squeeze(1));
 
-    // Compact FRI statement: eval_point then the batched claim (γ-Horner
-    // with weights 1, γ, … — one column, so the claim IS the opening).
-    let mut lanes = Vec::with_capacity(num_vars + 1);
+    // The claim: opening tag, value, point, upper partial evals; then the
+    // τ beta draws.
+    let mut lanes = Vec::with_capacity(2 + num_vars + opening.upper_partial_evals.len());
+    lanes.push(Some(CAPSULE_OPEN_TAG));
+    lanes.push(s.data_lane(opening.value));
     for &v in reduction_point {
         lanes.push(s.data_lane(v));
     }
-    lanes.push(s.data_lane(opening.all_openings[0]));
-    s.absorb_lanes(lanes);
-    s.ops.push(TranscriptOp::Squeeze(tau));
-
-    // Per-round: sumcheck oracle pair, round root, depth constant; fold
-    // challenge.
-    for round in 0..n_rounds {
-        let [c0, c1] = opening.fri_proof.sum_check_oracles[round];
-        let mut lanes = vec![s.data_lane(c0), s.data_lane(c1)];
-        lanes.extend(s.hash_lanes(&opening.fri_proof.fri_roots[round]));
-        lanes.push(Some(compute_round_depth(n_rounds, round) as u128));
-        s.absorb_lanes(lanes);
-        s.ops.push(TranscriptOp::Squeeze(1));
+    for &v in &opening.upper_partial_evals {
+        lanes.push(s.data_lane(v));
     }
+    s.absorb_lanes(lanes);
+    s.ops.push(TranscriptOp::Squeeze(CAPSULE_TAU));
 
-    // Final codeword.
-    let mut lanes = Vec::with_capacity(opening.fri_proof.final_codeword.len());
-    for &v in &opening.fri_proof.final_codeword {
+    // Mid-layer root, then the h table.
+    let mid_lanes = s.hash_lanes(&opening.mid_root).to_vec();
+    s.absorb_lanes(mid_lanes);
+    let mut lanes = Vec::with_capacity(opening.h_evals.len());
+    for &v in &opening.h_evals {
         lanes.push(s.data_lane(v));
     }
     s.absorb_lanes(lanes);
 
-    // Source binding commitments: tag, H table, folded roots + depths.
-    let mut lanes = vec![Some(MIXED_SOURCE_BINDING_TAG)];
-    for &v in &opening.source_proof.h_evals {
-        lanes.push(s.data_lane(v));
-    }
-    for (i, root) in opening.source_proof.folded_roots.iter().enumerate() {
-        let layer_log = num_vars - 1 - i;
-        lanes.extend(s.hash_lanes(root));
-        lanes.push(Some(high_pair_tree_depth(layer_log) as u128));
-    }
-    s.absorb_lanes(lanes);
-
-    // Source-binding query draw, then compact FRI's own query draw. Both
-    // clamp the query count to the domain size (`gen_compact_queries`);
-    // the compact-FRI domain `2^(n_rounds + LOG_RATE)` is small at wallet
-    // shapes.
-    let source_queries = num_queries.min(1usize << (num_vars + noid_fri::code::LOG_RATE));
-    let fri_queries = num_queries.min(1usize << (n_rounds + noid_fri::code::LOG_RATE));
-    s.ops.push(TranscriptOp::Squeeze(source_queries));
-    s.ops.push(TranscriptOp::Squeeze(fri_queries));
+    // Grind: nonce absorb + the ground squeeze, then the query draw.
+    let nonce_lane = s.data_lane(Block128::from(opening.grind_nonce as u128));
+    s.absorb_lanes(vec![nonce_lane]);
+    s.ops.push(TranscriptOp::Squeeze(1));
+    s.ops.push(TranscriptOp::Squeeze(CAPSULE_NUM_QUERIES));
 
     s
 }
@@ -284,12 +265,11 @@ pub fn owner_auth_channel_schedule(
         lanes.push(s.data_lane(pair[1]));
     }
 
-    // Step 2: auth MLE commitment absorb.
+    // Step 2: auth MLE commitment absorb (tag, log_rows, cap length, cap
+    // hash lanes — the capsule commitment carries no other shape fields).
     let commitment = &proof.pcs.commitment;
     lanes.push(Some(AUTH_PCS_COMMIT_TAG));
     lanes.push(Some(commitment.log_rows as u128));
-    lanes.push(Some(commitment.n_cols as u128));
-    lanes.push(Some(commitment.hash_backend.as_u128()));
     lanes.push(Some(commitment.cap.hashes.len() as u128));
     for h in &commitment.cap.hashes {
         lanes.extend(s.hash_lanes(h));
