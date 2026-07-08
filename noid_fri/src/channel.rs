@@ -143,6 +143,19 @@ impl Channel {
         self.squeeze_block()
     }
 
+    /// Prover-side grind probe: the challenge that `observe_field_elem(elem)`
+    /// followed by `get_random_point()` would produce, computed on a copy of
+    /// the transcript in a single permutation (the squeeze's advance
+    /// permutation is skipped — the probe state is discarded). The live
+    /// transcript is untouched, so a grind loop can test candidate nonces in
+    /// parallel and absorb only the accepted one.
+    pub fn probe_squeeze(&self, elem: Block128) -> Block128 {
+        let mut probe = self.clone();
+        probe.observe_field_elem(elem);
+        probe.sponge.flush_to_squeeze();
+        probe.sponge.peek_rate()[0]
+    }
+
     /// Squeeze `n` random challenges.
     pub fn get_random_points(&mut self, n: usize) -> Vec<Block128> {
         (0..n).map(|_| self.squeeze_block()).collect()
@@ -241,6 +254,29 @@ mod tests {
         assert_eq!(a1, a2);
         assert_eq!(b1, b2);
         assert_ne!(a1, b1);
+    }
+
+    #[test]
+    fn test_probe_squeeze_matches_live_squeeze() {
+        // Fresh, half-block-buffered, block-aligned, and mid-squeeze
+        // channel states: the probe must equal the live observe+squeeze
+        // in every absorb/squeeze phase.
+        let mut states: Vec<Channel> = vec![Channel::new()];
+        let mut c = Channel::new();
+        c.observe_field_elem(Block128::from(7u8)); // 16 bytes buffered
+        states.push(c.clone());
+        c.observe_field_elem(Block128::from(9u8)); // 32 bytes: rate-aligned
+        states.push(c.clone());
+        let _ = c.get_random_point(); // squeezing, pending block held
+        states.push(c);
+
+        for (i, ch) in states.into_iter().enumerate() {
+            let elem = Block128::from(0xA5u128 + i as u128);
+            let probed = ch.probe_squeeze(elem);
+            let mut live = ch;
+            live.observe_field_elem(elem);
+            assert_eq!(probed, live.get_random_point(), "channel state {i}");
+        }
     }
 
     #[test]

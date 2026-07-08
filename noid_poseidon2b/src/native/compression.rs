@@ -122,6 +122,15 @@ impl Poseidon2bSponge {
         out
     }
 
+    /// Rate lanes of the current state — what the next [`Self::squeeze`]
+    /// would return — without the squeeze's advance permutation. For
+    /// prover-side probes whose state is discarded after one read (grind
+    /// loops); the caller must have flushed any buffered absorbs.
+    pub fn peek_rate(&self) -> [Block128; 2] {
+        debug_assert_eq!(self.filled_bytes, 0, "peek_rate requires a flushed buffer");
+        [self.state[0], self.state[1]]
+    }
+
     /// Flush any buffered absorb bytes into the state via one padded
     /// permutation, so subsequent `squeeze()` calls are guaranteed to
     /// commit to everything absorbed so far.

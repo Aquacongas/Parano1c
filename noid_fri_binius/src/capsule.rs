@@ -103,6 +103,27 @@ pub const CAPSULE_GRIND_BITS: u32 = 6;
 
 const CAPSULE_OPEN_TAG: u128 = 0xCA95_01E0_0AE4_1102;
 
+/// Stage-timing profile for the capsule prover, printed to stderr when
+/// `NOID_CAPSULE_PROFILE` is set (same convention as the auth-PCS byte
+/// profile). Zero cost when the variable is absent.
+fn capsule_profile() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("NOID_CAPSULE_PROFILE").is_ok())
+}
+
+macro_rules! capsule_stage {
+    ($label:expr, $body:expr) => {{
+        if capsule_profile() {
+            let t = std::time::Instant::now();
+            let out = $body;
+            eprintln!("capsule {:<14} {:>9.3} ms", $label, t.elapsed().as_secs_f64() * 1e3);
+            out
+        } else {
+            $body
+        }
+    }};
+}
+
 /// Node hasher for every capsule tree: the 1-permutation flat feed-forward
 /// compress under `TAG_CAPSNODE`. Leaves are hashed separately (flat
 /// sponge); the pair/field/concat entry points are never used on trees
@@ -186,12 +207,24 @@ impl CapsuleOpeningProof {
 /// Rate-`1/32` encoding: `CAPSULE_RATE` window transforms of the message
 /// (window `r` spans NTT basis `[r, r + nv)`), concatenated. The same
 /// construction as `noid_fri::code::Code::new`, at the capsule's own rate.
+/// The windows are independent, so prover-size messages transform in
+/// parallel; small messages (the verifier's `Code(h)` re-encode) stay
+/// sequential below the dispatch break-even.
 pub fn capsule_encode(message: &[Block128], ntt: &AdditiveNTT<Block128>) -> Vec<Block128> {
-    let mut encoding = Vec::with_capacity(message.len() * CAPSULE_RATE);
-    for round in 0..CAPSULE_RATE as u32 {
+    let window = |round: u32| {
         let mut temp = message.to_vec();
         ntt.forward_transform(&mut temp, round, 0);
-        encoding.append(&mut temp);
+        temp
+    };
+    let windows: Vec<Vec<Block128>> = if message.len() >= 1024 {
+        use rayon::prelude::*;
+        (0..CAPSULE_RATE as u32).into_par_iter().map(window).collect()
+    } else {
+        (0..CAPSULE_RATE as u32).map(window).collect()
+    };
+    let mut encoding = Vec::with_capacity(message.len() * CAPSULE_RATE);
+    for mut w in windows {
+        encoding.append(&mut w);
     }
     encoding
 }
@@ -353,19 +386,32 @@ pub fn absorb_capsule_commitment(channel: &mut Channel, commitment: &CapsuleComm
 
 /// Deterministic pre-query grind: find the smallest nonce whose absorb
 /// makes the next squeeze end in `CAPSULE_GRIND_BITS` zero bits.
+///
+/// Candidate nonces are probed in parallel on transcript copies, one
+/// permutation per probe ([`Channel::probe_squeeze`]). Blocks are scanned
+/// in order and `find_first` returns the smallest in-block match, so the
+/// accepted nonce — and the live transcript, which absorbs only that
+/// nonce — is identical to a sequential search's. Block ≈ 2× the expected
+/// attempts: the match usually lands in the first block while over-scan
+/// past it stays bounded (the LANECHAL grind uses the same sizing).
 fn grind_channel(channel: &mut Channel) -> u64 {
+    use rayon::prelude::*;
     let mask = (1u128 << CAPSULE_GRIND_BITS) - 1;
-    let mut nonce = 0u64;
-    loop {
-        let mut probe = channel.clone();
-        probe.observe_field_elem(Block128::from(nonce as u128));
-        if probe.get_random_point().0 & mask == 0 {
-            channel.observe_field_elem(Block128::from(nonce as u128));
-            let _ = channel.get_random_point();
-            return nonce;
+    let block: u64 = 1 << (CAPSULE_GRIND_BITS + 1);
+    let probe_src: &Channel = channel;
+    let mut start: u64 = 0;
+    let nonce = loop {
+        if let Some(n) = (start..start.saturating_add(block))
+            .into_par_iter()
+            .find_first(|&n| probe_src.probe_squeeze(Block128::from(n as u128)).0 & mask == 0)
+        {
+            break n;
         }
-        nonce = nonce.checked_add(1).expect("grind nonce space exhausted");
-    }
+        start = start.saturating_add(block);
+    };
+    channel.observe_field_elem(Block128::from(nonce as u128));
+    let _ = channel.get_random_point();
+    nonce
 }
 
 fn check_grind(channel: &mut Channel, nonce: u64) -> bool {
@@ -391,9 +437,16 @@ fn draw_queries(channel: &mut Channel, log_len: usize) -> Vec<usize> {
 pub fn capsule_commit(column: &[Block128], nv: usize) -> (CapsuleCommitment, CapsuleProverState) {
     assert!(nv > CAPSULE_TAU, "capsule column must exceed the tau fold");
     assert_eq!(column.len(), 1usize << nv);
+    if capsule_profile() {
+        eprintln!(
+            "capsule commit: nv={nv} codeword=2^{} leaves=2^{}",
+            nv + CAPSULE_LOG_RATE,
+            capsule_tree_depth(nv)
+        );
+    }
     let ntt = AdditiveNTT::<Block128>::new(nv + CAPSULE_LOG_RATE);
-    let encoded = capsule_encode(column, &ntt);
-    let tree = build_capsule_tree(&encoded, nv);
+    let encoded = capsule_stage!("commit/encode", capsule_encode(column, &ntt));
+    let tree = capsule_stage!("commit/tree", build_capsule_tree(&encoded, nv));
     let cap = MerkleCap {
         hashes: tree.get_layer_at_depth(CAPSULE_CAP_DEPTH),
     };
@@ -419,13 +472,16 @@ pub fn capsule_open(
     let low_vars = nv - CAPSULE_TAU;
     let (x_low, _x_top) = point.split_at(low_vars);
 
-    let value = evaluate_slice(column, point);
+    let value = capsule_stage!("open/value", evaluate_slice(column, point));
 
     // upper[i] = col(top = i, x_low): contract each top-slice at x_low.
     let low_len = 1usize << low_vars;
-    let upper: Vec<Block128> = (0..1usize << CAPSULE_TAU)
-        .map(|i| evaluate_slice(&column[i * low_len..(i + 1) * low_len], x_low))
-        .collect();
+    let upper: Vec<Block128> = capsule_stage!(
+        "open/upper",
+        (0..1usize << CAPSULE_TAU)
+            .map(|i| evaluate_slice(&column[i * low_len..(i + 1) * low_len], x_low))
+            .collect()
+    );
 
     // Transcript: commitment cap, then the claim, then upper; draw beta.
     absorb_capsule_commitment(channel, commitment);
@@ -440,11 +496,11 @@ pub fn capsule_open(
     let wide_hi: Vec<Block128> = (0..CAPSULE_WIDE_LOG)
         .map(|t| beta[CAPSULE_TAU - 1 - t])
         .collect();
-    let mid_msg = fold_top_vars(column, &wide_hi);
+    let mid_msg = capsule_stage!("open/mid_fold", fold_top_vars(column, &wide_hi));
     let mid_log = nv - CAPSULE_WIDE_LOG;
     let mid_ntt = AdditiveNTT::<Block128>::new(mid_log + CAPSULE_LOG_RATE);
-    let mid_code = capsule_encode(&mid_msg, &mid_ntt);
-    let mid_tree = build_capsule_tree(&mid_code, mid_log);
+    let mid_code = capsule_stage!("open/mid_enc", capsule_encode(&mid_msg, &mid_ntt));
+    let mid_tree = capsule_stage!("open/mid_tree", build_capsule_tree(&mid_code, mid_log));
     let mid_root = mid_tree.get_layer_at_depth(0)[0];
     absorb_digest(channel, &mid_root);
 
@@ -479,7 +535,7 @@ pub fn capsule_open(
     }
 
     // Grind, then draw the query positions over the source codeword.
-    let grind_nonce = grind_channel(channel);
+    let grind_nonce = capsule_stage!("open/grind", grind_channel(channel));
     let queries = draw_queries(channel, nv + CAPSULE_LOG_RATE);
 
     // Reveal the queried source + mid cosets and build the batched paths.
@@ -499,21 +555,27 @@ pub fn capsule_open(
             mid_symbols.push(mid_code[p]);
         }
     }
-    let source_batch = build_source_batched_merkle_proof_to_cap(
-        &state.tree,
-        &source_leaves,
-        capsule_tree_depth(nv),
-        CAPSULE_CAP_DEPTH,
-        CommitmentHashBackend::Arithmetic,
-        &CapsuleNodeHasher,
+    let source_batch = capsule_stage!(
+        "open/src_paths",
+        build_source_batched_merkle_proof_to_cap(
+            &state.tree,
+            &source_leaves,
+            capsule_tree_depth(nv),
+            CAPSULE_CAP_DEPTH,
+            CommitmentHashBackend::Arithmetic,
+            &CapsuleNodeHasher,
+        )
     );
-    let mid_batch = build_source_batched_merkle_proof_to_cap(
-        &mid_tree,
-        &mid_leaves,
-        capsule_tree_depth(mid_log),
-        0,
-        CommitmentHashBackend::Arithmetic,
-        &CapsuleNodeHasher,
+    let mid_batch = capsule_stage!(
+        "open/mid_paths",
+        build_source_batched_merkle_proof_to_cap(
+            &mid_tree,
+            &mid_leaves,
+            capsule_tree_depth(mid_log),
+            0,
+            CommitmentHashBackend::Arithmetic,
+            &CapsuleNodeHasher,
+        )
     );
 
     CapsuleOpeningProof {
@@ -690,6 +752,32 @@ mod tests {
         let mut vals = rng_column(nv.next_power_of_two().trailing_zeros() as usize + 1, seed);
         vals.truncate(nv);
         vals
+    }
+
+    /// The parallel block-scanned grind must accept exactly the nonce the
+    /// sequential search would (the smallest satisfying one), leaving the
+    /// live transcript byte-identical.
+    #[test]
+    fn parallel_grind_matches_sequential_smallest() {
+        let mask = (1u128 << CAPSULE_GRIND_BITS) - 1;
+        for seed in 0..3u64 {
+            let mut channel = Channel::new();
+            for v in rng_column(3, 900 + seed) {
+                channel.observe_field_elem(v);
+            }
+            let mut sequential = 0u64;
+            while channel.probe_squeeze(Block128::from(sequential as u128)).0 & mask != 0 {
+                sequential += 1;
+            }
+            let mut reference = channel.clone();
+            let nonce = grind_channel(&mut channel);
+            assert_eq!(nonce, sequential, "seed {seed}");
+            // Live transcript state matches the reference replay of the
+            // accepted nonce: the next challenges coincide.
+            reference.observe_field_elem(Block128::from(nonce as u128));
+            let _ = reference.get_random_point();
+            assert_eq!(channel.get_random_point(), reference.get_random_point());
+        }
     }
 
     /// The wide code-side fold must agree with encode(fold(message)) —
