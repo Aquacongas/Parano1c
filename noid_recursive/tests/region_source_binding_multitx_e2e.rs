@@ -397,12 +397,13 @@ fn region_spine_families_multitx_with_ghosts() {
     );
 
     // Walk-A column slices are allocated first and in the meta order
-    // (CODE0, CODE1, KID0, KID1, IN0, IN1, C0..C3) — recover KID0 as the
-    // third distinct slice and the per-tx block size from its length / k.
+    // (KID0, KID1, IN0, IN1, C0..C3 — the source-tree CODE lanes ride IN) —
+    // recover KID0 as the FIRST distinct slice and the per-tx block size
+    // from its length / k.
     let mut uniq: Vec<WitnessSlice> = claims.iter().map(|c| c.slice).collect();
     uniq.sort_by_key(|s| s.start());
     uniq.dedup_by_key(|s| s.start());
-    let kid0 = uniq[2];
+    let kid0 = uniq[0];
     let p_col = 1usize << kid0.log2_len;
     let per_tx_block_a = p_col / k;
     // Recover the spine-tree base by locating instance 2's L2 leaf digest

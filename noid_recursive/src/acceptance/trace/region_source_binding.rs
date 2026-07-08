@@ -160,12 +160,16 @@ const DOMAIN_B: &[u8] = b"source-binding-full-merkle-union";
 const DOMAIN_C: &[u8] = b"source-binding-full-duplex-union";
 
 // Meta committed column order (all length P):
-//   CODE0=0, CODE1=1, KID0=2, KID1=3, IN0=4, IN1=5, C0=6..C3=9.
-const CODE0: usize = 0;
-const KID0: usize = 2;
-const IN0: usize = 4;
-const C0: usize = 6;
-const N_COMMITTED: usize = 10;
+//   KID0=0, KID1=1, IN0=2, IN1=3, C0=4..C3=7.
+// The source-tree CODE lanes RIDE the IN columns: CODE cells live only in
+// source-tree slots ([tx_off, +st_slots) and the ghosted spine trees), IN
+// cells only in leaf/es/spine-tile slots — disjoint by layout, and every
+// relation term reading either is gated by its family's fixed pattern.
+const KID0: usize = 0;
+const IN0: usize = 2;
+const CODE0: usize = IN0;
+const C0: usize = 4;
+const N_COMMITTED: usize = 8;
 
 // ---------------------------------------------------------------------------
 // Public API
