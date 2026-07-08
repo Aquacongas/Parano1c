@@ -23,6 +23,7 @@ pub mod chain_accumulator_killshot;
 pub mod circuit;
 pub mod circuit_sweep;
 pub mod fixed_field_hash_killshot;
+pub mod ghost_tx;
 pub mod guard_bucket_killshot;
 pub mod header_hash_killshot;
 pub mod history_claim_killshot;
