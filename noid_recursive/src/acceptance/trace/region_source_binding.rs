@@ -404,7 +404,15 @@ pub fn discharge_auth_pcs_obligations_via_region(
     let per_tx_block_b = 1usize << block_log_b;
     let w_log_b = (k * per_tx_block_b).next_power_of_two().trailing_zeros() as usize;
     let pb = 1usize << w_log_b;
-    let n_committed_b = 6 + 5 * n_legs;
+    // Walk-B committed set is leg-count FLAT: the legs' slot ranges are
+    // disjoint, every relation term is gated by a leg-specific fixed pattern
+    // (zero outside its own slots), and the only cross-boundary shifted reads
+    // (`c_sh` at path-start slots) are cancelled by the START patterns — so
+    // ALL legs share ONE physical {E0,E1,SIB0,SIB1,D} column set at [6..11)
+    // next to the shared pair-IN [0..2) and C0..C3 [2..6). Committed lanes
+    // per leg were the production-shape wall (6 + 5·n_legs columns × the
+    // k-tiled domain); the shared set is 11 columns regardless of leg count.
+    let n_committed_b = 6 + 5;
     let region_pair = 0usize;
     let pair_refs = pair_leaf_refs(0);
     let iv_b = compress_iv_flat();
@@ -954,7 +962,7 @@ pub fn discharge_auth_pcs_obligations_via_region(
         let f = 0usize;
         let depth = leg_depths[f];
         let meta_base = meta_bases[f];
-        let col_base = 6 + 5 * f;
+        let col_base = 6;
         let stride = (2 * depth).next_power_of_two();
         let n_slots = nq_fri * stride;
         let fam_wlog = n_slots.trailing_zeros() as usize;
@@ -998,7 +1006,7 @@ pub fn discharge_auth_pcs_obligations_via_region(
         let f = 1usize;
         let depth = leg_depths[f];
         let meta_base = meta_bases[f];
-        let col_base = 6 + 5 * f;
+        let col_base = 6;
         let stride = (2 * depth).next_power_of_two();
         let n_slots = nq * stride;
         let fam_wlog = n_slots.trailing_zeros() as usize;
@@ -1083,7 +1091,7 @@ pub fn discharge_auth_pcs_obligations_via_region(
         let f = 2 + kk;
         let depth = leg_depths[f];
         let meta_base = meta_bases[f];
-        let col_base = 6 + 5 * f;
+        let col_base = 6;
         let stride = (2 * depth).next_power_of_two();
         let n_slots = nq * stride;
         let fam_wlog = n_slots.trailing_zeros() as usize;
@@ -1269,7 +1277,7 @@ pub fn discharge_auth_pcs_obligations_via_region(
                 e.d_state,
                 state_cap,
                 leg_ivs[es_state_leg],
-                6 + 5 * es_state_leg,
+                6,
                 blk * per_tx_block_b + meta_bases[es_state_leg],
                 &state_paths,
             );
@@ -1306,7 +1314,7 @@ pub fn discharge_auth_pcs_obligations_via_region(
                     gd.depth,
                     cap,
                     leg_ivs[es_guard_leg],
-                    6 + 5 * es_guard_leg,
+                    6,
                     blk * per_tx_block_b + meta_bases[es_guard_leg],
                     &guard_paths,
                 );
@@ -1328,8 +1336,8 @@ pub fn discharge_auth_pcs_obligations_via_region(
     if let Some(t) = txr {
         let cap = leg_caps[txr_leg];
         let stride = (2 * t.depth).next_power_of_two();
-        let d_col = 6 + 5 * txr_leg + 4;
-        let sib_cols = [6 + 5 * txr_leg + 2, 6 + 5 * txr_leg + 3];
+        let d_col = 10;
+        let sib_cols = [8, 9];
         let n_paths = t.paths.len();
         // Tier-capacity handoffs authenticate EVERY padded-tree leaf and carry
         // no rim constants (the padding leaves are proven zero directly);
@@ -1369,7 +1377,7 @@ pub fn discharge_auth_pcs_obligations_via_region(
                 t.depth,
                 cap,
                 leg_ivs[txr_leg],
-                6 + 5 * txr_leg,
+                6,
                 region_base,
                 &real,
             );
@@ -1666,11 +1674,10 @@ pub fn discharge_auth_pcs_obligations_via_region(
     let mut legs: Vec<MerkleLeg> = Vec::with_capacity(n_legs);
     for f in 0..n_legs {
         let depth = leg_depths[f];
-        let col_base = 6 + 5 * f;
         let fixed_base = 1 + 9 * f;
         legs.push(MerkleLeg {
             family: MerklePathFamily { depth, n_paths: leg_caps[f] },
-            refs: union_merkle_refs(col_base, fixed_base),
+            refs: union_merkle_refs(fixed_base),
             region: fixed_base + 8,
             committed_roots: std::mem::take(&mut acc_committed_roots[f]),
             entry_wires: std::mem::take(&mut acc_entry_wires[f]),
@@ -3525,11 +3532,11 @@ fn discharge_union(
 // ===========================================================================
 // WALK B — the merkle-union.
 // ===========================================================================
-fn union_merkle_refs(col_base: usize, fixed_base: usize) -> MerkleFamilyRefs {
+fn union_merkle_refs(fixed_base: usize) -> MerkleFamilyRefs {
     MerkleFamilyRefs {
-        e: [col_base, col_base + 1],
-        sib: [col_base + 2, col_base + 3],
-        d: col_base + 4,
+        e: [6, 7],
+        sib: [8, 9],
+        d: 10,
         c: std::array::from_fn(|i| 2 + i),
         even: fixed_base,
         evenns: fixed_base + 1,
