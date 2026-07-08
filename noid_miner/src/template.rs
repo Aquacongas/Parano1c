@@ -260,9 +260,18 @@ impl TemplateBuilder {
                 let exact_state_transition = if inner.txs.is_empty() {
                     None
                 } else {
-                    let mut surface_state = snapshot.state.state.clone();
-                    while surface_state.log_slots() < inner.log_slots as usize {
-                        surface_state.expand();
+                    // Expansion blocks are coinbase-only (template building
+                    // clears user txs when log_slots grows), so a tx-bearing
+                    // template always shares the snapshot state's log_slots
+                    // and the action surface builds against the snapshot
+                    // directly — no expanded whole-state copy.
+                    if inner.log_slots as usize != snapshot.state.state.log_slots() {
+                        tracing::warn!(
+                            template_log_slots = inner.log_slots,
+                            state_log_slots = snapshot.state.state.log_slots(),
+                            "tx-bearing template log_slots diverges from snapshot state"
+                        );
+                        return None;
                     }
                     let mut bodies: Vec<_> = inner.txs.iter().map(|tx| tx.body.clone()).collect();
                     bodies.push(inner.coinbase.body.clone());
@@ -271,7 +280,7 @@ impl TemplateBuilder {
                         .map(|body| noid_tx::compute_claims_commitment(&body.inputs, &body.outputs))
                         .collect();
                     let surface = match noid_chain::build_exact_action_surface(
-                        &surface_state,
+                        &snapshot.state.state,
                         &bodies,
                         &commitments,
                     ) {

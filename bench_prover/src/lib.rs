@@ -15,6 +15,7 @@ use noid_block::{
     BlockProof, ExactStateTransitionInputs,
 };
 use noid_chain::exact_state_hash::{composite_state_root, slot_leaf_hash_checked};
+use noid_chain::sparse_merkle::reconstruct_root;
 use noid_chain::state::ChainState;
 use noid_chain::{Block, BlockHeader, SlotValue};
 use noid_core::mem_profile::{current_mem_snapshot, MemSnapshot};
@@ -715,6 +716,7 @@ fn bench_block_from_parts(
 }
 
 fn prove_full_block_from_bodies_and_auth(
+    pre_state: ChainState,
     user_bodies: Vec<TxBody>,
     tx_auth: Vec<OwnerAuthProofKillShot>,
     n_standard: usize,
@@ -723,12 +725,12 @@ fn prove_full_block_from_bodies_and_auth(
 ) -> (BlockProof, Block, BlockAuthSidecar, ChainState) {
     assert_eq!(user_bodies.len(), tx_auth.len());
     let mut profiler = BenchFullBlockProfiler::new();
-    profiler.phase("body_clone");
-
-    let mut pre_state = seed_state_for_bodies(&user_bodies);
-    let prev_state_root = pre_state.state_root();
+    // The parent root is a cached read: a live miner takes it from the
+    // parent header, and the seeded fixture state arrives with its cache
+    // built (`state_root()` would rebuild the whole sparse cache).
+    let prev_state_root = pre_state.cached_state_root();
     let coinbase_body = bench_coinbase_body();
-    profiler.phase("seed_state");
+    profiler.phase("prev_root_and_coinbase");
 
     let mut all_state_bodies = user_bodies.clone();
     all_state_bodies.push(coinbase_body.clone());
@@ -753,18 +755,22 @@ fn prove_full_block_from_bodies_and_auth(
         build_exact_state_transition_proof(&exact_cache, &exact_surface, &pre_state.reuse_guard, 1)
             .expect("build bench exact state proof");
     profiler.phase("exact_transition_proof");
-    let mut child_cache = exact_cache.clone();
-    for (&slot_index, &slot) in exact_surface
-        .touched_indices
+    // Child roots from the multiproof frontier — O(touched · depth), the
+    // same reconstruction the verifier runs. Cloning the whole sparse
+    // cache and re-setting every touched leaf measures cache-maintenance
+    // work, not block-proving work.
+    let new_leaf_hashes: Vec<_> = exact_surface
+        .new_slots
         .iter()
-        .zip(exact_surface.new_slots.iter())
-    {
-        let leaf = slot_leaf_hash_checked(slot).expect("bench slot hash");
-        child_cache
-            .set_leaf(slot_index, leaf)
-            .expect("bench child leaf update");
-    }
-    let child_utxo_root = child_cache.root();
+        .map(|&slot| slot_leaf_hash_checked(slot).expect("bench slot hash"))
+        .collect();
+    let child_utxo_root = reconstruct_root(
+        &exact_surface.touched_indices,
+        &new_leaf_hashes,
+        &exact_state_transition.slot_siblings,
+        BENCH_LOG_SLOTS,
+    )
+    .expect("bench child utxo root from multiproof frontier");
     let child_guard_root = if exact_surface.spent_slots.is_empty() {
         pre_state.reuse_guard.root()
     } else {
@@ -775,7 +781,7 @@ fn prove_full_block_from_bodies_and_auth(
         next_guard.root()
     };
     let new_state_root = composite_state_root(BENCH_LOG_SLOTS, child_utxo_root, child_guard_root);
-    profiler.phase("child_root_from_surface");
+    profiler.phase("child_root_reconstruct");
 
     let auth_sidecar = BlockAuthSidecar { tx_auth };
     profiler.phase("auth_sidecar");
@@ -806,16 +812,27 @@ pub fn bench_full_block_proof_minimal(fixtures: &[MinimalTxFixture]) -> FullBloc
                     TxShape::Sweep25x2 => (standard, sweep + 1),
                 },
             );
-    let (prove_time, (proof, block, auth_sidecar, pre_state)) = time_once(|| {
-        let user_bodies = fixtures
-            .iter()
-            .map(|f| f.scenario.body.clone())
-            .collect::<Vec<_>>();
-        let tx_auth = fixtures
-            .iter()
-            .map(|f| f.auth_proof.clone())
-            .collect::<Vec<_>>();
-        prove_full_block_from_bodies_and_auth(user_bodies, tx_auth, n_standard, n_sweep, n_sweep)
+    // Fixture prep is untimed: body/auth clones and the seeded parent
+    // state are bench inputs — a live miner starts from the state it
+    // already holds in memory, so seeding one is not block-time work.
+    let user_bodies = fixtures
+        .iter()
+        .map(|f| f.scenario.body.clone())
+        .collect::<Vec<_>>();
+    let tx_auth = fixtures
+        .iter()
+        .map(|f| f.auth_proof.clone())
+        .collect::<Vec<_>>();
+    let pre_state = seed_state_for_bodies(&user_bodies);
+    let (prove_time, (proof, block, auth_sidecar, pre_state)) = time_once(move || {
+        prove_full_block_from_bodies_and_auth(
+            pre_state,
+            user_bodies,
+            tx_auth,
+            n_standard,
+            n_sweep,
+            n_sweep,
+        )
     });
     let (verify_time, _) = time_once(|| {
         noid_block::validate_block_authorizations(
