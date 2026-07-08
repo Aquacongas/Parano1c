@@ -35,11 +35,17 @@
 //! and raising the provable floor by query count alone (~148 queries for
 //! 128-bit Johnson) would roughly double the opening bytes.
 
+pub mod capsule;
 pub mod compact_fri;
 pub mod encode_kernel;
 pub mod interleaved_commit;
 pub mod mixed_open;
 
+pub use capsule::{
+    absorb_capsule_commitment, capsule_commit, capsule_open, capsule_verify, CapsuleCommitment,
+    CapsuleOpeningProof, CapsuleProverState, CAPSULE_CAP_DEPTH, CAPSULE_GRIND_BITS,
+    CAPSULE_LOG_RATE, CAPSULE_NUM_QUERIES, CAPSULE_TAU, CAPSULE_WIDE_LOG,
+};
 pub use compact_fri::{CompactEvalProof, COMPACT_NUM_QUERIES, COMPACT_TAU};
 pub use interleaved_commit::{
     absorb_cap, interleaved_commit, interleaved_commit_arithmetic, CommitmentHashBackend,

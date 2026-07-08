@@ -115,6 +115,11 @@ pub const TAG_HISTCLM: DomainTag = DomainTag::new(b"HISTCLM_");
 pub const TAG_HISTPRF: DomainTag = DomainTag::new(b"HISTPRF_");
 /// Variable-length byte hashing with an explicit absorbed domain string.
 pub const TAG_BYTEHASH: DomainTag = DomainTag::new(b"BYTEHASH");
+/// Wallet-capsule PCS tree leaf (flat sponge over one 16-symbol fold coset).
+pub const TAG_CAPSLEAF: DomainTag = DomainTag::new(b"CAPSLEAF");
+/// Wallet-capsule PCS tree inner node (1-permutation flat feed-forward
+/// compress — the same node shape as the proof-core PCS Merkle).
+pub const TAG_CAPSNODE: DomainTag = DomainTag::new(b"CAPSNODE");
 
 #[cfg(test)]
 mod tests {
@@ -153,6 +158,8 @@ mod tests {
             TAG_HISTCLM,
             TAG_HISTPRF,
             TAG_BYTEHASH,
+            TAG_CAPSLEAF,
+            TAG_CAPSNODE,
         ];
         for i in 0..tags.len() {
             for j in (i + 1)..tags.len() {

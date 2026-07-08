@@ -38,6 +38,10 @@ pub const NUM_QUERIES: usize = 10;
 pub const TAU: usize = 7;
 
 /// Fiat–Shamir channel backed by a Poseidon2b sponge (duplex mode).
+///
+/// `Clone` supports prover-side transcript grinding: probe nonces against a
+/// snapshot of the channel state without mutating the live transcript.
+#[derive(Clone)]
 pub struct Channel {
     sponge: Poseidon2bSponge,
     /// One rate block (two Block128s) of buffered squeeze output.
