@@ -756,6 +756,226 @@ impl FsChannelTrace {
 }
 
 // ---------------------------------------------------------------------------
+// Channel abstraction: inline permutation replay vs union recording
+// ---------------------------------------------------------------------------
+
+/// The channel interface the deep-chain verifier twins consume, so one twin
+/// body runs against either the inline permutation replay
+/// ([`FsChannelTrace`]) or the union recorder ([`FsChannelUnionRecorder`])
+/// that discharges the same transcript through a committed duplex-union
+/// walk instead of in-trace permutations.
+pub trait FsChannelOps {
+    fn observe_label(&mut self, b: &mut FieldR1csBuilder, label: &[u8]);
+    fn observe_f128(&mut self, b: &mut FieldR1csBuilder, value: &LinExpr);
+    fn observe_f128_slice(&mut self, b: &mut FieldR1csBuilder, values: &[LinExpr]);
+    fn sample_f128(&mut self, b: &mut FieldR1csBuilder) -> LinExpr;
+}
+
+impl FsChannelOps for FsChannelTrace {
+    fn observe_label(&mut self, b: &mut FieldR1csBuilder, label: &[u8]) {
+        FsChannelTrace::observe_label(self, b, label);
+    }
+    fn observe_f128(&mut self, b: &mut FieldR1csBuilder, value: &LinExpr) {
+        FsChannelTrace::observe_f128(self, b, value);
+    }
+    fn observe_f128_slice(&mut self, b: &mut FieldR1csBuilder, values: &[LinExpr]) {
+        FsChannelTrace::observe_f128_slice(self, b, values);
+    }
+    fn sample_f128(&mut self, b: &mut FieldR1csBuilder) -> LinExpr {
+        FsChannelTrace::sample_f128(self, b)
+    }
+}
+
+/// A finished union recording: the class-fixed transcript schedule plus this
+/// instance's witness lanes and challenge wires, ready for the duplex-union
+/// discharge (`compile_duplex(&ops)` → committed columns; data cells pin to
+/// `data_wires`, challenge carry cells pin to `challenge_wires`).
+pub struct RecordedChannel {
+    pub ops: Vec<crate::deep_chain::schedule::TranscriptOp>,
+    pub data_wires: Vec<LinExpr>,
+    pub data_flat: Vec<F128>,
+    pub challenge_wires: Vec<LinExpr>,
+    /// Native post-transcript state lanes (flat) — the lockstep differential
+    /// value gates compare against an inline replay.
+    pub post_state: [F128; STATE_SIZE],
+    /// Native transcript permutations executed (pad flushes included).
+    pub perms: usize,
+}
+
+/// Union-mode twin channel: RECORDS the transcript instead of replaying its
+/// permutations in-trace.
+///
+/// Drop-in for [`FsChannelTrace`] behind [`FsChannelOps`]: the twin's
+/// verifier algebra runs unchanged, but every absorb lane lands in a
+/// [`crate::deep_chain::schedule::TranscriptOp`] schedule — protocol
+/// constants as `Some(tower pattern)`, witness lanes as `None` plus the
+/// lane's expression and native value — and every sampled challenge returns
+/// a FRESH witness wire carrying the native challenge value. The schedule is
+/// class-fixed because the twin's control flow is (op counts derive from
+/// class parameters); constant-vs-data is decided by the expression form,
+/// which is deterministic per call site.
+///
+/// The lane discipline (rate-2 pair buffering, pad lane on an odd flush,
+/// pending second squeeze lane, absorb-after-squeeze reset) mirrors
+/// [`FsChannelTrace`] exactly, and `compile_duplex` implements the same
+/// discipline slot-for-slot — the pad lane is therefore NOT emitted into
+/// the schedule (the compiler inserts the same constant itself). The native
+/// state runs alongside so sampled values are real; the post-state
+/// differential against an inline replay is the lockstep gate.
+pub struct FsChannelUnionRecorder {
+    state: [F128; STATE_SIZE],
+    buffered: Option<F128>,
+    pending: Option<F128>,
+    /// Absorb lanes accumulated since the last emitted op.
+    cur_absorb: Vec<Option<u128>>,
+    ops: Vec<crate::deep_chain::schedule::TranscriptOp>,
+    data_wires: Vec<LinExpr>,
+    data_flat: Vec<F128>,
+    challenge_wires: Vec<LinExpr>,
+    perms: usize,
+}
+
+impl FsChannelUnionRecorder {
+    /// Mirror of `FsChannelTrace::new(domain)`: LANECHAL capacity IV, then
+    /// the domain-op header and label lanes (all protocol constants).
+    pub fn new(domain: &[u8]) -> Self {
+        let [iv0, iv1] = fs_lane_iv_flat();
+        let mut t = Self {
+            state: [F128::ZERO, F128::ZERO, iv0, iv1],
+            buffered: None,
+            pending: None,
+            cur_absorb: Vec::new(),
+            ops: Vec::new(),
+            data_wires: Vec::new(),
+            data_flat: Vec::new(),
+            challenge_wires: Vec::new(),
+            perms: 0,
+        };
+        t.absorb_const(fs_op_lane(FS_OP_DOMAIN, 0, domain.len() as u64));
+        for lane in fs_pack_bytes_lanes(domain) {
+            t.absorb_const(lane);
+        }
+        t
+    }
+
+    /// The capacity IV the discharge seeds the duplex columns with.
+    pub fn capacity_iv_flat() -> [F128; 2] {
+        fs_lane_iv_flat()
+    }
+
+    fn flat_bits(v: F128) -> u128 {
+        (v.lo as u128) | ((v.hi as u128) << 64)
+    }
+
+    fn permute(&mut self) {
+        let mut lanes: [u128; STATE_SIZE] = std::array::from_fn(|i| Self::flat_bits(self.state[i]));
+        noid_poseidon2b::native::permutation::permute_flat_u128(&mut lanes);
+        self.state = std::array::from_fn(|i| F128 {
+            lo: lanes[i] as u64,
+            hi: (lanes[i] >> 64) as u64,
+        });
+        self.perms += 1;
+    }
+
+    fn absorb_native(&mut self, v: F128) {
+        self.pending = None;
+        if let Some(first) = self.buffered.take() {
+            self.state[0] += first;
+            self.state[1] += v;
+            self.permute();
+        } else {
+            self.buffered = Some(v);
+        }
+    }
+
+    fn absorb_const(&mut self, c: F128) {
+        self.cur_absorb
+            .push(Some(noid_core::hardware::flat_to_tower_u128(Self::flat_bits(c))));
+        self.absorb_native(c);
+    }
+
+    fn absorb_expr(&mut self, b: &FieldR1csBuilder, e: &LinExpr) {
+        if e.is_const() {
+            self.absorb_const(e.constant);
+        } else {
+            let v = e.eval(b.values());
+            self.cur_absorb.push(None);
+            self.data_wires.push(e.clone());
+            self.data_flat.push(v);
+            self.absorb_native(v);
+        }
+    }
+
+    fn close_absorb(&mut self) {
+        if !self.cur_absorb.is_empty() {
+            self.ops.push(crate::deep_chain::schedule::TranscriptOp::Absorb(
+                std::mem::take(&mut self.cur_absorb),
+            ));
+        }
+    }
+
+    fn squeeze_native(&mut self) -> F128 {
+        if let Some(p) = self.pending.take() {
+            return p;
+        }
+        if let Some(first) = self.buffered.take() {
+            self.state[0] += first;
+            self.state[1] += fs_pad_lane_flat();
+            self.permute();
+        }
+        let out = self.state[0];
+        self.pending = Some(self.state[1]);
+        self.permute();
+        out
+    }
+
+    /// Finish: emit any trailing absorb op and return the recording.
+    pub fn finish(mut self) -> RecordedChannel {
+        self.close_absorb();
+        RecordedChannel {
+            ops: self.ops,
+            data_wires: self.data_wires,
+            data_flat: self.data_flat,
+            challenge_wires: self.challenge_wires,
+            post_state: self.state,
+            perms: self.perms,
+        }
+    }
+}
+
+impl FsChannelOps for FsChannelUnionRecorder {
+    fn observe_label(&mut self, _b: &mut FieldR1csBuilder, label: &[u8]) {
+        self.absorb_const(fs_op_lane(FS_OP_LABEL, 0, label.len() as u64));
+        for lane in fs_pack_bytes_lanes(label) {
+            self.absorb_const(lane);
+        }
+    }
+
+    fn observe_f128(&mut self, b: &mut FieldR1csBuilder, value: &LinExpr) {
+        self.absorb_const(fs_op_lane(FS_OP_OBSERVE, FS_KIND_SCALAR, 0));
+        self.absorb_expr(b, value);
+    }
+
+    fn observe_f128_slice(&mut self, b: &mut FieldR1csBuilder, values: &[LinExpr]) {
+        self.absorb_const(fs_op_lane(FS_OP_OBSERVE, FS_KIND_SLICE, values.len() as u64));
+        for v in values {
+            self.absorb_expr(b, v);
+        }
+    }
+
+    fn sample_f128(&mut self, b: &mut FieldR1csBuilder) -> LinExpr {
+        self.absorb_const(fs_op_lane(FS_OP_SQUEEZE, FS_KIND_SCALAR, 0));
+        self.close_absorb();
+        self.ops
+            .push(crate::deep_chain::schedule::TranscriptOp::Squeeze(1));
+        let v = self.squeeze_native();
+        let w = LinExpr::from_wire(b.alloc_f128(v));
+        self.challenge_wires.push(w.clone());
+        w
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Raw Fiat-Shamir channel trace gadget
 // ---------------------------------------------------------------------------
 
@@ -876,6 +1096,84 @@ mod tests {
     use noid_core::hardware::clmul_gcm;
     use noid_core::{Block128, TowerField};
     use noid_poseidon2b::native::permutation::Poseidon2bPermutation;
+
+    /// The union recorder must be bit-lockstep with the inline channel twin
+    /// (same challenges, same permutation count), and its recorded schedule
+    /// must reproduce the same challenges when compiled and run through the
+    /// duplex-column builder — the exact machinery the region discharge
+    /// pins against.
+    #[test]
+    fn union_recorder_locksteps_inline_channel_and_duplex_columns() {
+        use crate::deep_chain::schedule::{build_duplex_columns, compile_duplex};
+
+        fn drive<C: FsChannelOps>(
+            ch: &mut C,
+            b: &mut FieldR1csBuilder,
+            wires: &[LinExpr],
+        ) -> Vec<LinExpr> {
+            let mut chals = Vec::new();
+            ch.observe_label(b, b"stage-1");
+            ch.observe_f128(b, &LinExpr::constant(F128 { lo: 42, hi: 7 }));
+            ch.observe_f128(b, &wires[0]);
+            chals.push(ch.sample_f128(b));
+            ch.observe_f128_slice(b, &wires[1..4]);
+            chals.push(ch.sample_f128(b));
+            chals.push(ch.sample_f128(b)); // back-to-back squeezes
+            ch.observe_f128_slice(b, &wires[4..7]);
+            ch.observe_label(b, b"stage-2");
+            chals.push(ch.sample_f128(b));
+            chals
+        }
+
+        let mut b = FieldR1csBuilder::new();
+        let mut rng = Rng::new(0xD00D);
+        let data: Vec<F128> = (0..7).map(|_| rng.f128()).collect();
+        let wires: Vec<LinExpr> = data
+            .iter()
+            .map(|&v| LinExpr::from_wire(b.alloc_f128(v)))
+            .collect();
+
+        let mut inline = FsChannelTrace::new(&mut b, b"union-recorder-lockstep");
+        let chal_inline = drive(&mut inline, &mut b, &wires);
+        let mut rec = FsChannelUnionRecorder::new(b"union-recorder-lockstep");
+        let chal_rec = drive(&mut rec, &mut b, &wires);
+        let rc = rec.finish();
+
+        let vals = b.values().to_vec();
+        assert_eq!(chal_inline.len(), chal_rec.len());
+        for (k, (ci, cr)) in chal_inline.iter().zip(chal_rec.iter()).enumerate() {
+            assert_eq!(ci.eval(&vals), cr.eval(&vals), "challenge {k} diverges");
+        }
+        assert_eq!(inline.perms(), rc.perms, "permutation count diverges");
+        assert_eq!(rc.data_flat.len(), 7, "exactly the witness lanes are data");
+        for (dw, df) in rc.data_wires.iter().zip(rc.data_flat.iter()) {
+            assert_eq!(dw.eval(&vals), *df, "data wire/value mismatch");
+        }
+
+        // Compile the recorded schedule and rebuild the columns natively:
+        // the challenge carry cells must reproduce the sampled values.
+        let layout = compile_duplex(&rc.ops);
+        assert_eq!(layout.n_data, rc.data_flat.len(), "data lane count");
+        let block_log = layout
+            .slots
+            .len()
+            .next_power_of_two()
+            .trailing_zeros() as usize;
+        let cols = build_duplex_columns(
+            &layout,
+            FsChannelUnionRecorder::capacity_iv_flat(),
+            &rc.data_flat,
+            block_log,
+        );
+        assert_eq!(cols.challenges.len(), rc.challenge_wires.len());
+        for (k, cw) in rc.challenge_wires.iter().enumerate() {
+            assert_eq!(
+                cols.challenges[k],
+                cw.eval(&vals),
+                "duplex column challenge {k} diverges from the recording"
+            );
+        }
+    }
 
     struct Rng(u64);
     impl Rng {

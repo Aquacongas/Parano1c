@@ -24,6 +24,8 @@ use noid_ivc_core::deep_chain::schedule::flat_of_tower_u128;
 use noid_ivc_core::deep_chain::{
     flat_mds, flat_round_constant, is_full_round, DeepChainWalkProof, WALK_DEGREE,
 };
+use noid_ivc_core::field_circuit::FsChannelOps;
+#[cfg(test)]
 use noid_ivc_core::field_circuit::FsChannelTrace;
 use noid_poseidon2b::native::permutation::{N_ROUNDS, STATE_SIZE};
 
@@ -121,7 +123,7 @@ fn compressed_horner(
 /// the terminal layer-0 claim group for the wiring substitution.
 pub fn verify_deep_chain_walk_trace(
     b: &mut FieldR1csBuilder,
-    ch: &mut FsChannelTrace,
+    ch: &mut impl FsChannelOps,
     w_log: usize,
     out_groups: &[LaneClaimGroupTrace],
     proof: &DeepChainWalkProofTrace,
@@ -274,7 +276,7 @@ pub struct RelationTermTrace {
 /// expressions so challenge-derived coefficients stay sound.
 fn absorb_relation_header_trace(
     b: &mut FieldR1csBuilder,
-    ch: &mut FsChannelTrace,
+    ch: &mut impl FsChannelOps,
     target: &LinExpr,
     eq_point: &[LinExpr],
     terms: &[RelationTermTrace],
@@ -344,7 +346,7 @@ pub fn fixed_pattern_eval_trace(
 /// evaluated in closed form from the protocol-constant patterns).
 pub fn verify_column_relation_trace(
     b: &mut FieldR1csBuilder,
-    ch: &mut FsChannelTrace,
+    ch: &mut impl FsChannelOps,
     w_log: usize,
     target: &LinExpr,
     eq_point: &[LinExpr],
@@ -492,7 +494,7 @@ pub fn shift_pow2_kernel_eval_trace(
 /// `proof.final_value` as the plain column claim).
 pub fn verify_shift_discharge_trace(
     b: &mut FieldR1csBuilder,
-    ch: &mut FsChannelTrace,
+    ch: &mut impl FsChannelOps,
     w_log: usize,
     sigma: &[LinExpr],
     target: &LinExpr,
@@ -564,7 +566,7 @@ impl WeightedSumProofTrace {
 /// mirroring the native callback. Returns the derived point.
 pub fn verify_weighted_sum_trace<W>(
     b: &mut FieldR1csBuilder,
-    ch: &mut FsChannelTrace,
+    ch: &mut impl FsChannelOps,
     w_log: usize,
     target: &LinExpr,
     proof: &WeightedSumProofTrace,
