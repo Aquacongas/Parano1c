@@ -109,7 +109,7 @@ fn region_discharge_claims_flat_in_tx_count() {
             });
         }
         let claims =
-            discharge_auth_pcs_obligations_via_region(&mut b, &obligations, &natives, params, None);
+            discharge_auth_pcs_obligations_via_region(&mut b, &obligations, &natives, params, None, None);
         eprintln!("[flatness] K={k:>2}: claims={} wires={}", claims.len(), b.num_wires());
         match ref_claims {
             None => ref_claims = Some(claims.len()),
@@ -151,7 +151,7 @@ fn region_source_binding_multitx_end_to_end() {
 
     // ONE plural call: discharge all K txs, collect opening claims.
     let claims: Vec<RegionPcsClaim> =
-        discharge_auth_pcs_obligations_via_region(&mut b, &obligations, &natives, params, None);
+        discharge_auth_pcs_obligations_via_region(&mut b, &obligations, &natives, params, None, None);
 
     // Wrap the claims in ONE public-IO discharge.
     let max_arity = claims.iter().map(|c| c.point.len()).max().unwrap();

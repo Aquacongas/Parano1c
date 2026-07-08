@@ -209,6 +209,7 @@ pub fn discharge_auth_pcs_obligation_via_region(
         std::slice::from_ref(native),
         params,
         None,
+        None,
     )
 }
 
@@ -233,12 +234,22 @@ pub fn discharge_auth_pcs_obligation_via_region(
 /// class-fixed. Leaf digests pin to the slot-leaf `expected_leaf` statement
 /// wires which double as the state leg's entry wires (the leaf↔path closure),
 /// and each leg root pins to the composite-root statement wires (path↔root).
+///
+/// `txr` (tx-root region handoff, [`TxRootRegionData`]): when `Some`, the
+/// block's tx-root Merkle paths ride walk B as one more TAG_COMPRESS leg —
+/// entries are the SPINE tx-hash wires, every root pins to the header
+/// `tx_root` wires, the leaf POSITIONS are bound by const-pinning the
+/// committed direction cells to the leaf-index bits, and the last real
+/// path's right-hand sibling cells are const-pinned to the zero-subtree
+/// padding constants (exactly the bindings the inline slot pinned on its
+/// statement wires).
 pub fn discharge_auth_pcs_obligations_via_region(
     b: &mut FieldR1csBuilder,
     obligations: &[PendingAuthPcsObligation],
     natives: &[AuthMleOpeningProof],
     params: RegionDischargeParams,
     es: Option<&ExactStateRegionData>,
+    txr: Option<&TxRootRegionData>,
 ) -> Vec<RegionPcsClaim> {
     assert_eq!(obligations.len(), natives.len(), "one native proof per obligation");
     assert!(!obligations.is_empty(), "at least one obligation");
@@ -318,6 +329,15 @@ pub fn discharge_auth_pcs_obligations_via_region(
             leg_caps.push(2usize.div_ceil(k));
             leg_ivs.push(iv_flat_of_tag(TAG_RGDNODE));
         }
+    }
+    // Tx-root paths: one TAG_COMPRESS leg (the same tree hash as the wallet
+    // legs), one path per user tx chunked across the tx blocks.
+    let txr_leg = leg_depths.len();
+    if let Some(t) = txr {
+        assert!(!t.paths.is_empty(), "tx-root region handoff without paths");
+        leg_depths.push(t.depth);
+        leg_caps.push(t.paths.len().div_ceil(k));
+        leg_ivs.push(compress_iv_flat());
     }
     let n_legs = leg_depths.len();
     let mut meta_bases = Vec::with_capacity(n_legs);
@@ -1229,6 +1249,85 @@ pub fn discharge_auth_pcs_obligations_via_region(
                     blk * per_tx_block_b + meta_bases[es_guard_leg],
                     &guard_paths,
                 );
+            }
+        }
+    }
+
+    // ===================================================================
+    // Tx-root paths (block-level, chunked like the exact-state families):
+    // one TAG_COMPRESS walk-B leg, entries = the spine tx-hash wires, every
+    // root = the header tx_root wires. The leaf POSITION is bound by
+    // const-pinning the committed direction cells to the leaf-index bits
+    // (block content never moves a tx to another slot), and the padding rim
+    // by const-pinning the LAST real path's right-hand sibling cells to the
+    // zero-subtree constants — the exact bindings the inline slot pinned on
+    // its statement wires. Const pins are self-testing: a wrong bit or rim
+    // constant makes the HONEST witness unsatisfiable.
+    // ===================================================================
+    if let Some(t) = txr {
+        let cap = leg_caps[txr_leg];
+        let stride = (2 * t.depth).next_power_of_two();
+        let d_col = 6 + 5 * txr_leg + 4;
+        let sib_cols = [6 + 5 * txr_leg + 2, 6 + 5 * txr_leg + 3];
+        let n_paths = t.paths.len();
+        assert_eq!(t.rim_flat.len(), t.depth, "one rim constant per level");
+        for blk in 0..k {
+            let lo = (blk * cap).min(n_paths);
+            let hi = ((blk + 1) * cap).min(n_paths);
+            let real: Vec<EsPathReal> = (lo..hi)
+                .map(|j| {
+                    let p = &t.paths[j];
+                    assert_eq!(p.siblings.len(), t.depth, "tx-root path depth");
+                    EsPathReal {
+                        entry_flat: p.entry_flat,
+                        entry_w: p.entry_w.clone(),
+                        siblings: p.siblings.clone(),
+                        directions: (0..t.depth).map(|l| (j >> l) & 1 == 1).collect(),
+                        root_flat: t.root_flat,
+                        root_w: t.root_w.clone(),
+                    }
+                })
+                .collect();
+            let region_base = blk * per_tx_block_b + meta_bases[txr_leg];
+            fill_es_merkle_leg(
+                &mut cb,
+                &mut s0b,
+                &mut soutb,
+                &mut acc_entry_wires[txr_leg],
+                &mut acc_root_wires[txr_leg],
+                &mut acc_committed_roots[txr_leg],
+                &mut acc_path_slots[txr_leg],
+                &mut acc_recomputed_roots[txr_leg],
+                t.depth,
+                cap,
+                leg_ivs[txr_leg],
+                6 + 5 * txr_leg,
+                region_base,
+                &real,
+            );
+            for (i, j) in (lo..hi).enumerate() {
+                let base = region_base + i * stride;
+                for level in 0..t.depth {
+                    let bit = (j >> level) & 1 == 1;
+                    cell_pins_b.push((
+                        d_col,
+                        base + 2 * level,
+                        LinExpr::constant(if bit { F128::ONE } else { F128::ZERO }),
+                    ));
+                }
+                if j == n_paths - 1 {
+                    for level in 0..t.depth {
+                        if (j >> level) & 1 == 0 {
+                            for lane in 0..2 {
+                                cell_pins_b.push((
+                                    sib_cols[lane],
+                                    base + 2 * level,
+                                    LinExpr::constant(t.rim_flat[level][lane]),
+                                ));
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -2156,6 +2255,37 @@ fn lanes_flat(d: &[u8; 32]) -> [F128; 2] {
         phi(Block128::from(u128::from_le_bytes(d[..16].try_into().unwrap()))),
         phi(Block128::from(u128::from_le_bytes(d[16..].try_into().unwrap()))),
     ]
+}
+
+/// The tx-root region handoff: every user tx's body-hash Merkle path to the
+/// header `tx_root`, as ONE walk-B TAG_COMPRESS leg. Entries are the SPINE
+/// tx-hash wires (the leaf closure); the root is the header `tx_root` wire
+/// pair (the root closure); direction bits are the CONSTANT leaf-index bits
+/// and the last real path's right-hand siblings are the zero-subtree padding
+/// constants — both become const cell pins on the committed D/SIB cells.
+pub struct TxRootRegionData {
+    /// The padded tx-tree depth (class data:
+    /// `1 << depth = n_txs.next_power_of_two().max(2)`).
+    pub depth: usize,
+    /// The header `tx_root` statement wires — every path's expected root.
+    pub root_w: [LinExpr; 2],
+    pub root_flat: [F128; 2],
+    /// One path per user tx, in tx order (path `j`'s leaf position is `j`).
+    pub paths: Vec<TxRootPathRegion>,
+    /// Zero-subtree digest lanes per level (`Z_0 = zero leaf`,
+    /// `Z_{l+1} = compress(Z_l, Z_l)`) — the padding-rim constants.
+    pub rim_flat: Vec<[F128; 2]>,
+}
+
+/// One tx-root path's region handoff. The direction bits are NOT carried:
+/// they are the leaf-index bits of the path's position in
+/// [`TxRootRegionData::paths`], const-pinned in the leg fill.
+pub struct TxRootPathRegion {
+    /// The spine tx-hash wires — the walk-B entry (shared-wire leaf closure).
+    pub entry_w: [LinExpr; 2],
+    pub entry_flat: [F128; 2],
+    /// Sibling digests, flat lanes, `[..depth]`.
+    pub siblings: Vec<[F128; 2]>,
 }
 
 /// The flat-basis capacity IV of a consensus domain tag (mirror of the

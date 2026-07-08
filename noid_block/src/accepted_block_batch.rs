@@ -1747,6 +1747,7 @@ mod tests {
                 }),
                 owner_auth_region: false,
                 exact_state_region: false,
+                tx_root_region: false,
             };
             let mut b = FieldR1csBuilder::new();
             let slots = build_block_slots_with_config(
@@ -1805,6 +1806,7 @@ mod tests {
                 wallet_pcs_region: Some(rp),
                 owner_auth_region: false,
                 exact_state_region: false,
+                tx_root_region: false,
             };
             let sample = LinkBlock {
                 start_accumulator: &units[0].start_accumulator,
@@ -1820,6 +1822,7 @@ mod tests {
                     units[0].start_accumulator.clone(),
                     rp,
                     &sample,
+                    false,
                     false,
                     false,
                 );
@@ -2221,12 +2224,13 @@ mod tests {
         let region_params = RegionDischargeParams { nq: 2, sb8_auth_layers: 1 };
         let units = chained_multi_tx_blocks(1, 2);
         let u = &units[0];
-        let scratch = region_wallet_pcs_native(&u.inputs, region_params, false, false);
+        let scratch = region_wallet_pcs_native(&u.inputs, region_params, false, false, false);
         let cfg = BlockSlotsConfig {
             discharge_wallet_pcs: true,
             wallet_pcs_region: Some(region_params),
             owner_auth_region: false,
             exact_state_region: false,
+            tx_root_region: false,
         };
         let mut b = FieldR1csBuilder::new();
         let slots = build_block_slots_with_config(
@@ -2398,6 +2402,7 @@ mod tests {
             wallet_pcs_region: Some(RegionDischargeParams { nq: 2, sb8_auth_layers: 1 }),
             owner_auth_region: true,
             exact_state_region: true,
+            tx_root_region: true,
         };
         let mut b = FieldR1csBuilder::new();
         let slots = build_block_slots_with_config(
@@ -2451,9 +2456,11 @@ mod tests {
                 "parent guard-root wire"
             );
         }
-        // (c) inline path slots are gone in region mode.
+        // (c) inline path slots are gone in region mode — exact-state AND
+        // tx-root (its paths ride the walk-B TAG_COMPRESS leg).
         assert!(slots.exact_state.state_paths.is_empty(), "no inline state-path slot");
         assert!(slots.exact_state.guard_paths.is_none(), "no inline guard-path slot");
+        assert!(slots.tx_root_paths.is_empty(), "no inline tx-root slot");
         eprintln!(
             "[es-region] parity OK: {} wires, {} region claims, {} slot leaves",
             z.len(),
@@ -2484,7 +2491,22 @@ mod tests {
             bad[wire_of(&slots.exact_state.state_roots[1].utxo_root[0])] += F128::ONE;
             assert!(!r1cs.satisfies(&bad), "flipped utxo-root wire accepted");
         }
-        eprintln!("[es-region] all three one-flip negatives rejected");
+        // 4. Spine tx-hash wire — the tx-root leaf closure: bound to the
+        //    walk-B tx-root leg's entry cell (and the spine killshot).
+        {
+            let mut bad = z.clone();
+            bad[wire_of(&slots.tx_hashes[0][0])] += F128::ONE;
+            assert!(!r1cs.satisfies(&bad), "flipped spine tx-hash wire accepted");
+        }
+        // 5. Header tx_root wire — the tx-root root closure (also bound by the
+        //    header-hash killshot and the claim pins).
+        {
+            use noid_recursive::acceptance::block_slots::header_fields;
+            let mut bad = z.clone();
+            bad[wire_of(&slots.header.fields[header_fields::TX_ROOT])] += F128::ONE;
+            assert!(!r1cs.satisfies(&bad), "flipped header tx_root wire accepted");
+        }
+        eprintln!("[es-region] all five one-flip negatives rejected");
     }
 
     /// MEMORY / SHAPE measurement for `BlockSlotsConfig::owner_auth_region`.
@@ -2517,12 +2539,14 @@ mod tests {
             wallet_pcs_region: Some(region_params),
             owner_auth_region: false,
             exact_state_region: false,
+            tx_root_region: false,
         };
         let cfg_region = BlockSlotsConfig {
             discharge_wallet_pcs: true,
             wallet_pcs_region: Some(region_params),
             owner_auth_region: true,
             exact_state_region: false,
+            tx_root_region: false,
         };
 
         // Inline-owner-auth path: build, extract numbers + wallet-PCS claim
@@ -2614,7 +2638,7 @@ mod tests {
         // cells; its output MUST match the real build's `pending_wallet_pcs`
         // natives, in ORDER, for the owner-auth-region path too (the mirror). Gate
         // it directly against the real region build above.
-        let scratch = region_wallet_pcs_native(&u.inputs, region_params, true, false);
+        let scratch = region_wallet_pcs_native(&u.inputs, region_params, true, false, false);
         assert_eq!(
             scratch.len(),
             pcs_region_all.len(),
@@ -2679,6 +2703,7 @@ mod tests {
             wallet_pcs_region: None,
             owner_auth_region: false,
             exact_state_region: false,
+            tx_root_region: false,
         };
         let layout = link_io_layout_for(shape.k_log, true);
 
@@ -2908,6 +2933,7 @@ mod tests {
         region_params: noid_recursive::acceptance::trace::region_source_binding::RegionDischargeParams,
         owner_auth_region: bool,
         exact_state_region: bool,
+        tx_root_region: bool,
     ) {
         use noid_ivc_core::challenger::FsLaneChallenger;
         use noid_ivc_core::field::F128;
@@ -2947,6 +2973,7 @@ mod tests {
             wallet_pcs_region: Some(region_params),
             owner_auth_region,
             exact_state_region,
+            tx_root_region,
         };
 
         fn mk(u: &BlockUnit, config: BlockSlotsConfig) -> LinkBlock<'_> {
@@ -2969,6 +2996,7 @@ mod tests {
             &mk(&units[0], region_cfg),
             owner_auth_region,
             exact_state_region,
+            tx_root_region,
         );
         eprintln!(
             "[region-link] class frozen in {:.1?}: owner_auth_region={owner_auth_region}, \
@@ -2988,10 +3016,22 @@ mod tests {
         // (different claim count -> different IO layout -> different matrix).
         if owner_auth_region {
             let lb = mk(&units[0], region_cfg);
-            let wallet_only =
-                region_wallet_pcs_native(lb.inputs, region_params, false, exact_state_region).len();
-            let with_owner_auth =
-                region_wallet_pcs_native(lb.inputs, region_params, true, exact_state_region).len();
+            let wallet_only = region_wallet_pcs_native(
+                lb.inputs,
+                region_params,
+                false,
+                exact_state_region,
+                tx_root_region,
+            )
+            .len();
+            let with_owner_auth = region_wallet_pcs_native(
+                lb.inputs,
+                region_params,
+                true,
+                exact_state_region,
+                tx_root_region,
+            )
+            .len();
             eprintln!(
                 "[region-link] owner-auth region delta: wallet-PCS-only={wallet_only} claims, \
                  with-owner-auth={with_owner_auth} claims (+{} walk-C); frozen={}",
@@ -3232,6 +3272,7 @@ mod tests {
             RegionDischargeParams { nq: 2, sb8_auth_layers: 1 },
             false,
             false,
+            false,
         );
     }
 
@@ -3249,6 +3290,7 @@ mod tests {
         run_region_block_bearing_gate(
             &units,
             RegionDischargeParams { nq: 2, sb8_auth_layers: 1 },
+            false,
             false,
             false,
         );
@@ -3274,6 +3316,7 @@ mod tests {
             RegionDischargeParams { nq: 2, sb8_auth_layers: 1 },
             true,
             false,
+            false,
         );
     }
 
@@ -3294,6 +3337,30 @@ mod tests {
         run_region_block_bearing_gate(
             &units,
             RegionDischargeParams { nq: 2, sb8_auth_layers: 1 },
+            true,
+            true,
+            false,
+        );
+    }
+
+    /// COMPLETE region block-bearing recursion with the TX-ROOT paths ALSO
+    /// discharged in the region (task 4c): one TAG_COMPRESS walk-B leg per
+    /// block (entries = the spine tx-hash wires, roots = the header tx_root
+    /// wires, positions + padding rim const-cell-pinned), on top of
+    /// owner-auth (walk C) and exact-state (walk A tiles + walk B legs) —
+    /// EVERY per-tx-growing [K] hashing family now rides the region. π₀ is a
+    /// COMPLETE block-bearing proof; π₁ ⊳ π₀; the decider accepts. A
+    /// DISTINCT, larger class than the exact-state one (the tx-root leg adds
+    /// frozen claims — a different class matrix + digest).
+    #[test]
+    #[ignore = "heavy (m=24, several 2^24 proofs + one class digest); run explicitly"]
+    fn region_complete_block_bearing_tx_root_link_e2e() {
+        use noid_recursive::acceptance::trace::region_source_binding::RegionDischargeParams;
+        let units = chained_std_tx_blocks(2);
+        run_region_block_bearing_gate(
+            &units,
+            RegionDischargeParams { nq: 2, sb8_auth_layers: 1 },
+            true,
             true,
             true,
         );
@@ -3339,6 +3406,7 @@ mod tests {
             wallet_pcs_region: None,
             owner_auth_region: false,
             exact_state_region: false,
+            tx_root_region: false,
         };
         let r0 = build(&units[0], no_pcs, "block 0 (height 1, no wallet-PCS)");
         let r1 = build(&units[1], no_pcs, "block 1 (height 2, no wallet-PCS)");
@@ -3420,6 +3488,7 @@ mod tests {
             }),
             owner_auth_region: false,
             exact_state_region: false,
+            tx_root_region: false,
         });
     }
 
@@ -3442,6 +3511,30 @@ mod tests {
             }),
             owner_auth_region: false,
             exact_state_region: true,
+            tx_root_region: false,
+        });
+    }
+
+    /// Class-fixity gate for the TX-ROOT region leg (task 4c): the same
+    /// two-real-blocks matrix + claim-structure comparison with
+    /// `tx_root_region = true` (exact-state ON too — the production stack).
+    /// The tx-root leg's direction/rim const pins and path layout must be a
+    /// pure function of (tx count, depth, K) — any block-content-derived
+    /// index in a pin or claim point/value drifts here.
+    #[test]
+    #[ignore = "heavy (two region-ON block-slot builds); run explicitly"]
+    fn region_tx_root_class_fixed_across_two_blocks() {
+        use noid_recursive::acceptance::block_slots::BlockSlotsConfig;
+        use noid_recursive::acceptance::trace::region_source_binding::RegionDischargeParams;
+        run_region_class_fixity_gate(BlockSlotsConfig {
+            discharge_wallet_pcs: true,
+            wallet_pcs_region: Some(RegionDischargeParams {
+                nq: 2,
+                sb8_auth_layers: 1,
+            }),
+            owner_auth_region: false,
+            exact_state_region: true,
+            tx_root_region: true,
         });
     }
 

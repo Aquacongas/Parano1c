@@ -75,7 +75,7 @@ use super::trace::accepted_claim_hash::{build_accepted_claim_hash_slot, Accepted
 use super::trace::auth_pcs::discharge_auth_pcs_obligation;
 use super::trace::region_source_binding::{
     discharge_auth_pcs_obligations_via_region, discharge_owner_auth_killshots_via_region,
-    RegionDischargeParams, RegionPcsClaim,
+    RegionDischargeParams, RegionPcsClaim, TxRootPathRegion, TxRootRegionData,
 };
 use super::trace::checkpoint_poseidon::{
     build_checkpoint_poseidon_slot_with_inputs, ChainAccumulatorBatchInputsTrace,
@@ -90,8 +90,8 @@ use super::trace::owner_auth::{
 };
 use super::trace::tx_body_spine::{build_standard_tx_body_slot, SpineInputsTrace};
 use super::trace::{
-    alloc_block, const_block, flat_const, mul, pin_eq, pin_zero, range_check_bits, FieldR1csBuilder,
-    LinExpr, RawChannelTrace, F128,
+    alloc_block, const_block, flat_const, flat_of, mul, pin_eq, pin_zero, range_check_bits,
+    FieldR1csBuilder, LinExpr, RawChannelTrace, F128,
 };
 use crate::accumulator::ChainAccumulator;
 use crate::block_certificate_backend::{
@@ -264,6 +264,109 @@ fn zero_subtree_lanes(depth: usize) -> Vec<[Block128; 2]> {
     out
 }
 
+/// Assemble the tx-root region handoff from already-allocated statement
+/// wires — the real build passes the header `tx_root` pair + the spine
+/// tx-hash wires; the scratch mirror passes throwaway allocs of the same
+/// natives. Pure transliteration of the killshot statement (depth, one path
+/// per tx in tx order, shared expected root, rim constants); every wire is
+/// asserted to carry its native value at build time.
+fn tx_root_region_data_from_wires(
+    b: &FieldR1csBuilder,
+    tx_root_inputs: &[noid_gkr::merkle_circuit::MerklePathInputs],
+    root_w: [LinExpr; 2],
+    entry_ws: &[[LinExpr; 2]],
+) -> TxRootRegionData {
+    let n_txs = tx_root_inputs.len();
+    assert!(n_txs > 0, "tx-root region handoff without paths");
+    assert_eq!(
+        n_txs,
+        entry_ws.len(),
+        "pure-standard tier: every tx is a spine instance"
+    );
+    let depth = tx_root_inputs[0].active_depth;
+    assert_eq!(1usize << depth, n_txs.next_power_of_two().max(2));
+    let root_native = tx_root_inputs[0].expected_root;
+    let root_flat = [flat_of(root_native[0]), flat_of(root_native[1])];
+    for lane in 0..2 {
+        assert_eq!(
+            root_w[lane].eval(b.values()),
+            root_flat[lane],
+            "header tx_root wire != the killshot statement root"
+        );
+    }
+    let paths: Vec<TxRootPathRegion> = tx_root_inputs
+        .iter()
+        .enumerate()
+        .map(|(j, p)| {
+            assert_eq!(p.active_depth, depth, "all tx-root paths share the depth");
+            assert_eq!(
+                p.expected_root, root_native,
+                "tx-root path {j} root != the header tx_root"
+            );
+            let entry_flat = [flat_of(p.leaf[0]), flat_of(p.leaf[1])];
+            for lane in 0..2 {
+                assert_eq!(
+                    entry_ws[j][lane].eval(b.values()),
+                    entry_flat[lane],
+                    "spine tx hash {j} != the tx-root leaf"
+                );
+            }
+            TxRootPathRegion {
+                entry_w: entry_ws[j].clone(),
+                entry_flat,
+                siblings: p.siblings[..depth]
+                    .iter()
+                    .map(|s| [flat_of(s[0]), flat_of(s[1])])
+                    .collect(),
+            }
+        })
+        .collect();
+    TxRootRegionData {
+        depth,
+        root_w,
+        root_flat,
+        paths,
+        rim_flat: zero_subtree_lanes(depth)
+            .iter()
+            .map(|z| [flat_of(z[0]), flat_of(z[1])])
+            .collect(),
+    }
+}
+
+/// The real build's tx-root handoff: header `tx_root` wires + spine tx-hash
+/// wires (the shared-wire leaf/root closures).
+fn tx_root_region_handoff(
+    b: &FieldR1csBuilder,
+    tx_root_inputs: &[noid_gkr::merkle_circuit::MerklePathInputs],
+    header: &HeaderHashInputsTrace,
+    tx_hashes: &[[LinExpr; 2]],
+) -> TxRootRegionData {
+    let root_w = [
+        header.fields[header_fields::TX_ROOT].clone(),
+        header.fields[header_fields::TX_ROOT + 1].clone(),
+    ];
+    tx_root_region_data_from_wires(b, tx_root_inputs, root_w, tx_hashes)
+}
+
+/// Tx-root region handoff on THROWAWAY wires (fresh allocs of the same
+/// natives) — the `region_wallet_pcs_native` mirror; the plural's native
+/// claim `(point, value)` sequences depend only on native values + layout.
+fn scratch_tx_root_region_data(
+    pb: &mut FieldR1csBuilder,
+    tx_root_inputs: &[noid_gkr::merkle_circuit::MerklePathInputs],
+) -> TxRootRegionData {
+    let root_native = tx_root_inputs[0].expected_root;
+    let root_w = [
+        alloc_block(pb, root_native[0]),
+        alloc_block(pb, root_native[1]),
+    ];
+    let entry_ws: Vec<[LinExpr; 2]> = tx_root_inputs
+        .iter()
+        .map(|p| [alloc_block(pb, p.leaf[0]), alloc_block(pb, p.leaf[1])])
+        .collect();
+    tx_root_region_data_from_wires(pb, tx_root_inputs, root_w, &entry_ws)
+}
+
 // ---------------------------------------------------------------------------
 // Assembly
 // ---------------------------------------------------------------------------
@@ -360,6 +463,17 @@ pub struct BlockSlotsConfig {
     /// the wallet-PCS region walks (a new walk is never spawned), so the plural
     /// discharge must run. `false` = the inline killshot replays.
     pub exact_state_region: bool,
+    /// When true, verify the tx-root Merkle paths via the shared region walks
+    /// instead of the inline batched killshot: one TAG_COMPRESS walk-B leg,
+    /// entries = the SPINE tx-hash wires, roots = the header `tx_root` wires,
+    /// leaf positions bound by const-pinning the committed direction cells to
+    /// the leaf-index bits, and the padding rim by const-pinning the last real
+    /// path's right-hand sibling cells to the zero-subtree constants — exactly
+    /// the bindings the inline slot pins on its statement wires.
+    ///
+    /// REQUIRES `wallet_pcs_region.is_some()` (the leg rides walk B).
+    /// `false` = the inline killshot replay.
+    pub tx_root_region: bool,
 }
 
 impl Default for BlockSlotsConfig {
@@ -369,6 +483,7 @@ impl Default for BlockSlotsConfig {
             wallet_pcs_region: None,
             owner_auth_region: false,
             exact_state_region: false,
+            tx_root_region: false,
         }
     }
 }
@@ -431,6 +546,11 @@ pub fn build_block_slots_with_config(
         !config.exact_state_region || config.wallet_pcs_region.is_some(),
         "exact_state_region requires wallet_pcs_region (the exact-state families \
          ride the wallet-PCS region walks; a new walk is never spawned)"
+    );
+    assert!(
+        !config.tx_root_region || config.wallet_pcs_region.is_some(),
+        "tx_root_region requires wallet_pcs_region (the tx-root leg rides the \
+         wallet-PCS region walk B; a new walk is never spawned)"
     );
 
     // ---- Primary statement wires: header, claim, accumulator boundary.
@@ -519,8 +639,23 @@ pub fn build_block_slots_with_config(
     };
 
     // ---- tx_root component: paths for the REAL leaves, position-pinned.
+    // Region mode moves the path hashing onto the shared walk B (one
+    // TAG_COMPRESS leg): the entry/root closures ride the SAME statement
+    // wires (spine tx hashes / header tx_root) via cell pins, and the
+    // position + padding-rim bindings become const cell pins on the
+    // committed direction/sibling cells — the exact constants pinned below
+    // on the inline slot's statement wires.
+    let mut tx_root_region_data: Option<TxRootRegionData> = None;
     let tx_root_paths = if inputs.tx_root_inputs.is_empty() {
         assert!(proof.tx_root.is_none());
+        Vec::new()
+    } else if config.tx_root_region {
+        tx_root_region_data = Some(tx_root_region_handoff(
+            b,
+            &inputs.tx_root_inputs,
+            &header,
+            &tx_hashes,
+        ));
         Vec::new()
     } else {
         let circuit = MerkleCircuit::build();
@@ -700,15 +835,15 @@ pub fn build_block_slots_with_config(
     // public IO. `k` = tx count must be a power of two (the plural asserts it; a
     // tier pads its real txs to next_pow2 with ghost obligations).
     if let Some(params) = config.wallet_pcs_region {
-        if config.exact_state_region {
-            // The exact-state families ride the plural discharge's walks; a
-            // block-bearing region class always carries at least one tx, so an
-            // empty obligation set (which would skip the plural and leave the
-            // exact-state hashing undischarged) is unreachable by construction.
+        if config.exact_state_region || config.tx_root_region {
+            // The exact-state / tx-root families ride the plural discharge's
+            // walks; a block-bearing region class always carries at least one
+            // tx, so an empty obligation set (which would skip the plural and
+            // leave that hashing undischarged) is unreachable by construction.
             assert!(
                 !region_obligations.is_empty(),
-                "exact_state_region with no wallet-PCS obligations (a block-bearing \
-                 region class always has txs)"
+                "exact_state_region/tx_root_region with no wallet-PCS obligations \
+                 (a block-bearing region class always has txs)"
             );
         }
         if !region_obligations.is_empty() {
@@ -720,6 +855,7 @@ pub fn build_block_slots_with_config(
                 &region_natives,
                 params,
                 es_region_data.as_ref(),
+                tx_root_region_data.as_ref(),
             ));
         }
     }
@@ -813,11 +949,13 @@ pub fn build_block_slots_with_config(
 /// a scratch exact-state region handoff (fresh wires, same native values) is
 /// threaded into the plural discharge, so the walk-A/B columns — hence every
 /// native claim `(point, value)` — mirror the real build exactly.
+/// `tx_root_region` is the same contract for the tx-root walk-B leg.
 pub fn region_wallet_pcs_native(
     inputs: &AcceptedBlockBatchComponentInputs,
     params: RegionDischargeParams,
     owner_auth_region: bool,
     exact_state_region: bool,
+    tx_root_region: bool,
 ) -> Vec<(Vec<F128>, F128)> {
     if inputs.authorization_inputs.is_empty() {
         return Vec::new();
@@ -827,6 +965,8 @@ pub fn region_wallet_pcs_native(
     let scratch_es = exact_state_region.then(|| {
         scratch_exact_state_region_data(&mut pb, &inputs.exact_state_killshot_inputs[0])
     });
+    let scratch_txr = (tx_root_region && !inputs.tx_root_inputs.is_empty())
+        .then(|| scratch_tx_root_region_data(&mut pb, &inputs.tx_root_inputs));
     // Produce the wallet-PCS obligations + natives the SAME way the real build
     // does for this `owner_auth_region` mode.
     let (obligations, natives) = if owner_auth_region {
@@ -891,6 +1031,7 @@ pub fn region_wallet_pcs_native(
         &natives,
         params,
         scratch_es.as_ref(),
+        scratch_txr.as_ref(),
     ) {
         out.push((c.native_point, c.native_value));
     }
