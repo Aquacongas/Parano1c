@@ -318,6 +318,16 @@ pub struct LinkClass {
     /// owner-auth discharge produces the obligations the wallet-PCS discharge
     /// then consumes).
     pub owner_auth_region: bool,
+    /// When true, this block-bearing region class verifies each block's
+    /// exact-state HASHING killshots (slot leaves, state paths, guard paths)
+    /// on the shared region walks instead of the inline per-slot replays: the
+    /// slot-leaf sponge tiles ride the wallet-PCS discharge's walk A and the
+    /// state/guard Merkle paths ride its walk B as extra legs, so exact-state
+    /// verification is touched-slot-count flat AND the exact-state internal
+    /// wiring residue (leaf↔path↔root) is closed in-trace. The frozen
+    /// `region_claims` grow by the extra walk-B leg claims. Only meaningful
+    /// when `region_params` is `Some` (the families ride those walks).
+    pub exact_state_region: bool,
 }
 
 impl LinkClass {
@@ -361,6 +371,7 @@ impl LinkClass {
             region_claims: Vec::new(),
             region_max_arity: 0,
             owner_auth_region: false,
+            exact_state_region: false,
         }
     }
 
@@ -391,6 +402,7 @@ impl LinkClass {
         region_params: RegionDischargeParams,
         sample_block: &LinkBlock<'_>,
         owner_auth_region: bool,
+        exact_state_region: bool,
     ) -> Self {
         freeze_region_block_bearing(
             shape,
@@ -399,6 +411,7 @@ impl LinkClass {
             region_params,
             sample_block,
             owner_auth_region,
+            exact_state_region,
         )
     }
 
@@ -425,6 +438,7 @@ impl LinkClass {
                 discharge_wallet_pcs: true,
                 wallet_pcs_region: Some(params),
                 owner_auth_region: self.owner_auth_region,
+                exact_state_region: self.exact_state_region,
             },
             None => block.config,
         }
@@ -612,8 +626,13 @@ fn build_link_inner(class: &LinkClass, input: &LinkInput<'_>, freeze: bool) -> B
         // are irrelevant to the region values). The count must match the frozen
         // class shape; the full trace pass below re-derives the same claims with
         // their wires + slices and asserts the complete shape.
-        let region_native =
-            region_wallet_pcs_native(block.inputs, params, class.block_config(block).owner_auth_region);
+        let block_cfg = class.block_config(block);
+        let region_native = region_wallet_pcs_native(
+            block.inputs,
+            params,
+            block_cfg.owner_auth_region,
+            block_cfg.exact_state_region,
+        );
         assert_eq!(
             region_native.len(),
             class.region_claims.len(),
@@ -870,11 +889,13 @@ fn freeze_region_block_bearing(
     region_params: RegionDischargeParams,
     sample_block: &LinkBlock<'_>,
     owner_auth_region: bool,
+    exact_state_region: bool,
 ) -> LinkClass {
     let region_cfg = BlockSlotsConfig {
         discharge_wallet_pcs: true,
         wallet_pcs_region: Some(region_params),
         owner_auth_region,
+        exact_state_region,
     };
 
     // ---- Probe: a standalone discharge reveals the claim count + arities.
@@ -921,6 +942,7 @@ fn freeze_region_block_bearing(
         region_claims: Vec::new(),
         region_max_arity: max_arity,
         owner_auth_region,
+        exact_state_region,
     };
 
     // ---- Genesis dummy T + its proof over the placeholder spec (all-zero IO,
@@ -987,6 +1009,7 @@ fn freeze_region_block_bearing(
         region_claims: frozen,
         region_max_arity: max_arity,
         owner_auth_region,
+        exact_state_region,
     }
 }
 

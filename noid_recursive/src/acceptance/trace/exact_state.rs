@@ -22,6 +22,18 @@
 //! statement is fully witness-carried: occupancy, heights, digests and the
 //! class-padded spent list travel as wires with liveness selectors, so the
 //! guard slot's matrix depends only on the class's spend capacity.
+//!
+//! REGION MODE ([`build_exact_state_slot_with_config`] with `region = true`):
+//! the three per-tx-GROWING hashing killshots — slot_leaves (TAG_EXSTSLT
+//! sponge), state_paths (TAG_EXSTNOD Merkle) and guard_paths (TAG_RGDNODE
+//! Merkle) — are NOT replayed inline; their statement wires still allocate
+//! (amount range check, owner lanes, expected leaf digests) and the hashing
+//! moves onto the shared region walks via [`ExactStateRegionData`], which the
+//! wallet-PCS plural discharge consumes (sponge tiles on walk A, state/guard
+//! path legs on walk B). guard_buckets and state_roots STAY INLINE (bounded,
+//! class-capacity work). Region mode also CLOSES the exact-state internal
+//! wiring residue: the region ties leaf digests to path entries (shared
+//! wires) and path roots to the composite-root statement wires.
 
 use noid_core::{Block128, TowerField};
 use noid_gkr::guard_bucket_killshot::{
@@ -56,9 +68,11 @@ use super::merkle_path::{
     MerklePathInputsTrace,
 };
 use super::{
-    alloc_block, const_block, flat_of, lt_strict_expr, mul, pin_zero, range_check_bits,
-    BatchEvalReductionTrace, FieldR1csBuilder, LinExpr, RawChannelTrace,
+    alloc_block, const_block, flat_of, lt_strict_expr, mul, pin_zero, poseidon2b_permute,
+    range_check_bits, BatchEvalReductionTrace, FieldR1csBuilder, LinExpr, RawChannelTrace, F128,
 };
+use noid_chain::exact_state_hash::{state_node_hash, zero_slot_roots};
+use noid_ivc_core::deep_chain::leaf_hash::flat_sponge_leaf_hash;
 use noid_poseidon2b::native::permutation::{MDS_FULL, N_ROUNDS, STATE_SIZE};
 
 fn pad_after_one_field() -> Block128 {
@@ -679,13 +693,347 @@ pub fn discharge_batched_state_root_trace(
 // ---------------------------------------------------------------------------
 
 /// The statement wires of one exact-state component slot, returned for the
-/// [B] bindings.
+/// [B] bindings. In region mode (`build_exact_state_slot_with_config` with
+/// `region = true`) `state_paths` is empty and `guard_paths` is `None` — the
+/// path hashing lives on the region walks, not in inline killshot slots.
 pub struct ExactStateSlotWires {
     pub slot_leaves: Vec<SlotLeafInputsTrace>,
     pub state_paths: Vec<MerklePathInputsTrace>,
     pub guard_buckets: Option<GuardBucketUpdateInputsTrace>,
     pub guard_paths: Option<Vec<MerklePathInputsTrace>>,
     pub state_roots: Vec<CompositeStateRootInputsTrace>,
+}
+
+// ---------------------------------------------------------------------------
+// Region-mode data (the [D]-migration handoff to the shared region walks)
+// ---------------------------------------------------------------------------
+
+/// One slot leaf's region handoff: the statement WIRES (shared with the walk
+/// via cell pins — the same wires the walk-B state leg reads as its entry)
+/// plus the flat-basis natives the region column builder consumes.
+pub struct ExactStateLeafRegion {
+    pub amount_w: LinExpr,
+    pub owner_hi_w: LinExpr,
+    pub owner_lo_w: LinExpr,
+    pub expected_leaf_w: [LinExpr; 2],
+    pub amount_flat: F128,
+    pub owner_hi_flat: F128,
+    pub owner_lo_flat: F128,
+    pub expected_leaf_flat: [F128; 2],
+}
+
+/// One state Merkle path's region handoff (active-depth data only). The entry
+/// digest is NOT carried here: the walk reads it from the paired slot leaf's
+/// `expected_leaf` wires (`entry_leaf_index`), closing the leaf↔path residue.
+pub struct ExactStatePathRegion {
+    /// Sibling digests, flat lanes, `[..active_depth]`.
+    pub siblings: Vec<[F128; 2]>,
+    /// Direction bits, `[..active_depth]` (`true` = carried digest is RIGHT).
+    pub directions: Vec<bool>,
+    /// The paired slot-leaf index (old `i` ↔ path `i`, new `i` ↔ path `T+i`;
+    /// with `slot_leaves = old ++ new` this is just the path's own index).
+    pub entry_leaf_index: usize,
+    /// `true` for the old-root half (paths `0..T`), `false` for the new half.
+    pub is_old: bool,
+}
+
+/// The guard-path region handoff: entries are the guard-bucket statement's
+/// expected leaf digests (the bucket killshot STAYS INLINE and binds them),
+/// roots are the composite-root statement's guard-root wires.
+pub struct ExactStateGuardRegion {
+    /// The ReuseGuard tree depth (a protocol constant, read from the inputs).
+    pub depth: usize,
+    /// `[old, new]` bucket-leaf digest wires (the walk-B guard-leg entries).
+    pub entries_w: [[LinExpr; 2]; 2],
+    pub entries_flat: [[F128; 2]; 2],
+    /// `[old, new]` sibling stacks (identical stacks natively — the guard
+    /// update opens ONE bucket — but carried per path for uniformity).
+    pub siblings: [Vec<[F128; 2]>; 2],
+    pub directions: [Vec<bool>; 2],
+    /// `[parent, child]` guard-root wires (the composite-root statement's).
+    pub roots_w: [[LinExpr; 2]; 2],
+    pub roots_flat: [[F128; 2]; 2],
+}
+
+/// Everything the region walks need to discharge the exact-state hashing
+/// families (slot-leaf sponge tiles on walk A; state/guard Merkle legs on
+/// walk B). Assembled from the SAME native `ExactStateKillShotInputs` the
+/// inline killshots consume — a pure transliteration, no re-derivation.
+pub struct ExactStateRegionData {
+    /// `2T` leaves, old `++` new — index-paired with `paths`.
+    pub leaves: Vec<ExactStateLeafRegion>,
+    /// `2T` paths, old `++` new, all at depth `d_state`.
+    pub paths: Vec<ExactStatePathRegion>,
+    /// `child_log_slots` — every state path's active depth (class data).
+    pub d_state: usize,
+    /// Old-half expected root. Equal case: the parent composite statement's
+    /// `utxo_root` wires. Grow case: an inline 2-perm TAG_EXSTNOD compress
+    /// replay of `compress(parent_utxo, zeros[parent_log])` — the trace twin
+    /// of `state_node_hash` in the derive.
+    pub old_root_w: [LinExpr; 2],
+    pub old_root_flat: [F128; 2],
+    /// New-half expected root: the child composite statement's `utxo_root`.
+    pub new_root_w: [LinExpr; 2],
+    pub new_root_flat: [F128; 2],
+    pub guard: Option<ExactStateGuardRegion>,
+}
+
+/// Digest fields `[lo, hi]` (the killshot statement lane convention) back to
+/// the native 32-byte hash — the inverse of the derive's `digest_to_fields`.
+fn fields_to_digest(fields: [Block128; 2]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out[..16].copy_from_slice(&fields[0].0.to_le_bytes());
+    out[16..].copy_from_slice(&fields[1].0.to_le_bytes());
+    out
+}
+
+fn digest_to_fields(hash: [u8; 32]) -> [Block128; 2] {
+    [
+        Block128::from(u128::from_le_bytes(hash[..16].try_into().unwrap())),
+        Block128::from(u128::from_le_bytes(hash[16..].try_into().unwrap())),
+    ]
+}
+
+fn flat2(fields: [Block128; 2]) -> [F128; 2] {
+    [flat_of(fields[0]), flat_of(fields[1])]
+}
+
+/// Assemble the region handoff from already-allocated statement wires. The
+/// old-root rule mirrors `derive_exact_state_merkle_batch_inputs` exactly:
+/// equal `log_slots` reuses the parent composite `utxo_root`; the grow case
+/// (`child = parent + 1`, both class data, so the native branch is legal)
+/// replays `state_node_hash(parent_utxo, zeros[parent_log])` as an inline
+/// 2-perm TAG_EXSTNOD compress over the parent `utxo_root` wires.
+fn assemble_exact_state_region_data(
+    b: &mut FieldR1csBuilder,
+    inputs: &crate::block_certificate_backend::ExactStateKillShotInputs,
+    slot_leaves: &[SlotLeafInputsTrace],
+    guard_buckets: Option<&GuardBucketUpdateInputsTrace>,
+    state_roots: &[CompositeStateRootInputsTrace],
+) -> ExactStateRegionData {
+    assert_eq!(
+        state_roots.len(),
+        2,
+        "region mode expects the block's parent/child composite-root pair"
+    );
+    assert_eq!(
+        inputs.slot_leaves.len(),
+        inputs.state_paths.len(),
+        "one state path per slot leaf (old ++ new)"
+    );
+    assert!(inputs.state_paths.len() % 2 == 0, "old ++ new halves");
+    let t = inputs.state_paths.len() / 2;
+
+    // Leaves: statement wires + flat natives; the digest must be the real
+    // slot-leaf sponge (the walk-A tile digest pin rests on it).
+    let leaves: Vec<ExactStateLeafRegion> = inputs
+        .slot_leaves
+        .iter()
+        .zip(slot_leaves.iter())
+        .map(|(native, wires)| {
+            let leaf = ExactStateLeafRegion {
+                amount_w: wires.amount.clone(),
+                owner_hi_w: wires.owner_hi.clone(),
+                owner_lo_w: wires.owner_lo.clone(),
+                expected_leaf_w: wires.expected_leaf.clone(),
+                amount_flat: flat_of(Block128::from(native.amount)),
+                owner_hi_flat: flat_of(native.owner_hi),
+                owner_lo_flat: flat_of(native.owner_lo),
+                expected_leaf_flat: flat2(native.expected_leaf),
+            };
+            assert_eq!(
+                flat_sponge_leaf_hash(leaf.amount_flat, leaf.owner_hi_flat, leaf.owner_lo_flat),
+                leaf.expected_leaf_flat,
+                "slot-leaf statement digest != the flat sponge replay"
+            );
+            leaf
+        })
+        .collect();
+
+    // Old/new expected roots (`derive_exact_state_merkle_batch_inputs` rule).
+    let parent_log = inputs.state_roots[0].log_slots;
+    let child_log = inputs.state_roots[1].log_slots;
+    let (old_root_w, old_root_flat) = if child_log == parent_log {
+        (
+            state_roots[0].utxo_root.clone(),
+            flat2(inputs.state_roots[0].utxo_root),
+        )
+    } else if child_log == parent_log + 1 {
+        // Grow: old_root = state_node_hash(parent_utxo, zeros[parent_log]).
+        // The branch is on `log_slots` — CLASS data, so a native `if` is
+        // shape-legal. The zero subtree digest is a protocol constant.
+        let zeros = zero_slot_roots(parent_log as usize);
+        let z = digest_to_fields(zeros[parent_log as usize]);
+        let native = state_node_hash(
+            fields_to_digest(inputs.state_roots[0].utxo_root),
+            zeros[parent_log as usize],
+        );
+        // Inline 2-perm compress replay (compress_with_tag(TAG_EXSTNOD, l, r)):
+        //   state = [l0, l1, iv_hi, iv_lo]; permute;
+        //   state[0] += r0; state[1] += r1; permute; digest = state[0..2].
+        let iv = capacity_iv(TAG_EXSTNOD);
+        let u = &state_roots[0].utxo_root;
+        let s = poseidon2b_permute(
+            b,
+            [
+                u[0].clone(),
+                u[1].clone(),
+                const_block(iv[0]),
+                const_block(iv[1]),
+            ],
+        );
+        let [s0, s1, s2, s3] = s;
+        let s = poseidon2b_permute(
+            b,
+            [
+                s0.add(&const_block(z[0])),
+                s1.add(&const_block(z[1])),
+                s2,
+                s3,
+            ],
+        );
+        let flat = flat2(digest_to_fields(native));
+        for lane in 0..2 {
+            assert_eq!(
+                s[lane].eval(b.values()),
+                flat[lane],
+                "grow-case compress replay != native state_node_hash"
+            );
+        }
+        ([s[0].clone(), s[1].clone()], flat)
+    } else {
+        unreachable!("invalid log_slots pair (the native derive rejects it)");
+    };
+    let new_root_w = state_roots[1].utxo_root.clone();
+    let new_root_flat = flat2(inputs.state_roots[1].utxo_root);
+
+    // Paths: transliteration of the derived inputs, index-paired with the
+    // leaves; every root/leaf equality asserted natively.
+    let d_state = inputs.state_paths[0].active_depth;
+    let paths: Vec<ExactStatePathRegion> = inputs
+        .state_paths
+        .iter()
+        .enumerate()
+        .map(|(j, p)| {
+            assert_eq!(p.active_depth, d_state, "all state paths share the depth");
+            let is_old = j < t;
+            assert_eq!(
+                p.leaf, inputs.slot_leaves[j].expected_leaf,
+                "state path {j} leaf != its slot leaf digest"
+            );
+            if is_old {
+                assert_eq!(flat2(p.expected_root), old_root_flat, "old path root");
+            } else {
+                assert_eq!(flat2(p.expected_root), new_root_flat, "new path root");
+            }
+            ExactStatePathRegion {
+                siblings: p.siblings[..d_state].iter().map(|s| flat2(*s)).collect(),
+                directions: p.directions[..d_state].to_vec(),
+                entry_leaf_index: j,
+                is_old,
+            }
+        })
+        .collect();
+
+    // Guard: entries = the bucket statement's expected leaf digests (the
+    // inline bucket killshot binds them); roots = the composite statement's
+    // guard roots.
+    let guard = match (&inputs.guard_paths, &inputs.guard_buckets, guard_buckets) {
+        (Some(path_inputs), Some(bucket_native), Some(bucket_wires)) => {
+            assert_eq!(path_inputs.len(), 2, "guard paths = [old, new]");
+            let depth = path_inputs[0].active_depth;
+            assert_eq!(path_inputs[1].active_depth, depth);
+            assert_eq!(
+                path_inputs[0].leaf, bucket_native.old_leaf.expected_hash,
+                "old guard path leaf != old bucket hash"
+            );
+            assert_eq!(
+                path_inputs[1].leaf, bucket_native.new_leaf.expected_hash,
+                "new guard path leaf != new bucket hash"
+            );
+            assert_eq!(
+                path_inputs[0].expected_root, inputs.state_roots[0].guard_root,
+                "old guard root != parent composite guard root"
+            );
+            assert_eq!(
+                path_inputs[1].expected_root, inputs.state_roots[1].guard_root,
+                "new guard root != child composite guard root"
+            );
+            Some(ExactStateGuardRegion {
+                depth,
+                entries_w: [
+                    bucket_wires.old_leaf.expected_hash.clone(),
+                    bucket_wires.new_leaf.expected_hash.clone(),
+                ],
+                entries_flat: [
+                    flat2(bucket_native.old_leaf.expected_hash),
+                    flat2(bucket_native.new_leaf.expected_hash),
+                ],
+                siblings: [
+                    path_inputs[0].siblings[..depth].iter().map(|s| flat2(*s)).collect(),
+                    path_inputs[1].siblings[..depth].iter().map(|s| flat2(*s)).collect(),
+                ],
+                directions: [
+                    path_inputs[0].directions[..depth].to_vec(),
+                    path_inputs[1].directions[..depth].to_vec(),
+                ],
+                roots_w: [
+                    state_roots[0].guard_root.clone(),
+                    state_roots[1].guard_root.clone(),
+                ],
+                roots_flat: [
+                    flat2(inputs.state_roots[0].guard_root),
+                    flat2(inputs.state_roots[1].guard_root),
+                ],
+            })
+        }
+        (None, None, None) => None,
+        _ => unreachable!("guard presence asserted by the caller"),
+    };
+
+    ExactStateRegionData {
+        leaves,
+        paths,
+        d_state,
+        old_root_w,
+        old_root_flat,
+        new_root_w,
+        new_root_flat,
+        guard,
+    }
+}
+
+/// Region handoff on THROWAWAY wires — the native-mirror recovery the link's
+/// IO prefill uses (`region_wallet_pcs_native`). Allocates fresh wires
+/// carrying the same native values (no killshots, no proof needed): the
+/// plural discharge's walk-A/B native claim `(point, value)` sequences depend
+/// only on native VALUES + layout, never on wire ids, so this mirrors the
+/// real build exactly.
+pub fn scratch_exact_state_region_data(
+    pb: &mut FieldR1csBuilder,
+    inputs: &crate::block_certificate_backend::ExactStateKillShotInputs,
+) -> ExactStateRegionData {
+    let slot_leaves: Vec<SlotLeafInputsTrace> = inputs
+        .slot_leaves
+        .iter()
+        .map(|i| SlotLeafInputsTrace::alloc(pb, i))
+        .collect();
+    let guard_buckets = inputs
+        .guard_buckets
+        .as_ref()
+        .map(|g| GuardBucketUpdateInputsTrace::alloc(pb, g));
+    let state_roots: Vec<CompositeStateRootInputsTrace> = inputs
+        .state_roots
+        .iter()
+        .map(|i| CompositeStateRootInputsTrace::alloc(pb, i))
+        .collect();
+    assemble_exact_state_region_data(
+        pb,
+        inputs,
+        &slot_leaves,
+        guard_buckets.as_ref(),
+        &state_roots,
+    )
 }
 
 /// Trace twin of `block_certificate_backend::verify_exact_state_killshot`:
@@ -697,6 +1045,21 @@ pub fn build_exact_state_slot(
     inputs: &crate::block_certificate_backend::ExactStateKillShotInputs,
     proof: &crate::block_certificate_backend::ExactStateKillShotProof,
 ) -> ExactStateSlotWires {
+    build_exact_state_slot_with_config(b, inputs, proof, false).0
+}
+
+/// [`build_exact_state_slot`] with the region toggle. `region = false` is the
+/// inline component exactly; `region = true` allocates the slot-leaf
+/// statement wires but SKIPS the three hashing killshots (slot_leaves,
+/// state_paths, guard_paths — they move onto the shared region walks) and
+/// returns the [`ExactStateRegionData`] handoff; guard_buckets and
+/// state_roots stay inline in both modes.
+pub fn build_exact_state_slot_with_config(
+    b: &mut FieldR1csBuilder,
+    inputs: &crate::block_certificate_backend::ExactStateKillShotInputs,
+    proof: &crate::block_certificate_backend::ExactStateKillShotProof,
+    region: bool,
+) -> (ExactStateSlotWires, Option<ExactStateRegionData>) {
     // validate_exact_state_inputs
     assert!(!inputs.slot_leaves.is_empty());
     assert!(!inputs.state_paths.is_empty());
@@ -706,45 +1069,57 @@ pub fn build_exact_state_slot(
     assert_eq!(inputs.guard_buckets.is_some(), proof.guard_buckets.is_some());
     assert_eq!(inputs.guard_paths.is_some(), proof.guard_paths.is_some());
 
-    // Slot leaves.
+    // Slot leaves: the statement wires allocate in BOTH modes (amount range
+    // check, owner lanes, expected leaf); the sponge killshot replays only
+    // inline — in region mode the hashing rides the walk-A sponge tiles.
     let slot_leaves: Vec<SlotLeafInputsTrace> = inputs
         .slot_leaves
         .iter()
         .map(|i| SlotLeafInputsTrace::alloc(b, i))
         .collect();
-    let leaf_proof = SpongeFamilyProofTrace::alloc(
-        b,
-        &proof.slot_leaves.kill_shot,
-        &proof.slot_leaves.chain,
-        &proof.slot_leaves.batch,
-        proof.slot_leaves.num_vars,
-        proof.slot_leaves.live_slots,
-        inputs.slot_leaves.len() * SLOT_LEAF_PERMS,
-    );
-    assert_eq!(proof.slot_leaves.n_leaves, inputs.slot_leaves.len());
-    let mut ch = RawChannelTrace::new();
-    let leaf_reds = verify_batched_slot_leaf_killshot_trace(b, &mut ch, &leaf_proof, &slot_leaves);
-    discharge_batched_slot_leaf_trace(b, &slot_leaves, &leaf_reds);
+    if !region {
+        let leaf_proof = SpongeFamilyProofTrace::alloc(
+            b,
+            &proof.slot_leaves.kill_shot,
+            &proof.slot_leaves.chain,
+            &proof.slot_leaves.batch,
+            proof.slot_leaves.num_vars,
+            proof.slot_leaves.live_slots,
+            inputs.slot_leaves.len() * SLOT_LEAF_PERMS,
+        );
+        assert_eq!(proof.slot_leaves.n_leaves, inputs.slot_leaves.len());
+        let mut ch = RawChannelTrace::new();
+        let leaf_reds =
+            verify_batched_slot_leaf_killshot_trace(b, &mut ch, &leaf_proof, &slot_leaves);
+        discharge_batched_slot_leaf_trace(b, &slot_leaves, &leaf_reds);
+    }
 
-    // State Merkle paths (TAG_EXSTNOD).
-    let state_circuit = MerkleCircuit::build_with_tag(TAG_EXSTNOD);
-    let state_paths: Vec<MerklePathInputsTrace> = inputs
-        .state_paths
-        .iter()
-        .map(|i| MerklePathInputsTrace::alloc(b, i))
-        .collect();
-    let state_path_proof = BatchedMerkleProofTrace::alloc(b, &proof.state_paths, &state_paths);
-    let mut ch = RawChannelTrace::new();
-    let state_path_reds = verify_batched_merkle_killshot_trace(
-        b,
-        &mut ch,
-        &state_circuit,
-        &state_path_proof,
-        &state_paths,
-    );
-    discharge_batched_merkle_trace(b, &state_circuit, &state_paths, &state_path_reds);
+    // State Merkle paths (TAG_EXSTNOD) — inline only; the region walk-B state
+    // leg replays them with the SAME derived inputs otherwise.
+    let state_paths: Vec<MerklePathInputsTrace> = if region {
+        Vec::new()
+    } else {
+        let state_circuit = MerkleCircuit::build_with_tag(TAG_EXSTNOD);
+        let state_paths: Vec<MerklePathInputsTrace> = inputs
+            .state_paths
+            .iter()
+            .map(|i| MerklePathInputsTrace::alloc(b, i))
+            .collect();
+        let state_path_proof = BatchedMerkleProofTrace::alloc(b, &proof.state_paths, &state_paths);
+        let mut ch = RawChannelTrace::new();
+        let state_path_reds = verify_batched_merkle_killshot_trace(
+            b,
+            &mut ch,
+            &state_circuit,
+            &state_path_proof,
+            &state_paths,
+        );
+        discharge_batched_merkle_trace(b, &state_circuit, &state_paths, &state_path_reds);
+        state_paths
+    };
 
-    // Guard buckets + guard paths (optional, present together).
+    // Guard buckets (inline in BOTH modes — bounded class-capacity work; its
+    // statement carries the bucket-leaf digests the region guard leg reads).
     let guard_buckets = match (&inputs.guard_buckets, &proof.guard_buckets) {
         (Some(bucket_inputs), Some(bucket_proof)) => {
             let update = GuardBucketUpdateInputsTrace::alloc(b, bucket_inputs);
@@ -767,25 +1142,30 @@ pub fn build_exact_state_slot(
         _ => unreachable!("guard presence asserted above"),
     };
 
-    let guard_paths = match (&inputs.guard_paths, &proof.guard_paths) {
-        (Some(path_inputs), Some(path_proof)) => {
-            let circuit = MerkleCircuit::build_with_tag(TAG_RGDNODE);
-            let paths: Vec<MerklePathInputsTrace> = path_inputs
-                .iter()
-                .map(|i| MerklePathInputsTrace::alloc(b, i))
-                .collect();
-            let proof_t = BatchedMerkleProofTrace::alloc(b, path_proof, &paths);
-            let mut ch = RawChannelTrace::new();
-            let reds =
-                verify_batched_merkle_killshot_trace(b, &mut ch, &circuit, &proof_t, &paths);
-            discharge_batched_merkle_trace(b, &circuit, &paths, &reds);
-            Some(paths)
+    // Guard Merkle paths (TAG_RGDNODE) — inline only.
+    let guard_paths = if region {
+        None
+    } else {
+        match (&inputs.guard_paths, &proof.guard_paths) {
+            (Some(path_inputs), Some(path_proof)) => {
+                let circuit = MerkleCircuit::build_with_tag(TAG_RGDNODE);
+                let paths: Vec<MerklePathInputsTrace> = path_inputs
+                    .iter()
+                    .map(|i| MerklePathInputsTrace::alloc(b, i))
+                    .collect();
+                let proof_t = BatchedMerkleProofTrace::alloc(b, path_proof, &paths);
+                let mut ch = RawChannelTrace::new();
+                let reds =
+                    verify_batched_merkle_killshot_trace(b, &mut ch, &circuit, &proof_t, &paths);
+                discharge_batched_merkle_trace(b, &circuit, &paths, &reds);
+                Some(paths)
+            }
+            (None, None) => None,
+            _ => unreachable!("guard presence asserted above"),
         }
-        (None, None) => None,
-        _ => unreachable!("guard presence asserted above"),
     };
 
-    // Composite state roots.
+    // Composite state roots (inline in BOTH modes).
     let state_roots: Vec<CompositeStateRootInputsTrace> = inputs
         .state_roots
         .iter()
@@ -806,13 +1186,26 @@ pub fn build_exact_state_slot(
         verify_batched_state_root_killshot_trace(b, &mut ch, &root_family, &state_roots);
     discharge_batched_state_root_trace(b, &state_roots, &root_reds);
 
-    ExactStateSlotWires {
-        slot_leaves,
-        state_paths,
-        guard_buckets,
-        guard_paths,
-        state_roots,
-    }
+    let region_data = region.then(|| {
+        assemble_exact_state_region_data(
+            b,
+            inputs,
+            &slot_leaves,
+            guard_buckets.as_ref(),
+            &state_roots,
+        )
+    });
+
+    (
+        ExactStateSlotWires {
+            slot_leaves,
+            state_paths,
+            guard_buckets,
+            guard_paths,
+            state_roots,
+        },
+        region_data,
+    )
 }
 
 // ---------------------------------------------------------------------------

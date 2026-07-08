@@ -309,6 +309,92 @@ mod tests {
         assert!(proof.byte_len(&killshot_inputs) > 0);
     }
 
+    /// GROW-branch unit test for the exact-state REGION data (task 4b): a
+    /// 4→5 `SparseMerkleCache` transition. The derived state paths run at the
+    /// CHILD depth 5 against `old_root = state_node_hash(parent_utxo,
+    /// zeros[4])`; the region handoff must (a) compute `old_root_flat` as
+    /// φ(that native hash) and (b) carry `old_root_w` from the inline 2-perm
+    /// TAG_EXSTNOD compress replay over the parent `utxo_root` statement
+    /// wires — asserted by evaluating the wires in the built witness.
+    #[test]
+    fn exact_state_region_data_grow_branch() {
+        use noid_chain::exact_state_hash::{state_node_hash, zero_slot_roots};
+        use noid_ivc_core::deep_chain::schedule::flat_of_tower_u128;
+        use noid_ivc_core::field_circuit::FieldR1csBuilder;
+        use noid_recursive::acceptance::trace::exact_state::build_exact_state_slot_with_config;
+
+        let old = sv(10, 100);
+        let new = sv(7, 200);
+        let surface = surface(old, new);
+        // Parent tree at log_slots 4. The GROWN depth-5 tree keeps the parent
+        // leaves at their indices (5th direction bit 0) with an all-empty
+        // right half, so its root is state_node_hash(parent_root, zeros[4]).
+        let parent_cache = SparseMerkleCache::from_leaves(4, &[(2, slot_leaf_hash(old))]).unwrap();
+        let grown_cache = SparseMerkleCache::from_leaves(5, &[(2, slot_leaf_hash(old))]).unwrap();
+        let zeros = zero_slot_roots(4);
+        let grown_root = state_node_hash(parent_cache.root(), zeros[4]);
+        assert_eq!(grown_cache.root(), grown_root, "grown-root sanity");
+        let guard = ReuseGuard::new_empty();
+        let mut next_guard = guard.clone();
+        next_guard.apply_spends(10, &[2]).unwrap();
+        let child_utxo = SparseMerkleCache::from_leaves(5, &[(5, slot_leaf_hash(new))])
+            .unwrap()
+            .root();
+        let inputs = ExactStateTransitionInputs {
+            parent_state_root: composite_state_root(4, parent_cache.root(), guard.root()),
+            parent_log_slots: 4,
+            parent_utxo_root: parent_cache.root(),
+            parent_guard_root: guard.root(),
+            child_state_root: composite_state_root(5, child_utxo, next_guard.root()),
+            child_log_slots: 5,
+            height: 10,
+            parent_active_slot_count: 1,
+            parent_alloc_counter: 1,
+        };
+        // The transition proof's multiproof runs over the GROWN depth-5 tree.
+        let exact_proof =
+            crate::build_exact_state_transition_proof(&grown_cache, &surface, &guard, 10).unwrap();
+        let (killshot_inputs, verified) =
+            derive_exact_state_killshot_inputs(&inputs, &surface, &guard, &exact_proof, 8).unwrap();
+        assert_eq!(verified.child_state_root(), inputs.child_state_root);
+        assert_eq!(killshot_inputs.state_roots[0].log_slots, 4);
+        assert_eq!(killshot_inputs.state_roots[1].log_slots, 5);
+        let proof = prove_exact_state_killshot(&killshot_inputs).unwrap();
+        verify_exact_state_killshot(&killshot_inputs, &proof).unwrap();
+
+        let mut b = FieldR1csBuilder::new();
+        let (wires, region) =
+            build_exact_state_slot_with_config(&mut b, &killshot_inputs, &proof, true);
+        let region = region.expect("region data present in region mode");
+        // (a) old_root_flat == φ(state_node_hash(parent_utxo, zeros[4])).
+        let expected_flat = [
+            flat_of_tower_u128(u128::from_le_bytes(grown_root[..16].try_into().unwrap())),
+            flat_of_tower_u128(u128::from_le_bytes(grown_root[16..].try_into().unwrap())),
+        ];
+        assert_eq!(region.old_root_flat, expected_flat, "grow-case old_root_flat");
+        assert_eq!(region.d_state, 5, "state paths at the child depth");
+        assert!(
+            region.paths.iter().all(|p| p.siblings.len() == 5),
+            "path siblings at depth 5"
+        );
+        // (b) the inline compress-replay wires carry exactly that value, and
+        // the partial builder (statement wires + inline bucket/root killshots
+        // + the 2-perm replay) is satisfiable.
+        let (r1cs, z) = b.build();
+        assert!(r1cs.satisfies(&z), "region-mode exact-state slot satisfies");
+        for lane in 0..2 {
+            assert_eq!(
+                region.old_root_w[lane].eval(&z),
+                expected_flat[lane],
+                "grow-case compress replay wire lane {lane}"
+            );
+        }
+        // Region mode skips the inline path slots.
+        assert!(wires.state_paths.is_empty());
+        assert!(wires.guard_paths.is_none());
+        eprintln!("[es-grow] 4→5 grow branch: compress replay == state_node_hash, slot satisfies");
+    }
+
     #[test]
     fn exact_state_killshot_rejects_tampered_slot_leaf_statement() {
         let old = sv(10, 100);

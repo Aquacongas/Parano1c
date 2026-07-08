@@ -36,11 +36,16 @@
 //! NOT bound here (audited residue, each correctly scoped to another
 //! layer, none a hole in what this file claims):
 //! - exact-state INTERNAL wiring (slot leaves ↔ state paths ↔ utxo/guard
-//!   roots): each of the five killshots self-binds its own hash chain, but
-//!   the cross-killshot gluing (state-path root == composite utxo_root, and
-//!   likewise for guard) is a free witness pair here — natively guaranteed
-//!   by `derive_exact_state_killshot_inputs` re-deriving every input from
-//!   the one validated block. Lands with the region layer's per-tx algebra.
+//!   roots) — IN INLINE MODE ONLY (`exact_state_region = false`): each of
+//!   the five killshots self-binds its own hash chain, but the
+//!   cross-killshot gluing (state-path root == composite utxo_root, and
+//!   likewise for guard) is a free witness pair, natively guaranteed by
+//!   `derive_exact_state_killshot_inputs` re-deriving every input from the
+//!   one validated block. REGION MODE (`exact_state_region = true`) CLOSES
+//!   this residue: the slot-leaf sponge tiles pin their digest cells to the
+//!   `expected_leaf` statement wires, the walk-B state-leg entry cells pin
+//!   to the SAME wires (leaf ↔ path), and each leg root cell pins to the
+//!   composite-root statement's utxo/guard-root wires (path ↔ root).
 //! - public transaction logic — likewise a region-layer per-tx obligation.
 //! - the parent header's `active_slot_count` / `alloc_counter` (they feed
 //!   only the claim hash and there is no accumulator wire to pin them
@@ -76,7 +81,9 @@ use super::trace::checkpoint_poseidon::{
     build_checkpoint_poseidon_slot_with_inputs, ChainAccumulatorBatchInputsTrace,
     ChainAccumulatorItemTrace, HeaderHashInputsTrace,
 };
-use super::trace::exact_state::{build_exact_state_slot, ExactStateSlotWires};
+use super::trace::exact_state::{
+    build_exact_state_slot_with_config, scratch_exact_state_region_data, ExactStateSlotWires,
+};
 use super::trace::merkle_path::{build_batched_merkle_slot, MerklePathInputsTrace};
 use super::trace::owner_auth::{
     build_owner_auth_slot, OwnerAuthProofTrace, OwnerAuthPublicInputsTrace,
@@ -340,6 +347,19 @@ pub struct BlockSlotsConfig {
     /// wallet-PCS claims) for the link to thread through public-IO, so both must
     /// be discharged for a complete proof. `false` = the inline per-tx replay.
     pub owner_auth_region: bool,
+    /// When true, verify the exact-state HASHING killshots (slot_leaves,
+    /// state_paths, guard_paths — the per-touched-slot-growing pieces) via the
+    /// shared region walks instead of the inline per-slot replays: the slot-leaf
+    /// sponge tiles join the wallet-PCS discharge's walk A, the state/guard
+    /// Merkle paths join its walk B as extra legs (`ExactStateRegionData`
+    /// threaded into the plural discharge). guard_buckets and state_roots stay
+    /// inline. Region mode ALSO closes the exact-state internal-wiring residue
+    /// (leaf↔path↔root — see the module doc).
+    ///
+    /// REQUIRES `wallet_pcs_region.is_some()`: the exact-state families ride
+    /// the wallet-PCS region walks (a new walk is never spawned), so the plural
+    /// discharge must run. `false` = the inline killshot replays.
+    pub exact_state_region: bool,
 }
 
 impl Default for BlockSlotsConfig {
@@ -348,6 +368,7 @@ impl Default for BlockSlotsConfig {
             discharge_wallet_pcs: true,
             wallet_pcs_region: None,
             owner_auth_region: false,
+            exact_state_region: false,
         }
     }
 }
@@ -405,6 +426,11 @@ pub fn build_block_slots_with_config(
     assert_eq!(
         inputs.authorization_inputs.len(),
         inputs.authorization_totals.user_tx_count
+    );
+    assert!(
+        !config.exact_state_region || config.wallet_pcs_region.is_some(),
+        "exact_state_region requires wallet_pcs_region (the exact-state families \
+         ride the wallet-PCS region walks; a new walk is never spawned)"
     );
 
     // ---- Primary statement wires: header, claim, accumulator boundary.
@@ -541,6 +567,40 @@ pub fn build_block_slots_with_config(
         paths
     };
 
+    // ---- exact_state component + its statement anchors. Built BEFORE the
+    // authorization loop so region mode can thread its region handoff
+    // (`ExactStateRegionData`) into the plural wallet-PCS discharge below;
+    // its own inputs (claim/header wires) all exist by this point.
+    let (exact_state, es_region_data) = build_exact_state_slot_with_config(
+        b,
+        &inputs.exact_state_killshot_inputs[0],
+        &proof.exact_state[0],
+        config.exact_state_region,
+    );
+    assert_eq!(exact_state.state_roots.len(), 2, "parent/child pair");
+    for lane in 0..2 {
+        pin_eq(
+            b,
+            &exact_state.state_roots[0].expected_state_root[lane],
+            &claim.fields[parent + hc::STATE_ROOT + lane],
+        );
+        pin_eq(
+            b,
+            &exact_state.state_roots[1].expected_state_root[lane],
+            &header.fields[hf::STATE_ROOT + lane],
+        );
+    }
+    pin_eq(
+        b,
+        &exact_state.state_roots[0].log_slots,
+        &claim.fields[parent + hc::LOG_SLOTS],
+    );
+    pin_eq(
+        b,
+        &exact_state.state_roots[1].log_slots,
+        &header.fields[hf::LOG_SLOTS],
+    );
+
     // ---- authorization components (per user tx): owner-auth killshot +
     // wallet-PCS discharge, tx_body_hash pinned to the spine hash.
     let mut auth_inputs = Vec::with_capacity(inputs.authorization_inputs.len());
@@ -640,6 +700,17 @@ pub fn build_block_slots_with_config(
     // public IO. `k` = tx count must be a power of two (the plural asserts it; a
     // tier pads its real txs to next_pow2 with ghost obligations).
     if let Some(params) = config.wallet_pcs_region {
+        if config.exact_state_region {
+            // The exact-state families ride the plural discharge's walks; a
+            // block-bearing region class always carries at least one tx, so an
+            // empty obligation set (which would skip the plural and leave the
+            // exact-state hashing undischarged) is unreachable by construction.
+            assert!(
+                !region_obligations.is_empty(),
+                "exact_state_region with no wallet-PCS obligations (a block-bearing \
+                 region class always has txs)"
+            );
+        }
         if !region_obligations.is_empty() {
             // extend (not assign): the owner-auth region path may have already
             // pushed its walk-C opening claims, which must be kept.
@@ -648,6 +719,7 @@ pub fn build_block_slots_with_config(
                 &region_obligations,
                 &region_natives,
                 params,
+                es_region_data.as_ref(),
             ));
         }
     }
@@ -699,36 +771,6 @@ pub fn build_block_slots_with_config(
     );
     let [header] = header_slice;
 
-    // ---- exact_state component + its statement anchors.
-    let exact_state = build_exact_state_slot(
-        b,
-        &inputs.exact_state_killshot_inputs[0],
-        &proof.exact_state[0],
-    );
-    assert_eq!(exact_state.state_roots.len(), 2, "parent/child pair");
-    for lane in 0..2 {
-        pin_eq(
-            b,
-            &exact_state.state_roots[0].expected_state_root[lane],
-            &claim.fields[parent + hc::STATE_ROOT + lane],
-        );
-        pin_eq(
-            b,
-            &exact_state.state_roots[1].expected_state_root[lane],
-            &header.fields[hf::STATE_ROOT + lane],
-        );
-    }
-    pin_eq(
-        b,
-        &exact_state.state_roots[0].log_slots,
-        &claim.fields[parent + hc::LOG_SLOTS],
-    );
-    pin_eq(
-        b,
-        &exact_state.state_roots[1].log_slots,
-        &header.fields[hf::LOG_SLOTS],
-    );
-
     BlockSlots {
         header,
         claim,
@@ -766,16 +808,25 @@ pub fn build_block_slots_with_config(
 /// `pending_wallet_pcs` ordering), and the wallet-PCS obligations are produced
 /// by the SAME scratch owner-auth region discharge (parity with the inline
 /// obligations is separately gated).
+///
+/// `exact_state_region` MUST likewise match the real build's flag: when true,
+/// a scratch exact-state region handoff (fresh wires, same native values) is
+/// threaded into the plural discharge, so the walk-A/B columns — hence every
+/// native claim `(point, value)` — mirror the real build exactly.
 pub fn region_wallet_pcs_native(
     inputs: &AcceptedBlockBatchComponentInputs,
     params: RegionDischargeParams,
     owner_auth_region: bool,
+    exact_state_region: bool,
 ) -> Vec<(Vec<F128>, F128)> {
     if inputs.authorization_inputs.is_empty() {
         return Vec::new();
     }
     let mut pb = FieldR1csBuilder::new();
     let mut out: Vec<(Vec<F128>, F128)> = Vec::new();
+    let scratch_es = exact_state_region.then(|| {
+        scratch_exact_state_region_data(&mut pb, &inputs.exact_state_killshot_inputs[0])
+    });
     // Produce the wallet-PCS obligations + natives the SAME way the real build
     // does for this `owner_auth_region` mode.
     let (obligations, natives) = if owner_auth_region {
@@ -830,10 +881,17 @@ pub fn region_wallet_pcs_native(
     }
     // ONE tiled plural wallet-PCS discharge -- the same call the real block-slots
     // build makes. The region `(point, value)` depend only on each tx's
-    // obligation + native proof (not on the wire positions or the [B] killshots),
-    // so they are identical to the full build; only the committed-column SLICES
-    // differ (the link takes those from the real build).
-    for c in discharge_auth_pcs_obligations_via_region(&mut pb, &obligations, &natives, params) {
+    // obligation + native proof + the block's exact-state natives (not on the
+    // wire positions or the [B] killshots), so they are identical to the full
+    // build; only the committed-column SLICES differ (the link takes those from
+    // the real build).
+    for c in discharge_auth_pcs_obligations_via_region(
+        &mut pb,
+        &obligations,
+        &natives,
+        params,
+        scratch_es.as_ref(),
+    ) {
         out.push((c.native_point, c.native_value));
     }
     out

@@ -82,7 +82,9 @@ use noid_fri_binius::{COMPACT_NUM_QUERIES, COMPACT_TAU, MERKLE_CAP_DEPTH};
 use noid_gkr::auth_pcs::AuthMleOpeningProof;
 use noid_gkr::owner_auth::{OwnerAuthProofKillShot, OwnerAuthPublicInputs};
 use noid_poseidon2b::hasher::CryptographicHasher;
-use noid_poseidon2b::native::domain::{capacity_iv, TAG_FRICHANL, TAG_KSCHANNL};
+use noid_poseidon2b::native::domain::{
+    capacity_iv, DomainTag, TAG_EXSTNOD, TAG_FRICHANL, TAG_KSCHANNL, TAG_RGDNODE,
+};
 use noid_poseidon2b::native::permutation::STATE_SIZE;
 use noid_poseidon2b::Poseidon2bSponge;
 
@@ -90,9 +92,11 @@ use noid_ivc_core::challenger::{Challenger, FsLaneChallenger};
 use noid_ivc_core::deep_chain::flat_mds;
 use noid_ivc_core::deep_chain::leaf_hash::{
     build_high_pair_leaf_columns, build_pair_leaf_columns, build_source_leaf_columns,
-    high_pair_leaf_chain, pair_leaf_refs, pair_leaf_substitution_terms, source_leaf_fixed_patterns,
-    source_leaf_refs, source_leaf_substitution_terms, PairLeafRefs, SourceLeafChain,
-    SourceLeafColumns, SourceLeafRefs,
+    build_sponge_leaf_columns, high_pair_leaf_chain, pair_leaf_refs, pair_leaf_substitution_terms,
+    slot_leaf_iv_flat, slot_leaf_pad_flat, source_leaf_fixed_patterns, source_leaf_refs,
+    source_leaf_substitution_terms, sponge_leaf_fixed_patterns, sponge_leaf_substitution_terms,
+    PairLeafRefs, SourceLeafChain, SourceLeafColumns, SourceLeafRefs, SpongeLeafRefs,
+    SPONGE_LEAF_DIGEST_SLOT, SPONGE_LEAF_SLOTS,
 };
 use noid_ivc_core::deep_chain::relations::{
     claimed_refs, prove_column_relation, prove_shift_discharge, prove_shift_discharge_pow2,
@@ -124,6 +128,7 @@ use super::deep_chain::{
     ColumnRelationProofTrace, DeepChainWalkProofTrace, LaneClaimGroupTrace, RelationTermTrace,
     ShiftDischargeProofTrace,
 };
+use super::exact_state::ExactStateRegionData;
 use super::fri_pcs::{
     alloc_digest, code_new_trace, compact_queries_from_squeezes_with_bits, fold_trace_bits,
     mle_evaluate_small_trace,
@@ -203,6 +208,7 @@ pub fn discharge_auth_pcs_obligation_via_region(
         std::slice::from_ref(obligation),
         std::slice::from_ref(native),
         params,
+        None,
     )
 }
 
@@ -215,11 +221,24 @@ pub fn discharge_auth_pcs_obligation_via_region(
 /// leaves) + ONE walk B (merkle) at common-period offsets — the walk cost is
 /// logarithmic in the tiled domain (transaction-count independent), K per-tree
 /// exposures the only per-tx source-tree residual.
+///
+/// `es` (exact-state region handoff, [`ExactStateRegionData`]): when `Some`,
+/// the block's exact-state hashing families ride the SAME walks — no new walk
+/// is ever spawned. The `2T` slot-leaf sponge tiles join walk A as one more
+/// leaf family (its plain `IN` reads gated by a region-ones pattern); the
+/// state paths (TAG_EXSTNOD) and guard paths (TAG_RGDNODE) join walk B as two
+/// more Merkle legs with their own tree IVs. Block-level entries are chunked
+/// `ceil(len/K)` per tx block (contiguous, canonical-ghost-filled), so the
+/// layout stays a deterministic function of (input lengths, K, depths) —
+/// class-fixed. Leaf digests pin to the slot-leaf `expected_leaf` statement
+/// wires which double as the state leg's entry wires (the leaf↔path closure),
+/// and each leg root pins to the composite-root statement wires (path↔root).
 pub fn discharge_auth_pcs_obligations_via_region(
     b: &mut FieldR1csBuilder,
     obligations: &[PendingAuthPcsObligation],
     natives: &[AuthMleOpeningProof],
     params: RegionDischargeParams,
+    es: Option<&ExactStateRegionData>,
 ) -> Vec<RegionPcsClaim> {
     assert_eq!(obligations.len(), natives.len(), "one native proof per obligation");
     assert!(!obligations.is_empty(), "at least one obligation");
@@ -254,7 +273,15 @@ pub fn discharge_auth_pcs_obligations_via_region(
     // Walk-A domain: `[tx_hi | within-tx block]`. Every tx's source tree +
     // leaf families occupy one power-of-two block; the K blocks tile the domain,
     // so common-period patterns (period = the block) cover every tx.
-    let per_tx_a = st_slots + n_leaf_families * leaf_family_slots;
+    //
+    // Exact-state extension: the block's `2T` slot-leaf sponge tiles ride the
+    // SAME walk A after the wallet leaf families, distributed across the K tx
+    // blocks in contiguous chunks of `es_leaf_cap = ceil(2T/K)` tiles each
+    // (shortfall = canonical ghost sponge leaves) — the layout stays a pure
+    // function of (2T, K).
+    let es_leaf_base = st_slots + n_leaf_families * leaf_family_slots; // within a tx block
+    let es_leaf_cap = es.map_or(0, |e| e.leaves.len().div_ceil(k));
+    let per_tx_a = es_leaf_base + es_leaf_cap * SPONGE_LEAF_SLOTS;
     let block_log_a = per_tx_a.next_power_of_two().trailing_zeros() as usize;
     let per_tx_block_a = 1usize << block_log_a;
     let w_log = (k * per_tx_block_a).next_power_of_two().trailing_zeros() as usize;
@@ -271,12 +298,33 @@ pub fn discharge_auth_pcs_obligations_via_region(
     for &layer in &sb8_auth_layers {
         leg_depths.push(high_pair_tree_depth(log_n - 1 - layer));
     }
+    // Per-leg per-tx-block path capacity and per-leg tree IV. The wallet legs
+    // open `nq` paths per tx on TAG_COMPRESS trees; the exact-state legs open
+    // the block's chunked state/guard paths on their consensus-tagged trees
+    // (the IV is a PER-LEG pattern parameter, so heterogeneous tags coexist
+    // in ONE walk B).
+    let n_wallet_legs = leg_depths.len();
+    let mut leg_caps: Vec<usize> = vec![nq; n_wallet_legs];
+    let mut leg_ivs: Vec<[F128; 2]> = vec![compress_iv_flat(); n_wallet_legs];
+    let es_state_leg = leg_depths.len();
+    let mut es_guard_leg = usize::MAX;
+    if let Some(e) = es {
+        leg_depths.push(e.d_state);
+        leg_caps.push(e.paths.len().div_ceil(k));
+        leg_ivs.push(iv_flat_of_tag(TAG_EXSTNOD));
+        if let Some(g) = &e.guard {
+            es_guard_leg = leg_depths.len();
+            leg_depths.push(g.depth);
+            leg_caps.push(2usize.div_ceil(k));
+            leg_ivs.push(iv_flat_of_tag(TAG_RGDNODE));
+        }
+    }
     let n_legs = leg_depths.len();
     let mut meta_bases = Vec::with_capacity(n_legs);
     let mut acc = nq;
-    for &d in &leg_depths {
+    for f in 0..n_legs {
         meta_bases.push(acc);
-        acc += nq * (2 * d).next_power_of_two();
+        acc += leg_caps[f] * (2 * leg_depths[f]).next_power_of_two();
     }
     let per_tx_b = acc;
     let block_log_b = per_tx_b.next_power_of_two().trailing_zeros() as usize;
@@ -1048,6 +1096,144 @@ pub fn discharge_auth_pcs_obligations_via_region(
     } // end `for tx in 0..k`
 
     // ===================================================================
+    // Exact-state families (block-level, chunked across the K tx blocks —
+    // NEVER a new walk): the 2T slot-leaf sponge tiles fill walk A's es
+    // region; the state/guard Merkle paths fill walk B's es legs. Chunk i
+    // gets entries [i·cap, min((i+1)·cap, len)); the shortfall is canonical
+    // ghosts, so every pattern-covered slot is a valid chain and the pin
+    // structure is a pure function of (input lengths, K, depths).
+    // ===================================================================
+    if let Some(e) = es {
+        let n_es = e.leaves.len();
+        assert_eq!(e.paths.len(), n_es, "one state path per slot leaf");
+        let pad_flat = slot_leaf_pad_flat();
+        let state_cap = leg_caps[es_state_leg];
+        for blk in 0..k {
+            let lo = (blk * es_leaf_cap).min(n_es);
+            let hi = ((blk + 1) * es_leaf_cap).min(n_es);
+
+            // --- Walk A: this block's sponge-leaf tiles (chunk + ghosts). ---
+            let chunk: Vec<(F128, F128, F128)> = e.leaves[lo..hi]
+                .iter()
+                .map(|l| (l.amount_flat, l.owner_hi_flat, l.owner_lo_flat))
+                .collect();
+            let tile_wlog = (es_leaf_cap * SPONGE_LEAF_SLOTS)
+                .next_power_of_two()
+                .trailing_zeros() as usize;
+            let (tc, tile_digests) = build_sponge_leaf_columns(&chunk, tile_wlog);
+            let base = blk * per_tx_block_a + es_leaf_base;
+            let n_copy = es_leaf_cap * SPONGE_LEAF_SLOTS;
+            for j in 0..2 {
+                cols[IN0 + j][base..base + n_copy].copy_from_slice(&tc.in_[j][..n_copy]);
+            }
+            for j in 0..STATE_SIZE {
+                cols[C0 + j][base..base + n_copy].copy_from_slice(&tc.c[j][..n_copy]);
+                s0[j][base..base + n_copy].copy_from_slice(&tc.s0[j][..n_copy]);
+                s_out[j][base..base + n_copy].copy_from_slice(&tc.s_out[j][..n_copy]);
+            }
+            for (t, g) in (lo..hi).enumerate() {
+                let leaf = &e.leaves[g];
+                assert_eq!(
+                    tile_digests[t], leaf.expected_leaf_flat,
+                    "es sponge tile digest != the statement's expected leaf"
+                );
+                let off = base + t * SPONGE_LEAF_SLOTS;
+                // Statement wires pinned to the committed absorb cells; the
+                // PAD lane is a protocol constant (`pad_after_one_field`).
+                cell_pins_a.push((IN0, off, leaf.amount_w.clone()));
+                cell_pins_a.push((IN0 + 1, off, leaf.owner_hi_w.clone()));
+                cell_pins_a.push((IN0, off + 1, leaf.owner_lo_w.clone()));
+                cell_pins_a.push((IN0 + 1, off + 1, LinExpr::constant(pad_flat)));
+                // Digest cells == the expected-leaf statement wires — the
+                // SAME wires the state leg reads as its Merkle entries (the
+                // exact-state leaf↔path closure).
+                let dslot = off + SPONGE_LEAF_DIGEST_SLOT;
+                cell_pins_a.push((C0, dslot, leaf.expected_leaf_w[0].clone()));
+                cell_pins_a.push((C0 + 1, dslot, leaf.expected_leaf_w[1].clone()));
+            }
+
+            // --- Walk B: this block's state-path chunk (the same chunking;
+            // entries = the paired slot-leaf digest wires, roots = the
+            // old/new expected-root statement wires). ---
+            let state_paths: Vec<EsPathReal> = (lo..hi)
+                .map(|g| {
+                    let path = &e.paths[g];
+                    assert_eq!(path.entry_leaf_index, g, "leaf↔path pairing is index-aligned");
+                    assert_eq!(path.siblings.len(), e.d_state, "state path depth");
+                    let leaf = &e.leaves[g];
+                    let (root_w, root_flat) = if path.is_old {
+                        (e.old_root_w.clone(), e.old_root_flat)
+                    } else {
+                        (e.new_root_w.clone(), e.new_root_flat)
+                    };
+                    EsPathReal {
+                        entry_flat: leaf.expected_leaf_flat,
+                        entry_w: leaf.expected_leaf_w.clone(),
+                        siblings: path.siblings.clone(),
+                        directions: path.directions.clone(),
+                        root_flat,
+                        root_w,
+                    }
+                })
+                .collect();
+            fill_es_merkle_leg(
+                &mut cb,
+                &mut s0b,
+                &mut soutb,
+                &mut acc_entry_wires[es_state_leg],
+                &mut acc_root_wires[es_state_leg],
+                &mut acc_committed_roots[es_state_leg],
+                &mut acc_path_slots[es_state_leg],
+                &mut acc_recomputed_roots[es_state_leg],
+                e.d_state,
+                state_cap,
+                leg_ivs[es_state_leg],
+                6 + 5 * es_state_leg,
+                blk * per_tx_block_b + meta_bases[es_state_leg],
+                &state_paths,
+            );
+
+            // --- Walk B: this block's guard-path chunk (present iff guard;
+            // entries = the INLINE guard-bucket statement's leaf digests,
+            // roots = the composite statement's guard roots). ---
+            if let Some(gd) = &e.guard {
+                let cap = leg_caps[es_guard_leg];
+                let glo = (blk * cap).min(2);
+                let ghi = ((blk + 1) * cap).min(2);
+                let guard_paths: Vec<EsPathReal> = (glo..ghi)
+                    .map(|i| {
+                        assert_eq!(gd.siblings[i].len(), gd.depth, "guard path depth");
+                        EsPathReal {
+                            entry_flat: gd.entries_flat[i],
+                            entry_w: gd.entries_w[i].clone(),
+                            siblings: gd.siblings[i].clone(),
+                            directions: gd.directions[i].clone(),
+                            root_flat: gd.roots_flat[i],
+                            root_w: gd.roots_w[i].clone(),
+                        }
+                    })
+                    .collect();
+                fill_es_merkle_leg(
+                    &mut cb,
+                    &mut s0b,
+                    &mut soutb,
+                    &mut acc_entry_wires[es_guard_leg],
+                    &mut acc_root_wires[es_guard_leg],
+                    &mut acc_committed_roots[es_guard_leg],
+                    &mut acc_path_slots[es_guard_leg],
+                    &mut acc_recomputed_roots[es_guard_leg],
+                    gd.depth,
+                    cap,
+                    leg_ivs[es_guard_leg],
+                    6 + 5 * es_guard_leg,
+                    blk * per_tx_block_b + meta_bases[es_guard_leg],
+                    &guard_paths,
+                );
+            }
+        }
+    }
+
+    // ===================================================================
     // Walk A (once): source_tree + leaf families over ALL K txs, common-period
     // patterns, K per-tree exposures. The walk/substitution flatten; the K
     // exposures are the only per-tx source-tree residual.
@@ -1062,6 +1248,31 @@ pub fn discharge_auth_pcs_obligations_via_region(
             fixed.push(common_period_pattern(&pat.table, leaf_base(f), nq, block_log_a));
         }
     }
+    // Exact-state sponge family: a region-ones selector (gating its PLAIN
+    // IN reads — the family's own substitution reads IN ungated, which in a
+    // UNION would fire inside other families' slots) + the family's ODD/IV
+    // patterns, all localized to the es region of every tx block. Committed
+    // refs REMAP onto walk A's shared IN0/IN1 + C0..C3 columns.
+    let es_sponge: Option<(SpongeLeafRefs, usize)> = es.map(|_| {
+        let base = fixed.len();
+        fixed.push(common_period_ones(
+            es_leaf_base,
+            es_leaf_cap * SPONGE_LEAF_SLOTS,
+            block_log_a,
+        ));
+        for pat in sponge_leaf_fixed_patterns(slot_leaf_iv_flat()) {
+            fixed.push(common_period_pattern(&pat.table, es_leaf_base, es_leaf_cap, block_log_a));
+        }
+        (
+            SpongeLeafRefs {
+                in_: [IN0, IN0 + 1],
+                c: std::array::from_fn(|i| C0 + i),
+                odd: base + 1,
+                iv: [base + 2, base + 3],
+            },
+            base,
+        )
+    });
     let st_refs = SourceTreeRefs {
         code: [CODE0, CODE0 + 1],
         kid: [KID0, KID0 + 1],
@@ -1090,13 +1301,14 @@ pub fn discharge_auth_pcs_obligations_via_region(
     let expo_cols: [&[F128]; 4] =
         [expo_kid0.as_slice(), expo_kid1.as_slice(), expo_c0.as_slice(), expo_c1.as_slice()];
     let native_u = run_union_native(
-        &committed, &s0, &s_out, &fixed, &st_refs, &leaf_refs, w_log, &expo_tiled, &expo_cols, st_wlog,
-        block_log_a,
+        &committed, &s0, &s_out, &fixed, &st_refs, &leaf_refs, es_sponge.as_ref(), w_log,
+        &expo_tiled, &expo_cols, st_wlog, block_log_a,
     );
     let mut slices: Vec<WitnessSlice> =
         cols.iter().map(|c| alloc_column_slice(b, c, w_log).0).collect();
     claims.extend(discharge_union(
-        b, &fixed, &st_refs, &leaf_refs, w_log, st_wlog, block_log_a, &expo_tiled, &native_u,
+        b, &fixed, &st_refs, &leaf_refs, es_sponge.as_ref(), w_log, st_wlog, block_log_a,
+        &expo_tiled, &native_u,
     ));
 
     // ===================================================================
@@ -1110,7 +1322,7 @@ pub fn discharge_auth_pcs_obligations_via_region(
         let col_base = 6 + 5 * f;
         let fixed_base = 1 + 9 * f;
         legs.push(MerkleLeg {
-            family: MerklePathFamily { depth, n_paths: nq },
+            family: MerklePathFamily { depth, n_paths: leg_caps[f] },
             refs: union_merkle_refs(col_base, fixed_base),
             region: fixed_base + 8,
             committed_roots: std::mem::take(&mut acc_committed_roots[f]),
@@ -1123,13 +1335,14 @@ pub fn discharge_auth_pcs_obligations_via_region(
     }
     // Common-period patterns: pair-leaf region at [0, nq), then each leg's 8
     // merkle patterns + a region selector at meta_bases[f], all periodic over the
-    // tx block.
+    // tx block. The IV patterns are per-leg (the exact-state legs run on their
+    // own consensus tree tags).
     let mut fixed_b: Vec<FixedPattern> = Vec::new();
     fixed_b.push(common_period_ones(0, nq, block_log_b));
     for f in 0..n_legs {
-        let family = MerklePathFamily { depth: leg_depths[f], n_paths: nq };
-        for pat in merkle_fixed_patterns(&family, iv_b) {
-            fixed_b.push(common_period_pattern(&pat.table, meta_bases[f], nq, block_log_b));
+        let family = MerklePathFamily { depth: leg_depths[f], n_paths: leg_caps[f] };
+        for pat in merkle_fixed_patterns(&family, leg_ivs[f]) {
+            fixed_b.push(common_period_pattern(&pat.table, meta_bases[f], leg_caps[f], block_log_b));
         }
         fixed_b.push(common_period_ones(meta_bases[f], family.n_slots(), block_log_b));
     }
@@ -1945,6 +2158,91 @@ fn lanes_flat(d: &[u8; 32]) -> [F128; 2] {
     ]
 }
 
+/// The flat-basis capacity IV of a consensus domain tag (mirror of the
+/// TAG_FRICHANL conversion at the walk-C setup: `[φ(iv_hi), φ(iv_lo)]`).
+fn iv_flat_of_tag(tag: DomainTag) -> [F128; 2] {
+    let iv = capacity_iv(tag);
+    [flat_of_tower_u128(iv[0].0), flat_of_tower_u128(iv[1].0)]
+}
+
+/// One real exact-state path of a walk-B leg chunk: the flat witness data
+/// plus the statement wires the leg pins bind (entry = the paired slot-leaf /
+/// guard-bucket digest wires; root = the expected-root statement wires).
+struct EsPathReal {
+    entry_flat: [F128; 2],
+    entry_w: [LinExpr; 2],
+    siblings: Vec<[F128; 2]>,
+    directions: Vec<bool>,
+    root_flat: [F128; 2],
+    root_w: [LinExpr; 2],
+}
+
+/// Fill ONE tx block's chunk of an exact-state walk-B Merkle leg: the real
+/// paths (entries/roots = statement wires) then canonical ghost paths (entry
+/// `[0,0]`, zero siblings, all-left — the recomputed root is a deterministic
+/// constant of `(depth, iv)`) up to the leg's per-block capacity. Extends the
+/// per-leg accumulators in path order so `discharge_merkle_union`'s generic
+/// entry/root pin loop covers real and ghost paths alike.
+#[allow(clippy::too_many_arguments)]
+fn fill_es_merkle_leg(
+    cb: &mut [Vec<F128>],
+    s0b: &mut [Vec<F128>; STATE_SIZE],
+    soutb: &mut [Vec<F128>; STATE_SIZE],
+    acc_entry_wires: &mut Vec<[LinExpr; 2]>,
+    acc_root_wires: &mut Vec<[LinExpr; 2]>,
+    acc_committed_roots: &mut Vec<[F128; 2]>,
+    acc_path_slots: &mut Vec<usize>,
+    acc_recomputed_roots: &mut Vec<[F128; 2]>,
+    depth: usize,
+    cap: usize,
+    iv_flat: [F128; 2],
+    col_base: usize,
+    region_base: usize,
+    real: &[EsPathReal],
+) {
+    assert!(real.len() <= cap, "es leg chunk exceeds the per-block capacity");
+    let stride = (2 * depth).next_power_of_two();
+    let mut witnesses = Vec::with_capacity(cap);
+    for p in real {
+        assert_eq!(p.siblings.len(), depth);
+        assert_eq!(p.directions.len(), depth);
+        witnesses.push(MerklePathWitness {
+            entry: p.entry_flat,
+            siblings: p.siblings.clone(),
+            directions: p.directions.clone(),
+        });
+    }
+    for _ in real.len()..cap {
+        witnesses.push(MerklePathWitness {
+            entry: [F128::ZERO; 2],
+            siblings: vec![[F128::ZERO; 2]; depth],
+            directions: vec![false; depth],
+        });
+    }
+    let family = MerklePathFamily { depth, n_paths: cap };
+    let fam_wlog = (cap * stride).next_power_of_two().trailing_zeros() as usize;
+    let mcols = build_merkle_path_columns(&family, iv_flat, &witnesses, fam_wlog);
+    place_merkle(cb, s0b, soutb, &mcols, col_base, region_base, cap * stride);
+    for (i, p) in real.iter().enumerate() {
+        assert_eq!(
+            mcols.roots[i], p.root_flat,
+            "es path recomputed root != the expected-root statement"
+        );
+        acc_entry_wires.push(p.entry_w.clone());
+        acc_root_wires.push(p.root_w.clone());
+        acc_committed_roots.push(p.root_flat);
+        acc_path_slots.push(region_base + i * stride);
+    }
+    for i in real.len()..cap {
+        let r = mcols.roots[i];
+        acc_entry_wires.push([LinExpr::zero(), LinExpr::zero()]);
+        acc_root_wires.push([LinExpr::constant(r[0]), LinExpr::constant(r[1])]);
+        acc_committed_roots.push(r);
+        acc_path_slots.push(region_base + i * stride);
+    }
+    acc_recomputed_roots.extend(mcols.roots.iter().copied());
+}
+
 fn eq_tensor_tower(point: &[Block128]) -> Vec<Block128> {
     let mut t = vec![Block128::ONE; 1usize << point.len()];
     for (i, slot) in t.iter_mut().enumerate() {
@@ -2172,11 +2470,28 @@ struct ExpoTiledSpec {
 fn union_native_terms(
     st_refs: &SourceTreeRefs,
     leaf_refs: &[SourceLeafRefs],
+    es_sponge: Option<&(SpongeLeafRefs, usize)>,
     alpha: F128,
 ) -> Vec<RelationTerm> {
     let mut terms = source_tree_substitution_terms(st_refs, alpha);
     for lr in leaf_refs {
         terms.extend(source_leaf_substitution_terms(lr, alpha));
+    }
+    // Exact-state sponge family: its own substitution reads IN0/IN1 PLAINLY
+    // (every slot of the standalone family absorbs); in the union those
+    // terms would fire inside other families' slots, so any term without a
+    // Fixed factor is gated by the family's region-ones pattern — the same
+    // discipline the walk-B merkle union applies. All its committed refs
+    // (IN0/IN1, C0..C3) are already claimed by the wallet leaf families, so
+    // the union's claimed-ref set (and claim count) is unchanged.
+    if let Some((sr, region)) = es_sponge {
+        let mut t = sponge_leaf_substitution_terms(sr, alpha);
+        for term in t.iter_mut() {
+            if !term.factors.iter().any(|f| matches!(f, ColRef::Fixed(_))) {
+                term.factors.insert(0, ColRef::Fixed(*region));
+            }
+        }
+        terms.extend(t);
     }
     terms
 }
@@ -2189,6 +2504,7 @@ fn run_union_native(
     fixed: &[FixedPattern],
     st_refs: &SourceTreeRefs,
     leaf_refs: &[SourceLeafRefs],
+    es_sponge: Option<&(SpongeLeafRefs, usize)>,
     w_log: usize,
     expo: &ExpoTiledSpec,
     expo_cols: &[&[F128]; 4],
@@ -2230,7 +2546,7 @@ fn run_union_native(
 
     let alpha = ch_p.sample_f128();
     assert_eq!(alpha, ch_v.sample_f128());
-    let sub_terms = union_native_terms(st_refs, leaf_refs, alpha);
+    let sub_terms = union_native_terms(st_refs, leaf_refs, es_sponge, alpha);
     let mut target = F128::ZERO;
     let mut p = F128::ONE;
     for e in 0..STATE_SIZE {
@@ -2329,6 +2645,7 @@ fn union_trace_terms(
     m: &[LinExpr],
     st_refs: &SourceTreeRefs,
     leaf_refs: &[SourceLeafRefs],
+    es_sponge: Option<&(SpongeLeafRefs, usize)>,
 ) -> Vec<RelationTermTrace> {
     let mut terms = Vec::new();
     for i in 0..2 {
@@ -2373,11 +2690,40 @@ fn union_trace_terms(
             });
         }
     }
+    // Exact-state sponge family — the line-by-line shadow of the GATED
+    // `sponge_leaf_substitution_terms` (region-ones inserted on the plain IN
+    // reads; the ODD-gated carries and IV patterns carry their own gate).
+    if let Some((sr, region)) = es_sponge {
+        for i in 0..2 {
+            terms.push(RelationTermTrace {
+                coeff: m[i].clone(),
+                factors: vec![ColRef::Fixed(*region), ColRef::Committed(sr.in_[i])],
+            });
+            terms.push(RelationTermTrace {
+                coeff: m[i].clone(),
+                factors: vec![ColRef::Fixed(sr.odd), ColRef::CommittedShift(sr.c[i])],
+            });
+        }
+        for j in 2..STATE_SIZE {
+            terms.push(RelationTermTrace {
+                coeff: m[j].clone(),
+                factors: vec![ColRef::Fixed(sr.iv[j - 2])],
+            });
+            terms.push(RelationTermTrace {
+                coeff: m[j].clone(),
+                factors: vec![ColRef::Fixed(sr.odd), ColRef::CommittedShift(sr.c[j])],
+            });
+        }
+    }
     terms
 }
 
-fn union_ref_terms(st_refs: &SourceTreeRefs, leaf_refs: &[SourceLeafRefs]) -> Vec<RelationTerm> {
-    union_native_terms(st_refs, leaf_refs, F128::ONE)
+fn union_ref_terms(
+    st_refs: &SourceTreeRefs,
+    leaf_refs: &[SourceLeafRefs],
+    es_sponge: Option<&(SpongeLeafRefs, usize)>,
+) -> Vec<RelationTerm> {
+    union_native_terms(st_refs, leaf_refs, es_sponge, F128::ONE)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2386,6 +2732,7 @@ fn discharge_union(
     fixed: &[FixedPattern],
     st_refs: &SourceTreeRefs,
     leaf_refs: &[SourceLeafRefs],
+    es_sponge: Option<&(SpongeLeafRefs, usize)>,
     w_log: usize,
     expo_wlog: usize,
     block_log_a: usize,
@@ -2429,8 +2776,8 @@ fn discharge_union(
 
     let alpha = ch.sample_f128(b);
     let (m, ap) = mds_alpha_weights(b, &alpha);
-    let sub_terms = union_trace_terms(&m, st_refs, leaf_refs);
-    let ref_terms = union_ref_terms(st_refs, leaf_refs);
+    let sub_terms = union_trace_terms(&m, st_refs, leaf_refs, es_sponge);
+    let ref_terms = union_ref_terms(st_refs, leaf_refs, es_sponge);
     let mut target = LinExpr::zero();
     for e in 0..STATE_SIZE {
         target = target.add(&mul(b, &ap[e], &terminal.values[e]));
