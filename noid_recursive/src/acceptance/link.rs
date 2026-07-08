@@ -284,6 +284,14 @@ pub fn link_io_spec_region(
 /// The link class constants.
 pub struct LinkClass {
     pub shape: FieldShape,
+    /// Statement digest of the CLASS matrix — the constant
+    /// `bind_statement_field` absorbs into every link transcript. The
+    /// matrix is class-fixed (I1), so it is hashed ONCE (on the first
+    /// real link build; the freeze build's matrix differs — it omits the
+    /// region IO-tail pin rows) and seeded into every subsequently built
+    /// instance: without the seed each prove re-hashes gigabytes of
+    /// coefficient data (measured ~130 s of a ~206 s m=24 prove).
+    pub class_statement_digest: std::sync::OnceLock<[u8; 32]>,
     pub pcs_params: PcsParams,
     pub spec: PublicIoSpec,
     pub genesis: FieldR1cs,
@@ -380,6 +388,7 @@ impl LinkClass {
         let genesis_digest = genesis.statement_digest();
         Self {
             shape,
+            class_statement_digest: std::sync::OnceLock::new(),
             pcs_params,
             spec: link_io_spec_for(shape.k_log, block_bearing),
             genesis,
@@ -897,6 +906,21 @@ fn build_link_inner(class: &LinkClass, input: &LinkInput<'_>, freeze: bool) -> B
     }
     let (r1cs, witness) = b.build();
     assert_eq!(r1cs.m, class.shape.m, "class shape mismatch after padding");
+    if !freeze {
+        // The class matrix is a protocol constant (I1): hash it once per
+        // class — on the first real build — and seed every later instance,
+        // so `bind_statement_field`'s transcript binding is a cached read
+        // instead of a full coefficient re-hash per prove (measured ~130 s
+        // of a ~206 s m=24 prove). Freeze builds are excluded: their matrix
+        // omits the region IO-tail pin rows. Seeding does not itself detect
+        // a build that drifted from the class — that is the two-block
+        // fixity gates' job, and end-to-end a drifted matrix still fails at
+        // the decider's accumulated matrix-claim evaluation.
+        let class_digest = class
+            .class_statement_digest
+            .get_or_init(|| r1cs.statement_digest());
+        r1cs.seed_statement_digest(*class_digest);
+    }
     BuiltLink {
         r1cs,
         witness,
@@ -956,6 +980,14 @@ fn freeze_region_block_bearing(
     assert!(n_claims > 0, "region discharge produced no opening claims");
 
     let genesis_digest = genesis_instance(&shape).statement_digest();
+    // The genesis dummy's matrix is deterministic in the shape; seed every
+    // stored instance so the T proves don't re-hash its (mostly-offset)
+    // serialization per prove.
+    let seeded_genesis = || {
+        let g = genesis_instance(&shape);
+        g.seed_statement_digest(genesis_digest);
+        g
+    };
 
     // ---- Placeholder spec: N claims of the right arities, pointing at safe
     // all-zero columns of the genesis dummy (index 1 excludes the const-one
@@ -972,9 +1004,10 @@ fn freeze_region_block_bearing(
 
     let freeze_class = LinkClass {
         shape,
+        class_statement_digest: std::sync::OnceLock::new(),
         pcs_params: pcs_params.clone(),
         spec: freeze_spec,
-        genesis: genesis_instance(&shape),
+        genesis: seeded_genesis(),
         genesis_digest,
         block_bearing: true,
         genesis_block_accumulator: genesis_block_accumulator.clone(),
@@ -1042,9 +1075,13 @@ fn freeze_region_block_bearing(
     let real_spec = link_io_spec_region(shape.k_log, true, &frozen, max_arity);
     LinkClass {
         shape,
+        // NOT carried over from the freeze pass: the freeze build's matrix
+        // omits the region IO-tail pin rows, so its digest is not the class
+        // digest. The first REAL build fills this cell.
+        class_statement_digest: std::sync::OnceLock::new(),
         pcs_params,
         spec: real_spec,
-        genesis: genesis_instance(&shape),
+        genesis: seeded_genesis(),
         genesis_digest,
         block_bearing: true,
         genesis_block_accumulator,

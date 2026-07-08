@@ -1770,10 +1770,13 @@ mod tests {
         }
     }
 
-    /// Size the region-mode block-bearing link: run the freeze (which prints
-    /// the full link's used-wire count via build_link's eprintln) at a couple
-    /// of `nq` at a given class m, tolerating the class-shape assert so
-    /// the printed size is visible even when a choice does not fit.
+    /// 4f.3 sizing ladder: freeze the region-mode block-bearing link at
+    /// PRODUCTION parameters — the FULL region stack (owner-auth +
+    /// exact-state + tx-root + spine + tier capacity) with the wallet-PCS
+    /// discharge authenticating EVERY capsule query — across the std tiers
+    /// a single m=24 class could host. On fit, prints the freeze time and
+    /// the frozen claim ledger; on a class-shape miss the freeze's own
+    /// eprintln has already printed the offending wire count.
     #[test]
     #[ignore = "measurement helper; run explicitly to size the region link"]
     fn region_link_size_measure() {
@@ -1784,7 +1787,7 @@ mod tests {
         use noid_recursive::acceptance::link::{LinkBlock, LinkClass};
         use noid_recursive::acceptance::trace::region_source_binding::RegionDischargeParams;
 
-        const CLASS_M: usize = 23;
+        const CLASS_M: usize = 24;
         let shape = FieldShape {
             m: CLASS_M,
             k_log: CLASS_M,
@@ -1797,17 +1800,19 @@ mod tests {
             log_batch_size: 5,
             profile: Default::default(),
         };
-        let units = chained_std_tx_blocks(1);
-        for nq in [1usize] {
+        let nq = BlockSlotsConfig::default().wallet_pcs_params.nq;
+        // Real-tx counts landing exactly on the {4, 8, 16, 32} std tiers.
+        for (n_real, tier) in [(3usize, 4usize), (5, 8), (9, 16), (17, 32)] {
+            let units = chained_multi_tx_blocks(1, n_real);
             let rp = RegionDischargeParams { nq };
             let cfg = BlockSlotsConfig {
                 discharge_wallet_pcs: true,
                 wallet_pcs_params: rp,
-                owner_auth_region: false,
-                exact_state_region: false,
-                tx_root_region: false,
-                spine_region: false,
-                tier_user_tx_capacity: None,
+                owner_auth_region: true,
+                exact_state_region: true,
+                tx_root_region: true,
+                spine_region: true,
+                tier_user_tx_capacity: Some(tier),
             };
             let sample = LinkBlock {
                 start_accumulator: &units[0].start_accumulator,
@@ -1816,6 +1821,7 @@ mod tests {
                 proof: &units[0].proof,
                 config: cfg,
             };
+            let t = std::time::Instant::now();
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let class = LinkClass::new_region_block_bearing(
                     shape,
@@ -1823,21 +1829,289 @@ mod tests {
                     units[0].start_accumulator.clone(),
                     rp,
                     &sample,
-                    false,
-                    false,
-                    false,
-                    false,
-                    None,
+                    true,
+                    true,
+                    true,
+                    true,
+                    Some(tier),
                 );
-                (class.region_claims.len(), class.region_max_arity, class.spec.io_len)
+                (
+                    class.region_claims.len(),
+                    class.region_max_arity,
+                    class.spec.io_len,
+                )
             }));
             match r {
                 Ok((n, ma, io)) => eprintln!(
-                    "[size] nq={nq} @m={CLASS_M}: FIT  claims={n} max_arity={ma} io_len={io}"
+                    "[size] tier={tier} ({n_real} real tx) nq={nq} @m={CLASS_M}: FIT \
+                     freeze={:.1?} claims={n} max_arity={ma} io_len={io}",
+                    t.elapsed()
                 ),
-                Err(_) => eprintln!("[size] nq={nq} @m={CLASS_M}: (see wire count above)"),
+                Err(_) => eprintln!(
+                    "[size] tier={tier} ({n_real} real tx) nq={nq} @m={CLASS_M}: \
+                     DOES NOT FIT (wire count above)"
+                ),
             }
         }
+    }
+
+    /// 4f.3 budget gate: ONE miner-shaped prove at production parameters.
+    /// Freezes the full-region class at one tier, builds π₀ for a real
+    /// block of that tier, runs exactly ONE `prove_field_with_public_io`
+    /// and verifies it, reporting wall times and process RSS/HWM at each
+    /// stage. A miner's per-block footprint = the frozen class + one
+    /// prove (the genesis-T prove is a once-per-class setup cost of the
+    /// same instance shape, so the final HWM is a conservative bound for
+    /// both). Asserts the acceptance budget: peak RSS ≤ 8 GB.
+    ///
+    /// Tier via `NOID_REGION_MEASURE_TIER` in {4, 8, 16, 32} (default 4);
+    /// prover memory at a fixed class m is tier-independent (the class
+    /// pads to 2^m rows), so one tier is representative — the ladder test
+    /// above establishes which tiers FIT.
+    #[test]
+    #[ignore = "measurement gate; run explicitly (ONE at a time, heavy prove)"]
+    fn region_link_isolated_prove_budget_measure() {
+        use noid_core::mem_profile::current_mem_snapshot;
+        use noid_ivc_core::challenger::FsLaneChallenger;
+        use noid_ivc_core::field::F128;
+        use noid_ivc_core::pcs::{self, PcsParams};
+        use noid_ivc_core::proof::FieldShape;
+        use noid_ivc_core::verifier::verify_field_with_public_io;
+        use noid_ivc_core::zerocheck::K_SKIP;
+        use noid_ivc_prover::field_prover::prove_field_with_public_io;
+        use noid_recursive::acceptance::block_slots::BlockSlotsConfig;
+        use noid_recursive::acceptance::link::{
+            build_link, genesis_witness, LinkBlock, LinkClass, LinkEnvelope, LinkInput,
+        };
+        use noid_recursive::acceptance::trace::region_source_binding::RegionDischargeParams;
+        use std::time::Instant;
+
+        let tier: usize = std::env::var("NOID_REGION_MEASURE_TIER")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4);
+        let n_real = match tier {
+            4 => 3,
+            8 => 5,
+            16 => 9,
+            32 => 17,
+            other => panic!("unsupported measure tier {other} (use 4, 8, 16 or 32)"),
+        };
+        let rss = |label: &str| {
+            if let Some(m) = current_mem_snapshot() {
+                eprintln!(
+                    "[budget] {label}: rss={:.2} GB hwm={:.2} GB",
+                    m.rss_mb() / 1024.0,
+                    m.hwm_mb() / 1024.0
+                );
+            }
+        };
+
+        const CLASS_M: usize = 24;
+        let shape = FieldShape {
+            m: CLASS_M,
+            k_log: CLASS_M,
+            k_skip: K_SKIP,
+            const_pin: Some(0),
+        };
+        let params = PcsParams {
+            m: CLASS_M + pcs::LOG_PACKING,
+            log_inv_rate: 2,
+            log_batch_size: 5,
+            profile: Default::default(),
+        };
+        let nq = BlockSlotsConfig::default().wallet_pcs_params.nq;
+        let rp = RegionDischargeParams { nq };
+        let cfg = BlockSlotsConfig {
+            discharge_wallet_pcs: true,
+            wallet_pcs_params: rp,
+            owner_auth_region: true,
+            exact_state_region: true,
+            tx_root_region: true,
+            spine_region: true,
+            tier_user_tx_capacity: Some(tier),
+        };
+
+        eprintln!("[budget] tier={tier} ({n_real} real tx) nq={nq} @m={CLASS_M}");
+        let units = chained_multi_tx_blocks(2, n_real);
+        rss("fixtures built");
+
+        fn mk(u: &BlockUnit, config: BlockSlotsConfig) -> LinkBlock<'_> {
+            LinkBlock {
+                start_accumulator: &u.start_accumulator,
+                end_accumulator: &u.end_accumulator,
+                inputs: &u.inputs,
+                proof: &u.proof,
+                config,
+            }
+        }
+
+        let t = Instant::now();
+        let class = LinkClass::new_region_block_bearing(
+            shape,
+            params.clone(),
+            units[0].start_accumulator.clone(),
+            rp,
+            &mk(&units[0], cfg),
+            true,
+            true,
+            true,
+            true,
+            Some(tier),
+        );
+        eprintln!(
+            "[budget] class frozen in {:.1?}: claims={} max_arity={} io_len={}",
+            t.elapsed(),
+            class.region_claims.len(),
+            class.region_max_arity,
+            class.spec.io_len
+        );
+        rss("after freeze");
+
+        // Once-per-class setup: the genesis dummy T proof.
+        let t_witness = genesis_witness(&shape);
+        let t_io = vec![F128::ZERO; class.spec.io_len];
+        let t = Instant::now();
+        let mut ch = FsLaneChallenger::new(b"history-link-v0");
+        let (t_proof, t_commitment, _) = prove_field_with_public_io(
+            &class.genesis,
+            &t_witness,
+            &params,
+            &class.spec,
+            &t_io,
+            &mut ch,
+        );
+        eprintln!("[budget] genesis T prove (once-per-class setup) {:.1?}", t.elapsed());
+        drop(t_witness);
+        rss("after T prove");
+        let env_t = LinkEnvelope {
+            proof: t_proof,
+            commitment: t_commitment,
+            io: t_io,
+        };
+
+        // The per-block work a miner repeats: build π₀'s trace + ONE prove.
+        let t = Instant::now();
+        let built0 = build_link(
+            &class,
+            &LinkInput {
+                prev: &env_t,
+                verified_digest: class.genesis_digest,
+                genesis: true,
+                fold_matrix: &class.genesis,
+                block: Some(mk(&units[0], cfg)),
+            },
+        );
+        let build_time = t.elapsed();
+        eprintln!(
+            "[budget] π₀ build {build_time:.1?}: {} wires -> 2^{}",
+            built0.witness.len(),
+            built0.r1cs.k_log
+        );
+        assert!(
+            built0.r1cs.satisfies(&built0.witness),
+            "π₀ trace unsatisfiable at tier {tier}"
+        );
+        rss("after π₀ build");
+
+        let t = Instant::now();
+        let mut ch = FsLaneChallenger::new(b"history-link-v0");
+        let (p0, c0, _) = prove_field_with_public_io(
+            &built0.r1cs,
+            &built0.witness,
+            &params,
+            &class.spec,
+            &built0.io,
+            &mut ch,
+        );
+        let prove_time = t.elapsed();
+        // THE 8 GB BAR: the isolated single-link prove — one class matrix
+        // resident, nothing else (fold matrix was the small genesis dummy).
+        // Captured here, before the steady-state leg below inflates the
+        // process high-water mark with its two-matrix build window.
+        let isolated_prove_hwm_gb = current_mem_snapshot()
+            .map(|m| m.hwm_mb() / 1024.0)
+            .unwrap_or(f64::NAN);
+        rss("after π₀ prove");
+
+        // π₁ ⊳ π₀ — the STEADY-STATE per-block work: the class statement
+        // digest is now seeded, so this build+prove is what a miner repeats
+        // every block.
+        let pi0_io = built0.io;
+        let pi0_r1cs = built0.r1cs;
+        drop(built0.witness);
+        drop(built0.region_claims);
+        let env0 = LinkEnvelope {
+            proof: p0,
+            commitment: c0,
+            io: pi0_io,
+        };
+        let class_digest = pi0_r1cs.statement_digest();
+        let t = Instant::now();
+        let built1 = build_link(
+            &class,
+            &LinkInput {
+                prev: &env0,
+                verified_digest: class_digest,
+                genesis: false,
+                fold_matrix: &pi0_r1cs,
+                block: Some(mk(&units[1], cfg)),
+            },
+        );
+        let build1_time = t.elapsed();
+        // The build window holds TWO copies of the class matrix — the fold
+        // reference (the previous instance) plus the fresh build. A miner
+        // drops the previous instance right here (the fresh one is the next
+        // block's fold reference); sharing the class matrix between the two
+        // (task-5 residual diet) removes the double residency entirely.
+        let build_window_hwm_gb = current_mem_snapshot()
+            .map(|m| m.hwm_mb() / 1024.0)
+            .unwrap_or(f64::NAN);
+        rss("after π₁ build (two-matrix window)");
+        drop(pi0_r1cs);
+        assert!(
+            built1.r1cs.satisfies(&built1.witness),
+            "π₁ trace unsatisfiable at tier {tier}"
+        );
+        let t = Instant::now();
+        let mut ch = FsLaneChallenger::new(b"history-link-v0");
+        let (p1, c1, _) = prove_field_with_public_io(
+            &built1.r1cs,
+            &built1.witness,
+            &params,
+            &class.spec,
+            &built1.io,
+            &mut ch,
+        );
+        let prove1_time = t.elapsed();
+        rss("after π₁ prove");
+
+        // A validator never holds the prover's witness; drop it before
+        // measuring the verify (its own memory profile — an O(2^m) matrix
+        // pass — stacked here on retained prover state).
+        let pi1_io = built1.io;
+        let pi1_r1cs = built1.r1cs;
+        drop(built1.witness);
+        drop(built1.region_claims);
+        let t = Instant::now();
+        let mut chv = FsLaneChallenger::new(b"history-link-v0");
+        verify_field_with_public_io(&pi1_r1cs, &c1, &p1, &class.spec, &pi1_io, &mut chv)
+            .expect("π₁ verifies");
+        let verify_time = t.elapsed();
+        rss("after π₁ verify (validator-side, stacked on retained prover state)");
+
+        eprintln!(
+            "[budget] RESULT tier={tier} @m={CLASS_M} nq={nq}: once-per-class π₀ build \
+             {build_time:.1?} (includes the one-time class digest) + prove {prove_time:.1?}; \
+             STEADY-STATE per block: build {build1_time:.1?} + prove {prove1_time:.1?} \
+             (verify {verify_time:.1?}); ISOLATED prove peak {isolated_prove_hwm_gb:.2} GB, \
+             two-matrix build window {build_window_hwm_gb:.2} GB"
+        );
+        assert!(
+            isolated_prove_hwm_gb <= 8.0,
+            "isolated single-link prover peak RSS {isolated_prove_hwm_gb:.2} GB busts the \
+             8 GB acceptance budget"
+        );
     }
 
     /// One accepted block plus everything the single-block component
