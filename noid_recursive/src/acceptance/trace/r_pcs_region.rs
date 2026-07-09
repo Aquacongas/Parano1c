@@ -46,16 +46,19 @@ use noid_ivc_core::deep_chain::ff_merkle::{
 use noid_ivc_core::deep_chain::relations::FixedPattern;
 use noid_ivc_core::deep_chain::schedule::{compile_duplex, TranscriptOp};
 use noid_ivc_core::field::F128;
-use noid_ivc_core::field_circuit::{FieldR1csBuilder, FsChannelTrace, LinExpr};
+use noid_ivc_core::field_circuit::{
+    FieldR1csBuilder, FsChannelTrace, FsChannelUnionRecorder, LinExpr, RecordedChannel,
+};
 use noid_ivc_core::pcs::{self, PcsParams};
 use noid_ivc_core::public_io::WitnessSlice;
 use noid_poseidon2b::native::permutation::STATE_SIZE;
 
 use super::region_source_binding::{
-    alloc_column_slice, build_combined_duplex_union, common_period_ones, common_period_pattern,
-    discharge_duplex_union, discharge_merkle_union, duplex_data_positions, place_ff,
-    run_duplex_union_native, run_merkle_union_native, slot_cell, DuplexUnion, FfLegSpec,
-    MerkleLeg, RegionPcsClaim, SubChannel,
+    alloc_column_slice, build_combined_duplex_union_with_recordings, common_period_ones,
+    common_period_pattern, discharge_duplex_union, discharge_merkle_union,
+    duplex_data_positions, place_ff, run_duplex_union_native, run_merkle_union_native,
+    slot_cell, DuplexUnion, FfLegSpec, MerkleLeg, MerkleUnionNative, RecordingSpec,
+    RegionPcsClaim, SubChannel,
 };
 use super::self_verify::{
     flat_digest_lanes, pcs_leaf_iv_flat, pcs_node_iv_flat, PcsWalkObligations,
@@ -182,6 +185,12 @@ struct Assembly {
     leg_offsets: Vec<Vec<usize>>,
     block_log_b: usize,
     w_log_b: usize,
+    /// The walk L-B native run (proves + verifies once; phase 2 reuses it).
+    native_b: MerkleUnionNative,
+    /// The scratch recording of the walk L-B discharge transcript — the
+    /// values walk L-A's region-2 block carries; phase 2's real discharge
+    /// must reproduce it op-for-op.
+    rec_b_scratch: RecordedChannel,
 }
 
 fn build_assembly(proofs: &[RPcsProof<'_>]) -> Assembly {
@@ -239,25 +248,6 @@ fn build_assembly(proofs: &[RPcsProof<'_>]) -> Assembly {
         }
         digests.push(per_proof);
     }
-    let u_a = build_combined_duplex_union(&subs, &tiles);
-    // Sanity: the C0/C1 cells at each sub-channel's last real slot carry
-    // the native leaf digest (the fixed no-pad sponge reads its state
-    // directly after the last absorb permutation).
-    let per_tile = 1usize << u_a.block_log;
-    for (pi, per_proof) in digests.iter().enumerate() {
-        for (qi, ds) in per_proof.iter().enumerate() {
-            let tile_off = (pi * n_queries + qi) * per_tile;
-            for (t, d) in ds.iter().enumerate() {
-                let dslot = tile_off + t * s + lanes_sig[t] / 2 - 1;
-                assert_eq!(
-                    [u_a.committed[2][dslot], u_a.committed[3][dslot]],
-                    *d,
-                    "leaf digest cell mismatch (proof {pi}, query {qi}, tree {t})"
-                );
-            }
-        }
-    }
-
     // ---- Walk L-B: ff legs per (proof, tree), one path per query block.
     let iv_node = pcs_node_iv_flat();
     let mut leg_offsets: Vec<Vec<usize>> = Vec::with_capacity(proofs.len());
@@ -359,6 +349,55 @@ fn build_assembly(proofs: &[RPcsProof<'_>]) -> Assembly {
         }
     }
 
+    // ---- Walk L-B native + the SCRATCH-RECORDED trace discharge. The
+    // walk L-B discharge transcript rides walk L-A as a REGION-2 recording
+    // block instead of an inline permutation replay (the 4f.1c diet applied
+    // to the link walks; L-A's own transcript stays inline — a walk cannot
+    // host its own transcript). The recording's VALUES must exist before
+    // the L-A columns are built (the split link allocates walk columns
+    // right after its IO cells), so a throwaway builder runs the discharge
+    // twin once here; phase 2 re-runs it for real and asserts op/data/
+    // challenge identity against this scratch recording.
+    let committed_b: Vec<&[F128]> = cb.iter().map(|c| c.as_slice()).collect();
+    let c_refs: [usize; STATE_SIZE] = std::array::from_fn(|i| i);
+    let legs: Vec<MerkleLeg> = Vec::new();
+    let native_b = run_merkle_union_native(
+        &committed_b, &s0b, &soutb, &fixed_b, &c_refs, &ff_specs, &legs, w_log_b, DOMAIN_LB,
+    );
+    let mut scratch = FieldR1csBuilder::new();
+    let mut rec_ch = FsChannelUnionRecorder::new(DOMAIN_LB);
+    let (_, scratch_pins) = discharge_merkle_union(
+        &mut scratch, &mut rec_ch, &fixed_b, &c_refs, &ff_specs, &legs, w_log_b, &native_b,
+    );
+    assert!(scratch_pins.is_empty(), "no 2-perm legs in the link walks");
+    let rec_b_scratch = rec_ch.finish();
+
+    // ---- Walk L-A: the combined union hosting the leaf tiles (region 1)
+    // and the walk L-B discharge recording (region 2).
+    let rec_spec = RecordingSpec {
+        layout: compile_duplex(&rec_b_scratch.ops),
+        iv_flat: FsChannelUnionRecorder::capacity_iv_flat(),
+        data: &rec_b_scratch.data_flat,
+    };
+    let u_a = build_combined_duplex_union_with_recordings(&subs, &tiles, &[rec_spec]);
+    // Sanity: the C0/C1 cells at each sub-channel's last real slot carry
+    // the native leaf digest (the fixed no-pad sponge reads its state
+    // directly after the last absorb permutation).
+    let per_tile = 1usize << u_a.block_log;
+    for (pi, per_proof) in digests.iter().enumerate() {
+        for (qi, ds) in per_proof.iter().enumerate() {
+            let tile_off = (pi * n_queries + qi) * per_tile;
+            for (t, d) in ds.iter().enumerate() {
+                let dslot = tile_off + t * s + lanes_sig[t] / 2 - 1;
+                assert_eq!(
+                    [u_a.committed[2][dslot], u_a.committed[3][dslot]],
+                    *d,
+                    "leaf digest cell mismatch (proof {pi}, query {qi}, tree {t})"
+                );
+            }
+        }
+    }
+
     Assembly {
         u_a,
         digests,
@@ -373,6 +412,8 @@ fn build_assembly(proofs: &[RPcsProof<'_>]) -> Assembly {
         leg_offsets,
         block_log_b,
         w_log_b,
+        native_b,
+        rec_b_scratch,
     }
 }
 
@@ -382,25 +423,11 @@ fn build_assembly(proofs: &[RPcsProof<'_>]) -> Assembly {
 pub fn r_pcs_region_native(proofs: &[RPcsProof<'_>]) -> Vec<(Vec<F128>, F128)> {
     let asm = build_assembly(proofs);
     let native_a = run_duplex_union_native(&asm.u_a, DOMAIN_LA);
-    let committed_b: Vec<&[F128]> = asm.cb.iter().map(|c| c.as_slice()).collect();
-    let c_refs: [usize; STATE_SIZE] = std::array::from_fn(|i| i);
-    let legs: Vec<MerkleLeg> = Vec::new();
-    let native_b = run_merkle_union_native(
-        &committed_b,
-        &asm.s0b,
-        &asm.soutb,
-        &asm.fixed_b,
-        &c_refs,
-        &asm.ff_specs,
-        &legs,
-        asm.w_log_b,
-        DOMAIN_LB,
-    );
     let mut out: Vec<(Vec<F128>, F128)> = Vec::new();
     for (_, pt, v) in &native_a.pending {
         out.push((pt.clone(), *v));
     }
-    for (_, pt, v) in &native_b.pending {
+    for (_, pt, v) in &asm.native_b.pending {
         out.push((pt.clone(), *v));
     }
     out
@@ -468,30 +495,18 @@ pub(crate) fn discharge_r_pcs_via_region(
         assert_eq!(obs.paths.len(), obs.leaves.len(), "proof {pi}: path/leaf pairing");
     }
 
-    // ---- Natives (both walks).
+    // ---- Walk L-A native (over the recording-bearing domain; walk L-B's
+    // native run rides the assembly).
     let native_a = run_duplex_union_native(&asm.u_a, DOMAIN_LA);
-    let committed_b: Vec<&[F128]> = asm.cb.iter().map(|c| c.as_slice()).collect();
     let c_refs: [usize; STATE_SIZE] = std::array::from_fn(|i| i);
     let legs: Vec<MerkleLeg> = Vec::new();
-    let native_b = run_merkle_union_native(
-        &committed_b,
-        &asm.s0b,
-        &asm.soutb,
-        &asm.fixed_b,
-        &c_refs,
-        &asm.ff_specs,
-        &legs,
-        asm.w_log_b,
-        DOMAIN_LB,
-    );
 
-    // ---- The two walk discharges (inline transcripts — a walk cannot
-    // host its own transcript, and at link scale both are cheap).
+    // ---- Walk L-B discharge FIRST, on a RECORDER: its transcript rides
+    // walk L-A's region-2 block; the real recording must reproduce the
+    // assembly's scratch recording exactly (same native inputs — any drift
+    // is a bug, caught loudly here before the cell pins).
     let mut ledger = b.num_wires();
-    let mut ch_a = FsChannelTrace::new(b, DOMAIN_LA);
-    let mut claims = discharge_duplex_union(b, &mut ch_a, &asm.u_a, &native_a, 0);
-    crate::acceptance::row_ledger_mark(b, &mut ledger, "r-pcs: walk L-A twin (inline)");
-    let mut ch_b = FsChannelTrace::new(b, DOMAIN_LB);
+    let mut ch_b = FsChannelUnionRecorder::new(DOMAIN_LB);
     let (mut claims_b, leg_pins) = discharge_merkle_union(
         b,
         &mut ch_b,
@@ -500,10 +515,51 @@ pub(crate) fn discharge_r_pcs_via_region(
         &asm.ff_specs,
         &legs,
         asm.w_log_b,
-        &native_b,
+        &asm.native_b,
     );
     assert!(leg_pins.is_empty(), "no 2-perm legs in the link walks");
-    crate::acceptance::row_ledger_mark(b, &mut ledger, "r-pcs: walk L-B twin (inline)");
+    let rec_b = ch_b.finish();
+    assert_eq!(rec_b.ops, asm.rec_b_scratch.ops, "walk L-B recording schedule drift");
+    assert_eq!(rec_b.data_flat, asm.rec_b_scratch.data_flat, "walk L-B recording data drift");
+    assert_eq!(
+        rec_b.post_state, asm.rec_b_scratch.post_state,
+        "walk L-B recording post-state drift"
+    );
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "r-pcs: walk L-B twin (recorded)");
+
+    // ---- Walk L-A discharge (inline transcript — a walk cannot host its
+    // own transcript; L-A is the one inline replay the link pays for).
+    let mut ch_a = FsChannelTrace::new(b, DOMAIN_LA);
+    let mut claims = discharge_duplex_union(b, &mut ch_a, &asm.u_a, &native_a, 0);
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "r-pcs: walk L-A twin (inline)");
+
+    // ---- Region-2 recording cell pins: the walk L-B discharge's absorbed
+    // proof data pins to the recording block's A-lane cells and its
+    // squeezed challenges to the carry cells — walk L-A then proves the
+    // whole transcript chain, replacing the deleted inline replay.
+    {
+        let (rec_layout, off) = &asm.u_a.rec_blocks[0];
+        assert_eq!(
+            rec_b.challenge_wires.len(),
+            rec_layout.challenges.len(),
+            "walk L-B recording challenge count"
+        );
+        assert_eq!(rec_b.data_wires.len(), rec_layout.n_data, "walk L-B recording data count");
+        for (kk, &(slot, lane)) in rec_layout.challenges.iter().enumerate() {
+            assert_eq!(
+                rec_b.challenge_wires[kk].eval(b.values()),
+                asm.u_a.rec_challenges[0][kk],
+                "walk L-B recording challenge {kk} lockstep"
+            );
+            let cell = slot_cell(&slices_a[asm.u_a.refs.c[lane]], off + slot);
+            pin_eq(b, &rec_b.challenge_wires[kk], &cell);
+        }
+        for (kk, &(slot, lane)) in duplex_data_positions(rec_layout).iter().enumerate() {
+            let cell = slot_cell(&slices_a[asm.u_a.refs.a[lane]], off + slot);
+            pin_eq(b, &rec_b.data_wires[kk], &cell);
+        }
+    }
+
     for c in claims_b.iter_mut() {
         c.slice += slices_a.len();
     }
@@ -654,6 +710,23 @@ mod tests {
             },
         ];
         let cols = alloc_r_pcs_columns(&mut b, &proofs);
+        // Recording-region cell coordinates (captured before `cols` moves):
+        // the hosted walk L-B discharge transcript's first data cell and a
+        // carry-chain cell inside the recording block.
+        let (rec_layout, rec_off) = {
+            let (l, o) = &cols.asm.u_a.rec_blocks[0];
+            (l.clone(), *o)
+        };
+        let rec_data0 = duplex_data_positions(&rec_layout)[0];
+        let rec_data_cell = slot_cell(
+            &cols.slices_a[cols.asm.u_a.refs.a[rec_data0.1]],
+            rec_off + rec_data0.0,
+        );
+        let rec_chal0 = rec_layout.challenges[0];
+        let rec_chal_cell = slot_cell(
+            &cols.slices_a[cols.asm.u_a.refs.c[rec_chal0.1]],
+            rec_off + rec_chal0.0,
+        );
         let claims = discharge_r_pcs_via_region(&mut b, cols, &[&obs0, &obs1]);
         assert!(!claims.is_empty(), "walk opening claims present");
         let rows = b.num_wires();
@@ -688,6 +761,14 @@ mod tests {
         flips.push((wire_of(&obs1.leaves[3].lanes[1]), "leaf lane (proof 1)"));
         flips.push((wire_of(&obs0.paths[0].dir_bits[0]), "direction bit"));
         flips.push((wire_of(&obs1.paths[1].root[0]), "observed root lane"));
+        // Hosted-recording negatives: a data cell and a squeezed-challenge
+        // carry cell of the walk L-B discharge recording — each pinned
+        // (pin_eq) to the discharge twin's wire, so a flip breaks the
+        // binding row. (Unpinned interior carry cells are bound by the
+        // column OPENING claim, which only a consumer of the claim tail
+        // enforces — the standalone gate cannot flip those.)
+        flips.push((wire_of(&rec_data_cell), "recording data cell"));
+        flips.push((wire_of(&rec_chal_cell), "recording challenge cell"));
         for (w, what) in flips {
             let mut bad = z.clone();
             bad[w] += F128::ONE;

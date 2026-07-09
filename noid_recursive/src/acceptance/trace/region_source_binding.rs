@@ -3627,23 +3627,9 @@ pub(crate) fn build_duplex_union_with_recordings(
     let r1_len = (k.max(1) * per_tx).next_power_of_two();
     let r1_log = r1_len.trailing_zeros() as usize;
 
-    // Descending-size dyadic packing of the recordings after region 1.
-    let sizes: Vec<usize> = recordings
-        .iter()
-        .map(|r| r.layout.slots.len().max(1).next_power_of_two())
-        .collect();
-    let s_max = *sizes.iter().max().expect("non-empty recordings");
-    let mut order: Vec<usize> = (0..recordings.len()).collect();
-    order.sort_by_key(|&r| std::cmp::Reverse(sizes[r]));
-    let r2_base = r1_len.max(s_max);
-    let mut offsets = vec![0usize; recordings.len()];
-    let mut cur = r2_base;
-    for &r in &order {
-        debug_assert_eq!(cur % sizes[r], 0, "dyadic packing alignment");
-        offsets[r] = cur;
-        cur += sizes[r];
-    }
-    let w_log = cur.next_power_of_two().trailing_zeros() as usize;
+    let packing = pack_recordings(r1_len, recordings);
+    let offsets = &packing.offsets;
+    let w_log = packing.w_log;
     let p = 1usize << w_log;
 
     let mut committed: [Vec<F128>; 6] = std::array::from_fn(|_| vec![F128::ZERO; p]);
@@ -3671,67 +3657,17 @@ pub(crate) fn build_duplex_union_with_recordings(
         }
     }
 
-    // Gap, recording blocks, tail: pure carry between blocks, each
-    // recording re-seeded at its offset.
-    let mut rec_challenges: Vec<Vec<F128>> = vec![Vec::new(); recordings.len()];
-    let mut carry: [F128; STATE_SIZE] = std::array::from_fn(|j| committed[2 + j][r1_len - 1]);
-    let mut cursor = r1_len;
-    let fill_carry = |committed: &mut [Vec<F128>; 6],
-                          s0: &mut [Vec<F128>; STATE_SIZE],
-                          s_out: &mut [Vec<F128>; STATE_SIZE],
-                          carry: &mut [F128; STATE_SIZE],
-                          from: usize,
-                          to: usize| {
-        for slot in from..to {
-            let (g0, gout) = noid_ivc_core::deep_chain::source_tree::run_perm(*carry);
-            for j in 0..STATE_SIZE {
-                s0[j][slot] = g0[j];
-                s_out[j][slot] = gout[j];
-                committed[2 + j][slot] = gout[j];
-            }
-            *carry = gout;
-        }
-    };
-    for &r in &order {
-        fill_carry(&mut committed, &mut s0, &mut s_out, &mut carry, cursor, offsets[r]);
-        let rec = &recordings[r];
-        let sz = sizes[r];
-        let s_log = sz.trailing_zeros() as usize;
-        let cols = build_duplex_columns(&rec.layout, rec.iv_flat, rec.data, s_log);
-        let off = offsets[r];
-        for j in 0..2 {
-            committed[j][off..off + sz].copy_from_slice(&cols.a[j]);
-        }
-        for j in 0..STATE_SIZE {
-            committed[2 + j][off..off + sz].copy_from_slice(&cols.c[j]);
-            s0[j][off..off + sz].copy_from_slice(&cols.s0[j]);
-            s_out[j][off..off + sz].copy_from_slice(&cols.s_out[j]);
-        }
-        rec_challenges[r] = cols.challenges;
-        carry = std::array::from_fn(|j| committed[2 + j][off + sz - 1]);
-        cursor = off + sz;
-    }
-    fill_carry(&mut committed, &mut s0, &mut s_out, &mut carry, cursor, p);
+    let rec_challenges =
+        fill_recording_region(&mut committed, &mut s0, &mut s_out, r1_len, &packing, recordings);
 
     // Gated pattern sets: region 1 pinned to its dyadic prefix, each
     // recording to its own block. Both region boundaries are strictly
     // below the domain top (region 2 is non-empty), so no gate is empty.
-    let hi_bits = |off: usize, from: usize| -> Vec<bool> {
-        (from..w_log).map(|c| (off >> c) & 1 == 1).collect()
-    };
     let mut fixed: Vec<FixedPattern> = duplex_fixed_patterns(layout, iv_flat, block_log)
         .into_iter()
-        .map(|pat| pat.gated(r1_log, hi_bits(0, r1_log)))
+        .map(|pat| pat.gated(r1_log, rec_hi_bits(0, r1_log, w_log)))
         .collect();
-    let mut rec_refs = Vec::with_capacity(recordings.len());
-    for (r, rec) in recordings.iter().enumerate() {
-        let s_log = sizes[r].trailing_zeros() as usize;
-        let base = fixed.len();
-        for pat in duplex_fixed_patterns(&rec.layout, rec.iv_flat, s_log) {
-            fixed.push(pat.gated(s_log, hi_bits(offsets[r], s_log)));
-        }
-        rec_refs.push(duplex_family_refs(0, base));
-    }
+    let rec_refs = gate_recording_patterns(&mut fixed, &packing, recordings);
 
     DuplexUnion {
         committed,
@@ -3751,6 +3687,116 @@ pub(crate) fn build_duplex_union_with_recordings(
         rec_refs,
         rec_challenges,
     }
+}
+
+/// Descending-size dyadic packing of recording blocks after a region-1
+/// prefix of `r1_len` slots: each recording gets a self-aligned dyadic
+/// block, `w_log` covers everything.
+pub(crate) struct RecordingPacking {
+    pub(crate) order: Vec<usize>,
+    pub(crate) sizes: Vec<usize>,
+    pub(crate) offsets: Vec<usize>,
+    pub(crate) w_log: usize,
+}
+
+pub(crate) fn pack_recordings(r1_len: usize, recordings: &[RecordingSpec<'_>]) -> RecordingPacking {
+    let sizes: Vec<usize> = recordings
+        .iter()
+        .map(|r| r.layout.slots.len().max(1).next_power_of_two())
+        .collect();
+    let s_max = *sizes.iter().max().expect("non-empty recordings");
+    let mut order: Vec<usize> = (0..recordings.len()).collect();
+    order.sort_by_key(|&r| std::cmp::Reverse(sizes[r]));
+    let r2_base = r1_len.max(s_max);
+    let mut offsets = vec![0usize; recordings.len()];
+    let mut cur = r2_base;
+    for &r in &order {
+        debug_assert_eq!(cur % sizes[r], 0, "dyadic packing alignment");
+        offsets[r] = cur;
+        cur += sizes[r];
+    }
+    let w_log = cur.next_power_of_two().trailing_zeros() as usize;
+    RecordingPacking { order, sizes, offsets, w_log }
+}
+
+/// High-coordinate gate bits of the dyadic block at `off` (block log
+/// `from`) inside a `w_log` domain.
+pub(crate) fn rec_hi_bits(off: usize, from: usize, w_log: usize) -> Vec<bool> {
+    (from..w_log).map(|c| (off >> c) & 1 == 1).collect()
+}
+
+/// Fill the recording blocks + the carry-ghost gap/tail slots of a
+/// recording-bearing union domain (columns pre-sized to `2^packing.w_log`;
+/// region 1 already filled up to `r1_len`). Returns each recording's
+/// squeezed challenges.
+pub(crate) fn fill_recording_region(
+    committed: &mut [Vec<F128>; 6],
+    s0: &mut [Vec<F128>; STATE_SIZE],
+    s_out: &mut [Vec<F128>; STATE_SIZE],
+    r1_len: usize,
+    packing: &RecordingPacking,
+    recordings: &[RecordingSpec<'_>],
+) -> Vec<Vec<F128>> {
+    let p = 1usize << packing.w_log;
+    let mut rec_challenges: Vec<Vec<F128>> = vec![Vec::new(); recordings.len()];
+    let mut carry: [F128; STATE_SIZE] = std::array::from_fn(|j| committed[2 + j][r1_len - 1]);
+    let mut cursor = r1_len;
+    let fill_carry = |committed: &mut [Vec<F128>; 6],
+                          s0: &mut [Vec<F128>; STATE_SIZE],
+                          s_out: &mut [Vec<F128>; STATE_SIZE],
+                          carry: &mut [F128; STATE_SIZE],
+                          from: usize,
+                          to: usize| {
+        for slot in from..to {
+            let (g0, gout) = noid_ivc_core::deep_chain::source_tree::run_perm(*carry);
+            for j in 0..STATE_SIZE {
+                s0[j][slot] = g0[j];
+                s_out[j][slot] = gout[j];
+                committed[2 + j][slot] = gout[j];
+            }
+            *carry = gout;
+        }
+    };
+    for &r in &packing.order {
+        fill_carry(committed, s0, s_out, &mut carry, cursor, packing.offsets[r]);
+        let rec = &recordings[r];
+        let sz = packing.sizes[r];
+        let s_log = sz.trailing_zeros() as usize;
+        let cols = build_duplex_columns(&rec.layout, rec.iv_flat, rec.data, s_log);
+        let off = packing.offsets[r];
+        for j in 0..2 {
+            committed[j][off..off + sz].copy_from_slice(&cols.a[j]);
+        }
+        for j in 0..STATE_SIZE {
+            committed[2 + j][off..off + sz].copy_from_slice(&cols.c[j]);
+            s0[j][off..off + sz].copy_from_slice(&cols.s0[j]);
+            s_out[j][off..off + sz].copy_from_slice(&cols.s_out[j]);
+        }
+        rec_challenges[r] = cols.challenges;
+        carry = std::array::from_fn(|j| committed[2 + j][off + sz - 1]);
+        cursor = off + sz;
+    }
+    fill_carry(committed, s0, s_out, &mut carry, cursor, p);
+    rec_challenges
+}
+
+/// Append each recording's gated 7-pattern set to `fixed` and return the
+/// per-recording family refs (pattern indices after the existing sets).
+pub(crate) fn gate_recording_patterns(
+    fixed: &mut Vec<FixedPattern>,
+    packing: &RecordingPacking,
+    recordings: &[RecordingSpec<'_>],
+) -> Vec<DuplexFamilyRefs> {
+    let mut rec_refs = Vec::with_capacity(recordings.len());
+    for (r, rec) in recordings.iter().enumerate() {
+        let s_log = packing.sizes[r].trailing_zeros() as usize;
+        let base = fixed.len();
+        for pat in duplex_fixed_patterns(&rec.layout, rec.iv_flat, s_log) {
+            fixed.push(pat.gated(s_log, rec_hi_bits(packing.offsets[r], s_log, packing.w_log)));
+        }
+        rec_refs.push(duplex_family_refs(0, base));
+    }
+    rec_refs
 }
 
 /// Substitution terms over a MULTI-REGION duplex domain: the ungated
@@ -4381,6 +4427,118 @@ pub(crate) fn build_combined_duplex_union(subs: &[SubChannel], data: &[Vec<Vec<F
         rec_blocks: Vec::new(),
         rec_refs: Vec::new(),
         rec_challenges: Vec::new(),
+    }
+}
+
+/// [`build_combined_duplex_union`] with REGION-2 recording blocks — the
+/// heterogeneous-sub-channel analogue of
+/// [`build_duplex_union_with_recordings`]. Region 1 tiles the K txs'
+/// combined sub-channel blocks (its pattern set hi-gated to the region-1
+/// dyadic prefix); each recorded discharge transcript rides its own
+/// self-aligned dyadic block after it; gaps and the tail are pure carry
+/// ghosts. Same pattern/substitution discipline as the homogeneous
+/// recordings builder — `run_duplex_union_native` / `discharge_duplex_union`
+/// consume the result unchanged.
+pub(crate) fn build_combined_duplex_union_with_recordings(
+    subs: &[SubChannel],
+    data: &[Vec<Vec<F128>>],
+    recordings: &[RecordingSpec<'_>],
+) -> DuplexUnion {
+    assert!(
+        !recordings.is_empty(),
+        "recording-free combined unions use build_combined_duplex_union"
+    );
+    assert!(!subs.is_empty(), "need at least one sub-channel");
+    let n_real = subs.len();
+    let n = n_real.next_power_of_two();
+    let s = subs
+        .iter()
+        .map(|c| c.layout.slots.len())
+        .max()
+        .unwrap()
+        .max(1)
+        .next_power_of_two();
+    let s_log = s.trailing_zeros() as usize;
+    let per_tx = n * s;
+    let block_log = per_tx.trailing_zeros() as usize;
+    let k = data.len();
+    let r1_len = (k.max(1) * per_tx).next_power_of_two();
+    let r1_log = r1_len.trailing_zeros() as usize;
+
+    let packing = pack_recordings(r1_len, recordings);
+    let w_log = packing.w_log;
+    let p = 1usize << w_log;
+
+    for (t, row) in data.iter().enumerate() {
+        assert_eq!(row.len(), n_real, "data row {t} width must equal the sub-channel count");
+        for (i, stream) in row.iter().enumerate() {
+            assert_eq!(stream.len(), subs[i].layout.n_data, "data[{t}][{i}] length");
+        }
+    }
+    let ghost = SubChannel {
+        layout: DuplexLayout { slots: Vec::new(), challenges: Vec::new(), n_data: 0 },
+        iv_flat: [F128::ZERO, F128::ZERO],
+    };
+    let subs_padded: Vec<SubChannel> =
+        (0..n).map(|i| if i < n_real { subs[i].clone() } else { ghost.clone() }).collect();
+
+    let mut committed: [Vec<F128>; 6] = std::array::from_fn(|_| vec![F128::ZERO; p]);
+    let mut s0: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; p]);
+    let mut s_out: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; p]);
+    let mut challenges: Vec<Vec<F128>> = Vec::with_capacity(k);
+
+    // Region 1: the combined tiling (real tx blocks + zero-data ghost
+    // tiles up to the region boundary).
+    for blk in 0..r1_len / per_tx {
+        let mut tx_challenges: Vec<F128> = Vec::new();
+        for (i, sub) in subs_padded.iter().enumerate() {
+            let zero_data = vec![F128::ZERO; sub.layout.n_data];
+            let d: &[F128] = if blk < k && i < n_real { &data[blk][i] } else { &zero_data };
+            let cols = build_duplex_columns(&sub.layout, sub.iv_flat, d, s_log);
+            let off = blk * per_tx + i * s;
+            for j in 0..2 {
+                committed[j][off..off + s].copy_from_slice(&cols.a[j]);
+            }
+            for j in 0..STATE_SIZE {
+                committed[2 + j][off..off + s].copy_from_slice(&cols.c[j]);
+                s0[j][off..off + s].copy_from_slice(&cols.s0[j]);
+                s_out[j][off..off + s].copy_from_slice(&cols.s_out[j]);
+            }
+            if blk < k {
+                tx_challenges.extend_from_slice(&cols.challenges);
+            }
+        }
+        if blk < k {
+            challenges.push(tx_challenges);
+        }
+    }
+
+    let rec_challenges =
+        fill_recording_region(&mut committed, &mut s0, &mut s_out, r1_len, &packing, recordings);
+
+    let mut fixed: Vec<FixedPattern> = combined_duplex_fixed_patterns(&subs_padded, s_log)
+        .into_iter()
+        .map(|pat| pat.gated(r1_log, rec_hi_bits(0, r1_log, w_log)))
+        .collect();
+    let rec_refs = gate_recording_patterns(&mut fixed, &packing, recordings);
+
+    DuplexUnion {
+        committed,
+        s0,
+        s_out,
+        fixed,
+        refs: duplex_family_refs(0, 0),
+        layout: combined_duplex_layout(&subs_padded, s_log),
+        w_log,
+        block_log,
+        challenges,
+        rec_blocks: recordings
+            .iter()
+            .enumerate()
+            .map(|(r, rec)| (rec.layout.clone(), packing.offsets[r]))
+            .collect(),
+        rec_refs,
+        rec_challenges,
     }
 }
 

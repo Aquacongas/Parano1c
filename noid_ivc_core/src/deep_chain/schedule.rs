@@ -78,7 +78,7 @@ pub enum LaneSource {
 }
 
 /// One channel operation of the class-fixed schedule.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TranscriptOp {
     /// Absorb lanes in order; `None` = next witness-data lane, `Some(c)` =
     /// a protocol-constant lane (tower bit pattern).
