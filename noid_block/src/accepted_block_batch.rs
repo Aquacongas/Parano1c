@@ -1881,7 +1881,8 @@ mod tests {
         use noid_ivc_prover::field_prover::prove_field_with_public_io;
         use noid_recursive::acceptance::block_slots::BlockSlotsConfig;
         use noid_recursive::acceptance::link::{
-            build_link, genesis_witness, LinkBlock, LinkClass, LinkEnvelope, LinkInput,
+            build_link, build_link_reusing_matrix, genesis_witness, LinkBlock, LinkClass,
+            LinkEnvelope, LinkInput,
         };
         use noid_recursive::acceptance::trace::region_source_binding::RegionDischargeParams;
         use std::time::Instant;
@@ -2048,27 +2049,24 @@ mod tests {
         };
         let class_digest = pi0_r1cs.statement_digest();
         let t = Instant::now();
-        let built1 = build_link(
+        // Steady state: the previous instance is MOVED in as both the fold
+        // reference and the adopted class matrix — the trace pass runs
+        // witness-only, so no second matrix copy ever exists (the old
+        // "two-matrix build window" is gone by construction). The satisfies
+        // check below runs the full witness against the ADOPTED matrix,
+        // end-to-end validating the witness-only rebuild.
+        let built1 = build_link_reusing_matrix(
             &class,
-            &LinkInput {
-                prev: &env0,
-                verified_digest: class_digest,
-                genesis: false,
-                fold_matrix: &pi0_r1cs,
-                block: Some(mk(&units[1], cfg)),
-            },
+            &env0,
+            class_digest,
+            Some(mk(&units[1], cfg)),
+            pi0_r1cs,
         );
         let build1_time = t.elapsed();
-        // The build window holds TWO copies of the class matrix — the fold
-        // reference (the previous instance) plus the fresh build. A miner
-        // drops the previous instance right here (the fresh one is the next
-        // block's fold reference); sharing the class matrix between the two
-        // (task-5 residual diet) removes the double residency entirely.
         let build_window_hwm_gb = current_mem_snapshot()
             .map(|m| m.hwm_mb() / 1024.0)
             .unwrap_or(f64::NAN);
-        rss("after π₁ build (two-matrix window)");
-        drop(pi0_r1cs);
+        rss("after π₁ build (matrix adopted, witness-only)");
         assert!(
             built1.r1cs.satisfies(&built1.witness),
             "π₁ trace unsatisfiable at tier {tier}"
@@ -2105,7 +2103,8 @@ mod tests {
              {build_time:.1?} (includes the one-time class digest) + prove {prove_time:.1?}; \
              STEADY-STATE per block: build {build1_time:.1?} + prove {prove1_time:.1?} \
              (verify {verify_time:.1?}); ISOLATED prove peak {isolated_prove_hwm_gb:.2} GB, \
-             two-matrix build window {build_window_hwm_gb:.2} GB"
+             steady build window {build_window_hwm_gb:.2} GB (matrix adopted; the residual \
+             transient is the deferred fold's dense g_v/g_e/e_c/v tables, ~3*2^(m+5) B)"
         );
         assert!(
             isolated_prove_hwm_gb <= 8.0,

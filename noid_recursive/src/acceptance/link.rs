@@ -584,7 +584,36 @@ pub struct BuiltLink {
 /// `class.spec.claims` (a class constant) turns them into opening claims on
 /// the previous link's committed columns when the NEXT link replays this one.
 pub fn build_link(class: &LinkClass, input: &LinkInput<'_>) -> BuiltLink {
-    build_link_inner(class, input, false)
+    build_link_inner(class, input, false, None)
+}
+
+/// The STEADY-STATE per-block build: rebuild the link witness while ADOPTING
+/// the class matrix of a previous instance instead of materializing a fresh
+/// copy. The matrix is a class constant (I1 — byte-identical across builds,
+/// enforced by the two-block fixity gates), so the trace pass runs a
+/// witness-only builder: no row accumulation, no coefficient interning, no
+/// second ~2.5 GB matrix during the build window, and the adopted instance
+/// keeps its statement-digest and CSC caches warm. `prev_instance` is both
+/// the fold reference and the returned `BuiltLink::r1cs`. Non-genesis only
+/// (the first build of a class must materialize the matrix once).
+pub fn build_link_reusing_matrix(
+    class: &LinkClass,
+    prev: &LinkEnvelope,
+    verified_digest: [u8; 32],
+    block: Option<LinkBlock<'_>>,
+    prev_instance: FieldR1cs,
+) -> BuiltLink {
+    let input = LinkInput {
+        prev,
+        verified_digest,
+        genesis: false,
+        // Never read on the reuse path: `build_link_inner` folds against the
+        // owned `reuse` instance (the borrow checker cannot express "borrow
+        // the value this same call consumes").
+        fold_matrix: &class.genesis,
+        block,
+    };
+    build_link_inner(class, &input, false, Some(prev_instance))
 }
 
 /// [`build_link`] core. `freeze = true` is the region shape-freeze pass: the
@@ -593,7 +622,13 @@ pub fn build_link(class: &LinkClass, input: &LinkInput<'_>) -> BuiltLink {
 /// frozen-shape assert or the region IO-tail pinning (the tail lanes stay
 /// zero). The caller reads the live claim slices to build the class's frozen
 /// shape and its real spec.
-fn build_link_inner(class: &LinkClass, input: &LinkInput<'_>, freeze: bool) -> BuiltLink {
+fn build_link_inner(
+    class: &LinkClass,
+    input: &LinkInput<'_>,
+    freeze: bool,
+    reuse: Option<FieldR1cs>,
+) -> BuiltLink {
+    assert!(!(freeze && reuse.is_some()), "freeze builds materialize their own matrix");
     let region_mode = class.region_params.is_some();
     let k_log = class.shape.k_log;
     let layout = class.layout();
@@ -627,8 +662,11 @@ fn build_link_inner(class: &LinkClass, input: &LinkInput<'_>, freeze: bool) -> B
         value: input.prev.io[layout.acc_value],
     };
     let mut fold_ch_native = FsLaneChallenger::new(b"history-link-fold-v0");
+    // On the matrix-reuse path the adopted instance IS the fold reference
+    // (steady state: the previous link of the same class).
+    let fold_matrix: &FieldR1cs = reuse.as_ref().unwrap_or(input.fold_matrix);
     let (fold_proof, acc_out) = prove_matrix_claim_fold(
-        input.fold_matrix,
+        fold_matrix,
         &fresh_native,
         &incoming_native,
         gate_native,
@@ -694,8 +732,13 @@ fn build_link_inner(class: &LinkClass, input: &LinkInput<'_>, freeze: bool) -> B
         }
     }
 
-    // ---- Trace pass.
-    let mut b = FieldR1csBuilder::new();
+    // ---- Trace pass. With an adopted matrix the builder runs witness-only:
+    // identical wire numbering and values, no row accumulation.
+    let mut b = if reuse.is_some() {
+        FieldR1csBuilder::new_witness_only()
+    } else {
+        FieldR1csBuilder::new()
+    };
 
     // IO slice cells at their fixed dyadic position (wire 0 is the
     // builder's constant-one pin; pad up to the slice start).
@@ -904,7 +947,16 @@ fn build_link_inner(class: &LinkClass, input: &LinkInput<'_>, freeze: bool) -> B
     while b.num_wires() < target {
         b.alloc_f128(F128::ZERO);
     }
-    let (r1cs, witness) = b.build();
+    let (r1cs, witness) = match reuse {
+        Some(prev) => {
+            let (n_wires, witness) = b.build_witness_only();
+            assert_eq!(n_wires, target, "witness-only build wire count");
+            assert_eq!(prev.m, class.shape.m, "adopted instance shape");
+            assert_eq!(prev.useful_rows, target, "adopted instance row count");
+            (prev, witness)
+        }
+        None => b.build(),
+    };
     assert_eq!(r1cs.m, class.shape.m, "class shape mismatch after padding");
     if !freeze {
         // The class matrix is a protocol constant (I1): hash it once per
@@ -1059,6 +1111,7 @@ fn freeze_region_block_bearing(
             block: Some(freeze_block),
         },
         true,
+        None,
     );
     let frozen: Vec<RegionFrozenClaim> = built
         .region_claims

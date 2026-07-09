@@ -205,6 +205,14 @@ pub struct FieldR1csBuilder {
     value_map: std::collections::HashMap<u128, u32>,
     /// `(wire, value)` pairs registered through [`Self::alloc_public_f128`].
     publics: Vec<(u32, F128)>,
+    /// When false (witness-only mode, [`Self::new_witness_only`]), constraint
+    /// rows are not accumulated: [`Self::commit_wire`] stores only the wire
+    /// VALUE. Witness values are computed by the gadget callers before the
+    /// commit, so skipping the row pushes cannot change the witness — the
+    /// mode rebuilds the witness of a CLASS-FIXED matrix (identical across
+    /// builds by I1, enforced by the fixity gates) without materializing a
+    /// second matrix copy. Finish with [`Self::build_witness_only`].
+    record_rows: bool,
 }
 
 impl Default for FieldR1csBuilder {
@@ -226,10 +234,29 @@ impl FieldR1csBuilder {
             value_table: Vec::new(),
             value_map: std::collections::HashMap::new(),
             publics: Vec::new(),
+            record_rows: true,
         };
         // Wire 0: the constant-one wire, z_0 = z_0 · z_0.
         let w = b.commit_wire(F128::ONE, &[(0, F128::ONE)], &[(0, F128::ONE)]);
         debug_assert_eq!(w.0, 0);
+        b
+    }
+
+    /// A witness-only builder: identical wire numbering and witness values,
+    /// no constraint-row accumulation (see `record_rows`). Finish with
+    /// [`Self::build_witness_only`]; [`Self::build`] would produce an empty
+    /// matrix and is forbidden.
+    pub fn new_witness_only() -> Self {
+        let mut b = Self::new();
+        b.record_rows = false;
+        // Drop wire 0's already-recorded row: witness-only builds never read
+        // the row arrays, keep them empty for the `build` guard.
+        b.a_cols.clear();
+        b.a_value_indices.clear();
+        b.a_offsets.truncate(1);
+        b.b_cols.clear();
+        b.b_value_indices.clear();
+        b.b_offsets.truncate(1);
         b
     }
 
@@ -268,18 +295,20 @@ impl FieldR1csBuilder {
         let idx = self.values.len();
         assert!(idx < u32::MAX as usize);
         self.values.push(value);
-        for &(c, v) in a_row {
-            self.a_cols.push(c);
-            let vi = self.intern_value(v);
-            self.a_value_indices.push(vi);
+        if self.record_rows {
+            for &(c, v) in a_row {
+                self.a_cols.push(c);
+                let vi = self.intern_value(v);
+                self.a_value_indices.push(vi);
+            }
+            self.a_offsets.push(self.a_cols.len());
+            for &(c, v) in b_row {
+                self.b_cols.push(c);
+                let vi = self.intern_value(v);
+                self.b_value_indices.push(vi);
+            }
+            self.b_offsets.push(self.b_cols.len());
         }
-        self.a_offsets.push(self.a_cols.len());
-        for &(c, v) in b_row {
-            self.b_cols.push(c);
-            let vi = self.intern_value(v);
-            self.b_value_indices.push(vi);
-        }
-        self.b_offsets.push(self.b_cols.len());
         Wire(idx as u32)
     }
 
@@ -362,7 +391,24 @@ impl FieldR1csBuilder {
     /// Finish: pad to the next power of two (≥ 2^7 — the zerocheck needs
     /// `m ≥ K_SKIP + 1` and the lincheck `k_skip ≤ k_log`), emit a
     /// single-block `FieldR1cs` (`m = k_log`, `n_outer = 1`) and the witness.
+    /// Finish a witness-only builder: the real wire count plus the witness
+    /// padded to the dyadic size [`Self::build`] would have used. The caller
+    /// pairs it with an existing instance of the same class-fixed matrix.
+    pub fn build_witness_only(self) -> (usize, Vec<F128>) {
+        assert!(!self.record_rows, "use build() on a row-recording builder");
+        let n_wires = self.values.len();
+        let k_log = n_wires.next_power_of_two().trailing_zeros().max(7) as usize;
+        let mut values = self.values;
+        values.resize(1 << k_log, F128::ZERO);
+        (n_wires, values)
+    }
+
     pub fn build(self) -> (FieldR1cs, Vec<F128>) {
+        assert!(
+            self.record_rows,
+            "build() on a witness-only builder would emit an empty matrix; \
+             use build_witness_only()"
+        );
         let n_wires = self.values.len();
         let k_log = n_wires
             .next_power_of_two()
@@ -1136,6 +1182,45 @@ mod tests {
     use noid_core::hardware::clmul_gcm;
     use noid_core::{Block128, TowerField};
     use noid_poseidon2b::native::permutation::Poseidon2bPermutation;
+
+    fn drive_mixed_gadgets(b: &mut FieldR1csBuilder) {
+        let mut rng = Rng::new(0xF00D);
+        let xs: Vec<LinExpr> = (0..8)
+            .map(|_| LinExpr::from_wire(b.alloc_f128(rng.f128())))
+            .collect();
+        let _p = b.alloc_public_f128(F128 { lo: 5, hi: 9 });
+        let _bit = b.alloc_bool(true);
+        let prod = LinExpr::from_wire(b.mul(&xs[0], &xs[1]));
+        let combo = prod.add(&xs[2]).scale(F128 { lo: 3, hi: 1 }).add_const(F128::ONE);
+        let m = LinExpr::from_wire(b.materialize(&combo));
+        let mv = m.eval(b.values());
+        b.pin_f128(&m, mv);
+        let mut ch = FsChannelTrace::new(b, b"witness-only-parity");
+        ch.observe_f128_slice(b, &xs);
+        let c = ch.sample_f128(b);
+        let s = b.mul(&c, &xs[3]);
+        let sv = LinExpr::from_wire(s).eval(b.values());
+        b.pin_f128(&LinExpr::from_wire(s), sv);
+    }
+
+    /// Witness-only builder parity: identical wire numbering and witness
+    /// values with the row accumulation skipped, and the witness satisfies
+    /// the FULL build's matrix — the steady-state link rebuild (which adopts
+    /// the class-fixed matrix of a previous instance) rests on exactly this.
+    #[test]
+    fn witness_only_builder_matches_full_build() {
+        let mut full = FieldR1csBuilder::new();
+        drive_mixed_gadgets(&mut full);
+        let (r1cs, w_full) = full.build();
+
+        let mut wo = FieldR1csBuilder::new_witness_only();
+        drive_mixed_gadgets(&mut wo);
+        let (n_wires, w_wo) = wo.build_witness_only();
+
+        assert_eq!(n_wires, r1cs.useful_rows, "wire count parity");
+        assert_eq!(w_full, w_wo, "witness parity");
+        assert!(r1cs.satisfies(&w_wo), "witness-only witness on the full matrix");
+    }
 
     /// The union recorder must be bit-lockstep with the inline channel twin
     /// (same challenges, same permutation count), and its recorded schedule
