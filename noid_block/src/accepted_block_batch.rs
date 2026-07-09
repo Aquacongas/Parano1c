@@ -1801,8 +1801,18 @@ mod tests {
             profile: Default::default(),
         };
         let nq = BlockSlotsConfig::default().wallet_pcs_params.nq;
-        // Real-tx counts landing exactly on the {4, 8, 16, 32} std tiers.
-        for (n_real, tier) in [(3usize, 4usize), (5, 8), (9, 16), (17, 32)] {
+        // Real-tx counts landing exactly on the std tiers (the smallest
+        // count whose consensus tier is the target keeps the fixtures cheap;
+        // the trace is capacity-shaped, so the real count doesn't matter).
+        for (n_real, tier) in [
+            (3usize, 4usize),
+            (5, 8),
+            (9, 16),
+            (17, 32),
+            (33, 64),
+            (65, 128),
+            (129, 255),
+        ] {
             let units = chained_multi_tx_blocks(1, n_real);
             let rp = RegionDischargeParams { nq };
             let cfg = BlockSlotsConfig {
@@ -1896,7 +1906,10 @@ mod tests {
             8 => 5,
             16 => 9,
             32 => 17,
-            other => panic!("unsupported measure tier {other} (use 4, 8, 16 or 32)"),
+            64 => 33,
+            128 => 65,
+            255 => 129,
+            other => panic!("unsupported measure tier {other} (use a std tier ≥ 4)"),
         };
         let rss = |label: &str| {
             if let Some(m) = current_mem_snapshot() {
