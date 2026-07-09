@@ -34,6 +34,21 @@ pub mod region;
 pub mod shape;
 pub mod trace;
 
+/// Env-gated (`NOID_ROW_LEDGER=1`) wire-count checkpoint: prints the delta
+/// since the previous mark and the running total. The Stage-0 per-subsystem
+/// row ledger — zero cost when the variable is unset.
+pub(crate) fn row_ledger_mark(
+    b: &noid_ivc_core::field_circuit::FieldR1csBuilder,
+    last: &mut usize,
+    label: &str,
+) {
+    if std::env::var_os("NOID_ROW_LEDGER").is_some() {
+        let now = b.num_wires();
+        eprintln!("[ledger] {label:<32} +{:>9}  (total {:>9})", now - *last, now);
+        *last = now;
+    }
+}
+
 use noid_poseidon2b::primitives::Digest;
 
 use crate::block_certificate::BlockProofAcceptanceReceipt;

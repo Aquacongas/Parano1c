@@ -739,6 +739,7 @@ fn build_link_inner(
     } else {
         FieldR1csBuilder::new()
     };
+    let mut ledger = 0usize;
 
     // IO slice cells at their fixed dyadic position (wire 0 is the
     // builder's constant-one pin; pad up to the slice start).
@@ -772,6 +773,7 @@ fn build_link_inner(
         &class.shape,
         &class.pcs_params,
     );
+    crate::acceptance::row_ledger_mark(&b, &mut ledger, "link: IO + prev envelope alloc");
 
     // The deferred [R] replay of the previous proof.
     let mut ch = FsChannelTrace::new(&mut b, b"history-link-v0");
@@ -786,6 +788,7 @@ fn build_link_inner(
         &class.spec,
         &prev_io_wires,
     );
+    crate::acceptance::row_ledger_mark(&b, &mut ledger, "link: [R] deferred replay");
 
     // ---- Rules.
     let one = LinExpr::constant(F128::ONE);
@@ -815,6 +818,8 @@ fn build_link_inner(
         pin_eq(&mut b, &gated, &LinExpr::zero());
     }
 
+    crate::acceptance::row_ledger_mark(&b, &mut ledger, "link: chain rules");
+
     // ---- The accumulator fold twin, pinned to the IO cells.
     let incoming_e = MatrixAccClaimTrace {
         point: prev_io_wires[layout.acc_point..layout.acc_value].to_vec(),
@@ -836,6 +841,7 @@ fn build_link_inner(
         pin_eq(&mut b, p, &io_cells[layout.acc_point + i]);
     }
     pin_eq(&mut b, &acc_e.value, &io_cells[layout.acc_value]);
+    crate::acceptance::row_ledger_mark(&b, &mut ledger, "link: matrix fold twin");
 
     // ---- Block [B] slots (block-bearing class only).
     let mut live_region: Vec<RegionPcsClaim> = Vec::new();
@@ -897,6 +903,8 @@ fn build_link_inner(
             pin_eq(&mut b, &ng_gated, &LinExpr::zero());
         }
 
+        crate::acceptance::row_ledger_mark(&b, &mut ledger, "link: block slots total");
+
         // ---- Region wallet-PCS opening claims → the public-IO tail. Assert
         // the live discharge reproduces the frozen class shape (slices AND
         // arities — same builder context as the freeze), then pin each claim's
@@ -925,6 +933,8 @@ fn build_link_inner(
             }
         }
     }
+
+    crate::acceptance::row_ledger_mark(&b, &mut ledger, "link: region tail pins");
 
     // ---- Pad to the class size (the fixed point: the trace of a class
     // verifier must itself fit the class shape).

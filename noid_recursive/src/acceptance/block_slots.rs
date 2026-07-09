@@ -900,12 +900,15 @@ pub fn build_block_slots_with_config(
         );
     }
 
+    let mut ledger = b.num_wires();
+
     // ---- Primary statement wires: header, claim, accumulator boundary.
     let header_inputs = header_hash_proof_inputs(&witness.headers);
     let header = HeaderHashInputsTrace::alloc(b, &header_inputs[0]);
     let start_acc = AccumulatorWires::alloc(b, start_accumulator);
     let end_acc = AccumulatorWires::alloc(b, end_accumulator);
 
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: statement wires");
     // ---- accepted_claim_hash component (fresh channel, killshot + [D]).
     let mut ch = RawChannelTrace::new();
     let (claim_inputs_t, _claim_reds) = build_accepted_claim_hash_slot(
@@ -969,6 +972,7 @@ pub fn build_block_slots_with_config(
     // proper ripple-carry increment over the tower-bit decompositions.
     pin_u64_successor(b, &start_acc.height, &header.fields[hf::HEIGHT]);
 
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: claim-hash killshot+[D]");
     // ---- tx_body standard spine component. Region mode moves the whole
     // 59-permutation-per-tx replay onto the shared walk A (leaf/wrap tile +
     // compress tree): only the statement wires are allocated here — the SAME
@@ -1037,6 +1041,7 @@ pub fn build_block_slots_with_config(
         )
     };
 
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: spine (tiles+tree data)");
     // ---- Slot liveness (tier capacity): one witness bit per authorization
     // slot — 1 for the real txs, 0 for the ghost padding. Boolean and
     // MONOTONE (no live slot after a dead one), so the vector is determined
@@ -1065,6 +1070,7 @@ pub fn build_block_slots_with_config(
         }
     }
 
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: liveness bits");
     // ---- tx_root component: paths for the REAL leaves, position-pinned.
     // Region mode moves the path hashing onto the shared walk B (one
     // TAG_COMPRESS leg): the entry/root closures ride the SAME statement
@@ -1141,6 +1147,7 @@ pub fn build_block_slots_with_config(
         paths
     };
 
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: tx-root");
     // ---- exact_state component + its statement anchors. Built BEFORE the
     // authorization loop so region mode can thread its region handoff
     // (`ExactStateRegionData`) into the plural wallet-PCS discharge below;
@@ -1187,6 +1194,7 @@ pub fn build_block_slots_with_config(
         &header.fields[hf::LOG_SLOTS],
     );
 
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: exact-state");
     // ---- authorization components (per user tx): owner-auth killshot +
     // wallet-PCS discharge, tx_body_hash pinned to the spine hash.
     let mut auth_inputs = Vec::with_capacity(inputs.authorization_inputs.len());
@@ -1269,6 +1277,7 @@ pub fn build_block_slots_with_config(
             auth_inputs.push(inputs_t);
         }
     }
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: per-tx auth allocs");
     // Region owner-auth discharge (once, after the loop): ONE tiled walk-C
     // replays all K KSCHANNL transcripts (transaction-count flat), producing the
     // SAME `PendingAuthPcsObligation`s the inline per-tx replay does plus the
@@ -1296,6 +1305,7 @@ pub fn build_block_slots_with_config(
         // walk C (region-2 block) — the plural pins its wires there.
         oa_recording = Some(recording);
     }
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: owner-auth walk C' discharge");
     // ONE tiled plural discharge for the whole block (region path): the K txs'
     // wallet-capsule families tile into one walk A/B/C and the returned committed-
     // column opening claims are flat in tx count, threading through the link's
@@ -1330,6 +1340,7 @@ pub fn build_block_slots_with_config(
             ));
         }
     }
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: wallet plural (walks A/B/C)");
     // Totals: the per-slot counts sum to the claim's resource lanes
     // (`verify_authorization_components`). The per-tx counts sum as INTEGERS
     // (ripple-carry over tower bits), NOT field addition -- GF(2^128) add is XOR,
@@ -1360,6 +1371,7 @@ pub fn build_block_slots_with_config(
     let owner_sum = pin_u64_sum(b, &owner_counts);
     pin_eq(b, &owner_total, &owner_sum);
 
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: count sums");
     // ---- accepted-claim batch fold (claim part): shared statement wires,
     // no re-allocation — extend(state_root, block_id, height, claim).
     let steps = vec![ClaimBatchStepWires {
@@ -1391,6 +1403,8 @@ pub fn build_block_slots_with_config(
         1,
     );
     let [header] = header_slice;
+
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: claim fold + checkpoint");
 
     BlockSlots {
         header,
