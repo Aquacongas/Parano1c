@@ -1414,7 +1414,17 @@ fn tx_root_merkle_inputs(block: &Block) -> Result<Vec<MerklePathInputs>, ()> {
         };
     }
 
-    let target = block.transactions.len().next_power_of_two().max(2);
+    // Tier-quantized capacity padding — the same rule as `compute_tx_root`,
+    // so the rebuilt root matches the header.
+    let (standard, sweep) = block.transactions.iter().fold((0usize, 0usize), |(s, w), tx| {
+        match tx.body.shape {
+            _ if tx.body.is_coinbase => (s, w),
+            noid_tx::TxShape::Standard4x8 => (s + 1, w),
+            noid_tx::TxShape::Sweep25x2 => (s, w + 1),
+        }
+    });
+    let non_user = block.transactions.len() - standard - sweep;
+    let target = noid_chain::consensus::params::tx_tree_target(standard, sweep, non_user);
     let depth = target.trailing_zeros() as usize;
     if depth == 0 || depth > MAX_MERKLE_DEPTH {
         return Err(());
@@ -1804,15 +1814,7 @@ mod tests {
         // Real-tx counts landing exactly on the std tiers (the smallest
         // count whose consensus tier is the target keeps the fixtures cheap;
         // the trace is capacity-shaped, so the real count doesn't matter).
-        for (n_real, tier) in [
-            (3usize, 4usize),
-            (5, 8),
-            (9, 16),
-            (17, 32),
-            (33, 64),
-            (65, 128),
-            (129, 255),
-        ] {
+        for (n_real, tier) in [(5usize, 8usize), (17, 32), (33, 64), (129, 255)] {
             let units = chained_multi_tx_blocks(1, n_real);
             let rp = RegionDischargeParams { nq };
             let cfg = BlockSlotsConfig {
@@ -1960,7 +1962,7 @@ mod tests {
     /// same instance shape, so the final HWM is a conservative bound for
     /// both). Asserts the acceptance budget: peak RSS ≤ 8 GB.
     ///
-    /// Tier via `NOID_REGION_MEASURE_TIER` in {4, 8, 16, 32} (default 4);
+    /// Tier via `NOID_REGION_MEASURE_TIER` in {8, 32, 64, 255} (default 8);
     /// prover memory at a fixed class m is tier-independent (the class
     /// pads to 2^m rows), so one tier is representative — the ladder test
     /// above establishes which tiers FIT.
@@ -1986,16 +1988,13 @@ mod tests {
         let tier: usize = std::env::var("NOID_REGION_MEASURE_TIER")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(4);
+            .unwrap_or(8);
         let n_real = match tier {
-            4 => 3,
             8 => 5,
-            16 => 9,
             32 => 17,
             64 => 33,
-            128 => 65,
             255 => 129,
-            other => panic!("unsupported measure tier {other} (use a std tier ≥ 4)"),
+            other => panic!("unsupported measure tier {other} (use a ladder tier)"),
         };
         let rss = |label: &str| {
             if let Some(m) = current_mem_snapshot() {
@@ -2789,7 +2788,7 @@ mod tests {
             profile: Default::default(),
         };
         let rp = RegionDischargeParams { nq: 2 };
-        let tier = 4usize;
+        let tier = 8usize;
         let units = chained_multi_tx_blocks(2, 3);
         fn mk(u: &BlockUnit) -> LinkBlock<'_> {
             LinkBlock {
@@ -3013,10 +3012,10 @@ mod tests {
     }
 
     /// The SPLIT LINK cross-class chain (two-level π, Stage A part 2): two
-    /// block classes on different ladder shapes (tier-8 @ m=23, tier-4 @
-    /// m=22), two link classes sharing one shape+spec (m=24), and the real
-    /// chain crossing classes — genesis link (slot hi, covering the tier-8
-    /// block 1) → tip link (slot lo, covering the tier-4 block 2) — decided
+    /// block classes on different ladder shapes (tier-32 @ m=23, tier-8 @
+    /// m=22), two link classes sharing one shape+spec, and the real
+    /// chain crossing classes — genesis link (slot hi, covering the tier-32
+    /// block 1) → tip link (slot lo, covering the tier-8 block 2) — decided
     /// natively. Exercises: the whitelist-lane digest derivation (`w_D =
     /// Σ β·WL + g·D_T`), whitelist inheritance, the baked block digest +
     /// spec in [R]_B, the two fold twins with per-matrix lanes (link lane
@@ -3056,16 +3055,16 @@ mod tests {
             log_batch_size: 5,
             profile: Default::default(),
         };
-        const MB_LO: usize = 22; // the tier-4 block class shape
-        const MB_HI: usize = 23; // the tier-8 block class shape (heterogeneity on purpose)
+        const MB_LO: usize = 22; // the tier-8 block class shape
+        const MB_HI: usize = 23; // the tier-32 block class shape (heterogeneity on purpose)
         const ML: usize = 23; // the link shape: two walk-dieted [R] replays
         // PRODUCTION region density: the block classes discharge their
         // wallet PCS at the full query count, so the block specs carry
         // production-arity claims and the link's [R]_B sees real sizes.
         let rp = RegionDischargeParams { nq: 64 };
 
-        // Block 1: 5 std txs (consensus tier 8); block 2: 3 std txs (tier 4).
-        let units = chained_blocks_with_tx_counts(&[5, 3]);
+        // Block 1: 17 std txs (consensus tier 32); block 2: 5 std txs (tier 8).
+        let units = chained_blocks_with_tx_counts(&[17, 5]);
         fn mk(u: &BlockUnit) -> LinkBlock<'_> {
             LinkBlock {
                 start_accumulator: &u.start_accumulator,
@@ -3078,8 +3077,8 @@ mod tests {
 
         // ---- Block classes + block proofs.
         let t0 = Instant::now();
-        let b_hi = BlockClass::freeze(shape(MB_HI), params(MB_HI), rp, &mk(&units[0]), 8);
-        let b_lo = BlockClass::freeze(shape(MB_LO), params(MB_LO), rp, &mk(&units[1]), 4);
+        let b_hi = BlockClass::freeze(shape(MB_HI), params(MB_HI), rp, &mk(&units[0]), 32);
+        let b_lo = BlockClass::freeze(shape(MB_LO), params(MB_LO), rp, &mk(&units[1]), 8);
         eprintln!("[split-e2e] block classes frozen: {:.1?}", t0.elapsed());
         let prove_block = |class: &BlockClass,
                            unit: &BlockUnit|
@@ -3112,12 +3111,12 @@ mod tests {
         // ---- The ladder + the two link classes (shared shape and spec).
         let ladder = vec![
             LadderSlotInfo {
-                tier: 4,
+                tier: 8,
                 b_shape: shape(MB_LO),
                 b_digest: *b_lo.class_statement_digest.get().unwrap(),
             },
             LadderSlotInfo {
-                tier: 8,
+                tier: 32,
                 b_shape: shape(MB_HI),
                 b_digest: *b_hi.class_statement_digest.get().unwrap(),
             },
@@ -4582,9 +4581,9 @@ mod tests {
     }
 
     /// COMPLETE region block-bearing recursion AT TIER CAPACITY (task 4e.3):
-    /// tier-4 blocks carrying 3 REAL user txs assemble with one ghost
-    /// authorization slot, one ghost spine instance, one dead padded-tree
-    /// leaf, per-slot liveness bits and liveness-derived count lanes — the
+    /// tier-8 blocks carrying 3 REAL user txs assemble with five ghost
+    /// authorization slots, ghost spine instances, dead padded-tree
+    /// leaves, per-slot liveness bits and liveness-derived count lanes — the
     /// tier-fixity machinery end to end through the link: π₀ COMPLETE at
     /// capacity, π₁ ⊳ π₀, decider + negatives. (Same-tier class identity
     /// across DIFFERENT real counts is gated by
@@ -4601,7 +4600,7 @@ mod tests {
             true,
             true,
             true,
-            Some(4),
+            Some(8),
         );
     }
 
@@ -4805,9 +4804,9 @@ mod tests {
     }
 
     /// Tier-capacity parity (task 4e.3): a 3-real-user-tx block assembled at
-    /// its consensus tier capacity 4 — one GHOST authorization slot (the
-    /// protocol `ghost_authorization()`), one ghost spine instance, one dead
-    /// padded-tree leaf — must satisfy, and the liveness machinery must
+    /// its consensus tier capacity 8 — five GHOST authorization slots (the
+    /// protocol `ghost_authorization()`), ghost spine instances, dead
+    /// padded-tree leaves — must satisfy, and the liveness machinery must
     /// reject one-flip tampering: a dead→live bit flip (breaks the
     /// USER_TX_COUNT liveness sum), a live→dead flip on a real slot (breaks
     /// monotonicity/sum), and a flipped ghost tx-hash wire (breaks the ghost
@@ -4834,7 +4833,7 @@ mod tests {
             exact_state_region: true,
             tx_root_region: true,
             spine_region: true,
-            tier_user_tx_capacity: Some(4),
+            tier_user_tx_capacity: Some(8),
         };
         let mut b = FieldR1csBuilder::new();
         let slots = build_block_slots_with_config(
@@ -4845,13 +4844,13 @@ mod tests {
             &u.proof,
             cfg,
         );
-        assert_eq!(slots.tx_hashes.len(), 4, "capacity tx-hash vector");
-        assert_eq!(slots.auth_inputs.len(), 4, "capacity auth slots");
-        assert_eq!(slots.live_bits.len(), 4, "capacity liveness vector");
+        assert_eq!(slots.tx_hashes.len(), 8, "capacity tx-hash vector");
+        assert_eq!(slots.auth_inputs.len(), 8, "capacity auth slots");
+        assert_eq!(slots.live_bits.len(), 8, "capacity liveness vector");
         let (r1cs, z) = b.build();
         assert!(r1cs.satisfies(&z), "tier-capacity block slots must satisfy");
         eprintln!(
-            "[tier-cap] parity OK: {} wires, {} claims, 3 real + 1 ghost slot",
+            "[tier-cap] parity OK: {} wires, {} claims, 3 real + 5 ghost slots",
             z.len(),
             slots.pending_wallet_pcs.len()
         );
@@ -4881,7 +4880,7 @@ mod tests {
     }
 
     /// THE 4e money gate: two blocks of the SAME consensus tier (standard
-    /// tier 4) with DIFFERENT real user-tx counts (3 vs 4) assemble at tier
+    /// tier 8) with DIFFERENT real user-tx counts (3 vs 4) assemble at tier
     /// capacity to ONE class — byte-identical matrices and identical claim
     /// structures. The 3-real block carries one ghost authorization slot,
     /// one ghost spine instance and one dead padded-tree leaf; every
@@ -4904,7 +4903,7 @@ mod tests {
                 exact_state_region: true,
                 tx_root_region: true,
                 spine_region: true,
-                tier_user_tx_capacity: Some(4),
+                tier_user_tx_capacity: Some(8),
             },
         );
     }

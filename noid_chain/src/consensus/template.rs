@@ -307,7 +307,15 @@ pub fn build_block_template(
         if tx_hashes_for_root.is_empty() {
             [0u8; 32]
         } else {
-            let n = tx_hashes_for_root.len().next_power_of_two().max(2);
+            // Tier-quantized capacity padding — the same rule as
+            // `compute_tx_root` (the winners are user txs; the coinbase is
+            // the one non-user leaf).
+            let (standard, sweep) =
+                ordered_winners.iter().fold((0usize, 0usize), |(s, w), tx| match tx.body.shape {
+                    noid_tx::TxShape::Standard4x8 => (s + 1, w),
+                    noid_tx::TxShape::Sweep25x2 => (s, w + 1),
+                });
+            let n = crate::consensus::params::tx_tree_target(standard, sweep, 1);
             let mut layer = Vec::with_capacity(n);
             layer.extend_from_slice(&tx_hashes_for_root);
             layer.resize(n, [0u8; 32]);

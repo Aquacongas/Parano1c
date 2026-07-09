@@ -88,8 +88,14 @@ pub const fn block_semantic_limits_ok(
 /// Standard4x8 transaction-count tiers. Every proof-facing per-block
 /// structure is padded up to the smallest tier holding the block's standard
 /// tx count, so the proof system sees a small fixed family of shapes
-/// (worst-case padding is 2x) instead of per-count structures.
-pub const STANDARD_TX_CLASS_TIERS: [usize; 10] = [0, 1, 2, 4, 8, 16, 32, 64, 128, 255];
+/// instead of per-count structures. The tiers ARE the recursive-proof
+/// ladder: one standalone block class and one link class exist per tier,
+/// and every node can derive/rebuild each class matrix locally, so the
+/// tier set is kept small. Blocks below the lowest tier (including
+/// coinbase-only blocks) pad up to it with protocol ghost transactions;
+/// the worst-case padding ratio is bounded by the largest adjacent-tier
+/// step (4x).
+pub const STANDARD_TX_CLASS_TIERS: [usize; 4] = [8, 32, 64, 255];
 
 /// Sweep25x2 transaction-count tiers (same role as the standard tiers; the
 /// top tier is the live-input budget's sweep capacity).
@@ -134,6 +140,22 @@ pub fn block_class_spend_capacity_for_counts(
     let standard_tier = standard_tx_class_tier(standard_txs)?;
     let sweep_tier = sweep_tx_class_tier(sweep_txs)?;
     Some(block_class_spend_capacity(standard_tier, sweep_tier))
+}
+
+/// The tx-tree leaf target of a block with the given transaction
+/// composition: the tier-quantized user-tx capacity (standard tier + sweep
+/// tier) plus the non-user transactions (the coinbase), padded to the next
+/// power of two (minimum 2). The tx tree is padded to the CLASS capacity —
+/// not the real count — so the tree depth is a pure function of the block's
+/// shape class and the per-tier proof classes stay count-independent.
+/// Compositions past the tier tables fall back to the real count (such
+/// blocks are rejected by consensus elsewhere).
+#[inline]
+pub fn tx_tree_target(standard_txs: usize, sweep_txs: usize, non_user_txs: usize) -> usize {
+    let user_capacity = standard_tx_class_tier(standard_txs)
+        .zip(sweep_tx_class_tier(sweep_txs))
+        .map_or(standard_txs + sweep_txs, |(s, w)| s + w);
+    (user_capacity + non_user_txs).next_power_of_two().max(2)
 }
 
 // ---------------------------------------------------------------------------

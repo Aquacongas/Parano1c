@@ -419,7 +419,7 @@ mod tests {
     #[test]
     fn shape_class_table_is_finite_and_injective() {
         let classes: Vec<ShapeClass> = enumerate_shape_classes().collect();
-        assert_eq!(classes.len(), 10 * 8);
+        assert_eq!(classes.len(), 4 * 8);
         let digests: std::collections::HashSet<[u8; 32]> =
             classes.iter().map(ShapeClass::shape_digest).collect();
         assert_eq!(digests.len(), classes.len(), "class digests must be distinct");
@@ -427,7 +427,7 @@ mod tests {
         // Every consensus-admissible composition maps into the table and its
         // capacity covers the composition's live-input maximum.
         let class = ShapeClass::for_counts(9, 3).expect("in-range composition");
-        assert_eq!(class.standard_tier, 16);
+        assert_eq!(class.standard_tier, 32);
         assert_eq!(class.sweep_tier, 4);
         assert!(class.spend_capacity() >= 9 * 4 + 3 * 25);
         assert!(ShapeClass::for_counts(256, 0).is_none());

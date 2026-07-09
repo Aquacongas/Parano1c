@@ -22,6 +22,7 @@ use noid_tx::wire::WireError;
 use noid_tx::{hash_tx_body_for_shape, Transaction};
 
 use crate::block_header::BlockHeader;
+use crate::consensus::params;
 use crate::state::{apply_tx, ApplyError, ChainState, StateTransition};
 
 /// Hard DoS cap on the number of transactions accepted by the decoder.
@@ -352,20 +353,29 @@ pub fn apply_genesis_block(
 }
 
 /// Compute the block's tx-root — a COMPRESS-domain Merkle reduction over
-/// each transaction's `tx_body_hash`, zero-padded to the next power of
-/// two. An empty block reduces to `ZERO_DIGEST` so a zero-tx header is
+/// each transaction's `tx_body_hash`, zero-padded to the block's
+/// TIER-QUANTIZED transaction capacity ([`params::tx_tree_target`]). An
+/// empty block reduces to `ZERO_DIGEST` so a zero-tx header is
 /// unambiguously representable.
-/// Compute the tx_root Merkle hash over a block's transaction hashes.
 ///
-/// Uses a Poseidon2b COMPRESS binary Merkle tree, padded to the next power
-/// of two (minimum 2). Poseidon2b is chosen because this Merkle root feeds
+/// Uses a Poseidon2b COMPRESS binary Merkle tree. Padding to the shape
+/// class's capacity (not the real count) keeps the tree depth a pure
+/// function of the block's tier, so the per-tier proof classes replay one
+/// fixed path depth. Poseidon2b is chosen because this Merkle root feeds
 /// directly into the block proof and history-proof relations.
 pub fn compute_tx_root(txs: &[Transaction]) -> Digest {
     if txs.is_empty() {
         return [0u8; 32];
     }
-    // Pad to at least 2 so the tree always has at least one internal node.
-    let target = txs.len().next_power_of_two().max(2);
+    let (standard, sweep) = txs.iter().fold((0usize, 0usize), |(s, w), tx| {
+        match tx.body.shape {
+            _ if tx.body.is_coinbase => (s, w),
+            noid_tx::TxShape::Standard4x8 => (s + 1, w),
+            noid_tx::TxShape::Sweep25x2 => (s, w + 1),
+        }
+    });
+    let non_user = txs.len() - standard - sweep;
+    let target = params::tx_tree_target(standard, sweep, non_user);
     let mut level: Vec<Digest> = txs.iter().map(|tx| tx.tx_body_hash.0).collect();
     level.resize(target, [0u8; 32]);
     while level.len() > 1 {

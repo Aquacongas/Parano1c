@@ -286,7 +286,10 @@ fn tx_root_region_data_from_wires(
         "pure-standard tier: every tx is a spine instance"
     );
     let depth = tx_root_inputs[0].active_depth;
-    assert_eq!(1usize << depth, n_txs.next_power_of_two().max(2));
+    // The consensus tree is padded to the block's TIER capacity (a class
+    // constant, at least the count's power of two); the depth rides the
+    // verified killshot statement.
+    assert!(1usize << depth >= n_txs.next_power_of_two().max(2));
     let root_native = tx_root_inputs[0].expected_root;
     let root_flat = [flat_of(root_native[0]), flat_of(root_native[1])];
     for lane in 0..2 {
@@ -1131,7 +1134,8 @@ pub fn build_block_slots_with_config(
             "pure-standard tier: every tx is a spine instance"
         );
         let depth = paths[0].active_depth;
-        assert_eq!(1usize << depth, n_txs.next_power_of_two().max(2));
+        // Tier-capacity consensus padding: the tree is at least count-deep.
+        assert!(1usize << depth >= n_txs.next_power_of_two().max(2));
         let rim = zero_subtree_lanes(depth);
         for (j, path) in paths.iter().enumerate() {
             assert_eq!(path.active_depth, depth);
