@@ -330,12 +330,15 @@ pub fn mk_secret(seed: u128) -> SpendSecret {
 }
 
 fn standard_secrets(seed_base: u128) -> [SpendSecret; MAX_INPUTS] {
-    std::array::from_fn(|i| mk_secret(seed_base + i as u128 * 0x101))
+    // One owner per tx (consensus rule): every live input shares the
+    // tx's single address, so all input slots carry the SAME secret.
+    std::array::from_fn(|_| mk_secret(seed_base))
 }
 
 fn sweep_secrets(seed_base: u128) -> Vec<SpendSecret> {
+    // One owner per tx (consensus rule): one secret for every input slot.
     (0..TxShape::Sweep25x2.max_inputs())
-        .map(|i| mk_secret(seed_base + i as u128 * 0x101))
+        .map(|_| mk_secret(seed_base))
         .collect()
 }
 

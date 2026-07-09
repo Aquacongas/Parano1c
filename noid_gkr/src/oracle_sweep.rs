@@ -234,7 +234,8 @@ mod tests {
         let circuit = SweepSpineCircuit::build();
         let (inputs, input_leaves, output_leaves) = fixture_inputs();
         let got = evaluate_sweep_spine(&circuit, &inputs).tx_body_hash;
-        let want = hash_tx_body_sweep25x2(&[0x5Au8; 32], 123, &input_leaves, &output_leaves, false);
+        let want =
+            hash_tx_body_sweep25x2(&[0x5Au8; 32], 123, &input_leaves, &output_leaves, false, 0);
         assert_eq!(fields_to_digest(got), want.into_bytes());
     }
 

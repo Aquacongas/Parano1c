@@ -36,6 +36,14 @@ pub enum PublicLogicError {
     FeeTooLarge {
         fee: u128,
     },
+    /// A `valid = false` entry carries non-dummy content (canonicality:
+    /// dead entries are the zero pattern, matching the committed bitmap).
+    DeadEntryNotDummy {
+        index: usize,
+    },
+    /// Live inputs owned by more than one address (consensus: one owner
+    /// group per transaction — wallets spend from one active address).
+    MultipleInputOwners,
     InputSumOverflow,
     OutputSumOverflow,
     OutputPlusFeeOverflow,
@@ -103,6 +111,41 @@ pub fn validate_public_tx_logic(body: &TxBody) -> Result<PublicLogicFacts, Publi
         }
     })?;
 
+    // ONE OWNER PER TRANSACTION (consensus rule): every live input is
+    // owned by the same address. Wallets operate one active address at a
+    // time (per-address balances; cross-address moves are explicit
+    // transactions), spending never proves common ownership of two
+    // addresses, and the owner-auth statement always carries exactly one
+    // owner group — so the proof layout (hence the recursive block class
+    // shape) is owner-count independent by construction.
+    let mut live_owner: Option<&noid_poseidon2b::primitives::Address> = None;
+    for input in body.inputs.iter().filter(|i| i.valid) {
+        match live_owner {
+            None => live_owner = Some(&input.owner),
+            Some(owner) if *owner == input.owner => {}
+            Some(_) => return Err(PublicLogicError::MultipleInputOwners),
+        }
+    }
+
+    // Canonicality: a dead entry carries dummy content — the committed
+    // liveness bitmap (the body hash's reserved leaf) is then exactly the
+    // "which leaves are semantic" selector and dead leaves are the zero
+    // pattern everywhere (native and in-trace).
+    for (i, input) in body.inputs.iter().enumerate() {
+        if !input.valid
+            && (input.slot_index != 0 || input.value != 0 || input.owner.0 != [0u8; 32])
+        {
+            return Err(PublicLogicError::DeadEntryNotDummy { index: i });
+        }
+    }
+    for (j, output) in body.outputs.iter().enumerate() {
+        if !output.valid
+            && (output.slot_index != 0 || output.value != 0 || output.owner.0 != [0u8; 32])
+        {
+            return Err(PublicLogicError::DeadEntryNotDummy { index: j });
+        }
+    }
+
     let mut input_sum = 0u128;
     for input in body.inputs.iter().filter(|i| i.valid) {
         input_sum = input_sum
@@ -157,7 +200,9 @@ mod tests {
         TxInput {
             slot_index: slot,
             value,
-            owner: Address([slot as u8; 32]),
+            // One owner per tx (consensus): live inputs share an address;
+            // dead entries carry the dummy zero pattern.
+            owner: if valid { Address([7u8; 32]) } else { Address([0u8; 32]) },
             spend_secret: SpendSecret([0u8; 32]),
             valid,
         }
@@ -167,7 +212,7 @@ mod tests {
         TxOutput {
             slot_index: slot,
             value,
-            owner: Address([slot as u8; 32]),
+            owner: if valid { Address([slot as u8; 32]) } else { Address([0u8; 32]) },
             valid,
         }
     }
@@ -190,17 +235,54 @@ mod tests {
     }
 
     #[test]
-    fn invalid_entries_are_ignored_for_balance() {
+    fn dead_entries_are_dummy_and_ignored_for_balance() {
+        // Canonical dead entries (dummy content) are accepted and excluded
+        // from the balance.
         let body = TxBody::standard(
             [2u8; 32],
             1,
-            vec![input(1, 10, true), input(2, u64::MAX, false)],
-            vec![output(10, 9, true), output(11, u64::MAX, false)],
+            vec![input(1, 10, true), input(0, 0, false)],
+            vec![output(10, 9, true), output(0, 0, false)],
             false,
         );
         let facts = validate_public_tx_logic(&body).expect("valid body");
         assert_eq!(facts.input_sum, 10);
         assert_eq!(facts.output_sum, 9);
+    }
+
+    #[test]
+    fn dead_entry_with_content_rejects() {
+        // A dead entry smuggling non-dummy content violates canonicality
+        // (the committed bitmap marks exactly the semantic leaves).
+        let body = TxBody::standard(
+            [2u8; 32],
+            1,
+            vec![input(1, 10, true), input(2, u64::MAX, false)],
+            vec![output(10, 9, true)],
+            false,
+        );
+        assert!(matches!(
+            validate_public_tx_logic(&body),
+            Err(PublicLogicError::DeadEntryNotDummy { index: 1 })
+        ));
+    }
+
+    #[test]
+    fn multiple_input_owners_reject() {
+        // Consensus: live inputs must share one owner address.
+        let mut i2 = input(2, 5, true);
+        i2.owner = Address([9u8; 32]);
+        let body = TxBody::standard(
+            [2u8; 32],
+            0,
+            vec![input(1, 10, true), i2],
+            vec![output(10, 15, true)],
+            false,
+        );
+        assert_eq!(
+            validate_public_tx_logic(&body),
+            Err(PublicLogicError::MultipleInputOwners)
+        );
     }
 
     #[test]
@@ -225,7 +307,7 @@ mod tests {
             epoch_anchor: [4u8; 32],
             fee: 5,
             inputs: (0..5).map(|i| input(i, 20, true)).collect(),
-            outputs: vec![output(100, 95, true), output(101, 0, false)],
+            outputs: vec![output(100, 95, true), output(0, 0, false)],
             is_coinbase: false,
         };
         let facts = validate_public_tx_logic(&body).expect("valid sweep body");

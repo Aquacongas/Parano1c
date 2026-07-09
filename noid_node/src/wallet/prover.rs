@@ -141,7 +141,8 @@ mod tests {
     #[test]
     #[cfg_attr(debug_assertions, ignore = "release-only sweep proof regression")]
     fn sweep_wallet_bundle_does_not_serialize_spend_secret_bytes() {
-        let secrets: Vec<_> = (0..5).map(|i| secret(21 + i)).collect();
+        // One owner per tx: every input carries the same secret/address.
+        let secrets: Vec<_> = (0..5).map(|_| secret(21)).collect();
         let raw_secrets: Vec<_> = secrets.iter().map(|s| s.0).collect();
         let body = sweep_body(&secrets);
 

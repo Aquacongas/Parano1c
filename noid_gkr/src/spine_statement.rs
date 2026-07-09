@@ -85,7 +85,12 @@ pub fn spine_inputs_from_body(body: &TxBody) -> Result<SpineInputs, SpineStateme
         input_leaves,
         output_leaves,
         is_coinbase_leaf: digest_to_fields(&is_coinbase_leaf(body.is_coinbase)),
-        pad_leaf: [Block128::ZERO; 2],
+        // The reserved leaf carries the committed liveness bitmap -- the
+        // hash-bound source of the per-entry `valid` selectors (a ghost
+        // body's zero bitmap reproduces the historical zero pad).
+        pad_leaf: digest_to_fields(&noid_poseidon2b::primitives::validity_leaf(
+            noid_tx::validity_bits_for_shape(body.shape, &body.inputs, &body.outputs),
+        )),
     })
 }
 
@@ -147,6 +152,7 @@ mod tests {
             &input_leaf_hashes,
             &output_leaf_hashes,
             body.is_coinbase,
+            noid_tx::validity_bits_for_shape(body.shape, &body.inputs, &body.outputs),
         );
         assert_eq!(got, native.0);
     }

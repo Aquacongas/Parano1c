@@ -133,7 +133,7 @@ fn gkr_oracle_matches_native_over_random_fixtures() {
             hash_output_leaf(out_slots[7], out_values[7], &owners[7]),
         ];
 
-        let native: TxBodyHash = hash_tx_body(&prev, fee, &ins_d, &outs_d, is_coinbase);
+        let native: TxBodyHash = hash_tx_body(&prev, fee, &ins_d, &outs_d, is_coinbase, 0);
 
         let inputs = SpineInputs {
             epoch_anchor: digest_to_fields(&prev),

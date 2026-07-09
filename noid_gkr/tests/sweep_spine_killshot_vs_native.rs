@@ -99,6 +99,7 @@ fn fixture(is_coinbase: bool) -> (SweepSpineInputs, TxBodyHash) {
         &input_leaves,
         &output_leaves,
         is_coinbase,
+        0,
     );
     (inputs, native)
 }

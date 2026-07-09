@@ -27,14 +27,17 @@ fn mk_secret(seed: u8) -> SpendSecret {
 }
 
 fn mk_sweep_body(epoch_anchor: [u8; 32], fee: u64) -> TxBody {
+    // One owner per tx (consensus rule): every live input shares the
+    // sweeping wallet's single active address.
+    let spend_secret = mk_secret(1);
+    let owner = derive_address(&spend_secret);
     let mut inputs = Vec::with_capacity(5);
     for i in 0..5u32 {
-        let spend_secret = mk_secret(i as u8 + 1);
         inputs.push(TxInput {
             slot_index: 1_000 + i,
             value: 20_000 + i as u64,
-            owner: derive_address(&spend_secret),
-            spend_secret,
+            owner,
+            spend_secret: spend_secret.clone(),
             valid: true,
         });
     }
@@ -323,7 +326,13 @@ async fn mempool_rejects_wrong_shape_bundle_for_standard_body() {
         .map(|input| input.value)
         .sum();
     standard_body.outputs[0].value = standard_input_sum - standard_body.fee as u64;
-    standard_body.outputs[1].valid = false;
+    // Dead entries must carry the canonical dummy pattern.
+    standard_body.outputs[1] = TxOutput {
+        slot_index: 0,
+        value: 0,
+        owner: Address([0u8; 32]),
+        valid: false,
+    };
     let intent = intent_with_proof(standard_body, authorization_bytes(&sweep_bundle));
     let intent_bytes = intent.to_bytes();
 

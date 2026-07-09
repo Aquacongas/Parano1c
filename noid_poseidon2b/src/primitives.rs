@@ -396,18 +396,24 @@ fn txbody_wrap(root: Digest) -> TxBodyHash {
 /// L2..L5     = input_leaves[0..4]        // hash_input_leaf
 /// L6..L13    = output_leaves[0..8]       // hash_output_leaf
 /// L14        = is_coinbase_leaf(is_coinbase)
-/// L15        = [0u8; 32]                 // pad
+/// L15        = validity_leaf(validity_bits)
 /// ```
 ///
 /// Callers (`noid_tx::body_hash::hash_tx_body`) fill padding with the
 /// zero digest for dummy slots so the shape is constant across every
-/// transaction.
+/// transaction. `validity_bits` commits the per-entry liveness (bit `i`
+/// = input `i` live, bit `TXBODY_INPUTS + j` = output `j` live): the
+/// same body content with different liveness selectors hashes
+/// differently, so balance/action semantics are hash-bound. A zero
+/// bitmap (no live entries — the protocol ghost body) reproduces the
+/// historical zero pad leaf.
 pub fn hash_tx_body(
     epoch_anchor: &Digest,
     fee: u128,
     input_leaves: &[Digest; TXBODY_INPUTS],
     output_leaves: &[Digest; TXBODY_OUTPUTS],
     is_coinbase: bool,
+    validity_bits: u128,
 ) -> TxBodyHash {
     let mut leaves: [Digest; TXBODY_LEAVES] = [[0u8; 32]; TXBODY_LEAVES];
     leaves[0] = *epoch_anchor;
@@ -415,9 +421,18 @@ pub fn hash_tx_body(
     leaves[2..2 + TXBODY_INPUTS].copy_from_slice(input_leaves);
     leaves[2 + TXBODY_INPUTS..2 + TXBODY_INPUTS + TXBODY_OUTPUTS].copy_from_slice(output_leaves);
     leaves[14] = is_coinbase_leaf(is_coinbase);
-    // L15 already zero.
+    leaves[15] = validity_leaf(validity_bits);
 
     txbody_wrap(txbody_merkle_root(&leaves))
+}
+
+/// The reserved-leaf validity bitmap: the first 16 bytes carry the packed
+/// liveness bits (LE), the second half stays zero. Bit positions are
+/// shape-relative: input bit `i`, output bit `max_inputs + j`.
+pub fn validity_leaf(bits: u128) -> Digest {
+    let mut leaf = [0u8; 32];
+    leaf[..16].copy_from_slice(&bits.to_le_bytes());
+    leaf
 }
 
 /// Canonical Sweep25x2 transaction-body hash.
@@ -431,7 +446,7 @@ pub fn hash_tx_body(
 /// L3..L27     = input_leaves[0..25]
 /// L28..L29    = output_leaves[0..2]
 /// L30         = is_coinbase_leaf(is_coinbase)
-/// L31         = [0u8; 32]                    // reserved/pad
+/// L31         = validity_leaf(validity_bits)
 /// ```
 pub fn hash_tx_body_sweep25x2(
     epoch_anchor: &Digest,
@@ -439,6 +454,7 @@ pub fn hash_tx_body_sweep25x2(
     input_leaves: &[Digest; SWEEP_TXBODY_INPUTS],
     output_leaves: &[Digest; SWEEP_TXBODY_OUTPUTS],
     is_coinbase: bool,
+    validity_bits: u128,
 ) -> TxBodyHash {
     let mut leaves: [Digest; SWEEP_TXBODY_LEAVES] = [[0u8; 32]; SWEEP_TXBODY_LEAVES];
     leaves[0] = *epoch_anchor;
@@ -447,7 +463,7 @@ pub fn hash_tx_body_sweep25x2(
     leaves[3..3 + SWEEP_TXBODY_INPUTS].copy_from_slice(input_leaves);
     leaves[28..28 + SWEEP_TXBODY_OUTPUTS].copy_from_slice(output_leaves);
     leaves[30] = is_coinbase_leaf(is_coinbase);
-    // L31 already zero/reserved.
+    leaves[31] = validity_leaf(validity_bits);
 
     txbody_wrap(txbody_merkle_root(&leaves))
 }
@@ -500,8 +516,8 @@ mod tests {
 
         let ins = pad_inputs(vec![hash_input_leaf(5, 100, &addr)]);
         let outs = pad_outputs(vec![c.0]);
-        let tb = hash_tx_body(&[1u8; 32], 3, &ins, &outs, false);
-        assert_eq!(tb, hash_tx_body(&[1u8; 32], 3, &ins, &outs, false));
+        let tb = hash_tx_body(&[1u8; 32], 3, &ins, &outs, false, 0);
+        assert_eq!(tb, hash_tx_body(&[1u8; 32], 3, &ins, &outs, false, 0));
 
         assert_ne!(tb.0, addr.0);
     }
@@ -549,9 +565,9 @@ mod tests {
         let outs_ab = pad_outputs(vec![c2]);
         let outs_ba = pad_outputs(vec![c1]);
 
-        let h_a = hash_tx_body(&[0u8; 32], 10, &ins_ab, &outs_ab, false);
-        let h_b = hash_tx_body(&[0u8; 32], 10, &ins_ba, &outs_ba, false);
-        let h_c = hash_tx_body(&[0u8; 32], 11, &ins_ab, &outs_ab, false);
+        let h_a = hash_tx_body(&[0u8; 32], 10, &ins_ab, &outs_ab, false, 0);
+        let h_b = hash_tx_body(&[0u8; 32], 10, &ins_ba, &outs_ba, false, 0);
+        let h_c = hash_tx_body(&[0u8; 32], 11, &ins_ab, &outs_ab, false, 0);
         assert_ne!(h_a, h_b);
         assert_ne!(h_a, h_c);
     }
@@ -597,6 +613,7 @@ mod tests {
             &[[0u8; 32]; TXBODY_INPUTS],
             &[[0u8; 32]; TXBODY_OUTPUTS],
             false,
+            0,
         );
         assert_eq!(got.0, expected);
     }
@@ -634,7 +651,7 @@ mod tests {
             level = next;
         }
         let expected = txbody_wrap(level[0]);
-        let got = hash_tx_body_sweep25x2(&anchor, fee, &ins, &outs, false);
+        let got = hash_tx_body_sweep25x2(&anchor, fee, &ins, &outs, false, 0);
         assert_eq!(got.0, expected);
     }
 
@@ -645,8 +662,8 @@ mod tests {
         let standard_outs = pad_outputs(vec![hash_output_leaf(2, 90, &addr)]);
         let sweep_ins = pad_sweep_inputs(vec![hash_input_leaf(1, 100, &addr)]);
         let sweep_outs = pad_sweep_outputs(vec![hash_output_leaf(2, 90, &addr)]);
-        let standard = hash_tx_body(&[0x11; 32], 10, &standard_ins, &standard_outs, false);
-        let sweep = hash_tx_body_sweep25x2(&[0x11; 32], 10, &sweep_ins, &sweep_outs, false);
+        let standard = hash_tx_body(&[0x11; 32], 10, &standard_ins, &standard_outs, false, 0);
+        let sweep = hash_tx_body_sweep25x2(&[0x11; 32], 10, &sweep_ins, &sweep_outs, false, 0);
         assert_ne!(standard, sweep);
     }
 
@@ -662,14 +679,14 @@ mod tests {
             hash_output_leaf(30, 100, &addr),
             hash_output_leaf(31, 200, &addr),
         ]);
-        let h = hash_tx_body_sweep25x2(&anchor, 3, &ins, &outs, false);
+        let h = hash_tx_body_sweep25x2(&anchor, 3, &ins, &outs, false, 0);
         let mut ins2 = ins;
         ins2[24] = hash_input_leaf(24, 999, &addr);
-        let h2 = hash_tx_body_sweep25x2(&anchor, 3, &ins2, &outs, false);
+        let h2 = hash_tx_body_sweep25x2(&anchor, 3, &ins2, &outs, false, 0);
         assert_ne!(h, h2);
         let mut outs2 = outs;
         outs2[1] = hash_output_leaf(31, 201, &addr);
-        let h3 = hash_tx_body_sweep25x2(&anchor, 3, &ins, &outs2, false);
+        let h3 = hash_tx_body_sweep25x2(&anchor, 3, &ins, &outs2, false, 0);
         assert_ne!(h, h3);
     }
 
@@ -695,9 +712,9 @@ mod tests {
             outs_full[i] = hash_output_leaf(i as u32, 5 + i as u64, &a);
         }
 
-        let h_empty = hash_tx_body(&[0u8; 32], 0, &ins_empty, &outs_empty, false);
-        let h_one = hash_tx_body(&[0u8; 32], 0, &ins_one, &outs_one, false);
-        let h_full = hash_tx_body(&[0u8; 32], 0, &ins_full, &outs_full, false);
+        let h_empty = hash_tx_body(&[0u8; 32], 0, &ins_empty, &outs_empty, false, 0);
+        let h_one = hash_tx_body(&[0u8; 32], 0, &ins_one, &outs_one, false, 0);
+        let h_full = hash_tx_body(&[0u8; 32], 0, &ins_full, &outs_full, false, 0);
         assert_ne!(h_empty, h_one);
         assert_ne!(h_empty, h_full);
         assert_ne!(h_one, h_full);
@@ -710,8 +727,8 @@ mod tests {
         let prev = [0u8; 32];
         let ins = [[0u8; 32]; TXBODY_INPUTS];
         let outs = [[0u8; 32]; TXBODY_OUTPUTS];
-        let h_regular = hash_tx_body(&prev, 0, &ins, &outs, false);
-        let h_coinbase = hash_tx_body(&prev, 0, &ins, &outs, true);
+        let h_regular = hash_tx_body(&prev, 0, &ins, &outs, false, 0);
+        let h_coinbase = hash_tx_body(&prev, 0, &ins, &outs, true, 0);
         assert_ne!(h_regular, h_coinbase);
     }
 

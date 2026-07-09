@@ -92,7 +92,7 @@ fn oracle_output_equals_native_with_layered_cross_check() {
         hash_output_leaf(16, 170, &addrs[2]),
         hash_output_leaf(17, 190, &addrs[3]),
     ];
-    let native = hash_tx_body(&prev, fee, &ins_d, &outs_d, false);
+    let native = hash_tx_body(&prev, fee, &ins_d, &outs_d, false, 0);
 
     let inputs = SpineInputs {
         epoch_anchor: digest_to_fields(&prev),

@@ -17,7 +17,7 @@ pub mod public_logic;
 pub mod types;
 pub mod wire;
 
-pub use body_hash::{hash_tx_body, hash_tx_body_for_shape};
+pub use body_hash::{hash_tx_body, hash_tx_body_for_shape, validity_bits_for_shape};
 pub use claims::compute_claims_commitment;
 pub use intent::{ClaimedSlot, TxIntent};
 pub use owner_auth::{

@@ -12,9 +12,12 @@
 //! `TxInput::dummy` / `TxOutput::dummy`.
 //!
 //! Every slot is hashed unconditionally, including `valid=false`
-//! slots (which absorb `(0, 0, zero_address)` fields). `valid` is a
-//! pure proof selector, not an input to the body hash; this keeps tx identity
-//! independent from selector padding details.
+//! slots (which absorb `(0, 0, zero_address)` fields), AND the per-entry
+//! `valid` selectors are committed as a bitmap in the reserved pad leaf
+//! (input bit `i`, output bit `max_inputs + j`): the same slot contents
+//! with different liveness selectors are DIFFERENT transactions — the
+//! balance/action semantics are bound by the hash, so no consumer can
+//! reinterpret one body hash under another live set.
 
 use noid_poseidon2b::primitives::{
     hash_input_leaf, hash_output_leaf, hash_tx_body as hash_tx_body_core,
@@ -49,6 +52,28 @@ pub fn hash_tx_body(
     )
 }
 
+/// The liveness bitmap committed in the body's reserved leaf: input bit
+/// `i`, output bit `max_inputs + j`. Shared by the body hash, the spine
+/// statement and every consumer that re-derives the committed selectors.
+pub fn validity_bits_for_shape(
+    shape: TxShape,
+    inputs: &[TxInput],
+    outputs: &[TxOutput],
+) -> u128 {
+    let mut bits = 0u128;
+    for (i, inp) in inputs.iter().enumerate() {
+        if inp.valid {
+            bits |= 1u128 << i;
+        }
+    }
+    for (j, out) in outputs.iter().enumerate() {
+        if out.valid {
+            bits |= 1u128 << (shape.max_inputs() + j);
+        }
+    }
+    bits
+}
+
 /// Compute the canonical transaction-body hash for a specific shape.
 ///
 /// `Standard4x8` preserves the existing 16-leaf launch layout exactly.
@@ -69,6 +94,8 @@ pub fn hash_tx_body_for_shape(
         outputs.len() <= shape.max_outputs(),
         "outputs exceed shape max"
     );
+
+    let validity_bits = validity_bits_for_shape(shape, inputs, outputs);
 
     match shape {
         TxShape::Standard4x8 => {
@@ -93,6 +120,7 @@ pub fn hash_tx_body_for_shape(
                 &input_leaves,
                 &output_leaves,
                 is_coinbase,
+                validity_bits,
             )
         }
         TxShape::Sweep25x2 => {
@@ -118,6 +146,7 @@ pub fn hash_tx_body_for_shape(
                 &input_leaves,
                 &output_leaves,
                 is_coinbase,
+                validity_bits,
             )
         }
     }
