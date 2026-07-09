@@ -241,8 +241,12 @@ fn exact_transition_digest(surface: &ExactActionSurface, child_utxo_root: Digest
     for &slot_index in &surface.spent_slots {
         sponge.absorb(Block128::from(slot_index as u128));
     }
+    // The absorb schedule is VARIABLE-length (per-surface action/slot
+    // counts) and can end on a half-filled rate block, so the padded
+    // finalize is required: the no-pad squeeze would silently drop a
+    // trailing buffered lane from the commitment.
     absorb_digest(&mut sponge, &child_utxo_root);
-    sponge.finalize_no_pad()
+    sponge.finalize()
 }
 
 pub fn accepted_state_transition_claim_fields(
