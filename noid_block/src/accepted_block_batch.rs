@@ -2820,7 +2820,10 @@ mod tests {
         const MB_LO: usize = 22; // the tier-4 block class shape
         const MB_HI: usize = 23; // the tier-8 block class shape (heterogeneity on purpose)
         const ML: usize = 23; // the link shape: two walk-dieted [R] replays
-        let rp = RegionDischargeParams { nq: 2 };
+        // PRODUCTION region density: the block classes discharge their
+        // wallet PCS at the full query count, so the block specs carry
+        // production-arity claims and the link's [R]_B sees real sizes.
+        let rp = RegionDischargeParams { nq: 64 };
 
         // Block 1: 5 std txs (consensus tier 8); block 2: 3 std txs (tier 4).
         let units = chained_blocks_with_tx_counts(&[5, 3]);
@@ -2904,6 +2907,19 @@ mod tests {
         );
         eprintln!("[split-e2e] link classes frozen: {:.1?}", t0.elapsed());
         assert!(!l_lo.region_claims.is_empty(), "frozen walk claims present");
+        eprintln!(
+            "[split-e2e] specs: b_lo io {} ({} claims, max_arity {}), b_hi io {} ({} claims, \
+             max_arity {}), link io {} ({} claims, max_arity {})",
+            b_lo.spec.io_len,
+            b_lo.region_claims.len(),
+            b_lo.region_max_arity,
+            b_hi.spec.io_len,
+            b_hi.region_claims.len(),
+            b_hi.region_max_arity,
+            l_lo.spec.io_len,
+            l_lo.region_claims.len(),
+            l_lo.region_max_arity,
+        );
         assert_eq!(l_lo.spec.io_len, l_hi.spec.io_len, "shared spec io_len");
         assert_eq!(
             l_lo.spec.io_slice.log2_len, l_hi.spec.io_slice.log2_len,
@@ -3043,10 +3059,12 @@ mod tests {
         );
         drop(tw1_r1cs);
         assert!(gen.r1cs.satisfies(&gen.witness), "genesis link unsatisfiable");
+        eprintln!("[split-e2e] genesis link build+satisfies: {:.1?}", t0.elapsed());
         let gen_r1cs = gen.r1cs;
+        let tp = Instant::now();
         let env_gen = prove_link(&l_hi, &gen_r1cs, &gen.witness, gen.io);
+        eprintln!("[split-e2e] genesis link PROVE (m=23): {:.1?}", tp.elapsed());
         drop(gen.witness);
-        eprintln!("[split-e2e] genesis link: {:.1?}", t0.elapsed());
 
         let t0 = Instant::now();
         let l2 = build_split_link(
@@ -3073,10 +3091,12 @@ mod tests {
         );
         drop(tw_l2_r1cs);
         assert!(l2.r1cs.satisfies(&l2.witness), "tip link unsatisfiable");
+        eprintln!("[split-e2e] tip link build+satisfies: {:.1?}", t0.elapsed());
         let l2_r1cs = l2.r1cs;
+        let tp = Instant::now();
         let mut env_tip = prove_link(&l_lo, &l2_r1cs, &l2.witness, l2.io);
+        eprintln!("[split-e2e] tip link PROVE (m=23): {:.1?}", tp.elapsed());
         drop(l2.witness);
-        eprintln!("[split-e2e] tip link: {:.1?}", t0.elapsed());
 
         // ---- Lane liveness sanity: link lane hi live (the tip folded the
         // genesis link's claim), link lane lo dead (nobody verified an
