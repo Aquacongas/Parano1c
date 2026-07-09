@@ -1865,6 +1865,92 @@ mod tests {
         }
     }
 
+    /// Two-level split ladder sizing: freeze the STANDALONE block class at
+    /// each candidate ladder slot (tier, class m) and report the frozen
+    /// claim ledger + freeze time; on a class-shape miss the freeze build's
+    /// own eprintln has already printed the offending wire count. The
+    /// tier-255 slot exercises the power-of-two obligation pad (255 user
+    /// slots round up to 256 with one PAD ghost slot).
+    ///
+    /// One tier per process via `NOID_LADDER_TIER` (the tier-255 freeze is
+    /// a ~30M-wire build — run it alone and watch RSS); all four otherwise.
+    #[test]
+    #[ignore = "measurement helper; run explicitly (multi-million-wire freezes)"]
+    fn block_class_ladder_size_measure() {
+        use noid_ivc_core::pcs::{self, PcsParams};
+        use noid_ivc_core::proof::FieldShape;
+        use noid_ivc_core::zerocheck::K_SKIP;
+        use noid_recursive::acceptance::block_class::BlockClass;
+        use noid_recursive::acceptance::block_slots::BlockSlotsConfig;
+        use noid_recursive::acceptance::link::LinkBlock;
+        use noid_recursive::acceptance::trace::region_source_binding::RegionDischargeParams;
+
+        let nq = BlockSlotsConfig::default().wallet_pcs_params.nq;
+        let only: Option<usize> =
+            std::env::var("NOID_LADDER_TIER").ok().and_then(|t| t.parse().ok());
+        // (smallest real-tx count landing on the tier, tier, candidate m).
+        for (n_real, tier, m) in [
+            (5usize, 8usize, 22usize),
+            (17, 32, 23),
+            (33, 64, 24),
+            (129, 255, 25),
+        ] {
+            if only.is_some_and(|t| t != tier) {
+                continue;
+            }
+            let shape = FieldShape {
+                m,
+                k_log: m,
+                k_skip: K_SKIP,
+                const_pin: Some(0),
+            };
+            let params = PcsParams {
+                m: m + pcs::LOG_PACKING,
+                log_inv_rate: 2,
+                log_batch_size: 5,
+                profile: Default::default(),
+            };
+            let units = chained_multi_tx_blocks(1, n_real);
+            let rp = RegionDischargeParams { nq };
+            let cfg = BlockSlotsConfig {
+                discharge_wallet_pcs: true,
+                wallet_pcs_params: rp,
+                owner_auth_region: true,
+                exact_state_region: true,
+                tx_root_region: true,
+                spine_region: true,
+                tier_user_tx_capacity: Some(tier),
+            };
+            let sample = LinkBlock {
+                start_accumulator: &units[0].start_accumulator,
+                end_accumulator: &units[0].end_accumulator,
+                inputs: &units[0].inputs,
+                proof: &units[0].proof,
+                config: cfg,
+            };
+            let t0 = std::time::Instant::now();
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let class = BlockClass::freeze(shape, params.clone(), rp, &sample, tier);
+                (
+                    class.region_claims.len(),
+                    class.region_max_arity,
+                    class.spec.io_len,
+                )
+            }));
+            match r {
+                Ok((n, ma, io)) => eprintln!(
+                    "[b-size] tier={tier} ({n_real} real tx) nq={nq} @m={m}: FIT \
+                     freeze={:.1?} claims={n} max_arity={ma} io_len={io}",
+                    t0.elapsed()
+                ),
+                Err(_) => eprintln!(
+                    "[b-size] tier={tier} ({n_real} real tx) nq={nq} @m={m}: \
+                     DOES NOT FIT (wire count above)"
+                ),
+            }
+        }
+    }
+
     /// 4f.3 budget gate: ONE miner-shaped prove at production parameters.
     /// Freezes the full-region class at one tier, builds π₀ for a real
     /// block of that tier, runs exactly ONE `prove_field_with_public_io`
@@ -2771,6 +2857,159 @@ mod tests {
             "B_t matrices differ across blocks of the same tier"
         );
         assert!(built2.r1cs.satisfies(&built2.witness), "second B_t trace unsatisfiable");
+    }
+
+    /// The FULL LADDER freeze (two-level π, task-6 ladder sizing): freeze
+    /// all four candidate ladder slots — block classes {tier-8 @ m=22,
+    /// tier-32 @ m=23, tier-64 @ m=24, tier-255 @ m=25} — prove one sample
+    /// block per class, freeze the four link classes at the m=23 link
+    /// shape, and assert the ladder invariant: ALL FOUR link classes share
+    /// one spec (io layout + walk opening-claim slices/arities). The
+    /// tier-255 slot exercises the power-of-two obligation pad and the
+    /// deepest [R]_B replay (m=25: 5-epoch FRI, 2^10 plaintext tail).
+    /// Chain proving/decider mechanics are covered by the two-slot gate
+    /// below; this measure stops at the frozen classes.
+    ///
+    /// HEAVY: ~184 wallet proves in the fixture, a 29M-wire tier-255
+    /// freeze, and an m=25 block prove (peak RSS well above the 8 GB miner
+    /// budget — a measurement artifact of holding four classes at once;
+    /// run ALONE and watch RSS).
+    #[test]
+    #[ignore = "very heavy ladder measure; run explicitly, ONE at a time"]
+    fn split_ladder_four_slot_freeze_measure() {
+        use noid_ivc_core::challenger::FsLaneChallenger;
+        use noid_ivc_core::pcs::{self, PcsParams};
+        use noid_ivc_core::proof::FieldShape;
+        use noid_ivc_core::zerocheck::K_SKIP;
+        use noid_ivc_prover::field_prover::prove_field_with_public_io;
+        use noid_recursive::acceptance::block_class::{build_block_proof_trace, BlockClass};
+        use noid_recursive::acceptance::link::{LinkBlock, LinkEnvelope};
+        use noid_recursive::acceptance::split_link::{LadderSlotInfo, SplitLinkClass};
+        use noid_recursive::acceptance::trace::region_source_binding::RegionDischargeParams;
+        use std::time::Instant;
+
+        let shape = |m: usize| FieldShape {
+            m,
+            k_log: m,
+            k_skip: K_SKIP,
+            const_pin: Some(0),
+        };
+        let params = |m: usize| PcsParams {
+            m: m + pcs::LOG_PACKING,
+            log_inv_rate: 2,
+            log_batch_size: 5,
+            profile: Default::default(),
+        };
+        const ML: usize = 23;
+        let rp = RegionDischargeParams { nq: 64 };
+        // Ladder slots ascending; fixture blocks are non-increasing tx
+        // counts, so slot t's sample is units[n_slots - 1 - t].
+        let slots: [(usize, usize, usize); 4] =
+            [(8, 22, 5), (32, 23, 17), (64, 24, 33), (255, 25, 129)];
+        let counts: Vec<usize> = slots.iter().rev().map(|&(_, _, n)| n).collect();
+        let units = chained_blocks_with_tx_counts(&counts);
+        fn mk(u: &BlockUnit) -> LinkBlock<'_> {
+            LinkBlock {
+                start_accumulator: &u.start_accumulator,
+                end_accumulator: &u.end_accumulator,
+                inputs: &u.inputs,
+                proof: &u.proof,
+                config: Default::default(),
+            }
+        }
+
+        // ---- Phase 1: per slot, freeze the block class and prove the
+        // sample block (fills the class digest the ladder needs).
+        let mut b_classes = Vec::new();
+        let mut b_matrices = Vec::new();
+        let mut b_envs = Vec::new();
+        for (t, &(tier, mb, _)) in slots.iter().enumerate() {
+            let unit = &units[slots.len() - 1 - t];
+            let t0 = Instant::now();
+            let class = BlockClass::freeze(shape(mb), params(mb), rp, &mk(unit), tier);
+            eprintln!("[ladder] B tier={tier} @m={mb}: frozen in {:.1?}", t0.elapsed());
+            let t0 = Instant::now();
+            let built = build_block_proof_trace(&class, &mk(unit));
+            assert!(built.r1cs.satisfies(&built.witness), "π_block trace unsatisfiable");
+            let mut ch = FsLaneChallenger::new(b"history-block-v0");
+            let (proof, commitment, _) = prove_field_with_public_io(
+                &built.r1cs,
+                &built.witness,
+                &class.pcs_params,
+                &class.spec,
+                &built.io,
+                &mut ch,
+            );
+            eprintln!(
+                "[ladder] B tier={tier} sample block build+prove: {:.1?}",
+                t0.elapsed()
+            );
+            b_classes.push(class);
+            b_matrices.push(built.r1cs);
+            b_envs.push(LinkEnvelope {
+                proof,
+                commitment,
+                io: built.io,
+            });
+        }
+
+        // ---- Phase 2: the four link classes over the SAME ladder.
+        let ladder: Vec<LadderSlotInfo> = slots
+            .iter()
+            .zip(&b_classes)
+            .map(|(&(tier, mb, _), class)| LadderSlotInfo {
+                tier,
+                b_shape: shape(mb),
+                b_digest: *class.class_statement_digest.get().unwrap(),
+            })
+            .collect();
+        let genesis_acc = units[0].start_accumulator.clone();
+        let mut links = Vec::new();
+        for (t, &(tier, _, _)) in slots.iter().enumerate() {
+            let t0 = Instant::now();
+            let link = SplitLinkClass::freeze(
+                shape(ML),
+                params(ML),
+                genesis_acc.clone(),
+                ladder.clone(),
+                t,
+                &b_classes[t],
+                &b_envs[t],
+                &b_matrices[t],
+            );
+            eprintln!(
+                "[ladder] L slot={t} (tier {tier}) @m={ML}: frozen in {:.1?} \
+                 (io {}, {} claims, max_arity {})",
+                t0.elapsed(),
+                link.spec.io_len,
+                link.region_claims.len(),
+                link.region_max_arity,
+            );
+            links.push(link);
+        }
+
+        // ---- THE ladder invariant: one shape + one spec across every slot.
+        for l in &links[1..] {
+            assert_eq!(l.spec.io_len, links[0].spec.io_len, "shared spec io_len");
+            assert_eq!(
+                l.spec.io_slice.log2_len, links[0].spec.io_slice.log2_len,
+                "shared spec slice"
+            );
+            assert_eq!(
+                l.region_max_arity, links[0].region_max_arity,
+                "shared walk max arity"
+            );
+            assert_eq!(
+                l.region_claims.len(),
+                links[0].region_claims.len(),
+                "shared walk claim count"
+            );
+            for (a, b) in l.region_claims.iter().zip(&links[0].region_claims) {
+                assert_eq!(a.slice, b.slice, "shared walk claim slice");
+                assert_eq!(a.arity, b.arity, "shared walk claim arity");
+            }
+        }
+        eprintln!("[ladder] ALL FOUR link classes share one spec — ladder invariant holds");
     }
 
     /// The SPLIT LINK cross-class chain (two-level π, Stage A part 2): two

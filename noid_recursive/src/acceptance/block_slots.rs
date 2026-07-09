@@ -508,6 +508,20 @@ fn tx_root_region_capacity_data_from_wires(
     }
 }
 
+/// Authorization-slot count of a build: at tier capacity, the capacity
+/// rounded up to the next power of two — the walk tiling requires a
+/// power-of-two per-slot obligation count, and 255 is the one non-power
+/// tier. Slots past the consensus capacity are PAD slots: they prove the
+/// same protocol ghost authorization as the in-capacity ghost slots, but no
+/// tx slot exists behind them, so their body-hash pin lands on the
+/// ghost-body constant and their liveness bit stays zero-valued (the
+/// USER_TX_COUNT sum is unchanged). Non-capacity builds keep the caller's
+/// tx count (the plural discharge asserts it is a power of two).
+fn tier_auth_slot_count(tier_user_tx_capacity: Option<usize>, n_real_user: usize) -> usize {
+    tier_user_tx_capacity
+        .map_or(n_real_user, |c| if c == 0 { 0 } else { c.next_power_of_two() })
+}
+
 /// The tier's touched-slot capacity: the class spend capacity (the guard
 /// bucket's padded spend width) plus the output capacity (every standard tx
 /// may create up to its shape's max outputs). Every touched slot is a spend
@@ -1049,7 +1063,7 @@ pub fn build_block_slots_with_config(
     // below. Every count that reaches a claim lane is gated by these bits,
     // replacing the content-shaped const pins with class-fixed structure.
     let n_real_user = inputs.authorization_inputs.len();
-    let n_auth_slots = config.tier_user_tx_capacity.unwrap_or(n_real_user);
+    let n_auth_slots = tier_auth_slot_count(config.tier_user_tx_capacity, n_real_user);
     let live_bits: Vec<LinExpr> = (0..n_auth_slots)
         .map(|i| {
             let v = Block128::from(if i < n_real_user { 1u128 } else { 0u128 });
@@ -1247,7 +1261,17 @@ pub fn build_block_slots_with_config(
             // live-input counts) are identical to the inline path.
             let inputs_t = OwnerAuthPublicInputsTrace::alloc(b, public_native);
             let proof_t = OwnerAuthProofTrace::alloc(b, witness_proof, public_native.layout);
-            pin_eq2(b, &inputs_t.tx_body_hash, &tx_hashes[hash_idx]);
+            if hash_idx < tx_hashes.len() {
+                pin_eq2(b, &inputs_t.tx_body_hash, &tx_hashes[hash_idx]);
+            } else {
+                // PAD slot (the capacity rounded up to a power of two): no
+                // tx slot exists past the capacity, so the body-hash pin
+                // lands on the ghost-body protocol constant — the same value
+                // the in-capacity ghost slots read from their tx-hash wires.
+                let gh = noid_gkr::ghost_tx::ghost_tx_body_hash();
+                let gw = [const_block(gh[0]), const_block(gh[1])];
+                pin_eq2(b, &inputs_t.tx_body_hash, &gw);
+            }
             if config.tier_user_tx_capacity.is_some() {
                 owner_counts.push(mul(b, &live_bits[i], &inputs_t.owner_count));
                 live_lens.push(mul(b, &live_bits[i], &inputs_t.live_len));
@@ -1474,7 +1498,7 @@ pub fn region_wallet_pcs_native(
     let n_real_user = inputs.authorization_inputs.len();
     let n_real_txs = inputs.tx_body_standard_inputs.len();
     let tx_delta = n_real_txs.saturating_sub(n_real_user);
-    let n_auth_slots = tier_user_tx_capacity.unwrap_or(n_real_user);
+    let n_auth_slots = tier_auth_slot_count(tier_user_tx_capacity, n_real_user);
     let cap_txs = tier_user_tx_capacity.map_or(n_real_txs, |c| c + tx_delta);
     let mut spine_natives: Vec<SpineInputs> = inputs.tx_body_standard_inputs.clone();
     let mut hash_natives: Vec<[Block128; 2]> = inputs.tx_body_standard_hashes.clone();
