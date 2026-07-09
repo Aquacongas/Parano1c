@@ -133,6 +133,30 @@ pub trait WalletOps: Send + Sync {
     /// Derive and return the next unused address, advancing next_index.
     fn next_address(&self) -> Option<WalletAddressInfo>;
 
+    /// The ACTIVE address (key index + bech32m): every send/consolidation
+    /// spends this address's UTXOs only and change returns to it (one owner
+    /// per transaction is a consensus rule).
+    fn active_address(&self) -> Option<(u32, String)>;
+
+    /// Switch the active address to `index` (derives it if fresh; persists
+    /// the choice). Returns the new (index, bech32m).
+    fn set_active_address(&self, index: u32) -> Result<(u32, String), String>;
+
+    /// Build, prove, and serialize a PULL: move address `from_index`'s
+    /// funds (smallest-first, up to the largest shape) minus fee to the
+    /// ACTIVE address — the explicit cross-address transfer of the
+    /// one-owner-per-tx model. Returns `(intent_bytes, input_slots)`.
+    ///
+    /// This is CPU-heavy (~0.3–3 s): caller must invoke in `spawn_blocking`.
+    fn build_pull(
+        &self,
+        from_index: u32,
+        fee_micronoid: u64,
+        epoch_anchor: [u8; 32],
+        slot_hints: Vec<u32>,
+        log_slots: u32,
+    ) -> Result<(Vec<u8>, Vec<u32>), String>;
+
     /// List all addresses that have been used (have UTXOs or history),
     /// plus the next_index address if it's fresh.
     fn list_addresses(&self) -> Vec<WalletAddressInfo>;

@@ -142,7 +142,7 @@ pub fn extract_build_data(
     Ok(TxBuildData {
         selected_utxos,
         spend_secrets,
-        change_address: wallet.primary_address(),
+        change_address: wallet.active_address(),
         epoch_anchor,
         output_slot_hints: slot_hints,
         shape,
@@ -182,13 +182,16 @@ pub fn extract_consolidate_data(
     pending_output_slots: &std::collections::HashSet<u32>,
     pending_input_slots: &std::collections::HashSet<u32>,
 ) -> Result<(TxBuildData, u64), BuildError> {
-    // Sort all UTXOs smallest-first, skipping any whose slot is already being
-    // spent by a pending (unconfirmed) TX. This prevents double-spend
-    // SlotConflict errors when multiple consolidation rounds are submitted
-    // before the first round is confirmed in a block.
+    // Sort the ACTIVE address's UTXOs smallest-first (one owner per
+    // transaction — the consensus rule; other addresses consolidate after
+    // switching or via an explicit pull), skipping any whose slot is
+    // already being spent by a pending (unconfirmed) TX. This prevents
+    // double-spend SlotConflict errors when multiple consolidation rounds
+    // are submitted before the first round is confirmed in a block.
     let mut all_utxos: Vec<&WalletUtxo> = wallet
         .utxos
         .values()
+        .filter(|u| u.key_index == wallet.active_index)
         .filter(|u| !pending_input_slots.contains(&u.slot_index))
         .collect();
     all_utxos.sort_by_key(|u| u.value);
@@ -238,12 +241,93 @@ pub fn extract_consolidate_data(
         TxBuildData {
             selected_utxos: selected,
             spend_secrets,
-            change_address: wallet.primary_address(),
+            change_address: wallet.active_address(),
             epoch_anchor,
             output_slot_hints: slot_hints,
             shape,
         },
         consolidation_amount,
+    ))
+}
+
+/// Build `TxBuildData` for a PULL: spend address `from_index`'s UTXOs
+/// (smallest-first, up to the largest shape) and send their total minus fee
+/// to the ACTIVE address — the explicit cross-address move of the
+/// one-owner-per-tx model. The inputs all belong to `from_index` (the
+/// consensus rule allows exactly one input owner); the payment output goes
+/// to the active address; any change would return to the SOURCE address.
+#[allow(clippy::too_many_arguments)]
+pub fn extract_pull_data(
+    wallet: &WalletState,
+    from_index: u32,
+    fee_micronoid: u64,
+    epoch_anchor: [u8; 32],
+    slot_hints: Vec<u32>,
+    _log_slots: u32,
+    pending_output_slots: &std::collections::HashSet<u32>,
+    pending_input_slots: &std::collections::HashSet<u32>,
+) -> Result<(TxBuildData, u64), BuildError> {
+    let mut source_utxos: Vec<&WalletUtxo> = wallet
+        .utxos
+        .values()
+        .filter(|u| u.key_index == from_index)
+        .filter(|u| !pending_input_slots.contains(&u.slot_index))
+        .collect();
+    source_utxos.sort_by_key(|u| u.value);
+    let selected: Vec<WalletUtxo> = source_utxos
+        .into_iter()
+        .take(TxShape::Sweep25x2.max_inputs())
+        .cloned()
+        .collect();
+
+    if selected.is_empty() {
+        return Err(BuildError::InsufficientFunds {
+            need: fee_micronoid.saturating_add(1),
+            have: 0,
+        });
+    }
+
+    let shape = if selected.len() <= TxShape::Standard4x8.max_inputs() {
+        TxShape::Standard4x8
+    } else {
+        TxShape::Sweep25x2
+    };
+
+    let total: u64 = selected.iter().map(|u| u.value).sum();
+    if total <= fee_micronoid {
+        return Err(BuildError::InsufficientFunds {
+            need: fee_micronoid.saturating_add(1),
+            have: total,
+        });
+    }
+    let pull_amount = total - fee_micronoid;
+
+    // A pull has no change: one output (to the active address).
+    let slot_hints: Vec<u32> = slot_hints
+        .into_iter()
+        .filter(|s| !pending_output_slots.contains(s))
+        .collect();
+    if slot_hints.is_empty() {
+        return Err(BuildError::NotEnoughSlots { need: 1, got: 0 });
+    }
+
+    let spend_secrets: Vec<SpendSecret> = selected
+        .iter()
+        .map(|u| wallet.spend_secret_for(u.key_index))
+        .collect();
+
+    Ok((
+        TxBuildData {
+            selected_utxos: selected,
+            spend_secrets,
+            // Defensive: any change belongs to the SOURCE address (the
+            // inputs' owner); output owners are unconstrained.
+            change_address: wallet.address_at(from_index),
+            epoch_anchor,
+            output_slot_hints: slot_hints,
+            shape,
+        },
+        pull_amount,
     ))
 }
 
@@ -395,8 +479,10 @@ mod tests {
                 WalletUtxo {
                     slot_index: i,
                     value,
-                    address: wallet.address_at(i),
-                    key_index: i,
+                    // One owner per tx: the fixture's UTXOs all live on the
+                    // ACTIVE (index-0) address.
+                    address: wallet.address_at(0),
+                    key_index: 0,
                     confirmed_height: 1,
                 },
             );

@@ -231,12 +231,17 @@ enum Command {
         /// Derive and return the next fresh address (for a new incoming payment).
         #[arg(long)]
         new: bool,
-        /// List all addresses with their balances.
+        /// List all addresses with their balances (the active one is marked).
         #[arg(long)]
         list: bool,
         /// Show address at a specific key index.
         #[arg(long, value_name = "INDEX")]
         index: Option<u32>,
+        /// Switch the ACTIVE address to this key index. Sends spend from the
+        /// active address only (one owner per transaction); change returns
+        /// to it.
+        #[arg(long = "use", value_name = "INDEX")]
+        use_index: Option<u32>,
     },
 
     /// Confirmed wallet balance (NOID and μNOID).
@@ -287,7 +292,19 @@ enum Command {
     /// Run this if your balance seems wrong or after importing a wallet.
     Scan,
 
-    /// Merge small UTXOs into fewer larger ones (lowers future fees).
+    /// Move another address's funds to the ACTIVE address (an explicit
+    /// single-owner transaction from the source address).
+    Pull {
+        /// Source address key index (see 'address --list').
+        #[arg(value_name = "FROM_INDEX")]
+        from_index: u32,
+        /// Transaction fee in NOID. Omit for automatic minimum fee.
+        #[arg(long, value_name = "FEE_NOID")]
+        fee: Option<String>,
+    },
+
+    /// Merge small UTXOs of the ACTIVE address into fewer larger ones
+    /// (lowers future fees).
     #[command(alias = "merge")]
     Consolidate {
         /// Fee per consolidation transaction in NOID. Omit for auto.
@@ -413,7 +430,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Epoch => cmd_epoch(&ctx).await,
         Command::Mempool => cmd_mempool(&ctx).await,
         Command::MempoolTx { txhash } => cmd_mempool_tx(&ctx, txhash).await,
-        Command::Address { new, list, index } => cmd_address(&ctx, *new, *list, *index).await,
+        Command::Address {
+            new,
+            list,
+            index,
+            use_index,
+        } => cmd_address(&ctx, *new, *list, *index, *use_index).await,
         Command::Balance => cmd_balance(&ctx).await,
         Command::Utxos => cmd_utxos(&ctx).await,
         Command::Send {
@@ -424,6 +446,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         } => cmd_send(&ctx, to, amount, fee.as_deref(), *dry_run).await,
         Command::History { address, last } => cmd_history(&ctx, address.as_deref(), *last).await,
         Command::Scan => cmd_scan(&ctx).await,
+        Command::Pull { from_index, fee } => cmd_pull(&ctx, *from_index, fee.as_deref()).await,
         Command::Consolidate {
             fee,
             dry_run,
@@ -1190,7 +1213,31 @@ async fn cmd_address(
     new: bool,
     list: bool,
     index: Option<u32>,
+    use_index: Option<u32>,
 ) -> anyhow::Result<()> {
+    if let Some(idx) = use_index {
+        let result = rpc(ctx, "walletSetActiveAddress", &[serde_json::json!(idx)])
+            .await
+            .context("walletSetActiveAddress")?;
+        if ctx.json {
+            return print_json(&result);
+        }
+        let addr = result["address"].as_str().unwrap_or("?");
+        let bal = result["balance_noid"].as_f64().unwrap_or(0.0);
+        section(&format!("Active address switched [index={idx}]"));
+        if is_tty() {
+            println!("  {}{}{}", BOLD, addr, RST);
+        } else {
+            println!("  {}", addr);
+        }
+        println!("  Balance: {bal:.6} NOID");
+        println!();
+        println!(
+            "  {} Sends now spend from this address only; change returns here.",
+            c!(DIM, "↑")
+        );
+        return Ok(());
+    }
     if list {
         let result = rpc(ctx, "walletListAddresses", &[])
             .await
@@ -1217,7 +1264,14 @@ async fn cmd_address(
             let noid = a["balance_noid"].as_f64().unwrap_or(0.0);
             let utxos = a["utxo_count"].as_u64().unwrap_or(0);
             let addr = a["address"].as_str().unwrap_or("");
-            let marker = if utxos > 0 { "●" } else { "○" };
+            let active = a["is_active"].as_bool().unwrap_or(false);
+            let marker = if active {
+                "▶"
+            } else if utxos > 0 {
+                "●"
+            } else {
+                "○"
+            };
             println!(
                 "  {} {:>5}  {:>18.6}  {:>6}  {}",
                 marker,
@@ -1244,7 +1298,12 @@ async fn cmd_address(
         );
         println!();
         println!(
-            "  {}Tip: use 'noid-cli address --new' to generate a fresh receiving address.{}",
+            "  {}▶ = active address (sends spend from it). Switch: 'address --use <index>'.{}",
+            c!(DIM, ""),
+            RST
+        );
+        println!(
+            "  {}Tip: 'address --new' for a fresh receiving address; 'pull <index>' to move\n  another address's funds to the active one.{}",
             c!(DIM, ""),
             RST
         );
@@ -1283,15 +1342,16 @@ async fn cmd_address(
             println!("  {}", addr);
         }
     } else {
-        // default: primary address (index 0)
-        let result = rpc(ctx, "walletGetAddress", &[serde_json::json!(0u32)])
+        // default: the ACTIVE address.
+        let result = rpc(ctx, "walletActiveAddress", &[])
             .await
-            .context("walletGetAddress")?;
+            .context("walletActiveAddress")?;
         if ctx.json {
             return print_json(&result);
         }
-        let addr = result.as_str().unwrap_or("?");
-        section("Wallet address [index=0]");
+        let addr = result["address"].as_str().unwrap_or("?");
+        let idx = result["key_index"].as_u64().unwrap_or(0);
+        section(&format!("Active address [index={idx}]"));
         if is_tty() {
             println!("  {}{}{}", BOLD, addr, RST);
         } else {
@@ -1299,11 +1359,11 @@ async fn cmd_address(
         }
         println!();
         println!(
-            "  {} This is your primary receiving address. Share it to receive NOID.",
+            "  {} Sends spend from this address; share it to receive NOID here.",
             c!(DIM, "↑")
         );
         println!(
-            "  {}Tip: use 'address --new' for a fresh address, 'address --list' to see all.{}",
+            "  {}Tip: 'address --new' for a fresh address, '--list' for all, '--use <i>' to switch.{}",
             DIM, RST
         );
     }
@@ -1326,7 +1386,8 @@ async fn cmd_balance(ctx: &Ctx<'_>) -> anyhow::Result<()> {
         .as_f64()
         .unwrap_or(micro as f64 / MICRO_PER_NOID);
 
-    section("Wallet balance");
+    let all_addr_micro = result["all_addresses_micronoid"].as_u64().unwrap_or(micro);
+    section("Wallet balance (active address)");
     if is_tty() {
         println!(
             "  {}Balance:{} {}{} NOID{} {}({} \u{03bc}NOID){}  {}({} UTXOs){}",
@@ -1373,15 +1434,55 @@ async fn cmd_balance(ctx: &Ctx<'_>) -> anyhow::Result<()> {
         }
     }
 
-    if micro == 0 && utxos == 0 {
-        println!();
-        warn_msg("No UTXOs found in wallet cache.");
+    if all_addr_micro > micro {
         println!(
-            "       Run {} to discover UTXOs from chain state.",
-            c!(BOLD, "'noid-cli scan'")
+            "  All addresses:     {} NOID  ({} \u{03bc}NOID) — switch with 'address --use <i>' \
+or move funds with 'pull <i>'",
+            noid_str(all_addr_micro),
+            all_addr_micro
         );
     }
 
+    if micro == 0 && utxos == 0 {
+        println!();
+        warn_msg("No UTXOs found on the active address.");
+        println!(
+            "       Run {} to discover UTXOs from chain state; use {} to see other addresses.",
+            c!(BOLD, "'noid-cli scan'"),
+            c!(BOLD, "'address --list'")
+        );
+    }
+
+    Ok(())
+}
+
+/// Move address `from_index`'s funds to the ACTIVE address (a single-owner
+/// transaction spending only the source address's UTXOs).
+async fn cmd_pull(ctx: &Ctx<'_>, from_index: u32, fee: Option<&str>) -> anyhow::Result<()> {
+    let fee_micro: u64 = match fee {
+        Some(f) => parse_noid_amount(f)?,
+        None => 0, // automatic shape-aware fee
+    };
+    let result = rpc(
+        ctx,
+        "walletPull",
+        &[serde_json::json!(from_index), serde_json::json!(fee_micro)],
+    )
+    .await
+    .context("walletPull")?;
+    if ctx.json {
+        return print_json(&result);
+    }
+    let tx_hash = result["tx_hash"].as_str().unwrap_or("?");
+    let fee_paid = result["fee_micronoid"].as_u64().unwrap_or(0);
+    section(&format!("Pull from address index {from_index}"));
+    println!("  Submitted: {}", ctx.h(tx_hash));
+    println!("  Fee:       {} NOID", noid_str(fee_paid));
+    println!();
+    println!(
+        "  {} Funds move to the active address once the transaction confirms.",
+        c!(DIM, "↑")
+    );
     Ok(())
 }
 

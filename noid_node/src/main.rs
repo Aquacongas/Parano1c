@@ -160,7 +160,7 @@ struct Cli {
     #[arg(long)]
     genesis: bool,
 
-    /// Miner coinbase address (32-byte hex). Defaults to built-in wallet address.
+    /// Miner coinbase address (32-byte hex). Defaults to the wallet's ACTIVE address.
     #[arg(long, value_name = "HEX")]
     miner_address: Option<String>,
 
@@ -453,7 +453,7 @@ async fn main() -> anyhow::Result<()> {
     let wallet_path = data_dir.join("wallet.key");
     let wallet_state = match WalletState::create_or_load(wallet_path) {
         Ok(w) => {
-            tracing::debug!(address = %w.primary_address(), "wallet ready");
+            tracing::debug!(address = %w.active_address(), "wallet ready");
             w
         }
         Err(e) => {
@@ -601,7 +601,7 @@ async fn main() -> anyhow::Result<()> {
         let guard = shared_wallet.lock().unwrap();
         guard
             .as_ref()
-            .map(|w| w.primary_address())
+            .map(|w| w.active_address())
             .unwrap_or(noid_poseidon2b::primitives::Address([0u8; 32]))
     } else {
         parse_address(&cfg.mining.miner_address)?
@@ -646,7 +646,7 @@ async fn main() -> anyhow::Result<()> {
             let guard = shared_wallet.lock().unwrap();
             guard
                 .as_ref()
-                .map(|w| w.primary_address())
+                .map(|w| w.active_address())
                 .unwrap_or(noid_poseidon2b::primitives::Address([0u8; 32]))
         } else {
             parse_address(&cfg.mining.miner_address)?

@@ -1566,6 +1566,171 @@ impl ParanoidApiServer for RpcHandler {
         )))
     }
 
+    async fn wallet_active_address(&self) -> RpcResult<WalletAddressInfo> {
+        let (index, _addr) = self
+            .wallet
+            .active_address()
+            .ok_or_else(|| rpc_err("wallet not initialized"))?;
+        self.wallet
+            .list_addresses()
+            .into_iter()
+            .find(|a| a.key_index == index)
+            .ok_or_else(|| rpc_err("active address missing from list"))
+    }
+
+    async fn wallet_set_active_address(&self, index: u32) -> RpcResult<WalletAddressInfo> {
+        let (idx, _addr) = self.wallet.set_active_address(index).map_err(rpc_err)?;
+        self.wallet
+            .list_addresses()
+            .into_iter()
+            .find(|a| a.key_index == idx)
+            .ok_or_else(|| rpc_err("active address missing from list"))
+    }
+
+    async fn wallet_pull(
+        &self,
+        from_index: u32,
+        fee_micronoid: u64,
+    ) -> RpcResult<WalletSendResult> {
+        // A pull produces exactly 1 output (to the active address); the
+        // inputs all belong to the source address (one owner per tx).
+        let (fee_active_slot_count, fee_log_slots) = self.mempool.fee_context().await;
+        let fee_floor = self.mempool.fee_floor().await;
+        let source_utxos: usize = self
+            .wallet
+            .list_utxos()
+            .iter()
+            .filter(|u| u.key_index == from_index)
+            .count();
+        if source_utxos == 0 {
+            return Err(rpc_err(format!("address index {from_index} has no UTXOs")));
+        }
+        let planned_inputs =
+            source_utxos.min(noid_tx::TxShape::Sweep25x2.max_inputs());
+        let effective_fee = if fee_micronoid == 0 {
+            noid_chain::consensus::fee_breakdown(
+                planned_inputs as u64,
+                1,
+                fee_active_slot_count,
+                fee_log_slots,
+            )
+            .required_total
+            .max(fee_floor)
+        } else {
+            fee_micronoid
+        };
+        tracing::info!(
+            from_index,
+            inputs = planned_inputs,
+            fee_micronoid = effective_fee,
+            "wallet_pull planned"
+        );
+
+        let call_nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos() as u64;
+
+        let mut last_err = String::new();
+        for attempt in 0..3u32 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+
+            let reserved_outputs = self.mempool.reserved_output_slots().await;
+            let (epoch_anchor, slot_hints, log_slots) = {
+                let chain = self.chain.read().await;
+                let tip = chain.tip_header();
+                let log_slots = tip.log_slots;
+                let epoch_anchor = block_id(tip);
+                let tip_seed = u64::from_le_bytes(tip.state_root[..8].try_into().unwrap());
+                let unique_seed = tip_seed.wrapping_add(
+                    call_nonce
+                        .wrapping_add(attempt as u64)
+                        .wrapping_mul(0x9e3779b97f4a7c15),
+                );
+                let raw = generate_slot_hints(unique_seed, log_slots, 256);
+                let mut hints = chain.state.state.empty_slot_hints_in_populated_segments(
+                    unique_seed,
+                    4,
+                    &reserved_outputs,
+                );
+                let mut seen = reserved_outputs.clone();
+                seen.extend(hints.iter().copied());
+                for idx in raw {
+                    if (idx as u64) < (1u64 << log_slots)
+                        && seen.insert(idx)
+                        && chain.state.state.slot(idx) == noid_chain::fri_state::SlotValue::EMPTY
+                    {
+                        hints.push(idx);
+                        if hints.len() == 4 {
+                            break;
+                        }
+                    }
+                }
+                (epoch_anchor, hints, log_slots)
+            };
+
+            if slot_hints.is_empty() {
+                return Err(rpc_err("no empty slot hints available"));
+            }
+
+            let wallet = Arc::clone(&self.wallet);
+            let (intent_bytes, input_slots) = match tokio::task::spawn_blocking(move || {
+                wallet.build_pull(from_index, effective_fee, epoch_anchor, slot_hints, log_slots)
+            })
+            .await
+            {
+                Ok(Ok(tuple)) => tuple,
+                Ok(Err(e)) => return Err(rpc_err(e)),
+                Err(e) => return Err(rpc_err(format!("task: {e}"))),
+            };
+
+            let intent = match noid_tx::TxIntent::from_bytes(&intent_bytes) {
+                Ok(i) => i,
+                Err(e) => return Err(rpc_err(format!("intent decode: {e:?}"))),
+            };
+            let tx_shape = format!("{:?}", intent.tx_body.shape);
+            let tx_input_count = intent.tx_body.inputs.iter().filter(|i| i.valid).count();
+            let tx_output_count = intent.tx_body.outputs.iter().filter(|o| o.valid).count();
+            let tx_fee = intent.tx_body.fee.min(u64::MAX as u128) as u64;
+            let failed_tx_hash = intent.tx_body_hash.0;
+            let output_slots: Vec<u32> = intent
+                .tx_body
+                .outputs
+                .iter()
+                .filter(|o| o.valid)
+                .map(|o| o.slot_index)
+                .collect();
+
+            match self.mempool.submit(intent, intent_bytes).await {
+                Ok(hash) => {
+                    self.wallet.add_pending_inputs(&input_slots);
+                    let tx_hash = hex::encode(hash.0);
+                    return Ok(WalletSendResult {
+                        tx_hash: tx_hash.clone(),
+                        fee_micronoid: effective_fee,
+                        tx_hashes: vec![tx_hash],
+                        split_count: None,
+                        shape: Some(tx_shape.clone()),
+                        tx_shapes: vec![tx_shape],
+                        tx_input_counts: vec![tx_input_count],
+                        tx_output_counts: vec![tx_output_count],
+                        tx_fees_micronoid: vec![tx_fee],
+                    });
+                }
+                Err(e) => {
+                    self.wallet
+                        .cleanup_failed_send(failed_tx_hash, &output_slots);
+                    last_err = e.to_string();
+                    tracing::debug!(attempt, err = %last_err, "wallet_pull: retrying");
+                }
+            }
+        }
+
+        Err(rpc_err(format!("pull failed after 3 attempts: {last_err}")))
+    }
+
     // -----------------------------------------------------------------------
     // Node control
     // -----------------------------------------------------------------------

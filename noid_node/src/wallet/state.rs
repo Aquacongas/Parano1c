@@ -98,6 +98,11 @@ pub struct WalletState {
     /// Used to avoid double-spending the same UTXO in consecutive consolidation
     /// or send rounds before the first TX is confirmed.
     pub pending_input_slots: std::collections::HashSet<u32>,
+    /// The ACTIVE address key index. One owner per transaction (consensus
+    /// rule): sends and consolidations spend ONLY this address's UTXOs and
+    /// change returns to it; other addresses' funds move via an explicit
+    /// pull (a single-owner tx from the source address).
+    pub active_index: u32,
 }
 
 impl WalletState {
@@ -133,6 +138,7 @@ impl WalletState {
             receipts: HashMap::new(),
             pending_output_slots: std::collections::HashSet::new(),
             pending_input_slots: std::collections::HashSet::new(),
+            active_index: 0,
         };
         wallet.load_metadata();
         wallet.load_receipts();
@@ -156,8 +162,41 @@ impl WalletState {
         self.secret.derive_spend_secret(key_index)
     }
 
-    /// Total confirmed balance in μNOID.
+    /// The ACTIVE address (spends originate here; change returns here).
+    pub fn active_address(&self) -> Address {
+        self.secret.derive_address(self.active_index)
+    }
+
+    /// Switch the active address; derives (and remembers) the address and
+    /// persists the choice in the wallet metadata.
+    pub fn set_active_index(&mut self, index: u32) {
+        let addr = self.secret.derive_address(index);
+        self.known_addresses.insert(addr.0, index);
+        if index >= self.next_index {
+            self.next_index = index + 1;
+        }
+        self.active_index = index;
+        self.save_metadata();
+    }
+
+    /// Confirmed balance of the ACTIVE address in μNOID (the spendable
+    /// balance under the one-owner-per-tx rule).
     pub fn balance(&self) -> u64 {
+        self.balance_at(self.active_index)
+    }
+
+    /// Confirmed balance of one address (by key index) in μNOID.
+    pub fn balance_at(&self, key_index: u32) -> u64 {
+        self.utxos
+            .values()
+            .filter(|u| u.key_index == key_index)
+            .map(|u| u.value)
+            .fold(0u64, |a, v| a.saturating_add(v))
+    }
+
+    /// Total confirmed balance across ALL derived addresses in μNOID
+    /// (informational — spending is per-address).
+    pub fn balance_total(&self) -> u64 {
         self.utxos
             .values()
             .map(|u| u.value)
@@ -301,11 +340,24 @@ impl WalletState {
     /// block confirmation. Without this filter the second send hits a
     /// `SlotConflict` error in the mempool even though the wallet has balance.
     pub fn select_utxos(&self, target: u64, fee: u64) -> Option<(Vec<&WalletUtxo>, u64)> {
+        self.select_utxos_from(self.active_index, target, fee)
+    }
+
+    /// Coin selection restricted to ONE address (one owner per transaction —
+    /// the consensus rule): the active address for sends, an explicit source
+    /// address for pulls.
+    pub fn select_utxos_from(
+        &self,
+        key_index: u32,
+        target: u64,
+        fee: u64,
+    ) -> Option<(Vec<&WalletUtxo>, u64)> {
         let needed = target.saturating_add(fee);
         // Filter out UTXOs that are already being spent by a pending tx.
         let mut available: Vec<&WalletUtxo> = self
             .utxos
             .values()
+            .filter(|u| u.key_index == key_index)
             .filter(|u| !self.pending_input_slots.contains(&u.slot_index))
             .collect();
         available.sort_by_key(|u| std::cmp::Reverse(u.value));
@@ -345,6 +397,11 @@ fn metadata_path(wallet_key_path: &Path) -> PathBuf {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct WalletMetadata {
     next_index: u32,
+    /// The ACTIVE address key index (one-owner-per-tx model: sends spend
+    /// from this address only; change returns to it). Old metadata files
+    /// default to the primary address.
+    #[serde(default)]
+    active_index: u32,
 }
 
 impl WalletState {
@@ -353,6 +410,7 @@ impl WalletState {
         let path = metadata_path(&self.keystore_path);
         let meta = WalletMetadata {
             next_index: self.next_index,
+            active_index: self.active_index,
         };
         if let Ok(json) = serde_json::to_string(&meta) {
             let tmp = path.with_extension("meta.tmp");
@@ -380,8 +438,10 @@ impl WalletState {
                 }
                 self.next_index = meta.next_index;
             }
+            self.active_index = meta.active_index;
             tracing::info!(
                 next_index = self.next_index,
+                active_index = self.active_index,
                 "loaded wallet metadata from disk"
             );
         }

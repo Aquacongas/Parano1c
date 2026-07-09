@@ -110,8 +110,10 @@ impl WalletOps for WalletHandle {
             None => WalletStatus {
                 exists: false,
                 address: String::new(),
+                active_index: 0,
                 balance_micronoid: 0,
                 balance_noid: 0.0,
+                total_micronoid: 0,
                 utxo_count: 0,
                 address_count: 0,
             },
@@ -119,9 +121,11 @@ impl WalletOps for WalletHandle {
                 let balance = w.balance();
                 WalletStatus {
                     exists: true,
-                    address: w.primary_address().to_bech32(),
+                    address: w.active_address().to_bech32(),
+                    active_index: w.active_index,
                     balance_micronoid: balance,
                     balance_noid: micronoid_to_noid(balance),
+                    total_micronoid: w.balance_total(),
                     utxo_count: w.utxos.len(),
                     address_count: w.next_index,
                 }
@@ -145,6 +149,7 @@ impl WalletOps for WalletHandle {
             None => WalletBalance {
                 total_micronoid: 0,
                 total_noid: 0.0,
+                all_addresses_micronoid: 0,
                 utxo_count: 0,
                 pending_outbound_micronoid: 0,
                 spendable_micronoid: 0,
@@ -162,6 +167,7 @@ impl WalletOps for WalletHandle {
                 WalletBalance {
                     total_micronoid: total,
                     total_noid: micronoid_to_noid(total),
+                    all_addresses_micronoid: w.balance_total(),
                     utxo_count: w.utxos.len(),
                     pending_outbound_micronoid: pending_out,
                     spendable_micronoid: spendable,
@@ -632,13 +638,14 @@ impl WalletOps for WalletHandle {
             .map(|u| u.slot_index)
             .collect();
 
-        // Self-address: send consolidated amount to own primary address.
+        // Self-address: send the consolidated amount to the ACTIVE address
+        // (the same address the inputs belong to — one owner per tx).
         let self_address = {
             let guard = self.inner.lock().unwrap();
             guard
                 .as_ref()
                 .ok_or_else(|| "wallet not initialized".to_string())?
-                .primary_address()
+                .active_address()
                 .0
         };
 
@@ -692,6 +699,91 @@ impl WalletOps for WalletHandle {
         }
     }
 
+    fn active_address(&self) -> Option<(u32, String)> {
+        let guard = self.inner.lock().unwrap();
+        guard
+            .as_ref()
+            .map(|w| (w.active_index, w.active_address().to_bech32()))
+    }
+
+    fn set_active_address(&self, index: u32) -> Result<(u32, String), String> {
+        let mut guard = self.inner.lock().unwrap();
+        let w = guard
+            .as_mut()
+            .ok_or_else(|| "wallet not initialized".to_string())?;
+        w.set_active_index(index);
+        Ok((index, w.active_address().to_bech32()))
+    }
+
+    fn build_pull(
+        &self,
+        from_index: u32,
+        fee_micronoid: u64,
+        epoch_anchor: [u8; 32],
+        slot_hints: Vec<u32>,
+        log_slots: u32,
+    ) -> Result<(Vec<u8>, Vec<u32>), String> {
+        // Extract the source address's UTXOs (brief lock).
+        let (build_data, pull_amount, target_address) = {
+            let guard = self.inner.lock().unwrap();
+            let w = guard
+                .as_ref()
+                .ok_or_else(|| "wallet not initialized".to_string())?;
+            if from_index == w.active_index {
+                return Err(
+                    "pull source is the active address (use consolidate instead)".to_string(),
+                );
+            }
+            let pending_output_slots = w.pending_output_slots.clone();
+            let pending_input_slots = w.pending_input_slots.clone();
+            let (data, amount) = builder::extract_pull_data(
+                w,
+                from_index,
+                fee_micronoid,
+                epoch_anchor,
+                slot_hints,
+                log_slots,
+                &pending_output_slots,
+                &pending_input_slots,
+            )
+            .map_err(|e| e.to_string())?;
+            (data, amount, w.active_address().0)
+        };
+
+        let input_slots: Vec<u32> = build_data
+            .selected_utxos
+            .iter()
+            .map(|u| u.slot_index)
+            .collect();
+
+        // Prove outside the lock (CPU-heavy).
+        let (_tx_hash, intent_bytes) = builder::build_and_prove_tx(
+            target_address,
+            pull_amount,
+            fee_micronoid,
+            build_data,
+        )
+        .map_err(|e| e.to_string())?;
+
+        {
+            let intent = noid_tx::TxIntent::from_bytes(&intent_bytes)
+                .map_err(|e| format!("decode: {e:?}"))?;
+            let output_slots: Vec<u32> = intent
+                .tx_body
+                .outputs
+                .iter()
+                .filter(|o| o.valid)
+                .map(|o| o.slot_index)
+                .collect();
+            let mut guard = self.inner.lock().unwrap();
+            if let Some(w) = guard.as_mut() {
+                w.add_pending_outputs(&output_slots);
+            }
+        }
+
+        Ok((intent_bytes, input_slots))
+    }
+
     fn next_address(&self) -> Option<WalletAddressInfo> {
         let mut guard = self.inner.lock().unwrap();
         let w = guard.as_mut()?;
@@ -707,6 +799,7 @@ impl WalletOps for WalletHandle {
             balance_micronoid: 0,
             balance_noid: 0.0,
             utxo_count: 0,
+            is_active: idx == w.active_index,
         })
     }
 
@@ -736,8 +829,9 @@ impl WalletOps for WalletHandle {
                 seen_indices.insert(idx);
             }
         }
-        // Always include index 0 (primary address).
+        // Always include index 0 (primary) and the ACTIVE address.
         seen_indices.insert(0);
+        seen_indices.insert(w.active_index);
 
         let mut result: Vec<WalletAddressInfo> = seen_indices
             .iter()
@@ -750,6 +844,7 @@ impl WalletOps for WalletHandle {
                     balance_micronoid: bal,
                     balance_noid: micronoid_to_noid(bal),
                     utxo_count: count,
+                    is_active: idx == w.active_index,
                 }
             })
             .collect();
@@ -763,6 +858,7 @@ impl WalletOps for WalletHandle {
                 balance_micronoid: 0,
                 balance_noid: 0.0,
                 utxo_count: 0,
+                is_active: false,
             });
         }
 
@@ -813,14 +909,16 @@ mod tests {
         let path = dir.path().join("wallet.key");
         let mut wallet = WalletState::create_or_load(path).unwrap();
         for (i, value) in values.iter().copied().enumerate() {
-            let key_index = i as u32;
+            let slot_index = i as u32;
             wallet.utxos.insert(
-                key_index,
+                slot_index,
                 state::WalletUtxo {
-                    slot_index: key_index,
+                    slot_index,
                     value,
-                    address: wallet.address_at(key_index),
-                    key_index,
+                    // One owner per tx: fixture UTXOs live on the ACTIVE
+                    // (index-0) address.
+                    address: wallet.address_at(0),
+                    key_index: 0,
                     confirmed_height: 1,
                 },
             );

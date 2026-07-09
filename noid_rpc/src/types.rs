@@ -98,6 +98,10 @@ pub struct WalletAddressInfo {
     pub balance_noid: f64,
     /// Number of confirmed UTXOs at this address.
     pub utxo_count: usize,
+    /// Whether this is the wallet's ACTIVE address (sends spend from it;
+    /// one owner per transaction is a consensus rule).
+    #[serde(default)]
+    pub is_active: bool,
 }
 
 /// Overall wallet status.
@@ -105,13 +109,21 @@ pub struct WalletAddressInfo {
 pub struct WalletStatus {
     /// Whether a wallet file exists.
     pub exists: bool,
-    /// Primary address (index 0) as bech32m, or empty string.
+    /// The ACTIVE address as bech32m, or empty string (sends spend from
+    /// this address only — one owner per transaction).
     pub address: String,
-    /// Total confirmed balance in μNOID.
+    /// The active address's key index.
+    #[serde(default)]
+    pub active_index: u32,
+    /// Confirmed balance of the ACTIVE address in μNOID.
     pub balance_micronoid: u64,
-    /// Balance in NOID (6 decimal places).
+    /// Active-address balance in NOID (6 decimal places).
     pub balance_noid: f64,
-    /// Number of confirmed UTXOs.
+    /// Total confirmed balance across ALL addresses in μNOID
+    /// (informational — spending is per-address).
+    #[serde(default)]
+    pub total_micronoid: u64,
+    /// Number of confirmed UTXOs (all addresses).
     pub utxo_count: usize,
     /// Number of derived addresses.
     pub address_count: u32,
@@ -120,8 +132,13 @@ pub struct WalletStatus {
 /// Balance breakdown.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletBalance {
+    /// Confirmed balance of the ACTIVE address (the spendable pool under
+    /// the one-owner-per-tx rule).
     pub total_micronoid: u64,
     pub total_noid: f64,
+    /// Total across ALL derived addresses (informational).
+    #[serde(default)]
+    pub all_addresses_micronoid: u64,
     pub utxo_count: usize,
     /// Confirmed UTXOs being spent by pending (mempool) txs.
     /// These are locked and cannot be spent again until confirmed or evicted.
