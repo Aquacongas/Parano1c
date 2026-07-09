@@ -2656,6 +2656,109 @@ mod tests {
         );
     }
 
+    /// The standalone per-tier BLOCK class `B_t` (two-level split, Stage A):
+    /// freeze from a sample block, build a real block trace, prove + verify
+    /// with the accumulator/region public IO, and assert PER-TIER CLASS
+    /// FIXITY — a second (different, chained) block of the same tier
+    /// produces a byte-identical class matrix. Negative: a corrupted end-
+    /// accumulator IO lane must fail verification (the statement is bound).
+    #[test]
+    fn block_class_standalone_e2e() {
+        use noid_ivc_core::challenger::FsLaneChallenger;
+        use noid_ivc_core::field::F128;
+        use noid_ivc_core::pcs::{self, PcsParams};
+        use noid_ivc_core::proof::FieldShape;
+        use noid_ivc_core::verifier::verify_field_with_public_io;
+        use noid_ivc_core::zerocheck::K_SKIP;
+        use noid_ivc_prover::field_prover::prove_field_with_public_io;
+        use noid_recursive::acceptance::block_class::{build_block_proof_trace, BlockClass};
+        use noid_recursive::acceptance::link::LinkBlock;
+        use noid_recursive::acceptance::trace::region_source_binding::RegionDischargeParams;
+
+        const M: usize = 22;
+        let shape = FieldShape {
+            m: M,
+            k_log: M,
+            k_skip: K_SKIP,
+            const_pin: Some(0),
+        };
+        let params = PcsParams {
+            m: M + pcs::LOG_PACKING,
+            log_inv_rate: 2,
+            log_batch_size: 5,
+            profile: Default::default(),
+        };
+        let rp = RegionDischargeParams { nq: 2 };
+        let tier = 4usize;
+        let units = chained_multi_tx_blocks(2, 3);
+        fn mk(u: &BlockUnit) -> LinkBlock<'_> {
+            LinkBlock {
+                start_accumulator: &u.start_accumulator,
+                end_accumulator: &u.end_accumulator,
+                inputs: &u.inputs,
+                proof: &u.proof,
+                config: Default::default(),
+            }
+        }
+
+        let class = BlockClass::freeze(shape, params.clone(), rp, &mk(&units[0]), tier);
+        assert!(!class.region_claims.is_empty(), "frozen claims present");
+
+        let built = build_block_proof_trace(&class, &mk(&units[0]));
+        assert!(built.r1cs.satisfies(&built.witness), "B_t trace unsatisfiable");
+
+        let mut ch = FsLaneChallenger::new(b"history-block-v0");
+        let (proof, commitment, _) = prove_field_with_public_io(
+            &built.r1cs,
+            &built.witness,
+            &params,
+            &class.spec,
+            &built.io,
+            &mut ch,
+        );
+        let mut chv = FsLaneChallenger::new(b"history-block-v0");
+        verify_field_with_public_io(
+            &built.r1cs,
+            &commitment,
+            &proof,
+            &class.spec,
+            &built.io,
+            &mut chv,
+        )
+        .expect("π_block verifies with its public IO");
+
+        // Negative: a corrupted end-accumulator lane must reject.
+        let mut bad_io = built.io.clone();
+        bad_io[5] += F128::ONE;
+        let mut chb = FsLaneChallenger::new(b"history-block-v0");
+        assert!(
+            verify_field_with_public_io(
+                &built.r1cs,
+                &commitment,
+                &proof,
+                &class.spec,
+                &bad_io,
+                &mut chb,
+            )
+            .is_err(),
+            "corrupted end-accumulator IO lane slipped through"
+        );
+
+        // Per-tier class fixity: a DIFFERENT block of the same tier yields a
+        // byte-identical class matrix (and a satisfiable trace).
+        let built2 = build_block_proof_trace(&class, &mk(&units[1]));
+        assert_eq!(
+            built.r1cs.statement_digest(),
+            built2.r1cs.statement_digest(),
+            "B_t class matrix drifted across blocks"
+        );
+        assert!(
+            built.r1cs.a_0 == built2.r1cs.a_0 && built.r1cs.b_0 == built2.r1cs.b_0,
+            "B_t matrices differ across blocks of the same tier"
+        );
+        assert!(built2.r1cs.satisfies(&built2.witness), "second B_t trace unsatisfiable");
+    }
+
     /// Exact-state REGION parity on a REAL block (task 4b): build the complete
     /// block slots with wallet-PCS + owner-auth + exact-state ALL in the region
     /// and assert (a) the honest trace satisfies (every new cell pin — sponge

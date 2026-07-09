@@ -70,7 +70,7 @@ use crate::block_certificate_backend::{
 use noid_core::Block128;
 
 /// The block chain accumulator as flat IO lanes, in the layout's order.
-fn block_acc_lanes(acc: &ChainAccumulator) -> [F128; 5] {
+pub(crate) fn block_acc_lanes(acc: &ChainAccumulator) -> [F128; 5] {
     let sr = digest_lanes(&acc.state_root);
     let ch = digest_lanes(&acc.chain_hash);
     [
