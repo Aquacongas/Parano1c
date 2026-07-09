@@ -622,6 +622,9 @@ fn validate_public_accepted_claim_digest_fields(
             != digest_fields(&accumulator.state_root)
         || fields[accumulator_offset + 3..accumulator_offset + 5]
             != digest_fields(&accumulator.chain_hash)
+        || fields[accumulator_offset + 5]
+            != Block128::from(accumulator.active_slot_count as u128)
+        || fields[accumulator_offset + 6] != Block128::from(accumulator.alloc_counter as u128)
     {
         return Err(HistoryCheckpointIvcChunkCoreError::AcceptedClaimOutputMismatch);
     }

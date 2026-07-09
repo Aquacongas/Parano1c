@@ -98,6 +98,33 @@ mod tests {
     use super::*;
     use noid_tx::validate_public_tx_logic;
 
+    /// GOLDEN: the ghost body's committed validity bitmap is 17 (one live
+    /// input at bit 0 + one live output at bit MAX_INPUTS=4) — NOT zero.
+    /// The bitmap leaf therefore changed the ghost body hash when it
+    /// landed; every ghost constant DERIVES from the body, so consumers
+    /// stay consistent by construction, and this test pins the derivation
+    /// so a silent bitmap-rule drift cannot change the ghost identity
+    /// unnoticed.
+    #[test]
+    fn ghost_body_bitmap_is_seventeen_and_hash_derives_from_it() {
+        let body = ghost_tx_body();
+        let bits = noid_tx::validity_bits_for_shape(body.shape, &body.inputs, &body.outputs);
+        assert_eq!(bits, 1 | (1 << 4), "ghost bitmap: live input 0 + live output 0");
+        let recomputed = noid_tx::hash_tx_body_for_shape(
+            body.shape,
+            &body.epoch_anchor,
+            body.fee,
+            &body.inputs,
+            &body.outputs,
+            body.is_coinbase,
+        );
+        assert_eq!(
+            [recomputed.as_fields()[0], recomputed.as_fields()[1]],
+            ghost_tx_body_hash(),
+            "ghost body hash != canonical re-derivation"
+        );
+    }
+
     #[test]
     fn ghost_body_passes_public_logic_and_proof_verifies() {
         let body = ghost_tx_body();

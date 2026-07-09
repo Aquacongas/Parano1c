@@ -1561,11 +1561,15 @@ fn verify_history_checkpoint_proof_checkpoint_inner(
     }
     if proof.start_accumulator.height != proof.start_anchor.height
         || proof.start_accumulator.state_root != proof.start_anchor.state_root
+        || proof.start_accumulator.active_slot_count != proof.start_anchor.active_slot_count
+        || proof.start_accumulator.alloc_counter != proof.start_anchor.alloc_counter
     {
         return Err(HistoryCheckpointProofError::StartAccumulatorMismatch);
     }
     if proof.end_accumulator.height != proof.end_anchor.height
         || proof.end_accumulator.state_root != proof.end_anchor.state_root
+        || proof.end_accumulator.active_slot_count != proof.end_anchor.active_slot_count
+        || proof.end_accumulator.alloc_counter != proof.end_anchor.alloc_counter
     {
         return Err(HistoryCheckpointProofError::EndAccumulatorMismatch);
     }
@@ -1789,6 +1793,8 @@ fn absorb_accumulator(sponge: &mut Poseidon2bSponge, accumulator: &ChainAccumula
     sponge.absorb(Block128::from(accumulator.height as u128));
     absorb_digest(sponge, &accumulator.state_root);
     absorb_digest(sponge, &accumulator.chain_hash);
+    sponge.absorb(Block128::from(accumulator.active_slot_count as u128));
+    sponge.absorb(Block128::from(accumulator.alloc_counter as u128));
 }
 
 fn absorb_consensus(sponge: &mut Poseidon2bSponge, consensus: &RecursiveConsensusState) {

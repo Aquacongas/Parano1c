@@ -36,7 +36,7 @@ pub const ACCEPTED_CLAIM_BATCH_DIGEST_HEADER_WITNESS_FIELDS: usize = POW_HEADER_
 pub const ACCEPTED_CLAIM_BATCH_DIGEST_CLAIM_FIELDS: usize = 2;
 pub const ACCEPTED_CLAIM_BATCH_DIGEST_CONSENSUS_FIELDS: usize =
     16 + MEDIAN_TIME_BLOCKS + EXPANSION_WINDOW_LEN;
-pub const ACCEPTED_CLAIM_BATCH_DIGEST_ACCUMULATOR_FIELDS: usize = 5;
+pub const ACCEPTED_CLAIM_BATCH_DIGEST_ACCUMULATOR_FIELDS: usize = 7;
 pub const ACCEPTED_CLAIM_BATCH_DIGEST_SLOT_FIELDS: usize =
     ACCEPTED_CLAIM_BATCH_DIGEST_HEADER_WITNESS_FIELDS + ACCEPTED_CLAIM_BATCH_DIGEST_CLAIM_FIELDS;
 pub const ACCEPTED_CLAIM_BATCH_DIGEST_PAYLOAD_FIELDS: usize = 1
@@ -326,6 +326,10 @@ fn push_accumulator_fields<const N: usize>(
     *index += 1;
     push_digest_fields(fields, index, &accumulator.state_root);
     push_digest_fields(fields, index, &accumulator.chain_hash);
+    fields[*index] = Block128::from(accumulator.active_slot_count as u128);
+    *index += 1;
+    fields[*index] = Block128::from(accumulator.alloc_counter as u128);
+    *index += 1;
 }
 
 fn push_claim_fields<const N: usize>(

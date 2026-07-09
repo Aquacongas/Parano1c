@@ -105,6 +105,93 @@ pub fn sweep_spine_inputs_from_body(
         input_leaves,
         output_leaves,
         is_coinbase_leaf: digest_to_fields(&is_coinbase_leaf(body.is_coinbase)),
-        pad_leaf: [Block128::ZERO, Block128::ZERO],
+        // The reserved leaf carries the committed liveness bitmap — the
+        // same rule as the standard spine (L31 of the sweep tree).
+        pad_leaf: digest_to_fields(&noid_poseidon2b::primitives::validity_leaf(
+            noid_tx::validity_bits_for_shape(body.shape, &body.inputs, &body.outputs),
+        )),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::circuit_sweep::SweepSpineCircuit;
+    use crate::oracle_sweep::evaluate_sweep_spine;
+    use noid_poseidon2b::primitives::{
+        derive_address, hash_input_leaf, hash_output_leaf, hash_tx_body_sweep25x2, SpendSecret,
+        SWEEP_TXBODY_INPUTS, SWEEP_TXBODY_OUTPUTS,
+    };
+
+    fn fields_to_digest(fields: [Block128; 2]) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        out[..16].copy_from_slice(&fields[0].to_u128().to_le_bytes());
+        out[16..].copy_from_slice(&fields[1].to_u128().to_le_bytes());
+        out
+    }
+
+    /// The sweep statement's reserved leaf must carry the SAME validity
+    /// bitmap the native body hash commits — a SPARSE nonzero live set
+    /// (dead dummy holes between live entries) is exactly the case a
+    /// zero-bitmap fixture cannot catch.
+    #[test]
+    fn sweep_spine_statement_matches_native_tx_hash_sparse_bitmap() {
+        let secret = SpendSecret([9u8; 32]);
+        let owner = derive_address(&secret);
+        // Live inputs at positions 0, 2, 5 (one owner per tx); dummy holes
+        // at 1, 3, 4; live output at 0, dead dummy at 1.
+        let mut inputs = vec![TxInput::dummy(); 6];
+        for &pos in &[0usize, 2, 5] {
+            inputs[pos] = TxInput {
+                slot_index: 100 + pos as u32,
+                value: 1_000 + pos as u64,
+                owner,
+                spend_secret: secret.clone(),
+                valid: true,
+            };
+        }
+        let total: u64 = inputs.iter().filter(|i| i.valid).map(|i| i.value).sum();
+        let body = TxBody {
+            shape: TxShape::Sweep25x2,
+            epoch_anchor: [0x77; 32],
+            fee: 5,
+            inputs,
+            outputs: vec![
+                TxOutput {
+                    slot_index: 900,
+                    value: total - 5,
+                    owner,
+                    valid: true,
+                },
+                TxOutput::dummy(),
+            ],
+            is_coinbase: false,
+        };
+
+        let statement = sweep_spine_inputs_from_body(&body).expect("sweep statement");
+        let got =
+            fields_to_digest(evaluate_sweep_spine(&SweepSpineCircuit::build(), &statement).tx_body_hash);
+
+        let mut input_leaf_hashes = [[0u8; 32]; SWEEP_TXBODY_INPUTS];
+        for (i, leaf) in input_leaf_hashes.iter_mut().enumerate() {
+            let input = body.inputs.get(i).cloned().unwrap_or_else(TxInput::dummy);
+            *leaf = hash_input_leaf(input.slot_index, input.value, &input.owner);
+        }
+        let mut output_leaf_hashes = [[0u8; 32]; SWEEP_TXBODY_OUTPUTS];
+        for (i, leaf) in output_leaf_hashes.iter_mut().enumerate() {
+            let output = body.outputs.get(i).copied().unwrap_or_else(TxOutput::dummy);
+            *leaf = hash_output_leaf(output.slot_index, output.value, &output.owner);
+        }
+        let bits = noid_tx::validity_bits_for_shape(body.shape, &body.inputs, &body.outputs);
+        assert_ne!(bits, 0, "the fixture must exercise a NONZERO bitmap");
+        let native = hash_tx_body_sweep25x2(
+            &body.epoch_anchor,
+            body.fee,
+            &input_leaf_hashes,
+            &output_leaf_hashes,
+            body.is_coinbase,
+            bits,
+        );
+        assert_eq!(got, native.0, "sweep GKR body hash != native (bitmap leaf)");
+    }
 }
