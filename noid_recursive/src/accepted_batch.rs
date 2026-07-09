@@ -422,6 +422,8 @@ pub fn verify_accepted_claim_batch_native(
             header_witness.block_id,
             header_witness.header.height,
             chain_claim,
+            header_witness.header.active_slot_count,
+            header_witness.header.alloc_counter,
         );
     }
 
@@ -477,6 +479,8 @@ pub fn verify_accepted_claim_batch_with_header_trace(
             header_witness.block_id,
             header_witness.header.height,
             chain_claim,
+            header_witness.header.active_slot_count,
+            header_witness.header.alloc_counter,
         );
     }
 
@@ -544,6 +548,8 @@ mod tests {
                 header_witness.block_id,
                 header_witness.header.height,
                 chain_claim,
+                header_witness.header.active_slot_count,
+                header_witness.header.alloc_counter,
             );
         }
         Ok(AcceptedClaimBatchOutput {
@@ -607,6 +613,8 @@ mod tests {
             height: header.height,
             state_root: header.state_root,
             chain_hash: [0u8; 32],
+            active_slot_count: header.active_slot_count,
+            alloc_counter: header.alloc_counter,
         };
         (start_consensus, start_accumulator)
     }
@@ -695,12 +703,16 @@ mod tests {
                 noid_chain::hash_block_header(&h1),
                 h1.height,
                 claims[0],
+                h1.active_slot_count,
+                h1.alloc_counter,
             )
             .extend(
                 h2.state_root,
                 noid_chain::hash_block_header(&h2),
                 h2.height,
                 claims[1],
+                h2.active_slot_count,
+                h2.alloc_counter,
             );
         assert_eq!(out.accumulator, expected);
     }

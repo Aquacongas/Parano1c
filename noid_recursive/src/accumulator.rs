@@ -29,6 +29,15 @@ pub struct ChainAccumulator {
     /// local claim for a covered block: the resulting `chain_hash` would diverge
     /// from the value computed by honest nodes, making the mismatch detectable.
     pub chain_hash: Digest,
+    /// Active slot count after all blocks up to `height` are applied — the
+    /// consensus-continuity counter the chain rules carry across blocks
+    /// (each block pins its start counter to its claim's PARENT counter and
+    /// its end counter to its header's child counter; the boundary equality
+    /// start == prev.end closes the chain).
+    pub active_slot_count: u64,
+    /// Allocation counter after all blocks up to `height` are applied —
+    /// same continuity discipline as `active_slot_count`.
+    pub alloc_counter: u64,
 }
 
 impl ChainAccumulator {
@@ -39,12 +48,17 @@ impl ChainAccumulator {
     /// - `block_hash`  = `hash_block_header(&header)` semantic block id.
     /// - `chain_claim` = canonical 32-byte block claim folded into recursive
     ///   history. `[Block128::ZERO; 2]` for genesis.
+    /// - `active_slot_count` / `alloc_counter` = the block header's child
+    ///   consensus counters.
+    #[allow(clippy::too_many_arguments)]
     pub fn extend(
         &self,
         new_state_root: StateRoot,
         block_hash: Digest,
         new_height: u64,
         chain_claim: [Block128; 2],
+        active_slot_count: u64,
+        alloc_counter: u64,
     ) -> Self {
         use noid_poseidon2b::native::compress;
         // Encode claim as 32 bytes (two LE u128 lanes).
@@ -58,6 +72,8 @@ impl ChainAccumulator {
             height: new_height,
             state_root: new_state_root,
             chain_hash,
+            active_slot_count,
+            alloc_counter,
         }
     }
 }
@@ -77,12 +93,16 @@ pub fn genesis_accumulator(
         height: 0,
         state_root: [0u8; 32],
         chain_hash: [0u8; 32],
+        active_slot_count: 0,
+        alloc_counter: 0,
     };
-    // Genesis block has no BlockProof.
+    // Genesis block has no BlockProof (and mints nothing: zero counters).
     pre_genesis.extend(
         genesis_state_root,
         genesis_block_hash,
         0,
         [Block128::ZERO; 2],
+        0,
+        0,
     )
 }

@@ -805,6 +805,8 @@ mod tests {
             height: 0,
             state_root: [1u8; 32],
             chain_hash: [0u8; 32],
+            active_slot_count: 0,
+            alloc_counter: 0,
         };
         let mut acc = start.clone();
         let mut prev_block_id = [0u8; 32];
@@ -817,7 +819,14 @@ mod tests {
                 Block128::from(0xA0u128 + height as u128),
                 Block128::from(0xB0u128 + height as u128),
             ];
-            acc = acc.extend(h.state_root, w.block_id, h.height, claim);
+            acc = acc.extend(
+                h.state_root,
+                w.block_id,
+                h.height,
+                claim,
+                h.active_slot_count,
+                h.alloc_counter,
+            );
             prev_block_id = w.block_id;
             headers.push(w);
             claims.push(claim);

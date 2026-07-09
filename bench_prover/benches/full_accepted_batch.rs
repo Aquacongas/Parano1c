@@ -117,6 +117,8 @@ fn start_tuple(parent: &BlockHeader) -> (RecursiveConsensusState, ChainAccumulat
         height: parent.height,
         state_root: parent.state_root,
         chain_hash: [0u8; 32],
+        active_slot_count: parent.active_slot_count,
+        alloc_counter: parent.alloc_counter,
     };
     (start_consensus, start_accumulator)
 }

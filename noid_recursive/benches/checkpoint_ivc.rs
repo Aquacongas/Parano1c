@@ -200,6 +200,8 @@ fn chunk_fixture() -> ChunkFixture {
         height: start_header.height,
         state_root: start_header.state_root,
         chain_hash: [0u8; 32],
+        active_slot_count: start_header.active_slot_count,
+        alloc_counter: start_header.alloc_counter,
     };
     let start_anchor = anchor_from_consensus(&start_consensus, start_header.tx_root);
 
@@ -250,7 +252,14 @@ fn chunk_fixture() -> ChunkFixture {
         consensus.active_slot_count = header.active_slot_count;
         consensus.alloc_counter = header.alloc_counter;
 
-        accumulator = accumulator.extend(header.state_root, header_witness.block_id, height, claim);
+        accumulator = accumulator.extend(
+            header.state_root,
+            header_witness.block_id,
+            height,
+            claim,
+            header.active_slot_count,
+            header.alloc_counter,
+        );
         previous_block_id = header_witness.block_id;
         headers.push(header_witness);
         claims.push(claim);

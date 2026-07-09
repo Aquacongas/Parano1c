@@ -220,6 +220,8 @@ fn checkpoint_poseidon_fixture(
         height: 0,
         state_root: [0x11; 32],
         chain_hash: [0x22; 32],
+        active_slot_count: 0,
+        alloc_counter: 0,
     };
     let mut acc = start.clone();
     let mut prev = [0u8; 32];
@@ -246,7 +248,7 @@ fn checkpoint_poseidon_fixture(
             Block128::from(0xC000_0000_u128 + i as u128),
             Block128::from(0xD000_0000_u128 + i as u128),
         ];
-        acc = acc.extend(state_root, witness.block_id, height, claim);
+        acc = acc.extend(state_root, witness.block_id, height, claim, 0, 0);
         prev = witness.block_id;
         headers.push(witness);
         claims.push(claim);

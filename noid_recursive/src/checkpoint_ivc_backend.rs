@@ -523,6 +523,8 @@ fn validate_private_chunk_inputs(
             header_witness.block_id,
             header_witness.header.height,
             accepted_claim_witness.accepted_block_claims[index],
+            header_witness.header.active_slot_count,
+            header_witness.header.alloc_counter,
         );
         previous_block_id = header_witness.block_id;
     }
@@ -896,6 +898,8 @@ fn chunk_core_witness(
             header_witness.block_id,
             header_witness.header.height,
             claim,
+            header_witness.header.active_slot_count,
+            header_witness.header.alloc_counter,
         );
 
         write_u64_bits(&mut witness, base + PREV_HEIGHT, accumulator.height);
@@ -1410,6 +1414,8 @@ mod tests {
             height: start_header.height,
             state_root: start_header.state_root,
             chain_hash: [0u8; 32],
+            active_slot_count: start_header.active_slot_count,
+            alloc_counter: start_header.alloc_counter,
         };
         let start_anchor = anchor_from_consensus(&start_consensus, start_header.tx_root);
 
@@ -1460,8 +1466,14 @@ mod tests {
             consensus.active_slot_count = header.active_slot_count;
             consensus.alloc_counter = header.alloc_counter;
 
-            accumulator =
-                accumulator.extend(header.state_root, header_witness.block_id, height, claim);
+            accumulator = accumulator.extend(
+                header.state_root,
+                header_witness.block_id,
+                height,
+                claim,
+                header.active_slot_count,
+                header.alloc_counter,
+            );
             previous_block_id = header_witness.block_id;
             headers.push(header_witness);
             claims.push(claim);

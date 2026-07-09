@@ -1005,6 +1005,8 @@ fn verify_accepted_block_certificate_batch_witness(
             statement.block_id,
             header.height,
             chain_claim,
+            header.active_slot_count,
+            header.alloc_counter,
         );
         previous_block_id = statement.block_id;
         previous_state_root = statement.child_state_root;
@@ -1726,6 +1728,8 @@ mod tests {
             height: parent.height,
             state_root: parent.state_root,
             chain_hash: [0u8; 32],
+            active_slot_count: parent.active_slot_count,
+            alloc_counter: parent.alloc_counter,
         };
         (
             start_consensus,
@@ -2405,6 +2409,8 @@ mod tests {
             height: parent.height,
             state_root: parent.state_root,
             chain_hash: [0u8; 32],
+            active_slot_count: parent.active_slot_count,
+            alloc_counter: parent.alloc_counter,
         };
 
         let mut units = Vec::with_capacity(n);
@@ -2528,6 +2534,8 @@ mod tests {
             height: parent.height,
             state_root: parent.state_root,
             chain_hash: [0u8; 32],
+            active_slot_count: parent.active_slot_count,
+            alloc_counter: parent.alloc_counter,
         };
 
         let mut units = Vec::with_capacity(n_blocks);
@@ -5132,6 +5140,8 @@ mod tests {
             height: parent.height,
             state_root: parent.state_root,
             chain_hash: [0u8; 32],
+            active_slot_count: parent.active_slot_count,
+            alloc_counter: parent.alloc_counter,
         };
         let mut block_state = state.clone();
         let block = empty_child(&parent, &mut block_state);
@@ -5246,6 +5256,8 @@ mod tests {
             height: parent.height,
             state_root: parent.state_root,
             chain_hash: [0u8; 32],
+            active_slot_count: parent.active_slot_count,
+            alloc_counter: parent.alloc_counter,
         };
         let mut block_state = state.clone();
         let block = empty_child(&parent, &mut block_state);
@@ -5367,6 +5379,8 @@ mod tests {
             height: parent.height,
             state_root: parent.state_root,
             chain_hash: [0u8; 32],
+            active_slot_count: parent.active_slot_count,
+            alloc_counter: parent.alloc_counter,
         };
         let mut block_state = state.clone();
         let block = empty_child(&parent, &mut block_state);
@@ -5442,6 +5456,8 @@ mod tests {
             height: start_consensus.height,
             state_root: start_consensus.state_root,
             chain_hash: [0u8; 32],
+            active_slot_count: start_consensus.active_slot_count,
+            alloc_counter: start_consensus.alloc_counter,
         };
         let mut original_parent_state = state.clone();
         let original_parent = parent_header(&mut original_parent_state);

@@ -72,6 +72,11 @@ pub struct AccumulatorWires {
     pub height: LinExpr,
     pub state_root: [LinExpr; 2],
     pub chain_hash: [LinExpr; 2],
+    /// Consensus-continuity counters (the boundary header's child
+    /// counters): bound per block to the header / claim-parent wires by
+    /// the block-slot pins; carried across blocks by the link chain rules.
+    pub active_slot_count: LinExpr,
+    pub alloc_counter: LinExpr,
 }
 
 impl AccumulatorWires {
@@ -86,6 +91,8 @@ impl AccumulatorWires {
                 let lanes = digest_lanes(&native.chain_hash);
                 std::array::from_fn(|i| alloc_block(b, lanes[i]))
             },
+            active_slot_count: alloc_block(b, Block128::from(native.active_slot_count)),
+            alloc_counter: alloc_block(b, Block128::from(native.alloc_counter)),
         }
     }
 }
@@ -160,6 +167,8 @@ mod tests {
             height: 5,
             state_root: [9u8; 32],
             chain_hash: [3u8; 32],
+            active_slot_count: 11,
+            alloc_counter: 12,
         };
         let mut acc = start.clone();
         let mut blocks = Vec::new();
@@ -168,7 +177,7 @@ mod tests {
             let claim = [Block128::from(100 + i as u128), Block128::from(200 + i as u128)];
             let state_root = [40 + i as u8; 32];
             let height = start.height + 1 + i;
-            acc = acc.extend(state_root, block_id, height, claim);
+            acc = acc.extend(state_root, block_id, height, claim, 11 + i, 12 + i);
             blocks.push((block_id, claim, state_root, height));
         }
         (start, blocks, acc)

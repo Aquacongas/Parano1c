@@ -121,7 +121,7 @@ impl SplitLaneLayout {
 
 /// The split-link public-IO layout, shared by every link class of a
 /// ladder: `[g | whitelist (2 lanes per slot) | link lanes | block
-/// lanes | block_acc (5 lanes)]`.
+/// lanes | block_acc (ACC_LANES)]`.
 #[derive(Clone, Debug)]
 pub struct SplitIoLayout {
     pub g: usize,
@@ -132,7 +132,7 @@ pub struct SplitIoLayout {
     pub link_lanes: Vec<SplitLaneLayout>,
     /// Per-block-class accumulator lanes (slot-specific k_log).
     pub b_lanes: Vec<SplitLaneLayout>,
-    /// The covered block's end accumulator (5 lanes).
+    /// The covered block's end accumulator ([`ACC_LANES`] lanes).
     pub block_acc: usize,
     /// First lane of the [R]-PCS walk opening-claim tail.
     pub region_tail_offset: usize,
@@ -163,7 +163,7 @@ pub fn split_io_layout(
         b_lanes.push(lane);
         off = next;
     }
-    let region_tail_offset = off + 5;
+    let region_tail_offset = off + super::link::ACC_LANES;
     let region_len = n_claims * (max_arity + 1);
     SplitIoLayout {
         g,
@@ -564,8 +564,9 @@ fn build_split_link_inner(
                 .copy_from_slice(&input.prev.io[lane.point..=lane.live]);
         }
     }
-    io[layout.block_acc..layout.block_acc + 5]
-        .copy_from_slice(&input.block.io[BLOCK_IO_END_ACC..BLOCK_IO_END_ACC + 5]);
+    io[layout.block_acc..layout.block_acc + super::link::ACC_LANES].copy_from_slice(
+        &input.block.io[BLOCK_IO_END_ACC..BLOCK_IO_END_ACC + super::link::ACC_LANES],
+    );
 
     // ---- [R]-PCS walk opening claims: NATIVE values into the IO tail
     // (deterministic in the two proofs; the trace discharge below
@@ -845,7 +846,7 @@ fn build_split_link_inner(
     // chain (genesis pins the class constant), its end accumulator IS
     // this link's exposed block accumulator.
     let genesis_start = block_acc_lanes(&class.genesis_block_accumulator);
-    for i in 0..5 {
+    for i in 0..super::link::ACC_LANES {
         let sw = &block_io_wires[BLOCK_IO_START_ACC + i];
         let to_genesis = sw.add(&LinExpr::constant(genesis_start[i]));
         let g_gated = mul(&mut b, &g, &to_genesis);
@@ -1016,6 +1017,8 @@ pub fn tip_block_accumulator_split(
             tip.io[layout.block_acc + 3],
             tip.io[layout.block_acc + 4],
         ),
+        active_slot_count: flat_to_block(tip.io[layout.block_acc + 5]) as u64,
+        alloc_counter: flat_to_block(tip.io[layout.block_acc + 6]) as u64,
     }
 }
 

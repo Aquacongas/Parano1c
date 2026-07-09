@@ -69,8 +69,12 @@ use crate::block_certificate_backend::{
 };
 use noid_core::Block128;
 
+/// The accumulator-boundary lane count: height, state_root×2,
+/// chain_hash×2, active_slot_count, alloc_counter.
+pub const ACC_LANES: usize = 7;
+
 /// The block chain accumulator as flat IO lanes, in the layout's order.
-pub(crate) fn block_acc_lanes(acc: &ChainAccumulator) -> [F128; 5] {
+pub(crate) fn block_acc_lanes(acc: &ChainAccumulator) -> [F128; ACC_LANES] {
     let sr = digest_lanes(&acc.state_root);
     let ch = digest_lanes(&acc.chain_hash);
     [
@@ -79,6 +83,8 @@ pub(crate) fn block_acc_lanes(acc: &ChainAccumulator) -> [F128; 5] {
         flat_of(sr[1]),
         flat_of(ch[0]),
         flat_of(ch[1]),
+        flat_of(Block128::from(acc.active_slot_count)),
+        flat_of(Block128::from(acc.alloc_counter)),
     ]
 }
 
@@ -202,7 +208,7 @@ pub fn link_io_layout_region(
     let recursion_len = 4 + acc_len;
     let block_height = recursion_len;
     let base_len = if block_bearing {
-        recursion_len + 5
+        recursion_len + ACC_LANES
     } else {
         recursion_len
     };
@@ -363,6 +369,8 @@ impl LinkClass {
             height: 0,
             state_root: [0u8; 32],
             chain_hash: [0u8; 32],
+            active_slot_count: 0,
+            alloc_counter: 0,
         };
         Self::new_configured(shape, pcs_params, false, zero_acc)
     }
@@ -682,11 +690,7 @@ fn build_link_inner(
     io[layout.acc_value] = acc_out.value;
     if let Some(block) = &input.block {
         let lanes = block_acc_lanes(block.end_accumulator);
-        io[layout.block_height] = lanes[0];
-        io[layout.block_state_root] = lanes[1];
-        io[layout.block_state_root + 1] = lanes[2];
-        io[layout.block_chain_hash] = lanes[3];
-        io[layout.block_chain_hash + 1] = lanes[4];
+        io[layout.block_height..layout.block_height + ACC_LANES].copy_from_slice(&lanes);
     }
 
     // ---- Region wallet-PCS opening claims: NATIVE values into the IO tail.
@@ -863,14 +867,10 @@ fn build_link_inner(
             &slots.end_acc.state_root[1],
             &slots.end_acc.chain_hash[0],
             &slots.end_acc.chain_hash[1],
+            &slots.end_acc.active_slot_count,
+            &slots.end_acc.alloc_counter,
         ];
-        let io_end = [
-            layout.block_height,
-            layout.block_state_root,
-            layout.block_state_root + 1,
-            layout.block_chain_hash,
-            layout.block_chain_hash + 1,
-        ];
+        let io_end: [usize; ACC_LANES] = std::array::from_fn(|i| layout.block_height + i);
         for (w, &cell) in end_lanes.iter().zip(io_end.iter()) {
             pin_eq(&mut b, w, &io_cells[cell]);
         }
@@ -883,15 +883,12 @@ fn build_link_inner(
             &slots.start_acc.state_root[1],
             &slots.start_acc.chain_hash[0],
             &slots.start_acc.chain_hash[1],
+            &slots.start_acc.active_slot_count,
+            &slots.start_acc.alloc_counter,
         ];
         let genesis_start = block_acc_lanes(&class.genesis_block_accumulator);
-        let prev_block_io = [
-            layout.block_height,
-            layout.block_state_root,
-            layout.block_state_root + 1,
-            layout.block_chain_hash,
-            layout.block_chain_hash + 1,
-        ];
+        let prev_block_io: [usize; ACC_LANES] =
+            std::array::from_fn(|i| layout.block_height + i);
         for (i, sw) in start_lanes.iter().enumerate() {
             // g · (start - genesis_const) = 0.
             let to_genesis = (*sw).add(&LinExpr::constant(genesis_start[i]));
@@ -1221,6 +1218,8 @@ pub fn tip_block_accumulator(class: &LinkClass, tip: &LinkEnvelope) -> Option<Ch
             tip.io[layout.block_chain_hash],
             tip.io[layout.block_chain_hash + 1],
         ),
+        active_slot_count: flat_to_block(tip.io[layout.block_height + 5]) as u64,
+        alloc_counter: flat_to_block(tip.io[layout.block_height + 6]) as u64,
     })
 }
 

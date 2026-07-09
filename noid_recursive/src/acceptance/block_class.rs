@@ -39,16 +39,17 @@ use noid_ivc_core::public_io::{IoClaimSpec, PublicIoSpec, WitnessSlice};
 use super::block_slots::{
     build_block_slots_with_config, region_wallet_pcs_native, BlockSlotsConfig,
 };
-use super::link::{block_acc_lanes, LinkBlock, RegionFrozenClaim};
+use super::link::{block_acc_lanes, LinkBlock, RegionFrozenClaim, ACC_LANES};
 use super::trace::pin_eq;
 use super::trace::region_source_binding::{RegionDischargeParams, RegionPcsClaim};
 
 /// Public-IO layout of a block class.
 #[derive(Clone, Copy, Debug)]
 pub struct BlockIoLayout {
-    /// Start accumulator: 5 lanes (height, state_root×2, chain_hash×2).
+    /// Start accumulator: [`ACC_LANES`] lanes (height, state_root×2,
+    /// chain_hash×2, active_slot_count, alloc_counter).
     pub start_acc: usize,
-    /// End accumulator: 5 lanes.
+    /// End accumulator: [`ACC_LANES`] lanes.
     pub end_acc: usize,
     /// First region-tail lane.
     pub region_tail_offset: usize,
@@ -62,16 +63,16 @@ pub struct BlockIoLayout {
 /// independent of the region tail, so link-side consumers can address them
 /// without knowing the frozen claim shape.
 pub const BLOCK_IO_START_ACC: usize = 0;
-pub const BLOCK_IO_END_ACC: usize = 5;
+pub const BLOCK_IO_END_ACC: usize = ACC_LANES;
 
 pub fn block_io_layout(n_claims: usize, max_arity: usize) -> BlockIoLayout {
     let region_len = n_claims * (max_arity + 1);
     BlockIoLayout {
-        start_acc: 0,
-        end_acc: 5,
-        region_tail_offset: 10,
+        start_acc: BLOCK_IO_START_ACC,
+        end_acc: BLOCK_IO_END_ACC,
+        region_tail_offset: 2 * ACC_LANES,
         region_len,
-        len: 10 + region_len,
+        len: 2 * ACC_LANES + region_len,
     }
 }
 
@@ -204,9 +205,9 @@ pub fn build_block_proof_trace(class: &BlockClass, block: &LinkBlock<'_>) -> Bui
     let layout = block_io_layout(class.region_claims.len(), class.region_max_arity);
     assert_eq!(class.spec.io_len, layout.len);
     let mut io = vec![F128::ZERO; layout.len];
-    io[layout.start_acc..layout.start_acc + 5]
+    io[layout.start_acc..layout.start_acc + ACC_LANES]
         .copy_from_slice(&block_acc_lanes(block.start_accumulator));
-    io[layout.end_acc..layout.end_acc + 5]
+    io[layout.end_acc..layout.end_acc + ACC_LANES]
         .copy_from_slice(&block_acc_lanes(block.end_accumulator));
     let region_native = region_wallet_pcs_native(
         block.inputs,
@@ -307,6 +308,8 @@ fn build_block_trace_parts(
                 &slots.start_acc.state_root[1],
                 &slots.start_acc.chain_hash[0],
                 &slots.start_acc.chain_hash[1],
+                &slots.start_acc.active_slot_count,
+                &slots.start_acc.alloc_counter,
             ];
             let end_lanes = [
                 &slots.end_acc.height,
@@ -314,6 +317,8 @@ fn build_block_trace_parts(
                 &slots.end_acc.state_root[1],
                 &slots.end_acc.chain_hash[0],
                 &slots.end_acc.chain_hash[1],
+                &slots.end_acc.active_slot_count,
+                &slots.end_acc.alloc_counter,
             ];
             for (i, w) in start_lanes.iter().enumerate() {
                 pin_eq(&mut b, w, &io_cells[layout.start_acc + i]);

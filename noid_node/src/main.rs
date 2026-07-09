@@ -1715,6 +1715,8 @@ mod tests {
             height: h0.height,
             state_root: h0.state_root,
             chain_hash: [0u8; 32],
+            active_slot_count: h0.active_slot_count,
+            alloc_counter: h0.alloc_counter,
         };
         let start_anchor = noid_chain::header_anchor::compute_header_chain_anchor(
             std::iter::once(&h0),

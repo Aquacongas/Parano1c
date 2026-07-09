@@ -47,11 +47,12 @@
 //!   to the SAME wires (leaf ↔ path), and each leg root cell pins to the
 //!   composite-root statement's utxo/guard-root wires (path ↔ root).
 //! - public transaction logic — likewise a region-layer per-tx obligation.
-//! - the parent header's `active_slot_count` / `alloc_counter` (they feed
-//!   only the claim hash and there is no accumulator wire to pin them
-//!   against): these are consensus-continuity lanes the LINK binds by
-//!   exposing the previous link's child consensus. Header PoW/ASERT/MTP
-//!   fields (timestamp, miner, nonce, target) are deliberately out of π's
+//! - the parent header's `active_slot_count` / `alloc_counter`: CLOSED —
+//!   the accumulator boundary carries both counters as lanes; each block
+//!   pins its start counters to the claim's PARENT section and its end
+//!   counters to the verified header, and the link chain rule
+//!   `start == prev.end` closes the chain. Header PoW/ASERT/MTP fields
+//!   (timestamp, miner, nonce, target) are deliberately out of π's
 //!   scope — a fresh peer validates its own header chain.
 //! - the wallet-capsule PCS opening: replayed by `discharge_auth_pcs_
 //!   obligation` when [`BlockSlotsConfig::discharge_wallet_pcs`] is set, but
@@ -527,11 +528,14 @@ fn tier_auth_slot_count(tier_user_tx_capacity: Option<usize>, n_real_user: usize
 
 /// The tier's touched-slot capacity: the class spend capacity (the guard
 /// bucket's padded spend width) plus the output capacity (every standard tx
-/// may create up to its shape's max outputs). Every touched slot is a spend
-/// or a creation, so the real touched count never exceeds this.
+/// may create up to its shape's max outputs) PLUS ONE for the coinbase
+/// mint — the coinbase is not a user tx but its reward output touches a
+/// slot too, so a genuinely full block touches `user actions + 1` slots
+/// (3061 at the attack tier, not 3060). Every touched slot is a spend or a
+/// creation, so the real touched count never exceeds this.
 fn tier_touched_capacity(std_tier: usize) -> usize {
     let spend = noid_chain::consensus::params::block_class_spend_capacity(std_tier, 0);
-    spend + std_tier * noid_gkr::tx_body_layout::TXBODY_N_OUTPUT_LEAVES
+    spend + std_tier * noid_gkr::tx_body_layout::TXBODY_N_OUTPUT_LEAVES + 1
 }
 
 /// Pad the exact-state statement to the tier's touched capacity: the
@@ -983,6 +987,20 @@ pub fn build_block_slots_with_config(
         );
     }
     pin_eq(b, &claim.fields[parent + hc::HEIGHT], &start_acc.height);
+    // Consensus-counter continuity: the START accumulator carries the
+    // PARENT header's counters (the claim transcript's parent section) and
+    // the END accumulator this header's child counters — the link chain
+    // rule `start == prev.end` then closes the counter chain across
+    // blocks (previously an unbound residue: the counters fed only the
+    // claim hash with no accumulator wire to pin against).
+    pin_eq(
+        b,
+        &claim.fields[parent + hc::ACTIVE_SLOT_COUNT],
+        &start_acc.active_slot_count,
+    );
+    pin_eq(b, &claim.fields[parent + hc::ALLOC_COUNTER], &start_acc.alloc_counter);
+    pin_eq(b, &end_acc.active_slot_count, &header.fields[hf::ACTIVE_SLOT_COUNT]);
+    pin_eq(b, &end_acc.alloc_counter, &header.fields[hf::ALLOC_COUNTER]);
     // First block height = start height + 1 (INTEGER successor). Field
     // addition is XOR, so a naive `child + parent + 1 = 0` would only be
     // the integer increment when the parent height is even; this is a
