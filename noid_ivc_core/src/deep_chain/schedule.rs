@@ -178,6 +178,16 @@ pub fn compile_duplex(ops: &[TranscriptOp]) -> DuplexLayout {
             }
         }
     }
+    if filled == 1 {
+        // Trailing partial absorb with no following squeeze: the lane is
+        // still buffered in the native channel (its permutation never ran),
+        // but the layout must place it so its data lane exists. Give it a
+        // slot with the second lane empty — the chain performs the flush
+        // permutation; no challenge is ever read past this point.
+        slots.push(DuplexSlot {
+            lanes: [buf[0], None],
+        });
+    }
     DuplexLayout {
         slots,
         challenges,

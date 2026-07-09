@@ -115,6 +115,7 @@ fn measure(k: usize, params: RegionDischargeParams) -> Measured {
         None,
         None,
         None,
+        None,
     );
     let max_arity = claims.iter().map(|c| c.point.len()).max().unwrap();
     Measured { wires: b.num_wires() - before, claims: claims.len(), max_arity }

@@ -310,9 +310,50 @@ fn absorb_relation_header_trace(
     ch.observe_f128_slice(b, &lanes);
 }
 
+/// One doubling step of the eq tensor (mirrors `build_eq_table`: the new
+/// variable is the HIGH bit; `(1+p)·t = t + p·t`, one multiplication per
+/// parent entry).
+fn eq_tensor_extend(b: &mut FieldR1csBuilder, tensor: &[LinExpr], p_j: &LinExpr) -> Vec<LinExpr> {
+    let his: Vec<LinExpr> = tensor.iter().map(|t| mul(b, t, p_j)).collect();
+    let mut next = Vec::with_capacity(tensor.len() * 2);
+    for (t, hi) in tensor.iter().zip(his.iter()) {
+        next.push(t.add(hi));
+    }
+    next.extend(his);
+    next
+}
+
+/// Dot a pattern's constant table with a prebuilt eq tensor of its low
+/// coordinates (zero rows — a pure linear combination), then apply the
+/// hi-gate factors (`ρ_j` / `1+ρ_j` per pinned coordinate).
+fn fixed_pattern_dot_gate(
+    b: &mut FieldR1csBuilder,
+    pattern: &FixedPattern,
+    tensor: &[LinExpr],
+    point: &[LinExpr],
+) -> LinExpr {
+    assert_eq!(tensor.len(), pattern.table.len(), "eq tensor arity");
+    let mut acc = LinExpr::zero();
+    for (v, t) in pattern.table.iter().zip(tensor.iter()) {
+        if *v != F128::ZERO {
+            acc = acc.add(&t.scale(*v));
+        }
+    }
+    if let Some((first, bits)) = &pattern.hi_gate {
+        assert_eq!(point.len(), first + bits.len(), "gated pattern point arity");
+        for (j, bit) in bits.iter().enumerate() {
+            let p = &point[first + j];
+            let f = if *bit { p.clone() } else { p.add_const(F128::ONE) };
+            acc = mul(b, &acc, &f);
+        }
+    }
+    acc
+}
+
 /// Closed-form MLE evaluation of a [`FixedPattern`] at an expression point:
 /// build the eq tensor of the low `low_log` coordinates (2^low_log − 1
-/// multiplications), then dot it with the constant table (zero rows).
+/// multiplications), then dot it with the constant table (zero rows) and
+/// apply the hi-gate factors, if any.
 pub fn fixed_pattern_eval_trace(
     b: &mut FieldR1csBuilder,
     pattern: &FixedPattern,
@@ -321,23 +362,9 @@ pub fn fixed_pattern_eval_trace(
     assert!(point.len() >= pattern.low_log, "fixed pattern point arity");
     let mut tensor: Vec<LinExpr> = vec![LinExpr::constant(F128::ONE)];
     for p_j in &point[..pattern.low_log] {
-        // Mirrors `build_eq_table`: the new variable is the HIGH bit;
-        // (1+p)·t = t + p·t, so one multiplication per parent entry.
-        let his: Vec<LinExpr> = tensor.iter().map(|t| mul(b, t, p_j)).collect();
-        let mut next = Vec::with_capacity(tensor.len() * 2);
-        for (t, hi) in tensor.iter().zip(his.iter()) {
-            next.push(t.add(hi));
-        }
-        next.extend(his);
-        tensor = next;
+        tensor = eq_tensor_extend(b, &tensor, p_j);
     }
-    let mut acc = LinExpr::zero();
-    for (v, t) in pattern.table.iter().zip(tensor.iter()) {
-        if *v != F128::ZERO {
-            acc = acc.add(&t.scale(*v));
-        }
-    }
-    acc
+    fixed_pattern_dot_gate(b, pattern, &tensor, point)
 }
 
 /// Trace twin of `relations::verify_column_relation`; returns the derived
@@ -381,20 +408,40 @@ pub fn verify_column_relation_trace(
     }
     ch.observe_f128_slice(b, &proof.final_values);
 
-    // Each distinct Fixed ref is evaluated once per relation.
+    // Each distinct Fixed ref is evaluated once per relation, and ALL the
+    // relation's patterns share ONE incrementally-built eq tensor (each
+    // pattern reads the 2^low_log prefix stage it needs) — n patterns of a
+    // common period cost one tensor, not n.
+    let mut fixed_used: Vec<usize> = Vec::new();
+    for t in terms {
+        for f in &t.factors {
+            if let ColRef::Fixed(i) = f {
+                if !fixed_used.contains(i) {
+                    fixed_used.push(*i);
+                }
+            }
+        }
+    }
     let mut fixed_cache: Vec<Option<LinExpr>> = vec![None; fixed.len()];
+    {
+        let mut by_low = fixed_used.clone();
+        by_low.sort_by_key(|i| fixed[*i].low_log);
+        let mut tensor: Vec<LinExpr> = vec![LinExpr::constant(F128::ONE)];
+        let mut cur_log = 0usize;
+        for i in by_low {
+            while cur_log < fixed[i].low_log {
+                tensor = eq_tensor_extend(b, &tensor, &point[cur_log]);
+                cur_log += 1;
+            }
+            fixed_cache[i] = Some(fixed_pattern_dot_gate(b, &fixed[i], &tensor, &point));
+        }
+    }
     let mut sum = LinExpr::zero();
     for t in terms {
         let mut prod = t.coeff.clone();
         for f in &t.factors {
             let value = match f {
-                ColRef::Fixed(i) => {
-                    if fixed_cache[*i].is_none() {
-                        fixed_cache[*i] =
-                            Some(fixed_pattern_eval_trace(b, &fixed[*i], &point));
-                    }
-                    fixed_cache[*i].clone().expect("cached")
-                }
+                ColRef::Fixed(i) => fixed_cache[*i].clone().expect("pre-evaluated"),
                 _ => {
                     let fi = claimed
                         .iter()

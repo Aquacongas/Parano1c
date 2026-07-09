@@ -2595,7 +2595,7 @@ mod tests {
             .collect();
         let natives: Vec<_> = wit.iter().cloned().collect();
         let native_inputs: Vec<_> = auth.iter().map(|i| i.public.clone()).collect();
-        let (region_obs, oa_claims) = discharge_owner_auth_killshots_via_region(
+        let (region_obs, oa_claims, _oa_recording) = discharge_owner_auth_killshots_via_region(
             &mut b,
             &proof_ts,
             &input_ts,

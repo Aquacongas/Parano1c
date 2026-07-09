@@ -1277,12 +1277,13 @@ pub fn build_block_slots_with_config(
     // and MUST be threaded through the link IO, so they come FIRST in
     // `pending_wallet_pcs`. Requires the region wallet-PCS path so the obligations
     // are actually discharged (a complete proof).
+    let mut oa_recording = None;
     if config.owner_auth_region {
         assert!(
             config.discharge_wallet_pcs,
             "owner_auth_region requires the wallet-PCS discharge (the produced obligation must be discharged)"
         );
-        let (obligations, oa_claims) = discharge_owner_auth_killshots_via_region(
+        let (obligations, oa_claims, recording) = discharge_owner_auth_killshots_via_region(
             b,
             &oa_trace_proofs,
             &auth_inputs,
@@ -1291,6 +1292,9 @@ pub fn build_block_slots_with_config(
         );
         region_obligations = obligations;
         pending_wallet_pcs.extend(oa_claims);
+        // The C′ discharge transcript recording rides the wallet plural's
+        // walk C (region-2 block) — the plural pins its wires there.
+        oa_recording = Some(recording);
     }
     // ONE tiled plural discharge for the whole block (region path): the K txs'
     // wallet-capsule families tile into one walk A/B/C and the returned committed-
@@ -1322,6 +1326,7 @@ pub fn build_block_slots_with_config(
                 es_region_data.as_ref(),
                 tx_root_region_data.as_ref(),
                 spine_region_data.as_ref(),
+                oa_recording.as_ref(),
             ));
         }
     }
@@ -1512,6 +1517,7 @@ pub fn region_wallet_pcs_native(
     // Produce the wallet-PCS obligations + natives the SAME way the real build
     // does for this `owner_auth_region` mode: the capacity view appends the
     // protocol ghost authorization to the real per-tx lists.
+    let mut oa_recording = None;
     let (obligations, natives) = if owner_auth_region {
         // Scratch owner-auth region discharge (mirror of the real build): its
         // walk-C opening claims come FIRST in `pending_wallet_pcs`, so prefill
@@ -1542,13 +1548,14 @@ pub fn region_wallet_pcs_native(
         let oa_natives: Vec<_> = (0..n_auth_slots).map(|i| slot_native(i).1.clone()).collect();
         let oa_native_inputs: Vec<_> =
             (0..n_auth_slots).map(|i| slot_native(i).0.clone()).collect();
-        let (obligations, oa_claims) = discharge_owner_auth_killshots_via_region(
+        let (obligations, oa_claims, recording) = discharge_owner_auth_killshots_via_region(
             &mut pb,
             &oa_trace_proofs,
             &oa_trace_inputs,
             &oa_natives,
             &oa_native_inputs,
         );
+        oa_recording = Some(recording);
         for c in &oa_claims {
             out.push((c.native_point.clone(), c.native_value));
         }
@@ -1588,6 +1595,7 @@ pub fn region_wallet_pcs_native(
         scratch_es.as_ref(),
         scratch_txr.as_ref(),
         scratch_spine.as_ref(),
+        oa_recording.as_ref(),
     ) {
         out.push((c.native_point, c.native_value));
     }

@@ -769,6 +769,28 @@ pub trait FsChannelOps {
     fn observe_f128(&mut self, b: &mut FieldR1csBuilder, value: &LinExpr);
     fn observe_f128_slice(&mut self, b: &mut FieldR1csBuilder, values: &[LinExpr]);
     fn sample_f128(&mut self, b: &mut FieldR1csBuilder) -> LinExpr;
+    /// One SLICE-kind squeeze header followed by `n` challenge reads — the
+    /// native `sample_f128_vec` discipline (NOT `n` scalar samples, whose
+    /// per-sample headers would diverge from the native transcript).
+    fn sample_f128_vec(&mut self, b: &mut FieldR1csBuilder, n: usize) -> Vec<LinExpr>;
+}
+
+impl<C: FsChannelOps + ?Sized> FsChannelOps for &mut C {
+    fn observe_label(&mut self, b: &mut FieldR1csBuilder, label: &[u8]) {
+        (**self).observe_label(b, label);
+    }
+    fn observe_f128(&mut self, b: &mut FieldR1csBuilder, value: &LinExpr) {
+        (**self).observe_f128(b, value);
+    }
+    fn observe_f128_slice(&mut self, b: &mut FieldR1csBuilder, values: &[LinExpr]) {
+        (**self).observe_f128_slice(b, values);
+    }
+    fn sample_f128(&mut self, b: &mut FieldR1csBuilder) -> LinExpr {
+        (**self).sample_f128(b)
+    }
+    fn sample_f128_vec(&mut self, b: &mut FieldR1csBuilder, n: usize) -> Vec<LinExpr> {
+        (**self).sample_f128_vec(b, n)
+    }
 }
 
 impl FsChannelOps for FsChannelTrace {
@@ -783,6 +805,9 @@ impl FsChannelOps for FsChannelTrace {
     }
     fn sample_f128(&mut self, b: &mut FieldR1csBuilder) -> LinExpr {
         FsChannelTrace::sample_f128(self, b)
+    }
+    fn sample_f128_vec(&mut self, b: &mut FieldR1csBuilder, n: usize) -> Vec<LinExpr> {
+        FsChannelTrace::sample_f128_vec(self, b, n)
     }
 }
 
@@ -973,6 +998,21 @@ impl FsChannelOps for FsChannelUnionRecorder {
         self.challenge_wires.push(w.clone());
         w
     }
+
+    fn sample_f128_vec(&mut self, b: &mut FieldR1csBuilder, n: usize) -> Vec<LinExpr> {
+        self.absorb_const(fs_op_lane(FS_OP_SQUEEZE, FS_KIND_SLICE, n as u64));
+        self.close_absorb();
+        self.ops
+            .push(crate::deep_chain::schedule::TranscriptOp::Squeeze(n));
+        (0..n)
+            .map(|_| {
+                let v = self.squeeze_native();
+                let w = LinExpr::from_wire(b.alloc_f128(v));
+                self.challenge_wires.push(w.clone());
+                w
+            })
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1119,9 +1159,14 @@ mod tests {
             ch.observe_f128_slice(b, &wires[1..4]);
             chals.push(ch.sample_f128(b));
             chals.push(ch.sample_f128(b)); // back-to-back squeezes
+            chals.extend(ch.sample_f128_vec(b, 3)); // SLICE-header vec draw
             ch.observe_f128_slice(b, &wires[4..7]);
             ch.observe_label(b, b"stage-2");
             chals.push(ch.sample_f128(b));
+            // Odd-parity tail after the last squeeze: the final data lane
+            // lands in a trailing partial-absorb slot that `compile_duplex`
+            // must flush into the layout.
+            ch.observe_f128_slice(b, &wires[..2]);
             chals
         }
 
@@ -1145,7 +1190,7 @@ mod tests {
             assert_eq!(ci.eval(&vals), cr.eval(&vals), "challenge {k} diverges");
         }
         assert_eq!(inline.perms(), rc.perms, "permutation count diverges");
-        assert_eq!(rc.data_flat.len(), 7, "exactly the witness lanes are data");
+        assert_eq!(rc.data_flat.len(), 9, "exactly the witness lanes are data");
         for (dw, df) in rc.data_wires.iter().zip(rc.data_flat.iter()) {
             assert_eq!(dw.eval(&vals), *df, "data wire/value mismatch");
         }

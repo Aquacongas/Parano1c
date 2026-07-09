@@ -93,19 +93,50 @@ pub enum ColRef {
 /// `col(w) = table[w mod 2^low_log]`. Its MLE at any point ρ (with
 /// `ρ.len() ≥ low_log`) is `table~(ρ[..low_log])` — the high coordinates
 /// integrate out because `Σ_hi eq(ρ_hi, hi) = 1`.
+///
+/// An optional HI-GATE restricts the pattern to one aligned dyadic region
+/// of the slot domain: with `hi_gate = Some((first, bits))` the column is
+/// `table[w mod 2^low_log]` where the index bits `first..first+bits.len()`
+/// of `w` equal `bits`, and ZERO everywhere else. The MLE gains one linear
+/// factor per gated coordinate (`ρ_j` or `1+ρ_j`), so evaluation stays
+/// closed-form; coordinates in `low_log..first` still integrate out (the
+/// pattern repeats across them inside the region). This is what lets slot
+/// regions with DIFFERENT periods share one walk domain: each region's
+/// selector/constant patterns vanish exactly on the other regions.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FixedPattern {
     pub low_log: usize,
     pub table: Vec<F128>,
+    /// `(first_coord, required bits for coords first..first+len)`; the gate
+    /// must pin every coordinate up to the walk's `w_log` (a shorter gate
+    /// would alias the region across the un-pinned high bits).
+    pub hi_gate: Option<(usize, Vec<bool>)>,
 }
 
 impl FixedPattern {
     pub fn new(low_log: usize, table: Vec<F128>) -> Self {
         assert_eq!(table.len(), 1usize << low_log, "fixed pattern length");
-        Self { low_log, table }
+        Self {
+            low_log,
+            table,
+            hi_gate: None,
+        }
     }
 
-    /// MLE evaluation at a point of ≥ `low_log` coordinates.
+    /// Restrict the pattern to the dyadic region whose index bits
+    /// `first..first+bits.len()` equal `bits` (little-endian). `first` must
+    /// be ≥ `low_log` and `first + bits.len()` must equal the walk's
+    /// `w_log` exactly.
+    pub fn gated(mut self, first: usize, bits: Vec<bool>) -> Self {
+        assert!(first >= self.low_log, "gate below the pattern period");
+        assert!(!bits.is_empty(), "empty hi-gate");
+        self.hi_gate = Some((first, bits));
+        self
+    }
+
+    /// MLE evaluation at a point of ≥ `low_log` coordinates (gated patterns
+    /// require the point arity to equal `first + bits.len()` exactly — the
+    /// gate must pin every high coordinate).
     pub fn eval(&self, point: &[F128]) -> F128 {
         assert!(point.len() >= self.low_log, "fixed pattern point arity");
         let eq = build_eq_table(&point[..self.low_log]);
@@ -113,14 +144,47 @@ impl FixedPattern {
         for (v, e) in self.table.iter().zip(eq.iter()) {
             acc += *v * *e;
         }
+        if let Some((first, bits)) = &self.hi_gate {
+            assert_eq!(
+                point.len(),
+                first + bits.len(),
+                "gated pattern point arity"
+            );
+            for (j, bit) in bits.iter().enumerate() {
+                let p = point[first + j];
+                acc = acc * if *bit { p } else { F128::ONE + p };
+            }
+        }
         acc
     }
 
-    /// The periodic extension over a `2^w_log`-slot domain (prover side).
+    /// The periodic extension over a `2^w_log`-slot domain (prover side);
+    /// gated patterns are zero outside their region, and the domain must
+    /// match the gate's span exactly.
     pub fn materialize(&self, w: usize) -> Vec<F128> {
         assert!(w >= self.table.len(), "domain below pattern period");
         let mask = self.table.len() - 1;
-        (0..w).map(|i| self.table[i & mask]).collect()
+        match &self.hi_gate {
+            None => (0..w).map(|i| self.table[i & mask]).collect(),
+            Some((first, bits)) => {
+                assert_eq!(w, 1usize << (first + bits.len()), "gated pattern domain");
+                let mut gate_val = 0usize;
+                for (j, bit) in bits.iter().enumerate() {
+                    if *bit {
+                        gate_val |= 1 << j;
+                    }
+                }
+                (0..w)
+                    .map(|i| {
+                        if i >> first == gate_val {
+                            self.table[i & mask]
+                        } else {
+                            F128::ZERO
+                        }
+                    })
+                    .collect()
+            }
+        }
     }
 }
 

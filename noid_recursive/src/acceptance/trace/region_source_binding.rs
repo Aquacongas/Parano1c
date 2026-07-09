@@ -115,7 +115,10 @@ use noid_ivc_core::deep_chain::{
     prove_deep_chain_walk, verify_deep_chain_walk, DeepChainWalkProof, LaneClaimGroup,
 };
 use noid_ivc_core::field::F128;
-use noid_ivc_core::field_circuit::{FieldR1csBuilder, FsChannelTrace, LinExpr, Wire};
+use noid_ivc_core::field_circuit::{
+    FieldR1csBuilder, FsChannelOps, FsChannelTrace, FsChannelUnionRecorder, LinExpr,
+    RecordedChannel, Wire,
+};
 use noid_ivc_core::public_io::WitnessSlice;
 
 use super::deep_chain::{
@@ -209,6 +212,7 @@ pub fn discharge_auth_pcs_obligation_via_region(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -264,6 +268,7 @@ pub fn discharge_auth_pcs_obligations_via_region(
     es: Option<&ExactStateRegionData>,
     txr: Option<&TxRootRegionData>,
     spine: Option<&SpineRegionData>,
+    oa_recording: Option<&RecordedChannel>,
 ) -> Vec<RegionPcsClaim> {
     assert_eq!(obligations.len(), natives.len(), "one native proof per obligation");
     assert!(!obligations.is_empty(), "at least one obligation");
@@ -1335,10 +1340,15 @@ pub fn discharge_auth_pcs_obligations_via_region(
     );
     let mut slices: Vec<WitnessSlice> =
         cols.iter().map(|c| alloc_column_slice(b, c, w_log).0).collect();
+    // The walk-A discharge transcript is RECORDED (not replayed in-trace):
+    // its absorb/squeeze chain rides walk C's region-2 blocks below, where
+    // the challenge wires the twins consumed pin to walk-C carry cells.
+    let mut ch_a = FsChannelUnionRecorder::new(DOMAIN);
     claims.extend(discharge_union(
-        b, &fixed, &meta_c, &wallet_leaf_refs, es_sponge.as_ref(), spine_union_spec.as_ref(),
-        w_log, &native_u,
+        b, &mut ch_a, &fixed, &meta_c, &wallet_leaf_refs, es_sponge.as_ref(),
+        spine_union_spec.as_ref(), w_log, &native_u,
     ));
+    let rec_a = ch_a.finish();
 
     // ===================================================================
     // Walk B (once): the two feed-forward wallet legs + the 2-permutation
@@ -1394,9 +1404,12 @@ pub fn discharge_auth_pcs_obligations_via_region(
     let n_slices_a = slices.len();
     let slices_b: Vec<WitnessSlice> =
         cb.iter().map(|c| alloc_column_slice(b, c, w_log_b).0).collect();
+    // Walk B's discharge transcript is recorded too (region-2 block).
+    let mut ch_b = FsChannelUnionRecorder::new(DOMAIN_B);
     let (mut wb_claims, wb_cell_pins) = discharge_merkle_union(
-        b, &fixed_b, &cb_c, &ff_specs, &legs, w_log_b, &native_b, DOMAIN_B,
+        b, &mut ch_b, &fixed_b, &cb_c, &ff_specs, &legs, w_log_b, &native_b,
     );
+    let rec_b = ch_b.finish();
     for c in wb_claims.iter_mut() {
         c.slice += n_slices_a;
     }
@@ -1435,17 +1448,35 @@ pub fn discharge_auth_pcs_obligations_via_region(
     }
 
     // ===================================================================
-    // Walk C (once): the K txs' FRICHANL transcript channels, tiled into ONE
-    // duplex walk. The squeezed challenges the per-tx algebra consumed are bound
-    // to the carry cells; the absorbed proof data is bound to the A-lane cells.
-    // The permutations are discharged by ONE walk — transaction-count flat.
+    // Walk C (once): REGION 1 tiles the K txs' FRICHANL transcript channels;
+    // REGION 2 carries the walk A / walk B / owner-auth walk-C′ discharge
+    // TRANSCRIPT RECORDINGS as per-block chain blocks (tx-count flat). The
+    // squeezed challenges every consumer (per-tx algebra AND the walk twins)
+    // used are bound to carry cells; the absorbed data to A-lane cells. Walk
+    // C's OWN discharge transcript stays an inline replay (`DOMAIN_C`) — a
+    // walk cannot host its own transcript.
     // ===================================================================
-    let u_c = build_duplex_union(&chan_layout, iv_c, &chan_data_streams);
+    let rec_iv = FsChannelUnionRecorder::capacity_iv_flat();
+    let mut recordings: Vec<&RecordedChannel> = vec![&rec_a, &rec_b];
+    if let Some(rc) = oa_recording {
+        recordings.push(rc);
+    }
+    let rec_specs: Vec<RecordingSpec> = recordings
+        .iter()
+        .map(|rc| RecordingSpec {
+            layout: compile_duplex(&rc.ops),
+            iv_flat: rec_iv,
+            data: &rc.data_flat,
+        })
+        .collect();
+    let u_c =
+        build_duplex_union_with_recordings(&chan_layout, iv_c, &chan_data_streams, &rec_specs);
     let native_c = run_duplex_union_native(&u_c, DOMAIN_C);
     let n_slices_ab = slices.len();
     let slices_c: Vec<WitnessSlice> =
         u_c.committed.iter().map(|c| alloc_column_slice(b, c, u_c.w_log).0).collect();
-    let mut wc_claims = discharge_duplex_union(b, &u_c, DOMAIN_C, &native_c, 0);
+    let mut ch_c = FsChannelTrace::new(b, DOMAIN_C);
+    let mut wc_claims = discharge_duplex_union(b, &mut ch_c, &u_c, &native_c, 0);
     for c in wc_claims.iter_mut() {
         c.slice += n_slices_ab;
     }
@@ -1466,6 +1497,33 @@ pub fn discharge_auth_pcs_obligations_via_region(
         for (kk, &(slot, lane)) in chan_data_positions.iter().enumerate() {
             let cell = slot_cell(&slices_c[u_c.refs.a[lane]], tx * per_tx_c + slot);
             pin_eq(b, &chan_data_wires[tx][kk], &cell);
+        }
+    }
+    // Region-2 recordings: same cell-pin discipline. Each recording's absorbed
+    // data wires (the walk discharges' proof wires) pin to its block's A-lane
+    // cells and its challenge wires (the values the discharge twins consumed)
+    // pin to the carry cells — the walk then proves the whole transcript chain,
+    // replacing the deleted inline permutation replays.
+    for (r, rc) in recordings.iter().enumerate() {
+        let (rec_layout, off) = &u_c.rec_blocks[r];
+        assert_eq!(
+            rc.challenge_wires.len(),
+            rec_layout.challenges.len(),
+            "recording {r} challenge count"
+        );
+        assert_eq!(rc.data_wires.len(), rec_layout.n_data, "recording {r} data count");
+        for (kk, &(slot, lane)) in rec_layout.challenges.iter().enumerate() {
+            assert_eq!(
+                rc.challenge_wires[kk].eval(b.values()),
+                u_c.rec_challenges[r][kk],
+                "recording {r} challenge {kk} lockstep"
+            );
+            let cell = slot_cell(&slices_c[u_c.refs.c[lane]], off + slot);
+            pin_eq(b, &rc.challenge_wires[kk], &cell);
+        }
+        for (kk, &(slot, lane)) in duplex_data_positions(rec_layout).iter().enumerate() {
+            let cell = slot_cell(&slices_c[u_c.refs.a[lane]], off + slot);
+            pin_eq(b, &rc.data_wires[kk], &cell);
         }
     }
     slices.extend(slices_c);
@@ -1585,7 +1643,7 @@ pub fn discharge_owner_auth_killshots_via_region(
     trace_inputs: &[OwnerAuthPublicInputsTrace],
     native_proofs: &[OwnerAuthProofKillShot],
     native_inputs: &[OwnerAuthPublicInputs],
-) -> (Vec<PendingAuthPcsObligation>, Vec<RegionPcsClaim>) {
+) -> (Vec<PendingAuthPcsObligation>, Vec<RegionPcsClaim>, RecordedChannel) {
     let k = trace_proofs.len();
     assert!(k >= 1, "at least one owner-auth killshot");
     assert_eq!(trace_inputs.len(), k, "one trace input per killshot");
@@ -1843,7 +1901,11 @@ pub fn discharge_owner_auth_killshots_via_region(
     let native_c = run_duplex_union_native(&u_c, OWNER_AUTH_DOMAIN_C);
     let slices: Vec<WitnessSlice> =
         u_c.committed.iter().map(|c| alloc_column_slice(b, c, u_c.w_log).0).collect();
-    let claims = discharge_duplex_union(b, &u_c, OWNER_AUTH_DOMAIN_C, &native_c, 0);
+    // This walk-C′ discharge transcript is RECORDED: the wallet-PCS plural
+    // hosts it as a region-2 block of ITS walk C (the recording's challenge
+    // wires below pin to that walk's carry cells there).
+    let mut rec_ch = FsChannelUnionRecorder::new(OWNER_AUTH_DOMAIN_C);
+    let claims = discharge_duplex_union(b, &mut rec_ch, &u_c, &native_c, 0);
     // Stage 2: the per-tx channel absorbs + squeezed challenges are tied to the
     // walk-C A/C cells by R1CS constraint (`pin_eq`), NOT per-cell opening claims
     // — every A/C column is opened by the walk-C discharge (O(1) per column), so
@@ -1873,7 +1935,7 @@ pub fn discharge_owner_auth_killshots_via_region(
         })
         .collect();
 
-    (obligations, region_claims)
+    (obligations, region_claims, rec_ch.finish())
 }
 
 // ===========================================================================
@@ -2656,6 +2718,7 @@ fn union_ref_terms(
 #[allow(clippy::too_many_arguments)]
 fn discharge_union(
     b: &mut FieldR1csBuilder,
+    mut ch: &mut impl FsChannelOps,
     fixed: &[FixedPattern],
     meta_c: &[usize; STATE_SIZE],
     leaf_refs: &[(SpongeLeafRefs, usize)],
@@ -2664,7 +2727,6 @@ fn discharge_union(
     w_log: usize,
     native: &UnionNative,
 ) -> Vec<Claim> {
-    let mut ch = FsChannelTrace::new(b, DOMAIN);
     let mut out: Vec<Claim> = Vec::new();
     let np = &native.pending;
     let mut cur = 0usize;
@@ -3212,15 +3274,14 @@ fn run_merkle_union_native(
 #[allow(clippy::too_many_arguments)]
 fn discharge_merkle_union(
     b: &mut FieldR1csBuilder,
+    mut ch: &mut impl FsChannelOps,
     fixed: &[FixedPattern],
     cb_c: &[usize; STATE_SIZE],
     ff_specs: &[FfLegSpec],
     legs: &[MerkleLeg],
     w_log: usize,
     native: &MerkleUnionNative,
-    domain: &[u8],
 ) -> (Vec<Claim>, Vec<(usize, usize, LinExpr)>) {
-    let mut ch = FsChannelTrace::new(b, domain);
     let mut out: Vec<Claim> = Vec::new();
     // Stage 2: the per-cell reads/pins (leg entries, leg roots) resolve to
     // pin_eq of the wire to the committed cell -- R1CS rows, not link-IO
@@ -3450,6 +3511,15 @@ struct DuplexUnion {
     block_log: usize,
     /// One squeezed-challenge stream per real tx (schedule order).
     challenges: Vec<Vec<F128>>,
+    /// REGION-2 recording blocks (caller order): each recorded discharge
+    /// transcript's compiled layout and its dyadic domain offset. Empty for
+    /// a single-region union.
+    rec_blocks: Vec<(DuplexLayout, usize)>,
+    /// Per-recording gated pattern-set refs (same committed columns,
+    /// pattern indices after the region-1 set).
+    rec_refs: Vec<DuplexFamilyRefs>,
+    /// Per-recording squeezed challenges (native, schedule order).
+    rec_challenges: Vec<Vec<F128>>,
 }
 
 /// Tile `data.len()` transactions' duplex channels into ONE walk-C domain at a
@@ -3501,6 +3571,236 @@ fn build_duplex_union(layout: &DuplexLayout, iv_flat: [F128; 2], data: &[Vec<F12
         w_log,
         block_log,
         challenges,
+        rec_blocks: Vec::new(),
+        rec_refs: Vec::new(),
+        rec_challenges: Vec::new(),
+    }
+}
+
+/// A recorded LANECHAL discharge transcript riding walk C as a REGION-2
+/// block: its compiled schedule, capacity IV and absorbed witness data
+/// (flat). Recordings are per-BLOCK objects (one per walk discharge), so
+/// region 2 is transaction-count FLAT.
+struct RecordingSpec<'a> {
+    layout: DuplexLayout,
+    iv_flat: [F128; 2],
+    data: &'a [F128],
+}
+
+/// Two-region walk-C domain. REGION 1 (`[0, 2^r1_log)`) tiles the K
+/// transactions' channels at the per-tx block period exactly like
+/// [`build_duplex_union`] (real blocks + canonical zero-data ghost
+/// channels); REGION 2 appends each RECORDED walk-discharge transcript
+/// ONCE as its own dyadic sub-block, packed in descending size order (so
+/// every offset is self-aligned to its block size). The slots between and
+/// after the regions are pure carry-chain ghosts.
+///
+/// Pattern discipline: every set's START/ABS/CONST patterns carry a
+/// [`FixedPattern::gated`] hi-gate pinning its dyadic region, so no set's
+/// constants fire in another's slots (regions of DIFFERENT periods share
+/// one walk soundly). The substitution's leading carry term stays ungated:
+/// every slot is a valid chain permutation — schedule slots, in-block
+/// ghost tails, the inter-region gap and the domain tail all carry the
+/// previous state forward, and each block start re-seeds its capacity IV
+/// through its own gated START/const patterns (char-2: `(1+START)·C`
+/// cancels the incoming carry).
+fn build_duplex_union_with_recordings(
+    layout: &DuplexLayout,
+    iv_flat: [F128; 2],
+    data: &[Vec<F128>],
+    recordings: &[RecordingSpec<'_>],
+) -> DuplexUnion {
+    assert!(!recordings.is_empty(), "recording-free unions use build_duplex_union");
+    let per_tx = layout.slots.len().next_power_of_two();
+    let block_log = per_tx.trailing_zeros() as usize;
+    let k = data.len();
+    let r1_len = (k.max(1) * per_tx).next_power_of_two();
+    let r1_log = r1_len.trailing_zeros() as usize;
+
+    // Descending-size dyadic packing of the recordings after region 1.
+    let sizes: Vec<usize> = recordings
+        .iter()
+        .map(|r| r.layout.slots.len().max(1).next_power_of_two())
+        .collect();
+    let s_max = *sizes.iter().max().expect("non-empty recordings");
+    let mut order: Vec<usize> = (0..recordings.len()).collect();
+    order.sort_by_key(|&r| std::cmp::Reverse(sizes[r]));
+    let r2_base = r1_len.max(s_max);
+    let mut offsets = vec![0usize; recordings.len()];
+    let mut cur = r2_base;
+    for &r in &order {
+        debug_assert_eq!(cur % sizes[r], 0, "dyadic packing alignment");
+        offsets[r] = cur;
+        cur += sizes[r];
+    }
+    let w_log = cur.next_power_of_two().trailing_zeros() as usize;
+    let p = 1usize << w_log;
+
+    let mut committed: [Vec<F128>; 6] = std::array::from_fn(|_| vec![F128::ZERO; p]);
+    let mut s0: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; p]);
+    let mut s_out: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; p]);
+    let mut challenges = Vec::with_capacity(k);
+    let zero_data = vec![F128::ZERO; layout.n_data];
+
+    // Region 1: real channel blocks + zero-data ghost channels to the
+    // region boundary (each block IV-re-seeded by the gated START).
+    for blk in 0..r1_len / per_tx {
+        let d = data.get(blk).unwrap_or(&zero_data);
+        let cols = build_duplex_columns(layout, iv_flat, d, block_log);
+        let off = blk * per_tx;
+        for j in 0..2 {
+            committed[j][off..off + per_tx].copy_from_slice(&cols.a[j]);
+        }
+        for j in 0..STATE_SIZE {
+            committed[2 + j][off..off + per_tx].copy_from_slice(&cols.c[j]);
+            s0[j][off..off + per_tx].copy_from_slice(&cols.s0[j]);
+            s_out[j][off..off + per_tx].copy_from_slice(&cols.s_out[j]);
+        }
+        if blk < k {
+            challenges.push(cols.challenges);
+        }
+    }
+
+    // Gap, recording blocks, tail: pure carry between blocks, each
+    // recording re-seeded at its offset.
+    let mut rec_challenges: Vec<Vec<F128>> = vec![Vec::new(); recordings.len()];
+    let mut carry: [F128; STATE_SIZE] = std::array::from_fn(|j| committed[2 + j][r1_len - 1]);
+    let mut cursor = r1_len;
+    let fill_carry = |committed: &mut [Vec<F128>; 6],
+                          s0: &mut [Vec<F128>; STATE_SIZE],
+                          s_out: &mut [Vec<F128>; STATE_SIZE],
+                          carry: &mut [F128; STATE_SIZE],
+                          from: usize,
+                          to: usize| {
+        for slot in from..to {
+            let (g0, gout) = noid_ivc_core::deep_chain::source_tree::run_perm(*carry);
+            for j in 0..STATE_SIZE {
+                s0[j][slot] = g0[j];
+                s_out[j][slot] = gout[j];
+                committed[2 + j][slot] = gout[j];
+            }
+            *carry = gout;
+        }
+    };
+    for &r in &order {
+        fill_carry(&mut committed, &mut s0, &mut s_out, &mut carry, cursor, offsets[r]);
+        let rec = &recordings[r];
+        let sz = sizes[r];
+        let s_log = sz.trailing_zeros() as usize;
+        let cols = build_duplex_columns(&rec.layout, rec.iv_flat, rec.data, s_log);
+        let off = offsets[r];
+        for j in 0..2 {
+            committed[j][off..off + sz].copy_from_slice(&cols.a[j]);
+        }
+        for j in 0..STATE_SIZE {
+            committed[2 + j][off..off + sz].copy_from_slice(&cols.c[j]);
+            s0[j][off..off + sz].copy_from_slice(&cols.s0[j]);
+            s_out[j][off..off + sz].copy_from_slice(&cols.s_out[j]);
+        }
+        rec_challenges[r] = cols.challenges;
+        carry = std::array::from_fn(|j| committed[2 + j][off + sz - 1]);
+        cursor = off + sz;
+    }
+    fill_carry(&mut committed, &mut s0, &mut s_out, &mut carry, cursor, p);
+
+    // Gated pattern sets: region 1 pinned to its dyadic prefix, each
+    // recording to its own block. Both region boundaries are strictly
+    // below the domain top (region 2 is non-empty), so no gate is empty.
+    let hi_bits = |off: usize, from: usize| -> Vec<bool> {
+        (from..w_log).map(|c| (off >> c) & 1 == 1).collect()
+    };
+    let mut fixed: Vec<FixedPattern> = duplex_fixed_patterns(layout, iv_flat, block_log)
+        .into_iter()
+        .map(|pat| pat.gated(r1_log, hi_bits(0, r1_log)))
+        .collect();
+    let mut rec_refs = Vec::with_capacity(recordings.len());
+    for (r, rec) in recordings.iter().enumerate() {
+        let s_log = sizes[r].trailing_zeros() as usize;
+        let base = fixed.len();
+        for pat in duplex_fixed_patterns(&rec.layout, rec.iv_flat, s_log) {
+            fixed.push(pat.gated(s_log, hi_bits(offsets[r], s_log)));
+        }
+        rec_refs.push(duplex_family_refs(0, base));
+    }
+
+    DuplexUnion {
+        committed,
+        s0,
+        s_out,
+        fixed,
+        refs: duplex_family_refs(0, 0),
+        layout: layout.clone(),
+        w_log,
+        block_log,
+        challenges,
+        rec_blocks: recordings
+            .iter()
+            .enumerate()
+            .map(|(r, rec)| (rec.layout.clone(), offsets[r]))
+            .collect(),
+        rec_refs,
+        rec_challenges,
+    }
+}
+
+/// Substitution terms over a MULTI-REGION duplex domain: the ungated
+/// leading carry once (`Σ_j m_j·C_j(w−1)` — every slot of every region and
+/// ghost gap is a chain permutation), then each pattern set's gated
+/// START/ABS/CONST wiring. The claimed refs stay the six A/C columns —
+/// identical discharge plumbing to the single-set terms.
+fn duplex_substitution_terms_multi(sets: &[DuplexFamilyRefs], alpha: F128) -> Vec<RelationTerm> {
+    let flat = |v: u128| flat_of_tower_u128(v);
+    let mut alphas = [F128::ZERO; STATE_SIZE];
+    let mut pw = F128::ONE;
+    for a in alphas.iter_mut() {
+        pw = pw * alpha;
+        *a = pw;
+    }
+    let m: [F128; STATE_SIZE] = std::array::from_fn(|j| {
+        let mut acc = F128::ZERO;
+        for e in 0..STATE_SIZE {
+            acc += alphas[e] * flat(noid_poseidon2b::native::permutation::MDS_FULL[e][j]);
+        }
+        acc
+    });
+    let mut terms = Vec::new();
+    for j in 0..STATE_SIZE {
+        terms.push(RelationTerm {
+            coeff: m[j],
+            factors: vec![ColRef::CommittedShift(sets[0].c[j])],
+        });
+    }
+    for refs in sets {
+        for j in 0..STATE_SIZE {
+            terms.push(RelationTerm {
+                coeff: m[j],
+                factors: vec![ColRef::Fixed(refs.start), ColRef::CommittedShift(refs.c[j])],
+            });
+            if j < 2 {
+                terms.push(RelationTerm {
+                    coeff: m[j],
+                    factors: vec![ColRef::Fixed(refs.abs[j]), ColRef::Committed(refs.a[j])],
+                });
+            }
+            terms.push(RelationTerm {
+                coeff: m[j],
+                factors: vec![ColRef::Fixed(refs.consts[j])],
+            });
+        }
+    }
+    terms
+}
+
+/// The union's substitution terms: single-set unions keep the original
+/// [`duplex_substitution_terms`] wiring byte-for-byte; recording-bearing
+/// unions use the multi-set form.
+fn duplex_union_sub_terms(u: &DuplexUnion, alpha: F128) -> Vec<RelationTerm> {
+    if u.rec_refs.is_empty() {
+        duplex_substitution_terms(&u.refs, alpha)
+    } else {
+        let mut sets = vec![u.refs];
+        sets.extend(u.rec_refs.iter().copied());
+        duplex_substitution_terms_multi(&sets, alpha)
     }
 }
 
@@ -3554,7 +3854,7 @@ fn run_duplex_union_native(u: &DuplexUnion, domain: &[u8]) -> DuplexUnionNative 
 
     let alpha = ch_p.sample_f128();
     assert_eq!(alpha, ch_v.sample_f128());
-    let sub_terms = duplex_substitution_terms(refs, alpha);
+    let sub_terms = duplex_union_sub_terms(u, alpha);
     let mut target = F128::ZERO;
     let mut p = F128::ONE;
     for e in 0..STATE_SIZE {
@@ -3622,20 +3922,57 @@ fn duplex_sub_terms_trace(
     (terms, ap)
 }
 
+/// Trace twin of [`duplex_substitution_terms_multi`] (same term order).
+fn duplex_sub_terms_trace_multi(
+    b: &mut FieldR1csBuilder,
+    sets: &[DuplexFamilyRefs],
+    alpha: &LinExpr,
+) -> (Vec<RelationTermTrace>, Vec<LinExpr>) {
+    let (m, ap) = mds_alpha_weights(b, alpha);
+    let mut terms = Vec::new();
+    for j in 0..STATE_SIZE {
+        terms.push(RelationTermTrace {
+            coeff: m[j].clone(),
+            factors: vec![ColRef::CommittedShift(sets[0].c[j])],
+        });
+    }
+    for refs in sets {
+        for j in 0..STATE_SIZE {
+            terms.push(RelationTermTrace {
+                coeff: m[j].clone(),
+                factors: vec![ColRef::Fixed(refs.start), ColRef::CommittedShift(refs.c[j])],
+            });
+            if j < 2 {
+                terms.push(RelationTermTrace {
+                    coeff: m[j].clone(),
+                    factors: vec![ColRef::Fixed(refs.abs[j]), ColRef::Committed(refs.a[j])],
+                });
+            }
+            terms.push(RelationTermTrace {
+                coeff: m[j].clone(),
+                factors: vec![ColRef::Fixed(refs.consts[j])],
+            });
+        }
+    }
+    (terms, ap)
+}
+
 /// Discharge the shared channel union in-trace (mirror of `discharge_leaf_union`
 /// for the duplex family). Column claims are offset by `base` in the caller's
 /// global slice table. Returns the pending terminal claims on the A/C columns.
+/// The caller supplies the discharge transcript channel: an inline
+/// [`FsChannelTrace`] (walk C itself — a walk cannot host its own transcript),
+/// or an [`FsChannelUnionRecorder`] whose recording rides another union.
 fn discharge_duplex_union(
     b: &mut FieldR1csBuilder,
+    mut ch: &mut impl FsChannelOps,
     u: &DuplexUnion,
-    domain: &[u8],
     native: &DuplexUnionNative,
     base: usize,
 ) -> Vec<Claim> {
     let refs = &u.refs;
     let fixed = &u.fixed;
     let w_log = u.w_log;
-    let mut ch = FsChannelTrace::new(b, domain);
     let mut out: Vec<Claim> = Vec::new();
     let np = &native.pending;
     let mut np_cursor = 0usize;
@@ -3679,8 +4016,14 @@ fn discharge_duplex_union(
     let terminal = verify_deep_chain_walk_trace(b, &mut ch, w_log, &groups_e, &walk_e);
 
     let alpha = ch.sample_f128(b);
-    let sub_native = duplex_substitution_terms(refs, F128::ONE);
-    let (sub_e_terms, ap) = duplex_sub_terms_trace(b, refs, &alpha);
+    let sub_native = duplex_union_sub_terms(u, F128::ONE);
+    let (sub_e_terms, ap) = if u.rec_refs.is_empty() {
+        duplex_sub_terms_trace(b, refs, &alpha)
+    } else {
+        let mut sets = vec![*refs];
+        sets.extend(u.rec_refs.iter().copied());
+        duplex_sub_terms_trace_multi(b, &sets, &alpha)
+    };
     let mut target = LinExpr::zero();
     for e in 0..STATE_SIZE {
         target = target.add(&mul(b, &ap[e], &terminal.values[e]));
@@ -4015,7 +4358,20 @@ fn build_combined_duplex_union(subs: &[SubChannel], data: &[Vec<Vec<F128>>]) -> 
     let fixed = combined_duplex_fixed_patterns(&subs_padded, s_log);
     let layout = combined_duplex_layout(&subs_padded, s_log);
     let refs = duplex_family_refs(0, 0);
-    DuplexUnion { committed, s0, s_out, fixed, refs, layout, w_log, block_log, challenges }
+    DuplexUnion {
+        committed,
+        s0,
+        s_out,
+        fixed,
+        refs,
+        layout,
+        w_log,
+        block_log,
+        challenges,
+        rec_blocks: Vec::new(),
+        rec_refs: Vec::new(),
+        rec_challenges: Vec::new(),
+    }
 }
 
 #[cfg(test)]
@@ -4073,7 +4429,8 @@ mod stage1_duplex_union_tests {
         for col in u.committed.iter() {
             alloc_column_slice(&mut b, col, u.w_log);
         }
-        let mut claims = discharge_duplex_union(&mut b, &u, b"duplex-union-unit", &native, 0);
+        let mut ch = FsChannelTrace::new(&mut b, b"duplex-union-unit");
+        let mut claims = discharge_duplex_union(&mut b, &mut ch, &u, &native, 0);
         let ch0 = read_duplex_challenges(&mut b, &u, 0, 0, &mut claims);
         let ch1 = read_duplex_challenges(&mut b, &u, 1, 0, &mut claims);
         let (r1cs, z) = b.build();
@@ -4085,6 +4442,168 @@ mod stage1_duplex_union_tests {
             assert_eq!(w.eval(&z), u.challenges[1][k], "tx1 challenge wire");
         }
         assert!(!claims.is_empty());
+    }
+
+    /// TWO-REGION union: region 1 tiles K=2 channel blocks, region 2 hosts two
+    /// RECORDED LANECHAL transcripts of different sizes (descending-size dyadic
+    /// packing, per-set gated patterns). Honest: satisfiable, every opening
+    /// claim true against the committed columns natively, claim count equal to
+    /// the single-region discharge (recordings add pins, not claims), and the
+    /// build's recording challenges equal the recorder's. Negatives: corrupting
+    /// a recording's absorbed-data stream (fed to the union build) breaks the
+    /// data-cell pins — the twin's proof wires no longer match the walk-proven
+    /// chain — and corrupting an early lane also drags every downstream
+    /// challenge pin along; both must be unsatisfiable.
+    #[test]
+    fn duplex_union_two_region_recording_binding() {
+        use noid_ivc_core::lincheck::build_eq_table;
+
+        let layout = compile_duplex(&channel_ops());
+        let data: Vec<Vec<F128>> =
+            (0..2).map(|t| tx_data(&layout, 0xBEEF_0000 + t as u64)).collect();
+
+        // Two synthetic recorded transcripts of DIFFERENT lengths (the second
+        // exercises `sample_f128_vec` and lands in a smaller dyadic block).
+        let record =
+            |b: &mut FieldR1csBuilder, domain: &[u8], n_wires: usize, vec_draw: bool| {
+                let wires: Vec<LinExpr> = (0..n_wires)
+                    .map(|i| {
+                        let v = F128 { lo: 0x1111 * (i as u64 + 1), hi: 0x77 ^ i as u64 };
+                        LinExpr::from_wire(b.alloc_f128(v))
+                    })
+                    .collect();
+                let mut rec = FsChannelUnionRecorder::new(domain);
+                rec.observe_label(b, b"two-region-unit");
+                rec.observe_f128_slice(b, &wires);
+                let _c1 = rec.sample_f128(b);
+                rec.observe_f128(b, &wires[0]);
+                if vec_draw {
+                    let _cv = rec.sample_f128_vec(b, 3);
+                }
+                rec.observe_f128_slice(b, &wires[..n_wires / 2]);
+                let _c2 = rec.sample_f128(b);
+                // Trailing absorbs AFTER the last squeeze: corrupting these
+                // lanes breaks ONLY their data pins (no downstream
+                // challenge). The tail deliberately ends at ODD lane parity
+                // (2-lane observe + 3-lane slice = 5 lanes): the last data
+                // lane sits alone in a trailing partial-absorb slot, which
+                // `compile_duplex` must flush — the real walk discharges end
+                // this way, and an unflushed lane would be unpinnable.
+                rec.observe_f128(b, &wires[1]);
+                rec.observe_f128_slice(b, &wires[..2]);
+                rec.finish()
+            };
+
+        let run = |corrupt: Option<(usize, usize)>| -> bool {
+            let mut b = FieldR1csBuilder::new();
+            let rec_a = record(&mut b, b"two-region-rec-a", 24, false);
+            let rec_b = record(&mut b, b"two-region-rec-b", 6, true);
+            let recs = [&rec_a, &rec_b];
+            let mut rec_data: Vec<Vec<F128>> =
+                recs.iter().map(|r| r.data_flat.clone()).collect();
+            if let Some((r, lane)) = corrupt {
+                rec_data[r][lane] += F128::ONE;
+            }
+            let rec_iv = FsChannelUnionRecorder::capacity_iv_flat();
+            let rec_specs: Vec<RecordingSpec> = recs
+                .iter()
+                .zip(rec_data.iter())
+                .map(|(rc, d)| RecordingSpec {
+                    layout: compile_duplex(&rc.ops),
+                    iv_flat: rec_iv,
+                    data: d,
+                })
+                .collect();
+            let u = build_duplex_union_with_recordings(&layout, iv_flat(), &data, &rec_specs);
+            let native = run_duplex_union_native(&u, b"two-region-unit");
+
+            let slices: Vec<WitnessSlice> = u
+                .committed
+                .iter()
+                .map(|c| alloc_column_slice(&mut b, c, u.w_log).0)
+                .collect();
+            let mut ch = FsChannelTrace::new(&mut b, b"two-region-unit");
+            let claims = discharge_duplex_union(&mut b, &mut ch, &u, &native, 0);
+            // Region-1 challenge pins (the per-tx algebra path) + the
+            // recording pins (the plural's region-2 discipline).
+            let per_tx = 1usize << u.block_log;
+            for tx in 0..2 {
+                for (kk, &(slot, lane)) in u.layout.challenges.iter().enumerate() {
+                    let w = LinExpr::from_wire(b.alloc_f128(u.challenges[tx][kk]));
+                    pin_eq(&mut b, &w, &slot_cell(&slices[u.refs.c[lane]], tx * per_tx + slot));
+                }
+            }
+            for (r, rc) in recs.iter().enumerate() {
+                let (rec_layout, off) = &u.rec_blocks[r];
+                assert_eq!(rc.challenge_wires.len(), rec_layout.challenges.len());
+                assert_eq!(rc.data_wires.len(), rec_layout.n_data);
+                for (kk, &(slot, lane)) in rec_layout.challenges.iter().enumerate() {
+                    pin_eq(
+                        &mut b,
+                        &rc.challenge_wires[kk],
+                        &slot_cell(&slices[u.refs.c[lane]], off + slot),
+                    );
+                }
+                for (kk, &(slot, lane)) in duplex_data_positions(rec_layout).iter().enumerate() {
+                    pin_eq(
+                        &mut b,
+                        &rc.data_wires[kk],
+                        &slot_cell(&slices[u.refs.a[lane]], off + slot),
+                    );
+                }
+            }
+
+            if corrupt.is_none() {
+                // Structure: dyadic packing puts the LARGER recording first
+                // and both blocks after region 1; claim count matches the
+                // single-region discharge (flatness — recordings are pins).
+                let (la, oa) = &u.rec_blocks[0];
+                let (lb, ob) = &u.rec_blocks[1];
+                let sz = |l: &DuplexLayout| l.slots.len().next_power_of_two();
+                assert!(sz(la) >= sz(lb), "recording sizes");
+                assert!(*oa >= 2 * per_tx && *ob == oa + sz(la), "descending packing");
+                let u1 = build_duplex_union(&layout, iv_flat(), &data);
+                let n1 = run_duplex_union_native(&u1, b"two-region-unit");
+                let mut b1 = FieldR1csBuilder::new();
+                for col in u1.committed.iter() {
+                    alloc_column_slice(&mut b1, col, u1.w_log);
+                }
+                let mut ch1 = FsChannelTrace::new(&mut b1, b"two-region-unit");
+                let c1 = discharge_duplex_union(&mut b1, &mut ch1, &u1, &n1, 0);
+                assert_eq!(claims.len(), c1.len(), "recording-bearing union claim flatness");
+                // Recorder challenges match the union build's chain.
+                for (r, rc) in recs.iter().enumerate() {
+                    assert_eq!(
+                        u.rec_challenges[r].len(),
+                        rc.challenge_wires.len(),
+                        "recording {r} challenge stream"
+                    );
+                }
+                // Every opening claim is true against the committed columns.
+                for c in &claims {
+                    let eq = build_eq_table(&c.native_point);
+                    let mut acc = F128::ZERO;
+                    for (v, e) in u.committed[c.slice].iter().zip(eq.iter()) {
+                        acc += *v * *e;
+                    }
+                    assert_eq!(acc, c.native_value, "claim false on column {}", c.slice);
+                }
+            }
+            let (r1cs, z) = b.build();
+            r1cs.satisfies(&z)
+        };
+
+        assert!(run(None), "honest two-region union unsatisfiable");
+        // rec_a data lanes: 24 (slice) + 1 + 12 (slice) + 1 + 2 (tail) = 40;
+        // lane 39 is the odd trailing lane living in the flushed partial slot.
+        assert!(
+            !run(Some((0, 39))),
+            "corrupted trailing recording data slipped through the data pin"
+        );
+        assert!(
+            !run(Some((1, 0))),
+            "corrupted early lane slipped through the challenge/data pins"
+        );
     }
 
     /// The channel union discharged through the REAL outer PCS: the 6 committed
@@ -4115,7 +4634,8 @@ mod stage1_duplex_union_tests {
         let mut b = FieldR1csBuilder::new();
         let slices: Vec<WitnessSlice> =
             u.committed.iter().map(|c| alloc_column_slice(&mut b, c, w_log).0).collect();
-        let mut claims = discharge_duplex_union(&mut b, &u, b"duplex-union-slot", &native, 0);
+        let mut ch = FsChannelTrace::new(&mut b, b"duplex-union-slot");
+        let mut claims = discharge_duplex_union(&mut b, &mut ch, &u, &native, 0);
         for t in 0..k {
             let _ = read_duplex_challenges(&mut b, &u, t, 0, &mut claims);
         }
@@ -4232,7 +4752,8 @@ mod stage1_duplex_union_tests {
             u.committed.iter().map(|c| alloc_column_slice(&mut b, c, w_log).0).collect();
         // Discharge ONLY the walk (selection -> walk -> substitution -> shifts).
         // NO per-cell challenge reads: the Stage-2 pattern raw-reads instead.
-        let claims = discharge_duplex_union(&mut b, &u, b"duplex-raw-read", &native, 0);
+        let mut ch = FsChannelTrace::new(&mut b, b"duplex-raw-read");
+        let claims = discharge_duplex_union(&mut b, &mut ch, &u, &native, 0);
 
         // RAW-READ tx 0's first squeezed challenge straight out of its carry cell
         // (no fresh wire, no per-cell claim): the cell wire IS the challenge.
@@ -4613,7 +5134,8 @@ mod combined_duplex_union_tests {
         let mut b = FieldR1csBuilder::new();
         let slices: Vec<WitnessSlice> =
             u.committed.iter().map(|c| alloc_column_slice(&mut b, c, w_log).0).collect();
-        let mut claims = discharge_duplex_union(&mut b, &u, DOM, &native, 0);
+        let mut ch = FsChannelTrace::new(&mut b, DOM);
+        let mut claims = discharge_duplex_union(&mut b, &mut ch, &u, &native, 0);
         for t in 0..k {
             let _ = read_duplex_challenges(&mut b, &u, t, 0, &mut claims);
         }
@@ -4744,7 +5266,8 @@ mod combined_duplex_union_tests {
             for c in u.committed.iter() {
                 alloc_column_slice(&mut b, c, u.w_log);
             }
-            let mut claims = discharge_duplex_union(&mut b, &u, b"combined-flat", &native, 0);
+            let mut ch = FsChannelTrace::new(&mut b, b"combined-flat");
+        let mut claims = discharge_duplex_union(&mut b, &mut ch, &u, &native, 0);
             for t in 0..k {
                 let _ = read_duplex_challenges(&mut b, &u, t, 0, &mut claims);
             }
@@ -4845,7 +5368,7 @@ mod owner_auth_region_tests {
             .collect();
         let input_ts: Vec<OwnerAuthPublicInputsTrace> =
             publics.iter().map(|pubx| OwnerAuthPublicInputsTrace::alloc(b, pubx)).collect();
-        let (_obligations, claims) =
+        let (_obligations, claims, _recording) =
             discharge_owner_auth_killshots_via_region(b, &proof_ts, &input_ts, proofs, publics);
         assert!(!claims.is_empty(), "region discharge produced no opening claims");
 
@@ -4899,7 +5422,7 @@ mod owner_auth_region_tests {
         // Region obligation on freshly-allocated trace proof/inputs.
         let inputs_t = OwnerAuthPublicInputsTrace::alloc(&mut b, &public);
         let proof_t = OwnerAuthProofTrace::alloc(&mut b, &proof, public.layout);
-        let (obligations_region, claims) = discharge_owner_auth_killshots_via_region(
+        let (obligations_region, claims, _recording) = discharge_owner_auth_killshots_via_region(
             &mut b,
             std::slice::from_ref(&proof_t),
             std::slice::from_ref(&inputs_t),
