@@ -10,6 +10,8 @@
 //! and final-evaluation wires, and the outgoing plain claim
 //! `M̂~(ρ ‖ σ) = final` is returned for the caller's IO exposure.
 
+use noid_ivc_core::field_circuit::FsChannelOps;
+#[cfg(test)]
 use noid_ivc_core::field_circuit::FsChannelTrace;
 use noid_ivc_core::matrix_claim::MatrixFoldProof;
 
@@ -115,7 +117,7 @@ fn small_mle_eval_trace(
 
 fn compressed_deg2_round(
     b: &mut FieldR1csBuilder,
-    ch: &mut FsChannelTrace,
+    ch: &mut impl FsChannelOps,
     claim: &LinExpr,
     wire: &[LinExpr; 2],
 ) -> (LinExpr, LinExpr) {
@@ -133,7 +135,7 @@ fn compressed_deg2_round(
 #[allow(clippy::too_many_arguments)]
 pub fn verify_matrix_claim_fold_trace(
     b: &mut FieldR1csBuilder,
-    ch: &mut FsChannelTrace,
+    ch: &mut impl FsChannelOps,
     k_log: usize,
     k_skip: usize,
     fresh: &FreshLincheckClaimTrace,

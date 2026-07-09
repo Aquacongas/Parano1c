@@ -24,7 +24,7 @@
 //! images — do not mix the two conventions.)
 
 use noid_ivc_core::field::PHI_8_TABLE;
-use noid_ivc_core::field_circuit::{f128_from_u128, FsChannelTrace};
+use noid_ivc_core::field_circuit::{f128_from_u128, FsChannelOps};
 use noid_ivc_core::field_r1cs::FieldR1cs;
 use noid_ivc_core::merkle::{self, Hash};
 use noid_ivc_core::ntt::AdditiveNttF128;
@@ -210,7 +210,7 @@ pub fn merkle_hash_leaf_lanes_trace(
 /// [`FlatDigestExpr`]'s lane convention — pinned by test.
 pub fn observe_flat_digest(
     b: &mut FieldR1csBuilder,
-    ch: &mut noid_ivc_core::field_circuit::FsChannelTrace,
+    ch: &mut impl FsChannelOps,
     d: &FlatDigestExpr,
 ) {
     ch.observe_lanes(b, 32, &[d[0].clone(), d[1].clone()]);
@@ -226,7 +226,7 @@ pub fn observe_flat_digest(
 /// byte observes; the commitment root is proof data (witness lanes).
 pub fn bind_statement_field_trace(
     b: &mut FieldR1csBuilder,
-    ch: &mut FsChannelTrace,
+    ch: &mut impl FsChannelOps,
     r1cs: &FieldR1cs,
     pcs_params: &PcsParams,
     root: &FlatDigestExpr,
@@ -246,7 +246,7 @@ pub fn bind_statement_field_trace(
 /// parameters stay a class constant.
 pub fn bind_statement_field_parts_trace(
     b: &mut FieldR1csBuilder,
-    ch: &mut FsChannelTrace,
+    ch: &mut impl FsChannelOps,
     statement_digest: &FlatDigestExpr,
     pcs_params: &PcsParams,
     root: &FlatDigestExpr,
@@ -438,7 +438,7 @@ pub struct ZerocheckClaimTrace {
 /// `SumcheckFinalFailed`) become pins.
 pub fn zerocheck_field_verify_trace(
     b: &mut FieldR1csBuilder,
-    ch: &mut FsChannelTrace,
+    ch: &mut impl FsChannelOps,
     log_n: usize,
     proof: &ZerocheckProofTrace,
 ) -> ZerocheckClaimTrace {
@@ -698,7 +698,7 @@ fn lincheck_final_sum_trace(
 #[allow(clippy::too_many_arguments)]
 pub fn lincheck_verify_trace(
     b: &mut FieldR1csBuilder,
-    ch: &mut FsChannelTrace,
+    ch: &mut impl FsChannelOps,
     r1cs: &FieldR1cs,
     m: usize,
     x_ab: &QuirkyPointTrace,
@@ -795,7 +795,7 @@ pub fn lincheck_verify_trace(
 #[allow(clippy::too_many_arguments)]
 pub fn lincheck_verify_trace_deferred(
     b: &mut FieldR1csBuilder,
-    ch: &mut FsChannelTrace,
+    ch: &mut impl FsChannelOps,
     k_log: usize,
     k_skip: usize,
     const_pin: Option<usize>,
@@ -1255,7 +1255,7 @@ fn verify_merkle_path_trace(
 /// gate: those bits are verifier-internal witness, not proof wires).
 pub fn basefold_verify_trace(
     b: &mut FieldR1csBuilder,
-    ch: &mut FsChannelTrace,
+    ch: &mut impl FsChannelOps,
     target: &LinExpr,
     proof: &BaseFoldProofTrace,
     initial_codeword_root: &FlatDigestExpr,
@@ -1333,7 +1333,7 @@ pub fn basefold_verify_trace(
     // squeeze. Every position bit becomes a transcript-bound witness
     // boolean; the whole per-query replay below is driven by those bits,
     // so its structure is a pure function of the shape.
-    ch.verify_pow_trace(b, &proof.pow_nonce, pcs::QUERY_GRIND_BITS);
+    ch.verify_pow(b, &proof.pow_nonce, pcs::QUERY_GRIND_BITS);
     let n_queries = proof.queries.len();
     let per_lane = 128 / k_code;
     let lanes = ch.sample_f128_vec(b, n_queries.div_ceil(per_lane));
@@ -1496,7 +1496,7 @@ pub struct QuirkyDirectClaimTrace {
 /// pinned against the proof's `final_b`.
 pub fn verify_opening_batch_quirky_direct_trace(
     b: &mut FieldR1csBuilder,
-    ch: &mut FsChannelTrace,
+    ch: &mut impl FsChannelOps,
     commitment_root: &FlatDigestExpr,
     claims: &[QuirkyDirectClaimTrace],
     proof: &BaseFoldProofTrace,
@@ -1601,7 +1601,7 @@ impl FieldR1csProofTrace {
 /// pins them to whatever carries the verified proof's public values).
 pub fn bind_public_io_trace(
     b: &mut FieldR1csBuilder,
-    ch: &mut FsChannelTrace,
+    ch: &mut impl FsChannelOps,
     spec: &noid_ivc_core::public_io::PublicIoSpec,
     io: &[LinExpr],
     total_vars: usize,
@@ -1657,7 +1657,7 @@ pub fn bind_public_io_trace(
 /// the two z-claims for the caller's public-input chaining.
 pub fn verify_field_trace(
     b: &mut FieldR1csBuilder,
-    ch: &mut FsChannelTrace,
+    ch: &mut impl FsChannelOps,
     r1cs: &FieldR1cs,
     pcs_params: &PcsParams,
     commitment_root: &FlatDigestExpr,
@@ -1672,7 +1672,7 @@ pub fn verify_field_trace(
 /// protocol constant.
 pub fn verify_field_trace_with_public_io(
     b: &mut FieldR1csBuilder,
-    ch: &mut FsChannelTrace,
+    ch: &mut impl FsChannelOps,
     r1cs: &FieldR1cs,
     pcs_params: &PcsParams,
     commitment_root: &FlatDigestExpr,
@@ -1700,7 +1700,7 @@ pub fn verify_field_trace_with_public_io(
 #[allow(clippy::too_many_arguments)]
 pub fn verify_field_trace_deferred(
     b: &mut FieldR1csBuilder,
-    ch: &mut FsChannelTrace,
+    ch: &mut impl FsChannelOps,
     shape: &noid_ivc_core::proof::FieldShape,
     pcs_params: &PcsParams,
     statement_digest: &FlatDigestExpr,
@@ -1795,7 +1795,7 @@ pub fn verify_field_trace_deferred(
 
 fn verify_field_trace_inner(
     b: &mut FieldR1csBuilder,
-    ch: &mut FsChannelTrace,
+    ch: &mut impl FsChannelOps,
     r1cs: &FieldR1cs,
     pcs_params: &PcsParams,
     commitment_root: &FlatDigestExpr,

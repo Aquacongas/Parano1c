@@ -446,10 +446,6 @@ pub const FS_OP_POW: u8 = 0x06;
 pub const FS_KIND_SCALAR: u8 = 0x01;
 pub const FS_KIND_SLICE: u8 = 0x02;
 
-/// PoW domain for the lane challenger's grind permutation.
-const TAG_FS_POW_LANE: noid_poseidon2b::native::DomainTag =
-    noid_poseidon2b::native::DomainTag::new(b"FSPOWLNE");
-
 #[inline]
 fn f128_of_u128(v: u128) -> F128 {
     F128 {
@@ -507,15 +503,6 @@ pub fn fs_lane_iv_flat() -> [F128; 2] {
 /// replay ([`crate::field_circuit::RawChannelTrace`]).
 pub fn ks_channel_iv_flat() -> [F128; 2] {
     capacity_iv_flat_lanes(noid_poseidon2b::native::TAG_KSCHANNL)
-}
-
-/// PoW capacity IV (`FSPOWLNE`) lanes in the flat basis.
-pub fn fs_pow_iv_flat() -> [F128; 2] {
-    let [hi, lo] = capacity_iv(TAG_FS_POW_LANE);
-    [
-        f128_of_u128(noid_core::hardware::tower_to_flat_u128(hi.0)),
-        f128_of_u128(noid_core::hardware::tower_to_flat_u128(lo.0)),
-    ]
 }
 
 /// The sponge pad block (`0x80 … 0x01` over one lane) in the flat basis.
@@ -605,17 +592,41 @@ impl FsLaneChallenger {
         out
     }
 
-    /// PoW predicate: one permutation over `[d0 + nonce, d1, POW_IV]`; the
-    /// output lane's top `bits` bits must be zero.
-    fn pow_ok(d0: F128, d1: F128, nonce: u64, bits: u32) -> bool {
+    /// PoW predicate under the GRIND-BY-SQUEEZE rule: absorb the
+    /// `[FS_OP_POW header, nonce]` pair with the ORDINARY lane discipline
+    /// (a buffered lane pairs with the header), then run `sample_f128`
+    /// (squeeze header absorb + pad flush) and require the squeezed lane's
+    /// top `bits` flat bits to be zero. The pow rides the TRANSCRIPT
+    /// sponge itself — no separate PoW instance, no flush, no
+    /// mid-transcript state peek — so it is expressible entirely in
+    /// transcript ops: the in-trace mirror is an observe + sample + bit
+    /// pin, and a walk-C recording carries it as plain schedule lanes.
+    /// Two to three permutations per trial.
+    fn pow_ok(state: &[F128; 4], buffered: Option<F128>, nonce: u64, bits: u32) -> bool {
         debug_assert!(bits <= 64);
-        if bits == 0 {
-            return true;
+        let mut s = *state;
+        let mut buf = buffered;
+        let lanes = [
+            fs_op_lane(FS_OP_POW, 0, bits as u64),
+            F128 { lo: nonce, hi: 0 },
+            fs_op_lane(FS_OP_SQUEEZE, FS_KIND_SCALAR, 0),
+        ];
+        for lane in lanes {
+            if let Some(first) = buf.take() {
+                s[0] += first;
+                s[1] += lane;
+                permute_flat(&mut s);
+            } else {
+                buf = Some(lane);
+            }
         }
-        let [iv0, iv1] = fs_pow_iv_flat();
-        let mut state = [d0 + F128 { lo: nonce, hi: 0 }, d1, iv0, iv1];
-        permute_flat(&mut state);
-        (state[0].hi >> (64 - bits)) == 0
+        // squeeze_lane: pad-flush the odd lane, read lane 0.
+        if let Some(first) = buf.take() {
+            s[0] += first;
+            s[1] += fs_pad_lane_flat();
+            permute_flat(&mut s);
+        }
+        bits == 0 || (s[0].hi >> (64 - bits)) == 0
     }
 }
 
@@ -661,8 +672,8 @@ impl Challenger for FsLaneChallenger {
     }
 
     fn grind_pow(&mut self, bits: u32) -> u64 {
-        self.flush();
-        let (d0, d1) = (self.state[0], self.state[1]);
+        let snapshot = self.state;
+        let buffered = self.buffered;
         // Same parallel-dispatch policy and determinism argument as
         // `FsChallenger::grind_pow`: block-parallel `find_first` returns the
         // globally smallest satisfying nonce, identical to the sequential
@@ -673,7 +684,7 @@ impl Challenger for FsLaneChallenger {
         } else if (1u64 << bits.min(63)) < PARALLEL_GRIND_MIN_HASHES {
             let mut n = 0u64;
             loop {
-                if Self::pow_ok(d0, d1, n, bits) {
+                if Self::pow_ok(&snapshot, buffered, n, bits) {
                     break n;
                 }
                 n = n.wrapping_add(1);
@@ -685,30 +696,33 @@ impl Challenger for FsLaneChallenger {
             loop {
                 if let Some(n) = (start..start.saturating_add(block))
                     .into_par_iter()
-                    .find_first(|&n| Self::pow_ok(d0, d1, n, bits))
+                    .find_first(|&n| Self::pow_ok(&snapshot, buffered, n, bits))
                 {
                     break n;
                 }
                 start = start.saturating_add(block);
             }
         };
+        // Replay the winning trial on the live transcript: absorb the pow
+        // header + nonce, then the scalar squeeze whose output carried the
+        // zeros. Subsequent challenges bind to the nonce through it.
         self.absorb_lane(fs_op_lane(FS_OP_POW, 0, bits as u64));
         self.absorb_lane(F128 { lo: nonce, hi: 0 });
+        let _pt = self.sample_f128();
         nonce
     }
 
     fn verify_pow(&mut self, nonce: u64, bits: u32) -> bool {
-        self.flush();
-        let ok = if bits == 0 {
+        self.absorb_lane(fs_op_lane(FS_OP_POW, 0, bits as u64));
+        self.absorb_lane(F128 { lo: nonce, hi: 0 });
+        let pt = self.sample_f128();
+        if bits == 0 {
             // Canonical zero nonce at zero-bit sites (same non-malleability
             // rule as FsChallenger).
             nonce == 0
         } else {
-            Self::pow_ok(self.state[0], self.state[1], nonce, bits)
-        };
-        self.absorb_lane(fs_op_lane(FS_OP_POW, 0, bits as u64));
-        self.absorb_lane(F128 { lo: nonce, hi: 0 });
-        ok
+            (pt.hi >> (64 - bits)) == 0
+        }
     }
 }
 

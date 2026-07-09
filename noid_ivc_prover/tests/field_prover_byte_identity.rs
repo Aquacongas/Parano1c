@@ -37,11 +37,13 @@ fn field_proof_byte_digest() {
         all.extend_from_slice(&digest);
     }
     let top = noid_poseidon2b::native::poseidon2b_hash_byte_slices(b"BYTE-IDENTITY-TOP", &[&all]);
-    // Pinned digest, identical on the pre-change (CSC-fold) prover.
+    // Pinned digest. Re-pinned 2026-07-09 for the grind-by-squeeze pow rule
+    // (the transcript-protocol change is deliberate; the pin still catches
+    // ACCIDENTAL transcript perturbations such as a non-identical fold).
     assert_eq!(
         hex(&top),
-        "d820e54279bb8c61436620c89443bf35ac7db181d8896added181d004f371448",
-        "proof bytes changed — the row-major fold must be value-identical to the CSC fold"
+        "9655b9e0c2052777809d96c01af2cc4dba5a8d6dd9ab4d0e2a97b3b90a4d3021",
+        "proof bytes changed — the transcript must be byte-stable"
     );
 }
 

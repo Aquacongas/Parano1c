@@ -33,13 +33,13 @@
 //! - [`FsChannelTrace`] — 360 per sponge permutation; the op schedule is the
 //!   [`crate::challenger::FsLaneChallenger`] lane protocol, one lane-affine
 //!   absorb per element, no byte splitting.
-//! - [`FsChannelTrace::verify_pow_trace`] — 360 + (128 − bits) boolean wires
-//!   + 1 pin.
+//! - [`FsChannelTrace::verify_pow_trace`] — grind-by-squeeze: 2 transcript
+//!   permutations (absorb pair + squeeze flush) + (128 − bits) boolean
+//!   wires + 1 pin.
 
 use crate::challenger::{
     FS_KIND_SCALAR, FS_KIND_SLICE, FS_OP_BYTES, FS_OP_DOMAIN, FS_OP_LABEL, FS_OP_OBSERVE,
     FS_OP_POW, FS_OP_SQUEEZE, fs_lane_iv_flat, fs_op_lane, fs_pack_bytes_lanes, fs_pad_lane_flat,
-    fs_pow_iv_flat,
 };
 use crate::field::F128;
 use crate::field_r1cs::{FieldR1cs, SparseFieldMatrix};
@@ -760,11 +760,13 @@ impl FsChannelTrace {
         (0..n).map(|_| self.squeeze_lane(b)).collect()
     }
 
-    /// In-trace mirror of `FsLaneChallenger::verify_pow`: peek the flushed
-    /// state, run one PoW permutation over `[d0 + nonce, d1, POW_IV]`, prove
-    /// the output lane has `bits` leading zeros (via a `128 − bits`-bit
-    /// decomposition — the missing top wires force the zeros), then absorb
-    /// the nonce. The nonce enters as an expression (witness).
+    /// In-trace mirror of `FsLaneChallenger::verify_pow` (GRIND-BY-SQUEEZE):
+    /// absorb the `[FS_OP_POW header, nonce]` pair with the ordinary lane
+    /// discipline, sample one scalar challenge and prove its top `bits`
+    /// flat bits are zero (via a `128 − bits`-bit decomposition — the
+    /// missing top wires force the zeros). The pow rides the transcript
+    /// sponge itself — no separate PoW instance, no state peek — so a
+    /// union recording carries it as plain schedule lanes.
     pub fn verify_pow_trace(
         &mut self,
         b: &mut FieldR1csBuilder,
@@ -772,32 +774,20 @@ impl FsChannelTrace {
         bits: u32,
     ) {
         assert!(bits <= 64, "leading-zero window limited to the top limb");
-        self.flush(b);
-        // Non-advancing peek of the two rate lanes.
-        let d0 = self.state[0].clone();
-        let d1 = self.state[1].clone();
-        let [pow_iv0, pow_iv1] = fs_pow_iv_flat();
-        let pow_state = [
-            d0.add(nonce),
-            d1,
-            LinExpr::constant(pow_iv0),
-            LinExpr::constant(pow_iv1),
-        ];
-        // NOTE: the PoW permutation is a separate sponge instance — it is
-        // deliberately NOT counted in `perms` (which tracks the transcript
-        // sponge only, so it stays comparable with the native challenger,
-        // whose grind may run many search permutations).
-        let out = poseidon2b_permute(b, pow_state);
-        if bits > 0 {
-            // h must satisfy: top `bits` bits zero ⇔ h = Σ_{i<128−bits} b_i·x^i.
-            b.decompose_bits_le(&out[0], 128 - bits as usize);
-        }
-        // Absorb the nonce (mirror of the native observe).
         self.absorb_lane(
             b,
             LinExpr::constant(fs_op_lane(FS_OP_POW, 0, bits as u64)),
         );
         self.absorb_lane(b, nonce.clone());
+        let pt = self.sample_f128(b);
+        if bits > 0 {
+            // pt must satisfy: top `bits` bits zero ⇔ pt = Σ_{i<128−bits} b_i·x^i.
+            b.decompose_bits_le(&pt, 128 - bits as usize);
+        } else {
+            // Zero-bit site: the canonical nonce is 0 (the native verifier's
+            // non-malleability rule) — a zero-length decomposition pins it.
+            b.decompose_bits_le(nonce, 0);
+        }
     }
 }
 
@@ -819,6 +809,16 @@ pub trait FsChannelOps {
     /// native `sample_f128_vec` discipline (NOT `n` scalar samples, whose
     /// per-sample headers would diverge from the native transcript).
     fn sample_f128_vec(&mut self, b: &mut FieldR1csBuilder, n: usize) -> Vec<LinExpr>;
+    /// Grind-by-squeeze pow mirror: absorb the `[FS_OP_POW header, nonce]`
+    /// pair, sample one scalar challenge and pin its top `bits` flat bits
+    /// to zero (`FsLaneChallenger::verify_pow` lockstep).
+    fn verify_pow(&mut self, b: &mut FieldR1csBuilder, nonce: &LinExpr, bits: u32);
+    /// Constant byte observation (`FsLaneChallenger::observe_bytes` mirror
+    /// for build-time constants: statement digests, baked roots).
+    fn observe_bytes_const(&mut self, b: &mut FieldR1csBuilder, bytes: &[u8]);
+    /// Witness-carried byte observation: packed lanes as expressions plus
+    /// the true byte length for the header.
+    fn observe_lanes(&mut self, b: &mut FieldR1csBuilder, byte_len: u64, lanes: &[LinExpr]);
 }
 
 impl<C: FsChannelOps + ?Sized> FsChannelOps for &mut C {
@@ -837,6 +837,15 @@ impl<C: FsChannelOps + ?Sized> FsChannelOps for &mut C {
     fn sample_f128_vec(&mut self, b: &mut FieldR1csBuilder, n: usize) -> Vec<LinExpr> {
         (**self).sample_f128_vec(b, n)
     }
+    fn verify_pow(&mut self, b: &mut FieldR1csBuilder, nonce: &LinExpr, bits: u32) {
+        (**self).verify_pow(b, nonce, bits);
+    }
+    fn observe_bytes_const(&mut self, b: &mut FieldR1csBuilder, bytes: &[u8]) {
+        (**self).observe_bytes_const(b, bytes);
+    }
+    fn observe_lanes(&mut self, b: &mut FieldR1csBuilder, byte_len: u64, lanes: &[LinExpr]) {
+        (**self).observe_lanes(b, byte_len, lanes);
+    }
 }
 
 impl FsChannelOps for FsChannelTrace {
@@ -854,6 +863,15 @@ impl FsChannelOps for FsChannelTrace {
     }
     fn sample_f128_vec(&mut self, b: &mut FieldR1csBuilder, n: usize) -> Vec<LinExpr> {
         FsChannelTrace::sample_f128_vec(self, b, n)
+    }
+    fn verify_pow(&mut self, b: &mut FieldR1csBuilder, nonce: &LinExpr, bits: u32) {
+        FsChannelTrace::verify_pow_trace(self, b, nonce, bits);
+    }
+    fn observe_bytes_const(&mut self, b: &mut FieldR1csBuilder, bytes: &[u8]) {
+        FsChannelTrace::observe_bytes_const(self, b, bytes);
+    }
+    fn observe_lanes(&mut self, b: &mut FieldR1csBuilder, byte_len: u64, lanes: &[LinExpr]) {
+        FsChannelTrace::observe_lanes(self, b, byte_len, lanes);
     }
 }
 
@@ -1058,6 +1076,42 @@ impl FsChannelOps for FsChannelUnionRecorder {
                 w
             })
             .collect()
+    }
+
+    fn verify_pow(&mut self, b: &mut FieldR1csBuilder, nonce: &LinExpr, bits: u32) {
+        assert!(bits <= 64, "leading-zero window limited to the top limb");
+        self.absorb_const(fs_op_lane(FS_OP_POW, 0, bits as u64));
+        self.absorb_expr(b, nonce);
+        self.absorb_const(fs_op_lane(FS_OP_SQUEEZE, FS_KIND_SCALAR, 0));
+        self.close_absorb();
+        self.ops
+            .push(crate::deep_chain::schedule::TranscriptOp::Squeeze(1));
+        let v = self.squeeze_native();
+        let pt = LinExpr::from_wire(b.alloc_f128(v));
+        self.challenge_wires.push(pt.clone());
+        if bits > 0 {
+            // pt's top `bits` flat bits must be zero (same pin as the inline
+            // twin; the challenge cell binds pt to the recorded transcript).
+            b.decompose_bits_le(&pt, 128 - bits as usize);
+        } else {
+            // Zero-bit site: canonical nonce 0 (non-malleability rule).
+            b.decompose_bits_le(nonce, 0);
+        }
+    }
+
+    fn observe_bytes_const(&mut self, _b: &mut FieldR1csBuilder, bytes: &[u8]) {
+        self.absorb_const(fs_op_lane(FS_OP_BYTES, 0, bytes.len() as u64));
+        for lane in fs_pack_bytes_lanes(bytes) {
+            self.absorb_const(lane);
+        }
+    }
+
+    fn observe_lanes(&mut self, b: &mut FieldR1csBuilder, byte_len: u64, lanes: &[LinExpr]) {
+        assert_eq!(lanes.len() as u64, byte_len.div_ceil(16));
+        self.absorb_const(fs_op_lane(FS_OP_BYTES, 0, byte_len));
+        for lane in lanes {
+            self.absorb_expr(b, lane);
+        }
     }
 }
 
