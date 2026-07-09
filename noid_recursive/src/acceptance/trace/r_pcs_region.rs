@@ -406,21 +406,59 @@ pub fn r_pcs_region_native(proofs: &[RPcsProof<'_>]) -> Vec<(Vec<F128>, F128)> {
     out
 }
 
-/// Discharge BOTH [R]s' PCS obligations on the two link walks: allocate
-/// the committed columns, replay each walk's discharge in-trace, and bind
-/// every obligation (leaf lanes → A cells, leaf digests → L-A digest
-/// cells AND L-B entry cells, direction bits → D cells, recomputed roots
-/// → the FS-observed root wires). Returns the committed-column opening
-/// claims for the caller's public-IO tail — claim order matches
-/// [`r_pcs_region_native`].
-pub(crate) fn discharge_r_pcs_via_region(
+/// Phase 1 of the walk discharge: build the assembly from the native
+/// proofs and ALLOCATE the committed walk columns. The caller runs this
+/// right after its public-IO cells, BEFORE anything class-specific (the
+/// verified envelopes, the replays), so the columns' [`WitnessSlice`]s —
+/// hence the class's opening-claim spec — depend on the two PCS parameter
+/// sets alone and stay IDENTICAL across every link class of a ladder.
+pub(crate) struct RPcsColumns {
+    asm: Assembly,
+    slices_a: Vec<WitnessSlice>,
+    slices_b: Vec<WitnessSlice>,
+}
+
+pub(crate) fn alloc_r_pcs_columns(
     b: &mut FieldR1csBuilder,
     proofs: &[RPcsProof<'_>],
+) -> RPcsColumns {
+    let asm = build_assembly(proofs);
+    let slices_a: Vec<WitnessSlice> = asm
+        .u_a
+        .committed
+        .iter()
+        .map(|c| alloc_column_slice(b, c, asm.u_a.w_log).0)
+        .collect();
+    let slices_b: Vec<WitnessSlice> = asm
+        .cb
+        .iter()
+        .map(|c| alloc_column_slice(b, c, asm.w_log_b).0)
+        .collect();
+    RPcsColumns {
+        asm,
+        slices_a,
+        slices_b,
+    }
+}
+
+/// Phase 2: discharge BOTH [R]s' PCS obligations on the two link walks —
+/// replay each walk's discharge in-trace and bind every obligation (leaf
+/// lanes → A cells, leaf digests → L-A digest cells AND L-B entry cells,
+/// direction bits → D cells, recomputed roots → the FS-observed root
+/// wires). Returns the committed-column opening claims for the caller's
+/// public-IO tail — claim order matches [`r_pcs_region_native`].
+pub(crate) fn discharge_r_pcs_via_region(
+    b: &mut FieldR1csBuilder,
+    cols: RPcsColumns,
     obligations: &[&PcsWalkObligations],
 ) -> Vec<RegionPcsClaim> {
-    assert_eq!(proofs.len(), obligations.len(), "one obligation set per proof");
-    let asm = build_assembly(proofs);
+    let RPcsColumns {
+        asm,
+        slices_a,
+        slices_b,
+    } = cols;
     let n_trees = asm.trees[0].len();
+    assert_eq!(obligations.len(), asm.trees.len(), "one obligation set per proof");
     for (pi, obs) in obligations.iter().enumerate() {
         assert_eq!(
             obs.leaves.len(),
@@ -430,7 +468,7 @@ pub(crate) fn discharge_r_pcs_via_region(
         assert_eq!(obs.paths.len(), obs.leaves.len(), "proof {pi}: path/leaf pairing");
     }
 
-    // ---- Natives (both walks) + column allocation.
+    // ---- Natives (both walks).
     let native_a = run_duplex_union_native(&asm.u_a, DOMAIN_LA);
     let committed_b: Vec<&[F128]> = asm.cb.iter().map(|c| c.as_slice()).collect();
     let c_refs: [usize; STATE_SIZE] = std::array::from_fn(|i| i);
@@ -446,17 +484,6 @@ pub(crate) fn discharge_r_pcs_via_region(
         asm.w_log_b,
         DOMAIN_LB,
     );
-    let slices_a: Vec<WitnessSlice> = asm
-        .u_a
-        .committed
-        .iter()
-        .map(|c| alloc_column_slice(b, c, asm.u_a.w_log).0)
-        .collect();
-    let slices_b: Vec<WitnessSlice> = asm
-        .cb
-        .iter()
-        .map(|c| alloc_column_slice(b, c, asm.w_log_b).0)
-        .collect();
 
     // ---- The two walk discharges (inline transcripts — a walk cannot
     // host its own transcript, and at link scale both are cheap).
@@ -623,7 +650,8 @@ mod tests {
                 commitment_root: flat_digest_lanes(&com1.root),
             },
         ];
-        let claims = discharge_r_pcs_via_region(&mut b, &proofs, &[&obs0, &obs1]);
+        let cols = alloc_r_pcs_columns(&mut b, &proofs);
+        let claims = discharge_r_pcs_via_region(&mut b, cols, &[&obs0, &obs1]);
         assert!(!claims.is_empty(), "walk opening claims present");
         let rows = b.num_wires();
         eprintln!(

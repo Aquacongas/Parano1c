@@ -2819,7 +2819,7 @@ mod tests {
         };
         const MB_LO: usize = 22; // the tier-4 block class shape
         const MB_HI: usize = 23; // the tier-8 block class shape (heterogeneity on purpose)
-        const ML: usize = 24; // the link shape: two [R] replays, pre-diet
+        const ML: usize = 23; // the link shape: two walk-dieted [R] replays
         let rp = RegionDischargeParams { nq: 2 };
 
         // Block 1: 5 std txs (consensus tier 8); block 2: 3 std txs (tier 4).
@@ -2881,15 +2881,29 @@ mod tests {
             },
         ];
         let genesis_acc = units[0].start_accumulator.clone();
-        let l_lo = SplitLinkClass::new(
+        let t0 = Instant::now();
+        let l_lo = SplitLinkClass::freeze(
             shape(ML),
             params(ML),
             genesis_acc.clone(),
             ladder.clone(),
             0,
             &b_lo,
+            &env_block2,
+            &b_lo_r1cs,
         );
-        let l_hi = SplitLinkClass::new(shape(ML), params(ML), genesis_acc, ladder, 1, &b_hi);
+        let l_hi = SplitLinkClass::freeze(
+            shape(ML),
+            params(ML),
+            genesis_acc,
+            ladder,
+            1,
+            &b_hi,
+            &env_block1,
+            &b_hi_r1cs,
+        );
+        eprintln!("[split-e2e] link classes frozen: {:.1?}", t0.elapsed());
+        assert!(!l_lo.region_claims.is_empty(), "frozen walk claims present");
         assert_eq!(l_lo.spec.io_len, l_hi.spec.io_len, "shared spec io_len");
         assert_eq!(
             l_lo.spec.io_slice.log2_len, l_hi.spec.io_slice.log2_len,

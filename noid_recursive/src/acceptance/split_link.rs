@@ -62,17 +62,23 @@ use noid_ivc_core::public_io::{PublicIoSpec, WitnessSlice};
 
 use super::block_class::{BlockClass, BLOCK_IO_END_ACC, BLOCK_IO_START_ACC};
 use super::link::{
-    block_acc_lanes, genesis_baked_claim_value, genesis_instance, LinkEnvelope,
+    block_acc_lanes, genesis_baked_claim_value, genesis_instance, genesis_witness,
+    LinkEnvelope, RegionFrozenClaim,
 };
 use super::trace::matrix_fold::{
     verify_matrix_claim_fold_trace, MatrixAccClaimTrace, MatrixFoldProofTrace,
 };
+use super::trace::r_pcs_region::{
+    alloc_r_pcs_columns, discharge_r_pcs_via_region, r_pcs_region_native, RPcsProof,
+};
 use super::trace::self_verify::{
-    alloc_flat_digest, flat_digest_lanes, verify_field_trace_deferred, FieldR1csProofTrace,
-    FlatDigestExpr,
+    alloc_flat_digest, flat_digest_lanes, verify_field_trace_deferred_region,
+    FieldR1csProofTrace, FlatDigestExpr, PcsWalkObligations,
 };
 use super::trace::{mul, pin_eq};
 use crate::accumulator::ChainAccumulator;
+use noid_ivc_core::public_io::IoClaimSpec;
+use noid_ivc_prover::field_prover::prove_field_with_public_io;
 
 /// One ladder slot's protocol constants, as seen by EVERY link class (the
 /// lane widths must be known to lay out the shared IO). The full block
@@ -128,10 +134,19 @@ pub struct SplitIoLayout {
     pub b_lanes: Vec<SplitLaneLayout>,
     /// The covered block's end accumulator (5 lanes).
     pub block_acc: usize,
+    /// First lane of the [R]-PCS walk opening-claim tail.
+    pub region_tail_offset: usize,
+    /// Region tail length (`n_claims × (max_arity + 1)`).
+    pub region_len: usize,
     pub len: usize,
 }
 
-pub fn split_io_layout(link_k_log: usize, ladder: &[LadderSlotInfo]) -> SplitIoLayout {
+pub fn split_io_layout(
+    link_k_log: usize,
+    ladder: &[LadderSlotInfo],
+    n_claims: usize,
+    max_arity: usize,
+) -> SplitIoLayout {
     let n = ladder.len();
     let g = 0usize;
     let wl = 1usize;
@@ -148,26 +163,50 @@ pub fn split_io_layout(link_k_log: usize, ladder: &[LadderSlotInfo]) -> SplitIoL
         b_lanes.push(lane);
         off = next;
     }
+    let region_tail_offset = off + 5;
+    let region_len = n_claims * (max_arity + 1);
     SplitIoLayout {
         g,
         wl,
         link_lanes,
         b_lanes,
         block_acc: off,
-        len: off + 5,
+        region_tail_offset,
+        region_len,
+        len: region_tail_offset + region_len,
     }
 }
 
-/// The shared spec: one dyadic IO slice, NO derived claims (the split
-/// link threads no region tail of its own — the region claims live on
-/// the block class's IO and are enforced inside `[R]_B`).
-pub fn split_io_spec(link_k_log: usize, ladder: &[LadderSlotInfo]) -> PublicIoSpec {
-    let layout = split_io_layout(link_k_log, ladder);
+/// The shared spec: one dyadic IO slice plus one derived opening claim
+/// per frozen [R]-PCS walk claim, reading its point/value out of the
+/// region tail lanes (identical mechanics to the block class's spec —
+/// the successor's `[R]_prev` replay enforces the walk claims against
+/// THIS link's committed walk columns).
+pub fn split_io_spec(
+    link_k_log: usize,
+    ladder: &[LadderSlotInfo],
+    frozen: &[RegionFrozenClaim],
+    max_arity: usize,
+) -> PublicIoSpec {
+    let layout = split_io_layout(link_k_log, ladder, frozen.len(), max_arity);
     let log2_len = layout.len.next_power_of_two().trailing_zeros() as usize;
+    let stride = max_arity + 1;
+    let claims = frozen
+        .iter()
+        .enumerate()
+        .map(|(ci, fc)| {
+            let base = layout.region_tail_offset + ci * stride;
+            IoClaimSpec {
+                slice: fc.slice,
+                point: base..base + fc.arity,
+                value: base + max_arity,
+            }
+        })
+        .collect();
     PublicIoSpec {
         io_slice: WitnessSlice { log2_len, index: 1 },
         io_len: layout.len,
-        claims: vec![],
+        claims,
     }
 }
 
@@ -195,20 +234,41 @@ pub struct SplitLinkClass {
     pub b_spec: PublicIoSpec,
     /// The slot's block-class PCS parameters.
     pub b_pcs_params: PcsParams,
+    /// The frozen [R]-PCS walk opening-claim shape; every build
+    /// reproduces exactly these `(slice, arity)` pairs.
+    pub region_claims: Vec<RegionFrozenClaim>,
+    pub region_max_arity: usize,
 }
 
 impl SplitLinkClass {
-    /// Assemble the slot's link class from the (already frozen AND once
-    /// built — the digest must exist) block class. No freeze pass of its
-    /// own: the spec is closed-form (no region tail), so the first build
-    /// materializes the matrix directly.
-    pub fn new(
+    /// Freeze the slot's link class from the (already frozen AND once
+    /// built — the digest must exist) block class plus one sample
+    /// `π_block` envelope of the slot. Mirrors the block class's freeze
+    /// discipline for the [R]-PCS walk claims:
+    ///
+    /// 1. a BOOTSTRAP T proof (claimless base spec) feeds the native
+    ///    probe [`r_pcs_region_native`] — walk claim COUNT and ARITIES
+    ///    are functions of the two PCS parameter sets alone, which fixes
+    ///    the IO layout;
+    /// 2. a placeholder-claim spec of the final size, a second T proof
+    ///    over it, and one FREEZE-mode build (tail zeros, no tail pins)
+    ///    reveal the claims' committed-column SLICES — the freeze build
+    ///    shares the real builds' wire layout because the placeholder
+    ///    spec has the same claim count and IO-slice size;
+    /// 3. the real spec re-freezes the claims at their live slices.
+    ///
+    /// The class MATRIX is created by the first real build (the freeze
+    /// matrix omits the tail pin rows) and every later build must
+    /// reproduce it bit-exactly (I1; the per-class fixity gates).
+    pub fn freeze(
         shape: FieldShape,
         pcs_params: PcsParams,
         genesis_block_accumulator: ChainAccumulator,
         ladder: Vec<LadderSlotInfo>,
         slot: usize,
         block_class: &BlockClass,
+        sample_block: &LinkEnvelope,
+        block_matrix: &FieldR1cs,
     ) -> Self {
         assert!(slot < ladder.len(), "slot out of ladder");
         assert_eq!(ladder[slot].b_shape, block_class.shape, "slot shape vs block class");
@@ -221,23 +281,116 @@ impl SplitLinkClass {
         // statement_digest() also warms the instance's digest cache, so
         // every T prove reads it instead of re-hashing the serialization.
         let genesis_digest = genesis.statement_digest();
-        Self {
+
+        // ---- Phase 1: bootstrap T proof + native probe → count/arities.
+        let base_spec = split_io_spec(shape.k_log, &ladder, &[], 0);
+        let t_witness = genesis_witness(&shape);
+        let t_io = vec![F128::ZERO; base_spec.io_len];
+        let mut ch = FsLaneChallenger::new(b"history-link-v0");
+        let (t_proof, t_commitment, _) = prove_field_with_public_io(
+            &genesis,
+            &t_witness,
+            &pcs_params,
+            &base_spec,
+            &t_io,
+            &mut ch,
+        );
+        let probe = r_pcs_region_native(&[
+            RPcsProof {
+                native: &t_proof.pcs_open,
+                params: &pcs_params,
+                commitment_root: flat_digest_lanes(&t_commitment.root),
+            },
+            RPcsProof {
+                native: &sample_block.proof.pcs_open,
+                params: &block_class.pcs_params,
+                commitment_root: flat_digest_lanes(&sample_block.commitment.root),
+            },
+        ]);
+        let arities: Vec<usize> = probe.iter().map(|(pt, _)| pt.len()).collect();
+        let max_arity = arities.iter().copied().max().unwrap_or(0);
+        assert!(!arities.is_empty(), "walk discharge produced no opening claims");
+
+        // ---- Phase 2: placeholder spec + freeze-mode genesis build.
+        let placeholders: Vec<RegionFrozenClaim> = arities
+            .iter()
+            .map(|&a| RegionFrozenClaim {
+                slice: WitnessSlice { log2_len: a, index: 1 },
+                arity: a,
+            })
+            .collect();
+        let freeze_class = Self {
             shape,
-            pcs_params,
-            spec: split_io_spec(shape.k_log, &ladder),
+            pcs_params: pcs_params.clone(),
+            spec: split_io_spec(shape.k_log, &ladder, &placeholders, max_arity),
             class_statement_digest: std::sync::OnceLock::new(),
             genesis,
             genesis_digest,
-            genesis_block_accumulator,
+            genesis_block_accumulator: genesis_block_accumulator.clone(),
             ladder,
             slot,
             b_spec: block_class.spec.clone(),
             b_pcs_params: block_class.pcs_params.clone(),
+            region_claims: placeholders,
+            region_max_arity: max_arity,
+        };
+        let t_io = vec![F128::ZERO; freeze_class.spec.io_len];
+        let mut ch = FsLaneChallenger::new(b"history-link-v0");
+        let (t_proof, t_commitment, _) = prove_field_with_public_io(
+            &freeze_class.genesis,
+            &t_witness,
+            &pcs_params,
+            &freeze_class.spec,
+            &t_io,
+            &mut ch,
+        );
+        let env_t = LinkEnvelope {
+            proof: t_proof,
+            commitment: t_commitment,
+            io: t_io,
+        };
+        let built = build_split_link_inner(
+            &freeze_class,
+            &SplitLinkInput {
+                prev: &env_t,
+                verified_digest: freeze_class.genesis_digest,
+                prev_slot: 0,
+                genesis: true,
+                link_class_digests: vec![[0u8; 32]; freeze_class.ladder.len()],
+                block: sample_block,
+                fold_matrix_link: &freeze_class.genesis,
+                fold_matrix_block: block_matrix,
+            },
+            true,
+        );
+        let frozen: Vec<RegionFrozenClaim> = built
+            .region_claims
+            .iter()
+            .map(|c| RegionFrozenClaim {
+                slice: c.slice,
+                arity: c.point.len(),
+            })
+            .collect();
+        assert_eq!(frozen.len(), arities.len(), "freeze claim count vs native probe");
+        drop(built);
+
+        // ---- Phase 3: the real spec (frozen slices).
+        let spec = split_io_spec(shape.k_log, &freeze_class.ladder, &frozen, max_arity);
+        Self {
+            spec,
+            class_statement_digest: std::sync::OnceLock::new(),
+            region_claims: frozen,
+            ..freeze_class
         }
     }
 
     pub fn layout(&self) -> SplitIoLayout {
-        split_io_layout(self.shape.k_log, &self.ladder)
+        split_io_layout(
+            self.shape.k_log,
+            &self.ladder,
+            self.region_claims.len(),
+            self.region_max_arity,
+        )
     }
 }
 
@@ -272,6 +425,9 @@ pub struct BuiltSplitLink {
     pub r1cs: FieldR1cs,
     pub witness: Vec<F128>,
     pub io: Vec<F128>,
+    /// The live [R]-PCS walk opening claims (the freeze pass reads their
+    /// slices; real builds assert them against the frozen class shape).
+    pub region_claims: Vec<super::trace::region_source_binding::RegionPcsClaim>,
 }
 
 fn alloc_expr(b: &mut FieldR1csBuilder, v: F128) -> LinExpr {
@@ -280,9 +436,23 @@ fn alloc_expr(b: &mut FieldR1csBuilder, v: F128) -> LinExpr {
 
 /// Assemble one split link. Native pass first (both deferred verifies +
 /// both folds — every IO value is known before the trace starts), then
-/// the trace: IO cells, both envelopes, the two [R] replays, the chain
-/// rules, the two fold twins and the lane routing pins.
+/// the trace: IO cells, both envelopes, the two [R] replays IN REGION
+/// MODE (path-free — their PCS hashing lands on the link's two walks),
+/// the chain rules, the two fold twins, the lane routing pins, the walk
+/// discharge and the region-tail pins.
 pub fn build_split_link(class: &SplitLinkClass, input: &SplitLinkInput<'_>) -> BuiltSplitLink {
+    build_split_link_inner(class, input, false)
+}
+
+/// [`build_split_link`] core. `freeze = true` is the walk-claim
+/// shape-freeze pass: the region tail stays zero and UNPINNED (the
+/// freeze matrix omits those rows) and the live claims are returned for
+/// the class to freeze; the class digest is never seeded.
+fn build_split_link_inner(
+    class: &SplitLinkClass,
+    input: &SplitLinkInput<'_>,
+    freeze: bool,
+) -> BuiltSplitLink {
     let layout = class.layout();
     let n = class.ladder.len();
     let k_l = class.shape.k_log;
@@ -397,6 +567,40 @@ pub fn build_split_link(class: &SplitLinkClass, input: &SplitLinkInput<'_>) -> B
     io[layout.block_acc..layout.block_acc + 5]
         .copy_from_slice(&input.block.io[BLOCK_IO_END_ACC..BLOCK_IO_END_ACC + 5]);
 
+    // ---- [R]-PCS walk opening claims: NATIVE values into the IO tail
+    // (deterministic in the two proofs; the trace discharge below
+    // re-derives the same claims with their wires and asserts the frozen
+    // shape). The freeze pass leaves the tail zero.
+    let r_pcs_proofs = [
+        RPcsProof {
+            native: &input.prev.proof.pcs_open,
+            params: &class.pcs_params,
+            commitment_root: flat_digest_lanes(&input.prev.commitment.root),
+        },
+        RPcsProof {
+            native: &input.block.proof.pcs_open,
+            params: &class.b_pcs_params,
+            commitment_root: flat_digest_lanes(&input.block.commitment.root),
+        },
+    ];
+    if !freeze {
+        let region_native = r_pcs_region_native(&r_pcs_proofs);
+        assert_eq!(
+            region_native.len(),
+            class.region_claims.len(),
+            "region native claim count vs frozen"
+        );
+        let stride = class.region_max_arity + 1;
+        for (ci, (np, nv)) in region_native.iter().enumerate() {
+            let base = layout.region_tail_offset + ci * stride;
+            assert!(np.len() <= class.region_max_arity, "region claim arity over max");
+            for (kk, &p) in np.iter().enumerate() {
+                io[base + kk] = p;
+            }
+            io[base + class.region_max_arity] = *nv;
+        }
+    }
+
     // ---- Trace pass.
     let mut b = FieldR1csBuilder::new();
     let mut ledger = 0usize;
@@ -412,6 +616,13 @@ pub fn build_split_link(class: &SplitLinkClass, input: &SplitLinkInput<'_>) -> B
         .collect();
     let g = io_cells[layout.g].clone();
 
+    // ---- Walk-column allocation FIRST (right after the IO cells): the
+    // columns' slices — hence the class's opening-claim spec — must be
+    // identical across every link class of the ladder, so nothing
+    // class-specific (envelope sizes differ per slot!) may precede them.
+    let r_cols = alloc_r_pcs_columns(&mut b, &r_pcs_proofs);
+    crate::acceptance::row_ledger_mark(&b, &mut ledger, "split: walk columns");
+
     // Envelope wires: the previous link, then the block proof.
     let prev_root = alloc_flat_digest(&mut b, &input.prev.commitment.root);
     let prev_io_wires: Vec<LinExpr> = input
@@ -420,11 +631,12 @@ pub fn build_split_link(class: &SplitLinkClass, input: &SplitLinkInput<'_>) -> B
         .iter()
         .map(|&v| alloc_expr(&mut b, v))
         .collect();
-    let prev_proof_e = FieldR1csProofTrace::alloc_shape(
+    let prev_proof_e = FieldR1csProofTrace::alloc_shape_mode(
         &mut b,
         &input.prev.proof,
         &class.shape,
         &class.pcs_params,
+        false,
     );
     let block_root = alloc_flat_digest(&mut b, &input.block.commitment.root);
     let block_io_wires: Vec<LinExpr> = input
@@ -433,11 +645,12 @@ pub fn build_split_link(class: &SplitLinkClass, input: &SplitLinkInput<'_>) -> B
         .iter()
         .map(|&v| alloc_expr(&mut b, v))
         .collect();
-    let block_proof_e = FieldR1csProofTrace::alloc_shape(
+    let block_proof_e = FieldR1csProofTrace::alloc_shape_mode(
         &mut b,
         &input.block.proof,
         &b_shape,
         &class.b_pcs_params,
+        false,
     );
     crate::acceptance::row_ledger_mark(&b, &mut ledger, "split: IO + envelope alloc");
 
@@ -479,9 +692,11 @@ pub fn build_split_link(class: &SplitLinkClass, input: &SplitLinkInput<'_>) -> B
         acc
     });
 
-    // ---- [R]_prev: the deferred replay of the previous link's proof.
+    // ---- [R]_prev: the deferred replay of the previous link's proof,
+    // in REGION mode — its PCS hashing lands on the link walks below.
+    let mut obs_prev = PcsWalkObligations::default();
     let mut ch = FsChannelTrace::new(&mut b, b"history-link-v0");
-    let (_pce, fresh_link_e) = verify_field_trace_deferred(
+    let (_pce, fresh_link_e) = verify_field_trace_deferred_region(
         &mut b,
         &mut ch,
         &class.shape,
@@ -491,6 +706,7 @@ pub fn build_split_link(class: &SplitLinkClass, input: &SplitLinkInput<'_>) -> B
         &prev_proof_e,
         &class.spec,
         &prev_io_wires,
+        Some(&mut obs_prev),
     );
     crate::acceptance::row_ledger_mark(&b, &mut ledger, "split: [R]_prev replay");
 
@@ -498,8 +714,9 @@ pub fn build_split_link(class: &SplitLinkClass, input: &SplitLinkInput<'_>) -> B
     // BAKED block-class digest.
     let d_b = flat_digest_lanes(&class.ladder[slot].b_digest);
     let w_b: FlatDigestExpr = [LinExpr::constant(d_b[0]), LinExpr::constant(d_b[1])];
+    let mut obs_block = PcsWalkObligations::default();
     let mut chb = FsChannelTrace::new(&mut b, b"history-block-v0");
-    let (_bce, fresh_block_e) = verify_field_trace_deferred(
+    let (_bce, fresh_block_e) = verify_field_trace_deferred_region(
         &mut b,
         &mut chb,
         &b_shape,
@@ -509,6 +726,7 @@ pub fn build_split_link(class: &SplitLinkClass, input: &SplitLinkInput<'_>) -> B
         &block_proof_e,
         &class.b_spec,
         &block_io_wires,
+        Some(&mut obs_block),
     );
     crate::acceptance::row_ledger_mark(&b, &mut ledger, "split: [R]_B replay");
 
@@ -640,21 +858,63 @@ pub fn build_split_link(class: &SplitLinkClass, input: &SplitLinkInput<'_>) -> B
     }
     crate::acceptance::row_ledger_mark(&b, &mut ledger, "split: chain rules");
 
+    // ---- The [R]-PCS walk discharge: both replays' obligations land on
+    // the two link walks; the resulting committed-column opening claims
+    // thread through the region tail (frozen-shape asserted + pinned in
+    // real builds; the freeze pass returns them for the class to read).
+    let live_region =
+        discharge_r_pcs_via_region(&mut b, r_cols, &[&obs_prev, &obs_block]);
+    if !freeze {
+        assert_eq!(
+            live_region.len(),
+            class.region_claims.len(),
+            "region claim count drift (trace): live {} vs frozen {}",
+            live_region.len(),
+            class.region_claims.len()
+        );
+        let stride = class.region_max_arity + 1;
+        for (ci, c) in live_region.iter().enumerate() {
+            let fc = &class.region_claims[ci];
+            assert_eq!(c.slice, fc.slice, "region claim {ci} slice drift (trace)");
+            assert_eq!(c.point.len(), fc.arity, "region claim {ci} arity drift (trace)");
+            let base = layout.region_tail_offset + ci * stride;
+            for (kk, p) in c.point.iter().enumerate() {
+                pin_eq(&mut b, p, &io_cells[base + kk]);
+            }
+            pin_eq(&mut b, &c.value, &io_cells[base + class.region_max_arity]);
+        }
+    }
+    crate::acceptance::row_ledger_mark(&b, &mut ledger, "split: walk discharge + tail pins");
+
     // ---- Pad to the class size.
     let target = 1usize << class.shape.m;
     let used = b.num_wires();
-    eprintln!("[split-link] build: {used} wires (slot {slot}, genesis={})", input.genesis);
+    eprintln!(
+        "[split-link] build: {used} wires (slot {slot}, genesis={}, freeze={freeze})",
+        input.genesis
+    );
     assert!(used <= target, "split link outgrew the class shape: {used} > {target}");
     while b.num_wires() < target {
         b.alloc_f128(F128::ZERO);
     }
     let (r1cs, witness) = b.build();
     assert_eq!(r1cs.m, class.shape.m, "class shape mismatch after padding");
-    let class_digest = class
-        .class_statement_digest
-        .get_or_init(|| r1cs.statement_digest());
-    r1cs.seed_statement_digest(*class_digest);
-    BuiltSplitLink { r1cs, witness, io }
+    if !freeze {
+        // The class matrix is a protocol constant (I1): hash it once per
+        // class — on the first real build — and seed every later
+        // instance. Freeze builds are excluded: their matrix omits the
+        // region tail pin rows.
+        let class_digest = class
+            .class_statement_digest
+            .get_or_init(|| r1cs.statement_digest());
+        r1cs.seed_statement_digest(*class_digest);
+    }
+    BuiltSplitLink {
+        r1cs,
+        witness,
+        io,
+        region_claims: live_region,
+    }
 }
 
 /// The split-chain decider: natively verify the tip against its
