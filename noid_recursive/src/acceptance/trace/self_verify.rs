@@ -930,6 +930,20 @@ impl BaseFoldProofTrace {
         native: &pcs::BaseFoldProof,
         params: &PcsParams,
     ) -> Self {
+        Self::alloc_mode(b, native, params, true)
+    }
+
+    /// [`Self::alloc`] with the path allocation switchable: the walk-
+    /// discharge mode ([`PcsWalkObligations`]) never materializes sibling
+    /// digests as wires — they live only as walk-B column data — so the
+    /// query path vectors stay empty. Shape asserts on the NATIVE proof
+    /// run in both modes.
+    pub fn alloc_mode(
+        b: &mut FieldR1csBuilder,
+        native: &pcs::BaseFoldProof,
+        params: &PcsParams,
+        alloc_paths: bool,
+    ) -> Self {
         let log_msg_len = params.m - LOG_PACKING;
         let log_batch_size = params.log_batch_size;
         assert!(log_batch_size <= log_msg_len, "invalid proof shape");
@@ -1034,19 +1048,27 @@ impl BaseFoldProofTrace {
                 QueryOpeningTrace {
                     position: q.position,
                     initial_leaf: alloc_vec(b, &q.initial_leaf),
-                    initial_path: alloc_digests(b, &q.initial_path),
+                    initial_path: if alloc_paths {
+                        alloc_digests(b, &q.initial_path)
+                    } else {
+                        Vec::new()
+                    },
                     post_row_batch_leaf: alloc_vec(b, &q.post_row_batch_leaf),
-                    post_row_batch_path: alloc_digests(b, &q.post_row_batch_path),
+                    post_row_batch_path: if alloc_paths {
+                        alloc_digests(b, &q.post_row_batch_path)
+                    } else {
+                        Vec::new()
+                    },
                     epoch_leaves: q
                         .epoch_leaves
                         .iter()
                         .map(|l| alloc_vec(b, l))
                         .collect(),
-                    epoch_paths: q
-                        .epoch_paths
-                        .iter()
-                        .map(|p| alloc_digests(b, p))
-                        .collect(),
+                    epoch_paths: if alloc_paths {
+                        q.epoch_paths.iter().map(|p| alloc_digests(b, p)).collect()
+                    } else {
+                        q.epoch_paths.iter().map(|_| Vec::new()).collect()
+                    },
                 }
             })
             .collect();
@@ -1245,6 +1267,62 @@ fn verify_merkle_path_trace(
     pin_flat_digest_eq(b, &acc, root);
 }
 
+/// One [R] PCS leaf-hash obligation for the walk discharge: the absorbed
+/// lanes (proof wires — the fold algebra consumes the same wires, so the
+/// walk-A tile's absorb-cell pins bind the hashing to the folded values).
+/// Lane counts are even (the fixed-IV no-pad leaf mode), so a tile is a
+/// pure rate-2 absorb chain with the length-bound `IVCPCSF_` capacity IV.
+pub struct PcsLeafObligation {
+    pub lanes: Vec<LinExpr>,
+}
+
+/// One [R] PCS Merkle-path obligation: an `IVCPCSN_` feed-forward node
+/// chain from the digest of leaf obligation `leaf` up to `root`. Sibling
+/// digests are PURE WITNESS — they exist only as walk-B column data (any
+/// values satisfying the chain to the pinned root), so the obligation
+/// carries none; the assembly reads them from the native proof in the
+/// same deterministic order.
+pub struct PcsPathObligation {
+    /// Index into the leaf obligation list — the entry digest tile.
+    pub leaf: usize,
+    /// Transcript-bound position bits, LSB-first, one per level (bit = 1
+    /// ⇒ our node is the RIGHT child).
+    pub dir_bits: Vec<LinExpr>,
+    /// The FS-observed root wires the recomputed root pins to (absorbed
+    /// before the query draw — the capsule's authentication-root rule).
+    pub root: FlatDigestExpr,
+}
+
+/// Collected [R] PCS hashing obligations (region mode): the twin skips
+/// every inline leaf sponge and path replay — 94% of the per-query rows —
+/// and records the data instead; the link's walk assembly hosts them
+/// (leaf tiles on walk A, ff legs on walk B). Push order is the
+/// deterministic per-query order (initial, post-row-batch, epochs), which
+/// the assembly's native column builder mirrors over the native proof.
+#[derive(Default)]
+pub struct PcsWalkObligations {
+    pub leaves: Vec<PcsLeafObligation>,
+    pub paths: Vec<PcsPathObligation>,
+}
+
+impl PcsWalkObligations {
+    fn push(&mut self, lanes: &[LinExpr], dir_bits: &[LinExpr], root: &FlatDigestExpr) {
+        assert!(
+            !lanes.is_empty() && lanes.len() % 2 == 0,
+            "PCS leaf obligations are even-lane (fixed-IV no-pad mode)"
+        );
+        let leaf = self.leaves.len();
+        self.leaves.push(PcsLeafObligation {
+            lanes: lanes.to_vec(),
+        });
+        self.paths.push(PcsPathObligation {
+            leaf,
+            dir_bits: dir_bits.to_vec(),
+            root: root.clone(),
+        });
+    }
+}
+
 /// Trace twin of `basefold::verify`. Replays the sumcheck/commit transcript
 /// on the lane channel, binds resampled query positions, replays every
 /// query's leaf hashing / row-batch fold / FRI coset folds / final-codeword
@@ -1253,6 +1331,13 @@ fn verify_merkle_path_trace(
 /// rejections were alloc asserts. Returns the sumcheck challenges plus the
 /// wire ranges of the transcript-bound position bits (for the mutation
 /// gate: those bits are verifier-internal witness, not proof wires).
+///
+/// `region = Some(out)` is the WALK-DISCHARGE mode: every leaf sponge and
+/// Merkle path is recorded as an obligation instead of replayed inline
+/// (the proof trace must then be allocated path-free); the fold algebra,
+/// offset cross-checks and tail checks stay inline. Soundness moves to
+/// the caller: an obligation is discharged only when its tile/leg rides a
+/// walk whose opening claims the class threads through public IO.
 pub fn basefold_verify_trace(
     b: &mut FieldR1csBuilder,
     ch: &mut impl FsChannelOps,
@@ -1260,6 +1345,7 @@ pub fn basefold_verify_trace(
     proof: &BaseFoldProofTrace,
     initial_codeword_root: &FlatDigestExpr,
     params: &PcsParams,
+    mut region: Option<&mut PcsWalkObligations>,
 ) -> (Vec<LinExpr>, Vec<std::ops::Range<usize>>) {
     let log_msg_len = params.m - LOG_PACKING;
     let log_batch_size = params.log_batch_size;
@@ -1360,14 +1446,19 @@ pub fn basefold_verify_trace(
 
     // ---- Per-query fold replay + per-query independent Merkle paths.
     for (q, bits) in proof.queries.iter().zip(&query_bits) {
-        let initial_leaf_hash = merkle_hash_leaf_lanes_trace(b, &q.initial_leaf);
-        verify_merkle_path_trace(
-            b,
-            initial_codeword_root,
-            &initial_leaf_hash,
-            bits,
-            &q.initial_path,
-        );
+        if let Some(obs) = region.as_deref_mut() {
+            assert!(q.initial_path.is_empty(), "region mode expects path-free alloc");
+            obs.push(&q.initial_leaf, bits, initial_codeword_root);
+        } else {
+            let initial_leaf_hash = merkle_hash_leaf_lanes_trace(b, &q.initial_leaf);
+            verify_merkle_path_trace(
+                b,
+                initial_codeword_root,
+                &initial_leaf_hash,
+                bits,
+                &q.initial_path,
+            );
+        }
 
         // Row-batch fold T1's lanes to one post-row-batch value.
         let post_row_batch_value =
@@ -1379,14 +1470,23 @@ pub fn basefold_verify_trace(
         if arities.is_empty() {
             expected = post_row_batch_value;
         } else {
-            let post_leaf_hash = merkle_hash_leaf_lanes_trace(b, &q.post_row_batch_leaf);
-            verify_merkle_path_trace(
-                b,
-                &proof.post_row_batch_commit,
-                &post_leaf_hash,
-                &bits[arity_0..],
-                &q.post_row_batch_path,
-            );
+            if let Some(obs) = region.as_deref_mut() {
+                assert!(q.post_row_batch_path.is_empty(), "region mode expects path-free alloc");
+                obs.push(
+                    &q.post_row_batch_leaf,
+                    &bits[arity_0..],
+                    &proof.post_row_batch_commit,
+                );
+            } else {
+                let post_leaf_hash = merkle_hash_leaf_lanes_trace(b, &q.post_row_batch_leaf);
+                verify_merkle_path_trace(
+                    b,
+                    &proof.post_row_batch_commit,
+                    &post_leaf_hash,
+                    &bits[arity_0..],
+                    &q.post_row_batch_path,
+                );
+            }
 
             // Cross-check T2 against the row-batch fold: select the leaf
             // slot by the offset bits (eq-tensor dot; value check → pin).
@@ -1407,14 +1507,23 @@ pub fn basefold_verify_trace(
             let leaf = &q.epoch_leaves[i];
             let next_arity = arities[i + 1];
 
-            let epoch_leaf_hash = merkle_hash_leaf_lanes_trace(b, leaf);
-            verify_merkle_path_trace(
-                b,
-                &proof.round_commitments[i],
-                &epoch_leaf_hash,
-                &bits[cum_arity + next_arity..],
-                &q.epoch_paths[i],
-            );
+            if let Some(obs) = region.as_deref_mut() {
+                assert!(q.epoch_paths[i].is_empty(), "region mode expects path-free alloc");
+                obs.push(
+                    leaf,
+                    &bits[cum_arity + next_arity..],
+                    &proof.round_commitments[i],
+                );
+            } else {
+                let epoch_leaf_hash = merkle_hash_leaf_lanes_trace(b, leaf);
+                verify_merkle_path_trace(
+                    b,
+                    &proof.round_commitments[i],
+                    &epoch_leaf_hash,
+                    &bits[cum_arity + next_arity..],
+                    &q.epoch_paths[i],
+                );
+            }
 
             let at_offset =
                 evaluate_slice_trace(b, leaf, &bits[cum_arity..cum_arity + next_arity]);
@@ -1502,6 +1611,29 @@ pub fn verify_opening_batch_quirky_direct_trace(
     proof: &BaseFoldProofTrace,
     params: &PcsParams,
 ) -> Vec<std::ops::Range<usize>> {
+    verify_opening_batch_quirky_direct_trace_region(
+        b,
+        ch,
+        commitment_root,
+        claims,
+        proof,
+        params,
+        None,
+    )
+}
+
+/// [`verify_opening_batch_quirky_direct_trace`] with the walk-discharge
+/// mode switch (see [`basefold_verify_trace`]).
+#[allow(clippy::too_many_arguments)]
+pub fn verify_opening_batch_quirky_direct_trace_region(
+    b: &mut FieldR1csBuilder,
+    ch: &mut impl FsChannelOps,
+    commitment_root: &FlatDigestExpr,
+    claims: &[QuirkyDirectClaimTrace],
+    proof: &BaseFoldProofTrace,
+    params: &PcsParams,
+    region: Option<&mut PcsWalkObligations>,
+) -> Vec<std::ops::Range<usize>> {
     assert!(!claims.is_empty(), "need at least one claim");
     let l_log = params.m - LOG_PACKING;
     for c in claims {
@@ -1520,8 +1652,15 @@ pub fn verify_opening_batch_quirky_direct_trace(
         target_combined = target_combined.add(&mul(b, g, &c.value));
     }
 
-    let (challenges, query_bit_ranges) =
-        basefold_verify_trace(b, ch, &target_combined, proof, commitment_root, params);
+    let (challenges, query_bit_ranges) = basefold_verify_trace(
+        b,
+        ch,
+        &target_combined,
+        proof,
+        commitment_root,
+        params,
+        region,
+    );
     assert_eq!(challenges.len(), l_log);
 
     let mut expected_final_b = LinExpr::zero();
@@ -1586,10 +1725,23 @@ impl FieldR1csProofTrace {
         shape: &noid_ivc_core::proof::FieldShape,
         pcs_params: &PcsParams,
     ) -> Self {
+        Self::alloc_shape_mode(b, native, shape, pcs_params, true)
+    }
+
+    /// [`Self::alloc_shape`] with the path allocation switchable — the
+    /// walk-discharge [R] mode allocates the proof PATH-FREE (see
+    /// [`BaseFoldProofTrace::alloc_mode`]).
+    pub fn alloc_shape_mode(
+        b: &mut FieldR1csBuilder,
+        native: &noid_ivc_core::proof::FieldR1csProof,
+        shape: &noid_ivc_core::proof::FieldShape,
+        pcs_params: &PcsParams,
+        alloc_paths: bool,
+    ) -> Self {
         Self {
             zerocheck: ZerocheckProofTrace::alloc(b, &native.zerocheck, shape.m),
             lincheck: LincheckProofTrace::alloc(b, &native.lincheck, shape.k_log, shape.k_skip),
-            pcs_open: BaseFoldProofTrace::alloc(b, &native.pcs_open, pcs_params),
+            pcs_open: BaseFoldProofTrace::alloc_mode(b, &native.pcs_open, pcs_params, alloc_paths),
         }
     }
 }
@@ -1712,6 +1864,42 @@ pub fn verify_field_trace_deferred(
     R1csClaimTrace,
     super::matrix_fold::FreshLincheckClaimTrace,
 ) {
+    verify_field_trace_deferred_region(
+        b,
+        ch,
+        shape,
+        pcs_params,
+        statement_digest,
+        commitment_root,
+        proof,
+        spec,
+        io,
+        None,
+    )
+}
+
+/// [`verify_field_trace_deferred`] with the walk-discharge mode switch:
+/// `region = Some(out)` records every PCS leaf sponge and Merkle path as
+/// an obligation instead of replaying it inline (the proof trace must be
+/// allocated path-free via [`FieldR1csProofTrace::alloc_shape_mode`]);
+/// the caller hosts the obligations on the link's walks and threads the
+/// walk opening claims through public IO.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_field_trace_deferred_region(
+    b: &mut FieldR1csBuilder,
+    ch: &mut impl FsChannelOps,
+    shape: &noid_ivc_core::proof::FieldShape,
+    pcs_params: &PcsParams,
+    statement_digest: &FlatDigestExpr,
+    commitment_root: &FlatDigestExpr,
+    proof: &FieldR1csProofTrace,
+    spec: &noid_ivc_core::public_io::PublicIoSpec,
+    io: &[LinExpr],
+    region: Option<&mut PcsWalkObligations>,
+) -> (
+    R1csClaimTrace,
+    super::matrix_fold::FreshLincheckClaimTrace,
+) {
     assert_eq!(
         pcs_params.m,
         shape.m + LOG_PACKING,
@@ -1780,13 +1968,14 @@ pub fn verify_field_trace_deferred(
         },
     ];
     claims.extend(io_claims);
-    verify_opening_batch_quirky_direct_trace(
+    verify_opening_batch_quirky_direct_trace_region(
         b,
         ch,
         commitment_root,
         &claims,
         &proof.pcs_open,
         pcs_params,
+        region,
     );
     crate::acceptance::row_ledger_mark(b, &mut ledger, "R: PCS opening batch");
 
@@ -2860,6 +3049,109 @@ mod tests {
             survivors.is_empty(),
             "deferred mutation survivors: {survivors:?}"
         );
+    }
+
+    /// The walk-discharge (region) mode of the deferred [R] replay:
+    /// identical transcript and deferred claim to the inline mode (the
+    /// hashing never touched the channel), a satisfiable path-free trace,
+    /// the expected obligation structure (one leaf+path pair per tree per
+    /// query, dir-bit lengths matching the tree depths, even lane counts)
+    /// and a strictly smaller trace.
+    #[test]
+    fn verify_field_deferred_region_obligation_parity() {
+        use noid_ivc_core::field_r1cs::synthetic_satisfiable;
+        use noid_ivc_core::proof::FieldShape;
+        use noid_ivc_core::public_io::{PublicIoSpec, WitnessSlice};
+        use noid_ivc_prover::field_prover::prove_field_with_public_io;
+
+        let (m, k_log, seed) = (10usize, 10usize, 0x0B11u64);
+        let (inner, z) = synthetic_satisfiable(m, k_log, seed);
+        let spec = PublicIoSpec {
+            io_slice: WitnessSlice { log2_len: 2, index: 4 },
+            io_len: 4,
+            claims: vec![],
+        };
+        let io: Vec<F128> = (16..20).map(|t| z[t]).collect();
+        let params = PcsParams {
+            m: m + LOG_PACKING,
+            log_inv_rate: 2,
+            log_batch_size: 2,
+            profile: Default::default(),
+        };
+        let mut ch_p = FsLaneChallenger::new(b"self-verify-region-test");
+        let (proof, commitment, _) =
+            prove_field_with_public_io(&inner, &z, &params, &spec, &io, &mut ch_p);
+        let shape = FieldShape::of(&inner);
+        let digest = inner.statement_digest();
+
+        // Shared per-mode driver.
+        let run = |alloc_paths: bool,
+                   region: Option<&mut PcsWalkObligations>|
+         -> (usize, F128, F128) {
+            let mut b = FieldR1csBuilder::new();
+            let mut ch = FsChannelTrace::new(&mut b, b"self-verify-region-test");
+            let digest_e = alloc_flat_digest(&mut b, &digest);
+            let root = alloc_flat_digest(&mut b, &commitment.root);
+            let io_wires: Vec<LinExpr> = io
+                .iter()
+                .map(|&lane| LinExpr::from_wire(b.alloc_f128(lane)))
+                .collect();
+            let proof_e =
+                FieldR1csProofTrace::alloc_shape_mode(&mut b, &proof, &shape, &params, alloc_paths);
+            let (_claim, fresh_e) = verify_field_trace_deferred_region(
+                &mut b, &mut ch, &shape, &params, &digest_e, &root, &proof_e, &spec, &io_wires,
+                region,
+            );
+            let post = ch.sample_f128(&mut b);
+            let rows = b.num_wires();
+            let fresh_v = fresh_e.value.eval(b.values());
+            let post_v = post.eval(b.values());
+            let (r1cs_t, z_t) = b.build();
+            assert!(r1cs_t.satisfies(&z_t), "trace unsatisfiable (alloc_paths={alloc_paths})");
+            (rows, fresh_v, post_v)
+        };
+
+        let (rows_inline, fresh_inline, post_inline) = run(true, None);
+        let mut obs = PcsWalkObligations::default();
+        let (rows_region, fresh_region, post_region) = run(false, Some(&mut obs));
+        eprintln!(
+            "[self-verify] region-mode rows {rows_region} vs inline {rows_inline} \
+             ({} leaf/path obligations)",
+            obs.leaves.len()
+        );
+
+        // Transcript + claim parity (the hashing never touched the channel).
+        assert_eq!(post_region, post_inline, "region mode diverged the transcript");
+        assert_eq!(fresh_region, fresh_inline, "region mode changed the deferred claim");
+        assert!(rows_region < rows_inline, "region mode did not shrink the trace");
+
+        // Obligation structure: per query one pair per verified tree, dir
+        // bits matching the tree depths, even lane counts throughout.
+        let log_msg_len = params.m - LOG_PACKING;
+        let log_dim = log_msg_len - params.log_batch_size;
+        let k_code = log_dim + params.log_inv_rate;
+        let arities = compute_fri_arities(log_dim);
+        let (num_fri_commits, _) = pcs::fri_commit_layout(k_code, &arities);
+        let arity_0 = arities.first().copied().unwrap_or(0);
+        let n_queries = proof.pcs_open.queries.len();
+        let trees = 1 + usize::from(!arities.is_empty()) + num_fri_commits;
+        assert_eq!(obs.leaves.len(), n_queries * trees, "leaf obligation count");
+        assert_eq!(obs.paths.len(), obs.leaves.len(), "path obligation count");
+        for (i, p) in obs.paths.iter().enumerate() {
+            assert_eq!(p.leaf, i, "leaf/path pairing");
+            assert!(obs.leaves[i].lanes.len() % 2 == 0, "odd leaf lanes");
+        }
+        for q in 0..n_queries {
+            let base = q * trees;
+            assert_eq!(obs.paths[base].dir_bits.len(), k_code, "initial path depth");
+            if !arities.is_empty() {
+                assert_eq!(
+                    obs.paths[base + 1].dir_bits.len(),
+                    k_code - arity_0,
+                    "post-row-batch path depth"
+                );
+            }
+        }
     }
 
     /// `observe_flat_digest` keeps the trace channel in lockstep with the
