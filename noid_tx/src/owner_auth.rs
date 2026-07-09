@@ -66,6 +66,24 @@ impl CanonicalOwnerAuth {
 }
 
 pub fn canonical_owner_auth(body: &TxBody) -> Result<CanonicalOwnerAuth, OwnerAuthError> {
+    canonical_owner_auth_with_group_cap(body, 1)
+}
+
+/// LOW-LEVEL: the canonical statement WITHOUT the one-owner consensus cap
+/// (up to [`MAX_OWNER_AUTH_GROUPS`] groups). The generic multi-group GKR
+/// machinery is exercised through this in unit tests; NOTHING
+/// consensus-facing may call it — production statements carry exactly one
+/// owner group ([`canonical_owner_auth`]).
+pub fn canonical_owner_auth_multi_group(
+    body: &TxBody,
+) -> Result<CanonicalOwnerAuth, OwnerAuthError> {
+    canonical_owner_auth_with_group_cap(body, MAX_OWNER_AUTH_GROUPS)
+}
+
+fn canonical_owner_auth_with_group_cap(
+    body: &TxBody,
+    max_groups: usize,
+) -> Result<CanonicalOwnerAuth, OwnerAuthError> {
     if body.is_coinbase {
         return Err(OwnerAuthError::Coinbase);
     }
@@ -114,10 +132,13 @@ pub fn canonical_owner_auth(body: &TxBody) -> Result<CanonicalOwnerAuth, OwnerAu
     if live_input_positions.is_empty() {
         return Err(OwnerAuthError::NoLiveInputs);
     }
-    if groups.len() > MAX_OWNER_AUTH_GROUPS {
+    // ONE OWNER PER TRANSACTION (consensus rule): the production cap is
+    // 1 (`canonical_owner_auth`); the multi-group entry point exists for
+    // the low-level GKR unit tests only.
+    if groups.len() > max_groups {
         return Err(OwnerAuthError::TooManyOwnerGroups {
             actual: groups.len(),
-            max: MAX_OWNER_AUTH_GROUPS,
+            max: max_groups,
         });
     }
 
@@ -188,7 +209,7 @@ mod tests {
             ],
         );
 
-        let stmt = canonical_owner_auth(&body).expect("canonical statement");
+        let stmt = canonical_owner_auth_multi_group(&body).expect("canonical statement");
         assert_eq!(stmt.live_input_positions, vec![1, 2, 3]);
         assert_eq!(stmt.live_slot_indices, vec![2, 3, 2]);
         assert_eq!(stmt.groups.len(), 2);
@@ -204,7 +225,7 @@ mod tests {
             vec![input(2, true), input(3, true), input(2, true)],
         );
 
-        let stmt = canonical_owner_auth(&body).expect("canonical statement");
+        let stmt = canonical_owner_auth_multi_group(&body).expect("canonical statement");
         assert_eq!(stmt.groups.len(), 2);
         assert_eq!(stmt.input_to_group, vec![0, 1, 0]);
     }

@@ -278,11 +278,15 @@ mod tests {
         ctx
     }
 
-    fn output(slot: u32, value: u64, seed: u8) -> TxOutput {
+    fn output(slot: u32, value: u64, _seed: u8) -> TxOutput {
         TxOutput {
             slot_index: slot,
             value,
-            owner: Address([seed; 32]),
+            // One owner per tx (consensus): the fixtures co-spend these
+            // outputs, so they all live on ONE address (the seed keeps
+            // the call sites readable; ownership is irrelevant to the
+            // reorg slot semantics under test).
+            owner: Address([0x77u8; 32]),
             valid: true,
         }
     }
@@ -373,6 +377,12 @@ mod tests {
         inputs: &[TxOutput],
         outputs: Vec<TxOutput>,
     ) -> Transaction {
+        // The shared semantics predicate enforces input == outputs + fee:
+        // the fixtures balance by OVERPAYING the fee with the residual
+        // (legal — the consensus minimum is a floor), which keeps every
+        // asserted output value untouched.
+        let input_sum: u64 = inputs.iter().map(|o| o.value).sum();
+        let out_sum: u64 = outputs.iter().map(|o| o.value).sum();
         let mut body = TxBody {
             shape,
             epoch_anchor: [0x42; 32],
@@ -381,11 +391,14 @@ mod tests {
             outputs,
             is_coinbase: false,
         };
-        body.fee = required_fee_for_tx_body(
+        let required = required_fee_for_tx_body(
             &body,
             ctx.tip_header().active_slot_count,
             ctx.tip_header().log_slots,
-        ) as u128;
+        );
+        let residual = input_sum - out_sum;
+        assert!(residual >= required, "fixture must cover the required fee");
+        body.fee = residual as u128;
         tx_from_body(body)
     }
 

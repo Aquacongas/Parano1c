@@ -74,20 +74,14 @@ fn validate_tx_consensus_inner(
         )));
     }
 
-    // 0b. Coinbase fee must be zero.
-    if tx.body.is_coinbase && tx.body.fee != 0 {
-        return Err(ConsensusError::BadFee);
-    }
-
-    // 0c. Coinbase must have exactly one valid output.
-    if tx.body.is_coinbase {
-        let n_valid_outputs = tx.body.outputs.iter().filter(|o| o.valid).count();
-        if n_valid_outputs != 1 {
-            return Err(ConsensusError::ShapeMismatch(format!(
-                "coinbase must have exactly 1 valid output, got {n_valid_outputs}"
-            )));
-        }
-    }
+    // 0b. The SHARED body-semantics predicate (no hashing): dead-entry
+    // canonicality, one owner per transaction, balance, live-count
+    // bounds for user txs; zero fee / no live inputs / exactly one live
+    // output for the coinbase. Every consensus entrypoint calls this,
+    // so the sequential interpreter can never accept a body the
+    // proof-native path rejects.
+    noid_tx::validate_body_semantics_no_hash(&tx.body)
+        .map_err(|e| ConsensusError::ShapeMismatch(format!("body semantics: {e}")))?;
 
     // 1. tx_body_hash binding (skipped when called from validate_block_consensus
     //    because apply_block already verifies this for every tx in the block).
@@ -198,7 +192,7 @@ mod tests {
 
     #[test]
     fn valid_tx_passes() {
-        let tx = make_tx(vec![], vec![dummy_output(1)], false);
+        let tx = make_tx(vec![dummy_input(9)], vec![dummy_output(1)], false);
         assert!(validate_tx_consensus(&tx).is_ok());
     }
 
@@ -209,7 +203,15 @@ mod tests {
             epoch_anchor: [1u8; 32],
             fee: 0,
             inputs: (0..5).map(dummy_input).collect(),
-            outputs: vec![dummy_output(1), dummy_output(2)],
+            outputs: vec![
+                dummy_output(1),
+                TxOutput {
+                    slot_index: 2,
+                    value: 400,
+                    owner: Address([1u8; 32]),
+                    valid: true,
+                },
+            ],
             is_coinbase: false,
         };
         let tx_body_hash = hash_tx_body_for_shape(
@@ -246,7 +248,7 @@ mod tests {
 
     #[test]
     fn wrong_body_hash_rejected() {
-        let mut tx = make_tx(vec![], vec![dummy_output(1)], false);
+        let mut tx = make_tx(vec![dummy_input(9)], vec![dummy_output(1)], false);
         tx.tx_body_hash = TxBodyHash([0xAB; 32]); // tamper
         assert_eq!(
             validate_tx_consensus(&tx),
@@ -256,7 +258,7 @@ mod tests {
 
     #[test]
     fn non_coinbase_zero_anchor_rejected() {
-        let mut tx = make_tx(vec![], vec![dummy_output(1)], false);
+        let mut tx = make_tx(vec![dummy_input(9)], vec![dummy_output(1)], false);
         tx.body.epoch_anchor = [0u8; 32]; // zero anchor for non-coinbase
                                           // Recompute hash to match tampered body
         let hash = hash_tx_body(
@@ -404,10 +406,12 @@ mod tests {
             body,
             tx_body_hash: h,
         };
-        assert_eq!(
-            validate_tx_consensus(&tx),
-            Err(ConsensusError::BadFee),
-            "coinbase with non-zero fee must be rejected"
+        assert!(
+            matches!(
+                validate_tx_consensus(&tx),
+                Err(ConsensusError::ShapeMismatch(_))
+            ),
+            "coinbase with non-zero fee must be rejected (shared predicate)"
         );
     }
 

@@ -21,10 +21,14 @@ pub use body_hash::{hash_tx_body, hash_tx_body_for_shape, validity_bits_for_shap
 pub use claims::compute_claims_commitment;
 pub use intent::{ClaimedSlot, TxIntent};
 pub use owner_auth::{
-    canonical_owner_auth, CanonicalOwnerAuth, OwnerAuthError, OwnerAuthGroup, MAX_OWNER_AUTH_GROUPS,
+    canonical_owner_auth, canonical_owner_auth_multi_group, CanonicalOwnerAuth,
+    OwnerAuthError, OwnerAuthGroup, MAX_OWNER_AUTH_GROUPS,
 };
 pub use public::{PublicInputs, MAX_LOG_SLOTS, MIN_LOG_SLOTS};
-pub use public_logic::{validate_public_tx_logic, PublicLogicError, PublicLogicFacts};
+pub use public_logic::{
+    validate_body_semantics_no_hash, validate_public_tx_logic, PublicLogicError,
+    PublicLogicFacts,
+};
 pub use types::{
     Transaction, TxBody, TxInput, TxOutput, TxShape, ANCHOR_DEPTH, MAX_INPUTS, MAX_OUTPUTS,
 };

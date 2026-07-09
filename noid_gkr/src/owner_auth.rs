@@ -1897,7 +1897,27 @@ pub fn owner_auth_inputs_from_body_and_live_secrets(
     body: &TxBody,
     spend_secrets: &[SpendSecret],
 ) -> Result<OwnerAuthInputs, OwnerAuthStatementError> {
-    let statement = canonical_owner_auth(body)?;
+    owner_auth_inputs_from_statement_and_live_secrets(canonical_owner_auth(body)?, spend_secrets)
+}
+
+/// LOW-LEVEL: inputs from a statement built WITHOUT the one-owner
+/// consensus cap (`canonical_owner_auth_multi_group`) — the generic
+/// multi-group GKR machinery's unit-test entry; nothing consensus-facing
+/// may call it.
+pub fn owner_auth_inputs_from_body_and_live_secrets_multi_group(
+    body: &TxBody,
+    spend_secrets: &[SpendSecret],
+) -> Result<OwnerAuthInputs, OwnerAuthStatementError> {
+    owner_auth_inputs_from_statement_and_live_secrets(
+        noid_tx::canonical_owner_auth_multi_group(body)?,
+        spend_secrets,
+    )
+}
+
+fn owner_auth_inputs_from_statement_and_live_secrets(
+    statement: CanonicalOwnerAuth,
+    spend_secrets: &[SpendSecret],
+) -> Result<OwnerAuthInputs, OwnerAuthStatementError> {
     if spend_secrets.len() != statement.live_input_positions.len() {
         return Err(OwnerAuthStatementError::SecretCountMismatch {
             expected: statement.live_input_positions.len(),
@@ -2033,7 +2053,7 @@ mod tests {
             };
             let body = body_from_secrets(shape, &secrets, false);
             let inputs =
-                owner_auth_inputs_from_body_and_live_secrets(&body, &secrets).expect("inputs");
+                owner_auth_inputs_from_body_and_live_secrets_multi_group(&body, &secrets).expect("inputs");
             let circuit = OwnerAuthCircuit::build(inputs.layout);
             let mle = build_owner_auth_unified_from_inputs(&circuit, &inputs);
             let inv = mds_full_inverse();
@@ -2102,7 +2122,7 @@ mod tests {
             .map(|i| i.spend_secret.clone())
             .collect();
         let inputs =
-            owner_auth_inputs_from_body_and_live_secrets(&body, &live_secrets).expect("inputs");
+            owner_auth_inputs_from_body_and_live_secrets_multi_group(&body, &live_secrets).expect("inputs");
         assert_eq!(inputs.layout.owner_count, 1);
         let circuit = OwnerAuthCircuit::build(inputs.layout);
         let mut ch = owner_auth_gkr_channel();
@@ -2130,7 +2150,7 @@ mod tests {
             };
             let body = body_from_secrets(shape, &secrets, false);
             let inputs =
-                owner_auth_inputs_from_body_and_live_secrets(&body, &secrets).expect("inputs");
+                owner_auth_inputs_from_body_and_live_secrets_multi_group(&body, &secrets).expect("inputs");
             assert_eq!(inputs.layout.owner_count, k);
             let circuit = OwnerAuthCircuit::build(inputs.layout);
             let mut ch = owner_auth_gkr_channel();
@@ -2145,7 +2165,7 @@ mod tests {
     fn owner_auth_killshot_rejects_tamper() {
         let secrets = [secret(41), secret(42)];
         let body = body_from_secrets(TxShape::Standard4x8, &secrets, false);
-        let inputs = owner_auth_inputs_from_body_and_live_secrets(&body, &secrets).expect("inputs");
+        let inputs = owner_auth_inputs_from_body_and_live_secrets_multi_group(&body, &secrets).expect("inputs");
         let circuit = OwnerAuthCircuit::build(inputs.layout);
         let mut ch = owner_auth_gkr_channel();
         let (mut proof, _) = prove_owner_auth_killshot(&circuit, &inputs, &mut ch);
@@ -2161,7 +2181,7 @@ mod tests {
     fn owner_auth_rejects_tampered_or_off_shape_round_polys() {
         let secrets = [secret(71), secret(72)];
         let body = body_from_secrets(TxShape::Standard4x8, &secrets, false);
-        let inputs = owner_auth_inputs_from_body_and_live_secrets(&body, &secrets).expect("inputs");
+        let inputs = owner_auth_inputs_from_body_and_live_secrets_multi_group(&body, &secrets).expect("inputs");
         let circuit = OwnerAuthCircuit::build(inputs.layout);
         let prove = || {
             let mut ch = owner_auth_gkr_channel();
@@ -2203,7 +2223,7 @@ mod tests {
     fn owner_auth_rejects_canonical_statement_tamper() {
         let secrets = [secret(51), secret(52)];
         let body = body_from_secrets(TxShape::Standard4x8, &secrets, false);
-        let inputs = owner_auth_inputs_from_body_and_live_secrets(&body, &secrets).expect("inputs");
+        let inputs = owner_auth_inputs_from_body_and_live_secrets_multi_group(&body, &secrets).expect("inputs");
         let circuit = OwnerAuthCircuit::build(inputs.layout);
         let mut ch = owner_auth_gkr_channel();
         let (proof, _) = prove_owner_auth_killshot(&circuit, &inputs, &mut ch);
@@ -2228,7 +2248,7 @@ mod tests {
     fn owner_auth_rejects_boundary_batch_and_pcs_tamper() {
         let secrets = [secret(61), secret(62)];
         let body = body_from_secrets(TxShape::Standard4x8, &secrets, false);
-        let inputs = owner_auth_inputs_from_body_and_live_secrets(&body, &secrets).expect("inputs");
+        let inputs = owner_auth_inputs_from_body_and_live_secrets_multi_group(&body, &secrets).expect("inputs");
         let circuit = OwnerAuthCircuit::build(inputs.layout);
         let mut ch = owner_auth_gkr_channel();
         let (proof, _) = prove_owner_auth_killshot(&circuit, &inputs, &mut ch);

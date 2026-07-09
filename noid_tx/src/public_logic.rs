@@ -69,10 +69,19 @@ impl std::fmt::Display for PublicLogicError {
 
 impl std::error::Error for PublicLogicError {}
 
-pub fn validate_public_tx_logic(body: &TxBody) -> Result<PublicLogicFacts, PublicLogicError> {
-    if body.is_coinbase {
-        return Err(PublicLogicError::Coinbase);
-    }
+/// The SHARED body-semantics predicate — every consensus entrypoint
+/// (proof-native block validation, the sequential interpreter, mempool
+/// admission) calls THIS, so no path can accept a body another path
+/// rejects. No hashing (the 59-perm body hash is computed only where a
+/// caller needs it). Covers BOTH user transactions and the coinbase:
+///
+/// - shape support + input/output length bounds (both);
+/// - dead-entry canonicality: `valid = false` ⇒ the dummy zero pattern
+///   (both — the committed bitmap marks exactly the semantic leaves);
+/// - user tx: fee fits u64, live counts fit, at least one live input,
+///   ONE OWNER PER TRANSACTION, inputs balance outputs + fee;
+/// - coinbase: zero fee, NO live inputs, exactly one live output.
+pub fn validate_body_semantics_no_hash(body: &TxBody) -> Result<(), PublicLogicError> {
     if !body.shape.proof_supported() {
         return Err(PublicLogicError::UnsupportedShape(body.shape));
     }
@@ -92,11 +101,48 @@ pub fn validate_public_tx_logic(body: &TxBody) -> Result<PublicLogicFacts, Publi
         });
     }
 
-    let fee_u64 =
-        u64::try_from(body.fee).map_err(|_| PublicLogicError::FeeTooLarge { fee: body.fee })?;
+    // Canonicality: a dead entry carries dummy content — the committed
+    // liveness bitmap (the body hash's reserved leaf) is then exactly the
+    // "which leaves are semantic" selector and dead leaves are the zero
+    // pattern everywhere (native and in-trace). Applies to the coinbase
+    // too.
+    for (i, input) in body.inputs.iter().enumerate() {
+        if !input.valid
+            && (input.slot_index != 0 || input.value != 0 || input.owner.0 != [0u8; 32])
+        {
+            return Err(PublicLogicError::DeadEntryNotDummy { index: i });
+        }
+    }
+    for (j, output) in body.outputs.iter().enumerate() {
+        if !output.valid
+            && (output.slot_index != 0 || output.value != 0 || output.owner.0 != [0u8; 32])
+        {
+            return Err(PublicLogicError::DeadEntryNotDummy { index: j });
+        }
+    }
 
     let n_live_inputs_usize = body.inputs.iter().filter(|i| i.valid).count();
     let n_live_outputs_usize = body.outputs.iter().filter(|o| o.valid).count();
+
+    if body.is_coinbase {
+        if body.fee != 0 {
+            return Err(PublicLogicError::FeeTooLarge { fee: body.fee });
+        }
+        if n_live_inputs_usize != 0 {
+            return Err(PublicLogicError::LiveInputCountTooLarge {
+                actual: n_live_inputs_usize,
+            });
+        }
+        if n_live_outputs_usize != 1 {
+            return Err(PublicLogicError::LiveOutputCountTooLarge {
+                actual: n_live_outputs_usize,
+            });
+        }
+        return Ok(());
+    }
+
+    u64::try_from(body.fee).map_err(|_| PublicLogicError::FeeTooLarge { fee: body.fee })?;
+
     let n_live_inputs = u8::try_from(n_live_inputs_usize).map_err(|_| {
         PublicLogicError::LiveInputCountTooLarge {
             actual: n_live_inputs_usize,
@@ -105,7 +151,7 @@ pub fn validate_public_tx_logic(body: &TxBody) -> Result<PublicLogicFacts, Publi
     if n_live_inputs == 0 {
         return Err(PublicLogicError::NoLiveInputs);
     }
-    let n_live_outputs = u8::try_from(n_live_outputs_usize).map_err(|_| {
+    u8::try_from(n_live_outputs_usize).map_err(|_| {
         PublicLogicError::LiveOutputCountTooLarge {
             actual: n_live_outputs_usize,
         }
@@ -127,39 +173,18 @@ pub fn validate_public_tx_logic(body: &TxBody) -> Result<PublicLogicFacts, Publi
         }
     }
 
-    // Canonicality: a dead entry carries dummy content — the committed
-    // liveness bitmap (the body hash's reserved leaf) is then exactly the
-    // "which leaves are semantic" selector and dead leaves are the zero
-    // pattern everywhere (native and in-trace).
-    for (i, input) in body.inputs.iter().enumerate() {
-        if !input.valid
-            && (input.slot_index != 0 || input.value != 0 || input.owner.0 != [0u8; 32])
-        {
-            return Err(PublicLogicError::DeadEntryNotDummy { index: i });
-        }
-    }
-    for (j, output) in body.outputs.iter().enumerate() {
-        if !output.valid
-            && (output.slot_index != 0 || output.value != 0 || output.owner.0 != [0u8; 32])
-        {
-            return Err(PublicLogicError::DeadEntryNotDummy { index: j });
-        }
-    }
-
     let mut input_sum = 0u128;
     for input in body.inputs.iter().filter(|i| i.valid) {
         input_sum = input_sum
             .checked_add(input.value as u128)
             .ok_or(PublicLogicError::InputSumOverflow)?;
     }
-
     let mut output_sum = 0u128;
     for output in body.outputs.iter().filter(|o| o.valid) {
         output_sum = output_sum
             .checked_add(output.value as u128)
             .ok_or(PublicLogicError::OutputSumOverflow)?;
     }
-
     let rhs = output_sum
         .checked_add(body.fee)
         .ok_or(PublicLogicError::OutputPlusFeeOverflow)?;
@@ -170,6 +195,31 @@ pub fn validate_public_tx_logic(body: &TxBody) -> Result<PublicLogicFacts, Publi
             fee: body.fee,
         });
     }
+    Ok(())
+}
+
+pub fn validate_public_tx_logic(body: &TxBody) -> Result<PublicLogicFacts, PublicLogicError> {
+    if body.is_coinbase {
+        return Err(PublicLogicError::Coinbase);
+    }
+    validate_body_semantics_no_hash(body)?;
+
+    // The facts (already range-checked above).
+    let fee_u64 = body.fee as u64;
+    let n_live_inputs = body.inputs.iter().filter(|i| i.valid).count() as u8;
+    let n_live_outputs = body.outputs.iter().filter(|o| o.valid).count() as u8;
+    let input_sum: u128 = body
+        .inputs
+        .iter()
+        .filter(|i| i.valid)
+        .map(|i| i.value as u128)
+        .sum();
+    let output_sum: u128 = body
+        .outputs
+        .iter()
+        .filter(|o| o.valid)
+        .map(|o| o.value as u128)
+        .sum();
 
     let tx_body_hash = hash_tx_body_for_shape(
         body.shape,

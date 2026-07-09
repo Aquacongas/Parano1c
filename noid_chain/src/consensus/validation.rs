@@ -520,6 +520,9 @@ mod tests {
     }
 
     fn fee_test_user_tx(fee: u128) -> Transaction {
+        // Balanced body (the shared semantics predicate enforces
+        // input == outputs + fee): the first output absorbs whatever the
+        // fee leaves.
         tx_from_body(TxBody {
             shape: noid_tx::TxShape::Standard4x8,
             epoch_anchor: [1u8; 32],
@@ -534,7 +537,7 @@ mod tests {
             outputs: vec![
                 TxOutput {
                     slot_index: 2,
-                    value: 1_000,
+                    value: (10_000u128 - fee) as u64,
                     owner: Address([4u8; 32]),
                     valid: true,
                 },
