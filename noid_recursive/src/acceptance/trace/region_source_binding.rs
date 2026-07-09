@@ -276,6 +276,7 @@ pub fn discharge_auth_pcs_obligations_via_region(
     // (pair-leaf + merkle legs) + ONE walk C (FRICHANL channels) at common-period
     // offsets, with K per-tree source-tree exposures and a per-tx algebra loop.
     let k = obligations.len();
+    let mut ledger = b.num_wires();
 
     // ===================================================================
     // Class-level shapes (identical across the block's txs; the class is
@@ -875,6 +876,7 @@ pub fn discharge_auth_pcs_obligations_via_region(
             }
         }
     } // end `for tx in 0..k`
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "plural: per-tx algebra loop");
 
     // ===================================================================
     // Exact-state families (block-level, chunked across the K tx blocks —
@@ -1340,6 +1342,7 @@ pub fn discharge_auth_pcs_obligations_via_region(
     );
     let mut slices: Vec<WitnessSlice> =
         cols.iter().map(|c| alloc_column_slice(b, c, w_log).0).collect();
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "plural: walk-A columns");
     // The walk-A discharge transcript is RECORDED (not replayed in-trace):
     // its absorb/squeeze chain rides walk C's region-2 blocks below, where
     // the challenge wires the twins consumed pin to walk-C carry cells.
@@ -1349,6 +1352,7 @@ pub fn discharge_auth_pcs_obligations_via_region(
         spine_union_spec.as_ref(), w_log, &native_u,
     ));
     let rec_a = ch_a.finish();
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "plural: walk-A twin");
 
     // ===================================================================
     // Walk B (once): the two feed-forward wallet legs + the 2-permutation
@@ -1404,12 +1408,14 @@ pub fn discharge_auth_pcs_obligations_via_region(
     let n_slices_a = slices.len();
     let slices_b: Vec<WitnessSlice> =
         cb.iter().map(|c| alloc_column_slice(b, c, w_log_b).0).collect();
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "plural: walk-B columns");
     // Walk B's discharge transcript is recorded too (region-2 block).
     let mut ch_b = FsChannelUnionRecorder::new(DOMAIN_B);
     let (mut wb_claims, wb_cell_pins) = discharge_merkle_union(
         b, &mut ch_b, &fixed_b, &cb_c, &ff_specs, &legs, w_log_b, &native_b,
     );
     let rec_b = ch_b.finish();
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "plural: walk-B twin");
     for c in wb_claims.iter_mut() {
         c.slice += n_slices_a;
     }
@@ -1446,6 +1452,7 @@ pub fn discharge_auth_pcs_obligations_via_region(
             pin_eq(b, &c_cell.add(&cr_cell).add(&mix), &root_wires[lane]);
         }
     }
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "plural: stage-2 A/B cell pins");
 
     // ===================================================================
     // Walk C (once): REGION 1 tiles the K txs' FRICHANL transcript channels;
@@ -1475,8 +1482,10 @@ pub fn discharge_auth_pcs_obligations_via_region(
     let n_slices_ab = slices.len();
     let slices_c: Vec<WitnessSlice> =
         u_c.committed.iter().map(|c| alloc_column_slice(b, c, u_c.w_log).0).collect();
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "plural: walk-C columns");
     let mut ch_c = FsChannelTrace::new(b, DOMAIN_C);
     let mut wc_claims = discharge_duplex_union(b, &mut ch_c, &u_c, &native_c, 0);
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "plural: walk-C twin (inline)");
     for c in wc_claims.iter_mut() {
         c.slice += n_slices_ab;
     }
@@ -1528,6 +1537,7 @@ pub fn discharge_auth_pcs_obligations_via_region(
     }
     slices.extend(slices_c);
     claims.extend(wc_claims);
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "plural: cell pins + recordings");
 
     // Resolve each claim's column index into its committed WitnessSlice.
     claims

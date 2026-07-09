@@ -487,8 +487,10 @@ pub(crate) fn discharge_r_pcs_via_region(
 
     // ---- The two walk discharges (inline transcripts — a walk cannot
     // host its own transcript, and at link scale both are cheap).
+    let mut ledger = b.num_wires();
     let mut ch_a = FsChannelTrace::new(b, DOMAIN_LA);
     let mut claims = discharge_duplex_union(b, &mut ch_a, &asm.u_a, &native_a, 0);
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "r-pcs: walk L-A twin (inline)");
     let mut ch_b = FsChannelTrace::new(b, DOMAIN_LB);
     let (mut claims_b, leg_pins) = discharge_merkle_union(
         b,
@@ -501,6 +503,7 @@ pub(crate) fn discharge_r_pcs_via_region(
         &native_b,
     );
     assert!(leg_pins.is_empty(), "no 2-perm legs in the link walks");
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "r-pcs: walk L-B twin (inline)");
     for c in claims_b.iter_mut() {
         c.slice += slices_a.len();
     }
