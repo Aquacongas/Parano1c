@@ -33,6 +33,7 @@ pub mod block_slots;
 pub mod link;
 pub mod region;
 pub mod shape;
+pub mod split_link;
 pub mod trace;
 
 /// Env-gated (`NOID_ROW_LEDGER=1`) wire-count checkpoint: prints the delta

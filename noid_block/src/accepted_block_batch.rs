@@ -2377,16 +2377,29 @@ mod tests {
     /// so the region discharge sees `k = tx_per_block` obligations -- this is what
     /// exercises the MULTI-tx wallet-PCS region discharge end to end.
     fn chained_multi_tx_blocks(n_blocks: usize, tx_per_block: usize) -> Vec<BlockUnit> {
-        assert!(n_blocks >= 1 && tx_per_block >= 1);
+        chained_blocks_with_tx_counts(&vec![tx_per_block; n_blocks])
+    }
+
+    /// [`chained_multi_tx_blocks`] generalized to a PER-BLOCK tx count:
+    /// block i carries `counts[i]` standard txs and spends the first
+    /// `counts[i]` outputs of its predecessor (so counts must be
+    /// non-increasing). Mixed counts produce chained blocks of DIFFERENT
+    /// consensus tiers -- the split-link cross-class fixture.
+    fn chained_blocks_with_tx_counts(counts: &[usize]) -> Vec<BlockUnit> {
+        assert!(!counts.is_empty() && counts.iter().all(|&c| c >= 1));
+        for w in counts.windows(2) {
+            assert!(w[1] <= w[0], "each block can only spend its predecessor's outputs");
+        }
+        let n_blocks = counts.len();
         let secret = spend_secret(7);
         let owner = derive_address(&secret);
         let input_value = 10_000_000u64;
 
         // Slot space must hold the premined inputs + every block's fresh outputs.
-        let needed = 2 + tx_per_block * (n_blocks + 1);
+        let needed = 2 + counts[0] + counts.iter().sum::<usize>();
         let log_slots = needed.next_power_of_two().trailing_zeros().max(4) as usize;
         let mut state = ChainState::with_log_slots(log_slots);
-        let mut current_slots: Vec<u32> = (0..tx_per_block as u32).map(|i| 2 + i).collect();
+        let mut current_slots: Vec<u32> = (0..counts[0] as u32).map(|i| 2 + i).collect();
         for &s in &current_slots {
             state
                 .state
@@ -2401,8 +2414,8 @@ mod tests {
                 .unwrap();
         }
         state.rebuild_exact_utxo_root_loaded().unwrap();
-        state.active_slot_count = tx_per_block as u64;
-        state.alloc_counter = 2 + tx_per_block as u64;
+        state.active_slot_count = counts[0] as u64;
+        state.alloc_counter = 2 + counts[0] as u64;
 
         let mut parent = BlockHeader {
             prev_block_hash: [0u8; 32],
@@ -2433,13 +2446,14 @@ mod tests {
         };
 
         let mut units = Vec::with_capacity(n_blocks);
-        let mut values: Vec<u64> = vec![input_value; tx_per_block];
-        let mut next_free = 2 + tx_per_block as u32;
+        let mut values: Vec<u64> = vec![input_value; counts[0]];
+        let mut next_free = 2 + counts[0] as u32;
         for i in 0..n_blocks {
-            let output_slots: Vec<u32> =
-                (0..tx_per_block as u32).map(|j| next_free + j).collect();
-            next_free += tx_per_block as u32;
-            let specs: Vec<(u32, u32, u64)> = (0..tx_per_block)
+            let cnt = counts[i];
+            assert!(cnt <= current_slots.len(), "block {i} overspends its predecessor");
+            let output_slots: Vec<u32> = (0..cnt as u32).map(|j| next_free + j).collect();
+            next_free += cnt as u32;
+            let specs: Vec<(u32, u32, u64)> = (0..cnt)
                 .map(|j| (current_slots[j], output_slots[j], values[j]))
                 .collect();
             let anchor = AnchorInfo {
@@ -2757,6 +2771,409 @@ mod tests {
             "B_t matrices differ across blocks of the same tier"
         );
         assert!(built2.r1cs.satisfies(&built2.witness), "second B_t trace unsatisfiable");
+    }
+
+    /// The SPLIT LINK cross-class chain (two-level π, Stage A part 2): two
+    /// block classes on different ladder shapes (tier-8 @ m=23, tier-4 @
+    /// m=22), two link classes sharing one shape+spec (m=24), and the real
+    /// chain crossing classes — genesis link (slot hi, covering the tier-8
+    /// block 1) → tip link (slot lo, covering the tier-4 block 2) — decided
+    /// natively. Exercises: the whitelist-lane digest derivation (`w_D =
+    /// Σ β·WL + g·D_T`), whitelist inheritance, the baked block digest +
+    /// spec in [R]_B, the two fold twins with per-matrix lanes (link lane
+    /// β-routing, block lane pass-through across slots, liveness monotone
+    /// OR from a dead genesis), block-accumulator chaining across the two
+    /// envelopes, per-class matrix fixity (throwaway vs real builds — the
+    /// whitelist values are witness-only), and the split decider with its
+    /// negatives (wrong whitelist refs, missing matrix on a live lane,
+    /// wrong lane matrix, tampered lane IO, genesis tip).
+    #[test]
+    #[ignore = "heavy: six proves incl. four at the m=24 link shape"]
+    fn split_link_cross_class_chain_e2e() {
+        use noid_ivc_core::challenger::FsLaneChallenger;
+        use noid_ivc_core::field::F128;
+        use noid_ivc_core::pcs::{self, PcsParams};
+        use noid_ivc_core::proof::FieldShape;
+        use noid_ivc_core::zerocheck::K_SKIP;
+        use noid_ivc_prover::field_prover::prove_field_with_public_io;
+        use noid_recursive::acceptance::block_class::{build_block_proof_trace, BlockClass};
+        use noid_recursive::acceptance::link::{genesis_witness, LinkBlock, LinkEnvelope};
+        use noid_recursive::acceptance::split_link::{
+            build_split_link, decide_tip_split, tip_block_accumulator_split, LadderSlotInfo,
+            SplitLinkClass, SplitLinkInput,
+        };
+        use noid_recursive::acceptance::trace::region_source_binding::RegionDischargeParams;
+        use std::time::Instant;
+
+        let shape = |m: usize| FieldShape {
+            m,
+            k_log: m,
+            k_skip: K_SKIP,
+            const_pin: Some(0),
+        };
+        let params = |m: usize| PcsParams {
+            m: m + pcs::LOG_PACKING,
+            log_inv_rate: 2,
+            log_batch_size: 5,
+            profile: Default::default(),
+        };
+        const MB_LO: usize = 22; // the tier-4 block class shape
+        const MB_HI: usize = 23; // the tier-8 block class shape (heterogeneity on purpose)
+        const ML: usize = 24; // the link shape: two [R] replays, pre-diet
+        let rp = RegionDischargeParams { nq: 2 };
+
+        // Block 1: 5 std txs (consensus tier 8); block 2: 3 std txs (tier 4).
+        let units = chained_blocks_with_tx_counts(&[5, 3]);
+        fn mk(u: &BlockUnit) -> LinkBlock<'_> {
+            LinkBlock {
+                start_accumulator: &u.start_accumulator,
+                end_accumulator: &u.end_accumulator,
+                inputs: &u.inputs,
+                proof: &u.proof,
+                config: Default::default(),
+            }
+        }
+
+        // ---- Block classes + block proofs.
+        let t0 = Instant::now();
+        let b_hi = BlockClass::freeze(shape(MB_HI), params(MB_HI), rp, &mk(&units[0]), 8);
+        let b_lo = BlockClass::freeze(shape(MB_LO), params(MB_LO), rp, &mk(&units[1]), 4);
+        eprintln!("[split-e2e] block classes frozen: {:.1?}", t0.elapsed());
+        let prove_block = |class: &BlockClass,
+                           unit: &BlockUnit|
+         -> (noid_ivc_core::field_r1cs::FieldR1cs, LinkEnvelope) {
+            let built = build_block_proof_trace(class, &mk(unit));
+            assert!(built.r1cs.satisfies(&built.witness), "π_block trace unsatisfiable");
+            let mut ch = FsLaneChallenger::new(b"history-block-v0");
+            let (proof, commitment, _) = prove_field_with_public_io(
+                &built.r1cs,
+                &built.witness,
+                &class.pcs_params,
+                &class.spec,
+                &built.io,
+                &mut ch,
+            );
+            (
+                built.r1cs,
+                LinkEnvelope {
+                    proof,
+                    commitment,
+                    io: built.io,
+                },
+            )
+        };
+        let t0 = Instant::now();
+        let (b_hi_r1cs, env_block1) = prove_block(&b_hi, &units[0]);
+        let (b_lo_r1cs, env_block2) = prove_block(&b_lo, &units[1]);
+        eprintln!("[split-e2e] block proofs: {:.1?}", t0.elapsed());
+
+        // ---- The ladder + the two link classes (shared shape and spec).
+        let ladder = vec![
+            LadderSlotInfo {
+                tier: 4,
+                b_shape: shape(MB_LO),
+                b_digest: *b_lo.class_statement_digest.get().unwrap(),
+            },
+            LadderSlotInfo {
+                tier: 8,
+                b_shape: shape(MB_HI),
+                b_digest: *b_hi.class_statement_digest.get().unwrap(),
+            },
+        ];
+        let genesis_acc = units[0].start_accumulator.clone();
+        let l_lo = SplitLinkClass::new(
+            shape(ML),
+            params(ML),
+            genesis_acc.clone(),
+            ladder.clone(),
+            0,
+            &b_lo,
+        );
+        let l_hi = SplitLinkClass::new(shape(ML), params(ML), genesis_acc, ladder, 1, &b_hi);
+        assert_eq!(l_lo.spec.io_len, l_hi.spec.io_len, "shared spec io_len");
+        assert_eq!(
+            l_lo.spec.io_slice.log2_len, l_hi.spec.io_slice.log2_len,
+            "shared spec slice"
+        );
+
+        // ---- The genesis dummy T: one proof serves both classes.
+        let t0 = Instant::now();
+        let t_witness = genesis_witness(&shape(ML));
+        let t_io = vec![F128::ZERO; l_hi.spec.io_len];
+        let mut ch = FsLaneChallenger::new(b"history-link-v0");
+        let (t_proof, t_commitment, _) = prove_field_with_public_io(
+            &l_hi.genesis,
+            &t_witness,
+            &l_hi.pcs_params,
+            &l_hi.spec,
+            &t_io,
+            &mut ch,
+        );
+        let env_t = LinkEnvelope {
+            proof: t_proof,
+            commitment: t_commitment,
+            io: t_io,
+        };
+        eprintln!("[split-e2e] T proof: {:.1?}", t0.elapsed());
+
+        // ---- Throwaway builds derive the link-class digests (whitelist
+        // values are WITNESS data — the matrices ignore them; per-class
+        // fixity against the real builds asserts exactly that). A
+        // non-genesis throwaway must still satisfy whitelist inheritance
+        // and verify its predecessor against `WL[prev_slot]`, so the
+        // derivation runs as a chain: zero-WL genesis (digest only) →
+        // proven genesis carrying its own digest → the other class.
+        let prove_link = |class: &SplitLinkClass,
+                          r1cs: &noid_ivc_core::field_r1cs::FieldR1cs,
+                          witness: &[F128],
+                          io: Vec<F128>|
+         -> LinkEnvelope {
+            let mut ch = FsLaneChallenger::new(b"history-link-v0");
+            let (proof, commitment, _) = prove_field_with_public_io(
+                r1cs,
+                witness,
+                &class.pcs_params,
+                &class.spec,
+                &io,
+                &mut ch,
+            );
+            LinkEnvelope {
+                proof,
+                commitment,
+                io,
+            }
+        };
+        let t0 = Instant::now();
+        let tw0 = build_split_link(
+            &l_hi,
+            &SplitLinkInput {
+                prev: &env_t,
+                verified_digest: l_hi.genesis_digest,
+                prev_slot: 0,
+                genesis: true,
+                link_class_digests: vec![[0u8; 32]; 2],
+                block: &env_block1,
+                fold_matrix_link: &l_hi.genesis,
+                fold_matrix_block: &b_hi_r1cs,
+            },
+        );
+        let d_l_hi = *l_hi.class_statement_digest.get().unwrap();
+        let tw0_r1cs = tw0.r1cs;
+        drop(tw0.witness);
+        let tw1 = build_split_link(
+            &l_hi,
+            &SplitLinkInput {
+                prev: &env_t,
+                verified_digest: l_hi.genesis_digest,
+                prev_slot: 0,
+                genesis: true,
+                link_class_digests: vec![[0u8; 32], d_l_hi],
+                block: &env_block1,
+                fold_matrix_link: &l_hi.genesis,
+                fold_matrix_block: &b_hi_r1cs,
+            },
+        );
+        assert_eq!(
+            tw1.r1cs.statement_digest(),
+            tw0_r1cs.statement_digest(),
+            "L_hi matrix depends on whitelist values"
+        );
+        drop(tw0_r1cs);
+        assert!(tw1.r1cs.satisfies(&tw1.witness), "throwaway genesis unsatisfiable");
+        let tw1_r1cs = tw1.r1cs;
+        let env_tw1 = prove_link(&l_hi, &tw1_r1cs, &tw1.witness, tw1.io);
+        drop(tw1.witness);
+        let tw_l2 = build_split_link(
+            &l_lo,
+            &SplitLinkInput {
+                prev: &env_tw1,
+                verified_digest: d_l_hi,
+                prev_slot: 1,
+                genesis: false,
+                link_class_digests: vec![[0u8; 32], d_l_hi],
+                block: &env_block2,
+                fold_matrix_link: &tw1_r1cs,
+                fold_matrix_block: &b_lo_r1cs,
+            },
+        );
+        let d_l_lo = *l_lo.class_statement_digest.get().unwrap();
+        let tw_l2_r1cs = tw_l2.r1cs;
+        drop(tw_l2.witness);
+        drop(env_tw1);
+        eprintln!("[split-e2e] digest derivation chain: {:.1?}", t0.elapsed());
+
+        // ---- The real chain: genesis (slot hi) → tip (slot lo).
+        let digests = vec![d_l_lo, d_l_hi];
+        let t0 = Instant::now();
+        let gen = build_split_link(
+            &l_hi,
+            &SplitLinkInput {
+                prev: &env_t,
+                verified_digest: l_hi.genesis_digest,
+                prev_slot: 0,
+                genesis: true,
+                link_class_digests: digests.clone(),
+                block: &env_block1,
+                fold_matrix_link: &l_hi.genesis,
+                fold_matrix_block: &b_hi_r1cs,
+            },
+        );
+        assert_eq!(
+            gen.r1cs.statement_digest(),
+            tw1_r1cs.statement_digest(),
+            "L_hi class fixity (throwaway vs real)"
+        );
+        assert!(
+            gen.r1cs.a_0 == tw1_r1cs.a_0 && gen.r1cs.b_0 == tw1_r1cs.b_0,
+            "L_hi matrices differ between throwaway and real build"
+        );
+        drop(tw1_r1cs);
+        assert!(gen.r1cs.satisfies(&gen.witness), "genesis link unsatisfiable");
+        let gen_r1cs = gen.r1cs;
+        let env_gen = prove_link(&l_hi, &gen_r1cs, &gen.witness, gen.io);
+        drop(gen.witness);
+        eprintln!("[split-e2e] genesis link: {:.1?}", t0.elapsed());
+
+        let t0 = Instant::now();
+        let l2 = build_split_link(
+            &l_lo,
+            &SplitLinkInput {
+                prev: &env_gen,
+                verified_digest: d_l_hi,
+                prev_slot: 1,
+                genesis: false,
+                link_class_digests: digests.clone(),
+                block: &env_block2,
+                fold_matrix_link: &gen_r1cs,
+                fold_matrix_block: &b_lo_r1cs,
+            },
+        );
+        assert_eq!(
+            l2.r1cs.statement_digest(),
+            tw_l2_r1cs.statement_digest(),
+            "L_lo class fixity (throwaway vs real)"
+        );
+        assert!(
+            l2.r1cs.a_0 == tw_l2_r1cs.a_0 && l2.r1cs.b_0 == tw_l2_r1cs.b_0,
+            "L_lo matrices differ between throwaway and real build"
+        );
+        drop(tw_l2_r1cs);
+        assert!(l2.r1cs.satisfies(&l2.witness), "tip link unsatisfiable");
+        let l2_r1cs = l2.r1cs;
+        let mut env_tip = prove_link(&l_lo, &l2_r1cs, &l2.witness, l2.io);
+        drop(l2.witness);
+        eprintln!("[split-e2e] tip link: {:.1?}", t0.elapsed());
+
+        // ---- Lane liveness sanity: link lane hi live (the tip folded the
+        // genesis link's claim), link lane lo dead (nobody verified an
+        // L_lo proof yet), both block lanes live.
+        let layout = l_lo.layout();
+        assert_eq!(env_tip.io[layout.link_lanes[0].live], F128::ZERO);
+        assert_eq!(env_tip.io[layout.link_lanes[1].live], F128::ONE);
+        assert_eq!(env_tip.io[layout.b_lanes[0].live], F128::ONE);
+        assert_eq!(env_tip.io[layout.b_lanes[1].live], F128::ONE);
+
+        // ---- The decider accepts; the anchored accumulator is block 2's.
+        decide_tip_split(
+            &l_lo,
+            &l2_r1cs,
+            &env_tip,
+            &digests,
+            &[None, Some(&gen_r1cs)],
+            &[Some(&b_lo_r1cs), Some(&b_hi_r1cs)],
+        )
+        .expect("split decider accepts the cross-class tip");
+        let anchored = tip_block_accumulator_split(&l_lo, &env_tip);
+        assert_eq!(anchored.height, units[1].end_accumulator.height);
+        assert_eq!(anchored.state_root, units[1].end_accumulator.state_root);
+        assert_eq!(anchored.chain_hash, units[1].end_accumulator.chain_hash);
+
+        // ---- Decider negatives.
+        // Wrong whitelist reference set (swapped digests).
+        let swapped = vec![digests[1], digests[0]];
+        assert!(
+            decide_tip_split(
+                &l_lo,
+                &l2_r1cs,
+                &env_tip,
+                &swapped,
+                &[None, Some(&gen_r1cs)],
+                &[Some(&b_lo_r1cs), Some(&b_hi_r1cs)],
+            )
+            .is_err(),
+            "swapped whitelist references slipped through"
+        );
+        // A live lane without its matrix.
+        assert!(
+            decide_tip_split(
+                &l_lo,
+                &l2_r1cs,
+                &env_tip,
+                &digests,
+                &[None, None],
+                &[Some(&b_lo_r1cs), Some(&b_hi_r1cs)],
+            )
+            .is_err(),
+            "live link lane without its matrix slipped through"
+        );
+        // The wrong matrix on a live block lane (different shape: caught by
+        // the lane-width guard).
+        assert!(
+            decide_tip_split(
+                &l_lo,
+                &l2_r1cs,
+                &env_tip,
+                &digests,
+                &[None, Some(&gen_r1cs)],
+                &[Some(&b_hi_r1cs), Some(&b_lo_r1cs)],
+            )
+            .is_err(),
+            "swapped block matrices slipped through"
+        );
+        // The wrong matrix of the SAME shape on a live link lane (the tip
+        // class instead of the genesis class): the claim must evaluate false.
+        assert!(
+            decide_tip_split(
+                &l_lo,
+                &l2_r1cs,
+                &env_tip,
+                &digests,
+                &[None, Some(&l2_r1cs)],
+                &[Some(&b_lo_r1cs), Some(&b_hi_r1cs)],
+            )
+            .is_err(),
+            "wrong same-shape link matrix slipped through"
+        );
+        // Tampered lane IO: the tip proof itself must reject (IO is
+        // PCS-bound). Flip, check, flip back (char 2).
+        let tamper = layout.b_lanes[0].value;
+        env_tip.io[tamper] += F128::ONE;
+        assert!(
+            decide_tip_split(
+                &l_lo,
+                &l2_r1cs,
+                &env_tip,
+                &digests,
+                &[None, Some(&gen_r1cs)],
+                &[Some(&b_lo_r1cs), Some(&b_hi_r1cs)],
+            )
+            .is_err(),
+            "tampered lane IO slipped through"
+        );
+        env_tip.io[tamper] += F128::ONE;
+        // A genesis link is not an acceptable tip.
+        let genesis_verdict = decide_tip_split(
+            &l_hi,
+            &gen_r1cs,
+            &env_gen,
+            &digests,
+            &[None, None],
+            &[None, Some(&b_hi_r1cs)],
+        );
+        assert!(
+            matches!(&genesis_verdict, Err(e) if e.contains("genesis")),
+            "genesis tip verdict: {genesis_verdict:?}"
+        );
     }
 
     /// Exact-state REGION parity on a REAL block (task 4b): build the complete

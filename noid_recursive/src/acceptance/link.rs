@@ -528,7 +528,7 @@ fn alloc_expr(b: &mut FieldR1csBuilder, v: F128) -> LinExpr {
 /// `e₀·q₀·(α·Σ_r λ_r·zp_r + (Σ_r λ_r)·zp_0)` with `e₀ = Π(1 + x_i)`,
 /// `q₀ = Π(1 + r_i)` — no tensors. Returns the value the deferred
 /// fresh claim must equal when `g = 1`.
-fn genesis_baked_claim_value(
+pub(crate) fn genesis_baked_claim_value(
     b: &mut FieldR1csBuilder,
     genesis: &FieldR1cs,
     fresh: &FreshLincheckClaimTrace,

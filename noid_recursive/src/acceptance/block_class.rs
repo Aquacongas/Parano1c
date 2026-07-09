@@ -58,6 +58,12 @@ pub struct BlockIoLayout {
     pub len: usize,
 }
 
+/// Fixed offsets of the accumulator lanes within a block class's IO —
+/// independent of the region tail, so link-side consumers can address them
+/// without knowing the frozen claim shape.
+pub const BLOCK_IO_START_ACC: usize = 0;
+pub const BLOCK_IO_END_ACC: usize = 5;
+
 pub fn block_io_layout(n_claims: usize, max_arity: usize) -> BlockIoLayout {
     let region_len = n_claims * (max_arity + 1);
     BlockIoLayout {
