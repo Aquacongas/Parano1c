@@ -94,19 +94,15 @@ unsafe fn reduce_gcm_256(x_hi: __m256i, x_lo: __m256i) -> __m256i {
     _mm256_xor_si256(lo, v3)
 }
 
-/// SIMD flat-basis squaring of a `PackedBlock128` (two u128 lanes).
+/// Per-lane flat-basis squaring directly on a `__m256i` (two u128 lanes) —
+/// the register-domain core shared by [`packed_square_flat_avx2`] and the
+/// vector permutation kernels. Bit-spread + shift-XOR reduction: no CLMUL,
+/// so it runs on the shift/ALU ports and overlaps CLMUL-based multiplies.
 ///
 /// # Safety
-/// Requires runtime AVX2 support. The module-level cfg gate guarantees
-/// this at compile time.
-#[inline]
-#[target_feature(enable = "avx2")]
-pub unsafe fn packed_square_flat_avx2(x: PackedBlock128) -> PackedBlock128 {
-    // PackedBlock128 is repr(C) { lanes: [u128; 2] } = 32 bytes, layout-
-    // compatible with __m256i. loadu/storeu handle arbitrary alignment.
-    let lanes_ptr = &x as *const PackedBlock128 as *const __m256i;
-    let val = _mm256_loadu_si256(lanes_ptr);
-
+/// Requires AVX2; the module-level cfg gate guarantees it at compile time.
+#[inline(always)]
+pub unsafe fn square_gcm_x2(val: __m256i) -> __m256i {
     let low_half_mask = _mm256_set_epi64x(0, -1, 0, -1);
     // Extract lo-u64 of each 128-bit lane (zero the hi-u64).
     let lo64s = _mm256_and_si256(val, low_half_mask);
@@ -118,7 +114,22 @@ pub unsafe fn packed_square_flat_avx2(x: PackedBlock128) -> PackedBlock128 {
     let s_hi = bit_spread(hi64s);
 
     // Reduce the 256-bit per-lane value to 128 bits.
-    let result = reduce_gcm_256(s_hi, s_lo);
+    reduce_gcm_256(s_hi, s_lo)
+}
+
+/// SIMD flat-basis squaring of a `PackedBlock128` (two u128 lanes).
+///
+/// # Safety
+/// Requires runtime AVX2 support. The module-level cfg gate guarantees
+/// this at compile time.
+#[inline(always)]
+pub unsafe fn packed_square_flat_avx2(x: PackedBlock128) -> PackedBlock128 {
+    // PackedBlock128 is repr(C) { lanes: [u128; 2] } = 32 bytes, layout-
+    // compatible with __m256i. loadu/storeu handle arbitrary alignment.
+    let lanes_ptr = &x as *const PackedBlock128 as *const __m256i;
+    let val = _mm256_loadu_si256(lanes_ptr);
+
+    let result = square_gcm_x2(val);
 
     let mut out = PackedBlock128::ZERO;
     let out_ptr = &mut out as *mut PackedBlock128 as *mut __m256i;

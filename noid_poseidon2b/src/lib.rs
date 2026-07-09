@@ -5,6 +5,7 @@
 //! UTXO-layer primitives, and hasher trait.
 
 pub mod batch;
+pub(crate) mod batch_avx2;
 pub mod channel;
 pub mod hasher;
 pub mod hasher_impl;

@@ -538,6 +538,37 @@ fn flat_tables() -> &'static FlatTables {
     })
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "vpclmulqdq",
+    not(target_feature = "avx512f"),
+))]
+pub(crate) fn vec_tables() -> &'static crate::batch_avx2::VecTables {
+    static TABLES: OnceLock<crate::batch_avx2::VecTables> = OnceLock::new();
+    TABLES.get_or_init(|| {
+        let t = flat_tables();
+        let mut mds_partial_diag = [0u128; STATE_SIZE];
+        for i in 0..STATE_SIZE {
+            mds_partial_diag[i] = t.mds_partial[i][i];
+            for j in 0..STATE_SIZE {
+                // The register-domain kernel folds the off-diagonal entries
+                // into one shared XOR sum — valid only while they are all 1.
+                assert!(
+                    i == j || t.mds_partial_is_one[i][j],
+                    "partial MDS off-diagonal must be 1"
+                );
+            }
+        }
+        crate::batch_avx2::VecTables {
+            rc: t.rc,
+            mds_full: t.mds_full,
+            mds_full_is_one: t.mds_full_is_one,
+            mds_partial_diag,
+        }
+    })
+}
+
 /// Apply PackedBlock128 Poseidon2b permutation to P states simultaneously.
 ///
 /// Runs the entire schedule in flat basis: a single tower→flat pass at the
@@ -555,10 +586,79 @@ pub fn packed_poseidon2b_permute(states: &mut [PackedBlock128; STATE_SIZE]) {
     }
 }
 
+/// Number of independent packed state groups the wide batch kernels keep in
+/// flight. One permutation is a serial multiply chain (S-box then MDS every
+/// round), so a single group leaves the CLMUL unit mostly idle waiting on
+/// latency; interleaving independent hashes converts the batch from
+/// latency-bound to throughput-bound. 4 groups × PACKED_LANES lanes saturate
+/// the carry-less-multiply port without spilling the working set.
+const PERM_INTERLEAVE: usize = 4;
+
+/// Apply the flat-basis packed permutation to several INDEPENDENT packed
+/// state groups in lockstep — each round phase runs across all groups before
+/// the next phase starts, so the out-of-order core overlaps the groups'
+/// multiply chains. Bit-identical per group to
+/// [`packed_poseidon2b_permute_flat`].
+pub fn packed_poseidon2b_permute_flat_many(states: &mut [[PackedBlock128; STATE_SIZE]]) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx2",
+        target_feature = "vpclmulqdq",
+        not(target_feature = "avx512f"),
+    ))]
+    {
+        return crate::batch_avx2::permute_flat_groups(states, vec_tables());
+    }
+    #[allow(unreachable_code)]
+    {
+        let tables = flat_tables();
+
+        for s in states.iter_mut() {
+            packed_apply_mds_full_flat(s, tables);
+        }
+
+        for r in 0..N_ROUNDS {
+            let is_full = !((F_ROUNDS / 2..F_ROUNDS / 2 + P_ROUNDS).contains(&r));
+
+            if is_full {
+                for s in states.iter_mut() {
+                    for i in 0..STATE_SIZE {
+                        s[i] =
+                            s[i].xor(PackedBlock128::broadcast(Block128::from(tables.rc[i][r])));
+                        s[i] = packed_sbox_x7_flat(s[i]);
+                    }
+                }
+                for s in states.iter_mut() {
+                    packed_apply_mds_full_flat(s, tables);
+                }
+            } else {
+                let rc_flat = tables.rc[0][r];
+                for s in states.iter_mut() {
+                    s[0] = s[0].xor(PackedBlock128::broadcast(Block128::from(rc_flat)));
+                    s[0] = packed_sbox_x7_flat(s[0]);
+                }
+                for s in states.iter_mut() {
+                    packed_apply_mds_partial_flat(s, tables);
+                }
+            }
+        }
+    }
+}
+
 /// Packed permutation acting on states whose lanes already carry **flat
 /// (GCM) basis** bit patterns — the batched twin of
 /// `native::permutation::permute_flat_u128`, with no boundary conversion.
 pub fn packed_poseidon2b_permute_flat(states: &mut [PackedBlock128; STATE_SIZE]) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx2",
+        target_feature = "vpclmulqdq",
+        not(target_feature = "avx512f"),
+    ))]
+    {
+        return crate::batch_avx2::permute_flat_one(states, vec_tables());
+    }
+    #[allow(unreachable_code)]
     let tables = flat_tables();
 
     // Initial MDS_FULL multiplication (flat basis).
@@ -627,14 +727,15 @@ pub fn compress_flat_ff_batch_interleaved_with_tag_into(
     let [iv_hi, iv_lo] = crate::native::domain::capacity_iv_flat(tag);
     let chunks = n / PACKED_LANES;
 
-    for chunk in 0..chunks {
-        let mut states = [PackedBlock128::ZERO; STATE_SIZE];
-        let off = chunk * PACKED_LANES;
-
-        // state = [a0, a1, b0 ^ IV_hi, b1 ^ IV_lo] (all lanes flat bit
-        // patterns; Block128 is used as a plain 128-bit container here).
+    // Load one packed group: state = [a0, a1, b0 ^ IV_hi, b1 ^ IV_lo] (all
+    // lanes flat bit patterns; Block128 is used as a plain 128-bit container
+    // here). Returns the (a0, a1) lanes for the feed-forward.
+    let load_group = |off: usize,
+                      states: &mut [PackedBlock128; STATE_SIZE]|
+     -> (PackedBlock128, PackedBlock128) {
         let mut a0s = PackedBlock128::ZERO;
         let mut a1s = PackedBlock128::ZERO;
+        *states = [PackedBlock128::ZERO; STATE_SIZE];
         for lane in 0..PACKED_LANES {
             let a = &pairs[2 * (off + lane)];
             let b = &pairs[2 * (off + lane) + 1];
@@ -649,19 +750,45 @@ pub fn compress_flat_ff_batch_interleaved_with_tag_into(
             states[2] = states[2].set_lane(lane, Block128::from(b0 ^ iv_hi));
             states[3] = states[3].set_lane(lane, Block128::from(b1 ^ iv_lo));
         }
+        (a0s, a1s)
+    };
 
-        packed_poseidon2b_permute_flat(&mut states);
-
-        // Feed-forward of the left input on the truncated lanes.
-        states[0] = states[0].xor(a0s);
-        states[1] = states[1].xor(a1s);
-
+    // Feed-forward of the left input on the truncated lanes, then store.
+    let store_group = |off: usize,
+                       states: &[PackedBlock128; STATE_SIZE],
+                       ff: (PackedBlock128, PackedBlock128),
+                       out: &mut [[u8; 32]]| {
+        let s0 = states[0].xor(ff.0);
+        let s1 = states[1].xor(ff.1);
         for lane in 0..PACKED_LANES {
-            let s0 = states[0].get_lane(lane);
-            let s1 = states[1].get_lane(lane);
-            out[off + lane][..16].copy_from_slice(&s0.to_u128().to_le_bytes());
-            out[off + lane][16..].copy_from_slice(&s1.to_u128().to_le_bytes());
+            out[off + lane][..16].copy_from_slice(&s0.get_lane(lane).to_u128().to_le_bytes());
+            out[off + lane][16..].copy_from_slice(&s1.get_lane(lane).to_u128().to_le_bytes());
         }
+    };
+
+    // Wide pass: PERM_INTERLEAVE independent groups per permutation call so
+    // the multiply chains of one hash overlap another's.
+    let wide_chunks = chunks / PERM_INTERLEAVE;
+    for wchunk in 0..wide_chunks {
+        let base = wchunk * PERM_INTERLEAVE * PACKED_LANES;
+        let mut states = [[PackedBlock128::ZERO; STATE_SIZE]; PERM_INTERLEAVE];
+        let mut ffs = [(PackedBlock128::ZERO, PackedBlock128::ZERO); PERM_INTERLEAVE];
+        for g in 0..PERM_INTERLEAVE {
+            ffs[g] = load_group(base + g * PACKED_LANES, &mut states[g]);
+        }
+        packed_poseidon2b_permute_flat_many(&mut states);
+        for g in 0..PERM_INTERLEAVE {
+            store_group(base + g * PACKED_LANES, &states[g], ffs[g], out);
+        }
+    }
+
+    // Remaining full groups, one at a time.
+    for chunk in wide_chunks * PERM_INTERLEAVE..chunks {
+        let off = chunk * PACKED_LANES;
+        let mut states = [PackedBlock128::ZERO; STATE_SIZE];
+        let ff = load_group(off, &mut states);
+        packed_poseidon2b_permute_flat(&mut states);
+        store_group(off, &states, ff, out);
     }
 
     let rem_off = chunks * PACKED_LANES;
@@ -737,72 +864,115 @@ pub fn leaf_sponge_flat_batch_with_iv_into(
     let rem = leaf_size % 32;
     let chunks = n / PACKED_LANES;
 
-    for chunk in 0..chunks {
-        let off = chunk * PACKED_LANES;
-        let mut states = [
-            PackedBlock128::ZERO,
-            PackedBlock128::ZERO,
-            PackedBlock128::broadcast(Block128::from(iv_hi)),
-            PackedBlock128::broadcast(Block128::from(iv_lo)),
-        ];
+    // Absorb the b-th 32-byte block of every lane in one group (leaves start
+    // at leaf index `off`).
+    let absorb_block = |off: usize, b: usize, states: &mut [PackedBlock128; STATE_SIZE]| {
+        let mut w0 = PackedBlock128::ZERO;
+        let mut w1 = PackedBlock128::ZERO;
+        for lane in 0..PACKED_LANES {
+            let base = (off + lane) * leaf_size + b * 32;
+            w0 = w0.set_lane(
+                lane,
+                Block128::from(u128::from_le_bytes(data[base..base + 16].try_into().unwrap())),
+            );
+            w1 = w1.set_lane(
+                lane,
+                Block128::from(u128::from_le_bytes(
+                    data[base + 16..base + 32].try_into().unwrap(),
+                )),
+            );
+        }
+        states[0] = states[0].xor(w0);
+        states[1] = states[1].xor(w1);
+    };
 
-        let lane_word = |lane: usize, block_off: usize, word: usize| -> Block128 {
-            let base = (off + lane) * leaf_size + block_off + word * 16;
-            Block128::from(u128::from_le_bytes(
-                data[base..base + 16].try_into().unwrap(),
-            ))
-        };
-
-        for b in 0..full_blocks {
+    // Absorb the 0x80…01-padded tail block (padded mode only): a pure pad
+    // block when the leaf is block-aligned, else the leftover bytes with the
+    // pad markers OR'd into the zero-filled remainder. The no-pad mode ends
+    // block-aligned and squeezes as-is.
+    let absorb_tail = |off: usize, states: &mut [PackedBlock128; STATE_SIZE]| {
+        if rem == 0 {
+            states[0] = states[0].xor(PackedBlock128::broadcast(Block128::from(PAD0)));
+            states[1] = states[1].xor(PackedBlock128::broadcast(Block128::from(PAD1)));
+        } else {
             let mut w0 = PackedBlock128::ZERO;
             let mut w1 = PackedBlock128::ZERO;
             for lane in 0..PACKED_LANES {
-                w0 = w0.set_lane(lane, lane_word(lane, b * 32, 0));
-                w1 = w1.set_lane(lane, lane_word(lane, b * 32, 1));
+                let mut tail = [0u8; 32];
+                let base = (off + lane) * leaf_size + full_blocks * 32;
+                tail[..rem].copy_from_slice(&data[base..base + rem]);
+                tail[rem] |= 0x80;
+                tail[31] |= 0x01;
+                w0 = w0.set_lane(
+                    lane,
+                    Block128::from(u128::from_le_bytes(tail[..16].try_into().unwrap())),
+                );
+                w1 = w1.set_lane(
+                    lane,
+                    Block128::from(u128::from_le_bytes(tail[16..].try_into().unwrap())),
+                );
             }
             states[0] = states[0].xor(w0);
             states[1] = states[1].xor(w1);
-            packed_poseidon2b_permute_flat(&mut states);
         }
+    };
 
-        // Final permutation (padded mode only): the 0x80…01-padded tail
-        // block — a pure pad block when the leaf is block-aligned, else the
-        // leftover bytes with the pad markers OR'd into the zero-filled
-        // remainder. The no-pad mode ends block-aligned and squeezes as-is.
-        if pad {
-            if rem == 0 {
-                states[0] = states[0].xor(PackedBlock128::broadcast(Block128::from(PAD0)));
-                states[1] = states[1].xor(PackedBlock128::broadcast(Block128::from(PAD1)));
-            } else {
-                let mut w0 = PackedBlock128::ZERO;
-                let mut w1 = PackedBlock128::ZERO;
-                for lane in 0..PACKED_LANES {
-                    let mut tail = [0u8; 32];
-                    let base = (off + lane) * leaf_size + full_blocks * 32;
-                    tail[..rem].copy_from_slice(&data[base..base + rem]);
-                    tail[rem] |= 0x80;
-                    tail[31] |= 0x01;
-                    w0 = w0.set_lane(
-                        lane,
-                        Block128::from(u128::from_le_bytes(tail[..16].try_into().unwrap())),
-                    );
-                    w1 = w1.set_lane(
-                        lane,
-                        Block128::from(u128::from_le_bytes(tail[16..].try_into().unwrap())),
-                    );
-                }
-                states[0] = states[0].xor(w0);
-                states[1] = states[1].xor(w1);
-            }
-            packed_poseidon2b_permute_flat(&mut states);
-        }
-
+    let store_group = |off: usize, states: &[PackedBlock128; STATE_SIZE], out: &mut [[u8; 32]]| {
         for lane in 0..PACKED_LANES {
             let s0 = states[0].get_lane(lane);
             let s1 = states[1].get_lane(lane);
             out[off + lane][..16].copy_from_slice(&s0.to_u128().to_le_bytes());
             out[off + lane][16..].copy_from_slice(&s1.to_u128().to_le_bytes());
         }
+    };
+
+    let fresh_states = || {
+        [
+            PackedBlock128::ZERO,
+            PackedBlock128::ZERO,
+            PackedBlock128::broadcast(Block128::from(iv_hi)),
+            PackedBlock128::broadcast(Block128::from(iv_lo)),
+        ]
+    };
+
+    // Wide pass: PERM_INTERLEAVE independent groups advance through the
+    // absorb schedule in lockstep, so every permutation call carries
+    // PERM_INTERLEAVE × PACKED_LANES independent sponges.
+    let wide_chunks = chunks / PERM_INTERLEAVE;
+    for wchunk in 0..wide_chunks {
+        let base = wchunk * PERM_INTERLEAVE * PACKED_LANES;
+        let mut states = [fresh_states(); PERM_INTERLEAVE];
+
+        for b in 0..full_blocks {
+            for g in 0..PERM_INTERLEAVE {
+                absorb_block(base + g * PACKED_LANES, b, &mut states[g]);
+            }
+            packed_poseidon2b_permute_flat_many(&mut states);
+        }
+        if pad {
+            for g in 0..PERM_INTERLEAVE {
+                absorb_tail(base + g * PACKED_LANES, &mut states[g]);
+            }
+            packed_poseidon2b_permute_flat_many(&mut states);
+        }
+        for g in 0..PERM_INTERLEAVE {
+            store_group(base + g * PACKED_LANES, &states[g], out);
+        }
+    }
+
+    // Remaining full groups, one at a time.
+    for chunk in wide_chunks * PERM_INTERLEAVE..chunks {
+        let off = chunk * PACKED_LANES;
+        let mut states = fresh_states();
+        for b in 0..full_blocks {
+            absorb_block(off, b, &mut states);
+            packed_poseidon2b_permute_flat(&mut states);
+        }
+        if pad {
+            absorb_tail(off, &mut states);
+            packed_poseidon2b_permute_flat(&mut states);
+        }
+        store_group(off, &states, out);
     }
 
     let rem_off = chunks * PACKED_LANES;

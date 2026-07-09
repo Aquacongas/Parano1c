@@ -9,6 +9,7 @@
 //! per-lane but batch the lane setup/teardown amortisation.
 
 pub mod arith;
+pub mod clmul_avx2;
 pub mod karatsuba;
 pub mod mul_table;
 pub mod pow7;

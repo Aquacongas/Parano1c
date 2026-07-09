@@ -96,6 +96,16 @@ impl PackedBlock128 {
     /// Multiply two flat-basis packed values (no basis conversion).
     #[inline(always)]
     pub fn flat_mul(self, other: Self) -> Self {
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx2",
+            target_feature = "vpclmulqdq",
+            not(target_feature = "avx512f"),
+        ))]
+        {
+            return unsafe { super::clmul_avx2::packed_mul_flat_avx2(self, other) };
+        }
+        #[allow(unreachable_code)]
         Self {
             lanes: std::array::from_fn(|i| clmul_gcm(self.lanes[i], other.lanes[i])),
         }
@@ -121,6 +131,16 @@ impl PackedBlock128 {
     /// Multiply every flat-basis lane by a single flat-basis scalar.
     #[inline(always)]
     pub fn flat_scalar_mul(self, scalar_flat: u128) -> Self {
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx2",
+            target_feature = "vpclmulqdq",
+            not(target_feature = "avx512f"),
+        ))]
+        {
+            return unsafe { super::clmul_avx2::packed_scalar_mul_flat_avx2(self, scalar_flat) };
+        }
+        #[allow(unreachable_code)]
         Self {
             lanes: std::array::from_fn(|i| clmul_gcm(self.lanes[i], scalar_flat)),
         }
