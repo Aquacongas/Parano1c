@@ -96,6 +96,21 @@ fn tag_iv_flat_f128(tag: DomainTag) -> [F128; 2] {
 // Merkle primitives (trace twins of noid_ivc_core::merkle)
 // ---------------------------------------------------------------------------
 
+/// The `IVCPCSN_` node capacity IV in flat lanes — the ff-leg family IV of
+/// the [R] PCS walk discharge ([`super::r_pcs_region`]).
+pub(crate) fn pcs_node_iv_flat() -> [F128; 2] {
+    tag_iv_flat_f128(MERKLE_NODE_TAG)
+}
+
+/// The length-bound `IVCPCSF_` leaf capacity IV in flat lanes for an
+/// even `lanes`-lane leaf (the fixed no-pad sponge mode every [R] PCS
+/// leaf uses).
+pub(crate) fn pcs_leaf_iv_flat(lanes: usize) -> [F128; 2] {
+    assert!(lanes > 0 && lanes % 2 == 0, "fixed-IV leaves are even-lane");
+    let [hi, lo] = merkle::leaf_fixed_iv_flat(lanes * 16);
+    [f128_from_u128(hi), f128_from_u128(lo)]
+}
+
 /// Trace twin of `noid_ivc_core::merkle::hash_pair` — ONE feed-forward
 /// permutation over `[l0, l1, r0 ⊕ IV_hi, r1 ⊕ IV_lo]`, output
 /// `(state[0] ⊕ l0, state[1] ⊕ l1)`. All-constant inputs fold to the native

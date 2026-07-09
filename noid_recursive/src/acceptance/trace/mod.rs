@@ -43,6 +43,7 @@ pub mod exact_state;
 pub mod matrix_fold;
 pub mod merkle_path;
 pub mod owner_auth;
+pub mod r_pcs_region;
 pub mod region_source_binding;
 pub mod self_verify;
 pub mod tx_body_spine;

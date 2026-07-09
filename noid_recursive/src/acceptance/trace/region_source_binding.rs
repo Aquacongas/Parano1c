@@ -2048,15 +2048,15 @@ fn capsule_encode_trace(message: &[LinExpr]) -> Vec<LinExpr> {
 
 /// One feed-forward wallet leg's union wiring: column/pattern indices only
 /// (entries, directions and roots bind through cell pins in the caller).
-struct FfLegSpec {
-    refs: FfMerkleFamilyRefs,
-    region: usize,
+pub(crate) struct FfLegSpec {
+    pub(crate) refs: FfMerkleFamilyRefs,
+    pub(crate) region: usize,
 }
 
 /// Place one ff-Merkle family's columns into the shared walk-B tables:
 /// CR → the shared E columns [4..6), SIB → [6..8), D → 8, plus the walk
 /// state columns.
-fn place_ff(
+pub(crate) fn place_ff(
     cb: &mut [Vec<F128>],
     s0b: &mut [Vec<F128>; STATE_SIZE],
     soutb: &mut [Vec<F128>; STATE_SIZE],
@@ -2223,7 +2223,7 @@ fn fill_es_merkle_leg(
 }
 
 
-fn alloc_column_slice(
+pub(crate) fn alloc_column_slice(
     b: &mut FieldR1csBuilder,
     col: &[F128],
     log2_len: usize,
@@ -2241,7 +2241,7 @@ fn alloc_column_slice(
 }
 
 /// The boolean point selecting slot `s` in `w_log` coordinates.
-fn slot_point(s: usize, w_log: usize) -> (Vec<LinExpr>, Vec<F128>) {
+pub(crate) fn slot_point(s: usize, w_log: usize) -> (Vec<LinExpr>, Vec<F128>) {
     let lin = (0..w_log)
         .map(|bb| LinExpr::constant(if (s >> bb) & 1 == 1 { F128::ONE } else { F128::ZERO }))
         .collect();
@@ -2252,7 +2252,7 @@ fn slot_point(s: usize, w_log: usize) -> (Vec<LinExpr>, Vec<F128>) {
 /// The committed cell at `slot` of `slice`, as a raw wire read. Bound by the
 /// column's walk opening (Stage 2: pin an algebra wire to a cell instead of
 /// emitting a per-cell opening claim — an R1CS row, not a link-IO lane).
-fn slot_cell(slice: &WitnessSlice, slot: usize) -> LinExpr {
+pub(crate) fn slot_cell(slice: &WitnessSlice, slot: usize) -> LinExpr {
     LinExpr::from_wire(Wire((slice.start() + slot) as u32))
 }
 
@@ -2264,7 +2264,7 @@ fn slot_cell(slice: &WitnessSlice, slot: usize) -> LinExpr {
 /// `low_log = block_log`. Because the pattern is periodic over the tx block, it
 /// fires in every tx for free and its MLE cost is `O(2^block_log)` (flat in the
 /// tx count) — NOT the `O(2^w_log)` of a full-domain [`localize`].
-fn common_period_pattern(
+pub(crate) fn common_period_pattern(
     stride_table: &[F128],
     offset: usize,
     n_tiles: usize,
@@ -2283,7 +2283,7 @@ fn common_period_pattern(
 /// A common-period selector: `1` over `[offset, offset + len)` within a per-tx
 /// block of `2^block_log` slots, `low_log = block_log` (a region selector that
 /// fires in every tx).
-fn common_period_ones(offset: usize, len: usize, block_log: usize) -> FixedPattern {
+pub(crate) fn common_period_ones(offset: usize, len: usize, block_log: usize) -> FixedPattern {
     let block = 1usize << block_log;
     let mut t = vec![F128::ZERO; block];
     for s in offset..offset + len {
@@ -2897,7 +2897,7 @@ fn union_merkle_refs(fixed_base: usize) -> MerkleFamilyRefs {
 }
 
 /// One Merkle-authentication leg placed in the shared walk-B meta domain.
-struct MerkleLeg {
+pub(crate) struct MerkleLeg {
     family: MerklePathFamily,
     refs: MerkleFamilyRefs,
     region: usize,
@@ -3101,14 +3101,14 @@ fn union_sub_terms_trace(
     (terms, ap)
 }
 
-struct MerkleUnionNative {
-    zero_proof: ColumnRelationProof,
-    zero_shifts: Vec<(usize, usize, ShiftDischargeProof)>,
-    sel_proof: ColumnRelationProof,
-    walk_proof: DeepChainWalkProof,
-    sub_proof: ColumnRelationProof,
-    shifts: Vec<(usize, usize, ShiftDischargeProof)>,
-    pending: Vec<(usize, Vec<F128>, F128)>,
+pub(crate) struct MerkleUnionNative {
+    pub(crate) zero_proof: ColumnRelationProof,
+    pub(crate) zero_shifts: Vec<(usize, usize, ShiftDischargeProof)>,
+    pub(crate) sel_proof: ColumnRelationProof,
+    pub(crate) walk_proof: DeepChainWalkProof,
+    pub(crate) sub_proof: ColumnRelationProof,
+    pub(crate) shifts: Vec<(usize, usize, ShiftDischargeProof)>,
+    pub(crate) pending: Vec<(usize, Vec<F128>, F128)>,
 }
 
 fn place_merkle(
@@ -3171,7 +3171,7 @@ fn native_claim_pass(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_merkle_union_native(
+pub(crate) fn run_merkle_union_native(
     committed: &[&[F128]],
     s0: &[Vec<F128>; STATE_SIZE],
     s_out: &[Vec<F128>; STATE_SIZE],
@@ -3272,7 +3272,7 @@ fn run_merkle_union_native(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn discharge_merkle_union(
+pub(crate) fn discharge_merkle_union(
     b: &mut FieldR1csBuilder,
     mut ch: &mut impl FsChannelOps,
     fixed: &[FixedPattern],
@@ -3500,26 +3500,26 @@ fn derive_queries(proof: &AuthMleOpeningProof, primary_point: &[Block128]) -> Ve
 // back to the per-tx algebra. `stage1_duplex_union_tests` gates the mechanism in
 // isolation (native+trace, a full-PCS binding negative, K-flatness).
 // ===========================================================================
-struct DuplexUnion {
-    committed: [Vec<F128>; 6],
-    s0: [Vec<F128>; STATE_SIZE],
-    s_out: [Vec<F128>; STATE_SIZE],
-    fixed: Vec<FixedPattern>,
-    refs: DuplexFamilyRefs,
-    layout: DuplexLayout,
-    w_log: usize,
-    block_log: usize,
+pub(crate) struct DuplexUnion {
+    pub(crate) committed: [Vec<F128>; 6],
+    pub(crate) s0: [Vec<F128>; STATE_SIZE],
+    pub(crate) s_out: [Vec<F128>; STATE_SIZE],
+    pub(crate) fixed: Vec<FixedPattern>,
+    pub(crate) refs: DuplexFamilyRefs,
+    pub(crate) layout: DuplexLayout,
+    pub(crate) w_log: usize,
+    pub(crate) block_log: usize,
     /// One squeezed-challenge stream per real tx (schedule order).
-    challenges: Vec<Vec<F128>>,
+    pub(crate) challenges: Vec<Vec<F128>>,
     /// REGION-2 recording blocks (caller order): each recorded discharge
     /// transcript's compiled layout and its dyadic domain offset. Empty for
     /// a single-region union.
-    rec_blocks: Vec<(DuplexLayout, usize)>,
+    pub(crate) rec_blocks: Vec<(DuplexLayout, usize)>,
     /// Per-recording gated pattern-set refs (same committed columns,
     /// pattern indices after the region-1 set).
-    rec_refs: Vec<DuplexFamilyRefs>,
+    pub(crate) rec_refs: Vec<DuplexFamilyRefs>,
     /// Per-recording squeezed challenges (native, schedule order).
-    rec_challenges: Vec<Vec<F128>>,
+    pub(crate) rec_challenges: Vec<Vec<F128>>,
 }
 
 /// Tile `data.len()` transactions' duplex channels into ONE walk-C domain at a
@@ -3529,7 +3529,7 @@ struct DuplexUnion {
 /// `perm([0;4])` ghost slots: the duplex substitution's leading carry term is
 /// ungated, so every block must be a valid IV-seeded chain (the START pattern
 /// cancels the cross-block carry in char 2, re-seeding each block).
-fn build_duplex_union(layout: &DuplexLayout, iv_flat: [F128; 2], data: &[Vec<F128>]) -> DuplexUnion {
+pub(crate) fn build_duplex_union(layout: &DuplexLayout, iv_flat: [F128; 2], data: &[Vec<F128>]) -> DuplexUnion {
     let per_tx = layout.slots.len().next_power_of_two();
     let block_log = per_tx.trailing_zeros() as usize;
     let k = data.len();
@@ -3581,10 +3581,10 @@ fn build_duplex_union(layout: &DuplexLayout, iv_flat: [F128; 2], data: &[Vec<F12
 /// block: its compiled schedule, capacity IV and absorbed witness data
 /// (flat). Recordings are per-BLOCK objects (one per walk discharge), so
 /// region 2 is transaction-count FLAT.
-struct RecordingSpec<'a> {
-    layout: DuplexLayout,
-    iv_flat: [F128; 2],
-    data: &'a [F128],
+pub(crate) struct RecordingSpec<'a> {
+    pub(crate) layout: DuplexLayout,
+    pub(crate) iv_flat: [F128; 2],
+    pub(crate) data: &'a [F128],
 }
 
 /// Two-region walk-C domain. REGION 1 (`[0, 2^r1_log)`) tiles the K
@@ -3604,7 +3604,7 @@ struct RecordingSpec<'a> {
 /// previous state forward, and each block start re-seeds its capacity IV
 /// through its own gated START/const patterns (char-2: `(1+START)·C`
 /// cancels the incoming carry).
-fn build_duplex_union_with_recordings(
+pub(crate) fn build_duplex_union_with_recordings(
     layout: &DuplexLayout,
     iv_flat: [F128; 2],
     data: &[Vec<F128>],
@@ -3794,7 +3794,7 @@ fn duplex_substitution_terms_multi(sets: &[DuplexFamilyRefs], alpha: F128) -> Ve
 /// The union's substitution terms: single-set unions keep the original
 /// [`duplex_substitution_terms`] wiring byte-for-byte; recording-bearing
 /// unions use the multi-set form.
-fn duplex_union_sub_terms(u: &DuplexUnion, alpha: F128) -> Vec<RelationTerm> {
+pub(crate) fn duplex_union_sub_terms(u: &DuplexUnion, alpha: F128) -> Vec<RelationTerm> {
     if u.rec_refs.is_empty() {
         duplex_substitution_terms(&u.refs, alpha)
     } else {
@@ -3804,17 +3804,17 @@ fn duplex_union_sub_terms(u: &DuplexUnion, alpha: F128) -> Vec<RelationTerm> {
     }
 }
 
-struct DuplexUnionNative {
-    sel_proof: ColumnRelationProof,
-    walk_proof: DeepChainWalkProof,
-    sub_proof: ColumnRelationProof,
-    shifts: Vec<(usize, usize, ShiftDischargeProof)>,
-    pending: Vec<(usize, Vec<F128>, F128)>,
+pub(crate) struct DuplexUnionNative {
+    pub(crate) sel_proof: ColumnRelationProof,
+    pub(crate) walk_proof: DeepChainWalkProof,
+    pub(crate) sub_proof: ColumnRelationProof,
+    pub(crate) shifts: Vec<(usize, usize, ShiftDischargeProof)>,
+    pub(crate) pending: Vec<(usize, Vec<F128>, F128)>,
 }
 
 /// Native discharge of the whole channel union in ONE walk (mirror of
 /// `run_leaf_union_native` with the duplex family's terms).
-fn run_duplex_union_native(u: &DuplexUnion, domain: &[u8]) -> DuplexUnionNative {
+pub(crate) fn run_duplex_union_native(u: &DuplexUnion, domain: &[u8]) -> DuplexUnionNative {
     let committed: Vec<&[F128]> = u.committed.iter().map(|c| c.as_slice()).collect();
     let internal: Vec<&[F128]> = u.s_out.iter().map(|c| c.as_slice()).collect();
     let fixed = &u.fixed;
@@ -3963,7 +3963,7 @@ fn duplex_sub_terms_trace_multi(
 /// The caller supplies the discharge transcript channel: an inline
 /// [`FsChannelTrace`] (walk C itself — a walk cannot host its own transcript),
 /// or an [`FsChannelUnionRecorder`] whose recording rides another union.
-fn discharge_duplex_union(
+pub(crate) fn discharge_duplex_union(
     b: &mut FieldR1csBuilder,
     mut ch: &mut impl FsChannelOps,
     u: &DuplexUnion,
@@ -4083,7 +4083,7 @@ fn discharge_duplex_union(
 /// at the exact slot, the bound wire is forced to the correct squeezed challenge
 /// — the prover cannot use a different value. The plural uses this to bind the
 /// in-loop challenge wires the per-tx algebra consumed.
-fn bind_duplex_challenges(
+pub(crate) fn bind_duplex_challenges(
     u: &DuplexUnion,
     t: usize,
     base: usize,
@@ -4124,7 +4124,7 @@ fn read_duplex_challenges(
 
 /// The `(slot, lane)` where each data lane `k` is absorbed, read off the compiled
 /// layout — a class constant used to place each tx's absorb-binding claims.
-fn duplex_data_positions(layout: &DuplexLayout) -> Vec<(usize, usize)> {
+pub(crate) fn duplex_data_positions(layout: &DuplexLayout) -> Vec<(usize, usize)> {
     let mut pos = vec![(0usize, 0usize); layout.n_data];
     for (slot, ds) in layout.slots.iter().enumerate() {
         for (lane, src) in ds.lanes.iter().enumerate() {
@@ -4172,9 +4172,9 @@ fn duplex_data_positions(layout: &DuplexLayout) -> Vec<(usize, usize)> {
 /// data-parallel walk.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone)]
-struct SubChannel {
-    layout: DuplexLayout,
-    iv_flat: [F128; 2],
+pub(crate) struct SubChannel {
+    pub(crate) layout: DuplexLayout,
+    pub(crate) iv_flat: [F128; 2],
 }
 
 /// The 7 duplex fixed patterns (`start, abs0, abs1, const0..const3`) over the
@@ -4185,7 +4185,7 @@ struct SubChannel {
 /// real length) carry START=0 and no constants — they just continue the chain, and
 /// `build_duplex_columns` fills the matching continuing-chain tail per sub-block.
 #[cfg_attr(not(test), allow(dead_code))]
-fn combined_duplex_fixed_patterns(subs: &[SubChannel], s_log: usize) -> Vec<FixedPattern> {
+pub(crate) fn combined_duplex_fixed_patterns(subs: &[SubChannel], s_log: usize) -> Vec<FixedPattern> {
     let s = 1usize << s_log;
     let per_tx = subs.len() * s;
     let block_log = per_tx.trailing_zeros() as usize;
@@ -4227,7 +4227,7 @@ fn combined_duplex_fixed_patterns(subs: &[SubChannel], s_log: usize) -> Vec<Fixe
 /// construction `duplex_data_positions(&combined_duplex_layout(subs, s_log))` ==
 /// [`combined_duplex_data_positions`]`(subs, s_log)`.
 #[cfg_attr(not(test), allow(dead_code))]
-fn combined_duplex_layout(subs: &[SubChannel], s_log: usize) -> DuplexLayout {
+pub(crate) fn combined_duplex_layout(subs: &[SubChannel], s_log: usize) -> DuplexLayout {
     let s = 1usize << s_log;
     let per_tx = subs.len() * s;
     let mut slots = vec![DuplexSlot { lanes: [None, None] }; per_tx];
@@ -4255,7 +4255,7 @@ fn combined_duplex_layout(subs: &[SubChannel], s_log: usize) -> DuplexLayout {
 /// slot shifted by `i·S`. The per-tx algebra reads each channel's absorbed data at
 /// these positions; agrees with `duplex_data_positions(&combined_duplex_layout(..))`.
 #[cfg_attr(not(test), allow(dead_code))]
-fn combined_duplex_data_positions(subs: &[SubChannel], s_log: usize) -> Vec<(usize, usize)> {
+pub(crate) fn combined_duplex_data_positions(subs: &[SubChannel], s_log: usize) -> Vec<(usize, usize)> {
     let s = 1usize << s_log;
     let mut out = Vec::new();
     for (i, sub) in subs.iter().enumerate() {
@@ -4285,7 +4285,7 @@ fn combined_duplex_data_positions(subs: &[SubChannel], s_log: usize) -> Vec<(usi
 /// slots (the duplex substitution's leading carry term is ungated, so every block
 /// must be a genuine IV-seeded chain).
 #[cfg_attr(not(test), allow(dead_code))]
-fn build_combined_duplex_union(subs: &[SubChannel], data: &[Vec<Vec<F128>>]) -> DuplexUnion {
+pub(crate) fn build_combined_duplex_union(subs: &[SubChannel], data: &[Vec<Vec<F128>>]) -> DuplexUnion {
     assert!(!subs.is_empty(), "need at least one sub-channel");
     let n_real = subs.len();
     let n = n_real.next_power_of_two();
