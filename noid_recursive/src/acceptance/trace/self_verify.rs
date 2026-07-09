@@ -1272,6 +1272,7 @@ pub fn basefold_verify_trace(
     let ntt = AdditiveNttF128::standard(k_code);
 
     ch.observe_label(b, b"history-basefold-v0");
+    let mut ledger = b.num_wires();
 
     // ---- Sumcheck rounds in lockstep, with the T2 / epoch commit observes.
     let mut running = target.clone();
@@ -1315,6 +1316,8 @@ pub fn basefold_verify_trace(
         }
     }
 
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "R-pcs: sumcheck rounds");
+
     // ---- Final sumcheck consistency (native reject → pin).
     let ab = mul(b, &proof.final_a, &proof.final_b);
     pin_eq(b, &ab, &running);
@@ -1353,6 +1356,7 @@ pub fn basefold_verify_trace(
         }
     }
     assert_eq!(query_bits.len(), n_queries, "query positions off shape");
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "R-pcs: grind + query sample");
 
     // ---- Per-query fold replay + per-query independent Merkle paths.
     for (q, bits) in proof.queries.iter().zip(&query_bits) {
@@ -1442,6 +1446,8 @@ pub fn basefold_verify_trace(
         }
     }
 
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "R-pcs: per-query folds+paths");
+
     // ---- The plaintext tail folds to the final codeword: one coset of
     // 2^rem elements per final-layer slot (value checks → pins).
     if let Some((tail_len, tail_cum)) = tail_layout {
@@ -1464,6 +1470,8 @@ pub fn basefold_verify_trace(
             pin_eq(b, &folded, &proof.final_codeword[f]);
         }
     }
+
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "R-pcs: plaintext tail");
 
     (challenges, bit_ranges)
 }
@@ -1710,10 +1718,14 @@ pub fn verify_field_trace_deferred(
         "pcs_params.m must be shape.m + LOG_PACKING"
     );
 
+    let mut ledger = b.num_wires();
     bind_statement_field_parts_trace(b, ch, statement_digest, pcs_params, commitment_root);
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "R: statement bind");
     let io_claims = bind_public_io_trace(b, ch, spec, io, shape.m);
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "R: public-IO bind");
 
     let zc_claim = zerocheck_field_verify_trace(b, ch, shape.m, &proof.zerocheck);
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "R: zerocheck");
 
     let inner_rest_len = shape.k_log - shape.k_skip;
     let x_ab = QuirkyPointTrace {
@@ -1733,6 +1745,7 @@ pub fn verify_field_trace_deferred(
         &zc_claim.b_eval,
         &proof.lincheck,
     );
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "R: lincheck");
 
     let ab = ZClaimTrace {
         z_skip: lc_claim.r_inner_skip.clone(),
@@ -1775,6 +1788,7 @@ pub fn verify_field_trace_deferred(
         &proof.pcs_open,
         pcs_params,
     );
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "R: PCS opening batch");
 
     (R1csClaimTrace { ab, c }, fresh)
 }
@@ -1794,17 +1808,21 @@ fn verify_field_trace_inner(
         "pcs_params.m must be r1cs.m + LOG_PACKING"
     );
 
+    let mut ledger = b.num_wires();
     // ---- Bind the FS transcript to the statement.
     bind_statement_field_trace(b, ch, r1cs, pcs_params, commitment_root);
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "R: statement bind");
 
     // ---- Public-IO envelope binding (mirrors verify_field_with_public_io).
     let io_claims: Vec<QuirkyDirectClaimTrace> = match public_io {
         Some((spec, io)) => bind_public_io_trace(b, ch, spec, io, r1cs.m),
         None => Vec::new(),
     };
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "R: public-IO bind");
 
     // ---- Field zerocheck.
     let zc_claim = zerocheck_field_verify_trace(b, ch, r1cs.m, &proof.zerocheck);
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "R: zerocheck");
 
     // ---- Lincheck at the zerocheck's quirky point.
     let inner_rest_len = r1cs.k_log - r1cs.k_skip;
@@ -1823,6 +1841,7 @@ fn verify_field_trace_inner(
         &zc_claim.b_eval,
         &proof.lincheck,
     );
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "R: lincheck");
 
     // ---- The two z-claims (mirror of verify_field_inner).
     let ab = ZClaimTrace {
@@ -1867,6 +1886,7 @@ fn verify_field_trace_inner(
         &proof.pcs_open,
         pcs_params,
     );
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "R: PCS opening batch");
 
     R1csClaimTrace { ab, c }
 }
