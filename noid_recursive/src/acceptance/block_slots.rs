@@ -617,16 +617,9 @@ fn pad_exact_state_inputs_to_tier(
 /// The flat image of one native `SpineInputs` statement (φ lane by lane).
 fn spine_instance_flat(n: &SpineInputs) -> SpineInstanceFlat {
     SpineInstanceFlat {
-        epoch_anchor: std::array::from_fn(|i| flat_of(n.epoch_anchor[i])),
-        fee_leaf: std::array::from_fn(|i| flat_of(n.fee_leaf[i])),
-        input_leaves: std::array::from_fn(|c| {
-            std::array::from_fn(|i| flat_of(n.input_leaves[c][i]))
+        leaves: std::array::from_fn(|leaf| {
+            std::array::from_fn(|lane| flat_of(n.leaves[leaf][lane]))
         }),
-        output_leaves: std::array::from_fn(|o| {
-            std::array::from_fn(|i| flat_of(n.output_leaves[o][i]))
-        }),
-        is_coinbase_leaf: std::array::from_fn(|i| flat_of(n.is_coinbase_leaf[i])),
-        pad_leaf: std::array::from_fn(|i| flat_of(n.pad_leaf[i])),
     }
 }
 
@@ -671,39 +664,19 @@ fn spine_region_data_from_wires(
         .zip(native_hashes.iter())
         .zip(inputs_t.iter().zip(tx_hashes.iter()))
         .map(|((n, h), (t, hw))| {
-            assert_eq!(t.input_leaves.len(), n.input_leaves.len());
-            assert_eq!(t.output_leaves.len(), n.output_leaves.len());
-            for (c, w4) in t.input_leaves.iter().enumerate() {
-                for i in 0..4 {
+            for (leaf, pair) in t.leaves.iter().enumerate() {
+                for lane in 0..2 {
                     assert_eq!(
-                        w4[i].eval(b.values()),
-                        flat_of(n.input_leaves[c][i]),
-                        "spine input leaf wire"
+                        pair[lane].eval(b.values()),
+                        flat_of(n.leaves[leaf][lane]),
+                        "spine raw leaf wire L{leaf}[{lane}]"
                     );
                 }
             }
-            for (o, w4) in t.output_leaves.iter().enumerate() {
-                for i in 0..4 {
-                    assert_eq!(
-                        w4[i].eval(b.values()),
-                        flat_of(n.output_leaves[o][i]),
-                        "spine output leaf wire"
-                    );
-                }
-            }
-            assert_pair(&t.epoch_anchor, &n.epoch_anchor, "spine anchor");
-            assert_pair(&t.fee_leaf, &n.fee_leaf, "spine fee");
-            assert_pair(&t.is_coinbase_leaf, &n.is_coinbase_leaf, "spine coinbase");
-            assert_pair(&t.pad_leaf, &n.pad_leaf, "spine pad");
             assert_pair(hw, h, "spine tx hash");
             SpineInstanceRegion {
                 flat: spine_instance_flat(n),
-                input_leaves_w: t.input_leaves.clone(),
-                output_leaves_w: t.output_leaves.clone(),
-                anchor_w: t.epoch_anchor.clone(),
-                fee_w: t.fee_leaf.clone(),
-                coinbase_w: t.is_coinbase_leaf.clone(),
-                pad_w: t.pad_leaf.clone(),
+                leaves_w: t.leaves.clone(),
                 tx_hash_w: hw.clone(),
                 tx_hash_flat: [flat_of(h[0]), flat_of(h[1])],
             }
@@ -843,17 +816,15 @@ pub struct BlockSlotsConfig {
     /// REQUIRES `discharge_wallet_pcs` (the leg rides walk B).
     /// `false` = the inline killshot replay.
     pub tx_root_region: bool,
-    /// When true, verify every transaction's 59-permutation tx-body spine via
-    /// the shared region walks instead of the inline batched killshot: each
-    /// instance's 12 leaf sub-sponges + wrap ride walk A as a 32-slot
-    /// region-gated sponge tile and its 16-leaf compress tree as a 64-slot
-    /// source-tree-shaped family (zero LEAFODD, gated internal-child
-    /// exposure). The leaf payload statement wires pin to the tile absorb
-    /// cells, the chain digests join the tree KID leaf cells as shared wires,
-    /// the statement lanes (anchor/fee/coinbase/pad) pin the remaining KID
-    /// leaves, and the wrap digest pins to the `tx_hashes` statement wires —
-    /// the same wires the tx-root leg and the owner-auth statements consume,
-    /// so downstream bindings are untouched.
+    /// When true, verify every transaction's final 31-permutation tx-body
+    /// spine via the shared region walks instead of the inline batched
+    /// killshot: the fifteen two-permutation compression nodes occupy one
+    /// 32-slot source-tree family (two ghost cells), and the TAG_TX8X2 wrap
+    /// occupies one one-slot sponge family. The sixteen raw L0..L15 statement
+    /// pairs pin directly to the tree's external KID cells; the recomputed
+    /// root pins to the wrap input and the wrap digest pins to the `tx_hashes`
+    /// statement wires — the same wires consumed by tx-root and owner-auth, so
+    /// downstream bindings are untouched.
     ///
     /// REQUIRES `discharge_wallet_pcs` (the families ride walk A).
     /// `false` = the inline killshot replay.
@@ -1072,9 +1043,9 @@ pub fn build_block_slots_with_config(
     pin_u64_successor(b, &start_acc.height, &header.fields[hf::HEIGHT]);
 
     crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: claim-hash killshot+[D]");
-    // ---- Tx8x2 body-spine component. Region mode moves the whole
-    // 59-permutation-per-tx replay onto the shared walk A (leaf/wrap tile +
-    // compress tree): only the statement wires are allocated here — the SAME
+    // ---- Tx8x2 body-spine component. Region mode moves the whole final
+    // 31-permutation-per-tx replay onto the shared walk A (compress tree +
+    // TAG_TX8X2 wrap): only the statement wires are allocated here — the SAME
     // wire vectors the inline slot returns, so every downstream consumer
     // (tx-root leaves, owner-auth tx_body_hash pins, claim lanes) is
     // untouched — and the handoff carries them into the plural discharge.

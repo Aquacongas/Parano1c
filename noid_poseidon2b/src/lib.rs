@@ -16,9 +16,8 @@ pub use channel::Poseidon2bChannel;
 pub use hasher::*;
 pub use native::*;
 pub use primitives::{
-    derive_address, hash_input_leaf_packed, hash_leaf, hash_output_leaf, hash_output_leaf_packed,
-    hash_tx_body_carrier, hash_utxo_leaf, is_coinbase_leaf, Address, Commitment, Digest,
-    SpendSecret, TxBodyHash,
+    derive_address, hash_leaf, hash_tx8x2_leaves, hash_utxo_leaf, Address, Commitment, Digest,
+    SpendSecret, TxBodyHash, TX8X2_LEAF_COUNT, TX8X2_TREE_DEPTH,
 };
 
 /// Bulk import surface for UTXO-layer callers.
@@ -26,12 +25,11 @@ pub mod prelude {
     pub use crate::native::{
         capacity_iv, compress, poseidon2b_hash_byte_slices, poseidon2b_hash_bytes, DomainTag,
         Poseidon2bSponge, TAG_ACCBLK, TAG_ADDRFIX, TAG_BLOCKHDR, TAG_COMMIT, TAG_COMPRESS,
-        TAG_FSCHALNG, TAG_LEAF, TAG_POWHDR, TAG_TXBODY, TAG_TXROOT,
+        TAG_FSCHALNG, TAG_LEAF, TAG_POWHDR, TAG_TX8X2, TAG_TXROOT,
     };
     pub use crate::primitives::{
-        derive_address, hash_input_leaf_packed, hash_leaf, hash_output_leaf,
-        hash_output_leaf_packed, hash_tx_body_carrier, hash_utxo_leaf, Address, Commitment, Digest,
-        SpendSecret, TxBodyHash,
+        derive_address, hash_leaf, hash_tx8x2_leaves, hash_utxo_leaf, Address, Commitment, Digest,
+        SpendSecret, TxBodyHash, TX8X2_LEAF_COUNT, TX8X2_TREE_DEPTH,
     };
     pub use crate::Poseidon2bChannel;
 }

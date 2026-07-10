@@ -3,23 +3,33 @@
 
 //! Hash-bound transaction selectors shared by the C' semantic relation.
 //!
-//! The Tx8x2 carrier spine exposes the reserved validity leaf and every
-//! logical record quad as statement wires. This module makes that leaf the
-//! only in-trace liveness source, enforces the canonical zero form of dead
-//! entries, and binds every live input owner to the one-owner authorization
-//! address. Ordered actions and the exact-state overlay build on these wires in
-//! the next C' slice.
+//! The final Tx8x2 spine exposes all 16 raw body-hash leaves as statement
+//! wires. This module makes the flags leaf the only in-trace liveness source,
+//! enforces the canonical zero form of dead entries, and binds the body-level
+//! input owner to the one-owner authorization address. Ordered actions and the
+//! exact-state overlay build on these wires in the next C' slice.
 
 use super::tx_body_spine::SpineInputsTrace;
 use super::{mul, pin_eq, pin_zero, range_check_bits, FieldR1csBuilder, LinExpr, F128};
+pub use noid_tx::body_hash::{
+    TX8X2_LEAF_EPOCH_ANCHOR as LEAF_EPOCH_ANCHOR, TX8X2_LEAF_FEE as LEAF_FEE,
+    TX8X2_LEAF_FLAGS as LEAF_FLAGS, TX8X2_LEAF_INPUT_BASE as LEAF_INPUT_BASE,
+    TX8X2_LEAF_INPUT_OWNER as LEAF_INPUT_OWNER, TX8X2_LEAF_OUTPUT0_DATA as LEAF_OUTPUT0_DATA,
+    TX8X2_LEAF_OUTPUT0_OWNER as LEAF_OUTPUT0_OWNER, TX8X2_LEAF_OUTPUT1_DATA as LEAF_OUTPUT1_DATA,
+    TX8X2_LEAF_OUTPUT1_OWNER as LEAF_OUTPUT1_OWNER,
+};
 
 pub const INPUT_SELECTORS: usize = noid_tx::TX_INPUTS;
 pub const OUTPUT_SELECTORS: usize = noid_tx::TX_OUTPUTS;
 pub const VALIDITY_BITS: usize = INPUT_SELECTORS + OUTPUT_SELECTORS;
 
+const _: () = assert!(LEAF_INPUT_BASE + INPUT_SELECTORS == LEAF_OUTPUT0_DATA);
+const _: () = assert!(LEAF_OUTPUT1_OWNER + 1 == LEAF_FLAGS);
+const _: () = assert!(LEAF_FLAGS + 1 == super::tx_body_spine::TX_BODY_RAW_LEAVES);
+
 /// Selector surface of one Tx8x2 body.
 ///
-/// `raw_*` are committed by `pad_leaf`; `selected_* = tx_live * raw_*`
+/// `raw_*` are committed by `L15`; `selected_* = tx_live * raw_*`
 /// additionally gate tier-padding ghost transactions out of block resource
 /// totals without changing their canonical ghost body or authorization proof.
 pub struct ActionSurfaceTrace {
@@ -39,59 +49,46 @@ pub fn bind_user_action_surface(
     tx_live: &LinExpr,
     expected_owner: &[LinExpr; 2],
 ) -> ActionSurfaceTrace {
-    assert_eq!(spine.input_leaves.len(), 4);
-    assert_eq!(spine.output_leaves.len(), 8);
-
     // Capacity builds already constrain their shared liveness wires. Keeping
     // this local booleanity also makes the component sound in isolation.
     let tx_live_sq = mul(b, tx_live, tx_live);
     pin_eq(b, &tx_live_sq, tx_live);
 
-    // The first validity-leaf lane contains exactly 10 little-endian bits;
-    // range_check_bits also forces every higher tower bit to zero. The second
-    // lane is the canonical all-zero half of validity_leaf().
-    let bits = range_check_bits(b, &spine.pad_leaf[0], VALIDITY_BITS);
-    pin_zero(b, &spine.pad_leaf[1]);
+    // L15 = [validity_bitmap, is_coinbase]. A user transaction's bitmap has
+    // exactly ten little-endian bits, and its coinbase flag is zero.
+    let bits = range_check_bits(b, &spine.leaves[LEAF_FLAGS][0], VALIDITY_BITS);
+    pin_zero(b, &spine.leaves[LEAF_FLAGS][1]);
     let raw: [LinExpr; VALIDITY_BITS] = std::array::from_fn(|i| LinExpr::from_wire(bits[i]));
     let raw_inputs: [LinExpr; INPUT_SELECTORS] = std::array::from_fn(|i| raw[i].clone());
     let raw_outputs: [LinExpr; OUTPUT_SELECTORS] =
         std::array::from_fn(|i| raw[INPUT_SELECTORS + i].clone());
 
-    let bind_dead_quad = |b: &mut FieldR1csBuilder, live: &LinExpr, quad: &[LinExpr; 4]| {
+    let bind_dead_pair = |b: &mut FieldR1csBuilder, live: &LinExpr, pair: &[LinExpr; 2]| {
         // Characteristic two: 1 + live is the boolean NOT of live.
         let dead = live.add_const(F128::ONE);
-        for lane in quad {
+        for lane in pair {
             let dead_lane = mul(b, &dead, lane);
             pin_zero(b, &dead_lane);
         }
     };
 
+    // L2 is the body-level input owner, committed exactly once and pinned
+    // directly to the one OwnerAuth statement; input records L3..L10 carry
+    // only slot/value data.
+    for lane in 0..2 {
+        pin_eq(
+            b,
+            &spine.leaves[LEAF_INPUT_OWNER][lane],
+            &expected_owner[lane],
+        );
+    }
     for (index, live) in raw_inputs.iter().enumerate() {
-        let quad = if index < 4 {
-            &spine.input_leaves[index]
-        } else {
-            &spine.output_leaves[index - 4]
-        };
-        bind_dead_quad(b, live, quad);
-        // Input quad = [slot_index, packed(amount, creation_id),
-        // owner_hi, owner_lo]. Equality is required exactly when the
-        // body-committed input selector is one.
-        for lane in 0..2 {
-            let owner_delta = quad[2 + lane].add(&expected_owner[lane]);
-            let gated_delta = mul(b, live, &owner_delta);
-            pin_zero(b, &gated_delta);
-        }
+        bind_dead_pair(b, live, &spine.leaves[LEAF_INPUT_BASE + index]);
     }
     for (index, live) in raw_outputs.iter().enumerate() {
-        let quad = &spine.output_leaves[4 + index];
-        bind_dead_quad(b, live, quad);
-    }
-
-    // Physical carrier positions 6 and 7 have no logical records.
-    for quad in &spine.output_leaves[6..8] {
-        for lane in quad {
-            pin_zero(b, lane);
-        }
+        let data_leaf = LEAF_OUTPUT0_DATA + 2 * index;
+        bind_dead_pair(b, live, &spine.leaves[data_leaf]);
+        bind_dead_pair(b, live, &spine.leaves[data_leaf + 1]);
     }
 
     let selected_inputs = std::array::from_fn(|i| mul(b, tx_live, &raw_inputs[i]));
@@ -200,7 +197,7 @@ mod tests {
     }
 
     #[test]
-    fn final_input_and_output_selectors_map_across_carrier_boundary() {
+    fn final_input_and_output_selectors_map_to_l10_and_l14() {
         let owner = Address([0x35; 32]);
         let native = spine_inputs_from_body(&edge_body(owner));
         let mut b = FieldR1csBuilder::new();
@@ -227,6 +224,33 @@ mod tests {
     }
 
     #[test]
+    fn input_leaf_recombination_is_unsatisfied() {
+        let owner = Address([0x35; 32]);
+        let mut native = spine_inputs_from_body(&edge_body(owner));
+        native
+            .leaves
+            .swap(LEAF_INPUT_BASE + TX_INPUTS - 1, LEAF_INPUT_BASE);
+        assert!(!relation_satisfies(
+            &native,
+            owner.as_fields(),
+            Block128::ONE
+        ));
+    }
+
+    #[test]
+    fn output_leaf_recombination_is_unsatisfied() {
+        let owner = Address([0x35; 32]);
+        let mut native = spine_inputs_from_body(&edge_body(owner));
+        native.leaves.swap(LEAF_OUTPUT1_DATA, LEAF_OUTPUT0_DATA);
+        native.leaves.swap(LEAF_OUTPUT1_OWNER, LEAF_OUTPUT0_OWNER);
+        assert!(!relation_satisfies(
+            &native,
+            owner.as_fields(),
+            Block128::ONE
+        ));
+    }
+
+    #[test]
     fn outer_inactive_gates_counts() {
         let owner = Address([0x33; 32]);
         let native = spine_inputs_from_body(&body(owner));
@@ -246,19 +270,19 @@ mod tests {
     }
 
     #[test]
-    fn dead_nonzero_quad_is_rejected() {
+    fn dead_nonzero_input_leaf_is_rejected() {
         let owner = Address([0x33; 32]);
         let mut native = spine_inputs_from_body(&body(owner));
-        native.input_leaves[1][1] = Block128::ONE;
+        native.leaves[LEAF_INPUT_BASE + 1][1] = Block128::ONE;
         let owner_fields = owner.as_fields();
         assert!(!relation_satisfies(&native, owner_fields, Block128::ONE));
     }
 
     #[test]
-    fn dead_nonzero_output_quad_is_rejected() {
+    fn dead_nonzero_output_data_leaf_is_rejected() {
         let owner = Address([0x33; 32]);
         let mut native = spine_inputs_from_body(&body(owner));
-        native.output_leaves[1][0] = Block128::ONE;
+        native.leaves[LEAF_OUTPUT1_DATA][0] = Block128::ONE;
         assert!(!relation_satisfies(
             &native,
             owner.as_fields(),
@@ -267,10 +291,10 @@ mod tests {
     }
 
     #[test]
-    fn nonzero_unused_carrier_quad_is_rejected() {
+    fn dead_nonzero_output_owner_is_rejected() {
         let owner = Address([0x33; 32]);
         let mut native = spine_inputs_from_body(&body(owner));
-        native.output_leaves[6][0] = Block128::ONE;
+        native.leaves[LEAF_OUTPUT1_OWNER][1] = Block128::ONE;
         assert!(!relation_satisfies(
             &native,
             owner.as_fields(),
@@ -279,10 +303,10 @@ mod tests {
     }
 
     #[test]
-    fn nonzero_second_validity_lane_is_rejected() {
+    fn user_coinbase_flag_is_rejected() {
         let owner = Address([0x33; 32]);
         let mut native = spine_inputs_from_body(&body(owner));
-        native.pad_leaf[1] = Block128::ONE;
+        native.leaves[LEAF_FLAGS][1] = Block128::ONE;
         assert!(!relation_satisfies(
             &native,
             owner.as_fields(),
@@ -294,7 +318,7 @@ mod tests {
     fn unused_high_validity_bit_is_rejected() {
         let owner = Address([0x33; 32]);
         let mut native = spine_inputs_from_body(&body(owner));
-        native.pad_leaf[0] += Block128::from(1u128 << VALIDITY_BITS);
+        native.leaves[LEAF_FLAGS][0] += Block128::from(1u128 << VALIDITY_BITS);
         assert!(!relation_satisfies(
             &native,
             owner.as_fields(),

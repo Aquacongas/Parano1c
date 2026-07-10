@@ -102,11 +102,10 @@ use noid_ivc_core::deep_chain::source_tree::{
     compress_iv_flat, mds_weights_pub, source_tree_substitution_terms, SourceTreeRefs,
 };
 use noid_ivc_core::deep_chain::spine::{
-    build_spine_instance_columns, spine_input_digest_slot, spine_output_digest_slot,
-    spine_pad_absorb_flat, spine_tile_fixed_patterns, spine_tree_exposure_terms,
-    spine_tree_fixed_patterns, spine_tree_internal_child_pattern, SpineInstanceFlat,
-    SPINE_N_INPUT_LEAVES, SPINE_N_OUTPUT_LEAVES, SPINE_TILE_SLOTS, SPINE_TILE_WRAP_SLOT,
-    SPINE_TREE_KID_LEAF_BASE, SPINE_TREE_SLOTS,
+    build_spine_instance_columns, spine_tree_exposure_terms, spine_tree_fixed_patterns,
+    spine_tree_internal_child_pattern, spine_wrap_fixed_patterns, SpineInstanceFlat,
+    SPINE_TREE_KID_LEAF_BASE, SPINE_TREE_LEAVES, SPINE_TREE_SLOTS, SPINE_WRAP_SLOT,
+    SPINE_WRAP_SLOTS,
 };
 use noid_ivc_core::deep_chain::{
     prove_deep_chain_walk, verify_deep_chain_walk, DeepChainWalkProof, LaneClaimGroup,
@@ -243,18 +242,14 @@ pub fn discharge_auth_pcs_obligation_via_region(
 /// statement wires).
 ///
 /// `spine` (tx-body spine region handoff, [`SpineRegionData`]): when `Some`,
-/// every transaction's 59-permutation tx-body hash rides walk A as TWO more
-/// families — the 32-slot leaf/wrap TILE (the 12 leaf sub-sponges + the wrap,
-/// a region-gated sponge-shape family) and the 64-slot compress TREE (the
-/// source-tree heap shape with a zero `LEAFODD` pattern and a GATED
-/// internal-child exposure). Joins are cell pins: leaf payload statement
-/// wires → tile `IN` cells (the input pad flush is a const pin), chain
-/// digests → tile `C` cells AND tree KID leaf cells (shared wires), the
-/// statement lanes (anchor / fee / coinbase / pad) → the remaining KID leaf
-/// cells, the tree root → the wrap `IN` cells, and the wrap digest → the
-/// `tx_hashes` statement wires (which the tx-root leg and the owner-auth
-/// statements already consume). Instances are chunked `ceil(n/K)` per tx
-/// block with canonical GHOST spines (the zero body) past the real count.
+/// every transaction's final 31-permutation body hash rides walk A as TWO
+/// families — the 32-slot compress TREE (30 active COMPRESS permutations,
+/// zero `LEAFODD`) and a separate one-slot `TAG_TX8X2` WRAP. Joins are cell
+/// pins: all sixteen raw statement leaves → tree KID leaf cells, the tree root
+/// → the wrap `IN` cells, and the wrap digest → the `tx_hashes` statement
+/// wires (which the tx-root leg and owner-auth statements already consume).
+/// Instances are chunked `ceil(n/K)` per tx block with canonical zero-leaf
+/// GHOST spines past the real count.
 pub fn discharge_auth_pcs_obligations_via_region(
     b: &mut FieldR1csBuilder,
     obligations: &[PendingAuthPcsObligation],
@@ -314,8 +309,8 @@ pub fn discharge_auth_pcs_obligations_via_region(
     let es_leaf_base = n_leaf_families * leaf_family_slots; // within a tx block
     let es_leaf_cap = es.map_or(0, |e| e.leaves.len().div_ceil(k));
     let es_end = es_leaf_base + es_leaf_cap * SPONGE_LEAF_SLOTS;
-    // Spine extension: `spine_cap = ceil(n_instances/K)` tree+tile pairs per tx
-    // block, trees first. The tree run must start at a multiple of
+    // Spine extension: `spine_cap = ceil(n_instances/K)` tree+wrap pairs per
+    // tx block, trees first. The tree run must start at a multiple of
     // `SPINE_TREE_SLOTS · spine_cap` so the gated exposure's window claims
     // re-point into walk A with constant offset bits (the same zero-bit
     // insertion trick as the wallet trees, plus the instance coordinates);
@@ -330,8 +325,8 @@ pub fn discharge_auth_pcs_obligations_via_region(
     } else {
         es_end
     };
-    let spine_tile_base = spine_tree_base + spine_cap * SPINE_TREE_SLOTS;
-    let per_tx_a = spine_tile_base + spine_cap * SPINE_TILE_SLOTS;
+    let spine_wrap_base = spine_tree_base + spine_cap * SPINE_TREE_SLOTS;
+    let per_tx_a = spine_wrap_base + spine_cap * SPINE_WRAP_SLOTS;
     let block_log_a = per_tx_a.next_power_of_two().trailing_zeros() as usize;
     let per_tx_block_a = 1usize << block_log_a;
     let w_log = (k * per_tx_block_a).next_power_of_two().trailing_zeros() as usize;
@@ -1129,19 +1124,15 @@ pub fn discharge_auth_pcs_obligations_via_region(
 
     // ===================================================================
     // Tx-body spine (block-level, chunked like the exact-state families):
-    // per instance, one 32-slot leaf/wrap tile + one 64-slot compress tree
-    // fill walk A's spine region. Real instances pin their statement wires
-    // (payload lanes → IN cells, pad flush = const pin), share their chain
-    // digest wires between the tile C cells and the tree KID leaf cells,
-    // pin the statement lanes to the remaining KID leaf cells, feed the
-    // tree root into the wrap IN cells, and pin the wrap digest to the
-    // tx-hash statement wires. Ghost instances (past the real count) are
-    // canonical zero-body spines — valid chains satisfying the periodic
-    // patterns, nothing downstream reads them.
+    // per instance, one 32-slot compress tree plus one independent wrap slot
+    // fill walk A's spine region. Real instances pin all sixteen raw body-leaf
+    // statement pairs directly to the tree KID leaf cells, feed the tree root
+    // into the TAG_TX8X2 wrap, and pin its digest to the tx-hash statement.
+    // Ghost instances are the deterministic all-zero raw-leaf body; nothing
+    // downstream reads their digest.
     // ===================================================================
     if let Some(sp) = spine {
         let n_inst = sp.instances.len();
-        let pad_absorb = spine_pad_absorb_flat();
         for blk in 0..k {
             for i in 0..spine_cap {
                 let g = blk * spine_cap + i;
@@ -1152,24 +1143,24 @@ pub fn discharge_auth_pcs_obligations_via_region(
                     .unwrap_or_else(SpineInstanceFlat::ghost);
                 let icols = build_spine_instance_columns(&inst_flat);
                 let tree_abs = blk * per_tx_block_a + spine_tree_base + i * SPINE_TREE_SLOTS;
-                let tile_abs = blk * per_tx_block_a + spine_tile_base + i * SPINE_TILE_SLOTS;
+                let wrap_abs = blk * per_tx_block_a + spine_wrap_base + i * SPINE_WRAP_SLOTS;
                 for j in 0..STATE_SIZE {
                     cols[C0 + j][tree_abs..tree_abs + SPINE_TREE_SLOTS]
                         .copy_from_slice(&icols.tree_c[j]);
                     s0[j][tree_abs..tree_abs + SPINE_TREE_SLOTS].copy_from_slice(&icols.tree_s0[j]);
                     s_out[j][tree_abs..tree_abs + SPINE_TREE_SLOTS]
                         .copy_from_slice(&icols.tree_s_out[j]);
-                    cols[C0 + j][tile_abs..tile_abs + SPINE_TILE_SLOTS]
-                        .copy_from_slice(&icols.tile_c[j]);
-                    s0[j][tile_abs..tile_abs + SPINE_TILE_SLOTS].copy_from_slice(&icols.tile_s0[j]);
-                    s_out[j][tile_abs..tile_abs + SPINE_TILE_SLOTS]
-                        .copy_from_slice(&icols.tile_s_out[j]);
+                    cols[C0 + j][wrap_abs..wrap_abs + SPINE_WRAP_SLOTS]
+                        .copy_from_slice(&icols.wrap_c[j]);
+                    s0[j][wrap_abs..wrap_abs + SPINE_WRAP_SLOTS].copy_from_slice(&icols.wrap_s0[j]);
+                    s_out[j][wrap_abs..wrap_abs + SPINE_WRAP_SLOTS]
+                        .copy_from_slice(&icols.wrap_s_out[j]);
                 }
                 for lane in 0..2 {
                     cols[KID0 + lane][tree_abs..tree_abs + SPINE_TREE_SLOTS]
                         .copy_from_slice(&icols.tree_kid[lane]);
-                    cols[IN0 + lane][tile_abs..tile_abs + SPINE_TILE_SLOTS]
-                        .copy_from_slice(&icols.tile_in[lane]);
+                    cols[IN0 + lane][wrap_abs..wrap_abs + SPINE_WRAP_SLOTS]
+                        .copy_from_slice(&icols.wrap_in[lane]);
                 }
                 let kid_half = SPINE_TREE_SLOTS / 2;
                 spine_expo_kid0.extend_from_slice(&icols.tree_kid[0][..kid_half]);
@@ -1185,50 +1176,9 @@ pub fn discharge_auth_pcs_obligations_via_region(
                     icols.tx_hash, inst.tx_hash_flat,
                     "spine instance {g}: region tx-body hash != the statement wires"
                 );
-                // Input chains: payload lanes → IN cells; pad flush const.
-                for c4 in 0..SPINE_N_INPUT_LEAVES {
-                    let head = tile_abs + 3 * c4;
-                    let w4 = &inst.input_leaves_w[c4];
-                    cell_pins_a.push((IN0, head, w4[0].clone()));
-                    cell_pins_a.push((IN0 + 1, head, w4[1].clone()));
-                    cell_pins_a.push((IN0, head + 1, w4[2].clone()));
-                    cell_pins_a.push((IN0 + 1, head + 1, w4[3].clone()));
-                    cell_pins_a.push((IN0, head + 2, LinExpr::constant(pad_absorb[0])));
-                    cell_pins_a.push((IN0 + 1, head + 2, LinExpr::constant(pad_absorb[1])));
-                }
-                // Output chains: payload lanes → IN cells.
-                for o8 in 0..SPINE_N_OUTPUT_LEAVES {
-                    let head = tile_abs + 3 * SPINE_N_INPUT_LEAVES + 2 * o8;
-                    let w4 = &inst.output_leaves_w[o8];
-                    cell_pins_a.push((IN0, head, w4[0].clone()));
-                    cell_pins_a.push((IN0 + 1, head, w4[1].clone()));
-                    cell_pins_a.push((IN0, head + 1, w4[2].clone()));
-                    cell_pins_a.push((IN0 + 1, head + 1, w4[3].clone()));
-                }
-                // Chain digests: ONE wire pinned to BOTH the tile C cell and
-                // the tree KID leaf cell (the leaf join).
-                for t in 0..SPINE_N_INPUT_LEAVES + SPINE_N_OUTPUT_LEAVES {
-                    let dslot = tile_abs
-                        + if t < SPINE_N_INPUT_LEAVES {
-                            spine_input_digest_slot(t)
-                        } else {
-                            spine_output_digest_slot(t - SPINE_N_INPUT_LEAVES)
-                        };
-                    let kslot = tree_abs + SPINE_TREE_KID_LEAF_BASE + 2 + t;
-                    for lane in 0..2 {
-                        let w = LinExpr::from_wire(b.alloc_f128(icols.chain_digests[t][lane]));
-                        cell_pins_a.push((C0 + lane, dslot, w.clone()));
-                        cell_pins_a.push((KID0 + lane, kslot, w));
-                    }
-                }
-                // Statement lanes → the non-chain KID leaf cells
-                // (L0 anchor, L1 fee, L14 coinbase, L15 pad).
-                for (leaf, wpair) in [
-                    (0usize, &inst.anchor_w),
-                    (1, &inst.fee_w),
-                    (14, &inst.coinbase_w),
-                    (15, &inst.pad_w),
-                ] {
+                // Every raw statement leaf feeds the corresponding external
+                // KID position. There is no record-leaf hash family.
+                for (leaf, wpair) in inst.leaves_w.iter().enumerate() {
                     let kslot = tree_abs + SPINE_TREE_KID_LEAF_BASE + leaf;
                     cell_pins_a.push((KID0, kslot, wpair[0].clone()));
                     cell_pins_a.push((KID0 + 1, kslot, wpair[1].clone()));
@@ -1238,13 +1188,13 @@ pub fn discharge_auth_pcs_obligations_via_region(
                 for lane in 0..2 {
                     let w = LinExpr::from_wire(b.alloc_f128(icols.root[lane]));
                     cell_pins_a.push((C0 + lane, tree_abs + 3, w.clone()));
-                    cell_pins_a.push((IN0 + lane, tile_abs + SPINE_TILE_WRAP_SLOT, w));
+                    cell_pins_a.push((IN0 + lane, wrap_abs + SPINE_WRAP_SLOT, w));
                 }
                 // Wrap digest → the tx-hash statement wires.
                 for lane in 0..2 {
                     cell_pins_a.push((
                         C0 + lane,
-                        tile_abs + SPINE_TILE_WRAP_SLOT,
+                        wrap_abs + SPINE_WRAP_SLOT,
                         inst.tx_hash_w[lane].clone(),
                     ));
                 }
@@ -1255,7 +1205,7 @@ pub fn discharge_auth_pcs_obligations_via_region(
     // ===================================================================
     // Walk A (once): the two capsule-leaf tile families over ALL K txs,
     // common-period patterns (+ the exact-state sponge tiles and the spine
-    // tree/tile when handed off). The walk/substitution flatten in tx count.
+    // tree/wrap when handed off). The walk/substitution flatten in tx count.
     // ===================================================================
     let mut fixed: Vec<FixedPattern> = Vec::new();
     let iv_capsleaf = capsule_leaf_iv_flat();
@@ -1318,11 +1268,9 @@ pub fn discharge_auth_pcs_obligations_via_region(
             base,
         )
     });
-    // Spine families: the tree rides the SOURCE-TREE term shape on the shared
-    // CODE/KID/C columns with its own patterns (LEAFODD identically zero — the
-    // leaf level is external, its slots ghost); the tile rides the SPONGE term
-    // shape (CHAIN as the carry selector, the per-slot IV table carrying all
-    // three head tags) gated by its own region-ones pattern.
+    // Spine families: the 32-slot tree rides the SOURCE-TREE term shape on the
+    // shared CODE/KID/C columns (`LEAFODD` identically zero); the independent
+    // one-slot TAG_TX8X2 wrap rides the SPONGE term shape with CHAIN zero.
     let spine_refs: Option<(SourceTreeRefs, SpongeLeafRefs, usize)> = spine.map(|_| {
         let base = fixed.len();
         for pat in spine_tree_fixed_patterns() {
@@ -1333,10 +1281,10 @@ pub fn discharge_auth_pcs_obligations_via_region(
                 block_log_a,
             ));
         }
-        for pat in spine_tile_fixed_patterns() {
+        for pat in spine_wrap_fixed_patterns() {
             fixed.push(common_period_pattern(
                 &pat.table,
-                spine_tile_base,
+                spine_wrap_base,
                 spine_cap,
                 block_log_a,
             ));
@@ -1357,16 +1305,16 @@ pub fn discharge_auth_pcs_obligations_via_region(
                 odd: base + 6, // the CHAIN carry selector
                 iv: [base + 7, base + 8],
             },
-            base + 5, // the tile REGION gate
+            base + 5, // the wrap REGION gate
         )
     });
     let meta_c: [usize; STATE_SIZE] = std::array::from_fn(|i| C0 + i);
     let committed: Vec<&[F128]> = cols.iter().map(|c| c.as_slice()).collect();
     let spine_union_spec: Option<SpineUnionSpec> =
-        spine_refs.map(|(tree_refs, tile_refs, tile_region)| SpineUnionSpec {
+        spine_refs.map(|(tree_refs, wrap_refs, wrap_region)| SpineUnionSpec {
             tree_refs,
-            tile_refs,
-            tile_region,
+            wrap_refs,
+            wrap_region,
             kid_meta: [KID0, KID0 + 1],
             c_meta: [C0, C0 + 1],
             cap_log: spine_cap.trailing_zeros() as usize,
@@ -2219,26 +2167,17 @@ pub struct TxRootPathRegion {
     pub siblings: Vec<[F128; 2]>,
 }
 
-/// The tx-body spine region handoff: every transaction's 59-permutation
-/// spine hashed by the walk-A tile+tree families instead of the inline
-/// killshot replay. One instance per block transaction (coinbase included),
-/// in tx order.
+/// Final 31-permutation Tx8x2 spine handoff.  One instance per block
+/// transaction (coinbase included), in transaction order.
 pub struct SpineRegionData {
     pub instances: Vec<SpineInstanceRegion>,
 }
 
-/// One transaction's spine handoff: the statement's flat lanes (driving the
-/// column fill) plus the statement WIRES the cell pins bind — the leaf
-/// payload lanes, the four non-chain tree leaves and the tx-body-hash pair
-/// (the same wires the tx-root leg and the owner-auth statements consume).
+/// One transaction's spine handoff: all sixteen canonical raw body leaves,
+/// plus the tx-body hash pair consumed by the tx-root and owner-auth paths.
 pub struct SpineInstanceRegion {
     pub flat: SpineInstanceFlat,
-    pub input_leaves_w: Vec<[LinExpr; 4]>,
-    pub output_leaves_w: Vec<[LinExpr; 4]>,
-    pub anchor_w: [LinExpr; 2],
-    pub fee_w: [LinExpr; 2],
-    pub coinbase_w: [LinExpr; 2],
-    pub pad_w: [LinExpr; 2],
+    pub leaves_w: [[LinExpr; 2]; SPINE_TREE_LEAVES],
     pub tx_hash_w: [LinExpr; 2],
     pub tx_hash_flat: [F128; 2],
 }
@@ -2476,13 +2415,13 @@ pub(crate) struct Claim {
 // WALK A — the leaf-union native/trace DAG.
 // ===========================================================================
 /// The spine families' union wiring: the tree rides the source-tree term
-/// shape (own patterns, zero LEAFODD), the tile the region-gated sponge
-/// shape, and the gated tiled exposure re-points into walk A through the
-/// class-constant layout below.
+/// shape (own patterns, zero LEAFODD), the one-slot wrap the region-gated
+/// sponge shape, and the gated tiled exposure re-points into walk A through
+/// the class-constant layout below.
 struct SpineUnionSpec {
     tree_refs: SourceTreeRefs,
-    tile_refs: SpongeLeafRefs,
-    tile_region: usize,
+    wrap_refs: SpongeLeafRefs,
+    wrap_region: usize,
     /// Walk-A columns the 4 exposure claims re-point into.
     kid_meta: [usize; 2],
     c_meta: [usize; 2],
@@ -2598,13 +2537,11 @@ fn union_native_terms(
     if let Some((sr, region)) = es_sponge {
         gated_sponge_native_terms(sr, *region, alpha, &mut terms);
     }
-    // Spine families: the tree is the SOURCE-TREE shape on the shared
-    // CODE/KID/C columns with its own patterns (LEAFODD ≡ 0, so the
-    // `LEAFODD·CODE` terms vanish identically); the tile is the region-gated
-    // sponge shape.
+    // Spine families: the tree is the SOURCE-TREE shape on shared CODE/KID/C
+    // columns (LEAFODD ≡ 0); the TAG_TX8X2 wrap is a one-slot sponge shape.
     if let Some(sp) = spine {
         terms.extend(source_tree_substitution_terms(&sp.tree_refs, alpha));
-        gated_sponge_native_terms(&sp.tile_refs, sp.tile_region, alpha, &mut terms);
+        gated_sponge_native_terms(&sp.wrap_refs, sp.wrap_region, alpha, &mut terms);
     }
     terms
 }
@@ -2841,7 +2778,7 @@ fn tree_trace_terms(m: &[LinExpr], st_refs: &SourceTreeRefs, terms: &mut Vec<Rel
 }
 
 /// One region-gated sponge-shaped trace term block (the capsule-leaf tile
-/// families, the exact-state sponge tiles and the spine leaf/wrap tile all
+/// families, the exact-state sponge tiles and the one-slot spine wrap all
 /// ride this shape).
 fn gated_sponge_trace_terms(
     m: &[LinExpr],
@@ -2887,7 +2824,7 @@ fn union_trace_terms(
     }
     if let Some(sp) = spine {
         tree_trace_terms(m, &sp.tree_refs, &mut terms);
-        gated_sponge_trace_terms(m, &sp.tile_refs, sp.tile_region, &mut terms);
+        gated_sponge_trace_terms(m, &sp.wrap_refs, sp.wrap_region, &mut terms);
     }
     terms
 }

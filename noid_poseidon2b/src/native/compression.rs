@@ -106,7 +106,7 @@ impl Poseidon2bSponge {
     /// `filled_bytes == 0` at squeeze time, i.e. the caller absorbed
     /// a whole number of rate blocks. Domain separation between this
     /// no-pad construction and the pad-flushed [`Self::finalize`] must
-    /// come from a distinct capacity IV (see `TAG_OUTLEAF`).
+    /// come from a construction-specific capacity IV.
     pub fn finalize_no_pad(self) -> [u8; 32] {
         debug_assert_eq!(
             self.filled_bytes, 0,

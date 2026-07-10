@@ -28,12 +28,12 @@
 //!                    `y` directly — no shift needed inside this MLE).
 //! * `σ(x)`            is the public S-box selector schedule.
 //!
-//! Index layout (low → high bit): `elem:2 | round:7 | slot:6`.
+//! Index layout (low → high bit): `elem:2 | round:7 | slot:5`.
 //! `dec_round_index(y)` decrements the round bits by 1 (mod 128) using
-//! plain integer arithmetic on the 15-bit index — no symbolic
+//! plain integer arithmetic on the 14-bit index — no symbolic
 //! polynomial work.
 //!
-//! All `*_evaluate` functions take a 15-element point in `F^15` and
+//! All `*_evaluate` functions take a 14-element point in `F^14` and
 //! return the evaluation of the corresponding multilinear extension.
 //! They are intended for the verifier (called once per spine proof)
 //! and for prover sanity tests; the prover itself does not call them
@@ -54,7 +54,7 @@ use crate::spine_mle::{
 
 const ELEM_BITS: usize = N_SPINE_ELEM_VARS; // 2
 const ROUND_BITS: usize = N_SPINE_ROUND_VARS; // 7
-const SLOT_BITS: usize = N_SPINE_SLOT_VARS; // 6
+const SLOT_BITS: usize = N_SPINE_SLOT_VARS; // 5
 
 const ROUND_SHIFT: usize = ELEM_BITS;
 const SLOT_SHIFT: usize = ELEM_BITS + ROUND_BITS;
@@ -69,25 +69,25 @@ const ELEM_LIMIT: usize = 1 << ELEM_BITS; // 4
 // Compile-time consistency with the unified MLE.
 const _: () = assert!(ELEM_BITS + ROUND_BITS + SLOT_BITS == N_SPINE_UNIFIED_VARS);
 
-/// Extract the 7-bit round index from a packed 15-bit cell index.
+/// Extract the 7-bit round index from a packed 14-bit cell index.
 #[inline]
 pub fn round_of(idx: u16) -> usize {
     ((idx & ROUND_MASK) >> ROUND_SHIFT) as usize
 }
 
-/// Extract the 2-bit element index from a packed 15-bit cell index.
+/// Extract the 2-bit element index from a packed 14-bit cell index.
 #[inline]
 pub fn elem_of(idx: u16) -> usize {
     (idx & ELEM_MASK) as usize
 }
 
-/// Extract the 6-bit slot index from a packed 15-bit cell index.
+/// Extract the 5-bit slot index from a packed 14-bit cell index.
 #[inline]
 pub fn slot_of(idx: u16) -> usize {
     ((idx & SLOT_MASK) >> SLOT_SHIFT) as usize
 }
 
-/// Decrement the round component of a 15-bit cell index by 1 (mod 128).
+/// Decrement the round component of a 14-bit cell index by 1 (mod 128).
 /// This is the inverse of `inc_round_index` and is the *only* helper
 /// the prover hot path needs: it is plain integer arithmetic with no
 /// symbolic / polynomial expansion.
@@ -98,7 +98,7 @@ pub fn dec_round_index(idx: u16) -> u16 {
     (idx & !ROUND_MASK) | ((prev as u16) << ROUND_SHIFT)
 }
 
-/// Increment the round component of a 15-bit cell index by 1 (mod 128).
+/// Increment the round component of a 14-bit cell index by 1 (mod 128).
 /// Provided for symmetry / tests; the hot path only ever decrements.
 #[inline]
 pub fn inc_round_index(idx: u16) -> u16 {
@@ -113,8 +113,8 @@ pub fn inc_round_index(idx: u16) -> u16 {
 
 /// `μ_table[idx] == ONE` iff `slot(idx) < live_slots` and
 /// `round(idx) < N_ROUNDS` (the "live witness cell" mask). Otherwise
-/// `ZERO`. Length `2^15`. Parameterised by `live_slots` so the same
-/// schedule machinery serves Spine (`N_SPINE_SLOTS = 59`) and AuthGKR
+/// `ZERO`. Length `2^14`. Parameterised by `live_slots` so the same
+/// schedule machinery serves Spine (`N_SPINE_SLOTS = 31`) and AuthGKR
 /// (`N_AUTH_LIVE_SLOTS = 20`).
 pub fn build_mu_table_for_live_slots(live_slots: usize) -> Vec<Block128> {
     debug_assert!(live_slots <= (1 << SLOT_BITS));
@@ -146,7 +146,7 @@ pub fn mu_evaluate(point: &[Block128]) -> Block128 {
 // ---------------------------------------------------------------------------
 
 /// `σ_table[idx] == ONE` iff the cell goes through the x^7 S-box on the
-/// active topology. Length `2^15`. Parameterised by `live_slots`.
+/// active topology. Length `2^14`. Parameterised by `live_slots`.
 pub fn build_sigma_table_for_live_slots(live_slots: usize) -> Vec<Block128> {
     debug_assert!(live_slots <= (1 << SLOT_BITS));
     let mut tab = vec![Block128::ZERO; N_SPINE_UNIFIED_CELLS];
@@ -198,7 +198,7 @@ pub fn spine_sigma_dec_lane_tables() -> &'static [Vec<Block128>; STATE_SIZE] {
 
 // ---------------------------------------------------------------------------
 // Pre-flat cached tables: stored as Vec<u128> already in GCM basis.
-// Eliminates ~360K tower_to_flat conversions per verify (32768 × 11 tables).
+// Eliminates ~180K tower_to_flat conversions per verify (16384 × 11 tables).
 // ---------------------------------------------------------------------------
 
 fn to_flat_vec(tower: &[Block128]) -> Vec<u128> {
@@ -395,8 +395,8 @@ pub fn build_mds_lane_table(lane: usize) -> Vec<Block128> {
 // Internals.
 // ---------------------------------------------------------------------------
 
-/// Pack `(slot, round, elem)` into the 15-bit cell index with the
-/// canonical layout `elem:2 | round:7 | slot:6` (low → high bit).
+/// Pack `(slot, round, elem)` into the 14-bit cell index with the
+/// canonical layout `elem:2 | round:7 | slot:5` (low → high bit).
 #[inline]
 pub fn pack_index(slot: usize, round: usize, elem: usize) -> u16 {
     debug_assert!(slot < (1 << SLOT_BITS));
@@ -405,7 +405,7 @@ pub fn pack_index(slot: usize, round: usize, elem: usize) -> u16 {
     ((slot << SLOT_SHIFT) | (round << ROUND_SHIFT) | elem) as u16
 }
 
-/// Inner product of a length-`2^15` table with the eq-tensor of
+/// Inner product of a length-`2^14` table with the eq-tensor of
 /// `point`, evaluating the multilinear extension of `tab` at `point`.
 fn inner_product_with_eq_tensor(tab: &[Block128], point: &[Block128]) -> Block128 {
     let eq_tab = eq_ind_partial_eval::<Block128>(point);
@@ -490,8 +490,8 @@ mod tests {
     #[test]
     fn mu_evaluate_at_boolean_points_matches_table() {
         let tab = build_mu_table();
-        // Spot-check a handful of indices — exhaustive 32K would be too slow.
-        for &idx in &[0u16, 1, 4, 7, 64, 1023, 8192, 16383, 32767] {
+        // Spot-check a handful of indices across the full padded domain.
+        for &idx in &[0u16, 1, 4, 7, 64, 1023, 8192, 16383] {
             let pt = boolean_point(idx);
             assert_eq!(mu_evaluate(&pt), tab[idx as usize], "idx {idx}");
         }
@@ -499,7 +499,7 @@ mod tests {
 
     #[test]
     fn sigma_evaluate_at_boolean_points_matches_native() {
-        for slot in [0usize, 5, 58] {
+        for slot in [0usize, 5, 30] {
             for round in [0usize, 4, 5, 30, 61, 62, 65] {
                 for elem in 0..STATE_SIZE {
                     let idx = pack_index(slot, round, elem);
@@ -512,7 +512,7 @@ mod tests {
 
     #[test]
     fn rc_evaluate_at_live_boolean_points_matches_native() {
-        for slot in [0usize, 1, 30, 58] {
+        for slot in [0usize, 1, 15, 30] {
             for round in [0usize, 1, 4, 5, 33, 61, 62, 65] {
                 let is_partial = (F_ROUNDS / 2..F_ROUNDS / 2 + P_ROUNDS).contains(&round);
                 for elem in 0..STATE_SIZE {

@@ -1,68 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Temporary 59-slot carrier topology used by Tx8x2 GKR.
-//!
-//! These are physical carrier roles, not logical transaction capacities:
-//! logical inputs 0..3 occupy the four input chains, inputs 4..7 occupy
-//! output chains 0..3, logical outputs occupy output chains 4..5, and the
-//! final two output chains are zero. The carrier then has 15 binary compress
-//! nodes × 2 permutations and one final wrap permutation.
+//! Canonical 31-permutation flattened Tx8x2 body topology.
 
-pub const TXBODY_N_INPUT_LEAVES: usize = 4;
-pub const TXBODY_N_OUTPUT_LEAVES: usize = 8;
-pub const TXBODY_N_TREE_LEAVES: usize = 16;
+pub const TXBODY_N_TREE_LEAVES: usize = noid_tx::body_hash::BODY_HASH_LEAVES;
 pub const TXBODY_TREE_DEPTH: usize = 4;
-
-pub const PERMS_PER_INPUT_LEAF: usize = 3;
-pub const PERMS_PER_OUTPUT_LEAF: usize = 2;
 pub const PERMS_PER_COMPRESS: usize = 2;
 pub const PERMS_PER_WRAP: usize = 1;
+pub const N_SPINE_SLOTS: usize = (TXBODY_N_TREE_LEAVES - 1) * PERMS_PER_COMPRESS + PERMS_PER_WRAP;
+pub const N_SPINE_SLOTS_PADDED: usize = N_SPINE_SLOTS.next_power_of_two();
 
-pub const TREE_LEAF_EPOCH_ANCHOR: usize = 0;
-pub const TREE_LEAF_FEE: usize = 1;
-pub const TREE_LEAF_INPUT_BASE: usize = 2;
-pub const TREE_LEAF_OUTPUT_BASE: usize = 6;
-pub const TREE_LEAF_FLAGS_BASE: usize = 14;
-
-pub const N_INSTANCES: usize = TXBODY_N_INPUT_LEAVES * PERMS_PER_INPUT_LEAF
-    + TXBODY_N_OUTPUT_LEAVES * PERMS_PER_OUTPUT_LEAF
-    + 15 * PERMS_PER_COMPRESS
-    + PERMS_PER_WRAP;
+const _: () = assert!(N_SPINE_SLOTS == 31);
+const _: () = assert!(N_SPINE_SLOTS_PADDED == 32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstanceRole {
-    InputLeafPermA { leaf_idx: u8 },
-    InputLeafPermB { leaf_idx: u8 },
-    InputLeafPermC { leaf_idx: u8 },
-    OutputLeafPermA { leaf_idx: u8 },
-    OutputLeafPermB { leaf_idx: u8 },
     CompressPermA { level: u8, pos: u8 },
     CompressPermB { level: u8, pos: u8 },
     WrapPerm,
 }
 
 impl InstanceRole {
-    pub const fn is_head(&self) -> bool {
-        matches!(
-            self,
-            Self::InputLeafPermA { .. }
-                | Self::OutputLeafPermA { .. }
-                | Self::CompressPermA { .. }
-                | Self::WrapPerm
-        )
-    }
-
-    pub const fn tree_leaf_index(&self) -> Option<usize> {
-        match *self {
-            Self::InputLeafPermA { leaf_idx }
-            | Self::InputLeafPermB { leaf_idx }
-            | Self::InputLeafPermC { leaf_idx } => Some(TREE_LEAF_INPUT_BASE + leaf_idx as usize),
-            Self::OutputLeafPermA { leaf_idx } | Self::OutputLeafPermB { leaf_idx } => {
-                Some(TREE_LEAF_OUTPUT_BASE + leaf_idx as usize)
-            }
-            _ => None,
-        }
+    pub const fn is_head(self) -> bool {
+        matches!(self, Self::CompressPermA { .. } | Self::WrapPerm)
     }
 }
 
@@ -70,111 +30,53 @@ impl InstanceRole {
 pub struct InstanceMeta {
     pub role: InstanceRole,
     pub is_head: bool,
-    pub parent: Option<usize>,
+    /// `None` denotes a raw external leaf and is legal only at level one.
     pub children: Option<[Option<usize>; 2]>,
 }
 
 pub fn build_instance_layout() -> Vec<InstanceMeta> {
-    let mut out = Vec::with_capacity(N_INSTANCES);
-    let mut tree_leaf_last_instance: [Option<usize>; TXBODY_N_TREE_LEAVES] =
-        [None; TXBODY_N_TREE_LEAVES];
+    let mut out = Vec::with_capacity(N_SPINE_SLOTS);
+    let mut previous_level = vec![None; TXBODY_N_TREE_LEAVES];
 
-    for leaf_slot in 0..TXBODY_N_INPUT_LEAVES {
-        let tree_leaf = TREE_LEAF_INPUT_BASE + leaf_slot;
-        out.push(make_meta(InstanceRole::InputLeafPermA {
-            leaf_idx: leaf_slot as u8,
-        }));
-        out.push(make_meta(InstanceRole::InputLeafPermB {
-            leaf_idx: leaf_slot as u8,
-        }));
-        let c_id = out.len();
-        out.push(make_meta(InstanceRole::InputLeafPermC {
-            leaf_idx: leaf_slot as u8,
-        }));
-        tree_leaf_last_instance[tree_leaf] = Some(c_id);
-    }
-
-    for leaf_slot in 0..TXBODY_N_OUTPUT_LEAVES {
-        let tree_leaf = TREE_LEAF_OUTPUT_BASE + leaf_slot;
-        out.push(make_meta(InstanceRole::OutputLeafPermA {
-            leaf_idx: leaf_slot as u8,
-        }));
-        let b_id = out.len();
-        out.push(make_meta(InstanceRole::OutputLeafPermB {
-            leaf_idx: leaf_slot as u8,
-        }));
-        tree_leaf_last_instance[tree_leaf] = Some(b_id);
-    }
-
-    let mut prev_level_last: Vec<Option<usize>> = tree_leaf_last_instance.to_vec();
     for level in 1..=TXBODY_TREE_DEPTH {
-        let n_nodes = 1 << (TXBODY_TREE_DEPTH - level);
-        let mut this_level_last = Vec::with_capacity(n_nodes);
-        for pos in 0..n_nodes {
-            let children = [prev_level_last[2 * pos], prev_level_last[2 * pos + 1]];
-            out.push(make_meta_with_children(
+        let node_count = 1 << (TXBODY_TREE_DEPTH - level);
+        let mut this_level = Vec::with_capacity(node_count);
+        for pos in 0..node_count {
+            let children = [previous_level[2 * pos], previous_level[2 * pos + 1]];
+            out.push(meta_with_children(
                 InstanceRole::CompressPermA {
                     level: level as u8,
                     pos: pos as u8,
                 },
                 children,
             ));
-            let b_id = out.len();
-            out.push(make_meta_with_children(
+            let perm_b = out.len();
+            out.push(meta_with_children(
                 InstanceRole::CompressPermB {
                     level: level as u8,
                     pos: pos as u8,
                 },
                 children,
             ));
-            this_level_last.push(Some(b_id));
+            this_level.push(Some(perm_b));
         }
-        prev_level_last = this_level_last;
+        previous_level = this_level;
     }
 
-    let root_instance = prev_level_last[0];
-    out.push(make_meta_with_children(
+    out.push(meta_with_children(
         InstanceRole::WrapPerm,
-        [root_instance, None],
+        [previous_level[0], None],
     ));
 
-    let edges: Vec<(usize, usize)> = out
-        .iter()
-        .enumerate()
-        .filter_map(|(parent_id, m)| m.children.map(|c| (parent_id, c)))
-        .flat_map(|(parent_id, [l, r])| {
-            [l, r]
-                .into_iter()
-                .flatten()
-                .map(move |child_id| (child_id, parent_id))
-        })
-        .collect();
-    for (child_id, parent_id) in edges {
-        if out[child_id].parent.is_none() {
-            out[child_id].parent = Some(parent_id);
-        }
-    }
-
-    debug_assert_eq!(out.len(), N_INSTANCES);
+    debug_assert_eq!(out.len(), N_SPINE_SLOTS);
     out
 }
 
 #[inline]
-fn make_meta(role: InstanceRole) -> InstanceMeta {
+fn meta_with_children(role: InstanceRole, children: [Option<usize>; 2]) -> InstanceMeta {
     InstanceMeta {
         role,
         is_head: role.is_head(),
-        parent: None,
-        children: None,
-    }
-}
-
-#[inline]
-fn make_meta_with_children(role: InstanceRole, children: [Option<usize>; 2]) -> InstanceMeta {
-    InstanceMeta {
-        role,
-        is_head: role.is_head(),
-        parent: None,
         children: Some(children),
     }
 }
@@ -184,61 +86,60 @@ mod tests {
     use super::*;
 
     #[test]
-    fn instance_count_matches_budget() {
-        assert_eq!(N_INSTANCES, 59);
-        assert_eq!(build_instance_layout().len(), N_INSTANCES);
+    fn exact_topology_is_thirty_compressions_plus_wrap() {
+        let layout = build_instance_layout();
+        assert_eq!(N_SPINE_SLOTS, 31);
+        assert_eq!(N_SPINE_SLOTS_PADDED, 32);
+        assert_eq!(layout.len(), 31);
+        assert_eq!(
+            layout
+                .iter()
+                .filter(|meta| matches!(meta.role, InstanceRole::CompressPermA { .. }))
+                .count(),
+            15
+        );
+        assert_eq!(
+            layout
+                .iter()
+                .filter(|meta| matches!(meta.role, InstanceRole::CompressPermB { .. }))
+                .count(),
+            15
+        );
+        assert!(matches!(layout[30].role, InstanceRole::WrapPerm));
     }
 
     #[test]
-    fn role_counts_by_category() {
-        let layout = build_instance_layout();
-        let mut input_perms = 0;
-        let mut output_perms = 0;
-        let mut compress_perms = 0;
-        let mut wrap_perms = 0;
-        for meta in &layout {
-            match meta.role {
-                InstanceRole::InputLeafPermA { .. }
-                | InstanceRole::InputLeafPermB { .. }
-                | InstanceRole::InputLeafPermC { .. } => input_perms += 1,
-                InstanceRole::OutputLeafPermA { .. } | InstanceRole::OutputLeafPermB { .. } => {
-                    output_perms += 1
-                }
-                InstanceRole::CompressPermA { .. } | InstanceRole::CompressPermB { .. } => {
-                    compress_perms += 1
-                }
-                InstanceRole::WrapPerm => wrap_perms += 1,
+    fn level_slot_ranges_and_postorder_are_exact() {
+        for (level, positions, base) in [(1, 8, 0), (2, 4, 16), (3, 2, 24), (4, 1, 28)] {
+            for pos in 0..positions {
+                assert!(matches!(
+                    build_instance_layout()[base + 2 * pos].role,
+                    InstanceRole::CompressPermA { level: l, pos: p }
+                        if usize::from(l) == level && usize::from(p) == pos
+                ));
+                assert!(matches!(
+                    build_instance_layout()[base + 2 * pos + 1].role,
+                    InstanceRole::CompressPermB { level: l, pos: p }
+                        if usize::from(l) == level && usize::from(p) == pos
+                ));
             }
         }
-        assert_eq!(input_perms, TXBODY_N_INPUT_LEAVES * PERMS_PER_INPUT_LEAF);
-        assert_eq!(output_perms, TXBODY_N_OUTPUT_LEAVES * PERMS_PER_OUTPUT_LEAF);
-        assert_eq!(compress_perms, 15 * PERMS_PER_COMPRESS);
-        assert_eq!(wrap_perms, PERMS_PER_WRAP);
-    }
-
-    #[test]
-    fn post_order_invariants() {
         let layout = build_instance_layout();
-        for (parent_id, meta) in layout.iter().enumerate() {
-            if let Some([l, r]) = meta.children {
-                for child in [l, r].into_iter().flatten() {
-                    assert!(child < parent_id);
+        for (parent, meta) in layout.iter().enumerate() {
+            if let Some(children) = meta.children {
+                for child in children.into_iter().flatten() {
+                    assert!(child < parent);
                 }
             }
         }
+        assert_eq!(layout[30].children, Some([Some(29), None]));
     }
 
     #[test]
-    fn wrap_is_last_and_references_root() {
+    fn level_one_children_are_the_sixteen_raw_leaves() {
         let layout = build_instance_layout();
-        let last = layout.last().unwrap();
-        assert!(matches!(last.role, InstanceRole::WrapPerm));
-        let [left, right] = last.children.unwrap();
-        assert!(left.is_some());
-        assert!(right.is_none());
-        assert!(matches!(
-            layout[left.unwrap()].role,
-            InstanceRole::CompressPermB { level: 4, pos: 0 }
-        ));
+        for meta in &layout[..16] {
+            assert_eq!(meta.children, Some([None, None]));
+        }
     }
 }

@@ -4,33 +4,27 @@
 //! Regression gate for the packed alloc-counter UTXO incarnation scheme.
 //!
 //! It locks the two design facts the production implementation relies on: the
-//! incarnation fits in the existing value lane without changing either hash
-//! schedule, and a canonical checked counter increment makes a stale input fail
-//! after physical-slot reuse.
+//! incarnation fits in the packed value lane used by the raw Tx8x2 statement
+//! and exact-state leaf, and a canonical checked counter increment makes a
+//! stale input fail after physical-slot reuse.
 
 use noid_chain::exact_state_hash::slot_leaf_hash;
 use noid_chain::SlotValue;
 use noid_core::Block128;
 use noid_poseidon2b::native::compression::Poseidon2bSponge;
 use noid_poseidon2b::native::domain::{capacity_iv, TAG_EXSTSLT};
-use noid_poseidon2b::primitives::{hash_input_leaf_packed, Address};
+use noid_poseidon2b::primitives::Address;
 use noid_tx::{pack_amount_creation_id, unpack_amount_creation_id};
 
 fn incarnation_slot(amount: u64, creation_id: u64, owner: Address) -> SlotValue {
     SlotValue::with_owner_fields(amount, creation_id, owner.as_fields())
 }
 
-fn incarnation_input_leaf(
-    slot_index: u32,
-    amount: u64,
-    creation_id: u64,
-    owner: Address,
-) -> [u8; 32] {
-    hash_input_leaf_packed(
-        slot_index,
+fn incarnation_input_leaf(slot_index: u32, amount: u64, creation_id: u64) -> [Block128; 2] {
+    [
+        Block128::from(slot_index as u128),
         pack_amount_creation_id(amount, creation_id),
-        &owner,
-    )
+    ]
 }
 
 fn incarnation_exact_leaf(slot: SlotValue) -> [u8; 32] {
@@ -60,15 +54,18 @@ fn validate_mint_ids(parent_alloc_counter: u64, creation_ids: &[u64]) -> bool {
 }
 
 #[test]
-fn packed_incarnation_zero_id_uses_canonical_low_lane_schedules() {
+fn packed_incarnation_zero_id_uses_canonical_raw_lanes() {
     let owner = Address([0x37; 32]);
     let amount = 42_000_000u64;
     let slot_index = 19u32;
 
     assert_eq!(
-        incarnation_input_leaf(slot_index, amount, 0, owner),
-        hash_input_leaf_packed(slot_index, pack_amount_creation_id(amount, 0), &owner,),
-        "creation_id=0 uses the canonical low-lane input-leaf schedule"
+        incarnation_input_leaf(slot_index, amount, 0),
+        [
+            Block128::from(slot_index as u128),
+            Block128::from(amount as u128),
+        ],
+        "creation_id=0 uses the canonical raw input-leaf lanes"
     );
     let zero_id_slot = incarnation_slot(amount, 0, owner);
     assert_eq!(
@@ -80,8 +77,8 @@ fn packed_incarnation_zero_id_uses_canonical_low_lane_schedules() {
     let live = incarnation_slot(amount, 7, owner);
     assert_ne!(incarnation_exact_leaf(live), slot_leaf_hash(zero_id_slot));
     assert_ne!(
-        incarnation_input_leaf(slot_index, amount, 7, owner),
-        hash_input_leaf_packed(slot_index, pack_amount_creation_id(amount, 0), &owner,)
+        incarnation_input_leaf(slot_index, amount, 7),
+        incarnation_input_leaf(slot_index, amount, 0)
     );
     assert_eq!(unpack_amount_creation_id(live.value), (amount, 7));
     assert_eq!(pack_amount_creation_id(0, 0), Block128::from(0u128));

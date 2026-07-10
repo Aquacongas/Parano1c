@@ -145,8 +145,7 @@ pub use state_leaf_killshot::{
     SlotLeafInputs,
 };
 pub use tx_body_layout::{
-    build_instance_layout, InstanceMeta, InstanceRole, N_INSTANCES, TREE_LEAF_INPUT_BASE,
-    TREE_LEAF_OUTPUT_BASE, TXBODY_N_INPUT_LEAVES, TXBODY_N_OUTPUT_LEAVES,
+    build_instance_layout, InstanceMeta, InstanceRole, TXBODY_N_TREE_LEAVES, TXBODY_TREE_DEPTH,
 };
 pub use wallet_authorization::{
     authorization_proof_wire_bytes, canonical_authorization_statement_from_body,

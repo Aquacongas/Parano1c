@@ -1,16 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Unified Block SpineGKR — single Kill-Shot over N*59 slots.
+//! Unified Block SpineGKR — single Kill-Shot over N*31 slots.
 //!
 //! Instead of N independent per-tx SpineGKR proofs (each 5 KB, each
 //! requiring a separate sumcheck replay at verification), this module
-//! packs all N transactions' 59-slot spines into a single dynamically-
+//! packs all N transactions' 31-slot spines into a single dynamically-
 //! sized MLE and runs one unified Kill-Shot.
 //!
-//! Result: proof size and verification cost grow logarithmically (not
-//! linearly) in N. For N=256 txs, this saves ~1.4 MB of spine proofs
-//! and reduces verifier time from 6s to ~35ms.
+//! Proof size and verification cost grow logarithmically rather than
+//! linearly in the number of transaction bodies.
 //!
 //! # Layout
 //!
@@ -21,7 +20,7 @@
 //!   elem:2 | round:7 | slot:S
 //! ```
 //!
-//! where `S = ceil(log2(N * 59))` (padded to next power of two).
+//! where `S = ceil(log2(N * 31))` (padded to next power of two).
 //!
 //! The constraints (C1, C1', C2) are identical per-slot — the same
 //! Poseidon2b round structure applies regardless of which transaction
@@ -53,8 +52,8 @@ use std::time::{Duration, Instant};
 const ELEM_BITS: usize = N_SPINE_ELEM_VARS; // 2
 const ROUND_BITS: usize = N_SPINE_ROUND_VARS; // 7
 const ROUND_LIMIT: usize = 1 << ROUND_BITS; // 128
-// Public: the in-circuit trace transliteration replays the tx-hash pin relation
-// from this same definition; change both together.
+                                            // Public: the in-circuit trace transliteration replays the tx-hash pin relation
+                                            // from this same definition; change both together.
 pub const BLOCK_SPINE_TX_HASH_PIN_TAG: u128 = 0x4253_5049_4E54_5801; // "BSPINTX"+1
 
 /// Per-variable degree of the unified block sumcheck (same as per-tx).
@@ -293,7 +292,7 @@ impl BlockSpineMle {
     }
 
     /// Build the unified block MLE from N transactions' slot state_in vectors.
-    /// Each transaction contributes exactly `N_SPINE_SLOTS` (59) slots.
+    /// Each transaction contributes exactly `N_SPINE_SLOTS` (31) slots.
     pub fn build(n_instances: usize, slot_state_ins: &[[Block128; STATE_SIZE]]) -> Self {
         let total_live = n_instances * N_SPINE_SLOTS;
         assert_eq!(slot_state_ins.len(), total_live);
@@ -1762,7 +1761,7 @@ fn tx_hash_pin_claims(
     claims
 }
 
-/// Prove the unified block spine Kill-Shot over N*59 slots.
+/// Prove the unified block spine Kill-Shot over N*31 slots.
 ///
 /// The caller provides the already-built `BlockSpineMle`. This keeps the block
 /// prover honest-by-construction: the GKR proof is derived from the same spine
@@ -2111,12 +2110,12 @@ mod tests {
 
     fn fixture_inputs(seed: u128) -> SpineInputs {
         SpineInputs {
-            epoch_anchor: [Block128::from(seed + 11), Block128::from(seed + 22)],
-            fee_leaf: [Block128::from(seed + 33), Block128::from(seed + 44)],
-            input_leaves: [[Block128::from(seed + 1); 4]; 4],
-            output_leaves: [[Block128::from(seed + 2); 4]; 8],
-            is_coinbase_leaf: [Block128::from(seed + 55), Block128::from(seed + 66)],
-            pad_leaf: [Block128::from(0u128), Block128::from(0u128)],
+            leaves: std::array::from_fn(|leaf| {
+                [
+                    Block128::from(seed + (2 * leaf + 1) as u128),
+                    Block128::from(seed + (2 * leaf + 2) as u128),
+                ]
+            }),
         }
     }
 
@@ -2136,17 +2135,32 @@ mod tests {
 
     #[test]
     fn slot_vars_computation() {
-        assert_eq!(slot_vars_for(59), 6); // 1 tx
-        assert_eq!(slot_vars_for(118), 7); // 2 txs
-        assert_eq!(slot_vars_for(4 * 59), 8); // 4 txs: 236 slots
-        assert_eq!(slot_vars_for(1024 * 59), 16); // 1024 txs: 60416 slots
+        assert_eq!(slot_vars_for(31), 5); // 1 tx
+        assert_eq!(slot_vars_for(62), 6); // 2 txs
+        assert_eq!(slot_vars_for(4 * 31), 7); // 4 txs: 124 slots
+        assert_eq!(slot_vars_for(1024 * 31), 15); // 1024 txs: 31744 slots
     }
 
     #[test]
     fn num_vars_computation() {
-        assert_eq!(num_vars_for(59), 6 + 7 + 2); // 15 (same as per-tx)
-        assert_eq!(num_vars_for(118), 7 + 7 + 2); // 16
-        assert_eq!(num_vars_for(4 * 59), 8 + 7 + 2); // 17
+        assert_eq!(num_vars_for(31), 5 + 7 + 2); // 14 (same as per-tx)
+        assert_eq!(num_vars_for(62), 6 + 7 + 2); // 15
+        assert_eq!(num_vars_for(4 * 31), 7 + 7 + 2); // 16
+    }
+
+    #[test]
+    fn exact_block_class_geometry_includes_coinbase_body() {
+        for (bodies, live_slots, slot_domain, num_vars) in [
+            (9, 279, 512, 18),
+            (33, 1_023, 1_024, 19),
+            (65, 2_015, 2_048, 20),
+            (256, 7_936, 8_192, 22),
+        ] {
+            let actual_live = bodies * N_SPINE_SLOTS;
+            assert_eq!(actual_live, live_slots);
+            assert_eq!(actual_live.next_power_of_two(), slot_domain);
+            assert_eq!(num_vars_for(actual_live), num_vars);
+        }
     }
 
     #[test]
@@ -2196,8 +2210,8 @@ mod tests {
         let mut ch_p = Poseidon2bChannel::new();
         let (proof, reductions) = prove_block_spine_killshot(4, &mle, &tx_body_hashes, &mut ch_p);
 
-        assert_eq!(proof.num_vars, 8 + 7 + 2); // 17 vars for 236 slots
-        assert_eq!(proof.live_slots, 4 * 59);
+        assert_eq!(proof.num_vars, 7 + 7 + 2); // 16 vars for 124 slots
+        assert_eq!(proof.live_slots, 4 * 31);
 
         let mut ch_v = Poseidon2bChannel::new();
         let v_red = verify_block_spine_killshot(&proof, 4, &tx_body_hashes, &mut ch_v)
@@ -2257,8 +2271,7 @@ mod tests {
         // constant term and one high-degree term separately.
         for (poly_idx, coeff_idx) in [(0usize, 0usize), (3, 5)] {
             let (mut proof, hashes) = one_tx_proof();
-            proof.kill_shot.main.round_polys[poly_idx].coeffs_no_linear[coeff_idx] +=
-                Block128::ONE;
+            proof.kill_shot.main.round_polys[poly_idx].coeffs_no_linear[coeff_idx] += Block128::ONE;
             let mut ch_v = Poseidon2bChannel::new();
             assert!(verify_block_spine_killshot(&proof, 1, &hashes, &mut ch_v).is_none());
         }

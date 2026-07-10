@@ -54,7 +54,8 @@ pub fn capacity_iv_flat(tag: DomainTag) -> [u128; 2] {
 pub const TAG_LEAF: DomainTag = DomainTag::new(b"LEAF____");
 pub const TAG_COMMIT: DomainTag = DomainTag::new(b"COMMIT__");
 pub const TAG_ADDRFIX: DomainTag = DomainTag::new(b"ADDRFIX_");
-pub const TAG_TXBODY: DomainTag = DomainTag::new(b"TXBODY__");
+/// Canonical flattened Tx8x2 body: raw 16-leaf tree plus one wrap permutation.
+pub const TAG_TX8X2: DomainTag = DomainTag::new(b"TX8X2___");
 /// Count-bound universal 256-leaf block transaction root.
 pub const TAG_TXROOT: DomainTag = DomainTag::new(b"TXROOT__");
 pub const TAG_BLOCKHDR: DomainTag = DomainTag::new(b"BLOCKHDR");
@@ -80,13 +81,6 @@ pub const TAG_FRISTATE: DomainTag = DomainTag::new(b"FRISTATE");
 /// Segment-level Merkle tree: Poseidon2b binary tree over per-segment
 /// FRI roots. The root is the global `state_root` when `num_segments > 1`.
 pub const TAG_SEGMENTTREE: DomainTag = DomainTag::new(b"SEGTREE_");
-/// Fixed-length 4-field output-leaf sponge: `[slot, value, owner_hi,
-/// owner_lo]` absorbed as two rate blocks with no padding flush
-/// (total: 2 permutations). Symmetric twin of the canonical tx-body
-/// GKR `OutputLeafPermA + OutputLeafPermB` schedule. Distinct from `TAG_LEAF` so the
-/// no-pad 4-field output-leaf construction cannot collide with the
-/// pad-flushed variable-length `hash_leaf` under the same IV.
-pub const TAG_OUTLEAF: DomainTag = DomainTag::new(b"OUTLEAF_");
 /// Claims commitment: Poseidon2b sponge over all claimed slot data
 /// (inputs + outputs). Bridges WalletAuthorizationBundle to exact state proof.
 pub const TAG_CLAIMS: DomainTag = DomainTag::new(b"CLAIMS__");
@@ -125,7 +119,7 @@ mod tests {
             TAG_LEAF,
             TAG_COMMIT,
             TAG_ADDRFIX,
-            TAG_TXBODY,
+            TAG_TX8X2,
             TAG_TXROOT,
             TAG_BLOCKHDR,
             TAG_POWHDR,
@@ -137,7 +131,6 @@ mod tests {
             TAG_DAWTNSS,
             TAG_FRISTATE,
             TAG_SEGMENTTREE,
-            TAG_OUTLEAF,
             TAG_CLAIMS,
             TAG_EXSTSLT,
             TAG_EXSTNOD,
@@ -164,5 +157,11 @@ mod tests {
         assert_ne!(hi, Block128::ZERO);
         assert_ne!(lo, Block128::ZERO);
         assert_ne!(hi, lo);
+    }
+
+    #[test]
+    fn tx8x2_tag_bytes_are_frozen() {
+        assert_eq!(TAG_TX8X2.0, *b"TX8X2___");
+        assert_eq!(TAG_TX8X2.as_u64(), 0x5458_3858_325f_5f5f);
     }
 }

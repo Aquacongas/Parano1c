@@ -13,26 +13,23 @@ use noid_poseidon2b::native::permutation::STATE_SIZE;
 use crate::circuit::{SpineCircuit, SpineInputs};
 use crate::layers::evaluate_permutation;
 use crate::mle_layout::{PermMle, N_PERM_CELLS, N_PERM_VARS};
+pub use crate::tx_body_layout::{N_SPINE_SLOTS, N_SPINE_SLOTS_PADDED};
 
-/// Number of slots in the tx-body spine.
-pub const N_SPINE_SLOTS: usize = 59;
-
-/// Smallest power of two ≥ `N_SPINE_SLOTS`, used for zero-padding so
-/// the concatenated boundary MLE lives on a hypercube.
-pub const N_SPINE_SLOTS_PADDED: usize = 64;
-
-/// Extra variable count to index slots. `log2(64) = 6`.
-pub const N_SLOT_VARS: usize = 6;
+/// Extra variable count to index the 32-slot padded body domain.
+pub const N_SLOT_VARS: usize = N_SPINE_SLOTS_PADDED.trailing_zeros() as usize;
 
 /// Total variables in the concatenated boundary MLE:
-/// `log2(N_SPINE_SLOTS_PADDED) + N_PERM_VARS = 6 + 9 = 15`.
+/// `log2(N_SPINE_SLOTS_PADDED) + N_PERM_VARS = 5 + 9 = 14`.
 pub const N_BOUNDARY_VARS: usize = N_SLOT_VARS + N_PERM_VARS;
 
 /// `2^N_BOUNDARY_VARS` cells — the padded size of the boundary MLE.
 pub const N_BOUNDARY_CELLS: usize = 1 << N_BOUNDARY_VARS;
 
+const _: () = assert!(N_SLOT_VARS == 5);
+const _: () = assert!(N_BOUNDARY_VARS == 14);
+
 /// Build the concatenated boundary MLE `B` of length
-/// `N_BOUNDARY_CELLS = 2^15`. Slot `s ∈ 0..N_SPINE_SLOTS` occupies
+/// `N_BOUNDARY_CELLS = 2^14`. Slot `s ∈ 0..N_SPINE_SLOTS` occupies
 /// indices `(s << N_PERM_VARS) .. ((s+1) << N_PERM_VARS)`; padded
 /// slots are zero.
 pub fn build_boundary_mle(
@@ -97,12 +94,12 @@ mod unit {
         use crate::oracle::evaluate_spine;
         let circuit = SpineCircuit::build();
         let inputs = SpineInputs {
-            epoch_anchor: [Block128::from(11u128), Block128::from(22u128)],
-            fee_leaf: [Block128::from(33u128), Block128::from(44u128)],
-            input_leaves: [[Block128::from(1u128); 4]; 4],
-            output_leaves: [[Block128::from(2u128); 4]; 8],
-            is_coinbase_leaf: [Block128::from(55u128), Block128::from(66u128)],
-            pad_leaf: [Block128::from(0u128), Block128::from(0u128)],
+            leaves: std::array::from_fn(|leaf| {
+                [
+                    Block128::from((2 * leaf + 1) as u128),
+                    Block128::from((2 * leaf + 2) as u128),
+                ]
+            }),
         };
         let from_spine = compute_tx_body_hash(&circuit, &inputs);
         let from_oracle = evaluate_spine(&circuit, &inputs).tx_body_hash;

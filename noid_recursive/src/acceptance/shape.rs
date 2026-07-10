@@ -53,6 +53,8 @@ impl ShapeClass {
             self.touched_capacity(),
             noid_tx::TX_INPUTS,
             noid_tx::TX_OUTPUTS,
+            noid_tx::body_hash::BODY_HASH_LEAVES,
+            noid_gkr::N_SPINE_SLOTS,
             noid_chain::tx_tree::TX_TREE_DEPTH,
         ];
         let mut encoded = Vec::with_capacity(fields.len() * 8);
@@ -70,7 +72,7 @@ pub fn enumerate_shape_classes() -> impl Iterator<Item = ShapeClass> {
         .map(|tier| ShapeClass { tier })
 }
 
-const SHAPE_CLASS_DOMAIN: &[u8] = b"NOID-TX8X2-SHAPE-CLASS-V1";
+const SHAPE_CLASS_DOMAIN: &[u8] = b"NOID-TX8X2-SHAPE-CLASS-V2";
 
 #[cfg(test)]
 mod tests {
@@ -104,5 +106,7 @@ mod tests {
             ShapeClass::for_count(255).unwrap().touched_capacity(),
             1_531
         );
+        assert_eq!(noid_tx::body_hash::BODY_HASH_LEAVES, 16);
+        assert_eq!(noid_gkr::N_SPINE_SLOTS, 31);
     }
 }

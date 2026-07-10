@@ -19,9 +19,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::batch::compress_batch_interleaved_into;
 use crate::native::compression::Poseidon2bSponge;
-use crate::native::domain::{
-    capacity_iv, DomainTag, TAG_ADDRFIX, TAG_COMMIT, TAG_LEAF, TAG_OUTLEAF, TAG_TXBODY,
-};
+use crate::native::domain::{capacity_iv, DomainTag, TAG_ADDRFIX, TAG_COMMIT, TAG_LEAF, TAG_TX8X2};
 use crate::native::permutation::Poseidon2bPermutation;
 use noid_core::CanonicalSerialize;
 
@@ -273,96 +271,23 @@ pub fn derive_address(secret: &SpendSecret) -> Address {
     Address(s.finalize_no_pad())
 }
 
-/// Internal 59-permutation carrier retained until the flattened Tx8x2 spine
-/// lands. These are carrier payload counts, not transaction capacities.
-pub const TXBODY_CARRIER_INPUTS: usize = 4;
-pub const TXBODY_CARRIER_OUTPUTS: usize = 8;
-pub const TXBODY_CARRIER_LEAVES: usize = 16;
-pub const TXBODY_CARRIER_DEPTH: usize = 4;
+/// Number of raw two-field leaves in the sole Tx8x2 body construction.
+pub const TX8X2_LEAF_COUNT: usize = 16;
+pub const TX8X2_TREE_DEPTH: usize = 4;
 
-/// Per-input leaf of the tx-body Merkle tree. Binds the slot index to
-/// the UTXO being spent. Sponge-mode 4-field absorb under IV `LEAF____`:
-/// `hash_leaf([slot_index, packed_value, owner_hi, owner_lo])`.
-///
-/// `packed_value` is the transaction layer's `amount || creation_id`
-/// incarnation lane. Keeping it as one field preserves the existing
-/// three-permutation input-leaf schedule.
-pub fn hash_input_leaf_packed(slot_index: u32, packed_value: Block128, owner: &Address) -> Digest {
-    let [owner_hi, owner_lo] = owner.as_fields();
-    hash_leaf(&[
-        Block128::from(slot_index as u128),
-        packed_value,
-        owner_hi,
-        owner_lo,
-    ])
-}
-
-/// Per-output leaf of the tx-body Merkle tree.
-///
-/// Fixed-length 4-field sponge under IV `OUTLEAF_`:
-/// `[slot_index, value, owner_hi, owner_lo]` absorbed as two rate
-/// blocks and squeezed **without a padding flush** (2 permutations
-/// total). This matches the canonical tx-body GKR output-leaf schedule
-/// (`OutputLeafPermA + OutputLeafPermB`) byte-for-byte.
-///
-/// Domain separation vs. [`hash_leaf`] — which uses `TAG_LEAF` and a
-/// padding-flush — comes from the distinct `TAG_OUTLEAF` capacity IV,
-/// not from shape; the no-pad construction cannot be reached through
-/// the padded API under any tag.
-pub fn hash_output_leaf_packed(slot_index: u32, packed_value: Block128, owner: &Address) -> Digest {
-    let [owner_hi, owner_lo] = owner.as_fields();
-    let mut s = sponge(TAG_OUTLEAF);
-    s.absorb_pair(Block128::from(slot_index as u128), packed_value);
-    s.absorb_pair(owner_hi, owner_lo);
-    s.finalize_no_pad()
-}
-
-/// Output payload convenience wrapper for an ordinary 64-bit amount.
 #[inline]
-pub fn hash_output_leaf(slot_index: u32, amount: u64, owner: &Address) -> Digest {
-    hash_output_leaf_packed(slot_index, Block128::from(amount as u128), owner)
-}
-
-/// 32-byte fee leaf: `fee_le_bytes_u64 || [0u8; 24]`.
-#[inline]
-pub fn fee_leaf(fee: u64) -> Digest {
+fn fields_to_digest(fields: [Block128; 2]) -> Digest {
     let mut out = [0u8; 32];
-    out[..8].copy_from_slice(&fee.to_le_bytes());
-    out
-}
-
-/// Encode `is_coinbase` into the tx-body Merkle leaf as a
-/// bit-wide digest: `[is_coinbase as u8, 0, …, 0]`.
-///
-/// Zero-preserving: `is_coinbase=false` leaves the leaf at the all-zero
-/// digest, so both branches share the same tree shape. The corresponding
-/// AIR pin lives at
-/// `TxBodyMerkleBoundaryPins.is_coinbase_leaf` and is tied to
-/// `SKEL_IS_COINBASE_COL` in f₃.
-#[inline]
-pub fn is_coinbase_leaf(is_coinbase: bool) -> Digest {
-    let mut out = [0u8; 32];
-    out[0] = is_coinbase as u8;
+    out[..16].copy_from_slice(&fields[0].to_bytes());
+    out[16..].copy_from_slice(&fields[1].to_bytes());
     out
 }
 
 #[inline]
-fn txbody_merkle_root<const N: usize>(leaves: &[Digest; N]) -> Digest {
-    debug_assert!(N.is_power_of_two());
-    let mut level: Vec<Digest> = leaves.to_vec();
-    while level.len() > 1 {
-        let mut next = vec![[0u8; 32]; level.len() / 2];
-        compress_batch_interleaved_into(&level, &mut next);
-        level = next;
-    }
-    level[0]
-}
-
-#[inline]
-fn txbody_wrap(root: Digest) -> TxBodyHash {
+fn tx8x2_wrap(root: Digest) -> TxBodyHash {
     let r0 = Block128::from(u128::from_le_bytes(root[..16].try_into().unwrap()));
     let r1 = Block128::from(u128::from_le_bytes(root[16..].try_into().unwrap()));
-    let [iv_hi, iv_lo] = capacity_iv(TAG_TXBODY);
+    let [iv_hi, iv_lo] = capacity_iv(TAG_TX8X2);
     let mut state = [r0, r1, iv_hi, iv_lo];
     Poseidon2bPermutation.permute_mut(&mut state);
     let mut out = [0u8; 32];
@@ -371,49 +296,21 @@ fn txbody_wrap(root: Digest) -> TxBodyHash {
     TxBodyHash(out)
 }
 
-/// Transitional Tx8x2 body-hash carrier.
+/// Hash the canonical sixteen raw Tx8x2 leaves.
 ///
-/// Fixed 16-leaf, depth-4 Merkle tree over 32-byte canonical leaves,
-/// reduced with [`compress`](crate::native::compress) and wrapped with
-/// a single `TXBODY__` permutation. Layout:
-///
-/// ```text
-/// L0         = epoch_anchor (fork-binding digest)
-/// L1         = fee_leaf(fee)
-/// L2..L5     = input_leaves[0..4]        // hash_input_leaf
-/// L6..L13    = output_leaves[0..8]       // hash_output_leaf
-/// L14        = is_coinbase_leaf(is_coinbase)
-/// L15        = validity_leaf(validity_bits)
-/// ```
-///
-/// Logical Tx8x2 records are mapped into these carrier payloads by `noid_tx`;
-/// this function deliberately knows nothing about logical input/output counts.
-pub fn hash_tx_body_carrier(
-    epoch_anchor: &Digest,
-    fee: u64,
-    input_leaves: &[Digest; TXBODY_CARRIER_INPUTS],
-    output_leaves: &[Digest; TXBODY_CARRIER_OUTPUTS],
-    is_coinbase: bool,
-    validity_bits: u16,
-) -> TxBodyHash {
-    let mut leaves: [Digest; TXBODY_CARRIER_LEAVES] = [[0u8; 32]; TXBODY_CARRIER_LEAVES];
-    leaves[0] = *epoch_anchor;
-    leaves[1] = fee_leaf(fee);
-    leaves[2..2 + TXBODY_CARRIER_INPUTS].copy_from_slice(input_leaves);
-    leaves[2 + TXBODY_CARRIER_INPUTS..2 + TXBODY_CARRIER_INPUTS + TXBODY_CARRIER_OUTPUTS]
-        .copy_from_slice(output_leaves);
-    leaves[14] = is_coinbase_leaf(is_coinbase);
-    leaves[15] = validity_leaf(validity_bits);
-
-    txbody_wrap(txbody_merkle_root(&leaves))
-}
-
-/// The reserved-leaf Tx8x2 validity bitmap. Bits 0..7 are inputs and bits
-/// 8..9 are outputs; callers reject every high bit before hashing.
-pub fn validity_leaf(bits: u16) -> Digest {
-    let mut leaf = [0u8; 32];
-    leaf[..2].copy_from_slice(&bits.to_le_bytes());
-    leaf
+/// The leaves are reduced by fifteen canonical two-permutation `COMPRESS`
+/// nodes, then wrapped by one permutation under `TAG_TX8X2`: exactly 31
+/// Poseidon2b permutations in total. This function deliberately knows only
+/// the fixed leaf array; `noid_tx` owns the field-to-leaf mapping.
+pub fn hash_tx8x2_leaves(leaves: &[[Block128; 2]; TX8X2_LEAF_COUNT]) -> TxBodyHash {
+    let mut level: Vec<Digest> = leaves.iter().copied().map(fields_to_digest).collect();
+    for _ in 0..TX8X2_TREE_DEPTH {
+        let mut next = vec![[0u8; 32]; level.len() / 2];
+        compress_batch_interleaved_into(&level, &mut next);
+        level = next;
+    }
+    debug_assert_eq!(level.len(), 1);
+    tx8x2_wrap(level[0])
 }
 
 #[cfg(test)]
@@ -423,25 +320,6 @@ mod tests {
 
     const SS: SpendSecret = SpendSecret([7u8; 32]);
 
-    fn zero_creation_input_leaf(slot_index: u32, value: u64, owner: &Address) -> Digest {
-        hash_input_leaf_packed(slot_index, Block128::from(value as u128), owner)
-    }
-
-    fn pad_inputs(leaves: Vec<Digest>) -> [Digest; TXBODY_CARRIER_INPUTS] {
-        let mut out = [[0u8; 32]; TXBODY_CARRIER_INPUTS];
-        for (i, d) in leaves.into_iter().enumerate() {
-            out[i] = d;
-        }
-        out
-    }
-    fn pad_outputs(leaves: Vec<Digest>) -> [Digest; TXBODY_CARRIER_OUTPUTS] {
-        let mut out = [[0u8; 32]; TXBODY_CARRIER_OUTPUTS];
-        for (i, d) in leaves.into_iter().enumerate() {
-            out[i] = d;
-        }
-        out
-    }
-
     #[test]
     fn determinism_all_primitives() {
         let addr = derive_address(&SS);
@@ -449,29 +327,6 @@ mod tests {
 
         let c = hash_utxo_leaf(100, &addr);
         assert_eq!(c, hash_utxo_leaf(100, &addr));
-
-        let ins = pad_inputs(vec![zero_creation_input_leaf(5, 100, &addr)]);
-        let outs = pad_outputs(vec![c.0]);
-        let tb = hash_tx_body_carrier(&[1u8; 32], 3, &ins, &outs, false, 0);
-        assert_eq!(
-            tb,
-            hash_tx_body_carrier(&[1u8; 32], 3, &ins, &outs, false, 0)
-        );
-
-        assert_ne!(tb.0, addr.0);
-    }
-
-    #[test]
-    fn packed_input_leaf_uses_low_lane_for_zero_id_and_binds_nonzero() {
-        let addr = Address([0x6Du8; 32]);
-        let amount = 0x0123_4567_89AB_CDEFu64;
-        let zero_id = zero_creation_input_leaf(17, amount, &addr);
-        assert_eq!(
-            zero_id,
-            hash_input_leaf_packed(17, Block128::from(amount as u128), &addr)
-        );
-        let incarnated = Block128::from((9u128 << 64) | amount as u128);
-        assert_ne!(zero_id, hash_input_leaf_packed(17, incarnated, &addr));
     }
 
     #[test]
@@ -501,123 +356,6 @@ mod tests {
                 assert_ne!(all[i], all[j]);
             }
         }
-    }
-
-    #[test]
-    fn tx_body_sensitive_to_ordering_and_fee() {
-        let a1 = Address([1u8; 32]);
-        let a2 = Address([2u8; 32]);
-        let in1 = zero_creation_input_leaf(0, 1, &a1);
-        let in2 = zero_creation_input_leaf(0, 2, &a2);
-        let c1 = hash_utxo_leaf(1, &a1).0;
-        let c2 = hash_utxo_leaf(2, &a2).0;
-
-        let ins_ab = pad_inputs(vec![in1]);
-        let ins_ba = pad_inputs(vec![in2]);
-        let outs_ab = pad_outputs(vec![c2]);
-        let outs_ba = pad_outputs(vec![c1]);
-
-        let h_a = hash_tx_body_carrier(&[0u8; 32], 10, &ins_ab, &outs_ab, false, 0);
-        let h_b = hash_tx_body_carrier(&[0u8; 32], 10, &ins_ba, &outs_ba, false, 0);
-        let h_c = hash_tx_body_carrier(&[0u8; 32], 11, &ins_ab, &outs_ab, false, 0);
-        assert_ne!(h_a, h_b);
-        assert_ne!(h_a, h_c);
-    }
-
-    fn txbody_wrap(root: [u8; 32]) -> [u8; 32] {
-        let r0 = Block128::from(u128::from_le_bytes(root[..16].try_into().unwrap()));
-        let r1 = Block128::from(u128::from_le_bytes(root[16..].try_into().unwrap()));
-        let [hi, lo] = capacity_iv(TAG_TXBODY);
-        let mut state = [r0, r1, hi, lo];
-        Poseidon2bPermutation.permute_mut(&mut state);
-        let mut out = [0u8; 32];
-        out[..16].copy_from_slice(&state[0].to_bytes());
-        out[16..].copy_from_slice(&state[1].to_bytes());
-        out
-    }
-
-    #[test]
-    fn tx_body_matches_reference_construction() {
-        use crate::native::compress;
-
-        let prev = [0xAAu8; 32];
-        let fee = 0x1234_5678u64;
-
-        // Fully-empty tx: 16 leaves = [prev, fee_leaf, 14 × zero].
-        let mut leaves: [Digest; TXBODY_CARRIER_LEAVES] = [[0u8; 32]; TXBODY_CARRIER_LEAVES];
-        leaves[0] = prev;
-        leaves[1] = fee_leaf(fee);
-
-        // Depth-4 compress.
-        let mut level = leaves.to_vec();
-        while level.len() > 1 {
-            let mut next = vec![[0u8; 32]; level.len() / 2];
-            for (i, pair) in level.chunks_exact(2).enumerate() {
-                next[i] = compress(&pair[0], &pair[1]);
-            }
-            level = next;
-        }
-        let expected = txbody_wrap(level[0]);
-
-        let got = hash_tx_body_carrier(
-            &prev,
-            fee,
-            &[[0u8; 32]; TXBODY_CARRIER_INPUTS],
-            &[[0u8; 32]; TXBODY_CARRIER_OUTPUTS],
-            false,
-            0,
-        );
-        assert_eq!(got.0, expected);
-    }
-
-    #[test]
-    fn tx_body_depth_always_four() {
-        // Empty tx, 1-in/1-out, and 4-in/8-out must all produce
-        // different but equally deep hashes.
-        let a = Address([9u8; 32]);
-        let ins_empty = [[0u8; 32]; TXBODY_CARRIER_INPUTS];
-        let outs_empty = [[0u8; 32]; TXBODY_CARRIER_OUTPUTS];
-
-        let mut ins_one = ins_empty;
-        ins_one[0] = zero_creation_input_leaf(1, 100, &a);
-        let mut outs_one = outs_empty;
-        outs_one[0] = hash_output_leaf(0, 50, &a);
-
-        let mut ins_full = ins_empty;
-        for i in 0..TXBODY_CARRIER_INPUTS {
-            ins_full[i] = zero_creation_input_leaf(i as u32, 10 + i as u64, &a);
-        }
-        let mut outs_full = outs_empty;
-        for i in 0..TXBODY_CARRIER_OUTPUTS {
-            outs_full[i] = hash_output_leaf(i as u32, 5 + i as u64, &a);
-        }
-
-        let h_empty = hash_tx_body_carrier(&[0u8; 32], 0, &ins_empty, &outs_empty, false, 0);
-        let h_one = hash_tx_body_carrier(&[0u8; 32], 0, &ins_one, &outs_one, false, 0);
-        let h_full = hash_tx_body_carrier(&[0u8; 32], 0, &ins_full, &outs_full, false, 0);
-        assert_ne!(h_empty, h_one);
-        assert_ne!(h_empty, h_full);
-        assert_ne!(h_one, h_full);
-    }
-
-    #[test]
-    fn is_coinbase_flips_tx_body_hash() {
-        // Body hash must be sensitive to the is_coinbase flag;
-        // the L14 leaf separates the coinbase branch from regular txs.
-        let prev = [0u8; 32];
-        let ins = [[0u8; 32]; TXBODY_CARRIER_INPUTS];
-        let outs = [[0u8; 32]; TXBODY_CARRIER_OUTPUTS];
-        let h_regular = hash_tx_body_carrier(&prev, 0, &ins, &outs, false, 0);
-        let h_coinbase = hash_tx_body_carrier(&prev, 0, &ins, &outs, true, 0);
-        assert_ne!(h_regular, h_coinbase);
-    }
-
-    #[test]
-    fn is_coinbase_leaf_zero_preserving() {
-        assert_eq!(is_coinbase_leaf(false), [0u8; 32]);
-        let mut expected = [0u8; 32];
-        expected[0] = 1;
-        assert_eq!(is_coinbase_leaf(true), expected);
     }
 
     #[test]

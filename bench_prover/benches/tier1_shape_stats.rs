@@ -33,6 +33,22 @@ fn main() {
 
     for tier in tiers {
         let class = ShapeClass { tier };
+        let bodies = tier + 1;
+        let live_spine_slots = bodies * noid_gkr::N_SPINE_SLOTS;
+        let spine_slot_domain = live_spine_slots.next_power_of_two();
+        let spine_num_vars = noid_gkr::block_spine::num_vars_for(live_spine_slots);
+        let expected = match tier {
+            8 => (279, 512, 18),
+            32 => (1_023, 1_024, 19),
+            64 => (2_015, 2_048, 20),
+            255 => (7_936, 8_192, 22),
+            _ => unreachable!("tier filtered above"),
+        };
+        assert_eq!(
+            (live_spine_slots, spine_slot_domain, spine_num_vars),
+            expected,
+            "B{tier} body-spine geometry drift"
+        );
         let spend_capacity = class.spend_capacity();
         let touched_capacity = class.touched_capacity();
         let (fixture_time, fixtures) = time_once(|| {
@@ -58,6 +74,9 @@ fn main() {
         println!("    spend capacity:    {spend_capacity}");
         println!("    auth capacity:     {}", class.authorization_capacity());
         println!("    touched capacity:  {touched_capacity}");
+        println!(
+            "    body spine:        {live_spine_slots} live / {spine_slot_domain} slots / m={spine_num_vars}"
+        );
         println!(
             "    tx tree:           {} leaves / depth {}",
             noid_chain::tx_tree::TX_TREE_LEAVES,

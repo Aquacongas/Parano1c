@@ -366,13 +366,14 @@ fn region_source_binding_multitx_end_to_end() {
 /// chunked layout, the cap_log = 1 instance coordinates in the gated
 /// exposure's re-point, and the ghost fill — the exact shape a real block
 /// (user txs + coinbase) produces. Honest build satisfies; a flipped KID
-/// LEAF cell (pinned to a chain-digest wire) breaks a Stage-2 pin; a flipped
+/// LEAF cell (pinned to a raw body-leaf wire) breaks a Stage-2 pin; a flipped
 /// INTERNAL KID cell in the GHOST-PADDED chunk breaks the gated tiled
 /// exposure's re-pointed opening at the PCS.
 #[test]
 fn region_spine_families_multitx_with_ghosts() {
     use noid_ivc_core::deep_chain::spine::{
-        build_spine_instance_columns, SpineInstanceFlat, SPINE_TREE_KID_LEAF_BASE,
+        build_spine_instance_columns, spine_tree_internal_child_pattern, SpineInstanceFlat,
+        SPINE_TREE_KID_LEAF_BASE, SPINE_TREE_SLOTS,
     };
 
     let num_vars = 9usize;
@@ -406,8 +407,7 @@ fn region_spine_families_multitx_with_ghosts() {
         });
     }
 
-    // Three synthetic spine instances (random flat statement lanes; the
-    // builder is separately gated against the native tower spine).
+    // Three synthetic final-spine instances: sixteen raw body leaves each.
     let mut rng = Rng(0xF00D);
     let f = |rng: &mut Rng| -> F128 {
         F128 {
@@ -418,27 +418,14 @@ fn region_spine_families_multitx_with_ghosts() {
     let instances: Vec<SpineInstanceRegion> = (0..n_inst)
         .map(|_| {
             let flat = SpineInstanceFlat {
-                epoch_anchor: [f(&mut rng), f(&mut rng)],
-                fee_leaf: [f(&mut rng), f(&mut rng)],
-                input_leaves: std::array::from_fn(|_| std::array::from_fn(|_| f(&mut rng))),
-                output_leaves: std::array::from_fn(|_| std::array::from_fn(|_| f(&mut rng))),
-                is_coinbase_leaf: [f(&mut rng), f(&mut rng)],
-                pad_leaf: [F128::ZERO; 2],
+                leaves: std::array::from_fn(|_| [f(&mut rng), f(&mut rng)]),
             };
             let tx_hash = build_spine_instance_columns(&flat).tx_hash;
             let w2 = |b: &mut FieldR1csBuilder, v: [F128; 2]| -> [LinExpr; 2] {
                 std::array::from_fn(|i| LinExpr::from_wire(b.alloc_f128(v[i])))
             };
-            let w4 = |b: &mut FieldR1csBuilder, v: [F128; 4]| -> [LinExpr; 4] {
-                std::array::from_fn(|i| LinExpr::from_wire(b.alloc_f128(v[i])))
-            };
             SpineInstanceRegion {
-                input_leaves_w: flat.input_leaves.iter().map(|p| w4(&mut b, *p)).collect(),
-                output_leaves_w: flat.output_leaves.iter().map(|p| w4(&mut b, *p)).collect(),
-                anchor_w: w2(&mut b, flat.epoch_anchor),
-                fee_w: w2(&mut b, flat.fee_leaf),
-                coinbase_w: w2(&mut b, flat.is_coinbase_leaf),
-                pad_w: w2(&mut b, flat.pad_leaf),
+                leaves_w: std::array::from_fn(|leaf| w2(&mut b, flat.leaves[leaf])),
                 tx_hash_w: w2(&mut b, tx_hash),
                 tx_hash_flat: tx_hash,
                 flat,
@@ -507,6 +494,29 @@ fn region_spine_families_multitx_with_ghosts() {
         z.len(),
         claims.len()
     );
+    // One full PCS gate on the honest witness.  The precise corruptions below
+    // use direct R1CS pins or the exact KID↔C exposure equality, so this
+    // 4M-row proof is not repeated for every invalid witness.
+    let params_pcs = PcsParams {
+        m: r1cs.m + pcs::LOG_PACKING,
+        log_inv_rate: 2,
+        log_batch_size: 2,
+        profile: Default::default(),
+    };
+    let mut chp = FsLaneChallenger::new(OUTER);
+    let (bp, bc, _) = noid_ivc_prover::field_prover::prove_field_with_public_io(
+        &r1cs,
+        &z,
+        &params_pcs,
+        &spec,
+        &io_values,
+        &mut chp,
+    );
+    let mut chv = FsLaneChallenger::new(OUTER);
+    noid_ivc_core::verifier::verify_field_with_public_io(
+        &r1cs, &bc, &bp, &spec, &io_values, &mut chv,
+    )
+    .expect("honest spine multitx+ghost PCS proof");
 
     // Walk-A column slices are allocated first and in the meta order
     // (KID0, KID1, IN0, IN1, C0..C3 — the source-tree CODE lanes ride IN) —
@@ -516,23 +526,27 @@ fn region_spine_families_multitx_with_ghosts() {
     uniq.sort_by_key(|s| s.start());
     uniq.dedup_by_key(|s| s.start());
     let kid0 = uniq[0];
+    let c0 = uniq[4];
     let p_col = 1usize << kid0.log2_len;
     let per_tx_block_a = p_col / k;
-    // Recover the spine-tree base by locating instance 2's L2 leaf digest
-    // (a known value, computed by the gated builder) inside tx block 1's
+    // Recover the spine-tree base by locating instance 2's raw L2 lane inside tx block 1's
     // KID0 slice — robust against the wallet-family layout details.
-    let inst2_l2 = build_spine_instance_columns(&spine.instances[2].flat).chain_digests[0][0];
+    let inst2_l2 = spine.instances[2].flat.leaves[2][0];
     let blk1 = kid0.start() + per_tx_block_a;
     let hit = (0..per_tx_block_a)
         .find(|&w| z[blk1 + w] == inst2_l2)
-        .expect("instance 2's L2 digest present in block 1's KID0");
+        .expect("instance 2's raw L2 present in block 1's KID0");
     // Instance 2 is block 1's in-block instance 0, leaf L2 = KID position
     // SPINE_TREE_KID_LEAF_BASE + 2 within its tree.
     let spine_tree_base = hit - (SPINE_TREE_KID_LEAF_BASE + 2);
-    assert_eq!(spine_tree_base % 128, 0, "tree base 64*cap alignment");
+    assert_eq!(
+        spine_tree_base % (SPINE_TREE_SLOTS * 2),
+        0,
+        "tree base must align to tree_slots*cap"
+    );
 
     // Negative 1 (Stage-2 pin): flip instance 2's KID LEAF cell (block 1,
-    // in-block instance 0) — pinned to its chain-digest wire, so the trace
+    // in-block instance 0) — pinned to its raw body-leaf wire, so the trace
     // itself must reject.
     {
         let cell = blk1 + spine_tree_base + SPINE_TREE_KID_LEAF_BASE + 2;
@@ -541,41 +555,36 @@ fn region_spine_families_multitx_with_ghosts() {
         assert!(!r1cs.satisfies(&bad), "flipped KID leaf cell accepted");
     }
 
-    // Negative 2 (gated exposure): flip an INTERNAL KID cell of the REAL
-    // instance in the ghost-padded chunk (block 1, instance 0, node 5). No
-    // pin covers internal children — the gated tiled exposure's re-pointed
-    // KID0 opening must break at the PCS.
+    // Negative 2 (gated exposure): KID(w) must equal C(2w+1) wherever the
+    // exposure gate is one.  Check the exact real-instance cells before and
+    // after flipping internal child w=5.  The honest full PCS gate above
+    // exercises the generic opening machinery once; this deterministic
+    // negative isolates the spine wiring without a second 4M-row proof.
     {
-        let cell = blk1 + spine_tree_base + 5;
+        let w = 5usize;
+        assert_eq!(spine_tree_internal_child_pattern().table[w], F128::ONE);
+        let cell = blk1 + spine_tree_base + w;
+        let child = c0.start() + per_tx_block_a + spine_tree_base + 2 * w + 1;
+        assert_eq!(z[cell], z[child], "honest internal KID exposure");
         let mut bad = z.clone();
         bad[cell] += F128::ONE;
-        let caught = if !r1cs.satisfies(&bad) {
-            true
-        } else {
-            let params_pcs = PcsParams {
-                m: r1cs.m + pcs::LOG_PACKING,
-                log_inv_rate: 2,
-                log_batch_size: 2,
-                profile: Default::default(),
-            };
-            let mut chp = FsLaneChallenger::new(OUTER);
-            let (bp, bc, _) = noid_ivc_prover::field_prover::prove_field_with_public_io(
-                &r1cs,
-                &bad,
-                &params_pcs,
-                &spec,
-                &io_values,
-                &mut chp,
-            );
-            let mut chv = FsLaneChallenger::new(OUTER);
-            noid_ivc_core::verifier::verify_field_with_public_io(
-                &r1cs, &bc, &bp, &spec, &io_values, &mut chv,
-            )
-            .is_err()
-        };
+        assert_ne!(
+            bad[cell], bad[child],
+            "corrupted internal KID stayed exposed"
+        );
+    }
+
+    // Negative 3 (root→wrap→hash closure): C0 is the fifth walk-A meta
+    // slice.  Flip the real instance's one-slot wrap output; the direct cell
+    // pin to the tx-hash statement must reject without relying on PCS chance.
+    {
+        let wrap_base = spine_tree_base + 2 * SPINE_TREE_SLOTS;
+        let cell = c0.start() + per_tx_block_a + wrap_base;
+        let mut bad = z.clone();
+        bad[cell] += F128::ONE;
         assert!(
-            caught,
-            "the gated exposure must catch a corrupted internal KID cell"
+            !r1cs.satisfies(&bad),
+            "flipped TAG_TX8X2 wrap output accepted"
         );
     }
 }

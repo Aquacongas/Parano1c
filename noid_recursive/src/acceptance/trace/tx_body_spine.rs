@@ -5,8 +5,8 @@
 //!
 //! Trace twins of:
 //! - [`verify_block_spine_killshot_trace`] ←
-//!   `noid_gkr::block_spine::verify_block_spine_killshot` (the temporary
-//!   59-slot Tx8x2 carrier) + `discharge_block_spine_reductions_native`.
+//!   `noid_gkr::block_spine::verify_block_spine_killshot` (the final
+//!   31-slot Tx8x2 tree) + `discharge_block_spine_reductions_native`.
 //!
 //! The discharge walks the native `SpineCircuit`
 //! descriptor tables (build-time structure) and rebuilds every slot's
@@ -38,40 +38,25 @@ use super::{
     F128,
 };
 
-/// Trace twin of the oracles' `padding_absorb_block` (`[0x80, 0x01 << 120]`).
-fn padding_absorb_block_const() -> [LinExpr; 2] {
-    [
-        const_block(Block128::from(0x80u128)),
-        const_block(Block128::from(0x01u128 << 120)),
-    ]
-}
-
 // ---------------------------------------------------------------------------
 // Statement wire types
 // ---------------------------------------------------------------------------
 
-/// Trace twin of the Tx8x2 carrier `SpineInputs`.
+/// Final Tx8x2 raw-leaf count. The binary tree is complete at depth four.
+pub use noid_tx::body_hash::BODY_HASH_LEAVES as TX_BODY_RAW_LEAVES;
+
+/// Trace twin of the final Tx8x2 `SpineInputs`: the 16 raw two-lane leaves
+/// consumed directly by the first compression level.
 pub struct SpineInputsTrace {
-    pub epoch_anchor: [LinExpr; 2],
-    pub fee_leaf: [LinExpr; 2],
-    pub input_leaves: Vec<[LinExpr; 4]>,
-    pub output_leaves: Vec<[LinExpr; 4]>,
-    pub is_coinbase_leaf: [LinExpr; 2],
-    pub pad_leaf: [LinExpr; 2],
+    pub leaves: [[LinExpr; 2]; TX_BODY_RAW_LEAVES],
 }
 
 impl SpineInputsTrace {
     pub fn alloc(b: &mut FieldR1csBuilder, native: &SpineInputs) -> Self {
-        let quad = |b: &mut FieldR1csBuilder, v: &[Block128; 4]| -> [LinExpr; 4] {
-            std::array::from_fn(|i| alloc_block(b, v[i]))
-        };
         Self {
-            epoch_anchor: std::array::from_fn(|i| alloc_block(b, native.epoch_anchor[i])),
-            fee_leaf: std::array::from_fn(|i| alloc_block(b, native.fee_leaf[i])),
-            input_leaves: native.input_leaves.iter().map(|l| quad(b, l)).collect(),
-            output_leaves: native.output_leaves.iter().map(|l| quad(b, l)).collect(),
-            is_coinbase_leaf: std::array::from_fn(|i| alloc_block(b, native.is_coinbase_leaf[i])),
-            pad_leaf: std::array::from_fn(|i| alloc_block(b, native.pad_leaf[i])),
+            leaves: std::array::from_fn(|leaf| {
+                std::array::from_fn(|lane| alloc_block(b, native.leaves[leaf][lane]))
+            }),
         }
     }
 }
@@ -104,11 +89,10 @@ impl TxBodySpineProofTrace {
 }
 
 // ---------------------------------------------------------------------------
-// [K] — verifier replay (shared skeleton, per-variant slot counts and tags)
+// [K] — verifier replay
 // ---------------------------------------------------------------------------
 
-/// Trace twin of `tx_hash_pin_claims` (same helper in both variants; only
-/// the slots-per-tx constant differs).
+/// Trace twin of `tx_hash_pin_claims`.
 fn tx_hash_pin_claims_trace(
     tx_body_hashes: &[[LinExpr; 2]],
     slots_per_tx: usize,
@@ -223,49 +207,10 @@ fn push_tx_body_spine_slots(
     for slot in &circuit.slots {
         let [iv_hi, iv_lo] = slot.capacity_iv;
         let state_in: [LinExpr; STATE_SIZE] = match slot.role {
-            InstanceRole::InputLeafPermA { leaf_idx } => {
-                let p = &inputs.input_leaves[leaf_idx as usize];
-                [
-                    p[0].clone(),
-                    p[1].clone(),
-                    const_block(iv_hi),
-                    const_block(iv_lo),
-                ]
-            }
-            InstanceRole::InputLeafPermB { leaf_idx } => {
-                let p = &inputs.input_leaves[leaf_idx as usize];
-                chain_absorb_pair_trace(
-                    &outs,
-                    slot.prev_output_src.unwrap(),
-                    [p[2].clone(), p[3].clone()],
-                )
-            }
-            InstanceRole::InputLeafPermC { .. } => chain_absorb_pair_trace(
-                &outs,
-                slot.prev_output_src.unwrap(),
-                padding_absorb_block_const(),
-            ),
-            InstanceRole::OutputLeafPermA { leaf_idx } => {
-                let p = &inputs.output_leaves[leaf_idx as usize];
-                [
-                    p[0].clone(),
-                    p[1].clone(),
-                    const_block(iv_hi),
-                    const_block(iv_lo),
-                ]
-            }
-            InstanceRole::OutputLeafPermB { leaf_idx } => {
-                let p = &inputs.output_leaves[leaf_idx as usize];
-                chain_absorb_pair_trace(
-                    &outs,
-                    slot.prev_output_src.unwrap(),
-                    [p[2].clone(), p[3].clone()],
-                )
-            }
             InstanceRole::CompressPermA { level, pos } => {
                 let left = match slot.left_child {
                     Some(id) => digest(&outs, id),
-                    None => resolve_carrier_leaf(inputs, level, pos, true),
+                    None => resolve_raw_leaf(inputs, level, pos, true),
                 };
                 [
                     left[0].clone(),
@@ -277,7 +222,7 @@ fn push_tx_body_spine_slots(
             InstanceRole::CompressPermB { level, pos } => {
                 let right = match slot.right_child {
                     Some(id) => digest(&outs, id),
-                    None => resolve_carrier_leaf(inputs, level, pos, false),
+                    None => resolve_raw_leaf(inputs, level, pos, false),
                 };
                 chain_absorb_pair_trace(&outs, slot.prev_output_src.unwrap(), right)
             }
@@ -296,21 +241,17 @@ fn push_tx_body_spine_slots(
     }
 }
 
-/// Trace twin of `oracle::resolve_child_digest`'s non-AIR branch.
-fn resolve_carrier_leaf(
-    inputs: &SpineInputsTrace,
-    level: u8,
-    pos: u8,
-    is_left: bool,
-) -> [LinExpr; 2] {
-    assert_eq!(level, 1, "non-AIR child outside level-1 compress");
-    match (pos, is_left) {
-        (0, true) => inputs.epoch_anchor.clone(),
-        (0, false) => inputs.fee_leaf.clone(),
-        (7, true) => inputs.is_coinbase_leaf.clone(),
-        (7, false) => inputs.pad_leaf.clone(),
-        _ => panic!("unexpected non-AIR child at compress (level={level}, pos={pos})"),
-    }
+/// Trace twin of `oracle::resolve_child_digest`'s raw-leaf branch. Only the
+/// eight level-one compression nodes consume external leaves; every higher
+/// child is the digest of a preceding spine slot.
+fn resolve_raw_leaf(inputs: &SpineInputsTrace, level: u8, pos: u8, is_left: bool) -> [LinExpr; 2] {
+    assert_eq!(level, 1, "raw child outside level-1 compress");
+    let leaf = 2 * pos as usize + usize::from(!is_left);
+    inputs
+        .leaves
+        .get(leaf)
+        .unwrap_or_else(|| panic!("raw leaf out of range at compress (pos={pos})"))
+        .clone()
 }
 
 /// Trace twin of the tx-body component discharge.
@@ -336,7 +277,7 @@ pub fn discharge_tx_body_trace(
 // Full slot assembly: killshot on a fresh channel plus discharge.
 // ---------------------------------------------------------------------------
 
-/// Tx8x2 carrier [K]+[D] slot. Returns input and tx-body-hash
+/// Final Tx8x2 [K]+[D] slot. Returns input and tx-body-hash
 /// wires (shared with any other slot that consumes the same hashes — e.g.
 /// the tx-root Merkle leaves and the receipt bindings).
 pub fn build_tx_body_slot(
@@ -378,12 +319,9 @@ mod tests {
 
     fn tx_body_inputs(seed: u128) -> SpineInputs {
         SpineInputs {
-            epoch_anchor: [Block128::from(seed + 11), Block128::from(seed + 22)],
-            fee_leaf: [Block128::from(seed + 33), Block128::from(seed + 44)],
-            input_leaves: [[Block128::from(seed + 1); 4]; 4],
-            output_leaves: [[Block128::from(seed + 2); 4]; 8],
-            is_coinbase_leaf: [Block128::from(seed + 55), Block128::from(seed + 66)],
-            pad_leaf: [Block128::from(0u128), Block128::from(0u128)],
+            leaves: std::array::from_fn(|leaf| {
+                std::array::from_fn(|lane| Block128::from(seed + 1 + (2 * leaf + lane) as u128))
+            }),
         }
     }
 
@@ -414,6 +352,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn final_topology_is_31_contiguous_slots_per_transaction() {
+        let circuit = SpineCircuit::build();
+        assert_eq!(N_SPINE_SLOTS, 31);
+        assert_eq!(circuit.slots.len(), N_SPINE_SLOTS);
+        assert_eq!(circuit.wrap_id(), 30);
+        assert!(matches!(
+            circuit.slots[0].role,
+            InstanceRole::CompressPermA { level: 1, pos: 0 }
+        ));
+        assert!(matches!(
+            circuit.slots[29].role,
+            InstanceRole::CompressPermB { level: 4, pos: 0 }
+        ));
+        assert!(matches!(circuit.slots[30].role, InstanceRole::WrapPerm));
+
+        let fixture = tx_body_fixture(2);
+        assert_eq!(fixture.proof.live_slots, 2 * N_SPINE_SLOTS);
+        assert_eq!(fixture.proof.live_slots, 62);
+
+        let hashes = vec![
+            [LinExpr::zero(), LinExpr::zero()],
+            [LinExpr::zero(), LinExpr::zero()],
+        ];
+        let num_vars = num_vars_for(2 * N_SPINE_SLOTS);
+        let claims = tx_hash_pin_claims_trace(&hashes, N_SPINE_SLOTS, num_vars);
+        assert_eq!(
+            claims[2].terms[0].index,
+            spine_point_index(num_vars, 61, N_ROUNDS, 0),
+            "the second wrap must be slot 61, with no per-tx padding gap"
+        );
+    }
+
     fn native_accepts(f: &TxBodyFixture) -> bool {
         let circuit = SpineCircuit::build();
         let mut ch = Poseidon2bChannel::new();
@@ -433,10 +404,13 @@ mod tests {
     }
 
     fn trace_accepts(f: &TxBodyFixture) -> bool {
-        let mut b = FieldR1csBuilder::new();
-        let _ = build_tx_body_slot(&mut b, &f.proof, &f.inputs, &f.hashes);
-        let (r1cs, z) = b.build();
-        r1cs.satisfies(&z)
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut b = FieldR1csBuilder::new();
+            let _ = build_tx_body_slot(&mut b, &f.proof, &f.inputs, &f.hashes);
+            let (r1cs, z) = b.build();
+            r1cs.satisfies(&z)
+        }))
+        .unwrap_or(false)
     }
 
     /// Fixed-matrix class gate: same tx count, different tx content must
@@ -533,7 +507,7 @@ mod tests {
         }
     }
 
-    /// Replay-completeness auto-mutator (Tx8x2 carrier @1 tx).
+    /// Replay-completeness auto-mutator (final Tx8x2 tree @1 tx).
     /// 0 surviving mutants.
     #[test]
     fn tx_body_proof_mutator_kills_all() {
@@ -579,20 +553,18 @@ mod tests {
     #[test]
     fn tx_body_statement_mutator_kills_all() {
         let f = tx_body_fixture(1);
-        // 2+2+16+32+2+2 = 56 input lanes + 2 hash lanes.
+        const STATEMENT_LANES: usize = TX_BODY_RAW_LEAVES * 2;
+        // 16 raw leaves × 2 lanes + 2 hash lanes.
         let mutate = |target: usize| -> TxBodyFixture {
             let mut inputs = f.inputs.clone();
             let mut hashes = f.hashes.clone();
             let i0 = &mut inputs[0];
-            match target {
-                0 | 1 => i0.epoch_anchor[target] += Block128::ONE,
-                2 | 3 => i0.fee_leaf[target - 2] += Block128::ONE,
-                4..=19 => i0.input_leaves[(target - 4) / 4][(target - 4) % 4] += Block128::ONE,
-                20..=51 => i0.output_leaves[(target - 20) / 4][(target - 20) % 4] += Block128::ONE,
-                52 | 53 => i0.is_coinbase_leaf[target - 52] += Block128::ONE,
-                54 | 55 => i0.pad_leaf[target - 54] += Block128::ONE,
-                56 | 57 => hashes[0][target - 56] += Block128::ONE,
-                _ => unreachable!(),
+            if target < STATEMENT_LANES {
+                i0.leaves[target / 2][target % 2] += Block128::ONE;
+            } else if target < STATEMENT_LANES + 2 {
+                hashes[0][target - STATEMENT_LANES] += Block128::ONE;
+            } else {
+                unreachable!();
             }
             TxBodyFixture {
                 proof: f.proof.clone(),
@@ -601,7 +573,7 @@ mod tests {
             }
         };
         let mut survivors = Vec::new();
-        for target in 0..58 {
+        for target in 0..STATEMENT_LANES + 2 {
             let bad = mutate(target);
             assert!(
                 !native_accepts(&bad),
@@ -615,6 +587,19 @@ mod tests {
             survivors.is_empty(),
             "surviving tx-body spine statement mutants: {survivors:?}"
         );
+    }
+
+    #[test]
+    fn raw_leaf_recombination_is_rejected() {
+        let f = tx_body_fixture(1);
+        let mut bad = TxBodyFixture {
+            proof: f.proof.clone(),
+            inputs: f.inputs.clone(),
+            hashes: f.hashes.clone(),
+        };
+        bad.inputs[0].leaves.swap(0, TX_BODY_RAW_LEAVES - 1);
+        assert!(!native_accepts(&bad));
+        assert!(!trace_accepts(&bad));
     }
 
     /// Cross-test "trace ⇔ native" on randomized honest/mutated cases.

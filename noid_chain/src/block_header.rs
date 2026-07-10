@@ -158,14 +158,14 @@ mod tests {
     }
 
     #[test]
-    fn domain_disjoint_from_txbody() {
-        use noid_poseidon2b::native::domain::{capacity_iv, TAG_TXBODY};
+    fn domain_disjoint_from_tx8x2() {
+        use noid_poseidon2b::native::domain::{capacity_iv, TAG_TX8X2};
 
         let h = header_fixture();
         let block_digest = hash_block_header(&h);
 
         // Build the same absorb schedule under a different IV.
-        let mut s = Poseidon2bSponge::with_iv(capacity_iv(TAG_TXBODY));
+        let mut s = Poseidon2bSponge::with_iv(capacity_iv(TAG_TX8X2));
         absorb_digest(&mut s, &h.prev_block_hash);
         absorb_digest(&mut s, &h.state_root);
         absorb_digest(&mut s, &h.tx_root);
@@ -177,8 +177,8 @@ mod tests {
         s.absorb(Block128::from(h.log_slots as u128));
         s.absorb(Block128::from(h.active_slot_count as u128));
         s.absorb(Block128::from(h.alloc_counter as u128));
-        let txbody_flavor = s.finalize();
+        let tx8x2_flavor = s.finalize();
 
-        assert_ne!(block_digest, txbody_flavor);
+        assert_ne!(block_digest, tx8x2_flavor);
     }
 }

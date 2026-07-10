@@ -6,7 +6,7 @@
 //! Unified Kill-Shot sumcheck — main half.
 //!
 //! Discharges the full Spine algebraic surface (C1 + β·C1' + γ·C2)
-//! in a single degree-9 sumcheck of length `N_SPINE_UNIFIED_VARS = 15`.
+//! in a single degree-9 sumcheck of length `N_SPINE_UNIFIED_VARS = 14`.
 //!
 //! Variant I (immutable tables + later shift gadget): the change of
 //! variable `y = inc_round(x)` is realised by materialising one
@@ -16,7 +16,7 @@
 //! sumcheck in this codebase.
 //!
 //! After the 15 main rounds, the prover holds 12 witness-derived
-//! claims at the final point `r' ∈ F^15`:
+//! claims at the final point `r' ∈ F^14`:
 //!
 //! * `s_in_dec(r')`, `s_out_dec(r')`, `state_dec(r')`,
 //! * `state(r')` — direct opening of the un-permuted state column,
@@ -30,7 +30,7 @@
 //!
 //! The verifier recomputes the four public schedules `U`, `σ_dec`,
 //! `RC_dec`, `M_lane_dec[j]`, and `σ_lane_dec[j]` natively at `r'`
-//! using `evaluate_slice` — `O(2^15)` per evaluation (precomputed
+//! using `evaluate_slice` — `O(2^14)` per evaluation (precomputed
 //! tables, no FFT). With six public inner products this is ~200K
 //! Block128 muls total in the verifier per spine.
 
@@ -56,7 +56,7 @@ use crate::spine_shift::{
     spine_sigma_dec_table_flat,
 };
 
-// Bit layout: `elem:2 | round:7 | slot:6` (low → high). Slices over
+// Bit layout: `elem:2 | round:7 | slot:5` (low → high). Slices over
 // `r_prime[bit_idx]` follow the same convention as `evaluate_slice`.
 const ELEM_LO: usize = 0;
 const ELEM_HI: usize = ELEM_LO + N_SPINE_ELEM_VARS;
@@ -953,7 +953,7 @@ fn compute_round_polynomial_flat(
 // passed through.
 //
 // The gadget is a single batched product-sumcheck of degree 2 over
-// `N_SPINE_UNIFIED_VARS = 15` rounds. Eleven witness claims share the
+// `N_SPINE_UNIFIED_VARS = 14` rounds. Eleven witness claims share the
 // shape `Σ_x w_k(r', x) · T_k(x) = c_k` with public weights `w_k`:
 //
 //   k=0: T = s_in,         w(x) = eq(r', inc(x))                          (s_in_dec)
@@ -976,7 +976,7 @@ fn compute_round_polynomial_flat(
 //   C = δ⁰·c_s_in_dec + δ¹·c_s_out_dec + δ²·c_state_dec
 //     + Σ_{j} δ^{3+j}·c_s_out_lane[j] + Σ_{j} δ^{7+j}·c_state_lane[j].
 //
-// After 15 rounds the verifier learns one final point `r'' ∈ F^15`
+// After 14 rounds the verifier learns one final point `r'' ∈ F^14`
 // and three claimed evaluations `s_in(r'')`, `s_out(r'')`,
 // `state(r'')`. It checks the final-round-poly value matches
 //   W_sin(r'')·v_sin + W_sout(r'')·v_sout + W_state(r'')·v_state
@@ -1157,7 +1157,7 @@ struct WeightsAtPoint {
 }
 
 /// Build the per-cell combined weight tables for the shift gadget.
-/// Returns three length-`2^15` tables aligned with the natural
+/// Returns three length-`2^14` tables aligned with the natural
 /// low-bit-first cell index.
 fn build_combined_weights(r_prime: &[Block128], delta: Block128) -> CombinedWeights {
     let r_slot = &r_prime[SLOT_LO..SLOT_HI];

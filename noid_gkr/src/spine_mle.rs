@@ -3,14 +3,14 @@
 
 #![allow(clippy::needless_range_loop, clippy::doc_overindented_list_items)]
 
-//! Unified 15-variable MLE layout for the Spine Kill-Shot.
+//! Unified 14-variable MLE layout for the Spine Kill-Shot.
 //!
 //! Architecture
 //! ------------
 //!
-//! The kill-shot prover represents the full 59-permutation spine as
-//! four side-by-side 15-variable MLEs on a single hypercube of
-//! `2^15 = 32 768` cells:
+//! The kill-shot prover represents the full 31-permutation spine as
+//! four side-by-side 14-variable MLEs on a single hypercube of
+//! `2^14 = 16 384` cells:
 //!
 //! | MLE       | Meaning per cell `(slot, round, elem)`                       |
 //! |-----------|---------------------------------------------------------------|
@@ -19,7 +19,7 @@
 //! | `sigma`   | 1 if the S-box is active on this cell, else 0                 |
 //! | `state`   | Round-entry state = `state[round][elem]` from the witness     |
 //!
-//! Bit layout (15 bits, low → high): `elem:2 | round:7 | slot:6`.
+//! Bit layout (14 bits, low → high): `elem:2 | round:7 | slot:5`.
 //! `(slot, round, elem)` lives at index
 //! `(slot << (N_SPINE_ROUND_VARS + N_SPINE_ELEM_VARS))
 //!  | (round << N_SPINE_ELEM_VARS)
@@ -34,7 +34,7 @@
 //!     rounds 67..127 are zero-padded.
 //!   - `s_in` / `s_out` exist for `round ∈ 0..N_ROUNDS`; row `N_ROUNDS`
 //!     and rounds 67..127 are zero by convention.
-//!   - Slots `N_SPINE_SLOTS..64` are zero-padded.
+//!   - Slot 31 is zero-padded.
 //!
 //! Identities discharged by the unified Kill-Shot sumcheck (degree 9
 //! after the change of variable `y = inc_round(x)`):
@@ -69,30 +69,30 @@ use noid_core::{Block128, TowerField};
 use noid_poseidon2b::native::permutation::{F_ROUNDS, N_ROUNDS, P_ROUNDS, STATE_SIZE};
 
 use crate::layers::{evaluate_permutation, PermLayerWitness, RoundKind};
+pub use crate::tx_body_layout::N_SPINE_SLOTS;
+use crate::tx_body_layout::N_SPINE_SLOTS_PADDED;
 
-/// Number of slots in the tx-body spine. Mirrors
-/// `spine_sumcheck::N_SPINE_SLOTS`; both constants must stay in sync.
-pub const N_SPINE_SLOTS: usize = 59;
-
-/// `log2(64) = 6` slot variables.
-pub const N_SPINE_SLOT_VARS: usize = 6;
+/// `log2(32) = 5` slot variables.
+pub const N_SPINE_SLOT_VARS: usize = N_SPINE_SLOTS_PADDED.trailing_zeros() as usize;
 /// `log2(128) = 7` round variables (covers `N_ROUNDS = 66` with padding).
 pub const N_SPINE_ROUND_VARS: usize = 7;
 /// `log2(4) = 2` element-within-state variables.
 pub const N_SPINE_ELEM_VARS: usize = 2;
 /// Total variable count of the unified MLE.
 pub const N_SPINE_UNIFIED_VARS: usize = N_SPINE_SLOT_VARS + N_SPINE_ROUND_VARS + N_SPINE_ELEM_VARS;
-/// `2^15 = 32 768` cells.
+/// `2^14 = 16 384` cells.
 pub const N_SPINE_UNIFIED_CELLS: usize = 1 << N_SPINE_UNIFIED_VARS;
 
 /// Padding helpers — compile-time assertions on topology.
 const _: () = assert!(N_ROUNDS == 66);
 const _: () = assert!(STATE_SIZE == 4);
+const _: () = assert!(N_SPINE_SLOT_VARS == 5);
+const _: () = assert!(N_SPINE_UNIFIED_VARS == 14);
 const _: () = assert!(N_SPINE_SLOTS <= (1 << N_SPINE_SLOT_VARS));
 const _: () = assert!(N_ROUNDS <= (1 << N_SPINE_ROUND_VARS));
 const _: () = assert!(STATE_SIZE <= (1 << N_SPINE_ELEM_VARS));
 
-/// The four columns of the unified MLE. Each is a length-`2^15`
+/// The four columns of the unified MLE. Each is a length-`2^14`
 /// vector of `Block128`. The verifier opens all of them at points
 /// derived from the unified sumcheck's final challenge.
 #[derive(Debug, Clone)]
@@ -286,14 +286,14 @@ mod tests {
 
     #[test]
     fn topology_constants_consistent() {
-        assert_eq!(N_SPINE_UNIFIED_VARS, 15);
-        assert_eq!(N_SPINE_UNIFIED_CELLS, 32_768);
+        assert_eq!(N_SPINE_UNIFIED_VARS, 14);
+        assert_eq!(N_SPINE_UNIFIED_CELLS, 16_384);
     }
 
     #[test]
     fn index_round_trip() {
         // Each (slot, round, elem) must produce a unique index inside
-        // the 15-bit space, and we should be able to decode it back.
+        // the 14-bit space, and we should be able to decode it back.
         for slot in 0..N_SPINE_SLOTS {
             for round in 0..N_ROUNDS {
                 for elem in 0..STATE_SIZE {
@@ -378,7 +378,7 @@ mod tests {
             .map(|i| random_state(i as u128 + 1))
             .collect();
         let (mle, _) = build_unified_mle(&state_ins);
-        // Slots 59..63 must be fully zero.
+        // Slot 31 must be fully zero.
         for slot in N_SPINE_SLOTS..(1 << N_SPINE_SLOT_VARS) {
             for round in 0..(1 << N_SPINE_ROUND_VARS) {
                 for elem in 0..(1 << N_SPINE_ELEM_VARS) {

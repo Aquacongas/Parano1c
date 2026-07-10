@@ -9,6 +9,7 @@ use noid_gkr::{
     discharge_block_spine_reductions_native, owner_auth_gkr_channel, prove_block_spine_killshot,
     prove_owner_auth_killshot, reconstruct_slot_states, verify_block_spine_killshot,
     verify_owner_auth_killshot, BlockSpineMle, OwnerAuthCircuit, SpineCircuit,
+    N_SPINE_SLOTS, N_SPINE_SLOTS_PADDED, N_SPINE_SLOT_VARS,
 };
 use noid_poseidon2b::channel::Poseidon2bChannel;
 use noid_poseidon2b::primitives::TxBodyHash;
@@ -97,6 +98,10 @@ fn bench_body_spine(n: usize) {
 
 fn main() {
     let _ = noid_ivc_prover::init_perf_thread_pool();
+    assert_eq!(SpineCircuit::build().slots.len(), 31);
+    assert_eq!(N_SPINE_SLOTS, 31);
+    assert_eq!(N_SPINE_SLOTS_PADDED, 32);
+    assert_eq!(N_SPINE_SLOT_VARS, 5);
     println!("PARANOID current component bench — Tx8x2 only");
     println!("Single current transaction axis; no pre-cutover golden.\n");
     bench_owner_auth();

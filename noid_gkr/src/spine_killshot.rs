@@ -15,7 +15,7 @@
 //!     s_out           s_out(r'')                      ← `s_out_at_r2`
 //! ```
 //!
-//! Each column is a 15-variable MLE over the unified hypercube (same
+//! Each column is a 14-variable MLE over the unified hypercube (same
 //! bit layout as the boundary MLE for the `state` column, so
 //! the state commitment uses the same coordinate order). The three columns
 //! share the same hypercube topology.
@@ -287,12 +287,12 @@ mod tests {
 
     fn fixture_inputs() -> SpineInputs {
         SpineInputs {
-            epoch_anchor: [Block128::from(11u128), Block128::from(22u128)],
-            fee_leaf: [Block128::from(33u128), Block128::from(44u128)],
-            input_leaves: [[Block128::from(1u128); 4]; 4],
-            output_leaves: [[Block128::from(2u128); 4]; 8],
-            is_coinbase_leaf: [Block128::from(55u128), Block128::from(66u128)],
-            pad_leaf: [Block128::from(0u128), Block128::from(0u128)],
+            leaves: std::array::from_fn(|leaf| {
+                [
+                    Block128::from((2 * leaf + 1) as u128),
+                    Block128::from((2 * leaf + 2) as u128),
+                ]
+            }),
         }
     }
 
