@@ -298,6 +298,7 @@ mod tests {
         let inputs = vec![TxInput {
             slot_index: 17,
             value: 100,
+            creation_id: 0,
             owner: derive_address(&secret),
             spend_secret: SpendSecret(secret.0),
             valid: true,
@@ -325,6 +326,7 @@ mod tests {
             TxInput {
                 slot_index: 17,
                 value: 60,
+                creation_id: 0,
                 owner: derive_address(&secret),
                 spend_secret: SpendSecret(secret.0),
                 valid: true,
@@ -332,6 +334,7 @@ mod tests {
             TxInput {
                 slot_index: 18,
                 value: 40,
+                creation_id: 0,
                 owner: derive_address(&secret),
                 spend_secret: SpendSecret(secret.0),
                 valid: true,

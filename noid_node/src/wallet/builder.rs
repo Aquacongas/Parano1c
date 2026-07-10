@@ -12,7 +12,6 @@
 use noid_poseidon2b::primitives::{Address, SpendSecret};
 use noid_tx::{
     body_hash::hash_tx_body_for_shape,
-    claims::compute_claims_commitment,
     intent::TxIntent,
     types::{TxBody, TxInput, TxOutput, TxShape},
 };
@@ -351,8 +350,8 @@ pub fn extract_pull_data(
 /// 4. `tx_body_hash = hash_tx_body_for_shape(shape, epoch_anchor, fee, inputs, outputs, false)`.
 /// 5. `prove_tx(&body, spend_secrets)` → `WalletAuthorizationBundle`
 ///    (secrets are consumed and zeroized inside).
-/// 6. `claims_commitment = compute_claims_commitment(inputs, outputs)`.
-/// 7. Assemble and wire-encode the [`TxIntent`].
+/// 6. Assemble and wire-encode the [`TxIntent`]; validators derive claims from
+///    the hash-bound body.
 ///
 /// # Returns
 ///
@@ -401,6 +400,7 @@ pub fn build_and_prove_tx(
         .map(|(utxo, secret)| TxInput {
             slot_index: utxo.slot_index,
             value: utxo.value,
+            creation_id: utxo.creation_id,
             owner: utxo.address,
             // Copy secret bytes into the input witness slot.
             // The original in data.spend_secrets is still live for prove_tx.
@@ -448,16 +448,12 @@ pub fn build_and_prove_tx(
         .map_err(|e| BuildError::ProveFailed(e.to_string()))?;
 
     // -----------------------------------------------------------------------
-    // Steps 8–9: Claims commitment, claimed slots, assemble TxIntent.
+    // Assemble the minimal TxIntent. A second claims/slot copy would be
+    // redundant and malleable; validators derive it from `body`.
     // -----------------------------------------------------------------------
-    let claims_commitment = compute_claims_commitment(&body.inputs, &body.outputs);
-    let claimed_slots = TxIntent::claimed_slots_from_body(&body);
-
     let intent = TxIntent {
         tx_body: body,
         tx_body_hash,
-        claims_commitment,
-        claimed_slots,
         authorization_bytes,
     };
 
@@ -479,6 +475,7 @@ mod tests {
                 WalletUtxo {
                     slot_index: i,
                     value,
+                    creation_id: u64::from(i) + 1,
                     // One owner per tx: the fixture's UTXOs all live on the
                     // ACTIVE (index-0) address.
                     address: wallet.address_at(0),
@@ -548,6 +545,15 @@ mod tests {
         let intent = TxIntent::from_bytes(&intent_bytes).expect("decode intent");
         assert_eq!(intent.tx_body.shape, TxShape::Sweep25x2);
         assert_eq!(intent.tx_body.inputs.iter().filter(|i| i.valid).count(), 5);
+        let mut creation_ids: Vec<u64> = intent
+            .tx_body
+            .inputs
+            .iter()
+            .filter(|input| input.valid)
+            .map(|input| input.creation_id)
+            .collect();
+        creation_ids.sort_unstable();
+        assert_eq!(creation_ids, vec![1, 2, 3, 4, 5]);
         assert_eq!(intent.tx_body_hash.0, tx_hash);
 
         let bundle = noid_gkr::WalletAuthorizationBundle::from_bytes(&intent.authorization_bytes)

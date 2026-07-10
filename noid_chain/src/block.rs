@@ -283,7 +283,6 @@ pub fn apply_state_delta(
     block: &Block,
 ) -> Result<StateTransition, BlockApplyError> {
     use crate::fri_state::SlotValue;
-    use noid_core::Block128;
 
     // Sanity-guard: must be called after BlockProof verification.
     // tx_root is still checked natively (cheap, doesn't require state reads).
@@ -312,18 +311,29 @@ pub fn apply_state_delta(
             // The exact state certificate established that this slot matched the claim.
             // Just zero it out; no read needed.
             deltas.push((inp.slot_index, SlotValue::EMPTY));
-            snap.active_slot_count = snap.active_slot_count.saturating_sub(1);
+            snap.active_slot_count = snap
+                .active_slot_count
+                .checked_sub(1)
+                .ok_or(BlockApplyError::Tx(
+                    crate::state::ApplyError::ActiveSlotCountUnderflow,
+                ))?;
         }
         for out in tx.body.outputs.iter().filter(|o| o.valid) {
             // The exact state certificate established that this output slot was empty.
-            let sv = SlotValue {
-                value: Block128::from(out.value as u128),
-                owner_hi: out.owner.as_fields()[0],
-                owner_lo: out.owner.as_fields()[1],
-            };
+            let creation_id = snap.alloc_counter.checked_add(1).ok_or(
+                BlockApplyError::Tx(crate::state::ApplyError::AllocCounterOverflow),
+            )?;
+            let active_slot_count = snap.active_slot_count.checked_add(1).ok_or(
+                BlockApplyError::Tx(crate::state::ApplyError::ActiveSlotCountOverflow),
+            )?;
+            let sv = SlotValue::with_owner_fields(
+                out.value,
+                creation_id,
+                out.owner.as_fields(),
+            );
             deltas.push((out.slot_index, sv));
-            snap.active_slot_count = snap.active_slot_count.saturating_add(1);
-            snap.alloc_counter = snap.alloc_counter.wrapping_add(1);
+            snap.active_slot_count = active_slot_count;
+            snap.alloc_counter = creation_id;
         }
     }
     snap.state
@@ -468,6 +478,20 @@ pub fn compute_tx_root(txs: &[Transaction]) -> Digest {
 // container; BlockHeader's encoding lives in `wire.rs`).
 // ---------------------------------------------------------------------------
 
+/// Incompatible block-wire epoch for packed input incarnations and the
+/// secret-free public transaction representation. Retained pre-epoch block
+/// bytes must be reset/migrated at the publication refreeze.
+pub const BLOCK_WIRE_VERSION: u8 = 0xB2;
+
+/// Byte offset of the semantic [`BlockHeader`] inside serialized [`Block`]
+/// bytes. The leading byte is the block-wire version marker.
+pub const BLOCK_WIRE_HEADER_OFFSET: usize = 1;
+
+/// Byte offset of `BlockHeader::nonce` inside serialized [`Block`] bytes.
+/// External miners must patch this offset, not the header-relative offset.
+pub const BLOCK_WIRE_NONCE_OFFSET: usize =
+    BLOCK_WIRE_HEADER_OFFSET + crate::wire::BLOCK_HEADER_NONCE_OFFSET;
+
 #[inline]
 fn put_u32(buf: &mut Vec<u8>, v: u32) {
     buf.extend_from_slice(&v.to_le_bytes());
@@ -496,10 +520,11 @@ impl Block {
             "transactions exceed BLOCK_MAX_TXS"
         );
 
+        buf.push(BLOCK_WIRE_VERSION);
         self.header.encode(buf);
         put_u32(buf, self.transactions.len() as u32);
         for tx in &self.transactions {
-            tx.encode(buf);
+            tx.encode_public(buf);
         }
     }
 
@@ -510,6 +535,10 @@ impl Block {
     }
 
     pub fn decode(src: &mut &[u8]) -> Result<Self, WireError> {
+        let version = *take(src, 1)?.first().expect("one byte requested");
+        if version != BLOCK_WIRE_VERSION {
+            return Err(WireError::UnsupportedVersion);
+        }
         let header = BlockHeader::decode(src)?;
         let n = take_u32(src)? as usize;
         if n > BLOCK_MAX_TXS {
@@ -517,7 +546,7 @@ impl Block {
         }
         let mut transactions = Vec::with_capacity(n);
         for _ in 0..n {
-            transactions.push(Transaction::decode(src)?);
+            transactions.push(Transaction::decode_public(src)?);
         }
         Ok(Self {
             header,
@@ -588,6 +617,7 @@ mod tests {
         TxInput {
             slot_index,
             value: out.value,
+            creation_id: 1,
             owner: out.owner,
             spend_secret: SpendSecret([0u8; 32]),
             valid: true,
@@ -685,6 +715,56 @@ mod tests {
     }
 
     #[test]
+    fn apply_state_delta_rejects_alloc_counter_overflow_without_writes() {
+        let mut state = fresh_state();
+        state.alloc_counter = u64::MAX;
+        let before_root = state.state_root();
+        let body = TxBody {
+            shape: noid_tx::TxShape::Standard4x8,
+            epoch_anchor: [0u8; 32],
+            fee: 0,
+            inputs: vec![],
+            outputs: vec![mk_output(1)],
+            is_coinbase: true,
+        };
+        let tx = Transaction {
+            tx_body_hash: hash_tx_body(
+                &body.epoch_anchor,
+                body.fee,
+                &body.inputs,
+                &body.outputs,
+                body.is_coinbase,
+            ),
+            body,
+        };
+        let transactions = vec![tx];
+        let block = Block {
+            header: BlockHeader {
+                prev_block_hash: [0u8; 32],
+                state_root: before_root,
+                tx_root: compute_tx_root(&transactions),
+                timestamp: 1,
+                height: 1,
+                miner_address: Address([9u8; 32]),
+                nonce: 0,
+                difficulty_target: [0xFFu8; 32],
+                log_slots: TEST_LOG_SLOTS as u32,
+                active_slot_count: 0,
+                alloc_counter: u64::MAX,
+            },
+            transactions,
+        };
+
+        assert_eq!(
+            apply_state_delta(&mut state, &block),
+            Err(BlockApplyError::Tx(ApplyError::AllocCounterOverflow))
+        );
+        assert_eq!(state.state_root(), before_root);
+        assert_eq!(state.active_slot_count, 0);
+        assert_eq!(state.alloc_counter, u64::MAX);
+    }
+
+    #[test]
     fn apply_state_delta_matches_native_apply_block_on_small_block() {
         let mut native_state = fresh_state();
         let mut delta_state = native_state.clone();
@@ -747,11 +827,11 @@ mod tests {
             .state
             .set_slot(
                 live.slot_index,
-                crate::fri_state::SlotValue {
-                    value: noid_core::Block128::from(live.value as u128),
-                    owner_hi: live.owner.as_fields()[0],
-                    owner_lo: live.owner.as_fields()[1],
-                },
+                crate::fri_state::SlotValue::with_owner_fields(
+                    live.value,
+                    1,
+                    live.owner.as_fields(),
+                ),
             )
             .unwrap();
         state.active_slot_count = 1;
@@ -881,6 +961,108 @@ mod tests {
     }
 
     #[test]
+    fn block_wire_omits_spend_secrets_and_is_secret_invariant() {
+        let input = TxInput {
+            slot_index: 7,
+            value: 1_000,
+            creation_id: 41,
+            owner: Address([0x51; 32]),
+            spend_secret: SpendSecret([0xA6; 32]),
+            valid: true,
+        };
+        let body = TxBody {
+            shape: noid_tx::TxShape::Standard4x8,
+            epoch_anchor: [0x31; 32],
+            fee: 0,
+            inputs: vec![input],
+            outputs: vec![TxOutput {
+                slot_index: 8,
+                value: 1_000,
+                owner: Address([0x52; 32]),
+                valid: true,
+            }],
+            is_coinbase: false,
+        };
+        let tx = Transaction {
+            tx_body_hash: hash_tx_body(
+                &body.epoch_anchor,
+                body.fee,
+                &body.inputs,
+                &body.outputs,
+                body.is_coinbase,
+            ),
+            body,
+        };
+        let header = BlockHeader {
+            prev_block_hash: [0x11; 32],
+            state_root: [0x12; 32],
+            tx_root: compute_tx_root(std::slice::from_ref(&tx)),
+            timestamp: 1,
+            height: 1,
+            miner_address: Address([0x13; 32]),
+            nonce: 0,
+            difficulty_target: [0xFF; 32],
+            log_slots: 24,
+            active_slot_count: 1,
+            alloc_counter: 42,
+        };
+        let block = Block {
+            header,
+            transactions: vec![tx],
+        };
+
+        let bytes = block.to_bytes();
+        let mut different_secret = block.clone();
+        different_secret.transactions[0].body.inputs[0].spend_secret = SpendSecret([0xD7; 32]);
+        assert_eq!(
+            different_secret.to_bytes(),
+            bytes,
+            "consensus block bytes must not carry witness secrets"
+        );
+
+        let decoded = Block::from_bytes(&bytes).expect("public block decode");
+        assert_eq!(
+            decoded.transactions[0].body.inputs[0].spend_secret,
+            SpendSecret([0u8; 32])
+        );
+        assert_eq!(
+            decoded.transactions[0].body.inputs[0].creation_id,
+            block.transactions[0].body.inputs[0].creation_id,
+            "the public input incarnation remains on wire"
+        );
+        assert_eq!(
+            decoded.transactions[0].tx_body_hash,
+            block.transactions[0].tx_body_hash
+        );
+    }
+
+    #[test]
+    fn serialized_nonce_offset_preserves_version_and_roundtrips() {
+        let mut state = fresh_state();
+        let tx = build_tx(&mut state, vec![], vec![mk_output(1)]);
+        let txs = vec![tx];
+        let mut expected = Block {
+            header: mk_header(&state, &txs),
+            transactions: txs,
+        };
+        let mut bytes = expected.to_bytes();
+        let version_prefix = bytes[..BLOCK_WIRE_HEADER_OFFSET].to_vec();
+        let nonce = 0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210u128;
+
+        bytes[BLOCK_WIRE_NONCE_OFFSET..BLOCK_WIRE_NONCE_OFFSET + 16]
+            .copy_from_slice(&nonce.to_le_bytes());
+        expected.header.nonce = nonce;
+
+        assert_eq!(version_prefix, [BLOCK_WIRE_VERSION]);
+        assert_eq!(
+            &bytes[..BLOCK_WIRE_HEADER_OFFSET],
+            version_prefix.as_slice(),
+            "patching the serialized nonce must not overwrite the wire epoch"
+        );
+        assert_eq!(Block::from_bytes(&bytes), Ok(expected));
+    }
+
+    #[test]
     fn block_rejects_trailing_bytes() {
         let block = Block {
             header: BlockHeader {
@@ -901,6 +1083,29 @@ mod tests {
         let mut bytes = block.to_bytes();
         bytes.push(0);
         assert_eq!(Block::from_bytes(&bytes), Err(WireError::TrailingBytes));
+    }
+
+    #[test]
+    fn block_rejects_previous_unversioned_wire_epoch() {
+        let block = Block {
+            header: BlockHeader {
+                prev_block_hash: [0u8; 32],
+                state_root: [0u8; 32],
+                tx_root: [0u8; 32],
+                timestamp: 0,
+                height: 0,
+                miner_address: Address([0u8; 32]),
+                nonce: 0,
+                difficulty_target: [0xFFu8; 32],
+                log_slots: 24,
+                active_slot_count: 0,
+                alloc_counter: 0,
+            },
+            transactions: vec![],
+        };
+        let mut bytes = block.to_bytes();
+        bytes.remove(0);
+        assert_eq!(Block::from_bytes(&bytes), Err(WireError::UnsupportedVersion));
     }
 
     #[test]

@@ -473,6 +473,7 @@ mod tests {
             .map(|i| TxInput {
                 slot_index: slot_base + i as u32,
                 value: 100,
+                creation_id: 0,
                 owner: Address([1u8; 32]),
                 spend_secret: SpendSecret([2u8; 32]),
                 valid: true,
@@ -530,6 +531,7 @@ mod tests {
             inputs: vec![TxInput {
                 slot_index: 1,
                 value: 10_000,
+                creation_id: 0,
                 owner: Address([1u8; 32]),
                 spend_secret: SpendSecret([2u8; 32]),
                 valid: true,

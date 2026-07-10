@@ -4009,8 +4009,7 @@ async fn rescan_wallet_from_chain(
     chain: &Arc<RwLock<MdbxChainContext>>,
     reason: &'static str,
 ) {
-    let ctx = chain.read().await;
-    let height = ctx.tip_height();
+    // Avoid hydrating the entire durable state when no wallet is loaded.
     let (master, hint_next_index) = {
         let guard = wallet.lock().unwrap();
         match guard.as_ref() {
@@ -4018,8 +4017,21 @@ async fn rescan_wallet_from_chain(
             Some(w) => (w.secret_clone(), w.next_index),
         }
     };
+    // A live state may have clean-but-live segments evicted from RAM. Hydrate
+    // them for the full scan; otherwise `slot()` deliberately presents them as
+    // virtual zero and the wallet would lose confirmed UTXOs after a rescan.
+    let mut ctx = chain.write().await;
+    if let Err(error) = ctx.preload_all_evicted_segments() {
+        tracing::error!(%error, reason, "wallet: cannot hydrate state for rescan");
+        return;
+    }
+    let height = ctx.tip_height();
     let (utxos, known_addresses, next_index) =
         wallet::scanner::scan_state_for_utxos(&ctx.state.state, &master, height, hint_next_index);
+    // `restore_evicted_segment` invalidates the internal per-segment FRI cache.
+    // Rebuild it while columns are present. Keep the columns loaded: subsequent
+    // ChainView snapshots must not reinterpret durable live slots as zero.
+    let _ = ctx.state.state.root();
     drop(ctx);
     let found = utxos.len();
     let balance: u64 = utxos.iter().map(|u| u.value).sum();

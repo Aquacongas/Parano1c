@@ -273,8 +273,9 @@ impl TemplateBuilder {
                         );
                         return None;
                     }
-                    let mut bodies: Vec<_> = inner.txs.iter().map(|tx| tx.body.clone()).collect();
-                    bodies.push(inner.coinbase.body.clone());
+                    let bodies: Vec<_> = std::iter::once(inner.coinbase.body.clone())
+                        .chain(inner.txs.iter().map(|tx| tx.body.clone()))
+                        .collect();
                     let commitments: Vec<[u8; 32]> = bodies
                         .iter()
                         .map(|body| noid_tx::compute_claims_commitment(&body.inputs, &body.outputs))
@@ -283,6 +284,7 @@ impl TemplateBuilder {
                         &snapshot.state.state,
                         &bodies,
                         &commitments,
+                        snapshot.state.alloc_counter,
                     ) {
                         Ok(surface) => surface,
                         Err(e) => {

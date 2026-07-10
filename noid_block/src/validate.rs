@@ -508,18 +508,26 @@ fn build_exact_surface_for_block(
         return Err(VerifyBlockError::ShapeMismatch);
     }
 
-    let mut bodies = Vec::with_capacity(block.transactions.len());
-    for tx in block.transactions.iter().filter(|tx| !tx.body.is_coinbase) {
-        bodies.push(tx.body.clone());
-    }
-    if let Some(coinbase) = block.transactions.iter().find(|tx| tx.body.is_coinbase) {
-        bodies.push(coinbase.body.clone());
-    }
+    // Preserve the consensus block order exactly.  In particular the coinbase
+    // is first, so its live outputs consume the first creation IDs.  Reordering
+    // it behind user transactions would reconstruct a different packed state
+    // surface even when every amount/owner/slot matched.
+    let bodies: Vec<_> = block
+        .transactions
+        .iter()
+        .map(|tx| tx.body.clone())
+        .collect();
     let commitments: Vec<[u8; 32]> = bodies
         .iter()
         .map(|body| compute_claims_commitment(&body.inputs, &body.outputs))
         .collect();
-    build_exact_action_surface(&surface_state, &bodies, &commitments).map_err(map_state_delta_error)
+    build_exact_action_surface(
+        &surface_state,
+        &bodies,
+        &commitments,
+        state.alloc_counter,
+    )
+    .map_err(map_state_delta_error)
 }
 
 fn map_state_delta_error(err: StateDeltaError) -> VerifyBlockError {
@@ -552,6 +560,16 @@ fn map_state_delta_error(err: StateDeltaError) -> VerifyBlockError {
         }
         StateDeltaError::SlotOutOfRange { tx_index } => {
             VerifyBlockError::ExactStateSurfaceSlotOutOfRange { tx_index }
+        }
+        StateDeltaError::AllocationCounterOverflow {
+            tx_index,
+            output_index,
+        } => VerifyBlockError::ExactStateSurfaceAllocationCounterOverflow {
+            tx_index,
+            output_index,
+        },
+        StateDeltaError::ActionCountOverflow => {
+            VerifyBlockError::ExactStateSurfaceActionCountOverflow
         }
     }
 }
@@ -1208,6 +1226,7 @@ mod tests {
             inputs: vec![TxInput {
                 slot_index: slot,
                 value: 100,
+                creation_id: 0,
                 owner,
                 spend_secret: secret,
                 valid: true,

@@ -279,6 +279,7 @@ impl MdbxChainContext {
                     &[],
                     None,
                     &meta,
+                    false,
                 )?;
             }
             Ok(ctx)
@@ -311,6 +312,7 @@ impl MdbxChainContext {
             &[],
             None, // no block bytes for genesis
             &meta,
+            false,
         )?;
         Ok(())
     }
@@ -359,6 +361,23 @@ impl MdbxChainContext {
         let mut seg_state = SegmentedFriState::new_empty(log_slots as usize);
         let all_segs = store.all_segments()?;
         for (seg_id, _eff, cols) in all_segs {
+            for ((&value, &owner_hi), &owner_lo) in cols
+                .values
+                .iter()
+                .zip(cols.owners_hi.iter())
+                .zip(cols.owners_lo.iter())
+            {
+                let slot = crate::fri_state::SlotValue {
+                    value,
+                    owner_hi,
+                    owner_lo,
+                };
+                if !slot.is_empty() && slot.creation_id() > alloc_counter {
+                    return Err(MdbxContextError::Corrupt(
+                        "persisted slot creation_id exceeds alloc_counter",
+                    ));
+                }
+            }
             seg_state.set_segment_columns(seg_id, cols);
         }
         // Confirm: after restore, mdbx_dirty must be empty.
@@ -377,6 +396,14 @@ impl MdbxChainContext {
         if block_id(&tip_hdr) != tip_hash {
             return Err(MdbxContextError::Corrupt(
                 "tip hash mismatch with persisted tip header",
+            ));
+        }
+        if log_slots != tip_hdr.log_slots
+            || active_slot_count != tip_hdr.active_slot_count
+            || alloc_counter != tip_hdr.alloc_counter
+        {
+            return Err(MdbxContextError::Corrupt(
+                "state_meta counters mismatch with persisted tip header",
             ));
         }
         let finalized_hdr =
@@ -493,6 +520,7 @@ impl MdbxChainContext {
             &tx_hashes,
             Some(&block.to_bytes()),
             &consensus_meta,
+            false,
         ) {
             revert_block(&mut self.state.state, undo);
             crate::consensus::reorg::revert_reuse_guard(&mut self.state, undo);
@@ -1187,6 +1215,7 @@ impl MdbxChainContext {
                 &[],
                 None, // no block bytes (stored earlier or DA-pruned)
                 &consensus_meta,
+                true,
             )
             .map_err(MdbxContextError::Store)?;
 
@@ -1214,7 +1243,9 @@ impl MdbxChainContext {
                     self.state.state.restore_evicted_segment(seg_id, cols);
                 }
                 Ok(None) => {
-                    tracing::warn!(seg_id, "preload_all_evicted: segment missing from MDBX");
+                    return Err(MdbxContextError::Corrupt(
+                        "evicted live segment is missing from MDBX",
+                    ));
                 }
                 Err(e) => return Err(MdbxContextError::Store(e)),
             }
@@ -1250,12 +1281,9 @@ impl MdbxChainContext {
                         self.state.state.restore_evicted_segment(seg_id, cols);
                     }
                     Ok(None) => {
-                        // Segment was marked evicted but MDBX has no data.
-                        // This shouldn't happen; treat as bug and clear eviction.
-                        tracing::warn!(
-                            seg_id,
-                            "evicted segment not found in MDBX — treating as zero (this is a bug)"
-                        );
+                        return Err(MdbxContextError::Corrupt(
+                            "evicted live segment is missing from MDBX",
+                        ));
                     }
                     Err(e) => return Err(MdbxContextError::Store(e)),
                 }
@@ -1392,14 +1420,29 @@ impl MdbxChainContext {
             if computed_root != *expected_root {
                 return Err(MdbxContextError::Corrupt("snapshot segment root mismatch"));
             }
-            live_count = live_count.saturating_add(
-                cols.values
-                    .iter()
-                    .zip(cols.owners_hi.iter())
-                    .zip(cols.owners_lo.iter())
-                    .filter(|((v, hi), lo)| v.0 != 0 || hi.0 != 0 || lo.0 != 0)
-                    .count() as u64,
-            );
+            for ((&value, &owner_hi), &owner_lo) in cols
+                .values
+                .iter()
+                .zip(cols.owners_hi.iter())
+                .zip(cols.owners_lo.iter())
+            {
+                let slot = crate::fri_state::SlotValue {
+                    value,
+                    owner_hi,
+                    owner_lo,
+                };
+                if slot.is_empty() {
+                    continue;
+                }
+                if slot.creation_id() > alloc_counter {
+                    return Err(MdbxContextError::Corrupt(
+                        "snapshot slot creation_id exceeds alloc_counter",
+                    ));
+                }
+                live_count = live_count.checked_add(1).ok_or(MdbxContextError::Corrupt(
+                    "snapshot active slot count overflow",
+                ))?;
+            }
             seg_state.set_segment_columns(*seg_id, cols.clone());
         }
         if live_count != active_slot_count {
@@ -1713,6 +1756,105 @@ mod tests {
                 Some(expected_anchor)
             );
         }
+    }
+
+    #[test]
+    fn reopen_rejects_state_meta_counter_drift_from_tip_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let tip = {
+            let ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
+            *ctx.tip_header()
+        };
+        {
+            let store = MdbxStore::open(dir.path()).unwrap();
+            store
+                .overwrite_state_meta_for_test(
+                    tip.log_slots,
+                    tip.active_slot_count,
+                    tip.alloc_counter + 1,
+                )
+                .unwrap();
+        }
+
+        assert!(matches!(
+            MdbxChainContext::open_or_create_for_test(dir.path()),
+            Err(MdbxContextError::Corrupt(
+                "state_meta counters mismatch with persisted tip header"
+            ))
+        ));
+    }
+
+    #[test]
+    fn reopen_rejects_persisted_creation_id_above_alloc_counter() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
+            let eff_log = ctx.state.state.effective_log_segment_size() as u8;
+            let mut cols = crate::segmented_state::SegmentColumns::new_zero(1usize << eff_log);
+            let owner = Address([0xA5; 32]);
+            let slot = crate::fri_state::SlotValue::with_owner_fields(7, 1, owner.as_fields());
+            cols.values[7] = slot.value;
+            cols.owners_hi[7] = slot.owner_hi;
+            cols.owners_lo[7] = slot.owner_lo;
+            ctx.store
+                .overwrite_segment_for_test(0, eff_log, &cols)
+                .unwrap();
+        }
+
+        assert!(matches!(
+            MdbxChainContext::open_or_create_for_test(dir.path()),
+            Err(MdbxContextError::Corrupt(
+                "persisted slot creation_id exceeds alloc_counter"
+            ))
+        ));
+    }
+
+    #[test]
+    fn targeted_preload_rejects_missing_evicted_segment() {
+        use noid_poseidon2b::primitives::TxBodyHash;
+        use noid_tx::{Transaction, TxBody, TxOutput, TxShape};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
+        let owner = Address([0x3C; 32]);
+        let eff_log = ctx.state.state.effective_log_segment_size();
+        let mut cols = crate::segmented_state::SegmentColumns::new_zero(1usize << eff_log);
+        let slot = crate::fri_state::SlotValue::with_owner_fields(5, 1, owner.as_fields());
+        cols.values[7] = slot.value;
+        cols.owners_hi[7] = slot.owner_hi;
+        cols.owners_lo[7] = slot.owner_lo;
+        let seg_id = 0;
+        ctx.state.state.restore_evicted_segment(seg_id, cols);
+        ctx.state.state.evict_segment(seg_id);
+        assert!(ctx.state.state.is_evicted(seg_id));
+        assert!(ctx.store.get_segment(seg_id).unwrap().is_none());
+
+        let block = Block {
+            header: *ctx.tip_header(),
+            transactions: vec![Transaction {
+                body: TxBody {
+                    shape: TxShape::Standard4x8,
+                    epoch_anchor: [0; 32],
+                    fee: 0,
+                    inputs: vec![],
+                    outputs: vec![TxOutput {
+                        slot_index: 7,
+                        value: 1,
+                        owner,
+                        valid: true,
+                    }],
+                    is_coinbase: false,
+                },
+                tx_body_hash: TxBodyHash([0; 32]),
+            }],
+        };
+
+        assert!(matches!(
+            ctx.preload_segments_for_block(&block),
+            Err(MdbxContextError::Corrupt(
+                "evicted live segment is missing from MDBX"
+            ))
+        ));
     }
 
     #[test]

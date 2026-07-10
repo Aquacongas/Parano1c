@@ -726,6 +726,7 @@ async fn cmd_slot(ctx: &Ctx<'_>, index: u32) -> anyhow::Result<()> {
 
     let empty = result["empty"].as_bool().unwrap_or(true);
     let value = result["value"].as_u64().unwrap_or(0);
+    let creation_id = result["creation_id"].as_u64().unwrap_or(0);
     let owner = result["owner"].as_str().unwrap_or("?");
 
     section(&format!("Slot #{index}"));
@@ -738,6 +739,7 @@ async fn cmd_slot(ctx: &Ctx<'_>, index: u32) -> anyhow::Result<()> {
             &format!("{} NOID", noid_str(value)),
             &format!("({value} μNOID)"),
         );
+        kv("Creation ID", &creation_id.to_string());
         kv("Owner", ctx.h(owner));
     }
 
@@ -826,18 +828,25 @@ async fn cmd_utxos_of(ctx: &Ctx<'_>, address: &str) -> anyhow::Result<()> {
         return Ok(());
     }
     let total: u64 = slots.iter().map(|s| s["value"].as_u64().unwrap_or(0)).sum();
-    separator(50);
-    println!("  {:<12}  {:>14}", "slot", "NOID");
-    separator(50);
+    separator(74);
+    println!("  {:<12}  {:>20}  {:>14}", "slot", "creation id", "NOID");
+    separator(74);
     for s in &slots {
         let slot = s["slot_index"].as_u64().unwrap_or(0);
+        let creation_id = s["creation_id"].as_u64().unwrap_or(0);
         let value = s["value"].as_u64().unwrap_or(0);
-        println!("  {:<12}  {:>14}", slot, noid_str(value));
+        println!(
+            "  {:<12}  {:>20}  {:>14}",
+            slot,
+            creation_id,
+            noid_str(value)
+        );
     }
-    separator(50);
+    separator(74);
     println!(
-        "  {:<12}  {:>14}  ({} UTXOs)",
+        "  {:<12}  {:>20}  {:>14}  ({} UTXOs)",
         "TOTAL",
+        "",
         noid_str(total),
         slots.len()
     );
@@ -1513,29 +1522,31 @@ async fn cmd_utxos(ctx: &Ctx<'_>) -> anyhow::Result<()> {
         .map(|u| u["value_micronoid"].as_u64().unwrap_or(0))
         .sum();
 
-    separator(72);
+    separator(96);
     if is_tty() {
         println!(
-            "  {}{:<8}  {:>14}  {:>7}  {:>9}  {}{}",
-            BOLD, "slot", "NOID", "key", "at block", "address", RST
+            "  {}{:<8}  {:>20}  {:>14}  {:>7}  {:>9}  {}{}",
+            BOLD, "slot", "creation id", "NOID", "key", "at block", "address", RST
         );
     } else {
         println!(
-            "  {:<8}  {:>14}  {:>7}  {:>9}  {}",
-            "slot", "NOID", "key", "at block", "address"
+            "  {:<8}  {:>20}  {:>14}  {:>7}  {:>9}  {}",
+            "slot", "creation id", "NOID", "key", "at block", "address"
         );
     }
-    separator(72);
+    separator(96);
 
     for u in &utxos {
         let slot = u["slot_index"].as_u64().unwrap_or(0);
+        let creation_id = u["creation_id"].as_u64().unwrap_or(0);
         let micro = u["value_micronoid"].as_u64().unwrap_or(0);
         let key = u["key_index"].as_u64().unwrap_or(0);
         let height = u["confirmed_height"].as_u64().unwrap_or(0);
         let addr = u["address"].as_str().unwrap_or("?");
         println!(
-            "  {:<8}  {:>14}  {:>7}  {:>9}  {}",
+            "  {:<8}  {:>20}  {:>14}  {:>7}  {:>9}  {}",
             slot,
+            creation_id,
             noid_str(micro),
             key,
             height,
@@ -1543,11 +1554,18 @@ async fn cmd_utxos(ctx: &Ctx<'_>) -> anyhow::Result<()> {
         );
     }
 
-    separator(72);
+    separator(96);
     if is_tty() {
-        println!("  {}{:<8}  {:>14}{}", BOLD, "TOTAL", noid_str(total), RST);
+        println!(
+            "  {}{:<8}  {:>20}  {:>14}{}",
+            BOLD,
+            "TOTAL",
+            "",
+            noid_str(total),
+            RST
+        );
     } else {
-        println!("  {:<8}  {:>14}", "TOTAL", noid_str(total));
+        println!("  {:<8}  {:>20}  {:>14}", "TOTAL", "", noid_str(total));
     }
 
     Ok(())

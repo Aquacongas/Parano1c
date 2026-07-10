@@ -19,7 +19,9 @@ pub type StateHash = [u8; 32];
 /// Errors returned by checked exact-state hash encoders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExactStateHashError {
-    /// Slot amount is not the canonical u64 embedding in GF(2^128).
+    /// Retained for API compatibility with legacy amount-only raw states.
+    /// Packed `(amount, creation_id)` lanes use all 128 bits and therefore no
+    /// longer produce this error.
     NonCanonicalAmount,
 }
 
@@ -48,28 +50,19 @@ pub fn fields_from_digest(hash: StateHash) -> [Block128; 2] {
     ]
 }
 
-#[inline]
-fn canonical_amount_u64(slot: SlotValue) -> Result<u64, ExactStateHashError> {
-    let value = slot.value.to_u128();
-    if value >> 64 != 0 {
-        return Err(ExactStateHashError::NonCanonicalAmount);
-    }
-    Ok(value as u64)
-}
-
 /// Hash one exact-state slot leaf.
 ///
-/// This panics if `slot.value` is not a canonical u64 embedding. Use
-/// [`slot_leaf_hash_checked`] when hashing untrusted raw state.
+/// The full packed `(amount, creation_id)` lane is absorbed. Creation ID zero
+/// is therefore byte-for-byte compatible with the historical amount-only
+/// schedule.
 pub fn slot_leaf_hash(slot: SlotValue) -> StateHash {
-    slot_leaf_hash_checked(slot).expect("slot amount must be canonical u64")
+    slot_leaf_hash_checked(slot).expect("every packed slot lane is canonical")
 }
 
 /// Checked variant of [`slot_leaf_hash`].
 pub fn slot_leaf_hash_checked(slot: SlotValue) -> Result<StateHash, ExactStateHashError> {
-    let amount = canonical_amount_u64(slot)?;
     let mut s = Poseidon2bSponge::with_iv(capacity_iv(TAG_EXSTSLT));
-    s.absorb(Block128::from(amount));
+    s.absorb(slot.value);
     s.absorb_pair(slot.owner_hi, slot.owner_lo);
     Ok(s.finalize())
 }
@@ -119,14 +112,16 @@ mod tests {
     }
 
     #[test]
-    fn slot_hash_is_deterministic_and_amount_canonical() {
+    fn slot_hash_binds_full_packed_value_and_keeps_id_zero_schedule() {
         let s = slot(42, 7, 9);
         assert_eq!(slot_leaf_hash(s), slot_leaf_hash(s));
-        let bad = slot((1u128 << 64) | 1, 7, 9);
-        assert_eq!(
-            slot_leaf_hash_checked(bad),
-            Err(ExactStateHashError::NonCanonicalAmount)
-        );
+        let incarnation = slot((1u128 << 64) | 42, 7, 9);
+        assert_ne!(slot_leaf_hash(s), slot_leaf_hash(incarnation));
+
+        let mut legacy = Poseidon2bSponge::with_iv(capacity_iv(TAG_EXSTSLT));
+        legacy.absorb(Block128::from(42u64));
+        legacy.absorb_pair(Block128::from(7u64), Block128::from(9u64));
+        assert_eq!(slot_leaf_hash(s), legacy.finalize());
     }
 
     #[test]

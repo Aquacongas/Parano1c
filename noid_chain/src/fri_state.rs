@@ -17,6 +17,7 @@
 use std::borrow::Cow;
 
 use noid_core::{Block128, TowerField};
+use noid_tx::{pack_amount_creation_id, unpack_amount_creation_id};
 
 /// Segment size used by `SegmentedFriState`.
 /// Each segment independently holds and commits `2^LOG_SEGMENT_SIZE` slots.
@@ -40,8 +41,10 @@ use noid_poseidon2b::native::compression::Poseidon2bSponge;
 /// smaller values through [`FriState::new_empty`].
 pub const STATE_LOG_SLOTS: usize = 24;
 
-/// Per-slot payload: `(value, owner)` where `owner` is 256 bits split
-/// into two 128-bit halves. All-zeros means "slot empty / spent".
+/// Per-slot payload: `(pack(amount, creation_id), owner)` where `owner` is
+/// 256 bits split into two 128-bit halves.  The packed value keeps the raw
+/// storage layout at three field elements while binding a slot incarnation to
+/// every live UTXO. All-zeros means "slot empty / spent".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SlotValue {
     pub value: Block128,
@@ -59,6 +62,40 @@ impl SlotValue {
     #[inline]
     pub fn is_empty(&self) -> bool {
         *self == Self::EMPTY
+    }
+
+    /// Construct a live slot from its typed components without exposing the
+    /// packed field layout to callers.
+    #[inline]
+    pub const fn from_parts(
+        amount: u64,
+        creation_id: u64,
+        owner_hi: Block128,
+        owner_lo: Block128,
+    ) -> Self {
+        Self {
+            value: pack_amount_creation_id(amount, creation_id),
+            owner_hi,
+            owner_lo,
+        }
+    }
+
+    /// Construct a live slot from typed value parts and the two owner fields.
+    #[inline]
+    pub const fn with_owner_fields(amount: u64, creation_id: u64, owner: [Block128; 2]) -> Self {
+        Self::from_parts(amount, creation_id, owner[0], owner[1])
+    }
+
+    /// Monetary amount stored in the low 64 bits of the packed value lane.
+    #[inline]
+    pub const fn amount(&self) -> u64 {
+        unpack_amount_creation_id(self.value).0
+    }
+
+    /// Monotone UTXO incarnation stored in the high 64 bits.
+    #[inline]
+    pub const fn creation_id(&self) -> u64 {
+        unpack_amount_creation_id(self.value).1
     }
 }
 

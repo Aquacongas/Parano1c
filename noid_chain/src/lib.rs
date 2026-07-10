@@ -66,6 +66,7 @@ pub use storage::{
 pub use block::{
     apply_block, apply_genesis_block, apply_state_delta, compute_tx_root,
     validate_block_proof_binding, Block, BlockApplyError, ProofBindingError, BLOCK_MAX_TXS,
+    BLOCK_WIRE_HEADER_OFFSET, BLOCK_WIRE_NONCE_OFFSET, BLOCK_WIRE_VERSION,
 };
 pub use block_header::{block_id, hash_block_header, BlockHeader};
 pub use header_anchor::{
@@ -90,8 +91,7 @@ pub use chain_context::ChainContext;
 pub use mempool::{Mempool, MempoolEntry, MempoolError};
 pub use reuse_guard::{
     validate_reuse_guard_actions, GuardBucket, ReuseGuard, ReuseGuardActionError,
-    ReuseGuardActionKind, ReuseGuardActionState, ReuseGuardError, REUSE_DELAY,
-    REUSE_GUARD_BUCKETS,
+    ReuseGuardActionKind, ReuseGuardActionState, ReuseGuardError, REUSE_DELAY, REUSE_GUARD_BUCKETS,
 };
 pub use state::{apply_tx, ApplyError, ChainState, SparseUtxoBuildError, StateTransition};
 pub use state_delta::{

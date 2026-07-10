@@ -6,8 +6,8 @@
 use std::collections::BTreeSet;
 
 use noid_core::Block128;
-use noid_poseidon2b::native::compression::{compress_with_tag, Poseidon2bSponge};
 use noid_core::TowerField;
+use noid_poseidon2b::native::compression::{compress_with_tag, Poseidon2bSponge};
 use noid_poseidon2b::native::domain::{capacity_iv, TAG_RGDBUCK, TAG_RGDNODE, TAG_RGDSLOT};
 use noid_tx::Transaction;
 
@@ -58,11 +58,8 @@ where
                     return Err(serde::de::Error::invalid_length(actual, &self));
                 }
             }
-            let mut slots = Vec::with_capacity(
-                seq.size_hint()
-                    .unwrap_or(0)
-                    .min(BLOCK_MAX_LIVE_INPUTS),
-            );
+            let mut slots =
+                Vec::with_capacity(seq.size_hint().unwrap_or(0).min(BLOCK_MAX_LIVE_INPUTS));
             while let Some(slot) = seq.next_element()? {
                 if slots.len() == BLOCK_MAX_LIVE_INPUTS {
                     return Err(serde::de::Error::invalid_length(
@@ -254,20 +251,10 @@ impl ReuseGuardActionState {
         tx: &Transaction,
     ) -> Result<(), ReuseGuardActionError> {
         for input in tx.body.inputs.iter().filter(|input| input.valid) {
-            self.validate_action(
-                guard,
-                height,
-                ReuseGuardActionKind::Spend,
-                input.slot_index,
-            )?;
+            self.validate_action(guard, height, ReuseGuardActionKind::Spend, input.slot_index)?;
         }
         for output in tx.body.outputs.iter().filter(|output| output.valid) {
-            self.validate_action(
-                guard,
-                height,
-                ReuseGuardActionKind::Mint,
-                output.slot_index,
-            )?;
+            self.validate_action(guard, height, ReuseGuardActionKind::Mint, output.slot_index)?;
         }
         Ok(())
     }
@@ -619,6 +606,7 @@ mod tests {
                 .map(|slot_index| TxInput {
                     slot_index,
                     value: 1,
+                    creation_id: 0,
                     owner: Address([1u8; 32]),
                     spend_secret: SpendSecret([2u8; 32]),
                     valid: true,

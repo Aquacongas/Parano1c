@@ -27,7 +27,7 @@
 //!   - `block_hex`                — full sealed block with nonce = 0
 //!   - `block_proof_hex`          — serialized BlockProof, empty for coinbase-only
 //!   - `block_auth_sidecar_hex`   — serialized public Auth sidecar, empty when absent
-//!   - `nonce_offset`             — byte offset of nonce inside block_hex (always 144)
+//!   - `nonce_offset`             — byte offset of nonce inside versioned block_hex
 //!   - `difficulty_target_hex`    — 256-bit LE target
 //!   - shape/proof metadata       — operator display only; PoW uses pow_fields
 //!
@@ -216,11 +216,11 @@ const DIGEST_BATCH: usize = 256;
 const POW_HEADER_FIELD_COUNT: usize = 16;
 const POW_NONCE_FIELD_INDEX: usize = 10;
 const POW_FIELDS_HEX_BYTES: usize = POW_HEADER_FIELD_COUNT * 16;
-/// Byte offset of the nonce inside block header wire.
+/// Header-relative nonce offset. The serialized block-envelope offset is
+/// advertised by the node and may include a version prefix.
 const BLOCK_HEADER_NONCE_OFFSET: usize = 144;
-/// Serialized semantic block header size.
+/// Serialized semantic block header size, excluding its block-envelope prefix.
 const BLOCK_HEADER_WIRE_SIZE: usize = 212;
-
 /// Search for a valid nonce using all rayon threads.
 /// Returns `Some(nonce)` or `None` if cancelled.
 fn search_nonce(
@@ -293,32 +293,39 @@ fn decode_pow_fields_hex(hex_str: &str) -> Result<[Block128; POW_HEADER_FIELD_CO
     Ok(fields)
 }
 
-fn pow_fields_from_block_header(block_bytes: &[u8]) -> Result<[Block128; POW_HEADER_FIELD_COUNT]> {
-    if block_bytes.len() < BLOCK_HEADER_WIRE_SIZE {
+fn pow_fields_from_block_header(
+    block_bytes: &[u8],
+    header_offset: usize,
+) -> Result<[Block128; POW_HEADER_FIELD_COUNT]> {
+    let header_end = header_offset
+        .checked_add(BLOCK_HEADER_WIRE_SIZE)
+        .ok_or_else(|| anyhow!("block header offset overflow"))?;
+    if block_bytes.len() < header_end {
         return Err(anyhow!(
-            "block_hex too short: {} bytes, need at least {BLOCK_HEADER_WIRE_SIZE}",
-            block_bytes.len()
+            "block_hex too short: {} bytes, need at least {header_end}",
+            block_bytes.len(),
         ));
     }
+    let header = &block_bytes[header_offset..header_end];
 
     let mut fields = [Block128::ZERO; POW_HEADER_FIELD_COUNT];
     let mut field = 0usize;
-    put_digest_fields(&mut fields, &mut field, &block_bytes[0..32]);
-    put_digest_fields(&mut fields, &mut field, &block_bytes[32..64]);
-    put_digest_fields(&mut fields, &mut field, &block_bytes[64..96]);
-    fields[field] = Block128::from(read_u64(&block_bytes[96..104]) as u128);
+    put_digest_fields(&mut fields, &mut field, &header[0..32]);
+    put_digest_fields(&mut fields, &mut field, &header[32..64]);
+    put_digest_fields(&mut fields, &mut field, &header[64..96]);
+    fields[field] = Block128::from(read_u64(&header[96..104]) as u128);
     field += 1;
-    fields[field] = Block128::from(read_u64(&block_bytes[104..112]) as u128);
+    fields[field] = Block128::from(read_u64(&header[104..112]) as u128);
     field += 1;
-    put_digest_fields(&mut fields, &mut field, &block_bytes[112..144]);
-    fields[field] = Block128::from(read_u128(&block_bytes[144..160]));
+    put_digest_fields(&mut fields, &mut field, &header[112..144]);
+    fields[field] = Block128::from(read_u128(&header[144..160]));
     field += 1;
-    put_digest_fields(&mut fields, &mut field, &block_bytes[160..192]);
-    fields[field] = Block128::from(read_u32(&block_bytes[192..196]) as u128);
+    put_digest_fields(&mut fields, &mut field, &header[160..192]);
+    fields[field] = Block128::from(read_u32(&header[192..196]) as u128);
     field += 1;
-    fields[field] = Block128::from(read_u64(&block_bytes[196..204]) as u128);
+    fields[field] = Block128::from(read_u64(&header[196..204]) as u128);
     field += 1;
-    fields[field] = Block128::from(read_u64(&block_bytes[204..212]) as u128);
+    fields[field] = Block128::from(read_u64(&header[204..212]) as u128);
     field += 1;
     debug_assert_eq!(field, POW_HEADER_FIELD_COUNT);
     Ok(fields)
@@ -419,25 +426,45 @@ fn validate_template_layout(
     block_bytes: &[u8],
     nonce_offset: usize,
 ) -> Result<()> {
-    if nonce_offset != BLOCK_HEADER_NONCE_OFFSET {
+    // The node is the single source of truth for the serialized offset. Derive
+    // the semantic header start from the stable header-relative nonce offset,
+    // leaving any version/envelope prefix opaque and untouched.
+    let header_offset = nonce_offset.checked_sub(BLOCK_HEADER_NONCE_OFFSET).ok_or_else(|| {
+        anyhow!(
+            "nonce_offset={nonce_offset} precedes header-relative nonce offset {BLOCK_HEADER_NONCE_OFFSET}"
+        )
+    })?;
+    let minimum_len = header_offset
+        .checked_add(BLOCK_HEADER_WIRE_SIZE)
+        .ok_or_else(|| anyhow!("block header length overflow"))?;
+    if block_bytes.len() < minimum_len {
         return Err(anyhow!(
-            "unexpected nonce_offset={nonce_offset}; expected {BLOCK_HEADER_NONCE_OFFSET}"
-        ));
-    }
-    if block_bytes.len() < BLOCK_HEADER_WIRE_SIZE {
-        return Err(anyhow!(
-            "block_hex too short: {} bytes, need at least {BLOCK_HEADER_WIRE_SIZE}",
-            block_bytes.len()
+            "block_hex too short: {} bytes, need at least {minimum_len}",
+            block_bytes.len(),
         ));
     }
 
-    let block_fields = pow_fields_from_block_header(block_bytes)?;
+    let block_fields = pow_fields_from_block_header(block_bytes, header_offset)?;
     if &block_fields != pow_fields {
         return Err(anyhow!(
             "template mismatch: pow_fields_hex does not match the semantic header embedded in block_hex"
         ));
     }
 
+    Ok(())
+}
+
+fn patch_block_nonce(block_bytes: &mut [u8], nonce_offset: usize, nonce: u128) -> Result<()> {
+    let nonce_end = nonce_offset
+        .checked_add(16)
+        .ok_or_else(|| anyhow!("nonce offset overflow"))?;
+    let block_len = block_bytes.len();
+    let dst = block_bytes
+        .get_mut(nonce_offset..nonce_end)
+        .ok_or_else(|| {
+            anyhow!("nonce_offset={nonce_offset} out of range (block_len={block_len})")
+        })?;
+    dst.copy_from_slice(&nonce.to_le_bytes());
     Ok(())
 }
 
@@ -564,14 +591,7 @@ fn mine(cli: &Cli) -> Result<()> {
         let elapsed = t0.elapsed();
 
         // Patch nonce into block bytes.
-        let nonce_bytes = nonce.to_le_bytes();
-        if nonce_offset + 16 > block_bytes.len() {
-            return Err(anyhow!(
-                "nonce_offset={nonce_offset} out of range (block_len={})",
-                block_bytes.len()
-            ));
-        }
-        block_bytes[nonce_offset..nonce_offset + 16].copy_from_slice(&nonce_bytes);
+        patch_block_nonce(&mut block_bytes, nonce_offset, nonce)?;
 
         // Submit.
         match rpc.submit_block(
@@ -620,31 +640,61 @@ fn main() {
 mod tests {
     use super::*;
 
+    const TEST_BLOCK_WIRE_HEADER_OFFSET: usize = 1;
+    const TEST_BLOCK_WIRE_NONCE_OFFSET: usize =
+        TEST_BLOCK_WIRE_HEADER_OFFSET + BLOCK_HEADER_NONCE_OFFSET;
+    const TEST_BLOCK_WIRE_VERSION: u8 = 0xB2;
+
     fn matching_pow_fields_and_block_bytes() -> ([Block128; POW_HEADER_FIELD_COUNT], Vec<u8>) {
-        let mut block = vec![0u8; BLOCK_HEADER_WIRE_SIZE + 4];
-        for (i, b) in block[..BLOCK_HEADER_WIRE_SIZE].iter_mut().enumerate() {
+        let mut block = vec![0u8; TEST_BLOCK_WIRE_HEADER_OFFSET + BLOCK_HEADER_WIRE_SIZE + 4];
+        block[0] = TEST_BLOCK_WIRE_VERSION;
+        for (i, b) in block
+            [TEST_BLOCK_WIRE_HEADER_OFFSET..TEST_BLOCK_WIRE_HEADER_OFFSET + BLOCK_HEADER_WIRE_SIZE]
+            .iter_mut()
+            .enumerate()
+        {
             *b = i as u8;
         }
-        let fields = pow_fields_from_block_header(&block).expect("valid header bytes");
+        let fields = pow_fields_from_block_header(&block, TEST_BLOCK_WIRE_HEADER_OFFSET)
+            .expect("valid header bytes");
         (fields, block)
     }
 
     #[test]
     fn template_layout_accepts_matching_pow_fields_and_full_header() {
         let (fields, block) = matching_pow_fields_and_block_bytes();
-        validate_template_layout(&fields, &block, BLOCK_HEADER_NONCE_OFFSET).unwrap();
+        validate_template_layout(&fields, &block, TEST_BLOCK_WIRE_NONCE_OFFSET).unwrap();
     }
 
     #[test]
     fn template_layout_rejects_mismatched_pow_fields() {
         let (mut fields, block) = matching_pow_fields_and_block_bytes();
         fields[0] += Block128::from(1u128);
-        assert!(validate_template_layout(&fields, &block, BLOCK_HEADER_NONCE_OFFSET).is_err());
+        assert!(validate_template_layout(&fields, &block, TEST_BLOCK_WIRE_NONCE_OFFSET).is_err());
     }
 
     #[test]
     fn template_layout_rejects_unexpected_nonce_offset() {
         let (fields, block) = matching_pow_fields_and_block_bytes();
-        assert!(validate_template_layout(&fields, &block, BLOCK_HEADER_NONCE_OFFSET + 1).is_err());
+        assert!(
+            validate_template_layout(&fields, &block, TEST_BLOCK_WIRE_NONCE_OFFSET + 1).is_err()
+        );
+    }
+
+    #[test]
+    fn nonce_patch_preserves_opaque_wire_prefix_and_header_alignment() {
+        let (mut fields, mut block) = matching_pow_fields_and_block_bytes();
+        let prefix = block[..TEST_BLOCK_WIRE_HEADER_OFFSET].to_vec();
+        let nonce = 0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210u128;
+        fields[POW_NONCE_FIELD_INDEX] = Block128::from(nonce);
+
+        patch_block_nonce(&mut block, TEST_BLOCK_WIRE_NONCE_OFFSET, nonce).unwrap();
+
+        assert_eq!(&block[..TEST_BLOCK_WIRE_HEADER_OFFSET], prefix.as_slice());
+        assert_eq!(
+            pow_fields_from_block_header(&block, TEST_BLOCK_WIRE_HEADER_OFFSET).unwrap(),
+            fields
+        );
+        validate_template_layout(&fields, &block, TEST_BLOCK_WIRE_NONCE_OFFSET).unwrap();
     }
 }

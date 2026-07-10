@@ -16,8 +16,8 @@ pub use channel::Poseidon2bChannel;
 pub use hasher::*;
 pub use native::*;
 pub use primitives::{
-    derive_address, hash_leaf, hash_tx_body, hash_utxo_leaf, is_coinbase_leaf, Address, Commitment,
-    Digest, SpendSecret, TxBodyHash,
+    derive_address, hash_input_leaf_packed, hash_leaf, hash_tx_body, hash_utxo_leaf,
+    is_coinbase_leaf, Address, Commitment, Digest, SpendSecret, TxBodyHash,
 };
 
 /// Bulk import surface for UTXO-layer callers.
@@ -28,8 +28,8 @@ pub mod prelude {
         TAG_FSCHALNG, TAG_LEAF, TAG_POWHDR, TAG_TXBODY,
     };
     pub use crate::primitives::{
-        derive_address, hash_leaf, hash_tx_body, hash_utxo_leaf, Address, Commitment, Digest,
-        SpendSecret, TxBodyHash,
+        derive_address, hash_input_leaf_packed, hash_leaf, hash_tx_body, hash_utxo_leaf, Address,
+        Commitment, Digest, SpendSecret, TxBodyHash,
     };
     pub use crate::Poseidon2bChannel;
 }

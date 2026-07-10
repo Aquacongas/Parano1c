@@ -10,7 +10,24 @@
 //! The proof layer enforces ownership (`owner = H_ADDR(spend_secret)`), public
 //! range/balance predicates, and exact state membership against that witness.
 
+use noid_core::Block128;
 use noid_poseidon2b::primitives::{Address, Commitment, Digest, SpendSecret, TxBodyHash};
+
+/// Pack the transparent amount and alloc-counter incarnation into the single
+/// existing value field used by state and transaction hash schedules.
+///
+/// The amount occupies the low 64 bits and `creation_id` the high 64 bits, so
+/// `creation_id = 0` is byte-identical to the historical amount-only lane.
+#[inline]
+pub const fn pack_amount_creation_id(amount: u64, creation_id: u64) -> Block128 {
+    Block128(((creation_id as u128) << 64) | amount as u128)
+}
+
+/// Inverse of [`pack_amount_creation_id`], returning `(amount, creation_id)`.
+#[inline]
+pub const fn unpack_amount_creation_id(packed: Block128) -> (u64, u64) {
+    (packed.0 as u64, (packed.0 >> 64) as u64)
+}
 
 /// Transaction proof/body shape.
 ///
@@ -43,10 +60,6 @@ impl TxShape {
             Self::Standard4x8 => 8,
             Self::Sweep25x2 => 2,
         }
-    }
-
-    pub const fn max_claimed_slots(self) -> usize {
-        self.max_inputs() + self.max_outputs()
     }
 
     pub const fn from_id(id: u8) -> Option<Self> {
@@ -85,6 +98,10 @@ pub struct TxInput {
     pub slot_index: u32,
     /// Transparent value (LE u64).
     pub value: u64,
+    /// Alloc-counter incarnation assigned when this UTXO was created.
+    /// Prevents a stale opening from spending a later UTXO that reused the
+    /// same physical slot.
+    pub creation_id: u64,
     /// 256-bit owner address. Must equal `H_ADDR(spend_secret)`.
     pub owner: Address,
     /// Preimage of `owner`. Never on-chain in cleartext — lives only
@@ -98,17 +115,22 @@ impl TxInput {
         Self {
             slot_index: 0,
             value: 0,
+            creation_id: 0,
             owner: Address([0u8; 32]),
             spend_secret: SpendSecret([0u8; 32]),
             valid: false,
         }
     }
 
-    /// Commitment leaf for this input: `hash_utxo_leaf(value, owner)`.
+    /// Commitment leaf for this input:
+    /// `hash_utxo_leaf(pack(value, creation_id), owner)`.
     /// Must equal the current `FriState` entry at `slot_index` for a
     /// valid spend.
     pub fn commitment(&self) -> Commitment {
-        noid_poseidon2b::primitives::hash_utxo_leaf(self.value as u128, &self.owner)
+        noid_poseidon2b::primitives::hash_utxo_leaf(
+            pack_amount_creation_id(self.value, self.creation_id).0,
+            &self.owner,
+        )
     }
 }
 
@@ -139,8 +161,13 @@ impl TxOutput {
         }
     }
 
-    pub fn commitment(&self) -> Commitment {
-        noid_poseidon2b::primitives::hash_utxo_leaf(self.value as u128, &self.owner)
+    /// State-leaf commitment after the block allocator assigns this output's
+    /// incarnation. Outputs intentionally do not choose their own ID.
+    pub fn commitment_with_creation_id(&self, creation_id: u64) -> Commitment {
+        noid_poseidon2b::primitives::hash_utxo_leaf(
+            pack_amount_creation_id(self.value, creation_id).0,
+            &self.owner,
+        )
     }
 }
 
@@ -222,9 +249,47 @@ impl std::fmt::Debug for TxInput {
         f.debug_struct("TxInput")
             .field("slot_index", &self.slot_index)
             .field("value", &self.value)
+            .field("creation_id", &self.creation_id)
             .field("owner", &self.owner)
             .field("spend_secret", &"[REDACTED]")
             .field("valid", &self.valid)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn amount_creation_id_packing_roundtrips_and_preserves_legacy_lane() {
+        for (amount, creation_id) in [
+            (0, 0),
+            (u64::MAX, 0),
+            (0, u64::MAX),
+            (0x0123_4567_89AB_CDEF, 0xFEDC_BA98_7654_3210),
+        ] {
+            let packed = pack_amount_creation_id(amount, creation_id);
+            assert_eq!(unpack_amount_creation_id(packed), (amount, creation_id));
+        }
+        assert_eq!(
+            pack_amount_creation_id(0xA55A, 0),
+            Block128::from(0xA55Au128)
+        );
+
+        let output = TxOutput {
+            slot_index: 3,
+            value: 77,
+            owner: Address([0x5A; 32]),
+            valid: true,
+        };
+        assert_eq!(
+            output.commitment_with_creation_id(0),
+            noid_poseidon2b::primitives::hash_utxo_leaf(77, &output.owner)
+        );
+        assert_ne!(
+            output.commitment_with_creation_id(0),
+            output.commitment_with_creation_id(1)
+        );
     }
 }

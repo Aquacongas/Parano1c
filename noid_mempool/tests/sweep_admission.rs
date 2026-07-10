@@ -14,9 +14,7 @@ use noid_gkr::{
 };
 use noid_mempool::{AsyncMempool, ChainView, SubmitError};
 use noid_poseidon2b::primitives::{derive_address, Address, SpendSecret, TxBodyHash};
-use noid_tx::{
-    compute_claims_commitment, hash_tx_body_for_shape, TxBody, TxInput, TxIntent, TxOutput, TxShape,
-};
+use noid_tx::{hash_tx_body_for_shape, TxBody, TxInput, TxIntent, TxOutput, TxShape};
 
 fn mk_secret(seed: u8) -> SpendSecret {
     let mut bytes = [0u8; 32];
@@ -36,6 +34,7 @@ fn mk_sweep_body(epoch_anchor: [u8; 32], fee: u64) -> TxBody {
         inputs.push(TxInput {
             slot_index: 1_000 + i,
             value: 20_000 + i as u64,
+            creation_id: 10_000 + i as u64,
             owner,
             spend_secret: spend_secret.clone(),
             valid: true,
@@ -95,11 +94,11 @@ fn chain_view_with_live_slots(body: &TxBody, include_outputs: bool) -> ChainView
             .state
             .set_slot(
                 input.slot_index,
-                SlotValue {
-                    value: Block128::from(input.value as u128),
-                    owner_hi: input.owner.as_fields()[0],
-                    owner_lo: input.owner.as_fields()[1],
-                },
+                SlotValue::with_owner_fields(
+                    input.value,
+                    input.creation_id,
+                    input.owner.as_fields(),
+                ),
             )
             .expect("insert live input slot");
         state.active_slot_count += 1;
@@ -110,11 +109,11 @@ fn chain_view_with_live_slots(body: &TxBody, include_outputs: bool) -> ChainView
                 .state
                 .set_slot(
                     output.slot_index,
-                    SlotValue {
-                        value: Block128::from(output.value as u128),
-                        owner_hi: output.owner.as_fields()[0],
-                        owner_lo: output.owner.as_fields()[1],
-                    },
+                    SlotValue::with_owner_fields(
+                        output.value,
+                        20_000 + u64::from(output.slot_index),
+                        output.owner.as_fields(),
+                    ),
                 )
                 .expect("insert occupied output slot");
             state.active_slot_count += 1;
@@ -148,10 +147,8 @@ fn intent_with_proof(body: TxBody, authorization_bytes: Vec<u8>) -> TxIntent {
         body.is_coinbase,
     );
     TxIntent {
-        tx_body: body.clone(),
+        tx_body: body,
         tx_body_hash,
-        claims_commitment: compute_claims_commitment(&body.inputs, &body.outputs),
-        claimed_slots: TxIntent::claimed_slots_from_body(&body),
         authorization_bytes,
     }
 }
@@ -160,8 +157,6 @@ fn intent_without_proof(body: TxBody) -> TxIntent {
     TxIntent {
         tx_body: body,
         tx_body_hash: TxBodyHash([0u8; 32]),
-        claims_commitment: [0u8; 32],
-        claimed_slots: vec![],
         authorization_bytes: vec![],
     }
 }
@@ -187,8 +182,6 @@ async fn mempool_accepts_valid_sweep25x2_bundle() {
     let intent = TxIntent {
         tx_body: body.clone(),
         tx_body_hash,
-        claims_commitment: compute_claims_commitment(&body.inputs, &body.outputs),
-        claimed_slots: TxIntent::claimed_slots_from_body(&body),
         authorization_bytes: authorization_bytes(&bundle),
     };
     let intent_bytes = intent.to_bytes();
@@ -235,8 +228,6 @@ async fn mempool_rejects_sweep_body_tamper_against_valid_bundle() {
     let intent = TxIntent {
         tx_body: tampered.clone(),
         tx_body_hash,
-        claims_commitment: compute_claims_commitment(&tampered.inputs, &tampered.outputs),
-        claimed_slots: TxIntent::claimed_slots_from_body(&tampered),
         authorization_bytes: authorization_bytes(&bundle),
     };
     let intent_bytes = intent.to_bytes();

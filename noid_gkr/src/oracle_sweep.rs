@@ -166,9 +166,10 @@ mod tests {
     use super::*;
     use noid_core::TowerField;
     use noid_poseidon2b::primitives::{
-        hash_input_leaf, hash_output_leaf, hash_tx_body_sweep25x2, Address, Digest,
+        hash_input_leaf_packed, hash_output_leaf, hash_tx_body_sweep25x2, Address, Digest,
         SWEEP_TXBODY_INPUTS, SWEEP_TXBODY_OUTPUTS,
     };
+    use noid_tx::pack_amount_creation_id;
 
     fn fields_to_digest(f: [Block128; 2]) -> Digest {
         let mut out = [0u8; 32];
@@ -188,14 +189,11 @@ mod tests {
             let owner = Address([i as u8 + 1; 32]);
             let slot = 10 + i as u32;
             let value = 1_000 + i as u64;
+            let creation_id = 100 + i as u64;
+            let packed = pack_amount_creation_id(value, creation_id);
             let [owner_hi, owner_lo] = owner.as_fields();
-            input_payloads[i] = [
-                Block128::from(slot as u128),
-                Block128::from(value as u128),
-                owner_hi,
-                owner_lo,
-            ];
-            input_leaves[i] = hash_input_leaf(slot, value, &owner);
+            input_payloads[i] = [Block128::from(slot as u128), packed, owner_hi, owner_lo];
+            input_leaves[i] = hash_input_leaf_packed(slot, packed, &owner);
         }
 
         let mut output_payloads = [[Block128::ZERO; 4]; SWEEP_TXBODY_OUTPUTS];

@@ -395,6 +395,7 @@ fn user_txs_block_batch(n: usize) -> FullBatchFixture {
             inputs: vec![TxInput {
                 slot_index: input_slot(i) as u32,
                 value: input_value,
+                creation_id: 0,
                 owner: owners[i],
                 spend_secret: secrets[i].clone(),
                 valid: true,
@@ -423,8 +424,13 @@ fn user_txs_block_batch(n: usize) -> FullBatchFixture {
         .iter()
         .map(|body| noid_tx::compute_claims_commitment(&body.inputs, &body.outputs))
         .collect();
-    let surface = build_exact_action_surface(&start_state.state, &bodies, &claims)
-        .expect("exact action surface");
+    let surface = build_exact_action_surface(
+        &start_state.state,
+        &bodies,
+        &claims,
+        start_state.alloc_counter,
+    )
+    .expect("exact action surface");
     let state_transition = build_exact_state_transition_proof(
         &parent_cache,
         &surface,
@@ -556,6 +562,7 @@ fn sweep_txs_block_batch(n: usize) -> FullBatchFixture {
             .map(|k| TxInput {
                 slot_index: in_slot(tx, k) as u32,
                 value: input_value,
+                creation_id: 0,
                 owner: derive_address(&secrets[tx][k]),
                 spend_secret: secrets[tx][k].clone(),
                 valid: true,
@@ -601,8 +608,13 @@ fn sweep_txs_block_batch(n: usize) -> FullBatchFixture {
         .iter()
         .map(|body| noid_tx::compute_claims_commitment(&body.inputs, &body.outputs))
         .collect();
-    let surface = build_exact_action_surface(&start_state.state, &bodies, &claims)
-        .expect("exact action surface");
+    let surface = build_exact_action_surface(
+        &start_state.state,
+        &bodies,
+        &claims,
+        start_state.alloc_counter,
+    )
+    .expect("exact action surface");
     let state_transition = build_exact_state_transition_proof(
         &parent_cache,
         &surface,

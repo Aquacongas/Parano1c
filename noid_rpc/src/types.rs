@@ -21,6 +21,9 @@ pub struct ChainInfo {
 pub struct SlotInfo {
     pub slot_index: u32,
     pub value: u64,
+    /// Alloc-counter incarnation assigned when this UTXO was minted.
+    #[serde(default)]
+    pub creation_id: u64,
     pub owner: String,
     pub empty: bool,
 }
@@ -41,7 +44,7 @@ pub struct BlockTemplateResponse {
     /// `Poseidon2b(POWHDR__, patched_fields) < difficulty_target`.
     pub pow_fields_hex: String,
     /// Full sealed block bytes (hex) with nonce = 0.
-    /// External miner: patch bytes at nonce_offset (144..160) with the found nonce.
+    /// External miner: patch the 16 bytes beginning at `nonce_offset` with the found nonce.
     pub block_hex: String,
     /// Serialized BlockProof bytes as hex. Empty for coinbase-only blocks.
     /// Submit this alongside `block_hex` to `submitBlock`.
@@ -51,7 +54,7 @@ pub struct BlockTemplateResponse {
     #[serde(default)]
     pub block_auth_sidecar_hex: String,
     /// Byte offset of the nonce field inside `block_hex`.
-    /// Always 144 bytes from the start of the block header (= start of block bytes).
+    /// Includes any block-wire prefix before the semantic header.
     pub nonce_offset: usize,
     /// Difficulty target as 64-char little-endian hex.
     pub difficulty_target_hex: String,
@@ -153,6 +156,9 @@ pub struct WalletBalance {
 pub struct WalletUtxoInfo {
     pub slot_index: u32,
     pub value_micronoid: u64,
+    /// Alloc-counter incarnation committed alongside the amount.
+    #[serde(default)]
+    pub creation_id: u64,
     pub value_noid: f64,
     pub address: String,
     pub key_index: u32,

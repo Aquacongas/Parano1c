@@ -17,6 +17,10 @@ use noid_poseidon2b::primitives::{Address, SpendSecret};
 
 use super::keystore::{Keystore, KeystoreError, MasterSecret};
 
+/// Maximum number of HD addresses the built-in wallet will derive or scan.
+/// Valid key indices are `0..MAX_WALLET_ADDRESSES`.
+pub const MAX_WALLET_ADDRESSES: u32 = 100_000;
+
 // ---------------------------------------------------------------------------
 // TxHistoryEntry
 // ---------------------------------------------------------------------------
@@ -60,6 +64,9 @@ pub struct WalletUtxo {
     pub slot_index: u32,
     /// Value in μNOID.
     pub value: u64,
+    /// Monotone alloc-counter incarnation assigned when this UTXO was minted.
+    /// This must be copied into every spending [`noid_tx::TxInput`].
+    pub creation_id: u64,
     /// The 32-byte address that owns this slot.
     pub address: Address,
     /// Key index used to derive this address.
@@ -169,14 +176,19 @@ impl WalletState {
 
     /// Switch the active address; derives (and remembers) the address and
     /// persists the choice in the wallet metadata.
-    pub fn set_active_index(&mut self, index: u32) {
+    pub fn set_active_index(&mut self, index: u32) -> Result<(), &'static str> {
+        if index >= MAX_WALLET_ADDRESSES {
+            return Err("active address index exceeds wallet address limit");
+        }
+        let next_index = index + 1;
         let addr = self.secret.derive_address(index);
         self.known_addresses.insert(addr.0, index);
         if index >= self.next_index {
-            self.next_index = index + 1;
+            self.next_index = next_index;
         }
         self.active_index = index;
         self.save_metadata();
+        Ok(())
     }
 
     /// Confirmed balance of the ACTIVE address in μNOID (the spendable
@@ -404,6 +416,25 @@ struct WalletMetadata {
     active_index: u32,
 }
 
+fn normalize_metadata_indices(
+    stored_next_index: u32,
+    stored_active_index: u32,
+    minimum_next_index: u32,
+) -> (u32, u32, bool) {
+    let active_index = if stored_active_index < MAX_WALLET_ADDRESSES {
+        stored_active_index
+    } else {
+        0
+    };
+    let required_for_active = active_index + 1;
+    let next_index = stored_next_index
+        .min(MAX_WALLET_ADDRESSES)
+        .max(minimum_next_index.min(MAX_WALLET_ADDRESSES))
+        .max(required_for_active);
+    let corrected = next_index != stored_next_index || active_index != stored_active_index;
+    (next_index, active_index, corrected)
+}
+
 impl WalletState {
     /// Save lightweight wallet metadata to disk.
     pub fn save_metadata(&self) {
@@ -431,14 +462,33 @@ impl WalletState {
             Err(_) => return,
         };
         if let Ok(meta) = serde_json::from_str::<WalletMetadata>(&text) {
-            if meta.next_index > self.next_index {
-                for i in self.next_index..meta.next_index {
+            let (next_index, active_index, corrected) =
+                normalize_metadata_indices(meta.next_index, meta.active_index, self.next_index);
+            if meta.next_index > MAX_WALLET_ADDRESSES {
+                tracing::warn!(
+                    stored = meta.next_index,
+                    limit = MAX_WALLET_ADDRESSES,
+                    "wallet metadata next_index exceeds address limit; clamping"
+                );
+            }
+            if meta.active_index >= MAX_WALLET_ADDRESSES {
+                tracing::warn!(
+                    stored = meta.active_index,
+                    limit = MAX_WALLET_ADDRESSES,
+                    "wallet metadata active_index exceeds address limit; keeping index 0"
+                );
+            }
+            if next_index > self.next_index {
+                for i in self.next_index..next_index {
                     let addr = self.secret.derive_address(i);
                     self.known_addresses.insert(addr.0, i);
                 }
-                self.next_index = meta.next_index;
+                self.next_index = next_index;
             }
-            self.active_index = meta.active_index;
+            self.active_index = active_index;
+            if corrected {
+                self.save_metadata();
+            }
             tracing::info!(
                 next_index = self.next_index,
                 active_index = self.active_index,
@@ -525,3 +575,36 @@ impl WalletState {
 
 /// Thread-safe shared wallet. `None` if wallet is not yet initialized.
 pub type SharedWallet = Arc<Mutex<Option<WalletState>>>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metadata_indices_are_bounded_and_keep_active_address_covered() {
+        assert_eq!(
+            normalize_metadata_indices(u32::MAX, u32::MAX, 50),
+            (MAX_WALLET_ADDRESSES, 0, true)
+        );
+        assert_eq!(
+            normalize_metadata_indices(50, MAX_WALLET_ADDRESSES - 1, 50),
+            (MAX_WALLET_ADDRESSES, MAX_WALLET_ADDRESSES - 1, true)
+        );
+        assert_eq!(normalize_metadata_indices(50, 7, 50), (50, 7, false));
+    }
+
+    #[test]
+    fn active_index_rejects_limit_without_mutating_wallet() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = WalletState::create_or_load(dir.path().join("wallet.key")).unwrap();
+        let before_next = wallet.next_index;
+        let before_active = wallet.active_index;
+
+        assert_eq!(
+            wallet.set_active_index(MAX_WALLET_ADDRESSES),
+            Err("active address index exceeds wallet address limit")
+        );
+        assert_eq!(wallet.next_index, before_next);
+        assert_eq!(wallet.active_index, before_active);
+    }
+}

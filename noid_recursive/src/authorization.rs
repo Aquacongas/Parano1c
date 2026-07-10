@@ -223,6 +223,7 @@ mod tests {
             inputs: vec![TxInput {
                 slot_index: 7,
                 value: 100,
+                creation_id: 0,
                 owner,
                 spend_secret: secret.clone(),
                 valid: true,

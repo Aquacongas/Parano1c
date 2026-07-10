@@ -197,12 +197,12 @@ fn transition_value_counters(surface: &ExactActionSurface) -> TransitionValueCou
             StateDeltaActionKind::Spend => {
                 counters.spent_value = counters
                     .spent_value
-                    .saturating_add(action.pre.value.to_u128());
+                    .saturating_add(action.pre.amount() as u128);
             }
             StateDeltaActionKind::Mint => {
                 counters.minted_value = counters
                     .minted_value
-                    .saturating_add(action.post.value.to_u128());
+                    .saturating_add(action.post.amount() as u128);
             }
         }
     }

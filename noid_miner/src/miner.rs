@@ -962,13 +962,14 @@ mod tests {
         parent.alloc_counter = pre_state.alloc_counter;
 
         let mut post_state = pre_state.clone();
+        apply_tx(&mut post_state, &coinbase.body).expect("test coinbase applies");
         for body in &user_bodies {
             apply_tx(&mut post_state, body).expect("test user tx applies");
         }
-        apply_tx(&mut post_state, &coinbase.body).expect("test coinbase applies");
         let state_root = post_state.state_root();
-        let mut exact_bodies = user_bodies.clone();
-        exact_bodies.push(coinbase.body.clone());
+        let exact_bodies: Vec<_> = std::iter::once(coinbase.body.clone())
+            .chain(user_bodies.iter().cloned())
+            .collect();
         let exact_commitments: Vec<_> = exact_bodies
             .iter()
             .map(|body| compute_claims_commitment(&body.inputs, &body.outputs))
@@ -977,6 +978,7 @@ mod tests {
             &pre_state.state,
             &exact_bodies,
             &exact_commitments,
+            pre_state.alloc_counter,
         )
         .expect("build exact surface");
         let exact_cache = pre_state

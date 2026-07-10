@@ -48,7 +48,6 @@ use noid_chain::consensus::{
 };
 use noid_chain::fri_state::SlotValue;
 use noid_chain::Mempool;
-use noid_core::Block128;
 use noid_poseidon2b::primitives::TxBodyHash;
 use noid_tx::{validate_public_tx_logic, Transaction, TxIntent};
 
@@ -459,14 +458,15 @@ impl AsyncMempool {
                     if !inp.valid {
                         return false;
                     }
-                    // Input must still hold exactly (value, owner) for this tx to
+                    // Input must still hold exactly (value, creation_id, owner)
+                    // for this tx to
                     // be includable. If the slot is EMPTY or has different content,
                     // the tx cannot be included in any future block.
-                    let expected = SlotValue {
-                        value: noid_core::Block128::from(inp.value as u128),
-                        owner_hi: inp.owner.as_fields()[0],
-                        owner_lo: inp.owner.as_fields()[1],
-                    };
+                    let expected = SlotValue::with_owner_fields(
+                        inp.value,
+                        inp.creation_id,
+                        inp.owner.as_fields(),
+                    );
                     st.view.slot(inp.slot_index) != expected
                 });
                 if stale {
@@ -772,11 +772,8 @@ fn check_input_slots(tx: &Transaction, view: &ChainView) -> Result<(), SubmitErr
                 )),
             ));
         }
-        let expected = SlotValue {
-            value: Block128::from(inp.value as u128),
-            owner_hi: inp.owner.as_fields()[0],
-            owner_lo: inp.owner.as_fields()[1],
-        };
+        let expected =
+            SlotValue::with_owner_fields(inp.value, inp.creation_id, inp.owner.as_fields());
         let actual = view.slot(idx);
         if actual != expected {
             // Log diagnostic: expected non-empty slot but got EMPTY.
@@ -785,6 +782,7 @@ fn check_input_slots(tx: &Transaction, view: &ChainView) -> Result<(), SubmitErr
             tracing::warn!(
                 slot_index = idx,
                 expected_value = inp.value,
+                expected_creation_id = inp.creation_id,
                 actual_empty = actual.is_empty(),
                 "check_input_slots: slot mismatch — likely evicted segment in ChainView"
             );
@@ -838,4 +836,56 @@ fn verify_intent_authorization(
         WalletAuthorizationBundle::from_bytes_for_shape(authorization_bytes, tx_body.shape)
             .map_err(|e| format!("authorization decode: {e}"))?;
     verify_wallet_authorization(tx_body, &bundle).map_err(|e| format!("authorization verify: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use noid_chain::consensus::genesis::genesis_header;
+    use noid_chain::fri_state::SlotValue;
+    use noid_chain::state::ChainState;
+    use noid_poseidon2b::primitives::{Address, SpendSecret, TxBodyHash};
+    use noid_tx::{Transaction, TxBody, TxInput, TxShape};
+
+    use super::check_input_slots;
+    use crate::view::ChainView;
+
+    #[test]
+    fn input_state_match_binds_creation_id() {
+        let owner = Address([0xA5; 32]);
+        let mut state = ChainState::with_log_slots(6);
+        state
+            .state
+            .set_slot(
+                7,
+                SlotValue::with_owner_fields(1_000, 42, owner.as_fields()),
+            )
+            .unwrap();
+        let mut headers = HashMap::new();
+        headers.insert(0, genesis_header());
+        let view = ChainView::new(0, headers, 1, state.state);
+        let mut tx = Transaction {
+            body: TxBody {
+                shape: TxShape::Standard4x8,
+                epoch_anchor: [1; 32],
+                fee: 0,
+                inputs: vec![TxInput {
+                    slot_index: 7,
+                    value: 1_000,
+                    creation_id: 41,
+                    owner,
+                    spend_secret: SpendSecret([0; 32]),
+                    valid: true,
+                }],
+                outputs: vec![],
+                is_coinbase: false,
+            },
+            tx_body_hash: TxBodyHash([2; 32]),
+        };
+
+        assert!(check_input_slots(&tx, &view).is_err());
+        tx.body.inputs[0].creation_id = 42;
+        assert!(check_input_slots(&tx, &view).is_ok());
+    }
 }

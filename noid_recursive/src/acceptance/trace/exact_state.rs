@@ -155,10 +155,11 @@ impl SpongeFamilyProofTrace {
 // slot_leaf (grouped here with its exact-state siblings)
 // ---------------------------------------------------------------------------
 
-/// Trace twin of `SlotLeafInputs`. `amount` carries the native `u64` bound
-/// as an explicit 64-bit range decomposition.
+/// Trace twin of `SlotLeafInputs`. The packed value carries
+/// `(creation_id:u64 << 64) | amount:u64`; ActionSurfaceTrace owns the limb
+/// range checks and mint-prefix binding.
 pub struct SlotLeafInputsTrace {
-    pub amount: LinExpr,
+    pub packed_value: LinExpr,
     pub owner_hi: LinExpr,
     pub owner_lo: LinExpr,
     pub expected_leaf: [LinExpr; 2],
@@ -166,10 +167,9 @@ pub struct SlotLeafInputsTrace {
 
 impl SlotLeafInputsTrace {
     pub fn alloc(b: &mut FieldR1csBuilder, native: &SlotLeafInputs) -> Self {
-        let amount = alloc_block(b, Block128::from(native.amount));
-        range_check_bits(b, &amount, 64);
+        let packed_value = alloc_block(b, native.packed_value);
         Self {
-            amount,
+            packed_value,
             owner_hi: alloc_block(b, native.owner_hi),
             owner_lo: alloc_block(b, native.owner_lo),
             expected_leaf: std::array::from_fn(|i| alloc_block(b, native.expected_leaf[i])),
@@ -179,7 +179,7 @@ impl SlotLeafInputsTrace {
     /// Trace twin of `evaluate_slot_leaf`'s rate blocks (2 perms).
     fn blocks(&self) -> Vec<[LinExpr; 2]> {
         vec![
-            [self.amount.clone(), self.owner_hi.clone()],
+            [self.packed_value.clone(), self.owner_hi.clone()],
             [self.owner_lo.clone(), const_block(pad_after_one_field())],
         ]
     }
@@ -199,7 +199,7 @@ pub fn verify_batched_slot_leaf_killshot_trace(
     ch.absorb_const_tower(b, inputs.len() as u128);
     ch.absorb_const_tower(b, TAG_EXSTSLT.as_u64() as u128);
     for input in inputs {
-        ch.absorb(b, &input.amount);
+        ch.absorb(b, &input.packed_value);
         ch.absorb(b, &input.owner_hi);
         ch.absorb(b, &input.owner_lo);
         ch.absorb(b, &input.expected_leaf[0]);
@@ -712,11 +712,11 @@ pub struct ExactStateSlotWires {
 /// via cell pins — the same wires the walk-B state leg reads as its entry)
 /// plus the flat-basis natives the region column builder consumes.
 pub struct ExactStateLeafRegion {
-    pub amount_w: LinExpr,
+    pub packed_value_w: LinExpr,
     pub owner_hi_w: LinExpr,
     pub owner_lo_w: LinExpr,
     pub expected_leaf_w: [LinExpr; 2],
-    pub amount_flat: F128,
+    pub packed_value_flat: F128,
     pub owner_hi_flat: F128,
     pub owner_lo_flat: F128,
     pub expected_leaf_flat: [F128; 2],
@@ -832,17 +832,21 @@ fn assemble_exact_state_region_data(
         .zip(slot_leaves.iter())
         .map(|(native, wires)| {
             let leaf = ExactStateLeafRegion {
-                amount_w: wires.amount.clone(),
+                packed_value_w: wires.packed_value.clone(),
                 owner_hi_w: wires.owner_hi.clone(),
                 owner_lo_w: wires.owner_lo.clone(),
                 expected_leaf_w: wires.expected_leaf.clone(),
-                amount_flat: flat_of(Block128::from(native.amount)),
+                packed_value_flat: flat_of(native.packed_value),
                 owner_hi_flat: flat_of(native.owner_hi),
                 owner_lo_flat: flat_of(native.owner_lo),
                 expected_leaf_flat: flat2(native.expected_leaf),
             };
             assert_eq!(
-                flat_sponge_leaf_hash(leaf.amount_flat, leaf.owner_hi_flat, leaf.owner_lo_flat),
+                flat_sponge_leaf_hash(
+                    leaf.packed_value_flat,
+                    leaf.owner_hi_flat,
+                    leaf.owner_lo_flat,
+                ),
                 leaf.expected_leaf_flat,
                 "slot-leaf statement digest != the flat sponge replay"
             );
@@ -1230,17 +1234,18 @@ mod tests {
 
     fn leaf_fixture(seed: u128) -> SlotLeafInputs {
         let amount = (seed as u64) | 1;
+        let packed_value = Block128::from((seed << 64) | amount as u128);
         let owner_hi = Block128::from(seed + 7);
         let owner_lo = Block128::from(seed + 13);
-        // evaluate_slot_leaf semantics via the sponge: absorb [amount,
+        // evaluate_slot_leaf semantics via the sponge: absorb [packed_value,
         // owner_hi] then [owner_lo, pad].
         let [iv_hi, iv_lo] = capacity_iv(TAG_EXSTSLT);
         let mut sponge = Poseidon2bSponge::with_iv([iv_hi, iv_lo]);
-        sponge.absorb_pair(Block128::from(amount), owner_hi);
+        sponge.absorb_pair(packed_value, owner_hi);
         sponge.absorb_pair(owner_lo, super::pad_after_one_field());
         let digest = sponge.finalize_no_pad();
         SlotLeafInputs {
-            amount,
+            packed_value,
             owner_hi,
             owner_lo,
             expected_leaf: [
@@ -1454,7 +1459,7 @@ mod tests {
         let (inputs, proof) = fixture(true);
         let mut survivors = Vec::new();
         let mutations: Vec<Box<dyn Fn(&mut ExactStateKillShotInputs)>> = vec![
-            Box::new(|i| i.slot_leaves[0].amount = i.slot_leaves[0].amount.wrapping_add(1)),
+            Box::new(|i| i.slot_leaves[0].packed_value += Block128::ONE),
             Box::new(|i| i.slot_leaves[0].owner_hi += Block128::ONE),
             Box::new(|i| i.slot_leaves[1].expected_leaf[1] += Block128::ONE),
             Box::new(|i| i.state_paths[0].leaf[0] += Block128::ONE),

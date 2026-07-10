@@ -6,7 +6,7 @@
 //! Proves the fixed two-permutation `EXSTSLT_` leaf hash schedule:
 //!
 //! ```text
-//! perm0_in = [amount_u64, owner_hi, EXSTSLT_iv_hi, EXSTSLT_iv_lo]
+//! perm0_in = [packed_value, owner_hi, EXSTSLT_iv_hi, EXSTSLT_iv_lo]
 //! perm1_in = [perm0_out[0] + owner_lo, perm0_out[1] + PAD, perm0_out[2], perm0_out[3]]
 //! leaf     = perm1_out[0..2]
 //! ```
@@ -33,7 +33,8 @@ pub const SLOT_LEAF_PIN_LANES: usize = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SlotLeafInputs {
-    pub amount: u64,
+    /// `(creation_id:u64 << 64) | amount:u64`.
+    pub packed_value: Block128,
     pub owner_hi: Block128,
     pub owner_lo: Block128,
     pub expected_leaf: [Block128; 2],
@@ -79,7 +80,7 @@ struct SlotLeafWitness {
 }
 
 fn absorb_public_leaf<T: FiatShamir<Block128>>(channel: &mut T, input: &SlotLeafInputs) {
-    channel.absorb(Block128::from(input.amount));
+    channel.absorb(input.packed_value);
     channel.absorb(input.owner_hi);
     channel.absorb(input.owner_lo);
     channel.absorb(input.expected_leaf[0]);
@@ -104,7 +105,7 @@ fn padding_after_one_field() -> Block128 {
 fn evaluate_slot_leaf(input: &SlotLeafInputs) -> SlotLeafWitness {
     let [iv_hi, iv_lo] = capacity_iv(TAG_EXSTSLT);
     let perm = Poseidon2bPermutation;
-    let mut perm0_out = [Block128::from(input.amount), input.owner_hi, iv_hi, iv_lo];
+    let mut perm0_out = [input.packed_value, input.owner_hi, iv_hi, iv_lo];
     let perm0_in = perm0_out;
     perm.permute_mut(&mut perm0_out);
 
@@ -174,7 +175,7 @@ fn chain_claims_at_offset(
             value: mds_constant(
                 lane,
                 &[
-                    (0, Block128::from(input.amount)),
+                    (0, input.packed_value),
                     (1, input.owner_hi),
                     (2, iv_hi),
                     (3, iv_lo),
@@ -421,22 +422,27 @@ mod tests {
         ]
     }
 
-    fn native_leaf(amount: u64, owner_hi: Block128, owner_lo: Block128) -> [Block128; 2] {
+    fn native_leaf(
+        packed_value: Block128,
+        owner_hi: Block128,
+        owner_lo: Block128,
+    ) -> [Block128; 2] {
         let mut s = Poseidon2bSponge::with_iv(capacity_iv(TAG_EXSTSLT));
-        s.absorb(Block128::from(amount));
+        s.absorb(packed_value);
         s.absorb_pair(owner_hi, owner_lo);
         fields_from_digest(s.finalize())
     }
 
     fn input(seed: u64) -> SlotLeafInputs {
         let amount = seed * 3 + 7;
+        let packed_value = Block128::from(((seed as u128) << 64) | amount as u128);
         let owner_hi = Block128::from((seed as u128) << 32);
         let owner_lo = Block128::from((seed as u128).wrapping_mul(17));
         SlotLeafInputs {
-            amount,
+            packed_value,
             owner_hi,
             owner_lo,
-            expected_leaf: native_leaf(amount, owner_hi, owner_lo),
+            expected_leaf: native_leaf(packed_value, owner_hi, owner_lo),
         }
     }
 

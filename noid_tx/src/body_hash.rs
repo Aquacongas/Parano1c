@@ -20,12 +20,12 @@
 //! reinterpret one body hash under another live set.
 
 use noid_poseidon2b::primitives::{
-    hash_input_leaf, hash_output_leaf, hash_tx_body as hash_tx_body_core,
+    hash_input_leaf_packed, hash_output_leaf, hash_tx_body as hash_tx_body_core,
     hash_tx_body_sweep25x2 as hash_tx_body_sweep25x2_core, Digest, TxBodyHash, SWEEP_TXBODY_INPUTS,
     SWEEP_TXBODY_OUTPUTS, TXBODY_INPUTS, TXBODY_OUTPUTS,
 };
 
-use crate::types::{TxInput, TxOutput, TxShape};
+use crate::types::{pack_amount_creation_id, TxInput, TxOutput, TxShape};
 
 /// Compute the canonical transaction-body hash. `inputs.len()` and
 /// `outputs.len()` must not exceed `MAX_INPUTS` / `MAX_OUTPUTS`;
@@ -55,11 +55,7 @@ pub fn hash_tx_body(
 /// The liveness bitmap committed in the body's reserved leaf: input bit
 /// `i`, output bit `max_inputs + j`. Shared by the body hash, the spine
 /// statement and every consumer that re-derives the committed selectors.
-pub fn validity_bits_for_shape(
-    shape: TxShape,
-    inputs: &[TxInput],
-    outputs: &[TxOutput],
-) -> u128 {
+pub fn validity_bits_for_shape(shape: TxShape, inputs: &[TxInput], outputs: &[TxOutput]) -> u128 {
     let mut bits = 0u128;
     for (i, inp) in inputs.iter().enumerate() {
         if inp.valid {
@@ -105,7 +101,11 @@ pub fn hash_tx_body_for_shape(
             let mut input_leaves: [Digest; TXBODY_INPUTS] = [[0u8; 32]; TXBODY_INPUTS];
             for i in 0..TXBODY_INPUTS {
                 let inp = inputs.get(i).cloned().unwrap_or_else(TxInput::dummy);
-                input_leaves[i] = hash_input_leaf(inp.slot_index, inp.value, &inp.owner);
+                input_leaves[i] = hash_input_leaf_packed(
+                    inp.slot_index,
+                    pack_amount_creation_id(inp.value, inp.creation_id),
+                    &inp.owner,
+                );
             }
 
             let mut output_leaves: [Digest; TXBODY_OUTPUTS] = [[0u8; 32]; TXBODY_OUTPUTS];
@@ -130,7 +130,11 @@ pub fn hash_tx_body_for_shape(
             let mut input_leaves: [Digest; SWEEP_TXBODY_INPUTS] = [[0u8; 32]; SWEEP_TXBODY_INPUTS];
             for i in 0..SWEEP_TXBODY_INPUTS {
                 let inp = inputs.get(i).cloned().unwrap_or_else(TxInput::dummy);
-                input_leaves[i] = hash_input_leaf(inp.slot_index, inp.value, &inp.owner);
+                input_leaves[i] = hash_input_leaf_packed(
+                    inp.slot_index,
+                    pack_amount_creation_id(inp.value, inp.creation_id),
+                    &inp.owner,
+                );
             }
 
             let mut output_leaves: [Digest; SWEEP_TXBODY_OUTPUTS] =
@@ -155,12 +159,13 @@ pub fn hash_tx_body_for_shape(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use noid_poseidon2b::primitives::{Address, SpendSecret};
+    use noid_poseidon2b::primitives::{hash_input_leaf, Address, SpendSecret};
 
     fn mk_input(seed: u8) -> TxInput {
         TxInput {
             slot_index: seed as u32,
             value: (seed as u64) * 11,
+            creation_id: 0,
             owner: Address([seed; 32]),
             spend_secret: SpendSecret([seed ^ 0xAA; 32]),
             valid: true,
@@ -219,6 +224,27 @@ mod tests {
         let h1 = hash_tx_body(&anchor, 0, &[i1], &[], false);
         let h2 = hash_tx_body(&anchor, 0, &[i2], &[], false);
         assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn input_creation_id_preserves_legacy_zero_and_binds_nonzero() {
+        let anchor = [0x31u8; 32];
+        let legacy = mk_input(3);
+        let legacy_leaf = hash_input_leaf(legacy.slot_index, legacy.value, &legacy.owner);
+        assert_eq!(
+            legacy_leaf,
+            hash_input_leaf_packed(
+                legacy.slot_index,
+                pack_amount_creation_id(legacy.value, 0),
+                &legacy.owner,
+            )
+        );
+
+        let h0 = hash_tx_body(&anchor, 0, std::slice::from_ref(&legacy), &[], false);
+        let mut incarnated = legacy;
+        incarnated.creation_id = 9;
+        let h9 = hash_tx_body(&anchor, 0, &[incarnated], &[], false);
+        assert_ne!(h0, h9);
     }
 
     #[test]

@@ -483,6 +483,14 @@ pub enum VerifyBlockError {
     ExactStateSurfaceSlotOutOfRange {
         tx_index: usize,
     },
+    /// Assigning the next live output incarnation would overflow the
+    /// consensus allocation counter.
+    ExactStateSurfaceAllocationCounterOverflow {
+        tx_index: usize,
+        output_index: usize,
+    },
+    /// The compact action counters cannot represent the reconstructed block.
+    ExactStateSurfaceActionCountOverflow,
     /// Public AuthGKR sidecar length, ordering, or tx-shape tags are invalid.
     AuthSidecarShapeMismatch,
     /// Block proof/sidecar/body plus admission verification work exceed the
@@ -550,6 +558,7 @@ mod tests {
             inputs: vec![TxInput {
                 slot_index: 1,
                 value: 100,
+                creation_id: 0,
                 owner: Address([0x11; 32]),
                 spend_secret: SpendSecret([0x22; 32]),
                 valid: true,

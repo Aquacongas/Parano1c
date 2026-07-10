@@ -302,6 +302,7 @@ fn one_user_block_item() -> (
         inputs: vec![TxInput {
             slot_index: 2,
             value: input_value,
+            creation_id: 0,
             owner,
             spend_secret: secret,
             valid: true,
@@ -328,8 +329,13 @@ fn one_user_block_item() -> (
         &body.inputs,
         &body.outputs,
     )];
-    let surface = build_exact_action_surface(&start_state.state, &[body.clone()], &claims)
-        .expect("exact action surface");
+    let surface = build_exact_action_surface(
+        &start_state.state,
+        &[body.clone()],
+        &claims,
+        start_state.alloc_counter,
+    )
+    .expect("exact action surface");
     let state_transition = build_exact_state_transition_proof(
         &parent_cache,
         &surface,

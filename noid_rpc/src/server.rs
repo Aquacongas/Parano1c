@@ -5,6 +5,7 @@
 //!
 //! All JSON-RPC methods are implemented. See API.md for the full method reference.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -14,7 +15,7 @@ use jsonrpsee::server::Server;
 use jsonrpsee::types::ErrorObject;
 use tokio::sync::RwLock;
 
-use noid_chain::block::Block;
+use noid_chain::block::{Block, BLOCK_WIRE_NONCE_OFFSET};
 use noid_chain::consensus::wire_limits::{
     hex_chars_for_bytes, proof_sidecar_combined_len_ok, MAX_BLOCK_AUTH_SIDECAR_BYTES,
     MAX_BLOCK_BYTES, MAX_BLOCK_PROOF_BYTES, MAX_HISTORY_PROOF_BYTES, MAX_RPC_RECEIPT_BYTES,
@@ -25,7 +26,6 @@ use noid_chain::consensus::{
     pow::{block_id, pow_header_fields},
 };
 use noid_chain::storage::MdbxChainContext;
-use noid_chain::wire::BLOCK_HEADER_NONCE_OFFSET;
 use noid_mempool::AsyncMempool;
 use noid_miner::template::{TemplateBuilder, TemplateChainSnapshot};
 
@@ -40,6 +40,64 @@ use crate::wallet_ops::WalletOps;
 
 fn rpc_err(msg: impl Into<String>) -> ErrorObject<'static> {
     ErrorObject::owned(-32000, msg.into(), None::<()>)
+}
+
+/// Read a canonical slot without treating an MDBX-evicted segment as virtual
+/// zero. `SegmentedFriState::slot` intentionally cannot distinguish those at
+/// the read call site, so RPC reads hydrate the one needed segment from the
+/// durable store. The cache amortizes owner-index responses with many UTXOs in
+/// the same segment.
+fn read_canonical_slot(
+    chain: &MdbxChainContext,
+    slot_index: u32,
+    segment_cache: &mut HashMap<u16, noid_chain::segmented_state::SegmentColumns>,
+) -> Result<noid_chain::fri_state::SlotValue, String> {
+    use noid_chain::fri_state::SlotValue;
+
+    let state = &chain.state.state;
+    if u64::from(slot_index) >= state.num_slots() {
+        return Err(format!("slot {slot_index} is out of range"));
+    }
+    let segment_log = state.effective_log_segment_size();
+    let segment_id = (slot_index >> segment_log) as u16;
+    if !state.is_evicted(segment_id) {
+        return Ok(state.slot(slot_index));
+    }
+
+    if !segment_cache.contains_key(&segment_id) {
+        let Some((stored_log, columns)) = chain
+            .store
+            .get_segment(segment_id)
+            .map_err(|error| error.to_string())?
+        else {
+            return Err(format!(
+                "evicted segment {segment_id} is missing from durable state"
+            ));
+        };
+        if usize::from(stored_log) != segment_log {
+            return Err(format!(
+                "segment {segment_id} depth mismatch: stored {stored_log}, expected {segment_log}"
+            ));
+        }
+        segment_cache.insert(segment_id, columns);
+    }
+
+    let local_mask = (1u32 << segment_log) - 1;
+    let local_index = (slot_index & local_mask) as usize;
+    let columns = &segment_cache[&segment_id];
+    if local_index >= columns.values.len()
+        || local_index >= columns.owners_hi.len()
+        || local_index >= columns.owners_lo.len()
+    {
+        return Err(format!(
+            "segment {segment_id} is too short for local slot {local_index}"
+        ));
+    }
+    Ok(SlotValue {
+        value: columns.values[local_index],
+        owner_hi: columns.owners_hi[local_index],
+        owner_lo: columns.owners_lo[local_index],
+    })
 }
 
 fn history_claim_fields_bytes(
@@ -391,10 +449,12 @@ impl ParanoidApiServer for RpcHandler {
             )));
         }
         use noid_chain::fri_state::SlotValue;
-        let sv = chain.state.state.slot(slot_index);
-        // Compute value independently so the response always reflects the actual FRI state.
-        // Never suppress value based on empty — exposes any inconsistency rather than hiding it.
-        let value = sv.value.0 as u64;
+        let sv = read_canonical_slot(&chain, slot_index, &mut HashMap::new()).map_err(rpc_err)?;
+        // Decode both packed limbs independently so the response always reflects
+        // the actual FRI state. Never suppress them based on `empty` — that would
+        // hide a malformed all-zero-owner/non-zero-value state.
+        let value = sv.amount();
+        let creation_id = sv.creation_id();
         let empty = sv == SlotValue::EMPTY;
         let owner_bytes = {
             let mut b = [0u8; 32];
@@ -411,6 +471,7 @@ impl ParanoidApiServer for RpcHandler {
         Ok(SlotInfo {
             slot_index,
             value,
+            creation_id,
             owner,
             empty,
         })
@@ -536,15 +597,30 @@ impl ParanoidApiServer for RpcHandler {
             .store
             .get_utxos_by_owner(&addr.0)
             .map_err(|e| rpc_err(e.to_string()))?;
-        Ok(utxos
-            .into_iter()
-            .map(|(slot_index, value)| SlotInfo {
+        // The owner index currently stores `(slot_index, amount)` only. Enrich
+        // each hit from canonical state so creation_id is never guessed or
+        // silently reported as zero. Also suppress a stale owner-index entry if
+        // its slot has since changed owner.
+        let mut segment_cache = HashMap::new();
+        let mut result = Vec::with_capacity(utxos.len());
+        for (slot_index, _indexed_value) in utxos {
+            let slot =
+                read_canonical_slot(&chain, slot_index, &mut segment_cache).map_err(rpc_err)?;
+            let mut state_owner = [0u8; 32];
+            state_owner[..16].copy_from_slice(&slot.owner_hi.0.to_le_bytes());
+            state_owner[16..].copy_from_slice(&slot.owner_lo.0.to_le_bytes());
+            if slot.is_empty() || state_owner != addr.0 {
+                continue;
+            }
+            result.push(SlotInfo {
                 slot_index,
-                value,
+                value: slot.amount(),
+                creation_id: slot.creation_id(),
                 owner: address.clone(),
                 empty: false,
-            })
-            .collect())
+            });
+        }
+        Ok(result)
     }
 
     async fn get_tx(&self, txhash: String) -> RpcResult<Option<TxInfo>> {
@@ -901,12 +977,13 @@ impl ParanoidApiServer for RpcHandler {
         .map_err(|e| rpc_err(format!("prove task: {e}")))?
         .map_err(|e| rpc_err(format!("prove_block: {e}")))?;
 
-        // Seal block with nonce = 0. External miner patches bytes [144..160].
+        // Seal block with nonce = 0. External miner patches the advertised
+        // version-aware `nonce_offset` below.
         let sealed = tmpl.seal(0);
         let block_bytes = sealed.to_bytes();
 
-        // nonce_offset inside block bytes = header starts at byte 0.
-        let nonce_offset = BLOCK_HEADER_NONCE_OFFSET;
+        // Serialized blocks carry a version prefix before the semantic header.
+        let nonce_offset = BLOCK_WIRE_NONCE_OFFSET;
 
         let block_proof_hex = hex::encode(&proof_bytes);
         let block_auth_sidecar_hex = hex::encode(&auth_sidecar_bytes);
@@ -1114,9 +1191,21 @@ impl ParanoidApiServer for RpcHandler {
     }
 
     async fn wallet_scan(&self) -> RpcResult<WalletScanResult> {
-        let chain = self.chain.read().await;
+        if !self.wallet.status().exists {
+            return Err(rpc_err("wallet not initialized"));
+        }
+        // `SegmentedFriState::slot` intentionally returns EMPTY for an evicted
+        // segment. A full wallet scan must therefore hydrate durable live
+        // segments first, then rebuild the internal FRI cache. Keep columns
+        // loaded so later ChainView snapshots remain complete.
+        let mut chain = self.chain.write().await;
+        chain
+            .preload_all_evicted_segments()
+            .map_err(|error| rpc_err(error.to_string()))?;
         let height = chain.tip_height();
-        Ok(self.wallet.scan_state(&chain.state.state, height))
+        let result = self.wallet.scan_state(&chain.state.state, height);
+        let _ = chain.state.state.root();
+        Ok(result)
     }
 
     async fn wallet_plan_send(
@@ -1605,8 +1694,7 @@ impl ParanoidApiServer for RpcHandler {
         if source_utxos == 0 {
             return Err(rpc_err(format!("address index {from_index} has no UTXOs")));
         }
-        let planned_inputs =
-            source_utxos.min(noid_tx::TxShape::Sweep25x2.max_inputs());
+        let planned_inputs = source_utxos.min(noid_tx::TxShape::Sweep25x2.max_inputs());
         let effective_fee = if fee_micronoid == 0 {
             noid_chain::consensus::fee_breakdown(
                 planned_inputs as u64,
@@ -1677,7 +1765,13 @@ impl ParanoidApiServer for RpcHandler {
 
             let wallet = Arc::clone(&self.wallet);
             let (intent_bytes, input_slots) = match tokio::task::spawn_blocking(move || {
-                wallet.build_pull(from_index, effective_fee, epoch_anchor, slot_hints, log_slots)
+                wallet.build_pull(
+                    from_index,
+                    effective_fee,
+                    epoch_anchor,
+                    slot_hints,
+                    log_slots,
+                )
             })
             .await
             {
@@ -1845,7 +1939,7 @@ mod tests {
             block_hex: "11".into(),
             block_proof_hex: "22".into(),
             block_auth_sidecar_hex: "33".into(),
-            nonce_offset: 144,
+            nonce_offset: BLOCK_WIRE_NONCE_OFFSET,
             difficulty_target_hex: "ff".into(),
             height: 7,
             n_txs: 3,

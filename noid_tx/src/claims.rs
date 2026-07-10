@@ -12,11 +12,11 @@ use noid_poseidon2b::native::{
 };
 use noid_poseidon2b::primitives::Digest;
 
-use crate::types::{TxInput, TxOutput};
+use crate::types::{pack_amount_creation_id, TxInput, TxOutput};
 
 /// Compute the binding commitment to all claimed slot values.
 ///
-/// Absorbs `(slot_index, value, owner_hi, owner_lo)` for each input
+/// Absorbs `(slot_index, pack(value, creation_id), owner_hi, owner_lo)` for each input
 /// followed by each output into a Poseidon2b sponge under `TAG_CLAIMS`.
 /// Only live (valid=true) entries are included; dummy entries are skipped
 /// to minimize hashing cost without affecting security (the count of
@@ -31,7 +31,7 @@ pub fn compute_claims_commitment(inputs: &[TxInput], outputs: &[TxOutput]) -> Di
 
     for inp in inputs.iter().filter(|i| i.valid) {
         sponge.absorb(Block128::from(inp.slot_index as u128));
-        sponge.absorb(Block128::from(inp.value as u128));
+        sponge.absorb(pack_amount_creation_id(inp.value, inp.creation_id));
         let (hi, lo) = owner_to_fields(&inp.owner.0);
         sponge.absorb(hi);
         sponge.absorb(lo);
@@ -64,6 +64,7 @@ mod tests {
         TxInput {
             slot_index: seed as u32 * 100,
             value: (seed as u64) * 1000,
+            creation_id: 0,
             owner: Address([seed; 32]),
             spend_secret: SpendSecret([seed ^ 0xAA; 32]),
             valid: true,
@@ -96,6 +97,18 @@ mod tests {
 
         let mut tampered = [mk_input(1)];
         tampered[0].value ^= 1;
+        let c2 = compute_claims_commitment(&tampered, &outputs);
+        assert_ne!(c1, c2);
+    }
+
+    #[test]
+    fn tamper_input_creation_id_changes_commitment() {
+        let inputs = [mk_input(1)];
+        let outputs = [mk_output(2)];
+        let c1 = compute_claims_commitment(&inputs, &outputs);
+
+        let mut tampered = [mk_input(1)];
+        tampered[0].creation_id = 1;
         let c2 = compute_claims_commitment(&tampered, &outputs);
         assert_ne!(c1, c2);
     }

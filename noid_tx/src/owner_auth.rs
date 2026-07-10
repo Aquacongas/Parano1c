@@ -171,6 +171,7 @@ mod tests {
         TxInput {
             slot_index: owner as u32,
             value: 10,
+            creation_id: 0,
             owner: Address([owner; 32]),
             spend_secret: SpendSecret([0xEE; 32]),
             valid,

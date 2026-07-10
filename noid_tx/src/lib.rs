@@ -19,7 +19,7 @@ pub mod wire;
 
 pub use body_hash::{hash_tx_body, hash_tx_body_for_shape, validity_bits_for_shape};
 pub use claims::compute_claims_commitment;
-pub use intent::{ClaimedSlot, TxIntent};
+pub use intent::TxIntent;
 pub use owner_auth::{
     canonical_owner_auth, canonical_owner_auth_multi_group, CanonicalOwnerAuth,
     OwnerAuthError, OwnerAuthGroup, MAX_OWNER_AUTH_GROUPS,
@@ -30,7 +30,8 @@ pub use public_logic::{
     PublicLogicFacts,
 };
 pub use types::{
-    Transaction, TxBody, TxInput, TxOutput, TxShape, ANCHOR_DEPTH, MAX_INPUTS, MAX_OUTPUTS,
+    pack_amount_creation_id, unpack_amount_creation_id, Transaction, TxBody, TxInput, TxOutput,
+    TxShape, ANCHOR_DEPTH, MAX_INPUTS, MAX_OUTPUTS,
 };
 pub use wire::{
     WireError, PUBLIC_INPUTS_WIRE_SIZE, TX_INPUT_PUBLIC_WIRE_SIZE, TX_INPUT_WIRE_SIZE,

@@ -274,7 +274,7 @@ fn slot_value(seed: u128) -> SlotValue {
 fn slot_leaf_input(seed: u128) -> SlotLeafInputs {
     let slot = slot_value(seed);
     SlotLeafInputs {
-        amount: slot.value.to_u128() as u64,
+        packed_value: slot.value,
         owner_hi: slot.owner_hi,
         owner_lo: slot.owner_lo,
         expected_leaf: digest_to_fields(slot_leaf_hash(slot)),

@@ -290,15 +290,27 @@ pub const SWEEP_TXBODY_DEPTH: usize = 5;
 
 /// Per-input leaf of the tx-body Merkle tree. Binds the slot index to
 /// the UTXO being spent. Sponge-mode 4-field absorb under IV `LEAF____`:
-/// `hash_leaf([slot_index, value, owner_hi, owner_lo])`.
-pub fn hash_input_leaf(slot_index: u32, value: u64, owner: &Address) -> Digest {
+/// `hash_leaf([slot_index, packed_value, owner_hi, owner_lo])`.
+///
+/// `packed_value` is the transaction layer's `amount || creation_id`
+/// incarnation lane. Keeping it as one field preserves the existing
+/// three-permutation input-leaf schedule.
+pub fn hash_input_leaf_packed(slot_index: u32, packed_value: Block128, owner: &Address) -> Digest {
     let [owner_hi, owner_lo] = owner.as_fields();
     hash_leaf(&[
         Block128::from(slot_index as u128),
-        Block128::from(value as u128),
+        packed_value,
         owner_hi,
         owner_lo,
     ])
+}
+
+/// Legacy `creation_id = 0` input-leaf helper.
+///
+/// This remains the compatibility entry point for callers that do not carry
+/// incarnations. Its output is byte-identical to the pre-incarnation hash.
+pub fn hash_input_leaf(slot_index: u32, value: u64, owner: &Address) -> Digest {
+    hash_input_leaf_packed(slot_index, Block128::from(value as u128), owner)
 }
 
 /// Per-output leaf of the tx-body Merkle tree.
@@ -520,6 +532,19 @@ mod tests {
         assert_eq!(tb, hash_tx_body(&[1u8; 32], 3, &ins, &outs, false, 0));
 
         assert_ne!(tb.0, addr.0);
+    }
+
+    #[test]
+    fn packed_input_leaf_preserves_zero_incarnation_and_binds_nonzero() {
+        let addr = Address([0x6Du8; 32]);
+        let amount = 0x0123_4567_89AB_CDEFu64;
+        let legacy = hash_input_leaf(17, amount, &addr);
+        assert_eq!(
+            legacy,
+            hash_input_leaf_packed(17, Block128::from(amount as u128), &addr)
+        );
+        let incarnated = Block128::from((9u128 << 64) | amount as u128);
+        assert_ne!(legacy, hash_input_leaf_packed(17, incarnated, &addr));
     }
 
     #[test]

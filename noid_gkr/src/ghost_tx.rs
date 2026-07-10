@@ -47,6 +47,7 @@ pub fn ghost_tx_body() -> TxBody {
     inputs[0] = TxInput {
         slot_index: 0,
         value: 1,
+        creation_id: 0,
         owner,
         spend_secret: secret,
         valid: true,
@@ -109,7 +110,11 @@ mod tests {
     fn ghost_body_bitmap_is_seventeen_and_hash_derives_from_it() {
         let body = ghost_tx_body();
         let bits = noid_tx::validity_bits_for_shape(body.shape, &body.inputs, &body.outputs);
-        assert_eq!(bits, 1 | (1 << 4), "ghost bitmap: live input 0 + live output 0");
+        assert_eq!(
+            bits,
+            1 | (1 << 4),
+            "ghost bitmap: live input 0 + live output 0"
+        );
         let recomputed = noid_tx::hash_tx_body_for_shape(
             body.shape,
             &body.epoch_anchor,

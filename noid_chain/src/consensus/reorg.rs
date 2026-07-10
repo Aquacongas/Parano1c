@@ -218,7 +218,6 @@ mod tests {
     };
     use crate::fri_state::SlotValue;
     use crate::state::{apply_tx, ChainState};
-    use noid_core::Block128;
     use noid_poseidon2b::primitives::{Address, SpendSecret};
     use noid_tx::{hash_tx_body_for_shape, Transaction, TxBody, TxInput, TxOutput, TxShape};
     const TEST_TARGET: [u8; 32] = [0xFF; 32];
@@ -279,6 +278,9 @@ mod tests {
         TxInput {
             slot_index: out.slot_index,
             value: out.value,
+            // Funding fixtures mint one output per block into slots 1..N, so
+            // their canonical creation IDs equal their slot indices.
+            creation_id: out.slot_index as u64,
             owner: out.owner,
             spend_secret: SpendSecret([0x55; 32]),
             valid: true,
@@ -397,14 +399,11 @@ mod tests {
     }
 
     fn assert_live_slot(state: &ChainState, out: &TxOutput) {
-        assert_eq!(
-            slot_value(state, out.slot_index),
-            SlotValue {
-                value: Block128::from(out.value as u128),
-                owner_hi: out.owner.as_fields()[0],
-                owner_lo: out.owner.as_fields()[1],
-            }
-        );
+        let actual = slot_value(state, out.slot_index);
+        assert_eq!(actual.amount(), out.value);
+        assert_ne!(actual.creation_id(), 0);
+        assert_eq!(actual.owner_hi, out.owner.as_fields()[0]);
+        assert_eq!(actual.owner_lo, out.owner.as_fields()[1]);
     }
 
     fn assert_empty_slot(state: &ChainState, slot: u32) {

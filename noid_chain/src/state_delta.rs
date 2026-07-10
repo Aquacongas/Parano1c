@@ -22,7 +22,6 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use noid_core::Block128;
 use noid_poseidon2b::primitives::Digest;
 use noid_tx::{compute_claims_commitment, TxBody, TxInput, TxOutput};
 
@@ -139,6 +138,14 @@ pub enum StateDeltaError {
     InputOutputSlotOverlap { tx_index: usize },
     /// A valid input/output references a slot outside the current state domain.
     SlotOutOfRange { tx_index: usize },
+    /// Assigning the next live output's creation ID would overflow the
+    /// consensus allocation counter.
+    AllocationCounterOverflow {
+        tx_index: usize,
+        output_index: usize,
+    },
+    /// The compact action counters cannot represent the supplied body list.
+    ActionCountOverflow,
 }
 
 /// Build the canonical ordered state-delta action surface without mutating state
@@ -152,6 +159,7 @@ pub fn build_state_delta_action_surface(
     state: &SegmentedFriState,
     bodies: &[TxBody],
     expected_commitments: &[Digest],
+    parent_alloc_counter: u64,
 ) -> Result<StateDeltaActionSurface, StateDeltaError> {
     assert_eq!(
         bodies.len(),
@@ -164,6 +172,7 @@ pub fn build_state_delta_action_surface(
     let mut actions = Vec::new();
     let mut spends = 0u32;
     let mut mints = 0u32;
+    let mut alloc_counter = parent_alloc_counter;
 
     for (tx_idx, body) in bodies.iter().enumerate() {
         check_tx_slot_shape(body, tx_idx)?;
@@ -202,7 +211,9 @@ pub fn build_state_delta_action_surface(
                 kind: StateDeltaActionKind::Spend,
             });
             overlay.insert(input.slot_index, post);
-            spends = spends.saturating_add(1);
+            spends = spends
+                .checked_add(1)
+                .ok_or(StateDeltaError::ActionCountOverflow)?;
         }
 
         for (j, output) in body.outputs.iter().enumerate() {
@@ -217,13 +228,20 @@ pub fn build_state_delta_action_surface(
                 .get(&output.slot_index)
                 .copied()
                 .unwrap_or_else(|| state.slot(output.slot_index));
-            let post = slot_value_from_output(output);
             if pre != SlotValue::EMPTY {
                 return Err(StateDeltaError::OutputSlotOccupied {
                     tx_index: tx_idx,
                     output_index: j,
                 });
             }
+            let creation_id =
+                alloc_counter
+                    .checked_add(1)
+                    .ok_or(StateDeltaError::AllocationCounterOverflow {
+                        tx_index: tx_idx,
+                        output_index: j,
+                    })?;
+            let post = slot_value_from_output(output, creation_id);
 
             actions.push(StateDeltaAction {
                 tx_index: tx_idx as u32,
@@ -234,7 +252,10 @@ pub fn build_state_delta_action_surface(
                 kind: StateDeltaActionKind::Mint,
             });
             overlay.insert(output.slot_index, post);
-            mints = mints.saturating_add(1);
+            mints = mints
+                .checked_add(1)
+                .ok_or(StateDeltaError::ActionCountOverflow)?;
+            alloc_counter = creation_id;
         }
     }
 
@@ -250,8 +271,14 @@ pub fn build_exact_action_surface(
     state: &SegmentedFriState,
     bodies: &[TxBody],
     expected_commitments: &[Digest],
+    parent_alloc_counter: u64,
 ) -> Result<ExactActionSurface, StateDeltaError> {
-    let surface = build_state_delta_action_surface(state, bodies, expected_commitments)?;
+    let surface = build_state_delta_action_surface(
+        state,
+        bodies,
+        expected_commitments,
+        parent_alloc_counter,
+    )?;
     Ok(exact_action_surface_from_surface(surface))
 }
 
@@ -299,10 +326,16 @@ pub fn build_state_delta_witness(
     state: &mut SegmentedFriState,
     bodies: &[TxBody],
     expected_commitments: &[Digest],
+    parent_alloc_counter: u64,
 ) -> Result<StateDeltaWitness, StateDeltaError> {
     let mut snap = state.clone();
     let prev_state_root = snap.root();
-    let surface = build_state_delta_action_surface(&snap, bodies, expected_commitments)?;
+    let surface = build_state_delta_action_surface(
+        &snap,
+        bodies,
+        expected_commitments,
+        parent_alloc_counter,
+    )?;
 
     let deltas: Vec<_> = surface
         .actions
@@ -347,22 +380,12 @@ fn check_tx_slot_shape(body: &TxBody, tx_idx: usize) -> Result<(), StateDeltaErr
 
 #[inline]
 fn slot_value_from_input(input: &TxInput) -> SlotValue {
-    let [owner_hi, owner_lo] = input.owner.as_fields();
-    SlotValue {
-        value: Block128::from(input.value as u128),
-        owner_hi,
-        owner_lo,
-    }
+    SlotValue::with_owner_fields(input.value, input.creation_id, input.owner.as_fields())
 }
 
 #[inline]
-fn slot_value_from_output(output: &TxOutput) -> SlotValue {
-    let [owner_hi, owner_lo] = output.owner.as_fields();
-    SlotValue {
-        value: Block128::from(output.value as u128),
-        owner_hi,
-        owner_lo,
-    }
+fn slot_value_from_output(output: &TxOutput, creation_id: u64) -> SlotValue {
+    SlotValue::with_owner_fields(output.value, creation_id, output.owner.as_fields())
 }
 
 #[cfg(test)]
@@ -383,9 +406,14 @@ mod tests {
     }
 
     fn mk_input(slot: u32, value: u64, owner: Address) -> TxInput {
+        mk_input_with_id(slot, value, 0, owner)
+    }
+
+    fn mk_input_with_id(slot: u32, value: u64, creation_id: u64, owner: Address) -> TxInput {
         TxInput {
             slot_index: slot,
             value,
+            creation_id,
             owner,
             spend_secret: SpendSecret([0xA0; 32]),
             valid: true,
@@ -421,7 +449,10 @@ mod tests {
 
     fn seed_slot(state: &mut SegmentedFriState, slot: u32, value: u64, owner: Address) {
         state
-            .set_slot(slot, slot_value_from_output(&mk_output(slot, value, owner)))
+            .set_slot(
+                slot,
+                slot_value_from_output(&mk_output(slot, value, owner), 0),
+            )
             .unwrap();
     }
 
@@ -443,7 +474,7 @@ mod tests {
         let bodies = vec![tx0, tx1];
         let cs = commitments(&bodies);
 
-        let witness = build_state_delta_witness(&mut state, &bodies, &cs).unwrap();
+        let witness = build_state_delta_witness(&mut state, &bodies, &cs, 0).unwrap();
 
         assert_eq!(witness.spends, 2);
         assert_eq!(witness.mints, 2);
@@ -463,11 +494,11 @@ mod tests {
         assert_eq!(state.slot(2), SlotValue::EMPTY);
         assert_eq!(
             state.slot(5),
-            slot_value_from_output(&mk_output(5, 450, carol))
+            slot_value_from_output(&mk_output(5, 450, carol), 1)
         );
         assert_eq!(
             state.slot(6),
-            slot_value_from_output(&mk_output(6, 650, dave))
+            slot_value_from_output(&mk_output(6, 650, dave), 2)
         );
         assert_eq!(witness.post_state_root, state.root());
     }
@@ -480,13 +511,13 @@ mod tests {
 
         let tx0 = body(vec![], vec![mk_output(10, 123, alice)]);
         let tx1 = body(
-            vec![mk_input(10, 123, alice)],
+            vec![mk_input_with_id(10, 123, 1, alice)],
             vec![mk_output(11, 100, bob)],
         );
         let bodies = vec![tx0, tx1];
         let cs = commitments(&bodies);
 
-        let witness = build_state_delta_witness(&mut state, &bodies, &cs).unwrap();
+        let witness = build_state_delta_witness(&mut state, &bodies, &cs, 0).unwrap();
 
         assert_eq!(witness.spends, 1);
         assert_eq!(witness.mints, 2);
@@ -494,8 +525,41 @@ mod tests {
         assert_eq!(state.slot(10), SlotValue::EMPTY);
         assert_eq!(
             state.slot(11),
-            slot_value_from_output(&mk_output(11, 100, bob))
+            slot_value_from_output(&mk_output(11, 100, bob), 2)
         );
+    }
+
+    #[test]
+    fn parent_counter_assigns_canonical_output_prefix_ids() {
+        let state = fresh_segmented();
+        let alice = owner(0x11);
+        let bob = owner(0x22);
+        let bodies = vec![
+            body(vec![], vec![mk_output(10, 123, alice)]),
+            body(vec![], vec![mk_output(11, 456, bob)]),
+        ];
+        let cs = commitments(&bodies);
+
+        let surface = build_state_delta_action_surface(&state, &bodies, &cs, 41).unwrap();
+        assert_eq!(surface.actions[0].post.creation_id(), 42);
+        assert_eq!(surface.actions[1].post.creation_id(), 43);
+    }
+
+    #[test]
+    fn allocation_counter_overflow_rejects_before_mutation() {
+        let mut state = fresh_segmented();
+        let body = body(vec![], vec![mk_output(10, 123, owner(0x11))]);
+        let cs = commitments(std::slice::from_ref(&body));
+        let before = state.root();
+
+        assert_eq!(
+            build_state_delta_witness(&mut state, &[body], &cs, u64::MAX),
+            Err(StateDeltaError::AllocationCounterOverflow {
+                tx_index: 0,
+                output_index: 0,
+            })
+        );
+        assert_eq!(state.root(), before);
     }
 
     #[test]
@@ -513,7 +577,7 @@ mod tests {
         let cs = commitments(&bodies);
         let before = state.root();
 
-        let err = build_state_delta_witness(&mut state, &bodies, &cs).unwrap_err();
+        let err = build_state_delta_witness(&mut state, &bodies, &cs, 0).unwrap_err();
 
         assert_eq!(
             err,
@@ -536,7 +600,7 @@ mod tests {
         let bodies = vec![tx0, tx1];
         let cs = commitments(&bodies);
 
-        let err = build_state_delta_witness(&mut state, &bodies, &cs).unwrap_err();
+        let err = build_state_delta_witness(&mut state, &bodies, &cs, 0).unwrap_err();
 
         assert_eq!(
             err,
@@ -560,7 +624,7 @@ mod tests {
         let bodies = vec![tx];
         let cs = commitments(&bodies);
 
-        let err = build_state_delta_witness(&mut state, &bodies, &cs).unwrap_err();
+        let err = build_state_delta_witness(&mut state, &bodies, &cs, 0).unwrap_err();
 
         assert_eq!(err, StateDeltaError::DuplicateInputSlot { tx_index: 0 });
     }
@@ -577,7 +641,7 @@ mod tests {
         let bodies = vec![tx];
         let cs = commitments(&bodies);
 
-        let err = build_state_delta_witness(&mut state, &bodies, &cs).unwrap_err();
+        let err = build_state_delta_witness(&mut state, &bodies, &cs, 0).unwrap_err();
 
         assert_eq!(err, StateDeltaError::DuplicateOutputSlot { tx_index: 0 });
     }
@@ -595,7 +659,7 @@ mod tests {
         let bodies = vec![tx];
         let cs = commitments(&bodies);
 
-        let err = build_state_delta_witness(&mut state, &bodies, &cs).unwrap_err();
+        let err = build_state_delta_witness(&mut state, &bodies, &cs, 0).unwrap_err();
 
         assert_eq!(err, StateDeltaError::InputOutputSlotOverlap { tx_index: 0 });
     }
@@ -610,7 +674,7 @@ mod tests {
         let bodies = vec![tx];
         let cs = commitments(&bodies);
 
-        let err = build_state_delta_witness(&mut state, &bodies, &cs).unwrap_err();
+        let err = build_state_delta_witness(&mut state, &bodies, &cs, 0).unwrap_err();
 
         assert_eq!(
             err,
@@ -631,7 +695,7 @@ mod tests {
         let bodies = vec![tx];
         let cs = commitments(&bodies);
 
-        let err = build_state_delta_witness(&mut state, &bodies, &cs).unwrap_err();
+        let err = build_state_delta_witness(&mut state, &bodies, &cs, 0).unwrap_err();
 
         assert_eq!(
             err,
@@ -649,7 +713,7 @@ mod tests {
         let mut cs = commitments(std::slice::from_ref(&tx));
         cs[0][0] ^= 1;
 
-        let err = build_state_delta_witness(&mut state, &[tx], &cs).unwrap_err();
+        let err = build_state_delta_witness(&mut state, &[tx], &cs, 0).unwrap_err();
 
         assert_eq!(
             err,
@@ -667,18 +731,21 @@ mod tests {
         seed_slot(&mut segmented, 1, 500, alice);
 
         let tx0 = body(vec![mk_input(1, 500, alice)], vec![mk_output(5, 450, bob)]);
-        let tx1 = body(vec![mk_input(5, 450, bob)], vec![mk_output(6, 400, carol)]);
+        let tx1 = body(
+            vec![mk_input_with_id(5, 450, 1, bob)],
+            vec![mk_output(6, 400, carol)],
+        );
         let bodies = vec![tx0, tx1];
         let cs = commitments(&bodies);
 
         let mut state_for_root = segmented.clone();
         let before_root = state_for_root.root();
-        let surface = build_state_delta_action_surface(&segmented, &bodies, &cs).unwrap();
+        let surface = build_state_delta_action_surface(&segmented, &bodies, &cs, 0).unwrap();
         let mut state_after_surface = segmented.clone();
         assert_eq!(state_after_surface.root(), before_root);
 
         let mut witness_state = segmented;
-        let witness = build_state_delta_witness(&mut witness_state, &bodies, &cs).unwrap();
+        let witness = build_state_delta_witness(&mut witness_state, &bodies, &cs, 0).unwrap();
 
         assert_eq!(surface.actions, witness.actions);
         assert_eq!(surface.spends, witness.spends);
@@ -696,16 +763,19 @@ mod tests {
         seed_slot(&mut segmented, 1, 500, alice);
 
         let tx0 = body(vec![mk_input(1, 500, alice)], vec![mk_output(5, 450, bob)]);
-        let tx1 = body(vec![mk_input(5, 450, bob)], vec![mk_output(6, 400, carol)]);
+        let tx1 = body(
+            vec![mk_input_with_id(5, 450, 1, bob)],
+            vec![mk_output(6, 400, carol)],
+        );
         let bodies = vec![tx0, tx1];
         let cs = commitments(&bodies);
 
-        let exact = build_exact_action_surface(&segmented, &bodies, &cs).unwrap();
+        let exact = build_exact_action_surface(&segmented, &bodies, &cs, 0).unwrap();
 
         assert_eq!(exact.touched_indices, vec![1, 5, 6]);
         assert_eq!(
             exact.old_slots[0],
-            slot_value_from_output(&mk_output(1, 500, alice))
+            slot_value_from_output(&mk_output(1, 500, alice), 0)
         );
         assert_eq!(exact.new_slots[0], SlotValue::EMPTY);
         assert_eq!(exact.old_slots[1], SlotValue::EMPTY);
@@ -713,7 +783,7 @@ mod tests {
         assert_eq!(exact.old_slots[2], SlotValue::EMPTY);
         assert_eq!(
             exact.new_slots[2],
-            slot_value_from_output(&mk_output(6, 400, carol))
+            slot_value_from_output(&mk_output(6, 400, carol), 2)
         );
         assert_eq!(exact.spent_slots, vec![1, 5]);
         assert_eq!(exact.spends, 2);
@@ -726,11 +796,11 @@ mod tests {
 
         let segmented = fresh_segmented();
         let tx0 = body(vec![], vec![mk_output(10, 123, alice)]);
-        let tx1 = body(vec![mk_input(10, 123, alice)], vec![]);
+        let tx1 = body(vec![mk_input_with_id(10, 123, 1, alice)], vec![]);
         let bodies = vec![tx0, tx1];
         let cs = commitments(&bodies);
 
-        let exact = build_exact_action_surface(&segmented, &bodies, &cs).unwrap();
+        let exact = build_exact_action_surface(&segmented, &bodies, &cs, 0).unwrap();
 
         assert_eq!(exact.spends, 1);
         assert_eq!(exact.mints, 1);
@@ -745,7 +815,7 @@ mod tests {
         assert_eq!(exact.actions[0].pre, SlotValue::EMPTY);
         assert_eq!(
             exact.actions[0].post,
-            slot_value_from_output(&mk_output(10, 123, alice))
+            slot_value_from_output(&mk_output(10, 123, alice), 1)
         );
         assert_eq!(exact.actions[1].kind, StateDeltaActionKind::Spend);
         assert_eq!(exact.actions[1].tx_index, 1);
@@ -773,7 +843,7 @@ mod tests {
         let cs = commitments(&bodies);
 
         let mut delta_state = segmented.clone();
-        let delta = build_state_delta_witness(&mut delta_state, &bodies, &cs).unwrap();
+        let delta = build_state_delta_witness(&mut delta_state, &bodies, &cs, 0).unwrap();
 
         let mut chain = ChainState::with_log_slots(TEST_LOG_SLOTS);
         chain.state = segmented;

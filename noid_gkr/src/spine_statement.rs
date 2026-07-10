@@ -5,7 +5,7 @@
 
 use noid_core::{Block128, TowerField};
 use noid_poseidon2b::primitives::{fee_leaf, is_coinbase_leaf, Digest};
-use noid_tx::{TxBody, TxInput, TxOutput, TxShape};
+use noid_tx::{pack_amount_creation_id, TxBody, TxInput, TxOutput, TxShape};
 
 use crate::SpineInputs;
 
@@ -61,7 +61,7 @@ pub fn spine_inputs_from_body(body: &TxBody) -> Result<SpineInputs, SpineStateme
         let [owner_hi, owner_lo] = inp.owner.as_fields();
         *leaf = [
             Block128::from(inp.slot_index as u128),
-            Block128::from(inp.value as u128),
+            pack_amount_creation_id(inp.value, inp.creation_id),
             owner_hi,
             owner_lo,
         ];
@@ -100,7 +100,8 @@ mod tests {
     use crate::{compute_tx_body_hash, SpineCircuit};
     use noid_core::CanonicalSerialize;
     use noid_poseidon2b::primitives::{
-        derive_address, hash_input_leaf, hash_output_leaf, hash_tx_body, SpendSecret,
+        derive_address, hash_input_leaf, hash_input_leaf_packed, hash_output_leaf, hash_tx_body,
+        SpendSecret,
     };
     use noid_tx::{TxInput, TxOutput};
 
@@ -121,6 +122,7 @@ mod tests {
             inputs: vec![TxInput {
                 slot_index: 11,
                 value: 50,
+                creation_id: 29,
                 owner: derive_address(&secret),
                 spend_secret: secret.clone(),
                 valid: true,
@@ -134,26 +136,55 @@ mod tests {
             is_coinbase: false,
         };
 
-        let inputs = spine_inputs_from_body(&body).expect("standard statement");
-        let got = digest_fields_to_bytes(compute_tx_body_hash(&SpineCircuit::build(), &inputs));
-        let mut input_leaf_hashes = [[0u8; 32]; 4];
-        for (i, leaf) in input_leaf_hashes.iter_mut().enumerate() {
-            let input = body.inputs.get(i).cloned().unwrap_or_else(TxInput::dummy);
-            *leaf = hash_input_leaf(input.slot_index, input.value, &input.owner);
-        }
-        let mut output_leaf_hashes = [[0u8; 32]; 8];
-        for (i, leaf) in output_leaf_hashes.iter_mut().enumerate() {
-            let output = body.outputs.get(i).copied().unwrap_or_else(TxOutput::dummy);
-            *leaf = hash_output_leaf(output.slot_index, output.value, &output.owner);
-        }
-        let native = hash_tx_body(
-            &body.epoch_anchor,
-            body.fee,
-            &input_leaf_hashes,
-            &output_leaf_hashes,
-            body.is_coinbase,
-            noid_tx::validity_bits_for_shape(body.shape, &body.inputs, &body.outputs),
+        let circuit = SpineCircuit::build();
+        assert_eq!(
+            circuit.slots.len(),
+            59,
+            "incarnations must not grow the spine"
         );
-        assert_eq!(got, native.0);
+
+        let mut hashes = Vec::new();
+        for creation_id in [0, 29] {
+            let mut body = body.clone();
+            body.inputs[0].creation_id = creation_id;
+            let inputs = spine_inputs_from_body(&body).expect("standard statement");
+            let got = digest_fields_to_bytes(compute_tx_body_hash(&circuit, &inputs));
+            let mut input_leaf_hashes = [[0u8; 32]; 4];
+            for (i, leaf) in input_leaf_hashes.iter_mut().enumerate() {
+                let input = body.inputs.get(i).cloned().unwrap_or_else(TxInput::dummy);
+                *leaf = hash_input_leaf_packed(
+                    input.slot_index,
+                    pack_amount_creation_id(input.value, input.creation_id),
+                    &input.owner,
+                );
+            }
+            if creation_id == 0 {
+                assert_eq!(
+                    input_leaf_hashes[0],
+                    hash_input_leaf(
+                        body.inputs[0].slot_index,
+                        body.inputs[0].value,
+                        &body.inputs[0].owner,
+                    ),
+                    "creation_id=0 must preserve the legacy leaf"
+                );
+            }
+            let mut output_leaf_hashes = [[0u8; 32]; 8];
+            for (i, leaf) in output_leaf_hashes.iter_mut().enumerate() {
+                let output = body.outputs.get(i).copied().unwrap_or_else(TxOutput::dummy);
+                *leaf = hash_output_leaf(output.slot_index, output.value, &output.owner);
+            }
+            let native = hash_tx_body(
+                &body.epoch_anchor,
+                body.fee,
+                &input_leaf_hashes,
+                &output_leaf_hashes,
+                body.is_coinbase,
+                noid_tx::validity_bits_for_shape(body.shape, &body.inputs, &body.outputs),
+            );
+            assert_eq!(got, native.0);
+            hashes.push(got);
+        }
+        assert_ne!(hashes[0], hashes[1], "nonzero creation_id must be bound");
     }
 }

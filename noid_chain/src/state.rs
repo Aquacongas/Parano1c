@@ -18,7 +18,6 @@
 
 use std::collections::HashSet;
 
-use noid_core::Block128;
 use noid_poseidon2b::primitives::Digest;
 use noid_tx::{TxBody, TxInput, TxOutput};
 
@@ -35,9 +34,9 @@ use crate::sparse_merkle::{SparseMerkleCache, SparseMerkleError};
 /// The wallet picks each output's `slot_index` and binds it into the
 /// body hash. The chain only *verifies* that the chosen slot is
 /// currently empty and that the outputs of a single tx don't collide.
-/// `alloc_counter` is retained as a seed for the splitmix64-based
-/// wallet hint generator; it does not
-/// influence `apply_tx` outcomes.
+/// `alloc_counter` assigns the globally monotone `creation_id` packed into
+/// every newly minted UTXO. It is also the seed for splitmix64-based wallet
+/// slot hints and is therefore consensus-significant on both paths.
 #[derive(Debug, Clone)]
 pub struct ChainState {
     /// Segmented raw UTXO state (2^16 slots per segment).
@@ -50,9 +49,9 @@ pub struct ChainState {
     /// on deactivation. This is the consensus-significant occupancy
     /// signal for the `log_slots` expansion trigger (see
     pub active_slot_count: u64,
-    /// Monotone counter incremented on each successful allocation.
-    /// Used only as a seed source for deterministic wallet slot-hint
-    /// generation. Consensus-significant.
+    /// Monotone counter incremented on each successful allocation. The next
+    /// live output stores `creation_id = alloc_counter + 1`; the updated value
+    /// also seeds deterministic wallet slot hints.
     pub alloc_counter: u64,
 }
 
@@ -61,6 +60,11 @@ pub enum SparseUtxoBuildError {
     SlotOutOfRange,
     DuplicateSlot(u32),
     EmptySlot(u32),
+    CreationIdExceedsAllocCounter {
+        slot_index: u32,
+        creation_id: u64,
+        alloc_counter: u64,
+    },
     State(StateError),
     ExactHash(ExactStateHashError),
     SparseMerkle(SparseMerkleError),
@@ -112,6 +116,7 @@ impl ChainState {
     pub fn from_sparse_utxos(
         log_slots: usize,
         slots: &[(u32, SlotValue)],
+        alloc_counter: u64,
     ) -> Result<Self, SparseUtxoBuildError> {
         let mut seen = HashSet::with_capacity(slots.len());
         let max_slots = 1u64
@@ -128,6 +133,13 @@ impl ChainState {
             if slot.is_empty() {
                 return Err(SparseUtxoBuildError::EmptySlot(index));
             }
+            if slot.creation_id() > alloc_counter {
+                return Err(SparseUtxoBuildError::CreationIdExceedsAllocCounter {
+                    slot_index: index,
+                    creation_id: slot.creation_id(),
+                    alloc_counter,
+                });
+            }
             leaves.push((
                 index,
                 slot_leaf_hash_checked(slot).map_err(SparseUtxoBuildError::ExactHash)?,
@@ -143,6 +155,10 @@ impl ChainState {
             .map_err(SparseUtxoBuildError::SparseMerkle)?;
         state.utxo_root = cache.root();
         state.active_slot_count = slots.len() as u64;
+        // The highest historical creation ID may already have been spent, so
+        // it cannot be reconstructed from the live sparse set. Callers must
+        // supply the trusted header/checkpoint counter explicitly.
+        state.alloc_counter = alloc_counter;
         Ok(state)
     }
 
@@ -288,6 +304,13 @@ pub enum ApplyError {
     /// allowed after a slot is freed, but not inside the same transaction: the
     /// exact transition surface requires output slots to be empty before the tx.
     InputOutputSlotOverlap,
+    /// A live spend was attempted while the occupancy counter was already
+    /// zero. Consensus code must fail closed instead of panicking or wrapping.
+    ActiveSlotCountUnderflow,
+    /// Minting a live output would overflow the occupancy counter.
+    ActiveSlotCountOverflow,
+    /// No fresh non-zero creation ID can be assigned to the next live output.
+    AllocCounterOverflow,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -370,11 +393,8 @@ fn spend_input(state: &mut ChainState, input: &TxInput) -> Result<(), ApplyError
     if (input.slot_index as u64) >= state.state.num_slots() {
         return Err(ApplyError::SlotOutOfRange);
     }
-    let expected = SlotValue {
-        value: Block128::from(input.value as u128),
-        owner_hi: input.owner.as_fields()[0],
-        owner_lo: input.owner.as_fields()[1],
-    };
+    let expected =
+        SlotValue::with_owner_fields(input.value, input.creation_id, input.owner.as_fields());
     let current = state.state.slot(input.slot_index);
     if current != expected {
         return Err(ApplyError::UnknownOrSpentInput);
@@ -386,7 +406,7 @@ fn spend_input(state: &mut ChainState, input: &TxInput) -> Result<(), ApplyError
     state.active_slot_count = state
         .active_slot_count
         .checked_sub(1)
-        .expect("spending a live slot cannot drop active count below zero");
+        .ok_or(ApplyError::ActiveSlotCountUnderflow)?;
     Ok(())
 }
 
@@ -399,17 +419,21 @@ fn insert_output(state: &mut ChainState, out: &TxOutput) -> Result<(), ApplyErro
     if state.state.slot(idx) != SlotValue::EMPTY {
         return Err(ApplyError::OutputSlotNotEmpty);
     }
-    let slot = SlotValue {
-        value: Block128::from(out.value as u128),
-        owner_hi: out.owner.as_fields()[0],
-        owner_lo: out.owner.as_fields()[1],
-    };
+    let creation_id = state
+        .alloc_counter
+        .checked_add(1)
+        .ok_or(ApplyError::AllocCounterOverflow)?;
+    let active_slot_count = state
+        .active_slot_count
+        .checked_add(1)
+        .ok_or(ApplyError::ActiveSlotCountOverflow)?;
+    let slot = SlotValue::with_owner_fields(out.value, creation_id, out.owner.as_fields());
     state
         .state
         .apply_delta_unrooted(&[(idx, slot)])
         .expect("bounds checked above");
-    state.active_slot_count += 1;
-    state.alloc_counter += 1;
+    state.active_slot_count = active_slot_count;
+    state.alloc_counter = creation_id;
     Ok(())
 }
 
@@ -444,6 +468,7 @@ mod tests {
         TxInput {
             slot_index,
             value: out.value,
+            creation_id: 1,
             owner: out.owner,
             spend_secret: SpendSecret([0u8; 32]),
             valid: true,
@@ -476,6 +501,8 @@ mod tests {
         assert_eq!(out.new_state_root, state.state_root());
         assert_eq!(state.active_slot_count, 2);
         assert_eq!(state.alloc_counter, 2);
+        assert_eq!(state.state.slot(1).creation_id(), 1);
+        assert_eq!(state.state.slot(2).creation_id(), 2);
     }
 
     #[test]
@@ -638,5 +665,49 @@ mod tests {
             apply_tx(&mut state, &body_with(0, vec![bogus], vec![])),
             Err(ApplyError::UnknownOrSpentInput)
         );
+    }
+
+    #[test]
+    fn stale_creation_id_rejects_even_when_amount_and_owner_match() {
+        let mut state = fresh();
+        let real = mk_output(5);
+        apply_tx(&mut state, &body_with(0, vec![], vec![real])).unwrap();
+
+        let mut stale = mk_input_for(real.slot_index, &real);
+        stale.creation_id = 0;
+        assert_eq!(
+            apply_tx(&mut state, &body_with(0, vec![stale], vec![])),
+            Err(ApplyError::UnknownOrSpentInput)
+        );
+        assert_eq!(state.state.slot(real.slot_index).creation_id(), 1);
+    }
+
+    #[test]
+    fn allocation_counter_overflow_is_atomic() {
+        let mut state = fresh();
+        state.alloc_counter = u64::MAX;
+        let before = state.state_root();
+
+        assert_eq!(
+            apply_tx(&mut state, &body_with(0, vec![], vec![mk_output(1)])),
+            Err(ApplyError::AllocCounterOverflow)
+        );
+        assert_eq!(state.state_root(), before);
+        assert_eq!(state.active_slot_count, 0);
+        assert_eq!(state.alloc_counter, u64::MAX);
+    }
+
+    #[test]
+    fn sparse_constructor_rejects_creation_id_above_trusted_counter() {
+        let owner = Address([0x44; 32]);
+        let slot = SlotValue::with_owner_fields(100, 2, owner.as_fields());
+        assert!(matches!(
+            ChainState::from_sparse_utxos(TEST_LOG_SLOTS, &[(7, slot)], 1),
+            Err(SparseUtxoBuildError::CreationIdExceedsAllocCounter {
+                slot_index: 7,
+                creation_id: 2,
+                alloc_counter: 1,
+            })
+        ));
     }
 }

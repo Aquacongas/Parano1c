@@ -1,37 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! No-refreeze semantic gate for replacing the branch-local ReuseGuard with
-//! alloc-counter UTXO incarnations.
+//! Regression gate for the packed alloc-counter UTXO incarnation scheme.
 //!
-//! This deliberately does not change consensus types. It locks the two facts
-//! the production implementation relies on: the incarnation fits in the
-//! existing value lane without changing either hash schedule, and a canonical
-//! counter increment makes a stale input fail after physical-slot reuse.
+//! It locks the two design facts the production implementation relies on: the
+//! incarnation fits in the existing value lane without changing either hash
+//! schedule, and a canonical checked counter increment makes a stale input fail
+//! after physical-slot reuse.
 
 use noid_chain::exact_state_hash::slot_leaf_hash;
 use noid_chain::SlotValue;
 use noid_core::Block128;
 use noid_poseidon2b::native::compression::Poseidon2bSponge;
 use noid_poseidon2b::native::domain::{capacity_iv, TAG_EXSTSLT};
-use noid_poseidon2b::primitives::{hash_input_leaf, hash_leaf, Address};
-
-fn pack_value(amount: u64, creation_id: u64) -> Block128 {
-    Block128::from(((creation_id as u128) << 64) | amount as u128)
-}
-
-fn unpack_value(value: Block128) -> (u64, u64) {
-    let packed = value.0;
-    (packed as u64, (packed >> 64) as u64)
-}
+use noid_poseidon2b::primitives::{hash_input_leaf, hash_input_leaf_packed, Address};
+use noid_tx::{pack_amount_creation_id, unpack_amount_creation_id};
 
 fn incarnation_slot(amount: u64, creation_id: u64, owner: Address) -> SlotValue {
-    let [owner_hi, owner_lo] = owner.as_fields();
-    SlotValue {
-        value: pack_value(amount, creation_id),
-        owner_hi,
-        owner_lo,
-    }
+    SlotValue::with_owner_fields(amount, creation_id, owner.as_fields())
 }
 
 fn incarnation_input_leaf(
@@ -40,13 +26,11 @@ fn incarnation_input_leaf(
     creation_id: u64,
     owner: Address,
 ) -> [u8; 32] {
-    let [owner_hi, owner_lo] = owner.as_fields();
-    hash_leaf(&[
-        Block128::from(slot_index as u128),
-        pack_value(amount, creation_id),
-        owner_hi,
-        owner_lo,
-    ])
+    hash_input_leaf_packed(
+        slot_index,
+        pack_amount_creation_id(amount, creation_id),
+        &owner,
+    )
 }
 
 fn incarnation_exact_leaf(slot: SlotValue) -> [u8; 32] {
@@ -99,8 +83,8 @@ fn packed_incarnation_keeps_existing_hash_schedules() {
         incarnation_input_leaf(slot_index, amount, 7, owner),
         hash_input_leaf(slot_index, amount, &owner)
     );
-    assert_eq!(unpack_value(live.value), (amount, 7));
-    assert_eq!(pack_value(0, 0), Block128::from(0u128));
+    assert_eq!(unpack_amount_creation_id(live.value), (amount, 7));
+    assert_eq!(pack_amount_creation_id(0, 0), Block128::from(0u128));
 }
 
 #[test]

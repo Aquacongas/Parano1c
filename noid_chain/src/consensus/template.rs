@@ -184,6 +184,18 @@ pub fn build_block_template(
     if should_expand {
         selection_scratch.state.expand();
     }
+    // Selection executes users before their fee-dependent coinbase is known.
+    // Reserve the coinbase's canonical first creation ID so user outputs get
+    // exactly the same IDs here as in the final coinbase -> users replay.
+    selection_scratch.alloc_counter =
+        selection_scratch
+            .alloc_counter
+            .checked_add(1)
+            .ok_or_else(|| {
+                TemplateBuildError::StateApplyError(
+                    "alloc_counter exhausted while reserving coinbase creation ID".into(),
+                )
+            })?;
 
     let mut applied_winners: Vec<Transaction> = Vec::new();
     let mut guard_actions = ReuseGuardActionState::default();
@@ -335,6 +347,7 @@ pub fn build_block_template(
         &exact_parent_state,
         &exact_bodies,
         &exact_commitments,
+        state.alloc_counter,
     )
     .map_err(|e| TemplateBuildError::StateApplyError(format!("{:?}", e)))?;
     crate::block::advance_reuse_state(&mut scratch, parent.height + 1, &exact_surface.spent_slots)
@@ -355,10 +368,12 @@ pub fn build_block_template(
             // `compute_tx_root` (the winners are user txs; the coinbase is
             // the one non-user leaf).
             let (standard, sweep) =
-                ordered_winners.iter().fold((0usize, 0usize), |(s, w), tx| match tx.body.shape {
-                    noid_tx::TxShape::Standard4x8 => (s + 1, w),
-                    noid_tx::TxShape::Sweep25x2 => (s, w + 1),
-                });
+                ordered_winners
+                    .iter()
+                    .fold((0usize, 0usize), |(s, w), tx| match tx.body.shape {
+                        noid_tx::TxShape::Standard4x8 => (s + 1, w),
+                        noid_tx::TxShape::Sweep25x2 => (s, w + 1),
+                    });
             let n = crate::consensus::params::tx_tree_target(standard, sweep, 1);
             let mut layer = Vec::with_capacity(n);
             layer.extend_from_slice(&tx_hashes_for_root);
@@ -402,7 +417,6 @@ mod tests {
     };
     use crate::fri_state::SlotValue;
     use crate::state::ChainState;
-    use noid_core::Block128;
     use noid_poseidon2b::primitives::{Address, SpendSecret};
     use noid_tx::{hash_tx_body, Transaction, TxBody, TxInput, TxOutput};
 
@@ -512,14 +526,7 @@ mod tests {
         let mut state = fresh_state();
         state
             .state
-            .set_slot(
-                3,
-                SlotValue {
-                    value: Block128::from(100_000u128),
-                    owner_hi,
-                    owner_lo,
-                },
-            )
+            .set_slot(3, SlotValue::from_parts(100_000, 1, owner_hi, owner_lo))
             .unwrap();
         state.active_slot_count = 1;
         state.alloc_counter = 1;
@@ -533,6 +540,7 @@ mod tests {
         let input = TxInput {
             slot_index: 3,
             value: 100_000,
+            creation_id: 1,
             owner,
             spend_secret: SpendSecret([0x22; 32]),
             valid: true,
@@ -569,6 +577,20 @@ mod tests {
         let mut expected = state.clone();
         crate::state::apply_tx(&mut expected, &tmpl.coinbase.body).unwrap();
         crate::state::apply_tx(&mut expected, &tx.body).unwrap();
+        assert_eq!(
+            expected
+                .state
+                .slot(tmpl.coinbase.body.outputs[0].slot_index)
+                .creation_id(),
+            2,
+            "coinbase must reserve the first child creation ID"
+        );
+        assert_eq!(
+            expected.state.slot(4).creation_id(),
+            3,
+            "selected user outputs must keep coinbase-first creation IDs"
+        );
+        assert_eq!(tmpl.alloc_counter, 3);
         let no_guard_root = expected.state_root();
         expected
             .reuse_guard

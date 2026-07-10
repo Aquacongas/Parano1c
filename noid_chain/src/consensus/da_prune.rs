@@ -314,6 +314,7 @@ mod tests {
             inputs: vec![TxInput {
                 slot_index: out.slot_index,
                 value: out.value,
+                creation_id: 10,
                 owner: out.owner,
                 spend_secret: SpendSecret([2u8; 32]),
                 valid: true,

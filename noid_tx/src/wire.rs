@@ -6,7 +6,7 @@
 //! Fixed-width, little-endian. Counts on variable-length vectors
 //! (`inputs`, `outputs`) are explicit `u32`s, each bounded by its
 //! spec-level maximum. Every 32-byte digest is a passthrough byte copy;
-//! `value` is 8 LE bytes; `slot_index` is 4 LE bytes.
+//! `value` and input `creation_id` are 8 LE bytes; `slot_index` is 4 LE bytes.
 
 use noid_poseidon2b::primitives::{Address, Digest, SpendSecret, TxBodyHash};
 
@@ -17,6 +17,7 @@ use crate::types::{Transaction, TxBody, TxInput, TxOutput, TxShape};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WireError {
     Truncated,
+    UnsupportedVersion,
     CountTooLarge,
     /// fee field exceeds u64::MAX — cannot be represented in the
     /// balance circuit (which uses 64-bit operands).
@@ -109,11 +110,12 @@ fn take_shape(src: &mut &[u8]) -> Result<TxShape, WireError> {
 // Two wire formats:
 //
 //   FULL  (local wallet storage only — NEVER sent over the network):
-//     slot_index (4) + value (8) + owner (32) + spend_secret (32)
-//     + valid (1) = 77 bytes
+//     slot_index (4) + value (8) + creation_id (8) + owner (32)
+//     + spend_secret (32) + valid (1) = 85 bytes
 //
 //   PUBLIC (network wire format — spend_secret omitted):
-//     slot_index (4) + value (8) + owner (32) + valid (1) = 45 bytes
+//     slot_index (4) + value (8) + creation_id (8) + owner (32)
+//     + valid (1) = 53 bytes
 //
 // The full format is used internally by the wallet to persist its own
 // transaction records. The public format is what goes into TxIntent and
@@ -124,10 +126,10 @@ fn take_shape(src: &mut &[u8]) -> Result<TxShape, WireError> {
 // ---------------------------------------------------------------------------
 
 /// Wire size of the FULL local format (includes spend_secret).
-pub const TX_INPUT_WIRE_SIZE: usize = 4 + 8 + 32 + 32 + 1;
+pub const TX_INPUT_WIRE_SIZE: usize = 4 + 8 + 8 + 32 + 32 + 1;
 
 /// Wire size of the PUBLIC network format (spend_secret omitted).
-pub const TX_INPUT_PUBLIC_WIRE_SIZE: usize = 4 + 8 + 32 + 1;
+pub const TX_INPUT_PUBLIC_WIRE_SIZE: usize = 4 + 8 + 8 + 32 + 1;
 
 impl TxInput {
     /// Encode with spend_secret included. **Local wallet storage only.**
@@ -135,6 +137,7 @@ impl TxInput {
     pub fn encode(&self, buf: &mut Vec<u8>) {
         put_u32(buf, self.slot_index);
         put_u64(buf, self.value);
+        put_u64(buf, self.creation_id);
         put_digest(buf, &self.owner.0);
         put_digest(buf, &self.spend_secret.0);
         put_bool(buf, self.valid);
@@ -145,6 +148,7 @@ impl TxInput {
     pub fn encode_public(&self, buf: &mut Vec<u8>) {
         put_u32(buf, self.slot_index);
         put_u64(buf, self.value);
+        put_u64(buf, self.creation_id);
         put_digest(buf, &self.owner.0);
         put_bool(buf, self.valid);
     }
@@ -153,12 +157,14 @@ impl TxInput {
     pub fn decode(src: &mut &[u8]) -> Result<Self, WireError> {
         let slot_index = take_u32(src)?;
         let value = take_u64(src)?;
+        let creation_id = take_u64(src)?;
         let owner = Address(take_digest(src)?);
         let spend_secret = SpendSecret(take_digest(src)?);
         let valid = take_bool(src)?;
         Ok(Self {
             slot_index,
             value,
+            creation_id,
             owner,
             spend_secret,
             valid,
@@ -169,11 +175,13 @@ impl TxInput {
     pub fn decode_public(src: &mut &[u8]) -> Result<Self, WireError> {
         let slot_index = take_u32(src)?;
         let value = take_u64(src)?;
+        let creation_id = take_u64(src)?;
         let owner = Address(take_digest(src)?);
         let valid = take_bool(src)?;
         Ok(Self {
             slot_index,
             value,
+            creation_id,
             owner,
             spend_secret: SpendSecret([0u8; 32]),
             valid,
@@ -388,21 +396,31 @@ impl TxBody {
 }
 
 // ---------------------------------------------------------------------------
-// Transaction : body + tx_body_hash. Auth tags travel inside TxInput.
+// Transaction : body + tx_body_hash.
+//
+// The default/full encoding retains `spend_secret` for local wallet artifacts.
+// Network containers (TxIntent and Block) MUST use the public encoding, which
+// omits the secret and reconstructs it as zero on decode.
 // ---------------------------------------------------------------------------
 
 impl Transaction {
+    /// Encode the full local-wallet representation, including `spend_secret`.
+    /// Never use this method for a network or consensus container.
     pub fn encode(&self, buf: &mut Vec<u8>) {
         self.body.encode(buf);
         put_digest(buf, &self.tx_body_hash.0);
     }
 
+    /// Serialize the full local-wallet representation, including
+    /// `spend_secret`.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         self.encode(&mut buf);
         buf
     }
 
+    /// Decode the full local-wallet representation, including
+    /// `spend_secret`.
     pub fn decode(src: &mut &[u8]) -> Result<Self, WireError> {
         let body = TxBody::decode(src)?;
         let tx_body_hash = TxBodyHash(take_digest(src)?);
@@ -412,6 +430,38 @@ impl Transaction {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, WireError> {
         let mut src = bytes;
         let out = Self::decode(&mut src)?;
+        if !src.is_empty() {
+            return Err(WireError::TrailingBytes);
+        }
+        Ok(out)
+    }
+
+    /// Encode the canonical public/network representation. Input
+    /// `spend_secret` values are omitted; ownership is established by the
+    /// detached authorization proof, never by cleartext block data.
+    pub fn encode_public(&self, buf: &mut Vec<u8>) {
+        self.body.encode_public(buf);
+        put_digest(buf, &self.tx_body_hash.0);
+    }
+
+    /// Serialize the canonical public/network representation.
+    pub fn to_bytes_public(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        self.encode_public(&mut buf);
+        buf
+    }
+
+    /// Decode the canonical public/network representation. Every input's
+    /// `spend_secret` is reconstructed as the all-zero non-witness value.
+    pub fn decode_public(src: &mut &[u8]) -> Result<Self, WireError> {
+        let body = TxBody::decode_public(src)?;
+        let tx_body_hash = TxBodyHash(take_digest(src)?);
+        Ok(Self { body, tx_body_hash })
+    }
+
+    pub fn from_bytes_public(bytes: &[u8]) -> Result<Self, WireError> {
+        let mut src = bytes;
+        let out = Self::decode_public(&mut src)?;
         if !src.is_empty() {
             return Err(WireError::TrailingBytes);
         }
@@ -554,6 +604,7 @@ mod tests {
         TxInput {
             slot_index: seed as u32,
             value: (seed as u64) * 11,
+            creation_id: seed as u64 * 17,
             owner: Address([seed; 32]),
             spend_secret: SpendSecret([seed ^ 0xAA; 32]),
             valid: true,
@@ -704,6 +755,49 @@ mod tests {
         let back = Transaction::from_bytes(&bytes).unwrap();
         assert_eq!(back.tx_body_hash, tx.tx_body_hash);
         assert_eq!(back.body, tx.body);
+    }
+
+    #[test]
+    fn transaction_public_roundtrip_omits_secret_and_keeps_incarnation() {
+        let body = TxBody::standard(
+            [0xABu8; 32],
+            7,
+            vec![mk_input(3)],
+            vec![mk_output(4)],
+            false,
+        );
+        let tx = Transaction {
+            tx_body_hash: TxBodyHash([0x98u8; 32]),
+            body,
+        };
+
+        let public_bytes = tx.to_bytes_public();
+        assert_eq!(
+            tx.to_bytes().len() - public_bytes.len(),
+            32,
+            "one full input carries exactly one local-only spend secret"
+        );
+
+        let back = Transaction::from_bytes_public(&public_bytes).unwrap();
+        assert_eq!(back.tx_body_hash, tx.tx_body_hash);
+        assert_eq!(
+            back.body.inputs[0].creation_id,
+            tx.body.inputs[0].creation_id
+        );
+        assert_eq!(back.body.inputs[0].spend_secret, SpendSecret([0u8; 32]));
+
+        let mut different_secret = tx.clone();
+        different_secret.body.inputs[0].spend_secret = SpendSecret([0xD7u8; 32]);
+        assert_eq!(
+            different_secret.to_bytes_public(),
+            public_bytes,
+            "public transaction bytes must be secret-invariant"
+        );
+        assert_ne!(
+            different_secret.to_bytes(),
+            tx.to_bytes(),
+            "the explicit local format still retains the witness secret"
+        );
     }
 
     #[test]

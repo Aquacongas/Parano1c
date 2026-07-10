@@ -1662,6 +1662,7 @@ mod tests {
             inputs: vec![TxInput {
                 slot_index: 2,
                 value: input_value,
+                creation_id: 0,
                 owner,
                 spend_secret: secret,
                 valid: true,
@@ -1689,8 +1690,13 @@ mod tests {
             &body.inputs,
             &body.outputs,
         )];
-        let surface = build_exact_action_surface(&start_state.state, &[body.clone()], &claims)
-            .expect("exact action surface");
+        let surface = build_exact_action_surface(
+            &start_state.state,
+            &[body.clone()],
+            &claims,
+            start_state.alloc_counter,
+        )
+        .expect("exact action surface");
         let state_transition = crate::build_exact_state_transition_proof(
             &parent_cache,
             &surface,
@@ -2278,6 +2284,17 @@ mod tests {
         let owner = derive_address(secret);
         let mut bodies = Vec::with_capacity(specs.len());
         for &(input_slot, output_slot, input_value) in specs {
+            let pre_slot = start_state.state.slot(input_slot);
+            assert_eq!(
+                pre_slot.amount(),
+                input_value,
+                "fixture input amount must match the canonical parent slot"
+            );
+            assert_eq!(
+                [pre_slot.owner_hi, pre_slot.owner_lo],
+                owner.as_fields(),
+                "fixture input owner must match the canonical parent slot"
+            );
             let mut body = TxBody {
                 shape: TxShape::Standard4x8,
                 epoch_anchor: [0x42; 32],
@@ -2285,6 +2302,7 @@ mod tests {
                 inputs: vec![TxInput {
                     slot_index: input_slot,
                     value: input_value,
+                    creation_id: pre_slot.creation_id(),
                     owner,
                     spend_secret: secret.clone(),
                     valid: true,
@@ -2317,8 +2335,13 @@ mod tests {
             .iter()
             .map(|b| noid_tx::compute_claims_commitment(&b.inputs, &b.outputs))
             .collect();
-        let surface = build_exact_action_surface(&start_state.state, &bodies, &claims)
-            .expect("exact action surface");
+        let surface = build_exact_action_surface(
+            &start_state.state,
+            &bodies,
+            &claims,
+            start_state.alloc_counter,
+        )
+        .expect("exact action surface");
         let state_transition = crate::build_exact_state_transition_proof(
             &parent_cache,
             &surface,
@@ -2661,6 +2684,7 @@ mod tests {
                 .map(|(&slot_index, &value)| TxInput {
                     slot_index,
                     value,
+                    creation_id: 0,
                     owner,
                     spend_secret: secret.clone(),
                     valid: true,
@@ -2726,8 +2750,13 @@ mod tests {
             .iter()
             .map(|tx| noid_tx::compute_claims_commitment(&tx.inputs, &tx.outputs))
             .collect();
-        let surface = build_exact_action_surface(&state.state, &bodies, &claims)
-            .expect("coinbase + consolidation exact action surface");
+        let surface = build_exact_action_surface(
+            &state.state,
+            &bodies,
+            &claims,
+            state.alloc_counter,
+        )
+        .expect("coinbase + consolidation exact action surface");
         assert_eq!(surface.spends, 2);
         assert_eq!(surface.mints, 2, "user output plus coinbase output");
         let state_transition = crate::build_exact_state_transition_proof(
@@ -3706,7 +3735,7 @@ mod tests {
     /// holds); (b) the sponge digest wires carry φ(native `slot_leaf_hash`) and
     /// the leg-root statement wires carry φ(the composite-root natives); (c)
     /// the inline path killshot wires are GONE in region mode; and (d) three
-    /// one-flip NEGATIVES break satisfiability: a slot-leaf amount wire (bound
+    /// one-flip NEGATIVES break satisfiability: a slot-leaf packed-value wire (bound
     /// to its walk-A absorb cell), an expected-leaf wire (the leaf↔path
     /// closure: its ONLY constraints in region mode are the sponge digest-cell
     /// pin and the state-leg entry-cell pin), and a composite utxo-root wire
@@ -3763,7 +3792,7 @@ mod tests {
         for (t, lw) in slots.exact_state.slot_leaves.iter().enumerate() {
             let native = &es_in.slot_leaves[t];
             let digest = slot_leaf_hash(SlotValue {
-                value: Block128::from(native.amount as u128),
+                value: native.packed_value,
                 owner_hi: native.owner_hi,
                 owner_lo: native.owner_lo,
             });
@@ -3805,12 +3834,12 @@ mod tests {
         );
 
         // (d) one-flip negatives.
-        // 1. Slot-leaf amount wire: bound to the walk-A sponge absorb cell (and
-        //    its own range decomposition) — the flip must be rejected.
+        // 1. Slot-leaf packed-value wire: bound to the walk-A sponge absorb
+        //    cell — the flip must be rejected.
         {
             let mut bad = z.clone();
-            bad[wire_of(&slots.exact_state.slot_leaves[0].amount)] += F128::ONE;
-            assert!(!r1cs.satisfies(&bad), "flipped amount wire accepted");
+            bad[wire_of(&slots.exact_state.slot_leaves[0].packed_value)] += F128::ONE;
+            assert!(!r1cs.satisfies(&bad), "flipped packed-value wire accepted");
         }
         // 2. Expected-leaf wire — THE leaf↔path closure: in region mode its only
         //    constraints are the sponge digest-cell pin and the state-leg
@@ -5419,18 +5448,25 @@ mod tests {
         let mut bad_end = end_accumulator.clone();
         bad_end.chain_hash[0] ^= 0xA5;
         bad_end.chain_hash[17] ^= 0x5A;
-        let mut b2 = FieldR1csBuilder::new();
-        let _ = build_block_slots_with_config(
-            &mut b2,
-            &start_accumulator,
-            &bad_end,
-            inputs,
-            &proof,
-            no_pcs,
-        );
-        let (r1cs2, z2) = b2.build();
+        // Pin helpers reject a witness-known false equality eagerly in debug
+        // builds; optimized builders may instead materialize an unsatisfied
+        // row. Both are valid rejection modes for this semantic negative.
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut b2 = FieldR1csBuilder::new();
+            let _ = build_block_slots_with_config(
+                &mut b2,
+                &start_accumulator,
+                &bad_end,
+                inputs,
+                &proof,
+                no_pcs,
+            );
+            let (r1cs2, z2) = b2.build();
+            !r1cs2.satisfies(&z2)
+        }))
+        .unwrap_or(true);
         assert!(
-            !r1cs2.satisfies(&z2),
+            rejected,
             "tampered accumulator boundary must break the block-slot trace"
         );
     }

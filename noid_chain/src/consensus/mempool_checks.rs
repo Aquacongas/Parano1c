@@ -29,7 +29,6 @@ use crate::consensus::{
 };
 use crate::fri_state::SlotValue;
 use crate::reuse_guard::ReuseGuardActionState;
-use noid_core::Block128;
 use noid_tx::Transaction;
 
 /// Validate a transaction for mempool admission.
@@ -126,11 +125,8 @@ pub fn validate_tx_for_mempool(
                 ctx.state.state.num_slots()
             )));
         }
-        let expected = SlotValue {
-            value: Block128::from(inp.value as u128),
-            owner_hi: inp.owner.as_fields()[0],
-            owner_lo: inp.owner.as_fields()[1],
-        };
+        let expected =
+            SlotValue::with_owner_fields(inp.value, inp.creation_id, inp.owner.as_fields());
         if ctx.state.state.slot(idx) != expected {
             return Err(ConsensusError::BadStateRoot); // closest existing error
         }
@@ -297,11 +293,7 @@ mod tests {
             .state
             .set_slot(
                 7,
-                SlotValue {
-                    value: Block128::from(100u128),
-                    owner_hi: Block128(0),
-                    owner_lo: Block128(0),
-                },
+                SlotValue::with_owner_fields(100, 0, Address([0u8; 32]).as_fields()),
             )
             .unwrap();
 

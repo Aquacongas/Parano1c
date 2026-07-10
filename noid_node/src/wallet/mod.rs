@@ -29,7 +29,7 @@ pub mod prover;
 pub mod scanner;
 pub mod state;
 
-pub use state::{SharedWallet, WalletState};
+pub use state::{SharedWallet, WalletState, MAX_WALLET_ADDRESSES};
 
 // ---------------------------------------------------------------------------
 // WalletHandle — implements WalletOps for RPC layer
@@ -134,6 +134,9 @@ impl WalletOps for WalletHandle {
     }
 
     fn get_address(&self, index: u32) -> Option<String> {
+        if index >= MAX_WALLET_ADDRESSES {
+            return None;
+        }
         let guard = self.inner.lock().unwrap();
         guard.as_ref().map(|w| w.address_at(index).to_bech32())
     }
@@ -161,6 +164,7 @@ impl WalletOps for WalletHandle {
                     .pending_input_slots
                     .iter()
                     .filter_map(|&s| w.utxos.get(&s))
+                    .filter(|u| u.key_index == w.active_index)
                     .map(|u| u.value)
                     .sum();
                 let spendable = total.saturating_sub(pending_out);
@@ -187,6 +191,7 @@ impl WalletOps for WalletHandle {
                 .map(|u| WalletUtxoInfo {
                     slot_index: u.slot_index,
                     value_micronoid: u.value,
+                    creation_id: u.creation_id,
                     value_noid: micronoid_to_noid(u.value),
                     address: u.address.to_bech32(),
                     key_index: u.key_index,
@@ -279,6 +284,7 @@ impl WalletOps for WalletHandle {
         let mut available: Vec<&state::WalletUtxo> = w
             .utxos
             .values()
+            .filter(|u| u.key_index == w.active_index)
             .filter(|u| !w.pending_input_slots.contains(&u.slot_index))
             .collect();
         available.sort_by_key(|u| std::cmp::Reverse(u.value));
@@ -339,6 +345,7 @@ impl WalletOps for WalletHandle {
         let mut available: Vec<state::WalletUtxo> = w
             .utxos
             .values()
+            .filter(|u| u.key_index == w.active_index)
             .filter(|u| !w.pending_input_slots.contains(&u.slot_index))
             .cloned()
             .collect();
@@ -594,6 +601,7 @@ impl WalletOps for WalletHandle {
         let available = w
             .utxos
             .values()
+            .filter(|u| u.key_index == w.active_index)
             .filter(|u| !w.pending_input_slots.contains(&u.slot_index))
             .count();
         if available < 2 {
@@ -711,7 +719,7 @@ impl WalletOps for WalletHandle {
         let w = guard
             .as_mut()
             .ok_or_else(|| "wallet not initialized".to_string())?;
-        w.set_active_index(index);
+        w.set_active_index(index).map_err(str::to_string)?;
         Ok((index, w.active_address().to_bech32()))
     }
 
@@ -757,13 +765,9 @@ impl WalletOps for WalletHandle {
             .collect();
 
         // Prove outside the lock (CPU-heavy).
-        let (_tx_hash, intent_bytes) = builder::build_and_prove_tx(
-            target_address,
-            pull_amount,
-            fee_micronoid,
-            build_data,
-        )
-        .map_err(|e| e.to_string())?;
+        let (_tx_hash, intent_bytes) =
+            builder::build_and_prove_tx(target_address, pull_amount, fee_micronoid, build_data)
+                .map_err(|e| e.to_string())?;
 
         {
             let intent = noid_tx::TxIntent::from_bytes(&intent_bytes)
@@ -787,11 +791,14 @@ impl WalletOps for WalletHandle {
     fn next_address(&self) -> Option<WalletAddressInfo> {
         let mut guard = self.inner.lock().unwrap();
         let w = guard.as_mut()?;
+        if w.next_index >= MAX_WALLET_ADDRESSES {
+            return None;
+        }
         let idx = w.next_index;
         let addr = w.address_at(idx);
         // Register in known_addresses so incremental block updates catch payments to it.
         w.known_addresses.insert(addr.0, idx);
-        w.next_index += 1;
+        w.next_index = idx + 1;
         w.save_metadata();
         Some(WalletAddressInfo {
             address: addr.to_bech32(),
@@ -873,6 +880,7 @@ impl WalletOps for WalletHandle {
                 .pending_input_slots
                 .iter()
                 .filter_map(|&s| w.utxos.get(&s))
+                .filter(|u| u.key_index == w.active_index)
                 .map(|u| u.value)
                 .sum(),
         }
@@ -915,6 +923,7 @@ mod tests {
                 state::WalletUtxo {
                     slot_index,
                     value,
+                    creation_id: slot_index as u64 + 1,
                     // One owner per tx: fixture UTXOs live on the ACTIVE
                     // (index-0) address.
                     address: wallet.address_at(0),
@@ -953,6 +962,56 @@ mod tests {
         let err = handle.plan_send_splits(9_000, 500).unwrap_err();
         assert!(err.contains("insufficient funds"));
         assert!(err.contains("4000 μNOID spendable"));
+    }
+
+    #[test]
+    fn planning_and_pending_balance_use_active_address_only() {
+        let (_dir, handle) = handle_with_utxos(&[2_000, 2_000]);
+        {
+            let mut guard = handle.inner.lock().unwrap();
+            let wallet = guard.as_mut().unwrap();
+            let secondary = wallet.address_at(1);
+            wallet.utxos.insert(
+                99,
+                state::WalletUtxo {
+                    slot_index: 99,
+                    value: 50_000,
+                    creation_id: 99,
+                    address: secondary,
+                    key_index: 1,
+                    confirmed_height: 1,
+                },
+            );
+            wallet.pending_input_slots.insert(99);
+        }
+
+        assert!(handle.plan_send_splits(5_000, 0).is_err());
+        assert_eq!(handle.plan_consolidate_input_count().unwrap(), 2);
+        let balance = handle.get_balance();
+        assert_eq!(balance.total_micronoid, 4_000);
+        assert_eq!(balance.pending_outbound_micronoid, 0);
+        assert_eq!(balance.spendable_micronoid, 4_000);
+    }
+
+    #[test]
+    fn rpc_wallet_handle_rejects_max_active_index_without_mutation() {
+        let (_dir, handle) = handle_with_utxos(&[1_000]);
+        let error = handle.set_active_address(MAX_WALLET_ADDRESSES).unwrap_err();
+        assert!(error.contains("address limit"));
+        let (index, _) = handle.active_address().unwrap();
+        assert_eq!(index, 0);
+    }
+
+    #[test]
+    fn address_derivation_stops_at_shared_wallet_cap() {
+        let (_dir, handle) = handle_with_utxos(&[1_000]);
+        {
+            let mut guard = handle.inner.lock().unwrap();
+            guard.as_mut().unwrap().next_index = MAX_WALLET_ADDRESSES;
+        }
+
+        assert!(handle.next_address().is_none());
+        assert!(handle.get_address(MAX_WALLET_ADDRESSES).is_none());
     }
 
     #[test]

@@ -108,7 +108,10 @@ pub fn validate_body_semantics_no_hash(body: &TxBody) -> Result<(), PublicLogicE
     // too.
     for (i, input) in body.inputs.iter().enumerate() {
         if !input.valid
-            && (input.slot_index != 0 || input.value != 0 || input.owner.0 != [0u8; 32])
+            && (input.slot_index != 0
+                || input.value != 0
+                || input.creation_id != 0
+                || input.owner.0 != [0u8; 32])
         {
             return Err(PublicLogicError::DeadEntryNotDummy { index: i });
         }
@@ -151,10 +154,8 @@ pub fn validate_body_semantics_no_hash(body: &TxBody) -> Result<(), PublicLogicE
     if n_live_inputs == 0 {
         return Err(PublicLogicError::NoLiveInputs);
     }
-    u8::try_from(n_live_outputs_usize).map_err(|_| {
-        PublicLogicError::LiveOutputCountTooLarge {
-            actual: n_live_outputs_usize,
-        }
+    u8::try_from(n_live_outputs_usize).map_err(|_| PublicLogicError::LiveOutputCountTooLarge {
+        actual: n_live_outputs_usize,
     })?;
 
     // ONE OWNER PER TRANSACTION (consensus rule): every live input is
@@ -250,9 +251,14 @@ mod tests {
         TxInput {
             slot_index: slot,
             value,
+            creation_id: 0,
             // One owner per tx (consensus): live inputs share an address;
             // dead entries carry the dummy zero pattern.
-            owner: if valid { Address([7u8; 32]) } else { Address([0u8; 32]) },
+            owner: if valid {
+                Address([7u8; 32])
+            } else {
+                Address([0u8; 32])
+            },
             spend_secret: SpendSecret([0u8; 32]),
             valid,
         }
@@ -262,7 +268,11 @@ mod tests {
         TxOutput {
             slot_index: slot,
             value,
-            owner: if valid { Address([slot as u8; 32]) } else { Address([0u8; 32]) },
+            owner: if valid {
+                Address([slot as u8; 32])
+            } else {
+                Address([0u8; 32])
+            },
             valid,
         }
     }
@@ -315,6 +325,23 @@ mod tests {
             validate_public_tx_logic(&body),
             Err(PublicLogicError::DeadEntryNotDummy { index: 1 })
         ));
+    }
+
+    #[test]
+    fn dead_input_with_creation_id_rejects() {
+        let mut dead = input(0, 0, false);
+        dead.creation_id = 1;
+        let body = TxBody::standard(
+            [2u8; 32],
+            1,
+            vec![input(1, 10, true), dead],
+            vec![output(10, 9, true)],
+            false,
+        );
+        assert_eq!(
+            validate_public_tx_logic(&body),
+            Err(PublicLogicError::DeadEntryNotDummy { index: 1 })
+        );
     }
 
     #[test]

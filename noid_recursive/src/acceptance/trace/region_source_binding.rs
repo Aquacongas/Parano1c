@@ -898,7 +898,13 @@ pub fn discharge_auth_pcs_obligations_via_region(
             // --- Walk A: this block's sponge-leaf tiles (chunk + ghosts). ---
             let chunk: Vec<(F128, F128, F128)> = e.leaves[lo..hi]
                 .iter()
-                .map(|l| (l.amount_flat, l.owner_hi_flat, l.owner_lo_flat))
+                .map(|l| {
+                    (
+                        l.packed_value_flat,
+                        l.owner_hi_flat,
+                        l.owner_lo_flat,
+                    )
+                })
                 .collect();
             let tile_wlog = (es_leaf_cap * SPONGE_LEAF_SLOTS)
                 .next_power_of_two()
@@ -923,7 +929,7 @@ pub fn discharge_auth_pcs_obligations_via_region(
                 let off = base + t * SPONGE_LEAF_SLOTS;
                 // Statement wires pinned to the committed absorb cells; the
                 // PAD lane is a protocol constant (`pad_after_one_field`).
-                cell_pins_a.push((IN0, off, leaf.amount_w.clone()));
+                cell_pins_a.push((IN0, off, leaf.packed_value_w.clone()));
                 cell_pins_a.push((IN0 + 1, off, leaf.owner_hi_w.clone()));
                 cell_pins_a.push((IN0, off + 1, leaf.owner_lo_w.clone()));
                 cell_pins_a.push((IN0 + 1, off + 1, LinExpr::constant(pad_flat)));

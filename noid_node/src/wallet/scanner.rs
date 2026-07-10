@@ -29,7 +29,7 @@ use noid_chain::fri_state::SlotValue;
 use noid_chain::segmented_state::SegmentedFriState;
 
 use super::keystore::MasterSecret;
-use super::state::{TxDirection, TxHistoryEntry, WalletUtxo};
+use super::state::{TxDirection, TxHistoryEntry, WalletUtxo, MAX_WALLET_ADDRESSES};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -82,8 +82,10 @@ pub fn scan_state_for_utxos(
     let seg_size = 1usize << seg_log;
 
     // Collect all non-empty slots from active segments (O(active_slots))
-    // Build reverse map: owner_bytes → Vec<(slot_index, value)>
-    let mut owner_to_slots: HashMap<[u8; 32], Vec<(u32, u64)>> = HashMap::new();
+    // Build reverse map: owner_bytes → Vec<(slot_index, amount, creation_id)>.
+    // Both value limbs are part of the spend claim, so a full scan must retain
+    // the incarnation rather than reconstructing it from slot position/history.
+    let mut owner_to_slots: HashMap<[u8; 32], Vec<(u32, u64, u64)>> = HashMap::new();
     for seg_id in state.active_segment_ids() {
         let base = (seg_id as u32) << seg_log as u32;
         for local in 0..seg_size {
@@ -93,8 +95,10 @@ pub fn scan_state_for_utxos(
                 continue;
             }
             let owner = owner_bytes_from_slot(&sv);
-            let value = sv.value.0 as u64;
-            owner_to_slots.entry(owner).or_default().push((idx, value));
+            owner_to_slots
+                .entry(owner)
+                .or_default()
+                .push((idx, sv.amount(), sv.creation_id()));
         }
     }
 
@@ -113,8 +117,10 @@ pub fn scan_state_for_utxos(
     let mut batch_start: u32 = 0;
     let mut empty_batches: u32 = 0;
 
-    loop {
-        let batch_end = batch_start + BATCH_SIZE;
+    while batch_start < MAX_WALLET_ADDRESSES {
+        let batch_end = batch_start
+            .saturating_add(BATCH_SIZE)
+            .min(MAX_WALLET_ADDRESSES);
         let mut batch_found = 0u32;
 
         for i in batch_start..batch_end {
@@ -122,10 +128,11 @@ pub fn scan_state_for_utxos(
             known_addresses.insert(addr.0, i);
 
             if let Some(slots) = owner_to_slots.get(&addr.0) {
-                for &(slot_idx, value) in slots {
+                for &(slot_idx, value, creation_id) in slots {
                     found_utxos.push(WalletUtxo {
                         slot_index: slot_idx,
                         value,
+                        creation_id,
                         address: addr,
                         key_index: i,
                         confirmed_height: current_height,
@@ -148,18 +155,20 @@ pub fn scan_state_for_utxos(
         // Stop conditions:
         // 1. GAP_LIMIT consecutive empty batches AND we've scanned past hint_next_index
         //    (always cover addresses the user generated via address --new)
-        // 2. Safety cap: never derive more than 100_000 addresses
-        let min_scan_to = hint_next_index.saturating_add(BATCH_SIZE);
+        // 2. Safety cap: never derive more than MAX_WALLET_ADDRESSES.
+        let min_scan_to = hint_next_index
+            .min(MAX_WALLET_ADDRESSES)
+            .saturating_add(BATCH_SIZE)
+            .min(MAX_WALLET_ADDRESSES);
         if empty_batches >= GAP_LIMIT && batch_start >= min_scan_to {
-            break;
-        }
-        if batch_start >= 100_000 {
             break;
         }
     }
 
     // Ensure we always have at least BATCH_SIZE addresses beyond the last found
-    let next_index = (max_found_index + 1).max(batch_start);
+    let next_index = (max_found_index + 1)
+        .max(batch_start)
+        .min(MAX_WALLET_ADDRESSES);
 
     (found_utxos, known_addresses, next_index)
 }
@@ -167,6 +176,106 @@ pub fn scan_state_for_utxos(
 // ---------------------------------------------------------------------------
 // Incremental block update
 // ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CreationIdDerivationError {
+    MultipleCoinbase,
+    CoinbaseNotFirst,
+    MintCountOverflow,
+    HeaderCounterUnderflow { alloc_counter: u64, live_mints: u64 },
+    CounterOverflow,
+    FinalCounterMismatch { expected: u64, actual: u64 },
+}
+
+impl std::fmt::Display for CreationIdDerivationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MultipleCoinbase => write!(f, "multiple coinbase transactions"),
+            Self::CoinbaseNotFirst => write!(f, "coinbase transaction is not first"),
+            Self::MintCountOverflow => write!(f, "live output count exceeds u64"),
+            Self::HeaderCounterUnderflow {
+                alloc_counter,
+                live_mints,
+            } => write!(
+                f,
+                "header alloc_counter {alloc_counter} is below live mint count {live_mints}"
+            ),
+            Self::CounterOverflow => write!(f, "creation_id counter overflow"),
+            Self::FinalCounterMismatch { expected, actual } => write!(
+                f,
+                "derived final alloc_counter {actual} does not match header {expected}"
+            ),
+        }
+    }
+}
+
+/// Reconstruct each output's consensus creation id from the post-block
+/// allocator counter. IDs follow `block.transactions` and output order exactly.
+/// The helper independently rejects a late or duplicate coinbase so malformed
+/// data cannot acquire a wallet-only interpretation different from consensus.
+///
+/// `TxOutput` intentionally carries no caller-chosen creation id. The wallet
+/// therefore derives the parent counter as `header.alloc_counter - live_mints`
+/// and advances it with checked arithmetic. The returned matrix is aligned
+/// with `block.transactions[tx].body.outputs[output]`; dummy outputs map to
+/// `None`.
+fn derive_output_creation_ids(
+    block: &Block,
+) -> Result<Vec<Vec<Option<u64>>>, CreationIdDerivationError> {
+    let mut seen_coinbase = false;
+    for (tx_index, tx) in block.transactions.iter().enumerate() {
+        if !tx.body.is_coinbase {
+            continue;
+        }
+        if seen_coinbase {
+            return Err(CreationIdDerivationError::MultipleCoinbase);
+        }
+        if tx_index != 0 {
+            return Err(CreationIdDerivationError::CoinbaseNotFirst);
+        }
+        seen_coinbase = true;
+    }
+
+    let live_mints = block
+        .transactions
+        .iter()
+        .flat_map(|tx| tx.body.outputs.iter())
+        .filter(|output| output.valid)
+        .try_fold(0u64, |count, _| count.checked_add(1))
+        .ok_or(CreationIdDerivationError::MintCountOverflow)?;
+    let mut counter = block.header.alloc_counter.checked_sub(live_mints).ok_or(
+        CreationIdDerivationError::HeaderCounterUnderflow {
+            alloc_counter: block.header.alloc_counter,
+            live_mints,
+        },
+    )?;
+
+    let mut ids: Vec<Vec<Option<u64>>> = block
+        .transactions
+        .iter()
+        .map(|tx| vec![None; tx.body.outputs.len()])
+        .collect();
+
+    for (tx_index, tx) in block.transactions.iter().enumerate() {
+        for (output_index, output) in tx.body.outputs.iter().enumerate() {
+            if !output.valid {
+                continue;
+            }
+            counter = counter
+                .checked_add(1)
+                .ok_or(CreationIdDerivationError::CounterOverflow)?;
+            ids[tx_index][output_index] = Some(counter);
+        }
+    }
+
+    if counter != block.header.alloc_counter {
+        return Err(CreationIdDerivationError::FinalCounterMismatch {
+            expected: block.header.alloc_counter,
+            actual: counter,
+        });
+    }
+    Ok(ids)
+}
 
 /// Update wallet state based on a newly confirmed block.
 ///
@@ -190,6 +299,23 @@ pub fn update_wallet_from_block(
     let height = block.header.height;
     let timestamp = block.header.timestamp;
 
+    // Derive the complete map before mutating wallet state. Consensus-valid
+    // blocks always satisfy this relation; rejecting the update here avoids
+    // inventing or wrapping an incarnation if corrupt/unvalidated data reaches
+    // the product hook.
+    let output_creation_ids = match derive_output_creation_ids(block) {
+        Ok(ids) => ids,
+        Err(error) => {
+            tracing::error!(
+                height,
+                alloc_counter = block.header.alloc_counter,
+                %error,
+                "wallet: refusing block update with invalid creation-id sequence"
+            );
+            return;
+        }
+    };
+
     let block_tx_hashes: Vec<[u8; 32]> = block
         .transactions
         .iter()
@@ -207,11 +333,24 @@ pub fn update_wallet_from_block(
         if tx.body.is_coinbase {
             // Coinbase: track UTXOs for our addresses, record history.
             // No receipt — receipts are proof-of-payment for OUTGOING txs only.
-            for output in tx.body.outputs.iter().filter(|o| o.valid) {
+            for (output_index, output) in tx.body.outputs.iter().enumerate() {
+                if !output.valid {
+                    continue;
+                }
+                let Some(creation_id) = output_creation_ids[tx_index][output_index] else {
+                    tracing::error!(
+                        height,
+                        tx_index,
+                        output_index,
+                        "wallet: missing creation id for live coinbase output"
+                    );
+                    return;
+                };
                 if let Some(&key_idx) = known_addresses.get(&output.owner.0) {
                     let utxo = WalletUtxo {
                         slot_index: output.slot_index,
                         value: output.value,
+                        creation_id,
                         address: output.owner,
                         key_index: key_idx,
                         confirmed_height: height,
@@ -255,11 +394,24 @@ pub fn update_wallet_from_block(
         }
 
         // Outputs: add new UTXOs owned by this wallet
-        for output in tx.body.outputs.iter().filter(|o| o.valid) {
+        for (output_index, output) in tx.body.outputs.iter().enumerate() {
+            if !output.valid {
+                continue;
+            }
+            let Some(creation_id) = output_creation_ids[tx_index][output_index] else {
+                tracing::error!(
+                    height,
+                    tx_index,
+                    output_index,
+                    "wallet: missing creation id for live user output"
+                );
+                return;
+            };
             if let Some(&key_idx) = known_addresses.get(&output.owner.0) {
                 let utxo = WalletUtxo {
                     slot_index: output.slot_index,
                     value: output.value,
+                    creation_id,
                     address: output.owner,
                     key_index: key_idx,
                     confirmed_height: height,
@@ -339,5 +491,142 @@ pub fn update_wallet_from_block(
             );
             receipts.insert(tx.tx_body_hash.0, receipt.to_bytes());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use noid_chain::block_header::BlockHeader;
+    use noid_chain::segmented_state::SegmentedFriState;
+    use noid_poseidon2b::primitives::{Address, TxBodyHash};
+    use noid_tx::{Transaction, TxBody, TxOutput, TxShape};
+
+    fn transaction(is_coinbase: bool, slot_index: u32, owner: Address) -> Transaction {
+        Transaction {
+            body: TxBody {
+                shape: TxShape::Standard4x8,
+                epoch_anchor: if is_coinbase { [0; 32] } else { [1; 32] },
+                fee: 0,
+                inputs: vec![],
+                outputs: vec![TxOutput {
+                    slot_index,
+                    value: u64::from(slot_index) + 100,
+                    owner,
+                    valid: true,
+                }],
+                is_coinbase,
+            },
+            tx_body_hash: TxBodyHash([slot_index as u8; 32]),
+        }
+    }
+
+    fn block(transactions: Vec<Transaction>, alloc_counter: u64) -> Block {
+        Block {
+            header: BlockHeader {
+                prev_block_hash: [0; 32],
+                state_root: [0; 32],
+                tx_root: [0; 32],
+                timestamp: 123,
+                height: 7,
+                miner_address: Address([0x77; 32]),
+                nonce: 0,
+                difficulty_target: [0xFF; 32],
+                log_slots: 24,
+                active_slot_count: transactions.len() as u64,
+                alloc_counter,
+            },
+            transactions,
+        }
+    }
+
+    #[test]
+    fn incremental_scan_assigns_coinbase_then_user_creation_ids() {
+        let owner = Address([0xA1; 32]);
+        let block = block(
+            vec![transaction(true, 10, owner), transaction(false, 20, owner)],
+            102,
+        );
+        let mut utxos = HashMap::new();
+        let mut history = vec![];
+        let mut receipts = HashMap::new();
+        let known_addresses = HashMap::from([(owner.0, 3)]);
+        let mut pending_inputs = std::collections::HashSet::new();
+
+        update_wallet_from_block(
+            &mut utxos,
+            &mut history,
+            &mut receipts,
+            &known_addresses,
+            &mut pending_inputs,
+            &block,
+        );
+
+        assert_eq!(utxos[&10].creation_id, 101, "coinbase is first");
+        assert_eq!(utxos[&20].creation_id, 102, "user output follows");
+    }
+
+    #[test]
+    fn incremental_scan_rejects_noncanonical_coinbase_layout() {
+        let owner = Address([0xA3; 32]);
+        let late = block(
+            vec![transaction(false, 20, owner), transaction(true, 10, owner)],
+            102,
+        );
+        assert_eq!(
+            derive_output_creation_ids(&late),
+            Err(CreationIdDerivationError::CoinbaseNotFirst)
+        );
+
+        let duplicate = block(
+            vec![transaction(true, 10, owner), transaction(true, 11, owner)],
+            102,
+        );
+        assert_eq!(
+            derive_output_creation_ids(&duplicate),
+            Err(CreationIdDerivationError::MultipleCoinbase)
+        );
+    }
+
+    #[test]
+    fn full_scan_preserves_packed_creation_id() {
+        let master = MasterSecret([0x31; 32]);
+        let owner = master.derive_address(0);
+        let mut state = SegmentedFriState::new_empty(6);
+        state
+            .set_slot(9, SlotValue::with_owner_fields(777, 55, owner.as_fields()))
+            .unwrap();
+
+        let (utxos, _, _) = scan_state_for_utxos(&state, &master, 12, 1);
+        assert_eq!(utxos.len(), 1);
+        assert_eq!(utxos[0].slot_index, 9);
+        assert_eq!(utxos[0].value, 777);
+        assert_eq!(utxos[0].creation_id, 55);
+    }
+
+    #[test]
+    fn incremental_scan_rejects_counter_underflow_before_mutation() {
+        let owner = Address([0xA2; 32]);
+        let block = block(
+            vec![transaction(true, 10, owner), transaction(false, 20, owner)],
+            1,
+        );
+        let mut utxos = HashMap::new();
+        let mut history = vec![];
+        let mut receipts = HashMap::new();
+        let known_addresses = HashMap::from([(owner.0, 0)]);
+        let mut pending_inputs = std::collections::HashSet::new();
+
+        update_wallet_from_block(
+            &mut utxos,
+            &mut history,
+            &mut receipts,
+            &known_addresses,
+            &mut pending_inputs,
+            &block,
+        );
+
+        assert!(utxos.is_empty());
+        assert!(history.is_empty());
     }
 }

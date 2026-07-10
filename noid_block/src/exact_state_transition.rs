@@ -407,12 +407,8 @@ pub fn derive_exact_slot_leaf_batch_inputs(
 }
 
 fn slot_to_leaf_input(slot: SlotValue) -> Result<SlotLeafInputs, ExactStateTransitionError> {
-    let amount = slot.value.to_u128();
-    if amount >> 64 != 0 {
-        return Err(ExactStateTransitionError::NonCanonicalSlot);
-    }
     Ok(SlotLeafInputs {
-        amount: amount as u64,
+        packed_value: slot.value,
         owner_hi: slot.owner_hi,
         owner_lo: slot.owner_lo,
         expected_leaf: digest_to_fields(

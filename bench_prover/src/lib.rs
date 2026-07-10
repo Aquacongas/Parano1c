@@ -360,6 +360,7 @@ pub fn standard_scenario(
         inputs.push(TxInput {
             slot_index: slot_base + i as u32,
             value,
+            creation_id: 0,
             owner: derive_address(secret),
             spend_secret: secret.clone(),
             valid: true,
@@ -425,6 +426,7 @@ pub fn sweep_scenario(
         inputs.push(TxInput {
             slot_index: slot_base + i as u32,
             value,
+            creation_id: 0,
             owner: derive_address(secret),
             spend_secret: secret.clone(),
             valid: true,
@@ -616,17 +618,18 @@ fn seed_state_for_bodies(bodies: &[TxBody]) -> ChainState {
         .iter()
         .flat_map(|body| body.inputs.iter().filter(|i| i.valid))
     {
-        let [owner_hi, owner_lo] = input.owner.as_fields();
         slots.push((
             input.slot_index,
-            SlotValue {
-                value: Block128::from(input.value as u128),
-                owner_hi,
-                owner_lo,
-            },
+            SlotValue::with_owner_fields(
+                input.value,
+                input.creation_id,
+                input.owner.as_fields(),
+            ),
         ));
     }
-    ChainState::from_sparse_utxos(BENCH_LOG_SLOTS as usize, &slots)
+    // These benchmark fixtures intentionally use legacy creation_id=0 inputs
+    // and model a zero-counter parent.
+    ChainState::from_sparse_utxos(BENCH_LOG_SLOTS as usize, &slots, 0)
         .expect("bench input slots form a valid sparse UTXO state")
 }
 
@@ -735,8 +738,9 @@ fn prove_full_block_from_bodies_and_auth(
     let coinbase_body = bench_coinbase_body();
     profiler.phase("prev_root_and_coinbase");
 
-    let mut all_state_bodies = user_bodies.clone();
-    all_state_bodies.push(coinbase_body.clone());
+    let all_state_bodies: Vec<_> = std::iter::once(coinbase_body.clone())
+        .chain(user_bodies.iter().cloned())
+        .collect();
     let all_state_commitments: Vec<_> = all_state_bodies
         .iter()
         .map(|body| compute_claims_commitment(&body.inputs, &body.outputs))
@@ -746,6 +750,7 @@ fn prove_full_block_from_bodies_and_auth(
         &pre_state.state,
         &all_state_bodies,
         &all_state_commitments,
+        pre_state.alloc_counter,
     )
     .expect("build bench exact state surface");
     profiler.phase("exact_action_surface");
@@ -845,19 +850,11 @@ pub fn bench_full_block_proof_minimal(fixtures: &[MinimalTxFixture]) -> FullBloc
         )
         .expect("verify block authorizations");
 
-        let mut exact_bodies: Vec<TxBody> = block
+        let exact_bodies: Vec<TxBody> = block
             .transactions
             .iter()
-            .filter(|tx| !tx.body.is_coinbase)
             .map(|tx| tx.body.clone())
             .collect();
-        exact_bodies.extend(
-            block
-                .transactions
-                .iter()
-                .filter(|tx| tx.body.is_coinbase)
-                .map(|tx| tx.body.clone()),
-        );
         let exact_commitments: Vec<_> = exact_bodies
             .iter()
             .map(|body| compute_claims_commitment(&body.inputs, &body.outputs))
@@ -866,6 +863,7 @@ pub fn bench_full_block_proof_minimal(fixtures: &[MinimalTxFixture]) -> FullBloc
             &pre_state.state,
             &exact_bodies,
             &exact_commitments,
+            pre_state.alloc_counter,
         )
         .expect("rebuild exact state surface");
         let inputs = ExactStateTransitionInputs {

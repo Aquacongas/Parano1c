@@ -1973,6 +1973,7 @@ mod tests {
             inputs.push(TxInput {
                 slot_index: i as u32,
                 value: 10,
+                creation_id: 0,
                 owner: derive_address(s),
                 spend_secret: s.clone(),
                 valid: true,
@@ -1983,6 +1984,7 @@ mod tests {
             inputs.push(TxInput {
                 slot_index: 100,
                 value: 10,
+                creation_id: 0,
                 owner: derive_address(&s),
                 spend_secret: s,
                 valid: true,

@@ -5,7 +5,7 @@
 
 use noid_core::{Block128, TowerField};
 use noid_poseidon2b::primitives::{fee_leaf, is_coinbase_leaf, tx_shape_leaf, Digest};
-use noid_tx::{TxBody, TxInput, TxOutput, TxShape};
+use noid_tx::{pack_amount_creation_id, TxBody, TxInput, TxOutput, TxShape};
 
 use crate::SweepSpineInputs;
 
@@ -76,7 +76,7 @@ pub fn sweep_spine_inputs_from_body(
         let [owner_hi, owner_lo] = inp.owner.as_fields();
         *leaf = [
             Block128::from(inp.slot_index as u128),
-            Block128::from(inp.value as u128),
+            pack_amount_creation_id(inp.value, inp.creation_id),
             owner_hi,
             owner_lo,
         ];
@@ -119,8 +119,8 @@ mod tests {
     use crate::circuit_sweep::SweepSpineCircuit;
     use crate::oracle_sweep::evaluate_sweep_spine;
     use noid_poseidon2b::primitives::{
-        derive_address, hash_input_leaf, hash_output_leaf, hash_tx_body_sweep25x2, SpendSecret,
-        SWEEP_TXBODY_INPUTS, SWEEP_TXBODY_OUTPUTS,
+        derive_address, hash_input_leaf_packed, hash_output_leaf, hash_tx_body_sweep25x2,
+        SpendSecret, SWEEP_TXBODY_INPUTS, SWEEP_TXBODY_OUTPUTS,
     };
 
     fn fields_to_digest(fields: [Block128; 2]) -> [u8; 32] {
@@ -145,6 +145,7 @@ mod tests {
             inputs[pos] = TxInput {
                 slot_index: 100 + pos as u32,
                 value: 1_000 + pos as u64,
+                creation_id: 70 + pos as u64,
                 owner,
                 spend_secret: secret.clone(),
                 valid: true,
@@ -169,13 +170,18 @@ mod tests {
         };
 
         let statement = sweep_spine_inputs_from_body(&body).expect("sweep statement");
-        let got =
-            fields_to_digest(evaluate_sweep_spine(&SweepSpineCircuit::build(), &statement).tx_body_hash);
+        let got = fields_to_digest(
+            evaluate_sweep_spine(&SweepSpineCircuit::build(), &statement).tx_body_hash,
+        );
 
         let mut input_leaf_hashes = [[0u8; 32]; SWEEP_TXBODY_INPUTS];
         for (i, leaf) in input_leaf_hashes.iter_mut().enumerate() {
             let input = body.inputs.get(i).cloned().unwrap_or_else(TxInput::dummy);
-            *leaf = hash_input_leaf(input.slot_index, input.value, &input.owner);
+            *leaf = hash_input_leaf_packed(
+                input.slot_index,
+                pack_amount_creation_id(input.value, input.creation_id),
+                &input.owner,
+            );
         }
         let mut output_leaf_hashes = [[0u8; 32]; SWEEP_TXBODY_OUTPUTS];
         for (i, leaf) in output_leaf_hashes.iter_mut().enumerate() {

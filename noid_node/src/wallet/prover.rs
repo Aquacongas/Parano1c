@@ -73,6 +73,7 @@ mod tests {
             inputs: vec![TxInput {
                 slot_index: 7,
                 value: 1_000,
+                creation_id: 17,
                 owner,
                 spend_secret,
                 valid: true,
@@ -93,6 +94,7 @@ mod tests {
             inputs.push(TxInput {
                 slot_index: 1_000 + i as u32,
                 value: 10_000 + i as u64,
+                creation_id: 100 + i as u64,
                 owner: derive_address(&spend_secret),
                 spend_secret,
                 valid: true,

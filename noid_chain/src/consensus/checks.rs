@@ -162,6 +162,7 @@ mod tests {
         TxInput {
             slot_index: slot,
             value: 100,
+            creation_id: 0,
             owner: Address([1u8; 32]),
             spend_secret: SpendSecret([0u8; 32]),
             valid: true,
