@@ -1496,6 +1496,7 @@ mod tests {
     use noid_chain::consensus::fees::required_fee_for_tx_body;
     use noid_chain::consensus::params::{BLOCK_TIME, MAX_TARGET};
     use noid_chain::consensus::pow::search_pow;
+    use noid_chain::consensus::template::build_block_template;
     use noid_chain::exact_state_hash::composite_state_root;
     use noid_chain::fri_state::SlotValue;
     use noid_chain::header_anchor::compute_header_chain_anchor;
@@ -1551,6 +1552,37 @@ mod tests {
         Block {
             header,
             transactions: vec![],
+        }
+    }
+
+    /// A real coinbase-only child (one minting transaction, no detached
+    /// block proof or authorization sidecar).  Keep this separate from
+    /// `empty_child`: no-user blocks have two distinct action surfaces and
+    /// the C0 matrix diagnostic must not accidentally exercise the no-op one.
+    fn coinbase_only_child(parent: &BlockHeader, state: &ChainState) -> Block {
+        let timestamp = parent.timestamp + BLOCK_TIME;
+        let difficulty_target = next_target(
+            0,
+            parent.timestamp,
+            &parent.difficulty_target,
+            parent.height + 1,
+            timestamp,
+        );
+        let template = build_block_template(
+            parent,
+            state,
+            &[parent.active_slot_count],
+            vec![],
+            Address([0x22; 32]),
+            timestamp,
+            difficulty_target,
+        )
+        .expect("coinbase-only template");
+        let nonce = search_pow(&template.to_pow_header(0), 0, 64_000_000)
+            .expect("easy test target mines");
+        Block {
+            header: template.clone().into_header(nonce),
+            transactions: template.all_txs(),
         }
     }
 
@@ -2584,6 +2616,204 @@ mod tests {
         units
     }
 
+    /// One real Standard4x8 consolidation transaction (two live inputs from
+    /// the same owner, one output) plus the mandatory coinbase.  `variant`
+    /// changes every content-bearing value while preserving the protocol
+    /// shape; this makes two fixtures suitable for a class-matrix equality
+    /// check instead of merely rebuilding the same witness twice.
+    fn multi_input_coinbase_block_fixture(variant: u8) -> BlockUnit {
+        let secret = spend_secret(7u8.wrapping_add(variant));
+        let owner = derive_address(&secret);
+        let shift = u32::from(variant) * 8;
+        let input_slots = [2 + shift, 3 + shift];
+        let output_slot = 6 + shift;
+        let input_values = [
+            5_000_000u64 + u64::from(variant) * 10_000,
+            6_000_000u64 + u64::from(variant) * 20_000,
+        ];
+
+        let mut state = ChainState::with_log_slots(6);
+        for (&slot, &value) in input_slots.iter().zip(input_values.iter()) {
+            state
+                .state
+                .set_slot(
+                    slot,
+                    SlotValue {
+                        value: Block128::from(value as u128),
+                        owner_hi: owner.as_fields()[0],
+                        owner_lo: owner.as_fields()[1],
+                    },
+                )
+                .unwrap();
+        }
+        state.rebuild_exact_utxo_root_loaded().unwrap();
+        state.active_slot_count = 2;
+        state.alloc_counter = 16 + u64::from(variant);
+        let parent = parent_header(&mut state);
+
+        let mut body = TxBody {
+            shape: TxShape::Standard4x8,
+            epoch_anchor: noid_chain::consensus::pow::block_id(&parent),
+            fee: 0,
+            inputs: input_slots
+                .iter()
+                .zip(input_values.iter())
+                .map(|(&slot_index, &value)| TxInput {
+                    slot_index,
+                    value,
+                    owner,
+                    spend_secret: secret.clone(),
+                    valid: true,
+                })
+                .collect(),
+            outputs: vec![TxOutput {
+                slot_index: output_slot,
+                value: input_values.iter().sum(),
+                owner,
+                valid: true,
+            }],
+            is_coinbase: false,
+        };
+        let required_fee =
+            required_fee_for_tx_body(&body, parent.active_slot_count, parent.log_slots);
+        body.fee = required_fee as u128;
+        body.outputs[0].value = input_values
+            .iter()
+            .sum::<u64>()
+            .checked_sub(required_fee)
+            .expect("fixture remains solvent");
+        let user_tx = tx_from_body(body.clone());
+
+        let timestamp = parent.timestamp + BLOCK_TIME;
+        let difficulty_target = next_target(
+            0,
+            parent.timestamp,
+            &parent.difficulty_target,
+            parent.height + 1,
+            timestamp,
+        );
+        let template = build_block_template(
+            &parent,
+            &state,
+            &[parent.active_slot_count],
+            vec![user_tx.clone()],
+            Address([0xA0u8.wrapping_add(variant); 32]),
+            timestamp,
+            difficulty_target,
+        )
+        .expect("multi-input + coinbase template");
+        assert_eq!(template.txs, vec![user_tx], "user transaction selected");
+        let transactions = template.all_txs();
+        assert_eq!(transactions.len(), 2, "coinbase plus one user transaction");
+        assert!(transactions[0].body.is_coinbase, "coinbase is first");
+        assert_eq!(
+            transactions[1]
+                .body
+                .inputs
+                .iter()
+                .filter(|input| input.valid)
+                .count(),
+            2,
+            "real two-input consolidation"
+        );
+
+        let parent_cache = {
+            let mut tmp = state.clone();
+            tmp.exact_sparse_cache().unwrap()
+        };
+        let bodies: Vec<_> = transactions.iter().map(|tx| tx.body.clone()).collect();
+        let claims: Vec<_> = bodies
+            .iter()
+            .map(|tx| noid_tx::compute_claims_commitment(&tx.inputs, &tx.outputs))
+            .collect();
+        let surface = build_exact_action_surface(&state.state, &bodies, &claims)
+            .expect("coinbase + consolidation exact action surface");
+        assert_eq!(surface.spends, 2);
+        assert_eq!(surface.mints, 2, "user output plus coinbase output");
+        let state_transition = crate::build_exact_state_transition_proof(
+            &parent_cache,
+            &surface,
+            &state.reuse_guard,
+            parent.height + 1,
+        )
+        .expect("coinbase + consolidation exact proof");
+
+        let nonce = search_pow(&template.to_pow_header(0), 0, 64_000_000)
+            .expect("easy test target mines");
+        let header = template.clone().into_header(nonce);
+        let block = Block {
+            header: header.clone(),
+            transactions,
+        };
+        let block_proof = crate::BlockProof::minimal(
+            parent.state_root,
+            header.state_root,
+            1,
+            state_transition,
+        );
+        let auth_sidecar = crate::BlockAuthSidecar {
+            tx_auth: vec![auth_proof_for_body(&body)],
+        };
+        let witness = FullAcceptedBlockBatchWitness {
+            items: vec![FullAcceptedBlockBatchItem {
+                block,
+                block_proof_bytes: bincode::serialize(&block_proof).unwrap(),
+                block_auth_sidecar_bytes: bincode::serialize(&auth_sidecar).unwrap(),
+            }],
+        };
+
+        let start_consensus = RecursiveConsensusState::from_header(
+            &parent,
+            block_work(&parent.difficulty_target),
+            0,
+            parent.timestamp,
+            parent.difficulty_target,
+            &[parent.timestamp],
+            &[parent.active_slot_count],
+        );
+        let start_accumulator = ChainAccumulator {
+            height: parent.height,
+            state_root: parent.state_root,
+            chain_hash: [0u8; 32],
+            active_slot_count: parent.active_slot_count,
+            alloc_counter: parent.alloc_counter,
+        };
+        let (output, proof) = prove_retained_full_accepted_block_batch_proof(
+            &start_consensus,
+            &start_accumulator,
+            &parent,
+            &state,
+            &witness,
+        )
+        .expect("multi-input + coinbase fixture proves natively");
+        assert_eq!(output.proof_components.component_inputs.authorization_inputs.len(), 1);
+        assert_eq!(
+            output
+                .proof_components
+                .component_inputs
+                .authorization_totals
+                .live_input_count_total,
+            2
+        );
+        assert_eq!(
+            output
+                .proof_components
+                .component_inputs
+                .tx_body_standard_inputs
+                .len(),
+            2,
+            "coinbase and user body both reach the spine component"
+        );
+
+        BlockUnit {
+            start_accumulator,
+            end_accumulator: output.accepted_claim_batch.accumulator,
+            inputs: output.proof_components.component_inputs,
+            proof,
+            block_header: header,
+        }
+    }
+
     /// Fixture check: a chain of 2-tx-per-block standard blocks proves NATIVELY
     /// (the `prove_retained_*` call inside the builder validates each multi-tx
     /// block), and each block's component inputs carry 2 authorization inputs.
@@ -2602,6 +2832,19 @@ mod tests {
             assert_eq!(u.inputs.authorization_totals.user_tx_count, 2, "block {i} user_tx_count");
         }
         eprintln!("[multi-tx] 2 blocks x 2 std txs proved natively; 2 auth inputs each");
+    }
+
+    #[test]
+    #[ignore = "heavy C0 retained fixture (~97s); exercised twice by the explicit matrix gate"]
+    fn multi_input_coinbase_block_fixture_natively_valid() {
+        let unit = multi_input_coinbase_block_fixture(0);
+        assert_eq!(unit.inputs.authorization_inputs.len(), 1);
+        assert_eq!(unit.inputs.authorization_totals.user_tx_count, 1);
+        assert_eq!(unit.inputs.authorization_totals.owner_count_total, 1);
+        assert_eq!(unit.inputs.authorization_totals.live_input_count_total, 2);
+        assert_eq!(unit.inputs.tx_body_standard_inputs.len(), 2);
+        assert_eq!(unit.inputs.tx_root_inputs.len(), 2);
+        assert_eq!(unit.inputs.exact_state_killshot_inputs.len(), 1);
     }
 
     /// The link prefills its region IO envelope from `region_wallet_pcs_native`
@@ -4718,6 +4961,75 @@ mod tests {
         eprintln!("[block-slots] integer height successor rejects the XOR-decrement attack");
     }
 
+    /// C0 matrix-equality microfixture over the axes that are already legal
+    /// before C': both blocks carry one Standard4x8 user transaction with two
+    /// live inputs from ONE owner, one user output, and one coinbase output at
+    /// the same state depth.  Owner, slot positions, amounts, roots, hashes,
+    /// auth transcript and allocator-selected coinbase slot all differ.  None
+    /// of those content values may enter the class matrix.
+    ///
+    /// This intentionally does not claim the full no-user/coinbase axis: the
+    /// retained collector still omits its exact-state component (pinned by
+    /// `full_batch_accepts_coinbase_only_block_without_detached_proof`).
+    #[test]
+    #[ignore = "C0 matrix diagnostic (two retained fixtures + two block-slot builds)"]
+    fn c0_multi_input_coinbase_matrix_equality_on_legal_axes() {
+        use noid_ivc_core::field_circuit::FieldR1csBuilder;
+        use noid_ivc_core::field_r1cs::SparseFieldMatrix;
+        use noid_recursive::acceptance::block_slots::{
+            build_block_slots_with_config, BlockSlotsConfig,
+        };
+        use noid_recursive::acceptance::trace::region_source_binding::RegionDischargeParams;
+
+        let unit0 = multi_input_coinbase_block_fixture(0);
+        let unit1 = multi_input_coinbase_block_fixture(1);
+        let config = BlockSlotsConfig {
+            discharge_wallet_pcs: false,
+            wallet_pcs_params: RegionDischargeParams { nq: 2 },
+            owner_auth_region: false,
+            exact_state_region: false,
+            tx_root_region: false,
+            spine_region: false,
+            tier_user_tx_capacity: None,
+        };
+        let build = |unit: &BlockUnit, label: &str| {
+            let mut b = FieldR1csBuilder::new();
+            let _ = build_block_slots_with_config(
+                &mut b,
+                &unit.start_accumulator,
+                &unit.end_accumulator,
+                &unit.inputs,
+                &unit.proof,
+                config,
+            );
+            let (r1cs, z) = b.build();
+            assert!(r1cs.satisfies(&z), "{label} satisfies");
+            r1cs
+        };
+        let r0 = build(&unit0, "multi-input coinbase fixture 0");
+        let r1 = build(&unit1, "multi-input coinbase fixture 1");
+
+        let same_matrix_pair =
+            |a0: &SparseFieldMatrix,
+             b0: &SparseFieldMatrix,
+             a1: &SparseFieldMatrix,
+             b1: &SparseFieldMatrix| a0 == a1 && b0 == b1;
+        assert_eq!(r0.m, r1.m, "class m drifted across content values");
+        assert_eq!(r0.k_log, r1.k_log, "k_log drifted across content values");
+        assert!(
+            same_matrix_pair(&r0.a_0, &r0.b_0, &r1.a_0, &r1.b_0),
+            "one-owner multi-input + coinbase class matrix drifted across legal content axes"
+        );
+
+        // Comparator negative: crossing the A/B matrix lanes must be detected.
+        // This protects the diagnostic itself from a vacuous row-count-only
+        // comparison while staying independent of the known no-user gap.
+        assert!(
+            !same_matrix_pair(&r0.a_0, &r0.b_0, &r1.b_0, &r1.a_0),
+            "matrix-drift diagnostic accepted crossed A/B lanes"
+        );
+    }
+
     /// Class-fixity gate for the REGION wallet-PCS discharge
     /// (`discharge_wallet_pcs`, region params). Two DIFFERENT real
     /// blocks of the same tier must assemble to a byte-identical FieldR1cs
@@ -5143,8 +5455,10 @@ mod tests {
             active_slot_count: parent.active_slot_count,
             alloc_counter: parent.alloc_counter,
         };
-        let mut block_state = state.clone();
-        let block = empty_child(&parent, &mut block_state);
+        let block = coinbase_only_child(&parent, &state);
+        let child_state_root = block.header.state_root;
+        assert_eq!(block.transactions.len(), 1, "one real coinbase body");
+        assert!(block.transactions[0].body.is_coinbase);
         let witness = FullAcceptedBlockBatchWitness {
             items: vec![FullAcceptedBlockBatchItem {
                 block,
@@ -5162,7 +5476,8 @@ mod tests {
         )
         .expect("coinbase-only block without detached proof is a valid timeless accepted block");
         assert_eq!(out.accepted_claim_batch.consensus_state.height, 1);
-        assert_eq!(out.end_state.cached_state_root(), parent.state_root);
+        assert_eq!(out.end_state.cached_state_root(), child_state_root);
+        assert_ne!(child_state_root, parent.state_root, "coinbase mint changes state");
         assert_eq!(out.proof_components.component_inputs.accepted_claim_witness.headers.len(), 1);
         assert_eq!(
             out.proof_components
@@ -5224,8 +5539,28 @@ mod tests {
                 .accepted_block_receipt_projection_handles[0]
         );
         assert_eq!(out.proof_components.component_inputs.header_integer_trace.steps.len(), 1);
-        assert!(out.proof_components.component_inputs.tx_root_inputs.is_empty());
-        assert!(out.proof_components.component_inputs.exact_state_killshot_inputs.is_empty());
+        assert_eq!(out.proof_components.component_inputs.tx_root_inputs.len(), 1);
+        assert_eq!(
+            out.proof_components
+                .component_inputs
+                .tx_body_standard_inputs
+                .len(),
+            1,
+            "coinbase reaches the spine component"
+        );
+        // C0 diagnostic: native validation has a real one-mint exact-state
+        // surface, but the retained component collector currently appends an
+        // exact-state input only inside `has_user_txs`.  `build_block_slots`
+        // requires exactly one, so coinbase-only/no-user cannot join the class
+        // matrix yet.  Keep this assertion explicit instead of calling an
+        // empty block a coinbase fixture and hiding the structural gap.
+        assert!(
+            out.proof_components
+                .component_inputs
+                .exact_state_killshot_inputs
+                .is_empty(),
+            "known C' blocker changed: update the no-user matrix gate"
+        );
         assert_eq!(out.proof_components.component_inputs.authorization_totals.user_tx_count, 0);
         assert_eq!(
             out.proof_components.component_inputs.authorization_totals.owner_count_total,
