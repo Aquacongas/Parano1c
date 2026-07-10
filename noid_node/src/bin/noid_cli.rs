@@ -306,10 +306,10 @@ enum Command {
         /// Tip: for programmatic use the RPC walletSend accepts raw μNOID directly.
         #[arg(value_name = "AMOUNT")]
         amount: String,
-        /// Fee per ordinary transaction in NOID. Omit for automatic per-TX fees.
+        /// Transaction fee in NOID. Omit for automatic fee calculation.
         #[arg(long, value_name = "FEE_NOID")]
         fee: Option<String>,
-        /// Show the complete ordinary-transaction plan without submitting.
+        /// Show the ordinary-transaction plan without submitting.
         #[arg(long)]
         dry_run: bool,
     },
@@ -1574,13 +1574,21 @@ async fn cmd_send(
     }
 
     if dry_run {
-        let result = rpc(
+        let result = match rpc(
             ctx,
             "walletPlanSend",
             &[to_clean.into(), amount_micro.into(), fee_micro.into()],
         )
         .await
-        .context("walletPlanSend")?;
+        {
+            Ok(result) => result,
+            Err(error) => {
+                if let Some(message) = consolidation_required_message(&error) {
+                    bail!(message);
+                }
+                return Err(error).context("walletPlanSend");
+            }
+        };
         if ctx.json {
             return print_json(&result);
         }
@@ -1591,31 +1599,29 @@ async fn cmd_send(
             &format!("{} NOID", noid_str(amount_micro)),
             &format!("({amount_micro} μNOID)"),
         );
-        let planned_fee = result["total_fee_micronoid"].as_u64().unwrap_or(0);
+        let planned_fee = result["fee_micronoid"].as_u64().unwrap_or(0);
         kv2(
-            "Total fee",
+            "Fee",
             &format!("{} NOID", noid_str(planned_fee)),
             &format!(
                 "({planned_fee} μNOID){}",
                 if fee.is_none() { " auto" } else { "" }
             ),
         );
-        let chunks = result["chunks"].as_array().cloned().unwrap_or_default();
-        kv("Transactions", &chunks.len().to_string());
-        for (index, chunk) in chunks.iter().enumerate() {
-            let amount = chunk["amount_micronoid"].as_u64().unwrap_or(0);
-            let chunk_fee = chunk["fee_micronoid"].as_u64().unwrap_or(0);
-            let inputs = chunk["input_count"].as_u64().unwrap_or(0);
-            let outputs = chunk["output_count"].as_u64().unwrap_or(0);
-            let change = chunk["change_micronoid"].as_u64().unwrap_or(0);
-            println!(
-                "  TX #{}: inputs={inputs} outputs={outputs} amount={} NOID fee={} NOID change={} NOID",
-                index + 1,
-                noid_str(amount),
-                noid_str(chunk_fee),
-                noid_str(change),
-            );
-        }
+        kv(
+            "Inputs",
+            &result["input_count"].as_u64().unwrap_or(0).to_string(),
+        );
+        kv(
+            "Outputs",
+            &result["output_count"].as_u64().unwrap_or(0).to_string(),
+        );
+        let change = result["change_micronoid"].as_u64().unwrap_or(0);
+        kv2(
+            "Change",
+            &format!("{} NOID", noid_str(change)),
+            &format!("({change} μNOID)"),
+        );
         println!();
         println!(
             "  {} Dry run only; no proof was generated and nothing was submitted.",
@@ -1656,19 +1662,11 @@ async fn cmd_send(
     match result {
         Ok(r) if ctx.json => return print_json(&r),
         Ok(r) => {
-            let chunks = r["chunks"].as_array().cloned().unwrap_or_default();
-            let actual_fee = r["total_fee_micronoid"].as_u64().unwrap_or(0);
+            let actual_fee = r["fee_micronoid"].as_u64().unwrap_or(0);
             let auto_tag = if fee.is_none() { " (auto)" } else { "" };
 
             section("Transaction submitted");
-            if chunks.len() == 1 {
-                ok_msg(&format!(
-                    "TX {}",
-                    ctx.h(chunks[0]["txid"].as_str().unwrap_or("?"))
-                ));
-            } else {
-                ok_msg(&format!("{} ordinary transactions submitted", chunks.len()));
-            }
+            ok_msg(&format!("TX {}", ctx.h(r["txid"].as_str().unwrap_or("?"))));
             println!();
             kv("To", to_clean);
             kv2(
@@ -1681,17 +1679,9 @@ async fn cmd_send(
                 &format!("{} NOID", noid_str(actual_fee)),
                 &format!("({actual_fee} μNOID){auto_tag}"),
             );
-            for (index, chunk) in chunks.iter().enumerate() {
-                let txid = chunk["txid"].as_str().unwrap_or("?");
-                let chunk_fee = chunk["fee_micronoid"].as_u64().unwrap_or(0);
-                kv(
-                    &format!("TX #{} (fee {} NOID)", index + 1, noid_str(chunk_fee)),
-                    ctx.h(txid),
-                );
-            }
             println!();
             println!(
-                "  {} Submitted transaction(s) are pending confirmation.",
+                "  {} Submitted transaction is pending confirmation.",
                 c!(DIM, "⏳")
             );
             println!(
@@ -1703,32 +1693,8 @@ async fn cmd_send(
         Err(e) => {
             // Re-format common wallet errors into human language
             let msg = e.to_string();
-            if let Some(partial) = e
-                .downcast_ref::<RpcCallError>()
-                .filter(|error| error.code == -32010)
-                .and_then(|error| error.data.as_ref())
-            {
-                let submitted = partial["submitted_chunks"]
-                    .as_array()
-                    .cloned()
-                    .unwrap_or_default();
-                let remaining = partial["remaining_amount_micronoid"].as_u64().unwrap_or(0);
-                eprintln!(
-                    "Partial payment: {} transaction(s) were admitted; {} NOID remains unsent.",
-                    submitted.len(),
-                    noid_str(remaining)
-                );
-                for (index, chunk) in submitted.iter().enumerate() {
-                    eprintln!(
-                        "  TX #{}: {}",
-                        index + 1,
-                        chunk["txid"].as_str().unwrap_or("?")
-                    );
-                }
-                bail!(
-                    "Do not resend the original amount blindly. Wait for admitted transactions, then send only the reported remainder. Details: {}",
-                    partial["error"].as_str().unwrap_or("unknown failure")
-                );
+            if let Some(message) = consolidation_required_message(&e) {
+                bail!(message);
             }
             let human = if msg.contains("Insufficient") || msg.contains("insufficient") {
                 // Try to extract amounts
@@ -2000,11 +1966,10 @@ async fn cmd_consolidate(
 
         match rpc(ctx, "walletConsolidate", &[fee_micro.into()]).await {
             Ok(r) => {
-                let chunk = &r["chunks"][0];
-                let tx_hash = chunk["txid"].as_str().unwrap_or("?");
-                let actual_fee = chunk["fee_micronoid"].as_u64().unwrap_or(fee_micro);
-                let n_inputs = chunk["input_count"].as_u64().unwrap_or(0);
-                let n_outputs = chunk["output_count"].as_u64().unwrap_or(0);
+                let tx_hash = r["txid"].as_str().unwrap_or("?");
+                let actual_fee = r["fee_micronoid"].as_u64().unwrap_or(fee_micro);
+                let n_inputs = r["input_count"].as_u64().unwrap_or(0);
+                let n_outputs = r["output_count"].as_u64().unwrap_or(0);
                 let reduction = n_inputs.saturating_sub(n_outputs);
                 total_rounds += 1;
                 ok_msg(&format!("Round {total_rounds}: TX {}", ctx.h(tx_hash)));
@@ -2281,6 +2246,22 @@ impl std::fmt::Display for RpcCallError {
 
 impl std::error::Error for RpcCallError {}
 
+fn consolidation_required_message(error: &anyhow::Error) -> Option<String> {
+    let rpc = error.downcast_ref::<RpcCallError>()?;
+    if rpc.code != i64::from(noid_rpc::types::WALLET_CONSOLIDATION_REQUIRED_CODE) {
+        return None;
+    }
+    let target = rpc
+        .data
+        .as_ref()?
+        .get("target_amount_micronoid")?
+        .as_u64()?;
+    Some(format!(
+        "Consolidation required for {} NOID. Run targeted consolidation for this amount, then retry.",
+        noid_str(target)
+    ))
+}
+
 async fn rpc(ctx: &Ctx<'_>, method: &str, params: &[Value]) -> anyhow::Result<Value> {
     let method_full = format!("paranoid_{method}");
     let body = serde_json::json!({
@@ -2336,7 +2317,7 @@ fn print_json(v: &Value) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod amount_tests {
-    use super::{noid_str, parse_noid_amount};
+    use super::{consolidation_required_message, noid_str, parse_noid_amount, RpcCallError};
 
     #[test]
     fn decimal_amounts_are_exact_and_checked() {
@@ -2348,5 +2329,20 @@ mod amount_tests {
         assert!(parse_noid_amount("NaN").is_err());
         assert!(parse_noid_amount("inf").is_err());
         assert!(parse_noid_amount("18446744073710").is_err());
+    }
+
+    #[test]
+    fn consolidation_error_reports_only_the_target_amount() {
+        let error = anyhow::Error::new(RpcCallError {
+            code: i64::from(noid_rpc::types::WALLET_CONSOLIDATION_REQUIRED_CODE),
+            message: noid_rpc::types::WALLET_CONSOLIDATION_REQUIRED_MESSAGE.to_string(),
+            data: Some(serde_json::json!({ "target_amount_micronoid": 100_000_000 })),
+        });
+        assert_eq!(
+            consolidation_required_message(&error).as_deref(),
+            Some(
+                "Consolidation required for 100.000000 NOID. Run targeted consolidation for this amount, then retry."
+            )
+        );
     }
 }

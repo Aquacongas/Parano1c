@@ -16,6 +16,23 @@ use crate::types::{
     WalletStatus, WalletUtxoInfo,
 };
 
+/// Deterministic send-planning failure. Keeping the consolidation case typed
+/// prevents the RPC layer from scraping human-readable wallet errors.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum WalletSendPlanError {
+    #[error("InsufficientFunds: need {needed_micronoid} μNOID, have {available_micronoid} μNOID spendable")]
+    InsufficientFunds {
+        needed_micronoid: u64,
+        available_micronoid: u64,
+    },
+
+    #[error("ConsolidationRequired")]
+    ConsolidationRequired { target_amount_micronoid: u64 },
+
+    #[error("{0}")]
+    Other(String),
+}
+
 /// Immutable activation/reload intent captured under the wallet lock.
 /// Commit rejects it if either wallet index changed before installation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,21 +84,20 @@ pub trait WalletOps: Send + Sync {
     /// guard, establishing the global `chain -> wallet` lock order.
     fn on_accepted_block(&self, block: &Block) -> Result<(), String>;
 
-    /// Deterministically plan a logical payment as one or more ordinary
-    /// canonical transactions. Every chunk uses at most eight active UTXOs.
+    /// Deterministically plan one ordinary canonical payment transaction using
+    /// at most eight active-owner UTXOs.
     ///
-    /// `explicit_fee_per_tx_micronoid = Some(fee)` applies that fee to every planned tx
-    /// and rejects it if below the deterministic minimum for the resulting I/O.
-    /// `None` computes the automatic relay fee independently for each chunk
-    /// from its actual input/output counts.
+    /// `explicit_fee_micronoid = Some(fee)` applies that exact fee and rejects
+    /// it if below the deterministic minimum for the resulting I/O. `None`
+    /// computes the automatic relay fee from the actual input/output counts.
     fn plan_send(
         &self,
         amount_micronoid: u64,
-        explicit_fee_per_tx_micronoid: Option<u64>,
+        explicit_fee_micronoid: Option<u64>,
         active_slot_count: u64,
         log_slots: u32,
         relay_floor: u64,
-    ) -> Result<WalletSendPlan, String>;
+    ) -> Result<WalletSendPlan, WalletSendPlanError>;
 
     /// Build, prove, and serialize a send transaction.
     ///

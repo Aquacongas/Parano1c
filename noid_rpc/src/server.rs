@@ -30,11 +30,11 @@ use crate::api::ParanoidApiServer;
 use crate::types::{
     AddressInfo, BlockHeaderInfo, BlockTemplateResponse, ChainInfo, FeeBreakdownInfo, FeeEstimate,
     MempoolInfo, MempoolTxInfo, MiningInfo, ReceiptVerifyResult, SlotInfo, StateInfo, TxInfo,
-    WalletAddressInfo, WalletBalance, WalletConsolidatePlan, WalletHistoryEntry, WalletScanResult,
-    WalletSendPartialError, WalletSendPlan, WalletSendResult, WalletStatus, WalletSubmittedChunk,
-    WalletUtxoInfo,
+    WalletAddressInfo, WalletBalance, WalletConsolidatePlan, WalletConsolidationRequired,
+    WalletHistoryEntry, WalletScanResult, WalletSendPlan, WalletSendResult, WalletStatus,
+    WalletUtxoInfo, WALLET_CONSOLIDATION_REQUIRED_CODE, WALLET_CONSOLIDATION_REQUIRED_MESSAGE,
 };
-use crate::wallet_ops::{WalletActivationPreview, WalletOps};
+use crate::wallet_ops::{WalletActivationPreview, WalletOps, WalletSendPlanError};
 use crate::wallet_submit::{
     collect_empty_slot_hints, next_user_epoch_anchor, PendingAdmissionGuard,
     WalletSubmitCoordinator,
@@ -44,27 +44,19 @@ fn rpc_err(msg: impl Into<String>) -> ErrorObject<'static> {
     ErrorObject::owned(-32000, msg.into(), None::<()>)
 }
 
-fn wallet_send_error(
-    submitted_chunks: Vec<WalletSubmittedChunk>,
-    submitted_fee_micronoid: u64,
-    next_chunk_index: usize,
-    remaining_amount_micronoid: u64,
-    error: String,
-) -> ErrorObject<'static> {
-    if submitted_chunks.is_empty() {
-        return rpc_err(error);
+fn wallet_plan_error(error: WalletSendPlanError) -> ErrorObject<'static> {
+    match error {
+        WalletSendPlanError::ConsolidationRequired {
+            target_amount_micronoid,
+        } => ErrorObject::owned(
+            WALLET_CONSOLIDATION_REQUIRED_CODE,
+            WALLET_CONSOLIDATION_REQUIRED_MESSAGE,
+            Some(WalletConsolidationRequired {
+                target_amount_micronoid,
+            }),
+        ),
+        other => rpc_err(other.to_string()),
     }
-    ErrorObject::owned(
-        -32010,
-        "wallet payment partially submitted",
-        Some(WalletSendPartialError {
-            submitted_chunks,
-            submitted_fee_micronoid,
-            next_chunk_index,
-            remaining_amount_micronoid,
-            error,
-        }),
-    )
 }
 
 #[inline]
@@ -903,7 +895,7 @@ impl ParanoidApiServer for RpcHandler {
                 .await
             {
                 Ok(Some(result)) => tracing::info!(
-                    txid = %result.chunks[0].txid,
+                    txid = %result.txid,
                     "proactive miner consolidation admitted"
                 ),
                 Ok(None) => {}
@@ -1217,7 +1209,7 @@ impl ParanoidApiServer for RpcHandler {
         &self,
         to_address: String,
         amount_micronoid: u64,
-        fee_per_tx_micronoid: u64,
+        fee_micronoid: u64,
     ) -> RpcResult<WalletSendPlan> {
         let _wallet_operation = self.wallet_operation_gate.lock().await;
         self.reload_active_wallet().await?;
@@ -1227,23 +1219,23 @@ impl ParanoidApiServer for RpcHandler {
         self.wallet
             .plan_send(
                 amount_micronoid,
-                if fee_per_tx_micronoid == 0 {
+                if fee_micronoid == 0 {
                     None
                 } else {
-                    Some(fee_per_tx_micronoid)
+                    Some(fee_micronoid)
                 },
                 active_slot_count,
                 log_slots,
                 floor,
             )
-            .map_err(rpc_err)
+            .map_err(wallet_plan_error)
     }
 
     async fn wallet_send(
         &self,
         to_address: String,
         amount_micronoid: u64,
-        fee_per_tx_micronoid: u64,
+        fee_micronoid: u64,
     ) -> RpcResult<WalletSendResult> {
         let _wallet_operation = self.wallet_operation_gate.lock().await;
         self.reload_active_wallet().await?;
@@ -1255,16 +1247,17 @@ impl ParanoidApiServer for RpcHandler {
             .wallet
             .plan_send(
                 amount_micronoid,
-                (fee_per_tx_micronoid != 0).then_some(fee_per_tx_micronoid),
+                (fee_micronoid != 0).then_some(fee_micronoid),
                 fee_active_slot_count,
                 fee_log_slots,
                 fee_floor,
             )
-            .map_err(rpc_err)?;
+            .map_err(wallet_plan_error)?;
         tracing::info!(
-            chunks = plan.chunks.len(),
             amount_micronoid,
-            total_fee_micronoid = plan.total_fee_micronoid,
+            fee_micronoid = plan.fee_micronoid,
+            input_count = plan.input_count,
+            output_count = plan.output_count,
             "wallet_send deterministic plan ready"
         );
 
@@ -1272,182 +1265,133 @@ impl ParanoidApiServer for RpcHandler {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .subsec_nanos() as u64;
-        let mut submitted_chunks: Vec<WalletSubmittedChunk> = Vec::with_capacity(plan.chunks.len());
-        let mut submitted_fee_micronoid = 0u64;
-
-        for (chunk_index, chunk) in plan.chunks.iter().enumerate() {
-            let Some(remaining_amount_micronoid) = plan.chunks[chunk_index..]
-                .iter()
-                .map(|chunk| chunk.amount_micronoid)
-                .try_fold(0u64, u64::checked_add)
-            else {
-                return Err(wallet_send_error(
-                    submitted_chunks,
-                    submitted_fee_micronoid,
-                    chunk_index,
-                    0,
-                    "wallet plan amount arithmetic overflow".to_string(),
-                ));
-            };
-            let mut last_error = String::new();
-            let mut admitted = false;
-
-            for attempt in 0..3u32 {
-                if attempt > 0 {
-                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                }
-                let reserved_outputs = self.mempool.reserved_output_slots().await;
-                let selection = {
-                    let chain = self.chain.read().await;
-                    let tip = chain.tip_header();
-                    let unique_seed = u64::from_le_bytes(tip.state_root[..8].try_into().unwrap())
-                        .wrapping_add(
-                            call_nonce
-                                .wrapping_add(attempt as u64)
-                                .wrapping_add(
-                                    (chunk_index as u64).wrapping_mul(0x517c_c1b7_2722_0a95),
-                                )
-                                .wrapping_mul(0x9e37_79b9_7f4a_7c15),
-                        );
-                    next_user_epoch_anchor(&chain).and_then(|epoch_anchor| {
-                        collect_empty_slot_hints(
-                            &chain,
-                            &reserved_outputs,
-                            unique_seed,
-                            noid_tx::TX_OUTPUTS,
-                            256,
-                        )
-                        .map(|slot_hints| (epoch_anchor, tip.log_slots, slot_hints))
-                    })
-                };
-                let (epoch_anchor, log_slots, slot_hints) = match selection {
-                    Ok(selection) => selection,
-                    Err(error) => {
-                        last_error = error;
-                        break;
-                    }
-                };
-                if slot_hints.len() < chunk.output_count {
-                    last_error = "not enough empty output slots available".to_string();
-                    break;
-                }
-
-                let wallet = Arc::clone(&self.wallet);
-                let chunk_amount = chunk.amount_micronoid;
-                let chunk_fee = chunk.fee_micronoid;
-                let (intent_bytes, input_slots) = match tokio::task::spawn_blocking(move || {
-                    wallet.build_send(
-                        to_address,
-                        chunk_amount,
-                        chunk_fee,
-                        epoch_anchor,
-                        slot_hints,
-                        log_slots,
-                    )
-                })
-                .await
-                {
-                    Ok(Ok(parts)) => parts,
-                    Ok(Err(error)) => {
-                        last_error = error;
-                        break;
-                    }
-                    Err(error) => {
-                        last_error = format!("wallet proof task: {error}");
-                        break;
-                    }
-                };
-
-                let intent = match noid_tx::TxIntent::from_bytes(&intent_bytes) {
-                    Ok(intent) => intent,
-                    Err(error) => {
-                        last_error = format!("intent decode: {error:?}");
-                        break;
-                    }
-                };
-                let input_count = intent.tx_body.live_input_count();
-                let output_count = intent.tx_body.live_output_count();
-                let actual_fee = intent.tx_body.fee;
-                let failed_txid = intent.txid().0;
-                let output_slots: Vec<u32> = intent
-                    .tx_body
-                    .live_outputs()
-                    .map(|(_, output)| output.slot_index)
-                    .collect();
-                if actual_fee != chunk.fee_micronoid
-                    || input_count != chunk.input_count
-                    || output_count != chunk.output_count
-                {
-                    last_error = format!(
-                        "wallet builder diverged from plan: expected fee/counts {}/{}/{}, got {actual_fee}/{input_count}/{output_count}",
-                        chunk.fee_micronoid, chunk.input_count, chunk.output_count
+        let mut last_error = String::new();
+        for attempt in 0..3u32 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+            let reserved_outputs = self.mempool.reserved_output_slots().await;
+            let selection = {
+                let chain = self.chain.read().await;
+                let tip = chain.tip_header();
+                let unique_seed = u64::from_le_bytes(tip.state_root[..8].try_into().unwrap())
+                    .wrapping_add(
+                        call_nonce
+                            .wrapping_add(attempt as u64)
+                            .wrapping_mul(0x9e37_79b9_7f4a_7c15),
                     );
+                next_user_epoch_anchor(&chain).and_then(|epoch_anchor| {
+                    collect_empty_slot_hints(
+                        &chain,
+                        &reserved_outputs,
+                        unique_seed,
+                        noid_tx::TX_OUTPUTS,
+                        256,
+                    )
+                    .map(|slot_hints| (epoch_anchor, tip.log_slots, slot_hints))
+                })
+            };
+            let (epoch_anchor, log_slots, slot_hints) = match selection {
+                Ok(selection) => selection,
+                Err(error) => {
+                    last_error = error;
                     break;
                 }
-                let Some(next_submitted_fee_micronoid) =
-                    submitted_fee_micronoid.checked_add(actual_fee)
-                else {
-                    last_error = "wallet admitted-prefix fee arithmetic overflow".to_string();
-                    break;
-                };
-
-                let reservation = match PendingAdmissionGuard::reserve(
-                    Arc::clone(&self.wallet),
-                    failed_txid,
-                    input_slots,
-                    output_slots,
-                    chunk.amount_micronoid,
-                    to_address,
-                ) {
-                    Ok(reservation) => reservation,
-                    Err(error) => {
-                        last_error = error;
-                        break;
-                    }
-                };
-                match self.mempool.submit(intent, intent_bytes).await {
-                    Ok(txid) => {
-                        reservation.commit();
-                        submitted_fee_micronoid = next_submitted_fee_micronoid;
-                        submitted_chunks.push(WalletSubmittedChunk {
-                            txid: hex::encode(txid.0),
-                            amount_micronoid: chunk.amount_micronoid,
-                            fee_micronoid: actual_fee,
-                            input_count,
-                            output_count,
-                        });
-                        admitted = true;
-                        if attempt > 0 {
-                            tracing::info!(
-                                chunk_index,
-                                attempt,
-                                "wallet_send chunk succeeded after retry"
-                            );
-                        }
-                        break;
-                    }
-                    Err(error) => {
-                        drop(reservation);
-                        last_error = error.to_string();
-                    }
-                }
+            };
+            if slot_hints.len() < plan.output_count {
+                last_error = "not enough empty output slots available".to_string();
+                break;
             }
 
-            if !admitted {
-                return Err(wallet_send_error(
-                    submitted_chunks,
-                    submitted_fee_micronoid,
-                    chunk_index,
-                    remaining_amount_micronoid,
-                    last_error,
-                ));
+            let wallet = Arc::clone(&self.wallet);
+            let (intent_bytes, input_slots) = match tokio::task::spawn_blocking(move || {
+                wallet.build_send(
+                    to_address,
+                    amount_micronoid,
+                    plan.fee_micronoid,
+                    epoch_anchor,
+                    slot_hints,
+                    log_slots,
+                )
+            })
+            .await
+            {
+                Ok(Ok(parts)) => parts,
+                Ok(Err(error)) => {
+                    last_error = error;
+                    break;
+                }
+                Err(error) => {
+                    last_error = format!("wallet proof task: {error}");
+                    break;
+                }
+            };
+
+            let intent = match noid_tx::TxIntent::from_bytes(&intent_bytes) {
+                Ok(intent) => intent,
+                Err(error) => {
+                    last_error = format!("intent decode: {error:?}");
+                    break;
+                }
+            };
+            let input_count = intent.tx_body.live_input_count();
+            let output_count = intent.tx_body.live_output_count();
+            let actual_fee = intent.tx_body.fee;
+            let failed_txid = intent.txid().0;
+            let output_slots: Vec<u32> = intent
+                .tx_body
+                .live_outputs()
+                .map(|(_, output)| output.slot_index)
+                .collect();
+            if actual_fee != plan.fee_micronoid
+                || input_count != plan.input_count
+                || output_count != plan.output_count
+            {
+                last_error = format!(
+                    "wallet builder diverged from plan: expected fee/counts {}/{}/{}, got {actual_fee}/{input_count}/{output_count}",
+                    plan.fee_micronoid, plan.input_count, plan.output_count
+                );
+                break;
+            }
+
+            let reservation = match PendingAdmissionGuard::reserve(
+                Arc::clone(&self.wallet),
+                failed_txid,
+                input_slots,
+                output_slots,
+                amount_micronoid,
+                to_address,
+            ) {
+                Ok(reservation) => reservation,
+                Err(error) => {
+                    last_error = error;
+                    break;
+                }
+            };
+            match self.mempool.submit(intent, intent_bytes).await {
+                Ok(txid) => {
+                    reservation.commit();
+                    if attempt > 0 {
+                        tracing::info!(attempt, "wallet_send succeeded after retry");
+                    }
+                    return Ok(WalletSendResult {
+                        txid: hex::encode(txid.0),
+                        amount_micronoid,
+                        fee_micronoid: actual_fee,
+                        input_count,
+                        output_count,
+                    });
+                }
+                Err(error) => {
+                    drop(reservation);
+                    last_error = error.to_string();
+                }
             }
         }
 
-        Ok(WalletSendResult {
-            chunks: submitted_chunks,
-            total_fee_micronoid: submitted_fee_micronoid,
-        })
+        Err(rpc_err(format!(
+            "wallet send failed after 3 attempts: {last_error}"
+        )))
     }
 
     async fn wallet_export_receipt(&self, txhash_hex: String) -> RpcResult<String> {
@@ -1640,37 +1584,23 @@ mod tests {
     }
 
     #[test]
-    fn partial_wallet_send_error_carries_admitted_prefix_and_resume_cursor() {
-        let admitted = WalletSubmittedChunk {
-            txid: "11".repeat(32),
-            amount_micronoid: 70_000,
-            fee_micronoid: 10_000,
-            input_count: 8,
-            output_count: 1,
-        };
-        let error = wallet_send_error(
-            vec![admitted.clone()],
-            admitted.fee_micronoid,
-            1,
-            80_000,
-            "epoch anchor changed".to_string(),
-        );
+    fn consolidation_required_error_exposes_only_target_amount() {
+        let error = wallet_plan_error(WalletSendPlanError::ConsolidationRequired {
+            target_amount_micronoid: 80_000,
+        });
 
-        assert_eq!(error.code(), -32010);
-        assert_eq!(error.message(), "wallet payment partially submitted");
-        let data: WalletSendPartialError = serde_json::from_str(
+        assert_eq!(error.code(), WALLET_CONSOLIDATION_REQUIRED_CODE);
+        assert_eq!(error.message(), WALLET_CONSOLIDATION_REQUIRED_MESSAGE);
+        let data: WalletConsolidationRequired = serde_json::from_str(
             error
                 .data()
-                .expect("partial error has structured data")
+                .expect("consolidation error has structured data")
                 .get(),
         )
-        .expect("partial error data decodes");
-        assert_eq!(data.submitted_chunks.len(), 1);
-        assert_eq!(data.submitted_chunks[0].txid, admitted.txid);
-        assert_eq!(data.submitted_fee_micronoid, 10_000);
-        assert_eq!(data.next_chunk_index, 1);
-        assert_eq!(data.remaining_amount_micronoid, 80_000);
-        assert_eq!(data.error, "epoch anchor changed");
+        .expect("consolidation error data decodes");
+        assert_eq!(data.target_amount_micronoid, 80_000);
+        let value = serde_json::to_value(data).unwrap();
+        assert_eq!(value.as_object().unwrap().len(), 1);
     }
 
     #[test]

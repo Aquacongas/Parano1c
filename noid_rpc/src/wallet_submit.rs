@@ -17,7 +17,7 @@ use noid_chain::storage::MdbxChainContext;
 use noid_mempool::AsyncMempool;
 use tokio::sync::{Mutex, RwLock};
 
-use crate::types::{WalletSendResult, WalletSubmittedChunk};
+use crate::types::WalletSendResult;
 use crate::wallet_ops::WalletOps;
 
 pub type WalletOperationGate = Arc<Mutex<()>>;
@@ -266,14 +266,11 @@ impl WalletSubmitCoordinator {
                         self.proactive_latch.mark(admitted_tip);
                     }
                     return Ok(Some(WalletSendResult {
-                        chunks: vec![WalletSubmittedChunk {
-                            txid: hex::encode(txid.0),
-                            amount_micronoid,
-                            fee_micronoid: actual_fee,
-                            input_count,
-                            output_count,
-                        }],
-                        total_fee_micronoid: actual_fee,
+                        txid: hex::encode(txid.0),
+                        amount_micronoid,
+                        fee_micronoid: actual_fee,
+                        input_count,
+                        output_count,
                     }));
                 }
                 Err(error) => {

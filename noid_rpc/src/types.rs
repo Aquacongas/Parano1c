@@ -211,25 +211,29 @@ pub struct FeeEstimate {
     pub breakdown: FeeBreakdownInfo,
 }
 
-/// One ordinary Tx8x2 in a deterministic logical-payment plan.
+/// Dry-run plan for one ordinary Tx8x2 payment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WalletSendChunkPlan {
+pub struct WalletSendPlan {
     pub amount_micronoid: u64,
     pub fee_micronoid: u64,
+    pub total_spend_micronoid: u64,
     pub input_count: usize,
     pub output_count: usize,
     pub change_micronoid: u64,
     pub fee_breakdown: FeeBreakdownInfo,
 }
 
-/// Complete dry-run plan. Large payments are multiple ordinary transactions;
-/// there is no alternate bulk block or transaction form.
+/// Stable JSON-RPC code for a payment blocked by input fragmentation.
+pub const WALLET_CONSOLIDATION_REQUIRED_CODE: i32 = -32011;
+/// Stable JSON-RPC message for a payment blocked by input fragmentation.
+pub const WALLET_CONSOLIDATION_REQUIRED_MESSAGE: &str = "ConsolidationRequired";
+
+/// JSON-RPC error data when the active wallet has enough total spendable
+/// balance, but no legal set of at most eight inputs can fund the payment.
+/// This deliberately exposes only the amount that must be consolidated.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WalletSendPlan {
-    pub amount_micronoid: u64,
-    pub total_fee_micronoid: u64,
-    pub total_spend_micronoid: u64,
-    pub chunks: Vec<WalletSendChunkPlan>,
+pub struct WalletConsolidationRequired {
+    pub target_amount_micronoid: u64,
 }
 
 /// Dry-run plan for one consolidation transaction.
@@ -242,33 +246,14 @@ pub struct WalletConsolidatePlan {
     pub fee_breakdown: FeeBreakdownInfo,
 }
 
-/// One successfully admitted ordinary transaction.
+/// One successfully admitted ordinary payment or consolidation transaction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WalletSubmittedChunk {
+pub struct WalletSendResult {
     pub txid: String,
     pub amount_micronoid: u64,
     pub fee_micronoid: u64,
     pub input_count: usize,
     pub output_count: usize,
-}
-
-/// Successful logical payment or consolidation result.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WalletSendResult {
-    pub chunks: Vec<WalletSubmittedChunk>,
-    pub total_fee_micronoid: u64,
-}
-
-/// JSON-RPC error data when a later planned transaction fails after earlier
-/// transactions were admitted. The admitted prefix is final and remains
-/// pending; clients can resume only the explicitly reported remainder.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WalletSendPartialError {
-    pub submitted_chunks: Vec<WalletSubmittedChunk>,
-    pub submitted_fee_micronoid: u64,
-    pub next_chunk_index: usize,
-    pub remaining_amount_micronoid: u64,
-    pub error: String,
 }
 
 /// Decoded block header (structured, not raw bytes).

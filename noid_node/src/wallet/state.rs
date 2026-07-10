@@ -408,6 +408,14 @@ impl WalletState {
             )
         });
 
+        // Prefer an exact one-input payment before the largest-first prefix.
+        // Besides avoiding an unnecessary change output, this lets an explicit
+        // fee that is valid for 1 -> 1 remain usable when a larger UTXO would
+        // require the more expensive 1 -> 2 shape.
+        if let Some(exact) = available.iter().copied().find(|utxo| utxo.value == needed) {
+            return Some((vec![exact], 0));
+        }
+
         let mut selected = Vec::new();
         let mut total = 0u64;
         for utxo in available.into_iter().take(noid_tx::TX_INPUTS) {

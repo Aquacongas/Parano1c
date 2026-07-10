@@ -693,7 +693,7 @@ async fn main() -> anyhow::Result<()> {
                 Box::pin(async move {
                     match proactive.submit_consolidation(noid_tx::TX_INPUTS, 0).await {
                         Ok(Some(result)) => tracing::info!(
-                            txid = %result.chunks[0].txid,
+                            txid = %result.txid,
                             "proactive miner consolidation admitted before template"
                         ),
                         Ok(None) => {}

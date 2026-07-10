@@ -210,26 +210,25 @@ pub trait ParanoidApi {
     async fn wallet_scan(&self) -> RpcResult<WalletScanResult>;
 
     /// Dry-run wallet send planning without proving or submitting.
-    /// `fee_per_tx_micronoid = 0` computes an automatic fee per planned transaction.
+    /// `fee_micronoid = 0` computes the automatic fee.
     #[method(name = "walletPlanSend")]
     async fn wallet_plan_send(
         &self,
         to_address: String,
         amount_micronoid: u64,
-        fee_per_tx_micronoid: u64,
+        fee_micronoid: u64,
     ) -> RpcResult<WalletSendPlan>;
 
     /// Send NOID to a recipient address.
     /// `to_address`: recipient bech32m address.
     /// `amount_micronoid`: amount in μNOID.
-    /// `fee_per_tx_micronoid`: fee applied to every ordinary transaction
-    /// (0 = automatic fee independently per transaction).
+    /// `fee_micronoid`: exact fee (0 = automatic fee).
     #[method(name = "walletSend")]
     async fn wallet_send(
         &self,
         to_address: String,
         amount_micronoid: u64,
-        fee_per_tx_micronoid: u64,
+        fee_micronoid: u64,
     ) -> RpcResult<WalletSendResult>;
 
     /// Export a receipt for a confirmed transaction (hex-encoded bytes).
@@ -243,7 +242,7 @@ pub trait ParanoidApi {
         -> RpcResult<WalletConsolidatePlan>;
 
     /// Consolidate up to eight small UTXOs into one larger UTXO.
-    /// Returns the one submitted ordinary-transaction chunk.
+    /// Returns the submitted ordinary transaction.
     /// Returns an error if the wallet has 1 or fewer available UTXOs, or insufficient funds.
     /// `fee_micronoid = 0` uses an automatic fee for the selected inputs.
     #[method(name = "walletConsolidate")]
