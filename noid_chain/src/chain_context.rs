@@ -23,8 +23,9 @@ use crate::block::Block;
 use crate::block_header::BlockHeader;
 use crate::consensus::{
     da_prune::{build_undo_log, prune_undo_logs, BlockUndoLog},
+    epoch_anchor::{tx_epoch_anchor_height_for_child, validate_block_epoch_anchors},
     genesis::genesis_header,
-    header::epoch_anchor_height,
+    header::asert_anchor_height,
     params::{EXPANSION_WINDOW, MEDIAN_TIME_BLOCKS},
     pow::block_id,
     validation::{validate_block_consensus, AnchorInfo},
@@ -121,7 +122,7 @@ impl ChainContext {
     ///
     /// The anchor is the header at the most recent epoch boundary.
     pub fn anchor_info(&self) -> AnchorInfo {
-        let anchor_height = epoch_anchor_height(self.tip_height);
+        let anchor_height = asert_anchor_height(self.tip_height);
         let anchor_header = self
             .headers
             .get(&anchor_height)
@@ -158,6 +159,12 @@ impl ChainContext {
         let prev_timestamps = self.prev_timestamps();
         let prev_active_counts = self.prev_active_counts();
         let anchor = self.anchor_info();
+        let tx_anchor_height = tx_epoch_anchor_height_for_child(block.header.height);
+        let tx_anchor_header = self
+            .headers
+            .get(&tx_anchor_height)
+            .ok_or(ConsensusError::BadEpochAnchor)?;
+        validate_block_epoch_anchors(block, block_id(tx_anchor_header), block_id(&parent))?;
 
         // Build undo log BEFORE applying (captures pre-state).
         let undo = build_undo_log(&self.state, block);

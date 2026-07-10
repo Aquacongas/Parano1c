@@ -26,8 +26,9 @@ use noid_core::{Block128, TowerField};
 use noid_gkr::owner_auth::{
     owner_auth_sigma_at, OwnerAuthKillShotProof, OwnerAuthLayout, OwnerAuthProofKillShot,
     OwnerAuthPublicInputs, OWNER_AUTH_BOUNDARY_DOMAIN_TAG, OWNER_AUTH_ELEM_VARS,
-    OWNER_AUTH_GKR_DOMAIN_TAG, OWNER_AUTH_PIN_LANES, OWNER_AUTH_ROUND_VARS,
-    OWNER_AUTH_SLOTS_PER_OWNER, OWNER_AUTH_STATE_ROUND_DEGREE,
+    OWNER_AUTH_GKR_DOMAIN_TAG, OWNER_AUTH_LIVE_SLOTS, OWNER_AUTH_NUM_VARS, OWNER_AUTH_PADDED_SLOTS,
+    OWNER_AUTH_PIN_LANES, OWNER_AUTH_ROUND_VARS, OWNER_AUTH_SLOT_BITS,
+    OWNER_AUTH_STATE_ROUND_DEGREE,
 };
 use noid_poseidon2b::native::domain::{capacity_iv, TAG_ADDRFIX};
 use noid_poseidon2b::native::permutation::{
@@ -64,8 +65,8 @@ fn owner_mds_coeff(round: usize, i: usize, j: usize) -> Block128 {
 // ---------------------------------------------------------------------------
 
 /// Trace twin of the minimal `OwnerAuthPublicInputs`. The exact layout is
-/// fixed metadata; only the transaction-body hash and owner address pairs are
-/// statement wires. Production uses the one-owner layout.
+/// fixed metadata; only the transaction-body hash and sole owner address are
+/// statement wires.
 ///
 /// Statement-binding obligations (the block assembly must pin these wires
 /// to values derived from the transaction statement): `tx_body_hash`,
@@ -74,43 +75,20 @@ fn owner_mds_coeff(round: usize, i: usize, j: usize) -> Block128 {
 pub struct OwnerAuthPublicInputsTrace {
     pub layout: OwnerAuthLayout,
     pub tx_body_hash: [LinExpr; 2],
-    /// One pair per padded slot; ghost pairs carry zero.
-    pub expected_address: Vec<[LinExpr; 2]>,
+    pub expected_address: [LinExpr; 2],
     /// Slot-liveness selectors derived as constants from the exact layout.
     pub slot_live: Vec<LinExpr>,
 }
 
 impl OwnerAuthPublicInputsTrace {
     pub fn alloc(b: &mut FieldR1csBuilder, native: &OwnerAuthPublicInputs) -> Self {
-        // Native `verify_owner_auth_killshot_with_claims` shape checks.
         let layout = native.layout;
-        assert_eq!(
-            OwnerAuthLayout::for_owner_count(layout.owner_count).ok(),
-            Some(layout),
-            "owner-auth trace requires a canonical layout"
-        );
-        assert_eq!(native.expected_address.len(), layout.owner_count);
-        let expected_address: Vec<[LinExpr; 2]> = (0..layout.padded_slots)
-            .map(|slot| {
-                if let Some(pair) = native.expected_address.get(slot) {
-                    std::array::from_fn(|i| alloc_block(b, pair[i]))
-                } else {
-                    std::array::from_fn(|_| super::const_block(Block128::ZERO))
-                }
-            })
-            .collect();
+        assert_eq!(layout, OwnerAuthLayout::FIXED);
+        let expected_address = std::array::from_fn(|i| alloc_block(b, native.expected_address[i]));
 
         // The layout is fixed metadata, so live-vs-ghost selectors are
         // constants rather than malleable witness fields.
-        let slot_live: Vec<LinExpr> = (0..layout.padded_slots)
-            .map(|slot| {
-                super::const_block(if slot < layout.owner_count {
-                    Block128::ONE
-                } else {
-                    Block128::ZERO
-                })
-            })
-            .collect();
+        let slot_live = vec![super::const_block(Block128::ONE)];
 
         Self {
             layout,
@@ -143,19 +121,30 @@ impl OwnerAuthProofTrace {
     pub fn alloc(
         b: &mut FieldR1csBuilder,
         native: &OwnerAuthProofKillShot,
-        layout: OwnerAuthLayout,
+        _layout: OwnerAuthLayout,
     ) -> Self {
         let OwnerAuthKillShotProof { main, shift } = &native.kill_shot;
-        assert_eq!(main.round_polys.len(), layout.num_vars, "proof off shape");
-        assert_eq!(shift.round_polys.len(), layout.num_vars, "proof off shape");
+        assert_eq!(
+            main.round_polys.len(),
+            OWNER_AUTH_NUM_VARS,
+            "proof off shape"
+        );
+        assert_eq!(
+            shift.round_polys.len(),
+            OWNER_AUTH_NUM_VARS,
+            "proof off shape"
+        );
         assert_eq!(
             native.boundary.round_polys.len(),
-            layout.num_vars,
+            OWNER_AUTH_NUM_VARS,
             "proof off shape"
         );
         // Native rejects a wrong log_rows — shape-assert here (it is
         // absorbed as a constant below).
-        assert_eq!(native.pcs.commitment.log_rows, layout.num_vars, "proof off shape");
+        assert_eq!(
+            native.pcs.commitment.log_rows, OWNER_AUTH_NUM_VARS,
+            "proof off shape"
+        );
         Self {
             main_round_polys: main
                 .round_polys
@@ -179,7 +168,7 @@ impl OwnerAuthProofTrace {
                 .map(|r| BatchEvalRoundTrace::alloc(b, r))
                 .collect(),
             boundary_state_at_r: alloc_block(b, native.boundary.state_at_r),
-            batch: BatchEvalProofTrace::alloc(b, &native.batch, layout.num_vars),
+            batch: BatchEvalProofTrace::alloc(b, &native.batch, OWNER_AUTH_NUM_VARS),
             // Capsule digests are FLAT-basis lanes absorbed flat→tower by
             // the native channel, so each wire's flat value IS the raw
             // digest half (== the region tree column cell).
@@ -224,18 +213,15 @@ fn absorb_owner_public_boundary_trace(
     ch: &mut RawChannelTrace,
     inputs: &OwnerAuthPublicInputsTrace,
 ) {
-    let layout = inputs.layout;
-    ch.absorb_const_tower(b, layout.owner_count as u128);
-    ch.absorb_const_tower(b, layout.live_slots as u128);
-    ch.absorb_const_tower(b, layout.slot_bits as u128);
-    ch.absorb_const_tower(b, layout.num_vars as u128);
-    ch.absorb_const_tower(b, layout.padded_slots as u128);
+    ch.absorb_const_tower(b, 1);
+    ch.absorb_const_tower(b, OWNER_AUTH_LIVE_SLOTS as u128);
+    ch.absorb_const_tower(b, OWNER_AUTH_SLOT_BITS as u128);
+    ch.absorb_const_tower(b, OWNER_AUTH_NUM_VARS as u128);
+    ch.absorb_const_tower(b, OWNER_AUTH_PADDED_SLOTS as u128);
     ch.absorb(b, &inputs.tx_body_hash[0]);
     ch.absorb(b, &inputs.tx_body_hash[1]);
-    for pair in &inputs.expected_address {
-        ch.absorb(b, &pair[0]);
-        ch.absorb(b, &pair[1]);
-    }
+    ch.absorb(b, &inputs.expected_address[0]);
+    ch.absorb(b, &inputs.expected_address[1]);
 }
 
 /// Trace twin of `auth_pcs::absorb_auth_mle_commitment`.
@@ -280,7 +266,12 @@ pub(crate) fn owner_unified_final_evals(
     slot_live: &[LinExpr],
     rho: &[LinExpr],
     r_prime: &[LinExpr],
-) -> (LinExpr, [LinExpr; STATE_SIZE], [LinExpr; STATE_SIZE], [LinExpr; STATE_SIZE]) {
+) -> (
+    LinExpr,
+    [LinExpr; STATE_SIZE],
+    [LinExpr; STATE_SIZE],
+    [LinExpr; STATE_SIZE],
+) {
     let r_elem = &r_prime[..ELEM_BITS];
     let r_round = &r_prime[ELEM_BITS..ELEM_BITS + ROUND_BITS];
     let r_slot = &r_prime[ELEM_BITS + ROUND_BITS..];
@@ -368,19 +359,20 @@ fn verify_owner_auth_unified_trace(
     layout: OwnerAuthLayout,
     slot_live: &[LinExpr],
 ) -> OwnerUnifiedReductionTrace {
-    assert_eq!(proof.main_round_polys.len(), layout.num_vars);
+    let _ = layout;
+    assert_eq!(proof.main_round_polys.len(), OWNER_AUTH_NUM_VARS);
 
-    let rho: Vec<LinExpr> = ch.squeeze_n(b, layout.num_vars);
+    let rho: Vec<LinExpr> = ch.squeeze_n(b, OWNER_AUTH_NUM_VARS);
 
     let mut expected = LinExpr::zero();
-    let mut r_prime: Vec<Option<LinExpr>> = vec![None; layout.num_vars];
+    let mut r_prime: Vec<Option<LinExpr>> = vec![None; OWNER_AUTH_NUM_VARS];
     for (round, poly) in proof.main_round_polys.iter().enumerate() {
         // The linear coefficient comes from the running claim, so the
         // per-round sum check holds by construction (no pin).
         poly.absorb_coeffs(b, ch);
         let challenge = ch.squeeze(b);
         expected = poly.evaluate_reconstructed(b, &expected, &challenge);
-        r_prime[layout.num_vars - 1 - round] = Some(challenge);
+        r_prime[OWNER_AUTH_NUM_VARS - 1 - round] = Some(challenge);
     }
     let r_prime: Vec<LinExpr> = r_prime.into_iter().map(Option::unwrap).collect();
 
@@ -469,10 +461,11 @@ pub(crate) fn owner_shift_weights_at_point(
 ) -> LinExpr {
     let rp_elem = &r_prime[..ELEM_BITS];
     let rp_round = &r_prime[ELEM_BITS..ELEM_BITS + ROUND_BITS];
-    let rp_slot = &r_prime[ELEM_BITS + ROUND_BITS..layout.num_vars];
+    let _ = layout;
+    let rp_slot = &r_prime[ELEM_BITS + ROUND_BITS..OWNER_AUTH_NUM_VARS];
     let r2_elem = &r2[..ELEM_BITS];
     let r2_round = &r2[ELEM_BITS..ELEM_BITS + ROUND_BITS];
-    let r2_slot = &r2[ELEM_BITS + ROUND_BITS..layout.num_vars];
+    let r2_slot = &r2[ELEM_BITS + ROUND_BITS..OWNER_AUTH_NUM_VARS];
 
     let eq_slot = if rp_slot.is_empty() {
         LinExpr::constant(super::F128::ONE)
@@ -518,18 +511,13 @@ fn verify_owner_auth_shift_trace(
     layout: OwnerAuthLayout,
     main_red: &OwnerUnifiedReductionTrace,
 ) -> (Vec<LinExpr>, LinExpr) {
-    assert_eq!(proof.shift_round_polys.len(), layout.num_vars);
+    assert_eq!(proof.shift_round_polys.len(), OWNER_AUTH_NUM_VARS);
     let delta = ch.squeeze(b);
     let target = owner_combined_target_trace(b, main_red, &delta);
     let (r_double_prime, expected) =
         weighted_state_rounds_trace(b, ch, &proof.shift_round_polys, target);
-    let w_at_r = owner_shift_weights_at_point(
-        b,
-        layout,
-        &main_red.r_prime,
-        &delta,
-        &r_double_prime,
-    );
+    let w_at_r =
+        owner_shift_weights_at_point(b, layout, &main_red.r_prime, &delta, &r_double_prime);
     let rhs = mul(b, &w_at_r, &proof.shift_state_at_r2);
     pin_zero(b, &expected.add(&rhs));
     ch.absorb(b, &proof.shift_state_at_r2);
@@ -563,33 +551,31 @@ pub(crate) fn owner_boundary_constraints(
 ) -> Vec<ConstraintTrace> {
     let inv = mds_full_inverse_flat();
     let iv_addr = capacity_iv(TAG_ADDRFIX);
-    let mut constraints: Vec<ConstraintTrace> = Vec::new();
-    for slot in 0..layout.padded_slots {
-        let base = slot * OWNER_AUTH_SLOTS_PER_OWNER;
-        let live = &inputs.slot_live[slot];
-        for (pre_lane, iv_lane) in [(2usize, iv_addr[0]), (3usize, iv_addr[1])] {
-            let terms = (0..STATE_SIZE)
-                .map(|post_lane| {
-                    (
-                        spine_point_index(layout.num_vars, base, 0, post_lane),
-                        inv[pre_lane][post_lane],
-                    )
-                })
-                .collect();
-            constraints.push(ConstraintTrace {
-                terms,
-                constant: live.scale(flat_of(iv_lane)),
-            });
-        }
-        for lane in 0..OWNER_AUTH_PIN_LANES {
-            constraints.push(ConstraintTrace {
-                terms: vec![(
-                    spine_point_index(layout.num_vars, base, N_ROUNDS, lane),
-                    Block128::ONE,
-                )],
-                constant: mul(b, live, &inputs.expected_address[slot][lane]),
-            });
-        }
+    let _ = (b, layout);
+    let mut constraints: Vec<ConstraintTrace> = Vec::with_capacity(4);
+    let base = 0;
+    for (pre_lane, iv_lane) in [(2usize, iv_addr[0]), (3usize, iv_addr[1])] {
+        let terms = (0..STATE_SIZE)
+            .map(|post_lane| {
+                (
+                    spine_point_index(OWNER_AUTH_NUM_VARS, base, 0, post_lane),
+                    inv[pre_lane][post_lane],
+                )
+            })
+            .collect();
+        constraints.push(ConstraintTrace {
+            terms,
+            constant: LinExpr::constant(flat_of(iv_lane)),
+        });
+    }
+    for lane in 0..OWNER_AUTH_PIN_LANES {
+        constraints.push(ConstraintTrace {
+            terms: vec![(
+                spine_point_index(OWNER_AUTH_NUM_VARS, base, N_ROUNDS, lane),
+                Block128::ONE,
+            )],
+            constant: inputs.expected_address[lane].clone(),
+        });
     }
     constraints
 }
@@ -643,7 +629,7 @@ fn verify_owner_auth_boundary_trace(
     layout: OwnerAuthLayout,
     inputs: &OwnerAuthPublicInputsTrace,
 ) -> (Vec<LinExpr>, LinExpr) {
-    assert_eq!(proof.boundary_round_polys.len(), layout.num_vars);
+    assert_eq!(proof.boundary_round_polys.len(), OWNER_AUTH_NUM_VARS);
 
     let constraints = owner_boundary_constraints(b, inputs, layout);
 
@@ -653,8 +639,7 @@ fn verify_owner_auth_boundary_trace(
 
     let target = owner_boundary_target(b, &constraints, &alphas);
 
-    let (point, expected) =
-        weighted_state_rounds_trace(b, ch, &proof.boundary_round_polys, target);
+    let (point, expected) = weighted_state_rounds_trace(b, ch, &proof.boundary_round_polys, target);
 
     let w_at = owner_boundary_w(b, &constraints, &alphas, &point);
     let rhs = mul(b, &w_at, &proof.boundary_state_at_r);
@@ -735,11 +720,11 @@ pub fn verify_owner_auth_killshot_trace(
             value: boundary_state_at_r,
         },
     ];
-    let red = verify_batch_eval_trace(b, ch, &proof.batch, &state_claims, layout.num_vars);
+    let red = verify_batch_eval_trace(b, ch, &proof.batch, &state_claims, OWNER_AUTH_NUM_VARS);
 
     PendingAuthPcsObligation {
         commitment_cap_lanes: proof.commitment_cap_lanes.clone(),
-        num_vars: layout.num_vars,
+        num_vars: OWNER_AUTH_NUM_VARS,
         reduction: red,
     }
 }
@@ -774,23 +759,12 @@ mod tests {
         verify_owner_auth_killshot_with_claims, OwnerAuthInputs,
     };
 
-    /// Honest fixture: mirrors `owner_auth` unit-test construction — owners
-    /// with secrets, addresses derived by the native boundary computation.
-    fn fixture(owner_count: usize, seed: u128) -> (OwnerAuthInputs, OwnerAuthPublicInputs) {
-        let layout = OwnerAuthLayout::for_owner_count(owner_count).unwrap();
-        let circuit = noid_gkr::owner_auth::OwnerAuthCircuit::build(layout);
-        let spend_secret: Vec<[Block128; 2]> = (0..owner_count)
-            .map(|i| {
-                [
-                    Block128::from(seed + 1000 + i as u128),
-                    Block128::from(seed + 2000 + i as u128),
-                ]
-            })
-            .collect();
+    fn fixture(seed: u128) -> (OwnerAuthInputs, OwnerAuthPublicInputs) {
+        let circuit = noid_gkr::owner_auth::OwnerAuthCircuit::build();
+        let spend_secret = [Block128::from(seed + 1000), Block128::from(seed + 2000)];
         let tx_body_hash = [Block128::from(seed + 7), Block128::from(seed + 8)];
-        let expected_address =
-            compute_owner_auth_boundary(&circuit, spend_secret.clone(), tx_body_hash);
-        let public = OwnerAuthPublicInputs::new(layout, tx_body_hash, expected_address).unwrap();
+        let expected_address = compute_owner_auth_boundary(&circuit, spend_secret, tx_body_hash);
+        let public = OwnerAuthPublicInputs::new(tx_body_hash, expected_address);
         let inputs = OwnerAuthInputs::from_parts(&public, spend_secret);
         (inputs, public)
     }
@@ -799,22 +773,13 @@ mod tests {
     /// secrets, hashes and addresses) produce byte-identical matrices.
     #[test]
     fn fixed_matrix_within_class() {
-        let digest = |seed: u128, owner_count: usize| {
-            let layout = OwnerAuthLayout::for_owner_count(owner_count).unwrap();
-            let circuit = noid_gkr::owner_auth::OwnerAuthCircuit::build(layout);
-            let spend_secret: Vec<[Block128; 2]> = (0..owner_count)
-                .map(|i| {
-                    [
-                        Block128::from(seed + 1000 + i as u128),
-                        Block128::from(seed + 2000 + i as u128),
-                    ]
-                })
-                .collect();
+        let digest = |seed: u128| {
+            let circuit = noid_gkr::owner_auth::OwnerAuthCircuit::build();
+            let spend_secret = [Block128::from(seed + 1000), Block128::from(seed + 2000)];
             let tx_body_hash = [Block128::from(seed + 7), Block128::from(seed + 8)];
             let expected_address =
-                compute_owner_auth_boundary(&circuit, spend_secret.clone(), tx_body_hash);
-            let public =
-                OwnerAuthPublicInputs::new(layout, tx_body_hash, expected_address).unwrap();
+                compute_owner_auth_boundary(&circuit, spend_secret, tx_body_hash);
+            let public = OwnerAuthPublicInputs::new(tx_body_hash, expected_address);
             let inputs = OwnerAuthInputs::from_parts(&public, spend_secret);
             let proof = prove(&inputs);
             let mut b = FieldR1csBuilder::new();
@@ -823,86 +788,65 @@ mod tests {
             r1cs.statement_digest()
         };
         assert_eq!(
-            digest(11, 1),
-            digest(999, 1),
+            digest(11),
+            digest(999),
             "owner-auth slot matrix must depend only on the shape class"
         );
     }
 
-    #[test]
-    fn padded_ghost_address_lanes_are_constants() {
-        let (_, public) = fixture(3, 0x6A05_7A11);
-        assert_eq!(public.layout.padded_slots, 4);
-        let mut b = FieldR1csBuilder::new();
-        let traced = OwnerAuthPublicInputsTrace::alloc(&mut b, &public);
-        for lane in &traced.expected_address[3] {
-            assert!(lane.is_const(), "ghost address lane must not allocate a wire");
-            assert_eq!(lane.constant, flat_of(Block128::ZERO));
-        }
-    }
-
     fn prove(inputs: &OwnerAuthInputs) -> OwnerAuthProofKillShot {
-        let circuit = noid_gkr::owner_auth::OwnerAuthCircuit::build(inputs.layout);
+        let circuit = noid_gkr::owner_auth::OwnerAuthCircuit::build();
         let mut ch = owner_auth_gkr_channel();
         let (proof, _) = prove_owner_auth_killshot(&circuit, inputs, &mut ch);
         proof
     }
 
     fn native_gkr_accepts(proof: &OwnerAuthProofKillShot, public: &OwnerAuthPublicInputs) -> bool {
-        let circuit = noid_gkr::owner_auth::OwnerAuthCircuit::build(public.layout);
+        let circuit = noid_gkr::owner_auth::OwnerAuthCircuit::build();
         let mut ch = owner_auth_gkr_channel();
         verify_owner_auth_killshot_with_claims(proof, &circuit, public, &mut ch).is_some()
     }
 
     fn trace_accepts(proof: &OwnerAuthProofKillShot, public: &OwnerAuthPublicInputs) -> bool {
-        let mut b = FieldR1csBuilder::new();
-        let _ = build_owner_auth_slot(&mut b, proof, public);
-        let (r1cs, z) = b.build();
-        r1cs.satisfies(&z)
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut b = FieldR1csBuilder::new();
+            let _ = build_owner_auth_slot(&mut b, proof, public);
+            let (r1cs, z) = b.build();
+            r1cs.satisfies(&z)
+        }))
+        .unwrap_or(false)
     }
 
     /// Positive lockstep: the trace's reduced claim equals the native
     /// verifier's, and the built system is satisfiable.
     #[test]
     fn owner_auth_trace_positive_lockstep() {
-        for owner_count in [1usize, 3] {
-            let (inputs, public) = fixture(owner_count, 50 + owner_count as u128);
-            let proof = prove(&inputs);
+        let (inputs, public) = fixture(51);
+        let proof = prove(&inputs);
 
-            let circuit = noid_gkr::owner_auth::OwnerAuthCircuit::build(public.layout);
-            let mut ch = owner_auth_gkr_channel();
-            let claims =
-                verify_owner_auth_killshot_with_claims(&proof, &circuit, &public, &mut ch)
-                    .expect("native accepts the honest proof");
+        let circuit = noid_gkr::owner_auth::OwnerAuthCircuit::build();
+        let mut ch = owner_auth_gkr_channel();
+        let claims = verify_owner_auth_killshot_with_claims(&proof, &circuit, &public, &mut ch)
+            .expect("native accepts the honest proof");
 
-            let mut b = FieldR1csBuilder::new();
-            let (_, obligation) = build_owner_auth_slot(&mut b, &proof, &public);
-            for (e, v) in obligation
-                .reduction
-                .point
-                .iter()
-                .zip(claims.state.point.iter())
-            {
-                assert_expr_is(&b, e, *v, "owner-auth terminal point");
-            }
-            assert_expr_is(
-                &b,
-                &obligation.reduction.value,
-                claims.state.value,
-                "owner-auth terminal value",
-            );
-            let (r1cs, z) = b.build();
-            assert!(
-                r1cs.satisfies(&z),
-                "honest owner-auth trace unsat ({owner_count} owners)"
-            );
-            if owner_count == 3 {
-                eprintln!(
-                    "owner-auth GKR slot ({owner_count} owners): {} useful rows (k_log = {})",
-                    r1cs.useful_rows, r1cs.k_log
-                );
-            }
+        let mut b = FieldR1csBuilder::new();
+        let (_, obligation) = build_owner_auth_slot(&mut b, &proof, &public);
+        for (e, v) in obligation
+            .reduction
+            .point
+            .iter()
+            .zip(claims.state.point.iter())
+        {
+            assert_expr_is(&b, e, *v, "owner-auth terminal point");
         }
+        assert_expr_is(
+            &b,
+            &obligation.reduction.value,
+            claims.state.value,
+            "owner-auth terminal value",
+        );
+        let (r1cs, z) = b.build();
+        assert!(r1cs.satisfies(&z), "honest owner-auth trace unsat");
     }
 
     fn visit_gkr_proof_fields(p: &mut OwnerAuthProofKillShot, f: &mut dyn FnMut(&mut Block128)) {
@@ -939,7 +883,7 @@ mod tests {
     /// (the `pcs` opening body has its own mutator in `auth_pcs.rs`).
     #[test]
     fn owner_auth_gkr_proof_mutator_kills_all() {
-        let (inputs, public) = fixture(2, 90);
+        let (inputs, public) = fixture(90);
         let proof = prove(&inputs);
         let mut n_fields = 0usize;
         {
@@ -977,15 +921,15 @@ mod tests {
     /// Statement mutator: tx hash lanes and expected addresses.
     #[test]
     fn owner_auth_statement_mutator_kills_all() {
-        let (inputs, public) = fixture(2, 130);
+        let (inputs, public) = fixture(130);
         let proof = prove(&inputs);
         let mut survivors = Vec::new();
-        for target in 0..(2 + public.expected_address.len() * 2) {
+        for target in 0..4 {
             let mut bad = public.clone();
             if target < 2 {
                 bad.tx_body_hash[target] += Block128::ONE;
             } else {
-                bad.expected_address[(target - 2) / 2][(target - 2) % 2] += Block128::ONE;
+                bad.expected_address[target - 2] += Block128::ONE;
             }
             assert!(
                 !native_gkr_accepts(&proof, &bad),
@@ -1013,7 +957,7 @@ mod tests {
             seed = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
             (seed >> 16) % m
         };
-        let (inputs, public) = fixture(2, 170);
+        let (inputs, public) = fixture(170);
         let proof = prove(&inputs);
         let mut n_fields = 0usize;
         {

@@ -12,8 +12,8 @@ use noid_gkr::layers::evaluate_permutation;
 use noid_gkr::oracle::evaluate_spine;
 use noid_poseidon2b::native::domain::capacity_iv;
 use noid_poseidon2b::primitives::{
-    derive_address, fee_leaf, hash_input_leaf_packed, hash_output_leaf, hash_tx_body,
-    is_coinbase_leaf, Address, Digest, SpendSecret, TXBODY_INPUTS, TXBODY_OUTPUTS,
+    derive_address, fee_leaf, hash_input_leaf_packed, hash_output_leaf, hash_tx_body_carrier,
+    is_coinbase_leaf, Address, Digest, SpendSecret, TXBODY_CARRIER_INPUTS, TXBODY_CARRIER_OUTPUTS,
 };
 
 fn digest_to_fields(d: &Digest) -> [Block128; 2] {
@@ -56,13 +56,13 @@ fn oracle_output_equals_native_with_layered_cross_check() {
         .map(|i| derive_address(&SpendSecret([i as u8 + 1; 32])))
         .collect();
 
-    let inputs_payload: [[u128; 4]; TXBODY_INPUTS] = [
+    let inputs_payload: [[u128; 4]; TXBODY_CARRIER_INPUTS] = [
         input_payload_u128(0, 100, &addrs[0]),
         input_payload_u128(1, 200, &addrs[1]),
         input_payload_u128(2, 300, &addrs[2]),
         input_payload_u128(3, 400, &addrs[3]),
     ];
-    let outputs_payload: [[u128; 4]; TXBODY_OUTPUTS] = [
+    let outputs_payload: [[u128; 4]; TXBODY_CARRIER_OUTPUTS] = [
         input_payload_u128(10, 50, &addrs[0]),
         input_payload_u128(11, 70, &addrs[1]),
         input_payload_u128(12, 90, &addrs[2]),
@@ -73,16 +73,16 @@ fn oracle_output_equals_native_with_layered_cross_check() {
         input_payload_u128(17, 190, &addrs[3]),
     ];
     let prev = [0xAAu8; 32];
-    let fee = 7u128;
+    let fee = 7u64;
 
     // Native reference.
-    let ins_d: [Digest; TXBODY_INPUTS] = [
+    let ins_d: [Digest; TXBODY_CARRIER_INPUTS] = [
         hash_input_leaf_packed(0, Block128::from(100u128), &addrs[0]),
         hash_input_leaf_packed(1, Block128::from(200u128), &addrs[1]),
         hash_input_leaf_packed(2, Block128::from(300u128), &addrs[2]),
         hash_input_leaf_packed(3, Block128::from(400u128), &addrs[3]),
     ];
-    let outs_d: [Digest; TXBODY_OUTPUTS] = [
+    let outs_d: [Digest; TXBODY_CARRIER_OUTPUTS] = [
         hash_output_leaf(10, 50, &addrs[0]),
         hash_output_leaf(11, 70, &addrs[1]),
         hash_output_leaf(12, 90, &addrs[2]),
@@ -92,7 +92,7 @@ fn oracle_output_equals_native_with_layered_cross_check() {
         hash_output_leaf(16, 170, &addrs[2]),
         hash_output_leaf(17, 190, &addrs[3]),
     ];
-    let native = hash_tx_body(&prev, fee, &ins_d, &outs_d, false, 0);
+    let native = hash_tx_body_carrier(&prev, fee, &ins_d, &outs_d, false, 0);
 
     let inputs = SpineInputs {
         epoch_anchor: digest_to_fields(&prev),

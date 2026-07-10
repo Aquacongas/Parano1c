@@ -22,12 +22,10 @@
 //! other slot).
 
 use noid_core::Block128;
-use noid_poseidon2b::native::domain::{capacity_iv, TAG_COMPRESS};
+use noid_poseidon2b::native::domain::{capacity_iv, DomainTag, TAG_COMPRESS};
 use noid_poseidon2b::native::permutation::STATE_SIZE;
 
-use super::{
-    alloc_block, const_block, pin_eq, poseidon2b_permute, FieldR1csBuilder, LinExpr,
-};
+use super::{alloc_block, const_block, pin_eq, poseidon2b_permute, FieldR1csBuilder, LinExpr};
 use crate::accumulator::ChainAccumulator;
 
 /// Digest as two little-endian u128 lanes (the `digest_to_fields`
@@ -45,7 +43,17 @@ pub fn compress_trace(
     a_lanes: &[LinExpr; 2],
     b_lanes: &[LinExpr; 2],
 ) -> [LinExpr; 2] {
-    let [iv_hi, iv_lo] = capacity_iv(TAG_COMPRESS);
+    compress_with_tag_trace(b, TAG_COMPRESS, a_lanes, b_lanes)
+}
+
+/// Trace twin of `compress_with_tag(tag, a, b)`.
+pub fn compress_with_tag_trace(
+    b: &mut FieldR1csBuilder,
+    tag: DomainTag,
+    a_lanes: &[LinExpr; 2],
+    b_lanes: &[LinExpr; 2],
+) -> [LinExpr; 2] {
+    let [iv_hi, iv_lo] = capacity_iv(tag);
     let state: [LinExpr; STATE_SIZE] = [
         a_lanes[0].clone(),
         a_lanes[1].clone(),
@@ -133,6 +141,27 @@ pub fn build_accepted_claim_batch_claim_slot(
 mod tests {
     use super::*;
     use noid_core::TowerField;
+    use noid_poseidon2b::native::{compress_with_tag, domain::TAG_TXROOT};
+
+    #[test]
+    fn tagged_compression_trace_matches_tx_root_wrapper() {
+        let left = [0x31u8; 32];
+        let right = [0x72u8; 32];
+        let expected = digest_lanes(&compress_with_tag(TAG_TXROOT, &left, &right));
+
+        let mut b = FieldR1csBuilder::new();
+        let left_lanes = digest_lanes(&left);
+        let right_lanes = digest_lanes(&right);
+        let left_w = std::array::from_fn(|i| alloc_block(&mut b, left_lanes[i]));
+        let right_w = std::array::from_fn(|i| alloc_block(&mut b, right_lanes[i]));
+        let actual = compress_with_tag_trace(&mut b, TAG_TXROOT, &left_w, &right_w);
+        for lane in 0..2 {
+            let expected_w = alloc_block(&mut b, expected[lane]);
+            pin_eq(&mut b, &actual[lane], &expected_w);
+        }
+        let (r1cs, z) = b.build();
+        assert!(r1cs.satisfies(&z));
+    }
 
     fn wires_from(
         b: &mut FieldR1csBuilder,
@@ -158,7 +187,9 @@ mod tests {
         (start_w, steps, end_w)
     }
 
-    fn fixture(n: usize) -> (
+    fn fixture(
+        n: usize,
+    ) -> (
         ChainAccumulator,
         Vec<([u8; 32], [Block128; 2], [u8; 32], u64)>,
         ChainAccumulator,
@@ -174,7 +205,10 @@ mod tests {
         let mut blocks = Vec::new();
         for i in 0..n as u64 {
             let block_id = [10 + i as u8; 32];
-            let claim = [Block128::from(100 + i as u128), Block128::from(200 + i as u128)];
+            let claim = [
+                Block128::from(100 + i as u128),
+                Block128::from(200 + i as u128),
+            ];
             let state_root = [40 + i as u8; 32];
             let height = start.height + 1 + i;
             acc = acc.extend(state_root, block_id, height, claim, 11 + i, 12 + i);

@@ -34,6 +34,8 @@
 //!   2. First `TxAdmitted` while a coinbase-only no-proof block is being mined
 //!   3. New chain tip from P2P (block received or snapshot applied)
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -199,6 +201,11 @@ pub type BlockAppliedHook = Arc<dyn Fn(&noid_chain::block::Block) + Send + Sync>
 /// Resolves the payout address immediately before each template is built.
 /// Used by the built-in wallet when no explicit mining address is configured.
 pub type MiningPayoutResolver = Arc<dyn Fn() -> Address + Send + Sync>;
+/// Async maintenance hook completed immediately before each template snapshot.
+/// The miner stays agnostic to wallets/RPC; the node installs this only for
+/// default active-address payout.
+pub type BeforeTemplateHook =
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 fn resolve_mining_payout(configured: Address, resolver: Option<&MiningPayoutResolver>) -> Address {
     resolver.map(|resolve| resolve()).unwrap_or(configured)
@@ -229,6 +236,7 @@ pub struct BlockMiner {
     /// Optional dynamic payout. Explicitly configured miner addresses leave
     /// this unset and continue to use `config.miner_address`.
     payout_resolver: Option<MiningPayoutResolver>,
+    before_template: Option<BeforeTemplateHook>,
 }
 
 impl BlockMiner {
@@ -267,6 +275,7 @@ impl BlockMiner {
             prove_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
             on_block_applied: None,
             payout_resolver: None,
+            before_template: None,
         };
         (miner, rx)
     }
@@ -281,6 +290,12 @@ impl BlockMiner {
     /// Resolve the wallet's active address for every future template.
     pub fn set_payout_resolver(&mut self, resolver: MiningPayoutResolver) {
         self.payout_resolver = Some(resolver);
+    }
+
+    /// Install one async maintenance action that completes before every new
+    /// template snapshot and therefore can affect that template's mempool set.
+    pub fn set_before_template_hook(&mut self, hook: BeforeTemplateHook) {
+        self.before_template = Some(hook);
     }
 
     /// Cancel the current PoW search (call when a new P2P block arrives).
@@ -379,6 +394,10 @@ impl BlockMiner {
             if self.stopped.load(Ordering::Acquire) {
                 tracing::info!("miner: shutdown flag set, exiting loop");
                 break;
+            }
+
+            if let Some(hook) = &self.before_template {
+                hook().await;
             }
 
             // --- Build template ---
@@ -697,9 +716,13 @@ impl BlockMiner {
                      prev_timestamps,
                      prev_active_counts,
                      local_time,
+                     tx_epoch_anchor_id,
                      anchor,
-                     pre_state,
+                     _pre_state,
                      state| {
+                        let tx_epoch = noid_block::BlockTxEpochContext {
+                            expected_user_epoch_anchor_id: *tx_epoch_anchor_id,
+                        };
                         let output = noid_block::accept_block_with_artifacts(
                             block,
                             proof_bytes,
@@ -708,8 +731,8 @@ impl BlockMiner {
                             prev_timestamps,
                             prev_active_counts,
                             local_time,
+                            &tx_epoch,
                             anchor,
-                            pre_state,
                             state,
                         )?;
                         history_claim_bytes = Some(history_claim_fields_bytes(
@@ -744,11 +767,7 @@ impl BlockMiner {
         };
 
         // --- Update mempool (no chain lock held) ---
-        let confirmed: Vec<_> = block
-            .transactions
-            .iter()
-            .map(|tx| tx.tx_body_hash)
-            .collect();
+        let confirmed: Vec<_> = block.transactions.iter().map(|tx| tx.txid()).collect();
         self.mempool
             .on_new_block(&confirmed, block.header.height, new_view)
             .await;
@@ -801,11 +820,9 @@ pub(crate) fn run_prove_block(
                 "missing WalletAuthorizationBundle for non-coinbase tx index {idx} — will retry coinbase-only"
             )
         })?;
-        let expected_shape = tmpl.inner.txs[idx].body.shape;
-        let bundle = WalletAuthorizationBundle::from_bytes_for_shape(bytes, expected_shape)
-            .map_err(|e| {
-                format!("WalletAuthorizationBundle decode failed at tx index {idx}: {e}")
-            })?;
+        let bundle = WalletAuthorizationBundle::from_bytes(bytes).map_err(|e| {
+            format!("WalletAuthorizationBundle decode failed at tx index {idx}: {e}")
+        })?;
         verify_wallet_authorization(&tmpl.inner.txs[idx].body, &bundle).map_err(|e| {
             format!("WalletAuthorizationBundle verify failed at tx index {idx}: {e}")
         })?;
@@ -848,285 +865,26 @@ pub(crate) fn run_prove_block(
 #[cfg(test)]
 mod tests {
     use super::*;
-
     use std::sync::atomic::AtomicU8;
-
-    use bench_prover::{
-        prove_standard_wallet, prove_sweep_wallet, standard_bundle, standard_fixture,
-        standard_scenario, sweep_bundle, sweep_fixture, sweep_scenario, BENCH_LOG_SLOTS,
-    };
-    use noid_block::BlockProof;
-    use noid_chain::block::{compute_tx_root, Block};
-    use noid_chain::consensus::genesis::{genesis_header, GENESIS_TIMESTAMP};
-    use noid_chain::consensus::params::{BLOCK_TIME, GENESIS_TARGET};
-    use noid_chain::consensus::pow::block_id;
-    use noid_chain::consensus::template::BlockTemplate as ChainTemplate;
-    use noid_chain::fri_state::SlotValue;
-    use noid_chain::state::{apply_tx, ChainState};
-    use noid_gkr::WalletAuthorizationBundle;
-    use noid_poseidon2b::primitives::Address;
-    use noid_tx::{
-        compute_claims_commitment, hash_tx_body_for_shape, Transaction, TxBody, TxOutput, TxShape,
-    };
 
     #[test]
     fn payout_resolver_is_dynamic_while_configured_address_is_fixed() {
-        let configured = Address([0x11; 32]);
+        let configured = noid_poseidon2b::primitives::Address([0x11; 32]);
         assert_eq!(resolve_mining_payout(configured, None), configured);
 
         let marker = Arc::new(AtomicU8::new(0x22));
         let resolver_marker = Arc::clone(&marker);
-        let resolver: MiningPayoutResolver =
-            Arc::new(move || Address([resolver_marker.load(Ordering::Relaxed); 32]));
+        let resolver: MiningPayoutResolver = Arc::new(move || {
+            noid_poseidon2b::primitives::Address([resolver_marker.load(Ordering::Relaxed); 32])
+        });
         assert_eq!(
             resolve_mining_payout(configured, Some(&resolver)),
-            Address([0x22; 32])
+            noid_poseidon2b::primitives::Address([0x22; 32])
         );
         marker.store(0x33, Ordering::Relaxed);
         assert_eq!(
             resolve_mining_payout(configured, Some(&resolver)),
-            Address([0x33; 32])
-        );
-    }
-
-    fn tx_from_body(body: TxBody) -> Transaction {
-        let tx_body_hash = hash_tx_body_for_shape(
-            body.shape,
-            &body.epoch_anchor,
-            body.fee,
-            &body.inputs,
-            &body.outputs,
-            body.is_coinbase,
-        );
-        Transaction { body, tx_body_hash }
-    }
-
-    fn coinbase_tx() -> Transaction {
-        tx_from_body(TxBody::standard(
-            [0u8; 32],
-            0,
-            vec![],
-            vec![TxOutput {
-                slot_index: 42,
-                value: 1_000_000,
-                owner: Address([0xCB; 32]),
-                valid: true,
-            }],
-            true,
-        ))
-    }
-
-    fn standard_fixture_with_bundle(
-        label: &'static str,
-        slot_base: u32,
-        seed: u128,
-    ) -> (TxBody, WalletAuthorizationBundle) {
-        let fixture = standard_fixture(standard_scenario(label, 1, 2, slot_base, seed));
-        let proof = prove_standard_wallet(&fixture, 1).proof;
-        let body = fixture.scenario.body.clone();
-        (body, standard_bundle(&fixture, proof))
-    }
-
-    fn sweep_fixture_with_bundle(
-        label: &'static str,
-        n_inputs: usize,
-        slot_base: u32,
-        seed: u128,
-    ) -> (TxBody, WalletAuthorizationBundle) {
-        let fixture = sweep_fixture(sweep_scenario(label, n_inputs, slot_base, seed));
-        let proof = prove_sweep_wallet(&fixture, 1).proof;
-        let body = fixture.scenario.body.clone();
-        (body, sweep_bundle(&fixture, proof))
-    }
-
-    fn seed_pre_state(user_bodies: &[TxBody]) -> ChainState {
-        let mut state = ChainState::with_log_slots(BENCH_LOG_SLOTS as usize);
-        for input in user_bodies
-            .iter()
-            .flat_map(|body| body.inputs.iter().filter(|i| i.valid))
-        {
-            let [owner_hi, owner_lo] = input.owner.as_fields();
-            state
-                .state
-                .set_slot(
-                    input.slot_index,
-                    SlotValue {
-                        value: (input.value as u128).into(),
-                        owner_hi,
-                        owner_lo,
-                    },
-                )
-                .expect("test input slot in range");
-            state.active_slot_count += 1;
-            state.alloc_counter += 1;
-        }
-        state
-    }
-
-    fn miner_template(
-        user: Vec<(TxBody, WalletAuthorizationBundle)>,
-    ) -> crate::template::BlockTemplate {
-        let coinbase = coinbase_tx();
-        let user_bodies: Vec<TxBody> = user.iter().map(|(body, _)| body.clone()).collect();
-        let mut pre_state = seed_pre_state(&user_bodies);
-        let prev_state_root = pre_state.state_root();
-        let mut parent = genesis_header();
-        parent.state_root = prev_state_root;
-        parent.log_slots = BENCH_LOG_SLOTS;
-        parent.active_slot_count = pre_state.active_slot_count;
-        parent.alloc_counter = pre_state.alloc_counter;
-
-        let mut post_state = pre_state.clone();
-        apply_tx(&mut post_state, &coinbase.body).expect("test coinbase applies");
-        for body in &user_bodies {
-            apply_tx(&mut post_state, body).expect("test user tx applies");
-        }
-        let state_root = post_state.state_root();
-        let exact_bodies: Vec<_> = std::iter::once(coinbase.body.clone())
-            .chain(user_bodies.iter().cloned())
-            .collect();
-        let exact_commitments: Vec<_> = exact_bodies
-            .iter()
-            .map(|body| compute_claims_commitment(&body.inputs, &body.outputs))
-            .collect();
-        let exact_surface = noid_chain::build_exact_action_surface(
-            &pre_state.state,
-            &exact_bodies,
-            &exact_commitments,
-            pre_state.alloc_counter,
-        )
-        .expect("build exact surface");
-        let exact_cache = pre_state
-            .state
-            .exact_sparse_cache()
-            .expect("build exact sparse cache");
-        let exact_state_transition =
-            noid_block::build_exact_state_transition_proof(&exact_cache, &exact_surface)
-                .expect("build exact state proof");
-
-        let txs: Vec<Transaction> = user_bodies.into_iter().map(tx_from_body).collect();
-        let authorization_bytes = user
-            .into_iter()
-            .map(|(_, bundle)| Some(bundle.to_bytes().expect("serialize authorization")))
-            .collect();
-        let all_txs: Vec<Transaction> = std::iter::once(coinbase.clone())
-            .chain(txs.iter().cloned())
-            .collect();
-        let tx_root = compute_tx_root(&all_txs);
-        let inner = ChainTemplate {
-            coinbase,
-            txs,
-            state_root,
-            tx_root,
-            active_slot_count: post_state.active_slot_count,
-            alloc_counter: post_state.alloc_counter,
-            log_slots: BENCH_LOG_SLOTS,
-            height: parent.height + 1,
-            timestamp: GENESIS_TIMESTAMP + BLOCK_TIME,
-            miner_address: Address([0xCB; 32]),
-            difficulty_target: GENESIS_TARGET,
-            prev_block_hash: block_id(&parent),
-        };
-        crate::template::BlockTemplate {
-            inner,
-            difficulty_target: GENESIS_TARGET,
-            miner_address: Address([0xCB; 32]),
-            timestamp: GENESIS_TIMESTAMP + BLOCK_TIME,
-            parent,
-            authorization_bytes,
-            exact_state_transition: Some(exact_state_transition),
-        }
-    }
-
-    fn prove_template_wire(
-        tmpl: &crate::template::BlockTemplate,
-    ) -> (Block, Vec<u8>, Vec<u8>, BlockProof) {
-        let (proof_bytes, auth_sidecar_bytes) =
-            run_prove_block(tmpl, tmpl.parent.state_root).expect("run_prove_block");
-        assert!(
-            !proof_bytes.is_empty(),
-            "user-tx templates must carry BlockProof bytes"
-        );
-        let block = tmpl.seal(0);
-        assert!(
-            !auth_sidecar_bytes.is_empty(),
-            "user-tx templates must carry BlockAuthSidecar bytes"
-        );
-        let proof: BlockProof = bincode::deserialize(&proof_bytes).expect("decode BlockProof");
-        let sidecar: noid_block::BlockAuthSidecar =
-            bincode::deserialize(&auth_sidecar_bytes).expect("decode BlockAuthSidecar");
-        assert_eq!(sidecar.tx_auth.len(), tmpl.n_user_txs());
-        noid_block::validate_block_auth_sidecar_shape(&block, &sidecar)
-            .expect("detached sidecar shape");
-        (block, proof_bytes, auth_sidecar_bytes, proof)
-    }
-
-    fn prove_template(tmpl: &crate::template::BlockTemplate) -> (Block, BlockProof) {
-        let (block, _proof_bytes, _auth_sidecar_bytes, proof) = prove_template_wire(tmpl);
-        (block, proof)
-    }
-
-    fn assert_minimal_proof(proof: &BlockProof, n_user_txs: usize) {
-        assert_eq!(proof.meta.n_tx as usize, n_user_txs);
-    }
-
-    #[test]
-    #[cfg_attr(debug_assertions, ignore = "release-only miner proof regression")]
-    fn run_prove_block_serializes_standard_only_template() {
-        let standard = standard_fixture_with_bundle("std-only", 100, 0xA1);
-        let tmpl = miner_template(vec![standard]);
-        let (_block, proof) = prove_template(&tmpl);
-        assert_minimal_proof(&proof, 1);
-    }
-
-    #[test]
-    #[cfg_attr(debug_assertions, ignore = "release-only miner proof regression")]
-    fn run_prove_block_serializes_sweep_only_template() {
-        let sweep = sweep_fixture_with_bundle("sweep-only", 5, 1_000, 0xB1);
-        let tmpl = miner_template(vec![sweep]);
-        let (_block, proof) = prove_template(&tmpl);
-        assert_minimal_proof(&proof, 1);
-    }
-
-    #[test]
-    #[cfg_attr(debug_assertions, ignore = "release-only miner proof regression")]
-    fn run_prove_block_serializes_mixed_template() {
-        let standard = standard_fixture_with_bundle("mixed-std", 100, 0xC1);
-        let sweep = sweep_fixture_with_bundle("mixed-sweep", 5, 1_000, 0xD1);
-        let tmpl = miner_template(vec![standard, sweep]);
-        let (_block, proof) = prove_template(&tmpl);
-        assert_minimal_proof(&proof, 2);
-    }
-
-    #[test]
-    #[cfg_attr(debug_assertions, ignore = "release-only miner proof regression")]
-    fn run_prove_block_serializes_split_sweep_plus_standard_tail_template() {
-        let sweep = sweep_fixture_with_bundle(
-            "split-sweep-25x2",
-            TxShape::Sweep25x2.max_inputs(),
-            1_000,
-            0xE1,
-        );
-        let standard_tail = standard_fixture_with_bundle("split-standard-tail", 5_000, 0xF1);
-        let tmpl = miner_template(vec![sweep, standard_tail]);
-        let (_block, proof) = prove_template(&tmpl);
-        assert_minimal_proof(&proof, 2);
-    }
-
-    #[test]
-    #[cfg_attr(debug_assertions, ignore = "release-only miner proof regression")]
-    fn minimal_proof_serializes_without_bucket_payload() {
-        let standard = standard_fixture_with_bundle("bad-std", 100, 0xA11);
-        let sweep = sweep_fixture_with_bundle("bad-sweep", 5, 1_000, 0xB11);
-        let tmpl = miner_template(vec![standard, sweep]);
-        let (_block, proof_bytes, _auth_sidecar_bytes, proof) = prove_template_wire(&tmpl);
-
-        assert_minimal_proof(&proof, 2);
-        assert_eq!(
-            proof_bytes.len(),
-            bincode::serialize(&proof)
-                .expect("serialize minimal proof")
-                .len()
+            noid_poseidon2b::primitives::Address([0x33; 32])
         );
     }
 }

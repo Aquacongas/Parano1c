@@ -156,23 +156,21 @@ struct TransitionValueCounters {
 fn semantic_counters(block: &Block, parent: &BlockHeader) -> SemanticCounters {
     let mut counters = SemanticCounters::default();
     for tx in &block.transactions {
-        let live_inputs = tx.body.inputs.iter().filter(|input| input.valid).count() as u32;
-        let live_outputs = tx.body.outputs.iter().filter(|output| output.valid).count() as u32;
+        let live_inputs = tx.body.live_input_count() as u32;
+        let live_outputs = tx.body.live_output_count() as u32;
         counters.live_input_count = counters.live_input_count.saturating_add(live_inputs);
         counters.live_output_count = counters.live_output_count.saturating_add(live_outputs);
 
         if tx.body.is_coinbase {
             counters.reward_value = counters.reward_value.saturating_add(
                 tx.body
-                    .outputs
-                    .iter()
-                    .filter(|output| output.valid)
-                    .map(|output| output.value as u128)
+                    .live_outputs()
+                    .map(|(_, output)| output.amount as u128)
                     .sum::<u128>(),
             );
         } else {
             counters.user_body_count = counters.user_body_count.saturating_add(1);
-            counters.total_fee = counters.total_fee.saturating_add(tx.body.fee);
+            counters.total_fee = counters.total_fee.saturating_add(tx.body.fee.into());
             counters.claimable_fee =
                 counters
                     .claimable_fee

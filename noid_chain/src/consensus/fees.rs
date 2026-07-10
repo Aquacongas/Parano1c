@@ -54,9 +54,9 @@ impl FeeBreakdown {
 
 /// Count live inputs and outputs in a tx body.
 #[inline]
-pub fn tx_shape(body: &TxBody) -> (u64, u64) {
-    let n_inputs = body.inputs.iter().filter(|i| i.valid).count() as u64;
-    let n_outputs = body.outputs.iter().filter(|o| o.valid).count() as u64;
+pub fn tx_live_counts(body: &TxBody) -> (u64, u64) {
+    let n_inputs = body.live_input_count() as u64;
+    let n_outputs = body.live_output_count() as u64;
     (n_inputs, n_outputs)
 }
 
@@ -87,13 +87,12 @@ pub fn state_growth_fee_per_slot(active_slot_count: u64, log_slots: u32) -> u64 
     STATE_GROWTH_FEE_BASE.saturating_mul(pressure_multiplier(active_slot_count, log_slots))
 }
 
-/// Compute the deterministic required fee for an arbitrary tx shape.
+/// Compute the deterministic required fee for arbitrary live I/O counts.
 ///
 /// The formula is intentionally output-centric: inputs pay a small anti-DoS
 /// component, outputs pay the larger ordinary I/O component, and only net-new
-/// state growth is burned. There is no shape premium; a `Sweep25x2` transaction
-/// pays for its actual live inputs/outputs and is naturally cheap when it
-/// consolidates or otherwise reduces live slot count.
+/// state growth is burned. The sole fixed body pays for its actual live
+/// inputs/outputs and is naturally cheap when it consolidates.
 pub fn fee_breakdown(
     n_inputs: u64,
     n_outputs: u64,
@@ -128,7 +127,7 @@ pub fn fee_breakdown_for_tx_body(
     active_slot_count: u64,
     log_slots: u32,
 ) -> FeeBreakdown {
-    let (n_inputs, n_outputs) = tx_shape(body);
+    let (n_inputs, n_outputs) = tx_live_counts(body);
     fee_breakdown(n_inputs, n_outputs, active_slot_count, log_slots)
 }
 
@@ -153,7 +152,7 @@ pub fn claimable_fee_for_tx_body(body: &TxBody, active_slot_count: u64, log_slot
     if body.is_coinbase {
         return 0;
     }
-    let actual = body.fee.min(u64::MAX as u128) as u64;
+    let actual = body.fee;
     let burned = burned_fee_for_tx_body(body, active_slot_count, log_slots);
     actual.saturating_sub(burned)
 }
@@ -161,95 +160,78 @@ pub fn claimable_fee_for_tx_body(body: &TxBody, active_slot_count: u64, log_slot
 #[cfg(test)]
 mod tests {
     use super::*;
-    use noid_poseidon2b::primitives::{Address, SpendSecret};
-    use noid_tx::{TxBody, TxInput, TxOutput};
+    use noid_poseidon2b::primitives::Address;
+    use noid_tx::{output_bitmap_bit, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS};
 
-    fn input(slot: u32) -> TxInput {
-        TxInput {
-            slot_index: slot,
-            value: 100,
-            creation_id: 0,
-            owner: Address([1u8; 32]),
-            spend_secret: SpendSecret([2u8; 32]),
-            valid: true,
+    fn body(n_inputs: usize, n_outputs: usize, fee: u64) -> TxBody {
+        let mut inputs = [TxInput::dummy(); TX_INPUTS];
+        for (i, input) in inputs.iter_mut().take(n_inputs).enumerate() {
+            *input = TxInput {
+                slot_index: i as u32,
+                amount: 100,
+                creation_id: 1,
+            };
         }
-    }
-
-    fn output(slot: u32) -> TxOutput {
-        TxOutput {
-            slot_index: slot,
-            value: 100,
-            owner: Address([4u8; 32]),
-            valid: true,
+        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        for (i, output) in outputs.iter_mut().take(n_outputs).enumerate() {
+            *output = TxOutput {
+                slot_index: 100 + i as u32,
+                amount: 1,
+                owner: Address([2u8; 32]),
+            };
         }
-    }
-
-    fn body(n_inputs: u32, n_outputs: u32, fee: u128) -> TxBody {
+        let input_bits = if n_inputs == 0 {
+            0
+        } else {
+            (1u16 << n_inputs) - 1
+        };
+        let output_bits = (0..n_outputs).fold(0, |bits, i| bits | output_bitmap_bit(i));
         TxBody {
-            shape: noid_tx::TxShape::Standard4x8,
             epoch_anchor: [1u8; 32],
             fee,
-            inputs: (0..n_inputs).map(input).collect(),
-            outputs: (0..n_outputs).map(|i| output(100 + i)).collect(),
+            input_owner: if n_inputs == 0 {
+                Address([0u8; 32])
+            } else {
+                Address([1u8; 32])
+            },
+            inputs,
+            outputs,
+            validity_bitmap: input_bits | output_bits,
             is_coinbase: false,
         }
     }
 
     #[test]
-    fn low_pressure_standard_send_matches_old_baseline() {
-        let b = fee_breakdown(1, 2, 0, LOG_SLOTS_GENESIS);
-        assert_eq!(b.input, 100);
-        assert_eq!(b.output, 1_400);
-        assert_eq!(b.io, 1_500);
-        assert_eq!(b.required_total, 9_000);
-        assert_eq!(b.burned, 2_500);
-        assert_eq!(b.claimable_at_minimum(), 6_500);
+    fn live_bitmap_drives_fee_counts() {
+        assert_eq!(tx_live_counts(&body(8, 2, 0)), (8, 2));
+        assert_eq!(tx_live_counts(&body(1, 1, 0)), (1, 1));
     }
 
     #[test]
-    fn consolidation_avoids_state_growth_burn() {
-        let b = fee_breakdown(4, 1, 0, LOG_SLOTS_GENESIS);
-        assert_eq!(b.state_growth, 0);
-        assert_eq!(b.burned, 0);
-        assert_eq!(b.required_total, 6_100);
+    fn consolidation_has_no_state_growth_burn() {
+        let f = fee_breakdown(8, 1, 0, LOG_SLOTS_GENESIS);
+        assert_eq!(f.state_growth, 0);
+        assert_eq!(f.burned, 0);
     }
 
     #[test]
-    fn sweep_pays_actual_io_without_shape_premium() {
-        let payment = fee_breakdown(25, 2, 0, LOG_SLOTS_GENESIS);
-        let consolidation = fee_breakdown(25, 1, 0, LOG_SLOTS_GENESIS);
-        assert_eq!(payment.state_growth, 0);
-        assert_eq!(consolidation.state_growth, 0);
-        assert_eq!(payment.required_total, 8_900);
-        assert_eq!(consolidation.required_total, 8_200);
+    fn pressure_only_multiplies_net_growth() {
+        let low = fee_breakdown(1, 2, 0, LOG_SLOTS_GENESIS);
+        let capacity = 1u64 << LOG_SLOTS_GENESIS;
+        let high = fee_breakdown(1, 2, capacity * 9 / 10, LOG_SLOTS_GENESIS);
+        assert!(high.state_growth > low.state_growth);
+        assert_eq!(high.base, low.base);
+        assert_eq!(high.io, low.io);
     }
 
     #[test]
-    fn split_tx_pays_for_net_new_slots() {
-        let split = fee_breakdown(1, 8, 0, LOG_SLOTS_GENESIS);
-        let flat = fee_breakdown(1, 1, 0, LOG_SLOTS_GENESIS);
-        assert!(split.required_total > flat.required_total);
-        assert_eq!(split.burned, 7 * STATE_GROWTH_FEE_BASE);
-    }
-
-    #[test]
-    fn pressure_multiplier_steps_are_deterministic() {
-        assert_eq!(pressure_multiplier(0, LOG_SLOTS_GENESIS), 1);
-        assert_eq!(pressure_multiplier(1u64 << 23, LOG_SLOTS_GENESIS), 2);
+    fn claimable_subtracts_deterministic_burn() {
+        let mut body = body(1, 2, 1_000_000);
+        body.fee = required_fee_for_tx_body(&body, 0, LOG_SLOTS_GENESIS);
+        let breakdown = fee_breakdown_for_tx_body(&body, 0, LOG_SLOTS_GENESIS);
         assert_eq!(
-            pressure_multiplier((1u64 << 24) * 3 / 4, LOG_SLOTS_GENESIS),
-            4
+            claimable_fee_for_tx_body(&body, 0, LOG_SLOTS_GENESIS),
+            breakdown.required_total - breakdown.burned
         );
-        assert_eq!(
-            pressure_multiplier(((1u64 << 24) * 9).div_ceil(10), LOG_SLOTS_GENESIS),
-            8
-        );
-    }
-
-    #[test]
-    fn claimable_fee_burns_only_required_growth_component() {
-        let tx = body(1, 2, 12_000);
-        assert_eq!(burned_fee_for_tx_body(&tx, 0, LOG_SLOTS_GENESIS), 2_500);
-        assert_eq!(claimable_fee_for_tx_body(&tx, 0, LOG_SLOTS_GENESIS), 9_500);
     }
 }

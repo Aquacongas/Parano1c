@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Canonical 59-slot tx-body Poseidon2b topology used by GKR.
+//! Temporary 59-slot carrier topology used by Tx8x2 GKR.
 //!
-//! This module keeps the production GKR crate's tx-body proof layout aligned
-//! with the canonical tx-body hash:
-//! 4 input leaves × 3 permutations, 8 output leaves × 2 permutations,
-//! 15 binary compress nodes × 2 permutations, and 1 final wrap permutation.
+//! These are physical carrier roles, not logical transaction capacities:
+//! logical inputs 0..3 occupy the four input chains, inputs 4..7 occupy
+//! output chains 0..3, logical outputs occupy output chains 4..5, and the
+//! final two output chains are zero. The carrier then has 15 binary compress
+//! nodes × 2 permutations and one final wrap permutation.
 
 pub const TXBODY_N_INPUT_LEAVES: usize = 4;
 pub const TXBODY_N_OUTPUT_LEAVES: usize = 8;
@@ -18,11 +19,11 @@ pub const PERMS_PER_OUTPUT_LEAF: usize = 2;
 pub const PERMS_PER_COMPRESS: usize = 2;
 pub const PERMS_PER_WRAP: usize = 1;
 
-pub const TREE_LEAF_PREV_STATE_ROOT: usize = 0;
+pub const TREE_LEAF_EPOCH_ANCHOR: usize = 0;
 pub const TREE_LEAF_FEE: usize = 1;
 pub const TREE_LEAF_INPUT_BASE: usize = 2;
 pub const TREE_LEAF_OUTPUT_BASE: usize = 6;
-pub const TREE_LEAF_PAD_BASE: usize = 14;
+pub const TREE_LEAF_FLAGS_BASE: usize = 14;
 
 pub const N_INSTANCES: usize = TXBODY_N_INPUT_LEAVES * PERMS_PER_INPUT_LEAF
     + TXBODY_N_OUTPUT_LEAVES * PERMS_PER_OUTPUT_LEAF

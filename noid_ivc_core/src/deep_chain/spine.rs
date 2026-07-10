@@ -1,5 +1,5 @@
-//! Flat-basis replay of the tx-body SPINE — the canonical Standard4x8
-//! transaction-body hash — as two deep-chain region families.
+//! Flat-basis replay of the temporary 59-permutation Tx8x2 carrier spine as
+//! two deep-chain region families.
 //!
 //! The native spine (59 Poseidon2b permutations per transaction: 4 input
 //! leaves × 3, 8 output leaves × 2, 15 binary `compress` nodes × 2, one
@@ -22,9 +22,12 @@
 //!   children (`w ∈ [2, L)`). The substitution is the source-tree one
 //!   with an all-zero `LEAFODD` pattern (no leaf permutations).
 //!
-//! Tree leaf order (the canonical tx-body layout): `L0 = epoch_anchor`,
-//! `L1 = fee_leaf`, `L2..L5 = input-leaf digests`, `L6..L13 = output-leaf
-//! digests`, `L14 = is_coinbase_leaf`, `L15 = pad_leaf`.
+//! Tree leaf order (the physical carrier layout): `L0 = epoch_anchor`,
+//! `L1 = fee_leaf`, `L2..L5 = carrier-input digests`, `L6..L13 =
+//! carrier-output digests`, `L14 = is_coinbase_leaf`, `L15 = validity_leaf`.
+//! The statement mapping is injective: logical inputs 0..3 use the four
+//! input chains, logical inputs 4..7 use output chains 0..3, logical outputs
+//! use output chains 4..5, and output chains 6..7 are zero.
 //!
 //! # Basis
 //!
@@ -44,8 +47,8 @@ use noid_poseidon2b::native::domain::{
 };
 use noid_poseidon2b::native::permutation::STATE_SIZE;
 
-/// Leaf/wrap tile geometry: 4 input chains × 3 slots + 8 output chains ×
-/// 2 slots + 1 wrap + 3 ghost slots = one 32-slot tile per transaction.
+/// Carrier leaf/wrap tile geometry: 4 input chains × 3 slots + 8 output
+/// chains × 2 slots + 1 wrap + 3 ghost slots = one 32-slot tile.
 pub const SPINE_N_INPUT_LEAVES: usize = 4;
 pub const SPINE_N_OUTPUT_LEAVES: usize = 8;
 pub const SPINE_TILE_SLOTS: usize = 32;
@@ -154,7 +157,7 @@ pub struct SpineInstanceColumns {
     /// `kid[w]`, `w ∈ [0, 2L)`: internal children = `C(2w+1)`, leaf
     /// children = the external digests, `kid[0] = kid[1] = 0`.
     pub tree_kid: [Vec<F128>; 2],
-    /// Input/output chain digests in tile order (4 inputs then 8 outputs).
+    /// Carrier-chain digests in physical tile order (4 input then 8 output).
     pub chain_digests: Vec<[F128; 2]>,
     /// The recomputed tree root (`C0/C1` at tree slot 3).
     pub root: [F128; 2],

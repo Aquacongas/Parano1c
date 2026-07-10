@@ -18,13 +18,12 @@
 //! deep-chain walk replays the same permutation on flat values.
 
 use noid_core::Block128;
-use noid_fri_binius::capsule::{
-    CAPSULE_CAP_DEPTH, CAPSULE_NUM_QUERIES, CAPSULE_TAU,
-};
+use noid_fri_binius::capsule::{CAPSULE_CAP_DEPTH, CAPSULE_NUM_QUERIES, CAPSULE_TAU};
 use noid_gkr::auth_pcs::AuthMleOpeningProof;
 use noid_gkr::owner_auth::{
     OwnerAuthLayout, OwnerAuthProofKillShot, OwnerAuthPublicInputs, OWNER_AUTH_BOUNDARY_DOMAIN_TAG,
-    OWNER_AUTH_GKR_DOMAIN_TAG, OWNER_AUTH_STATE_ROUND_DEGREE,
+    OWNER_AUTH_GKR_DOMAIN_TAG, OWNER_AUTH_LIVE_SLOTS, OWNER_AUTH_NUM_VARS, OWNER_AUTH_PADDED_SLOTS,
+    OWNER_AUTH_SLOT_BITS, OWNER_AUTH_STATE_ROUND_DEGREE,
 };
 use noid_ivc_core::deep_chain::schedule::{flat_of_tower_u128, TranscriptOp};
 use noid_ivc_core::field::F128;
@@ -180,13 +179,8 @@ pub fn owner_auth_channel_schedule(
     inputs: &OwnerAuthPublicInputs,
 ) -> ChannelSchedule {
     let layout = inputs.layout;
-    assert_eq!(
-        OwnerAuthLayout::for_owner_count(layout.owner_count).ok(),
-        Some(layout),
-        "owner-auth schedule requires a canonical layout"
-    );
-    assert_eq!(inputs.expected_address.len(), layout.owner_count);
-    let num_vars = layout.num_vars;
+    assert_eq!(layout, OwnerAuthLayout::FIXED);
+    let num_vars = OWNER_AUTH_NUM_VARS;
     // Class-shape assertions: the schedule (op structure) is a function of
     // these counts alone.
     assert_eq!(proof.kill_shot.main.round_polys.len(), num_vars);
@@ -207,25 +201,16 @@ pub fn owner_auth_channel_schedule(
     // whole channel from `capacity_iv(TAG_KSCHANNL)`).
     let mut lanes: Vec<Option<u128>> = vec![
         Some(OWNER_AUTH_GKR_DOMAIN_TAG),
-        Some(layout.owner_count as u128),
-        Some(layout.live_slots as u128),
-        Some(layout.slot_bits as u128),
+        Some(1),
+        Some(OWNER_AUTH_LIVE_SLOTS as u128),
+        Some(OWNER_AUTH_SLOT_BITS as u128),
         Some(num_vars as u128),
-        Some(layout.padded_slots as u128),
+        Some(OWNER_AUTH_PADDED_SLOTS as u128),
     ];
     lanes.push(s.data_lane(inputs.tx_body_hash[0]));
     lanes.push(s.data_lane(inputs.tx_body_hash[1]));
-    // Addresses for every padded slot (ghost slots >= owner_count as zero
-    // pairs, selected by liveness in the region).
-    for slot in 0..layout.padded_slots {
-        if let Some(pair) = inputs.expected_address.get(slot) {
-            lanes.push(s.data_lane(pair[0]));
-            lanes.push(s.data_lane(pair[1]));
-        } else {
-            lanes.push(Some(0));
-            lanes.push(Some(0));
-        }
-    }
+    lanes.push(s.data_lane(inputs.expected_address[0]));
+    lanes.push(s.data_lane(inputs.expected_address[1]));
 
     // Step 2: auth MLE commitment absorb (tag, log_rows, cap length, cap
     // hash lanes — the capsule commitment carries no other shape fields).
@@ -265,14 +250,17 @@ pub fn owner_auth_channel_schedule(
     s.absorb_lanes(vec![lane]);
 
     // Step 5: boundary sumcheck. domain tag + constraint count, the RLC
-    // level draws (`rlc_levels(m)` squeezes — 1 at every standard class),
+    // level draws (`rlc_levels(m)` squeezes — 1 at every transaction class),
     // per round: 2 evals + fold, state_at_r.
-    let constraints_len = layout.padded_slots * 4;
+    let constraints_len = 4;
     s.absorb_lanes(vec![
         Some(OWNER_AUTH_BOUNDARY_DOMAIN_TAG),
         Some(constraints_len as u128),
     ]);
-    s.ops.push(TranscriptOp::Squeeze(noid_gkr::batch_eval::rlc_levels(constraints_len)));
+    s.ops
+        .push(TranscriptOp::Squeeze(noid_gkr::batch_eval::rlc_levels(
+            constraints_len,
+        )));
     for r in &proof.boundary.round_polys {
         let round_lanes: Vec<Option<u128>> =
             r.evals_at_1_2.iter().map(|&e| s.data_lane(e)).collect();

@@ -105,7 +105,7 @@ pub fn block_io_spec(frozen: &[RegionFrozenClaim], max_arity: usize) -> PublicIo
 
 /// The per-tier block class constants.
 pub struct BlockClass {
-    /// The consensus standard-tx tier this class hosts (capacity).
+    /// The consensus user-transaction tier this class hosts (capacity).
     pub tier: usize,
     pub shape: FieldShape,
     /// Statement digest of the CLASS matrix — filled on the first real
@@ -175,7 +175,11 @@ impl BlockClass {
             &vec![F128::ZERO; layout.len],
             None,
         );
-        assert_eq!(live.len(), native.len(), "freeze claim count vs native probe");
+        assert_eq!(
+            live.len(),
+            native.len(),
+            "freeze claim count vs native probe"
+        );
         let frozen: Vec<RegionFrozenClaim> = live
             .iter()
             .map(|c| RegionFrozenClaim {
@@ -226,7 +230,10 @@ pub fn build_block_proof_trace(class: &BlockClass, block: &LinkBlock<'_>) -> Bui
     let stride = class.region_max_arity + 1;
     for (ci, (np, nv)) in region_native.iter().enumerate() {
         let base = layout.region_tail_offset + ci * stride;
-        assert!(np.len() <= class.region_max_arity, "region claim arity over max");
+        assert!(
+            np.len() <= class.region_max_arity,
+            "region claim arity over max"
+        );
         for (kk, &p) in np.iter().enumerate() {
             io[base + kk] = p;
         }
@@ -244,11 +251,19 @@ pub fn build_block_proof_trace(class: &BlockClass, block: &LinkBlock<'_>) -> Bui
     );
     let (r1cs, witness) = built.expect("real build returns the instance");
     // Frozen-shape assert.
-    assert_eq!(live.len(), class.region_claims.len(), "block region claim count drift");
+    assert_eq!(
+        live.len(),
+        class.region_claims.len(),
+        "block region claim count drift"
+    );
     for (ci, c) in live.iter().enumerate() {
         let fc = &class.region_claims[ci];
         assert_eq!(c.slice, fc.slice, "block region claim {ci} slice drift");
-        assert_eq!(c.point.len(), fc.arity, "block region claim {ci} arity drift");
+        assert_eq!(
+            c.point.len(),
+            fc.arity,
+            "block region claim {ci} arity drift"
+        );
     }
     let class_digest = class
         .class_statement_digest
@@ -339,7 +354,10 @@ fn build_block_trace_parts(
             let target = 1usize << shape.m;
             let used = b.num_wires();
             eprintln!("[block-class] build: {used} wires (tier {})", class.tier);
-            assert!(used <= target, "block trace outgrew the class: {used} > {target}");
+            assert!(
+                used <= target,
+                "block trace outgrew the class: {used} > {target}"
+            );
             while b.num_wires() < target {
                 b.alloc_f128(F128::ZERO);
             }

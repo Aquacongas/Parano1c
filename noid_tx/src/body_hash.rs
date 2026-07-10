@@ -1,339 +1,278 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-#![allow(clippy::needless_range_loop)]
-
-//! Canonical transaction-body hash for the transparent UTXO model.
+//! Canonical Tx8x2 body hash on the temporary 59-permutation carrier.
 //!
-//! Adapter over `noid_poseidon2b::primitives::hash_tx_body`. The
-//! primitives layer enforces a fixed 16-leaf / depth-4 layout (see
-//! `TXBODY_LEAVES`); this adapter builds the per-input and per-output
-//! leaves from `TxInput` / `TxOutput`, filling missing slots with
-//! `TxInput::dummy` / `TxOutput::dummy`.
-//!
-//! Every slot is hashed unconditionally, including `valid=false`
-//! slots (which absorb `(0, 0, zero_address)` fields), AND the per-entry
-//! `valid` selectors are committed as a bitmap in the reserved pad leaf
-//! (input bit `i`, output bit `max_inputs + j`): the same slot contents
-//! with different liveness selectors are DIFFERENT transactions — the
-//! balance/action semantics are bound by the hash, so no consumer can
-//! reinterpret one body hash under another live set.
+//! The public body is already final. Until the flattened 31-permutation spine
+//! lands, its records are injectively mapped into the existing 4-input/8-output
+//! carrier. This module is the single native definition of that mapping.
 
+use noid_core::{Block128, TowerField};
 use noid_poseidon2b::primitives::{
-    hash_input_leaf_packed, hash_output_leaf, hash_tx_body as hash_tx_body_core,
-    hash_tx_body_sweep25x2 as hash_tx_body_sweep25x2_core, Digest, TxBodyHash, SWEEP_TXBODY_INPUTS,
-    SWEEP_TXBODY_OUTPUTS, TXBODY_INPUTS, TXBODY_OUTPUTS,
+    hash_input_leaf_packed, hash_output_leaf_packed, hash_tx_body_carrier, Address, Digest,
+    TxBodyHash, TXBODY_CARRIER_INPUTS, TXBODY_CARRIER_OUTPUTS,
 };
 
-use crate::types::{pack_amount_creation_id, TxInput, TxOutput, TxShape};
+use crate::{pack_amount_creation_id, TxBody, TX_INPUTS, TX_OUTPUTS};
 
-/// Compute the canonical transaction-body hash. `inputs.len()` and
-/// `outputs.len()` must not exceed `MAX_INPUTS` / `MAX_OUTPUTS`;
-/// missing slots are filled with `TxInput::dummy` / `TxOutput::dummy`
-/// so the leaf tree is always depth-4. Every slot — including
-/// `valid=false` ones — is hashed into its leaf.
-///
-/// `epoch_anchor` occupies leaf L0 (replacing the former
-/// `prev_state_root`), providing fork-binding and natural TTL.
-pub fn hash_tx_body(
-    epoch_anchor: &Digest,
-    fee: u128,
-    inputs: &[TxInput],
-    outputs: &[TxOutput],
-    is_coinbase: bool,
-) -> TxBodyHash {
-    hash_tx_body_for_shape(
-        TxShape::Standard4x8,
-        epoch_anchor,
-        fee,
-        inputs,
-        outputs,
-        is_coinbase,
+pub const CARRIER_INPUTS: usize = TXBODY_CARRIER_INPUTS;
+pub const CARRIER_OUTPUTS: usize = TXBODY_CARRIER_OUTPUTS;
+
+/// Logical Tx8x2 records expressed as the old carrier's raw four-lane
+/// payloads. This is proof plumbing, never a wire representation.
+pub fn carrier_payloads(
+    body: &TxBody,
+) -> (
+    [[Block128; 4]; CARRIER_INPUTS],
+    [[Block128; 4]; CARRIER_OUTPUTS],
+) {
+    let mut carrier_inputs = [[Block128::ZERO; 4]; CARRIER_INPUTS];
+    let mut carrier_outputs = [[Block128::ZERO; 4]; CARRIER_OUTPUTS];
+    let [owner_hi, owner_lo] = body.input_owner.as_fields();
+
+    for logical_index in 0..TX_INPUTS {
+        let input = body.inputs[logical_index];
+        let owner = if body.input_is_live(logical_index) {
+            [owner_hi, owner_lo]
+        } else {
+            [Block128::ZERO; 2]
+        };
+        let payload = [
+            Block128::from(input.slot_index as u128),
+            pack_amount_creation_id(input.amount, input.creation_id),
+            owner[0],
+            owner[1],
+        ];
+        if logical_index < CARRIER_INPUTS {
+            carrier_inputs[logical_index] = payload;
+        } else {
+            carrier_outputs[logical_index - CARRIER_INPUTS] = payload;
+        }
+    }
+
+    for logical_index in 0..TX_OUTPUTS {
+        let output = body.outputs[logical_index];
+        let [output_owner_hi, output_owner_lo] = output.owner.as_fields();
+        carrier_outputs[4 + logical_index] = [
+            Block128::from(output.slot_index as u128),
+            Block128::from(output.amount as u128),
+            output_owner_hi,
+            output_owner_lo,
+        ];
+    }
+
+    // Carrier output payloads 6 and 7 remain the fixed zero payload.
+    (carrier_inputs, carrier_outputs)
+}
+
+pub fn hash_tx_body(body: &TxBody) -> TxBodyHash {
+    let (input_payloads, output_payloads) = carrier_payloads(body);
+    let mut input_leaves: [Digest; CARRIER_INPUTS] = [[0u8; 32]; CARRIER_INPUTS];
+    let mut output_leaves: [Digest; CARRIER_OUTPUTS] = [[0u8; 32]; CARRIER_OUTPUTS];
+
+    for (index, payload) in input_payloads.iter().enumerate() {
+        input_leaves[index] = hash_input_leaf_packed(
+            payload[0].0 as u32,
+            payload[1],
+            &address_from_fields(payload[2], payload[3]),
+        );
+    }
+    for (index, payload) in output_payloads.iter().enumerate() {
+        output_leaves[index] = hash_output_leaf_packed(
+            payload[0].0 as u32,
+            payload[1],
+            &address_from_fields(payload[2], payload[3]),
+        );
+    }
+
+    hash_tx_body_carrier(
+        &body.epoch_anchor,
+        body.fee,
+        &input_leaves,
+        &output_leaves,
+        body.is_coinbase,
+        body.validity_bitmap,
     )
 }
 
-/// The liveness bitmap committed in the body's reserved leaf: input bit
-/// `i`, output bit `max_inputs + j`. Shared by the body hash, the spine
-/// statement and every consumer that re-derives the committed selectors.
-pub fn validity_bits_for_shape(shape: TxShape, inputs: &[TxInput], outputs: &[TxOutput]) -> u128 {
-    let mut bits = 0u128;
-    for (i, inp) in inputs.iter().enumerate() {
-        if inp.valid {
-            bits |= 1u128 << i;
-        }
-    }
-    for (j, out) in outputs.iter().enumerate() {
-        if out.valid {
-            bits |= 1u128 << (shape.max_inputs() + j);
-        }
-    }
-    bits
-}
-
-/// Compute the canonical transaction-body hash for a specific shape.
-///
-/// `Standard4x8` preserves the existing 16-leaf launch layout exactly.
-/// `Sweep25x2` uses the reserved 32-leaf layout with an explicit shape leaf.
-pub fn hash_tx_body_for_shape(
-    shape: TxShape,
-    epoch_anchor: &Digest,
-    fee: u128,
-    inputs: &[TxInput],
-    outputs: &[TxOutput],
-    is_coinbase: bool,
-) -> TxBodyHash {
-    assert!(
-        inputs.len() <= shape.max_inputs(),
-        "inputs exceed shape max"
-    );
-    assert!(
-        outputs.len() <= shape.max_outputs(),
-        "outputs exceed shape max"
-    );
-
-    let validity_bits = validity_bits_for_shape(shape, inputs, outputs);
-
-    match shape {
-        TxShape::Standard4x8 => {
-            debug_assert_eq!(shape.max_inputs(), TXBODY_INPUTS);
-            debug_assert_eq!(shape.max_outputs(), TXBODY_OUTPUTS);
-
-            let mut input_leaves: [Digest; TXBODY_INPUTS] = [[0u8; 32]; TXBODY_INPUTS];
-            for i in 0..TXBODY_INPUTS {
-                let inp = inputs.get(i).cloned().unwrap_or_else(TxInput::dummy);
-                input_leaves[i] = hash_input_leaf_packed(
-                    inp.slot_index,
-                    pack_amount_creation_id(inp.value, inp.creation_id),
-                    &inp.owner,
-                );
-            }
-
-            let mut output_leaves: [Digest; TXBODY_OUTPUTS] = [[0u8; 32]; TXBODY_OUTPUTS];
-            for i in 0..TXBODY_OUTPUTS {
-                let out = outputs.get(i).copied().unwrap_or_else(TxOutput::dummy);
-                output_leaves[i] = hash_output_leaf(out.slot_index, out.value, &out.owner);
-            }
-
-            hash_tx_body_core(
-                epoch_anchor,
-                fee,
-                &input_leaves,
-                &output_leaves,
-                is_coinbase,
-                validity_bits,
-            )
-        }
-        TxShape::Sweep25x2 => {
-            debug_assert_eq!(shape.max_inputs(), SWEEP_TXBODY_INPUTS);
-            debug_assert_eq!(shape.max_outputs(), SWEEP_TXBODY_OUTPUTS);
-
-            let mut input_leaves: [Digest; SWEEP_TXBODY_INPUTS] = [[0u8; 32]; SWEEP_TXBODY_INPUTS];
-            for i in 0..SWEEP_TXBODY_INPUTS {
-                let inp = inputs.get(i).cloned().unwrap_or_else(TxInput::dummy);
-                input_leaves[i] = hash_input_leaf_packed(
-                    inp.slot_index,
-                    pack_amount_creation_id(inp.value, inp.creation_id),
-                    &inp.owner,
-                );
-            }
-
-            let mut output_leaves: [Digest; SWEEP_TXBODY_OUTPUTS] =
-                [[0u8; 32]; SWEEP_TXBODY_OUTPUTS];
-            for i in 0..SWEEP_TXBODY_OUTPUTS {
-                let out = outputs.get(i).copied().unwrap_or_else(TxOutput::dummy);
-                output_leaves[i] = hash_output_leaf(out.slot_index, out.value, &out.owner);
-            }
-
-            hash_tx_body_sweep25x2_core(
-                epoch_anchor,
-                fee,
-                &input_leaves,
-                &output_leaves,
-                is_coinbase,
-                validity_bits,
-            )
-        }
-    }
+fn address_from_fields(hi: Block128, lo: Block128) -> Address {
+    let mut bytes = [0u8; 32];
+    bytes[..16].copy_from_slice(&hi.0.to_le_bytes());
+    bytes[16..].copy_from_slice(&lo.0.to_le_bytes());
+    Address(bytes)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use noid_poseidon2b::primitives::{Address, SpendSecret};
+    use crate::{output_bitmap_bit, TxInput, TxOutput, TX_VALIDITY_MASK};
 
-    fn mk_input(seed: u8) -> TxInput {
-        TxInput {
-            slot_index: seed as u32,
-            value: (seed as u64) * 11,
-            creation_id: 0,
-            owner: Address([seed; 32]),
-            spend_secret: SpendSecret([seed ^ 0xAA; 32]),
-            valid: true,
+    fn body() -> TxBody {
+        let mut inputs = [TxInput::dummy(); TX_INPUTS];
+        inputs[0] = TxInput {
+            slot_index: 11,
+            amount: 50,
+            creation_id: 3,
+        };
+        inputs[7] = TxInput {
+            slot_index: 77,
+            amount: 60,
+            creation_id: 9,
+        };
+        let outputs = [
+            TxOutput {
+                slot_index: 101,
+                amount: 70,
+                owner: Address([0x31; 32]),
+            },
+            TxOutput {
+                slot_index: 102,
+                amount: 30,
+                owner: Address([0x32; 32]),
+            },
+        ];
+        TxBody {
+            epoch_anchor: [0xA5; 32],
+            fee: 10,
+            input_owner: Address([0x21; 32]),
+            inputs,
+            outputs,
+            validity_bitmap: (1 << 0) | (1 << 7) | output_bitmap_bit(0) | output_bitmap_bit(1),
+            is_coinbase: false,
         }
     }
 
-    fn mk_output(seed: u8) -> TxOutput {
-        TxOutput {
-            slot_index: (seed as u32).wrapping_mul(3),
-            value: (seed as u64) * 7,
-            owner: Address([seed; 32]),
-            valid: true,
+    #[test]
+    fn carrier_mapping_uses_every_logical_edge() {
+        let body = body();
+        let (ins, outs) = carrier_payloads(&body);
+        assert_eq!(ins[0][0], Block128::from(11u128));
+        assert_eq!(outs[3][0], Block128::from(77u128));
+        assert_eq!(outs[4][0], Block128::from(101u128));
+        assert_eq!(outs[5][0], Block128::from(102u128));
+        assert_eq!(outs[6], [Block128::ZERO; 4]);
+        assert_eq!(outs[7], [Block128::ZERO; 4]);
+    }
+
+    #[test]
+    fn input_seven_creation_id_high_half_is_bound() {
+        let body = body();
+        let h0 = hash_tx_body(&body);
+        let mut changed = body;
+        changed.inputs[7].creation_id ^= 1;
+        assert_ne!(h0, hash_tx_body(&changed));
+    }
+
+    #[test]
+    fn every_body_surface_is_hash_bound() {
+        let base = body();
+        let hash = hash_tx_body(&base);
+
+        let mut variants = Vec::new();
+        let mut v = base.clone();
+        v.epoch_anchor[0] ^= 1;
+        variants.push(v);
+        let mut v = base.clone();
+        v.fee ^= 1;
+        variants.push(v);
+        let mut v = base.clone();
+        v.input_owner.0[0] ^= 1;
+        variants.push(v);
+        let mut v = base.clone();
+        v.inputs[0].slot_index ^= 1;
+        variants.push(v);
+        let mut v = base.clone();
+        v.inputs[7].amount ^= 1;
+        variants.push(v);
+        let mut v = base.clone();
+        v.outputs[0].owner.0[0] ^= 1;
+        variants.push(v);
+        let mut v = base.clone();
+        v.outputs[1].amount ^= 1;
+        variants.push(v);
+        let mut v = base.clone();
+        v.validity_bitmap ^= 1 << 4;
+        variants.push(v);
+        let mut v = base;
+        v.is_coinbase = true;
+        variants.push(v);
+
+        for variant in variants {
+            assert_ne!(hash, hash_tx_body(&variant));
         }
+        assert_eq!(TX_VALIDITY_MASK, 0x03ff);
     }
 
     #[test]
-    fn determinism() {
-        let anchor = [0xABu8; 32];
-        let i = [mk_input(1)];
-        let o = [mk_output(2), mk_output(3)];
-        assert_eq!(
-            hash_tx_body(&anchor, 5, &i, &o, false),
-            hash_tx_body(&anchor, 5, &i, &o, false)
-        );
-    }
+    fn every_fixed_record_lane_is_hash_bound() {
+        let mut inputs = [TxInput::dummy(); TX_INPUTS];
+        for (index, input) in inputs.iter_mut().enumerate() {
+            *input = TxInput {
+                slot_index: 100 + index as u32,
+                amount: 10 + index as u64,
+                creation_id: 1_000 + index as u64,
+            };
+        }
+        let outputs = [
+            TxOutput {
+                slot_index: 200,
+                amount: 50,
+                owner: Address([0x41; 32]),
+            },
+            TxOutput {
+                slot_index: 201,
+                amount: 51,
+                owner: Address([0x42; 32]),
+            },
+        ];
+        let body = TxBody {
+            epoch_anchor: [0x51; 32],
+            fee: 7,
+            input_owner: Address([0x52; 32]),
+            inputs,
+            outputs,
+            validity_bitmap: TX_VALIDITY_MASK,
+            is_coinbase: false,
+        };
+        assert!(body.validate_canonical().is_ok());
+        let expected = hash_tx_body(&body);
 
-    #[test]
-    fn output_value_flip_changes_body_hash() {
-        let anchor = [0u8; 32];
-        let o1 = mk_output(1);
-        let mut o2 = o1;
-        o2.value ^= 0xFF;
-        let h1 = hash_tx_body(&anchor, 0, &[], &[o1], false);
-        let h2 = hash_tx_body(&anchor, 0, &[], &[o2], false);
-        assert_ne!(h1, h2);
-    }
+        for index in 0..TX_INPUTS {
+            let mut changed = body.clone();
+            changed.inputs[index].slot_index ^= 1;
+            assert_ne!(expected, hash_tx_body(&changed), "input {index} slot");
 
-    #[test]
-    fn output_slot_index_is_bound() {
-        let anchor = [0u8; 32];
-        let o1 = mk_output(1);
-        let mut o2 = o1;
-        o2.slot_index ^= 0x33;
-        let h1 = hash_tx_body(&anchor, 0, &[], &[o1], false);
-        let h2 = hash_tx_body(&anchor, 0, &[], &[o2], false);
-        assert_ne!(h1, h2);
-    }
+            let mut changed = body.clone();
+            changed.inputs[index].amount ^= 1;
+            assert_ne!(expected, hash_tx_body(&changed), "input {index} amount");
 
-    #[test]
-    fn input_slot_index_is_bound() {
-        let anchor = [0u8; 32];
-        let mut i1 = mk_input(1);
-        let mut i2 = i1.clone();
-        i2.slot_index ^= 0x55;
-        i1.valid = true;
-        let h1 = hash_tx_body(&anchor, 0, &[i1], &[], false);
-        let h2 = hash_tx_body(&anchor, 0, &[i2], &[], false);
-        assert_ne!(h1, h2);
-    }
+            let mut changed = body.clone();
+            changed.inputs[index].creation_id ^= 1;
+            assert_ne!(
+                expected,
+                hash_tx_body(&changed),
+                "input {index} creation id"
+            );
+        }
 
-    #[test]
-    fn input_creation_id_zero_uses_low_lane_and_nonzero_is_bound() {
-        let anchor = [0x31u8; 32];
-        let zero_id = mk_input(3);
-        let zero_id_leaf = hash_input_leaf_packed(
-            zero_id.slot_index,
-            pack_amount_creation_id(zero_id.value, zero_id.creation_id),
-            &zero_id.owner,
-        );
-        assert_eq!(
-            zero_id_leaf,
-            hash_input_leaf_packed(
-                zero_id.slot_index,
-                pack_amount_creation_id(zero_id.value, 0),
-                &zero_id.owner,
-            )
-        );
+        for index in 0..TX_OUTPUTS {
+            let mut changed = body.clone();
+            changed.outputs[index].slot_index ^= 1;
+            assert_ne!(expected, hash_tx_body(&changed), "output {index} slot");
 
-        let h0 = hash_tx_body(&anchor, 0, std::slice::from_ref(&zero_id), &[], false);
-        let mut incarnated = zero_id;
-        incarnated.creation_id = 9;
-        let h9 = hash_tx_body(&anchor, 0, &[incarnated], &[], false);
-        assert_ne!(h0, h9);
-    }
+            let mut changed = body.clone();
+            changed.outputs[index].amount ^= 1;
+            assert_ne!(expected, hash_tx_body(&changed), "output {index} amount");
 
-    #[test]
-    fn ordering_and_fee_sensitive() {
-        let anchor = [0u8; 32];
-        let i1 = mk_input(1);
-        let i2 = mk_input(2);
-        let h_a = hash_tx_body(&anchor, 10, &[i1.clone(), i2.clone()], &[], false);
-        let h_b = hash_tx_body(&anchor, 10, &[i2.clone(), i1.clone()], &[], false);
-        let h_c = hash_tx_body(&anchor, 11, &[i1, i2], &[], false);
-        assert_ne!(h_a, h_b);
-        assert_ne!(h_a, h_c);
-    }
+            let mut changed = body.clone();
+            changed.outputs[index].owner.0[31] ^= 1;
+            assert_ne!(expected, hash_tx_body(&changed), "output {index} owner");
+        }
 
-    #[test]
-    fn dummy_input_equals_zero_leaf() {
-        let anchor = [0u8; 32];
-        let real = mk_input(1);
-        let h1 = hash_tx_body(&anchor, 0, std::slice::from_ref(&real), &[], false);
-        let h2 = hash_tx_body(
-            &anchor,
-            0,
-            &[real, TxInput::dummy(), TxInput::dummy()],
-            &[],
-            false,
-        );
-        assert_eq!(h1, h2);
-    }
-
-    #[test]
-    fn is_coinbase_flips_hash() {
-        let anchor = [0u8; 32];
-        let h0 = hash_tx_body(&anchor, 0, &[], &[], false);
-        let h1 = hash_tx_body(&anchor, 0, &[], &[], true);
-        assert_ne!(h0, h1);
-    }
-
-    #[test]
-    fn epoch_anchor_flip_changes_body_hash() {
-        let a1 = [0x11u8; 32];
-        let a2 = [0x22u8; 32];
-        let h1 = hash_tx_body(&a1, 0, &[], &[], false);
-        let h2 = hash_tx_body(&a2, 0, &[], &[], false);
-        assert_ne!(h1, h2);
-    }
-
-    #[test]
-    fn sweep_hash_is_shape_separated() {
-        let anchor = [0x44u8; 32];
-        let inputs = vec![mk_input(1)];
-        let outputs = vec![mk_output(1)];
-        let standard =
-            hash_tx_body_for_shape(TxShape::Standard4x8, &anchor, 7, &inputs, &outputs, false);
-        let sweep =
-            hash_tx_body_for_shape(TxShape::Sweep25x2, &anchor, 7, &inputs, &outputs, false);
-        assert_ne!(standard, sweep);
-    }
-
-    #[test]
-    fn sweep_hash_binds_last_input_and_second_output() {
-        let anchor = [0x55u8; 32];
-        let mut inputs: Vec<TxInput> = (0..25).map(|i| mk_input(i as u8 + 1)).collect();
-        let outputs = vec![mk_output(1), mk_output(2)];
-        let h1 = hash_tx_body_for_shape(TxShape::Sweep25x2, &anchor, 9, &inputs, &outputs, false);
-        inputs[24].value ^= 1;
-        let h2 = hash_tx_body_for_shape(TxShape::Sweep25x2, &anchor, 9, &inputs, &outputs, false);
-        assert_ne!(h1, h2);
-
-        let mut outputs2 = outputs;
-        outputs2[1].owner = Address([0xEE; 32]);
-        let h3 = hash_tx_body_for_shape(TxShape::Sweep25x2, &anchor, 9, &inputs, &outputs2, false);
-        assert_ne!(h2, h3);
-    }
-
-    #[test]
-    #[should_panic(expected = "inputs exceed shape max")]
-    fn standard_hash_rejects_more_than_four_inputs() {
-        let inputs = vec![TxInput::dummy(); 5];
-        let _ = hash_tx_body_for_shape(TxShape::Standard4x8, &[0u8; 32], 0, &inputs, &[], false);
-    }
-
-    #[test]
-    #[should_panic(expected = "outputs exceed shape max")]
-    fn sweep_hash_rejects_more_than_two_outputs() {
-        let outputs = vec![TxOutput::dummy(); 3];
-        let _ = hash_tx_body_for_shape(TxShape::Sweep25x2, &[0u8; 32], 0, &[], &outputs, false);
+        for bit in 0..crate::TX_ACTIONS {
+            let mut changed = body.clone();
+            changed.validity_bitmap ^= 1 << bit;
+            assert_ne!(expected, hash_tx_body(&changed), "bitmap bit {bit}");
+        }
     }
 }

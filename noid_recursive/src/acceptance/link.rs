@@ -48,26 +48,26 @@ use noid_ivc_core::pcs::{self, PcsParams};
 use noid_ivc_core::proof::{FieldR1csProof, FieldShape};
 use noid_ivc_core::public_io::{IoClaimSpec, PublicIoSpec, WitnessSlice};
 
+use super::block_slots::{
+    build_block_slots_with_config, region_wallet_pcs_native, BlockSlots, BlockSlotsConfig,
+};
+use super::trace::accepted_claim_batch::digest_lanes;
 use super::trace::matrix_fold::{
     verify_matrix_claim_fold_trace, FreshLincheckClaimTrace, MatrixAccClaimTrace,
     MatrixFoldProofTrace,
 };
+use super::trace::region_source_binding::{RegionDischargeParams, RegionPcsClaim};
 use super::trace::self_verify::{
     alloc_flat_digest, flat_digest_lanes, lagrange_weights_window_trace,
     verify_field_trace_deferred, FieldR1csProofTrace, FlatDigestExpr,
 };
-use super::trace::region_source_binding::{RegionDischargeParams, RegionPcsClaim};
-use super::trace::accepted_claim_batch::digest_lanes;
 use super::trace::{flat_of, mul, pin_eq};
-use super::block_slots::{
-    build_block_slots_with_config, region_wallet_pcs_native, BlockSlots, BlockSlotsConfig,
-};
-use noid_ivc_prover::field_prover::prove_field_with_public_io;
 use crate::accumulator::ChainAccumulator;
 use crate::block_certificate_backend::{
     AcceptedBlockBatchComponentInputs, AcceptedBlockBatchComponentProof,
 };
 use noid_core::Block128;
+use noid_ivc_prover::field_prover::prove_field_with_public_io;
 
 /// The accumulator-boundary lane count: height, state_root×2,
 /// chain_hash×2, active_slot_count, alloc_counter.
@@ -114,7 +114,13 @@ pub fn genesis_instance(shape: &FieldShape) -> FieldR1cs {
     let b_0 = SparseFieldMatrix::from_rows(
         k,
         (0..k)
-            .map(|r| if r < ell { vec![(0u32, F128::ONE)] } else { vec![] })
+            .map(|r| {
+                if r < ell {
+                    vec![(0u32, F128::ONE)]
+                } else {
+                    vec![]
+                }
+            })
             .collect(),
     );
     FieldR1cs {
@@ -344,9 +350,11 @@ pub struct LinkClass {
     pub exact_state_region: bool,
     /// When true, this block-bearing region class verifies the tx-root
     /// Merkle paths on the shared walk B (one TAG_COMPRESS leg; entries =
-    /// the spine tx-hash wires, roots = the header `tx_root` wires,
-    /// positions + padding rim const-cell-pinned) instead of the inline
-    /// batched killshot. Only meaningful when `region_params` is `Some`.
+    /// the spine tx-hash wires, roots = the underlying universal Merkle-root
+    /// `M` wires, positions + padding rim const-cell-pinned) instead of the
+    /// inline batched killshot. The block slot separately binds
+    /// `TAG_TXROOT(M, tx_count)` to the header `tx_root`. Only meaningful
+    /// when `region_params` is `Some`.
     pub tx_root_region: bool,
     /// When true, this block-bearing region class verifies every
     /// transaction's tx-body spine on the shared walk A (the leaf/wrap tile
@@ -359,7 +367,7 @@ pub struct LinkClass {
     /// liveness-gated count lanes + capacity spine/tx-root structures), so
     /// same-tier blocks with different real usage share the ONE class
     /// matrix. Requires the full region stack; `cap` must be the consensus
-    /// standard tier of every block the class carries.
+    /// user-transaction tier of every block the class carries.
     pub tier_user_tx_capacity: Option<usize>,
 }
 
@@ -636,7 +644,10 @@ fn build_link_inner(
     freeze: bool,
     reuse: Option<FieldR1cs>,
 ) -> BuiltLink {
-    assert!(!(freeze && reuse.is_some()), "freeze builds materialize their own matrix");
+    assert!(
+        !(freeze && reuse.is_some()),
+        "freeze builds materialize their own matrix"
+    );
     let region_mode = class.region_params.is_some();
     let k_log = class.shape.k_log;
     let layout = class.layout();
@@ -728,7 +739,10 @@ fn build_link_inner(
         let stride = class.region_max_arity + 1;
         for (ci, (np, nv)) in region_native.iter().enumerate() {
             let base = layout.region_tail_offset + ci * stride;
-            assert!(np.len() <= class.region_max_arity, "region claim arity over max");
+            assert!(
+                np.len() <= class.region_max_arity,
+                "region claim arity over max"
+            );
             for (kk, &p) in np.iter().enumerate() {
                 io[base + kk] = p;
             }
@@ -887,8 +901,7 @@ fn build_link_inner(
             &slots.start_acc.alloc_counter,
         ];
         let genesis_start = block_acc_lanes(&class.genesis_block_accumulator);
-        let prev_block_io: [usize; ACC_LANES] =
-            std::array::from_fn(|i| layout.block_height + i);
+        let prev_block_io: [usize; ACC_LANES] = std::array::from_fn(|i| layout.block_height + i);
         for (i, sw) in start_lanes.iter().enumerate() {
             // g · (start - genesis_const) = 0.
             let to_genesis = (*sw).add(&LinExpr::constant(genesis_start[i]));
@@ -921,7 +934,11 @@ fn build_link_inner(
             for (ci, c) in live_region.iter().enumerate() {
                 let fc = &class.region_claims[ci];
                 assert_eq!(c.slice, fc.slice, "region claim {ci} slice drift (trace)");
-                assert_eq!(c.point.len(), fc.arity, "region claim {ci} arity drift (trace)");
+                assert_eq!(
+                    c.point.len(),
+                    fc.arity,
+                    "region claim {ci} arity drift (trace)"
+                );
                 let base = layout.region_tail_offset + ci * stride;
                 for (kk, p) in c.point.iter().enumerate() {
                     pin_eq(&mut b, p, &io_cells[base + kk]);
@@ -945,7 +962,10 @@ fn build_link_inner(
     if region_mode {
         // Memory guard: a region block-bearing link must stay well under 2^24
         // wires (a runaway combined trace once OOM'd at ~30 GB).
-        assert!(used < (1usize << 24), "region link wire guard: {used} >= 2^24");
+        assert!(
+            used < (1usize << 24),
+            "region link wire guard: {used} >= 2^24"
+        );
     }
     assert!(
         used <= target,
@@ -1032,7 +1052,11 @@ fn freeze_region_block_bearing(
             sample_block.proof,
             region_cfg,
         );
-        let arities: Vec<usize> = slots.pending_wallet_pcs.iter().map(|c| c.point.len()).collect();
+        let arities: Vec<usize> = slots
+            .pending_wallet_pcs
+            .iter()
+            .map(|c| c.point.len())
+            .collect();
         let max_arity = arities.iter().copied().max().unwrap_or(0);
         (arities.len(), arities, max_arity)
     };
@@ -1055,7 +1079,10 @@ fn freeze_region_block_bearing(
     let placeholders: Vec<RegionFrozenClaim> = arities
         .iter()
         .map(|&a| RegionFrozenClaim {
-            slice: WitnessSlice { log2_len: a, index: 1 },
+            slice: WitnessSlice {
+                log2_len: a,
+                index: 1,
+            },
             arity: a,
         })
         .collect();

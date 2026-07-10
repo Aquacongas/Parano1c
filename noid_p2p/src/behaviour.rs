@@ -179,16 +179,13 @@ impl NodeBehaviour {
         //                       scale (Ethereum uses 700ms too).
         // Max gossipsub message size.
         //
-        // Block sizes (block_bytes only, no proof):
-        //   coinbase:  ~1 KB
-        //   50 txs:    ~27 KB
-        //   256 txs:   ~135 KB
+        // Block bodies are fixed-form and capped at 82,905 bytes for all 256
+        // canonical transaction slots, including coinbase.
         //
         // Block proof sizes (block_proof_bytes):
         //   coinbase:  0 B (empty)
-        //   user-tx blocks carry shape-specific BlockProof bytes.
-        //   Current caps are conservative; exact Standard4x8/Sweep25x2 and
-        //   mixed-block sizes are remeasured in the benchmark/report phase.
+        //   user-tx blocks carry BlockProof bytes. The proof caps remain
+        //   conservative until final production row-ledger measurements.
         //
         // Strategy: inline blocks up to 1 MB via gossip for low-tx blocks.
         // Larger blocks use compact announcement + pull sync via block_sync

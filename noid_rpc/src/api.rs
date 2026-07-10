@@ -65,7 +65,7 @@ pub trait ParanoidApi {
     #[method(name = "getStateInfo")]
     async fn get_state_info(&self) -> RpcResult<StateInfo>;
 
-    /// Confirmed transaction info by tx_body_hash. Uses the permanent tx index.
+    /// Confirmed transaction info by derived txid. Uses the permanent tx index.
     /// Returns null if hash is unknown (not yet confirmed or never submitted).
     #[method(name = "getTx")]
     async fn get_tx(&self, txhash: String) -> RpcResult<Option<TxInfo>>;
@@ -92,7 +92,7 @@ pub trait ParanoidApi {
     #[method(name = "estimateFee")]
     async fn estimate_fee(&self, n_outputs: u32) -> RpcResult<u64>;
 
-    /// Detailed shape-aware fee estimate for explicit live input/output counts.
+    /// Detailed fee estimate for explicit live input/output counts.
     #[method(name = "estimateFeeDetailed")]
     async fn estimate_fee_detailed(&self, n_inputs: u32, n_outputs: u32) -> RpcResult<FeeEstimate>;
 
@@ -210,25 +210,26 @@ pub trait ParanoidApi {
     async fn wallet_scan(&self) -> RpcResult<WalletScanResult>;
 
     /// Dry-run wallet send planning without proving or submitting.
-    /// `fee_micronoid = 0` uses automatic per-chunk minimum relay fee.
+    /// `fee_per_tx_micronoid = 0` computes an automatic fee per planned transaction.
     #[method(name = "walletPlanSend")]
     async fn wallet_plan_send(
         &self,
-        to_hex: String,
+        to_address: String,
         amount_micronoid: u64,
-        fee_micronoid: u64,
+        fee_per_tx_micronoid: u64,
     ) -> RpcResult<WalletSendPlan>;
 
     /// Send NOID to a recipient address.
-    /// `to_hex`: 32-byte recipient address as hex.
+    /// `to_address`: recipient bech32m address.
     /// `amount_micronoid`: amount in μNOID.
-    /// `fee_micronoid`: transaction fee in μNOID (0 = use automatic per-chunk minimum).
+    /// `fee_per_tx_micronoid`: fee applied to every ordinary transaction
+    /// (0 = automatic fee independently per transaction).
     #[method(name = "walletSend")]
     async fn wallet_send(
         &self,
-        to_hex: String,
+        to_address: String,
         amount_micronoid: u64,
-        fee_micronoid: u64,
+        fee_per_tx_micronoid: u64,
     ) -> RpcResult<WalletSendResult>;
 
     /// Export a receipt for a confirmed transaction (hex-encoded bytes).
@@ -236,15 +237,15 @@ pub trait ParanoidApi {
     async fn wallet_export_receipt(&self, txhash_hex: String) -> RpcResult<String>;
 
     /// Dry-run one consolidation round without proving or submitting.
-    /// `fee_micronoid = 0` uses automatic shape-aware minimum relay fee.
+    /// `fee_micronoid = 0` uses the automatic minimum relay fee.
     #[method(name = "walletPlanConsolidate")]
     async fn wallet_plan_consolidate(&self, fee_micronoid: u64)
         -> RpcResult<WalletConsolidatePlan>;
 
-    /// Consolidate small UTXOs into one larger UTXO (up to `Sweep25x2` capacity).
-    /// Returns tx_hash of the submitted consolidation transaction.
+    /// Consolidate up to eight small UTXOs into one larger UTXO.
+    /// Returns the one submitted ordinary-transaction chunk.
     /// Returns an error if the wallet has 1 or fewer available UTXOs, or insufficient funds.
-    /// `fee_micronoid = 0` uses a shape-aware automatic fee for the selected inputs.
+    /// `fee_micronoid = 0` uses an automatic fee for the selected inputs.
     #[method(name = "walletConsolidate")]
     async fn wallet_consolidate(&self, fee_micronoid: u64) -> RpcResult<WalletSendResult>;
 

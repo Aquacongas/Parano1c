@@ -19,7 +19,7 @@
 //!   1. select UTXOs from utxos map
 //!   2. get slot hints from local chain state (empty slots for outputs)
 //!   3. builder::build_and_prove_tx(...)
-//!      a. compute tx_body_hash
+//!      a. derive txid from the canonical body
 //!      b. prove_tx(body, one_owner_witness) → WalletAuthorizationBundle
 //!      c. assemble TxIntent bytes
 //!   4. submit to own mempool
@@ -49,7 +49,7 @@ use noid_rpc::types::{
 };
 use noid_rpc::wallet_ops::WalletActivationPreview;
 use noid_rpc::WalletOps;
-use noid_tx::TxShape;
+use noid_tx::TX_INPUTS;
 
 /// Thread-safe handle to the in-process wallet.
 ///
@@ -102,12 +102,11 @@ pub fn update_for_accepted_block(
     });
 
     for tx in &block.transactions {
-        wallet.confirm_pending_tx(&tx.tx_body_hash.0, block.header.height);
+        wallet.confirm_pending_tx(&tx.txid().0, block.header.height);
         let output_slots: Vec<u32> = tx
             .body
-            .outputs
-            .iter()
-            .filter(|output| output.valid)
+            .live_outputs()
+            .map(|(_, output)| output)
             .map(|output| output.slot_index)
             .collect();
         wallet.remove_pending_outputs(&output_slots);
@@ -163,7 +162,7 @@ pub fn install_reorg_snapshot_and_artifacts(
     let replacement: std::collections::HashSet<[u8; 32]> = replacement_blocks
         .iter()
         .flat_map(|block| block.transactions.iter())
-        .map(|transaction| transaction.tx_body_hash.0)
+        .map(|transaction| transaction.txid().0)
         .collect();
     wallet.history.retain_mut(|entry| {
         if !reclaimed.contains(&entry.tx_hash) {
@@ -189,12 +188,11 @@ pub fn install_reorg_snapshot_and_artifacts(
             block,
         );
         for transaction in &block.transactions {
-            wallet.confirm_pending_tx(&transaction.tx_body_hash.0, block.header.height);
+            wallet.confirm_pending_tx(&transaction.txid().0, block.header.height);
             let output_slots: Vec<u32> = transaction
                 .body
-                .outputs
-                .iter()
-                .filter(|output| output.valid)
+                .live_outputs()
+                .map(|(_, output)| output)
                 .map(|output| output.slot_index)
                 .collect();
             wallet.remove_pending_outputs(&output_slots);
@@ -242,25 +240,6 @@ fn fee_breakdown_info(
     }
 }
 
-fn wallet_send_shape_for_counts(n_inputs: usize, n_outputs: usize) -> Result<TxShape, String> {
-    if n_inputs == 0 {
-        return Err("send plan needs at least one input".to_string());
-    }
-    if n_inputs <= TxShape::Standard4x8.max_inputs()
-        && n_outputs <= TxShape::Standard4x8.max_outputs()
-    {
-        Ok(TxShape::Standard4x8)
-    } else if n_inputs <= TxShape::Sweep25x2.max_inputs()
-        && n_outputs <= TxShape::Sweep25x2.max_outputs()
-    {
-        Ok(TxShape::Sweep25x2)
-    } else {
-        Err(format!(
-            "no supported wallet tx shape for {n_inputs} input(s) and {n_outputs} output(s)"
-        ))
-    }
-}
-
 impl WalletOps for WalletHandle {
     fn status(&self) -> WalletStatus {
         let guard = self.inner.lock().unwrap();
@@ -300,8 +279,8 @@ impl WalletOps for WalletHandle {
         let guard = self.inner.lock().unwrap();
         match &*guard {
             None => WalletBalance {
-                total_micronoid: 0,
-                total_noid: 0.0,
+                balance_micronoid: 0,
+                balance_noid: 0.0,
                 utxo_count: 0,
                 pending_outbound_micronoid: 0,
                 spendable_micronoid: 0,
@@ -318,8 +297,8 @@ impl WalletOps for WalletHandle {
                     .sum();
                 let spendable = total.saturating_sub(pending_out);
                 WalletBalance {
-                    total_micronoid: total,
-                    total_noid: micronoid_to_noid(total),
+                    balance_micronoid: total,
+                    balance_noid: micronoid_to_noid(total),
                     utxo_count: w.utxos.len(),
                     pending_outbound_micronoid: pending_out,
                     spendable_micronoid: spendable,
@@ -474,68 +453,10 @@ impl WalletOps for WalletHandle {
         update_for_accepted_block(&self.inner, block)
     }
 
-    fn plan_send_splits(
-        &self,
-        amount_micronoid: u64,
-        fee_per_tx_micronoid: u64,
-    ) -> Result<Vec<u64>, String> {
-        if amount_micronoid == 0 {
-            return Err("amount cannot be zero".to_string());
-        }
-
-        let guard = self.inner.lock().unwrap();
-        let w = guard
-            .as_ref()
-            .ok_or_else(|| "wallet not initialized".to_string())?;
-
-        let mut available: Vec<&state::WalletUtxo> = w
-            .utxos
-            .values()
-            .filter(|u| u.key_index == w.active_index)
-            .filter(|u| !w.pending_input_slots.contains(&u.slot_index))
-            .collect();
-        available.sort_by_key(|u| std::cmp::Reverse(u.value));
-
-        let spendable: u64 = available.iter().map(|u| u.value).sum();
-        let mut cursor = 0usize;
-        let mut remaining = amount_micronoid;
-        let mut chunks = Vec::new();
-
-        while remaining > 0 {
-            let mut selected_value = 0u64;
-            let mut selected_inputs = 0usize;
-
-            while cursor < available.len()
-                && selected_inputs < TxShape::Sweep25x2.max_inputs()
-                && selected_value < remaining.saturating_add(fee_per_tx_micronoid)
-            {
-                selected_value = selected_value.saturating_add(available[cursor].value);
-                cursor += 1;
-                selected_inputs += 1;
-            }
-
-            if selected_inputs == 0 || selected_value <= fee_per_tx_micronoid {
-                let planned_fees = fee_per_tx_micronoid.saturating_mul(chunks.len() as u64 + 1);
-                return Err(format!(
-                    "insufficient funds: need at least {} μNOID including split fees, have {} μNOID spendable",
-                    amount_micronoid.saturating_add(planned_fees),
-                    spendable
-                ));
-            }
-
-            let max_payment = selected_value - fee_per_tx_micronoid;
-            let chunk = max_payment.min(remaining);
-            chunks.push(chunk);
-            remaining -= chunk;
-        }
-
-        Ok(chunks)
-    }
-
     fn plan_send(
         &self,
         amount_micronoid: u64,
-        explicit_fee_micronoid: Option<u64>,
+        explicit_fee_per_tx_micronoid: Option<u64>,
         active_slot_count: u64,
         log_slots: u32,
         relay_floor: u64,
@@ -545,199 +466,205 @@ impl WalletOps for WalletHandle {
         }
 
         let guard = self.inner.lock().unwrap();
-        let w = guard
+        let wallet = guard
             .as_ref()
             .ok_or_else(|| "wallet not initialized".to_string())?;
-
-        let mut available: Vec<state::WalletUtxo> = w
+        let mut available: Vec<&state::WalletUtxo> = wallet
             .utxos
             .values()
-            .filter(|u| u.key_index == w.active_index)
-            .filter(|u| !w.pending_input_slots.contains(&u.slot_index))
-            .cloned()
+            .filter(|utxo| utxo.key_index == wallet.active_index)
+            .filter(|utxo| !wallet.pending_input_slots.contains(&utxo.slot_index))
             .collect();
-        available.sort_by_key(|u| std::cmp::Reverse(u.value));
+        available.sort_by_key(|utxo| {
+            (
+                std::cmp::Reverse(utxo.value),
+                utxo.slot_index >> noid_chain::consensus::params::LOG_SEGMENT_SIZE,
+                utxo.slot_index,
+            )
+        });
+        let spendable = available
+            .iter()
+            .map(|utxo| utxo.value)
+            .try_fold(0u64, u64::checked_add)
+            .ok_or_else(|| "wallet balance arithmetic overflow".to_string())?;
 
-        let spendable: u64 = available.iter().map(|u| u.value).sum();
         let mut cursor = 0usize;
         let mut remaining = amount_micronoid;
         let mut chunks = Vec::new();
 
         while remaining > 0 {
             let mut selected_value = 0u64;
-            let mut selected_inputs = 0usize;
-            let planned = loop {
-                if cursor + selected_inputs >= available.len()
-                    || selected_inputs >= TxShape::Sweep25x2.max_inputs()
-                {
-                    if selected_inputs == TxShape::Sweep25x2.max_inputs() {
-                        let output_count = 1usize;
-                        let shape = wallet_send_shape_for_counts(selected_inputs, output_count)?;
-                        let breakdown = noid_chain::consensus::fee_breakdown(
-                            selected_inputs as u64,
-                            output_count as u64,
-                            active_slot_count,
-                            log_slots,
-                        );
-                        let minimum_fee = breakdown.required_total.max(relay_floor);
-                        let fee = explicit_fee_micronoid.unwrap_or(minimum_fee);
-                        if fee < minimum_fee {
-                            return Err(format!(
-                                "fee too low for planned {shape:?} tx with {selected_inputs} input(s) and {output_count} output(s): required {minimum_fee} μNOID, got {fee} μNOID"
-                            ));
-                        }
-                        if selected_value > fee {
-                            let chunk_amount = selected_value - fee;
-                            break (shape, output_count, chunk_amount, 0u64, fee, breakdown);
-                        }
-                    }
-                    let planned_fees = chunks
-                        .iter()
-                        .map(|c: &WalletSendChunkPlan| c.fee_micronoid)
-                        .fold(0u64, |acc, f| acc.saturating_add(f));
-                    return Err(format!(
-                        "insufficient funds: need at least {} μNOID including planned fees, have {} μNOID spendable",
-                        amount_micronoid.saturating_add(planned_fees),
-                        spendable
-                    ));
-                }
+            let mut planned: Option<(
+                usize,
+                u64,
+                u64,
+                usize,
+                u64,
+                noid_chain::consensus::FeeBreakdown,
+            )> = None;
 
-                selected_value =
-                    selected_value.saturating_add(available[cursor + selected_inputs].value);
-                selected_inputs += 1;
+            for input_count in 1..=TX_INPUTS {
+                let Some(utxo) = available.get(cursor + input_count - 1) else {
+                    break;
+                };
+                selected_value = selected_value
+                    .checked_add(utxo.value)
+                    .ok_or_else(|| "wallet balance arithmetic overflow".to_string())?;
+                let at_limit = input_count == TX_INPUTS;
+                let at_end = cursor + input_count == available.len();
 
-                if let Some(explicit_fee) = explicit_fee_micronoid {
-                    if selected_value < explicit_fee {
+                if let Some(fee) = explicit_fee_per_tx_micronoid {
+                    if selected_value <= fee {
+                        if at_end {
+                            break;
+                        }
                         continue;
                     }
-                    let max_payment = selected_value - explicit_fee;
-                    if max_payment >= remaining
-                        || selected_inputs == TxShape::Sweep25x2.max_inputs()
-                    {
-                        let chunk_amount = max_payment.min(remaining);
-                        let expected_change = selected_value - explicit_fee - chunk_amount;
-                        let output_count = if expected_change > 0 { 2 } else { 1 };
-                        let shape = wallet_send_shape_for_counts(selected_inputs, output_count)?;
+                    let max_payment = selected_value - fee;
+                    if max_payment >= remaining {
+                        let change = max_payment - remaining;
+                        let output_count = 1 + usize::from(change > 0);
                         let breakdown = noid_chain::consensus::fee_breakdown(
-                            selected_inputs as u64,
+                            input_count as u64,
                             output_count as u64,
                             active_slot_count,
                             log_slots,
                         );
-                        let minimum_fee = breakdown.required_total.max(relay_floor);
-                        if explicit_fee < minimum_fee {
+                        let minimum = breakdown.required_total.max(relay_floor);
+                        if fee < minimum {
                             return Err(format!(
-                                "fee too low for planned {shape:?} tx with {selected_inputs} input(s) and {output_count} output(s): required {minimum_fee} μNOID, got {explicit_fee} μNOID"
+                                "fee too low for transaction with {input_count} input(s) and {output_count} output(s): required {minimum} μNOID, got {fee} μNOID"
                             ));
                         }
-                        break (
-                            shape,
-                            output_count,
-                            chunk_amount,
-                            expected_change,
-                            explicit_fee,
-                            breakdown,
+                        planned =
+                            Some((input_count, remaining, fee, output_count, change, breakdown));
+                        break;
+                    }
+                    if at_limit {
+                        let breakdown = noid_chain::consensus::fee_breakdown(
+                            input_count as u64,
+                            1,
+                            active_slot_count,
+                            log_slots,
                         );
+                        let minimum = breakdown.required_total.max(relay_floor);
+                        if fee < minimum {
+                            return Err(format!(
+                                "fee too low for transaction with {input_count} input(s) and 1 output: required {minimum} μNOID, got {fee} μNOID"
+                            ));
+                        }
+                        planned = Some((input_count, max_payment, fee, 1, 0, breakdown));
+                        break;
                     }
                     continue;
                 }
 
                 let one_output_breakdown = noid_chain::consensus::fee_breakdown(
-                    selected_inputs as u64,
+                    input_count as u64,
                     1,
                     active_slot_count,
                     log_slots,
                 );
                 let one_output_fee = one_output_breakdown.required_total.max(relay_floor);
-                if selected_value <= one_output_fee {
-                    continue;
-                }
-
-                if selected_value >= remaining {
+                if selected_value > remaining {
                     let two_output_breakdown = noid_chain::consensus::fee_breakdown(
-                        selected_inputs as u64,
+                        input_count as u64,
                         2,
                         active_slot_count,
                         log_slots,
                     );
                     let two_output_fee = two_output_breakdown.required_total.max(relay_floor);
-                    if selected_value > remaining.saturating_add(two_output_fee) {
-                        let expected_change = selected_value - remaining - two_output_fee;
-                        let shape = wallet_send_shape_for_counts(selected_inputs, 2)?;
-                        break (
-                            shape,
-                            2,
+                    let two_output_need = remaining
+                        .checked_add(two_output_fee)
+                        .ok_or_else(|| "payment amount plus fee overflows u64".to_string())?;
+                    if selected_value > two_output_need {
+                        planned = Some((
+                            input_count,
                             remaining,
-                            expected_change,
                             two_output_fee,
+                            2,
+                            selected_value - two_output_need,
                             two_output_breakdown,
-                        );
+                        ));
+                        break;
                     }
-
+                }
+                if selected_value >= remaining {
                     let no_change_fee = selected_value - remaining;
                     if no_change_fee >= one_output_fee {
-                        let shape = wallet_send_shape_for_counts(selected_inputs, 1)?;
-                        break (
-                            shape,
-                            1,
+                        planned = Some((
+                            input_count,
                             remaining,
-                            0u64,
                             no_change_fee,
+                            1,
+                            0,
                             one_output_breakdown,
-                        );
+                        ));
+                        break;
                     }
                 }
-
-                if selected_inputs == TxShape::Sweep25x2.max_inputs() {
-                    let chunk_amount = selected_value - one_output_fee;
-                    let shape = wallet_send_shape_for_counts(selected_inputs, 1)?;
-                    break (
-                        shape,
-                        1,
-                        chunk_amount,
-                        0u64,
+                if at_limit && selected_value > one_output_fee {
+                    planned = Some((
+                        input_count,
+                        selected_value - one_output_fee,
                         one_output_fee,
+                        1,
+                        0,
                         one_output_breakdown,
-                    );
+                    ));
+                    break;
                 }
-            };
-
-            let (shape, output_count, chunk_amount, expected_change, fee, breakdown) = planned;
-            if chunk_amount == 0 {
-                return Err(format!(
-                    "insufficient funds: need at least {} μNOID including fee, have {} μNOID spendable",
-                    amount_micronoid.saturating_add(fee),
-                    spendable
-                ));
+                if at_end {
+                    break;
+                }
             }
-            let chunk_index = chunks.len();
+
+            let Some((input_count, chunk_amount, fee, output_count, change, breakdown)) = planned
+            else {
+                let planned_fees = chunks
+                    .iter()
+                    .map(|chunk: &WalletSendChunkPlan| chunk.fee_micronoid)
+                    .try_fold(0u64, u64::checked_add)
+                    .ok_or_else(|| "wallet fee arithmetic overflow".to_string())?;
+                return Err(format!(
+                    "insufficient funds: need {} μNOID including planned fees, have {spendable} μNOID spendable",
+                    amount_micronoid
+                        .checked_add(planned_fees)
+                        .ok_or_else(|| "payment amount plus fees overflows u64".to_string())?
+                ));
+            };
+            if chunk_amount == 0 || chunk_amount > remaining {
+                return Err("wallet planner produced an invalid chunk amount".to_string());
+            }
             chunks.push(WalletSendChunkPlan {
-                chunk_index,
                 amount_micronoid: chunk_amount,
-                shape: format!("{shape:?}"),
-                selected_input_count: selected_inputs,
-                output_count,
-                expected_change_micronoid: expected_change,
                 fee_micronoid: fee,
+                input_count,
+                output_count,
+                change_micronoid: change,
                 fee_breakdown: fee_breakdown_info(breakdown, relay_floor, fee),
             });
-            cursor += selected_inputs;
+            cursor = cursor
+                .checked_add(input_count)
+                .ok_or_else(|| "wallet plan cursor overflow".to_string())?;
             remaining -= chunk_amount;
         }
 
         let total_fee_micronoid = chunks
             .iter()
-            .map(|c| c.fee_micronoid)
-            .fold(0u64, |acc, f| acc.saturating_add(f));
+            .map(|chunk| chunk.fee_micronoid)
+            .try_fold(0u64, u64::checked_add)
+            .ok_or_else(|| "wallet fee arithmetic overflow".to_string())?;
+        let total_spend_micronoid = amount_micronoid
+            .checked_add(total_fee_micronoid)
+            .ok_or_else(|| "payment amount plus fees overflows u64".to_string())?;
         Ok(WalletSendPlan {
             amount_micronoid,
             total_fee_micronoid,
-            total_spend_micronoid: amount_micronoid.saturating_add(total_fee_micronoid),
-            split_count: chunks.len(),
+            total_spend_micronoid,
             chunks,
         })
     }
-
     fn build_send(
         &self,
         to_address: [u8; 32],
@@ -749,8 +676,7 @@ impl WalletOps for WalletHandle {
     ) -> Result<(Vec<u8>, Vec<u32>), String> {
         // Extract build data from wallet (brief lock).
         // Snapshot pending_output_slots (avoid output reuse). Input slots are
-        // returned to the RPC layer and marked pending only after successful
-        // mempool admission, so failed submit retries cannot self-lock UTXOs.
+        // returned to the coordinator for reserve-before-admit handling.
         let (build_data, input_slots) = {
             let guard = self.inner.lock().unwrap();
             let w = guard
@@ -773,29 +699,9 @@ impl WalletOps for WalletHandle {
         };
 
         // Prove outside the lock (CPU-heavy, ~0.3–3 s).
-        let (tx_hash, intent_bytes) =
+        let (_txid, intent_bytes) =
             builder::build_and_prove_tx(to_address, amount_micronoid, fee_micronoid, build_data)
                 .map_err(|e| e.to_string())?;
-
-        // Register output slots as pending immediately to avoid output-slot reuse
-        // during retries/concurrent sends. Inputs are intentionally NOT marked
-        // here; the RPC layer marks them only after mempool.submit succeeds.
-        {
-            let intent = noid_tx::TxIntent::from_bytes(&intent_bytes)
-                .map_err(|e| format!("decode: {e:?}"))?;
-            let output_slots: Vec<u32> = intent
-                .tx_body
-                .outputs
-                .iter()
-                .filter(|o| o.valid)
-                .map(|o| o.slot_index)
-                .collect();
-            let mut guard = self.inner.lock().unwrap();
-            if let Some(w) = guard.as_mut() {
-                w.add_pending_outputs(&output_slots);
-                w.record_pending_send(tx_hash, amount_micronoid, to_address);
-            }
-        }
 
         Ok((intent_bytes, input_slots))
     }
@@ -816,7 +722,7 @@ impl WalletOps for WalletHandle {
                 "nothing to consolidate — wallet has 1 or fewer available UTXOs".to_string(),
             );
         }
-        Ok(available.min(TxShape::Sweep25x2.max_inputs()))
+        Ok(available.min(TX_INPUTS))
     }
 
     fn build_consolidate(
@@ -859,7 +765,7 @@ impl WalletOps for WalletHandle {
         let self_address = build_data.change_address.0;
 
         // Prove outside the lock (CPU-heavy).
-        let (tx_hash, intent_bytes) = builder::build_and_prove_tx(
+        let (_txid, intent_bytes) = builder::build_and_prove_tx(
             self_address,
             consolidation_amount,
             fee_micronoid,
@@ -867,47 +773,38 @@ impl WalletOps for WalletHandle {
         )
         .map_err(|e| e.to_string())?;
 
-        // Register output slots as pending (brief lock).
-        // Output slots: prevents concurrent TXs from targeting the same empty slot.
-        // Input slots are intentionally NOT registered here — the caller
-        // (wallet_consolidate in server.rs) must call add_pending_inputs only
-        // after a successful mempool.submit.  Registering inputs before submit
-        // would permanently lock UTXOs on a failed attempt, making every retry
-        // unable to find inputs to consolidate (Bug #3).
-        {
-            let intent = noid_tx::TxIntent::from_bytes(&intent_bytes)
-                .map_err(|e| format!("decode: {e:?}"))?;
-            let output_slots: Vec<u32> = intent
-                .tx_body
-                .outputs
-                .iter()
-                .filter(|o| o.valid)
-                .map(|o| o.slot_index)
-                .collect();
-            let mut guard = self.inner.lock().unwrap();
-            if let Some(w) = guard.as_mut() {
-                w.add_pending_outputs(&output_slots);
-                // Keep a durable source-account tag for receipt generation.
-                // A self-consolidation's net outgoing amount is its fee.
-                w.record_pending_send(tx_hash, fee_micronoid, self_address);
-            }
-        }
-
         Ok((intent_bytes, input_slots))
     }
 
-    fn add_pending_inputs(&self, slots: &[u32]) {
+    fn reserve_pending_submission(
+        &self,
+        txid: [u8; 32],
+        input_slots: &[u32],
+        output_slots: &[u32],
+        amount_micronoid: u64,
+        peer_address: [u8; 32],
+    ) -> Result<(), String> {
         let mut guard = self.inner.lock().unwrap();
-        if let Some(w) = guard.as_mut() {
-            w.add_pending_inputs(slots);
-        }
+        let wallet = guard
+            .as_mut()
+            .ok_or_else(|| "wallet not initialized".to_string())?;
+        wallet.add_pending_inputs(input_slots);
+        wallet.add_pending_outputs(output_slots);
+        wallet.record_pending_send(txid, amount_micronoid, peer_address);
+        Ok(())
     }
 
-    fn cleanup_failed_send(&self, tx_hash: [u8; 32], output_slots: &[u32]) {
+    fn rollback_pending_submission(
+        &self,
+        txid: [u8; 32],
+        input_slots: &[u32],
+        output_slots: &[u32],
+    ) {
         let mut guard = self.inner.lock().unwrap();
-        if let Some(w) = guard.as_mut() {
-            w.remove_pending_outputs(output_slots);
-            w.remove_pending_send(&tx_hash);
+        if let Some(wallet) = guard.as_mut() {
+            wallet.remove_pending_inputs(input_slots);
+            wallet.remove_pending_outputs(output_slots);
+            wallet.remove_pending_send(&txid);
         }
     }
 
@@ -1017,17 +914,68 @@ mod tests {
     }
 
     #[test]
-    fn planner_uses_one_sweep_sized_chunk_for_20_inputs() {
-        let (_dir, handle) = handle_with_utxos(&[1_000; 20]);
-        let chunks = handle.plan_send_splits(19_500, 500).unwrap();
-        assert_eq!(chunks, vec![19_500]);
+    fn planner_splits_large_payment_into_ordinary_tx8x2_chunks() {
+        let (_dir, handle) = handle_with_utxos(&[10_000; 20]);
+        let plan = handle.plan_send(150_000, Some(10_000), 0, 24, 0).unwrap();
+        assert_eq!(plan.chunks.len(), 3);
+        assert_eq!(
+            plan.chunks
+                .iter()
+                .map(|chunk| chunk.amount_micronoid)
+                .collect::<Vec<_>>(),
+            vec![70_000, 70_000, 10_000]
+        );
+        assert!(plan.chunks.iter().all(|chunk| chunk.input_count <= 8));
+        assert_eq!(plan.total_fee_micronoid, 30_000);
     }
 
     #[test]
-    fn planner_splits_after_25_inputs() {
-        let (_dir, handle) = handle_with_utxos(&[1_000; 26]);
-        let chunks = handle.plan_send_splits(25_000, 500).unwrap();
-        assert_eq!(chunks, vec![24_500, 500]);
+    fn building_is_side_effect_free_until_pending_reservation_is_installed() {
+        let (_dir, handle) = handle_with_utxos(&[100_000]);
+        let (intent_bytes, input_slots) = handle
+            .build_send(
+                [0xA7; 32],
+                50_000,
+                9_000,
+                [0x11; 32],
+                vec![10_000, 10_001],
+                24,
+            )
+            .expect("build ordinary send");
+        let intent = noid_tx::TxIntent::from_bytes(&intent_bytes).expect("decode built intent");
+        let txid = intent.txid().0;
+        let output_slots: Vec<u32> = intent
+            .tx_body
+            .live_outputs()
+            .map(|(_, output)| output.slot_index)
+            .collect();
+
+        {
+            let guard = handle.inner.lock().unwrap();
+            let wallet = guard.as_ref().unwrap();
+            assert!(wallet.pending_input_slots.is_empty());
+            assert!(wallet.pending_output_slots.is_empty());
+            assert!(wallet.history.is_empty());
+        }
+
+        handle
+            .reserve_pending_submission(txid, &input_slots, &output_slots, 50_000, [0xA7; 32])
+            .expect("install pending reservation");
+        {
+            let guard = handle.inner.lock().unwrap();
+            let wallet = guard.as_ref().unwrap();
+            assert_eq!(wallet.pending_input_slots.len(), input_slots.len());
+            assert_eq!(wallet.pending_output_slots.len(), output_slots.len());
+            assert_eq!(wallet.history.len(), 1);
+            assert_eq!(wallet.history[0].tx_hash, txid);
+        }
+
+        handle.rollback_pending_submission(txid, &input_slots, &output_slots);
+        let guard = handle.inner.lock().unwrap();
+        let wallet = guard.as_ref().unwrap();
+        assert!(wallet.pending_input_slots.is_empty());
+        assert!(wallet.pending_output_slots.is_empty());
+        assert!(wallet.history.is_empty());
     }
 
     #[test]
@@ -1037,7 +985,7 @@ mod tests {
             let mut guard = handle.inner.lock().unwrap();
             guard.as_mut().unwrap().pending_input_slots.insert(0);
         }
-        let err = handle.plan_send_splits(9_000, 500).unwrap_err();
+        let err = handle.plan_send(9_000, Some(500), 0, 24, 0).unwrap_err();
         assert!(err.contains("insufficient funds"));
         assert!(err.contains("4000 μNOID spendable"));
     }
@@ -1051,9 +999,9 @@ mod tests {
             wallet.pending_input_slots.insert(0);
         }
 
-        assert!(handle.plan_send_splits(3_000, 0).is_err());
+        assert!(handle.plan_send(3_000, None, 0, 24, 0).is_err());
         let balance = handle.get_balance();
-        assert_eq!(balance.total_micronoid, 4_000);
+        assert_eq!(balance.balance_micronoid, 4_000);
         assert_eq!(balance.pending_outbound_micronoid, 2_000);
         assert_eq!(balance.spendable_micronoid, 2_000);
         assert_eq!(handle.status().utxo_count, 2);
@@ -1255,18 +1203,21 @@ mod tests {
             .unwrap()
             .active_snapshot = Some(baseline.clone());
 
-        let body = noid_tx::TxBody::standard(
-            [0; 32],
-            0,
-            vec![],
-            vec![noid_tx::TxOutput {
-                slot_index: 9,
-                value: 50,
-                owner,
-                valid: true,
-            }],
-            true,
-        );
+        let mut outputs = [noid_tx::TxOutput::dummy(); noid_tx::TX_OUTPUTS];
+        outputs[0] = noid_tx::TxOutput {
+            slot_index: 9,
+            amount: 50,
+            owner,
+        };
+        let body = noid_tx::TxBody {
+            epoch_anchor: [0; 32],
+            fee: 0,
+            input_owner: noid_poseidon2b::primitives::Address([0; 32]),
+            inputs: [noid_tx::TxInput::dummy(); noid_tx::TX_INPUTS],
+            outputs,
+            validity_bitmap: noid_tx::output_bitmap_bit(0),
+            is_coinbase: true,
+        };
         let malformed = noid_chain::block::Block {
             header: noid_chain::BlockHeader {
                 prev_block_hash: baseline.tip_hash,
@@ -1282,10 +1233,7 @@ mod tests {
                 // One live mint with a zero post-counter is impossible.
                 alloc_counter: 0,
             },
-            transactions: vec![noid_tx::Transaction {
-                body,
-                tx_body_hash: noid_poseidon2b::primitives::TxBodyHash([0x43; 32]),
-            }],
+            transactions: vec![noid_tx::Transaction::new(body)],
         };
 
         assert!(update_for_accepted_block(&handle.inner, &malformed).is_err());
@@ -1298,12 +1246,13 @@ mod tests {
     }
 
     #[test]
-    fn sweep_sized_send_selects_more_than_four_inputs() {
+    fn canonical_send_selects_up_to_eight_inputs() {
         let (_dir, handle) = handle_with_utxos(&[50_000_000; 8]);
         let amount = 200_000_001;
         let fee = 18_500;
-        let chunks = handle.plan_send_splits(amount, fee).unwrap();
-        assert_eq!(chunks, vec![amount]);
+        let plan = handle.plan_send(amount, Some(fee), 0, 24, 0).unwrap();
+        assert_eq!(plan.amount_micronoid, amount);
+        assert_eq!(plan.chunks.len(), 1);
 
         let guard = handle.inner.lock().unwrap();
         let wallet = guard.as_ref().unwrap();
@@ -1313,46 +1262,40 @@ mod tests {
     }
 
     #[test]
-    fn shape_aware_plan_keeps_small_standard_fee_at_baseline() {
+    fn plan_keeps_small_payment_fee_at_baseline() {
         let (_dir, handle) = handle_with_utxos(&[100_000]);
         let plan = handle.plan_send(50_000, None, 0, 24, 0).unwrap();
-        assert_eq!(plan.split_count, 1);
         assert_eq!(plan.total_fee_micronoid, 9_000);
-        assert_eq!(plan.chunks[0].shape, "Standard4x8");
-        assert_eq!(plan.chunks[0].selected_input_count, 1);
+        assert_eq!(plan.chunks[0].input_count, 1);
         assert_eq!(plan.chunks[0].output_count, 2);
         assert_eq!(plan.chunks[0].fee_breakdown.burned, 2_500);
     }
 
     #[test]
-    fn shape_aware_plan_handles_no_change_boundary_without_oscillation() {
+    fn plan_handles_no_change_boundary_without_oscillation() {
         let (_dir, handle) = handle_with_utxos(&[100_000]);
         let plan = handle.plan_send(91_000, None, 0, 24, 0).unwrap();
-        assert_eq!(plan.split_count, 1);
         assert_eq!(plan.total_fee_micronoid, 9_000);
-        assert_eq!(plan.chunks[0].shape, "Standard4x8");
         assert_eq!(plan.chunks[0].output_count, 1);
-        assert_eq!(plan.chunks[0].expected_change_micronoid, 0);
+        assert_eq!(plan.chunks[0].change_micronoid, 0);
         assert_eq!(plan.chunks[0].fee_breakdown.paid_total, 9_000);
         assert_eq!(plan.chunks[0].fee_breakdown.relay_total, 5_800);
     }
 
     #[test]
-    fn shape_aware_plan_does_not_apply_sweep_worst_case_to_five_input_send() {
+    fn plan_charges_actual_io_for_five_input_send() {
         let (_dir, handle) = handle_with_utxos(&[50_000_000; 8]);
         let plan = handle.plan_send(200_000_001, None, 0, 24, 0).unwrap();
-        assert_eq!(plan.split_count, 1);
-        assert_eq!(plan.chunks[0].shape, "Sweep25x2");
-        assert_eq!(plan.chunks[0].selected_input_count, 5);
+        assert_eq!(plan.chunks[0].input_count, 5);
         assert_eq!(plan.chunks[0].output_count, 2);
         assert_eq!(plan.chunks[0].fee_micronoid, 6_900);
         assert_eq!(plan.chunks[0].fee_breakdown.state_growth, 0);
     }
 
     #[test]
-    fn consolidate_planner_caps_at_sweep_capacity() {
+    fn consolidate_planner_caps_at_eight_inputs() {
         let (_dir, handle) = handle_with_utxos(&[1_000; 30]);
-        assert_eq!(handle.plan_consolidate_input_count().unwrap(), 25);
+        assert_eq!(handle.plan_consolidate_input_count().unwrap(), 8);
     }
 
     #[test]
@@ -1366,7 +1309,7 @@ mod tests {
         assert_eq!(handle.plan_consolidate_input_count().unwrap(), 4);
     }
 
-    fn extract_consolidate_shape(values: &[u64]) -> (TxShape, usize, u64) {
+    fn extract_consolidation(values: &[u64]) -> (usize, u64) {
         let (_dir, handle) = handle_with_utxos(values);
         let guard = handle.inner.lock().unwrap();
         let wallet = guard.as_ref().unwrap();
@@ -1382,31 +1325,21 @@ mod tests {
             &pending_inputs,
         )
         .unwrap();
-        (data.shape, data.selected_utxos.len(), amount)
+        (data.selected_utxos.len(), amount)
     }
 
     #[test]
-    fn consolidate_four_inputs_uses_standard_shape() {
-        let (shape, selected, amount) = extract_consolidate_shape(&[1_000; 4]);
-        assert_eq!(shape, TxShape::Standard4x8);
+    fn consolidate_four_inputs_is_an_ordinary_transaction() {
+        let (selected, amount) = extract_consolidation(&[1_000; 4]);
         assert_eq!(selected, 4);
         assert_eq!(amount, 3_990);
     }
 
     #[test]
-    fn consolidate_five_inputs_uses_sweep_shape() {
-        let (shape, selected, amount) = extract_consolidate_shape(&[1_000; 5]);
-        assert_eq!(shape, TxShape::Sweep25x2);
-        assert_eq!(selected, 5);
-        assert_eq!(amount, 4_990);
-    }
-
-    #[test]
-    fn consolidate_twenty_five_inputs_uses_sweep_shape() {
-        let (shape, selected, amount) = extract_consolidate_shape(&[1_000; 30]);
-        assert_eq!(shape, TxShape::Sweep25x2);
-        assert_eq!(selected, 25);
-        assert_eq!(amount, 24_990);
+    fn consolidation_selects_at_most_eight_smallest_utxos() {
+        let (selected, amount) = extract_consolidation(&[1_000; 30]);
+        assert_eq!(selected, 8);
+        assert_eq!(amount, 7_990);
     }
 
     #[test]

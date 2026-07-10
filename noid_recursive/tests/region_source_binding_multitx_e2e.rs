@@ -46,25 +46,40 @@ impl Rng {
     }
 }
 
-fn capsule_fixture(num_vars: usize, seed: u64) -> (Vec<Block128>, BatchEvalReduction, AuthMleOpeningProof) {
+fn capsule_fixture(
+    num_vars: usize,
+    seed: u64,
+) -> (Vec<Block128>, BatchEvalReduction, AuthMleOpeningProof) {
     use noid_core::mle::evaluate::evaluate_slice;
     let mut rng = Rng(seed);
-    let column: Vec<Block128> = (0..(1usize << num_vars)).map(|_| rng.f128_block()).collect();
+    let column: Vec<Block128> = (0..(1usize << num_vars))
+        .map(|_| rng.f128_block())
+        .collect();
     let point: Vec<Block128> = (0..num_vars).map(|_| rng.f128_block()).collect();
     let value = evaluate_slice(&column, &point);
-    let reduction = BatchEvalReduction { point: point.clone(), value };
+    let reduction = BatchEvalReduction {
+        point: point.clone(),
+        value,
+    };
     let mut committed = commit_auth_mle_column(&column, num_vars);
     let proof = open_auth_mle_committed(&mut committed, num_vars, &reduction);
     (point, reduction, proof)
 }
 
-fn alloc_column_slice(b: &mut FieldR1csBuilder, col: &[F128], log2_len: usize) -> (WitnessSlice, Vec<LinExpr>) {
+fn alloc_column_slice(
+    b: &mut FieldR1csBuilder,
+    col: &[F128],
+    log2_len: usize,
+) -> (WitnessSlice, Vec<LinExpr>) {
     let block = 1usize << log2_len;
     while b.num_wires() % block != 0 {
         b.alloc_f128(F128::ZERO);
     }
     let index = b.num_wires() / block;
-    let wires: Vec<LinExpr> = col.iter().map(|&v| LinExpr::from_wire(b.alloc_f128(v))).collect();
+    let wires: Vec<LinExpr> = col
+        .iter()
+        .map(|&v| LinExpr::from_wire(b.alloc_f128(v)))
+        .collect();
     for _ in col.len()..block {
         b.alloc_f128(F128::ZERO);
     }
@@ -76,7 +91,10 @@ fn alloc_column_slice(b: &mut FieldR1csBuilder, col: &[F128], log2_len: usize) -
 fn alloc_digest_raw(b: &mut FieldR1csBuilder, d: &[u8; 32]) -> [LinExpr; 2] {
     let lo = u128::from_le_bytes(d[..16].try_into().unwrap());
     let hi = u128::from_le_bytes(d[16..].try_into().unwrap());
-    let lane = |v: u128| F128 { lo: v as u64, hi: (v >> 64) as u64 };
+    let lane = |v: u128| F128 {
+        lo: v as u64,
+        hi: (v >> 64) as u64,
+    };
     [
         LinExpr::from_wire(b.alloc_f128(lane(lo))),
         LinExpr::from_wire(b.alloc_f128(lane(hi))),
@@ -87,7 +105,7 @@ fn alloc_digest_raw(b: &mut FieldR1csBuilder, d: &[u8; 32]) -> [LinExpr; 2] {
 /// claims regardless of the tx count -- the K txs' capsule families tile into ONE
 /// walk A/B/C (cost O(log domain)) and every terminal claim is class-fixed. This
 /// is the non-negotiable "the proof must not depend on the tx count": 1 tx, up to
-/// 255 standard (4x8) or up to 40 sweep (25x2). Build-only (no PCS prove): scan
+/// 255 Tx8x2 user transactions. Build-only (no PCS prove): scan
 /// K = 1..256 and assert the claim count is CONSTANT.
 ///
 /// The constant claim count is the recursion/[R] flatness the O(1) snapshot
@@ -103,21 +121,42 @@ fn region_discharge_claims_flat_in_tx_count() {
             .collect();
         let mut b = FieldR1csBuilder::new();
         let mut obligations: Vec<PendingAuthPcsObligation> = Vec::with_capacity(k);
-        let natives: Vec<AuthMleOpeningProof> = fixtures.iter().map(|(_, _, p)| p.clone()).collect();
+        let natives: Vec<AuthMleOpeningProof> =
+            fixtures.iter().map(|(_, _, p)| p.clone()).collect();
         for (point, red, proof) in &fixtures {
-            let cap_lanes: Vec<[LinExpr; 2]> =
-                proof.commitment.cap.hashes.iter().map(|h| alloc_digest_raw(&mut b, h)).collect();
+            let cap_lanes: Vec<[LinExpr; 2]> = proof
+                .commitment
+                .cap
+                .hashes
+                .iter()
+                .map(|h| alloc_digest_raw(&mut b, h))
+                .collect();
             let point_w = alloc_blocks(&mut b, point);
             let value_w = alloc_block(&mut b, red.value);
             obligations.push(PendingAuthPcsObligation {
                 commitment_cap_lanes: cap_lanes,
                 num_vars,
-                reduction: BatchEvalReductionTrace { point: point_w, value: value_w },
+                reduction: BatchEvalReductionTrace {
+                    point: point_w,
+                    value: value_w,
+                },
             });
         }
-        let claims =
-            discharge_auth_pcs_obligations_via_region(&mut b, &obligations, &natives, params, None, None, None, None);
-        eprintln!("[flatness] K={k:>2}: claims={} wires={}", claims.len(), b.num_wires());
+        let claims = discharge_auth_pcs_obligations_via_region(
+            &mut b,
+            &obligations,
+            &natives,
+            params,
+            None,
+            None,
+            None,
+            None,
+        );
+        eprintln!(
+            "[flatness] K={k:>2}: claims={} wires={}",
+            claims.len(),
+            b.num_wires()
+        );
         match ref_claims {
             None => ref_claims = Some(claims.len()),
             Some(r) => assert_eq!(
@@ -135,8 +174,9 @@ fn region_source_binding_multitx_end_to_end() {
     let k = 2usize;
 
     // K capsule openings (distinct seeds ⇒ distinct source bindings/queries).
-    let fixtures: Vec<(Vec<Block128>, BatchEvalReduction, AuthMleOpeningProof)> =
-        (0..k).map(|tx| capsule_fixture(num_vars, 0xA55E_C0DE + tx as u64 * 0x1111)).collect();
+    let fixtures: Vec<(Vec<Block128>, BatchEvalReduction, AuthMleOpeningProof)> = (0..k)
+        .map(|tx| capsule_fixture(num_vars, 0xA55E_C0DE + tx as u64 * 0x1111))
+        .collect();
 
     // Build K obligations in ONE builder (the cap + reduction point/value wires).
     let mut b = FieldR1csBuilder::new();
@@ -144,21 +184,37 @@ fn region_source_binding_multitx_end_to_end() {
     let natives: Vec<AuthMleOpeningProof> = fixtures.iter().map(|(_, _, p)| p.clone()).collect();
     for (point, red, proof) in &fixtures {
         assert_eq!(proof.commitment.log_rows, num_vars);
-        let cap_lanes: Vec<[LinExpr; 2]> =
-            proof.commitment.cap.hashes.iter().map(|h| alloc_digest_raw(&mut b, h)).collect();
+        let cap_lanes: Vec<[LinExpr; 2]> = proof
+            .commitment
+            .cap
+            .hashes
+            .iter()
+            .map(|h| alloc_digest_raw(&mut b, h))
+            .collect();
         let point_w = alloc_blocks(&mut b, point);
         let value_w = alloc_block(&mut b, red.value);
         obligations.push(PendingAuthPcsObligation {
             commitment_cap_lanes: cap_lanes,
             num_vars,
-            reduction: BatchEvalReductionTrace { point: point_w, value: value_w },
+            reduction: BatchEvalReductionTrace {
+                point: point_w,
+                value: value_w,
+            },
         });
     }
     let params = RegionDischargeParams { nq: NQ };
 
     // ONE plural call: discharge all K txs, collect opening claims.
-    let claims: Vec<RegionPcsClaim> =
-        discharge_auth_pcs_obligations_via_region(&mut b, &obligations, &natives, params, None, None, None, None);
+    let claims: Vec<RegionPcsClaim> = discharge_auth_pcs_obligations_via_region(
+        &mut b,
+        &obligations,
+        &natives,
+        params,
+        None,
+        None,
+        None,
+        None,
+    );
 
     // Wrap the claims in ONE public-IO discharge.
     let max_arity = claims.iter().map(|c| c.point.len()).max().unwrap();
@@ -168,7 +224,11 @@ fn region_source_binding_multitx_end_to_end() {
     let mut io_values = Vec::with_capacity(io_len);
     for c in &claims {
         for kk in 0..max_arity {
-            io_values.push(if kk < c.native_point.len() { c.native_point[kk] } else { F128::ZERO });
+            io_values.push(if kk < c.native_point.len() {
+                c.native_point[kk]
+            } else {
+                F128::ZERO
+            });
         }
         io_values.push(c.native_value);
     }
@@ -195,10 +255,16 @@ fn region_source_binding_multitx_end_to_end() {
     };
 
     let n_wires = b.num_wires();
-    eprintln!("[src-multitx] K={k}, wires before build = {n_wires}, claims = {}", claims.len());
+    eprintln!(
+        "[src-multitx] K={k}, wires before build = {n_wires}, claims = {}",
+        claims.len()
+    );
 
     let (r1cs, z) = b.build();
-    assert!(r1cs.satisfies(&z), "honest multi-tx source-binding trace unsatisfiable");
+    assert!(
+        r1cs.satisfies(&z),
+        "honest multi-tx source-binding trace unsatisfiable"
+    );
     let params_pcs = PcsParams {
         m: r1cs.m + pcs::LOG_PACKING,
         log_inv_rate: 2,
@@ -207,11 +273,21 @@ fn region_source_binding_multitx_end_to_end() {
     };
     let mut chp = FsLaneChallenger::new(OUTER);
     let (pf, commitment, _) = noid_ivc_prover::field_prover::prove_field_with_public_io(
-        &r1cs, &z, &params_pcs, &spec, &io_values, &mut chp,
+        &r1cs,
+        &z,
+        &params_pcs,
+        &spec,
+        &io_values,
+        &mut chp,
     );
     let mut chv = FsLaneChallenger::new(OUTER);
     noid_ivc_core::verifier::verify_field_with_public_io(
-        &r1cs, &commitment, &pf, &spec, &io_values, &mut chv,
+        &r1cs,
+        &commitment,
+        &pf,
+        &spec,
+        &io_values,
+        &mut chv,
     )
     .expect("multi-tx source-binding composition verifies");
     eprintln!(
@@ -233,7 +309,12 @@ fn region_source_binding_multitx_end_to_end() {
     } else {
         let mut chp = FsLaneChallenger::new(OUTER);
         let (bp, bc, _) = noid_ivc_prover::field_prover::prove_field_with_public_io(
-            &r1cs, &bad_z, &params_pcs, &spec, &io_values, &mut chp,
+            &r1cs,
+            &bad_z,
+            &params_pcs,
+            &spec,
+            &io_values,
+            &mut chp,
         );
         let mut chv = FsLaneChallenger::new(OUTER);
         noid_ivc_core::verifier::verify_field_with_public_io(
@@ -263,7 +344,12 @@ fn region_source_binding_multitx_end_to_end() {
     } else {
         let mut chp = FsLaneChallenger::new(OUTER);
         let (bp, bc, _) = noid_ivc_prover::field_prover::prove_field_with_public_io(
-            &r1cs, &bad2, &params_pcs, &spec, &io_values, &mut chp,
+            &r1cs,
+            &bad2,
+            &params_pcs,
+            &spec,
+            &io_values,
+            &mut chp,
         );
         let mut chv = FsLaneChallenger::new(OUTER);
         noid_ivc_core::verifier::verify_field_with_public_io(
@@ -293,21 +379,30 @@ fn region_spine_families_multitx_with_ghosts() {
     let k = 2usize;
     let n_inst = 3usize;
 
-    let fixtures: Vec<(Vec<Block128>, BatchEvalReduction, AuthMleOpeningProof)> =
-        (0..k).map(|tx| capsule_fixture(num_vars, 0x59147E + tx as u64 * 0x2222)).collect();
+    let fixtures: Vec<(Vec<Block128>, BatchEvalReduction, AuthMleOpeningProof)> = (0..k)
+        .map(|tx| capsule_fixture(num_vars, 0x59147E + tx as u64 * 0x2222))
+        .collect();
 
     let mut b = FieldR1csBuilder::new();
     let mut obligations: Vec<PendingAuthPcsObligation> = Vec::with_capacity(k);
     let natives: Vec<AuthMleOpeningProof> = fixtures.iter().map(|(_, _, p)| p.clone()).collect();
     for (point, red, proof) in &fixtures {
-        let cap_lanes: Vec<[LinExpr; 2]> =
-            proof.commitment.cap.hashes.iter().map(|h| alloc_digest_raw(&mut b, h)).collect();
+        let cap_lanes: Vec<[LinExpr; 2]> = proof
+            .commitment
+            .cap
+            .hashes
+            .iter()
+            .map(|h| alloc_digest_raw(&mut b, h))
+            .collect();
         let point_w = alloc_blocks(&mut b, point);
         let value_w = alloc_block(&mut b, red.value);
         obligations.push(PendingAuthPcsObligation {
             commitment_cap_lanes: cap_lanes,
             num_vars,
-            reduction: BatchEvalReductionTrace { point: point_w, value: value_w },
+            reduction: BatchEvalReductionTrace {
+                point: point_w,
+                value: value_w,
+            },
         });
     }
 
@@ -315,7 +410,10 @@ fn region_spine_families_multitx_with_ghosts() {
     // builder is separately gated against the native tower spine).
     let mut rng = Rng(0xF00D);
     let f = |rng: &mut Rng| -> F128 {
-        F128 { lo: rng.next_u64(), hi: rng.next_u64() }
+        F128 {
+            lo: rng.next_u64(),
+            hi: rng.next_u64(),
+        }
     };
     let instances: Vec<SpineInstanceRegion> = (0..n_inst)
         .map(|_| {
@@ -369,7 +467,11 @@ fn region_spine_families_multitx_with_ghosts() {
     let mut io_values = Vec::with_capacity(io_len);
     for c in &claims {
         for kk in 0..max_arity {
-            io_values.push(if kk < c.native_point.len() { c.native_point[kk] } else { F128::ZERO });
+            io_values.push(if kk < c.native_point.len() {
+                c.native_point[kk]
+            } else {
+                F128::ZERO
+            });
         }
         io_values.push(c.native_value);
     }
@@ -396,7 +498,10 @@ fn region_spine_families_multitx_with_ghosts() {
     };
 
     let (r1cs, z) = b.build();
-    assert!(r1cs.satisfies(&z), "spine multitx+ghost region trace unsatisfiable");
+    assert!(
+        r1cs.satisfies(&z),
+        "spine multitx+ghost region trace unsatisfiable"
+    );
     eprintln!(
         "[spine-ghost] K={k}, instances={n_inst} (cap=2, 1 ghost): rows={} claims={}",
         z.len(),
@@ -455,7 +560,12 @@ fn region_spine_families_multitx_with_ghosts() {
             };
             let mut chp = FsLaneChallenger::new(OUTER);
             let (bp, bc, _) = noid_ivc_prover::field_prover::prove_field_with_public_io(
-                &r1cs, &bad, &params_pcs, &spec, &io_values, &mut chp,
+                &r1cs,
+                &bad,
+                &params_pcs,
+                &spec,
+                &io_values,
+                &mut chp,
             );
             let mut chv = FsLaneChallenger::new(OUTER);
             noid_ivc_core::verifier::verify_field_with_public_io(
@@ -463,6 +573,9 @@ fn region_spine_families_multitx_with_ghosts() {
             )
             .is_err()
         };
-        assert!(caught, "the gated exposure must catch a corrupted internal KID cell");
+        assert!(
+            caught,
+            "the gated exposure must catch a corrupted internal KID cell"
+        );
     }
 }

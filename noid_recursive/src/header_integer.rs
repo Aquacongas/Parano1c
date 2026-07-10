@@ -10,7 +10,7 @@
 
 use noid_chain::consensus::difficulty::{add_work, block_work, le256_lt, next_target};
 use noid_chain::consensus::expected_child_log_slots;
-use noid_chain::consensus::header::epoch_anchor_height;
+use noid_chain::consensus::header::asert_anchor_height;
 use noid_chain::consensus::pow::pow_header_fields;
 use noid_chain::consensus::timestamps::median_time_past;
 use noid_chain::consensus::ConsensusError;
@@ -82,7 +82,7 @@ pub fn build_header_integer_trace(
         let mut anchor_height_after = state.asert_anchor_height;
         let mut anchor_timestamp_after = state.asert_anchor_timestamp;
         let mut anchor_target_after = state.asert_anchor_target;
-        if epoch_anchor_height(header.height) == header.height {
+        if asert_anchor_height(header.height) == header.height {
             anchor_height_after = header.height;
             anchor_timestamp_after = header.timestamp;
             anchor_target_after = header.difficulty_target;
@@ -178,7 +178,7 @@ pub fn verify_header_integer_trace(
         let mut anchor_height_after = state.asert_anchor_height;
         let mut anchor_timestamp_after = state.asert_anchor_timestamp;
         let mut anchor_target_after = state.asert_anchor_target;
-        if epoch_anchor_height(header.height) == header.height {
+        if asert_anchor_height(header.height) == header.height {
             anchor_height_after = header.height;
             anchor_timestamp_after = header.timestamp;
             anchor_target_after = header.difficulty_target;

@@ -1,28 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Canonical Standard4x8 spine public statements derived from `TxBody`.
+//! Canonical Tx8x2 statements on the temporary 59-permutation carrier.
 
-use noid_core::{Block128, TowerField};
+use noid_core::Block128;
 use noid_poseidon2b::primitives::{fee_leaf, is_coinbase_leaf, Digest};
-use noid_tx::{pack_amount_creation_id, TxBody, TxInput, TxOutput, TxShape};
+use noid_tx::{body_hash::carrier_payloads, TxBody};
 
 use crate::SpineInputs;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SpineStatementError {
-    ShapeMismatch { expected: TxShape, actual: TxShape },
-    TooManyInputs { actual: usize, max: usize },
-    TooManyOutputs { actual: usize, max: usize },
-}
-
-impl std::fmt::Display for SpineStatementError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self:?}")
-    }
-}
-
-impl std::error::Error for SpineStatementError {}
 
 fn digest_to_fields(d: &Digest) -> [Block128; 2] {
     let mut lo = [0u8; 16];
@@ -35,63 +20,19 @@ fn digest_to_fields(d: &Digest) -> [Block128; 2] {
     ]
 }
 
-pub fn spine_inputs_from_body(body: &TxBody) -> Result<SpineInputs, SpineStatementError> {
-    if body.shape != TxShape::Standard4x8 {
-        return Err(SpineStatementError::ShapeMismatch {
-            expected: TxShape::Standard4x8,
-            actual: body.shape,
-        });
-    }
-    if body.inputs.len() > body.shape.max_inputs() {
-        return Err(SpineStatementError::TooManyInputs {
-            actual: body.inputs.len(),
-            max: body.shape.max_inputs(),
-        });
-    }
-    if body.outputs.len() > body.shape.max_outputs() {
-        return Err(SpineStatementError::TooManyOutputs {
-            actual: body.outputs.len(),
-            max: body.shape.max_outputs(),
-        });
-    }
-
-    let mut input_leaves = [[Block128::ZERO; 4]; TxShape::Standard4x8.max_inputs()];
-    for (i, leaf) in input_leaves.iter_mut().enumerate() {
-        let inp = body.inputs.get(i).cloned().unwrap_or_else(TxInput::dummy);
-        let [owner_hi, owner_lo] = inp.owner.as_fields();
-        *leaf = [
-            Block128::from(inp.slot_index as u128),
-            pack_amount_creation_id(inp.value, inp.creation_id),
-            owner_hi,
-            owner_lo,
-        ];
-    }
-
-    let mut output_leaves = [[Block128::ZERO; 4]; TxShape::Standard4x8.max_outputs()];
-    for (i, leaf) in output_leaves.iter_mut().enumerate() {
-        let out = body.outputs.get(i).copied().unwrap_or_else(TxOutput::dummy);
-        let [owner_hi, owner_lo] = out.owner.as_fields();
-        *leaf = [
-            Block128::from(out.slot_index as u128),
-            Block128::from(out.value as u128),
-            owner_hi,
-            owner_lo,
-        ];
-    }
-
-    Ok(SpineInputs {
+pub fn spine_inputs_from_body(body: &TxBody) -> SpineInputs {
+    let (input_leaves, output_leaves) = carrier_payloads(body);
+    SpineInputs {
         epoch_anchor: digest_to_fields(&body.epoch_anchor),
         fee_leaf: digest_to_fields(&fee_leaf(body.fee)),
         input_leaves,
         output_leaves,
         is_coinbase_leaf: digest_to_fields(&is_coinbase_leaf(body.is_coinbase)),
-        // The reserved leaf carries the committed liveness bitmap -- the
-        // hash-bound source of the per-entry `valid` selectors (a ghost
-        // body's zero bitmap reproduces the historical zero pad).
+        // The reserved leaf carries the sole committed liveness bitmap.
         pad_leaf: digest_to_fields(&noid_poseidon2b::primitives::validity_leaf(
-            noid_tx::validity_bits_for_shape(body.shape, &body.inputs, &body.outputs),
+            body.validity_bitmap,
         )),
-    })
+    }
 }
 
 #[cfg(test)]
@@ -99,10 +40,8 @@ mod tests {
     use super::*;
     use crate::{compute_tx_body_hash, SpineCircuit};
     use noid_core::CanonicalSerialize;
-    use noid_poseidon2b::primitives::{
-        derive_address, hash_input_leaf_packed, hash_output_leaf, hash_tx_body, SpendSecret,
-    };
-    use noid_tx::{pack_amount_creation_id, TxInput, TxOutput};
+    use noid_poseidon2b::primitives::Address;
+    use noid_tx::{output_bitmap_bit, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS};
 
     fn digest_fields_to_bytes(fields: [Block128; 2]) -> [u8; 32] {
         let mut out = [0u8; 32];
@@ -112,26 +51,31 @@ mod tests {
     }
 
     #[test]
-    fn standard_spine_statement_matches_native_tx_hash() {
-        let secret = SpendSecret([3u8; 32]);
+    fn tx8x2_carrier_statement_matches_native_tx_hash() {
+        let mut inputs = [TxInput::dummy(); TX_INPUTS];
+        inputs[0] = TxInput {
+            slot_index: 11,
+            amount: 50,
+            creation_id: 29,
+        };
+        inputs[7] = TxInput {
+            slot_index: 77,
+            amount: 20,
+            creation_id: 31,
+        };
+        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        outputs[0] = TxOutput {
+            slot_index: 20,
+            amount: 63,
+            owner: Address([4u8; 32]),
+        };
         let body = TxBody {
-            shape: TxShape::Standard4x8,
             epoch_anchor: [0xA5; 32],
             fee: 7,
-            inputs: vec![TxInput {
-                slot_index: 11,
-                value: 50,
-                creation_id: 29,
-                owner: derive_address(&secret),
-                spend_secret: secret.clone(),
-                valid: true,
-            }],
-            outputs: vec![TxOutput {
-                slot_index: 20,
-                value: 43,
-                owner: derive_address(&SpendSecret([4u8; 32])),
-                valid: true,
-            }],
+            input_owner: Address([3u8; 32]),
+            inputs,
+            outputs,
+            validity_bitmap: (1 << 0) | (1 << 7) | output_bitmap_bit(0),
             is_coinbase: false,
         };
 
@@ -143,50 +87,14 @@ mod tests {
         );
 
         let mut hashes = Vec::new();
-        for creation_id in [0, 29] {
+        for creation_id in [0, 31] {
             let mut body = body.clone();
-            body.inputs[0].creation_id = creation_id;
-            let inputs = spine_inputs_from_body(&body).expect("standard statement");
-            let got = digest_fields_to_bytes(compute_tx_body_hash(&circuit, &inputs));
-            let mut input_leaf_hashes = [[0u8; 32]; 4];
-            for (i, leaf) in input_leaf_hashes.iter_mut().enumerate() {
-                let input = body.inputs.get(i).cloned().unwrap_or_else(TxInput::dummy);
-                *leaf = hash_input_leaf_packed(
-                    input.slot_index,
-                    pack_amount_creation_id(input.value, input.creation_id),
-                    &input.owner,
-                );
-            }
-            if creation_id == 0 {
-                assert_eq!(
-                    input_leaf_hashes[0],
-                    hash_input_leaf_packed(
-                        body.inputs[0].slot_index,
-                        pack_amount_creation_id(
-                            body.inputs[0].value,
-                            body.inputs[0].creation_id,
-                        ),
-                        &body.inputs[0].owner,
-                    ),
-                    "creation_id=0 must use the canonical low-lane leaf"
-                );
-            }
-            let mut output_leaf_hashes = [[0u8; 32]; 8];
-            for (i, leaf) in output_leaf_hashes.iter_mut().enumerate() {
-                let output = body.outputs.get(i).copied().unwrap_or_else(TxOutput::dummy);
-                *leaf = hash_output_leaf(output.slot_index, output.value, &output.owner);
-            }
-            let native = hash_tx_body(
-                &body.epoch_anchor,
-                body.fee,
-                &input_leaf_hashes,
-                &output_leaf_hashes,
-                body.is_coinbase,
-                noid_tx::validity_bits_for_shape(body.shape, &body.inputs, &body.outputs),
-            );
-            assert_eq!(got, native.0);
+            body.inputs[7].creation_id = creation_id;
+            let statement = spine_inputs_from_body(&body);
+            let got = digest_fields_to_bytes(compute_tx_body_hash(&circuit, &statement));
+            assert_eq!(got, body.txid().0);
             hashes.push(got);
         }
-        assert_ne!(hashes[0], hashes[1], "nonzero creation_id must be bound");
+        assert_ne!(hashes[0], hashes[1], "logical input 7 must be bound");
     }
 }

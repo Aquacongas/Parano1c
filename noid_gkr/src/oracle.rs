@@ -8,7 +8,7 @@
 //!
 //! This is the ground-truth against which every later GKR prover stage
 //! must byte-equal. If the spine ever diverges from
-//! `noid_poseidon2b::primitives::hash_tx_body` on any fixture, we have
+//! `noid_poseidon2b::primitives::hash_tx_body_carrier` on any fixture, we have
 //! a protocol bug, not a benchmark discrepancy.
 
 use noid_core::{Block128, CanonicalSerialize};

@@ -8,7 +8,7 @@
 //! ```text
 //!  submit(TxIntent)
 //!    │
-//!    ├─ Stateless check (no lock):  tx_body_hash consistency — O(1) hash, rejects garbage immediately
+//!    ├─ Stateless check (no lock): canonical body logic + derived txid
 //!    │
 //!    ├─ Pre-proof filter (lock, brief): all cheap checks on current view
 //!    │   fee floor → consensus → epoch_anchor → slot conflicts → slot state
@@ -39,12 +39,10 @@ use std::sync::Arc;
 
 use tokio::sync::{broadcast, Mutex, Semaphore};
 
-use noid_chain::consensus::params::{ANCHOR_DEPTH, BLOCK_MAX_TXS};
-use noid_chain::consensus::wire_limits::{
-    max_authorization_bytes_for_shape, max_tx_intent_bytes_for_shape, MAX_TX_INTENT_BYTES_GLOBAL,
-};
+use noid_chain::consensus::params::BLOCK_MAX_USER_TXS;
+use noid_chain::consensus::wire_limits::{MAX_AUTHORIZATION_BYTES, MAX_TX_INTENT_BYTES_GLOBAL};
 use noid_chain::consensus::{
-    checks::validate_tx_consensus, pow::block_id, required_fee_for_tx_body,
+    checks::validate_tx_consensus, required_fee_for_tx_body, tx_epoch_anchor_height_for_child,
 };
 use noid_chain::fri_state::SlotValue;
 use noid_chain::Mempool;
@@ -72,6 +70,10 @@ pub(crate) struct MempoolState {
     pub admitted_input_slots: HashSet<u32>,
     /// Output slot indices currently held by admitted txs. O(1) conflict check.
     pub admitted_output_slots: HashSet<u32>,
+    /// Locally generated maintenance transactions that must be considered
+    /// before ordinary fee ordering in the next template. Admission remains
+    /// identical to every other transaction; this set is only selection policy.
+    pub local_template_priority: HashSet<TxBodyHash>,
 }
 
 // ---------------------------------------------------------------------------
@@ -107,6 +109,7 @@ impl AsyncMempool {
             floor,
             admitted_input_slots: HashSet::new(),
             admitted_output_slots: HashSet::new(),
+            local_template_priority: HashSet::new(),
         };
         let max_permits = if config.auth_verify_workers == 0 {
             // 0 = unlimited concurrency; verification is still required
@@ -137,7 +140,7 @@ impl AsyncMempool {
     /// Runs the full native admission pipeline:
     /// 1. Fee ≥ dynamic floor
     /// 2. Basic consensus checks (fee overflow, body hash, anchor)
-    /// 3. epoch_anchor hash must be a known header within window
+    /// 3. epoch_anchor equals the one canonical next-block epoch anchor
     /// 4. No slot conflict with admitted mempool txs
     /// 5. Input slots live in state, output slots empty
     ///
@@ -151,52 +154,58 @@ impl AsyncMempool {
         intent: TxIntent,
         intent_bytes: Vec<u8>,
     ) -> Result<TxBodyHash, SubmitError> {
+        self.submit_with_policy(intent, intent_bytes, false).await
+    }
+
+    /// Submit a locally built consolidation through the identical validation
+    /// pipeline and atomically mark it for next-template priority under the
+    /// final admission lock. Network callers cannot set this policy bit.
+    pub async fn submit_local_consolidation(
+        &self,
+        intent: TxIntent,
+        intent_bytes: Vec<u8>,
+    ) -> Result<TxBodyHash, SubmitError> {
+        self.submit_with_policy(intent, intent_bytes, true).await
+    }
+
+    async fn submit_with_policy(
+        &self,
+        intent: TxIntent,
+        intent_bytes: Vec<u8>,
+        local_template_priority: bool,
+    ) -> Result<TxBodyHash, SubmitError> {
         if intent_bytes.len() > MAX_TX_INTENT_BYTES_GLOBAL {
             return Err(SubmitError::IntentTooLarge {
                 actual: intent_bytes.len(),
                 max: MAX_TX_INTENT_BYTES_GLOBAL,
             });
         }
-        let shape_intent_cap = max_tx_intent_bytes_for_shape(intent.tx_body.shape);
-        if !intent.tx_body.is_coinbase && intent_bytes.len() > shape_intent_cap {
-            return Err(SubmitError::IntentTooLarge {
-                actual: intent_bytes.len(),
-                max: shape_intent_cap,
-            });
-        }
-
         // ── Stateless sanity check (no lock, no IO) ────────────────────
-        // One hash computation rejects malformed intents before touching any
-        // shared state. Previously this ran after AuthGKR verification — moved here so
-        // hash-confusion spam is free to reject.
+        // Canonical public logic rejects malformed intents before touching any
+        // shared state or invoking the authorization verifier.
         if !intent.tx_body.is_coinbase {
-            let facts = validate_public_tx_logic(&intent.tx_body)
+            validate_public_tx_logic(&intent.tx_body)
                 .map_err(|e| SubmitError::MalformedIntent(format!("public tx logic: {e}")))?;
-            if facts.tx_body_hash != intent.tx_body_hash {
-                return Err(SubmitError::MalformedIntent(
-                    "tx_body_hash does not match body (hash confusion attack)".into(),
-                ));
-            }
         }
+        let txid = intent.txid();
 
         if !intent.tx_body.is_coinbase && intent.authorization_bytes.is_empty() {
             return Err(SubmitError::MissingProof);
         }
-        let shape_authorization_cap = max_authorization_bytes_for_shape(intent.tx_body.shape);
-        if intent.authorization_bytes.len() > shape_authorization_cap {
+        if intent.authorization_bytes.len() > MAX_AUTHORIZATION_BYTES {
             return Err(SubmitError::ProofTooLarge {
                 actual: intent.authorization_bytes.len(),
-                max: shape_authorization_cap,
+                max: MAX_AUTHORIZATION_BYTES,
             });
         }
         let needs_zk = !intent.tx_body.is_coinbase;
 
         // ── Cheap pre-filter (lock held briefly) ─────────────────
-        // Runs all O(1)-O(ANCHOR_DEPTH) state checks before expensive Auth verification.
+        // Runs all cheap state checks before expensive Auth verification.
         {
             let st = self.state.lock().await;
-            if st.pool.contains(&intent.tx_body_hash) {
-                return Err(SubmitError::AlreadyAdmitted(intent.tx_body_hash));
+            if st.pool.contains(&txid) {
+                return Err(SubmitError::AlreadyAdmitted(txid));
             }
             let projected_bytes = st
                 .pool
@@ -240,7 +249,7 @@ impl AsyncMempool {
         let mut st = self.state.lock().await;
 
         let tx = intent_to_transaction(&intent)?;
-        let hash = tx.tx_body_hash;
+        let hash = tx.txid();
 
         if st.pool.contains(&hash) {
             return Err(SubmitError::AlreadyAdmitted(hash));
@@ -257,20 +266,20 @@ impl AsyncMempool {
         }
 
         // Re-derive anchor_height from current state (needed by pool.admit).
-        let anchor_height = run_admission_checks(&tx, &st)?;
+        let _anchor_height = run_admission_checks(&tx, &st)?;
 
         // --- Admit ---
-        let fee = tx.body.fee.min(u64::MAX as u128) as u64;
+        let fee = tx.body.fee;
         let is_coinbase = tx.body.is_coinbase;
         let has_authorization = needs_zk;
         let tip_height = st.view.tip_height;
-        match st.pool.admit(tx.clone(), tip_height, anchor_height) {
+        match st.pool.admit(tx.clone(), tip_height) {
             Ok(()) => {
                 // Maintain persistent slot sets so future checks are O(1).
-                for inp in tx.body.inputs.iter().filter(|i| i.valid) {
+                for (_, inp) in tx.body.live_inputs() {
                     st.admitted_input_slots.insert(inp.slot_index);
                 }
-                for out in tx.body.outputs.iter().filter(|o| o.valid) {
+                for (_, out) in tx.body.live_outputs() {
                     st.admitted_output_slots.insert(out.slot_index);
                 }
             }
@@ -294,6 +303,9 @@ impl AsyncMempool {
         }
         // Store raw intent bytes for mempool-sync serving to new peers.
         st.pool.set_intent_bytes(&hash, intent_bytes.clone());
+        if local_template_priority {
+            st.local_template_priority.insert(hash);
+        }
 
         if !is_coinbase {
             st.floor.record(fee);
@@ -329,14 +341,35 @@ impl AsyncMempool {
     /// Returns a fee-sorted list of `(Transaction, Option<cached_proof>)`.
     /// The caller (block builder) applies conflict resolution and coinbase on top.
     ///
-    /// Returned txs are in descending fee-rate order with tx_body_hash tie-break.
+    /// Returned txs are in descending fee-rate order with txid tie-break.
     pub async fn select_for_block(&self, max_txs: usize) -> Vec<noid_chain::mempool::MempoolEntry> {
         let st = self.state.lock().await;
-        st.pool
-            .select_for_block(max_txs.min(BLOCK_MAX_TXS))
-            .into_iter()
-            .cloned()
-            .collect()
+        let limit = max_txs.min(BLOCK_MAX_USER_TXS);
+        let mut priority_hashes: Vec<TxBodyHash> = st
+            .local_template_priority
+            .iter()
+            .filter(|hash| st.pool.contains(hash))
+            .copied()
+            .collect();
+        priority_hashes.sort_by_key(|hash| hash.0);
+
+        let mut selected = Vec::with_capacity(limit);
+        for hash in priority_hashes.into_iter().take(limit) {
+            if let Some(entry) = st.pool.get(&hash) {
+                selected.push(entry.clone());
+            }
+        }
+        if selected.len() < limit {
+            for entry in st.pool.select_for_block(limit) {
+                if !st.local_template_priority.contains(&entry.tx.txid()) {
+                    selected.push(entry.clone());
+                    if selected.len() == limit {
+                        break;
+                    }
+                }
+            }
+        }
+        selected
     }
 
     // -----------------------------------------------------------------------
@@ -346,7 +379,7 @@ impl AsyncMempool {
     /// Called when a new block is confirmed. Updates the chain view, removes
     /// confirmed txs, evicts expired txs, and broadcasts events.
     ///
-    /// `confirmed_hashes`: tx_body_hashes of all txs in the confirmed block.
+    /// `confirmed_hashes`: derived txids of all txs in the confirmed block.
     /// `new_view`: updated chain state snapshot.
     pub async fn on_new_block(
         &self,
@@ -359,52 +392,31 @@ impl AsyncMempool {
         // Remove confirmed txs.
         let removed = st.pool.on_block_confirmed(confirmed_hashes);
         for &hash in confirmed_hashes {
+            st.local_template_priority.remove(&hash);
             let _ = self.events.send(MempoolEvent::TxConfirmed {
                 hash,
                 block_height: new_height,
             });
         }
 
-        // Detect state expansion: if log_slots changed, all non-coinbase TXs in the
-        // pool were proved with the old log_slots and cannot be included in future
-        // blocks (their AuthGKRs are bound to log_slots via PublicInputs).
-        // Evict them now so the miner doesn't waste time on stale proofs.
-        let old_log_slots = st.view.log_slots();
-        let new_log_slots = new_view.log_slots();
-        if old_log_slots != new_log_slots {
-            let stale: Vec<TxBodyHash> = st
-                .pool
-                .iter()
-                .filter(|(_, e)| !e.tx.body.is_coinbase)
-                .map(|(h, _)| *h)
-                .collect();
-            let stale_count = stale.len();
-            for hash in stale {
-                st.pool.remove(&hash);
-                let _ = self.events.send(MempoolEvent::TxEvicted {
-                    hash,
-                    reason: EvictReason::LogSlotsChanged,
-                });
-            }
-            if stale_count > 0 {
-                tracing::info!(
-                    old_log_slots,
-                    new_log_slots,
-                    evicted = stale_count,
-                    "state expanded: evicted stale-proof TXs from mempool (wallets must re-prove)"
-                );
-            }
-        }
-
         // Update chain view BEFORE eviction so anchor check uses new state.
         st.view = new_view;
 
-        // Evict expired (anchor window expired).
-        let evicted = st.pool.evict_expired(new_height);
-        for hash in evicted {
+        // Evict transactions from the previous exact epoch after a boundary.
+        let stale_anchor: Vec<TxBodyHash> = st
+            .pool
+            .iter()
+            .filter(|(_, entry)| {
+                !entry.tx.body.is_coinbase
+                    && entry.tx.body.epoch_anchor != st.view.user_epoch_anchor_id
+            })
+            .map(|(hash, _)| *hash)
+            .collect();
+        for hash in stale_anchor {
+            st.pool.remove(&hash);
             let _ = self.events.send(MempoolEvent::TxEvicted {
                 hash,
-                reason: EvictReason::AnchorExpired,
+                reason: EvictReason::EpochAnchorChanged,
             });
         }
 
@@ -413,21 +425,22 @@ impl AsyncMempool {
         // in the mempool) landed on the same slot the wallet chose for its output.
         // The wallet must re-prove with fresh slot hints.
         use noid_chain::fri_state::SlotValue;
-        let output_conflicts: Vec<TxBodyHash> =
-            st.pool
-                .iter()
-                .filter_map(|(hash, entry)| {
-                    let occupied =
-                        entry.tx.body.outputs.iter().any(|out| {
-                            out.valid && st.view.slot(out.slot_index) != SlotValue::EMPTY
-                        });
-                    if occupied {
-                        Some(*hash)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
+        let output_conflicts: Vec<TxBodyHash> = st
+            .pool
+            .iter()
+            .filter_map(|(hash, entry)| {
+                let occupied = entry
+                    .tx
+                    .body
+                    .live_outputs()
+                    .any(|(_, out)| st.view.slot(out.slot_index) != SlotValue::EMPTY);
+                if occupied {
+                    Some(*hash)
+                } else {
+                    None
+                }
+            })
+            .collect();
         for hash in output_conflicts {
             st.pool.remove(&hash);
             tracing::debug!(?hash, "tx evicted: output slot occupied by confirmed block");
@@ -443,9 +456,7 @@ impl AsyncMempool {
         // spent by other confirmed txs (not the same tx). Those pool txs are now
         // invalid: their input slot is EMPTY (was moved elsewhere by the block).
         //
-        // Without this eviction, stale txs occupy pool capacity for up to
-        // ANCHOR_DEPTH blocks (~36 min at 15s/block) before anchor_expiry.
-        // They also fail silently in build_block_template (apply_tx returns Err)
+        // They also fail silently in build_block_template (apply_tx returns Err),
         // wasting template-build cycles.
         let input_consumed: Vec<TxBodyHash> = st
             .pool
@@ -454,18 +465,15 @@ impl AsyncMempool {
                 if entry.tx.body.is_coinbase {
                     return None;
                 }
-                let stale = entry.tx.body.inputs.iter().any(|inp| {
-                    if !inp.valid {
-                        return false;
-                    }
+                let stale = entry.tx.body.live_inputs().any(|(_, inp)| {
                     // Input must still hold exactly (value, creation_id, owner)
                     // for this tx to
                     // be includable. If the slot is EMPTY or has different content,
                     // the tx cannot be included in any future block.
                     let expected = SlotValue::with_owner_fields(
-                        inp.value,
+                        inp.amount,
                         inp.creation_id,
-                        inp.owner.as_fields(),
+                        entry.tx.body.input_owner.as_fields(),
                     );
                     st.view.slot(inp.slot_index) != expected
                 });
@@ -497,6 +505,9 @@ impl AsyncMempool {
 
         // Rebuild slot sets after bulk eviction (O(pool) once/block vs O(N²) per submit).
         rebuild_slot_sets(&mut st);
+        let admitted: HashSet<TxBodyHash> = st.pool.iter().map(|(hash, _)| *hash).collect();
+        st.local_template_priority
+            .retain(|hash| admitted.contains(hash));
 
         tracing::debug!(
             height = new_height,
@@ -535,6 +546,7 @@ impl AsyncMempool {
         for hash in &tx_hashes {
             if st.pool.contains(hash) {
                 st.pool.remove(hash);
+                st.local_template_priority.remove(hash);
                 tracing::debug!(?hash, "reorg: removed re-submitted duplicate from pool");
             }
         }
@@ -593,7 +605,7 @@ impl AsyncMempool {
         st.pool.iter().map(|(_, e)| e.clone()).collect()
     }
 
-    /// O(1) lookup of a single entry by tx_body_hash.
+    /// O(1) lookup of a single entry by derived txid.
     pub async fn get_entry_by_hash(
         &self,
         hash: &TxBodyHash,
@@ -637,16 +649,14 @@ impl AsyncMempool {
             let Ok(intent) = TxIntent::from_bytes(&intent_bytes) else {
                 continue;
             };
-            let Ok(bundle) = WalletAuthorizationBundle::from_bytes_for_shape(
-                &intent.authorization_bytes,
-                intent.tx_body.shape,
-            ) else {
+            let Ok(bundle) = WalletAuthorizationBundle::from_bytes(&intent.authorization_bytes)
+            else {
                 continue;
             };
             let Some(proof_bytes) = bundle.proof_wire_bytes() else {
                 continue;
             };
-            out.insert(intent.tx_body_hash.0, proof_bytes);
+            out.insert(intent.txid().0, proof_bytes);
         }
         out
     }
@@ -656,7 +666,7 @@ impl AsyncMempool {
 // Helper: all cheap admission checks
 // ---------------------------------------------------------------------------
 
-/// Run every O(1)–O(ANCHOR_DEPTH) admission check against `st`.
+/// Run every cheap admission check against `st`.
 ///
 /// Called **twice** per `submit`:
 /// - Pre-proof filter (DoS guard): rejects invalid txs before CPU-heavy work.
@@ -670,7 +680,7 @@ fn run_admission_checks(tx: &Transaction, st: &MempoolState) -> Result<u64, Subm
         let consensus_required =
             required_fee_for_tx_body(&tx.body, st.view.active_slot_count, st.view.log_slots());
         let required = st.floor.current().max(consensus_required);
-        let actual = tx.body.fee.min(u64::MAX as u128) as u64;
+        let actual = tx.body.fee;
         if actual < required {
             return Err(SubmitError::Consensus(
                 noid_chain::consensus::ConsensusError::BelowMinFee { required, actual },
@@ -681,27 +691,18 @@ fn run_admission_checks(tx: &Transaction, st: &MempoolState) -> Result<u64, Subm
     // Basic consensus (fee overflow, body hash non-zero, anchor non-zero).
     validate_tx_consensus(tx)?;
 
-    // Epoch anchor must be a known header within ANCHOR_DEPTH window.
-    // Returns anchor_height for pool.admit expiry tracking.
+    // Epoch anchor is the one start-of-next-block transaction-epoch anchor.
+    // Returns its height for deterministic mempool bookkeeping.
     let anchor_height: u64 = if !tx.body.is_coinbase {
-        let anchor_hash = tx.body.epoch_anchor;
-        let tip = st.view.tip_height;
-        let lo = tip.saturating_sub(ANCHOR_DEPTH);
-        let found = (lo..=tip).find(|&h| {
-            st.view
-                .recent_headers
-                .get(&h)
-                .map(|hdr| block_id(hdr) == anchor_hash)
-                .unwrap_or(false)
-        });
-        match found {
-            Some(h) => h,
-            None => {
-                return Err(SubmitError::Consensus(
-                    noid_chain::consensus::ConsensusError::BadEpochAnchor,
-                ));
-            }
+        let height = tx_epoch_anchor_height_for_child(st.view.tip_height + 1);
+        if st.view.user_epoch_anchor_id == [0u8; 32]
+            || tx.body.epoch_anchor != st.view.user_epoch_anchor_id
+        {
+            return Err(SubmitError::Consensus(
+                noid_chain::consensus::ConsensusError::BadEpochAnchor,
+            ));
         }
+        height
     } else {
         u64::MAX
     };
@@ -723,11 +724,7 @@ fn run_admission_checks(tx: &Transaction, st: &MempoolState) -> Result<u64, Subm
 // ---------------------------------------------------------------------------
 
 fn intent_to_transaction(intent: &TxIntent) -> Result<Transaction, SubmitError> {
-    // submit() already verified tx_body_hash matches the body before calling this.
-    Ok(Transaction {
-        body: intent.tx_body.clone(),
-        tx_body_hash: intent.tx_body_hash,
-    })
+    Ok(Transaction::new(intent.tx_body.clone()))
 }
 
 // ---------------------------------------------------------------------------
@@ -738,10 +735,10 @@ fn rebuild_slot_sets(st: &mut MempoolState) {
     st.admitted_input_slots.clear();
     st.admitted_output_slots.clear();
     for (_, entry) in st.pool.iter() {
-        for inp in entry.tx.body.inputs.iter().filter(|i| i.valid) {
+        for (_, inp) in entry.tx.body.live_inputs() {
             st.admitted_input_slots.insert(inp.slot_index);
         }
-        for out in entry.tx.body.outputs.iter().filter(|o| o.valid) {
+        for (_, out) in entry.tx.body.live_outputs() {
             st.admitted_output_slots.insert(out.slot_index);
         }
     }
@@ -756,14 +753,14 @@ fn check_slot_conflicts_with_pool(
     pool_inputs: &HashSet<u32>,
     pool_outputs: &HashSet<u32>,
 ) -> Result<(), SubmitError> {
-    for inp in tx.body.inputs.iter().filter(|i| i.valid) {
+    for (_, inp) in tx.body.live_inputs() {
         if pool_inputs.contains(&inp.slot_index) {
             return Err(SubmitError::Consensus(
                 noid_chain::consensus::ConsensusError::SlotConflict,
             ));
         }
     }
-    for out in tx.body.outputs.iter().filter(|o| o.valid) {
+    for (_, out) in tx.body.live_outputs() {
         if pool_outputs.contains(&out.slot_index) {
             return Err(SubmitError::Consensus(
                 noid_chain::consensus::ConsensusError::SlotConflict,
@@ -778,10 +775,7 @@ fn check_slot_conflicts_with_pool(
 // ---------------------------------------------------------------------------
 
 fn check_input_slots(tx: &Transaction, view: &ChainView) -> Result<(), SubmitError> {
-    for inp in &tx.body.inputs {
-        if !inp.valid {
-            continue;
-        }
+    for (_, inp) in tx.body.live_inputs() {
         let idx = inp.slot_index;
         if (idx as u64) >= view.num_slots {
             return Err(SubmitError::Consensus(
@@ -790,8 +784,11 @@ fn check_input_slots(tx: &Transaction, view: &ChainView) -> Result<(), SubmitErr
                 )),
             ));
         }
-        let expected =
-            SlotValue::with_owner_fields(inp.value, inp.creation_id, inp.owner.as_fields());
+        let expected = SlotValue::with_owner_fields(
+            inp.amount,
+            inp.creation_id,
+            tx.body.input_owner.as_fields(),
+        );
         let actual = view.slot(idx);
         if actual != expected {
             // Log diagnostic: expected non-empty slot but got EMPTY.
@@ -799,7 +796,7 @@ fn check_input_slots(tx: &Transaction, view: &ChainView) -> Result<(), SubmitErr
             // the ChainView's SegmentedFriState. Check preload_all_evicted_segments.
             tracing::warn!(
                 slot_index = idx,
-                expected_value = inp.value,
+                expected_value = inp.amount,
                 expected_creation_id = inp.creation_id,
                 actual_empty = actual.is_empty(),
                 "check_input_slots: slot mismatch — likely evicted segment in ChainView"
@@ -817,10 +814,7 @@ fn check_input_slots(tx: &Transaction, view: &ChainView) -> Result<(), SubmitErr
 // ---------------------------------------------------------------------------
 
 fn check_output_slots(tx: &Transaction, view: &ChainView) -> Result<(), SubmitError> {
-    for out in &tx.body.outputs {
-        if !out.valid {
-            continue;
-        }
+    for (_, out) in tx.body.live_outputs() {
         let idx = out.slot_index;
         if (idx as u64) >= view.num_slots {
             return Err(SubmitError::Consensus(
@@ -850,9 +844,8 @@ fn verify_intent_authorization(
 ) -> Result<(), String> {
     use noid_gkr::{verify_wallet_authorization, WalletAuthorizationBundle};
 
-    let bundle =
-        WalletAuthorizationBundle::from_bytes_for_shape(authorization_bytes, tx_body.shape)
-            .map_err(|e| format!("authorization decode: {e}"))?;
+    let bundle = WalletAuthorizationBundle::from_bytes(authorization_bytes)
+        .map_err(|e| format!("authorization decode: {e}"))?;
     verify_wallet_authorization(tx_body, &bundle).map_err(|e| format!("authorization verify: {e}"))
 }
 
@@ -863,8 +856,10 @@ mod tests {
     use noid_chain::consensus::genesis::genesis_header;
     use noid_chain::fri_state::SlotValue;
     use noid_chain::state::ChainState;
-    use noid_poseidon2b::primitives::{Address, SpendSecret, TxBodyHash};
-    use noid_tx::{Transaction, TxBody, TxInput, TxShape};
+    use noid_poseidon2b::primitives::Address;
+    use noid_tx::{
+        output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS,
+    };
 
     use super::check_input_slots;
     use crate::view::ChainView;
@@ -883,27 +878,75 @@ mod tests {
         let mut headers = HashMap::new();
         headers.insert(0, genesis_header());
         let view = ChainView::new(0, headers, 1, state.state);
-        let mut tx = Transaction {
-            body: TxBody {
-                shape: TxShape::Standard4x8,
-                epoch_anchor: [1; 32],
-                fee: 0,
-                inputs: vec![TxInput {
-                    slot_index: 7,
-                    value: 1_000,
-                    creation_id: 41,
-                    owner,
-                    spend_secret: SpendSecret([0; 32]),
-                    valid: true,
-                }],
-                outputs: vec![],
-                is_coinbase: false,
-            },
-            tx_body_hash: TxBodyHash([2; 32]),
+        let mut inputs = [TxInput::dummy(); TX_INPUTS];
+        inputs[0] = TxInput {
+            slot_index: 7,
+            amount: 1_000,
+            creation_id: 41,
         };
+        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        outputs[0] = TxOutput {
+            slot_index: 8,
+            amount: 999,
+            owner: Address([0xB6; 32]),
+        };
+        let mut tx = Transaction::new(TxBody {
+            epoch_anchor: [1; 32],
+            fee: 1,
+            input_owner: owner,
+            inputs,
+            outputs,
+            validity_bitmap: 1 | output_bitmap_bit(0),
+            is_coinbase: false,
+        });
 
         assert!(check_input_slots(&tx, &view).is_err());
         tx.body.inputs[0].creation_id = 42;
         assert!(check_input_slots(&tx, &view).is_ok());
+    }
+
+    fn policy_tx(seed: u8, fee: u64) -> Transaction {
+        let mut inputs = [TxInput::dummy(); TX_INPUTS];
+        inputs[0] = TxInput {
+            slot_index: u32::from(seed),
+            amount: 1_000 + fee,
+            creation_id: u64::from(seed),
+        };
+        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        outputs[0] = TxOutput {
+            slot_index: u32::from(seed) + 100,
+            amount: 1_000,
+            owner: Address([seed.wrapping_add(1); 32]),
+        };
+        Transaction::new(TxBody {
+            epoch_anchor: [1; 32],
+            fee,
+            input_owner: Address([seed; 32]),
+            inputs,
+            outputs,
+            validity_bitmap: 1 | output_bitmap_bit(0),
+            is_coinbase: false,
+        })
+    }
+
+    #[tokio::test]
+    async fn trusted_local_consolidation_precedes_fee_order() {
+        let mut headers = HashMap::new();
+        headers.insert(0, genesis_header());
+        let view = ChainView::new(0, headers, 0, ChainState::with_log_slots(8).state);
+        let pool = crate::AsyncMempool::new(view, crate::MempoolConfig::default());
+        let maintenance = policy_tx(1, 1);
+        let ordinary = policy_tx(2, 10_000);
+        let maintenance_id = maintenance.txid();
+        {
+            let mut state = pool.state.lock().await;
+            state.pool.admit(maintenance, 0).unwrap();
+            state.pool.admit(ordinary, 0).unwrap();
+            state.local_template_priority.insert(maintenance_id);
+        }
+
+        let selected = pool.select_for_block(1).await;
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].tx.txid(), maintenance_id);
     }
 }

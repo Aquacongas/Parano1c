@@ -22,7 +22,7 @@ pub enum MempoolEvent {
         intent_bytes: Vec<u8>,
     },
 
-    /// A transaction was evicted (epoch_anchor expired or pool pressure).
+    /// A transaction was evicted (epoch changed or pool pressure).
     TxEvicted {
         hash: TxBodyHash,
         reason: EvictReason,
@@ -39,8 +39,8 @@ pub enum MempoolEvent {
 /// Why a transaction was evicted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EvictReason {
-    /// epoch_anchor window expired (tx is too old to include in any block).
-    AnchorExpired,
+    /// The canonical transaction epoch anchor advanced at a boundary.
+    EpochAnchorChanged,
     /// Pool over capacity; low-fee tx was dropped.
     CapacityPressure,
     /// The transaction's claimed input slot was spent by a confirmed block.
@@ -48,7 +48,4 @@ pub enum EvictReason {
     /// One of the transaction's chosen output slots was filled by a confirmed block.
     /// The wallet should rebuild/re-prove with fresh slot hints.
     OutputSlotOccupied,
-    /// Transaction was proved with a log_slots that no longer matches the chain
-    /// (state expansion occurred). Must be re-proved with the new log_slots.
-    LogSlotsChanged,
 }

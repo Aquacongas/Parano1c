@@ -22,11 +22,13 @@
 //!   witness);
 //! - `validate_accumulator_boundary`: first block height = start height + 1
 //!   (affine pin), end accumulator pins live in the claim-fold slot;
-//! - every tx-root Merkle path pins its root to the header `tx_root`, its
-//!   leaf to the spine slot's tx-body hash, its direction bits to the
+//! - every tx-root Merkle path pins its root to the underlying universal
+//!   256-leaf Merkle root `M`, its leaf to the spine slot's tx-body hash, its
+//!   direction bits to the
 //!   CONSTANT bits of its tx position, and the last real path pins its
 //!   right-hand siblings to the canonical zero-subtree digests (the padding
-//!   rim the native root reconstruction binds);
+//!   rim the native root reconstruction binds); a domain-separated
+//!   `TAG_TXROOT(M, tx_count)` wrapper then pins to the header `tx_root`;
 //! - each owner-auth slot pins its `tx_body_hash` to the spine hash of its
 //!   tx and discharges its wallet-PCS obligation; the authorization totals
 //!   are pinned to the per-slot counts AND to the claim's resource fields;
@@ -61,18 +63,15 @@
 use noid_core::Block128;
 use noid_gkr::merkle_circuit::MerkleCircuit;
 use noid_poseidon2b::native::compression::compress;
+use noid_poseidon2b::native::domain::TAG_TXROOT;
 
 use super::trace::accepted_claim_batch::{
-    build_accepted_claim_batch_claim_slot, digest_lanes, AccumulatorWires, ClaimBatchStepWires,
+    build_accepted_claim_batch_claim_slot, compress_with_tag_trace, digest_lanes, AccumulatorWires,
+    ClaimBatchStepWires,
 };
-use super::trace::accepted_claim_hash::{build_accepted_claim_hash_slot, AcceptedClaimHashInputsTrace};
-use super::trace::region_source_binding::{
-    discharge_auth_pcs_obligations_via_region, discharge_owner_auth_killshots_via_region,
-    RegionDischargeParams, RegionPcsClaim, SpineInstanceRegion, SpineRegionData,
-    TxRootPathRegion, TxRootRegionData,
+use super::trace::accepted_claim_hash::{
+    build_accepted_claim_hash_slot, AcceptedClaimHashInputsTrace,
 };
-use noid_gkr::SpineInputs;
-use noid_ivc_core::deep_chain::spine::SpineInstanceFlat;
 use super::trace::checkpoint_poseidon::{
     build_checkpoint_poseidon_slot_with_inputs, ChainAccumulatorBatchInputsTrace,
     ChainAccumulatorItemTrace, HeaderHashInputsTrace,
@@ -85,7 +84,12 @@ use super::trace::merkle_path::{build_batched_merkle_slot, MerklePathInputsTrace
 use super::trace::owner_auth::{
     build_owner_auth_slot, OwnerAuthProofTrace, OwnerAuthPublicInputsTrace,
 };
-use super::trace::tx_body_spine::{build_standard_tx_body_slot, SpineInputsTrace};
+use super::trace::region_source_binding::{
+    discharge_auth_pcs_obligations_via_region, discharge_owner_auth_killshots_via_region,
+    RegionDischargeParams, RegionPcsClaim, SpineInstanceRegion, SpineRegionData, TxRootPathRegion,
+    TxRootRegionData,
+};
+use super::trace::tx_body_spine::{build_tx_body_slot, SpineInputsTrace};
 use super::trace::{
     alloc_block, const_block, flat_const, flat_of, mul, pin_eq, pin_lt_strict, pin_zero,
     range_check_bits, FieldR1csBuilder, LinExpr, RawChannelTrace, F128,
@@ -95,6 +99,8 @@ use crate::block_certificate_backend::{
     AcceptedBlockBatchComponentInputs, AcceptedBlockBatchComponentProof,
 };
 use crate::pow_header::header_hash_proof_inputs;
+use noid_gkr::SpineInputs;
+use noid_ivc_core::deep_chain::spine::SpineInstanceFlat;
 
 // ---------------------------------------------------------------------------
 // Fixed field positions (protocol constants of the two statement encodings)
@@ -160,7 +166,8 @@ pub mod header_fields {
     pub const FIELDS: usize = 16;
 }
 
-const _: () = assert!(claim_layout::FIELDS == noid_gkr::accepted_claim_killshot::ACCEPTED_CLAIM_FIELDS);
+const _: () =
+    assert!(claim_layout::FIELDS == noid_gkr::accepted_claim_killshot::ACCEPTED_CLAIM_FIELDS);
 const _: () = assert!(header_fields::FIELDS == noid_chain::consensus::pow::POW_HEADER_FIELD_COUNT);
 
 fn pin_eq2(b: &mut FieldR1csBuilder, a: &[LinExpr; 2], c: &[LinExpr; 2]) {
@@ -245,10 +252,10 @@ fn pin_u64_sum(b: &mut FieldR1csBuilder, terms: &[LinExpr]) -> LinExpr {
 
 /// Allocate the transitional body-derived live-input count used by the block
 /// count lanes until C' pins it to the transaction validity bitmap. Keep the
-/// relation class-fixed while enforcing the serialized boundary 1..=25.
+/// relation class-fixed while enforcing the serialized boundary 1..=8.
 fn alloc_transitional_live_input_count(b: &mut FieldR1csBuilder, count: u8) -> LinExpr {
     assert!((1..=noid_gkr::MAX_AUTHORIZATION_LIVE_INPUTS).contains(&count));
-    const BITS: usize = 5;
+    const BITS: usize = 4;
     let count = alloc_block(b, Block128::from(count as u128));
     let count_bits = range_check_bits(b, &count, BITS);
     let zero_bits = range_check_bits(b, &const_block(Block128::from(0u128)), BITS);
@@ -266,6 +273,19 @@ fn pin_pair_at(b: &mut FieldR1csBuilder, fields: &[LinExpr], at: usize, to: &[Li
     pin_eq(b, &fields[at + 1], &to[1]);
 }
 
+/// Bind the universal 256-leaf Merkle root and real transaction count to the
+/// header's domain-separated transaction root.
+fn bind_tx_root_count_wrapper(
+    b: &mut FieldR1csBuilder,
+    merkle_root: &[LinExpr; 2],
+    tx_count: &LinExpr,
+    header_root: &[LinExpr; 2],
+) {
+    let count_digest = [tx_count.clone(), LinExpr::zero()];
+    let wrapped = compress_with_tag_trace(b, TAG_TXROOT, merkle_root, &count_digest);
+    pin_eq2(b, &wrapped, header_root);
+}
+
 /// Canonical zero-subtree digest lanes per level: `Z_0 = zero leaf`,
 /// `Z_{L+1} = compress(Z_L, Z_L)` — the tx-tree padding constants the last
 /// real path's right-hand siblings must equal.
@@ -280,10 +300,11 @@ fn zero_subtree_lanes(depth: usize) -> Vec<[Block128; 2]> {
 }
 
 /// Assemble the tx-root region handoff from already-allocated statement
-/// wires — the real build passes the header `tx_root` pair + the spine
-/// tx-hash wires; the scratch mirror passes throwaway allocs of the same
-/// natives. Pure transliteration of the killshot statement (depth, one path
-/// per tx in tx order, shared expected root, rim constants); every wire is
+/// wires. `root_w` is the underlying universal-tree Merkle root `M`, never
+/// the count-bound header `tx_root`; [`bind_tx_root_count_wrapper`] performs
+/// that separate binding. The scratch mirror passes throwaway allocations of
+/// the same natives. Pure transliteration of the killshot statement (depth,
+/// one path per tx in tx order, shared `M`, rim constants); every wire is
 /// asserted to carry its native value at build time.
 fn tx_root_region_data_from_wires(
     b: &FieldR1csBuilder,
@@ -296,20 +317,17 @@ fn tx_root_region_data_from_wires(
     assert_eq!(
         n_txs,
         entry_ws.len(),
-        "pure-standard tier: every tx is a spine instance"
+        "every transaction is a tx-body spine instance"
     );
     let depth = tx_root_inputs[0].active_depth;
-    // The consensus tree is padded to the block's TIER capacity (a class
-    // constant, at least the count's power of two); the depth rides the
-    // verified killshot statement.
-    assert!(1usize << depth >= n_txs.next_power_of_two().max(2));
+    assert_eq!(depth, noid_chain::tx_tree::TX_TREE_DEPTH);
     let root_native = tx_root_inputs[0].expected_root;
     let root_flat = [flat_of(root_native[0]), flat_of(root_native[1])];
     for lane in 0..2 {
         assert_eq!(
             root_w[lane].eval(b.values()),
             root_flat[lane],
-            "header tx_root wire != the killshot statement root"
+            "Merkle root wire != the killshot statement root"
         );
     }
     let paths: Vec<TxRootPathRegion> = tx_root_inputs
@@ -319,7 +337,7 @@ fn tx_root_region_data_from_wires(
             assert_eq!(p.active_depth, depth, "all tx-root paths share the depth");
             assert_eq!(
                 p.expected_root, root_native,
-                "tx-root path {j} root != the header tx_root"
+                "tx-root path {j} root != the shared universal-tree root M"
             );
             let entry_flat = [flat_of(p.leaf[0]), flat_of(p.leaf[1])];
             for lane in 0..2 {
@@ -351,17 +369,17 @@ fn tx_root_region_data_from_wires(
     }
 }
 
-/// The real build's tx-root handoff: header `tx_root` wires + spine tx-hash
-/// wires (the shared-wire leaf/root closures).
+/// The real build's tx-root handoff: underlying Merkle-root wires plus spine
+/// tx-hash wires. The count wrapper binds this root to the header separately.
 fn tx_root_region_handoff(
-    b: &FieldR1csBuilder,
+    b: &mut FieldR1csBuilder,
     tx_root_inputs: &[noid_gkr::merkle_circuit::MerklePathInputs],
-    header: &HeaderHashInputsTrace,
     tx_hashes: &[[LinExpr; 2]],
 ) -> TxRootRegionData {
+    let root_native = tx_root_inputs[0].expected_root;
     let root_w = [
-        header.fields[header_fields::TX_ROOT].clone(),
-        header.fields[header_fields::TX_ROOT + 1].clone(),
+        alloc_block(b, root_native[0]),
+        alloc_block(b, root_native[1]),
     ];
     tx_root_region_data_from_wires(b, tx_root_inputs, root_w, tx_hashes)
 }
@@ -404,7 +422,10 @@ fn padded_tx_tree_levels(hashes: &[[Block128; 2]], depth: usize) -> Vec<Vec<[u8;
     level.resize(target, [0u8; 32]);
     let mut levels = vec![level.clone()];
     while level.len() > 1 {
-        level = level.chunks_exact(2).map(|p| compress(&p[0], &p[1])).collect();
+        level = level
+            .chunks_exact(2)
+            .map(|p| compress(&p[0], &p[1]))
+            .collect();
         levels.push(level.clone());
     }
     levels
@@ -420,14 +441,14 @@ fn tx_root_region_capacity_handoff(
     b: &mut FieldR1csBuilder,
     tx_root_inputs: &[noid_gkr::merkle_circuit::MerklePathInputs],
     real_hashes: &[[Block128; 2]],
-    header: &HeaderHashInputsTrace,
     tx_hashes: &[[LinExpr; 2]],
     live_bits: &[LinExpr],
     tx_delta: usize,
 ) -> TxRootRegionData {
+    let root_native = tx_root_inputs[0].expected_root;
     let root_w = [
-        header.fields[header_fields::TX_ROOT].clone(),
-        header.fields[header_fields::TX_ROOT + 1].clone(),
+        alloc_block(b, root_native[0]),
+        alloc_block(b, root_native[1]),
     ];
     tx_root_region_capacity_data_from_wires(
         b,
@@ -441,7 +462,7 @@ fn tx_root_region_capacity_handoff(
 }
 
 /// [`tx_root_region_capacity_handoff`] core on caller-supplied wires (the
-/// real build passes the header root + statement liveness; the scratch
+/// real build passes the underlying universal-tree root `M` + statement liveness; the scratch
 /// mirror passes throwaway allocs of the same natives).
 fn tx_root_region_capacity_data_from_wires(
     b: &mut FieldR1csBuilder,
@@ -452,28 +473,32 @@ fn tx_root_region_capacity_data_from_wires(
     live_bits: &[LinExpr],
     tx_delta: usize,
 ) -> TxRootRegionData {
-    assert!(!tx_root_inputs.is_empty(), "tx-root region handoff without paths");
+    assert!(
+        !tx_root_inputs.is_empty(),
+        "tx-root region handoff without paths"
+    );
     let depth = tx_root_inputs[0].active_depth;
     let n_leaves = 1usize << depth;
     let n_real = real_hashes.len();
     assert!(n_real >= 1 && n_real <= n_leaves);
-    assert_eq!(
-        n_leaves,
-        tx_hashes.len().next_power_of_two().max(2),
-        "tier tx capacity must fill the padded tx-tree depth"
-    );
+    assert_eq!(depth, noid_chain::tx_tree::TX_TREE_DEPTH);
+    assert!(tx_hashes.len() <= n_leaves);
     let root_native = tx_root_inputs[0].expected_root;
     let root_flat = [flat_of(root_native[0]), flat_of(root_native[1])];
     for lane in 0..2 {
         assert_eq!(
             root_w[lane].eval(b.values()),
             root_flat[lane],
-            "header tx_root wire != the killshot statement root"
+            "Merkle root wire != the killshot statement root"
         );
     }
     let levels = padded_tx_tree_levels(real_hashes, depth);
     // Cross-check the rebuilt root against the killshot statement.
-    assert_eq!(digest_lanes(&levels[depth][0]), root_native, "rebuilt padded tree root");
+    assert_eq!(
+        digest_lanes(&levels[depth][0]),
+        root_native,
+        "rebuilt padded tree root"
+    );
 
     let paths: Vec<TxRootPathRegion> = (0..n_leaves)
         .map(|j| {
@@ -511,7 +536,11 @@ fn tx_root_region_capacity_data_from_wires(
                     [flat_of(lanes[0]), flat_of(lanes[1])]
                 })
                 .collect();
-            TxRootPathRegion { entry_w, entry_flat, siblings }
+            TxRootPathRegion {
+                entry_w,
+                entry_flat,
+                siblings,
+            }
         })
         .collect();
     TxRootRegionData {
@@ -534,20 +563,20 @@ fn tx_root_region_capacity_data_from_wires(
 /// USER_TX_COUNT sum is unchanged). Non-capacity builds keep the caller's
 /// tx count (the plural discharge asserts it is a power of two).
 fn tier_auth_slot_count(tier_user_tx_capacity: Option<usize>, n_real_user: usize) -> usize {
-    tier_user_tx_capacity
-        .map_or(n_real_user, |c| if c == 0 { 0 } else { c.next_power_of_two() })
+    tier_user_tx_capacity.map_or(n_real_user, |tier| {
+        super::shape::ShapeClass { tier }.authorization_capacity()
+    })
 }
 
 /// The tier's touched-slot capacity: the class live-input capacity plus the
-/// output capacity (every standard tx may create up to its shape's max
-/// outputs) PLUS ONE for the coinbase
+/// output capacity (every Tx8x2 user transaction may create two outputs)
+/// PLUS ONE for the coinbase
 /// mint — the coinbase is not a user tx but its reward output touches a
 /// slot too, so a genuinely full block touches `user actions + 1` slots
-/// (3061 at the attack tier, not 3060). Every touched slot is a spend or a
+/// (1531 at the attack tier, not 1530). Every touched slot is a spend or a
 /// creation, so the real touched count never exceeds this.
-fn tier_touched_capacity(std_tier: usize) -> usize {
-    let spend = noid_chain::consensus::params::block_class_spend_capacity(std_tier, 0);
-    spend + std_tier * noid_gkr::tx_body_layout::TXBODY_N_OUTPUT_LEAVES + 1
+fn tier_touched_capacity(user_tier: usize) -> usize {
+    super::shape::ShapeClass { tier: user_tier }.touched_capacity()
 }
 
 /// Pad the exact-state statement to the tier's touched capacity: the
@@ -557,13 +586,16 @@ fn tier_touched_capacity(std_tier: usize) -> usize {
 /// value-neutral).
 fn pad_exact_state_inputs_to_tier(
     es: &crate::block_certificate_backend::ExactStateKillShotInputs,
-    std_tier: usize,
+    user_tier: usize,
 ) -> crate::block_certificate_backend::ExactStateKillShotInputs {
-    let cap = tier_touched_capacity(std_tier);
+    let cap = tier_touched_capacity(user_tier);
     let t = es.slot_leaves.len() / 2;
     assert_eq!(es.slot_leaves.len(), 2 * t, "old/new leaf halves");
     assert_eq!(es.state_paths.len(), 2 * t, "old/new path halves");
-    assert!(t >= 1 && t <= cap, "touched count {t} exceeds tier capacity {cap}");
+    assert!(
+        t >= 1 && t <= cap,
+        "touched count {t} exceeds tier capacity {cap}"
+    );
     let mut out = es.clone();
     fn dup_half<T: Clone>(v: &mut Vec<T>, half_start: usize, t: usize, cap: usize) {
         let template = v[half_start].clone();
@@ -610,12 +642,28 @@ fn spine_region_data_from_wires(
     inputs_t: &[SpineInputsTrace],
     tx_hashes: &[[LinExpr; 2]],
 ) -> SpineRegionData {
-    assert_eq!(natives.len(), inputs_t.len(), "one wire set per spine instance");
-    assert_eq!(natives.len(), native_hashes.len(), "one hash per spine instance");
-    assert_eq!(natives.len(), tx_hashes.len(), "one hash wire pair per instance");
+    assert_eq!(
+        natives.len(),
+        inputs_t.len(),
+        "one wire set per spine instance"
+    );
+    assert_eq!(
+        natives.len(),
+        native_hashes.len(),
+        "one hash per spine instance"
+    );
+    assert_eq!(
+        natives.len(),
+        tx_hashes.len(),
+        "one hash wire pair per instance"
+    );
     let assert_pair = |w: &[LinExpr; 2], n: &[Block128; 2], what: &str| {
         for lane in 0..2 {
-            assert_eq!(w[lane].eval(b.values()), flat_of(n[lane]), "{what} lane {lane}");
+            assert_eq!(
+                w[lane].eval(b.values()),
+                flat_of(n[lane]),
+                "{what} lane {lane}"
+            );
         }
     };
     let instances = natives
@@ -671,8 +719,10 @@ fn scratch_spine_region_data(
     natives: &[SpineInputs],
     native_hashes: &[[Block128; 2]],
 ) -> SpineRegionData {
-    let inputs_t: Vec<SpineInputsTrace> =
-        natives.iter().map(|i| SpineInputsTrace::alloc(pb, i)).collect();
+    let inputs_t: Vec<SpineInputsTrace> = natives
+        .iter()
+        .map(|i| SpineInputsTrace::alloc(pb, i))
+        .collect();
     let tx_hashes: Vec<[LinExpr; 2]> = native_hashes
         .iter()
         .map(|h| std::array::from_fn(|i| alloc_block(pb, h[i])))
@@ -781,11 +831,14 @@ pub struct BlockSlotsConfig {
     pub exact_state_region: bool,
     /// When true, verify the tx-root Merkle paths via the shared region walks
     /// instead of the inline batched killshot: one TAG_COMPRESS walk-B leg,
-    /// entries = the SPINE tx-hash wires, roots = the header `tx_root` wires,
+    /// entries = the SPINE tx-hash wires, roots = the underlying universal
+    /// Merkle-root `M` wires,
     /// leaf positions bound by const-pinning the committed direction cells to
     /// the leaf-index bits, and the padding rim by const-pinning the last real
     /// path's right-hand sibling cells to the zero-subtree constants — exactly
-    /// the bindings the inline slot pins on its statement wires.
+    /// the bindings the inline slot pins on its statement wires. The
+    /// count-bound `TAG_TXROOT(M, tx_count)` wrapper is enforced separately
+    /// against the header `tx_root`.
     ///
     /// REQUIRES `discharge_wallet_pcs` (the leg rides walk B).
     /// `false` = the inline killshot replay.
@@ -818,8 +871,8 @@ pub struct BlockSlotsConfig {
     /// padding digest), replacing the content-shaped rim/count const pins
     /// with class-fixed structure.
     ///
-    /// `cap` MUST be the block's consensus standard-tx class tier
-    /// (`standard_tx_class_tier(n_real)`), so the native tier-quantized
+    /// `cap` MUST be the block's consensus user-transaction class tier
+    /// (`user_tx_class_tier(n_real)`), so the native tier-quantized
     /// statements (exact-state touched capacity and padded tx-tree depth)
     /// already agree across the tier. REQUIRES the full
     /// region stack (all four region flags). `None` = exact counts (the
@@ -845,8 +898,7 @@ impl Default for BlockSlotsConfig {
 
 /// Assemble the single-block component replay. `inputs`/`proof` are the
 /// native component objects; `start/end_accumulator` the block's
-/// accumulator boundary. The current class shape is a pure-standard tier
-/// (sweep component empty); the sweep arm lands with its tier class.
+/// accumulator boundary. Every class has one Tx8x2 user-transaction tier.
 pub fn build_block_slots(
     b: &mut FieldR1csBuilder,
     start_accumulator: &ChainAccumulator,
@@ -884,14 +936,7 @@ pub fn build_block_slots_with_config(
         inputs.authorization_inputs.len(),
         inputs.authorization_witnesses.len()
     );
-    assert_eq!(
-        inputs.tx_body_standard_inputs.len(),
-        inputs.tx_body_standard_hashes.len()
-    );
-    assert!(
-        inputs.tx_body_sweep_inputs.is_empty() && proof.tx_body_sweep.is_none(),
-        "sweep tier class not assembled yet"
-    );
+    assert_eq!(inputs.tx_body_inputs.len(), inputs.tx_body_hashes.len());
     // verify_authorization_components count check (structural side).
     assert_eq!(
         inputs.authorization_inputs.len(),
@@ -922,11 +967,9 @@ pub fn build_block_slots_with_config(
             "tier capacity requires the full region stack (all four region flags)"
         );
         assert_eq!(
-            noid_chain::consensus::params::standard_tx_class_tier(
-                inputs.authorization_inputs.len()
-            ),
+            noid_chain::consensus::params::user_tx_class_tier(inputs.authorization_inputs.len()),
             Some(cap),
-            "tier capacity must be the block's consensus standard-tx class tier"
+            "tier capacity must be the block's consensus user-tx class tier"
         );
     }
 
@@ -975,7 +1018,11 @@ pub fn build_block_slots_with_config(
         (hc::ALLOC_COUNTER, hf::ALLOC_COUNTER, 1),
     ] {
         for lane in 0..lanes {
-            pin_eq(b, &claim.fields[claim_at + lane], &header.fields[field_at + lane]);
+            pin_eq(
+                b,
+                &claim.fields[claim_at + lane],
+                &header.fields[field_at + lane],
+            );
         }
     }
     // Parent-section anchors: the parent's block id is the header's
@@ -1007,8 +1054,16 @@ pub fn build_block_slots_with_config(
         &claim.fields[parent + hc::ACTIVE_SLOT_COUNT],
         &start_acc.active_slot_count,
     );
-    pin_eq(b, &claim.fields[parent + hc::ALLOC_COUNTER], &start_acc.alloc_counter);
-    pin_eq(b, &end_acc.active_slot_count, &header.fields[hf::ACTIVE_SLOT_COUNT]);
+    pin_eq(
+        b,
+        &claim.fields[parent + hc::ALLOC_COUNTER],
+        &start_acc.alloc_counter,
+    );
+    pin_eq(
+        b,
+        &end_acc.active_slot_count,
+        &header.fields[hf::ACTIVE_SLOT_COUNT],
+    );
     pin_eq(b, &end_acc.alloc_counter, &header.fields[hf::ALLOC_COUNTER]);
     // First block height = start height + 1 (INTEGER successor). Field
     // addition is XOR, so a naive `child + parent + 1 = 0` would only be
@@ -1017,7 +1072,7 @@ pub fn build_block_slots_with_config(
     pin_u64_successor(b, &start_acc.height, &header.fields[hf::HEIGHT]);
 
     crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: claim-hash killshot+[D]");
-    // ---- tx_body standard spine component. Region mode moves the whole
+    // ---- Tx8x2 body-spine component. Region mode moves the whole
     // 59-permutation-per-tx replay onto the shared walk A (leaf/wrap tile +
     // compress tree): only the statement wires are allocated here — the SAME
     // wire vectors the inline slot returns, so every downstream consumer
@@ -1031,32 +1086,36 @@ pub fn build_block_slots_with_config(
     // ghost tx), so `tx_hashes`/`spine_inputs` are capacity-length and every
     // per-tx-slot structure below is class-fixed. `delta` = non-user txs
     // (the coinbase when present) — a class constant within a tier.
-    let n_real_txs = inputs.tx_body_standard_inputs.len();
+    let n_real_txs = inputs.tx_body_inputs.len();
     let tx_delta = n_real_txs
         .checked_sub(inputs.authorization_inputs.len())
         .expect("every user tx is a spine instance");
-    assert!(tx_delta <= 1, "at most one non-user (coinbase) tx per block");
+    assert!(
+        tx_delta <= 1,
+        "at most one non-user (coinbase) tx per block"
+    );
     let cap_txs = config
         .tier_user_tx_capacity
         .map_or(n_real_txs, |c| c + tx_delta);
-    let (spine_inputs, tx_hashes) = if inputs.tx_body_standard_inputs.is_empty() {
-        assert!(proof.tx_body_standard.is_none());
+    let (spine_inputs, tx_hashes) = if inputs.tx_body_inputs.is_empty() {
+        assert!(proof.tx_body.is_none());
         (Vec::new(), Vec::new())
     } else if config.spine_region {
-        let mut spine_natives: Vec<SpineInputs> = inputs.tx_body_standard_inputs.clone();
-        let mut hash_natives: Vec<[Block128; 2]> = inputs.tx_body_standard_hashes.clone();
+        let mut spine_natives: Vec<SpineInputs> = inputs.tx_body_inputs.clone();
+        let mut hash_natives: Vec<[Block128; 2]> = inputs.tx_body_hashes.clone();
         if cap_txs > n_real_txs {
             let ghost_body = noid_gkr::ghost_tx::ghost_tx_body();
-            let ghost_spine = noid_gkr::spine_statement::spine_inputs_from_body(&ghost_body)
-                .expect("the canonical ghost body has spine inputs");
+            let ghost_spine = noid_gkr::spine_statement::spine_inputs_from_body(&ghost_body);
             let ghost_hash = noid_gkr::ghost_tx::ghost_tx_body_hash();
             for _ in n_real_txs..cap_txs {
                 spine_natives.push(ghost_spine.clone());
                 hash_natives.push(ghost_hash);
             }
         }
-        let inputs_t: Vec<SpineInputsTrace> =
-            spine_natives.iter().map(|i| SpineInputsTrace::alloc(b, i)).collect();
+        let inputs_t: Vec<SpineInputsTrace> = spine_natives
+            .iter()
+            .map(|i| SpineInputsTrace::alloc(b, i))
+            .collect();
         let hashes_t: Vec<[LinExpr; 2]> = hash_natives
             .iter()
             .map(|h| std::array::from_fn(|i| alloc_block(b, h[i])))
@@ -1074,14 +1133,11 @@ pub fn build_block_slots_with_config(
             config.tier_user_tx_capacity.is_none(),
             "tier capacity requires spine_region"
         );
-        build_standard_tx_body_slot(
+        build_tx_body_slot(
             b,
-            proof
-                .tx_body_standard
-                .as_ref()
-                .expect("standard spine proof present"),
-            &inputs.tx_body_standard_inputs,
-            &inputs.tx_body_standard_hashes,
+            proof.tx_body.as_ref().expect("tx-body spine proof present"),
+            &inputs.tx_body_inputs,
+            &inputs.tx_body_hashes,
         )
     };
 
@@ -1118,7 +1174,7 @@ pub fn build_block_slots_with_config(
     // ---- tx_root component: paths for the REAL leaves, position-pinned.
     // Region mode moves the path hashing onto the shared walk B (one
     // TAG_COMPRESS leg): the entry/root closures ride the SAME statement
-    // wires (spine tx hashes / header tx_root) via cell pins, and the
+    // wires (spine tx hashes / underlying universal Merkle root M) via cell pins, and the
     // position + padding-rim bindings become const cell pins on the
     // committed direction/sibling cells — the exact constants pinned below
     // on the inline slot's statement wires.
@@ -1136,14 +1192,13 @@ pub fn build_block_slots_with_config(
             tx_root_region_capacity_handoff(
                 b,
                 &inputs.tx_root_inputs,
-                &inputs.tx_body_standard_hashes,
-                &header,
+                &inputs.tx_body_hashes,
                 &tx_hashes,
                 &live_bits,
                 tx_delta,
             )
         } else {
-            tx_root_region_handoff(b, &inputs.tx_root_inputs, &header, &tx_hashes)
+            tx_root_region_handoff(b, &inputs.tx_root_inputs, &tx_hashes)
         });
         Vec::new()
     } else {
@@ -1158,16 +1213,17 @@ pub fn build_block_slots_with_config(
         assert_eq!(
             n_txs,
             tx_hashes.len(),
-            "pure-standard tier: every tx is a spine instance"
+            "every transaction is a tx-body spine instance"
         );
         let depth = paths[0].active_depth;
-        // Tier-capacity consensus padding: the tree is at least count-deep.
-        assert!(1usize << depth >= n_txs.next_power_of_two().max(2));
+        assert_eq!(depth, noid_chain::tx_tree::TX_TREE_DEPTH);
         let rim = zero_subtree_lanes(depth);
         for (j, path) in paths.iter().enumerate() {
             assert_eq!(path.active_depth, depth);
-            // Root = header tx_root; leaf = this tx's body hash.
-            pin_pair_at(b, &header.fields.clone(), hf::TX_ROOT, &path.expected_root);
+            // Every path shares the underlying universal-tree Merkle root.
+            if j > 0 {
+                pin_eq2(b, &path.expected_root, &paths[0].expected_root);
+            }
             pin_eq2(b, &path.leaf, &tx_hashes[j]);
             // Position binding: direction bits are the CONSTANT leaf-index
             // bits (block content never moves a tx to another slot).
@@ -1192,6 +1248,24 @@ pub fn build_block_slots_with_config(
         paths
     };
 
+    if !inputs.tx_root_inputs.is_empty() {
+        let merkle_root = if let Some(region) = tx_root_region_data.as_ref() {
+            region.root_w.clone()
+        } else {
+            tx_root_paths[0].expected_root.clone()
+        };
+        let header_root = [
+            header.fields[hf::TX_ROOT].clone(),
+            header.fields[hf::TX_ROOT + 1].clone(),
+        ];
+        bind_tx_root_count_wrapper(
+            b,
+            &merkle_root,
+            &claim.fields[claim_layout::TX_COUNT],
+            &header_root,
+        );
+    }
+
     crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: tx-root");
     // ---- exact_state component + its statement anchors. Built BEFORE the
     // authorization loop so region mode can thread its region handoff
@@ -1204,21 +1278,23 @@ pub fn build_block_slots_with_config(
     // against the same root (value-neutral), so the statement width is a
     // pure function of the tier and the leaf↔path index pairing (old half
     // `j < t`, new half `j ≥ t`) is preserved.
-    let es_inputs_padded = config.tier_user_tx_capacity.map(|cap| {
-        pad_exact_state_inputs_to_tier(&inputs.exact_state_killshot_inputs[0], cap)
-    });
-    let es_inputs_ref =
-        es_inputs_padded.as_ref().unwrap_or(&inputs.exact_state_killshot_inputs[0]);
+    let es_inputs_padded = config
+        .tier_user_tx_capacity
+        .map(|cap| pad_exact_state_inputs_to_tier(&inputs.exact_state_killshot_inputs[0], cap));
+    let es_inputs_ref = es_inputs_padded
+        .as_ref()
+        .unwrap_or(&inputs.exact_state_killshot_inputs[0]);
     let (exact_state, es_region_data) = build_exact_state_slot_with_config(
         b,
         es_inputs_ref,
         &proof.exact_state[0],
         config.exact_state_region,
     );
-    let parent_log_native = inputs.accepted_claim_hash_inputs[0].fields
-        [parent + hc::LOG_SLOTS]
-        .0;
-    assert!(parent_log_native <= u32::MAX as u128, "parent log_slots off range");
+    let parent_log_native = inputs.accepted_claim_hash_inputs[0].fields[parent + hc::LOG_SLOTS].0;
+    assert!(
+        parent_log_native <= u32::MAX as u128,
+        "parent log_slots off range"
+    );
     let parent_root = [
         claim.fields[parent + hc::STATE_ROOT].clone(),
         claim.fields[parent + hc::STATE_ROOT + 1].clone(),
@@ -1259,10 +1335,7 @@ pub fn build_block_slots_with_config(
     let mut oa_trace_proofs: Vec<OwnerAuthProofTrace> = Vec::new();
     let mut oa_natives = Vec::new();
     let mut oa_native_inputs = Vec::new();
-    // Per-tx owner / live-input counts, summed as INTEGERS after the loop (field
-    // addition would be XOR -- wrong for >1 tx). At tier capacity each term is
-    // GATED by the slot's liveness bit, so ghost slots contribute zero.
-    let mut owner_counts: Vec<LinExpr> = Vec::new();
+    // Per-tx live-input counts, summed as INTEGERS after the loop.
     let mut live_lens: Vec<LinExpr> = Vec::new();
     // Tier capacity: slots [n_real_user, n_auth_slots) are canonical GHOST
     // slots proving the protocol `ghost_authorization()` — same code path as
@@ -1287,11 +1360,10 @@ pub fn build_block_slots_with_config(
             let (proof, public) = ghost_auth.expect("ghost authorization derives");
             (public, proof, i + tx_delta, 1)
         };
-        let one_owner_layout = noid_gkr::OwnerAuthLayout::for_owner_count(1)
-            .expect("the protocol one-owner layout is valid");
         assert_eq!(
-            public_native.layout, one_owner_layout,
-            "block owner-auth component must use the production one-owner layout"
+            public_native.layout,
+            noid_gkr::OwnerAuthLayout::FIXED,
+            "block owner-auth component must use the fixed layout"
         );
         let live_len = alloc_transitional_live_input_count(b, live_input_count);
         if config.owner_auth_region {
@@ -1314,10 +1386,8 @@ pub fn build_block_slots_with_config(
                 pin_eq2(b, &inputs_t.tx_body_hash, &gw);
             }
             if config.tier_user_tx_capacity.is_some() {
-                owner_counts.push(live_bits[i].clone());
                 live_lens.push(mul(b, &live_bits[i], &live_len));
             } else {
-                owner_counts.push(const_block(Block128::from(1u128)));
                 live_lens.push(live_len);
             }
             oa_trace_proofs.push(proof_t);
@@ -1337,7 +1407,6 @@ pub fn build_block_slots_with_config(
                 region_natives.push(witness_proof.pcs.clone());
             }
             pin_eq2(b, &inputs_t.tx_body_hash, &tx_hashes[hash_idx]);
-            owner_counts.push(const_block(Block128::from(1u128)));
             live_lens.push(live_len);
             auth_inputs.push(inputs_t);
         }
@@ -1390,7 +1459,7 @@ pub fn build_block_slots_with_config(
                  obligations (a block-bearing region class always has txs)"
             );
         }
-            if !region_obligations.is_empty() {
+        if !region_obligations.is_empty() {
             // extend (not assign): the owner-auth region path may have already
             // pushed its walk-C opening claims, which must be kept.
             pending_wallet_pcs.extend(discharge_auth_pcs_obligations_via_region(
@@ -1426,16 +1495,16 @@ pub fn build_block_slots_with_config(
         }
     } else {
         let user_tx_count = const_block(Block128::from(totals.user_tx_count as u128));
-        pin_eq(b, &claim.fields[claim_layout::USER_TX_COUNT], &user_tx_count);
+        pin_eq(
+            b,
+            &claim.fields[claim_layout::USER_TX_COUNT],
+            &user_tx_count,
+        );
         let tx_count = const_block(Block128::from(tx_hashes.len() as u128));
         pin_eq(b, &claim.fields[claim_layout::TX_COUNT], &tx_count);
     }
     let live_sum = pin_u64_sum(b, &live_lens);
     pin_eq(b, &claim.fields[claim_layout::LIVE_INPUT_COUNT], &live_sum);
-    let owner_total = alloc_block(b, Block128::from(totals.owner_count_total as u128));
-    let owner_sum = pin_u64_sum(b, &owner_counts);
-    pin_eq(b, &owner_total, &owner_sum);
-
     crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: count sums");
     // ---- accepted-claim batch fold (claim part): shared statement wires,
     // no re-allocation — extend(state_root, block_id, height, claim).
@@ -1537,16 +1606,15 @@ pub fn region_wallet_pcs_native(
     // The capacity view of the block's tx lists (mirror of the real build):
     // real bodies/proofs first, then the protocol ghost slots.
     let n_real_user = inputs.authorization_inputs.len();
-    let n_real_txs = inputs.tx_body_standard_inputs.len();
+    let n_real_txs = inputs.tx_body_inputs.len();
     let tx_delta = n_real_txs.saturating_sub(n_real_user);
     let n_auth_slots = tier_auth_slot_count(tier_user_tx_capacity, n_real_user);
     let cap_txs = tier_user_tx_capacity.map_or(n_real_txs, |c| c + tx_delta);
-    let mut spine_natives: Vec<SpineInputs> = inputs.tx_body_standard_inputs.clone();
-    let mut hash_natives: Vec<[Block128; 2]> = inputs.tx_body_standard_hashes.clone();
+    let mut spine_natives: Vec<SpineInputs> = inputs.tx_body_inputs.clone();
+    let mut hash_natives: Vec<[Block128; 2]> = inputs.tx_body_hashes.clone();
     if cap_txs > n_real_txs {
         let ghost_body = noid_gkr::ghost_tx::ghost_tx_body();
-        let ghost_spine = noid_gkr::spine_statement::spine_inputs_from_body(&ghost_body)
-            .expect("the canonical ghost body has spine inputs");
+        let ghost_spine = noid_gkr::spine_statement::spine_inputs_from_body(&ghost_body);
         let ghost_hash = noid_gkr::ghost_tx::ghost_tx_body_hash();
         for _ in n_real_txs..cap_txs {
             spine_natives.push(ghost_spine.clone());
@@ -1558,7 +1626,9 @@ pub fn region_wallet_pcs_native(
     let scratch_es = exact_state_region.then(|| {
         scratch_exact_state_region_data(
             &mut pb,
-            es_padded.as_ref().unwrap_or(&inputs.exact_state_killshot_inputs[0]),
+            es_padded
+                .as_ref()
+                .unwrap_or(&inputs.exact_state_killshot_inputs[0]),
         )
     });
     let scratch_txr = (tx_root_region && !inputs.tx_root_inputs.is_empty()).then(|| {
@@ -1566,8 +1636,10 @@ pub fn region_wallet_pcs_native(
             // Throwaway wires carrying the same natives: root, capacity
             // tx-hash wires, constant liveness bits.
             let root_native = inputs.tx_root_inputs[0].expected_root;
-            let root_w =
-                [alloc_block(&mut pb, root_native[0]), alloc_block(&mut pb, root_native[1])];
+            let root_w = [
+                alloc_block(&mut pb, root_native[0]),
+                alloc_block(&mut pb, root_native[1]),
+            ];
             let tx_hash_ws: Vec<[LinExpr; 2]> = hash_natives
                 .iter()
                 .map(|h| std::array::from_fn(|i| alloc_block(&mut pb, h[i])))
@@ -1581,7 +1653,7 @@ pub fn region_wallet_pcs_native(
             tx_root_region_capacity_data_from_wires(
                 &mut pb,
                 &inputs.tx_root_inputs,
-                &inputs.tx_body_standard_hashes,
+                &inputs.tx_body_hashes,
                 root_w,
                 &tx_hash_ws,
                 &live,
@@ -1591,7 +1663,7 @@ pub fn region_wallet_pcs_native(
             scratch_tx_root_region_data(&mut pb, &inputs.tx_root_inputs)
         }
     });
-    let scratch_spine = (spine_region && !inputs.tx_body_standard_inputs.is_empty())
+    let scratch_spine = (spine_region && !inputs.tx_body_inputs.is_empty())
         .then(|| scratch_spine_region_data(&mut pb, &spine_natives, &hash_natives));
     // Produce the wallet-PCS obligations + natives the SAME way the real build
     // does for this `owner_auth_region` mode: the capacity view appends the
@@ -1601,10 +1673,11 @@ pub fn region_wallet_pcs_native(
         // Scratch owner-auth region discharge (mirror of the real build): its
         // walk-C opening claims come FIRST in `pending_wallet_pcs`, so prefill
         // their natives before the wallet-PCS claims below.
-        let ghost_auth =
-            (n_auth_slots > n_real_user).then(noid_gkr::ghost_tx::ghost_authorization);
-        let slot_native = |i: usize| -> (&noid_gkr::owner_auth::OwnerAuthPublicInputs,
-                                          &noid_gkr::OwnerAuthProofKillShot) {
+        let ghost_auth = (n_auth_slots > n_real_user).then(noid_gkr::ghost_tx::ghost_authorization);
+        let slot_native = |i: usize| -> (
+            &noid_gkr::owner_auth::OwnerAuthPublicInputs,
+            &noid_gkr::OwnerAuthProofKillShot,
+        ) {
             if i < n_real_user {
                 (
                     &inputs.authorization_inputs[i].public,
@@ -1624,9 +1697,12 @@ pub fn region_wallet_pcs_native(
         let oa_trace_inputs: Vec<OwnerAuthPublicInputsTrace> = (0..n_auth_slots)
             .map(|i| OwnerAuthPublicInputsTrace::alloc(&mut pb, slot_native(i).0))
             .collect();
-        let oa_natives: Vec<_> = (0..n_auth_slots).map(|i| slot_native(i).1.clone()).collect();
-        let oa_native_inputs: Vec<_> =
-            (0..n_auth_slots).map(|i| slot_native(i).0.clone()).collect();
+        let oa_natives: Vec<_> = (0..n_auth_slots)
+            .map(|i| slot_native(i).1.clone())
+            .collect();
+        let oa_native_inputs: Vec<_> = (0..n_auth_slots)
+            .map(|i| slot_native(i).0.clone())
+            .collect();
         let (obligations, oa_claims, recording) = discharge_owner_auth_killshots_via_region(
             &mut pb,
             &oa_trace_proofs,
@@ -1638,8 +1714,9 @@ pub fn region_wallet_pcs_native(
         for c in &oa_claims {
             out.push((c.native_point.clone(), c.native_value));
         }
-        let natives: Vec<_> =
-            (0..n_auth_slots).map(|i| slot_native(i).1.pcs.clone()).collect();
+        let natives: Vec<_> = (0..n_auth_slots)
+            .map(|i| slot_native(i).1.pcs.clone())
+            .collect();
         (obligations, natives)
     } else {
         // Inline per-tx owner-auth obligations.

@@ -273,20 +273,12 @@ pub fn derive_address(secret: &SpendSecret) -> Address {
     Address(s.finalize_no_pad())
 }
 
-/// Shape of the standard tx-body Merkle tree, locked to keep the current AIR
-/// `§TxBodyMerkle` sub-circuit at a fixed depth. Changing these breaks
-/// every downstream component; they are intentionally constants.
-pub const TXBODY_INPUTS: usize = 4;
-pub const TXBODY_OUTPUTS: usize = 8;
-pub const TXBODY_LEAVES: usize = 16;
-pub const TXBODY_DEPTH: usize = 4;
-
-/// Shape of the Sweep25x2 tx-body Merkle tree. This native hash is available
-/// before the proof stack so wallets/consensus can agree on the future layout.
-pub const SWEEP_TXBODY_INPUTS: usize = 25;
-pub const SWEEP_TXBODY_OUTPUTS: usize = 2;
-pub const SWEEP_TXBODY_LEAVES: usize = 32;
-pub const SWEEP_TXBODY_DEPTH: usize = 5;
+/// Internal 59-permutation carrier retained until the flattened Tx8x2 spine
+/// lands. These are carrier payload counts, not transaction capacities.
+pub const TXBODY_CARRIER_INPUTS: usize = 4;
+pub const TXBODY_CARRIER_OUTPUTS: usize = 8;
+pub const TXBODY_CARRIER_LEAVES: usize = 16;
+pub const TXBODY_CARRIER_DEPTH: usize = 4;
 
 /// Per-input leaf of the tx-body Merkle tree. Binds the slot index to
 /// the UTXO being spent. Sponge-mode 4-field absorb under IV `LEAF____`:
@@ -317,34 +309,25 @@ pub fn hash_input_leaf_packed(slot_index: u32, packed_value: Block128, owner: &A
 /// padding-flush — comes from the distinct `TAG_OUTLEAF` capacity IV,
 /// not from shape; the no-pad construction cannot be reached through
 /// the padded API under any tag.
-pub fn hash_output_leaf(slot_index: u32, value: u64, owner: &Address) -> Digest {
+pub fn hash_output_leaf_packed(slot_index: u32, packed_value: Block128, owner: &Address) -> Digest {
     let [owner_hi, owner_lo] = owner.as_fields();
     let mut s = sponge(TAG_OUTLEAF);
-    s.absorb_pair(
-        Block128::from(slot_index as u128),
-        Block128::from(value as u128),
-    );
+    s.absorb_pair(Block128::from(slot_index as u128), packed_value);
     s.absorb_pair(owner_hi, owner_lo);
     s.finalize_no_pad()
 }
 
-/// 32-byte fee leaf: `fee_le_bytes_u128 || [0u8; 16]`.
+/// Output payload convenience wrapper for an ordinary 64-bit amount.
 #[inline]
-pub fn fee_leaf(fee: u128) -> Digest {
-    let mut out = [0u8; 32];
-    out[..16].copy_from_slice(&fee.to_le_bytes());
-    out
+pub fn hash_output_leaf(slot_index: u32, amount: u64, owner: &Address) -> Digest {
+    hash_output_leaf_packed(slot_index, Block128::from(amount as u128), owner)
 }
 
-/// Encode a transaction shape id into a tx-body Merkle leaf.
-///
-/// Used by future non-standard layouts (starting with Sweep25x2) for explicit
-/// cross-shape domain separation. Standard4x8 intentionally does not include
-/// this leaf so its launch hash layout remains byte-for-byte unchanged.
+/// 32-byte fee leaf: `fee_le_bytes_u64 || [0u8; 24]`.
 #[inline]
-pub fn tx_shape_leaf(shape_id: u8) -> Digest {
+pub fn fee_leaf(fee: u64) -> Digest {
     let mut out = [0u8; 32];
-    out[0] = shape_id;
+    out[..8].copy_from_slice(&fee.to_le_bytes());
     out
 }
 
@@ -388,7 +371,7 @@ fn txbody_wrap(root: Digest) -> TxBodyHash {
     TxBodyHash(out)
 }
 
-/// Canonical Standard4x8 transaction-body hash.
+/// Transitional Tx8x2 body-hash carrier.
 ///
 /// Fixed 16-leaf, depth-4 Merkle tree over 32-byte canonical leaves,
 /// reduced with [`compress`](crate::native::compress) and wrapped with
@@ -403,73 +386,34 @@ fn txbody_wrap(root: Digest) -> TxBodyHash {
 /// L15        = validity_leaf(validity_bits)
 /// ```
 ///
-/// Callers (`noid_tx::body_hash::hash_tx_body`) fill padding with the
-/// zero digest for dummy slots so the shape is constant across every
-/// transaction. `validity_bits` commits the per-entry liveness (bit `i`
-/// = input `i` live, bit `TXBODY_INPUTS + j` = output `j` live): the
-/// same body content with different liveness selectors hashes
-/// differently, so balance/action semantics are hash-bound. A zero
-/// bitmap (no live entries — the protocol ghost body) reproduces the
-/// historical zero pad leaf.
-pub fn hash_tx_body(
+/// Logical Tx8x2 records are mapped into these carrier payloads by `noid_tx`;
+/// this function deliberately knows nothing about logical input/output counts.
+pub fn hash_tx_body_carrier(
     epoch_anchor: &Digest,
-    fee: u128,
-    input_leaves: &[Digest; TXBODY_INPUTS],
-    output_leaves: &[Digest; TXBODY_OUTPUTS],
+    fee: u64,
+    input_leaves: &[Digest; TXBODY_CARRIER_INPUTS],
+    output_leaves: &[Digest; TXBODY_CARRIER_OUTPUTS],
     is_coinbase: bool,
-    validity_bits: u128,
+    validity_bits: u16,
 ) -> TxBodyHash {
-    let mut leaves: [Digest; TXBODY_LEAVES] = [[0u8; 32]; TXBODY_LEAVES];
+    let mut leaves: [Digest; TXBODY_CARRIER_LEAVES] = [[0u8; 32]; TXBODY_CARRIER_LEAVES];
     leaves[0] = *epoch_anchor;
     leaves[1] = fee_leaf(fee);
-    leaves[2..2 + TXBODY_INPUTS].copy_from_slice(input_leaves);
-    leaves[2 + TXBODY_INPUTS..2 + TXBODY_INPUTS + TXBODY_OUTPUTS].copy_from_slice(output_leaves);
+    leaves[2..2 + TXBODY_CARRIER_INPUTS].copy_from_slice(input_leaves);
+    leaves[2 + TXBODY_CARRIER_INPUTS..2 + TXBODY_CARRIER_INPUTS + TXBODY_CARRIER_OUTPUTS]
+        .copy_from_slice(output_leaves);
     leaves[14] = is_coinbase_leaf(is_coinbase);
     leaves[15] = validity_leaf(validity_bits);
 
     txbody_wrap(txbody_merkle_root(&leaves))
 }
 
-/// The reserved-leaf validity bitmap: the first 16 bytes carry the packed
-/// liveness bits (LE), the second half stays zero. Bit positions are
-/// shape-relative: input bit `i`, output bit `max_inputs + j`.
-pub fn validity_leaf(bits: u128) -> Digest {
+/// The reserved-leaf Tx8x2 validity bitmap. Bits 0..7 are inputs and bits
+/// 8..9 are outputs; callers reject every high bit before hashing.
+pub fn validity_leaf(bits: u16) -> Digest {
     let mut leaf = [0u8; 32];
-    leaf[..16].copy_from_slice(&bits.to_le_bytes());
+    leaf[..2].copy_from_slice(&bits.to_le_bytes());
     leaf
-}
-
-/// Canonical Sweep25x2 transaction-body hash.
-///
-/// Fixed 32-leaf, depth-5 Merkle tree. Layout:
-///
-/// ```text
-/// L0          = epoch_anchor
-/// L1          = fee_leaf(fee)
-/// L2          = tx_shape_leaf(1)             // Sweep25x2
-/// L3..L27     = input_leaves[0..25]
-/// L28..L29    = output_leaves[0..2]
-/// L30         = is_coinbase_leaf(is_coinbase)
-/// L31         = validity_leaf(validity_bits)
-/// ```
-pub fn hash_tx_body_sweep25x2(
-    epoch_anchor: &Digest,
-    fee: u128,
-    input_leaves: &[Digest; SWEEP_TXBODY_INPUTS],
-    output_leaves: &[Digest; SWEEP_TXBODY_OUTPUTS],
-    is_coinbase: bool,
-    validity_bits: u128,
-) -> TxBodyHash {
-    let mut leaves: [Digest; SWEEP_TXBODY_LEAVES] = [[0u8; 32]; SWEEP_TXBODY_LEAVES];
-    leaves[0] = *epoch_anchor;
-    leaves[1] = fee_leaf(fee);
-    leaves[2] = tx_shape_leaf(1);
-    leaves[3..3 + SWEEP_TXBODY_INPUTS].copy_from_slice(input_leaves);
-    leaves[28..28 + SWEEP_TXBODY_OUTPUTS].copy_from_slice(output_leaves);
-    leaves[30] = is_coinbase_leaf(is_coinbase);
-    leaves[31] = validity_leaf(validity_bits);
-
-    txbody_wrap(txbody_merkle_root(&leaves))
 }
 
 #[cfg(test)]
@@ -483,31 +427,15 @@ mod tests {
         hash_input_leaf_packed(slot_index, Block128::from(value as u128), owner)
     }
 
-    fn pad_inputs(leaves: Vec<Digest>) -> [Digest; TXBODY_INPUTS] {
-        let mut out = [[0u8; 32]; TXBODY_INPUTS];
+    fn pad_inputs(leaves: Vec<Digest>) -> [Digest; TXBODY_CARRIER_INPUTS] {
+        let mut out = [[0u8; 32]; TXBODY_CARRIER_INPUTS];
         for (i, d) in leaves.into_iter().enumerate() {
             out[i] = d;
         }
         out
     }
-    fn pad_outputs(leaves: Vec<Digest>) -> [Digest; TXBODY_OUTPUTS] {
-        let mut out = [[0u8; 32]; TXBODY_OUTPUTS];
-        for (i, d) in leaves.into_iter().enumerate() {
-            out[i] = d;
-        }
-        out
-    }
-
-    fn pad_sweep_inputs(leaves: Vec<Digest>) -> [Digest; SWEEP_TXBODY_INPUTS] {
-        let mut out = [[0u8; 32]; SWEEP_TXBODY_INPUTS];
-        for (i, d) in leaves.into_iter().enumerate() {
-            out[i] = d;
-        }
-        out
-    }
-
-    fn pad_sweep_outputs(leaves: Vec<Digest>) -> [Digest; SWEEP_TXBODY_OUTPUTS] {
-        let mut out = [[0u8; 32]; SWEEP_TXBODY_OUTPUTS];
+    fn pad_outputs(leaves: Vec<Digest>) -> [Digest; TXBODY_CARRIER_OUTPUTS] {
+        let mut out = [[0u8; 32]; TXBODY_CARRIER_OUTPUTS];
         for (i, d) in leaves.into_iter().enumerate() {
             out[i] = d;
         }
@@ -524,8 +452,11 @@ mod tests {
 
         let ins = pad_inputs(vec![zero_creation_input_leaf(5, 100, &addr)]);
         let outs = pad_outputs(vec![c.0]);
-        let tb = hash_tx_body(&[1u8; 32], 3, &ins, &outs, false, 0);
-        assert_eq!(tb, hash_tx_body(&[1u8; 32], 3, &ins, &outs, false, 0));
+        let tb = hash_tx_body_carrier(&[1u8; 32], 3, &ins, &outs, false, 0);
+        assert_eq!(
+            tb,
+            hash_tx_body_carrier(&[1u8; 32], 3, &ins, &outs, false, 0)
+        );
 
         assert_ne!(tb.0, addr.0);
     }
@@ -586,9 +517,9 @@ mod tests {
         let outs_ab = pad_outputs(vec![c2]);
         let outs_ba = pad_outputs(vec![c1]);
 
-        let h_a = hash_tx_body(&[0u8; 32], 10, &ins_ab, &outs_ab, false, 0);
-        let h_b = hash_tx_body(&[0u8; 32], 10, &ins_ba, &outs_ba, false, 0);
-        let h_c = hash_tx_body(&[0u8; 32], 11, &ins_ab, &outs_ab, false, 0);
+        let h_a = hash_tx_body_carrier(&[0u8; 32], 10, &ins_ab, &outs_ab, false, 0);
+        let h_b = hash_tx_body_carrier(&[0u8; 32], 10, &ins_ba, &outs_ba, false, 0);
+        let h_c = hash_tx_body_carrier(&[0u8; 32], 11, &ins_ab, &outs_ab, false, 0);
         assert_ne!(h_a, h_b);
         assert_ne!(h_a, h_c);
     }
@@ -610,10 +541,10 @@ mod tests {
         use crate::native::compress;
 
         let prev = [0xAAu8; 32];
-        let fee = 0x1234_5678u128;
+        let fee = 0x1234_5678u64;
 
         // Fully-empty tx: 16 leaves = [prev, fee_leaf, 14 × zero].
-        let mut leaves: [Digest; TXBODY_LEAVES] = [[0u8; 32]; TXBODY_LEAVES];
+        let mut leaves: [Digest; TXBODY_CARRIER_LEAVES] = [[0u8; 32]; TXBODY_CARRIER_LEAVES];
         leaves[0] = prev;
         leaves[1] = fee_leaf(fee);
 
@@ -628,11 +559,11 @@ mod tests {
         }
         let expected = txbody_wrap(level[0]);
 
-        let got = hash_tx_body(
+        let got = hash_tx_body_carrier(
             &prev,
             fee,
-            &[[0u8; 32]; TXBODY_INPUTS],
-            &[[0u8; 32]; TXBODY_OUTPUTS],
+            &[[0u8; 32]; TXBODY_CARRIER_INPUTS],
+            &[[0u8; 32]; TXBODY_CARRIER_OUTPUTS],
             false,
             0,
         );
@@ -640,84 +571,12 @@ mod tests {
     }
 
     #[test]
-    fn sweep_tx_body_matches_reference_construction() {
-        use crate::native::compress;
-
-        let anchor = [0xBBu8; 32];
-        let fee = 0xCAFE_BABEu128;
-        let addr = Address([3u8; 32]);
-        let mut ins = [[0u8; 32]; SWEEP_TXBODY_INPUTS];
-        for i in 0..SWEEP_TXBODY_INPUTS {
-            ins[i] = zero_creation_input_leaf(i as u32, 100 + i as u64, &addr);
-        }
-        let outs = pad_sweep_outputs(vec![
-            hash_output_leaf(1000, 1200, &addr),
-            hash_output_leaf(1001, 200, &addr),
-        ]);
-
-        let mut leaves: [Digest; SWEEP_TXBODY_LEAVES] = [[0u8; 32]; SWEEP_TXBODY_LEAVES];
-        leaves[0] = anchor;
-        leaves[1] = fee_leaf(fee);
-        leaves[2] = tx_shape_leaf(1);
-        leaves[3..28].copy_from_slice(&ins);
-        leaves[28..30].copy_from_slice(&outs);
-        leaves[30] = is_coinbase_leaf(false);
-
-        let mut level = leaves.to_vec();
-        while level.len() > 1 {
-            let mut next = vec![[0u8; 32]; level.len() / 2];
-            for (i, pair) in level.chunks_exact(2).enumerate() {
-                next[i] = compress(&pair[0], &pair[1]);
-            }
-            level = next;
-        }
-        let expected = txbody_wrap(level[0]);
-        let got = hash_tx_body_sweep25x2(&anchor, fee, &ins, &outs, false, 0);
-        assert_eq!(got.0, expected);
-    }
-
-    #[test]
-    fn sweep_tx_body_is_shape_separated_from_standard() {
-        let addr = Address([4u8; 32]);
-        let standard_ins = pad_inputs(vec![zero_creation_input_leaf(1, 100, &addr)]);
-        let standard_outs = pad_outputs(vec![hash_output_leaf(2, 90, &addr)]);
-        let sweep_ins = pad_sweep_inputs(vec![zero_creation_input_leaf(1, 100, &addr)]);
-        let sweep_outs = pad_sweep_outputs(vec![hash_output_leaf(2, 90, &addr)]);
-        let standard = hash_tx_body(&[0x11; 32], 10, &standard_ins, &standard_outs, false, 0);
-        let sweep = hash_tx_body_sweep25x2(&[0x11; 32], 10, &sweep_ins, &sweep_outs, false, 0);
-        assert_ne!(standard, sweep);
-    }
-
-    #[test]
-    fn sweep_tx_body_sensitive_to_each_edge_slot() {
-        let addr = Address([5u8; 32]);
-        let anchor = [0x22; 32];
-        let mut ins = [[0u8; 32]; SWEEP_TXBODY_INPUTS];
-        for i in 0..SWEEP_TXBODY_INPUTS {
-            ins[i] = zero_creation_input_leaf(i as u32, 10 + i as u64, &addr);
-        }
-        let outs = pad_sweep_outputs(vec![
-            hash_output_leaf(30, 100, &addr),
-            hash_output_leaf(31, 200, &addr),
-        ]);
-        let h = hash_tx_body_sweep25x2(&anchor, 3, &ins, &outs, false, 0);
-        let mut ins2 = ins;
-        ins2[24] = zero_creation_input_leaf(24, 999, &addr);
-        let h2 = hash_tx_body_sweep25x2(&anchor, 3, &ins2, &outs, false, 0);
-        assert_ne!(h, h2);
-        let mut outs2 = outs;
-        outs2[1] = hash_output_leaf(31, 201, &addr);
-        let h3 = hash_tx_body_sweep25x2(&anchor, 3, &ins, &outs2, false, 0);
-        assert_ne!(h, h3);
-    }
-
-    #[test]
     fn tx_body_depth_always_four() {
         // Empty tx, 1-in/1-out, and 4-in/8-out must all produce
         // different but equally deep hashes.
         let a = Address([9u8; 32]);
-        let ins_empty = [[0u8; 32]; TXBODY_INPUTS];
-        let outs_empty = [[0u8; 32]; TXBODY_OUTPUTS];
+        let ins_empty = [[0u8; 32]; TXBODY_CARRIER_INPUTS];
+        let outs_empty = [[0u8; 32]; TXBODY_CARRIER_OUTPUTS];
 
         let mut ins_one = ins_empty;
         ins_one[0] = zero_creation_input_leaf(1, 100, &a);
@@ -725,17 +584,17 @@ mod tests {
         outs_one[0] = hash_output_leaf(0, 50, &a);
 
         let mut ins_full = ins_empty;
-        for i in 0..TXBODY_INPUTS {
+        for i in 0..TXBODY_CARRIER_INPUTS {
             ins_full[i] = zero_creation_input_leaf(i as u32, 10 + i as u64, &a);
         }
         let mut outs_full = outs_empty;
-        for i in 0..TXBODY_OUTPUTS {
+        for i in 0..TXBODY_CARRIER_OUTPUTS {
             outs_full[i] = hash_output_leaf(i as u32, 5 + i as u64, &a);
         }
 
-        let h_empty = hash_tx_body(&[0u8; 32], 0, &ins_empty, &outs_empty, false, 0);
-        let h_one = hash_tx_body(&[0u8; 32], 0, &ins_one, &outs_one, false, 0);
-        let h_full = hash_tx_body(&[0u8; 32], 0, &ins_full, &outs_full, false, 0);
+        let h_empty = hash_tx_body_carrier(&[0u8; 32], 0, &ins_empty, &outs_empty, false, 0);
+        let h_one = hash_tx_body_carrier(&[0u8; 32], 0, &ins_one, &outs_one, false, 0);
+        let h_full = hash_tx_body_carrier(&[0u8; 32], 0, &ins_full, &outs_full, false, 0);
         assert_ne!(h_empty, h_one);
         assert_ne!(h_empty, h_full);
         assert_ne!(h_one, h_full);
@@ -746,10 +605,10 @@ mod tests {
         // Body hash must be sensitive to the is_coinbase flag;
         // the L14 leaf separates the coinbase branch from regular txs.
         let prev = [0u8; 32];
-        let ins = [[0u8; 32]; TXBODY_INPUTS];
-        let outs = [[0u8; 32]; TXBODY_OUTPUTS];
-        let h_regular = hash_tx_body(&prev, 0, &ins, &outs, false, 0);
-        let h_coinbase = hash_tx_body(&prev, 0, &ins, &outs, true, 0);
+        let ins = [[0u8; 32]; TXBODY_CARRIER_INPUTS];
+        let outs = [[0u8; 32]; TXBODY_CARRIER_OUTPUTS];
+        let h_regular = hash_tx_body_carrier(&prev, 0, &ins, &outs, false, 0);
+        let h_coinbase = hash_tx_body_carrier(&prev, 0, &ins, &outs, true, 0);
         assert_ne!(h_regular, h_coinbase);
     }
 

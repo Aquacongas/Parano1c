@@ -108,7 +108,7 @@ pub struct WalletState {
     pub active_snapshot: Option<ActiveWalletSnapshot>,
     /// Transaction history (most recent last).
     pub history: Vec<TxHistoryEntry>,
-    /// Cached receipts: tx_body_hash → bincode-serialized ParanoidReceipt bytes.
+    /// Cached receipts: txid → bincode-serialized ParanoidReceipt bytes.
     /// Generated automatically when a block is applied, before pruning.
     pub receipts: HashMap<[u8; 32], Vec<u8>>,
     /// Output slots claimed by pending (submitted but not yet confirmed) txs.
@@ -295,7 +295,7 @@ impl WalletState {
         Ok(())
     }
 
-    /// Get a cached receipt by tx_body_hash.
+    /// Get a cached receipt by txid.
     pub fn get_receipt(&self, tx_hash: &[u8; 32]) -> Option<&Vec<u8>> {
         self.receipts.get(tx_hash)
     }
@@ -373,6 +373,13 @@ impl WalletState {
         }
     }
 
+    /// Release input slots reserved immediately before mempool admission.
+    pub fn remove_pending_inputs(&mut self, slot_indices: &[u32]) {
+        for slot in slot_indices {
+            self.pending_input_slots.remove(slot);
+        }
+    }
+
     /// Simple largest-first coin selection.
     /// Returns `(selected UTXOs, change_amount)` or `None` if insufficient funds.
     ///
@@ -382,7 +389,7 @@ impl WalletState {
     /// block confirmation. Without this filter the second send hits a
     /// `SlotConflict` error in the mempool even though the wallet has balance.
     pub fn select_utxos(&self, target: u64, fee: u64) -> Option<(Vec<&WalletUtxo>, u64)> {
-        let needed = target.saturating_add(fee);
+        let needed = target.checked_add(fee)?;
         // `utxos` contains the active owner only. Filter out outputs already
         // being spent by a pending transaction.
         let mut available: Vec<&WalletUtxo> = self
@@ -390,13 +397,22 @@ impl WalletState {
             .values()
             .filter(|u| !self.pending_input_slots.contains(&u.slot_index))
             .collect();
-        available.sort_by_key(|u| std::cmp::Reverse(u.value));
+        // Value-first selection minimizes input count. Equal-value candidates
+        // are ordered by state segment and slot so every caller produces the
+        // same touched-segment set and stable proof workload.
+        available.sort_by_key(|u| {
+            (
+                std::cmp::Reverse(u.value),
+                u.slot_index >> noid_chain::consensus::params::LOG_SEGMENT_SIZE,
+                u.slot_index,
+            )
+        });
 
         let mut selected = Vec::new();
         let mut total = 0u64;
-        for utxo in available {
+        for utxo in available.into_iter().take(noid_tx::TX_INPUTS) {
             selected.push(utxo);
-            total = total.saturating_add(utxo.value);
+            total = total.checked_add(utxo.value)?;
             if total >= needed {
                 return Some((selected, total - needed));
             }

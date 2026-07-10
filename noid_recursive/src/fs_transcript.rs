@@ -56,8 +56,9 @@ pub struct FiatShamirTranscriptBatchProofKillShot {
 
 impl FiatShamirTranscriptBatchProofKillShot {
     pub fn byte_len(&self) -> usize {
-        let main_polys =
-            self.kill_shot.main.round_polys.len() * noid_gkr::block_spine::BLOCK_SPINE_ROUND_DEGREE * 16;
+        let main_polys = self.kill_shot.main.round_polys.len()
+            * noid_gkr::block_spine::BLOCK_SPINE_ROUND_DEGREE
+            * 16;
         let shift_polys = self.kill_shot.shift.round_polys.len()
             * noid_gkr::block_spine::BLOCK_SPINE_SHIFT_DEGREE
             * 16;
@@ -74,8 +75,9 @@ impl FiatShamirTranscriptBatchProofKillShot {
 
 impl FiatShamirTranscriptProofKillShot {
     pub fn byte_len(&self) -> usize {
-        let main_polys =
-            self.kill_shot.main.round_polys.len() * noid_gkr::block_spine::BLOCK_SPINE_ROUND_DEGREE * 16;
+        let main_polys = self.kill_shot.main.round_polys.len()
+            * noid_gkr::block_spine::BLOCK_SPINE_ROUND_DEGREE
+            * 16;
         let shift_polys = self.kill_shot.shift.round_polys.len()
             * noid_gkr::block_spine::BLOCK_SPINE_SHIFT_DEGREE
             * 16;
@@ -812,7 +814,9 @@ mod tests {
     use noid_gkr::OwnerAuthWitness;
     use noid_poseidon2b::channel::Poseidon2bChannel;
     use noid_poseidon2b::primitives::{derive_address, Address, SpendSecret};
-    use noid_tx::{hash_tx_body_for_shape, Transaction, TxBody, TxInput, TxOutput, TxShape};
+    use noid_tx::{
+        output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS,
+    };
 
     fn synthetic_trace() -> Vec<FiatShamirTraceOp> {
         let mut ch = Poseidon2bChannel::new();
@@ -835,35 +839,28 @@ mod tests {
     fn auth_trace() -> Vec<FiatShamirTraceOp> {
         let secret = SpendSecret([0x73; 32]);
         let owner = derive_address(&secret);
+        let mut inputs = [TxInput::dummy(); TX_INPUTS];
+        inputs[0] = TxInput {
+            slot_index: 7,
+            amount: 100,
+            creation_id: 0,
+        };
+        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        outputs[0] = TxOutput {
+            slot_index: 1007,
+            amount: 97,
+            owner: Address([0x11; 32]),
+        };
         let body = TxBody {
-            shape: TxShape::Standard4x8,
             epoch_anchor: [0xA5; 32],
             fee: 3,
-            inputs: vec![TxInput {
-                slot_index: 7,
-                value: 100,
-                creation_id: 0,
-                owner,
-                spend_secret: secret.clone(),
-                valid: true,
-            }],
-            outputs: vec![TxOutput {
-                slot_index: 1007,
-                value: 97,
-                owner: Address([0x11; 32]),
-                valid: true,
-            }],
+            input_owner: owner,
+            inputs,
+            outputs,
+            validity_bitmap: 1 | output_bitmap_bit(0),
             is_coinbase: false,
         };
-        let tx_body_hash = hash_tx_body_for_shape(
-            body.shape,
-            &body.epoch_anchor,
-            body.fee,
-            &body.inputs,
-            &body.outputs,
-            body.is_coinbase,
-        );
-        let tx = Transaction { body, tx_body_hash };
+        let tx = Transaction::new(body);
         let proof = noid_gkr::prove_wallet_authorization(&tx.body, OwnerAuthWitness::new(secret))
             .expect("wallet auth")
             .proof;

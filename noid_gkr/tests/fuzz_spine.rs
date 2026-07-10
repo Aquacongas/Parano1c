@@ -8,7 +8,7 @@
 //! input leaves (slot/value/owner), 8 output leaves (slot/value/owner).
 //! The GKR oracle re-executes the 59-slot spine via the native
 //! Poseidon2b implementation; we assert byte-equality against
-//! `primitives::hash_tx_body`. Any drift between the two paths shows
+//! `primitives::hash_tx_body_carrier`. Any drift between the two paths shows
 //! up as a mismatched digest.
 //!
 //! Default iteration count is 1024 to keep `cargo test` under a
@@ -22,8 +22,9 @@ use noid_core::Block128;
 use noid_gkr::circuit::{SpineCircuit, SpineInputs};
 use noid_gkr::oracle::evaluate_spine;
 use noid_poseidon2b::primitives::{
-    derive_address, fee_leaf, hash_input_leaf_packed, hash_output_leaf, hash_tx_body,
-    is_coinbase_leaf, Address, Digest, SpendSecret, TxBodyHash, TXBODY_INPUTS, TXBODY_OUTPUTS,
+    derive_address, fee_leaf, hash_input_leaf_packed, hash_output_leaf, hash_tx_body_carrier,
+    is_coinbase_leaf, Address, Digest, SpendSecret, TxBodyHash, TXBODY_CARRIER_INPUTS,
+    TXBODY_CARRIER_OUTPUTS,
 };
 use rand::rngs::StdRng;
 use rand::{Rng, RngCore, SeedableRng};
@@ -79,33 +80,33 @@ fn gkr_oracle_matches_native_over_random_fixtures() {
 
     for i in 0..n {
         let prev = rand_digest(&mut rng);
-        let fee: u128 = rng.gen();
+        let fee: u64 = rng.gen();
         let is_coinbase: bool = rng.gen();
 
         let owners: Vec<Address> = (0..8)
             .map(|_| derive_address(&rand_secret(&mut rng)))
             .collect();
 
-        let mut in_slots = [0u32; TXBODY_INPUTS];
-        let mut in_values = [0u64; TXBODY_INPUTS];
-        let mut out_slots = [0u32; TXBODY_OUTPUTS];
-        let mut out_values = [0u64; TXBODY_OUTPUTS];
-        for k in 0..TXBODY_INPUTS {
+        let mut in_slots = [0u32; TXBODY_CARRIER_INPUTS];
+        let mut in_values = [0u64; TXBODY_CARRIER_INPUTS];
+        let mut out_slots = [0u32; TXBODY_CARRIER_OUTPUTS];
+        let mut out_values = [0u64; TXBODY_CARRIER_OUTPUTS];
+        for k in 0..TXBODY_CARRIER_INPUTS {
             in_slots[k] = rng.gen();
             in_values[k] = rng.gen();
         }
-        for k in 0..TXBODY_OUTPUTS {
+        for k in 0..TXBODY_CARRIER_OUTPUTS {
             out_slots[k] = rng.gen();
             out_values[k] = rng.gen();
         }
 
-        let input_leaves_payload: [[Block128; 4]; TXBODY_INPUTS] = [
+        let input_leaves_payload: [[Block128; 4]; TXBODY_CARRIER_INPUTS] = [
             payload_lanes(in_slots[0], in_values[0], &owners[0]),
             payload_lanes(in_slots[1], in_values[1], &owners[1]),
             payload_lanes(in_slots[2], in_values[2], &owners[2]),
             payload_lanes(in_slots[3], in_values[3], &owners[3]),
         ];
-        let output_leaves_payload: [[Block128; 4]; TXBODY_OUTPUTS] = [
+        let output_leaves_payload: [[Block128; 4]; TXBODY_CARRIER_OUTPUTS] = [
             payload_lanes(out_slots[0], out_values[0], &owners[0]),
             payload_lanes(out_slots[1], out_values[1], &owners[1]),
             payload_lanes(out_slots[2], out_values[2], &owners[2]),
@@ -116,7 +117,7 @@ fn gkr_oracle_matches_native_over_random_fixtures() {
             payload_lanes(out_slots[7], out_values[7], &owners[7]),
         ];
 
-        let ins_d: [Digest; TXBODY_INPUTS] = [
+        let ins_d: [Digest; TXBODY_CARRIER_INPUTS] = [
             hash_input_leaf_packed(
                 in_slots[0],
                 Block128::from(in_values[0] as u128),
@@ -138,7 +139,7 @@ fn gkr_oracle_matches_native_over_random_fixtures() {
                 &owners[3],
             ),
         ];
-        let outs_d: [Digest; TXBODY_OUTPUTS] = [
+        let outs_d: [Digest; TXBODY_CARRIER_OUTPUTS] = [
             hash_output_leaf(out_slots[0], out_values[0], &owners[0]),
             hash_output_leaf(out_slots[1], out_values[1], &owners[1]),
             hash_output_leaf(out_slots[2], out_values[2], &owners[2]),
@@ -149,7 +150,7 @@ fn gkr_oracle_matches_native_over_random_fixtures() {
             hash_output_leaf(out_slots[7], out_values[7], &owners[7]),
         ];
 
-        let native: TxBodyHash = hash_tx_body(&prev, fee, &ins_d, &outs_d, is_coinbase, 0);
+        let native: TxBodyHash = hash_tx_body_carrier(&prev, fee, &ins_d, &outs_d, is_coinbase, 0);
 
         let inputs = SpineInputs {
             epoch_anchor: digest_to_fields(&prev),

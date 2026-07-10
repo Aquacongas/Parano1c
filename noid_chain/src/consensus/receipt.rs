@@ -16,12 +16,12 @@
 //! **Header lookup** (online): `getHeaderByHeight(claimed_height)` → check `tx_root`.
 //! **Chain cert verify** (offline): `verify_tip(chain_cert, ...)` with embedded proof.
 
-use noid_poseidon2b::native::{compress, poseidon2b_hash_bytes};
-
 use crate::block_header::BlockHeader;
+use crate::tx_tree;
 use noid_poseidon2b::primitives::Address;
+use noid_tx::TxBody;
 
-const RECEIPT_SUMMARY_HASH_DOMAIN: &[u8] = b"NOID_RECEIPT_SUMMARY";
+const RECEIPT_CONSTRUCTION_MARKER: u8 = 0x01;
 
 /// Compact summary of a transaction (public on-chain data only).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -37,20 +37,19 @@ pub struct TxSummary {
 /// Cryptographic proof that a transaction is in the canonical chain.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ParanoidReceipt {
-    pub version: u8,
-    pub tx_body_hash: [u8; 32],
-    /// Sibling hashes along the Merkle path (leaf → root), length ≤ 8 for 256 txs.
-    pub merkle_path: Vec<[u8; 32]>,
-    /// Bitmask: bit k = 1 means the sibling at level k is on the LEFT.
-    /// (equivalently: the current node at level k is a RIGHT child.)
-    /// Stored separately to avoid corrupting hash bytes (common pitfall).
-    pub merkle_dirs: u32,
+    /// Fixed construction marker. This is not a negotiable protocol version.
+    pub construction_marker: u8,
+    /// Canonical authenticated Tx8x2 body bytes. Its derived txid is the leaf.
+    pub tx_body: Vec<u8>,
+    /// Logical position in the universal namespace. Directions derive from it.
+    pub tx_index: u16,
+    /// Real block transaction count, including the mandatory coinbase.
+    pub tx_count: u16,
+    /// Sibling hashes along the Merkle path (leaf → root), always depth 8.
+    pub merkle_path: [[u8; 32]; tx_tree::TX_TREE_DEPTH],
     pub claimed_root: [u8; 32],
     pub claimed_height: u64,
     pub summary: TxSummary,
-    /// Poseidon2b(bincode(summary)). Prevents forging payment data (amounts, addresses)
-    /// while keeping the Merkle proof valid — summary is not in the Merkle tree.
-    pub summary_hash: [u8; 32],
     pub chain_cert: Option<Vec<u8>>,
 }
 
@@ -82,25 +81,43 @@ impl ReceiptVerifyResult {
 /// Generate a receipt for a confirmed transaction.
 pub fn generate_receipt(
     header: &BlockHeader,
-    tx_body_hash: [u8; 32],
+    tx_body: &TxBody,
     tx_index: usize,
     block_tx_hashes: &[[u8; 32]],
-    summary: TxSummary,
     chain_cert: Option<Vec<u8>>,
 ) -> ParanoidReceipt {
-    let (merkle_path, merkle_dirs) = build_merkle_path(block_tx_hashes, tx_index);
-    let summary_bytes = bincode::serialize(&summary).expect("TxSummary bincode");
-    let summary_hash = poseidon2b_hash_bytes(RECEIPT_SUMMARY_HASH_DOMAIN, &summary_bytes);
+    let tx_body_hash = tx_body.txid().0;
+    assert_eq!(block_tx_hashes.get(tx_index), Some(&tx_body_hash));
+    let merkle_path = tx_tree::path_from_hashes(block_tx_hashes, tx_index);
+    let summary = summary_from_body(tx_body, header.height, header.timestamp);
     ParanoidReceipt {
-        version: 1,
-        tx_body_hash,
+        construction_marker: RECEIPT_CONSTRUCTION_MARKER,
+        tx_body: tx_body.to_bytes().to_vec(),
+        tx_index: tx_index as u16,
+        tx_count: block_tx_hashes.len() as u16,
         merkle_path,
-        merkle_dirs,
         claimed_root: header.tx_root,
         claimed_height: header.height,
         summary,
-        summary_hash,
         chain_cert,
+    }
+}
+
+/// Derive every payment-relevant summary field from the authenticated body.
+pub fn summary_from_body(body: &TxBody, confirmed_height: u64, confirmed_unix: u64) -> TxSummary {
+    TxSummary {
+        tx_body_hash: body.txid().0,
+        inputs: body
+            .live_inputs()
+            .map(|(_, input)| (input.slot_index, body.input_owner))
+            .collect(),
+        outputs: body
+            .live_outputs()
+            .map(|(_, output)| (output.slot_index, output.amount, output.owner))
+            .collect(),
+        fee_micronoid: body.fee,
+        confirmed_height,
+        confirmed_unix,
     }
 }
 
@@ -111,93 +128,78 @@ pub fn generate_receipt(
 ///
 /// Uses Poseidon2b COMPRESS to match `compute_tx_root` in `noid_chain::block`.
 pub fn verify_merkle_inclusion(receipt: &ParanoidReceipt) -> bool {
-    // 1. TxSummary integrity: Poseidon2b(bincode(summary)) must match.
-    let summary_bytes = bincode::serialize(&receipt.summary).expect("TxSummary bincode");
-    if poseidon2b_hash_bytes(RECEIPT_SUMMARY_HASH_DOMAIN, &summary_bytes) != receipt.summary_hash {
+    if receipt.construction_marker != RECEIPT_CONSTRUCTION_MARKER {
+        return false;
+    }
+    let Ok(body) = TxBody::from_bytes(&receipt.tx_body) else {
+        return false;
+    };
+    let expected_summary = summary_from_body(
+        &body,
+        receipt.claimed_height,
+        receipt.summary.confirmed_unix,
+    );
+    if receipt.summary != expected_summary {
         return false;
     }
 
-    // 2. Merkle path: tx_body_hash → claimed_root.
-    let mut current = receipt.tx_body_hash;
-    for (level, sibling) in receipt.merkle_path.iter().enumerate() {
-        let sibling_on_left = (receipt.merkle_dirs >> level) & 1 == 1;
-        current = if sibling_on_left {
-            compress(sibling, &current)
-        } else {
-            compress(&current, sibling)
-        };
-    }
-    current == receipt.claimed_root
+    // Fixed-depth Merkle path plus the header's real-count wrapper.
+    tx_tree::verify_path(
+        body.txid().0,
+        &receipt.merkle_path,
+        usize::from(receipt.tx_index),
+        usize::from(receipt.tx_count),
+        receipt.claimed_root,
+    )
 }
 
 /// Verify receipt against a canonical header (online step).
 pub fn verify_against_header(receipt: &ParanoidReceipt, canonical_header: &BlockHeader) -> bool {
     canonical_header.height == receipt.claimed_height
         && canonical_header.tx_root == receipt.claimed_root
-}
-
-/// Build a Poseidon2b COMPRESS Merkle inclusion path.
-///
-/// Must match `compute_tx_root` in `noid_chain::block` exactly:
-/// - Pads to `next_power_of_two().max(2)` (at least 2 leaves).
-/// - Uses `compress(left, right)` (Poseidon2b) at each level.
-///
-/// Returns `(siblings, dirs_bitmask)` where bit k of `dirs_bitmask` is 1 iff
-/// the sibling at level k is on the left side.
-fn build_merkle_path(tx_hashes: &[[u8; 32]], tx_index: usize) -> (Vec<[u8; 32]>, u32) {
-    if tx_hashes.is_empty() {
-        return (vec![], 0);
-    }
-    // Match compute_tx_root: always pad to at least 2 leaves.
-    let n = tx_hashes.len().next_power_of_two().max(2);
-    let mut layer: Vec<[u8; 32]> = tx_hashes.to_vec();
-    layer.resize(n, [0u8; 32]);
-
-    let mut path = Vec::new();
-    let mut dirs: u32 = 0;
-    let mut idx = tx_index;
-    let mut level = 0u32;
-
-    while layer.len() > 1 {
-        let sibling_idx = idx ^ 1;
-        path.push(layer[sibling_idx]);
-        // If idx is ODD, sibling is to the LEFT (even index = left child).
-        if idx % 2 == 1 {
-            dirs |= 1 << level;
-        }
-        // Build next layer using Poseidon2b COMPRESS (same as compute_tx_root).
-        let next: Vec<[u8; 32]> = layer
-            .chunks(2)
-            .map(|pair| compress(&pair[0], &pair[1]))
-            .collect();
-        idx /= 2;
-        layer = next;
-        level += 1;
-    }
-    (path, dirs)
+        && canonical_header.timestamp == receipt.summary.confirmed_unix
 }
 
 /// Compute the tx_root from a list of tx_body_hashes.
 /// Mirrors `compute_tx_root` in `noid_chain::block`.
 pub fn tx_root(tx_hashes: &[[u8; 32]]) -> [u8; 32] {
-    if tx_hashes.is_empty() {
-        return [0u8; 32];
-    }
-    let n = tx_hashes.len().next_power_of_two().max(2);
-    let mut layer: Vec<[u8; 32]> = tx_hashes.to_vec();
-    layer.resize(n, [0u8; 32]);
-    while layer.len() > 1 {
-        layer = layer.chunks(2).map(|p| compress(&p[0], &p[1])).collect();
-    }
-    layer[0]
+    tx_tree::root_from_hashes(tx_hashes)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::consensus::params::GENESIS_TARGET;
+    use noid_tx::{output_bitmap_bit, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS};
 
-    fn dummy_header(height: u64, root: [u8; 32]) -> BlockHeader {
+    fn body(index: u16) -> TxBody {
+        let mut inputs = [TxInput::dummy(); TX_INPUTS];
+        inputs[0] = TxInput {
+            slot_index: u32::from(index) + 1,
+            amount: u64::from(index) + 10,
+            creation_id: 1,
+        };
+        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        outputs[0] = TxOutput {
+            slot_index: u32::from(index) + 1_000,
+            amount: u64::from(index) + 9,
+            owner: Address([2u8; 32]),
+        };
+        let mut anchor = [0u8; 32];
+        anchor[..2].copy_from_slice(&index.to_le_bytes());
+        anchor[2] = 1;
+        TxBody {
+            epoch_anchor: anchor,
+            fee: 1,
+            input_owner: Address([1u8; 32]),
+            inputs,
+            outputs,
+            validity_bitmap: 1 | output_bitmap_bit(0),
+            is_coinbase: false,
+        }
+    }
+
+    fn header(height: u64, root: [u8; 32]) -> BlockHeader {
         BlockHeader {
             prev_block_hash: [0u8; 32],
             state_root: [0u8; 32],
@@ -213,125 +215,57 @@ mod tests {
         }
     }
 
-    fn dummy_summary(hash: [u8; 32], height: u64) -> TxSummary {
-        TxSummary {
-            tx_body_hash: hash,
-            inputs: vec![],
-            outputs: vec![],
-            fee_micronoid: 1_000_000,
-            confirmed_height: height,
-            confirmed_unix: 1_700_000_000,
-        }
-    }
-
     #[test]
-    fn single_tx() {
-        let tx = [42u8; 32];
-        let root = tx_root(&[tx]);
-        let header = dummy_header(1, root);
-        let receipt = generate_receipt(&header, tx, 0, &[tx], dummy_summary(tx, 1), None);
-        assert!(verify_merkle_inclusion(&receipt));
-        assert!(verify_against_header(&receipt, &header));
-    }
-
-    #[test]
-    fn all_positions_in_8_tx_block() {
-        let hashes: Vec<[u8; 32]> = (0u8..8).map(|i| [i; 32]).collect();
-        let root = tx_root(&hashes);
-        let header = dummy_header(10, root);
-        for (i, &tx) in hashes.iter().enumerate() {
-            let r = generate_receipt(&header, tx, i, &hashes, dummy_summary(tx, 10), None);
-            assert!(verify_merkle_inclusion(&r), "failed at idx={i}");
-            assert!(verify_against_header(&r, &header));
-        }
-    }
-
-    #[test]
-    fn all_positions_in_1024_tx_block() {
-        let hashes: Vec<[u8; 32]> = (0u16..1024)
-            .map(|i| {
-                let mut h = [0u8; 32];
-                h[0] = (i & 0xFF) as u8;
-                h[1] = (i >> 8) as u8;
-                h
-            })
-            .collect();
-        let root = tx_root(&hashes);
-        let header = dummy_header(100, root);
-        for &idx in &[0usize, 1, 255, 512, 1023] {
-            let r = generate_receipt(
-                &header,
-                hashes[idx],
-                idx,
-                &hashes,
-                dummy_summary(hashes[idx], 100),
-                None,
+    fn all_256_positions_have_authenticated_fixed_paths() {
+        let bodies: Vec<_> = (0..256).map(body).collect();
+        let hashes: Vec<_> = bodies.iter().map(|body| body.txid().0).collect();
+        let header = header(10, tx_root(&hashes));
+        for (index, body) in bodies.iter().enumerate() {
+            let receipt = generate_receipt(&header, body, index, &hashes, None);
+            assert_eq!(receipt.merkle_path.len(), 8);
+            assert!(verify_merkle_inclusion(&receipt), "index {index}");
+            assert!(verify_against_header(&receipt, &header));
+            assert_eq!(
+                ParanoidReceipt::from_bytes(&receipt.to_bytes())
+                    .unwrap()
+                    .tx_body,
+                receipt.tx_body
             );
-            assert!(verify_merkle_inclusion(&r), "failed at idx={idx}");
         }
     }
 
     #[test]
-    fn tampered_hash_fails() {
-        let hashes: Vec<[u8; 32]> = (0u8..4).map(|i| [i; 32]).collect();
-        let root = tx_root(&hashes);
-        let header = dummy_header(5, root);
-        let mut r = generate_receipt(
-            &header,
-            hashes[0],
-            0,
-            &hashes,
-            dummy_summary(hashes[0], 5),
-            None,
-        );
-        r.tx_body_hash = [0xFF; 32];
-        assert!(!verify_merkle_inclusion(&r));
+    fn body_summary_count_index_and_header_tamper_fail() {
+        let bodies = [body(1), body(2), body(3)];
+        let hashes: Vec<_> = bodies.iter().map(|body| body.txid().0).collect();
+        let header = header(5, tx_root(&hashes));
+        let receipt = generate_receipt(&header, &bodies[1], 1, &hashes, None);
+
+        let mut bad = receipt.clone();
+        bad.tx_body[80] ^= 1;
+        assert!(!verify_merkle_inclusion(&bad));
+
+        let mut bad = receipt.clone();
+        bad.summary.outputs[0].1 += 1;
+        assert!(!verify_merkle_inclusion(&bad));
+
+        let mut bad = receipt.clone();
+        bad.tx_count = 2;
+        assert!(!verify_merkle_inclusion(&bad));
+
+        let mut bad = receipt.clone();
+        bad.tx_index = 2;
+        assert!(!verify_merkle_inclusion(&bad));
+
+        let mut other_header = header;
+        other_header.timestamp += 1;
+        assert!(!verify_against_header(&receipt, &other_header));
     }
 
     #[test]
-    fn reorg_detected() {
-        let hashes = vec![[1u8; 32]];
-        let root = tx_root(&hashes);
-        let header = dummy_header(50, root);
-        let r = generate_receipt(
-            &header,
-            hashes[0],
-            0,
-            &hashes,
-            dummy_summary(hashes[0], 50),
-            None,
-        );
-        let reorged = dummy_header(50, [0xDE; 32]);
-        assert!(verify_merkle_inclusion(&r));
-        assert!(!verify_against_header(&r, &reorged));
-    }
-
-    #[test]
-    fn tx_root_empty() {
+    fn real_count_is_bound_even_with_zero_suffix() {
+        let hashes = [body(1).txid().0, body(2).txid().0];
+        assert_ne!(tx_root(&hashes[..1]), tx_root(&hashes));
         assert_eq!(tx_root(&[]), [0u8; 32]);
-    }
-
-    #[test]
-    fn tx_root_order_matters() {
-        let a = [[1u8; 32], [2u8; 32]];
-        let b = [[2u8; 32], [1u8; 32]];
-        assert_ne!(tx_root(&a), tx_root(&b));
-    }
-
-    #[test]
-    fn direction_encoding_does_not_corrupt_hashes() {
-        // Ensure siblings in path are unmodified (no high-bit tampering).
-        let hashes: Vec<[u8; 32]> = (0u8..4).map(|i| [i; 32]).collect();
-        let root = tx_root(&hashes);
-        let header = dummy_header(1, root);
-        for (i, &tx) in hashes.iter().enumerate() {
-            let r = generate_receipt(&header, tx, i, &hashes, dummy_summary(tx, 1), None);
-            // Direction stored in dirs, not in path bytes.
-            for _sibling in &r.merkle_path {
-                // The sibling is an actual Poseidon2b digest or zero — never modified.
-                // Just verify inclusion works correctly for all positions.
-            }
-            assert!(verify_merkle_inclusion(&r));
-        }
     }
 }

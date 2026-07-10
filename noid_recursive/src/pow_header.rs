@@ -11,7 +11,7 @@ use noid_chain::block_header::BlockHeader;
 use noid_chain::consensus::difficulty::le256_lt;
 use noid_chain::consensus::difficulty::{add_work, block_work, next_target};
 use noid_chain::consensus::expected_child_log_slots;
-use noid_chain::consensus::header::epoch_anchor_height;
+use noid_chain::consensus::header::asert_anchor_height;
 use noid_chain::consensus::params::{EXPANSION_WINDOW, MEDIAN_TIME_BLOCKS};
 use noid_chain::consensus::pow::{
     poseidon_pow_digest, pow_header_fields, validate_pow, PowHeaderFields,
@@ -303,7 +303,7 @@ fn verify_pow_header_batch_inner(
         state.push_timestamp(header.timestamp);
         state.push_active_count(header.active_slot_count);
 
-        if epoch_anchor_height(header.height) == header.height {
+        if asert_anchor_height(header.height) == header.height {
             state.asert_anchor_height = header.height;
             state.asert_anchor_timestamp = header.timestamp;
             state.asert_anchor_target = header.difficulty_target;

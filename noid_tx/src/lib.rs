@@ -12,25 +12,24 @@ pub mod body_hash;
 pub mod claims;
 pub mod intent;
 pub mod owner_auth;
-pub mod public;
 pub mod public_logic;
 pub mod types;
 pub mod wire;
 
-pub use body_hash::{hash_tx_body, hash_tx_body_for_shape, validity_bits_for_shape};
+pub use body_hash::hash_tx_body;
 pub use claims::compute_claims_commitment;
-pub use intent::TxIntent;
+pub use intent::{
+    TxIntent, MAX_TX_AUTHORIZATION_BYTES, MAX_TX_INTENT_BYTES, TX_INTENT_FIXED_OVERHEAD,
+    TX_INTENT_MARKER,
+};
 pub use owner_auth::{canonical_owner_auth, CanonicalOwnerAuth, OwnerAuthError};
-pub use public::{PublicInputs, MAX_LOG_SLOTS, MIN_LOG_SLOTS};
 pub use public_logic::{
-    validate_body_semantics_no_hash, validate_public_tx_logic, PublicLogicError,
-    PublicLogicFacts,
+    validate_body_semantics_no_hash, validate_public_tx_logic, PublicLogicError, PublicLogicFacts,
 };
 pub use types::{
-    pack_amount_creation_id, unpack_amount_creation_id, Transaction, TxBody, TxInput, TxOutput,
-    TxShape, ANCHOR_DEPTH, MAX_INPUTS, MAX_OUTPUTS,
+    output_bitmap_bit, pack_amount_creation_id, unpack_amount_creation_id, Transaction, TxBody,
+    TxInput, TxOutput, TX_ACTIONS, TX_EPOCH_BLOCKS, TX_INPUTS, TX_OUTPUTS, TX_VALIDITY_MASK,
 };
 pub use wire::{
-    WireError, PUBLIC_INPUTS_WIRE_SIZE, TX_INPUT_PUBLIC_WIRE_SIZE, TX_INPUT_WIRE_SIZE,
-    TX_OUTPUT_WIRE_SIZE,
+    WireError, TRANSACTION_WIRE_SIZE, TX_BODY_WIRE_SIZE, TX_INPUT_WIRE_SIZE, TX_OUTPUT_WIRE_SIZE,
 };

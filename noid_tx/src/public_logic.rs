@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Exact public transaction predicate for wallet-originated transactions.
-//!
-//! Wallets do not transmit a public-arithmetic proof. Mempool and block
-//! validation deterministically rebuild these facts from `TxBody`, while the
-//! authorization proof handles ownership.
+//! Shared native semantics for the sole Tx8x2 body.
 
-use noid_poseidon2b::primitives::TxBodyHash;
+use std::collections::HashSet;
 
-use crate::{hash_tx_body_for_shape, TxBody, TxShape};
+use noid_poseidon2b::primitives::{Address, TxBodyHash};
+
+use crate::{output_bitmap_bit, TxBody, TX_INPUTS, TX_OUTPUTS, TX_VALIDITY_MASK};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PublicLogicFacts {
@@ -24,40 +22,36 @@ pub struct PublicLogicFacts {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PublicLogicError {
     Coinbase,
-    UnsupportedShape(TxShape),
-    TooManyInputs {
-        actual: usize,
-        max: usize,
+    BitmapHighBits {
+        bitmap: u16,
     },
-    TooManyOutputs {
-        actual: usize,
-        max: usize,
-    },
-    FeeTooLarge {
-        fee: u128,
-    },
-    /// A `valid = false` entry carries non-dummy content (canonicality:
-    /// dead entries are the zero pattern, matching the committed bitmap).
-    DeadEntryNotDummy {
+    DeadInputNotZero {
         index: usize,
     },
-    /// Live inputs owned by more than one address (consensus: one owner
-    /// group per transaction — wallets spend from one active address).
-    MultipleInputOwners,
+    DeadOutputNotZero {
+        index: usize,
+    },
+    NoLiveInputs,
+    CoinbaseInputOwner,
+    CoinbaseBitmap {
+        bitmap: u16,
+    },
+    DuplicateInputSlot {
+        slot: u32,
+    },
+    DuplicateOutputSlot {
+        slot: u32,
+    },
+    InputOutputSlotOverlap {
+        slot: u32,
+    },
     InputSumOverflow,
     OutputSumOverflow,
     OutputPlusFeeOverflow,
     BalanceMismatch {
         input_sum: u128,
         output_sum: u128,
-        fee: u128,
-    },
-    NoLiveInputs,
-    LiveInputCountTooLarge {
-        actual: usize,
-    },
-    LiveOutputCountTooLarge {
-        actual: usize,
+        fee: u64,
     },
 }
 
@@ -69,127 +63,48 @@ impl std::fmt::Display for PublicLogicError {
 
 impl std::error::Error for PublicLogicError {}
 
-/// The SHARED body-semantics predicate — every consensus entrypoint
-/// (proof-native block validation, the sequential interpreter, mempool
-/// admission) calls THIS, so no path can accept a body another path
-/// rejects. No hashing (the 59-perm body hash is computed only where a
-/// caller needs it). Covers BOTH user transactions and the coinbase:
-///
-/// - shape support + input/output length bounds (both);
-/// - dead-entry canonicality: `valid = false` ⇒ the dummy zero pattern
-///   (both — the committed bitmap marks exactly the semantic leaves);
-/// - user tx: fee fits u64, live counts fit, at least one live input,
-///   ONE OWNER PER TRANSACTION, inputs balance outputs + fee;
-/// - coinbase: zero fee, NO live inputs, exactly one live output.
+/// Canonical body checks shared by decode, mempool, sequential apply, delta
+/// apply, proof-native validation, and template construction.
 pub fn validate_body_semantics_no_hash(body: &TxBody) -> Result<(), PublicLogicError> {
-    if !body.shape.proof_supported() {
-        return Err(PublicLogicError::UnsupportedShape(body.shape));
-    }
-
-    let max_inputs = body.shape.max_inputs();
-    if body.inputs.len() > max_inputs {
-        return Err(PublicLogicError::TooManyInputs {
-            actual: body.inputs.len(),
-            max: max_inputs,
-        });
-    }
-    let max_outputs = body.shape.max_outputs();
-    if body.outputs.len() > max_outputs {
-        return Err(PublicLogicError::TooManyOutputs {
-            actual: body.outputs.len(),
-            max: max_outputs,
+    if body.validity_bitmap & !TX_VALIDITY_MASK != 0 {
+        return Err(PublicLogicError::BitmapHighBits {
+            bitmap: body.validity_bitmap,
         });
     }
 
-    // Canonicality: a dead entry carries dummy content — the committed
-    // liveness bitmap (the body hash's reserved leaf) is then exactly the
-    // "which leaves are semantic" selector and dead leaves are the zero
-    // pattern everywhere (native and in-trace). Applies to the coinbase
-    // too.
-    for (i, input) in body.inputs.iter().enumerate() {
-        if !input.valid
-            && (input.slot_index != 0
-                || input.value != 0
-                || input.creation_id != 0
-                || input.owner.0 != [0u8; 32])
-        {
-            return Err(PublicLogicError::DeadEntryNotDummy { index: i });
+    for (index, input) in body.inputs.iter().enumerate() {
+        if !body.input_is_live(index) && *input != crate::TxInput::dummy() {
+            return Err(PublicLogicError::DeadInputNotZero { index });
         }
     }
-    for (j, output) in body.outputs.iter().enumerate() {
-        if !output.valid
-            && (output.slot_index != 0 || output.value != 0 || output.owner.0 != [0u8; 32])
-        {
-            return Err(PublicLogicError::DeadEntryNotDummy { index: j });
+    for (index, output) in body.outputs.iter().enumerate() {
+        if !body.output_is_live(index) && *output != crate::TxOutput::dummy() {
+            return Err(PublicLogicError::DeadOutputNotZero { index });
         }
     }
-
-    let n_live_inputs_usize = body.inputs.iter().filter(|i| i.valid).count();
-    let n_live_outputs_usize = body.outputs.iter().filter(|o| o.valid).count();
 
     if body.is_coinbase {
-        if body.fee != 0 {
-            return Err(PublicLogicError::FeeTooLarge { fee: body.fee });
+        if body.input_owner != Address([0u8; 32]) {
+            return Err(PublicLogicError::CoinbaseInputOwner);
         }
-        if n_live_inputs_usize != 0 {
-            return Err(PublicLogicError::LiveInputCountTooLarge {
-                actual: n_live_inputs_usize,
+        let expected = output_bitmap_bit(0);
+        if body.validity_bitmap != expected || body.fee != 0 {
+            return Err(PublicLogicError::CoinbaseBitmap {
+                bitmap: body.validity_bitmap,
             });
         }
-        if n_live_outputs_usize != 1 {
-            return Err(PublicLogicError::LiveOutputCountTooLarge {
-                actual: n_live_outputs_usize,
-            });
-        }
-        return Ok(());
+        return unique_slots(body);
     }
 
-    u64::try_from(body.fee).map_err(|_| PublicLogicError::FeeTooLarge { fee: body.fee })?;
-
-    let n_live_inputs = u8::try_from(n_live_inputs_usize).map_err(|_| {
-        PublicLogicError::LiveInputCountTooLarge {
-            actual: n_live_inputs_usize,
-        }
-    })?;
-    if n_live_inputs == 0 {
+    if body.live_input_count() == 0 {
         return Err(PublicLogicError::NoLiveInputs);
     }
-    u8::try_from(n_live_outputs_usize).map_err(|_| PublicLogicError::LiveOutputCountTooLarge {
-        actual: n_live_outputs_usize,
-    })?;
-
-    // ONE OWNER PER TRANSACTION (consensus rule): every live input is
-    // owned by the same address. Wallets operate one active address at a
-    // time (per-address balances; cross-address moves are explicit
-    // transactions), spending never proves common ownership of two
-    // addresses, and the owner-auth statement always carries exactly one
-    // owner identity — so the proof layout (hence the recursive block class
-    // shape) is owner-count independent by construction.
-    let mut live_owner: Option<&noid_poseidon2b::primitives::Address> = None;
-    for input in body.inputs.iter().filter(|i| i.valid) {
-        match live_owner {
-            None => live_owner = Some(&input.owner),
-            Some(owner) if *owner == input.owner => {}
-            Some(_) => return Err(PublicLogicError::MultipleInputOwners),
-        }
-    }
-
-    let mut input_sum = 0u128;
-    for input in body.inputs.iter().filter(|i| i.valid) {
-        input_sum = input_sum
-            .checked_add(input.value as u128)
-            .ok_or(PublicLogicError::InputSumOverflow)?;
-    }
-    let mut output_sum = 0u128;
-    for output in body.outputs.iter().filter(|o| o.valid) {
-        output_sum = output_sum
-            .checked_add(output.value as u128)
-            .ok_or(PublicLogicError::OutputSumOverflow)?;
-    }
-    let rhs = output_sum
-        .checked_add(body.fee)
+    unique_slots(body)?;
+    let (_, _, input_sum, output_sum) = sums(body)?;
+    let expected = output_sum
+        .checked_add(body.fee as u128)
         .ok_or(PublicLogicError::OutputPlusFeeOverflow)?;
-    if input_sum != rhs {
+    if input_sum != expected {
         return Err(PublicLogicError::BalanceMismatch {
             input_sum,
             output_sum,
@@ -204,36 +119,10 @@ pub fn validate_public_tx_logic(body: &TxBody) -> Result<PublicLogicFacts, Publi
         return Err(PublicLogicError::Coinbase);
     }
     validate_body_semantics_no_hash(body)?;
-
-    // The facts (already range-checked above).
-    let fee_u64 = body.fee as u64;
-    let n_live_inputs = body.inputs.iter().filter(|i| i.valid).count() as u8;
-    let n_live_outputs = body.outputs.iter().filter(|o| o.valid).count() as u8;
-    let input_sum: u128 = body
-        .inputs
-        .iter()
-        .filter(|i| i.valid)
-        .map(|i| i.value as u128)
-        .sum();
-    let output_sum: u128 = body
-        .outputs
-        .iter()
-        .filter(|o| o.valid)
-        .map(|o| o.value as u128)
-        .sum();
-
-    let tx_body_hash = hash_tx_body_for_shape(
-        body.shape,
-        &body.epoch_anchor,
-        body.fee,
-        &body.inputs,
-        &body.outputs,
-        body.is_coinbase,
-    );
-
+    let (n_live_inputs, n_live_outputs, input_sum, output_sum) = sums(body)?;
     Ok(PublicLogicFacts {
-        tx_body_hash,
-        fee_u64,
+        tx_body_hash: body.txid(),
+        fee_u64: body.fee,
         n_live_inputs,
         n_live_outputs,
         input_sum,
@@ -241,189 +130,155 @@ pub fn validate_public_tx_logic(body: &TxBody) -> Result<PublicLogicFacts, Publi
     })
 }
 
+fn unique_slots(body: &TxBody) -> Result<(), PublicLogicError> {
+    let mut inputs = HashSet::with_capacity(TX_INPUTS);
+    for (_, input) in body.live_inputs() {
+        if !inputs.insert(input.slot_index) {
+            return Err(PublicLogicError::DuplicateInputSlot {
+                slot: input.slot_index,
+            });
+        }
+    }
+
+    let mut outputs = HashSet::with_capacity(TX_OUTPUTS);
+    for (_, output) in body.live_outputs() {
+        if !outputs.insert(output.slot_index) {
+            return Err(PublicLogicError::DuplicateOutputSlot {
+                slot: output.slot_index,
+            });
+        }
+        if inputs.contains(&output.slot_index) {
+            return Err(PublicLogicError::InputOutputSlotOverlap {
+                slot: output.slot_index,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn sums(body: &TxBody) -> Result<(u8, u8, u128, u128), PublicLogicError> {
+    let mut input_sum = 0u128;
+    for (_, input) in body.live_inputs() {
+        input_sum = input_sum
+            .checked_add(input.amount as u128)
+            .ok_or(PublicLogicError::InputSumOverflow)?;
+    }
+    let mut output_sum = 0u128;
+    for (_, output) in body.live_outputs() {
+        output_sum = output_sum
+            .checked_add(output.amount as u128)
+            .ok_or(PublicLogicError::OutputSumOverflow)?;
+    }
+    Ok((
+        body.live_input_count() as u8,
+        body.live_output_count() as u8,
+        input_sum,
+        output_sum,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{TxInput, TxOutput};
-    use noid_poseidon2b::primitives::{Address, SpendSecret};
 
-    fn input(slot: u32, value: u64, valid: bool) -> TxInput {
-        TxInput {
-            slot_index: slot,
-            value,
-            creation_id: 0,
-            // One owner per tx (consensus): live inputs share an address;
-            // dead entries carry the dummy zero pattern.
-            owner: if valid {
-                Address([7u8; 32])
-            } else {
-                Address([0u8; 32])
-            },
-            spend_secret: SpendSecret([0u8; 32]),
-            valid,
-        }
-    }
-
-    fn output(slot: u32, value: u64, valid: bool) -> TxOutput {
-        TxOutput {
-            slot_index: slot,
-            value,
-            owner: if valid {
-                Address([slot as u8; 32])
-            } else {
-                Address([0u8; 32])
-            },
-            valid,
-        }
-    }
-
-    #[test]
-    fn standard_balanced_body_accepts() {
-        let body = TxBody::standard(
-            [1u8; 32],
-            7,
-            vec![input(1, 100, true), input(2, 50, true)],
-            vec![output(10, 143, true)],
-            false,
-        );
-        let facts = validate_public_tx_logic(&body).expect("valid body");
-        assert_eq!(facts.fee_u64, 7);
-        assert_eq!(facts.n_live_inputs, 2);
-        assert_eq!(facts.n_live_outputs, 1);
-        assert_eq!(facts.input_sum, 150);
-        assert_eq!(facts.output_sum, 143);
-    }
-
-    #[test]
-    fn dead_entries_are_dummy_and_ignored_for_balance() {
-        // Canonical dead entries (dummy content) are accepted and excluded
-        // from the balance.
-        let body = TxBody::standard(
-            [2u8; 32],
-            1,
-            vec![input(1, 10, true), input(0, 0, false)],
-            vec![output(10, 9, true), output(0, 0, false)],
-            false,
-        );
-        let facts = validate_public_tx_logic(&body).expect("valid body");
-        assert_eq!(facts.input_sum, 10);
-        assert_eq!(facts.output_sum, 9);
-    }
-
-    #[test]
-    fn dead_entry_with_content_rejects() {
-        // A dead entry smuggling non-dummy content violates canonicality
-        // (the committed bitmap marks exactly the semantic leaves).
-        let body = TxBody::standard(
-            [2u8; 32],
-            1,
-            vec![input(1, 10, true), input(2, u64::MAX, false)],
-            vec![output(10, 9, true)],
-            false,
-        );
-        assert!(matches!(
-            validate_public_tx_logic(&body),
-            Err(PublicLogicError::DeadEntryNotDummy { index: 1 })
-        ));
-    }
-
-    #[test]
-    fn dead_input_with_creation_id_rejects() {
-        let mut dead = input(0, 0, false);
-        dead.creation_id = 1;
-        let body = TxBody::standard(
-            [2u8; 32],
-            1,
-            vec![input(1, 10, true), dead],
-            vec![output(10, 9, true)],
-            false,
-        );
-        assert_eq!(
-            validate_public_tx_logic(&body),
-            Err(PublicLogicError::DeadEntryNotDummy { index: 1 })
-        );
-    }
-
-    #[test]
-    fn multiple_input_owners_reject() {
-        // Consensus: live inputs must share one owner address.
-        let mut i2 = input(2, 5, true);
-        i2.owner = Address([9u8; 32]);
-        let body = TxBody::standard(
-            [2u8; 32],
-            0,
-            vec![input(1, 10, true), i2],
-            vec![output(10, 15, true)],
-            false,
-        );
-        assert_eq!(
-            validate_public_tx_logic(&body),
-            Err(PublicLogicError::MultipleInputOwners)
-        );
-    }
-
-    #[test]
-    fn imbalance_rejects() {
-        let body = TxBody::standard(
-            [3u8; 32],
-            1,
-            vec![input(1, 10, true)],
-            vec![output(10, 10, true)],
-            false,
-        );
-        assert!(matches!(
-            validate_public_tx_logic(&body),
-            Err(PublicLogicError::BalanceMismatch { .. })
-        ));
-    }
-
-    #[test]
-    fn sweep_balanced_body_accepts() {
-        let body = TxBody {
-            shape: TxShape::Sweep25x2,
-            epoch_anchor: [4u8; 32],
-            fee: 5,
-            inputs: (0..5).map(|i| input(i, 20, true)).collect(),
-            outputs: vec![output(100, 95, true), output(0, 0, false)],
-            is_coinbase: false,
+    fn user_body() -> TxBody {
+        let mut inputs = [TxInput::dummy(); TX_INPUTS];
+        inputs[0] = TxInput {
+            slot_index: 1,
+            amount: 10,
+            creation_id: 4,
         };
-        let facts = validate_public_tx_logic(&body).expect("valid sweep body");
-        assert_eq!(facts.n_live_inputs, 5);
+        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        outputs[0] = TxOutput {
+            slot_index: 2,
+            amount: 9,
+            owner: Address([8u8; 32]),
+        };
+        TxBody {
+            epoch_anchor: [7u8; 32],
+            fee: 1,
+            input_owner: Address([6u8; 32]),
+            inputs,
+            outputs,
+            validity_bitmap: 1 | output_bitmap_bit(0),
+            is_coinbase: false,
+        }
+    }
+
+    #[test]
+    fn canonical_user_facts() {
+        let facts = validate_public_tx_logic(&user_body()).unwrap();
+        assert_eq!(facts.n_live_inputs, 1);
         assert_eq!(facts.n_live_outputs, 1);
-        assert_eq!(facts.input_sum, 100);
-        assert_eq!(facts.output_sum, 95);
-    }
-
-    #[test]
-    fn coinbase_rejects() {
-        let body = TxBody::standard([0u8; 32], 0, vec![], vec![], true);
         assert_eq!(
-            validate_public_tx_logic(&body),
-            Err(PublicLogicError::Coinbase)
+            (facts.input_sum, facts.output_sum, facts.fee_u64),
+            (10, 9, 1)
         );
     }
 
     #[test]
-    fn zero_input_non_coinbase_rejects() {
-        let body = TxBody::standard([5u8; 32], 0, vec![], vec![], false);
-        assert_eq!(
-            validate_public_tx_logic(&body),
-            Err(PublicLogicError::NoLiveInputs)
-        );
-    }
-
-    #[test]
-    fn fee_too_large_rejects() {
-        let body = TxBody::standard(
-            [0u8; 32],
-            u64::MAX as u128 + 1,
-            vec![input(1, 1, true)],
-            vec![],
-            false,
-        );
+    fn rejects_high_bits_and_dead_content() {
+        let mut body = user_body();
+        body.validity_bitmap |= 1 << 10;
         assert!(matches!(
-            validate_public_tx_logic(&body),
-            Err(PublicLogicError::FeeTooLarge { .. })
+            validate_body_semantics_no_hash(&body),
+            Err(PublicLogicError::BitmapHighBits { .. })
+        ));
+        let mut body = user_body();
+        body.inputs[7].amount = 1;
+        assert_eq!(
+            validate_body_semantics_no_hash(&body),
+            Err(PublicLogicError::DeadInputNotZero { index: 7 })
+        );
+        let mut body = user_body();
+        body.outputs[1].owner = Address([1u8; 32]);
+        assert_eq!(
+            validate_body_semantics_no_hash(&body),
+            Err(PublicLogicError::DeadOutputNotZero { index: 1 })
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_and_overlapping_slots() {
+        let mut body = user_body();
+        body.inputs[1] = body.inputs[0];
+        body.validity_bitmap |= 1 << 1;
+        assert!(matches!(
+            validate_body_semantics_no_hash(&body),
+            Err(PublicLogicError::DuplicateInputSlot { slot: 1 })
+        ));
+        let mut body = user_body();
+        body.outputs[0].slot_index = body.inputs[0].slot_index;
+        assert!(matches!(
+            validate_body_semantics_no_hash(&body),
+            Err(PublicLogicError::InputOutputSlotOverlap { slot: 1 })
+        ));
+    }
+
+    #[test]
+    fn canonical_coinbase_is_exact() {
+        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        outputs[0] = TxOutput {
+            slot_index: 5,
+            amount: 50,
+            owner: Address([9u8; 32]),
+        };
+        let body = TxBody {
+            epoch_anchor: [3u8; 32],
+            fee: 0,
+            input_owner: Address([0u8; 32]),
+            inputs: [TxInput::dummy(); TX_INPUTS],
+            outputs,
+            validity_bitmap: output_bitmap_bit(0),
+            is_coinbase: true,
+        };
+        assert_eq!(validate_body_semantics_no_hash(&body), Ok(()));
+        let mut bad = body;
+        bad.validity_bitmap |= output_bitmap_bit(1);
+        assert!(matches!(
+            validate_body_semantics_no_hash(&bad),
+            Err(PublicLogicError::CoinbaseBitmap { .. })
         ));
     }
 }

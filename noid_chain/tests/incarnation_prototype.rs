@@ -67,11 +67,7 @@ fn packed_incarnation_zero_id_uses_canonical_low_lane_schedules() {
 
     assert_eq!(
         incarnation_input_leaf(slot_index, amount, 0, owner),
-        hash_input_leaf_packed(
-            slot_index,
-            pack_amount_creation_id(amount, 0),
-            &owner,
-        ),
+        hash_input_leaf_packed(slot_index, pack_amount_creation_id(amount, 0), &owner,),
         "creation_id=0 uses the canonical low-lane input-leaf schedule"
     );
     let zero_id_slot = incarnation_slot(amount, 0, owner);
@@ -85,11 +81,7 @@ fn packed_incarnation_zero_id_uses_canonical_low_lane_schedules() {
     assert_ne!(incarnation_exact_leaf(live), slot_leaf_hash(zero_id_slot));
     assert_ne!(
         incarnation_input_leaf(slot_index, amount, 7, owner),
-        hash_input_leaf_packed(
-            slot_index,
-            pack_amount_creation_id(amount, 0),
-            &owner,
-        )
+        hash_input_leaf_packed(slot_index, pack_amount_creation_id(amount, 0), &owner,)
     );
     assert_eq!(unpack_amount_creation_id(live.value), (amount, 7));
     assert_eq!(pack_amount_creation_id(0, 0), Block128::from(0u128));
@@ -139,11 +131,11 @@ fn allocation_is_checked_and_strictly_monotone() {
 }
 
 #[test]
-fn both_same_block_action_orders_bind_the_new_incarnation() {
+fn cross_block_slot_reuse_binds_the_new_incarnation() {
     let owner = Address([0x63; 32]);
     let amount = 77u64;
 
-    // spend(old id=10) -> mint(new id=11) at the same physical slot
+    // A later block may reuse a slot after the spend block has committed.
     let spent = incarnation_slot(amount, 10, owner);
     let reminted = incarnation_slot(amount, 11, owner);
     assert_ne!(spent, reminted);
@@ -152,8 +144,9 @@ fn both_same_block_action_orders_bind_the_new_incarnation() {
         incarnation_exact_leaf(reminted)
     );
 
-    // mint(id=12) -> spend in the same block is also unambiguous: the child
-    // input must carry the just-assigned id, not the prior incarnation.
+    // A still later spend must carry the just-assigned id, not the prior
+    // incarnation. Same-block reuse in either direction is rejected earlier by
+    // the block-wide touched-set rule.
     let minted = incarnation_slot(amount, 12, owner);
     let correct_child_claim = incarnation_slot(amount, 12, owner);
     let stale_child_claim = incarnation_slot(amount, 11, owner);

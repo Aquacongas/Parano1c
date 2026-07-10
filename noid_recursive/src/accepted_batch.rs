@@ -504,8 +504,8 @@ pub fn verify_accepted_claim_batch_with_header_trace(
 mod tests {
     use super::*;
     use crate::header_integer::build_header_integer_trace;
+    use noid_chain::consensus::asert_anchor_height;
     use noid_chain::consensus::difficulty::{add_work, block_work, next_target};
-    use noid_chain::consensus::epoch_anchor_height;
     use noid_chain::consensus::params::{BLOCK_TIME, MAX_TARGET};
     use noid_gkr::{prove_chain_accumulator_killshot, verify_chain_accumulator_killshot};
     use noid_poseidon2b::channel::Poseidon2bChannel;
@@ -641,7 +641,7 @@ mod tests {
         next.alloc_counter = header.alloc_counter;
         next.push_timestamp(header.timestamp);
         next.push_active_count(header.active_slot_count);
-        if epoch_anchor_height(header.height) == header.height {
+        if asert_anchor_height(header.height) == header.height {
             next.asert_anchor_height = header.height;
             next.asert_anchor_timestamp = header.timestamp;
             next.asert_anchor_target = header.difficulty_target;

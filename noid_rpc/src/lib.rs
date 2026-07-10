@@ -7,6 +7,8 @@ pub mod api;
 pub mod server;
 pub mod types;
 pub mod wallet_ops;
+pub mod wallet_submit;
 
 pub use server::start_rpc_server;
 pub use wallet_ops::WalletOps;
+pub use wallet_submit::{WalletOperationGate, WalletSubmitCoordinator};

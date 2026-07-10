@@ -28,24 +28,6 @@ use noid_chain::state::ChainState;
 use noid_chain::storage::{MdbxChainContext, MdbxContextError};
 use noid_mempool::AsyncMempool;
 use noid_poseidon2b::primitives::Address;
-use noid_tx::TxShape;
-
-/// Shapes that the current cryptographic block prover can include directly in a block.
-#[inline]
-fn is_current_block_provable_shape(shape: TxShape) -> bool {
-    matches!(shape, TxShape::Standard4x8 | TxShape::Sweep25x2)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn current_block_template_policy_accepts_current_zk_bound_shapes() {
-        assert!(is_current_block_provable_shape(TxShape::Standard4x8));
-        assert!(is_current_block_provable_shape(TxShape::Sweep25x2));
-    }
-}
 
 /// Why the template was refreshed (carried in `MinerEvent::TemplateRefreshed`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,7 +101,7 @@ pub struct TemplateChainSnapshot {
     pub prev_timestamps: Vec<u64>,
     pub anchor: AnchorInfo,
     pub state: ChainState,
-    fresh_anchor_hashes: Vec<[u8; 32]>,
+    user_epoch_anchor: [u8; 32],
 }
 
 impl TemplateChainSnapshot {
@@ -127,11 +109,14 @@ impl TemplateChainSnapshot {
         ctx.preload_all_evicted_segments()?;
 
         let parent = *ctx.tip_header();
-        let tip_height = parent.height;
-        let lo = tip_height.saturating_sub(noid_chain::consensus::params::ANCHOR_DEPTH);
-        let fresh_anchor_hashes = (lo..=tip_height)
-            .filter_map(|h| ctx.header(h).map(block_id))
-            .collect();
+        let anchor_height =
+            noid_chain::consensus::tx_epoch_anchor_height_for_child(parent.height + 1);
+        let user_epoch_anchor = ctx
+            .get_header_from_store(anchor_height)?
+            .map(|header| block_id(&header))
+            .ok_or(MdbxContextError::Corrupt(
+                "transaction epoch anchor header missing",
+            ))?;
 
         Ok(Self {
             parent,
@@ -139,16 +124,12 @@ impl TemplateChainSnapshot {
             prev_timestamps: ctx.prev_timestamps(),
             anchor: ctx.anchor_info(),
             state: ctx.state.clone(),
-            fresh_anchor_hashes,
+            user_epoch_anchor,
         })
     }
 
     pub fn prev_state_root(&self) -> [u8; 32] {
         self.parent.state_root
-    }
-
-    fn is_anchor_fresh(&self, anchor_hash: &[u8; 32]) -> bool {
-        self.fresh_anchor_hashes.iter().any(|h| h == anchor_hash)
     }
 }
 
@@ -175,7 +156,7 @@ impl TemplateBuilder {
             snapshot,
             miner_address,
             now_unix,
-            noid_chain::consensus::params::BLOCK_MAX_TXS - 1,
+            noid_chain::consensus::params::BLOCK_MAX_USER_TXS,
         )
         .await
     }
@@ -218,7 +199,7 @@ impl TemplateBuilder {
         );
 
         // Select top txs from mempool (coinbase is added separately by the chain template).
-        let consensus_max = noid_chain::consensus::params::BLOCK_MAX_TXS - 1;
+        let consensus_max = noid_chain::consensus::params::BLOCK_MAX_USER_TXS;
         let max_user_txs = max_user_txs.min(consensus_max);
         let entries = self.mempool.select_for_block(consensus_max).await;
         // Single-pass: move authorization bytes and transactions together (no clone).
@@ -227,22 +208,18 @@ impl TemplateBuilder {
             .map(|e| (e.cached_authorization, e.tx))
             .unzip();
 
-        // Filter out transactions whose epoch_anchor has expired since mempool
-        // admission. Without this, the miner wastes proving time on txs that
-        // will be rejected by peers during full block validation.
+        // Recheck exact start-of-block anchor after selection. A boundary may
+        // have advanced while the transaction waited in the mempool.
         let (authorization_bytes, txs): (Vec<_>, Vec<_>) = authorization_bytes
             .into_iter()
             .zip(txs)
-            .filter(|(_, tx)| {
-                is_current_block_provable_shape(tx.body.shape)
-                    && (tx.body.is_coinbase || snapshot.is_anchor_fresh(&tx.body.epoch_anchor))
-            })
+            .filter(|(_, tx)| tx.body.epoch_anchor == snapshot.user_epoch_anchor)
             .take(max_user_txs)
             .unzip();
         let mut proof_by_hash: HashMap<noid_poseidon2b::primitives::TxBodyHash, Option<Vec<u8>>> =
             authorization_bytes
                 .into_iter()
-                .zip(txs.iter().map(|tx| tx.tx_body_hash))
+                .zip(txs.iter().map(|tx| tx.txid()))
                 .map(|(proof, hash)| (hash, proof))
                 .collect();
 
@@ -278,7 +255,7 @@ impl TemplateBuilder {
                         .collect();
                     let commitments: Vec<[u8; 32]> = bodies
                         .iter()
-                        .map(|body| noid_tx::compute_claims_commitment(&body.inputs, &body.outputs))
+                        .map(noid_tx::compute_claims_commitment)
                         .collect();
                     let surface = match noid_chain::build_exact_action_surface(
                         &snapshot.state.state,
@@ -311,7 +288,7 @@ impl TemplateBuilder {
                 let authorization_bytes = inner
                     .txs
                     .iter()
-                    .map(|tx| proof_by_hash.remove(&tx.tx_body_hash).unwrap_or(None))
+                    .map(|tx| proof_by_hash.remove(&tx.txid()).unwrap_or(None))
                     .collect();
                 Some(BlockTemplate {
                     inner,

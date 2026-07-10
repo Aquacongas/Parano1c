@@ -6,7 +6,7 @@
 use bincode::Options;
 use noid_core::Block128;
 use noid_poseidon2b::primitives::SpendSecret;
-use noid_tx::{canonical_owner_auth, validate_public_tx_logic, PublicLogicError, TxBody, TxShape};
+use noid_tx::{canonical_owner_auth, validate_public_tx_logic, PublicLogicError, TxBody};
 use serde::{Deserialize, Serialize};
 
 use crate::owner_auth::owner_auth_trace_inputs_from_body_and_secret;
@@ -16,13 +16,11 @@ use crate::{
     OwnerAuthStatementError,
 };
 
-pub const MAX_STANDARD_AUTHORIZATION_BYTES: usize = 192 * 1024;
-pub const MAX_SWEEP_AUTHORIZATION_BYTES: usize = 256 * 1024;
-pub const MAX_AUTHORIZATION_BUNDLE_BYTES: usize = MAX_SWEEP_AUTHORIZATION_BYTES;
+pub const MAX_AUTHORIZATION_BUNDLE_BYTES: usize = noid_tx::MAX_TX_AUTHORIZATION_BYTES;
 /// Absolute cap for the transitional live-input-count metadata. The exact
 /// shape-specific count is derived from the canonical body at production
 /// boundaries and will be pinned to the validity bitmap by ActionSurface C'.
-pub const MAX_AUTHORIZATION_LIVE_INPUTS: u8 = TxShape::Sweep25x2.max_inputs() as u8;
+pub const MAX_AUTHORIZATION_LIVE_INPUTS: u8 = noid_tx::TX_INPUTS as u8;
 
 /// Wallet-local authority to prove one transaction owned by one address.
 ///
@@ -63,14 +61,12 @@ pub struct CanonicalAuthorizationStatement {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct VerifiedAuthorization {
     pub tx_index: usize,
-    pub owner_count: usize,
     pub live_input_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct VerifiedAuthorizationBatch {
     pub user_tx_count: usize,
-    pub owner_count_total: usize,
     pub live_input_count_total: usize,
 }
 
@@ -105,29 +101,8 @@ impl WalletAuthorizationBundle {
             .map_err(|e| AuthorizationDecodeError::Bincode(e.to_string()))
     }
 
-    pub fn from_bytes_for_shape(
-        bytes: &[u8],
-        shape: TxShape,
-    ) -> Result<Self, AuthorizationDecodeError> {
-        let max = max_authorization_bytes_for_shape(shape);
-        if bytes.len() > max {
-            return Err(AuthorizationDecodeError::TooLarge {
-                actual: bytes.len(),
-                max,
-            });
-        }
-        Self::from_bytes(bytes)
-    }
-
     pub fn byte_len(&self) -> Result<usize, AuthorizationEncodeError> {
         self.to_bytes().map(|bytes| bytes.len())
-    }
-}
-
-pub const fn max_authorization_bytes_for_shape(shape: TxShape) -> usize {
-    match shape {
-        TxShape::Standard4x8 => MAX_STANDARD_AUTHORIZATION_BYTES,
-        TxShape::Sweep25x2 => MAX_SWEEP_AUTHORIZATION_BYTES,
     }
 }
 
@@ -202,9 +177,7 @@ pub enum VerifyAuthorizationError {
 pub fn validate_authorization_statement(
     statement: &CanonicalAuthorizationStatement,
 ) -> Result<(), VerifyAuthorizationError> {
-    let one_owner_layout =
-        crate::OwnerAuthLayout::for_owner_count(1).expect("the protocol one-owner layout is valid");
-    if statement.public.layout != one_owner_layout || statement.public.expected_address.len() != 1 {
+    if statement.public.layout != crate::OwnerAuthLayout::FIXED {
         return Err(VerifyAuthorizationError::OwnerAuthStatement(
             "production owner-auth statement must use the canonical one-owner layout".to_string(),
         ));
@@ -244,7 +217,7 @@ pub fn prove_wallet_authorization(
     validate_public_tx_logic(body)?;
     let auth_inputs = owner_auth_trace_inputs_from_body_and_secret(body, witness.spend_secret())
         .map_err(map_owner_auth_prove_error)?;
-    let circuit = OwnerAuthCircuit::build(auth_inputs.layout);
+    let circuit = OwnerAuthCircuit::build();
     let mut channel = owner_auth_gkr_channel();
     let (proof, _) = prove_owner_auth_killshot(&circuit, &auth_inputs, &mut channel);
     Ok(WalletAuthorizationBundle { proof })
@@ -269,7 +242,7 @@ pub fn verify_wallet_authorization_proof(
     let statement = CanonicalAuthorizationStatement {
         tx_index: 0,
         tx_body_hash: public.tx_body_hash,
-        live_input_count: u8::try_from(canonical.live_input_count())
+        live_input_count: u8::try_from(body.live_input_count())
             .expect("canonical transaction input capacity fits u8"),
         public,
     };
@@ -282,17 +255,17 @@ pub fn canonical_authorization_statement_from_body(
     body: &TxBody,
 ) -> Result<CanonicalAuthorizationStatement, OwnerAuthStatementError> {
     let canonical = canonical_owner_auth(body)?;
-    let live_input_count = canonical.live_input_count();
-    if live_input_count == 0 || live_input_count > body.shape.max_inputs() {
+    let live_input_count = body.live_input_count();
+    if live_input_count == 0 || live_input_count > noid_tx::TX_INPUTS {
         return Err(OwnerAuthStatementError::LiveInputCountOutOfRange {
             actual: live_input_count,
-            max: body.shape.max_inputs(),
+            max: noid_tx::TX_INPUTS,
         });
     }
     let live_input_count = u8::try_from(live_input_count).map_err(|_| {
         OwnerAuthStatementError::LiveInputCountOutOfRange {
             actual: live_input_count,
-            max: body.shape.max_inputs(),
+            max: noid_tx::TX_INPUTS,
         }
     })?;
     let public = owner_auth_public_from_statement(&canonical)?;
@@ -316,14 +289,13 @@ pub fn verify_authorization_statement_proof(
     proof: &OwnerAuthProofKillShot,
 ) -> Result<VerifiedAuthorization, VerifyAuthorizationError> {
     validate_authorization_statement(statement)?;
-    let circuit = OwnerAuthCircuit::build(statement.public.layout);
+    let circuit = OwnerAuthCircuit::build();
     let mut channel = owner_auth_gkr_channel();
     verify_owner_auth_killshot(proof, &circuit, &statement.public, &mut channel)
         .ok_or(VerifyAuthorizationError::AuthProof)?;
 
     Ok(VerifiedAuthorization {
         tx_index: statement.tx_index,
-        owner_count: statement.public.layout.owner_count,
         live_input_count: usize::from(statement.live_input_count),
     })
 }
@@ -346,7 +318,7 @@ mod tests {
     use crate::owner_auth_public_from_body;
     use noid_core::{Block128, TowerField};
     use noid_poseidon2b::primitives::{derive_address, Address};
-    use noid_tx::{TxInput, TxOutput};
+    use noid_tx::{output_bitmap_bit, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS};
 
     fn mk_secret(seed: u8) -> SpendSecret {
         let mut bytes = [0u8; 32];
@@ -358,26 +330,25 @@ mod tests {
 
     fn standard_body_and_secret() -> (TxBody, SpendSecret) {
         let secret = mk_secret(7);
-        let inputs = vec![TxInput {
+        let mut inputs = [TxInput::dummy(); TX_INPUTS];
+        inputs[0] = TxInput {
             slot_index: 17,
-            value: 100,
+            amount: 100,
             creation_id: 0,
-            owner: derive_address(&secret),
-            spend_secret: SpendSecret(secret.0),
-            valid: true,
-        }];
-        let outputs = vec![TxOutput {
+        };
+        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        outputs[0] = TxOutput {
             slot_index: 29,
-            value: 95,
+            amount: 95,
             owner: Address([0xB0; 32]),
-            valid: true,
-        }];
+        };
         let body = TxBody {
-            shape: TxShape::Standard4x8,
             epoch_anchor: [0xA5; 32],
             fee: 5,
+            input_owner: derive_address(&secret),
             inputs,
             outputs,
+            validity_bitmap: 1 | output_bitmap_bit(0),
             is_coinbase: false,
         };
         (body, secret)
@@ -385,36 +356,30 @@ mod tests {
 
     fn repeated_owner_body_and_secret() -> (TxBody, SpendSecret) {
         let secret = mk_secret(17);
-        let inputs = vec![
-            TxInput {
-                slot_index: 17,
-                value: 60,
-                creation_id: 0,
-                owner: derive_address(&secret),
-                spend_secret: SpendSecret(secret.0),
-                valid: true,
-            },
-            TxInput {
-                slot_index: 18,
-                value: 40,
-                creation_id: 0,
-                owner: derive_address(&secret),
-                spend_secret: SpendSecret(secret.0),
-                valid: true,
-            },
-        ];
-        let outputs = vec![TxOutput {
+        let mut inputs = [TxInput::dummy(); TX_INPUTS];
+        inputs[0] = TxInput {
+            slot_index: 17,
+            amount: 60,
+            creation_id: 0,
+        };
+        inputs[1] = TxInput {
+            slot_index: 18,
+            amount: 40,
+            creation_id: 0,
+        };
+        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        outputs[0] = TxOutput {
             slot_index: 29,
-            value: 95,
+            amount: 95,
             owner: Address([0xB0; 32]),
-            valid: true,
-        }];
+        };
         let body = TxBody {
-            shape: TxShape::Standard4x8,
             epoch_anchor: [0xA5; 32],
             fee: 5,
+            input_owner: derive_address(&secret),
             inputs,
             outputs,
+            validity_bitmap: (1 << 0) | (1 << 1) | output_bitmap_bit(0),
             is_coinbase: false,
         };
         (body, secret)
@@ -457,7 +422,7 @@ mod tests {
         ));
 
         let (_, _, honest_bundle) = prove_standard_fixture();
-        body.inputs[0].owner = Address([0x44; 32]);
+        body.input_owner = Address([0x44; 32]);
         assert!(matches!(
             verify_wallet_authorization(&body, &honest_bundle),
             Err(VerifyAuthorizationError::AuthProof)
@@ -477,7 +442,7 @@ mod tests {
             })
         ));
 
-        body.inputs[0].owner = Address([0x55; 32]);
+        body.input_owner = Address([0x55; 32]);
         assert!(matches!(
             prove_wallet_authorization(&body, OwnerAuthWitness::new(SpendSecret(secret.0)),),
             Err(ProveAuthorizationError::BoundaryMismatch {
@@ -496,7 +461,7 @@ mod tests {
         verify_wallet_authorization(&body, &bundle).expect("verify repeated-owner authorization");
 
         let public = owner_auth_public_from_body(&body).expect("public owner auth");
-        assert_eq!(public.layout.owner_count, 1);
+        assert_eq!(public.layout, crate::OwnerAuthLayout::FIXED);
         let statement =
             canonical_authorization_statement_from_body(0, public.tx_body_hash, &body).unwrap();
         assert_eq!(statement.live_input_count, 2);
@@ -516,22 +481,6 @@ mod tests {
             canonical_authorization_statement_from_body(3, public.tx_body_hash, &body)
                 .expect("canonical authorization statement");
         statement.tx_body_hash[0] += Block128::ONE;
-
-        assert!(matches!(
-            verify_authorization_statement_proof(&statement, &bundle.proof),
-            Err(VerifyAuthorizationError::OwnerAuthStatement(_))
-        ));
-    }
-
-    #[test]
-    fn production_statement_rejects_multi_owner_layout() {
-        let (body, _, bundle) = prove_standard_fixture();
-        let public = owner_auth_public_from_body(&body).expect("public owner auth");
-        let mut statement =
-            canonical_authorization_statement_from_body(0, public.tx_body_hash, &body)
-                .expect("canonical authorization statement");
-        statement.public.layout = crate::OwnerAuthLayout::for_owner_count(2).unwrap();
-        statement.public.expected_address.push([Block128::ZERO; 2]);
 
         assert!(matches!(
             verify_authorization_statement_proof(&statement, &bundle.proof),

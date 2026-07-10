@@ -12,17 +12,15 @@
 
 use noid_core::Block128;
 use noid_gkr::{
-    discharge_accepted_claim_hash_reductions_native,
-    discharge_batched_merkle_reductions_native, discharge_batched_slot_leaf_reductions_native,
-    discharge_block_spine_reductions_native, discharge_sweep_block_spine_reductions_native,
+    discharge_accepted_claim_hash_reductions_native, discharge_batched_merkle_reductions_native,
+    discharge_batched_slot_leaf_reductions_native, discharge_block_spine_reductions_native,
     reconstruct_slot_states, verify_accepted_claim_hash_killshot,
     verify_authorization_statement_proof, verify_batched_merkle_killshot,
-    verify_batched_slot_leaf_killshot, verify_block_spine_killshot,
-    verify_sweep_block_spine_killshot, AcceptedClaimHashInputs, AcceptedClaimHashProofKillShot,
-    BatchedMerkleProofKillShot, BatchedSlotLeafProofKillShot, BlockSpineProof,
-    CanonicalAuthorizationStatement, MerkleCircuit, MerklePathInputs, OwnerAuthProofKillShot,
-    OwnerAuthPublicInputs, SlotLeafInputs, SpineCircuit, SpineInputs, SweepBlockSpineProof,
-    SweepSpineInputs, VerifiedAuthorizationBatch,
+    verify_batched_slot_leaf_killshot, verify_block_spine_killshot, AcceptedClaimHashInputs,
+    AcceptedClaimHashProofKillShot, BatchedMerkleProofKillShot, BatchedSlotLeafProofKillShot,
+    BlockSpineProof, CanonicalAuthorizationStatement, MerkleCircuit, MerklePathInputs,
+    OwnerAuthProofKillShot, OwnerAuthPublicInputs, SlotLeafInputs, SpineCircuit, SpineInputs,
+    VerifiedAuthorizationBatch,
 };
 use noid_poseidon2b::channel::Poseidon2bChannel;
 use noid_poseidon2b::native::domain::TAG_EXSTNOD;
@@ -55,10 +53,7 @@ pub struct AuthorizationComponentInput {
 }
 
 fn authorization_component_input_shape_ok(input: &AuthorizationComponentInput) -> bool {
-    let one_owner_layout = noid_gkr::OwnerAuthLayout::for_owner_count(1)
-        .expect("the protocol one-owner layout is valid");
-    input.public.layout == one_owner_layout
-        && input.public.expected_address.len() == 1
+    input.public.layout == noid_gkr::OwnerAuthLayout::FIXED
         && (1..=noid_gkr::MAX_AUTHORIZATION_LIVE_INPUTS).contains(&input.live_input_count)
 }
 
@@ -85,10 +80,8 @@ pub struct AcceptedBlockBatchComponentInputs {
     pub accepted_claim_witness: AcceptedClaimBatchWitness,
     pub accepted_block_certificate_statements: Vec<AcceptedBlockCertificateStatement>,
     pub accepted_claim_hash_inputs: Vec<AcceptedClaimHashInputs>,
-    pub tx_body_standard_inputs: Vec<SpineInputs>,
-    pub tx_body_standard_hashes: Vec<[Block128; 2]>,
-    pub tx_body_sweep_inputs: Vec<SweepSpineInputs>,
-    pub tx_body_sweep_hashes: Vec<[Block128; 2]>,
+    pub tx_body_inputs: Vec<SpineInputs>,
+    pub tx_body_hashes: Vec<[Block128; 2]>,
     pub tx_root_inputs: Vec<MerklePathInputs>,
     pub header_integer_trace: HeaderIntegerBatchTrace,
     pub authorization_inputs: Vec<AuthorizationComponentInput>,
@@ -101,8 +94,7 @@ pub struct AcceptedBlockBatchComponentInputs {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AcceptedBlockBatchComponentProof {
     pub accepted_claim_hash: AcceptedClaimHashProofKillShot,
-    pub tx_body_standard: Option<BlockSpineProof>,
-    pub tx_body_sweep: Option<SweepBlockSpineProof>,
+    pub tx_body: Option<BlockSpineProof>,
     pub tx_root: Option<BatchedMerkleProofKillShot>,
     pub checkpoint_poseidon: CheckpointPoseidonProof,
     pub exact_state: Vec<ExactStateKillShotProof>,
@@ -111,14 +103,7 @@ pub struct AcceptedBlockBatchComponentProof {
 impl AcceptedBlockBatchComponentProof {
     pub fn byte_len(&self, inputs: &AcceptedBlockBatchComponentInputs) -> usize {
         self.accepted_claim_hash.byte_len()
-            + self
-                .tx_body_standard
-                .as_ref()
-                .map_or(0, BlockSpineProof::byte_len)
-            + self
-                .tx_body_sweep
-                .as_ref()
-                .map_or(0, SweepBlockSpineProof::byte_len)
+            + self.tx_body.as_ref().map_or(0, BlockSpineProof::byte_len)
             + self
                 .tx_root
                 .as_ref()
@@ -176,7 +161,7 @@ pub fn verify_accepted_block_batch_components(
     // unwrapped below in the same order the old sequential code checked them,
     // so error precedence is unchanged when several components fail at once.
     let (
-        (claim_hash_result, (standard_result, sweep_result)),
+        (claim_hash_result, tx_body_result),
         (
             (tx_root_result, authorization_result),
             (claim_batch_result, (checkpoint_result, exact_state_result)),
@@ -185,12 +170,7 @@ pub fn verify_accepted_block_batch_components(
         || {
             rayon::join(
                 || verify_accepted_claim_hash_component(inputs, proof),
-                || {
-                    rayon::join(
-                        || verify_standard_tx_body_component(inputs, proof),
-                        || verify_sweep_tx_body_component(inputs, proof),
-                    )
-                },
+                || verify_tx_body_component(inputs, proof),
             )
         },
         || {
@@ -214,32 +194,31 @@ pub fn verify_accepted_block_batch_components(
                         },
                         || {
                             rayon::join(
-                                        || {
-                                            verify_checkpoint_poseidon(
-                                                start_accumulator,
-                                                end_accumulator,
-                                                &inputs.accepted_claim_witness,
-                                                &proof.checkpoint_poseidon,
+                                || {
+                                    verify_checkpoint_poseidon(
+                                        start_accumulator,
+                                        end_accumulator,
+                                        &inputs.accepted_claim_witness,
+                                        &proof.checkpoint_poseidon,
+                                    )
+                                    .map_err(AcceptedBlockBatchComponentError::CheckpointPoseidon)
+                                },
+                                || {
+                                    inputs
+                                        .exact_state_killshot_inputs
+                                        .par_iter()
+                                        .zip(proof.exact_state.par_iter())
+                                        .enumerate()
+                                        .try_for_each(|(index, (inputs, proof))| {
+                                            verify_exact_state_killshot(inputs, proof).map_err(
+                                                |source| {
+                                                    AcceptedBlockBatchComponentError::ExactState {
+                                                        index,
+                                                        source,
+                                                    }
+                                                },
                                             )
-                                            .map_err(
-                                                AcceptedBlockBatchComponentError::CheckpointPoseidon,
-                                            )
-                                        },
-                                        || {
-                                            inputs
-                                                .exact_state_killshot_inputs
-                                                .par_iter()
-                                                .zip(proof.exact_state.par_iter())
-                                                .enumerate()
-                                                .try_for_each(|(index, (inputs, proof))| {
-                                                    verify_exact_state_killshot(inputs, proof)
-                                                        .map_err(|source| {
-                                                            AcceptedBlockBatchComponentError::ExactState {
-                                                                index,
-                                                                source,
-                                                            }
-                                                        })
-                                                })
+                                        })
                                 },
                             )
                         },
@@ -250,8 +229,7 @@ pub fn verify_accepted_block_batch_components(
     );
 
     claim_hash_result?;
-    standard_result?;
-    sweep_result?;
+    tx_body_result?;
     tx_root_result?;
     authorization_result?;
     let accepted_claim_batch = claim_batch_result?;
@@ -271,41 +249,41 @@ pub fn verify_exact_state_killshot(
     validate_exact_state_inputs(inputs)?;
 
     let (slot_result, state_result) = rayon::join(
-            || {
-                let mut channel = Poseidon2bChannel::new();
-                let reductions = verify_batched_slot_leaf_killshot(
-                    &proof.slot_leaves,
-                    &inputs.slot_leaves,
-                    &mut channel,
-                )
-                .ok_or(ExactStateKillShotError::SlotLeafProofRejected)?;
-                if discharge_batched_slot_leaf_reductions_native(&inputs.slot_leaves, &reductions) {
-                    Ok(())
-                } else {
-                    Err(ExactStateKillShotError::SlotLeafProofRejected)
-                }
-            },
-            || {
-                let circuit = MerkleCircuit::build_with_tag(TAG_EXSTNOD);
-                let mut channel = Poseidon2bChannel::new();
-                let reductions = verify_batched_merkle_killshot(
-                    &circuit,
-                    &proof.state_paths,
-                    &inputs.state_paths,
-                    &mut channel,
-                )
-                .ok_or(ExactStateKillShotError::StateMerkleProofRejected)?;
-                if discharge_batched_merkle_reductions_native(
-                    &circuit,
-                    &inputs.state_paths,
-                    &reductions,
-                ) {
-                    Ok(())
-                } else {
-                    Err(ExactStateKillShotError::StateMerkleProofRejected)
-                }
-            },
-        );
+        || {
+            let mut channel = Poseidon2bChannel::new();
+            let reductions = verify_batched_slot_leaf_killshot(
+                &proof.slot_leaves,
+                &inputs.slot_leaves,
+                &mut channel,
+            )
+            .ok_or(ExactStateKillShotError::SlotLeafProofRejected)?;
+            if discharge_batched_slot_leaf_reductions_native(&inputs.slot_leaves, &reductions) {
+                Ok(())
+            } else {
+                Err(ExactStateKillShotError::SlotLeafProofRejected)
+            }
+        },
+        || {
+            let circuit = MerkleCircuit::build_with_tag(TAG_EXSTNOD);
+            let mut channel = Poseidon2bChannel::new();
+            let reductions = verify_batched_merkle_killshot(
+                &circuit,
+                &proof.state_paths,
+                &inputs.state_paths,
+                &mut channel,
+            )
+            .ok_or(ExactStateKillShotError::StateMerkleProofRejected)?;
+            if discharge_batched_merkle_reductions_native(
+                &circuit,
+                &inputs.state_paths,
+                &reductions,
+            ) {
+                Ok(())
+            } else {
+                Err(ExactStateKillShotError::StateMerkleProofRejected)
+            }
+        },
+    );
     slot_result?;
     state_result?;
     Ok(())
@@ -320,8 +298,7 @@ fn validate_component_shape(
         || inputs.authorization_traces.len() != inputs.authorization_witnesses.len()
         || inputs.accepted_claim_hash_inputs.len()
             != inputs.accepted_claim_witness.accepted_block_claims.len()
-        || inputs.tx_body_standard_inputs.len() != inputs.tx_body_standard_hashes.len()
-        || inputs.tx_body_sweep_inputs.len() != inputs.tx_body_sweep_hashes.len()
+        || inputs.tx_body_inputs.len() != inputs.tx_body_hashes.len()
     {
         return Err(AcceptedBlockBatchComponentError::ComponentShapeMismatch);
     }
@@ -392,63 +369,34 @@ fn verify_accepted_claim_hash_component(
     }
 }
 
-fn verify_standard_tx_body_component(
+fn verify_tx_body_component(
     inputs: &AcceptedBlockBatchComponentInputs,
     proof: &AcceptedBlockBatchComponentProof,
 ) -> Result<(), AcceptedBlockBatchComponentError> {
-    if inputs.tx_body_standard_inputs.is_empty() {
-        if proof.tx_body_standard.is_some() {
+    if inputs.tx_body_inputs.is_empty() {
+        if proof.tx_body.is_some() {
             return Err(AcceptedBlockBatchComponentError::ComponentShapeMismatch);
         }
         return Ok(());
     }
     let tx_body_proof = proof
-        .tx_body_standard
+        .tx_body
         .as_ref()
         .ok_or(AcceptedBlockBatchComponentError::ComponentShapeMismatch)?;
     let mut channel = Poseidon2bChannel::new();
     let reductions = verify_block_spine_killshot(
         tx_body_proof,
-        inputs.tx_body_standard_inputs.len(),
-        &inputs.tx_body_standard_hashes,
+        inputs.tx_body_inputs.len(),
+        &inputs.tx_body_hashes,
         &mut channel,
     )
     .ok_or(AcceptedBlockBatchComponentError::TxBodyHashProofRejected)?;
-    let slot_state_ins = standard_tx_body_slot_state_ins(&inputs.tx_body_standard_inputs);
+    let slot_state_ins = tx_body_slot_state_ins(&inputs.tx_body_inputs);
     if discharge_block_spine_reductions_native(
-        inputs.tx_body_standard_inputs.len(),
+        inputs.tx_body_inputs.len(),
         &slot_state_ins,
         &reductions,
     ) {
-        Ok(())
-    } else {
-        Err(AcceptedBlockBatchComponentError::TxBodyHashProofRejected)
-    }
-}
-
-fn verify_sweep_tx_body_component(
-    inputs: &AcceptedBlockBatchComponentInputs,
-    proof: &AcceptedBlockBatchComponentProof,
-) -> Result<(), AcceptedBlockBatchComponentError> {
-    if inputs.tx_body_sweep_inputs.is_empty() {
-        if proof.tx_body_sweep.is_some() {
-            return Err(AcceptedBlockBatchComponentError::ComponentShapeMismatch);
-        }
-        return Ok(());
-    }
-    let tx_body_proof = proof
-        .tx_body_sweep
-        .as_ref()
-        .ok_or(AcceptedBlockBatchComponentError::ComponentShapeMismatch)?;
-    let mut channel = Poseidon2bChannel::new();
-    let reductions = verify_sweep_block_spine_killshot(
-        tx_body_proof,
-        inputs.tx_body_sweep_inputs.len(),
-        &inputs.tx_body_sweep_hashes,
-        &mut channel,
-    )
-    .ok_or(AcceptedBlockBatchComponentError::TxBodyHashProofRejected)?;
-    if discharge_sweep_block_spine_reductions_native(&inputs.tx_body_sweep_inputs, &reductions) {
         Ok(())
     } else {
         Err(AcceptedBlockBatchComponentError::TxBodyHashProofRejected)
@@ -510,20 +458,11 @@ fn verify_authorization_components(
                         tx_index: input.tx_index,
                     }
                 })?;
-            Ok((verified.owner_count, verified.live_input_count))
+            Ok(verified.live_input_count)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let owner_count_total = auth_counts
-        .iter()
-        .map(|(owner_count, _)| *owner_count)
-        .sum::<usize>();
-    let live_input_count_total = auth_counts
-        .iter()
-        .map(|(_, live_inputs)| *live_inputs)
-        .sum::<usize>();
-    if owner_count_total != inputs.authorization_totals.owner_count_total
-        || live_input_count_total != inputs.authorization_totals.live_input_count_total
-    {
+    let live_input_count_total = auth_counts.iter().sum::<usize>();
+    if live_input_count_total != inputs.authorization_totals.live_input_count_total {
         return Err(AcceptedBlockBatchComponentError::ComponentShapeMismatch);
     }
     Ok(())
@@ -535,31 +474,24 @@ fn validate_exact_state_inputs(
     if inputs.slot_leaves.is_empty() || inputs.state_paths.is_empty() {
         return Err(ExactStateKillShotError::EmptyDerivedInput);
     }
-    if inputs.slot_leaves.len() != inputs.state_paths.len()
-        || inputs.state_paths.len() % 2 != 0
-    {
+    if inputs.slot_leaves.len() != inputs.state_paths.len() || inputs.state_paths.len() % 2 != 0 {
         return Err(ExactStateKillShotError::EmptyDerivedInput);
     }
     let half = inputs.state_paths.len() / 2;
     let depth = inputs.state_paths[0].active_depth;
     let old_root = inputs.state_paths[0].expected_root;
     let new_root = inputs.state_paths[half].expected_root;
-    if inputs
-        .state_paths
-        .iter()
-        .enumerate()
-        .any(|(index, path)| {
-            path.active_depth != depth
-                || path.leaf != inputs.slot_leaves[index].expected_leaf
-                || path.expected_root != if index < half { old_root } else { new_root }
-        })
-    {
+    if inputs.state_paths.iter().enumerate().any(|(index, path)| {
+        path.active_depth != depth
+            || path.leaf != inputs.slot_leaves[index].expected_leaf
+            || path.expected_root != if index < half { old_root } else { new_root }
+    }) {
         return Err(ExactStateKillShotError::StateMerkleProofRejected);
     }
     Ok(())
 }
 
-fn standard_tx_body_slot_state_ins(inputs: &[SpineInputs]) -> Vec<[Block128; 4]> {
+fn tx_body_slot_state_ins(inputs: &[SpineInputs]) -> Vec<[Block128; 4]> {
     let circuit = SpineCircuit::build();
     let mut slot_state_ins = Vec::new();
     for input in inputs {
@@ -577,33 +509,22 @@ mod tests {
     use super::*;
 
     fn authorization_component_input() -> AuthorizationComponentInput {
-        let layout = noid_gkr::OwnerAuthLayout::for_owner_count(1).unwrap();
         AuthorizationComponentInput {
             block_index: 0,
             tx_index: 0,
             tx_body_hash: [Block128::from(7u128), Block128::from(8u128)],
             live_input_count: 1,
             public: OwnerAuthPublicInputs::new(
-                layout,
                 [Block128::from(7u128), Block128::from(8u128)],
-                vec![[Block128::from(9u128), Block128::from(10u128)]],
-            )
-            .unwrap(),
+                [Block128::from(9u128), Block128::from(10u128)],
+            ),
         }
     }
 
     #[test]
-    fn authorization_component_boundary_rejects_multi_owner_and_bad_live_count() {
+    fn authorization_component_boundary_rejects_bad_live_count() {
         let valid = authorization_component_input();
         assert!(authorization_component_input_shape_ok(&valid));
-
-        let mut multi_owner = valid.clone();
-        multi_owner.public.layout = noid_gkr::OwnerAuthLayout::for_owner_count(2).unwrap();
-        multi_owner
-            .public
-            .expected_address
-            .push([Block128::from(11u128), Block128::from(12u128)]);
-        assert!(!authorization_component_input_shape_ok(&multi_owner));
 
         for count in [0, noid_gkr::MAX_AUTHORIZATION_LIVE_INPUTS + 1] {
             let mut bad_count = valid.clone();

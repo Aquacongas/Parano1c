@@ -67,24 +67,17 @@ pub trait WalletOps: Send + Sync {
     /// guard, establishing the global `chain -> wallet` lock order.
     fn on_accepted_block(&self, block: &Block) -> Result<(), String>;
 
-    /// Plan one logical payment as one or more transaction amounts using a fixed
-    /// per-tx fee. Kept for focused tests and simple callers.
-    fn plan_send_splits(
-        &self,
-        amount_micronoid: u64,
-        fee_per_tx_micronoid: u64,
-    ) -> Result<Vec<u64>, String>;
-
-    /// Shape-aware dry-run plan for one logical payment.
+    /// Deterministically plan a logical payment as one or more ordinary
+    /// canonical transactions. Every chunk uses at most eight active UTXOs.
     ///
-    /// `explicit_fee_micronoid = Some(fee)` applies that fee to every planned tx
-    /// and rejects it if below the deterministic minimum for the resulting shape.
-    /// `None` computes automatic per-chunk relay fee from actual planned
-    /// input/output counts.
+    /// `explicit_fee_per_tx_micronoid = Some(fee)` applies that fee to every planned tx
+    /// and rejects it if below the deterministic minimum for the resulting I/O.
+    /// `None` computes the automatic relay fee independently for each chunk
+    /// from its actual input/output counts.
     fn plan_send(
         &self,
         amount_micronoid: u64,
-        explicit_fee_micronoid: Option<u64>,
+        explicit_fee_per_tx_micronoid: Option<u64>,
         active_slot_count: u64,
         log_slots: u32,
         relay_floor: u64,
@@ -92,9 +85,9 @@ pub trait WalletOps: Send + Sync {
 
     /// Build, prove, and serialize a send transaction.
     ///
-    /// Returns raw `TxIntent` bytes plus selected input slot indices ready for
-    /// mempool submission. The caller must call `add_pending_inputs` only after
-    /// successful mempool admission; otherwise retries can self-lock UTXOs.
+    /// Returns raw `TxIntent` bytes plus selected input slot indices. Building
+    /// is side-effect free: the async coordinator installs the complete pending
+    /// reservation only after `spawn_blocking` returns.
     ///
     /// This is CPU-heavy (~0.3–3 s): caller must invoke in `spawn_blocking`.
     ///
@@ -102,8 +95,8 @@ pub trait WalletOps: Send + Sync {
     /// - `to_address`: recipient 32-byte address
     /// - `amount_micronoid`: payment amount in μNOID
     /// - `fee_micronoid`: transaction fee in μNOID
-    /// - `epoch_anchor`: current chain tip full-block hash (from `block_id(tip)`)
-    /// - `slot_hints`: 2–4 empty slot indices for outputs (from `get_slot_hints`)
+    /// - `epoch_anchor`: exact transaction-epoch anchor for the next block
+    /// - `slot_hints`: one or two empty slot indices for outputs
     /// - `log_slots`: current chain `log_slots` (from `tip_header().log_slots`)
     fn build_send(
         &self,
@@ -122,22 +115,19 @@ pub trait WalletOps: Send + Sync {
 
     /// Return how many inputs the next consolidation round would select.
     ///
-    /// This is lightweight planning used for shape-aware auto-fee calculation.
-    /// It must skip pending input slots and cap at the largest supported wallet
-    /// shape (`Sweep25x2`).
+    /// This is lightweight planning used for automatic fee calculation. It
+    /// skips pending input slots and caps one round at eight inputs.
     fn plan_consolidate_input_count(&self) -> Result<usize, String>;
 
     /// Consolidate small UTXOs into one larger UTXO.
     ///
-    /// Selects the smallest UTXOs (up to `Sweep25x2` capacity) and sends their
-    /// combined value minus fee to the wallet's own primary address.
+    /// Selects up to eight smallest UTXOs and sends their combined value minus
+    /// fee to the active address as an ordinary transaction.
     ///
     /// Returns `(intent_bytes, input_slot_indices)` on success, or an error
     /// string if there is nothing to consolidate (e.g. only 1 UTXO, or
-    /// insufficient funds).  The caller is responsible for calling
-    /// `add_pending_inputs` with the returned slot indices **only after**
-    /// the transaction is successfully submitted to the mempool, so that a
-    /// failed submit does not permanently lock those UTXOs.
+    /// insufficient funds). Building is side-effect free; the coordinator owns
+    /// the pending reservation around normal mempool admission.
     ///
     /// This is CPU-heavy (~0.3–3 s): caller must invoke in `spawn_blocking`.
     fn build_consolidate(
@@ -148,17 +138,25 @@ pub trait WalletOps: Send + Sync {
         log_slots: u32,
     ) -> Result<(Vec<u8>, Vec<u32>), String>;
 
-    /// Mark input slot indices as pending (spent by a submitted but
-    /// unconfirmed tx).  Prevents subsequent consolidation or send rounds
-    /// from double-spending the same UTXOs before the first TX is confirmed.
-    ///
-    /// For `build_consolidate` this must be called by the RPC layer only
-    /// after a successful `mempool.submit`.
-    fn add_pending_inputs(&self, slots: &[u32]);
+    /// Atomically reserve every wallet-side artifact immediately before async
+    /// mempool admission. The caller wraps this reservation in an owned rollback
+    /// guard, so task cancellation cannot strand inputs, outputs, or history.
+    fn reserve_pending_submission(
+        &self,
+        txid: [u8; 32],
+        input_slots: &[u32],
+        output_slots: &[u32],
+        amount_micronoid: u64,
+        peer_address: [u8; 32],
+    ) -> Result<(), String>;
 
-    /// Clear wallet-side pending output/history state for a send attempt that
-    /// built successfully but failed mempool admission.
-    fn cleanup_failed_send(&self, tx_hash: [u8; 32], output_slots: &[u32]);
+    /// Roll back the exact reservation installed above. Safe to call from Drop.
+    fn rollback_pending_submission(
+        &self,
+        txid: [u8; 32],
+        input_slots: &[u32],
+        output_slots: &[u32],
+    );
 
     /// The ACTIVE address (key index + bech32m): every send/consolidation
     /// spends this address's UTXOs only and change returns to it (one owner

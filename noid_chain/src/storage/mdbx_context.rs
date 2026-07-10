@@ -36,7 +36,7 @@
 //! | Undo logs | MDBX retained window | Reorg recovery |
 //! | Block bodies/proofs/sidecars | MDBX retained suffix after coverage | Bounded peer sync and prover input |
 //! | ChainState (active/alloc) | MDBX (state_meta) | Fast restart |
-//! | Recent headers | RAM (MEDIAN_TIME_BLOCKS + ANCHOR_DEPTH) | Timestamp + anchor validation |
+//! | Recent headers | RAM (MTP/expansion window) | Header validation |
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -53,11 +53,9 @@ use crate::checkpoint::{
 use crate::consensus::{
     da_prune::{build_undo_log, revert_block},
     difficulty::{add_work, block_work},
-    header::epoch_anchor_height,
-    params::{
-        ANCHOR_DEPTH, CONSENSUS_FINALITY_DEPTH, EXPANSION_WINDOW, GENESIS_TARGET,
-        MEDIAN_TIME_BLOCKS,
-    },
+    epoch_anchor::{tx_epoch_anchor_height_for_child, validate_block_epoch_anchors},
+    header::asert_anchor_height,
+    params::{CONSENSUS_FINALITY_DEPTH, EXPANSION_WINDOW, GENESIS_TARGET, MEDIAN_TIME_BLOCKS},
     pow::block_id,
     validation::{validate_block_checks, AnchorInfo},
     ConsensusError,
@@ -120,8 +118,7 @@ pub struct MdbxChainContext {
     /// atomically with each block commit.
     pub state: ChainState,
 
-    /// Recent headers for validation (needed for MTP, ASERT anchor, epoch_anchor check).
-    /// Covers the last `MEDIAN_TIME_BLOCKS + ANCHOR_DEPTH` blocks.
+    /// Recent headers needed for MTP, ASERT and the expansion median.
     pub recent_headers: HashMap<u64, BlockHeader>,
 
     /// Current tip height.
@@ -419,8 +416,8 @@ impl MdbxChainContext {
             ));
         }
 
-        // 5. Rebuild recent headers (last MEDIAN_TIME_BLOCKS + ANCHOR_DEPTH blocks).
-        let window = (MEDIAN_TIME_BLOCKS as u64) + ANCHOR_DEPTH;
+        // 5. Rebuild the bounded header window used by native header checks.
+        let window = (MEDIAN_TIME_BLOCKS as u64).max(EXPANSION_WINDOW);
         let start_height = tip_height.saturating_sub(window);
         let mut recent_headers = HashMap::new();
         for h in start_height..=tip_height {
@@ -484,8 +481,7 @@ impl MdbxChainContext {
             .map(|(id, eff, cols)| (*id, *eff, cols))
             .collect();
 
-        let tx_hashes: Vec<TxBodyHash> =
-            block.transactions.iter().map(|t| t.tx_body_hash).collect();
+        let tx_hashes: Vec<TxBodyHash> = block.transactions.iter().map(|tx| tx.txid()).collect();
         let block_hash = block_id(&block.header);
         let new_tip_chain_work = add_work(
             &self.tip_chain_work,
@@ -526,7 +522,7 @@ impl MdbxChainContext {
         self.finalized = new_finalized;
         self.state.state.clear_dirty();
 
-        let window = (MEDIAN_TIME_BLOCKS as u64) + ANCHOR_DEPTH;
+        let window = (MEDIAN_TIME_BLOCKS as u64).max(EXPANSION_WINDOW);
         if self.tip_height > window {
             self.recent_headers.remove(&(self.tip_height - window - 1));
         }
@@ -560,6 +556,7 @@ impl MdbxChainContext {
             &[u64],
             &[u64],
             u64,
+            &[u8; 32],
             &AnchorInfo,
             &SegmentedFriState,
             &mut ChainState,
@@ -570,7 +567,15 @@ impl MdbxChainContext {
         let prev_timestamps = self.prev_timestamps();
         let prev_active_counts = self.prev_active_counts();
         let anchor = self.anchor_info();
-        // All deterministic cheap checks, including shape-charged resources
+        let tx_anchor_height = tx_epoch_anchor_height_for_child(block.header.height);
+        let tx_anchor_header =
+            self.get_header_from_store(tx_anchor_height)?
+                .ok_or(MdbxContextError::Corrupt(
+                    "canonical transaction epoch-anchor header missing",
+                ))?;
+        let tx_epoch_anchor_id = block_id(&tx_anchor_header);
+        validate_block_epoch_anchors(block, tx_epoch_anchor_id, block_id(&parent))?;
+        // All deterministic cheap checks, including bitmap-live resources
         // and the segment cap, precede proof decode, segment hydration, state
         // cloning, and undo allocation.
         validate_block_checks(
@@ -634,6 +639,7 @@ impl MdbxChainContext {
             &prev_timestamps,
             &prev_active_counts,
             local_time,
+            &tx_epoch_anchor_id,
             &anchor,
             &pre_state,
             &mut self.state,
@@ -875,12 +881,12 @@ impl MdbxChainContext {
                 (true, _) => {
                     return Err(MdbxContextError::Corrupt(
                         "checkpoint user block proof missing",
-                    ))
+                    ));
                 }
                 (false, Some(bytes)) if !bytes.is_empty() => {
                     return Err(MdbxContextError::Corrupt(
                         "checkpoint coinbase block has unexpected proof bytes",
-                    ))
+                    ));
                 }
                 (false, _) => Vec::new(),
             };
@@ -889,12 +895,12 @@ impl MdbxChainContext {
                 (true, _) => {
                     return Err(MdbxContextError::Corrupt(
                         "checkpoint user block auth sidecar missing",
-                    ))
+                    ));
                 }
                 (false, Some(bytes)) if !bytes.is_empty() => {
                     return Err(MdbxContextError::Corrupt(
                         "checkpoint coinbase block has unexpected auth sidecar bytes",
-                    ))
+                    ));
                 }
                 (false, _) => Vec::new(),
             };
@@ -1325,10 +1331,10 @@ impl MdbxChainContext {
         let mut needed: std::collections::HashSet<u16> = std::collections::HashSet::new();
 
         for tx in &block.transactions {
-            for inp in tx.body.inputs.iter().filter(|i| i.valid) {
+            for (_, inp) in tx.body.live_inputs() {
                 needed.insert((inp.slot_index >> eff_log) as u16);
             }
-            for out in tx.body.outputs.iter().filter(|o| o.valid) {
+            for (_, out) in tx.body.live_outputs() {
                 needed.insert((out.slot_index >> eff_log) as u16);
             }
             // Coinbase slot (splitmix64 assigned): include all recently-checked
@@ -1601,7 +1607,7 @@ impl MdbxChainContext {
 
     /// Collect the last `EXPANSION_WINDOW` `active_slot_count` values for the
     /// median expansion trigger. Always available: `recent_headers` covers
-    /// `MEDIAN_TIME_BLOCKS + ANCHOR_DEPTH` (≥ EXPANSION_WINDOW) blocks.
+    /// the bounded recent window (≥ EXPANSION_WINDOW).
     pub fn prev_active_counts(&self) -> Vec<u64> {
         let tip = self.tip_height;
         let start = tip.saturating_sub(EXPANSION_WINDOW.saturating_sub(1));
@@ -1611,7 +1617,7 @@ impl MdbxChainContext {
     }
 
     pub fn anchor_info(&self) -> AnchorInfo {
-        let anchor_height = epoch_anchor_height(self.tip_height);
+        let anchor_height = asert_anchor_height(self.tip_height);
         let anchor_header = self
             .recent_headers
             .get(&anchor_height)
@@ -1623,19 +1629,13 @@ impl MdbxChainContext {
         }
     }
 
-    /// Check whether `anchor_hash` references a known header within the
-    /// ANCHOR_DEPTH window relative to `tip_height`.
-    ///
-    /// Used by the template builder to filter out transactions whose
-    /// epoch_anchor has expired since mempool admission.
-    pub fn is_anchor_fresh(&self, anchor_hash: &[u8; 32], tip_height: u64) -> bool {
-        let lo = tip_height.saturating_sub(ANCHOR_DEPTH);
-        (lo..=tip_height).any(|h| {
-            self.recent_headers
-                .get(&h)
-                .map(|hdr| block_id(hdr) == *anchor_hash)
-                .unwrap_or(false)
-        })
+    /// Check exact equality with the start anchor for the next child block.
+    pub fn is_current_tx_epoch_anchor(&self, anchor_hash: &[u8; 32]) -> bool {
+        let height = tx_epoch_anchor_height_for_child(self.tip_height + 1);
+        self.get_header_from_store(height)
+            .ok()
+            .flatten()
+            .is_some_and(|header| block_id(&header) == *anchor_hash)
     }
 
     pub fn tip_height(&self) -> u64 {
@@ -1691,1147 +1691,176 @@ fn checkpoint_segments_and_root(
 mod tests {
     use super::*;
     use crate::block::{compute_tx_root, Block};
-    use crate::block_header::BlockHeader;
-    use crate::consensus::{params::BLOCK_TIME, pow::block_id};
+    use crate::chain_context::TEST_TARGET;
+    use crate::consensus::{emission::block_reward, params::BLOCK_TIME};
     use noid_poseidon2b::primitives::Address;
+    use noid_tx::{
+        output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS,
+    };
 
-    fn build_coinbase_block_on(ctx: &mut MdbxChainContext) -> Block {
-        let slot_index = ctx
-            .tip_height()
-            .checked_add(1)
-            .and_then(|height| u32::try_from(height).ok())
-            .expect("test height fits a fresh slot index");
-        build_coinbase_block_at(ctx, slot_index, 0x42)
-    }
-
-    fn build_coinbase_block_at(
-        ctx: &mut MdbxChainContext,
-        slot_index: u32,
-        owner_seed: u8,
-    ) -> Block {
-        use crate::chain_context::TEST_TARGET;
-        use crate::consensus::emission::block_reward;
-        use noid_tx::{hash_tx_body_for_shape, Transaction, TxBody, TxOutput, TxShape};
-
+    fn coinbase_block(ctx: &MdbxChainContext, slot: u32, owner: Address) -> Block {
         let parent = *ctx.tip_header();
-        let owner = Address([owner_seed; 32]);
-        let body = TxBody::standard(
-            block_id(&parent),
-            0,
-            vec![],
-            vec![TxOutput {
-                slot_index,
-                value: block_reward(parent.log_slots),
-                owner,
-                valid: true,
-            }],
-            true,
-        );
-        let tx_body_hash = hash_tx_body_for_shape(
-            TxShape::Standard4x8,
-            &body.epoch_anchor,
-            body.fee,
-            &body.inputs,
-            &body.outputs,
-            body.is_coinbase,
-        );
-        let tx = Transaction { body, tx_body_hash };
-
-        let mut child = ctx.state.clone();
-        crate::state::apply_tx(&mut child, &tx.body).expect("coinbase fixture applies");
-        let header = BlockHeader {
-            prev_block_hash: block_id(&parent),
-            state_root: child.state_root(),
-            tx_root: compute_tx_root(std::slice::from_ref(&tx)),
-            timestamp: parent.timestamp + BLOCK_TIME,
-            height: parent.height + 1,
-            miner_address: owner,
-            nonce: owner_seed as u128,
-            difficulty_target: TEST_TARGET,
-            log_slots: parent.log_slots,
-            active_slot_count: child.active_slot_count,
-            alloc_counter: child.alloc_counter,
+        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        outputs[0] = TxOutput {
+            slot_index: slot,
+            amount: block_reward(parent.log_slots),
+            owner,
         };
-        Block {
-            header,
-            transactions: vec![tx],
-        }
-    }
-
-    /// Construct the header/state pair that the old blind delta path would
-    /// accept when a coinbase overwrites an occupied slot. The exact validator
-    /// must reject it even though the supplied post-root and counters agree
-    /// with that invalid overwrite.
-    fn build_overwriting_coinbase_block_at(
-        ctx: &MdbxChainContext,
-        slot_index: u32,
-        owner_seed: u8,
-    ) -> Block {
-        use crate::chain_context::TEST_TARGET;
-        use crate::consensus::emission::block_reward;
-        use crate::fri_state::SlotValue;
-        use noid_tx::{hash_tx_body_for_shape, Transaction, TxBody, TxOutput, TxShape};
-
-        let parent = *ctx.tip_header();
-        let owner = Address([owner_seed; 32]);
-        let value = block_reward(parent.log_slots);
-        let body = TxBody::standard(
-            block_id(&parent),
-            0,
-            vec![],
-            vec![TxOutput {
-                slot_index,
-                value,
-                owner,
-                valid: true,
-            }],
-            true,
-        );
-        let tx_body_hash = hash_tx_body_for_shape(
-            TxShape::Standard4x8,
-            &body.epoch_anchor,
-            body.fee,
-            &body.inputs,
-            &body.outputs,
-            body.is_coinbase,
-        );
-        let tx = Transaction { body, tx_body_hash };
-
-        let mut blind_child = ctx.state.clone();
-        blind_child.alloc_counter = blind_child
-            .alloc_counter
-            .checked_add(1)
-            .expect("test allocation counter");
-        blind_child.active_slot_count = blind_child
-            .active_slot_count
-            .checked_add(1)
-            .expect("test active-slot counter");
-        blind_child
-            .state
-            .set_slot(
-                slot_index,
-                SlotValue::with_owner_fields(value, blind_child.alloc_counter, owner.as_fields()),
-            )
-            .expect("blind overwrite fixture stays in range");
-        let state_root = blind_child.state_root();
-
+        let tx = Transaction::new(TxBody {
+            epoch_anchor: block_id(&parent),
+            fee: 0,
+            input_owner: Address([0u8; 32]),
+            inputs: [TxInput::dummy(); TX_INPUTS],
+            outputs,
+            validity_bitmap: output_bitmap_bit(0),
+            is_coinbase: true,
+        });
+        let mut child = ctx.state.clone();
+        crate::state::apply_tx(&mut child, &tx.body).unwrap();
         Block {
             header: BlockHeader {
                 prev_block_hash: block_id(&parent),
-                state_root,
+                state_root: child.state_root(),
                 tx_root: compute_tx_root(std::slice::from_ref(&tx)),
                 timestamp: parent.timestamp + BLOCK_TIME,
                 height: parent.height + 1,
                 miner_address: owner,
-                nonce: owner_seed as u128,
+                nonce: 0,
                 difficulty_target: TEST_TARGET,
                 log_slots: parent.log_slots,
-                active_slot_count: blind_child.active_slot_count,
-                alloc_counter: blind_child.alloc_counter,
+                active_slot_count: child.active_slot_count,
+                alloc_counter: child.alloc_counter,
             },
             transactions: vec![tx],
         }
     }
 
-    fn apply_coinbase_only_for_test(
+    fn apply_coinbase(
         ctx: &mut MdbxChainContext,
         block: &Block,
-        local_time: u64,
-    ) -> Result<[u8; 32], MdbxContextError> {
-        apply_coinbase_only_with_witness_for_test(ctx, block, &[], &[], local_time)
-    }
-
-    fn apply_coinbase_only_with_witness_for_test(
-        ctx: &mut MdbxChainContext,
-        block: &Block,
-        block_proof_bytes: &[u8],
-        block_auth_sidecar_bytes: &[u8],
-        local_time: u64,
     ) -> Result<[u8; 32], MdbxContextError> {
         ctx.apply_next_block(
             block,
-            block_proof_bytes,
-            block_auth_sidecar_bytes,
-            local_time,
+            &[],
+            &[],
+            block.header.timestamp + 1,
             |block,
-             _proof_bytes,
-             _auth_sidecar_bytes,
+             _proof,
+             _sidecar,
              _parent,
-             _prev_timestamps,
-             _prev_active_counts,
-             _local_time,
+             _timestamps,
+             _active,
+             _local,
+             _tx_epoch,
              _anchor,
              _pre_state,
              state|
              -> Result<[u8; 32], String> {
                 crate::block::apply_block(state, block)
                     .map(|transition| transition.new_state_root)
-                    .map_err(|error| format!("test exact transition rejected: {error:?}"))
+                    .map_err(|error| format!("{error:?}"))
             },
         )
     }
 
     #[test]
-    fn open_fresh_database() {
+    fn fresh_database_has_canonical_genesis_anchor() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
         assert_eq!(ctx.tip_height(), 0);
-        let h0 = *ctx.tip_header();
-        let expected_anchor =
-            crate::compute_header_chain_anchor(std::iter::once(&h0), *ctx.tip_chain_work())
-                .expect("genesis anchor");
-        assert_eq!(
-            ctx.store.get_header_anchor(0).unwrap(),
-            Some(expected_anchor)
-        );
+        let header = *ctx.tip_header();
+        let expected =
+            crate::compute_header_chain_anchor(std::iter::once(&header), *ctx.tip_chain_work())
+                .unwrap();
+        assert_eq!(ctx.store.get_header_anchor(0).unwrap(), Some(expected));
     }
 
     #[test]
-    fn segment_cap_fails_before_preload_reads() {
-        use noid_poseidon2b::primitives::{Address, SpendSecret, TxBodyHash};
-        use noid_tx::{Transaction, TxBody, TxInput, TxShape};
-
+    fn coinbase_commit_tx_index_and_restart_are_atomic() {
         let dir = tempfile::tempdir().unwrap();
-        let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
-        let mut transactions = Vec::new();
-        for chunk in (0..257usize).collect::<Vec<_>>().chunks(4) {
-            let inputs = chunk
-                .iter()
-                .map(|&segment| TxInput {
-                    slot_index: (segment as u32) << crate::consensus::params::LOG_SEGMENT_SIZE,
-                    value: 1,
-                    creation_id: 0,
-                    owner: Address([1; 32]),
-                    spend_secret: SpendSecret([2; 32]),
-                    valid: true,
-                })
-                .collect();
-            transactions.push(Transaction {
-                body: TxBody {
-                    shape: TxShape::Standard4x8,
-                    epoch_anchor: [1; 32],
-                    fee: 0,
-                    inputs,
-                    outputs: Vec::new(),
-                    is_coinbase: false,
-                },
-                tx_body_hash: TxBodyHash([0; 32]),
-            });
-        }
-        let mut header = *ctx.tip_header();
-        header.log_slots = 32;
-        let block = Block {
-            header,
-            transactions,
-        };
-
-        assert!(matches!(
-            ctx.preload_segments_for_block(&block),
-            Err(MdbxContextError::Consensus(
-                ConsensusError::BlockResourceLimitExceeded {
-                    limit: "distinct_segments",
-                    actual: 257,
-                    max: crate::consensus::params::BLOCK_MAX_DISTINCT_SEGMENTS,
-                }
-            ))
-        ));
-    }
-
-    #[test]
-    fn persist_reorg_checkpoint_rejects_missing_non_genesis_undo() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
-        let mut ancestor = *ctx.tip_header();
-        ancestor.height = 1;
-
-        assert!(matches!(
-            ctx.persist_reorg_checkpoint(&ancestor, &[]),
-            Err(MdbxContextError::Corrupt("reorg ancestor undo log missing"))
-        ));
-        assert!(ctx.store.get_undo_log(1).unwrap().is_none());
-    }
-
-    #[test]
-    fn apply_one_block_and_reopen() {
-        let dir = tempfile::tempdir().unwrap();
-
-        // Apply one block.
+        let txid;
+        let root;
         {
             let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
-            let block = build_coinbase_block_on(&mut ctx);
-            let ts = block.header.timestamp + 1;
-            apply_coinbase_only_for_test(&mut ctx, &block, ts).unwrap();
-            assert_eq!(ctx.tip_height(), 1);
+            let block = coinbase_block(&ctx, 7, Address([1u8; 32]));
+            txid = block.transactions[0].txid();
+            root = apply_coinbase(&mut ctx, &block).unwrap();
+            assert_eq!(ctx.store.get_tx_index(&txid.0).unwrap(), Some((1, 0)));
         }
-
-        // Reopen and verify tip is persisted.
-        {
-            let ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
-            assert_eq!(ctx.tip_height(), 1, "tip must survive restart");
-            let h0 = ctx.store.get_header(0).unwrap().expect("h0");
-            let h1 = ctx.store.get_header(1).unwrap().expect("h1");
-            let expected_anchor =
-                crate::compute_header_chain_anchor([h0, h1].iter(), *ctx.tip_chain_work())
-                    .expect("h1 anchor");
-            assert_eq!(
-                ctx.store.get_header_anchor(1).unwrap(),
-                Some(expected_anchor)
-            );
-        }
-    }
-
-    #[test]
-    fn coinbase_only_durable_boundary_rejects_occupied_mint_slot() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
-        let first = build_coinbase_block_at(&mut ctx, 7, 0x41);
-        apply_coinbase_only_for_test(&mut ctx, &first, first.header.timestamp + 1)
-            .expect("first coinbase occupies slot 7");
-
-        let before_tip = ctx.tip_height();
-        let before_root = ctx.state.cached_state_root();
-        let overwrite = build_overwriting_coinbase_block_at(&ctx, 7, 0x42);
-        let error =
-            apply_coinbase_only_for_test(&mut ctx, &overwrite, overwrite.header.timestamp + 1)
-                .expect_err("coinbase must prove its mint slot was empty");
-
-        assert!(matches!(error, MdbxContextError::Consensus(_)));
-        assert_eq!(ctx.tip_height(), before_tip);
-        assert_eq!(ctx.state.cached_state_root(), before_root);
-    }
-
-    #[test]
-    fn reorg_removes_orphan_tx_index_and_persists_new_branch_index() {
-        let dir = tempfile::tempdir().unwrap();
-        let competing_dir = tempfile::tempdir().unwrap();
-
-        let (orphan_hash, canonical_hash) = {
-            let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
-            let old_block = build_coinbase_block_at(&mut ctx, 7, 0x11);
-            let orphan_hash = old_block.transactions[0].tx_body_hash;
-            apply_coinbase_only_for_test(&mut ctx, &old_block, old_block.header.timestamp + 1)
-                .unwrap();
-            assert_eq!(
-                ctx.store.get_tx_index(&orphan_hash.0).unwrap(),
-                Some((1, 0))
-            );
-
-            // Build a genuinely competing height-1 block from the same easy
-            // genesis in an independent context.
-            let mut competing =
-                MdbxChainContext::open_or_create_for_test(competing_dir.path()).unwrap();
-            let new_block = build_coinbase_block_at(&mut competing, 9, 0x22);
-            let canonical_hash = new_block.transactions[0].tx_body_hash;
-            assert_ne!(orphan_hash, canonical_hash);
-
-            let result = ctx
-                .apply_reorg_mdbx_with_applier(
-                    0,
-                    std::slice::from_ref(&new_block),
-                    new_block.header.timestamp + 1,
-                    |ctx, block, local_time| {
-                        apply_coinbase_only_for_test(ctx, block, local_time).map(|_| ())
-                    },
-                )
-                .unwrap();
-            assert_eq!(result.reverted_heights, vec![1]);
-            assert_eq!(result.applied_heights, vec![1]);
-            assert_eq!(
-                ctx.store.get_tx_index(&orphan_hash.0).unwrap(),
-                None,
-                "an orphan transaction must not remain confirmed"
-            );
-            assert_eq!(
-                ctx.store.get_tx_index(&canonical_hash.0).unwrap(),
-                Some((1, 0))
-            );
-
-            (orphan_hash, canonical_hash)
-        };
-
         let reopened = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
         assert_eq!(reopened.tip_height(), 1);
-        assert_eq!(reopened.store.get_tx_index(&orphan_hash.0).unwrap(), None);
-        assert_eq!(
-            reopened.store.get_tx_index(&canonical_hash.0).unwrap(),
-            Some((1, 0)),
-            "canonical tx index must survive restart"
-        );
+        assert_eq!(reopened.state.cached_state_root(), root);
+        assert_eq!(reopened.store.get_tx_index(&txid.0).unwrap(), Some((1, 0)));
     }
 
     #[test]
-    fn expansion_upper_mint_reorg_restart_and_reexpand_stays_empty() {
-        use crate::chain_context::TEST_TARGET;
-        use crate::consensus::emission::block_reward;
-        use crate::consensus::params::LOG_SEGMENT_SIZE;
-        use noid_poseidon2b::primitives::SpendSecret;
-        use noid_tx::{hash_tx_body_for_shape, Transaction, TxBody, TxInput, TxOutput, TxShape};
-
-        let dir = tempfile::tempdir().unwrap();
-        let store = MdbxStore::open(dir.path()).unwrap();
-        let parent_log = LOG_SEGMENT_SIZE;
-        let mut state = ChainState::with_log_slots(parent_log as usize);
-        // Structural persistence fixture: the occupancy counter is placed at
-        // the expansion threshold without materialising 49k unrelated UTXOs.
-        // The test exercises domain grow/undo/storage, not occupancy accounting.
-        let expansion_trigger = (1u64 << parent_log) * 3 / 4;
-        state.active_slot_count = expansion_trigger;
-        let parent_root = state.cached_state_root();
-        let parent = BlockHeader {
-            prev_block_hash: [0u8; 32],
-            state_root: parent_root,
-            tx_root: compute_tx_root(&[]),
-            timestamp: 1_767_225_600,
-            height: 0,
-            miner_address: Address([0u8; 32]),
-            nonce: 0,
-            difficulty_target: TEST_TARGET,
-            log_slots: parent_log,
-            active_slot_count: expansion_trigger,
-            alloc_counter: 0,
-        };
-        let parent_hash = block_id(&parent);
-        let tip_chain_work = block_work(&TEST_TARGET);
-        let finalized = FinalizedCheckpoint {
-            height: 0,
-            hash: parent_hash,
-        };
-        let parent_meta = ConsensusMeta {
-            tip_height: 0,
-            tip_hash: parent_hash,
-            cumulative_chainwork: tip_chain_work,
-            finalized,
-        };
-        store
-            .commit_block(
-                &parent,
-                &parent_hash,
-                &crate::consensus::da_prune::BlockUndoLog::empty(0, parent_log),
-                &[],
-                &[],
-                &[],
-                None,
-                &parent_meta,
-                false,
-            )
-            .unwrap();
-
-        let mut recent_headers = HashMap::new();
-        recent_headers.insert(0, parent);
-        let mut ctx = MdbxChainContext {
-            store,
-            state,
-            recent_headers,
-            tip_height: 0,
-            tip_hash: parent_hash,
-            tip_chain_work,
-            finalized,
-            defer_finality_updates: false,
-        };
-
-        let child_log = parent_log + 1;
-        let upper_slot = 1u32 << parent_log;
-        let owner = Address([0x5A; 32]);
-        let reward = block_reward(child_log);
-        let body = TxBody::standard(
-            parent_hash,
-            0,
-            vec![],
-            vec![TxOutput {
-                slot_index: upper_slot,
-                value: reward,
-                owner,
-                valid: true,
-            }],
-            true,
-        );
-        let tx = Transaction {
-            tx_body_hash: hash_tx_body_for_shape(
-                TxShape::Standard4x8,
-                &body.epoch_anchor,
-                body.fee,
-                &body.inputs,
-                &body.outputs,
-                body.is_coinbase,
-            ),
-            body,
-        };
-        let transient_owner = Address([0x6B; 32]);
-        let transient_value = 17u64;
-        let transient_mint_body = TxBody::standard(
-            parent_hash,
-            0,
-            vec![],
-            vec![TxOutput {
-                slot_index: 7,
-                value: transient_value,
-                owner: transient_owner,
-                valid: true,
-            }],
-            false,
-        );
-        let transient_mint = Transaction {
-            tx_body_hash: hash_tx_body_for_shape(
-                TxShape::Standard4x8,
-                &transient_mint_body.epoch_anchor,
-                transient_mint_body.fee,
-                &transient_mint_body.inputs,
-                &transient_mint_body.outputs,
-                false,
-            ),
-            body: transient_mint_body,
-        };
-        let transient_spend_body = TxBody::standard(
-            parent_hash,
-            0,
-            vec![TxInput {
-                slot_index: 7,
-                value: transient_value,
-                creation_id: 2,
-                owner: transient_owner,
-                spend_secret: SpendSecret([0x7C; 32]),
-                valid: true,
-            }],
-            vec![],
-            false,
-        );
-        let transient_spend = Transaction {
-            tx_body_hash: hash_tx_body_for_shape(
-                TxShape::Standard4x8,
-                &transient_spend_body.epoch_anchor,
-                transient_spend_body.fee,
-                &transient_spend_body.inputs,
-                &transient_spend_body.outputs,
-                false,
-            ),
-            body: transient_spend_body,
-        };
-        let minted = crate::fri_state::SlotValue::with_owner_fields(reward, 1, owner.as_fields());
-        let mut child_state =
-            ChainState::from_sparse_utxos(child_log as usize, &[(upper_slot, minted)], 2).unwrap();
-        child_state.active_slot_count = expansion_trigger + 1;
-        let child = Block {
-            header: BlockHeader {
-                prev_block_hash: parent_hash,
-                state_root: child_state.cached_state_root(),
-                tx_root: compute_tx_root(&[
-                    tx.clone(),
-                    transient_mint.clone(),
-                    transient_spend.clone(),
-                ]),
-                timestamp: parent.timestamp + BLOCK_TIME,
-                height: 1,
-                miner_address: owner,
-                nonce: 0,
-                difficulty_target: TEST_TARGET,
-                log_slots: child_log,
-                active_slot_count: child_state.active_slot_count,
-                alloc_counter: child_state.alloc_counter,
-            },
-            transactions: vec![tx, transient_mint, transient_spend],
-        };
-
-        let undo = build_undo_log(&ctx.state, &child);
-        let state_before_child = ctx.state.clone();
-        ctx.state = child_state;
-        ctx.commit_applied_next_block(&child, &undo, &state_before_child)
-            .unwrap();
-        assert_eq!(ctx.state.state.log_slots(), child_log as usize);
-        assert_eq!(ctx.state.state.slot(upper_slot).creation_id(), 1);
-        assert_eq!(
-            ctx.store
-                .get_verified_utxos_by_owner(&owner.0)
-                .unwrap()
-                .utxos,
-            vec![crate::storage::mdbx_store::VerifiedOwnerUtxo {
-                slot_index: upper_slot,
-                amount: reward,
-                creation_id: 1,
-            }]
-        );
-        assert!(ctx
-            .store
-            .get_verified_utxos_by_owner(&transient_owner.0)
-            .unwrap()
-            .utxos
-            .is_empty());
-        assert!(ctx.store.get_segment(1).unwrap().is_some());
-        let stored_undo = ctx.store.get_undo_log(1).unwrap().unwrap();
-        assert_eq!(stored_undo.log_slots_before, parent_log);
-        assert!(stored_undo
-            .slot_changes
-            .contains(&(upper_slot, crate::fri_state::SlotValue::EMPTY)));
-        assert!(stored_undo
-            .slot_changes
-            .contains(&(7, crate::fri_state::SlotValue::EMPTY)));
-
-        ctx.apply_reorg_mdbx_with_applier(0, &[], child.header.timestamp + 1, |_, _, _| {
-            Ok::<(), MdbxContextError>(())
-        })
-        .unwrap();
-        assert_eq!(ctx.state.state.log_slots(), parent_log as usize);
-        assert!(ctx
-            .store
-            .get_verified_utxos_by_owner(&owner.0)
-            .unwrap()
-            .utxos
-            .is_empty());
-        assert!(ctx.store.get_segment(1).unwrap().is_none());
-        drop(ctx);
-
-        let mut reopened = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
-        assert_eq!(reopened.tip_height(), 0);
-        assert_eq!(reopened.state.state.log_slots(), parent_log as usize);
-        assert!(reopened
-            .store
-            .all_segments()
-            .unwrap()
-            .iter()
-            .all(|(segment_id, _, _)| *segment_id == 0));
-        assert!(reopened
-            .store
-            .get_verified_utxos_by_owner(&owner.0)
-            .unwrap()
-            .utxos
-            .is_empty());
-        assert!(reopened
-            .store
-            .get_verified_utxos_by_owner(&transient_owner.0)
-            .unwrap()
-            .utxos
-            .is_empty());
-        assert!(reopened.store.get_segment(1).unwrap().is_none());
-        reopened.state.expand_one();
-        assert_eq!(
-            reopened.state.state.slot(upper_slot),
-            crate::fri_state::SlotValue::EMPTY
-        );
-        assert_eq!(
-            reopened.state.try_state_root().unwrap(),
-            crate::exact_state_hash::state_node_hash(
-                parent_root,
-                crate::exact_state_hash::zero_slot_roots(parent_log as usize)[parent_log as usize],
-            )
-        );
-    }
-
-    #[test]
-    fn reopen_rejects_state_meta_counter_drift_from_tip_header() {
-        let dir = tempfile::tempdir().unwrap();
-        let tip = {
-            let ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
-            *ctx.tip_header()
-        };
-        {
-            let store = MdbxStore::open(dir.path()).unwrap();
-            store
-                .overwrite_state_meta_for_test(
-                    tip.log_slots,
-                    tip.active_slot_count,
-                    tip.alloc_counter + 1,
-                )
-                .unwrap();
-        }
-
-        assert!(matches!(
-            MdbxChainContext::open_or_create_for_test(dir.path()),
-            Err(MdbxContextError::Corrupt(
-                "state_meta counters mismatch with persisted tip header"
-            ))
-        ));
-    }
-
-    #[test]
-    fn reopen_rejects_persisted_creation_id_above_alloc_counter() {
-        let dir = tempfile::tempdir().unwrap();
-        {
-            let ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
-            let eff_log = ctx.state.state.effective_log_segment_size() as u8;
-            let mut cols = crate::segmented_state::SegmentColumns::new_zero(1usize << eff_log);
-            let owner = Address([0xA5; 32]);
-            let slot = crate::fri_state::SlotValue::with_owner_fields(7, 1, owner.as_fields());
-            cols.values[7] = slot.value;
-            cols.owners_hi[7] = slot.owner_hi;
-            cols.owners_lo[7] = slot.owner_lo;
-            ctx.store
-                .overwrite_segment_for_test(0, eff_log, &cols)
-                .unwrap();
-        }
-
-        assert!(matches!(
-            MdbxChainContext::open_or_create_for_test(dir.path()),
-            Err(MdbxContextError::Corrupt(
-                "persisted slot creation_id exceeds alloc_counter"
-            ))
-        ));
-    }
-
-    #[test]
-    fn targeted_preload_rejects_missing_evicted_segment() {
-        use noid_poseidon2b::primitives::TxBodyHash;
-        use noid_tx::{Transaction, TxBody, TxOutput, TxShape};
-
+    fn occupied_coinbase_slot_rejects_without_poisoning_tip() {
         let dir = tempfile::tempdir().unwrap();
         let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
-        let owner = Address([0x3C; 32]);
-        let eff_log = ctx.state.state.effective_log_segment_size();
-        let mut cols = crate::segmented_state::SegmentColumns::new_zero(1usize << eff_log);
-        let slot = crate::fri_state::SlotValue::with_owner_fields(5, 1, owner.as_fields());
-        cols.values[7] = slot.value;
-        cols.owners_hi[7] = slot.owner_hi;
-        cols.owners_lo[7] = slot.owner_lo;
-        let seg_id = 0;
-        ctx.state.state.restore_evicted_segment(seg_id, cols);
-        ctx.state.state.evict_segment(seg_id);
-        assert!(ctx.state.state.is_evicted(seg_id));
-        assert!(ctx.store.get_segment(seg_id).unwrap().is_none());
+        let first = coinbase_block(&ctx, 7, Address([1u8; 32]));
+        apply_coinbase(&mut ctx, &first).unwrap();
+        let tip = ctx.tip_hash();
+        let root = ctx.state.cached_state_root();
 
-        let block = Block {
-            header: *ctx.tip_header(),
-            transactions: vec![Transaction {
-                body: TxBody {
-                    shape: TxShape::Standard4x8,
-                    epoch_anchor: [0; 32],
-                    fee: 0,
-                    inputs: vec![],
-                    outputs: vec![TxOutput {
-                        slot_index: 7,
-                        value: 1,
-                        owner,
-                        valid: true,
-                    }],
-                    is_coinbase: false,
-                },
-                tx_body_hash: TxBodyHash([0; 32]),
-            }],
-        };
+        let parent = *ctx.tip_header();
+        let mut bad = coinbase_block(&ctx, 8, Address([2u8; 32]));
+        bad.transactions[0].body.outputs[0].slot_index = 7;
+        bad.header.tx_root = compute_tx_root(&bad.transactions);
+        let mut blind = ctx.state.clone();
+        blind.alloc_counter += 1;
+        blind.active_slot_count += 1;
+        blind
+            .state
+            .set_slot(
+                7,
+                crate::fri_state::SlotValue::with_owner_fields(
+                    bad.transactions[0].body.outputs[0].amount,
+                    blind.alloc_counter,
+                    Address([2u8; 32]).as_fields(),
+                ),
+            )
+            .unwrap();
+        bad.header.state_root = blind.state_root();
+        bad.header.active_slot_count = blind.active_slot_count;
+        bad.header.alloc_counter = blind.alloc_counter;
+        bad.header.prev_block_hash = block_id(&parent);
 
-        assert!(matches!(
-            ctx.preload_segments_for_block(&block),
-            Err(MdbxContextError::Corrupt(
-                "evicted live segment is missing from MDBX"
-            ))
-        ));
+        assert!(apply_coinbase(&mut ctx, &bad).is_err());
+        assert_eq!(ctx.tip_hash(), tip);
+        assert_eq!(ctx.state.cached_state_root(), root);
     }
 
     #[test]
-    fn invalid_detached_witness_does_not_poison_semantic_block() {
+    fn direct_block_with_wrong_user_epoch_anchor_fails_before_apply() {
         let dir = tempfile::tempdir().unwrap();
         let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
-        let initial_tip_hash = ctx.tip_hash();
-        let block = build_coinbase_block_on(&mut ctx);
-        let block_hash = block_id(&block.header);
-        let ts = block.header.timestamp + 1;
-
-        let invalid_proof = apply_coinbase_only_with_witness_for_test(
-            &mut ctx,
-            &block,
-            b"invalid detached proof",
-            &[],
-            ts,
-        );
-        assert!(
-            invalid_proof.is_err(),
-            "coinbase-only block must reject unexpected proof bytes"
-        );
+        let mut block = coinbase_block(&ctx, 7, Address([1u8; 32]));
+        let mut user_inputs = [TxInput::dummy(); TX_INPUTS];
+        user_inputs[0] = TxInput {
+            slot_index: 9,
+            amount: 2,
+            creation_id: 1,
+        };
+        let mut user_outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        user_outputs[0] = TxOutput {
+            slot_index: 10,
+            amount: 1,
+            owner: Address([3u8; 32]),
+        };
+        block.transactions.push(Transaction::new(TxBody {
+            epoch_anchor: [0xAA; 32],
+            fee: 1,
+            input_owner: Address([3u8; 32]),
+            inputs: user_inputs,
+            outputs: user_outputs,
+            validity_bitmap: 1 | output_bitmap_bit(0),
+            is_coinbase: false,
+        }));
+        block.header.tx_root = compute_tx_root(&block.transactions);
+        assert!(matches!(
+            apply_coinbase(&mut ctx, &block),
+            Err(MdbxContextError::Consensus(ConsensusError::BadEpochAnchor))
+        ));
         assert_eq!(ctx.tip_height(), 0);
-        assert_eq!(ctx.tip_hash(), initial_tip_hash);
-        assert_eq!(ctx.store.get_block_proof(1).unwrap(), None);
-        assert_eq!(block_id(&block.header), block_hash);
-
-        let invalid_sidecar = apply_coinbase_only_with_witness_for_test(
-            &mut ctx,
-            &block,
-            &[],
-            b"invalid auth sidecar",
-            ts,
-        );
-        assert!(
-            invalid_sidecar.is_err(),
-            "coinbase-only block must reject unexpected auth sidecar bytes"
-        );
-        assert_eq!(ctx.tip_height(), 0);
-        assert_eq!(ctx.tip_hash(), initial_tip_hash);
-
-        let accepted = apply_coinbase_only_for_test(&mut ctx, &block, ts)
-            .expect("same semantic block must accept with valid detached witness");
-        assert_eq!(ctx.tip_height(), 1);
-        assert_eq!(block_id(ctx.tip_header()), block_hash);
-        assert_eq!(accepted, block.header.state_root);
-    }
-
-    #[test]
-    fn three_blocks_survive_restart() {
-        let dir = tempfile::tempdir().unwrap();
-
-        {
-            let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
-            for _ in 0..3 {
-                let block = build_coinbase_block_on(&mut ctx);
-                let ts = block.header.timestamp + 1;
-                apply_coinbase_only_for_test(&mut ctx, &block, ts).unwrap();
-            }
-        }
-
-        let ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
-        assert_eq!(ctx.tip_height(), 3);
-        assert_eq!(ctx.state.active_slot_count, 3);
-    }
-
-    #[test]
-    fn exact_chainwork_survives_restart() {
-        let dir = tempfile::tempdir().unwrap();
-        let expected_work;
-
-        {
-            let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
-            for _ in 0..3 {
-                let block = build_coinbase_block_on(&mut ctx);
-                let ts = block.header.timestamp + 1;
-                apply_coinbase_only_for_test(&mut ctx, &block, ts).unwrap();
-            }
-            expected_work = *ctx.tip_chain_work();
-            assert_eq!(
-                ctx.store.get_chain_work(ctx.tip_height()).unwrap(),
-                Some(expected_work)
-            );
-        }
-
-        let ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
-        assert_eq!(*ctx.tip_chain_work(), expected_work);
-        assert_eq!(
-            ctx.store.get_chain_work(ctx.tip_height()).unwrap(),
-            Some(expected_work)
-        );
-    }
-
-    #[test]
-    fn finalized_pair_survives_restart() {
-        use crate::consensus::params::CONSENSUS_FINALITY_DEPTH;
-
-        let dir = tempfile::tempdir().unwrap();
-        let expected_finalized;
-
-        {
-            let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
-            for _ in 0..(CONSENSUS_FINALITY_DEPTH + 2) {
-                let block = build_coinbase_block_on(&mut ctx);
-                let ts = block.header.timestamp + 1;
-                apply_coinbase_only_for_test(&mut ctx, &block, ts).unwrap();
-            }
-            expected_finalized = ctx.finalized_checkpoint();
-            assert_eq!(expected_finalized.height, 2);
-        }
-
-        let ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
-        assert_eq!(ctx.finalized_checkpoint(), expected_finalized);
-        assert_eq!(
-            ctx.store.get_consensus_meta().unwrap().unwrap().finalized,
-            expected_finalized
-        );
-    }
-
-    #[test]
-    fn genesis_checkpoint_package_has_empty_payload_range() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
-        let package = ctx.generate_immutable_checkpoint().unwrap();
-
-        assert_eq!(package.manifest.height, 0);
-        assert_eq!(package.manifest.covered_from, 1);
-        assert_eq!(package.manifest.covered_to, 0);
-        assert_eq!(package.manifest.segment_count, 0);
-        assert_eq!(
-            package.manifest.block_body_root,
-            checkpoint_payload_root(
-                CHECKPOINT_BLOCK_BODY_ROOT_DOMAIN,
-                std::iter::empty::<(u64, Vec<u8>)>(),
-            )
-        );
-        assert_eq!(
-            ctx.store.get_checkpoint_coverage().unwrap().unwrap().height,
-            0
-        );
-    }
-
-    #[test]
-    fn immutable_checkpoint_package_persists_after_restart() {
-        use crate::consensus::params::CONSENSUS_FINALITY_DEPTH;
-
-        let dir = tempfile::tempdir().unwrap();
-        let checkpoint_id;
-        let checkpoint_height;
-
-        {
-            let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
-            for _ in 0..(CONSENSUS_FINALITY_DEPTH + 2) {
-                let block = build_coinbase_block_on(&mut ctx);
-                apply_coinbase_only_for_test(&mut ctx, &block, block.header.timestamp + 1).unwrap();
-            }
-            let package = ctx.generate_immutable_checkpoint().unwrap();
-            checkpoint_id = package.checkpoint_id();
-            checkpoint_height = package.manifest.height;
-
-            assert_eq!(checkpoint_height, ctx.finalized_checkpoint().height);
-            assert_eq!(package.manifest.covered_from, 1);
-            assert_eq!(package.manifest.covered_to, checkpoint_height);
-            assert_eq!(package.manifest.segment_count, 1);
-
-            let coverage = ctx.store.get_checkpoint_coverage().unwrap().unwrap();
-            assert_eq!(coverage.checkpoint_id, checkpoint_id);
-            assert_eq!(coverage.height, checkpoint_height);
-            assert_eq!(coverage.history_proof_covered_to, None);
-        }
-
-        {
-            let ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
-            let package = ctx
-                .store
-                .get_checkpoint_package(checkpoint_height)
-                .unwrap()
-                .expect("checkpoint package must survive restart");
-            let coverage = ctx
-                .store
-                .get_checkpoint_coverage()
-                .unwrap()
-                .expect("checkpoint coverage must survive restart");
-            assert_eq!(package.checkpoint_id(), checkpoint_id);
-            assert_eq!(coverage.checkpoint_id, checkpoint_id);
-        }
-    }
-
-    #[test]
-    fn checkpoint_generation_rejects_non_latest_finalized_height() {
-        use crate::consensus::params::CONSENSUS_FINALITY_DEPTH;
-
-        let dir = tempfile::tempdir().unwrap();
-        let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
-        for _ in 0..(CONSENSUS_FINALITY_DEPTH + 2) {
-            let block = build_coinbase_block_on(&mut ctx);
-            apply_coinbase_only_for_test(&mut ctx, &block, block.header.timestamp + 1).unwrap();
-        }
-
-        assert!(matches!(
-            ctx.generate_immutable_checkpoint_at(1),
-            Err(MdbxContextError::Corrupt(
-                "checkpoint generation requires the latest finalized height"
-            ))
-        ));
-    }
-
-    #[test]
-    fn block_payloads_remain_after_finality_without_checkpoint_coverage() {
-        use crate::consensus::params::CONSENSUS_FINALITY_DEPTH;
-
-        let dir = tempfile::tempdir().unwrap();
-        let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
-
-        let first = build_coinbase_block_on(&mut ctx);
-        apply_coinbase_only_for_test(&mut ctx, &first, first.header.timestamp + 1).unwrap();
-        ctx.store.put_block_proof(1, b"proof-1").unwrap();
-        ctx.store.put_block_auth_sidecar(1, b"sidecar-1").unwrap();
-
-        for _ in 0..(CONSENSUS_FINALITY_DEPTH + 2) {
-            let block = build_coinbase_block_on(&mut ctx);
-            apply_coinbase_only_for_test(&mut ctx, &block, block.header.timestamp + 1).unwrap();
-        }
-
-        assert!(ctx.store.get_recent_block(1).unwrap().is_some());
-        assert_eq!(
-            ctx.store.get_block_proof(1).unwrap(),
-            Some(b"proof-1".to_vec())
-        );
-        assert_eq!(
-            ctx.store.get_block_auth_sidecar(1).unwrap(),
-            Some(b"sidecar-1".to_vec())
-        );
-    }
-
-    #[test]
-    fn block_payloads_prune_after_checkpoint_history_coverage() {
-        use crate::consensus::params::CONSENSUS_FINALITY_DEPTH;
-
-        let dir = tempfile::tempdir().unwrap();
-        let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
-
-        let first = build_coinbase_block_on(&mut ctx);
-        apply_coinbase_only_for_test(&mut ctx, &first, first.header.timestamp + 1).unwrap();
-        ctx.store.put_block_proof(1, b"proof-1").unwrap();
-        ctx.store.put_block_auth_sidecar(1, b"sidecar-1").unwrap();
-        ctx.store.put_history_claim(1, b"claim-1").unwrap();
-        ctx.store
-            .put_accepted_block_certificate(1, b"certificate-1")
-            .unwrap();
-
-        for _ in 0..CONSENSUS_FINALITY_DEPTH {
-            let block = build_coinbase_block_on(&mut ctx);
-            apply_coinbase_only_for_test(&mut ctx, &block, block.header.timestamp + 1).unwrap();
-        }
-        assert_eq!(ctx.tip_height(), CONSENSUS_FINALITY_DEPTH + 1);
-        assert!(ctx.store.get_recent_block(1).unwrap().is_some());
-
-        ctx.store
-            .put_checkpoint_coverage(&crate::checkpoint::CheckpointCoverage {
-                checkpoint_id: [0xA5; 32],
-                height: 1,
-                block_hash: crate::hash_block_header(&first.header),
-                covered_from: 1,
-                covered_to: 1,
-                history_proof_covered_to: Some(1),
-            })
-            .unwrap();
-        let block = build_coinbase_block_on(&mut ctx);
-        apply_coinbase_only_for_test(&mut ctx, &block, block.header.timestamp + 1).unwrap();
-
-        assert_eq!(ctx.store.get_recent_block(1).unwrap(), None);
-        assert_eq!(ctx.store.get_block_proof(1).unwrap(), None);
-        assert_eq!(ctx.store.get_block_auth_sidecar(1).unwrap(), None);
-        assert_eq!(ctx.store.get_history_claim(1).unwrap(), None);
-
-        assert!(ctx.store.get_header(1).unwrap().is_some());
-        assert!(ctx.store.get_header_anchor(1).unwrap().is_some());
-        assert_eq!(
-            ctx.store.get_accepted_block_certificate(1).unwrap(),
-            Some(b"certificate-1".to_vec())
-        );
-    }
-
-    #[test]
-    fn block_payloads_do_not_prune_without_history_proof_coverage() {
-        use crate::consensus::params::CONSENSUS_FINALITY_DEPTH;
-
-        let dir = tempfile::tempdir().unwrap();
-        let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
-
-        let first = build_coinbase_block_on(&mut ctx);
-        apply_coinbase_only_for_test(&mut ctx, &first, first.header.timestamp + 1).unwrap();
-        ctx.store.put_block_proof(1, b"proof-1").unwrap();
-        ctx.store.put_block_auth_sidecar(1, b"sidecar-1").unwrap();
-        ctx.store.put_history_claim(1, b"claim-1").unwrap();
-        ctx.store
-            .put_accepted_block_certificate(1, b"certificate-1")
-            .unwrap();
-
-        for _ in 0..CONSENSUS_FINALITY_DEPTH {
-            let block = build_coinbase_block_on(&mut ctx);
-            apply_coinbase_only_for_test(&mut ctx, &block, block.header.timestamp + 1).unwrap();
-        }
-        ctx.store
-            .put_checkpoint_coverage(&crate::checkpoint::CheckpointCoverage {
-                checkpoint_id: [0xA5; 32],
-                height: 1,
-                block_hash: crate::hash_block_header(&first.header),
-                covered_from: 1,
-                covered_to: 1,
-                history_proof_covered_to: None,
-            })
-            .unwrap();
-        let block = build_coinbase_block_on(&mut ctx);
-        apply_coinbase_only_for_test(&mut ctx, &block, block.header.timestamp + 1).unwrap();
-
-        assert!(ctx.store.get_recent_block(1).unwrap().is_some());
-        assert_eq!(
-            ctx.store.get_block_proof(1).unwrap(),
-            Some(b"proof-1".to_vec())
-        );
-        assert_eq!(
-            ctx.store.get_block_auth_sidecar(1).unwrap(),
-            Some(b"sidecar-1".to_vec())
-        );
-        assert_eq!(
-            ctx.store.get_history_claim(1).unwrap(),
-            Some(b"claim-1".to_vec())
-        );
-        assert_eq!(
-            ctx.store.get_accepted_block_certificate(1).unwrap(),
-            Some(b"certificate-1".to_vec())
-        );
-    }
-
-    #[test]
-    fn block_payloads_do_not_prune_without_certificate_record() {
-        use crate::consensus::params::CONSENSUS_FINALITY_DEPTH;
-
-        let dir = tempfile::tempdir().unwrap();
-        let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
-
-        let first = build_coinbase_block_on(&mut ctx);
-        apply_coinbase_only_for_test(&mut ctx, &first, first.header.timestamp + 1).unwrap();
-        ctx.store.put_block_proof(1, b"proof-1").unwrap();
-        ctx.store.put_block_auth_sidecar(1, b"sidecar-1").unwrap();
-        ctx.store.put_history_claim(1, b"claim-1").unwrap();
-
-        for _ in 0..CONSENSUS_FINALITY_DEPTH {
-            let block = build_coinbase_block_on(&mut ctx);
-            apply_coinbase_only_for_test(&mut ctx, &block, block.header.timestamp + 1).unwrap();
-        }
-        ctx.store
-            .put_checkpoint_coverage(&crate::checkpoint::CheckpointCoverage {
-                checkpoint_id: [0xA5; 32],
-                height: 1,
-                block_hash: crate::hash_block_header(&first.header),
-                covered_from: 1,
-                covered_to: 1,
-                history_proof_covered_to: Some(1),
-            })
-            .unwrap();
-        let block = build_coinbase_block_on(&mut ctx);
-        apply_coinbase_only_for_test(&mut ctx, &block, block.header.timestamp + 1).unwrap();
-
-        assert!(ctx.store.get_recent_block(1).unwrap().is_some());
-        assert_eq!(
-            ctx.store.get_block_proof(1).unwrap(),
-            Some(b"proof-1".to_vec())
-        );
-        assert_eq!(
-            ctx.store.get_block_auth_sidecar(1).unwrap(),
-            Some(b"sidecar-1".to_vec())
-        );
-        assert_eq!(
-            ctx.store.get_history_claim(1).unwrap(),
-            Some(b"claim-1".to_vec())
-        );
-    }
-
-    #[test]
-    fn state_root_consistent_after_restart() {
-        let dir = tempfile::tempdir().unwrap();
-        let root_after_block;
-
-        {
-            let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
-            let block = build_coinbase_block_on(&mut ctx);
-            let ts = block.header.timestamp + 1;
-            root_after_block = apply_coinbase_only_for_test(&mut ctx, &block, ts).unwrap();
-        }
-
-        let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
-        assert_eq!(
-            ctx.state.state_root(),
-            root_after_block,
-            "state root must be identical after restart"
-        );
-    }
-
-    /// Verify that `dirty_segment_ids()` is empty after restart (segments are
-    /// not needlessly re-written to MDBX on the very first block).
-    #[test]
-    fn no_spurious_dirty_segments_after_restart() {
-        let dir = tempfile::tempdir().unwrap();
-
-        // First run: apply one block.
-        {
-            let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
-            let block = build_coinbase_block_on(&mut ctx);
-            apply_coinbase_only_for_test(&mut ctx, &block, block.header.timestamp + 1).unwrap();
-        }
-
-        // Second run: open and verify no dirty segments are queued.
-        let ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
-        assert_eq!(
-            ctx.state.state.dirty_segment_ids().count(),
-            0,
-            "no segments should be marked MDBX-dirty after a clean restart"
-        );
     }
 }

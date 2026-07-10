@@ -5,7 +5,7 @@
 //!
 //! Runs the reference spine oracle in `noid_gkr` on a handful of
 //! fixtures and asserts its output byte-equals
-//! `noid_poseidon2b::primitives::hash_tx_body`.
+//! `noid_poseidon2b::primitives::hash_tx_body_carrier`.
 //!
 //! Note: the spine oracle always hashes payload pre-images for
 //! every leaf slot (it doesn't model "dummy slots with zero digest").
@@ -18,8 +18,9 @@ use noid_gkr::oracle::evaluate_spine;
 use noid_poseidon2b::native::domain::{capacity_iv, TAG_LEAF, TAG_OUTLEAF, TAG_TXBODY};
 use noid_poseidon2b::native::permutation::Poseidon2bPermutation;
 use noid_poseidon2b::primitives::{
-    derive_address, fee_leaf, hash_input_leaf_packed, hash_output_leaf, hash_tx_body,
-    is_coinbase_leaf, Address, Digest, SpendSecret, TxBodyHash, TXBODY_INPUTS, TXBODY_OUTPUTS,
+    derive_address, fee_leaf, hash_input_leaf_packed, hash_output_leaf, hash_tx_body_carrier,
+    is_coinbase_leaf, Address, Digest, SpendSecret, TxBodyHash, TXBODY_CARRIER_INPUTS,
+    TXBODY_CARRIER_OUTPUTS,
 };
 
 fn digest_to_fields(d: &Digest) -> [Block128; 2] {
@@ -57,9 +58,9 @@ fn payload_to_lanes(p: [u128; 4]) -> [Block128; 4] {
 
 fn make_full_inputs(
     prev: &Digest,
-    fee: u128,
-    inputs_leaf_payload: [[u128; 4]; TXBODY_INPUTS],
-    outputs_leaf_payload: [[u128; 4]; TXBODY_OUTPUTS],
+    fee: u64,
+    inputs_leaf_payload: [[u128; 4]; TXBODY_CARRIER_INPUTS],
+    outputs_leaf_payload: [[u128; 4]; TXBODY_CARRIER_OUTPUTS],
     is_coinbase: bool,
 ) -> SpineInputs {
     SpineInputs {
@@ -91,13 +92,13 @@ fn fixture_full(is_coinbase: bool) -> (SpineInputs, TxBodyHash) {
         .map(|i| derive_address(&SpendSecret([i as u8 + 1; 32])))
         .collect();
 
-    let inputs_payload: [[u128; 4]; TXBODY_INPUTS] = [
+    let inputs_payload: [[u128; 4]; TXBODY_CARRIER_INPUTS] = [
         input_payload_u128(0, 100, &addrs[0]),
         input_payload_u128(1, 200, &addrs[1]),
         input_payload_u128(2, 300, &addrs[2]),
         input_payload_u128(3, 400, &addrs[3]),
     ];
-    let outputs_payload: [[u128; 4]; TXBODY_OUTPUTS] = [
+    let outputs_payload: [[u128; 4]; TXBODY_CARRIER_OUTPUTS] = [
         input_payload_u128(10, 50, &addrs[0]),
         input_payload_u128(11, 70, &addrs[1]),
         input_payload_u128(12, 90, &addrs[2]),
@@ -109,13 +110,13 @@ fn fixture_full(is_coinbase: bool) -> (SpineInputs, TxBodyHash) {
     ];
 
     // Native leaves:
-    let ins_d: [Digest; TXBODY_INPUTS] = [
+    let ins_d: [Digest; TXBODY_CARRIER_INPUTS] = [
         hash_input_leaf_packed(0, Block128::from(100u128), &addrs[0]),
         hash_input_leaf_packed(1, Block128::from(200u128), &addrs[1]),
         hash_input_leaf_packed(2, Block128::from(300u128), &addrs[2]),
         hash_input_leaf_packed(3, Block128::from(400u128), &addrs[3]),
     ];
-    let outs_d: [Digest; TXBODY_OUTPUTS] = [
+    let outs_d: [Digest; TXBODY_CARRIER_OUTPUTS] = [
         hash_output_leaf(10, 50, &addrs[0]),
         hash_output_leaf(11, 70, &addrs[1]),
         hash_output_leaf(12, 90, &addrs[2]),
@@ -127,8 +128,8 @@ fn fixture_full(is_coinbase: bool) -> (SpineInputs, TxBodyHash) {
     ];
 
     let prev = [0xAAu8; 32];
-    let fee = 7u128;
-    let native = hash_tx_body(&prev, fee, &ins_d, &outs_d, is_coinbase, 0);
+    let fee = 7u64;
+    let native = hash_tx_body_carrier(&prev, fee, &ins_d, &outs_d, is_coinbase, 0);
 
     let inputs = make_full_inputs(&prev, fee, inputs_payload, outputs_payload, is_coinbase);
     (inputs, native)
@@ -143,7 +144,7 @@ fn full_tx_matches_native() {
     assert_eq!(
         wit.tx_body_hash_bytes(),
         native.0,
-        "GKR oracle output must byte-equal native hash_tx_body",
+        "GKR oracle output must byte-equal native carrier hash",
     );
 }
 

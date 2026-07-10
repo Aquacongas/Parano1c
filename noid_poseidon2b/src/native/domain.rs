@@ -55,6 +55,8 @@ pub const TAG_LEAF: DomainTag = DomainTag::new(b"LEAF____");
 pub const TAG_COMMIT: DomainTag = DomainTag::new(b"COMMIT__");
 pub const TAG_ADDRFIX: DomainTag = DomainTag::new(b"ADDRFIX_");
 pub const TAG_TXBODY: DomainTag = DomainTag::new(b"TXBODY__");
+/// Count-bound universal 256-leaf block transaction root.
+pub const TAG_TXROOT: DomainTag = DomainTag::new(b"TXROOT__");
 pub const TAG_BLOCKHDR: DomainTag = DomainTag::new(b"BLOCKHDR");
 /// Proof-of-work header digest. Distinct from `BLOCKHDR`: the same semantic
 /// header has separate chain-link and mining-difficulty hash domains.
@@ -124,6 +126,7 @@ mod tests {
             TAG_COMMIT,
             TAG_ADDRFIX,
             TAG_TXBODY,
+            TAG_TXROOT,
             TAG_BLOCKHDR,
             TAG_POWHDR,
             TAG_FSCHALNG,

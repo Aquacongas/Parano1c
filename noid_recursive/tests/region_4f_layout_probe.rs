@@ -35,7 +35,7 @@ use noid_recursive::acceptance::trace::region_source_binding::{
 };
 use noid_recursive::acceptance::trace::{alloc_block, alloc_blocks, BatchEvalReductionTrace};
 
-/// The real wallet auth-MLE width (`AUTH_PCS_BASE_LOG`): standard txs commit
+/// The real wallet auth-MLE width (`AUTH_PCS_BASE_LOG`): Tx8x2 transactions commit
 /// a 2^9 column, so the capsule shape here IS the production shape.
 const WALLET_NUM_VARS: usize = 9;
 
@@ -45,7 +45,10 @@ fn alloc_digest_raw(b: &mut FieldR1csBuilder, d: &[u8; 32]) -> [LinExpr; 2] {
     use noid_ivc_core::field::F128;
     let lo = u128::from_le_bytes(d[..16].try_into().unwrap());
     let hi = u128::from_le_bytes(d[16..].try_into().unwrap());
-    let lane = |v: u128| F128 { lo: v as u64, hi: (v >> 64) as u64 };
+    let lane = |v: u128| F128 {
+        lo: v as u64,
+        hi: (v >> 64) as u64,
+    };
     [
         LinExpr::from_wire(b.alloc_f128(lane(lo))),
         LinExpr::from_wire(b.alloc_f128(lane(hi))),
@@ -71,11 +74,15 @@ impl Rng {
 fn capsule_fixture(seed: u64) -> (Vec<Block128>, BatchEvalReduction, AuthMleOpeningProof) {
     use noid_core::mle::evaluate::evaluate_slice;
     let mut rng = Rng(seed);
-    let column: Vec<Block128> =
-        (0..(1usize << WALLET_NUM_VARS)).map(|_| rng.f128_block()).collect();
+    let column: Vec<Block128> = (0..(1usize << WALLET_NUM_VARS))
+        .map(|_| rng.f128_block())
+        .collect();
     let point: Vec<Block128> = (0..WALLET_NUM_VARS).map(|_| rng.f128_block()).collect();
     let value = evaluate_slice(&column, &point);
-    let reduction = BatchEvalReduction { point: point.clone(), value };
+    let reduction = BatchEvalReduction {
+        point: point.clone(),
+        value,
+    };
     let mut committed = commit_auth_mle_column(&column, WALLET_NUM_VARS);
     let proof = open_auth_mle_committed(&mut committed, WALLET_NUM_VARS, &reduction);
     (point, reduction, proof)
@@ -91,18 +98,28 @@ struct Measured {
 /// builder wire count and claim count the discharge produced.
 fn measure(k: usize, params: RegionDischargeParams) -> Measured {
     let mut b = FieldR1csBuilder::new();
-    let fixtures: Vec<_> = (0..k).map(|i| capsule_fixture(0xA55E_C0DE + i as u64)).collect();
+    let fixtures: Vec<_> = (0..k)
+        .map(|i| capsule_fixture(0xA55E_C0DE + i as u64))
+        .collect();
     let mut obligations = Vec::with_capacity(k);
     let mut natives = Vec::with_capacity(k);
     for (point, red, proof) in &fixtures {
-        let cap_lanes: Vec<[LinExpr; 2]> =
-            proof.commitment.cap.hashes.iter().map(|h| alloc_digest_raw(&mut b, h)).collect();
+        let cap_lanes: Vec<[LinExpr; 2]> = proof
+            .commitment
+            .cap
+            .hashes
+            .iter()
+            .map(|h| alloc_digest_raw(&mut b, h))
+            .collect();
         let point_w = alloc_blocks(&mut b, point);
         let value_w = alloc_block(&mut b, red.value);
         obligations.push(PendingAuthPcsObligation {
             commitment_cap_lanes: cap_lanes,
             num_vars: WALLET_NUM_VARS,
-            reduction: BatchEvalReductionTrace { point: point_w, value: value_w },
+            reduction: BatchEvalReductionTrace {
+                point: point_w,
+                value: value_w,
+            },
         });
         natives.push(proof.clone());
     }
@@ -118,7 +135,11 @@ fn measure(k: usize, params: RegionDischargeParams) -> Measured {
         None,
     );
     let max_arity = claims.iter().map(|c| c.point.len()).max().unwrap();
-    Measured { wires: b.num_wires() - before, claims: claims.len(), max_arity }
+    Measured {
+        wires: b.num_wires() - before,
+        claims: claims.len(),
+        max_arity,
+    }
 }
 
 /// Fit `wires(k) = w(1) + s·(k−1) + t·log2(k)` on k = 1/2/4 (s = linear
@@ -163,7 +184,9 @@ fn fit_and_report(label: &str, ms: &[Measured]) {
 #[ignore = "layout probe (multi-million-wire builds at the production point); run explicitly"]
 fn region_4f_layout_probe() {
     let test_params = RegionDischargeParams { nq: 2 };
-    let prod_params = RegionDischargeParams { nq: CAPSULE_NUM_QUERIES };
+    let prod_params = RegionDischargeParams {
+        nq: CAPSULE_NUM_QUERIES,
+    };
     println!(
         "[probe] wallet num_vars = {WALLET_NUM_VARS}, tau = {CAPSULE_TAU}; TEST params: nq = {}; \
          PRODUCTION params: nq = {} (all queries, both trees)",

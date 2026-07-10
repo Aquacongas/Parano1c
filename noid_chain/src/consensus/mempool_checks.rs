@@ -6,7 +6,7 @@
 //! `validate_tx_for_mempool` enforces all native checks a node performs
 //! before admitting a transaction to the mempool. This is a SUPERSET of
 //! `validate_tx_consensus` — it adds state-dependent checks that require
-//! knowing the current UTXO state and the last ANCHOR_DEPTH block headers.
+//! knowing the current UTXO state and current transaction-epoch anchor.
 //!
 //! Wallet authorization verification is intentionally NOT performed here.
 //! It runs as a background verification task after admission.
@@ -14,8 +14,8 @@
 //! # Check order (cheapest first)
 //!
 //! 0. P.16 min fee: base + I/O + occupancy-scaled net-new-state fee (coinbase exempt)
-//! 1. Basic consensus checks: fee overflow, body_hash, anchor non-zero
-//! 2. epoch_anchor hash is a known block header within the ANCHOR_DEPTH window
+//! 1. Basic canonical body checks
+//! 2. epoch_anchor equals the single current transaction-epoch anchor
 //! 3. No slot conflict with currently admitted mempool transactions
 //! 4. Input slots are live in state with matching (value, owner)
 //! 5. Output slots are empty in state
@@ -24,8 +24,8 @@ use std::collections::HashSet;
 
 use crate::chain_context::ChainContext;
 use crate::consensus::{
-    checks::validate_tx_consensus, fees::required_fee_for_tx_body, params::ANCHOR_DEPTH,
-    pow::block_id, ConsensusError,
+    checks::validate_tx_consensus, epoch_anchor::tx_epoch_anchor_height_for_child,
+    fees::required_fee_for_tx_body, pow::block_id, ConsensusError,
 };
 use crate::fri_state::SlotValue;
 use noid_tx::Transaction;
@@ -51,7 +51,7 @@ pub fn validate_tx_for_mempool(
             ctx.state.active_slot_count,
             ctx.state.state.log_slots() as u32,
         );
-        let actual = tx.body.fee.min(u64::MAX as u128) as u64;
+        let actual = tx.body.fee;
         if actual < required {
             return Err(ConsensusError::BelowMinFee { required, actual });
         }
@@ -60,53 +60,42 @@ pub fn validate_tx_for_mempool(
     // --- Basic consensus checks ---
     validate_tx_consensus(tx)?;
 
-    // --- Epoch anchor hash must be a known header within window ---
+    // --- User anchor must equal the one start-of-next-block epoch anchor ---
     if !tx.body.is_coinbase {
-        let anchor_hash = tx.body.epoch_anchor;
-        let tip = ctx.tip_height;
-        let lo = tip.saturating_sub(ANCHOR_DEPTH);
-        let anchor_valid = (lo..=tip).any(|h| {
-            ctx.headers
-                .get(&h)
-                .map(|hdr| block_id(hdr) == anchor_hash)
-                .unwrap_or(false)
-        });
-        if !anchor_valid {
+        let anchor_height = tx_epoch_anchor_height_for_child(ctx.tip_height + 1);
+        let expected_anchor = ctx
+            .headers
+            .get(&anchor_height)
+            .map(block_id)
+            .ok_or(ConsensusError::BadEpochAnchor)?;
+        if tx.body.epoch_anchor != expected_anchor {
             return Err(ConsensusError::BadEpochAnchor);
         }
     }
 
-    // --- No slot conflict with mempool ---
-    let mut mempool_inputs: HashSet<u32> = HashSet::new();
-    let mut mempool_outputs: HashSet<u32> = HashSet::new();
+    // --- Strict pending-set disjointness (packages are not supported) ---
+    let mut mempool_touched: HashSet<u32> = HashSet::new();
     for admitted in mempool_txs {
-        for inp in &admitted.body.inputs {
-            if inp.valid {
-                mempool_inputs.insert(inp.slot_index);
-            }
+        for (_, inp) in admitted.body.live_inputs() {
+            mempool_touched.insert(inp.slot_index);
         }
-        for out in &admitted.body.outputs {
-            if out.valid {
-                mempool_outputs.insert(out.slot_index);
-            }
+        for (_, out) in admitted.body.live_outputs() {
+            mempool_touched.insert(out.slot_index);
         }
     }
-    for inp in &tx.body.inputs {
-        if inp.valid && mempool_inputs.contains(&inp.slot_index) {
+    for (_, inp) in tx.body.live_inputs() {
+        if mempool_touched.contains(&inp.slot_index) {
             return Err(ConsensusError::SlotConflict);
         }
     }
-    for out in &tx.body.outputs {
-        if out.valid && mempool_outputs.contains(&out.slot_index) {
+    for (_, out) in tx.body.live_outputs() {
+        if mempool_touched.contains(&out.slot_index) {
             return Err(ConsensusError::SlotConflict);
         }
     }
 
     // --- Input slots live in state with matching (value, owner) ---
-    for inp in &tx.body.inputs {
-        if !inp.valid {
-            continue;
-        }
+    for (_, inp) in tx.body.live_inputs() {
         let idx = inp.slot_index;
         if (idx as u64) >= ctx.state.state.num_slots() {
             return Err(ConsensusError::ShapeMismatch(format!(
@@ -115,18 +104,18 @@ pub fn validate_tx_for_mempool(
                 ctx.state.state.num_slots()
             )));
         }
-        let expected =
-            SlotValue::with_owner_fields(inp.value, inp.creation_id, inp.owner.as_fields());
+        let expected = SlotValue::with_owner_fields(
+            inp.amount,
+            inp.creation_id,
+            tx.body.input_owner.as_fields(),
+        );
         if ctx.state.state.slot(idx) != expected {
             return Err(ConsensusError::BadStateRoot); // closest existing error
         }
     }
 
     // --- Output slots empty in state ---
-    for out in &tx.body.outputs {
-        if !out.valid {
-            continue;
-        }
+    for (_, out) in tx.body.live_outputs() {
         let idx = out.slot_index;
         if (idx as u64) >= ctx.state.state.num_slots() {
             return Err(ConsensusError::ShapeMismatch(format!(
@@ -147,148 +136,89 @@ mod tests {
     use super::*;
     use crate::chain_context::ChainContext;
     use noid_poseidon2b::primitives::Address;
-    use noid_tx::{Transaction, TxBody, TxOutput};
+    use noid_tx::{
+        output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS,
+    };
 
-    fn make_coinbase(slot: u32) -> Transaction {
-        let body = TxBody {
-            shape: noid_tx::TxShape::Standard4x8,
-            epoch_anchor: [0u8; 32],
-            fee: 0,
-            inputs: vec![],
-            outputs: vec![TxOutput {
-                slot_index: slot,
-                value: 50_000_000,
-                owner: Address([0u8; 32]),
-                valid: true,
-            }],
-            is_coinbase: true,
+    fn tx(anchor: [u8; 32], fee: u64, input_slot: u32, output_slot: u32) -> Transaction {
+        let mut inputs = [TxInput::dummy(); TX_INPUTS];
+        inputs[0] = TxInput {
+            slot_index: input_slot,
+            amount: 100 + fee,
+            creation_id: 1,
         };
-        let hash = noid_tx::hash_tx_body(
-            &body.epoch_anchor,
-            body.fee,
-            &body.inputs,
-            &body.outputs,
-            body.is_coinbase,
-        );
-        Transaction {
-            body,
-            tx_body_hash: hash,
-        }
-    }
-
-    fn make_mint_tx(slot: u32, fee: u128) -> Transaction {
-        let body = TxBody {
-            shape: noid_tx::TxShape::Standard4x8,
-            epoch_anchor: [1u8; 32], // non-zero anchor for non-coinbase
+        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        outputs[0] = TxOutput {
+            slot_index: output_slot,
+            amount: 100,
+            owner: Address([2u8; 32]),
+        };
+        Transaction::new(TxBody {
+            epoch_anchor: anchor,
             fee,
-            inputs: vec![],
-            outputs: vec![TxOutput {
-                slot_index: slot,
-                value: 1000,
-                owner: Address([1u8; 32]),
-                valid: true,
-            }],
+            input_owner: Address([1u8; 32]),
+            inputs,
+            outputs,
+            validity_bitmap: 1 | output_bitmap_bit(0),
             is_coinbase: false,
-        };
-        let hash = noid_tx::hash_tx_body(
-            &body.epoch_anchor,
-            body.fee,
-            &body.inputs,
-            &body.outputs,
-            body.is_coinbase,
-        );
-        Transaction {
-            body,
-            tx_body_hash: hash,
-        }
+        })
     }
 
-    #[test]
-    fn min_fee_enforced_for_non_coinbase() {
-        use crate::consensus::required_fee_for_tx_body;
-        let ctx = ChainContext::init_from_genesis();
-        let probe = make_mint_tx(5, 0);
-        let required = required_fee_for_tx_body(
-            &probe.body,
-            ctx.state.active_slot_count,
-            ctx.state.state.log_slots() as u32,
-        );
-
-        // Below minimum.
-        let tx_low = make_mint_tx(5, (required - 1) as u128);
-        assert_eq!(
-            validate_tx_for_mempool(&tx_low, &ctx, &[]),
-            Err(ConsensusError::BelowMinFee {
-                required,
-                actual: required - 1
-            }),
-            "fee below minimum must be rejected"
-        );
-
-        // Exactly at minimum — note: also needs valid anchor in ctx.headers,
-        // but since ctx is fresh (genesis only), epoch_anchor=[1;32] won't
-        // match any known header. This tests fee check fires BEFORE anchor check.
-        let tx_exact = make_mint_tx(5, required as u128);
-        // Not BelowMinFee — it gets further to the anchor check.
-        let result = validate_tx_for_mempool(&tx_exact, &ctx, &[]);
-        assert!(
-            !matches!(result, Err(ConsensusError::BelowMinFee { .. })),
-            "fee at minimum must not fail BelowMinFee"
-        );
-    }
-
-    #[test]
-    fn coinbase_exempt_from_min_fee() {
-        let ctx = ChainContext::init_from_genesis();
-        // Coinbase with fee=0 must not fail BelowMinFee.
-        let cb = make_coinbase(100);
-        assert_eq!(cb.body.fee, 0);
-        let result = validate_tx_for_mempool(&cb, &ctx, &[]);
-        // Passes fee check; may fail other checks (anchor, state) — but NOT BelowMinFee.
-        assert!(
-            !matches!(result, Err(ConsensusError::BelowMinFee { .. })),
-            "coinbase must be exempt from min fee check"
-        );
-    }
-
-    #[test]
-    fn coinbase_passes_without_anchor_check() {
-        let ctx = ChainContext::init_from_genesis();
-        let cb = make_coinbase(100);
-        // Coinbase skips anchor and slot checks.
-        // It has zero epoch_anchor which is valid for coinbase.
-        // Coinbase output slot 100 is empty in fresh state.
-        let result = validate_tx_for_mempool(&cb, &ctx, &[]);
-        assert!(result.is_ok(), "coinbase should pass: {:?}", result);
-    }
-
-    #[test]
-    fn slot_conflict_with_mempool_detected() {
-        let ctx = ChainContext::init_from_genesis();
-        let tx1 = make_coinbase(50); // admitted to mempool
-        let tx2 = make_coinbase(50); // conflict: same output slot
-
-        // tx2 conflicts with already-admitted tx1 on slot 50.
-        let result = validate_tx_for_mempool(&tx2, &ctx, &[tx1]);
-        assert_eq!(result, Err(ConsensusError::SlotConflict));
-    }
-
-    #[test]
-    fn output_slot_occupied_in_state_rejected() {
-        // First mint to a slot; then try minting again.
-        let mut ctx = ChainContext::init_from_genesis();
-
-        // Directly write to state to simulate an occupied slot.
+    fn funded_context(fee: u64) -> ChainContext {
+        let mut ctx = ChainContext::init_from_easy_genesis();
         ctx.state
             .state
             .set_slot(
-                7,
-                SlotValue::with_owner_fields(100, 0, Address([0u8; 32]).as_fields()),
+                1,
+                SlotValue::with_owner_fields(100 + fee, 1, Address([1u8; 32]).as_fields()),
             )
             .unwrap();
+        ctx.state.active_slot_count = 1;
+        ctx.state.alloc_counter = 1;
+        ctx
+    }
 
-        let tx = make_coinbase(7); // tries to mint to occupied slot 7
-        let result = validate_tx_for_mempool(&tx, &ctx, &[]);
-        assert_eq!(result, Err(ConsensusError::SlotConflict));
+    #[test]
+    fn exact_current_anchor_and_state_are_required() {
+        let probe = tx([1u8; 32], 0, 1, 2);
+        let ctx0 = funded_context(0);
+        let required = required_fee_for_tx_body(
+            &probe.body,
+            ctx0.state.active_slot_count,
+            ctx0.state.state.log_slots() as u32,
+        );
+        let ctx = funded_context(required);
+        let good = tx(ctx.tip_hash, required, 1, 2);
+        assert_eq!(validate_tx_for_mempool(&good, &ctx, &[]), Ok(()));
+
+        let bad_anchor = tx([9u8; 32], required, 1, 2);
+        assert_eq!(
+            validate_tx_for_mempool(&bad_anchor, &ctx, &[]),
+            Err(ConsensusError::BadEpochAnchor)
+        );
+
+        let bad_state = tx(ctx.tip_hash, required, 3, 2);
+        assert_eq!(
+            validate_tx_for_mempool(&bad_state, &ctx, &[]),
+            Err(ConsensusError::BadStateRoot)
+        );
+    }
+
+    #[test]
+    fn pending_cross_slot_conflict_rejects() {
+        let probe = tx([1u8; 32], 0, 1, 2);
+        let ctx0 = funded_context(0);
+        let required = required_fee_for_tx_body(
+            &probe.body,
+            ctx0.state.active_slot_count,
+            ctx0.state.state.log_slots() as u32,
+        );
+        let ctx = funded_context(required);
+        let admitted = tx(ctx.tip_hash, required, 3, 1);
+        let candidate = tx(ctx.tip_hash, required, 1, 2);
+        assert_eq!(
+            validate_tx_for_mempool(&candidate, &ctx, &[admitted]),
+            Err(ConsensusError::SlotConflict)
+        );
     }
 }

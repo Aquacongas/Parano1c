@@ -12,7 +12,7 @@ use crate::block_header::BlockHeader;
 use crate::consensus::{
     difficulty::next_target,
     expected_child_log_slots,
-    params::{ANCHOR_DEPTH, CONSENSUS_FINALITY_DEPTH, EPOCH_LENGTH},
+    params::{CONSENSUS_FINALITY_DEPTH, EPOCH_LENGTH},
     pow::{block_id, validate_pow},
     timestamps::{validate_future_drift, validate_median_time_past},
     ConsensusError,
@@ -144,20 +144,8 @@ fn validate_header_inner(
 ///
 /// The anchor is the block at the most recent epoch boundary:
 /// `anchor_height = largest H ≤ current_height where H % EPOCH_LENGTH == 0`.
-pub fn epoch_anchor_height(current_height: u64) -> u64 {
+pub fn asert_anchor_height(current_height: u64) -> u64 {
     (current_height / EPOCH_LENGTH) * EPOCH_LENGTH
-}
-
-/// Check whether a block at `height` is within the valid epoch anchor window
-/// for a transaction (i.e., `epoch_anchor` hash must be from a header at
-/// `[height - ANCHOR_DEPTH - 1, height - 1]`).
-pub fn is_anchor_height_valid(tx_anchor_height: u64, block_height: u64) -> bool {
-    if block_height == 0 {
-        return tx_anchor_height == 0;
-    }
-    let lo = block_height.saturating_sub(ANCHOR_DEPTH + 1);
-    let hi = block_height - 1;
-    tx_anchor_height >= lo && tx_anchor_height <= hi
 }
 
 /// Returns `true` if a block at `height` is considered final (cannot be reorged).
@@ -307,33 +295,13 @@ mod tests {
     }
 
     #[test]
-    fn epoch_anchor_height_examples() {
-        assert_eq!(epoch_anchor_height(0), 0);
-        assert_eq!(epoch_anchor_height(5), 0);
-        assert_eq!(epoch_anchor_height(6), 6);
-        assert_eq!(epoch_anchor_height(11), 6);
-        assert_eq!(epoch_anchor_height(12), 12);
-        assert_eq!(epoch_anchor_height(100), 96); // 100/6*6 = 96
-    }
-
-    #[test]
-    fn anchor_window_validation() {
-        // With ANCHOR_DEPTH=144, for block at height 10:
-        // lo = 10 - 145 = 0 (saturated), hi = 9 → anchors [0, 9] all valid.
-        assert!(is_anchor_height_valid(9, 10));
-        assert!(is_anchor_height_valid(5, 10));
-        assert!(is_anchor_height_valid(3, 10));
-        assert!(is_anchor_height_valid(0, 10)); // genesis anchor valid (depth=144 >> 10)
-        assert!(!is_anchor_height_valid(10, 10)); // current height not valid (must be past block)
-
-        // Test at a height where the window actually truncates.
-        // For block at height = ANCHOR_DEPTH + 50:
-        let h = ANCHOR_DEPTH + 50; // e.g. height=194
-        let lo = h - ANCHOR_DEPTH - 1; // = 49
-        assert!(is_anchor_height_valid(lo, h)); // just inside
-        assert!(!is_anchor_height_valid(lo - 1, h)); // just outside
-        assert!(!is_anchor_height_valid(h, h)); // current height not valid
-        assert!(is_anchor_height_valid(h - 1, h)); // latest valid
+    fn asert_anchor_height_examples() {
+        assert_eq!(asert_anchor_height(0), 0);
+        assert_eq!(asert_anchor_height(5), 0);
+        assert_eq!(asert_anchor_height(6), 6);
+        assert_eq!(asert_anchor_height(11), 6);
+        assert_eq!(asert_anchor_height(12), 12);
+        assert_eq!(asert_anchor_height(100), 96);
     }
 
     #[test]

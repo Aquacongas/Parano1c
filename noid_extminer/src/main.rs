@@ -27,9 +27,9 @@
 //!   - `block_hex`                — full sealed block with nonce = 0
 //!   - `block_proof_hex`          — serialized BlockProof, empty for coinbase-only
 //!   - `block_auth_sidecar_hex`   — serialized public Auth sidecar, empty when absent
-//!   - `nonce_offset`             — byte offset of nonce inside versioned block_hex
+//!   - `nonce_offset`             — byte offset of nonce inside canonical block_hex
 //!   - `difficulty_target_hex`    — 256-bit LE target
-//!   - shape/proof metadata       — operator display only; PoW uses pow_fields
+//!   - proof metadata             — operator display only; PoW uses pow_fields
 //!
 //! The miner patches `block_hex[nonce_offset..nonce_offset+16]` with the found
 //! 16-byte LE nonce and calls `submitBlock(patched_block_hex, block_proof_hex,
@@ -109,12 +109,6 @@ struct BlockTemplateResponse {
     difficulty_target_hex: String,
     height: u64,
     n_txs: usize,
-    #[serde(default)]
-    tx_shapes: Vec<String>,
-    #[serde(default)]
-    standard_tx_count: usize,
-    #[serde(default)]
-    sweep_tx_count: usize,
     #[serde(default)]
     block_proof_size_bytes: usize,
 }
@@ -468,21 +462,12 @@ fn patch_block_nonce(block_bytes: &mut [u8], nonce_offset: usize, nonce: u128) -
     Ok(())
 }
 
-fn shape_summary(tmpl: &BlockTemplateResponse) -> String {
+fn proof_summary(tmpl: &BlockTemplateResponse) -> String {
     let proof_size = if tmpl.block_proof_size_bytes > 0 {
         tmpl.block_proof_size_bytes
     } else {
         tmpl.block_proof_hex.len() / 2
     };
-    if tmpl.standard_tx_count > 0 || tmpl.sweep_tx_count > 0 {
-        return format!(
-            "std={} sweep={} proof={}B",
-            tmpl.standard_tx_count, tmpl.sweep_tx_count, proof_size
-        );
-    }
-    if !tmpl.tx_shapes.is_empty() {
-        return format!("shapes={} proof={}B", tmpl.tx_shapes.join(","), proof_size);
-    }
     format!("proof={proof_size}B")
 }
 
@@ -573,7 +558,7 @@ fn mine(cli: &Cli) -> Result<()> {
         eprintln!(
             "┌─ h={height} txs={n_txs} {} diff={diff_bits} leading-zero-bits  \
              target={}…",
-            shape_summary(&tmpl),
+            proof_summary(&tmpl),
             &tmpl.difficulty_target_hex[tmpl.difficulty_target_hex.len().saturating_sub(8)..]
         );
 

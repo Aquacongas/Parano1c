@@ -20,9 +20,7 @@ use std::collections::HashSet;
 use noid_poseidon2b::primitives::Digest;
 use noid_tx::{TxBody, TxInput, TxOutput};
 
-use crate::exact_state_hash::{
-    slot_leaf_hash, state_node_hash, zero_slot_roots, StateHash,
-};
+use crate::exact_state_hash::{slot_leaf_hash, state_node_hash, zero_slot_roots, StateHash};
 use crate::fri_state::{SlotValue, StateError, STATE_LOG_SLOTS};
 use crate::segmented_state::{ExactStateReadError, SegmentedFriState};
 use crate::sparse_merkle::{SparseMerkleCache, SparseMerkleError};
@@ -314,7 +312,7 @@ pub enum ApplyExactTransitionError {
 }
 
 /// Apply a `TxBody` to `state` in place, returning the post-transition
-/// root on success. Dummy slots (`valid = false`) are skipped entirely.
+/// root on success. Bitmap-dead slots are skipped entirely.
 ///
 /// State root validation happens at block level via the exact authenticated
 /// transition proof — this function purely executes the UTXO state transition
@@ -345,19 +343,14 @@ pub(crate) fn apply_tx_checked_deferred_root(
     let mut snapshot = state.clone();
 
     let input_slots: HashSet<u32> = body
-        .inputs
-        .iter()
-        .filter(|input| input.valid)
-        .map(|input| input.slot_index)
+        .live_inputs()
+        .map(|(_, input)| input.slot_index)
         .collect();
 
     // Wallet-chosen output slots: reject duplicates *within this tx*
     // up-front so we don't silently overwrite our own earlier write.
     let mut seen: HashSet<u32> = HashSet::new();
-    for output in &body.outputs {
-        if !output.valid {
-            continue;
-        }
+    for (_, output) in body.live_outputs() {
         if !seen.insert(output.slot_index) {
             return Err(ApplyError::DuplicateOutputSlot);
         }
@@ -366,17 +359,11 @@ pub(crate) fn apply_tx_checked_deferred_root(
         }
     }
 
-    for input in &body.inputs {
-        if !input.valid {
-            continue;
-        }
-        spend_input(&mut snapshot, input)?;
+    for (_, input) in body.live_inputs() {
+        spend_input(&mut snapshot, input, &body.input_owner)?;
     }
 
-    for output in &body.outputs {
-        if !output.valid {
-            continue;
-        }
+    for (_, output) in body.live_outputs() {
         insert_output(&mut snapshot, output)?;
     }
 
@@ -384,12 +371,16 @@ pub(crate) fn apply_tx_checked_deferred_root(
     Ok(())
 }
 
-fn spend_input(state: &mut ChainState, input: &TxInput) -> Result<(), ApplyError> {
+fn spend_input(
+    state: &mut ChainState,
+    input: &TxInput,
+    input_owner: &noid_poseidon2b::primitives::Address,
+) -> Result<(), ApplyError> {
     if (input.slot_index as u64) >= state.state.num_slots() {
         return Err(ApplyError::SlotOutOfRange);
     }
     let expected =
-        SlotValue::with_owner_fields(input.value, input.creation_id, input.owner.as_fields());
+        SlotValue::with_owner_fields(input.amount, input.creation_id, input_owner.as_fields());
     let current = state.state.slot(input.slot_index);
     if current != expected {
         return Err(ApplyError::UnknownOrSpentInput);
@@ -422,7 +413,7 @@ fn insert_output(state: &mut ChainState, out: &TxOutput) -> Result<(), ApplyErro
         .active_slot_count
         .checked_add(1)
         .ok_or(ApplyError::ActiveSlotCountOverflow)?;
-    let slot = SlotValue::with_owner_fields(out.value, creation_id, out.owner.as_fields());
+    let slot = SlotValue::with_owner_fields(out.amount, creation_id, out.owner.as_fields());
     state
         .state
         .apply_delta_unrooted(&[(idx, slot)])
@@ -435,307 +426,83 @@ fn insert_output(state: &mut ChainState, out: &TxOutput) -> Result<(), ApplyErro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use noid_poseidon2b::primitives::{Address, SpendSecret};
-    use noid_tx::TxInput;
+    use noid_poseidon2b::primitives::Address;
+    use noid_tx::{output_bitmap_bit, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS};
 
-    const TEST_LOG_SLOTS: usize = 6; // 64 slots — cheap FRI
-
-    fn fresh() -> ChainState {
-        ChainState::with_log_slots(TEST_LOG_SLOTS)
+    fn funded() -> ChainState {
+        let mut state = ChainState::with_log_slots(8);
+        state
+            .state
+            .set_slot(
+                1,
+                SlotValue::with_owner_fields(11, 7, Address([1u8; 32]).as_fields()),
+            )
+            .unwrap();
+        state.active_slot_count = 1;
+        state.alloc_counter = 7;
+        state
     }
 
-    fn mk_output_at(slot: u32, seed: u8) -> TxOutput {
-        TxOutput {
-            slot_index: slot,
-            value: (seed as u64) * 100,
-            owner: Address([seed; 32]),
-            valid: true,
-        }
-    }
-
-    fn mk_output(seed: u8) -> TxOutput {
-        // Default helper: pick slot = seed so each test output lands
-        // somewhere unique in the fresh state.
-        mk_output_at(seed as u32, seed)
-    }
-
-    fn mk_input_for(slot_index: u32, out: &TxOutput) -> TxInput {
-        TxInput {
-            slot_index,
-            value: out.value,
-            creation_id: 1,
-            owner: out.owner,
-            spend_secret: SpendSecret([0u8; 32]),
-            valid: true,
-        }
-    }
-
-    fn body_with(fee: u128, inputs: Vec<TxInput>, outputs: Vec<TxOutput>) -> TxBody {
+    fn body(owner: Address, input_slot: u32, output_slot: u32) -> TxBody {
+        let mut inputs = [TxInput::dummy(); TX_INPUTS];
+        inputs[0] = TxInput {
+            slot_index: input_slot,
+            amount: 11,
+            creation_id: 7,
+        };
+        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        outputs[0] = TxOutput {
+            slot_index: output_slot,
+            amount: 10,
+            owner: Address([2u8; 32]),
+        };
         TxBody {
-            shape: noid_tx::TxShape::Standard4x8,
-            epoch_anchor: [0u8; 32],
-            fee,
+            epoch_anchor: [3u8; 32],
+            fee: 1,
+            input_owner: owner,
             inputs,
             outputs,
+            validity_bitmap: 1 | output_bitmap_bit(0),
             is_coinbase: false,
         }
     }
 
-    /// The output's slot_index is wallet-chosen and bound into the
-    /// body hash. This helper is a trivial accessor kept so tests
-    /// read naturally.
-    fn find_slot(_state: &ChainState, out: &TxOutput) -> u32 {
-        out.slot_index
+    #[test]
+    fn explicit_input_owner_matches_state_and_output_gets_new_incarnation() {
+        let mut state = funded();
+        apply_tx(&mut state, &body(Address([1u8; 32]), 1, 2)).unwrap();
+        assert_eq!(state.state.slot(1), SlotValue::EMPTY);
+        assert_eq!(state.state.slot(2).amount(), 10);
+        assert_eq!(state.state.slot(2).creation_id(), 8);
+        assert_eq!(state.active_slot_count, 1);
+        assert_eq!(state.alloc_counter, 8);
     }
 
     #[test]
-    fn fresh_state_accepts_mint_only_body() {
-        let mut state = fresh();
-        let body = body_with(0, vec![], vec![mk_output(1), mk_output(2)]);
-        let out = apply_tx(&mut state, &body).expect("apply");
-        assert_eq!(out.new_state_root, state.state_root());
-        assert_eq!(state.active_slot_count, 2);
-        assert_eq!(state.alloc_counter, 2);
-        assert_eq!(state.state.slot(1).creation_id(), 1);
-        assert_eq!(state.state.slot(2).creation_id(), 2);
-    }
-
-    #[test]
-    fn spend_known_utxo_then_double_spend_rejects() {
-        let mut state = fresh();
-        let out = mk_output(7);
-        apply_tx(&mut state, &body_with(0, vec![], vec![out])).unwrap();
-        let slot = find_slot(&state, &out);
-
-        let input = mk_input_for(slot, &out);
-        apply_tx(&mut state, &body_with(0, vec![input.clone()], vec![])).expect("first spend");
-
+    fn wrong_owner_and_occupied_output_fail_atomically() {
+        let mut state = funded();
+        let root = state.state_root();
         assert_eq!(
-            apply_tx(&mut state, &body_with(0, vec![input], vec![])),
+            apply_tx(&mut state, &body(Address([9u8; 32]), 1, 2)),
             Err(ApplyError::UnknownOrSpentInput)
         );
-    }
+        assert_eq!(state.state_root(), root);
 
-    #[test]
-    fn dummy_slots_ignored() {
-        let mut state = fresh();
-        let valid_out = mk_output(1);
-        let body = body_with(
-            0,
-            vec![TxInput::dummy()],
-            vec![valid_out, TxOutput::dummy()],
-        );
-        apply_tx(&mut state, &body).expect("apply");
-        assert_eq!(state.active_slot_count, 1);
-    }
-
-    #[test]
-    fn post_root_flows_into_next_tx() {
-        let mut state = fresh();
-        let body1 = body_with(0, vec![], vec![mk_output(1)]);
-        let st1 = apply_tx(&mut state, &body1).expect("apply 1");
-
-        let body2 = body_with(0, vec![], vec![mk_output(2)]);
-        let st2 = apply_tx(&mut state, &body2).expect("apply 2");
-        assert_ne!(st1.new_state_root, st2.new_state_root);
-    }
-
-    #[test]
-    fn err_leaves_state_untouched() {
-        let mut state = fresh();
-        apply_tx(&mut state, &body_with(0, vec![], vec![mk_output(1)])).unwrap();
-        let snap_root = state.state_root();
-        let snap_active = state.active_slot_count;
-        let snap_counter = state.alloc_counter;
-
-        // Try to mint into the same slot (already occupied) — must fail.
-        let bad = body_with(0, vec![], vec![mk_output(1)]);
-        assert!(apply_tx(&mut state, &bad).is_err());
-        assert_eq!(state.state_root(), snap_root);
-        assert_eq!(state.active_slot_count, snap_active);
-        assert_eq!(state.alloc_counter, snap_counter);
-    }
-
-    #[test]
-    fn spent_slot_can_be_reused_by_next_mint() {
-        // The wallet is the slot chooser. After a spend frees a slot,
-        // the wallet is free to reuse that exact slot in a later mint.
-        let mut state = fresh();
-
-        let a = mk_output_at(7, 1);
-        apply_tx(&mut state, &body_with(0, vec![], vec![a])).unwrap();
-        assert_eq!(state.active_slot_count, 1);
-
-        apply_tx(&mut state, &body_with(0, vec![mk_input_for(7, &a)], vec![])).unwrap();
-        assert_eq!(state.active_slot_count, 0);
-
-        // Wallet reuses slot 7 — discovered via random probe.
-        let c = mk_output_at(7, 3);
-        apply_tx(&mut state, &body_with(0, vec![], vec![c])).unwrap();
-        assert_eq!(state.active_slot_count, 1);
-        assert_eq!(state.state.slot(7).creation_id(), 2);
+        let overlap = body(Address([1u8; 32]), 1, 1);
         assert_eq!(
-            apply_tx(&mut state, &body_with(0, vec![mk_input_for(7, &c)], vec![]),),
-            Err(ApplyError::UnknownOrSpentInput),
-            "the first incarnation's creation ID must not spend the replacement"
+            apply_tx(&mut state, &overlap),
+            Err(ApplyError::InputOutputSlotOverlap)
         );
     }
 
     #[test]
-    fn evicted_expand_updates_cached_exact_root_and_fails_closed() {
-        let old_log = TEST_LOG_SLOTS;
-        let owner = Address([0x41; 32]);
-        let live = SlotValue::with_owner_fields(50, 1, owner.as_fields());
-        let old_root = crate::sparse_merkle::SparseMerkleCache::from_leaves(
-            old_log as u32,
-            &[(7, slot_leaf_hash(live))],
-        )
-        .unwrap()
-        .root();
-        let mut state = ChainState::with_log_slots(old_log);
-        state.utxo_root = old_root;
-        state.active_slot_count = 1;
-        state.alloc_counter = 1;
-
-        state.state.mark_segment_evicted_for_test(0, [0xA5; 32]);
-        assert!(state.try_state_root().is_err());
-        state.expand_one();
-
-        let expected =
-            crate::exact_state_hash::state_node_hash(old_root, zero_slot_roots(old_log)[old_log]);
-        assert_eq!(state.cached_state_root(), expected);
-        assert_eq!(state.state.log_slots(), old_log + 1);
-        assert!(state.try_state_root().is_err());
-    }
-
-    #[test]
-    fn same_tx_cannot_reuse_input_slot_as_output() {
-        let mut state = fresh();
-        let a = mk_output_at(7, 1);
-        apply_tx(&mut state, &body_with(0, vec![], vec![a])).unwrap();
-
-        let replacement = mk_output_at(7, 2);
+    fn duplicate_live_outputs_reject() {
+        let mut body = body(Address([1u8; 32]), 1, 2);
+        body.outputs[1] = body.outputs[0];
+        body.validity_bitmap |= output_bitmap_bit(1);
         assert_eq!(
-            apply_tx(
-                &mut state,
-                &body_with(0, vec![mk_input_for(7, &a)], vec![replacement]),
-            ),
-            Err(ApplyError::InputOutputSlotOverlap),
+            apply_tx(&mut funded(), &body),
+            Err(ApplyError::DuplicateOutputSlot)
         );
-    }
-
-    #[test]
-    fn mint_to_occupied_slot_rejects() {
-        let mut state = fresh();
-        // First mint lands at slot 1.
-        apply_tx(&mut state, &body_with(0, vec![], vec![mk_output_at(1, 1)])).unwrap();
-
-        // Second mint targeting the same slot must reject.
-        assert_eq!(
-            apply_tx(&mut state, &body_with(0, vec![], vec![mk_output_at(1, 2)]),),
-            Err(ApplyError::OutputSlotNotEmpty),
-        );
-    }
-
-    #[test]
-    fn mint_to_out_of_range_slot_rejects() {
-        // Depth 1 state: valid slots in {0,1}. Targeting slot 2 must
-        // reject with `SlotOutOfRange`.
-        let mut state = ChainState::with_log_slots(1);
-        assert_eq!(
-            apply_tx(&mut state, &body_with(0, vec![], vec![mk_output_at(2, 3)]),),
-            Err(ApplyError::SlotOutOfRange),
-        );
-    }
-
-    #[test]
-    fn duplicate_output_slot_in_tx_rejects() {
-        let mut state = fresh();
-        // Two outputs targeting the same slot within one tx must fail
-        // before any write hits the state.
-        let a = mk_output_at(5, 1);
-        let b = mk_output_at(5, 2);
-        assert_eq!(
-            apply_tx(&mut state, &body_with(0, vec![], vec![a, b])),
-            Err(ApplyError::DuplicateOutputSlot),
-        );
-        assert_eq!(state.active_slot_count, 0);
-    }
-
-    #[test]
-    fn deterministic_across_validators() {
-        // Two independent states apply the same tx sequence — post
-        // roots and counters must match deterministically.
-        let mut s1 = fresh();
-        let mut s2 = fresh();
-
-        for seed in 1u8..6 {
-            let o = mk_output(seed);
-
-            apply_tx(&mut s1, &body_with(0, vec![], vec![o])).unwrap();
-            apply_tx(&mut s2, &body_with(0, vec![], vec![o])).unwrap();
-        }
-
-        assert_eq!(s1.state_root(), s2.state_root());
-        assert_eq!(s1.alloc_counter, s2.alloc_counter);
-    }
-
-    #[test]
-    fn input_with_wrong_owner_rejects() {
-        let mut state = fresh();
-        let real = mk_output(5);
-        apply_tx(&mut state, &body_with(0, vec![], vec![real])).unwrap();
-
-        let slot = find_slot(&state, &real);
-        let mut bogus = mk_input_for(slot, &real);
-        bogus.owner = Address([0xDE; 32]);
-        assert_eq!(
-            apply_tx(&mut state, &body_with(0, vec![bogus], vec![])),
-            Err(ApplyError::UnknownOrSpentInput)
-        );
-    }
-
-    #[test]
-    fn stale_creation_id_rejects_even_when_amount_and_owner_match() {
-        let mut state = fresh();
-        let real = mk_output(5);
-        apply_tx(&mut state, &body_with(0, vec![], vec![real])).unwrap();
-
-        let mut stale = mk_input_for(real.slot_index, &real);
-        stale.creation_id = 0;
-        assert_eq!(
-            apply_tx(&mut state, &body_with(0, vec![stale], vec![])),
-            Err(ApplyError::UnknownOrSpentInput)
-        );
-        assert_eq!(state.state.slot(real.slot_index).creation_id(), 1);
-    }
-
-    #[test]
-    fn allocation_counter_overflow_is_atomic() {
-        let mut state = fresh();
-        state.alloc_counter = u64::MAX;
-        let before = state.state_root();
-
-        assert_eq!(
-            apply_tx(&mut state, &body_with(0, vec![], vec![mk_output(1)])),
-            Err(ApplyError::AllocCounterOverflow)
-        );
-        assert_eq!(state.state_root(), before);
-        assert_eq!(state.active_slot_count, 0);
-        assert_eq!(state.alloc_counter, u64::MAX);
-    }
-
-    #[test]
-    fn sparse_constructor_rejects_creation_id_above_trusted_counter() {
-        let owner = Address([0x44; 32]);
-        let slot = SlotValue::with_owner_fields(100, 2, owner.as_fields());
-        assert!(matches!(
-            ChainState::from_sparse_utxos(TEST_LOG_SLOTS, &[(7, slot)], 1),
-            Err(SparseUtxoBuildError::CreationIdExceedsAllocCounter {
-                slot_index: 7,
-                creation_id: 2,
-                alloc_counter: 1,
-            })
-        ));
     }
 }

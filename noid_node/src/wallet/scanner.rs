@@ -18,7 +18,7 @@ use std::collections::HashMap;
 
 use super::state::{TxDirection, TxHistoryEntry, WalletUtxo};
 use noid_chain::block::Block;
-use noid_chain::consensus::receipt::{generate_receipt, TxSummary};
+use noid_chain::consensus::receipt::generate_receipt;
 
 // ---------------------------------------------------------------------------
 // Incremental block update
@@ -86,8 +86,7 @@ fn derive_output_creation_ids(
     let live_mints = block
         .transactions
         .iter()
-        .flat_map(|tx| tx.body.outputs.iter())
-        .filter(|output| output.valid)
+        .flat_map(|tx| tx.body.live_outputs())
         .try_fold(0u64, |count, _| count.checked_add(1))
         .ok_or(CreationIdDerivationError::MintCountOverflow)?;
     let mut counter = block.header.alloc_counter.checked_sub(live_mints).ok_or(
@@ -104,8 +103,8 @@ fn derive_output_creation_ids(
         .collect();
 
     for (tx_index, tx) in block.transactions.iter().enumerate() {
-        for (output_index, output) in tx.body.outputs.iter().enumerate() {
-            if !output.valid {
+        for (output_index, _output) in tx.body.outputs.iter().enumerate() {
+            if !tx.body.output_is_live(output_index) {
                 continue;
             }
             counter = counter
@@ -138,7 +137,7 @@ pub fn update_wallet_artifacts_from_block(
     let block_tx_hashes: Vec<[u8; 32]> = block
         .transactions
         .iter()
-        .map(|transaction| transaction.tx_body_hash.0)
+        .map(|transaction| transaction.txid().0)
         .collect();
     let pending_hashes: std::collections::HashSet<[u8; 32]> = history
         .iter()
@@ -152,38 +151,12 @@ pub fn update_wallet_artifacts_from_block(
         .collect();
 
     for (tx_index, tx) in block.transactions.iter().enumerate() {
-        let tx_hash = tx.tx_body_hash.0;
+        let tx_hash = tx.txid().0;
         let pending_send = pending_hashes.contains(&tx_hash);
 
         if pending_send {
-            let summary = TxSummary {
-                tx_body_hash: tx_hash,
-                inputs: tx
-                    .body
-                    .inputs
-                    .iter()
-                    .filter(|input| input.valid)
-                    .map(|input| (input.slot_index, input.owner))
-                    .collect(),
-                outputs: tx
-                    .body
-                    .outputs
-                    .iter()
-                    .filter(|output| output.valid)
-                    .map(|output| (output.slot_index, output.value, output.owner))
-                    .collect(),
-                fee_micronoid: tx.body.fee as u64,
-                confirmed_height: block.header.height,
-                confirmed_unix: block.header.timestamp,
-            };
-            let receipt = generate_receipt(
-                &block.header,
-                tx_hash,
-                tx_index,
-                &block_tx_hashes,
-                summary,
-                None,
-            );
+            let receipt =
+                generate_receipt(&block.header, &tx.body, tx_index, &block_tx_hashes, None);
             receipts.insert(tx_hash, receipt.to_bytes());
             continue;
         }
@@ -193,10 +166,10 @@ pub fn update_wallet_artifacts_from_block(
         }
         let received = tx
             .body
-            .outputs
-            .iter()
-            .filter(|output| output.valid && output.owner == active_address)
-            .map(|output| output.value)
+            .live_outputs()
+            .map(|(_, output)| output)
+            .filter(|output| output.owner == active_address)
+            .map(|output| output.amount)
             .fold(0u64, u64::saturating_add);
         if received == 0 {
             continue;
@@ -251,7 +224,7 @@ pub fn update_active_wallet_from_block(
     let block_tx_hashes: Vec<[u8; 32]> = block
         .transactions
         .iter()
-        .map(|t| t.tx_body_hash.0)
+        .map(|transaction| transaction.txid().0)
         .collect();
 
     // Build once before the loop: O(history) instead of O(history × txs).
@@ -262,11 +235,12 @@ pub fn update_active_wallet_from_block(
         .collect();
 
     for (tx_index, tx) in block.transactions.iter().enumerate() {
+        let tx_hash = tx.txid().0;
         if tx.body.is_coinbase {
             // Coinbase: track UTXOs for our addresses, record history.
             // No receipt — receipts are proof-of-payment for OUTGOING txs only.
             for (output_index, output) in tx.body.outputs.iter().enumerate() {
-                if !output.valid {
+                if !tx.body.output_is_live(output_index) {
                     continue;
                 }
                 let Some(creation_id) = output_creation_ids[tx_index][output_index] else {
@@ -277,7 +251,7 @@ pub fn update_active_wallet_from_block(
                 if output.owner == active_address {
                     let utxo = WalletUtxo {
                         slot_index: output.slot_index,
-                        value: output.value,
+                        value: output.amount,
                         creation_id,
                         address: output.owner,
                         key_index: active_index,
@@ -286,10 +260,10 @@ pub fn update_active_wallet_from_block(
                     utxos.insert(output.slot_index, utxo);
                     let addr_str = output.owner.to_bech32();
                     history.push(TxHistoryEntry {
-                        tx_hash: tx.tx_body_hash.0,
+                        tx_hash,
                         height,
                         direction: TxDirection::Received,
-                        amount_micronoid: output.value,
+                        amount_micronoid: output.amount,
                         peer_address: None,
                         timestamp,
                         own_address: Some(addr_str),
@@ -309,7 +283,7 @@ pub fn update_active_wallet_from_block(
         let mut recv_own_key_index: Option<u32> = None;
 
         // Inputs: remove spent UTXOs and clear from pending_input_slots.
-        for input in tx.body.inputs.iter().filter(|i| i.valid) {
+        for (_, input) in tx.body.live_inputs() {
             pending_input_slots.remove(&input.slot_index);
             if let Some(spent) = utxos.remove(&input.slot_index) {
                 sent_from_wallet = sent_from_wallet.saturating_add(spent.value);
@@ -323,7 +297,7 @@ pub fn update_active_wallet_from_block(
 
         // Outputs: add new UTXOs owned by this wallet
         for (output_index, output) in tx.body.outputs.iter().enumerate() {
-            if !output.valid {
+            if !tx.body.output_is_live(output_index) {
                 continue;
             }
             let Some(creation_id) = output_creation_ids[tx_index][output_index] else {
@@ -334,14 +308,14 @@ pub fn update_active_wallet_from_block(
             if output.owner == active_address {
                 let utxo = WalletUtxo {
                     slot_index: output.slot_index,
-                    value: output.value,
+                    value: output.amount,
                     creation_id,
                     address: output.owner,
                     key_index: active_index,
                     confirmed_height: height,
                 };
                 utxos.insert(output.slot_index, utxo);
-                received_by_wallet = received_by_wallet.saturating_add(output.value);
+                received_by_wallet = received_by_wallet.saturating_add(output.amount);
                 // Track the first received-to address as the "own" receiving address.
                 if recv_own_address.is_none() {
                     recv_own_address = Some(output.owner.to_bech32());
@@ -353,13 +327,13 @@ pub fn update_active_wallet_from_block(
         // Record history entry.
         // Skip if this tx_hash is already in history as a pending (height=0) entry
         // from record_pending_send — confirm_pending_tx will update the height.
-        let already_pending = pending_hashes.contains(&tx.tx_body_hash.0);
+        let already_pending = pending_hashes.contains(&tx_hash);
 
         if !already_pending {
             if sent_from_wallet > 0 {
                 let net_sent = sent_from_wallet.saturating_sub(received_by_wallet);
                 history.push(TxHistoryEntry {
-                    tx_hash: tx.tx_body_hash.0,
+                    tx_hash,
                     height,
                     direction: TxDirection::Sent,
                     amount_micronoid: net_sent,
@@ -370,7 +344,7 @@ pub fn update_active_wallet_from_block(
                 });
             } else if received_by_wallet > 0 {
                 history.push(TxHistoryEntry {
-                    tx_hash: tx.tx_body_hash.0,
+                    tx_hash,
                     height,
                     direction: TxDirection::Received,
                     amount_micronoid: received_by_wallet,
@@ -388,35 +362,9 @@ pub fn update_active_wallet_from_block(
         // pending history tag is the ownership signal for receipt generation.
         // Incoming-only transactions still need no receipt.
         if sent_from_wallet > 0 || already_pending {
-            let summary = TxSummary {
-                tx_body_hash: tx.tx_body_hash.0,
-                inputs: tx
-                    .body
-                    .inputs
-                    .iter()
-                    .filter(|i| i.valid)
-                    .map(|i| (i.slot_index, i.owner))
-                    .collect(),
-                outputs: tx
-                    .body
-                    .outputs
-                    .iter()
-                    .filter(|o| o.valid)
-                    .map(|o| (o.slot_index, o.value, o.owner))
-                    .collect(),
-                fee_micronoid: tx.body.fee as u64,
-                confirmed_height: height,
-                confirmed_unix: timestamp,
-            };
-            let receipt = generate_receipt(
-                &block.header,
-                tx.tx_body_hash.0,
-                tx_index,
-                &block_tx_hashes,
-                summary,
-                None,
-            );
-            receipts.insert(tx.tx_body_hash.0, receipt.to_bytes());
+            let receipt =
+                generate_receipt(&block.header, &tx.body, tx_index, &block_tx_hashes, None);
+            receipts.insert(tx_hash, receipt.to_bytes());
         }
     }
     Ok(())
@@ -426,26 +374,40 @@ pub fn update_active_wallet_from_block(
 mod tests {
     use super::*;
     use noid_chain::block_header::BlockHeader;
-    use noid_poseidon2b::primitives::{Address, TxBodyHash};
-    use noid_tx::{Transaction, TxBody, TxOutput, TxShape};
+    use noid_poseidon2b::primitives::Address;
+    use noid_tx::{
+        output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS,
+    };
 
     fn transaction(is_coinbase: bool, slot_index: u32, owner: Address) -> Transaction {
-        Transaction {
-            body: TxBody {
-                shape: TxShape::Standard4x8,
-                epoch_anchor: if is_coinbase { [0; 32] } else { [1; 32] },
-                fee: 0,
-                inputs: vec![],
-                outputs: vec![TxOutput {
-                    slot_index,
-                    value: u64::from(slot_index) + 100,
-                    owner,
-                    valid: true,
-                }],
-                is_coinbase,
-            },
-            tx_body_hash: TxBodyHash([slot_index as u8; 32]),
+        let amount = u64::from(slot_index) + 100;
+        let mut inputs = [TxInput::dummy(); TX_INPUTS];
+        if !is_coinbase {
+            inputs[0] = TxInput {
+                slot_index: slot_index + 1_000,
+                amount,
+                creation_id: 1,
+            };
         }
+        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        outputs[0] = TxOutput {
+            slot_index,
+            amount,
+            owner,
+        };
+        Transaction::new(TxBody {
+            epoch_anchor: if is_coinbase { [0; 32] } else { [1; 32] },
+            fee: 0,
+            input_owner: if is_coinbase {
+                Address([0; 32])
+            } else {
+                Address([0xEE; 32])
+            },
+            inputs,
+            outputs,
+            validity_bitmap: output_bitmap_bit(0) | u16::from(!is_coinbase),
+            is_coinbase,
+        })
     }
 
     fn block(transactions: Vec<Transaction>, alloc_counter: u64) -> Block {
@@ -574,7 +536,7 @@ mod tests {
         let inactive_source = Address([0xA7; 32]);
         let coinbase = transaction(true, 10, Address([0xCC; 32]));
         let outgoing = transaction(false, 20, Address([0xBB; 32]));
-        let outgoing_hash = outgoing.tx_body_hash.0;
+        let outgoing_hash = outgoing.txid().0;
         let block = block(vec![coinbase, outgoing], 2);
         let mut utxos = HashMap::new();
         let mut history = vec![TxHistoryEntry {
@@ -612,7 +574,7 @@ mod tests {
         let inactive_source = Address([0xD2; 32]);
         let coinbase = transaction(true, 10, Address([0xCC; 32]));
         let outgoing = transaction(false, 20, Address([0xBB; 32]));
-        let outgoing_hash = outgoing.tx_body_hash.0;
+        let outgoing_hash = outgoing.txid().0;
         let block = block(vec![coinbase, outgoing], 2);
         let mut history = vec![TxHistoryEntry {
             tx_hash: outgoing_hash,

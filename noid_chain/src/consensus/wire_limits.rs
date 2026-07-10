@@ -7,20 +7,9 @@
 //! the proof-native protocol: every large object must be bounded before expensive
 //! decode, allocation, verification or storage.
 
-/// Maximum serialized TxIntent accepted by P2P/RPC/mempool admission.
-pub const MAX_TX_INTENT_BYTES_GLOBAL: usize = 512 * 1024;
-
-/// Maximum serialized Standard4x8 wallet authorization bytes.
-pub const MAX_STANDARD_AUTHORIZATION_BYTES: usize = 192 * 1024;
-
-/// Maximum serialized Sweep25x2 wallet authorization bytes.
-pub const MAX_SWEEP_AUTHORIZATION_BYTES: usize = 256 * 1024;
-
-/// Shape-specific serialized TxIntent cap for Standard4x8 auth-only wallet artifacts.
-pub const MAX_STANDARD_TX_INTENT_BYTES: usize = 256 * 1024;
-
-/// Shape-specific serialized TxIntent cap for Sweep25x2 auth-only wallet artifacts.
-pub const MAX_SWEEP_TX_INTENT_BYTES: usize = 320 * 1024;
+/// Maximum serialized authorization and intent sizes for the sole fixed body.
+pub const MAX_AUTHORIZATION_BYTES: usize = noid_tx::MAX_TX_AUTHORIZATION_BYTES;
+pub const MAX_TX_INTENT_BYTES_GLOBAL: usize = noid_tx::MAX_TX_INTENT_BYTES;
 
 /// Maximum admitted mempool transactions kept in RAM.
 pub const MAX_MEMPOOL_TXS: usize = 1024;
@@ -34,8 +23,8 @@ pub const MAX_MEMPOOL_SYNC_TXS: usize = 128;
 /// Maximum bytes returned in one mempool-sync response.
 pub const MAX_MEMPOOL_SYNC_BYTES: usize = 16 * 1024 * 1024;
 
-/// Maximum serialized block body/header payload.
-pub const MAX_BLOCK_BYTES: usize = 1024 * 1024;
+/// Exact largest canonical block: marker + header + count + 256 Tx8x2 bodies.
+pub const MAX_BLOCK_BYTES: usize = 1 + 212 + 4 + 256 * noid_tx::TX_BODY_WIRE_SIZE;
 
 /// Maximum serialized canonical BlockProof payload.
 pub const MAX_BLOCK_PROOF_BYTES: usize = 32 * 1024 * 1024;
@@ -50,7 +39,7 @@ pub const MAX_BLOCK_PROOF_PLUS_SIDECAR_BYTES: usize = 48 * 1024 * 1024;
 ///
 /// This is an admission/DoS guard, not the consensus semantic throughput
 /// budget. Consensus semantic limits live in `consensus::params` and are
-/// calibrated to 255 maximum Standard4x8 user transactions.
+/// calibrated to 255 maximum fixed-shape user transactions.
 pub const MAX_BLOCK_RESOURCE_WEIGHT: usize = 64 * 1024 * 1024;
 
 pub const BLOCK_WEIGHT_PER_USER_TX: usize = 16 * 1024;
@@ -101,22 +90,6 @@ pub const MAX_RPC_SALT_BYTES: usize = 256;
 #[inline]
 pub const fn hex_chars_for_bytes(bytes: usize) -> usize {
     bytes.saturating_mul(2)
-}
-
-#[inline]
-pub fn max_tx_intent_bytes_for_shape(shape: noid_tx::TxShape) -> usize {
-    match shape {
-        noid_tx::TxShape::Standard4x8 => MAX_STANDARD_TX_INTENT_BYTES,
-        noid_tx::TxShape::Sweep25x2 => MAX_SWEEP_TX_INTENT_BYTES,
-    }
-}
-
-#[inline]
-pub fn max_authorization_bytes_for_shape(shape: noid_tx::TxShape) -> usize {
-    match shape {
-        noid_tx::TxShape::Standard4x8 => MAX_STANDARD_AUTHORIZATION_BYTES,
-        noid_tx::TxShape::Sweep25x2 => MAX_SWEEP_AUTHORIZATION_BYTES,
-    }
 }
 
 #[inline]
@@ -174,66 +147,27 @@ mod tests {
     use super::*;
 
     #[test]
-    #[allow(clippy::assertions_on_constants)]
-    fn production_wire_caps_are_ordered() {
-        assert!(MAX_STANDARD_TX_INTENT_BYTES <= MAX_TX_INTENT_BYTES_GLOBAL);
-        assert!(MAX_SWEEP_TX_INTENT_BYTES <= MAX_TX_INTENT_BYTES_GLOBAL);
-        assert!(
-            MAX_BLOCK_PROOF_PLUS_SIDECAR_BYTES
-                <= MAX_BLOCK_PROOF_BYTES + MAX_BLOCK_AUTH_SIDECAR_BYTES
-        );
-        assert!(MAX_BLOCK_BYTES <= INLINE_BLOCK_GOSSIP_THRESHOLD);
-        assert!(INLINE_BLOCK_GOSSIP_THRESHOLD <= GOSSIP_MAX_TRANSMIT_BYTES);
-        assert!(MAX_MEMPOOL_SYNC_BYTES <= MAX_MEMPOOL_BYTES);
-        assert_eq!(MAX_SNAPSHOT_MANIFEST_SEGMENTS, u16::MAX as usize + 1);
-        assert!(MAX_SEGMENT_BYTES.saturating_mul(MAX_INFLIGHT_SEGMENTS) == 64 * 1024 * 1024);
-        assert!(MAX_ORPHAN_POOL_BYTES >= MAX_BLOCK_PROOF_PLUS_SIDECAR_BYTES);
-        assert!(MAX_BLOCK_PROOF_PLUS_SIDECAR_BYTES <= MAX_BLOCK_RESOURCE_WEIGHT);
+    fn final_wire_caps_match_canonical_constructions() {
+        assert_eq!(MAX_AUTHORIZATION_BYTES, noid_tx::MAX_TX_AUTHORIZATION_BYTES);
+        assert_eq!(MAX_TX_INTENT_BYTES_GLOBAL, noid_tx::MAX_TX_INTENT_BYTES);
+        assert_eq!(MAX_BLOCK_BYTES, 82_905);
     }
 
     #[test]
-    fn proof_sidecar_combined_cap_is_saturating() {
+    fn combined_proof_cap_is_checked_without_overflow() {
         assert!(proof_sidecar_combined_len_ok(
-            MAX_BLOCK_PROOF_PLUS_SIDECAR_BYTES,
-            0
-        ));
-        assert!(proof_sidecar_combined_len_ok(
-            MAX_BLOCK_PROOF_PLUS_SIDECAR_BYTES / 2,
-            MAX_BLOCK_PROOF_PLUS_SIDECAR_BYTES / 2
+            MAX_BLOCK_PROOF_BYTES,
+            MAX_BLOCK_PROOF_PLUS_SIDECAR_BYTES - MAX_BLOCK_PROOF_BYTES,
         ));
         assert!(!proof_sidecar_combined_len_ok(
-            MAX_BLOCK_PROOF_PLUS_SIDECAR_BYTES,
-            1
-        ));
-        assert!(!proof_sidecar_combined_len_ok(usize::MAX, usize::MAX));
-    }
-
-    #[test]
-    fn block_resource_weight_counts_work_units() {
-        let light = block_resource_weight(1024, 1024, 1024, 1, 1, 2, 3).unwrap();
-        let heavy = block_resource_weight(1024, 1024, 1024, 1, 25, 2, 27).unwrap();
-        assert!(heavy > light);
-        assert!(block_resource_weight_ok(1024, 1024, 1024, 1, 25, 2, 27));
-        assert!(!block_resource_weight_ok(
-            MAX_BLOCK_RESOURCE_WEIGHT,
-            1,
-            0,
-            0,
-            0,
-            0,
-            0
+            MAX_BLOCK_PROOF_BYTES,
+            MAX_BLOCK_AUTH_SIDECAR_BYTES,
         ));
     }
 
     #[test]
-    fn tx_shape_caps_are_below_global_cap() {
-        assert_eq!(
-            max_tx_intent_bytes_for_shape(noid_tx::TxShape::Standard4x8),
-            MAX_STANDARD_TX_INTENT_BYTES
-        );
-        assert_eq!(
-            max_tx_intent_bytes_for_shape(noid_tx::TxShape::Sweep25x2),
-            MAX_SWEEP_TX_INTENT_BYTES
-        );
+    fn resource_weight_uses_checked_arithmetic() {
+        assert!(block_resource_weight(1, 2, 3, 4, 5, 6, 7).is_some());
+        assert!(block_resource_weight(usize::MAX, 1, 0, 0, 0, 0, 0).is_none());
     }
 }

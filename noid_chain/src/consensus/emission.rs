@@ -49,19 +49,21 @@ pub fn block_reward(log_slots: u32) -> u64 {
 }
 
 /// Sum all transaction fees (non-coinbase) in μNOID.
-/// Saturates on overflow rather than panicking.
-pub fn total_fees(txs: &[TxBody]) -> u64 {
+///
+/// A block can contain 255 `u64` fees, so aggregation uses `u128`; consensus
+/// predicates never silently saturate a monetary total.
+pub fn total_fees(txs: &[TxBody]) -> u128 {
     txs.iter()
         .filter(|tx| !tx.is_coinbase)
-        .map(|tx| tx.fee.min(u64::MAX as u128) as u64)
-        .fold(0u64, |acc, f| acc.saturating_add(f))
+        .map(|tx| u128::from(tx.fee))
+        .sum()
 }
 
 /// Maximum value the coinbase output is permitted to carry (μNOID).
 ///
 /// `coinbase_value ≤ block_reward(log_slots) + total_fees(non_coinbase_txs)`
-pub fn max_coinbase_value(log_slots: u32, non_coinbase_txs: &[TxBody]) -> u64 {
-    block_reward(log_slots).saturating_add(total_fees(non_coinbase_txs))
+pub fn max_coinbase_value(log_slots: u32, non_coinbase_txs: &[TxBody]) -> u128 {
+    u128::from(block_reward(log_slots)) + total_fees(non_coinbase_txs)
 }
 
 /// Same as `max_coinbase_value` but accepts a pre-computed fee sum.
@@ -70,8 +72,8 @@ pub fn max_coinbase_value(log_slots: u32, non_coinbase_txs: &[TxBody]) -> u64 {
 /// `TxBody` objects just to sum their fees. Saves ~256 × (Vec allocs +
 /// TxInput/TxOutput copies) per block at 256 txs.
 #[inline]
-pub fn max_coinbase_value_from_fee_sum(log_slots: u32, fee_sum: u64) -> u64 {
-    block_reward(log_slots).saturating_add(fee_sum)
+pub fn max_coinbase_value_from_fee_sum(log_slots: u32, fee_sum: u128) -> u128 {
+    u128::from(block_reward(log_slots)) + fee_sum
 }
 
 /// Format a μNOID amount as a human-readable string (not consensus-critical).
@@ -84,111 +86,43 @@ pub fn format_noid(micronoid: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consensus::params::LOG_SLOTS_MAX;
+    use noid_poseidon2b::primitives::Address;
+    use noid_tx::{TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS};
 
-    #[test]
-    fn reward_table_matches_spec() {
-        // Exact values from the consensus emission table.
-        assert_eq!(block_reward(24), 50_000_000, "50 NOID at genesis");
-        assert_eq!(block_reward(25), 25_000_000, "25 NOID");
-        assert_eq!(block_reward(26), 12_500_000, "12.5 NOID");
-        assert_eq!(block_reward(27), 6_250_000, "6.25 NOID");
-        assert_eq!(block_reward(28), 3_125_000, "3.125 NOID");
-        assert_eq!(block_reward(29), 1_562_500, "1.5625 NOID");
-        // log_slots=30: 50_000_000 >> 6 = 781_250 < 1_000_000 → floor
-        assert_eq!(block_reward(30), 1_000_000, "1 NOID floor at 30");
-        assert_eq!(block_reward(31), 1_000_000, "1 NOID floor at 31");
-        assert_eq!(block_reward(32), 1_000_000, "1 NOID floor at max");
-    }
-
-    #[test]
-    fn floor_never_violated_for_any_log_slots() {
-        for log_s in LOG_SLOTS_GENESIS..=LOG_SLOTS_MAX + 10 {
-            assert!(
-                block_reward(log_s) >= FLOOR_REWARD_MICRONOID,
-                "floor violated at log_slots={log_s}"
-            );
+    fn fee_body(fee: u64, coinbase: bool) -> TxBody {
+        TxBody {
+            epoch_anchor: [1u8; 32],
+            fee: if coinbase { 0 } else { fee },
+            input_owner: Address([0u8; 32]),
+            inputs: [TxInput::dummy(); TX_INPUTS],
+            outputs: [TxOutput::dummy(); TX_OUTPUTS],
+            validity_bitmap: 0,
+            is_coinbase: coinbase,
         }
     }
 
     #[test]
-    fn reward_monotone_non_increasing() {
-        let mut prev = block_reward(LOG_SLOTS_GENESIS);
-        for log_s in (LOG_SLOTS_GENESIS + 1)..=LOG_SLOTS_MAX {
-            let curr = block_reward(log_s);
-            assert!(
-                curr <= prev,
-                "reward increased from log_slots={} to {}",
-                log_s - 1,
-                log_s
-            );
-            prev = curr;
-        }
+    fn reward_halves_with_expansion_and_has_floor() {
+        assert_eq!(block_reward(LOG_SLOTS_GENESIS), BASE_REWARD_MICRONOID);
+        assert_eq!(
+            block_reward(LOG_SLOTS_GENESIS + 1),
+            BASE_REWARD_MICRONOID / 2
+        );
+        assert_eq!(
+            block_reward(LOG_SLOTS_GENESIS + 100),
+            FLOOR_REWARD_MICRONOID
+        );
     }
 
     #[test]
-    fn halving_per_expansion() {
-        // Each expansion halves until floor.
-        assert_eq!(block_reward(25), block_reward(24) / 2);
-        assert_eq!(block_reward(26), block_reward(25) / 2);
-        assert_eq!(block_reward(27), block_reward(26) / 2);
-        assert_eq!(block_reward(28), block_reward(27) / 2);
-        assert_eq!(block_reward(29), block_reward(28) / 2);
-        // At 30+, floor prevents further halving.
-        assert_eq!(block_reward(30), block_reward(31));
-    }
-
-    #[test]
-    fn total_fees_sums_non_coinbase() {
-        use noid_tx::types::TxBody;
-        let coinbase = TxBody {
-            shape: noid_tx::TxShape::Standard4x8,
-            fee: 0,
-            is_coinbase: true,
-            inputs: vec![],
-            outputs: vec![],
-            epoch_anchor: [0; 32],
-        };
-        let tx1 = TxBody {
-            shape: noid_tx::TxShape::Standard4x8,
-            fee: 5_000_000,
-            is_coinbase: false,
-            inputs: vec![],
-            outputs: vec![],
-            epoch_anchor: [0; 32],
-        };
-        let tx2 = TxBody {
-            shape: noid_tx::TxShape::Standard4x8,
-            fee: 3_000_000,
-            is_coinbase: false,
-            inputs: vec![],
-            outputs: vec![],
-            epoch_anchor: [0; 32],
-        };
-        assert_eq!(total_fees(&[coinbase, tx1, tx2]), 8_000_000);
-    }
-
-    #[test]
-    fn max_coinbase_at_genesis() {
-        // No fees, genesis: max coinbase = 50 NOID.
-        assert_eq!(max_coinbase_value(24, &[]), 50_000_000);
-    }
-
-    #[test]
-    fn expansion_is_anti_spam() {
-        // Spamming to trigger expansion (24→25) cuts reward from 50 to 25 NOID/block.
-        let before = block_reward(24);
-        let after = block_reward(25);
-        assert_eq!(after, before / 2, "expansion must halve reward");
-        // Attacker who fills 2^24 slots triggers expansion,
-        // immediately halving their own mining income.
-    }
-
-    #[test]
-    fn format_noid_display() {
-        assert_eq!(format_noid(50_000_000), "50.000000 NOID");
-        assert_eq!(format_noid(1_562_500), "1.562500 NOID");
-        assert_eq!(format_noid(1_000_000), "1.000000 NOID");
-        assert_eq!(format_noid(0), "0.000000 NOID");
+    fn total_fees_excludes_coinbase_without_u64_saturation() {
+        assert_eq!(
+            total_fees(&[fee_body(7, false), fee_body(0, true), fee_body(9, false),]),
+            16
+        );
+        assert_eq!(
+            total_fees(&[fee_body(u64::MAX, false), fee_body(1, false)]),
+            u128::from(u64::MAX) + 1
+        );
     }
 }

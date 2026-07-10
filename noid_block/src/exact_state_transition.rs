@@ -9,9 +9,7 @@
 //! `EXSTNOD(parent_root, zero_root[parent_depth])`; otherwise they authenticate
 //! directly against the parent header root.
 
-use noid_chain::exact_state_hash::{
-    slot_leaf_hash, state_node_hash, zero_slot_roots, StateHash,
-};
+use noid_chain::exact_state_hash::{slot_leaf_hash, state_node_hash, zero_slot_roots, StateHash};
 use noid_chain::fri_state::SlotValue;
 use noid_chain::sparse_merkle::{
     build_multiproof, expand_multiproof_paths, reconstruct_root, ExpandedMerklePath,
@@ -23,8 +21,7 @@ use noid_gkr::{MerklePathInputs, SlotLeafInputs, MAX_MERKLE_DEPTH};
 
 /// Maximum user transactions under the consensus semantic block budget.
 pub const MAX_EXACT_USER_TXS: usize = noid_chain::consensus::params::BLOCK_MAX_USER_TXS;
-/// Max touched user slots under the Standard4x8-calibrated semantic budget plus
-/// the required single coinbase output.
+/// Maximum bitmap-live touched slots plus the required coinbase output.
 pub const MAX_EXACT_TOUCHED_SLOTS: usize =
     noid_chain::consensus::params::BLOCK_MAX_USER_ACTIONS + 1;
 /// Conservative sibling bound before canonical deduplication.

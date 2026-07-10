@@ -11,11 +11,12 @@
 //! is held for as short a time as possible.
 //!
 use noid_gkr::OwnerAuthWitness;
-use noid_poseidon2b::primitives::{derive_address, Address, SpendSecret};
+use noid_poseidon2b::primitives::{derive_address, Address};
 use noid_tx::{
-    body_hash::hash_tx_body_for_shape,
     intent::TxIntent,
-    types::{TxBody, TxInput, TxOutput, TxShape},
+    output_bitmap_bit,
+    types::{TxBody, TxInput, TxOutput},
+    TX_INPUTS, TX_OUTPUTS,
 };
 
 use crate::wallet::prover::prove_tx;
@@ -38,13 +39,11 @@ pub struct TxBuildData {
     pub owner_auth_witness: OwnerAuthWitness,
     /// Change address (the captured active address). Excess funds return here.
     pub change_address: Address,
-    /// Epoch anchor bytes from the chain tip (anti-replay / natural TTL).
+    /// Exact transaction-epoch anchor accepted in the next child block.
     pub epoch_anchor: [u8; 32],
     /// Free-slot hints for outputs: index `0` = payment output slot,
     /// index `1` = change output slot (present only when change > 0).
     pub output_slot_hints: Vec<u32>,
-    /// Transaction proof/body shape selected by coin selection.
-    pub shape: TxShape,
 }
 
 // ---------------------------------------------------------------------------
@@ -57,7 +56,7 @@ pub enum BuildError {
     #[error("insufficient funds: need {need} μNOID, have {have} μNOID")]
     InsufficientFunds { need: u64, have: u64 },
 
-    #[error("too many inputs needed (selected {selected}, max {max})")]
+    #[error("payment needs more than {max} active UTXOs (selected at least {selected}); consolidation required")]
     TooManyInputs { selected: usize, max: usize },
 
     #[error("not enough output slot hints (need {need}, got {got})")]
@@ -68,6 +67,9 @@ pub enum BuildError {
 
     #[error("selected UTXO set is not owned exclusively by the active address")]
     ActiveOwnerMismatch,
+
+    #[error("wallet amount arithmetic overflow")]
+    AmountOverflow,
 }
 
 fn active_owner_witness(
@@ -104,8 +106,8 @@ fn active_owner_witness(
 ///
 /// - [`BuildError::InsufficientFunds`] — confirmed balance is below
 ///   `amount_micronoid + fee_micronoid`.
-/// - [`BuildError::TooManyInputs`] — coin selection required more than
-///   the largest currently admitted transaction proof shape to cover the target amount.
+/// - [`BuildError::TooManyInputs`] — the payment cannot be covered by one
+///   canonical eight-input transaction.
 /// - [`BuildError::NotEnoughSlots`] — `slot_hints` did not supply enough
 ///   free-slot indices for all outputs (1 for payment, +1 if change > 0).
 pub fn extract_build_data(
@@ -117,28 +119,35 @@ pub fn extract_build_data(
     _log_slots: u32,
     pending_output_slots: &std::collections::HashSet<u32>,
 ) -> Result<TxBuildData, BuildError> {
-    let total_needed = amount_micronoid.saturating_add(fee_micronoid);
+    let total_needed = amount_micronoid
+        .checked_add(fee_micronoid)
+        .ok_or(BuildError::AmountOverflow)?;
 
     // Coin selection — largest-first, returns (selected, change_amount).
-    let (selected_refs, change_amount) = wallet
-        .select_utxos(amount_micronoid, fee_micronoid)
-        .ok_or(BuildError::InsufficientFunds {
-            need: total_needed,
-            have: wallet.balance(),
-        })?;
-
-    // Select the smallest proof shape that can carry the selected inputs.
-    let shape = if selected_refs.len() <= TxShape::Standard4x8.max_inputs() {
-        TxShape::Standard4x8
-    } else {
-        TxShape::Sweep25x2
+    let (selected_refs, change_amount) = match wallet.select_utxos(amount_micronoid, fee_micronoid)
+    {
+        Some(selection) => selection,
+        None => {
+            let spendable = wallet
+                .utxos
+                .values()
+                .filter(|utxo| utxo.key_index == wallet.active_index)
+                .filter(|utxo| !wallet.pending_input_slots.contains(&utxo.slot_index))
+                .map(|utxo| utxo.value)
+                .try_fold(0u64, u64::checked_add)
+                .ok_or(BuildError::AmountOverflow)?;
+            if spendable >= total_needed {
+                return Err(BuildError::TooManyInputs {
+                    selected: TX_INPUTS + 1,
+                    max: TX_INPUTS,
+                });
+            }
+            return Err(BuildError::InsufficientFunds {
+                need: total_needed,
+                have: spendable,
+            });
+        }
     };
-    if selected_refs.len() > shape.max_inputs() {
-        return Err(BuildError::TooManyInputs {
-            selected: selected_refs.len(),
-            max: shape.max_inputs(),
-        });
-    }
 
     // Filter out slots already claimed by in-flight (pending) txs to prevent
     // SlotConflict when wallet_send is retried or called concurrently.
@@ -167,7 +176,6 @@ pub fn extract_build_data(
         change_address: wallet.active_address(),
         epoch_anchor,
         output_slot_hints: slot_hints,
-        shape,
     })
 }
 
@@ -177,10 +185,9 @@ pub fn extract_build_data(
 
 /// Build `TxBuildData` for a consolidation transaction.
 ///
-/// Consolidation selects the **smallest** UTXOs, capped by the largest current
-/// transaction proof shape, and sends their total value minus fee back to the
-/// wallet's own address. It uses `TxShape::Standard4x8` for 1..4 selected inputs
-/// and `TxShape::Sweep25x2` for 5..25 selected inputs.
+/// Consolidation selects the eight smallest available active-owner UTXOs and
+/// sends their total value minus fee back to the same active address. It is an
+/// ordinary canonical transaction, not a distinct transaction class.
 ///
 /// Unlike `extract_build_data` (which uses largest-first greedy selection to
 /// cover a target amount), this function explicitly selects the smallest UTXOs
@@ -217,29 +224,28 @@ pub fn extract_consolidate_data(
         .filter(|u| !pending_input_slots.contains(&u.slot_index))
         .collect();
     all_utxos.sort_by_key(|u| u.value);
-    let selected: Vec<WalletUtxo> = all_utxos
-        .into_iter()
-        .take(TxShape::Sweep25x2.max_inputs())
-        .cloned()
-        .collect();
+    let selected: Vec<WalletUtxo> = all_utxos.into_iter().take(TX_INPUTS).cloned().collect();
 
     if selected.len() < 2 {
+        let have = selected
+            .iter()
+            .try_fold(0u64, |sum, utxo| sum.checked_add(utxo.value))
+            .ok_or(BuildError::AmountOverflow)?;
         return Err(BuildError::InsufficientFunds {
             need: fee_micronoid,
-            have: selected.iter().map(|u| u.value).sum(),
+            have,
         });
     }
 
-    let shape = if selected.len() <= TxShape::Standard4x8.max_inputs() {
-        TxShape::Standard4x8
-    } else {
-        TxShape::Sweep25x2
-    };
-
-    let total: u64 = selected.iter().map(|u| u.value).sum();
+    let total = selected
+        .iter()
+        .try_fold(0u64, |sum, utxo| sum.checked_add(utxo.value))
+        .ok_or(BuildError::AmountOverflow)?;
     if total <= fee_micronoid {
         return Err(BuildError::InsufficientFunds {
-            need: fee_micronoid.saturating_add(1),
+            need: fee_micronoid
+                .checked_add(1)
+                .ok_or(BuildError::AmountOverflow)?,
             have: total,
         });
     }
@@ -263,7 +269,6 @@ pub fn extract_consolidate_data(
             change_address: wallet.active_address(),
             epoch_anchor,
             output_slot_hints: slot_hints,
-            shape,
         },
         consolidation_amount,
     ))
@@ -284,9 +289,8 @@ pub fn extract_consolidate_data(
 ///
 /// 1. Build outputs: payment output at `slot_hints[0]`; change output at
 ///    `slot_hints[1]` if `change_amount > 0`.
-/// 2. Build live inputs.
-/// 3. Pad inputs to the selected shape with `TxInput::dummy()` (`valid = false`).
-/// 4. `tx_body_hash = hash_tx_body_for_shape(shape, epoch_anchor, fee, inputs, outputs, false)`.
+/// 2. Build the fixed input/output arrays and their sole validity bitmap.
+/// 3. Derive the txid from the canonical body.
 /// 5. `prove_tx(&body, owner_auth_witness)` → `WalletAuthorizationBundle`;
 ///    the one secret is consumed and zeroized inside.
 /// 6. Assemble and wire-encode the [`TxIntent`]; validators derive claims from
@@ -294,7 +298,7 @@ pub fn extract_consolidate_data(
 ///
 /// # Returns
 ///
-/// `(tx_body_hash_bytes, serialized_TxIntent_bytes)` on success.
+/// `(txid_bytes, serialized_TxIntent_bytes)` on success.
 ///
 /// # Errors
 ///
@@ -308,65 +312,49 @@ pub fn build_and_prove_tx(
     // -----------------------------------------------------------------------
     // Build outputs.
     // -----------------------------------------------------------------------
-    let total_selected: u64 = data.selected_utxos.iter().map(|u| u.value).sum();
+    let total_selected = data
+        .selected_utxos
+        .iter()
+        .try_fold(0u64, |sum, utxo| sum.checked_add(utxo.value))
+        .ok_or(BuildError::AmountOverflow)?;
     let change_amount = total_selected
         .checked_sub(amount_micronoid)
         .and_then(|remaining| remaining.checked_sub(fee_micronoid))
         .ok_or(BuildError::InsufficientFunds {
-            need: amount_micronoid.saturating_add(fee_micronoid),
+            need: amount_micronoid
+                .checked_add(fee_micronoid)
+                .ok_or(BuildError::AmountOverflow)?,
             have: total_selected,
         })?;
 
-    let mut outputs: Vec<TxOutput> = Vec::with_capacity(2);
-    outputs.push(TxOutput {
+    let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+    outputs[0] = TxOutput {
         slot_index: data.output_slot_hints[0],
-        value: amount_micronoid,
+        amount: amount_micronoid,
         owner: Address(to_address),
-        valid: true,
-    });
+    };
+    let mut validity_bitmap = output_bitmap_bit(0);
     if change_amount > 0 {
-        outputs.push(TxOutput {
+        outputs[1] = TxOutput {
             slot_index: data.output_slot_hints[1],
-            value: change_amount,
+            amount: change_amount,
             owner: data.change_address,
-            valid: true,
-        });
+        };
+        validity_bitmap |= output_bitmap_bit(1);
     }
 
     // -----------------------------------------------------------------------
-    // Steps 2–3: Build live inputs; pad to selected shape.
+    // Build the fixed input bank. Dead records stay canonical all-zero.
     // -----------------------------------------------------------------------
-    let mut inputs: Vec<TxInput> = data
-        .selected_utxos
-        .iter()
-        .map(|utxo| TxInput {
+    let mut inputs = [TxInput::dummy(); TX_INPUTS];
+    for (index, utxo) in data.selected_utxos.iter().enumerate() {
+        inputs[index] = TxInput {
             slot_index: utxo.slot_index,
-            value: utxo.value,
+            amount: utxo.value,
             creation_id: utxo.creation_id,
-            owner: utxo.address,
-            // Transitional field removed in Slice B. Production bodies carry
-            // only the canonical non-witness zero value already used by the
-            // public decoder; the real secret lives solely in OwnerAuthWitness.
-            spend_secret: SpendSecret([0u8; 32]),
-            valid: true,
-        })
-        .collect();
-
-    while inputs.len() < data.shape.max_inputs() {
-        inputs.push(TxInput::dummy());
+        };
+        validity_bitmap |= 1u16 << index;
     }
-
-    // -----------------------------------------------------------------------
-    // Compute the body hash.
-    // -----------------------------------------------------------------------
-    let tx_body_hash = hash_tx_body_for_shape(
-        data.shape,
-        &data.epoch_anchor,
-        fee_micronoid as u128,
-        &inputs,
-        &outputs,
-        false,
-    );
 
     // -----------------------------------------------------------------------
     // Assemble TxBody and run wallet authorization generation.
@@ -374,13 +362,15 @@ pub fn build_and_prove_tx(
     // owner_auth_witness is consumed here and zeroized when proving returns.
     // -----------------------------------------------------------------------
     let body = TxBody {
-        shape: data.shape,
         epoch_anchor: data.epoch_anchor,
-        fee: fee_micronoid as u128,
+        fee: fee_micronoid,
+        input_owner: data.change_address,
         inputs,
         outputs,
+        validity_bitmap,
         is_coinbase: false,
     };
+    let txid = body.txid();
 
     let bundle = prove_tx(&body, data.owner_auth_witness)
         .map_err(|e| BuildError::ProveFailed(e.to_string()))?;
@@ -394,7 +384,7 @@ pub fn build_and_prove_tx(
     // redundant and malleable; validators derive it from `body`.
     // -----------------------------------------------------------------------
     let intent = TxIntent::new(body, authorization_bytes);
-    debug_assert_eq!(intent.txid(), tx_body_hash);
+    debug_assert_eq!(intent.txid(), txid);
 
     Ok((intent.txid().0, intent.to_bytes()))
 }
@@ -439,33 +429,24 @@ mod tests {
     }
 
     #[test]
-    fn extract_build_data_uses_standard_for_four_inputs() {
-        let (_dir, wallet) = wallet_with_utxos(4, 1_000);
-        let data = extract_for(&wallet, 3_500, 500).unwrap();
-        assert_eq!(data.selected_utxos.len(), 4);
-        assert_eq!(data.shape, TxShape::Standard4x8);
+    fn extract_build_data_accepts_eight_inputs() {
+        let (_dir, wallet) = wallet_with_utxos(8, 1_000);
+        let data = extract_for(&wallet, 7_500, 500).unwrap();
+        assert_eq!(data.selected_utxos.len(), TX_INPUTS);
     }
 
     #[test]
-    fn extract_build_data_uses_sweep_for_five_inputs() {
-        let (_dir, wallet) = wallet_with_utxos(5, 1_000);
-        let data = extract_for(&wallet, 4_500, 500).unwrap();
-        assert_eq!(data.selected_utxos.len(), 5);
-        assert_eq!(data.shape, TxShape::Sweep25x2);
-    }
-
-    #[test]
-    fn extract_build_data_rejects_more_than_sweep_capacity() {
-        let (_dir, wallet) = wallet_with_utxos(26, 1_000);
-        let err = match extract_for(&wallet, 26_000, 0) {
+    fn extract_build_data_rejects_more_than_eight_inputs() {
+        let (_dir, wallet) = wallet_with_utxos(9, 1_000);
+        let err = match extract_for(&wallet, 9_000, 0) {
             Ok(_) => panic!("expected too many inputs error"),
             Err(err) => err,
         };
         assert!(matches!(
             err,
             BuildError::TooManyInputs {
-                selected: 26,
-                max: 25
+                selected: 9,
+                max: 8
             }
         ));
     }
@@ -481,11 +462,6 @@ mod tests {
         let intent = TxIntent::from_bytes(&intent_bytes).expect("decode standard intent");
 
         assert_eq!(intent.txid().0, txid);
-        assert!(intent
-            .tx_body
-            .inputs
-            .iter()
-            .all(|input| input.spend_secret == SpendSecret([0u8; 32])));
         assert!(
             !intent_bytes
                 .windows(raw_secret.len())
@@ -499,33 +475,38 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(debug_assertions, ignore = "release-only sweep proof regression")]
-    fn build_and_prove_tx_emits_sweep_intent_for_five_inputs() {
-        let (_dir, wallet) = wallet_with_utxos(5, 20_000);
-        let amount = 80_000;
+    #[cfg_attr(debug_assertions, ignore = "release-only eight-input proof regression")]
+    fn build_and_prove_tx_emits_eight_input_secret_free_intent() {
+        let (_dir, wallet) = wallet_with_utxos(8, 20_000);
+        let raw_secret = wallet.spend_secret_for(0).0;
+        let amount = 140_000;
         let fee = 18_500;
         let data = extract_for(&wallet, amount, fee).unwrap();
-        assert_eq!(data.shape, TxShape::Sweep25x2);
+        assert_eq!(data.selected_utxos.len(), TX_INPUTS);
 
         let (tx_hash, intent_bytes) =
-            build_and_prove_tx([0xA7; 32], amount, fee, data).expect("prove sweep wallet tx");
+            build_and_prove_tx([0xA7; 32], amount, fee, data).expect("prove eight-input wallet tx");
         let intent = TxIntent::from_bytes(&intent_bytes).expect("decode intent");
-        assert_eq!(intent.tx_body.shape, TxShape::Sweep25x2);
-        assert_eq!(intent.tx_body.inputs.iter().filter(|i| i.valid).count(), 5);
+        assert_eq!(intent.tx_body.live_input_count(), TX_INPUTS);
         let mut creation_ids: Vec<u64> = intent
             .tx_body
-            .inputs
-            .iter()
-            .filter(|input| input.valid)
+            .live_inputs()
+            .map(|(_, input)| input)
             .map(|input| input.creation_id)
             .collect();
         creation_ids.sort_unstable();
-        assert_eq!(creation_ids, vec![1, 2, 3, 4, 5]);
-        assert_eq!(intent.tx_body_hash.0, tx_hash);
+        assert_eq!(creation_ids, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(intent.txid().0, tx_hash);
+        assert!(
+            !intent_bytes
+                .windows(raw_secret.len())
+                .any(|window| window == raw_secret),
+            "public intent serialized the active owner's spend secret"
+        );
 
         let bundle = noid_gkr::WalletAuthorizationBundle::from_bytes(&intent.authorization_bytes)
             .expect("decode wallet authorization bundle");
         noid_gkr::verify_wallet_authorization(&intent.tx_body, &bundle)
-            .expect("verify sweep authorization bundle");
+            .expect("verify eight-input authorization bundle");
     }
 }

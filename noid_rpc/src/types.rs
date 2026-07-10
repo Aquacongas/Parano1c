@@ -60,17 +60,10 @@ pub struct BlockTemplateResponse {
     pub height: u64,
     /// Total transaction count including coinbase.
     pub n_txs: usize,
-    /// User transaction shapes in canonical block order (coinbase excluded).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tx_shapes: Vec<String>,
-    /// Number of `Standard4x8` user transactions in the template.
-    pub standard_tx_count: usize,
-    /// Number of `Sweep25x2` user transactions in the template.
-    pub sweep_tx_count: usize,
-    /// Live input counts per user transaction, index-aligned with `tx_shapes`.
+    /// Live input counts per user transaction in canonical block order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tx_input_counts: Vec<usize>,
-    /// Live output counts per user transaction, index-aligned with `tx_shapes`.
+    /// Live output counts per user transaction in canonical block order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tx_output_counts: Vec<usize>,
     /// Coinbase output value in μNOID.
@@ -92,7 +85,7 @@ pub struct BlockTemplateResponse {
 pub struct WalletAddressInfo {
     /// Bech32m address string.
     pub address: String,
-    /// HD derivation index (0 = primary).
+    /// Derivation index (0 = default on first load/import).
     pub key_index: u32,
     /// Whether this is the wallet's ACTIVE address (sends spend from it;
     /// one owner per transaction is a consensus rule).
@@ -124,14 +117,14 @@ pub struct WalletStatus {
 pub struct WalletBalance {
     /// Confirmed balance of the ACTIVE address (the spendable pool under
     /// the one-owner-per-tx rule).
-    pub total_micronoid: u64,
-    pub total_noid: f64,
+    pub balance_micronoid: u64,
+    pub balance_noid: f64,
     /// Number of confirmed UTXOs at the active address.
     pub utxo_count: usize,
     /// Confirmed UTXOs being spent by pending (mempool) txs.
     /// These are locked and cannot be spent again until confirmed or evicted.
     pub pending_outbound_micronoid: u64,
-    /// Spendable = total - pending_outbound.
+    /// Spendable = active balance - pending_outbound.
     pub spendable_micronoid: u64,
     pub spendable_noid: f64,
 }
@@ -206,10 +199,9 @@ pub struct FeeBreakdownInfo {
     pub miner_claimable: u64,
 }
 
-/// Shape-aware fee estimate for explicit live input/output counts.
+/// Fee estimate for explicit live input/output counts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeeEstimate {
-    pub shape: String,
     pub n_inputs: usize,
     pub n_outputs: usize,
     pub net_new_slots: u64,
@@ -219,33 +211,30 @@ pub struct FeeEstimate {
     pub breakdown: FeeBreakdownInfo,
 }
 
-/// One planned transaction in a logical wallet send.
+/// One ordinary Tx8x2 in a deterministic logical-payment plan.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletSendChunkPlan {
-    pub chunk_index: usize,
     pub amount_micronoid: u64,
-    pub shape: String,
-    pub selected_input_count: usize,
-    pub output_count: usize,
-    pub expected_change_micronoid: u64,
     pub fee_micronoid: u64,
+    pub input_count: usize,
+    pub output_count: usize,
+    pub change_micronoid: u64,
     pub fee_breakdown: FeeBreakdownInfo,
 }
 
-/// Dry-run plan for a logical wallet send.
+/// Complete dry-run plan. Large payments are multiple ordinary transactions;
+/// there is no alternate bulk block or transaction form.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletSendPlan {
     pub amount_micronoid: u64,
     pub total_fee_micronoid: u64,
     pub total_spend_micronoid: u64,
-    pub split_count: usize,
     pub chunks: Vec<WalletSendChunkPlan>,
 }
 
 /// Dry-run plan for one consolidation transaction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletConsolidatePlan {
-    pub shape: String,
     pub selected_input_count: usize,
     pub output_count: usize,
     pub fee_micronoid: u64,
@@ -253,36 +242,33 @@ pub struct WalletConsolidatePlan {
     pub fee_breakdown: FeeBreakdownInfo,
 }
 
-/// Result of a send operation.
+/// One successfully admitted ordinary transaction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WalletSubmittedChunk {
+    pub txid: String,
+    pub amount_micronoid: u64,
+    pub fee_micronoid: u64,
+    pub input_count: usize,
+    pub output_count: usize,
+}
+
+/// Successful logical payment or consolidation result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletSendResult {
-    /// Primary transaction body hash (hex). For split payments this is the first
-    /// submitted transaction, kept for backwards-compatible clients.
-    pub tx_hash: String,
-    /// Total fee paid in μNOID across all submitted transactions.
-    pub fee_micronoid: u64,
-    /// All transaction body hashes for this logical payment. Single-transaction
-    /// sends contain one hash; auto-split sends contain multiple hashes.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tx_hashes: Vec<String>,
-    /// Number of transactions used for this logical wallet send.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub split_count: Option<usize>,
-    /// Shape of the primary transaction (`Standard4x8` or `Sweep25x2`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub shape: Option<String>,
-    /// Shape per submitted transaction, index-aligned with `tx_hashes`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tx_shapes: Vec<String>,
-    /// Live input count per submitted transaction, index-aligned with `tx_hashes`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tx_input_counts: Vec<usize>,
-    /// Live output count per submitted transaction, index-aligned with `tx_hashes`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tx_output_counts: Vec<usize>,
-    /// Fee per submitted transaction, index-aligned with `tx_hashes`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tx_fees_micronoid: Vec<u64>,
+    pub chunks: Vec<WalletSubmittedChunk>,
+    pub total_fee_micronoid: u64,
+}
+
+/// JSON-RPC error data when a later planned transaction fails after earlier
+/// transactions were admitted. The admitted prefix is final and remains
+/// pending; clients can resume only the explicitly reported remainder.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WalletSendPartialError {
+    pub submitted_chunks: Vec<WalletSubmittedChunk>,
+    pub submitted_fee_micronoid: u64,
+    pub next_chunk_index: usize,
+    pub remaining_amount_micronoid: u64,
+    pub error: String,
 }
 
 /// Decoded block header (structured, not raw bytes).
@@ -400,8 +386,6 @@ pub fn micronoid_to_noid(micronoid: u64) -> f64 {
 pub struct MempoolTxInfo {
     /// Transaction body hash (hex).
     pub tx_hash: String,
-    /// Transaction shape (`Standard4x8` or `Sweep25x2`).
-    pub shape: String,
     /// Fee in μNOID.
     pub fee_micronoid: u64,
     /// Fee rate using weighted resource units (`inputs + outputs + 4 × net_new_slots`).

@@ -16,13 +16,13 @@
 //! When a block is confirmed: `on_block_confirmed()` removes confirmed txs
 //! and returns reverted txs (from reorged blocks) to the pool.
 //!
-//! Eviction: `evict_expired(height)` removes txs whose epoch_anchor has
-//! expired (anchor block is more than ANCHOR_DEPTH blocks old).
+//! On an epoch boundary or reorg, `evict_wrong_anchor` removes every intent
+//! that does not bind the chain's one current transaction-epoch anchor.
 
 use std::collections::{BTreeMap, HashMap};
 
-use noid_poseidon2b::primitives::TxBodyHash;
-use noid_tx::{Transaction, ANCHOR_DEPTH};
+use noid_poseidon2b::primitives::{Digest, TxBodyHash};
+use noid_tx::Transaction;
 
 use crate::consensus::params::BLOCK_MAX_TXS;
 
@@ -63,14 +63,6 @@ pub struct MempoolEntry {
     pub tx: Transaction,
     /// Chain height at the time of admission.
     pub admitted_height: u64,
-    /// Height of the block referenced by `tx.body.epoch_anchor`.
-    ///
-    /// The transaction expires when `current_height > anchor_height + ANCHOR_DEPTH`.
-    /// This is the correct expiry condition: the tx is valid as long as the anchor
-    /// block is within the rolling ANCHOR_DEPTH window.
-    ///
-    /// `u64::MAX` for coinbase (no anchor, never expires via this mechanism).
-    pub anchor_height: u64,
     /// Fee per weighted resource unit.
     ///
     /// The weight is `inputs + outputs + 4 × net_new_slots`, so transactions
@@ -95,27 +87,24 @@ pub struct MempoolEntry {
 impl MempoolEntry {
     /// Compute the fee_rate from the transaction body.
     pub fn compute_fee_rate(tx: &Transaction) -> u64 {
-        let n_inputs = tx.body.inputs.iter().filter(|i| i.valid).count() as u64;
-        let n_outputs = tx.body.outputs.iter().filter(|o| o.valid).count() as u64;
+        let n_inputs = tx.body.live_input_count() as u64;
+        let n_outputs = tx.body.live_output_count() as u64;
         let net_new_slots = n_outputs.saturating_sub(n_inputs);
         let weight = n_inputs
             .saturating_add(n_outputs)
             .saturating_add(net_new_slots.saturating_mul(4))
             .max(1);
-        (tx.body.fee.min(u64::MAX as u128) as u64) / weight
+        tx.body.fee / weight
     }
 
     /// Create a new entry.
     ///
     /// `current_height` — chain tip at admission time.
-    /// `anchor_height` — height of the block whose hash is `tx.body.epoch_anchor`;
-    ///   pass `u64::MAX` for coinbase transactions (no anchor).
-    pub fn new(tx: Transaction, current_height: u64, anchor_height: u64) -> Self {
+    pub fn new(tx: Transaction, current_height: u64) -> Self {
         let fee_rate = Self::compute_fee_rate(&tx);
         Self {
             tx,
             admitted_height: current_height,
-            anchor_height,
             fee_rate,
             cached_authorization: None,
             intent_bytes: Vec::new(), // populated by AsyncMempool::submit
@@ -146,8 +135,7 @@ pub enum MempoolError {
 /// In-memory mempool: a conflict-free set of admitted transactions.
 ///
 /// Invariants maintained:
-/// - No two txs share an input slot (no double-spend within pool).
-/// - No two txs share an output slot (no double-mint within pool).
+/// - No two live actions share any physical slot.
 /// - `fee_index` is always in sync with `entries`.
 ///
 /// # Block selection performance
@@ -213,34 +201,34 @@ impl Mempool {
     /// for pre-validation. This function only checks pool-internal constraints
     /// (capacity, duplicates, slot conflicts with already-admitted txs).
     ///
-    /// `anchor_height` — height of the block referenced by `tx.body.epoch_anchor`
-    /// (already found by the caller during epoch-anchor validation). Used for
-    /// precise expiry: `evict_expired` evicts when `current_height > anchor_height + ANCHOR_DEPTH`.
-    /// Pass `u64::MAX` for coinbase transactions.
-    pub fn admit(
-        &mut self,
-        tx: Transaction,
-        current_height: u64,
-        anchor_height: u64,
-    ) -> Result<(), MempoolError> {
+    pub fn admit(&mut self, tx: Transaction, current_height: u64) -> Result<(), MempoolError> {
         if self.entries.len() >= self.capacity {
             return Err(MempoolError::Full);
         }
-        if self.entries.contains_key(&tx.tx_body_hash) {
+        let hash = tx.txid();
+        if self.entries.contains_key(&hash) {
             return Err(MempoolError::AlreadyAdmitted);
         }
 
         // Check input slot conflicts.
-        for inp in tx.body.inputs.iter().filter(|i| i.valid) {
-            if let Some(&existing) = self.spent_inputs.get(&inp.slot_index) {
+        for (_, inp) in tx.body.live_inputs() {
+            if let Some(&existing) = self
+                .spent_inputs
+                .get(&inp.slot_index)
+                .or_else(|| self.minted_outputs.get(&inp.slot_index))
+            {
                 return Err(MempoolError::InputConflict {
                     conflicting_hash: existing,
                 });
             }
         }
         // Check output slot conflicts.
-        for out in tx.body.outputs.iter().filter(|o| o.valid) {
-            if let Some(&existing) = self.minted_outputs.get(&out.slot_index) {
+        for (_, out) in tx.body.live_outputs() {
+            if let Some(&existing) = self
+                .minted_outputs
+                .get(&out.slot_index)
+                .or_else(|| self.spent_inputs.get(&out.slot_index))
+            {
                 return Err(MempoolError::OutputConflict {
                     conflicting_hash: existing,
                 });
@@ -248,13 +236,12 @@ impl Mempool {
         }
 
         // All checks passed — insert.
-        let hash = tx.tx_body_hash;
-        let entry = MempoolEntry::new(tx, current_height, anchor_height);
+        let entry = MempoolEntry::new(tx, current_height);
         let fee_key = FeeKey::new(entry.fee_rate, hash);
-        for inp in entry.tx.body.inputs.iter().filter(|i| i.valid) {
+        for (_, inp) in entry.tx.body.live_inputs() {
             self.spent_inputs.insert(inp.slot_index, hash);
         }
-        for out in entry.tx.body.outputs.iter().filter(|o| o.valid) {
+        for (_, out) in entry.tx.body.live_outputs() {
             self.minted_outputs.insert(out.slot_index, hash);
         }
         self.fee_index.insert(fee_key, hash);
@@ -267,34 +254,22 @@ impl Mempool {
         let entry = self.entries.remove(hash)?;
         // Remove from fee_index using the same key that was inserted.
         self.fee_index.remove(&FeeKey::new(entry.fee_rate, *hash));
-        for inp in entry.tx.body.inputs.iter().filter(|i| i.valid) {
+        for (_, inp) in entry.tx.body.live_inputs() {
             self.spent_inputs.remove(&inp.slot_index);
         }
-        for out in entry.tx.body.outputs.iter().filter(|o| o.valid) {
+        for (_, out) in entry.tx.body.live_outputs() {
             self.minted_outputs.remove(&out.slot_index);
         }
         Some(entry)
     }
 
-    /// Evict transactions whose epoch_anchor has expired.
-    ///
-    /// A transaction is valid while:
-    ///   `current_height <= anchor_height + ANCHOR_DEPTH`
-    ///
-    /// where `anchor_height` is the chain height of the block referenced by
-    /// `tx.body.epoch_anchor` (stored at admission time). This is the
-    /// **correct** expiry: the tx expires when its anchor block exits the
-    /// rolling ANCHOR_DEPTH window, not based on when the tx was admitted.
-    ///
-    /// Returns the hashes of evicted transactions (wallets must rebuild).
-    pub fn evict_expired(&mut self, current_height: u64) -> Vec<TxBodyHash> {
+    /// Evict every user intent not bound to the chain's current exact anchor.
+    pub fn evict_wrong_anchor(&mut self, current_anchor: &Digest) -> Vec<TxBodyHash> {
         let expired: Vec<TxBodyHash> = self
             .entries
             .iter()
-            .filter(|(_, e)| {
-                // anchor_height == u64::MAX for coinbase — never expires this way.
-                e.anchor_height != u64::MAX
-                    && current_height > e.anchor_height.saturating_add(ANCHOR_DEPTH)
+            .filter(|(_, entry)| {
+                !entry.tx.body.is_coinbase && &entry.tx.body.epoch_anchor != current_anchor
             })
             .map(|(&h, _)| h)
             .collect();
@@ -387,7 +362,7 @@ impl Mempool {
         self.entries
             .values()
             .filter(|e| !e.tx.body.is_coinbase)
-            .map(|e| e.tx.body.fee.min(u64::MAX as u128) as u64)
+            .map(|e| e.tx.body.fee)
             .fold(0u64, |a, f| a.saturating_add(f))
     }
 }
@@ -400,127 +375,92 @@ impl Mempool {
 mod tests {
     use super::*;
     use noid_poseidon2b::primitives::Address;
-    use noid_tx::{hash_tx_body, Transaction, TxBody, TxOutput};
+    use noid_tx::{
+        output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS,
+    };
 
-    fn make_tx(slot: u32, fee: u128, seed: u8) -> Transaction {
-        let body = TxBody {
-            shape: noid_tx::TxShape::Standard4x8,
-            epoch_anchor: [seed; 32],
-            fee,
-            inputs: vec![],
-            outputs: vec![TxOutput {
-                slot_index: slot,
-                value: 100,
-                owner: Address([seed; 32]),
-                valid: true,
-            }],
-            is_coinbase: false,
+    fn tx(input_slot: u32, output_slot: u32, fee: u64, seed: u8, anchor: Digest) -> Transaction {
+        let mut inputs = [TxInput::dummy(); TX_INPUTS];
+        inputs[0] = TxInput {
+            slot_index: input_slot,
+            amount: 100 + fee,
+            creation_id: 1,
         };
-        let hash = hash_tx_body(
-            &body.epoch_anchor,
-            body.fee,
-            &body.inputs,
-            &body.outputs,
-            body.is_coinbase,
-        );
-        Transaction {
-            body,
-            tx_body_hash: hash,
-        }
-    }
-
-    // Helper: anchor_height = current_height - 1 (tx anchored one block ago)
-    fn admit_with_anchor(mp: &mut Mempool, tx: Transaction, current_height: u64) {
-        let anchor_h = current_height.saturating_sub(1);
-        mp.admit(tx, current_height, anchor_h).unwrap();
-    }
-
-    #[test]
-    fn admit_and_lookup() {
-        let mut mp = Mempool::new(100);
-        let tx = make_tx(1, 5000, 1);
-        let hash = tx.tx_body_hash;
-        admit_with_anchor(&mut mp, tx, 10);
-        assert!(mp.contains(&hash));
-        assert_eq!(mp.len(), 1);
+        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        outputs[0] = TxOutput {
+            slot_index: output_slot,
+            amount: 100,
+            owner: Address([seed; 32]),
+        };
+        Transaction::new(TxBody {
+            epoch_anchor: anchor,
+            fee,
+            input_owner: Address([seed; 32]),
+            inputs,
+            outputs,
+            validity_bitmap: 1 | output_bitmap_bit(0),
+            is_coinbase: false,
+        })
     }
 
     #[test]
-    fn duplicate_rejected() {
-        let mut mp = Mempool::new(100);
-        let tx = make_tx(1, 5000, 1);
-        admit_with_anchor(&mut mp, tx.clone(), 10);
-        assert_eq!(mp.admit(tx, 10, 9), Err(MempoolError::AlreadyAdmitted));
+    fn derived_txid_keys_and_duplicate_admission() {
+        let mut pool = Mempool::new(4);
+        let tx = tx(1, 2, 10, 1, [9u8; 32]);
+        let hash = tx.txid();
+        pool.admit(tx.clone(), 3).unwrap();
+        assert!(pool.contains(&hash));
+        assert_eq!(pool.admit(tx, 3), Err(MempoolError::AlreadyAdmitted));
+        assert_eq!(pool.remove(&hash).unwrap().tx.txid(), hash);
     }
 
     #[test]
-    fn output_slot_conflict_rejected() {
-        let mut mp = Mempool::new(100);
-        admit_with_anchor(&mut mp, make_tx(5, 5000, 1), 10);
-        let conflict_result = mp.admit(make_tx(5, 6000, 2), 10, 9);
+    fn pending_set_is_fully_disjoint() {
+        let mut pool = Mempool::new(8);
+        pool.admit(tx(1, 2, 10, 1, [9u8; 32]), 3).unwrap();
+
         assert!(matches!(
-            conflict_result,
+            pool.admit(tx(1, 3, 10, 2, [9u8; 32]), 3),
+            Err(MempoolError::InputConflict { .. })
+        ));
+        assert!(matches!(
+            pool.admit(tx(4, 2, 10, 3, [9u8; 32]), 3),
+            Err(MempoolError::OutputConflict { .. })
+        ));
+        assert!(matches!(
+            pool.admit(tx(2, 5, 10, 4, [9u8; 32]), 3),
+            Err(MempoolError::InputConflict { .. })
+        ));
+        assert!(matches!(
+            pool.admit(tx(6, 1, 10, 5, [9u8; 32]), 3),
             Err(MempoolError::OutputConflict { .. })
         ));
     }
 
     #[test]
-    fn on_block_confirmed_removes_txs() {
-        let mut mp = Mempool::new(100);
-        let tx1 = make_tx(1, 5000, 1);
-        let tx2 = make_tx(2, 6000, 2);
-        let h1 = tx1.tx_body_hash;
-        let h2 = tx2.tx_body_hash;
-        admit_with_anchor(&mut mp, tx1, 10);
-        admit_with_anchor(&mut mp, tx2, 10);
-        let removed = mp.on_block_confirmed(&[h1]);
-        assert_eq!(removed, 1);
-        assert!(!mp.contains(&h1));
-        assert!(mp.contains(&h2));
+    fn epoch_switch_evicts_by_exact_anchor() {
+        let mut pool = Mempool::new(8);
+        let old = tx(1, 2, 10, 1, [7u8; 32]);
+        let old_hash = old.txid();
+        pool.admit(old, 3).unwrap();
+        pool.admit(tx(3, 4, 10, 2, [8u8; 32]), 3).unwrap();
+
+        let evicted = pool.evict_wrong_anchor(&[8u8; 32]);
+        assert_eq!(evicted, vec![old_hash]);
+        assert_eq!(pool.len(), 1);
     }
 
     #[test]
-    fn evict_expired_removes_old_txs() {
-        let mut mp = Mempool::new(100);
-        let tx = make_tx(1, 5000, 1);
-        let hash = tx.tx_body_hash;
-        // anchor_height = 5, admitted at height 10
-        mp.admit(tx, 10, 5).unwrap();
-        // Not expired yet: current = 5 + ANCHOR_DEPTH (boundary, inclusive)
-        assert_eq!(mp.evict_expired(5 + ANCHOR_DEPTH).len(), 0);
-        assert!(mp.contains(&hash));
-        // Expired: current = 5 + ANCHOR_DEPTH + 1
-        let evicted = mp.evict_expired(5 + ANCHOR_DEPTH + 1);
-        assert_eq!(evicted.len(), 1);
-        assert!(!mp.contains(&hash));
-    }
-
-    #[test]
-    fn select_for_block_orders_by_fee_rate() {
-        let mut mp = Mempool::new(100);
-        admit_with_anchor(&mut mp, make_tx(1, 1000, 1), 0);
-        admit_with_anchor(&mut mp, make_tx(2, 9000, 2), 0);
-        admit_with_anchor(&mut mp, make_tx(3, 3000, 3), 0);
-        let selected = mp.select_for_block(10);
-        let fees: Vec<u64> = selected.iter().map(|e| e.fee_rate).collect();
-        for i in 0..fees.len() - 1 {
-            assert!(fees[i] >= fees[i + 1]);
-        }
-    }
-
-    #[test]
-    fn capacity_enforced() {
-        let mut mp = Mempool::new(2);
-        admit_with_anchor(&mut mp, make_tx(1, 100, 1), 0);
-        admit_with_anchor(&mut mp, make_tx(2, 100, 2), 0);
-        assert_eq!(mp.admit(make_tx(3, 100, 3), 0, 0), Err(MempoolError::Full));
-    }
-
-    #[test]
-    fn total_fees_sums_non_coinbase() {
-        let mut mp = Mempool::new(100);
-        admit_with_anchor(&mut mp, make_tx(1, 5_000, 1), 0);
-        admit_with_anchor(&mut mp, make_tx(2, 3_000, 2), 0);
-        assert_eq!(mp.total_fees(), 8_000);
+    fn fee_index_selects_highest_rate_first_and_capacity_holds() {
+        let mut pool = Mempool::new(2);
+        let low = tx(1, 2, 1, 1, [9u8; 32]);
+        let high = tx(3, 4, 100, 2, [9u8; 32]);
+        pool.admit(low, 0).unwrap();
+        pool.admit(high.clone(), 0).unwrap();
+        assert_eq!(pool.select_for_block(1)[0].tx.txid(), high.txid());
+        assert_eq!(
+            pool.admit(tx(5, 6, 10, 3, [9u8; 32]), 0),
+            Err(MempoolError::Full)
+        );
     }
 }

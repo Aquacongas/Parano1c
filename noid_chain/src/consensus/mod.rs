@@ -45,6 +45,7 @@ pub mod wire_limits;
 pub mod allocator;
 pub mod difficulty;
 pub mod emission;
+pub mod epoch_anchor;
 pub mod fees;
 pub mod fork_choice;
 pub mod genesis;
@@ -64,14 +65,18 @@ pub use difficulty::{add_work, block_work, le256_lt, next_target, work_gt};
 pub use emission::{
     block_reward, format_noid, max_coinbase_value, max_coinbase_value_from_fee_sum, total_fees,
 };
+pub use epoch_anchor::{
+    next_tx_epoch_anchor_id, resolve_user_epoch_anchor_id, tx_epoch_anchor_height_for_child,
+    validate_block_epoch_anchors,
+};
 pub use fees::{
     burned_fee_for_tx_body, claimable_fee_for_tx_body, fee_breakdown, fee_breakdown_for_tx_body,
     occupancy_bps, pressure_multiplier, required_fee_for_tx_body, state_growth_fee_per_slot,
-    tx_shape, FeeBreakdown,
+    tx_live_counts, FeeBreakdown,
 };
 pub use fork_choice::{choose_chain_by_work, reorg_allowed, ChainChoice};
 pub use genesis::{find_genesis_nonce, genesis_header, genesis_state_root, GENESIS_TIMESTAMP};
-pub use header::{epoch_anchor_height, is_anchor_height_valid, is_final, validate_header};
+pub use header::{asert_anchor_height, is_final, validate_header};
 pub use mempool_checks::validate_tx_for_mempool;
 pub use network::{NetworkConfig, NetworkKind};
 pub use ordering::order_block_txs;
@@ -123,10 +128,8 @@ pub enum ConsensusError {
     BadTxRoot,
     /// §16.10 — Two transactions claim the same input or output slot.
     SlotConflict,
-    /// §16.11 — `epoch_anchor` outside valid `[height-7, height-1]` window.
+    /// §16.11 — user `epoch_anchor` differs from the one current epoch id.
     BadEpochAnchor,
-    /// §16.12 — `tx_body_hash` in `PublicInputs` ≠ `hash(tx.body)`.
-    BadTxBodyHash,
     /// §16.14 — LogicProof verification failed.
     InvalidLogicProof { tx_index: usize },
     /// Every non-genesis block must carry its canonical coinbase at index zero.
@@ -135,16 +138,12 @@ pub enum ConsensusError {
     MultipleCoinbase,
     /// The unique coinbase is present but is not transaction zero.
     CoinbaseNotFirst,
-    /// Coinbase must use the Standard4x8 transaction shape.
-    BadCoinbaseShape,
     /// The unique live coinbase output must pay `header.miner_address`.
     BadCoinbaseOwner,
     /// §16.15 — Coinbase value exceeds `block_reward + sum(fees)`.
     InflatedCoinbase,
     /// Coinbase `epoch_anchor` must equal the parent block hash.
     BadCoinbaseAnchor,
-    /// Fee exceeds u64::MAX (values are 64-bit in this protocol).
-    BadFee,
     /// P.16 — transaction fee is below the deterministic minimum fee.
     BelowMinFee { required: u64, actual: u64 },
     /// §15.3.6 — `log_slots` must expand exactly when occupancy ≥ 75 %,
@@ -162,7 +161,6 @@ impl std::fmt::Display for ConsensusError {
             Self::InvalidLogicProof { tx_index } => {
                 write!(f, "InvalidLogicProof at tx_index={tx_index}")
             }
-            Self::BadFee => write!(f, "BadFee"),
             Self::BadLogSlotsExpansion => write!(f, "BadLogSlotsExpansion"),
             Self::ShapeMismatch(msg) => write!(f, "ShapeMismatch: {msg}"),
             Self::BelowMinFee { required, actual } => {

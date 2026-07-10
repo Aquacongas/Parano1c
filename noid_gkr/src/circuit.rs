@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Typed topology description of the 59-slot tx-body Merkle Poseidon2b spine.
+//! Typed topology of the temporary 59-slot Tx8x2 carrier spine.
 //!
-//! The topology is static: 4 input leaves (3 perms each) + 8 output
-//! leaves (2 each) + 15 compress nodes (2 each) + 1 wrap = 59 slots,
+//! The physical topology stays static during the cutover: 4 input-chain
+//! leaves (3 perms each) + 8 output-chain leaves (2 each) + 15 compress
+//! nodes (2 each) + 1 wrap = 59 slots,
 //! post-order. Each slot produces one digest (the pre-squeeze state
 //! lanes 0..1 of its last permutation). Non-head slots take their
 //! pre-MDS seed as `prev_output XOR absorb_block`; head slots take it
@@ -60,15 +61,15 @@ pub struct SpineInputs {
     pub epoch_anchor: [Block128; 2],
     /// `fee_leaf(fee)` as two field lanes (tree leaf L1).
     pub fee_leaf: [Block128; 2],
-    /// Four input-leaf payloads, each `[slot, value, owner_hi,
-    /// owner_lo]` (tree leaves L2..L5).
+    /// Carrier input payloads for logical inputs 0..4, each
+    /// `[slot, pack(amount, creation_id), input_owner_hi, input_owner_lo]`.
     pub input_leaves: [[Block128; 4]; TXBODY_N_INPUT_LEAVES],
-    /// Eight output-leaf payloads, each `[slot, value, owner_hi,
-    /// owner_lo]` (tree leaves L6..L13).
+    /// Carrier output payloads: logical inputs 4..8 in positions 0..4,
+    /// logical outputs 0..2 in positions 4..6, then two zero payloads.
     pub output_leaves: [[Block128; 4]; TXBODY_N_OUTPUT_LEAVES],
     /// `is_coinbase_leaf` as two lanes (tree leaf L14).
     pub is_coinbase_leaf: [Block128; 2],
-    /// Pad leaf (tree leaf L15), always `[0, 0]` in current shape.
+    /// Bitmap leaf (tree leaf L15): Tx8x2 validity bits 0..9 in lane zero.
     pub pad_leaf: [Block128; 2],
 }
 

@@ -48,7 +48,7 @@ pub fn prove_tx(
 mod tests {
     use super::*;
     use noid_poseidon2b::primitives::{derive_address, Address, SpendSecret};
-    use noid_tx::{TxInput, TxOutput, TxShape};
+    use noid_tx::{output_bitmap_bit, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS};
 
     fn secret(seed: u8) -> SpendSecret {
         let mut bytes = [0u8; 32];
@@ -62,97 +62,66 @@ mod tests {
         haystack.windows(needle.len()).any(|w| w == needle)
     }
 
-    fn standard_body(spend_secret: &SpendSecret) -> TxBody {
+    fn body(spend_secret: &SpendSecret, input_count: usize) -> TxBody {
         let owner = derive_address(spend_secret);
-        TxBody {
-            shape: TxShape::Standard4x8,
-            epoch_anchor: [0x51; 32],
-            fee: 10,
-            inputs: vec![TxInput {
-                slot_index: 7,
-                value: 1_000,
-                creation_id: 17,
-                owner,
-                spend_secret: SpendSecret([0u8; 32]),
-                valid: true,
-            }],
-            outputs: vec![TxOutput {
-                slot_index: 70,
-                value: 990,
-                owner: Address([0xA7; 32]),
-                valid: true,
-            }],
-            is_coinbase: false,
-        }
-    }
-
-    fn sweep_body(spend_secret: &SpendSecret, input_count: usize) -> TxBody {
-        let owner = derive_address(spend_secret);
-        let mut inputs = Vec::with_capacity(input_count);
+        let mut inputs = [TxInput::dummy(); TX_INPUTS];
+        let mut total = 0u64;
         for i in 0..input_count {
-            inputs.push(TxInput {
+            inputs[i] = TxInput {
                 slot_index: 1_000 + i as u32,
-                value: 10_000 + i as u64,
+                amount: 10_000 + i as u64,
                 creation_id: 100 + i as u64,
-                owner,
-                spend_secret: SpendSecret([0u8; 32]),
-                valid: true,
-            });
+            };
+            total += inputs[i].amount;
         }
-        let total: u64 = inputs.iter().map(|i| i.value).sum();
         let fee = 123u64;
+        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        outputs[0] = TxOutput {
+            slot_index: 50_000,
+            amount: total - fee,
+            owner: Address([0xB1; 32]),
+        };
         TxBody {
-            shape: TxShape::Sweep25x2,
             epoch_anchor: [0x52; 32],
-            fee: fee as u128,
+            fee,
+            input_owner: owner,
             inputs,
-            outputs: vec![
-                TxOutput {
-                    slot_index: 50_000,
-                    value: (total - fee) / 2,
-                    owner: Address([0xB1; 32]),
-                    valid: true,
-                },
-                TxOutput {
-                    slot_index: 50_001,
-                    value: total - fee - (total - fee) / 2,
-                    owner: Address([0xB2; 32]),
-                    valid: true,
-                },
-            ],
+            outputs,
+            validity_bitmap: ((1u16 << input_count) - 1) | output_bitmap_bit(0),
             is_coinbase: false,
         }
     }
 
     #[test]
-    fn standard_wallet_bundle_does_not_serialize_spend_secret_bytes() {
+    fn wallet_bundle_does_not_serialize_spend_secret_bytes() {
         let spend_secret = secret(11);
         let raw_secret = spend_secret.0;
-        let body = standard_body(&spend_secret);
+        let body = body(&spend_secret, 1);
 
         let bundle =
-            prove_tx(&body, OwnerAuthWitness::new(spend_secret)).expect("prove standard tx");
+            prove_tx(&body, OwnerAuthWitness::new(spend_secret)).expect("prove transaction");
         let bytes = bundle.to_bytes().expect("serialize wallet authorization");
 
         assert!(
             !contains_subslice(&bytes, &raw_secret),
-            "standard wallet bundle must not contain raw spend_secret bytes"
+            "wallet bundle must not contain raw spend_secret bytes"
         );
     }
 
     #[test]
-    #[cfg_attr(debug_assertions, ignore = "release-only sweep proof regression")]
-    fn sweep_wallet_bundle_does_not_serialize_spend_secret_bytes() {
+    #[cfg_attr(debug_assertions, ignore = "release-only eight-input proof regression")]
+    fn eight_input_wallet_bundle_does_not_serialize_spend_secret_bytes() {
         let spend_secret = secret(21);
         let raw_secret = spend_secret.0;
-        let body = sweep_body(&spend_secret, 5);
+        let body = body(&spend_secret, TX_INPUTS);
 
-        let bundle = prove_tx(&body, OwnerAuthWitness::new(spend_secret)).expect("prove sweep tx");
+        let bundle = prove_tx(&body, OwnerAuthWitness::new(spend_secret))
+            .expect("prove eight-input transaction");
         let bytes = bundle.to_bytes().expect("serialize wallet authorization");
 
         assert!(
             !contains_subslice(&bytes, &raw_secret),
-            "sweep wallet bundle must not contain raw spend_secret bytes"
+            "eight-input wallet bundle must not contain raw spend_secret bytes"
         );
     }
 }

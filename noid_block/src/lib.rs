@@ -65,9 +65,9 @@ pub use validate::{
     validate_block_authorizations, validate_block_full, validate_block_full_timeless,
     validate_block_full_timeless_with_artifacts, AcceptedBlockRawValidationOutput,
     AcceptedBlockValidationArtifacts, AcceptedBlockValidationOutput, AuthorizationProof,
-    AuthorizationVerifier, CanonicalAuthorizationStatement, FullValidationError,
-    OwnerAuthAuthorizationVerifier, PreverifiedAuthorizationVerifier, VerifiedAuthorization,
-    VerifiedAuthorizationBatch,
+    AuthorizationVerifier, BlockTxEpochContext, CanonicalAuthorizationStatement,
+    FullValidationError, OwnerAuthAuthorizationVerifier, PreverifiedAuthorizationVerifier,
+    VerifiedAuthorization, VerifiedAuthorizationBatch,
 };
 
 use crate::exact_state_transition::ExactStateTransitionProof as BlockExactStateTransitionProof;
@@ -226,6 +226,10 @@ pub fn accepted_block_claim_transcript(
     proof: Option<&BlockProof>,
     auth_sidecar: &BlockAuthSidecar,
 ) -> Result<AcceptedBlockClaimTranscript, VerifyBlockError> {
+    let block_body_len = block
+        .canonical_wire_len()
+        .map_err(|_| VerifyBlockError::BlockResourceWeightExceeded)?
+        as u64;
     let (user_txs, live_inputs, outputs, state_frontier_nodes) =
         crate::validate::block_resource_counts(block);
     if user_txs == 0 {
@@ -250,8 +254,6 @@ pub fn accepted_block_claim_transcript(
             .map_err(|_| VerifyBlockError::AuthSidecarShapeMismatch)?
             .min(u64::MAX)
     };
-    let block_body_len = block.to_bytes().len() as u64;
-
     Ok(AcceptedBlockClaimTranscript {
         block: AcceptedBlockHeaderClaim::from_header(&block.header),
         context: AcceptedBlockContextClaim {
@@ -472,6 +474,10 @@ pub enum VerifyBlockError {
     ExactStateSurfaceInputOutputSlotOverlap {
         tx_index: usize,
     },
+    ExactStateSurfaceBlockSlotConflict {
+        tx_index: usize,
+        op_index: usize,
+    },
     /// The tx-body claims commitment does not match the reconstructed exact surface.
     ExactStateSurfaceClaimsCommitmentMismatch {
         tx_index: usize,
@@ -503,171 +509,190 @@ pub enum VerifyBlockError {
 mod tests {
     use super::*;
     use noid_chain::block::{compute_tx_root, Block};
-    use noid_chain::block_header::BlockHeader;
-    use noid_chain::consensus::AnchorInfo;
-    use noid_poseidon2b::primitives::{Address, SpendSecret};
-    use noid_tx::{hash_tx_body_for_shape, Transaction, TxBody, TxInput, TxOutput, TxShape};
+    use noid_poseidon2b::primitives::Address;
+    use noid_tx::{
+        output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS,
+    };
 
-    fn header(height: u64, parent: Option<&BlockHeader>, txs: &[Transaction]) -> BlockHeader {
-        let prev_block_hash = parent
-            .map(noid_chain::hash_block_header)
-            .unwrap_or([0u8; 32]);
+    fn header(height: u64, txs: &[Transaction]) -> BlockHeader {
         BlockHeader {
-            prev_block_hash,
-            state_root: [height as u8; 32],
+            prev_block_hash: [height as u8; 32],
+            state_root: [0x22; 32],
             tx_root: compute_tx_root(txs),
-            timestamp: 1_767_225_600 + height * 15,
+            timestamp: 1_767_225_600 + height,
             height,
-            miner_address: Address([0x44; 32]),
+            miner_address: Address([0x33; 32]),
             nonce: height as u128,
-            difficulty_target: [0xFF; 32],
+            difficulty_target: [0xff; 32],
             log_slots: 24,
-            active_slot_count: height,
-            alloc_counter: height,
+            active_slot_count: 1,
+            alloc_counter: 1,
         }
     }
 
-    fn anchor(parent: &BlockHeader) -> AnchorInfo {
-        AnchorInfo {
-            anchor_height: parent.height,
-            anchor_timestamp: parent.timestamp,
-            anchor_target: parent.difficulty_target,
-        }
-    }
-
-    fn minimal_proof(parent: &BlockHeader, block: &Block, n_tx: u32) -> BlockProof {
-        BlockProof::minimal(
-            parent.state_root,
-            block.header.state_root,
-            n_tx,
-            ExactStateTransitionProof {
-                slot_siblings: Vec::new(),
-            },
-        )
-    }
-
-    fn user_tx() -> Transaction {
-        let body = TxBody {
-            shape: TxShape::Standard4x8,
-            epoch_anchor: [0u8; 32],
-            fee: 0,
-            inputs: vec![TxInput {
-                slot_index: 1,
-                value: 100,
-                creation_id: 0,
-                owner: Address([0x11; 32]),
-                spend_secret: SpendSecret([0x22; 32]),
-                valid: true,
-            }],
-            outputs: vec![TxOutput {
-                slot_index: 2,
-                value: 90,
-                owner: Address([0x33; 32]),
-                valid: true,
-            }],
-            is_coinbase: false,
+    fn coinbase(epoch_anchor: [u8; 32]) -> Transaction {
+        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        outputs[0] = TxOutput {
+            slot_index: 9,
+            amount: 50,
+            owner: Address([0x44; 32]),
         };
-        let tx_body_hash = hash_tx_body_for_shape(
-            body.shape,
-            &body.epoch_anchor,
-            body.fee,
-            &body.inputs,
-            &body.outputs,
-            body.is_coinbase,
-        );
-        Transaction { body, tx_body_hash }
-    }
-
-    fn coinbase_tx(parent: &BlockHeader) -> Transaction {
-        let body = TxBody {
-            shape: TxShape::Standard4x8,
-            epoch_anchor: noid_chain::hash_block_header(parent),
+        Transaction::new(TxBody {
+            epoch_anchor,
             fee: 0,
-            inputs: vec![],
-            outputs: vec![TxOutput {
-                slot_index: 0,
-                value: 1,
-                owner: Address([0x44; 32]),
-                valid: true,
-            }],
+            input_owner: Address([0; 32]),
+            inputs: [TxInput::dummy(); TX_INPUTS],
+            outputs,
+            validity_bitmap: output_bitmap_bit(0),
             is_coinbase: true,
+        })
+    }
+
+    fn user_tx(epoch_anchor: [u8; 32]) -> Transaction {
+        let owner = Address([0x55; 32]);
+        let mut inputs = [TxInput::dummy(); TX_INPUTS];
+        inputs[0] = TxInput {
+            slot_index: 3,
+            amount: 100,
+            creation_id: 7,
         };
-        let tx_body_hash = hash_tx_body_for_shape(
-            body.shape,
-            &body.epoch_anchor,
-            body.fee,
-            &body.inputs,
-            &body.outputs,
-            body.is_coinbase,
-        );
-        Transaction { body, tx_body_hash }
+        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        outputs[0] = TxOutput {
+            slot_index: 4,
+            amount: 100,
+            owner,
+        };
+        Transaction::new(TxBody {
+            epoch_anchor,
+            fee: 0,
+            input_owner: owner,
+            inputs,
+            outputs,
+            validity_bitmap: 1 | output_bitmap_bit(0),
+            is_coinbase: false,
+        })
+    }
+
+    fn anchor() -> AnchorInfo {
+        AnchorInfo {
+            anchor_height: 0,
+            anchor_timestamp: 1_767_225_600,
+            anchor_target: [0xff; 32],
+        }
     }
 
     #[test]
-    fn accepted_block_claim_binds_context_and_rejects_wrong_witness_shape() {
-        let parent = header(0, None, &[]);
-        let coinbase = coinbase_tx(&parent);
+    fn coinbase_claim_uses_final_fixed_tx_shape_counts() {
+        let parent = header(0, &[]);
+        let transactions = vec![coinbase(hash_block_header(&parent))];
         let block = Block {
-            header: header(1, Some(&parent), std::slice::from_ref(&coinbase)),
-            transactions: vec![coinbase],
+            header: header(1, &transactions),
+            transactions,
         };
-        let empty_sidecar = BlockAuthSidecar::default();
-        let a = accepted_block_claim_hash(
+        let transcript = accepted_block_claim_transcript(
             &block,
             &parent,
             &[parent.timestamp],
             &[parent.active_slot_count],
-            &anchor(&parent),
+            &anchor(),
             None,
-            &empty_sidecar,
+            &BlockAuthSidecar::default(),
         )
         .unwrap();
-        let b = accepted_block_claim_hash(
-            &block,
-            &parent,
-            &[parent.timestamp + 1],
-            &[parent.active_slot_count],
-            &anchor(&parent),
-            None,
-            &empty_sidecar,
-        )
-        .unwrap();
-        assert_ne!(a, b, "MTP context must bind the accepted-block claim");
 
-        let proof = minimal_proof(&parent, &block, 0);
-        assert!(
-            accepted_block_claim_hash(
-                &block,
-                &parent,
-                &[parent.timestamp],
-                &[parent.active_slot_count],
-                &anchor(&parent),
-                Some(&proof),
-                &empty_sidecar,
-            )
-            .is_err(),
-            "coinbase-only block without detached proof must reject carried proof metadata"
+        assert_eq!(transcript.resources.tx_count, 1);
+        assert_eq!(transcript.resources.user_tx_count, 0);
+        assert_eq!(transcript.resources.live_input_count, 0);
+        assert_eq!(transcript.resources.output_count, 1);
+        assert_eq!(transcript.resources.state_frontier_node_count, 1);
+        assert_eq!(
+            accepted_block_claim_fields_from_transcript(&transcript).len(),
+            ACCEPTED_BLOCK_CLAIM_FIELDS
+        );
+        assert_eq!(
+            accepted_block_claim_from_transcript(&transcript),
+            digest_to_fields(&accepted_block_claim_hash_from_transcript(&transcript))
         );
     }
 
     #[test]
-    fn accepted_block_claim_rejects_user_tx_without_block_proof() {
-        let tx = user_tx();
-        let parent = header(0, None, &[]);
+    fn accepted_claim_binds_context_and_universal_tx_root() {
+        let parent = header(0, &[]);
+        let transactions = vec![coinbase(hash_block_header(&parent)), user_tx([0x77; 32])];
         let block = Block {
-            header: header(1, Some(&parent), std::slice::from_ref(&tx)),
-            transactions: vec![tx],
+            header: header(1, &transactions),
+            transactions,
         };
-        let err = accepted_block_claim_hash(
+
+        let error = accepted_block_claim_transcript(
             &block,
             &parent,
-            &[parent.timestamp],
-            &[parent.active_slot_count],
-            &anchor(&parent),
+            &[10, 11],
+            &[1, 2],
+            &anchor(),
             None,
             &BlockAuthSidecar::default(),
         )
         .unwrap_err();
-        assert!(matches!(err, VerifyBlockError::ShapeMismatch));
+        assert!(matches!(error, VerifyBlockError::ShapeMismatch));
+
+        let coinbase_transactions = vec![coinbase(hash_block_header(&parent))];
+        let coinbase_block = Block {
+            header: header(1, &coinbase_transactions),
+            transactions: coinbase_transactions,
+        };
+        let first = accepted_block_claim_transcript(
+            &coinbase_block,
+            &parent,
+            &[10, 11],
+            &[1, 2],
+            &anchor(),
+            None,
+            &BlockAuthSidecar::default(),
+        )
+        .unwrap();
+        let second = accepted_block_claim_transcript(
+            &coinbase_block,
+            &parent,
+            &[10, 12],
+            &[1, 2],
+            &anchor(),
+            None,
+            &BlockAuthSidecar::default(),
+        )
+        .unwrap();
+        assert_ne!(
+            accepted_block_claim_hash_from_transcript(&first),
+            accepted_block_claim_hash_from_transcript(&second)
+        );
+        assert_eq!(
+            coinbase_block.header.tx_root,
+            compute_tx_root(&coinbase_block.transactions)
+        );
+    }
+
+    #[test]
+    fn claim_transcript_rejects_oversized_in_memory_block_without_encoding() {
+        let parent = header(0, &[]);
+        let transactions =
+            vec![coinbase(hash_block_header(&parent)); noid_chain::BLOCK_MAX_TXS + 1];
+        // Do not derive a tx root: the semantic candidate is deliberately
+        // beyond the universal tree and must fail on the O(1) length cap.
+        let oversized = Block {
+            header: header(1, &[]),
+            transactions,
+        };
+        assert!(matches!(
+            accepted_block_claim_transcript(
+                &oversized,
+                &parent,
+                &[parent.timestamp],
+                &[parent.active_slot_count],
+                &anchor(),
+                None,
+                &BlockAuthSidecar::default(),
+            ),
+            Err(VerifyBlockError::BlockResourceWeightExceeded)
+        ));
     }
 }

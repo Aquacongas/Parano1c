@@ -34,7 +34,6 @@ use noid_chain::consensus::wire_limits::{
     MAX_BLOCK_PROOF_BYTES,
 };
 use noid_chain::consensus::ConsensusError;
-use noid_chain::segmented_state::SegmentedFriState;
 use noid_chain::state::ChainState;
 use noid_chain::state_delta::{build_exact_action_surface, ExactActionSurface, StateDeltaError};
 
@@ -44,8 +43,31 @@ use noid_gkr::{
     canonical_authorization_statement_from_body, verify_authorization_statement_proof,
     VerifyAuthorizationError,
 };
-use noid_tx::{compute_claims_commitment, validate_public_tx_logic, Transaction};
+use noid_tx::{validate_public_tx_logic, Transaction};
 use rayon::prelude::*;
+
+/// Exact transaction-epoch public input for one candidate block.
+///
+/// This is deliberately separate from ASERT [`AnchorInfo`]. The owning chain
+/// context resolves it from the canonical header at the current 144-block
+/// boundary before calling any standalone proof-native acceptance entrypoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockTxEpochContext {
+    pub expected_user_epoch_anchor_id: [u8; 32],
+}
+
+fn validate_tx_epoch_context(
+    block: &Block,
+    parent: &BlockHeader,
+    context: &BlockTxEpochContext,
+) -> Result<(), FullValidationError> {
+    noid_chain::consensus::validate_block_epoch_anchors(
+        block,
+        context.expected_user_epoch_anchor_id,
+        noid_chain::consensus::pow::block_id(parent),
+    )
+    .map_err(FullValidationError::Consensus)
+}
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -162,7 +184,6 @@ impl AuthorizationVerifier for PreverifiedAuthorizationVerifier<'_> {
                     })?;
                     return Ok(VerifiedAuthorization {
                         tx_index: statement.tx_index,
-                        owner_count: statement.public.layout.owner_count,
                         live_input_count: usize::from(statement.live_input_count),
                     });
                 }
@@ -207,9 +228,12 @@ pub fn validate_block_full(
     // Pass &[parent.active_slot_count] when the full window is not available.
     prev_active_counts: &[u64],
     local_time: u64,
+    tx_epoch: &BlockTxEpochContext,
     anchor: &AnchorInfo,
     state: &mut ChainState,
 ) -> Result<[u8; 32], FullValidationError> {
+    validate_block_resource_preflight(block).map_err(FullValidationError::Consensus)?;
+    validate_tx_epoch_context(block, parent, tx_epoch)?;
     validate_block_full_inner(
         block,
         proof,
@@ -239,6 +263,7 @@ pub fn validate_block_full_timeless(
     parent: &BlockHeader,
     prev_timestamps: &[u64],
     prev_active_counts: &[u64],
+    tx_epoch: &BlockTxEpochContext,
     anchor: &AnchorInfo,
     state: &mut ChainState,
 ) -> Result<[u8; 32], FullValidationError> {
@@ -249,6 +274,7 @@ pub fn validate_block_full_timeless(
         parent,
         prev_timestamps,
         prev_active_counts,
+        tx_epoch,
         anchor,
         state,
     )
@@ -265,9 +291,12 @@ pub fn validate_block_full_timeless_with_artifacts(
     parent: &BlockHeader,
     prev_timestamps: &[u64],
     prev_active_counts: &[u64],
+    tx_epoch: &BlockTxEpochContext,
     anchor: &AnchorInfo,
     state: &mut ChainState,
 ) -> Result<AcceptedBlockValidationOutput, FullValidationError> {
+    validate_block_resource_preflight(block).map_err(FullValidationError::Consensus)?;
+    validate_tx_epoch_context(block, parent, tx_epoch)?;
     validate_block_full_inner(
         block,
         proof,
@@ -455,7 +484,7 @@ fn validate_block_public_logic(block: &Block) -> Result<(), VerifyBlockError> {
             }
             let facts = validate_public_tx_logic(&tx.body)
                 .map_err(|error| VerifyBlockError::TxPublicLogic { tx_index, error })?;
-            if tx.tx_body_hash != facts.tx_body_hash {
+            if tx.txid() != facts.tx_body_hash {
                 return Err(VerifyBlockError::TxPublicInputsMismatch { tx_index });
             }
             Ok(())
@@ -494,7 +523,7 @@ pub fn validate_block_authorizations_with_output<V: AuthorizationVerifier>(
         .map(|((tx_index, tx), proof)| {
             let statement = canonical_authorization_statement_from_body(
                 *tx_index,
-                tx.tx_body_hash.as_fields(),
+                tx.txid().as_fields(),
                 &tx.body,
             )
             .map_err(|_| VerifyBlockError::AuthSidecarShapeMismatch)?;
@@ -502,20 +531,17 @@ pub fn validate_block_authorizations_with_output<V: AuthorizationVerifier>(
         })
         .collect();
 
-    let mut owner_count_total = 0usize;
     let mut live_input_count_total = 0usize;
     for verified in results {
         let verified = verified?;
-        if verified.live_input_count == 0 || verified.owner_count == 0 {
+        if verified.live_input_count == 0 {
             return Err(VerifyBlockError::AuthSidecarShapeMismatch);
         }
-        owner_count_total = owner_count_total.saturating_add(verified.owner_count);
         live_input_count_total = live_input_count_total.saturating_add(verified.live_input_count);
     }
 
     Ok(VerifiedAuthorizationBatch {
         user_tx_count: user_txs.len(),
-        owner_count_total,
         live_input_count_total,
     })
 }
@@ -541,10 +567,7 @@ fn build_exact_surface_for_block(
         .iter()
         .map(|tx| tx.body.clone())
         .collect();
-    let commitments: Vec<[u8; 32]> = bodies
-        .iter()
-        .map(|body| compute_claims_commitment(&body.inputs, &body.outputs))
-        .collect();
+    let commitments: Vec<[u8; 32]> = bodies.iter().map(|body| body.claims_commitment()).collect();
     build_exact_action_surface(&surface_state, &bodies, &commitments, state.alloc_counter)
         .map_err(map_state_delta_error)
 }
@@ -576,6 +599,9 @@ fn map_state_delta_error(err: StateDeltaError) -> VerifyBlockError {
         }
         StateDeltaError::InputOutputSlotOverlap { tx_index } => {
             VerifyBlockError::ExactStateSurfaceInputOutputSlotOverlap { tx_index }
+        }
+        StateDeltaError::BlockSlotConflict { tx_index, op_index } => {
+            VerifyBlockError::ExactStateSurfaceBlockSlotConflict { tx_index, op_index }
         }
         StateDeltaError::SlotOutOfRange { tx_index } => {
             VerifyBlockError::ExactStateSurfaceSlotOutOfRange { tx_index }
@@ -639,11 +665,10 @@ pub fn accept_block(
     prev_timestamps: &[u64],
     prev_active_counts: &[u64],
     local_time: u64,
+    tx_epoch: &BlockTxEpochContext,
     anchor: &AnchorInfo,
-    pre_state: &noid_chain::segmented_state::SegmentedFriState,
     state: &mut ChainState,
 ) -> Result<[u8; 32], FullValidationError> {
-    let _ = pre_state;
     accept_block_inner(
         block,
         block_proof_bytes,
@@ -652,6 +677,7 @@ pub fn accept_block(
         prev_timestamps,
         prev_active_counts,
         TimestampPolicy::Live(local_time),
+        tx_epoch,
         anchor,
         state,
     )
@@ -668,11 +694,10 @@ pub fn accept_block_with_artifacts(
     prev_timestamps: &[u64],
     prev_active_counts: &[u64],
     local_time: u64,
+    tx_epoch: &BlockTxEpochContext,
     anchor: &AnchorInfo,
-    pre_state: &SegmentedFriState,
     state: &mut ChainState,
 ) -> Result<AcceptedBlockRawValidationOutput, FullValidationError> {
-    let _ = pre_state;
     accept_block_inner_with_artifacts(
         block,
         block_proof_bytes,
@@ -681,6 +706,7 @@ pub fn accept_block_with_artifacts(
         prev_timestamps,
         prev_active_counts,
         TimestampPolicy::Live(local_time),
+        tx_epoch,
         anchor,
         state,
         &OwnerAuthAuthorizationVerifier,
@@ -698,12 +724,11 @@ pub fn accept_block_with_artifacts_with_auth_verifier<V: AuthorizationVerifier>(
     prev_timestamps: &[u64],
     prev_active_counts: &[u64],
     local_time: u64,
+    tx_epoch: &BlockTxEpochContext,
     anchor: &AnchorInfo,
-    pre_state: &SegmentedFriState,
     state: &mut ChainState,
     auth_verifier: &V,
 ) -> Result<AcceptedBlockRawValidationOutput, FullValidationError> {
-    let _ = pre_state;
     accept_block_inner_with_artifacts(
         block,
         block_proof_bytes,
@@ -712,6 +737,7 @@ pub fn accept_block_with_artifacts_with_auth_verifier<V: AuthorizationVerifier>(
         prev_timestamps,
         prev_active_counts,
         TimestampPolicy::Live(local_time),
+        tx_epoch,
         anchor,
         state,
         auth_verifier,
@@ -730,6 +756,7 @@ pub fn accept_block_timeless(
     parent: &BlockHeader,
     prev_timestamps: &[u64],
     prev_active_counts: &[u64],
+    tx_epoch: &BlockTxEpochContext,
     anchor: &AnchorInfo,
     state: &mut ChainState,
 ) -> Result<[u8; 32], FullValidationError> {
@@ -741,6 +768,7 @@ pub fn accept_block_timeless(
         prev_timestamps,
         prev_active_counts,
         TimestampPolicy::Timeless,
+        tx_epoch,
         anchor,
         state,
     )
@@ -756,6 +784,7 @@ pub fn accept_block_timeless_with_artifacts(
     parent: &BlockHeader,
     prev_timestamps: &[u64],
     prev_active_counts: &[u64],
+    tx_epoch: &BlockTxEpochContext,
     anchor: &AnchorInfo,
     state: &mut ChainState,
 ) -> Result<AcceptedBlockRawValidationOutput, FullValidationError> {
@@ -766,6 +795,7 @@ pub fn accept_block_timeless_with_artifacts(
         parent,
         prev_timestamps,
         prev_active_counts,
+        tx_epoch,
         anchor,
         state,
         &OwnerAuthAuthorizationVerifier,
@@ -787,6 +817,7 @@ pub fn accept_block_timeless_with_artifacts_with_auth_verifier<V: AuthorizationV
     parent: &BlockHeader,
     prev_timestamps: &[u64],
     prev_active_counts: &[u64],
+    tx_epoch: &BlockTxEpochContext,
     anchor: &AnchorInfo,
     state: &mut ChainState,
     auth_verifier: &V,
@@ -799,6 +830,7 @@ pub fn accept_block_timeless_with_artifacts_with_auth_verifier<V: AuthorizationV
         prev_timestamps,
         prev_active_counts,
         TimestampPolicy::Timeless,
+        tx_epoch,
         anchor,
         state,
         auth_verifier,
@@ -814,6 +846,7 @@ fn accept_block_inner(
     prev_timestamps: &[u64],
     prev_active_counts: &[u64],
     timestamp_policy: TimestampPolicy,
+    tx_epoch: &BlockTxEpochContext,
     anchor: &AnchorInfo,
     state: &mut ChainState,
 ) -> Result<[u8; 32], FullValidationError> {
@@ -825,6 +858,7 @@ fn accept_block_inner(
         prev_timestamps,
         prev_active_counts,
         timestamp_policy,
+        tx_epoch,
         anchor,
         state,
         &OwnerAuthAuthorizationVerifier,
@@ -841,6 +875,7 @@ fn accept_block_inner_with_artifacts<V: AuthorizationVerifier>(
     prev_timestamps: &[u64],
     prev_active_counts: &[u64],
     timestamp_policy: TimestampPolicy,
+    tx_epoch: &BlockTxEpochContext,
     anchor: &AnchorInfo,
     state: &mut ChainState,
     auth_verifier: &V,
@@ -857,10 +892,17 @@ fn accept_block_inner_with_artifacts<V: AuthorizationVerifier>(
             crate::VerifyBlockError::AuthSidecarShapeMismatch,
         ));
     }
-    validate_block_resource_preflight(block).map_err(FullValidationError::Consensus)?;
-    let (user_txs, live_inputs, outputs, state_frontier_nodes) = block_resource_counts(block);
+    let preflight =
+        validate_block_resource_preflight(block).map_err(FullValidationError::Consensus)?;
+    let block_body_len = block.canonical_wire_len().map_err(|_| {
+        FullValidationError::ZkProof(crate::VerifyBlockError::BlockResourceWeightExceeded)
+    })?;
+    let user_txs = preflight.user_tx_count;
+    let live_inputs = preflight.live_input_count;
+    let outputs = preflight.output_count;
+    let state_frontier_nodes = preflight.action_count;
     if !block_resource_weight_ok(
-        block.to_bytes().len(),
+        block_body_len,
         block_proof_bytes.len(),
         block_auth_sidecar_bytes.len(),
         user_txs,
@@ -872,6 +914,7 @@ fn accept_block_inner_with_artifacts<V: AuthorizationVerifier>(
             crate::VerifyBlockError::BlockResourceWeightExceeded,
         ));
     }
+    validate_tx_epoch_context(block, parent, tx_epoch)?;
 
     if user_txs == 0 {
         validate_block_proof_binding(block, block_proof_bytes)
@@ -1033,7 +1076,6 @@ fn derive_coinbase_only_validation_artifacts(
     Ok(AcceptedBlockValidationArtifacts {
         authorization: VerifiedAuthorizationBatch {
             user_tx_count: 0,
-            owner_count_total: 0,
             live_input_count_total: 0,
         },
         exact_state_inputs: inputs,
@@ -1049,9 +1091,9 @@ pub(crate) fn block_resource_counts(block: &Block) -> (usize, usize, usize, usiz
     for tx in &block.transactions {
         if !tx.body.is_coinbase {
             user_txs += 1;
-            live_inputs += tx.body.inputs.iter().filter(|input| input.valid).count();
+            live_inputs += tx.body.live_input_count();
         }
-        outputs += tx.body.outputs.iter().filter(|output| output.valid).count();
+        outputs += tx.body.live_output_count();
     }
     let state_frontier_nodes = live_inputs.saturating_add(outputs);
     (user_txs, live_inputs, outputs, state_frontier_nodes)
@@ -1065,346 +1107,277 @@ pub(crate) fn block_resource_counts(block: &Block) -> (usize, usize, usize, usiz
 mod tests {
     use super::*;
     use noid_chain::block::{compute_tx_root, Block};
-    use noid_chain::block_header::BlockHeader;
-    use noid_chain::consensus::wire_limits::{
-        proof_sidecar_combined_len_ok, MAX_BLOCK_AUTH_SIDECAR_BYTES,
+    use noid_chain::consensus::{next_tx_epoch_anchor_id, ConsensusError};
+    use noid_poseidon2b::primitives::Address;
+    use noid_tx::{
+        output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS,
     };
-    use noid_chain::consensus::{
-        genesis::GENESIS_TIMESTAMP,
-        params::{BLOCK_TIME, GENESIS_TARGET},
-        pow::search_pow,
-        template::build_block_template,
-    };
-    use noid_chain::state::ChainState;
-    use noid_poseidon2b::primitives::{derive_address, Address, SpendSecret};
-    use noid_tx::{Transaction, TxBody, TxInput, TxOutput};
 
-    const TEST_LOG_SLOTS: usize = 6;
-
-    fn make_tx_body(slot: u32, is_coinbase: bool) -> TxBody {
-        TxBody {
-            shape: noid_tx::TxShape::Standard4x8,
-            epoch_anchor: [0u8; 32],
-            fee: 0,
-            inputs: vec![],
-            outputs: vec![TxOutput {
-                slot_index: slot,
-                value: 100,
-                owner: Address([1u8; 32]),
-                valid: true,
-            }],
-            is_coinbase,
-        }
-    }
-
-    fn make_transaction(body: TxBody) -> Transaction {
-        let hash = noid_tx::hash_tx_body(
-            &body.epoch_anchor,
-            body.fee,
-            &body.inputs,
-            &body.outputs,
-            body.is_coinbase,
-        );
-        Transaction {
-            body,
-            tx_body_hash: hash,
-        }
-    }
-
-    fn history_parent(state: &mut ChainState) -> BlockHeader {
+    fn header(height: u64) -> BlockHeader {
         BlockHeader {
-            prev_block_hash: [0u8; 32],
-            state_root: state.state_root(),
-            tx_root: compute_tx_root(&[]),
-            timestamp: GENESIS_TIMESTAMP,
-            height: 0,
-            miner_address: Address([0x44; 32]),
-            nonce: 0,
-            difficulty_target: GENESIS_TARGET,
-            log_slots: state.state.log_slots() as u32,
-            active_slot_count: state.active_slot_count,
-            alloc_counter: state.alloc_counter,
+            prev_block_hash: [height as u8; 32],
+            state_root: [0x11; 32],
+            tx_root: [0x22; 32],
+            timestamp: 1_767_225_600 + height,
+            height,
+            miner_address: Address([0x33; 32]),
+            nonce: height as u128,
+            difficulty_target: [0xff; 32],
+            log_slots: 6,
+            active_slot_count: 0,
+            alloc_counter: 0,
         }
     }
 
-    fn history_anchor(parent: &BlockHeader) -> AnchorInfo {
-        AnchorInfo {
-            anchor_height: parent.height,
-            anchor_timestamp: parent.timestamp,
-            anchor_target: parent.difficulty_target,
+    fn coinbase(epoch_anchor: [u8; 32], slot_index: u32) -> Transaction {
+        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        outputs[0] = TxOutput {
+            slot_index,
+            amount: 50,
+            owner: Address([0x44; 32]),
+        };
+        Transaction::new(TxBody {
+            epoch_anchor,
+            fee: 0,
+            input_owner: Address([0; 32]),
+            inputs: [TxInput::dummy(); TX_INPUTS],
+            outputs,
+            validity_bitmap: output_bitmap_bit(0),
+            is_coinbase: true,
+        })
+    }
+
+    fn user_tx(epoch_anchor: [u8; 32], live_inputs: usize) -> Transaction {
+        assert!(live_inputs <= TX_INPUTS);
+        let owner = Address([0x55; 32]);
+        let mut inputs = [TxInput::dummy(); TX_INPUTS];
+        let mut validity_bitmap = output_bitmap_bit(0) | output_bitmap_bit(1);
+        for (index, input) in inputs.iter_mut().enumerate().take(live_inputs) {
+            *input = TxInput {
+                slot_index: index as u32,
+                amount: 10,
+                creation_id: index as u64,
+            };
+            validity_bitmap |= 1 << index;
+        }
+        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        outputs[0] = TxOutput {
+            slot_index: 20,
+            amount: 1,
+            owner,
+        };
+        outputs[1] = TxOutput {
+            slot_index: 21,
+            amount: 1,
+            owner,
+        };
+        Transaction::new(TxBody {
+            epoch_anchor,
+            fee: 0,
+            input_owner: owner,
+            inputs,
+            outputs,
+            validity_bitmap,
+            is_coinbase: false,
+        })
+    }
+
+    fn block(parent: &BlockHeader, height: u64, user_anchor: [u8; 32]) -> Block {
+        let transactions = vec![
+            coinbase(noid_chain::hash_block_header(parent), 30),
+            user_tx(user_anchor, 1),
+        ];
+        let mut child = header(height);
+        child.prev_block_hash = noid_chain::hash_block_header(parent);
+        child.tx_root = compute_tx_root(&transactions);
+        Block {
+            header: child,
+            transactions,
         }
     }
 
     #[test]
-    fn parent_chain_state_boundary_binds_root_depth_and_counters() {
-        let mut state = ChainState::with_log_slots(TEST_LOG_SLOTS);
-        let parent = history_parent(&mut state);
-        validate_parent_state_boundary(&parent, &state).expect("matching parent boundary");
+    fn tx_epoch_context_rejects_wrong_user_and_coinbase_anchors() {
+        let parent = header(17);
+        let expected = [0x66; 32];
+        let valid = block(&parent, 18, expected);
+        let context = BlockTxEpochContext {
+            expected_user_epoch_anchor_id: expected,
+        };
+        validate_tx_epoch_context(&valid, &parent, &context).unwrap();
 
-        let mut bad_root = parent.clone();
-        bad_root.state_root[0] ^= 1;
-        assert!(validate_parent_state_boundary(&bad_root, &state).is_err());
+        let wrong_context = BlockTxEpochContext {
+            expected_user_epoch_anchor_id: [0x67; 32],
+        };
+        assert!(matches!(
+            validate_tx_epoch_context(&valid, &parent, &wrong_context),
+            Err(FullValidationError::Consensus(
+                ConsensusError::BadEpochAnchor
+            ))
+        ));
 
-        let mut bad_depth = parent.clone();
-        bad_depth.log_slots += 1;
-        assert!(validate_parent_state_boundary(&bad_depth, &state).is_err());
-
-        let mut bad_active = parent.clone();
-        bad_active.active_slot_count += 1;
-        assert!(validate_parent_state_boundary(&bad_active, &state).is_err());
-
-        let mut bad_alloc = parent;
-        bad_alloc.alloc_counter += 1;
-        assert!(validate_parent_state_boundary(&bad_alloc, &state).is_err());
+        let mut wrong_coinbase = valid.clone();
+        wrong_coinbase.transactions[0].body.epoch_anchor = [0x68; 32];
+        assert!(matches!(
+            validate_tx_epoch_context(&wrong_coinbase, &parent, &context),
+            Err(FullValidationError::Consensus(
+                ConsensusError::BadCoinbaseAnchor
+            ))
+        ));
     }
 
     #[test]
-    fn coinbase_only_block_returns_history_claim_artifacts() {
-        let mut state = ChainState::with_log_slots(TEST_LOG_SLOTS);
-        let parent = history_parent(&mut state);
-        let template = build_block_template(
-            &parent,
-            &state,
-            &[parent.active_slot_count],
-            vec![],
-            Address([0x55; 32]),
-            parent.timestamp + BLOCK_TIME,
-            GENESIS_TARGET,
-        )
-        .expect("coinbase-only template");
-        let header = {
-            let pow_header = template.to_pow_header(0);
-            let nonce =
-                search_pow(&pow_header, 0, 100_000_000).expect("test target should mine quickly");
-            template.clone().into_header(nonce)
+    fn boundary_block_consumes_old_epoch_then_child_uses_boundary_id() {
+        let parent_143 = header(143);
+        let old_anchor = [0x71; 32];
+        let boundary = block(&parent_143, 144, old_anchor);
+        let old_context = BlockTxEpochContext {
+            expected_user_epoch_anchor_id: old_anchor,
         };
-        let block = Block {
-            header,
-            transactions: template.all_txs(),
+        validate_tx_epoch_context(&boundary, &parent_143, &old_context).unwrap();
+
+        let boundary_id = noid_chain::hash_block_header(&boundary.header);
+        let next_anchor = next_tx_epoch_anchor_id(old_anchor, 144, boundary_id);
+        assert_eq!(next_anchor, boundary_id);
+
+        let child_145 = block(&boundary.header, 145, next_anchor);
+        let next_context = BlockTxEpochContext {
+            expected_user_epoch_anchor_id: next_anchor,
         };
-        let out = accept_block_timeless_with_artifacts(
-            &block,
+        validate_tx_epoch_context(&child_145, &boundary.header, &next_context).unwrap();
+        assert!(matches!(
+            validate_tx_epoch_context(&child_145, &boundary.header, &old_context),
+            Err(FullValidationError::Consensus(
+                ConsensusError::BadEpochAnchor
+            ))
+        ));
+    }
+
+    #[test]
+    fn raw_accept_fails_on_epoch_before_proof_or_state_work() {
+        let parent = header(8);
+        let valid_anchor = [0x81; 32];
+        let candidate = block(&parent, 9, valid_anchor);
+        let mut state = ChainState::with_log_slots(6);
+        let error = accept_block_timeless_with_artifacts(
+            &candidate,
             &[],
             &[],
             &parent,
             &[parent.timestamp],
             &[parent.active_slot_count],
-            &history_anchor(&parent),
+            &BlockTxEpochContext {
+                expected_user_epoch_anchor_id: [0x82; 32],
+            },
+            &AnchorInfo {
+                anchor_height: 0,
+                anchor_timestamp: parent.timestamp,
+                anchor_target: parent.difficulty_target,
+            },
             &mut state,
         )
-        .expect("coinbase-only block accepted with artifacts");
-
-        assert_eq!(out.state_root, block.header.state_root);
-        assert_eq!(out.artifacts.exact_action_surface.spends, 0);
-        assert_eq!(out.artifacts.exact_action_surface.mints, 1);
-        assert_eq!(
-            out.artifacts.verified_transition.child_state_root(),
-            block.header.state_root
-        );
-
-        let claim = crate::AcceptedStateTransitionClaim::from_accepted_block(
-            &block,
-            &parent,
-            &out.artifacts,
-        )
-        .expect("history claim from coinbase artifacts");
-        assert_ne!(claim.claim_digest, [0u8; 32]);
-        assert_eq!(claim.touched_slot_count, 1);
-        assert_eq!(claim.mint_count, 1);
-        assert_eq!(claim.spend_count, 0);
-        assert_eq!(claim.reward_value, claim.minted_value);
-        assert!(claim.supply_delta > 0);
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            FullValidationError::Consensus(ConsensusError::BadEpochAnchor)
+        ));
     }
 
     #[test]
-    fn coinbase_only_artifact_derivation_rejects_empty_before_state_boundary() {
-        let mut state = ChainState::with_log_slots(TEST_LOG_SLOTS);
-        let parent = history_parent(&mut state);
-        let header = BlockHeader {
-            prev_block_hash: noid_chain::hash_block_header(&parent),
-            state_root: parent.state_root,
-            tx_root: compute_tx_root(&[]),
-            timestamp: parent.timestamp + BLOCK_TIME,
-            height: parent.height + 1,
-            miner_address: Address([0x66; 32]),
-            nonce: 0,
-            difficulty_target: GENESIS_TARGET,
-            log_slots: parent.log_slots,
-            active_slot_count: parent.active_slot_count,
-            alloc_counter: parent.alloc_counter,
-        };
-        let block = Block {
-            header,
-            transactions: vec![],
-        };
-        let mut mismatched_state = state.clone();
-        mismatched_state.alloc_counter += 1;
-        let direct_err =
-            derive_coinbase_only_validation_artifacts(&block, &parent, &mismatched_state)
-                .expect_err("direct artifact derivation must enforce the mandatory coinbase");
-        assert!(matches!(
-            direct_err,
-            FullValidationError::Consensus(noid_chain::consensus::ConsensusError::MissingCoinbase)
-        ));
+    fn malformed_in_memory_body_is_rejected_without_encoder_panic() {
+        let parent = header(8);
+        let user_anchor = [0x83; 32];
+        let mut candidate = block(&parent, 9, user_anchor);
+        // A dead record must be exactly zero.  The canonical encoder asserts
+        // this invariant, so validation must never call it before rejection.
+        candidate.transactions[1].body.inputs[7].amount = 1;
+        let mut state = ChainState::with_log_slots(6);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            accept_block_timeless_with_artifacts(
+                &candidate,
+                &[],
+                &[],
+                &parent,
+                &[parent.timestamp],
+                &[parent.active_slot_count],
+                &BlockTxEpochContext {
+                    expected_user_epoch_anchor_id: user_anchor,
+                },
+                &AnchorInfo {
+                    anchor_height: 0,
+                    anchor_timestamp: parent.timestamp,
+                    anchor_target: parent.difficulty_target,
+                },
+                &mut state,
+            )
+        }));
+        assert!(
+            caught.is_ok(),
+            "validation invoked a panic-only encoder path"
+        );
+        assert!(caught.unwrap().is_err());
+    }
 
-        let template = build_block_template(
+    #[test]
+    fn oversized_in_memory_block_fails_preflight_before_epoch_scan() {
+        let parent = header(8);
+        let mut transactions = Vec::with_capacity(noid_chain::BLOCK_MAX_TXS + 1);
+        transactions.push(coinbase(noid_chain::hash_block_header(&parent), 30));
+        transactions.extend((0..noid_chain::BLOCK_MAX_TXS).map(|_| user_tx([0xa1; 32], 1)));
+        let candidate = Block {
+            header: header(9),
+            transactions,
+        };
+        let mut state = ChainState::with_log_slots(6);
+        let error = accept_block_timeless_with_artifacts(
+            &candidate,
+            &[],
+            &[],
             &parent,
-            &state,
+            &[parent.timestamp],
             &[parent.active_slot_count],
-            vec![],
-            Address([0x55; 32]),
-            parent.timestamp + BLOCK_TIME,
-            GENESIS_TARGET,
+            &BlockTxEpochContext {
+                expected_user_epoch_anchor_id: [0xa2; 32],
+            },
+            &AnchorInfo {
+                anchor_height: 0,
+                anchor_timestamp: parent.timestamp,
+                anchor_target: parent.difficulty_target,
+            },
+            &mut state,
         )
-        .expect("coinbase-only template");
-        let mut block_with_user = Block {
-            header: template.clone().into_header(0),
-            transactions: template.all_txs(),
-        };
-        block_with_user
-            .transactions
-            .push(make_transaction(make_spend_body(1)));
-        let direct_err =
-            derive_coinbase_only_validation_artifacts(&block_with_user, &parent, &mismatched_state)
-                .expect_err("coinbase-only artifact derivation must reject user transactions");
+        .unwrap_err();
         assert!(matches!(
-            direct_err,
-            FullValidationError::Consensus(noid_chain::consensus::ConsensusError::ShapeMismatch(_))
+            error,
+            FullValidationError::Consensus(ConsensusError::TooManyTxs)
         ));
     }
 
-    fn make_spend_body(slot: u32) -> TxBody {
-        let secret = SpendSecret([0x7Au8; 32]);
-        let owner = derive_address(&secret);
-        TxBody {
-            shape: noid_tx::TxShape::Standard4x8,
-            epoch_anchor: [0x42; 32],
-            fee: 0,
-            inputs: vec![TxInput {
-                slot_index: slot,
-                value: 100,
-                creation_id: 0,
-                owner,
-                spend_secret: secret,
-                valid: true,
-            }],
-            outputs: vec![TxOutput {
-                slot_index: 10_000 + slot,
-                value: 100,
-                owner,
-                valid: true,
-            }],
-            is_coinbase: false,
-        }
-    }
-
-    fn auth_proof_for_body(body: &TxBody) -> AuthorizationProof {
-        use noid_gkr::{
-            owner_auth_gkr_channel, owner_auth_trace_inputs_from_body_and_secret,
-            prove_owner_auth_killshot, OwnerAuthCircuit,
+    #[test]
+    fn tier_255_resource_ledger_matches_fixed_tx8x2_budget() {
+        let parent = header(0);
+        let mut transactions = Vec::with_capacity(256);
+        transactions.push(coinbase(noid_chain::hash_block_header(&parent), 31));
+        transactions.extend((0..255).map(|_| user_tx([0x91; 32], 4)));
+        let block = Block {
+            header: header(1),
+            transactions,
         };
-        let spend_secret = &body
-            .inputs
-            .iter()
-            .find(|input| input.valid)
-            .expect("test body has a live input")
-            .spend_secret;
-        let auth_inputs = owner_auth_trace_inputs_from_body_and_secret(body, spend_secret)
-            .expect("owner auth inputs from test body");
-        let circuit = OwnerAuthCircuit::build(auth_inputs.layout);
-        let mut channel = owner_auth_gkr_channel();
-        prove_owner_auth_killshot(&circuit, &auth_inputs, &mut channel).0
+
+        assert_eq!(block_resource_counts(&block), (255, 1020, 511, 1531));
     }
 
     #[test]
-    fn authorization_batch_output_counts_verified_public_relation() {
-        let tx = make_transaction(make_spend_body(17));
-        let proof = auth_proof_for_body(&tx.body);
-        let transactions = vec![tx];
-        let block = Block {
-            header: {
-                let mut state = ChainState::with_log_slots(TEST_LOG_SLOTS);
-                BlockHeader {
-                    prev_block_hash: [0u8; 32],
-                    state_root: state.state_root(),
-                    tx_root: noid_chain::compute_tx_root(&transactions),
-                    timestamp: GENESIS_TIMESTAMP,
-                    height: 1,
-                    miner_address: Address([0u8; 32]),
-                    nonce: 0,
-                    difficulty_target: GENESIS_TARGET,
-                    log_slots: TEST_LOG_SLOTS as u32,
-                    active_slot_count: 0,
-                    alloc_counter: 0,
-                }
-            },
-            transactions,
-        };
-        let sidecar = BlockAuthSidecar {
-            tx_auth: vec![proof],
-        };
-
-        let out = validate_block_authorizations_with_output(
-            &block,
-            &sidecar,
-            &OwnerAuthAuthorizationVerifier,
-        )
-        .expect("authorization batch verifies");
-
-        assert_eq!(
-            out,
-            VerifiedAuthorizationBatch {
-                user_tx_count: 1,
-                owner_count_total: 1,
-                live_input_count_total: 1,
-            }
-        );
-    }
-
-    #[test]
-    #[cfg_attr(debug_assertions, ignore = "release-only max sidecar regression")]
-    fn max_255_authorization_sidecar_is_detached_and_fits_caps() {
-        let proof = auth_proof_for_body(&make_spend_body(1));
-        let mut transactions = Vec::with_capacity(noid_chain::block::BLOCK_MAX_TXS);
-        transactions.push(make_transaction(make_tx_body(0, true)));
-        for slot in 0..255u32 {
-            transactions.push(make_transaction(make_spend_body(1_000 + slot)));
-        }
-        assert_eq!(transactions.len(), noid_chain::block::BLOCK_MAX_TXS);
-
-        let block = Block {
-            header: {
-                let mut state = ChainState::with_log_slots(TEST_LOG_SLOTS);
-                BlockHeader {
-                    prev_block_hash: [0u8; 32],
-                    state_root: state.state_root(),
-                    tx_root: noid_chain::compute_tx_root(&transactions),
-                    timestamp: GENESIS_TIMESTAMP,
-                    height: 1,
-                    miner_address: Address([0u8; 32]),
-                    nonce: 0,
-                    difficulty_target: GENESIS_TARGET,
-                    log_slots: TEST_LOG_SLOTS as u32,
-                    active_slot_count: 0,
-                    alloc_counter: 0,
-                }
-            },
-            transactions,
-        };
-        let sidecar = BlockAuthSidecar {
-            tx_auth: vec![proof; 255],
-        };
-        let sidecar_bytes = bincode::serialize(&sidecar).expect("serialize sidecar");
-        assert!(sidecar_bytes.len() <= MAX_BLOCK_AUTH_SIDECAR_BYTES);
-        assert!(proof_sidecar_combined_len_ok(0, sidecar_bytes.len()));
-
-        validate_block_auth_sidecar_shape(&block, &sidecar).expect("max sidecar shape verifies");
-
-        let mut short = sidecar.clone();
-        short.tx_auth.pop();
+    fn block_slot_conflict_has_a_distinct_proof_boundary_error() {
         assert!(matches!(
-            validate_block_auth_sidecar_shape(&block, &short),
-            Err(crate::VerifyBlockError::AuthSidecarShapeMismatch)
+            map_state_delta_error(StateDeltaError::BlockSlotConflict {
+                tx_index: 3,
+                op_index: 7,
+            }),
+            VerifyBlockError::ExactStateSurfaceBlockSlotConflict {
+                tx_index: 3,
+                op_index: 7,
+            }
         ));
     }
 }

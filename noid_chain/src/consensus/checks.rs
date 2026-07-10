@@ -7,103 +7,31 @@
 //! Ordering: cheapest first to fail fast.
 //!
 //! Checks covered here:
-//!   1. tx_body_hash == hash(tx.body)   [SPEC §6 check 1 — native side]
-//!   2. epoch_anchor within window      [SPEC §6 check 2]
+//!   1. canonical fixed body semantics
+//!   2. structurally non-zero user anchor (exact equality is checked by the
+//!      chain context against the current transaction epoch)
 //!
 //! Cross-tx slot conflicts (checks 4-5 in SPEC §6) are handled by
 //! `validate_block_slot_conflicts()` in `validation.rs` since they require
 //! looking at the full transaction set.
 
 use crate::consensus::ConsensusError;
-use noid_tx::{hash_tx_body_for_shape, Transaction};
+use noid_tx::Transaction;
 
 /// Validate the per-tx consensus rules for a transaction.
 ///
 /// Checks (ordered cheapest first):
-/// 0. Fee fits in u64; coinbase fee == 0; coinbase output count == 1.
-/// 1. `tx.tx_body_hash == hash(tx.body)` — binding check
-///    (skip when called from `validate_block_consensus` because `apply_block`
-///    already verifies this, avoiding double Poseidon2b computation per tx).
-/// 2. `epoch_anchor` is non-zero for non-coinbase txs.
-///
-/// `check_body_hash = false` skips check 1, reducing Poseidon2b work by
-/// ~59 permutations per tx (used by `validate_block_consensus`).
+/// The transaction id is derived from the body and therefore has no second
+/// cached field whose binding could diverge.
 pub fn validate_tx_consensus(tx: &Transaction) -> Result<(), ConsensusError> {
-    validate_tx_consensus_inner(tx, true)
-}
-
-/// Same as `validate_tx_consensus` but skips the tx_body_hash recomputation.
-///
-/// Called by `validate_block_consensus` because `apply_block` already
-/// verifies tx_body_hash for every transaction in the block, making the
-/// recomputation here redundant.
-/// At 256 txs × 59-perm Poseidon2b, this saves ~15 ms per block application.
-#[inline]
-pub(crate) fn validate_tx_consensus_skip_hash(tx: &Transaction) -> Result<(), ConsensusError> {
-    validate_tx_consensus_inner(tx, false)
-}
-
-fn validate_tx_consensus_inner(
-    tx: &Transaction,
-    check_body_hash: bool,
-) -> Result<(), ConsensusError> {
-    // 0. Fee must fit in u64 (values are 64-bit in this protocol).
-    if tx.body.fee > u64::MAX as u128 {
-        return Err(ConsensusError::BadFee);
-    }
-
-    // 0a. Only shapes with complete wallet/mempool proof support are admitted.
-    if !tx.body.shape.proof_supported() {
-        return Err(ConsensusError::ShapeMismatch(format!(
-            "unsupported tx shape {:?}",
-            tx.body.shape
-        )));
-    }
-    if tx.body.inputs.len() > tx.body.shape.max_inputs() {
-        return Err(ConsensusError::ShapeMismatch(format!(
-            "inputs exceed {:?} max {}",
-            tx.body.shape,
-            tx.body.shape.max_inputs()
-        )));
-    }
-    if tx.body.outputs.len() > tx.body.shape.max_outputs() {
-        return Err(ConsensusError::ShapeMismatch(format!(
-            "outputs exceed {:?} max {}",
-            tx.body.shape,
-            tx.body.shape.max_outputs()
-        )));
-    }
-
-    // 0b. The SHARED body-semantics predicate (no hashing): dead-entry
-    // canonicality, one owner per transaction, balance, live-count
-    // bounds for user txs; zero fee / no live inputs / exactly one live
-    // output for the coinbase. Every consensus entrypoint calls this,
-    // so the sequential interpreter can never accept a body the
-    // proof-native path rejects.
+    // The shared predicate owns bitmap/dead-zero canonicality, one explicit
+    // input owner, balance, range, and exact coinbase shape.
     noid_tx::validate_body_semantics_no_hash(&tx.body)
         .map_err(|e| ConsensusError::ShapeMismatch(format!("body semantics: {e}")))?;
 
-    // 1. tx_body_hash binding (skipped when called from validate_block_consensus
-    //    because apply_block already verifies this for every tx in the block).
-    if check_body_hash {
-        let expected_hash = hash_tx_body_for_shape(
-            tx.body.shape,
-            &tx.body.epoch_anchor,
-            tx.body.fee,
-            &tx.body.inputs,
-            &tx.body.outputs,
-            tx.body.is_coinbase,
-        );
-        if tx.tx_body_hash != expected_hash {
-            return Err(ConsensusError::BadTxBodyHash);
-        }
-    }
-
     // 2. epoch_anchor: non-zero for non-coinbase (structural check).
-    //    The full cryptographic check (anchor hash ∈ known headers within window)
-    //    is done at mempool admission (`mempool_checks.rs`) and at full block
-    //    validation in `noid_block::validate_block_full()` where a HeaderProvider
-    //    is available.
+    //    Exact equality with the current transaction-epoch id is owned by
+    //    mempool admission and the chain context's direct block boundary.
     if !tx.body.is_coinbase && tx.body.epoch_anchor == [0u8; 32] {
         return Err(ConsensusError::BadEpochAnchor);
     }
@@ -111,31 +39,24 @@ fn validate_tx_consensus_inner(
     Ok(())
 }
 
-/// Check that no two transactions in a block attempt to consume the same input slot
-/// or mint to the same output slot (SPEC §16 invariants 4-5).
+/// Check that every live action in a block touches a distinct physical slot.
 ///
-/// Returns `Err(ConsensusError::SlotConflict)` on the first conflict found.
+/// Input/input, output/output, and input/output reuse all fail, including a
+/// spend followed by a mint in a later transaction of the same block.
 /// This is O(n × inputs) per block, bounded by the decoder transaction cap and
 /// the consensus semantic live-input budget.
 pub fn validate_block_slot_conflicts(txs: &[Transaction]) -> Result<(), ConsensusError> {
     use std::collections::HashSet;
-    let mut spent_inputs: HashSet<u32> = HashSet::new();
-    let mut minted_outputs: HashSet<u32> = HashSet::new();
+    let mut touched: HashSet<u32> = HashSet::new();
 
     for tx in txs {
-        for inp in &tx.body.inputs {
-            if !inp.valid {
-                continue;
-            }
-            if !spent_inputs.insert(inp.slot_index) {
+        for (_, inp) in tx.body.live_inputs() {
+            if !touched.insert(inp.slot_index) {
                 return Err(ConsensusError::SlotConflict);
             }
         }
-        for out in &tx.body.outputs {
-            if !out.valid {
-                continue;
-            }
-            if !minted_outputs.insert(out.slot_index) {
+        for (_, out) in tx.body.live_outputs() {
+            if !touched.insert(out.slot_index) {
                 return Err(ConsensusError::SlotConflict);
             }
         }
@@ -146,280 +67,82 @@ pub fn validate_block_slot_conflicts(txs: &[Transaction]) -> Result<(), Consensu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use noid_poseidon2b::primitives::{Address, SpendSecret, TxBodyHash};
-    use noid_tx::{hash_tx_body, hash_tx_body_for_shape, Transaction, TxBody, TxInput, TxOutput};
+    use noid_poseidon2b::primitives::Address;
+    use noid_tx::{
+        output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS,
+    };
 
-    fn dummy_output(slot: u32) -> TxOutput {
-        TxOutput {
-            slot_index: slot,
-            value: 100,
-            owner: Address([1u8; 32]),
-            valid: true,
-        }
-    }
-
-    fn dummy_input(slot: u32) -> TxInput {
-        TxInput {
-            slot_index: slot,
-            value: 100,
-            creation_id: 0,
-            owner: Address([1u8; 32]),
-            spend_secret: SpendSecret([0u8; 32]),
-            valid: true,
-        }
-    }
-
-    fn make_tx(inputs: Vec<TxInput>, outputs: Vec<TxOutput>, is_coinbase: bool) -> Transaction {
-        let body = TxBody {
-            shape: noid_tx::TxShape::Standard4x8,
-            epoch_anchor: if is_coinbase { [0u8; 32] } else { [1u8; 32] },
-            fee: 0,
+    fn user_tx(input_slot: u32, output_slot: u32, anchor: [u8; 32]) -> Transaction {
+        let mut inputs = [TxInput::dummy(); TX_INPUTS];
+        inputs[0] = TxInput {
+            slot_index: input_slot,
+            amount: 10,
+            creation_id: 1,
+        };
+        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        outputs[0] = TxOutput {
+            slot_index: output_slot,
+            amount: 9,
+            owner: Address([2u8; 32]),
+        };
+        Transaction::new(TxBody {
+            epoch_anchor: anchor,
+            fee: 1,
+            input_owner: Address([1u8; 32]),
             inputs,
             outputs,
-            is_coinbase,
-        };
-        let hash = hash_tx_body(
-            &body.epoch_anchor,
-            body.fee,
-            &body.inputs,
-            &body.outputs,
-            body.is_coinbase,
-        );
-        Transaction {
-            body,
-            tx_body_hash: hash,
-        }
-    }
-
-    #[test]
-    fn valid_tx_passes() {
-        let tx = make_tx(vec![dummy_input(9)], vec![dummy_output(1)], false);
-        assert!(validate_tx_consensus(&tx).is_ok());
-    }
-
-    #[test]
-    fn sweep_shape_is_consensus_admitted() {
-        let body = TxBody {
-            shape: noid_tx::TxShape::Sweep25x2,
-            epoch_anchor: [1u8; 32],
-            fee: 0,
-            inputs: (0..5).map(dummy_input).collect(),
-            outputs: vec![
-                dummy_output(1),
-                TxOutput {
-                    slot_index: 2,
-                    value: 400,
-                    owner: Address([1u8; 32]),
-                    valid: true,
-                },
-            ],
+            validity_bitmap: 1 | output_bitmap_bit(0),
             is_coinbase: false,
-        };
-        let tx_body_hash = hash_tx_body_for_shape(
-            body.shape,
-            &body.epoch_anchor,
-            body.fee,
-            &body.inputs,
-            &body.outputs,
-            body.is_coinbase,
-        );
-        let tx = Transaction { body, tx_body_hash };
+        })
+    }
+
+    #[test]
+    fn fixed_body_and_structural_anchor_validate() {
+        let tx = user_tx(1, 2, [3u8; 32]);
         assert_eq!(validate_tx_consensus(&tx), Ok(()));
-    }
 
-    #[test]
-    fn sweep_shape_limits_are_enforced() {
-        let body = TxBody {
-            shape: noid_tx::TxShape::Sweep25x2,
-            epoch_anchor: [1u8; 32],
-            fee: 0,
-            inputs: (0..26).map(dummy_input).collect(),
-            outputs: vec![dummy_output(1)],
-            is_coinbase: false,
-        };
-        let tx = Transaction {
-            body,
-            tx_body_hash: TxBodyHash([0u8; 32]),
-        };
-        assert!(matches!(
-            validate_tx_consensus(&tx),
-            Err(ConsensusError::ShapeMismatch(_))
-        ));
-    }
-
-    #[test]
-    fn wrong_body_hash_rejected() {
-        let mut tx = make_tx(vec![dummy_input(9)], vec![dummy_output(1)], false);
-        tx.tx_body_hash = TxBodyHash([0xAB; 32]); // tamper
+        let mut zero_anchor = tx.clone();
+        zero_anchor.body.epoch_anchor = [0u8; 32];
         assert_eq!(
-            validate_tx_consensus(&tx),
-            Err(ConsensusError::BadTxBodyHash)
-        );
-    }
-
-    #[test]
-    fn non_coinbase_zero_anchor_rejected() {
-        let mut tx = make_tx(vec![dummy_input(9)], vec![dummy_output(1)], false);
-        tx.body.epoch_anchor = [0u8; 32]; // zero anchor for non-coinbase
-                                          // Recompute hash to match tampered body
-        let hash = hash_tx_body(
-            &tx.body.epoch_anchor,
-            tx.body.fee,
-            &tx.body.inputs,
-            &tx.body.outputs,
-            tx.body.is_coinbase,
-        );
-        tx.tx_body_hash = hash;
-        assert_eq!(
-            validate_tx_consensus(&tx),
+            validate_tx_consensus(&zero_anchor),
             Err(ConsensusError::BadEpochAnchor)
         );
     }
 
     #[test]
-    fn coinbase_zero_anchor_allowed() {
-        let tx = make_tx(vec![], vec![dummy_output(1)], true); // is_coinbase=true, epoch_anchor=[0;32]
-        assert!(validate_tx_consensus(&tx).is_ok());
-    }
+    fn block_touched_set_rejects_every_reuse_direction() {
+        let a = user_tx(1, 2, [3u8; 32]);
 
-    #[test]
-    fn slot_conflict_input_detected() {
-        let tx1 = make_tx(vec![dummy_input(5)], vec![], false);
-        let tx2 = make_tx(vec![dummy_input(5)], vec![], false); // same input slot
+        let duplicate_input = user_tx(1, 3, [3u8; 32]);
         assert_eq!(
-            validate_block_slot_conflicts(&[tx1, tx2]),
+            validate_block_slot_conflicts(&[a.clone(), duplicate_input]),
+            Err(ConsensusError::SlotConflict)
+        );
+
+        let duplicate_output = user_tx(4, 2, [3u8; 32]);
+        assert_eq!(
+            validate_block_slot_conflicts(&[a.clone(), duplicate_output]),
+            Err(ConsensusError::SlotConflict)
+        );
+
+        let spend_then_mint = user_tx(4, 1, [3u8; 32]);
+        assert_eq!(
+            validate_block_slot_conflicts(&[a.clone(), spend_then_mint]),
+            Err(ConsensusError::SlotConflict)
+        );
+
+        let mint_then_spend = user_tx(2, 5, [3u8; 32]);
+        assert_eq!(
+            validate_block_slot_conflicts(&[a, mint_then_spend]),
             Err(ConsensusError::SlotConflict)
         );
     }
 
     #[test]
-    fn slot_conflict_output_detected() {
-        let tx1 = make_tx(vec![], vec![dummy_output(3)], false);
-        let tx2 = make_tx(vec![], vec![dummy_output(3)], false); // same output slot
+    fn disjoint_actions_pass() {
         assert_eq!(
-            validate_block_slot_conflicts(&[tx1, tx2]),
-            Err(ConsensusError::SlotConflict)
+            validate_block_slot_conflicts(&[user_tx(1, 2, [3u8; 32]), user_tx(3, 4, [3u8; 32]),]),
+            Ok(())
         );
-    }
-
-    #[test]
-    fn fee_overflow_rejected() {
-        // Build a tx with fee > u64::MAX
-        let body = TxBody {
-            shape: noid_tx::TxShape::Standard4x8,
-            epoch_anchor: [1u8; 32],
-            fee: u128::MAX, // way over u64::MAX
-            inputs: vec![],
-            outputs: vec![dummy_output(1)],
-            is_coinbase: false,
-        };
-        let hash_bytes = hash_tx_body(
-            &body.epoch_anchor,
-            body.fee,
-            &body.inputs,
-            &body.outputs,
-            body.is_coinbase,
-        );
-        let tx = Transaction {
-            body,
-            tx_body_hash: hash_bytes,
-        };
-        assert_eq!(validate_tx_consensus(&tx), Err(ConsensusError::BadFee));
-    }
-
-    #[test]
-    fn coinbase_must_have_exactly_one_output() {
-        // 0 outputs: rejected
-        let body_no_output = TxBody {
-            shape: noid_tx::TxShape::Standard4x8,
-            epoch_anchor: [0u8; 32],
-            fee: 0,
-            inputs: vec![],
-            outputs: vec![],
-            is_coinbase: true,
-        };
-        let h0 = hash_tx_body(
-            &body_no_output.epoch_anchor,
-            body_no_output.fee,
-            &body_no_output.inputs,
-            &body_no_output.outputs,
-            body_no_output.is_coinbase,
-        );
-        let tx0 = Transaction {
-            body: body_no_output,
-            tx_body_hash: h0,
-        };
-        assert!(
-            matches!(
-                validate_tx_consensus(&tx0),
-                Err(ConsensusError::ShapeMismatch(_))
-            ),
-            "coinbase with 0 outputs must be rejected"
-        );
-
-        // 2 outputs: rejected
-        let body_two = TxBody {
-            shape: noid_tx::TxShape::Standard4x8,
-            epoch_anchor: [0u8; 32],
-            fee: 0,
-            inputs: vec![],
-            outputs: vec![dummy_output(1), dummy_output(2)],
-            is_coinbase: true,
-        };
-        let h2 = hash_tx_body(
-            &body_two.epoch_anchor,
-            body_two.fee,
-            &body_two.inputs,
-            &body_two.outputs,
-            body_two.is_coinbase,
-        );
-        let tx2 = Transaction {
-            body: body_two,
-            tx_body_hash: h2,
-        };
-        assert!(
-            matches!(
-                validate_tx_consensus(&tx2),
-                Err(ConsensusError::ShapeMismatch(_))
-            ),
-            "coinbase with 2 outputs must be rejected"
-        );
-    }
-
-    #[test]
-    fn coinbase_nonzero_fee_rejected() {
-        let body = TxBody {
-            shape: noid_tx::TxShape::Standard4x8,
-            epoch_anchor: [0u8; 32],
-            fee: 1,
-            inputs: vec![],
-            outputs: vec![dummy_output(5)],
-            is_coinbase: true,
-        };
-        let h = hash_tx_body(
-            &body.epoch_anchor,
-            body.fee,
-            &body.inputs,
-            &body.outputs,
-            body.is_coinbase,
-        );
-        let tx = Transaction {
-            body,
-            tx_body_hash: h,
-        };
-        assert!(
-            matches!(
-                validate_tx_consensus(&tx),
-                Err(ConsensusError::ShapeMismatch(_))
-            ),
-            "coinbase with non-zero fee must be rejected (shared predicate)"
-        );
-    }
-
-    #[test]
-    fn no_conflict_passes() {
-        let tx1 = make_tx(vec![dummy_input(1)], vec![dummy_output(10)], false);
-        let tx2 = make_tx(vec![dummy_input(2)], vec![dummy_output(11)], false);
-        assert!(validate_block_slot_conflicts(&[tx1, tx2]).is_ok());
     }
 }

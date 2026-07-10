@@ -1285,7 +1285,7 @@ mod tests {
     const TS: usize = 4; // 16 slots, 1 segment
 
     // -----------------------------------------------------------------------
-    // Single-segment tests (backward compatible with FriState)
+    // Single-segment equivalence tests against the exact FriState core.
     // -----------------------------------------------------------------------
 
     #[test]

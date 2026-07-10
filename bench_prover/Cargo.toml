@@ -28,23 +28,11 @@ name = "block_scaling"
 harness = false
 
 [[bench]]
-name = "block_hotspots"
-harness = false
-
-[[bench]]
 name = "killshot_components"
 harness = false
 
 [[bench]]
 name = "poseidon_pow_mining"
-harness = false
-
-[[bench]]
-name = "o1_auth_accumulator_lite"
-harness = false
-
-[[bench]]
-name = "full_accepted_batch"
 harness = false
 
 [[bench]]
@@ -61,8 +49,4 @@ harness = false
 
 [[bench]]
 name = "self_verify_rows"
-harness = false
-
-[[bench]]
-name = "wallet_field_auth"
 harness = false

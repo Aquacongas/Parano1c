@@ -1557,7 +1557,7 @@ async fn handle_swarm_event(
                 }
 
                 let header_window = noid_chain::consensus::params::MEDIAN_TIME_BLOCKS as u64
-                    + noid_chain::consensus::params::ANCHOR_DEPTH;
+                    + noid_chain::consensus::params::TX_EPOCH_BLOCKS;
                 let start_height = snapshot_height.saturating_sub(header_window);
                 let mut recent_headers = Vec::new();
                 let mut headers_ok = true;
@@ -2075,7 +2075,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::assertions_on_constants)]
-    fn conservative_wire_caps_are_ordered_for_sweep_redesign() {
+    fn canonical_wire_caps_are_ordered() {
         assert!(MAX_BLOCK_PROOF_BYTES > INLINE_BLOCK_GOSSIP_THRESHOLD);
         assert!(MAX_BLOCK_AUTH_SIDECAR_BYTES > INLINE_BLOCK_GOSSIP_THRESHOLD);
         assert!(MAX_TX_INTENT_BYTES_GLOBAL < INLINE_BLOCK_GOSSIP_THRESHOLD);

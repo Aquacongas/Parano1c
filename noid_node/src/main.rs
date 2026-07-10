@@ -68,10 +68,10 @@ struct OrphanBlock {
 impl OrphanBlock {
     fn new(
         block: noid_chain::block::Block,
+        block_bytes_len: usize,
         block_proof_bytes: Vec<u8>,
         block_auth_sidecar_bytes: Vec<u8>,
     ) -> Self {
-        let block_bytes_len = block.to_bytes().len();
         Self {
             block,
             block_bytes_len,
@@ -281,13 +281,6 @@ fn seed_to_multiaddr(s: &str, default_port: u16) -> anyhow::Result<libp2p::Multi
 ///
 /// This conversion is purely internal — users never see multiaddrs.
 fn ip_port_to_multiaddr(addr: &str) -> anyhow::Result<libp2p::Multiaddr> {
-    // Already a multiaddr? Pass through for backward-compat.
-    if addr.starts_with('/') {
-        return addr
-            .parse()
-            .with_context(|| format!("parse multiaddr: {addr}"));
-    }
-
     // Parse HOST:PORT
     let (host, port_str) = addr.rsplit_once(':').with_context(|| {
         format!(
@@ -509,6 +502,13 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     let wallet = WalletHandle::new(shared_wallet.clone());
+    let wallet_operation_gate = Arc::new(tokio::sync::Mutex::new(()));
+    let wallet_submit = noid_rpc::WalletSubmitCoordinator::new(
+        Arc::clone(&chain),
+        mempool.clone(),
+        Arc::clone(&wallet),
+        Arc::clone(&wallet_operation_gate),
+    );
 
     // --- P2P Network ---
     let p2p_listen_str = cli.p2p_listen.unwrap_or_else(|| {
@@ -638,6 +638,7 @@ async fn main() -> anyhow::Result<()> {
         chain.clone(),
         mempool.clone(),
         wallet,
+        wallet_submit.clone(),
         p2p.cmd_tx.clone(),
         cli.mode == NodeMode::Extminer,
         mining_payout_address,
@@ -684,6 +685,24 @@ async fn main() -> anyhow::Result<()> {
                     .ok()
                     .and_then(|wallet| wallet.as_ref().map(|wallet| wallet.active_address()))
                     .unwrap_or(fallback_payout)
+            }));
+
+            let proactive = wallet_submit.clone();
+            miner.set_before_template_hook(std::sync::Arc::new(move || {
+                let proactive = proactive.clone();
+                Box::pin(async move {
+                    match proactive.submit_consolidation(noid_tx::TX_INPUTS, 0).await {
+                        Ok(Some(result)) => tracing::info!(
+                            txid = %result.chunks[0].txid,
+                            "proactive miner consolidation admitted before template"
+                        ),
+                        Ok(None) => {}
+                        Err(error) => tracing::warn!(
+                            %error,
+                            "proactive miner consolidation skipped"
+                        ),
+                    }
+                })
             }));
         }
 
@@ -909,7 +928,7 @@ fn persist_snapshot_header_batch(
     use noid_chain::consensus::header::validate_header_timeless;
     use noid_chain::consensus::params::{EXPANSION_WINDOW, MEDIAN_TIME_BLOCKS};
     use noid_chain::consensus::pow::{block_id, validate_pow};
-    use noid_chain::consensus::{add_work, block_work, epoch_anchor_height};
+    use noid_chain::consensus::{add_work, asert_anchor_height, block_work};
 
     if headers.is_empty() {
         return Err("snapshot header sync returned an empty batch".into());
@@ -1014,7 +1033,7 @@ fn persist_snapshot_header_batch(
                 prev_active_counts.push(header.active_slot_count);
             }
 
-            let anchor_height = epoch_anchor_height(parent_height);
+            let anchor_height = asert_anchor_height(parent_height);
             let anchor_header = store
                 .get_header(anchor_height)
                 .map_err(|e| format!("ASERT anchor read h={anchor_height}: {e}"))?
@@ -1200,7 +1219,7 @@ async fn preverified_authorization_bytes(
         .transactions
         .iter()
         .filter(|tx| !tx.body.is_coinbase)
-        .map(|tx| tx.tx_body_hash)
+        .map(|tx| tx.txid())
         .collect();
     if hashes.is_empty() {
         return std::collections::HashMap::new();
@@ -1246,11 +1265,15 @@ async fn apply_p2p_block_offthread(
              prev_timestamps,
              prev_active_counts,
              local_time,
+             tx_epoch_anchor_id,
              anchor,
-             pre_state,
+             _pre_state,
              state| {
                 let auth_verifier = noid_block::PreverifiedAuthorizationVerifier {
                     verified_proof_bytes: &preverified_auth,
+                };
+                let tx_epoch = noid_block::BlockTxEpochContext {
+                    expected_user_epoch_anchor_id: *tx_epoch_anchor_id,
                 };
                 let output = noid_block::accept_block_with_artifacts_with_auth_verifier(
                     block,
@@ -1260,8 +1283,8 @@ async fn apply_p2p_block_offthread(
                     prev_timestamps,
                     prev_active_counts,
                     local_time,
+                    &tx_epoch,
                     anchor,
-                    pre_state,
                     state,
                     &auth_verifier,
                 )?;
@@ -1418,9 +1441,13 @@ async fn apply_reorg_offthread(
                      prev_timestamps,
                      prev_active_counts,
                      local_time,
+                     tx_epoch_anchor_id,
                      anchor,
-                     pre_state,
+                     _pre_state,
                      state| {
+                        let tx_epoch = noid_block::BlockTxEpochContext {
+                            expected_user_epoch_anchor_id: *tx_epoch_anchor_id,
+                        };
                         let output = noid_block::accept_block_with_artifacts(
                             block,
                             proof_bytes,
@@ -1429,8 +1456,8 @@ async fn apply_reorg_offthread(
                             prev_timestamps,
                             prev_active_counts,
                             local_time,
+                            &tx_epoch,
                             anchor,
-                            pre_state,
                             state,
                         )?;
                         history_claim_bytes = Some(history_claim_fields_bytes(
@@ -1748,6 +1775,7 @@ mod tests {
                 &start_consensus,
                 &start_accumulator,
                 &h0,
+                noid_chain::hash_block_header(&h0),
                 &state,
                 &witness,
             )
@@ -2401,7 +2429,7 @@ async fn handle_p2p_events(
                                 let confirmed: Vec<_> = block
                                     .transactions
                                     .iter()
-                                    .map(|tx| tx.tx_body_hash)
+                                    .map(|tx| tx.txid())
                                     .collect();
                                 mempool.on_new_block(&confirmed, height, new_view).await;
                                 tracing::info!(height, "applied P2P block");
@@ -2475,7 +2503,7 @@ async fn handle_p2p_events(
                                             let conf: Vec<_> = orphan_block
                                                 .transactions
                                                 .iter()
-                                                .map(|tx| tx.tx_body_hash)
+                                                .map(|tx| tx.txid())
                                                 .collect();
                                             mempool.on_new_block(&conf, h, nv).await;
                                             if !orphan_proof_bytes.is_empty() {
@@ -2615,7 +2643,7 @@ async fn handle_p2p_events(
                                                             b.block
                                                                 .transactions
                                                                 .iter()
-                                                                .map(|tx| tx.tx_body_hash)
+                                                                .map(|tx| tx.txid())
                                                         })
                                                         .collect();
                                                     mempool
@@ -2691,6 +2719,7 @@ async fn handle_p2p_events(
                                                 &mut orphan_pool,
                                                 OrphanBlock::new(
                                                     block,
+                                                    block_bytes.len(),
                                                     block_proof_bytes.clone(),
                                                     block_auth_sidecar_bytes.clone(),
                                                 ),
@@ -2717,6 +2746,7 @@ async fn handle_p2p_events(
                                             &mut orphan_pool,
                                             OrphanBlock::new(
                                                 block,
+                                                block_bytes.len(),
                                                 block_proof_bytes.clone(),
                                                 block_auth_sidecar_bytes.clone(),
                                             ),
@@ -4064,12 +4094,7 @@ async fn replay_prefetched_snapshot_suffix(
                 item.block.header.height
             ));
         }
-        let confirmed: Vec<_> = item
-            .block
-            .transactions
-            .iter()
-            .map(|tx| tx.tx_body_hash)
-            .collect();
+        let confirmed: Vec<_> = item.block.transactions.iter().map(|tx| tx.txid()).collect();
         let preverified_auth = preverified_authorization_bytes(mempool, &item.block).await;
         let (_hash, view) = apply_p2p_block_offthread(
             chain,
@@ -4213,7 +4238,7 @@ fn recursive_consensus_state_at_height(
     store: &noid_chain::storage::MdbxStore,
     height: u64,
 ) -> Result<noid_recursive::RecursiveConsensusState, String> {
-    use noid_chain::consensus::header::epoch_anchor_height;
+    use noid_chain::consensus::header::asert_anchor_height;
     use noid_chain::consensus::params::{EXPANSION_WINDOW, MEDIAN_TIME_BLOCKS};
 
     let header = store
@@ -4245,7 +4270,7 @@ fn recursive_consensus_state_at_height(
         prev_active_counts.push(header.active_slot_count);
     }
 
-    let anchor_height = epoch_anchor_height(height);
+    let anchor_height = asert_anchor_height(height);
     let anchor_header = store
         .get_header(anchor_height)
         .map_err(|e| format!("read ASERT anchor header h={anchor_height}: {e}"))?

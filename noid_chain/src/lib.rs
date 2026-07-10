@@ -28,6 +28,7 @@ pub mod sparse_merkle;
 pub mod state;
 pub mod state_delta;
 pub mod storage;
+pub mod tx_tree;
 pub mod wire;
 
 // ---------------------------------------------------------------------------
@@ -63,9 +64,9 @@ pub use storage::{
 // ---------------------------------------------------------------------------
 
 pub use block::{
-    apply_genesis_block, compute_tx_root, validate_block_proof_binding, Block, BlockApplyError,
-    ProofBindingError, BLOCK_MAX_TXS, BLOCK_WIRE_HEADER_OFFSET, BLOCK_WIRE_NONCE_OFFSET,
-    BLOCK_WIRE_VERSION,
+    apply_genesis_block, canonical_block_wire_len, compute_tx_root, validate_block_proof_binding,
+    Block, BlockApplyError, ProofBindingError, BLOCK_MAX_TXS, BLOCK_WIRE_FIXED_OVERHEAD,
+    BLOCK_WIRE_HEADER_OFFSET, BLOCK_WIRE_MARKER, BLOCK_WIRE_NONCE_OFFSET,
 };
 pub use block_header::{block_id, hash_block_header, BlockHeader};
 pub use header_anchor::{

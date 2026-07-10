@@ -24,7 +24,7 @@ use std::sync::OnceLock;
 
 use noid_core::Block128;
 use noid_poseidon2b::primitives::{derive_address, SpendSecret};
-use noid_tx::{TxBody, TxInput, TxOutput, TxShape};
+use noid_tx::{output_bitmap_bit, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS};
 
 use crate::owner_auth::{owner_auth_public_from_body, OwnerAuthPublicInputs};
 use crate::wallet_authorization::{
@@ -38,35 +38,34 @@ pub fn ghost_spend_secret() -> SpendSecret {
     SpendSecret(*b"PARANOID-GHOST-TX-SPEND-SECRET.0")
 }
 
-/// The canonical ghost body: standard 4x8 shape, zero epoch anchor, zero
+/// The canonical ghost body: fixed Tx8x2, zero epoch anchor, zero
 /// fee, ONE live input of value 1 owned by the ghost address, ONE live
 /// output of value 1 back to the ghost address (balance holds), all other
 /// slots dummy. Passes `validate_public_tx_logic` by construction.
 pub fn ghost_tx_body() -> TxBody {
     let secret = ghost_spend_secret();
     let owner = derive_address(&secret);
-    let mut inputs = vec![TxInput::dummy(); noid_tx::MAX_INPUTS];
+    let mut inputs = [TxInput::dummy(); TX_INPUTS];
     inputs[0] = TxInput {
         slot_index: 0,
-        value: 1,
+        amount: 1,
         creation_id: 0,
-        owner,
-        spend_secret: secret,
-        valid: true,
     };
-    let mut outputs = vec![TxOutput::dummy(); noid_tx::MAX_OUTPUTS];
+    let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
     outputs[0] = TxOutput {
-        slot_index: 0,
-        value: 1,
+        // Distinct from the ghost input so the canonical public-logic
+        // no-overlap rule holds even before block-level ghost gating.
+        slot_index: 1,
+        amount: 1,
         owner,
-        valid: true,
     };
     TxBody {
-        shape: TxShape::Standard4x8,
         epoch_anchor: [0u8; 32],
         fee: 0,
+        input_owner: owner,
         inputs,
         outputs,
+        validity_bitmap: 1 | output_bitmap_bit(0),
         is_coinbase: false,
     }
 }
@@ -101,30 +100,18 @@ mod tests {
     use super::*;
     use noid_tx::validate_public_tx_logic;
 
-    /// GOLDEN: the ghost body's committed validity bitmap is 17 (one live
-    /// input at bit 0 + one live output at bit MAX_INPUTS=4) — NOT zero.
+    /// GOLDEN: the ghost body's committed validity bitmap is 257 (one live
+    /// input at bit 0 + one live output at bit 8) — NOT zero.
     /// The bitmap leaf therefore changed the ghost body hash when it
     /// landed; every ghost constant DERIVES from the body, so consumers
     /// stay consistent by construction, and this test pins the derivation
     /// so a silent bitmap-rule drift cannot change the ghost identity
     /// unnoticed.
     #[test]
-    fn ghost_body_bitmap_is_seventeen_and_hash_derives_from_it() {
+    fn ghost_body_bitmap_is_257_and_hash_derives_from_it() {
         let body = ghost_tx_body();
-        let bits = noid_tx::validity_bits_for_shape(body.shape, &body.inputs, &body.outputs);
-        assert_eq!(
-            bits,
-            1 | (1 << 4),
-            "ghost bitmap: live input 0 + live output 0"
-        );
-        let recomputed = noid_tx::hash_tx_body_for_shape(
-            body.shape,
-            &body.epoch_anchor,
-            body.fee,
-            &body.inputs,
-            &body.outputs,
-            body.is_coinbase,
-        );
+        assert_eq!(body.validity_bitmap, 257, "input 0 + output 0");
+        let recomputed = body.txid();
         assert_eq!(
             [recomputed.as_fields()[0], recomputed.as_fields()[1]],
             ghost_tx_body_hash(),

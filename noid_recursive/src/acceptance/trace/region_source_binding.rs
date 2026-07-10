@@ -59,16 +59,15 @@ use noid_core::hardware::flat_to_tower_u128;
 use noid_core::Block128;
 use noid_fri::Channel;
 use noid_fri_binius::capsule::{
-    absorb_capsule_commitment, capsule_leaf_hash, capsule_leaf_of_position,
-    capsule_tree_depth, CapsuleNodeHasher, CAPSULE_CAP_DEPTH,
-    CAPSULE_GRIND_BITS, CAPSULE_LEAF_SYMBOLS, CAPSULE_LOG_RATE, CAPSULE_NUM_QUERIES,
-    CAPSULE_RATE, CAPSULE_TAU, CAPSULE_WIDE_LOG,
+    absorb_capsule_commitment, capsule_leaf_hash, capsule_leaf_of_position, capsule_tree_depth,
+    CapsuleNodeHasher, CAPSULE_CAP_DEPTH, CAPSULE_GRIND_BITS, CAPSULE_LEAF_SYMBOLS,
+    CAPSULE_LOG_RATE, CAPSULE_NUM_QUERIES, CAPSULE_RATE, CAPSULE_TAU, CAPSULE_WIDE_LOG,
 };
 use noid_fri_binius::compact_fri::{
     expand_batched_merkle_proof, expand_batched_merkle_proof_to_cap, BatchedMerkleProof,
 };
 use noid_gkr::auth_pcs::AuthMleOpeningProof;
-use noid_gkr::owner_auth::{OwnerAuthProofKillShot, OwnerAuthPublicInputs};
+use noid_gkr::owner_auth::{OwnerAuthProofKillShot, OwnerAuthPublicInputs, OWNER_AUTH_NUM_VARS};
 use noid_poseidon2b::native::domain::{
     capacity_iv, DomainTag, TAG_EXSTNOD, TAG_FRICHANL, TAG_KSCHANNL,
 };
@@ -84,15 +83,13 @@ use noid_ivc_core::deep_chain::ff_merkle::{
     ff_merkle_substitution_terms, FfMerkleFamilyRefs, FfMerklePathFamily, FfMerklePathWitness,
 };
 use noid_ivc_core::deep_chain::leaf_hash::{
-    build_sponge_leaf_columns, slot_leaf_iv_flat, slot_leaf_pad_flat,
-    sponge_leaf_fixed_patterns, sponge_leaf_substitution_terms, SpongeLeafRefs,
-    SPONGE_LEAF_DIGEST_SLOT, SPONGE_LEAF_SLOTS,
+    build_sponge_leaf_columns, slot_leaf_iv_flat, slot_leaf_pad_flat, sponge_leaf_fixed_patterns,
+    sponge_leaf_substitution_terms, SpongeLeafRefs, SPONGE_LEAF_DIGEST_SLOT, SPONGE_LEAF_SLOTS,
 };
 use noid_ivc_core::deep_chain::relations::{
     claimed_refs, prove_column_relation, prove_shift_discharge, prove_shift_discharge_pow2,
-    verify_column_relation, verify_shift_discharge, verify_shift_discharge_pow2,
-    ColRef, ColumnRelationProof, FixedPattern, RelationColumns,
-    RelationTerm, ShiftDischargeProof,
+    verify_column_relation, verify_shift_discharge, verify_shift_discharge_pow2, ColRef,
+    ColumnRelationProof, FixedPattern, RelationColumns, RelationTerm, ShiftDischargeProof,
 };
 use noid_ivc_core::deep_chain::schedule::{
     build_duplex_columns, build_merkle_path_columns, carry_selection_terms, compile_duplex,
@@ -128,8 +125,7 @@ use super::deep_chain::{
 };
 use super::exact_state::ExactStateRegionData;
 use super::fri_pcs::{
-    compact_queries_from_squeezes_with_bits, forward_ntt_trace,
-    mle_evaluate_small_trace,
+    compact_queries_from_squeezes_with_bits, forward_ntt_trace, mle_evaluate_small_trace,
 };
 use super::owner_auth::{
     owner_boundary_constraints, owner_boundary_target, owner_boundary_w,
@@ -269,7 +265,11 @@ pub fn discharge_auth_pcs_obligations_via_region(
     spine: Option<&SpineRegionData>,
     oa_recording: Option<&RecordedChannel>,
 ) -> Vec<RegionPcsClaim> {
-    assert_eq!(obligations.len(), natives.len(), "one native proof per obligation");
+    assert_eq!(
+        obligations.len(),
+        natives.len(),
+        "one native proof per obligation"
+    );
     assert!(!obligations.is_empty(), "at least one obligation");
     // The K txs' families tile ONE walk A (source tree + leaves) + ONE walk B
     // (pair-leaf + merkle legs) + ONE walk C (FRICHANL channels) at common-period
@@ -286,8 +286,14 @@ pub fn discharge_auth_pcs_obligations_via_region(
     let log_n = natives[0].commitment.log_rows;
     assert_eq!(log_n, num_vars, "capsule commitment shape");
     assert!(num_vars > CAPSULE_TAU, "capsule column below the tau fold");
-    assert!(nq <= CAPSULE_NUM_QUERIES, "nq exceeds the channel's query draw");
-    assert!(nq.is_power_of_two(), "nq must be a power of two (tile alignment)");
+    assert!(
+        nq <= CAPSULE_NUM_QUERIES,
+        "nq exceeds the channel's query draw"
+    );
+    assert!(
+        nq.is_power_of_two(),
+        "nq must be a power of two (tile alignment)"
+    );
     let low_vars = num_vars - CAPSULE_TAU;
     let low_len = 1usize << low_vars;
     let mid_log = num_vars - CAPSULE_WIDE_LOG;
@@ -427,11 +433,11 @@ pub fn discharge_auth_pcs_obligations_via_region(
     // Accumulators filled by the per-tx loop, assembled after it.
     // ===================================================================
     let mut claims: Vec<Claim> = Vec::new(); // walk-A/B/C discharge openings (IO)
-    // Stage 2: per-cell reads/pins (grand pins, symbols, digests, fold-join) are
-    // R1CS constraints, NOT IO opening claims -- the columns are opened by the
-    // walk discharges (random point), so every cell is bound. Collected as
-    // (col, slot, wire) and resolved post-loop as pin_eq(wire, cell). Walk-A cols
-    // resolve against `slices`; walk-B (fold-join) against `slices[n_slices_a+col]`.
+                                             // Stage 2: per-cell reads/pins (grand pins, symbols, digests, fold-join) are
+                                             // R1CS constraints, NOT IO opening claims -- the columns are opened by the
+                                             // walk discharges (random point), so every cell is bound. Collected as
+                                             // (col, slot, wire) and resolved post-loop as pin_eq(wire, cell). Walk-A cols
+                                             // resolve against `slices`; walk-B (fold-join) against `slices[n_slices_a+col]`.
     let mut cell_pins_a: Vec<(usize, usize, LinExpr)> = Vec::new();
     let mut cell_pins_b: Vec<(usize, usize, LinExpr)> = Vec::new();
     // Walk-A tiling requires a power-of-two obligation count so the tiled tx
@@ -499,13 +505,25 @@ pub fn discharge_auth_pcs_obligations_via_region(
         // Shape checks (same contract as the native verifier).
         assert_eq!(native.commitment.log_rows, num_vars);
         assert_eq!(obligation.reduction.point.len(), num_vars);
-        assert_eq!(obligation.commitment_cap_lanes.len(), native.commitment.cap.hashes.len());
-        assert_eq!(obligation.commitment_cap_lanes.len(), 1usize << CAPSULE_CAP_DEPTH);
+        assert_eq!(
+            obligation.commitment_cap_lanes.len(),
+            native.commitment.cap.hashes.len()
+        );
+        assert_eq!(
+            obligation.commitment_cap_lanes.len(),
+            1usize << CAPSULE_CAP_DEPTH
+        );
         let opening = &native.opening;
         assert_eq!(opening.upper_partial_evals.len(), 1usize << CAPSULE_TAU);
         assert_eq!(opening.h_evals.len(), low_len);
-        assert_eq!(opening.source_symbols.len(), CAPSULE_NUM_QUERIES * CAPSULE_LEAF_SYMBOLS);
-        assert_eq!(opening.mid_symbols.len(), CAPSULE_NUM_QUERIES * CAPSULE_LEAF_SYMBOLS);
+        assert_eq!(
+            opening.source_symbols.len(),
+            CAPSULE_NUM_QUERIES * CAPSULE_LEAF_SYMBOLS
+        );
+        assert_eq!(
+            opening.mid_symbols.len(),
+            CAPSULE_NUM_QUERIES * CAPSULE_LEAF_SYMBOLS
+        );
 
         // Recover the NATIVE reduction point (tower) from the obligation wires.
         let point: Vec<Block128> = obligation
@@ -535,8 +553,11 @@ pub fn discharge_auth_pcs_obligations_via_region(
         // Challenges in schedule order: [beta x tau, grind, query x N].
         let schedule = capsule_pcs_channel_schedule(native, num_vars, &point);
         let dcols = build_duplex_columns(&chan_layout, iv_c, &schedule.data_flat, block_log_c);
-        let chal_w: Vec<LinExpr> =
-            dcols.challenges.iter().map(|&v| LinExpr::from_wire(b.alloc_f128(v))).collect();
+        let chal_w: Vec<LinExpr> = dcols
+            .challenges
+            .iter()
+            .map(|&v| LinExpr::from_wire(b.alloc_f128(v)))
+            .collect();
         assert_eq!(
             chal_w.len(),
             CAPSULE_TAU + 1 + CAPSULE_NUM_QUERIES,
@@ -567,9 +588,17 @@ pub fn discharge_auth_pcs_obligations_via_region(
             data_wires.push(w.clone());
         }
         data_wires.push(nonce_w.clone());
-        assert_eq!(data_wires.len(), schedule.data_flat.len(), "absorb data lane count");
+        assert_eq!(
+            data_wires.len(),
+            schedule.data_flat.len(),
+            "absorb data lane count"
+        );
         for (kk, w) in data_wires.iter().enumerate() {
-            assert_eq!(w.eval(b.values()), schedule.data_flat[kk], "absorb data wire {kk}");
+            assert_eq!(
+                w.eval(b.values()),
+                schedule.data_flat[kk],
+                "absorb data wire {kk}"
+            );
         }
         chan_data_streams.push(schedule.data_flat.clone());
         chan_chal_wires.push(chal_w);
@@ -638,12 +667,14 @@ pub fn discharge_auth_pcs_obligations_via_region(
             .collect();
         let source_leaf_hashes: Vec<[u8; 32]> = (0..CAPSULE_NUM_QUERIES)
             .map(|q| {
-                let syms =
-                    &opening.source_symbols[q * CAPSULE_LEAF_SYMBOLS..(q + 1) * CAPSULE_LEAF_SYMBOLS];
+                let syms = &opening.source_symbols
+                    [q * CAPSULE_LEAF_SYMBOLS..(q + 1) * CAPSULE_LEAF_SYMBOLS];
                 capsule_leaf_hash(num_vars, source_leaves_idx[q], syms)
             })
             .collect();
-        let src_batch = BatchedMerkleProof { siblings: opening.source_batch.siblings.clone() };
+        let src_batch = BatchedMerkleProof {
+            siblings: opening.source_batch.siblings.clone(),
+        };
         let src_paths = expand_batched_merkle_proof_to_cap(
             &src_batch,
             capsule_tree_depth(num_vars),
@@ -665,7 +696,9 @@ pub fn discharge_auth_pcs_obligations_via_region(
                 capsule_leaf_hash(mid_log, mid_leaves_idx[q], syms)
             })
             .collect();
-        let mid_batch = BatchedMerkleProof { siblings: opening.mid_batch.siblings.clone() };
+        let mid_batch = BatchedMerkleProof {
+            siblings: opening.mid_batch.siblings.clone(),
+        };
         let mid_paths = expand_batched_merkle_proof(
             &mid_batch,
             capsule_tree_depth(mid_log),
@@ -716,13 +749,23 @@ pub fn discharge_auth_pcs_obligations_via_region(
         // ---------------------------------------------------------------
         let depth_s = ff_depths[0];
         let depth_m = ff_depths[1];
-        let wide_hi: Vec<LinExpr> =
-            (0..CAPSULE_WIDE_LOG).map(|t| beta[CAPSULE_TAU - 1 - t].clone()).collect();
-        let wide_lo: Vec<LinExpr> =
-            (0..CAPSULE_WIDE_LOG).map(|t| beta[CAPSULE_WIDE_LOG - 1 - t].clone()).collect();
+        let wide_hi: Vec<LinExpr> = (0..CAPSULE_WIDE_LOG)
+            .map(|t| beta[CAPSULE_TAU - 1 - t].clone())
+            .collect();
+        let wide_lo: Vec<LinExpr> = (0..CAPSULE_WIDE_LOG)
+            .map(|t| beta[CAPSULE_WIDE_LOG - 1 - t].clone())
+            .collect();
         let cap_lanes: [Vec<LinExpr>; 2] = [
-            obligation.commitment_cap_lanes.iter().map(|l| l[0].clone()).collect(),
-            obligation.commitment_cap_lanes.iter().map(|l| l[1].clone()).collect(),
+            obligation
+                .commitment_cap_lanes
+                .iter()
+                .map(|l| l[0].clone())
+                .collect(),
+            obligation
+                .commitment_cap_lanes
+                .iter()
+                .map(|l| l[1].clone())
+                .collect(),
         ];
         let mut src_witnesses: Vec<FfMerklePathWitness> = Vec::with_capacity(nq);
         let mut mid_witnesses: Vec<FfMerklePathWitness> = Vec::with_capacity(nq);
@@ -749,9 +792,17 @@ pub fn discharge_auth_pcs_obligations_via_region(
             // linear in the transcript-bound bits).
             let src_tile = tx_off_a + leaf_base(0) + q * leaf_stride;
             let mid_tile = tx_off_a + leaf_base(1) + q * leaf_stride;
-            cell_pins_a.push((IN0, src_tile, LinExpr::constant(raw_flat_lane(num_vars as u128))));
+            cell_pins_a.push((
+                IN0,
+                src_tile,
+                LinExpr::constant(raw_flat_lane(num_vars as u128)),
+            ));
             cell_pins_a.push((IN0 + 1, src_tile, raw_lane_from_bits(&src_leaf_bits)));
-            cell_pins_a.push((IN0, mid_tile, LinExpr::constant(raw_flat_lane(mid_log as u128))));
+            cell_pins_a.push((
+                IN0,
+                mid_tile,
+                LinExpr::constant(raw_flat_lane(mid_log as u128)),
+            ));
             cell_pins_a.push((IN0 + 1, mid_tile, raw_lane_from_bits(&mid_leaf_bits)));
 
             // Symbol wires pinned into the tile IN cells (slots 1..=8).
@@ -809,7 +860,9 @@ pub fn discharge_auth_pcs_obligations_via_region(
             src_witnesses.push(FfMerklePathWitness {
                 entry: fam_digest_vals[0][q],
                 siblings: src_path.siblings.iter().map(lanes_raw).collect(),
-                directions: (0..depth_s).map(|kk| (source_leaves_idx[q] >> kk) & 1 == 1).collect(),
+                directions: (0..depth_s)
+                    .map(|kk| (source_leaves_idx[q] >> kk) & 1 == 1)
+                    .collect(),
             });
             for lane in 0..2 {
                 cell_pins_b.push((4 + lane, s_slot, src_entry[lane].clone()));
@@ -840,7 +893,9 @@ pub fn discharge_auth_pcs_obligations_via_region(
             mid_witnesses.push(FfMerklePathWitness {
                 entry: fam_digest_vals[1][q],
                 siblings: mid_path.siblings.iter().map(lanes_raw).collect(),
-                directions: (0..depth_m).map(|kk| (mid_leaves_idx[q] >> kk) & 1 == 1).collect(),
+                directions: (0..depth_m)
+                    .map(|kk| (mid_leaves_idx[q] >> kk) & 1 == 1)
+                    .collect(),
             });
             for lane in 0..2 {
                 cell_pins_b.push((4 + lane, m_slot, mid_entry[lane].clone()));
@@ -848,16 +903,29 @@ pub fn discharge_auth_pcs_obligations_via_region(
             for (kk, bit) in mid_leaf_bits.iter().enumerate().take(depth_m) {
                 cell_pins_b.push((8, m_slot + kk, bit.clone()));
             }
-            ff_root_pins.push((m_slot + depth_m - 1, [mid_root_w[0].clone(), mid_root_w[1].clone()]));
+            ff_root_pins.push((
+                m_slot + depth_m - 1,
+                [mid_root_w[0].clone(), mid_root_w[1].clone()],
+            ));
         }
 
         // Build + place the two ff legs' columns; assert the recomputed
         // roots equal the committed roots (native path-replay consistency).
         for (fam, wits) in [(0usize, &src_witnesses), (1usize, &mid_witnesses)] {
-            let family = FfMerklePathFamily { depth: ff_depths[fam], n_paths: nq };
+            let family = FfMerklePathFamily {
+                depth: ff_depths[fam],
+                n_paths: nq,
+            };
             let fam_wlog = (nq * ff_strides[fam]).trailing_zeros() as usize;
             let fcols = build_ff_merkle_path_columns(&family, iv_capsnode, wits, fam_wlog);
-            place_ff(&mut cb, &mut s0b, &mut soutb, &fcols, tx_off_b + ff_bases[fam], nq * ff_strides[fam]);
+            place_ff(
+                &mut cb,
+                &mut s0b,
+                &mut soutb,
+                &fcols,
+                tx_off_b + ff_bases[fam],
+                nq * ff_strides[fam],
+            );
             for q in 0..nq {
                 let committed = if fam == 0 {
                     lanes_raw(&native.commitment.cap.hashes[source_leaves_idx[q] >> depth_s])
@@ -890,13 +958,7 @@ pub fn discharge_auth_pcs_obligations_via_region(
             // --- Walk A: this block's sponge-leaf tiles (chunk + ghosts). ---
             let chunk: Vec<(F128, F128, F128)> = e.leaves[lo..hi]
                 .iter()
-                .map(|l| {
-                    (
-                        l.packed_value_flat,
-                        l.owner_hi_flat,
-                        l.owner_lo_flat,
-                    )
-                })
+                .map(|l| (l.packed_value_flat, l.owner_hi_flat, l.owner_lo_flat))
                 .collect();
             let tile_wlog = (es_leaf_cap * SPONGE_LEAF_SLOTS)
                 .next_power_of_two()
@@ -939,7 +1001,10 @@ pub fn discharge_auth_pcs_obligations_via_region(
             let state_paths: Vec<EsPathReal> = (lo..hi)
                 .map(|g| {
                     let path = &e.paths[g];
-                    assert_eq!(path.entry_leaf_index, g, "leaf↔path pairing is index-aligned");
+                    assert_eq!(
+                        path.entry_leaf_index, g,
+                        "leaf↔path pairing is index-aligned"
+                    );
                     assert_eq!(path.siblings.len(), e.d_state, "state path depth");
                     let leaf = &e.leaves[g];
                     let (root_w, root_flat) = if path.is_old {
@@ -973,14 +1038,13 @@ pub fn discharge_auth_pcs_obligations_via_region(
                 blk * per_tx_block_b + meta_bases[es_state_leg],
                 &state_paths,
             );
-
         }
     }
 
     // ===================================================================
     // Tx-root paths (block-level, chunked like the exact-state families):
     // one TAG_COMPRESS walk-B leg, entries = the spine tx-hash wires, every
-    // root = the header tx_root wires. The leaf POSITION is bound by
+    // root = the underlying universal-tree Merkle root M wires. The leaf POSITION is bound by
     // const-pinning the committed direction cells to the leaf-index bits
     // (block content never moves a tx to another slot), and the padding rim
     // by const-pinning the LAST real path's right-hand sibling cells to the
@@ -1092,14 +1156,12 @@ pub fn discharge_auth_pcs_obligations_via_region(
                 for j in 0..STATE_SIZE {
                     cols[C0 + j][tree_abs..tree_abs + SPINE_TREE_SLOTS]
                         .copy_from_slice(&icols.tree_c[j]);
-                    s0[j][tree_abs..tree_abs + SPINE_TREE_SLOTS]
-                        .copy_from_slice(&icols.tree_s0[j]);
+                    s0[j][tree_abs..tree_abs + SPINE_TREE_SLOTS].copy_from_slice(&icols.tree_s0[j]);
                     s_out[j][tree_abs..tree_abs + SPINE_TREE_SLOTS]
                         .copy_from_slice(&icols.tree_s_out[j]);
                     cols[C0 + j][tile_abs..tile_abs + SPINE_TILE_SLOTS]
                         .copy_from_slice(&icols.tile_c[j]);
-                    s0[j][tile_abs..tile_abs + SPINE_TILE_SLOTS]
-                        .copy_from_slice(&icols.tile_s0[j]);
+                    s0[j][tile_abs..tile_abs + SPINE_TILE_SLOTS].copy_from_slice(&icols.tile_s0[j]);
                     s_out[j][tile_abs..tile_abs + SPINE_TILE_SLOTS]
                         .copy_from_slice(&icols.tile_s_out[j]);
                 }
@@ -1154,8 +1216,7 @@ pub fn discharge_auth_pcs_obligations_via_region(
                         };
                     let kslot = tree_abs + SPINE_TREE_KID_LEAF_BASE + 2 + t;
                     for lane in 0..2 {
-                        let w =
-                            LinExpr::from_wire(b.alloc_f128(icols.chain_digests[t][lane]));
+                        let w = LinExpr::from_wire(b.alloc_f128(icols.chain_digests[t][lane]));
                         cell_pins_a.push((C0 + lane, dslot, w.clone()));
                         cell_pins_a.push((KID0 + lane, kslot, w));
                     }
@@ -1204,9 +1265,18 @@ pub fn discharge_auth_pcs_obligations_via_region(
     let mut wallet_leaf_refs: Vec<(SpongeLeafRefs, usize)> = Vec::with_capacity(n_leaf_families);
     for f in 0..n_leaf_families {
         let base = fixed.len();
-        fixed.push(common_period_ones(leaf_base(f), nq * leaf_stride, block_log_a));
+        fixed.push(common_period_ones(
+            leaf_base(f),
+            nq * leaf_stride,
+            block_log_a,
+        ));
         for pat in capsule_leaf_fixed_patterns(iv_capsleaf) {
-            fixed.push(common_period_pattern(&pat.table, leaf_base(f), nq, block_log_a));
+            fixed.push(common_period_pattern(
+                &pat.table,
+                leaf_base(f),
+                nq,
+                block_log_a,
+            ));
         }
         wallet_leaf_refs.push((
             SpongeLeafRefs {
@@ -1231,7 +1301,12 @@ pub fn discharge_auth_pcs_obligations_via_region(
             block_log_a,
         ));
         for pat in sponge_leaf_fixed_patterns(slot_leaf_iv_flat()) {
-            fixed.push(common_period_pattern(&pat.table, es_leaf_base, es_leaf_cap, block_log_a));
+            fixed.push(common_period_pattern(
+                &pat.table,
+                es_leaf_base,
+                es_leaf_cap,
+                block_log_a,
+            ));
         }
         (
             SpongeLeafRefs {
@@ -1251,10 +1326,20 @@ pub fn discharge_auth_pcs_obligations_via_region(
     let spine_refs: Option<(SourceTreeRefs, SpongeLeafRefs, usize)> = spine.map(|_| {
         let base = fixed.len();
         for pat in spine_tree_fixed_patterns() {
-            fixed.push(common_period_pattern(&pat.table, spine_tree_base, spine_cap, block_log_a));
+            fixed.push(common_period_pattern(
+                &pat.table,
+                spine_tree_base,
+                spine_cap,
+                block_log_a,
+            ));
         }
         for pat in spine_tile_fixed_patterns() {
-            fixed.push(common_period_pattern(&pat.table, spine_tile_base, spine_cap, block_log_a));
+            fixed.push(common_period_pattern(
+                &pat.table,
+                spine_tile_base,
+                spine_cap,
+                block_log_a,
+            ));
         }
         (
             SourceTreeRefs {
@@ -1296,21 +1381,36 @@ pub fn discharge_auth_pcs_obligations_via_region(
         spine_expo_c1.as_slice(),
     ];
     let native_u = run_union_native(
-        &committed, &s0, &s_out, &fixed, &meta_c, &wallet_leaf_refs, es_sponge.as_ref(),
+        &committed,
+        &s0,
+        &s_out,
+        &fixed,
+        &meta_c,
+        &wallet_leaf_refs,
+        es_sponge.as_ref(),
         spine_union_spec.as_ref(),
         spine_union_spec.as_ref().map(|_| &spine_expo_cols),
         w_log,
     );
-    let mut slices: Vec<WitnessSlice> =
-        cols.iter().map(|c| alloc_column_slice(b, c, w_log).0).collect();
+    let mut slices: Vec<WitnessSlice> = cols
+        .iter()
+        .map(|c| alloc_column_slice(b, c, w_log).0)
+        .collect();
     crate::acceptance::row_ledger_mark(b, &mut ledger, "plural: walk-A columns");
     // The walk-A discharge transcript is RECORDED (not replayed in-trace):
     // its absorb/squeeze chain rides walk C's region-2 blocks below, where
     // the challenge wires the twins consumed pin to walk-C carry cells.
     let mut ch_a = FsChannelUnionRecorder::new(DOMAIN);
     claims.extend(discharge_union(
-        b, &mut ch_a, &fixed, &meta_c, &wallet_leaf_refs, es_sponge.as_ref(),
-        spine_union_spec.as_ref(), w_log, &native_u,
+        b,
+        &mut ch_a,
+        &fixed,
+        &meta_c,
+        &wallet_leaf_refs,
+        es_sponge.as_ref(),
+        spine_union_spec.as_ref(),
+        w_log,
+        &native_u,
     ));
     let rec_a = ch_a.finish();
     crate::acceptance::row_ledger_mark(b, &mut ledger, "plural: walk-A twin");
@@ -1323,11 +1423,23 @@ pub fn discharge_auth_pcs_obligations_via_region(
     let mut ff_specs: Vec<FfLegSpec> = Vec::with_capacity(2);
     for f in 0..2 {
         let base = fixed_b.len();
-        let family = FfMerklePathFamily { depth: ff_depths[f], n_paths: nq };
+        let family = FfMerklePathFamily {
+            depth: ff_depths[f],
+            n_paths: nq,
+        };
         for pat in ff_merkle_fixed_patterns(&family, iv_capsnode) {
-            fixed_b.push(common_period_pattern(&pat.table, ff_bases[f], nq, block_log_b));
+            fixed_b.push(common_period_pattern(
+                &pat.table,
+                ff_bases[f],
+                nq,
+                block_log_b,
+            ));
         }
-        fixed_b.push(common_period_ones(ff_bases[f], nq * ff_strides[f], block_log_b));
+        fixed_b.push(common_period_ones(
+            ff_bases[f],
+            nq * ff_strides[f],
+            block_log_b,
+        ));
         ff_specs.push(FfLegSpec {
             refs: FfMerkleFamilyRefs {
                 cr: [4, 5],
@@ -1346,11 +1458,23 @@ pub fn discharge_auth_pcs_obligations_via_region(
     for f in 0..n_legs {
         let depth = leg_depths[f];
         let fixed_base = fixed_b.len();
-        let family = MerklePathFamily { depth, n_paths: leg_caps[f] };
+        let family = MerklePathFamily {
+            depth,
+            n_paths: leg_caps[f],
+        };
         for pat in merkle_fixed_patterns(&family, leg_ivs[f]) {
-            fixed_b.push(common_period_pattern(&pat.table, meta_bases[f], leg_caps[f], block_log_b));
+            fixed_b.push(common_period_pattern(
+                &pat.table,
+                meta_bases[f],
+                leg_caps[f],
+                block_log_b,
+            ));
         }
-        fixed_b.push(common_period_ones(meta_bases[f], family.n_slots(), block_log_b));
+        fixed_b.push(common_period_ones(
+            meta_bases[f],
+            family.n_slots(),
+            block_log_b,
+        ));
         legs.push(MerkleLeg {
             family,
             refs: union_merkle_refs(fixed_base),
@@ -1364,11 +1488,21 @@ pub fn discharge_auth_pcs_obligations_via_region(
     }
     let committed_b: Vec<&[F128]> = cb.iter().map(|c| c.as_slice()).collect();
     let native_b = run_merkle_union_native(
-        &committed_b, &s0b, &soutb, &fixed_b, &cb_c, &ff_specs, &legs, w_log_b, DOMAIN_B,
+        &committed_b,
+        &s0b,
+        &soutb,
+        &fixed_b,
+        &cb_c,
+        &ff_specs,
+        &legs,
+        w_log_b,
+        DOMAIN_B,
     );
     let n_slices_a = slices.len();
-    let slices_b: Vec<WitnessSlice> =
-        cb.iter().map(|c| alloc_column_slice(b, c, w_log_b).0).collect();
+    let slices_b: Vec<WitnessSlice> = cb
+        .iter()
+        .map(|c| alloc_column_slice(b, c, w_log_b).0)
+        .collect();
     crate::acceptance::row_ledger_mark(b, &mut ledger, "plural: walk-B columns");
     // Walk B's discharge transcript is recorded too (region-2 block).
     let mut ch_b = FsChannelUnionRecorder::new(DOMAIN_B);
@@ -1385,7 +1519,10 @@ pub fn discharge_auth_pcs_obligations_via_region(
     // The merkle discharge's per-cell pins (leg entries/roots) join the
     // walk-B cell pins (both index the walk-B slices).
     cell_pins_b.extend(wb_cell_pins);
-    assert!(all_expands_ok, "all real-sibling octopus expands returned non-empty paths");
+    assert!(
+        all_expands_ok,
+        "all real-sibling octopus expands returned non-empty paths"
+    );
 
     // Stage 2: resolve the per-cell reads/pins to R1CS constraints (pin_eq), NOT
     // link-IO opening claims. Each column is opened by its walk discharge (random
@@ -1441,8 +1578,11 @@ pub fn discharge_auth_pcs_obligations_via_region(
         build_duplex_union_with_recordings(&chan_layout, iv_c, &chan_data_streams, &rec_specs);
     let native_c = run_duplex_union_native(&u_c, DOMAIN_C);
     let n_slices_ab = slices.len();
-    let slices_c: Vec<WitnessSlice> =
-        u_c.committed.iter().map(|c| alloc_column_slice(b, c, u_c.w_log).0).collect();
+    let slices_c: Vec<WitnessSlice> = u_c
+        .committed
+        .iter()
+        .map(|c| alloc_column_slice(b, c, u_c.w_log).0)
+        .collect();
     crate::acceptance::row_ledger_mark(b, &mut ledger, "plural: walk-C columns");
     let mut ch_c = FsChannelTrace::new(b, DOMAIN_C);
     let mut wc_claims = discharge_duplex_union(b, &mut ch_c, &u_c, &native_c, 0);
@@ -1481,7 +1621,11 @@ pub fn discharge_auth_pcs_obligations_via_region(
             rec_layout.challenges.len(),
             "recording {r} challenge count"
         );
-        assert_eq!(rc.data_wires.len(), rec_layout.n_data, "recording {r} data count");
+        assert_eq!(
+            rc.data_wires.len(),
+            rec_layout.n_data,
+            "recording {r} data count"
+        );
         for (kk, &(slot, lane)) in rec_layout.challenges.iter().enumerate() {
             assert_eq!(
                 rc.challenge_wires[kk].eval(b.values()),
@@ -1614,7 +1758,11 @@ pub fn discharge_owner_auth_killshots_via_region(
     trace_inputs: &[OwnerAuthPublicInputsTrace],
     native_proofs: &[OwnerAuthProofKillShot],
     native_inputs: &[OwnerAuthPublicInputs],
-) -> (Vec<PendingAuthPcsObligation>, Vec<RegionPcsClaim>, RecordedChannel) {
+) -> (
+    Vec<PendingAuthPcsObligation>,
+    Vec<RegionPcsClaim>,
+    RecordedChannel,
+) {
     let k = trace_proofs.len();
     assert!(k >= 1, "at least one owner-auth killshot");
     assert_eq!(trace_inputs.len(), k, "one trace input per killshot");
@@ -1622,8 +1770,7 @@ pub fn discharge_owner_auth_killshots_via_region(
     assert_eq!(native_inputs.len(), k, "one native input per killshot");
 
     // Class-fixed channel layout — tx 0 defines it; every tx shares the class.
-    let layout0 = native_inputs[0].layout;
-    let num_vars = layout0.num_vars;
+    let num_vars = OWNER_AUTH_NUM_VARS;
     let chan_layout =
         compile_duplex(&owner_auth_channel_schedule(&native_proofs[0], &native_inputs[0]).ops);
     let chan_data_positions = duplex_data_positions(&chan_layout);
@@ -1645,7 +1792,7 @@ pub fn discharge_owner_auth_killshots_via_region(
         let native = &native_proofs[tx];
         let inputs_n = &native_inputs[tx];
         let layout = inputs_t.layout;
-        let nv = layout.num_vars;
+        let nv = OWNER_AUTH_NUM_VARS;
         assert_eq!(nv, num_vars, "class fixity: all txs share num_vars");
 
         // This tx's channel schedule + concrete duplex columns (native); the
@@ -1657,12 +1804,14 @@ pub fn discharge_owner_auth_killshots_via_region(
             "class fixity: absorb data count"
         );
         let dcols = build_duplex_columns(&chan_layout, iv_c, &schedule.data_flat, block_log_c);
-        let chal_w: Vec<LinExpr> =
-            dcols.challenges.iter().map(|&v| LinExpr::from_wire(b.alloc_f128(v))).collect();
+        let chal_w: Vec<LinExpr> = dcols
+            .challenges
+            .iter()
+            .map(|&v| LinExpr::from_wire(b.alloc_f128(v)))
+            .collect();
         // The boundary constraint count is the class parameter
         // `padded_slots · 4` (the schedule extractor draws the same count).
-        let lb_expected =
-            noid_gkr::batch_eval::rlc_levels(trace_inputs[tx].layout.padded_slots * 4);
+        let lb_expected = noid_gkr::batch_eval::rlc_levels(4);
         assert_eq!(
             chal_w.len(),
             5 * nv + 2 + lb_expected,
@@ -1711,8 +1860,7 @@ pub fn discharge_owner_auth_killshots_via_region(
         let mut r_double_prime: Vec<LinExpr> = Vec::with_capacity(nv);
         for round in 0..nv {
             let challenge = chal_w[2 * nv + 1 + round].clone();
-            expected =
-                proof_t.shift_round_polys[round].evaluate(b, &expected.clone(), &challenge);
+            expected = proof_t.shift_round_polys[round].evaluate(b, &expected.clone(), &challenge);
             r_double_prime.push(challenge);
         }
         r_double_prime.reverse();
@@ -1722,11 +1870,12 @@ pub fn discharge_owner_auth_killshots_via_region(
         pin_zero(b, &expected.add(&rhs));
 
         // ----- Boundary sumcheck: the RLC level draws + per-round folds
-        // from chal_w (rlc_levels(constraints) cells — 1 at every standard
+        // from chal_w (rlc_levels(constraints) cells — 1 at every transaction
         // class, 2 once a class exceeds 64 boundary constraints).
         let constraints = owner_boundary_constraints(b, inputs_t, layout);
         let lb = noid_gkr::batch_eval::rlc_levels(constraints.len());
-        let boundary_bases: Vec<LinExpr> = (0..lb).map(|j| chal_w[3 * nv + 1 + j].clone()).collect();
+        let boundary_bases: Vec<LinExpr> =
+            (0..lb).map(|j| chal_w[3 * nv + 1 + j].clone()).collect();
         let alphas = owner_rlc_weights(b, &boundary_bases, constraints.len());
         let target = owner_boundary_target(b, &constraints, &alphas);
         let mut expected = target;
@@ -1790,14 +1939,8 @@ pub fn discharge_owner_auth_killshots_via_region(
         // Step 0/1: owner public boundary.
         data_wires.push(inputs_t.tx_body_hash[0].clone());
         data_wires.push(inputs_t.tx_body_hash[1].clone());
-        for pair in inputs_t
-            .expected_address
-            .iter()
-            .take(inputs_t.layout.owner_count)
-        {
-            data_wires.push(pair[0].clone());
-            data_wires.push(pair[1].clone());
-        }
+        data_wires.push(inputs_t.expected_address[0].clone());
+        data_wires.push(inputs_t.expected_address[1].clone());
         // Step 2: auth MLE commitment cap hashes (2 lanes per 32-byte hash).
         for lane in &proof_t.commitment_cap_lanes {
             data_wires.push(lane[0].clone());
@@ -1859,8 +2002,11 @@ pub fn discharge_owner_auth_killshots_via_region(
     // ===================================================================
     let u_c = build_duplex_union(&chan_layout, iv_c, &chan_data_streams);
     let native_c = run_duplex_union_native(&u_c, OWNER_AUTH_DOMAIN_C);
-    let slices: Vec<WitnessSlice> =
-        u_c.committed.iter().map(|c| alloc_column_slice(b, c, u_c.w_log).0).collect();
+    let slices: Vec<WitnessSlice> = u_c
+        .committed
+        .iter()
+        .map(|c| alloc_column_slice(b, c, u_c.w_log).0)
+        .collect();
     // This walk-C′ discharge transcript is RECORDED: the wallet-PCS plural
     // hosts it as a region-2 block of ITS walk C (the recording's challenge
     // wires below pin to that walk's carry cells there).
@@ -2041,21 +2187,21 @@ fn phi(bl: Block128) -> F128 {
     flat_of_tower_u128(bl.0)
 }
 
-
-/// The tx-root region handoff: every user tx's body-hash Merkle path to the
-/// header `tx_root`, as ONE walk-B TAG_COMPRESS leg. Entries are the SPINE
-/// tx-hash wires (the leaf closure); the root is the header `tx_root` wire
-/// pair (the root closure); direction bits are the CONSTANT leaf-index bits
-/// and the last real path's right-hand siblings are the zero-subtree padding
-/// constants — both become const cell pins on the committed D/SIB cells.
+/// The tx-root region handoff: every transaction body-hash Merkle path to the
+/// underlying universal 256-leaf tree root `M`, as ONE walk-B TAG_COMPRESS
+/// leg. Entries are the SPINE tx-hash wires (the leaf closure); `root_w` is
+/// `M` (the root closure), not the header `tx_root`. The block slot separately
+/// binds `TAG_TXROOT(M, tx_count)` to the header. Direction bits are the
+/// CONSTANT leaf-index bits and the last real path's right-hand siblings are
+/// the zero-subtree padding constants — both become const cell pins on the
+/// committed D/SIB cells.
 pub struct TxRootRegionData {
-    /// The padded tx-tree depth (class data:
-    /// `1 << depth = n_txs.next_power_of_two().max(2)`).
+    /// Universal transaction-tree depth; fixed to `TX_TREE_DEPTH == 8`.
     pub depth: usize,
-    /// The header `tx_root` statement wires — every path's expected root.
+    /// Underlying universal-tree root `M` wires — every path's expected root.
     pub root_w: [LinExpr; 2],
     pub root_flat: [F128; 2],
-    /// One path per user tx, in tx order (path `j`'s leaf position is `j`).
+    /// One path per transaction, in tx order (path `j`'s leaf position is `j`).
     pub paths: Vec<TxRootPathRegion>,
     /// Zero-subtree digest lanes per level (`Z_0 = zero leaf`,
     /// `Z_{l+1} = compress(Z_l, Z_l)`) — the padding-rim constants.
@@ -2139,7 +2285,10 @@ fn fill_es_merkle_leg(
     region_base: usize,
     real: &[EsPathReal],
 ) {
-    assert!(real.len() <= cap, "es leg chunk exceeds the per-block capacity");
+    assert!(
+        real.len() <= cap,
+        "es leg chunk exceeds the per-block capacity"
+    );
     let stride = (2 * depth).next_power_of_two();
     let mut witnesses = Vec::with_capacity(cap);
     for p in real {
@@ -2158,7 +2307,10 @@ fn fill_es_merkle_leg(
             directions: vec![false; depth],
         });
     }
-    let family = MerklePathFamily { depth, n_paths: cap };
+    let family = MerklePathFamily {
+        depth,
+        n_paths: cap,
+    };
     let fam_wlog = (cap * stride).next_power_of_two().trailing_zeros() as usize;
     let mcols = build_merkle_path_columns(&family, iv_flat, &witnesses, fam_wlog);
     place_merkle(cb, s0b, soutb, &mcols, col_base, region_base, cap * stride);
@@ -2182,7 +2334,6 @@ fn fill_es_merkle_leg(
     acc_recomputed_roots.extend(mcols.roots.iter().copied());
 }
 
-
 pub(crate) fn alloc_column_slice(
     b: &mut FieldR1csBuilder,
     col: &[F128],
@@ -2193,7 +2344,10 @@ pub(crate) fn alloc_column_slice(
         b.alloc_f128(F128::ZERO);
     }
     let index = b.num_wires() / block;
-    let wires: Vec<LinExpr> = col.iter().map(|&v| LinExpr::from_wire(b.alloc_f128(v))).collect();
+    let wires: Vec<LinExpr> = col
+        .iter()
+        .map(|&v| LinExpr::from_wire(b.alloc_f128(v)))
+        .collect();
     for _ in col.len()..block {
         b.alloc_f128(F128::ZERO);
     }
@@ -2203,9 +2357,23 @@ pub(crate) fn alloc_column_slice(
 /// The boolean point selecting slot `s` in `w_log` coordinates.
 pub(crate) fn slot_point(s: usize, w_log: usize) -> (Vec<LinExpr>, Vec<F128>) {
     let lin = (0..w_log)
-        .map(|bb| LinExpr::constant(if (s >> bb) & 1 == 1 { F128::ONE } else { F128::ZERO }))
+        .map(|bb| {
+            LinExpr::constant(if (s >> bb) & 1 == 1 {
+                F128::ONE
+            } else {
+                F128::ZERO
+            })
+        })
         .collect();
-    let nat = (0..w_log).map(|bb| if (s >> bb) & 1 == 1 { F128::ONE } else { F128::ZERO }).collect();
+    let nat = (0..w_log)
+        .map(|bb| {
+            if (s >> bb) & 1 == 1 {
+                F128::ONE
+            } else {
+                F128::ZERO
+            }
+        })
+        .collect();
     (lin, nat)
 }
 
@@ -2339,7 +2507,11 @@ impl SpineUnionSpec {
     /// up to `block_log_a`.
     fn base_bits(&self) -> Vec<F128> {
         let start = self.local_log() + 1 + self.cap_log;
-        assert_eq!(self.tree_base % (1usize << start), 0, "spine tree base alignment");
+        assert_eq!(
+            self.tree_base % (1usize << start),
+            0,
+            "spine tree base alignment"
+        );
         let s = self.tree_base >> start;
         (start..self.block_log_a)
             .map(|bit| {
@@ -2450,7 +2622,11 @@ fn run_union_native(
     spine_expo_cols: Option<&[&[F128]; 4]>,
     w_log: usize,
 ) -> UnionNative {
-    assert_eq!(spine.is_some(), spine_expo_cols.is_some(), "spine expo columns");
+    assert_eq!(
+        spine.is_some(),
+        spine_expo_cols.is_some(),
+        "spine expo columns"
+    );
     let internal: Vec<&[F128]> = s_out.iter().map(|c| c.as_slice()).collect();
     let mut ch_p = FsLaneChallenger::new(DOMAIN);
     let mut ch_v = FsLaneChallenger::new(DOMAIN);
@@ -2465,14 +2641,28 @@ fn run_union_native(
         F128::ZERO,
         &rho,
         &sel_terms,
-        &RelationColumns { committed, internal: &internal, fixed },
+        &RelationColumns {
+            committed,
+            internal: &internal,
+            fixed,
+        },
         &mut ch_p,
     );
-    let sel_point =
-        verify_column_relation(w_log, F128::ZERO, &rho, &sel_terms, fixed, &sel_proof, &mut ch_v)
-            .expect("native selection");
+    let sel_point = verify_column_relation(
+        w_log,
+        F128::ZERO,
+        &rho,
+        &sel_terms,
+        fixed,
+        &sel_proof,
+        &mut ch_v,
+    )
+    .expect("native selection");
     let mut gv = [F128::ZERO; STATE_SIZE];
-    for (r, v) in claimed_refs(&sel_terms).iter().zip(sel_proof.final_values.iter()) {
+    for (r, v) in claimed_refs(&sel_terms)
+        .iter()
+        .zip(sel_proof.final_values.iter())
+    {
         match r {
             ColRef::Committed(c) => pending.push((*c, sel_point.clone(), *v)),
             ColRef::Internal(j) => gv[*j] = *v,
@@ -2480,9 +2670,13 @@ fn run_union_native(
         }
     }
 
-    let groups = vec![LaneClaimGroup { point: sel_point, values: gv }];
+    let groups = vec![LaneClaimGroup {
+        point: sel_point,
+        values: gv,
+    }];
     let (walk_proof, _) = prove_deep_chain_walk(s0, &groups, &mut ch_p);
-    let terminal = verify_deep_chain_walk(w_log, &groups, &walk_proof, &mut ch_v).expect("native walk");
+    let terminal =
+        verify_deep_chain_walk(w_log, &groups, &walk_proof, &mut ch_v).expect("native walk");
 
     let alpha = ch_p.sample_f128();
     assert_eq!(alpha, ch_v.sample_f128());
@@ -2497,19 +2691,34 @@ fn run_union_native(
         target,
         &terminal.point,
         &sub_terms,
-        &RelationColumns { committed, internal: &[], fixed },
+        &RelationColumns {
+            committed,
+            internal: &[],
+            fixed,
+        },
         &mut ch_p,
     );
-    let sub_point =
-        verify_column_relation(w_log, target, &terminal.point, &sub_terms, fixed, &sub_proof, &mut ch_v)
-            .expect("native substitution");
+    let sub_point = verify_column_relation(
+        w_log,
+        target,
+        &terminal.point,
+        &sub_terms,
+        fixed,
+        &sub_proof,
+        &mut ch_v,
+    )
+    .expect("native substitution");
     let mut shifts = Vec::new();
-    for (r, v) in claimed_refs(&sub_terms).iter().zip(sub_proof.final_values.iter()) {
+    for (r, v) in claimed_refs(&sub_terms)
+        .iter()
+        .zip(sub_proof.final_values.iter())
+    {
         match r {
             ColRef::Committed(c) => pending.push((*c, sub_point.clone(), *v)),
             ColRef::CommittedShift(c) => {
                 let (pr, _) = prove_shift_discharge(committed[*c], &sub_point, *v, &mut ch_p);
-                let pt = verify_shift_discharge(w_log, &sub_point, *v, &pr, &mut ch_v).expect("shift");
+                let pt =
+                    verify_shift_discharge(w_log, &sub_point, *v, &pr, &mut ch_v).expect("shift");
                 pending.push((*c, pt, pr.final_value));
                 shifts.push((0usize, *c, pr));
             }
@@ -2551,7 +2760,11 @@ fn run_union_native(
             F128::ZERO,
             &rho_e,
             &expo_terms,
-            &RelationColumns { committed: se_cols, internal: &[], fixed: &expo_fixed },
+            &RelationColumns {
+                committed: se_cols,
+                internal: &[],
+                fixed: &expo_fixed,
+            },
             &mut ch_p,
         );
         let expo_point = verify_column_relation(
@@ -2564,7 +2777,10 @@ fn run_union_native(
             &mut ch_v,
         )
         .expect("native spine tiled exposure");
-        for (r, v) in claimed_refs(&expo_terms).iter().zip(proof.final_values.iter()) {
+        for (r, v) in claimed_refs(&expo_terms)
+            .iter()
+            .zip(proof.final_values.iter())
+        {
             match r {
                 ColRef::Committed(ll) => {
                     spine_expo_pending.push((sp.kid_meta[*ll], sp.repoint_kid(&expo_point), *v));
@@ -2603,14 +2819,23 @@ fn tree_trace_terms(m: &[LinExpr], st_refs: &SourceTreeRefs, terms: &mut Vec<Rel
             vec![ColRef::Fixed(st_refs.odd_int), c_sh],
             vec![ColRef::Fixed(st_refs.leafodd), code],
         ] {
-            terms.push(RelationTermTrace { coeff: m[i].clone(), factors });
+            terms.push(RelationTermTrace {
+                coeff: m[i].clone(),
+                factors,
+            });
         }
     }
     for j in 2..STATE_SIZE {
-        terms.push(RelationTermTrace { coeff: m[j].clone(), factors: vec![ColRef::Fixed(st_refs.iv[j - 2])] });
         terms.push(RelationTermTrace {
             coeff: m[j].clone(),
-            factors: vec![ColRef::Fixed(st_refs.odd_int), ColRef::CommittedShift(st_refs.c[j])],
+            factors: vec![ColRef::Fixed(st_refs.iv[j - 2])],
+        });
+        terms.push(RelationTermTrace {
+            coeff: m[j].clone(),
+            factors: vec![
+                ColRef::Fixed(st_refs.odd_int),
+                ColRef::CommittedShift(st_refs.c[j]),
+            ],
         });
     }
 }
@@ -2697,12 +2922,19 @@ fn discharge_union(
     let mut sel_terms: Vec<RelationTermTrace> = Vec::new();
     for j in 0..STATE_SIZE {
         bp = mul(b, &bp, &beta);
-        sel_terms.push(RelationTermTrace { coeff: bp.clone(), factors: vec![ColRef::Committed(meta_c[j])] });
-        sel_terms.push(RelationTermTrace { coeff: bp.clone(), factors: vec![ColRef::Internal(j)] });
+        sel_terms.push(RelationTermTrace {
+            coeff: bp.clone(),
+            factors: vec![ColRef::Committed(meta_c[j])],
+        });
+        sel_terms.push(RelationTermTrace {
+            coeff: bp.clone(),
+            factors: vec![ColRef::Internal(j)],
+        });
     }
     let rho = ch.sample_f128_vec(b, w_log);
     let sel_e = ColumnRelationProofTrace::alloc(b, &native.sel_proof, w_log, 2 * STATE_SIZE);
-    let sel_point = verify_column_relation_trace(b, &mut ch, w_log, &zero, &rho, &sel_terms, fixed, &sel_e);
+    let sel_point =
+        verify_column_relation_trace(b, &mut ch, w_log, &zero, &rho, &sel_terms, fixed, &sel_e);
     let sel_claimed = claimed_refs(&carry_selection_terms(meta_c, F128::ONE));
     let mut gv: [LinExpr; STATE_SIZE] = std::array::from_fn(|_| LinExpr::zero());
     for (r, v) in sel_claimed.iter().zip(sel_e.final_values.iter()) {
@@ -2710,14 +2942,23 @@ fn discharge_union(
             ColRef::Committed(_) => {
                 let (col, npt, nval) = &np[cur];
                 cur += 1;
-                out.push(Claim { slice: *col, point: sel_point.clone(), value: v.clone(), native_point: npt.clone(), native_value: *nval });
+                out.push(Claim {
+                    slice: *col,
+                    point: sel_point.clone(),
+                    value: v.clone(),
+                    native_point: npt.clone(),
+                    native_value: *nval,
+                });
             }
             ColRef::Internal(j) => gv[*j] = v.clone(),
             _ => unreachable!(),
         }
     }
 
-    let groups_e = vec![LaneClaimGroupTrace { point: sel_point, values: gv }];
+    let groups_e = vec![LaneClaimGroupTrace {
+        point: sel_point,
+        values: gv,
+    }];
     let walk_e = DeepChainWalkProofTrace::alloc(b, &native.walk_proof, w_log);
     let terminal = verify_deep_chain_walk_trace(b, &mut ch, w_log, &groups_e, &walk_e);
 
@@ -2729,24 +2970,54 @@ fn discharge_union(
     for e in 0..STATE_SIZE {
         target = target.add(&mul(b, &ap[e], &terminal.values[e]));
     }
-    let sub_e = ColumnRelationProofTrace::alloc(b, &native.sub_proof, w_log, claimed_refs(&ref_terms).len());
-    let sub_point = verify_column_relation_trace(b, &mut ch, w_log, &target, &terminal.point, &sub_terms, fixed, &sub_e);
+    let sub_e = ColumnRelationProofTrace::alloc(
+        b,
+        &native.sub_proof,
+        w_log,
+        claimed_refs(&ref_terms).len(),
+    );
+    let sub_point = verify_column_relation_trace(
+        b,
+        &mut ch,
+        w_log,
+        &target,
+        &terminal.point,
+        &sub_terms,
+        fixed,
+        &sub_e,
+    );
     let mut shift_cursor = 0usize;
-    for (r, v) in claimed_refs(&ref_terms).iter().zip(sub_e.final_values.iter()) {
+    for (r, v) in claimed_refs(&ref_terms)
+        .iter()
+        .zip(sub_e.final_values.iter())
+    {
         match r {
             ColRef::Committed(_) => {
                 let (col, npt, nval) = &np[cur];
                 cur += 1;
-                out.push(Claim { slice: *col, point: sub_point.clone(), value: v.clone(), native_point: npt.clone(), native_value: *nval });
+                out.push(Claim {
+                    slice: *col,
+                    point: sub_point.clone(),
+                    value: v.clone(),
+                    native_point: npt.clone(),
+                    native_value: *nval,
+                });
             }
             ColRef::CommittedShift(_) | ColRef::CommittedShift2(_) => {
                 let (shift_log, _col, ns) = &native.shifts[shift_cursor];
                 shift_cursor += 1;
                 let se = ShiftDischargeProofTrace::alloc(b, ns, w_log);
-                let pt = verify_shift_discharge_trace(b, &mut ch, w_log, &sub_point, v, *shift_log, &se);
+                let pt =
+                    verify_shift_discharge_trace(b, &mut ch, w_log, &sub_point, v, *shift_log, &se);
                 let (col, npt, nval) = &np[cur];
                 cur += 1;
-                out.push(Claim { slice: *col, point: pt, value: se.final_value.clone(), native_point: npt.clone(), native_value: *nval });
+                out.push(Claim {
+                    slice: *col,
+                    point: pt,
+                    value: se.final_value.clone(),
+                    native_point: npt.clone(),
+                    native_value: *nval,
+                });
             }
             _ => unreachable!(),
         }
@@ -2776,7 +3047,11 @@ fn discharge_union(
                 coeff: gp.clone(),
                 factors: vec![
                     ColRef::Fixed(0),
-                    ColRef::Window { col: 2 + i, stride_log: 1, offset: 1 },
+                    ColRef::Window {
+                        col: 2 + i,
+                        stride_log: 1,
+                        offset: 1,
+                    },
                 ],
             });
         }
@@ -2803,7 +3078,10 @@ fn discharge_union(
         let (rho_i, rho_tx) = rest.split_at(sp.cap_log);
         let base_bits = sp.base_bits();
         let mut ec2 = 0usize;
-        for (r, v) in claimed_refs(&expo_ref).iter().zip(expo_e.final_values.iter()) {
+        for (r, v) in claimed_refs(&expo_ref)
+            .iter()
+            .zip(expo_e.final_values.iter())
+        {
             let (col, npt, nval) = &native.spine_expo_pending[ec2];
             ec2 += 1;
             let mut pt: Vec<LinExpr> = match r {
@@ -2832,7 +3110,11 @@ fn discharge_union(
                 native_value: *nval,
             });
         }
-        assert_eq!(ec2, native.spine_expo_pending.len(), "spine exposure pending lockstep");
+        assert_eq!(
+            ec2,
+            native.spine_expo_pending.len(),
+            "spine exposure pending lockstep"
+        );
     }
     out
 }
@@ -2933,7 +3215,10 @@ fn union_zero_terms_trace(
                 vec![nodens, d_sh, cr_sh],
                 vec![nodens, d_sh, sib_sh],
             ] {
-                t.push(RelationTermTrace { coeff: w.clone(), factors });
+                t.push(RelationTermTrace {
+                    coeff: w.clone(),
+                    factors,
+                });
             }
         }
     }
@@ -2988,7 +3273,10 @@ fn union_sub_terms_trace(
         for j in 0..STATE_SIZE {
             terms.push(RelationTermTrace {
                 coeff: m[j].clone(),
-                factors: vec![ColRef::Fixed(spec.region), ColRef::CommittedShift(refs.c[j])],
+                factors: vec![
+                    ColRef::Fixed(spec.region),
+                    ColRef::CommittedShift(refs.c[j]),
+                ],
             });
         }
         let node = ColRef::Fixed(refs.node);
@@ -3003,7 +3291,10 @@ fn union_sub_terms_trace(
                 vec![node, d, cr],
                 vec![node, d, sib],
             ] {
-                terms.push(RelationTermTrace { coeff: m[i].clone(), factors });
+                terms.push(RelationTermTrace {
+                    coeff: m[i].clone(),
+                    factors,
+                });
             }
             let j = 2 + i;
             let c_sh_j = ColRef::CommittedShift(refs.c[j]);
@@ -3014,7 +3305,10 @@ fn union_sub_terms_trace(
                 vec![node, d, sib],
                 vec![ColRef::Fixed(refs.iv[i])],
             ] {
-                terms.push(RelationTermTrace { coeff: m[j].clone(), factors });
+                terms.push(RelationTermTrace {
+                    coeff: m[j].clone(),
+                    factors,
+                });
             }
         }
     }
@@ -3042,12 +3336,18 @@ fn union_sub_terms_trace(
                 vec![ColRef::Fixed(refs.oddns), d_sh, c_sh2],
                 vec![ColRef::Fixed(refs.oddstart), d_sh, e_sh],
             ] {
-                terms.push(RelationTermTrace { coeff: m[i].clone(), factors });
+                terms.push(RelationTermTrace {
+                    coeff: m[i].clone(),
+                    factors,
+                });
             }
         }
         for j in 2..STATE_SIZE {
             let c_sh = ColRef::CommittedShift(refs.c[j]);
-            terms.push(RelationTermTrace { coeff: m[j].clone(), factors: vec![region, c_sh] });
+            terms.push(RelationTermTrace {
+                coeff: m[j].clone(),
+                factors: vec![region, c_sh],
+            });
             terms.push(RelationTermTrace {
                 coeff: m[j].clone(),
                 factors: vec![ColRef::Fixed(refs.even), c_sh],
@@ -3120,7 +3420,8 @@ fn native_claim_pass(
             }
             ColRef::CommittedShift2(c) => {
                 let (pr, _) = prove_shift_discharge_pow2(committed[*c], point, *v, 1, ch_p);
-                let pt = verify_shift_discharge_pow2(w_log, point, *v, 1, &pr, ch_v).expect("shift2");
+                let pt =
+                    verify_shift_discharge_pow2(w_log, point, *v, 1, &pr, ch_v).expect("shift2");
                 pending.push((*c, pt, pr.final_value));
                 shifts.push((1usize, *c, pr));
             }
@@ -3158,15 +3459,33 @@ pub(crate) fn run_merkle_union_native(
         F128::ZERO,
         &rho_b,
         &zero_terms,
-        &RelationColumns { committed, internal: &[], fixed },
+        &RelationColumns {
+            committed,
+            internal: &[],
+            fixed,
+        },
         &mut ch_p,
     );
-    let zero_point =
-        verify_column_relation(w_log, F128::ZERO, &rho_b, &zero_terms, fixed, &zero_proof, &mut ch_v)
-            .expect("native merkle-union zero-check");
+    let zero_point = verify_column_relation(
+        w_log,
+        F128::ZERO,
+        &rho_b,
+        &zero_terms,
+        fixed,
+        &zero_proof,
+        &mut ch_v,
+    )
+    .expect("native merkle-union zero-check");
     native_claim_pass(
-        committed, w_log, &claimed_refs(&zero_terms), &zero_proof.final_values, &zero_point,
-        &mut ch_p, &mut ch_v, &mut pending, &mut zero_shifts,
+        committed,
+        w_log,
+        &claimed_refs(&zero_terms),
+        &zero_proof.final_values,
+        &zero_point,
+        &mut ch_p,
+        &mut ch_v,
+        &mut pending,
+        &mut zero_shifts,
     );
 
     let beta = ch_p.sample_f128();
@@ -3178,20 +3497,41 @@ pub(crate) fn run_merkle_union_native(
         F128::ZERO,
         &rho,
         &sel_terms,
-        &RelationColumns { committed, internal: &internal, fixed },
+        &RelationColumns {
+            committed,
+            internal: &internal,
+            fixed,
+        },
         &mut ch_p,
     );
-    let sel_point =
-        verify_column_relation(w_log, F128::ZERO, &rho, &sel_terms, fixed, &sel_proof, &mut ch_v)
-            .expect("native merkle-union selection");
+    let sel_point = verify_column_relation(
+        w_log,
+        F128::ZERO,
+        &rho,
+        &sel_terms,
+        fixed,
+        &sel_proof,
+        &mut ch_v,
+    )
+    .expect("native merkle-union selection");
     let mut sel_shifts = Vec::new();
     let gv = native_claim_pass(
-        committed, w_log, &claimed_refs(&sel_terms), &sel_proof.final_values, &sel_point,
-        &mut ch_p, &mut ch_v, &mut pending, &mut sel_shifts,
+        committed,
+        w_log,
+        &claimed_refs(&sel_terms),
+        &sel_proof.final_values,
+        &sel_point,
+        &mut ch_p,
+        &mut ch_v,
+        &mut pending,
+        &mut sel_shifts,
     );
     assert!(sel_shifts.is_empty(), "carry selection claims no shifts");
 
-    let groups = vec![LaneClaimGroup { point: sel_point, values: gv }];
+    let groups = vec![LaneClaimGroup {
+        point: sel_point,
+        values: gv,
+    }];
     let (walk_proof, _) = prove_deep_chain_walk(s0, &groups, &mut ch_p);
     let terminal =
         verify_deep_chain_walk(w_log, &groups, &walk_proof, &mut ch_v).expect("native merkle walk");
@@ -3209,7 +3549,11 @@ pub(crate) fn run_merkle_union_native(
         target,
         &terminal.point,
         &sub_terms,
-        &RelationColumns { committed, internal: &[], fixed },
+        &RelationColumns {
+            committed,
+            internal: &[],
+            fixed,
+        },
         &mut ch_p,
     );
     let sub_point = verify_column_relation(
@@ -3224,11 +3568,30 @@ pub(crate) fn run_merkle_union_native(
     .expect("native merkle-union substitution");
     let mut shifts = Vec::new();
     native_claim_pass(
-        committed, w_log, &claimed_refs(&sub_terms), &sub_proof.final_values, &sub_point,
-        &mut ch_p, &mut ch_v, &mut pending, &mut shifts,
+        committed,
+        w_log,
+        &claimed_refs(&sub_terms),
+        &sub_proof.final_values,
+        &sub_point,
+        &mut ch_p,
+        &mut ch_v,
+        &mut pending,
+        &mut shifts,
     );
-    assert_eq!(ch_p.sample_f128(), ch_v.sample_f128(), "native merkle-union lockstep");
-    MerkleUnionNative { zero_proof, zero_shifts, sel_proof, walk_proof, sub_proof, shifts, pending }
+    assert_eq!(
+        ch_p.sample_f128(),
+        ch_v.sample_f128(),
+        "native merkle-union lockstep"
+    );
+    MerkleUnionNative {
+        zero_proof,
+        zero_shifts,
+        sel_proof,
+        walk_proof,
+        sub_proof,
+        shifts,
+        pending,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3273,8 +3636,9 @@ pub(crate) fn discharge_merkle_union(
                         let (shift_log, _col, ns) = &$shifts[$shift_cursor];
                         $shift_cursor += 1;
                         let se = ShiftDischargeProofTrace::alloc(b, ns, w_log);
-                        let pt =
-                            verify_shift_discharge_trace(b, &mut ch, w_log, &$point, v, *shift_log, &se);
+                        let pt = verify_shift_discharge_trace(
+                            b, &mut ch, w_log, &$point, v, *shift_log, &se,
+                        );
                         let (col, npt, nval) = &np[cur];
                         cur += 1;
                         out.push(Claim {
@@ -3299,8 +3663,16 @@ pub(crate) fn discharge_merkle_union(
     let rho_b = ch.sample_f128_vec(b, w_log);
     let zero_e = ColumnRelationProofTrace::alloc(b, &native.zero_proof, w_log, n_zero);
     let zero_terms_e = union_zero_terms_trace(b, legs, ff_specs, &lambda);
-    let zero_point =
-        verify_column_relation_trace(b, &mut ch, w_log, &zero, &rho_b, &zero_terms_e, fixed, &zero_e);
+    let zero_point = verify_column_relation_trace(
+        b,
+        &mut ch,
+        w_log,
+        &zero,
+        &rho_b,
+        &zero_terms_e,
+        fixed,
+        &zero_e,
+    );
     let mut zero_shift_cursor = 0usize;
     let mut unused_gv: [LinExpr; STATE_SIZE] = std::array::from_fn(|_| LinExpr::zero());
     trace_claim_pass!(
@@ -3311,7 +3683,11 @@ pub(crate) fn discharge_merkle_union(
         zero_shift_cursor,
         unused_gv
     );
-    assert_eq!(zero_shift_cursor, native.zero_shifts.len(), "zero-check shifts consumed");
+    assert_eq!(
+        zero_shift_cursor,
+        native.zero_shifts.len(),
+        "zero-check shifts consumed"
+    );
 
     let beta = ch.sample_f128(b);
     let mut bp = LinExpr::constant(F128::ONE);
@@ -3322,7 +3698,10 @@ pub(crate) fn discharge_merkle_union(
             coeff: bp.clone(),
             factors: vec![ColRef::Committed(cb_c[j])],
         });
-        sel_terms.push(RelationTermTrace { coeff: bp.clone(), factors: vec![ColRef::Internal(j)] });
+        sel_terms.push(RelationTermTrace {
+            coeff: bp.clone(),
+            factors: vec![ColRef::Internal(j)],
+        });
     }
     let rho = ch.sample_f128_vec(b, w_log);
     let sel_e = ColumnRelationProofTrace::alloc(b, &native.sel_proof, w_log, 2 * STATE_SIZE);
@@ -3332,10 +3711,20 @@ pub(crate) fn discharge_merkle_union(
     let mut gv: [LinExpr; STATE_SIZE] = std::array::from_fn(|_| LinExpr::zero());
     let mut sel_shift_cursor = 0usize;
     let no_shifts: Vec<(usize, usize, ShiftDischargeProof)> = Vec::new();
-    trace_claim_pass!(sel_claimed, sel_e.final_values, sel_point, no_shifts, sel_shift_cursor, gv);
+    trace_claim_pass!(
+        sel_claimed,
+        sel_e.final_values,
+        sel_point,
+        no_shifts,
+        sel_shift_cursor,
+        gv
+    );
     assert_eq!(sel_shift_cursor, 0, "carry selection claims no shifts");
 
-    let groups_e = vec![LaneClaimGroupTrace { point: sel_point, values: gv }];
+    let groups_e = vec![LaneClaimGroupTrace {
+        point: sel_point,
+        values: gv,
+    }];
     let walk_e = DeepChainWalkProofTrace::alloc(b, &native.walk_proof, w_log);
     let terminal = verify_deep_chain_walk_trace(b, &mut ch, w_log, &groups_e, &walk_e);
 
@@ -3346,8 +3735,12 @@ pub(crate) fn discharge_merkle_union(
     for e in 0..STATE_SIZE {
         target = target.add(&mul(b, &ap[e], &terminal.values[e]));
     }
-    let sub_e =
-        ColumnRelationProofTrace::alloc(b, &native.sub_proof, w_log, claimed_refs(&ref_terms).len());
+    let sub_e = ColumnRelationProofTrace::alloc(
+        b,
+        &native.sub_proof,
+        w_log,
+        claimed_refs(&ref_terms).len(),
+    );
     let sub_point = verify_column_relation_trace(
         b,
         &mut ch,
@@ -3368,7 +3761,11 @@ pub(crate) fn discharge_merkle_union(
         shift_cursor,
         unused_gv2
     );
-    assert_eq!(shift_cursor, native.shifts.len(), "merkle-union shifts consumed");
+    assert_eq!(
+        shift_cursor,
+        native.shifts.len(),
+        "merkle-union shifts consumed"
+    );
     assert_eq!(cur, np.len(), "merkle-union pending lockstep");
 
     // Per-leg entry pins (E == shared leaf digest wire) + recomputed-root pins
@@ -3390,8 +3787,15 @@ pub(crate) fn discharge_merkle_union(
             // bound; the pin is an R1CS ROW, not an IO claim.
             let root_slot = leg.path_slots[path] + root_slot_local;
             for lane in 0..2 {
-                assert_eq!(leg.recomputed_roots[path][lane], leg.committed_roots[path][lane]);
-                cell_pins.push((leg.refs.c[lane], root_slot, leg.root_wires[path][lane].clone()));
+                assert_eq!(
+                    leg.recomputed_roots[path][lane],
+                    leg.committed_roots[path][lane]
+                );
+                cell_pins.push((
+                    leg.refs.c[lane],
+                    root_slot,
+                    leg.root_wires[path][lane].clone(),
+                ));
             }
         }
     }
@@ -3489,7 +3893,11 @@ pub(crate) struct DuplexUnion {
 /// `perm([0;4])` ghost slots: the duplex substitution's leading carry term is
 /// ungated, so every block must be a valid IV-seeded chain (the START pattern
 /// cancels the cross-block carry in char 2, re-seeding each block).
-pub(crate) fn build_duplex_union(layout: &DuplexLayout, iv_flat: [F128; 2], data: &[Vec<F128>]) -> DuplexUnion {
+pub(crate) fn build_duplex_union(
+    layout: &DuplexLayout,
+    iv_flat: [F128; 2],
+    data: &[Vec<F128>],
+) -> DuplexUnion {
     let per_tx = layout.slots.len().next_power_of_two();
     let block_log = per_tx.trailing_zeros() as usize;
     let k = data.len();
@@ -3570,7 +3978,10 @@ pub(crate) fn build_duplex_union_with_recordings(
     data: &[Vec<F128>],
     recordings: &[RecordingSpec<'_>],
 ) -> DuplexUnion {
-    assert!(!recordings.is_empty(), "recording-free unions use build_duplex_union");
+    assert!(
+        !recordings.is_empty(),
+        "recording-free unions use build_duplex_union"
+    );
     let per_tx = layout.slots.len().next_power_of_two();
     let block_log = per_tx.trailing_zeros() as usize;
     let k = data.len();
@@ -3607,8 +4018,14 @@ pub(crate) fn build_duplex_union_with_recordings(
         }
     }
 
-    let rec_challenges =
-        fill_recording_region(&mut committed, &mut s0, &mut s_out, r1_len, &packing, recordings);
+    let rec_challenges = fill_recording_region(
+        &mut committed,
+        &mut s0,
+        &mut s_out,
+        r1_len,
+        &packing,
+        recordings,
+    );
 
     // Gated pattern sets: region 1 pinned to its dyadic prefix, each
     // recording to its own block. Both region boundaries are strictly
@@ -3666,7 +4083,12 @@ pub(crate) fn pack_recordings(r1_len: usize, recordings: &[RecordingSpec<'_>]) -
         cur += sizes[r];
     }
     let w_log = cur.next_power_of_two().trailing_zeros() as usize;
-    RecordingPacking { order, sizes, offsets, w_log }
+    RecordingPacking {
+        order,
+        sizes,
+        offsets,
+        w_log,
+    }
 }
 
 /// High-coordinate gate bits of the dyadic block at `off` (block log
@@ -3692,11 +4114,11 @@ pub(crate) fn fill_recording_region(
     let mut carry: [F128; STATE_SIZE] = std::array::from_fn(|j| committed[2 + j][r1_len - 1]);
     let mut cursor = r1_len;
     let fill_carry = |committed: &mut [Vec<F128>; 6],
-                          s0: &mut [Vec<F128>; STATE_SIZE],
-                          s_out: &mut [Vec<F128>; STATE_SIZE],
-                          carry: &mut [F128; STATE_SIZE],
-                          from: usize,
-                          to: usize| {
+                      s0: &mut [Vec<F128>; STATE_SIZE],
+                      s_out: &mut [Vec<F128>; STATE_SIZE],
+                      carry: &mut [F128; STATE_SIZE],
+                      from: usize,
+                      to: usize| {
         for slot in from..to {
             let (g0, gout) = noid_ivc_core::deep_chain::source_tree::run_perm(*carry);
             for j in 0..STATE_SIZE {
@@ -3839,21 +4261,38 @@ pub(crate) fn run_duplex_union_native(u: &DuplexUnion, domain: &[u8]) -> DuplexU
         F128::ZERO,
         &rho,
         &sel_terms,
-        &RelationColumns { committed: &committed, internal: &internal, fixed },
+        &RelationColumns {
+            committed: &committed,
+            internal: &internal,
+            fixed,
+        },
         &mut ch_p,
     );
-    let sel_point =
-        verify_column_relation(w_log, F128::ZERO, &rho, &sel_terms, fixed, &sel_proof, &mut ch_v)
-            .expect("native duplex selection");
+    let sel_point = verify_column_relation(
+        w_log,
+        F128::ZERO,
+        &rho,
+        &sel_terms,
+        fixed,
+        &sel_proof,
+        &mut ch_v,
+    )
+    .expect("native duplex selection");
     let mut gv = [F128::ZERO; STATE_SIZE];
-    for (r, v) in claimed_refs(&sel_terms).iter().zip(sel_proof.final_values.iter()) {
+    for (r, v) in claimed_refs(&sel_terms)
+        .iter()
+        .zip(sel_proof.final_values.iter())
+    {
         match r {
             ColRef::Committed(c) => pending.push((*c, sel_point.clone(), *v)),
             ColRef::Internal(j) => gv[*j] = *v,
             _ => unreachable!(),
         }
     }
-    let groups = vec![LaneClaimGroup { point: sel_point, values: gv }];
+    let groups = vec![LaneClaimGroup {
+        point: sel_point,
+        values: gv,
+    }];
     let (walk_proof, _) = prove_deep_chain_walk(&u.s0, &groups, &mut ch_p);
     let terminal =
         verify_deep_chain_walk(w_log, &groups, &walk_proof, &mut ch_v).expect("native duplex walk");
@@ -3871,14 +4310,28 @@ pub(crate) fn run_duplex_union_native(u: &DuplexUnion, domain: &[u8]) -> DuplexU
         target,
         &terminal.point,
         &sub_terms,
-        &RelationColumns { committed: &committed, internal: &[], fixed },
+        &RelationColumns {
+            committed: &committed,
+            internal: &[],
+            fixed,
+        },
         &mut ch_p,
     );
-    let sub_point =
-        verify_column_relation(w_log, target, &terminal.point, &sub_terms, fixed, &sub_proof, &mut ch_v)
-            .expect("native duplex substitution");
+    let sub_point = verify_column_relation(
+        w_log,
+        target,
+        &terminal.point,
+        &sub_terms,
+        fixed,
+        &sub_proof,
+        &mut ch_v,
+    )
+    .expect("native duplex substitution");
     let mut shifts = Vec::new();
-    for (r, v) in claimed_refs(&sub_terms).iter().zip(sub_proof.final_values.iter()) {
+    for (r, v) in claimed_refs(&sub_terms)
+        .iter()
+        .zip(sub_proof.final_values.iter())
+    {
         match r {
             ColRef::Committed(c) => pending.push((*c, sub_point.clone(), *v)),
             ColRef::CommittedShift(c) => {
@@ -3891,8 +4344,18 @@ pub(crate) fn run_duplex_union_native(u: &DuplexUnion, domain: &[u8]) -> DuplexU
             _ => unreachable!(),
         }
     }
-    assert_eq!(ch_p.sample_f128(), ch_v.sample_f128(), "native duplex-union lockstep");
-    DuplexUnionNative { sel_proof, walk_proof, sub_proof, shifts, pending }
+    assert_eq!(
+        ch_p.sample_f128(),
+        ch_v.sample_f128(),
+        "native duplex-union lockstep"
+    );
+    DuplexUnionNative {
+        sel_proof,
+        walk_proof,
+        sub_proof,
+        shifts,
+        pending,
+    }
 }
 
 /// Trace twin of `duplex_substitution_terms`: the α-batched walk-terminal wiring
@@ -3989,10 +4452,14 @@ pub(crate) fn discharge_duplex_union(
     let mut sel_e_terms = Vec::new();
     for j in 0..STATE_SIZE {
         bp = mul(b, &bp, &beta);
-        sel_e_terms
-            .push(RelationTermTrace { coeff: bp.clone(), factors: vec![ColRef::Committed(refs.c[j])] });
-        sel_e_terms
-            .push(RelationTermTrace { coeff: bp.clone(), factors: vec![ColRef::Internal(j)] });
+        sel_e_terms.push(RelationTermTrace {
+            coeff: bp.clone(),
+            factors: vec![ColRef::Committed(refs.c[j])],
+        });
+        sel_e_terms.push(RelationTermTrace {
+            coeff: bp.clone(),
+            factors: vec![ColRef::Internal(j)],
+        });
     }
     let rho = ch.sample_f128_vec(b, w_log);
     let sel_e = ColumnRelationProofTrace::alloc(b, &native.sel_proof, w_log, 2 * STATE_SIZE);
@@ -4017,7 +4484,10 @@ pub(crate) fn discharge_duplex_union(
             _ => unreachable!(),
         }
     }
-    let groups_e = vec![LaneClaimGroupTrace { point: sel_point, values: gv }];
+    let groups_e = vec![LaneClaimGroupTrace {
+        point: sel_point,
+        values: gv,
+    }];
     let walk_e = DeepChainWalkProofTrace::alloc(b, &native.walk_proof, w_log);
     let terminal = verify_deep_chain_walk_trace(b, &mut ch, w_log, &groups_e, &walk_e);
 
@@ -4034,8 +4504,12 @@ pub(crate) fn discharge_duplex_union(
     for e in 0..STATE_SIZE {
         target = target.add(&mul(b, &ap[e], &terminal.values[e]));
     }
-    let sub_e =
-        ColumnRelationProofTrace::alloc(b, &native.sub_proof, w_log, claimed_refs(&sub_native).len());
+    let sub_e = ColumnRelationProofTrace::alloc(
+        b,
+        &native.sub_proof,
+        w_log,
+        claimed_refs(&sub_native).len(),
+    );
     let sub_point = verify_column_relation_trace(
         b,
         &mut ch,
@@ -4047,7 +4521,10 @@ pub(crate) fn discharge_duplex_union(
         &sub_e,
     );
     let mut shift_cursor = 0usize;
-    for (r, v) in claimed_refs(&sub_native).iter().zip(sub_e.final_values.iter()) {
+    for (r, v) in claimed_refs(&sub_native)
+        .iter()
+        .zip(sub_e.final_values.iter())
+    {
         match r {
             ColRef::Committed(c) => {
                 let (_, npt, nval) = &np[np_cursor];
@@ -4097,7 +4574,11 @@ pub(crate) fn bind_duplex_challenges(
     out: &mut Vec<Claim>,
 ) {
     let per_tx = 1usize << u.block_log;
-    assert_eq!(chal_wires.len(), u.layout.challenges.len(), "challenge wire count");
+    assert_eq!(
+        chal_wires.len(),
+        u.layout.challenges.len(),
+        "challenge wire count"
+    );
     for (k, &(slot, lane)) in u.layout.challenges.iter().enumerate() {
         let gslot = t * per_tx + slot;
         let (pt_lin, pt_nat) = slot_point(gslot, u.w_log);
@@ -4191,7 +4672,10 @@ pub(crate) struct SubChannel {
 /// real length) carry START=0 and no constants — they just continue the chain, and
 /// `build_duplex_columns` fills the matching continuing-chain tail per sub-block.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn combined_duplex_fixed_patterns(subs: &[SubChannel], s_log: usize) -> Vec<FixedPattern> {
+pub(crate) fn combined_duplex_fixed_patterns(
+    subs: &[SubChannel],
+    s_log: usize,
+) -> Vec<FixedPattern> {
     let s = 1usize << s_log;
     let per_tx = subs.len() * s;
     let block_log = per_tx.trailing_zeros() as usize;
@@ -4200,7 +4684,10 @@ pub(crate) fn combined_duplex_fixed_patterns(subs: &[SubChannel], s_log: usize) 
     let mut consts: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; per_tx]);
     for (i, sub) in subs.iter().enumerate() {
         let off = i * s;
-        assert!(sub.layout.slots.len() <= s, "sub schedule exceeds the common S");
+        assert!(
+            sub.layout.slots.len() <= s,
+            "sub schedule exceeds the common S"
+        );
         // Carry reset + IV seed at this sub-channel's slot 0.
         start[off] = F128::ONE;
         consts[2][off] = sub.iv_flat[0];
@@ -4236,7 +4723,12 @@ pub(crate) fn combined_duplex_fixed_patterns(subs: &[SubChannel], s_log: usize) 
 pub(crate) fn combined_duplex_layout(subs: &[SubChannel], s_log: usize) -> DuplexLayout {
     let s = 1usize << s_log;
     let per_tx = subs.len() * s;
-    let mut slots = vec![DuplexSlot { lanes: [None, None] }; per_tx];
+    let mut slots = vec![
+        DuplexSlot {
+            lanes: [None, None]
+        };
+        per_tx
+    ];
     let mut challenges = Vec::new();
     let mut data_off = 0usize;
     for (i, sub) in subs.iter().enumerate() {
@@ -4253,7 +4745,11 @@ pub(crate) fn combined_duplex_layout(subs: &[SubChannel], s_log: usize) -> Duple
         }
         data_off += sub.layout.n_data;
     }
-    DuplexLayout { slots, challenges, n_data: data_off }
+    DuplexLayout {
+        slots,
+        challenges,
+        n_data: data_off,
+    }
 }
 
 /// Each data lane's `(slot, lane)` in the combined per-tx block, in the flattened
@@ -4261,7 +4757,10 @@ pub(crate) fn combined_duplex_layout(subs: &[SubChannel], s_log: usize) -> Duple
 /// slot shifted by `i·S`. The per-tx algebra reads each channel's absorbed data at
 /// these positions; agrees with `duplex_data_positions(&combined_duplex_layout(..))`.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn combined_duplex_data_positions(subs: &[SubChannel], s_log: usize) -> Vec<(usize, usize)> {
+pub(crate) fn combined_duplex_data_positions(
+    subs: &[SubChannel],
+    s_log: usize,
+) -> Vec<(usize, usize)> {
     let s = 1usize << s_log;
     let mut out = Vec::new();
     for (i, sub) in subs.iter().enumerate() {
@@ -4291,7 +4790,10 @@ pub(crate) fn combined_duplex_data_positions(subs: &[SubChannel], s_log: usize) 
 /// slots (the duplex substitution's leading carry term is ungated, so every block
 /// must be a genuine IV-seeded chain).
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn build_combined_duplex_union(subs: &[SubChannel], data: &[Vec<Vec<F128>>]) -> DuplexUnion {
+pub(crate) fn build_combined_duplex_union(
+    subs: &[SubChannel],
+    data: &[Vec<Vec<F128>>],
+) -> DuplexUnion {
     assert!(!subs.is_empty(), "need at least one sub-channel");
     let n_real = subs.len();
     let n = n_real.next_power_of_two();
@@ -4313,7 +4815,11 @@ pub(crate) fn build_combined_duplex_union(subs: &[SubChannel], data: &[Vec<Vec<F
 
     // Validate the caller's data shape against the real sub-channels.
     for (t, row) in data.iter().enumerate() {
-        assert_eq!(row.len(), n_real, "data row {t} width must equal the sub-channel count");
+        assert_eq!(
+            row.len(),
+            n_real,
+            "data row {t} width must equal the sub-channel count"
+        );
         for (i, stream) in row.iter().enumerate() {
             assert_eq!(stream.len(), subs[i].layout.n_data, "data[{t}][{i}] length");
         }
@@ -4323,11 +4829,22 @@ pub(crate) fn build_combined_duplex_union(subs: &[SubChannel], data: &[Vec<Vec<F
     // schedule seeds a pure zero-IV chain in its S-block — no absorbs, no
     // challenges). For the N=2 wallet use this is a no-op.
     let ghost = SubChannel {
-        layout: DuplexLayout { slots: Vec::new(), challenges: Vec::new(), n_data: 0 },
+        layout: DuplexLayout {
+            slots: Vec::new(),
+            challenges: Vec::new(),
+            n_data: 0,
+        },
         iv_flat: [F128::ZERO, F128::ZERO],
     };
-    let subs_padded: Vec<SubChannel> =
-        (0..n).map(|i| if i < n_real { subs[i].clone() } else { ghost.clone() }).collect();
+    let subs_padded: Vec<SubChannel> = (0..n)
+        .map(|i| {
+            if i < n_real {
+                subs[i].clone()
+            } else {
+                ghost.clone()
+            }
+        })
+        .collect();
 
     let mut committed: [Vec<F128>; 6] = std::array::from_fn(|_| vec![F128::ZERO; p]);
     let mut s0: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; p]);
@@ -4338,8 +4855,12 @@ pub(crate) fn build_combined_duplex_union(subs: &[SubChannel], data: &[Vec<Vec<F
         let mut tx_challenges: Vec<F128> = Vec::new();
         for (i, sub) in subs_padded.iter().enumerate() {
             let zero_data = vec![F128::ZERO; sub.layout.n_data];
-            let d: &[F128] = if blk < k && i < n_real { &data[blk][i] } else { &zero_data };
-            // Each sub-block is a STANDARD S-slot homogeneous block: slot 0 is
+            let d: &[F128] = if blk < k && i < n_real {
+                &data[blk][i]
+            } else {
+                &zero_data
+            };
+            // Each sub-block is an S-slot homogeneous block: slot 0 is
             // IV-seeded, later slots carry, and the tail past the real schedule is
             // the continuing chain fill — copied wholesale into the tiled domain.
             let cols = build_duplex_columns(&sub.layout, sub.iv_flat, d, s_log);
@@ -4420,17 +4941,32 @@ pub(crate) fn build_combined_duplex_union_with_recordings(
     let p = 1usize << w_log;
 
     for (t, row) in data.iter().enumerate() {
-        assert_eq!(row.len(), n_real, "data row {t} width must equal the sub-channel count");
+        assert_eq!(
+            row.len(),
+            n_real,
+            "data row {t} width must equal the sub-channel count"
+        );
         for (i, stream) in row.iter().enumerate() {
             assert_eq!(stream.len(), subs[i].layout.n_data, "data[{t}][{i}] length");
         }
     }
     let ghost = SubChannel {
-        layout: DuplexLayout { slots: Vec::new(), challenges: Vec::new(), n_data: 0 },
+        layout: DuplexLayout {
+            slots: Vec::new(),
+            challenges: Vec::new(),
+            n_data: 0,
+        },
         iv_flat: [F128::ZERO, F128::ZERO],
     };
-    let subs_padded: Vec<SubChannel> =
-        (0..n).map(|i| if i < n_real { subs[i].clone() } else { ghost.clone() }).collect();
+    let subs_padded: Vec<SubChannel> = (0..n)
+        .map(|i| {
+            if i < n_real {
+                subs[i].clone()
+            } else {
+                ghost.clone()
+            }
+        })
+        .collect();
 
     let mut committed: [Vec<F128>; 6] = std::array::from_fn(|_| vec![F128::ZERO; p]);
     let mut s0: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; p]);
@@ -4443,7 +4979,11 @@ pub(crate) fn build_combined_duplex_union_with_recordings(
         let mut tx_challenges: Vec<F128> = Vec::new();
         for (i, sub) in subs_padded.iter().enumerate() {
             let zero_data = vec![F128::ZERO; sub.layout.n_data];
-            let d: &[F128] = if blk < k && i < n_real { &data[blk][i] } else { &zero_data };
+            let d: &[F128] = if blk < k && i < n_real {
+                &data[blk][i]
+            } else {
+                &zero_data
+            };
             let cols = build_duplex_columns(&sub.layout, sub.iv_flat, d, s_log);
             let off = blk * per_tx + i * s;
             for j in 0..2 {
@@ -4463,8 +5003,14 @@ pub(crate) fn build_combined_duplex_union_with_recordings(
         }
     }
 
-    let rec_challenges =
-        fill_recording_region(&mut committed, &mut s0, &mut s_out, r1_len, &packing, recordings);
+    let rec_challenges = fill_recording_region(
+        &mut committed,
+        &mut s0,
+        &mut s_out,
+        r1_len,
+        &packing,
+        recordings,
+    );
 
     let mut fixed: Vec<FixedPattern> = combined_duplex_fixed_patterns(&subs_padded, s_log)
         .into_iter()
@@ -4524,7 +5070,10 @@ mod stage1_duplex_union_tests {
         (0..layout.n_data)
             .map(|_| {
                 r = r.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(0x1234_5);
-                F128 { lo: r, hi: r.rotate_left(29) ^ 0xA5A5 }
+                F128 {
+                    lo: r,
+                    hi: r.rotate_left(29) ^ 0xA5A5,
+                }
             })
             .collect()
     }
@@ -4537,10 +5086,14 @@ mod stage1_duplex_union_tests {
     #[test]
     fn duplex_union_native_and_trace() {
         let layout = compile_duplex(&channel_ops());
-        let data: Vec<Vec<F128>> =
-            (0..2).map(|t| tx_data(&layout, 0xABCD_0000 + t as u64)).collect();
+        let data: Vec<Vec<F128>> = (0..2)
+            .map(|t| tx_data(&layout, 0xABCD_0000 + t as u64))
+            .collect();
         let u = build_duplex_union(&layout, iv_flat(), &data);
-        assert_ne!(u.challenges[0], u.challenges[1], "per-tx channels squeeze distinct challenges");
+        assert_ne!(
+            u.challenges[0], u.challenges[1],
+            "per-tx channels squeeze distinct challenges"
+        );
         let native = run_duplex_union_native(&u, b"duplex-union-unit");
 
         let mut b = FieldR1csBuilder::new();
@@ -4577,48 +5130,50 @@ mod stage1_duplex_union_tests {
         use noid_ivc_core::lincheck::build_eq_table;
 
         let layout = compile_duplex(&channel_ops());
-        let data: Vec<Vec<F128>> =
-            (0..2).map(|t| tx_data(&layout, 0xBEEF_0000 + t as u64)).collect();
+        let data: Vec<Vec<F128>> = (0..2)
+            .map(|t| tx_data(&layout, 0xBEEF_0000 + t as u64))
+            .collect();
 
         // Two synthetic recorded transcripts of DIFFERENT lengths (the second
         // exercises `sample_f128_vec` and lands in a smaller dyadic block).
-        let record =
-            |b: &mut FieldR1csBuilder, domain: &[u8], n_wires: usize, vec_draw: bool| {
-                let wires: Vec<LinExpr> = (0..n_wires)
-                    .map(|i| {
-                        let v = F128 { lo: 0x1111 * (i as u64 + 1), hi: 0x77 ^ i as u64 };
-                        LinExpr::from_wire(b.alloc_f128(v))
-                    })
-                    .collect();
-                let mut rec = FsChannelUnionRecorder::new(domain);
-                rec.observe_label(b, b"two-region-unit");
-                rec.observe_f128_slice(b, &wires);
-                let _c1 = rec.sample_f128(b);
-                rec.observe_f128(b, &wires[0]);
-                if vec_draw {
-                    let _cv = rec.sample_f128_vec(b, 3);
-                }
-                rec.observe_f128_slice(b, &wires[..n_wires / 2]);
-                let _c2 = rec.sample_f128(b);
-                // Trailing absorbs AFTER the last squeeze: corrupting these
-                // lanes breaks ONLY their data pins (no downstream
-                // challenge). The tail deliberately ends at ODD lane parity
-                // (2-lane observe + 3-lane slice = 5 lanes): the last data
-                // lane sits alone in a trailing partial-absorb slot, which
-                // `compile_duplex` must flush — the real walk discharges end
-                // this way, and an unflushed lane would be unpinnable.
-                rec.observe_f128(b, &wires[1]);
-                rec.observe_f128_slice(b, &wires[..2]);
-                rec.finish()
-            };
+        let record = |b: &mut FieldR1csBuilder, domain: &[u8], n_wires: usize, vec_draw: bool| {
+            let wires: Vec<LinExpr> = (0..n_wires)
+                .map(|i| {
+                    let v = F128 {
+                        lo: 0x1111 * (i as u64 + 1),
+                        hi: 0x77 ^ i as u64,
+                    };
+                    LinExpr::from_wire(b.alloc_f128(v))
+                })
+                .collect();
+            let mut rec = FsChannelUnionRecorder::new(domain);
+            rec.observe_label(b, b"two-region-unit");
+            rec.observe_f128_slice(b, &wires);
+            let _c1 = rec.sample_f128(b);
+            rec.observe_f128(b, &wires[0]);
+            if vec_draw {
+                let _cv = rec.sample_f128_vec(b, 3);
+            }
+            rec.observe_f128_slice(b, &wires[..n_wires / 2]);
+            let _c2 = rec.sample_f128(b);
+            // Trailing absorbs AFTER the last squeeze: corrupting these
+            // lanes breaks ONLY their data pins (no downstream
+            // challenge). The tail deliberately ends at ODD lane parity
+            // (2-lane observe + 3-lane slice = 5 lanes): the last data
+            // lane sits alone in a trailing partial-absorb slot, which
+            // `compile_duplex` must flush — the real walk discharges end
+            // this way, and an unflushed lane would be unpinnable.
+            rec.observe_f128(b, &wires[1]);
+            rec.observe_f128_slice(b, &wires[..2]);
+            rec.finish()
+        };
 
         let run = |corrupt: Option<(usize, usize)>| -> bool {
             let mut b = FieldR1csBuilder::new();
             let rec_a = record(&mut b, b"two-region-rec-a", 24, false);
             let rec_b = record(&mut b, b"two-region-rec-b", 6, true);
             let recs = [&rec_a, &rec_b];
-            let mut rec_data: Vec<Vec<F128>> =
-                recs.iter().map(|r| r.data_flat.clone()).collect();
+            let mut rec_data: Vec<Vec<F128>> = recs.iter().map(|r| r.data_flat.clone()).collect();
             if let Some((r, lane)) = corrupt {
                 rec_data[r][lane] += F128::ONE;
             }
@@ -4648,7 +5203,11 @@ mod stage1_duplex_union_tests {
             for tx in 0..2 {
                 for (kk, &(slot, lane)) in u.layout.challenges.iter().enumerate() {
                     let w = LinExpr::from_wire(b.alloc_f128(u.challenges[tx][kk]));
-                    pin_eq(&mut b, &w, &slot_cell(&slices[u.refs.c[lane]], tx * per_tx + slot));
+                    pin_eq(
+                        &mut b,
+                        &w,
+                        &slot_cell(&slices[u.refs.c[lane]], tx * per_tx + slot),
+                    );
                 }
             }
             for (r, rc) in recs.iter().enumerate() {
@@ -4679,7 +5238,10 @@ mod stage1_duplex_union_tests {
                 let (lb, ob) = &u.rec_blocks[1];
                 let sz = |l: &DuplexLayout| l.slots.len().next_power_of_two();
                 assert!(sz(la) >= sz(lb), "recording sizes");
-                assert!(*oa >= 2 * per_tx && *ob == oa + sz(la), "descending packing");
+                assert!(
+                    *oa >= 2 * per_tx && *ob == oa + sz(la),
+                    "descending packing"
+                );
                 let u1 = build_duplex_union(&layout, iv_flat(), &data);
                 let n1 = run_duplex_union_native(&u1, b"two-region-unit");
                 let mut b1 = FieldR1csBuilder::new();
@@ -4688,7 +5250,11 @@ mod stage1_duplex_union_tests {
                 }
                 let mut ch1 = FsChannelTrace::new(&mut b1, b"two-region-unit");
                 let c1 = discharge_duplex_union(&mut b1, &mut ch1, &u1, &n1, 0);
-                assert_eq!(claims.len(), c1.len(), "recording-bearing union claim flatness");
+                assert_eq!(
+                    claims.len(),
+                    c1.len(),
+                    "recording-bearing union claim flatness"
+                );
                 // Recorder challenges match the union build's chain.
                 for (r, rc) in recs.iter().enumerate() {
                     assert_eq!(
@@ -4743,15 +5309,19 @@ mod stage1_duplex_union_tests {
         const OUTER: &[u8] = b"duplex-union-slot-outer";
         let layout = compile_duplex(&channel_ops());
         let k = 2usize;
-        let data: Vec<Vec<F128>> =
-            (0..k).map(|t| tx_data(&layout, 0xC0FE_0000 + t as u64)).collect();
+        let data: Vec<Vec<F128>> = (0..k)
+            .map(|t| tx_data(&layout, 0xC0FE_0000 + t as u64))
+            .collect();
         let u = build_duplex_union(&layout, iv_flat(), &data);
         let native = run_duplex_union_native(&u, b"duplex-union-slot");
         let w_log = u.w_log;
 
         let mut b = FieldR1csBuilder::new();
-        let slices: Vec<WitnessSlice> =
-            u.committed.iter().map(|c| alloc_column_slice(&mut b, c, w_log).0).collect();
+        let slices: Vec<WitnessSlice> = u
+            .committed
+            .iter()
+            .map(|c| alloc_column_slice(&mut b, c, w_log).0)
+            .collect();
         let mut ch = FsChannelTrace::new(&mut b, b"duplex-union-slot");
         let mut claims = discharge_duplex_union(&mut b, &mut ch, &u, &native, 0);
         for t in 0..k {
@@ -4790,7 +5360,10 @@ mod stage1_duplex_union_tests {
         };
 
         let (r1cs, z) = b.build();
-        assert!(r1cs.satisfies(&z), "honest duplex-union trace unsatisfiable");
+        assert!(
+            r1cs.satisfies(&z),
+            "honest duplex-union trace unsatisfiable"
+        );
         let params = PcsParams {
             m: r1cs.m + pcs::LOG_PACKING,
             log_inv_rate: 2,
@@ -4859,15 +5432,19 @@ mod stage1_duplex_union_tests {
 
         const OUTER: &[u8] = b"duplex-raw-read-outer";
         let layout = compile_duplex(&channel_ops());
-        let data: Vec<Vec<F128>> =
-            (0..2).map(|t| tx_data(&layout, 0x5EED_0000 + t as u64)).collect();
+        let data: Vec<Vec<F128>> = (0..2)
+            .map(|t| tx_data(&layout, 0x5EED_0000 + t as u64))
+            .collect();
         let u = build_duplex_union(&layout, iv_flat(), &data);
         let native = run_duplex_union_native(&u, b"duplex-raw-read");
         let w_log = u.w_log;
 
         let mut b = FieldR1csBuilder::new();
-        let slices: Vec<WitnessSlice> =
-            u.committed.iter().map(|c| alloc_column_slice(&mut b, c, w_log).0).collect();
+        let slices: Vec<WitnessSlice> = u
+            .committed
+            .iter()
+            .map(|c| alloc_column_slice(&mut b, c, w_log).0)
+            .collect();
         // Discharge ONLY the walk (selection -> walk -> substitution -> shifts).
         // NO per-cell challenge reads: the Stage-2 pattern raw-reads instead.
         let mut ch = FsChannelTrace::new(&mut b, b"duplex-raw-read");
@@ -4915,7 +5492,11 @@ mod stage1_duplex_union_tests {
         let (r1cs, z) = b.build();
         assert!(r1cs.satisfies(&z), "honest raw-read trace unsatisfiable");
         // The raw-read cell carries exactly the native squeezed challenge.
-        assert_eq!(chal.eval(&z), u.challenges[0][0], "raw-read == native challenge");
+        assert_eq!(
+            chal.eval(&z),
+            u.challenges[0][0],
+            "raw-read == native challenge"
+        );
         let params = PcsParams {
             m: r1cs.m + pcs::LOG_PACKING,
             log_inv_rate: 2,
@@ -4933,14 +5514,24 @@ mod stage1_duplex_union_tests {
         // claim constrains it) but the column's selection opening is now false.
         let mut bad_z = z.clone();
         bad_z[c_col.start() + chal_slot] += F128::ONE;
-        assert!(r1cs.satisfies(&bad_z), "the raw-read cell is unconstrained by the trace");
+        assert!(
+            r1cs.satisfies(&bad_z),
+            "the raw-read cell is unconstrained by the trace"
+        );
         let mut ch_p = FsLaneChallenger::new(OUTER);
         let (bad_proof, bad_commitment, _) =
             prove_field_with_public_io(&r1cs, &bad_z, &params, &spec, &io_values, &mut ch_p);
         let mut ch_v = FsLaneChallenger::new(OUTER);
         assert!(
-            verify_field_with_public_io(&r1cs, &bad_commitment, &bad_proof, &spec, &io_values, &mut ch_v)
-                .is_err(),
+            verify_field_with_public_io(
+                &r1cs,
+                &bad_commitment,
+                &bad_proof,
+                &spec,
+                &io_values,
+                &mut ch_v
+            )
+            .is_err(),
             "flipping a raw-read carry cell must break the column's walk opening"
         );
     }
@@ -4952,10 +5543,13 @@ mod stage1_duplex_union_tests {
     fn duplex_union_walk_is_flat() {
         let layout = compile_duplex(&channel_ops());
         let rounds = |k: usize| {
-            let data: Vec<Vec<F128>> =
-                (0..k).map(|t| tx_data(&layout, 0xF1A7_0000 + t as u64)).collect();
+            let data: Vec<Vec<F128>> = (0..k)
+                .map(|t| tx_data(&layout, 0xF1A7_0000 + t as u64))
+                .collect();
             let u = build_duplex_union(&layout, iv_flat(), &data);
-            run_duplex_union_native(&u, b"flat").walk_proof.layers[0].round_coeffs.len()
+            run_duplex_union_native(&u, b"flat").walk_proof.layers[0]
+                .round_coeffs
+                .len()
         };
         let r1 = rounds(1);
         assert_eq!(rounds(2), r1 + 1, "K:1->2 adds one walk round");
@@ -5021,7 +5615,10 @@ mod combined_duplex_union_tests {
         (0..layout.n_data)
             .map(|_| {
                 r = r.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(0x1234_5);
-                F128 { lo: r, hi: r.rotate_left(29) ^ 0xA5A5 }
+                F128 {
+                    lo: r,
+                    hi: r.rotate_left(29) ^ 0xA5A5,
+                }
             })
             .collect()
     }
@@ -5047,18 +5644,35 @@ mod combined_duplex_union_tests {
     fn combined_correctness_vs_separate() {
         let ch0 = compile_duplex(&channel0_ops());
         let ch1 = compile_duplex(&channel1_ops());
-        assert_eq!((ch0.slots.len(), ch0.n_data, ch0.challenges.len()), (7, 6, 5));
-        assert_eq!((ch1.slots.len(), ch1.n_data, ch1.challenges.len()), (4, 3, 3));
+        assert_eq!(
+            (ch0.slots.len(), ch0.n_data, ch0.challenges.len()),
+            (7, 6, 5)
+        );
+        assert_eq!(
+            (ch1.slots.len(), ch1.n_data, ch1.challenges.len()),
+            (4, 3, 3)
+        );
         let iv0 = iv_flat(TAG_FRICHANL);
         let iv1 = iv_flat(TAG_KSCHANNL);
         assert_ne!(iv0, iv1, "the two channels must carry different IVs");
         let subs = vec![
-            SubChannel { layout: ch0.clone(), iv_flat: iv0 },
-            SubChannel { layout: ch1.clone(), iv_flat: iv1 },
+            SubChannel {
+                layout: ch0.clone(),
+                iv_flat: iv0,
+            },
+            SubChannel {
+                layout: ch1.clone(),
+                iv_flat: iv1,
+            },
         ];
         let k = 2usize;
         let data: Vec<Vec<Vec<F128>>> = (0..k)
-            .map(|t| vec![tx_data(&ch0, 0x1000 + t as u64), tx_data(&ch1, 0x2000 + t as u64)])
+            .map(|t| {
+                vec![
+                    tx_data(&ch0, 0x1000 + t as u64),
+                    tx_data(&ch1, 0x2000 + t as u64),
+                ]
+            })
             .collect();
         let u = build_combined_duplex_union(&subs, &data);
 
@@ -5071,7 +5685,11 @@ mod combined_duplex_union_tests {
         let (n0, n1) = (ch0.challenges.len(), ch1.challenges.len());
         assert_eq!(u.challenges.len(), k);
         for t in 0..k {
-            assert_eq!(u.challenges[t].len(), n0 + n1, "concatenated challenge count");
+            assert_eq!(
+                u.challenges[t].len(),
+                n0 + n1,
+                "concatenated challenge count"
+            );
             assert_eq!(
                 &u.challenges[t][0..n0],
                 h0.challenges[t].as_slice(),
@@ -5083,7 +5701,10 @@ mod combined_duplex_union_tests {
                 "channel 1 squeezes exactly its standalone challenges (no cross-channel bleed)"
             );
         }
-        assert_ne!(u.challenges[0], u.challenges[1], "distinct tx data ⇒ distinct challenges");
+        assert_ne!(
+            u.challenges[0], u.challenges[1],
+            "distinct tx data ⇒ distinct challenges"
+        );
 
         // Data-position self-consistency: the separate helper agrees with reading
         // the combined layout directly (Data indices renumbered to the global
@@ -5120,9 +5741,18 @@ mod combined_duplex_union_tests {
             flat_of_tower_u128(0x5A5A_A5A5_8765_4321_0FED_CBA9_C3D2_E1F0),
         ];
         let subs = vec![
-            SubChannel { layout: ch0.clone(), iv_flat: iv0 },
-            SubChannel { layout: ch1.clone(), iv_flat: iv1 },
-            SubChannel { layout: ch2.clone(), iv_flat: iv2 },
+            SubChannel {
+                layout: ch0.clone(),
+                iv_flat: iv0,
+            },
+            SubChannel {
+                layout: ch1.clone(),
+                iv_flat: iv1,
+            },
+            SubChannel {
+                layout: ch2.clone(),
+                iv_flat: iv2,
+            },
         ];
         let k = 3usize; // K=3 -> padded to 4 tx-blocks (ghost tile).
         let data: Vec<Vec<Vec<F128>>> = (0..k)
@@ -5147,13 +5777,24 @@ mod combined_duplex_union_tests {
         let h0 = mk(&ch0, iv0, 0x11);
         let h1 = mk(&ch1, iv1, 0x22);
         let h2 = mk(&ch2, iv2, 0x33);
-        let (n0, n1, n2) = (ch0.challenges.len(), ch1.challenges.len(), ch2.challenges.len());
-        assert_eq!(u.challenges.len(), k, "K real tx challenge streams (ghost tile excluded)");
+        let (n0, n1, n2) = (
+            ch0.challenges.len(),
+            ch1.challenges.len(),
+            ch2.challenges.len(),
+        );
+        assert_eq!(
+            u.challenges.len(),
+            k,
+            "K real tx challenge streams (ghost tile excluded)"
+        );
         for t in 0..k {
             assert_eq!(u.challenges[t].len(), n0 + n1 + n2);
             assert_eq!(&u.challenges[t][0..n0], h0.challenges[t].as_slice());
             assert_eq!(&u.challenges[t][n0..n0 + n1], h1.challenges[t].as_slice());
-            assert_eq!(&u.challenges[t][n0 + n1..n0 + n1 + n2], h2.challenges[t].as_slice());
+            assert_eq!(
+                &u.challenges[t][n0 + n1..n0 + n1 + n2],
+                h2.challenges[t].as_slice()
+            );
         }
         // The padded (ghost sub + ghost tile) domain still discharges natively.
         let _ = run_duplex_union_native(&u, b"combined-ghost");
@@ -5174,11 +5815,22 @@ mod combined_duplex_union_tests {
         let iv0 = iv_flat(TAG_FRICHANL);
         let iv1 = iv_flat(TAG_KSCHANNL);
         let subs = vec![
-            SubChannel { layout: ch0.clone(), iv_flat: iv0 },
-            SubChannel { layout: ch1.clone(), iv_flat: iv1 },
+            SubChannel {
+                layout: ch0.clone(),
+                iv_flat: iv0,
+            },
+            SubChannel {
+                layout: ch1.clone(),
+                iv_flat: iv1,
+            },
         ];
         let data: Vec<Vec<Vec<F128>>> = (0..2)
-            .map(|t| vec![tx_data(&ch0, 0x900 + t as u64), tx_data(&ch1, 0xA00 + t as u64)])
+            .map(|t| {
+                vec![
+                    tx_data(&ch0, 0x900 + t as u64),
+                    tx_data(&ch1, 0xA00 + t as u64),
+                ]
+            })
             .collect();
         let u = build_combined_duplex_union(&subs, &data);
         let s = 1usize << s_log_of(&subs);
@@ -5192,7 +5844,11 @@ mod combined_duplex_union_tests {
             .filter(|(_, v)| **v == F128::ONE)
             .map(|(i, _)| i)
             .collect();
-        assert_eq!(ones, vec![0, s], "START resets each sub-channel's carry at i·S");
+        assert_eq!(
+            ones,
+            vec![0, s],
+            "START resets each sub-channel's carry at i·S"
+        );
         // Structural: each boundary seeds its OWN channel's capacity IV.
         assert_eq!(u.fixed[u.refs.consts[2]].table[0], iv0[0]);
         assert_eq!(u.fixed[u.refs.consts[3]].table[0], iv0[1]);
@@ -5212,7 +5868,10 @@ mod combined_duplex_union_tests {
             let _ = run_duplex_union_native(&bad, b"carry-reset");
         }));
         std::panic::set_hook(prev);
-        assert!(broke.is_err(), "removing the carry reset must break the heterogeneous discharge");
+        assert!(
+            broke.is_err(),
+            "removing the carry reset must break the heterogeneous discharge"
+        );
     }
 
     /// ONE discharge binds BOTH channels through the REAL outer PCS. The 6 committed
@@ -5236,12 +5895,23 @@ mod combined_duplex_union_tests {
         let iv0 = iv_flat(TAG_FRICHANL);
         let iv1 = iv_flat(TAG_KSCHANNL);
         let subs = vec![
-            SubChannel { layout: ch0.clone(), iv_flat: iv0 },
-            SubChannel { layout: ch1.clone(), iv_flat: iv1 },
+            SubChannel {
+                layout: ch0.clone(),
+                iv_flat: iv0,
+            },
+            SubChannel {
+                layout: ch1.clone(),
+                iv_flat: iv1,
+            },
         ];
         let k = 2usize;
         let data: Vec<Vec<Vec<F128>>> = (0..k)
-            .map(|t| vec![tx_data(&ch0, 0xC0FE_0000 + t as u64), tx_data(&ch1, 0xBEEF_0000 + t as u64)])
+            .map(|t| {
+                vec![
+                    tx_data(&ch0, 0xC0FE_0000 + t as u64),
+                    tx_data(&ch1, 0xBEEF_0000 + t as u64),
+                ]
+            })
             .collect();
         let u = build_combined_duplex_union(&subs, &data);
         let native = run_duplex_union_native(&u, DOM);
@@ -5250,8 +5920,11 @@ mod combined_duplex_union_tests {
         // Build the trace: 6 committed columns as slices, ONE union discharge, and
         // each tx's challenges read from the carry cells.
         let mut b = FieldR1csBuilder::new();
-        let slices: Vec<WitnessSlice> =
-            u.committed.iter().map(|c| alloc_column_slice(&mut b, c, w_log).0).collect();
+        let slices: Vec<WitnessSlice> = u
+            .committed
+            .iter()
+            .map(|c| alloc_column_slice(&mut b, c, w_log).0)
+            .collect();
         let mut ch = FsChannelTrace::new(&mut b, DOM);
         let mut claims = discharge_duplex_union(&mut b, &mut ch, &u, &native, 0);
         for t in 0..k {
@@ -5291,7 +5964,10 @@ mod combined_duplex_union_tests {
         };
 
         let (r1cs, z) = b.build();
-        assert!(r1cs.satisfies(&z), "honest combined-union trace unsatisfiable");
+        assert!(
+            r1cs.satisfies(&z),
+            "honest combined-union trace unsatisfiable"
+        );
         assert!(z.len() < (1usize << 21), "wire-count guard");
         let params = PcsParams {
             m: r1cs.m + pcs::LOG_PACKING,
@@ -5320,7 +5996,10 @@ mod combined_duplex_union_tests {
             let col = slices[u.refs.c[lane]];
             let mut bad_z = z.clone();
             bad_z[col.start() + slot] += F128::ONE;
-            assert!(r1cs.satisfies(&bad_z), "committed columns are free wires ({label})");
+            assert!(
+                r1cs.satisfies(&bad_z),
+                "committed columns are free wires ({label})"
+            );
             let mut ch_p = FsLaneChallenger::new(OUTER);
             let (bad_proof, bad_commitment, _) =
                 prove_field_with_public_io(&r1cs, &bad_z, &params, &spec, &io_values, &mut ch_p);
@@ -5355,28 +6034,56 @@ mod combined_duplex_union_tests {
         let iv0 = iv_flat(TAG_FRICHANL);
         let iv1 = iv_flat(TAG_KSCHANNL);
         let subs = vec![
-            SubChannel { layout: ch0.clone(), iv_flat: iv0 },
-            SubChannel { layout: ch1.clone(), iv_flat: iv1 },
+            SubChannel {
+                layout: ch0.clone(),
+                iv_flat: iv0,
+            },
+            SubChannel {
+                layout: ch1.clone(),
+                iv_flat: iv1,
+            },
         ];
 
         // Walk rounds (layer 0 sumcheck rounds) grow by exactly one per K-doubling.
         let walk_rounds = |k: usize| {
             let data: Vec<Vec<Vec<F128>>> = (0..k)
-                .map(|t| vec![tx_data(&ch0, 0xF00D + t as u64), tx_data(&ch1, 0xBA5E + t as u64)])
+                .map(|t| {
+                    vec![
+                        tx_data(&ch0, 0xF00D + t as u64),
+                        tx_data(&ch1, 0xBA5E + t as u64),
+                    ]
+                })
                 .collect();
             let u = build_combined_duplex_union(&subs, &data);
-            run_duplex_union_native(&u, b"combined-flat").walk_proof.layers[0].round_coeffs.len()
+            run_duplex_union_native(&u, b"combined-flat")
+                .walk_proof
+                .layers[0]
+                .round_coeffs
+                .len()
         };
         let r1 = walk_rounds(1);
-        assert_eq!(walk_rounds(2), r1 + 1, "K:1->2 adds exactly one shared-walk round");
-        assert_eq!(walk_rounds(4), r1 + 2, "K:1->4 adds exactly two shared-walk rounds");
+        assert_eq!(
+            walk_rounds(2),
+            r1 + 1,
+            "K:1->2 adds exactly one shared-walk round"
+        );
+        assert_eq!(
+            walk_rounds(4),
+            r1 + 2,
+            "K:1->4 adds exactly two shared-walk rounds"
+        );
 
         // Full-trace RAW wire counts (discharge + per-tx challenge reads), taken
         // BEFORE `build()` rounds up to a power of two — the padded `z.len()` would
         // hide the sub-linear growth (both K land in the same 2^m block).
         let trace_wires = |k: usize| -> usize {
             let data: Vec<Vec<Vec<F128>>> = (0..k)
-                .map(|t| vec![tx_data(&ch0, 0xF00D + t as u64), tx_data(&ch1, 0xBA5E + t as u64)])
+                .map(|t| {
+                    vec![
+                        tx_data(&ch0, 0xF00D + t as u64),
+                        tx_data(&ch1, 0xBA5E + t as u64),
+                    ]
+                })
                 .collect();
             let u = build_combined_duplex_union(&subs, &data);
             let native = run_duplex_union_native(&u, b"combined-flat");
@@ -5385,7 +6092,7 @@ mod combined_duplex_union_tests {
                 alloc_column_slice(&mut b, c, u.w_log);
             }
             let mut ch = FsChannelTrace::new(&mut b, b"combined-flat");
-        let mut claims = discharge_duplex_union(&mut b, &mut ch, &u, &native, 0);
+            let mut claims = discharge_duplex_union(&mut b, &mut ch, &u, &native, 0);
             for t in 0..k {
                 let _ = read_duplex_challenges(&mut b, &u, t, 0, &mut claims);
             }
@@ -5397,8 +6104,14 @@ mod combined_duplex_union_tests {
             "[combined-duplex-flat] raw wires K=1: {w1}, K=2: {w2} (Δ={}) — shared walk, NOT a second walk (Δ ≪ w1)",
             w2 - w1
         );
-        assert!(w2 < 2 * w1, "K=2 must NOT be a second walk (sub-linear wire growth)");
-        assert!(w2 - w1 < w1 / 2, "K-doubling grows the trace by ≪ a full walk");
+        assert!(
+            w2 < 2 * w1,
+            "K=2 must NOT be a second walk (sub-linear wire growth)"
+        );
+        assert!(
+            w2 - w1 < w1 / 2,
+            "K-doubling grows the trace by ≪ a full walk"
+        );
     }
 }
 
@@ -5408,7 +6121,7 @@ mod owner_auth_region_tests {
     use noid_core::Block128;
     use noid_gkr::owner_auth::{
         compute_owner_auth_boundary, owner_auth_gkr_channel, prove_owner_auth_killshot,
-        OwnerAuthCircuit, OwnerAuthInputs, OwnerAuthLayout,
+        OwnerAuthCircuit, OwnerAuthInputs,
     };
     use noid_ivc_core::challenger::FsLaneChallenger;
     use noid_ivc_core::pcs::{self, PcsParams};
@@ -5418,24 +6131,14 @@ mod owner_auth_region_tests {
 
     use crate::acceptance::trace::owner_auth::build_owner_auth_slot;
 
-    /// Honest owner-auth fixture (mirrors `tests/owner_auth_channel_region.rs`):
-    /// owners with secrets, addresses derived by the native boundary computation.
-    /// Secrets run the native prover only; no secret-derived value enters a trace.
-    fn fixture(owner_count: usize, seed: u128) -> (OwnerAuthProofKillShot, OwnerAuthPublicInputs) {
-        let layout = OwnerAuthLayout::for_owner_count(owner_count).unwrap();
-        let circuit = OwnerAuthCircuit::build(layout);
-        let spend_secret: Vec<[Block128; 2]> = (0..owner_count)
-            .map(|i| {
-                [
-                    Block128::from(seed + 1000 + i as u128),
-                    Block128::from(seed + 2000 + i as u128),
-                ]
-            })
-            .collect();
+    /// Honest fixed-owner fixture. Secrets run the native prover only; no
+    /// secret-derived value enters a trace.
+    fn fixture(seed: u128) -> (OwnerAuthProofKillShot, OwnerAuthPublicInputs) {
+        let circuit = OwnerAuthCircuit::build();
+        let spend_secret = [Block128::from(seed + 1000), Block128::from(seed + 2000)];
         let tx_body_hash = [Block128::from(seed + 7), Block128::from(seed + 8)];
-        let expected_address =
-            compute_owner_auth_boundary(&circuit, spend_secret.clone(), tx_body_hash);
-        let public = OwnerAuthPublicInputs::new(layout, tx_body_hash, expected_address).unwrap();
+        let expected_address = compute_owner_auth_boundary(&circuit, spend_secret, tx_body_hash);
+        let public = OwnerAuthPublicInputs::new(tx_body_hash, expected_address);
         let inputs = OwnerAuthInputs::from_parts(&public, spend_secret);
         let mut ch = owner_auth_gkr_channel();
         let (proof, _) = prove_owner_auth_killshot(&circuit, &inputs, &mut ch);
@@ -5450,7 +6153,7 @@ mod owner_auth_region_tests {
         let mut proofs = Vec::with_capacity(k);
         let mut publics = Vec::with_capacity(k);
         for t in 0..k {
-            let (p, pubx) = fixture(3, seed0 + (t as u128) * 0x1000);
+            let (p, pubx) = fixture(seed0 + (t as u128) * 0x1000);
             proofs.push(p);
             publics.push(pubx);
         }
@@ -5472,11 +6175,16 @@ mod owner_auth_region_tests {
             .zip(publics.iter())
             .map(|(p, pubx)| OwnerAuthProofTrace::alloc(b, p, pubx.layout))
             .collect();
-        let input_ts: Vec<OwnerAuthPublicInputsTrace> =
-            publics.iter().map(|pubx| OwnerAuthPublicInputsTrace::alloc(b, pubx)).collect();
+        let input_ts: Vec<OwnerAuthPublicInputsTrace> = publics
+            .iter()
+            .map(|pubx| OwnerAuthPublicInputsTrace::alloc(b, pubx))
+            .collect();
         let (_obligations, claims, _recording) =
             discharge_owner_auth_killshots_via_region(b, &proof_ts, &input_ts, proofs, publics);
-        assert!(!claims.is_empty(), "region discharge produced no opening claims");
+        assert!(
+            !claims.is_empty(),
+            "region discharge produced no opening claims"
+        );
 
         let w_log = claims[0].point.len();
         let lanes_per = w_log + 1;
@@ -5519,7 +6227,7 @@ mod owner_auth_region_tests {
     /// combined trace is satisfiable.
     #[test]
     fn owner_auth_region_parity() {
-        let (proof, public) = fixture(3, 0xA3);
+        let (proof, public) = fixture(0xA3);
         let mut b = FieldR1csBuilder::new();
 
         // Inline obligation (the canonical per-tx replay).
@@ -5541,7 +6249,10 @@ mod owner_auth_region_tests {
 
         let nw = b.num_wires();
         let (r1cs, z) = b.build();
-        assert!(r1cs.satisfies(&z), "owner-auth region parity trace unsatisfiable");
+        assert!(
+            r1cs.satisfies(&z),
+            "owner-auth region parity trace unsatisfiable"
+        );
 
         // Same reduced (r_B, b_final) and cap lanes as the inline twin.
         assert_eq!(obligation_region.num_vars, obligation_inline.num_vars);
@@ -5576,7 +6287,7 @@ mod owner_auth_region_tests {
         }
         eprintln!(
             "[owner-auth-region] parity nv={} wires={} (inline+region combined) claims={}",
-            public.layout.num_vars,
+            OWNER_AUTH_NUM_VARS,
             nw,
             claims.len()
         );
@@ -5590,13 +6301,22 @@ mod owner_auth_region_tests {
     #[test]
     fn owner_auth_region_slot_e2e() {
         const OUTER: &[u8] = b"owner-auth-region-slot-outer";
-        let (proof, public) = fixture(3, 0x0E2E);
+        let (proof, public) = fixture(0x0E2E);
         let mut b = FieldR1csBuilder::new();
-        let (spec, io_values, claim_slices, _w_log) =
-            region_slot_into_builder(&mut b, std::slice::from_ref(&proof), std::slice::from_ref(&public));
+        let (spec, io_values, claim_slices, _w_log) = region_slot_into_builder(
+            &mut b,
+            std::slice::from_ref(&proof),
+            std::slice::from_ref(&public),
+        );
         let (r1cs, z) = b.build();
-        assert!(r1cs.satisfies(&z), "honest owner-auth region slot unsatisfiable");
-        assert!(r1cs.m < 22, "gate guard: keep the region slot well under 2^22 rows");
+        assert!(
+            r1cs.satisfies(&z),
+            "honest owner-auth region slot unsatisfiable"
+        );
+        assert!(
+            r1cs.m < 22,
+            "gate guard: keep the region slot well under 2^22 rows"
+        );
 
         let params = PcsParams {
             m: r1cs.m + pcs::LOG_PACKING,
@@ -5612,7 +6332,7 @@ mod owner_auth_region_tests {
             .expect("honest owner-auth region slot verifies");
         eprintln!(
             "[owner-auth-region] slot nv={} rows={} (m={}) claims={}",
-            public.layout.num_vars,
+            OWNER_AUTH_NUM_VARS,
             z.len(),
             r1cs.m,
             spec.claims.len()
@@ -5698,10 +6418,15 @@ mod owner_auth_region_tests {
                 let iv = capacity_iv(TAG_KSCHANNL);
                 [flat_of_tower_u128(iv[0].0), flat_of_tower_u128(iv[1].0)]
             };
-            let streams: Vec<Vec<F128>> =
-                pp.iter().zip(&uu).map(|(p, u)| owner_auth_channel_schedule(p, u).data_flat).collect();
+            let streams: Vec<Vec<F128>> = pp
+                .iter()
+                .zip(&uu)
+                .map(|(p, u)| owner_auth_channel_schedule(p, u).data_flat)
+                .collect();
             let u_c = build_duplex_union(&chan_layout, iv, &streams);
-            run_duplex_union_native(&u_c, OWNER_AUTH_DOMAIN_C).walk_proof.layers[0]
+            run_duplex_union_native(&u_c, OWNER_AUTH_DOMAIN_C)
+                .walk_proof
+                .layers[0]
                 .round_coeffs
                 .len()
         };

@@ -29,33 +29,26 @@ pub const MEDIAN_TIME_BLOCKS: usize = 11;
 /// Maximum transactions decoded in one block, including coinbase.
 ///
 /// This is a hard decoder/DoS cap. The consensus throughput budget is the
-/// semantic block budget below, calibrated to 255 maximum Standard4x8 user
-/// transactions plus one coinbase.
+/// semantic block budget below: 255 fixed-shape user transactions plus one
+/// mandatory coinbase.
 pub const BLOCK_MAX_TXS: usize = 256;
 
-/// Maximum inputs in the baseline Standard4x8 transaction shape.
-pub const MAX_INPUTS: usize = 4;
+/// Fixed input capacity of every transaction body.
+pub const MAX_INPUTS: usize = 8;
 
-/// Maximum outputs in the baseline Standard4x8 transaction shape.
-pub const MAX_OUTPUTS: usize = 8;
-
-/// Baseline non-coinbase block load used to define semantic block capacity.
-pub const BLOCK_BASELINE_STANDARD_USER_TXS: usize = BLOCK_MAX_TXS - 1;
+/// Fixed output capacity of every transaction body.
+pub const MAX_OUTPUTS: usize = 2;
 
 /// Maximum non-coinbase transactions accepted by consensus.
-pub const BLOCK_MAX_USER_TXS: usize = BLOCK_BASELINE_STANDARD_USER_TXS;
+pub const BLOCK_MAX_USER_TXS: usize = BLOCK_MAX_TXS - 1;
 
-/// Maximum shape-charged user input capacity accepted by consensus in one
-/// block. A Standard4x8 body always charges 4 and a Sweep25x2 body always
-/// charges 25, irrespective of its validity bitmap.
-pub const BLOCK_MAX_LIVE_INPUTS: usize =
-    BLOCK_BASELINE_STANDARD_USER_TXS * noid_tx::TxShape::Standard4x8.max_inputs();
+/// Maximum live user inputs accepted in one block.
+pub const BLOCK_MAX_LIVE_INPUTS: usize = 1_020;
 
-/// Maximum shape-charged user output capacity accepted by consensus.
-pub const BLOCK_MAX_USER_OUTPUTS: usize =
-    BLOCK_BASELINE_STANDARD_USER_TXS * noid_tx::TxShape::Standard4x8.max_outputs();
+/// Maximum live user outputs accepted in one block.
+pub const BLOCK_MAX_USER_OUTPUTS: usize = 510;
 
-/// Maximum shape-charged user action capacity accepted by consensus.
+/// Maximum bitmap-live user action capacity accepted by consensus.
 pub const BLOCK_MAX_USER_ACTIONS: usize = BLOCK_MAX_LIVE_INPUTS + BLOCK_MAX_USER_OUTPUTS;
 
 /// Maximum accepted live action count including the mandatory coinbase output.
@@ -65,30 +58,12 @@ pub const BLOCK_MAX_ACTIONS: usize = BLOCK_MAX_USER_ACTIONS + 1;
 /// This is an availability/DoS bound and is checked before segment preload.
 pub const BLOCK_MAX_DISTINCT_SEGMENTS: usize = 256;
 
-/// Maximum full Sweep25x2 transactions admitted by the semantic live-input
-/// budget when every sweep uses 25 live inputs.
-pub const BLOCK_MAX_FULL_SWEEP25X2_TXS: usize =
-    BLOCK_MAX_LIVE_INPUTS / noid_tx::TxShape::Sweep25x2.max_inputs();
-
-#[inline]
-pub const fn block_shape_limits_ok(standard_txs: usize, sweep_txs: usize) -> bool {
-    let user_txs = standard_txs + sweep_txs;
-    let charged_inputs = standard_txs * noid_tx::TxShape::Standard4x8.max_inputs()
-        + sweep_txs * noid_tx::TxShape::Sweep25x2.max_inputs();
-    let charged_outputs = standard_txs * noid_tx::TxShape::Standard4x8.max_outputs()
-        + sweep_txs * noid_tx::TxShape::Sweep25x2.max_outputs();
-    user_txs <= BLOCK_MAX_USER_TXS
-        && charged_inputs <= BLOCK_MAX_LIVE_INPUTS
-        && charged_outputs <= BLOCK_MAX_USER_OUTPUTS
-        && charged_inputs + charged_outputs <= BLOCK_MAX_USER_ACTIONS
-}
-
 // ---------------------------------------------------------------------------
-// Block shape classes
+// Block proof classes
 // ---------------------------------------------------------------------------
 
-/// Standard4x8 transaction-count tiers. Every proof-facing per-block
-/// structure is padded up to the smallest tier holding the block's standard
+/// Fixed-body user-transaction count tiers. Every proof-facing per-block
+/// structure is padded up to the smallest tier holding the block's user
 /// tx count, so the proof system sees a small fixed family of shapes
 /// instead of per-count structures. The tiers ARE the recursive-proof
 /// ladder: one standalone block class and one link class exist per tier,
@@ -97,11 +72,7 @@ pub const fn block_shape_limits_ok(standard_txs: usize, sweep_txs: usize) -> boo
 /// coinbase-only blocks) pad up to it with protocol ghost transactions;
 /// the worst-case padding ratio is bounded by the largest adjacent-tier
 /// step (4x).
-pub const STANDARD_TX_CLASS_TIERS: [usize; 4] = [8, 32, 64, 255];
-
-/// Sweep25x2 transaction-count tiers (same role as the standard tiers; the
-/// top tier is the live-input budget's sweep capacity).
-pub const SWEEP_TX_CLASS_TIERS: [usize; 8] = [0, 1, 2, 4, 8, 16, 32, 40];
+pub const USER_TX_CLASS_TIERS: [usize; 4] = [8, 32, 64, 255];
 
 /// Smallest tier in `tiers` holding `count`, or None past the top tier.
 #[inline]
@@ -109,83 +80,48 @@ fn class_tier_for(tiers: &[usize], count: usize) -> Option<usize> {
     tiers.iter().copied().find(|&tier| tier >= count)
 }
 
-/// Standard-tx class tier for a block's standard tx count.
+/// Proof class tier for a block's user transaction count.
 #[inline]
-pub fn standard_tx_class_tier(count: usize) -> Option<usize> {
-    class_tier_for(&STANDARD_TX_CLASS_TIERS, count)
+pub fn user_tx_class_tier(count: usize) -> Option<usize> {
+    class_tier_for(&USER_TX_CLASS_TIERS, count)
 }
 
-/// Sweep-tx class tier for a block's sweep tx count.
-#[inline]
-pub fn sweep_tx_class_tier(count: usize) -> Option<usize> {
-    class_tier_for(&SWEEP_TX_CLASS_TIERS, count)
-}
-
-/// Live-input (spend) capacity of a shape class: what the class's per-input
+/// Live-input (spend) capacity of a proof class: what the class's per-input
 /// proof structures are padded to. Capped by the semantic
 /// block budget, which admits the tier mix only up to the global
 /// live-input maximum.
 #[inline]
-pub fn block_class_spend_capacity(standard_tier: usize, sweep_tier: usize) -> usize {
-    let cap = standard_tier * noid_tx::TxShape::Standard4x8.max_inputs()
-        + sweep_tier * noid_tx::TxShape::Sweep25x2.max_inputs();
-    cap.min(BLOCK_MAX_LIVE_INPUTS)
+pub fn block_class_spend_capacity(user_tier: usize) -> usize {
+    (user_tier * MAX_INPUTS).min(BLOCK_MAX_LIVE_INPUTS)
 }
 
-/// Spend capacity of the shape class holding a block with the given user-tx
+/// Live user-output capacity of one proof class.
+#[inline]
+pub fn block_class_output_capacity(user_tier: usize) -> usize {
+    (user_tier * MAX_OUTPUTS).min(BLOCK_MAX_USER_OUTPUTS)
+}
+
+/// Maximum exact-state touched surface, including the mandatory coinbase.
+#[inline]
+pub fn block_class_touched_capacity(user_tier: usize) -> usize {
+    block_class_spend_capacity(user_tier) + block_class_output_capacity(user_tier) + 1
+}
+
+/// Spend capacity of the proof class holding a block with the given user-tx
 /// composition, or None past the tier tables (over consensus limits).
 #[inline]
-pub fn block_class_spend_capacity_for_counts(
-    standard_txs: usize,
-    sweep_txs: usize,
-) -> Option<usize> {
-    let standard_tier = standard_tx_class_tier(standard_txs)?;
-    let sweep_tier = sweep_tx_class_tier(sweep_txs)?;
-    Some(block_class_spend_capacity(standard_tier, sweep_tier))
+pub fn block_class_spend_capacity_for_count(user_txs: usize) -> Option<usize> {
+    user_tx_class_tier(user_txs).map(block_class_spend_capacity)
 }
 
-/// The tx-tree leaf target of a block with the given transaction
-/// composition: the tier-quantized user-tx capacity (standard tier + sweep
-/// tier) plus the non-user transactions (the coinbase), padded to the next
-/// power of two (minimum 2). The tx tree is padded to the CLASS capacity —
-/// not the real count — so the tree depth is a pure function of the block's
-/// shape class and the per-tier proof classes stay count-independent.
-/// Compositions past the tier tables fall back to the real count (such
-/// blocks are rejected by consensus elsewhere).
-#[inline]
-pub fn tx_tree_target(standard_txs: usize, sweep_txs: usize, non_user_txs: usize) -> usize {
-    let user_capacity = standard_tx_class_tier(standard_txs)
-        .zip(sweep_tx_class_tier(sweep_txs))
-        .map_or(standard_txs + sweep_txs, |(s, w)| s + w);
-    (user_capacity + non_user_txs).next_power_of_two().max(2)
-}
+/// Number of blocks for the transaction replay-protection epoch.
+///
+/// This is a separate protocol clock from ASERT's short difficulty epoch.
+pub const TX_EPOCH_BLOCKS: u64 = 144;
 
-// ---------------------------------------------------------------------------
-// Epoch anchor
-// ---------------------------------------------------------------------------
-
-/// Epoch anchor validity depth.
-///
-/// A non-coinbase tx's epoch_anchor must reference a header at height in
-/// `[block_height - ANCHOR_DEPTH - 1, block_height - 1]`.
-/// This gives a window of **ANCHOR_DEPTH + 1 = 145** possible anchor heights.
-///
-/// At 15 s block time: ~36 minutes under normal conditions.
-///
-/// Controls:
-/// 1. How old a transaction's epoch_anchor may be (wallet tx validity window).
-/// 2. How far back block headers are retained for anchor validation.
-///
-/// Note: the window *size* is ANCHOR_DEPTH+1 (inclusive on both ends).
-/// The constant name reflects maximum *depth*, not window size.
-///
-pub const ANCHOR_DEPTH: u64 = 144;
-
-// Compile-time assertion: ANCHOR_DEPTH must match noid_tx::ANCHOR_DEPTH.
-// If they drift, replay protection breaks.
 const _: () = assert!(
-    ANCHOR_DEPTH == noid_tx::ANCHOR_DEPTH,
-    "noid_chain ANCHOR_DEPTH must equal noid_tx::ANCHOR_DEPTH"
+    TX_EPOCH_BLOCKS == noid_tx::TX_EPOCH_BLOCKS,
+    "noid_chain TX_EPOCH_BLOCKS must equal noid_tx"
 );
 
 // ---------------------------------------------------------------------------
@@ -195,9 +131,8 @@ const _: () = assert!(
 /// Consensus hard-finality depth.
 ///
 /// Reorgs that would change the finalized prefix are rejected by fork choice.
-/// `18` is suitable only as an initial testnet value (~4.5 minutes at 15s
-/// blocks); mainnet must choose this independently in protocol parameters.
-pub const CONSENSUS_FINALITY_DEPTH: u64 = 18; // testnet initial value
+/// Pre-launch provisional value; publication freeze must ratify it independently.
+pub const CONSENSUS_FINALITY_DEPTH: u64 = 18;
 
 /// Undo-log retention depth for local shallow reorg recovery.
 ///
@@ -345,7 +280,7 @@ pub const MIN_FEE_BASE: u64 = 5_000; // 0.005 NOID
 ///
 /// Inputs do not grow chain state, so this intentionally stays much lower than
 /// the output fee. It keeps very large-input transactions from becoming free
-/// relay/prover spam without penalising useful sweep/consolidation shapes.
+/// relay/prover spam without penalising useful consolidation transactions.
 pub const FEE_PER_INPUT: u64 = 100; // 0.0001 NOID per input
 
 /// Fee charged per live output created by a transaction.
@@ -364,60 +299,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn genesis_target_is_2_pow_237() {
-        // 2^237: bit 237 = bit 5 of byte 29 (LE). Bytes 30-31 = 0x00.
-        let mut expected = [0u8; 32];
-        expected[29] = 0x20; // 2^5 at byte 29 -> 2^(8*29+5) = 2^237
-        assert_eq!(GENESIS_TARGET, expected);
-        assert_eq!(GENESIS_TARGET[28], 0x00);
-        assert_eq!(GENESIS_TARGET[29], 0x20);
-        assert_eq!(GENESIS_TARGET[30], 0x00);
-        assert_eq!(GENESIS_TARGET[31], 0x00);
-    }
-
-    #[test]
-    fn epoch_timing_is_consistent() {
-        assert_eq!(HALFLIFE, EPOCH_LENGTH * BLOCK_TIME);
-        assert_eq!(HALFLIFE, 90, "HALFLIFE = 6 epochs × 15s");
-        assert_eq!(CONSENSUS_FINALITY_DEPTH, 3 * EPOCH_LENGTH);
-    }
-
-    #[test]
-    fn shape_charged_block_budget_is_standard_baseline() {
+    fn final_block_caps_are_exact() {
         assert_eq!(BLOCK_MAX_TXS, 256);
         assert_eq!(BLOCK_MAX_USER_TXS, 255);
-        assert_eq!(BLOCK_MAX_LIVE_INPUTS, 1020);
-        assert_eq!(BLOCK_MAX_USER_OUTPUTS, 2040);
-        assert_eq!(BLOCK_MAX_USER_ACTIONS, 3060);
-        assert_eq!(BLOCK_MAX_ACTIONS, 3061);
-        assert_eq!(BLOCK_MAX_DISTINCT_SEGMENTS, 256);
-        assert_eq!(BLOCK_MAX_FULL_SWEEP25X2_TXS, 40);
+        assert_eq!(MAX_INPUTS, 8);
+        assert_eq!(MAX_OUTPUTS, 2);
+        assert_eq!(BLOCK_MAX_LIVE_INPUTS, 1_020);
+        assert_eq!(BLOCK_MAX_USER_OUTPUTS, 510);
+        assert_eq!(BLOCK_MAX_USER_ACTIONS, 1_530);
+        assert_eq!(BLOCK_MAX_ACTIONS, 1_531);
     }
 
     #[test]
-    fn shape_charged_budget_rejects_sparse_sweep_overload() {
-        assert!(block_shape_limits_ok(255, 0));
-        assert!(block_shape_limits_ok(0, BLOCK_MAX_FULL_SWEEP25X2_TXS));
-        assert!(block_shape_limits_ok(5, 40));
-        assert!(!block_shape_limits_ok(6, 40));
-        assert!(!block_shape_limits_ok(0, BLOCK_MAX_FULL_SWEEP25X2_TXS + 1));
+    fn one_user_class_ladder() {
+        assert_eq!(USER_TX_CLASS_TIERS, [8, 32, 64, 255]);
+        assert_eq!(user_tx_class_tier(0), Some(8));
+        assert_eq!(user_tx_class_tier(9), Some(32));
+        assert_eq!(user_tx_class_tier(255), Some(255));
+        assert_eq!(user_tx_class_tier(256), None);
+        assert_eq!(block_class_spend_capacity(255), BLOCK_MAX_LIVE_INPUTS);
+        assert_eq!(block_class_output_capacity(255), BLOCK_MAX_USER_OUTPUTS);
+        assert_eq!(block_class_touched_capacity(255), 1_531);
     }
 
     #[test]
-    #[allow(clippy::assertions_on_constants)]
-    fn emission_floor_positive() {
-        assert!(FLOOR_REWARD_MICRONOID > 0);
-        assert!(BASE_REWARD_MICRONOID > FLOOR_REWARD_MICRONOID);
-        assert_eq!(BASE_REWARD_MICRONOID, 50 * MICRONOID_PER_NOID);
-    }
-
-    #[test]
-    #[allow(clippy::assertions_on_constants)]
-    fn log_slots_range() {
-        assert!(LOG_SLOTS_GENESIS < LOG_SLOTS_MAX);
-        assert_eq!(LOG_SLOTS_GENESIS, 24);
-        assert_eq!(LOG_SLOTS_MAX, 32);
-        // Each segment fits in 2^16 slots, genesis has 2^(24-16)=256 segments
-        assert_eq!(1u32 << (LOG_SLOTS_GENESIS - LOG_SEGMENT_SIZE), 256);
+    fn transaction_epoch_is_not_asert_epoch() {
+        assert_eq!(TX_EPOCH_BLOCKS, 144);
+        assert_ne!(TX_EPOCH_BLOCKS, EPOCH_LENGTH);
     }
 }

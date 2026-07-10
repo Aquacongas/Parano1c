@@ -15,8 +15,8 @@ use noid_gkr::{
     canonical_authorization_statement_from_body, init_owner_auth_gkr_channel,
     validate_authorization_statement, verify_owner_auth_killshot_with_claims,
     CanonicalAuthorizationStatement, OwnerAuthCircuit, OwnerAuthProofKillShot,
-    OwnerAuthVerifierClaims, VerifiedAuthorization,
-    VerifiedAuthorizationBatch, VerifyAuthorizationError,
+    OwnerAuthVerifierClaims, VerifiedAuthorization, VerifiedAuthorizationBatch,
+    VerifyAuthorizationError,
 };
 use noid_poseidon2b::Poseidon2bChannel;
 use rayon::prelude::*;
@@ -30,7 +30,6 @@ pub enum FiatShamirTraceOp {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AuthorizationVerifierTrace {
     pub tx_index: usize,
-    pub owner_count: usize,
     pub live_input_count: usize,
     pub proof_byte_len: usize,
     pub transcript: Vec<FiatShamirTraceOp>,
@@ -97,7 +96,7 @@ pub fn verify_authorization_statement_proof_with_trace(
     proof: &OwnerAuthProofKillShot,
 ) -> Result<(VerifiedAuthorization, AuthorizationVerifierTrace), VerifyAuthorizationError> {
     validate_authorization_statement(statement)?;
-    let circuit = OwnerAuthCircuit::build(statement.public.layout);
+    let circuit = OwnerAuthCircuit::build();
     let mut channel = TracingPoseidon2bChannel::new();
     init_owner_auth_gkr_channel(&mut channel);
     let verifier_claims =
@@ -106,12 +105,10 @@ pub fn verify_authorization_statement_proof_with_trace(
 
     let verified = VerifiedAuthorization {
         tx_index: statement.tx_index,
-        owner_count: statement.public.layout.owner_count,
         live_input_count: usize::from(statement.live_input_count),
     };
     let trace = AuthorizationVerifierTrace {
         tx_index: statement.tx_index,
-        owner_count: verified.owner_count,
         live_input_count: verified.live_input_count,
         proof_byte_len: proof.byte_len(),
         transcript: channel.into_transcript(),
@@ -162,39 +159,34 @@ pub fn verify_authorization_batch_native_with_traces(
         .map(|((tx_index, tx), proof)| {
             let statement = canonical_authorization_statement_from_body(
                 *tx_index,
-                tx.tx_body_hash.as_fields(),
+                tx.txid().as_fields(),
                 &tx.body,
             )
             .map_err(|_| AuthorizationBatchError::Statement {
                 tx_index: *tx_index,
             })?;
             let (verified, trace) = verify_authorization_statement_with_trace(&statement, proof)?;
-            if verified.owner_count == 0 || verified.live_input_count == 0 {
+            if verified.live_input_count == 0 {
                 return Err(AuthorizationBatchError::EmptyVerifiedCounts {
                     tx_index: *tx_index,
                 });
             }
-            Ok((verified.owner_count, verified.live_input_count, trace))
+            Ok((verified.live_input_count, trace))
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    let owner_count_total = verified
-        .iter()
-        .map(|(owner_count, _, _)| *owner_count)
-        .sum::<usize>();
     let live_input_count_total = verified
         .iter()
-        .map(|(_, live_inputs, _)| *live_inputs)
+        .map(|(live_inputs, _)| *live_inputs)
         .sum::<usize>();
     let traces = verified
         .into_iter()
-        .map(|(_, _, trace)| trace)
+        .map(|(_, trace)| trace)
         .collect::<Vec<_>>();
 
     Ok((
         VerifiedAuthorizationBatch {
             user_tx_count: user_txs.len(),
-            owner_count_total,
             live_input_count_total,
         },
         traces,
@@ -208,44 +200,39 @@ mod tests {
     use noid_core::TowerField;
     use noid_gkr::OwnerAuthWitness;
     use noid_poseidon2b::primitives::{derive_address, Address, SpendSecret};
-    use noid_tx::{hash_tx_body_for_shape, Transaction, TxBody, TxInput, TxOutput, TxShape};
+    use noid_tx::{
+        output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS,
+    };
 
     fn body_and_secret() -> (TxBody, SpendSecret) {
         let secret = SpendSecret([0x42; 32]);
         let owner = derive_address(&secret);
+        let mut inputs = [TxInput::dummy(); TX_INPUTS];
+        inputs[0] = TxInput {
+            slot_index: 7,
+            amount: 100,
+            creation_id: 0,
+        };
+        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        outputs[0] = TxOutput {
+            slot_index: 1007,
+            amount: 97,
+            owner: Address([0x11; 32]),
+        };
         let body = TxBody {
-            shape: TxShape::Standard4x8,
             epoch_anchor: [0xA5; 32],
             fee: 3,
-            inputs: vec![TxInput {
-                slot_index: 7,
-                value: 100,
-                creation_id: 0,
-                owner,
-                spend_secret: secret.clone(),
-                valid: true,
-            }],
-            outputs: vec![TxOutput {
-                slot_index: 1007,
-                value: 97,
-                owner: Address([0x11; 32]),
-                valid: true,
-            }],
+            input_owner: owner,
+            inputs,
+            outputs,
+            validity_bitmap: 1 | output_bitmap_bit(0),
             is_coinbase: false,
         };
         (body, secret)
     }
 
     fn tx(body: TxBody) -> Transaction {
-        let tx_body_hash = hash_tx_body_for_shape(
-            body.shape,
-            &body.epoch_anchor,
-            body.fee,
-            &body.inputs,
-            &body.outputs,
-            body.is_coinbase,
-        );
-        Transaction { body, tx_body_hash }
+        Transaction::new(body)
     }
 
     fn block(transaction: Transaction) -> Block {
@@ -279,7 +266,6 @@ mod tests {
         let verified = verify_authorization_batch_native(&block, std::slice::from_ref(&proof))
             .expect("authorization batch verifies");
         assert_eq!(verified.user_tx_count, 1);
-        assert_eq!(verified.owner_count_total, 1);
         assert_eq!(verified.live_input_count_total, 1);
 
         let (verified, traces) =
@@ -288,7 +274,6 @@ mod tests {
         assert_eq!(verified.user_tx_count, 1);
         assert_eq!(traces.len(), 1);
         assert_eq!(traces[0].tx_index, 0);
-        assert_eq!(traces[0].owner_count, 1);
         assert_eq!(traces[0].live_input_count, 1);
         assert_eq!(traces[0].proof_byte_len, proof.byte_len());
         assert_eq!(traces[0].verifier_claims.state_claims.len(), 3);
@@ -333,7 +318,7 @@ mod tests {
         );
 
         let mut bad_hash_block = block.clone();
-        bad_hash_block.transactions[0].tx_body_hash.0[0] ^= 0x80;
+        bad_hash_block.transactions[0].body.epoch_anchor[0] ^= 0x80;
         assert!(matches!(
             verify_authorization_batch_native_with_traces(
                 &bad_hash_block,

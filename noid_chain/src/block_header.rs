@@ -24,7 +24,7 @@ use noid_poseidon2b::primitives::{Address, Digest};
 /// ```text
 ///   prev_block_hash       [32B]  hash of previous header
 ///   state_root            [32B]  exact sparse-Merkle UTXO root
-///   tx_root               [32B]  COMPRESS Merkle of tx_body_hashes
+///   tx_root               [32B]  count-bound universal transaction root
 ///   timestamp             [8B]   seconds since Unix epoch (LE u64)
 ///   height                [8B]   block height (LE u64)
 ///   miner_address         [32B]  coinbase recipient address
@@ -41,7 +41,7 @@ pub struct BlockHeader {
     pub prev_block_hash: Digest,
     /// Exact sparse-Merkle root over the UTXO slot vector.
     pub state_root: Digest,
-    /// COMPRESS-domain Merkle root of all `tx_body_hash`es in block order.
+    /// Count-bound `TAG_TXROOT` wrap of the universal 256-leaf transaction tree.
     pub tx_root: Digest,
     pub timestamp: u64,
     pub height: u64,
@@ -51,8 +51,9 @@ pub struct BlockHeader {
     /// 256-bit ASERT difficulty target (LE). Block valid iff
     /// `H_POSEIDON_POW(header) < difficulty_target`.
     pub difficulty_target: [u8; 32],
-    /// Slot-space depth: `log₂(num_slots)`. Lives in [24, 32] on mainnet;
-    /// may be smaller in test mode. Replicated in every Fiat-Shamir
+    /// Slot-space depth: `log₂(num_slots)`. Production values are in
+    /// `[LOG_SLOTS_GENESIS, LOG_SLOTS_MAX]`; small in-memory fixtures may use
+    /// reduced domains. Replicated in every Fiat-Shamir
     pub log_slots: u32,
     /// Number of live (non-empty) slots after all transactions in this block
     /// are applied. Drives the §15.3.6 expansion trigger. MUST equal
@@ -66,7 +67,7 @@ pub struct BlockHeader {
 /// Compute the semantic `block_id` — the Poseidon2b hash of the canonical
 /// semantic header.
 ///
-/// Used as `epoch_anchor` in transactions (`H_BLOCK(header[height - 6])`)
+/// Header identity is also used by the separate 144-block transaction epoch.
 /// and for chain linking (`prev_block_hash`).
 pub fn hash_block_header(hdr: &BlockHeader) -> Digest {
     let mut s = Poseidon2bSponge::with_iv(capacity_iv(TAG_BLOCKHDR));
