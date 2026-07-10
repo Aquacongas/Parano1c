@@ -51,9 +51,10 @@ libp2p  = { version = "0.54", features = ["tokio", "tcp", "noise", "yamux", "gos
 futures = "0.3"
 reqwest = { version = "0.12", features = ["json"] }
 
-# Wallet security: key derivation + symmetric encryption
+# Wallet security: key derivation, zeroization, and owner-only file handling
 rand             = "0.8"
 zeroize          = { version = "1", features = ["zeroize_derive"] }
+libc             = "0.2"
 
 # Memory: jemalloc as global allocator.
 # glibc malloc retains freed pages from large proof-generation allocations (FRI/NTT Vecs)

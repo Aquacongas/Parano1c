@@ -181,8 +181,10 @@ impl std::fmt::Display for TxBodyHash {
     }
 }
 
-/// The 256-bit wallet spend secret. Preimage of `Address`. Stored
-/// encrypted at rest.
+/// The 256-bit wallet spend secret. Preimage of `Address`. It is derived from
+/// the wallet master secret and never serialized by transaction code. The
+/// current daemon keystore stores its master secret in plaintext behind
+/// owner-only filesystem permissions; it does not claim encryption at rest.
 ///
 /// SECURITY: NOT `Copy` — prevents accidental bitwise copies that bypass
 /// the `ZeroizeOnDrop` destructor. NOT `Debug` — prevents printing in

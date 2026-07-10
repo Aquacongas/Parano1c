@@ -11,10 +11,12 @@
 //! master secret from a user-chosen file (photo, document, etc.) instead of
 //! generating random bytes.
 
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use rand::RngCore;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use noid_poseidon2b::primitives::{Address, SpendSecret};
 
@@ -30,6 +32,12 @@ pub enum KeystoreError {
     NotFound(PathBuf),
     #[error("invalid wallet file format")]
     InvalidFormat,
+    #[cfg(unix)]
+    #[error("wallet file permissions are insecure: expected 0600, got {mode:04o}")]
+    InsecurePermissions { mode: u32 },
+    #[cfg(unix)]
+    #[error("wallet file belongs to uid {actual}, expected current uid {expected}")]
+    WrongOwner { actual: u32, expected: u32 },
     #[error("I/O: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -88,6 +96,31 @@ pub struct Keystore {
     path: PathBuf,
 }
 
+struct TemporaryKeyFile {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TemporaryKeyFile {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn remove(mut self) -> std::io::Result<()> {
+        std::fs::remove_file(&self.path)?;
+        self.armed = false;
+        Ok(())
+    }
+}
+
+impl Drop for TemporaryKeyFile {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
 impl Keystore {
     pub fn new(path: impl AsRef<Path>) -> Self {
         Self {
@@ -106,28 +139,57 @@ impl Keystore {
         if self.exists() {
             return Err(KeystoreError::AlreadyExists(self.path.clone()));
         }
-        let mut secret = [0u8; SECRET_LEN];
-        rand::thread_rng().fill_bytes(&mut secret);
+        let mut secret = Zeroizing::new([0u8; SECRET_LEN]);
+        rand::thread_rng().fill_bytes(&mut *secret);
 
-        let mut buf = Vec::with_capacity(PLAIN_FILE_LEN);
+        let mut buf = Zeroizing::new(Vec::with_capacity(PLAIN_FILE_LEN));
         buf.extend_from_slice(PLAIN_MAGIC);
-        buf.extend_from_slice(&secret);
+        buf.extend_from_slice(&*secret);
 
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        // Atomic write: write to .tmp then rename.
-        let tmp = self.path.with_extension("tmp");
-        std::fs::write(&tmp, &buf)?;
-        std::fs::rename(&tmp, &self.path)?;
-
+        // Create a unique owner-only inode before the first secret byte is
+        // written. `create_new` and O_NOFOLLOW reject a pre-existing temp path
+        // or symlink. Linking that inode into the final name is atomic and,
+        // unlike rename on Unix, cannot replace a wallet created concurrently.
+        let tmp = self
+            .path
+            .with_extension(format!("tmp.{:032x}", rand::random::<u128>()));
+        let temporary = TemporaryKeyFile::new(tmp.clone());
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600))?;
+            use std::os::unix::fs::OpenOptionsExt;
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        }
+        let mut file = options.open(&tmp)?;
+        file.write_all(&buf)?;
+        file.sync_all()?;
+        drop(file);
+
+        match std::fs::hard_link(&tmp, &self.path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(KeystoreError::AlreadyExists(self.path.clone()));
+            }
+            Err(error) => return Err(error.into()),
+        }
+        // The final link is already durable and safe to use. Temp cleanup is
+        // best-effort: its guard retries once on failure, and any orphan keeps
+        // the same owner-only mode rather than turning successful wallet
+        // creation into a misleading externally-visible error.
+        let _ = temporary.remove();
+
+        #[cfg(unix)]
+        if let Some(parent) = self.path.parent() {
+            File::open(parent)?.sync_all()?;
         }
 
-        Ok(MasterSecret(secret))
+        Ok(MasterSecret(*secret))
     }
 
     /// Load a plaintext wallet key file.
@@ -135,7 +197,36 @@ impl Keystore {
         if !self.exists() {
             return Err(KeystoreError::NotFound(self.path.clone()));
         }
-        let data = std::fs::read(&self.path)?;
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        }
+        let file = options.open(&self.path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(KeystoreError::InvalidFormat);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let mode = metadata.permissions().mode() & 0o777;
+            if mode != 0o600 {
+                return Err(KeystoreError::InsecurePermissions { mode });
+            }
+            let actual = metadata.uid();
+            // SAFETY: `geteuid` has no preconditions and does not dereference
+            // pointers or mutate process state.
+            let expected = unsafe { libc::geteuid() };
+            if actual != expected {
+                return Err(KeystoreError::WrongOwner { actual, expected });
+            }
+        }
+        let mut data = Zeroizing::new(Vec::with_capacity(PLAIN_FILE_LEN + 1));
+        file.take((PLAIN_FILE_LEN + 1) as u64)
+            .read_to_end(&mut data)?;
         if data.len() != PLAIN_FILE_LEN {
             return Err(KeystoreError::InvalidFormat);
         }
@@ -202,5 +293,43 @@ mod tests {
             master.derive_spend_secret(0).0,
             master.derive_spend_secret(1).0
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_is_private_before_and_after_load() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("wallet.key");
+        let ks = Keystore::new(&path);
+        ks.create_plain().unwrap();
+
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        assert!(metadata.file_type().is_file());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+        ks.load_plain().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_rejects_public_permissions_and_symlinks() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("wallet.key");
+        let ks = Keystore::new(&path);
+        ks.create_plain().unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            ks.load_plain(),
+            Err(KeystoreError::InsecurePermissions { mode: 0o644 })
+        ));
+
+        let link = dir.path().join("wallet-link.key");
+        symlink(&path, &link).unwrap();
+        let linked = Keystore::new(link);
+        assert!(matches!(linked.load_plain(), Err(KeystoreError::Io(_))));
     }
 }
