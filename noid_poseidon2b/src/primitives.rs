@@ -305,14 +305,6 @@ pub fn hash_input_leaf_packed(slot_index: u32, packed_value: Block128, owner: &A
     ])
 }
 
-/// Legacy `creation_id = 0` input-leaf helper.
-///
-/// This remains the compatibility entry point for callers that do not carry
-/// incarnations. Its output is byte-identical to the pre-incarnation hash.
-pub fn hash_input_leaf(slot_index: u32, value: u64, owner: &Address) -> Digest {
-    hash_input_leaf_packed(slot_index, Block128::from(value as u128), owner)
-}
-
 /// Per-output leaf of the tx-body Merkle tree.
 ///
 /// Fixed-length 4-field sponge under IV `OUTLEAF_`:
@@ -487,6 +479,10 @@ mod tests {
 
     const SS: SpendSecret = SpendSecret([7u8; 32]);
 
+    fn zero_creation_input_leaf(slot_index: u32, value: u64, owner: &Address) -> Digest {
+        hash_input_leaf_packed(slot_index, Block128::from(value as u128), owner)
+    }
+
     fn pad_inputs(leaves: Vec<Digest>) -> [Digest; TXBODY_INPUTS] {
         let mut out = [[0u8; 32]; TXBODY_INPUTS];
         for (i, d) in leaves.into_iter().enumerate() {
@@ -526,7 +522,7 @@ mod tests {
         let c = hash_utxo_leaf(100, &addr);
         assert_eq!(c, hash_utxo_leaf(100, &addr));
 
-        let ins = pad_inputs(vec![hash_input_leaf(5, 100, &addr)]);
+        let ins = pad_inputs(vec![zero_creation_input_leaf(5, 100, &addr)]);
         let outs = pad_outputs(vec![c.0]);
         let tb = hash_tx_body(&[1u8; 32], 3, &ins, &outs, false, 0);
         assert_eq!(tb, hash_tx_body(&[1u8; 32], 3, &ins, &outs, false, 0));
@@ -535,16 +531,16 @@ mod tests {
     }
 
     #[test]
-    fn packed_input_leaf_preserves_zero_incarnation_and_binds_nonzero() {
+    fn packed_input_leaf_uses_low_lane_for_zero_id_and_binds_nonzero() {
         let addr = Address([0x6Du8; 32]);
         let amount = 0x0123_4567_89AB_CDEFu64;
-        let legacy = hash_input_leaf(17, amount, &addr);
+        let zero_id = zero_creation_input_leaf(17, amount, &addr);
         assert_eq!(
-            legacy,
+            zero_id,
             hash_input_leaf_packed(17, Block128::from(amount as u128), &addr)
         );
         let incarnated = Block128::from((9u128 << 64) | amount as u128);
-        assert_ne!(legacy, hash_input_leaf_packed(17, incarnated, &addr));
+        assert_ne!(zero_id, hash_input_leaf_packed(17, incarnated, &addr));
     }
 
     #[test]
@@ -580,8 +576,8 @@ mod tests {
     fn tx_body_sensitive_to_ordering_and_fee() {
         let a1 = Address([1u8; 32]);
         let a2 = Address([2u8; 32]);
-        let in1 = hash_input_leaf(0, 1, &a1);
-        let in2 = hash_input_leaf(0, 2, &a2);
+        let in1 = zero_creation_input_leaf(0, 1, &a1);
+        let in2 = zero_creation_input_leaf(0, 2, &a2);
         let c1 = hash_utxo_leaf(1, &a1).0;
         let c2 = hash_utxo_leaf(2, &a2).0;
 
@@ -652,7 +648,7 @@ mod tests {
         let addr = Address([3u8; 32]);
         let mut ins = [[0u8; 32]; SWEEP_TXBODY_INPUTS];
         for i in 0..SWEEP_TXBODY_INPUTS {
-            ins[i] = hash_input_leaf(i as u32, 100 + i as u64, &addr);
+            ins[i] = zero_creation_input_leaf(i as u32, 100 + i as u64, &addr);
         }
         let outs = pad_sweep_outputs(vec![
             hash_output_leaf(1000, 1200, &addr),
@@ -683,9 +679,9 @@ mod tests {
     #[test]
     fn sweep_tx_body_is_shape_separated_from_standard() {
         let addr = Address([4u8; 32]);
-        let standard_ins = pad_inputs(vec![hash_input_leaf(1, 100, &addr)]);
+        let standard_ins = pad_inputs(vec![zero_creation_input_leaf(1, 100, &addr)]);
         let standard_outs = pad_outputs(vec![hash_output_leaf(2, 90, &addr)]);
-        let sweep_ins = pad_sweep_inputs(vec![hash_input_leaf(1, 100, &addr)]);
+        let sweep_ins = pad_sweep_inputs(vec![zero_creation_input_leaf(1, 100, &addr)]);
         let sweep_outs = pad_sweep_outputs(vec![hash_output_leaf(2, 90, &addr)]);
         let standard = hash_tx_body(&[0x11; 32], 10, &standard_ins, &standard_outs, false, 0);
         let sweep = hash_tx_body_sweep25x2(&[0x11; 32], 10, &sweep_ins, &sweep_outs, false, 0);
@@ -698,7 +694,7 @@ mod tests {
         let anchor = [0x22; 32];
         let mut ins = [[0u8; 32]; SWEEP_TXBODY_INPUTS];
         for i in 0..SWEEP_TXBODY_INPUTS {
-            ins[i] = hash_input_leaf(i as u32, 10 + i as u64, &addr);
+            ins[i] = zero_creation_input_leaf(i as u32, 10 + i as u64, &addr);
         }
         let outs = pad_sweep_outputs(vec![
             hash_output_leaf(30, 100, &addr),
@@ -706,7 +702,7 @@ mod tests {
         ]);
         let h = hash_tx_body_sweep25x2(&anchor, 3, &ins, &outs, false, 0);
         let mut ins2 = ins;
-        ins2[24] = hash_input_leaf(24, 999, &addr);
+        ins2[24] = zero_creation_input_leaf(24, 999, &addr);
         let h2 = hash_tx_body_sweep25x2(&anchor, 3, &ins2, &outs, false, 0);
         assert_ne!(h, h2);
         let mut outs2 = outs;
@@ -724,13 +720,13 @@ mod tests {
         let outs_empty = [[0u8; 32]; TXBODY_OUTPUTS];
 
         let mut ins_one = ins_empty;
-        ins_one[0] = hash_input_leaf(1, 100, &a);
+        ins_one[0] = zero_creation_input_leaf(1, 100, &a);
         let mut outs_one = outs_empty;
         outs_one[0] = hash_output_leaf(0, 50, &a);
 
         let mut ins_full = ins_empty;
         for i in 0..TXBODY_INPUTS {
-            ins_full[i] = hash_input_leaf(i as u32, 10 + i as u64, &a);
+            ins_full[i] = zero_creation_input_leaf(i as u32, 10 + i as u64, &a);
         }
         let mut outs_full = outs_empty;
         for i in 0..TXBODY_OUTPUTS {

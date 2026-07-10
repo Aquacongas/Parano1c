@@ -27,7 +27,6 @@ use noid_tx::Transaction;
 
 use crate::block_header::BlockHeader;
 use crate::consensus::pow::block_id;
-use crate::reuse_guard::ReuseGuardActionState;
 use crate::state::{apply_tx_checked_deferred_root, ChainState};
 
 // ---------------------------------------------------------------------------
@@ -182,7 +181,7 @@ pub fn build_block_template(
     // 3. Apply non-coinbase txs to scratch state.
     let mut selection_scratch = state.clone();
     if should_expand {
-        selection_scratch.state.expand();
+        selection_scratch.expand_one();
     }
     // Selection executes users before their fee-dependent coinbase is known.
     // Reserve the coinbase's canonical first creation ID so user outputs get
@@ -198,7 +197,6 @@ pub fn build_block_template(
             })?;
 
     let mut applied_winners: Vec<Transaction> = Vec::new();
-    let mut guard_actions = ReuseGuardActionState::default();
     let ordered_winners = order_block_txs(winners);
     for tx in ordered_winners {
         let required =
@@ -207,16 +205,8 @@ pub fn build_block_template(
         if actual < required {
             continue;
         }
-        let mut trial_guard_actions = guard_actions.clone();
-        if trial_guard_actions
-            .validate_transaction(&state.reuse_guard, parent.height + 1, &tx)
-            .is_err()
-        {
-            continue;
-        }
         match apply_tx_checked_deferred_root(&mut selection_scratch, &tx.body) {
             Ok(_) => {
-                guard_actions = trial_guard_actions;
                 applied_winners.push(tx);
             }
             Err(_e) => {}
@@ -229,7 +219,7 @@ pub fn build_block_template(
     // the actual block and exact action stream are coinbase -> users.
     let mut scratch = state.clone();
     if should_expand {
-        scratch.state.expand();
+        scratch.expand_one();
     }
 
     // 4. Build coinbase transaction.
@@ -262,12 +252,10 @@ pub fn build_block_template(
         let reuse_hints = scratch
             .state
             .empty_slot_hints_in_populated_segments(seed, 32, &reserved);
-        if let Some(slot) = reuse_hints.into_iter().find(|&slot| {
-            scratch.state.slot(slot) == crate::fri_state::SlotValue::EMPTY
-                && guard_actions
-                    .validate_mint(&state.reuse_guard, parent.height + 1, slot)
-                    .is_ok()
-        }) {
+        if let Some(slot) = reuse_hints
+            .into_iter()
+            .find(|&slot| scratch.state.slot(slot) == crate::fri_state::SlotValue::EMPTY)
+        {
             slot
         } else {
             // Fall back to the virgin-zone allocator. Grow the candidate window
@@ -281,9 +269,6 @@ pub fn build_block_template(
                     .find(|&slot| {
                         !reserved.contains(&slot)
                             && scratch.state.slot(slot) == crate::fri_state::SlotValue::EMPTY
-                            && guard_actions
-                                .validate_mint(&state.reuse_guard, parent.height + 1, slot)
-                                .is_ok()
                     });
                 count *= 2;
             }
@@ -332,29 +317,10 @@ pub fn build_block_template(
             .map_err(|e| TemplateBuildError::StateApplyError(format!("{:?}", e)))?;
     }
 
-    let exact_bodies: Vec<_> = std::iter::once(coinbase.body.clone())
-        .chain(ordered_winners.iter().map(|tx| tx.body.clone()))
-        .collect();
-    let exact_commitments: Vec<_> = exact_bodies
-        .iter()
-        .map(|body| noid_tx::compute_claims_commitment(&body.inputs, &body.outputs))
-        .collect();
-    let mut exact_parent_state = state.state.clone();
-    if should_expand {
-        exact_parent_state.expand();
-    }
-    let exact_surface = crate::state_delta::build_exact_action_surface(
-        &exact_parent_state,
-        &exact_bodies,
-        &exact_commitments,
-        state.alloc_counter,
-    )
-    .map_err(|e| TemplateBuildError::StateApplyError(format!("{:?}", e)))?;
-    crate::block::advance_reuse_state(&mut scratch, parent.height + 1, &exact_surface.spent_slots)
-        .map_err(|e| TemplateBuildError::StateApplyError(format!("{:?}", e)))?;
-
     // 5. Compute final header fields.
-    let state_root = scratch.state_root();
+    let state_root = scratch
+        .try_state_root()
+        .map_err(|e| TemplateBuildError::StateApplyError(format!("{e:?}")))?;
     // Collect only tx_body_hashes to avoid cloning full Transaction objects.
     let tx_hashes_for_root: Vec<[u8; 32]> = std::iter::once(coinbase.tx_body_hash.0)
         .chain(ordered_winners.iter().map(|tx| tx.tx_body_hash.0))
@@ -451,27 +417,6 @@ mod tests {
     }
 
     #[test]
-    fn template_rejects_when_every_coinbase_slot_is_guarded() {
-        let mut state = fresh_state();
-        let all_slots: Vec<u32> = (0..state.state.num_slots() as u32).collect();
-        state.reuse_guard.apply_spends(0, &all_slots).unwrap();
-        let mut parent = genesis_header();
-        parent.state_root = state.state_root();
-        parent.log_slots = TEST_LOG_SLOTS as u32;
-
-        let result = build_block_template(
-            &parent,
-            &state,
-            &[parent.active_slot_count],
-            vec![],
-            Address([0xAB; 32]),
-            GENESIS_TIMESTAMP + BLOCK_TIME,
-            GENESIS_TARGET,
-        );
-        assert!(matches!(result, Err(TemplateBuildError::NoCoinbaseSlot)));
-    }
-
-    #[test]
     fn template_state_root_matches_applied() {
         let parent = genesis_header();
         let mut state = fresh_state();
@@ -520,7 +465,7 @@ mod tests {
     }
 
     #[test]
-    fn user_spend_template_state_root_includes_reuse_guard_update() {
+    fn user_spend_template_state_root_matches_direct_utxo_root() {
         let owner = Address([0x11; 32]);
         let [owner_hi, owner_lo] = owner.as_fields();
         let mut state = fresh_state();
@@ -591,17 +536,7 @@ mod tests {
             "selected user outputs must keep coinbase-first creation IDs"
         );
         assert_eq!(tmpl.alloc_counter, 3);
-        let no_guard_root = expected.state_root();
-        expected
-            .reuse_guard
-            .apply_spends(tmpl.height, &[3])
-            .unwrap();
         let expected_root = expected.state_root();
-
-        assert_ne!(
-            no_guard_root, expected_root,
-            "spend blocks must change the composite root through ReuseGuard"
-        );
         assert_eq!(tmpl.state_root, expected_root);
 
         let mut block_order_state = state.clone();

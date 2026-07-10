@@ -131,17 +131,12 @@ pub struct GetStateManifestResponse {
     pub eff_log: u8,
     /// IDs of all non-empty state segments.  Each must be fetched individually.
     pub segment_ids: Vec<u16>,
-    /// Exact sparse-state segment roots aligned with `segment_ids`. The sparse
-    /// Merkle root reconstructed from this table and canonical zero leaves must
-    /// equal the snapshot tip header's `state_root` before segment download is
-    /// accepted by the checkpoint proof verifier.
+    /// Raw FRI segment roots aligned with `segment_ids`. These authenticate
+    /// downloaded payloads; after decoding, the receiver independently rebuilds
+    /// the exact sparse UTXO root and compares it with the tip header.
     pub segment_roots: Vec<[u8; 32]>,
     /// Wire-encoded recent headers (last ~155 blocks) for PoW validation.
     pub recent_headers: Vec<Vec<u8>>,
-    /// Canonical ReuseGuard buckets at the advertised snapshot boundary. The block header's
-    /// `state_root` commits to both the UTXO root and this guard root, so a
-    /// snapshot cannot be reconstructed from UTXO segments alone.
-    pub reuse_guard_buckets: Vec<noid_chain::GuardBucket>,
 }
 
 // ---------------------------------------------------------------------------

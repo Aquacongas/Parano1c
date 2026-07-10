@@ -24,17 +24,15 @@ use crate::header_anchor::{
     compute_header_chain_anchor, extend_header_chain_anchor, HeaderChainAnchor,
     HeaderChainAnchorError,
 };
-use crate::reuse_guard::{GuardBucket, REUSE_GUARD_BUCKETS};
 use crate::segmented_state::SegmentColumns;
 use crate::storage::meta::ConsensusMeta;
 use crate::storage::serial::{
     decode_chain_tip, decode_chain_work, decode_checkpoint_coverage, decode_checkpoint_package,
-    decode_consensus_meta, decode_header, decode_header_chain_anchor, decode_reuse_guard_buckets,
-    decode_segment, decode_state_meta, decode_tx_index_value, decode_undo_log, encode_chain_tip,
-    encode_chain_work, encode_checkpoint_coverage, encode_checkpoint_package,
-    encode_consensus_meta, encode_header, encode_header_chain_anchor, encode_reuse_guard_buckets,
-    encode_segment, encode_state_meta, encode_tx_index_value, encode_undo_log, u64_from_key,
-    u64_key,
+    decode_consensus_meta, decode_header, decode_header_chain_anchor, decode_segment,
+    decode_state_meta, decode_tx_index_value, decode_undo_log, encode_chain_tip, encode_chain_work,
+    encode_checkpoint_coverage, encode_checkpoint_package, encode_consensus_meta, encode_header,
+    encode_header_chain_anchor, encode_segment, encode_state_meta, encode_tx_index_value,
+    encode_undo_log, u64_from_key, u64_key,
 };
 
 // ---------------------------------------------------------------------------
@@ -49,7 +47,6 @@ const T_CHAIN_WORK: &str = "chain_work";
 const T_UNDO_LOGS: &str = "undo";
 const T_SEGMENTS: &str = "segments";
 const T_STATE_META: &str = "state_meta";
-const T_REUSE_GUARD: &str = "reuse_guard";
 const T_RECENT_BLOCKS: &str = "recent";
 /// Transaction index for receipt lookup. Key: TxBodyHash (32B). Value: (height, tx_pos) (12B).
 const T_TX_INDEX: &str = "tx_index";
@@ -84,7 +81,6 @@ const N_TABLES: u64 = 32;
 // Single-entry table keys
 const KEY_TIP: &[u8] = &[0u8];
 const KEY_META: &[u8] = &[0u8];
-const KEY_REUSE_GUARD: &[u8] = &[0u8];
 const KEY_CONSENSUS_META: &[u8] = &[0u8];
 const KEY_CHECKPOINT_COVERAGE: &[u8] = &[0u8];
 
@@ -217,7 +213,6 @@ impl MdbxStore {
             T_UNDO_LOGS,
             T_SEGMENTS,
             T_STATE_META,
-            T_REUSE_GUARD,
             T_RECENT_BLOCKS,
             T_TX_INDEX,
             T_BLOCK_PROOFS,
@@ -298,15 +293,6 @@ impl MdbxStore {
         )?;
         txn.commit()?;
         Ok(())
-    }
-
-    pub fn get_reuse_guard_buckets(
-        &self,
-    ) -> Result<Option<[GuardBucket; REUSE_GUARD_BUCKETS]>, StoreError> {
-        let txn = self.db.begin_ro_txn()?;
-        let tbl = txn.open_table(Some(T_REUSE_GUARD))?;
-        let raw: Option<Vec<u8>> = txn.get(&tbl, KEY_REUSE_GUARD)?;
-        Ok(raw.and_then(|b| decode_reuse_guard_buckets(&b)))
     }
 
     pub fn get_header(&self, height: u64) -> Result<Option<BlockHeader>, StoreError> {
@@ -839,14 +825,12 @@ impl MdbxStore {
     ///
     /// This replaces volatile state tables only. Canonical headers, hash->height,
     /// chainwork, and local history/checkpoint tables are preserved.
-    #[allow(clippy::too_many_arguments)]
     pub fn install_state_snapshot(
         &self,
         tip_header: &BlockHeader,
         tip_hash: &[u8; 32],
         consensus_meta: &ConsensusMeta,
         segments: &[(u16, u8, &SegmentColumns)],
-        reuse_guard_buckets: &[GuardBucket; REUSE_GUARD_BUCKETS],
     ) -> Result<(), StoreError> {
         use std::collections::HashMap;
 
@@ -926,14 +910,6 @@ impl MdbxStore {
                 tip_header.active_slot_count,
                 tip_header.alloc_counter,
             ),
-            WriteFlags::empty(),
-        )?;
-
-        let guard_tbl = txn.open_table(Some(T_REUSE_GUARD))?;
-        txn.put(
-            &guard_tbl,
-            KEY_REUSE_GUARD,
-            encode_reuse_guard_buckets(reuse_guard_buckets),
             WriteFlags::empty(),
         )?;
 
@@ -1027,7 +1003,6 @@ impl MdbxStore {
         hash: &[u8; 32],
         undo_log: &BlockUndoLog,
         dirty_segments: &[(u16, u8, &SegmentColumns)], // (seg_id, effective_log_seg, cols)
-        reuse_guard_buckets: &[GuardBucket; REUSE_GUARD_BUCKETS],
         tx_hashes: &[TxBodyHash],
         tx_index_deletes: &[TxBodyHash],
         block_bytes: Option<&[u8]>, // None = don't store (DA already pruned)
@@ -1048,6 +1023,38 @@ impl MdbxStore {
                 let val = encode_segment(cols, *eff_log);
                 txn.put(&seg_tbl, key, val, WriteFlags::empty())?;
             }
+        }
+        // Reorg rollback may cross a slot-domain expansion. Purge every
+        // persisted segment outside the ancestor header's domain in this same
+        // atomic checkpoint transaction; otherwise a restart could reload
+        // stale upper-half data under the smaller depth.
+        let domain_segments = if header.log_slots > crate::consensus::params::LOG_SEGMENT_SIZE {
+            1usize
+                .checked_shl(header.log_slots - crate::consensus::params::LOG_SEGMENT_SIZE)
+                .ok_or(StoreError::Decode(
+                    "header log_slots exceeds segment domain",
+                ))?
+        } else {
+            1
+        };
+        let out_of_domain_keys: Vec<Vec<u8>> = {
+            let mut cursor = txn.cursor(&seg_tbl)?;
+            let mut keys = Vec::new();
+            let mut item: Option<(Vec<u8>, Vec<u8>)> = cursor.first()?;
+            while let Some((key, _)) = item {
+                if key.len() != 2 {
+                    return Err(StoreError::Decode("invalid segment key"));
+                }
+                let seg_id = u16::from_le_bytes([key[0], key[1]]) as usize;
+                if seg_id >= domain_segments {
+                    keys.push(key);
+                }
+                item = cursor.next()?;
+            }
+            keys
+        };
+        for key in out_of_domain_keys {
+            txn.del(&seg_tbl, &key, None)?;
         }
 
         // --- 2. BlockHeader ---
@@ -1133,14 +1140,6 @@ impl MdbxStore {
                 header.active_slot_count,
                 header.alloc_counter,
             ),
-            WriteFlags::empty(),
-        )?;
-
-        let guard_tbl = txn.open_table(Some(T_REUSE_GUARD))?;
-        txn.put(
-            &guard_tbl,
-            KEY_REUSE_GUARD,
-            encode_reuse_guard_buckets(reuse_guard_buckets),
             WriteFlags::empty(),
         )?;
 
@@ -1287,24 +1286,39 @@ impl MdbxStore {
 
                     // Add the post-block owner, if any. Doing both halves for
                     // every first-touch slot also handles live→live physical
-                    // reuse once the legacy ReuseGuard is removed.
+                    // reuse with a fresh creation ID.
                     let seg_id = (slot_index >> eff_log) as u16;
                     let local = (slot_index & ((1u32 << eff_log) - 1)) as usize;
-                    let (value, owner_hi, owner_lo) = dirty_segments
-                        .iter()
-                        .find(|(id, _, _)| *id == seg_id)
-                        .and_then(|(_, _, cols)| {
-                            (local < cols.values.len()).then(|| {
-                                (
-                                    cols.values[local],
-                                    cols.owners_hi[local],
-                                    cols.owners_lo[local],
-                                )
-                            })
-                        })
-                        .ok_or(StoreError::Decode(
-                            "owner-index delta slot missing from dirty segments",
-                        ))?;
+                    let post_value = match dirty_segments.iter().find(|(id, _, _)| *id == seg_id) {
+                        // A proven transient EMPTY→mint→spend→EMPTY action
+                        // collapses to no final slot update. The segment is
+                        // legitimately absent and durable post == pre.
+                        None => *prev_value,
+                        // Spending the last live slot dematerializes the dirty
+                        // segment; persistence represents its post-state as an
+                        // empty/zero-length column payload.
+                        Some((_, _, cols)) if segment_columns_empty(cols) => SlotValue::EMPTY,
+                        Some((_, _, cols)) => {
+                            if local >= cols.values.len()
+                                || local >= cols.owners_hi.len()
+                                || local >= cols.owners_lo.len()
+                            {
+                                return Err(StoreError::Decode(
+                                    "owner-index dirty segment is truncated",
+                                ));
+                            }
+                            SlotValue {
+                                value: cols.values[local],
+                                owner_hi: cols.owners_hi[local],
+                                owner_lo: cols.owners_lo[local],
+                            }
+                        }
+                    };
+                    let SlotValue {
+                        value,
+                        owner_hi,
+                        owner_lo,
+                    } = post_value;
                     if value.0 != 0 || owner_hi.0 != 0 || owner_lo.0 != 0 {
                         let owner_key = owner_key_from_fields(owner_hi, owner_lo);
                         let amount = unpack_amount_creation_id(value).0;
@@ -1430,33 +1444,36 @@ impl MdbxStore {
         Ok(())
     }
 
-    /// Clear volatile tables after local state corruption is detected, keeping
-    /// append-only headers, hash->height index, header anchors, and chainwork.
+    /// Atomically clear every chain table.
     ///
-    /// Normal startup does NOT clear these tables: `MdbxChainContext::open_or_create`
-    /// first tries to restore persisted current state from MDBX and checks it against
-    /// the tip header's `state_root`. This function is the local recovery path
-    /// for corrupt local state; peer snapshot recovery goes through the
-    /// manifest/proof sync pipeline instead.
-    pub fn clear_for_restart(&self) -> Result<(), StoreError> {
+    /// The on-disk format has one canonical epoch. A database that cannot be
+    /// restored must never retain headers, claims, indexes, or checkpoints while
+    /// installing a fresh genesis state; that would create a mixed-epoch store.
+    pub fn clear_all(&self) -> Result<(), StoreError> {
         let txn = self.db.begin_rw_txn()?;
-        let volatile = [
-            T_SEGMENTS,
-            T_RECENT_BLOCKS,
+        let tables = [
+            T_HEADERS,
+            T_HEADER_ANCHORS,
+            T_HASH_TO_HEIGHT,
+            T_CHAIN_TIP,
+            T_CONSENSUS_META,
+            T_CHAIN_WORK,
             T_UNDO_LOGS,
+            T_SEGMENTS,
+            T_STATE_META,
+            T_RECENT_BLOCKS,
+            T_TX_INDEX,
             T_BLOCK_PROOFS,
             T_BLOCK_AUTH_SIDECARS,
+            T_HISTORY_CLAIMS,
             T_ACCEPTED_BLOCK_CERTIFICATES,
             T_ACCEPTED_BLOCK_BATCH_CERTIFICATE_PACKAGES,
             T_HISTORY_CHECKPOINT_HEADS,
-            T_CHECKPOINT_COVERAGE,
             T_OWNER_INDEX,
-            T_STATE_META,
-            T_CHAIN_TIP,
-            T_CONSENSUS_META,
-            T_TX_INDEX,
+            T_CHECKPOINT_PACKAGES,
+            T_CHECKPOINT_COVERAGE,
         ];
-        for name in volatile {
+        for name in tables {
             let tbl = txn.open_table(Some(name))?;
             let keys: Vec<Vec<u8>> = {
                 let mut cur = txn.cursor(&tbl)?;
@@ -1519,14 +1536,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tx_index_reorg_delete_preserves_ancestor_entry() {
+    fn clear_all_removes_chain_and_certificate_epochs_together() {
         let dir = tempfile::tempdir().unwrap();
         let store = MdbxStore::open(dir.path()).unwrap();
         let header = crate::consensus::genesis::genesis_header();
         let hash = crate::hash_block_header(&header);
-        let guard = crate::reuse_guard::ReuseGuard::new_empty();
-        let ancestor_tx = TxBodyHash([0xC3; 32]);
-        let undo = BlockUndoLog::empty(0);
+        let undo = BlockUndoLog::empty(0, header.log_slots);
         let meta = ConsensusMeta {
             tip_height: 0,
             tip_hash: hash,
@@ -1540,7 +1555,60 @@ mod tests {
                 &hash,
                 &undo,
                 &[],
-                guard.buckets(),
+                &[],
+                &[],
+                None,
+                &meta,
+                false,
+            )
+            .unwrap();
+        store.put_history_claim(0, b"history").unwrap();
+        store
+            .put_accepted_block_certificate(0, b"certificate")
+            .unwrap();
+        store
+            .put_accepted_block_batch_certificate_package(0, b"batch")
+            .unwrap();
+        store
+            .put_history_checkpoint_head_record(0, b"head")
+            .unwrap();
+
+        store.clear_all().unwrap();
+
+        assert!(store.is_empty().unwrap());
+        assert_eq!(store.get_header(0).unwrap(), None);
+        assert_eq!(store.get_history_claim(0).unwrap(), None);
+        assert_eq!(store.get_accepted_block_certificate(0).unwrap(), None);
+        assert_eq!(
+            store
+                .get_accepted_block_batch_certificate_package(0)
+                .unwrap(),
+            None
+        );
+        assert_eq!(store.get_history_checkpoint_head_record(0).unwrap(), None);
+    }
+
+    #[test]
+    fn tx_index_reorg_delete_preserves_ancestor_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(dir.path()).unwrap();
+        let header = crate::consensus::genesis::genesis_header();
+        let hash = crate::hash_block_header(&header);
+        let ancestor_tx = TxBodyHash([0xC3; 32]);
+        let undo = BlockUndoLog::empty(0, header.log_slots);
+        let meta = ConsensusMeta {
+            tip_height: 0,
+            tip_hash: hash,
+            cumulative_chainwork: [1u8; 32],
+            finalized: crate::storage::meta::FinalizedCheckpoint { height: 0, hash },
+        };
+
+        store
+            .commit_block(
+                &header,
+                &hash,
+                &undo,
+                &[],
                 std::slice::from_ref(&ancestor_tx),
                 &[],
                 None,
@@ -1554,7 +1622,6 @@ mod tests {
                 &hash,
                 &undo,
                 &[],
-                guard.buckets(),
                 &[],
                 std::slice::from_ref(&ancestor_tx),
                 None,
@@ -1571,14 +1638,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let header = crate::consensus::genesis::genesis_header();
         let hash = crate::hash_block_header(&header);
-        let guard = crate::reuse_guard::ReuseGuard::new_empty();
         let undo = BlockUndoLog {
             block_height: header.height,
+            log_slots_before: header.log_slots,
             active_slot_count_before: 37,
             alloc_counter_before: 91,
             slot_changes: vec![],
             tx_hashes: vec![TxBodyHash([0xA5; 32])],
-            reuse_guard_before: (*guard.buckets()).clone(),
         };
         let meta = ConsensusMeta {
             tip_height: header.height,
@@ -1598,7 +1664,6 @@ mod tests {
                     &hash,
                     &undo,
                     &[],
-                    guard.buckets(),
                     &undo.tx_hashes,
                     &[],
                     None,
@@ -1624,7 +1689,6 @@ mod tests {
         header.active_slot_count = 1;
         header.alloc_counter = 1;
         let hash = crate::hash_block_header(&header);
-        let guard = crate::reuse_guard::ReuseGuard::new_empty();
         let meta = ConsensusMeta {
             tip_height: 0,
             tip_hash: hash,
@@ -1633,11 +1697,11 @@ mod tests {
         };
         let undo = BlockUndoLog {
             block_height: 0,
+            log_slots_before: header.log_slots,
             active_slot_count_before: 0,
             alloc_counter_before: 0,
             slot_changes: vec![(1, crate::fri_state::SlotValue::EMPTY)],
             tx_hashes: vec![],
-            reuse_guard_before: (*guard.buckets()).clone(),
         };
 
         let mut branch_cols = SegmentColumns::new_zero(2);
@@ -1652,7 +1716,6 @@ mod tests {
                 &hash,
                 &undo,
                 &[(0, 1, &branch_cols)],
-                guard.buckets(),
                 &[],
                 &[],
                 None,
@@ -1674,7 +1737,6 @@ mod tests {
                 &hash,
                 &undo,
                 &[(0, 1, &restored_cols)],
-                guard.buckets(),
                 &[],
                 &[],
                 None,
@@ -1705,7 +1767,6 @@ mod tests {
                 &hash,
                 &replacement_undo,
                 &[(0, 1, &replacement_cols)],
-                guard.buckets(),
                 &[],
                 &[],
                 None,
@@ -1715,6 +1776,32 @@ mod tests {
             .unwrap();
         assert!(store.get_utxos_by_owner(&owner_a.0).unwrap().is_empty());
         assert_eq!(store.get_utxos_by_owner(&owner_b.0).unwrap(), vec![(1, 93)]);
+
+        // Spending the last live slot dematerializes the segment. The
+        // incremental owner index must treat that dirty empty payload as an
+        // EMPTY post-value rather than requiring a local column entry.
+        let spent_undo = BlockUndoLog {
+            slot_changes: vec![(1, replacement)],
+            ..undo.clone()
+        };
+        let empty_cols = SegmentColumns::new_zero(0);
+        store
+            .commit_block(
+                &header,
+                &hash,
+                &spent_undo,
+                &[(0, 1, &empty_cols)],
+                &[],
+                &[],
+                None,
+                &meta,
+                false,
+            )
+            .unwrap();
+        assert!(store.get_utxos_by_owner(&owner_b.0).unwrap().is_empty());
+        drop(store);
+        let reopened = MdbxStore::open(dir.path()).unwrap();
+        assert!(reopened.get_utxos_by_owner(&owner_b.0).unwrap().is_empty());
     }
 
     #[test]

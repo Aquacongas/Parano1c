@@ -24,7 +24,6 @@ pub mod circuit;
 pub mod circuit_sweep;
 pub mod fixed_field_hash_killshot;
 pub mod ghost_tx;
-pub mod guard_bucket_killshot;
 pub mod header_hash_killshot;
 pub mod history_claim_killshot;
 pub mod layers;
@@ -47,7 +46,6 @@ pub mod spine_sumcheck_sweep;
 pub mod spine_unified;
 pub mod spine_unified_sweep;
 pub mod state_leaf_killshot;
-pub mod state_root_killshot;
 pub mod sweep_spine_statement;
 pub mod tx_body_layout;
 pub mod wallet_authorization;
@@ -91,12 +89,6 @@ pub use fixed_field_hash_killshot::{
     discharge_fixed_field_hash_reductions_native, prove_fixed_field_hash_killshot,
     verify_fixed_field_hash_killshot, FixedFieldHashInputs, FixedFieldHashParams,
     FixedFieldHashProofKillShot, FixedFieldHashReductions, FIXED_FIELD_HASH_PIN_LANES,
-};
-pub use guard_bucket_killshot::{
-    discharge_batched_guard_bucket_reductions_native, guard_slots_chain_len,
-    guard_update_live_slots, prove_batched_guard_bucket_killshot,
-    verify_batched_guard_bucket_killshot, BatchedGuardBucketProofKillShot,
-    BatchedGuardBucketReductions, GuardBucketUpdateInputs, GuardLeafHashInputs,
 };
 pub use header_hash_killshot::{
     discharge_header_hash_reductions_native, discharge_header_hash_reductions_native_padded,
@@ -195,11 +187,6 @@ pub use state_leaf_killshot::{
     discharge_batched_slot_leaf_reductions_native, prove_batched_slot_leaf_killshot,
     verify_batched_slot_leaf_killshot, BatchedSlotLeafProofKillShot, BatchedSlotLeafReductions,
     SlotLeafInputs,
-};
-pub use state_root_killshot::{
-    discharge_batched_state_root_reductions_native, prove_batched_state_root_killshot,
-    verify_batched_state_root_killshot, BatchedStateRootProofKillShot, BatchedStateRootReductions,
-    CompositeStateRootInputs,
 };
 pub use sweep_spine_statement::{sweep_spine_inputs_from_body, SweepSpineStatementError};
 pub use tx_body_layout::{

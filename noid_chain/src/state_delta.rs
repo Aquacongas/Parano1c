@@ -20,7 +20,7 @@
 //! ordered delta surface: roots + touched-slot actions, not full pre/post segment
 //! columns.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use noid_poseidon2b::primitives::Digest;
 use noid_tx::{compute_claims_commitment, TxBody, TxInput, TxOutput};
@@ -88,7 +88,6 @@ pub struct ExactActionSurface {
     pub touched_indices: Vec<u32>,
     pub old_slots: Vec<SlotValue>,
     pub new_slots: Vec<SlotValue>,
-    pub spent_slots: Vec<u32>,
     pub spends: u32,
     pub mints: u32,
 }
@@ -282,19 +281,15 @@ pub fn build_exact_action_surface(
     Ok(exact_action_surface_from_surface(surface))
 }
 
-/// Convert the ordered action surface into sorted old/new leaves and spend set.
+/// Convert the ordered action surface into sorted old/new leaves.
 pub fn exact_action_surface_from_surface(surface: StateDeltaActionSurface) -> ExactActionSurface {
     let mut touched: BTreeMap<u32, (SlotValue, SlotValue)> = BTreeMap::new();
-    let mut spent = BTreeSet::new();
 
     for action in &surface.actions {
         touched
             .entry(action.slot_index)
             .and_modify(|(_, new_slot)| *new_slot = action.post)
             .or_insert((action.pre, action.post));
-        if action.kind == StateDeltaActionKind::Spend {
-            spent.insert(action.slot_index);
-        }
     }
 
     let mut touched_indices = Vec::with_capacity(touched.len());
@@ -311,7 +306,6 @@ pub fn exact_action_surface_from_surface(surface: StateDeltaActionSurface) -> Ex
         touched_indices,
         old_slots,
         new_slots,
-        spent_slots: spent.into_iter().collect(),
         spends: surface.spends,
         mints: surface.mints,
     }
@@ -754,7 +748,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_surface_derives_sorted_old_new_and_spent_slots() {
+    fn exact_surface_derives_sorted_old_and_new_slots() {
         let alice = owner(0x11);
         let bob = owner(0x22);
         let carol = owner(0x33);
@@ -785,7 +779,6 @@ mod tests {
             exact.new_slots[2],
             slot_value_from_output(&mk_output(6, 400, carol), 2)
         );
-        assert_eq!(exact.spent_slots, vec![1, 5]);
         assert_eq!(exact.spends, 2);
         assert_eq!(exact.mints, 2);
     }
@@ -807,7 +800,6 @@ mod tests {
         assert_eq!(exact.touched_indices, vec![10]);
         assert_eq!(exact.old_slots, vec![SlotValue::EMPTY]);
         assert_eq!(exact.new_slots, vec![SlotValue::EMPTY]);
-        assert_eq!(exact.spent_slots, vec![10]);
         assert_eq!(exact.actions.len(), 2);
         assert_eq!(exact.actions[0].kind, StateDeltaActionKind::Mint);
         assert_eq!(exact.actions[0].tx_index, 0);

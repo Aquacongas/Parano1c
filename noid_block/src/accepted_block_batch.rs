@@ -18,12 +18,12 @@ use noid_chain::header_anchor::{
 use noid_chain::state::ChainState;
 use noid_core::{Block128, TowerField};
 use noid_gkr::{
-    prove_accepted_claim_hash_killshot, prove_batched_merkle_killshot,
-    prove_block_spine_killshot, prove_sweep_block_spine_killshot, reconstruct_slot_states,
-    spine_inputs_from_body, sweep_spine_inputs_from_body, AcceptedClaimHashInputs,
-    AcceptedClaimHashProofKillShot, BatchedMerkleProofKillShot, BlockSpineMle, BlockSpineProof,
-    MerkleCircuit, MerklePathInputs, SpineCircuit,
-    SpineInputs, SweepBlockSpineMle, SweepBlockSpineProof, SweepSpineInputs, MAX_MERKLE_DEPTH,
+    prove_accepted_claim_hash_killshot, prove_batched_merkle_killshot, prove_block_spine_killshot,
+    prove_sweep_block_spine_killshot, reconstruct_slot_states, spine_inputs_from_body,
+    sweep_spine_inputs_from_body, AcceptedClaimHashInputs, AcceptedClaimHashProofKillShot,
+    BatchedMerkleProofKillShot, BlockSpineMle, BlockSpineProof, MerkleCircuit, MerklePathInputs,
+    SpineCircuit, SpineInputs, SweepBlockSpineMle, SweepBlockSpineProof, SweepSpineInputs,
+    MAX_MERKLE_DEPTH,
 };
 use noid_poseidon2b::native::compress;
 use noid_poseidon2b::primitives::Digest;
@@ -53,8 +53,7 @@ use noid_recursive::{
     AcceptedBlockCertificateReceiptError, AcceptedBlockReceiptProjectionHandle,
     AcceptedBlockReceiptProjectionHandleError, AcceptedClaimBatchError, AcceptedClaimBatchOutput,
     AcceptedClaimBatchWitness, AuthorizationVerifierTrace, BlockProofAcceptanceReceipt,
-    ChainAccumulator, CheckpointPoseidonError, CheckpointPoseidonProof,
-    HeaderIntegerTraceError,
+    ChainAccumulator, CheckpointPoseidonError, CheckpointPoseidonProof, HeaderIntegerTraceError,
     HeaderWitness, HistoryCheckpointBatchSummary, HistoryCheckpointHead, HistoryCheckpointProof,
     HistoryCheckpointProofError, HistoryCheckpointStepProof, HistoryCheckpointStepProofError,
     HistoryCheckpointStepStatement, PowHeaderBatchError, RecursiveConsensusState,
@@ -273,8 +272,9 @@ impl AuthorizationVerifier for TracingOwnerAuthVerifier {
         statement: &CanonicalAuthorizationStatement,
         proof: &AuthorizationProof,
     ) -> Result<VerifiedAuthorization, VerifyBlockError> {
-        let (verified, trace) = verify_authorization_statement_proof_with_trace(statement, proof)
-            .map_err(|error| map_verify_authorization_error(error, statement.tx_index))?;
+        let (verified, trace) =
+            verify_authorization_statement_proof_with_trace(statement, proof)
+                .map_err(|error| map_verify_authorization_error(error, statement.tx_index))?;
         self.captured
             .lock()
             .expect("owner-auth trace mutex poisoned")
@@ -354,7 +354,6 @@ pub fn verify_full_accepted_block_batch_native(
             (None, BlockAuthSidecar::default())
         };
 
-        let pre_validation_guard = state.reuse_guard.clone();
         let auth_tracer = TracingOwnerAuthVerifier::default();
         let validation = accept_block_timeless_with_artifacts_with_auth_verifier(
             &item.block,
@@ -374,26 +373,10 @@ pub fn verify_full_accepted_block_batch_native(
             let proof = proof
                 .as_ref()
                 .expect("user-transaction block proof decoded above");
-            let (standard_txs, sweep_txs) = item.block.transactions.iter().fold(
-                (0usize, 0usize),
-                |(s, w), tx| match tx.body.shape {
-                    _ if tx.body.is_coinbase => (s, w),
-                    noid_tx::TxShape::Standard4x8 => (s + 1, w),
-                    noid_tx::TxShape::Sweep25x2 => (s, w + 1),
-                },
-            );
-            let padded_spent_len =
-                noid_chain::consensus::params::block_class_spend_capacity_for_counts(
-                    standard_txs,
-                    sweep_txs,
-                )
-                .ok_or(FullAcceptedBlockBatchError::ComponentShapeMismatch)?;
             let (inputs, verified) = derive_exact_state_killshot_inputs(
                 &artifacts.exact_state_inputs,
                 &artifacts.exact_action_surface,
-                &pre_validation_guard,
                 &proof.state_transition,
-                padded_spent_len,
             )
             .map_err(|source| FullAcceptedBlockBatchError::ExactStateComponent { index, source })?;
             if verified != artifacts.verified_transition {
@@ -574,22 +557,25 @@ pub(crate) fn prove_full_accepted_block_batch_components(
     {
         return Err(FullAcceptedBlockBatchError::ComponentShapeMismatch);
     }
-    if components.component_inputs.authorization_inputs.len() != components.component_inputs.authorization_witnesses.len() {
+    if components.component_inputs.authorization_inputs.len()
+        != components.component_inputs.authorization_witnesses.len()
+    {
         return Err(FullAcceptedBlockBatchError::ComponentShapeMismatch);
     }
-    if components.component_inputs.authorization_traces.len() != components.component_inputs.authorization_witnesses.len() {
+    if components.component_inputs.authorization_traces.len()
+        != components.component_inputs.authorization_witnesses.len()
+    {
         return Err(FullAcceptedBlockBatchError::ComponentShapeMismatch);
     }
     validate_tx_body_component_shape(components)?;
-    let claim_result =
-        || -> Result<AcceptedClaimHashProofKillShot, FullAcceptedBlockBatchError> {
-            let mut channel = noid_poseidon2b::channel::Poseidon2bChannel::new();
-            Ok(prove_accepted_claim_hash_killshot(
-                &components.component_inputs.accepted_claim_hash_inputs,
-                &mut channel,
-            )
-            .0)
-        };
+    let claim_result = || -> Result<AcceptedClaimHashProofKillShot, FullAcceptedBlockBatchError> {
+        let mut channel = noid_poseidon2b::channel::Poseidon2bChannel::new();
+        Ok(prove_accepted_claim_hash_killshot(
+            &components.component_inputs.accepted_claim_hash_inputs,
+            &mut channel,
+        )
+        .0)
+    };
 
     let rest_result = || -> Result<
         (
@@ -795,7 +781,11 @@ fn certificate_batch_witness_from_retained_output(
     let components = &output.proof_components;
     let len = retained_witness.items.len();
     if components.accepted_block_acceptance_receipts.len() != len
-        || components.component_inputs.accepted_block_certificate_statements.len() != len
+        || components
+            .component_inputs
+            .accepted_block_certificate_statements
+            .len()
+            != len
         || components.accepted_block_certificate_proofs.len() != len
         || components.accepted_block_certificate_receipts.len() != len
         || components.accepted_block_receipt_projection_handles.len() != len
@@ -809,7 +799,10 @@ fn certificate_batch_witness_from_retained_output(
             certificate_record: AcceptedBlockCertificateRecord {
                 height: components.accepted_block_acceptance_receipts[index].height,
                 acceptance_receipt: components.accepted_block_acceptance_receipts[index].clone(),
-                statement: components.component_inputs.accepted_block_certificate_statements[index].clone(),
+                statement: components
+                    .component_inputs
+                    .accepted_block_certificate_statements[index]
+                    .clone(),
                 proof: components.accepted_block_certificate_proofs[index].clone(),
                 receipt: components.accepted_block_certificate_receipts[index].clone(),
                 receipt_projection_handle: components.accepted_block_receipt_projection_handles
@@ -1046,7 +1039,11 @@ pub fn history_checkpoint_batch_summary_from_full_accepted_output(
     output: &FullAcceptedBlockBatchOutput,
     accepted_claim_batch_digest: Digest,
 ) -> Result<HistoryCheckpointBatchSummary, FullAcceptedBlockBatchError> {
-    let headers = &output.proof_components.component_inputs.accepted_claim_witness.headers;
+    let headers = &output
+        .proof_components
+        .component_inputs
+        .accepted_claim_witness
+        .headers;
     if headers.is_empty() || headers.len() > HISTORY_CHECKPOINT_BATCH_TARGET_BLOCKS as usize {
         return Err(FullAcceptedBlockBatchError::ComponentShapeMismatch);
     }
@@ -1101,7 +1098,10 @@ pub fn history_checkpoint_batch_summary_from_full_accepted_output(
 
 pub fn accepted_claim_batch_digest(output: &FullAcceptedBlockBatchOutput) -> Digest {
     recursive_accepted_claim_batch_digest(
-        &output.proof_components.component_inputs.accepted_claim_witness,
+        &output
+            .proof_components
+            .component_inputs
+            .accepted_claim_witness,
         &output.accepted_claim_batch,
     )
     .expect("verified full accepted batch output has a valid digest shape")
@@ -1130,7 +1130,9 @@ fn validate_full_accepted_certificate_package(
     components: &FullAcceptedBlockBatchProofComponents,
 ) -> Result<(), FullAcceptedBlockBatchError> {
     let acceptance_receipts = &components.accepted_block_acceptance_receipts;
-    let statements = &components.component_inputs.accepted_block_certificate_statements;
+    let statements = &components
+        .component_inputs
+        .accepted_block_certificate_statements;
     let proofs = &components.accepted_block_certificate_proofs;
     let receipts = &components.accepted_block_certificate_receipts;
     let handles = &components.accepted_block_receipt_projection_handles;
@@ -1198,10 +1200,13 @@ pub fn prove_history_checkpoint_step_proof_from_verified_full_accepted_output(
             &output
                 .proof_components
                 .component_inputs
-            .accepted_block_certificate_statements,
+                .accepted_block_certificate_statements,
             &output.proof_components.accepted_block_certificate_proofs,
             &output.proof_components.accepted_block_certificate_receipts,
-            &output.proof_components.component_inputs.accepted_claim_witness,
+            &output
+                .proof_components
+                .component_inputs
+                .accepted_claim_witness,
             &output.accepted_claim_batch,
         )
         .map_err(FullAcceptedBlockBatchError::CheckpointStep)?;
@@ -1218,7 +1223,10 @@ pub fn verify_history_checkpoint_step_proof_with_verified_full_accepted_output(
     verify_history_checkpoint_step_proof_private_components_native(
         statement,
         certificate_batch_statement,
-        &output.proof_components.component_inputs.accepted_claim_witness,
+        &output
+            .proof_components
+            .component_inputs
+            .accepted_claim_witness,
         &output.accepted_claim_batch,
         checkpoint_step_proof,
     )
@@ -1292,7 +1300,12 @@ fn prove_tx_root_component(
     let circuit = MerkleCircuit::build();
     let mut channel = noid_poseidon2b::channel::Poseidon2bChannel::new();
     Ok(Some(
-        prove_batched_merkle_killshot(&circuit, &components.component_inputs.tx_root_inputs, &mut channel).0,
+        prove_batched_merkle_killshot(
+            &circuit,
+            &components.component_inputs.tx_root_inputs,
+            &mut channel,
+        )
+        .0,
     ))
 }
 
@@ -1301,7 +1314,7 @@ fn prove_exact_state_components(
 ) -> Result<Vec<ExactStateKillShotProof>, FullAcceptedBlockBatchError> {
     components
         .component_inputs
-            .exact_state_killshot_inputs
+        .exact_state_killshot_inputs
         .par_iter()
         .enumerate()
         .map(|(index, inputs)| {
@@ -1315,8 +1328,10 @@ fn prove_exact_state_components(
 fn validate_tx_body_component_shape(
     components: &FullAcceptedBlockBatchProofComponents,
 ) -> Result<(), FullAcceptedBlockBatchError> {
-    if components.component_inputs.tx_body_standard_inputs.len() != components.component_inputs.tx_body_standard_hashes.len()
-        || components.component_inputs.tx_body_sweep_inputs.len() != components.component_inputs.tx_body_sweep_hashes.len()
+    if components.component_inputs.tx_body_standard_inputs.len()
+        != components.component_inputs.tx_body_standard_hashes.len()
+        || components.component_inputs.tx_body_sweep_inputs.len()
+            != components.component_inputs.tx_body_sweep_hashes.len()
     {
         return Err(FullAcceptedBlockBatchError::ComponentShapeMismatch);
     }
@@ -1365,11 +1380,19 @@ fn standard_tx_body_slot_state_ins(inputs: &[SpineInputs]) -> Vec<[Block128; 4]>
 fn prove_standard_tx_body_component(
     components: &FullAcceptedBlockBatchProofComponents,
 ) -> Result<Option<BlockSpineProof>, FullAcceptedBlockBatchError> {
-    if components.component_inputs.tx_body_standard_inputs.is_empty() {
+    if components
+        .component_inputs
+        .tx_body_standard_inputs
+        .is_empty()
+    {
         return Ok(None);
     }
-    let slot_state_ins = standard_tx_body_slot_state_ins(&components.component_inputs.tx_body_standard_inputs);
-    let mle = BlockSpineMle::build(components.component_inputs.tx_body_standard_inputs.len(), &slot_state_ins);
+    let slot_state_ins =
+        standard_tx_body_slot_state_ins(&components.component_inputs.tx_body_standard_inputs);
+    let mle = BlockSpineMle::build(
+        components.component_inputs.tx_body_standard_inputs.len(),
+        &slot_state_ins,
+    );
     let mut channel = noid_poseidon2b::channel::Poseidon2bChannel::new();
     Ok(Some(
         prove_block_spine_killshot(
@@ -1419,13 +1442,14 @@ fn tx_root_merkle_inputs(block: &Block) -> Result<Vec<MerklePathInputs>, ()> {
 
     // Tier-quantized capacity padding — the same rule as `compute_tx_root`,
     // so the rebuilt root matches the header.
-    let (standard, sweep) = block.transactions.iter().fold((0usize, 0usize), |(s, w), tx| {
-        match tx.body.shape {
+    let (standard, sweep) = block
+        .transactions
+        .iter()
+        .fold((0usize, 0usize), |(s, w), tx| match tx.body.shape {
             _ if tx.body.is_coinbase => (s, w),
             noid_tx::TxShape::Standard4x8 => (s + 1, w),
             noid_tx::TxShape::Sweep25x2 => (s, w + 1),
-        }
-    });
+        });
     let non_user = block.transactions.len() - standard - sweep;
     let target = noid_chain::consensus::params::tx_tree_target(standard, sweep, non_user);
     let depth = target.trailing_zeros() as usize;
@@ -1498,7 +1522,6 @@ mod tests {
     use noid_chain::consensus::params::{BLOCK_TIME, MAX_TARGET};
     use noid_chain::consensus::pow::search_pow;
     use noid_chain::consensus::template::build_block_template;
-    use noid_chain::exact_state_hash::composite_state_root;
     use noid_chain::fri_state::SlotValue;
     use noid_chain::header_anchor::compute_header_chain_anchor;
     use noid_chain::{apply_tx, build_exact_action_surface};
@@ -1579,8 +1602,8 @@ mod tests {
             difficulty_target,
         )
         .expect("coinbase-only template");
-        let nonce = search_pow(&template.to_pow_header(0), 0, 64_000_000)
-            .expect("easy test target mines");
+        let nonce =
+            search_pow(&template.to_pow_header(0), 0, 64_000_000).expect("easy test target mines");
         Block {
             header: template.clone().into_header(nonce),
             transactions: template.all_txs(),
@@ -1698,22 +1721,12 @@ mod tests {
             start_state.alloc_counter,
         )
         .expect("exact action surface");
-        let state_transition = crate::build_exact_state_transition_proof(
-            &parent_cache,
-            &surface,
-            &start_state.reuse_guard,
-            1,
-        )
-        .expect("exact proof");
+        let state_transition = crate::build_exact_state_transition_proof(&parent_cache, &surface)
+            .expect("exact proof");
 
         let mut child_state = start_state.clone();
         apply_tx(&mut child_state, &body).expect("native tx apply");
-        let mut child_guard = start_state.reuse_guard.clone();
-        child_guard
-            .apply_spends(1, &surface.spent_slots)
-            .expect("guard spend apply");
-        let child_state_root =
-            composite_state_root(parent.log_slots, child_state.utxo_root, child_guard.root());
+        let child_state_root = child_state.utxo_root;
         let mut header = BlockHeader {
             prev_block_hash: hash_block_header(&parent),
             state_root: child_state_root,
@@ -1931,8 +1944,9 @@ mod tests {
         use noid_recursive::acceptance::trace::region_source_binding::RegionDischargeParams;
 
         let nq = BlockSlotsConfig::default().wallet_pcs_params.nq;
-        let only: Option<usize> =
-            std::env::var("NOID_LADDER_TIER").ok().and_then(|t| t.parse().ok());
+        let only: Option<usize> = std::env::var("NOID_LADDER_TIER")
+            .ok()
+            .and_then(|t| t.parse().ok());
         // (smallest real-tx count landing on the tier, tier, candidate m).
         for (n_real, tier, m) in [
             (5usize, 8usize, 22usize),
@@ -2123,7 +2137,10 @@ mod tests {
             &t_io,
             &mut ch,
         );
-        eprintln!("[budget] genesis T prove (once-per-class setup) {:.1?}", t.elapsed());
+        eprintln!(
+            "[budget] genesis T prove (once-per-class setup) {:.1?}",
+            t.elapsed()
+        );
         drop(t_witness);
         rss("after T prove");
         let env_t = LinkEnvelope {
@@ -2327,7 +2344,6 @@ mod tests {
         }
         let txs: Vec<_> = bodies.iter().map(|b| tx_from_body(b.clone())).collect();
 
-        let height = start_parent.height + 1;
         let parent_cache = {
             let mut tmp = start_state.clone();
             tmp.exact_sparse_cache().unwrap()
@@ -2343,27 +2359,14 @@ mod tests {
             start_state.alloc_counter,
         )
         .expect("exact action surface");
-        let state_transition = crate::build_exact_state_transition_proof(
-            &parent_cache,
-            &surface,
-            &start_state.reuse_guard,
-            height,
-        )
-        .expect("exact proof");
+        let state_transition = crate::build_exact_state_transition_proof(&parent_cache, &surface)
+            .expect("exact proof");
 
         let mut child_state = start_state.clone();
         for body in &bodies {
             apply_tx(&mut child_state, body).expect("native tx apply");
         }
-        let mut child_guard = start_state.reuse_guard.clone();
-        child_guard
-            .apply_spends(height, &surface.spent_slots)
-            .expect("guard spend apply");
-        let child_state_root = composite_state_root(
-            start_parent.log_slots,
-            child_state.utxo_root,
-            child_guard.root(),
-        );
+        let child_state_root = child_state.utxo_root;
         let mut header = BlockHeader {
             prev_block_hash: hash_block_header(start_parent),
             state_root: child_state_root,
@@ -2487,9 +2490,7 @@ mod tests {
                 &[(input_slot, output_slot, value)],
             );
             let surviving_value = surviving[0];
-            let witness = FullAcceptedBlockBatchWitness {
-                items: vec![item],
-            };
+            let witness = FullAcceptedBlockBatchWitness { items: vec![item] };
             let (output, proof) = prove_retained_full_accepted_block_batch_proof(
                 &consensus,
                 &accumulator,
@@ -2535,7 +2536,10 @@ mod tests {
     fn chained_blocks_with_tx_counts(counts: &[usize]) -> Vec<BlockUnit> {
         assert!(!counts.is_empty() && counts.iter().all(|&c| c >= 1));
         for w in counts.windows(2) {
-            assert!(w[1] <= w[0], "each block can only spend its predecessor's outputs");
+            assert!(
+                w[1] <= w[0],
+                "each block can only spend its predecessor's outputs"
+            );
         }
         let n_blocks = counts.len();
         let secret = spend_secret(7);
@@ -2599,7 +2603,10 @@ mod tests {
         let mut next_free = 2 + counts[0] as u32;
         for i in 0..n_blocks {
             let cnt = counts[i];
-            assert!(cnt <= current_slots.len(), "block {i} overspends its predecessor");
+            assert!(
+                cnt <= current_slots.len(),
+                "block {i} overspends its predecessor"
+            );
             let output_slots: Vec<u32> = (0..cnt as u32).map(|j| next_free + j).collect();
             next_free += cnt as u32;
             let specs: Vec<(u32, u32, u64)> = (0..cnt)
@@ -2751,36 +2758,23 @@ mod tests {
             .iter()
             .map(|tx| noid_tx::compute_claims_commitment(&tx.inputs, &tx.outputs))
             .collect();
-        let surface = build_exact_action_surface(
-            &state.state,
-            &bodies,
-            &claims,
-            state.alloc_counter,
-        )
-        .expect("coinbase + consolidation exact action surface");
+        let surface =
+            build_exact_action_surface(&state.state, &bodies, &claims, state.alloc_counter)
+                .expect("coinbase + consolidation exact action surface");
         assert_eq!(surface.spends, 2);
         assert_eq!(surface.mints, 2, "user output plus coinbase output");
-        let state_transition = crate::build_exact_state_transition_proof(
-            &parent_cache,
-            &surface,
-            &state.reuse_guard,
-            parent.height + 1,
-        )
-        .expect("coinbase + consolidation exact proof");
+        let state_transition = crate::build_exact_state_transition_proof(&parent_cache, &surface)
+            .expect("coinbase + consolidation exact proof");
 
-        let nonce = search_pow(&template.to_pow_header(0), 0, 64_000_000)
-            .expect("easy test target mines");
+        let nonce =
+            search_pow(&template.to_pow_header(0), 0, 64_000_000).expect("easy test target mines");
         let header = template.clone().into_header(nonce);
         let block = Block {
             header: header.clone(),
             transactions,
         };
-        let block_proof = crate::BlockProof::minimal(
-            parent.state_root,
-            header.state_root,
-            1,
-            state_transition,
-        );
+        let block_proof =
+            crate::BlockProof::minimal(parent.state_root, header.state_root, 1, state_transition);
         let auth_sidecar = crate::BlockAuthSidecar {
             tx_auth: vec![auth_proof_for_body(&body)],
         };
@@ -2816,7 +2810,14 @@ mod tests {
             &witness,
         )
         .expect("multi-input + coinbase fixture proves natively");
-        assert_eq!(output.proof_components.component_inputs.authorization_inputs.len(), 1);
+        assert_eq!(
+            output
+                .proof_components
+                .component_inputs
+                .authorization_inputs
+                .len(),
+            1
+        );
         assert_eq!(
             output
                 .proof_components
@@ -2859,7 +2860,10 @@ mod tests {
                 2,
                 "block {i} carries 2 authorization inputs (2 std txs)"
             );
-            assert_eq!(u.inputs.authorization_totals.user_tx_count, 2, "block {i} user_tx_count");
+            assert_eq!(
+                u.inputs.authorization_totals.user_tx_count, 2,
+                "block {i} user_tx_count"
+            );
         }
         eprintln!("[multi-tx] 2 blocks x 2 std txs proved natively; 2 auth inputs each");
     }
@@ -2893,7 +2897,8 @@ mod tests {
         let region_params = RegionDischargeParams { nq: 2 };
         let units = chained_multi_tx_blocks(1, 2);
         let u = &units[0];
-        let scratch = region_wallet_pcs_native(&u.inputs, region_params, false, false, false, false, None);
+        let scratch =
+            region_wallet_pcs_native(&u.inputs, region_params, false, false, false, false, None);
         let cfg = BlockSlotsConfig {
             discharge_wallet_pcs: true,
             wallet_pcs_params: region_params,
@@ -2913,8 +2918,16 @@ mod tests {
             cfg,
         );
         let real = &slots.pending_wallet_pcs;
-        eprintln!("[region-native] scratch claims={} real claims={}", scratch.len(), real.len());
-        assert_eq!(scratch.len(), real.len(), "claim count matches (scratch vs real)");
+        eprintln!(
+            "[region-native] scratch claims={} real claims={}",
+            scratch.len(),
+            real.len()
+        );
+        assert_eq!(
+            scratch.len(),
+            real.len(),
+            "claim count matches (scratch vs real)"
+        );
         let mut mism = 0usize;
         for (i, (s, r)) in scratch.iter().zip(real.iter()).enumerate() {
             let point_eq = s.0 == r.native_point;
@@ -2930,8 +2943,14 @@ mod tests {
                 }
             }
         }
-        assert_eq!(mism, 0, "region_wallet_pcs_native must match the real discharge (2-tx)");
-        eprintln!("[region-native] scratch == real for {} claims (2-tx)", scratch.len());
+        assert_eq!(
+            mism, 0,
+            "region_wallet_pcs_native must match the real discharge (2-tx)"
+        );
+        eprintln!(
+            "[region-native] scratch == real for {} claims (2-tx)",
+            scratch.len()
+        );
 
         // The whole block_slots(2-tx) trace is satisfiable (region columns are
         // free wires bound only by the opening claims; the [K]/block pins -- incl.
@@ -2941,7 +2960,10 @@ mod tests {
             r1cs.satisfies(&z),
             "block_slots(2-tx) trace must be satisfiable (a [K]/block pin fails at this tier)"
         );
-        eprintln!("[region-native] block_slots(2-tx) IS satisfiable ({} wires)", z.len());
+        eprintln!(
+            "[region-native] block_slots(2-tx) IS satisfiable ({} wires)",
+            z.len()
+        );
     }
 
     /// Owner-auth region-vs-inline OBLIGATION PARITY on a REAL block's auth data.
@@ -2965,7 +2987,10 @@ mod tests {
         let u = &units[0];
         let auth = &u.inputs.authorization_inputs;
         let wit = &u.inputs.authorization_witnesses;
-        assert!(!auth.is_empty(), "the std-tx block carries at least one auth input");
+        assert!(
+            !auth.is_empty(),
+            "the std-tx block carries at least one auth input"
+        );
 
         let mut b = FieldR1csBuilder::new();
         // Inline obligations (the canonical per-tx replay).
@@ -2994,7 +3019,10 @@ mod tests {
             &natives,
             &native_inputs,
         );
-        assert!(!oa_claims.is_empty(), "region discharge produced no walk-C opening claims");
+        assert!(
+            !oa_claims.is_empty(),
+            "region discharge produced no walk-C opening claims"
+        );
 
         let (r1cs, z) = b.build();
         assert!(
@@ -3011,7 +3039,11 @@ mod tests {
                 "obligation {i} point arity"
             );
             for (pr, pi) in ro.reduction.point.iter().zip(io.reduction.point.iter()) {
-                assert_eq!(pr.eval(&z), pi.eval(&z), "obligation {i} r_B mismatch (region vs inline)");
+                assert_eq!(
+                    pr.eval(&z),
+                    pi.eval(&z),
+                    "obligation {i} r_B mismatch (region vs inline)"
+                );
             }
             assert_eq!(
                 ro.reduction.value.eval(&z),
@@ -3023,7 +3055,11 @@ mod tests {
                 io.commitment_cap_lanes.len(),
                 "obligation {i} cap lane count"
             );
-            for (lr, li) in ro.commitment_cap_lanes.iter().zip(io.commitment_cap_lanes.iter()) {
+            for (lr, li) in ro
+                .commitment_cap_lanes
+                .iter()
+                .zip(io.commitment_cap_lanes.iter())
+            {
                 assert_eq!(lr[0].eval(&z), li[0].eval(&z), "obligation {i} cap lane 0");
                 assert_eq!(lr[1].eval(&z), li[1].eval(&z), "obligation {i} cap lane 1");
             }
@@ -3085,7 +3121,10 @@ mod tests {
         assert!(!class.region_claims.is_empty(), "frozen claims present");
 
         let built = build_block_proof_trace(&class, &mk(&units[0]));
-        assert!(built.r1cs.satisfies(&built.witness), "B_t trace unsatisfiable");
+        assert!(
+            built.r1cs.satisfies(&built.witness),
+            "B_t trace unsatisfiable"
+        );
 
         let mut ch = FsLaneChallenger::new(b"history-block-v0");
         let (proof, commitment, _) = prove_field_with_public_io(
@@ -3136,7 +3175,10 @@ mod tests {
             built.r1cs.a_0 == built2.r1cs.a_0 && built.r1cs.b_0 == built2.r1cs.b_0,
             "B_t matrices differ across blocks of the same tier"
         );
-        assert!(built2.r1cs.satisfies(&built2.witness), "second B_t trace unsatisfiable");
+        assert!(
+            built2.r1cs.satisfies(&built2.witness),
+            "second B_t trace unsatisfiable"
+        );
     }
 
     /// The FULL LADDER freeze (two-level π, task-6 ladder sizing): freeze
@@ -3207,10 +3249,16 @@ mod tests {
             let unit = &units[slots.len() - 1 - t];
             let t0 = Instant::now();
             let class = BlockClass::freeze(shape(mb), params(mb), rp, &mk(unit), tier);
-            eprintln!("[ladder] B tier={tier} @m={mb}: frozen in {:.1?}", t0.elapsed());
+            eprintln!(
+                "[ladder] B tier={tier} @m={mb}: frozen in {:.1?}",
+                t0.elapsed()
+            );
             let t0 = Instant::now();
             let built = build_block_proof_trace(&class, &mk(unit));
-            assert!(built.r1cs.satisfies(&built.witness), "π_block trace unsatisfiable");
+            assert!(
+                built.r1cs.satisfies(&built.witness),
+                "π_block trace unsatisfiable"
+            );
             let mut ch = FsLaneChallenger::new(b"history-block-v0");
             let (proof, commitment, _) = prove_field_with_public_io(
                 &built.r1cs,
@@ -3339,9 +3387,9 @@ mod tests {
         const MB_LO: usize = 22; // the tier-8 block class shape
         const MB_HI: usize = 23; // the tier-32 block class shape (heterogeneity on purpose)
         const ML: usize = 23; // the link shape: two walk-dieted [R] replays
-        // PRODUCTION region density: the block classes discharge their
-        // wallet PCS at the full query count, so the block specs carry
-        // production-arity claims and the link's [R]_B sees real sizes.
+                              // PRODUCTION region density: the block classes discharge their
+                              // wallet PCS at the full query count, so the block specs carry
+                              // production-arity claims and the link's [R]_B sees real sizes.
         let rp = RegionDischargeParams { nq: 64 };
 
         // Block 1: 17 std txs (consensus tier 32); block 2: 5 std txs (tier 8).
@@ -3365,7 +3413,10 @@ mod tests {
                            unit: &BlockUnit|
          -> (noid_ivc_core::field_r1cs::FieldR1cs, LinkEnvelope) {
             let built = build_block_proof_trace(class, &mk(unit));
-            assert!(built.r1cs.satisfies(&built.witness), "π_block trace unsatisfiable");
+            assert!(
+                built.r1cs.satisfies(&built.witness),
+                "π_block trace unsatisfiable"
+            );
             let mut ch = FsLaneChallenger::new(b"history-block-v0");
             let (proof, commitment, _) = prove_field_with_public_io(
                 &built.r1cs,
@@ -3528,7 +3579,10 @@ mod tests {
             "L_hi matrix depends on whitelist values"
         );
         drop(tw0_r1cs);
-        assert!(tw1.r1cs.satisfies(&tw1.witness), "throwaway genesis unsatisfiable");
+        assert!(
+            tw1.r1cs.satisfies(&tw1.witness),
+            "throwaway genesis unsatisfiable"
+        );
         let tw1_r1cs = tw1.r1cs;
         let env_tw1 = prove_link(&l_hi, &tw1_r1cs, &tw1.witness, tw1.io);
         drop(tw1.witness);
@@ -3577,12 +3631,21 @@ mod tests {
             "L_hi matrices differ between throwaway and real build"
         );
         drop(tw1_r1cs);
-        assert!(gen.r1cs.satisfies(&gen.witness), "genesis link unsatisfiable");
-        eprintln!("[split-e2e] genesis link build+satisfies: {:.1?}", t0.elapsed());
+        assert!(
+            gen.r1cs.satisfies(&gen.witness),
+            "genesis link unsatisfiable"
+        );
+        eprintln!(
+            "[split-e2e] genesis link build+satisfies: {:.1?}",
+            t0.elapsed()
+        );
         let gen_r1cs = gen.r1cs;
         let tp = Instant::now();
         let env_gen = prove_link(&l_hi, &gen_r1cs, &gen.witness, gen.io);
-        eprintln!("[split-e2e] genesis link PROVE (m=23): {:.1?}", tp.elapsed());
+        eprintln!(
+            "[split-e2e] genesis link PROVE (m=23): {:.1?}",
+            tp.elapsed()
+        );
         drop(gen.witness);
 
         let t0 = Instant::now();
@@ -3734,13 +3797,13 @@ mod tests {
     /// and assert (a) the honest trace satisfies (every new cell pin — sponge
     /// absorbs, PAD constant, digest↔expected_leaf, path entries, leg roots —
     /// holds); (b) the sponge digest wires carry φ(native `slot_leaf_hash`) and
-    /// the leg-root statement wires carry φ(the composite-root natives); (c)
+    /// the leg-root statement wires carry φ(the direct UTXO-root natives); (c)
     /// the inline path killshot wires are GONE in region mode; and (d) three
     /// one-flip NEGATIVES break satisfiability: a slot-leaf packed-value wire (bound
     /// to its walk-A absorb cell), an expected-leaf wire (the leaf↔path
     /// closure: its ONLY constraints in region mode are the sponge digest-cell
-    /// pin and the state-leg entry-cell pin), and a composite utxo-root wire
-    /// (the path→root closure + the inline root killshot).
+    /// pin and the state-leg entry-cell pin), and a child state-root wire (the
+    /// path→header-root closure).
     #[test]
     fn region_exact_state_block_slots_parity_real_block() {
         use noid_chain::exact_state_hash::slot_leaf_hash;
@@ -3779,12 +3842,14 @@ mod tests {
             &u.proof,
             cfg,
         );
-        assert!(!slots.pending_wallet_pcs.is_empty(), "region claims present");
-        let (r1cs, z) = b.build();
         assert!(
-            r1cs.satisfies(&z),
-            "region exact-state block slots must satisfy (a cell pin fails)"
+            !slots.pending_wallet_pcs.is_empty(),
+            "region claims present"
         );
+        let (r1cs, z) = b.build();
+        // This constructor checks the honest witness once and caches A·z/B·z;
+        // each one-wire negative below then costs only the touched columns.
+        let mut battery = r1cs.flip_battery(&z);
 
         // (b) sponge digest wires == φ(native slot_leaf_hash) — recomputed from
         // the killshot statement, not read back from the derived digest.
@@ -3809,23 +3874,26 @@ mod tests {
                 );
             }
         }
-        // Leg roots == φ(the composite-root statement natives).
+        // Leg roots == φ(the derived old/new path statement roots).
+        let half = es_in.state_paths.len() / 2;
         for lane in 0..2 {
             assert_eq!(
-                slots.exact_state.state_roots[1].utxo_root[lane].eval(&z),
-                phi(es_in.state_roots[1].utxo_root[lane]),
-                "new utxo-root wire"
+                slots.exact_state.roots.old_root[lane].eval(&z),
+                phi(es_in.state_paths[0].expected_root[lane]),
+                "old state-root wire"
             );
             assert_eq!(
-                slots.exact_state.state_roots[0].guard_root[lane].eval(&z),
-                phi(es_in.state_roots[0].guard_root[lane]),
-                "parent guard-root wire"
+                slots.exact_state.roots.new_root[lane].eval(&z),
+                phi(es_in.state_paths[half].expected_root[lane]),
+                "new state-root wire"
             );
         }
         // (c) inline path slots are gone in region mode — exact-state AND
         // tx-root (its paths ride the walk-B TAG_COMPRESS leg).
-        assert!(slots.exact_state.state_paths.is_empty(), "no inline state-path slot");
-        assert!(slots.exact_state.guard_paths.is_none(), "no inline guard-path slot");
+        assert!(
+            slots.exact_state.state_paths.is_empty(),
+            "no inline state-path slot"
+        );
         assert!(slots.tx_root_paths.is_empty(), "no inline tx-root slot");
         eprintln!(
             "[es-region] parity OK: {} wires, {} region claims, {} slot leaves",
@@ -3838,54 +3906,49 @@ mod tests {
         // 1. Slot-leaf packed-value wire: bound to the walk-A sponge absorb
         //    cell — the flip must be rejected.
         {
-            let mut bad = z.clone();
-            bad[wire_of(&slots.exact_state.slot_leaves[0].packed_value)] += F128::ONE;
-            assert!(!r1cs.satisfies(&bad), "flipped packed-value wire accepted");
+            let wire = wire_of(&slots.exact_state.slot_leaves[0].packed_value);
+            assert!(!battery.survives_flip(wire), "flipped packed-value wire accepted");
         }
         // 2. Expected-leaf wire — THE leaf↔path closure: in region mode its only
         //    constraints are the sponge digest-cell pin and the state-leg
         //    entry-cell pin, so this isolates the new region binding.
         {
-            let mut bad = z.clone();
-            bad[wire_of(&slots.exact_state.slot_leaves[0].expected_leaf[0])] += F128::ONE;
-            assert!(!r1cs.satisfies(&bad), "flipped expected-leaf wire accepted");
+            let wire = wire_of(&slots.exact_state.slot_leaves[0].expected_leaf[0]);
+            assert!(!battery.survives_flip(wire), "flipped expected-leaf wire accepted");
         }
-        // 3. Child composite utxo-root wire — the path→root closure (also bound
-        //    by the inline composite-root killshot).
+        // 3. Child state-root wire — direct path→header-root closure.
         {
-            let mut bad = z.clone();
-            bad[wire_of(&slots.exact_state.state_roots[1].utxo_root[0])] += F128::ONE;
-            assert!(!r1cs.satisfies(&bad), "flipped utxo-root wire accepted");
+            let wire = wire_of(&slots.exact_state.roots.new_root[0]);
+            assert!(!battery.survives_flip(wire), "flipped state-root wire accepted");
         }
         // 4. Spine tx-hash wire — the tx-root leaf closure AND the spine wrap
         //    closure: bound to the walk-B tx-root leg's entry cell and to the
         //    walk-A wrap digest cell (region mode has no inline spine slot).
         {
-            let mut bad = z.clone();
-            bad[wire_of(&slots.tx_hashes[0][0])] += F128::ONE;
-            assert!(!r1cs.satisfies(&bad), "flipped spine tx-hash wire accepted");
+            let wire = wire_of(&slots.tx_hashes[0][0]);
+            assert!(!battery.survives_flip(wire), "flipped spine tx-hash wire accepted");
         }
         // 5. Header tx_root wire — the tx-root root closure (also bound by the
         //    header-hash killshot and the claim pins).
         {
             use noid_recursive::acceptance::block_slots::header_fields;
-            let mut bad = z.clone();
-            bad[wire_of(&slots.header.fields[header_fields::TX_ROOT])] += F128::ONE;
-            assert!(!r1cs.satisfies(&bad), "flipped header tx_root wire accepted");
+            let wire = wire_of(&slots.header.fields[header_fields::TX_ROOT]);
+            assert!(
+                !battery.survives_flip(wire),
+                "flipped header tx_root wire accepted"
+            );
         }
         // 6. Spine input payload lane — in region mode its ONLY hash binding is
         //    the walk-A tile absorb cell pin; the flip must be rejected there.
         {
-            let mut bad = z.clone();
-            bad[wire_of(&slots.spine_inputs[0].input_leaves[0][1])] += F128::ONE;
-            assert!(!r1cs.satisfies(&bad), "flipped spine payload wire accepted");
+            let wire = wire_of(&slots.spine_inputs[0].input_leaves[0][1]);
+            assert!(!battery.survives_flip(wire), "flipped spine payload wire accepted");
         }
         // 7. Epoch-anchor lane — bound ONLY by the spine tree's KID leaf-cell
         //    pin (tree leaf L0) in region mode.
         {
-            let mut bad = z.clone();
-            bad[wire_of(&slots.spine_inputs[0].epoch_anchor[0])] += F128::ONE;
-            assert!(!r1cs.satisfies(&bad), "flipped epoch-anchor wire accepted");
+            let wire = wire_of(&slots.spine_inputs[0].epoch_anchor[0]);
+            assert!(!battery.survives_flip(wire), "flipped epoch-anchor wire accepted");
         }
         eprintln!("[es-region] all seven one-flip negatives rejected");
     }
@@ -3932,15 +3995,25 @@ mod tests {
             &u.proof,
             cfg,
         );
-        assert_eq!(slots.tx_hashes.len(), 2, "two user txs, no coinbase in the fixture");
+        assert_eq!(
+            slots.tx_hashes.len(),
+            2,
+            "two user txs, no coinbase in the fixture"
+        );
         let (r1cs, z) = b.build();
-        assert!(r1cs.satisfies(&z), "multi-tx spine-region block slots must satisfy");
+        assert!(
+            r1cs.satisfies(&z),
+            "multi-tx spine-region block slots must satisfy"
+        );
         // The LAST tx's hash lives in tx block 1's chunk — its wrap-digest
         // cell pin must still bind it.
         let last = slots.tx_hashes.len() - 1;
         let mut bad = z.clone();
         bad[wire_of(&slots.tx_hashes[last][0])] += F128::ONE;
-        assert!(!r1cs.satisfies(&bad), "flipped chunked spine tx-hash accepted");
+        assert!(
+            !r1cs.satisfies(&bad),
+            "flipped chunked spine tx-hash accepted"
+        );
         eprintln!(
             "[spine-region] multitx parity OK: {} wires, {} claims, {} instances",
             z.len(),
@@ -4053,8 +4126,14 @@ mod tests {
             wires_region as i64 - wires_inline as i64,
         );
 
-        assert!(sat_inline, "inline-owner-auth complete block must be satisfiable");
-        assert!(sat_region, "region-owner-auth complete block must be satisfiable");
+        assert!(
+            sat_inline,
+            "inline-owner-auth complete block must be satisfiable"
+        );
+        assert!(
+            sat_region,
+            "region-owner-auth complete block must be satisfiable"
+        );
 
         // End-to-end parity: `pending_wallet_pcs` in the region path is
         // [owner-auth walk-C claims ... , wallet-PCS claims ...]; the wallet-PCS
@@ -4069,8 +4148,14 @@ mod tests {
         let n_wallet = pcs_inline.len();
         let suffix = &pcs_region_all[n_all - n_wallet..];
         for (i, (sr, si)) in suffix.iter().zip(pcs_inline.iter()).enumerate() {
-            assert_eq!(sr.0, si.0, "wallet-PCS claim {i} point drift (region vs inline)");
-            assert_eq!(sr.1, si.1, "wallet-PCS claim {i} value drift (region vs inline)");
+            assert_eq!(
+                sr.0, si.0,
+                "wallet-PCS claim {i} point drift (region vs inline)"
+            );
+            assert_eq!(
+                sr.1, si.1,
+                "wallet-PCS claim {i} value drift (region vs inline)"
+            );
         }
         eprintln!(
             "[owner-auth-region] wallet-PCS suffix ({n_wallet} claims) parity OK; owner-auth added {} walk-C claims",
@@ -4082,15 +4167,22 @@ mod tests {
         // cells; its output MUST match the real build's `pending_wallet_pcs`
         // natives, in ORDER, for the owner-auth-region path too (the mirror). Gate
         // it directly against the real region build above.
-        let scratch = region_wallet_pcs_native(&u.inputs, region_params, true, false, false, false, None);
+        let scratch =
+            region_wallet_pcs_native(&u.inputs, region_params, true, false, false, false, None);
         assert_eq!(
             scratch.len(),
             pcs_region_all.len(),
             "region_wallet_pcs_native(true) claim count must match the real region build"
         );
         for (i, (s, r)) in scratch.iter().zip(pcs_region_all.iter()).enumerate() {
-            assert_eq!(s.0, r.0, "scratch-vs-real region claim {i} point drift (owner-auth region)");
-            assert_eq!(s.1, r.1, "scratch-vs-real region claim {i} value drift (owner-auth region)");
+            assert_eq!(
+                s.0, r.0,
+                "scratch-vs-real region claim {i} point drift (owner-auth region)"
+            );
+            assert_eq!(
+                s.1, r.1,
+                "scratch-vs-real region claim {i} value drift (owner-auth region)"
+            );
         }
         eprintln!(
             "[owner-auth-region] region_wallet_pcs_native(true) == real build for {} claims (mirror OK)",
@@ -4099,7 +4191,10 @@ mod tests {
 
         // Guard against an accidental blow-up (region walk-C discharges are
         // ~1M rows each; two in one build must stay bounded).
-        assert!(m_region <= 24, "region owner-auth block-slot m exceeded 2^24 guard: {m_region}");
+        assert!(
+            m_region <= 24,
+            "region owner-auth block-slot m exceeded 2^24 guard: {m_region}"
+        );
     }
 
     /// THE stage-2 payoff: a CLOSED recursion over REAL blocks. π₀ (genesis
@@ -4157,11 +4252,8 @@ mod tests {
         let layout = link_io_layout_for(shape.k_log, true);
 
         let units = chained_std_tx_blocks(3);
-        let class = LinkClass::new_block_bearing(
-            shape,
-            params.clone(),
-            units[0].start_accumulator.clone(),
-        );
+        let class =
+            LinkClass::new_block_bearing(shape, params.clone(), units[0].start_accumulator.clone());
 
         fn mk_block(u: &BlockUnit, config: BlockSlotsConfig) -> LinkBlock<'_> {
             LinkBlock {
@@ -4787,12 +4879,12 @@ mod tests {
 
     /// COMPLETE region block-bearing recursion with the EXACT-STATE hashing
     /// killshots ALSO discharged in the region (task 4b): slot leaves on the
-    /// walk-A sponge tiles, state/guard paths as walk-B legs, owner-auth on
+    /// walk-A sponge tiles, state paths as one walk-B leg, owner-auth on
     /// walk C — every per-tx/per-slot-GROWING [K] hashing family flat. π₀ is a
     /// COMPLETE block-bearing proof whose owner-auth, wallet-PCS AND
     /// exact-state hashing are all region-verified; π₁ ⊳ π₀ opens π₀'s region
     /// columns through the link IO; the decider accepts. A DISTINCT, larger
-    /// class than the owner-auth-only one (the walk-B exact-state legs add
+    /// class than the owner-auth-only one (the walk-B exact-state leg adds
     /// frozen claims — a different class matrix + digest).
     #[test]
     #[ignore = "heavy (m=24, several 2^24 proofs + one class digest); run explicitly"]
@@ -5090,7 +5182,7 @@ mod tests {
     /// Class-fixity gate for the EXACT-STATE region discharge (task 4b): the
     /// same two-real-blocks matrix + claim-structure comparison with
     /// `exact_state_region = true`. The exact-state extension adds walk-A
-    /// sponge tiles, two walk-B legs and their cell pins whose STRUCTURE must
+    /// sponge tiles, one walk-B state-path leg and its cell pins whose STRUCTURE must
     /// be a pure function of (touched count, K, depths) — any block-content-
     /// derived index in a pin, pattern or claim point/value drifts here.
     #[test]
@@ -5283,25 +5375,33 @@ mod tests {
         // link), so a claim whose point/value LinExpr references a
         // block-dependent WIRE passes the matrix check yet drifts the LINK.
         #[allow(clippy::type_complexity)]
-        let build = |u: &BlockUnit, label: &str| -> (_, Vec<(usize, usize, Vec<LinExpr>, LinExpr)>) {
-            let mut b = FieldR1csBuilder::new();
-            let slots = build_block_slots_with_config(
-                &mut b,
-                &u.start_accumulator,
-                &u.end_accumulator,
-                &u.inputs,
-                &u.proof,
-                region_cfg,
-            );
-            let claims: Vec<(usize, usize, Vec<LinExpr>, LinExpr)> = slots
-                .pending_wallet_pcs
-                .iter()
-                .map(|c| (c.slice.start(), c.slice.len(), c.point.clone(), c.value.clone()))
-                .collect();
-            let (r, z) = b.build();
-            assert!(r.satisfies(&z), "{label} satisfies");
-            (r, claims)
-        };
+        let build =
+            |u: &BlockUnit, label: &str| -> (_, Vec<(usize, usize, Vec<LinExpr>, LinExpr)>) {
+                let mut b = FieldR1csBuilder::new();
+                let slots = build_block_slots_with_config(
+                    &mut b,
+                    &u.start_accumulator,
+                    &u.end_accumulator,
+                    &u.inputs,
+                    &u.proof,
+                    region_cfg,
+                );
+                let claims: Vec<(usize, usize, Vec<LinExpr>, LinExpr)> = slots
+                    .pending_wallet_pcs
+                    .iter()
+                    .map(|c| {
+                        (
+                            c.slice.start(),
+                            c.slice.len(),
+                            c.point.clone(),
+                            c.value.clone(),
+                        )
+                    })
+                    .collect();
+                let (r, z) = b.build();
+                assert!(r.satisfies(&z), "{label} satisfies");
+                (r, claims)
+            };
 
         let (r0, claims0) = build(unit0, "block 0 region-ON");
         let (r1, claims1) = build(unit1, "block 1 region-ON");
@@ -5311,14 +5411,24 @@ mod tests {
         for (ci, (c0, c1)) in claims0.iter().zip(claims1.iter()).enumerate() {
             if c0 != c1 {
                 eprintln!("[region-claim-diff] claim {ci} drifts:");
-                eprintln!("[region-claim-diff]   slice: {:?} vs {:?}", (c0.0, c0.1), (c1.0, c1.1));
+                eprintln!(
+                    "[region-claim-diff]   slice: {:?} vs {:?}",
+                    (c0.0, c0.1),
+                    (c1.0, c1.1)
+                );
                 for (k, (p0, p1)) in c0.2.iter().zip(c1.2.iter()).enumerate() {
                     if p0 != p1 {
-                        eprintln!("[region-claim-diff]   point[{k}]: {:?} vs {:?}", p0.terms, p1.terms);
+                        eprintln!(
+                            "[region-claim-diff]   point[{k}]: {:?} vs {:?}",
+                            p0.terms, p1.terms
+                        );
                     }
                 }
                 if c0.3 != c1.3 {
-                    eprintln!("[region-claim-diff]   value: {:?} vs {:?}", c0.3.terms, c1.3.terms);
+                    eprintln!(
+                        "[region-claim-diff]   value: {:?} vs {:?}",
+                        c0.3.terms, c1.3.terms
+                    );
                 }
                 panic!("region wallet-PCS claim {ci} point/value drifted between blocks");
             }
@@ -5514,27 +5624,41 @@ mod tests {
         .expect("coinbase-only block without detached proof is a valid timeless accepted block");
         assert_eq!(out.accepted_claim_batch.consensus_state.height, 1);
         assert_eq!(out.end_state.cached_state_root(), child_state_root);
-        assert_ne!(child_state_root, parent.state_root, "coinbase mint changes state");
-        assert_eq!(out.proof_components.component_inputs.accepted_claim_witness.headers.len(), 1);
+        assert_ne!(
+            child_state_root, parent.state_root,
+            "coinbase mint changes state"
+        );
         assert_eq!(
             out.proof_components
                 .component_inputs
-            .accepted_block_certificate_statements
+                .accepted_claim_witness
+                .headers
+                .len(),
+            1
+        );
+        assert_eq!(
+            out.proof_components
+                .component_inputs
+                .accepted_block_certificate_statements
                 .len(),
             1
         );
         assert_eq!(
             accepted_block_certificate_chain_claim(
-                &out.proof_components.component_inputs.accepted_block_certificate_statements[0]
+                &out.proof_components
+                    .component_inputs
+                    .accepted_block_certificate_statements[0]
             ),
             out.proof_components
                 .component_inputs
-            .accepted_claim_witness
+                .accepted_claim_witness
                 .accepted_block_claims[0]
         );
         assert_ne!(
             crate::accepted_block_certificate_statement_digest(
-                &out.proof_components.component_inputs.accepted_block_certificate_statements[0]
+                &out.proof_components
+                    .component_inputs
+                    .accepted_block_certificate_statements[0]
             ),
             [0u8; 32]
         );
@@ -5555,7 +5679,9 @@ mod tests {
             1
         );
         let statement_digest = noid_recursive::accepted_block_certificate_statement_digest(
-            &out.proof_components.component_inputs.accepted_block_certificate_statements[0],
+            &out.proof_components
+                .component_inputs
+                .accepted_block_certificate_statements[0],
         );
         assert_eq!(
             out.proof_components.accepted_block_certificate_receipts[0].statement_digest,
@@ -5575,8 +5701,18 @@ mod tests {
             out.proof_components
                 .accepted_block_receipt_projection_handles[0]
         );
-        assert_eq!(out.proof_components.component_inputs.header_integer_trace.steps.len(), 1);
-        assert_eq!(out.proof_components.component_inputs.tx_root_inputs.len(), 1);
+        assert_eq!(
+            out.proof_components
+                .component_inputs
+                .header_integer_trace
+                .steps
+                .len(),
+            1
+        );
+        assert_eq!(
+            out.proof_components.component_inputs.tx_root_inputs.len(),
+            1
+        );
         assert_eq!(
             out.proof_components
                 .component_inputs
@@ -5598,14 +5734,24 @@ mod tests {
                 .is_empty(),
             "known C' blocker changed: update the no-user matrix gate"
         );
-        assert_eq!(out.proof_components.component_inputs.authorization_totals.user_tx_count, 0);
         assert_eq!(
-            out.proof_components.component_inputs.authorization_totals.owner_count_total,
+            out.proof_components
+                .component_inputs
+                .authorization_totals
+                .user_tx_count,
             0
         );
         assert_eq!(
             out.proof_components
-                .component_inputs.authorization_totals
+                .component_inputs
+                .authorization_totals
+                .owner_count_total,
+            0
+        );
+        assert_eq!(
+            out.proof_components
+                .component_inputs
+                .authorization_totals
                 .live_input_count_total,
             0
         );
@@ -5669,7 +5815,9 @@ mod tests {
         );
         let original_claim_batch_digest = summary.accepted_claim_batch_digest;
         let original_certificate_digest = crate::accepted_block_certificate_statement_digest(
-            &out.proof_components.component_inputs.accepted_block_certificate_statements[0],
+            &out.proof_components
+                .component_inputs
+                .accepted_block_certificate_statements[0],
         );
         let certificate_batch_statement =
             accepted_block_certificate_batch_statement_from_full_accepted_output(
@@ -5872,15 +6020,25 @@ mod tests {
             out.end_state.cached_state_root(),
             witness.items[0].block.header.state_root
         );
-        assert_eq!(out.proof_components.component_inputs.accepted_claim_witness.headers.len(), 1);
         assert_eq!(
             out.proof_components
                 .component_inputs
-            .accepted_block_certificate_statements
+                .accepted_claim_witness
+                .headers
                 .len(),
             1
         );
-        let certificate_statement = &out.proof_components.component_inputs.accepted_block_certificate_statements[0];
+        assert_eq!(
+            out.proof_components
+                .component_inputs
+                .accepted_block_certificate_statements
+                .len(),
+            1
+        );
+        let certificate_statement = &out
+            .proof_components
+            .component_inputs
+            .accepted_block_certificate_statements[0];
         assert_eq!(certificate_statement.user_tx_count, 1);
         assert_eq!(certificate_statement.live_input_count, 1);
         assert_eq!(certificate_statement.touched_slot_count, 2);
@@ -5888,28 +6046,78 @@ mod tests {
             accepted_block_certificate_chain_claim(certificate_statement),
             out.proof_components
                 .component_inputs
-            .accepted_claim_witness
+                .accepted_claim_witness
                 .accepted_block_claims[0]
         );
-        assert_eq!(out.proof_components.component_inputs.header_integer_trace.steps.len(), 1);
-        assert_eq!(out.proof_components.component_inputs.tx_body_standard_inputs.len(), 1);
-        assert_eq!(out.proof_components.component_inputs.tx_body_standard_hashes.len(), 1);
-        assert!(out.proof_components.component_inputs.tx_body_sweep_inputs.is_empty());
-        assert!(out.proof_components.component_inputs.tx_body_sweep_hashes.is_empty());
-        assert!(!out.proof_components.component_inputs.tx_root_inputs.is_empty());
-        assert_eq!(out.proof_components.component_inputs.exact_state_killshot_inputs.len(), 1);
-        assert_eq!(out.proof_components.component_inputs.authorization_totals.user_tx_count, 1);
         assert_eq!(
-            out.proof_components.component_inputs.authorization_totals.owner_count_total,
+            out.proof_components
+                .component_inputs
+                .header_integer_trace
+                .steps
+                .len(),
             1
         );
         assert_eq!(
             out.proof_components
-                .component_inputs.authorization_totals
+                .component_inputs
+                .tx_body_standard_inputs
+                .len(),
+            1
+        );
+        assert_eq!(
+            out.proof_components
+                .component_inputs
+                .tx_body_standard_hashes
+                .len(),
+            1
+        );
+        assert!(out
+            .proof_components
+            .component_inputs
+            .tx_body_sweep_inputs
+            .is_empty());
+        assert!(out
+            .proof_components
+            .component_inputs
+            .tx_body_sweep_hashes
+            .is_empty());
+        assert!(!out
+            .proof_components
+            .component_inputs
+            .tx_root_inputs
+            .is_empty());
+        assert_eq!(
+            out.proof_components
+                .component_inputs
+                .exact_state_killshot_inputs
+                .len(),
+            1
+        );
+        assert_eq!(
+            out.proof_components
+                .component_inputs
+                .authorization_totals
+                .user_tx_count,
+            1
+        );
+        assert_eq!(
+            out.proof_components
+                .component_inputs
+                .authorization_totals
+                .owner_count_total,
+            1
+        );
+        assert_eq!(
+            out.proof_components
+                .component_inputs
+                .authorization_totals
                 .live_input_count_total,
             1
         );
-        let exact_inputs = &out.proof_components.component_inputs.exact_state_killshot_inputs[0];
+        let exact_inputs = &out
+            .proof_components
+            .component_inputs
+            .exact_state_killshot_inputs[0];
         let exact_proof = crate::prove_exact_state_killshot(exact_inputs)
             .expect("derived exact-state component proves");
         crate::verify_exact_state_killshot(exact_inputs, &exact_proof)
@@ -6064,7 +6272,10 @@ mod tests {
         ));
 
         let mut bad_components = out.proof_components.clone();
-        bad_components.component_inputs.accepted_block_certificate_statements[0].child_state_root = [0x44; 32];
+        bad_components
+            .component_inputs
+            .accepted_block_certificate_statements[0]
+            .child_state_root = [0x44; 32];
         assert!(matches!(
             verify_full_accepted_block_batch_components(
                 &start_consensus,
@@ -6105,7 +6316,10 @@ mod tests {
         ));
 
         let mut bad_components = out.proof_components.clone();
-        bad_components.component_inputs.authorization_totals.owner_count_total += 1;
+        bad_components
+            .component_inputs
+            .authorization_totals
+            .owner_count_total += 1;
         assert!(matches!(
             verify_full_accepted_block_batch_components(
                 &start_consensus,

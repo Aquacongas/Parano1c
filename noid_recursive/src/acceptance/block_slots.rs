@@ -30,22 +30,15 @@
 //! - each owner-auth slot pins its `tx_body_hash` to the spine hash of its
 //!   tx and discharges its wallet-PCS obligation; the authorization totals
 //!   are pinned to the per-slot counts AND to the claim's resource fields;
-//! - the exact-state composite roots pin to the claim's parent/child state
-//!   roots and `log_slots` lanes.
+//! - exact-state old paths pin directly to the parent state root (or its
+//!   canonical one-level grow), new paths to the child header state root,
+//!   and every path depth to the child `log_slots` lane.
 //!
 //! NOT bound here (audited residue, each correctly scoped to another
 //! layer, none a hole in what this file claims):
-//! - exact-state INTERNAL wiring (slot leaves ↔ state paths ↔ utxo/guard
-//!   roots) — IN INLINE MODE ONLY (`exact_state_region = false`): each of
-//!   the five killshots self-binds its own hash chain, but the
-//!   cross-killshot gluing (state-path root == composite utxo_root, and
-//!   likewise for guard) is a free witness pair, natively guaranteed by
-//!   `derive_exact_state_killshot_inputs` re-deriving every input from the
-//!   one validated block. REGION MODE (`exact_state_region = true`) CLOSES
-//!   this residue: the slot-leaf sponge tiles pin their digest cells to the
-//!   `expected_leaf` statement wires, the walk-B state-leg entry cells pin
-//!   to the SAME wires (leaf ↔ path), and each leg root cell pins to the
-//!   composite-root statement's utxo/guard-root wires (path ↔ root).
+//! - exact-state ActionSurface recombination remains a C' obligation. The
+//!   hashing layer here does close slot-leaf ↔ state-path ↔ header-root in
+//!   both inline and region modes.
 //! - public transaction logic — likewise a region-layer per-tx obligation.
 //! - the parent header's `active_slot_count` / `alloc_counter`: CLOSED —
 //!   the accumulator boundary carries both counters as lanes; each block
@@ -85,7 +78,8 @@ use super::trace::checkpoint_poseidon::{
     ChainAccumulatorItemTrace, HeaderHashInputsTrace,
 };
 use super::trace::exact_state::{
-    build_exact_state_slot_with_config, scratch_exact_state_region_data, ExactStateSlotWires,
+    bind_exact_state_header_roots, build_exact_state_slot_with_config,
+    scratch_exact_state_region_data, ExactStateSlotWires,
 };
 use super::trace::merkle_path::{build_batched_merkle_slot, MerklePathInputsTrace};
 use super::trace::owner_auth::{
@@ -544,9 +538,9 @@ fn tier_auth_slot_count(tier_user_tx_capacity: Option<usize>, n_real_user: usize
         .map_or(n_real_user, |c| if c == 0 { 0 } else { c.next_power_of_two() })
 }
 
-/// The tier's touched-slot capacity: the class spend capacity (the guard
-/// bucket's padded spend width) plus the output capacity (every standard tx
-/// may create up to its shape's max outputs) PLUS ONE for the coinbase
+/// The tier's touched-slot capacity: the class live-input capacity plus the
+/// output capacity (every standard tx may create up to its shape's max
+/// outputs) PLUS ONE for the coinbase
 /// mint — the coinbase is not a user tx but its reward output touches a
 /// slot too, so a genuinely full block touches `user actions + 1` slots
 /// (3061 at the attack tier, not 3060). Every touched slot is a spend or a
@@ -560,8 +554,7 @@ fn tier_touched_capacity(std_tier: usize) -> usize {
 /// `slot_leaves`/`state_paths` old and new HALVES each grow to
 /// [`tier_touched_capacity`] entries by duplicating the half's first
 /// leaf+path pair (re-proving a real leaf against the same root —
-/// value-neutral). Guard and composite-root parts are already
-/// per-block-fixed.
+/// value-neutral).
 fn pad_exact_state_inputs_to_tier(
     es: &crate::block_certificate_backend::ExactStateKillShotInputs,
     std_tier: usize,
@@ -775,14 +768,12 @@ pub struct BlockSlotsConfig {
     /// wallet-PCS claims) for the link to thread through public-IO, so both must
     /// be discharged for a complete proof. `false` = the inline per-tx replay.
     pub owner_auth_region: bool,
-    /// When true, verify the exact-state HASHING killshots (slot_leaves,
-    /// state_paths, guard_paths — the per-touched-slot-growing pieces) via the
+    /// When true, verify the exact-state HASHING killshots (slot_leaves and
+    /// state_paths — the per-touched-slot-growing pieces) via the
     /// shared region walks instead of the inline per-slot replays: the slot-leaf
-    /// sponge tiles join the wallet-PCS discharge's walk A, the state/guard
-    /// Merkle paths join its walk B as extra legs (`ExactStateRegionData`
-    /// threaded into the plural discharge). guard_buckets and state_roots stay
-    /// inline. Region mode ALSO closes the exact-state internal-wiring residue
-    /// (leaf↔path↔root — see the module doc).
+    /// sponge tiles join the wallet-PCS discharge's walk A and state Merkle
+    /// paths join its walk B as one extra leg (`ExactStateRegionData` threaded
+    /// into the plural discharge). Region mode also closes leaf↔path↔header-root.
     ///
     /// REQUIRES `discharge_wallet_pcs`: the exact-state families ride
     /// the wallet-PCS region walks (a new walk is never spawned), so the plural
@@ -829,8 +820,8 @@ pub struct BlockSlotsConfig {
     ///
     /// `cap` MUST be the block's consensus standard-tx class tier
     /// (`standard_tx_class_tier(n_real)`), so the native tier-quantized
-    /// statements (exact-state spend capacity, guard capacity, padded
-    /// tx-tree depth) already agree across the tier. REQUIRES the full
+    /// statements (exact-state touched capacity and padded tx-tree depth)
+    /// already agree across the tier. REQUIRES the full
     /// region stack (all four region flags). `None` = exact counts (the
     /// per-block shapes; the pre-capacity behavior).
     pub tier_user_tx_capacity: Option<usize>,
@@ -1224,27 +1215,25 @@ pub fn build_block_slots_with_config(
         &proof.exact_state[0],
         config.exact_state_region,
     );
-    assert_eq!(exact_state.state_roots.len(), 2, "parent/child pair");
-    for lane in 0..2 {
-        pin_eq(
-            b,
-            &exact_state.state_roots[0].expected_state_root[lane],
-            &claim.fields[parent + hc::STATE_ROOT + lane],
-        );
-        pin_eq(
-            b,
-            &exact_state.state_roots[1].expected_state_root[lane],
-            &header.fields[hf::STATE_ROOT + lane],
-        );
-    }
-    pin_eq(
+    let parent_log_native = inputs.accepted_claim_hash_inputs[0].fields
+        [parent + hc::LOG_SLOTS]
+        .0;
+    assert!(parent_log_native <= u32::MAX as u128, "parent log_slots off range");
+    let parent_root = [
+        claim.fields[parent + hc::STATE_ROOT].clone(),
+        claim.fields[parent + hc::STATE_ROOT + 1].clone(),
+    ];
+    let child_root = [
+        header.fields[hf::STATE_ROOT].clone(),
+        header.fields[hf::STATE_ROOT + 1].clone(),
+    ];
+    bind_exact_state_header_roots(
         b,
-        &exact_state.state_roots[0].log_slots,
+        &exact_state.roots,
+        &parent_root,
         &claim.fields[parent + hc::LOG_SLOTS],
-    );
-    pin_eq(
-        b,
-        &exact_state.state_roots[1].log_slots,
+        parent_log_native as u32,
+        &child_root,
         &header.fields[hf::LOG_SLOTS],
     );
 

@@ -15,7 +15,6 @@ use crate::checkpoint::{CheckpointCoverage, ImmutableCheckpointPackage};
 use crate::consensus::da_prune::BlockUndoLog;
 use crate::fri_state::SlotValue;
 use crate::header_anchor::HeaderChainAnchor;
-use crate::reuse_guard::{GuardBucket, REUSE_GUARD_BUCKETS};
 use crate::segmented_state::SegmentColumns;
 use crate::storage::meta::{ConsensusMeta, FinalizedCheckpoint};
 use crate::wire::BLOCK_HEADER_WIRE_SIZE;
@@ -169,6 +168,7 @@ pub fn decode_slot_value(bytes: &[u8]) -> Option<SlotValue> {
 //
 // Wire format:
 //   block_height             : u64 LE  (8 bytes)
+//   log_slots_before          : u32 LE  (4 bytes)
 //   active_slot_count_before : u64 LE  (8 bytes)
 //   alloc_counter_before     : u64 LE  (8 bytes)
 //   n_changes                : u32 LE  (4 bytes)
@@ -176,15 +176,11 @@ pub fn decode_slot_value(bytes: &[u8]) -> Option<SlotValue> {
 //   [slot_index  : u32 LE  (4 bytes)
 //    slot_value  : 48 bytes          ] × n_changes
 //   tx_hash      : 32 bytes × n_hashes
-//   guard_len    : u32 LE
-//   guard_bytes  : bincode Vec<GuardBucket>
 
 pub fn encode_undo_log(u: &BlockUndoLog) -> Vec<u8> {
-    let guard_bytes = encode_reuse_guard_buckets(&u.reuse_guard_before);
-    let mut buf = Vec::with_capacity(
-        36 + u.slot_changes.len() * 52 + u.tx_hashes.len() * 32 + guard_bytes.len(),
-    );
+    let mut buf = Vec::with_capacity(36 + u.slot_changes.len() * 52 + u.tx_hashes.len() * 32);
     buf.extend_from_slice(&u.block_height.to_le_bytes());
+    buf.extend_from_slice(&u.log_slots_before.to_le_bytes());
     buf.extend_from_slice(&u.active_slot_count_before.to_le_bytes());
     buf.extend_from_slice(&u.alloc_counter_before.to_le_bytes());
     buf.extend_from_slice(&(u.slot_changes.len() as u32).to_le_bytes());
@@ -196,29 +192,27 @@ pub fn encode_undo_log(u: &BlockUndoLog) -> Vec<u8> {
     for h in &u.tx_hashes {
         buf.extend_from_slice(&h.0);
     }
-    buf.extend_from_slice(&(guard_bytes.len() as u32).to_le_bytes());
-    buf.extend_from_slice(&guard_bytes);
     buf
 }
 
 pub fn decode_undo_log(bytes: &[u8]) -> Option<BlockUndoLog> {
-    if bytes.len() < 32 {
+    if bytes.len() < 36 {
         return None;
     }
     let block_height = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
-    let active_slot_count_before = u64::from_le_bytes(bytes[8..16].try_into().ok()?);
-    let alloc_counter_before = u64::from_le_bytes(bytes[16..24].try_into().ok()?);
-    let n = u32::from_le_bytes(bytes[24..28].try_into().ok()?) as usize;
-    let n_hashes = u32::from_le_bytes(bytes[28..32].try_into().ok()?) as usize;
-    let payload_min = 32usize
+    let log_slots_before = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
+    let active_slot_count_before = u64::from_le_bytes(bytes[12..20].try_into().ok()?);
+    let alloc_counter_before = u64::from_le_bytes(bytes[20..28].try_into().ok()?);
+    let n = u32::from_le_bytes(bytes[28..32].try_into().ok()?) as usize;
+    let n_hashes = u32::from_le_bytes(bytes[32..36].try_into().ok()?) as usize;
+    let payload_min = 36usize
         .checked_add(n.checked_mul(52)?)?
-        .checked_add(n_hashes.checked_mul(32)?)?
-        .checked_add(4)?;
-    if bytes.len() < payload_min {
+        .checked_add(n_hashes.checked_mul(32)?)?;
+    if bytes.len() != payload_min {
         return None;
     }
     let mut slot_changes = Vec::with_capacity(n);
-    let mut pos = 32;
+    let mut pos = 36;
     for _ in 0..n {
         if bytes.len() < pos + 52 {
             return None;
@@ -237,22 +231,14 @@ pub fn decode_undo_log(bytes: &[u8]) -> Option<BlockUndoLog> {
         tx_hashes.push(TxBodyHash(h));
         pos += 32;
     }
-    if bytes.len() < pos + 4 {
-        return None;
-    }
-    let guard_len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().ok()?) as usize;
-    pos += 4;
-    if bytes.len() != pos + guard_len {
-        return None;
-    }
-    let reuse_guard_before = decode_reuse_guard_buckets(&bytes[pos..pos + guard_len])?;
+    debug_assert_eq!(pos, bytes.len());
     Some(BlockUndoLog {
         block_height,
+        log_slots_before,
         active_slot_count_before,
         alloc_counter_before,
         slot_changes,
         tx_hashes,
-        reuse_guard_before,
     })
 }
 
@@ -423,15 +409,6 @@ pub fn decode_state_meta(bytes: &[u8]) -> Option<(u32, u64, u64)> {
     Some((log_slots, active, alloc))
 }
 
-pub fn encode_reuse_guard_buckets(buckets: &[GuardBucket; REUSE_GUARD_BUCKETS]) -> Vec<u8> {
-    bincode::serialize(&buckets.to_vec()).expect("ReuseGuard buckets serialization must succeed")
-}
-
-pub fn decode_reuse_guard_buckets(bytes: &[u8]) -> Option<[GuardBucket; REUSE_GUARD_BUCKETS]> {
-    let buckets: Vec<GuardBucket> = bincode::deserialize(bytes).ok()?;
-    buckets.try_into().ok()
-}
-
 // consensus_meta value:
 //   tip_height(u64) + tip_hash([u8;32]) + cumulative_chainwork([u8;32])
 //   + finalized_height(u64) + finalized_hash([u8;32]) = 112 bytes
@@ -555,11 +532,11 @@ mod tests {
         };
         let undo = BlockUndoLog {
             block_height: 7,
+            log_slots_before: 24,
             active_slot_count_before: 19,
             alloc_counter_before: 41,
             slot_changes: vec![(3u32, sv), (9u32, SlotValue::EMPTY)],
             tx_hashes: vec![TxBodyHash([0xABu8; 32])],
-            reuse_guard_before: std::array::from_fn(|_| crate::reuse_guard::GuardBucket::Empty),
         };
         let bytes = encode_undo_log(&undo);
         let undo2 = decode_undo_log(&bytes).expect("decode");
@@ -568,7 +545,7 @@ mod tests {
 
     #[test]
     fn undo_log_empty_roundtrip() {
-        let undo = BlockUndoLog::empty(42);
+        let undo = BlockUndoLog::empty(42, 24);
         let bytes = encode_undo_log(&undo);
         let undo2 = decode_undo_log(&bytes).expect("decode");
         assert_eq!(undo2.block_height, 42);
@@ -580,12 +557,12 @@ mod tests {
 
     #[test]
     fn undo_log_rejects_truncated_counter_header_and_impossible_lengths() {
-        let undo = BlockUndoLog::empty(42);
+        let undo = BlockUndoLog::empty(42, 24);
         let bytes = encode_undo_log(&undo);
         assert!(decode_undo_log(&bytes[..23]).is_none());
 
         let mut malformed = bytes;
-        malformed[24..28].copy_from_slice(&u32::MAX.to_le_bytes());
+        malformed[28..32].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(decode_undo_log(&malformed).is_none());
     }
 

@@ -92,15 +92,6 @@ pub const TAG_CLAIMS: DomainTag = DomainTag::new(b"CLAIMS__");
 pub const TAG_EXSTSLT: DomainTag = DomainTag::new(b"EXSTSLT_");
 /// Exact UTXO state binary Merkle node: `PARANOID/EXACT-STATE-NODE/256/v1`.
 pub const TAG_EXSTNOD: DomainTag = DomainTag::new(b"EXSTNOD_");
-/// Composite exact state root: `PARANOID/EXACT-STATE-ROOT/256/v1`.
-pub const TAG_EXSTROT: DomainTag = DomainTag::new(b"EXSTROT_");
-/// ReuseGuard canonical bucket: `PARANOID/REUSE-GUARD-BUCKET/256/v1`.
-pub const TAG_RGDBUCK: DomainTag = DomainTag::new(b"RGDBUCK_");
-/// ReuseGuard spent-slot list digest (the inner hash nested inside a
-/// bucket leaf): `PARANOID/REUSE-GUARD-SLOTS/256/v1`.
-pub const TAG_RGDSLOT: DomainTag = DomainTag::new(b"RGDSLOT_");
-/// ReuseGuard fixed-depth Merkle node: `PARANOID/REUSE-GUARD-NODE/256/v1`.
-pub const TAG_RGDNODE: DomainTag = DomainTag::new(b"RGDNODE_");
 /// Accepted-block claim field transcript for recursive chain accumulation.
 pub const TAG_ACCBLK: DomainTag = DomainTag::new(b"ACCBLK__");
 /// Header projection item for public history anchoring.
@@ -147,10 +138,6 @@ mod tests {
             TAG_CLAIMS,
             TAG_EXSTSLT,
             TAG_EXSTNOD,
-            TAG_EXSTROT,
-            TAG_RGDBUCK,
-            TAG_RGDSLOT,
-            TAG_RGDNODE,
             TAG_ACCBLK,
             TAG_HDRPROJ,
             TAG_HDRANCH,

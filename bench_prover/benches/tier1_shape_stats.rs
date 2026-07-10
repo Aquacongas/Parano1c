@@ -41,15 +41,15 @@ use noid_core::transcript::FiatShamir;
 use noid_core::Block128;
 use noid_gkr::{
     init_owner_auth_gkr_channel, owner_auth_gkr_channel, owner_auth_inputs_from_body_and_live_secrets,
-    prove_owner_auth_killshot, verify_accepted_claim_hash_killshot, verify_batched_guard_bucket_killshot,
+    prove_owner_auth_killshot, verify_accepted_claim_hash_killshot,
     verify_batched_merkle_killshot, verify_batched_slot_leaf_killshot,
-    verify_batched_state_root_killshot, verify_block_spine_killshot,
+    verify_block_spine_killshot,
     verify_chain_accumulator_killshot_padded, verify_header_hash_killshot_padded,
     verify_owner_auth_killshot, verify_sweep_block_spine_killshot, MerkleCircuit, OwnerAuthCircuit,
     MAX_MERKLE_DEPTH,
 };
 use noid_poseidon2b::channel::Poseidon2bChannel;
-use noid_poseidon2b::native::domain::{TAG_EXSTNOD, TAG_RGDNODE};
+use noid_poseidon2b::native::domain::TAG_EXSTNOD;
 use noid_poseidon2b::primitives::{derive_address, Address, SpendSecret};
 use noid_recursive::{
     chain_accumulator_proof_inputs,
@@ -371,12 +371,12 @@ fn user_txs_block_batch(n: usize) -> FullBatchFixture {
             .set_slot(input_slot(i) as u32, pre_slot)
             .unwrap();
     }
-    // n == 1 keeps the exact legacy layout (input slot 2, output slot 5,
-    // alloc_counter 2) so the premined nonce stays valid.
-    let legacy_single = n == 1;
+    // The one-transaction fixture keeps its dedicated layout (input slot 2,
+    // output slot 5, alloc_counter 2) so the premined nonce stays valid.
+    let single_tx_layout = n == 1;
     start_state.rebuild_exact_utxo_root_loaded().unwrap();
     start_state.active_slot_count = n as u64;
-    start_state.alloc_counter = if legacy_single {
+    start_state.alloc_counter = if single_tx_layout {
         2
     } else {
         (input_slot(n - 1) + 1) as u64
@@ -387,7 +387,7 @@ fn user_txs_block_batch(n: usize) -> FullBatchFixture {
 
     let mut bodies = Vec::with_capacity(n);
     for i in 0..n {
-        let out_slot = if legacy_single { 5 } else { output_slot(i) };
+        let out_slot = if single_tx_layout { 5 } else { output_slot(i) };
         let mut body = TxBody {
             shape: TxShape::Standard4x8,
             epoch_anchor: [0x42; 32],
@@ -431,23 +431,13 @@ fn user_txs_block_batch(n: usize) -> FullBatchFixture {
         start_state.alloc_counter,
     )
     .expect("exact action surface");
-    let state_transition = build_exact_state_transition_proof(
-        &parent_cache,
-        &surface,
-        &start_state.reuse_guard,
-        parent.height + 1,
-    )
+    let state_transition = build_exact_state_transition_proof(&parent_cache, &surface)
     .expect("exact proof");
 
     let mut child_state = start_state.clone();
     for body in &bodies {
         apply_tx(&mut child_state, body).expect("native tx apply");
     }
-    let mut child_guard = start_state.reuse_guard.clone();
-    child_guard
-        .apply_spends(parent.height + 1, &surface.spent_slots)
-        .expect("guard spend apply");
-    child_state.reuse_guard = child_guard;
     let child_state_root = child_state.cached_state_root();
     let timestamp = parent.timestamp + BLOCK_TIME;
     let mut header = BlockHeader {
@@ -469,7 +459,7 @@ fn user_txs_block_batch(n: usize) -> FullBatchFixture {
         active_slot_count: child_state.active_slot_count,
         alloc_counter: child_state.alloc_counter,
     };
-    if legacy_single {
+    if single_tx_layout {
         header.nonce = PREMINED_USER_BLOCK_NONCE;
         validate_pow(&header).expect("premined user-block bench nonce is valid");
     } else {
@@ -615,23 +605,13 @@ fn sweep_txs_block_batch(n: usize) -> FullBatchFixture {
         start_state.alloc_counter,
     )
     .expect("exact action surface");
-    let state_transition = build_exact_state_transition_proof(
-        &parent_cache,
-        &surface,
-        &start_state.reuse_guard,
-        parent.height + 1,
-    )
+    let state_transition = build_exact_state_transition_proof(&parent_cache, &surface)
     .expect("exact proof");
 
     let mut child_state = start_state.clone();
     for body in &bodies {
         apply_tx(&mut child_state, body).expect("native tx apply");
     }
-    let mut child_guard = start_state.reuse_guard.clone();
-    child_guard
-        .apply_spends(parent.height + 1, &surface.spent_slots)
-        .expect("guard spend apply");
-    child_state.reuse_guard = child_guard;
     let child_state_root = child_state.cached_state_root();
     let timestamp = parent.timestamp + BLOCK_TIME;
     let mut header = BlockHeader {
@@ -866,49 +846,6 @@ fn replay_components(
                 note: format!("paths={}", inputs.state_paths.len()),
             });
         }
-        if let (Some(bucket_inputs), Some(bucket_proof)) =
-            (&inputs.guard_buckets, &es_proof.guard_buckets)
-        {
-            let mut ch = CountingChannel::new();
-            let ok =
-                verify_batched_guard_bucket_killshot(bucket_proof, bucket_inputs, &mut ch).is_some();
-            assert!(ok, "guard-bucket verifier rejected (block {index})");
-            rows.push(Row {
-                name: format!("exact_state[{index}].guard_buckets"),
-                stats: ch.stats(),
-                proof_bytes: bucket_proof.byte_len(),
-                note: format!("spends={}", bucket_inputs.spent_slots.len()),
-            });
-        }
-        if let (Some(path_inputs), Some(path_proof)) = (&inputs.guard_paths, &es_proof.guard_paths) {
-            let circuit = MerkleCircuit::build_with_tag(TAG_RGDNODE);
-            let mut ch = CountingChannel::new();
-            let ok =
-                verify_batched_merkle_killshot(&circuit, path_proof, path_inputs, &mut ch).is_some();
-            assert!(ok, "guard-path merkle verifier rejected (block {index})");
-            rows.push(Row {
-                name: format!("exact_state[{index}].guard_paths"),
-                stats: ch.stats(),
-                proof_bytes: path_proof.byte_len(path_inputs),
-                note: format!("paths={}", path_inputs.len()),
-            });
-        }
-        {
-            let mut ch = CountingChannel::new();
-            let ok = verify_batched_state_root_killshot(
-                &es_proof.state_roots,
-                &inputs.state_roots,
-                &mut ch,
-            )
-            .is_some();
-            assert!(ok, "state-root verifier rejected (block {index})");
-            rows.push(Row {
-                name: format!("exact_state[{index}].state_roots"),
-                stats: ch.stats(),
-                proof_bytes: es_proof.state_roots.byte_len(),
-                note: format!("roots={}", inputs.state_roots.len()),
-            });
-        }
     }
 
     rows
@@ -970,12 +907,9 @@ fn print_data_volumes(components: &FullAcceptedBlockBatchProofComponents) {
     );
     for (index, es) in components.component_inputs.exact_state_killshot_inputs.iter().enumerate() {
         println!(
-            "    exact_state[{index}]: slot_leaves={} state_paths={} guard_buckets={} guard_paths={} state_roots={}",
+            "    exact_state[{index}]: slot_leaves={} state_paths={}",
             es.slot_leaves.len(),
             es.state_paths.len(),
-            es.guard_buckets.as_ref().map_or(0, |u| u.spent_slots.len()),
-            es.guard_paths.as_ref().map_or(0, Vec::len),
-            es.state_roots.len(),
         );
     }
     println!(

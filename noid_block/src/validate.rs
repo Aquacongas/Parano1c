@@ -157,8 +157,9 @@ impl AuthorizationVerifier for PreverifiedAuthorizationVerifier<'_> {
         if let Some(known) = self.verified_proof_bytes.get(&body_hash) {
             if let Some(bytes) = noid_gkr::authorization_proof_wire_bytes(proof) {
                 if bytes == *known {
-                    noid_gkr::validate_authorization_statement(statement)
-                        .map_err(|error| map_verify_authorization_error(error, statement.tx_index))?;
+                    noid_gkr::validate_authorization_statement(statement).map_err(|error| {
+                        map_verify_authorization_error(error, statement.tx_index)
+                    })?;
                     return Ok(VerifiedAuthorization {
                         tx_index: statement.tx_index,
                         owner_count: statement.public.layout.owner_count,
@@ -180,9 +181,8 @@ pub(crate) fn map_verify_authorization_error(
 ) -> VerifyBlockError {
     match error {
         VerifyAuthorizationError::AuthProof => VerifyBlockError::AuthKillShot(tx_index),
-        VerifyAuthorizationError::OwnerAuthStatement(_) | VerifyAuthorizationError::PublicLogic(_) => {
-            VerifyBlockError::AuthSpineBridge(tx_index)
-        }
+        VerifyAuthorizationError::OwnerAuthStatement(_)
+        | VerifyAuthorizationError::PublicLogic(_) => VerifyBlockError::AuthSpineBridge(tx_index),
     }
 }
 
@@ -288,6 +288,34 @@ enum TimestampPolicy {
     Timeless,
 }
 
+/// Pin the mutable native state snapshot to the parent header before deriving
+/// any action surface from it.  A root-only check is insufficient: depth and
+/// both monotone counters affect slot interpretation and the child boundary.
+fn validate_parent_state_boundary(
+    parent: &BlockHeader,
+    state: &ChainState,
+) -> Result<(), FullValidationError> {
+    let mismatch = if state.cached_state_root() != parent.state_root {
+        Some("state_root")
+    } else if state.state.log_slots() as u32 != parent.log_slots {
+        Some("log_slots")
+    } else if state.active_slot_count != parent.active_slot_count {
+        Some("active_slot_count")
+    } else if state.alloc_counter != parent.alloc_counter {
+        Some("alloc_counter")
+    } else {
+        None
+    };
+    if let Some(field) = mismatch {
+        return Err(FullValidationError::Consensus(
+            noid_chain::consensus::ConsensusError::ShapeMismatch(format!(
+                "parent ChainState {field} mismatch"
+            )),
+        ));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn validate_block_full_inner<V: AuthorizationVerifier>(
     block: &Block,
@@ -324,6 +352,7 @@ fn validate_block_full_inner<V: AuthorizationVerifier>(
             noid_chain::consensus::ConsensusError::BadTxRoot,
         ));
     }
+    validate_parent_state_boundary(parent, state)?;
 
     validate_minimal_block_proof_shape(block, proof).map_err(FullValidationError::ZkProof)?;
     if proof.meta.prev_block_state_root != parent.state_root {
@@ -337,29 +366,24 @@ fn validate_block_full_inner<V: AuthorizationVerifier>(
         ));
     }
     validate_block_public_logic(block).map_err(FullValidationError::ZkProof)?;
-    let authorization = validate_block_authorizations_with_output(block, auth_sidecar, auth_verifier)
-        .map_err(FullValidationError::ZkProof)?;
+    let authorization =
+        validate_block_authorizations_with_output(block, auth_sidecar, auth_verifier)
+            .map_err(FullValidationError::ZkProof)?;
 
     let surface =
         build_exact_surface_for_block(block, state).map_err(FullValidationError::ZkProof)?;
     let inputs = crate::ExactStateTransitionInputs {
         parent_state_root: parent.state_root,
         parent_log_slots: state.state.log_slots() as u32,
-        parent_utxo_root: state.utxo_root,
-        parent_guard_root: state.reuse_guard.root(),
         child_state_root: block.header.state_root,
         child_log_slots: block.header.log_slots,
-        height: block.header.height,
         parent_active_slot_count: state.active_slot_count,
         parent_alloc_counter: state.alloc_counter,
     };
-    let verified = crate::verify_exact_state_transition(
-        &inputs,
-        &surface,
-        &state.reuse_guard,
-        &proof.state_transition,
-    )
-    .map_err(|e| FullValidationError::ZkProof(crate::VerifyBlockError::ExactStateTransition(e)))?;
+    let verified = crate::verify_exact_state_transition(&inputs, &surface, &proof.state_transition)
+        .map_err(|e| {
+            FullValidationError::ZkProof(crate::VerifyBlockError::ExactStateTransition(e))
+        })?;
 
     if verified.active_slot_count() != block.header.active_slot_count {
         return Err(FullValidationError::Consensus(
@@ -377,10 +401,8 @@ fn validate_block_full_inner<V: AuthorizationVerifier>(
     let applied_root = state
         .apply_verified_exact_transition(
             verified.log_slots(),
-            verified.child_utxo_root(),
-            verified.child_guard_root(),
+            verified.child_state_root(),
             verified.slot_updates(),
-            verified.guard_bucket_update().cloned(),
             verified.active_slot_count(),
             verified.alloc_counter(),
         )
@@ -523,13 +545,8 @@ fn build_exact_surface_for_block(
         .iter()
         .map(|body| compute_claims_commitment(&body.inputs, &body.outputs))
         .collect();
-    build_exact_action_surface(
-        &surface_state,
-        &bodies,
-        &commitments,
-        state.alloc_counter,
-    )
-    .map_err(map_state_delta_error)
+    build_exact_action_surface(&surface_state, &bodies, &commitments, state.alloc_counter)
+        .map_err(map_state_delta_error)
 }
 
 fn map_state_delta_error(err: StateDeltaError) -> VerifyBlockError {
@@ -890,10 +907,8 @@ fn accept_block_inner_with_artifacts<V: AuthorizationVerifier>(
         let applied_root = state
             .apply_verified_exact_transition(
                 artifacts.verified_transition.log_slots(),
-                artifacts.verified_transition.child_utxo_root(),
-                artifacts.verified_transition.child_guard_root(),
+                artifacts.verified_transition.child_state_root(),
                 artifacts.verified_transition.slot_updates(),
-                artifacts.verified_transition.guard_bucket_update().cloned(),
                 artifacts.verified_transition.active_slot_count(),
                 artifacts.verified_transition.alloc_counter(),
             )
@@ -962,16 +977,14 @@ pub fn derive_no_user_tx_validation_artifacts(
     parent: &BlockHeader,
     state: &ChainState,
 ) -> Result<AcceptedBlockValidationArtifacts, FullValidationError> {
+    validate_parent_state_boundary(parent, state)?;
     let surface =
         build_exact_surface_for_block(block, state).map_err(FullValidationError::ZkProof)?;
     let inputs = crate::ExactStateTransitionInputs {
         parent_state_root: parent.state_root,
         parent_log_slots: state.state.log_slots() as u32,
-        parent_utxo_root: state.utxo_root,
-        parent_guard_root: state.reuse_guard.root(),
         child_state_root: block.header.state_root,
         child_log_slots: block.header.log_slots,
-        height: block.header.height,
         parent_active_slot_count: state.active_slot_count,
         parent_alloc_counter: state.alloc_counter,
     };
@@ -981,7 +994,7 @@ pub fn derive_no_user_tx_validation_artifacts(
         .copied()
         .zip(surface.new_slots.iter().copied())
         .collect();
-    let child_utxo_root = state
+    let child_state_root = state
         .exact_utxo_root_after_slot_updates(block.header.log_slots, &slot_updates)
         .map_err(|e| {
             FullValidationError::Consensus(noid_chain::consensus::ConsensusError::ShapeMismatch(
@@ -991,7 +1004,7 @@ pub fn derive_no_user_tx_validation_artifacts(
     let verified = crate::VerifiedStateTransition::from_verified_no_spend_native(
         &inputs,
         &surface,
-        child_utxo_root,
+        child_state_root,
     )
     .map_err(|e| FullValidationError::ZkProof(crate::VerifyBlockError::ExactStateTransition(e)))?;
 
@@ -1111,6 +1124,29 @@ mod tests {
             anchor_timestamp: parent.timestamp,
             anchor_target: parent.difficulty_target,
         }
+    }
+
+    #[test]
+    fn parent_chain_state_boundary_binds_root_depth_and_counters() {
+        let mut state = ChainState::with_log_slots(TEST_LOG_SLOTS);
+        let parent = history_parent(&mut state);
+        validate_parent_state_boundary(&parent, &state).expect("matching parent boundary");
+
+        let mut bad_root = parent.clone();
+        bad_root.state_root[0] ^= 1;
+        assert!(validate_parent_state_boundary(&bad_root, &state).is_err());
+
+        let mut bad_depth = parent.clone();
+        bad_depth.log_slots += 1;
+        assert!(validate_parent_state_boundary(&bad_depth, &state).is_err());
+
+        let mut bad_active = parent.clone();
+        bad_active.active_slot_count += 1;
+        assert!(validate_parent_state_boundary(&bad_active, &state).is_err());
+
+        let mut bad_alloc = parent;
+        bad_alloc.alloc_counter += 1;
+        assert!(validate_parent_state_boundary(&bad_alloc, &state).is_err());
     }
 
     #[test]

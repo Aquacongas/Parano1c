@@ -809,8 +809,8 @@ pub struct SpongeChainTrace {
 }
 
 /// Shared discharge skeleton for the sponge-chain killshots
-/// (`accepted_claim_hash`, `header_hash`, `slot_leaf`, `guard_bucket`,
-/// `state_root`): replay every chain through one [`ColumnAccumulator`] (the
+/// (`accepted_claim_hash`, `header_hash`, `slot_leaf`): replay every chain
+/// through one [`ColumnAccumulator`] (the
 /// slot order is the concatenation order of `chains`) and pin the three
 /// column evaluations against the reductions.
 pub fn discharge_sponge_chains_trace(

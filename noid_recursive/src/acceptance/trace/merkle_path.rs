@@ -6,15 +6,14 @@
 //! Trace twins of `noid_gkr::merkle_batch_killshot`:
 //! [`verify_batched_merkle_killshot_trace`] ← `verify_batched_merkle_killshot`
 //! and [`discharge_batched_merkle_trace`] ←
-//! `discharge_batched_merkle_reductions_native`. One module serves all three
-//! Merkle users of `verify_accepted_block_batch_components`: the tx-root
+//! `discharge_batched_merkle_reductions_native`. One module serves the tx-root
 //! component (`MerkleCircuit::build()`, TAG_COMPRESS) and the exact-state
-//! path batches (`TAG_EXSTNOD` / `TAG_RGDNODE`).
+//! path batches (`TAG_EXSTNOD`).
 //!
 //! ## Shape note
 //!
 //! `active_depth` is a TRACE-STRUCTURE constant: it is a class parameter
-//! (padded tx-tree depth, state-trie `log_slots`, guard depth), not block
+//! (padded tx-tree depth or state-trie `log_slots`), not block
 //! content. Path DIRECTIONS are block content (slot keys, tx indices) and
 //! enter as witness booleans: the absorbed packed-directions lane is an
 //! affine combination of the bit wires, the chain claims carry the union

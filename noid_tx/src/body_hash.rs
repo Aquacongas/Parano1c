@@ -159,7 +159,7 @@ pub fn hash_tx_body_for_shape(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use noid_poseidon2b::primitives::{hash_input_leaf, Address, SpendSecret};
+    use noid_poseidon2b::primitives::{Address, SpendSecret};
 
     fn mk_input(seed: u8) -> TxInput {
         TxInput {
@@ -227,21 +227,25 @@ mod tests {
     }
 
     #[test]
-    fn input_creation_id_preserves_legacy_zero_and_binds_nonzero() {
+    fn input_creation_id_zero_uses_low_lane_and_nonzero_is_bound() {
         let anchor = [0x31u8; 32];
-        let legacy = mk_input(3);
-        let legacy_leaf = hash_input_leaf(legacy.slot_index, legacy.value, &legacy.owner);
+        let zero_id = mk_input(3);
+        let zero_id_leaf = hash_input_leaf_packed(
+            zero_id.slot_index,
+            pack_amount_creation_id(zero_id.value, zero_id.creation_id),
+            &zero_id.owner,
+        );
         assert_eq!(
-            legacy_leaf,
+            zero_id_leaf,
             hash_input_leaf_packed(
-                legacy.slot_index,
-                pack_amount_creation_id(legacy.value, 0),
-                &legacy.owner,
+                zero_id.slot_index,
+                pack_amount_creation_id(zero_id.value, 0),
+                &zero_id.owner,
             )
         );
 
-        let h0 = hash_tx_body(&anchor, 0, std::slice::from_ref(&legacy), &[], false);
-        let mut incarnated = legacy;
+        let h0 = hash_tx_body(&anchor, 0, std::slice::from_ref(&zero_id), &[], false);
+        let mut incarnated = zero_id;
         incarnated.creation_id = 9;
         let h9 = hash_tx_body(&anchor, 0, &[incarnated], &[], false);
         assert_ne!(h0, h9);

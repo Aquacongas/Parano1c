@@ -13,7 +13,7 @@ use noid_chain::SlotValue;
 use noid_core::Block128;
 use noid_poseidon2b::native::compression::Poseidon2bSponge;
 use noid_poseidon2b::native::domain::{capacity_iv, TAG_EXSTSLT};
-use noid_poseidon2b::primitives::{hash_input_leaf, hash_input_leaf_packed, Address};
+use noid_poseidon2b::primitives::{hash_input_leaf_packed, Address};
 use noid_tx::{pack_amount_creation_id, unpack_amount_creation_id};
 
 fn incarnation_slot(amount: u64, creation_id: u64, owner: Address) -> SlotValue {
@@ -60,28 +60,36 @@ fn validate_mint_ids(parent_alloc_counter: u64, creation_ids: &[u64]) -> bool {
 }
 
 #[test]
-fn packed_incarnation_keeps_existing_hash_schedules() {
+fn packed_incarnation_zero_id_uses_canonical_low_lane_schedules() {
     let owner = Address([0x37; 32]);
     let amount = 42_000_000u64;
     let slot_index = 19u32;
 
     assert_eq!(
         incarnation_input_leaf(slot_index, amount, 0, owner),
-        hash_input_leaf(slot_index, amount, &owner),
-        "creation_id=0 uses the historical four-field input-leaf schedule"
+        hash_input_leaf_packed(
+            slot_index,
+            pack_amount_creation_id(amount, 0),
+            &owner,
+        ),
+        "creation_id=0 uses the canonical low-lane input-leaf schedule"
     );
-    let legacy_slot = incarnation_slot(amount, 0, owner);
+    let zero_id_slot = incarnation_slot(amount, 0, owner);
     assert_eq!(
-        incarnation_exact_leaf(legacy_slot),
-        slot_leaf_hash(legacy_slot),
-        "creation_id=0 uses the historical three-field exact-leaf schedule"
+        incarnation_exact_leaf(zero_id_slot),
+        slot_leaf_hash(zero_id_slot),
+        "creation_id=0 uses the canonical low-lane exact-leaf schedule"
     );
 
     let live = incarnation_slot(amount, 7, owner);
-    assert_ne!(incarnation_exact_leaf(live), slot_leaf_hash(legacy_slot));
+    assert_ne!(incarnation_exact_leaf(live), slot_leaf_hash(zero_id_slot));
     assert_ne!(
         incarnation_input_leaf(slot_index, amount, 7, owner),
-        hash_input_leaf(slot_index, amount, &owner)
+        hash_input_leaf_packed(
+            slot_index,
+            pack_amount_creation_id(amount, 0),
+            &owner,
+        )
     );
     assert_eq!(unpack_amount_creation_id(live.value), (amount, 7));
     assert_eq!(pack_amount_creation_id(0, 0), Block128::from(0u128));
@@ -158,7 +166,7 @@ fn counter_is_explicitly_branch_local_after_rollback() {
     let (branch_a_id, _) = assign_creation_id(100).unwrap();
     let (branch_b_id, _) = assign_creation_id(100).unwrap();
     assert_eq!(branch_a_id, branch_b_id);
-    // This matches today's ReuseGuard rollback scope. Cross-branch replay is a
+    // This matches the retained undo rollback scope. Cross-branch replay is a
     // separate epoch-anchor/history binding obligation; the incarnation gate
     // claims canonical-branch ABA protection, not a global outpoint namespace.
 }

@@ -726,7 +726,9 @@ async fn cmd_slot(ctx: &Ctx<'_>, index: u32) -> anyhow::Result<()> {
 
     let empty = result["empty"].as_bool().unwrap_or(true);
     let value = result["value"].as_u64().unwrap_or(0);
-    let creation_id = result["creation_id"].as_u64().unwrap_or(0);
+    let creation_id = result["creation_id"]
+        .as_u64()
+        .context("getSlot response missing creation_id")?;
     let owner = result["owner"].as_str().unwrap_or("?");
 
     section(&format!("Slot #{index}"));
@@ -833,7 +835,9 @@ async fn cmd_utxos_of(ctx: &Ctx<'_>, address: &str) -> anyhow::Result<()> {
     separator(74);
     for s in &slots {
         let slot = s["slot_index"].as_u64().unwrap_or(0);
-        let creation_id = s["creation_id"].as_u64().unwrap_or(0);
+        let creation_id = s["creation_id"]
+            .as_u64()
+            .context("getSlotsByOwner response missing creation_id")?;
         let value = s["value"].as_u64().unwrap_or(0);
         println!(
             "  {:<12}  {:>20}  {:>14}",
@@ -1538,7 +1542,9 @@ async fn cmd_utxos(ctx: &Ctx<'_>) -> anyhow::Result<()> {
 
     for u in &utxos {
         let slot = u["slot_index"].as_u64().unwrap_or(0);
-        let creation_id = u["creation_id"].as_u64().unwrap_or(0);
+        let creation_id = u["creation_id"]
+            .as_u64()
+            .context("walletListUtxos response missing creation_id")?;
         let micro = u["value_micronoid"].as_u64().unwrap_or(0);
         let key = u["key_index"].as_u64().unwrap_or(0);
         let height = u["confirmed_height"].as_u64().unwrap_or(0);

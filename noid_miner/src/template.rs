@@ -299,12 +299,7 @@ impl TemplateBuilder {
                             return None;
                         }
                     };
-                    match noid_block::build_exact_state_transition_proof(
-                        &cache,
-                        &surface,
-                        &snapshot.state.reuse_guard,
-                        inner.height,
-                    ) {
+                    match noid_block::build_exact_state_transition_proof(&cache, &surface) {
                         Ok(proof) => Some(proof),
                         Err(e) => {
                             tracing::warn!(err = ?e, "exact state proof build failed");

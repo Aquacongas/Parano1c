@@ -9,7 +9,7 @@
 //! **after the transcript-freeze diet and the class-shaped statements**
 //! (squeeze diet + prefix-decodable Merkle statement absorbs +
 //! real-leaf-only tx-root paths + prebound batch-eval claims + compressed
-//! sumcheck rounds + capacity-padded owner-auth/guard statements; the P0
+//! sumcheck rounds + capacity-padded owner-auth/exact-state statements; the P0
 //! pre-diet snapshot had 24,726 squeezes / 30,120 perms @16 txs): every
 //! killshot verifier that `verify_accepted_block_batch_components` runs for a
 //! real accepted block was replayed with a counting Fiat-Shamir channel
@@ -94,9 +94,6 @@ pub const CHECKPOINT_HEADER_HASH: &str = "checkpoint_header_hash";
 pub const CHECKPOINT_CHAIN_ACCUMULATOR: &str = "checkpoint_chain_accumulator";
 pub const EXACT_STATE_SLOT_LEAVES: &str = "exact_state.slot_leaves";
 pub const EXACT_STATE_STATE_PATHS: &str = "exact_state.state_paths";
-pub const EXACT_STATE_GUARD_BUCKETS: &str = "exact_state.guard_buckets";
-pub const EXACT_STATE_GUARD_PATHS: &str = "exact_state.guard_paths";
-pub const EXACT_STATE_STATE_ROOTS: &str = "exact_state.state_roots";
 
 /// One coinbase-only block (no user transactions).
 pub const CASE_COINBASE_ONLY: CaseStats = CaseStats {
@@ -122,9 +119,6 @@ pub const CASE_USER_TXS_1: CaseStats = CaseStats {
         ComponentStats { name: CHECKPOINT_CHAIN_ACCUMULATOR, instances: 1, absorbs: 214, squeezes: 62, perms: 168 },
         ComponentStats { name: EXACT_STATE_SLOT_LEAVES, instances: 1, absorbs: 240, squeezes: 67, perms: 185 },
         ComponentStats { name: EXACT_STATE_STATE_PATHS, instances: 1, absorbs: 306, squeezes: 77, perms: 228 },
-        ComponentStats { name: EXACT_STATE_GUARD_BUCKETS, instances: 1, absorbs: 252, squeezes: 72, perms: 197 },
-        ComponentStats { name: EXACT_STATE_GUARD_PATHS, instances: 1, absorbs: 294, squeezes: 77, perms: 222 },
-        ComponentStats { name: EXACT_STATE_STATE_ROOTS, instances: 1, absorbs: 234, squeezes: 67, perms: 182 },
     ],
 };
 
@@ -141,9 +135,6 @@ pub const CASE_USER_TXS_4: CaseStats = CaseStats {
         ComponentStats { name: CHECKPOINT_CHAIN_ACCUMULATOR, instances: 1, absorbs: 214, squeezes: 62, perms: 168 },
         ComponentStats { name: EXACT_STATE_SLOT_LEAVES, instances: 1, absorbs: 330, squeezes: 77, perms: 240 },
         ComponentStats { name: EXACT_STATE_STATE_PATHS, instances: 1, absorbs: 647, squeezes: 92, perms: 414 },
-        ComponentStats { name: EXACT_STATE_GUARD_BUCKETS, instances: 1, absorbs: 264, squeezes: 72, perms: 203 },
-        ComponentStats { name: EXACT_STATE_GUARD_PATHS, instances: 1, absorbs: 294, squeezes: 77, perms: 222 },
-        ComponentStats { name: EXACT_STATE_STATE_ROOTS, instances: 1, absorbs: 234, squeezes: 67, perms: 182 },
     ],
 };
 
@@ -160,9 +151,6 @@ pub const CASE_USER_TXS_16: CaseStats = CaseStats {
         ComponentStats { name: CHECKPOINT_CHAIN_ACCUMULATOR, instances: 1, absorbs: 214, squeezes: 62, perms: 168 },
         ComponentStats { name: EXACT_STATE_SLOT_LEAVES, instances: 1, absorbs: 600, squeezes: 87, perms: 385 },
         ComponentStats { name: EXACT_STATE_STATE_PATHS, instances: 1, absorbs: 1733, squeezes: 102, perms: 967 },
-        ComponentStats { name: EXACT_STATE_GUARD_BUCKETS, instances: 1, absorbs: 342, squeezes: 82, perms: 252 },
-        ComponentStats { name: EXACT_STATE_GUARD_PATHS, instances: 1, absorbs: 294, squeezes: 77, perms: 222 },
-        ComponentStats { name: EXACT_STATE_STATE_ROOTS, instances: 1, absorbs: 234, squeezes: 67, perms: 182 },
     ],
 };
 
@@ -180,9 +168,6 @@ pub const CASE_SWEEP_TXS_1: CaseStats = CaseStats {
         ComponentStats { name: CHECKPOINT_CHAIN_ACCUMULATOR, instances: 1, absorbs: 214, squeezes: 62, perms: 168 },
         ComponentStats { name: EXACT_STATE_SLOT_LEAVES, instances: 1, absorbs: 550, squeezes: 87, perms: 360 },
         ComponentStats { name: EXACT_STATE_STATE_PATHS, instances: 1, absorbs: 1513, squeezes: 102, perms: 857 },
-        ComponentStats { name: EXACT_STATE_GUARD_BUCKETS, instances: 1, absorbs: 288, squeezes: 77, perms: 219 },
-        ComponentStats { name: EXACT_STATE_GUARD_PATHS, instances: 1, absorbs: 294, squeezes: 77, perms: 222 },
-        ComponentStats { name: EXACT_STATE_STATE_ROOTS, instances: 1, absorbs: 234, squeezes: 67, perms: 182 },
     ],
 };
 
@@ -200,9 +185,6 @@ pub const CASE_SWEEP_TXS_4: CaseStats = CaseStats {
         ComponentStats { name: CHECKPOINT_CHAIN_ACCUMULATOR, instances: 1, absorbs: 214, squeezes: 62, perms: 168 },
         ComponentStats { name: EXACT_STATE_SLOT_LEAVES, instances: 1, absorbs: 1390, squeezes: 97, perms: 790 },
         ComponentStats { name: EXACT_STATE_STATE_PATHS, instances: 1, absorbs: 5107, squeezes: 112, perms: 2664 },
-        ComponentStats { name: EXACT_STATE_GUARD_BUCKETS, instances: 1, absorbs: 378, squeezes: 82, perms: 270 },
-        ComponentStats { name: EXACT_STATE_GUARD_PATHS, instances: 1, absorbs: 294, squeezes: 77, perms: 222 },
-        ComponentStats { name: EXACT_STATE_STATE_ROOTS, instances: 1, absorbs: 234, squeezes: 67, perms: 182 },
     ],
 };
 
@@ -281,14 +263,12 @@ pub fn projected_perms_max_sweep_block_no_auth_fs() -> u64 {
 /// the proof system works over this finite family instead of per-content
 /// shapes; the R1CS matrix of a class is a protocol constant.
 ///
-/// What the class fixes today: the guard-update spend capacity (killshot
-/// schedule + trace matrix) and the per-tx statement paddings (owner-auth
-/// input capacity per tx shape). What still varies below class granularity
-/// until the folding layer replaces per-tx replay slots: the number of
-/// per-tx replay instances in the assembled trace (absent txs do not yet
-/// materialize canonical empty slots) and the per-tx owner-auth `num_vars`
-/// tier. Per-class R1CS statement digests are pinned once the assembly
-/// builds at class shapes.
+/// What the class fixes today: transaction capacities, the live-input/action
+/// capacities, padded tx-tree depth, and exact-state touched capacity. What
+/// still varies below class granularity until the folding layer replaces
+/// per-tx replay slots is the number of replay instances in non-capacity
+/// builds; tier-capacity builds materialize canonical ghost slots. The
+/// one-owner authorization statement itself has one fixed `num_vars` class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ShapeClass {
     pub standard_tier: usize,
@@ -305,7 +285,7 @@ impl ShapeClass {
         })
     }
 
-    /// The class's live-input (spend) capacity — the guard-update padding.
+    /// The class's live-input (spend) capacity used by per-input structures.
     pub fn spend_capacity(&self) -> usize {
         noid_chain::consensus::params::block_class_spend_capacity(
             self.standard_tier,

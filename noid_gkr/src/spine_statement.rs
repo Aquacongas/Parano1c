@@ -100,10 +100,9 @@ mod tests {
     use crate::{compute_tx_body_hash, SpineCircuit};
     use noid_core::CanonicalSerialize;
     use noid_poseidon2b::primitives::{
-        derive_address, hash_input_leaf, hash_input_leaf_packed, hash_output_leaf, hash_tx_body,
-        SpendSecret,
+        derive_address, hash_input_leaf_packed, hash_output_leaf, hash_tx_body, SpendSecret,
     };
-    use noid_tx::{TxInput, TxOutput};
+    use noid_tx::{pack_amount_creation_id, TxInput, TxOutput};
 
     fn digest_fields_to_bytes(fields: [Block128; 2]) -> [u8; 32] {
         let mut out = [0u8; 32];
@@ -161,12 +160,15 @@ mod tests {
             if creation_id == 0 {
                 assert_eq!(
                     input_leaf_hashes[0],
-                    hash_input_leaf(
+                    hash_input_leaf_packed(
                         body.inputs[0].slot_index,
-                        body.inputs[0].value,
+                        pack_amount_creation_id(
+                            body.inputs[0].value,
+                            body.inputs[0].creation_id,
+                        ),
                         &body.inputs[0].owner,
                     ),
-                    "creation_id=0 must preserve the legacy leaf"
+                    "creation_id=0 must use the canonical low-lane leaf"
                 );
             }
             let mut output_leaf_hashes = [[0u8; 32]; 8];

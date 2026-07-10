@@ -1535,8 +1535,7 @@ pub struct OwnerAuthKillShotReductions {
     pub state: BatchEvalReduction,
 }
 
-/// Owner-auth transcript epoch for the minimal one-owner public statement.
-/// Version 4 removes the legacy per-input position/slot/group vectors.
+/// Domain tag for the minimal one-owner public statement.
 pub const OWNER_AUTH_GKR_DOMAIN_TAG: u128 = 0xA07D_0B47_CAFE_0004;
 
 pub fn init_owner_auth_gkr_channel<T: FiatShamir<Block128>>(channel: &mut T) {

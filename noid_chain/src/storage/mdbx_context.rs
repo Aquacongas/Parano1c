@@ -21,8 +21,8 @@
 //! root), the node resumes at its stored tip height and forward-syncs from
 //! peers (block-by-block for small gaps, snapshot-sync for large gaps).
 //!
-//! If state is corrupt (bit-rot, incomplete write), volatile tables are
-//! cleared and the node falls back to genesis + snapshot-sync from peers.
+//! If persisted state cannot be restored, every chain table is cleared before
+//! the canonical genesis is installed. Mixed-epoch recovery is never attempted.
 //!
 //! This prevents simultaneous-restart network death: when all nodes reboot,
 //! each resumes from its own verified state instead of needing a peer snapshot.
@@ -62,8 +62,6 @@ use crate::consensus::{
     validation::{validate_block_checks, AnchorInfo},
     ConsensusError,
 };
-use crate::exact_state_hash::composite_state_root;
-use crate::reuse_guard::{ReuseGuard, REUSE_GUARD_BUCKETS};
 use crate::segmented_state::SegmentedFriState;
 use crate::state::ChainState;
 use crate::storage::serial::encode_segment;
@@ -158,8 +156,8 @@ impl MdbxChainContext {
     ///    resume from local state. The P2P layer handles forward-sync (block-by-block
     ///    if gap <= CONSENSUS_FINALITY_DEPTH, snapshot-sync if gap is larger).
     ///
-    /// 2. If state is corrupted (state_root mismatch, missing tables), clear volatile
-    ///    tables and fall back to genesis. The P2P layer will snapshot-sync from peers.
+    /// 2. If state cannot be restored, atomically clear every chain table and
+    ///    initialise the canonical genesis. No format migration is attempted.
     ///
     /// 3. If MDBX is empty (first run), initialise from genesis.
     ///
@@ -167,7 +165,6 @@ impl MdbxChainContext {
     /// once (provider outage), each resumes from its own verified local state instead
     /// of requiring peers to serve a snapshot that nobody has.
     ///
-    /// Headers, hash-to-height indexes, header anchors, and chainwork are always preserved.
     pub fn open_or_create(path: &Path) -> Result<Self, MdbxContextError> {
         let store = MdbxStore::open(path)?;
 
@@ -201,13 +198,11 @@ impl MdbxChainContext {
                 Err(MdbxContextError::Corrupt(reason)) => {
                     tracing::warn!(
                         reason,
-                        "local state corrupt — clearing and restarting from genesis"
+                        "persisted state rejected — clearing the chain database"
                     );
                     // Re-open store (the previous one was consumed by restore_from_mdbx).
                     let store = MdbxStore::open(path)?;
-                    if let Err(e) = store.clear_for_restart() {
-                        tracing::warn!(err = %e, "clear_for_restart failed");
-                    }
+                    store.clear_all()?;
                     let consensus = ChainContext::init_from_genesis();
                     let tip_chain_work = block_work(&GENESIS_TARGET);
                     let finalized = FinalizedCheckpoint {
@@ -273,9 +268,8 @@ impl MdbxChainContext {
                 ctx.store.commit_block(
                     &genesis,
                     &genesis_hash,
-                    &BlockUndoLog::empty(0),
+                    &BlockUndoLog::empty(0, genesis.log_slots),
                     &[],
-                    ctx.state.reuse_guard.buckets(),
                     &[],
                     &[],
                     None,
@@ -307,9 +301,8 @@ impl MdbxChainContext {
         self.store.commit_block(
             &genesis,
             &genesis_hash,
-            &BlockUndoLog::empty(0),
+            &BlockUndoLog::empty(0, genesis.log_slots),
             &[], // no dirty segments (all virtual zero)
-            self.state.reuse_guard.buckets(),
             &[],
             &[],
             None, // no block bytes for genesis
@@ -351,12 +344,6 @@ impl MdbxChainContext {
         let (log_slots, active_slot_count, alloc_counter) = store
             .get_state_meta()?
             .ok_or(MdbxContextError::Corrupt("missing state_meta"))?;
-        let reuse_guard_buckets = store
-            .get_reuse_guard_buckets()?
-            .ok_or(MdbxContextError::Corrupt("missing reuse_guard"))?;
-        let reuse_guard = crate::reuse_guard::ReuseGuard::from_buckets(reuse_guard_buckets)
-            .map_err(|_| MdbxContextError::Corrupt("invalid reuse_guard"))?;
-
         // 3. Rebuild SegmentedFriState from stored segments.
         //    Use `set_segment_columns` (not `set_slot`) so that restored
         //    segments are NOT marked as MDBX-dirty — they are already in MDBX.
@@ -419,11 +406,14 @@ impl MdbxChainContext {
                 "finalized hash mismatch with persisted finalized header",
             ));
         }
-        // 4. Rebuild ChainState and exact composite root.
-        let mut state =
-            ChainState::from_loaded_parts(seg_state, active_slot_count, alloc_counter, reuse_guard)
-                .map_err(|_| MdbxContextError::Corrupt("exact state root rebuild failed"))?;
-        if state.state_root() != tip_hdr.state_root {
+        // 4. Rebuild ChainState and the direct exact UTXO root.
+        let mut state = ChainState::from_loaded_parts(seg_state, active_slot_count, alloc_counter)
+            .map_err(|_| MdbxContextError::Corrupt("exact state root rebuild failed"))?;
+        if state
+            .try_state_root()
+            .map_err(|_| MdbxContextError::Corrupt("exact state root rebuild failed"))?
+            != tip_hdr.state_root
+        {
             return Err(MdbxContextError::Corrupt(
                 "state root mismatch after restore: segment data is corrupt",
             ));
@@ -478,8 +468,7 @@ impl MdbxChainContext {
         &mut self,
         block: &Block,
         undo: &crate::consensus::da_prune::BlockUndoLog,
-        pre_active: u64,
-        pre_alloc: u64,
+        state_before_apply: &ChainState,
     ) -> Result<(), MdbxContextError> {
         let dirty_ids: Vec<u16> = self.state.state.dirty_segment_ids().collect();
         let eff_log = self.state.state.effective_log_segment_size() as u8;
@@ -518,18 +507,13 @@ impl MdbxChainContext {
             &block_hash,
             undo,
             &dirty_refs,
-            self.state.reuse_guard.buckets(),
             &tx_hashes,
             &[],
             Some(&block.to_bytes()),
             &consensus_meta,
             false,
         ) {
-            revert_block(&mut self.state.state, undo);
-            crate::consensus::reorg::revert_reuse_guard(&mut self.state, undo);
-            let _ = self.state.rebuild_exact_utxo_root_loaded();
-            self.state.active_slot_count = pre_active;
-            self.state.alloc_counter = pre_alloc;
+            self.state = state_before_apply.clone();
             self.state.state.clear_dirty();
             return Err(e.into());
         }
@@ -600,10 +584,14 @@ impl MdbxChainContext {
         let prev_timestamps = self.prev_timestamps();
         let prev_active_counts = self.prev_active_counts();
         let anchor = self.anchor_info();
-        let pre_active = self.state.active_slot_count;
-        let pre_alloc = self.state.alloc_counter;
-
         self.preload_segments_for_block(block)?;
+        if !has_user_txs {
+            // The native coinbase-only path recomputes the exact post-root.
+            // Until it has an incremental exact-tree cache, every live segment
+            // must be resident so an unrelated eviction cannot turn the cached
+            // parent root into a false post-root acceptance.
+            self.preload_all_evicted_segments()?;
+        }
         let pre_state = self.state.state.clone();
         let state_before_validation = self.state.clone();
         let undo = build_undo_log(&self.state, block);
@@ -641,7 +629,7 @@ impl MdbxChainContext {
             )?;
             apply_state_delta(&mut self.state, block)
                 .map_err(|e| {
-                    self.state = state_before_validation;
+                    self.state = state_before_validation.clone();
                     self.state.state.clear_dirty();
                     MdbxContextError::Consensus(ConsensusError::ShapeMismatch(format!(
                         "coinbase-only proven-delta apply failed: {e:?}"
@@ -650,7 +638,7 @@ impl MdbxChainContext {
                 .new_state_root
         };
 
-        self.commit_applied_next_block(block, &undo, pre_active, pre_alloc)?;
+        self.commit_applied_next_block(block, &undo, &state_before_validation)?;
         Ok(new_state_root)
     }
 
@@ -705,9 +693,7 @@ impl MdbxChainContext {
             .ok_or(MdbxContextError::Corrupt("checkpoint chainwork missing"))?;
 
         let checkpoint_state = self.reconstruct_state_at_height(height)?;
-        let guard_root = checkpoint_state.reuse_guard.root();
-        let state_root =
-            composite_state_root(header.log_slots, checkpoint_state.utxo_root, guard_root);
+        let state_root = checkpoint_state.utxo_root;
         if state_root != header.state_root {
             return Err(MdbxContextError::Corrupt(
                 "checkpoint reconstructed state_root mismatch",
@@ -734,7 +720,6 @@ impl MdbxChainContext {
         let (covered_from, covered_to, block_body_root, block_proof_root, block_auth_sidecar_root) =
             self.checkpoint_payload_roots(height)?;
 
-        let reuse_guard_buckets = checkpoint_state.reuse_guard.buckets().to_vec();
         let manifest = ImmutableCheckpointManifest {
             height,
             block_hash,
@@ -742,8 +727,6 @@ impl MdbxChainContext {
             log_slots: header.log_slots,
             active_slot_count: header.active_slot_count,
             alloc_counter: header.alloc_counter,
-            utxo_root: checkpoint_state.utxo_root,
-            guard_root,
             state_root,
             covered_from,
             covered_to,
@@ -752,13 +735,8 @@ impl MdbxChainContext {
             block_auth_sidecar_root,
             segment_payload_root,
             segment_count: segments.len() as u32,
-            reuse_guard_bucket_count: REUSE_GUARD_BUCKETS as u32,
         };
-        let package = ImmutableCheckpointPackage {
-            manifest,
-            segments,
-            reuse_guard_buckets,
-        };
+        let package = ImmutableCheckpointPackage { manifest, segments };
         let coverage = CheckpointCoverage {
             checkpoint_id: package.checkpoint_id(),
             height,
@@ -783,8 +761,30 @@ impl MdbxChainContext {
                     "checkpoint reconstruction undo log missing",
                 ))?;
             revert_block(&mut checkpoint_state.state, &undo);
+            checkpoint_state
+                .state
+                .shrink_to_log_slots(undo.log_slots_before as usize)
+                .map_err(|_| MdbxContextError::Corrupt("checkpoint state shrink failed"))?;
             crate::consensus::reorg::revert_state_counters(&mut checkpoint_state, &undo);
-            crate::consensus::reorg::revert_reuse_guard(&mut checkpoint_state, &undo);
+            checkpoint_state
+                .rebuild_exact_utxo_root_loaded()
+                .map_err(|_| MdbxContextError::Corrupt("checkpoint exact root rebuild failed"))?;
+            let parent_header = self
+                .store
+                .get_header(h - 1)?
+                .ok_or(MdbxContextError::Corrupt(
+                    "checkpoint parent header missing",
+                ))?;
+            if undo.log_slots_before != parent_header.log_slots
+                || checkpoint_state.state.log_slots() as u32 != parent_header.log_slots
+                || checkpoint_state.utxo_root != parent_header.state_root
+                || checkpoint_state.active_slot_count != parent_header.active_slot_count
+                || checkpoint_state.alloc_counter != parent_header.alloc_counter
+            {
+                return Err(MdbxContextError::Corrupt(
+                    "checkpoint undo does not restore parent header state",
+                ));
+            }
         }
         checkpoint_state
             .rebuild_exact_utxo_root_loaded()
@@ -951,7 +951,7 @@ impl MdbxChainContext {
     where
         F: FnMut(&mut Self, &Block, u64) -> Result<(), MdbxContextError>,
     {
-        use crate::consensus::reorg::{revert_reuse_guard, revert_state_counters, ReorgResult};
+        use crate::consensus::reorg::{revert_state_counters, ReorgResult};
 
         // Re-validate inside write lock: ancestor_height must be <= our CURRENT tip.
         // The caller computed ancestor_height outside the lock — if another task applied
@@ -997,6 +997,12 @@ impl MdbxChainContext {
             });
         }
 
+        let state_before_reorg = self.state.clone();
+        let recent_headers_before_reorg = self.recent_headers.clone();
+        let tip_height_before_reorg = self.tip_height;
+        let tip_hash_before_reorg = self.tip_hash;
+        let tip_chain_work_before_reorg = self.tip_chain_work;
+
         #[allow(unused_assignments)]
         let mut reclaimed_tx_hashes: Vec<TxBodyHash> = Vec::new();
         #[allow(unused_assignments)]
@@ -1009,6 +1015,21 @@ impl MdbxChainContext {
             reorg_depth,
             new_blocks.len()
         );
+
+        // Load the ancestor metadata before installing any reverted RAM
+        // candidate. Read/corruption errors must leave state and tip pointers
+        // byte-for-byte on the old canonical chain.
+        let ancestor_header =
+            self.get_header_from_store(ancestor_height)?
+                .ok_or(MdbxContextError::Corrupt(
+                    "ancestor header missing from store",
+                ))?;
+        let ancestor_chain_work =
+            self.store
+                .get_chain_work(ancestor_height)?
+                .ok_or(MdbxContextError::Corrupt(
+                    "missing exact chainwork for reorg ancestor",
+                ))?;
 
         // -----------------------------------------------------------------------
         // Validate ALL undo logs before modifying any state.
@@ -1059,18 +1080,42 @@ impl MdbxChainContext {
             let mut reverted_heights_inner: Vec<u64> = Vec::new();
 
             self.preload_all_evicted_segments()?;
+            let mut candidate_state = self.state.clone();
+            let mut candidate_headers = self.recent_headers.clone();
 
             for (height, undo) in &loaded {
                 reclaimed_tx_hashes_inner.extend_from_slice(&undo.tx_hashes);
-                revert_block(&mut self.state.state, undo);
-                revert_state_counters(&mut self.state, undo);
-                revert_reuse_guard(&mut self.state, undo);
-                self.state.rebuild_exact_utxo_root_loaded().map_err(|_| {
-                    MdbxContextError::Corrupt("exact root rebuild after reorg failed")
-                })?;
-                self.recent_headers.remove(height);
+                revert_block(&mut candidate_state.state, undo);
+                candidate_state
+                    .state
+                    .shrink_to_log_slots(undo.log_slots_before as usize)
+                    .map_err(|_| MdbxContextError::Corrupt("state shrink after reorg failed"))?;
+                revert_state_counters(&mut candidate_state, undo);
+                candidate_state
+                    .rebuild_exact_utxo_root_loaded()
+                    .map_err(|_| {
+                        MdbxContextError::Corrupt("exact root rebuild after reorg failed")
+                    })?;
+                let parent_header = self
+                    .store
+                    .get_header(height - 1)?
+                    .ok_or(MdbxContextError::Corrupt("reorg parent header missing"))?;
+                if undo.log_slots_before != parent_header.log_slots
+                    || candidate_state.state.log_slots() as u32 != parent_header.log_slots
+                    || candidate_state.utxo_root != parent_header.state_root
+                    || candidate_state.active_slot_count != parent_header.active_slot_count
+                    || candidate_state.alloc_counter != parent_header.alloc_counter
+                {
+                    return Err(MdbxContextError::Corrupt(
+                        "reorg undo does not restore parent header state",
+                    ));
+                }
+                candidate_headers.remove(height);
                 reverted_heights_inner.push(*height);
             }
+
+            self.state = candidate_state;
+            self.recent_headers = candidate_headers;
 
             // Move into outer scope variables.
             reclaimed_tx_hashes = reclaimed_tx_hashes_inner;
@@ -1080,19 +1125,6 @@ impl MdbxChainContext {
         // -----------------------------------------------------------------------
         // Update tip pointers to the ancestor.
         // -----------------------------------------------------------------------
-        let ancestor_header =
-            self.get_header_from_store(ancestor_height)?
-                .ok_or(MdbxContextError::Corrupt(
-                    "ancestor header missing from store",
-                ))?;
-
-        let ancestor_chain_work =
-            self.store
-                .get_chain_work(ancestor_height)?
-                .ok_or(MdbxContextError::Corrupt(
-                    "missing exact chainwork for reorg ancestor",
-                ))?;
-
         self.tip_height = ancestor_height;
         self.tip_hash = block_id(&ancestor_header);
         self.tip_chain_work = ancestor_chain_work;
@@ -1102,15 +1134,19 @@ impl MdbxChainContext {
         // dirty segments are written before new blocks so crash
         // recovery always sees a consistent ancestor checkpoint.
         //
-        // SAFETY: if persist fails, the node is in a degraded state (RAM reverted
-        // but MDBX at old tip). The caller must trigger snapshot sync to recover.
-        // On crash-and-restart, MDBX wins (still at old tip, consistent).
+        // MDBX commit is atomic. If it fails, restore the pre-reorg RAM snapshot
+        // so local state and the still-old durable tip remain consistent.
         // -----------------------------------------------------------------------
         if let Err(e) = self.persist_reorg_checkpoint(&ancestor_header, &reclaimed_tx_hashes) {
             tracing::error!(
                 ancestor_height,
-                "persist_reorg_checkpoint failed — node state degraded, snapshot sync required"
+                "persist_reorg_checkpoint failed — restored pre-reorg RAM state"
             );
+            self.state = state_before_reorg;
+            self.recent_headers = recent_headers_before_reorg;
+            self.tip_height = tip_height_before_reorg;
+            self.tip_hash = tip_hash_before_reorg;
+            self.tip_chain_work = tip_chain_work_before_reorg;
             return Err(e);
         }
 
@@ -1201,7 +1237,9 @@ impl MdbxChainContext {
         // empty — it must remain intact for any future reorg within finality.
         let existing_undo = match self.store.get_undo_log(ancestor_header.height)? {
             Some(undo) => undo,
-            None if ancestor_header.height == 0 => BlockUndoLog::empty(0),
+            None if ancestor_header.height == 0 => {
+                BlockUndoLog::empty(0, ancestor_header.log_slots)
+            }
             None => {
                 return Err(MdbxContextError::Corrupt("reorg ancestor undo log missing"));
             }
@@ -1215,7 +1253,6 @@ impl MdbxChainContext {
                 &ancestor_hash,
                 &existing_undo,
                 &dirty_refs,
-                self.state.reuse_guard.buckets(),
                 &[],
                 reverted_tx_hashes,
                 None, // no block bytes (stored earlier or DA-pruned)
@@ -1315,7 +1352,6 @@ impl MdbxChainContext {
         alloc_counter: u64,
         segments: I,
         recent_headers_bytes: &[Vec<u8>],
-        reuse_guard_buckets: &[crate::reuse_guard::GuardBucket],
     ) -> Result<(), MdbxContextError>
     where
         I: IntoIterator<Item = (u16, u8, crate::segmented_state::SegmentColumns, [u8; 32])>,
@@ -1388,13 +1424,6 @@ impl MdbxChainContext {
             }
         }
 
-        let guard_array: [crate::reuse_guard::GuardBucket; REUSE_GUARD_BUCKETS] =
-            reuse_guard_buckets.to_vec().try_into().map_err(|_| {
-                MdbxContextError::Corrupt("snapshot reuse guard bucket count mismatch")
-            })?;
-        let reuse_guard = ReuseGuard::from_buckets(guard_array.clone())
-            .map_err(|_| MdbxContextError::Corrupt("snapshot reuse guard buckets invalid"))?;
-
         let owned_segments: Vec<_> = segments.into_iter().collect();
         let mut seg_state = SegmentedFriState::new_empty(log_slots as usize);
         let expected_eff_log = seg_state.effective_log_segment_size() as u8;
@@ -1457,9 +1486,13 @@ impl MdbxChainContext {
         }
 
         let mut snapshot_state =
-            ChainState::from_loaded_parts(seg_state, active_slot_count, alloc_counter, reuse_guard)
+            ChainState::from_loaded_parts(seg_state, active_slot_count, alloc_counter)
                 .map_err(|_| MdbxContextError::Corrupt("snapshot exact state rebuild failed"))?;
-        if snapshot_state.state_root() != tip_header.state_root {
+        if snapshot_state
+            .try_state_root()
+            .map_err(|_| MdbxContextError::Corrupt("snapshot exact state rebuild failed"))?
+            != tip_header.state_root
+        {
             return Err(MdbxContextError::Corrupt(
                 "snapshot reconstructed state_root mismatch",
             ));
@@ -1499,7 +1532,6 @@ impl MdbxChainContext {
             &tip_hash,
             &consensus_meta,
             &segment_refs,
-            &guard_array,
         )?;
 
         self.state = snapshot_state;
@@ -1877,6 +1909,247 @@ mod tests {
     }
 
     #[test]
+    fn expansion_upper_mint_reorg_restart_and_reexpand_stays_empty() {
+        use crate::chain_context::TEST_TARGET;
+        use crate::consensus::emission::block_reward;
+        use crate::consensus::params::LOG_SEGMENT_SIZE;
+        use noid_poseidon2b::primitives::SpendSecret;
+        use noid_tx::{hash_tx_body_for_shape, Transaction, TxBody, TxInput, TxOutput, TxShape};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(dir.path()).unwrap();
+        let parent_log = LOG_SEGMENT_SIZE;
+        let mut state = ChainState::with_log_slots(parent_log as usize);
+        // Structural persistence fixture: the occupancy counter is placed at
+        // the expansion threshold without materialising 49k unrelated UTXOs.
+        // The test exercises domain grow/undo/storage, not occupancy accounting.
+        let expansion_trigger = (1u64 << parent_log) * 3 / 4;
+        state.active_slot_count = expansion_trigger;
+        let parent_root = state.cached_state_root();
+        let parent = BlockHeader {
+            prev_block_hash: [0u8; 32],
+            state_root: parent_root,
+            tx_root: compute_tx_root(&[]),
+            timestamp: 1_767_225_600,
+            height: 0,
+            miner_address: Address([0u8; 32]),
+            nonce: 0,
+            difficulty_target: TEST_TARGET,
+            log_slots: parent_log,
+            active_slot_count: expansion_trigger,
+            alloc_counter: 0,
+        };
+        let parent_hash = block_id(&parent);
+        let tip_chain_work = block_work(&TEST_TARGET);
+        let finalized = FinalizedCheckpoint {
+            height: 0,
+            hash: parent_hash,
+        };
+        let parent_meta = ConsensusMeta {
+            tip_height: 0,
+            tip_hash: parent_hash,
+            cumulative_chainwork: tip_chain_work,
+            finalized,
+        };
+        store
+            .commit_block(
+                &parent,
+                &parent_hash,
+                &crate::consensus::da_prune::BlockUndoLog::empty(0, parent_log),
+                &[],
+                &[],
+                &[],
+                None,
+                &parent_meta,
+                false,
+            )
+            .unwrap();
+
+        let mut recent_headers = HashMap::new();
+        recent_headers.insert(0, parent);
+        let mut ctx = MdbxChainContext {
+            store,
+            state,
+            recent_headers,
+            tip_height: 0,
+            tip_hash: parent_hash,
+            tip_chain_work,
+            finalized,
+            defer_finality_updates: false,
+        };
+
+        let child_log = parent_log + 1;
+        let upper_slot = 1u32 << parent_log;
+        let owner = Address([0x5A; 32]);
+        let reward = block_reward(child_log);
+        let body = TxBody::standard(
+            parent_hash,
+            0,
+            vec![],
+            vec![TxOutput {
+                slot_index: upper_slot,
+                value: reward,
+                owner,
+                valid: true,
+            }],
+            true,
+        );
+        let tx = Transaction {
+            tx_body_hash: hash_tx_body_for_shape(
+                TxShape::Standard4x8,
+                &body.epoch_anchor,
+                body.fee,
+                &body.inputs,
+                &body.outputs,
+                body.is_coinbase,
+            ),
+            body,
+        };
+        let transient_owner = Address([0x6B; 32]);
+        let transient_value = 17u64;
+        let transient_mint_body = TxBody::standard(
+            parent_hash,
+            0,
+            vec![],
+            vec![TxOutput {
+                slot_index: 7,
+                value: transient_value,
+                owner: transient_owner,
+                valid: true,
+            }],
+            false,
+        );
+        let transient_mint = Transaction {
+            tx_body_hash: hash_tx_body_for_shape(
+                TxShape::Standard4x8,
+                &transient_mint_body.epoch_anchor,
+                transient_mint_body.fee,
+                &transient_mint_body.inputs,
+                &transient_mint_body.outputs,
+                false,
+            ),
+            body: transient_mint_body,
+        };
+        let transient_spend_body = TxBody::standard(
+            parent_hash,
+            0,
+            vec![TxInput {
+                slot_index: 7,
+                value: transient_value,
+                creation_id: 2,
+                owner: transient_owner,
+                spend_secret: SpendSecret([0x7C; 32]),
+                valid: true,
+            }],
+            vec![],
+            false,
+        );
+        let transient_spend = Transaction {
+            tx_body_hash: hash_tx_body_for_shape(
+                TxShape::Standard4x8,
+                &transient_spend_body.epoch_anchor,
+                transient_spend_body.fee,
+                &transient_spend_body.inputs,
+                &transient_spend_body.outputs,
+                false,
+            ),
+            body: transient_spend_body,
+        };
+        let minted = crate::fri_state::SlotValue::with_owner_fields(reward, 1, owner.as_fields());
+        let mut child_state =
+            ChainState::from_sparse_utxos(child_log as usize, &[(upper_slot, minted)], 2).unwrap();
+        child_state.active_slot_count = expansion_trigger + 1;
+        let child = Block {
+            header: BlockHeader {
+                prev_block_hash: parent_hash,
+                state_root: child_state.cached_state_root(),
+                tx_root: compute_tx_root(&[
+                    tx.clone(),
+                    transient_mint.clone(),
+                    transient_spend.clone(),
+                ]),
+                timestamp: parent.timestamp + BLOCK_TIME,
+                height: 1,
+                miner_address: owner,
+                nonce: 0,
+                difficulty_target: TEST_TARGET,
+                log_slots: child_log,
+                active_slot_count: child_state.active_slot_count,
+                alloc_counter: child_state.alloc_counter,
+            },
+            transactions: vec![tx, transient_mint, transient_spend],
+        };
+
+        let undo = build_undo_log(&ctx.state, &child);
+        let state_before_child = ctx.state.clone();
+        ctx.state = child_state;
+        ctx.commit_applied_next_block(&child, &undo, &state_before_child)
+            .unwrap();
+        assert_eq!(ctx.state.state.log_slots(), child_log as usize);
+        assert_eq!(ctx.state.state.slot(upper_slot).creation_id(), 1);
+        assert_eq!(
+            ctx.store.get_utxos_by_owner(&owner.0).unwrap(),
+            vec![(upper_slot, reward)]
+        );
+        assert!(ctx
+            .store
+            .get_utxos_by_owner(&transient_owner.0)
+            .unwrap()
+            .is_empty());
+        assert!(ctx.store.get_segment(1).unwrap().is_some());
+        let stored_undo = ctx.store.get_undo_log(1).unwrap().unwrap();
+        assert_eq!(stored_undo.log_slots_before, parent_log);
+        assert!(stored_undo
+            .slot_changes
+            .contains(&(upper_slot, crate::fri_state::SlotValue::EMPTY)));
+        assert!(stored_undo
+            .slot_changes
+            .contains(&(7, crate::fri_state::SlotValue::EMPTY)));
+
+        ctx.apply_reorg_mdbx_with_applier(0, &[], child.header.timestamp + 1, |_, _, _| {
+            Ok::<(), MdbxContextError>(())
+        })
+        .unwrap();
+        assert_eq!(ctx.state.state.log_slots(), parent_log as usize);
+        assert!(ctx.store.get_utxos_by_owner(&owner.0).unwrap().is_empty());
+        assert!(ctx.store.get_segment(1).unwrap().is_none());
+        drop(ctx);
+
+        let mut reopened = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
+        assert_eq!(reopened.tip_height(), 0);
+        assert_eq!(reopened.state.state.log_slots(), parent_log as usize);
+        assert!(reopened
+            .store
+            .all_segments()
+            .unwrap()
+            .iter()
+            .all(|(segment_id, _, _)| *segment_id == 0));
+        assert!(reopened
+            .store
+            .get_utxos_by_owner(&owner.0)
+            .unwrap()
+            .is_empty());
+        assert!(reopened
+            .store
+            .get_utxos_by_owner(&transient_owner.0)
+            .unwrap()
+            .is_empty());
+        assert!(reopened.store.get_segment(1).unwrap().is_none());
+        reopened.state.expand_one();
+        assert_eq!(
+            reopened.state.state.slot(upper_slot),
+            crate::fri_state::SlotValue::EMPTY
+        );
+        assert_eq!(
+            reopened.state.try_state_root().unwrap(),
+            crate::exact_state_hash::state_node_hash(
+                parent_root,
+                crate::exact_state_hash::zero_slot_roots(parent_log as usize)[parent_log as usize],
+            )
+        );
+    }
+
+    #[test]
     fn reopen_rejects_state_meta_counter_drift_from_tip_header() {
         let dir = tempfile::tempdir().unwrap();
         let tip = {
@@ -2109,7 +2382,6 @@ mod tests {
                 std::iter::empty::<(u64, Vec<u8>)>(),
             )
         );
-        assert_eq!(package.reuse_guard_buckets.len(), REUSE_GUARD_BUCKETS);
         assert_eq!(
             ctx.store.get_checkpoint_coverage().unwrap().unwrap().height,
             0

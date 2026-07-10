@@ -7,84 +7,30 @@
 //! commitment path. They are pure building blocks for the exact Merkle state
 //! transition proof.
 
+#[cfg(test)]
 use noid_core::Block128;
 use noid_poseidon2b::native::compression::{compress_with_tag, Poseidon2bSponge};
-use noid_poseidon2b::native::domain::{capacity_iv, TAG_EXSTNOD, TAG_EXSTROT, TAG_EXSTSLT};
+use noid_poseidon2b::native::domain::{capacity_iv, TAG_EXSTNOD, TAG_EXSTSLT};
 
 use crate::fri_state::SlotValue;
 
 /// 32-byte exact-state hash.
 pub type StateHash = [u8; 32];
 
-/// Errors returned by checked exact-state hash encoders.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExactStateHashError {
-    /// Retained for API compatibility with legacy amount-only raw states.
-    /// Packed `(amount, creation_id)` lanes use all 128 bits and therefore no
-    /// longer produce this error.
-    NonCanonicalAmount,
-}
-
-impl core::fmt::Display for ExactStateHashError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::NonCanonicalAmount => {
-                write!(f, "slot amount is not a canonical u64 embedding")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ExactStateHashError {}
-
-/// Split a 32-byte state hash into its two canonical field lanes.
-#[inline]
-pub fn fields_from_digest(hash: StateHash) -> [Block128; 2] {
-    let mut lo = [0u8; 16];
-    let mut hi = [0u8; 16];
-    lo.copy_from_slice(&hash[..16]);
-    hi.copy_from_slice(&hash[16..]);
-    [
-        Block128::from(u128::from_le_bytes(lo)),
-        Block128::from(u128::from_le_bytes(hi)),
-    ]
-}
-
 /// Hash one exact-state slot leaf.
 ///
-/// The full packed `(amount, creation_id)` lane is absorbed. Creation ID zero
-/// is therefore byte-for-byte compatible with the historical amount-only
-/// schedule.
+/// The full packed `(amount, creation_id)` lane is absorbed. Every 128-bit
+/// lane is a canonical pair of `u64`s, so hashing is infallible.
 pub fn slot_leaf_hash(slot: SlotValue) -> StateHash {
-    slot_leaf_hash_checked(slot).expect("every packed slot lane is canonical")
-}
-
-/// Checked variant of [`slot_leaf_hash`].
-pub fn slot_leaf_hash_checked(slot: SlotValue) -> Result<StateHash, ExactStateHashError> {
     let mut s = Poseidon2bSponge::with_iv(capacity_iv(TAG_EXSTSLT));
     s.absorb(slot.value);
     s.absorb_pair(slot.owner_hi, slot.owner_lo);
-    Ok(s.finalize())
+    s.finalize()
 }
 
 /// Hash one exact-state binary Merkle node.
 pub fn state_node_hash(left: StateHash, right: StateHash) -> StateHash {
     compress_with_tag(TAG_EXSTNOD, &left, &right)
-}
-
-/// Compose UTXO and ReuseGuard component roots into the header state root.
-pub fn composite_state_root(
-    log_slots: u32,
-    utxo_root: StateHash,
-    guard_root: StateHash,
-) -> StateHash {
-    let [u0, u1] = fields_from_digest(utxo_root);
-    let [g0, g1] = fields_from_digest(guard_root);
-    let mut s = Poseidon2bSponge::with_iv(capacity_iv(TAG_EXSTROT));
-    s.absorb_pair(Block128::from(log_slots), u0);
-    s.absorb_pair(u1, g0);
-    s.absorb(g1);
-    s.finalize()
 }
 
 /// Precompute `Z_0..=Z_max_depth` for the exact sparse UTXO tree.
@@ -112,16 +58,16 @@ mod tests {
     }
 
     #[test]
-    fn slot_hash_binds_full_packed_value_and_keeps_id_zero_schedule() {
+    fn slot_hash_binds_full_packed_value_and_zero_id_uses_low_lane() {
         let s = slot(42, 7, 9);
         assert_eq!(slot_leaf_hash(s), slot_leaf_hash(s));
         let incarnation = slot((1u128 << 64) | 42, 7, 9);
         assert_ne!(slot_leaf_hash(s), slot_leaf_hash(incarnation));
 
-        let mut legacy = Poseidon2bSponge::with_iv(capacity_iv(TAG_EXSTSLT));
-        legacy.absorb(Block128::from(42u64));
-        legacy.absorb_pair(Block128::from(7u64), Block128::from(9u64));
-        assert_eq!(slot_leaf_hash(s), legacy.finalize());
+        let mut zero_id = Poseidon2bSponge::with_iv(capacity_iv(TAG_EXSTSLT));
+        zero_id.absorb(Block128::from(42u64));
+        zero_id.absorb_pair(Block128::from(7u64), Block128::from(9u64));
+        assert_eq!(slot_leaf_hash(s), zero_id.finalize());
     }
 
     #[test]
@@ -130,11 +76,6 @@ mod tests {
         let b = slot_leaf_hash(slot(4, 5, 6));
         assert_ne!(state_node_hash(a, b), state_node_hash(b, a));
         assert_ne!(slot_leaf_hash(SlotValue::EMPTY), state_node_hash(a, b));
-        assert_ne!(
-            composite_state_root(24, a, b),
-            state_node_hash(a, b),
-            "composite root must be cross-domain separated from nodes"
-        );
     }
 
     #[test]

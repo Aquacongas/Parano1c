@@ -42,7 +42,7 @@ use std::sync::OnceLock;
 use noid_core::{Block128, TowerField};
 use noid_poseidon2b::native::compress;
 
-use crate::exact_state_hash::{slot_leaf_hash_checked, ExactStateHashError, StateHash};
+use crate::exact_state_hash::{slot_leaf_hash, StateHash};
 #[cfg(test)]
 use crate::fri_state::merkle_root_from_leaf;
 use crate::fri_state::{
@@ -65,9 +65,43 @@ pub const MAX_SEGTREE_DEPTH: usize = 16;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExactStateReadError {
     EvictedSegment { seg_id: u16 },
-    Hash(ExactStateHashError),
     SparseMerkle(SparseMerkleError),
 }
+
+/// Errors returned when rolling the slot domain back across an expansion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StateResizeError {
+    InvalidTarget { current: usize, target: usize },
+    EvictedUpperSegment { seg_id: u16 },
+    NonEmptyUpperHalf { seg_id: u16 },
+}
+
+impl core::fmt::Display for StateResizeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::InvalidTarget { current, target } => {
+                write!(
+                    f,
+                    "cannot shrink state from log_slots {current} to {target}"
+                )
+            }
+            Self::EvictedUpperSegment { seg_id } => {
+                write!(
+                    f,
+                    "cannot verify evicted upper segment {seg_id} during shrink"
+                )
+            }
+            Self::NonEmptyUpperHalf { seg_id } => {
+                write!(
+                    f,
+                    "cannot discard non-empty upper state at segment {seg_id}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for StateResizeError {}
 
 impl core::fmt::Display for ExactStateReadError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -75,19 +109,12 @@ impl core::fmt::Display for ExactStateReadError {
             Self::EvictedSegment { seg_id } => {
                 write!(f, "exact state rebuild needs evicted segment {seg_id}")
             }
-            Self::Hash(err) => write!(f, "{err}"),
             Self::SparseMerkle(err) => write!(f, "{err}"),
         }
     }
 }
 
 impl std::error::Error for ExactStateReadError {}
-
-impl From<ExactStateHashError> for ExactStateReadError {
-    fn from(err: ExactStateHashError) -> Self {
-        Self::Hash(err)
-    }
-}
 
 impl From<SparseMerkleError> for ExactStateReadError {
     fn from(err: SparseMerkleError) -> Self {
@@ -717,7 +744,7 @@ impl SegmentedFriState {
                 if slot.is_empty() {
                     continue;
                 }
-                leaves.push((base | (local as u32), slot_leaf_hash_checked(slot)?));
+                leaves.push((base | (local as u32), slot_leaf_hash(slot)));
             }
         }
         Ok(SparseMerkleCache::from_leaves(
@@ -876,6 +903,21 @@ impl SegmentedFriState {
     /// Iterator over segment IDs that are evicted from RAM but non-zero in MDBX.
     pub fn evicted_segment_ids(&self) -> impl Iterator<Item = u16> + '_ {
         self.evicted.iter().copied()
+    }
+
+    /// Install only the residency metadata needed by exact-root fail-closed
+    /// tests, without constructing a 3 MiB FRI segment fixture.
+    #[cfg(test)]
+    pub(crate) fn mark_segment_evicted_for_test(
+        &mut self,
+        seg_id: u16,
+        cached_segment_root: StateRoot,
+    ) {
+        let id = seg_id as usize;
+        self.segments[id] = None;
+        self.seg_roots[id] = Some(cached_segment_root);
+        self.live_counts[id] = 1;
+        self.evicted.insert(seg_id);
     }
 
     // -----------------------------------------------------------------------
@@ -1041,6 +1083,89 @@ impl SegmentedFriState {
             compress(&old_root, &zero_segtree_node(old_depth)),
             "expand: new root must equal compress(old_root, Z[old_depth])"
         );
+    }
+
+    /// Shrink to a previously committed slot depth after undo has emptied every
+    /// slot in the discarded upper half.
+    ///
+    /// This is a rollback-only primitive. It fails closed if the upper half is
+    /// live or evicted, rather than silently dropping state.
+    pub fn shrink_to_log_slots(&mut self, target: usize) -> Result<(), StateResizeError> {
+        if target < 1 || target > self.log_slots {
+            return Err(StateResizeError::InvalidTarget {
+                current: self.log_slots,
+                target,
+            });
+        }
+
+        while self.log_slots > target {
+            self.flush_all_dirty();
+
+            if self.log_slots <= LOG_SEGMENT_SIZE {
+                if self.evicted.contains(&0) {
+                    return Err(StateResizeError::EvictedUpperSegment { seg_id: 0 });
+                }
+                let keep = 1usize << (self.log_slots - 1);
+                if let Some(cols) = self.segments[0].as_mut() {
+                    let upper_is_empty = cols.values[keep..].iter().all(|v| v.0 == 0)
+                        && cols.owners_hi[keep..].iter().all(|v| v.0 == 0)
+                        && cols.owners_lo[keep..].iter().all(|v| v.0 == 0);
+                    if !upper_is_empty {
+                        return Err(StateResizeError::NonEmptyUpperHalf { seg_id: 0 });
+                    }
+                    cols.values.truncate(keep);
+                    cols.owners_hi.truncate(keep);
+                    cols.owners_lo.truncate(keep);
+                    self.live_counts[0] = Self::count_live(cols);
+                    if self.live_counts[0] == 0 {
+                        self.segments[0] = None;
+                    }
+                }
+                self.log_slots -= 1;
+                self.effective_log_seg = self.log_slots;
+                self.seg_roots[0] = None;
+                self.dirty.insert(0);
+                self.mdbx_dirty.insert(0);
+                self.tree_dirty = true;
+                self.flush_all_dirty();
+                continue;
+            }
+
+            let new_num_segments = self.num_segments / 2;
+            for id in new_num_segments..self.num_segments {
+                let seg_id = id as u16;
+                if self.evicted.contains(&seg_id) {
+                    return Err(StateResizeError::EvictedUpperSegment { seg_id });
+                }
+                if self.live_counts[id] != 0 {
+                    return Err(StateResizeError::NonEmptyUpperHalf { seg_id });
+                }
+            }
+
+            self.log_slots -= 1;
+            self.num_segments = new_num_segments;
+            self.segments.truncate(new_num_segments);
+            self.seg_roots.truncate(new_num_segments);
+            self.live_counts.truncate(new_num_segments);
+            self.evicted.retain(|id| (*id as usize) < new_num_segments);
+            self.dirty.retain(|id| (*id as usize) < new_num_segments);
+            self.mdbx_dirty
+                .retain(|id| (*id as usize) < new_num_segments);
+            self.dirty_tree_leaves
+                .retain(|id| (*id as usize) < new_num_segments);
+
+            let zero_leaf = zero_seg_root_for(self.effective_log_seg);
+            self.tree = vec![[0u8; 32]; 2 * new_num_segments + 1];
+            for i in 0..new_num_segments {
+                self.tree[new_num_segments + i] = self.seg_roots[i].unwrap_or(zero_leaf);
+            }
+            for k in (1..new_num_segments).rev() {
+                self.tree[k] = compress(&self.tree[2 * k], &self.tree[2 * k + 1]);
+            }
+            self.tree_dirty = false;
+        }
+
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1451,5 +1576,37 @@ mod tests {
         // But the slot value should be visible.
         let sv = s.slot(0);
         assert_eq!(sv.value, Block128::from(42u128));
+    }
+
+    #[test]
+    fn shrink_rejects_nonempty_upper_half_without_changing_domain() {
+        let mut state = SegmentedFriState::new_empty(TS);
+        state.expand();
+        let upper_slot = (1u32 << TS) + 3;
+        state.set_slot(upper_slot, sv(7)).unwrap();
+        let root_before = state.root();
+
+        assert_eq!(
+            state.shrink_to_log_slots(TS),
+            Err(StateResizeError::NonEmptyUpperHalf { seg_id: 0 })
+        );
+        assert_eq!(state.log_slots(), TS + 1);
+        assert_eq!(state.num_slots(), 1u64 << (TS + 1));
+        assert_eq!(state.slot(upper_slot), sv(7));
+        assert_eq!(state.root(), root_before);
+    }
+
+    #[test]
+    fn shrink_rejects_evicted_state_without_changing_domain() {
+        let mut state = SegmentedFriState::new_empty(TS + 1);
+        state.mark_segment_evicted_for_test(0, [0x5A; 32]);
+
+        assert_eq!(
+            state.shrink_to_log_slots(TS),
+            Err(StateResizeError::EvictedUpperSegment { seg_id: 0 })
+        );
+        assert_eq!(state.log_slots(), TS + 1);
+        assert_eq!(state.num_slots(), 1u64 << (TS + 1));
+        assert!(state.is_evicted(0));
     }
 }

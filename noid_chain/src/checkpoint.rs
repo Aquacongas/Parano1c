@@ -5,10 +5,9 @@
 //!
 //! A checkpoint package is not a consensus acceptance shortcut. It is a
 //! deterministic, immutable record over an already-accepted finalized prefix:
-//! exact state component roots, active UTXO segment payloads, ReuseGuard buckets,
-//! and retained block/proof/authorization-sidecar byte roots.
+//! the exact state root, active UTXO segment payloads, and retained
+//! block/proof/authorization-sidecar byte roots.
 
-use crate::reuse_guard::GuardBucket;
 use noid_poseidon2b::native::poseidon2b_hash_byte_slices;
 
 const MANIFEST_DIGEST_DOMAIN: &[u8] = b"NOID_IMMUTABLE_CHECKPOINT_MANIFEST";
@@ -30,8 +29,6 @@ pub struct ImmutableCheckpointManifest {
     pub log_slots: u32,
     pub active_slot_count: u64,
     pub alloc_counter: u64,
-    pub utxo_root: [u8; 32],
-    pub guard_root: [u8; 32],
     pub state_root: [u8; 32],
     /// Retained post-genesis block payload range covered by the byte roots.
     /// Empty at genesis: `covered_from = 1`, `covered_to = 0`.
@@ -42,7 +39,6 @@ pub struct ImmutableCheckpointManifest {
     pub block_auth_sidecar_root: [u8; 32],
     pub segment_payload_root: [u8; 32],
     pub segment_count: u32,
-    pub reuse_guard_bucket_count: u32,
 }
 
 impl ImmutableCheckpointManifest {
@@ -62,7 +58,6 @@ pub struct CheckpointSegmentPayload {
 pub struct ImmutableCheckpointPackage {
     pub manifest: ImmutableCheckpointManifest,
     pub segments: Vec<CheckpointSegmentPayload>,
-    pub reuse_guard_buckets: Vec<GuardBucket>,
 }
 
 impl ImmutableCheckpointPackage {
@@ -150,8 +145,6 @@ mod tests {
             log_slots: 24,
             active_slot_count: 5,
             alloc_counter: 8,
-            utxo_root: [3; 32],
-            guard_root: [4; 32],
             state_root: [5; 32],
             covered_from: 1,
             covered_to: 7,
@@ -160,7 +153,6 @@ mod tests {
             block_auth_sidecar_root: [8; 32],
             segment_payload_root: [9; 32],
             segment_count: 2,
-            reuse_guard_bucket_count: 256,
         };
         let a = manifest.checkpoint_id();
         manifest.block_body_root[0] ^= 1;

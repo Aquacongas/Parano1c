@@ -119,8 +119,8 @@ pub fn sweep_tx_class_tier(count: usize) -> Option<usize> {
     class_tier_for(&SWEEP_TX_CLASS_TIERS, count)
 }
 
-/// Live-input (spend) capacity of a shape class: what the class's guard
-/// bucket and per-input structures are padded to. Capped by the semantic
+/// Live-input (spend) capacity of a shape class: what the class's per-input
+/// proof structures are padded to. Capped by the semantic
 /// block budget, which admits the tier mix only up to the global
 /// live-input maximum.
 #[inline]
@@ -209,12 +209,6 @@ pub const UNDO_RETENTION_DEPTH: u64 = 18;
 /// only for this recent window. Older full payloads are prunable once consumed
 /// by accepted-block certificate/checkpoint coverage; headers remain permanent.
 pub const RECENT_BLOCK_RETENTION_DEPTH: u64 = UNDO_RETENTION_DEPTH;
-
-/// Compatibility alias for older internal callers.
-pub const FINALITY_DEPTH: u64 = CONSENSUS_FINALITY_DEPTH;
-
-/// Backwards-compatible alias for in-memory undo pruning.
-pub const UNDO_LOG_RETENTION: u64 = UNDO_RETENTION_DEPTH;
 
 /// Number of finalised block headers used for the expansion trigger median.
 /// Using median over this window makes the trigger immune to single-block spam.

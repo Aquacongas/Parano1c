@@ -19,7 +19,6 @@ use std::collections::{HashMap, HashSet};
 use crate::block::Block;
 use crate::consensus::params::UNDO_RETENTION_DEPTH;
 use crate::fri_state::SlotValue;
-use crate::reuse_guard::{GuardBucket, REUSE_GUARD_BUCKETS};
 use crate::segmented_state::SegmentedFriState;
 use crate::state::ChainState;
 use noid_poseidon2b::primitives::TxBodyHash;
@@ -33,6 +32,9 @@ use noid_poseidon2b::primitives::TxBodyHash;
 pub struct BlockUndoLog {
     /// Height of the block this undo log was produced for.
     pub block_height: u64,
+    /// Slot-domain depth before this block. Reorg rollback must undo any
+    /// expansion performed by the block before restoring the parent root.
+    pub log_slots_before: u32,
     /// Exact active-slot counter before this block was applied.
     pub active_slot_count_before: u64,
     /// Exact allocator counter before this block was applied.
@@ -45,20 +47,18 @@ pub struct BlockUndoLog {
     /// Used to restore the mempool after a reorg: txs that are no longer
     /// on the canonical chain can be re-admitted.
     pub tx_hashes: Vec<TxBodyHash>,
-    /// ReuseGuard buckets before this block was applied.
-    pub reuse_guard_before: [GuardBucket; REUSE_GUARD_BUCKETS],
 }
 
 impl BlockUndoLog {
     /// Create an empty undo log for the given block height.
-    pub fn empty(block_height: u64) -> Self {
+    pub fn empty(block_height: u64, log_slots_before: u32) -> Self {
         Self {
             block_height,
+            log_slots_before,
             active_slot_count_before: 0,
             alloc_counter_before: 0,
             slot_changes: vec![],
             tx_hashes: vec![],
-            reuse_guard_before: std::array::from_fn(|_| GuardBucket::Empty),
         }
     }
 }
@@ -71,9 +71,9 @@ impl BlockUndoLog {
 ///
 /// # Panics
 ///
-/// Does not panic; slots outside the current state range are silently
-/// skipped (the block pipeline will have already rejected them via
-/// `apply_block`).
+/// Does not panic. Slots outside both the parent domain and a legal one-level
+/// child domain are skipped; outputs in the newly-created upper half are
+/// recorded with the canonical parent pre-image [`SlotValue::EMPTY`].
 pub fn build_undo_log(state_before: &ChainState, block: &Block) -> BlockUndoLog {
     let tx_hashes: Vec<TxBodyHash> = block.transactions.iter().map(|t| t.tx_body_hash).collect();
     let mut slot_changes = Vec::new();
@@ -97,22 +97,37 @@ pub fn build_undo_log(state_before: &ChainState, block: &Block) -> BlockUndoLog 
             if !out.valid {
                 continue;
             }
-            if (out.slot_index as u64) < state_before.state.num_slots()
-                && touched_slots.insert(out.slot_index)
-            {
-                let prev = state_before.state.slot(out.slot_index);
-                slot_changes.push((out.slot_index, prev));
+            if touched_slots.insert(out.slot_index) {
+                if (out.slot_index as u64) < state_before.state.num_slots() {
+                    slot_changes.push((out.slot_index, state_before.state.slot(out.slot_index)));
+                } else {
+                    // An expansion block may mint into its newly-created upper
+                    // half. Those slots are canonically EMPTY in the parent and
+                    // still need an undo entry so shrink can prove the discarded
+                    // half is empty after rollback.
+                    let parent_log_slots = state_before.state.log_slots() as u32;
+                    let parent_slots = state_before.state.num_slots();
+                    let child_slots =
+                        if block.header.log_slots == parent_log_slots.saturating_add(1) {
+                            parent_slots.checked_mul(2).unwrap_or(parent_slots)
+                        } else {
+                            parent_slots
+                        };
+                    if (out.slot_index as u64) < child_slots {
+                        slot_changes.push((out.slot_index, SlotValue::EMPTY));
+                    }
+                }
             }
         }
     }
 
     BlockUndoLog {
         block_height: block.header.height,
+        log_slots_before: state_before.state.log_slots() as u32,
         active_slot_count_before: state_before.active_slot_count,
         alloc_counter_before: state_before.alloc_counter,
         slot_changes,
         tx_hashes,
-        reuse_guard_before: std::array::from_fn(|i| state_before.reuse_guard.bucket(i).clone()),
     }
 }
 
@@ -192,7 +207,7 @@ mod tests {
         let n = UNDO_RETENTION_DEPTH + 5; // 23 blocks
         let mut logs: HashMap<u64, BlockUndoLog> = HashMap::new();
         for h in 0..n {
-            logs.insert(h, BlockUndoLog::empty(h));
+            logs.insert(h, BlockUndoLog::empty(h, TEST_LOG_SLOTS as u32));
         }
         let current = n - 1;
         prune_undo_logs(&mut logs, current);

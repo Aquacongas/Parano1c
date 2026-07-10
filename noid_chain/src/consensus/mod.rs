@@ -69,7 +69,7 @@ pub use fees::{
     occupancy_bps, pressure_multiplier, required_fee_for_tx_body, state_growth_fee_per_slot,
     tx_shape, FeeBreakdown,
 };
-pub use fork_choice::{choose_chain, choose_chain_by_work, reorg_allowed, ChainChoice};
+pub use fork_choice::{choose_chain_by_work, reorg_allowed, ChainChoice};
 pub use genesis::{find_genesis_nonce, genesis_header, genesis_state_root, GENESIS_TIMESTAMP};
 pub use header::{epoch_anchor_height, is_anchor_height_valid, is_final, validate_header};
 pub use mempool_checks::validate_tx_for_mempool;

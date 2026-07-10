@@ -10,7 +10,7 @@
 //! - Coinbase to burn address (initial coins bootstrapping)
 //! - zero detached witness metadata; genesis has no block proof
 //!
-//! The genesis state_root is the exact composite root of an empty chain state.
+//! The genesis state_root is the direct exact sparse-Merkle root of an empty UTXO tree.
 
 use crate::block_header::BlockHeader;
 use crate::consensus::{
@@ -50,24 +50,24 @@ pub fn genesis_header() -> BlockHeader {
     }
 }
 
-/// The canonical genesis state root: exact composite root of an all-zero UTXO
-/// tree and empty ReuseGuard with `log_slots = LOG_SLOTS_GENESIS`.
+/// The canonical genesis state root of the all-zero exact UTXO tree at
+/// `LOG_SLOTS_GENESIS`.
 ///
-/// Computed once via `SegmentedFriState::new_empty(24).root()` and hardcoded.
+/// Computed from `zero_slot_roots(LOG_SLOTS_GENESIS)` and hardcoded.
 /// Verified by the test `genesis_state_root_matches_computed` below.
 pub fn genesis_state_root() -> [u8; 32] {
     GENESIS_STATE_ROOT
 }
 
-/// Pre-computed genesis state root. All 2^24 slots are zero and the ReuseGuard is empty.
+/// Pre-computed genesis state root. All 2^24 slots are zero.
 const GENESIS_STATE_ROOT: [u8; 32] = [
-    0x93, 0xd6, 0x55, 0x08, 0xa9, 0x36, 0x75, 0x11, 0x35, 0x8b, 0xe7, 0xa6, 0x3f, 0xfa, 0x77, 0xaf,
-    0x8e, 0xcc, 0xa1, 0xc8, 0x04, 0x16, 0x75, 0x9d, 0x67, 0x0c, 0xe6, 0x57, 0x18, 0xd0, 0xef, 0x1b,
+    0x5c, 0x7f, 0x37, 0x12, 0x61, 0x1c, 0x83, 0x6a, 0x2c, 0x6a, 0xb0, 0x44, 0x8d, 0x32, 0xc2, 0x71,
+    0xf0, 0x4e, 0x32, 0x13, 0x56, 0x0e, 0x8a, 0x53, 0x21, 0x33, 0x1c, 0xd6, 0xa5, 0xc9, 0x84, 0x92,
 ];
 
 /// Pre-mined genesis nonce.
 /// Satisfies: `H_POSEIDON_POW(genesis_header()) < GENESIS_TARGET`.
-const GENESIS_NONCE: u128 = 1_688_852;
+const GENESIS_NONCE: u128 = 468_361;
 
 /// Find and return a valid genesis nonce at runtime.
 /// Used for verification only — not for production (nonce is hardcoded as `GENESIS_NONCE`).

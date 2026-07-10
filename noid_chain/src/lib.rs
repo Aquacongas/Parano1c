@@ -4,7 +4,7 @@
 //! Chain layer for Paranoid.
 //!
 //! Ties transactions (`noid_tx`) to the on-chain state: the segmented raw UTXO
-//! vector, exact state commitments, bounded `ReuseGuard`, and block-header hash.
+//! vector, exact state commitments, and block-header hash.
 //!
 //! Two primary entry points:
 //!
@@ -23,7 +23,6 @@ pub mod exact_state_hash;
 pub mod fri_state;
 pub mod header_anchor;
 pub mod mempool;
-pub mod reuse_guard;
 pub mod segmented_state;
 pub mod sparse_merkle;
 pub mod state;
@@ -46,8 +45,8 @@ pub use fri_state::{
 // ---------------------------------------------------------------------------
 
 pub use segmented_state::{
-    zero_segment_root_16, zero_segtree_node, SegmentColumns, SegmentedFriState, MAX_SEGTREE_DEPTH,
-    SEGMENT_SIZE,
+    zero_segment_root_16, zero_segtree_node, SegmentColumns, SegmentedFriState, StateResizeError,
+    MAX_SEGTREE_DEPTH, SEGMENT_SIZE,
 };
 
 // ---------------------------------------------------------------------------
@@ -89,10 +88,6 @@ pub use checkpoint::{
 
 pub use chain_context::ChainContext;
 pub use mempool::{Mempool, MempoolEntry, MempoolError};
-pub use reuse_guard::{
-    validate_reuse_guard_actions, GuardBucket, ReuseGuard, ReuseGuardActionError,
-    ReuseGuardActionKind, ReuseGuardActionState, ReuseGuardError, REUSE_DELAY, REUSE_GUARD_BUCKETS,
-};
 pub use state::{apply_tx, ApplyError, ChainState, SparseUtxoBuildError, StateTransition};
 pub use state_delta::{
     build_exact_action_surface, build_state_delta_action_surface, build_state_delta_witness,

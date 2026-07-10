@@ -14,7 +14,7 @@ use noid_block::{
     build_exact_state_transition_proof, verify_exact_state_transition, BlockAuthSidecar,
     BlockProof, ExactStateTransitionInputs,
 };
-use noid_chain::exact_state_hash::{composite_state_root, slot_leaf_hash_checked};
+use noid_chain::exact_state_hash::slot_leaf_hash;
 use noid_chain::sparse_merkle::reconstruct_root;
 use noid_chain::state::ChainState;
 use noid_chain::{Block, BlockHeader, SlotValue};
@@ -627,7 +627,7 @@ fn seed_state_for_bodies(bodies: &[TxBody]) -> ChainState {
             ),
         ));
     }
-    // These benchmark fixtures intentionally use legacy creation_id=0 inputs
+    // These benchmark fixtures intentionally use creation_id=0 inputs
     // and model a zero-counter parent.
     ChainState::from_sparse_utxos(BENCH_LOG_SLOTS as usize, &slots, 0)
         .expect("bench input slots form a valid sparse UTXO state")
@@ -759,9 +759,8 @@ fn prove_full_block_from_bodies_and_auth(
         .exact_sparse_cache()
         .expect("build bench exact sparse cache");
     profiler.phase("exact_sparse_cache");
-    let exact_state_transition =
-        build_exact_state_transition_proof(&exact_cache, &exact_surface, &pre_state.reuse_guard, 1)
-            .expect("build bench exact state proof");
+    let exact_state_transition = build_exact_state_transition_proof(&exact_cache, &exact_surface)
+        .expect("build bench exact state proof");
     profiler.phase("exact_transition_proof");
     // Child roots from the multiproof frontier — O(touched · depth), the
     // same reconstruction the verifier runs. Cloning the whole sparse
@@ -770,25 +769,15 @@ fn prove_full_block_from_bodies_and_auth(
     let new_leaf_hashes: Vec<_> = exact_surface
         .new_slots
         .iter()
-        .map(|&slot| slot_leaf_hash_checked(slot).expect("bench slot hash"))
+        .map(|&slot| slot_leaf_hash(slot))
         .collect();
-    let child_utxo_root = reconstruct_root(
+    let new_state_root = reconstruct_root(
         &exact_surface.touched_indices,
         &new_leaf_hashes,
         &exact_state_transition.slot_siblings,
         BENCH_LOG_SLOTS,
     )
-    .expect("bench child utxo root from multiproof frontier");
-    let child_guard_root = if exact_surface.spent_slots.is_empty() {
-        pre_state.reuse_guard.root()
-    } else {
-        let mut next_guard = pre_state.reuse_guard.clone();
-        next_guard
-            .apply_spends(1, &exact_surface.spent_slots)
-            .expect("bench guard update");
-        next_guard.root()
-    };
-    let new_state_root = composite_state_root(BENCH_LOG_SLOTS, child_utxo_root, child_guard_root);
+    .expect("bench child state root from multiproof frontier");
     profiler.phase("child_root_reconstruct");
 
     let auth_sidecar = BlockAuthSidecar { tx_auth };
@@ -869,20 +858,12 @@ pub fn bench_full_block_proof_minimal(fixtures: &[MinimalTxFixture]) -> FullBloc
         let inputs = ExactStateTransitionInputs {
             parent_state_root: proof.meta.prev_block_state_root,
             parent_log_slots: pre_state.state.log_slots() as u32,
-            parent_utxo_root: pre_state.utxo_root,
-            parent_guard_root: pre_state.reuse_guard.root(),
             child_state_root: block.header.state_root,
             child_log_slots: block.header.log_slots,
-            height: block.header.height,
             parent_active_slot_count: pre_state.active_slot_count,
             parent_alloc_counter: pre_state.alloc_counter,
         };
-        verify_exact_state_transition(
-            &inputs,
-            &exact_surface,
-            &pre_state.reuse_guard,
-            &proof.state_transition,
-        )
+        verify_exact_state_transition(&inputs, &exact_surface, &proof.state_transition)
         .expect("verify exact state transition");
     });
     let state_transition_bytes = proof.state_transition.byte_len();

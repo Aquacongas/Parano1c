@@ -410,9 +410,7 @@ fn metadata_path(wallet_key_path: &Path) -> PathBuf {
 struct WalletMetadata {
     next_index: u32,
     /// The ACTIVE address key index (one-owner-per-tx model: sends spend
-    /// from this address only; change returns to it). Old metadata files
-    /// default to the primary address.
-    #[serde(default)]
+    /// from this address only; change returns to it).
     active_index: u32,
 }
 

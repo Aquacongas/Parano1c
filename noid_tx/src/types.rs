@@ -262,7 +262,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn amount_creation_id_packing_roundtrips_and_preserves_legacy_lane() {
+    fn amount_creation_id_packing_roundtrips_and_zero_id_uses_low_lane() {
         for (amount, creation_id) in [
             (0, 0),
             (u64::MAX, 0),

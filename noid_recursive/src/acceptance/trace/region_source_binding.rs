@@ -70,7 +70,7 @@ use noid_fri_binius::compact_fri::{
 use noid_gkr::auth_pcs::AuthMleOpeningProof;
 use noid_gkr::owner_auth::{OwnerAuthProofKillShot, OwnerAuthPublicInputs};
 use noid_poseidon2b::native::domain::{
-    capacity_iv, DomainTag, TAG_EXSTNOD, TAG_FRICHANL, TAG_KSCHANNL, TAG_RGDNODE,
+    capacity_iv, DomainTag, TAG_EXSTNOD, TAG_FRICHANL, TAG_KSCHANNL,
 };
 use noid_poseidon2b::native::permutation::STATE_SIZE;
 
@@ -230,13 +230,12 @@ pub fn discharge_auth_pcs_obligation_via_region(
 /// the block's exact-state hashing families ride the SAME walks — no new walk
 /// is ever spawned. The `2T` slot-leaf sponge tiles join walk A as one more
 /// leaf family (its plain `IN` reads gated by a region-ones pattern); the
-/// state paths (TAG_EXSTNOD) and guard paths (TAG_RGDNODE) join walk B as two
-/// more Merkle legs with their own tree IVs. Block-level entries are chunked
+/// state paths (TAG_EXSTNOD) join walk B as one more Merkle leg. Block-level entries are chunked
 /// `ceil(len/K)` per tx block (contiguous, canonical-ghost-filled), so the
 /// layout stays a deterministic function of (input lengths, K, depths) —
 /// class-fixed. Leaf digests pin to the slot-leaf `expected_leaf` statement
 /// wires which double as the state leg's entry wires (the leaf↔path closure),
-/// and each leg root pins to the composite-root statement wires (path↔root).
+/// and each root pins directly to the parent/grown-parent or child header wires.
 ///
 /// `txr` (tx-root region handoff, [`TxRootRegionData`]): when `Some`, the
 /// block's tx-root Merkle paths ride walk B as one more TAG_COMPRESS leg —
@@ -348,17 +347,10 @@ pub fn discharge_auth_pcs_obligations_via_region(
     let mut leg_caps: Vec<usize> = Vec::new();
     let mut leg_ivs: Vec<[F128; 2]> = Vec::new();
     let es_state_leg = 0usize;
-    let mut es_guard_leg = usize::MAX;
     if let Some(e) = es {
         leg_depths.push(e.d_state);
         leg_caps.push(e.paths.len().div_ceil(k));
         leg_ivs.push(iv_flat_of_tag(TAG_EXSTNOD));
-        if let Some(g) = &e.guard {
-            es_guard_leg = leg_depths.len();
-            leg_depths.push(g.depth);
-            leg_caps.push(2usize.div_ceil(k));
-            leg_ivs.push(iv_flat_of_tag(TAG_RGDNODE));
-        }
     }
     // Tx-root paths: one TAG_COMPRESS leg, one path per user tx chunked
     // across the tx blocks.
@@ -881,7 +873,7 @@ pub fn discharge_auth_pcs_obligations_via_region(
     // ===================================================================
     // Exact-state families (block-level, chunked across the K tx blocks —
     // NEVER a new walk): the 2T slot-leaf sponge tiles fill walk A's es
-    // region; the state/guard Merkle paths fill walk B's es legs. Chunk i
+    // region; the state Merkle paths fill walk B's exact-state leg. Chunk i
     // gets entries [i·cap, min((i+1)·cap, len)); the shortfall is canonical
     // ghosts, so every pattern-covered slot is a valid chain and the pin
     // structure is a pure function of (input lengths, K, depths).
@@ -982,43 +974,6 @@ pub fn discharge_auth_pcs_obligations_via_region(
                 &state_paths,
             );
 
-            // --- Walk B: this block's guard-path chunk (present iff guard;
-            // entries = the INLINE guard-bucket statement's leaf digests,
-            // roots = the composite statement's guard roots). ---
-            if let Some(gd) = &e.guard {
-                let cap = leg_caps[es_guard_leg];
-                let glo = (blk * cap).min(2);
-                let ghi = ((blk + 1) * cap).min(2);
-                let guard_paths: Vec<EsPathReal> = (glo..ghi)
-                    .map(|i| {
-                        assert_eq!(gd.siblings[i].len(), gd.depth, "guard path depth");
-                        EsPathReal {
-                            entry_flat: gd.entries_flat[i],
-                            entry_w: gd.entries_w[i].clone(),
-                            siblings: gd.siblings[i].clone(),
-                            directions: gd.directions[i].clone(),
-                            root_flat: gd.roots_flat[i],
-                            root_w: gd.roots_w[i].clone(),
-                        }
-                    })
-                    .collect();
-                fill_es_merkle_leg(
-                    &mut cb,
-                    &mut s0b,
-                    &mut soutb,
-                    &mut acc_entry_wires[es_guard_leg],
-                    &mut acc_root_wires[es_guard_leg],
-                    &mut acc_committed_roots[es_guard_leg],
-                    &mut acc_path_slots[es_guard_leg],
-                    &mut acc_recomputed_roots[es_guard_leg],
-                    gd.depth,
-                    cap,
-                    leg_ivs[es_guard_leg],
-                    4,
-                    blk * per_tx_block_b + meta_bases[es_guard_leg],
-                    &guard_paths,
-                );
-            }
         }
     }
 
@@ -2150,8 +2105,8 @@ fn iv_flat_of_tag(tag: DomainTag) -> [F128; 2] {
 }
 
 /// One real exact-state path of a walk-B leg chunk: the flat witness data
-/// plus the statement wires the leg pins bind (entry = the paired slot-leaf /
-/// guard-bucket digest wires; root = the expected-root statement wires).
+/// plus the statement wires the leg pins bind (entry = the paired slot-leaf
+/// digest wires; root = the expected-root statement wires).
 struct EsPathReal {
     entry_flat: [F128; 2],
     entry_w: [LinExpr; 2],

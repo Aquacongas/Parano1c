@@ -4,12 +4,11 @@
 //! Native-side state transition for the transparent UTXO chain.
 //!
 //! The chain state is a segmented raw UTXO slot vector plus exact commitments.
-//! A spend zeroes the slot at `input.slot_index` and the block-level exact
-//! transition records that slot in `ReuseGuard`; a mint writes to the
+//! A spend zeroes the slot at `input.slot_index`; a mint writes to the
 //! wallet-chosen `output.slot_index` only if the verifier-derived prefix state
-//! says it is empty and not active-guarded.
-//! The block header state root is the exact composite root:
-//! `H(log_slots, UTXO_MerkleRoot, ReuseGuardRoot)`.
+//! says it is empty. Every mint receives a fresh monotone `creation_id`, so a
+//! stale spend cannot consume a later UTXO that reuses the same slot index.
+//! The block header state root is the exact sparse-Merkle UTXO root directly.
 //!
 //! This is the canonical native state engine used by miners, validators,
 //! storage and tests.
@@ -22,10 +21,9 @@ use noid_poseidon2b::primitives::Digest;
 use noid_tx::{TxBody, TxInput, TxOutput};
 
 use crate::exact_state_hash::{
-    composite_state_root, slot_leaf_hash_checked, zero_slot_roots, ExactStateHashError, StateHash,
+    slot_leaf_hash, state_node_hash, zero_slot_roots, StateHash,
 };
 use crate::fri_state::{SlotValue, StateError, STATE_LOG_SLOTS};
-use crate::reuse_guard::{GuardBucket, ReuseGuard};
 use crate::segmented_state::{ExactStateReadError, SegmentedFriState};
 use crate::sparse_merkle::{SparseMerkleCache, SparseMerkleError};
 
@@ -43,11 +41,9 @@ pub struct ChainState {
     pub state: SegmentedFriState,
     /// Exact sparse Merkle root over the UTXO slot vector.
     pub utxo_root: StateHash,
-    /// Bounded ABA replay guard over recently spent slot indices.
-    pub reuse_guard: ReuseGuard,
     /// Number of live (non-empty) slots. Grows on activation, shrinks
     /// on deactivation. This is the consensus-significant occupancy
-    /// signal for the `log_slots` expansion trigger (see
+    /// signal for the `log_slots` expansion trigger.
     pub active_slot_count: u64,
     /// Monotone counter incremented on each successful allocation. The next
     /// live output stores `creation_id = alloc_counter + 1`; the updated value
@@ -66,7 +62,6 @@ pub enum SparseUtxoBuildError {
         alloc_counter: u64,
     },
     State(StateError),
-    ExactHash(ExactStateHashError),
     SparseMerkle(SparseMerkleError),
 }
 
@@ -83,7 +78,6 @@ impl ChainState {
         Self {
             state: SegmentedFriState::new_empty(log_slots),
             utxo_root,
-            reuse_guard: ReuseGuard::new_empty(),
             active_slot_count: 0,
             alloc_counter: 0,
         }
@@ -94,12 +88,10 @@ impl ChainState {
         state: SegmentedFriState,
         active_slot_count: u64,
         alloc_counter: u64,
-        reuse_guard: ReuseGuard,
     ) -> Result<Self, ExactStateReadError> {
         let mut out = Self {
             utxo_root: zero_slot_roots(state.log_slots())[state.log_slots()],
             state,
-            reuse_guard,
             active_slot_count,
             alloc_counter,
         };
@@ -140,10 +132,7 @@ impl ChainState {
                     alloc_counter,
                 });
             }
-            leaves.push((
-                index,
-                slot_leaf_hash_checked(slot).map_err(SparseUtxoBuildError::ExactHash)?,
-            ));
+            leaves.push((index, slot_leaf_hash(slot)));
         }
 
         let mut state = Self::with_log_slots(log_slots);
@@ -177,25 +166,37 @@ impl ChainState {
         (self.active_slot_count as f64) / (self.state.num_slots() as f64)
     }
 
+    /// Grow the slot domain by one level while updating the exact root in O(1).
+    ///
+    /// The old tree becomes the left child and a depth-`old_log_slots` empty
+    /// subtree becomes the right child. This remains valid when live segment
+    /// columns are evicted and a full exact-root rebuild is unavailable.
+    pub fn expand_one(&mut self) {
+        let old_log_slots = self.state.log_slots();
+        let empty_right = zero_slot_roots(old_log_slots)[old_log_slots];
+        self.state.expand();
+        self.utxo_root = state_node_hash(self.utxo_root, empty_right);
+    }
+
     #[inline]
     pub fn state_root(&mut self) -> Digest {
-        if let Ok(root) = self.state.exact_utxo_root() {
-            self.utxo_root = root;
-        }
-        composite_state_root(
-            self.state.log_slots() as u32,
-            self.utxo_root,
-            self.reuse_guard.root(),
-        )
+        self.try_state_root()
+            .expect("state_root requires every live segment to be loaded; use cached_state_root for a trusted persisted root")
+    }
+
+    /// Rebuild and return the exact root, failing if any required segment is
+    /// evicted. Consensus mutation paths must use this method rather than
+    /// silently treating the cached pre-state root as a recomputed post-root.
+    #[inline]
+    pub fn try_state_root(&mut self) -> Result<Digest, ExactStateReadError> {
+        let root = self.state.exact_utxo_root()?;
+        self.utxo_root = root;
+        Ok(root)
     }
 
     #[inline]
     pub fn cached_state_root(&self) -> Digest {
-        composite_state_root(
-            self.state.log_slots() as u32,
-            self.utxo_root,
-            self.reuse_guard.root(),
-        )
+        self.utxo_root
     }
 
     pub fn rebuild_exact_utxo_root_loaded(&mut self) -> Result<StateHash, ExactStateReadError> {
@@ -219,7 +220,7 @@ impl ChainState {
     ) -> Result<StateHash, ApplyExactTransitionError> {
         let mut snapshot = self.clone();
         while log_slots as usize > snapshot.state.log_slots() {
-            snapshot.state.expand();
+            snapshot.expand_one();
         }
         if log_slots as usize != snapshot.state.log_slots() {
             return Err(ApplyExactTransitionError::HeaderLogSlotsMismatch);
@@ -233,20 +234,17 @@ impl ChainState {
             .map_err(ApplyExactTransitionError::ExactStateRead)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn apply_verified_exact_transition(
         &mut self,
         log_slots: u32,
-        child_utxo_root: StateHash,
-        child_guard_root: StateHash,
+        child_state_root: StateHash,
         slot_updates: &[(u32, SlotValue)],
-        guard_bucket_update: Option<(usize, GuardBucket)>,
         active_slot_count: u64,
         alloc_counter: u64,
     ) -> Result<Digest, ApplyExactTransitionError> {
         let mut snapshot = self.clone();
         while log_slots as usize > snapshot.state.log_slots() {
-            snapshot.state.expand();
+            snapshot.expand_one();
         }
         if log_slots as usize != snapshot.state.log_slots() {
             return Err(ApplyExactTransitionError::HeaderLogSlotsMismatch);
@@ -255,15 +253,7 @@ impl ChainState {
             .state
             .apply_delta_unrooted(slot_updates)
             .map_err(|_| ApplyExactTransitionError::SlotOutOfRange)?;
-        snapshot.utxo_root = child_utxo_root;
-        if let Some((bucket_index, bucket)) = guard_bucket_update {
-            snapshot
-                .reuse_guard
-                .apply_verified_bucket_update(bucket_index, bucket, child_guard_root)
-                .map_err(ApplyExactTransitionError::ReuseGuard)?;
-        } else if snapshot.reuse_guard.root() != child_guard_root {
-            return Err(ApplyExactTransitionError::ReuseGuardRootMismatch);
-        }
+        snapshot.utxo_root = child_state_root;
         snapshot.active_slot_count = active_slot_count;
         snapshot.alloc_counter = alloc_counter;
         let root = snapshot.cached_state_root();
@@ -311,15 +301,16 @@ pub enum ApplyError {
     ActiveSlotCountOverflow,
     /// No fresh non-zero creation ID can be assigned to the next live output.
     AllocCounterOverflow,
+    /// The exact post-state root cannot be recomputed because part of the raw
+    /// state is evicted. Acceptance must fail closed or preload the state.
+    ExactStateUnavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApplyExactTransitionError {
     SlotOutOfRange,
     HeaderLogSlotsMismatch,
-    ReuseGuardRootMismatch,
     ExactStateRead(ExactStateReadError),
-    ReuseGuard(crate::reuse_guard::ReuseGuardError),
 }
 
 /// Apply a `TxBody` to `state` in place, returning the post-transition
@@ -331,8 +322,12 @@ pub enum ApplyExactTransitionError {
 ///
 /// On `Err`, `state` is left untouched.
 pub fn apply_tx(state: &mut ChainState, body: &TxBody) -> Result<StateTransition, ApplyError> {
-    apply_tx_checked_deferred_root(state, body)?;
-    let new_state_root = state.state_root();
+    let mut snapshot = state.clone();
+    apply_tx_checked_deferred_root(&mut snapshot, body)?;
+    let new_state_root = snapshot
+        .try_state_root()
+        .map_err(|_| ApplyError::ExactStateUnavailable)?;
+    *state = snapshot;
     Ok(StateTransition { new_state_root })
 }
 
@@ -578,6 +573,39 @@ mod tests {
         let c = mk_output_at(7, 3);
         apply_tx(&mut state, &body_with(0, vec![], vec![c])).unwrap();
         assert_eq!(state.active_slot_count, 1);
+        assert_eq!(state.state.slot(7).creation_id(), 2);
+        assert_eq!(
+            apply_tx(&mut state, &body_with(0, vec![mk_input_for(7, &c)], vec![]),),
+            Err(ApplyError::UnknownOrSpentInput),
+            "the first incarnation's creation ID must not spend the replacement"
+        );
+    }
+
+    #[test]
+    fn evicted_expand_updates_cached_exact_root_and_fails_closed() {
+        let old_log = TEST_LOG_SLOTS;
+        let owner = Address([0x41; 32]);
+        let live = SlotValue::with_owner_fields(50, 1, owner.as_fields());
+        let old_root = crate::sparse_merkle::SparseMerkleCache::from_leaves(
+            old_log as u32,
+            &[(7, slot_leaf_hash(live))],
+        )
+        .unwrap()
+        .root();
+        let mut state = ChainState::with_log_slots(old_log);
+        state.utxo_root = old_root;
+        state.active_slot_count = 1;
+        state.alloc_counter = 1;
+
+        state.state.mark_segment_evicted_for_test(0, [0xA5; 32]);
+        assert!(state.try_state_root().is_err());
+        state.expand_one();
+
+        let expected =
+            crate::exact_state_hash::state_node_hash(old_root, zero_slot_roots(old_log)[old_log]);
+        assert_eq!(state.cached_state_root(), expected);
+        assert_eq!(state.state.log_slots(), old_log + 1);
+        assert!(state.try_state_root().is_err());
     }
 
     #[test]

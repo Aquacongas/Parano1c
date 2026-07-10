@@ -21,7 +21,8 @@ use noid_poseidon2b::primitives::Digest;
 
 use crate::{AcceptedBlockValidationArtifacts, VerifyBlockError};
 
-pub const ACCEPTED_STATE_TRANSITION_CLAIM_FIELDS: usize = 40;
+pub const ACCEPTED_STATE_TRANSITION_CLAIM_FIELDS: usize = 32;
+const _: [(); noid_gkr::HISTORY_CLAIM_FIELDS] = [(); ACCEPTED_STATE_TRANSITION_CLAIM_FIELDS];
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AcceptedStateTransitionClaim {
@@ -37,10 +38,6 @@ pub struct AcceptedStateTransitionClaim {
     pub child_active_slot_count: u64,
     pub parent_alloc_counter: u64,
     pub child_alloc_counter: u64,
-    pub parent_utxo_root: Digest,
-    pub child_utxo_root: Digest,
-    pub parent_guard_root: Digest,
-    pub child_guard_root: Digest,
     pub touched_slot_count: u32,
     pub action_count: u32,
     pub spend_count: u32,
@@ -72,6 +69,9 @@ impl AcceptedStateTransitionClaim {
         let verified = &artifacts.verified_transition;
         let inputs = &artifacts.exact_state_inputs;
         if inputs.parent_state_root != parent.state_root
+            || inputs.parent_log_slots != parent.log_slots
+            || inputs.parent_active_slot_count != parent.active_slot_count
+            || inputs.parent_alloc_counter != parent.alloc_counter
             || verified.parent_state_root() != parent.state_root
             || verified.child_state_root() != block.header.state_root
             || verified.log_slots() != block.header.log_slots
@@ -93,7 +93,7 @@ impl AcceptedStateTransitionClaim {
         counters.supply_delta = value_counters.supply_delta;
 
         let exact_transition_digest =
-            exact_transition_digest(&artifacts.exact_action_surface, verified.child_utxo_root());
+            exact_transition_digest(&artifacts.exact_action_surface, verified.child_state_root());
 
         let mut claim = Self {
             height: block.header.height,
@@ -108,10 +108,6 @@ impl AcceptedStateTransitionClaim {
             child_active_slot_count: verified.active_slot_count(),
             parent_alloc_counter: inputs.parent_alloc_counter,
             child_alloc_counter: verified.alloc_counter(),
-            parent_utxo_root: inputs.parent_utxo_root,
-            child_utxo_root: verified.child_utxo_root(),
-            parent_guard_root: inputs.parent_guard_root,
-            child_guard_root: verified.child_guard_root(),
             touched_slot_count: artifacts.exact_action_surface.touched_indices.len() as u32,
             action_count: artifacts.exact_action_surface.actions.len() as u32,
             spend_count: artifacts.exact_action_surface.spends,
@@ -211,7 +207,7 @@ fn transition_value_counters(surface: &ExactActionSurface) -> TransitionValueCou
     counters
 }
 
-fn exact_transition_digest(surface: &ExactActionSurface, child_utxo_root: Digest) -> Digest {
+fn exact_transition_digest(surface: &ExactActionSurface, child_state_root: Digest) -> Digest {
     let mut sponge = Poseidon2bSponge::with_iv(capacity_iv(TAG_HISTTRN));
     sponge.absorb(Block128::from(surface.actions.len() as u128));
     sponge.absorb(Block128::from(surface.touched_indices.len() as u128));
@@ -238,14 +234,11 @@ fn exact_transition_digest(surface: &ExactActionSurface, child_utxo_root: Digest
         absorb_slot(&mut sponge, *old_slot);
         absorb_slot(&mut sponge, *new_slot);
     }
-    for &slot_index in &surface.spent_slots {
-        sponge.absorb(Block128::from(slot_index as u128));
-    }
     // The absorb schedule is VARIABLE-length (per-surface action/slot
     // counts) and can end on a half-filled rate block, so the padded
     // finalize is required: the no-pad squeeze would silently drop a
     // trailing buffered lane from the commitment.
-    absorb_digest(&mut sponge, &child_utxo_root);
+    absorb_digest(&mut sponge, &child_state_root);
     sponge.finalize()
 }
 
@@ -265,10 +258,6 @@ pub fn accepted_state_transition_claim_fields(
     fields.push(Block128::from(claim.child_active_slot_count as u128));
     fields.push(Block128::from(claim.parent_alloc_counter as u128));
     fields.push(Block128::from(claim.child_alloc_counter as u128));
-    push_digest_fields(&mut fields, &claim.parent_utxo_root);
-    push_digest_fields(&mut fields, &claim.child_utxo_root);
-    push_digest_fields(&mut fields, &claim.parent_guard_root);
-    push_digest_fields(&mut fields, &claim.child_guard_root);
     fields.push(Block128::from(claim.touched_slot_count as u128));
     fields.push(Block128::from(claim.action_count as u128));
     fields.push(Block128::from(claim.spend_count as u128));
@@ -324,4 +313,71 @@ fn absorb_slot(sponge: &mut Poseidon2bSponge, slot: noid_chain::fri_state::SlotV
     sponge.absorb(slot.value);
     sponge.absorb(slot.owner_hi);
     sponge.absorb(slot.owner_lo);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use noid_poseidon2b::channel::Poseidon2bChannel;
+
+    fn digest(lo: u128, hi: u128) -> Digest {
+        let mut out = [0u8; 32];
+        out[..16].copy_from_slice(&lo.to_le_bytes());
+        out[16..].copy_from_slice(&hi.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn native_and_gkr_history_schedule_match_sentinel_order_and_hash() {
+        // Every field lane has its own sentinel.  Besides the compile-time
+        // length assertion above, this catches insertion/reordering drift in
+        // the native encoder before it reaches the fixed GKR absorb schedule.
+        let claim = AcceptedStateTransitionClaim {
+            height: 1,
+            block_id: digest(2, 3),
+            parent_block_id: digest(4, 5),
+            parent_state_root: digest(6, 7),
+            child_state_root: digest(8, 9),
+            tx_root: digest(10, 11),
+            parent_log_slots: 12,
+            child_log_slots: 13,
+            parent_active_slot_count: 14,
+            child_active_slot_count: 15,
+            parent_alloc_counter: 16,
+            child_alloc_counter: 17,
+            touched_slot_count: 18,
+            action_count: 19,
+            spend_count: 20,
+            mint_count: 21,
+            user_body_count: 22,
+            live_input_count: 23,
+            live_output_count: 24,
+            total_fee: 25,
+            claimable_fee: 26,
+            reward_value: 27,
+            spent_value: 28,
+            minted_value: 29,
+            supply_delta: 30,
+            exact_transition_digest: digest(31, 32),
+            claim_digest: [0u8; 32],
+        };
+        let fields = accepted_state_transition_claim_fields(&claim);
+        let expected: [Block128; ACCEPTED_STATE_TRANSITION_CLAIM_FIELDS] =
+            std::array::from_fn(|i| Block128::from(i as u128 + 1));
+        assert_eq!(fields, expected);
+
+        let expected_claim = digest_to_fields(&accepted_state_transition_claim_digest(&claim));
+        let inputs = vec![noid_gkr::HistoryClaimHashInputs {
+            fields,
+            expected_claim,
+        }];
+        let mut prover_channel = Poseidon2bChannel::new();
+        let (proof, reductions) =
+            noid_gkr::prove_history_claim_hash_killshot(&inputs, &mut prover_channel);
+        let mut verifier_channel = Poseidon2bChannel::new();
+        let verified =
+            noid_gkr::verify_history_claim_hash_killshot(&proof, &inputs, &mut verifier_channel)
+                .expect("GKR history schedule accepts the native sentinel hash");
+        assert_eq!(verified, reductions);
+    }
 }

@@ -333,13 +333,13 @@ pub struct LinkClass {
     /// then consumes).
     pub owner_auth_region: bool,
     /// When true, this block-bearing region class verifies each block's
-    /// exact-state HASHING killshots (slot leaves, state paths, guard paths)
+    /// exact-state HASHING killshots (slot leaves and state paths)
     /// on the shared region walks instead of the inline per-slot replays: the
     /// slot-leaf sponge tiles ride the wallet-PCS discharge's walk A and the
-    /// state/guard Merkle paths ride its walk B as extra legs, so exact-state
+    /// state Merkle paths ride its walk B as one extra leg, so exact-state
     /// verification is touched-slot-count flat AND the exact-state internal
     /// wiring residue (leaf↔path↔root) is closed in-trace. The frozen
-    /// `region_claims` grow by the extra walk-B leg claims. Only meaningful
+    /// `region_claims` grow by that walk-B leg's claims. Only meaningful
     /// when `region_params` is `Some` (the families ride those walks).
     pub exact_state_region: bool,
     /// When true, this block-bearing region class verifies the tx-root

@@ -1514,7 +1514,7 @@ async fn handle_swarm_event(
                         break 'build_manifest (GetStateManifestResponse::default(), None);
                     }
                 };
-                if snapshot_state.state_root() != snapshot_header.state_root {
+                if snapshot_state.try_state_root().ok() != Some(snapshot_header.state_root) {
                     tracing::warn!(
                         snapshot_height,
                         "state manifest build failed: reconstructed state root mismatch"
@@ -1628,7 +1628,6 @@ async fn handle_swarm_event(
                     segment_ids,
                     segment_roots,
                     recent_headers,
-                    reuse_guard_buckets: snapshot_state.reuse_guard.buckets().to_vec(),
                 };
                 break 'build_manifest (response, Some(encoded_segments));
             };
@@ -1672,15 +1671,6 @@ async fn handle_swarm_event(
                 }
                 if response.segment_ids.len() != response.segment_roots.len() {
                     tracing::warn!(from = %peer, "manifest: segment_ids/segment_roots length mismatch, dropping");
-                    return;
-                }
-                if response.reuse_guard_buckets.len() != noid_chain::REUSE_GUARD_BUCKETS {
-                    tracing::warn!(
-                        from = %peer,
-                        buckets = response.reuse_guard_buckets.len(),
-                        expected = noid_chain::REUSE_GUARD_BUCKETS,
-                        "manifest: reuse guard bucket count mismatch, dropping"
-                    );
                     return;
                 }
                 if !response.segment_ids.windows(2).all(|w| w[0] < w[1]) {

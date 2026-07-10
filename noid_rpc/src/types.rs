@@ -22,7 +22,6 @@ pub struct SlotInfo {
     pub slot_index: u32,
     pub value: u64,
     /// Alloc-counter incarnation assigned when this UTXO was minted.
-    #[serde(default)]
     pub creation_id: u64,
     pub owner: String,
     pub empty: bool,
@@ -103,7 +102,6 @@ pub struct WalletAddressInfo {
     pub utxo_count: usize,
     /// Whether this is the wallet's ACTIVE address (sends spend from it;
     /// one owner per transaction is a consensus rule).
-    #[serde(default)]
     pub is_active: bool,
 }
 
@@ -116,7 +114,6 @@ pub struct WalletStatus {
     /// this address only — one owner per transaction).
     pub address: String,
     /// The active address's key index.
-    #[serde(default)]
     pub active_index: u32,
     /// Confirmed balance of the ACTIVE address in μNOID.
     pub balance_micronoid: u64,
@@ -124,7 +121,6 @@ pub struct WalletStatus {
     pub balance_noid: f64,
     /// Total confirmed balance across ALL addresses in μNOID
     /// (informational — spending is per-address).
-    #[serde(default)]
     pub total_micronoid: u64,
     /// Number of confirmed UTXOs (all addresses).
     pub utxo_count: usize,
@@ -140,7 +136,6 @@ pub struct WalletBalance {
     pub total_micronoid: u64,
     pub total_noid: f64,
     /// Total across ALL derived addresses (informational).
-    #[serde(default)]
     pub all_addresses_micronoid: u64,
     pub utxo_count: usize,
     /// Confirmed UTXOs being spent by pending (mempool) txs.
@@ -157,7 +152,6 @@ pub struct WalletUtxoInfo {
     pub slot_index: u32,
     pub value_micronoid: u64,
     /// Alloc-counter incarnation committed alongside the amount.
-    #[serde(default)]
     pub creation_id: u64,
     pub value_noid: f64,
     pub address: String,

@@ -336,21 +336,11 @@ fn one_user_block_item() -> (
         start_state.alloc_counter,
     )
     .expect("exact action surface");
-    let state_transition = build_exact_state_transition_proof(
-        &parent_cache,
-        &surface,
-        &start_state.reuse_guard,
-        parent.height + 1,
-    )
+    let state_transition = build_exact_state_transition_proof(&parent_cache, &surface)
     .expect("exact proof");
 
     let mut child_state = start_state.clone();
     apply_tx(&mut child_state, &body).expect("native tx apply");
-    let mut child_guard = start_state.reuse_guard.clone();
-    child_guard
-        .apply_spends(parent.height + 1, &surface.spent_slots)
-        .expect("guard spend apply");
-    child_state.reuse_guard = child_guard;
     let child_state_root = child_state.cached_state_root();
     let timestamp = parent.timestamp + BLOCK_TIME;
     let mut header = BlockHeader {

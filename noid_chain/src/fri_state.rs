@@ -6,9 +6,9 @@
 //! The chain state is a vector of `2^log_slots` UTXO slots. Each slot is
 //! a `SlotValue { value, owner_hi, owner_lo }` tuple. Production block
 //! validation does not use the column opening as state proof authority: user
-//! blocks use the exact Poseidon2b sparse-Merkle UTXO root composed with the
-//! bounded `ReuseGuard` root. This module remains the raw segment storage
-//! utility used by the node, wallet scanner, and snapshot serializer.
+//! blocks use the exact Poseidon2b sparse-Merkle UTXO root. This module remains
+//! the raw segment storage utility used by the node, wallet scanner, and
+//! snapshot serializer.
 //!
 //! State transitions are **linear**: spending `slot_i` is `slot_i ← 0`,
 //! minting into `slot_j` is `slot_j ← new`. `apply_delta` applies a batch

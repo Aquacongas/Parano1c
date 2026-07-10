@@ -7,7 +7,7 @@
 //! schedule:
 //!
 //! ```text
-//! history_claim = Poseidon2b(HISTCLM_, fields[0..42])
+//! history_claim = Poseidon2b(HISTCLM_, fields[0..32])
 //! ```
 
 use noid_core::transcript::FiatShamir;
@@ -26,7 +26,7 @@ use crate::block_spine::{
     BlockSpineUnifiedReduction,
 };
 
-pub const HISTORY_CLAIM_FIELDS: usize = 42;
+pub const HISTORY_CLAIM_FIELDS: usize = 32;
 const HISTORY_CLAIM_BLOCKS: usize = HISTORY_CLAIM_FIELDS / 2;
 const HISTORY_CLAIM_PIN_LANES: usize = 2;
 const HISTORY_CLAIM_LINEAR_RELATION_TAG: u128 = 0x4849_5354_434C_4D01; // "HISTCLM"+1

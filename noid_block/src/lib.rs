@@ -6,7 +6,7 @@
 //! Current block validity is:
 //! - exact public transaction predicates reconstructed from `TxBody`;
 //! - one owner-batched authorization proof per non-coinbase transaction;
-//! - exact authenticated UTXO/ReuseGuard state transition.
+//! - exact authenticated UTXO state transition.
 
 pub mod accepted_block_batch;
 pub mod accepted_block_certificate;
@@ -48,13 +48,10 @@ pub use exact_state_killshot::{
     ExactStateKillShotError, ExactStateKillShotInputs, ExactStateKillShotProof,
 };
 pub use exact_state_transition::{
-    build_exact_state_transition_proof, derive_exact_composite_state_root_inputs,
-    derive_exact_guard_bucket_hash_inputs, derive_exact_guard_merkle_batch_inputs,
-    derive_exact_slot_leaf_batch_inputs, derive_exact_state_merkle_batch_inputs,
-    verify_exact_state_transition, ExactCompositeStateRootBatchInputs,
-    ExactGuardBucketHashBatchInputs, ExactGuardMerkleBatchInputs, ExactSlotLeafBatchInputs,
-    ExactStateMerkleBatchInputs, ExactStateTransitionError, ExactStateTransitionInputs,
-    ExactStateTransitionProof, GuardBucketUpdateProof, VerifiedStateTransition,
+    build_exact_state_transition_proof, derive_exact_slot_leaf_batch_inputs,
+    derive_exact_state_merkle_batch_inputs, verify_exact_state_transition,
+    ExactSlotLeafBatchInputs, ExactStateMerkleBatchInputs, ExactStateTransitionError,
+    ExactStateTransitionInputs, ExactStateTransitionProof, VerifiedStateTransition,
 };
 pub use history_claim::{
     accepted_state_transition_chain_claim, accepted_state_transition_claim_digest,
@@ -103,7 +100,7 @@ pub struct BlockPublicMeta {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BlockProof {
     pub meta: BlockPublicMeta,
-    /// Exact authenticated UTXO/ReuseGuard state transition proof.
+    /// Exact authenticated UTXO state transition proof.
     pub state_transition: BlockExactStateTransitionProof,
 }
 
@@ -545,7 +542,6 @@ mod tests {
             n_tx,
             ExactStateTransitionProof {
                 slot_siblings: Vec::new(),
-                guard_update: None,
             },
         )
     }

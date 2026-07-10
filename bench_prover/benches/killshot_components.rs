@@ -20,31 +20,29 @@ use noid_block::{
     prove_exact_state_killshot, verify_exact_state_killshot, ExactStateKillShotInputs,
 };
 use noid_chain::consensus::params::MAX_TARGET;
-use noid_chain::exact_state_hash::{composite_state_root, slot_leaf_hash};
+use noid_chain::exact_state_hash::slot_leaf_hash;
 use noid_chain::fri_state::SlotValue;
-use noid_chain::reuse_guard::{guard_bucket_hash, GuardBucket};
 use noid_core::{Block128, TowerField};
 use noid_gkr::OwnerAuthProofKillShot;
 use noid_gkr::{
     compute_merkle_root, compute_sweep_tx_body_hash, compute_tx_body_hash,
     discharge_block_spine_reductions_native, discharge_sweep_block_spine_reductions_native,
-    owner_auth_gkr_channel, prove_batched_guard_bucket_killshot, prove_batched_merkle_killshot,
-    prove_batched_slot_leaf_killshot, prove_batched_state_root_killshot,
+    owner_auth_gkr_channel, prove_batched_merkle_killshot,
+    prove_batched_slot_leaf_killshot,
     prove_block_spine_killshot, prove_chain_accumulator_killshot, prove_header_hash_killshot,
     prove_owner_auth_killshot, prove_sweep_block_spine_killshot, reconstruct_slot_states,
-    verify_batched_guard_bucket_killshot, verify_batched_merkle_killshot,
-    verify_batched_slot_leaf_killshot, verify_batched_state_root_killshot,
+    verify_batched_merkle_killshot, verify_batched_slot_leaf_killshot,
     verify_block_spine_killshot, verify_chain_accumulator_killshot, verify_header_hash_killshot,
     verify_owner_auth_killshot, verify_sweep_block_spine_killshot, BlockSpineMle,
-    ChainAccumulatorBatchInputs, ChainAccumulatorItem, CompositeStateRootInputs,
-    GuardBucketUpdateInputs, GuardLeafHashInputs, HeaderHashInputs, MerkleCircuit, MerklePathInputs, SlotLeafInputs,
+    ChainAccumulatorBatchInputs, ChainAccumulatorItem, HeaderHashInputs, MerkleCircuit,
+    MerklePathInputs, SlotLeafInputs,
     SpineCircuit, SpineInputs, SweepBlockSpineMle, SweepSpineCircuit, MAX_MERKLE_DEPTH,
 };
 use noid_poseidon2b::channel::Poseidon2bChannel;
 use noid_poseidon2b::native::compress;
 use noid_poseidon2b::native::compression::Poseidon2bSponge;
 use noid_poseidon2b::native::domain::{
-    capacity_iv, TAG_BLOCKHDR, TAG_COMPRESS, TAG_EXSTNOD, TAG_POWHDR, TAG_RGDNODE,
+    capacity_iv, TAG_BLOCKHDR, TAG_COMPRESS, TAG_EXSTNOD, TAG_POWHDR,
 };
 use noid_poseidon2b::native::permutation::STATE_SIZE;
 use noid_poseidon2b::primitives::Address;
@@ -281,56 +279,6 @@ fn slot_leaf_input(seed: u128) -> SlotLeafInputs {
     }
 }
 
-fn guard_leaf_input(bucket: &GuardBucket) -> GuardLeafHashInputs {
-    let (occupied, absolute_height, slots_digest) = match bucket {
-        GuardBucket::Empty => (false, 0, [noid_core::Block128::from(0u128); 2]),
-        GuardBucket::Occupied {
-            absolute_height,
-            spent_slots,
-        } => (
-            true,
-            *absolute_height,
-            noid_chain::reuse_guard::guard_slots_digest(spent_slots),
-        ),
-    };
-    GuardLeafHashInputs {
-        occupied,
-        absolute_height,
-        slots_digest,
-        expected_hash: digest_to_fields(guard_bucket_hash(bucket)),
-    }
-}
-
-fn guard_update_input(seed: u128, padded_spent_len: usize) -> GuardBucketUpdateInputs {
-    let base = (seed as u32).wrapping_mul(16);
-    let spent_slots = vec![base + 1, base + 3, base + 7, base + 15];
-    let old_bucket = GuardBucket::Empty;
-    let new_bucket = GuardBucket::Occupied {
-        absolute_height: 1_000 + seed as u64,
-        spent_slots: spent_slots.clone(),
-    };
-    GuardBucketUpdateInputs {
-        old_leaf: guard_leaf_input(&old_bucket),
-        new_leaf: guard_leaf_input(&new_bucket),
-        spent_slots,
-        padded_spent_len,
-    }
-}
-
-fn state_root_input(seed: u128) -> CompositeStateRootInputs {
-    let utxo_root = [seed as u8; 32];
-    let guard_root = [(seed as u8) ^ 0x5A; 32];
-    let log_slots = 24;
-    CompositeStateRootInputs {
-        log_slots,
-        utxo_root: digest_to_fields(utxo_root),
-        guard_root: digest_to_fields(guard_root),
-        expected_state_root: digest_to_fields(composite_state_root(
-            log_slots, utxo_root, guard_root,
-        )),
-    }
-}
-
 fn merkle_inputs(depth: usize, seed: u128) -> MerklePathInputs {
     merkle_inputs_with_tag(depth, seed, TAG_COMPRESS)
 }
@@ -358,25 +306,31 @@ fn merkle_inputs_with_tag(
 }
 
 fn exact_state_killshot_inputs(n: usize) -> ExactStateKillShotInputs {
-    let slot_leaves: Vec<_> = (0..(2 * n))
-        .map(|i| slot_leaf_input(0xE000 + i as u128))
+    let old_leaf = slot_leaf_input(0xE000);
+    let new_leaf = slot_leaf_input(0xE001);
+    let mut old_path =
+        merkle_inputs_with_tag(MAX_MERKLE_DEPTH, 0xE100, TAG_EXSTNOD);
+    let mut new_path =
+        merkle_inputs_with_tag(MAX_MERKLE_DEPTH, 0xE200, TAG_EXSTNOD);
+    for (path, leaf) in [(&mut old_path, &old_leaf), (&mut new_path, &new_leaf)] {
+        path.leaf = leaf.expected_leaf;
+        let circuit = MerkleCircuit::build_with_tag(TAG_EXSTNOD);
+        path.expected_root = compute_merkle_root(
+            &circuit,
+            path.leaf,
+            &path.siblings[..path.active_depth],
+            path.active_depth,
+        );
+    }
+    let slot_leaves = std::iter::repeat_n(old_leaf, n)
+        .chain(std::iter::repeat_n(new_leaf, n))
         .collect();
-    let state_paths: Vec<_> = (0..(2 * n))
-        .map(|i| merkle_inputs_with_tag(MAX_MERKLE_DEPTH, 0xE100 + i as u128 * 1000, TAG_EXSTNOD))
-        .collect();
-    let guard_buckets = guard_update_input(0xE200, 8);
-    let guard_paths: Vec<_> = (0..(2 * n))
-        .map(|i| merkle_inputs_with_tag(8, 0xE300 + i as u128 * 1000, TAG_RGDNODE))
-        .collect();
-    let state_roots: Vec<_> = (0..(2 * n))
-        .map(|i| state_root_input(0xE400 + i as u128))
+    let state_paths = std::iter::repeat_n(old_path, n)
+        .chain(std::iter::repeat_n(new_path, n))
         .collect();
     ExactStateKillShotInputs {
         slot_leaves,
         state_paths,
-        guard_buckets: Some(guard_buckets),
-        guard_paths: Some(guard_paths),
-        state_roots,
     }
 }
 
@@ -499,7 +453,7 @@ fn bench_merkle_many(n_paths: usize) {
 
 fn bench_exact_state_components(n: usize) {
     println!("  ---------------------------------------------------------------------");
-    println!("  Exact-state KillShot components: {n} leaves/buckets/roots");
+    println!("  Exact-state KillShot components: {n} slot leaves");
     println!("  ---------------------------------------------------------------------");
 
     let slot_inputs: Vec<_> = (0..n)
@@ -523,45 +477,6 @@ fn bench_exact_state_components(n: usize) {
         slot_verified == Some(slot_reductions)
     );
 
-    let bucket_inputs = guard_update_input(0xB000, 4 * n.max(1));
-    let (bucket_prove, (bucket_proof, bucket_reductions)) = time_once(|| {
-        let mut ch = Poseidon2bChannel::new();
-        prove_batched_guard_bucket_killshot(&bucket_inputs, &mut ch)
-    });
-    let (bucket_verify, bucket_verified) = time_once(|| {
-        let mut ch = Poseidon2bChannel::new();
-        verify_batched_guard_bucket_killshot(&bucket_proof, &bucket_inputs, &mut ch)
-    });
-
-    println!("    GuardBucket RGDBUCK_");
-    print_metric("prove", bucket_prove);
-    print_metric("verify", bucket_verify);
-    print_size("proof logical", bucket_proof.byte_len());
-    println!(
-        "    verify result             {}",
-        bucket_verified == Some(bucket_reductions)
-    );
-
-    let root_inputs: Vec<_> = (0..n)
-        .map(|i| state_root_input(0xA000 + i as u128))
-        .collect();
-    let (root_prove, (root_proof, root_reductions)) = time_once(|| {
-        let mut ch = Poseidon2bChannel::new();
-        prove_batched_state_root_killshot(&root_inputs, &mut ch)
-    });
-    let (root_verify, root_verified) = time_once(|| {
-        let mut ch = Poseidon2bChannel::new();
-        verify_batched_state_root_killshot(&root_proof, &root_inputs, &mut ch)
-    });
-
-    println!("    CompositeStateRoot EXSTROT_");
-    print_metric("prove", root_prove);
-    print_metric("verify", root_verify);
-    print_size("proof logical", root_proof.byte_len());
-    println!(
-        "    verify result             {}",
-        root_verified == Some(root_reductions)
-    );
     println!();
 }
 
@@ -578,15 +493,6 @@ fn bench_exact_state_composed(n: usize) {
     print_size("proof logical", proof.byte_len(&inputs));
     println!("    slot leaf claims          {}", inputs.slot_leaves.len());
     println!("    state paths               {}", inputs.state_paths.len());
-    println!(
-        "    guard bucket claims       {}",
-        inputs.guard_buckets.as_ref().map_or(0, |u| u.spent_slots.len())
-    );
-    println!(
-        "    guard paths               {}",
-        inputs.guard_paths.as_ref().map_or(0, Vec::len)
-    );
-    println!("    state root claims         {}", inputs.state_roots.len());
     println!("    verify result             {verified}");
     println!();
 }

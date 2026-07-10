@@ -246,7 +246,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_previous_unversioned_intent_epoch() {
+    fn rejects_missing_format_marker() {
         let intent = TxIntent {
             tx_body: mk_body(),
             tx_body_hash: TxBodyHash([0; 32]),

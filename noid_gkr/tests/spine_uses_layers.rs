@@ -12,8 +12,8 @@ use noid_gkr::layers::evaluate_permutation;
 use noid_gkr::oracle::evaluate_spine;
 use noid_poseidon2b::native::domain::capacity_iv;
 use noid_poseidon2b::primitives::{
-    derive_address, fee_leaf, hash_input_leaf, hash_output_leaf, hash_tx_body, is_coinbase_leaf,
-    Address, Digest, SpendSecret, TXBODY_INPUTS, TXBODY_OUTPUTS,
+    derive_address, fee_leaf, hash_input_leaf_packed, hash_output_leaf, hash_tx_body,
+    is_coinbase_leaf, Address, Digest, SpendSecret, TXBODY_INPUTS, TXBODY_OUTPUTS,
 };
 
 fn digest_to_fields(d: &Digest) -> [Block128; 2] {
@@ -77,10 +77,10 @@ fn oracle_output_equals_native_with_layered_cross_check() {
 
     // Native reference.
     let ins_d: [Digest; TXBODY_INPUTS] = [
-        hash_input_leaf(0, 100, &addrs[0]),
-        hash_input_leaf(1, 200, &addrs[1]),
-        hash_input_leaf(2, 300, &addrs[2]),
-        hash_input_leaf(3, 400, &addrs[3]),
+        hash_input_leaf_packed(0, Block128::from(100u128), &addrs[0]),
+        hash_input_leaf_packed(1, Block128::from(200u128), &addrs[1]),
+        hash_input_leaf_packed(2, Block128::from(300u128), &addrs[2]),
+        hash_input_leaf_packed(3, Block128::from(400u128), &addrs[3]),
     ];
     let outs_d: [Digest; TXBODY_OUTPUTS] = [
         hash_output_leaf(10, 50, &addrs[0]),

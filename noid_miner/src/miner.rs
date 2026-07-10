@@ -985,12 +985,8 @@ mod tests {
             .state
             .exact_sparse_cache()
             .expect("build exact sparse cache");
-        let exact_state_transition = noid_block::build_exact_state_transition_proof(
-            &exact_cache,
-            &exact_surface,
-            &pre_state.reuse_guard,
-            parent.height + 1,
-        )
+        let exact_state_transition =
+            noid_block::build_exact_state_transition_proof(&exact_cache, &exact_surface)
         .expect("build exact state proof");
 
         let txs: Vec<Transaction> = user_bodies.into_iter().map(tx_from_body).collect();

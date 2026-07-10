@@ -42,6 +42,9 @@ pub enum ReorgError {
     BlockApplyFailed { height: u64, error: ConsensusError },
     /// Required undo log is missing (should not happen within finality window).
     MissingUndoLog { height: u64 },
+    /// Reverted slots did not leave an empty upper half, or the exact parent
+    /// root could not be rebuilt.
+    StateRollbackFailed { height: u64 },
 }
 
 // ---------------------------------------------------------------------------
@@ -98,12 +101,6 @@ pub fn revert_state_counters(state: &mut ChainState, undo: &BlockUndoLog) {
     state.alloc_counter = undo.alloc_counter_before;
 }
 
-pub fn revert_reuse_guard(state: &mut ChainState, undo: &BlockUndoLog) {
-    state.reuse_guard =
-        crate::reuse_guard::ReuseGuard::from_buckets(undo.reuse_guard_before.clone())
-            .expect("undo log must contain canonical ReuseGuard buckets");
-}
-
 /// Apply a chain reorg: revert to `ancestor_height` then apply `new_blocks`.
 ///
 /// On success: `ctx` reflects the new canonical chain.
@@ -116,6 +113,9 @@ pub fn apply_reorg(
     ancestor_height: u64,
     new_blocks: &[(Block, u64)],
 ) -> Result<ReorgResult, ReorgError> {
+    if ancestor_height > ctx.tip_height {
+        return Err(ReorgError::NoCommonAncestor);
+    }
     let reorg_depth = ctx.tip_height.saturating_sub(ancestor_height);
 
     if reorg_depth > CONSENSUS_FINALITY_DEPTH {
@@ -135,31 +135,50 @@ pub fn apply_reorg(
     let mut reverted_heights = Vec::new();
     let mut reclaimed_hashes: Vec<TxBodyHash> = Vec::new();
 
-    for height in (ancestor_height + 1..=ctx.tip_height).rev() {
-        let undo = ctx
-            .undo_logs
-            .get(&height)
-            .ok_or(ReorgError::MissingUndoLog { height })?
-            .clone();
+    let revert_result = (|| -> Result<(), ReorgError> {
+        for height in (ancestor_height + 1..=ctx.tip_height).rev() {
+            let undo = ctx
+                .undo_logs
+                .get(&height)
+                .ok_or(ReorgError::MissingUndoLog { height })?
+                .clone();
 
-        // Collect tx hashes for mempool re-admission.
-        reclaimed_hashes.extend_from_slice(&undo.tx_hashes);
+            reclaimed_hashes.extend_from_slice(&undo.tx_hashes);
+            revert_block(&mut ctx.state.state, &undo);
+            ctx.state
+                .state
+                .shrink_to_log_slots(undo.log_slots_before as usize)
+                .map_err(|_| ReorgError::StateRollbackFailed { height })?;
+            ctx.state
+                .rebuild_exact_utxo_root_loaded()
+                .map_err(|_| ReorgError::StateRollbackFailed { height })?;
+            revert_state_counters(&mut ctx.state, &undo);
+            let parent = ctx
+                .headers
+                .get(&(height - 1))
+                .ok_or(ReorgError::StateRollbackFailed { height })?;
+            if undo.log_slots_before != parent.log_slots
+                || ctx.state.state.log_slots() as u32 != parent.log_slots
+                || ctx.state.utxo_root != parent.state_root
+                || ctx.state.active_slot_count != parent.active_slot_count
+                || ctx.state.alloc_counter != parent.alloc_counter
+            {
+                return Err(ReorgError::StateRollbackFailed { height });
+            }
 
-        // Revert UTXO slot data.
-        revert_block(&mut ctx.state.state, &undo);
-        ctx.state
-            .rebuild_exact_utxo_root_loaded()
-            .expect("in-memory reorg state must be fully loaded");
-        revert_reuse_guard(&mut ctx.state, &undo);
-
-        // Revert active_slot_count and alloc_counter.
-        // Without this, the counters stay at the post-reorg tip values and the
-        // next validate_block_consensus call would fail HeaderActiveSlotCountMismatch.
-        revert_state_counters(&mut ctx.state, &undo);
-
-        ctx.undo_logs.remove(&height);
-        ctx.headers.remove(&height);
-        reverted_heights.push(height);
+            ctx.undo_logs.remove(&height);
+            ctx.headers.remove(&height);
+            reverted_heights.push(height);
+        }
+        Ok(())
+    })();
+    if let Err(error) = revert_result {
+        ctx.state = state_snapshot;
+        ctx.headers = headers_snapshot;
+        ctx.tip_height = tip_height_snapshot;
+        ctx.tip_hash = tip_hash_snapshot;
+        ctx.undo_logs = undo_logs_snapshot;
+        return Err(error);
     }
 
     ctx.tip_height = ancestor_height;
@@ -305,12 +324,6 @@ mod tests {
         for tx in &txs {
             apply_tx(&mut dry, &tx.body).expect("test tx applies to dry state");
         }
-        crate::block::advance_reuse_state(
-            &mut dry,
-            parent.height + 1,
-            &crate::block::block_spent_slots(&txs),
-        )
-        .expect("test guard advances");
         let header = BlockHeader {
             prev_block_hash: block_id(&parent),
             state_root: dry.state_root(),
@@ -469,14 +482,54 @@ mod tests {
     }
 
     #[test]
+    fn apply_reorg_rejects_future_ancestor_without_mutation() {
+        let mut ctx = ChainContext::init_from_easy_genesis();
+        let before_root = ctx.state.cached_state_root();
+        let before_hash = ctx.tip_hash;
+        assert!(matches!(
+            apply_reorg(&mut ctx, 1, &[]),
+            Err(ReorgError::NoCommonAncestor)
+        ));
+        assert_eq!(ctx.tip_height, 0);
+        assert_eq!(ctx.tip_hash, before_hash);
+        assert_eq!(ctx.state.cached_state_root(), before_root);
+    }
+
+    #[test]
+    fn tampered_undo_depth_fails_and_restores_pre_reorg_snapshot() {
+        let mut ctx = init_small_easy_context();
+        let block = build_empty_block(&mut ctx);
+        ctx.apply_next_block(&block, block.header.timestamp + 1)
+            .unwrap();
+        ctx.undo_logs
+            .get_mut(&1)
+            .expect("height-1 undo")
+            .log_slots_before = (TEST_LOG_SLOTS + 1) as u32;
+
+        let before_root = ctx.state.cached_state_root();
+        let before_hash = ctx.tip_hash;
+        let before_log_slots = ctx.state.state.log_slots();
+        assert!(matches!(
+            apply_reorg(&mut ctx, 0, &[]),
+            Err(ReorgError::StateRollbackFailed { height: 1 })
+        ));
+        assert_eq!(ctx.tip_height, 1);
+        assert_eq!(ctx.tip_hash, before_hash);
+        assert_eq!(ctx.state.cached_state_root(), before_root);
+        assert_eq!(ctx.state.state.log_slots(), before_log_slots);
+        assert!(ctx.headers.contains_key(&1));
+        assert!(ctx.undo_logs.contains_key(&1));
+    }
+
+    #[test]
     fn revert_state_counters_restores_exact_snapshot() {
         let undo = BlockUndoLog {
             block_height: 5,
+            log_slots_before: 6,
             active_slot_count_before: 2,
             alloc_counter_before: 6,
             slot_changes: vec![(10, SlotValue::EMPTY)],
             tx_hashes: vec![],
-            reuse_guard_before: std::array::from_fn(|_| crate::reuse_guard::GuardBucket::Empty),
         };
         let mut state = crate::state::ChainState::with_log_slots(6);
         state.active_slot_count = 99;
@@ -493,11 +546,11 @@ mod tests {
         // values without trying to interpret slot_changes.
         let undo = BlockUndoLog {
             block_height: 5,
+            log_slots_before: 6,
             active_slot_count_before: 17,
             alloc_counter_before: 29,
             slot_changes: vec![(10, SlotValue::EMPTY), (11, SlotValue::EMPTY)],
             tx_hashes: vec![],
-            reuse_guard_before: std::array::from_fn(|_| crate::reuse_guard::GuardBucket::Empty),
         };
         let mut state = crate::state::ChainState::with_log_slots(6);
         state.active_slot_count = 0;

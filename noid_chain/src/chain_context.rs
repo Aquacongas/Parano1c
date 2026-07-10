@@ -41,7 +41,7 @@ pub struct ChainContext {
     /// 212 bytes × N blocks (≈ 1.1 GB after 10 years at 1 block/min).
     pub headers: HashMap<u64, BlockHeader>,
 
-    /// Current exact UTXO/ReuseGuard chain state.
+    /// Current exact UTXO chain state.
     pub state: ChainState,
 
     /// Compact undo logs for the last `UNDO_RETENTION_DEPTH` blocks.
@@ -142,7 +142,6 @@ impl ChainContext {
     /// On success:
     /// - `state` is updated to the post-block UTXO state
     /// - the block's header is stored in `headers`
-    /// - the ReuseGuard is updated
     /// - a new undo log is appended
     /// - old undo logs (> UNDO_RETENTION_DEPTH blocks old) are pruned
     /// - `tip_height` and `tip_hash` are updated

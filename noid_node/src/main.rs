@@ -416,10 +416,10 @@ async fn main() -> anyhow::Result<()> {
     // --- Storage ---
     tracing::debug!(path = %data_dir.display(), "opening MDBX");
     if cli.purge_state {
-        tracing::info!("--purge-state: clearing volatile state before startup");
+        tracing::info!("--purge-state: clearing the chain database before startup");
         let tmp_store =
             noid_chain::storage::MdbxStore::open(&data_dir).context("open MDBX for purge")?;
-        tmp_store.clear_for_restart().context("purge state")?;
+        tmp_store.clear_all().context("purge state")?;
         drop(tmp_store);
     }
     let ctx = MdbxChainContext::open_or_create(&data_dir).context("open MDBX")?;
@@ -1661,7 +1661,6 @@ mod tests {
             0,
             noid_block::ExactStateTransitionProof {
                 slot_siblings: vec![],
-                guard_update: None,
             },
         )
     }
@@ -3237,15 +3236,6 @@ async fn handle_p2p_events(
                         );
                         continue;
                     }
-                    if manifest.reuse_guard_buckets.len() != noid_chain::REUSE_GUARD_BUCKETS {
-                        tracing::warn!(
-                            from = %from,
-                            buckets = manifest.reuse_guard_buckets.len(),
-                            expected = noid_chain::REUSE_GUARD_BUCKETS,
-                            "manifest reuse guard bucket count mismatch — dropping"
-                        );
-                        continue;
-                    }
                     if !manifest.segment_ids.windows(2).all(|w| w[0] < w[1]) {
                         tracing::warn!(from = %from, "manifest segment IDs are not strictly sorted — dropping");
                         continue;
@@ -4115,7 +4105,6 @@ async fn apply_verified_snapshot_with_suffix(
             manifest.alloc_counter,
             segments,
             &manifest.recent_headers,
-            &manifest.reuse_guard_buckets,
         );
         r.map(|_| {
             let view = ChainView::from_mdbx(&ctx);

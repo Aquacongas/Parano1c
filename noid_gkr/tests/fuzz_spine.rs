@@ -22,8 +22,8 @@ use noid_core::Block128;
 use noid_gkr::circuit::{SpineCircuit, SpineInputs};
 use noid_gkr::oracle::evaluate_spine;
 use noid_poseidon2b::primitives::{
-    derive_address, fee_leaf, hash_input_leaf, hash_output_leaf, hash_tx_body, is_coinbase_leaf,
-    Address, Digest, SpendSecret, TxBodyHash, TXBODY_INPUTS, TXBODY_OUTPUTS,
+    derive_address, fee_leaf, hash_input_leaf_packed, hash_output_leaf, hash_tx_body,
+    is_coinbase_leaf, Address, Digest, SpendSecret, TxBodyHash, TXBODY_INPUTS, TXBODY_OUTPUTS,
 };
 use rand::rngs::StdRng;
 use rand::{Rng, RngCore, SeedableRng};
@@ -117,10 +117,26 @@ fn gkr_oracle_matches_native_over_random_fixtures() {
         ];
 
         let ins_d: [Digest; TXBODY_INPUTS] = [
-            hash_input_leaf(in_slots[0], in_values[0], &owners[0]),
-            hash_input_leaf(in_slots[1], in_values[1], &owners[1]),
-            hash_input_leaf(in_slots[2], in_values[2], &owners[2]),
-            hash_input_leaf(in_slots[3], in_values[3], &owners[3]),
+            hash_input_leaf_packed(
+                in_slots[0],
+                Block128::from(in_values[0] as u128),
+                &owners[0],
+            ),
+            hash_input_leaf_packed(
+                in_slots[1],
+                Block128::from(in_values[1] as u128),
+                &owners[1],
+            ),
+            hash_input_leaf_packed(
+                in_slots[2],
+                Block128::from(in_values[2] as u128),
+                &owners[2],
+            ),
+            hash_input_leaf_packed(
+                in_slots[3],
+                Block128::from(in_values[3] as u128),
+                &owners[3],
+            ),
         ];
         let outs_d: [Digest; TXBODY_OUTPUTS] = [
             hash_output_leaf(out_slots[0], out_values[0], &owners[0]),

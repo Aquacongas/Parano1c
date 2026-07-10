@@ -24,8 +24,9 @@ use noid_gkr::{
 };
 use noid_poseidon2b::channel::Poseidon2bChannel;
 use noid_poseidon2b::primitives::{
-    fee_leaf, hash_input_leaf, hash_output_leaf, hash_tx_body_sweep25x2, is_coinbase_leaf,
-    tx_shape_leaf, Address, Digest, TxBodyHash, SWEEP_TXBODY_INPUTS, SWEEP_TXBODY_OUTPUTS,
+    fee_leaf, hash_input_leaf_packed, hash_output_leaf, hash_tx_body_sweep25x2,
+    is_coinbase_leaf, tx_shape_leaf, Address, Digest, TxBodyHash, SWEEP_TXBODY_INPUTS,
+    SWEEP_TXBODY_OUTPUTS,
 };
 
 fn digest_to_fields(d: &Digest) -> [Block128; 2] {
@@ -71,7 +72,8 @@ fn fixture(is_coinbase: bool) -> (SweepSpineInputs, TxBodyHash) {
         let slot = 10 + i as u32;
         let value = 1_000 + i as u64;
         input_payloads[i] = payload(slot, value, &owner);
-        input_leaves[i] = hash_input_leaf(slot, value, &owner);
+        input_leaves[i] =
+            hash_input_leaf_packed(slot, Block128::from(value as u128), &owner);
     }
 
     let mut output_payloads = [[Block128::ZERO; 4]; SWEEP_TXBODY_OUTPUTS];
