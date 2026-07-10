@@ -27,7 +27,7 @@ use noid_chain::block::{compute_tx_root, validate_block_proof_binding, Block};
 use noid_chain::block_header::BlockHeader;
 use noid_chain::consensus::validation::{
     validate_block_checks, validate_block_checks_timeless, validate_block_resource_preflight,
-    AnchorInfo,
+    validate_mandatory_coinbase, AnchorInfo,
 };
 use noid_chain::consensus::wire_limits::{
     block_resource_weight_ok, proof_sidecar_combined_len_ok, MAX_BLOCK_AUTH_SIDECAR_BYTES,
@@ -903,7 +903,7 @@ fn accept_block_inner_with_artifacts<V: AuthorizationVerifier>(
                 noid_chain::consensus::ConsensusError::BadTxRoot,
             ));
         }
-        let artifacts = derive_no_user_tx_validation_artifacts(block, parent, state)?;
+        let artifacts = derive_coinbase_only_validation_artifacts(block, parent, state)?;
         let applied_root = state
             .apply_verified_exact_transition(
                 artifacts.verified_transition.log_slots(),
@@ -967,16 +967,25 @@ fn accept_block_inner_with_artifacts<V: AuthorizationVerifier>(
     })
 }
 
-/// Derive proof-facing accepted-transition artifacts for a block with no user bodies.
+/// Derive proof-facing accepted-transition artifacts for a canonical
+/// coinbase-only block.
 ///
-/// Callers must run header/consensus checks before treating the result as an
-/// accepted block. This helper exists so coinbase-only and empty blocks produce
-/// the same sealed state-transition surface as proof-carrying blocks.
-pub fn derive_no_user_tx_validation_artifacts(
+/// The shared mandatory-coinbase predicate runs before any state boundary or
+/// exact-surface work, so direct callers cannot use this helper to turn a
+/// structurally empty child into an accepted transition.
+fn derive_coinbase_only_validation_artifacts(
     block: &Block,
     parent: &BlockHeader,
     state: &ChainState,
 ) -> Result<AcceptedBlockValidationArtifacts, FullValidationError> {
+    validate_mandatory_coinbase(block, parent).map_err(FullValidationError::Consensus)?;
+    if block.transactions.len() != 1 {
+        return Err(FullValidationError::Consensus(
+            noid_chain::consensus::ConsensusError::ShapeMismatch(
+                "coinbase-only artifact derivation received user transactions".into(),
+            ),
+        ));
+    }
     validate_parent_state_boundary(parent, state)?;
     let surface =
         build_exact_surface_for_block(block, state).map_err(FullValidationError::ZkProof)?;
@@ -998,7 +1007,7 @@ pub fn derive_no_user_tx_validation_artifacts(
         .exact_utxo_root_after_slot_updates(block.header.log_slots, &slot_updates)
         .map_err(|e| {
             FullValidationError::Consensus(noid_chain::consensus::ConsensusError::ShapeMismatch(
-                format!("no-user exact UTXO root derivation failed: {e:?}"),
+                format!("coinbase-only exact UTXO root derivation failed: {e:?}"),
             ))
         })?;
     let verified = crate::VerifiedStateTransition::from_verified_no_spend_native(
@@ -1150,7 +1159,7 @@ mod tests {
     }
 
     #[test]
-    fn no_user_tx_coinbase_block_returns_history_claim_artifacts() {
+    fn coinbase_only_block_returns_history_claim_artifacts() {
         let mut state = ChainState::with_log_slots(TEST_LOG_SLOTS);
         let parent = history_parent(&mut state);
         let template = build_block_template(
@@ -1208,10 +1217,10 @@ mod tests {
     }
 
     #[test]
-    fn empty_noop_block_still_returns_deterministic_history_claim() {
+    fn coinbase_only_artifact_derivation_rejects_empty_before_state_boundary() {
         let mut state = ChainState::with_log_slots(TEST_LOG_SLOTS);
         let parent = history_parent(&mut state);
-        let mut header = BlockHeader {
+        let header = BlockHeader {
             prev_block_hash: noid_chain::hash_block_header(&parent),
             state_root: parent.state_root,
             tx_root: compute_tx_root(&[]),
@@ -1224,34 +1233,44 @@ mod tests {
             active_slot_count: parent.active_slot_count,
             alloc_counter: parent.alloc_counter,
         };
-        header.nonce =
-            search_pow(&header, 0, 100_000_000).expect("test target should mine quickly");
         let block = Block {
             header,
             transactions: vec![],
         };
-        let out = accept_block_timeless_with_artifacts(
-            &block,
-            &[],
-            &[],
-            &parent,
-            &[parent.timestamp],
-            &[parent.active_slot_count],
-            &history_anchor(&parent),
-            &mut state,
-        )
-        .expect("empty block accepted with no-op artifacts");
+        let mut mismatched_state = state.clone();
+        mismatched_state.alloc_counter += 1;
+        let direct_err =
+            derive_coinbase_only_validation_artifacts(&block, &parent, &mismatched_state)
+                .expect_err("direct artifact derivation must enforce the mandatory coinbase");
+        assert!(matches!(
+            direct_err,
+            FullValidationError::Consensus(noid_chain::consensus::ConsensusError::MissingCoinbase)
+        ));
 
-        let claim = crate::AcceptedStateTransitionClaim::from_accepted_block(
-            &block,
+        let template = build_block_template(
             &parent,
-            &out.artifacts,
+            &state,
+            &[parent.active_slot_count],
+            vec![],
+            Address([0x55; 32]),
+            parent.timestamp + BLOCK_TIME,
+            GENESIS_TARGET,
         )
-        .expect("history claim from no-op artifacts");
-        assert_ne!(claim.claim_digest, [0u8; 32]);
-        assert_eq!(claim.touched_slot_count, 0);
-        assert_eq!(claim.action_count, 0);
-        assert_eq!(claim.child_state_root, parent.state_root);
+        .expect("coinbase-only template");
+        let mut block_with_user = Block {
+            header: template.clone().into_header(0),
+            transactions: template.all_txs(),
+        };
+        block_with_user
+            .transactions
+            .push(make_transaction(make_spend_body(1)));
+        let direct_err =
+            derive_coinbase_only_validation_artifacts(&block_with_user, &parent, &mismatched_state)
+                .expect_err("coinbase-only artifact derivation must reject user transactions");
+        assert!(matches!(
+            direct_err,
+            FullValidationError::Consensus(noid_chain::consensus::ConsensusError::ShapeMismatch(_))
+        ));
     }
 
     fn make_spend_body(slot: u32) -> TxBody {

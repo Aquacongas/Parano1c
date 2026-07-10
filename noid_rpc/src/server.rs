@@ -111,16 +111,6 @@ fn history_claim_fields_bytes(
     Ok(bincode::serialize(&claim.fields().to_vec()).expect("history claim fields serialize"))
 }
 
-fn map_history_claim_error(
-    error: noid_block::FullValidationError,
-) -> noid_chain::storage::MdbxContextError {
-    noid_chain::storage::MdbxContextError::Consensus(
-        noid_chain::consensus::ConsensusError::ShapeMismatch(format!(
-            "history claim derivation failed: {error}"
-        )),
-    )
-}
-
 #[inline]
 fn snapshot_suffix_is_retained(tip_height: u64, proof_height: u64) -> bool {
     proof_height <= tip_height
@@ -1046,21 +1036,7 @@ impl ParanoidApiServer for RpcHandler {
         // proven transition, then commit atomically to MDBX.
         let (hash, new_view) = {
             let mut ctx = self.chain.write().await;
-            let mut history_claim_bytes = if block.transactions.iter().all(|tx| tx.body.is_coinbase)
-            {
-                let parent = *ctx.tip_header();
-                let artifacts =
-                    noid_block::derive_no_user_tx_validation_artifacts(&block, &parent, &ctx.state)
-                        .map_err(map_history_claim_error)
-                        .map_err(|e| rpc_err(format!("consensus: {e}")))?;
-                Some(
-                    history_claim_fields_bytes(&block, &parent, &artifacts)
-                        .map_err(map_history_claim_error)
-                        .map_err(|e| rpc_err(format!("consensus: {e}")))?,
-                )
-            } else {
-                None
-            };
+            let mut history_claim_bytes = None;
             ctx.apply_next_block(
                 &block,
                 &block_proof_bytes,

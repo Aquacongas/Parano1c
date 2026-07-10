@@ -1150,16 +1150,6 @@ fn accepted_block_certificate_record_bytes(
     Ok(bincode::serialize(&record).expect("AcceptedBlockCertificateRecord serializes"))
 }
 
-fn map_acceptance_artifact_error(
-    error: noid_block::FullValidationError,
-) -> noid_chain::storage::MdbxContextError {
-    noid_chain::storage::MdbxContextError::Consensus(
-        noid_chain::consensus::ConsensusError::ShapeMismatch(format!(
-            "acceptance artifact derivation failed: {error}"
-        )),
-    )
-}
-
 /// Inputs of the accepted-block certificate record build, captured under the
 /// chain write lock and proved after it is released (the receipt-projection
 /// prove takes tens of milliseconds and needs no chain state).
@@ -1209,31 +1199,10 @@ async fn apply_p2p_block_offthread(
     let chain = chain.clone();
     tokio::task::spawn_blocking(move || {
         let block_height = block.header.height;
-        let is_coinbase_only = block.transactions.iter().all(|tx| tx.body.is_coinbase);
         let mut history_claim_bytes = None;
         let mut certificate_inputs: Option<CertificateRecordInputs> = None;
 
         let mut ctx = chain.blocking_write();
-        if is_coinbase_only {
-            let parent = *ctx.tip_header();
-            let prev_timestamps = ctx.prev_timestamps();
-            let prev_active_counts = ctx.prev_active_counts();
-            let anchor = ctx.anchor_info();
-            let artifacts =
-                noid_block::derive_no_user_tx_validation_artifacts(&block, &parent, &ctx.state)
-                    .map_err(map_acceptance_artifact_error)?;
-            history_claim_bytes = Some(
-                history_claim_fields_bytes(&block, &parent, &artifacts)
-                    .map_err(map_acceptance_artifact_error)?,
-            );
-            certificate_inputs = Some(CertificateRecordInputs {
-                parent,
-                prev_timestamps,
-                prev_active_counts,
-                anchor,
-                artifacts,
-            });
-        }
         let hash = ctx.apply_next_block(
             &block,
             &block_proof_bytes,
@@ -1396,38 +1365,8 @@ async fn apply_reorg_offthread(
                             ),
                         )
                     })?;
-                let is_coinbase_only = block.transactions.iter().all(|tx| tx.body.is_coinbase);
-                let (mut history_claim_bytes, mut certificate_record_bytes) = if is_coinbase_only {
-                    let parent = *ctx.tip_header();
-                    let prev_timestamps = ctx.prev_timestamps();
-                    let prev_active_counts = ctx.prev_active_counts();
-                    let anchor = ctx.anchor_info();
-                    let artifacts = noid_block::derive_no_user_tx_validation_artifacts(
-                        block, &parent, &ctx.state,
-                    )
-                    .map_err(map_acceptance_artifact_error)?;
-                    (
-                        Some(
-                            history_claim_fields_bytes(block, &parent, &artifacts)
-                                .map_err(map_acceptance_artifact_error)?,
-                        ),
-                        Some(
-                            accepted_block_certificate_record_bytes(
-                                block,
-                                &parent,
-                                &prev_timestamps,
-                                &prev_active_counts,
-                                &anchor,
-                                proof_bytes,
-                                auth_sidecar_bytes,
-                                &artifacts,
-                            )
-                            .map_err(map_acceptance_artifact_error)?,
-                        ),
-                    )
-                } else {
-                    (None, None)
-                };
+                let mut history_claim_bytes = None;
+                let mut certificate_record_bytes = None;
                 ctx.apply_next_block(
                     block,
                     proof_bytes,
@@ -1621,9 +1560,9 @@ mod tests {
         }
     }
 
-    fn test_empty_child(
+    fn test_coinbase_child(
         parent: &noid_chain::BlockHeader,
-        state: &mut noid_chain::ChainState,
+        state: &noid_chain::ChainState,
     ) -> noid_chain::block::Block {
         let timestamp = parent.timestamp + noid_chain::consensus::params::BLOCK_TIME;
         let difficulty_target = noid_chain::consensus::difficulty::next_target(
@@ -1633,24 +1572,23 @@ mod tests {
             parent.height + 1,
             timestamp,
         );
-        let mut header = noid_chain::BlockHeader {
-            prev_block_hash: noid_chain::hash_block_header(parent),
-            state_root: state.state_root(),
-            tx_root: noid_chain::compute_tx_root(&[]),
+        let template = noid_chain::consensus::build_block_template(
+            parent,
+            state,
+            &[parent.active_slot_count],
+            vec![],
+            noid_poseidon2b::primitives::Address([0x22; 32]),
             timestamp,
-            height: parent.height + 1,
-            miner_address: noid_poseidon2b::primitives::Address([0x22; 32]),
-            nonce: 0,
             difficulty_target,
-            log_slots: parent.log_slots,
-            active_slot_count: parent.active_slot_count,
-            alloc_counter: parent.alloc_counter,
-        };
+        )
+        .expect("canonical coinbase child template");
+        let transactions = template.all_txs();
+        let mut header = template.into_header(0);
         header.nonce = noid_chain::consensus::pow::search_pow(&header, 0, 1_000_000)
             .expect("easy test target mines");
         noid_chain::block::Block {
             header,
-            transactions: vec![],
+            transactions,
         }
     }
 
@@ -1722,8 +1660,7 @@ mod tests {
             high_start_work,
         )
         .expect("start anchor computes");
-        let mut block_state = state.clone();
-        let block = test_empty_child(&h0, &mut block_state);
+        let block = test_coinbase_child(&h0, &state);
         let witness = noid_block::FullAcceptedBlockBatchWitness {
             items: vec![noid_block::FullAcceptedBlockBatchItem {
                 block,

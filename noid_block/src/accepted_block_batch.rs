@@ -1517,6 +1517,7 @@ fn tx_root_merkle_inputs(block: &Block) -> Result<Vec<MerklePathInputs>, ()> {
 mod tests {
     use super::*;
     use noid_chain::block::{compute_tx_root, Block};
+    use noid_chain::build_exact_action_surface;
     use noid_chain::consensus::difficulty::{block_work, next_target};
     use noid_chain::consensus::fees::required_fee_for_tx_body;
     use noid_chain::consensus::params::{BLOCK_TIME, MAX_TARGET};
@@ -1524,7 +1525,6 @@ mod tests {
     use noid_chain::consensus::template::build_block_template;
     use noid_chain::fri_state::SlotValue;
     use noid_chain::header_anchor::compute_header_chain_anchor;
-    use noid_chain::{apply_tx, build_exact_action_surface};
     use noid_core::{Block128, TowerField};
     use noid_gkr::{
         owner_auth_gkr_channel, owner_auth_inputs_from_body_and_live_secrets,
@@ -1550,39 +1550,8 @@ mod tests {
         }
     }
 
-    fn empty_child(parent: &BlockHeader, state: &mut ChainState) -> Block {
-        let timestamp = parent.timestamp + BLOCK_TIME;
-        let difficulty_target = next_target(
-            0,
-            parent.timestamp,
-            &parent.difficulty_target,
-            parent.height + 1,
-            timestamp,
-        );
-        let mut header = BlockHeader {
-            prev_block_hash: hash_block_header(parent),
-            state_root: state.state_root(),
-            tx_root: compute_tx_root(&[]),
-            timestamp,
-            height: parent.height + 1,
-            miner_address: Address([0x22; 32]),
-            nonce: 0,
-            difficulty_target,
-            log_slots: parent.log_slots,
-            active_slot_count: parent.active_slot_count,
-            alloc_counter: parent.alloc_counter,
-        };
-        header.nonce = search_pow(&header, 0, 64_000_000).expect("easy test target mines");
-        Block {
-            header,
-            transactions: vec![],
-        }
-    }
-
     /// A real coinbase-only child (one minting transaction, no detached
-    /// block proof or authorization sidecar).  Keep this separate from
-    /// `empty_child`: no-user blocks have two distinct action surfaces and
-    /// the C0 matrix diagnostic must not accidentally exercise the no-op one.
+    /// block proof or authorization sidecar).
     fn coinbase_only_child(parent: &BlockHeader, state: &ChainState) -> Block {
         let timestamp = parent.timestamp + BLOCK_TIME;
         let difficulty_target = next_target(
@@ -1704,52 +1673,49 @@ mod tests {
         body.fee = required_fee as u128;
         body.outputs[0].value = input_value.saturating_sub(required_fee);
         let tx = tx_from_body(body.clone());
-        let txs = vec![tx.clone()];
+
+        let timestamp = parent.timestamp + BLOCK_TIME;
+        let difficulty_target =
+            next_target(0, parent.timestamp, &parent.difficulty_target, 1, timestamp);
+        let template = build_block_template(
+            &parent,
+            &start_state,
+            &[parent.active_slot_count],
+            vec![tx.clone()],
+            Address([0x22; 32]),
+            timestamp,
+            difficulty_target,
+        )
+        .expect("canonical user + coinbase template");
+        assert_eq!(template.txs, vec![tx], "fixture user tx selected");
+        let transactions = template.all_txs();
+        assert!(transactions[0].body.is_coinbase);
 
         let parent_cache = {
             let mut tmp = start_state.clone();
             tmp.exact_sparse_cache().unwrap()
         };
-        let claims = vec![noid_tx::compute_claims_commitment(
-            &body.inputs,
-            &body.outputs,
-        )];
+        let block_bodies: Vec<_> = transactions.iter().map(|tx| tx.body.clone()).collect();
+        let claims: Vec<_> = block_bodies
+            .iter()
+            .map(|body| noid_tx::compute_claims_commitment(&body.inputs, &body.outputs))
+            .collect();
         let surface = build_exact_action_surface(
             &start_state.state,
-            &[body.clone()],
+            &block_bodies,
             &claims,
             start_state.alloc_counter,
         )
-        .expect("exact action surface");
+        .expect("coinbase + user exact action surface");
         let state_transition = crate::build_exact_state_transition_proof(&parent_cache, &surface)
             .expect("exact proof");
 
-        let mut child_state = start_state.clone();
-        apply_tx(&mut child_state, &body).expect("native tx apply");
-        let child_state_root = child_state.utxo_root;
-        let mut header = BlockHeader {
-            prev_block_hash: hash_block_header(&parent),
-            state_root: child_state_root,
-            tx_root: compute_tx_root(&txs),
-            timestamp: parent.timestamp + BLOCK_TIME,
-            height: 1,
-            miner_address: Address([0x22; 32]),
-            nonce: 0,
-            difficulty_target: next_target(
-                0,
-                parent.timestamp,
-                &parent.difficulty_target,
-                1,
-                parent.timestamp + BLOCK_TIME,
-            ),
-            log_slots: parent.log_slots,
-            active_slot_count: start_state.active_slot_count,
-            alloc_counter: start_state.alloc_counter + 1,
-        };
-        header.nonce = search_pow(&header, 0, 64_000_000).expect("easy test target mines");
+        let nonce =
+            search_pow(&template.to_pow_header(0), 0, 64_000_000).expect("easy test target mines");
+        let header = template.into_header(nonce);
         let block = Block {
-            header,
-            transactions: txs,
+            header: header.clone(),
+            transactions,
         };
         let block_proof = crate::BlockProof::minimal(
             parent.state_root,
@@ -2344,52 +2310,57 @@ mod tests {
         }
         let txs: Vec<_> = bodies.iter().map(|b| tx_from_body(b.clone())).collect();
 
+        let timestamp = start_parent.timestamp + BLOCK_TIME;
+        let difficulty_target = next_target(
+            anchor.anchor_height,
+            anchor.anchor_timestamp,
+            &anchor.anchor_target,
+            start_parent.height + 1,
+            timestamp,
+        );
+        let template = build_block_template(
+            start_parent,
+            start_state,
+            &[start_parent.active_slot_count],
+            txs,
+            Address([0x22; 32]),
+            timestamp,
+            difficulty_target,
+        )
+        .expect("canonical standard-user + coinbase template");
+        assert_eq!(
+            template.txs.len(),
+            bodies.len(),
+            "every fixture user transaction is selected"
+        );
+        let transactions = template.all_txs();
+        assert!(transactions[0].body.is_coinbase);
+
         let parent_cache = {
             let mut tmp = start_state.clone();
             tmp.exact_sparse_cache().unwrap()
         };
-        let claims: Vec<_> = bodies
+        let block_bodies: Vec<_> = transactions.iter().map(|tx| tx.body.clone()).collect();
+        let claims: Vec<_> = block_bodies
             .iter()
-            .map(|b| noid_tx::compute_claims_commitment(&b.inputs, &b.outputs))
+            .map(|body| noid_tx::compute_claims_commitment(&body.inputs, &body.outputs))
             .collect();
         let surface = build_exact_action_surface(
             &start_state.state,
-            &bodies,
+            &block_bodies,
             &claims,
             start_state.alloc_counter,
         )
-        .expect("exact action surface");
+        .expect("coinbase + standard-user exact action surface");
         let state_transition = crate::build_exact_state_transition_proof(&parent_cache, &surface)
             .expect("exact proof");
 
-        let mut child_state = start_state.clone();
-        for body in &bodies {
-            apply_tx(&mut child_state, body).expect("native tx apply");
-        }
-        let child_state_root = child_state.utxo_root;
-        let mut header = BlockHeader {
-            prev_block_hash: hash_block_header(start_parent),
-            state_root: child_state_root,
-            tx_root: compute_tx_root(&txs),
-            timestamp: start_parent.timestamp + BLOCK_TIME,
-            height: start_parent.height + 1,
-            miner_address: Address([0x22; 32]),
-            nonce: 0,
-            difficulty_target: next_target(
-                anchor.anchor_height,
-                anchor.anchor_timestamp,
-                &anchor.anchor_target,
-                start_parent.height + 1,
-                start_parent.timestamp + BLOCK_TIME,
-            ),
-            log_slots: start_parent.log_slots,
-            active_slot_count: start_state.active_slot_count,
-            alloc_counter: start_state.alloc_counter + specs.len() as u64,
-        };
-        header.nonce = search_pow(&header, 0, 64_000_000).expect("easy test target mines");
+        let nonce =
+            search_pow(&template.to_pow_header(0), 0, 64_000_000).expect("easy test target mines");
+        let header = template.clone().into_header(nonce);
         let block = Block {
             header: header.clone(),
-            transactions: txs,
+            transactions,
         };
         let block_proof = crate::BlockProof::minimal(
             start_parent.state_root,
@@ -2398,7 +2369,13 @@ mod tests {
             state_transition,
         );
         let auth_sidecar = crate::BlockAuthSidecar {
-            tx_auth: bodies.iter().map(auth_proof_for_body).collect(),
+            // Coinbase has no authorization proof. Preserve canonical block
+            // order for user proofs after template ordering.
+            tx_auth: template
+                .txs
+                .iter()
+                .map(|tx| auth_proof_for_body(&tx.body))
+                .collect(),
         };
         let surviving_values: Vec<u64> = bodies.iter().map(|b| b.outputs[0].value).collect();
         (
@@ -3919,7 +3896,10 @@ mod tests {
         // 3. Child state-root wire — direct path→header-root closure.
         {
             let wire = wire_of(&slots.exact_state.roots.new_root[0]);
-            assert!(!battery.survives_flip(wire), "flipped state-root wire accepted");
+            assert!(
+                !battery.survives_flip(wire),
+                "flipped state-root wire accepted"
+            );
         }
         // 4. Spine tx-hash wire — the tx-root leaf closure AND the spine wrap
         //    closure: bound to the walk-B tx-root leg's entry cell and to the
@@ -5094,7 +5074,7 @@ mod tests {
     /// auth transcript and allocator-selected coinbase slot all differ.  None
     /// of those content values may enter the class matrix.
     ///
-    /// This intentionally does not claim the full no-user/coinbase axis: the
+    /// This intentionally does not claim the full coinbase-only axis: the
     /// retained collector still omits its exact-state component (pinned by
     /// `full_batch_accepts_coinbase_only_block_without_detached_proof`).
     #[test]
@@ -5149,7 +5129,7 @@ mod tests {
 
         // Comparator negative: crossing the A/B matrix lanes must be detected.
         // This protects the diagnostic itself from a vacuous row-count-only
-        // comparison while staying independent of the known no-user gap.
+        // comparison while staying independent of the known coinbase-only gap.
         assert!(
             !same_matrix_pair(&r0.a_0, &r0.b_0, &r1.b_0, &r1.a_0),
             "matrix-drift diagnostic accepted crossed A/B lanes"
@@ -5728,7 +5708,7 @@ mod tests {
         // C0 diagnostic: native validation has a real one-mint exact-state
         // surface, but the retained component collector currently appends an
         // exact-state input only inside `has_user_txs`.  `build_block_slots`
-        // requires exactly one, so coinbase-only/no-user cannot join the class
+        // requires exactly one, so coinbase-only cannot join the class
         // matrix yet.  Keep this assertion explicit instead of calling an
         // empty block a coinbase fixture and hiding the structural gap.
         assert!(
@@ -5736,7 +5716,7 @@ mod tests {
                 .component_inputs
                 .exact_state_killshot_inputs
                 .is_empty(),
-            "known C' blocker changed: update the no-user matrix gate"
+            "known C' blocker changed: update the coinbase-only matrix gate"
         );
         assert_eq!(
             out.proof_components
@@ -5781,8 +5761,8 @@ mod tests {
             active_slot_count: parent.active_slot_count,
             alloc_counter: parent.alloc_counter,
         };
-        let mut block_state = state.clone();
-        let block = empty_child(&parent, &mut block_state);
+        let block_state = state.clone();
+        let block = coinbase_only_child(&parent, &block_state);
         let witness = FullAcceptedBlockBatchWitness {
             items: vec![FullAcceptedBlockBatchItem {
                 block,
@@ -5906,8 +5886,8 @@ mod tests {
             active_slot_count: parent.active_slot_count,
             alloc_counter: parent.alloc_counter,
         };
-        let mut block_state = state.clone();
-        let block = empty_child(&parent, &mut block_state);
+        let block_state = state.clone();
+        let block = coinbase_only_child(&parent, &block_state);
         let witness = FullAcceptedBlockBatchWitness {
             items: vec![FullAcceptedBlockBatchItem {
                 block,
@@ -5985,8 +5965,8 @@ mod tests {
         };
         let mut original_parent_state = state.clone();
         let original_parent = parent_header(&mut original_parent_state);
-        let mut block_state = state.clone();
-        let block = empty_child(&original_parent, &mut block_state);
+        let block_state = state.clone();
+        let block = coinbase_only_child(&original_parent, &block_state);
         let witness = FullAcceptedBlockBatchWitness {
             items: vec![FullAcceptedBlockBatchItem {
                 block,
@@ -6045,7 +6025,10 @@ mod tests {
             .accepted_block_certificate_statements[0];
         assert_eq!(certificate_statement.user_tx_count, 1);
         assert_eq!(certificate_statement.live_input_count, 1);
-        assert_eq!(certificate_statement.touched_slot_count, 2);
+        assert_eq!(
+            certificate_statement.touched_slot_count, 3,
+            "one user spend, one user output, and the mandatory coinbase output"
+        );
         assert_eq!(
             accepted_block_certificate_chain_claim(certificate_statement),
             out.proof_components
@@ -6066,14 +6049,15 @@ mod tests {
                 .component_inputs
                 .tx_body_standard_inputs
                 .len(),
-            1
+            2,
+            "coinbase and user body both reach the spine component"
         );
         assert_eq!(
             out.proof_components
                 .component_inputs
                 .tx_body_standard_hashes
                 .len(),
-            1
+            2
         );
         assert!(out
             .proof_components

@@ -61,13 +61,13 @@ pub use history_claim::{
 pub use validate::{
     accept_block, accept_block_timeless, accept_block_timeless_with_artifacts,
     accept_block_timeless_with_artifacts_with_auth_verifier, accept_block_with_artifacts,
-    accept_block_with_artifacts_with_auth_verifier, derive_no_user_tx_validation_artifacts,
-    validate_block_auth_sidecar_shape, validate_block_authorizations, validate_block_full,
-    validate_block_full_timeless, validate_block_full_timeless_with_artifacts,
-    AcceptedBlockRawValidationOutput, AcceptedBlockValidationArtifacts,
-    AcceptedBlockValidationOutput, AuthorizationProof, AuthorizationVerifier,
-    CanonicalAuthorizationStatement, FullValidationError, OwnerAuthAuthorizationVerifier,
-    PreverifiedAuthorizationVerifier, VerifiedAuthorization, VerifiedAuthorizationBatch,
+    accept_block_with_artifacts_with_auth_verifier, validate_block_auth_sidecar_shape,
+    validate_block_authorizations, validate_block_full, validate_block_full_timeless,
+    validate_block_full_timeless_with_artifacts, AcceptedBlockRawValidationOutput,
+    AcceptedBlockValidationArtifacts, AcceptedBlockValidationOutput, AuthorizationProof,
+    AuthorizationVerifier, CanonicalAuthorizationStatement, FullValidationError,
+    OwnerAuthAuthorizationVerifier, PreverifiedAuthorizationVerifier, VerifiedAuthorization,
+    VerifiedAuthorizationBatch,
 };
 
 use crate::exact_state_transition::ExactStateTransitionProof as BlockExactStateTransitionProof;
@@ -578,12 +578,38 @@ mod tests {
         Transaction { body, tx_body_hash }
     }
 
+    fn coinbase_tx(parent: &BlockHeader) -> Transaction {
+        let body = TxBody {
+            shape: TxShape::Standard4x8,
+            epoch_anchor: noid_chain::hash_block_header(parent),
+            fee: 0,
+            inputs: vec![],
+            outputs: vec![TxOutput {
+                slot_index: 0,
+                value: 1,
+                owner: Address([0x44; 32]),
+                valid: true,
+            }],
+            is_coinbase: true,
+        };
+        let tx_body_hash = hash_tx_body_for_shape(
+            body.shape,
+            &body.epoch_anchor,
+            body.fee,
+            &body.inputs,
+            &body.outputs,
+            body.is_coinbase,
+        );
+        Transaction { body, tx_body_hash }
+    }
+
     #[test]
     fn accepted_block_claim_binds_context_and_rejects_wrong_witness_shape() {
         let parent = header(0, None, &[]);
+        let coinbase = coinbase_tx(&parent);
         let block = Block {
-            header: header(1, Some(&parent), &[]),
-            transactions: vec![],
+            header: header(1, Some(&parent), std::slice::from_ref(&coinbase)),
+            transactions: vec![coinbase],
         };
         let empty_sidecar = BlockAuthSidecar::default();
         let a = accepted_block_claim_hash(

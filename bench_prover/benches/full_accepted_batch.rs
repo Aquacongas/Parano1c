@@ -25,12 +25,12 @@ use noid_chain::block::{compute_tx_root, Block};
 use noid_chain::consensus::difficulty::{block_work, next_target};
 use noid_chain::consensus::fees::required_fee_for_tx_body;
 use noid_chain::consensus::params::{BLOCK_TIME, MAX_TARGET};
-use noid_chain::consensus::pow::{search_pow, validate_pow};
+use noid_chain::consensus::pow::search_pow;
+use noid_chain::consensus::template::build_block_template;
 use noid_chain::fri_state::SlotValue;
 use noid_chain::header_anchor::compute_header_chain_anchor;
 use noid_chain::state::ChainState;
-use noid_chain::{apply_tx, build_exact_action_surface, hash_block_header, BlockHeader};
-use noid_core::Block128;
+use noid_chain::{apply_tx, build_exact_action_surface, BlockHeader};
 use noid_gkr::{
     owner_auth_gkr_channel, owner_auth_inputs_from_body_and_live_secrets,
     prove_owner_auth_killshot, OwnerAuthCircuit,
@@ -51,15 +51,6 @@ const RETAINED_WINDOW_BLOCKS: usize = 18;
 const CHECKPOINT_BATCH_TARGET_BLOCKS: usize = 16;
 const BENCH_POW_SEARCH_RANGE: u128 = 100_000_000;
 const BENCH_POW_CHUNK_SIZE: u128 = 65_536;
-const PREMINED_COINBASE_ONLY_NONCES: [u128; CHECKPOINT_BATCH_TARGET_BLOCKS] = [
-    69_582, 579_360, 737_824, 268_145, 15_749, 43_373, 199_577, 600_086, 425_466, 310_248, 166_011,
-    1_355_852, 479_822, 418_510, 220_161, 95_998,
-];
-const PREMINED_USER_BLOCK_NONCE: u128 = 87_803;
-const PREMINED_USER_THEN_COINBASE_TAIL_NONCES: [u128; CHECKPOINT_BATCH_TARGET_BLOCKS - 1] = [
-    124_329, 1_886_009, 159_414, 531_286, 230_280, 689_257, 156_834, 582_378, 691_435, 566_052,
-    420_051, 94_211, 93_651, 134_834, 366_524,
-];
 
 type FullBatchFixture = (
     RecursiveConsensusState,
@@ -145,12 +136,12 @@ fn bench_pow_nonce(header: &BlockHeader) -> u128 {
     panic!("bench target mines")
 }
 
-fn empty_child(
+fn canonical_child(
     parent: &BlockHeader,
     state: &ChainState,
     rolling_consensus: &RecursiveConsensusState,
-    premined_nonce: Option<u128>,
-) -> Block {
+    candidate_txs: Vec<Transaction>,
+) -> (Block, ChainState) {
     let timestamp = parent.timestamp + BLOCK_TIME;
     let difficulty_target = next_target(
         rolling_consensus.asert_anchor_height,
@@ -159,29 +150,42 @@ fn empty_child(
         parent.height + 1,
         timestamp,
     );
-    let mut header = BlockHeader {
-        prev_block_hash: hash_block_header(parent),
-        state_root: state.cached_state_root(),
-        tx_root: compute_tx_root(&[]),
+    let expected_user_txs = candidate_txs.len();
+    let template = build_block_template(
+        parent,
+        state,
+        rolling_consensus.active_counts(),
+        candidate_txs,
+        Address([0x22; 32]),
         timestamp,
-        height: parent.height + 1,
-        miner_address: Address([0x22; 32]),
-        nonce: 0,
         difficulty_target,
-        log_slots: parent.log_slots,
-        active_slot_count: parent.active_slot_count,
-        alloc_counter: parent.alloc_counter,
-    };
-    if let Some(nonce) = premined_nonce {
-        header.nonce = nonce;
-        validate_pow(&header).expect("premined bench nonce is valid");
-    } else {
-        header.nonce = bench_pow_nonce(&header);
+    )
+    .expect("canonical bench block template");
+    assert_eq!(
+        template.txs.len(),
+        expected_user_txs,
+        "bench template must select every prepared user transaction"
+    );
+    let transactions = template.all_txs();
+    assert!(transactions[0].body.is_coinbase, "coinbase is tx0");
+    let nonce = bench_pow_nonce(&template.to_pow_header(0));
+    let header = template.into_header(nonce);
+
+    let mut child_state = state.clone();
+    for tx in &transactions {
+        apply_tx(&mut child_state, &tx.body).expect("canonical bench transaction applies");
     }
-    Block {
-        header,
-        transactions: vec![],
-    }
+    assert_eq!(child_state.cached_state_root(), header.state_root);
+    assert_eq!(child_state.active_slot_count, header.active_slot_count);
+    assert_eq!(child_state.alloc_counter, header.alloc_counter);
+
+    (
+        Block {
+            header,
+            transactions,
+        },
+        child_state,
+    )
 }
 
 fn coinbase_only_batch(
@@ -195,15 +199,15 @@ fn coinbase_only_batch(
 ) {
     let mut start_state = ChainState::with_log_slots(8);
     let mut parent = parent_header(&mut start_state);
+    let mut rolling_state = start_state.clone();
     let start_parent = parent.clone();
     let (start_consensus, start_accumulator) = start_tuple(&start_parent);
     let mut items = Vec::with_capacity(n);
     let mut rolling_consensus = start_consensus.clone();
     let progress = env_bool("NOID_FULL_ACCEPTED_BATCH_PROGRESS", false);
     for index in 0..n {
-        let premined_nonce = PREMINED_COINBASE_ONLY_NONCES.get(index).copied();
-        let (block_time, block) =
-            time_once(|| empty_child(&parent, &start_state, &rolling_consensus, premined_nonce));
+        let (block_time, (block, child_state)) =
+            time_once(|| canonical_child(&parent, &rolling_state, &rolling_consensus, vec![]));
         if progress {
             println!(
                 "    fixture block={}/{} height={} nonce={} build={}",
@@ -220,6 +224,7 @@ fn coinbase_only_batch(
             &[HeaderWitness::from_header(&block.header)],
         )
         .expect("bench header advances consensus");
+        rolling_state = child_state;
         parent = block.header.clone();
         items.push(FullAcceptedBlockBatchItem {
             block,
@@ -282,15 +287,11 @@ fn one_user_block_item() -> (
     let owner = derive_address(&secret);
     let mut start_state = ChainState::with_log_slots(4);
     let input_value = 10_000u64;
-    let pre_slot = SlotValue {
-        value: Block128::from(input_value as u128),
-        owner_hi: owner.as_fields()[0],
-        owner_lo: owner.as_fields()[1],
-    };
+    let pre_slot = SlotValue::with_owner_fields(input_value, 1, owner.as_fields());
     start_state.state.set_slot(2, pre_slot).unwrap();
     start_state.rebuild_exact_utxo_root_loaded().unwrap();
     start_state.active_slot_count = 1;
-    start_state.alloc_counter = 2;
+    start_state.alloc_counter = 1;
 
     let parent = parent_header(&mut start_state);
     let (start_consensus, start_accumulator) = start_tuple(&parent);
@@ -302,7 +303,7 @@ fn one_user_block_item() -> (
         inputs: vec![TxInput {
             slot_index: 2,
             value: input_value,
-            creation_id: 0,
+            creation_id: 1,
             owner,
             spend_secret: secret,
             valid: true,
@@ -319,67 +320,41 @@ fn one_user_block_item() -> (
     body.fee = required_fee as u128;
     body.outputs[0].value = input_value.saturating_sub(required_fee);
     let tx = tx_from_body(body.clone());
-    let txs = vec![tx.clone()];
+
+    let (block, child_state) = canonical_child(&parent, &start_state, &start_consensus, vec![tx]);
+    let block_bodies: Vec<_> = block
+        .transactions
+        .iter()
+        .map(|tx| tx.body.clone())
+        .collect();
 
     let parent_cache = {
         let mut tmp = start_state.clone();
         tmp.exact_sparse_cache().unwrap()
     };
-    let claims = vec![noid_tx::compute_claims_commitment(
-        &body.inputs,
-        &body.outputs,
-    )];
+    let claims: Vec<_> = block_bodies
+        .iter()
+        .map(|block_body| {
+            noid_tx::compute_claims_commitment(&block_body.inputs, &block_body.outputs)
+        })
+        .collect();
     let surface = build_exact_action_surface(
         &start_state.state,
-        &[body.clone()],
+        &block_bodies,
         &claims,
         start_state.alloc_counter,
     )
-    .expect("exact action surface");
-    let state_transition = build_exact_state_transition_proof(&parent_cache, &surface)
-    .expect("exact proof");
-
-    let mut child_state = start_state.clone();
-    apply_tx(&mut child_state, &body).expect("native tx apply");
-    let child_state_root = child_state.cached_state_root();
-    let timestamp = parent.timestamp + BLOCK_TIME;
-    let mut header = BlockHeader {
-        prev_block_hash: hash_block_header(&parent),
-        state_root: child_state_root,
-        tx_root: compute_tx_root(&txs),
-        timestamp,
-        height: parent.height + 1,
-        miner_address: Address([0x22; 32]),
-        nonce: 0,
-        difficulty_target: next_target(
-            start_consensus.asert_anchor_height,
-            start_consensus.asert_anchor_timestamp,
-            &start_consensus.asert_anchor_target,
-            parent.height + 1,
-            timestamp,
-        ),
-        log_slots: parent.log_slots,
-        active_slot_count: child_state.active_slot_count,
-        alloc_counter: child_state.alloc_counter,
-    };
+    .expect("coinbase + user exact action surface");
+    let state_transition =
+        build_exact_state_transition_proof(&parent_cache, &surface).expect("exact proof");
     let progress = env_bool("NOID_FULL_ACCEPTED_BATCH_PROGRESS", false);
-    let (pow_time, ()) = time_once(|| {
-        header.nonce = PREMINED_USER_BLOCK_NONCE;
-        validate_pow(&header).expect("premined user-block bench nonce is valid");
-    });
     if progress {
         println!(
-            "    fixture user_block height={} nonce={} pow={}",
-            header.height,
-            header.nonce,
-            fmt_ms(pow_time)
+            "    fixture user_block height={} nonce={}",
+            block.header.height, block.header.nonce
         );
         let _ = std::io::stdout().flush();
     }
-    let block = Block {
-        header,
-        transactions: txs,
-    };
     let block_proof = BlockProof::minimal(
         parent.state_root,
         block.header.state_root,
@@ -428,14 +403,12 @@ fn user_then_coinbase_batch(n: usize) -> FullBatchFixture {
         &[HeaderWitness::from_header(&parent)],
     )
     .expect("bench user header advances consensus");
+    let mut rolling_state = tail_state;
     items.push(first_item);
 
     for tail_index in 0..n.saturating_sub(1) {
-        let premined_nonce = PREMINED_USER_THEN_COINBASE_TAIL_NONCES
-            .get(tail_index)
-            .copied();
-        let (block_time, block) =
-            time_once(|| empty_child(&parent, &tail_state, &rolling_consensus, premined_nonce));
+        let (block_time, (block, child_state)) =
+            time_once(|| canonical_child(&parent, &rolling_state, &rolling_consensus, vec![]));
         if progress {
             println!(
                 "    fixture mixed_tail block={}/{} height={} nonce={} build={}",
@@ -452,6 +425,7 @@ fn user_then_coinbase_batch(n: usize) -> FullBatchFixture {
             &[HeaderWitness::from_header(&block.header)],
         )
         .expect("bench tail header advances consensus");
+        rolling_state = child_state;
         parent = block.header.clone();
         items.push(FullAcceptedBlockBatchItem {
             block,

@@ -63,9 +63,9 @@ pub use storage::{
 // ---------------------------------------------------------------------------
 
 pub use block::{
-    apply_block, apply_genesis_block, apply_state_delta, compute_tx_root,
-    validate_block_proof_binding, Block, BlockApplyError, ProofBindingError, BLOCK_MAX_TXS,
-    BLOCK_WIRE_HEADER_OFFSET, BLOCK_WIRE_NONCE_OFFSET, BLOCK_WIRE_VERSION,
+    apply_genesis_block, compute_tx_root, validate_block_proof_binding, Block, BlockApplyError,
+    ProofBindingError, BLOCK_MAX_TXS, BLOCK_WIRE_HEADER_OFFSET, BLOCK_WIRE_NONCE_OFFSET,
+    BLOCK_WIRE_VERSION,
 };
 pub use block_header::{block_id, hash_block_header, BlockHeader};
 pub use header_anchor::{

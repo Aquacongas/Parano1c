@@ -242,26 +242,21 @@ mod tests {
     const TEST_TARGET: [u8; 32] = [0xFF; 32];
     const TEST_LOG_SLOTS: usize = 8;
 
-    fn build_empty_block(ctx: &mut ChainContext) -> Block {
+    fn build_coinbase_block(ctx: &mut ChainContext) -> Block {
         let parent = *ctx.tip_header();
-        let new_root = ctx.state.state_root();
-        let mut header = BlockHeader {
-            prev_block_hash: block_id(&parent),
-            state_root: new_root,
-            tx_root: compute_tx_root(&[]),
-            timestamp: parent.timestamp + BLOCK_TIME,
-            height: parent.height + 1,
-            miner_address: Address([0u8; 32]),
-            nonce: 0,
-            difficulty_target: TEST_TARGET,
-            log_slots: parent.log_slots,
-            active_slot_count: parent.active_slot_count,
-            alloc_counter: parent.alloc_counter,
-        };
-        header.nonce = 0; // TEST_TARGET: any nonce works
+        let template = crate::consensus::template::build_block_template(
+            &parent,
+            &ctx.state,
+            &ctx.prev_active_counts(),
+            vec![],
+            Address([0u8; 32]),
+            parent.timestamp + BLOCK_TIME,
+            TEST_TARGET,
+        )
+        .expect("canonical coinbase-only child template");
         Block {
-            header,
-            transactions: vec![],
+            header: template.clone().into_header(0),
+            transactions: template.all_txs(),
         }
     }
 
@@ -320,6 +315,23 @@ mod tests {
 
     fn build_block(ctx: &ChainContext, txs: Vec<Transaction>) -> Block {
         let parent = *ctx.tip_header();
+        if !txs.iter().any(|tx| tx.body.is_coinbase) {
+            let template = crate::consensus::template::build_block_template(
+                &parent,
+                &ctx.state,
+                &ctx.prev_active_counts(),
+                txs,
+                Address([0u8; 32]),
+                parent.timestamp + BLOCK_TIME,
+                TEST_TARGET,
+            )
+            .expect("canonical user + coinbase child template");
+            return Block {
+                header: template.clone().into_header(0),
+                transactions: template.all_txs(),
+            };
+        }
+
         let mut dry = ctx.state.clone();
         for tx in &txs {
             apply_tx(&mut dry, &tx.body).expect("test tx applies to dry state");
@@ -330,7 +342,13 @@ mod tests {
             tx_root: compute_tx_root(&txs),
             timestamp: parent.timestamp + BLOCK_TIME,
             height: parent.height + 1,
-            miner_address: Address([0u8; 32]),
+            miner_address: txs[0]
+                .body
+                .outputs
+                .iter()
+                .find(|output| output.valid)
+                .expect("coinbase fixture has one live output")
+                .owner,
             nonce: 0,
             difficulty_target: TEST_TARGET,
             log_slots: dry.state.log_slots() as u32,
@@ -456,7 +474,7 @@ mod tests {
     fn apply_reorg_exceeds_finality_rejects() {
         let mut ctx = ChainContext::init_from_easy_genesis();
         for _ in 0..(CONSENSUS_FINALITY_DEPTH + 1) {
-            let block = build_empty_block(&mut ctx);
+            let block = build_coinbase_block(&mut ctx);
             ctx.apply_next_block(&block, block.header.timestamp + 1)
                 .unwrap();
         }
@@ -468,7 +486,7 @@ mod tests {
     fn apply_reorg_within_finality_reverts() {
         let mut ctx = ChainContext::init_from_easy_genesis();
         for _ in 0..3 {
-            let block = build_empty_block(&mut ctx);
+            let block = build_coinbase_block(&mut ctx);
             ctx.apply_next_block(&block, block.header.timestamp + 1)
                 .unwrap();
         }
@@ -498,7 +516,7 @@ mod tests {
     #[test]
     fn tampered_undo_depth_fails_and_restores_pre_reorg_snapshot() {
         let mut ctx = init_small_easy_context();
-        let block = build_empty_block(&mut ctx);
+        let block = build_coinbase_block(&mut ctx);
         ctx.apply_next_block(&block, block.header.timestamp + 1)
             .unwrap();
         ctx.undo_logs
@@ -567,7 +585,7 @@ mod tests {
 
         // Apply 3 blocks.
         for _ in 0..3 {
-            let block = build_empty_block(&mut ctx);
+            let block = build_coinbase_block(&mut ctx);
             ctx.apply_next_block(&block, block.header.timestamp + 1)
                 .unwrap();
         }

@@ -11,7 +11,7 @@
 //! # Invariants checked here (SPEC §16)
 //!
 //!  ✅  Header chain (prev_hash, height, difficulty, timestamp, PoW)     [P.6]
-//!  ✅  Coinbase structure (at most one, first, zero inputs)              [P.7 partial]
+//!  ✅  Mandatory canonical coinbase (exactly one, first, Standard4x8)   [P.7 partial]
 //!  ✅  Coinbase value ≤ block_reward(log_slots) + Σ fees                [P.7 full]
 //!  ✅  Per-tx: body_hash binding, non-zero anchor                        [P.8]
 //!  ✅  Cross-tx slot conflicts                                           [P.8]
@@ -214,45 +214,65 @@ fn validate_fee_policy_and_claimable_fee_sum(
     Ok(claimable_fee_sum)
 }
 
-fn validate_coinbase_canonical(block: &Block, parent: &BlockHeader) -> Result<(), ConsensusError> {
+/// Validate the complete mandatory coinbase contract for a non-genesis block.
+///
+/// This is the single cheap, state-free predicate shared by every accepted
+/// block entry point. Genesis is deliberately outside this contract and is
+/// required to have an empty transaction list by `apply_genesis_block`.
+pub fn validate_mandatory_coinbase(
+    block: &Block,
+    parent: &BlockHeader,
+) -> Result<(), ConsensusError> {
     let expected_anchor = crate::consensus::pow::block_id(parent);
-    let mut seen_coinbase = false;
+    let mut coinbase_positions = block
+        .transactions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, tx)| tx.body.is_coinbase.then_some(index));
+    let coinbase_index = coinbase_positions
+        .next()
+        .ok_or(ConsensusError::MissingCoinbase)?;
+    if coinbase_positions.next().is_some() {
+        return Err(ConsensusError::MultipleCoinbase);
+    }
+    if coinbase_index != 0 {
+        return Err(ConsensusError::CoinbaseNotFirst);
+    }
 
-    for (idx, tx) in block.transactions.iter().enumerate() {
-        if !tx.body.is_coinbase {
-            continue;
-        }
-        if seen_coinbase {
-            return Err(ConsensusError::ShapeMismatch(
-                "multiple coinbase transactions".into(),
-            ));
-        }
-        seen_coinbase = true;
-        if idx != 0 {
-            return Err(ConsensusError::ShapeMismatch(
-                "coinbase transaction must be first".into(),
-            ));
-        }
-        if tx.body.inputs.iter().any(|input| input.valid) {
-            return Err(ConsensusError::ShapeMismatch(
-                "coinbase transaction has valid inputs".into(),
-            ));
-        }
-        if tx.body.epoch_anchor != expected_anchor {
-            return Err(ConsensusError::BadCoinbaseAnchor);
-        }
+    let coinbase = &block.transactions[0];
+    if coinbase.body.shape != noid_tx::TxShape::Standard4x8 {
+        return Err(ConsensusError::BadCoinbaseShape);
+    }
+    // This one shared predicate owns fee/input/output counts and canonical
+    // dead-entry encoding. Keeping it here (rather than relying on the later
+    // per-transaction loop) makes the complete coinbase contract one atomic
+    // cheap preflight.
+    noid_tx::validate_body_semantics_no_hash(&coinbase.body)
+        .map_err(|error| ConsensusError::ShapeMismatch(format!("coinbase semantics: {error}")))?;
 
-        let expected_hash = noid_tx::hash_tx_body_for_shape(
-            tx.body.shape,
-            &tx.body.epoch_anchor,
-            tx.body.fee,
-            &tx.body.inputs,
-            &tx.body.outputs,
-            tx.body.is_coinbase,
-        );
-        if tx.tx_body_hash != expected_hash {
-            return Err(ConsensusError::BadTxBodyHash);
-        }
+    if coinbase.body.epoch_anchor != expected_anchor {
+        return Err(ConsensusError::BadCoinbaseAnchor);
+    }
+    let output = coinbase
+        .body
+        .outputs
+        .iter()
+        .find(|output| output.valid)
+        .ok_or_else(|| ConsensusError::ShapeMismatch("coinbase has no live output".into()))?;
+    if output.owner != block.header.miner_address {
+        return Err(ConsensusError::BadCoinbaseOwner);
+    }
+
+    let expected_hash = noid_tx::hash_tx_body_for_shape(
+        coinbase.body.shape,
+        &coinbase.body.epoch_anchor,
+        coinbase.body.fee,
+        &coinbase.body.inputs,
+        &coinbase.body.outputs,
+        coinbase.body.is_coinbase,
+    );
+    if coinbase.tx_body_hash != expected_hash {
+        return Err(ConsensusError::BadTxBodyHash);
     }
 
     Ok(())
@@ -262,11 +282,12 @@ fn validate_coinbase_canonical(block: &Block, parent: &BlockHeader) -> Result<()
 ///
 /// Use this as the first step of the full-proof-native validation path:
 ///   1. `validate_block_checks()` — header + tx checks (no MDBX reads)
-///   2. minimal block proof verification
-///   3. `apply_state_delta()` — write delta to MDBX (no pre-state reads)
+///   2. exact block transition verification
+///   3. commit the verifier-sealed slot updates and counters atomically
 ///
 /// Note: does NOT check `state_root` (that's done by minimal proof verification).
-/// Does NOT check `active_slot_count` / `alloc_counter` (done by `apply_state_delta`).
+/// Does NOT check `active_slot_count` / `alloc_counter` (done by the exact
+/// transition verifier).
 pub fn validate_block_checks(
     block: &Block,
     parent: &BlockHeader,
@@ -337,7 +358,7 @@ fn validate_block_checks_inner(
         )?,
     }
     validate_block_resource_preflight(block)?;
-    validate_coinbase_canonical(block, parent)?;
+    validate_mandatory_coinbase(block, parent)?;
     validate_block_slot_conflicts(&block.transactions)?;
     for tx in &block.transactions {
         validate_tx_consensus_skip_hash(tx)?;
@@ -367,7 +388,7 @@ fn validate_block_checks_inner(
 /// This is not the live full-node production path. It is used by the in-memory
 /// context and tests/utilities that intentionally recompute the transition
 /// directly. Production validation uses:
-/// `validate_block_checks` + minimal proof verification + `apply_state_delta`.
+/// `validate_block_checks` + exact transition verification + sealed commit.
 ///
 /// On success, `state` is updated. On failure, `state` is left unchanged.
 pub fn validate_block_consensus(
@@ -394,7 +415,7 @@ pub fn validate_block_consensus(
     // --- Bounded canonical resource preflight ---
     validate_block_resource_preflight(block)?;
 
-    validate_coinbase_canonical(block, parent)?;
+    validate_mandatory_coinbase(block, parent)?;
 
     // --- Cross-tx slot conflict check (P.8, §16 invariants 4-5) ---
     validate_block_slot_conflicts(&block.transactions)?;
@@ -477,7 +498,7 @@ mod tests {
         }
     }
 
-    /// Build a minimal valid block (no txs) on top of `parent`.
+    /// Build a structurally empty child for negative/header-ordering tests.
     fn build_empty_block(parent: &BlockHeader, state: &mut ChainState) -> Block {
         use crate::block::compute_tx_root;
         use crate::consensus::pow::block_id;
@@ -650,7 +671,7 @@ mod tests {
                 tx_root: compute_tx_root(&txs),
                 timestamp: parent.timestamp + BLOCK_TIME,
                 height: parent.height + 1,
-                miner_address: Address([0u8; 32]),
+                miner_address: Address([9u8; 32]),
                 nonce: 0,
                 difficulty_target: TEST_TARGET,
                 log_slots: parent.log_slots,
@@ -659,6 +680,149 @@ mod tests {
             },
             transactions: txs,
         }
+    }
+
+    fn canonical_coinbase_block(parent: &BlockHeader) -> Block {
+        use crate::consensus::pow::block_id;
+
+        let coinbase = fee_test_coinbase(block_id(parent), 1);
+        let transactions = vec![coinbase];
+        let mut header = mk_parent(
+            parent.height + 1,
+            parent.timestamp + BLOCK_TIME,
+            block_id(parent),
+            parent.state_root,
+        );
+        header.miner_address = Address([9u8; 32]);
+        header.tx_root = crate::block::compute_tx_root(&transactions);
+        Block {
+            header,
+            transactions,
+        }
+    }
+
+    fn rehash(tx: &mut Transaction) {
+        tx.tx_body_hash = hash_tx_body_for_shape(
+            tx.body.shape,
+            &tx.body.epoch_anchor,
+            tx.body.fee,
+            &tx.body.inputs,
+            &tx.body.outputs,
+            tx.body.is_coinbase,
+        );
+    }
+
+    #[test]
+    fn canonical_coinbase_contract_accepts_exact_standard_form() {
+        let parent = mk_parent(0, GENESIS_TIMESTAMP, [0u8; 32], [0u8; 32]);
+        assert_eq!(
+            validate_mandatory_coinbase(&canonical_coinbase_block(&parent), &parent),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn canonical_coinbase_contract_rejects_missing_late_and_multiple() {
+        let parent = mk_parent(0, GENESIS_TIMESTAMP, [0u8; 32], [0u8; 32]);
+        let mut block = canonical_coinbase_block(&parent);
+
+        block.transactions.clear();
+        assert_eq!(
+            validate_mandatory_coinbase(&block, &parent),
+            Err(ConsensusError::MissingCoinbase)
+        );
+
+        let coinbase = canonical_coinbase_block(&parent).transactions.remove(0);
+        block.transactions = vec![fee_test_user_tx(0), coinbase.clone()];
+        assert_eq!(
+            validate_mandatory_coinbase(&block, &parent),
+            Err(ConsensusError::CoinbaseNotFirst)
+        );
+
+        block.transactions = vec![coinbase.clone(), coinbase];
+        assert_eq!(
+            validate_mandatory_coinbase(&block, &parent),
+            Err(ConsensusError::MultipleCoinbase)
+        );
+    }
+
+    #[test]
+    fn canonical_coinbase_contract_binds_shape_semantics_anchor_owner_and_hash() {
+        let parent = mk_parent(0, GENESIS_TIMESTAMP, [0u8; 32], [0u8; 32]);
+
+        let mut bad_shape = canonical_coinbase_block(&parent);
+        bad_shape.transactions[0].body.shape = TxShape::Sweep25x2;
+        rehash(&mut bad_shape.transactions[0]);
+        assert_eq!(
+            validate_mandatory_coinbase(&bad_shape, &parent),
+            Err(ConsensusError::BadCoinbaseShape)
+        );
+
+        let mut bad_fee = canonical_coinbase_block(&parent);
+        bad_fee.transactions[0].body.fee = 1;
+        rehash(&mut bad_fee.transactions[0]);
+        assert!(matches!(
+            validate_mandatory_coinbase(&bad_fee, &parent),
+            Err(ConsensusError::ShapeMismatch(_))
+        ));
+
+        let mut bad_inputs = canonical_coinbase_block(&parent);
+        bad_inputs.transactions[0].body.inputs.push(TxInput {
+            slot_index: 1,
+            value: 1,
+            creation_id: 1,
+            owner: Address([9u8; 32]),
+            spend_secret: SpendSecret([1u8; 32]),
+            valid: true,
+        });
+        rehash(&mut bad_inputs.transactions[0]);
+        assert!(matches!(
+            validate_mandatory_coinbase(&bad_inputs, &parent),
+            Err(ConsensusError::ShapeMismatch(_))
+        ));
+
+        let mut bad_outputs = canonical_coinbase_block(&parent);
+        bad_outputs.transactions[0].body.outputs.clear();
+        rehash(&mut bad_outputs.transactions[0]);
+        assert!(matches!(
+            validate_mandatory_coinbase(&bad_outputs, &parent),
+            Err(ConsensusError::ShapeMismatch(_))
+        ));
+
+        let mut bad_dead_entry = canonical_coinbase_block(&parent);
+        bad_dead_entry.transactions[0].body.outputs.push(TxOutput {
+            slot_index: 7,
+            value: 0,
+            owner: Address([0u8; 32]),
+            valid: false,
+        });
+        rehash(&mut bad_dead_entry.transactions[0]);
+        assert!(matches!(
+            validate_mandatory_coinbase(&bad_dead_entry, &parent),
+            Err(ConsensusError::ShapeMismatch(_))
+        ));
+
+        let mut bad_anchor = canonical_coinbase_block(&parent);
+        bad_anchor.transactions[0].body.epoch_anchor = [0xAA; 32];
+        rehash(&mut bad_anchor.transactions[0]);
+        assert_eq!(
+            validate_mandatory_coinbase(&bad_anchor, &parent),
+            Err(ConsensusError::BadCoinbaseAnchor)
+        );
+
+        let mut bad_owner = canonical_coinbase_block(&parent);
+        bad_owner.header.miner_address = Address([0xBB; 32]);
+        assert_eq!(
+            validate_mandatory_coinbase(&bad_owner, &parent),
+            Err(ConsensusError::BadCoinbaseOwner)
+        );
+
+        let mut bad_hash = canonical_coinbase_block(&parent);
+        bad_hash.transactions[0].tx_body_hash.0[0] ^= 1;
+        assert_eq!(
+            validate_mandatory_coinbase(&bad_hash, &parent),
+            Err(ConsensusError::BadTxBodyHash)
+        );
     }
 
     #[test]
@@ -786,7 +950,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_block_on_genesis_validates() {
+    fn non_genesis_empty_block_is_rejected() {
         let mut state = ChainState::with_log_slots(TEST_LOG_SLOTS);
         let state_root = state.state_root();
         let parent = mk_parent(0, GENESIS_TIMESTAMP, [0u8; 32], state_root);
@@ -802,7 +966,7 @@ mod tests {
             &genesis_anchor(&parent),
             &mut apply_state,
         );
-        assert!(result.is_ok(), "empty block should validate: {:?}", result);
+        assert_eq!(result, Err(ConsensusError::MissingCoinbase));
     }
 
     #[test]
@@ -991,31 +1155,28 @@ mod tests {
             alloc_counter: 0,
         };
 
-        // Build a block that does NOT expand (log_slots unchanged).
-        use crate::block::compute_tx_root;
-        use crate::consensus::pow::block_id;
-        let mut hdr = BlockHeader {
-            prev_block_hash: block_id(&parent),
-            state_root,
-            tx_root: compute_tx_root(&[]),
-            timestamp: parent.timestamp + BLOCK_TIME,
-            height: 1,
-            miner_address: noid_poseidon2b::primitives::Address([0u8; 32]),
-            nonce: 0,
-            difficulty_target: TEST_TARGET,
-            log_slots: TEST_LOG_SLOTS as u32, // no expansion
-            active_slot_count: spike_active,
-            alloc_counter: 0,
-        };
-        hdr.nonce = 0; // TEST_TARGET: any nonce works
-        let block = crate::block::Block {
-            header: hdr,
-            transactions: vec![],
-        };
-
         // Window: 17 values at 25%, 1 value at 75%. Median = 25% → no trigger.
         let mut active_window = vec![low_active; 17];
         active_window.push(spike_active);
+
+        // Build the canonical coinbase-only child. The template and validator
+        // consume the same active-count window, so this remains an expansion
+        // trigger test rather than an obsolete empty-child fixture.
+        let template = crate::consensus::template::build_block_template(
+            &parent,
+            &state,
+            &active_window,
+            vec![],
+            Address([0u8; 32]),
+            parent.timestamp + BLOCK_TIME,
+            TEST_TARGET,
+        )
+        .expect("coinbase-only non-expansion template");
+        let block = crate::block::Block {
+            header: template.clone().into_header(0),
+            transactions: template.all_txs(),
+        };
+        assert_eq!(block.header.log_slots, TEST_LOG_SLOTS as u32);
 
         let mut apply_state = ChainState::with_log_slots(TEST_LOG_SLOTS);
         apply_state.active_slot_count = spike_active;

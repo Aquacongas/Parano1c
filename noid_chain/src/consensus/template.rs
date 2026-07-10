@@ -501,7 +501,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_template_builds() {
+    fn coinbase_only_template_builds() {
         let parent = genesis_header();
         let state = fresh_state();
         let miner = Address([0xAB; 32]);
@@ -515,7 +515,11 @@ mod tests {
             GENESIS_TIMESTAMP + BLOCK_TIME,
             GENESIS_TARGET,
         );
-        assert!(result.is_ok(), "empty template should build: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "coinbase-only template should build: {:?}",
+            result
+        );
         let tmpl = result.unwrap();
         assert_eq!(tmpl.height, 1);
         assert_eq!(tmpl.txs.len(), 0);

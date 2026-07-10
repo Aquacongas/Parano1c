@@ -41,7 +41,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::block::{apply_state_delta, Block};
+use crate::block::Block;
 use crate::block_header::BlockHeader;
 use crate::chain_context::ChainContext;
 use crate::checkpoint::{
@@ -541,8 +541,8 @@ impl MdbxChainContext {
     /// post-block state (the node passes `noid_block::accept_block`).
     /// The sequential interpreter is not a second production validity source.
     /// Coinbase-only blocks are the sole no-proof exception, but they still go
-    /// through this same method: detached-proof presence checks, cheap consensus checks,
-    /// `apply_state_delta`, then atomic commit.
+    /// through the supplied proof-native validator so mint-slot emptiness and
+    /// the exact transition are established before the atomic commit.
     pub fn apply_next_block<F, E>(
         &mut self,
         block: &Block,
@@ -626,38 +626,26 @@ impl MdbxChainContext {
         let state_before_validation = self.state.clone();
         let undo = build_undo_log(&self.state, block);
 
-        let new_state_root = if has_user_txs {
-            match validate_and_apply(
-                block,
-                block_proof_bytes,
-                block_auth_sidecar_bytes,
-                &parent,
-                &prev_timestamps,
-                &prev_active_counts,
-                local_time,
-                &anchor,
-                &pre_state,
-                &mut self.state,
-            ) {
-                Ok(root) => root,
-                Err(e) => {
-                    self.state = state_before_validation;
-                    self.state.state.clear_dirty();
-                    return Err(MdbxContextError::Consensus(ConsensusError::ShapeMismatch(
-                        format!("proof-native validation failed: {e}"),
-                    )));
-                }
+        let new_state_root = match validate_and_apply(
+            block,
+            block_proof_bytes,
+            block_auth_sidecar_bytes,
+            &parent,
+            &prev_timestamps,
+            &prev_active_counts,
+            local_time,
+            &anchor,
+            &pre_state,
+            &mut self.state,
+        ) {
+            Ok(root) => root,
+            Err(e) => {
+                self.state = state_before_validation;
+                self.state.state.clear_dirty();
+                return Err(MdbxContextError::Consensus(ConsensusError::ShapeMismatch(
+                    format!("proof-native validation failed: {e}"),
+                )));
             }
-        } else {
-            apply_state_delta(&mut self.state, block)
-                .map_err(|e| {
-                    self.state = state_before_validation.clone();
-                    self.state.state.clear_dirty();
-                    MdbxContextError::Consensus(ConsensusError::ShapeMismatch(format!(
-                        "coinbase-only proven-delta apply failed: {e:?}"
-                    )))
-                })?
-                .new_state_root
         };
 
         self.commit_applied_next_block(block, &undo, &state_before_validation)?;
@@ -1707,33 +1695,16 @@ mod tests {
     use crate::consensus::{params::BLOCK_TIME, pow::block_id};
     use noid_poseidon2b::primitives::Address;
 
-    fn build_empty_block_on(ctx: &mut MdbxChainContext) -> Block {
-        use crate::chain_context::TEST_TARGET;
-        let parent = *ctx.tip_header();
-        let new_root = ctx.state.state_root();
-
-        // Use TEST_TARGET so nonce=0 trivially satisfies PoW.
-        // ASERT with perfect BLOCK_TIME timing returns TEST_TARGET → consistent.
-        let header = BlockHeader {
-            prev_block_hash: block_id(&parent),
-            state_root: new_root,
-            tx_root: compute_tx_root(&[]),
-            timestamp: parent.timestamp + BLOCK_TIME,
-            height: parent.height + 1,
-            miner_address: Address([0u8; 32]),
-            nonce: 0,
-            difficulty_target: TEST_TARGET,
-            log_slots: parent.log_slots,
-            active_slot_count: parent.active_slot_count,
-            alloc_counter: parent.alloc_counter,
-        };
-        Block {
-            header,
-            transactions: vec![],
-        }
+    fn build_coinbase_block_on(ctx: &mut MdbxChainContext) -> Block {
+        let slot_index = ctx
+            .tip_height()
+            .checked_add(1)
+            .and_then(|height| u32::try_from(height).ok())
+            .expect("test height fits a fresh slot index");
+        build_coinbase_block_at(ctx, slot_index, 0x42)
     }
 
-    fn build_coinbase_block_on(
+    fn build_coinbase_block_at(
         ctx: &mut MdbxChainContext,
         slot_index: u32,
         owner_seed: u8,
@@ -1787,6 +1758,81 @@ mod tests {
         }
     }
 
+    /// Construct the header/state pair that the old blind delta path would
+    /// accept when a coinbase overwrites an occupied slot. The exact validator
+    /// must reject it even though the supplied post-root and counters agree
+    /// with that invalid overwrite.
+    fn build_overwriting_coinbase_block_at(
+        ctx: &MdbxChainContext,
+        slot_index: u32,
+        owner_seed: u8,
+    ) -> Block {
+        use crate::chain_context::TEST_TARGET;
+        use crate::consensus::emission::block_reward;
+        use crate::fri_state::SlotValue;
+        use noid_tx::{hash_tx_body_for_shape, Transaction, TxBody, TxOutput, TxShape};
+
+        let parent = *ctx.tip_header();
+        let owner = Address([owner_seed; 32]);
+        let value = block_reward(parent.log_slots);
+        let body = TxBody::standard(
+            block_id(&parent),
+            0,
+            vec![],
+            vec![TxOutput {
+                slot_index,
+                value,
+                owner,
+                valid: true,
+            }],
+            true,
+        );
+        let tx_body_hash = hash_tx_body_for_shape(
+            TxShape::Standard4x8,
+            &body.epoch_anchor,
+            body.fee,
+            &body.inputs,
+            &body.outputs,
+            body.is_coinbase,
+        );
+        let tx = Transaction { body, tx_body_hash };
+
+        let mut blind_child = ctx.state.clone();
+        blind_child.alloc_counter = blind_child
+            .alloc_counter
+            .checked_add(1)
+            .expect("test allocation counter");
+        blind_child.active_slot_count = blind_child
+            .active_slot_count
+            .checked_add(1)
+            .expect("test active-slot counter");
+        blind_child
+            .state
+            .set_slot(
+                slot_index,
+                SlotValue::with_owner_fields(value, blind_child.alloc_counter, owner.as_fields()),
+            )
+            .expect("blind overwrite fixture stays in range");
+        let state_root = blind_child.state_root();
+
+        Block {
+            header: BlockHeader {
+                prev_block_hash: block_id(&parent),
+                state_root,
+                tx_root: compute_tx_root(std::slice::from_ref(&tx)),
+                timestamp: parent.timestamp + BLOCK_TIME,
+                height: parent.height + 1,
+                miner_address: owner,
+                nonce: owner_seed as u128,
+                difficulty_target: TEST_TARGET,
+                log_slots: parent.log_slots,
+                active_slot_count: blind_child.active_slot_count,
+                alloc_counter: blind_child.alloc_counter,
+            },
+            transactions: vec![tx],
+        }
+    }
+
     fn apply_coinbase_only_for_test(
         ctx: &mut MdbxChainContext,
         block: &Block,
@@ -1807,7 +1853,7 @@ mod tests {
             block_proof_bytes,
             block_auth_sidecar_bytes,
             local_time,
-            |_block,
+            |block,
              _proof_bytes,
              _auth_sidecar_bytes,
              _parent,
@@ -1816,9 +1862,11 @@ mod tests {
              _local_time,
              _anchor,
              _pre_state,
-             _state|
-             -> Result<[u8; 32], std::convert::Infallible> {
-                unreachable!("empty/coinbase-only blocks do not call full proof validator")
+             state|
+             -> Result<[u8; 32], String> {
+                crate::block::apply_block(state, block)
+                    .map(|transition| transition.new_state_root)
+                    .map_err(|error| format!("test exact transition rejected: {error:?}"))
             },
         )
     }
@@ -1910,7 +1958,7 @@ mod tests {
         // Apply one block.
         {
             let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
-            let block = build_empty_block_on(&mut ctx);
+            let block = build_coinbase_block_on(&mut ctx);
             let ts = block.header.timestamp + 1;
             apply_coinbase_only_for_test(&mut ctx, &block, ts).unwrap();
             assert_eq!(ctx.tip_height(), 1);
@@ -1933,13 +1981,33 @@ mod tests {
     }
 
     #[test]
+    fn coinbase_only_durable_boundary_rejects_occupied_mint_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
+        let first = build_coinbase_block_at(&mut ctx, 7, 0x41);
+        apply_coinbase_only_for_test(&mut ctx, &first, first.header.timestamp + 1)
+            .expect("first coinbase occupies slot 7");
+
+        let before_tip = ctx.tip_height();
+        let before_root = ctx.state.cached_state_root();
+        let overwrite = build_overwriting_coinbase_block_at(&ctx, 7, 0x42);
+        let error =
+            apply_coinbase_only_for_test(&mut ctx, &overwrite, overwrite.header.timestamp + 1)
+                .expect_err("coinbase must prove its mint slot was empty");
+
+        assert!(matches!(error, MdbxContextError::Consensus(_)));
+        assert_eq!(ctx.tip_height(), before_tip);
+        assert_eq!(ctx.state.cached_state_root(), before_root);
+    }
+
+    #[test]
     fn reorg_removes_orphan_tx_index_and_persists_new_branch_index() {
         let dir = tempfile::tempdir().unwrap();
         let competing_dir = tempfile::tempdir().unwrap();
 
         let (orphan_hash, canonical_hash) = {
             let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
-            let old_block = build_coinbase_block_on(&mut ctx, 7, 0x11);
+            let old_block = build_coinbase_block_at(&mut ctx, 7, 0x11);
             let orphan_hash = old_block.transactions[0].tx_body_hash;
             apply_coinbase_only_for_test(&mut ctx, &old_block, old_block.header.timestamp + 1)
                 .unwrap();
@@ -1952,7 +2020,7 @@ mod tests {
             // genesis in an independent context.
             let mut competing =
                 MdbxChainContext::open_or_create_for_test(competing_dir.path()).unwrap();
-            let new_block = build_coinbase_block_on(&mut competing, 9, 0x22);
+            let new_block = build_coinbase_block_at(&mut competing, 9, 0x22);
             let canonical_hash = new_block.transactions[0].tx_body_hash;
             assert_ne!(orphan_hash, canonical_hash);
 
@@ -2351,7 +2419,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
         let initial_tip_hash = ctx.tip_hash();
-        let block = build_empty_block_on(&mut ctx);
+        let block = build_coinbase_block_on(&mut ctx);
         let block_hash = block_id(&block.header);
         let ts = block.header.timestamp + 1;
 
@@ -2399,7 +2467,7 @@ mod tests {
         {
             let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
             for _ in 0..3 {
-                let block = build_empty_block_on(&mut ctx);
+                let block = build_coinbase_block_on(&mut ctx);
                 let ts = block.header.timestamp + 1;
                 apply_coinbase_only_for_test(&mut ctx, &block, ts).unwrap();
             }
@@ -2407,7 +2475,7 @@ mod tests {
 
         let ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
         assert_eq!(ctx.tip_height(), 3);
-        assert_eq!(ctx.state.active_slot_count, 0);
+        assert_eq!(ctx.state.active_slot_count, 3);
     }
 
     #[test]
@@ -2418,7 +2486,7 @@ mod tests {
         {
             let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
             for _ in 0..3 {
-                let block = build_empty_block_on(&mut ctx);
+                let block = build_coinbase_block_on(&mut ctx);
                 let ts = block.header.timestamp + 1;
                 apply_coinbase_only_for_test(&mut ctx, &block, ts).unwrap();
             }
@@ -2447,7 +2515,7 @@ mod tests {
         {
             let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
             for _ in 0..(CONSENSUS_FINALITY_DEPTH + 2) {
-                let block = build_empty_block_on(&mut ctx);
+                let block = build_coinbase_block_on(&mut ctx);
                 let ts = block.header.timestamp + 1;
                 apply_coinbase_only_for_test(&mut ctx, &block, ts).unwrap();
             }
@@ -2497,7 +2565,7 @@ mod tests {
         {
             let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
             for _ in 0..(CONSENSUS_FINALITY_DEPTH + 2) {
-                let block = build_empty_block_on(&mut ctx);
+                let block = build_coinbase_block_on(&mut ctx);
                 apply_coinbase_only_for_test(&mut ctx, &block, block.header.timestamp + 1).unwrap();
             }
             let package = ctx.generate_immutable_checkpoint().unwrap();
@@ -2507,7 +2575,7 @@ mod tests {
             assert_eq!(checkpoint_height, ctx.finalized_checkpoint().height);
             assert_eq!(package.manifest.covered_from, 1);
             assert_eq!(package.manifest.covered_to, checkpoint_height);
-            assert_eq!(package.manifest.segment_count, 0);
+            assert_eq!(package.manifest.segment_count, 1);
 
             let coverage = ctx.store.get_checkpoint_coverage().unwrap().unwrap();
             assert_eq!(coverage.checkpoint_id, checkpoint_id);
@@ -2539,7 +2607,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
         for _ in 0..(CONSENSUS_FINALITY_DEPTH + 2) {
-            let block = build_empty_block_on(&mut ctx);
+            let block = build_coinbase_block_on(&mut ctx);
             apply_coinbase_only_for_test(&mut ctx, &block, block.header.timestamp + 1).unwrap();
         }
 
@@ -2558,13 +2626,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
 
-        let first = build_empty_block_on(&mut ctx);
+        let first = build_coinbase_block_on(&mut ctx);
         apply_coinbase_only_for_test(&mut ctx, &first, first.header.timestamp + 1).unwrap();
         ctx.store.put_block_proof(1, b"proof-1").unwrap();
         ctx.store.put_block_auth_sidecar(1, b"sidecar-1").unwrap();
 
         for _ in 0..(CONSENSUS_FINALITY_DEPTH + 2) {
-            let block = build_empty_block_on(&mut ctx);
+            let block = build_coinbase_block_on(&mut ctx);
             apply_coinbase_only_for_test(&mut ctx, &block, block.header.timestamp + 1).unwrap();
         }
 
@@ -2586,7 +2654,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
 
-        let first = build_empty_block_on(&mut ctx);
+        let first = build_coinbase_block_on(&mut ctx);
         apply_coinbase_only_for_test(&mut ctx, &first, first.header.timestamp + 1).unwrap();
         ctx.store.put_block_proof(1, b"proof-1").unwrap();
         ctx.store.put_block_auth_sidecar(1, b"sidecar-1").unwrap();
@@ -2596,7 +2664,7 @@ mod tests {
             .unwrap();
 
         for _ in 0..CONSENSUS_FINALITY_DEPTH {
-            let block = build_empty_block_on(&mut ctx);
+            let block = build_coinbase_block_on(&mut ctx);
             apply_coinbase_only_for_test(&mut ctx, &block, block.header.timestamp + 1).unwrap();
         }
         assert_eq!(ctx.tip_height(), CONSENSUS_FINALITY_DEPTH + 1);
@@ -2612,7 +2680,7 @@ mod tests {
                 history_proof_covered_to: Some(1),
             })
             .unwrap();
-        let block = build_empty_block_on(&mut ctx);
+        let block = build_coinbase_block_on(&mut ctx);
         apply_coinbase_only_for_test(&mut ctx, &block, block.header.timestamp + 1).unwrap();
 
         assert_eq!(ctx.store.get_recent_block(1).unwrap(), None);
@@ -2635,7 +2703,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
 
-        let first = build_empty_block_on(&mut ctx);
+        let first = build_coinbase_block_on(&mut ctx);
         apply_coinbase_only_for_test(&mut ctx, &first, first.header.timestamp + 1).unwrap();
         ctx.store.put_block_proof(1, b"proof-1").unwrap();
         ctx.store.put_block_auth_sidecar(1, b"sidecar-1").unwrap();
@@ -2645,7 +2713,7 @@ mod tests {
             .unwrap();
 
         for _ in 0..CONSENSUS_FINALITY_DEPTH {
-            let block = build_empty_block_on(&mut ctx);
+            let block = build_coinbase_block_on(&mut ctx);
             apply_coinbase_only_for_test(&mut ctx, &block, block.header.timestamp + 1).unwrap();
         }
         ctx.store
@@ -2658,7 +2726,7 @@ mod tests {
                 history_proof_covered_to: None,
             })
             .unwrap();
-        let block = build_empty_block_on(&mut ctx);
+        let block = build_coinbase_block_on(&mut ctx);
         apply_coinbase_only_for_test(&mut ctx, &block, block.header.timestamp + 1).unwrap();
 
         assert!(ctx.store.get_recent_block(1).unwrap().is_some());
@@ -2687,14 +2755,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
 
-        let first = build_empty_block_on(&mut ctx);
+        let first = build_coinbase_block_on(&mut ctx);
         apply_coinbase_only_for_test(&mut ctx, &first, first.header.timestamp + 1).unwrap();
         ctx.store.put_block_proof(1, b"proof-1").unwrap();
         ctx.store.put_block_auth_sidecar(1, b"sidecar-1").unwrap();
         ctx.store.put_history_claim(1, b"claim-1").unwrap();
 
         for _ in 0..CONSENSUS_FINALITY_DEPTH {
-            let block = build_empty_block_on(&mut ctx);
+            let block = build_coinbase_block_on(&mut ctx);
             apply_coinbase_only_for_test(&mut ctx, &block, block.header.timestamp + 1).unwrap();
         }
         ctx.store
@@ -2707,7 +2775,7 @@ mod tests {
                 history_proof_covered_to: Some(1),
             })
             .unwrap();
-        let block = build_empty_block_on(&mut ctx);
+        let block = build_coinbase_block_on(&mut ctx);
         apply_coinbase_only_for_test(&mut ctx, &block, block.header.timestamp + 1).unwrap();
 
         assert!(ctx.store.get_recent_block(1).unwrap().is_some());
@@ -2732,7 +2800,7 @@ mod tests {
 
         {
             let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
-            let block = build_empty_block_on(&mut ctx);
+            let block = build_coinbase_block_on(&mut ctx);
             let ts = block.header.timestamp + 1;
             root_after_block = apply_coinbase_only_for_test(&mut ctx, &block, ts).unwrap();
         }
@@ -2754,7 +2822,7 @@ mod tests {
         // First run: apply one block.
         {
             let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
-            let block = build_empty_block_on(&mut ctx);
+            let block = build_coinbase_block_on(&mut ctx);
             apply_coinbase_only_for_test(&mut ctx, &block, block.header.timestamp + 1).unwrap();
         }
 

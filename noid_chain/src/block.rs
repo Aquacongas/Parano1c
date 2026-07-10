@@ -6,8 +6,9 @@
 //!
 //! A `Block` is a header plus an ordered list of transactions. Live full-node
 //! validation is proof-native: the block proof establishes the state transition,
-//! then the node commits the proven delta with `apply_state_delta`. The native
-//! sequential interpreter remains only for in-memory tests and local utilities.
+//! then the node commits the sealed exact slot updates through
+//! `ChainState::apply_verified_exact_transition`. The native sequential
+//! interpreter remains only for in-memory tests and local utilities.
 //! Per-tx state-root chaining is obsolete; block-level state validation ensures
 //! `header.state_root` matches the final computed post-root after all txs are applied, and
 //! `tx_root` equals the Merkle reduction over the transactions'
@@ -48,7 +49,8 @@ pub struct Block {
 pub enum ProofBindingError {
     /// A block with user transactions did not include detached `BlockProof` bytes.
     MissingProof,
-    /// A coinbase-only block carried proof bytes. Empty blocks have no block proof.
+    /// A structurally no-user block carried proof bytes. Consensus separately
+    /// requires its mandatory coinbase.
     UnexpectedProofForCoinbaseOnly,
 }
 
@@ -90,6 +92,8 @@ pub enum BlockApplyError {
     Tx(ApplyError),
     /// Block carries more transactions than the hard wire/DoS cap.
     TooManyTransactions,
+    /// Canonical genesis must have an empty transaction list.
+    GenesisHasTransactions,
     /// Transaction uses a shape that is not supported by the current proof stack.
     UnsupportedTxShape,
     /// `tx.body_hash` does not match the canonical hash of `tx.body`.
@@ -126,7 +130,7 @@ impl From<ApplyError> for BlockApplyError {
 /// utility contexts that need to recompute a transition directly. On error,
 /// `state` is left untouched (work happens on a snapshot and is swapped only on
 /// success).
-pub fn apply_block(
+pub(crate) fn apply_block(
     state: &mut ChainState,
     block: &Block,
 ) -> Result<StateTransition, BlockApplyError> {
@@ -225,7 +229,8 @@ pub fn apply_block(
     })
 }
 
-/// Apply a block's state delta without re-validating pre-conditions.
+/// Test-only differential primitive that applies a block delta without
+/// re-validating pre-conditions.
 ///
 /// **Proof-native path** — called after the minimal block verifier succeeds.
 /// The verifier has already established that:
@@ -241,10 +246,10 @@ pub fn apply_block(
 ///      `block.header.state_root`.
 ///   5. Still checks tx_root (cheap, O(n) hashing).
 ///
-/// This is the live production apply primitive for non-genesis blocks after
-/// proof verification. The native post-root check is a consensus belt; it does
-/// not replace the proof-layer state-transition argument.
-pub fn apply_state_delta(
+/// Production acceptance commits the sealed exact transition returned by the
+/// verifier and never calls this blind interpreter.
+#[cfg(test)]
+pub(crate) fn apply_state_delta(
     state: &mut ChainState,
     block: &Block,
 ) -> Result<StateTransition, BlockApplyError> {
@@ -348,7 +353,11 @@ pub fn apply_genesis_block(
     if block.transactions.len() > BLOCK_MAX_TXS {
         return Err(BlockApplyError::TooManyTransactions);
     }
-    // Genesis has no transactions (empty block, no coinbase).
+    // Genesis alone has no transactions and no coinbase. Check the body list
+    // itself before trusting its independently supplied tx_root.
+    if !block.transactions.is_empty() {
+        return Err(BlockApplyError::GenesisHasTransactions);
+    }
     // tx_root must be [0;32] (empty).
     if block.header.tx_root != [0u8; 32] {
         return Err(BlockApplyError::HeaderTxRootMismatch);
@@ -373,8 +382,9 @@ pub fn apply_genesis_block(
 /// Compute the block's tx-root — a COMPRESS-domain Merkle reduction over
 /// each transaction's `tx_body_hash`, zero-padded to the block's
 /// TIER-QUANTIZED transaction capacity ([`params::tx_tree_target`]). An
-/// empty block reduces to `ZERO_DIGEST` so a zero-tx header is
-/// unambiguously representable.
+/// zero-transaction genesis reduces to `ZERO_DIGEST` so its header is
+/// unambiguously representable. Every non-genesis block has at least the
+/// mandatory coinbase leaf.
 ///
 /// Uses a Poseidon2b COMPRESS binary Merkle tree. Padding to the shape
 /// class's capacity (not the real count) keeps the tree depth a pure
@@ -829,9 +839,9 @@ mod tests {
     }
 
     #[test]
-    fn apply_block_allows_no_proof_coinbase_only() {
+    fn internal_interpreter_can_apply_structurally_empty_noop() {
         let mut state = fresh_state();
-        let txs: Vec<Transaction> = vec![]; // empty block (no coinbase in this test)
+        let txs: Vec<Transaction> = vec![]; // internal interpreter no-op, not an accepted child
         let header = BlockHeader {
             prev_block_hash: [0u8; 32],
             state_root: state.state_root(),
@@ -849,7 +859,10 @@ mod tests {
             header,
             transactions: txs,
         };
-        apply_block(&mut state, &block).expect("empty block without proof should be accepted");
+        // `apply_block` is crate-private and does not establish consensus by
+        // itself. Every non-genesis accepted entry point first runs the shared
+        // mandatory-coinbase predicate.
+        apply_block(&mut state, &block).expect("internal no-op transition applies");
     }
 
     #[test]
@@ -1137,6 +1150,16 @@ mod tests {
         };
         let result = apply_genesis_block(&mut state, &block);
         assert!(result.is_ok(), "genesis block must apply: {:?}", result);
+
+        let mut nonempty = block;
+        nonempty
+            .transactions
+            .push(build_tx(&mut state, vec![], vec![mk_output(1)]));
+        assert_eq!(
+            apply_genesis_block(&mut state, &nonempty),
+            Err(BlockApplyError::GenesisHasTransactions),
+            "genesis must reject a body even when the header claims the empty tx root"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1420,7 +1443,7 @@ mod tests {
         use crate::consensus::{
             genesis::GENESIS_TIMESTAMP,
             params::BLOCK_TIME,
-            pow::block_id,
+            template::build_block_template,
             validation::{validate_block_consensus, AnchorInfo},
         };
         const TEST_TARGET: [u8; 32] = [0xFF; 32];
@@ -1444,37 +1467,30 @@ mod tests {
             alloc_counter: 12,
         };
 
-        // Build the expansion block header.
-        let mut exp_state = state.clone();
-        exp_state.expand_one();
-        let mut expansion_header = BlockHeader {
-            prev_block_hash: block_id(&parent),
-            state_root: exp_state.state_root(),
-            tx_root: compute_tx_root(&[]),
-            timestamp: GENESIS_TIMESTAMP + BLOCK_TIME,
-            height: 1,
-            miner_address: noid_poseidon2b::primitives::Address([0u8; 32]),
-            nonce: 0,
-            difficulty_target: TEST_TARGET,
-            log_slots: 5,          // expanded!
-            active_slot_count: 12, // unchanged (no mints/spends)
-            alloc_counter: 12,
-        };
-        expansion_header.nonce = 0; // TEST_TARGET: any nonce works
-
+        // Supply EXPANSION_WINDOW copies of the triggering occupancy so
+        // the median equals the parent's active_slot_count and fires.
+        let active_window = vec![parent.active_slot_count; 18];
+        let template = build_block_template(
+            &parent,
+            &state,
+            &active_window,
+            vec![],
+            noid_poseidon2b::primitives::Address([0u8; 32]),
+            GENESIS_TIMESTAMP + BLOCK_TIME,
+            TEST_TARGET,
+        )
+        .expect("canonical expansion coinbase template");
         let block = Block {
-            header: expansion_header,
-            transactions: vec![],
+            header: template.clone().into_header(0),
+            transactions: template.all_txs(),
         };
+        assert_eq!(block.header.log_slots, 5);
         let anchor = AnchorInfo {
             anchor_height: 0,
             anchor_timestamp: GENESIS_TIMESTAMP,
             anchor_target: TEST_TARGET,
         };
         let mut apply_state = state.clone();
-        // Supply EXPANSION_WINDOW copies of the triggering occupancy so
-        // the median equals the parent's active_slot_count and fires.
-        let active_window = vec![parent.active_slot_count; 18];
         let result = validate_block_consensus(
             &block,
             &parent,

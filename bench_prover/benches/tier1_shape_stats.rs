@@ -32,18 +32,19 @@ use noid_chain::block::{compute_tx_root, Block};
 use noid_chain::consensus::difficulty::{block_work, next_target};
 use noid_chain::consensus::fees::required_fee_for_tx_body;
 use noid_chain::consensus::params::{BLOCK_TIME, MAX_TARGET};
-use noid_chain::consensus::pow::{search_pow, validate_pow};
+use noid_chain::consensus::pow::search_pow;
+use noid_chain::consensus::template::build_block_template;
 use noid_chain::consensus::validation::{validate_block_checks_timeless, AnchorInfo};
 use noid_chain::fri_state::SlotValue;
 use noid_chain::state::ChainState;
-use noid_chain::{apply_tx, build_exact_action_surface, hash_block_header, BlockHeader};
+use noid_chain::{apply_tx, build_exact_action_surface, BlockHeader};
 use noid_core::transcript::FiatShamir;
 use noid_core::Block128;
 use noid_gkr::{
-    init_owner_auth_gkr_channel, owner_auth_gkr_channel, owner_auth_inputs_from_body_and_live_secrets,
-    prove_owner_auth_killshot, verify_accepted_claim_hash_killshot,
-    verify_batched_merkle_killshot, verify_batched_slot_leaf_killshot,
-    verify_block_spine_killshot,
+    init_owner_auth_gkr_channel, owner_auth_gkr_channel,
+    owner_auth_inputs_from_body_and_live_secrets, prove_owner_auth_killshot,
+    verify_accepted_claim_hash_killshot, verify_batched_merkle_killshot,
+    verify_batched_slot_leaf_killshot, verify_block_spine_killshot,
     verify_chain_accumulator_killshot_padded, verify_header_hash_killshot_padded,
     verify_owner_auth_killshot, verify_sweep_block_spine_killshot, MerkleCircuit, OwnerAuthCircuit,
     MAX_MERKLE_DEPTH,
@@ -52,10 +53,10 @@ use noid_poseidon2b::channel::Poseidon2bChannel;
 use noid_poseidon2b::native::domain::TAG_EXSTNOD;
 use noid_poseidon2b::primitives::{derive_address, Address, SpendSecret};
 use noid_recursive::{
-    chain_accumulator_proof_inputs,
-    header_hash_proof_inputs, prove_accepted_block_certificate_receipt_projection_proof,
-    verify_pow_header_witness_batch_native,
-    ChainAccumulator, HeaderWitness, RecursiveConsensusState,
+    chain_accumulator_proof_inputs, header_hash_proof_inputs,
+    prove_accepted_block_certificate_receipt_projection_proof,
+    verify_pow_header_witness_batch_native, ChainAccumulator, HeaderWitness,
+    RecursiveConsensusState,
 };
 use noid_tx::{
     hash_tx_body_for_shape, validate_public_tx_logic, Transaction, TxBody, TxInput, TxOutput,
@@ -67,8 +68,6 @@ use rayon::prelude::*;
 // (linear layers live in the F128-coefficient matrices for free):
 // 90 S-boxes x 4 multiplications.
 const PERM_TRACE_CONSTRAINTS: usize = 360;
-const PREMINED_COINBASE_NONCE: u128 = 142_522;
-const PREMINED_USER_BLOCK_NONCE: u128 = 399_004;
 const BENCH_POW_SEARCH_RANGE: u128 = 100_000_000;
 const BENCH_POW_CHUNK_SIZE: u128 = 65_536;
 
@@ -237,12 +236,12 @@ fn bench_pow_nonce(header: &BlockHeader) -> u128 {
     panic!("bench target mines")
 }
 
-fn empty_child(
+fn canonical_child(
     parent: &BlockHeader,
     state: &ChainState,
     rolling_consensus: &RecursiveConsensusState,
-    premined_nonce: Option<u128>,
-) -> Block {
+    candidate_txs: Vec<Transaction>,
+) -> (Block, ChainState) {
     let timestamp = parent.timestamp + BLOCK_TIME;
     let difficulty_target = next_target(
         rolling_consensus.asert_anchor_height,
@@ -251,41 +250,49 @@ fn empty_child(
         parent.height + 1,
         timestamp,
     );
-    let mut header = BlockHeader {
-        prev_block_hash: hash_block_header(parent),
-        state_root: state.cached_state_root(),
-        tx_root: compute_tx_root(&[]),
+    let expected_user_txs = candidate_txs.len();
+    let template = build_block_template(
+        parent,
+        state,
+        rolling_consensus.active_counts(),
+        candidate_txs,
+        Address([0x22; 32]),
         timestamp,
-        height: parent.height + 1,
-        miner_address: Address([0x22; 32]),
-        nonce: 0,
         difficulty_target,
-        log_slots: parent.log_slots,
-        active_slot_count: parent.active_slot_count,
-        alloc_counter: parent.alloc_counter,
-    };
-    if let Some(nonce) = premined_nonce {
-        header.nonce = nonce;
-        validate_pow(&header).expect("premined bench nonce is valid");
-    } else {
-        header.nonce = bench_pow_nonce(&header);
+    )
+    .expect("canonical bench block template");
+    assert_eq!(
+        template.txs.len(),
+        expected_user_txs,
+        "bench template must select every prepared user transaction"
+    );
+    let transactions = template.all_txs();
+    assert!(transactions[0].body.is_coinbase, "coinbase is tx0");
+    let nonce = bench_pow_nonce(&template.to_pow_header(0));
+    let header = template.into_header(nonce);
+
+    let mut child_state = state.clone();
+    for tx in &transactions {
+        apply_tx(&mut child_state, &tx.body).expect("canonical bench transaction applies");
     }
-    Block {
-        header,
-        transactions: vec![],
-    }
+    assert_eq!(child_state.cached_state_root(), header.state_root);
+    assert_eq!(child_state.active_slot_count, header.active_slot_count);
+    assert_eq!(child_state.alloc_counter, header.alloc_counter);
+
+    (
+        Block {
+            header,
+            transactions,
+        },
+        child_state,
+    )
 }
 
 fn coinbase_only_batch() -> FullBatchFixture {
     let mut start_state = ChainState::with_log_slots(8);
     let parent = parent_header(&mut start_state);
     let (start_consensus, start_accumulator) = start_tuple(&parent);
-    let block = empty_child(
-        &parent,
-        &start_state,
-        &start_consensus,
-        Some(PREMINED_COINBASE_NONCE),
-    );
+    let (block, _) = canonical_child(&parent, &start_state, &start_consensus, vec![]);
     verify_pow_header_witness_batch_native(
         &start_consensus,
         &[HeaderWitness::from_header(&block.header)],
@@ -340,8 +347,6 @@ fn auth_proof_for_body(body: &TxBody) -> noid_gkr::OwnerAuthProofKillShot {
 }
 
 /// A single block with `n` independent Standard4x8 user transactions.
-/// `n == 1` reproduces the `one_user_block` fixture of full_accepted_batch.rs
-/// (premined nonce); larger `n` searches PoW (cheap at bench difficulty).
 fn user_txs_block_batch(n: usize) -> FullBatchFixture {
     assert!(n >= 1);
     let log_slots = if n <= 1 {
@@ -361,26 +366,17 @@ fn user_txs_block_batch(n: usize) -> FullBatchFixture {
     let input_slot = |i: usize| 2 + 2 * i;
     let output_slot = |i: usize| 3 + 2 * i;
     for i in 0..n {
-        let pre_slot = SlotValue {
-            value: Block128::from(input_value as u128),
-            owner_hi: owners[i].as_fields()[0],
-            owner_lo: owners[i].as_fields()[1],
-        };
+        let pre_slot =
+            SlotValue::with_owner_fields(input_value, (i + 1) as u64, owners[i].as_fields());
         start_state
             .state
             .set_slot(input_slot(i) as u32, pre_slot)
             .unwrap();
     }
-    // The one-transaction fixture keeps its dedicated layout (input slot 2,
-    // output slot 5, alloc_counter 2) so the premined nonce stays valid.
     let single_tx_layout = n == 1;
     start_state.rebuild_exact_utxo_root_loaded().unwrap();
     start_state.active_slot_count = n as u64;
-    start_state.alloc_counter = if single_tx_layout {
-        2
-    } else {
-        (input_slot(n - 1) + 1) as u64
-    };
+    start_state.alloc_counter = n as u64;
 
     let parent = parent_header(&mut start_state);
     let (start_consensus, start_accumulator) = start_tuple(&parent);
@@ -395,7 +391,7 @@ fn user_txs_block_batch(n: usize) -> FullBatchFixture {
             inputs: vec![TxInput {
                 slot_index: input_slot(i) as u32,
                 value: input_value,
-                creation_id: 0,
+                creation_id: (i + 1) as u64,
                 owner: owners[i],
                 spend_secret: secrets[i].clone(),
                 valid: true,
@@ -415,60 +411,30 @@ fn user_txs_block_batch(n: usize) -> FullBatchFixture {
         bodies.push(body);
     }
     let txs: Vec<Transaction> = bodies.iter().cloned().map(tx_from_body).collect();
+    let (block, _) = canonical_child(&parent, &start_state, &start_consensus, txs);
+    let block_bodies: Vec<_> = block
+        .transactions
+        .iter()
+        .map(|tx| tx.body.clone())
+        .collect();
 
     let parent_cache = {
         let mut tmp = start_state.clone();
         tmp.exact_sparse_cache().unwrap()
     };
-    let claims: Vec<_> = bodies
+    let claims: Vec<_> = block_bodies
         .iter()
         .map(|body| noid_tx::compute_claims_commitment(&body.inputs, &body.outputs))
         .collect();
     let surface = build_exact_action_surface(
         &start_state.state,
-        &bodies,
+        &block_bodies,
         &claims,
         start_state.alloc_counter,
     )
-    .expect("exact action surface");
-    let state_transition = build_exact_state_transition_proof(&parent_cache, &surface)
-    .expect("exact proof");
-
-    let mut child_state = start_state.clone();
-    for body in &bodies {
-        apply_tx(&mut child_state, body).expect("native tx apply");
-    }
-    let child_state_root = child_state.cached_state_root();
-    let timestamp = parent.timestamp + BLOCK_TIME;
-    let mut header = BlockHeader {
-        prev_block_hash: hash_block_header(&parent),
-        state_root: child_state_root,
-        tx_root: compute_tx_root(&txs),
-        timestamp,
-        height: parent.height + 1,
-        miner_address: Address([0x22; 32]),
-        nonce: 0,
-        difficulty_target: next_target(
-            start_consensus.asert_anchor_height,
-            start_consensus.asert_anchor_timestamp,
-            &start_consensus.asert_anchor_target,
-            parent.height + 1,
-            timestamp,
-        ),
-        log_slots: parent.log_slots,
-        active_slot_count: child_state.active_slot_count,
-        alloc_counter: child_state.alloc_counter,
-    };
-    if single_tx_layout {
-        header.nonce = PREMINED_USER_BLOCK_NONCE;
-        validate_pow(&header).expect("premined user-block bench nonce is valid");
-    } else {
-        header.nonce = bench_pow_nonce(&header);
-    }
-    let block = Block {
-        header,
-        transactions: txs,
-    };
+    .expect("coinbase + Standard user exact action surface");
+    let state_transition =
+        build_exact_state_transition_proof(&parent_cache, &surface).expect("exact proof");
     let block_proof = BlockProof::minimal(
         parent.state_root,
         block.header.state_root,
@@ -476,7 +442,12 @@ fn user_txs_block_batch(n: usize) -> FullBatchFixture {
         state_transition,
     );
     let auth_sidecar = BlockAuthSidecar {
-        tx_auth: bodies.iter().map(auth_proof_for_body).collect(),
+        tx_auth: block
+            .transactions
+            .iter()
+            .filter(|tx| !tx.body.is_coinbase)
+            .map(|tx| auth_proof_for_body(&tx.body))
+            .collect(),
     };
     let item = FullAcceptedBlockBatchItem {
         block,
@@ -492,23 +463,18 @@ fn user_txs_block_batch(n: usize) -> FullBatchFixture {
     )
 }
 
-fn sweep_spend_secret(tx_index: usize, input_index: usize) -> SpendSecret {
+fn sweep_spend_secret(tx_index: usize) -> SpendSecret {
     let mut bytes = [0u8; 32];
     bytes[0] = 0x53; // 'S'weep domain byte, distinct from spend_secret()
     bytes[1..9].copy_from_slice(&(tx_index as u64).to_le_bytes());
-    bytes[9..17].copy_from_slice(&(input_index as u64).to_le_bytes());
-    for i in 17..32 {
-        bytes[i] = (tx_index as u8)
-            .wrapping_mul(31)
-            .wrapping_add(input_index as u8)
-            .wrapping_add(i as u8);
+    for i in 9..32 {
+        bytes[i] = (tx_index as u8).wrapping_mul(31).wrapping_add(i as u8);
     }
     SpendSecret(bytes)
 }
 
 /// A single block with `n` independent full Sweep25x2 user transactions
-/// (25 live inputs with a distinct owner each / 2 outputs — the heaviest
-/// per-tx authorization shape; the sweep-heavy adversarial case).
+/// (25 live inputs from one owner / 2 outputs; the sweep-heavy shape).
 fn sweep_txs_block_batch(n: usize) -> FullBatchFixture {
     assert!(n >= 1);
     const SWEEP_INPUTS: usize = 25;
@@ -522,17 +488,13 @@ fn sweep_txs_block_batch(n: usize) -> FullBatchFixture {
     let in_slot = |tx: usize, k: usize| 2 + tx * SLOTS_PER_TX + k;
     let out_slot = |tx: usize, k: usize| 2 + tx * SLOTS_PER_TX + SWEEP_INPUTS + k;
 
-    let secrets: Vec<Vec<SpendSecret>> = (0..n)
-        .map(|tx| (0..SWEEP_INPUTS).map(|k| sweep_spend_secret(tx, k)).collect())
-        .collect();
+    let secrets: Vec<SpendSecret> = (0..n).map(sweep_spend_secret).collect();
+    let owners: Vec<Address> = secrets.iter().map(derive_address).collect();
     for tx in 0..n {
         for k in 0..SWEEP_INPUTS {
-            let owner = derive_address(&secrets[tx][k]);
-            let pre_slot = SlotValue {
-                value: Block128::from(input_value as u128),
-                owner_hi: owner.as_fields()[0],
-                owner_lo: owner.as_fields()[1],
-            };
+            let creation_id = (tx * SWEEP_INPUTS + k + 1) as u64;
+            let pre_slot =
+                SlotValue::with_owner_fields(input_value, creation_id, owners[tx].as_fields());
             start_state
                 .state
                 .set_slot(in_slot(tx, k) as u32, pre_slot)
@@ -541,7 +503,7 @@ fn sweep_txs_block_batch(n: usize) -> FullBatchFixture {
     }
     start_state.rebuild_exact_utxo_root_loaded().unwrap();
     start_state.active_slot_count = (n * SWEEP_INPUTS) as u64;
-    start_state.alloc_counter = (2 + n * SLOTS_PER_TX) as u64;
+    start_state.alloc_counter = (n * SWEEP_INPUTS) as u64;
 
     let parent = parent_header(&mut start_state);
     let (start_consensus, start_accumulator) = start_tuple(&parent);
@@ -552,9 +514,9 @@ fn sweep_txs_block_batch(n: usize) -> FullBatchFixture {
             .map(|k| TxInput {
                 slot_index: in_slot(tx, k) as u32,
                 value: input_value,
-                creation_id: 0,
-                owner: derive_address(&secrets[tx][k]),
-                spend_secret: secrets[tx][k].clone(),
+                creation_id: (tx * SWEEP_INPUTS + k + 1) as u64,
+                owner: owners[tx],
+                spend_secret: secrets[tx].clone(),
                 valid: true,
             })
             .collect();
@@ -568,13 +530,13 @@ fn sweep_txs_block_batch(n: usize) -> FullBatchFixture {
                 TxOutput {
                     slot_index: out_slot(tx, 0) as u32,
                     value: total_in / 2,
-                    owner: derive_address(&secrets[tx][0]),
+                    owner: owners[tx],
                     valid: true,
                 },
                 TxOutput {
                     slot_index: out_slot(tx, 1) as u32,
                     value: total_in - total_in / 2,
-                    owner: derive_address(&secrets[tx][1]),
+                    owner: owners[tx],
                     valid: true,
                 },
             ],
@@ -589,55 +551,30 @@ fn sweep_txs_block_batch(n: usize) -> FullBatchFixture {
         bodies.push(body);
     }
     let txs: Vec<Transaction> = bodies.iter().cloned().map(tx_from_body).collect();
+    let (block, _) = canonical_child(&parent, &start_state, &start_consensus, txs);
+    let block_bodies: Vec<_> = block
+        .transactions
+        .iter()
+        .map(|tx| tx.body.clone())
+        .collect();
 
     let parent_cache = {
         let mut tmp = start_state.clone();
         tmp.exact_sparse_cache().unwrap()
     };
-    let claims: Vec<_> = bodies
+    let claims: Vec<_> = block_bodies
         .iter()
         .map(|body| noid_tx::compute_claims_commitment(&body.inputs, &body.outputs))
         .collect();
     let surface = build_exact_action_surface(
         &start_state.state,
-        &bodies,
+        &block_bodies,
         &claims,
         start_state.alloc_counter,
     )
-    .expect("exact action surface");
-    let state_transition = build_exact_state_transition_proof(&parent_cache, &surface)
-    .expect("exact proof");
-
-    let mut child_state = start_state.clone();
-    for body in &bodies {
-        apply_tx(&mut child_state, body).expect("native tx apply");
-    }
-    let child_state_root = child_state.cached_state_root();
-    let timestamp = parent.timestamp + BLOCK_TIME;
-    let mut header = BlockHeader {
-        prev_block_hash: hash_block_header(&parent),
-        state_root: child_state_root,
-        tx_root: compute_tx_root(&txs),
-        timestamp,
-        height: parent.height + 1,
-        miner_address: Address([0x22; 32]),
-        nonce: 0,
-        difficulty_target: next_target(
-            start_consensus.asert_anchor_height,
-            start_consensus.asert_anchor_timestamp,
-            &start_consensus.asert_anchor_target,
-            parent.height + 1,
-            timestamp,
-        ),
-        log_slots: parent.log_slots,
-        active_slot_count: child_state.active_slot_count,
-        alloc_counter: child_state.alloc_counter,
-    };
-    header.nonce = bench_pow_nonce(&header);
-    let block = Block {
-        header,
-        transactions: txs,
-    };
+    .expect("coinbase + Sweep user exact action surface");
+    let state_transition =
+        build_exact_state_transition_proof(&parent_cache, &surface).expect("exact proof");
     let block_proof = BlockProof::minimal(
         parent.state_root,
         block.header.state_root,
@@ -645,7 +582,12 @@ fn sweep_txs_block_batch(n: usize) -> FullBatchFixture {
         state_transition,
     );
     let auth_sidecar = BlockAuthSidecar {
-        tx_auth: bodies.iter().map(auth_proof_for_body).collect(),
+        tx_auth: block
+            .transactions
+            .iter()
+            .filter(|tx| !tx.body.is_coinbase)
+            .map(|tx| auth_proof_for_body(&tx.body))
+            .collect(),
     };
     let item = FullAcceptedBlockBatchItem {
         block,
@@ -687,7 +629,10 @@ fn replay_components(
             name: "accepted_claim_hash".into(),
             stats: ch.stats(),
             proof_bytes: proof.accepted_claim_hash.byte_len(),
-            note: format!("claims={}", components.component_inputs.accepted_claim_hash_inputs.len()),
+            note: format!(
+                "claims={}",
+                components.component_inputs.accepted_claim_hash_inputs.len()
+            ),
         });
     }
 
@@ -705,7 +650,10 @@ fn replay_components(
             name: "tx_body_standard_spine".into(),
             stats: ch.stats(),
             proof_bytes: tx_body_proof.byte_len(),
-            note: format!("txs={}", components.component_inputs.tx_body_standard_inputs.len()),
+            note: format!(
+                "txs={}",
+                components.component_inputs.tx_body_standard_inputs.len()
+            ),
         });
     }
 
@@ -723,7 +671,10 @@ fn replay_components(
             name: "tx_body_sweep_spine".into(),
             stats: ch.stats(),
             proof_bytes: sweep_proof.byte_len(),
-            note: format!("sweeps={}", components.component_inputs.tx_body_sweep_inputs.len()),
+            note: format!(
+                "sweeps={}",
+                components.component_inputs.tx_body_sweep_inputs.len()
+            ),
         });
     }
 
@@ -751,7 +702,8 @@ fn replay_components(
     }
 
     for (index, (input, witness)) in components
-        .component_inputs.authorization_inputs
+        .component_inputs
+        .authorization_inputs
         .iter()
         .zip(components.component_inputs.authorization_witnesses.iter())
         .enumerate()
@@ -810,16 +762,20 @@ fn replay_components(
     }
 
     for (index, (inputs, es_proof)) in components
-        .component_inputs.exact_state_killshot_inputs
+        .component_inputs
+        .exact_state_killshot_inputs
         .iter()
         .zip(proof.exact_state.iter())
         .enumerate()
     {
         {
             let mut ch = CountingChannel::new();
-            let ok =
-                verify_batched_slot_leaf_killshot(&es_proof.slot_leaves, &inputs.slot_leaves, &mut ch)
-                    .is_some();
+            let ok = verify_batched_slot_leaf_killshot(
+                &es_proof.slot_leaves,
+                &inputs.slot_leaves,
+                &mut ch,
+            )
+            .is_some();
             assert!(ok, "slot-leaf verifier rejected (block {index})");
             rows.push(Row {
                 name: format!("exact_state[{index}].slot_leaves"),
@@ -885,16 +841,19 @@ fn print_rows(label: &str, rows: &[Row]) -> FsStats {
 
 fn print_data_volumes(components: &FullAcceptedBlockBatchProofComponents) {
     let trace_ops: usize = components
-        .component_inputs.authorization_traces
+        .component_inputs
+        .authorization_traces
         .iter()
         .map(|trace| trace.transcript.len())
         .sum();
-    let exact_state_bytes: usize = bincode::serialized_size(&components.component_inputs.exact_state_killshot_inputs)
-        .expect("exact-state inputs serialize") as usize;
-    let spine_bytes: usize = bincode::serialized_size(&components.component_inputs.tx_body_standard_inputs)
-        .expect("spine inputs serialize") as usize
-        + bincode::serialized_size(&components.component_inputs.tx_body_sweep_inputs)
-            .expect("sweep inputs serialize") as usize;
+    let exact_state_bytes: usize =
+        bincode::serialized_size(&components.component_inputs.exact_state_killshot_inputs)
+            .expect("exact-state inputs serialize") as usize;
+    let spine_bytes: usize =
+        bincode::serialized_size(&components.component_inputs.tx_body_standard_inputs)
+            .expect("spine inputs serialize") as usize
+            + bincode::serialized_size(&components.component_inputs.tx_body_sweep_inputs)
+                .expect("sweep inputs serialize") as usize;
     println!("  [D] discharge data volumes (per block batch)");
     println!(
         "    accepted_claims={} std_txs={} sweep_txs={} tx_root_paths={} auth_witnesses={} auth_trace_ops={}",
@@ -905,7 +864,12 @@ fn print_data_volumes(components: &FullAcceptedBlockBatchProofComponents) {
         components.component_inputs.authorization_witnesses.len(),
         trace_ops,
     );
-    for (index, es) in components.component_inputs.exact_state_killshot_inputs.iter().enumerate() {
+    for (index, es) in components
+        .component_inputs
+        .exact_state_killshot_inputs
+        .iter()
+        .enumerate()
+    {
         println!(
             "    exact_state[{index}]: slot_leaves={} state_paths={}",
             es.slot_leaves.len(),
@@ -1072,8 +1036,13 @@ fn profile_component_leaves(
         let circuit = MerkleCircuit::build_with_tag(TAG_EXSTNOD);
         let mut ch = Poseidon2bChannel::new();
         let (path_time, _) = time_once(|| {
-            verify_batched_merkle_killshot(&circuit, &es_proof.state_paths, &inputs.state_paths, &mut ch)
-                .expect("component leaf probe: state-path merkle verifies")
+            verify_batched_merkle_killshot(
+                &circuit,
+                &es_proof.state_paths,
+                &inputs.state_paths,
+                &mut ch,
+            )
+            .expect("component leaf probe: state-path merkle verifies")
         });
         state_paths_total += path_time;
     }
@@ -1115,7 +1084,10 @@ fn run_case(label: &str, fixture: FullBatchFixture) {
         )
         .is_ok()
     });
-    assert!(verified, "production verify_retained path rejected the fixture");
+    assert!(
+        verified,
+        "production verify_retained path rejected the fixture"
+    );
 
     // Phase split of the full verify: native AcceptBlock replay vs killshot
     // component verification.
@@ -1185,7 +1157,9 @@ fn run_case(label: &str, fixture: FullBatchFixture) {
 
 fn main() {
     println!("tier1_shape_stats — verifier-replay shape statistics");
-    println!("counts are exact production-transcript replays; estimates use the F128-trace cost model");
+    println!(
+        "counts are exact production-transcript replays; estimates use the F128-trace cost model"
+    );
     // NOID_SHAPE_CASE=<substring> runs only matching cases (iteration aid).
     let case_filter = std::env::var("NOID_SHAPE_CASE").ok();
     let wants = |label: &str| {

@@ -92,7 +92,8 @@ pub use timestamps::{
 };
 pub use validation::{
     validate_block_checks, validate_block_checks_timeless, validate_block_consensus,
-    validate_block_resource_preflight, AnchorInfo, BlockResourcePreflight,
+    validate_block_resource_preflight, validate_mandatory_coinbase, AnchorInfo,
+    BlockResourcePreflight,
 };
 
 /// Consensus validation errors — one variant per block invariant.
@@ -128,6 +129,16 @@ pub enum ConsensusError {
     BadTxBodyHash,
     /// §16.14 — LogicProof verification failed.
     InvalidLogicProof { tx_index: usize },
+    /// Every non-genesis block must carry its canonical coinbase at index zero.
+    MissingCoinbase,
+    /// A block carries more than one transaction marked as coinbase.
+    MultipleCoinbase,
+    /// The unique coinbase is present but is not transaction zero.
+    CoinbaseNotFirst,
+    /// Coinbase must use the Standard4x8 transaction shape.
+    BadCoinbaseShape,
+    /// The unique live coinbase output must pay `header.miner_address`.
+    BadCoinbaseOwner,
     /// §16.15 — Coinbase value exceeds `block_reward + sum(fees)`.
     InflatedCoinbase,
     /// Coinbase `epoch_anchor` must equal the parent block hash.

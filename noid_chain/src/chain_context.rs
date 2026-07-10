@@ -198,19 +198,25 @@ impl ChainContext {
     }
 
     /// Test-only: initialise a chain from a fake genesis with a trivially-satisfiable
-    /// PoW target (`[0xFF; 32]`). Any nonce satisfies this target, so all subsequent
-    /// blocks can use `nonce = 0`.  ASERT with perfect `BLOCK_TIME` timing always
-    /// returns the same easy target, so all chained blocks are consistent.
+    /// PoW target (`[0xFF; 32]`) and a small exact-state domain. Any nonce
+    /// satisfies this target, so all subsequent blocks can use `nonce = 0`.
+    /// ASERT with perfect `BLOCK_TIME` timing always returns the same easy
+    /// target, while the `2^8` state keeps coinbase/finality/reorg tests from
+    /// paying the production `2^24` exact-root cost per block.
     #[cfg(test)]
     pub fn init_from_easy_genesis() -> Self {
-        // Override difficulty_target only; keep all other genesis fields identical
-        // so the rest of the consensus logic is exercised normally.
+        const TEST_LOG_SLOTS: usize = 8;
+
         let mut genesis = crate::consensus::genesis::genesis_header();
         genesis.difficulty_target = TEST_TARGET;
         // nonce = 0 trivially satisfies TEST_TARGET (any digest < 0xFF..FF).
         genesis.nonce = 0;
 
-        let state = crate::state::ChainState::new();
+        let mut state = crate::state::ChainState::with_log_slots(TEST_LOG_SLOTS);
+        genesis.log_slots = TEST_LOG_SLOTS as u32;
+        genesis.state_root = state.state_root();
+        genesis.active_slot_count = 0;
+        genesis.alloc_counter = 0;
         let mut headers = std::collections::HashMap::new();
         let genesis_hash = crate::consensus::pow::block_id(&genesis);
         headers.insert(0u64, genesis);
@@ -232,12 +238,12 @@ impl ChainContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block::{compute_tx_root, Block};
-    use crate::block_header::BlockHeader;
+    use crate::block::Block;
     use crate::consensus::{
         genesis::GENESIS_TIMESTAMP,
         params::{BLOCK_TIME, EXPANSION_WINDOW, MEDIAN_TIME_BLOCKS, UNDO_RETENTION_DEPTH},
         pow::block_id,
+        template::build_block_template,
     };
     // Easy target for test blocks: any digest satisfies hash < 0xFF..FF.
     // ASERT with perfect BLOCK_TIME timing returns this same target for every
@@ -245,29 +251,21 @@ mod tests {
     use crate::chain_context::TEST_TARGET;
     use noid_poseidon2b::primitives::Address;
 
-    fn build_empty_block_on(ctx: &mut ChainContext) -> Block {
+    fn build_coinbase_block_on(ctx: &mut ChainContext) -> Block {
         let parent = *ctx.tip_header();
-        let mut state_snap = ctx.state.clone();
-        let new_root = state_snap.state_root();
-
-        let mut header = BlockHeader {
-            prev_block_hash: block_id(&parent),
-            state_root: new_root,
-            tx_root: compute_tx_root(&[]),
-            timestamp: parent.timestamp + BLOCK_TIME,
-            height: parent.height + 1,
-            miner_address: Address([0u8; 32]),
-            nonce: 0,
-            difficulty_target: TEST_TARGET,
-            log_slots: parent.log_slots,
-            active_slot_count: parent.active_slot_count,
-            alloc_counter: parent.alloc_counter,
-        };
-        // TEST_TARGET: nonce = 0 always satisfies the target — no search needed.
-        header.nonce = 0;
+        let template = build_block_template(
+            &parent,
+            &ctx.state,
+            &ctx.prev_active_counts(),
+            vec![],
+            Address([0u8; 32]),
+            parent.timestamp + BLOCK_TIME,
+            TEST_TARGET,
+        )
+        .expect("canonical coinbase-only child template");
         Block {
-            header,
-            transactions: vec![],
+            header: template.clone().into_header(0),
+            transactions: template.all_txs(),
         }
     }
 
@@ -285,7 +283,7 @@ mod tests {
     #[test]
     fn apply_next_block_advances_tip() {
         let mut ctx = ChainContext::init_from_easy_genesis();
-        let block = build_empty_block_on(&mut ctx);
+        let block = build_coinbase_block_on(&mut ctx);
         let ts = block.header.timestamp + 1;
         let result = ctx.apply_next_block(&block, ts);
         assert!(result.is_ok(), "first block should apply: {:?}", result);
@@ -297,7 +295,7 @@ mod tests {
     fn three_consecutive_blocks_apply() {
         let mut ctx = ChainContext::init_from_easy_genesis();
         for expected_height in 1..=3u64 {
-            let block = build_empty_block_on(&mut ctx);
+            let block = build_coinbase_block_on(&mut ctx);
             let ts = block.header.timestamp + 1;
             ctx.apply_next_block(&block, ts)
                 .unwrap_or_else(|e| panic!("block {} should apply: {:?}", expected_height, e));
@@ -311,7 +309,7 @@ mod tests {
         let mut ctx = ChainContext::init_from_easy_genesis();
         // Apply UNDO_RETENTION_DEPTH + 2 blocks.
         for _ in 0..(UNDO_RETENTION_DEPTH + 2) {
-            let block = build_empty_block_on(&mut ctx);
+            let block = build_coinbase_block_on(&mut ctx);
             let ts = block.header.timestamp + 1;
             ctx.apply_next_block(&block, ts).expect("apply");
         }
@@ -327,7 +325,7 @@ mod tests {
     #[test]
     fn bad_parent_hash_rejected() {
         let mut ctx = ChainContext::init_from_easy_genesis();
-        let mut block = build_empty_block_on(&mut ctx);
+        let mut block = build_coinbase_block_on(&mut ctx);
         block.header.prev_block_hash = [0xAB; 32]; // wrong
                                                    // TEST_TARGET: nonce = 0 always satisfies the target after tampering.
         block.header.nonce = 0;
@@ -339,7 +337,7 @@ mod tests {
     fn prev_timestamps_covers_up_to_11_headers() {
         let mut ctx = ChainContext::init_from_easy_genesis();
         for _ in 0..15 {
-            let block = build_empty_block_on(&mut ctx);
+            let block = build_coinbase_block_on(&mut ctx);
             let ts = block.header.timestamp + 1;
             ctx.apply_next_block(&block, ts).expect("apply");
         }
@@ -356,7 +354,7 @@ mod tests {
     fn prev_active_counts_covers_exact_expansion_window() {
         let mut ctx = ChainContext::init_from_easy_genesis();
         for _ in 0..(EXPANSION_WINDOW + 4) {
-            let block = build_empty_block_on(&mut ctx);
+            let block = build_coinbase_block_on(&mut ctx);
             let ts = block.header.timestamp + 1;
             ctx.apply_next_block(&block, ts).expect("apply");
         }
