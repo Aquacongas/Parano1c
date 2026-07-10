@@ -6,12 +6,26 @@
 //! Implemented by `WalletHandle` in `noid_node/src/wallet/mod.rs`.
 //! `RpcHandler` holds `Arc<dyn WalletOps + Send + Sync>`.
 
-use noid_chain::segmented_state::SegmentedFriState;
+use std::collections::HashSet;
+
+use noid_chain::block::Block;
+use noid_chain::storage::VerifiedOwnerSnapshot;
 
 use crate::types::{
     WalletAddressInfo, WalletBalance, WalletHistoryEntry, WalletScanResult, WalletSendPlan,
     WalletStatus, WalletUtxoInfo,
 };
+
+/// Immutable activation/reload intent captured under the wallet lock.
+/// Commit rejects it if either wallet index changed before installation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalletActivationPreview {
+    pub expected_active_index: u32,
+    pub expected_next_index: u32,
+    pub target_index: u32,
+    pub owner: [u8; 32],
+    pub advance_next_index: bool,
+}
 
 pub trait WalletOps: Send + Sync {
     /// Overall wallet status (exists, address, balance).
@@ -19,9 +33,6 @@ pub trait WalletOps: Send + Sync {
 
     /// Derive the address at `index`. Returns None if wallet is not loaded.
     fn get_address(&self, index: u32) -> Option<String>;
-
-    /// Primary address (index 0). Returns None if wallet is not loaded.
-    fn primary_address(&self) -> Option<String>;
 
     /// Current confirmed balance.
     fn get_balance(&self) -> WalletBalance;
@@ -32,10 +43,29 @@ pub trait WalletOps: Send + Sync {
     /// Transaction history (most recent last).
     fn history(&self) -> Vec<WalletHistoryEntry>;
 
-    /// Full state scan: discover UTXOs owned by this wallet.
-    /// Returns a scan summary after updating internal UTXO state.
-    /// `state` is the current chain state (read under chain lock by caller).
-    fn scan_state(&self, state: &SegmentedFriState, height: u64) -> WalletScanResult;
+    /// Preview a reload of the current active address without mutation.
+    fn preview_active_reload(&self) -> Result<WalletActivationPreview, String>;
+
+    /// Preview switching to an already-generated address without mutation.
+    fn preview_address_switch(&self, index: u32) -> Result<WalletActivationPreview, String>;
+
+    /// Preview generating the next address without mutation.
+    fn preview_next_address(&self) -> Result<WalletActivationPreview, String>;
+
+    /// Atomically validate a preview, persist its indices, and install the
+    /// exact durable owner snapshot while holding one wallet lock.
+    fn commit_activation_snapshot(
+        &self,
+        preview: WalletActivationPreview,
+        snapshot: VerifiedOwnerSnapshot,
+        reserved_input_slots: &HashSet<u32>,
+        reserved_output_slots: &HashSet<u32>,
+    ) -> Result<(WalletAddressInfo, WalletScanResult), String>;
+
+    /// Apply one accepted block to the active-address cache and wallet
+    /// artifacts. The caller invokes this while it still holds the chain write
+    /// guard, establishing the global `chain -> wallet` lock order.
+    fn on_accepted_block(&self, block: &Block) -> Result<(), String>;
 
     /// Plan one logical payment as one or more transaction amounts using a fixed
     /// per-tx fee. Kept for focused tests and simple callers.
@@ -130,35 +160,13 @@ pub trait WalletOps: Send + Sync {
     /// built successfully but failed mempool admission.
     fn cleanup_failed_send(&self, tx_hash: [u8; 32], output_slots: &[u32]);
 
-    /// Derive and return the next unused address, advancing next_index.
-    fn next_address(&self) -> Option<WalletAddressInfo>;
-
     /// The ACTIVE address (key index + bech32m): every send/consolidation
     /// spends this address's UTXOs only and change returns to it (one owner
     /// per transaction is a consensus rule).
     fn active_address(&self) -> Option<(u32, String)>;
 
-    /// Switch the active address to `index` (derives it if fresh; persists
-    /// the choice). Returns the new (index, bech32m).
-    fn set_active_address(&self, index: u32) -> Result<(u32, String), String>;
-
-    /// Build, prove, and serialize a PULL: move address `from_index`'s
-    /// funds (smallest-first, up to the largest shape) minus fee to the
-    /// ACTIVE address — the explicit cross-address transfer of the
-    /// one-owner-per-tx model. Returns `(intent_bytes, input_slots)`.
-    ///
-    /// This is CPU-heavy (~0.3–3 s): caller must invoke in `spawn_blocking`.
-    fn build_pull(
-        &self,
-        from_index: u32,
-        fee_micronoid: u64,
-        epoch_anchor: [u8; 32],
-        slot_hints: Vec<u32>,
-        log_slots: u32,
-    ) -> Result<(Vec<u8>, Vec<u32>), String>;
-
-    /// List all addresses that have been used (have UTXOs or history),
-    /// plus the next_index address if it's fresh.
+    /// List locally generated address metadata. No inactive address is
+    /// scanned and no per-address balances are synthesized.
     fn list_addresses(&self) -> Vec<WalletAddressInfo>;
 
     /// Sum of values of UTXOs currently being spent by pending txs.

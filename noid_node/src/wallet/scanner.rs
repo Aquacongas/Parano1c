@@ -1,177 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! UTXO discovery by scanning the chain state.
+//! Incremental active-address wallet updates from accepted blocks.
 //!
 //! # Architecture
 //!
-//! Blocks are pruned immediately after `apply_block`. Only the last
-//! Only the retained recent block window remains. There is NO historical block scan.
-//!
-//! The SegmentedFriState is kept FOREVER and is the source of truth for all UTXOs.
-//!
-//! ## Full scan (import on new machine)
-//!
-//! 1. Collect all active slots from state (O(active_slots))
-//! 2. Derive addresses in batches of BATCH_SIZE=20
-//! 3. Stop after GAP_LIMIT=1 consecutive batches with no new matches
-//! 4. Returns all matching UTXOs and the full set of known_addresses
+//! Blocks are pruned after application, so this hook consumes accepted block
+//! bodies while they are available. It never discovers inactive accounts.
 //!
 //! ## Incremental update (new block)
 //!
-//! O(block_size): check outputs for owned addresses, remove spent inputs.
+//! O(block_size): check outputs for the one active address, remove spent inputs.
+//! Startup, explicit reload, snapshot install, and reorg recovery use the
+//! durable verified owner index instead of traversing state here.
 
 use std::collections::HashMap;
 
+use super::state::{TxDirection, TxHistoryEntry, WalletUtxo};
 use noid_chain::block::Block;
 use noid_chain::consensus::receipt::{generate_receipt, TxSummary};
-use noid_chain::fri_state::SlotValue;
-use noid_chain::segmented_state::SegmentedFriState;
-
-use super::keystore::MasterSecret;
-use super::state::{TxDirection, TxHistoryEntry, WalletUtxo, MAX_WALLET_ADDRESSES};
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-/// Number of addresses to derive per batch during state scan.
-/// Matches the standard HD wallet gap limit.
-const BATCH_SIZE: u32 = 20;
-
-/// Stop scanning after this many consecutive batches yield no UTXOs.
-/// GAP_LIMIT=1 means stop after 20 unused addresses (one full batch).
-const GAP_LIMIT: u32 = 1;
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Extract 32-byte owner address from a SlotValue.
-/// Layout: owner_hi.0.to_le_bytes() ++ owner_lo.0.to_le_bytes()
-#[inline]
-pub fn owner_bytes_from_slot(sv: &SlotValue) -> [u8; 32] {
-    let mut b = [0u8; 32];
-    b[..16].copy_from_slice(&sv.owner_hi.0.to_le_bytes());
-    b[16..].copy_from_slice(&sv.owner_lo.0.to_le_bytes());
-    b
-}
-
-// ---------------------------------------------------------------------------
-// Full state scan
-// ---------------------------------------------------------------------------
-
-/// Scan the entire chain state for UTXOs owned by this wallet.
-///
-/// Uses dynamic address discovery: derives addresses in batches of BATCH_SIZE,
-/// stopping after GAP_LIMIT consecutive batches find no new UTXOs.
-///
-/// Returns:
-/// - `Vec<WalletUtxo>`: all found UTXOs
-/// - `HashMap<[u8;32], u32>`: all derived addresses (address → key_index)
-/// - `u32`: highest used key_index + 1 (next_index hint)
-///
-/// Complexity: O(active_slots) for state traversal + O(n_addresses) for derivation.
-pub fn scan_state_for_utxos(
-    state: &SegmentedFriState,
-    master: &MasterSecret,
-    current_height: u64,
-    hint_next_index: u32, // always scan at least to this index
-) -> (Vec<WalletUtxo>, HashMap<[u8; 32], u32>, u32) {
-    let seg_log = state.effective_log_segment_size();
-    let seg_size = 1usize << seg_log;
-
-    // Collect all non-empty slots from active segments (O(active_slots))
-    // Build reverse map: owner_bytes → Vec<(slot_index, amount, creation_id)>.
-    // Both value limbs are part of the spend claim, so a full scan must retain
-    // the incarnation rather than reconstructing it from slot position/history.
-    let mut owner_to_slots: HashMap<[u8; 32], Vec<(u32, u64, u64)>> = HashMap::new();
-    for seg_id in state.active_segment_ids() {
-        let base = (seg_id as u32) << seg_log as u32;
-        for local in 0..seg_size {
-            let idx = base + local as u32;
-            let sv = state.slot(idx);
-            if sv.is_empty() {
-                continue;
-            }
-            let owner = owner_bytes_from_slot(&sv);
-            owner_to_slots
-                .entry(owner)
-                .or_default()
-                .push((idx, sv.amount(), sv.creation_id()));
-        }
-    }
-
-    if owner_to_slots.is_empty() {
-        // Empty state (genesis) — fast path
-        let known: HashMap<[u8; 32], u32> = (0..BATCH_SIZE)
-            .map(|i| (master.derive_address(i).0, i))
-            .collect();
-        return (vec![], known, BATCH_SIZE);
-    }
-
-    // Derive addresses in batches until gap condition met
-    let mut known_addresses: HashMap<[u8; 32], u32> = HashMap::new();
-    let mut found_utxos: Vec<WalletUtxo> = Vec::new();
-    let mut max_found_index: u32 = 0;
-    let mut batch_start: u32 = 0;
-    let mut empty_batches: u32 = 0;
-
-    while batch_start < MAX_WALLET_ADDRESSES {
-        let batch_end = batch_start
-            .saturating_add(BATCH_SIZE)
-            .min(MAX_WALLET_ADDRESSES);
-        let mut batch_found = 0u32;
-
-        for i in batch_start..batch_end {
-            let addr = master.derive_address(i);
-            known_addresses.insert(addr.0, i);
-
-            if let Some(slots) = owner_to_slots.get(&addr.0) {
-                for &(slot_idx, value, creation_id) in slots {
-                    found_utxos.push(WalletUtxo {
-                        slot_index: slot_idx,
-                        value,
-                        creation_id,
-                        address: addr,
-                        key_index: i,
-                        confirmed_height: current_height,
-                    });
-                }
-                if i > max_found_index {
-                    max_found_index = i;
-                }
-                batch_found += 1;
-                empty_batches = 0; // reset gap counter
-            }
-        }
-
-        if batch_found == 0 {
-            empty_batches += 1;
-        }
-
-        batch_start = batch_end;
-
-        // Stop conditions:
-        // 1. GAP_LIMIT consecutive empty batches AND we've scanned past hint_next_index
-        //    (always cover addresses the user generated via address --new)
-        // 2. Safety cap: never derive more than MAX_WALLET_ADDRESSES.
-        let min_scan_to = hint_next_index
-            .min(MAX_WALLET_ADDRESSES)
-            .saturating_add(BATCH_SIZE)
-            .min(MAX_WALLET_ADDRESSES);
-        if empty_batches >= GAP_LIMIT && batch_start >= min_scan_to {
-            break;
-        }
-    }
-
-    // Ensure we always have at least BATCH_SIZE addresses beyond the last found
-    let next_index = (max_found_index + 1)
-        .max(batch_start)
-        .min(MAX_WALLET_ADDRESSES);
-
-    (found_utxos, known_addresses, next_index)
-}
 
 // ---------------------------------------------------------------------------
 // Incremental block update
@@ -277,10 +124,100 @@ fn derive_output_creation_ids(
     Ok(ids)
 }
 
+/// Record history and receipts from an accepted block without touching the
+/// active UTXO cache. Reorg recovery uses this after installing one exact
+/// post-reorg owner snapshot; replaying replacement deltas onto the old branch
+/// cache would make balance and sent-value inference transiently incorrect.
+pub fn update_wallet_artifacts_from_block(
+    history: &mut Vec<TxHistoryEntry>,
+    receipts: &mut HashMap<[u8; 32], Vec<u8>>,
+    active_address: noid_poseidon2b::primitives::Address,
+    active_index: u32,
+    block: &Block,
+) {
+    let block_tx_hashes: Vec<[u8; 32]> = block
+        .transactions
+        .iter()
+        .map(|transaction| transaction.tx_body_hash.0)
+        .collect();
+    let pending_hashes: std::collections::HashSet<[u8; 32]> = history
+        .iter()
+        .filter(|entry| entry.height == 0 && entry.direction == TxDirection::Sent)
+        .map(|entry| entry.tx_hash)
+        .collect();
+    let existing_confirmed: std::collections::HashSet<[u8; 32]> = history
+        .iter()
+        .filter(|entry| entry.height != 0)
+        .map(|entry| entry.tx_hash)
+        .collect();
+
+    for (tx_index, tx) in block.transactions.iter().enumerate() {
+        let tx_hash = tx.tx_body_hash.0;
+        let pending_send = pending_hashes.contains(&tx_hash);
+
+        if pending_send {
+            let summary = TxSummary {
+                tx_body_hash: tx_hash,
+                inputs: tx
+                    .body
+                    .inputs
+                    .iter()
+                    .filter(|input| input.valid)
+                    .map(|input| (input.slot_index, input.owner))
+                    .collect(),
+                outputs: tx
+                    .body
+                    .outputs
+                    .iter()
+                    .filter(|output| output.valid)
+                    .map(|output| (output.slot_index, output.value, output.owner))
+                    .collect(),
+                fee_micronoid: tx.body.fee as u64,
+                confirmed_height: block.header.height,
+                confirmed_unix: block.header.timestamp,
+            };
+            let receipt = generate_receipt(
+                &block.header,
+                tx_hash,
+                tx_index,
+                &block_tx_hashes,
+                summary,
+                None,
+            );
+            receipts.insert(tx_hash, receipt.to_bytes());
+            continue;
+        }
+
+        if existing_confirmed.contains(&tx_hash) {
+            continue;
+        }
+        let received = tx
+            .body
+            .outputs
+            .iter()
+            .filter(|output| output.valid && output.owner == active_address)
+            .map(|output| output.value)
+            .fold(0u64, u64::saturating_add);
+        if received == 0 {
+            continue;
+        }
+        history.push(TxHistoryEntry {
+            tx_hash,
+            height: block.header.height,
+            direction: TxDirection::Received,
+            amount_micronoid: received,
+            peer_address: None,
+            timestamp: block.header.timestamp,
+            own_address: Some(active_address.to_bech32()),
+            own_key_index: Some(active_index),
+        });
+    }
+}
+
 /// Update wallet state based on a newly confirmed block.
 ///
 /// Must be called BEFORE block pruning (while transactions are still available).
-/// O(block_size × known_addresses).
+/// O(block_size).
 ///
 /// Updates:
 /// - Removes spent UTXOs (inputs consumed by this block)
@@ -288,14 +225,15 @@ fn derive_output_creation_ids(
 /// - Appends to tx history
 /// - Generates and stores Merkle receipts for all wallet-relevant transactions
 /// - Clears confirmed input slots from `pending_input_slots`
-pub fn update_wallet_from_block(
+pub fn update_active_wallet_from_block(
     utxos: &mut HashMap<u32, WalletUtxo>,
     history: &mut Vec<TxHistoryEntry>,
     receipts: &mut HashMap<[u8; 32], Vec<u8>>,
-    known_addresses: &HashMap<[u8; 32], u32>,
+    active_address: noid_poseidon2b::primitives::Address,
+    active_index: u32,
     pending_input_slots: &mut std::collections::HashSet<u32>,
     block: &Block,
-) {
+) -> Result<(), String> {
     let height = block.header.height;
     let timestamp = block.header.timestamp;
 
@@ -303,18 +241,12 @@ pub fn update_wallet_from_block(
     // blocks always satisfy this relation; rejecting the update here avoids
     // inventing or wrapping an incarnation if corrupt/unvalidated data reaches
     // the product hook.
-    let output_creation_ids = match derive_output_creation_ids(block) {
-        Ok(ids) => ids,
-        Err(error) => {
-            tracing::error!(
-                height,
-                alloc_counter = block.header.alloc_counter,
-                %error,
-                "wallet: refusing block update with invalid creation-id sequence"
-            );
-            return;
-        }
-    };
+    let output_creation_ids = derive_output_creation_ids(block).map_err(|error| {
+        format!(
+            "wallet block h={height} has invalid creation-id sequence at alloc_counter {}: {error}",
+            block.header.alloc_counter
+        )
+    })?;
 
     let block_tx_hashes: Vec<[u8; 32]> = block
         .transactions
@@ -338,21 +270,17 @@ pub fn update_wallet_from_block(
                     continue;
                 }
                 let Some(creation_id) = output_creation_ids[tx_index][output_index] else {
-                    tracing::error!(
-                        height,
-                        tx_index,
-                        output_index,
-                        "wallet: missing creation id for live coinbase output"
-                    );
-                    return;
+                    return Err(format!(
+                        "wallet block h={height} is missing creation id for live coinbase output {tx_index}:{output_index}"
+                    ));
                 };
-                if let Some(&key_idx) = known_addresses.get(&output.owner.0) {
+                if output.owner == active_address {
                     let utxo = WalletUtxo {
                         slot_index: output.slot_index,
                         value: output.value,
                         creation_id,
                         address: output.owner,
-                        key_index: key_idx,
+                        key_index: active_index,
                         confirmed_height: height,
                     };
                     utxos.insert(output.slot_index, utxo);
@@ -365,7 +293,7 @@ pub fn update_wallet_from_block(
                         peer_address: None,
                         timestamp,
                         own_address: Some(addr_str),
-                        own_key_index: Some(key_idx),
+                        own_key_index: Some(active_index),
                     });
                 }
             }
@@ -399,21 +327,17 @@ pub fn update_wallet_from_block(
                 continue;
             }
             let Some(creation_id) = output_creation_ids[tx_index][output_index] else {
-                tracing::error!(
-                    height,
-                    tx_index,
-                    output_index,
-                    "wallet: missing creation id for live user output"
-                );
-                return;
+                return Err(format!(
+                    "wallet block h={height} is missing creation id for live user output {tx_index}:{output_index}"
+                ));
             };
-            if let Some(&key_idx) = known_addresses.get(&output.owner.0) {
+            if output.owner == active_address {
                 let utxo = WalletUtxo {
                     slot_index: output.slot_index,
                     value: output.value,
                     creation_id,
                     address: output.owner,
-                    key_index: key_idx,
+                    key_index: active_index,
                     confirmed_height: height,
                 };
                 utxos.insert(output.slot_index, utxo);
@@ -421,7 +345,7 @@ pub fn update_wallet_from_block(
                 // Track the first received-to address as the "own" receiving address.
                 if recv_own_address.is_none() {
                     recv_own_address = Some(output.owner.to_bech32());
-                    recv_own_key_index = Some(key_idx);
+                    recv_own_key_index = Some(active_index);
                 }
             }
         }
@@ -458,9 +382,12 @@ pub fn update_wallet_from_block(
             }
         }
 
-        // Receipt = proof of payment. Only generate when WE sent funds.
-        // Incoming-only txs need no receipt — the sender holds the proof.
-        if sent_from_wallet > 0 {
+        // A locally pending send remains ours even if the user switched away
+        // from its source address before confirmation. In that case its input
+        // is intentionally absent from the active-address cache, so the durable
+        // pending history tag is the ownership signal for receipt generation.
+        // Incoming-only transactions still need no receipt.
+        if sent_from_wallet > 0 || already_pending {
             let summary = TxSummary {
                 tx_body_hash: tx.tx_body_hash.0,
                 inputs: tx
@@ -492,13 +419,13 @@ pub fn update_wallet_from_block(
             receipts.insert(tx.tx_body_hash.0, receipt.to_bytes());
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use noid_chain::block_header::BlockHeader;
-    use noid_chain::segmented_state::SegmentedFriState;
     use noid_poseidon2b::primitives::{Address, TxBodyHash};
     use noid_tx::{Transaction, TxBody, TxOutput, TxShape};
 
@@ -550,17 +477,18 @@ mod tests {
         let mut utxos = HashMap::new();
         let mut history = vec![];
         let mut receipts = HashMap::new();
-        let known_addresses = HashMap::from([(owner.0, 3)]);
         let mut pending_inputs = std::collections::HashSet::new();
 
-        update_wallet_from_block(
+        update_active_wallet_from_block(
             &mut utxos,
             &mut history,
             &mut receipts,
-            &known_addresses,
+            owner,
+            3,
             &mut pending_inputs,
             &block,
-        );
+        )
+        .unwrap();
 
         assert_eq!(utxos[&10].creation_id, 101, "coinbase is first");
         assert_eq!(utxos[&20].creation_id, 102, "user output follows");
@@ -589,22 +517,6 @@ mod tests {
     }
 
     #[test]
-    fn full_scan_preserves_packed_creation_id() {
-        let master = MasterSecret([0x31; 32]);
-        let owner = master.derive_address(0);
-        let mut state = SegmentedFriState::new_empty(6);
-        state
-            .set_slot(9, SlotValue::with_owner_fields(777, 55, owner.as_fields()))
-            .unwrap();
-
-        let (utxos, _, _) = scan_state_for_utxos(&state, &master, 12, 1);
-        assert_eq!(utxos.len(), 1);
-        assert_eq!(utxos[0].slot_index, 9);
-        assert_eq!(utxos[0].value, 777);
-        assert_eq!(utxos[0].creation_id, 55);
-    }
-
-    #[test]
     fn incremental_scan_rejects_counter_underflow_before_mutation() {
         let owner = Address([0xA2; 32]);
         let block = block(
@@ -614,19 +526,110 @@ mod tests {
         let mut utxos = HashMap::new();
         let mut history = vec![];
         let mut receipts = HashMap::new();
-        let known_addresses = HashMap::from([(owner.0, 0)]);
         let mut pending_inputs = std::collections::HashSet::new();
 
-        update_wallet_from_block(
+        assert!(update_active_wallet_from_block(
             &mut utxos,
             &mut history,
             &mut receipts,
-            &known_addresses,
+            owner,
+            0,
             &mut pending_inputs,
             &block,
-        );
+        )
+        .is_err());
 
         assert!(utxos.is_empty());
         assert!(history.is_empty());
+    }
+
+    #[test]
+    fn incremental_update_ignores_inactive_owner_outputs() {
+        let active = Address([0xA4; 32]);
+        let inactive = Address([0xA5; 32]);
+        let block = block(vec![transaction(true, 10, inactive)], 1);
+        let mut utxos = HashMap::new();
+        let mut history = vec![];
+        let mut receipts = HashMap::new();
+        let mut pending_inputs = std::collections::HashSet::new();
+
+        update_active_wallet_from_block(
+            &mut utxos,
+            &mut history,
+            &mut receipts,
+            active,
+            0,
+            &mut pending_inputs,
+            &block,
+        )
+        .unwrap();
+
+        assert!(utxos.is_empty());
+        assert!(history.is_empty());
+    }
+
+    #[test]
+    fn pending_send_gets_receipt_after_source_account_becomes_inactive() {
+        let active = Address([0xA6; 32]);
+        let inactive_source = Address([0xA7; 32]);
+        let coinbase = transaction(true, 10, Address([0xCC; 32]));
+        let outgoing = transaction(false, 20, Address([0xBB; 32]));
+        let outgoing_hash = outgoing.tx_body_hash.0;
+        let block = block(vec![coinbase, outgoing], 2);
+        let mut utxos = HashMap::new();
+        let mut history = vec![TxHistoryEntry {
+            tx_hash: outgoing_hash,
+            height: 0,
+            direction: TxDirection::Sent,
+            amount_micronoid: 123,
+            peer_address: Some([0xBB; 32]),
+            timestamp: 1,
+            own_address: Some(inactive_source.to_bech32()),
+            own_key_index: Some(9),
+        }];
+        let mut receipts = HashMap::new();
+        let mut pending_inputs = std::collections::HashSet::new();
+
+        update_active_wallet_from_block(
+            &mut utxos,
+            &mut history,
+            &mut receipts,
+            active,
+            0,
+            &mut pending_inputs,
+            &block,
+        )
+        .unwrap();
+
+        assert!(receipts.contains_key(&outgoing_hash));
+        assert_eq!(history.len(), 1, "pending history must not be duplicated");
+        assert_eq!(history[0].own_key_index, Some(9));
+    }
+
+    #[test]
+    fn reorg_artifact_replay_does_not_need_or_mutate_utxo_cache() {
+        let active = Address([0xD1; 32]);
+        let inactive_source = Address([0xD2; 32]);
+        let coinbase = transaction(true, 10, Address([0xCC; 32]));
+        let outgoing = transaction(false, 20, Address([0xBB; 32]));
+        let outgoing_hash = outgoing.tx_body_hash.0;
+        let block = block(vec![coinbase, outgoing], 2);
+        let mut history = vec![TxHistoryEntry {
+            tx_hash: outgoing_hash,
+            height: 0,
+            direction: TxDirection::Sent,
+            amount_micronoid: 123,
+            peer_address: Some([0xBB; 32]),
+            timestamp: 1,
+            own_address: Some(inactive_source.to_bech32()),
+            own_key_index: Some(9),
+        }];
+        let mut receipts = HashMap::new();
+
+        update_wallet_artifacts_from_block(&mut history, &mut receipts, active, 0, &block);
+
+        assert!(receipts.contains_key(&outgoing_hash));
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].own_key_index, Some(9));
     }
 }

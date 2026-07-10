@@ -205,8 +205,7 @@ pub trait ParanoidApi {
     #[method(name = "walletHistory")]
     async fn wallet_history(&self) -> RpcResult<Vec<WalletHistoryEntry>>;
 
-    /// Full rescan of the chain state for wallet UTXOs.
-    /// WARNING: may take a few seconds on large state.
+    /// Reload the active address from the exact verified durable owner index.
     #[method(name = "walletScan")]
     async fn wallet_scan(&self) -> RpcResult<WalletScanResult>;
 
@@ -249,14 +248,11 @@ pub trait ParanoidApi {
     #[method(name = "walletConsolidate")]
     async fn wallet_consolidate(&self, fee_micronoid: u64) -> RpcResult<WalletSendResult>;
 
-    /// Derive and return the next fresh address (increments the internal index).
-    /// Use this to get a unique address for each incoming payment.
+    /// Generate the next address, make it active, and load its current UTXOs.
     #[method(name = "walletNextAddress")]
     async fn wallet_next_address(&self) -> RpcResult<WalletAddressInfo>;
 
-    /// List all addresses that have ever had activity (UTXOs or history),
-    /// plus the next fresh address. Shows per-address balance and marks the
-    /// ACTIVE address.
+    /// List locally generated address metadata and mark the active address.
     #[method(name = "walletListAddresses")]
     async fn wallet_list_addresses(&self) -> RpcResult<Vec<WalletAddressInfo>>;
 
@@ -266,17 +262,8 @@ pub trait ParanoidApi {
     #[method(name = "walletActiveAddress")]
     async fn wallet_active_address(&self) -> RpcResult<WalletAddressInfo>;
 
-    /// Switch the ACTIVE address to the given key index (derives it if
-    /// fresh; the choice persists across restarts).
+    /// Switch the ACTIVE address to an already-generated key index and load
+    /// that address's current UTXOs. The choice persists across restarts.
     #[method(name = "walletSetActiveAddress")]
     async fn wallet_set_active_address(&self, index: u32) -> RpcResult<WalletAddressInfo>;
-
-    /// Move address `from_index`'s funds (up to `Sweep25x2` capacity,
-    /// smallest-first) minus fee to the ACTIVE address — the explicit
-    /// cross-address transfer of the one-owner-per-tx model. Returns the
-    /// tx_hash of the submitted pull transaction.
-    /// `fee_micronoid = 0` uses a shape-aware automatic fee.
-    #[method(name = "walletPull")]
-    async fn wallet_pull(&self, from_index: u32, fee_micronoid: u64)
-        -> RpcResult<WalletSendResult>;
 }

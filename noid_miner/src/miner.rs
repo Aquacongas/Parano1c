@@ -196,6 +196,13 @@ fn adaptive_user_tx_limit(ms_per_tx_ewma: Option<f64>) -> usize {
 ///
 /// Remote wallets subscribe via the P2P block event instead.
 pub type BlockAppliedHook = Arc<dyn Fn(&noid_chain::block::Block) + Send + Sync>;
+/// Resolves the payout address immediately before each template is built.
+/// Used by the built-in wallet when no explicit mining address is configured.
+pub type MiningPayoutResolver = Arc<dyn Fn() -> Address + Send + Sync>;
+
+fn resolve_mining_payout(configured: Address, resolver: Option<&MiningPayoutResolver>) -> Address {
+    resolver.map(|resolve| resolve()).unwrap_or(configured)
+}
 
 pub struct BlockMiner {
     config: MinerConfig,
@@ -219,6 +226,9 @@ pub struct BlockMiner {
     /// the mempool is updated. Used by the built-in wallet to generate receipts
     /// race-free (receipt ready before getMempoolSize → 0 is observable).
     on_block_applied: Option<BlockAppliedHook>,
+    /// Optional dynamic payout. Explicitly configured miner addresses leave
+    /// this unset and continue to use `config.miner_address`.
+    payout_resolver: Option<MiningPayoutResolver>,
 }
 
 impl BlockMiner {
@@ -256,6 +266,7 @@ impl BlockMiner {
             sync_ready,
             prove_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
             on_block_applied: None,
+            payout_resolver: None,
         };
         (miner, rx)
     }
@@ -265,6 +276,11 @@ impl BlockMiner {
     /// to generate payment receipts race-free at any mining speed.
     pub fn set_block_applied_hook(&mut self, hook: BlockAppliedHook) {
         self.on_block_applied = Some(hook);
+    }
+
+    /// Resolve the wallet's active address for every future template.
+    pub fn set_payout_resolver(&mut self, resolver: MiningPayoutResolver) {
+        self.payout_resolver = Some(resolver);
     }
 
     /// Cancel the current PoW search (call when a new P2P block arrives).
@@ -350,13 +366,12 @@ impl BlockMiner {
         }
 
         let builder = TemplateBuilder::new(self.mempool.clone());
-        let addr = self.config.miner_address;
         let cancel = self.cancel_pow.clone();
         let mut heartbeat = interval(Duration::from_secs(self.config.refresh_interval_secs));
         let mut mempool_events = self.mempool.subscribe();
         let mut prove_ms_per_tx_ewma: Option<f64> = None;
 
-        tracing::debug!(address = %addr, "BlockMiner started");
+        tracing::debug!("BlockMiner started");
 
         loop {
             // Clean shutdown: stop() sets `stopped` permanently; break before
@@ -372,9 +387,15 @@ impl BlockMiner {
                 .unwrap_or_default()
                 .as_secs();
 
-            let snapshot_result = {
+            // Resolve payout under the same chain guard that captures the
+            // template snapshot. Account activation takes `chain -> wallet`
+            // too, so the selected owner and parent snapshot form one instant.
+            // An already-built template remains immutable.
+            let (snapshot_result, addr) = {
                 let mut ctx = self.chain.write().await;
-                TemplateChainSnapshot::from_context(&mut ctx)
+                let addr =
+                    resolve_mining_payout(self.config.miner_address, self.payout_resolver.as_ref());
+                (TemplateChainSnapshot::from_context(&mut ctx), addr)
             };
             let snapshot = match snapshot_result {
                 Ok(snapshot) => snapshot,
@@ -828,6 +849,8 @@ pub(crate) fn run_prove_block(
 mod tests {
     use super::*;
 
+    use std::sync::atomic::AtomicU8;
+
     use bench_prover::{
         prove_standard_wallet, prove_sweep_wallet, standard_bundle, standard_fixture,
         standard_scenario, sweep_bundle, sweep_fixture, sweep_scenario, BENCH_LOG_SLOTS,
@@ -845,6 +868,26 @@ mod tests {
     use noid_tx::{
         compute_claims_commitment, hash_tx_body_for_shape, Transaction, TxBody, TxOutput, TxShape,
     };
+
+    #[test]
+    fn payout_resolver_is_dynamic_while_configured_address_is_fixed() {
+        let configured = Address([0x11; 32]);
+        assert_eq!(resolve_mining_payout(configured, None), configured);
+
+        let marker = Arc::new(AtomicU8::new(0x22));
+        let resolver_marker = Arc::clone(&marker);
+        let resolver: MiningPayoutResolver =
+            Arc::new(move || Address([resolver_marker.load(Ordering::Relaxed); 32]));
+        assert_eq!(
+            resolve_mining_payout(configured, Some(&resolver)),
+            Address([0x22; 32])
+        );
+        marker.store(0x33, Ordering::Relaxed);
+        assert_eq!(
+            resolve_mining_payout(configured, Some(&resolver)),
+            Address([0x33; 32])
+        );
+    }
 
     fn tx_from_body(body: TxBody) -> Transaction {
         let tx_body_hash = hash_tx_body_for_shape(
@@ -959,7 +1002,7 @@ mod tests {
             .expect("build exact sparse cache");
         let exact_state_transition =
             noid_block::build_exact_state_transition_proof(&exact_cache, &exact_surface)
-        .expect("build exact state proof");
+                .expect("build exact state proof");
 
         let txs: Vec<Transaction> = user_bodies.into_iter().map(tx_from_body).collect();
         let authorization_bytes = user

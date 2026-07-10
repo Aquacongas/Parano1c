@@ -7,17 +7,19 @@
 //! - On first start: generate random master secret, save to wallet.key
 //! - On subsequent starts: load master secret from wallet.key
 //! - Wallet is always "unlocked" once loaded (no lock/unlock cycle)
-//! - UTXO state updated via state scan + incremental block updates
+//! - Only the active address's UTXOs are cached in memory
+//! - The cache is replaced from an exact, verified owner-index snapshot
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use noid_chain::storage::VerifiedOwnerSnapshot;
 use noid_poseidon2b::primitives::{Address, SpendSecret};
 
 use super::keystore::{Keystore, KeystoreError, MasterSecret};
 
-/// Maximum number of HD addresses the built-in wallet will derive or scan.
+/// Maximum number of local addresses the built-in wallet will derive.
 /// Valid key indices are `0..MAX_WALLET_ADDRESSES`.
 pub const MAX_WALLET_ADDRESSES: u32 = 100_000;
 
@@ -75,6 +77,17 @@ pub struct WalletUtxo {
     pub confirmed_height: u64,
 }
 
+/// Durable chain identity to which the active-address cache is bound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveWalletSnapshot {
+    pub height: u64,
+    pub tip_hash: [u8; 32],
+    pub state_root: [u8; 32],
+    pub log_slots: u32,
+    pub active_slot_count: u64,
+    pub alloc_counter: u64,
+}
+
 // ---------------------------------------------------------------------------
 // WalletState
 // ---------------------------------------------------------------------------
@@ -87,12 +100,12 @@ pub struct WalletState {
     pub keystore_path: PathBuf,
     /// Master secret (always present, loaded from disk at startup).
     secret: MasterSecret,
-    /// All UTXOs owned by this wallet (slot_index → utxo).
+    /// UTXOs owned by the active address only (slot_index → utxo).
     pub utxos: HashMap<u32, WalletUtxo>,
     /// Next unused key index.
     pub next_index: u32,
-    /// All derived addresses: address bytes → key_index.
-    pub known_addresses: HashMap<[u8; 32], u32>,
+    /// Exact durable snapshot backing `utxos`. `None` until the first reload.
+    pub active_snapshot: Option<ActiveWalletSnapshot>,
     /// Transaction history (most recent last).
     pub history: Vec<TxHistoryEntry>,
     /// Cached receipts: tx_body_hash → bincode-serialized ParanoidReceipt bytes.
@@ -107,8 +120,7 @@ pub struct WalletState {
     pub pending_input_slots: std::collections::HashSet<u32>,
     /// The ACTIVE address key index. One owner per transaction (consensus
     /// rule): sends and consolidations spend ONLY this address's UTXOs and
-    /// change returns to it; other addresses' funds move via an explicit
-    /// pull (a single-owner tx from the source address).
+    /// change returns to it. Inactive addresses are not scanned or cached.
     pub active_index: u32,
 }
 
@@ -127,20 +139,12 @@ impl WalletState {
             ks.create_plain()?
         };
 
-        // Pre-derive initial lookahead window of addresses.
-        const INITIAL_LOOKAHEAD: u32 = 50;
-        let mut known_addresses: HashMap<[u8; 32], u32> = HashMap::new();
-        for i in 0..INITIAL_LOOKAHEAD {
-            let addr = secret.derive_address(i);
-            known_addresses.insert(addr.0, i);
-        }
-
         let mut wallet = Self {
             keystore_path: key_path,
             secret,
             utxos: HashMap::new(),
-            next_index: INITIAL_LOOKAHEAD,
-            known_addresses,
+            next_index: 1,
+            active_snapshot: None,
             history: Vec::new(),
             receipts: HashMap::new(),
             pending_output_slots: std::collections::HashSet::new(),
@@ -153,14 +157,8 @@ impl WalletState {
         Ok(wallet)
     }
 
-    /// Primary address (index 0).
-    pub fn primary_address(&self) -> Address {
-        self.secret.derive_address(0)
-    }
-
     /// Address at a specific key index.
     pub fn address_at(&self, index: u32) -> Address {
-        // Ensure we have it in known_addresses if needed.
         self.secret.derive_address(index)
     }
 
@@ -174,81 +172,132 @@ impl WalletState {
         self.secret.derive_address(self.active_index)
     }
 
-    /// Switch the active address; derives (and remembers) the address and
-    /// persists the choice in the wallet metadata.
-    pub fn set_active_index(&mut self, index: u32) -> Result<(), &'static str> {
-        if index >= MAX_WALLET_ADDRESSES {
-            return Err("active address index exceeds wallet address limit");
-        }
-        let next_index = index + 1;
-        let addr = self.secret.derive_address(index);
-        self.known_addresses.insert(addr.0, index);
+    /// Preview an address already generated on this machine without mutation.
+    pub fn preview_generated_index(&self, index: u32) -> Result<Address, &'static str> {
         if index >= self.next_index {
-            self.next_index = next_index;
+            return Err("active address index has not been generated");
         }
-        self.active_index = index;
-        self.save_metadata();
-        Ok(())
+        if index != self.active_index && self.has_pending_activity() {
+            return Err("cannot switch active address while a wallet transaction is pending");
+        }
+        Ok(self.secret.derive_address(index))
+    }
+
+    /// Preview exactly the next local address without mutation.
+    pub fn preview_next_index(&self) -> Result<(u32, Address), &'static str> {
+        if self.next_index >= MAX_WALLET_ADDRESSES {
+            return Err("wallet address limit reached");
+        }
+        if self.has_pending_activity() {
+            return Err(
+                "cannot generate a new active address while a wallet transaction is pending",
+            );
+        }
+        let index = self.next_index;
+        Ok((index, self.secret.derive_address(index)))
+    }
+
+    pub fn has_pending_activity(&self) -> bool {
+        !self.pending_input_slots.is_empty() || !self.pending_output_slots.is_empty()
     }
 
     /// Confirmed balance of the ACTIVE address in μNOID (the spendable
     /// balance under the one-owner-per-tx rule).
     pub fn balance(&self) -> u64 {
-        self.balance_at(self.active_index)
-    }
-
-    /// Confirmed balance of one address (by key index) in μNOID.
-    pub fn balance_at(&self, key_index: u32) -> u64 {
-        self.utxos
-            .values()
-            .filter(|u| u.key_index == key_index)
-            .map(|u| u.value)
-            .fold(0u64, |a, v| a.saturating_add(v))
-    }
-
-    /// Total confirmed balance across ALL derived addresses in μNOID
-    /// (informational — spending is per-address).
-    pub fn balance_total(&self) -> u64 {
         self.utxos
             .values()
             .map(|u| u.value)
             .fold(0u64, |a, v| a.saturating_add(v))
     }
 
-    /// Replace all UTXOs with the result of a full state scan.
-    pub fn apply_scan_results(
+    /// Replace the active cache from an owner-index view that was verified
+    /// against one atomic durable chain snapshot.
+    pub fn commit_verified_activation(
         &mut self,
-        utxos: Vec<WalletUtxo>,
-        new_addresses: HashMap<[u8; 32], u32>,
-        next_index: u32,
-    ) {
-        self.utxos.clear();
-        for utxo in utxos {
-            self.utxos.insert(utxo.slot_index, utxo);
+        expected_active_index: u32,
+        expected_next_index: u32,
+        target_index: u32,
+        advance_next_index: bool,
+        queried_owner: [u8; 32],
+        snapshot: VerifiedOwnerSnapshot,
+        reserved_input_slots: &HashSet<u32>,
+        reserved_output_slots: &HashSet<u32>,
+    ) -> Result<(), String> {
+        if self.active_index != expected_active_index || self.next_index != expected_next_index {
+            return Err(
+                "wallet address selection changed during owner snapshot lookup".to_string(),
+            );
         }
-        // Merge new addresses (don't overwrite existing).
-        for (addr_bytes, idx) in new_addresses {
-            self.known_addresses.entry(addr_bytes).or_insert(idx);
+        if target_index != self.active_index && self.has_pending_activity() {
+            return Err(
+                "cannot switch active address while a wallet transaction is pending".into(),
+            );
         }
-        if next_index > self.next_index {
-            self.next_index = next_index;
-            self.save_metadata();
+        let new_next_index = if advance_next_index {
+            if target_index != self.next_index || target_index >= MAX_WALLET_ADDRESSES {
+                return Err("stale next-address preview".to_string());
+            }
+            target_index + 1
+        } else {
+            if target_index >= self.next_index {
+                return Err("active address index has not been generated".to_string());
+            }
+            self.next_index
+        };
+        let active_address = self.secret.derive_address(target_index);
+        if active_address.0 != queried_owner {
+            return Err("owner snapshot does not match activation preview".to_string());
         }
-        // Clear pending slot sets: the scan has replaced the UTXO set from
-        // chain state, so any in-flight tracking is now stale.
-        self.pending_output_slots.clear();
-        self.pending_input_slots.clear();
+        if snapshot.owner != queried_owner {
+            return Err("verified snapshot belongs to another owner".to_string());
+        }
+
+        let mut new_utxos = HashMap::with_capacity(snapshot.utxos.len());
+        for utxo in snapshot.utxos.iter() {
+            new_utxos.insert(
+                utxo.slot_index,
+                WalletUtxo {
+                    slot_index: utxo.slot_index,
+                    value: utxo.amount,
+                    creation_id: utxo.creation_id,
+                    address: active_address,
+                    key_index: target_index,
+                    confirmed_height: snapshot.height,
+                },
+            );
+        }
+        let new_snapshot = ActiveWalletSnapshot {
+            height: snapshot.height,
+            tip_hash: snapshot.tip_hash,
+            state_root: snapshot.state_root,
+            log_slots: snapshot.log_slots,
+            active_slot_count: snapshot.active_slot_count,
+            alloc_counter: snapshot.alloc_counter,
+        };
+
+        // Persist first. If the filesystem operation fails, the live wallet
+        // remains byte-for-byte on the old account/cache.
+        if target_index != self.active_index || new_next_index != self.next_index {
+            self.persist_metadata(new_next_index, target_index)?;
+        }
+        self.active_index = target_index;
+        self.next_index = new_next_index;
+        self.utxos = new_utxos;
+        self.active_snapshot = Some(new_snapshot);
+        self.pending_input_slots = self
+            .utxos
+            .keys()
+            .filter(|slot| reserved_input_slots.contains(slot))
+            .copied()
+            .collect();
+        self.pending_output_slots
+            .retain(|slot| reserved_output_slots.contains(slot));
+        Ok(())
     }
 
     /// Get a cached receipt by tx_body_hash.
     pub fn get_receipt(&self, tx_hash: &[u8; 32]) -> Option<&Vec<u8>> {
         self.receipts.get(tx_hash)
-    }
-
-    /// Clone the master secret so the wallet lock can be released before scanning.
-    /// The cloned secret has the same ZeroizeOnDrop guarantee.
-    pub fn secret_clone(&self) -> MasterSecret {
-        MasterSecret(self.secret.0)
     }
 
     /// Record an outgoing send in history (height=0 until confirmed).
@@ -269,8 +318,8 @@ impl WalletState {
             amount_micronoid,
             peer_address: Some(to_address),
             timestamp: now,
-            own_address: None,
-            own_key_index: None,
+            own_address: Some(self.active_address().to_bech32()),
+            own_key_index: Some(self.active_index),
         });
         self.save_history();
     }
@@ -283,25 +332,6 @@ impl WalletState {
         if self.history.len() != before {
             self.save_history();
         }
-    }
-
-    /// Remove history entries for transactions that were reverted by a chain reorg.
-    ///
-    /// Current mempool policy does not persist full proof-bearing transaction bytes,
-    /// so reverted wallet transactions are marked non-final by removing their history
-    /// entry; users/wallet automation may resubmit if still desired.
-    pub fn remove_reorged_history(
-        &mut self,
-        tx_hashes: &std::collections::HashSet<[u8; 32]>,
-    ) -> usize {
-        let before = self.history.len();
-        self.history
-            .retain(|entry| !tx_hashes.contains(&entry.tx_hash));
-        let removed = before.saturating_sub(self.history.len());
-        if removed > 0 {
-            self.save_history();
-        }
-        removed
     }
 
     /// Update the height of a pending (height=0) tx once it's confirmed in a block.
@@ -352,24 +382,12 @@ impl WalletState {
     /// block confirmation. Without this filter the second send hits a
     /// `SlotConflict` error in the mempool even though the wallet has balance.
     pub fn select_utxos(&self, target: u64, fee: u64) -> Option<(Vec<&WalletUtxo>, u64)> {
-        self.select_utxos_from(self.active_index, target, fee)
-    }
-
-    /// Coin selection restricted to ONE address (one owner per transaction —
-    /// the consensus rule): the active address for sends, an explicit source
-    /// address for pulls.
-    pub fn select_utxos_from(
-        &self,
-        key_index: u32,
-        target: u64,
-        fee: u64,
-    ) -> Option<(Vec<&WalletUtxo>, u64)> {
         let needed = target.saturating_add(fee);
-        // Filter out UTXOs that are already being spent by a pending tx.
+        // `utxos` contains the active owner only. Filter out outputs already
+        // being spent by a pending transaction.
         let mut available: Vec<&WalletUtxo> = self
             .utxos
             .values()
-            .filter(|u| u.key_index == key_index)
             .filter(|u| !self.pending_input_slots.contains(&u.slot_index))
             .collect();
         available.sort_by_key(|u| std::cmp::Reverse(u.value));
@@ -434,18 +452,25 @@ fn normalize_metadata_indices(
 }
 
 impl WalletState {
-    /// Save lightweight wallet metadata to disk.
-    pub fn save_metadata(&self) {
+    fn persist_metadata(&self, next_index: u32, active_index: u32) -> Result<(), String> {
         let path = metadata_path(&self.keystore_path);
         let meta = WalletMetadata {
-            next_index: self.next_index,
-            active_index: self.active_index,
+            next_index,
+            active_index,
         };
-        if let Ok(json) = serde_json::to_string(&meta) {
-            let tmp = path.with_extension("meta.tmp");
-            if std::fs::write(&tmp, json).is_ok() {
-                let _ = std::fs::rename(&tmp, &path);
-            }
+        let json = serde_json::to_string(&meta)
+            .map_err(|error| format!("serialize wallet metadata: {error}"))?;
+        let tmp = path.with_extension("meta.tmp");
+        std::fs::write(&tmp, json).map_err(|error| format!("write wallet metadata: {error}"))?;
+        std::fs::rename(&tmp, &path)
+            .map_err(|error| format!("replace wallet metadata: {error}"))?;
+        Ok(())
+    }
+
+    /// Save lightweight wallet metadata to disk.
+    pub fn save_metadata(&self) {
+        if let Err(error) = self.persist_metadata(self.next_index, self.active_index) {
+            tracing::warn!(%error, "failed to persist wallet metadata");
         }
     }
 
@@ -477,10 +502,6 @@ impl WalletState {
                 );
             }
             if next_index > self.next_index {
-                for i in self.next_index..next_index {
-                    let addr = self.secret.derive_address(i);
-                    self.known_addresses.insert(addr.0, i);
-                }
                 self.next_index = next_index;
             }
             self.active_index = active_index;
@@ -578,6 +599,26 @@ pub type SharedWallet = Arc<Mutex<Option<WalletState>>>;
 mod tests {
     use super::*;
 
+    fn snapshot(owner: [u8; 32], amount: Option<u64>) -> VerifiedOwnerSnapshot {
+        VerifiedOwnerSnapshot {
+            owner,
+            height: 19,
+            tip_hash: [0x11; 32],
+            state_root: [0x22; 32],
+            log_slots: 24,
+            active_slot_count: u64::from(amount.is_some()),
+            alloc_counter: 9,
+            utxos: amount
+                .map(|amount| noid_chain::storage::VerifiedOwnerUtxo {
+                    slot_index: 5,
+                    amount,
+                    creation_id: 8,
+                })
+                .into_iter()
+                .collect(),
+        }
+    }
+
     #[test]
     fn metadata_indices_are_bounded_and_keep_active_address_covered() {
         assert_eq!(
@@ -594,15 +635,256 @@ mod tests {
     #[test]
     fn active_index_rejects_limit_without_mutating_wallet() {
         let dir = tempfile::tempdir().unwrap();
-        let mut wallet = WalletState::create_or_load(dir.path().join("wallet.key")).unwrap();
+        let wallet = WalletState::create_or_load(dir.path().join("wallet.key")).unwrap();
         let before_next = wallet.next_index;
         let before_active = wallet.active_index;
 
         assert_eq!(
-            wallet.set_active_index(MAX_WALLET_ADDRESSES),
-            Err("active address index exceeds wallet address limit")
+            wallet.preview_generated_index(MAX_WALLET_ADDRESSES),
+            Err("active address index has not been generated")
         );
         assert_eq!(wallet.next_index, before_next);
         assert_eq!(wallet.active_index, before_active);
+    }
+
+    #[test]
+    fn generated_address_becomes_active_and_only_generated_indices_can_be_selected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = WalletState::create_or_load(dir.path().join("wallet.key")).unwrap();
+        assert_eq!(wallet.active_index, 0);
+        assert_eq!(wallet.next_index, 1);
+        assert_eq!(
+            wallet.preview_generated_index(1),
+            Err("active address index has not been generated")
+        );
+
+        let (index, address) = wallet.preview_next_index().unwrap();
+        assert_eq!(index, 1);
+        assert_ne!(address, wallet.active_address());
+        assert_eq!(wallet.active_index, 0, "preview must not switch accounts");
+        assert_eq!(wallet.next_index, 1, "preview must not consume an index");
+
+        wallet
+            .commit_verified_activation(
+                0,
+                1,
+                index,
+                true,
+                address.0,
+                snapshot(address.0, None),
+                &HashSet::new(),
+                &HashSet::new(),
+            )
+            .unwrap();
+        assert_eq!(address, wallet.active_address());
+        assert_eq!(wallet.active_index, 1);
+        assert_eq!(wallet.next_index, 2);
+        assert!(wallet.utxos.is_empty());
+        assert_eq!(wallet.active_snapshot.as_ref().unwrap().height, 19);
+
+        let address0 = wallet.preview_generated_index(0).unwrap();
+        wallet
+            .commit_verified_activation(
+                1,
+                2,
+                0,
+                false,
+                address0.0,
+                snapshot(address0.0, None),
+                &HashSet::new(),
+                &HashSet::new(),
+            )
+            .unwrap();
+        assert_eq!(wallet.active_index, 0);
+    }
+
+    #[test]
+    fn verified_owner_snapshot_replaces_only_the_active_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = WalletState::create_or_load(dir.path().join("wallet.key")).unwrap();
+        let owner = wallet.active_address();
+        wallet
+            .commit_verified_activation(
+                0,
+                1,
+                0,
+                false,
+                owner.0,
+                snapshot(owner.0, Some(123)),
+                &HashSet::new(),
+                &HashSet::new(),
+            )
+            .unwrap();
+        assert_eq!(wallet.balance(), 123);
+        assert_eq!(wallet.utxos[&5].key_index, 0);
+        assert_eq!(wallet.utxos[&5].confirmed_height, 19);
+        assert_eq!(
+            wallet.active_snapshot.as_ref().unwrap().tip_hash,
+            [0x11; 32]
+        );
+
+        let wrong_owner = [0xFF; 32];
+        assert!(wallet
+            .commit_verified_activation(
+                0,
+                1,
+                0,
+                false,
+                wrong_owner,
+                snapshot(wrong_owner, None),
+                &HashSet::new(),
+                &HashSet::new(),
+            )
+            .unwrap_err()
+            .contains("does not match"));
+        assert_eq!(wallet.balance(), 123, "failed reload must not erase cache");
+    }
+
+    #[test]
+    fn failed_switch_lookup_leaves_account_indices_and_cache_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = WalletState::create_or_load(dir.path().join("wallet.key")).unwrap();
+        let owner = wallet.active_address();
+        wallet
+            .commit_verified_activation(
+                0,
+                1,
+                0,
+                false,
+                owner.0,
+                snapshot(owner.0, Some(456)),
+                &HashSet::new(),
+                &HashSet::new(),
+            )
+            .unwrap();
+        wallet.next_index = 2; // index 1 was generated locally before this test's baseline
+        let old_snapshot = wallet.active_snapshot.clone();
+        let old_utxos = wallet.utxos.clone();
+
+        // The store lookup happens between preview and commit. A lookup error
+        // drops this preview and must have no observable wallet effect.
+        let _switch_preview = wallet.preview_generated_index(1).unwrap();
+
+        assert_eq!(wallet.active_index, 0);
+        assert_eq!(wallet.next_index, 2);
+        assert_eq!(wallet.balance(), 456);
+        assert_eq!(wallet.active_snapshot, old_snapshot);
+        assert_eq!(wallet.utxos.len(), old_utxos.len());
+        assert_eq!(wallet.utxos[&5].value, old_utxos[&5].value);
+    }
+
+    #[test]
+    fn failed_next_address_lookup_does_not_consume_index_or_clear_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = WalletState::create_or_load(dir.path().join("wallet.key")).unwrap();
+        let owner = wallet.active_address();
+        wallet
+            .commit_verified_activation(
+                0,
+                1,
+                0,
+                false,
+                owner.0,
+                snapshot(owner.0, Some(789)),
+                &HashSet::new(),
+                &HashSet::new(),
+            )
+            .unwrap();
+        let old_snapshot = wallet.active_snapshot.clone();
+        let old_utxos = wallet.utxos.clone();
+
+        let (preview_index, _owner) = wallet.preview_next_index().unwrap();
+        assert_eq!(preview_index, 1);
+
+        assert_eq!(wallet.active_index, 0);
+        assert_eq!(wallet.next_index, 1);
+        assert_eq!(wallet.balance(), 789);
+        assert_eq!(wallet.active_snapshot, old_snapshot);
+        assert_eq!(wallet.utxos.len(), old_utxos.len());
+        assert_eq!(wallet.utxos[&5].value, old_utxos[&5].value);
+    }
+
+    #[test]
+    fn reload_reconciles_pending_sets_with_snapshot_and_mempool() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = WalletState::create_or_load(dir.path().join("wallet.key")).unwrap();
+        let owner = wallet.active_address();
+        wallet.pending_input_slots.extend([5, 99]);
+        wallet.pending_output_slots.extend([7, 8]);
+
+        wallet
+            .commit_verified_activation(
+                0,
+                1,
+                0,
+                false,
+                owner.0,
+                snapshot(owner.0, Some(100)),
+                &HashSet::from([5, 99]),
+                &HashSet::from([7]),
+            )
+            .unwrap();
+
+        assert_eq!(wallet.pending_input_slots, HashSet::from([5]));
+        assert_eq!(wallet.pending_output_slots, HashSet::from([7]));
+
+        wallet
+            .commit_verified_activation(
+                0,
+                1,
+                0,
+                false,
+                owner.0,
+                snapshot(owner.0, Some(100)),
+                &HashSet::new(),
+                &HashSet::new(),
+            )
+            .unwrap();
+        assert!(!wallet.has_pending_activity());
+    }
+
+    #[test]
+    fn pending_activity_blocks_account_change_until_reload_clears_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = WalletState::create_or_load(dir.path().join("wallet.key")).unwrap();
+        let owner = wallet.active_address();
+        wallet.next_index = 2;
+        wallet.pending_input_slots.insert(5);
+
+        assert!(wallet
+            .preview_generated_index(1)
+            .unwrap_err()
+            .contains("pending"));
+        assert!(wallet.preview_next_index().unwrap_err().contains("pending"));
+        assert!(wallet.preview_generated_index(0).is_ok());
+
+        wallet
+            .commit_verified_activation(
+                0,
+                2,
+                0,
+                false,
+                owner.0,
+                snapshot(owner.0, Some(100)),
+                &HashSet::new(),
+                &HashSet::new(),
+            )
+            .unwrap();
+        assert!(wallet.preview_generated_index(1).is_ok());
+    }
+
+    #[test]
+    fn pending_send_is_tagged_with_its_source_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = WalletState::create_or_load(dir.path().join("wallet.key")).unwrap();
+        let expected_address = wallet.active_address().to_bech32();
+        wallet.record_pending_send([3; 32], 77, [4; 32]);
+
+        let entry = wallet.history.last().unwrap();
+        assert_eq!(entry.own_key_index, Some(0));
+        assert_eq!(
+            entry.own_address.as_deref(),
+            Some(expected_address.as_str())
+        );
     }
 }

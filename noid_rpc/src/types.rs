@@ -87,19 +87,13 @@ pub struct BlockTemplateResponse {
 // Wallet types
 // ---------------------------------------------------------------------------
 
-/// Info about a single derived wallet address.
+/// Local derivation metadata for one generated wallet address.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletAddressInfo {
     /// Bech32m address string.
     pub address: String,
     /// HD derivation index (0 = primary).
     pub key_index: u32,
-    /// Confirmed balance in μNOID across all UTXOs at this address.
-    pub balance_micronoid: u64,
-    /// Balance in NOID.
-    pub balance_noid: f64,
-    /// Number of confirmed UTXOs at this address.
-    pub utxo_count: usize,
     /// Whether this is the wallet's ACTIVE address (sends spend from it;
     /// one owner per transaction is a consensus rule).
     pub is_active: bool,
@@ -119,10 +113,7 @@ pub struct WalletStatus {
     pub balance_micronoid: u64,
     /// Active-address balance in NOID (6 decimal places).
     pub balance_noid: f64,
-    /// Total confirmed balance across ALL addresses in μNOID
-    /// (informational — spending is per-address).
-    pub total_micronoid: u64,
-    /// Number of confirmed UTXOs (all addresses).
+    /// Number of confirmed UTXOs at the active address.
     pub utxo_count: usize,
     /// Number of derived addresses.
     pub address_count: u32,
@@ -135,8 +126,7 @@ pub struct WalletBalance {
     /// the one-owner-per-tx rule).
     pub total_micronoid: u64,
     pub total_noid: f64,
-    /// Total across ALL derived addresses (informational).
-    pub all_addresses_micronoid: u64,
+    /// Number of confirmed UTXOs at the active address.
     pub utxo_count: usize,
     /// Confirmed UTXOs being spent by pending (mempool) txs.
     /// These are locked and cannot be spent again until confirmed or evicted.
@@ -175,16 +165,16 @@ pub struct WalletHistoryEntry {
     pub own_key_index: Option<u32>,
 }
 
-/// Result of a full state scan.
+/// Result of reloading the active owner from one verified durable snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletScanResult {
     pub found_utxos: usize,
     pub balance_micronoid: u64,
     pub balance_noid: f64,
-    /// Total addresses derived during this scan.
-    pub addresses_scanned: u32,
-    /// Next available key index after scan (use for address --new).
-    pub next_index: u32,
+    pub active_index: u32,
+    pub snapshot_height: u64,
+    pub snapshot_tip_hash: String,
+    pub snapshot_state_root: String,
 }
 
 /// Detailed deterministic fee calculation exposed over RPC.

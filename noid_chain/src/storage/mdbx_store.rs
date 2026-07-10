@@ -153,6 +153,8 @@ pub struct VerifiedOwnerUtxo {
 /// Exact owner view tied to one atomic durable chain snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedOwnerSnapshot {
+    /// Owner key whose complete derived index entry was queried.
+    pub owner: [u8; 32],
     pub height: u64,
     pub tip_hash: [u8; 32],
     pub state_root: [u8; 32],
@@ -843,6 +845,7 @@ impl MdbxStore {
         let raw: Option<Vec<u8>> = txn.get(&owner_tbl, owner.as_slice())?;
         let Some(raw) = raw else {
             return Ok(VerifiedOwnerSnapshot {
+                owner: *owner,
                 height,
                 tip_hash,
                 state_root: header.state_root,
@@ -931,6 +934,7 @@ impl MdbxStore {
             });
         }
         Ok(VerifiedOwnerSnapshot {
+            owner: *owner,
             height,
             tip_hash,
             state_root: header.state_root,
@@ -1864,6 +1868,7 @@ mod tests {
         let (header, _) = commit_owner_fixture(&store, owner);
 
         let snapshot = store.get_verified_utxos_by_owner(&owner.0).unwrap();
+        assert_eq!(snapshot.owner, owner.0);
         assert_eq!(snapshot.height, header.height);
         assert_eq!(snapshot.tip_hash, crate::hash_block_header(&header));
         assert_eq!(snapshot.state_root, header.state_root);
@@ -1886,6 +1891,7 @@ mod tests {
             ]
         );
         let empty_snapshot = store.get_verified_utxos_by_owner(&other.0).unwrap();
+        assert_eq!(empty_snapshot.owner, other.0);
         assert_eq!(empty_snapshot.tip_hash, snapshot.tip_hash);
         assert!(empty_snapshot.utxos.is_empty());
     }

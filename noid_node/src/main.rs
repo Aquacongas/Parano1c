@@ -464,34 +464,48 @@ async fn main() -> anyhow::Result<()> {
     let shared_wallet: SharedWallet = Arc::new(std::sync::Mutex::new(Some(wallet_state)));
     {
         let ctx = chain.read().await;
-        let height = ctx.tip_height();
-        let (master, hint_next_index) = {
+        let (active_index, next_index, owner) = {
             let guard = shared_wallet.lock().unwrap();
             match guard.as_ref() {
                 None => unreachable!("wallet just initialized"),
-                Some(w) => (w.secret_clone(), w.next_index),
+                Some(w) => (w.active_index, w.next_index, w.active_address().0),
             }
         };
-        let (utxos, known_addresses, next_index) = wallet::scanner::scan_state_for_utxos(
-            &ctx.state.state,
-            &master,
-            height,
-            hint_next_index,
-        );
-        drop(ctx);
-        let found = utxos.len();
-        let balance: u64 = utxos.iter().map(|u| u.value).sum();
+        let snapshot = ctx
+            .store
+            .get_verified_utxos_by_owner(&owner)
+            .map_err(|error| anyhow::anyhow!("wallet owner lookup: {error}"))?;
+        let height = snapshot.height;
+        let found = snapshot.utxos.len();
+        let balance = snapshot
+            .utxos
+            .iter()
+            .map(|utxo| utxo.amount)
+            .fold(0u64, u64::saturating_add);
+        let (reserved_inputs, reserved_outputs) = mempool.reserved_slots().await;
         {
             let mut guard = shared_wallet.lock().unwrap();
             if let Some(w) = guard.as_mut() {
-                w.apply_scan_results(utxos, known_addresses, next_index);
+                w.commit_verified_activation(
+                    active_index,
+                    next_index,
+                    active_index,
+                    false,
+                    owner,
+                    snapshot,
+                    &reserved_inputs,
+                    &reserved_outputs,
+                )
+                .map_err(|error| anyhow::anyhow!("wallet owner reload: {error}"))?;
             }
         }
+        drop(ctx);
         tracing::info!(
             height,
+            active_index,
             utxos = found,
             balance,
-            "wallet startup scan complete"
+            "wallet active address loaded"
         );
     }
     let wallet = WalletHandle::new(shared_wallet.clone());
@@ -596,15 +610,11 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or_else(|| net.default_rpc_listen())
     });
     let rpc_listen: std::net::SocketAddr = rpc_addr_str.parse().context("parse RPC listen")?;
-    // Payout address for the mining template API: --miner-address flag or wallet primary.
+    // Payout address for the mining template API: explicit override or active wallet address.
     let mining_payout_address = if cfg.mining.miner_address.is_empty() {
-        let guard = shared_wallet.lock().unwrap();
-        guard
-            .as_ref()
-            .map(|w| w.active_address())
-            .unwrap_or(noid_poseidon2b::primitives::Address([0u8; 32]))
+        None
     } else {
-        parse_address(&cfg.mining.miner_address)?
+        Some(parse_address(&cfg.mining.miner_address)?)
     };
     if let Some(ref key) = cli.mining_key {
         if key.len() < 16 {
@@ -640,7 +650,8 @@ async fn main() -> anyhow::Result<()> {
 
     // --- Miner (optional) ---
     let miner_handle = if cfg.mining.enabled {
-        // If no miner address configured, use the wallet's primary address.
+        // If no miner address is configured, resolve the active wallet address
+        // afresh for every template.
         // This ensures coinbase rewards go directly to the built-in wallet.
         let miner_addr = if cfg.mining.miner_address.is_empty() {
             let guard = shared_wallet.lock().unwrap();
@@ -663,6 +674,18 @@ async fn main() -> anyhow::Result<()> {
             chain.clone(),
             Arc::clone(&sync_ready),
         );
+
+        if cfg.mining.miner_address.is_empty() {
+            let payout_wallet = shared_wallet.clone();
+            let fallback_payout = miner_addr;
+            miner.set_payout_resolver(std::sync::Arc::new(move || {
+                payout_wallet
+                    .lock()
+                    .ok()
+                    .and_then(|wallet| wallet.as_ref().map(|wallet| wallet.active_address()))
+                    .unwrap_or(fallback_payout)
+            }));
+        }
 
         // Register wallet hook: called synchronously in apply_found_block BEFORE
         // on_new_block. Guarantees receipt is stored before getMempoolSize drops to 0.
@@ -752,11 +775,17 @@ async fn main() -> anyhow::Result<()> {
 
         let wallet_bech32 = {
             let g = shared_wallet.lock().unwrap();
-            g.as_ref().map(|w| w.primary_address().to_bech32())
+            g.as_ref().map(|w| w.active_address().to_bech32())
         };
         let miner_bech32 = if cfg.mining.enabled {
-            let g = shared_wallet.lock().unwrap();
-            g.as_ref().map(|w| w.primary_address().to_bech32())
+            mining_payout_address
+                .map(|address| address.to_bech32())
+                .or_else(|| {
+                    let wallet = shared_wallet.lock().unwrap();
+                    wallet
+                        .as_ref()
+                        .map(|wallet| wallet.active_address().to_bech32())
+                })
         } else {
             None
         };
@@ -1190,6 +1219,7 @@ async fn preverified_authorization_bytes(
 /// write lock is released and stored under a read lock.
 async fn apply_p2p_block_offthread(
     chain: &Arc<RwLock<MdbxChainContext>>,
+    wallet: &SharedWallet,
     block: noid_chain::block::Block,
     block_proof_bytes: Vec<u8>,
     block_auth_sidecar_bytes: Vec<u8>,
@@ -1197,6 +1227,7 @@ async fn apply_p2p_block_offthread(
     preverified_auth: std::collections::HashMap<[u8; 32], Vec<u8>>,
 ) -> Result<([u8; 32], ChainView), noid_chain::storage::MdbxContextError> {
     let chain = chain.clone();
+    let wallet = wallet.clone();
     tokio::task::spawn_blocking(move || {
         let block_height = block.header.height;
         let mut history_claim_bytes = None;
@@ -1265,6 +1296,10 @@ async fn apply_p2p_block_offthread(
                 tracing::warn!(height = block_height, err = %e, "failed to store P2P block auth sidecar");
             }
         }
+        // Keep the chain writer through the incremental wallet update. This
+        // shares the same `chain -> wallet` order as account activation and
+        // prevents an exact newer snapshot from receiving this delta twice.
+        update_wallet_for_block(&wallet, &block);
         let view = ChainView::from_mdbx(&ctx);
         drop(ctx);
 
@@ -1315,6 +1350,9 @@ async fn apply_p2p_block_offthread(
 /// in the success path without an extra clone or read lock.
 async fn apply_reorg_offthread(
     chain: &Arc<RwLock<MdbxChainContext>>,
+    wallet: &SharedWallet,
+    reserved_input_slots: std::collections::HashSet<u32>,
+    reserved_output_slots: std::collections::HashSet<u32>,
     ancestor_height: u64,
     new_blocks: Vec<ProvedBlockCandidate>,
     local_time: u64,
@@ -1324,6 +1362,7 @@ async fn apply_reorg_offthread(
     Option<ChainView>,
 ) {
     let chain = chain.clone();
+    let wallet = wallet.clone();
     tokio::task::spawn_blocking(move || {
         let mut ctx = chain.blocking_write();
         if ancestor_height > ctx.tip_height() {
@@ -1463,6 +1502,41 @@ async fn apply_reorg_offthread(
                             err = %e,
                             "failed to store reorg block auth sidecar"
                         );
+                    }
+                }
+            }
+            if let Ok(reorg) = &result {
+                let selection = match wallet.lock() {
+                    Ok(guard) => guard
+                        .as_ref()
+                        .map(|wallet| (wallet.active_index, wallet.next_index, wallet.active_address().0)),
+                    Err(_) => {
+                        tracing::error!("wallet state lock poisoned after committed reorg");
+                        None
+                    }
+                };
+                if let Some((active_index, next_index, owner)) = selection {
+                    match ctx.store.get_verified_utxos_by_owner(&owner) {
+                        Ok(snapshot) => {
+                            if let Err(error) = wallet::install_reorg_snapshot_and_artifacts(
+                                &wallet,
+                                active_index,
+                                next_index,
+                                owner,
+                                snapshot,
+                                &reserved_input_slots,
+                                &reserved_output_slots,
+                                &reorg.reclaimed_tx_hashes,
+                                &block_bodies,
+                            ) {
+                                tracing::error!(%error, "post-reorg wallet snapshot install failed");
+                                wallet::invalidate_active_cache(&wallet);
+                            }
+                        }
+                        Err(error) => {
+                            tracing::error!(%error, "post-reorg owner lookup failed");
+                            wallet::invalidate_active_cache(&wallet);
+                        }
                     }
                 }
             }
@@ -2312,6 +2386,7 @@ async fn handle_p2p_events(
                             preverified_authorization_bytes(&mempool, &block).await;
                         let apply_result = apply_p2p_block_offthread(
                             &chain,
+                            &wallet,
                             block.clone(),
                             block_proof_bytes.clone(),
                             block_auth_sidecar_bytes.clone(),
@@ -2329,7 +2404,6 @@ async fn handle_p2p_events(
                                     .map(|tx| tx.tx_body_hash)
                                     .collect();
                                 mempool.on_new_block(&confirmed, height, new_view).await;
-                                update_wallet_for_block(&wallet, &block);
                                 tracing::info!(height, "applied P2P block");
                                 last_tip_advance = Instant::now();
                                 sync_ready.notify_one(); // safe: no-op after first waiter wakes
@@ -2387,6 +2461,7 @@ async fn handle_p2p_events(
                                             .await;
                                     let orphan_result = apply_p2p_block_offthread(
                                         &chain,
+                                        &wallet,
                                         orphan_block.clone(),
                                         orphan_proof_bytes.clone(),
                                         orphan_auth_sidecar_bytes.clone(),
@@ -2403,7 +2478,6 @@ async fn handle_p2p_events(
                                                 .map(|tx| tx.tx_body_hash)
                                                 .collect();
                                             mempool.on_new_block(&conf, h, nv).await;
-                                            update_wallet_for_block(&wallet, &orphan_block);
                                             if !orphan_proof_bytes.is_empty() {
                                                 let ctx = chain.read().await;
                                                 if let Err(e) = ctx.store.put_block_proof(h, &orphan_proof_bytes) {
@@ -2517,10 +2591,15 @@ async fn handle_p2p_events(
                                             );
 
                                             let local_time = unix_now();
+                                            let (reorg_reserved_inputs, reorg_reserved_outputs) =
+                                                mempool.reserved_slots().await;
                                             // Reorg off the async executor (MDBX fsync is blocking).
                                             // ChainView is built inside write lock (no extra read lock needed).
                                             let (reorg_result, new_chain, maybe_reorg_view) = apply_reorg_offthread(
                                                 &chain,
+                                                &wallet,
+                                                reorg_reserved_inputs,
+                                                reorg_reserved_outputs,
                                                 ancestor_height,
                                                 new_chain,
                                                 local_time,
@@ -2548,16 +2627,17 @@ async fn handle_p2p_events(
                                                         .await;
 
                                                     let reclaimed = result.reclaimed_tx_hashes.clone();
-                                                    remove_reorged_wallet_history(&wallet, &reclaimed);
-                                                    for new_block in &new_chain {
-                                                        update_wallet_for_block(&wallet, &new_block.block);
-                                                    }
-                                                    rescan_wallet_from_chain(
+                                                    if let Err(error) = rescan_wallet_from_chain(
                                                         &wallet,
                                                         &chain,
+                                                        &mempool,
                                                         "after reorg",
                                                     )
-                                                    .await;
+                                                    .await
+                                                    {
+                                                        tracing::error!(%error, "post-reorg wallet reload failed");
+                                                        wallet::invalidate_active_cache(&wallet);
+                                                    }
 
                                                     mempool
                                                         .readmit_after_reorg(reclaimed)
@@ -3911,75 +3991,68 @@ fn evict_lowest_orphan(pool: &mut std::collections::HashMap<[u8; 32], OrphanBloc
 // Wallet block update
 // ---------------------------------------------------------------------------
 
-fn remove_reorged_wallet_history(
-    wallet: &SharedWallet,
-    tx_hashes: &[noid_poseidon2b::primitives::TxBodyHash],
-) {
-    if tx_hashes.is_empty() {
-        return;
-    }
-    let hashes: std::collections::HashSet<[u8; 32]> = tx_hashes.iter().map(|h| h.0).collect();
-    let mut guard = wallet.lock().unwrap();
-    if let Some(w) = guard.as_mut() {
-        let removed = w.remove_reorged_history(&hashes);
-        if removed > 0 {
-            tracing::info!(
-                removed,
-                "wallet: removed reorged transaction history entries"
-            );
-        }
-    }
-}
-
 async fn rescan_wallet_from_chain(
     wallet: &SharedWallet,
     chain: &Arc<RwLock<MdbxChainContext>>,
+    mempool: &AsyncMempool,
     reason: &'static str,
-) {
-    // Avoid hydrating the entire durable state when no wallet is loaded.
-    let (master, hint_next_index) = {
-        let guard = wallet.lock().unwrap();
+) -> Result<(), String> {
+    let (active_index, next_index, owner) = {
+        let guard = wallet
+            .lock()
+            .map_err(|_| "wallet state lock is poisoned".to_string())?;
         match guard.as_ref() {
-            None => return,
-            Some(w) => (w.secret_clone(), w.next_index),
+            None => return Ok(()),
+            Some(w) => (w.active_index, w.next_index, w.active_address().0),
         }
     };
-    // A live state may have clean-but-live segments evicted from RAM. Hydrate
-    // them for the full scan; otherwise `slot()` deliberately presents them as
-    // virtual zero and the wallet would lose confirmed UTXOs after a rescan.
-    let mut ctx = chain.write().await;
-    if let Err(error) = ctx.preload_all_evicted_segments() {
-        tracing::error!(%error, reason, "wallet: cannot hydrate state for rescan");
-        return;
-    }
-    let height = ctx.tip_height();
-    let (utxos, known_addresses, next_index) =
-        wallet::scanner::scan_state_for_utxos(&ctx.state.state, &master, height, hint_next_index);
-    // `restore_evicted_segment` invalidates the internal per-segment FRI cache.
-    // Rebuild it while columns are present. Keep the columns loaded: subsequent
-    // ChainView snapshots must not reinterpret durable live slots as zero.
-    let _ = ctx.state.state.root();
-    drop(ctx);
-    let found = utxos.len();
-    let balance: u64 = utxos.iter().map(|u| u.value).sum();
+    let (reserved_inputs, reserved_outputs) = mempool.reserved_slots().await;
+    let ctx = chain.read().await;
+    let snapshot = ctx
+        .store
+        .get_verified_utxos_by_owner(&owner)
+        .map_err(|error| format!("verified owner reload failed: {error}"))?;
+    let height = snapshot.height;
+    let found = snapshot.utxos.len();
+    let balance = snapshot
+        .utxos
+        .iter()
+        .map(|utxo| utxo.amount)
+        .fold(0u64, u64::saturating_add);
     {
-        let mut guard = wallet.lock().unwrap();
+        let mut guard = wallet
+            .lock()
+            .map_err(|_| "wallet state lock is poisoned".to_string())?;
         if let Some(w) = guard.as_mut() {
-            w.apply_scan_results(utxos, known_addresses, next_index);
+            w.commit_verified_activation(
+                active_index,
+                next_index,
+                active_index,
+                false,
+                owner,
+                snapshot,
+                &reserved_inputs,
+                &reserved_outputs,
+            )
+            .map_err(|error| format!("active address changed during reload: {error}"))?;
         }
     }
+    drop(ctx);
     tracing::info!(
         height,
+        active_index,
         utxos = found,
         balance,
         reason,
-        "wallet scan complete"
+        "wallet active address reloaded"
     );
+    Ok(())
 }
 
 async fn replay_prefetched_snapshot_suffix(
     chain: &Arc<RwLock<MdbxChainContext>>,
     mempool: &AsyncMempool,
+    wallet: &SharedWallet,
     suffix: Vec<PrefetchedSnapshotBlock>,
 ) -> Result<u64, String> {
     let mut current_height = chain.read().await.tip_height();
@@ -4000,6 +4073,7 @@ async fn replay_prefetched_snapshot_suffix(
         let preverified_auth = preverified_authorization_bytes(mempool, &item.block).await;
         let (_hash, view) = apply_p2p_block_offthread(
             chain,
+            wallet,
             item.block.clone(),
             item.block_proof_bytes,
             item.block_auth_sidecar_bytes,
@@ -4053,7 +4127,22 @@ async fn apply_verified_snapshot_with_suffix(
 
     let (applied_height, view) = result;
     mempool.on_new_block(&[], applied_height, view).await;
-    let final_height = match replay_prefetched_snapshot_suffix(chain, mempool, suffix).await {
+
+    // Establish the exact active-owner cache at the snapshot checkpoint before
+    // replaying any retained suffix. Incremental wallet deltas must never run
+    // on the pre-snapshot chain's UTXO cache: that would corrupt sent/received
+    // amounts and receipts even if a final balance reload repaired the UTXOs.
+    if let Err(error) =
+        rescan_wallet_from_chain(wallet, chain, mempool, "snapshot checkpoint baseline").await
+    {
+        wallet::invalidate_active_cache(wallet);
+        return Err(format!(
+            "snapshot applied but active-wallet baseline reload failed: {error}"
+        ));
+    }
+
+    let final_height = match replay_prefetched_snapshot_suffix(chain, mempool, wallet, suffix).await
+    {
         Ok(height) => height,
         Err(e) => {
             tracing::warn!(
@@ -4076,7 +4165,10 @@ async fn apply_verified_snapshot_with_suffix(
         height = final_height,
         "chain snapshot applied — mining can begin"
     );
-    rescan_wallet_from_chain(wallet, chain, "snapshot sync").await;
+    if let Err(error) = rescan_wallet_from_chain(wallet, chain, mempool, "snapshot sync").await {
+        tracing::error!(%error, "final post-snapshot wallet reload failed");
+        wallet::invalidate_active_cache(wallet);
+    }
     let _ = p2p_cmd
         .send(noid_p2p::NetworkCommand::SyncBlocksFrom {
             peer,
@@ -4092,38 +4184,12 @@ async fn apply_verified_snapshot_with_suffix(
 /// Must be called after `apply_next_block` succeeds and before block pruning.
 /// No-op if the wallet is not initialized.
 fn update_wallet_for_block(wallet: &SharedWallet, block: &noid_chain::block::Block) {
-    let mut guard = wallet.lock().unwrap();
-    if let Some(w) = guard.as_mut() {
-        // Borrow distinct fields directly — no HashMap clone needed.
-        wallet::scanner::update_wallet_from_block(
-            &mut w.utxos,
-            &mut w.history,
-            &mut w.receipts,
-            &w.known_addresses,
-            &mut w.pending_input_slots,
-            block,
+    if let Err(error) = wallet::update_for_accepted_block(wallet, block) {
+        tracing::error!(
+            height = block.header.height,
+            %error,
+            "committed block but wallet update failed"
         );
-        // Confirm any pending (height=0) txs that appear in this block
-        // and clear their output slots from pending_output_slots.
-        let height = block.header.height;
-        for tx in &block.transactions {
-            w.confirm_pending_tx(&tx.tx_body_hash.0, height);
-            // Clear pending output slots now that the tx is confirmed.
-            let output_slots: Vec<u32> = tx
-                .body
-                .outputs
-                .iter()
-                .filter(|o| o.valid)
-                .map(|o| o.slot_index)
-                .collect();
-            w.remove_pending_outputs(&output_slots);
-        }
-        // Save wallet artifacts after updating. History is in-memory during block
-        // application, but must survive process restarts for confirmed txs.
-        w.save_history();
-        if !w.receipts.is_empty() {
-            w.save_receipts();
-        }
     }
 }
 

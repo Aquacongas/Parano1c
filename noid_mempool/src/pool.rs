@@ -563,6 +563,24 @@ impl AsyncMempool {
         self.state.lock().await.admitted_output_slots.clone()
     }
 
+    /// Snapshot of input slots currently reserved by admitted mempool txs.
+    pub async fn reserved_input_slots(&self) -> HashSet<u32> {
+        self.state.lock().await.admitted_input_slots.clone()
+    }
+
+    /// Atomically snapshot both input and output reservations.
+    ///
+    /// Wallet reloads use this instead of two independent reads so an
+    /// intervening admission/eviction cannot leave their pending sets sourced
+    /// from different mempool states.
+    pub async fn reserved_slots(&self) -> (HashSet<u32>, HashSet<u32>) {
+        let state = self.state.lock().await;
+        (
+            state.admitted_input_slots.clone(),
+            state.admitted_output_slots.clone(),
+        )
+    }
+
     /// Current chain occupancy used for fee estimation: (active slots, log_slots).
     pub async fn fee_context(&self) -> (u64, u32) {
         let st = self.state.lock().await;
