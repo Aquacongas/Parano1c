@@ -66,7 +66,8 @@ pub struct MempoolEntry {
     /// Fee per weighted resource unit.
     ///
     /// The weight is `inputs + outputs + 4 × net_new_slots`, so transactions
-    /// that grow live state are deprioritised versus consolidation at similar fees.
+    /// that grow live state are deprioritised versus state-shrinking
+    /// transactions at similar fees.
     pub fee_rate: u64,
 
     /// Cached `WalletAuthorizationBundle` bytes (AuthGKR authorization) provided

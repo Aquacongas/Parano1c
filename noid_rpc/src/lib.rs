@@ -11,4 +11,4 @@ pub mod wallet_submit;
 
 pub use server::start_rpc_server;
 pub use wallet_ops::WalletOps;
-pub use wallet_submit::{WalletOperationGate, WalletSubmitCoordinator};
+pub use wallet_submit::WalletOperationGate;

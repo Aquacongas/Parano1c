@@ -280,7 +280,7 @@ pub const MIN_FEE_BASE: u64 = 5_000; // 0.005 NOID
 ///
 /// Inputs do not grow chain state, so this intentionally stays much lower than
 /// the output fee. It keeps very large-input transactions from becoming free
-/// relay/prover spam without penalising useful consolidation transactions.
+/// relay/prover spam without penalising useful state-shrinking transactions.
 pub const FEE_PER_INPUT: u64 = 100; // 0.0001 NOID per input
 
 /// Fee charged per live output created by a transaction.

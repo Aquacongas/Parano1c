@@ -115,12 +115,12 @@ pub struct WalletState {
     /// Used to avoid SlotConflict when retrying or sending multiple txs.
     pub pending_output_slots: std::collections::HashSet<u32>,
     /// Input slots being spent by pending (submitted but not yet confirmed) txs.
-    /// Used to avoid double-spending the same UTXO in consecutive consolidation
-    /// or send rounds before the first TX is confirmed.
+    /// Used to avoid double-spending the same UTXO when a send is retried or
+    /// another send starts before the first transaction is confirmed.
     pub pending_input_slots: std::collections::HashSet<u32>,
     /// The ACTIVE address key index. One owner per transaction (consensus
-    /// rule): sends and consolidations spend ONLY this address's UTXOs and
-    /// change returns to it. Inactive addresses are not scanned or cached.
+    /// rule): sends spend ONLY this address's UTXOs and change returns to it.
+    /// Inactive addresses are not scanned or cached.
     pub active_index: u32,
 }
 

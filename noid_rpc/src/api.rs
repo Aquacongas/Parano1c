@@ -8,8 +8,8 @@ use jsonrpsee::proc_macros::rpc;
 use crate::types::{
     AddressInfo, BlockHeaderInfo, BlockTemplateResponse, ChainInfo, FeeEstimate, MempoolInfo,
     MiningInfo, ReceiptVerifyResult, SlotInfo, StateInfo, TxInfo, WalletAddressInfo, WalletBalance,
-    WalletConsolidatePlan, WalletHistoryEntry, WalletScanResult, WalletSendPlan, WalletSendResult,
-    WalletStatus, WalletUtxoInfo,
+    WalletHistoryEntry, WalletScanResult, WalletSendPlan, WalletSendResult, WalletStatus,
+    WalletUtxoInfo,
 };
 
 #[rpc(server, namespace = "paranoid")]
@@ -235,19 +235,6 @@ pub trait ParanoidApi {
     #[method(name = "walletExportReceipt")]
     async fn wallet_export_receipt(&self, txhash_hex: String) -> RpcResult<String>;
 
-    /// Dry-run one consolidation round without proving or submitting.
-    /// `fee_micronoid = 0` uses the automatic minimum relay fee.
-    #[method(name = "walletPlanConsolidate")]
-    async fn wallet_plan_consolidate(&self, fee_micronoid: u64)
-        -> RpcResult<WalletConsolidatePlan>;
-
-    /// Consolidate up to eight small UTXOs into one larger UTXO.
-    /// Returns the submitted ordinary transaction.
-    /// Returns an error if the wallet has 1 or fewer available UTXOs, or insufficient funds.
-    /// `fee_micronoid = 0` uses an automatic fee for the selected inputs.
-    #[method(name = "walletConsolidate")]
-    async fn wallet_consolidate(&self, fee_micronoid: u64) -> RpcResult<WalletSendResult>;
-
     /// Generate the next address, make it active, and load its current UTXOs.
     #[method(name = "walletNextAddress")]
     async fn wallet_next_address(&self) -> RpcResult<WalletAddressInfo>;
@@ -256,9 +243,9 @@ pub trait ParanoidApi {
     #[method(name = "walletListAddresses")]
     async fn wallet_list_addresses(&self) -> RpcResult<Vec<WalletAddressInfo>>;
 
-    /// The ACTIVE address (key index + bech32m). Sends and consolidations
-    /// spend this address's UTXOs only (one owner per transaction is a
-    /// consensus rule) and change returns to it.
+    /// The ACTIVE address (key index + bech32m). Sends spend this address's
+    /// UTXOs only (one owner per transaction is a consensus rule) and change
+    /// returns to it.
     #[method(name = "walletActiveAddress")]
     async fn wallet_active_address(&self) -> RpcResult<WalletAddressInfo>;
 

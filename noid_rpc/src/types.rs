@@ -223,78 +223,19 @@ pub struct WalletSendPlan {
     pub fee_breakdown: FeeBreakdownInfo,
 }
 
-/// Stable JSON-RPC code for a payment blocked by input fragmentation.
-pub const WALLET_CONSOLIDATION_REQUIRED_CODE: i32 = -32011;
-/// Stable JSON-RPC message for a payment blocked by input fragmentation.
-pub const WALLET_CONSOLIDATION_REQUIRED_MESSAGE: &str = "ConsolidationRequired";
+/// Stable JSON-RPC code for a payment that exceeds the canonical input limit.
+pub const WALLET_INPUT_LIMIT_EXCEEDED_CODE: i32 = -32011;
+/// Stable JSON-RPC message for a payment that exceeds the canonical input limit.
+pub const WALLET_INPUT_LIMIT_EXCEEDED_MESSAGE: &str = "InputLimitExceeded";
 
-/// JSON-RPC error data when the active wallet has enough total spendable
-/// balance, but no legal set of at most eight inputs can fund the payment.
-/// This deliberately exposes only the amount that must be consolidated.
+/// JSON-RPC error data when no legal payment can be formed within the fixed
+/// transaction input bound.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WalletConsolidationRequired {
-    pub target_amount_micronoid: u64,
+pub struct WalletInputLimitExceeded {
+    pub max_inputs: usize,
 }
 
-/// Dry-run plan for one consolidation transaction.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WalletConsolidatePlan {
-    pub selected_input_count: usize,
-    pub output_count: usize,
-    pub fee_micronoid: u64,
-    pub expected_utxo_reduction: usize,
-    pub fee_breakdown: FeeBreakdownInfo,
-}
-
-/// One exact confirmed active-owner source captured by a targeted
-/// consolidation plan.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WalletTargetConsolidationCoin {
-    pub slot_index: u32,
-    pub value_micronoid: u64,
-}
-
-/// One ordinary Tx8x2 in the immediately executable confirmation wave.
-///
-/// `input_slots` is the exact set the builder must consume.  The first output
-/// always returns `output_amount_micronoid` to the captured active address;
-/// `change_micronoid`, when present, is the second active-address output.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WalletTargetConsolidationWaveTransaction {
-    pub input_slots: Vec<u32>,
-    pub input_amounts_micronoid: Vec<u64>,
-    pub output_amount_micronoid: u64,
-    pub change_micronoid: Option<u64>,
-    pub fee_micronoid: u64,
-    pub creates_target: bool,
-}
-
-/// Deterministic exact-target consolidation plan.
-///
-/// Only `first_wave` is executable now. Descendant slots do not exist until
-/// their parent transactions confirm, so later work is an honest aggregate
-/// projection rather than a fabricated list of slot indices.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WalletTargetConsolidationPlan {
-    pub target_amount_micronoid: u64,
-    pub selected_source_count: usize,
-    pub first_wave: Vec<WalletTargetConsolidationWaveTransaction>,
-    pub projected_total_transactions: usize,
-    pub projected_confirmation_waves: usize,
-    pub projected_total_fee_micronoid: u64,
-    pub final_change_micronoid: u64,
-}
-
-/// Planning can finish without a transaction when the exact requested UTXO
-/// already exists.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum WalletTargetConsolidationOutcome {
-    AlreadyPresent { coin: WalletTargetConsolidationCoin },
-    Planned { plan: WalletTargetConsolidationPlan },
-}
-
-/// One successfully admitted ordinary payment or consolidation transaction.
+/// One successfully admitted ordinary payment transaction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletSendResult {
     pub txid: String,

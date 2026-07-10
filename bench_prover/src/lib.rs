@@ -221,14 +221,14 @@ pub fn tx8x2_scenario(
     }
 }
 
-pub fn consolidation_scenario(
+pub fn state_shrinking_scenario(
     label: &'static str,
     n_inputs: usize,
     slot_base: u32,
     seed: u128,
 ) -> BenchScenario {
     let mut scenario = tx8x2_scenario(label, n_inputs, 1, slot_base, seed);
-    scenario.desc = format!("Tx8x2 consolidation: {n_inputs} inputs / 1 output");
+    scenario.desc = format!("Tx8x2 state shrink: {n_inputs} inputs / 1 output");
     scenario
 }
 

@@ -34,8 +34,6 @@
 //!   2. First `TxAdmitted` while a coinbase-only no-proof block is being mined
 //!   3. New chain tip from P2P (block received or snapshot applied)
 
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -201,12 +199,6 @@ pub type BlockAppliedHook = Arc<dyn Fn(&noid_chain::block::Block) + Send + Sync>
 /// Resolves the payout address immediately before each template is built.
 /// Used by the built-in wallet when no explicit mining address is configured.
 pub type MiningPayoutResolver = Arc<dyn Fn() -> Address + Send + Sync>;
-/// Async maintenance hook completed immediately before each template snapshot.
-/// The miner stays agnostic to wallets/RPC; the node installs this only for
-/// default active-address payout.
-pub type BeforeTemplateHook =
-    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
-
 fn resolve_mining_payout(configured: Address, resolver: Option<&MiningPayoutResolver>) -> Address {
     resolver.map(|resolve| resolve()).unwrap_or(configured)
 }
@@ -236,7 +228,6 @@ pub struct BlockMiner {
     /// Optional dynamic payout. Explicitly configured miner addresses leave
     /// this unset and continue to use `config.miner_address`.
     payout_resolver: Option<MiningPayoutResolver>,
-    before_template: Option<BeforeTemplateHook>,
 }
 
 impl BlockMiner {
@@ -275,7 +266,6 @@ impl BlockMiner {
             prove_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
             on_block_applied: None,
             payout_resolver: None,
-            before_template: None,
         };
         (miner, rx)
     }
@@ -290,12 +280,6 @@ impl BlockMiner {
     /// Resolve the wallet's active address for every future template.
     pub fn set_payout_resolver(&mut self, resolver: MiningPayoutResolver) {
         self.payout_resolver = Some(resolver);
-    }
-
-    /// Install one async maintenance action that completes before every new
-    /// template snapshot and therefore can affect that template's mempool set.
-    pub fn set_before_template_hook(&mut self, hook: BeforeTemplateHook) {
-        self.before_template = Some(hook);
     }
 
     /// Cancel the current PoW search (call when a new P2P block arrives).
@@ -394,10 +378,6 @@ impl BlockMiner {
             if self.stopped.load(Ordering::Acquire) {
                 tracing::info!("miner: shutdown flag set, exiting loop");
                 break;
-            }
-
-            if let Some(hook) = &self.before_template {
-                hook().await;
             }
 
             // --- Build template ---

@@ -48,7 +48,7 @@ use noid_chain::storage::{encoded_segment_len_for_eff_log, MdbxChainContext};
 use noid_mempool::{AsyncMempool, ChainView, MempoolConfig};
 use noid_miner::{BlockMiner, MinerConfig};
 use noid_p2p::{NetworkEvent, P2PNetwork};
-use noid_rpc::start_rpc_server;
+use noid_rpc::{start_rpc_server, WalletOperationGate};
 
 #[derive(Clone)]
 struct ProvedBlockCandidate {
@@ -503,12 +503,6 @@ async fn main() -> anyhow::Result<()> {
     }
     let wallet = WalletHandle::new(shared_wallet.clone());
     let wallet_operation_gate = Arc::new(tokio::sync::Mutex::new(()));
-    let wallet_submit = noid_rpc::WalletSubmitCoordinator::new(
-        Arc::clone(&chain),
-        mempool.clone(),
-        Arc::clone(&wallet),
-        Arc::clone(&wallet_operation_gate),
-    );
 
     // --- P2P Network ---
     let p2p_listen_str = cli.p2p_listen.unwrap_or_else(|| {
@@ -569,6 +563,7 @@ async fn main() -> anyhow::Result<()> {
     let p2p_events = p2p.subscribe();
     let p2p_cmd_for_events = p2p.cmd_tx.clone();
     let p2p_sync_ready = Arc::clone(&sync_ready);
+    let p2p_wallet_operation_gate = Arc::clone(&wallet_operation_gate);
     tokio::spawn(async move {
         handle_p2p_events(
             p2p_events,
@@ -577,6 +572,7 @@ async fn main() -> anyhow::Result<()> {
             p2p_wallet,
             p2p_cmd_for_events,
             p2p_sync_ready,
+            p2p_wallet_operation_gate,
         )
         .await;
     });
@@ -638,7 +634,7 @@ async fn main() -> anyhow::Result<()> {
         chain.clone(),
         mempool.clone(),
         wallet,
-        wallet_submit.clone(),
+        Arc::clone(&wallet_operation_gate),
         p2p.cmd_tx.clone(),
         cli.mode == NodeMode::Extminer,
         mining_payout_address,
@@ -685,24 +681,6 @@ async fn main() -> anyhow::Result<()> {
                     .ok()
                     .and_then(|wallet| wallet.as_ref().map(|wallet| wallet.active_address()))
                     .unwrap_or(fallback_payout)
-            }));
-
-            let proactive = wallet_submit.clone();
-            miner.set_before_template_hook(std::sync::Arc::new(move || {
-                let proactive = proactive.clone();
-                Box::pin(async move {
-                    match proactive.submit_consolidation(noid_tx::TX_INPUTS, 0).await {
-                        Ok(Some(result)) => tracing::info!(
-                            txid = %result.txid,
-                            "proactive miner consolidation admitted before template"
-                        ),
-                        Ok(None) => {}
-                        Err(error) => tracing::warn!(
-                            %error,
-                            "proactive miner consolidation skipped"
-                        ),
-                    }
-                })
             }));
         }
 
@@ -1872,6 +1850,7 @@ async fn handle_p2p_events(
     wallet: SharedWallet,
     p2p_cmd: tokio::sync::mpsc::Sender<noid_p2p::NetworkCommand>,
     sync_ready: Arc<tokio::sync::Notify>,
+    wallet_operation_gate: WalletOperationGate,
 ) {
     // Orphan pool: blocks whose parent is not yet known.
     // When the parent arrives, we re-apply the orphan.
@@ -2311,6 +2290,7 @@ async fn handle_p2p_events(
                                 *pending.manifest,
                                 Vec::new(),
                                 pending.prefetched_suffix,
+                                &wallet_operation_gate,
                             )
                             .await
                             {
@@ -2599,6 +2579,15 @@ async fn handle_p2p_events(
                                                 "reorg: competing chain has more work, reorganising"
                                             );
 
+                                            // Serialize the complete chain + active-wallet
+                                            // replacement against RPC address switches,
+                                            // scans, and submissions. Lock order is:
+                                            // wallet_operation_gate -> mempool snapshot/view
+                                            // -> chain -> SharedWallet. apply_reorg_offthread
+                                            // wallet RPC must not reacquire this gate while
+                                            // this guard is held.
+                                            let _wallet_operation =
+                                                wallet_operation_gate.lock().await;
                                             let local_time = unix_now();
                                             let (reorg_reserved_inputs, reorg_reserved_outputs) =
                                                 mempool.reserved_slots().await;
@@ -2636,18 +2625,6 @@ async fn handle_p2p_events(
                                                         .await;
 
                                                     let reclaimed = result.reclaimed_tx_hashes.clone();
-                                                    if let Err(error) = rescan_wallet_from_chain(
-                                                        &wallet,
-                                                        &chain,
-                                                        &mempool,
-                                                        "after reorg",
-                                                    )
-                                                    .await
-                                                    {
-                                                        tracing::error!(%error, "post-reorg wallet reload failed");
-                                                        wallet::invalidate_active_cache(&wallet);
-                                                    }
-
                                                     mempool
                                                         .readmit_after_reorg(reclaimed)
                                                         .await;
@@ -3592,6 +3569,7 @@ async fn handle_p2p_events(
                                 *pending.manifest,
                                 segments,
                                 pending.prefetched_suffix,
+                                &wallet_operation_gate,
                             )
                             .await
                             {
@@ -3802,6 +3780,7 @@ async fn handle_p2p_events(
                                     *pending.manifest,
                                     Vec::new(),
                                     pending.prefetched_suffix,
+                                    &wallet_operation_gate,
                                 )
                                 .await
                                 {
@@ -4109,7 +4088,14 @@ async fn apply_verified_snapshot_with_suffix(
     manifest: noid_p2p::protocol::GetStateManifestResponse,
     segments: Vec<VerifiedSnapshotSegment>,
     suffix: Vec<PrefetchedSnapshotBlock>,
+    wallet_operation_gate: &WalletOperationGate,
 ) -> Result<u64, String> {
+    // Global order for operations that can replace the active wallet cache:
+    // wallet_operation_gate -> mempool snapshot/view -> chain -> SharedWallet.
+    // Keep this single acquisition across snapshot install, the checkpoint
+    // baseline, suffix replay, and the final reload. None of those helpers may
+    // enter wallet RPC code that acquires the same gate.
+    let wallet_operation = wallet_operation_gate.lock().await;
     let snapshot_height = manifest.tip_height;
     let segment_count = segments.len();
     let result = {
@@ -4175,6 +4161,7 @@ async fn apply_verified_snapshot_with_suffix(
         tracing::error!(%error, "final post-snapshot wallet reload failed");
         wallet::invalidate_active_cache(wallet);
     }
+    drop(wallet_operation);
     let _ = p2p_cmd
         .send(noid_p2p::NetworkCommand::SyncBlocksFrom {
             peer,
@@ -4410,9 +4397,7 @@ fn prepare_certificate_batch_package_build(
         |package| Ok(package.step_statement.batch_summary.end_consensus.clone()),
     )?;
     let start_accumulator = latest_package.as_ref().map_or_else(
-        || {
-            Ok::<noid_recursive::ChainAccumulator, String>(genesis_accumulator())
-        },
+        || Ok::<noid_recursive::ChainAccumulator, String>(genesis_accumulator()),
         |package| Ok(package.step_statement.batch_summary.end_accumulator.clone()),
     )?;
     let previous_head = match latest_package {

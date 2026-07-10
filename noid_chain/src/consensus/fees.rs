@@ -70,7 +70,8 @@ pub fn occupancy_bps(active_slot_count: u64, log_slots: u32) -> u64 {
 /// Deterministic pressure multiplier for the state-growth component.
 ///
 /// This is intentionally stepwise instead of floating-point. The multiplier only
-/// affects net-new state growth; consolidation remains free of this pressure fee.
+/// affects net-new state growth; state-shrinking transactions remain free of
+/// this pressure fee.
 #[inline]
 pub fn pressure_multiplier(active_slot_count: u64, log_slots: u32) -> u64 {
     match occupancy_bps(active_slot_count, log_slots) {
@@ -92,7 +93,7 @@ pub fn state_growth_fee_per_slot(active_slot_count: u64, log_slots: u32) -> u64 
 /// The formula is intentionally output-centric: inputs pay a small anti-DoS
 /// component, outputs pay the larger ordinary I/O component, and only net-new
 /// state growth is burned. The sole fixed body pays for its actual live
-/// inputs/outputs and is naturally cheap when it consolidates.
+/// inputs/outputs and is naturally cheap when it shrinks live state.
 pub fn fee_breakdown(
     n_inputs: u64,
     n_outputs: u64,
@@ -208,7 +209,7 @@ mod tests {
     }
 
     #[test]
-    fn consolidation_has_no_state_growth_burn() {
+    fn state_shrinking_transaction_has_no_state_growth_burn() {
         let f = fee_breakdown(8, 1, 0, LOG_SLOTS_GENESIS);
         assert_eq!(f.state_growth, 0);
         assert_eq!(f.burned, 0);

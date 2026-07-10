@@ -4,7 +4,7 @@
 //! Wallet authorization benchmark for the sole Tx8x2 form.
 
 use bench_prover::{
-    authorization_size, consolidation_scenario, fmt_bytes, fmt_ms, live_counts, prove_wallet,
+    authorization_size, fmt_bytes, fmt_ms, live_counts, prove_wallet, state_shrinking_scenario,
     tx8x2_scenario, tx_fixture, wallet_bundle_size, TxFixture, WalletBench,
 };
 
@@ -43,7 +43,7 @@ fn main() {
         tx8x2_scenario("send-small", 1, 2, 0, 0xA1),
         tx8x2_scenario("send-medium", 4, 2, 100, 0xB1),
         tx8x2_scenario("send-max-input", 8, 2, 200, 0xC1),
-        consolidation_scenario("consolidate-max", 8, 300, 0xD1),
+        state_shrinking_scenario("state-shrink-max", 8, 300, 0xD1),
     ];
 
     for scenario in cases {

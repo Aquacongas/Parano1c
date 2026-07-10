@@ -30,7 +30,6 @@ pub mod keystore;
 pub mod prover;
 pub mod scanner;
 pub mod state;
-pub mod target_consolidation;
 
 pub use state::{SharedWallet, WalletState};
 
@@ -46,9 +45,7 @@ use std::sync::Arc;
 use noid_chain::storage::VerifiedOwnerSnapshot;
 use noid_rpc::types::{
     micronoid_to_noid, FeeBreakdownInfo, WalletAddressInfo, WalletBalance, WalletHistoryEntry,
-    WalletScanResult, WalletSendPlan, WalletStatus, WalletTargetConsolidationCoin,
-    WalletTargetConsolidationOutcome, WalletTargetConsolidationPlan,
-    WalletTargetConsolidationWaveTransaction, WalletUtxoInfo,
+    WalletScanResult, WalletSendPlan, WalletStatus, WalletUtxoInfo,
 };
 use noid_rpc::wallet_ops::{WalletActivationPreview, WalletSendPlanError};
 use noid_rpc::WalletOps;
@@ -495,9 +492,9 @@ impl WalletOps for WalletHandle {
                 WalletSendPlanError::Other("wallet balance arithmetic overflow".to_string())
             })?;
 
-        // The remediation amount is deliberately stable and independent of
-        // the current fragmented shape: requested amount plus the explicit
-        // fee, or plus today's minimum one-input/one-output automatic fee.
+        // Reject an impossible balance before shape selection using the
+        // cheapest legal transaction as the lower bound. The exact fee is
+        // still computed below from the selected transaction's real I/O.
         let one_input_one_output =
             noid_chain::consensus::fee_breakdown(1, 1, active_slot_count, log_slots);
         let one_input_one_output_minimum = one_input_one_output.required_total.max(relay_floor);
@@ -508,13 +505,13 @@ impl WalletOps for WalletHandle {
                 )));
             }
         }
-        let target_fee = explicit_fee_micronoid.unwrap_or(one_input_one_output_minimum);
-        let consolidation_target = amount_micronoid.checked_add(target_fee).ok_or_else(|| {
+        let minimum_fee = explicit_fee_micronoid.unwrap_or(one_input_one_output_minimum);
+        let minimum_total = amount_micronoid.checked_add(minimum_fee).ok_or_else(|| {
             WalletSendPlanError::Other("payment amount plus fee overflows u64".to_string())
         })?;
-        if spendable < consolidation_target {
+        if spendable < minimum_total {
             return Err(WalletSendPlanError::InsufficientFunds {
-                needed_micronoid: consolidation_target,
+                needed_micronoid: minimum_total,
                 available_micronoid: spendable,
             });
         }
@@ -523,7 +520,7 @@ impl WalletOps for WalletHandle {
         let mut planned = explicit_fee_micronoid.and_then(|fee| {
             available
                 .iter()
-                .find(|utxo| utxo.value == consolidation_target)
+                .find(|utxo| utxo.value == minimum_total)
                 .map(|_| (1, fee, 1, 0, one_input_one_output))
         });
         for input_count in 1..=TX_INPUTS {
@@ -538,10 +535,10 @@ impl WalletOps for WalletHandle {
             })?;
 
             if let Some(fee) = explicit_fee_micronoid {
-                if selected_value < consolidation_target {
+                if selected_value < minimum_total {
                     continue;
                 }
-                let change = selected_value - consolidation_target;
+                let change = selected_value - minimum_total;
                 let output_count = 1 + usize::from(change > 0);
                 let breakdown = noid_chain::consensus::fee_breakdown(
                     input_count as u64,
@@ -603,8 +600,14 @@ impl WalletOps for WalletHandle {
         }
 
         let Some((_, fee_micronoid, _, _, _)) = planned else {
-            return Err(WalletSendPlanError::ConsolidationRequired {
-                target_amount_micronoid: consolidation_target,
+            if available.len() > TX_INPUTS {
+                return Err(WalletSendPlanError::InputLimitExceeded {
+                    max_inputs: TX_INPUTS,
+                });
+            }
+            return Err(WalletSendPlanError::InsufficientFunds {
+                needed_micronoid: minimum_total,
+                available_micronoid: spendable,
             });
         };
         // Re-run the shared exact-single-before-greedy selector with the final
@@ -613,8 +616,14 @@ impl WalletOps for WalletHandle {
         let Some((selected, change_micronoid)) =
             wallet.select_utxos(amount_micronoid, fee_micronoid)
         else {
-            return Err(WalletSendPlanError::ConsolidationRequired {
-                target_amount_micronoid: consolidation_target,
+            if available.len() > TX_INPUTS {
+                return Err(WalletSendPlanError::InputLimitExceeded {
+                    max_inputs: TX_INPUTS,
+                });
+            }
+            return Err(WalletSendPlanError::InsufficientFunds {
+                needed_micronoid: amount_micronoid.saturating_add(fee_micronoid),
+                available_micronoid: spendable,
             });
         };
         let input_count = selected.len();
@@ -682,222 +691,6 @@ impl WalletOps for WalletHandle {
         let (_txid, intent_bytes) =
             builder::build_and_prove_tx(to_address, amount_micronoid, fee_micronoid, build_data)
                 .map_err(|e| e.to_string())?;
-
-        Ok((intent_bytes, input_slots))
-    }
-
-    fn plan_target_consolidation(
-        &self,
-        target_amount_micronoid: u64,
-        explicit_fee_per_tx_micronoid: Option<u64>,
-        active_slot_count: u64,
-        log_slots: u32,
-        relay_floor_micronoid: u64,
-    ) -> Result<WalletTargetConsolidationOutcome, String> {
-        let guard = self.inner.lock().unwrap();
-        let wallet = guard
-            .as_ref()
-            .ok_or_else(|| "wallet not initialized".to_string())?;
-        let active_address = wallet.active_address();
-        let coins: Vec<target_consolidation::ConfirmedCoin> = wallet
-            .utxos
-            .values()
-            .filter(|utxo| utxo.confirmed_height > 0)
-            .filter(|utxo| utxo.key_index == wallet.active_index)
-            .filter(|utxo| utxo.address == active_address)
-            .filter(|utxo| !wallet.pending_input_slots.contains(&utxo.slot_index))
-            .map(|utxo| target_consolidation::ConfirmedCoin {
-                slot_index: utxo.slot_index,
-                value_micronoid: utxo.value,
-            })
-            .collect();
-        let outcome = target_consolidation::plan_target_consolidation(
-            &coins,
-            target_amount_micronoid,
-            target_consolidation::TargetConsolidationFeeContext {
-                explicit_fee_per_tx_micronoid,
-                active_slot_count,
-                log_slots,
-                relay_floor_micronoid,
-                max_transactions_per_wave: noid_chain::consensus::params::BLOCK_MAX_USER_TXS,
-            },
-        )
-        .map_err(|error| error.to_string())?;
-
-        match outcome {
-            target_consolidation::TargetConsolidationOutcome::AlreadyPresent { coin } => {
-                Ok(WalletTargetConsolidationOutcome::AlreadyPresent {
-                    coin: WalletTargetConsolidationCoin {
-                        slot_index: coin.slot_index,
-                        value_micronoid: coin.value_micronoid,
-                    },
-                })
-            }
-            target_consolidation::TargetConsolidationOutcome::Planned(plan) => {
-                let selected_source_count = plan.selected_sources.len();
-                let first_wave = plan
-                    .first_wave
-                    .into_iter()
-                    .map(|transaction| {
-                        let output_amount_micronoid = transaction
-                            .output_amounts_micronoid
-                            .first()
-                            .copied()
-                            .ok_or_else(|| {
-                                "target consolidation planner emitted no output".to_string()
-                            })?;
-                        let change_micronoid = transaction.output_amounts_micronoid.get(1).copied();
-                        if transaction.output_amounts_micronoid.len() > 2 {
-                            return Err(
-                                "target consolidation planner emitted too many outputs".to_string()
-                            );
-                        }
-                        Ok(WalletTargetConsolidationWaveTransaction {
-                            input_slots: transaction
-                                .inputs
-                                .iter()
-                                .map(|coin| coin.slot_index)
-                                .collect(),
-                            input_amounts_micronoid: transaction
-                                .inputs
-                                .iter()
-                                .map(|coin| coin.value_micronoid)
-                                .collect(),
-                            output_amount_micronoid,
-                            change_micronoid,
-                            fee_micronoid: transaction.fee_micronoid,
-                            creates_target: transaction.creates_target,
-                        })
-                    })
-                    .collect::<Result<Vec<_>, String>>()?;
-                Ok(WalletTargetConsolidationOutcome::Planned {
-                    plan: WalletTargetConsolidationPlan {
-                        target_amount_micronoid: plan.target_amount_micronoid,
-                        selected_source_count,
-                        first_wave,
-                        projected_total_transactions: plan.projected_total_transactions,
-                        projected_confirmation_waves: plan.projected_confirmation_waves,
-                        projected_total_fee_micronoid: plan.projected_total_fee_micronoid,
-                        final_change_micronoid: plan.final_change_micronoid,
-                    },
-                })
-            }
-        }
-    }
-
-    fn build_target_consolidation_transaction(
-        &self,
-        input_slots: Vec<u32>,
-        output_amount_micronoid: u64,
-        change_micronoid: Option<u64>,
-        fee_micronoid: u64,
-        epoch_anchor: [u8; 32],
-        slot_hints: Vec<u32>,
-        log_slots: u32,
-    ) -> Result<(Vec<u8>, Vec<u32>), String> {
-        let (build_data, captured_input_slots, self_address) = {
-            let guard = self.inner.lock().unwrap();
-            let wallet = guard
-                .as_ref()
-                .ok_or_else(|| "wallet not initialized".to_string())?;
-            let pending_output_slots = wallet.pending_output_slots.clone();
-            let build_data = builder::extract_exact_active_inputs_data(
-                wallet,
-                &input_slots,
-                output_amount_micronoid,
-                change_micronoid,
-                fee_micronoid,
-                epoch_anchor,
-                slot_hints,
-                log_slots,
-                &pending_output_slots,
-            )
-            .map_err(|error| error.to_string())?;
-            let captured_input_slots = build_data
-                .selected_utxos
-                .iter()
-                .map(|utxo| utxo.slot_index)
-                .collect();
-            let self_address = build_data.change_address.0;
-            (build_data, captured_input_slots, self_address)
-        };
-
-        let (_txid, intent_bytes) = builder::build_and_prove_tx(
-            self_address,
-            output_amount_micronoid,
-            fee_micronoid,
-            build_data,
-        )
-        .map_err(|error| error.to_string())?;
-        Ok((intent_bytes, captured_input_slots))
-    }
-
-    fn plan_maintenance_consolidation_input_count(&self) -> Result<usize, String> {
-        let guard = self.inner.lock().unwrap();
-        let w = guard
-            .as_ref()
-            .ok_or_else(|| "wallet not initialized".to_string())?;
-        let available = w
-            .utxos
-            .values()
-            .filter(|u| u.key_index == w.active_index)
-            .filter(|u| !w.pending_input_slots.contains(&u.slot_index))
-            .count();
-        if available < 2 {
-            return Err(
-                "nothing to consolidate — wallet has 1 or fewer available UTXOs".to_string(),
-            );
-        }
-        Ok(available.min(TX_INPUTS))
-    }
-
-    fn build_maintenance_consolidation(
-        &self,
-        fee_micronoid: u64,
-        epoch_anchor: [u8; 32],
-        slot_hints: Vec<u32>,
-        log_slots: u32,
-    ) -> Result<(Vec<u8>, Vec<u32>), String> {
-        // Extract consolidation build data from wallet (brief lock).
-        let (build_data, consolidation_amount) = {
-            let guard = self.inner.lock().unwrap();
-            let w = guard
-                .as_ref()
-                .ok_or_else(|| "wallet not initialized".to_string())?;
-            let pending_output_slots = w.pending_output_slots.clone();
-            let pending_input_slots = w.pending_input_slots.clone();
-            builder::extract_consolidate_data(
-                w,
-                fee_micronoid,
-                epoch_anchor,
-                slot_hints,
-                log_slots,
-                &pending_output_slots,
-                &pending_input_slots,
-            )
-            .map_err(|e| e.to_string())?
-        };
-
-        // Capture input slots before build_data is moved into the prover.
-        let input_slots: Vec<u32> = build_data
-            .selected_utxos
-            .iter()
-            .map(|u| u.slot_index)
-            .collect();
-
-        // The destination is captured together with the selected inputs.
-        // Never re-read active_index after proving starts: an account switch
-        // must not redirect a consolidation built for the previous owner.
-        let self_address = build_data.change_address.0;
-
-        // Prove outside the lock (CPU-heavy).
-        let (_txid, intent_bytes) = builder::build_and_prove_tx(
-            self_address,
-            consolidation_amount,
-            fee_micronoid,
-            build_data,
-        )
-        .map_err(|e| e.to_string())?;
 
         Ok((intent_bytes, input_slots))
     }
@@ -1040,16 +833,14 @@ mod tests {
     }
 
     #[test]
-    fn planner_requires_consolidation_instead_of_splitting_a_payment() {
+    fn planner_rejects_a_payment_that_needs_more_than_eight_inputs() {
         let (_dir, handle) = handle_with_utxos(&[10_000; 20]);
         let error = handle
             .plan_send(150_000, Some(10_000), 0, 24, 0)
             .unwrap_err();
         assert_eq!(
             error,
-            WalletSendPlanError::ConsolidationRequired {
-                target_amount_micronoid: 160_000,
-            }
+            WalletSendPlanError::InputLimitExceeded { max_inputs: 8 }
         );
         let guard = handle.inner.lock().unwrap();
         let wallet = guard.as_ref().unwrap();
@@ -1059,23 +850,17 @@ mod tests {
     }
 
     #[test]
-    fn automatic_consolidation_target_uses_one_input_one_output_fee() {
+    fn automatic_fee_path_reports_the_input_limit_without_a_workaround() {
         let (_dir, handle) = handle_with_utxos(&[1_000; 20]);
-        let amount_micronoid = 10_000;
-        let expected_fee = noid_chain::consensus::fee_breakdown(1, 1, 0, 24).required_total;
-        let error = handle
-            .plan_send(amount_micronoid, None, 0, 24, 0)
-            .unwrap_err();
+        let error = handle.plan_send(10_000, None, 0, 24, 0).unwrap_err();
         assert_eq!(
             error,
-            WalletSendPlanError::ConsolidationRequired {
-                target_amount_micronoid: amount_micronoid + expected_fee,
-            }
+            WalletSendPlanError::InputLimitExceeded { max_inputs: 8 }
         );
     }
 
     #[test]
-    fn explicit_fee_below_one_by_one_minimum_is_not_a_consolidation_target() {
+    fn explicit_fee_below_one_by_one_minimum_is_rejected_before_selection() {
         let (_dir, handle) = handle_with_utxos(&[1_000; 20]);
         let error = handle.plan_send(10_000, Some(1), 0, 24, 0).unwrap_err();
         assert_eq!(
@@ -1102,60 +887,6 @@ mod tests {
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].value, 95_800);
         assert_eq!(change, 0);
-    }
-
-    #[test]
-    fn targeted_plan_exposes_exact_slots_target_and_optional_change() {
-        let (_dir, handle) = handle_with_utxos(&[100_000, 70_000]);
-        let outcome = handle
-            .plan_target_consolidation(150_000, Some(10_000), 2, 24, 0)
-            .expect("plan exact target");
-        let WalletTargetConsolidationOutcome::Planned { plan } = outcome else {
-            panic!("target should require a transaction");
-        };
-        assert_eq!(plan.target_amount_micronoid, 150_000);
-        assert_eq!(plan.selected_source_count, 2);
-        assert_eq!(plan.first_wave.len(), 1);
-        let transaction = &plan.first_wave[0];
-        assert_eq!(transaction.input_slots, vec![0, 1]);
-        assert_eq!(transaction.input_amounts_micronoid, vec![100_000, 70_000]);
-        assert_eq!(transaction.output_amount_micronoid, 150_000);
-        assert_eq!(transaction.change_micronoid, Some(10_000));
-        assert_eq!(transaction.fee_micronoid, 10_000);
-        assert!(transaction.creates_target);
-    }
-
-    #[test]
-    fn targeted_plan_slots_cannot_silently_diverge_before_build() {
-        let (_dir, handle) = handle_with_utxos(&[100_000, 70_000]);
-        let WalletTargetConsolidationOutcome::Planned { plan } = handle
-            .plan_target_consolidation(150_000, Some(10_000), 2, 24, 0)
-            .unwrap()
-        else {
-            panic!("target should require a transaction");
-        };
-        let transaction = plan.first_wave.into_iter().next().unwrap();
-        {
-            let mut guard = handle.inner.lock().unwrap();
-            guard
-                .as_mut()
-                .unwrap()
-                .pending_input_slots
-                .insert(transaction.input_slots[0]);
-        }
-
-        let error = handle
-            .build_target_consolidation_transaction(
-                transaction.input_slots,
-                transaction.output_amount_micronoid,
-                transaction.change_micronoid,
-                transaction.fee_micronoid,
-                [0x11; 32],
-                vec![10_000, 10_001],
-                24,
-            )
-            .unwrap_err();
-        assert!(error.contains("pending another transaction"));
     }
 
     #[test]
@@ -1524,70 +1255,5 @@ mod tests {
         assert_eq!(plan.output_count, 2);
         assert_eq!(plan.fee_micronoid, 6_900);
         assert_eq!(plan.fee_breakdown.state_growth, 0);
-    }
-
-    #[test]
-    fn consolidate_planner_caps_at_eight_inputs() {
-        let (_dir, handle) = handle_with_utxos(&[1_000; 30]);
-        assert_eq!(
-            handle.plan_maintenance_consolidation_input_count().unwrap(),
-            8
-        );
-    }
-
-    #[test]
-    fn consolidate_planner_skips_pending_inputs() {
-        let (_dir, handle) = handle_with_utxos(&[1_000; 6]);
-        {
-            let mut guard = handle.inner.lock().unwrap();
-            guard.as_mut().unwrap().pending_input_slots.insert(0);
-            guard.as_mut().unwrap().pending_input_slots.insert(1);
-        }
-        assert_eq!(
-            handle.plan_maintenance_consolidation_input_count().unwrap(),
-            4
-        );
-    }
-
-    fn extract_consolidation(values: &[u64]) -> (usize, u64) {
-        let (_dir, handle) = handle_with_utxos(values);
-        let guard = handle.inner.lock().unwrap();
-        let wallet = guard.as_ref().unwrap();
-        let pending_outputs = wallet.pending_output_slots.clone();
-        let pending_inputs = wallet.pending_input_slots.clone();
-        let (data, amount) = builder::extract_consolidate_data(
-            wallet,
-            10,
-            [0xAA; 32],
-            vec![10_000],
-            24,
-            &pending_outputs,
-            &pending_inputs,
-        )
-        .unwrap();
-        (data.selected_utxos.len(), amount)
-    }
-
-    #[test]
-    fn consolidate_four_inputs_is_an_ordinary_transaction() {
-        let (selected, amount) = extract_consolidation(&[1_000; 4]);
-        assert_eq!(selected, 4);
-        assert_eq!(amount, 3_990);
-    }
-
-    #[test]
-    fn consolidation_selects_at_most_eight_smallest_utxos() {
-        let (selected, amount) = extract_consolidation(&[1_000; 30]);
-        assert_eq!(selected, 8);
-        assert_eq!(amount, 7_990);
-    }
-
-    #[test]
-    fn consolidate_rejects_one_available_utxo() {
-        let (_dir, handle) = handle_with_utxos(&[1_000]);
-        let err = handle
-            .plan_maintenance_consolidation_input_count()
-            .unwrap_err();
-        assert!(err.contains("nothing to consolidate"));
     }
 }

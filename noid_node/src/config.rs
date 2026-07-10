@@ -50,7 +50,7 @@ pub struct MiningConfig {
     pub enabled: bool,
     /// Internal PoW mining threads. 0 = balanced default (roughly half of available cores).
     pub mining_threads: usize,
-    /// Miner coinbase address (32-byte hex). Empty = burn address [0;32].
+    /// Miner coinbase address (bech32m). Empty = current active wallet address.
     pub miner_address: String,
 }
 

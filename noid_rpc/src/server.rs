@@ -30,14 +30,13 @@ use crate::api::ParanoidApiServer;
 use crate::types::{
     AddressInfo, BlockHeaderInfo, BlockTemplateResponse, ChainInfo, FeeBreakdownInfo, FeeEstimate,
     MempoolInfo, MempoolTxInfo, MiningInfo, ReceiptVerifyResult, SlotInfo, StateInfo, TxInfo,
-    WalletAddressInfo, WalletBalance, WalletConsolidatePlan, WalletConsolidationRequired,
-    WalletHistoryEntry, WalletScanResult, WalletSendPlan, WalletSendResult, WalletStatus,
-    WalletUtxoInfo, WALLET_CONSOLIDATION_REQUIRED_CODE, WALLET_CONSOLIDATION_REQUIRED_MESSAGE,
+    WalletAddressInfo, WalletBalance, WalletHistoryEntry, WalletInputLimitExceeded,
+    WalletScanResult, WalletSendPlan, WalletSendResult, WalletStatus, WalletUtxoInfo,
+    WALLET_INPUT_LIMIT_EXCEEDED_CODE, WALLET_INPUT_LIMIT_EXCEEDED_MESSAGE,
 };
 use crate::wallet_ops::{WalletActivationPreview, WalletOps, WalletSendPlanError};
 use crate::wallet_submit::{
-    collect_empty_slot_hints, next_user_epoch_anchor, PendingAdmissionGuard,
-    WalletSubmitCoordinator,
+    collect_empty_slot_hints, next_user_epoch_anchor, PendingAdmissionGuard, WalletOperationGate,
 };
 
 fn rpc_err(msg: impl Into<String>) -> ErrorObject<'static> {
@@ -46,25 +45,13 @@ fn rpc_err(msg: impl Into<String>) -> ErrorObject<'static> {
 
 fn wallet_plan_error(error: WalletSendPlanError) -> ErrorObject<'static> {
     match error {
-        WalletSendPlanError::ConsolidationRequired {
-            target_amount_micronoid,
-        } => ErrorObject::owned(
-            WALLET_CONSOLIDATION_REQUIRED_CODE,
-            WALLET_CONSOLIDATION_REQUIRED_MESSAGE,
-            Some(WalletConsolidationRequired {
-                target_amount_micronoid,
-            }),
+        WalletSendPlanError::InputLimitExceeded { max_inputs } => ErrorObject::owned(
+            WALLET_INPUT_LIMIT_EXCEEDED_CODE,
+            WALLET_INPUT_LIMIT_EXCEEDED_MESSAGE,
+            Some(WalletInputLimitExceeded { max_inputs }),
         ),
         other => rpc_err(other.to_string()),
     }
-}
-
-#[inline]
-fn should_run_proactive_consolidation(
-    configured_payout: Option<noid_poseidon2b::primitives::Address>,
-    requested_payout: Option<noid_poseidon2b::primitives::Address>,
-) -> bool {
-    configured_payout.is_none() && requested_payout.is_none()
 }
 
 /// Read a canonical slot without treating an MDBX-evicted segment as virtual
@@ -332,8 +319,6 @@ pub struct RpcHandler {
     /// proving and mempool admission. The wallet's short synchronous mutex is
     /// intentionally not held during proving.
     pub wallet_operation_gate: Arc<tokio::sync::Mutex<()>>,
-    /// Shared manual/proactive consolidation submission pipeline.
-    pub wallet_submit: WalletSubmitCoordinator,
     /// Channel to the P2P layer for queries (peer count, etc.).
     pub p2p_cmd: tokio::sync::mpsc::Sender<noid_p2p::NetworkCommand>,
     /// One-shot sender: firing this triggers graceful daemon shutdown
@@ -885,27 +870,6 @@ impl ParanoidApiServer for RpcHandler {
             Some(parse_address_param(&miner_address)?)
         };
 
-        // Default active-address mining maintains its spendable rolling UTXO
-        // before the template snapshot is captured. Explicit payout requests
-        // never touch the built-in wallet.
-        if should_run_proactive_consolidation(self.mining_payout_address, requested) {
-            match self
-                .wallet_submit
-                .submit_consolidation(noid_tx::TX_INPUTS, 0)
-                .await
-            {
-                Ok(Some(result)) => tracing::info!(
-                    txid = %result.txid,
-                    "proactive miner consolidation admitted"
-                ),
-                Ok(None) => {}
-                Err(error) => tracing::warn!(
-                    %error,
-                    "proactive miner consolidation skipped"
-                ),
-            }
-        }
-
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1422,54 +1386,6 @@ impl ParanoidApiServer for RpcHandler {
         })
     }
 
-    async fn wallet_plan_consolidate(
-        &self,
-        fee_micronoid: u64,
-    ) -> RpcResult<WalletConsolidatePlan> {
-        let _wallet_operation = self.wallet_operation_gate.lock().await;
-        self.reload_active_wallet().await?;
-        let selected_input_count = self
-            .wallet
-            .plan_consolidate_input_count()
-            .map_err(rpc_err)?;
-        let output_count = 1usize;
-        validate_tx_counts(selected_input_count, output_count)?;
-        let (active_slot_count, log_slots) = self.mempool.fee_context().await;
-        let floor = self.mempool.fee_floor().await;
-        let breakdown = noid_chain::consensus::fee_breakdown(
-            selected_input_count as u64,
-            output_count as u64,
-            active_slot_count,
-            log_slots,
-        );
-        let fee = if fee_micronoid == 0 {
-            breakdown.required_total.max(floor)
-        } else {
-            fee_micronoid
-        };
-        if fee < breakdown.required_total.max(floor) {
-            return Err(rpc_err(format!(
-                "BelowMinFee: consolidation fee {fee} μNOID is below required {} μNOID",
-                breakdown.required_total.max(floor)
-            )));
-        }
-        let fee_breakdown = fee_breakdown_info(breakdown, floor, fee);
-        Ok(WalletConsolidatePlan {
-            selected_input_count,
-            output_count,
-            fee_micronoid: fee,
-            expected_utxo_reduction: selected_input_count.saturating_sub(output_count),
-            fee_breakdown,
-        })
-    }
-
-    async fn wallet_consolidate(&self, fee_micronoid: u64) -> RpcResult<WalletSendResult> {
-        self.wallet_submit
-            .submit_consolidation(2, fee_micronoid)
-            .await
-            .map_err(rpc_err)?
-            .ok_or_else(|| rpc_err("nothing to consolidate"))
-    }
     async fn wallet_set_active_address(&self, index: u32) -> RpcResult<WalletAddressInfo> {
         let _wallet_operation = self.wallet_operation_gate.lock().await;
         self.reload_active_wallet().await?;
@@ -1576,29 +1492,19 @@ mod tests {
     }
 
     #[test]
-    fn proactive_consolidation_is_default_active_payout_only() {
-        let explicit = noid_poseidon2b::primitives::Address([7u8; 32]);
-        assert!(should_run_proactive_consolidation(None, None));
-        assert!(!should_run_proactive_consolidation(Some(explicit), None));
-        assert!(!should_run_proactive_consolidation(None, Some(explicit)));
-    }
+    fn input_limit_error_exposes_only_the_canonical_limit() {
+        let error = wallet_plan_error(WalletSendPlanError::InputLimitExceeded { max_inputs: 8 });
 
-    #[test]
-    fn consolidation_required_error_exposes_only_target_amount() {
-        let error = wallet_plan_error(WalletSendPlanError::ConsolidationRequired {
-            target_amount_micronoid: 80_000,
-        });
-
-        assert_eq!(error.code(), WALLET_CONSOLIDATION_REQUIRED_CODE);
-        assert_eq!(error.message(), WALLET_CONSOLIDATION_REQUIRED_MESSAGE);
-        let data: WalletConsolidationRequired = serde_json::from_str(
+        assert_eq!(error.code(), WALLET_INPUT_LIMIT_EXCEEDED_CODE);
+        assert_eq!(error.message(), WALLET_INPUT_LIMIT_EXCEEDED_MESSAGE);
+        let data: WalletInputLimitExceeded = serde_json::from_str(
             error
                 .data()
-                .expect("consolidation error has structured data")
+                .expect("input-limit error has structured data")
                 .get(),
         )
-        .expect("consolidation error data decodes");
-        assert_eq!(data.target_amount_micronoid, 80_000);
+        .expect("input-limit error data decodes");
+        assert_eq!(data.max_inputs, 8);
         let value = serde_json::to_value(data).unwrap();
         assert_eq!(value.as_object().unwrap().len(), 1);
     }
@@ -1652,7 +1558,7 @@ pub async fn start_rpc_server(
     chain: Arc<RwLock<MdbxChainContext>>,
     mempool: AsyncMempool,
     wallet: Arc<dyn WalletOps + Send + Sync>,
-    wallet_submit: WalletSubmitCoordinator,
+    wallet_operation_gate: WalletOperationGate,
     p2p_cmd: tokio::sync::mpsc::Sender<noid_p2p::NetworkCommand>,
     mining_api_enabled: bool,
     mining_payout_address: Option<noid_poseidon2b::primitives::Address>,
@@ -1664,14 +1570,11 @@ pub async fn start_rpc_server(
 )> {
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     let stop_tx = Arc::new(tokio::sync::Mutex::new(Some(stop_tx)));
-    let wallet_operation_gate = wallet_submit.operation_gate();
-
     let handler = RpcHandler {
         chain,
         mempool,
         wallet,
         wallet_operation_gate,
-        wallet_submit,
         p2p_cmd,
         stop_tx,
         mining_api_enabled,

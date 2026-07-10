@@ -13,7 +13,7 @@
 
 #![allow(clippy::format_in_format_args, clippy::print_literal)]
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH;
 use serde_json::Value;
@@ -328,21 +328,6 @@ enum Command {
     /// Reload the active address from the verified owner index.
     Scan,
 
-    /// Merge small UTXOs of the ACTIVE address into fewer larger ones
-    /// (lowers future fees).
-    #[command(alias = "merge")]
-    Consolidate {
-        /// Fee per consolidation transaction in NOID. Omit for auto.
-        #[arg(long, value_name = "FEE_NOID")]
-        fee: Option<String>,
-        /// Show the next consolidation round plan without proving or submitting.
-        #[arg(long)]
-        dry_run: bool,
-        /// Maximum consolidation rounds (each round = one TX).
-        #[arg(long, default_value_t = 100, value_name = "N")]
-        rounds: u32,
-    },
-
     /// Export a Merkle payment receipt for a confirmed transaction.
     /// Redirect output to a file: noid-cli receipt <hash> > receipt.hex
     Receipt {
@@ -471,11 +456,6 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         } => cmd_send(&ctx, to, amount, fee.as_deref(), *dry_run).await,
         Command::History { address, last } => cmd_history(&ctx, address.as_deref(), *last).await,
         Command::Scan => cmd_scan(&ctx).await,
-        Command::Consolidate {
-            fee,
-            dry_run,
-            rounds,
-        } => cmd_consolidate(&ctx, fee.as_deref(), *dry_run, *rounds).await,
         Command::Receipt { txhash } => cmd_receipt(&ctx, txhash).await,
         Command::Verify { receipt } => cmd_verify(&ctx, receipt).await,
         Command::Stop => cmd_stop(&ctx).await,
@@ -1583,7 +1563,7 @@ async fn cmd_send(
         {
             Ok(result) => result,
             Err(error) => {
-                if let Some(message) = consolidation_required_message(&error) {
+                if let Some(message) = input_limit_exceeded_message(&error) {
                     bail!(message);
                 }
                 return Err(error).context("walletPlanSend");
@@ -1693,7 +1673,7 @@ async fn cmd_send(
         Err(e) => {
             // Re-format common wallet errors into human language
             let msg = e.to_string();
-            if let Some(message) = consolidation_required_message(&e) {
+            if let Some(message) = input_limit_exceeded_message(&e) {
                 bail!(message);
             }
             let human = if msg.contains("Insufficient") || msg.contains("insufficient") {
@@ -1713,9 +1693,13 @@ async fn cmd_send(
                 "Slot conflict: the output slot is occupied. This is transient — retry in a moment."
                     .into()
             } else if msg.contains("BelowMinFee") {
-                format!("Fee is below the current network minimum. Retry without --fee for automatic fee selection.\n\tDetails: {msg}")
+                format!(
+                    "Fee is below the current network minimum. Retry without --fee for automatic fee selection.\n\tDetails: {msg}"
+                )
             } else if msg.contains("proof") || msg.contains("prove") || msg.contains("task:") {
-                format!("Proof generation failed. Retry once; if it repeats, save the logs and report it.\n\tDetails: {msg}")
+                format!(
+                    "Proof generation failed. Retry once; if it repeats, save the logs and report it.\n\tDetails: {msg}"
+                )
             } else {
                 msg
             };
@@ -1896,156 +1880,8 @@ async fn cmd_scan(ctx: &Ctx<'_>) -> anyhow::Result<()> {
 
     if found == 0 {
         println!();
-        warn_msg("No UTXOs found. If you expect a balance, check that you're using the right data directory.");
-    }
-
-    Ok(())
-}
-
-async fn cmd_consolidate(
-    ctx: &Ctx<'_>,
-    fee: Option<&str>,
-    dry_run: bool,
-    rounds: u32,
-) -> anyhow::Result<()> {
-    let fee_micro = match fee {
-        Some(f) => parse_noid_amount(f).with_context(|| format!("invalid fee {f:?}"))?,
-        None => 0,
-    };
-
-    if dry_run {
-        let result = rpc(ctx, "walletPlanConsolidate", &[fee_micro.into()])
-            .await
-            .context("walletPlanConsolidate")?;
-        if ctx.json {
-            return print_json(&result);
-        }
-        let fee_actual = result["fee_micronoid"].as_u64().unwrap_or(fee_micro);
-        let selected = result["selected_input_count"].as_u64().unwrap_or(0);
-        let outputs = result["output_count"].as_u64().unwrap_or(1);
-        let reduction = result["expected_utxo_reduction"].as_u64().unwrap_or(0);
-        section("Wallet consolidate plan");
-        kv("Selected inputs", &selected.to_string());
-        kv("Outputs", &outputs.to_string());
-        kv("Expected UTXO reduction", &format!("-{reduction}"));
-        kv2(
-            "Fee",
-            &format!("{} NOID", noid_str(fee_actual)),
-            &format!(
-                "({fee_actual} μNOID){}",
-                if fee.is_none() { " auto" } else { "" }
-            ),
-        );
-        println!();
-        println!(
-            "  {} Dry run only; no proof was generated and nothing was submitted.",
-            c!(DIM, "Note:")
-        );
-        return Ok(());
-    }
-
-    section("Wallet consolidate");
-    println!("  Merging small UTXOs to reduce UTXO count and lower future fees.");
-    if fee_micro > 0 {
-        println!(
-            "  Fee per round: {} NOID ({fee_micro} μNOID)",
-            noid_str(fee_micro)
-        );
-    } else {
-        println!("  Fee: auto (minimum per round)");
-    }
-    println!();
-
-    let mut total_rounds = 0u32;
-
-    loop {
-        if total_rounds >= rounds {
-            println!("  Reached maximum rounds ({rounds}). Run again to continue.");
-            break;
-        }
-
-        match rpc(ctx, "walletConsolidate", &[fee_micro.into()]).await {
-            Ok(r) => {
-                let tx_hash = r["txid"].as_str().unwrap_or("?");
-                let actual_fee = r["fee_micronoid"].as_u64().unwrap_or(fee_micro);
-                let n_inputs = r["input_count"].as_u64().unwrap_or(0);
-                let n_outputs = r["output_count"].as_u64().unwrap_or(0);
-                let reduction = n_inputs.saturating_sub(n_outputs);
-                total_rounds += 1;
-                ok_msg(&format!("Round {total_rounds}: TX {}", ctx.h(tx_hash)));
-                println!(
-                    "  Inputs: {n_inputs}  Outputs: {n_outputs}  UTXO reduction: -{reduction}"
-                );
-                println!(
-                    "  Fee: {} NOID ({actual_fee} μNOID){}",
-                    noid_str(actual_fee),
-                    if fee.is_none() { " auto" } else { "" }
-                );
-                // Wait for confirmation
-                eprint!("  Waiting for confirmation");
-                io::stderr().flush()?;
-                for _ in 0..120u32 {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    let mp = rpc(ctx, "getMempoolSize", &[])
-                        .await
-                        .ok()
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(1);
-                    eprint!(".");
-                    io::stderr().flush()?;
-                    if mp == 0 {
-                        break;
-                    }
-                }
-                eprintln!(" confirmed.");
-
-                let _ = rpc(ctx, "walletScan", &[]).await;
-
-                if let Ok(bal) = rpc(ctx, "walletGetBalance", &[]).await {
-                    let utxo_count = bal["utxo_count"].as_u64().unwrap_or(0);
-                    let micro = bal["balance_micronoid"].as_u64().unwrap_or(0);
-                    println!(
-                        "  UTXOs remaining: {utxo_count}  Balance: {} NOID",
-                        noid_str(micro)
-                    );
-                    if utxo_count <= 1 {
-                        ok_msg("Consolidation complete — wallet has 1 UTXO.");
-                        break;
-                    }
-                }
-            }
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("InsufficientFunds")
-                    || msg.contains("nothing to consolidate")
-                    || msg.contains("1 or fewer")
-                {
-                    if total_rounds == 0 {
-                        warn_msg("Nothing to consolidate — wallet already has 1 UTXO or no UTXOs.");
-                    } else {
-                        ok_msg(&format!(
-                            "Consolidation complete after {total_rounds} round(s)."
-                        ));
-                    }
-                } else {
-                    bail!("{msg}");
-                }
-                break;
-            }
-        }
-    }
-
-    if total_rounds > 0 {
-        println!();
-        println!(
-            "  {} {} round(s) completed. TXs may still be pending.",
-            c!(DIM, "Total:"),
-            total_rounds
-        );
-        println!(
-            "  {} Run {} after confirmation.",
-            c!(DIM, "Next:"),
-            c!(BOLD, "'noid-cli balance'")
+        warn_msg(
+            "No UTXOs found. If you expect a balance, check that you're using the right data directory.",
         );
     }
 
@@ -2246,19 +2082,19 @@ impl std::fmt::Display for RpcCallError {
 
 impl std::error::Error for RpcCallError {}
 
-fn consolidation_required_message(error: &anyhow::Error) -> Option<String> {
+fn input_limit_exceeded_message(error: &anyhow::Error) -> Option<String> {
     let rpc = error.downcast_ref::<RpcCallError>()?;
-    if rpc.code != i64::from(noid_rpc::types::WALLET_CONSOLIDATION_REQUIRED_CODE) {
+    if rpc.code != i64::from(noid_rpc::types::WALLET_INPUT_LIMIT_EXCEEDED_CODE) {
         return None;
     }
-    let target = rpc
+    let max_inputs = rpc
         .data
-        .as_ref()?
-        .get("target_amount_micronoid")?
-        .as_u64()?;
+        .as_ref()
+        .and_then(|data| data.get("max_inputs"))
+        .and_then(Value::as_u64)
+        .unwrap_or(8);
     Some(format!(
-        "Consolidation required for {} NOID. Run targeted consolidation for this amount, then retry.",
-        noid_str(target)
+        "Payment cannot be created: it requires more than {max_inputs} inputs."
     ))
 }
 
@@ -2317,7 +2153,7 @@ fn print_json(v: &Value) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod amount_tests {
-    use super::{consolidation_required_message, noid_str, parse_noid_amount, RpcCallError};
+    use super::{RpcCallError, input_limit_exceeded_message, noid_str, parse_noid_amount};
 
     #[test]
     fn decimal_amounts_are_exact_and_checked() {
@@ -2332,17 +2168,15 @@ mod amount_tests {
     }
 
     #[test]
-    fn consolidation_error_reports_only_the_target_amount() {
+    fn input_limit_error_is_concise_and_uses_the_structured_limit() {
         let error = anyhow::Error::new(RpcCallError {
-            code: i64::from(noid_rpc::types::WALLET_CONSOLIDATION_REQUIRED_CODE),
-            message: noid_rpc::types::WALLET_CONSOLIDATION_REQUIRED_MESSAGE.to_string(),
-            data: Some(serde_json::json!({ "target_amount_micronoid": 100_000_000 })),
+            code: i64::from(noid_rpc::types::WALLET_INPUT_LIMIT_EXCEEDED_CODE),
+            message: noid_rpc::types::WALLET_INPUT_LIMIT_EXCEEDED_MESSAGE.to_string(),
+            data: Some(serde_json::json!({ "max_inputs": 8 })),
         });
         assert_eq!(
-            consolidation_required_message(&error).as_deref(),
-            Some(
-                "Consolidation required for 100.000000 NOID. Run targeted consolidation for this amount, then retry."
-            )
+            input_limit_exceeded_message(&error).as_deref(),
+            Some("Payment cannot be created: it requires more than 8 inputs.")
         );
     }
 }

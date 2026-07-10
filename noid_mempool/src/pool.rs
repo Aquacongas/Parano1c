@@ -70,10 +70,6 @@ pub(crate) struct MempoolState {
     pub admitted_input_slots: HashSet<u32>,
     /// Output slot indices currently held by admitted txs. O(1) conflict check.
     pub admitted_output_slots: HashSet<u32>,
-    /// Locally generated maintenance transactions that must be considered
-    /// before ordinary fee ordering in the next template. Admission remains
-    /// identical to every other transaction; this set is only selection policy.
-    pub local_template_priority: HashSet<TxBodyHash>,
 }
 
 // ---------------------------------------------------------------------------
@@ -109,7 +105,6 @@ impl AsyncMempool {
             floor,
             admitted_input_slots: HashSet::new(),
             admitted_output_slots: HashSet::new(),
-            local_template_priority: HashSet::new(),
         };
         let max_permits = if config.auth_verify_workers == 0 {
             // 0 = unlimited concurrency; verification is still required
@@ -153,26 +148,6 @@ impl AsyncMempool {
         &self,
         intent: TxIntent,
         intent_bytes: Vec<u8>,
-    ) -> Result<TxBodyHash, SubmitError> {
-        self.submit_with_policy(intent, intent_bytes, false).await
-    }
-
-    /// Submit a locally built consolidation through the identical validation
-    /// pipeline and atomically mark it for next-template priority under the
-    /// final admission lock. Network callers cannot set this policy bit.
-    pub async fn submit_local_consolidation(
-        &self,
-        intent: TxIntent,
-        intent_bytes: Vec<u8>,
-    ) -> Result<TxBodyHash, SubmitError> {
-        self.submit_with_policy(intent, intent_bytes, true).await
-    }
-
-    async fn submit_with_policy(
-        &self,
-        intent: TxIntent,
-        intent_bytes: Vec<u8>,
-        local_template_priority: bool,
     ) -> Result<TxBodyHash, SubmitError> {
         if intent_bytes.len() > MAX_TX_INTENT_BYTES_GLOBAL {
             return Err(SubmitError::IntentTooLarge {
@@ -303,10 +278,6 @@ impl AsyncMempool {
         }
         // Store raw intent bytes for mempool-sync serving to new peers.
         st.pool.set_intent_bytes(&hash, intent_bytes.clone());
-        if local_template_priority {
-            st.local_template_priority.insert(hash);
-        }
-
         if !is_coinbase {
             st.floor.record(fee);
         }
@@ -345,31 +316,11 @@ impl AsyncMempool {
     pub async fn select_for_block(&self, max_txs: usize) -> Vec<noid_chain::mempool::MempoolEntry> {
         let st = self.state.lock().await;
         let limit = max_txs.min(BLOCK_MAX_USER_TXS);
-        let mut priority_hashes: Vec<TxBodyHash> = st
-            .local_template_priority
-            .iter()
-            .filter(|hash| st.pool.contains(hash))
-            .copied()
-            .collect();
-        priority_hashes.sort_by_key(|hash| hash.0);
-
-        let mut selected = Vec::with_capacity(limit);
-        for hash in priority_hashes.into_iter().take(limit) {
-            if let Some(entry) = st.pool.get(&hash) {
-                selected.push(entry.clone());
-            }
-        }
-        if selected.len() < limit {
-            for entry in st.pool.select_for_block(limit) {
-                if !st.local_template_priority.contains(&entry.tx.txid()) {
-                    selected.push(entry.clone());
-                    if selected.len() == limit {
-                        break;
-                    }
-                }
-            }
-        }
-        selected
+        st.pool
+            .select_for_block(limit)
+            .into_iter()
+            .cloned()
+            .collect()
     }
 
     // -----------------------------------------------------------------------
@@ -392,7 +343,6 @@ impl AsyncMempool {
         // Remove confirmed txs.
         let removed = st.pool.on_block_confirmed(confirmed_hashes);
         for &hash in confirmed_hashes {
-            st.local_template_priority.remove(&hash);
             let _ = self.events.send(MempoolEvent::TxConfirmed {
                 hash,
                 block_height: new_height,
@@ -505,9 +455,6 @@ impl AsyncMempool {
 
         // Rebuild slot sets after bulk eviction (O(pool) once/block vs O(N²) per submit).
         rebuild_slot_sets(&mut st);
-        let admitted: HashSet<TxBodyHash> = st.pool.iter().map(|(hash, _)| *hash).collect();
-        st.local_template_priority
-            .retain(|hash| admitted.contains(hash));
 
         tracing::debug!(
             height = new_height,
@@ -546,7 +493,6 @@ impl AsyncMempool {
         for hash in &tx_hashes {
             if st.pool.contains(hash) {
                 st.pool.remove(hash);
-                st.local_template_priority.remove(hash);
                 tracing::debug!(?hash, "reorg: removed re-submitted duplicate from pool");
             }
         }
@@ -903,50 +849,5 @@ mod tests {
         assert!(check_input_slots(&tx, &view).is_err());
         tx.body.inputs[0].creation_id = 42;
         assert!(check_input_slots(&tx, &view).is_ok());
-    }
-
-    fn policy_tx(seed: u8, fee: u64) -> Transaction {
-        let mut inputs = [TxInput::dummy(); TX_INPUTS];
-        inputs[0] = TxInput {
-            slot_index: u32::from(seed),
-            amount: 1_000 + fee,
-            creation_id: u64::from(seed),
-        };
-        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
-        outputs[0] = TxOutput {
-            slot_index: u32::from(seed) + 100,
-            amount: 1_000,
-            owner: Address([seed.wrapping_add(1); 32]),
-        };
-        Transaction::new(TxBody {
-            epoch_anchor: [1; 32],
-            fee,
-            input_owner: Address([seed; 32]),
-            inputs,
-            outputs,
-            validity_bitmap: 1 | output_bitmap_bit(0),
-            is_coinbase: false,
-        })
-    }
-
-    #[tokio::test]
-    async fn trusted_local_consolidation_precedes_fee_order() {
-        let mut headers = HashMap::new();
-        headers.insert(0, genesis_header());
-        let view = ChainView::new(0, headers, 0, ChainState::with_log_slots(8).state);
-        let pool = crate::AsyncMempool::new(view, crate::MempoolConfig::default());
-        let maintenance = policy_tx(1, 1);
-        let ordinary = policy_tx(2, 10_000);
-        let maintenance_id = maintenance.txid();
-        {
-            let mut state = pool.state.lock().await;
-            state.pool.admit(maintenance, 0).unwrap();
-            state.pool.admit(ordinary, 0).unwrap();
-            state.local_template_priority.insert(maintenance_id);
-        }
-
-        let selected = pool.select_for_block(1).await;
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].tx.txid(), maintenance_id);
     }
 }
