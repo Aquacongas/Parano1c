@@ -3,10 +3,10 @@
 
 //! Transaction proving inside the daemon.
 //!
-//! This is the ONLY place where `SpendSecret` is combined with the wallet
-//! WalletAuthorizationBundle pipeline. It NEVER leaves this function — it's passed in, used to compute
-//! the auth proof, and then dropped (zeroized by `ZeroizeOnDrop` on `SpendSecret`).
-//! Field-limb temporaries are wallet-local proof workspace and are not serialized.
+//! This is the ONLY place where the wallet's one-secret `OwnerAuthWitness` is
+//! consumed by the authorization pipeline. It never leaves this function: it
+//! is moved into the prover and zeroized on drop. Field-limb temporaries are
+//! wallet-local proof workspace and are not serialized.
 //!
 //! # What this produces
 //!
@@ -18,12 +18,11 @@
 //!
 //! # SpendSecret handling
 //!
-//! The secret is taken by value and zeroized when this function returns.
-//! No reference escapes. No copy is serialized or stored on disk after this
+//! The witness is taken by value and zeroized when this function returns. No
+//! reference escapes. No copy is serialized or stored on disk after this
 //! function completes.
 
-use noid_gkr::{prove_wallet_authorization, WalletAuthorizationBundle};
-use noid_poseidon2b::primitives::SpendSecret;
+use noid_gkr::{prove_wallet_authorization, OwnerAuthWitness, WalletAuthorizationBundle};
 use noid_tx::TxBody;
 
 /// Error from transaction proving.
@@ -40,16 +39,15 @@ pub enum ProveError {
 /// block prover rebuilds the public AIR from `TxBody` at inclusion time.
 pub fn prove_tx(
     body: &TxBody,
-    spend_secrets: Vec<SpendSecret>,
+    witness: OwnerAuthWitness,
 ) -> Result<WalletAuthorizationBundle, ProveError> {
-    prove_wallet_authorization(body, spend_secrets)
-        .map_err(|e| ProveError::Authorization(e.to_string()))
+    prove_wallet_authorization(body, witness).map_err(|e| ProveError::Authorization(e.to_string()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use noid_poseidon2b::primitives::{derive_address, Address};
+    use noid_poseidon2b::primitives::{derive_address, Address, SpendSecret};
     use noid_tx::{TxInput, TxOutput, TxShape};
 
     fn secret(seed: u8) -> SpendSecret {
@@ -64,8 +62,8 @@ mod tests {
         haystack.windows(needle.len()).any(|w| w == needle)
     }
 
-    fn standard_body(spend_secret: SpendSecret) -> TxBody {
-        let owner = derive_address(&spend_secret);
+    fn standard_body(spend_secret: &SpendSecret) -> TxBody {
+        let owner = derive_address(spend_secret);
         TxBody {
             shape: TxShape::Standard4x8,
             epoch_anchor: [0x51; 32],
@@ -75,7 +73,7 @@ mod tests {
                 value: 1_000,
                 creation_id: 17,
                 owner,
-                spend_secret,
+                spend_secret: SpendSecret([0u8; 32]),
                 valid: true,
             }],
             outputs: vec![TxOutput {
@@ -88,15 +86,16 @@ mod tests {
         }
     }
 
-    fn sweep_body(secrets: &[SpendSecret]) -> TxBody {
-        let mut inputs = Vec::with_capacity(secrets.len());
-        for (i, spend_secret) in secrets.iter().cloned().enumerate() {
+    fn sweep_body(spend_secret: &SpendSecret, input_count: usize) -> TxBody {
+        let owner = derive_address(spend_secret);
+        let mut inputs = Vec::with_capacity(input_count);
+        for i in 0..input_count {
             inputs.push(TxInput {
                 slot_index: 1_000 + i as u32,
                 value: 10_000 + i as u64,
                 creation_id: 100 + i as u64,
-                owner: derive_address(&spend_secret),
-                spend_secret,
+                owner,
+                spend_secret: SpendSecret([0u8; 32]),
                 valid: true,
             });
         }
@@ -129,9 +128,10 @@ mod tests {
     fn standard_wallet_bundle_does_not_serialize_spend_secret_bytes() {
         let spend_secret = secret(11);
         let raw_secret = spend_secret.0;
-        let body = standard_body(spend_secret.clone());
+        let body = standard_body(&spend_secret);
 
-        let bundle = prove_tx(&body, vec![spend_secret]).expect("prove standard tx");
+        let bundle =
+            prove_tx(&body, OwnerAuthWitness::new(spend_secret)).expect("prove standard tx");
         let bytes = bundle.to_bytes().expect("serialize wallet authorization");
 
         assert!(
@@ -143,19 +143,16 @@ mod tests {
     #[test]
     #[cfg_attr(debug_assertions, ignore = "release-only sweep proof regression")]
     fn sweep_wallet_bundle_does_not_serialize_spend_secret_bytes() {
-        // One owner per tx: every input carries the same secret/address.
-        let secrets: Vec<_> = (0..5).map(|_| secret(21)).collect();
-        let raw_secrets: Vec<_> = secrets.iter().map(|s| s.0).collect();
-        let body = sweep_body(&secrets);
+        let spend_secret = secret(21);
+        let raw_secret = spend_secret.0;
+        let body = sweep_body(&spend_secret, 5);
 
-        let bundle = prove_tx(&body, secrets).expect("prove sweep tx");
+        let bundle = prove_tx(&body, OwnerAuthWitness::new(spend_secret)).expect("prove sweep tx");
         let bytes = bundle.to_bytes().expect("serialize wallet authorization");
 
-        for raw_secret in raw_secrets {
-            assert!(
-                !contains_subslice(&bytes, &raw_secret),
-                "sweep wallet bundle must not contain raw spend_secret bytes"
-            );
-        }
+        assert!(
+            !contains_subslice(&bytes, &raw_secret),
+            "sweep wallet bundle must not contain raw spend_secret bytes"
+        );
     }
 }

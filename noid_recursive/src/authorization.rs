@@ -206,6 +206,7 @@ mod tests {
     use super::*;
     use noid_chain::BlockHeader;
     use noid_core::TowerField;
+    use noid_gkr::OwnerAuthWitness;
     use noid_poseidon2b::primitives::{derive_address, Address, SpendSecret};
     use noid_tx::{hash_tx_body_for_shape, Transaction, TxBody, TxInput, TxOutput, TxShape};
 
@@ -269,7 +270,8 @@ mod tests {
     #[test]
     fn authorization_batch_accepts_and_rejects_tamper() {
         let (body, secret) = body_and_secret();
-        let proof = noid_gkr::prove_wallet_authorization(&body, vec![secret])
+        let raw_secret = secret.0;
+        let proof = noid_gkr::prove_wallet_authorization(&body, OwnerAuthWitness::new(secret))
             .expect("wallet auth")
             .proof;
         let block = block(tx(body));
@@ -318,6 +320,17 @@ mod tests {
         assert!(traces[0].transcript[..first_squeeze]
             .iter()
             .all(|op| matches!(op, FiatShamirTraceOp::Absorb(_))));
+
+        // The recursive verifier artifact is public replay data. It may carry
+        // the authorization proof and Fiat-Shamir transcript, but never the
+        // wallet's raw owner witness.
+        let encoded_trace = bincode::serialize(&traces[0]).expect("serialize verifier trace");
+        assert!(
+            !encoded_trace
+                .windows(raw_secret.len())
+                .any(|window| window == raw_secret),
+            "authorization verifier trace serialized the raw spend secret"
+        );
 
         let mut bad_hash_block = block.clone();
         bad_hash_block.transactions[0].tx_body_hash.0[0] ^= 0x80;

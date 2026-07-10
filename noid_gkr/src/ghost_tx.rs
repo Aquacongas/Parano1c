@@ -27,7 +27,9 @@ use noid_poseidon2b::primitives::{derive_address, SpendSecret};
 use noid_tx::{TxBody, TxInput, TxOutput, TxShape};
 
 use crate::owner_auth::{owner_auth_public_from_body, OwnerAuthPublicInputs};
-use crate::wallet_authorization::{prove_wallet_authorization, verify_wallet_authorization_proof};
+use crate::wallet_authorization::{
+    prove_wallet_authorization, verify_wallet_authorization_proof, OwnerAuthWitness,
+};
 use crate::OwnerAuthProofKillShot;
 
 /// The public protocol "secret" of the ghost owner (ASCII domain tag,
@@ -84,7 +86,7 @@ pub fn ghost_authorization() -> &'static (OwnerAuthProofKillShot, OwnerAuthPubli
     static GHOST: OnceLock<(OwnerAuthProofKillShot, OwnerAuthPublicInputs)> = OnceLock::new();
     GHOST.get_or_init(|| {
         let body = ghost_tx_body();
-        let bundle = prove_wallet_authorization(&body, vec![ghost_spend_secret()])
+        let bundle = prove_wallet_authorization(&body, OwnerAuthWitness::new(ghost_spend_secret()))
             .expect("the canonical ghost body must be provable");
         verify_wallet_authorization_proof(&body, &bundle.proof)
             .expect("the canonical ghost proof must verify");
@@ -151,8 +153,10 @@ mod tests {
         // Two independent proves over the constant body produce identical
         // proofs (Fiat–Shamir over fixed inputs — no prover randomness).
         let body = ghost_tx_body();
-        let a = prove_wallet_authorization(&body, vec![ghost_spend_secret()]).unwrap();
-        let b = prove_wallet_authorization(&body, vec![ghost_spend_secret()]).unwrap();
+        let a =
+            prove_wallet_authorization(&body, OwnerAuthWitness::new(ghost_spend_secret())).unwrap();
+        let b =
+            prove_wallet_authorization(&body, OwnerAuthWitness::new(ghost_spend_secret())).unwrap();
         assert_eq!(
             crate::wallet_authorization::authorization_proof_wire_bytes(&a.proof),
             crate::wallet_authorization::authorization_proof_wire_bytes(&b.proof),

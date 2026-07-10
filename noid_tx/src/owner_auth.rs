@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Canonical owner-batched authorization statement.
+//! Canonical one-owner authorization statement.
 //!
 //! This module is intentionally transaction-layer only: it derives the public
 //! owner statement from `TxBody` and never reads `SpendSecret`.
@@ -10,8 +10,6 @@ use noid_poseidon2b::primitives::{Address, TxBodyHash};
 
 use crate::{hash_tx_body_for_shape, TxBody, TxShape};
 
-pub const MAX_OWNER_AUTH_GROUPS: usize = 25;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OwnerAuthError {
     Coinbase,
@@ -19,7 +17,7 @@ pub enum OwnerAuthError {
     TooManyInputs { actual: usize, max: usize },
     TooManyOutputs { actual: usize, max: usize },
     NoLiveInputs,
-    TooManyOwnerGroups { actual: usize, max: usize },
+    MultipleInputOwners,
 }
 
 impl std::fmt::Display for OwnerAuthError {
@@ -30,11 +28,6 @@ impl std::fmt::Display for OwnerAuthError {
 
 impl std::error::Error for OwnerAuthError {}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct OwnerAuthGroup {
-    pub owner: Address,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CanonicalOwnerAuth {
     pub tx_body_hash: TxBodyHash,
@@ -42,10 +35,8 @@ pub struct CanonicalOwnerAuth {
     pub live_input_positions: Vec<usize>,
     /// UTXO slot indices for the live inputs, in canonical transaction order.
     pub live_slot_indices: Vec<u32>,
-    /// Unique owners in first-occurrence order.
-    pub groups: Vec<OwnerAuthGroup>,
-    /// For each live input position, the index into `groups`.
-    pub input_to_group: Vec<usize>,
+    /// The sole owner shared by every live input.
+    pub input_owner: Address,
     /// Transcript padding width for the per-input vectors: the shape's input
     /// capacity (`TxShape::max_inputs`). The authorization transcript absorbs
     /// each vector padded to this length with a sentinel so that the absorb
@@ -56,7 +47,7 @@ pub struct CanonicalOwnerAuth {
 impl CanonicalOwnerAuth {
     #[inline]
     pub fn owner_count(&self) -> usize {
-        self.groups.len()
+        1
     }
 
     #[inline]
@@ -66,24 +57,6 @@ impl CanonicalOwnerAuth {
 }
 
 pub fn canonical_owner_auth(body: &TxBody) -> Result<CanonicalOwnerAuth, OwnerAuthError> {
-    canonical_owner_auth_with_group_cap(body, 1)
-}
-
-/// LOW-LEVEL: the canonical statement WITHOUT the one-owner consensus cap
-/// (up to [`MAX_OWNER_AUTH_GROUPS`] groups). The generic multi-group GKR
-/// machinery is exercised through this in unit tests; NOTHING
-/// consensus-facing may call it — production statements carry exactly one
-/// owner group ([`canonical_owner_auth`]).
-pub fn canonical_owner_auth_multi_group(
-    body: &TxBody,
-) -> Result<CanonicalOwnerAuth, OwnerAuthError> {
-    canonical_owner_auth_with_group_cap(body, MAX_OWNER_AUTH_GROUPS)
-}
-
-fn canonical_owner_auth_with_group_cap(
-    body: &TxBody,
-    max_groups: usize,
-) -> Result<CanonicalOwnerAuth, OwnerAuthError> {
     if body.is_coinbase {
         return Err(OwnerAuthError::Coinbase);
     }
@@ -108,9 +81,7 @@ fn canonical_owner_auth_with_group_cap(
 
     let mut live_input_positions = Vec::new();
     let mut live_slot_indices = Vec::new();
-    let mut groups: Vec<OwnerAuthGroup> = Vec::new();
-    let mut first_positions: Vec<usize> = Vec::new();
-    let mut input_to_group = Vec::new();
+    let mut input_owner: Option<Address> = None;
 
     for (input_position, input) in body.inputs.iter().enumerate() {
         if !input.valid {
@@ -118,29 +89,14 @@ fn canonical_owner_auth_with_group_cap(
         }
         live_input_positions.push(input_position);
         live_slot_indices.push(input.slot_index);
-        let group_idx = match groups.iter().position(|group| group.owner == input.owner) {
-            Some(idx) => idx,
-            None => {
-                groups.push(OwnerAuthGroup { owner: input.owner });
-                first_positions.push(input_position);
-                groups.len() - 1
-            }
-        };
-        input_to_group.push(group_idx);
+        match input_owner {
+            None => input_owner = Some(input.owner),
+            Some(owner) if owner == input.owner => {}
+            Some(_) => return Err(OwnerAuthError::MultipleInputOwners),
+        }
     }
 
-    if live_input_positions.is_empty() {
-        return Err(OwnerAuthError::NoLiveInputs);
-    }
-    // ONE OWNER PER TRANSACTION (consensus rule): the production cap is
-    // 1 (`canonical_owner_auth`); the multi-group entry point exists for
-    // the low-level GKR unit tests only.
-    if groups.len() > max_groups {
-        return Err(OwnerAuthError::TooManyOwnerGroups {
-            actual: groups.len(),
-            max: max_groups,
-        });
-    }
+    let input_owner = input_owner.ok_or(OwnerAuthError::NoLiveInputs)?;
 
     let tx_body_hash = hash_tx_body_for_shape(
         body.shape,
@@ -155,8 +111,7 @@ fn canonical_owner_auth_with_group_cap(
         tx_body_hash,
         live_input_positions,
         live_slot_indices,
-        groups,
-        input_to_group,
+        input_owner,
         padded_input_len: max_inputs,
     })
 }
@@ -199,7 +154,7 @@ mod tests {
     }
 
     #[test]
-    fn groups_unique_owners_by_first_live_physical_position() {
+    fn mixed_owners_reject() {
         let body = body(
             TxShape::Sweep25x2,
             vec![
@@ -210,25 +165,22 @@ mod tests {
             ],
         );
 
-        let stmt = canonical_owner_auth_multi_group(&body).expect("canonical statement");
-        assert_eq!(stmt.live_input_positions, vec![1, 2, 3]);
-        assert_eq!(stmt.live_slot_indices, vec![2, 3, 2]);
-        assert_eq!(stmt.groups.len(), 2);
-        assert_eq!(stmt.groups[0].owner, Address([2; 32]));
-        assert_eq!(stmt.groups[1].owner, Address([3; 32]));
-        assert_eq!(stmt.input_to_group, vec![0, 1, 0]);
+        assert_eq!(
+            canonical_owner_auth(&body),
+            Err(OwnerAuthError::MultipleInputOwners)
+        );
     }
 
     #[test]
-    fn repeated_owner_maps_to_first_owner_group() {
+    fn repeated_inputs_keep_the_single_owner() {
         let body = body(
             TxShape::Sweep25x2,
-            vec![input(2, true), input(3, true), input(2, true)],
+            vec![input(2, true), input(2, true), input(2, true)],
         );
 
-        let stmt = canonical_owner_auth_multi_group(&body).expect("canonical statement");
-        assert_eq!(stmt.groups.len(), 2);
-        assert_eq!(stmt.input_to_group, vec![0, 1, 0]);
+        let stmt = canonical_owner_auth(&body).expect("canonical statement");
+        assert_eq!(stmt.input_owner, Address([2; 32]));
+        assert_eq!(stmt.owner_count(), 1);
     }
 
     #[test]

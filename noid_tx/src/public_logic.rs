@@ -163,7 +163,7 @@ pub fn validate_body_semantics_no_hash(body: &TxBody) -> Result<(), PublicLogicE
     // time (per-address balances; cross-address moves are explicit
     // transactions), spending never proves common ownership of two
     // addresses, and the owner-auth statement always carries exactly one
-    // owner group — so the proof layout (hence the recursive block class
+    // owner identity — so the proof layout (hence the recursive block class
     // shape) is owner-count independent by construction.
     let mut live_owner: Option<&noid_poseidon2b::primitives::Address> = None;
     for input in body.inputs.iter().filter(|i| i.valid) {

@@ -1527,7 +1527,7 @@ mod tests {
     use noid_chain::header_anchor::compute_header_chain_anchor;
     use noid_core::{Block128, TowerField};
     use noid_gkr::{
-        owner_auth_gkr_channel, owner_auth_inputs_from_body_and_live_secrets,
+        owner_auth_gkr_channel, owner_auth_trace_inputs_from_body_and_secret,
         prove_owner_auth_killshot, OwnerAuthCircuit,
     };
     use noid_poseidon2b::primitives::Address;
@@ -1600,13 +1600,13 @@ mod tests {
     }
 
     fn auth_proof_for_body(body: &TxBody) -> noid_gkr::OwnerAuthProofKillShot {
-        let live_secrets: Vec<_> = body
+        let spend_secret = &body
             .inputs
             .iter()
-            .filter(|input| input.valid)
-            .map(|input| input.spend_secret.clone())
-            .collect();
-        let auth_inputs = owner_auth_inputs_from_body_and_live_secrets(body, &live_secrets)
+            .find(|input| input.valid)
+            .expect("test body has a live input")
+            .spend_secret;
+        let auth_inputs = owner_auth_trace_inputs_from_body_and_secret(body, spend_secret)
             .expect("test auth inputs");
         let circuit = OwnerAuthCircuit::build(auth_inputs.layout);
         let mut channel = owner_auth_gkr_channel();

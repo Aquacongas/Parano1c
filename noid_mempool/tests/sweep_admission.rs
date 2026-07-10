@@ -10,7 +10,8 @@ use noid_chain::fri_state::SlotValue;
 use noid_chain::state::ChainState;
 use noid_core::{Block128, TowerField};
 use noid_gkr::{
-    prove_wallet_authorization, verify_wallet_authorization, WalletAuthorizationBundle,
+    prove_wallet_authorization, verify_wallet_authorization, OwnerAuthWitness,
+    WalletAuthorizationBundle,
 };
 use noid_mempool::{AsyncMempool, ChainView, SubmitError};
 use noid_poseidon2b::primitives::{derive_address, Address, SpendSecret, TxBodyHash};
@@ -124,13 +125,15 @@ fn chain_view_with_live_slots(body: &TxBody, include_outputs: bool) -> ChainView
 }
 
 fn prove_bundle(body: &TxBody) -> WalletAuthorizationBundle {
-    let spend_secrets = body
+    let spend_secret = body
         .inputs
         .iter()
-        .filter(|input| input.valid)
-        .map(|input| input.spend_secret.clone())
-        .collect();
-    prove_wallet_authorization(body, spend_secrets).expect("prove sweep authorization")
+        .find(|input| input.valid)
+        .expect("sweep fixture has a live input")
+        .spend_secret
+        .clone();
+    prove_wallet_authorization(body, OwnerAuthWitness::new(spend_secret))
+        .expect("prove sweep authorization")
 }
 
 fn authorization_bytes(bundle: &WalletAuthorizationBundle) -> Vec<u8> {

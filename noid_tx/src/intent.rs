@@ -50,10 +50,33 @@ use crate::wire::WireError;
 pub const TX_INTENT_WIRE_VERSION: u8 = 0xA2;
 
 impl TxIntent {
+    /// Construct a public intent from a body and detached authorization proof.
+    ///
+    /// The transitional per-input secret field is canonicalized to zero before
+    /// the body enters the public object. The canonical txid is derived here;
+    /// callers cannot supply an independent hash.
+    pub fn new(mut tx_body: TxBody, authorization_bytes: Vec<u8>) -> Self {
+        tx_body.clear_transitional_spend_secrets();
+        let tx_body_hash = tx_body.txid();
+        Self {
+            tx_body,
+            tx_body_hash,
+            authorization_bytes,
+        }
+    }
+
+    /// Canonical transaction id derived from the intent body.
+    ///
+    /// The transitional `tx_body_hash` field remains wire-visible until the
+    /// fixed Tx8x2 cutover, but this accessor never trusts that duplicate.
+    #[inline]
+    pub fn txid(&self) -> TxBodyHash {
+        self.tx_body.txid()
+    }
+
     pub fn encode(&self, buf: &mut Vec<u8>) {
         buf.push(TX_INTENT_WIRE_VERSION);
-        // Network wire: encode TxBody WITHOUT spend_secret in inputs.
-        self.tx_body.encode_public(buf);
+        self.tx_body.encode(buf);
         buf.extend_from_slice(&self.tx_body_hash.0);
         // authorization_bytes (length-prefixed)
         let proof_len = self.authorization_bytes.len() as u32;
@@ -76,8 +99,7 @@ impl TxIntent {
         }
         *src = tail;
 
-        // Network wire: decode TxBody WITHOUT spend_secret (spend_secret → zero).
-        let tx_body = TxBody::decode_public(src)?;
+        let tx_body = TxBody::decode(src)?;
 
         if src.len() < 32 {
             return Err(WireError::Truncated);
@@ -210,11 +232,12 @@ mod tests {
         assert_eq!(back.tx_body.shape, crate::types::TxShape::Sweep25x2);
         assert_eq!(back.tx_body.inputs.len(), 5);
         assert_eq!(back.tx_body.outputs.len(), 2);
-        assert!(back
-            .tx_body
-            .inputs
-            .iter()
-            .all(|inp| inp.spend_secret == SpendSecret([0u8; 32])));
+        assert!(
+            back.tx_body
+                .inputs
+                .iter()
+                .all(|inp| inp.spend_secret == SpendSecret([0u8; 32]))
+        );
     }
 
     /// Verify spend_secret is NOT present in the serialized bytes.
@@ -231,6 +254,29 @@ mod tests {
         // The raw secret bytes must not appear anywhere in the wire payload.
         let found = bytes.windows(32).any(|w| w == secret);
         assert!(!found, "spend_secret leaked into TxIntent wire bytes");
+    }
+
+    #[test]
+    fn constructor_canonicalizes_secret_and_wire_is_secret_invariant() {
+        let body = mk_body();
+        let mut same_public_body = body.clone();
+        same_public_body.inputs[0].spend_secret = SpendSecret([0xD9; 32]);
+
+        let intent = TxIntent::new(body, vec![1, 2, 3]);
+        let same_public_intent = TxIntent::new(same_public_body, vec![1, 2, 3]);
+
+        assert_eq!(
+            intent.tx_body.inputs[0].spend_secret,
+            SpendSecret([0u8; 32])
+        );
+        assert_eq!(intent.tx_body_hash, intent.tx_body.txid());
+        assert_eq!(intent.txid(), intent.tx_body_hash);
+        assert_eq!(intent.to_bytes(), same_public_intent.to_bytes());
+
+        let mut stale = intent;
+        stale.tx_body_hash = TxBodyHash([0xFE; 32]);
+        assert_ne!(stale.tx_body_hash, stale.txid());
+        assert_eq!(stale.txid(), stale.tx_body.txid());
     }
 
     #[test]
@@ -254,6 +300,9 @@ mod tests {
         };
         let mut bytes = intent.to_bytes();
         bytes.remove(0);
-        assert_eq!(TxIntent::from_bytes(&bytes), Err(WireError::UnsupportedVersion));
+        assert_eq!(
+            TxIntent::from_bytes(&bytes),
+            Err(WireError::UnsupportedVersion)
+        );
     }
 }

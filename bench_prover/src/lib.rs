@@ -21,7 +21,7 @@ use noid_chain::{Block, BlockHeader, SlotValue};
 use noid_core::mem_profile::{current_mem_snapshot, MemSnapshot};
 use noid_core::Block128;
 use noid_gkr::{
-    owner_auth_gkr_channel, owner_auth_inputs_from_body_and_live_secrets,
+    owner_auth_gkr_channel, owner_auth_trace_inputs_from_body_and_secret,
     prove_owner_auth_killshot, spine_inputs_from_body, sweep_spine_inputs_from_body,
     verify_owner_auth_killshot, OwnerAuthCircuit, OwnerAuthInputs, OwnerAuthProofKillShot,
     OwnerAuthPublicInputs, SpineInputs, WalletAuthorizationBundle,
@@ -497,13 +497,13 @@ pub fn standard_fixture(scenario: BenchScenario) -> StandardFixture {
     let body = &scenario.body;
     noid_tx::validate_public_tx_logic(body).expect("standard public logic");
 
-    let live_secrets: Vec<_> = body
+    let spend_secret = &body
         .inputs
         .iter()
-        .filter(|i| i.valid)
-        .map(|input| input.spend_secret.clone())
-        .collect();
-    let auth_inputs = owner_auth_inputs_from_body_and_live_secrets(body, &live_secrets)
+        .find(|input| input.valid)
+        .expect("standard bench body has a live input")
+        .spend_secret;
+    let auth_inputs = owner_auth_trace_inputs_from_body_and_secret(body, spend_secret)
         .expect("standard owner auth inputs from bench body");
     let auth_public = auth_inputs.to_public();
     let circuit = OwnerAuthCircuit::build(auth_inputs.layout);
@@ -526,14 +526,14 @@ pub fn standard_fixture(scenario: BenchScenario) -> StandardFixture {
 pub fn sweep_fixture(scenario: BenchScenario) -> SweepFixture {
     assert_eq!(scenario.body.shape, TxShape::Sweep25x2);
     noid_tx::validate_public_tx_logic(&scenario.body).expect("sweep public logic");
-    let live_secrets: Vec<_> = scenario
+    let spend_secret = &scenario
         .body
         .inputs
         .iter()
-        .filter(|i| i.valid)
-        .map(|input| input.spend_secret.clone())
-        .collect();
-    let auth_inputs = owner_auth_inputs_from_body_and_live_secrets(&scenario.body, &live_secrets)
+        .find(|input| input.valid)
+        .expect("sweep bench body has a live input")
+        .spend_secret;
+    let auth_inputs = owner_auth_trace_inputs_from_body_and_secret(&scenario.body, spend_secret)
         .expect("sweep owner auth inputs from bench body");
     let spine_inputs =
         sweep_spine_inputs_from_body(&scenario.body).expect("sweep spine inputs from bench body");
@@ -550,13 +550,13 @@ pub fn sweep_fixture(scenario: BenchScenario) -> SweepFixture {
 
 pub fn minimal_tx_fixture(scenario: BenchScenario) -> MinimalTxFixture {
     let body = &scenario.body;
-    let live_secrets: Vec<_> = body
+    let spend_secret = &body
         .inputs
         .iter()
-        .filter(|i| i.valid)
-        .map(|input| input.spend_secret.clone())
-        .collect();
-    let auth_inputs = owner_auth_inputs_from_body_and_live_secrets(body, &live_secrets)
+        .find(|input| input.valid)
+        .expect("minimal bench body has a live input")
+        .spend_secret;
+    let auth_inputs = owner_auth_trace_inputs_from_body_and_secret(body, spend_secret)
         .expect("owner auth inputs from bench body");
     let circuit = OwnerAuthCircuit::build(auth_inputs.layout);
     let mut ch = owner_auth_gkr_channel();

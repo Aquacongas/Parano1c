@@ -4,10 +4,10 @@
 #![allow(clippy::needless_range_loop)]
 #![allow(clippy::too_many_arguments)]
 
-//! Dynamic owner-batched AuthGKR.
+//! Owner-authorization AuthGKR.
 //!
-//! One transaction gets one AuthGKR capsule sized by canonical unique owner
-//! count `k`, not by live input count `m` and not by the transaction shape.
+//! Production statements have exactly one owner and one secret, independent
+//! of live-input count. Layout-parameterized circuit tests remain internal.
 
 use std::sync::OnceLock;
 
@@ -42,8 +42,8 @@ pub const OWNER_AUTH_PIN_LANES: usize = 2;
 pub const OWNER_AUTH_ROUND_VARS: usize = 7;
 pub const OWNER_AUTH_ELEM_VARS: usize = 2;
 pub const OWNER_AUTH_MIN_SLOT_BITS: usize = 0;
-pub const OWNER_AUTH_MIN_OWNERS: usize = 1;
-pub const OWNER_AUTH_MAX_OWNERS: usize = 25;
+pub(crate) const OWNER_AUTH_MIN_OWNERS: usize = 1;
+pub(crate) const OWNER_AUTH_MAX_OWNERS: usize = 25;
 const ELEM_LO: usize = 0;
 const ELEM_HI: usize = ELEM_LO + OWNER_AUTH_ELEM_VARS;
 const ROUND_LO: usize = ELEM_HI;
@@ -206,10 +206,9 @@ impl OwnerAuthPublicInputs {
     }
 }
 
-#[derive(Clone)]
 pub struct OwnerAuthInputs {
     pub layout: OwnerAuthLayout,
-    pub spend_secret: Vec<[Block128; 2]>,
+    spend_secret: Vec<[Block128; 2]>,
     pub tx_body_hash: [Block128; 2],
     pub expected_address: Vec<[Block128; 2]>,
 }
@@ -263,8 +262,13 @@ impl OwnerAuthSlotState {
     }
 }
 
+/// Evaluated permutation states used internally while constructing an
+/// owner-authorization proof.
+///
+/// This is deliberately named a *trace* witness so it cannot be confused
+/// with [`crate::OwnerAuthWitness`], the wallet-facing one-secret capability.
 #[derive(zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
-pub struct OwnerAuthWitness {
+pub struct OwnerAuthTraceWitness {
     pub slots: Vec<OwnerAuthSlotState>,
     pub derived_address: Vec<[Block128; 2]>,
 }
@@ -272,7 +276,7 @@ pub struct OwnerAuthWitness {
 pub fn evaluate_owner_auth(
     circuit: &OwnerAuthCircuit,
     inputs: &OwnerAuthInputs,
-) -> OwnerAuthWitness {
+) -> OwnerAuthTraceWitness {
     assert_eq!(inputs.layout, circuit.layout);
     assert_eq!(inputs.spend_secret.len(), circuit.layout.owner_count);
     let perm = noid_poseidon2b::native::permutation::Poseidon2bPermutation;
@@ -293,7 +297,7 @@ pub fn evaluate_owner_auth(
         derived_address[i] = slots[OwnerAuthCircuit::haddr_output_slot(i)].digest();
     }
 
-    OwnerAuthWitness {
+    OwnerAuthTraceWitness {
         slots,
         derived_address,
     }
@@ -329,7 +333,6 @@ pub fn compute_owner_auth_boundary(
     w.derived_address.clone()
 }
 
-#[derive(Debug, Clone)]
 pub struct OwnerAuthUnifiedMle {
     pub layout: OwnerAuthLayout,
     pub s_in: Vec<Block128>,
@@ -557,8 +560,7 @@ fn build_owner_auth_public_tables(layout: OwnerAuthLayout) -> OwnerAuthPublicTab
     let rc_lane_dec: [Vec<Block128>; STATE_SIZE] =
         std::array::from_fn(|j| owner_auth_project_lane(layout, &rc_dec, j));
     let mds_lane_dec_flat = std::array::from_fn(|j| owner_auth_table_to_flat(&mds_lane_dec[j]));
-    let sigma_lane_dec_flat =
-        std::array::from_fn(|j| owner_auth_table_to_flat(&sigma_lane_dec[j]));
+    let sigma_lane_dec_flat = std::array::from_fn(|j| owner_auth_table_to_flat(&sigma_lane_dec[j]));
     let rc_lane_dec_flat = std::array::from_fn(|j| owner_auth_table_to_flat(&rc_lane_dec[j]));
     OwnerAuthPublicTables {
         mds_lane_dec,
@@ -1728,9 +1730,7 @@ pub enum OwnerAuthStatementError {
     Canonical(OwnerAuthError),
     Layout(OwnerAuthLayoutError),
     LiveInputCountOutOfRange { actual: usize, max: usize },
-    SecretCountMismatch { expected: usize, actual: usize },
     SecretMismatch { input_position: usize },
-    RepeatedOwnerSecretMismatch { input_position: usize },
 }
 
 impl From<OwnerAuthError> for OwnerAuthStatementError {
@@ -1751,21 +1751,14 @@ impl std::fmt::Display for OwnerAuthStatementError {
             Self::Canonical(e) => write!(f, "canonical owner auth failed: {e}"),
             Self::Layout(e) => write!(f, "owner auth layout failed: {e}"),
             Self::LiveInputCountOutOfRange { actual, max } => {
-                write!(f, "live input count out of range: actual {actual}, max {max}")
-            }
-            Self::SecretCountMismatch { expected, actual } => {
                 write!(
                     f,
-                    "secret count mismatch: expected {expected}, actual {actual}"
+                    "live input count out of range: actual {actual}, max {max}"
                 )
             }
             Self::SecretMismatch { input_position } => {
                 write!(f, "secret mismatch at live input position {input_position}")
             }
-            Self::RepeatedOwnerSecretMismatch { input_position } => write!(
-                f,
-                "repeated owner provided different secret at live input position {input_position}"
-            ),
         }
     }
 }
@@ -1775,12 +1768,8 @@ impl std::error::Error for OwnerAuthStatementError {}
 pub fn owner_auth_public_from_statement(
     statement: &CanonicalOwnerAuth,
 ) -> Result<OwnerAuthPublicInputs, OwnerAuthStatementError> {
-    let layout = OwnerAuthLayout::for_owner_count(statement.groups.len())?;
-    let expected_address = statement
-        .groups
-        .iter()
-        .map(|group| group.owner.as_fields())
-        .collect::<Vec<_>>();
+    let layout = OwnerAuthLayout::for_owner_count(statement.owner_count())?;
+    let expected_address = vec![statement.input_owner.as_fields()];
     Ok(OwnerAuthPublicInputs {
         layout,
         tx_body_hash: statement.tx_body_hash.as_fields(),
@@ -1795,64 +1784,29 @@ pub fn owner_auth_public_from_body(
     owner_auth_public_from_statement(&statement)
 }
 
-pub fn owner_auth_inputs_from_body_and_live_secrets(
+/// One-secret trace boundary used by owner-auth proving and proof ledgers.
+///
+/// The secret is borrowed only long enough to validate the body's sole owner
+/// and copy its two field limbs into zeroizing prover inputs.  It is never
+/// returned, serialized, or repeated once per live input. Production wallets
+/// should pass [`crate::OwnerAuthWitness`] to
+/// [`crate::prove_wallet_authorization`] instead of constructing trace inputs.
+pub fn owner_auth_trace_inputs_from_body_and_secret(
     body: &TxBody,
-    spend_secrets: &[SpendSecret],
+    spend_secret: &SpendSecret,
 ) -> Result<OwnerAuthInputs, OwnerAuthStatementError> {
-    owner_auth_inputs_from_statement_and_live_secrets(canonical_owner_auth(body)?, spend_secrets)
-}
+    let statement = canonical_owner_auth(body)?;
 
-/// LOW-LEVEL: inputs from a statement built WITHOUT the one-owner
-/// consensus cap (`canonical_owner_auth_multi_group`) — the generic
-/// multi-group GKR machinery's unit-test entry; nothing consensus-facing
-/// may call it.
-pub fn owner_auth_inputs_from_body_and_live_secrets_multi_group(
-    body: &TxBody,
-    spend_secrets: &[SpendSecret],
-) -> Result<OwnerAuthInputs, OwnerAuthStatementError> {
-    owner_auth_inputs_from_statement_and_live_secrets(
-        noid_tx::canonical_owner_auth_multi_group(body)?,
-        spend_secrets,
-    )
-}
-
-fn owner_auth_inputs_from_statement_and_live_secrets(
-    statement: CanonicalOwnerAuth,
-    spend_secrets: &[SpendSecret],
-) -> Result<OwnerAuthInputs, OwnerAuthStatementError> {
-    if spend_secrets.len() != statement.live_input_positions.len() {
-        return Err(OwnerAuthStatementError::SecretCountMismatch {
-            expected: statement.live_input_positions.len(),
-            actual: spend_secrets.len(),
-        });
+    let input_position = statement.live_input_positions[0];
+    if derive_address(spend_secret) != statement.input_owner {
+        return Err(OwnerAuthStatementError::SecretMismatch { input_position });
     }
 
     let public = owner_auth_public_from_statement(&statement)?;
-    let mut group_secrets: Vec<Option<[Block128; 2]>> = vec![None; statement.groups.len()];
-    for (live_idx, &input_position) in statement.live_input_positions.iter().enumerate() {
-        let secret = &spend_secrets[live_idx];
-        let owner = derive_address(secret);
-        let group_idx = statement.input_to_group[live_idx];
-        if owner != statement.groups[group_idx].owner {
-            return Err(OwnerAuthStatementError::SecretMismatch { input_position });
-        }
-        let fields = secret.as_fields();
-        match group_secrets[group_idx] {
-            Some(existing) if existing != fields => {
-                return Err(OwnerAuthStatementError::RepeatedOwnerSecretMismatch {
-                    input_position,
-                });
-            }
-            Some(_) => {}
-            None => group_secrets[group_idx] = Some(fields),
-        }
-    }
-
-    let spend_secret = group_secrets
-        .into_iter()
-        .map(|slot| slot.expect("each canonical group has a first live input"))
-        .collect();
-    Ok(OwnerAuthInputs::from_parts(&public, spend_secret))
+    Ok(OwnerAuthInputs::from_parts(
+        &public,
+        vec![spend_secret.as_fields()],
+    ))
 }
 
 #[cfg(test)]
@@ -1869,29 +1823,18 @@ mod tests {
         SpendSecret(bytes)
     }
 
-    fn body_from_secrets(shape: TxShape, secrets: &[SpendSecret], repeated_first: bool) -> TxBody {
-        let mut inputs = Vec::new();
-        for (i, s) in secrets.iter().enumerate() {
-            inputs.push(TxInput {
+    fn body_from_secret(shape: TxShape, spend_secret: &SpendSecret, input_count: usize) -> TxBody {
+        let owner = derive_address(spend_secret);
+        let inputs = (0..input_count)
+            .map(|i| TxInput {
                 slot_index: i as u32,
                 value: 10,
                 creation_id: 0,
-                owner: derive_address(s),
-                spend_secret: s.clone(),
+                owner,
+                spend_secret: SpendSecret([0u8; 32]),
                 valid: true,
-            });
-        }
-        if repeated_first {
-            let s = secrets[0].clone();
-            inputs.push(TxInput {
-                slot_index: 100,
-                value: 10,
-                creation_id: 0,
-                owner: derive_address(&s),
-                spend_secret: s,
-                valid: true,
-            });
-        }
+            })
+            .collect::<Vec<_>>();
         let total = inputs.iter().map(|i| i.value).sum::<u64>();
         TxBody {
             shape,
@@ -1906,6 +1849,25 @@ mod tests {
             }],
             is_coinbase: false,
         }
+    }
+
+    /// Direct test fixture for exercising generic circuit layout classes
+    /// without exposing a multi-owner transaction-layer API.
+    fn generic_trace_inputs(secrets: &[SpendSecret], hash_seed: u8) -> OwnerAuthInputs {
+        let layout = OwnerAuthLayout::for_owner_count(secrets.len()).expect("test layout");
+        let public = OwnerAuthPublicInputs::new(
+            layout,
+            noid_poseidon2b::primitives::TxBodyHash([hash_seed; 32]).as_fields(),
+            secrets
+                .iter()
+                .map(|secret| derive_address(secret).as_fields())
+                .collect(),
+        )
+        .expect("test public inputs");
+        OwnerAuthInputs::from_parts(
+            &public,
+            secrets.iter().map(SpendSecret::as_fields).collect(),
+        )
     }
 
     #[test]
@@ -1950,14 +1912,7 @@ mod tests {
     fn owner_auth_state_mle_round_zero_extracts_spend_secret() {
         for k in [1usize, 4, 13] {
             let secrets: Vec<_> = (0..k).map(|i| secret(i as u8 + 70)).collect();
-            let shape = if k <= 4 {
-                TxShape::Standard4x8
-            } else {
-                TxShape::Sweep25x2
-            };
-            let body = body_from_secrets(shape, &secrets, false);
-            let inputs =
-                owner_auth_inputs_from_body_and_live_secrets_multi_group(&body, &secrets).expect("inputs");
+            let inputs = generic_trace_inputs(&secrets, 0x71);
             let circuit = OwnerAuthCircuit::build(inputs.layout);
             let mle = build_owner_auth_unified_from_inputs(&circuit, &inputs);
             let inv = mds_full_inverse();
@@ -2016,17 +1971,10 @@ mod tests {
     }
 
     #[test]
-    fn owner_auth_killshot_roundtrip_repeated_owner_k1() {
+    fn owner_auth_killshot_roundtrip_repeated_inputs_fixed_owner() {
         let s = secret(9);
-        let body = body_from_secrets(TxShape::Sweep25x2, std::slice::from_ref(&s), true);
-        let live_secrets: Vec<_> = body
-            .inputs
-            .iter()
-            .filter(|i| i.valid)
-            .map(|i| i.spend_secret.clone())
-            .collect();
-        let inputs =
-            owner_auth_inputs_from_body_and_live_secrets_multi_group(&body, &live_secrets).expect("inputs");
+        let body = body_from_secret(TxShape::Sweep25x2, &s, 2);
+        let inputs = owner_auth_trace_inputs_from_body_and_secret(&body, &s).expect("inputs");
         assert_eq!(inputs.layout.owner_count, 1);
         let circuit = OwnerAuthCircuit::build(inputs.layout);
         let mut ch = owner_auth_gkr_channel();
@@ -2047,14 +1995,7 @@ mod tests {
     fn owner_auth_killshot_roundtrip_layout_classes() {
         for k in [1usize, 2, 4, 7, 13] {
             let secrets: Vec<_> = (0..k).map(|i| secret(i as u8 + 20)).collect();
-            let shape = if k <= 4 {
-                TxShape::Standard4x8
-            } else {
-                TxShape::Sweep25x2
-            };
-            let body = body_from_secrets(shape, &secrets, false);
-            let inputs =
-                owner_auth_inputs_from_body_and_live_secrets_multi_group(&body, &secrets).expect("inputs");
+            let inputs = generic_trace_inputs(&secrets, 0x72);
             assert_eq!(inputs.layout.owner_count, k);
             let circuit = OwnerAuthCircuit::build(inputs.layout);
             let mut ch = owner_auth_gkr_channel();
@@ -2068,24 +2009,19 @@ mod tests {
     #[test]
     fn owner_auth_v3_transcript_rejects_v4_proof() {
         const OWNER_AUTH_GKR_V3_DOMAIN_TAG: u128 = 0xA07D_0B47_CAFE_0003;
-        let secrets = [secret(33)];
-        let body = body_from_secrets(TxShape::Standard4x8, &secrets, false);
-        let inputs = owner_auth_inputs_from_body_and_live_secrets(&body, &secrets).expect("inputs");
+        let spend_secret = secret(33);
+        let body = body_from_secret(TxShape::Standard4x8, &spend_secret, 1);
+        let inputs =
+            owner_auth_trace_inputs_from_body_and_secret(&body, &spend_secret).expect("inputs");
         let circuit = OwnerAuthCircuit::build(inputs.layout);
         let mut prover_channel = owner_auth_gkr_channel();
-        let (proof, _) =
-            prove_owner_auth_killshot(&circuit, &inputs, &mut prover_channel);
+        let (proof, _) = prove_owner_auth_killshot(&circuit, &inputs, &mut prover_channel);
 
         let mut old_channel = Poseidon2bChannel::new();
         old_channel.absorb(Block128::from(OWNER_AUTH_GKR_V3_DOMAIN_TAG));
         assert!(
-            verify_owner_auth_killshot(
-                &proof,
-                &circuit,
-                &inputs.to_public(),
-                &mut old_channel,
-            )
-            .is_none(),
+            verify_owner_auth_killshot(&proof, &circuit, &inputs.to_public(), &mut old_channel,)
+                .is_none(),
             "a v4 proof must not verify under the retired v3 transcript"
         );
     }
@@ -2093,8 +2029,7 @@ mod tests {
     #[test]
     fn owner_auth_killshot_rejects_tamper() {
         let secrets = [secret(41), secret(42)];
-        let body = body_from_secrets(TxShape::Standard4x8, &secrets, false);
-        let inputs = owner_auth_inputs_from_body_and_live_secrets_multi_group(&body, &secrets).expect("inputs");
+        let inputs = generic_trace_inputs(&secrets, 0x73);
         let circuit = OwnerAuthCircuit::build(inputs.layout);
         let mut ch = owner_auth_gkr_channel();
         let (mut proof, _) = prove_owner_auth_killshot(&circuit, &inputs, &mut ch);
@@ -2109,8 +2044,7 @@ mod tests {
     #[test]
     fn owner_auth_rejects_tampered_or_off_shape_round_polys() {
         let secrets = [secret(71), secret(72)];
-        let body = body_from_secrets(TxShape::Standard4x8, &secrets, false);
-        let inputs = owner_auth_inputs_from_body_and_live_secrets_multi_group(&body, &secrets).expect("inputs");
+        let inputs = generic_trace_inputs(&secrets, 0x74);
         let circuit = OwnerAuthCircuit::build(inputs.layout);
         let prove = || {
             let mut ch = owner_auth_gkr_channel();
@@ -2121,8 +2055,7 @@ mod tests {
         // coefficient must still die at the final constraint check.
         for (poly_idx, coeff_idx) in [(0usize, 0usize), (2, 7)] {
             let mut proof = prove();
-            proof.kill_shot.main.round_polys[poly_idx].coeffs_no_linear[coeff_idx] +=
-                Block128::ONE;
+            proof.kill_shot.main.round_polys[poly_idx].coeffs_no_linear[coeff_idx] += Block128::ONE;
             let mut ch_v = owner_auth_gkr_channel();
             assert!(
                 verify_owner_auth_killshot(&proof, &circuit, &inputs.to_public(), &mut ch_v)
@@ -2151,8 +2084,7 @@ mod tests {
     #[test]
     fn owner_auth_rejects_canonical_statement_tamper() {
         let secrets = [secret(51), secret(52)];
-        let body = body_from_secrets(TxShape::Standard4x8, &secrets, false);
-        let inputs = owner_auth_inputs_from_body_and_live_secrets_multi_group(&body, &secrets).expect("inputs");
+        let inputs = generic_trace_inputs(&secrets, 0x75);
         let circuit = OwnerAuthCircuit::build(inputs.layout);
         let mut ch = owner_auth_gkr_channel();
         let (proof, _) = prove_owner_auth_killshot(&circuit, &inputs, &mut ch);
@@ -2171,8 +2103,7 @@ mod tests {
     #[test]
     fn owner_auth_rejects_boundary_batch_and_pcs_tamper() {
         let secrets = [secret(61), secret(62)];
-        let body = body_from_secrets(TxShape::Standard4x8, &secrets, false);
-        let inputs = owner_auth_inputs_from_body_and_live_secrets_multi_group(&body, &secrets).expect("inputs");
+        let inputs = generic_trace_inputs(&secrets, 0x76);
         let circuit = OwnerAuthCircuit::build(inputs.layout);
         let mut ch = owner_auth_gkr_channel();
         let (proof, _) = prove_owner_auth_killshot(&circuit, &inputs, &mut ch);

@@ -6,8 +6,8 @@
 //! This crate implements the Kill-Shot GKR protocol for Poseidon2b
 //! permutation chains. It provides:
 //!
-//! - **Owner Auth GKR**: proves spend-secret ownership once per canonical
-//!   unique owner group in a transaction.
+//! - **Owner Auth GKR**: proves the transaction's single input owner from one
+//!   wallet spend secret.
 //! - **Poseidon2b spine components**: reusable Kill-Shot proofs for fixed
 //!   permutation batches such as tx-body hashing, accepted-claim hashing,
 //!   state-root hashing, and chain accumulation.
@@ -117,18 +117,17 @@ pub use oracle_sweep::{evaluate_sweep_spine, SweepSpineSlotState, SweepSpineWitn
 pub use owner_auth::{
     build_owner_auth_unified_from_inputs, build_owner_auth_unified_mle,
     compute_owner_auth_boundary, discharge_owner_auth_reductions_native, evaluate_owner_auth,
-    init_owner_auth_gkr_channel, owner_auth_gkr_channel,
-    owner_auth_inputs_from_body_and_live_secrets, owner_auth_public_from_body,
-    owner_auth_public_from_statement, prove_owner_auth_killshot,
-    prove_owner_auth_killshot_from_mle, verify_owner_auth_killshot,
+    init_owner_auth_gkr_channel, owner_auth_gkr_channel, owner_auth_public_from_body,
+    owner_auth_public_from_statement, owner_auth_trace_inputs_from_body_and_secret,
+    prove_owner_auth_killshot, prove_owner_auth_killshot_from_mle, verify_owner_auth_killshot,
     verify_owner_auth_killshot_with_claims, OwnerAuthBoundaryProof, OwnerAuthBoundaryReduction,
     OwnerAuthCircuit, OwnerAuthInputs, OwnerAuthKillShotProof, OwnerAuthKillShotReductions,
     OwnerAuthLayout, OwnerAuthLayoutError, OwnerAuthProofKillShot, OwnerAuthPublicInputs,
     OwnerAuthShiftProof, OwnerAuthShiftReduction, OwnerAuthSlotDescriptor, OwnerAuthSlotRole,
-    OwnerAuthSlotState, OwnerAuthStatementError, OwnerAuthUnifiedMle, OwnerAuthUnifiedProof,
-    OwnerAuthUnifiedReduction, OwnerAuthVerifierClaims, OwnerAuthWitness, OWNER_AUTH_MAX_OWNERS,
-    OWNER_AUTH_MIN_OWNERS, OWNER_AUTH_PIN_LANES, OWNER_AUTH_SHIFT_ROUND_DEGREE,
-    OWNER_AUTH_SLOTS_PER_OWNER, OWNER_AUTH_STATE_ROUND_DEGREE, OWNER_AUTH_UNIFIED_ROUND_DEGREE,
+    OwnerAuthSlotState, OwnerAuthStatementError, OwnerAuthTraceWitness, OwnerAuthUnifiedProof,
+    OwnerAuthUnifiedReduction, OwnerAuthVerifierClaims, OWNER_AUTH_PIN_LANES,
+    OWNER_AUTH_SHIFT_ROUND_DEGREE, OWNER_AUTH_SLOTS_PER_OWNER, OWNER_AUTH_STATE_ROUND_DEGREE,
+    OWNER_AUTH_UNIFIED_ROUND_DEGREE,
 };
 pub use spine_killshot::{
     build_unified_from_inputs, build_unified_from_states, discharge_reductions_native,
@@ -195,12 +194,11 @@ pub use tx_body_layout::{
 };
 pub use wallet_authorization::{
     authorization_proof_wire_bytes, canonical_authorization_statement_from_body,
-    max_authorization_bytes_for_shape, validate_authorization_statement,
-    prove_wallet_authorization, verify_authorization_statement_proof, verify_wallet_authorization,
-    verify_wallet_authorization_proof, AuthorizationDecodeError, AuthorizationEncodeError,
-    CanonicalAuthorizationStatement, ProveAuthorizationError, VerifiedAuthorization,
-    VerifiedAuthorizationBatch, VerifyAuthorizationError, WalletAuthorizationBundle,
-    MAX_AUTHORIZATION_BUNDLE_BYTES, MAX_AUTHORIZATION_LIVE_INPUTS,
-    MAX_STANDARD_AUTHORIZATION_BYTES,
-    MAX_SWEEP_AUTHORIZATION_BYTES,
+    max_authorization_bytes_for_shape, prove_wallet_authorization,
+    validate_authorization_statement, verify_authorization_statement_proof,
+    verify_wallet_authorization, verify_wallet_authorization_proof, AuthorizationDecodeError,
+    AuthorizationEncodeError, CanonicalAuthorizationStatement, OwnerAuthWitness,
+    ProveAuthorizationError, VerifiedAuthorization, VerifiedAuthorizationBatch,
+    VerifyAuthorizationError, WalletAuthorizationBundle, MAX_AUTHORIZATION_BUNDLE_BYTES,
+    MAX_AUTHORIZATION_LIVE_INPUTS, MAX_STANDARD_AUTHORIZATION_BYTES, MAX_SWEEP_AUTHORIZATION_BYTES,
 };

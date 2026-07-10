@@ -4,12 +4,14 @@
 //! Transaction builder for the Paranoid wallet.
 //!
 //! This is the only place that assembles a complete [`TxIntent`] from UTXOs
-//! and spending secrets. The two-phase API separates lock-holding work
-//! (coin selection + secret extraction via [`extract_build_data`]) from the
+//! and one active-owner proving capability. The two-phase API separates
+//! lock-holding work (coin selection + witness extraction via
+//! [`extract_build_data`]) from the
 //! CPU-heavy proving work (via [`build_and_prove_tx`]), so the wallet mutex
 //! is held for as short a time as possible.
 //!
-use noid_poseidon2b::primitives::{Address, SpendSecret};
+use noid_gkr::OwnerAuthWitness;
+use noid_poseidon2b::primitives::{derive_address, Address, SpendSecret};
 use noid_tx::{
     body_hash::hash_tx_body_for_shape,
     intent::TxIntent,
@@ -30,10 +32,11 @@ use crate::wallet::state::{WalletState, WalletUtxo};
 pub struct TxBuildData {
     /// Owned copies of the UTXOs selected for spending.
     pub selected_utxos: Vec<WalletUtxo>,
-    /// Spending secret for each selected UTXO (index-aligned with `selected_utxos`).
-    /// Zeroized on drop via [`SpendSecret`]'s `ZeroizeOnDrop` impl.
-    pub spend_secrets: Vec<SpendSecret>,
-    /// Change address (wallet primary address). Excess funds return here.
+    /// One proving capability for the active owner shared by every selected
+    /// UTXO. It is non-cloneable/non-serializable and zeroizes its secret on
+    /// drop; public transaction records carry only zero placeholders.
+    pub owner_auth_witness: OwnerAuthWitness,
+    /// Change address (the captured active address). Excess funds return here.
     pub change_address: Address,
     /// Epoch anchor bytes from the chain tip (anti-replay / natural TTL).
     pub epoch_anchor: [u8; 32],
@@ -62,6 +65,29 @@ pub enum BuildError {
 
     #[error("proving failed: {0}")]
     ProveFailed(String),
+
+    #[error("selected UTXO set is not owned exclusively by the active address")]
+    ActiveOwnerMismatch,
+}
+
+fn active_owner_witness(
+    wallet: &WalletState,
+    selected: &[WalletUtxo],
+) -> Result<OwnerAuthWitness, BuildError> {
+    let active_index = wallet.active_index;
+    let active_address = wallet.active_address();
+    if selected
+        .iter()
+        .any(|utxo| utxo.key_index != active_index || utxo.address != active_address)
+    {
+        return Err(BuildError::ActiveOwnerMismatch);
+    }
+
+    let spend_secret = wallet.spend_secret_for(active_index);
+    if derive_address(&spend_secret) != active_address {
+        return Err(BuildError::ActiveOwnerMismatch);
+    }
+    Ok(OwnerAuthWitness::new(spend_secret))
 }
 
 // ---------------------------------------------------------------------------
@@ -70,7 +96,7 @@ pub enum BuildError {
 
 /// Extract build data from [`WalletState`] while holding the wallet lock.
 ///
-/// Performs coin selection (largest-first) and derives spending secrets for
+/// Performs coin selection (largest-first) and derives one owner witness for
 /// the selected UTXOs. The caller must hold the wallet mutex for the entire
 /// duration of this call, then release it before invoking [`build_and_prove_tx`].
 ///
@@ -130,17 +156,14 @@ pub fn extract_build_data(
         });
     }
 
-    // Clone UTXOs and derive secrets while holding the wallet lock.
+    // Clone UTXOs and derive the active owner's one proving capability while
+    // holding the wallet lock.
     let selected_utxos: Vec<WalletUtxo> = selected_refs.into_iter().cloned().collect();
-
-    let spend_secrets: Vec<SpendSecret> = selected_utxos
-        .iter()
-        .map(|u| wallet.spend_secret_for(u.key_index))
-        .collect();
+    let owner_auth_witness = active_owner_witness(wallet, &selected_utxos)?;
 
     Ok(TxBuildData {
         selected_utxos,
-        spend_secrets,
+        owner_auth_witness,
         change_address: wallet.active_address(),
         epoch_anchor,
         output_slot_hints: slot_hints,
@@ -231,15 +254,12 @@ pub fn extract_consolidate_data(
         return Err(BuildError::NotEnoughSlots { need: 1, got: 0 });
     }
 
-    let spend_secrets: Vec<SpendSecret> = selected
-        .iter()
-        .map(|u| wallet.spend_secret_for(u.key_index))
-        .collect();
+    let owner_auth_witness = active_owner_witness(wallet, &selected)?;
 
     Ok((
         TxBuildData {
             selected_utxos: selected,
-            spend_secrets,
+            owner_auth_witness,
             change_address: wallet.active_address(),
             epoch_anchor,
             output_slot_hints: slot_hints,
@@ -267,8 +287,8 @@ pub fn extract_consolidate_data(
 /// 2. Build live inputs.
 /// 3. Pad inputs to the selected shape with `TxInput::dummy()` (`valid = false`).
 /// 4. `tx_body_hash = hash_tx_body_for_shape(shape, epoch_anchor, fee, inputs, outputs, false)`.
-/// 5. `prove_tx(&body, spend_secrets)` → `WalletAuthorizationBundle`
-///    (secrets are consumed and zeroized inside).
+/// 5. `prove_tx(&body, owner_auth_witness)` → `WalletAuthorizationBundle`;
+///    the one secret is consumed and zeroized inside.
 /// 6. Assemble and wire-encode the [`TxIntent`]; validators derive claims from
 ///    the hash-bound body.
 ///
@@ -289,9 +309,13 @@ pub fn build_and_prove_tx(
     // Build outputs.
     // -----------------------------------------------------------------------
     let total_selected: u64 = data.selected_utxos.iter().map(|u| u.value).sum();
-    // Subtraction is safe: extract_build_data already validated that
-    // total_selected >= amount_micronoid + fee_micronoid.
-    let change_amount = total_selected - amount_micronoid - fee_micronoid;
+    let change_amount = total_selected
+        .checked_sub(amount_micronoid)
+        .and_then(|remaining| remaining.checked_sub(fee_micronoid))
+        .ok_or(BuildError::InsufficientFunds {
+            need: amount_micronoid.saturating_add(fee_micronoid),
+            have: total_selected,
+        })?;
 
     let mut outputs: Vec<TxOutput> = Vec::with_capacity(2);
     outputs.push(TxOutput {
@@ -315,15 +339,15 @@ pub fn build_and_prove_tx(
     let mut inputs: Vec<TxInput> = data
         .selected_utxos
         .iter()
-        .zip(data.spend_secrets.iter())
-        .map(|(utxo, secret)| TxInput {
+        .map(|utxo| TxInput {
             slot_index: utxo.slot_index,
             value: utxo.value,
             creation_id: utxo.creation_id,
             owner: utxo.address,
-            // Copy secret bytes into the input witness slot.
-            // The original in data.spend_secrets is still live for prove_tx.
-            spend_secret: SpendSecret(secret.0),
+            // Transitional field removed in Slice B. Production bodies carry
+            // only the canonical non-witness zero value already used by the
+            // public decoder; the real secret lives solely in OwnerAuthWitness.
+            spend_secret: SpendSecret([0u8; 32]),
             valid: true,
         })
         .collect();
@@ -347,8 +371,7 @@ pub fn build_and_prove_tx(
     // -----------------------------------------------------------------------
     // Assemble TxBody and run wallet authorization generation.
     //
-    // spend_secrets is consumed here; SpendSecret's ZeroizeOnDrop impl
-    // ensures the raw key material is cleared from memory when prove_tx returns.
+    // owner_auth_witness is consumed here and zeroized when proving returns.
     // -----------------------------------------------------------------------
     let body = TxBody {
         shape: data.shape,
@@ -359,8 +382,8 @@ pub fn build_and_prove_tx(
         is_coinbase: false,
     };
 
-    let bundle =
-        prove_tx(&body, data.spend_secrets).map_err(|e| BuildError::ProveFailed(e.to_string()))?;
+    let bundle = prove_tx(&body, data.owner_auth_witness)
+        .map_err(|e| BuildError::ProveFailed(e.to_string()))?;
 
     let authorization_bytes = bundle
         .to_bytes()
@@ -370,13 +393,10 @@ pub fn build_and_prove_tx(
     // Assemble the minimal TxIntent. A second claims/slot copy would be
     // redundant and malleable; validators derive it from `body`.
     // -----------------------------------------------------------------------
-    let intent = TxIntent {
-        tx_body: body,
-        tx_body_hash,
-        authorization_bytes,
-    };
+    let intent = TxIntent::new(body, authorization_bytes);
+    debug_assert_eq!(intent.txid(), tx_body_hash);
 
-    Ok((tx_body_hash.0, intent.to_bytes()))
+    Ok((intent.txid().0, intent.to_bytes()))
 }
 
 #[cfg(test)]
@@ -448,6 +468,34 @@ mod tests {
                 max: 25
             }
         ));
+    }
+
+    #[test]
+    fn standard_builder_keeps_secret_only_in_owner_witness() {
+        let (_dir, wallet) = wallet_with_utxos(1, 20_000);
+        let raw_secret = wallet.spend_secret_for(0).0;
+        let data = extract_for(&wallet, 10_000, 1_000).unwrap();
+
+        let (txid, intent_bytes) =
+            build_and_prove_tx([0xA7; 32], 10_000, 1_000, data).expect("prove standard wallet tx");
+        let intent = TxIntent::from_bytes(&intent_bytes).expect("decode standard intent");
+
+        assert_eq!(intent.txid().0, txid);
+        assert!(intent
+            .tx_body
+            .inputs
+            .iter()
+            .all(|input| input.spend_secret == SpendSecret([0u8; 32])));
+        assert!(
+            !intent_bytes
+                .windows(raw_secret.len())
+                .any(|window| window == raw_secret),
+            "public intent serialized the active owner's spend secret"
+        );
+        let bundle = noid_gkr::WalletAuthorizationBundle::from_bytes(&intent.authorization_bytes)
+            .expect("decode standard authorization bundle");
+        noid_gkr::verify_wallet_authorization(&intent.tx_body, &bundle)
+            .expect("verify standard authorization bundle");
     }
 
     #[test]

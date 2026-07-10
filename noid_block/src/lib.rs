@@ -5,7 +5,7 @@
 //!
 //! Current block validity is:
 //! - exact public transaction predicates reconstructed from `TxBody`;
-//! - one owner-batched authorization proof per non-coinbase transaction;
+//! - one single-owner authorization proof per non-coinbase transaction;
 //! - exact authenticated UTXO state transition.
 
 pub mod accepted_block_batch;

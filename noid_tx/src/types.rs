@@ -200,6 +200,18 @@ pub struct TxBody {
 pub const ANCHOR_DEPTH: u64 = 144;
 
 impl TxBody {
+    /// Clear the transitional per-input witness placeholders before a body is
+    /// placed in a public transaction container.
+    ///
+    /// `TxInput::spend_secret` exists only until the fixed Tx8x2 cutover. No
+    /// public constructor or byte representation may retain a caller-provided
+    /// value in that field.
+    pub(crate) fn clear_transitional_spend_secrets(&mut self) {
+        for input in &mut self.inputs {
+            input.spend_secret = SpendSecret([0u8; 32]);
+        }
+    }
+
     /// Construct a standard 4-input/8-output transaction body.
     pub fn standard(
         epoch_anchor: Digest,
@@ -228,10 +240,91 @@ impl TxBody {
         self.shape.max_outputs()
     }
 
-    /// Number of real spend inputs (`valid = true`).
+    /// Canonical liveness bitmap for the transitional body layout.
+    ///
+    /// Input bit `i` and output bit `shape.max_inputs() + j` are set exactly
+    /// when the corresponding record is live.  Consumers should use this
+    /// accessor rather than read the transitional per-record `valid` fields;
+    /// the final fixed body stores this bitmap directly.
+    #[inline]
+    pub fn validity_bitmap(&self) -> u128 {
+        crate::body_hash::validity_bits_for_shape(self.shape, &self.inputs, &self.outputs)
+    }
+
+    /// Whether input position `index` is live. Out-of-range positions are
+    /// always dead.
+    #[inline]
+    pub fn input_is_live(&self, index: usize) -> bool {
+        self.inputs.get(index).is_some_and(|input| input.valid)
+    }
+
+    /// Whether output position `index` is live. Out-of-range positions are
+    /// always dead.
+    #[inline]
+    pub fn output_is_live(&self, index: usize) -> bool {
+        self.outputs.get(index).is_some_and(|output| output.valid)
+    }
+
+    /// Live inputs in canonical transaction order.
+    #[inline]
+    pub fn live_inputs(&self) -> impl Iterator<Item = &TxInput> {
+        self.inputs.iter().filter(|input| input.valid)
+    }
+
+    /// Live outputs in canonical transaction order.
+    #[inline]
+    pub fn live_outputs(&self) -> impl Iterator<Item = &TxOutput> {
+        self.outputs.iter().filter(|output| output.valid)
+    }
+
+    /// Number of live spend inputs.
+    #[inline]
+    pub fn live_input_count(&self) -> usize {
+        self.live_inputs().count()
+    }
+
+    /// Number of live outputs.
+    #[inline]
+    pub fn live_output_count(&self) -> usize {
+        self.live_outputs().count()
+    }
+
+    /// The sole owner of all live inputs, or the zero address when there are
+    /// no live inputs (the canonical coinbase/empty value).
+    ///
+    /// Body semantic validation separately rejects bodies containing more
+    /// than one live owner. This accessor deliberately has the same simple
+    /// return type as the final fixed `input_owner` field.
+    #[inline]
+    pub fn input_owner(&self) -> Address {
+        self.live_inputs()
+            .next()
+            .map_or(Address([0u8; 32]), |input| input.owner)
+    }
+
+    /// Canonical body hash, which is the transaction id.
+    #[inline]
+    pub fn txid(&self) -> TxBodyHash {
+        crate::body_hash::hash_tx_body_for_shape(
+            self.shape,
+            &self.epoch_anchor,
+            self.fee,
+            &self.inputs,
+            &self.outputs,
+            self.is_coinbase,
+        )
+    }
+
+    /// Commitment to the live state claims in canonical transaction order.
+    #[inline]
+    pub fn claims_commitment(&self) -> Digest {
+        crate::claims::compute_claims_commitment(&self.inputs, &self.outputs)
+    }
+
+    /// Backwards-compatible alias for [`Self::live_input_count`].
     #[inline]
     pub fn valid_input_count(&self) -> usize {
-        self.inputs.iter().filter(|i| i.valid).count()
+        self.live_input_count()
     }
 }
 
@@ -240,6 +333,25 @@ impl TxBody {
 pub struct Transaction {
     pub body: TxBody,
     pub tx_body_hash: TxBodyHash,
+}
+
+impl Transaction {
+    /// Construct a transaction with the canonical body hash.
+    #[inline]
+    pub fn new(mut body: TxBody) -> Self {
+        body.clear_transitional_spend_secrets();
+        let tx_body_hash = body.txid();
+        Self { body, tx_body_hash }
+    }
+
+    /// Canonical transaction id derived from the body.
+    ///
+    /// The transitional struct still carries `tx_body_hash` for consumer
+    /// compatibility, but this accessor never trusts that duplicate field.
+    #[inline]
+    pub fn txid(&self) -> TxBodyHash {
+        self.body.txid()
+    }
 }
 
 /// Custom Debug for TxInput: spend_secret is redacted to prevent
@@ -291,5 +403,103 @@ mod tests {
             output.commitment_with_creation_id(0),
             output.commitment_with_creation_id(1)
         );
+    }
+
+    #[test]
+    fn stable_body_accessors_project_transitional_layout() {
+        let owner = Address([0x31; 32]);
+        let live_input = |slot_index, value| TxInput {
+            slot_index,
+            value,
+            creation_id: u64::from(slot_index) + 10,
+            owner,
+            spend_secret: SpendSecret([0xA5; 32]),
+            valid: true,
+        };
+        let live_output = |slot_index, value| TxOutput {
+            slot_index,
+            value,
+            owner: Address([0x42; 32]),
+            valid: true,
+        };
+        let body = TxBody::standard(
+            [0x11; 32],
+            3,
+            vec![live_input(1, 8), TxInput::dummy(), live_input(3, 5)],
+            vec![live_output(4, 7), TxOutput::dummy(), live_output(6, 3)],
+            false,
+        );
+
+        assert_eq!(body.validity_bitmap(), 0b0101_0101);
+        assert!(body.input_is_live(0));
+        assert!(!body.input_is_live(1));
+        assert!(body.input_is_live(2));
+        assert!(!body.input_is_live(99));
+        assert!(body.output_is_live(0));
+        assert!(!body.output_is_live(1));
+        assert!(body.output_is_live(2));
+        assert!(!body.output_is_live(99));
+        assert_eq!(
+            body.live_inputs()
+                .map(|input| input.slot_index)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert_eq!(
+            body.live_outputs()
+                .map(|output| output.slot_index)
+                .collect::<Vec<_>>(),
+            vec![4, 6]
+        );
+        assert_eq!(body.live_input_count(), 2);
+        assert_eq!(body.valid_input_count(), 2);
+        assert_eq!(body.live_output_count(), 2);
+        assert_eq!(body.input_owner(), owner);
+        assert_eq!(
+            body.claims_commitment(),
+            crate::compute_claims_commitment(&body.inputs, &body.outputs)
+        );
+        assert_eq!(
+            body.txid(),
+            crate::hash_tx_body_for_shape(
+                body.shape,
+                &body.epoch_anchor,
+                body.fee,
+                &body.inputs,
+                &body.outputs,
+                body.is_coinbase,
+            )
+        );
+    }
+
+    #[test]
+    fn public_transaction_constructor_canonicalizes_secret_and_hash() {
+        let body = TxBody::standard(
+            [0x73; 32],
+            0,
+            vec![TxInput {
+                slot_index: 9,
+                value: 12,
+                creation_id: 4,
+                owner: Address([0x29; 32]),
+                spend_secret: SpendSecret([0xE7; 32]),
+                valid: true,
+            }],
+            vec![],
+            false,
+        );
+        let expected_txid = body.txid();
+        let transaction = Transaction::new(body);
+
+        assert_eq!(
+            transaction.body.inputs[0].spend_secret,
+            SpendSecret([0; 32])
+        );
+        assert_eq!(transaction.tx_body_hash, expected_txid);
+        assert_eq!(transaction.txid(), expected_txid);
+
+        let mut stale = transaction;
+        stale.tx_body_hash = TxBodyHash([0xFF; 32]);
+        assert_eq!(stale.txid(), expected_txid);
     }
 }

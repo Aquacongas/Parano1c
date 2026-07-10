@@ -809,6 +809,7 @@ mod tests {
     use super::*;
     use crate::authorization::verify_authorization_batch_native_with_traces;
     use noid_chain::{Block, BlockHeader};
+    use noid_gkr::OwnerAuthWitness;
     use noid_poseidon2b::channel::Poseidon2bChannel;
     use noid_poseidon2b::primitives::{derive_address, Address, SpendSecret};
     use noid_tx::{hash_tx_body_for_shape, Transaction, TxBody, TxInput, TxOutput, TxShape};
@@ -863,7 +864,7 @@ mod tests {
             body.is_coinbase,
         );
         let tx = Transaction { body, tx_body_hash };
-        let proof = noid_gkr::prove_wallet_authorization(&tx.body, vec![secret])
+        let proof = noid_gkr::prove_wallet_authorization(&tx.body, OwnerAuthWitness::new(secret))
             .expect("wallet auth")
             .proof;
         let block = Block {

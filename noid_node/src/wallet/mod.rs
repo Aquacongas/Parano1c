@@ -3,11 +3,13 @@
 
 //! Built-in wallet for the `paranoid` daemon.
 //!
-//! The wallet lives inside the daemon process. `SpendSecret` is:
-//! 1. Generated randomly on first start
-//! 2. Stored on disk in plaintext format (no password required for full nodes)
-//! 3. Decrypted into memory at startup
-//! 4. Zeroized from memory on daemon exit
+//! The wallet lives inside the daemon process. The master secret is generated
+//! once and stored by the keystore; the active address's `SpendSecret` is
+//! derived locally just in time for proving. Secret material is:
+//! 1. Kept in the wallet keystore (plaintext mode currently has no password)
+//! 2. Loaded/derived only inside the daemon
+//! 3. Moved into one zeroizing `OwnerAuthWitness` per transaction
+//! 4. Zeroized when its owner object is dropped
 //! 5. **NEVER transmitted over the network** — not in RPC responses,
 //!    not in P2P messages, not in `TxIntent`
 //!
@@ -18,7 +20,7 @@
 //!   2. get slot hints from local chain state (empty slots for outputs)
 //!   3. builder::build_and_prove_tx(...)
 //!      a. compute tx_body_hash
-//!      b. prove_tx(body, secrets) → WalletAuthorizationBundle
+//!      b. prove_tx(body, one_owner_witness) → WalletAuthorizationBundle
 //!      c. assemble TxIntent bytes
 //!   4. submit to own mempool
 //! ```

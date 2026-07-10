@@ -9,10 +9,11 @@ use noid_poseidon2b::primitives::SpendSecret;
 use noid_tx::{canonical_owner_auth, validate_public_tx_logic, PublicLogicError, TxBody, TxShape};
 use serde::{Deserialize, Serialize};
 
+use crate::owner_auth::owner_auth_trace_inputs_from_body_and_secret;
 use crate::{
-    owner_auth_gkr_channel, owner_auth_inputs_from_body_and_live_secrets,
-    owner_auth_public_from_statement, prove_owner_auth_killshot, verify_owner_auth_killshot,
-    OwnerAuthCircuit, OwnerAuthProofKillShot, OwnerAuthPublicInputs, OwnerAuthStatementError,
+    owner_auth_gkr_channel, owner_auth_public_from_statement, prove_owner_auth_killshot,
+    verify_owner_auth_killshot, OwnerAuthCircuit, OwnerAuthProofKillShot, OwnerAuthPublicInputs,
+    OwnerAuthStatementError,
 };
 
 pub const MAX_STANDARD_AUTHORIZATION_BYTES: usize = 192 * 1024;
@@ -22,6 +23,32 @@ pub const MAX_AUTHORIZATION_BUNDLE_BYTES: usize = MAX_SWEEP_AUTHORIZATION_BYTES;
 /// shape-specific count is derived from the canonical body at production
 /// boundaries and will be pinned to the validity bitmap by ActionSurface C'.
 pub const MAX_AUTHORIZATION_LIVE_INPUTS: u8 = TxShape::Sweep25x2.max_inputs() as u8;
+
+/// Wallet-local authority to prove one transaction owned by one address.
+///
+/// The public transaction carries no proving secret.  A wallet constructs this
+/// value from its active derived secret and moves it directly into
+/// [`prove_wallet_authorization`].  The inner secret is private, the type is
+/// intentionally neither `Clone`, `Debug`, nor serializable, and all retained
+/// bytes are zeroized when the value leaves scope.
+#[derive(zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
+pub struct OwnerAuthWitness {
+    spend_secret: SpendSecret,
+}
+
+impl OwnerAuthWitness {
+    #[inline]
+    pub fn new(spend_secret: SpendSecret) -> Self {
+        Self { spend_secret }
+    }
+
+    /// The only raw-secret access point.  It is module-private so callers can
+    /// hand proving authority in, but cannot recover or retain the secret.
+    #[inline]
+    fn spend_secret(&self) -> &SpendSecret {
+        &self.spend_secret
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct CanonicalAuthorizationStatement {
@@ -142,10 +169,6 @@ impl std::error::Error for AuthorizationDecodeError {}
 pub enum ProveAuthorizationError {
     PublicLogic(PublicLogicError),
     OwnerAuthStatement(String),
-    SecretCount {
-        expected: usize,
-        actual: usize,
-    },
     BoundaryMismatch {
         input_index: usize,
         field: &'static str,
@@ -173,15 +196,14 @@ pub enum VerifyAuthorizationError {
     AuthProof,
 }
 
-/// Fail-closed production statement boundary. The low-level owner-auth GKR
-/// remains generic over multiple owner groups, but every consensus-facing
-/// authorization statement is the canonical one-owner layout. The live count
-/// is transitional body-derived metadata until C' pins it to the body bitmap.
+/// Fail-closed production statement boundary. Every consensus-facing
+/// authorization statement uses the fixed one-owner layout. The live count is
+/// transitional body-derived metadata until C' pins it to the body bitmap.
 pub fn validate_authorization_statement(
     statement: &CanonicalAuthorizationStatement,
 ) -> Result<(), VerifyAuthorizationError> {
-    let one_owner_layout = crate::OwnerAuthLayout::for_owner_count(1)
-        .expect("the protocol one-owner layout is valid");
+    let one_owner_layout =
+        crate::OwnerAuthLayout::for_owner_count(1).expect("the protocol one-owner layout is valid");
     if statement.public.layout != one_owner_layout || statement.public.expected_address.len() != 1 {
         return Err(VerifyAuthorizationError::OwnerAuthStatement(
             "production owner-auth statement must use the canonical one-owner layout".to_string(),
@@ -217,10 +239,10 @@ impl std::error::Error for VerifyAuthorizationError {}
 
 pub fn prove_wallet_authorization(
     body: &TxBody,
-    spend_secrets: Vec<SpendSecret>,
+    witness: OwnerAuthWitness,
 ) -> Result<WalletAuthorizationBundle, ProveAuthorizationError> {
     validate_public_tx_logic(body)?;
-    let auth_inputs = owner_auth_inputs_from_body_and_live_secrets(body, &spend_secrets)
+    let auth_inputs = owner_auth_trace_inputs_from_body_and_secret(body, witness.spend_secret())
         .map_err(map_owner_auth_prove_error)?;
     let circuit = OwnerAuthCircuit::build(auth_inputs.layout);
     let mut channel = owner_auth_gkr_channel();
@@ -308,19 +330,10 @@ pub fn verify_authorization_statement_proof(
 
 fn map_owner_auth_prove_error(err: OwnerAuthStatementError) -> ProveAuthorizationError {
     match err {
-        OwnerAuthStatementError::SecretCountMismatch { expected, actual } => {
-            ProveAuthorizationError::SecretCount { expected, actual }
-        }
         OwnerAuthStatementError::SecretMismatch { input_position } => {
             ProveAuthorizationError::BoundaryMismatch {
                 input_index: input_position,
                 field: "owner_auth",
-            }
-        }
-        OwnerAuthStatementError::RepeatedOwnerSecretMismatch { input_position } => {
-            ProveAuthorizationError::BoundaryMismatch {
-                input_index: input_position,
-                field: "repeated_owner_secret",
             }
         }
         other => ProveAuthorizationError::OwnerAuthStatement(other.to_string()),
@@ -409,8 +422,9 @@ mod tests {
 
     fn prove_standard_fixture() -> (TxBody, SpendSecret, WalletAuthorizationBundle) {
         let (body, secret) = standard_body_and_secret();
-        let bundle = prove_wallet_authorization(&body, vec![SpendSecret(secret.0)])
-            .expect("prove standard authorization");
+        let witness = OwnerAuthWitness::new(SpendSecret(secret.0));
+        let bundle =
+            prove_wallet_authorization(&body, witness).expect("prove standard authorization");
         verify_wallet_authorization(&body, &bundle).expect("verify standard authorization");
         (body, secret, bundle)
     }
@@ -452,27 +466,20 @@ mod tests {
     }
 
     #[test]
-    fn missing_extra_or_wrong_secret_rejects_before_proving() {
+    fn wrong_secret_rejects_before_proving() {
         let (mut body, secret) = standard_body_and_secret();
 
         assert!(matches!(
-            prove_wallet_authorization(&body, vec![]),
-            Err(ProveAuthorizationError::SecretCount {
-                expected: 1,
-                actual: 0,
-            })
-        ));
-        assert!(matches!(
-            prove_wallet_authorization(&body, vec![SpendSecret(secret.0), mk_secret(8)]),
-            Err(ProveAuthorizationError::SecretCount {
-                expected: 1,
-                actual: 2,
+            prove_wallet_authorization(&body, OwnerAuthWitness::new(mk_secret(8))),
+            Err(ProveAuthorizationError::BoundaryMismatch {
+                input_index: 0,
+                field: "owner_auth",
             })
         ));
 
         body.inputs[0].owner = Address([0x55; 32]);
         assert!(matches!(
-            prove_wallet_authorization(&body, vec![SpendSecret(secret.0)]),
+            prove_wallet_authorization(&body, OwnerAuthWitness::new(SpendSecret(secret.0)),),
             Err(ProveAuthorizationError::BoundaryMismatch {
                 input_index: 0,
                 field: "owner_auth",
@@ -481,10 +488,10 @@ mod tests {
     }
 
     #[test]
-    fn repeated_owner_uses_one_owner_group() {
+    fn repeated_inputs_use_fixed_owner_layout() {
         let (body, secret) = repeated_owner_body_and_secret();
         let bundle =
-            prove_wallet_authorization(&body, vec![SpendSecret(secret.0), SpendSecret(secret.0)])
+            prove_wallet_authorization(&body, OwnerAuthWitness::new(SpendSecret(secret.0)))
                 .expect("prove repeated-owner authorization");
         verify_wallet_authorization(&body, &bundle).expect("verify repeated-owner authorization");
 
@@ -493,6 +500,12 @@ mod tests {
         let statement =
             canonical_authorization_statement_from_body(0, public.tx_body_hash, &body).unwrap();
         assert_eq!(statement.live_input_count, 2);
+    }
+
+    #[test]
+    fn owner_auth_witness_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<OwnerAuthWitness>();
     }
 
     #[test]
@@ -530,9 +543,8 @@ mod tests {
     fn production_statement_rejects_live_count_outside_transitional_cap() {
         let (body, _, bundle) = prove_standard_fixture();
         let public = owner_auth_public_from_body(&body).expect("public owner auth");
-        let statement =
-            canonical_authorization_statement_from_body(0, public.tx_body_hash, &body)
-                .expect("canonical authorization statement");
+        let statement = canonical_authorization_statement_from_body(0, public.tx_body_hash, &body)
+            .expect("canonical authorization statement");
 
         for bad_count in [0, MAX_AUTHORIZATION_LIVE_INPUTS + 1] {
             let mut bad = statement.clone();

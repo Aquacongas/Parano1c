@@ -62,7 +62,6 @@ pub fn round_kind(r: usize) -> RoundKind {
 ///
 /// Indexing convention for each field below: `[row][lane]`, with
 /// `row ∈ 0..=N_ROUNDS` and `lane ∈ 0..STATE_SIZE`.
-#[derive(Debug, Clone)]
 pub struct PermLayerWitness {
     /// Round-entry state. `state[0]` is the post-initial-MDS state;
     /// `state[N_ROUNDS]` is the permutation output.
