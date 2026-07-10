@@ -1421,7 +1421,9 @@ mod tests {
                 &fixture.certificate_batch_statement,
                 &bad_digest_fields,
             ),
-            Err(HistoryCheckpointIvcChunkCoreError::AcceptedClaimBatchDigestMismatch)
+            Err(HistoryCheckpointIvcChunkCoreError::BadAcceptedClaimBatchDigest(
+                AcceptedClaimBatchDigestError::NonCanonicalHeader
+            ))
         ));
 
         let mut bad_pcs_params = prove_history_checkpoint_ivc_chunk_core(

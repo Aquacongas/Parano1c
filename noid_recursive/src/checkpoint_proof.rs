@@ -1899,36 +1899,13 @@ fn absorb_address(sponge: &mut Poseidon2bSponge, address: &Address) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pow_header::{HeaderWitness, EXPANSION_WINDOW_LEN};
+    use crate::pow_header::HeaderWitness;
     use noid_chain::consensus::difficulty::{add_work, block_work};
-    use noid_chain::consensus::params::{BLOCK_TIME, MAX_TARGET, MEDIAN_TIME_BLOCKS};
+    use noid_chain::consensus::params::{BLOCK_TIME, MAX_TARGET};
     use noid_chain::consensus::{genesis_header, GENESIS_TIMESTAMP};
     use noid_chain::header_anchor::HeaderChainAnchor;
     use noid_chain::BlockHeader;
     use noid_poseidon2b::primitives::Address;
-
-    fn consensus(anchor: &HeaderChainAnchor) -> RecursiveConsensusState {
-        let mut mtp_timestamps = [0u64; MEDIAN_TIME_BLOCKS];
-        mtp_timestamps[0] = 1_767_225_600 + anchor.height;
-        let mut expansion_counts = [0u64; EXPANSION_WINDOW_LEN];
-        expansion_counts[0] = anchor.active_slot_count;
-        RecursiveConsensusState {
-            height: anchor.height,
-            block_id: anchor.block_id,
-            state_root: anchor.state_root,
-            cumulative_chainwork: anchor.cumulative_chainwork,
-            log_slots: anchor.log_slots,
-            active_slot_count: anchor.active_slot_count,
-            alloc_counter: anchor.alloc_counter,
-            asert_anchor_height: 0,
-            asert_anchor_timestamp: 1_767_225_600,
-            asert_anchor_target: [0x7f; 32],
-            mtp_timestamps,
-            mtp_len: 1,
-            expansion_counts,
-            expansion_len: 1,
-        }
-    }
 
     fn head_record() -> StoredHistoryCheckpointHeadRecord {
         let (
@@ -1985,16 +1962,10 @@ mod tests {
 
     fn batch_summary() -> HistoryCheckpointBatchSummary {
         let proof = proof();
-        HistoryCheckpointBatchSummary {
-            batch_len: HISTORY_CHECKPOINT_BATCH_TARGET_BLOCKS,
-            start_consensus: consensus(&proof.start_anchor),
-            end_consensus: consensus(&proof.end_anchor),
-            start_accumulator: proof.start_accumulator,
-            end_accumulator: proof.end_accumulator,
-            start_anchor: proof.start_anchor,
-            end_anchor: proof.end_anchor,
-            accepted_claim_batch_digest: [0x88; 32],
-        }
+        decode_history_checkpoint_recursive_head_proof(&proof)
+            .expect("fixture recursive head decodes")
+            .step_statement
+            .batch_summary
     }
 
     fn step_statement_pair() -> (
@@ -2048,18 +2019,11 @@ mod tests {
         );
         let start_consensus = consensus.clone();
         let start_accumulator = genesis_accumulator();
-        let start_anchor = HeaderChainAnchor {
-            height: start_consensus.height,
-            block_id: start_consensus.block_id,
-            state_root: start_consensus.state_root,
-            tx_root: start_header.tx_root,
-            miner_address: start_header.miner_address,
-            log_slots: start_consensus.log_slots,
-            active_slot_count: start_consensus.active_slot_count,
-            alloc_counter: start_consensus.alloc_counter,
-            projection_root: [0x70; 32],
-            cumulative_chainwork: start_consensus.cumulative_chainwork,
-        };
+        let start_anchor = noid_chain::header_anchor::compute_header_chain_anchor(
+            std::iter::once(&start_header),
+            start_consensus.cumulative_chainwork,
+        )
+        .expect("canonical genesis anchor");
 
         let chunk_len = HISTORY_CHECKPOINT_BATCH_TARGET_BLOCKS as usize;
         let mut accumulator = start_accumulator.clone();

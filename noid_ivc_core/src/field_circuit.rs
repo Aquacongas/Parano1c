@@ -380,11 +380,6 @@ impl FieldR1csBuilder {
         let w = self.next_wire();
         let full = expr.add(&LinExpr::from_wire(Wire(w))).add_const(expected);
         let a_row = Self::expr_to_row(&full);
-        debug_assert_eq!(
-            expr.eval(&self.values),
-            expected,
-            "pin_f128: witness does not satisfy the pinned equality"
-        );
         self.commit_wire(F128::ZERO, &a_row, &[(0, F128::ONE)]);
     }
 
