@@ -419,6 +419,7 @@ pub fn verify_full_accepted_block_batch_native(
                     block_index: index,
                     tx_index: statement.tx_index,
                     tx_body_hash: statement.tx_body_hash,
+                    live_input_count: statement.live_input_count,
                     public: statement.public,
                 });
                 authorization_witnesses.push(auth_proof.clone());

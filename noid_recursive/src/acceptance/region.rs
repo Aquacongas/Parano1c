@@ -23,8 +23,8 @@ use noid_fri_binius::capsule::{
 };
 use noid_gkr::auth_pcs::AuthMleOpeningProof;
 use noid_gkr::owner_auth::{
-    OwnerAuthProofKillShot, OwnerAuthPublicInputs, OWNER_AUTH_BOUNDARY_DOMAIN_TAG,
-    OWNER_AUTH_GKR_DOMAIN_TAG, OWNER_AUTH_INPUT_PAD_SENTINEL, OWNER_AUTH_STATE_ROUND_DEGREE,
+    OwnerAuthLayout, OwnerAuthProofKillShot, OwnerAuthPublicInputs, OWNER_AUTH_BOUNDARY_DOMAIN_TAG,
+    OWNER_AUTH_GKR_DOMAIN_TAG, OWNER_AUTH_STATE_ROUND_DEGREE,
 };
 use noid_ivc_core::deep_chain::schedule::{flat_of_tower_u128, TranscriptOp};
 use noid_ivc_core::field::F128;
@@ -157,27 +157,6 @@ pub fn capsule_pcs_channel_schedule(
 /// commit; the differential gate catches any divergence.
 const AUTH_PCS_COMMIT_TAG: u128 = 0xA07D_6B12_C011_17ED;
 
-/// Absorb one per-input statement vector, padded to `padded_len`: the live
-/// length, then the live values, then the pad sentinel for each remaining
-/// slot. The live length and the boundary between live values and sentinels
-/// VARY within a shape class (different live-input counts), so every entry is
-/// a witness-data lane; only the total count (`1 + padded_len`) is class-fixed.
-fn push_padded_input_vector(
-    s: &mut ChannelSchedule,
-    lanes: &mut Vec<Option<u128>>,
-    values: impl ExactSizeIterator<Item = u128>,
-    padded_len: usize,
-) {
-    let live_len = values.len();
-    lanes.push(s.data_lane(Block128::from(live_len as u128)));
-    for v in values {
-        lanes.push(s.data_lane(Block128::from(v)));
-    }
-    for _ in live_len..padded_len {
-        lanes.push(s.data_lane(Block128::from(OWNER_AUTH_INPUT_PAD_SENTINEL)));
-    }
-}
-
 /// The owner-authorization killshot channel schedule (the KSCHANNL
 /// `Poseidon2bChannel` transcript of `verify_owner_auth_killshot`, up to but
 /// NOT including the PCS opening — that runs on a separate FRICHANL channel
@@ -185,7 +164,7 @@ fn push_padded_input_vector(
 ///
 /// Mirrors, in order (`owner_auth::verify_owner_auth_killshot_with_claims`):
 /// the channel init domain tag; the owner public boundary (layout scalars,
-/// tx-body hash, three padded input vectors, per-slot addresses); the auth
+/// tx-body hash, per-slot addresses); the auth
 /// MLE commitment absorb; the unified state sumcheck (`rho`, per-round
 /// degree-10 oracle absorb + fold, `state_at_r` + lane decomposition); the
 /// shift sumcheck (`delta`, per-round 2-eval absorb + fold, `state_at_r2`);
@@ -193,18 +172,20 @@ fn push_padded_input_vector(
 /// absorb + fold, `state_at_r`); the batch-eval reduction (3 claim
 /// length/value binds, one α draw, per-round absorb + fold).
 ///
-/// Class-fixity: `slot_bits`, `num_vars`, `padded_slots`, `padded_input_len`,
-/// all domain tags, the commitment scalars and constraint count are Const
-/// (fixed by the shape class); `owner_count`, `live_slots`, the vector
-/// live-lengths / values / sentinels, addresses, cap hashes, all round-poly
-/// coefficients and reduced state values are witness data (they vary within a
-/// class — 3 vs 4 owners share a class). This matches the in-trace owner-auth
-/// verifier's witness/constant split.
+/// Class-fixity: the exact layout scalars, all domain tags, the commitment
+/// scalars and constraint count are Const. Addresses, cap hashes, all
+/// round-poly coefficients and reduced state values are witness data.
 pub fn owner_auth_channel_schedule(
     proof: &OwnerAuthProofKillShot,
     inputs: &OwnerAuthPublicInputs,
 ) -> ChannelSchedule {
     let layout = inputs.layout;
+    assert_eq!(
+        OwnerAuthLayout::for_owner_count(layout.owner_count).ok(),
+        Some(layout),
+        "owner-auth schedule requires a canonical layout"
+    );
+    assert_eq!(inputs.expected_address.len(), layout.owner_count);
     let num_vars = layout.num_vars;
     // Class-shape assertions: the schedule (op structure) is a function of
     // these counts alone.
@@ -226,43 +207,24 @@ pub fn owner_auth_channel_schedule(
     // whole channel from `capacity_iv(TAG_KSCHANNL)`).
     let mut lanes: Vec<Option<u128>> = vec![
         Some(OWNER_AUTH_GKR_DOMAIN_TAG),
-        s.data_lane(Block128::from(layout.owner_count as u128)),
-        s.data_lane(Block128::from(layout.live_slots as u128)),
+        Some(layout.owner_count as u128),
+        Some(layout.live_slots as u128),
         Some(layout.slot_bits as u128),
         Some(num_vars as u128),
         Some(layout.padded_slots as u128),
     ];
     lanes.push(s.data_lane(inputs.tx_body_hash[0]));
     lanes.push(s.data_lane(inputs.tx_body_hash[1]));
-    lanes.push(Some(inputs.padded_input_len as u128));
-    push_padded_input_vector(
-        &mut s,
-        &mut lanes,
-        inputs.live_input_positions.iter().map(|&p| p as u128),
-        inputs.padded_input_len,
-    );
-    push_padded_input_vector(
-        &mut s,
-        &mut lanes,
-        inputs.live_slot_indices.iter().map(|&x| x as u128),
-        inputs.padded_input_len,
-    );
-    push_padded_input_vector(
-        &mut s,
-        &mut lanes,
-        inputs.input_to_group.iter().map(|&g| g as u128),
-        inputs.padded_input_len,
-    );
     // Addresses for every padded slot (ghost slots >= owner_count as zero
     // pairs, selected by liveness in the region).
     for slot in 0..layout.padded_slots {
-        let pair = inputs
-            .expected_address
-            .get(slot)
-            .copied()
-            .unwrap_or([Block128::from(0u128); 2]);
-        lanes.push(s.data_lane(pair[0]));
-        lanes.push(s.data_lane(pair[1]));
+        if let Some(pair) = inputs.expected_address.get(slot) {
+            lanes.push(s.data_lane(pair[0]));
+            lanes.push(s.data_lane(pair[1]));
+        } else {
+            lanes.push(Some(0));
+            lanes.push(Some(0));
+        }
     }
 
     // Step 2: auth MLE commitment absorb (tag, log_rows, cap length, cap

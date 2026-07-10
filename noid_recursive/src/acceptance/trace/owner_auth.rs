@@ -63,33 +63,20 @@ fn owner_mds_coeff(round: usize, i: usize, j: usize) -> Block128 {
 // Statement / proof wire types
 // ---------------------------------------------------------------------------
 
-/// Trace twin of `OwnerAuthPublicInputs`, fully witness-carried: only the
-/// CLASS parameters — `slot_bits`/`num_vars`/`padded_slots` (the GKR round
-/// structure) and `padded_input_len` (the shape's input capacity) — shape
-/// the matrix. Everything content-dependent (owner count, live-input count,
-/// the three index vectors including their sentinel tails, the padded
-/// address pairs including ghost zeros) travels as witness wires, so two
-/// statements of the same class produce byte-identical matrices.
+/// Trace twin of the minimal `OwnerAuthPublicInputs`. The exact layout is
+/// fixed metadata; only the transaction-body hash and owner address pairs are
+/// statement wires. Production uses the one-owner layout.
 ///
 /// Statement-binding obligations (the block assembly must pin these wires
 /// to values derived from the transaction statement): `tx_body_hash`,
-/// `owner_count` (the liveness bits are then forced by their boolean +
-/// monotone + sum constraints), `live_len`, every entry of the three input
-/// vectors (live entries to the canonical statement values, tail entries to
-/// the pad sentinel), and every padded address pair (ghost pairs to zero).
+/// every live address pair. Ghost address pairs are fixed zeros derived from
+/// the layout rather than proof-carried statement data.
 pub struct OwnerAuthPublicInputsTrace {
     pub layout: OwnerAuthLayout,
-    pub padded_input_len: usize,
     pub tx_body_hash: [LinExpr; 2],
-    pub owner_count: LinExpr,
-    pub live_len: LinExpr,
-    pub live_input_positions: Vec<LinExpr>,
-    pub live_slot_indices: Vec<LinExpr>,
-    pub input_to_group: Vec<LinExpr>,
     /// One pair per padded slot; ghost pairs carry zero.
     pub expected_address: Vec<[LinExpr; 2]>,
-    /// Slot-liveness selectors `g_s = [s < owner_count]`: boolean wires,
-    /// monotone (no live slot after a ghost), summing to `owner_count`.
+    /// Slot-liveness selectors derived as constants from the exact layout.
     pub slot_live: Vec<LinExpr>,
 }
 
@@ -97,90 +84,37 @@ impl OwnerAuthPublicInputsTrace {
     pub fn alloc(b: &mut FieldR1csBuilder, native: &OwnerAuthPublicInputs) -> Self {
         // Native `verify_owner_auth_killshot_with_claims` shape checks.
         let layout = native.layout;
+        assert_eq!(
+            OwnerAuthLayout::for_owner_count(layout.owner_count).ok(),
+            Some(layout),
+            "owner-auth trace requires a canonical layout"
+        );
         assert_eq!(native.expected_address.len(), layout.owner_count);
-        assert!(!native.live_input_positions.is_empty());
-        assert_eq!(native.live_slot_indices.len(), native.live_input_positions.len());
-        assert_eq!(native.input_to_group.len(), native.live_input_positions.len());
-        assert!(native.padded_input_len >= native.live_input_positions.len());
-        assert!(native
-            .input_to_group
-            .iter()
-            .all(|&g| g < layout.owner_count));
-
-        let alloc_padded_vector = |b: &mut FieldR1csBuilder, values: Vec<u128>| -> Vec<LinExpr> {
-            (0..native.padded_input_len)
-                .map(|i| {
-                    let v = values
-                        .get(i)
-                        .copied()
-                        .unwrap_or(noid_gkr::owner_auth::OWNER_AUTH_INPUT_PAD_SENTINEL);
-                    alloc_block(b, Block128::from(v))
-                })
-                .collect()
-        };
-
-        let owner_count = alloc_block(b, Block128::from(layout.owner_count as u128));
-        let live_len = alloc_block(
-            b,
-            Block128::from(native.live_input_positions.len() as u128),
-        );
-        let live_input_positions = alloc_padded_vector(
-            b,
-            native.live_input_positions.iter().map(|&p| p as u128).collect(),
-        );
-        let live_slot_indices = alloc_padded_vector(
-            b,
-            native.live_slot_indices.iter().map(|&s| s as u128).collect(),
-        );
-        let input_to_group = alloc_padded_vector(
-            b,
-            native.input_to_group.iter().map(|&g| g as u128).collect(),
-        );
         let expected_address: Vec<[LinExpr; 2]> = (0..layout.padded_slots)
             .map(|slot| {
-                let pair = native
-                    .expected_address
-                    .get(slot)
-                    .copied()
-                    .unwrap_or([Block128::ZERO; 2]);
-                std::array::from_fn(|i| alloc_block(b, pair[i]))
+                if let Some(pair) = native.expected_address.get(slot) {
+                    std::array::from_fn(|i| alloc_block(b, pair[i]))
+                } else {
+                    std::array::from_fn(|_| super::const_block(Block128::ZERO))
+                }
             })
             .collect();
 
-        // Liveness selectors: boolean by allocation; monotone via
-        // g_s · (1 + g_{s-1}) = 0 (char-2 complement). A monotone vector has
-        // exactly one boundary g_s = 1, g_{s+1} = 0 (virtual g_padded = 0),
-        // so Σ_s (g_s + g_{s+1}) · s+1 collapses to the single field element
-        // encoding the live count — an affine unary-to-value binding with no
-        // char-2 carry problem.
+        // The layout is fixed metadata, so live-vs-ghost selectors are
+        // constants rather than malleable witness fields.
         let slot_live: Vec<LinExpr> = (0..layout.padded_slots)
-            .map(|slot| LinExpr::from_wire(b.alloc_bool(slot < layout.owner_count)))
+            .map(|slot| {
+                super::const_block(if slot < layout.owner_count {
+                    Block128::ONE
+                } else {
+                    Block128::ZERO
+                })
+            })
             .collect();
-        for s in 1..slot_live.len() {
-            let prev_ghost = slot_live[s - 1].add(&super::const_block(Block128::ONE));
-            let violation = mul(b, &slot_live[s], &prev_ghost);
-            pin_zero(b, &violation);
-        }
-        let mut unary_value = LinExpr::zero();
-        for s in 0..slot_live.len() {
-            let boundary = if s + 1 < slot_live.len() {
-                slot_live[s].add(&slot_live[s + 1])
-            } else {
-                slot_live[s].clone()
-            };
-            unary_value = unary_value.add(&boundary.scale(flat_of(Block128::from(s as u128 + 1))));
-        }
-        pin_zero(b, &unary_value.add(&owner_count));
 
         Self {
             layout,
-            padded_input_len: native.padded_input_len,
             tx_body_hash: std::array::from_fn(|i| alloc_block(b, native.tx_body_hash[i])),
-            owner_count,
-            live_len,
-            live_input_positions,
-            live_slot_indices,
-            input_to_group,
             expected_address,
             slot_live,
         }
@@ -284,37 +218,20 @@ pub struct PendingAuthPcsObligation {
 // ---------------------------------------------------------------------------
 
 /// Trace twin of `absorb_owner_public_boundary`. Class parameters absorb as
-/// constants; all content absorbs as wires, so the absorb schedule (and the
-/// matrix) depends only on `(slot_bits, padded_input_len)`.
+/// constants; only the hash and address content absorbs as wires.
 fn absorb_owner_public_boundary_trace(
     b: &mut FieldR1csBuilder,
     ch: &mut RawChannelTrace,
     inputs: &OwnerAuthPublicInputsTrace,
 ) {
-    // `live_slots = owner_count * OWNER_AUTH_SLOTS_PER_OWNER` is an INTEGER
-    // product natively; re-absorbing the owner-count wire is only exact
-    // while the multiplier is one.
-    const _: () = assert!(noid_gkr::owner_auth::OWNER_AUTH_SLOTS_PER_OWNER == 1);
-
     let layout = inputs.layout;
-    ch.absorb(b, &inputs.owner_count);
-    ch.absorb(b, &inputs.owner_count);
+    ch.absorb_const_tower(b, layout.owner_count as u128);
+    ch.absorb_const_tower(b, layout.live_slots as u128);
     ch.absorb_const_tower(b, layout.slot_bits as u128);
     ch.absorb_const_tower(b, layout.num_vars as u128);
     ch.absorb_const_tower(b, layout.padded_slots as u128);
     ch.absorb(b, &inputs.tx_body_hash[0]);
     ch.absorb(b, &inputs.tx_body_hash[1]);
-    ch.absorb_const_tower(b, inputs.padded_input_len as u128);
-    for vector in [
-        &inputs.live_input_positions,
-        &inputs.live_slot_indices,
-        &inputs.input_to_group,
-    ] {
-        ch.absorb(b, &inputs.live_len);
-        for entry in vector.iter() {
-            ch.absorb(b, entry);
-        }
-    }
     for pair in &inputs.expected_address {
         ch.absorb(b, &pair[0]);
         ch.absorb(b, &pair[1]);
@@ -873,31 +790,16 @@ mod tests {
         let tx_body_hash = [Block128::from(seed + 7), Block128::from(seed + 8)];
         let expected_address =
             compute_owner_auth_boundary(&circuit, spend_secret.clone(), tx_body_hash);
-        let live_input_positions: Vec<usize> = (0..owner_count).collect();
-        let live_slot_indices: Vec<u32> = (0..owner_count as u32).map(|i| 100 + i).collect();
-        let input_to_group: Vec<usize> = (0..owner_count).collect();
-        let public = OwnerAuthPublicInputs::new(
-            layout,
-            tx_body_hash,
-            live_input_positions,
-            live_slot_indices,
-            input_to_group,
-            expected_address,
-            owner_count.max(4),
-        )
-        .unwrap();
+        let public = OwnerAuthPublicInputs::new(layout, tx_body_hash, expected_address).unwrap();
         let inputs = OwnerAuthInputs::from_parts(&public, spend_secret);
         (inputs, public)
     }
 
-    /// Fixed-matrix class gate. The class is `(slot_bits, padded_input_len)`:
-    /// two statements with different owner counts inside one padded-slot
-    /// tier (3 vs 4 owners at 4 padded slots), different live-input counts,
-    /// positions, slot indices, groupings, secrets and addresses must
-    /// produce byte-identical matrices.
+    /// Production fixed-matrix gate: distinct one-owner statements (different
+    /// secrets, hashes and addresses) produce byte-identical matrices.
     #[test]
     fn fixed_matrix_within_class() {
-        let digest = |seed: u128, owner_count: usize, positions: Vec<usize>, slot_base: u32| {
+        let digest = |seed: u128, owner_count: usize| {
             let layout = OwnerAuthLayout::for_owner_count(owner_count).unwrap();
             let circuit = noid_gkr::owner_auth::OwnerAuthCircuit::build(layout);
             let spend_secret: Vec<[Block128; 2]> = (0..owner_count)
@@ -911,22 +813,8 @@ mod tests {
             let tx_body_hash = [Block128::from(seed + 7), Block128::from(seed + 8)];
             let expected_address =
                 compute_owner_auth_boundary(&circuit, spend_secret.clone(), tx_body_hash);
-            let live_slot_indices: Vec<u32> = (0..positions.len() as u32)
-                .map(|i| slot_base + 3 * i)
-                .collect();
-            let input_to_group: Vec<usize> = (0..positions.len())
-                .map(|i| i.min(owner_count - 1))
-                .collect();
-            let public = OwnerAuthPublicInputs::new(
-                layout,
-                tx_body_hash,
-                positions,
-                live_slot_indices,
-                input_to_group,
-                expected_address,
-                4,
-            )
-            .unwrap();
+            let public =
+                OwnerAuthPublicInputs::new(layout, tx_body_hash, expected_address).unwrap();
             let inputs = OwnerAuthInputs::from_parts(&public, spend_secret);
             let proof = prove(&inputs);
             let mut b = FieldR1csBuilder::new();
@@ -934,13 +822,23 @@ mod tests {
             let (r1cs, _z) = b.build();
             r1cs.statement_digest()
         };
-        // 3 owners / 2 live inputs vs 4 owners / 4 live inputs: same
-        // padded-slot tier (4) and input capacity (4) => same class.
         assert_eq!(
-            digest(11, 3, vec![0, 2], 100),
-            digest(999, 4, vec![0, 1, 2, 3], 55),
+            digest(11, 1),
+            digest(999, 1),
             "owner-auth slot matrix must depend only on the shape class"
         );
+    }
+
+    #[test]
+    fn padded_ghost_address_lanes_are_constants() {
+        let (_, public) = fixture(3, 0x6A05_7A11);
+        assert_eq!(public.layout.padded_slots, 4);
+        let mut b = FieldR1csBuilder::new();
+        let traced = OwnerAuthPublicInputsTrace::alloc(&mut b, &public);
+        for lane in &traced.expected_address[3] {
+            assert!(lane.is_const(), "ghost address lane must not allocate a wire");
+            assert_eq!(lane.constant, flat_of(Block128::ZERO));
+        }
     }
 
     fn prove(inputs: &OwnerAuthInputs) -> OwnerAuthProofKillShot {

@@ -44,14 +44,6 @@ pub const OWNER_AUTH_ELEM_VARS: usize = 2;
 pub const OWNER_AUTH_MIN_SLOT_BITS: usize = 0;
 pub const OWNER_AUTH_MIN_OWNERS: usize = 1;
 pub const OWNER_AUTH_MAX_OWNERS: usize = 25;
-/// Upper bound on the transcript padding width of the per-input statement
-/// vectors (`padded_input_len`): the largest input capacity of any supported
-/// transaction shape.
-pub const OWNER_AUTH_MAX_PADDED_INPUTS: usize = 25;
-/// Sentinel absorbed for padding entries of the per-input statement vectors.
-/// Real entries are small indices, so the all-ones word can never collide.
-pub const OWNER_AUTH_INPUT_PAD_SENTINEL: u128 = u128::MAX;
-
 const ELEM_LO: usize = 0;
 const ELEM_HI: usize = ELEM_LO + OWNER_AUTH_ELEM_VARS;
 const ROUND_LO: usize = ELEM_HI;
@@ -189,59 +181,28 @@ impl OwnerAuthCircuit {
 pub struct OwnerAuthPublicInputs {
     pub layout: OwnerAuthLayout,
     pub tx_body_hash: [Block128; 2],
-    pub live_input_positions: Vec<usize>,
-    pub live_slot_indices: Vec<u32>,
-    pub input_to_group: Vec<usize>,
     pub expected_address: Vec<[Block128; 2]>,
-    /// Transcript padding width for the three per-input vectors (the shape's
-    /// input capacity). The boundary absorb pads each vector to this length
-    /// with [`OWNER_AUTH_INPUT_PAD_SENTINEL`] so the absorb schedule depends
-    /// only on (shape, layout), never on the live-input count.
-    pub padded_input_len: usize,
 }
 
 impl OwnerAuthPublicInputs {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         layout: OwnerAuthLayout,
         tx_body_hash: [Block128; 2],
-        live_input_positions: Vec<usize>,
-        live_slot_indices: Vec<u32>,
-        input_to_group: Vec<usize>,
         expected_address: Vec<[Block128; 2]>,
-        padded_input_len: usize,
     ) -> Option<Self> {
-        if expected_address.len() != layout.owner_count
-            || live_input_positions.is_empty()
-            || live_slot_indices.len() != live_input_positions.len()
-            || input_to_group.len() != live_input_positions.len()
-            || input_to_group
-                .iter()
-                .any(|&group_idx| group_idx >= layout.owner_count)
-            || padded_input_len < live_input_positions.len()
-            || padded_input_len > OWNER_AUTH_MAX_PADDED_INPUTS
-        {
-            return None;
-        }
-        Some(Self {
+        let inputs = Self {
             layout,
             tx_body_hash,
-            live_input_positions,
-            live_slot_indices,
-            input_to_group,
             expected_address,
-            padded_input_len,
-        })
+        };
+        inputs.shape_ok().then_some(inputs)
     }
 
     /// Statement shape checks shared by the prove and verify entries.
     fn shape_ok(&self) -> bool {
-        self.expected_address.len() == self.layout.owner_count
-            && !self.live_input_positions.is_empty()
-            && self.live_slot_indices.len() == self.live_input_positions.len()
-            && self.input_to_group.len() == self.live_input_positions.len()
-            && self.padded_input_len >= self.live_input_positions.len()
-            && self.padded_input_len <= OWNER_AUTH_MAX_PADDED_INPUTS
+        OwnerAuthLayout::for_owner_count(self.layout.owner_count)
+            .is_ok_and(|canonical| canonical == self.layout)
+            && self.expected_address.len() == self.layout.owner_count
     }
 }
 
@@ -250,11 +211,7 @@ pub struct OwnerAuthInputs {
     pub layout: OwnerAuthLayout,
     pub spend_secret: Vec<[Block128; 2]>,
     pub tx_body_hash: [Block128; 2],
-    pub live_input_positions: Vec<usize>,
-    pub live_slot_indices: Vec<u32>,
-    pub input_to_group: Vec<usize>,
     pub expected_address: Vec<[Block128; 2]>,
-    pub padded_input_len: usize,
 }
 
 impl Drop for OwnerAuthInputs {
@@ -268,11 +225,7 @@ impl OwnerAuthInputs {
         OwnerAuthPublicInputs {
             layout: self.layout,
             tx_body_hash: self.tx_body_hash,
-            live_input_positions: self.live_input_positions.clone(),
-            live_slot_indices: self.live_slot_indices.clone(),
-            input_to_group: self.input_to_group.clone(),
             expected_address: self.expected_address.clone(),
-            padded_input_len: self.padded_input_len,
         }
     }
 
@@ -281,11 +234,7 @@ impl OwnerAuthInputs {
             layout: public.layout,
             spend_secret,
             tx_body_hash: public.tx_body_hash,
-            live_input_positions: public.live_input_positions.clone(),
-            live_slot_indices: public.live_slot_indices.clone(),
-            input_to_group: public.input_to_group.clone(),
             expected_address: public.expected_address.clone(),
-            padded_input_len: public.padded_input_len,
         }
     }
 }
@@ -296,9 +245,6 @@ impl std::fmt::Debug for OwnerAuthInputs {
             .field("layout", &self.layout)
             .field("spend_secret", &"[REDACTED]")
             .field("tx_body_hash", &self.tx_body_hash)
-            .field("live_input_positions", &self.live_input_positions)
-            .field("live_slot_indices", &self.live_slot_indices)
-            .field("input_to_group", &self.input_to_group)
             .field("expected_address", &self.expected_address)
             .finish()
     }
@@ -377,11 +323,7 @@ pub fn compute_owner_auth_boundary(
         layout: circuit.layout,
         spend_secret,
         tx_body_hash,
-        live_input_positions: (0..circuit.layout.owner_count).collect(),
-        live_slot_indices: (0..circuit.layout.owner_count).map(|i| i as u32).collect(),
-        input_to_group: (0..circuit.layout.owner_count).collect(),
         expected_address: vec![[Block128::ZERO; 2]; circuit.layout.owner_count],
-        padded_input_len: circuit.layout.owner_count,
     };
     let w = evaluate_owner_auth(circuit, &inputs);
     w.derived_address.clone()
@@ -1593,7 +1535,9 @@ pub struct OwnerAuthKillShotReductions {
     pub state: BatchEvalReduction,
 }
 
-pub const OWNER_AUTH_GKR_DOMAIN_TAG: u128 = 0xA07D_0B47_CAFE_0003;
+/// Owner-auth transcript epoch for the minimal one-owner public statement.
+/// Version 4 removes the legacy per-input position/slot/group vectors.
+pub const OWNER_AUTH_GKR_DOMAIN_TAG: u128 = 0xA07D_0B47_CAFE_0004;
 
 pub fn init_owner_auth_gkr_channel<T: FiatShamir<Block128>>(channel: &mut T) {
     channel.absorb(Block128::from(OWNER_AUTH_GKR_DOMAIN_TAG));
@@ -1611,25 +1555,6 @@ fn absorb_pair<T: FiatShamir<Block128>>(channel: &mut T, pair: &[Block128; 2]) {
     channel.absorb(pair[1]);
 }
 
-/// Absorbs one per-input statement vector padded to `padded_len` entries:
-/// the live length first, then real entries, then the pad sentinel. The
-/// absorb count is a function of `padded_len` alone.
-fn absorb_padded_input_vector<T: FiatShamir<Block128>>(
-    channel: &mut T,
-    values: impl ExactSizeIterator<Item = u128>,
-    padded_len: usize,
-) {
-    let live_len = values.len();
-    debug_assert!(live_len <= padded_len);
-    channel.absorb(Block128::from(live_len as u128));
-    for value in values {
-        channel.absorb(Block128::from(value));
-    }
-    for _ in live_len..padded_len {
-        channel.absorb(Block128::from(OWNER_AUTH_INPUT_PAD_SENTINEL));
-    }
-}
-
 fn absorb_owner_public_boundary<T: FiatShamir<Block128>>(
     channel: &mut T,
     inputs: &OwnerAuthPublicInputs,
@@ -1640,22 +1565,6 @@ fn absorb_owner_public_boundary<T: FiatShamir<Block128>>(
     channel.absorb(Block128::from(inputs.layout.num_vars as u128));
     channel.absorb(Block128::from(inputs.layout.padded_slots as u128));
     absorb_pair(channel, &inputs.tx_body_hash);
-    channel.absorb(Block128::from(inputs.padded_input_len as u128));
-    absorb_padded_input_vector(
-        channel,
-        inputs.live_input_positions.iter().map(|&p| p as u128),
-        inputs.padded_input_len,
-    );
-    absorb_padded_input_vector(
-        channel,
-        inputs.live_slot_indices.iter().map(|&s| s as u128),
-        inputs.padded_input_len,
-    );
-    absorb_padded_input_vector(
-        channel,
-        inputs.input_to_group.iter().map(|&g| g as u128),
-        inputs.padded_input_len,
-    );
     // Addresses are absorbed for every padded slot (ghost slots as zero
     // pairs) so the schedule depends on `padded_slots`, not `owner_count`.
     for slot in 0..inputs.layout.padded_slots {
@@ -1753,13 +1662,7 @@ pub fn verify_owner_auth_killshot_with_claims<T: FiatShamir<Block128>>(
     inputs: &OwnerAuthPublicInputs,
     channel: &mut T,
 ) -> Option<OwnerAuthVerifierClaims> {
-    if circuit.layout != inputs.layout
-        || !inputs.shape_ok()
-        || inputs
-            .input_to_group
-            .iter()
-            .any(|&group_idx| group_idx >= inputs.layout.owner_count)
-    {
+    if circuit.layout != inputs.layout || !inputs.shape_ok() {
         return None;
     }
     let layout = inputs.layout;
@@ -1825,6 +1728,7 @@ pub fn discharge_owner_auth_reductions_native(
 pub enum OwnerAuthStatementError {
     Canonical(OwnerAuthError),
     Layout(OwnerAuthLayoutError),
+    LiveInputCountOutOfRange { actual: usize, max: usize },
     SecretCountMismatch { expected: usize, actual: usize },
     SecretMismatch { input_position: usize },
     RepeatedOwnerSecretMismatch { input_position: usize },
@@ -1847,6 +1751,9 @@ impl std::fmt::Display for OwnerAuthStatementError {
         match self {
             Self::Canonical(e) => write!(f, "canonical owner auth failed: {e}"),
             Self::Layout(e) => write!(f, "owner auth layout failed: {e}"),
+            Self::LiveInputCountOutOfRange { actual, max } => {
+                write!(f, "live input count out of range: actual {actual}, max {max}")
+            }
             Self::SecretCountMismatch { expected, actual } => {
                 write!(
                     f,
@@ -1878,11 +1785,7 @@ pub fn owner_auth_public_from_statement(
     Ok(OwnerAuthPublicInputs {
         layout,
         tx_body_hash: statement.tx_body_hash.as_fields(),
-        live_input_positions: statement.live_input_positions.clone(),
-        live_slot_indices: statement.live_slot_indices.clone(),
-        input_to_group: statement.input_to_group.clone(),
         expected_address,
-        padded_input_len: statement.padded_input_len,
     })
 }
 
@@ -2164,6 +2067,31 @@ mod tests {
     }
 
     #[test]
+    fn owner_auth_v3_transcript_rejects_v4_proof() {
+        const OWNER_AUTH_GKR_V3_DOMAIN_TAG: u128 = 0xA07D_0B47_CAFE_0003;
+        let secrets = [secret(33)];
+        let body = body_from_secrets(TxShape::Standard4x8, &secrets, false);
+        let inputs = owner_auth_inputs_from_body_and_live_secrets(&body, &secrets).expect("inputs");
+        let circuit = OwnerAuthCircuit::build(inputs.layout);
+        let mut prover_channel = owner_auth_gkr_channel();
+        let (proof, _) =
+            prove_owner_auth_killshot(&circuit, &inputs, &mut prover_channel);
+
+        let mut old_channel = Poseidon2bChannel::new();
+        old_channel.absorb(Block128::from(OWNER_AUTH_GKR_V3_DOMAIN_TAG));
+        assert!(
+            verify_owner_auth_killshot(
+                &proof,
+                &circuit,
+                &inputs.to_public(),
+                &mut old_channel,
+            )
+            .is_none(),
+            "a v4 proof must not verify under the retired v3 transcript"
+        );
+    }
+
+    #[test]
     fn owner_auth_killshot_rejects_tamper() {
         let secrets = [secret(41), secret(42)];
         let body = body_from_secrets(TxShape::Standard4x8, &secrets, false);
@@ -2235,15 +2163,10 @@ mod tests {
         let mut ch_v = owner_auth_gkr_channel();
         assert!(verify_owner_auth_killshot(&proof, &circuit, &wrong_hash, &mut ch_v).is_none());
 
-        let mut wrong_slot = inputs.to_public();
-        wrong_slot.live_slot_indices[0] ^= 1;
+        let mut wrong_address = inputs.to_public();
+        wrong_address.expected_address[0][0] += Block128::ONE;
         let mut ch_v = owner_auth_gkr_channel();
-        assert!(verify_owner_auth_killshot(&proof, &circuit, &wrong_slot, &mut ch_v).is_none());
-
-        let mut wrong_mapping = inputs.to_public();
-        wrong_mapping.input_to_group[0] = 1;
-        let mut ch_v = owner_auth_gkr_channel();
-        assert!(verify_owner_auth_killshot(&proof, &circuit, &wrong_mapping, &mut ch_v).is_none());
+        assert!(verify_owner_auth_killshot(&proof, &circuit, &wrong_address, &mut ch_v).is_none());
     }
 
     #[test]

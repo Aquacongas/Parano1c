@@ -44,19 +44,7 @@ fn fixture(owner_count: usize, seed: u128) -> (OwnerAuthProofKillShot, OwnerAuth
         .collect();
     let tx_body_hash = [Block128::from(seed + 7), Block128::from(seed + 8)];
     let expected_address = compute_owner_auth_boundary(&circuit, spend_secret.clone(), tx_body_hash);
-    let live_input_positions: Vec<usize> = (0..owner_count).collect();
-    let live_slot_indices: Vec<u32> = (0..owner_count as u32).map(|i| 100 + i).collect();
-    let input_to_group: Vec<usize> = (0..owner_count).collect();
-    let public = OwnerAuthPublicInputs::new(
-        layout,
-        tx_body_hash,
-        live_input_positions,
-        live_slot_indices,
-        input_to_group,
-        expected_address,
-        owner_count.max(4),
-    )
-    .unwrap();
+    let public = OwnerAuthPublicInputs::new(layout, tx_body_hash, expected_address).unwrap();
     let inputs = OwnerAuthInputs::from_parts(&public, spend_secret);
     let mut ch = owner_auth_gkr_channel();
     let (proof, _) = prove_owner_auth_killshot(&circuit, &inputs, &mut ch);
@@ -243,4 +231,28 @@ fn owner_auth_layout_shape_facts() {
         5 * num_vars + 3,
         "owner-auth squeeze budget = 5*num_vars + 3"
     );
+}
+
+#[test]
+fn padded_ghost_addresses_are_literal_zero_schedule_lanes() {
+    let (proof, public) = fixture(3, 0x6A05_7A11);
+    assert_eq!(public.layout.padded_slots, 4);
+    let schedule = owner_auth_channel_schedule(&proof, &public);
+    let first = match &schedule.ops[0] {
+        TranscriptOp::Absorb(lanes) => lanes,
+        TranscriptOp::Squeeze(_) => panic!("owner-auth schedule must start with an absorb"),
+    };
+    // tag + five layout scalars + hash pair + three live address pairs.
+    let ghost_offset = 1 + 5 + 2 + 2 * public.layout.owner_count;
+    assert_eq!(first[ghost_offset], Some(0));
+    assert_eq!(first[ghost_offset + 1], Some(0));
+
+    let honest = drive_channel(&schedule.ops, &schedule.data_tower);
+    let mut bad_ops = schedule.ops.clone();
+    let TranscriptOp::Absorb(first) = &mut bad_ops[0] else {
+        unreachable!()
+    };
+    first[ghost_offset] = Some(1);
+    let bad = drive_channel(&bad_ops, &schedule.data_tower);
+    assert_ne!(bad.last(), honest.last(), "ghost constant must bind the transcript");
 }

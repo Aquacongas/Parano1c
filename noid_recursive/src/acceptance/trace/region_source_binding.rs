@@ -1833,24 +1833,13 @@ pub fn discharge_owner_auth_killshots_via_region(
         // eval assert is the safety net against any lane/ordering drift.
         let mut data_wires: Vec<LinExpr> = Vec::with_capacity(schedule.data_flat.len());
         // Step 0/1: owner public boundary.
-        data_wires.push(inputs_t.owner_count.clone());
-        // `live_slots == owner_count` (OWNER_AUTH_SLOTS_PER_OWNER == 1).
-        data_wires.push(inputs_t.owner_count.clone());
         data_wires.push(inputs_t.tx_body_hash[0].clone());
         data_wires.push(inputs_t.tx_body_hash[1].clone());
-        for vector in [
-            &inputs_t.live_input_positions,
-            &inputs_t.live_slot_indices,
-            &inputs_t.input_to_group,
-        ] {
-            // `push_padded_input_vector`: live_len, then the padded value/sentinel
-            // lanes (the trace vector is already padded to `padded_input_len`).
-            data_wires.push(inputs_t.live_len.clone());
-            for entry in vector.iter() {
-                data_wires.push(entry.clone());
-            }
-        }
-        for pair in &inputs_t.expected_address {
+        for pair in inputs_t
+            .expected_address
+            .iter()
+            .take(inputs_t.layout.owner_count)
+        {
             data_wires.push(pair[0].clone());
             data_wires.push(pair[1].clone());
         }
@@ -5491,19 +5480,7 @@ mod owner_auth_region_tests {
         let tx_body_hash = [Block128::from(seed + 7), Block128::from(seed + 8)];
         let expected_address =
             compute_owner_auth_boundary(&circuit, spend_secret.clone(), tx_body_hash);
-        let live_input_positions: Vec<usize> = (0..owner_count).collect();
-        let live_slot_indices: Vec<u32> = (0..owner_count as u32).map(|i| 100 + i).collect();
-        let input_to_group: Vec<usize> = (0..owner_count).collect();
-        let public = OwnerAuthPublicInputs::new(
-            layout,
-            tx_body_hash,
-            live_input_positions,
-            live_slot_indices,
-            input_to_group,
-            expected_address,
-            owner_count.max(4),
-        )
-        .unwrap();
+        let public = OwnerAuthPublicInputs::new(layout, tx_body_hash, expected_address).unwrap();
         let inputs = OwnerAuthInputs::from_parts(&public, spend_secret);
         let mut ch = owner_auth_gkr_channel();
         let (proof, _) = prove_owner_auth_killshot(&circuit, &inputs, &mut ch);

@@ -51,7 +51,18 @@ pub struct AuthorizationComponentInput {
     pub block_index: usize,
     pub tx_index: usize,
     pub tx_body_hash: [Block128; 2],
+    /// Transitional canonical-body metadata. C' pins this byte to the
+    /// transaction validity bitmap; it is deliberately not OwnerAuth public.
+    pub live_input_count: u8,
     pub public: OwnerAuthPublicInputs,
+}
+
+fn authorization_component_input_shape_ok(input: &AuthorizationComponentInput) -> bool {
+    let one_owner_layout = noid_gkr::OwnerAuthLayout::for_owner_count(1)
+        .expect("the protocol one-owner layout is valid");
+    input.public.layout == one_owner_layout
+        && input.public.expected_address.len() == 1
+        && (1..=noid_gkr::MAX_AUTHORIZATION_LIVE_INPUTS).contains(&input.live_input_count)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -421,6 +432,13 @@ fn validate_component_shape(
     {
         return Err(AcceptedBlockBatchComponentError::ComponentShapeMismatch);
     }
+    if inputs
+        .authorization_inputs
+        .iter()
+        .any(|input| !authorization_component_input_shape_ok(input))
+    {
+        return Err(AcceptedBlockBatchComponentError::ComponentShapeMismatch);
+    }
     Ok(())
 }
 
@@ -589,6 +607,7 @@ fn verify_authorization_components(
             let statement = CanonicalAuthorizationStatement {
                 tx_index: input.tx_index,
                 tx_body_hash: input.tx_body_hash,
+                live_input_count: input.live_input_count,
                 public: input.public.clone(),
             };
             let verified =
@@ -644,4 +663,45 @@ fn standard_tx_body_slot_state_ins(inputs: &[SpineInputs]) -> Vec<[Block128; 4]>
         );
     }
     slot_state_ins
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn authorization_component_input() -> AuthorizationComponentInput {
+        let layout = noid_gkr::OwnerAuthLayout::for_owner_count(1).unwrap();
+        AuthorizationComponentInput {
+            block_index: 0,
+            tx_index: 0,
+            tx_body_hash: [Block128::from(7u128), Block128::from(8u128)],
+            live_input_count: 1,
+            public: OwnerAuthPublicInputs::new(
+                layout,
+                [Block128::from(7u128), Block128::from(8u128)],
+                vec![[Block128::from(9u128), Block128::from(10u128)]],
+            )
+            .unwrap(),
+        }
+    }
+
+    #[test]
+    fn authorization_component_boundary_rejects_multi_owner_and_bad_live_count() {
+        let valid = authorization_component_input();
+        assert!(authorization_component_input_shape_ok(&valid));
+
+        let mut multi_owner = valid.clone();
+        multi_owner.public.layout = noid_gkr::OwnerAuthLayout::for_owner_count(2).unwrap();
+        multi_owner
+            .public
+            .expected_address
+            .push([Block128::from(11u128), Block128::from(12u128)]);
+        assert!(!authorization_component_input_shape_ok(&multi_owner));
+
+        for count in [0, noid_gkr::MAX_AUTHORIZATION_LIVE_INPUTS + 1] {
+            let mut bad_count = valid.clone();
+            bad_count.live_input_count = count;
+            assert!(!authorization_component_input_shape_ok(&bad_count));
+        }
+    }
 }

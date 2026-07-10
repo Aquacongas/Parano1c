@@ -157,10 +157,12 @@ impl AuthorizationVerifier for PreverifiedAuthorizationVerifier<'_> {
         if let Some(known) = self.verified_proof_bytes.get(&body_hash) {
             if let Some(bytes) = noid_gkr::authorization_proof_wire_bytes(proof) {
                 if bytes == *known {
+                    noid_gkr::validate_authorization_statement(statement)
+                        .map_err(|error| map_verify_authorization_error(error, statement.tx_index))?;
                     return Ok(VerifiedAuthorization {
                         tx_index: statement.tx_index,
                         owner_count: statement.public.layout.owner_count,
-                        live_input_count: statement.public.live_input_positions.len(),
+                        live_input_count: usize::from(statement.live_input_count),
                     });
                 }
             }

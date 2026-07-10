@@ -6,23 +6,30 @@
 use bincode::Options;
 use noid_core::Block128;
 use noid_poseidon2b::primitives::SpendSecret;
-use noid_tx::{validate_public_tx_logic, PublicLogicError, TxBody, TxShape};
+use noid_tx::{canonical_owner_auth, validate_public_tx_logic, PublicLogicError, TxBody, TxShape};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     owner_auth_gkr_channel, owner_auth_inputs_from_body_and_live_secrets,
-    owner_auth_public_from_body, prove_owner_auth_killshot, verify_owner_auth_killshot,
+    owner_auth_public_from_statement, prove_owner_auth_killshot, verify_owner_auth_killshot,
     OwnerAuthCircuit, OwnerAuthProofKillShot, OwnerAuthPublicInputs, OwnerAuthStatementError,
 };
 
 pub const MAX_STANDARD_AUTHORIZATION_BYTES: usize = 192 * 1024;
 pub const MAX_SWEEP_AUTHORIZATION_BYTES: usize = 256 * 1024;
 pub const MAX_AUTHORIZATION_BUNDLE_BYTES: usize = MAX_SWEEP_AUTHORIZATION_BYTES;
+/// Absolute cap for the transitional live-input-count metadata. The exact
+/// shape-specific count is derived from the canonical body at production
+/// boundaries and will be pinned to the validity bitmap by ActionSurface C'.
+pub const MAX_AUTHORIZATION_LIVE_INPUTS: u8 = TxShape::Sweep25x2.max_inputs() as u8;
 
 #[derive(Debug, Clone)]
 pub struct CanonicalAuthorizationStatement {
     pub tx_index: usize,
     pub tx_body_hash: [Block128; 2],
+    /// Transitional metadata derived from the canonical body, never from
+    /// proof-carried public data. C' pins it to the canonical validity bitmap.
+    pub live_input_count: u8,
     pub public: OwnerAuthPublicInputs,
 }
 
@@ -166,6 +173,34 @@ pub enum VerifyAuthorizationError {
     AuthProof,
 }
 
+/// Fail-closed production statement boundary. The low-level owner-auth GKR
+/// remains generic over multiple owner groups, but every consensus-facing
+/// authorization statement is the canonical one-owner layout. The live count
+/// is transitional body-derived metadata until C' pins it to the body bitmap.
+pub fn validate_authorization_statement(
+    statement: &CanonicalAuthorizationStatement,
+) -> Result<(), VerifyAuthorizationError> {
+    let one_owner_layout = crate::OwnerAuthLayout::for_owner_count(1)
+        .expect("the protocol one-owner layout is valid");
+    if statement.public.layout != one_owner_layout || statement.public.expected_address.len() != 1 {
+        return Err(VerifyAuthorizationError::OwnerAuthStatement(
+            "production owner-auth statement must use the canonical one-owner layout".to_string(),
+        ));
+    }
+    if !(1..=MAX_AUTHORIZATION_LIVE_INPUTS).contains(&statement.live_input_count) {
+        return Err(VerifyAuthorizationError::OwnerAuthStatement(format!(
+            "live input count {} is outside 1..={MAX_AUTHORIZATION_LIVE_INPUTS}",
+            statement.live_input_count
+        )));
+    }
+    if statement.public.tx_body_hash != statement.tx_body_hash {
+        return Err(VerifyAuthorizationError::OwnerAuthStatement(
+            "statement tx_body_hash does not match canonical owner-auth public input".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 impl From<PublicLogicError> for VerifyAuthorizationError {
     fn from(value: PublicLogicError) -> Self {
         Self::PublicLogic(value)
@@ -205,11 +240,15 @@ pub fn verify_wallet_authorization_proof(
     proof: &OwnerAuthProofKillShot,
 ) -> Result<(), VerifyAuthorizationError> {
     validate_public_tx_logic(body)?;
-    let public = owner_auth_public_from_body(body)
+    let canonical = canonical_owner_auth(body)
+        .map_err(|e| VerifyAuthorizationError::OwnerAuthStatement(e.to_string()))?;
+    let public = owner_auth_public_from_statement(&canonical)
         .map_err(|e| VerifyAuthorizationError::OwnerAuthStatement(e.to_string()))?;
     let statement = CanonicalAuthorizationStatement {
         tx_index: 0,
         tx_body_hash: public.tx_body_hash,
+        live_input_count: u8::try_from(canonical.live_input_count())
+            .expect("canonical transaction input capacity fits u8"),
         public,
     };
     verify_authorization_statement_proof(&statement, proof).map(|_| ())
@@ -220,10 +259,25 @@ pub fn canonical_authorization_statement_from_body(
     tx_body_hash: [Block128; 2],
     body: &TxBody,
 ) -> Result<CanonicalAuthorizationStatement, OwnerAuthStatementError> {
-    let public = owner_auth_public_from_body(body)?;
+    let canonical = canonical_owner_auth(body)?;
+    let live_input_count = canonical.live_input_count();
+    if live_input_count == 0 || live_input_count > body.shape.max_inputs() {
+        return Err(OwnerAuthStatementError::LiveInputCountOutOfRange {
+            actual: live_input_count,
+            max: body.shape.max_inputs(),
+        });
+    }
+    let live_input_count = u8::try_from(live_input_count).map_err(|_| {
+        OwnerAuthStatementError::LiveInputCountOutOfRange {
+            actual: live_input_count,
+            max: body.shape.max_inputs(),
+        }
+    })?;
+    let public = owner_auth_public_from_statement(&canonical)?;
     Ok(CanonicalAuthorizationStatement {
         tx_index,
         tx_body_hash,
+        live_input_count,
         public,
     })
 }
@@ -239,21 +293,16 @@ pub fn verify_authorization_statement_proof(
     statement: &CanonicalAuthorizationStatement,
     proof: &OwnerAuthProofKillShot,
 ) -> Result<VerifiedAuthorization, VerifyAuthorizationError> {
+    validate_authorization_statement(statement)?;
     let circuit = OwnerAuthCircuit::build(statement.public.layout);
     let mut channel = owner_auth_gkr_channel();
     verify_owner_auth_killshot(proof, &circuit, &statement.public, &mut channel)
         .ok_or(VerifyAuthorizationError::AuthProof)?;
 
-    if statement.public.tx_body_hash != statement.tx_body_hash {
-        return Err(VerifyAuthorizationError::OwnerAuthStatement(
-            "statement tx_body_hash does not match canonical owner-auth public input".to_string(),
-        ));
-    }
-
     Ok(VerifiedAuthorization {
         tx_index: statement.tx_index,
         owner_count: statement.public.layout.owner_count,
-        live_input_count: statement.public.live_input_positions.len(),
+        live_input_count: usize::from(statement.live_input_count),
     })
 }
 
@@ -281,6 +330,7 @@ fn map_owner_auth_prove_error(err: OwnerAuthStatementError) -> ProveAuthorizatio
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::owner_auth_public_from_body;
     use noid_core::{Block128, TowerField};
     use noid_poseidon2b::primitives::{derive_address, Address};
     use noid_tx::{TxInput, TxOutput};
@@ -440,6 +490,9 @@ mod tests {
 
         let public = owner_auth_public_from_body(&body).expect("public owner auth");
         assert_eq!(public.layout.owner_count, 1);
+        let statement =
+            canonical_authorization_statement_from_body(0, public.tx_body_hash, &body).unwrap();
+        assert_eq!(statement.live_input_count, 2);
     }
 
     #[test]
@@ -455,6 +508,40 @@ mod tests {
             verify_authorization_statement_proof(&statement, &bundle.proof),
             Err(VerifyAuthorizationError::OwnerAuthStatement(_))
         ));
+    }
+
+    #[test]
+    fn production_statement_rejects_multi_owner_layout() {
+        let (body, _, bundle) = prove_standard_fixture();
+        let public = owner_auth_public_from_body(&body).expect("public owner auth");
+        let mut statement =
+            canonical_authorization_statement_from_body(0, public.tx_body_hash, &body)
+                .expect("canonical authorization statement");
+        statement.public.layout = crate::OwnerAuthLayout::for_owner_count(2).unwrap();
+        statement.public.expected_address.push([Block128::ZERO; 2]);
+
+        assert!(matches!(
+            verify_authorization_statement_proof(&statement, &bundle.proof),
+            Err(VerifyAuthorizationError::OwnerAuthStatement(_))
+        ));
+    }
+
+    #[test]
+    fn production_statement_rejects_live_count_outside_transitional_cap() {
+        let (body, _, bundle) = prove_standard_fixture();
+        let public = owner_auth_public_from_body(&body).expect("public owner auth");
+        let statement =
+            canonical_authorization_statement_from_body(0, public.tx_body_hash, &body)
+                .expect("canonical authorization statement");
+
+        for bad_count in [0, MAX_AUTHORIZATION_LIVE_INPUTS + 1] {
+            let mut bad = statement.clone();
+            bad.live_input_count = bad_count;
+            assert!(matches!(
+                verify_authorization_statement_proof(&bad, &bundle.proof),
+                Err(VerifyAuthorizationError::OwnerAuthStatement(_))
+            ));
+        }
     }
 
     #[test]

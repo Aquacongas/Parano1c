@@ -13,8 +13,9 @@ use noid_core::transcript::FiatShamir;
 use noid_core::Block128;
 use noid_gkr::{
     canonical_authorization_statement_from_body, init_owner_auth_gkr_channel,
-    verify_owner_auth_killshot_with_claims, CanonicalAuthorizationStatement, OwnerAuthCircuit,
-    OwnerAuthProofKillShot, OwnerAuthVerifierClaims, VerifiedAuthorization,
+    validate_authorization_statement, verify_owner_auth_killshot_with_claims,
+    CanonicalAuthorizationStatement, OwnerAuthCircuit, OwnerAuthProofKillShot,
+    OwnerAuthVerifierClaims, VerifiedAuthorization,
     VerifiedAuthorizationBatch, VerifyAuthorizationError,
 };
 use noid_poseidon2b::Poseidon2bChannel;
@@ -95,6 +96,7 @@ pub fn verify_authorization_statement_proof_with_trace(
     statement: &CanonicalAuthorizationStatement,
     proof: &OwnerAuthProofKillShot,
 ) -> Result<(VerifiedAuthorization, AuthorizationVerifierTrace), VerifyAuthorizationError> {
+    validate_authorization_statement(statement)?;
     let circuit = OwnerAuthCircuit::build(statement.public.layout);
     let mut channel = TracingPoseidon2bChannel::new();
     init_owner_auth_gkr_channel(&mut channel);
@@ -102,16 +104,10 @@ pub fn verify_authorization_statement_proof_with_trace(
         verify_owner_auth_killshot_with_claims(proof, &circuit, &statement.public, &mut channel)
             .ok_or(VerifyAuthorizationError::AuthProof)?;
 
-    if statement.public.tx_body_hash != statement.tx_body_hash {
-        return Err(VerifyAuthorizationError::OwnerAuthStatement(
-            "statement tx_body_hash does not match canonical owner-auth public input".to_string(),
-        ));
-    }
-
     let verified = VerifiedAuthorization {
         tx_index: statement.tx_index,
         owner_count: statement.public.layout.owner_count,
-        live_input_count: statement.public.live_input_positions.len(),
+        live_input_count: usize::from(statement.live_input_count),
     };
     let trace = AuthorizationVerifierTrace {
         tx_index: statement.tx_index,

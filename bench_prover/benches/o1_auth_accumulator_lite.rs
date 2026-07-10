@@ -117,11 +117,6 @@ trait FieldSink {
         self.absorb(Block128::from(value as u128));
     }
 
-    #[inline]
-    fn absorb_u32(&mut self, value: u32) {
-        self.absorb(Block128::from(value as u128));
-    }
-
     fn absorb_hash(&mut self, hash: &[u8; 32]) {
         let mut lo = [0u8; 16];
         let mut hi = [0u8; 16];
@@ -253,20 +248,12 @@ fn absorb_public_to_channel(channel: &mut Poseidon2bChannel, public: &OwnerAuthP
     channel.absorb(Block128::from(public.layout.padded_slots as u128));
     channel.absorb(public.tx_body_hash[0]);
     channel.absorb(public.tx_body_hash[1]);
-    channel.absorb(Block128::from(public.live_input_positions.len() as u128));
-    for &position in &public.live_input_positions {
-        channel.absorb(Block128::from(position as u128));
-    }
-    channel.absorb(Block128::from(public.live_slot_indices.len() as u128));
-    for &slot in &public.live_slot_indices {
-        channel.absorb(Block128::from(slot as u128));
-    }
-    channel.absorb(Block128::from(public.input_to_group.len() as u128));
-    for &group in &public.input_to_group {
-        channel.absorb(Block128::from(group as u128));
-    }
-    channel.absorb(Block128::from(public.expected_address.len() as u128));
-    for address in &public.expected_address {
+    for slot in 0..public.layout.padded_slots {
+        let address = public
+            .expected_address
+            .get(slot)
+            .copied()
+            .unwrap_or([Block128::ZERO; 2]);
         channel.absorb(address[0]);
         channel.absorb(address[1]);
     }
@@ -310,20 +297,12 @@ fn absorb_public_fields<S: FieldSink>(sink: &mut S, index: usize, public: &Owner
     sink.absorb_usize(public.layout.padded_slots);
     sink.absorb(public.tx_body_hash[0]);
     sink.absorb(public.tx_body_hash[1]);
-    sink.absorb_usize(public.live_input_positions.len());
-    for &position in &public.live_input_positions {
-        sink.absorb_usize(position);
-    }
-    sink.absorb_usize(public.live_slot_indices.len());
-    for &slot in &public.live_slot_indices {
-        sink.absorb_u32(slot);
-    }
-    sink.absorb_usize(public.input_to_group.len());
-    for &group in &public.input_to_group {
-        sink.absorb_usize(group);
-    }
-    sink.absorb_usize(public.expected_address.len());
-    for address in &public.expected_address {
+    for slot in 0..public.layout.padded_slots {
+        let address = public
+            .expected_address
+            .get(slot)
+            .copied()
+            .unwrap_or([Block128::ZERO; 2]);
         sink.absorb(address[0]);
         sink.absorb(address[1]);
     }

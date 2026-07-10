@@ -93,8 +93,8 @@ use super::trace::owner_auth::{
 };
 use super::trace::tx_body_spine::{build_standard_tx_body_slot, SpineInputsTrace};
 use super::trace::{
-    alloc_block, const_block, flat_const, flat_of, mul, pin_eq, pin_zero, range_check_bits,
-    FieldR1csBuilder, LinExpr, RawChannelTrace, F128,
+    alloc_block, const_block, flat_const, flat_of, mul, pin_eq, pin_lt_strict, pin_zero,
+    range_check_bits, FieldR1csBuilder, LinExpr, RawChannelTrace, F128,
 };
 use crate::accumulator::ChainAccumulator;
 use crate::block_certificate_backend::{
@@ -247,6 +247,24 @@ fn pin_u64_sum(b: &mut FieldR1csBuilder, terms: &[LinExpr]) -> LinExpr {
             acc
         }
     }
+}
+
+/// Allocate the transitional body-derived live-input count used by the block
+/// count lanes until C' pins it to the transaction validity bitmap. Keep the
+/// relation class-fixed while enforcing the serialized boundary 1..=25.
+fn alloc_transitional_live_input_count(b: &mut FieldR1csBuilder, count: u8) -> LinExpr {
+    assert!((1..=noid_gkr::MAX_AUTHORIZATION_LIVE_INPUTS).contains(&count));
+    const BITS: usize = 5;
+    let count = alloc_block(b, Block128::from(count as u128));
+    let count_bits = range_check_bits(b, &count, BITS);
+    let zero_bits = range_check_bits(b, &const_block(Block128::from(0u128)), BITS);
+    pin_lt_strict(b, &zero_bits, &count_bits);
+    let cap_plus_one = const_block(Block128::from(
+        noid_gkr::MAX_AUTHORIZATION_LIVE_INPUTS as u128 + 1,
+    ));
+    let cap_plus_one_bits = range_check_bits(b, &cap_plus_one, BITS);
+    pin_lt_strict(b, &count_bits, &cap_plus_one_bits);
+    count
 }
 
 fn pin_pair_at(b: &mut FieldR1csBuilder, fields: &[LinExpr], at: usize, to: &[LinExpr; 2]) {
@@ -1265,17 +1283,29 @@ pub fn build_block_slots_with_config(
     // padding above).
     let ghost_auth = (n_auth_slots > n_real_user).then(noid_gkr::ghost_tx::ghost_authorization);
     for i in 0..n_auth_slots {
-        let (public_native, witness_proof, hash_idx) = if i < n_real_user {
+        let (public_native, witness_proof, hash_idx, live_input_count) = if i < n_real_user {
             let input = &inputs.authorization_inputs[i];
             assert_eq!(input.block_index, 0, "one block per link");
             // Native `verify_authorization_statement_proof` statement check.
             assert_eq!(input.tx_body_hash, input.public.tx_body_hash);
-            (&input.public, &inputs.authorization_witnesses[i], input.tx_index)
+            (
+                &input.public,
+                &inputs.authorization_witnesses[i],
+                input.tx_index,
+                input.live_input_count,
+            )
         } else {
             let (proof, public) = ghost_auth.expect("ghost authorization derives");
-            (public, proof, i + tx_delta)
+            (public, proof, i + tx_delta, 1)
         };
-            if config.owner_auth_region {
+        let one_owner_layout = noid_gkr::OwnerAuthLayout::for_owner_count(1)
+            .expect("the protocol one-owner layout is valid");
+        assert_eq!(
+            public_native.layout, one_owner_layout,
+            "block owner-auth component must use the production one-owner layout"
+        );
+        let live_len = alloc_transitional_live_input_count(b, live_input_count);
+        if config.owner_auth_region {
             // Region path: alloc the two trace objects EXACTLY as the inline slot
             // (`build_owner_auth_slot`) does, but do NOT run the inline killshot —
             // the KSCHANNL transcript is replayed by the shared walk-C discharge
@@ -1295,11 +1325,11 @@ pub fn build_block_slots_with_config(
                 pin_eq2(b, &inputs_t.tx_body_hash, &gw);
             }
             if config.tier_user_tx_capacity.is_some() {
-                owner_counts.push(mul(b, &live_bits[i], &inputs_t.owner_count));
-                live_lens.push(mul(b, &live_bits[i], &inputs_t.live_len));
+                owner_counts.push(live_bits[i].clone());
+                live_lens.push(mul(b, &live_bits[i], &live_len));
             } else {
-                owner_counts.push(inputs_t.owner_count.clone());
-                live_lens.push(inputs_t.live_len.clone());
+                owner_counts.push(const_block(Block128::from(1u128)));
+                live_lens.push(live_len);
             }
             oa_trace_proofs.push(proof_t);
             oa_natives.push(witness_proof.clone());
@@ -1318,8 +1348,8 @@ pub fn build_block_slots_with_config(
                 region_natives.push(witness_proof.pcs.clone());
             }
             pin_eq2(b, &inputs_t.tx_body_hash, &tx_hashes[hash_idx]);
-            owner_counts.push(inputs_t.owner_count.clone());
-            live_lens.push(inputs_t.live_len.clone());
+            owner_counts.push(const_block(Block128::from(1u128)));
+            live_lens.push(live_len);
             auth_inputs.push(inputs_t);
         }
     }
