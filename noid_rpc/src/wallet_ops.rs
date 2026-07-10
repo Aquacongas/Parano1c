@@ -13,7 +13,7 @@ use noid_chain::storage::VerifiedOwnerSnapshot;
 
 use crate::types::{
     WalletAddressInfo, WalletBalance, WalletHistoryEntry, WalletScanResult, WalletSendPlan,
-    WalletStatus, WalletUtxoInfo,
+    WalletStatus, WalletTargetConsolidationOutcome, WalletUtxoInfo,
 };
 
 /// Deterministic send-planning failure. Keeping the consolidation case typed
@@ -124,16 +124,49 @@ pub trait WalletOps: Send + Sync {
         log_slots: u32,
     ) -> Result<(Vec<u8>, Vec<u32>), String>;
 
+    /// Plan creation of one exact-value active-address UTXO from confirmed,
+    /// non-pending active-owner inputs.
+    ///
+    /// The result contains exact slots only for the immediately executable
+    /// wave. Projected descendant work remains aggregate because its output
+    /// slots do not exist yet.
+    fn plan_target_consolidation(
+        &self,
+        target_amount_micronoid: u64,
+        explicit_fee_per_tx_micronoid: Option<u64>,
+        active_slot_count: u64,
+        log_slots: u32,
+        relay_floor_micronoid: u64,
+    ) -> Result<WalletTargetConsolidationOutcome, String>;
+
+    /// Build exactly one transaction returned by `plan_target_consolidation`.
+    ///
+    /// The builder revalidates every supplied slot against current wallet
+    /// state and rejects missing, pending, unconfirmed, inactive-owner, or
+    /// value-divergent inputs. Both outputs, when present, go to the active
+    /// address captured under the same wallet lock as the input set.
+    fn build_target_consolidation_transaction(
+        &self,
+        input_slots: Vec<u32>,
+        output_amount_micronoid: u64,
+        change_micronoid: Option<u64>,
+        fee_micronoid: u64,
+        epoch_anchor: [u8; 32],
+        slot_hints: Vec<u32>,
+        log_slots: u32,
+    ) -> Result<(Vec<u8>, Vec<u32>), String>;
+
     /// Export a receipt for a past transaction as hex-encoded bytes.
     /// Returns `Err` if the tx is unknown or receipt was not generated
     /// (block already pruned when it was confirmed).
     fn export_receipt(&self, txhash_hex: &str) -> Result<String, String>;
 
-    /// Return how many inputs the next consolidation round would select.
+    /// Return how many inputs the next miner-maintenance consolidation round
+    /// would select.
     ///
     /// This is lightweight planning used for automatic fee calculation. It
     /// skips pending input slots and caps one round at eight inputs.
-    fn plan_consolidate_input_count(&self) -> Result<usize, String>;
+    fn plan_maintenance_consolidation_input_count(&self) -> Result<usize, String>;
 
     /// Consolidate small UTXOs into one larger UTXO.
     ///
@@ -146,7 +179,7 @@ pub trait WalletOps: Send + Sync {
     /// the pending reservation around normal mempool admission.
     ///
     /// This is CPU-heavy (~0.3–3 s): caller must invoke in `spawn_blocking`.
-    fn build_consolidate(
+    fn build_maintenance_consolidation(
         &self,
         fee_micronoid: u64,
         epoch_anchor: [u8; 32],

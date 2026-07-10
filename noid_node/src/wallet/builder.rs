@@ -70,6 +70,32 @@ pub enum BuildError {
 
     #[error("wallet amount arithmetic overflow")]
     AmountOverflow,
+
+    #[error("target consolidation requires 1..={max} unique inputs, got {got}")]
+    InvalidExactInputCount { got: usize, max: usize },
+
+    #[error("target consolidation repeats input slot {slot_index}")]
+    DuplicateExactInput { slot_index: u32 },
+
+    #[error("target consolidation input slot {slot_index} is no longer live")]
+    ExactInputMissing { slot_index: u32 },
+
+    #[error("target consolidation input slot {slot_index} is pending another transaction")]
+    ExactInputPending { slot_index: u32 },
+
+    #[error("target consolidation input slot {slot_index} is not confirmed")]
+    ExactInputUnconfirmed { slot_index: u32 },
+
+    #[error("target consolidation outputs must be non-zero")]
+    ZeroExactOutput,
+
+    #[error(
+        "target consolidation plan diverged: selected inputs total {input_total_micronoid} μNOID, outputs plus fee total {output_and_fee_micronoid} μNOID"
+    )]
+    ExactPlanDiverged {
+        input_total_micronoid: u64,
+        output_and_fee_micronoid: u64,
+    },
 }
 
 fn active_owner_witness(
@@ -174,6 +200,101 @@ pub fn extract_build_data(
         selected_utxos,
         owner_auth_witness,
         change_address: wallet.active_address(),
+        epoch_anchor,
+        output_slot_hints: slot_hints,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// extract_exact_active_inputs_data
+// ---------------------------------------------------------------------------
+
+/// Revalidate and capture one transaction from a targeted-consolidation plan.
+///
+/// Unlike ordinary payment selection and miner maintenance, this function
+/// never chooses a substitute coin. `input_slots` is the plan/build contract:
+/// if any exact slot changed ownership, became pending, disappeared, or no
+/// longer conserves the planned output values and fee, construction fails.
+#[allow(clippy::too_many_arguments)]
+pub fn extract_exact_active_inputs_data(
+    wallet: &WalletState,
+    input_slots: &[u32],
+    output_amount_micronoid: u64,
+    change_micronoid: Option<u64>,
+    fee_micronoid: u64,
+    epoch_anchor: [u8; 32],
+    slot_hints: Vec<u32>,
+    _log_slots: u32,
+    pending_output_slots: &std::collections::HashSet<u32>,
+) -> Result<TxBuildData, BuildError> {
+    if input_slots.is_empty() || input_slots.len() > TX_INPUTS {
+        return Err(BuildError::InvalidExactInputCount {
+            got: input_slots.len(),
+            max: TX_INPUTS,
+        });
+    }
+    if output_amount_micronoid == 0 || change_micronoid == Some(0) {
+        return Err(BuildError::ZeroExactOutput);
+    }
+
+    let mut seen_inputs = std::collections::HashSet::with_capacity(input_slots.len());
+    let active_index = wallet.active_index;
+    let active_address = wallet.active_address();
+    let mut selected = Vec::with_capacity(input_slots.len());
+    for &slot_index in input_slots {
+        if !seen_inputs.insert(slot_index) {
+            return Err(BuildError::DuplicateExactInput { slot_index });
+        }
+        if wallet.pending_input_slots.contains(&slot_index) {
+            return Err(BuildError::ExactInputPending { slot_index });
+        }
+        let utxo = wallet
+            .utxos
+            .get(&slot_index)
+            .ok_or(BuildError::ExactInputMissing { slot_index })?;
+        if utxo.confirmed_height == 0 {
+            return Err(BuildError::ExactInputUnconfirmed { slot_index });
+        }
+        if utxo.key_index != active_index || utxo.address != active_address {
+            return Err(BuildError::ActiveOwnerMismatch);
+        }
+        selected.push(utxo.clone());
+    }
+
+    let input_total_micronoid = selected
+        .iter()
+        .try_fold(0u64, |sum, utxo| sum.checked_add(utxo.value))
+        .ok_or(BuildError::AmountOverflow)?;
+    let output_and_fee_micronoid = output_amount_micronoid
+        .checked_add(change_micronoid.unwrap_or(0))
+        .and_then(|sum| sum.checked_add(fee_micronoid))
+        .ok_or(BuildError::AmountOverflow)?;
+    if input_total_micronoid != output_and_fee_micronoid {
+        return Err(BuildError::ExactPlanDiverged {
+            input_total_micronoid,
+            output_and_fee_micronoid,
+        });
+    }
+
+    let needed_slots = 1 + usize::from(change_micronoid.is_some());
+    let mut seen_output_slots = std::collections::HashSet::new();
+    let slot_hints: Vec<u32> = slot_hints
+        .into_iter()
+        .filter(|slot| !pending_output_slots.contains(slot))
+        .filter(|slot| seen_output_slots.insert(*slot))
+        .collect();
+    if slot_hints.len() < needed_slots {
+        return Err(BuildError::NotEnoughSlots {
+            need: needed_slots,
+            got: slot_hints.len(),
+        });
+    }
+
+    let owner_auth_witness = active_owner_witness(wallet, &selected)?;
+    Ok(TxBuildData {
+        selected_utxos: selected,
+        owner_auth_witness,
+        change_address: active_address,
         epoch_anchor,
         output_slot_hints: slot_hints,
     })
@@ -428,6 +549,26 @@ mod tests {
         )
     }
 
+    fn extract_exact(
+        wallet: &WalletState,
+        input_slots: &[u32],
+        output_amount: u64,
+        change: Option<u64>,
+        fee: u64,
+    ) -> Result<TxBuildData, BuildError> {
+        extract_exact_active_inputs_data(
+            wallet,
+            input_slots,
+            output_amount,
+            change,
+            fee,
+            [0x11; 32],
+            vec![50_000, 50_001],
+            24,
+            &std::collections::HashSet::new(),
+        )
+    }
+
     #[test]
     fn extract_build_data_accepts_eight_inputs() {
         let (_dir, wallet) = wallet_with_utxos(8, 1_000);
@@ -472,6 +613,85 @@ mod tests {
             .expect("decode standard authorization bundle");
         noid_gkr::verify_wallet_authorization(&intent.tx_body, &bundle)
             .expect("verify standard authorization bundle");
+    }
+
+    #[test]
+    fn exact_consolidation_builds_target_and_optional_active_change() {
+        let (_dir, wallet) = wallet_with_utxos(2, 100_000);
+        let data = extract_exact(&wallet, &[1, 0], 150_000, Some(40_000), 10_000)
+            .expect("capture exact plan inputs");
+        let active_address = wallet.active_address();
+        assert_eq!(
+            data.selected_utxos
+                .iter()
+                .map(|utxo| utxo.slot_index)
+                .collect::<Vec<_>>(),
+            vec![1, 0]
+        );
+
+        let (_txid, bytes) =
+            build_and_prove_tx(active_address.0, 150_000, 10_000, data).expect("prove exact plan");
+        let intent = TxIntent::from_bytes(&bytes).expect("decode exact-plan intent");
+        let outputs: Vec<TxOutput> = intent
+            .tx_body
+            .live_outputs()
+            .map(|(_, output)| *output)
+            .collect();
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0].amount, 150_000);
+        assert_eq!(outputs[1].amount, 40_000);
+        assert!(outputs.iter().all(|output| output.owner == active_address));
+    }
+
+    #[test]
+    fn exact_consolidation_rejects_pending_inactive_and_unconfirmed_inputs() {
+        let (_dir, mut wallet) = wallet_with_utxos(3, 100_000);
+        wallet.pending_input_slots.insert(0);
+        assert!(matches!(
+            extract_exact(&wallet, &[0], 90_000, None, 10_000),
+            Err(BuildError::ExactInputPending { slot_index: 0 })
+        ));
+
+        wallet.utxos.get_mut(&1).unwrap().key_index = 1;
+        wallet.utxos.get_mut(&1).unwrap().address = wallet.address_at(1);
+        assert!(matches!(
+            extract_exact(&wallet, &[1], 90_000, None, 10_000),
+            Err(BuildError::ActiveOwnerMismatch)
+        ));
+
+        wallet.utxos.get_mut(&2).unwrap().confirmed_height = 0;
+        assert!(matches!(
+            extract_exact(&wallet, &[2], 90_000, None, 10_000),
+            Err(BuildError::ExactInputUnconfirmed { slot_index: 2 })
+        ));
+    }
+
+    #[test]
+    fn exact_consolidation_rejects_plan_build_divergence_and_duplicate_slots() {
+        let (_dir, wallet) = wallet_with_utxos(2, 100_000);
+        assert!(matches!(
+            extract_exact(&wallet, &[0, 1], 150_000, Some(39_999), 10_000),
+            Err(BuildError::ExactPlanDiverged {
+                input_total_micronoid: 200_000,
+                output_and_fee_micronoid: 199_999,
+            })
+        ));
+        assert!(matches!(
+            extract_exact(&wallet, &[0, 0], 190_000, None, 10_000),
+            Err(BuildError::DuplicateExactInput { slot_index: 0 })
+        ));
+        assert!(matches!(
+            extract_exact(&wallet, &[], 1, None, 0),
+            Err(BuildError::InvalidExactInputCount { got: 0, max: 8 })
+        ));
+        assert!(matches!(
+            extract_exact(&wallet, &[0, 1, 2, 3, 4, 5, 6, 7, 8], 1, None, 0),
+            Err(BuildError::InvalidExactInputCount { got: 9, max: 8 })
+        ));
+        assert!(matches!(
+            extract_exact(&wallet, &[99], 90_000, None, 10_000),
+            Err(BuildError::ExactInputMissing { slot_index: 99 })
+        ));
     }
 
     #[test]
