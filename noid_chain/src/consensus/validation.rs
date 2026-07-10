@@ -27,6 +27,8 @@
 //!  ✅  Detached authorization sidecar verifies for every user transaction
 //!  ❌  epoch_anchor hash matches actual header at that height (needs HeaderProvider)
 
+use std::collections::BTreeSet;
+
 use crate::block::apply_block;
 use crate::block::Block;
 use crate::block_header::BlockHeader;
@@ -36,8 +38,9 @@ use crate::consensus::{
     fees::{claimable_fee_for_tx_body, required_fee_for_tx_body},
     header::{validate_header, validate_header_timeless},
     params::{
-        block_semantic_limits_ok, BLOCK_MAX_LIVE_INPUTS, BLOCK_MAX_OWNER_GROUPS, BLOCK_MAX_TXS,
-        BLOCK_MAX_USER_ACTIONS, BLOCK_MAX_USER_OUTPUTS, BLOCK_MAX_USER_TXS,
+        block_shape_limits_ok, BLOCK_MAX_ACTIONS, BLOCK_MAX_DISTINCT_SEGMENTS,
+        BLOCK_MAX_LIVE_INPUTS, BLOCK_MAX_TXS, BLOCK_MAX_USER_ACTIONS, BLOCK_MAX_USER_OUTPUTS,
+        BLOCK_MAX_USER_TXS, LOG_SEGMENT_SIZE,
     },
     ConsensusError,
 };
@@ -55,73 +58,138 @@ pub struct AnchorInfo {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct BlockSemanticCounts {
-    pub user_txs: usize,
-    pub live_inputs: usize,
-    pub user_outputs: usize,
-    pub owner_groups_upper_bound: usize,
-    pub user_actions: usize,
+pub struct BlockResourcePreflight {
+    pub standard_tx_count: usize,
+    pub sweep_tx_count: usize,
+    pub live_input_count: usize,
+    /// All live outputs, including coinbase.
+    pub output_count: usize,
+    /// Live inputs plus all live outputs, including coinbase.
+    pub action_count: usize,
+    pub touched_slot_count: usize,
+    pub distinct_segment_count: usize,
 }
 
-pub fn block_semantic_counts(block: &Block) -> BlockSemanticCounts {
-    let mut counts = BlockSemanticCounts::default();
-    for tx in block.transactions.iter().filter(|tx| !tx.body.is_coinbase) {
-        counts.user_txs += 1;
-        let live_inputs = tx.body.inputs.iter().filter(|input| input.valid).count();
-        let live_outputs = tx.body.outputs.iter().filter(|output| output.valid).count();
-        counts.live_inputs += live_inputs;
-        counts.user_outputs += live_outputs;
-    }
-    counts.owner_groups_upper_bound = counts.live_inputs;
-    counts.user_actions = counts.live_inputs + counts.user_outputs;
-    counts
+fn resource_limit(
+    limit: &'static str,
+    actual: usize,
+    max: usize,
+) -> Result<BlockResourcePreflight, ConsensusError> {
+    Err(ConsensusError::BlockResourceLimitExceeded { limit, actual, max })
 }
 
-pub fn validate_block_semantic_limits(
+/// Count and bound the complete raw block resource surface before any
+/// segment-sized work, proof decode, or state clone.
+///
+/// Shape budgets are charged by physical user transaction shape, never by the
+/// validity bitmap. Live selectors are used only for the accepted public
+/// resource counters and touched-slot/segment union. Vector lengths are
+/// checked before those sets are allocated, keeping this preflight bounded for
+/// programmatically constructed blocks as well as decoder-produced blocks.
+pub fn validate_block_resource_preflight(
     block: &Block,
-) -> Result<BlockSemanticCounts, ConsensusError> {
-    let counts = block_semantic_counts(block);
-    if block_semantic_limits_ok(
-        counts.user_txs,
-        counts.live_inputs,
-        counts.user_outputs,
-        counts.owner_groups_upper_bound,
-    ) {
-        return Ok(counts);
+) -> Result<BlockResourcePreflight, ConsensusError> {
+    if block.transactions.len() > BLOCK_MAX_TXS {
+        return Err(ConsensusError::TooManyTxs);
+    }
+    if !(1..=32).contains(&block.header.log_slots) {
+        return Err(ConsensusError::ShapeMismatch(
+            "block log_slots is outside the u32 slot domain".into(),
+        ));
+    }
+    let slot_domain = 1u64 << block.header.log_slots;
+
+    let mut standard_tx_count = 0usize;
+    let mut sweep_tx_count = 0usize;
+    for tx in &block.transactions {
+        if tx.body.inputs.len() > tx.body.shape.max_inputs()
+            || tx.body.outputs.len() > tx.body.shape.max_outputs()
+        {
+            return Err(ConsensusError::ShapeMismatch(format!(
+                "{:?} body exceeds its physical capacity",
+                tx.body.shape
+            )));
+        }
+        if !tx.body.is_coinbase {
+            match tx.body.shape {
+                noid_tx::TxShape::Standard4x8 => standard_tx_count += 1,
+                noid_tx::TxShape::Sweep25x2 => sweep_tx_count += 1,
+            }
+        }
     }
 
-    if counts.user_txs > BLOCK_MAX_USER_TXS {
-        return Err(ConsensusError::BlockSemanticLimitExceeded {
-            limit: "user_txs",
-            actual: counts.user_txs,
-            max: BLOCK_MAX_USER_TXS,
-        });
+    let user_tx_count = standard_tx_count + sweep_tx_count;
+    let charged_inputs = standard_tx_count * noid_tx::TxShape::Standard4x8.max_inputs()
+        + sweep_tx_count * noid_tx::TxShape::Sweep25x2.max_inputs();
+    let charged_outputs = standard_tx_count * noid_tx::TxShape::Standard4x8.max_outputs()
+        + sweep_tx_count * noid_tx::TxShape::Sweep25x2.max_outputs();
+    let charged_actions = charged_inputs + charged_outputs;
+    if !block_shape_limits_ok(standard_tx_count, sweep_tx_count) {
+        if user_tx_count > BLOCK_MAX_USER_TXS {
+            return resource_limit("user_txs", user_tx_count, BLOCK_MAX_USER_TXS);
+        }
+        if charged_inputs > BLOCK_MAX_LIVE_INPUTS {
+            return resource_limit("shape_inputs", charged_inputs, BLOCK_MAX_LIVE_INPUTS);
+        }
+        if charged_outputs > BLOCK_MAX_USER_OUTPUTS {
+            return resource_limit("shape_outputs", charged_outputs, BLOCK_MAX_USER_OUTPUTS);
+        }
+        return resource_limit("shape_actions", charged_actions, BLOCK_MAX_USER_ACTIONS);
     }
-    if counts.live_inputs > BLOCK_MAX_LIVE_INPUTS {
-        return Err(ConsensusError::BlockSemanticLimitExceeded {
-            limit: "live_inputs",
-            actual: counts.live_inputs,
-            max: BLOCK_MAX_LIVE_INPUTS,
-        });
+
+    let mut live_input_count = 0usize;
+    let mut output_count = 0usize;
+    let mut touched_slots = BTreeSet::new();
+    let mut segments = BTreeSet::new();
+    for tx in &block.transactions {
+        for input in tx.body.inputs.iter().filter(|input| input.valid) {
+            if u64::from(input.slot_index) >= slot_domain {
+                return Err(ConsensusError::ShapeMismatch(
+                    "live input slot is outside block log_slots".into(),
+                ));
+            }
+            live_input_count += 1;
+            touched_slots.insert(input.slot_index);
+            segments.insert(input.slot_index >> LOG_SEGMENT_SIZE);
+        }
+        for output in tx.body.outputs.iter().filter(|output| output.valid) {
+            if u64::from(output.slot_index) >= slot_domain {
+                return Err(ConsensusError::ShapeMismatch(
+                    "live output slot is outside block log_slots".into(),
+                ));
+            }
+            output_count += 1;
+            touched_slots.insert(output.slot_index);
+            segments.insert(output.slot_index >> LOG_SEGMENT_SIZE);
+        }
+        if segments.len() > BLOCK_MAX_DISTINCT_SEGMENTS {
+            return resource_limit(
+                "distinct_segments",
+                segments.len(),
+                BLOCK_MAX_DISTINCT_SEGMENTS,
+            );
+        }
     }
-    if counts.user_outputs > BLOCK_MAX_USER_OUTPUTS {
-        return Err(ConsensusError::BlockSemanticLimitExceeded {
-            limit: "user_outputs",
-            actual: counts.user_outputs,
-            max: BLOCK_MAX_USER_OUTPUTS,
-        });
+
+    if live_input_count > BLOCK_MAX_LIVE_INPUTS {
+        return resource_limit("live_inputs", live_input_count, BLOCK_MAX_LIVE_INPUTS);
     }
-    if counts.owner_groups_upper_bound > BLOCK_MAX_OWNER_GROUPS {
-        return Err(ConsensusError::BlockSemanticLimitExceeded {
-            limit: "owner_groups",
-            actual: counts.owner_groups_upper_bound,
-            max: BLOCK_MAX_OWNER_GROUPS,
-        });
+    if output_count > BLOCK_MAX_USER_OUTPUTS + 1 {
+        return resource_limit("outputs", output_count, BLOCK_MAX_USER_OUTPUTS + 1);
     }
-    Err(ConsensusError::BlockSemanticLimitExceeded {
-        limit: "user_actions",
-        actual: counts.user_actions,
-        max: BLOCK_MAX_USER_ACTIONS,
+    let action_count = live_input_count + output_count;
+    if action_count > BLOCK_MAX_ACTIONS {
+        return resource_limit("actions", action_count, BLOCK_MAX_ACTIONS);
+    }
+
+    Ok(BlockResourcePreflight {
+        standard_tx_count,
+        sweep_tx_count,
+        live_input_count,
+        output_count,
+        action_count,
+        touched_slot_count: touched_slots.len(),
+        distinct_segment_count: segments.len(),
     })
 }
 
@@ -268,10 +336,7 @@ fn validate_block_checks_inner(
             &anchor.anchor_target,
         )?,
     }
-    if block.transactions.len() > BLOCK_MAX_TXS {
-        return Err(ConsensusError::TooManyTxs);
-    }
-    validate_block_semantic_limits(block)?;
+    validate_block_resource_preflight(block)?;
     validate_coinbase_canonical(block, parent)?;
     validate_block_slot_conflicts(&block.transactions)?;
     for tx in &block.transactions {
@@ -326,11 +391,8 @@ pub fn validate_block_consensus(
         &anchor.anchor_target,
     )?;
 
-    // --- Tx count limit ---
-    if block.transactions.len() > BLOCK_MAX_TXS {
-        return Err(ConsensusError::TooManyTxs);
-    }
-    validate_block_semantic_limits(block)?;
+    // --- Bounded canonical resource preflight ---
+    validate_block_resource_preflight(block)?;
 
     validate_coinbase_canonical(block, parent)?;
 
@@ -514,8 +576,10 @@ mod tests {
     }
 
     fn semantic_limit_block(transactions: Vec<Transaction>) -> Block {
+        let mut header = mk_parent(1, GENESIS_TIMESTAMP + BLOCK_TIME, [0u8; 32], [0u8; 32]);
+        header.log_slots = 32;
         Block {
-            header: mk_parent(1, GENESIS_TIMESTAMP + BLOCK_TIME, [0u8; 32], [0u8; 32]),
+            header,
             transactions,
         }
     }
@@ -598,7 +662,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_limits_accept_standard_baseline_block() {
+    fn resource_preflight_accepts_standard_baseline_block() {
         let mut txs = Vec::with_capacity(crate::consensus::params::BLOCK_MAX_TXS);
         txs.push(semantic_limit_coinbase());
         for i in 0..crate::consensus::params::BLOCK_MAX_USER_TXS {
@@ -609,44 +673,115 @@ mod tests {
                 1_000 + i as u32 * 20,
             ));
         }
-        let counts = validate_block_semantic_limits(&semantic_limit_block(txs))
+        let counts = validate_block_resource_preflight(&semantic_limit_block(txs))
             .expect("255 Standard4x8-equivalent block fits semantic budget");
         assert_eq!(
-            counts.live_inputs,
+            counts.live_input_count,
             crate::consensus::params::BLOCK_MAX_LIVE_INPUTS
         );
         assert_eq!(
-            counts.user_outputs,
-            crate::consensus::params::BLOCK_MAX_USER_OUTPUTS
+            counts.output_count,
+            crate::consensus::params::BLOCK_MAX_USER_OUTPUTS + 1
         );
         assert_eq!(
-            counts.user_actions,
-            crate::consensus::params::BLOCK_MAX_USER_ACTIONS
+            counts.action_count,
+            crate::consensus::params::BLOCK_MAX_ACTIONS
         );
+        assert_eq!(counts.standard_tx_count, 255);
+        assert_eq!(counts.sweep_tx_count, 0);
     }
 
     #[test]
-    fn semantic_limits_reject_41_full_sweeps() {
+    fn resource_preflight_rejects_41_sparse_sweeps() {
         let mut txs = Vec::with_capacity(42);
         txs.push(semantic_limit_coinbase());
         for i in 0..(crate::consensus::params::BLOCK_MAX_FULL_SWEEP25X2_TXS + 1) {
             txs.push(semantic_limit_tx(
                 TxShape::Sweep25x2,
-                25,
-                2,
+                1,
+                1,
                 1_000 + i as u32 * 40,
             ));
         }
 
-        let err = validate_block_semantic_limits(&semantic_limit_block(txs))
-            .expect_err("41 full Sweep25x2 txs exceed live-input budget");
+        let err = validate_block_resource_preflight(&semantic_limit_block(txs))
+            .expect_err("41 sparse Sweep25x2 txs exceed physical shape budget");
         assert_eq!(
             err,
-            ConsensusError::BlockSemanticLimitExceeded {
-                limit: "live_inputs",
+            ConsensusError::BlockResourceLimitExceeded {
+                limit: "shape_inputs",
                 actual: 1025,
                 max: crate::consensus::params::BLOCK_MAX_LIVE_INPUTS,
             }
+        );
+    }
+
+    fn segment_spread_block(segment_count: usize) -> Block {
+        let mut txs = vec![semantic_limit_coinbase()];
+        for (tx_index, segment_chunk) in
+            (0..segment_count).collect::<Vec<_>>().chunks(4).enumerate()
+        {
+            let inputs = segment_chunk
+                .iter()
+                .map(|&segment| TxInput {
+                    slot_index: (segment as u32) << crate::consensus::params::LOG_SEGMENT_SIZE,
+                    value: 100,
+                    creation_id: 0,
+                    owner: Address([1u8; 32]),
+                    spend_secret: SpendSecret([2u8; 32]),
+                    valid: true,
+                })
+                .collect();
+            txs.push(tx_from_body(TxBody {
+                shape: TxShape::Standard4x8,
+                epoch_anchor: [tx_index as u8 + 1; 32],
+                fee: 0,
+                inputs,
+                outputs: vec![],
+                is_coinbase: false,
+            }));
+        }
+        let mut block = semantic_limit_block(txs);
+        block.header.log_slots = 32;
+        block
+    }
+
+    #[test]
+    fn resource_preflight_accepts_256_distinct_segments() {
+        let counts = validate_block_resource_preflight(&segment_spread_block(256))
+            .expect("the availability envelope includes exactly 256 segments");
+        assert_eq!(counts.distinct_segment_count, 256);
+        assert_eq!(counts.touched_slot_count, 256);
+    }
+
+    #[test]
+    fn resource_preflight_rejects_257_distinct_segments() {
+        let err = validate_block_resource_preflight(&segment_spread_block(257))
+            .expect_err("257 segments must fail before preload");
+        assert_eq!(
+            err,
+            ConsensusError::BlockResourceLimitExceeded {
+                limit: "distinct_segments",
+                actual: 257,
+                max: crate::consensus::params::BLOCK_MAX_DISTINCT_SEGMENTS,
+            }
+        );
+    }
+
+    #[test]
+    fn resource_preflight_rejects_out_of_domain_slot_before_preload() {
+        let mut block = semantic_limit_block(vec![semantic_limit_tx(
+            TxShape::Standard4x8,
+            1,
+            0,
+            1u32 << TEST_LOG_SLOTS,
+        )]);
+        block.header.log_slots = TEST_LOG_SLOTS as u32;
+        assert_eq!(
+            validate_block_resource_preflight(&block),
+            Err(ConsensusError::ShapeMismatch(
+                "live input slot is outside block log_slots".into()
+            ))
         );
     }
 

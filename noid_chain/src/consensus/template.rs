@@ -20,7 +20,7 @@
 //! `state_root` → different Poseidon2b PoW input → must redo PoW from scratch.
 //! This is Paranoid's block-withholding protection.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 use noid_poseidon2b::primitives::{Address, Digest};
 use noid_tx::Transaction;
@@ -127,6 +127,55 @@ pub enum TemplateBuildError {
     StateApplyError(String),
 }
 
+#[derive(Clone, Default)]
+struct TemplateResourceSelection {
+    standard_tx_count: usize,
+    sweep_tx_count: usize,
+    touched_segments: BTreeSet<u32>,
+}
+
+impl TemplateResourceSelection {
+    /// Return the next bounded selection, reserving one possible new segment
+    /// for the mandatory coinbase output.
+    fn with_user_tx(&self, tx: &Transaction) -> Option<Self> {
+        if tx.body.is_coinbase {
+            return None;
+        }
+        let (standard_tx_count, sweep_tx_count) = match tx.body.shape {
+            noid_tx::TxShape::Standard4x8 => (self.standard_tx_count + 1, self.sweep_tx_count),
+            noid_tx::TxShape::Sweep25x2 => (self.standard_tx_count, self.sweep_tx_count + 1),
+        };
+        if !crate::consensus::params::block_shape_limits_ok(standard_tx_count, sweep_tx_count) {
+            return None;
+        }
+
+        let mut touched_segments = self.touched_segments.clone();
+        touched_segments.extend(
+            tx.body
+                .inputs
+                .iter()
+                .filter(|input| input.valid)
+                .map(|input| input.slot_index >> crate::consensus::params::LOG_SEGMENT_SIZE),
+        );
+        touched_segments.extend(
+            tx.body
+                .outputs
+                .iter()
+                .filter(|output| output.valid)
+                .map(|output| output.slot_index >> crate::consensus::params::LOG_SEGMENT_SIZE),
+        );
+        if touched_segments.len() >= crate::consensus::params::BLOCK_MAX_DISTINCT_SEGMENTS {
+            return None;
+        }
+
+        Some(Self {
+            standard_tx_count,
+            sweep_tx_count,
+            touched_segments,
+        })
+    }
+}
+
 /// Build a `BlockTemplate` from a set of candidate transactions.
 ///
 /// Steps:
@@ -197,8 +246,15 @@ pub fn build_block_template(
             })?;
 
     let mut applied_winners: Vec<Transaction> = Vec::new();
+    // Reserve one segment for coinbase. Typical templates place coinbase in
+    // an already-populated segment, but this conservative reservation makes
+    // the final 256-segment consensus bound unconditional.
+    let mut resources = TemplateResourceSelection::default();
     let ordered_winners = order_block_txs(winners);
     for tx in ordered_winners {
+        let Some(next_resources) = resources.with_user_tx(&tx) else {
+            continue;
+        };
         let required =
             required_fee_for_tx_body(&tx.body, parent.active_slot_count, parent.log_slots);
         let actual = tx.body.fee.min(u64::MAX as u128) as u64;
@@ -207,6 +263,7 @@ pub fn build_block_template(
         }
         match apply_tx_checked_deferred_root(&mut selection_scratch, &tx.body) {
             Ok(_) => {
+                resources = next_resources;
                 applied_winners.push(tx);
             }
             Err(_e) => {}
@@ -390,6 +447,57 @@ mod tests {
 
     fn fresh_state() -> ChainState {
         ChainState::with_log_slots(TEST_LOG_SLOTS)
+    }
+
+    fn resource_tx(shape: noid_tx::TxShape, segments: &[u32]) -> Transaction {
+        let inputs = segments
+            .iter()
+            .map(|&segment| TxInput {
+                slot_index: segment << crate::consensus::params::LOG_SEGMENT_SIZE,
+                value: 1,
+                creation_id: 0,
+                owner: Address([1; 32]),
+                spend_secret: SpendSecret([2; 32]),
+                valid: true,
+            })
+            .collect();
+        Transaction {
+            body: TxBody {
+                shape,
+                epoch_anchor: [1; 32],
+                fee: 0,
+                inputs,
+                outputs: Vec::new(),
+                is_coinbase: false,
+            },
+            tx_body_hash: noid_poseidon2b::primitives::TxBodyHash([0; 32]),
+        }
+    }
+
+    #[test]
+    fn template_resource_selection_charges_sparse_sweep_shape() {
+        let tx = resource_tx(noid_tx::TxShape::Sweep25x2, &[0]);
+        let mut resources = TemplateResourceSelection::default();
+        for _ in 0..40 {
+            resources = resources
+                .with_user_tx(&tx)
+                .expect("forty sparse sweeps fit the physical input budget");
+        }
+        assert!(resources.with_user_tx(&tx).is_none());
+    }
+
+    #[test]
+    fn template_resource_selection_reserves_coinbase_segment() {
+        let mut resources = TemplateResourceSelection::default();
+        for chunk in (0..255u32).collect::<Vec<_>>().chunks(4) {
+            resources = resources
+                .with_user_tx(&resource_tx(noid_tx::TxShape::Standard4x8, chunk))
+                .expect("255 user segments leave one for coinbase");
+        }
+        assert_eq!(resources.touched_segments.len(), 255);
+        assert!(resources
+            .with_user_tx(&resource_tx(noid_tx::TxShape::Standard4x8, &[255]))
+            .is_none());
     }
 
     #[test]

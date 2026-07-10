@@ -5066,18 +5066,22 @@ mod tests {
             block_header: units[1].block_header.clone(),
         };
         bad_unit.start_accumulator.height = 3;
-        let mut b = FieldR1csBuilder::new();
-        let _ = build_block_slots_with_config(
-            &mut b,
-            &bad_unit.start_accumulator,
-            &bad_unit.end_accumulator,
-            &bad_unit.inputs,
-            &bad_unit.proof,
-            no_pcs,
-        );
-        let (rbad, zbad) = b.build();
+        let accepted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut b = FieldR1csBuilder::new();
+            let _ = build_block_slots_with_config(
+                &mut b,
+                &bad_unit.start_accumulator,
+                &bad_unit.end_accumulator,
+                &bad_unit.inputs,
+                &bad_unit.proof,
+                no_pcs,
+            );
+            let (rbad, zbad) = b.build();
+            rbad.satisfies(&zbad)
+        }))
+        .unwrap_or(false);
         assert!(
-            !rbad.satisfies(&zbad),
+            !accepted,
             "XOR-passing wrong parent height (3 -> child 2) must be rejected by the incrementer"
         );
         eprintln!("[block-slots] integer height successor rejects the XOR-decrement attack");

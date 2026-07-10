@@ -45,22 +45,25 @@ pub const BLOCK_BASELINE_STANDARD_USER_TXS: usize = BLOCK_MAX_TXS - 1;
 /// Maximum non-coinbase transactions accepted by consensus.
 pub const BLOCK_MAX_USER_TXS: usize = BLOCK_BASELINE_STANDARD_USER_TXS;
 
-/// Maximum valid user inputs accepted by consensus in one block.
+/// Maximum shape-charged user input capacity accepted by consensus in one
+/// block. A Standard4x8 body always charges 4 and a Sweep25x2 body always
+/// charges 25, irrespective of its validity bitmap.
 pub const BLOCK_MAX_LIVE_INPUTS: usize =
     BLOCK_BASELINE_STANDARD_USER_TXS * noid_tx::TxShape::Standard4x8.max_inputs();
 
-/// Maximum valid user outputs accepted by consensus in one block.
+/// Maximum shape-charged user output capacity accepted by consensus.
 pub const BLOCK_MAX_USER_OUTPUTS: usize =
     BLOCK_BASELINE_STANDARD_USER_TXS * noid_tx::TxShape::Standard4x8.max_outputs();
 
-/// Maximum unique owner groups accepted by consensus in one block.
-///
-/// A transaction cannot have more unique owner groups than live inputs, so this
-/// matches the baseline live-input budget.
-pub const BLOCK_MAX_OWNER_GROUPS: usize = BLOCK_MAX_LIVE_INPUTS;
-
-/// Maximum spend+mint user action count accepted by consensus in one block.
+/// Maximum shape-charged user action capacity accepted by consensus.
 pub const BLOCK_MAX_USER_ACTIONS: usize = BLOCK_MAX_LIVE_INPUTS + BLOCK_MAX_USER_OUTPUTS;
+
+/// Maximum accepted live action count including the mandatory coinbase output.
+pub const BLOCK_MAX_ACTIONS: usize = BLOCK_MAX_USER_ACTIONS + 1;
+
+/// Maximum number of distinct dense state segments a block may make resident.
+/// This is an availability/DoS bound and is checked before segment preload.
+pub const BLOCK_MAX_DISTINCT_SEGMENTS: usize = 256;
 
 /// Maximum full Sweep25x2 transactions admitted by the semantic live-input
 /// budget when every sweep uses 25 live inputs.
@@ -68,17 +71,16 @@ pub const BLOCK_MAX_FULL_SWEEP25X2_TXS: usize =
     BLOCK_MAX_LIVE_INPUTS / noid_tx::TxShape::Sweep25x2.max_inputs();
 
 #[inline]
-pub const fn block_semantic_limits_ok(
-    user_txs: usize,
-    live_inputs: usize,
-    user_outputs: usize,
-    owner_groups: usize,
-) -> bool {
+pub const fn block_shape_limits_ok(standard_txs: usize, sweep_txs: usize) -> bool {
+    let user_txs = standard_txs + sweep_txs;
+    let charged_inputs = standard_txs * noid_tx::TxShape::Standard4x8.max_inputs()
+        + sweep_txs * noid_tx::TxShape::Sweep25x2.max_inputs();
+    let charged_outputs = standard_txs * noid_tx::TxShape::Standard4x8.max_outputs()
+        + sweep_txs * noid_tx::TxShape::Sweep25x2.max_outputs();
     user_txs <= BLOCK_MAX_USER_TXS
-        && live_inputs <= BLOCK_MAX_LIVE_INPUTS
-        && user_outputs <= BLOCK_MAX_USER_OUTPUTS
-        && owner_groups <= BLOCK_MAX_OWNER_GROUPS
-        && live_inputs + user_outputs <= BLOCK_MAX_USER_ACTIONS
+        && charged_inputs <= BLOCK_MAX_LIVE_INPUTS
+        && charged_outputs <= BLOCK_MAX_USER_OUTPUTS
+        && charged_inputs + charged_outputs <= BLOCK_MAX_USER_ACTIONS
 }
 
 // ---------------------------------------------------------------------------
@@ -228,6 +230,11 @@ pub const LOG_SLOTS_MAX: u32 = 32;
 /// Each segment holds 2^LOG_SEGMENT_SIZE slots.
 pub const LOG_SEGMENT_SIZE: u32 = 16;
 
+const _: () = assert!(
+    LOG_SEGMENT_SIZE as usize == crate::fri_state::LOG_SEGMENT_SIZE,
+    "consensus and state segment geometry must match"
+);
+
 /// Fraction of current capacity that triggers expansion (numerator/denominator).
 /// When `active_slot_count * EXPAND_DENOM >= 2^log_slots * EXPAND_NUM`, expand.
 pub const EXPAND_NUM: u64 = 3; // 75 %
@@ -376,31 +383,24 @@ mod tests {
     }
 
     #[test]
-    fn semantic_block_budget_is_standard_baseline() {
+    fn shape_charged_block_budget_is_standard_baseline() {
         assert_eq!(BLOCK_MAX_TXS, 256);
         assert_eq!(BLOCK_MAX_USER_TXS, 255);
         assert_eq!(BLOCK_MAX_LIVE_INPUTS, 1020);
         assert_eq!(BLOCK_MAX_USER_OUTPUTS, 2040);
         assert_eq!(BLOCK_MAX_USER_ACTIONS, 3060);
-        assert_eq!(BLOCK_MAX_OWNER_GROUPS, 1020);
+        assert_eq!(BLOCK_MAX_ACTIONS, 3061);
+        assert_eq!(BLOCK_MAX_DISTINCT_SEGMENTS, 256);
         assert_eq!(BLOCK_MAX_FULL_SWEEP25X2_TXS, 40);
     }
 
     #[test]
-    fn semantic_block_budget_rejects_full_sweep_overload() {
-        assert!(block_semantic_limits_ok(255, 1020, 2040, 1020));
-        assert!(block_semantic_limits_ok(
-            BLOCK_MAX_FULL_SWEEP25X2_TXS,
-            BLOCK_MAX_FULL_SWEEP25X2_TXS * noid_tx::TxShape::Sweep25x2.max_inputs(),
-            BLOCK_MAX_FULL_SWEEP25X2_TXS * noid_tx::TxShape::Sweep25x2.max_outputs(),
-            BLOCK_MAX_FULL_SWEEP25X2_TXS * noid_tx::TxShape::Sweep25x2.max_inputs(),
-        ));
-        assert!(!block_semantic_limits_ok(
-            BLOCK_MAX_FULL_SWEEP25X2_TXS + 1,
-            (BLOCK_MAX_FULL_SWEEP25X2_TXS + 1) * noid_tx::TxShape::Sweep25x2.max_inputs(),
-            (BLOCK_MAX_FULL_SWEEP25X2_TXS + 1) * noid_tx::TxShape::Sweep25x2.max_outputs(),
-            (BLOCK_MAX_FULL_SWEEP25X2_TXS + 1) * noid_tx::TxShape::Sweep25x2.max_inputs(),
-        ));
+    fn shape_charged_budget_rejects_sparse_sweep_overload() {
+        assert!(block_shape_limits_ok(255, 0));
+        assert!(block_shape_limits_ok(0, BLOCK_MAX_FULL_SWEEP25X2_TXS));
+        assert!(block_shape_limits_ok(5, 40));
+        assert!(!block_shape_limits_ok(6, 40));
+        assert!(!block_shape_limits_ok(0, BLOCK_MAX_FULL_SWEEP25X2_TXS + 1));
     }
 
     #[test]

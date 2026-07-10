@@ -91,8 +91,8 @@ pub use timestamps::{
     validate_timestamp,
 };
 pub use validation::{
-    block_semantic_counts, validate_block_checks, validate_block_checks_timeless,
-    validate_block_consensus, validate_block_semantic_limits, AnchorInfo, BlockSemanticCounts,
+    validate_block_checks, validate_block_checks_timeless, validate_block_consensus,
+    validate_block_resource_preflight, AnchorInfo, BlockResourcePreflight,
 };
 
 /// Consensus validation errors — one variant per block invariant.
@@ -112,8 +112,8 @@ pub enum ConsensusError {
     MissingProof,
     /// §16.8 — Block contains more than `BLOCK_MAX_TXS` decoded transactions.
     TooManyTxs,
-    /// §16.8b — Block exceeds the Standard4x8-calibrated semantic budget.
-    BlockSemanticLimitExceeded {
+    /// §16.8b — Block exceeds a canonical shape or availability resource bound.
+    BlockResourceLimitExceeded {
         limit: &'static str,
         actual: usize,
         max: usize,

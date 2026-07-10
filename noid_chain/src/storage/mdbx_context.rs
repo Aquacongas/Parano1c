@@ -566,8 +566,42 @@ impl MdbxChainContext {
         ) -> Result<[u8; 32], E>,
         E: std::fmt::Display,
     {
+        let parent = *self.tip_header();
+        let prev_timestamps = self.prev_timestamps();
+        let prev_active_counts = self.prev_active_counts();
+        let anchor = self.anchor_info();
+        // All deterministic cheap checks, including shape-charged resources
+        // and the segment cap, precede proof decode, segment hydration, state
+        // cloning, and undo allocation.
+        validate_block_checks(
+            block,
+            &parent,
+            &prev_timestamps,
+            &prev_active_counts,
+            local_time,
+            &anchor,
+        )?;
+
         let has_user_txs = block.transactions.iter().any(|tx| !tx.body.is_coinbase);
-        if !has_user_txs {
+        if has_user_txs {
+            use crate::consensus::wire_limits::{
+                proof_sidecar_combined_len_ok, MAX_BLOCK_AUTH_SIDECAR_BYTES, MAX_BLOCK_PROOF_BYTES,
+            };
+            if block_proof_bytes.is_empty() || block_auth_sidecar_bytes.is_empty() {
+                return Err(MdbxContextError::Consensus(ConsensusError::MissingProof));
+            }
+            if block_proof_bytes.len() > MAX_BLOCK_PROOF_BYTES
+                || block_auth_sidecar_bytes.len() > MAX_BLOCK_AUTH_SIDECAR_BYTES
+                || !proof_sidecar_combined_len_ok(
+                    block_proof_bytes.len(),
+                    block_auth_sidecar_bytes.len(),
+                )
+            {
+                return Err(MdbxContextError::Consensus(ConsensusError::ShapeMismatch(
+                    "block proof/auth sidecar exceeds wire limits".to_string(),
+                )));
+            }
+        } else {
             crate::block::validate_block_proof_binding(block, block_proof_bytes).map_err(|e| {
                 MdbxContextError::Consensus(ConsensusError::ShapeMismatch(format!(
                     "coinbase-only proof binding invalid: {e}"
@@ -580,11 +614,7 @@ impl MdbxChainContext {
             }
         }
 
-        let parent = *self.tip_header();
-        let prev_timestamps = self.prev_timestamps();
-        let prev_active_counts = self.prev_active_counts();
-        let anchor = self.anchor_info();
-        self.preload_segments_for_block(block)?;
+        self.preload_segments_for_preflighted_block(block)?;
         if !has_user_txs {
             // The native coinbase-only path recomputes the exact post-root.
             // Until it has an incremental exact-tree cache, every live segment
@@ -619,14 +649,6 @@ impl MdbxChainContext {
                 }
             }
         } else {
-            validate_block_checks(
-                block,
-                &parent,
-                &prev_timestamps,
-                &prev_active_counts,
-                local_time,
-                &anchor,
-            )?;
             apply_state_delta(&mut self.state, block)
                 .map_err(|e| {
                     self.state = state_before_validation.clone();
@@ -1301,6 +1323,16 @@ impl MdbxChainContext {
     /// and each output slot (must be empty = need to read to verify).
     /// Reloads from MDBX any segment that is currently evicted.
     pub fn preload_segments_for_block(&mut self, block: &Block) -> Result<(), MdbxContextError> {
+        // Keep the public preload helper fail-closed even when a caller does
+        // not come through `apply_next_block`.
+        crate::consensus::validate_block_resource_preflight(block)?;
+        self.preload_segments_for_preflighted_block(block)
+    }
+
+    fn preload_segments_for_preflighted_block(
+        &mut self,
+        block: &Block,
+    ) -> Result<(), MdbxContextError> {
         let eff_log = self.state.state.effective_log_segment_size();
         let mut needed: std::collections::HashSet<u16> = std::collections::HashSet::new();
 
@@ -1804,6 +1836,57 @@ mod tests {
             ctx.store.get_header_anchor(0).unwrap(),
             Some(expected_anchor)
         );
+    }
+
+    #[test]
+    fn segment_cap_fails_before_preload_reads() {
+        use noid_poseidon2b::primitives::{Address, SpendSecret, TxBodyHash};
+        use noid_tx::{Transaction, TxBody, TxInput, TxShape};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
+        let mut transactions = Vec::new();
+        for chunk in (0..257usize).collect::<Vec<_>>().chunks(4) {
+            let inputs = chunk
+                .iter()
+                .map(|&segment| TxInput {
+                    slot_index: (segment as u32) << crate::consensus::params::LOG_SEGMENT_SIZE,
+                    value: 1,
+                    creation_id: 0,
+                    owner: Address([1; 32]),
+                    spend_secret: SpendSecret([2; 32]),
+                    valid: true,
+                })
+                .collect();
+            transactions.push(Transaction {
+                body: TxBody {
+                    shape: TxShape::Standard4x8,
+                    epoch_anchor: [1; 32],
+                    fee: 0,
+                    inputs,
+                    outputs: Vec::new(),
+                    is_coinbase: false,
+                },
+                tx_body_hash: TxBodyHash([0; 32]),
+            });
+        }
+        let mut header = *ctx.tip_header();
+        header.log_slots = 32;
+        let block = Block {
+            header,
+            transactions,
+        };
+
+        assert!(matches!(
+            ctx.preload_segments_for_block(&block),
+            Err(MdbxContextError::Consensus(
+                ConsensusError::BlockResourceLimitExceeded {
+                    limit: "distinct_segments",
+                    actual: 257,
+                    max: crate::consensus::params::BLOCK_MAX_DISTINCT_SEGMENTS,
+                }
+            ))
+        ));
     }
 
     #[test]
