@@ -593,34 +593,21 @@ impl ParanoidApiServer for RpcHandler {
         let addr =
             Address::parse(&address).map_err(|e| rpc_err(format!("invalid address: {e}")))?;
         let chain = self.chain.read().await;
-        let utxos = chain
+        let snapshot = chain
             .store
-            .get_utxos_by_owner(&addr.0)
+            .get_verified_utxos_by_owner(&addr.0)
             .map_err(|e| rpc_err(e.to_string()))?;
-        // The owner index currently stores `(slot_index, amount)` only. Enrich
-        // each hit from canonical state so creation_id is never guessed or
-        // silently reported as zero. Also suppress a stale owner-index entry if
-        // its slot has since changed owner.
-        let mut segment_cache = HashMap::new();
-        let mut result = Vec::with_capacity(utxos.len());
-        for (slot_index, _indexed_value) in utxos {
-            let slot =
-                read_canonical_slot(&chain, slot_index, &mut segment_cache).map_err(rpc_err)?;
-            let mut state_owner = [0u8; 32];
-            state_owner[..16].copy_from_slice(&slot.owner_hi.0.to_le_bytes());
-            state_owner[16..].copy_from_slice(&slot.owner_lo.0.to_le_bytes());
-            if slot.is_empty() || state_owner != addr.0 {
-                continue;
-            }
-            result.push(SlotInfo {
-                slot_index,
-                value: slot.amount(),
-                creation_id: slot.creation_id(),
+        Ok(snapshot
+            .utxos
+            .into_iter()
+            .map(|utxo| SlotInfo {
+                slot_index: utxo.slot_index,
+                value: utxo.amount,
+                creation_id: utxo.creation_id,
                 owner: address.clone(),
                 empty: false,
-            });
-        }
-        Ok(result)
+            })
+            .collect())
     }
 
     async fn get_tx(&self, txhash: String) -> RpcResult<Option<TxInfo>> {

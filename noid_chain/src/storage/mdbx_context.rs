@@ -2088,13 +2088,21 @@ mod tests {
         assert_eq!(ctx.state.state.log_slots(), child_log as usize);
         assert_eq!(ctx.state.state.slot(upper_slot).creation_id(), 1);
         assert_eq!(
-            ctx.store.get_utxos_by_owner(&owner.0).unwrap(),
-            vec![(upper_slot, reward)]
+            ctx.store
+                .get_verified_utxos_by_owner(&owner.0)
+                .unwrap()
+                .utxos,
+            vec![crate::storage::mdbx_store::VerifiedOwnerUtxo {
+                slot_index: upper_slot,
+                amount: reward,
+                creation_id: 1,
+            }]
         );
         assert!(ctx
             .store
-            .get_utxos_by_owner(&transient_owner.0)
+            .get_verified_utxos_by_owner(&transient_owner.0)
             .unwrap()
+            .utxos
             .is_empty());
         assert!(ctx.store.get_segment(1).unwrap().is_some());
         let stored_undo = ctx.store.get_undo_log(1).unwrap().unwrap();
@@ -2111,7 +2119,12 @@ mod tests {
         })
         .unwrap();
         assert_eq!(ctx.state.state.log_slots(), parent_log as usize);
-        assert!(ctx.store.get_utxos_by_owner(&owner.0).unwrap().is_empty());
+        assert!(ctx
+            .store
+            .get_verified_utxos_by_owner(&owner.0)
+            .unwrap()
+            .utxos
+            .is_empty());
         assert!(ctx.store.get_segment(1).unwrap().is_none());
         drop(ctx);
 
@@ -2126,13 +2139,15 @@ mod tests {
             .all(|(segment_id, _, _)| *segment_id == 0));
         assert!(reopened
             .store
-            .get_utxos_by_owner(&owner.0)
+            .get_verified_utxos_by_owner(&owner.0)
             .unwrap()
+            .utxos
             .is_empty());
         assert!(reopened
             .store
-            .get_utxos_by_owner(&transient_owner.0)
+            .get_verified_utxos_by_owner(&transient_owner.0)
             .unwrap()
+            .utxos
             .is_empty());
         assert!(reopened.store.get_segment(1).unwrap().is_none());
         reopened.state.expand_one();

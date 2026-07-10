@@ -69,8 +69,11 @@ const T_ACCEPTED_BLOCK_BATCH_CERTIFICATE_PACKAGES: &str =
 /// Verified recursive checkpoint head records.
 /// Key: checkpoint height (u64 LE). Value: raw bincode bytes owned by noid_recursive.
 const T_HISTORY_CHECKPOINT_HEADS: &str = "history_checkpoint_heads";
-/// Owner UTXO index. Key: owner[32]. Value: packed (slot:u32, value:u64)[] = 12 bytes each.
-/// Maintained incrementally in commit_block. Used for O(1) wallet scan.
+/// Owner UTXO index. Key: owner[32]. Value: packed
+/// `(slot:u32, packed_value:u128)[]` records. `packed_value` contains both the
+/// amount and the allocation-counter creation id, so an index lookup can be
+/// checked exactly against the durable state segment before it is exposed.
+/// Maintained incrementally in `commit_block`.
 const T_OWNER_INDEX: &str = "owner_idx";
 /// Immutable checkpoint package. Key: checkpoint height (u64 LE).
 const T_CHECKPOINT_PACKAGES: &str = "checkpoint_packages";
@@ -131,6 +134,34 @@ pub struct MdbxStore {
 // Owner index helpers
 // ---------------------------------------------------------------------------
 
+const OWNER_INDEX_RECORD_BYTES: usize = 4 + 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OwnerIndexEntry {
+    slot_index: u32,
+    packed_value: u128,
+}
+
+/// One owner-index entry after exact verification against the durable state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerifiedOwnerUtxo {
+    pub slot_index: u32,
+    pub amount: u64,
+    pub creation_id: u64,
+}
+
+/// Exact owner view tied to one atomic durable chain snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedOwnerSnapshot {
+    pub height: u64,
+    pub tip_hash: [u8; 32],
+    pub state_root: [u8; 32],
+    pub log_slots: u32,
+    pub active_slot_count: u64,
+    pub alloc_counter: u64,
+    pub utxos: Vec<VerifiedOwnerUtxo>,
+}
+
 /// Extract the 32-byte owner key from a slot's owner fields.
 #[inline]
 fn owner_key_from_fields(owner_hi: noid_core::Block128, owner_lo: noid_core::Block128) -> [u8; 32] {
@@ -140,28 +171,57 @@ fn owner_key_from_fields(owner_hi: noid_core::Block128, owner_lo: noid_core::Blo
     key
 }
 
-/// Encode a list of (slot_index, value) pairs for MDBX storage.
-#[inline]
-fn encode_owner_entries(entries: &[(u32, u64)]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(entries.len() * 12);
-    for &(slot, val) in entries {
-        buf.extend_from_slice(&slot.to_le_bytes());
-        buf.extend_from_slice(&val.to_le_bytes());
+/// Encode a strictly sorted, duplicate-free owner index value.
+fn encode_owner_entries(entries: &[OwnerIndexEntry]) -> Result<Vec<u8>, StoreError> {
+    if entries.is_empty() {
+        return Err(StoreError::Decode("empty owner-index value"));
     }
-    buf
+    if !entries
+        .windows(2)
+        .all(|pair| pair[0].slot_index < pair[1].slot_index)
+    {
+        return Err(StoreError::Decode(
+            "owner-index slots are not strictly sorted and unique",
+        ));
+    }
+    let capacity = entries
+        .len()
+        .checked_mul(OWNER_INDEX_RECORD_BYTES)
+        .ok_or(StoreError::Decode("owner-index encoded length overflow"))?;
+    let mut buf = Vec::with_capacity(capacity);
+    for entry in entries {
+        buf.extend_from_slice(&entry.slot_index.to_le_bytes());
+        buf.extend_from_slice(&entry.packed_value.to_le_bytes());
+    }
+    Ok(buf)
 }
 
-/// Decode a packed (slot_index, value) list from MDBX bytes.
-#[inline]
-fn decode_owner_entries(bytes: &[u8]) -> Vec<(u32, u64)> {
-    bytes
-        .chunks_exact(12)
-        .map(|c| {
-            let slot = u32::from_le_bytes(c[..4].try_into().unwrap());
-            let val = u64::from_le_bytes(c[4..12].try_into().unwrap());
-            (slot, val)
-        })
-        .collect()
+/// Decode the only accepted pre-launch owner-index format. There is
+/// deliberately no legacy 12-byte amount-only decoder.
+fn decode_owner_entries(bytes: &[u8]) -> Result<Vec<OwnerIndexEntry>, StoreError> {
+    if bytes.is_empty() {
+        return Err(StoreError::Decode("empty owner-index value"));
+    }
+    if bytes.len() % OWNER_INDEX_RECORD_BYTES != 0 {
+        return Err(StoreError::Decode("invalid owner-index encoded length"));
+    }
+
+    let mut entries = Vec::with_capacity(bytes.len() / OWNER_INDEX_RECORD_BYTES);
+    for chunk in bytes.chunks_exact(OWNER_INDEX_RECORD_BYTES) {
+        entries.push(OwnerIndexEntry {
+            slot_index: u32::from_le_bytes(chunk[..4].try_into().unwrap()),
+            packed_value: u128::from_le_bytes(chunk[4..20].try_into().unwrap()),
+        });
+    }
+    if !entries
+        .windows(2)
+        .all(|pair| pair[0].slot_index < pair[1].slot_index)
+    {
+        return Err(StoreError::Decode(
+            "owner-index slots are not strictly sorted and unique",
+        ));
+    }
+    Ok(entries)
 }
 
 #[inline]
@@ -716,18 +776,169 @@ impl MdbxStore {
         Ok(raw.and_then(|b| decode_checkpoint_coverage(&b)))
     }
 
-    /// Look up all live UTXOs for a given owner address.
+    /// Look up one owner's live UTXOs and verify every secondary-index entry
+    /// against the exact durable state in the same MDBX read transaction.
     ///
-    /// Returns `Vec<(slot_index, value_micronoid)>` — all UTXOs currently
-    /// owned by `owner` according to the incremental owner index.
-    ///
-    /// Returns an empty vec if the owner has no UTXOs OR if the index has
-    /// not yet been populated (e.g. on first startup before any blocks).
-    pub fn get_utxos_by_owner(&self, owner: &[u8; 32]) -> Result<Vec<(u32, u64)>, StoreError> {
+    /// The owner index is only an accelerator. A malformed, stale, duplicate,
+    /// out-of-domain, or value-mismatched entry fails closed rather than being
+    /// returned to the wallet. Absence of an owner key canonically means that
+    /// the owner currently has no live UTXOs.
+    pub fn get_verified_utxos_by_owner(
+        &self,
+        owner: &[u8; 32],
+    ) -> Result<VerifiedOwnerSnapshot, StoreError> {
         let txn = self.db.begin_ro_txn()?;
-        let tbl = txn.open_table(Some(T_OWNER_INDEX))?;
-        let raw: Option<Vec<u8>> = txn.get(&tbl, owner.as_slice())?;
-        Ok(raw.map(|b| decode_owner_entries(&b)).unwrap_or_default())
+
+        // Bind the returned owner view to the exact chain/state identity from
+        // this same MDBX snapshot. Callers never supply log_slots from a
+        // separately locked in-memory view.
+        let tip_tbl = txn.open_table(Some(T_CHAIN_TIP))?;
+        let tip_raw: Vec<u8> = txn.get(&tip_tbl, KEY_TIP)?.ok_or(StoreError::Decode(
+            "missing chain tip for owner-index query",
+        ))?;
+        let (height, tip_hash) = decode_chain_tip(&tip_raw).ok_or(StoreError::Decode(
+            "invalid chain tip for owner-index query",
+        ))?;
+        let header_tbl = txn.open_table(Some(T_HEADERS))?;
+        let header_raw: Vec<u8> =
+            txn.get(&header_tbl, &u64_key(height))?
+                .ok_or(StoreError::Decode(
+                    "missing tip header for owner-index query",
+                ))?;
+        let header = decode_header(&header_raw).ok_or(StoreError::Decode(
+            "invalid tip header for owner-index query",
+        ))?;
+        if header.height != height || crate::consensus::pow::block_id(&header) != tip_hash {
+            return Err(StoreError::Decode(
+                "tip identity mismatch during owner-index query",
+            ));
+        }
+        let state_meta_tbl = txn.open_table(Some(T_STATE_META))?;
+        let state_meta_raw: Vec<u8> =
+            txn.get(&state_meta_tbl, KEY_META)?
+                .ok_or(StoreError::Decode(
+                    "missing state metadata for owner-index query",
+                ))?;
+        let (log_slots, active_slot_count, alloc_counter) = decode_state_meta(&state_meta_raw)
+            .ok_or(StoreError::Decode(
+                "invalid state metadata for owner-index query",
+            ))?;
+        if header.log_slots != log_slots
+            || header.active_slot_count != active_slot_count
+            || header.alloc_counter != alloc_counter
+        {
+            return Err(StoreError::Decode(
+                "tip header and state metadata disagree during owner-index query",
+            ));
+        }
+        if !(1..=32).contains(&log_slots) {
+            return Err(StoreError::Decode(
+                "owner-index query log_slots is outside the u32 slot domain",
+            ));
+        }
+        let effective_log = log_slots.min(crate::consensus::params::LOG_SEGMENT_SIZE);
+        let slot_domain = 1u64 << log_slots;
+
+        let owner_tbl = txn.open_table(Some(T_OWNER_INDEX))?;
+        let raw: Option<Vec<u8>> = txn.get(&owner_tbl, owner.as_slice())?;
+        let Some(raw) = raw else {
+            return Ok(VerifiedOwnerSnapshot {
+                height,
+                tip_hash,
+                state_root: header.state_root,
+                log_slots,
+                active_slot_count,
+                alloc_counter,
+                utxos: Vec::new(),
+            });
+        };
+        if (raw.len() / OWNER_INDEX_RECORD_BYTES) as u64 > slot_domain {
+            return Err(StoreError::Decode(
+                "owner-index entry count exceeds slot domain",
+            ));
+        }
+        let entries = decode_owner_entries(&raw)?;
+
+        let segment_tbl = txn.open_table(Some(T_SEGMENTS))?;
+        // Entries are strictly slot-sorted, hence segment-sorted. Retain only
+        // one decoded dense segment at a time rather than O(owner segments).
+        let mut current_segment: Option<(u16, SegmentColumns)> = None;
+        let mut verified = Vec::with_capacity(entries.len());
+        for entry in entries {
+            if entry.slot_index as u64 >= slot_domain {
+                return Err(StoreError::Decode(
+                    "owner-index slot is outside current state domain",
+                ));
+            }
+            let segment_id = (entry.slot_index >> effective_log) as u16;
+            if current_segment
+                .as_ref()
+                .is_none_or(|(loaded_id, _)| *loaded_id != segment_id)
+            {
+                let segment_raw: Option<Vec<u8>> =
+                    txn.get(&segment_tbl, &segment_id.to_le_bytes())?;
+                let segment_raw = segment_raw.ok_or(StoreError::Decode(
+                    "owner-index slot references a missing durable segment",
+                ))?;
+                let (stored_effective_log, columns) = decode_segment(&segment_raw).ok_or(
+                    StoreError::Decode("invalid durable segment referenced by owner index"),
+                )?;
+                if u32::from(stored_effective_log) != effective_log {
+                    return Err(StoreError::Decode(
+                        "owner-index segment effective log mismatch",
+                    ));
+                }
+                current_segment = Some((segment_id, columns));
+            }
+
+            let local_mask = (1u32 << effective_log) - 1;
+            let local = (entry.slot_index & local_mask) as usize;
+            let columns = &current_segment
+                .as_ref()
+                .expect("segment was inserted above")
+                .1;
+            if local >= columns.values.len()
+                || local >= columns.owners_hi.len()
+                || local >= columns.owners_lo.len()
+            {
+                return Err(StoreError::Decode(
+                    "owner-index slot exceeds durable segment columns",
+                ));
+            }
+            let value = columns.values[local];
+            let owner_hi = columns.owners_hi[local];
+            let owner_lo = columns.owners_lo[local];
+            if value.0 == 0 && owner_hi.0 == 0 && owner_lo.0 == 0 {
+                return Err(StoreError::Decode(
+                    "owner-index slot is empty in durable state",
+                ));
+            }
+            if owner_key_from_fields(owner_hi, owner_lo) != *owner {
+                return Err(StoreError::Decode(
+                    "owner-index owner does not match durable state",
+                ));
+            }
+            if value.0 != entry.packed_value {
+                return Err(StoreError::Decode(
+                    "owner-index packed value does not match durable state",
+                ));
+            }
+            let (amount, creation_id) = unpack_amount_creation_id(value);
+            verified.push(VerifiedOwnerUtxo {
+                slot_index: entry.slot_index,
+                amount,
+                creation_id,
+            });
+        }
+        Ok(VerifiedOwnerSnapshot {
+            height,
+            tip_hash,
+            state_root: header.state_root,
+            log_slots,
+            active_slot_count,
+            alloc_counter,
+            utxos: verified,
+        })
     }
 
     /// Rebuild the owner index from a set of segment columns (used after
@@ -740,8 +951,8 @@ impl MdbxStore {
     ) -> Result<(), StoreError> {
         use std::collections::HashMap;
 
-        // Build in-memory map: owner_key → Vec<(slot, value)>
-        let mut owner_map: HashMap<[u8; 32], Vec<(u32, u64)>> = HashMap::new();
+        // Build in-memory map: owner_key → exact packed state entries.
+        let mut owner_map: HashMap<[u8; 32], Vec<OwnerIndexEntry>> = HashMap::new();
         for &(seg_id, eff_log, cols) in segments {
             let eff_log = eff_log as u32;
             let seg_size = cols.values.len();
@@ -754,8 +965,13 @@ impl MdbxStore {
                 }
                 let owner_key = owner_key_from_fields(oh, ol);
                 let slot = ((seg_id as u32) << eff_log) | (local as u32);
-                let value = unpack_amount_creation_id(v).0;
-                owner_map.entry(owner_key).or_default().push((slot, value));
+                owner_map
+                    .entry(owner_key)
+                    .or_default()
+                    .push(OwnerIndexEntry {
+                        slot_index: slot,
+                        packed_value: v.0,
+                    });
             }
         }
 
@@ -779,8 +995,11 @@ impl MdbxStore {
         }
 
         // Write new entries.
+        for entries in owner_map.values_mut() {
+            entries.sort_unstable_by_key(|entry| entry.slot_index);
+        }
         for (owner_key, entries) in &owner_map {
-            let encoded = encode_owner_entries(entries);
+            let encoded = encode_owner_entries(entries)?;
             txn.put(&tbl, owner_key.as_slice(), &encoded, WriteFlags::empty())?;
         }
 
@@ -913,7 +1132,7 @@ impl MdbxStore {
             WriteFlags::empty(),
         )?;
 
-        let mut owner_map: HashMap<[u8; 32], Vec<(u32, u64)>> = HashMap::new();
+        let mut owner_map: HashMap<[u8; 32], Vec<OwnerIndexEntry>> = HashMap::new();
         for &(seg_id, eff_log, cols) in segments {
             let eff_log = eff_log as u32;
             for local in 0..cols.values.len() {
@@ -925,19 +1144,22 @@ impl MdbxStore {
                 }
                 let owner = owner_key_from_fields(owner_hi, owner_lo);
                 let slot = ((seg_id as u32) << eff_log) | (local as u32);
-                owner_map
-                    .entry(owner)
-                    .or_default()
-                    .push((slot, unpack_amount_creation_id(value).0));
+                owner_map.entry(owner).or_default().push(OwnerIndexEntry {
+                    slot_index: slot,
+                    packed_value: value.0,
+                });
             }
         }
 
         let owner_tbl = txn.open_table(Some(T_OWNER_INDEX))?;
+        for entries in owner_map.values_mut() {
+            entries.sort_unstable_by_key(|entry| entry.slot_index);
+        }
         for (owner, entries) in owner_map {
             txn.put(
                 &owner_tbl,
                 owner.as_slice(),
-                encode_owner_entries(&entries),
+                encode_owner_entries(&entries)?,
                 WriteFlags::empty(),
             )?;
         }
@@ -1214,7 +1436,7 @@ impl MdbxStore {
                     let _ = txn.del(&oidx_tbl, key, None);
                 }
 
-                let mut owner_map: std::collections::HashMap<[u8; 32], Vec<(u32, u64)>> =
+                let mut owner_map: std::collections::HashMap<[u8; 32], Vec<OwnerIndexEntry>> =
                     std::collections::HashMap::new();
                 {
                     let mut cursor = txn.cursor(&seg_tbl)?;
@@ -1232,10 +1454,10 @@ impl MdbxStore {
                                 if value.0 != 0 || owner_hi.0 != 0 || owner_lo.0 != 0 {
                                     let owner = owner_key_from_fields(owner_hi, owner_lo);
                                     let slot = ((seg_id as u32) << eff_log) | local as u32;
-                                    owner_map
-                                        .entry(owner)
-                                        .or_default()
-                                        .push((slot, unpack_amount_creation_id(value).0));
+                                    owner_map.entry(owner).or_default().push(OwnerIndexEntry {
+                                        slot_index: slot,
+                                        packed_value: value.0,
+                                    });
                                 }
                             }
                         }
@@ -1243,13 +1465,13 @@ impl MdbxStore {
                     }
                 }
                 for entries in owner_map.values_mut() {
-                    entries.sort_unstable_by_key(|(slot, _)| *slot);
+                    entries.sort_unstable_by_key(|entry| entry.slot_index);
                 }
                 for (owner, entries) in owner_map {
                     txn.put(
                         &oidx_tbl,
                         owner.as_slice(),
-                        encode_owner_entries(&entries),
+                        encode_owner_entries(&entries)?,
                         WriteFlags::empty(),
                     )?;
                 }
@@ -1267,9 +1489,9 @@ impl MdbxStore {
                             owner_key_from_fields(prev_value.owner_hi, prev_value.owner_lo);
                         let existing: Option<Vec<u8>> = txn.get(&oidx_tbl, owner_key.as_slice())?;
                         if let Some(raw) = existing {
-                            let entries: Vec<(u32, u64)> = decode_owner_entries(&raw)
+                            let entries: Vec<OwnerIndexEntry> = decode_owner_entries(&raw)?
                                 .into_iter()
-                                .filter(|(slot, _)| *slot != slot_index)
+                                .filter(|entry| entry.slot_index != slot_index)
                                 .collect();
                             if entries.is_empty() {
                                 let _ = txn.del(&oidx_tbl, owner_key.as_slice(), None);
@@ -1277,7 +1499,7 @@ impl MdbxStore {
                                 txn.put(
                                     &oidx_tbl,
                                     owner_key.as_slice(),
-                                    encode_owner_entries(&entries),
+                                    encode_owner_entries(&entries)?,
                                     WriteFlags::empty(),
                                 )?;
                             }
@@ -1321,19 +1543,21 @@ impl MdbxStore {
                     } = post_value;
                     if value.0 != 0 || owner_hi.0 != 0 || owner_lo.0 != 0 {
                         let owner_key = owner_key_from_fields(owner_hi, owner_lo);
-                        let amount = unpack_amount_creation_id(value).0;
                         let existing: Option<Vec<u8>> = txn.get(&oidx_tbl, owner_key.as_slice())?;
-                        let mut entries = existing
-                            .as_deref()
-                            .map(decode_owner_entries)
-                            .unwrap_or_default();
-                        entries.retain(|(slot, _)| *slot != slot_index);
-                        entries.push((slot_index, amount));
-                        entries.sort_unstable_by_key(|(slot, _)| *slot);
+                        let mut entries = match existing {
+                            Some(raw) => decode_owner_entries(&raw)?,
+                            None => Vec::new(),
+                        };
+                        entries.retain(|entry| entry.slot_index != slot_index);
+                        entries.push(OwnerIndexEntry {
+                            slot_index,
+                            packed_value: value.0,
+                        });
+                        entries.sort_unstable_by_key(|entry| entry.slot_index);
                         txn.put(
                             &oidx_tbl,
                             owner_key.as_slice(),
-                            encode_owner_entries(&entries),
+                            encode_owner_entries(&entries)?,
                             WriteFlags::empty(),
                         )?;
                     }
@@ -1535,6 +1759,230 @@ impl crate::storage::BlockStore for MdbxStore {
 mod tests {
     use super::*;
 
+    fn owner_index_raw(entries: &[(u32, u128)]) -> Vec<u8> {
+        let mut raw = Vec::with_capacity(entries.len() * OWNER_INDEX_RECORD_BYTES);
+        for &(slot_index, packed_value) in entries {
+            raw.extend_from_slice(&slot_index.to_le_bytes());
+            raw.extend_from_slice(&packed_value.to_le_bytes());
+        }
+        raw
+    }
+
+    fn overwrite_owner_index(store: &MdbxStore, owner: &[u8; 32], raw: &[u8]) {
+        let txn = store.db.begin_rw_txn().unwrap();
+        let table = txn.open_table(Some(T_OWNER_INDEX)).unwrap();
+        txn.put(&table, owner.as_slice(), raw, WriteFlags::empty())
+            .unwrap();
+        txn.commit().unwrap();
+    }
+
+    fn commit_owner_fixture(
+        store: &MdbxStore,
+        owner: noid_poseidon2b::primitives::Address,
+    ) -> (BlockHeader, ConsensusMeta) {
+        let mut header = crate::consensus::genesis::genesis_header();
+        header.log_slots = 3;
+        header.active_slot_count = 2;
+        header.alloc_counter = 8;
+        let hash = crate::hash_block_header(&header);
+        let meta = ConsensusMeta {
+            tip_height: header.height,
+            tip_hash: hash,
+            cumulative_chainwork: [1u8; 32],
+            finalized: crate::storage::meta::FinalizedCheckpoint {
+                height: header.height,
+                hash,
+            },
+        };
+        let undo = BlockUndoLog {
+            block_height: header.height,
+            log_slots_before: header.log_slots,
+            active_slot_count_before: 0,
+            alloc_counter_before: 0,
+            slot_changes: vec![
+                (1, crate::fri_state::SlotValue::EMPTY),
+                (6, crate::fri_state::SlotValue::EMPTY),
+            ],
+            tx_hashes: vec![],
+        };
+        let mut columns = SegmentColumns::new_zero(8);
+        for (slot_index, amount, creation_id) in [(1usize, 11u64, 7u64), (6, 22, 8)] {
+            let slot = crate::fri_state::SlotValue::with_owner_fields(
+                amount,
+                creation_id,
+                owner.as_fields(),
+            );
+            columns.values[slot_index] = slot.value;
+            columns.owners_hi[slot_index] = slot.owner_hi;
+            columns.owners_lo[slot_index] = slot.owner_lo;
+        }
+        store
+            .commit_block(
+                &header,
+                &hash,
+                &undo,
+                &[(0, 3, &columns)],
+                &[],
+                &[],
+                None,
+                &meta,
+                false,
+            )
+            .unwrap();
+        (header, meta)
+    }
+
+    #[test]
+    fn owner_index_codec_rejects_noncanonical_values() {
+        let first = OwnerIndexEntry {
+            slot_index: 1,
+            packed_value: 7,
+        };
+        let second = OwnerIndexEntry {
+            slot_index: 2,
+            packed_value: 8,
+        };
+        let encoded = encode_owner_entries(&[first, second]).unwrap();
+        assert_eq!(decode_owner_entries(&encoded).unwrap(), vec![first, second]);
+
+        assert!(decode_owner_entries(&[]).is_err());
+        assert!(decode_owner_entries(&encoded[..encoded.len() - 1]).is_err());
+        assert!(encode_owner_entries(&[second, first]).is_err());
+        assert!(encode_owner_entries(&[first, first]).is_err());
+        assert!(decode_owner_entries(&owner_index_raw(&[(2, 8), (1, 7)])).is_err());
+        assert!(decode_owner_entries(&owner_index_raw(&[(1, 7), (1, 8)])).is_err());
+    }
+
+    #[test]
+    fn verified_owner_lookup_checks_exact_amount_and_creation_id() {
+        use noid_poseidon2b::primitives::Address;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(dir.path()).unwrap();
+        let owner = Address([0x41; 32]);
+        let other = Address([0x42; 32]);
+        let (header, _) = commit_owner_fixture(&store, owner);
+
+        let snapshot = store.get_verified_utxos_by_owner(&owner.0).unwrap();
+        assert_eq!(snapshot.height, header.height);
+        assert_eq!(snapshot.tip_hash, crate::hash_block_header(&header));
+        assert_eq!(snapshot.state_root, header.state_root);
+        assert_eq!(snapshot.log_slots, header.log_slots);
+        assert_eq!(snapshot.active_slot_count, header.active_slot_count);
+        assert_eq!(snapshot.alloc_counter, header.alloc_counter);
+        assert_eq!(
+            snapshot.utxos,
+            vec![
+                VerifiedOwnerUtxo {
+                    slot_index: 1,
+                    amount: 11,
+                    creation_id: 7,
+                },
+                VerifiedOwnerUtxo {
+                    slot_index: 6,
+                    amount: 22,
+                    creation_id: 8,
+                },
+            ]
+        );
+        let empty_snapshot = store.get_verified_utxos_by_owner(&other.0).unwrap();
+        assert_eq!(empty_snapshot.tip_hash, snapshot.tip_hash);
+        assert!(empty_snapshot.utxos.is_empty());
+    }
+
+    #[test]
+    fn verified_owner_lookup_rejects_state_identity_split_brain() {
+        use noid_poseidon2b::primitives::Address;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(dir.path()).unwrap();
+        let owner = Address([0x43; 32]);
+        let (header, _) = commit_owner_fixture(&store, owner);
+        store
+            .overwrite_state_meta_for_test(
+                header.log_slots,
+                header.active_slot_count + 1,
+                header.alloc_counter,
+            )
+            .unwrap();
+        assert!(store.get_verified_utxos_by_owner(&owner.0).is_err());
+    }
+
+    #[test]
+    fn verified_owner_lookup_rejects_stale_or_malformed_index_entries() {
+        use noid_poseidon2b::primitives::Address;
+        use noid_tx::pack_amount_creation_id;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(dir.path()).unwrap();
+        let owner = Address([0x51; 32]);
+        let (_header, _) = commit_owner_fixture(&store, owner);
+        let amount_11_id_7 = pack_amount_creation_id(11, 7).0;
+        let amount_22_id_8 = pack_amount_creation_id(22, 8).0;
+
+        for raw in [
+            vec![0xAA],
+            owner_index_raw(&[(1, amount_11_id_7), (1, amount_11_id_7)]),
+            owner_index_raw(&[(6, amount_22_id_8), (1, amount_11_id_7)]),
+            owner_index_raw(&[(1, pack_amount_creation_id(12, 7).0)]),
+            owner_index_raw(&[(1, pack_amount_creation_id(11, 9).0)]),
+            owner_index_raw(&[(2, amount_11_id_7)]),
+            owner_index_raw(&[(8, amount_11_id_7)]),
+        ] {
+            overwrite_owner_index(&store, &owner.0, &raw);
+            assert!(store.get_verified_utxos_by_owner(&owner.0).is_err());
+        }
+
+        let wrong_owner = Address([0x52; 32]);
+        overwrite_owner_index(
+            &store,
+            &wrong_owner.0,
+            &owner_index_raw(&[(1, amount_11_id_7)]),
+        );
+        assert!(store.get_verified_utxos_by_owner(&wrong_owner.0).is_err());
+    }
+
+    #[test]
+    fn snapshot_install_builds_exact_verified_owner_index() {
+        use noid_poseidon2b::primitives::Address;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(dir.path()).unwrap();
+        let owner = Address([0x61; 32]);
+        let mut header = crate::consensus::genesis::genesis_header();
+        header.log_slots = 3;
+        header.active_slot_count = 1;
+        header.alloc_counter = 19;
+        let hash = crate::hash_block_header(&header);
+        let meta = ConsensusMeta {
+            tip_height: header.height,
+            tip_hash: hash,
+            cumulative_chainwork: [1u8; 32],
+            finalized: crate::storage::meta::FinalizedCheckpoint {
+                height: header.height,
+                hash,
+            },
+        };
+        let mut columns = SegmentColumns::new_zero(8);
+        let slot = crate::fri_state::SlotValue::with_owner_fields(123, 19, owner.as_fields());
+        columns.values[5] = slot.value;
+        columns.owners_hi[5] = slot.owner_hi;
+        columns.owners_lo[5] = slot.owner_lo;
+
+        store.put_header_only(&header, &hash).unwrap();
+        store
+            .install_state_snapshot(&header, &hash, &meta, &[(0, 3, &columns)])
+            .unwrap();
+        assert_eq!(
+            store.get_verified_utxos_by_owner(&owner.0).unwrap().utxos,
+            vec![VerifiedOwnerUtxo {
+                slot_index: 5,
+                amount: 123,
+                creation_id: 19,
+            }]
+        );
+    }
+
     #[test]
     fn clear_all_removes_chain_and_certificate_epochs_together() {
         let dir = tempfile::tempdir().unwrap();
@@ -1550,17 +1998,7 @@ mod tests {
         };
 
         store
-            .commit_block(
-                &header,
-                &hash,
-                &undo,
-                &[],
-                &[],
-                &[],
-                None,
-                &meta,
-                false,
-            )
+            .commit_block(&header, &hash, &undo, &[], &[], &[], None, &meta, false)
             .unwrap();
         store.put_history_claim(0, b"history").unwrap();
         store
@@ -1686,6 +2124,7 @@ mod tests {
         let owner_a = Address([0x11; 32]);
         let owner_b = Address([0x22; 32]);
         let mut header = crate::consensus::genesis::genesis_header();
+        header.log_slots = 1;
         header.active_slot_count = 1;
         header.alloc_counter = 1;
         let hash = crate::hash_block_header(&header);
@@ -1723,7 +2162,14 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert_eq!(store.get_utxos_by_owner(&owner_b.0).unwrap(), vec![(1, 77)]);
+        assert_eq!(
+            store.get_verified_utxos_by_owner(&owner_b.0).unwrap().utxos,
+            vec![VerifiedOwnerUtxo {
+                slot_index: 1,
+                amount: 77,
+                creation_id: 1,
+            }]
+        );
 
         let mut restored_cols = SegmentColumns::new_zero(2);
         let restored_slot =
@@ -1745,8 +2191,19 @@ mod tests {
             )
             .unwrap();
 
-        assert!(store.get_utxos_by_owner(&owner_b.0).unwrap().is_empty());
-        assert_eq!(store.get_utxos_by_owner(&owner_a.0).unwrap(), vec![(1, 91)]);
+        assert!(store
+            .get_verified_utxos_by_owner(&owner_b.0)
+            .unwrap()
+            .utxos
+            .is_empty());
+        assert_eq!(
+            store.get_verified_utxos_by_owner(&owner_a.0).unwrap().utxos,
+            vec![VerifiedOwnerUtxo {
+                slot_index: 1,
+                amount: 91,
+                creation_id: 1,
+            }]
+        );
 
         // The incremental path must also replace a live slot's index entry
         // when an incarnation-safe block eventually permits spend→remint at
@@ -1774,8 +2231,19 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert!(store.get_utxos_by_owner(&owner_a.0).unwrap().is_empty());
-        assert_eq!(store.get_utxos_by_owner(&owner_b.0).unwrap(), vec![(1, 93)]);
+        assert!(store
+            .get_verified_utxos_by_owner(&owner_a.0)
+            .unwrap()
+            .utxos
+            .is_empty());
+        assert_eq!(
+            store.get_verified_utxos_by_owner(&owner_b.0).unwrap().utxos,
+            vec![VerifiedOwnerUtxo {
+                slot_index: 1,
+                amount: 93,
+                creation_id: 2,
+            }]
+        );
 
         // Spending the last live slot dematerializes the segment. The
         // incremental owner index must treat that dirty empty payload as an
@@ -1798,10 +2266,18 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert!(store.get_utxos_by_owner(&owner_b.0).unwrap().is_empty());
+        assert!(store
+            .get_verified_utxos_by_owner(&owner_b.0)
+            .unwrap()
+            .utxos
+            .is_empty());
         drop(store);
         let reopened = MdbxStore::open(dir.path()).unwrap();
-        assert!(reopened.get_utxos_by_owner(&owner_b.0).unwrap().is_empty());
+        assert!(reopened
+            .get_verified_utxos_by_owner(&owner_b.0)
+            .unwrap()
+            .utxos
+            .is_empty());
     }
 
     #[test]

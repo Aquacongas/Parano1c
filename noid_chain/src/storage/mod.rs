@@ -19,7 +19,7 @@ pub mod meta;
 pub mod serial;
 
 pub use mdbx_context::{MdbxChainContext, MdbxContextError};
-pub use mdbx_store::{MdbxStore, StoreError};
+pub use mdbx_store::{MdbxStore, StoreError, VerifiedOwnerSnapshot, VerifiedOwnerUtxo};
 pub use memory::RamBackend;
 pub use meta::{ConsensusMeta, FinalizedCheckpoint};
 pub use serial::{
