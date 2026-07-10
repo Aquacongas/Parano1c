@@ -6,15 +6,14 @@
 //! The proof authenticates every touched UTXO slot with canonical Poseidon2b
 //! sparse-Merkle openings and binds ABA replay protection through `ReuseGuard`.
 
-use std::collections::BTreeSet;
-
 use noid_chain::exact_state_hash::{
     composite_state_root, slot_leaf_hash_checked, state_node_hash, zero_slot_roots, StateHash,
 };
 use noid_chain::fri_state::SlotValue;
 use noid_chain::reuse_guard::{
     bucket_index_for_height, guard_bucket_hash, verify_guard_update_roots, GuardBucket, ReuseGuard,
-    ReuseGuardError, REUSE_GUARD_DEPTH,
+    ReuseGuardActionError, ReuseGuardActionKind, ReuseGuardActionState, ReuseGuardError,
+    REUSE_GUARD_DEPTH,
 };
 use noid_chain::sparse_merkle::{
     build_multiproof, expand_multiproof_paths, reconstruct_root, ExpandedMerklePath,
@@ -754,25 +753,22 @@ fn enforce_guard_exclusion(
     guard: &ReuseGuard,
     height: u64,
 ) -> Result<(), ExactStateTransitionError> {
-    let mut spent_in_block = BTreeSet::new();
+    let mut action_state = ReuseGuardActionState::default();
     for action in &surface.actions {
-        if guard.is_guarded(action.slot_index, height) {
-            return Err(ExactStateTransitionError::ActiveGuardedSlot {
-                slot_index: action.slot_index,
-            });
-        }
-        match action.kind {
-            StateDeltaActionKind::Spend => {
-                spent_in_block.insert(action.slot_index);
-            }
-            StateDeltaActionKind::Mint => {
-                if spent_in_block.contains(&action.slot_index) {
-                    return Err(ExactStateTransitionError::MintAfterSpendSameBlock {
-                        slot_index: action.slot_index,
-                    });
+        let kind = match action.kind {
+            StateDeltaActionKind::Spend => ReuseGuardActionKind::Spend,
+            StateDeltaActionKind::Mint => ReuseGuardActionKind::Mint,
+        };
+        action_state
+            .validate_action(guard, height, kind, action.slot_index)
+            .map_err(|err| match err {
+                ReuseGuardActionError::ActiveGuardedSlot { slot_index } => {
+                    ExactStateTransitionError::ActiveGuardedSlot { slot_index }
                 }
-            }
-        }
+                ReuseGuardActionError::MintAfterSpendSameBlock { slot_index } => {
+                    ExactStateTransitionError::MintAfterSpendSameBlock { slot_index }
+                }
+            })?;
     }
     Ok(())
 }

@@ -88,7 +88,11 @@ pub use checkpoint::{
 
 pub use chain_context::ChainContext;
 pub use mempool::{Mempool, MempoolEntry, MempoolError};
-pub use reuse_guard::{GuardBucket, ReuseGuard, REUSE_DELAY, REUSE_GUARD_BUCKETS};
+pub use reuse_guard::{
+    validate_reuse_guard_actions, GuardBucket, ReuseGuard, ReuseGuardActionError,
+    ReuseGuardActionKind, ReuseGuardActionState, ReuseGuardError, REUSE_DELAY,
+    REUSE_GUARD_BUCKETS,
+};
 pub use state::{apply_tx, ApplyError, ChainState, SparseUtxoBuildError, StateTransition};
 pub use state_delta::{
     build_exact_action_surface, build_state_delta_action_surface, build_state_delta_witness,

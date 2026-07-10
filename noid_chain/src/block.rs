@@ -23,6 +23,9 @@ use noid_tx::{hash_tx_body_for_shape, Transaction};
 
 use crate::block_header::BlockHeader;
 use crate::consensus::params;
+use crate::reuse_guard::{
+    validate_reuse_guard_actions, ReuseGuardActionError, ReuseGuardError,
+};
 use crate::state::{apply_tx, ApplyError, ChainState, StateTransition};
 
 /// Hard DoS cap on the number of transactions accepted by the decoder.
@@ -110,11 +113,28 @@ pub enum BlockApplyError {
     CoinbaseNotFirst,
     /// Coinbase transaction has non-empty inputs (coinbase must have zero inputs).
     CoinbaseHasInputs,
+    /// A transaction touched a slot that is quarantined by ReuseGuard, or
+    /// attempted a spend-then-mint ABA sequence inside the block.
+    ReuseGuardAction(ReuseGuardActionError),
+    /// Advancing the canonical ReuseGuard state failed.
+    ReuseGuard(ReuseGuardError),
 }
 
 impl From<ApplyError> for BlockApplyError {
     fn from(e: ApplyError) -> Self {
         Self::Tx(e)
+    }
+}
+
+impl From<ReuseGuardActionError> for BlockApplyError {
+    fn from(e: ReuseGuardActionError) -> Self {
+        Self::ReuseGuardAction(e)
+    }
+}
+
+impl From<ReuseGuardError> for BlockApplyError {
+    fn from(e: ReuseGuardError) -> Self {
+        Self::ReuseGuard(e)
     }
 }
 
@@ -165,6 +185,12 @@ pub fn apply_block(
         }
     }
 
+    validate_reuse_guard_actions(
+        &state.reuse_guard,
+        block.header.height,
+        &block.transactions,
+    )?;
+
     let mut snap = state.clone();
 
     // Slot-space expansion: if the block declares a larger log_slots, expand BEFORE
@@ -176,10 +202,6 @@ pub fn apply_block(
     while block.header.log_slots as usize > snap.state.log_slots() {
         snap.state.expand();
     }
-
-    let mut last = StateTransition {
-        new_state_root: snap.state_root(),
-    };
 
     for tx in &block.transactions {
         if !tx.body.shape.proof_supported()
@@ -200,8 +222,7 @@ pub fn apply_block(
             return Err(BlockApplyError::WrongTxBodyHash);
         }
 
-        let st = apply_tx(&mut snap, &tx.body).map_err(BlockApplyError::Tx)?;
-        last = st;
+        apply_tx(&mut snap, &tx.body).map_err(BlockApplyError::Tx)?;
     }
 
     // Advance the reuse guard by this block's spend set — the SHARED
@@ -214,10 +235,7 @@ pub fn apply_block(
         block.header.height,
         &block_spent_slots(&block.transactions),
     )
-    .map_err(|_| BlockApplyError::HeaderStateRootMismatch)?;
-    last = StateTransition {
-        new_state_root: snap.state_root(),
-    };
+    .map_err(BlockApplyError::ReuseGuard)?;
 
     if block.header.state_root != snap.state_root() {
         return Err(BlockApplyError::HeaderStateRootMismatch);
@@ -236,7 +254,9 @@ pub fn apply_block(
     }
 
     *state = snap;
-    Ok(last)
+    Ok(StateTransition {
+        new_state_root: state.state_root(),
+    })
 }
 
 /// Apply a block's state delta without re-validating pre-conditions.
@@ -270,6 +290,11 @@ pub fn apply_state_delta(
     if block.header.tx_root != compute_tx_root(&block.transactions) {
         return Err(BlockApplyError::HeaderTxRootMismatch);
     }
+    validate_reuse_guard_actions(
+        &state.reuse_guard,
+        block.header.height,
+        &block.transactions,
+    )?;
 
     let mut snap = state.clone();
 
@@ -317,16 +342,16 @@ pub fn apply_state_delta(
     }
 
     // 4. Advance the reuse guard from the block's spend set — the same
-    // shared rule as the sequential apply (a no-op for the coinbase-only
-    // blocks this primitive serves in production; spend-bearing blocks go
-    // through `apply_verified_exact_transition`, which installs the
-    // PROVEN bucket update instead).
+    // shared rule as the sequential apply. Production user blocks install the
+    // proven bucket update through `apply_verified_exact_transition`; keeping
+    // this generic delta primitive in lock-step prevents utility/test callers
+    // from accepting a transition the sequential interpreter rejects.
     advance_reuse_state(
         &mut snap,
         block.header.height,
         &block_spent_slots(&block.transactions),
     )
-    .map_err(|_| BlockApplyError::HeaderStateRootMismatch)?;
+    .map_err(BlockApplyError::ReuseGuard)?;
 
     // 5. Native post-root guard. The proof layer proves the transition, but full nodes still
     // recompute the dirty segment roots before accepting the local state update.
@@ -522,17 +547,21 @@ mod tests {
     /// after applying `txs`. Detached witness fields are deliberately populated
     /// with detached witness metadata so tests can prove they do not affect `apply_block`.
     fn mk_header(snap: &ChainState, txs: &[Transaction]) -> BlockHeader {
+        mk_header_at(snap, txs, 1)
+    }
+
+    fn mk_header_at(snap: &ChainState, txs: &[Transaction], height: u64) -> BlockHeader {
         let mut dry = snap.clone();
         for tx in txs {
             apply_tx(&mut dry, &tx.body).unwrap();
         }
-        advance_reuse_state(&mut dry, 1, &block_spent_slots(txs)).unwrap();
+        advance_reuse_state(&mut dry, height, &block_spent_slots(txs)).unwrap();
         BlockHeader {
             prev_block_hash: [0u8; 32],
             state_root: dry.state_root(),
             tx_root: compute_tx_root(txs),
-            timestamp: 1,
-            height: 1,
+            timestamp: height,
+            height,
             miner_address: Address([9u8; 32]),
             nonce: 0,
             difficulty_target: [0xFFu8; 32],
@@ -679,6 +708,76 @@ mod tests {
             native_state.active_slot_count
         );
         assert_eq!(delta_state.alloc_counter, native_state.alloc_counter);
+    }
+
+    #[test]
+    fn native_apply_paths_enforce_reuse_guard_expiry_boundary() {
+        let mut guarded = fresh_state();
+        guarded.reuse_guard.apply_spends(1, &[5]).unwrap();
+        let tx = build_tx(&mut guarded.clone(), vec![], vec![mk_output(5)]);
+
+        let active_block = Block {
+            header: mk_header_at(&guarded, std::slice::from_ref(&tx), 145),
+            transactions: vec![tx.clone()],
+        };
+        let expected = Err(BlockApplyError::ReuseGuardAction(
+            crate::reuse_guard::ReuseGuardActionError::ActiveGuardedSlot { slot_index: 5 },
+        ));
+        let mut sequential = guarded.clone();
+        let mut delta = guarded.clone();
+        assert_eq!(apply_block(&mut sequential, &active_block), expected);
+        assert_eq!(apply_state_delta(&mut delta, &active_block), expected);
+
+        let expired_block = Block {
+            header: mk_header_at(&guarded, std::slice::from_ref(&tx), 146),
+            transactions: vec![tx],
+        };
+        let mut sequential = guarded.clone();
+        apply_block(&mut sequential, &expired_block)
+            .expect("slot is reusable at the exact expiry boundary");
+        apply_state_delta(&mut guarded, &expired_block)
+            .expect("delta path uses the same expiry boundary");
+    }
+
+    #[test]
+    fn native_apply_paths_reject_spend_then_mint_same_block() {
+        let mut state = fresh_state();
+        let live = mk_output(2);
+        state
+            .state
+            .set_slot(
+                live.slot_index,
+                crate::fri_state::SlotValue {
+                    value: noid_core::Block128::from(live.value as u128),
+                    owner_hi: live.owner.as_fields()[0],
+                    owner_lo: live.owner.as_fields()[1],
+                },
+            )
+            .unwrap();
+        state.active_slot_count = 1;
+        state.alloc_counter = 1;
+
+        let spend = build_tx(
+            &mut state.clone(),
+            vec![mk_input_for(live.slot_index, &live)],
+            vec![],
+        );
+        let mut after_spend = state.clone();
+        apply_tx(&mut after_spend, &spend.body).unwrap();
+        let mint = build_tx(&mut after_spend, vec![], vec![live]);
+        let txs = vec![spend, mint];
+        let block = Block {
+            header: mk_header(&state, &txs),
+            transactions: txs,
+        };
+        let expected = Err(BlockApplyError::ReuseGuardAction(
+            crate::reuse_guard::ReuseGuardActionError::MintAfterSpendSameBlock {
+                slot_index: 2,
+            },
+        ));
+        let mut sequential = state.clone();
+        assert_eq!(apply_block(&mut sequential, &block), expected);
+        assert_eq!(apply_state_delta(&mut state, &block), expected);
     }
 
     #[test]

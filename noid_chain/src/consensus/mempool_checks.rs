@@ -28,6 +28,7 @@ use crate::consensus::{
     pow::block_id, ConsensusError,
 };
 use crate::fri_state::SlotValue;
+use crate::reuse_guard::ReuseGuardActionState;
 use noid_core::Block128;
 use noid_tx::Transaction;
 
@@ -60,6 +61,15 @@ pub fn validate_tx_for_mempool(
 
     // --- Basic consensus checks ---
     validate_tx_consensus(tx)?;
+
+    // --- ReuseGuard exclusion and within-transaction ABA rule ---
+    // Cross-transaction ordering is miner policy, so admission checks only the
+    // candidate. The template and block validators recheck the final order.
+    let next_height = ctx.tip_height.saturating_add(1);
+    let mut guard_actions = ReuseGuardActionState::default();
+    guard_actions
+        .validate_transaction(&ctx.state.reuse_guard, next_height, tx)
+        .map_err(|_| ConsensusError::SlotConflict)?;
 
     // --- Epoch anchor hash must be a known header within window ---
     if !tx.body.is_coinbase {
@@ -298,5 +308,18 @@ mod tests {
         let tx = make_coinbase(7); // tries to mint to occupied slot 7
         let result = validate_tx_for_mempool(&tx, &ctx, &[]);
         assert_eq!(result, Err(ConsensusError::SlotConflict));
+    }
+
+    #[test]
+    fn guarded_empty_output_slot_is_rejected() {
+        let mut ctx = ChainContext::init_from_genesis();
+        ctx.state.reuse_guard.apply_spends(0, &[7]).unwrap();
+        assert_eq!(ctx.state.state.slot(7), SlotValue::EMPTY);
+
+        let tx = make_coinbase(7);
+        assert_eq!(
+            validate_tx_for_mempool(&tx, &ctx, &[]),
+            Err(ConsensusError::SlotConflict)
+        );
     }
 }

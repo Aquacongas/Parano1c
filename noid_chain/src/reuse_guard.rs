@@ -3,12 +3,15 @@
 
 //! Bounded ReuseGuard for exact-state ABA protection.
 
+use std::collections::BTreeSet;
+
 use noid_core::Block128;
 use noid_poseidon2b::native::compression::{compress_with_tag, Poseidon2bSponge};
 use noid_core::TowerField;
 use noid_poseidon2b::native::domain::{capacity_iv, TAG_RGDBUCK, TAG_RGDNODE, TAG_RGDSLOT};
+use noid_tx::Transaction;
 
-use crate::consensus::params::ANCHOR_DEPTH;
+use crate::consensus::params::{ANCHOR_DEPTH, BLOCK_MAX_LIVE_INPUTS};
 use crate::exact_state_hash::StateHash;
 
 /// Slot reuse quarantine length.
@@ -25,8 +28,55 @@ pub enum GuardBucket {
     Empty,
     Occupied {
         absolute_height: u64,
+        #[serde(deserialize_with = "deserialize_spent_slots")]
         spent_slots: Vec<u32>,
     },
+}
+
+fn deserialize_spent_slots<'de, D>(deserializer: D) -> Result<Vec<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct BoundedSlots;
+
+    impl<'de> serde::de::Visitor<'de> for BoundedSlots {
+        type Value = Vec<u32>;
+
+        fn expecting(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            write!(
+                formatter,
+                "at most {BLOCK_MAX_LIVE_INPUTS} reuse-guard slots"
+            )
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            if let Some(actual) = seq.size_hint() {
+                if actual > BLOCK_MAX_LIVE_INPUTS {
+                    return Err(serde::de::Error::invalid_length(actual, &self));
+                }
+            }
+            let mut slots = Vec::with_capacity(
+                seq.size_hint()
+                    .unwrap_or(0)
+                    .min(BLOCK_MAX_LIVE_INPUTS),
+            );
+            while let Some(slot) = seq.next_element()? {
+                if slots.len() == BLOCK_MAX_LIVE_INPUTS {
+                    return Err(serde::de::Error::invalid_length(
+                        slots.len().saturating_add(1),
+                        &self,
+                    ));
+                }
+                slots.push(slot);
+            }
+            Ok(slots)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedSlots)
 }
 
 /// Fixed-size ReuseGuard state.
@@ -48,7 +98,7 @@ pub struct GuardBucketUpdate {
 }
 
 /// Errors returned by ReuseGuard operations.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReuseGuardError {
     BucketIndexOutOfRange {
         index: usize,
@@ -62,6 +112,11 @@ pub enum ReuseGuardError {
     },
     UnsortedOrDuplicateSlots {
         index: usize,
+    },
+    TooManySpentSlots {
+        index: usize,
+        actual: usize,
+        max: usize,
     },
     ActiveBucketOverwrite {
         index: usize,
@@ -93,6 +148,10 @@ impl core::fmt::Display for ReuseGuardError {
                     "reuse guard bucket {index} slots are not strictly sorted"
                 )
             }
+            Self::TooManySpentSlots { index, actual, max } => write!(
+                f,
+                "reuse guard bucket {index} has {actual} spent slots, maximum is {max}"
+            ),
             Self::ActiveBucketOverwrite {
                 index,
                 old_height,
@@ -107,6 +166,125 @@ impl core::fmt::Display for ReuseGuardError {
 }
 
 impl std::error::Error for ReuseGuardError {}
+
+/// Kind of slot action checked against ReuseGuard and the current block prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReuseGuardActionKind {
+    Spend,
+    Mint,
+}
+
+/// Errors returned by the shared ReuseGuard action predicate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReuseGuardActionError {
+    /// The action targets a slot quarantined by a recent spend.
+    ActiveGuardedSlot { slot_index: u32 },
+    /// A block prefix already spent this slot and then tried to recreate it.
+    MintAfterSpendSameBlock { slot_index: u32 },
+}
+
+impl core::fmt::Display for ReuseGuardActionError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::ActiveGuardedSlot { slot_index } => {
+                write!(f, "slot {slot_index} is active in the reuse guard")
+            }
+            Self::MintAfterSpendSameBlock { slot_index } => write!(
+                f,
+                "slot {slot_index} cannot be minted after a spend in the same block"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReuseGuardActionError {}
+
+/// Stateful ReuseGuard predicate for an ordered block action stream.
+///
+/// The state records spends already accepted in the current block so a later
+/// mint cannot reuse their slots. A mint followed by a spend remains legal.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReuseGuardActionState {
+    spent_in_block: BTreeSet<u32>,
+}
+
+impl ReuseGuardActionState {
+    /// Check a mint without changing the accepted block prefix.
+    pub fn validate_mint(
+        &self,
+        guard: &ReuseGuard,
+        height: u64,
+        slot_index: u32,
+    ) -> Result<(), ReuseGuardActionError> {
+        if guard.is_guarded(slot_index, height) {
+            return Err(ReuseGuardActionError::ActiveGuardedSlot { slot_index });
+        }
+        if self.spent_in_block.contains(&slot_index) {
+            return Err(ReuseGuardActionError::MintAfterSpendSameBlock { slot_index });
+        }
+        Ok(())
+    }
+
+    pub fn validate_action(
+        &mut self,
+        guard: &ReuseGuard,
+        height: u64,
+        kind: ReuseGuardActionKind,
+        slot_index: u32,
+    ) -> Result<(), ReuseGuardActionError> {
+        match kind {
+            ReuseGuardActionKind::Spend => {
+                if guard.is_guarded(slot_index, height) {
+                    return Err(ReuseGuardActionError::ActiveGuardedSlot { slot_index });
+                }
+                self.spent_in_block.insert(slot_index);
+            }
+            ReuseGuardActionKind::Mint => {
+                self.validate_mint(guard, height, slot_index)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate one transaction in canonical input-then-output action order.
+    pub fn validate_transaction(
+        &mut self,
+        guard: &ReuseGuard,
+        height: u64,
+        tx: &Transaction,
+    ) -> Result<(), ReuseGuardActionError> {
+        for input in tx.body.inputs.iter().filter(|input| input.valid) {
+            self.validate_action(
+                guard,
+                height,
+                ReuseGuardActionKind::Spend,
+                input.slot_index,
+            )?;
+        }
+        for output in tx.body.outputs.iter().filter(|output| output.valid) {
+            self.validate_action(
+                guard,
+                height,
+                ReuseGuardActionKind::Mint,
+                output.slot_index,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// Validate the ordered ReuseGuard action stream of a complete block body.
+pub fn validate_reuse_guard_actions(
+    guard: &ReuseGuard,
+    height: u64,
+    txs: &[Transaction],
+) -> Result<(), ReuseGuardActionError> {
+    let mut state = ReuseGuardActionState::default();
+    for tx in txs {
+        state.validate_transaction(guard, height, tx)?;
+    }
+    Ok(())
+}
 
 impl Default for ReuseGuard {
     fn default() -> Self {
@@ -409,10 +587,14 @@ fn validate_spent_slots(slots: &[u32], index: usize) -> Result<(), ReuseGuardErr
         return Err(ReuseGuardError::EmptyOccupiedBucket { index });
     }
     // A block can spend at most the semantic live-input budget, so no
-    // canonical bucket may carry more (decoder-side bound: an oversized
-    // list would otherwise deserialize fine and only fail much later).
-    if slots.len() > crate::consensus::params::BLOCK_MAX_LIVE_INPUTS {
-        return Err(ReuseGuardError::UnsortedOrDuplicateSlots { index });
+    // canonical bucket may carry more. The serde visitor enforces the same
+    // limit before allocating a decoded vector.
+    if slots.len() > BLOCK_MAX_LIVE_INPUTS {
+        return Err(ReuseGuardError::TooManySpentSlots {
+            index,
+            actual: slots.len(),
+            max: BLOCK_MAX_LIVE_INPUTS,
+        });
     }
     if slots.windows(2).any(|w| w[0] >= w[1]) {
         return Err(ReuseGuardError::UnsortedOrDuplicateSlots { index });
@@ -423,6 +605,46 @@ fn validate_spent_slots(slots: &[u32], index: usize) -> Result<(), ReuseGuardErr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use noid_poseidon2b::primitives::{Address, SpendSecret};
+    use noid_tx::{hash_tx_body, TxBody, TxInput, TxOutput, TxShape};
+
+    fn action_tx(input_slots: &[u32], output_slots: &[u32]) -> Transaction {
+        let body = TxBody {
+            shape: TxShape::Standard4x8,
+            epoch_anchor: [0u8; 32],
+            fee: 0,
+            inputs: input_slots
+                .iter()
+                .copied()
+                .map(|slot_index| TxInput {
+                    slot_index,
+                    value: 1,
+                    owner: Address([1u8; 32]),
+                    spend_secret: SpendSecret([2u8; 32]),
+                    valid: true,
+                })
+                .collect(),
+            outputs: output_slots
+                .iter()
+                .copied()
+                .map(|slot_index| TxOutput {
+                    slot_index,
+                    value: 1,
+                    owner: Address([1u8; 32]),
+                    valid: true,
+                })
+                .collect(),
+            is_coinbase: false,
+        };
+        let tx_body_hash = hash_tx_body(
+            &body.epoch_anchor,
+            body.fee,
+            &body.inputs,
+            &body.outputs,
+            body.is_coinbase,
+        );
+        Transaction { body, tx_body_hash }
+    }
 
     #[test]
     fn empty_guard_root_is_deterministic() {
@@ -529,6 +751,57 @@ mod tests {
             ReuseGuard::from_buckets(buckets),
             Err(ReuseGuardError::EmptyOccupiedBucket { index: 5 })
         );
+    }
+
+    #[test]
+    fn spent_slot_bucket_cap_accepts_1020_and_rejects_1021() {
+        assert_eq!(BLOCK_MAX_LIVE_INPUTS, 1020);
+        let mut guard = ReuseGuard::new_empty();
+        let at_cap: Vec<u32> = (0..BLOCK_MAX_LIVE_INPUTS as u32).collect();
+        guard.apply_spends(1, &at_cap).unwrap();
+        let encoded_at_cap = bincode::serialize(&GuardBucket::Occupied {
+            absolute_height: 1,
+            spent_slots: at_cap,
+        })
+        .unwrap();
+        bincode::deserialize::<GuardBucket>(&encoded_at_cap).unwrap();
+
+        let above_cap: Vec<u32> = (0..=BLOCK_MAX_LIVE_INPUTS as u32).collect();
+        assert_eq!(
+            guard.apply_spends(2, &above_cap),
+            Err(ReuseGuardError::TooManySpentSlots {
+                index: 2,
+                actual: 1021,
+                max: 1020,
+            })
+        );
+        let encoded_above_cap = bincode::serialize(&GuardBucket::Occupied {
+            absolute_height: 2,
+            spent_slots: above_cap,
+        })
+        .unwrap();
+        assert!(bincode::deserialize::<GuardBucket>(&encoded_above_cap).is_err());
+    }
+
+    #[test]
+    fn shared_action_checker_enforces_expiry_and_action_order() {
+        let mut guard = ReuseGuard::new_empty();
+        guard.apply_spends(1, &[7]).unwrap();
+        let mint_guarded = action_tx(&[], &[7]);
+        assert_eq!(
+            validate_reuse_guard_actions(&guard, 145, &[mint_guarded.clone()]),
+            Err(ReuseGuardActionError::ActiveGuardedSlot { slot_index: 7 })
+        );
+        validate_reuse_guard_actions(&guard, 146, &[mint_guarded]).unwrap();
+
+        let empty_guard = ReuseGuard::new_empty();
+        let spend = action_tx(&[9], &[]);
+        let mint = action_tx(&[], &[9]);
+        assert_eq!(
+            validate_reuse_guard_actions(&empty_guard, 10, &[spend.clone(), mint.clone()]),
+            Err(ReuseGuardActionError::MintAfterSpendSameBlock { slot_index: 9 })
+        );
+        validate_reuse_guard_actions(&empty_guard, 10, &[mint, spend]).unwrap();
     }
 
     #[test]

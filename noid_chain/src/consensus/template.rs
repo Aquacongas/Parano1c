@@ -27,6 +27,7 @@ use noid_tx::Transaction;
 
 use crate::block_header::BlockHeader;
 use crate::consensus::pow::block_id;
+use crate::reuse_guard::ReuseGuardActionState;
 use crate::state::{apply_tx_checked_deferred_root, ChainState};
 
 // ---------------------------------------------------------------------------
@@ -185,6 +186,7 @@ pub fn build_block_template(
     }
 
     let mut applied_winners: Vec<Transaction> = Vec::new();
+    let mut guard_actions = ReuseGuardActionState::default();
     let ordered_winners = order_block_txs(winners);
     for tx in ordered_winners {
         let required =
@@ -193,8 +195,18 @@ pub fn build_block_template(
         if actual < required {
             continue;
         }
+        let mut trial_guard_actions = guard_actions.clone();
+        if trial_guard_actions
+            .validate_transaction(&state.reuse_guard, parent.height + 1, &tx)
+            .is_err()
+        {
+            continue;
+        }
         match apply_tx_checked_deferred_root(&mut scratch, &tx.body) {
-            Ok(_) => applied_winners.push(tx),
+            Ok(_) => {
+                guard_actions = trial_guard_actions;
+                applied_winners.push(tx);
+            }
             Err(_e) => {}
         }
     }
@@ -216,7 +228,12 @@ pub fn build_block_template(
             .empty_slot_hints_in_populated_segments(seed, 32, &reserved);
         if let Some(slot) = reuse_hints
             .into_iter()
-            .find(|&slot| scratch.state.slot(slot) == crate::fri_state::SlotValue::EMPTY)
+            .find(|&slot| {
+                scratch.state.slot(slot) == crate::fri_state::SlotValue::EMPTY
+                    && guard_actions
+                        .validate_mint(&state.reuse_guard, parent.height + 1, slot)
+                        .is_ok()
+            })
         {
             slot
         } else {
@@ -228,7 +245,12 @@ pub fn build_block_template(
             while found.is_none() && count <= 65_536 {
                 found = generate_slot_hints(scratch.alloc_counter, state_log_slots, count)
                     .into_iter()
-                    .find(|&slot| scratch.state.slot(slot) == crate::fri_state::SlotValue::EMPTY);
+                    .find(|&slot| {
+                        scratch.state.slot(slot) == crate::fri_state::SlotValue::EMPTY
+                            && guard_actions
+                                .validate_mint(&state.reuse_guard, parent.height + 1, slot)
+                                .is_ok()
+                    });
                 count *= 2;
             }
             found.ok_or(TemplateBuildError::NoCoinbaseSlot)?
@@ -272,10 +294,8 @@ pub fn build_block_template(
     apply_tx_checked_deferred_root(&mut scratch, &coinbase.body)
         .map_err(|e| TemplateBuildError::StateApplyError(format!("{:?}", e)))?;
 
-    let exact_bodies: Vec<_> = ordered_winners
-        .iter()
-        .map(|tx| tx.body.clone())
-        .chain(std::iter::once(coinbase.body.clone()))
+    let exact_bodies: Vec<_> = std::iter::once(coinbase.body.clone())
+        .chain(ordered_winners.iter().map(|tx| tx.body.clone()))
         .collect();
     let exact_commitments: Vec<_> = exact_bodies
         .iter()
@@ -291,9 +311,11 @@ pub fn build_block_template(
         &exact_commitments,
     )
     .map_err(|e| TemplateBuildError::StateApplyError(format!("{:?}", e)))?;
-    scratch
-        .reuse_guard
-        .apply_spends(parent.height + 1, &exact_surface.spent_slots)
+    crate::block::advance_reuse_state(
+        &mut scratch,
+        parent.height + 1,
+        &exact_surface.spent_slots,
+    )
         .map_err(|e| TemplateBuildError::StateApplyError(format!("{:?}", e)))?;
 
     // 5. Compute final header fields.
@@ -390,6 +412,27 @@ mod tests {
         // Coinbase is present.
         assert!(tmpl.coinbase.body.is_coinbase);
         assert_eq!(tmpl.n_txs(), 1);
+    }
+
+    #[test]
+    fn template_rejects_when_every_coinbase_slot_is_guarded() {
+        let mut state = fresh_state();
+        let all_slots: Vec<u32> = (0..state.state.num_slots() as u32).collect();
+        state.reuse_guard.apply_spends(0, &all_slots).unwrap();
+        let mut parent = genesis_header();
+        parent.state_root = state.state_root();
+        parent.log_slots = TEST_LOG_SLOTS as u32;
+
+        let result = build_block_template(
+            &parent,
+            &state,
+            &[parent.active_slot_count],
+            vec![],
+            Address([0xAB; 32]),
+            GENESIS_TIMESTAMP + BLOCK_TIME,
+            GENESIS_TARGET,
+        );
+        assert!(matches!(result, Err(TemplateBuildError::NoCoinbaseSlot)));
     }
 
     #[test]
@@ -502,8 +545,8 @@ mod tests {
         .unwrap();
 
         let mut expected = state.clone();
-        crate::state::apply_tx(&mut expected, &tx.body).unwrap();
         crate::state::apply_tx(&mut expected, &tmpl.coinbase.body).unwrap();
+        crate::state::apply_tx(&mut expected, &tx.body).unwrap();
         let no_guard_root = expected.state_root();
         expected
             .reuse_guard
