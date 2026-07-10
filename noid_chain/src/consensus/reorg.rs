@@ -319,6 +319,12 @@ mod tests {
         for tx in &txs {
             apply_tx(&mut dry, &tx.body).expect("test tx applies to dry state");
         }
+        crate::block::advance_reuse_state(
+            &mut dry,
+            parent.height + 1,
+            &crate::block::block_spent_slots(&txs),
+        )
+        .expect("test guard advances");
         let header = BlockHeader {
             prev_block_hash: block_id(&parent),
             state_root: dry.state_root(),

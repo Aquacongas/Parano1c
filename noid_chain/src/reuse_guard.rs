@@ -408,6 +408,12 @@ fn validate_spent_slots(slots: &[u32], index: usize) -> Result<(), ReuseGuardErr
     if slots.is_empty() {
         return Err(ReuseGuardError::EmptyOccupiedBucket { index });
     }
+    // A block can spend at most the semantic live-input budget, so no
+    // canonical bucket may carry more (decoder-side bound: an oversized
+    // list would otherwise deserialize fine and only fail much later).
+    if slots.len() > crate::consensus::params::BLOCK_MAX_LIVE_INPUTS {
+        return Err(ReuseGuardError::UnsortedOrDuplicateSlots { index });
+    }
     if slots.windows(2).any(|w| w[0] >= w[1]) {
         return Err(ReuseGuardError::UnsortedOrDuplicateSlots { index });
     }

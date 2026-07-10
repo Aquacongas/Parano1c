@@ -204,6 +204,21 @@ pub fn apply_block(
         last = st;
     }
 
+    // Advance the reuse guard by this block's spend set — the SHARED
+    // native rule (the miner template and this sequential apply must move
+    // the guard identically; the composite state root covers the guard
+    // root, so skipping this here would reject every template-built
+    // spend-bearing block).
+    advance_reuse_state(
+        &mut snap,
+        block.header.height,
+        &block_spent_slots(&block.transactions),
+    )
+    .map_err(|_| BlockApplyError::HeaderStateRootMismatch)?;
+    last = StateTransition {
+        new_state_root: snap.state_root(),
+    };
+
     if block.header.state_root != snap.state_root() {
         return Err(BlockApplyError::HeaderStateRootMismatch);
     }
@@ -301,7 +316,19 @@ pub fn apply_state_delta(
         return Err(BlockApplyError::HeaderLogSlotsMismatch);
     }
 
-    // 4. Native post-root guard. The proof layer proves the transition, but full nodes still
+    // 4. Advance the reuse guard from the block's spend set — the same
+    // shared rule as the sequential apply (a no-op for the coinbase-only
+    // blocks this primitive serves in production; spend-bearing blocks go
+    // through `apply_verified_exact_transition`, which installs the
+    // PROVEN bucket update instead).
+    advance_reuse_state(
+        &mut snap,
+        block.header.height,
+        &block_spent_slots(&block.transactions),
+    )
+    .map_err(|_| BlockApplyError::HeaderStateRootMismatch)?;
+
+    // 5. Native post-root guard. The proof layer proves the transition, but full nodes still
     // recompute the dirty segment roots before accepting the local state update.
     let computed_post_root = snap.state_root();
     if block.header.state_root != computed_post_root {
@@ -350,6 +377,30 @@ pub fn apply_genesis_block(
     Ok(StateTransition {
         new_state_root: block.header.state_root,
     })
+}
+
+/// The block's canonical spend set: every live input slot across all
+/// transactions, sorted (uniqueness is guaranteed upstream by the
+/// slot-conflict rule; duplicates here would fail `apply_spends`).
+pub fn block_spent_slots(txs: &[Transaction]) -> Vec<u32> {
+    let mut spent: Vec<u32> = txs
+        .iter()
+        .flat_map(|tx| tx.body.inputs.iter().filter(|i| i.valid).map(|i| i.slot_index))
+        .collect();
+    spent.sort_unstable();
+    spent
+}
+
+/// Advance the reuse guard by one block — the ONE native rule shared by
+/// the sequential apply and the miner template (an empty spend set leaves
+/// the guard byte-identical).
+pub fn advance_reuse_state(
+    state: &mut ChainState,
+    height: u64,
+    spent_slots: &[u32],
+) -> Result<(), crate::reuse_guard::ReuseGuardError> {
+    state.reuse_guard.apply_spends(height, spent_slots)?;
+    Ok(())
 }
 
 /// Compute the block's tx-root — a COMPRESS-domain Merkle reduction over
@@ -475,6 +526,7 @@ mod tests {
         for tx in txs {
             apply_tx(&mut dry, &tx.body).unwrap();
         }
+        advance_reuse_state(&mut dry, 1, &block_spent_slots(txs)).unwrap();
         BlockHeader {
             prev_block_hash: [0u8; 32],
             state_root: dry.state_root(),
