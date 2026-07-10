@@ -235,7 +235,6 @@ fn dec_round_dyn(idx: usize) -> usize {
 pub struct BlockSpineMle {
     pub s_in: Vec<Block128>,
     pub s_out: Vec<Block128>,
-    pub sigma: Vec<Block128>,
     pub state: Vec<Block128>,
     pub num_vars: usize,
     pub live_slots: usize,
@@ -267,7 +266,6 @@ impl BlockSpineMle {
         let mut mle = BlockSpineMle {
             s_in: vec![Block128::ZERO; n_cells],
             s_out: vec![Block128::ZERO; n_cells],
-            sigma: vec![Block128::ZERO; n_cells],
             state: vec![Block128::ZERO; n_cells],
             num_vars,
             live_slots: padded_live_slots,
@@ -304,7 +302,6 @@ impl BlockSpineMle {
         let mut mle = BlockSpineMle {
             s_in: vec![Block128::ZERO; n_cells],
             s_out: vec![Block128::ZERO; n_cells],
-            sigma: vec![Block128::ZERO; n_cells],
             state: vec![Block128::ZERO; n_cells],
             num_vars,
             live_slots: total_live,
@@ -332,23 +329,10 @@ impl BlockSpineMle {
 
     fn populate_slot(&mut self, slot: usize, witness: &crate::layers::PermLayerWitness) {
         for r in 0..N_ROUNDS {
-            let active_mask = match witness.kind[r] {
-                crate::layers::RoundKind::Full => [true; STATE_SIZE],
-                crate::layers::RoundKind::Partial => {
-                    let mut m = [false; STATE_SIZE];
-                    m[0] = true;
-                    m
-                }
-            };
-            for (elem, active) in active_mask.iter().enumerate().take(STATE_SIZE) {
+            for elem in 0..STATE_SIZE {
                 let idx = pack_index_dyn(slot, r, elem);
                 self.s_in[idx] = witness.sin[r][elem];
                 self.s_out[idx] = witness.sout[r][elem];
-                self.sigma[idx] = if *active {
-                    Block128::ONE
-                } else {
-                    Block128::ZERO
-                };
             }
         }
         debug_assert_eq!(witness.state.len(), N_ROUNDS + 1);
