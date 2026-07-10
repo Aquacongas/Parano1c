@@ -277,6 +277,7 @@ impl MdbxChainContext {
                     &[],
                     ctx.state.reuse_guard.buckets(),
                     &[],
+                    &[],
                     None,
                     &meta,
                     false,
@@ -309,6 +310,7 @@ impl MdbxChainContext {
             &BlockUndoLog::empty(0),
             &[], // no dirty segments (all virtual zero)
             self.state.reuse_guard.buckets(),
+            &[],
             &[],
             None, // no block bytes for genesis
             &meta,
@@ -518,6 +520,7 @@ impl MdbxChainContext {
             &dirty_refs,
             self.state.reuse_guard.buckets(),
             &tx_hashes,
+            &[],
             Some(&block.to_bytes()),
             &consensus_meta,
             false,
@@ -1103,7 +1106,7 @@ impl MdbxChainContext {
         // but MDBX at old tip). The caller must trigger snapshot sync to recover.
         // On crash-and-restart, MDBX wins (still at old tip, consistent).
         // -----------------------------------------------------------------------
-        if let Err(e) = self.persist_reorg_checkpoint(&ancestor_header) {
+        if let Err(e) = self.persist_reorg_checkpoint(&ancestor_header, &reclaimed_tx_hashes) {
             tracing::error!(
                 ancestor_height,
                 "persist_reorg_checkpoint failed — node state degraded, snapshot sync required"
@@ -1167,6 +1170,7 @@ impl MdbxChainContext {
     fn persist_reorg_checkpoint(
         &mut self,
         ancestor_header: &BlockHeader,
+        reverted_tx_hashes: &[TxBodyHash],
     ) -> Result<(), MdbxContextError> {
         use crate::consensus::da_prune::BlockUndoLog;
 
@@ -1213,6 +1217,7 @@ impl MdbxChainContext {
                 &dirty_refs,
                 self.state.reuse_guard.buckets(),
                 &[],
+                reverted_tx_hashes,
                 None, // no block bytes (stored earlier or DA-pruned)
                 &consensus_meta,
                 true,
@@ -1664,6 +1669,60 @@ mod tests {
         }
     }
 
+    fn build_coinbase_block_on(
+        ctx: &mut MdbxChainContext,
+        slot_index: u32,
+        owner_seed: u8,
+    ) -> Block {
+        use crate::chain_context::TEST_TARGET;
+        use crate::consensus::emission::block_reward;
+        use noid_tx::{hash_tx_body_for_shape, Transaction, TxBody, TxOutput, TxShape};
+
+        let parent = *ctx.tip_header();
+        let owner = Address([owner_seed; 32]);
+        let body = TxBody::standard(
+            block_id(&parent),
+            0,
+            vec![],
+            vec![TxOutput {
+                slot_index,
+                value: block_reward(parent.log_slots),
+                owner,
+                valid: true,
+            }],
+            true,
+        );
+        let tx_body_hash = hash_tx_body_for_shape(
+            TxShape::Standard4x8,
+            &body.epoch_anchor,
+            body.fee,
+            &body.inputs,
+            &body.outputs,
+            body.is_coinbase,
+        );
+        let tx = Transaction { body, tx_body_hash };
+
+        let mut child = ctx.state.clone();
+        crate::state::apply_tx(&mut child, &tx.body).expect("coinbase fixture applies");
+        let header = BlockHeader {
+            prev_block_hash: block_id(&parent),
+            state_root: child.state_root(),
+            tx_root: compute_tx_root(std::slice::from_ref(&tx)),
+            timestamp: parent.timestamp + BLOCK_TIME,
+            height: parent.height + 1,
+            miner_address: owner,
+            nonce: owner_seed as u128,
+            difficulty_target: TEST_TARGET,
+            log_slots: parent.log_slots,
+            active_slot_count: child.active_slot_count,
+            alloc_counter: child.alloc_counter,
+        };
+        Block {
+            header,
+            transactions: vec![tx],
+        }
+    }
+
     fn apply_coinbase_only_for_test(
         ctx: &mut MdbxChainContext,
         block: &Block,
@@ -1723,7 +1782,7 @@ mod tests {
         ancestor.height = 1;
 
         assert!(matches!(
-            ctx.persist_reorg_checkpoint(&ancestor),
+            ctx.persist_reorg_checkpoint(&ancestor, &[]),
             Err(MdbxContextError::Corrupt("reorg ancestor undo log missing"))
         ));
         assert!(ctx.store.get_undo_log(1).unwrap().is_none());
@@ -1756,6 +1815,65 @@ mod tests {
                 Some(expected_anchor)
             );
         }
+    }
+
+    #[test]
+    fn reorg_removes_orphan_tx_index_and_persists_new_branch_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let competing_dir = tempfile::tempdir().unwrap();
+
+        let (orphan_hash, canonical_hash) = {
+            let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
+            let old_block = build_coinbase_block_on(&mut ctx, 7, 0x11);
+            let orphan_hash = old_block.transactions[0].tx_body_hash;
+            apply_coinbase_only_for_test(&mut ctx, &old_block, old_block.header.timestamp + 1)
+                .unwrap();
+            assert_eq!(
+                ctx.store.get_tx_index(&orphan_hash.0).unwrap(),
+                Some((1, 0))
+            );
+
+            // Build a genuinely competing height-1 block from the same easy
+            // genesis in an independent context.
+            let mut competing =
+                MdbxChainContext::open_or_create_for_test(competing_dir.path()).unwrap();
+            let new_block = build_coinbase_block_on(&mut competing, 9, 0x22);
+            let canonical_hash = new_block.transactions[0].tx_body_hash;
+            assert_ne!(orphan_hash, canonical_hash);
+
+            let result = ctx
+                .apply_reorg_mdbx_with_applier(
+                    0,
+                    std::slice::from_ref(&new_block),
+                    new_block.header.timestamp + 1,
+                    |ctx, block, local_time| {
+                        apply_coinbase_only_for_test(ctx, block, local_time).map(|_| ())
+                    },
+                )
+                .unwrap();
+            assert_eq!(result.reverted_heights, vec![1]);
+            assert_eq!(result.applied_heights, vec![1]);
+            assert_eq!(
+                ctx.store.get_tx_index(&orphan_hash.0).unwrap(),
+                None,
+                "an orphan transaction must not remain confirmed"
+            );
+            assert_eq!(
+                ctx.store.get_tx_index(&canonical_hash.0).unwrap(),
+                Some((1, 0))
+            );
+
+            (orphan_hash, canonical_hash)
+        };
+
+        let reopened = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
+        assert_eq!(reopened.tip_height(), 1);
+        assert_eq!(reopened.store.get_tx_index(&orphan_hash.0).unwrap(), None);
+        assert_eq!(
+            reopened.store.get_tx_index(&canonical_hash.0).unwrap(),
+            Some((1, 0)),
+            "canonical tx index must survive restart"
+        );
     }
 
     #[test]

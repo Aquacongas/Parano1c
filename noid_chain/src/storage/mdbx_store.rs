@@ -1013,6 +1013,7 @@ impl MdbxStore {
     /// 6. Write state_meta (log_slots, active_slot_count, alloc_counter)
     /// 7. Write BlockUndoLog
     /// 8. Write recent_block bytes
+    /// 9. Remove reverted tx-index entries and index this block's transactions
     ///
     /// After commit (non-atomic, re-runnable):
     ///   - Prune old undo_logs beyond UNDO_RETENTION_DEPTH.
@@ -1028,6 +1029,7 @@ impl MdbxStore {
         dirty_segments: &[(u16, u8, &SegmentColumns)], // (seg_id, effective_log_seg, cols)
         reuse_guard_buckets: &[GuardBucket; REUSE_GUARD_BUCKETS],
         tx_hashes: &[TxBodyHash],
+        tx_index_deletes: &[TxBodyHash],
         block_bytes: Option<&[u8]>, // None = don't store (DA already pruned)
         consensus_meta: &ConsensusMeta,
         rebuild_owner_index: bool,
@@ -1164,8 +1166,23 @@ impl MdbxStore {
 
         // --- 8.5. tx_index: TxBodyHash → (height, position_in_block) ---
         // Enables O(1) receipt lookup: given a tx_body_hash, find the block
-        // and position to reconstruct the Merkle inclusion path.
+        // and position to reconstruct the Merkle inclusion path. Reorg
+        // deletions live in this same transaction as the ancestor checkpoint,
+        // so a crash can never expose an orphan transaction as canonical.
         let tx_idx_tbl = txn.open_table(Some(T_TX_INDEX))?;
+        for h in tx_index_deletes {
+            let raw: Option<Vec<u8>> = txn.get(&tx_idx_tbl, h.0.as_slice())?;
+            if let Some(raw) = raw {
+                let (indexed_height, _) = decode_tx_index_value(&raw)
+                    .ok_or(StoreError::Decode("invalid tx index entry during reorg"))?;
+                // Preserve an older canonical occurrence defensively. Valid
+                // user transaction hashes are one-shot, but this guard keeps a
+                // malformed delete list from erasing ancestor history.
+                if indexed_height > header.height {
+                    txn.del(&tx_idx_tbl, h.0.as_slice(), None)?;
+                }
+            }
+        }
         for (pos, h) in tx_hashes.iter().enumerate() {
             txn.put(
                 &tx_idx_tbl,
@@ -1502,6 +1519,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tx_index_reorg_delete_preserves_ancestor_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(dir.path()).unwrap();
+        let header = crate::consensus::genesis::genesis_header();
+        let hash = crate::hash_block_header(&header);
+        let guard = crate::reuse_guard::ReuseGuard::new_empty();
+        let ancestor_tx = TxBodyHash([0xC3; 32]);
+        let undo = BlockUndoLog::empty(0);
+        let meta = ConsensusMeta {
+            tip_height: 0,
+            tip_hash: hash,
+            cumulative_chainwork: [1u8; 32],
+            finalized: crate::storage::meta::FinalizedCheckpoint { height: 0, hash },
+        };
+
+        store
+            .commit_block(
+                &header,
+                &hash,
+                &undo,
+                &[],
+                guard.buckets(),
+                std::slice::from_ref(&ancestor_tx),
+                &[],
+                None,
+                &meta,
+                false,
+            )
+            .unwrap();
+        store
+            .commit_block(
+                &header,
+                &hash,
+                &undo,
+                &[],
+                guard.buckets(),
+                &[],
+                std::slice::from_ref(&ancestor_tx),
+                None,
+                &meta,
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(store.get_tx_index(&ancestor_tx.0).unwrap(), Some((0, 0)));
+    }
+
+    #[test]
     fn undo_counter_snapshots_survive_durable_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let header = crate::consensus::genesis::genesis_header();
@@ -1535,6 +1600,7 @@ mod tests {
                     &[],
                     guard.buckets(),
                     &undo.tx_hashes,
+                    &[],
                     None,
                     &meta,
                     false,
@@ -1588,6 +1654,7 @@ mod tests {
                 &[(0, 1, &branch_cols)],
                 guard.buckets(),
                 &[],
+                &[],
                 None,
                 &meta,
                 false,
@@ -1608,6 +1675,7 @@ mod tests {
                 &undo,
                 &[(0, 1, &restored_cols)],
                 guard.buckets(),
+                &[],
                 &[],
                 None,
                 &meta,
@@ -1638,6 +1706,7 @@ mod tests {
                 &replacement_undo,
                 &[(0, 1, &replacement_cols)],
                 guard.buckets(),
+                &[],
                 &[],
                 None,
                 &meta,
