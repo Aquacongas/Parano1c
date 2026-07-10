@@ -1406,6 +1406,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn undo_counter_snapshots_survive_durable_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let header = crate::consensus::genesis::genesis_header();
+        let hash = crate::hash_block_header(&header);
+        let guard = crate::reuse_guard::ReuseGuard::new_empty();
+        let undo = BlockUndoLog {
+            block_height: header.height,
+            active_slot_count_before: 37,
+            alloc_counter_before: 91,
+            slot_changes: vec![],
+            tx_hashes: vec![TxBodyHash([0xA5; 32])],
+            reuse_guard_before: (*guard.buckets()).clone(),
+        };
+        let meta = ConsensusMeta {
+            tip_height: header.height,
+            tip_hash: hash,
+            cumulative_chainwork: [1u8; 32],
+            finalized: crate::storage::meta::FinalizedCheckpoint {
+                height: header.height,
+                hash,
+            },
+        };
+
+        {
+            let store = MdbxStore::open(dir.path()).unwrap();
+            store
+                .commit_block(
+                    &header,
+                    &hash,
+                    &undo,
+                    &[],
+                    guard.buckets(),
+                    &undo.tx_hashes,
+                    None,
+                    &meta,
+                )
+                .unwrap();
+        }
+
+        let reopened = MdbxStore::open(dir.path()).unwrap();
+        assert_eq!(reopened.get_undo_log(header.height).unwrap(), Some(undo));
+    }
+
+    #[test]
     fn history_claim_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let store = MdbxStore::open(dir.path()).unwrap();

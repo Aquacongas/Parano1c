@@ -25,7 +25,6 @@ use crate::consensus::{
     pow::block_id,
     ConsensusError,
 };
-use crate::fri_state::SlotValue;
 use crate::state::ChainState;
 use noid_poseidon2b::primitives::TxBodyHash;
 
@@ -91,27 +90,12 @@ pub fn find_common_ancestor(ctx: &ChainContext, new_headers: &[(u64, BlockHeader
     None
 }
 
-/// Revert `active_slot_count` and `alloc_counter` to their pre-block values.
-///
-/// Each `slot_change` entry in the undo log records the slot's **pre-block** value:
-/// - `prev == EMPTY` → the slot was **minted** in this block (was empty before).
-///   Reverting: decrement active_slot_count by 1, decrement alloc_counter by 1.
-/// - `prev != EMPTY` → the slot was **spent** in this block (was live before).
-///   Reverting: increment active_slot_count by 1.
-///
-/// Slots that appear twice (minted then spent in the same block) produce a net
-/// delta of zero on active_slot_count and -1 on alloc_counter, which is correct.
+/// Restore `active_slot_count` and `alloc_counter` to their exact pre-block
+/// values. Counter deltas cannot be inferred safely from final slot pre-images:
+/// a slot may be minted and then spent within the same block.
 pub fn revert_state_counters(state: &mut ChainState, undo: &BlockUndoLog) {
-    for (_, prev_value) in &undo.slot_changes {
-        if *prev_value == SlotValue::EMPTY {
-            // Reverting a mint: the slot was empty before the block, live after.
-            state.active_slot_count = state.active_slot_count.saturating_sub(1);
-            state.alloc_counter = state.alloc_counter.saturating_sub(1);
-        } else {
-            // Reverting a spend: the slot was live before the block, empty after.
-            state.active_slot_count += 1;
-        }
-    }
+    state.active_slot_count = undo.active_slot_count_before;
+    state.alloc_counter = undo.alloc_counter_before;
 }
 
 pub fn revert_reuse_guard(state: &mut ChainState, undo: &BlockUndoLog) {
@@ -486,45 +470,42 @@ mod tests {
     }
 
     #[test]
-    fn revert_state_counters_mint_decrements() {
-        use crate::fri_state::SlotValue;
-        // One minted slot (prev == EMPTY): active -1, alloc -1
+    fn revert_state_counters_restores_exact_snapshot() {
         let undo = BlockUndoLog {
             block_height: 5,
+            active_slot_count_before: 2,
+            alloc_counter_before: 6,
             slot_changes: vec![(10, SlotValue::EMPTY)],
             tx_hashes: vec![],
             reuse_guard_before: std::array::from_fn(|_| crate::reuse_guard::GuardBucket::Empty),
         };
         let mut state = crate::state::ChainState::with_log_slots(6);
-        state.active_slot_count = 3;
-        state.alloc_counter = 7;
+        state.active_slot_count = 99;
+        state.alloc_counter = 123;
         revert_state_counters(&mut state, &undo);
         assert_eq!(state.active_slot_count, 2);
         assert_eq!(state.alloc_counter, 6);
     }
 
     #[test]
-    fn revert_state_counters_spend_increments() {
-        use crate::fri_state::SlotValue;
-        use noid_core::{Block128, TowerField};
-        // One spent slot (prev != EMPTY): active +1, alloc unchanged
-        let prev = SlotValue {
-            value: Block128::from(100u128),
-            owner_hi: Block128::ZERO,
-            owner_lo: Block128::ZERO,
-        };
+    fn revert_state_counters_does_not_saturate_malformed_deltas() {
+        // The old delta inference silently saturated both zero counters for this
+        // impossible post-state. Exact snapshots restore the only authoritative
+        // values without trying to interpret slot_changes.
         let undo = BlockUndoLog {
             block_height: 5,
-            slot_changes: vec![(10, prev)],
+            active_slot_count_before: 17,
+            alloc_counter_before: 29,
+            slot_changes: vec![(10, SlotValue::EMPTY), (11, SlotValue::EMPTY)],
             tx_hashes: vec![],
             reuse_guard_before: std::array::from_fn(|_| crate::reuse_guard::GuardBucket::Empty),
         };
         let mut state = crate::state::ChainState::with_log_slots(6);
-        state.active_slot_count = 5;
-        state.alloc_counter = 10;
+        state.active_slot_count = 0;
+        state.alloc_counter = 0;
         revert_state_counters(&mut state, &undo);
-        assert_eq!(state.active_slot_count, 6);
-        assert_eq!(state.alloc_counter, 10); // unchanged
+        assert_eq!(state.active_slot_count, 17);
+        assert_eq!(state.alloc_counter, 29);
     }
 
     #[test]

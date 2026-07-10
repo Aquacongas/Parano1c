@@ -168,9 +168,11 @@ pub fn decode_slot_value(bytes: &[u8]) -> Option<SlotValue> {
 // ---------------------------------------------------------------------------
 //
 // Wire format:
-//   block_height : u64 LE  (8 bytes)
-//   n_changes    : u32 LE  (4 bytes)
-//   n_hashes     : u32 LE  (4 bytes)
+//   block_height             : u64 LE  (8 bytes)
+//   active_slot_count_before : u64 LE  (8 bytes)
+//   alloc_counter_before     : u64 LE  (8 bytes)
+//   n_changes                : u32 LE  (4 bytes)
+//   n_hashes                 : u32 LE  (4 bytes)
 //   [slot_index  : u32 LE  (4 bytes)
 //    slot_value  : 48 bytes          ] × n_changes
 //   tx_hash      : 32 bytes × n_hashes
@@ -180,9 +182,11 @@ pub fn decode_slot_value(bytes: &[u8]) -> Option<SlotValue> {
 pub fn encode_undo_log(u: &BlockUndoLog) -> Vec<u8> {
     let guard_bytes = encode_reuse_guard_buckets(&u.reuse_guard_before);
     let mut buf = Vec::with_capacity(
-        20 + u.slot_changes.len() * 52 + u.tx_hashes.len() * 32 + guard_bytes.len(),
+        36 + u.slot_changes.len() * 52 + u.tx_hashes.len() * 32 + guard_bytes.len(),
     );
     buf.extend_from_slice(&u.block_height.to_le_bytes());
+    buf.extend_from_slice(&u.active_slot_count_before.to_le_bytes());
+    buf.extend_from_slice(&u.alloc_counter_before.to_le_bytes());
     buf.extend_from_slice(&(u.slot_changes.len() as u32).to_le_bytes());
     buf.extend_from_slice(&(u.tx_hashes.len() as u32).to_le_bytes());
     for (idx, sv) in &u.slot_changes {
@@ -198,14 +202,23 @@ pub fn encode_undo_log(u: &BlockUndoLog) -> Vec<u8> {
 }
 
 pub fn decode_undo_log(bytes: &[u8]) -> Option<BlockUndoLog> {
-    if bytes.len() < 16 {
+    if bytes.len() < 32 {
         return None;
     }
     let block_height = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
-    let n = u32::from_le_bytes(bytes[8..12].try_into().ok()?) as usize;
-    let n_hashes = u32::from_le_bytes(bytes[12..16].try_into().ok()?) as usize;
+    let active_slot_count_before = u64::from_le_bytes(bytes[8..16].try_into().ok()?);
+    let alloc_counter_before = u64::from_le_bytes(bytes[16..24].try_into().ok()?);
+    let n = u32::from_le_bytes(bytes[24..28].try_into().ok()?) as usize;
+    let n_hashes = u32::from_le_bytes(bytes[28..32].try_into().ok()?) as usize;
+    let payload_min = 32usize
+        .checked_add(n.checked_mul(52)?)?
+        .checked_add(n_hashes.checked_mul(32)?)?
+        .checked_add(4)?;
+    if bytes.len() < payload_min {
+        return None;
+    }
     let mut slot_changes = Vec::with_capacity(n);
-    let mut pos = 16;
+    let mut pos = 32;
     for _ in 0..n {
         if bytes.len() < pos + 52 {
             return None;
@@ -235,6 +248,8 @@ pub fn decode_undo_log(bytes: &[u8]) -> Option<BlockUndoLog> {
     let reuse_guard_before = decode_reuse_guard_buckets(&bytes[pos..pos + guard_len])?;
     Some(BlockUndoLog {
         block_height,
+        active_slot_count_before,
+        alloc_counter_before,
         slot_changes,
         tx_hashes,
         reuse_guard_before,
@@ -540,16 +555,15 @@ mod tests {
         };
         let undo = BlockUndoLog {
             block_height: 7,
+            active_slot_count_before: 19,
+            alloc_counter_before: 41,
             slot_changes: vec![(3u32, sv), (9u32, SlotValue::EMPTY)],
             tx_hashes: vec![TxBodyHash([0xABu8; 32])],
             reuse_guard_before: std::array::from_fn(|_| crate::reuse_guard::GuardBucket::Empty),
         };
         let bytes = encode_undo_log(&undo);
         let undo2 = decode_undo_log(&bytes).expect("decode");
-        assert_eq!(undo2.block_height, 7);
-        assert_eq!(undo2.slot_changes.len(), 2);
-        assert_eq!(undo2.slot_changes[0].0, 3);
-        assert_eq!(undo2.tx_hashes.len(), 1);
+        assert_eq!(undo2, undo);
     }
 
     #[test]
@@ -558,8 +572,21 @@ mod tests {
         let bytes = encode_undo_log(&undo);
         let undo2 = decode_undo_log(&bytes).expect("decode");
         assert_eq!(undo2.block_height, 42);
+        assert_eq!(undo2.active_slot_count_before, 0);
+        assert_eq!(undo2.alloc_counter_before, 0);
         assert!(undo2.slot_changes.is_empty());
         assert!(undo2.tx_hashes.is_empty());
+    }
+
+    #[test]
+    fn undo_log_rejects_truncated_counter_header_and_impossible_lengths() {
+        let undo = BlockUndoLog::empty(42);
+        let bytes = encode_undo_log(&undo);
+        assert!(decode_undo_log(&bytes[..23]).is_none());
+
+        let mut malformed = bytes;
+        malformed[24..28].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decode_undo_log(&malformed).is_none());
     }
 
     #[test]

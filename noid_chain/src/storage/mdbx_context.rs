@@ -992,6 +992,9 @@ impl MdbxChainContext {
         // any in-memory state.
         // -----------------------------------------------------------------------
         {
+            if ancestor_height != 0 && self.store.get_undo_log(ancestor_height)?.is_none() {
+                return Err(MdbxContextError::Corrupt("reorg ancestor undo log missing"));
+            }
             let range = ancestor_height + 1..=self.tip_height;
             let total = self.tip_height.saturating_sub(ancestor_height) as usize;
             let mut loaded = Vec::with_capacity(total);
@@ -1164,10 +1167,13 @@ impl MdbxChainContext {
 
         // Read the ancestor's existing undo log so we don't overwrite it with
         // empty — it must remain intact for any future reorg within finality.
-        let existing_undo = self
-            .store
-            .get_undo_log(ancestor_header.height)?
-            .unwrap_or_else(|| BlockUndoLog::empty(ancestor_header.height));
+        let existing_undo = match self.store.get_undo_log(ancestor_header.height)? {
+            Some(undo) => undo,
+            None if ancestor_header.height == 0 => BlockUndoLog::empty(0),
+            None => {
+                return Err(MdbxContextError::Corrupt("reorg ancestor undo log missing"));
+            }
+        };
 
         // Atomic commit: dirty segments + updated chain_tip + state_meta.
         // The ancestor's header and hash→height index are idempotently re-written.
@@ -1664,6 +1670,20 @@ mod tests {
             ctx.store.get_header_anchor(0).unwrap(),
             Some(expected_anchor)
         );
+    }
+
+    #[test]
+    fn persist_reorg_checkpoint_rejects_missing_non_genesis_undo() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
+        let mut ancestor = *ctx.tip_header();
+        ancestor.height = 1;
+
+        assert!(matches!(
+            ctx.persist_reorg_checkpoint(&ancestor),
+            Err(MdbxContextError::Corrupt("reorg ancestor undo log missing"))
+        ));
+        assert!(ctx.store.get_undo_log(1).unwrap().is_none());
     }
 
     #[test]

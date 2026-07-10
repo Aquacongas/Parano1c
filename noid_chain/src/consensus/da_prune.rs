@@ -14,7 +14,7 @@
 //! BlockProof bytes, and Auth sidecars once finalized history/checkpoint
 //! coverage has consumed the same heights.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::block::Block;
 use crate::consensus::params::UNDO_RETENTION_DEPTH;
@@ -33,9 +33,13 @@ use noid_poseidon2b::primitives::TxBodyHash;
 pub struct BlockUndoLog {
     /// Height of the block this undo log was produced for.
     pub block_height: u64,
+    /// Exact active-slot counter before this block was applied.
+    pub active_slot_count_before: u64,
+    /// Exact allocator counter before this block was applied.
+    pub alloc_counter_before: u64,
     /// `(slot_index, value_before_block)` pairs for every slot mutated by
-    /// this block, recorded in application order. Replaying these in
-    /// *reverse* order restores the pre-block UTXO state.
+    /// this block, recorded once at the slot's first occurrence in application
+    /// order. Replaying these restores the pre-block UTXO state.
     pub slot_changes: Vec<(u32, SlotValue)>,
     /// tx_body_hashes of all transactions in this block (coinbase first).
     /// Used to restore the mempool after a reorg: txs that are no longer
@@ -50,6 +54,8 @@ impl BlockUndoLog {
     pub fn empty(block_height: u64) -> Self {
         Self {
             block_height,
+            active_slot_count_before: 0,
+            alloc_counter_before: 0,
             slot_changes: vec![],
             tx_hashes: vec![],
             reuse_guard_before: std::array::from_fn(|_| GuardBucket::Empty),
@@ -71,6 +77,7 @@ impl BlockUndoLog {
 pub fn build_undo_log(state_before: &ChainState, block: &Block) -> BlockUndoLog {
     let tx_hashes: Vec<TxBodyHash> = block.transactions.iter().map(|t| t.tx_body_hash).collect();
     let mut slot_changes = Vec::new();
+    let mut touched_slots = HashSet::new();
 
     for tx in &block.transactions {
         // Record pre-image of each spent input slot.
@@ -78,7 +85,9 @@ pub fn build_undo_log(state_before: &ChainState, block: &Block) -> BlockUndoLog 
             if !inp.valid {
                 continue;
             }
-            if (inp.slot_index as u64) < state_before.state.num_slots() {
+            if (inp.slot_index as u64) < state_before.state.num_slots()
+                && touched_slots.insert(inp.slot_index)
+            {
                 let prev = state_before.state.slot(inp.slot_index);
                 slot_changes.push((inp.slot_index, prev));
             }
@@ -88,7 +97,9 @@ pub fn build_undo_log(state_before: &ChainState, block: &Block) -> BlockUndoLog 
             if !out.valid {
                 continue;
             }
-            if (out.slot_index as u64) < state_before.state.num_slots() {
+            if (out.slot_index as u64) < state_before.state.num_slots()
+                && touched_slots.insert(out.slot_index)
+            {
                 let prev = state_before.state.slot(out.slot_index);
                 slot_changes.push((out.slot_index, prev));
             }
@@ -97,6 +108,8 @@ pub fn build_undo_log(state_before: &ChainState, block: &Block) -> BlockUndoLog 
 
     BlockUndoLog {
         block_height: block.header.height,
+        active_slot_count_before: state_before.active_slot_count,
+        alloc_counter_before: state_before.alloc_counter,
         slot_changes,
         tx_hashes,
         reuse_guard_before: std::array::from_fn(|i| state_before.reuse_guard.bucket(i).clone()),
@@ -104,7 +117,7 @@ pub fn build_undo_log(state_before: &ChainState, block: &Block) -> BlockUndoLog 
 }
 
 /// Revert the UTXO state to what it was before a block was applied by
-/// replaying `undo.slot_changes` in **reverse** order.
+/// replaying `undo.slot_changes`. Each physical slot occurs exactly once.
 ///
 /// Only the `SegmentedFriState` is modified; the caller is responsible for
 /// updating `ChainState::active_slot_count` and `alloc_counter` if needed.
@@ -135,8 +148,8 @@ mod tests {
     use crate::block_header::BlockHeader;
     use crate::consensus::params::GENESIS_TARGET;
     use crate::state::{apply_tx, ChainState};
-    use noid_poseidon2b::primitives::Address;
-    use noid_tx::{hash_tx_body, TxBody, TxOutput};
+    use noid_poseidon2b::primitives::{Address, SpendSecret};
+    use noid_tx::{hash_tx_body, Transaction, TxBody, TxInput, TxOutput};
 
     const TEST_LOG_SLOTS: usize = 6;
 
@@ -204,6 +217,8 @@ mod tests {
         let block = empty_block_at(1, state.clone().state_root());
         let undo = build_undo_log(&state, &block);
         assert_eq!(undo.block_height, 1);
+        assert_eq!(undo.active_slot_count_before, 0);
+        assert_eq!(undo.alloc_counter_before, 0);
         assert!(undo.slot_changes.is_empty());
     }
 
@@ -263,6 +278,8 @@ mod tests {
         let undo = build_undo_log(&state_before, &block);
         // One output → one slot recorded.
         assert_eq!(undo.slot_changes.len(), 1);
+        assert_eq!(undo.active_slot_count_before, 0);
+        assert_eq!(undo.alloc_counter_before, 0);
         assert_eq!(undo.slot_changes[0].0, 1); // slot index 1
         assert_eq!(undo.slot_changes[0].1, SlotValue::EMPTY); // was empty before
 
@@ -273,5 +290,81 @@ mod tests {
             pre_root,
             "state root must be restored after revert"
         );
+    }
+
+    #[test]
+    fn transient_mint_then_spend_records_first_touch_once_and_reverts_exactly() {
+        let mut state_before = fresh();
+        state_before.alloc_counter = 9;
+        let pre_root = state_before.state_root();
+        let out = mk_output(7);
+
+        let mint_body = TxBody {
+            shape: noid_tx::TxShape::Standard4x8,
+            epoch_anchor: [0u8; 32],
+            fee: 0,
+            inputs: vec![],
+            outputs: vec![out],
+            is_coinbase: true,
+        };
+        let spend_body = TxBody {
+            shape: noid_tx::TxShape::Standard4x8,
+            epoch_anchor: [0u8; 32],
+            fee: out.value as u128,
+            inputs: vec![TxInput {
+                slot_index: out.slot_index,
+                value: out.value,
+                owner: out.owner,
+                spend_secret: SpendSecret([2u8; 32]),
+                valid: true,
+            }],
+            outputs: vec![],
+            is_coinbase: false,
+        };
+        let tx = |body: TxBody| Transaction {
+            tx_body_hash: hash_tx_body(
+                &body.epoch_anchor,
+                body.fee,
+                &body.inputs,
+                &body.outputs,
+                body.is_coinbase,
+            ),
+            body,
+        };
+        let transactions = vec![tx(mint_body.clone()), tx(spend_body.clone())];
+
+        let mut state_after = state_before.clone();
+        apply_tx(&mut state_after, &mint_body).expect("mint applies");
+        apply_tx(&mut state_after, &spend_body).expect("same-block spend applies");
+        assert_eq!(state_after.active_slot_count, 0);
+        assert_eq!(state_after.alloc_counter, 10);
+        assert_eq!(state_after.state_root(), pre_root);
+
+        let block = Block {
+            header: BlockHeader {
+                prev_block_hash: [0u8; 32],
+                state_root: state_after.state_root(),
+                tx_root: compute_tx_root(&transactions),
+                timestamp: 1_767_225_660,
+                height: 1,
+                miner_address: Address([0u8; 32]),
+                nonce: 0,
+                difficulty_target: GENESIS_TARGET,
+                log_slots: TEST_LOG_SLOTS as u32,
+                active_slot_count: state_after.active_slot_count,
+                alloc_counter: state_after.alloc_counter,
+            },
+            transactions,
+        };
+        let undo = build_undo_log(&state_before, &block);
+        assert_eq!(undo.active_slot_count_before, 0);
+        assert_eq!(undo.alloc_counter_before, 9);
+        assert_eq!(undo.slot_changes, vec![(out.slot_index, SlotValue::EMPTY)]);
+
+        revert_block(&mut state_after.state, &undo);
+        crate::consensus::reorg::revert_state_counters(&mut state_after, &undo);
+        assert_eq!(state_after.state_root(), pre_root);
+        assert_eq!(state_after.active_slot_count, 0);
+        assert_eq!(state_after.alloc_counter, 9);
     }
 }

@@ -180,9 +180,9 @@ pub fn build_block_template(
     }
 
     // 3. Apply non-coinbase txs to scratch state.
-    let mut scratch = state.clone();
+    let mut selection_scratch = state.clone();
     if should_expand {
-        scratch.state.expand();
+        selection_scratch.state.expand();
     }
 
     let mut applied_winners: Vec<Transaction> = Vec::new();
@@ -202,7 +202,7 @@ pub fn build_block_template(
         {
             continue;
         }
-        match apply_tx_checked_deferred_root(&mut scratch, &tx.body) {
+        match apply_tx_checked_deferred_root(&mut selection_scratch, &tx.body) {
             Ok(_) => {
                 guard_actions = trial_guard_actions;
                 applied_winners.push(tx);
@@ -212,12 +212,36 @@ pub fn build_block_template(
     }
     let ordered_winners = applied_winners;
 
+    // Rebuild the final scratch state in semantic block order. Selection runs
+    // users first because coinbase value depends on the selected fee set, but
+    // the actual block and exact action stream are coinbase -> users.
+    let mut scratch = state.clone();
+    if should_expand {
+        scratch.state.expand();
+    }
+
     // 4. Build coinbase transaction.
     // Find an empty slot for coinbase output using the allocator.
     // Use the scratch state's actual capacity so hints are always in range.
     let coinbase_slot = {
         let state_log_slots = scratch.state.log_slots() as u32;
-        let reserved = HashSet::new();
+        let reserved: HashSet<u32> = ordered_winners
+            .iter()
+            .flat_map(|tx| {
+                tx.body
+                    .inputs
+                    .iter()
+                    .filter(|input| input.valid)
+                    .map(|input| input.slot_index)
+                    .chain(
+                        tx.body
+                            .outputs
+                            .iter()
+                            .filter(|output| output.valid)
+                            .map(|output| output.slot_index),
+                    )
+            })
+            .collect();
         let seed =
             scratch.alloc_counter ^ u64::from_le_bytes(parent.state_root[..8].try_into().unwrap());
 
@@ -226,15 +250,12 @@ pub fn build_block_template(
         let reuse_hints = scratch
             .state
             .empty_slot_hints_in_populated_segments(seed, 32, &reserved);
-        if let Some(slot) = reuse_hints
-            .into_iter()
-            .find(|&slot| {
-                scratch.state.slot(slot) == crate::fri_state::SlotValue::EMPTY
-                    && guard_actions
-                        .validate_mint(&state.reuse_guard, parent.height + 1, slot)
-                        .is_ok()
-            })
-        {
+        if let Some(slot) = reuse_hints.into_iter().find(|&slot| {
+            scratch.state.slot(slot) == crate::fri_state::SlotValue::EMPTY
+                && guard_actions
+                    .validate_mint(&state.reuse_guard, parent.height + 1, slot)
+                    .is_ok()
+        }) {
             slot
         } else {
             // Fall back to the virgin-zone allocator. Grow the candidate window
@@ -246,7 +267,8 @@ pub fn build_block_template(
                 found = generate_slot_hints(scratch.alloc_counter, state_log_slots, count)
                     .into_iter()
                     .find(|&slot| {
-                        scratch.state.slot(slot) == crate::fri_state::SlotValue::EMPTY
+                        !reserved.contains(&slot)
+                            && scratch.state.slot(slot) == crate::fri_state::SlotValue::EMPTY
                             && guard_actions
                                 .validate_mint(&state.reuse_guard, parent.height + 1, slot)
                                 .is_ok()
@@ -290,9 +312,13 @@ pub fn build_block_template(
         tx_body_hash: cb_hash,
     };
 
-    // Apply coinbase to scratch state.
+    // Apply the complete block to scratch in its real semantic order.
     apply_tx_checked_deferred_root(&mut scratch, &coinbase.body)
         .map_err(|e| TemplateBuildError::StateApplyError(format!("{:?}", e)))?;
+    for tx in &ordered_winners {
+        apply_tx_checked_deferred_root(&mut scratch, &tx.body)
+            .map_err(|e| TemplateBuildError::StateApplyError(format!("{:?}", e)))?;
+    }
 
     let exact_bodies: Vec<_> = std::iter::once(coinbase.body.clone())
         .chain(ordered_winners.iter().map(|tx| tx.body.clone()))
@@ -311,11 +337,7 @@ pub fn build_block_template(
         &exact_commitments,
     )
     .map_err(|e| TemplateBuildError::StateApplyError(format!("{:?}", e)))?;
-    crate::block::advance_reuse_state(
-        &mut scratch,
-        parent.height + 1,
-        &exact_surface.spent_slots,
-    )
+    crate::block::advance_reuse_state(&mut scratch, parent.height + 1, &exact_surface.spent_slots)
         .map_err(|e| TemplateBuildError::StateApplyError(format!("{:?}", e)))?;
 
     // 5. Compute final header fields.
@@ -559,6 +581,15 @@ mod tests {
             "spend blocks must change the composite root through ReuseGuard"
         );
         assert_eq!(tmpl.state_root, expected_root);
+
+        let mut block_order_state = state.clone();
+        let block = crate::block::Block {
+            header: tmpl.clone().into_header(0),
+            transactions: tmpl.all_txs(),
+        };
+        crate::block::apply_block(&mut block_order_state, &block)
+            .expect("template state root replays in coinbase-first block order");
+        assert_eq!(block_order_state.state_root(), tmpl.state_root);
     }
 
     #[test]
