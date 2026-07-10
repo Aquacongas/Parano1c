@@ -488,7 +488,7 @@ pub fn verify_block_spine_shift_trace(
 // ---------------------------------------------------------------------------
 
 /// Trace twin of the multi-batch closure every spine-family killshot ends
-/// with (`accepted_claim_hash`, `header_hash`, `chain_accumulator`, …): the
+/// with (`accepted_claim_hash`, `header_hash`, direct accumulator, …): the
 /// three column claim sets `(state ← r', r'', chain point; s_in/s_out ← r'')`
 /// fed into `verify_multi_batch_eval`. Returns `[state, sin, sout]`.
 pub fn close_spine_family_batch(

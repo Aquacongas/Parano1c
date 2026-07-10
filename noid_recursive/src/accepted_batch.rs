@@ -12,15 +12,15 @@ use noid_core::Block128;
 use noid_core::TowerField;
 use noid_gkr::{
     discharge_fixed_field_hash_reductions_native, prove_fixed_field_hash_killshot,
-    verify_fixed_field_hash_killshot, ChainAccumulatorBatchInputs, ChainAccumulatorItem,
-    FixedFieldHashInputs, FixedFieldHashParams, FixedFieldHashProofKillShot,
+    verify_fixed_field_hash_killshot, FixedFieldHashInputs, FixedFieldHashParams,
+    FixedFieldHashProofKillShot,
 };
 use noid_poseidon2b::channel::Poseidon2bChannel;
 use noid_poseidon2b::native::domain::{capacity_iv, TAG_HISTPRF};
 use noid_poseidon2b::native::Poseidon2bSponge;
 use noid_poseidon2b::primitives::Digest;
 
-use crate::accumulator::ChainAccumulator;
+use crate::accumulator::{ChainAccumulator, ChainAccumulatorAdvanceError, CHAIN_ACCUMULATOR_LANES};
 use crate::checkpoint_proof::HISTORY_CHECKPOINT_BATCH_TARGET_BLOCKS;
 use crate::header_integer::{
     verify_header_integer_trace, HeaderIntegerBatchTrace, HeaderIntegerTraceError,
@@ -36,7 +36,7 @@ pub const ACCEPTED_CLAIM_BATCH_DIGEST_HEADER_WITNESS_FIELDS: usize = POW_HEADER_
 pub const ACCEPTED_CLAIM_BATCH_DIGEST_CLAIM_FIELDS: usize = 2;
 pub const ACCEPTED_CLAIM_BATCH_DIGEST_CONSENSUS_FIELDS: usize =
     16 + MEDIAN_TIME_BLOCKS + EXPANSION_WINDOW_LEN;
-pub const ACCEPTED_CLAIM_BATCH_DIGEST_ACCUMULATOR_FIELDS: usize = 7;
+pub const ACCEPTED_CLAIM_BATCH_DIGEST_ACCUMULATOR_FIELDS: usize = CHAIN_ACCUMULATOR_LANES;
 pub const ACCEPTED_CLAIM_BATCH_DIGEST_SLOT_FIELDS: usize =
     ACCEPTED_CLAIM_BATCH_DIGEST_HEADER_WITNESS_FIELDS + ACCEPTED_CLAIM_BATCH_DIGEST_CLAIM_FIELDS;
 pub const ACCEPTED_CLAIM_BATCH_DIGEST_PAYLOAD_FIELDS: usize = 1
@@ -44,9 +44,11 @@ pub const ACCEPTED_CLAIM_BATCH_DIGEST_PAYLOAD_FIELDS: usize = 1
     + ACCEPTED_CLAIM_BATCH_DIGEST_CONSENSUS_FIELDS
     + ACCEPTED_CLAIM_BATCH_DIGEST_ACCUMULATOR_FIELDS
     + HISTORY_CHECKPOINT_BATCH_TARGET_BLOCKS as usize * ACCEPTED_CLAIM_BATCH_DIGEST_SLOT_FIELDS
-    + 2;
+    + 3;
 pub const ACCEPTED_CLAIM_BATCH_DIGEST_HASH_FIELDS: usize =
     2 + ACCEPTED_CLAIM_BATCH_DIGEST_PAYLOAD_FIELDS;
+
+const _: () = assert!(ACCEPTED_CLAIM_BATCH_DIGEST_HASH_FIELDS % 2 == 0);
 
 const ACB_DIG1: u128 = 0x4143_425F_4449_4731; // "ACB_DIG1"
 
@@ -65,10 +67,18 @@ pub struct AcceptedClaimBatchOutput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AcceptedClaimBatchError {
     EmptyBatch,
-    ClaimCountMismatch { headers: usize, claims: usize },
+    ClaimCountMismatch {
+        headers: usize,
+        claims: usize,
+    },
     StartStateMismatch,
+    EndStateMismatch,
     HeaderWork(PowHeaderBatchError),
     HeaderInteger(HeaderIntegerTraceError),
+    AccumulatorAdvance {
+        index: usize,
+        source: ChainAccumulatorAdvanceError,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +87,9 @@ pub enum AcceptedClaimBatchDigestError {
     TooManyClaims { actual: usize },
     ClaimCountMismatch { headers: usize, claims: usize },
     DigestFieldCountMismatch { actual: usize },
+    NonCanonicalHeader,
+    NonCanonicalSlotPadding,
+    NonCanonicalPadding,
     DigestMismatch,
     BadDigestProof,
     BadDigestDischarge,
@@ -97,6 +110,19 @@ impl std::fmt::Display for AcceptedClaimBatchDigestError {
                 f,
                 "accepted-claim batch digest field count mismatch: {actual}"
             ),
+            Self::NonCanonicalHeader => {
+                write!(f, "accepted-claim batch digest has a non-canonical header")
+            }
+            Self::NonCanonicalSlotPadding => write!(
+                f,
+                "accepted-claim batch digest has non-zero unused slot fields"
+            ),
+            Self::NonCanonicalPadding => {
+                write!(
+                    f,
+                    "accepted-claim batch digest has non-zero trailing padding"
+                )
+            }
             Self::DigestMismatch => write!(f, "accepted-claim batch digest mismatch"),
             Self::BadDigestProof => write!(f, "bad accepted-claim batch digest proof"),
             Self::BadDigestDischarge => {
@@ -164,7 +190,13 @@ pub fn accepted_claim_batch_digest_hash_fields(
             index += ACCEPTED_CLAIM_BATCH_DIGEST_SLOT_FIELDS;
         }
     }
-    index += 2;
+    // The fixed no-pad hash consumes field pairs. These three canonical zero
+    // lanes make the complete schedule even after the direct accumulator grew
+    // from seven to ten lanes.
+    for _ in 0..3 {
+        fields[index] = Block128::ZERO;
+        index += 1;
+    }
     debug_assert_eq!(index, ACCEPTED_CLAIM_BATCH_DIGEST_HASH_FIELDS);
     Ok(fields)
 }
@@ -201,6 +233,35 @@ pub fn accepted_claim_batch_digest_from_hash_fields(
         return Err(AcceptedClaimBatchDigestError::DigestFieldCountMismatch {
             actual: fields.len(),
         });
+    }
+    if fields[0] != Block128::from(ACB_DIG1)
+        || fields[1] != Block128::from(ACCEPTED_CLAIM_BATCH_DIGEST_PAYLOAD_FIELDS as u128)
+        || fields[3] != Block128::from(HISTORY_CHECKPOINT_BATCH_TARGET_BLOCKS as u128)
+    {
+        return Err(AcceptedClaimBatchDigestError::NonCanonicalHeader);
+    }
+    let slot_count = usize::try_from(fields[2].to_u128())
+        .map_err(|_| AcceptedClaimBatchDigestError::NonCanonicalHeader)?;
+    if slot_count == 0 || slot_count > HISTORY_CHECKPOINT_BATCH_TARGET_BLOCKS as usize {
+        return Err(AcceptedClaimBatchDigestError::NonCanonicalHeader);
+    }
+    let slots_offset = 4
+        + ACCEPTED_CLAIM_BATCH_DIGEST_CONSENSUS_FIELDS
+        + ACCEPTED_CLAIM_BATCH_DIGEST_ACCUMULATOR_FIELDS;
+    let unused_slots_start = slots_offset + slot_count * ACCEPTED_CLAIM_BATCH_DIGEST_SLOT_FIELDS;
+    let slot_region_end = slots_offset
+        + HISTORY_CHECKPOINT_BATCH_TARGET_BLOCKS as usize * ACCEPTED_CLAIM_BATCH_DIGEST_SLOT_FIELDS;
+    if fields[unused_slots_start..slot_region_end]
+        .iter()
+        .any(|field| *field != Block128::ZERO)
+    {
+        return Err(AcceptedClaimBatchDigestError::NonCanonicalSlotPadding);
+    }
+    if fields[fields.len() - 3..]
+        .iter()
+        .any(|field| *field != Block128::ZERO)
+    {
+        return Err(AcceptedClaimBatchDigestError::NonCanonicalPadding);
     }
     Ok(digest_fixed_no_pad_from_fields(fields))
 }
@@ -322,14 +383,10 @@ fn push_accumulator_fields<const N: usize>(
     index: &mut usize,
     accumulator: &ChainAccumulator,
 ) {
-    fields[*index] = Block128::from(accumulator.height as u128);
-    *index += 1;
-    push_digest_fields(fields, index, &accumulator.state_root);
-    push_digest_fields(fields, index, &accumulator.chain_hash);
-    fields[*index] = Block128::from(accumulator.active_slot_count as u128);
-    *index += 1;
-    fields[*index] = Block128::from(accumulator.alloc_counter as u128);
-    *index += 1;
+    for lane in accumulator.to_lanes() {
+        fields[*index] = lane;
+        *index += 1;
+    }
 }
 
 fn push_claim_fields<const N: usize>(
@@ -356,7 +413,11 @@ fn push_digest_fields<const N: usize>(
 }
 
 fn digest_fixed_no_pad_from_fields(fields: &[Block128]) -> Digest {
-    debug_assert_eq!(fields.len() % 2, 0);
+    assert_eq!(
+        fields.len() % 2,
+        0,
+        "fixed no-pad hash input must contain complete field pairs"
+    );
     let mut sponge = Poseidon2bSponge::with_iv(capacity_iv(TAG_HISTPRF));
     for pair in fields.chunks_exact(2) {
         sponge.absorb_pair(pair[0], pair[1]);
@@ -368,27 +429,6 @@ fn fixed_hash_input(fields: &[Block128], expected_digest: &Digest) -> FixedField
     FixedFieldHashInputs {
         fields: fields.to_vec(),
         expected_digest: digest_to_fields(*expected_digest),
-    }
-}
-
-pub fn chain_accumulator_proof_inputs(
-    start_accumulator: &ChainAccumulator,
-    accepted_witness: &AcceptedClaimBatchWitness,
-    end_accumulator: &ChainAccumulator,
-) -> ChainAccumulatorBatchInputs {
-    let items = accepted_witness
-        .headers
-        .iter()
-        .zip(accepted_witness.accepted_block_claims.iter().copied())
-        .map(|(header_witness, chain_claim)| ChainAccumulatorItem {
-            block_id: digest_to_fields(header_witness.block_id),
-            chain_claim,
-        })
-        .collect();
-    ChainAccumulatorBatchInputs {
-        start_chain_hash: digest_to_fields(start_accumulator.chain_hash),
-        items,
-        expected_chain_hash: digest_to_fields(end_accumulator.chain_hash),
     }
 }
 
@@ -406,9 +446,7 @@ pub fn verify_accepted_claim_batch_native(
             claims: witness.accepted_block_claims.len(),
         });
     }
-    if start_accumulator.height != start_consensus.height
-        || start_accumulator.state_root != start_consensus.state_root
-    {
+    if !accumulator_matches_consensus(start_accumulator, start_consensus) {
         return Err(AcceptedClaimBatchError::StartStateMismatch);
     }
 
@@ -416,25 +454,14 @@ pub fn verify_accepted_claim_batch_native(
         .map_err(AcceptedClaimBatchError::HeaderWork)?;
 
     let mut accumulator = start_accumulator.clone();
-    for (header_witness, chain_claim) in witness
-        .headers
-        .iter()
-        .zip(witness.accepted_block_claims.iter().copied())
-    {
-        accumulator = accumulator.extend(
-            header_witness.header.state_root,
-            header_witness.block_id,
-            header_witness.header.height,
-            chain_claim,
-            header_witness.header.active_slot_count,
-            header_witness.header.alloc_counter,
-        );
+    for (index, header_witness) in witness.headers.iter().enumerate() {
+        accumulator = accumulator
+            .advance(&header_witness.header)
+            .map_err(|source| AcceptedClaimBatchError::AccumulatorAdvance { index, source })?;
     }
 
-    if accumulator.height != consensus_state.height
-        || accumulator.state_root != consensus_state.state_root
-    {
-        return Err(AcceptedClaimBatchError::StartStateMismatch);
+    if !accumulator_matches_consensus(&accumulator, &consensus_state) {
+        return Err(AcceptedClaimBatchError::EndStateMismatch);
     }
 
     Ok(AcceptedClaimBatchOutput {
@@ -462,9 +489,7 @@ pub fn verify_accepted_claim_batch_with_header_trace(
             claims: witness.accepted_block_claims.len(),
         });
     }
-    if start_accumulator.height != start_consensus.height
-        || start_accumulator.state_root != start_consensus.state_root
-    {
+    if !accumulator_matches_consensus(start_accumulator, start_consensus) {
         return Err(AcceptedClaimBatchError::StartStateMismatch);
     }
 
@@ -473,25 +498,14 @@ pub fn verify_accepted_claim_batch_with_header_trace(
             .map_err(AcceptedClaimBatchError::HeaderInteger)?;
 
     let mut accumulator = start_accumulator.clone();
-    for (header_witness, chain_claim) in witness
-        .headers
-        .iter()
-        .zip(witness.accepted_block_claims.iter().copied())
-    {
-        accumulator = accumulator.extend(
-            header_witness.header.state_root,
-            header_witness.block_id,
-            header_witness.header.height,
-            chain_claim,
-            header_witness.header.active_slot_count,
-            header_witness.header.alloc_counter,
-        );
+    for (index, header_witness) in witness.headers.iter().enumerate() {
+        accumulator = accumulator
+            .advance(&header_witness.header)
+            .map_err(|source| AcceptedClaimBatchError::AccumulatorAdvance { index, source })?;
     }
 
-    if accumulator.height != consensus_state.height
-        || accumulator.state_root != consensus_state.state_root
-    {
-        return Err(AcceptedClaimBatchError::StartStateMismatch);
+    if !accumulator_matches_consensus(&accumulator, &consensus_state) {
+        return Err(AcceptedClaimBatchError::EndStateMismatch);
     }
 
     Ok(AcceptedClaimBatchOutput {
@@ -500,15 +514,25 @@ pub fn verify_accepted_claim_batch_with_header_trace(
     })
 }
 
+fn accumulator_matches_consensus(
+    accumulator: &ChainAccumulator,
+    consensus: &RecursiveConsensusState,
+) -> bool {
+    accumulator.height == consensus.height
+        && accumulator.tip_block_id == consensus.block_id
+        && accumulator.state_root == consensus.state_root
+        && accumulator.log_slots == consensus.log_slots
+        && accumulator.active_slot_count == consensus.active_slot_count
+        && accumulator.alloc_counter == consensus.alloc_counter
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::header_integer::build_header_integer_trace;
-    use noid_chain::consensus::asert_anchor_height;
     use noid_chain::consensus::difficulty::{add_work, block_work, next_target};
-    use noid_chain::consensus::params::{BLOCK_TIME, MAX_TARGET};
-    use noid_gkr::{prove_chain_accumulator_killshot, verify_chain_accumulator_killshot};
-    use noid_poseidon2b::channel::Poseidon2bChannel;
+    use noid_chain::consensus::params::BLOCK_TIME;
+    use noid_chain::consensus::{asert_anchor_height, genesis_header};
     use noid_poseidon2b::primitives::Address;
 
     fn verify_without_pow_for_tests(
@@ -543,39 +567,23 @@ mod tests {
                     },
                 ));
             }
-            let chain_claim = witness.accepted_block_claims[index];
             consensus.height = header_witness.header.height;
             consensus.block_id = header_witness.block_id;
             consensus.state_root = header_witness.header.state_root;
-            accumulator = accumulator.extend(
-                header_witness.header.state_root,
-                header_witness.block_id,
-                header_witness.header.height,
-                chain_claim,
-                header_witness.header.active_slot_count,
-                header_witness.header.alloc_counter,
-            );
+            consensus.log_slots = header_witness.header.log_slots;
+            consensus.active_slot_count = header_witness.header.active_slot_count;
+            consensus.alloc_counter = header_witness.header.alloc_counter;
+            accumulator = accumulator
+                .advance(&header_witness.header)
+                .map_err(|source| AcceptedClaimBatchError::AccumulatorAdvance { index, source })?;
+        }
+        if !accumulator_matches_consensus(&accumulator, &consensus) {
+            return Err(AcceptedClaimBatchError::EndStateMismatch);
         }
         Ok(AcceptedClaimBatchOutput {
             consensus_state: consensus,
             accumulator,
         })
-    }
-
-    fn start_header() -> noid_chain::BlockHeader {
-        noid_chain::BlockHeader {
-            prev_block_hash: [0u8; 32],
-            state_root: [1u8; 32],
-            tx_root: [0u8; 32],
-            timestamp: 1_767_225_600,
-            height: 0,
-            miner_address: Address([0x44; 32]),
-            nonce: 0,
-            difficulty_target: MAX_TARGET,
-            log_slots: 24,
-            active_slot_count: 0,
-            alloc_counter: 0,
-        }
     }
 
     fn next_header(state: &RecursiveConsensusState, state_seed: u8) -> noid_chain::BlockHeader {
@@ -603,7 +611,7 @@ mod tests {
     }
 
     fn start_pair() -> (RecursiveConsensusState, ChainAccumulator) {
-        let header = start_header();
+        let header = genesis_header();
         let start_consensus = RecursiveConsensusState::from_header(
             &header,
             block_work(&header.difficulty_target),
@@ -613,13 +621,7 @@ mod tests {
             &[header.timestamp],
             &[header.active_slot_count],
         );
-        let start_accumulator = ChainAccumulator {
-            height: header.height,
-            state_root: header.state_root,
-            chain_hash: [0u8; 32],
-            active_slot_count: header.active_slot_count,
-            alloc_counter: header.alloc_counter,
-        };
+        let start_accumulator = crate::accumulator::genesis_accumulator();
         (start_consensus, start_accumulator)
     }
 
@@ -694,62 +696,57 @@ mod tests {
         verify_accepted_claim_batch_digest(&witness, &out, &digest_proof)
             .expect("digest proof verifies");
 
-        let mut tampered_out = out.clone();
-        tampered_out.accumulator.chain_hash = [0x99; 32];
-        assert_eq!(
-            verify_accepted_claim_batch_digest(&witness, &tampered_out, &digest_proof),
-            Err(AcceptedClaimBatchDigestError::BadDigestProof)
-        );
+        for lane_index in 0..CHAIN_ACCUMULATOR_LANES {
+            let mut tampered_out = out.clone();
+            let mut lanes = tampered_out.accumulator.to_lanes();
+            lanes[lane_index] += Block128::ONE;
+            tampered_out.accumulator = ChainAccumulator::from_lanes(lanes).unwrap();
+            assert_eq!(
+                verify_accepted_claim_batch_digest(&witness, &tampered_out, &digest_proof),
+                Err(AcceptedClaimBatchDigestError::BadDigestProof),
+                "accumulator lane {lane_index} must be digest-bound"
+            );
+        }
 
         let expected = start_accumulator
-            .extend(
-                h1.state_root,
-                noid_chain::hash_block_header(&h1),
-                h1.height,
-                claims[0],
-                h1.active_slot_count,
-                h1.alloc_counter,
-            )
-            .extend(
-                h2.state_root,
-                noid_chain::hash_block_header(&h2),
-                h2.height,
-                claims[1],
-                h2.active_slot_count,
-                h2.alloc_counter,
-            );
+            .advance(&h1)
+            .unwrap()
+            .advance(&h2)
+            .unwrap();
         assert_eq!(out.accumulator, expected);
-    }
 
-    #[test]
-    fn accepted_claim_batch_feeds_chain_accumulator_killshot() {
-        let (start_consensus, start_accumulator) = start_pair();
-        let h1 = next_header(&start_consensus, 2);
-        let mut mid = start_consensus.clone();
-        mid.height = h1.height;
-        mid.block_id = noid_chain::hash_block_header(&h1);
-        mid.state_root = h1.state_root;
-        let h2 = next_header(&mid, 3);
-        let witness = AcceptedClaimBatchWitness {
-            headers: vec![
-                HeaderWitness::from_header(&h1),
-                HeaderWitness::from_header(&h2),
-            ],
-            accepted_block_claims: vec![
-                [Block128::from(0xA1u128), Block128::from(0xA2u128)],
-                [Block128::from(0xB1u128), Block128::from(0xB2u128)],
-            ],
-        };
-        let out =
-            verify_without_pow_for_tests(&start_consensus, &start_accumulator, &witness).unwrap();
-        let inputs = chain_accumulator_proof_inputs(&start_accumulator, &witness, &out.accumulator);
+        let fields = accepted_claim_batch_digest_hash_fields(&witness, &out).unwrap();
+        assert_eq!(fields.len() % 2, 0);
+        assert_eq!(
+            &fields[fields.len() - 3..],
+            &[Block128::ZERO, Block128::ZERO, Block128::ZERO]
+        );
+        let mut bad_padding = fields;
+        let last = bad_padding.len() - 1;
+        bad_padding[last] = Block128::ONE;
+        assert_eq!(
+            accepted_claim_batch_digest_from_hash_fields(&bad_padding),
+            Err(AcceptedClaimBatchDigestError::NonCanonicalPadding)
+        );
 
-        let mut ch_p = Poseidon2bChannel::new();
-        let (proof, reductions) = prove_chain_accumulator_killshot(&inputs, &mut ch_p);
-        let mut ch_v = Poseidon2bChannel::new();
-        let verified = verify_chain_accumulator_killshot(&proof, &inputs, &mut ch_v)
-            .expect("accepted batch accumulator proof verifies");
-        assert_eq!(verified, reductions);
+        let mut bad_header = fields;
+        bad_header[0] += Block128::ONE;
+        assert_eq!(
+            accepted_claim_batch_digest_from_hash_fields(&bad_header),
+            Err(AcceptedClaimBatchDigestError::NonCanonicalHeader)
+        );
+
+        let mut bad_slot_padding = fields;
+        let slots_offset = 4
+            + ACCEPTED_CLAIM_BATCH_DIGEST_CONSENSUS_FIELDS
+            + ACCEPTED_CLAIM_BATCH_DIGEST_ACCUMULATOR_FIELDS;
+        let first_unused =
+            slots_offset + witness.headers.len() * ACCEPTED_CLAIM_BATCH_DIGEST_SLOT_FIELDS;
+        bad_slot_padding[first_unused] = Block128::ONE;
+        assert_eq!(
+            accepted_claim_batch_digest_from_hash_fields(&bad_slot_padding),
+            Err(AcceptedClaimBatchDigestError::NonCanonicalSlotPadding)
+        );
     }
 
     #[test]
@@ -810,6 +807,35 @@ mod tests {
                 HeaderIntegerTraceError::BadPowTarget { index: 0 }
             ))
         );
+    }
+
+    #[test]
+    fn accepted_claim_batch_rejects_every_consensus_overlap_mismatch() {
+        let (start_consensus, start_accumulator) = start_pair();
+        let h1 = next_header(&start_consensus, 2);
+        let witness = AcceptedClaimBatchWitness {
+            headers: vec![integer_witness(&h1)],
+            accepted_block_claims: vec![[Block128::from(1u128), Block128::from(2u128)]],
+        };
+        let trace = build_header_integer_trace(&start_consensus, &witness.headers).unwrap();
+
+        // height, tip id, state root, log_slots, active count and allocation
+        // counter are the complete overlap with RecursiveConsensusState.
+        for lane_index in 0..8 {
+            let mut lanes = start_accumulator.to_lanes();
+            lanes[lane_index] += Block128::ONE;
+            let bad = ChainAccumulator::from_lanes(lanes).unwrap();
+            assert_eq!(
+                verify_accepted_claim_batch_with_header_trace(
+                    &start_consensus,
+                    &bad,
+                    &witness,
+                    &trace,
+                ),
+                Err(AcceptedClaimBatchError::StartStateMismatch),
+                "consensus-overlap lane {lane_index} must be pinned"
+            );
+        }
     }
 
     #[test]

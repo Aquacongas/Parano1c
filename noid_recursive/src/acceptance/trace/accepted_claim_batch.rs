@@ -1,32 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! The accepted-claim batch CLAIM PART in the trace.
+//! Direct ten-lane chain-accumulator transition in the acceptance trace.
 //!
-//! Trace twin of the claim part of
-//! `accepted_batch::verify_accepted_claim_batch_with_header_trace`: the
-//! rolling `ChainAccumulator::extend` fold over `(block_id, chain_claim,
-//! state_root, height)` per block, ending in the `end_accumulator` equality
-//! that `verify_accepted_block_batch_components` checks on its output.
-//!
-//! The header part (`verify_header_integer_trace` — PoW/ASERT/MTP/chainwork
-//! and the start-consensus equalities) is deliberately NOT replayed: header
-//! consensus does not belong in the O(1) history proof. A fresh peer
-//! verifies headers natively; the binding slot pins the same accumulator
-//! lanes to the snapshot-decider anchors.
-//!
-//! `ChainAccumulator::extend` is two `compress` calls; `compress` is the
-//! fixed two-permutation schedule (`compression.rs`): `[a0, a1, IV]` →
-//! permute → rate += b → permute. The 32-byte digests travel as two lanes
-//! (`Digest::as_fields` layout — the same φ-mapped lane convention as every
-//! other slot).
+//! There is no rolling chain hash and no accepted-claim digest fold. One
+//! block proof exposes the parent boundary and proves that the header is its
+//! exact child. The child header supplies the new tip, state, depth and
+//! counters directly; the transaction-epoch anchor changes to the child id
+//! exactly when the constrained child height is divisible by 144.
 
 use noid_core::Block128;
 use noid_poseidon2b::native::domain::{capacity_iv, DomainTag, TAG_COMPRESS};
 use noid_poseidon2b::native::permutation::STATE_SIZE;
 
-use super::{alloc_block, const_block, pin_eq, poseidon2b_permute, FieldR1csBuilder, LinExpr};
-use crate::accumulator::ChainAccumulator;
+use super::tx_epoch::constrain_tx_epoch_boundary;
+use super::{
+    alloc_block, const_block, flat_const, mul, pin_eq, pin_zero, poseidon2b_permute,
+    range_check_bits, FieldR1csBuilder, LinExpr, Wire, F128,
+};
+use crate::accumulator::{ChainAccumulator, CHAIN_ACCUMULATOR_LANES};
 
 /// Digest as two little-endian u128 lanes (the `digest_to_fields`
 /// convention).
@@ -67,74 +59,125 @@ pub fn compress_with_tag_trace(
     [state[0].clone(), state[1].clone()]
 }
 
-/// One accumulator step's statement wires.
-pub struct ClaimBatchStepWires {
+/// The child-header values consumed by the direct transition.
+pub struct DirectChildWires {
     pub block_id: [LinExpr; 2],
-    pub chain_claim: [LinExpr; 2],
+    pub prev_block_hash: [LinExpr; 2],
     pub state_root: [LinExpr; 2],
     pub height: LinExpr,
+    pub log_slots: LinExpr,
+    pub active_slot_count: LinExpr,
+    pub alloc_counter: LinExpr,
 }
 
 /// Accumulator boundary wires (start/end).
 pub struct AccumulatorWires {
     pub height: LinExpr,
+    pub tip_block_id: [LinExpr; 2],
     pub state_root: [LinExpr; 2],
-    pub chain_hash: [LinExpr; 2],
-    /// Consensus-continuity counters (the boundary header's child
-    /// counters): bound per block to the header / claim-parent wires by
-    /// the block-slot pins; carried across blocks by the link chain rules.
+    pub log_slots: LinExpr,
     pub active_slot_count: LinExpr,
     pub alloc_counter: LinExpr,
+    pub epoch_anchor_id: [LinExpr; 2],
 }
 
 impl AccumulatorWires {
     pub fn alloc(b: &mut FieldR1csBuilder, native: &ChainAccumulator) -> Self {
+        let lanes = native.to_lanes().map(|lane| alloc_block(b, lane));
+        Self::from_ordered_lanes(lanes)
+    }
+
+    /// Build named wires from the consensus-significant lane order.
+    pub fn from_ordered_lanes(lanes: [LinExpr; CHAIN_ACCUMULATOR_LANES]) -> Self {
         Self {
-            height: alloc_block(b, Block128::from(native.height)),
-            state_root: {
-                let lanes = digest_lanes(&native.state_root);
-                std::array::from_fn(|i| alloc_block(b, lanes[i]))
-            },
-            chain_hash: {
-                let lanes = digest_lanes(&native.chain_hash);
-                std::array::from_fn(|i| alloc_block(b, lanes[i]))
-            },
-            active_slot_count: alloc_block(b, Block128::from(native.active_slot_count)),
-            alloc_counter: alloc_block(b, Block128::from(native.alloc_counter)),
+            height: lanes[0].clone(),
+            tip_block_id: [lanes[1].clone(), lanes[2].clone()],
+            state_root: [lanes[3].clone(), lanes[4].clone()],
+            log_slots: lanes[5].clone(),
+            active_slot_count: lanes[6].clone(),
+            alloc_counter: lanes[7].clone(),
+            epoch_anchor_id: [lanes[8].clone(), lanes[9].clone()],
         }
+    }
+
+    /// Return the exact lane order used by block/link public IO.
+    pub fn ordered_lanes(&self) -> [LinExpr; CHAIN_ACCUMULATOR_LANES] {
+        [
+            self.height.clone(),
+            self.tip_block_id[0].clone(),
+            self.tip_block_id[1].clone(),
+            self.state_root[0].clone(),
+            self.state_root[1].clone(),
+            self.log_slots.clone(),
+            self.active_slot_count.clone(),
+            self.alloc_counter.clone(),
+            self.epoch_anchor_id[0].clone(),
+            self.epoch_anchor_id[1].clone(),
+        ]
     }
 }
 
-/// Trace twin of the claim-part fold: `acc = acc.extend(state_root,
-/// block_id, height, chain_claim)` per block, then the component's
-/// `accepted_claim_batch.accumulator == end_accumulator` check as pins
-/// (chain hash, final state root, final height).
-///
-/// Returns the per-step statement wires for the [B] bindings (they must be
-/// shared with the checkpoint slot's chain-accumulator items and the
-/// certificate statements at final proof assembly).
-pub fn build_accepted_claim_batch_claim_slot(
+/// Range-check every scalar accumulator lane and return the height bits for
+/// the exact successor relation.
+fn range_check_boundary_scalars(
+    b: &mut FieldR1csBuilder,
+    boundary: &AccumulatorWires,
+) -> Vec<Wire> {
+    let height_bits = range_check_bits(b, &boundary.height, 64);
+    let _ = range_check_bits(b, &boundary.log_slots, 32);
+    let _ = range_check_bits(b, &boundary.active_slot_count, 64);
+    let _ = range_check_bits(b, &boundary.alloc_counter, 64);
+    height_bits
+}
+
+/// Pin `child = parent + 1` as an exact u64 integer relation.
+fn pin_u64_successor(b: &mut FieldR1csBuilder, parent_bits: &[Wire], child: &LinExpr) {
+    const N: usize = 64;
+    assert_eq!(parent_bits.len(), N);
+    let mut carry = LinExpr::constant(F128::ONE);
+    let mut reconstructed = LinExpr::zero();
+    for (i, &bit) in parent_bits.iter().enumerate() {
+        let parent_bit = LinExpr::from_wire(bit);
+        let child_bit = parent_bit.add(&carry);
+        reconstructed = reconstructed.add(&child_bit.scale(flat_const(1u128 << i)));
+        carry = mul(b, &parent_bit, &carry);
+    }
+    pin_zero(b, &carry);
+    pin_eq(b, child, &reconstructed);
+}
+
+/// Prove one direct child transition between ten-lane boundaries.
+pub fn build_direct_accumulator_transition_slot(
     b: &mut FieldR1csBuilder,
     start: &AccumulatorWires,
-    steps: &[ClaimBatchStepWires],
+    child: &DirectChildWires,
     end: &AccumulatorWires,
 ) {
-    assert!(!steps.is_empty());
+    let start_height_bits = range_check_boundary_scalars(b, start);
+    let _ = range_check_boundary_scalars(b, end);
 
-    let mut chain_hash = start.chain_hash.clone();
-    for step in steps {
-        // extend: inner = compress(block_id, claim_bytes);
-        //         chain_hash = compress(chain_hash, inner).
-        let inner = compress_trace(b, &step.block_id, &step.chain_claim);
-        chain_hash = compress_trace(b, &chain_hash, &inner);
+    for lane in 0..2 {
+        pin_eq(b, &child.prev_block_hash[lane], &start.tip_block_id[lane]);
     }
+    pin_u64_successor(b, &start_height_bits, &child.height);
 
-    let last = steps.last().unwrap();
-    pin_eq(b, &chain_hash[0], &end.chain_hash[0]);
-    pin_eq(b, &chain_hash[1], &end.chain_hash[1]);
-    pin_eq(b, &last.state_root[0], &end.state_root[0]);
-    pin_eq(b, &last.state_root[1], &end.state_root[1]);
-    pin_eq(b, &last.height, &end.height);
+    pin_eq(b, &child.height, &end.height);
+    for lane in 0..2 {
+        pin_eq(b, &child.block_id[lane], &end.tip_block_id[lane]);
+        pin_eq(b, &child.state_root[lane], &end.state_root[lane]);
+    }
+    pin_eq(b, &child.log_slots, &end.log_slots);
+    pin_eq(b, &child.active_slot_count, &end.active_slot_count);
+    pin_eq(b, &child.alloc_counter, &end.alloc_counter);
+
+    // `boundary` is derived from the constrained child height, never supplied
+    // independently by the prover.
+    let epoch = constrain_tx_epoch_boundary(b, &child.height);
+    for lane in 0..2 {
+        let delta = start.epoch_anchor_id[lane].add(&child.block_id[lane]);
+        let selected = start.epoch_anchor_id[lane].add(&mul(b, &epoch.boundary, &delta));
+        pin_eq(b, &selected, &end.epoch_anchor_id[lane]);
+    }
 }
 
 #[cfg(test)]
@@ -143,6 +186,86 @@ mod tests {
     use noid_core::TowerField;
     use noid_poseidon2b::native::{compress_with_tag, domain::TAG_TXROOT};
 
+    #[derive(Clone)]
+    struct NativeChild {
+        block_id: [u8; 32],
+        prev_block_hash: [u8; 32],
+        state_root: [u8; 32],
+        height: u64,
+        log_slots: u32,
+        active_slot_count: u64,
+        alloc_counter: u64,
+    }
+
+    fn fixture(parent_height: u64) -> (ChainAccumulator, NativeChild, ChainAccumulator) {
+        let start = ChainAccumulator {
+            height: parent_height,
+            tip_block_id: [0x11; 32],
+            state_root: [0x22; 32],
+            log_slots: 24,
+            active_slot_count: 17,
+            alloc_counter: 29,
+            epoch_anchor_id: [0x33; 32],
+        };
+        let child = NativeChild {
+            block_id: [0x44; 32],
+            prev_block_hash: start.tip_block_id,
+            state_root: [0x55; 32],
+            height: parent_height + 1,
+            log_slots: 25,
+            active_slot_count: 19,
+            alloc_counter: 31,
+        };
+        let end = ChainAccumulator {
+            height: child.height,
+            tip_block_id: child.block_id,
+            state_root: child.state_root,
+            log_slots: child.log_slots,
+            active_slot_count: child.active_slot_count,
+            alloc_counter: child.alloc_counter,
+            epoch_anchor_id: if child.height % 144 == 0 {
+                child.block_id
+            } else {
+                start.epoch_anchor_id
+            },
+        };
+        (start, child, end)
+    }
+
+    fn alloc_child(b: &mut FieldR1csBuilder, child: &NativeChild) -> DirectChildWires {
+        let block_id = digest_lanes(&child.block_id);
+        let prev = digest_lanes(&child.prev_block_hash);
+        let state = digest_lanes(&child.state_root);
+        DirectChildWires {
+            block_id: block_id.map(|lane| alloc_block(b, lane)),
+            prev_block_hash: prev.map(|lane| alloc_block(b, lane)),
+            state_root: state.map(|lane| alloc_block(b, lane)),
+            height: alloc_block(b, Block128::from(child.height)),
+            log_slots: alloc_block(b, Block128::from(child.log_slots)),
+            active_slot_count: alloc_block(b, Block128::from(child.active_slot_count)),
+            alloc_counter: alloc_block(b, Block128::from(child.alloc_counter)),
+        }
+    }
+
+    fn satisfies(start: &ChainAccumulator, child: &NativeChild, end: &ChainAccumulator) -> bool {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut b = FieldR1csBuilder::new();
+            let start = AccumulatorWires::alloc(&mut b, start);
+            let child = alloc_child(&mut b, child);
+            let end = AccumulatorWires::alloc(&mut b, end);
+            build_direct_accumulator_transition_slot(&mut b, &start, &child, &end);
+            let (r1cs, witness) = b.build();
+            r1cs.satisfies(&witness)
+        }))
+        .unwrap_or(false)
+    }
+
+    fn mutate_accumulator_lane(acc: &ChainAccumulator, lane: usize) -> ChainAccumulator {
+        let mut lanes = acc.to_lanes();
+        lanes[lane] += Block128::ONE;
+        ChainAccumulator::from_lanes(lanes).unwrap()
+    }
+
     #[test]
     fn tagged_compression_trace_matches_tx_root_wrapper() {
         let left = [0x31u8; 32];
@@ -150,150 +273,104 @@ mod tests {
         let expected = digest_lanes(&compress_with_tag(TAG_TXROOT, &left, &right));
 
         let mut b = FieldR1csBuilder::new();
-        let left_lanes = digest_lanes(&left);
-        let right_lanes = digest_lanes(&right);
-        let left_w = std::array::from_fn(|i| alloc_block(&mut b, left_lanes[i]));
-        let right_w = std::array::from_fn(|i| alloc_block(&mut b, right_lanes[i]));
+        let left_w = digest_lanes(&left).map(|lane| alloc_block(&mut b, lane));
+        let right_w = digest_lanes(&right).map(|lane| alloc_block(&mut b, lane));
         let actual = compress_with_tag_trace(&mut b, TAG_TXROOT, &left_w, &right_w);
         for lane in 0..2 {
             let expected_w = alloc_block(&mut b, expected[lane]);
             pin_eq(&mut b, &actual[lane], &expected_w);
         }
-        let (r1cs, z) = b.build();
-        assert!(r1cs.satisfies(&z));
+        let (r1cs, witness) = b.build();
+        assert!(r1cs.satisfies(&witness));
     }
 
-    fn wires_from(
-        b: &mut FieldR1csBuilder,
-        start: &ChainAccumulator,
-        blocks: &[([u8; 32], [Block128; 2], [u8; 32], u64)],
-        end: &ChainAccumulator,
-    ) -> (AccumulatorWires, Vec<ClaimBatchStepWires>, AccumulatorWires) {
-        let start_w = AccumulatorWires::alloc(b, start);
-        let steps = blocks
-            .iter()
-            .map(|(block_id, claim, state_root, height)| {
-                let id_lanes = digest_lanes(block_id);
-                let root_lanes = digest_lanes(state_root);
-                ClaimBatchStepWires {
-                    block_id: std::array::from_fn(|i| alloc_block(b, id_lanes[i])),
-                    chain_claim: std::array::from_fn(|i| alloc_block(b, claim[i])),
-                    state_root: std::array::from_fn(|i| alloc_block(b, root_lanes[i])),
-                    height: alloc_block(b, Block128::from(*height)),
-                }
-            })
-            .collect();
-        let end_w = AccumulatorWires::alloc(b, end);
-        (start_w, steps, end_w)
-    }
-
-    fn fixture(
-        n: usize,
-    ) -> (
-        ChainAccumulator,
-        Vec<([u8; 32], [Block128; 2], [u8; 32], u64)>,
-        ChainAccumulator,
-    ) {
-        let start = ChainAccumulator {
-            height: 5,
-            state_root: [9u8; 32],
-            chain_hash: [3u8; 32],
-            active_slot_count: 11,
-            alloc_counter: 12,
-        };
-        let mut acc = start.clone();
-        let mut blocks = Vec::new();
-        for i in 0..n as u64 {
-            let block_id = [10 + i as u8; 32];
-            let claim = [
-                Block128::from(100 + i as u128),
-                Block128::from(200 + i as u128),
-            ];
-            let state_root = [40 + i as u8; 32];
-            let height = start.height + 1 + i;
-            acc = acc.extend(state_root, block_id, height, claim, 11 + i, 12 + i);
-            blocks.push((block_id, claim, state_root, height));
-        }
-        (start, blocks, acc)
-    }
-
-    /// Positive: the fold matches `ChainAccumulator::extend` and the end
-    /// pins hold; a swapped claim breaks the trace exactly as the native
-    /// component's accumulator equality breaks.
     #[test]
-    fn claim_batch_fold_positive_and_tamper() {
-        let (start, blocks, end) = fixture(2);
-
-        let mut b = FieldR1csBuilder::new();
-        let (start_w, steps, end_w) = wires_from(&mut b, &start, &blocks, &end);
-        build_accepted_claim_batch_claim_slot(&mut b, &start_w, &steps, &end_w);
-        let (r1cs, z) = b.build();
-        assert!(r1cs.satisfies(&z), "honest claim-batch fold unsatisfiable");
-        eprintln!(
-            "claim-batch fold slot (2 blocks): {} useful rows (k_log = {})",
-            r1cs.useful_rows, r1cs.k_log
-        );
-
-        // Every statement lane, mutated one at a time → unsat.
-        for target in 0..(blocks.len() * 7 + 5 + 5) {
-            let mut bad_blocks = blocks.clone();
-            let mut bad_start = start.clone();
-            let mut bad_end = end.clone();
-            let per_block = 7usize;
-            if target < blocks.len() * per_block {
-                let (i, k) = (target / per_block, target % per_block);
-                let blk = &mut bad_blocks[i];
-                match k {
-                    0 => blk.0[0] ^= 1,
-                    1 => blk.0[17] ^= 1,
-                    2 => blk.1[0] += Block128::ONE,
-                    3 => blk.1[1] += Block128::ONE,
-                    // state_root / height only matter for the LAST block's
-                    // end pins — mutate the last block for those.
-                    4 if i + 1 == blocks.len() => blk.2[0] ^= 1,
-                    5 if i + 1 == blocks.len() => blk.2[17] ^= 1,
-                    6 if i + 1 == blocks.len() => blk.3 ^= 1,
-                    _ => continue,
-                }
-            } else if target < blocks.len() * per_block + 5 {
-                match target - blocks.len() * per_block {
-                    0 => bad_start.chain_hash[0] ^= 1,
-                    1 => bad_start.chain_hash[17] ^= 1,
-                    // start height/state_root are [B]-layer publics — not
-                    // pinned by the claim fold itself.
-                    _ => continue,
-                }
+    fn exact_epoch_edges_143_to_144_and_144_to_145() {
+        for parent_height in [143, 144] {
+            let (start, child, end) = fixture(parent_height);
+            assert!(satisfies(&start, &child, &end));
+            let expected = if child.height == 144 {
+                child.block_id
             } else {
-                match target - blocks.len() * per_block - 5 {
-                    0 => bad_end.chain_hash[0] ^= 1,
-                    1 => bad_end.chain_hash[17] ^= 1,
-                    2 => bad_end.state_root[0] ^= 1,
-                    3 => bad_end.state_root[17] ^= 1,
-                    4 => bad_end.height ^= 1,
-                    _ => continue,
-                }
-            }
-
-            let mut b = FieldR1csBuilder::new();
-            let (start_w, steps, end_w) = wires_from(&mut b, &bad_start, &bad_blocks, &bad_end);
-            build_accepted_claim_batch_claim_slot(&mut b, &start_w, &steps, &end_w);
-            let (r1cs, z) = b.build();
-            assert!(
-                !r1cs.satisfies(&z),
-                "claim-batch mutant {target} produced a satisfiable trace"
-            );
+                start.epoch_anchor_id
+            };
+            assert_eq!(end.epoch_anchor_id, expected);
         }
     }
 
-    /// The fold agrees with `ChainAccumulator::extend` lane-for-lane on a
-    /// longer chain (5 blocks).
     #[test]
-    fn claim_batch_fold_matches_native_chain() {
-        let (start, blocks, end) = fixture(5);
-        let mut b = FieldR1csBuilder::new();
-        let (start_w, steps, end_w) = wires_from(&mut b, &start, &blocks, &end);
-        build_accepted_claim_batch_claim_slot(&mut b, &start_w, &steps, &end_w);
-        let (r1cs, z) = b.build();
-        assert!(r1cs.satisfies(&z));
+    fn direct_transition_rejects_every_end_lane_mutation() {
+        for parent_height in [143, 144] {
+            let (start, child, end) = fixture(parent_height);
+            for lane in 0..CHAIN_ACCUMULATOR_LANES {
+                let bad_end = mutate_accumulator_lane(&end, lane);
+                assert!(
+                    !satisfies(&start, &child, &bad_end),
+                    "end lane {lane} accepted at parent height {parent_height}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn direct_transition_rejects_parent_link_height_and_epoch_mutations() {
+        let (start, child, end) = fixture(143);
+        for lane in [0usize, 1, 2] {
+            let bad_start = mutate_accumulator_lane(&start, lane);
+            assert!(!satisfies(&bad_start, &child, &end), "start lane {lane}");
+        }
+
+        // At 143→144 the old epoch is intentionally overwritten, so its
+        // lanes are dead for that one transition. They are continuity-critical
+        // again on the following non-boundary step.
+        let (start, child, end) = fixture(144);
+        for lane in [8usize, 9] {
+            let bad_start = mutate_accumulator_lane(&start, lane);
+            assert!(!satisfies(&bad_start, &child, &end), "start lane {lane}");
+        }
+    }
+
+    #[test]
+    fn direct_transition_rejects_every_child_projection_mutation() {
+        let (start, child, end) = fixture(143);
+        for target in 0..10 {
+            let mut bad = child.clone();
+            match target {
+                0 => bad.block_id[0] ^= 1,
+                1 => bad.block_id[17] ^= 1,
+                2 => bad.prev_block_hash[0] ^= 1,
+                3 => bad.prev_block_hash[17] ^= 1,
+                4 => bad.state_root[0] ^= 1,
+                5 => bad.state_root[17] ^= 1,
+                6 => bad.height ^= 1,
+                7 => bad.log_slots ^= 1,
+                8 => bad.active_slot_count ^= 1,
+                9 => bad.alloc_counter ^= 1,
+                _ => unreachable!(),
+            }
+            assert!(!satisfies(&start, &bad, &end), "child target {target}");
+        }
+    }
+
+    #[test]
+    fn boundary_scalar_ranges_reject_oversized_field_lanes() {
+        for (lane, value) in [
+            (5usize, u32::MAX as u128 + 1),
+            (6usize, u64::MAX as u128 + 1),
+            (7usize, u64::MAX as u128 + 1),
+        ] {
+            let accepted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut b = FieldR1csBuilder::new();
+                let mut native = fixture(143).0.to_lanes();
+                native[lane] = Block128::from(value);
+                let wires = native.map(|value| alloc_block(&mut b, value));
+                let boundary = AccumulatorWires::from_ordered_lanes(wires);
+                let _ = range_check_boundary_scalars(&mut b, &boundary);
+                let (r1cs, witness) = b.build();
+                r1cs.satisfies(&witness)
+            }))
+            .unwrap_or(false);
+            assert!(!accepted, "oversized boundary lane {lane} was accepted");
+        }
     }
 }

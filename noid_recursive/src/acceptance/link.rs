@@ -51,7 +51,6 @@ use noid_ivc_core::public_io::{IoClaimSpec, PublicIoSpec, WitnessSlice};
 use super::block_slots::{
     build_block_slots_with_config, region_wallet_pcs_native, BlockSlots, BlockSlotsConfig,
 };
-use super::trace::accepted_claim_batch::digest_lanes;
 use super::trace::matrix_fold::{
     verify_matrix_claim_fold_trace, FreshLincheckClaimTrace, MatrixAccClaimTrace,
     MatrixFoldProofTrace,
@@ -62,30 +61,21 @@ use super::trace::self_verify::{
     verify_field_trace_deferred, FieldR1csProofTrace, FlatDigestExpr,
 };
 use super::trace::{flat_of, mul, pin_eq};
-use crate::accumulator::ChainAccumulator;
+use crate::accumulator::{
+    genesis_accumulator, ChainAccumulator, ChainAccumulatorLaneError, CHAIN_ACCUMULATOR_LANES,
+};
 use crate::block_certificate_backend::{
     AcceptedBlockBatchComponentInputs, AcceptedBlockBatchComponentProof,
 };
 use noid_core::Block128;
 use noid_ivc_prover::field_prover::prove_field_with_public_io;
 
-/// The accumulator-boundary lane count: height, state_root×2,
-/// chain_hash×2, active_slot_count, alloc_counter.
-pub const ACC_LANES: usize = 7;
+/// The canonical direct accumulator-boundary lane count.
+pub const ACC_LANES: usize = CHAIN_ACCUMULATOR_LANES;
 
 /// The block chain accumulator as flat IO lanes, in the layout's order.
 pub(crate) fn block_acc_lanes(acc: &ChainAccumulator) -> [F128; ACC_LANES] {
-    let sr = digest_lanes(&acc.state_root);
-    let ch = digest_lanes(&acc.chain_hash);
-    [
-        flat_of(Block128::from(acc.height)),
-        flat_of(sr[0]),
-        flat_of(sr[1]),
-        flat_of(ch[0]),
-        flat_of(ch[1]),
-        flat_of(Block128::from(acc.active_slot_count)),
-        flat_of(Block128::from(acc.alloc_counter)),
-    ]
+    acc.to_lanes().map(flat_of)
 }
 
 /// The genesis dummy instance: the link class's SHAPE with all real
@@ -152,7 +142,7 @@ pub fn genesis_witness(shape: &FieldShape) -> Vec<F128> {
 ///
 /// The recursion lanes (`w_d`, `g`, the matrix-claim accumulator) are
 /// always present. A BLOCK-BEARING class appends the block chain
-/// accumulator `acc_h` (height, state_root, chain_hash) so the decider can
+/// direct accumulator so the decider can
 /// anchor the tip against local headers and successive links can chain
 /// `start == prev.end`.
 #[derive(Clone, Copy, Debug)]
@@ -162,10 +152,9 @@ pub struct LinkIoLayout {
     pub acc_point: usize,
     pub acc_value: usize,
     pub block_bearing: bool,
-    /// Block chain accumulator lanes (only meaningful when block_bearing).
-    pub block_height: usize,
-    pub block_state_root: usize,
-    pub block_chain_hash: usize,
+    /// First canonical direct-accumulator lane (only meaningful when
+    /// `block_bearing`).
+    pub block_acc: usize,
     /// First IO lane of the region wallet-PCS opening-claim tail (== `len`
     /// when there is no region tail).
     pub region_tail_offset: usize,
@@ -212,7 +201,7 @@ pub fn link_io_layout_region(
 ) -> LinkIoLayout {
     let acc_len = 2 * k_log + 1;
     let recursion_len = 4 + acc_len;
-    let block_height = recursion_len;
+    let block_acc = recursion_len;
     let base_len = if block_bearing {
         recursion_len + ACC_LANES
     } else {
@@ -228,9 +217,7 @@ pub fn link_io_layout_region(
         acc_point: 3,
         acc_value: 3 + acc_len,
         block_bearing,
-        block_height,
-        block_state_root: block_height + 1,
-        block_chain_hash: block_height + 3,
+        block_acc,
         region_tail_offset: base_len,
         region_len,
         len: base_len + region_len,
@@ -313,7 +300,7 @@ pub struct LinkClass {
     pub block_bearing: bool,
     /// The block accumulator a genesis link starts from (canonical for a
     /// block-bearing class; unused otherwise).
-    pub genesis_block_accumulator: ChainAccumulator,
+    genesis_block_accumulator: ChainAccumulator,
     /// When `Some`, the block [B] slots discharge the wallet-capsule PCS via
     /// the shape-fixed region layer with these parameters, and the resulting
     /// committed-column opening claims are threaded through this class's
@@ -373,33 +360,17 @@ pub struct LinkClass {
 
 impl LinkClass {
     pub fn new(shape: FieldShape, pcs_params: PcsParams) -> Self {
-        let zero_acc = ChainAccumulator {
-            height: 0,
-            state_root: [0u8; 32],
-            chain_hash: [0u8; 32],
-            active_slot_count: 0,
-            alloc_counter: 0,
-        };
-        Self::new_configured(shape, pcs_params, false, zero_acc)
+        Self::new_configured(shape, pcs_params, false)
     }
 
     /// A block-bearing class: links carry [B] block slots and chain the
     /// block accumulator, with `genesis_block_accumulator` as the height-0
     /// start the genesis link pins.
-    pub fn new_block_bearing(
-        shape: FieldShape,
-        pcs_params: PcsParams,
-        genesis_block_accumulator: ChainAccumulator,
-    ) -> Self {
-        Self::new_configured(shape, pcs_params, true, genesis_block_accumulator)
+    pub fn new_block_bearing(shape: FieldShape, pcs_params: PcsParams) -> Self {
+        Self::new_configured(shape, pcs_params, true)
     }
 
-    fn new_configured(
-        shape: FieldShape,
-        pcs_params: PcsParams,
-        block_bearing: bool,
-        genesis_block_accumulator: ChainAccumulator,
-    ) -> Self {
+    fn new_configured(shape: FieldShape, pcs_params: PcsParams, block_bearing: bool) -> Self {
         let genesis = genesis_instance(&shape);
         let genesis_digest = genesis.statement_digest();
         Self {
@@ -410,7 +381,7 @@ impl LinkClass {
             genesis,
             genesis_digest,
             block_bearing,
-            genesis_block_accumulator,
+            genesis_block_accumulator: genesis_accumulator(),
             region_params: None,
             region_claims: Vec::new(),
             region_max_arity: 0,
@@ -445,7 +416,6 @@ impl LinkClass {
     pub fn new_region_block_bearing(
         shape: FieldShape,
         pcs_params: PcsParams,
-        genesis_block_accumulator: ChainAccumulator,
         region_params: RegionDischargeParams,
         sample_block: &LinkBlock<'_>,
         owner_auth_region: bool,
@@ -457,7 +427,6 @@ impl LinkClass {
         freeze_region_block_bearing(
             shape,
             pcs_params,
-            genesis_block_accumulator,
             region_params,
             sample_block,
             owner_auth_region,
@@ -701,7 +670,7 @@ fn build_link_inner(
     io[layout.acc_value] = acc_out.value;
     if let Some(block) = &input.block {
         let lanes = block_acc_lanes(block.end_accumulator);
-        io[layout.block_height..layout.block_height + ACC_LANES].copy_from_slice(&lanes);
+        io[layout.block_acc..layout.block_acc + ACC_LANES].copy_from_slice(&lanes);
     }
 
     // ---- Region wallet-PCS opening claims: NATIVE values into the IO tail.
@@ -875,33 +844,17 @@ fn build_link_inner(
         );
         live_region = std::mem::take(&mut slots.pending_wallet_pcs);
         // The block's end accumulator IS this link's exposed block_acc.
-        let end_lanes = [
-            &slots.end_acc.height,
-            &slots.end_acc.state_root[0],
-            &slots.end_acc.state_root[1],
-            &slots.end_acc.chain_hash[0],
-            &slots.end_acc.chain_hash[1],
-            &slots.end_acc.active_slot_count,
-            &slots.end_acc.alloc_counter,
-        ];
-        let io_end: [usize; ACC_LANES] = std::array::from_fn(|i| layout.block_height + i);
+        let end_lanes = slots.end_acc.ordered_lanes();
+        let io_end: [usize; ACC_LANES] = std::array::from_fn(|i| layout.block_acc + i);
         for (w, &cell) in end_lanes.iter().zip(io_end.iter()) {
             pin_eq(&mut b, w, &io_cells[cell]);
         }
         // Chain the block start accumulator:
         //   genesis (g = 1): start == the class genesis block accumulator;
         //   otherwise:       start == the PREVIOUS link's exposed block_acc.
-        let start_lanes = [
-            &slots.start_acc.height,
-            &slots.start_acc.state_root[0],
-            &slots.start_acc.state_root[1],
-            &slots.start_acc.chain_hash[0],
-            &slots.start_acc.chain_hash[1],
-            &slots.start_acc.active_slot_count,
-            &slots.start_acc.alloc_counter,
-        ];
+        let start_lanes = slots.start_acc.ordered_lanes();
         let genesis_start = block_acc_lanes(&class.genesis_block_accumulator);
-        let prev_block_io: [usize; ACC_LANES] = std::array::from_fn(|i| layout.block_height + i);
+        let prev_block_io: [usize; ACC_LANES] = std::array::from_fn(|i| layout.block_acc + i);
         for (i, sw) in start_lanes.iter().enumerate() {
             // g · (start - genesis_const) = 0.
             let to_genesis = (*sw).add(&LinExpr::constant(genesis_start[i]));
@@ -1022,7 +975,6 @@ fn build_link_inner(
 fn freeze_region_block_bearing(
     shape: FieldShape,
     pcs_params: PcsParams,
-    genesis_block_accumulator: ChainAccumulator,
     region_params: RegionDischargeParams,
     sample_block: &LinkBlock<'_>,
     owner_auth_region: bool,
@@ -1031,6 +983,7 @@ fn freeze_region_block_bearing(
     spine_region: bool,
     tier_user_tx_capacity: Option<usize>,
 ) -> LinkClass {
+    let genesis_block_accumulator = genesis_accumulator();
     let region_cfg = BlockSlotsConfig {
         discharge_wallet_pcs: true,
         wallet_pcs_params: region_params,
@@ -1224,30 +1177,17 @@ pub fn decide_tip(
 /// The tip's exposed block chain accumulator (block-bearing class only) —
 /// the value a fresh peer anchors against its locally validated headers
 /// (I8). Returns `None` for a non-block-bearing class.
-pub fn tip_block_accumulator(class: &LinkClass, tip: &LinkEnvelope) -> Option<ChainAccumulator> {
+pub fn tip_block_accumulator(
+    class: &LinkClass,
+    tip: &LinkEnvelope,
+) -> Result<Option<ChainAccumulator>, ChainAccumulatorLaneError> {
     if !class.block_bearing {
-        return None;
+        return Ok(None);
     }
     let layout = class.layout();
-    let lane_bytes = |a: F128, b: F128| -> [u8; 32] {
-        let mut out = [0u8; 32];
-        out[..16].copy_from_slice(&flat_to_block(a).to_le_bytes());
-        out[16..].copy_from_slice(&flat_to_block(b).to_le_bytes());
-        out
-    };
-    Some(ChainAccumulator {
-        height: flat_to_block(tip.io[layout.block_height]) as u64,
-        state_root: lane_bytes(
-            tip.io[layout.block_state_root],
-            tip.io[layout.block_state_root + 1],
-        ),
-        chain_hash: lane_bytes(
-            tip.io[layout.block_chain_hash],
-            tip.io[layout.block_chain_hash + 1],
-        ),
-        active_slot_count: flat_to_block(tip.io[layout.block_height + 5]) as u64,
-        alloc_counter: flat_to_block(tip.io[layout.block_height + 6]) as u64,
-    })
+    let lanes =
+        std::array::from_fn(|i| Block128::from(flat_to_block(tip.io[layout.block_acc + i])));
+    ChainAccumulator::from_lanes(lanes).map(Some)
 }
 
 /// Recover the u128 a flat IO lane encodes (the inverse of `flat_of` on an

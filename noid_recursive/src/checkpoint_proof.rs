@@ -8,6 +8,7 @@
 //! backend. Header consensus remains native and outside this aggregation layer.
 
 use noid_chain::header_anchor::HeaderChainAnchor;
+use noid_chain::{compute_header_chain_anchor, consensus::difficulty::block_work};
 use noid_core::{Block128, TowerField};
 use noid_gkr::{
     discharge_fixed_field_hash_reductions_native, prove_fixed_field_hash_killshot,
@@ -27,7 +28,7 @@ use crate::accepted_batch::{
     AcceptedClaimBatchDigestError, AcceptedClaimBatchDigestProof, AcceptedClaimBatchOutput,
     AcceptedClaimBatchWitness,
 };
-use crate::accumulator::ChainAccumulator;
+use crate::accumulator::{genesis_accumulator, ChainAccumulator};
 use crate::block_certificate::{
     accepted_block_certificate_batch_statement, accepted_block_certificate_batch_statement_digest,
     accepted_block_certificate_receipt, accepted_block_certificate_statement_digest,
@@ -249,6 +250,7 @@ pub enum HistoryCheckpointProofError {
     EndAnchorMismatch,
     StartAccumulatorMismatch,
     EndAccumulatorMismatch,
+    NonCanonicalBaseBoundary,
     StartConsensusMismatch,
     EndConsensusMismatch,
     BatchStartMismatch,
@@ -280,6 +282,9 @@ impl std::fmt::Display for HistoryCheckpointProofError {
             Self::EndAnchorMismatch => write!(f, "end anchor mismatch"),
             Self::StartAccumulatorMismatch => write!(f, "start accumulator mismatch"),
             Self::EndAccumulatorMismatch => write!(f, "end accumulator mismatch"),
+            Self::NonCanonicalBaseBoundary => {
+                write!(f, "checkpoint base is not the canonical genesis boundary")
+            }
             Self::StartConsensusMismatch => write!(f, "start consensus mismatch"),
             Self::EndConsensusMismatch => write!(f, "end consensus mismatch"),
             Self::BatchStartMismatch => write!(f, "checkpoint batch start mismatch"),
@@ -484,6 +489,12 @@ pub fn history_checkpoint_head_from_boundary(
     accumulator: &ChainAccumulator,
     consensus: &RecursiveConsensusState,
 ) -> Result<HistoryCheckpointHead, HistoryCheckpointProofError> {
+    // A head with no recursively proven predecessor has exactly one legal
+    // bootstrap: the canonical genesis boundary. In particular, callers may
+    // not choose an arbitrary transaction-epoch anchor here.
+    if !is_canonical_genesis_boundary(anchor, accumulator, consensus) {
+        return Err(HistoryCheckpointProofError::NonCanonicalBaseBoundary);
+    }
     validate_boundary(anchor, accumulator, consensus, true)?;
     let boundary_digest = history_checkpoint_boundary_digest(anchor, accumulator, consensus);
     Ok(HistoryCheckpointHead {
@@ -495,6 +506,30 @@ pub fn history_checkpoint_head_from_boundary(
         consensus_digest: history_checkpoint_consensus_digest(consensus),
         recursive_digest: history_checkpoint_base_recursive_digest(&boundary_digest),
     })
+}
+
+fn is_canonical_genesis_boundary(
+    anchor: &HeaderChainAnchor,
+    accumulator: &ChainAccumulator,
+    consensus: &RecursiveConsensusState,
+) -> bool {
+    let header = noid_chain::consensus::genesis_header();
+    let cumulative_chainwork = block_work(&header.difficulty_target);
+    let expected_anchor =
+        compute_header_chain_anchor(std::iter::once(&header), cumulative_chainwork)
+            .expect("canonical genesis header always builds an anchor");
+    let expected_consensus = RecursiveConsensusState::from_header(
+        &header,
+        cumulative_chainwork,
+        0,
+        header.timestamp,
+        header.difficulty_target,
+        &[header.timestamp],
+        &[header.active_slot_count],
+    );
+    anchor == &expected_anchor
+        && accumulator == &genesis_accumulator()
+        && consensus == &expected_consensus
 }
 
 pub fn advance_history_checkpoint_head_native(
@@ -1559,18 +1594,10 @@ fn verify_history_checkpoint_proof_checkpoint_inner(
     if &proof.end_anchor != local_end_anchor {
         return Err(HistoryCheckpointProofError::EndAnchorMismatch);
     }
-    if proof.start_accumulator.height != proof.start_anchor.height
-        || proof.start_accumulator.state_root != proof.start_anchor.state_root
-        || proof.start_accumulator.active_slot_count != proof.start_anchor.active_slot_count
-        || proof.start_accumulator.alloc_counter != proof.start_anchor.alloc_counter
-    {
+    if !accumulator_matches_anchor(&proof.start_accumulator, &proof.start_anchor) {
         return Err(HistoryCheckpointProofError::StartAccumulatorMismatch);
     }
-    if proof.end_accumulator.height != proof.end_anchor.height
-        || proof.end_accumulator.state_root != proof.end_anchor.state_root
-        || proof.end_accumulator.active_slot_count != proof.end_anchor.active_slot_count
-        || proof.end_accumulator.alloc_counter != proof.end_anchor.alloc_counter
-    {
+    if !accumulator_matches_anchor(&proof.end_accumulator, &proof.end_anchor) {
         return Err(HistoryCheckpointProofError::EndAccumulatorMismatch);
     }
     let payload: HistoryCheckpointRecursivePayload =
@@ -1713,7 +1740,7 @@ fn validate_boundary(
     consensus: &RecursiveConsensusState,
     start: bool,
 ) -> Result<(), HistoryCheckpointProofError> {
-    if accumulator.height != anchor.height || accumulator.state_root != anchor.state_root {
+    if !accumulator_matches_anchor(accumulator, anchor) {
         return if start {
             Err(HistoryCheckpointProofError::StartAccumulatorMismatch)
         } else {
@@ -1735,6 +1762,15 @@ fn validate_boundary(
         };
     }
     Ok(())
+}
+
+fn accumulator_matches_anchor(accumulator: &ChainAccumulator, anchor: &HeaderChainAnchor) -> bool {
+    accumulator.height == anchor.height
+        && accumulator.tip_block_id == anchor.block_id
+        && accumulator.state_root == anchor.state_root
+        && accumulator.log_slots == anchor.log_slots
+        && accumulator.active_slot_count == anchor.active_slot_count
+        && accumulator.alloc_counter == anchor.alloc_counter
 }
 
 fn history_checkpoint_boundary_digest(
@@ -1790,11 +1826,9 @@ fn absorb_anchor(sponge: &mut Poseidon2bSponge, anchor: &HeaderChainAnchor) {
 }
 
 fn absorb_accumulator(sponge: &mut Poseidon2bSponge, accumulator: &ChainAccumulator) {
-    sponge.absorb(Block128::from(accumulator.height as u128));
-    absorb_digest(sponge, &accumulator.state_root);
-    absorb_digest(sponge, &accumulator.chain_hash);
-    sponge.absorb(Block128::from(accumulator.active_slot_count as u128));
-    sponge.absorb(Block128::from(accumulator.alloc_counter as u128));
+    for lane in accumulator.to_lanes() {
+        sponge.absorb(lane);
+    }
 }
 
 fn absorb_consensus(sponge: &mut Poseidon2bSponge, consensus: &RecursiveConsensusState) {
@@ -1868,6 +1902,7 @@ mod tests {
     use crate::pow_header::{HeaderWitness, EXPANSION_WINDOW_LEN};
     use noid_chain::consensus::difficulty::{add_work, block_work};
     use noid_chain::consensus::params::{BLOCK_TIME, MAX_TARGET, MEDIAN_TIME_BLOCKS};
+    use noid_chain::consensus::{genesis_header, GENESIS_TIMESTAMP};
     use noid_chain::header_anchor::HeaderChainAnchor;
     use noid_chain::BlockHeader;
     use noid_poseidon2b::primitives::Address;
@@ -2001,19 +2036,7 @@ mod tests {
         Vec<AcceptedBlockCertificateStatement>,
         Vec<BlockProofAcceptanceReceipt>,
     ) {
-        let start_header = BlockHeader {
-            prev_block_hash: [0u8; 32],
-            state_root: [0x11; 32],
-            tx_root: [0x10; 32],
-            timestamp: 1_767_225_600,
-            height: 0,
-            miner_address: Address([0x55; 32]),
-            nonce: 0,
-            difficulty_target: MAX_TARGET,
-            log_slots: 8,
-            active_slot_count: 0,
-            alloc_counter: 0,
-        };
+        let start_header = genesis_header();
         let mut consensus = RecursiveConsensusState::from_header(
             &start_header,
             block_work(&start_header.difficulty_target),
@@ -2024,13 +2047,7 @@ mod tests {
             &[start_header.active_slot_count],
         );
         let start_consensus = consensus.clone();
-        let start_accumulator = ChainAccumulator {
-            height: start_header.height,
-            state_root: start_header.state_root,
-            chain_hash: [0u8; 32],
-            active_slot_count: start_header.active_slot_count,
-            alloc_counter: start_header.alloc_counter,
-        };
+        let start_accumulator = genesis_accumulator();
         let start_anchor = HeaderChainAnchor {
             height: start_consensus.height,
             block_id: start_consensus.block_id,
@@ -2057,12 +2074,12 @@ mod tests {
                 prev_block_hash: previous_block_id,
                 state_root: [(index as u8).wrapping_add(2); 32],
                 tx_root: [(index as u8).wrapping_add(0x20); 32],
-                timestamp: 1_767_225_600 + height * BLOCK_TIME,
+                timestamp: GENESIS_TIMESTAMP + height * BLOCK_TIME,
                 height,
                 miner_address: Address([0x55; 32]),
                 nonce: height as u128,
                 difficulty_target: MAX_TARGET,
-                log_slots: 8,
+                log_slots: start_header.log_slots,
                 active_slot_count: height,
                 alloc_counter: height,
             };
@@ -2076,8 +2093,8 @@ mod tests {
                 parent_state_root: accumulator.state_root,
                 child_state_root: header.state_root,
                 tx_root: header.tx_root,
-                parent_log_slots: 8,
-                child_log_slots: 8,
+                parent_log_slots: start_header.log_slots,
+                child_log_slots: start_header.log_slots,
                 parent_active_slot_count: height.saturating_sub(1),
                 child_active_slot_count: height,
                 parent_alloc_counter: height.saturating_sub(1),
@@ -2113,14 +2130,9 @@ mod tests {
             consensus.active_slot_count = header.active_slot_count;
             consensus.alloc_counter = header.alloc_counter;
 
-            accumulator = accumulator.extend(
-                header.state_root,
-                header_witness.block_id,
-                height,
-                claim,
-                header.active_slot_count,
-                header.alloc_counter,
-            );
+            accumulator = accumulator
+                .advance(&header)
+                .expect("fixture header advances accumulator");
             previous_block_id = header_witness.block_id;
             headers.push(header_witness);
             claims.push(claim);
@@ -2570,7 +2582,7 @@ mod tests {
         );
 
         let mut tampered_output = accepted_claim_output;
-        tampered_output.accumulator.chain_hash = [0x5A; 32];
+        tampered_output.accumulator.epoch_anchor_id = [0x5A; 32];
         assert_eq!(
             verify_history_checkpoint_step_proof_private_components_native(
                 &statement,
@@ -2616,12 +2628,8 @@ mod tests {
             Err(HistoryCheckpointProofError::EndAccumulatorMismatch)
         );
 
-        let wrong_previous = history_checkpoint_head_from_boundary(
-            &summary.end_anchor,
-            &summary.end_accumulator,
-            &summary.end_consensus,
-        )
-        .expect("end boundary builds a checkpoint head");
+        let mut wrong_previous = previous.clone();
+        wrong_previous.checkpoint_height = summary.end_anchor.height;
         assert_eq!(
             advance_history_checkpoint_head_native(&wrong_previous, &summary),
             Err(HistoryCheckpointProofError::BatchStartMismatch)
@@ -2639,5 +2647,36 @@ mod tests {
             verify_history_checkpoint_step_statement_native(&bad_statement),
             Err(HistoryCheckpointProofError::StepHeadMismatch)
         );
+    }
+
+    #[test]
+    fn checkpoint_base_rejects_arbitrary_epoch_anchor() {
+        let summary = batch_summary();
+        let mut bad = summary.start_accumulator.clone();
+        bad.epoch_anchor_id[0] ^= 1;
+        assert_eq!(
+            history_checkpoint_head_from_boundary(
+                &summary.start_anchor,
+                &bad,
+                &summary.start_consensus,
+            ),
+            Err(HistoryCheckpointProofError::NonCanonicalBaseBoundary)
+        );
+    }
+
+    #[test]
+    fn checkpoint_accumulator_digest_binds_all_ten_lanes() {
+        let accumulator = genesis_accumulator();
+        let expected = history_checkpoint_accumulator_digest(&accumulator);
+        for lane_index in 0..crate::accumulator::CHAIN_ACCUMULATOR_LANES {
+            let mut lanes = accumulator.to_lanes();
+            lanes[lane_index] += Block128::ONE;
+            let mutated = ChainAccumulator::from_lanes(lanes).unwrap();
+            assert_ne!(
+                history_checkpoint_accumulator_digest(&mutated),
+                expected,
+                "checkpoint accumulator lane {lane_index} must be digest-bound"
+            );
+        }
     }
 }

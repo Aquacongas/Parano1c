@@ -13,9 +13,9 @@
 //! this class's public IO (the accumulator boundary and the region opening
 //! claims) into the chain rules.
 //!
-//! Public IO layout: `[start_acc (5 lanes) | end_acc (5 lanes) | region
-//! claim tail]`. The accumulator lanes are `height, state_root×2,
-//! chain_hash×2` in the same flat encoding the link uses; the region tail
+//! Public IO layout: `[start_acc (10 lanes) | end_acc (10 lanes) | region
+//! claim tail]`. The accumulator lanes use the canonical direct-boundary
+//! order exported by `ChainAccumulator`; the region tail
 //! carries every frozen walk opening claim's (point ‖ value) exactly like
 //! the link's region tail does, so a verifier replaying this proof enforces
 //! the claims against the committed walk columns via the envelope-IO
@@ -46,8 +46,7 @@ use super::trace::region_source_binding::{RegionDischargeParams, RegionPcsClaim}
 /// Public-IO layout of a block class.
 #[derive(Clone, Copy, Debug)]
 pub struct BlockIoLayout {
-    /// Start accumulator: [`ACC_LANES`] lanes (height, state_root×2,
-    /// chain_hash×2, active_slot_count, alloc_counter).
+    /// Start accumulator: [`ACC_LANES`] canonical direct-boundary lanes.
     pub start_acc: usize,
     /// End accumulator: [`ACC_LANES`] lanes.
     pub end_acc: usize,
@@ -317,24 +316,8 @@ fn build_block_trace_parts(
     match finish {
         Some(class) => {
             let layout = block_io_layout(class.region_claims.len(), class.region_max_arity);
-            let start_lanes = [
-                &slots.start_acc.height,
-                &slots.start_acc.state_root[0],
-                &slots.start_acc.state_root[1],
-                &slots.start_acc.chain_hash[0],
-                &slots.start_acc.chain_hash[1],
-                &slots.start_acc.active_slot_count,
-                &slots.start_acc.alloc_counter,
-            ];
-            let end_lanes = [
-                &slots.end_acc.height,
-                &slots.end_acc.state_root[0],
-                &slots.end_acc.state_root[1],
-                &slots.end_acc.chain_hash[0],
-                &slots.end_acc.chain_hash[1],
-                &slots.end_acc.active_slot_count,
-                &slots.end_acc.alloc_counter,
-            ];
+            let start_lanes = slots.start_acc.ordered_lanes();
+            let end_lanes = slots.end_acc.ordered_lanes();
             for (i, w) in start_lanes.iter().enumerate() {
                 pin_eq(&mut b, w, &io_cells[layout.start_acc + i]);
             }

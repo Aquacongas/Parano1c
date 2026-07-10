@@ -51,11 +51,11 @@ use noid_recursive::{
     AcceptedBlockCertificateReceiptError, AcceptedBlockReceiptProjectionHandle,
     AcceptedBlockReceiptProjectionHandleError, AcceptedClaimBatchError, AcceptedClaimBatchOutput,
     AcceptedClaimBatchWitness, AuthorizationVerifierTrace, BlockProofAcceptanceReceipt,
-    ChainAccumulator, CheckpointPoseidonError, CheckpointPoseidonProof, HeaderIntegerTraceError,
-    HeaderWitness, HistoryCheckpointBatchSummary, HistoryCheckpointHead, HistoryCheckpointProof,
-    HistoryCheckpointProofError, HistoryCheckpointStepProof, HistoryCheckpointStepProofError,
-    HistoryCheckpointStepStatement, PowHeaderBatchError, RecursiveConsensusState,
-    HISTORY_CHECKPOINT_BATCH_TARGET_BLOCKS,
+    ChainAccumulator, ChainAccumulatorAdvanceError, CheckpointPoseidonError,
+    CheckpointPoseidonProof, HeaderIntegerTraceError, HeaderWitness, HistoryCheckpointBatchSummary,
+    HistoryCheckpointHead, HistoryCheckpointProof, HistoryCheckpointProofError,
+    HistoryCheckpointStepProof, HistoryCheckpointStepProofError, HistoryCheckpointStepStatement,
+    PowHeaderBatchError, RecursiveConsensusState, HISTORY_CHECKPOINT_BATCH_TARGET_BLOCKS,
 };
 
 use crate::validate::map_verify_authorization_error;
@@ -100,7 +100,6 @@ pub struct AcceptedBlockCertificateBatchWitness {
 pub struct FullAcceptedBlockBatchOutput {
     pub accepted_claim_batch: AcceptedClaimBatchOutput,
     pub end_state: ChainState,
-    pub end_tx_epoch_anchor_id: Digest,
     pub proof_components: FullAcceptedBlockBatchProofComponents,
 }
 
@@ -148,9 +147,7 @@ pub fn public_history_checkpoint_proof_from_package(
     base_accumulator: &ChainAccumulator,
     package: &AcceptedBlockCertificateBatchCheckpointPackage,
 ) -> Result<HistoryCheckpointProof, FullAcceptedBlockBatchError> {
-    if base_accumulator.height != base_anchor.height
-        || base_accumulator.state_root != base_anchor.state_root
-    {
+    if !accumulator_matches_anchor(base_accumulator, base_anchor) {
         return Err(FullAcceptedBlockBatchError::CheckpointSummaryStartMismatch);
     }
 
@@ -191,6 +188,10 @@ pub enum FullAcceptedBlockBatchError {
         source: PowHeaderBatchError,
     },
     HeaderInteger(HeaderIntegerTraceError),
+    AccumulatorAdvance {
+        index: usize,
+        source: ChainAccumulatorAdvanceError,
+    },
     HeaderAnchor {
         index: usize,
         source: HeaderChainAnchorError,
@@ -285,7 +286,6 @@ pub fn verify_full_accepted_block_batch_native(
     start_consensus: &RecursiveConsensusState,
     start_accumulator: &ChainAccumulator,
     start_parent: &BlockHeader,
-    start_tx_epoch_anchor_id: Digest,
     start_state: &ChainState,
     witness: &FullAcceptedBlockBatchWitness,
 ) -> Result<FullAcceptedBlockBatchOutput, FullAcceptedBlockBatchError> {
@@ -298,6 +298,12 @@ pub fn verify_full_accepted_block_batch_native(
         || start_parent.log_slots != start_consensus.log_slots
         || start_parent.active_slot_count != start_consensus.active_slot_count
         || start_parent.alloc_counter != start_consensus.alloc_counter
+        || start_accumulator.height != start_parent.height
+        || start_accumulator.tip_block_id != hash_block_header(start_parent)
+        || start_accumulator.state_root != start_parent.state_root
+        || start_accumulator.log_slots != start_parent.log_slots
+        || start_accumulator.active_slot_count != start_parent.active_slot_count
+        || start_accumulator.alloc_counter != start_parent.alloc_counter
     {
         return Err(FullAcceptedBlockBatchError::StartParentMismatch);
     }
@@ -308,7 +314,7 @@ pub fn verify_full_accepted_block_batch_native(
     }
 
     let mut parent = start_parent.clone();
-    let mut tx_epoch_anchor_id = start_tx_epoch_anchor_id;
+    let mut rolling_accumulator = start_accumulator.clone();
     let mut rolling_consensus = start_consensus.clone();
     let mut header_witnesses = Vec::with_capacity(witness.items.len());
     let mut accepted_block_claims = Vec::with_capacity(witness.items.len());
@@ -336,7 +342,7 @@ pub fn verify_full_accepted_block_batch_native(
             anchor_target: rolling_consensus.asert_anchor_target,
         };
         let tx_epoch = crate::BlockTxEpochContext {
-            expected_user_epoch_anchor_id: tx_epoch_anchor_id,
+            expected_user_epoch_anchor_id: rolling_accumulator.epoch_anchor_id,
         };
 
         let has_user_txs = item
@@ -470,12 +476,10 @@ pub fn verify_full_accepted_block_batch_native(
         accepted_block_claims.push(claim);
         accepted_block_acceptance_receipts.push(acceptance_receipt);
         accepted_block_certificate_statements.push(certificate_statement);
+        rolling_accumulator = rolling_accumulator
+            .advance(&item.block.header)
+            .map_err(|source| FullAcceptedBlockBatchError::AccumulatorAdvance { index, source })?;
         parent = item.block.header.clone();
-        tx_epoch_anchor_id = noid_chain::consensus::next_tx_epoch_anchor_id(
-            tx_epoch_anchor_id,
-            item.block.header.height,
-            noid_chain::hash_block_header(&item.block.header),
-        );
     }
 
     let accepted_block_certificate_receipts = accepted_block_certificate_statements
@@ -515,11 +519,13 @@ pub fn verify_full_accepted_block_batch_native(
         &header_integer_trace,
     )
     .map_err(FullAcceptedBlockBatchError::AcceptedClaimBatch)?;
+    if accepted_claim_batch.accumulator != rolling_accumulator {
+        return Err(FullAcceptedBlockBatchError::ComponentShapeMismatch);
+    }
 
     Ok(FullAcceptedBlockBatchOutput {
         accepted_claim_batch,
         end_state: state,
-        end_tx_epoch_anchor_id: tx_epoch_anchor_id,
         proof_components: FullAcceptedBlockBatchProofComponents {
             component_inputs: RecursiveBlockBatchComponentInputs {
                 accepted_claim_witness,
@@ -544,8 +550,6 @@ pub fn verify_full_accepted_block_batch_native(
 }
 
 pub(crate) fn prove_full_accepted_block_batch_components(
-    start_accumulator: &ChainAccumulator,
-    end_accumulator: &ChainAccumulator,
     components: &FullAcceptedBlockBatchProofComponents,
 ) -> Result<RetainedFullAcceptedBlockBatchProof, FullAcceptedBlockBatchError> {
     if components.component_inputs.accepted_claim_hash_inputs.len()
@@ -595,8 +599,6 @@ pub(crate) fn prove_full_accepted_block_batch_components(
                             rayon::join(
                                 || {
                                     prove_checkpoint_poseidon(
-                                        start_accumulator,
-                                        end_accumulator,
                                         &components.component_inputs.accepted_claim_witness,
                                     )
                                     .map_err(FullAcceptedBlockBatchError::CheckpointPoseidon)
@@ -637,7 +639,6 @@ pub fn prove_retained_full_accepted_block_batch_proof(
     start_consensus: &RecursiveConsensusState,
     start_accumulator: &ChainAccumulator,
     start_parent: &BlockHeader,
-    start_tx_epoch_anchor_id: Digest,
     start_state: &ChainState,
     witness: &FullAcceptedBlockBatchWitness,
 ) -> Result<
@@ -651,15 +652,10 @@ pub fn prove_retained_full_accepted_block_batch_proof(
         start_consensus,
         start_accumulator,
         start_parent,
-        start_tx_epoch_anchor_id,
         start_state,
         witness,
     )?;
-    let proof = prove_full_accepted_block_batch_components(
-        start_accumulator,
-        &output.accepted_claim_batch.accumulator,
-        &output.proof_components,
-    )?;
+    let proof = prove_full_accepted_block_batch_components(&output.proof_components)?;
     Ok((output, proof))
 }
 
@@ -673,7 +669,6 @@ pub fn verify_retained_full_accepted_block_batch_proof(
     start_consensus: &RecursiveConsensusState,
     start_accumulator: &ChainAccumulator,
     start_parent: &BlockHeader,
-    start_tx_epoch_anchor_id: Digest,
     start_state: &ChainState,
     witness: &FullAcceptedBlockBatchWitness,
     proof: &RetainedFullAcceptedBlockBatchProof,
@@ -682,7 +677,6 @@ pub fn verify_retained_full_accepted_block_batch_proof(
         start_consensus,
         start_accumulator,
         start_parent,
-        start_tx_epoch_anchor_id,
         start_state,
         witness,
     )?;
@@ -702,7 +696,6 @@ pub fn prove_retained_block_certificate_batch_checkpoint_package_from_boundary(
     start_consensus: &RecursiveConsensusState,
     start_accumulator: &ChainAccumulator,
     start_parent: &BlockHeader,
-    start_tx_epoch_anchor_id: Digest,
     start_state: &ChainState,
     witness: &FullAcceptedBlockBatchWitness,
 ) -> Result<AcceptedBlockCertificateBatchCheckpointPackage, FullAcceptedBlockBatchError> {
@@ -715,7 +708,6 @@ pub fn prove_retained_block_certificate_batch_checkpoint_package_from_boundary(
         start_consensus,
         start_accumulator,
         start_parent,
-        start_tx_epoch_anchor_id,
         start_state,
         witness,
     )
@@ -728,7 +720,6 @@ pub fn prove_retained_block_certificate_batch_checkpoint_package(
     start_consensus: &RecursiveConsensusState,
     start_accumulator: &ChainAccumulator,
     start_parent: &BlockHeader,
-    start_tx_epoch_anchor_id: Digest,
     start_state: &ChainState,
     witness: &FullAcceptedBlockBatchWitness,
 ) -> Result<AcceptedBlockCertificateBatchCheckpointPackage, FullAcceptedBlockBatchError> {
@@ -736,7 +727,6 @@ pub fn prove_retained_block_certificate_batch_checkpoint_package(
         start_consensus,
         start_accumulator,
         start_parent,
-        start_tx_epoch_anchor_id,
         start_state,
         witness,
     )?;
@@ -917,8 +907,7 @@ fn verify_accepted_block_certificate_batch_witness(
         return Err(FullAcceptedBlockBatchError::ComponentShapeMismatch);
     }
     if !anchor_matches_consensus(start_anchor, start_consensus)
-        || start_accumulator.height != start_anchor.height
-        || start_accumulator.state_root != start_anchor.state_root
+        || !accumulator_matches_anchor(start_accumulator, start_anchor)
     {
         return Err(FullAcceptedBlockBatchError::CheckpointSummaryStartMismatch);
     }
@@ -991,14 +980,9 @@ fn verify_accepted_block_certificate_batch_witness(
 
         let header_witness = HeaderWitness::from_header(header);
         let chain_claim = accepted_block_certificate_chain_claim(statement);
-        accumulator = accumulator.extend(
-            header.state_root,
-            statement.block_id,
-            header.height,
-            chain_claim,
-            header.active_slot_count,
-            header.alloc_counter,
-        );
+        accumulator = accumulator
+            .advance(header)
+            .map_err(|source| FullAcceptedBlockBatchError::AccumulatorAdvance { index, source })?;
         previous_block_id = statement.block_id;
         previous_state_root = statement.child_state_root;
         previous_log_slots = header.log_slots;
@@ -1016,8 +1000,7 @@ fn verify_accepted_block_certificate_batch_witness(
     };
     if previous_block_id != end_anchor.block_id
         || previous_state_root != end_anchor.state_root
-        || accumulator.height != end_anchor.height
-        || accumulator.state_root != end_anchor.state_root
+        || !accumulator_matches_anchor(&accumulator, end_anchor)
     {
         return Err(FullAcceptedBlockBatchError::CheckpointSummaryEndMismatch);
     }
@@ -1045,8 +1028,7 @@ pub fn history_checkpoint_batch_summary_from_full_accepted_output(
         return Err(FullAcceptedBlockBatchError::ComponentShapeMismatch);
     }
     if !anchor_matches_consensus(start_anchor, start_consensus)
-        || start_accumulator.height != start_anchor.height
-        || start_accumulator.state_root != start_anchor.state_root
+        || !accumulator_matches_anchor(start_accumulator, start_anchor)
     {
         return Err(FullAcceptedBlockBatchError::CheckpointSummaryStartMismatch);
     }
@@ -1072,8 +1054,7 @@ pub fn history_checkpoint_batch_summary_from_full_accepted_output(
             &rolling_anchor,
             &output.accepted_claim_batch.consensus_state,
         )
-        || output.accepted_claim_batch.accumulator.height != rolling_anchor.height
-        || output.accepted_claim_batch.accumulator.state_root != rolling_anchor.state_root
+        || !accumulator_matches_anchor(&output.accepted_claim_batch.accumulator, &rolling_anchor)
     {
         return Err(FullAcceptedBlockBatchError::CheckpointSummaryEndMismatch);
     }
@@ -1286,6 +1267,15 @@ fn anchor_matches_consensus(
         && anchor.log_slots == consensus.log_slots
         && anchor.active_slot_count == consensus.active_slot_count
         && anchor.alloc_counter == consensus.alloc_counter
+}
+
+fn accumulator_matches_anchor(accumulator: &ChainAccumulator, anchor: &HeaderChainAnchor) -> bool {
+    accumulator.height == anchor.height
+        && accumulator.tip_block_id == anchor.block_id
+        && accumulator.state_root == anchor.state_root
+        && accumulator.log_slots == anchor.log_slots
+        && accumulator.active_slot_count == anchor.active_slot_count
+        && accumulator.alloc_counter == anchor.alloc_counter
 }
 
 fn prove_tx_root_component(
@@ -1613,5 +1603,47 @@ mod tests {
         let mut malformed_genesis = genesis;
         malformed_genesis.header.tx_root = [1; 32];
         assert!(tx_root_merkle_inputs(&malformed_genesis).is_err());
+    }
+
+    #[test]
+    fn direct_accumulator_anchor_match_checks_every_shared_lane() {
+        let header = header(7, &[]);
+        let block_id = hash_block_header(&header);
+        let anchor = HeaderChainAnchor {
+            height: header.height,
+            block_id,
+            state_root: header.state_root,
+            tx_root: header.tx_root,
+            miner_address: header.miner_address,
+            log_slots: header.log_slots,
+            active_slot_count: header.active_slot_count,
+            alloc_counter: header.alloc_counter,
+            cumulative_chainwork: [0x55; 32],
+            projection_root: [0x66; 32],
+        };
+        let accumulator = ChainAccumulator {
+            height: header.height,
+            tip_block_id: block_id,
+            state_root: header.state_root,
+            log_slots: header.log_slots,
+            active_slot_count: header.active_slot_count,
+            alloc_counter: header.alloc_counter,
+            epoch_anchor_id: [0x77; 32],
+        };
+        assert!(accumulator_matches_anchor(&accumulator, &anchor));
+
+        for lane in 0..6 {
+            let mut bad = accumulator.clone();
+            match lane {
+                0 => bad.height += 1,
+                1 => bad.tip_block_id[0] ^= 1,
+                2 => bad.state_root[0] ^= 1,
+                3 => bad.log_slots += 1,
+                4 => bad.active_slot_count += 1,
+                5 => bad.alloc_counter += 1,
+                _ => unreachable!(),
+            }
+            assert!(!accumulator_matches_anchor(&bad, &anchor), "lane {lane}");
+        }
     }
 }

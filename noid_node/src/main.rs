@@ -1645,22 +1645,6 @@ mod tests {
         assert!(gap_requires_snapshot_sync(local_height, local_height + 19));
     }
 
-    fn test_parent_header(state: &mut noid_chain::ChainState) -> noid_chain::BlockHeader {
-        noid_chain::BlockHeader {
-            prev_block_hash: [0u8; 32],
-            state_root: state.state_root(),
-            tx_root: noid_chain::compute_tx_root(&[]),
-            timestamp: 1_767_225_600,
-            height: 0,
-            miner_address: noid_poseidon2b::primitives::Address([0x11; 32]),
-            nonce: 0,
-            difficulty_target: noid_chain::consensus::params::MAX_TARGET,
-            log_slots: state.state.log_slots() as u32,
-            active_slot_count: state.active_slot_count,
-            alloc_counter: state.alloc_counter,
-        }
-    }
-
     fn test_coinbase_child(
         parent: &noid_chain::BlockHeader,
         state: &noid_chain::ChainState,
@@ -1732,10 +1716,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = noid_chain::storage::MdbxStore::open(dir.path()).expect("open store");
 
-        let mut state = noid_chain::ChainState::with_log_slots(8);
-        let h0 = test_parent_header(&mut state);
+        let state = noid_chain::ChainState::with_log_slots(
+            noid_chain::consensus::params::LOG_SLOTS_GENESIS
+                .try_into()
+                .expect("genesis log_slots fits usize"),
+        );
+        let h0 = noid_chain::consensus::genesis_header();
         let h0_hash = noid_chain::hash_block_header(&h0);
-        let high_start_work = [2u8; 32];
+        let high_start_work = noid_chain::consensus::block_work(&h0.difficulty_target);
         store
             .put_verified_header_only(&h0, &h0_hash, &high_start_work)
             .expect("store genesis header");
@@ -1749,13 +1737,7 @@ mod tests {
             &[h0.timestamp],
             &[h0.active_slot_count],
         );
-        let start_accumulator = noid_recursive::ChainAccumulator {
-            height: h0.height,
-            state_root: h0.state_root,
-            chain_hash: [0u8; 32],
-            active_slot_count: h0.active_slot_count,
-            alloc_counter: h0.alloc_counter,
-        };
+        let start_accumulator = noid_recursive::genesis_accumulator();
         let start_anchor = noid_chain::header_anchor::compute_header_chain_anchor(
             std::iter::once(&h0),
             high_start_work,
@@ -1775,7 +1757,6 @@ mod tests {
                 &start_consensus,
                 &start_accumulator,
                 &h0,
-                noid_chain::hash_block_header(&h0),
                 &state,
                 &witness,
             )
@@ -4416,11 +4397,6 @@ fn prepare_certificate_batch_package_build(
     }
 
     let start_parent_height = start_height.saturating_sub(1);
-    let start_parent = ctx
-        .store
-        .get_header(start_parent_height)
-        .map_err(|e| format!("read package start parent h={start_parent_height}: {e}"))?
-        .ok_or_else(|| format!("missing package start parent h={start_parent_height}"))?;
     let start_anchor = match latest_package.as_ref() {
         Some(package) => package.step_statement.batch_summary.end_anchor.clone(),
         None => ctx
@@ -4435,10 +4411,7 @@ fn prepare_certificate_batch_package_build(
     )?;
     let start_accumulator = latest_package.as_ref().map_or_else(
         || {
-            Ok::<noid_recursive::ChainAccumulator, String>(genesis_accumulator(
-                start_parent.state_root,
-                noid_chain::hash_block_header(&start_parent),
-            ))
+            Ok::<noid_recursive::ChainAccumulator, String>(genesis_accumulator())
         },
         |package| Ok(package.step_statement.batch_summary.end_accumulator.clone()),
     )?;

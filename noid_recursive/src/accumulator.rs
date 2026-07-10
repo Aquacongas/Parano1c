@@ -1,108 +1,306 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Rolling chain accumulator proven by each recursive step.
+//! Direct recursive-chain continuity boundary.
 
+use noid_chain::block_header::BlockHeader;
+use noid_chain::consensus::{checked_tx_epoch_height_decomposition, genesis_header};
 use noid_chain::fri_state::StateRoot;
-use noid_core::{Block128, TowerField};
+use noid_chain::hash_block_header;
+use noid_core::Block128;
 use noid_poseidon2b::primitives::Digest;
 
-/// Rolling accumulator for the recursive chain proof.
+/// Canonical number of `Block128` lanes in [`ChainAccumulator`].
+pub const CHAIN_ACCUMULATOR_LANES: usize = 10;
+
+/// Direct recursive continuity state.
 ///
-/// Each block extends this by one step; `verify_tip` checks
-/// that the accumulator reaches the expected genesis state.
+/// The lane order is consensus-significant and is centralized in
+/// [`ChainAccumulator::to_lanes`] and [`ChainAccumulator::from_lanes`]:
+///
+/// ```text
+/// height
+/// tip_block_id[2]
+/// state_root[2]
+/// log_slots
+/// active_slot_count
+/// alloc_counter
+/// epoch_anchor_id[2]
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ChainAccumulator {
-    /// Block height (number of blocks applied since genesis).
     pub height: u64,
-    /// State root after all blocks up to `height` are applied.
+    pub tip_block_id: Digest,
     pub state_root: StateRoot,
-    /// Rolling Poseidon2b chain hash:
-    ///
-    ///   chain_hash_0 = compress(ZERO, compress(H_BLOCK(genesis), claim_bytes_0))
-    ///   chain_hash_n = compress(chain_hash_{n-1}, compress(H_BLOCK(header_n), claim_bytes_n))
-    ///
-    /// where `claim_bytes_n` = canonical 32-byte `chain_claim`.
-    ///
-    /// Binding both the semantic block id and the canonical chain claim into a
-    /// single 32-byte commitment prevents a forger from substituting a different
-    /// local claim for a covered block: the resulting `chain_hash` would diverge
-    /// from the value computed by honest nodes, making the mismatch detectable.
-    pub chain_hash: Digest,
-    /// Active slot count after all blocks up to `height` are applied — the
-    /// consensus-continuity counter the chain rules carry across blocks
-    /// (each block pins its start counter to its claim's PARENT counter and
-    /// its end counter to its header's child counter; the boundary equality
-    /// start == prev.end closes the chain).
+    pub log_slots: u32,
     pub active_slot_count: u64,
-    /// Allocation counter after all blocks up to `height` are applied —
-    /// same continuity discipline as `active_slot_count`.
     pub alloc_counter: u64,
+    pub epoch_anchor_id: Digest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainAccumulatorLaneError {
+    HeightOutOfRange,
+    LogSlotsOutOfRange,
+    ActiveSlotCountOutOfRange,
+    AllocCounterOutOfRange,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainAccumulatorAdvanceError {
+    HeightOverflow,
+    BadHeight { expected: u64, actual: u64 },
+    BadParentTip,
 }
 
 impl ChainAccumulator {
-    /// Extend the accumulator by one block.
+    /// Encode the canonical ten-lane recursive boundary.
+    pub fn to_lanes(&self) -> [Block128; CHAIN_ACCUMULATOR_LANES] {
+        let tip = digest_to_lanes(self.tip_block_id);
+        let state = digest_to_lanes(self.state_root);
+        let epoch = digest_to_lanes(self.epoch_anchor_id);
+        [
+            Block128::from(self.height),
+            tip[0],
+            tip[1],
+            state[0],
+            state[1],
+            Block128::from(self.log_slots),
+            Block128::from(self.active_slot_count),
+            Block128::from(self.alloc_counter),
+            epoch[0],
+            epoch[1],
+        ]
+    }
+
+    /// Decode the canonical ten-lane recursive boundary.
     ///
-    /// # Parameters
+    /// Scalar lanes are range-checked before conversion. In particular, this
+    /// API never truncates a field lane with `as u64`/`as u32`.
+    pub fn from_lanes(
+        lanes: [Block128; CHAIN_ACCUMULATOR_LANES],
+    ) -> Result<Self, ChainAccumulatorLaneError> {
+        Ok(Self {
+            height: u64::try_from(lanes[0].to_u128())
+                .map_err(|_| ChainAccumulatorLaneError::HeightOutOfRange)?,
+            tip_block_id: digest_from_lanes([lanes[1], lanes[2]]),
+            state_root: digest_from_lanes([lanes[3], lanes[4]]),
+            log_slots: u32::try_from(lanes[5].to_u128())
+                .map_err(|_| ChainAccumulatorLaneError::LogSlotsOutOfRange)?,
+            active_slot_count: u64::try_from(lanes[6].to_u128())
+                .map_err(|_| ChainAccumulatorLaneError::ActiveSlotCountOutOfRange)?,
+            alloc_counter: u64::try_from(lanes[7].to_u128())
+                .map_err(|_| ChainAccumulatorLaneError::AllocCounterOutOfRange)?,
+            epoch_anchor_id: digest_from_lanes([lanes[8], lanes[9]]),
+        })
+    }
+
+    /// Advance by one canonical child header.
     ///
-    /// - `block_hash`  = `hash_block_header(&header)` semantic block id.
-    /// - `chain_claim` = canonical 32-byte block claim folded into recursive
-    ///   history. `[Block128::ZERO; 2]` for genesis.
-    /// - `active_slot_count` / `alloc_counter` = the block header's child
-    ///   consensus counters.
-    #[allow(clippy::too_many_arguments)]
-    pub fn extend(
+    /// The child must link to the current tip and increment height exactly.
+    /// Its direct state/depth/counters become the new boundary. The transaction
+    /// epoch switches to the child id exactly at a 144-block boundary.
+    pub fn advance(
         &self,
-        new_state_root: StateRoot,
-        block_hash: Digest,
-        new_height: u64,
-        chain_claim: [Block128; 2],
-        active_slot_count: u64,
-        alloc_counter: u64,
-    ) -> Self {
-        use noid_poseidon2b::native::compress;
-        // Encode claim as 32 bytes (two LE u128 lanes).
-        let mut claim_bytes = [0u8; 32];
-        claim_bytes[..16].copy_from_slice(&chain_claim[0].to_u128().to_le_bytes());
-        claim_bytes[16..].copy_from_slice(&chain_claim[1].to_u128().to_le_bytes());
-        // chain_hash = compress(prev, compress(H_BLOCK, claim))
-        let inner = compress(&block_hash, &claim_bytes);
-        let chain_hash = compress(&self.chain_hash, &inner);
-        Self {
-            height: new_height,
-            state_root: new_state_root,
-            chain_hash,
-            active_slot_count,
-            alloc_counter,
+        child_header: &BlockHeader,
+    ) -> Result<Self, ChainAccumulatorAdvanceError> {
+        if child_header.prev_block_hash != self.tip_block_id {
+            return Err(ChainAccumulatorAdvanceError::BadParentTip);
         }
+        let expected_height = self
+            .height
+            .checked_add(1)
+            .ok_or(ChainAccumulatorAdvanceError::HeightOverflow)?;
+        if child_header.height != expected_height {
+            return Err(ChainAccumulatorAdvanceError::BadHeight {
+                expected: expected_height,
+                actual: child_header.height,
+            });
+        }
+
+        let child_id = hash_block_header(child_header);
+        Ok(Self {
+            height: child_header.height,
+            tip_block_id: child_id,
+            state_root: child_header.state_root,
+            log_slots: child_header.log_slots,
+            active_slot_count: child_header.active_slot_count,
+            alloc_counter: child_header.alloc_counter,
+            epoch_anchor_id: if checked_tx_epoch_height_decomposition(child_header.height)
+                .expect("every u64 height has a checked transaction-epoch decomposition")
+                .is_boundary()
+            {
+                child_id
+            } else {
+                self.epoch_anchor_id
+            },
+        })
     }
 }
 
-/// Build the genesis accumulator for a given genesis state root and genesis
-/// block hash.
-///
-/// Genesis uses a null witness so `chain_claim = [ZERO; 2]`.
-/// Formula: `compress(ZERO, compress(genesis_block_hash, [0;32]))`
-/// — identical to calling `pre_genesis.extend(state_root, block_hash, 0,
-/// [ZERO; 2])` on an all-zero pre-genesis accumulator.
-pub fn genesis_accumulator(
-    genesis_state_root: StateRoot,
-    genesis_block_hash: Digest,
-) -> ChainAccumulator {
-    let pre_genesis = ChainAccumulator {
-        height: 0,
-        state_root: [0u8; 32],
-        chain_hash: [0u8; 32],
-        active_slot_count: 0,
-        alloc_counter: 0,
-    };
-    // Genesis block has no BlockProof (and mints nothing: zero counters).
-    pre_genesis.extend(
-        genesis_state_root,
-        genesis_block_hash,
-        0,
-        [Block128::ZERO; 2],
-        0,
-        0,
-    )
+/// Canonical blockless bootstrap boundary.
+pub fn genesis_accumulator() -> ChainAccumulator {
+    let header = genesis_header();
+    let block_id = hash_block_header(&header);
+    ChainAccumulator {
+        height: header.height,
+        tip_block_id: block_id,
+        state_root: header.state_root,
+        log_slots: header.log_slots,
+        active_slot_count: header.active_slot_count,
+        alloc_counter: header.alloc_counter,
+        epoch_anchor_id: block_id,
+    }
+}
+
+fn digest_to_lanes(digest: Digest) -> [Block128; 2] {
+    [
+        Block128::from(u128::from_le_bytes(digest[..16].try_into().unwrap())),
+        Block128::from(u128::from_le_bytes(digest[16..].try_into().unwrap())),
+    ]
+}
+
+fn digest_from_lanes(lanes: [Block128; 2]) -> Digest {
+    let mut digest = [0u8; 32];
+    digest[..16].copy_from_slice(&lanes[0].to_u128().to_le_bytes());
+    digest[16..].copy_from_slice(&lanes[1].to_u128().to_le_bytes());
+    digest
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use noid_chain::consensus::params::GENESIS_TARGET;
+    use noid_poseidon2b::primitives::Address;
+
+    fn child(parent: &ChainAccumulator, height: u64) -> BlockHeader {
+        BlockHeader {
+            prev_block_hash: parent.tip_block_id,
+            state_root: [height as u8; 32],
+            tx_root: [0x33; 32],
+            timestamp: height,
+            height,
+            miner_address: Address([0x44; 32]),
+            nonce: height as u128,
+            difficulty_target: GENESIS_TARGET,
+            log_slots: 24 + u32::from(height >= 145),
+            active_slot_count: height * 2,
+            alloc_counter: height * 3,
+        }
+    }
+
+    #[test]
+    fn genesis_is_the_canonical_header_boundary() {
+        let header = genesis_header();
+        let id = hash_block_header(&header);
+        assert_eq!(
+            genesis_accumulator(),
+            ChainAccumulator {
+                height: 0,
+                tip_block_id: id,
+                state_root: header.state_root,
+                log_slots: header.log_slots,
+                active_slot_count: 0,
+                alloc_counter: 0,
+                epoch_anchor_id: id,
+            }
+        );
+    }
+
+    #[test]
+    fn lanes_roundtrip_without_truncation() {
+        let accumulator = ChainAccumulator {
+            height: u64::MAX,
+            tip_block_id: [0x11; 32],
+            state_root: [0x22; 32],
+            log_slots: u32::MAX,
+            active_slot_count: u64::MAX - 1,
+            alloc_counter: u64::MAX - 2,
+            epoch_anchor_id: [0x33; 32],
+        };
+        assert_eq!(
+            ChainAccumulator::from_lanes(accumulator.to_lanes()),
+            Ok(accumulator)
+        );
+    }
+
+    #[test]
+    fn lane_decoder_rejects_every_oversized_scalar() {
+        let base = genesis_accumulator().to_lanes();
+        for (lane, expected) in [
+            (0, ChainAccumulatorLaneError::HeightOutOfRange),
+            (5, ChainAccumulatorLaneError::LogSlotsOutOfRange),
+            (6, ChainAccumulatorLaneError::ActiveSlotCountOutOfRange),
+            (7, ChainAccumulatorLaneError::AllocCounterOutOfRange),
+        ] {
+            let mut lanes = base;
+            lanes[lane] = if lane == 5 {
+                Block128::from(u32::MAX as u128 + 1)
+            } else {
+                Block128::from(u64::MAX as u128 + 1)
+            };
+            assert_eq!(ChainAccumulator::from_lanes(lanes), Err(expected));
+        }
+    }
+
+    #[test]
+    fn advance_checks_link_and_exact_height() {
+        let start = genesis_accumulator();
+        let valid = child(&start, 1);
+        let end = start.advance(&valid).unwrap();
+        assert_eq!(end.height, 1);
+        assert_eq!(end.tip_block_id, hash_block_header(&valid));
+        assert_eq!(end.state_root, valid.state_root);
+        assert_eq!(end.log_slots, valid.log_slots);
+        assert_eq!(end.active_slot_count, valid.active_slot_count);
+        assert_eq!(end.alloc_counter, valid.alloc_counter);
+        assert_eq!(end.epoch_anchor_id, start.epoch_anchor_id);
+
+        let mut bad_parent = valid;
+        bad_parent.prev_block_hash = [0x99; 32];
+        assert_eq!(
+            start.advance(&bad_parent),
+            Err(ChainAccumulatorAdvanceError::BadParentTip)
+        );
+
+        let bad_height = child(&start, 2);
+        assert_eq!(
+            start.advance(&bad_height),
+            Err(ChainAccumulatorAdvanceError::BadHeight {
+                expected: 1,
+                actual: 2,
+            })
+        );
+
+        let max = ChainAccumulator {
+            height: u64::MAX,
+            ..start
+        };
+        let overflow_child = child(&max, 0);
+        assert_eq!(
+            max.advance(&overflow_child),
+            Err(ChainAccumulatorAdvanceError::HeightOverflow)
+        );
+    }
+
+    #[test]
+    fn epoch_changes_only_at_exact_boundary() {
+        let mut accumulator = genesis_accumulator();
+        let genesis_epoch = accumulator.epoch_anchor_id;
+        let mut boundary_id = None;
+        for height in 1..=145 {
+            let header = child(&accumulator, height);
+            let child_id = hash_block_header(&header);
+            accumulator = accumulator.advance(&header).unwrap();
+            match height {
+                1..=143 => assert_eq!(accumulator.epoch_anchor_id, genesis_epoch),
+                144 => {
+                    boundary_id = Some(child_id);
+                    assert_eq!(accumulator.epoch_anchor_id, child_id);
+                }
+                145 => assert_eq!(accumulator.epoch_anchor_id, boundary_id.unwrap()),
+                _ => unreachable!(),
+            }
+        }
+    }
 }

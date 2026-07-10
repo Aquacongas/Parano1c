@@ -16,12 +16,9 @@
 //!   transcript embeds `AcceptedBlockHeaderClaim::from_header(header)`);
 //! - the claim's parent-section block id is the header's `prev_block_hash`,
 //!   its parent state root / height are the start accumulator's;
-//! - the accumulator fold, the chain-accumulator killshot items and the
-//!   claim-hash statement share the `expected_claim` / `block_id` wires
-//!   (the image of `chain_accumulator_proof_inputs` deriving both from one
-//!   witness);
-//! - `validate_accumulator_boundary`: first block height = start height + 1
-//!   (affine pin), end accumulator pins live in the claim-fold slot;
+//! - the direct ten-lane accumulator transition shares the header block-id,
+//!   parent-tip, state/depth/counter and height wires; transaction epoch is
+//!   selected by a constrained `height mod 144` relation;
 //! - every tx-root Merkle path pins its root to the underlying universal
 //!   256-leaf Merkle root `M`, its leaf to the spine slot's tx-body hash, its
 //!   direction bits to the
@@ -45,7 +42,7 @@
 //! - the parent header's `active_slot_count` / `alloc_counter`: CLOSED —
 //!   the accumulator boundary carries both counters as lanes; each block
 //!   pins its start counters to the claim's PARENT section and its end
-//!   counters to the verified header, and the link chain rule
+//!   direct boundary to the verified header, and the link chain rule
 //!   `start == prev.end` closes the chain. Header PoW/ASERT/MTP fields
 //!   (timestamp, miner, nonce, target) are deliberately out of π's
 //!   scope — a fresh peer validates its own header chain.
@@ -66,15 +63,14 @@ use noid_poseidon2b::native::compression::compress;
 use noid_poseidon2b::native::domain::TAG_TXROOT;
 
 use super::trace::accepted_claim_batch::{
-    build_accepted_claim_batch_claim_slot, compress_with_tag_trace, digest_lanes, AccumulatorWires,
-    ClaimBatchStepWires,
+    build_direct_accumulator_transition_slot, compress_with_tag_trace, digest_lanes,
+    AccumulatorWires, DirectChildWires,
 };
 use super::trace::accepted_claim_hash::{
     build_accepted_claim_hash_slot, AcceptedClaimHashInputsTrace,
 };
 use super::trace::checkpoint_poseidon::{
-    build_checkpoint_poseidon_slot_with_inputs, ChainAccumulatorBatchInputsTrace,
-    ChainAccumulatorItemTrace, HeaderHashInputsTrace,
+    build_checkpoint_poseidon_slot_with_inputs, HeaderHashInputsTrace,
 };
 use super::trace::exact_state::{
     bind_exact_state_header_roots, build_exact_state_slot_with_config,
@@ -91,8 +87,8 @@ use super::trace::region_source_binding::{
 };
 use super::trace::tx_body_spine::{build_tx_body_slot, SpineInputsTrace};
 use super::trace::{
-    alloc_block, const_block, flat_const, flat_of, mul, pin_eq, pin_lt_strict, pin_zero,
-    range_check_bits, FieldR1csBuilder, LinExpr, RawChannelTrace, F128,
+    alloc_block, const_block, flat_const, flat_of, integer_add_no_overflow, mul, pin_eq,
+    pin_lt_strict, pin_zero, range_check_bits, FieldR1csBuilder, LinExpr, RawChannelTrace, F128,
 };
 use crate::accumulator::ChainAccumulator;
 use crate::block_certificate_backend::{
@@ -203,36 +199,6 @@ fn pin_u64_successor(b: &mut FieldR1csBuilder, parent: &LinExpr, child: &LinExpr
     pin_eq(b, child, &recon);
 }
 
-/// `a + c` as an INTEGER (ripple-carry full adder over `n` tower bits). Both
-/// operands are range-checked `< 2^n` and the final carry is pinned to zero (no
-/// overflow), so the reconstruction is exactly the integer sum. Field addition
-/// alone is XOR in GF(2^128), which is NOT integer addition once a carry occurs.
-fn u64_add(b: &mut FieldR1csBuilder, a: &LinExpr, c: &LinExpr, n: usize) -> LinExpr {
-    let a_bits = range_check_bits(b, a, n);
-    let c_bits = range_check_bits(b, c, n);
-    let mut carry = LinExpr::zero();
-    let mut terms: Vec<LinExpr> = Vec::with_capacity(n);
-    for i in 0..n {
-        let ai = LinExpr::from_wire(a_bits[i]);
-        let ci = LinExpr::from_wire(c_bits[i]);
-        // sum_i = a_i XOR c_i XOR carry_i.
-        let sum_i = ai.add(&ci).add(&carry);
-        terms.push(sum_i.scale(flat_const(1u128 << i)));
-        // carry_{i+1} = a_i·c_i + carry_i·(a_i XOR c_i)  (the full-adder majority;
-        // the two products are never both 1, so the char-2 add IS the OR).
-        let ai_ci = mul(b, &ai, &ci);
-        let axc = ai.add(&ci);
-        let carry_axc = mul(b, &carry, &axc);
-        carry = ai_ci.add(&carry_axc);
-    }
-    pin_zero(b, &carry);
-    let mut recon = LinExpr::zero();
-    for t in &terms {
-        recon = recon.add(t);
-    }
-    recon
-}
-
 /// `Σ terms` as an INTEGER. A single term is returned unchanged (no adder wires),
 /// so a single-tx block reproduces the former single-count path exactly; K terms
 /// cost K−1 ripple-carry adds. 16 bits hold any block total (≤ 255·255 < 2^16).
@@ -243,7 +209,7 @@ fn pin_u64_sum(b: &mut FieldR1csBuilder, terms: &[LinExpr]) -> LinExpr {
         Some((first, rest)) => {
             let mut acc = first.clone();
             for t in rest {
-                acc = u64_add(b, &acc, t, N);
+                acc = integer_add_no_overflow(b, &acc, t, N);
             }
             acc
         }
@@ -703,6 +669,67 @@ fn scratch_spine_region_data(
     spine_region_data_from_wires(pb, natives, native_hashes, &inputs_t, &tx_hashes)
 }
 
+/// Bind the Tx8x2 L0 domain anchor for every real body and fix every padded
+/// body to the complete canonical ghost statement.
+fn bind_tx_epoch_anchors(
+    b: &mut FieldR1csBuilder,
+    start: &AccumulatorWires,
+    spine_inputs: &[SpineInputsTrace],
+    n_real_txs: usize,
+    tx_delta: usize,
+    capacity_live_bits: Option<&[LinExpr]>,
+) {
+    assert!(tx_delta <= 1);
+    assert!(n_real_txs <= spine_inputs.len());
+    assert!(tx_delta <= n_real_txs);
+    const L0: usize = noid_tx::body_hash::TX8X2_LEAF_EPOCH_ANCHOR;
+
+    if tx_delta == 1 {
+        for lane in 0..2 {
+            pin_eq(
+                b,
+                &spine_inputs[0].leaves[L0][lane],
+                &start.tip_block_id[lane],
+            );
+        }
+    }
+    match capacity_live_bits {
+        None => {
+            assert_eq!(n_real_txs, spine_inputs.len());
+            for spine in &spine_inputs[tx_delta..] {
+                for lane in 0..2 {
+                    pin_eq(b, &spine.leaves[L0][lane], &start.epoch_anchor_id[lane]);
+                }
+            }
+        }
+        Some(live_bits) => {
+            assert_eq!(spine_inputs.len(), tx_delta + live_bits.len());
+            let ghost = noid_gkr::spine_statement::spine_inputs_from_body(
+                &noid_gkr::ghost_tx::ghost_tx_body(),
+            );
+            // Every capacity slot gets the exact same rows. `live` selects a
+            // real user epoch anchor; `1+live` selects the complete canonical
+            // ghost body. No branch depends on the block's real tx count.
+            for (spine, live) in spine_inputs[tx_delta..].iter().zip(live_bits) {
+                for lane in 0..2 {
+                    let epoch_diff = spine.leaves[L0][lane].add(&start.epoch_anchor_id[lane]);
+                    let gated = mul(b, live, &epoch_diff);
+                    pin_zero(b, &gated);
+                }
+                let dead = live.add_const(F128::ONE);
+                for leaf in 0..noid_tx::body_hash::BODY_HASH_LEAVES {
+                    for lane in 0..2 {
+                        let ghost_diff =
+                            spine.leaves[leaf][lane].add(&const_block(ghost.leaves[leaf][lane]));
+                        let gated = mul(b, &dead, &ghost_diff);
+                        pin_zero(b, &gated);
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Assembly
 // ---------------------------------------------------------------------------
@@ -1014,6 +1041,11 @@ pub fn build_block_slots_with_config(
         );
     }
     pin_eq(b, &claim.fields[parent + hc::HEIGHT], &start_acc.height);
+    pin_eq(
+        b,
+        &claim.fields[parent + hc::LOG_SLOTS],
+        &start_acc.log_slots,
+    );
     // Consensus-counter continuity: the START accumulator carries the
     // PARENT header's counters (the claim transcript's parent section) and
     // the END accumulator this header's child counters — the link chain
@@ -1036,12 +1068,6 @@ pub fn build_block_slots_with_config(
         &header.fields[hf::ACTIVE_SLOT_COUNT],
     );
     pin_eq(b, &end_acc.alloc_counter, &header.fields[hf::ALLOC_COUNTER]);
-    // First block height = start height + 1 (INTEGER successor). Field
-    // addition is XOR, so a naive `child + parent + 1 = 0` would only be
-    // the integer increment when the parent height is even; this is a
-    // proper ripple-carry increment over the tower-bit decompositions.
-    pin_u64_successor(b, &start_acc.height, &header.fields[hf::HEIGHT]);
-
     crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: claim-hash killshot+[D]");
     // ---- Tx8x2 body-spine component. Region mode moves the whole final
     // 31-permutation-per-tx replay onto the shared walk A (compress tree +
@@ -1140,6 +1166,18 @@ pub fn build_block_slots_with_config(
             pin_zero(b, &t);
         }
     }
+
+    // Coinbase L0 = parent tip. In a capacity class every user slot gets the
+    // same live/ghost gated relation; the non-capacity path pins all real L0s
+    // directly.
+    bind_tx_epoch_anchors(
+        b,
+        &start_acc,
+        &spine_inputs,
+        n_real_txs,
+        tx_delta,
+        config.tier_user_tx_capacity.map(|_| live_bits.as_slice()),
+    );
 
     crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: liveness bits");
     // ---- tx_root component: paths for the REAL leaves, position-pinned.
@@ -1477,39 +1515,36 @@ pub fn build_block_slots_with_config(
     let live_sum = pin_u64_sum(b, &live_lens);
     pin_eq(b, &claim.fields[claim_layout::LIVE_INPUT_COUNT], &live_sum);
     crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: count sums");
-    // ---- accepted-claim batch fold (claim part): shared statement wires,
-    // no re-allocation — extend(state_root, block_id, height, claim).
-    let steps = vec![ClaimBatchStepWires {
+    // ---- Direct ten-lane accumulator transition. The child header is the
+    // sole transition statement; there is no rolling claim/hash fold.
+    let child = DirectChildWires {
         block_id: header.expected_block_id.clone(),
-        chain_claim: claim.expected_claim.clone(),
+        prev_block_hash: [
+            header.fields[hf::PREV_BLOCK_HASH].clone(),
+            header.fields[hf::PREV_BLOCK_HASH + 1].clone(),
+        ],
         state_root: [
             header.fields[hf::STATE_ROOT].clone(),
             header.fields[hf::STATE_ROOT + 1].clone(),
         ],
         height: header.fields[hf::HEIGHT].clone(),
-    }];
-    build_accepted_claim_batch_claim_slot(b, &start_acc, &steps, &end_acc);
-
-    // ---- checkpoint_poseidon component over the SAME wires.
-    let chain_inputs_t = ChainAccumulatorBatchInputsTrace {
-        start_chain_hash: start_acc.chain_hash.clone(),
-        items: vec![ChainAccumulatorItemTrace {
-            block_id: header.expected_block_id.clone(),
-            chain_claim: claim.expected_claim.clone(),
-        }],
-        expected_chain_hash: end_acc.chain_hash.clone(),
+        log_slots: header.fields[hf::LOG_SLOTS].clone(),
+        active_slot_count: header.fields[hf::ACTIVE_SLOT_COUNT].clone(),
+        alloc_counter: header.fields[hf::ALLOC_COUNTER].clone(),
     };
-    let header_slice = [header];
+    build_direct_accumulator_transition_slot(b, &start_acc, &child, &end_acc);
+
+    // ---- Header-hash checkpoint component over the SAME wires. The former
+    // chain-accumulator killshot leg is gone: continuity is the direct
+    // arithmetic relation above.
     build_checkpoint_poseidon_slot_with_inputs(
         b,
         &proof.checkpoint_poseidon,
-        &header_slice,
-        &chain_inputs_t,
+        std::slice::from_ref(&header),
         1,
     );
-    let [header] = header_slice;
 
-    crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: claim fold + checkpoint");
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: direct accumulator + header hash");
 
     BlockSlots {
         header,
@@ -1727,4 +1762,110 @@ pub fn region_wallet_pcs_native(
         out.push((c.native_point, c.native_value));
     }
     out
+}
+
+#[cfg(test)]
+mod tx_epoch_anchor_tests {
+    use super::*;
+    use noid_core::TowerField;
+
+    fn start_accumulator() -> ChainAccumulator {
+        ChainAccumulator {
+            height: 143,
+            tip_block_id: [0x11; 32],
+            state_root: [0x22; 32],
+            log_slots: 24,
+            active_slot_count: 7,
+            alloc_counter: 9,
+            epoch_anchor_id: [0x33; 32],
+        }
+    }
+
+    fn bodies(start: &ChainAccumulator) -> Vec<SpineInputs> {
+        let mut coinbase = SpineInputs {
+            leaves: [[Block128::ZERO; 2]; noid_tx::body_hash::BODY_HASH_LEAVES],
+        };
+        coinbase.leaves[noid_tx::body_hash::TX8X2_LEAF_EPOCH_ANCHOR] =
+            digest_lanes(&start.tip_block_id);
+        let mut user = SpineInputs {
+            leaves: [[Block128::ZERO; 2]; noid_tx::body_hash::BODY_HASH_LEAVES],
+        };
+        user.leaves[noid_tx::body_hash::TX8X2_LEAF_EPOCH_ANCHOR] =
+            digest_lanes(&start.epoch_anchor_id);
+        let ghost =
+            noid_gkr::spine_statement::spine_inputs_from_body(&noid_gkr::ghost_tx::ghost_tx_body());
+        vec![coinbase, user, ghost]
+    }
+
+    fn build_relation(
+        start: &ChainAccumulator,
+        bodies: &[SpineInputs],
+        real_users: usize,
+    ) -> (noid_ivc_core::field_r1cs::FieldR1cs, Vec<F128>) {
+        assert_eq!(bodies.len(), 3, "test tier has coinbase + two user slots");
+        assert!(real_users <= 2);
+        let mut b = FieldR1csBuilder::new();
+        let start = AccumulatorWires::alloc(&mut b, start);
+        let traces: Vec<_> = bodies
+            .iter()
+            .map(|body| SpineInputsTrace::alloc(&mut b, body))
+            .collect();
+        let live_bits: Vec<_> = (0..2)
+            .map(|i| alloc_block(&mut b, Block128::from(u128::from(i < real_users))))
+            .collect();
+        for live in &live_bits {
+            let square = mul(&mut b, live, live);
+            pin_eq(&mut b, &square, live);
+        }
+        bind_tx_epoch_anchors(&mut b, &start, &traces, 1 + real_users, 1, Some(&live_bits));
+        b.build()
+    }
+
+    fn satisfies(start: &ChainAccumulator, bodies: &[SpineInputs], real_users: usize) -> bool {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let (r1cs, witness) = build_relation(start, bodies, real_users);
+            r1cs.satisfies(&witness)
+        }))
+        .unwrap_or(false)
+    }
+
+    #[test]
+    fn coinbase_user_and_ghost_anchor_recombination() {
+        let start = start_accumulator();
+        let honest = bodies(&start);
+        assert!(satisfies(&start, &honest, 1));
+
+        for (body, leaf, lane) in [
+            (0usize, noid_tx::body_hash::TX8X2_LEAF_EPOCH_ANCHOR, 0usize),
+            (1, noid_tx::body_hash::TX8X2_LEAF_EPOCH_ANCHOR, 1),
+            (2, noid_tx::body_hash::TX8X2_LEAF_FEE, 0),
+            (2, noid_tx::body_hash::TX8X2_LEAF_EPOCH_ANCHOR, 1),
+        ] {
+            let mut bad = honest.clone();
+            bad[body].leaves[leaf][lane] += Block128::ONE;
+            assert!(
+                !satisfies(&start, &bad, 1),
+                "body {body} leaf {leaf} lane {lane} recombination accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn capacity_matrix_is_identical_across_real_user_counts() {
+        let start = start_accumulator();
+        let one_user = bodies(&start);
+        let mut two_users = one_user.clone();
+        two_users[2] = SpineInputs {
+            leaves: [[Block128::ZERO; 2]; noid_tx::body_hash::BODY_HASH_LEAVES],
+        };
+        two_users[2].leaves[noid_tx::body_hash::TX8X2_LEAF_EPOCH_ANCHOR] =
+            digest_lanes(&start.epoch_anchor_id);
+
+        let (one_r1cs, one_witness) = build_relation(&start, &one_user, 1);
+        let (two_r1cs, two_witness) = build_relation(&start, &two_users, 2);
+        assert!(one_r1cs.satisfies(&one_witness));
+        assert!(two_r1cs.satisfies(&two_witness));
+        assert_eq!(one_r1cs.statement_digest(), two_r1cs.statement_digest());
+        assert_eq!(one_r1cs.useful_rows, two_r1cs.useful_rows);
+    }
 }

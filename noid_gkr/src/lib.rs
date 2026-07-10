@@ -18,7 +18,6 @@ pub mod accepted_claim_killshot;
 pub mod auth_pcs;
 pub mod batch_eval;
 pub mod block_spine;
-pub mod chain_accumulator_killshot;
 pub mod circuit;
 pub mod fixed_field_hash_killshot;
 pub mod ghost_tx;
@@ -58,13 +57,6 @@ pub use block_spine::{
     BlockSpineMle, BlockSpineProof, BlockSpineReductions, BlockSpineShiftProof,
     BlockSpineShiftReduction, BlockSpineUnifiedProof, BlockSpineUnifiedReduction,
     BLOCK_SPINE_ROUND_DEGREE, BLOCK_SPINE_SHIFT_DEGREE,
-};
-pub use chain_accumulator_killshot::{
-    discharge_chain_accumulator_reductions_native,
-    discharge_chain_accumulator_reductions_native_padded, prove_chain_accumulator_killshot,
-    prove_chain_accumulator_killshot_padded, verify_chain_accumulator_killshot,
-    verify_chain_accumulator_killshot_padded, ChainAccumulatorBatchInputs, ChainAccumulatorItem,
-    ChainAccumulatorProofKillShot, ChainAccumulatorReductions,
 };
 pub use circuit::{SlotDescriptor, SpineCircuit, SpineInputs};
 pub use fixed_field_hash_killshot::{

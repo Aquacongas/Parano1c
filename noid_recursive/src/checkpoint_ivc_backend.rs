@@ -15,13 +15,14 @@
 //! backend. It must not replay transaction-shaped retained component lists
 //! inside history aggregation.
 
+use noid_chain::BlockHeader;
 use noid_core::Block128;
 use noid_ivc_prover::challenger::{Challenger, FsChallenger};
 use noid_ivc_prover::pcs::{ligerito::LigeritoProfile, pack_witness, PcsParams};
 use noid_ivc_prover::proof_io::R1csProofBundle;
 use noid_ivc_prover::r1cs::{BlockR1cs, SparseBinaryMatrix};
 use noid_poseidon2b::native::poseidon2b_hash_byte_slices;
-use noid_poseidon2b::primitives::Digest;
+use noid_poseidon2b::primitives::{Address, Digest};
 
 use crate::accepted_batch::{
     accepted_claim_batch_digest, accepted_claim_batch_digest_from_hash_fields,
@@ -31,7 +32,7 @@ use crate::accepted_batch::{
     ACCEPTED_CLAIM_BATCH_DIGEST_CONSENSUS_FIELDS, ACCEPTED_CLAIM_BATCH_DIGEST_HASH_FIELDS,
     ACCEPTED_CLAIM_BATCH_DIGEST_HEADER_WITNESS_FIELDS, ACCEPTED_CLAIM_BATCH_DIGEST_SLOT_FIELDS,
 };
-use crate::accumulator::ChainAccumulator;
+use crate::accumulator::{ChainAccumulator, ChainAccumulatorAdvanceError};
 use crate::block_certificate::{
     accepted_block_certificate_batch_statement, accepted_block_certificate_receipt,
     accepted_block_certificate_receipt_chain_claim, accepted_block_receipt_projection_handle,
@@ -47,6 +48,7 @@ use crate::checkpoint_proof::{
     verify_history_checkpoint_step_statement_native, HistoryCheckpointProofError,
     HistoryCheckpointStepStatement, HISTORY_CHECKPOINT_BATCH_TARGET_BLOCKS,
 };
+use crate::pow_header::HeaderWitness;
 
 pub const HISTORY_CHECKPOINT_IVC_CHUNK_CORE_RELATION: u32 = 1;
 /// DoS cap on the serialized chunk-core proof. Sized for the FieldR1cs
@@ -136,6 +138,10 @@ pub enum HistoryCheckpointIvcChunkCoreError {
     CertificateStatementMismatch {
         index: usize,
     },
+    AccumulatorAdvance {
+        index: usize,
+        source: ChainAccumulatorAdvanceError,
+    },
     CoreUnsatisfied {
         row: usize,
     },
@@ -200,6 +206,9 @@ impl std::fmt::Display for HistoryCheckpointIvcChunkCoreError {
             Self::ComponentShapeMismatch => write!(f, "checkpoint IVC component shape mismatch"),
             Self::CertificateStatementMismatch { index } => {
                 write!(f, "checkpoint IVC certificate mismatch at {index}")
+            }
+            Self::AccumulatorAdvance { index, source } => {
+                write!(f, "checkpoint IVC accumulator advance failed at {index}: {source:?}")
             }
             Self::CoreUnsatisfied { row } => {
                 write!(f, "checkpoint IVC core witness does not satisfy row {row}")
@@ -293,7 +302,7 @@ pub fn prove_history_checkpoint_ivc_chunk_receipt_handle_core(
         &statement.batch_summary.start_accumulator,
         certificate_receipts,
         accepted_claim_witness,
-    );
+    )?;
     checkpoint_ivc_trace_step(trace, &mut trace_mark, "build_witness");
     let assert_r1cs = checkpoint_ivc_assert_r1cs_enabled();
     if assert_r1cs {
@@ -498,7 +507,7 @@ fn validate_private_chunk_inputs(
     }
 
     let mut accumulator = statement.batch_summary.start_accumulator.clone();
-    let mut previous_block_id = statement.batch_summary.start_consensus.block_id;
+    let mut previous_block_id = accumulator.tip_block_id;
     for (index, (receipt, header_witness)) in certificate_receipts
         .iter()
         .zip(accepted_claim_witness.headers.iter())
@@ -518,14 +527,11 @@ fn validate_private_chunk_inputs(
         {
             return Err(HistoryCheckpointIvcChunkCoreError::CertificateStatementMismatch { index });
         }
-        accumulator = accumulator.extend(
-            header_witness.header.state_root,
-            header_witness.block_id,
-            header_witness.header.height,
-            accepted_claim_witness.accepted_block_claims[index],
-            header_witness.header.active_slot_count,
-            header_witness.header.alloc_counter,
-        );
+        accumulator = accumulator
+            .advance(&header_witness.header)
+            .map_err(
+                |source| HistoryCheckpointIvcChunkCoreError::AccumulatorAdvance { index, source },
+            )?;
         previous_block_id = header_witness.block_id;
     }
     if accumulator != accepted_claim_output.accumulator {
@@ -617,19 +623,20 @@ fn validate_public_accepted_claim_digest_fields(
 
     let accumulator = &statement.batch_summary.end_accumulator;
     let accumulator_offset = 4 + ACCEPTED_CLAIM_BATCH_DIGEST_CONSENSUS_FIELDS;
-    if fields[accumulator_offset] != Block128::from(accumulator.height as u128)
-        || fields[accumulator_offset + 1..accumulator_offset + 3]
-            != digest_fields(&accumulator.state_root)
-        || fields[accumulator_offset + 3..accumulator_offset + 5]
-            != digest_fields(&accumulator.chain_hash)
-        || fields[accumulator_offset + 5]
-            != Block128::from(accumulator.active_slot_count as u128)
-        || fields[accumulator_offset + 6] != Block128::from(accumulator.alloc_counter as u128)
+    if fields
+        [accumulator_offset..accumulator_offset + ACCEPTED_CLAIM_BATCH_DIGEST_ACCUMULATOR_FIELDS]
+        != accumulator.to_lanes()
     {
         return Err(HistoryCheckpointIvcChunkCoreError::AcceptedClaimOutputMismatch);
     }
 
     let slots_offset = accumulator_offset + ACCEPTED_CLAIM_BATCH_DIGEST_ACCUMULATOR_FIELDS;
+    validate_public_direct_accumulator_transition(
+        statement,
+        certificate_receipts,
+        fields,
+        slots_offset,
+    )?;
     for (index, receipt) in certificate_receipts.iter().enumerate() {
         let slot_offset = slots_offset + index * ACCEPTED_CLAIM_BATCH_DIGEST_SLOT_FIELDS;
         let block_id_offset = slot_offset + ACCEPTED_CLAIM_BATCH_DIGEST_HEADER_WITNESS_FIELDS - 4;
@@ -642,6 +649,88 @@ fn validate_public_accepted_claim_digest_fields(
         }
     }
     Ok(())
+}
+
+/// Public-verifier twin of the final direct accumulator relation.
+///
+/// The fixed accepted-claim digest preimage already carries every canonical
+/// header field. Reconstructing and verifying those headers here binds all ten
+/// accumulator lanes, including log/counters/epoch, instead of trusting the
+/// prover-side native replay. The batch is capped at sixteen, so this remains
+/// constant verifier work independent of chain length.
+fn validate_public_direct_accumulator_transition(
+    statement: &HistoryCheckpointStepStatement,
+    certificate_receipts: &[AcceptedBlockCertificateReceipt],
+    fields: &[Block128],
+    slots_offset: usize,
+) -> Result<(), HistoryCheckpointIvcChunkCoreError> {
+    let mut accumulator = statement.batch_summary.start_accumulator.clone();
+    for (index, receipt) in certificate_receipts.iter().enumerate() {
+        let slot = slots_offset + index * ACCEPTED_CLAIM_BATCH_DIGEST_SLOT_FIELDS;
+        let pow_fields: [Block128; noid_chain::consensus::pow::POW_HEADER_FIELD_COUNT] = fields
+            [slot..slot + noid_chain::consensus::pow::POW_HEADER_FIELD_COUNT]
+            .try_into()
+            .expect("accepted-claim header schedule has a fixed width");
+        let digests = slot + noid_chain::consensus::pow::POW_HEADER_FIELD_COUNT;
+        let pow_digest = digest_from_field_pair(&fields[digests..digests + 2]);
+        let block_id = digest_from_field_pair(&fields[digests + 2..digests + 4]);
+        let target = digest_from_field_pair(&fields[digests + 4..digests + 6]);
+        let header = block_header_from_pow_fields(&pow_fields)
+            .ok_or(HistoryCheckpointIvcChunkCoreError::CertificateStatementMismatch { index })?;
+        let witness = HeaderWitness {
+            header,
+            pow_fields,
+            pow_digest,
+            block_id,
+            target,
+        };
+        witness.verify().map_err(|_| {
+            HistoryCheckpointIvcChunkCoreError::CertificateStatementMismatch { index }
+        })?;
+        if receipt.height != witness.header.height
+            || receipt.block_id != witness.block_id
+            || receipt.parent_block_id != witness.header.prev_block_hash
+            || receipt.parent_block_id != accumulator.tip_block_id
+            || receipt.parent_state_root != accumulator.state_root
+            || receipt.child_state_root != witness.header.state_root
+            || receipt.tx_root != witness.header.tx_root
+        {
+            return Err(HistoryCheckpointIvcChunkCoreError::CertificateStatementMismatch { index });
+        }
+        accumulator = accumulator.advance(&witness.header).map_err(|source| {
+            HistoryCheckpointIvcChunkCoreError::AccumulatorAdvance { index, source }
+        })?;
+    }
+    if accumulator != statement.batch_summary.end_accumulator {
+        return Err(HistoryCheckpointIvcChunkCoreError::AcceptedClaimOutputMismatch);
+    }
+    Ok(())
+}
+
+fn block_header_from_pow_fields(
+    fields: &[Block128; noid_chain::consensus::pow::POW_HEADER_FIELD_COUNT],
+) -> Option<BlockHeader> {
+    Some(BlockHeader {
+        prev_block_hash: digest_from_field_pair(&fields[0..2]),
+        state_root: digest_from_field_pair(&fields[2..4]),
+        tx_root: digest_from_field_pair(&fields[4..6]),
+        timestamp: u64::try_from(fields[6].to_u128()).ok()?,
+        height: u64::try_from(fields[7].to_u128()).ok()?,
+        miner_address: Address(digest_from_field_pair(&fields[8..10])),
+        nonce: fields[10].to_u128(),
+        difficulty_target: digest_from_field_pair(&fields[11..13]),
+        log_slots: u32::try_from(fields[13].to_u128()).ok()?,
+        active_slot_count: u64::try_from(fields[14].to_u128()).ok()?,
+        alloc_counter: u64::try_from(fields[15].to_u128()).ok()?,
+    })
+}
+
+fn digest_from_field_pair(fields: &[Block128]) -> Digest {
+    debug_assert_eq!(fields.len(), 2);
+    let mut digest = [0u8; 32];
+    digest[..16].copy_from_slice(&fields[0].to_u128().to_le_bytes());
+    digest[16..].copy_from_slice(&fields[1].to_u128().to_le_bytes());
+    digest
 }
 
 fn build_chunk_core_r1cs(
@@ -720,7 +809,7 @@ fn build_chunk_core_r1cs(
         &mut a_rows,
         &mut b_rows,
         slot_base(0) + PREV_BLOCK,
-        &statement.batch_summary.start_consensus.block_id,
+        &statement.batch_summary.start_accumulator.tip_block_id,
     );
     let last = slot_base(chunk_len - 1);
     pin_u64(
@@ -739,7 +828,7 @@ fn build_chunk_core_r1cs(
         &mut a_rows,
         &mut b_rows,
         last + HEADER_BLOCK,
-        &statement.batch_summary.end_consensus.block_id,
+        &statement.batch_summary.end_accumulator.tip_block_id,
     );
 
     let digest_cache = std::sync::OnceLock::new();
@@ -885,7 +974,7 @@ fn chunk_core_witness(
     start_accumulator: &ChainAccumulator,
     certificate_receipts: &[AcceptedBlockCertificateReceipt],
     accepted_claim_witness: &AcceptedClaimBatchWitness,
-) -> Vec<bool> {
+) -> Result<Vec<bool>, HistoryCheckpointIvcChunkCoreError> {
     let mut witness = vec![false; 1usize << CHUNK_M];
     witness[CONST_ONE] = true;
 
@@ -896,14 +985,11 @@ fn chunk_core_witness(
         let receipt = &certificate_receipts[index];
         let header_witness = &accepted_claim_witness.headers[index];
         let claim = accepted_claim_witness.accepted_block_claims[index];
-        let next_accumulator = accumulator.extend(
-            header_witness.header.state_root,
-            header_witness.block_id,
-            header_witness.header.height,
-            claim,
-            header_witness.header.active_slot_count,
-            header_witness.header.alloc_counter,
-        );
+        let next_accumulator = accumulator
+            .advance(&header_witness.header)
+            .map_err(
+                |source| HistoryCheckpointIvcChunkCoreError::AccumulatorAdvance { index, source },
+            )?;
 
         write_u64_bits(&mut witness, base + PREV_HEIGHT, accumulator.height);
         write_u64_bits(&mut witness, base + CERT_HEIGHT, receipt.height);
@@ -963,7 +1049,7 @@ fn chunk_core_witness(
         accumulator = next_accumulator;
         previous_block_id = header_witness.block_id;
     }
-    witness
+    Ok(witness)
 }
 
 fn receipts_and_handles_from_certificate_statements(
@@ -1233,6 +1319,7 @@ mod tests {
     use super::*;
     use noid_chain::consensus::difficulty::{add_work, block_work};
     use noid_chain::consensus::params::{BLOCK_TIME, MAX_TARGET};
+    use noid_chain::consensus::{genesis_header, GENESIS_TIMESTAMP};
     use noid_chain::header_anchor::HeaderChainAnchor;
     use noid_poseidon2b::primitives::Address;
 
@@ -1323,7 +1410,7 @@ mod tests {
                 &fixture.certificate_batch_statement,
                 &bad_receipt_projection,
             ),
-            Err(HistoryCheckpointIvcChunkCoreError::CoreVerify)
+            Err(HistoryCheckpointIvcChunkCoreError::CertificateStatementMismatch { index: 0 })
         ));
 
         let mut bad_digest_fields = proof;
@@ -1388,6 +1475,50 @@ mod tests {
         .expect("verify short chunk core");
     }
 
+    #[test]
+    fn public_direct_accumulator_validator_binds_all_ten_end_lanes() {
+        let fixture = chunk_fixture_with_len(1);
+        let fields = accepted_claim_batch_digest_hash_fields(
+            &fixture.accepted_claim_witness,
+            &fixture.accepted_claim_output,
+        )
+        .expect("canonical accepted-claim fields");
+        let receipts = fixture
+            .certificate_statements
+            .iter()
+            .map(accepted_block_certificate_receipt)
+            .collect::<Vec<_>>();
+        let slots_offset = 4
+            + ACCEPTED_CLAIM_BATCH_DIGEST_CONSENSUS_FIELDS
+            + ACCEPTED_CLAIM_BATCH_DIGEST_ACCUMULATOR_FIELDS;
+        validate_public_direct_accumulator_transition(
+            &fixture.statement,
+            &receipts,
+            &fields,
+            slots_offset,
+        )
+        .expect("honest direct accumulator transition");
+
+        for lane in 0..crate::accumulator::CHAIN_ACCUMULATOR_LANES {
+            let mut bad = fixture.statement.clone();
+            let mut lanes = bad.batch_summary.end_accumulator.to_lanes();
+            lanes[lane] += Block128::from(1u128);
+            bad.batch_summary.end_accumulator = ChainAccumulator::from_lanes(lanes).unwrap();
+            assert!(
+                matches!(
+                    validate_public_direct_accumulator_transition(
+                        &bad,
+                        &receipts,
+                        &fields,
+                        slots_offset,
+                    ),
+                    Err(HistoryCheckpointIvcChunkCoreError::AcceptedClaimOutputMismatch)
+                ),
+                "end accumulator lane {lane} was not transition-bound"
+            );
+        }
+    }
+
     struct ChunkFixture {
         statement: HistoryCheckpointStepStatement,
         certificate_batch_statement: AcceptedBlockCertificateBatchStatement,
@@ -1402,7 +1533,7 @@ mod tests {
 
     fn chunk_fixture_with_len(chunk_len: usize) -> ChunkFixture {
         assert!((1..=CHUNK_CAPACITY).contains(&chunk_len));
-        let start_header = test_header([0u8; 32], [1u8; 32], 0);
+        let start_header = genesis_header();
         let mut consensus = RecursiveConsensusState::from_header(
             &start_header,
             block_work(&start_header.difficulty_target),
@@ -1413,14 +1544,12 @@ mod tests {
             &[start_header.active_slot_count],
         );
         let start_consensus = consensus.clone();
-        let start_accumulator = ChainAccumulator {
-            height: start_header.height,
-            state_root: start_header.state_root,
-            chain_hash: [0u8; 32],
-            active_slot_count: start_header.active_slot_count,
-            alloc_counter: start_header.alloc_counter,
-        };
-        let start_anchor = anchor_from_consensus(&start_consensus, start_header.tx_root);
+        let start_accumulator = crate::accumulator::genesis_accumulator();
+        let start_anchor = noid_chain::header_anchor::compute_header_chain_anchor(
+            std::iter::once(&start_header),
+            start_consensus.cumulative_chainwork,
+        )
+        .expect("canonical genesis anchor");
 
         let mut accumulator = start_accumulator.clone();
         let mut previous_block_id = start_consensus.block_id;
@@ -1469,14 +1598,9 @@ mod tests {
             consensus.active_slot_count = header.active_slot_count;
             consensus.alloc_counter = header.alloc_counter;
 
-            accumulator = accumulator.extend(
-                header.state_root,
-                header_witness.block_id,
-                height,
-                claim,
-                header.active_slot_count,
-                header.alloc_counter,
-            );
+            accumulator = accumulator
+                .advance(&header)
+                .expect("fixture header advances accumulator");
             previous_block_id = header_witness.block_id;
             headers.push(header_witness);
             claims.push(claim);
@@ -1555,7 +1679,7 @@ mod tests {
             prev_block_hash,
             state_root,
             tx_root: digest_with_seed(0x10 | (height as u8)),
-            timestamp: 1_767_225_600 + height * BLOCK_TIME,
+            timestamp: GENESIS_TIMESTAMP + height * BLOCK_TIME,
             height,
             miner_address: Address([0x44; 32]),
             nonce: height as u128,

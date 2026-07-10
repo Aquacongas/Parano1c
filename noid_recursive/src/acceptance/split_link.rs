@@ -41,7 +41,7 @@
 //! previous link's exposed block accumulator (or the class's genesis
 //! accumulator under `g = 1`), and its `end_acc` is pinned to this
 //! link's own block-accumulator IO. Block-internal transition validity
-//! (state roots, heights, the chain hash) is the block class's job.
+//! (tip, state, depth, counters and epoch) is the block class's job.
 //!
 //! The decider verifies the tip natively against its published class
 //! matrix, pins the whitelist lanes to the true link-class digests,
@@ -62,8 +62,8 @@ use noid_ivc_core::public_io::{PublicIoSpec, WitnessSlice};
 
 use super::block_class::{BlockClass, BLOCK_IO_END_ACC, BLOCK_IO_START_ACC};
 use super::link::{
-    block_acc_lanes, genesis_baked_claim_value, genesis_instance, genesis_witness,
-    LinkEnvelope, RegionFrozenClaim,
+    block_acc_lanes, genesis_baked_claim_value, genesis_instance, genesis_witness, LinkEnvelope,
+    RegionFrozenClaim,
 };
 use super::trace::matrix_fold::{
     verify_matrix_claim_fold_trace, MatrixAccClaimTrace, MatrixFoldProofTrace,
@@ -72,11 +72,12 @@ use super::trace::r_pcs_region::{
     alloc_r_pcs_columns, discharge_r_pcs_via_region, r_pcs_region_native, RPcsProof,
 };
 use super::trace::self_verify::{
-    alloc_flat_digest, flat_digest_lanes, verify_field_trace_deferred_region,
-    FieldR1csProofTrace, FlatDigestExpr, PcsWalkObligations,
+    alloc_flat_digest, flat_digest_lanes, verify_field_trace_deferred_region, FieldR1csProofTrace,
+    FlatDigestExpr, PcsWalkObligations,
 };
 use super::trace::{mul, pin_eq};
-use crate::accumulator::ChainAccumulator;
+use crate::accumulator::{genesis_accumulator, ChainAccumulator, ChainAccumulatorLaneError};
+use noid_core::Block128;
 use noid_ivc_core::public_io::IoClaimSpec;
 use noid_ivc_prover::field_prover::prove_field_with_public_io;
 
@@ -225,7 +226,7 @@ pub struct SplitLinkClass {
     pub genesis: FieldR1cs,
     pub genesis_digest: [u8; 32],
     /// The block accumulator a genesis link's block must start from.
-    pub genesis_block_accumulator: ChainAccumulator,
+    genesis_block_accumulator: ChainAccumulator,
     pub ladder: Vec<LadderSlotInfo>,
     /// This class's ladder slot (selects the hosted block class).
     pub slot: usize,
@@ -263,20 +264,26 @@ impl SplitLinkClass {
     pub fn freeze(
         shape: FieldShape,
         pcs_params: PcsParams,
-        genesis_block_accumulator: ChainAccumulator,
         ladder: Vec<LadderSlotInfo>,
         slot: usize,
         block_class: &BlockClass,
         sample_block: &LinkEnvelope,
         block_matrix: &FieldR1cs,
     ) -> Self {
+        let genesis_block_accumulator = genesis_accumulator();
         assert!(slot < ladder.len(), "slot out of ladder");
-        assert_eq!(ladder[slot].b_shape, block_class.shape, "slot shape vs block class");
+        assert_eq!(
+            ladder[slot].b_shape, block_class.shape,
+            "slot shape vs block class"
+        );
         let b_digest = *block_class
             .class_statement_digest
             .get()
             .expect("block class digest requires one real block build");
-        assert_eq!(ladder[slot].b_digest, b_digest, "slot digest vs block class");
+        assert_eq!(
+            ladder[slot].b_digest, b_digest,
+            "slot digest vs block class"
+        );
         let genesis = genesis_instance(&shape);
         // statement_digest() also warms the instance's digest cache, so
         // every T prove reads it instead of re-hashing the serialization.
@@ -309,13 +316,19 @@ impl SplitLinkClass {
         ]);
         let arities: Vec<usize> = probe.iter().map(|(pt, _)| pt.len()).collect();
         let max_arity = arities.iter().copied().max().unwrap_or(0);
-        assert!(!arities.is_empty(), "walk discharge produced no opening claims");
+        assert!(
+            !arities.is_empty(),
+            "walk discharge produced no opening claims"
+        );
 
         // ---- Phase 2: placeholder spec + freeze-mode genesis build.
         let placeholders: Vec<RegionFrozenClaim> = arities
             .iter()
             .map(|&a| RegionFrozenClaim {
-                slice: WitnessSlice { log2_len: a, index: 1 },
+                slice: WitnessSlice {
+                    log2_len: a,
+                    index: 1,
+                },
                 arity: a,
             })
             .collect();
@@ -371,7 +384,11 @@ impl SplitLinkClass {
                 arity: c.point.len(),
             })
             .collect();
-        assert_eq!(frozen.len(), arities.len(), "freeze claim count vs native probe");
+        assert_eq!(
+            frozen.len(),
+            arities.len(),
+            "freeze claim count vs native probe"
+        );
         drop(built);
 
         // ---- Phase 3: the real spec (frozen slices).
@@ -460,9 +477,16 @@ fn build_split_link_inner(
     let b_shape = class.ladder[slot].b_shape;
     assert_eq!(class.spec.io_len, layout.len);
     assert_eq!(input.prev.io.len(), layout.len, "previous envelope IO");
-    assert_eq!(input.block.io.len(), class.b_spec.io_len, "block envelope IO");
+    assert_eq!(
+        input.block.io.len(),
+        class.b_spec.io_len,
+        "block envelope IO"
+    );
     assert_eq!(input.link_class_digests.len(), n, "whitelist size");
-    assert!(input.genesis || input.prev_slot < n, "prev slot out of ladder");
+    assert!(
+        input.genesis || input.prev_slot < n,
+        "prev slot out of ladder"
+    );
 
     // ---- Native pass.
     let mut ch_native = FsLaneChallenger::new(b"history-link-v0");
@@ -550,8 +574,7 @@ fn build_split_link_inner(
             io[lane.live] = F128::ONE;
         } else {
             // Pass-through (T's lanes are zero at genesis).
-            io[lane.point..=lane.live]
-                .copy_from_slice(&input.prev.io[lane.point..=lane.live]);
+            io[lane.point..=lane.live].copy_from_slice(&input.prev.io[lane.point..=lane.live]);
         }
     }
     for (t, lane) in layout.b_lanes.iter().enumerate() {
@@ -560,8 +583,7 @@ fn build_split_link_inner(
             io[lane.value] = acc_block.value;
             io[lane.live] = F128::ONE;
         } else {
-            io[lane.point..=lane.live]
-                .copy_from_slice(&input.prev.io[lane.point..=lane.live]);
+            io[lane.point..=lane.live].copy_from_slice(&input.prev.io[lane.point..=lane.live]);
         }
     }
     io[layout.block_acc..layout.block_acc + super::link::ACC_LANES].copy_from_slice(
@@ -594,7 +616,10 @@ fn build_split_link_inner(
         let stride = class.region_max_arity + 1;
         for (ci, (np, nv)) in region_native.iter().enumerate() {
             let base = layout.region_tail_offset + ci * stride;
-            assert!(np.len() <= class.region_max_arity, "region claim arity over max");
+            assert!(
+                np.len() <= class.region_max_arity,
+                "region claim arity over max"
+            );
             for (kk, &p) in np.iter().enumerate() {
                 io[base + kk] = p;
             }
@@ -789,7 +814,11 @@ fn build_split_link_inner(
                     &acc_link_e.point[j],
                 )
             } else {
-                (&io_cells[lane.value], &prev_io_wires[lane.value], &acc_link_e.value)
+                (
+                    &io_cells[lane.value],
+                    &prev_io_wires[lane.value],
+                    &acc_link_e.value,
+                )
             };
             let delta = fold_v.add(prev_v);
             let picked = mul(&mut b, ba, &delta);
@@ -863,8 +892,7 @@ fn build_split_link_inner(
     // the two link walks; the resulting committed-column opening claims
     // thread through the region tail (frozen-shape asserted + pinned in
     // real builds; the freeze pass returns them for the class to read).
-    let live_region =
-        discharge_r_pcs_via_region(&mut b, r_cols, &[&obs_prev, &obs_block]);
+    let live_region = discharge_r_pcs_via_region(&mut b, r_cols, &[&obs_prev, &obs_block]);
     if !freeze {
         assert_eq!(
             live_region.len(),
@@ -877,7 +905,11 @@ fn build_split_link_inner(
         for (ci, c) in live_region.iter().enumerate() {
             let fc = &class.region_claims[ci];
             assert_eq!(c.slice, fc.slice, "region claim {ci} slice drift (trace)");
-            assert_eq!(c.point.len(), fc.arity, "region claim {ci} arity drift (trace)");
+            assert_eq!(
+                c.point.len(),
+                fc.arity,
+                "region claim {ci} arity drift (trace)"
+            );
             let base = layout.region_tail_offset + ci * stride;
             for (kk, p) in c.point.iter().enumerate() {
                 pin_eq(&mut b, p, &io_cells[base + kk]);
@@ -894,7 +926,10 @@ fn build_split_link_inner(
         "[split-link] build: {used} wires (slot {slot}, genesis={}, freeze={freeze})",
         input.genesis
     );
-    assert!(used <= target, "split link outgrew the class shape: {used} > {target}");
+    assert!(
+        used <= target,
+        "split link outgrew the class shape: {used} > {target}"
+    );
     while b.num_wires() < target {
         b.alloc_f128(F128::ZERO);
     }
@@ -958,38 +993,48 @@ pub fn decide_tip_split(
     for (a, d) in link_class_digests.iter().enumerate() {
         let lanes = flat_digest_lanes(d);
         if tip.io[layout.wl + 2 * a] != lanes[0] || tip.io[layout.wl + 2 * a + 1] != lanes[1] {
-            return Err(format!("whitelist lane {a} does not carry the class digest"));
+            return Err(format!(
+                "whitelist lane {a} does not carry the class digest"
+            ));
         }
     }
-    let check_lane = |lane: &SplitLaneLayout,
-                      matrix: Option<&FieldR1cs>,
-                      what: &str|
-     -> Result<(), String> {
-        let live = tip.io[lane.live];
-        if live == F128::ZERO {
-            return Ok(());
-        }
-        if live != F128::ONE {
-            return Err(format!("{what}: non-boolean liveness"));
-        }
-        let m = matrix.ok_or_else(|| format!("{what}: live lane without its matrix"))?;
-        let acc = MatrixAccClaim {
-            point: tip.io[lane.point..lane.value].to_vec(),
-            value: tip.io[lane.value],
+    let check_lane =
+        |lane: &SplitLaneLayout, matrix: Option<&FieldR1cs>, what: &str| -> Result<(), String> {
+            let live = tip.io[lane.live];
+            if live == F128::ZERO {
+                return Ok(());
+            }
+            if live != F128::ONE {
+                return Err(format!("{what}: non-boolean liveness"));
+            }
+            let m = matrix.ok_or_else(|| format!("{what}: live lane without its matrix"))?;
+            let acc = MatrixAccClaim {
+                point: tip.io[lane.point..lane.value].to_vec(),
+                value: tip.io[lane.value],
+            };
+            if acc.point.len() != 2 * m.k_log + 1 {
+                return Err(format!(
+                    "{what}: lane width does not match the matrix shape"
+                ));
+            }
+            if stacked_matrix_mle_eval(m, &acc) != acc.value {
+                return Err(format!("{what}: accumulated matrix claim is false"));
+            }
+            Ok(())
         };
-        if acc.point.len() != 2 * m.k_log + 1 {
-            return Err(format!("{what}: lane width does not match the matrix shape"));
-        }
-        if stacked_matrix_mle_eval(m, &acc) != acc.value {
-            return Err(format!("{what}: accumulated matrix claim is false"));
-        }
-        Ok(())
-    };
     for a in 0..n {
-        check_lane(&layout.link_lanes[a], link_matrices[a], &format!("link lane {a}"))?;
+        check_lane(
+            &layout.link_lanes[a],
+            link_matrices[a],
+            &format!("link lane {a}"),
+        )?;
     }
     for t in 0..n {
-        check_lane(&layout.b_lanes[t], block_matrices[t], &format!("block lane {t}"))?;
+        check_lane(
+            &layout.b_lanes[t],
+            block_matrices[t],
+            &format!("block lane {t}"),
+        )?;
     }
     Ok(())
 }
@@ -999,27 +1044,11 @@ pub fn decide_tip_split(
 pub fn tip_block_accumulator_split(
     tip_class: &SplitLinkClass,
     tip: &LinkEnvelope,
-) -> ChainAccumulator {
+) -> Result<ChainAccumulator, ChainAccumulatorLaneError> {
     let layout = tip_class.layout();
-    let lane_bytes = |a: F128, b: F128| -> [u8; 32] {
-        let mut out = [0u8; 32];
-        out[..16].copy_from_slice(&flat_to_block(a).to_le_bytes());
-        out[16..].copy_from_slice(&flat_to_block(b).to_le_bytes());
-        out
-    };
-    ChainAccumulator {
-        height: flat_to_block(tip.io[layout.block_acc]) as u64,
-        state_root: lane_bytes(
-            tip.io[layout.block_acc + 1],
-            tip.io[layout.block_acc + 2],
-        ),
-        chain_hash: lane_bytes(
-            tip.io[layout.block_acc + 3],
-            tip.io[layout.block_acc + 4],
-        ),
-        active_slot_count: flat_to_block(tip.io[layout.block_acc + 5]) as u64,
-        alloc_counter: flat_to_block(tip.io[layout.block_acc + 6]) as u64,
-    }
+    let lanes =
+        std::array::from_fn(|i| Block128::from(flat_to_block(tip.io[layout.block_acc + i])));
+    ChainAccumulator::from_lanes(lanes)
 }
 
 /// Recover the u128 a flat IO lane encodes.

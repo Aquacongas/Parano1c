@@ -16,19 +16,21 @@ use std::time::{Duration, Instant};
 
 use noid_chain::consensus::difficulty::{add_work, block_work};
 use noid_chain::consensus::params::{BLOCK_TIME, MAX_TARGET};
+use noid_chain::consensus::{genesis_header, GENESIS_TIMESTAMP};
 use noid_chain::header_anchor::HeaderChainAnchor;
 use noid_core::Block128;
 use noid_poseidon2b::primitives::{Address, Digest};
 use noid_recursive::{
     accepted_block_certificate_batch_statement, accepted_block_certificate_receipt,
     accepted_block_receipt_projection_handle, accepted_claim_batch_digest,
-    advance_history_checkpoint_head_native, history_checkpoint_head_from_boundary,
+    advance_history_checkpoint_head_native, genesis_accumulator,
+    history_checkpoint_head_from_boundary,
     prove_accepted_block_certificate_receipt_projection_proof,
     prove_history_checkpoint_ivc_chunk_receipt_handle_core,
     verify_history_checkpoint_ivc_chunk_core, AcceptedBlockCertificateBatchStatement,
     AcceptedBlockCertificateReceipt, AcceptedBlockCertificateStatement,
     AcceptedBlockReceiptProjectionHandle, AcceptedClaimBatchOutput, AcceptedClaimBatchWitness,
-    ChainAccumulator, HeaderWitness, HistoryCheckpointBatchSummary, HistoryCheckpointStepStatement,
+    HeaderWitness, HistoryCheckpointBatchSummary, HistoryCheckpointStepStatement,
     RecursiveConsensusState, HISTORY_CHECKPOINT_BATCH_TARGET_BLOCKS,
     HISTORY_CHECKPOINT_ENGINE_STREAMING_TOWER_IVC, HISTORY_CHECKPOINT_IVC_CHUNK_CORE_WIRE_BYTES,
     HISTORY_CHECKPOINT_IVC_PCS_LOG_BATCH_SIZE, HISTORY_CHECKPOINT_IVC_PCS_LOG_INV_RATE,
@@ -185,7 +187,7 @@ fn main() {
 
 fn chunk_fixture() -> ChunkFixture {
     let chunk_capacity = HISTORY_CHECKPOINT_BATCH_TARGET_BLOCKS as usize;
-    let start_header = test_header([0u8; 32], [1u8; 32], 0);
+    let start_header = genesis_header();
     let mut consensus = RecursiveConsensusState::from_header(
         &start_header,
         block_work(&start_header.difficulty_target),
@@ -196,13 +198,7 @@ fn chunk_fixture() -> ChunkFixture {
         &[start_header.active_slot_count],
     );
     let start_consensus = consensus.clone();
-    let start_accumulator = ChainAccumulator {
-        height: start_header.height,
-        state_root: start_header.state_root,
-        chain_hash: [0u8; 32],
-        active_slot_count: start_header.active_slot_count,
-        alloc_counter: start_header.alloc_counter,
-    };
+    let start_accumulator = genesis_accumulator();
     let start_anchor = anchor_from_consensus(&start_consensus, start_header.tx_root);
 
     let mut accumulator = start_accumulator.clone();
@@ -252,14 +248,9 @@ fn chunk_fixture() -> ChunkFixture {
         consensus.active_slot_count = header.active_slot_count;
         consensus.alloc_counter = header.alloc_counter;
 
-        accumulator = accumulator.extend(
-            header.state_root,
-            header_witness.block_id,
-            height,
-            claim,
-            header.active_slot_count,
-            header.alloc_counter,
-        );
+        accumulator = accumulator
+            .advance(&header)
+            .expect("header advances accumulator");
         previous_block_id = header_witness.block_id;
         headers.push(header_witness);
         claims.push(claim);
@@ -348,7 +339,7 @@ fn test_header(
         prev_block_hash,
         state_root,
         tx_root: digest_with_seed(0x10 | (height as u8)),
-        timestamp: 1_767_225_600 + height * BLOCK_TIME,
+        timestamp: GENESIS_TIMESTAMP + height * BLOCK_TIME,
         height,
         miner_address: Address([0x44; 32]),
         nonce: height as u128,

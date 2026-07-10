@@ -196,8 +196,6 @@ pub fn verify_accepted_block_batch_components(
                             rayon::join(
                                 || {
                                     verify_checkpoint_poseidon(
-                                        start_accumulator,
-                                        end_accumulator,
                                         &inputs.accepted_claim_witness,
                                         &proof.checkpoint_poseidon,
                                     )

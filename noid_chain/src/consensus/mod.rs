@@ -66,8 +66,8 @@ pub use emission::{
     block_reward, format_noid, max_coinbase_value, max_coinbase_value_from_fee_sum, total_fees,
 };
 pub use epoch_anchor::{
-    next_tx_epoch_anchor_id, resolve_user_epoch_anchor_id, tx_epoch_anchor_height_for_child,
-    validate_block_epoch_anchors,
+    checked_tx_epoch_height_decomposition, next_tx_epoch_anchor_id, resolve_user_epoch_anchor_id,
+    tx_epoch_anchor_height_for_child, validate_block_epoch_anchors, TxEpochHeightDecomposition,
 };
 pub use fees::{
     burned_fee_for_tx_body, claimable_fee_for_tx_body, fee_breakdown, fee_breakdown_for_tx_body,

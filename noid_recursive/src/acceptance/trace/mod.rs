@@ -48,6 +48,7 @@ pub mod r_pcs_region;
 pub mod region_source_binding;
 pub mod self_verify;
 pub mod tx_body_spine;
+pub mod tx_epoch;
 
 use std::collections::HashMap;
 
@@ -228,6 +229,40 @@ pub fn range_check_bits(b: &mut FieldR1csBuilder, expr: &LinExpr, n_bits: usize)
     }
     pin_zero(b, &sum.add(expr));
     bits
+}
+
+/// `a + c` as an unsigned INTEGER over `n_bits` tower bits.
+///
+/// Both operands are range-checked and a ripple-carry full adder reconstructs
+/// the sum. The final carry is pinned to zero, so this is integer addition with
+/// no overflow rather than F128/XOR addition.
+pub fn integer_add_no_overflow(
+    b: &mut FieldR1csBuilder,
+    a: &LinExpr,
+    c: &LinExpr,
+    n_bits: usize,
+) -> LinExpr {
+    assert!((1..=128).contains(&n_bits));
+    let a_bits = range_check_bits(b, a, n_bits);
+    let c_bits = range_check_bits(b, c, n_bits);
+    let mut carry = LinExpr::zero();
+    let mut terms: Vec<LinExpr> = Vec::with_capacity(n_bits);
+    for i in 0..n_bits {
+        let ai = LinExpr::from_wire(a_bits[i]);
+        let ci = LinExpr::from_wire(c_bits[i]);
+        // sum_i = a_i XOR c_i XOR carry_i.
+        let sum_i = ai.add(&ci).add(&carry);
+        terms.push(sum_i.scale(flat_const(1u128 << i)));
+        // carry_{i+1} = a_i*c_i + carry_i*(a_i XOR c_i). The two products
+        // cannot both be one, so addition in characteristic two is the OR.
+        let ai_ci = mul(b, &ai, &ci);
+        let carry_axc = mul(b, &carry, &ai.add(&ci));
+        carry = ai_ci.add(&carry_axc);
+    }
+    pin_zero(b, &carry);
+    terms
+        .into_iter()
+        .fold(LinExpr::zero(), |sum, term| sum.add(&term))
 }
 
 /// Strict unsigned `a < b` over two already range-checked bit

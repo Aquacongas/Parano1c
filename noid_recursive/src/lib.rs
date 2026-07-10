@@ -26,13 +26,16 @@ pub use acceptance::{
 };
 pub use accepted_batch::{
     accepted_claim_batch_digest, accepted_claim_batch_digest_hash_fields,
-    accepted_claim_batch_digest_hash_params, chain_accumulator_proof_inputs,
+    accepted_claim_batch_digest_hash_params,
     prove_accepted_claim_batch_digest, verify_accepted_claim_batch_digest,
     verify_accepted_claim_batch_native, verify_accepted_claim_batch_with_header_trace,
     AcceptedClaimBatchDigestError, AcceptedClaimBatchDigestProof, AcceptedClaimBatchError,
     AcceptedClaimBatchOutput, AcceptedClaimBatchWitness, ACCEPTED_CLAIM_BATCH_DIGEST_HASH_FIELDS,
 };
-pub use accumulator::{genesis_accumulator, ChainAccumulator};
+pub use accumulator::{
+    genesis_accumulator, ChainAccumulator, ChainAccumulatorAdvanceError, ChainAccumulatorLaneError,
+    CHAIN_ACCUMULATOR_LANES,
+};
 pub use authorization::{
     verify_authorization_batch_native, verify_authorization_batch_native_with_traces,
     verify_authorization_statement_proof_with_trace, AuthorizationBatchError,
