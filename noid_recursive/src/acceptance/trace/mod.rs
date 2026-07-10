@@ -33,6 +33,7 @@
 //!   is untouched. The FS schedule itself is never restructured.
 
 pub mod accepted_claim_hash;
+pub mod action_surface;
 pub mod batch_eval;
 pub mod deep_chain;
 pub mod fri_pcs;
