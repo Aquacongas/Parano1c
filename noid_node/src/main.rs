@@ -1054,6 +1054,20 @@ fn verify_snapshot_history_proof_headers_anchored(
     proof_bytes: &[u8],
     store: &noid_chain::storage::MdbxStore,
 ) -> Result<(), String> {
+    verify_snapshot_history_proof_headers_anchored_with_minimum(
+        manifest,
+        proof_bytes,
+        store,
+        &noid_chain::consensus::params::MIN_SNAPSHOT_CHAINWORK,
+    )
+}
+
+fn verify_snapshot_history_proof_headers_anchored_with_minimum(
+    manifest: &noid_p2p::protocol::GetStateManifestResponse,
+    proof_bytes: &[u8],
+    store: &noid_chain::storage::MdbxStore,
+    minimum_chainwork: &[u8; 32],
+) -> Result<(), String> {
     if manifest.tip_height == 0 {
         return Err("snapshot manifest has no tip".into());
     }
@@ -1084,10 +1098,7 @@ fn verify_snapshot_history_proof_headers_anchored(
     if local_chainwork != manifest.cumulative_chainwork {
         return Err("snapshot manifest chainwork does not match local canonical headers".into());
     }
-    if noid_chain::work_gt(
-        &noid_chain::consensus::params::MIN_SNAPSHOT_CHAINWORK,
-        &local_chainwork,
-    ) {
+    if noid_chain::work_gt(minimum_chainwork, &local_chainwork) {
         return Err("snapshot chainwork below minimum snapshot work floor".into());
     }
 
@@ -1132,39 +1143,9 @@ fn read_local_header_anchor(
 // Blocking-I/O helpers
 // ---------------------------------------------------------------------------
 
-fn history_claim_fields_bytes(
-    block: &noid_chain::block::Block,
-    parent: &noid_chain::BlockHeader,
-    artifacts: &noid_block::AcceptedBlockValidationArtifacts,
-) -> Result<Vec<u8>, noid_block::FullValidationError> {
-    let claim =
-        noid_block::AcceptedStateTransitionClaim::from_accepted_block(block, parent, artifacts)
-            .map_err(noid_block::FullValidationError::from)?;
-    let fields = claim.fields().to_vec();
-    Ok(bincode::serialize(&fields).expect("history claim fields serialize"))
-}
-
-#[allow(clippy::too_many_arguments)]
 fn accepted_block_certificate_record_bytes(
-    block: &noid_chain::block::Block,
-    parent: &noid_chain::BlockHeader,
-    prev_timestamps: &[u64],
-    prev_active_counts: &[u64],
-    anchor: &noid_chain::consensus::validation::AnchorInfo,
-    block_proof_bytes: &[u8],
-    block_auth_sidecar_bytes: &[u8],
-    artifacts: &noid_block::AcceptedBlockValidationArtifacts,
+    acceptance_receipt: noid_block::BlockProofAcceptanceReceipt,
 ) -> Result<Vec<u8>, noid_block::FullValidationError> {
-    let acceptance_receipt = noid_block::block_proof_acceptance_receipt(
-        block,
-        parent,
-        prev_timestamps,
-        prev_active_counts,
-        anchor,
-        block_proof_bytes,
-        block_auth_sidecar_bytes,
-        artifacts,
-    )?;
     let record =
         noid_block::accepted_block_certificate_record(acceptance_receipt).map_err(|e| {
             noid_block::FullValidationError::Consensus(
@@ -1174,17 +1155,6 @@ fn accepted_block_certificate_record_bytes(
             )
         })?;
     Ok(bincode::serialize(&record).expect("AcceptedBlockCertificateRecord serializes"))
-}
-
-/// Inputs of the accepted-block certificate record build, captured under the
-/// chain write lock and proved after it is released (the receipt-projection
-/// prove takes tens of milliseconds and needs no chain state).
-struct CertificateRecordInputs {
-    parent: noid_chain::BlockHeader,
-    prev_timestamps: Vec<u64>,
-    prev_active_counts: Vec<u64>,
-    anchor: noid_chain::consensus::validation::AnchorInfo,
-    artifacts: noid_block::AcceptedBlockValidationArtifacts,
 }
 
 /// Owner-auth proof bytes this node already verified at mempool admission
@@ -1228,7 +1198,7 @@ async fn apply_p2p_block_offthread(
     tokio::task::spawn_blocking(move || {
         let block_height = block.header.height;
         let mut history_claim_bytes = None;
-        let mut certificate_inputs: Option<CertificateRecordInputs> = None;
+        let mut acceptance_receipt = None;
 
         let mut ctx = chain.blocking_write();
         let hash = ctx.apply_next_block(
@@ -1266,18 +1236,21 @@ async fn apply_p2p_block_offthread(
                     state,
                     &auth_verifier,
                 )?;
-                history_claim_bytes = Some(history_claim_fields_bytes(
+                let post_validation = noid_block::accepted_block_post_validation_bundle(
                     block,
                     parent,
+                    prev_timestamps,
+                    prev_active_counts,
+                    anchor,
+                    proof_bytes,
+                    auth_sidecar_bytes,
                     &output.artifacts,
-                )?);
-                certificate_inputs = Some(CertificateRecordInputs {
-                    parent: *parent,
-                    prev_timestamps: prev_timestamps.to_vec(),
-                    prev_active_counts: prev_active_counts.to_vec(),
-                    anchor: anchor.clone(),
-                    artifacts: output.artifacts.clone(),
-                });
+                )?;
+                history_claim_bytes = Some(
+                    bincode::serialize(&post_validation.history_claim_fields)
+                        .expect("history claim fields serialize"),
+                );
+                acceptance_receipt = Some(post_validation.acceptance_receipt);
                 Ok::<[u8; 32], noid_block::FullValidationError>(output.state_root)
             },
         )?;
@@ -1306,18 +1279,9 @@ async fn apply_p2p_block_offthread(
 
         // The certificate record (receipt-projection prove) runs after the
         // write lock is released; the store put only needs a read guard.
-        match certificate_inputs {
-            Some(inputs) => {
-                match accepted_block_certificate_record_bytes(
-                    &block,
-                    &inputs.parent,
-                    &inputs.prev_timestamps,
-                    &inputs.prev_active_counts,
-                    &inputs.anchor,
-                    &block_proof_bytes,
-                    &block_auth_sidecar_bytes,
-                    &inputs.artifacts,
-                ) {
+        match acceptance_receipt {
+            Some(receipt) => {
+                match accepted_block_certificate_record_bytes(receipt) {
                     Ok(bytes) => {
                         let ctx = chain.blocking_read();
                         if let Err(e) = ctx
@@ -1335,7 +1299,7 @@ async fn apply_p2p_block_offthread(
             None => {
                 tracing::warn!(
                     height = block_height,
-                    "accepted block committed without certificate record inputs"
+                    "accepted block committed without post-validation acceptance receipt"
                 );
             }
         }
@@ -1438,12 +1402,7 @@ async fn apply_reorg_offthread(
                             anchor,
                             state,
                         )?;
-                        history_claim_bytes = Some(history_claim_fields_bytes(
-                            block,
-                            parent,
-                            &output.artifacts,
-                        )?);
-                        certificate_record_bytes = Some(accepted_block_certificate_record_bytes(
+                        let post_validation = noid_block::accepted_block_post_validation_bundle(
                             block,
                             parent,
                             prev_timestamps,
@@ -1452,7 +1411,16 @@ async fn apply_reorg_offthread(
                             proof_bytes,
                             auth_sidecar_bytes,
                             &output.artifacts,
-                        )?);
+                        )?;
+                        history_claim_bytes = Some(
+                            bincode::serialize(&post_validation.history_claim_fields)
+                                .expect("history claim fields serialize"),
+                        );
+                        certificate_record_bytes = Some(
+                            accepted_block_certificate_record_bytes(
+                                post_validation.acceptance_receipt,
+                            )?,
+                        );
                         Ok::<[u8; 32], noid_block::FullValidationError>(output.state_root)
                     },
                 )?;
@@ -1605,7 +1573,7 @@ fn validate_p2p_block_proof_binding(
 mod tests {
     use super::{
         compare_manifest_fork_choice, gap_requires_snapshot_sync,
-        verify_snapshot_history_proof_headers_anchored,
+        verify_snapshot_history_proof_headers_anchored_with_minimum,
     };
 
     #[test]
@@ -1759,11 +1727,14 @@ mod tests {
             alloc_counter: h1.alloc_counter,
             ..Default::default()
         };
-        assert!(
-            verify_snapshot_history_proof_headers_anchored(&manifest, &[], &store)
-                .expect_err("missing proof must reject")
-                .contains("checkpoint proof missing")
-        );
+        assert!(verify_snapshot_history_proof_headers_anchored_with_minimum(
+            &manifest,
+            &[],
+            &store,
+            &high_start_work,
+        )
+        .expect_err("missing proof must reject")
+        .contains("checkpoint proof missing"));
 
         let checkpoint_proof = noid_block::public_history_checkpoint_proof_from_package(
             &start_anchor,
@@ -1773,28 +1744,68 @@ mod tests {
         .expect("public checkpoint proof exports from strict package");
         let checkpoint_proof_bytes =
             bincode::serialize(&checkpoint_proof).expect("serialize checkpoint proof");
-        verify_snapshot_history_proof_headers_anchored(&manifest, &checkpoint_proof_bytes, &store)
-            .expect("strict checkpoint proof verifies");
-
-        let mut tampered_projection = checkpoint_proof.clone();
-        tampered_projection.end_anchor.projection_root[0] ^= 0x01;
-        let tampered_projection_bytes =
-            bincode::serialize(&tampered_projection).expect("serialize tampered proof");
-        assert!(verify_snapshot_history_proof_headers_anchored(
+        verify_snapshot_history_proof_headers_anchored_with_minimum(
             &manifest,
-            &tampered_projection_bytes,
+            &checkpoint_proof_bytes,
             &store,
+            &high_start_work,
         )
-        .expect_err("proof-supplied projection root must not be trusted")
+        .expect("strict checkpoint proof verifies");
+
+        // A proof for another same-height fork must not pass merely because
+        // execution roots/counters and chainwork are identical. The local tip
+        // block id commits to the selected header and its ancestry.
+        let alt_dir = tempfile::tempdir().expect("alternate tempdir");
+        let alt_store =
+            noid_chain::storage::MdbxStore::open(alt_dir.path()).expect("open alternate store");
+        alt_store
+            .put_verified_header_only(&h0, &h0_hash, &high_start_work)
+            .expect("store alternate genesis header");
+        let mut alt_h1 = h1;
+        alt_h1.nonce =
+            noid_chain::consensus::pow::search_pow(&alt_h1, h1.nonce.wrapping_add(1), 1_000_000)
+                .expect("alternate easy test nonce mines");
+        let alt_h1_hash = noid_chain::hash_block_header(&alt_h1);
+        assert_ne!(alt_h1_hash, h1_hash);
+        alt_store
+            .put_verified_header_only(&alt_h1, &alt_h1_hash, &h1_work)
+            .expect("store alternate h1 header");
+        let alt_manifest = noid_p2p::protocol::GetStateManifestResponse {
+            tip_hash: alt_h1_hash,
+            ..manifest.clone()
+        };
+        assert!(verify_snapshot_history_proof_headers_anchored_with_minimum(
+            &alt_manifest,
+            &checkpoint_proof_bytes,
+            &alt_store,
+            &high_start_work,
+        )
+        .expect_err("proof for another local fork must reject")
+        .contains("end anchor mismatch"));
+
+        let mut tampered_tip = checkpoint_proof.clone();
+        tampered_tip.end_anchor.block_id[0] ^= 0x01;
+        let tampered_tip_bytes =
+            bincode::serialize(&tampered_tip).expect("serialize tampered proof");
+        assert!(verify_snapshot_history_proof_headers_anchored_with_minimum(
+            &manifest,
+            &tampered_tip_bytes,
+            &store,
+            &high_start_work,
+        )
+        .expect_err("proof-supplied tip id must not be trusted")
         .contains("end anchor mismatch"));
 
         let mut bad = manifest.clone();
         bad.cumulative_chainwork = [3u8; 32];
-        assert!(
-            verify_snapshot_history_proof_headers_anchored(&bad, &[], &store)
-                .expect_err("bad chainwork must reject")
-                .contains("chainwork")
-        );
+        assert!(verify_snapshot_history_proof_headers_anchored_with_minimum(
+            &bad,
+            &[],
+            &store,
+            &high_start_work,
+        )
+        .expect_err("bad chainwork must reject")
+        .contains("chainwork"));
 
         let mut low_work = [0u8; 32];
         low_work[0] = 1;
@@ -1805,11 +1816,14 @@ mod tests {
             cumulative_chainwork: low_work,
             ..manifest
         };
-        assert!(
-            verify_snapshot_history_proof_headers_anchored(&low_work_manifest, &[], &store)
-                .expect_err("below minimum snapshot work must reject")
-                .contains("minimum snapshot work")
-        );
+        assert!(verify_snapshot_history_proof_headers_anchored_with_minimum(
+            &low_work_manifest,
+            &[],
+            &store,
+            &high_start_work,
+        )
+        .expect_err("below minimum snapshot work must reject")
+        .contains("minimum snapshot work"));
     }
 
     #[test]

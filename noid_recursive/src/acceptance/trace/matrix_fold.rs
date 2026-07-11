@@ -230,8 +230,8 @@ mod tests {
     use noid_ivc_core::challenger::{Challenger, FsLaneChallenger};
     use noid_ivc_core::field_r1cs::{FieldR1cs, SparseFieldMatrix};
     use noid_ivc_core::matrix_claim::{
-        fresh_claim_value, prove_matrix_claim_fold, stacked_matrix_mle_eval,
-        FreshLincheckClaim, MatrixAccClaim,
+        fresh_claim_value, prove_matrix_claim_fold, stacked_matrix_mle_eval, FreshLincheckClaim,
+        MatrixAccClaim,
     };
 
     struct Rng(u64);
@@ -313,8 +313,16 @@ mod tests {
         let fresh_e = FreshLincheckClaimTrace {
             alpha: alloc(&mut b, fresh.alpha),
             z_skip: alloc(&mut b, fresh.z_skip),
-            x_inner_rest: fresh.x_inner_rest.iter().map(|&v| alloc(&mut b, v)).collect(),
-            r_inner_rest: fresh.r_inner_rest.iter().map(|&v| alloc(&mut b, v)).collect(),
+            x_inner_rest: fresh
+                .x_inner_rest
+                .iter()
+                .map(|&v| alloc(&mut b, v))
+                .collect(),
+            r_inner_rest: fresh
+                .r_inner_rest
+                .iter()
+                .map(|&v| alloc(&mut b, v))
+                .collect(),
             z_partial: fresh.z_partial.iter().map(|&v| alloc(&mut b, v)).collect(),
             value: alloc(&mut b, fresh.value),
         };
@@ -324,7 +332,14 @@ mod tests {
         let proof_e = MatrixFoldProofTrace::alloc(&mut b, &proof, k_log);
         let mutation_end = b.num_wires();
         let acc = verify_matrix_claim_fold_trace(
-            &mut b, &mut ch, k_log, k_skip, &fresh_e, &incoming_e, &gate, &proof_e,
+            &mut b,
+            &mut ch,
+            k_log,
+            k_skip,
+            &fresh_e,
+            &incoming_e,
+            &gate,
+            &proof_e,
         );
         let rows = b.num_wires();
         eprintln!("[matrix-fold] twin rows @k_log={k_log}: {rows}");
@@ -341,7 +356,9 @@ mod tests {
         let (r1cs_t, z) = b.build();
         assert!(r1cs_t.satisfies(&z), "honest fold twin unsatisfiable");
 
-        let survivors = r1cs_t.flip_battery(&z).survivors(mutation_start..mutation_end);
+        let survivors = r1cs_t
+            .flip_battery(&z)
+            .survivors(mutation_start..mutation_end);
         assert!(survivors.is_empty(), "fold twin survivors: {survivors:?}");
     }
 }

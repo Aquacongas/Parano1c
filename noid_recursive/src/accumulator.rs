@@ -4,7 +4,9 @@
 //! Direct recursive-chain continuity boundary.
 
 use noid_chain::block_header::BlockHeader;
-use noid_chain::consensus::{checked_tx_epoch_height_decomposition, genesis_header};
+use noid_chain::consensus::{
+    checked_tx_epoch_height_decomposition, genesis_header, params::TX_EPOCH_BLOCKS,
+};
 use noid_chain::fri_state::StateRoot;
 use noid_chain::hash_block_header;
 use noid_core::Block128;
@@ -52,6 +54,47 @@ pub enum ChainAccumulatorAdvanceError {
     BadHeight { expected: u64, actual: u64 },
     BadParentTip,
 }
+
+/// Mismatch between a recovered recursive boundary and the node's locally
+/// selected canonical header chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainAccumulatorLocalBoundaryError {
+    Height,
+    TipBlockId,
+    StateRoot,
+    LogSlots,
+    ActiveSlotCount,
+    AllocCounter,
+    EpochAnchorHeight { expected: u64, actual: u64 },
+    EpochAnchorId,
+}
+
+impl core::fmt::Display for ChainAccumulatorLocalBoundaryError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Height => write!(f, "accumulator height does not match local tip"),
+            Self::TipBlockId => write!(f, "accumulator tip id does not match local tip header"),
+            Self::StateRoot => write!(f, "accumulator state root does not match local tip"),
+            Self::LogSlots => write!(f, "accumulator log_slots does not match local tip"),
+            Self::ActiveSlotCount => {
+                write!(f, "accumulator active count does not match local tip")
+            }
+            Self::AllocCounter => {
+                write!(f, "accumulator allocation counter does not match local tip")
+            }
+            Self::EpochAnchorHeight { expected, actual } => write!(
+                f,
+                "local epoch-anchor header has height {actual}, expected {expected}"
+            ),
+            Self::EpochAnchorId => write!(
+                f,
+                "accumulator epoch anchor does not match the local canonical epoch header"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ChainAccumulatorLocalBoundaryError {}
 
 impl ChainAccumulator {
     /// Encode the canonical ten-lane recursive boundary.
@@ -135,6 +178,49 @@ impl ChainAccumulator {
                 self.epoch_anchor_id
             },
         })
+    }
+
+    /// Bind all ten recursive lanes to the locally selected canonical chain.
+    ///
+    /// `tip_header` and `epoch_anchor_header` must come from the node's native
+    /// header store on the selected fork. The latter is the header at
+    /// `floor(tip_height / 144) * 144`. Recomputing both ids makes the direct
+    /// boundary sufficient; no rolling header projection is needed.
+    pub fn validate_local_header_boundary(
+        &self,
+        tip_header: &BlockHeader,
+        epoch_anchor_header: &BlockHeader,
+    ) -> Result<(), ChainAccumulatorLocalBoundaryError> {
+        if self.height != tip_header.height {
+            return Err(ChainAccumulatorLocalBoundaryError::Height);
+        }
+        if self.tip_block_id != hash_block_header(tip_header) {
+            return Err(ChainAccumulatorLocalBoundaryError::TipBlockId);
+        }
+        if self.state_root != tip_header.state_root {
+            return Err(ChainAccumulatorLocalBoundaryError::StateRoot);
+        }
+        if self.log_slots != tip_header.log_slots {
+            return Err(ChainAccumulatorLocalBoundaryError::LogSlots);
+        }
+        if self.active_slot_count != tip_header.active_slot_count {
+            return Err(ChainAccumulatorLocalBoundaryError::ActiveSlotCount);
+        }
+        if self.alloc_counter != tip_header.alloc_counter {
+            return Err(ChainAccumulatorLocalBoundaryError::AllocCounter);
+        }
+
+        let expected_epoch_height = (tip_header.height / TX_EPOCH_BLOCKS) * TX_EPOCH_BLOCKS;
+        if epoch_anchor_header.height != expected_epoch_height {
+            return Err(ChainAccumulatorLocalBoundaryError::EpochAnchorHeight {
+                expected: expected_epoch_height,
+                actual: epoch_anchor_header.height,
+            });
+        }
+        if self.epoch_anchor_id != hash_block_header(epoch_anchor_header) {
+            return Err(ChainAccumulatorLocalBoundaryError::EpochAnchorId);
+        }
+        Ok(())
     }
 }
 
@@ -302,5 +388,64 @@ mod tests {
                 _ => unreachable!(),
             }
         }
+    }
+
+    #[test]
+    fn local_header_boundary_covers_epoch_edges_and_all_ten_lanes() {
+        let genesis = genesis_header();
+        let mut headers = vec![genesis];
+        let mut accumulator = genesis_accumulator();
+        let mut edge_boundaries = Vec::new();
+        for height in 1..=145 {
+            let header = child(&accumulator, height);
+            accumulator = accumulator.advance(&header).unwrap();
+            headers.push(header);
+            if matches!(height, 143..=145) {
+                edge_boundaries.push(accumulator.clone());
+            }
+        }
+
+        for (boundary, epoch_height) in edge_boundaries.iter().zip([0usize, 144, 144]) {
+            boundary
+                .validate_local_header_boundary(
+                    &headers[boundary.height as usize],
+                    &headers[epoch_height],
+                )
+                .unwrap();
+        }
+
+        let honest = &edge_boundaries[2];
+        let tip = &headers[145];
+        let epoch = &headers[144];
+        for lane in 0..CHAIN_ACCUMULATOR_LANES {
+            let mut lanes = honest.to_lanes();
+            lanes[lane] = Block128::from(lanes[lane].to_u128() ^ 1);
+            let bad = ChainAccumulator::from_lanes(lanes).unwrap();
+            assert!(
+                bad.validate_local_header_boundary(tip, epoch).is_err(),
+                "mutated accumulator lane {lane} accepted"
+            );
+        }
+
+        let mut competing_tip = *tip;
+        competing_tip.nonce = competing_tip.nonce.wrapping_add(1);
+        assert_eq!(
+            honest.validate_local_header_boundary(&competing_tip, epoch),
+            Err(ChainAccumulatorLocalBoundaryError::TipBlockId)
+        );
+
+        assert_eq!(
+            honest.validate_local_header_boundary(tip, &headers[143]),
+            Err(ChainAccumulatorLocalBoundaryError::EpochAnchorHeight {
+                expected: 144,
+                actual: 143,
+            })
+        );
+        let mut competing_epoch = *epoch;
+        competing_epoch.nonce = competing_epoch.nonce.wrapping_add(1);
+        assert_eq!(
+            honest.validate_local_header_boundary(tip, &competing_epoch),
+            Err(ChainAccumulatorLocalBoundaryError::EpochAnchorId)
+        );
     }
 }

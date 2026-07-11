@@ -29,10 +29,13 @@ use noid_ivc_core::field_r1cs::FieldR1cs;
 use noid_ivc_core::merkle::{self, Hash};
 use noid_ivc_core::ntt::AdditiveNttF128;
 use noid_ivc_core::pcs::{self, compute_fri_arities, default_fri_queries, PcsParams, LOG_PACKING};
+use noid_ivc_core::public_io::POST_COMMIT_CLASS_BINDING_LABEL;
 use noid_ivc_core::zerocheck::{self, K_SKIP};
 use noid_poseidon2b::native::{capacity_iv_flat, DomainTag};
 
-use super::{evaluate_slice_trace, mul, pin_eq, poseidon2b_permute, FieldR1csBuilder, LinExpr, F128};
+use super::{
+    evaluate_slice_trace, mul, pin_eq, poseidon2b_permute, FieldR1csBuilder, LinExpr, F128,
+};
 
 /// A 32-byte digest as two little-endian **flat** u128 lanes (see module
 /// docs — this is NOT the φ-mapped `fri_pcs::DigestExpr` convention).
@@ -140,10 +143,7 @@ pub fn merkle_hash_pair_trace(
 /// flat sponge XORs these into a flat state directly, with no φ map).
 fn pad_full_block_lanes() -> [F128; 2] {
     // fill_padding over a whole 32-byte block: byte 0 = 0x80, byte 31 = 0x01.
-    [
-        f128_from_u128(0x80u128),
-        f128_from_u128(0x01u128 << 120),
-    ]
+    [f128_from_u128(0x80u128), f128_from_u128(0x01u128 << 120)]
 }
 
 fn pad_half_block_lane() -> F128 {
@@ -158,10 +158,7 @@ fn pad_half_block_lane() -> F128 {
 /// count (block-aligned bytes) runs the fixed-length no-pad mode
 /// (`IVCPCSF_`, length-bound IV, one permutation per block); an odd count
 /// runs the padded `IVCPCSL_` duplex. All-constant inputs fold.
-pub fn merkle_hash_leaf_lanes_trace(
-    b: &mut FieldR1csBuilder,
-    lanes: &[LinExpr],
-) -> FlatDigestExpr {
+pub fn merkle_hash_leaf_lanes_trace(b: &mut FieldR1csBuilder, lanes: &[LinExpr]) -> FlatDigestExpr {
     if lanes.iter().all(|e| e.is_const()) {
         let mut bytes = Vec::with_capacity(lanes.len() * 16);
         for e in lanes {
@@ -183,14 +180,12 @@ pub fn merkle_hash_leaf_lanes_trace(
         LinExpr::constant(iv_hi),
         LinExpr::constant(iv_lo),
     ];
-    let absorb_block = |b: &mut FieldR1csBuilder,
-                            state: &mut [LinExpr; 4],
-                            lane0: &LinExpr,
-                            lane1: &LinExpr| {
-        state[0] = state[0].add(lane0);
-        state[1] = state[1].add(lane1);
-        *state = poseidon2b_permute(b, std::mem::take(state));
-    };
+    let absorb_block =
+        |b: &mut FieldR1csBuilder, state: &mut [LinExpr; 4], lane0: &LinExpr, lane1: &LinExpr| {
+            state[0] = state[0].add(lane0);
+            state[1] = state[1].add(lane1);
+            *state = poseidon2b_permute(b, std::mem::take(state));
+        };
     let mut chunks = lanes.chunks_exact(2);
     for pair in &mut chunks {
         absorb_block(b, &mut state, &pair[0].clone(), &pair[1].clone());
@@ -399,11 +394,7 @@ pub struct ZerocheckProofTrace {
 }
 
 impl ZerocheckProofTrace {
-    pub fn alloc(
-        b: &mut FieldR1csBuilder,
-        native: &zerocheck::ZerocheckProof,
-        m: usize,
-    ) -> Self {
+    pub fn alloc(b: &mut FieldR1csBuilder, native: &zerocheck::ZerocheckProof, m: usize) -> Self {
         let ell = 1usize << K_SKIP;
         assert!(m >= K_SKIP + 1, "log_n too small for the univariate skip");
         assert_eq!(native.round1_ab.len(), ell, "round1_ab off shape");
@@ -557,7 +548,11 @@ impl LincheckProofTrace {
         k_skip: usize,
     ) -> Self {
         assert_eq!(native.rounds.len(), k_log - k_skip, "rounds off shape");
-        assert_eq!(native.z_partial.len(), 1usize << k_skip, "z_partial off shape");
+        assert_eq!(
+            native.z_partial.len(),
+            1usize << k_skip,
+            "z_partial off shape"
+        );
         Self {
             rounds: native
                 .rounds
@@ -635,10 +630,11 @@ fn lincheck_final_sum_trace(
         for r in 0..m.num_rows {
             for (c, kappa) in m.row(r) {
                 let c = c as usize;
-                blocks
-                    .entry((r >> k_skip, c >> k_skip))
-                    .or_default()
-                    .push((r & mask, c & mask, kappa));
+                blocks.entry((r >> k_skip, c >> k_skip)).or_default().push((
+                    r & mask,
+                    c & mask,
+                    kappa,
+                ));
             }
         }
     }
@@ -647,8 +643,7 @@ fn lincheck_final_sum_trace(
     let mut p: BTreeMap<(usize, usize), LinExpr> = BTreeMap::new();
     for block in blocks_a.values().chain(blocks_b.values()) {
         for &(i, j, _) in block {
-            p.entry((i, j))
-                .or_insert_with_key(|_| LinExpr::zero());
+            p.entry((i, j)).or_insert_with_key(|_| LinExpr::zero());
         }
     }
     let keys: Vec<(usize, usize)> = p.keys().copied().collect();
@@ -660,7 +655,8 @@ fn lincheck_final_sum_trace(
     // ---- Per-block: t = e[R]·q[X] (shared between A and B), then one mul
     // with each symbolic block sum.
     let mut pair_products: BTreeMap<(usize, usize), LinExpr> = BTreeMap::new();
-    let mut all_keys: Vec<(usize, usize)> = blocks_a.keys().chain(blocks_b.keys()).copied().collect();
+    let mut all_keys: Vec<(usize, usize)> =
+        blocks_a.keys().chain(blocks_b.keys()).copied().collect();
     all_keys.sort_unstable();
     all_keys.dedup();
     for &(r_blk, x_blk) in &all_keys {
@@ -726,7 +722,11 @@ pub fn lincheck_verify_trace(
     let ell = 1usize << k_skip;
     let inner_rest_len = k_log - k_skip;
     assert!(k_skip <= k_log, "k_skip exceeds k_log");
-    assert_eq!(x_ab.x_inner_rest.len(), inner_rest_len, "x_inner_rest off shape");
+    assert_eq!(
+        x_ab.x_inner_rest.len(),
+        inner_rest_len,
+        "x_inner_rest off shape"
+    );
     assert_eq!(x_ab.x_outer.len(), m - k_log, "x_outer off shape");
     assert_eq!(proof.rounds.len(), inner_rest_len, "rounds off shape");
     assert_eq!(proof.z_partial.len(), ell, "z_partial off shape");
@@ -826,7 +826,11 @@ pub fn lincheck_verify_trace_deferred(
     let ell = 1usize << k_skip;
     let inner_rest_len = k_log - k_skip;
     assert!(k_skip <= k_log, "k_skip exceeds k_log");
-    assert_eq!(x_ab.x_inner_rest.len(), inner_rest_len, "x_inner_rest off shape");
+    assert_eq!(
+        x_ab.x_inner_rest.len(),
+        inner_rest_len,
+        "x_inner_rest off shape"
+    );
     assert_eq!(x_ab.x_outer.len(), m - k_log, "x_outer off shape");
     assert_eq!(proof.rounds.len(), inner_rest_len, "rounds off shape");
     assert_eq!(proof.z_partial.len(), ell, "z_partial off shape");
@@ -1023,8 +1027,7 @@ impl BaseFoldProofTrace {
         let final_codeword = alloc_vec(b, &native.final_codeword);
         let plaintext_tail = alloc_vec(b, &native.plaintext_tail);
         // The native challenger absorbs the nonce as `F128 { lo, hi: 0 }`.
-        let pow_nonce =
-            LinExpr::from_wire(b.alloc_f128(f128_from_u128(native.pow_nonce as u128)));
+        let pow_nonce = LinExpr::from_wire(b.alloc_f128(f128_from_u128(native.pow_nonce as u128)));
 
         let queries = native
             .queries
@@ -1048,8 +1051,16 @@ impl BaseFoldProofTrace {
                         "post-rb path off shape"
                     );
                 }
-                assert_eq!(q.epoch_leaves.len(), num_fri_commits, "epoch leaves off shape");
-                assert_eq!(q.epoch_paths.len(), num_fri_commits, "epoch paths off shape");
+                assert_eq!(
+                    q.epoch_leaves.len(),
+                    num_fri_commits,
+                    "epoch leaves off shape"
+                );
+                assert_eq!(
+                    q.epoch_paths.len(),
+                    num_fri_commits,
+                    "epoch paths off shape"
+                );
                 let mut cum = arity_0;
                 for (i, (leaf, path)) in q.epoch_leaves.iter().zip(&q.epoch_paths).enumerate() {
                     assert_eq!(leaf.len(), 1usize << arities[i + 1], "epoch leaf off shape");
@@ -1074,11 +1085,7 @@ impl BaseFoldProofTrace {
                     } else {
                         Vec::new()
                     },
-                    epoch_leaves: q
-                        .epoch_leaves
-                        .iter()
-                        .map(|l| alloc_vec(b, l))
-                        .collect(),
+                    epoch_leaves: q.epoch_leaves.iter().map(|l| alloc_vec(b, l)).collect(),
                     epoch_paths: if alloc_paths {
                         q.epoch_paths.iter().map(|p| alloc_digests(b, p)).collect()
                     } else {
@@ -1462,7 +1469,10 @@ pub fn basefold_verify_trace(
     // ---- Per-query fold replay + per-query independent Merkle paths.
     for (q, bits) in proof.queries.iter().zip(&query_bits) {
         if let Some(obs) = region.as_deref_mut() {
-            assert!(q.initial_path.is_empty(), "region mode expects path-free alloc");
+            assert!(
+                q.initial_path.is_empty(),
+                "region mode expects path-free alloc"
+            );
             obs.push(&q.initial_leaf, bits, initial_codeword_root);
         } else {
             let initial_leaf_hash = merkle_hash_leaf_lanes_trace(b, &q.initial_leaf);
@@ -1486,7 +1496,10 @@ pub fn basefold_verify_trace(
             expected = post_row_batch_value;
         } else {
             if let Some(obs) = region.as_deref_mut() {
-                assert!(q.post_row_batch_path.is_empty(), "region mode expects path-free alloc");
+                assert!(
+                    q.post_row_batch_path.is_empty(),
+                    "region mode expects path-free alloc"
+                );
                 obs.push(
                     &q.post_row_batch_leaf,
                     &bits[arity_0..],
@@ -1523,7 +1536,10 @@ pub fn basefold_verify_trace(
             let next_arity = arities[i + 1];
 
             if let Some(obs) = region.as_deref_mut() {
-                assert!(q.epoch_paths[i].is_empty(), "region mode expects path-free alloc");
+                assert!(
+                    q.epoch_paths[i].is_empty(),
+                    "region mode expects path-free alloc"
+                );
                 obs.push(
                     leaf,
                     &bits[cum_arity + next_arity..],
@@ -1540,16 +1556,15 @@ pub fn basefold_verify_trace(
                 );
             }
 
-            let at_offset =
-                evaluate_slice_trace(b, leaf, &bits[cum_arity..cum_arity + next_arity]);
+            let at_offset = evaluate_slice_trace(b, leaf, &bits[cum_arity..cum_arity + next_arity]);
             pin_eq(b, &at_offset, &expected);
 
             let input_layer = k_code - cum_arity;
             expected = fri_fold_coset_bits_trace(
                 b,
                 leaf,
-                &challenges[fri_challenge_start + cum_arity
-                    ..fri_challenge_start + cum_arity + next_arity],
+                &challenges
+                    [fri_challenge_start + cum_arity..fri_challenge_start + cum_arity + next_arity],
                 &ntt,
                 input_layer,
                 &bits[cum_arity + next_arity..],
@@ -1613,6 +1628,85 @@ pub struct QuirkyDirectClaimTrace {
     pub value: LinExpr,
 }
 
+/// Opaque recursive-trace capability for a causally post-commit auxiliary
+/// verifier. It delegates the exact enclosing FS channel and owns the claim
+/// sink appended to that proof's shared PCS replay.
+pub struct FieldPostCommitTraceContext<'a, C> {
+    commitment_root: &'a FlatDigestExpr,
+    total_vars: usize,
+    channel: &'a mut C,
+    claims: Vec<QuirkyDirectClaimTrace>,
+}
+
+impl<'a, C> FieldPostCommitTraceContext<'a, C> {
+    fn new(commitment_root: &'a FlatDigestExpr, total_vars: usize, channel: &'a mut C) -> Self {
+        Self {
+            commitment_root,
+            total_vars,
+            channel,
+            claims: Vec::new(),
+        }
+    }
+
+    fn finish(self) -> Vec<QuirkyDirectClaimTrace> {
+        self.claims
+    }
+
+    pub fn commitment_root(&self) -> &'a FlatDigestExpr {
+        self.commitment_root
+    }
+
+    pub fn total_vars(&self) -> usize {
+        self.total_vars
+    }
+
+    pub fn append_claim(&mut self, claim: QuirkyDirectClaimTrace) {
+        self.claims.push(claim);
+    }
+
+    pub fn append_claims(&mut self, claims: impl IntoIterator<Item = QuirkyDirectClaimTrace>) {
+        self.claims.extend(claims);
+    }
+
+    pub fn claim_count(&self) -> usize {
+        self.claims.len()
+    }
+}
+
+impl<C: FsChannelOps> FsChannelOps for FieldPostCommitTraceContext<'_, C> {
+    fn observe_label(&mut self, b: &mut FieldR1csBuilder, label: &[u8]) {
+        self.channel.observe_label(b, label);
+    }
+
+    fn observe_f128(&mut self, b: &mut FieldR1csBuilder, value: &LinExpr) {
+        self.channel.observe_f128(b, value);
+    }
+
+    fn observe_f128_slice(&mut self, b: &mut FieldR1csBuilder, values: &[LinExpr]) {
+        self.channel.observe_f128_slice(b, values);
+    }
+
+    fn sample_f128(&mut self, b: &mut FieldR1csBuilder) -> LinExpr {
+        self.channel.sample_f128(b)
+    }
+
+    fn sample_f128_vec(&mut self, b: &mut FieldR1csBuilder, n: usize) -> Vec<LinExpr> {
+        self.channel.sample_f128_vec(b, n)
+    }
+
+    fn verify_pow(&mut self, b: &mut FieldR1csBuilder, nonce: &LinExpr, bits: u32) {
+        self.channel.verify_pow(b, nonce, bits);
+    }
+
+    fn observe_bytes_const(&mut self, b: &mut FieldR1csBuilder, bytes: &[u8]) {
+        self.channel.observe_bytes_const(b, bytes);
+    }
+
+    fn observe_lanes(&mut self, b: &mut FieldR1csBuilder, byte_len: u64, lanes: &[LinExpr]) {
+        self.channel.observe_lanes(b, byte_len, lanes);
+    }
+}
+
 /// Trace twin of `pcs::verify_opening_batch_quirky_direct`: mirror
 /// transcript (labels, per-claim value observes, γ batching), the shared
 /// BaseFold replay, then the quirky `final_b` factorization
@@ -1655,9 +1749,12 @@ pub fn verify_opening_batch_quirky_direct_trace_region(
         assert_eq!(c.x_rest.len() + c.k_skip, l_log, "claim point off shape");
     }
 
-    ch.observe_label(b, b"history-pcs-open-field-v0");
+    ch.observe_label(b, b"history-pcs-open-field-v1");
     for c in claims {
-        ch.observe_label(b, b"history-pcs-quirky-direct-v0");
+        ch.observe_label(b, b"history-pcs-quirky-direct-v1");
+        ch.observe_f128(b, &c.z_skip);
+        ch.observe_f128(b, &LinExpr::constant(F128::new(c.k_skip as u64, 0)));
+        ch.observe_f128_slice(b, &c.x_rest);
         ch.observe_f128(b, &c.value);
     }
     let gammas: Vec<LinExpr> = (0..claims.len()).map(|_| ch.sample_f128(b)).collect();
@@ -1875,10 +1972,7 @@ pub fn verify_field_trace_deferred(
     proof: &FieldR1csProofTrace,
     spec: &noid_ivc_core::public_io::PublicIoSpec,
     io: &[LinExpr],
-) -> (
-    R1csClaimTrace,
-    super::matrix_fold::FreshLincheckClaimTrace,
-) {
+) -> (R1csClaimTrace, super::matrix_fold::FreshLincheckClaimTrace) {
     verify_field_trace_deferred_region(
         b,
         ch,
@@ -1911,10 +2005,45 @@ pub fn verify_field_trace_deferred_region(
     spec: &noid_ivc_core::public_io::PublicIoSpec,
     io: &[LinExpr],
     region: Option<&mut PcsWalkObligations>,
-) -> (
-    R1csClaimTrace,
-    super::matrix_fold::FreshLincheckClaimTrace,
-) {
+) -> (R1csClaimTrace, super::matrix_fold::FreshLincheckClaimTrace) {
+    verify_field_trace_deferred_region_with_post_commit(
+        b,
+        ch,
+        shape,
+        pcs_params,
+        statement_digest,
+        commitment_root,
+        proof,
+        spec,
+        io,
+        region,
+        |_, _| Vec::new(),
+    )
+}
+
+/// [`verify_field_trace_deferred_region`] with a post-commit auxiliary
+/// verifier. The callback runs after the verified proof's statement root and
+/// public IO have entered the SAME channel, but before zerocheck draws its
+/// first challenge. Returned claims are appended to that proof's shared PCS
+/// batch after the public-IO claims.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_field_trace_deferred_region_with_post_commit<C, PostCommit>(
+    b: &mut FieldR1csBuilder,
+    ch: &mut C,
+    shape: &noid_ivc_core::proof::FieldShape,
+    pcs_params: &PcsParams,
+    statement_digest: &FlatDigestExpr,
+    commitment_root: &FlatDigestExpr,
+    proof: &FieldR1csProofTrace,
+    spec: &noid_ivc_core::public_io::PublicIoSpec,
+    io: &[LinExpr],
+    region: Option<&mut PcsWalkObligations>,
+    post_commit: PostCommit,
+) -> (R1csClaimTrace, super::matrix_fold::FreshLincheckClaimTrace)
+where
+    C: FsChannelOps,
+    PostCommit: FnOnce(&mut FieldR1csBuilder, &mut C) -> Vec<QuirkyDirectClaimTrace>,
+{
     assert_eq!(
         pcs_params.m,
         shape.m + LOG_PACKING,
@@ -1926,6 +2055,8 @@ pub fn verify_field_trace_deferred_region(
     crate::acceptance::row_ledger_mark(b, &mut ledger, "R: statement bind");
     let io_claims = bind_public_io_trace(b, ch, spec, io, shape.m);
     crate::acceptance::row_ledger_mark(b, &mut ledger, "R: public-IO bind");
+    let auxiliary_claims = post_commit(b, ch);
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "R: post-commit auxiliary");
 
     let zc_claim = zerocheck_field_verify_trace(b, ch, shape.m, &proof.zerocheck);
     crate::acceptance::row_ledger_mark(b, &mut ledger, "R: zerocheck");
@@ -1983,6 +2114,7 @@ pub fn verify_field_trace_deferred_region(
         },
     ];
     claims.extend(io_claims);
+    claims.extend(auxiliary_claims);
     verify_opening_batch_quirky_direct_trace_region(
         b,
         ch,
@@ -1995,6 +2127,92 @@ pub fn verify_field_trace_deferred_region(
     crate::acceptance::row_ledger_mark(b, &mut ledger, "R: PCS opening batch");
 
     (R1csClaimTrace { ab, c }, fresh)
+}
+
+/// Typestate trace twin of
+/// `verifier::verify_field_deferred_matrix_with_post_commit_context`.
+/// It binds the explicit class digest after public IO, then gives the callback
+/// an opaque SAME-channel context whose internal claims are appended
+/// automatically to the verified proof's PCS batch.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_field_trace_deferred_region_with_post_commit_context<C, PostCommit>(
+    b: &mut FieldR1csBuilder,
+    ch: &mut C,
+    shape: &noid_ivc_core::proof::FieldShape,
+    pcs_params: &PcsParams,
+    statement_digest: &FlatDigestExpr,
+    commitment_root: &FlatDigestExpr,
+    proof: &FieldR1csProofTrace,
+    spec: &noid_ivc_core::public_io::PublicIoSpec,
+    io: &[LinExpr],
+    post_commit_class_digest: &[u8; 32],
+    region: Option<&mut PcsWalkObligations>,
+    post_commit: PostCommit,
+) -> (R1csClaimTrace, super::matrix_fold::FreshLincheckClaimTrace)
+where
+    C: FsChannelOps,
+    PostCommit: FnOnce(&mut FieldR1csBuilder, &mut FieldPostCommitTraceContext<'_, C>),
+{
+    let class_digest = const_flat_digest(post_commit_class_digest);
+    verify_field_trace_deferred_region_with_post_commit_context_expr(
+        b,
+        ch,
+        shape,
+        pcs_params,
+        statement_digest,
+        commitment_root,
+        proof,
+        spec,
+        io,
+        &class_digest,
+        region,
+        post_commit,
+    )
+}
+
+/// Witness-digest twin of
+/// [`verify_field_trace_deferred_region_with_post_commit_context`].  Link
+/// recursion uses it after one-hot selecting the previous class: the two flat
+/// digest lanes are absorbed with the exact 32-byte `observe_bytes` header,
+/// so a host cannot select a sidecar class outside the inherited whitelist.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_field_trace_deferred_region_with_post_commit_context_expr<C, PostCommit>(
+    b: &mut FieldR1csBuilder,
+    ch: &mut C,
+    shape: &noid_ivc_core::proof::FieldShape,
+    pcs_params: &PcsParams,
+    statement_digest: &FlatDigestExpr,
+    commitment_root: &FlatDigestExpr,
+    proof: &FieldR1csProofTrace,
+    spec: &noid_ivc_core::public_io::PublicIoSpec,
+    io: &[LinExpr],
+    post_commit_class_digest: &FlatDigestExpr,
+    region: Option<&mut PcsWalkObligations>,
+    post_commit: PostCommit,
+) -> (R1csClaimTrace, super::matrix_fold::FreshLincheckClaimTrace)
+where
+    C: FsChannelOps,
+    PostCommit: FnOnce(&mut FieldR1csBuilder, &mut FieldPostCommitTraceContext<'_, C>),
+{
+    verify_field_trace_deferred_region_with_post_commit(
+        b,
+        ch,
+        shape,
+        pcs_params,
+        statement_digest,
+        commitment_root,
+        proof,
+        spec,
+        io,
+        region,
+        |b, channel| {
+            channel.observe_label(b, POST_COMMIT_CLASS_BINDING_LABEL);
+            observe_flat_digest(b, channel, post_commit_class_digest);
+            let mut context = FieldPostCommitTraceContext::new(commitment_root, shape.m, channel);
+            post_commit(b, &mut context);
+            context.finish()
+        },
+    )
 }
 
 fn verify_field_trace_inner(
@@ -2134,9 +2352,7 @@ mod tests {
     /// reproduce the native digests.
     #[test]
     fn duplicated_tags_match_native_merkle() {
-        use noid_poseidon2b::native::{
-            compress_flat_feed_forward_with_tag, Poseidon2bFlatSponge,
-        };
+        use noid_poseidon2b::native::{compress_flat_feed_forward_with_tag, Poseidon2bFlatSponge};
         let mut rng = Rng(0x7A65);
         let (l, r) = (rng.next_hash(), rng.next_hash());
         assert_eq!(
@@ -2304,7 +2520,11 @@ mod tests {
             let claim = zerocheck_field_verify_trace(&mut b, &mut ch, m, &proof_e);
 
             assert_eq!(claim.z.eval(b.values()), native_claim.z, "z (m={m})");
-            for (e, n) in claim.mlv_challenges.iter().zip(&native_claim.mlv_challenges) {
+            for (e, n) in claim
+                .mlv_challenges
+                .iter()
+                .zip(&native_claim.mlv_challenges)
+            {
                 assert_eq!(e.eval(b.values()), *n, "mlv challenge (m={m})");
             }
             for (e, n) in claim.r_rest.iter().zip(&native_claim.r_rest) {
@@ -2573,13 +2793,8 @@ mod tests {
             .collect();
 
         let mut ch = FsLaneChallenger::new(b"self-verify-pcs-test");
-        let proof = pcs::open_batch_quirky_direct(
-            &witness,
-            &prover_data,
-            &commitment,
-            &claims,
-            &mut ch,
-        );
+        let proof =
+            pcs::open_batch_quirky_direct(&witness, &prover_data, &commitment, &claims, &mut ch);
         (params, commitment, claims, proof)
     }
 
@@ -2647,9 +2862,10 @@ mod tests {
     /// covering a single-epoch shape and a multi-epoch (FRI commit) shape.
     #[test]
     fn pcs_replay_lockstep_matches_native() {
-        for &(l_log, lb, lir, k_skip, seed) in
-            &[(6usize, 2usize, 2usize, 4usize, 0xA1u128), (9, 2, 3, 6, 0xB2)]
-        {
+        for &(l_log, lb, lir, k_skip, seed) in &[
+            (6usize, 2usize, 2usize, 4usize, 0xA1u128),
+            (9, 2, 3, 6, 0xB2),
+        ] {
             let (params, commitment, claims, proof) = pcs_fixture(l_log, lb, lir, k_skip, seed);
             let (r1cs, z, _) = build_pcs_trace(&params, &commitment, &claims, &proof);
             assert!(r1cs.satisfies(&z), "l_log={l_log} lir={lir}");
@@ -2670,7 +2886,10 @@ mod tests {
         for range in ranges {
             survivors.extend(battery.survivors(range));
         }
-        assert!(survivors.is_empty(), "PCS mutation survivors: {survivors:?}");
+        assert!(
+            survivors.is_empty(),
+            "PCS mutation survivors: {survivors:?}"
+        );
     }
 
     /// Full prove_field pipeline over a synthetic satisfiable instance —
@@ -2736,11 +2955,23 @@ mod tests {
         assert_eq!(c_t.eval(b.values()), c_n, "post-verify challenge diverged");
 
         let claim_evals = [
-            (claim.ab.value.eval(b.values()), claim.ab.z_skip.eval(b.values())),
-            (claim.c.value.eval(b.values()), claim.c.z_skip.eval(b.values())),
+            (
+                claim.ab.value.eval(b.values()),
+                claim.ab.z_skip.eval(b.values()),
+            ),
+            (
+                claim.c.value.eval(b.values()),
+                claim.c.z_skip.eval(b.values()),
+            ),
         ];
         let (out_r1cs, out_z) = b.build();
-        (out_r1cs, out_z, mutation_start..mutation_end, claim_evals, rows)
+        (
+            out_r1cs,
+            out_z,
+            mutation_start..mutation_end,
+            claim_evals,
+            rows,
+        )
     }
 
     /// THE [R] lockstep gate: the full verify_field replay on an honest
@@ -2771,7 +3002,6 @@ mod tests {
     /// unsatisfiable. 0 survivors.
     #[test]
     fn verify_field_replay_rejects_all_proof_mutations() {
-
         let (r1cs, params, commitment, proof, _) = field_proof_fixture(7, 2, 43);
         let (out_r1cs, out_z, range, _, _) =
             build_field_verify_trace(&r1cs, &params, &commitment, &proof);
@@ -2811,10 +3041,7 @@ mod tests {
                     .map(|r| vec![(if r == 0 { 0 } else { r as u32 }, F128::ONE)])
                     .collect(),
             ),
-            b_0: SparseFieldMatrix::from_rows(
-                k,
-                (0..k).map(|_| vec![(0u32, F128::ONE)]).collect(),
-            ),
+            b_0: SparseFieldMatrix::from_rows(k, (0..k).map(|_| vec![(0u32, F128::ONE)]).collect()),
             const_pin: Some(0),
             digest_cache: std::sync::OnceLock::new(),
             csc_cache: std::sync::OnceLock::new(),
@@ -2944,10 +3171,7 @@ mod tests {
                     .map(|r| vec![(if r == 0 { 0 } else { r as u32 }, F128::ONE)])
                     .collect(),
             ),
-            b_0: SparseFieldMatrix::from_rows(
-                k,
-                (0..k).map(|_| vec![(0u32, F128::ONE)]).collect(),
-            ),
+            b_0: SparseFieldMatrix::from_rows(k, (0..k).map(|_| vec![(0u32, F128::ONE)]).collect()),
             const_pin: Some(0),
             digest_cache: std::sync::OnceLock::new(),
             csc_cache: std::sync::OnceLock::new(),
@@ -3066,6 +3290,304 @@ mod tests {
         );
     }
 
+    /// Post-commit auxiliary claims occupy the same transcript position in
+    /// native matrix-free verification and its recursive trace twin: after
+    /// statement/root/public-IO binding, before zerocheck, and in the final
+    /// PCS batch. This is the causality gate used by region sidecars.
+    #[test]
+    fn verify_field_deferred_post_commit_auxiliary_lockstep() {
+        use noid_ivc_core::field_r1cs::synthetic_satisfiable;
+        use noid_ivc_core::proof::FieldShape;
+        use noid_ivc_core::public_io::{PublicIoSpec, WitnessSlice};
+        use noid_ivc_core::verifier::{verify_field_deferred_matrix_with_post_commit, VerifyError};
+        use noid_ivc_prover::field_prover::prove_field_with_public_io_and_post_commit;
+
+        #[derive(Clone)]
+        struct Aux {
+            point: Vec<F128>,
+            value: F128,
+        }
+
+        let (m, seed) = (8usize, 0x51DEC4u64);
+        let (inner, z) = synthetic_satisfiable(m, m, seed);
+        let shape = FieldShape::of(&inner);
+        let digest = inner.statement_digest();
+        let spec = PublicIoSpec {
+            io_slice: WitnessSlice {
+                log2_len: 2,
+                index: 4,
+            },
+            io_len: 4,
+            claims: Vec::new(),
+        };
+        let io: Vec<F128> = z[16..20].to_vec();
+        let params = PcsParams {
+            m: m + LOG_PACKING,
+            log_inv_rate: 2,
+            log_batch_size: 2,
+            profile: Default::default(),
+        };
+
+        let mut ch_p = FsLaneChallenger::new(b"self-verify-post-commit-test");
+        let (proof, auxiliary, commitment, _) = prove_field_with_public_io_and_post_commit(
+            &inner,
+            &z,
+            &params,
+            &spec,
+            &io,
+            &mut ch_p,
+            |z, _, ch| {
+                ch.observe_label(b"self-verify-post-commit-aux-v0");
+                let point = ch.sample_f128_vec(m);
+                let value = z
+                    .iter()
+                    .zip(noid_ivc_core::lincheck::build_eq_table(&point))
+                    .fold(F128::ZERO, |sum, (&v, eq)| sum + v * eq);
+                ch.observe_f128(value);
+                let claim = pcs::QuirkyDirectClaim {
+                    z_skip: F128::ZERO,
+                    k_skip: 0,
+                    x_rest: point.clone(),
+                    value,
+                };
+                (Aux { point, value }, vec![claim])
+            },
+        );
+
+        let mut ch_native = FsLaneChallenger::new(b"self-verify-post-commit-test");
+        let (_, fresh_native) = verify_field_deferred_matrix_with_post_commit(
+            &shape,
+            &digest,
+            &commitment,
+            &proof,
+            &spec,
+            &io,
+            &auxiliary,
+            &mut ch_native,
+            |aux, ch| {
+                ch.observe_label(b"self-verify-post-commit-aux-v0");
+                if ch.sample_f128_vec(m) != aux.point {
+                    return Err(VerifyError::Auxiliary);
+                }
+                ch.observe_f128(aux.value);
+                Ok(vec![pcs::QuirkyDirectClaim {
+                    z_skip: F128::ZERO,
+                    k_skip: 0,
+                    x_rest: aux.point.clone(),
+                    value: aux.value,
+                }])
+            },
+        )
+        .expect("native post-commit deferred verify");
+
+        let mut b = FieldR1csBuilder::new();
+        let mut ch = FsChannelTrace::new(&mut b, b"self-verify-post-commit-test");
+        let digest_e = alloc_flat_digest(&mut b, &digest);
+        let root = alloc_flat_digest(&mut b, &commitment.root);
+        let io_e: Vec<LinExpr> = io
+            .iter()
+            .map(|&v| LinExpr::from_wire(b.alloc_f128(v)))
+            .collect();
+        let proof_e = FieldR1csProofTrace::alloc_shape(&mut b, &proof, &shape, &params);
+        let aux_start = b.num_wires();
+        let aux_point_e: Vec<LinExpr> = auxiliary
+            .point
+            .iter()
+            .map(|&v| LinExpr::from_wire(b.alloc_f128(v)))
+            .collect();
+        let aux_value_e = LinExpr::from_wire(b.alloc_f128(auxiliary.value));
+        let aux_end = b.num_wires();
+        let (_, fresh_e) = verify_field_trace_deferred_region_with_post_commit(
+            &mut b,
+            &mut ch,
+            &shape,
+            &params,
+            &digest_e,
+            &root,
+            &proof_e,
+            &spec,
+            &io_e,
+            None,
+            |b, ch| {
+                ch.observe_label(b, b"self-verify-post-commit-aux-v0");
+                let expected = ch.sample_f128_vec(b, m);
+                for (got, expected) in aux_point_e.iter().zip(&expected) {
+                    pin_eq(b, got, expected);
+                }
+                ch.observe_f128(b, &aux_value_e);
+                vec![QuirkyDirectClaimTrace {
+                    z_skip: LinExpr::zero(),
+                    k_skip: 0,
+                    x_rest: aux_point_e.clone(),
+                    value: aux_value_e.clone(),
+                }]
+            },
+        );
+
+        assert_eq!(fresh_e.value.eval(b.values()), fresh_native.value);
+        let post_native = ch_native.sample_f128();
+        let post_trace = ch.sample_f128(&mut b);
+        assert_eq!(post_trace.eval(b.values()), post_native);
+        let (r1cs, witness) = b.build();
+        assert!(r1cs.satisfies(&witness));
+        let survivors = r1cs.flip_battery(&witness).survivors(aux_start..aux_end);
+        assert!(
+            survivors.is_empty(),
+            "post-commit auxiliary mutation survivors: {survivors:?}"
+        );
+    }
+
+    #[test]
+    fn verify_field_deferred_post_commit_context_lockstep() {
+        use noid_ivc_core::field_r1cs::synthetic_satisfiable;
+        use noid_ivc_core::proof::FieldShape;
+        use noid_ivc_core::public_io::{PublicIoSpec, WitnessSlice};
+        use noid_ivc_core::verifier::{
+            verify_field_deferred_matrix_with_post_commit_context, VerifyError,
+        };
+        use noid_ivc_prover::field_prover::prove_field_with_public_io_and_post_commit_context;
+
+        const CLASS_DIGEST: [u8; 32] = [0xAC; 32];
+
+        #[derive(Clone)]
+        struct Aux {
+            point: Vec<F128>,
+            value: F128,
+        }
+
+        let (m, seed) = (7usize, 0xC07E57u64);
+        let (inner, z) = synthetic_satisfiable(m, m, seed);
+        let shape = FieldShape::of(&inner);
+        let digest = inner.statement_digest();
+        let spec = PublicIoSpec {
+            io_slice: WitnessSlice {
+                log2_len: 2,
+                index: 4,
+            },
+            io_len: 4,
+            claims: Vec::new(),
+        };
+        let io: Vec<F128> = z[16..20].to_vec();
+        let params = PcsParams {
+            m: m + LOG_PACKING,
+            log_inv_rate: 2,
+            log_batch_size: 2,
+            profile: Default::default(),
+        };
+
+        let mut ch_p = FsLaneChallenger::new(b"self-verify-post-commit-context-test");
+        let (proof, auxiliary, commitment, _) = prove_field_with_public_io_and_post_commit_context(
+            &inner,
+            &z,
+            &params,
+            &spec,
+            &io,
+            &CLASS_DIGEST,
+            &mut ch_p,
+            |context| {
+                context.observe_label(b"self-verify-post-commit-context-aux-v1");
+                let point = context.sample_f128_vec(m);
+                let value = context
+                    .witness()
+                    .iter()
+                    .zip(noid_ivc_core::lincheck::build_eq_table(&point))
+                    .fold(F128::ZERO, |sum, (&v, eq)| sum + v * eq);
+                context.observe_f128(value);
+                context.append_claim(pcs::QuirkyDirectClaim {
+                    z_skip: F128::ZERO,
+                    k_skip: 0,
+                    x_rest: point.clone(),
+                    value,
+                });
+                Aux { point, value }
+            },
+        );
+
+        let mut ch_native = FsLaneChallenger::new(b"self-verify-post-commit-context-test");
+        let (_, fresh_native) = verify_field_deferred_matrix_with_post_commit_context(
+            &shape,
+            &digest,
+            &commitment,
+            &proof,
+            &spec,
+            &io,
+            &CLASS_DIGEST,
+            &auxiliary,
+            &mut ch_native,
+            |auxiliary, context| {
+                context.observe_label(b"self-verify-post-commit-context-aux-v1");
+                if context.sample_f128_vec(m) != auxiliary.point {
+                    return Err(VerifyError::Auxiliary);
+                }
+                context.observe_f128(auxiliary.value);
+                context.append_claim(pcs::QuirkyDirectClaim {
+                    z_skip: F128::ZERO,
+                    k_skip: 0,
+                    x_rest: auxiliary.point.clone(),
+                    value: auxiliary.value,
+                });
+                Ok(())
+            },
+        )
+        .expect("native post-commit context deferred verify");
+
+        let mut b = FieldR1csBuilder::new();
+        let mut ch = FsChannelTrace::new(&mut b, b"self-verify-post-commit-context-test");
+        let digest_e = alloc_flat_digest(&mut b, &digest);
+        let root = alloc_flat_digest(&mut b, &commitment.root);
+        let io_e: Vec<LinExpr> = io
+            .iter()
+            .map(|&value| LinExpr::from_wire(b.alloc_f128(value)))
+            .collect();
+        let proof_e = FieldR1csProofTrace::alloc_shape(&mut b, &proof, &shape, &params);
+        let point_e: Vec<LinExpr> = auxiliary
+            .point
+            .iter()
+            .map(|&value| LinExpr::from_wire(b.alloc_f128(value)))
+            .collect();
+        let value_e = LinExpr::from_wire(b.alloc_f128(auxiliary.value));
+        let (_, fresh_e) = verify_field_trace_deferred_region_with_post_commit_context(
+            &mut b,
+            &mut ch,
+            &shape,
+            &params,
+            &digest_e,
+            &root,
+            &proof_e,
+            &spec,
+            &io_e,
+            &CLASS_DIGEST,
+            None,
+            |b, context| {
+                assert_eq!(context.total_vars(), m);
+                assert_eq!(
+                    context.commitment_root()[0].eval(b.values()),
+                    root[0].eval(b.values())
+                );
+                context.observe_label(b, b"self-verify-post-commit-context-aux-v1");
+                let expected = context.sample_f128_vec(b, m);
+                for (got, expected) in point_e.iter().zip(&expected) {
+                    pin_eq(b, got, expected);
+                }
+                context.observe_f128(b, &value_e);
+                context.append_claim(QuirkyDirectClaimTrace {
+                    z_skip: LinExpr::zero(),
+                    k_skip: 0,
+                    x_rest: point_e.clone(),
+                    value: value_e.clone(),
+                });
+                assert_eq!(context.claim_count(), 1);
+            },
+        );
+
+        assert_eq!(fresh_e.value.eval(b.values()), fresh_native.value);
+        let post_native = ch_native.sample_f128();
+        let post_trace = ch.sample_f128(&mut b);
+        assert_eq!(post_trace.eval(b.values()), post_native);
+        let (r1cs, witness) = b.build();
+        assert!(r1cs.satisfies(&witness));
+    }
+
     /// The walk-discharge (region) mode of the deferred [R] replay:
     /// identical transcript and deferred claim to the inline mode (the
     /// hashing never touched the channel), a satisfiable path-free trace,
@@ -3082,7 +3604,10 @@ mod tests {
         let (m, k_log, seed) = (10usize, 10usize, 0x0B11u64);
         let (inner, z) = synthetic_satisfiable(m, k_log, seed);
         let spec = PublicIoSpec {
-            io_slice: WitnessSlice { log2_len: 2, index: 4 },
+            io_slice: WitnessSlice {
+                log2_len: 2,
+                index: 4,
+            },
             io_len: 4,
             claims: vec![],
         };
@@ -3122,7 +3647,10 @@ mod tests {
             let fresh_v = fresh_e.value.eval(b.values());
             let post_v = post.eval(b.values());
             let (r1cs_t, z_t) = b.build();
-            assert!(r1cs_t.satisfies(&z_t), "trace unsatisfiable (alloc_paths={alloc_paths})");
+            assert!(
+                r1cs_t.satisfies(&z_t),
+                "trace unsatisfiable (alloc_paths={alloc_paths})"
+            );
             (rows, fresh_v, post_v)
         };
 
@@ -3136,9 +3664,18 @@ mod tests {
         );
 
         // Transcript + claim parity (the hashing never touched the channel).
-        assert_eq!(post_region, post_inline, "region mode diverged the transcript");
-        assert_eq!(fresh_region, fresh_inline, "region mode changed the deferred claim");
-        assert!(rows_region < rows_inline, "region mode did not shrink the trace");
+        assert_eq!(
+            post_region, post_inline,
+            "region mode diverged the transcript"
+        );
+        assert_eq!(
+            fresh_region, fresh_inline,
+            "region mode changed the deferred claim"
+        );
+        assert!(
+            rows_region < rows_inline,
+            "region mode did not shrink the trace"
+        );
 
         // Obligation structure: per query one pair per verified tree, dir
         // bits matching the tree depths, even lane counts throughout.

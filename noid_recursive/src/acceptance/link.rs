@@ -67,6 +67,7 @@ use crate::accumulator::{
 use crate::block_certificate_backend::{
     AcceptedBlockBatchComponentInputs, AcceptedBlockBatchComponentProof,
 };
+use noid_chain::BlockHeader;
 use noid_core::Block128;
 use noid_ivc_prover::field_prover::prove_field_with_public_io;
 
@@ -1172,6 +1173,25 @@ pub fn decide_tip(
         return Err("accumulated matrix claim is false".into());
     }
     Ok(())
+}
+
+/// Final decider for a block-bearing tip against the node's locally selected
+/// canonical headers. This composes proof/matrix verification with exact
+/// equality of all ten direct-accumulator lanes.
+pub fn decide_block_tip(
+    class: &LinkClass,
+    class_r1cs: &FieldR1cs,
+    tip: &LinkEnvelope,
+    local_tip_header: &BlockHeader,
+    local_epoch_anchor_header: &BlockHeader,
+) -> Result<(), String> {
+    decide_tip(class, class_r1cs, tip)?;
+    let accumulator = tip_block_accumulator(class, tip)
+        .map_err(|error| format!("tip accumulator decode failed: {error:?}"))?
+        .ok_or_else(|| "tip class is not block-bearing".to_owned())?;
+    accumulator
+        .validate_local_header_boundary(local_tip_header, local_epoch_anchor_header)
+        .map_err(|error| format!("tip does not match local canonical headers: {error}"))
 }
 
 /// The tip's exposed block chain accumulator (block-bearing class only) —

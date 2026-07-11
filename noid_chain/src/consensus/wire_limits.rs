@@ -45,6 +45,9 @@ pub const MAX_BLOCK_RESOURCE_WEIGHT: usize = 64 * 1024 * 1024;
 pub const BLOCK_WEIGHT_PER_USER_TX: usize = 16 * 1024;
 pub const BLOCK_WEIGHT_PER_LIVE_INPUT: usize = 2 * 1024;
 pub const BLOCK_WEIGHT_PER_OUTPUT: usize = 1024;
+/// Charge per missing digest in the canonical sibling frontier. Touched leaf
+/// work is charged separately through the live-input/output terms; this is a
+/// conservative admission guard, not a literal count of old/new hash calls.
 pub const BLOCK_WEIGHT_PER_STATE_FRONTIER_NODE: usize = 256;
 
 /// Gossipsub message size. Large blocks must use compact announce + pull.
@@ -169,5 +172,34 @@ mod tests {
     fn resource_weight_uses_checked_arithmetic() {
         assert!(block_resource_weight(1, 2, 3, 4, 5, 6, 7).is_some());
         assert!(block_resource_weight(usize::MAX, 1, 0, 0, 0, 0, 0).is_none());
+    }
+
+    #[test]
+    fn legal_depth32_b255_frontier_fits_resource_weight() {
+        use crate::consensus::params::{
+            BLOCK_MAX_ACTIONS, BLOCK_MAX_DISTINCT_SEGMENTS, BLOCK_MAX_LIVE_INPUTS, BLOCK_MAX_TXS,
+            BLOCK_MAX_USER_OUTPUTS, BLOCK_MAX_USER_TXS, LOG_SEGMENT_SIZE,
+        };
+
+        let frontier = crate::sparse_merkle::maximum_sibling_count_with_segment_cap(
+            BLOCK_MAX_ACTIONS,
+            32,
+            LOG_SEGMENT_SIZE,
+            BLOCK_MAX_DISTINCT_SEGMENTS,
+        );
+        assert_eq!(frontier, 22_468);
+        let weight = block_resource_weight(
+            MAX_BLOCK_BYTES,
+            MAX_BLOCK_PROOF_BYTES,
+            MAX_BLOCK_PROOF_PLUS_SIDECAR_BYTES - MAX_BLOCK_PROOF_BYTES,
+            BLOCK_MAX_USER_TXS,
+            BLOCK_MAX_LIVE_INPUTS,
+            BLOCK_MAX_USER_OUTPUTS + 1,
+            frontier,
+        )
+        .unwrap();
+        assert_eq!(BLOCK_MAX_TXS, 256);
+        assert_eq!(weight, 62_956_505);
+        assert!(weight <= MAX_BLOCK_RESOURCE_WEIGHT);
     }
 }

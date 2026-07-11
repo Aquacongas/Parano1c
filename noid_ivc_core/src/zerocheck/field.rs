@@ -562,10 +562,7 @@ mod tests {
             ("round1_ab[0]", Box::new(|p| p.round1_ab[0].lo ^= 1)),
             ("round1_ab[63]", Box::new(|p| p.round1_ab[63].hi ^= 1)),
             ("round1_c[5]", Box::new(|p| p.round1_c[5].lo ^= 1)),
-            (
-                "mlv[0].0",
-                Box::new(|p| p.multilinear_rounds[0].0.lo ^= 1),
-            ),
+            ("mlv[0].0", Box::new(|p| p.multilinear_rounds[0].0.lo ^= 1)),
             (
                 "mlv[last].1",
                 Box::new(|p| {

@@ -145,11 +145,7 @@ impl FixedPattern {
             acc += *v * *e;
         }
         if let Some((first, bits)) = &self.hi_gate {
-            assert_eq!(
-                point.len(),
-                first + bits.len(),
-                "gated pattern point arity"
-            );
+            assert_eq!(point.len(), first + bits.len(), "gated pattern point arity");
             for (j, bit) in bits.iter().enumerate() {
                 let p = point[first + j];
                 acc = acc * if *bit { p } else { F128::ONE + p };
@@ -197,7 +193,7 @@ pub struct RelationTerm {
 }
 
 /// Proof wires of one relation sumcheck.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ColumnRelationProof {
     /// Per round: `[c_0, c_2, .., c_d]` (compressed wire form).
     pub rounds: Vec<[F128; RELATION_DEGREE]>,
@@ -257,7 +253,10 @@ pub fn claimed_refs(terms: &[RelationTerm]) -> Vec<ColRef> {
 /// fixed low bits select the coset; the high coordinates are `point`), so
 /// the caller discharges it directly as a PCS opening — no shift kernel.
 pub fn window_discharge_point(offset: usize, stride_log: usize, point: &[F128]) -> Vec<F128> {
-    debug_assert!(offset < (1usize << stride_log), "window offset outside stride");
+    debug_assert!(
+        offset < (1usize << stride_log),
+        "window offset outside stride"
+    );
     let mut out = Vec::with_capacity(stride_log + point.len());
     for j in 0..stride_log {
         out.push(if (offset >> j) & 1 == 1 {
@@ -599,10 +598,7 @@ pub fn verify_column_relation<Ch: Challenger>(
                 * match f {
                     ColRef::Fixed(i) => fixed[*i].eval(&point),
                     _ => {
-                        let fi = claimed
-                            .iter()
-                            .position(|r| r == f)
-                            .expect("claimed ref");
+                        let fi = claimed.iter().position(|r| r == f).expect("claimed ref");
                         proof.final_values[fi]
                     }
                 };
@@ -675,7 +671,7 @@ pub fn shift_pow2_kernel_eval(shift_log: usize, rho: &[F128], sigma: &[F128]) ->
 
 /// Proof wires of one shift discharge (degree-2 rounds `[c_0, c_2]` plus
 /// the terminal plain MLE value).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ShiftDischargeProof {
     pub rounds: Vec<[F128; 2]>,
     pub final_value: F128,
@@ -1181,8 +1177,9 @@ mod tests {
         let (proof, point_p, values_p) =
             prove_column_relation(target, &eq_point, &terms, &columns, &mut ch_p);
         let mut ch_v = FsLaneChallenger::new(b"relation-test");
-        let point_v = verify_column_relation(w_log, target, &eq_point, &terms, &[], &proof, &mut ch_v)
-            .expect("honest relation");
+        let point_v =
+            verify_column_relation(w_log, target, &eq_point, &terms, &[], &proof, &mut ch_v)
+                .expect("honest relation");
         assert_eq!(point_p, point_v);
         assert_eq!(values_p, proof.final_values);
         assert_eq!(ch_p.sample_f128(), ch_v.sample_f128());
@@ -1251,7 +1248,10 @@ mod tests {
                 }
             }
         }
-        assert!(survivors.is_empty(), "relation mutation survivors: {survivors:?}");
+        assert!(
+            survivors.is_empty(),
+            "relation mutation survivors: {survivors:?}"
+        );
     }
 
     /// Weighted-sum discharge with a tensor-product closed-form weight (the
@@ -1302,7 +1302,9 @@ mod tests {
 
         // Forged target rejected.
         let mut ch = FsLaneChallenger::new(b"wsum-test");
-        assert!(verify_weighted_sum(w_log, weight_eval, target + F128::ONE, &proof, &mut ch).is_err());
+        assert!(
+            verify_weighted_sum(w_log, weight_eval, target + F128::ONE, &proof, &mut ch).is_err()
+        );
 
         // Wire mutations rejected or land on a false plain claim.
         for round in 0..w_log {
@@ -1407,7 +1409,11 @@ mod tests {
         for offset in 0..(1usize << stride_log) {
             let win: Vec<F128> = (0..w).map(|i| child[(i << stride_log) + offset]).collect();
             let pt = window_discharge_point(offset, stride_log, &point_v);
-            assert_eq!(mle_eval(&win, &point_v), mle_eval(&child, &pt), "offset {offset}");
+            assert_eq!(
+                mle_eval(&win, &point_v),
+                mle_eval(&child, &pt),
+                "offset {offset}"
+            );
         }
 
         // Forged target and every wire mutation rejected (or land on a false
@@ -1455,7 +1461,10 @@ mod tests {
                 }
             }
         }
-        assert!(survivors.is_empty(), "window mutation survivors: {survivors:?}");
+        assert!(
+            survivors.is_empty(),
+            "window mutation survivors: {survivors:?}"
+        );
     }
 
     /// Fixed patterns: a periodic selector gating a 3-factor term. The
@@ -1589,8 +1598,9 @@ mod tests {
         let (proof, _, _) =
             prove_column_relation(F128::ZERO, &eq_point, &terms, &columns, &mut ch_p);
         let mut ch_v = FsLaneChallenger::new(b"bool-test");
-        let pt = verify_column_relation(w_log, F128::ZERO, &eq_point, &terms, &[], &proof, &mut ch_v)
-            .expect("boolean column accepted");
+        let pt =
+            verify_column_relation(w_log, F128::ZERO, &eq_point, &terms, &[], &proof, &mut ch_v)
+                .expect("boolean column accepted");
         assert_eq!(proof.final_values[0], mle_eval(&good, &pt));
 
         // Non-boolean column: the honest prover's target over it is nonzero

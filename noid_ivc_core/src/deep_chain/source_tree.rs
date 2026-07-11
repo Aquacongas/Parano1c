@@ -499,10 +499,8 @@ mod tests {
     }
 
     fn ref_compress(l: [Block128; 2], r: [Block128; 2]) -> [Block128; 2] {
-        let out = noid_poseidon2b::native::compress(
-            &digest_bytes(l[0], l[1]),
-            &digest_bytes(r[0], r[1]),
-        );
+        let out =
+            noid_poseidon2b::native::compress(&digest_bytes(l[0], l[1]), &digest_bytes(r[0], r[1]));
         [
             Block128::from(u128::from_le_bytes(out[..16].try_into().unwrap())),
             Block128::from(u128::from_le_bytes(out[16..].try_into().unwrap())),
@@ -538,8 +536,16 @@ mod tests {
 
             let cols = build_source_tree_columns(&tree, &code_flat, w_log);
             let want = reference_root(&code_tower);
-            assert_eq!(cols.root[0], tower_flat(want[0]), "root lane 0 (leaf_log={leaf_log})");
-            assert_eq!(cols.root[1], tower_flat(want[1]), "root lane 1 (leaf_log={leaf_log})");
+            assert_eq!(
+                cols.root[0],
+                tower_flat(want[0]),
+                "root lane 0 (leaf_log={leaf_log})"
+            );
+            assert_eq!(
+                cols.root[1],
+                tower_flat(want[1]),
+                "root lane 1 (leaf_log={leaf_log})"
+            );
         }
     }
 
@@ -567,7 +573,9 @@ mod tests {
         let iv = compress_iv_flat();
 
         let mut rng = Rng(0x7EE);
-        let code: Vec<F128> = (0..tree.code_len()).map(|_| tower_flat(rng.block())).collect();
+        let code: Vec<F128> = (0..tree.code_len())
+            .map(|_| tower_flat(rng.block()))
+            .collect();
         let cols = build_source_tree_columns(&tree, &code, w_log);
         let code_cols = build_source_code_columns(&tree, &code, w_log);
         let fixed = source_tree_fixed_patterns(&tree, iv);
@@ -575,7 +583,13 @@ mod tests {
 
         // Boolean point for the root at heap node 1's odd slot (index 3).
         let root_point: Vec<F128> = (0..w_log)
-            .map(|b| if (3usize >> b) & 1 == 1 { F128::ONE } else { F128::ZERO })
+            .map(|b| {
+                if (3usize >> b) & 1 == 1 {
+                    F128::ONE
+                } else {
+                    F128::ZERO
+                }
+            })
             .collect();
 
         // committed column order matches source_tree_refs: CODE0/1, KID0/1, C0..3.
@@ -585,9 +599,8 @@ mod tests {
                    kid1: &[F128],
                    c: &[Vec<F128>; STATE_SIZE]|
          -> Result<(), String> {
-            let committed: Vec<&[F128]> = vec![
-                code0, code1, kid0, kid1, &c[0], &c[1], &c[2], &c[3],
-            ];
+            let committed: Vec<&[F128]> =
+                vec![code0, code1, kid0, kid1, &c[0], &c[1], &c[2], &c[3]];
             let internal: Vec<&[F128]> = cols.s_out.iter().map(|c| c.as_slice()).collect();
             let mut ch_p = FsLaneChallenger::new(b"source-tree-dag");
             let mut ch_v = FsLaneChallenger::new(b"source-tree-dag");
@@ -610,9 +623,16 @@ mod tests {
                 },
                 &mut ch_p,
             );
-            let sel_point =
-                verify_column_relation(w_log, F128::ZERO, &rho, &sel_terms, &fixed, &sel_proof, &mut ch_v)
-                    .map_err(|e| format!("selection: {e}"))?;
+            let sel_point = verify_column_relation(
+                w_log,
+                F128::ZERO,
+                &rho,
+                &sel_terms,
+                &fixed,
+                &sel_proof,
+                &mut ch_v,
+            )
+            .map_err(|e| format!("selection: {e}"))?;
             let sel_claimed = claimed_refs(&sel_terms);
             let mut group_values = [F128::ZERO; STATE_SIZE];
             for (r, v) in sel_claimed.iter().zip(sel_proof.final_values.iter()) {
@@ -668,7 +688,8 @@ mod tests {
                 match r {
                     ColRef::Committed(cc) => pending.push((*cc, sub_point.clone(), *v)),
                     ColRef::CommittedShift(cc) => {
-                        let (pr, _) = prove_shift_discharge(committed[*cc], &sub_point, *v, &mut ch_p);
+                        let (pr, _) =
+                            prove_shift_discharge(committed[*cc], &sub_point, *v, &mut ch_p);
                         let pt = verify_shift_discharge(w_log, &sub_point, *v, &pr, &mut ch_v)
                             .map_err(|e| format!("shift: {e}"))?;
                         pending.push((*cc, pt, pr.final_value));
@@ -707,7 +728,10 @@ mod tests {
                 &mut ch_v,
             )
             .map_err(|e| format!("exposure: {e}"))?;
-            for (r, v) in claimed_refs(&expo_terms).iter().zip(expo_proof.final_values.iter()) {
+            for (r, v) in claimed_refs(&expo_terms)
+                .iter()
+                .zip(expo_proof.final_values.iter())
+            {
                 match r {
                     // KID low-slice claims: check against the low half.
                     ColRef::Committed(0) => {
@@ -721,7 +745,11 @@ mod tests {
                         }
                     }
                     // Window(C_i,1,1) → plain C_i opening at [1, expo_point].
-                    ColRef::Window { col, stride_log, offset } => {
+                    ColRef::Window {
+                        col,
+                        stride_log,
+                        offset,
+                    } => {
                         let pt = window_discharge_point(*offset, *stride_log, &expo_point);
                         let idx = if *col == 2 { 0 } else { 1 };
                         if mle_eval(&c[idx], &pt) != *v {
@@ -774,7 +802,14 @@ mod tests {
             let mut bad = cols.c.clone();
             bad[0][5] += F128::ONE;
             assert!(
-                run(&code_cols[0], &code_cols[1], &cols.kid[0], &cols.kid[1], &bad).is_err(),
+                run(
+                    &code_cols[0],
+                    &code_cols[1],
+                    &cols.kid[0],
+                    &cols.kid[1],
+                    &bad
+                )
+                .is_err(),
                 "corrupted C lane accepted"
             );
         }
@@ -803,10 +838,8 @@ mod tests {
             let b0 = rng.block();
             let b1 = rng.block();
 
-            let native = noid_poseidon2b::native::compress(
-                &digest_bytes(a0, a1),
-                &digest_bytes(b0, b1),
-            );
+            let native =
+                noid_poseidon2b::native::compress(&digest_bytes(a0, a1), &digest_bytes(b0, b1));
             let n0 = Block128::from(u128::from_le_bytes(native[..16].try_into().unwrap()));
             let n1 = Block128::from(u128::from_le_bytes(native[16..].try_into().unwrap()));
 

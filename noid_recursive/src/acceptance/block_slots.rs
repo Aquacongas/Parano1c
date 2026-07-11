@@ -29,16 +29,18 @@
 //! - each owner-auth slot pins its `tx_body_hash` to the spine hash of its
 //!   tx and discharges its wallet-PCS obligation; the authorization totals
 //!   are pinned to the per-slot counts AND to the claim's resource fields;
-//! - exact-state old paths pin directly to the parent state root (or its
-//!   canonical one-level grow), new paths to the child header state root,
-//!   and every path depth to the child `log_slots` lane.
+//! - production exact state derives a fixed-capacity paired local/upper walk
+//!   from the sibling-only structural carrier. Slot-sorted action leaves and
+//!   all 32 slot bits bind its entries/directions; local and segment chains
+//!   end at the parent/grown-parent and child header roots selected by the
+//!   header-bound dynamic depth.
+//! - each user's selected input/output amounts obey checked conservation; the
+//!   same selected bitmap bits drive minimum fee and deterministic burn under
+//!   parent occupancy, and the mandatory coinbase is bounded by child-depth
+//!   reward plus the checked 72-bit claimable-fee aggregate.
 //!
 //! NOT bound here (audited residue, each correctly scoped to another
 //! layer, none a hole in what this file claims):
-//! - exact-state ActionSurface recombination remains a C' obligation. The
-//!   hashing layer here does close slot-leaf ↔ state-path ↔ header-root in
-//!   both inline and region modes.
-//! - public transaction logic — likewise a region-layer per-tx obligation.
 //! - the parent header's `active_slot_count` / `alloc_counter`: CLOSED —
 //!   the accumulator boundary carries both counters as lanes; each block
 //!   pins its start counters to the claim's PARENT section and its end
@@ -46,16 +48,17 @@
 //!   `start == prev.end` closes the chain. Header PoW/ASERT/MTP fields
 //!   (timestamp, miner, nonce, target) are deliberately out of π's
 //!   scope — a fresh peer validates its own header chain.
-//! - the wallet-capsule PCS opening: replayed by `discharge_auth_pcs_
-//!   obligation` when [`BlockSlotsConfig::discharge_wallet_pcs`] is set, but
-//!   its trace STRUCTURE is proof-dependent (compact-FRI query positions /
-//!   Merkle schedule), so it is the SOLE obstacle to a fixed class matrix
-//!   across different blocks — everything else here is already class-fixed.
-//!   Its class-fixed form is a region-layer ([G]) obligation.
+//! - shared-region column algebra must be discharged by the post-commit
+//!   sidecar: its relation challenges are sampled only after the outer witness
+//!   commitment. The older in-builder A/B/C/D transcript twins are retained
+//!   temporarily during that migration, but are not production proof
+//!   authority because their columns were not committed before their local
+//!   Fiat--Shamir draws.
 //!
-//! A proof assembled from these slots binds the block's hashing work and
-//! the full statement skeleton; the transition-semantics gluing and the
-//! shape-fixed wallet-PCS are the region-layer remainder.
+//! The direct rows in this assembly bind authorization, action routing,
+//! exact-state transition, continuity, and checked monetary arithmetic. A
+//! production proof additionally requires the post-commit region sidecar to
+//! make the shared hashing-column reductions sound.
 
 use noid_core::Block128;
 use noid_gkr::merkle_circuit::MerkleCircuit;
@@ -69,32 +72,49 @@ use super::trace::accepted_claim_batch::{
 use super::trace::accepted_claim_hash::{
     build_accepted_claim_hash_slot, AcceptedClaimHashInputsTrace,
 };
+use super::trace::action_compaction::{
+    bind_mint_packed_values_body_order, compact_action_rows, CompactedActionTrace,
+};
+use super::trace::action_surface::{
+    bind_coinbase_action_with_amount, bind_user_action_surface, ActionRowTrace,
+};
 use super::trace::checkpoint_poseidon::{
     build_checkpoint_poseidon_slot_with_inputs, HeaderHashInputsTrace,
 };
 use super::trace::exact_state::{
-    bind_exact_state_header_roots, build_exact_state_slot_with_config,
-    scratch_exact_state_region_data, ExactStateSlotWires,
+    bind_actions_to_exact_state_leaves, bind_exact_state_header_roots_dynamic,
+    bind_structural_frontier_count_from_actions_dynamic, build_exact_state_slot_with_config,
+    build_exact_state_structural_region_slot, select_upper_paired_roots, ExactStateSlotWires,
+    PairedRootCellPair, StateDepthTrace,
 };
+use super::trace::fee_arithmetic::bind_block_fee_arithmetic;
 use super::trace::merkle_path::{build_batched_merkle_slot, MerklePathInputsTrace};
 use super::trace::owner_auth::{
     build_owner_auth_slot, OwnerAuthProofTrace, OwnerAuthPublicInputsTrace,
 };
+use super::trace::public_arithmetic::{bind_user_public_arithmetic, UserPublicArithmeticTrace};
 use super::trace::region_source_binding::{
-    discharge_auth_pcs_obligations_via_region, discharge_owner_auth_killshots_via_region,
+    discharge_auth_pcs_obligations_via_region,
+    discharge_auth_pcs_obligations_via_region_with_paired_handoff,
+    discharge_owner_auth_killshots_via_region,
+    prepare_auth_pcs_obligations_via_region_with_paired_handoff,
+    prepare_owner_auth_killshots_via_region, AuthPcsRegionPreparation, PairedExactStateCells,
     RegionDischargeParams, RegionPcsClaim, SpineInstanceRegion, SpineRegionData, TxRootPathRegion,
     TxRootRegionData,
 };
+use super::trace::segment_compaction::{bind_segment_upper_chain, compact_segment_updates};
 use super::trace::tx_body_spine::{build_tx_body_slot, SpineInputsTrace};
 use super::trace::{
     alloc_block, const_block, flat_const, flat_of, integer_add_no_overflow, mul, pin_eq,
-    pin_lt_strict, pin_zero, range_check_bits, FieldR1csBuilder, LinExpr, RawChannelTrace, F128,
+    pin_lt_strict, pin_zero, range_check_bits, FieldR1csBuilder, LinExpr, RawChannelTrace, Wire,
+    F128,
 };
 use crate::accumulator::ChainAccumulator;
 use crate::block_certificate_backend::{
     AcceptedBlockBatchComponentInputs, AcceptedBlockBatchComponentProof,
 };
 use crate::pow_header::header_hash_proof_inputs;
+use crate::region_sidecar::{BlockRegionPreparation, BlockRegionProverInput, BlockRegionSidecarVk};
 use noid_gkr::SpineInputs;
 use noid_ivc_core::deep_chain::spine::SpineInstanceFlat;
 
@@ -199,6 +219,105 @@ fn pin_u64_successor(b: &mut FieldR1csBuilder, parent: &LinExpr, child: &LinExpr
     pin_eq(b, child, &recon);
 }
 
+/// Prove `parent + mints = child + spends` over unsigned u64 integers.
+/// Both sides reject overflow; the scalar inputs are range-checked by the
+/// adders rather than interpreted as characteristic-two XOR sums.
+fn bind_active_slot_counter_delta(
+    b: &mut FieldR1csBuilder,
+    parent: &LinExpr,
+    child: &LinExpr,
+    spends: &LinExpr,
+    mints: &LinExpr,
+) {
+    let parent_plus_mints = integer_add_no_overflow(b, parent, mints, 64);
+    let child_plus_spends = integer_add_no_overflow(b, child, spends, 64);
+    pin_eq(b, &parent_plus_mints, &child_plus_spends);
+}
+
+/// Close the production exact-state relation from the slot-sorted action
+/// prefix through the paired local/upper Merkle walks to the header-bound
+/// old/new roots.
+fn bind_paired_exact_state_transition(
+    b: &mut FieldR1csBuilder,
+    actions: &CompactedActionTrace,
+    exact_state: &ExactStateSlotWires,
+    paired: &PairedExactStateCells,
+    child_depth: &StateDepthTrace,
+) {
+    let touched_capacity = actions.rows.len();
+    assert_eq!(exact_state.slot_leaves.len(), 2 * touched_capacity);
+    assert_eq!(paired.local.len(), touched_capacity);
+    assert!(!paired.upper.is_empty());
+    assert!(paired.upper.len() <= touched_capacity);
+
+    let (old_leaves, new_leaves) = exact_state.slot_leaves.split_at(touched_capacity);
+    bind_actions_to_exact_state_leaves(b, &actions.rows, old_leaves, new_leaves);
+
+    let mut local_before = Vec::with_capacity(touched_capacity);
+    let mut local_after = Vec::with_capacity(touched_capacity);
+    for index in 0..touched_capacity {
+        let cells = &paired.local[index];
+        pin_eq2(b, &old_leaves[index].expected_leaf, &cells.old_entry);
+        pin_eq2(b, &new_leaves[index].expected_leaf, &cells.new_entry);
+        for level in 0..16 {
+            pin_eq(
+                b,
+                &cells.directions[level],
+                &LinExpr::from_wire(actions.slot_bits[index][level]),
+            );
+        }
+        local_before.push(cells.old_root.clone());
+        local_after.push(cells.new_root.clone());
+    }
+
+    let segments = compact_segment_updates(
+        b,
+        &actions.rows,
+        &actions.slot_bits,
+        &actions.adjacent_msb_one_hot,
+        &actions.adjacent_both_live,
+        &local_before,
+        &local_after,
+        paired.upper.len(),
+    );
+
+    let mut upper_old_entries = Vec::with_capacity(paired.upper.len());
+    let mut upper_new_entries = Vec::with_capacity(paired.upper.len());
+    let mut upper_before = Vec::with_capacity(paired.upper.len());
+    let mut upper_after = Vec::with_capacity(paired.upper.len());
+    for (index, cells) in paired.upper.iter().enumerate() {
+        for level in 0..16 {
+            pin_eq(
+                b,
+                &cells.directions[level],
+                &LinExpr::from_wire(segments.segment_id_bits[index][level]),
+            );
+        }
+        let roots_by_depth: [PairedRootCellPair; 16] = std::array::from_fn(|level| {
+            [
+                cells.old_roots[level].clone(),
+                cells.new_roots[level].clone(),
+            ]
+        });
+        let selected = select_upper_paired_roots(b, child_depth, &roots_by_depth);
+        upper_old_entries.push(cells.old_entry.clone());
+        upper_new_entries.push(cells.new_entry.clone());
+        upper_before.push(selected[0].clone());
+        upper_after.push(selected[1].clone());
+    }
+
+    bind_segment_upper_chain(
+        b,
+        &segments,
+        &upper_old_entries,
+        &upper_new_entries,
+        &upper_before,
+        &upper_after,
+        &exact_state.roots.old_root,
+        &exact_state.roots.new_root,
+    );
+}
+
 /// `Σ terms` as an INTEGER. A single term is returned unchanged (no adder wires),
 /// so a single-tx block reproduces the former single-count path exactly; K terms
 /// cost K−1 ripple-carry adds. 16 bits hold any block total (≤ 255·255 < 2^16).
@@ -216,10 +335,31 @@ fn pin_u64_sum(b: &mut FieldR1csBuilder, terms: &[LinExpr]) -> LinExpr {
     }
 }
 
-/// Allocate the transitional body-derived live-input count used by the block
-/// count lanes until C' pins it to the transaction validity bitmap. Keep the
-/// relation class-fixed while enforcing the serialized boundary 1..=8.
-fn alloc_transitional_live_input_count(b: &mut FieldR1csBuilder, count: u8) -> LinExpr {
+fn append_user_action_surface(
+    b: &mut FieldR1csBuilder,
+    spine: &SpineInputsTrace,
+    tx_live: &LinExpr,
+    expected_owner: &[LinExpr; 2],
+    declared_live_inputs: u8,
+    candidates: &mut Vec<ActionRowTrace>,
+    input_selectors: &mut Vec<LinExpr>,
+    output_selectors: &mut Vec<LinExpr>,
+) -> UserPublicArithmeticTrace {
+    let surface = bind_user_action_surface(b, spine, tx_live, expected_owner);
+    let arithmetic = bind_user_public_arithmetic(b, spine, &surface);
+    let declared = alloc_declared_live_input_count(b, declared_live_inputs);
+    let selected_declared = mul(b, tx_live, &declared);
+    pin_eq(b, &arithmetic.live_input_count, &selected_declared);
+    input_selectors.extend(surface.selected_inputs.iter().cloned());
+    output_selectors.extend(surface.selected_outputs.iter().cloned());
+    candidates.extend(surface.ordered_rows());
+    arithmetic
+}
+
+/// Allocate the native authorization count and pin it to bitmap popcount in
+/// [`append_user_action_surface`]. Keep the relation class-fixed while
+/// enforcing the serialized boundary 1..=8.
+fn alloc_declared_live_input_count(b: &mut FieldR1csBuilder, count: u8) -> LinExpr {
     assert!((1..=noid_gkr::MAX_AUTHORIZATION_LIVE_INPUTS).contains(&count));
     const BITS: usize = 4;
     let count = alloc_block(b, Block128::from(count as u128));
@@ -534,50 +674,31 @@ fn tier_auth_slot_count(tier_user_tx_capacity: Option<usize>, n_real_user: usize
     })
 }
 
-/// The tier's touched-slot capacity: the class live-input capacity plus the
-/// output capacity (every Tx8x2 user transaction may create two outputs)
-/// PLUS ONE for the coinbase
-/// mint — the coinbase is not a user tx but its reward output touches a
-/// slot too, so a genuinely full block touches `user actions + 1` slots
-/// (1531 at the attack tier, not 1530). Every touched slot is a spend or a
-/// creation, so the real touched count never exceeds this.
-fn tier_touched_capacity(user_tier: usize) -> usize {
-    super::shape::ShapeClass { tier: user_tier }.touched_capacity()
-}
-
-/// Pad the exact-state statement to the tier's touched capacity: the
-/// `slot_leaves`/`state_paths` old and new HALVES each grow to
-/// [`tier_touched_capacity`] entries by duplicating the half's first
-/// leaf+path pair (re-proving a real leaf against the same root —
-/// value-neutral).
-fn pad_exact_state_inputs_to_tier(
-    es: &crate::block_certificate_backend::ExactStateKillShotInputs,
-    user_tier: usize,
-) -> crate::block_certificate_backend::ExactStateKillShotInputs {
-    let cap = tier_touched_capacity(user_tier);
-    let t = es.slot_leaves.len() / 2;
-    assert_eq!(es.slot_leaves.len(), 2 * t, "old/new leaf halves");
-    assert_eq!(es.state_paths.len(), 2 * t, "old/new path halves");
-    assert!(
-        t >= 1 && t <= cap,
-        "touched count {t} exceeds tier capacity {cap}"
-    );
-    let mut out = es.clone();
-    fn dup_half<T: Clone>(v: &mut Vec<T>, half_start: usize, t: usize, cap: usize) {
-        let template = v[half_start].clone();
-        let insert_at = half_start + t;
-        for _ in t..cap {
-            v.insert(insert_at, template.clone());
-        }
+/// Exact-state class capacities used by both the real region build and its
+/// native claim mirror. Tier builds are content-invariant. Transitional
+/// non-tier region tests use their exact touched/segment counts.
+fn exact_state_region_capacities(
+    structural: &crate::block_certificate_backend::ExactStateStructuralFrontierInputs,
+    user_tier: Option<usize>,
+) -> (usize, usize) {
+    if let Some(tier) = user_tier {
+        let class = super::shape::ShapeClass { tier };
+        return (class.touched_capacity(), class.segment_capacity());
     }
-    // New half first so the old half's indices stay valid while inserting.
-    dup_half(&mut out.slot_leaves, t, t, cap);
-    dup_half(&mut out.state_paths, t, t, cap);
-    dup_half(&mut out.slot_leaves, 0, t, cap);
-    dup_half(&mut out.state_paths, 0, t, cap);
-    assert_eq!(out.slot_leaves.len(), 2 * cap);
-    assert_eq!(out.state_paths.len(), 2 * cap);
-    out
+
+    let touched = structural.touched_indices.len();
+    let segments = structural
+        .touched_indices
+        .iter()
+        .map(|slot| slot >> noid_chain::consensus::params::LOG_SEGMENT_SIZE)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    assert!(touched > 0, "exact-state transition has no touched slots");
+    assert!(
+        segments > 0,
+        "exact-state transition has no touched segments"
+    );
+    (touched, segments)
 }
 
 /// The flat image of one native `SpineInputs` statement (φ lane by lane).
@@ -752,34 +873,19 @@ pub struct BlockSlots {
     /// real slots ONE / ghost slots ZERO at capacity). Boolean + monotone;
     /// their integer sum pins to the claim's USER_TX_COUNT lane at capacity.
     pub live_bits: Vec<LinExpr>,
+    /// Bitmap-derived, slot-sorted unique live action prefix. Its physical
+    /// permutation source is canonical body order.
+    pub compacted_actions: CompactedActionTrace,
     pub exact_state: ExactStateSlotWires,
-    /// Committed-column opening claims emitted by the region wallet-PCS
-    /// discharge (empty unless `BlockSlotsConfig::discharge_wallet_pcs` was set).
-    /// The link threads these into its public-IO (`spec.claims` + `io`).
+    /// Transitional committed-column opening claims emitted by the legacy
+    /// region discharge. Full production keeps this empty: its verifier
+    /// derives the claims inside the post-commit private sink from
+    /// `region_preparation`.
     pub pending_wallet_pcs: Vec<RegionPcsClaim>,
-}
-
-impl BlockSlots {
-    /// The receipt↔projection lanes in `verify_acceptance_against_projection`
-    /// order: height, block_id, parent_block_id, child_state_root, tx_root,
-    /// child_log_slots, child_active_slot_count, child_alloc_counter.
-    pub fn projection_lanes(&self) -> [LinExpr; 12] {
-        let f = &self.header.fields;
-        [
-            f[header_fields::HEIGHT].clone(),
-            self.header.expected_block_id[0].clone(),
-            self.header.expected_block_id[1].clone(),
-            f[header_fields::PREV_BLOCK_HASH].clone(),
-            f[header_fields::PREV_BLOCK_HASH + 1].clone(),
-            f[header_fields::STATE_ROOT].clone(),
-            f[header_fields::STATE_ROOT + 1].clone(),
-            f[header_fields::TX_ROOT].clone(),
-            f[header_fields::TX_ROOT + 1].clone(),
-            f[header_fields::LOG_SLOTS].clone(),
-            f[header_fields::ACTIVE_SLOT_COUNT].clone(),
-            f[header_fields::ALLOC_COUNTER].clone(),
-        ]
-    }
+    /// Mandatory six-vertical post-commit authority for a full production
+    /// tier build. Transitional/non-tier configurations retain the legacy
+    /// `pending_wallet_pcs` handoff and leave this `None`.
+    pub region_preparation: Option<BlockRegionPreparation>,
 }
 
 /// Assembly options.
@@ -797,10 +903,10 @@ pub struct BlockSlotsConfig {
     /// Parameters of the SHAPE-FIXED region wallet-PCS discharge
     /// (`discharge_auth_pcs_obligation_via_region`) — the ONLY wallet-PCS
     /// mode (the inline compact-FRI replay was deleted with the capsule
-    /// regeometry). The region discharge is class-fixed (its trace structure
-    /// does NOT drift with the proof), and it emits committed-column opening
-    /// claims collected into [`BlockSlots::pending_wallet_pcs`] for the link
-    /// to thread through public-IO. Only consulted when
+    /// regeometry). The region assembly is class-fixed (its trace structure
+    /// does NOT drift with the proof). Full production returns a mandatory
+    /// [`BlockRegionPreparation`]; transitional configurations still emit
+    /// [`BlockSlots::pending_wallet_pcs`]. Only consulted when
     /// `discharge_wallet_pcs` is true.
     pub wallet_pcs_params: RegionDischargeParams,
     /// When true, verify the block's owner-authorization killshots via the
@@ -810,24 +916,23 @@ pub struct BlockSlotsConfig {
     /// KSCHANNL transcripts on ONE tiled data-parallel walk, so owner-auth
     /// verification (the dominant per-tx [K] piece) is transaction-count flat.
     ///
-    /// REQUIRES `discharge_wallet_pcs`: the region owner-auth discharge
-    /// PRODUCES the [`super::trace::owner_auth::PendingAuthPcsObligation`]s that
-    /// the wallet-PCS region discharge then CONSUMES, and its own walk-C
-    /// committed-column opening claims (which bind the owner-auth transcript)
-    /// are collected into [`BlockSlots::pending_wallet_pcs`] (BEFORE the
-    /// wallet-PCS claims) for the link to thread through public-IO, so both must
-    /// be discharged for a complete proof. `false` = the inline per-tx replay.
+    /// REQUIRES `discharge_wallet_pcs`: owner C' PRODUCES the
+    /// [`super::trace::owner_auth::PendingAuthPcsObligation`]s consumed by the
+    /// wallet-PCS algebra. Full production binds C' through the mandatory block
+    /// sidecar; transitional configurations retain its opening claims and
+    /// recording in [`BlockSlots::pending_wallet_pcs`]. `false` = the inline
+    /// per-tx replay.
     pub owner_auth_region: bool,
-    /// When true, verify the exact-state HASHING killshots (slot_leaves and
-    /// state_paths — the per-touched-slot-growing pieces) via the
-    /// shared region walks instead of the inline per-slot replays: the slot-leaf
-    /// sponge tiles join the wallet-PCS discharge's walk A and state Merkle
-    /// paths join its walk B as one extra leg (`ExactStateRegionData` threaded
-    /// into the plural discharge). Region mode also closes leaf↔path↔header-root.
+    /// When true, verify exact state from the authoritative sibling-only
+    /// carrier: slot-leaf sponges join block-meta walk A and fixed depth-16
+    /// paired local/upper updates join block-meta walk B. The action compactor
+    /// binds every entry and direction, segment compaction closes sequential
+    /// roots, and the dynamic header depth selects the global endpoints.
     ///
     /// REQUIRES `discharge_wallet_pcs`: the exact-state families ride
     /// the wallet-PCS region walks (a new walk is never spawned), so the plural
-    /// discharge must run. `false` = the inline killshot replays.
+    /// discharge must run. `false` retains only the small transitional inline
+    /// directed-path replay pending its compile-atomic deletion.
     pub exact_state_region: bool,
     /// When true, verify the tx-root Merkle paths via the shared region walks
     /// instead of the inline batched killshot: one TAG_COMPRESS walk-B leg,
@@ -929,6 +1034,7 @@ pub fn build_block_slots_with_config(
     assert_eq!(witness.accepted_block_claims.len(), 1);
     assert_eq!(inputs.accepted_claim_hash_inputs.len(), 1);
     assert_eq!(inputs.exact_state_killshot_inputs.len(), 1);
+    assert_eq!(inputs.exact_state_structural_inputs.len(), 1);
     assert_eq!(proof.exact_state.len(), 1);
     assert_eq!(
         inputs.authorization_inputs.len(),
@@ -970,6 +1076,12 @@ pub fn build_block_slots_with_config(
             "tier capacity must be the block's consensus user-tx class tier"
         );
     }
+    let production_region_sidecar = config.tier_user_tx_capacity.is_some()
+        && config.discharge_wallet_pcs
+        && config.owner_auth_region
+        && config.exact_state_region
+        && config.tx_root_region
+        && config.spine_region;
 
     let mut ledger = b.num_wires();
 
@@ -1087,9 +1199,9 @@ pub fn build_block_slots_with_config(
     let tx_delta = n_real_txs
         .checked_sub(inputs.authorization_inputs.len())
         .expect("every user tx is a spine instance");
-    assert!(
-        tx_delta <= 1,
-        "at most one non-user (coinbase) tx per block"
+    assert_eq!(
+        tx_delta, 1,
+        "an accepted non-genesis block has exactly one mandatory coinbase"
     );
     let cap_txs = config
         .tier_user_tx_capacity
@@ -1165,7 +1277,21 @@ pub fn build_block_slots_with_config(
             let t = mul(b, &live_bits[i + 1], &not_prev);
             pin_zero(b, &t);
         }
+    } else {
+        // Content-shaped transitional builds contain only real user slots.
+        // Their liveness is therefore a constrained one, not a free witness.
+        for live in &live_bits {
+            pin_eq(b, live, &const_block(Block128::from(1u128)));
+        }
     }
+    let body_user_slots = config.tier_user_tx_capacity.unwrap_or(n_real_user);
+    assert!(body_user_slots <= live_bits.len());
+    for auth_pad in &live_bits[body_user_slots..] {
+        // B255 has one power-of-two authorization PAD but only 255 body and
+        // action slots. It can never impersonate transaction 256.
+        pin_zero(b, auth_pad);
+    }
+    let body_live_bits = &live_bits[..body_user_slots];
 
     // Coinbase L0 = parent tip. In a capacity class every user slot gets the
     // same live/ghost gated relation; the non-capacity path pins all real L0s
@@ -1176,8 +1302,43 @@ pub fn build_block_slots_with_config(
         &spine_inputs,
         n_real_txs,
         tx_delta,
-        config.tier_user_tx_capacity.map(|_| live_bits.as_slice()),
+        config.tier_user_tx_capacity.map(|_| body_live_bits),
     );
+
+    // Canonical body-order action candidates. Coinbase has exactly one live
+    // mint; each user tier slot contributes its eight input and two output
+    // bitmap positions. The extra B255 authorization PAD has no body/action
+    // slot and is excluded below by the tx-hash/spine bound.
+    let user_action_slots = config
+        .tier_user_tx_capacity
+        .unwrap_or(n_real_user)
+        .saturating_mul(noid_tx::TX_ACTIONS);
+    let mut action_candidates = Vec::with_capacity(user_action_slots + tx_delta);
+    let mut selected_input_bits = Vec::with_capacity(
+        config
+            .tier_user_tx_capacity
+            .unwrap_or(n_real_user)
+            .saturating_mul(noid_tx::TX_INPUTS),
+    );
+    let mut selected_output_bits = Vec::with_capacity(
+        config
+            .tier_user_tx_capacity
+            .unwrap_or(n_real_user)
+            .saturating_mul(noid_tx::TX_OUTPUTS)
+            + tx_delta,
+    );
+    let coinbase = bind_coinbase_action_with_amount(b, &spine_inputs[0]);
+    for lane in 0..2 {
+        pin_eq(
+            b,
+            &coinbase.action.owner[lane],
+            &header.fields[hf::MINER + lane],
+        );
+    }
+    selected_output_bits.push(coinbase.action.live.clone());
+    action_candidates.push(coinbase.action);
+    let coinbase_amount = coinbase.amount;
+    let coinbase_amount_bits: [Wire; 64] = coinbase.amount_bits;
 
     crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: liveness bits");
     // ---- tx_root component: paths for the REAL leaves, position-pinned.
@@ -1203,7 +1364,7 @@ pub fn build_block_slots_with_config(
                 &inputs.tx_root_inputs,
                 &inputs.tx_body_hashes,
                 &tx_hashes,
-                &live_bits,
+                body_live_bits,
                 tx_delta,
             )
         } else {
@@ -1276,34 +1437,30 @@ pub fn build_block_slots_with_config(
     }
 
     crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: tx-root");
-    // ---- exact_state component + its statement anchors. Built BEFORE the
-    // authorization loop so region mode can thread its region handoff
-    // (`ExactStateRegionData`) into the plural wallet-PCS discharge below;
-    // its own inputs (claim/header wires) all exist by this point.
-    //
-    // Tier capacity: the touched-slot statement (old ++ new halves) pads
-    // PER HALF to the tier's touched capacity with duplicates of each
-    // half's first entry — a duplicate re-proves an already-proven leaf
-    // against the same root (value-neutral), so the statement width is a
-    // pure function of the tier and the leaf↔path index pairing (old half
-    // `j < t`, new half `j ≥ t`) is preserved.
-    let es_inputs_padded = config
-        .tier_user_tx_capacity
-        .map(|cap| pad_exact_state_inputs_to_tier(&inputs.exact_state_killshot_inputs[0], cap));
-    let es_inputs_ref = es_inputs_padded
-        .as_ref()
-        .unwrap_or(&inputs.exact_state_killshot_inputs[0]);
-    let (exact_state, es_region_data) = build_exact_state_slot_with_config(
-        b,
-        es_inputs_ref,
-        &proof.exact_state[0],
-        config.exact_state_region,
-    );
-    let parent_log_native = inputs.accepted_claim_hash_inputs[0].fields[parent + hc::LOG_SLOTS].0;
-    assert!(
-        parent_log_native <= u32::MAX as u128,
-        "parent log_slots off range"
-    );
+    // ---- exact_state component + its statement anchors. Production region
+    // mode consumes only the authoritative sibling frontier and derives the
+    // fixed-capacity paired local/upper schedule. Expanded directed paths are
+    // retained solely by the small transitional inline mode.
+    let structural_es = &inputs.exact_state_structural_inputs[0];
+    let (exact_state, es_region_data) = if config.exact_state_region {
+        let (touched_capacity, segment_capacity) =
+            exact_state_region_capacities(structural_es, config.tier_user_tx_capacity);
+        let (slot, region) = build_exact_state_structural_region_slot(
+            b,
+            structural_es,
+            touched_capacity,
+            segment_capacity,
+        )
+        .expect("native-verified structural exact-state carrier");
+        (slot, Some(region))
+    } else {
+        build_exact_state_slot_with_config(
+            b,
+            &inputs.exact_state_killshot_inputs[0],
+            &proof.exact_state[0],
+            false,
+        )
+    };
     let parent_root = [
         claim.fields[parent + hc::STATE_ROOT].clone(),
         claim.fields[parent + hc::STATE_ROOT + 1].clone(),
@@ -1312,12 +1469,11 @@ pub fn build_block_slots_with_config(
         header.fields[hf::STATE_ROOT].clone(),
         header.fields[hf::STATE_ROOT + 1].clone(),
     ];
-    bind_exact_state_header_roots(
+    let exact_state_depth = bind_exact_state_header_roots_dynamic(
         b,
         &exact_state.roots,
         &parent_root,
         &claim.fields[parent + hc::LOG_SLOTS],
-        parent_log_native as u32,
         &child_root,
         &header.fields[hf::LOG_SLOTS],
     );
@@ -1327,6 +1483,9 @@ pub fn build_block_slots_with_config(
     // wallet-PCS discharge, tx_body_hash pinned to the spine hash.
     let mut auth_inputs = Vec::with_capacity(inputs.authorization_inputs.len());
     let mut pending_wallet_pcs: Vec<RegionPcsClaim> = Vec::new();
+    let mut paired_exact_state_cells: Option<PairedExactStateCells> = None;
+    let mut region_preparation: Option<BlockRegionPreparation> = None;
+    let mut owner_region_parts = None;
     // Region path: collect every tx's obligation; the whole block's wallet-PCS
     // discharges in ONE tiled plural call after the loop (all txs' capsule
     // families tile into one walk A/B/C, opening claims flat in tx count) so the
@@ -1344,8 +1503,7 @@ pub fn build_block_slots_with_config(
     let mut oa_trace_proofs: Vec<OwnerAuthProofTrace> = Vec::new();
     let mut oa_natives = Vec::new();
     let mut oa_native_inputs = Vec::new();
-    // Per-tx live-input counts, summed as INTEGERS after the loop.
-    let mut live_lens: Vec<LinExpr> = Vec::new();
+    let mut user_public_arithmetic = Vec::with_capacity(body_user_slots);
     // Tier capacity: slots [n_real_user, n_auth_slots) are canonical GHOST
     // slots proving the protocol `ghost_authorization()` — same code path as
     // real slots (their KSCHANNL transcripts tile walk C, their capsule proofs
@@ -1357,6 +1515,11 @@ pub fn build_block_slots_with_config(
         let (public_native, witness_proof, hash_idx, live_input_count) = if i < n_real_user {
             let input = &inputs.authorization_inputs[i];
             assert_eq!(input.block_index, 0, "one block per link");
+            assert_eq!(
+                input.tx_index,
+                i + tx_delta,
+                "authorization inputs must follow canonical block transaction order"
+            );
             // Native `verify_authorization_statement_proof` statement check.
             assert_eq!(input.tx_body_hash, input.public.tx_body_hash);
             (
@@ -1374,7 +1537,6 @@ pub fn build_block_slots_with_config(
             noid_gkr::OwnerAuthLayout::FIXED,
             "block owner-auth component must use the fixed layout"
         );
-        let live_len = alloc_transitional_live_input_count(b, live_input_count);
         if config.owner_auth_region {
             // Region path: alloc the two trace objects EXACTLY as the inline slot
             // (`build_owner_auth_slot`) does, but do NOT run the inline killshot —
@@ -1394,10 +1556,24 @@ pub fn build_block_slots_with_config(
                 let gw = [const_block(gh[0]), const_block(gh[1])];
                 pin_eq2(b, &inputs_t.tx_body_hash, &gw);
             }
-            if config.tier_user_tx_capacity.is_some() {
-                live_lens.push(mul(b, &live_bits[i], &live_len));
+            if hash_idx < spine_inputs.len() {
+                user_public_arithmetic.push(append_user_action_surface(
+                    b,
+                    &spine_inputs[hash_idx],
+                    &live_bits[i],
+                    &inputs_t.expected_address,
+                    live_input_count,
+                    &mut action_candidates,
+                    &mut selected_input_bits,
+                    &mut selected_output_bits,
+                ));
             } else {
-                live_lens.push(live_len);
+                assert_eq!(
+                    config.tier_user_tx_capacity,
+                    Some(noid_chain::consensus::params::BLOCK_MAX_USER_TXS),
+                    "only the B255 authorization PAD lacks an action slot"
+                );
+                assert_eq!(i + 1, n_auth_slots);
             }
             oa_trace_proofs.push(proof_t);
             oa_natives.push(witness_proof.clone());
@@ -1416,44 +1592,74 @@ pub fn build_block_slots_with_config(
                 region_natives.push(witness_proof.pcs.clone());
             }
             pin_eq2(b, &inputs_t.tx_body_hash, &tx_hashes[hash_idx]);
-            live_lens.push(live_len);
+            user_public_arithmetic.push(append_user_action_surface(
+                b,
+                &spine_inputs[hash_idx],
+                &live_bits[i],
+                &inputs_t.expected_address,
+                live_input_count,
+                &mut action_candidates,
+                &mut selected_input_bits,
+                &mut selected_output_bits,
+            ));
             auth_inputs.push(inputs_t);
         }
     }
-    crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: per-tx auth allocs");
-    // Region owner-auth discharge (once, after the loop): ONE tiled walk-C
-    // replays all K KSCHANNL transcripts (transaction-count flat), producing the
-    // SAME `PendingAuthPcsObligation`s the inline per-tx replay does plus the
-    // walk-C committed-column opening claims. The obligations feed the wallet-PCS
-    // discharge below UNCHANGED; the walk-C claims bind the owner-auth transcript
-    // and MUST be threaded through the link IO, so they come FIRST in
-    // `pending_wallet_pcs`. Requires the region wallet-PCS path so the obligations
-    // are actually discharged (a complete proof).
+    assert_eq!(
+        user_public_arithmetic.len(),
+        body_user_slots,
+        "one public-arithmetic trace per physical user body slot"
+    );
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: per-tx auth+public arithmetic");
+    let _fee_arithmetic = bind_block_fee_arithmetic(
+        b,
+        &user_public_arithmetic,
+        &start_acc.active_slot_count,
+        &exact_state_depth.parent,
+        &exact_state_depth.child,
+        &coinbase_amount,
+        &coinbase_amount_bits,
+    );
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: fee/burn/coinbase arithmetic");
+    // Region owner-auth assembly (once, after the loop). Full production stops
+    // at recording-free C' columns/VK/endpoints; transitional configurations
+    // retain the former discharge + recording handoff into wallet main-C.
     let mut oa_recording = None;
     if config.owner_auth_region {
         assert!(
             config.discharge_wallet_pcs,
             "owner_auth_region requires the wallet-PCS discharge (the produced obligation must be discharged)"
         );
-        let (obligations, oa_claims, recording) = discharge_owner_auth_killshots_via_region(
-            b,
-            &oa_trace_proofs,
-            &auth_inputs,
-            &oa_natives,
-            &oa_native_inputs,
-        );
-        region_obligations = obligations;
-        pending_wallet_pcs.extend(oa_claims);
-        // The C′ discharge transcript recording rides the wallet plural's
-        // walk C (region-2 block) — the plural pins its wires there.
-        oa_recording = Some(recording);
+        if production_region_sidecar {
+            let owner = prepare_owner_auth_killshots_via_region(
+                b,
+                &oa_trace_proofs,
+                &auth_inputs,
+                &oa_natives,
+                &oa_native_inputs,
+            );
+            let (obligations, vk, endpoints) = owner.into_block_parts();
+            region_obligations = obligations;
+            owner_region_parts = Some((vk, endpoints));
+        } else {
+            let (obligations, oa_claims, recording) = discharge_owner_auth_killshots_via_region(
+                b,
+                &oa_trace_proofs,
+                &auth_inputs,
+                &oa_natives,
+                &oa_native_inputs,
+            );
+            region_obligations = obligations;
+            pending_wallet_pcs.extend(oa_claims);
+            // The transitional C′ discharge transcript recording rides the
+            // wallet plural's recording region.
+            oa_recording = Some(recording);
+        }
     }
-    crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: owner-auth walk C' discharge");
-    // ONE tiled plural discharge for the whole block (region path): the K txs'
-    // wallet-capsule families tile into one walk A/B/C and the returned committed-
-    // column opening claims are flat in tx count, threading through the link's
-    // public IO. `k` = tx count must be a power of two (the plural asserts it; a
-    // tier pads its real txs to next_pow2 with ghost obligations).
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: owner-auth walk C' assembly");
+    // ONE tiled wallet/meta assembly for the whole block. Production returns
+    // five mandatory post-commit children; transitional configurations retain
+    // the old RegionPcsClaim/recording/D discharge.
     if config.discharge_wallet_pcs {
         let params = config.wallet_pcs_params;
         if config.exact_state_region || config.tx_root_region || config.spine_region {
@@ -1469,33 +1675,120 @@ pub fn build_block_slots_with_config(
             );
         }
         if !region_obligations.is_empty() {
-            // extend (not assign): the owner-auth region path may have already
-            // pushed its walk-C opening claims, which must be kept.
-            pending_wallet_pcs.extend(discharge_auth_pcs_obligations_via_region(
-                b,
-                &region_obligations,
-                &region_natives,
-                params,
-                es_region_data.as_ref(),
-                tx_root_region_data.as_ref(),
-                spine_region_data.as_ref(),
-                oa_recording.as_ref(),
-            ));
+            if production_region_sidecar {
+                assert!(
+                    oa_recording.is_none(),
+                    "production owner-C must not create a transcript recording"
+                );
+                assert_eq!(
+                    params.nq,
+                    noid_fri_binius::capsule::CAPSULE_NUM_QUERIES,
+                    "production block sidecar must authenticate every capsule query"
+                );
+                let auth = prepare_auth_pcs_obligations_via_region_with_paired_handoff(
+                    b,
+                    &region_obligations,
+                    &region_natives,
+                    params,
+                    es_region_data
+                        .as_ref()
+                        .expect("production exact-state region data"),
+                    tx_root_region_data
+                        .as_ref()
+                        .expect("production tx-root region data"),
+                    spine_region_data
+                        .as_ref()
+                        .expect("production spine region data"),
+                );
+                let AuthPcsRegionPreparation {
+                    wallet_a_vk,
+                    wallet_a_endpoints,
+                    meta_a_vk,
+                    meta_a_endpoints,
+                    wallet_b_vk,
+                    wallet_b_endpoints,
+                    meta_b_vk,
+                    meta_b_endpoints,
+                    main_c_vk,
+                    main_c_endpoints,
+                    paired,
+                } = auth;
+                let (owner_c_vk, owner_c_endpoints) = owner_region_parts
+                    .take()
+                    .expect("production owner-C preparation");
+                let vk = BlockRegionSidecarVk::new(
+                    wallet_a_vk,
+                    meta_a_vk,
+                    wallet_b_vk,
+                    meta_b_vk,
+                    owner_c_vk,
+                    main_c_vk,
+                )
+                .expect("canonical mandatory block-region VK");
+                let input = BlockRegionProverInput::new(
+                    &vk,
+                    wallet_a_endpoints,
+                    meta_a_endpoints,
+                    wallet_b_endpoints,
+                    meta_b_endpoints,
+                    owner_c_endpoints,
+                    main_c_endpoints,
+                )
+                .expect("canonical mandatory block-region endpoints");
+                region_preparation = Some(
+                    BlockRegionPreparation::new(vk, input)
+                        .expect("validated mandatory block-region preparation"),
+                );
+                paired_exact_state_cells = Some(paired);
+            } else {
+                // Extend (not assign): transitional owner-auth may already
+                // have pushed its C' opening claims, which must be kept.
+                let discharge = discharge_auth_pcs_obligations_via_region_with_paired_handoff(
+                    b,
+                    &region_obligations,
+                    &region_natives,
+                    params,
+                    es_region_data.as_ref(),
+                    tx_root_region_data.as_ref(),
+                    spine_region_data.as_ref(),
+                    oa_recording.as_ref(),
+                );
+                pending_wallet_pcs.extend(discharge.claims);
+                paired_exact_state_cells = discharge.paired;
+            }
         }
     }
-    crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: wallet plural (walks A/B/C)");
-    // Totals: the per-slot counts sum to the claim's resource lanes
-    // (`verify_authorization_components`). The per-tx counts sum as INTEGERS
-    // (ripple-carry over tower bits), NOT field addition -- GF(2^128) add is XOR,
-    // so a field sum of >1 count is wrong (e.g. 1 + 1 = 0, not 2). A single-tx
-    // block sums one term, reproducing the former single-count pin exactly.
+    assert_eq!(
+        paired_exact_state_cells.is_some(),
+        config.exact_state_region,
+        "production exact-state region must return its paired cell handoff"
+    );
+    assert_eq!(
+        region_preparation.is_some(),
+        production_region_sidecar,
+        "only full production all-region builds return mandatory post-commit authority"
+    );
+    if production_region_sidecar {
+        assert!(
+            pending_wallet_pcs.is_empty(),
+            "production region claims live only in the post-commit private sink"
+        );
+        assert!(
+            owner_region_parts.is_none(),
+            "owner-C preparation must be consumed by the block envelope"
+        );
+    }
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: wallet plural/sidecar assembly");
+    // Totals: transaction and action counts now come from the same liveness
+    // and bitmap wires that feed compaction. All sums are INTEGERS
+    // (ripple-carry over tower bits), not GF(2^128) XOR.
     let totals = &inputs.authorization_totals;
     if config.tier_user_tx_capacity.is_some() {
         // Tier capacity: the tx-count lanes bind to the LIVENESS SUM (the
         // pin structure is class-fixed; the value is content), replacing the
         // content-shaped const pins. TX_COUNT = USER_TX_COUNT + the class's
         // non-user delta (the coinbase when carried) as an INTEGER.
-        let user_sum = pin_u64_sum(b, &live_bits);
+        let user_sum = pin_u64_sum(b, body_live_bits);
         pin_eq(b, &claim.fields[claim_layout::USER_TX_COUNT], &user_sum);
         if tx_delta == 1 {
             pin_u64_successor(b, &user_sum, &claim.fields[claim_layout::TX_COUNT]);
@@ -1512,9 +1805,73 @@ pub fn build_block_slots_with_config(
         let tx_count = const_block(Block128::from(tx_hashes.len() as u128));
         pin_eq(b, &claim.fields[claim_layout::TX_COUNT], &tx_count);
     }
-    let live_sum = pin_u64_sum(b, &live_lens);
-    pin_eq(b, &claim.fields[claim_layout::LIVE_INPUT_COUNT], &live_sum);
-    crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: count sums");
+    let live_input_sum = pin_u64_sum(b, &selected_input_bits);
+    let output_sum = pin_u64_sum(b, &selected_output_bits);
+    pin_eq(
+        b,
+        &claim.fields[claim_layout::LIVE_INPUT_COUNT],
+        &live_input_sum,
+    );
+    pin_eq(b, &claim.fields[claim_layout::OUTPUT_COUNT], &output_sum);
+
+    // Exact active-slot counter equation as unsigned integers:
+    // parent + all mints (including coinbase) = child + all spends.
+    // Both additions reject u64 overflow instead of silently wrapping in the
+    // characteristic-two field.
+    bind_active_slot_counter_delta(
+        b,
+        &start_acc.active_slot_count,
+        &header.fields[hf::ACTIVE_SLOT_COUNT],
+        &live_input_sum,
+        &output_sum,
+    );
+
+    let action_live_capacity = if let Some(tier) = config.tier_user_tx_capacity {
+        let class = super::shape::ShapeClass { tier };
+        assert_eq!(
+            action_candidates.len(),
+            class.action_candidate_capacity(),
+            "one coinbase action plus ten candidates per tier user slot"
+        );
+        let count_bits = range_check_bits(b, &live_input_sum, 12);
+        let cap_plus_one = const_block(Block128::from((class.spend_capacity() + 1) as u128));
+        let cap_bits = range_check_bits(b, &cap_plus_one, 12);
+        pin_lt_strict(b, &count_bits, &cap_bits);
+        class.touched_capacity()
+    } else if config.exact_state_region {
+        exact_state.slot_leaves.len() / 2
+    } else {
+        action_candidates.len()
+    };
+    bind_mint_packed_values_body_order(
+        b,
+        &mut action_candidates,
+        &start_acc.alloc_counter,
+        &header.fields[hf::ALLOC_COUNTER],
+    );
+    let compacted_actions = compact_action_rows(b, &action_candidates, action_live_capacity);
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: action allocator+route+order");
+
+    if let Some(paired) = paired_exact_state_cells.as_ref() {
+        bind_paired_exact_state_transition(
+            b,
+            &compacted_actions,
+            &exact_state,
+            paired,
+            &exact_state_depth.child,
+        );
+    }
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: exact-state action+paired topology");
+
+    bind_structural_frontier_count_from_actions_dynamic(
+        b,
+        &compacted_actions.rows,
+        &compacted_actions.slot_bits,
+        &compacted_actions.adjacent_msb_one_hot,
+        &exact_state_depth.child,
+        &claim.fields[claim_layout::STATE_FRONTIER_NODE_COUNT],
+    );
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: structural frontier count");
     // ---- Direct ten-lane accumulator transition. The child header is the
     // sole transition statement; there is no rolling claim/hash fold.
     let child = DirectChildWires {
@@ -1556,8 +1913,10 @@ pub fn build_block_slots_with_config(
         tx_root_paths,
         auth_inputs,
         live_bits,
+        compacted_actions,
         exact_state,
         pending_wallet_pcs,
+        region_preparation,
     }
 }
 
@@ -1615,6 +1974,7 @@ pub fn region_wallet_pcs_native(
     let n_real_txs = inputs.tx_body_inputs.len();
     let tx_delta = n_real_txs.saturating_sub(n_real_user);
     let n_auth_slots = tier_auth_slot_count(tier_user_tx_capacity, n_real_user);
+    let n_body_user_slots = tier_user_tx_capacity.unwrap_or(n_real_user);
     let cap_txs = tier_user_tx_capacity.map_or(n_real_txs, |c| c + tx_delta);
     let mut spine_natives: Vec<SpineInputs> = inputs.tx_body_inputs.clone();
     let mut hash_natives: Vec<[Block128; 2]> = inputs.tx_body_hashes.clone();
@@ -1627,15 +1987,18 @@ pub fn region_wallet_pcs_native(
             hash_natives.push(ghost_hash);
         }
     }
-    let es_padded = tier_user_tx_capacity
-        .map(|cap| pad_exact_state_inputs_to_tier(&inputs.exact_state_killshot_inputs[0], cap));
     let scratch_es = exact_state_region.then(|| {
-        scratch_exact_state_region_data(
+        let structural = &inputs.exact_state_structural_inputs[0];
+        let (touched_capacity, segment_capacity) =
+            exact_state_region_capacities(structural, tier_user_tx_capacity);
+        build_exact_state_structural_region_slot(
             &mut pb,
-            es_padded
-                .as_ref()
-                .unwrap_or(&inputs.exact_state_killshot_inputs[0]),
+            structural,
+            touched_capacity,
+            segment_capacity,
         )
+        .expect("native-verified structural exact-state carrier")
+        .1
     });
     let scratch_txr = (tx_root_region && !inputs.tx_root_inputs.is_empty()).then(|| {
         if tier_user_tx_capacity.is_some() {
@@ -1662,7 +2025,7 @@ pub fn region_wallet_pcs_native(
                 &inputs.tx_body_hashes,
                 root_w,
                 &tx_hash_ws,
-                &live,
+                &live[..n_body_user_slots],
                 tx_delta,
             )
         } else {
@@ -1769,6 +2132,37 @@ mod tx_epoch_anchor_tests {
     use super::*;
     use noid_core::TowerField;
 
+    fn active_counter_case(
+        parent: u128,
+        child: u128,
+        spends: u128,
+        mints: u128,
+    ) -> (noid_ivc_core::field_r1cs::FieldR1cs, Vec<F128>) {
+        let mut b = FieldR1csBuilder::new();
+        let parent = alloc_block(&mut b, Block128::from(parent));
+        let child = alloc_block(&mut b, Block128::from(child));
+        let spends = alloc_block(&mut b, Block128::from(spends));
+        let mints = alloc_block(&mut b, Block128::from(mints));
+        bind_active_slot_counter_delta(&mut b, &parent, &child, &spends, &mints);
+        b.build()
+    }
+
+    #[test]
+    fn active_counter_uses_exact_spend_mint_delta() {
+        for (parent, child, spends, mints) in [(7, 8, 2, 3), (7, 5, 3, 1), (0, 1, 0, 1)] {
+            let (r1cs, witness) = active_counter_case(parent, child, spends, mints);
+            assert!(r1cs.satisfies(&witness));
+        }
+    }
+
+    #[test]
+    fn active_counter_rejects_wrong_delta_and_overflow() {
+        for case in [(7, 9, 2, 3), (u64::MAX as u128, 0, 0, 1)] {
+            let (r1cs, witness) = active_counter_case(case.0, case.1, case.2, case.3);
+            assert!(!r1cs.satisfies(&witness));
+        }
+    }
+
     fn start_accumulator() -> ChainAccumulator {
         ChainAccumulator {
             height: 143,
@@ -1867,5 +2261,238 @@ mod tx_epoch_anchor_tests {
         assert!(two_r1cs.satisfies(&two_witness));
         assert_eq!(one_r1cs.statement_digest(), two_r1cs.statement_digest());
         assert_eq!(one_r1cs.useful_rows, two_r1cs.useful_rows);
+    }
+
+    #[test]
+    fn b255_body_liveness_excludes_the_256th_authorization_pad() {
+        let start = start_accumulator();
+        let mut natives = bodies(&start);
+        let ghost = natives.pop().expect("small fixture ghost");
+        while natives.len() < 1 + noid_chain::consensus::params::BLOCK_MAX_USER_TXS {
+            natives.push(ghost.clone());
+        }
+        let mut b = FieldR1csBuilder::new();
+        let start_w = AccumulatorWires::alloc(&mut b, &start);
+        let traces: Vec<_> = natives
+            .iter()
+            .map(|body| SpineInputsTrace::alloc(&mut b, body))
+            .collect();
+        let auth_capacity =
+            super::tier_auth_slot_count(Some(noid_chain::consensus::params::BLOCK_MAX_USER_TXS), 1);
+        assert_eq!(auth_capacity, 256);
+        let live_bits: Vec<_> = (0..auth_capacity)
+            .map(|i| alloc_block(&mut b, Block128::from(u128::from(i == 0))))
+            .collect();
+        for live in &live_bits {
+            let square = mul(&mut b, live, live);
+            pin_eq(&mut b, &square, live);
+        }
+        pin_zero(&mut b, &live_bits[255]);
+        bind_tx_epoch_anchors(&mut b, &start_w, &traces, 2, 1, Some(&live_bits[..255]));
+        let (r1cs, witness) = b.build();
+        assert!(r1cs.satisfies(&witness));
+    }
+}
+
+#[cfg(test)]
+mod paired_exact_state_connection_tests {
+    use super::*;
+    use crate::acceptance::trace::exact_state::{ExactStateRootWires, SlotLeafInputsTrace};
+    use crate::acceptance::trace::region_source_binding::{
+        PairedLocalExactStateCells, PairedUpperExactStateCells,
+    };
+    use noid_ivc_core::field_r1cs::FieldR1cs;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum Fault {
+        None,
+        LocalEntry,
+        LocalDirection,
+        LocalChain,
+        UpperEntry,
+        UpperDirection,
+        UpperEndpoint,
+    }
+
+    fn pair(b: &mut FieldR1csBuilder, values: [u128; 2]) -> [LinExpr; 2] {
+        std::array::from_fn(|lane| alloc_block(b, Block128::from(values[lane])))
+    }
+
+    fn directions(b: &mut FieldR1csBuilder, bits: u16) -> [LinExpr; 16] {
+        std::array::from_fn(|bit| alloc_block(b, Block128::from(u128::from((bits >> bit) & 1))))
+    }
+
+    fn spend_action(
+        b: &mut FieldR1csBuilder,
+        slot: u32,
+        value: u128,
+        owner: [u128; 2],
+    ) -> ActionRowTrace {
+        ActionRowTrace {
+            live: LinExpr::from_wire(b.alloc_bool(true)),
+            slot_index: alloc_block(b, Block128::from(slot as u128)),
+            value: alloc_block(b, Block128::from(value)),
+            owner: pair(b, owner),
+            is_mint: LinExpr::zero(),
+        }
+    }
+
+    fn leaf(
+        b: &mut FieldR1csBuilder,
+        value: u128,
+        owner: [u128; 2],
+        expected: [u128; 2],
+    ) -> SlotLeafInputsTrace {
+        SlotLeafInputsTrace {
+            packed_value: alloc_block(b, Block128::from(value)),
+            owner_hi: alloc_block(b, Block128::from(owner[0])),
+            owner_lo: alloc_block(b, Block128::from(owner[1])),
+            expected_leaf: pair(b, expected),
+        }
+    }
+
+    fn drive_relation(b: &mut FieldR1csBuilder, fault: Fault) {
+        // Both live slots belong to segment zero.  Using the real action
+        // compactor gives this isolated connection test constrained slot bits
+        // and adjacent-MSB metadata instead of trusting hand-written hints.
+        let source = [
+            spend_action(b, 5, 71, [81, 82]),
+            spend_action(b, 9, 73, [83, 84]),
+        ];
+        let actions = compact_action_rows(b, &source, source.len());
+
+        // The leaf hash outputs are deliberately arbitrary: this test targets
+        // only the connection layer, while the region independently proves
+        // the hash walks.  The semantic preimages still satisfy the two spend
+        // transitions (old body value/owner, new canonical empty slot).
+        let old_leaves = [
+            leaf(b, 71, [81, 82], [11, 12]),
+            leaf(b, 73, [83, 84], [13, 14]),
+        ];
+        let new_leaves = [leaf(b, 0, [0, 0], [21, 22]), leaf(b, 0, [0, 0], [23, 24])];
+        let roots = ExactStateRootWires {
+            old_root: pair(b, [901, 902]),
+            new_root: pair(b, [951, 952]),
+            active_depth: 24,
+        };
+        let exact_state = ExactStateSlotWires {
+            slot_leaves: old_leaves.into_iter().chain(new_leaves).collect(),
+            state_paths: Vec::new(),
+            roots,
+        };
+
+        let mut first_old_entry = [11, 12];
+        if fault == Fault::LocalEntry {
+            first_old_entry[0] += 1;
+        }
+        let mut first_directions = 5u16;
+        if fault == Fault::LocalDirection {
+            first_directions ^= 1;
+        }
+        let mut first_after = [201, 202];
+        if fault == Fault::LocalChain {
+            first_after[0] += 1;
+        }
+        let local = vec![
+            PairedLocalExactStateCells {
+                old_entry: pair(b, first_old_entry),
+                new_entry: pair(b, [21, 22]),
+                old_root: pair(b, [101, 102]),
+                new_root: pair(b, first_after),
+                directions: directions(b, first_directions),
+            },
+            PairedLocalExactStateCells {
+                old_entry: pair(b, [13, 14]),
+                new_entry: pair(b, [23, 24]),
+                old_root: pair(b, [201, 202]),
+                new_root: pair(b, [301, 302]),
+                directions: directions(b, 9),
+            },
+        ];
+
+        let mut upper_old_entry = [101, 102];
+        if fault == Fault::UpperEntry {
+            upper_old_entry[0] += 1;
+        }
+        let upper_directions = if fault == Fault::UpperDirection { 1 } else { 0 };
+        let old_roots = std::array::from_fn(|level| {
+            if level == 7 {
+                pair(b, [901, 902])
+            } else {
+                pair(b, [1_000 + 2 * level as u128, 1_001 + 2 * level as u128])
+            }
+        });
+        let new_roots = std::array::from_fn(|level| {
+            if level == 7 {
+                let mut endpoint = [951, 952];
+                if fault == Fault::UpperEndpoint {
+                    endpoint[0] += 1;
+                }
+                pair(b, endpoint)
+            } else {
+                pair(b, [2_000 + 2 * level as u128, 2_001 + 2 * level as u128])
+            }
+        });
+        let paired = PairedExactStateCells {
+            local,
+            upper: vec![PairedUpperExactStateCells {
+                old_entry: pair(b, upper_old_entry),
+                new_entry: pair(b, [301, 302]),
+                old_roots,
+                new_roots,
+                directions: directions(b, upper_directions),
+            }],
+        };
+
+        let depth_value = alloc_block(b, Block128::from(24u128));
+        let child_depth = StateDepthTrace::bind(b, &depth_value);
+        bind_paired_exact_state_transition(b, &actions, &exact_state, &paired, &child_depth);
+    }
+
+    fn full_case(fault: Fault) -> (FieldR1cs, Vec<F128>) {
+        let mut b = FieldR1csBuilder::new();
+        drive_relation(&mut b, fault);
+        b.build()
+    }
+
+    fn witness_case(fault: Fault) -> (usize, Vec<F128>) {
+        let mut b = FieldR1csBuilder::new_witness_only();
+        drive_relation(&mut b, fault);
+        b.build_witness_only()
+    }
+
+    #[test]
+    fn paired_exact_state_connection_layer_rejects_every_broken_cross_link() {
+        let (r1cs, honest_full) = full_case(Fault::None);
+        assert!(r1cs.satisfies(&honest_full), "honest connection fixture");
+
+        let (honest_wires, honest_witness) = witness_case(Fault::None);
+        assert_eq!(honest_wires, r1cs.useful_rows, "honest wire-count parity");
+        assert_eq!(honest_witness, honest_full, "honest witness-only parity");
+        assert!(r1cs.satisfies(&honest_witness));
+
+        for fault in [
+            Fault::LocalEntry,
+            Fault::LocalDirection,
+            Fault::LocalChain,
+            Fault::UpperEntry,
+            Fault::UpperDirection,
+            Fault::UpperEndpoint,
+        ] {
+            let (wire_count, witness) = witness_case(fault);
+            assert_eq!(
+                wire_count, r1cs.useful_rows,
+                "{fault:?} changed the matrix wire count"
+            );
+            assert_eq!(
+                witness.len(),
+                honest_full.len(),
+                "{fault:?} changed the padded witness length"
+            );
+            assert!(
+                !r1cs.satisfies(&witness),
+                "{fault:?} cross-link mutation was accepted"
+            );
+        }
     }
 }

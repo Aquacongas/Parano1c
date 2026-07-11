@@ -5,9 +5,18 @@ use noid_ivc_core::challenger::{Challenger, FsLaneChallenger};
 use noid_ivc_core::field::F128;
 use noid_ivc_core::field_r1cs::synthetic_satisfiable;
 use noid_ivc_core::pcs::{self, PcsParams};
-use noid_ivc_core::proof::FieldR1csProof;
-use noid_ivc_core::verifier::verify_field;
-use noid_ivc_prover::field_prover::prove_field;
+use noid_ivc_core::proof::{FieldR1csProof, FieldShape};
+use noid_ivc_core::public_io::{PublicIoSpec, WitnessSlice};
+use noid_ivc_core::verifier::{
+    VerifyError, verify_field, verify_field_deferred_matrix_with_post_commit,
+    verify_field_deferred_matrix_with_post_commit_context, verify_field_with_public_io,
+    verify_field_with_public_io_and_post_commit,
+    verify_field_with_public_io_and_post_commit_context,
+};
+use noid_ivc_prover::field_prover::{
+    prove_field, prove_field_with_public_io_and_post_commit,
+    prove_field_with_public_io_and_post_commit_context,
+};
 
 fn params_for(m_elems: usize) -> PcsParams {
     PcsParams {
@@ -19,6 +28,270 @@ fn params_for(m_elems: usize) -> PcsParams {
 }
 
 const TEST_DOMAIN: &[u8] = b"field-r1cs-e2e-v0";
+
+#[derive(Clone)]
+struct PostCommitOpening {
+    point: Vec<F128>,
+    value: F128,
+}
+
+fn mle_eval(values: &[F128], point: &[F128]) -> F128 {
+    assert_eq!(values.len(), 1usize << point.len());
+    values
+        .iter()
+        .zip(noid_ivc_core::lincheck::build_eq_table(point))
+        .fold(F128::ZERO, |sum, (&value, weight)| sum + value * weight)
+}
+
+#[test]
+fn post_commit_auxiliary_claim_roundtrip_and_causality() {
+    let (r1cs, z) = synthetic_satisfiable(10, 7, 0xA11CE);
+    let params = params_for(10);
+    let spec = PublicIoSpec {
+        io_slice: WitnessSlice {
+            log2_len: 0,
+            index: 0,
+        },
+        io_len: 1,
+        claims: Vec::new(),
+    };
+    let io = [z[0]];
+
+    let mut ch_p = FsLaneChallenger::new(b"field-post-commit-v0");
+    let (proof, auxiliary, commitment, _) = prove_field_with_public_io_and_post_commit(
+        &r1cs,
+        &z,
+        &params,
+        &spec,
+        &io,
+        &mut ch_p,
+        |z, _commitment, ch| {
+            // This draw is causally downstream of bind_statement_field, which
+            // has already absorbed the exact witness commitment root.
+            ch.observe_label(b"post-commit-opening-test-v0");
+            let point = ch.sample_f128_vec(r1cs.m);
+            let value = mle_eval(z, &point);
+            ch.observe_f128(value);
+            let claim = pcs::QuirkyDirectClaim {
+                z_skip: F128::ZERO,
+                k_skip: 0,
+                x_rest: point.clone(),
+                value,
+            };
+            (PostCommitOpening { point, value }, vec![claim])
+        },
+    );
+
+    let verify = |auxiliary: &PostCommitOpening| {
+        let mut ch_v = FsLaneChallenger::new(b"field-post-commit-v0");
+        verify_field_with_public_io_and_post_commit(
+            &r1cs,
+            &commitment,
+            &proof,
+            &spec,
+            &io,
+            auxiliary,
+            &mut ch_v,
+            |auxiliary, ch| {
+                ch.observe_label(b"post-commit-opening-test-v0");
+                let expected_point = ch.sample_f128_vec(r1cs.m);
+                if auxiliary.point != expected_point {
+                    return Err(VerifyError::Auxiliary);
+                }
+                ch.observe_f128(auxiliary.value);
+                Ok(vec![pcs::QuirkyDirectClaim {
+                    z_skip: F128::ZERO,
+                    k_skip: 0,
+                    x_rest: auxiliary.point.clone(),
+                    value: auxiliary.value,
+                }])
+            },
+        )
+    };
+
+    assert!(verify(&auxiliary).is_ok());
+
+    // A proof produced in sidecar mode must not be accepted through the
+    // legacy verifier entry point. Production still has to make the sidecar
+    // mandatory in its envelope/VK; this guards the transcript-level half of
+    // that downgrade barrier.
+    let mut ch_without_aux = FsLaneChallenger::new(b"field-post-commit-v0");
+    assert!(
+        verify_field_with_public_io(&r1cs, &commitment, &proof, &spec, &io, &mut ch_without_aux,)
+            .is_err(),
+        "post-commit proof accepted without its mandatory auxiliary replay"
+    );
+
+    // Split-link recursion uses the matrix-free verifier. Its post-commit
+    // prefix and appended terminal claim must be transcript-identical.
+    let mut ch_deferred = FsLaneChallenger::new(b"field-post-commit-v0");
+    let deferred = verify_field_deferred_matrix_with_post_commit(
+        &FieldShape::of(&r1cs),
+        &r1cs.statement_digest(),
+        &commitment,
+        &proof,
+        &spec,
+        &io,
+        &auxiliary,
+        &mut ch_deferred,
+        |auxiliary, ch| {
+            ch.observe_label(b"post-commit-opening-test-v0");
+            let expected_point = ch.sample_f128_vec(r1cs.m);
+            if auxiliary.point != expected_point {
+                return Err(VerifyError::Auxiliary);
+            }
+            ch.observe_f128(auxiliary.value);
+            Ok(vec![pcs::QuirkyDirectClaim {
+                z_skip: F128::ZERO,
+                k_skip: 0,
+                x_rest: auxiliary.point.clone(),
+                value: auxiliary.value,
+            }])
+        },
+    );
+    assert!(deferred.is_ok());
+
+    let mut bad_point = auxiliary.clone();
+    bad_point.point[0] += F128::ONE;
+    assert_eq!(verify(&bad_point), Err(VerifyError::Auxiliary));
+
+    let mut bad_value = auxiliary;
+    bad_value.value += F128::ONE;
+    assert!(verify(&bad_value).is_err());
+}
+
+#[test]
+fn post_commit_context_binds_class_and_owns_claim_sink() {
+    const CLASS_DIGEST: [u8; 32] = [0xC7; 32];
+    let (r1cs, z) = synthetic_satisfiable(10, 7, 0xC07E57);
+    let params = params_for(10);
+    let spec = PublicIoSpec {
+        io_slice: WitnessSlice {
+            log2_len: 0,
+            index: 0,
+        },
+        io_len: 1,
+        claims: Vec::new(),
+    };
+    let io = [z[0]];
+
+    let mut ch_p = FsLaneChallenger::new(b"field-post-commit-context-v1");
+    let (proof, auxiliary, commitment, _) = prove_field_with_public_io_and_post_commit_context(
+        &r1cs,
+        &z,
+        &params,
+        &spec,
+        &io,
+        &CLASS_DIGEST,
+        &mut ch_p,
+        |context| {
+            assert_eq!(context.total_vars(), r1cs.m);
+            assert_eq!(context.witness(), z.as_slice());
+            context.observe_label(b"context-opening-v1");
+            let point = context.sample_f128_vec(r1cs.m);
+            let value = mle_eval(context.witness(), &point);
+            context.observe_f128(value);
+            context.append_claim(pcs::QuirkyDirectClaim {
+                z_skip: F128::ZERO,
+                k_skip: 0,
+                x_rest: point.clone(),
+                value,
+            });
+            assert_eq!(context.claim_count(), 1);
+            PostCommitOpening { point, value }
+        },
+    );
+
+    let verify = |class_digest: &[u8; 32], auxiliary: &PostCommitOpening, append_claim: bool| {
+        let mut ch_v = FsLaneChallenger::new(b"field-post-commit-context-v1");
+        verify_field_with_public_io_and_post_commit_context(
+            &r1cs,
+            &commitment,
+            &proof,
+            &spec,
+            &io,
+            class_digest,
+            auxiliary,
+            &mut ch_v,
+            |auxiliary, context| {
+                assert_eq!(context.total_vars(), r1cs.m);
+                assert_eq!(context.commitment().root, commitment.root);
+                context.observe_label(b"context-opening-v1");
+                let point = context.sample_f128_vec(r1cs.m);
+                if point != auxiliary.point {
+                    return Err(VerifyError::Auxiliary);
+                }
+                context.observe_f128(auxiliary.value);
+                if append_claim {
+                    context.append_claims([pcs::QuirkyDirectClaim {
+                        z_skip: F128::ZERO,
+                        k_skip: 0,
+                        x_rest: auxiliary.point.clone(),
+                        value: auxiliary.value,
+                    }]);
+                    assert_eq!(context.claim_count(), 1);
+                }
+                Ok(())
+            },
+        )
+    };
+
+    assert!(verify(&CLASS_DIGEST, &auxiliary, true).is_ok());
+
+    let mut wrong_class = CLASS_DIGEST;
+    wrong_class[0] ^= 1;
+    assert!(
+        verify(&wrong_class, &auxiliary, true).is_err(),
+        "post-commit class substitution accepted"
+    );
+    assert!(
+        verify(&CLASS_DIGEST, &auxiliary, false).is_err(),
+        "callback claim omission did not alter the mandatory PCS batch"
+    );
+
+    let mut bad_auxiliary = auxiliary.clone();
+    bad_auxiliary.value += F128::ONE;
+    assert!(verify(&CLASS_DIGEST, &bad_auxiliary, true).is_err());
+
+    let mut core_only = FsLaneChallenger::new(b"field-post-commit-context-v1");
+    assert!(
+        verify_field_with_public_io(&r1cs, &commitment, &proof, &spec, &io, &mut core_only,)
+            .is_err(),
+        "context proof downgraded to the core-only verifier"
+    );
+
+    let mut deferred_ch = FsLaneChallenger::new(b"field-post-commit-context-v1");
+    assert!(
+        verify_field_deferred_matrix_with_post_commit_context(
+            &FieldShape::of(&r1cs),
+            &r1cs.statement_digest(),
+            &commitment,
+            &proof,
+            &spec,
+            &io,
+            &CLASS_DIGEST,
+            &auxiliary,
+            &mut deferred_ch,
+            |auxiliary, context| {
+                context.observe_label(b"context-opening-v1");
+                let point = context.sample_f128_vec(r1cs.m);
+                if point != auxiliary.point {
+                    return Err(VerifyError::Auxiliary);
+                }
+                context.observe_f128(auxiliary.value);
+                context.append_claim(pcs::QuirkyDirectClaim {
+                    z_skip: F128::ZERO,
+                    k_skip: 0,
+                    x_rest: auxiliary.point.clone(),
+                    value: auxiliary.value,
+                });
+                Ok(())
+            },
+        )
+        .is_ok(),
+        "deferred context verifier diverged from the full verifier"
+    );
+}
 
 #[test]
 fn honest_roundtrip_multiple_shapes() {
@@ -51,7 +324,10 @@ fn false_witnesses_rejected() {
             lo: 1 + seed,
             hi: seed.wrapping_mul(0x9E3779B97F4A7C15),
         };
-        assert!(!r1cs.satisfies(&bad_z), "corruption did not break satisfiability");
+        assert!(
+            !r1cs.satisfies(&bad_z),
+            "corruption did not break satisfiability"
+        );
 
         let mut ch_p = FsLaneChallenger::new(TEST_DOMAIN);
         let (proof, commitment, _) = prove_field(&r1cs, &bad_z, &params, &mut ch_p);
@@ -90,7 +366,10 @@ fn adversarial_shapes_rejected_not_panicking() {
         bad.params.log_batch_size = bad.params.m; // log_dim would underflow
         let mut ch_v = FsLaneChallenger::new(TEST_DOMAIN);
         let res = verify_field(&r1cs, &bad, &proof, &mut ch_v);
-        assert!(matches!(res, Err(VerifyError::ParamsMismatch)), "got {res:?}");
+        assert!(
+            matches!(res, Err(VerifyError::ParamsMismatch)),
+            "got {res:?}"
+        );
     }
 
     // A proof whose sumcheck depth disagrees with the commitment.
@@ -297,5 +576,8 @@ fn serialized_bitflips_rejected() {
         );
         checked += 1;
     }
-    assert!(checked > 20, "too few decodable mutants exercised: {checked}");
+    assert!(
+        checked > 20,
+        "too few decodable mutants exercised: {checked}"
+    );
 }

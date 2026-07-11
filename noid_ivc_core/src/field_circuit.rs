@@ -149,11 +149,7 @@ impl LinExpr {
             return Self::zero();
         }
         Self {
-            terms: self
-                .terms
-                .iter()
-                .map(|&(w, c)| (w, c * scalar))
-                .collect(),
+            terms: self.terms.iter().map(|&(w, c)| (w, c * scalar)).collect(),
             constant: self.constant * scalar,
         }
     }
@@ -405,10 +401,7 @@ impl FieldR1csBuilder {
              use build_witness_only()"
         );
         let n_wires = self.values.len();
-        let k_log = n_wires
-            .next_power_of_two()
-            .trailing_zeros()
-            .max(7) as usize;
+        let k_log = n_wires.next_power_of_two().trailing_zeros().max(7) as usize;
         let k = 1usize << k_log;
 
         // Pad to k rows: the extra rows are empty, so their offset just repeats
@@ -486,8 +479,7 @@ impl FieldR1csBuilder {
     pub fn eq_eval_trace(&mut self, r: &[LinExpr], x: &[LinExpr]) -> LinExpr {
         assert_eq!(r.len(), x.len());
         assert!(!r.is_empty());
-        let factor =
-            |i: usize| -> LinExpr { r[i].add(&x[i]).add_const(F128::ONE) };
+        let factor = |i: usize| -> LinExpr { r[i].add(&x[i]).add_const(F128::ONE) };
         let mut acc = factor(0);
         for i in 1..r.len() {
             acc = LinExpr::from_wire(self.mul(&acc, &factor(i)));
@@ -591,8 +583,7 @@ pub fn poseidon2b_permute(
 
 /// Multiplication constraints per permutation (S-boxes only; MDS/RC are
 /// symbolic): 8 full rounds × 4 lanes × 4 + 58 partial × 4 = **360**.
-pub const POSEIDON2B_PERMUTE_CONSTRAINTS: usize =
-    (F_ROUNDS * STATE_SIZE + P_ROUNDS) * 4;
+pub const POSEIDON2B_PERMUTE_CONSTRAINTS: usize = (F_ROUNDS * STATE_SIZE + P_ROUNDS) * 4;
 
 // ---------------------------------------------------------------------------
 // Fiat-Shamir channel trace gadget
@@ -709,7 +700,11 @@ impl FsChannelTrace {
     pub fn observe_f128_slice(&mut self, b: &mut FieldR1csBuilder, values: &[LinExpr]) {
         self.absorb_lane(
             b,
-            LinExpr::constant(fs_op_lane(FS_OP_OBSERVE, FS_KIND_SLICE, values.len() as u64)),
+            LinExpr::constant(fs_op_lane(
+                FS_OP_OBSERVE,
+                FS_KIND_SLICE,
+                values.len() as u64,
+            )),
         );
         for v in values {
             self.absorb_lane(b, v.clone());
@@ -762,17 +757,9 @@ impl FsChannelTrace {
     /// missing top wires force the zeros). The pow rides the transcript
     /// sponge itself — no separate PoW instance, no state peek — so a
     /// union recording carries it as plain schedule lanes.
-    pub fn verify_pow_trace(
-        &mut self,
-        b: &mut FieldR1csBuilder,
-        nonce: &LinExpr,
-        bits: u32,
-    ) {
+    pub fn verify_pow_trace(&mut self, b: &mut FieldR1csBuilder, nonce: &LinExpr, bits: u32) {
         assert!(bits <= 64, "leading-zero window limited to the top limb");
-        self.absorb_lane(
-            b,
-            LinExpr::constant(fs_op_lane(FS_OP_POW, 0, bits as u64)),
-        );
+        self.absorb_lane(b, LinExpr::constant(fs_op_lane(FS_OP_POW, 0, bits as u64)));
         self.absorb_lane(b, nonce.clone());
         let pt = self.sample_f128(b);
         if bits > 0 {
@@ -974,7 +961,9 @@ impl FsChannelUnionRecorder {
 
     fn absorb_const(&mut self, c: F128) {
         self.cur_absorb
-            .push(Some(noid_core::hardware::flat_to_tower_u128(Self::flat_bits(c))));
+            .push(Some(noid_core::hardware::flat_to_tower_u128(
+                Self::flat_bits(c),
+            )));
         self.absorb_native(c);
     }
 
@@ -992,9 +981,10 @@ impl FsChannelUnionRecorder {
 
     fn close_absorb(&mut self) {
         if !self.cur_absorb.is_empty() {
-            self.ops.push(crate::deep_chain::schedule::TranscriptOp::Absorb(
-                std::mem::take(&mut self.cur_absorb),
-            ));
+            self.ops
+                .push(crate::deep_chain::schedule::TranscriptOp::Absorb(
+                    std::mem::take(&mut self.cur_absorb),
+                ));
         }
     }
 
@@ -1041,7 +1031,11 @@ impl FsChannelOps for FsChannelUnionRecorder {
     }
 
     fn observe_f128_slice(&mut self, b: &mut FieldR1csBuilder, values: &[LinExpr]) {
-        self.absorb_const(fs_op_lane(FS_OP_OBSERVE, FS_KIND_SLICE, values.len() as u64));
+        self.absorb_const(fs_op_lane(
+            FS_OP_OBSERVE,
+            FS_KIND_SLICE,
+            values.len() as u64,
+        ));
         for v in values {
             self.absorb_expr(b, v);
         }
@@ -1187,9 +1181,7 @@ impl RawChannelTrace {
     fn flush(&mut self, b: &mut FieldR1csBuilder) {
         if let Some(first) = self.buffered.take() {
             self.state[0] = self.state[0].add(&first);
-            self.state[1] = self
-                .state[1]
-                .add_const(crate::challenger::fs_pad_lane_flat());
+            self.state[1] = self.state[1].add_const(crate::challenger::fs_pad_lane_flat());
             self.permute(b);
         }
     }
@@ -1240,7 +1232,10 @@ mod tests {
         let _p = b.alloc_public_f128(F128 { lo: 5, hi: 9 });
         let _bit = b.alloc_bool(true);
         let prod = LinExpr::from_wire(b.mul(&xs[0], &xs[1]));
-        let combo = prod.add(&xs[2]).scale(F128 { lo: 3, hi: 1 }).add_const(F128::ONE);
+        let combo = prod
+            .add(&xs[2])
+            .scale(F128 { lo: 3, hi: 1 })
+            .add_const(F128::ONE);
         let m = LinExpr::from_wire(b.materialize(&combo));
         let mv = m.eval(b.values());
         b.pin_f128(&m, mv);
@@ -1268,7 +1263,10 @@ mod tests {
 
         assert_eq!(n_wires, r1cs.useful_rows, "wire count parity");
         assert_eq!(w_full, w_wo, "witness parity");
-        assert!(r1cs.satisfies(&w_wo), "witness-only witness on the full matrix");
+        assert!(
+            r1cs.satisfies(&w_wo),
+            "witness-only witness on the full matrix"
+        );
     }
 
     /// The union recorder must be bit-lockstep with the inline channel twin
@@ -1333,11 +1331,7 @@ mod tests {
         // the challenge carry cells must reproduce the sampled values.
         let layout = compile_duplex(&rc.ops);
         assert_eq!(layout.n_data, rc.data_flat.len(), "data lane count");
-        let block_log = layout
-            .slots
-            .len()
-            .next_power_of_two()
-            .trailing_zeros() as usize;
+        let block_log = layout.slots.len().next_power_of_two().trailing_zeros() as usize;
         let cols = build_duplex_columns(
             &layout,
             FsChannelUnionRecorder::capacity_iv_flat(),
@@ -1405,7 +1399,10 @@ mod tests {
         let xv = x.eval(b.values());
         let yv = y.eval(b.values());
         let prod = LinExpr::from_wire(b.mul(&x, &y));
-        let combo = prod.scale(F128 { lo: 3, hi: 0 }).add(&x).add_const(F128::ONE);
+        let combo = prod
+            .scale(F128 { lo: 3, hi: 0 })
+            .add(&x)
+            .add_const(F128::ONE);
         b.pin_f128(&combo, F128 { lo: 3, hi: 0 } * (xv * yv) + xv + F128::ONE);
         let pub_w = b.alloc_public_f128(F128 { lo: 42, hi: 7 });
         let pub_e = LinExpr::from_wire(pub_w);
@@ -1543,10 +1540,7 @@ mod tests {
         // (its debug_assert would fire in dev; here we hand-corrupt): flip
         // the input value in the finished witness — the pin row must break.
         let mut bad = z.clone();
-        bad[1] += F128 {
-            lo: 1 << 16,
-            hi: 0,
-        };
+        bad[1] += F128 { lo: 1 << 16, hi: 0 };
         assert!(!r1cs.satisfies(&bad));
     }
 
@@ -1591,8 +1585,7 @@ mod tests {
                     }
                     3 => {
                         let len = (rng.next_u64() % 40) as usize;
-                        let bytes: Vec<u8> =
-                            (0..len).map(|_| rng.next_u64() as u8).collect();
+                        let bytes: Vec<u8> = (0..len).map(|_| rng.next_u64() as u8).collect();
                         native.observe_bytes(&bytes);
                         trace.observe_bytes_const(&mut b, &bytes);
                     }
@@ -1612,10 +1605,8 @@ mod tests {
                     _ => {
                         let bits = (rng.next_u64() % 5) as u32; // 0..=4
                         let nonce = native.grind_pow(bits);
-                        let nonce_expr = LinExpr::from_wire(b.alloc_f128(F128 {
-                            lo: nonce,
-                            hi: 0,
-                        }));
+                        let nonce_expr =
+                            LinExpr::from_wire(b.alloc_f128(F128 { lo: nonce, hi: 0 }));
                         trace.verify_pow_trace(&mut b, &nonce_expr, bits);
                     }
                 }

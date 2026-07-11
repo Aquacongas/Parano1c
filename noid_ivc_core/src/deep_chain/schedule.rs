@@ -289,7 +289,7 @@ pub fn build_duplex_columns(
 
 /// Column indices of one duplex family inside a caller-managed committed
 /// table, and fixed-pattern indices inside the caller's pattern table.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DuplexFamilyRefs {
     /// Committed indices of `A0, A1`.
     pub a: [usize; 2],
@@ -321,8 +321,7 @@ pub fn duplex_fixed_patterns(
     let mut start = vec![F128::ZERO; period];
     start[0] = F128::ONE;
     let mut abs: [Vec<F128>; 2] = std::array::from_fn(|_| vec![F128::ZERO; period]);
-    let mut consts: [Vec<F128>; STATE_SIZE] =
-        std::array::from_fn(|_| vec![F128::ZERO; period]);
+    let mut consts: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; period]);
     consts[2][0] = iv_flat[0];
     consts[3][0] = iv_flat[1];
     for (slot, ds) in layout.slots.iter().enumerate() {
@@ -390,10 +389,7 @@ pub fn duplex_substitution_terms(refs: &DuplexFamilyRefs, alpha: F128) -> Vec<Re
         });
         terms.push(RelationTerm {
             coeff: m[j],
-            factors: vec![
-                ColRef::Fixed(refs.start),
-                ColRef::CommittedShift(refs.c[j]),
-            ],
+            factors: vec![ColRef::Fixed(refs.start), ColRef::CommittedShift(refs.c[j])],
         });
         if j < 2 {
             terms.push(RelationTerm {
@@ -572,9 +568,7 @@ pub fn build_merkle_path_columns(
             } else {
                 [carry[0], carry[1]]
             };
-            let left = |i: usize| {
-                (F128::ONE + d_w) * carried[i] + d_w * sib[i][slot]
-            };
+            let left = |i: usize| (F128::ONE + d_w) * carried[i] + d_w * sib[i][slot];
             [left(0), left(1), iv_flat[0], iv_flat[1]]
         } else if is_odd_node {
             let d_prev = d[slot - 1];
@@ -584,15 +578,8 @@ pub fn build_merkle_path_columns(
                 // The previous node's output digest, two slots back.
                 [c[0][slot - 2], c[1][slot - 2]]
             };
-            let right = |i: usize| {
-                d_prev * carried[i] + (F128::ONE + d_prev) * sib[i][slot - 1]
-            };
-            [
-                carry[0] + right(0),
-                carry[1] + right(1),
-                carry[2],
-                carry[3],
-            ]
+            let right = |i: usize| d_prev * carried[i] + (F128::ONE + d_prev) * sib[i][slot - 1];
+            [carry[0] + right(0), carry[1] + right(1), carry[2], carry[3]]
         } else {
             carry
         };
@@ -835,10 +822,7 @@ mod tests {
         assert_eq!(layout.n_data, 4);
         assert_eq!(
             layout.slots[0].lanes,
-            [
-                Some(LaneSource::Data(0)),
-                Some(LaneSource::Const(42)),
-            ]
+            [Some(LaneSource::Data(0)), Some(LaneSource::Const(42)),]
         );
         assert_eq!(layout.slots[1].lanes[0], Some(LaneSource::Data(1)));
         assert!(matches!(
@@ -854,10 +838,7 @@ mod tests {
         assert_eq!(layout.slots[5].lanes, [None, None]);
         // Challenges: pair from slot 1 (post-pad state), then lane 0 of the
         // eager slot 2; after the absorb, lane 0 of slot 4's output.
-        assert_eq!(
-            layout.challenges,
-            vec![(1, 0), (1, 1), (2, 0), (4, 0)]
-        );
+        assert_eq!(layout.challenges, vec![(1, 0), (1, 1), (2, 0), (4, 0)]);
     }
 
     /// Full native region DAG over a compiled duplex family: selection →
@@ -886,12 +867,7 @@ mod tests {
         // Prover + verifier in lockstep over one challenger each.
         let run = |cols: &DuplexColumns| -> Result<(), String> {
             let committed: Vec<&[F128]> = vec![
-                &cols.a[0],
-                &cols.a[1],
-                &cols.c[0],
-                &cols.c[1],
-                &cols.c[2],
-                &cols.c[3],
+                &cols.a[0], &cols.a[1], &cols.c[0], &cols.c[1], &cols.c[2], &cols.c[3],
             ];
             let internal: Vec<&[F128]> = cols.s_out.iter().map(|c| c.as_slice()).collect();
             let mut ch_p = FsLaneChallenger::new(b"duplex-dag-test");
@@ -991,20 +967,11 @@ mod tests {
                 match r {
                     ColRef::Committed(c) => pending.push((*c, sub_point.clone(), *v)),
                     ColRef::CommittedShift(c) => {
-                        let (shift_proof, _) = prove_shift_discharge(
-                            committed[*c],
-                            &sub_point,
-                            *v,
-                            &mut ch_p,
-                        );
-                        let pt = verify_shift_discharge(
-                            w_log,
-                            &sub_point,
-                            *v,
-                            &shift_proof,
-                            &mut ch_v,
-                        )
-                        .map_err(|e| format!("shift: {e}"))?;
+                        let (shift_proof, _) =
+                            prove_shift_discharge(committed[*c], &sub_point, *v, &mut ch_p);
+                        let pt =
+                            verify_shift_discharge(w_log, &sub_point, *v, &shift_proof, &mut ch_v)
+                                .map_err(|e| format!("shift: {e}"))?;
                         pending.push((*c, pt, shift_proof.final_value));
                     }
                     _ => unreachable!(),
@@ -1071,9 +1038,7 @@ mod tests {
         for p in 0..family.n_paths {
             let entry = rnd_digest(&mut rng);
             let sibs: Vec<[u8; 32]> = (0..depth).map(|_| rnd_digest(&mut rng)).collect();
-            let dirs: Vec<bool> = (0..depth)
-                .map(|k| (rng.next_u64() >> k) & 1 == 1)
-                .collect();
+            let dirs: Vec<bool> = (0..depth).map(|k| (rng.next_u64() >> k) & 1 == 1).collect();
             // Native fold: carried is LEFT iff the direction bit is 0.
             let mut hash = entry;
             for k in 0..depth {
@@ -1127,8 +1092,15 @@ mod tests {
 
         let run = |cols: &MerklePathColumns| -> Result<(), String> {
             let committed: Vec<&[F128]> = vec![
-                &cols.e[0], &cols.e[1], &cols.sib[0], &cols.sib[1], &cols.d, &cols.c[0],
-                &cols.c[1], &cols.c[2], &cols.c[3],
+                &cols.e[0],
+                &cols.e[1],
+                &cols.sib[0],
+                &cols.sib[1],
+                &cols.d,
+                &cols.c[0],
+                &cols.c[1],
+                &cols.c[2],
+                &cols.c[3],
             ];
             let internal: Vec<&[F128]> = cols.s_out.iter().map(|c| c.as_slice()).collect();
             let mut ch_p = FsLaneChallenger::new(b"merkle-dag-test");
@@ -1248,23 +1220,16 @@ mod tests {
                     ColRef::CommittedShift(c) => {
                         let (pr, _) =
                             prove_shift_discharge(committed[*c], &sub_point, *v, &mut ch_p);
-                        let pt =
-                            verify_shift_discharge(w_log, &sub_point, *v, &pr, &mut ch_v)
-                                .map_err(|e| format!("shift: {e}"))?;
+                        let pt = verify_shift_discharge(w_log, &sub_point, *v, &pr, &mut ch_v)
+                            .map_err(|e| format!("shift: {e}"))?;
                         pending.push((*c, pt, pr.final_value));
                     }
                     ColRef::CommittedShift2(c) => {
-                        let (pr, _) = prove_shift_discharge_pow2(
-                            committed[*c],
-                            &sub_point,
-                            *v,
-                            1,
-                            &mut ch_p,
-                        );
-                        let pt = verify_shift_discharge_pow2(
-                            w_log, &sub_point, *v, 1, &pr, &mut ch_v,
-                        )
-                        .map_err(|e| format!("shift2: {e}"))?;
+                        let (pr, _) =
+                            prove_shift_discharge_pow2(committed[*c], &sub_point, *v, 1, &mut ch_p);
+                        let pt =
+                            verify_shift_discharge_pow2(w_log, &sub_point, *v, 1, &pr, &mut ch_v)
+                                .map_err(|e| format!("shift2: {e}"))?;
                         pending.push((*c, pt, pr.final_value));
                     }
                     _ => unreachable!(),

@@ -25,12 +25,12 @@ use std::time::Instant;
 
 use bench_prover::poseidon_chain_field_instance;
 use noid_ivc_prover::challenger::FsLaneChallenger;
+use noid_ivc_prover::field::F128;
 use noid_ivc_prover::field_circuit::FsChannelTrace;
-use noid_ivc_prover::field_r1cs::{synthetic_satisfiable, FieldR1cs};
 use noid_ivc_prover::field_prover::prove_field;
+use noid_ivc_prover::field_r1cs::{synthetic_satisfiable, FieldR1cs};
 use noid_ivc_prover::pcs::{self, PcsParams};
 use noid_ivc_prover::verifier::verify_field;
-use noid_ivc_prover::field::F128;
 use noid_recursive::acceptance::trace::self_verify::{
     alloc_flat_digest, verify_field_trace, FieldR1csProofTrace,
 };

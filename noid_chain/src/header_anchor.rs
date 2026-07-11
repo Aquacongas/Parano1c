@@ -1,26 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Header-chain anchor for public history proofs.
+//! Exact local header-tip anchor for public history proofs.
 //!
-//! Nodes store and validate canonical headers from genesis.  Public O(1)
-//! history proofs should bind to those headers without storing a second copy.
-//! This module defines the small rolling commitment over the header fields that
-//! proof relations need to consume: state roots, transaction root, miner, and
-//! state counters, plus the canonical block id.
+//! Nodes validate and retain the canonical header chain itself. A block id
+//! commits to the complete header and recursively to its ancestry through
+//! `prev_block_hash`, so history proofs bind directly to the locally selected
+//! tip instead of maintaining a parallel rolling projection hash.
 
-use noid_core::Block128;
-use noid_poseidon2b::native::compression::Poseidon2bSponge;
-use noid_poseidon2b::native::domain::{capacity_iv, TAG_HDRANCH, TAG_HDRPROJ};
 use noid_poseidon2b::primitives::{Address, Digest};
 
 use crate::block_header::{hash_block_header, BlockHeader};
 
-/// Public commitment to a verified canonical header prefix.
+/// Exact tip of a locally verified canonical header prefix.
 ///
-/// `projection_root` is a rolling commitment over header projections from
-/// genesis through `height`.  `cumulative_chainwork` is the exact chainwork
-/// recorded by header validation for the same tip.
+/// `cumulative_chainwork` is the exact chainwork recorded by native header
+/// validation for this tip. `block_id` commits to the full ancestry.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HeaderChainAnchor {
     pub height: u64,
@@ -32,7 +27,6 @@ pub struct HeaderChainAnchor {
     pub active_slot_count: u64,
     pub alloc_counter: u64,
     pub cumulative_chainwork: Digest,
-    pub projection_root: Digest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,48 +59,10 @@ impl std::fmt::Display for HeaderChainAnchorError {
 
 impl std::error::Error for HeaderChainAnchorError {}
 
-/// Compute the digest of the proof-facing header projection.
-///
-/// The schedule deliberately includes `block_id` and the canonical header
-/// fields needed by future execution/history relations.  Header consensus
-/// checks remain native node work; this commitment binds proof witnesses to the
-/// exact header values the node already accepted.
-pub fn header_projection_digest(header: &BlockHeader, block_id: &Digest) -> Digest {
-    let mut sponge = Poseidon2bSponge::with_iv(capacity_iv(TAG_HDRPROJ));
-    absorb_digest(&mut sponge, block_id);
-    absorb_digest(&mut sponge, &header.prev_block_hash);
-    absorb_digest(&mut sponge, &header.state_root);
-    absorb_digest(&mut sponge, &header.tx_root);
-    sponge.absorb(Block128::from(header.timestamp as u128));
-    sponge.absorb(Block128::from(header.height as u128));
-    absorb_address(&mut sponge, &header.miner_address);
-    sponge.absorb(Block128::from(header.nonce));
-    absorb_digest(&mut sponge, &header.difficulty_target);
-    sponge.absorb(Block128::from(header.log_slots as u128));
-    sponge.absorb(Block128::from(header.active_slot_count as u128));
-    sponge.absorb(Block128::from(header.alloc_counter as u128));
-    sponge.finalize()
-}
-
-/// Extend the rolling header projection root by one canonical header.
-pub fn extend_header_projection_root(
-    previous_root: &Digest,
-    header: &BlockHeader,
-    block_id: &Digest,
-) -> Digest {
-    let item = header_projection_digest(header, block_id);
-    let mut sponge = Poseidon2bSponge::with_iv(capacity_iv(TAG_HDRANCH));
-    absorb_digest(&mut sponge, previous_root);
-    absorb_digest(&mut sponge, &item);
-    sponge.absorb(Block128::from(header.height as u128));
-    sponge.finalize()
-}
-
 /// Extend a verified header-chain anchor by one canonical child header.
 ///
-/// This stores no header copy.  It only carries forward the small rolling
-/// projection commitment and the exact cumulative chainwork already validated
-/// by the native header path.
+/// This carries the exact child tip and cumulative chainwork already validated
+/// by the native header path; it does not build a second history commitment.
 pub fn extend_header_chain_anchor(
     previous: &HeaderChainAnchor,
     header: &BlockHeader,
@@ -126,8 +82,6 @@ pub fn extend_header_chain_anchor(
     }
 
     let block_id = hash_block_header(header);
-    let projection_root =
-        extend_header_projection_root(&previous.projection_root, header, &block_id);
     Ok(HeaderChainAnchor {
         height: header.height,
         block_id,
@@ -138,7 +92,6 @@ pub fn extend_header_chain_anchor(
         active_slot_count: header.active_slot_count,
         alloc_counter: header.alloc_counter,
         cumulative_chainwork,
-        projection_root,
     })
 }
 
@@ -160,7 +113,6 @@ where
 
     let mut expected_height = 0u64;
     let mut previous_block_id = [0u8; 32];
-    let mut projection_root = [0u8; 32];
     let mut tip = None;
 
     for header in std::iter::once(first).chain(iter) {
@@ -177,7 +129,6 @@ where
         }
 
         let block_id = hash_block_header(header);
-        projection_root = extend_header_projection_root(&projection_root, header, &block_id);
         previous_block_id = block_id;
         tip = Some((*header, block_id));
         expected_height = expected_height.saturating_add(1);
@@ -194,20 +145,7 @@ where
         active_slot_count: tip_header.active_slot_count,
         alloc_counter: tip_header.alloc_counter,
         cumulative_chainwork,
-        projection_root,
     })
-}
-
-#[inline]
-fn absorb_digest(sponge: &mut Poseidon2bSponge, digest: &Digest) {
-    let lo = Block128::from(u128::from_le_bytes(digest[..16].try_into().unwrap()));
-    let hi = Block128::from(u128::from_le_bytes(digest[16..].try_into().unwrap()));
-    sponge.absorb_pair(lo, hi);
-}
-
-#[inline]
-fn absorb_address(sponge: &mut Poseidon2bSponge, address: &Address) {
-    absorb_digest(sponge, address.as_bytes());
 }
 
 #[cfg(test)]
@@ -241,7 +179,7 @@ mod tests {
     }
 
     #[test]
-    fn anchor_binds_tip_and_projection_root() {
+    fn anchor_binds_exact_tip_and_chainwork() {
         let headers = three_headers();
         let work = [0xAA; 32];
         let anchor = compute_header_chain_anchor(headers.iter(), work).unwrap();
@@ -250,19 +188,26 @@ mod tests {
         assert_eq!(anchor.block_id, hash_block_header(&headers[2]));
         assert_eq!(anchor.state_root, headers[2].state_root);
         assert_eq!(anchor.tx_root, headers[2].tx_root);
+        assert_eq!(anchor.miner_address, headers[2].miner_address);
+        assert_eq!(anchor.log_slots, headers[2].log_slots);
+        assert_eq!(anchor.active_slot_count, headers[2].active_slot_count);
+        assert_eq!(anchor.alloc_counter, headers[2].alloc_counter);
         assert_eq!(anchor.cumulative_chainwork, work);
-        assert_ne!(anchor.projection_root, [0u8; 32]);
     }
 
     #[test]
-    fn anchor_changes_when_proof_relevant_header_field_changes() {
+    fn tip_block_id_commits_changed_ancestor_after_relink() {
         let headers = three_headers();
         let mut changed = headers.clone();
-        changed[2].active_slot_count += 1;
+        changed[1].active_slot_count += 1;
+        changed[2].prev_block_hash = hash_block_header(&changed[1]);
         let original = compute_header_chain_anchor(headers.iter(), [1u8; 32]).unwrap();
         let changed = compute_header_chain_anchor(changed.iter(), [1u8; 32]).unwrap();
 
-        assert_ne!(original.projection_root, changed.projection_root);
+        assert_ne!(original.block_id, changed.block_id);
+        assert_eq!(original.height, changed.height);
+        assert_eq!(original.state_root, changed.state_root);
+        assert_eq!(original.tx_root, changed.tx_root);
     }
 
     #[test]

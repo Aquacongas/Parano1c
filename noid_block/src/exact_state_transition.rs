@@ -12,24 +12,43 @@
 use noid_chain::exact_state_hash::{slot_leaf_hash, state_node_hash, zero_slot_roots, StateHash};
 use noid_chain::fri_state::SlotValue;
 use noid_chain::sparse_merkle::{
-    build_multiproof, expand_multiproof_paths, reconstruct_root, ExpandedMerklePath,
-    SparseMerkleCache, SparseMerkleError,
+    build_multiproof, derive_structural_frontier_plan, evaluate_structural_frontier,
+    expand_multiproof_paths, maximum_sibling_count_with_segment_cap, ExpandedMerklePath,
+    SparseMerkleCache, SparseMerkleError, StructuralFrontierEvaluation, StructuralFrontierPlan,
+    StructuralNodeRef, STRUCTURAL_FRONTIER_PAD,
 };
 use noid_chain::state_delta::ExactActionSurface;
 use noid_core::{Block128, TowerField};
-use noid_gkr::{MerklePathInputs, SlotLeafInputs, MAX_MERKLE_DEPTH};
+use noid_gkr::{
+    FixedFieldHashInputs, FixedFieldHashParams, MerklePathInputs, SlotLeafInputs, MAX_MERKLE_DEPTH,
+};
+use noid_poseidon2b::native::domain::TAG_EXSTNOD;
 
 /// Maximum user transactions under the consensus semantic block budget.
 pub const MAX_EXACT_USER_TXS: usize = noid_chain::consensus::params::BLOCK_MAX_USER_TXS;
 /// Maximum bitmap-live touched slots plus the required coinbase output.
 pub const MAX_EXACT_TOUCHED_SLOTS: usize =
     noid_chain::consensus::params::BLOCK_MAX_USER_ACTIONS + 1;
-/// Conservative sibling bound before canonical deduplication.
-pub const MAX_EXACT_SLOT_SIBLINGS: usize = MAX_EXACT_TOUCHED_SLOTS * 32;
-/// Maximum raw sibling bytes under the conservative bound.
+/// Exact analytical frontier capacity at maximum depth under the consensus
+/// touched-slot and distinct-segment limits.
+pub const MAX_EXACT_SLOT_SIBLINGS: usize = maximum_sibling_count_with_segment_cap(
+    MAX_EXACT_TOUCHED_SLOTS,
+    MAX_MERKLE_DEPTH as u32,
+    noid_chain::consensus::params::LOG_SEGMENT_SIZE,
+    noid_chain::consensus::params::BLOCK_MAX_DISTINCT_SEGMENTS,
+);
+/// Maximum binary combines needed to reconstruct one exact-state root.
+pub const MAX_EXACT_FRONTIER_COMBINES: usize =
+    MAX_EXACT_TOUCHED_SLOTS + MAX_EXACT_SLOT_SIBLINGS - 1;
+/// Maximum raw sibling bytes under the analytical bound.
 pub const MAX_EXACT_SLOT_SIBLING_BYTES: usize = MAX_EXACT_SLOT_SIBLINGS * 32;
-/// Starting cap for serialized exact-state proof bytes.
-pub const MAX_EXACT_STATE_PROOF_BYTES: usize = 8 * 1024 * 1024;
+/// Bincode's vector length prefix plus the complete sibling frontier.
+pub const MAX_EXACT_STATE_PROOF_BYTES: usize = 8 + MAX_EXACT_SLOT_SIBLING_BYTES;
+/// Maximum EXSTNOD compression claims placed in one fixed-field GKR proof.
+///
+/// Every claim consumes two Poseidon permutation slots, so this cap keeps a
+/// chunk at `num_vars = 23` in the current dynamic block-spine layout.
+pub const MAX_EXACT_STRUCTURAL_HASH_CLAIMS_PER_PROOF: usize = 8_192;
 
 /// Exact authenticated state transition proof payload.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -82,15 +101,50 @@ pub struct ExactSlotLeafBatchInputs {
     pub new_leaves: Vec<SlotLeafInputs>,
 }
 
-/// Root-only result shared by the native acceptance path and the proof-input
-/// derivation path.  Keeping path expansion out of this step matters at the
-/// 255-transaction tier: acceptance reconstructs two roots and stops, while
-/// KillShot expands each old/new path family exactly once.
-struct VerifiedExactStateRoots {
-    old_root: StateHash,
-    new_root: StateHash,
-    old_leaf_hashes: Vec<StateHash>,
-    new_leaf_hashes: Vec<StateHash>,
+/// Deterministic proof-chunk geometry for the structural EXSTNOD carrier.
+///
+/// The logical statement always contains one class-capacity old-root half
+/// followed by one class-capacity new-root half.  Each half is live-combine
+/// prefix followed by canonical ghost combines.  Chunk boundaries are then
+/// cut across that fixed logical statement without reordering it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExactStateStructuralHashChunkPlan {
+    pub combine_capacity_per_root: usize,
+    pub total_claims: usize,
+    pub chunk_lengths: Vec<usize>,
+}
+
+/// Fixed-field EXSTNOD statements derived from one structural frontier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExactStateStructuralHashBatchInputs {
+    pub old_root: StateHash,
+    pub new_root: StateHash,
+    pub live_combines_per_root: usize,
+    pub chunk_plan: ExactStateStructuralHashChunkPlan,
+    pub chunks: Vec<Vec<FixedFieldHashInputs>>,
+}
+
+impl ExactStateStructuralHashBatchInputs {
+    /// Iterate in transcript order: padded old half, then padded new half.
+    pub fn claims(&self) -> impl Iterator<Item = &FixedFieldHashInputs> {
+        self.chunks.iter().flat_map(|chunk| chunk.iter())
+    }
+}
+
+/// Sealed root-only result shared by native acceptance and proof projection.
+///
+/// Fields stay crate-private and there is no public constructor: retained
+/// proof-input projection may reuse this object, but a verifier never accepts
+/// witness-supplied roots or combine digests as an authority. Keeping path
+/// expansion out of this step is what lets large statements stay path-free.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VerifiedExactStateRoots {
+    pub(crate) old_root: StateHash,
+    pub(crate) new_root: StateHash,
+    pub(crate) old_leaf_hashes: Vec<StateHash>,
+    pub(crate) new_leaf_hashes: Vec<StateHash>,
+    pub(crate) old_combine_digests: Vec<StateHash>,
+    pub(crate) new_combine_digests: Vec<StateHash>,
 }
 
 impl VerifiedStateTransition {
@@ -151,11 +205,17 @@ impl VerifiedStateTransition {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExactStateTransitionError {
     EmptyTouchedSet,
+    TooManyTouchedSlots { actual: usize, maximum: usize },
+    TooManyTouchedSegments { actual: usize, maximum: usize },
+    TooManySpends { actual: u32, maximum: usize },
+    TooManyMints { actual: u32, maximum: usize },
     SurfaceLengthMismatch,
     InvalidLogSlots,
     ParentRootMismatch,
     ChildRootMismatch,
     ProofTooLarge { siblings: usize },
+    StructuralCombineCapacityExceeded { required: usize, capacity: usize },
+    StructuralCombineCapacityTooLarge { capacity: usize, maximum: usize },
     CounterUnderflow,
     CounterOverflow,
     SparseMerkle(SparseMerkleError),
@@ -195,6 +255,18 @@ pub fn derive_exact_state_merkle_batch_inputs(
 ) -> Result<ExactStateMerkleBatchInputs, ExactStateTransitionError> {
     let roots = verify_exact_state_roots(inputs, surface, proof)?;
 
+    derive_exact_state_merkle_batch_inputs_from_verified_roots(inputs, surface, proof, &roots)
+}
+
+/// Project transitional directed-path inputs from roots already authenticated
+/// by [`verify_exact_state_roots`]. This is crate-private so untrusted callers
+/// cannot bypass the root audit.
+pub(crate) fn derive_exact_state_merkle_batch_inputs_from_verified_roots(
+    inputs: &ExactStateTransitionInputs,
+    surface: &ExactActionSurface,
+    proof: &ExactStateTransitionProof,
+    roots: &VerifiedExactStateRoots,
+) -> Result<ExactStateMerkleBatchInputs, ExactStateTransitionError> {
     let old_expanded = expand_multiproof_paths(
         &surface.touched_indices,
         &roots.old_leaf_hashes,
@@ -224,6 +296,189 @@ pub fn derive_exact_state_merkle_batch_inputs(
     })
 }
 
+/// Parameters for the structural binary-node hash relation.
+///
+/// Four fields are exactly the two 32-byte children in little-endian lane
+/// order.  The fixed no-padding schedule is byte-identical to
+/// `state_node_hash(left, right)` under `TAG_EXSTNOD`.
+pub fn exact_state_structural_hash_params() -> FixedFieldHashParams {
+    FixedFieldHashParams::with_default_relation_tag(TAG_EXSTNOD, 4)
+        .expect("four fields are a valid fixed EXSTNOD schedule")
+}
+
+/// Canonical class-level chunk plan for old and new structural combines.
+pub fn exact_state_structural_hash_chunk_plan(
+    combine_capacity_per_root: usize,
+) -> Result<ExactStateStructuralHashChunkPlan, ExactStateTransitionError> {
+    if combine_capacity_per_root == 0 {
+        return Err(
+            ExactStateTransitionError::StructuralCombineCapacityExceeded {
+                required: 1,
+                capacity: 0,
+            },
+        );
+    }
+    if combine_capacity_per_root > MAX_EXACT_FRONTIER_COMBINES {
+        return Err(
+            ExactStateTransitionError::StructuralCombineCapacityTooLarge {
+                capacity: combine_capacity_per_root,
+                maximum: MAX_EXACT_FRONTIER_COMBINES,
+            },
+        );
+    }
+
+    let total_claims = 2 * combine_capacity_per_root;
+    let mut remaining = total_claims;
+    let mut chunk_lengths =
+        Vec::with_capacity(total_claims.div_ceil(MAX_EXACT_STRUCTURAL_HASH_CLAIMS_PER_PROOF));
+    while remaining != 0 {
+        let chunk = remaining.min(MAX_EXACT_STRUCTURAL_HASH_CLAIMS_PER_PROOF);
+        chunk_lengths.push(chunk);
+        remaining -= chunk;
+    }
+    Ok(ExactStateStructuralHashChunkPlan {
+        combine_capacity_per_root,
+        total_claims,
+        chunk_lengths,
+    })
+}
+
+/// Canonical non-live EXSTNOD statement used after each root's live combines.
+///
+/// The all-zero digest is merely the structural PAD child value; its parent is
+/// still the real domain-separated hash of two PAD children.  Keeping this a
+/// valid hash statement lets every class retain fixed proof geometry without
+/// treating a zero digest as an end-of-frontier sentinel.
+pub fn exact_state_structural_hash_ghost_input() -> FixedFieldHashInputs {
+    structural_hash_input(
+        STRUCTURAL_FRONTIER_PAD,
+        STRUCTURAL_FRONTIER_PAD,
+        state_node_hash(STRUCTURAL_FRONTIER_PAD, STRUCTURAL_FRONTIER_PAD),
+    )
+}
+
+/// Derive fixed-field EXSTNOD statements from the canonical structural plan.
+///
+/// Live claims preserve `StructuralFrontierPlan::combines()` order.  The flat
+/// statement is:
+///
+/// ```text
+/// old_live || old_ghosts_to_class_cap ||
+/// new_live || new_ghosts_to_class_cap
+/// ```
+///
+/// It is then split deterministically into chunks of at most 8,192 claims.
+/// This is a prototype input carrier only; the production recursive backend
+/// still consumes expanded paths until its topology/source binding is moved to
+/// this structural statement.
+pub fn derive_exact_state_structural_hash_batch_inputs(
+    inputs: &ExactStateTransitionInputs,
+    surface: &ExactActionSurface,
+    proof: &ExactStateTransitionProof,
+    combine_capacity_per_root: usize,
+) -> Result<ExactStateStructuralHashBatchInputs, ExactStateTransitionError> {
+    let roots = verify_exact_state_roots(inputs, surface, proof)?;
+    let plan = derive_structural_frontier_plan(&surface.touched_indices, inputs.child_log_slots)?;
+    let live_combines_per_root = plan.combines().len();
+    if live_combines_per_root > combine_capacity_per_root {
+        return Err(
+            ExactStateTransitionError::StructuralCombineCapacityExceeded {
+                required: live_combines_per_root,
+                capacity: combine_capacity_per_root,
+            },
+        );
+    }
+    let chunk_plan = exact_state_structural_hash_chunk_plan(combine_capacity_per_root)?;
+
+    let old_evaluation =
+        evaluate_structural_frontier(&plan, &roots.old_leaf_hashes, &proof.slot_siblings)?;
+    if old_evaluation.root != roots.old_root {
+        return Err(ExactStateTransitionError::ParentRootMismatch);
+    }
+    let new_evaluation =
+        evaluate_structural_frontier(&plan, &roots.new_leaf_hashes, &proof.slot_siblings)?;
+    if new_evaluation.root != roots.new_root {
+        return Err(ExactStateTransitionError::ChildRootMismatch);
+    }
+
+    let ghost = exact_state_structural_hash_ghost_input();
+    let mut claims = Vec::with_capacity(chunk_plan.total_claims);
+    claims.extend(structural_hash_inputs_for_root(
+        &plan,
+        &roots.old_leaf_hashes,
+        &proof.slot_siblings,
+        &old_evaluation,
+    ));
+    claims.resize(combine_capacity_per_root, ghost.clone());
+    claims.extend(structural_hash_inputs_for_root(
+        &plan,
+        &roots.new_leaf_hashes,
+        &proof.slot_siblings,
+        &new_evaluation,
+    ));
+    claims.resize(chunk_plan.total_claims, ghost);
+
+    let mut claims = claims.into_iter();
+    let chunks = chunk_plan
+        .chunk_lengths
+        .iter()
+        .map(|&len| claims.by_ref().take(len).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    debug_assert!(claims.next().is_none());
+
+    Ok(ExactStateStructuralHashBatchInputs {
+        old_root: roots.old_root,
+        new_root: roots.new_root,
+        live_combines_per_root,
+        chunk_plan,
+        chunks,
+    })
+}
+
+fn structural_hash_inputs_for_root(
+    plan: &StructuralFrontierPlan,
+    leaves: &[StateHash],
+    siblings: &[StateHash],
+    evaluation: &StructuralFrontierEvaluation,
+) -> Vec<FixedFieldHashInputs> {
+    plan.combines()
+        .iter()
+        .enumerate()
+        .map(|(ordinal, combine)| {
+            let left = structural_node_value(combine.left, leaves, siblings, &evaluation.combines);
+            let right =
+                structural_node_value(combine.right, leaves, siblings, &evaluation.combines);
+            structural_hash_input(left, right, evaluation.combines[ordinal])
+        })
+        .collect()
+}
+
+fn structural_node_value(
+    node: StructuralNodeRef,
+    leaves: &[StateHash],
+    siblings: &[StateHash],
+    combines: &[StateHash],
+) -> StateHash {
+    match node {
+        StructuralNodeRef::TouchedLeaf(ordinal) => leaves[ordinal],
+        StructuralNodeRef::FrontierSibling(ordinal) => siblings[ordinal],
+        StructuralNodeRef::Combine(ordinal) => combines[ordinal],
+    }
+}
+
+fn structural_hash_input(
+    left: StateHash,
+    right: StateHash,
+    expected_parent: StateHash,
+) -> FixedFieldHashInputs {
+    let left = digest_to_fields(left);
+    let right = digest_to_fields(right);
+    FixedFieldHashInputs {
+        fields: vec![left[0], left[1], right[0], right[1]],
+        expected_digest: digest_to_fields(expected_parent),
+    }
+}
+
 pub fn derive_exact_slot_leaf_batch_inputs(
     surface: &ExactActionSurface,
 ) -> Result<ExactSlotLeafBatchInputs, ExactStateTransitionError> {
@@ -251,8 +506,20 @@ pub fn verify_exact_state_transition(
     surface: &ExactActionSurface,
     proof: &ExactStateTransitionProof,
 ) -> Result<VerifiedStateTransition, ExactStateTransitionError> {
-    verify_exact_state_roots(inputs, surface, proof)?;
-    seal_exact_state_transition(inputs, surface)
+    verify_exact_state_transition_with_roots(inputs, surface, proof)
+        .map(|(verified, _roots)| verified)
+}
+
+/// Verify both exact-state roots once and return the sealed transition together
+/// with its reusable, non-serializable root audit artifact.
+pub(crate) fn verify_exact_state_transition_with_roots(
+    inputs: &ExactStateTransitionInputs,
+    surface: &ExactActionSurface,
+    proof: &ExactStateTransitionProof,
+) -> Result<(VerifiedStateTransition, VerifiedExactStateRoots), ExactStateTransitionError> {
+    let roots = verify_exact_state_roots(inputs, surface, proof)?;
+    let verified = seal_exact_state_transition(inputs, surface)?;
+    Ok((verified, roots))
 }
 
 pub(crate) fn seal_exact_state_transition(
@@ -298,7 +565,7 @@ pub(crate) fn seal_exact_state_transition(
 /// without materialising per-leaf paths.  `reconstruct_root` consumes the
 /// canonical multiproof frontier directly, so the ordinary accept path stays
 /// O(frontier) in memory instead of O(touched_slots * depth).
-fn verify_exact_state_roots(
+pub(crate) fn verify_exact_state_roots(
     inputs: &ExactStateTransitionInputs,
     surface: &ExactActionSurface,
     proof: &ExactStateTransitionProof,
@@ -310,22 +577,15 @@ fn verify_exact_state_roots(
     let old_root = old_frontier_root(inputs)?;
     let old_leaf_hashes = hash_slots(&surface.old_slots);
     let new_leaf_hashes = hash_slots(&surface.new_slots);
-    let reconstructed_old = reconstruct_root(
-        &surface.touched_indices,
-        &old_leaf_hashes,
-        &proof.slot_siblings,
-        inputs.child_log_slots,
-    )?;
-    if reconstructed_old != old_root {
+    let plan = derive_structural_frontier_plan(&surface.touched_indices, inputs.child_log_slots)?;
+    let old_evaluation =
+        evaluate_structural_frontier(&plan, &old_leaf_hashes, &proof.slot_siblings)?;
+    if old_evaluation.root != old_root {
         return Err(ExactStateTransitionError::ParentRootMismatch);
     }
-    let reconstructed_new = reconstruct_root(
-        &surface.touched_indices,
-        &new_leaf_hashes,
-        &proof.slot_siblings,
-        inputs.child_log_slots,
-    )?;
-    if reconstructed_new != inputs.child_state_root {
+    let new_evaluation =
+        evaluate_structural_frontier(&plan, &new_leaf_hashes, &proof.slot_siblings)?;
+    if new_evaluation.root != inputs.child_state_root {
         return Err(ExactStateTransitionError::ChildRootMismatch);
     }
 
@@ -334,6 +594,8 @@ fn verify_exact_state_roots(
         new_root: inputs.child_state_root,
         old_leaf_hashes,
         new_leaf_hashes,
+        old_combine_digests: old_evaluation.combines,
+        new_combine_digests: new_evaluation.combines,
     })
 }
 
@@ -341,10 +603,43 @@ fn validate_surface(surface: &ExactActionSurface) -> Result<(), ExactStateTransi
     if surface.touched_indices.is_empty() {
         return Err(ExactStateTransitionError::EmptyTouchedSet);
     }
+    if surface.touched_indices.len() > MAX_EXACT_TOUCHED_SLOTS {
+        return Err(ExactStateTransitionError::TooManyTouchedSlots {
+            actual: surface.touched_indices.len(),
+            maximum: MAX_EXACT_TOUCHED_SLOTS,
+        });
+    }
+    let maximum_spends = noid_chain::consensus::params::BLOCK_MAX_LIVE_INPUTS;
+    if surface.spends as usize > maximum_spends {
+        return Err(ExactStateTransitionError::TooManySpends {
+            actual: surface.spends,
+            maximum: maximum_spends,
+        });
+    }
+    let maximum_mints = noid_chain::consensus::params::BLOCK_MAX_USER_OUTPUTS + 1;
+    if surface.mints as usize > maximum_mints {
+        return Err(ExactStateTransitionError::TooManyMints {
+            actual: surface.mints,
+            maximum: maximum_mints,
+        });
+    }
     if surface.touched_indices.len() != surface.old_slots.len()
         || surface.touched_indices.len() != surface.new_slots.len()
     {
         return Err(ExactStateTransitionError::SurfaceLengthMismatch);
+    }
+    let segment_count = surface
+        .touched_indices
+        .iter()
+        .map(|index| index >> noid_chain::consensus::params::LOG_SEGMENT_SIZE)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    let maximum_segments = noid_chain::consensus::params::BLOCK_MAX_DISTINCT_SEGMENTS;
+    if segment_count > maximum_segments {
+        return Err(ExactStateTransitionError::TooManyTouchedSegments {
+            actual: segment_count,
+            maximum: maximum_segments,
+        });
     }
     Ok(())
 }
@@ -460,6 +755,11 @@ mod tests {
         exact_action_surface_from_surface, StateDeltaAction, StateDeltaActionKind,
         StateDeltaActionSurface,
     };
+    use noid_gkr::{
+        discharge_fixed_field_hash_reductions_native, prove_fixed_field_hash_killshot,
+        verify_fixed_field_hash_killshot,
+    };
+    use noid_poseidon2b::channel::Poseidon2bChannel;
 
     fn sv(value: u64, seed: u128) -> SlotValue {
         SlotValue {
@@ -569,6 +869,159 @@ mod tests {
     }
 
     #[test]
+    fn structural_hash_inputs_follow_old_then_new_plan_order() {
+        let (surface, inputs, proof) = fixture(false);
+        let plan =
+            derive_structural_frontier_plan(&surface.touched_indices, inputs.child_log_slots)
+                .unwrap();
+        let live = plan.combines().len();
+        let capacity = live + 3;
+        let batch =
+            derive_exact_state_structural_hash_batch_inputs(&inputs, &surface, &proof, capacity)
+                .unwrap();
+        let claims = batch.claims().collect::<Vec<_>>();
+        let ghost = exact_state_structural_hash_ghost_input();
+
+        let old_leaves = hash_slots(&surface.old_slots);
+        let new_leaves = hash_slots(&surface.new_slots);
+        let old = evaluate_structural_frontier(&plan, &old_leaves, &proof.slot_siblings).unwrap();
+        let new = evaluate_structural_frontier(&plan, &new_leaves, &proof.slot_siblings).unwrap();
+
+        assert_eq!(batch.old_root, old.root);
+        assert_eq!(batch.new_root, new.root);
+        assert_eq!(batch.live_combines_per_root, live);
+        assert_eq!(claims.len(), 2 * capacity);
+        for (ordinal, expected) in old.combines.iter().enumerate() {
+            assert_eq!(claims[ordinal].expected_digest, digest_to_fields(*expected));
+        }
+        assert!(claims[live..capacity].iter().all(|claim| **claim == ghost));
+        for (ordinal, expected) in new.combines.iter().enumerate() {
+            assert_eq!(
+                claims[capacity + ordinal].expected_digest,
+                digest_to_fields(*expected)
+            );
+        }
+        assert!(claims[capacity + live..2 * capacity]
+            .iter()
+            .all(|claim| **claim == ghost));
+
+        assert_eq!(
+            structural_node_value(
+                plan.root_ref(),
+                &old_leaves,
+                &proof.slot_siblings,
+                &old.combines,
+            ),
+            batch.old_root
+        );
+        assert_eq!(
+            structural_node_value(
+                plan.root_ref(),
+                &new_leaves,
+                &proof.slot_siblings,
+                &new.combines,
+            ),
+            batch.new_root
+        );
+
+        let params = exact_state_structural_hash_params();
+        assert_eq!(params.domain_tag, TAG_EXSTNOD);
+        assert_eq!(params.n_fields, 4);
+        assert_eq!(
+            params.relation_tag,
+            0x4558_5354_4E4F_445F_4649_5848_4153_4805
+        );
+        assert_eq!(batch.chunks.len(), 1);
+        let mut prover_channel = Poseidon2bChannel::new();
+        let (hash_proof, expected_reductions) =
+            prove_fixed_field_hash_killshot(params, &batch.chunks[0], &mut prover_channel);
+        let mut verifier_channel = Poseidon2bChannel::new();
+        let reductions = verify_fixed_field_hash_killshot(
+            params,
+            &hash_proof,
+            &batch.chunks[0],
+            &mut verifier_channel,
+        )
+        .expect("structural fixed-field proof verifies");
+        assert_eq!(reductions, expected_reductions);
+        assert!(discharge_fixed_field_hash_reductions_native(
+            params,
+            &batch.chunks[0],
+            &reductions,
+        ));
+    }
+
+    #[test]
+    fn structural_hash_chunk_plans_are_class_fixed_and_m23_bounded() {
+        let cases: &[(usize, &[usize])] = &[
+            (2_152, &[4_304]),
+            (7_374, &[8_192, 6_556]),
+            (12_045, &[8_192, 8_192, 7_706]),
+            (23_998, &[8_192, 8_192, 8_192, 8_192, 8_192, 7_036]),
+        ];
+        for &(capacity, expected_chunks) in cases {
+            let plan = exact_state_structural_hash_chunk_plan(capacity).unwrap();
+            assert_eq!(plan.combine_capacity_per_root, capacity);
+            assert_eq!(plan.total_claims, 2 * capacity);
+            assert_eq!(plan.chunk_lengths, expected_chunks);
+            assert_eq!(plan.chunk_lengths.iter().sum::<usize>(), 2 * capacity);
+            assert!(plan
+                .chunk_lengths
+                .iter()
+                .all(|&len| len <= MAX_EXACT_STRUCTURAL_HASH_CLAIMS_PER_PROOF));
+            // Four fields means two permutation slots per claim.  At most
+            // 16,384 slots require 14 slot bits plus 7 round and 2 lane bits.
+            assert!(plan
+                .chunk_lengths
+                .iter()
+                .all(|&len| noid_gkr::block_spine::num_vars_for(2 * len) <= 23));
+        }
+
+        assert_eq!(
+            exact_state_structural_hash_chunk_plan(0),
+            Err(
+                ExactStateTransitionError::StructuralCombineCapacityExceeded {
+                    required: 1,
+                    capacity: 0,
+                }
+            )
+        );
+        assert_eq!(
+            exact_state_structural_hash_chunk_plan(MAX_EXACT_FRONTIER_COMBINES + 1),
+            Err(
+                ExactStateTransitionError::StructuralCombineCapacityTooLarge {
+                    capacity: MAX_EXACT_FRONTIER_COMBINES + 1,
+                    maximum: MAX_EXACT_FRONTIER_COMBINES,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn structural_hash_derivation_rejects_an_undersized_class_capacity() {
+        let (surface, inputs, proof) = fixture(false);
+        let required =
+            derive_structural_frontier_plan(&surface.touched_indices, inputs.child_log_slots)
+                .unwrap()
+                .combines()
+                .len();
+        assert_eq!(
+            derive_exact_state_structural_hash_batch_inputs(
+                &inputs,
+                &surface,
+                &proof,
+                required - 1,
+            ),
+            Err(
+                ExactStateTransitionError::StructuralCombineCapacityExceeded {
+                    required,
+                    capacity: required - 1,
+                }
+            )
+        );
+    }
+
+    #[test]
     fn root_depth_and_grow_zero_sibling_tamper_reject() {
         let (surface, inputs, proof) = fixture(false);
 
@@ -609,6 +1062,73 @@ mod tests {
         let bytes = bincode::serialize(&proof).unwrap();
         assert!(bytes.len() <= MAX_EXACT_STATE_PROOF_BYTES);
         assert_eq!(proof.byte_len(), proof.slot_siblings.len() * 32);
+    }
+
+    #[test]
+    fn production_frontier_uses_segment_aware_analytical_cap() {
+        assert_eq!(MAX_EXACT_TOUCHED_SLOTS, 1_531);
+        assert_eq!(MAX_EXACT_SLOT_SIBLINGS, 22_468);
+        assert_eq!(MAX_EXACT_SLOT_SIBLING_BYTES, 718_976);
+        assert_eq!(MAX_EXACT_STATE_PROOF_BYTES, 718_984);
+    }
+
+    #[test]
+    fn proof_helpers_enforce_live_and_segment_caps_before_frontier_work() {
+        let cache = SparseMerkleCache::new(32).unwrap();
+        let oversized = ExactActionSurface {
+            actions: Vec::new(),
+            touched_indices: (0..=MAX_EXACT_TOUCHED_SLOTS as u32).collect(),
+            old_slots: vec![SlotValue::EMPTY; MAX_EXACT_TOUCHED_SLOTS + 1],
+            new_slots: vec![SlotValue::EMPTY; MAX_EXACT_TOUCHED_SLOTS + 1],
+            spends: 0,
+            mints: 0,
+        };
+        assert_eq!(
+            build_exact_state_transition_proof(&cache, &oversized),
+            Err(ExactStateTransitionError::TooManyTouchedSlots {
+                actual: 1_532,
+                maximum: 1_531,
+            })
+        );
+
+        let dispersed: Vec<_> = (0..=noid_chain::consensus::params::BLOCK_MAX_DISTINCT_SEGMENTS)
+            .map(|segment| (segment as u32) << noid_chain::consensus::params::LOG_SEGMENT_SIZE)
+            .collect();
+        let too_many_segments = ExactActionSurface {
+            actions: Vec::new(),
+            old_slots: vec![SlotValue::EMPTY; dispersed.len()],
+            new_slots: vec![SlotValue::EMPTY; dispersed.len()],
+            touched_indices: dispersed,
+            spends: 0,
+            mints: 0,
+        };
+        assert_eq!(
+            build_exact_state_transition_proof(&cache, &too_many_segments),
+            Err(ExactStateTransitionError::TooManyTouchedSegments {
+                actual: 257,
+                maximum: 256,
+            })
+        );
+
+        let mut too_many_spends = surface(sv(10, 100), sv(7, 200));
+        too_many_spends.spends = 1_021;
+        assert_eq!(
+            build_exact_state_transition_proof(&cache, &too_many_spends),
+            Err(ExactStateTransitionError::TooManySpends {
+                actual: 1_021,
+                maximum: 1_020,
+            })
+        );
+
+        let mut too_many_mints = surface(sv(10, 100), sv(7, 200));
+        too_many_mints.mints = 512;
+        assert_eq!(
+            build_exact_state_transition_proof(&cache, &too_many_mints),
+            Err(ExactStateTransitionError::TooManyMints {
+                actual: 512,
+                maximum: 511,
+            })
+        );
     }
 
     #[test]

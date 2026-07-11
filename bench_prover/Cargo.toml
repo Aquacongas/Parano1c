@@ -50,3 +50,43 @@ harness = false
 [[bench]]
 name = "self_verify_rows"
 harness = false
+
+[[bench]]
+name = "action_compactor"
+harness = false
+
+[[bench]]
+name = "pcs_roofline"
+harness = false
+
+[[bench]]
+name = "accepted_b255_truth"
+harness = false
+
+[[bench]]
+name = "acceptance_row_ledger"
+harness = false
+
+[[bench]]
+name = "exact_state_structural_b255"
+harness = false
+
+[[bench]]
+name = "block_class_b8_proof"
+harness = false
+
+[[bench]]
+name = "block_link_tip_b8_vertical"
+harness = false
+
+[[bench]]
+name = "block_ladder_materialize"
+harness = false
+
+[[bench]]
+name = "block_class_ladder_proof"
+harness = false
+
+[[bench]]
+name = "canonical_ladder_capstone"
+harness = false

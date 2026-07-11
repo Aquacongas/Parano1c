@@ -37,7 +37,11 @@ pub fn flat_twiddle(c: usize, l: usize) -> F128 {
 fn eq2(z_hi: &[F128], c: usize) -> F128 {
     let mut e = F128::ONE;
     for (k, &zk) in z_hi.iter().enumerate() {
-        e = e * if (c >> k) & 1 == 1 { zk } else { F128::ONE + zk };
+        e = e * if (c >> k) & 1 == 1 {
+            zk
+        } else {
+            F128::ONE + zk
+        };
     }
     e
 }

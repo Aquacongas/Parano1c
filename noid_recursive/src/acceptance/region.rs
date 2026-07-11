@@ -18,7 +18,7 @@
 //! deep-chain walk replays the same permutation on flat values.
 
 use noid_core::Block128;
-use noid_fri_binius::capsule::{CAPSULE_CAP_DEPTH, CAPSULE_NUM_QUERIES, CAPSULE_TAU};
+use noid_fri_binius::capsule::{capsule_query_seed_count, CAPSULE_CAP_DEPTH, CAPSULE_TAU};
 use noid_gkr::auth_pcs::AuthMleOpeningProof;
 use noid_gkr::owner_auth::{
     OwnerAuthLayout, OwnerAuthProofKillShot, OwnerAuthPublicInputs, OWNER_AUTH_BOUNDARY_DOMAIN_TAG,
@@ -87,8 +87,9 @@ pub(crate) const CAPSULE_OPEN_TAG: u128 = 0xCA95_01E0_0AE4_1102;
 /// the 256 upper partial evals); the τ = 8 beta draws; the mid-layer root
 /// absorb; the `h` table absorb; the grind nonce absorb + the ground
 /// squeeze (its low [`noid_fri_binius::capsule::CAPSULE_GRIND_BITS`] bits
-/// are zero — enforced by the discharge, not the schedule); the query
-/// draw over `nv + CAPSULE_LOG_RATE` bits. Domain tags, `log_rows` and
+/// are zero — enforced by the discharge, not the schedule); the packed query
+/// seed draw carrying `CAPSULE_NUM_QUERIES * (nv + CAPSULE_LOG_RATE)` bits.
+/// Domain tags, `log_rows` and
 /// the cap length are protocol constants of the shape class; everything
 /// else is witness data.
 pub fn capsule_pcs_channel_schedule(
@@ -146,7 +147,9 @@ pub fn capsule_pcs_channel_schedule(
     let nonce_lane = s.data_lane(Block128::from(opening.grind_nonce as u128));
     s.absorb_lanes(vec![nonce_lane]);
     s.ops.push(TranscriptOp::Squeeze(1));
-    s.ops.push(TranscriptOp::Squeeze(CAPSULE_NUM_QUERIES));
+    s.ops.push(TranscriptOp::Squeeze(capsule_query_seed_count(
+        num_vars + noid_fri_binius::capsule::CAPSULE_LOG_RATE,
+    )));
 
     s
 }

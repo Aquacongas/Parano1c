@@ -9,10 +9,10 @@
 //! as [`super::source_tree`] (φ only at the symbol/digest boundary, every
 //! interior lane a plain flat wire).
 
+use crate::deep_chain::schedule::flat_of_tower_u128;
 use crate::deep_chain::source_tree::{
     compress_iv_flat, flat_compress, flat_hash_pair, permute_flat_state, run_perm,
 };
-use crate::deep_chain::schedule::flat_of_tower_u128;
 use crate::field::F128;
 use noid_poseidon2b::native::domain::{capacity_iv_flat, TAG_EXSTSLT};
 use noid_poseidon2b::native::permutation::STATE_SIZE;
@@ -274,7 +274,10 @@ fn slot_role(chain: &SourceLeafChain, slot: usize) -> u8 {
 /// `EVEN`, `ODD` mark the slot roles; `IV0/IV1` carry the compress capacity
 /// IV at even slots. One period tiles per leaf, so the verifier's pattern
 /// cost is leaf-count independent.
-pub fn source_leaf_fixed_patterns(chain: &SourceLeafChain, iv_flat: [F128; 2]) -> Vec<FixedPattern> {
+pub fn source_leaf_fixed_patterns(
+    chain: &SourceLeafChain,
+    iv_flat: [F128; 2],
+) -> Vec<FixedPattern> {
     let period = chain.stride();
     let low_log = period.trailing_zeros() as usize;
     let mut hp = vec![F128::ZERO; period];
@@ -395,7 +398,10 @@ pub fn flat_high_pair_leaf_hash(
     s1: F128,
 ) -> [F128; 2] {
     let iv = compress_iv_flat();
-    let acc = flat_hash_pair(flat_lane(HIGH_PAIR_LEAF_DOMAIN), flat_lane(layer_log as u128));
+    let acc = flat_hash_pair(
+        flat_lane(HIGH_PAIR_LEAF_DOMAIN),
+        flat_lane(layer_log as u128),
+    );
     let meta = flat_hash_pair(flat_lane(leaf_index as u128), s0);
     let acc = flat_compress(iv, acc, meta);
     let pair = flat_hash_pair(s0, s1);
@@ -571,7 +577,16 @@ pub fn build_pair_leaf_columns(
     }
 
     let digest = digests.first().copied().unwrap_or([F128::ZERO; 2]);
-    (SourceLeafColumns { c, s0, s_out, in_, digest }, digests)
+    (
+        SourceLeafColumns {
+            c,
+            s0,
+            s_out,
+            in_,
+            digest,
+        },
+        digests,
+    )
 }
 
 /// Wiring substitution for the bare hash-pair family: `raw = [IN0, IN1, 0, 0]`,
@@ -580,8 +595,14 @@ pub fn build_pair_leaf_columns(
 pub fn pair_leaf_substitution_terms(refs: &PairLeafRefs, alpha: F128) -> Vec<RelationTerm> {
     let m = mds_weights_pub(alpha);
     vec![
-        RelationTerm { coeff: m[0], factors: vec![ColRef::Committed(refs.in_[0])] },
-        RelationTerm { coeff: m[1], factors: vec![ColRef::Committed(refs.in_[1])] },
+        RelationTerm {
+            coeff: m[0],
+            factors: vec![ColRef::Committed(refs.in_[0])],
+        },
+        RelationTerm {
+            coeff: m[1],
+            factors: vec![ColRef::Committed(refs.in_[1])],
+        },
     ]
 }
 
@@ -699,7 +720,11 @@ pub fn build_sponge_leaf_columns(
     w_log: usize,
 ) -> (SourceLeafColumns, Vec<[F128; 2]>) {
     let w = 1usize << w_log;
-    assert_eq!(w % SPONGE_LEAF_SLOTS, 0, "domain not a multiple of the tile");
+    assert_eq!(
+        w % SPONGE_LEAF_SLOTS,
+        0,
+        "domain not a multiple of the tile"
+    );
     let num_tiles = w / SPONGE_LEAF_SLOTS;
     assert!(leaves.len() <= num_tiles, "more leaves than tiles");
     let iv = slot_leaf_iv_flat();
@@ -878,14 +903,21 @@ mod tests {
             let mut z = seed;
             z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
             z ^= z >> 31;
-            F128 { lo: z, hi: z.rotate_left(29) }
+            F128 {
+                lo: z,
+                hi: z.rotate_left(29),
+            }
         };
         let pairs: Vec<(F128, F128)> = (0..6).map(|_| (next(), next())).collect();
         let w_log = 3; // 8 slots cover 6 pairs
         let (cols, digests) = build_pair_leaf_columns(&pairs, w_log);
         for (t, &(s0, s1)) in pairs.iter().enumerate() {
             assert_eq!(digests[t], flat_hash_pair(s0, s1), "pair-leaf digest {t}");
-            assert_eq!([cols.c[0][t], cols.c[1][t]], flat_hash_pair(s0, s1), "column digest {t}");
+            assert_eq!(
+                [cols.c[0][t], cols.c[1][t]],
+                flat_hash_pair(s0, s1),
+                "column digest {t}"
+            );
         }
     }
 
@@ -904,7 +936,10 @@ mod tests {
             let mut z = seed;
             z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
             z ^= z >> 31;
-            F128 { lo: z, hi: z.rotate_left(17) }
+            F128 {
+                lo: z,
+                hi: z.rotate_left(17),
+            }
         };
         let pairs: Vec<(F128, F128)> = (0..n).map(|_| (next(), next())).collect();
         let (cols, digests) = build_pair_leaf_columns(&pairs, w_log);
@@ -926,11 +961,16 @@ mod tests {
                 F128::ZERO,
                 &rho,
                 &sel_terms,
-                &RelationColumns { committed: &committed, internal: &internal, fixed: &[] },
+                &RelationColumns {
+                    committed: &committed,
+                    internal: &internal,
+                    fixed: &[],
+                },
                 &mut ch_p,
             );
-            let sel_point = verify_column_relation(w_log, F128::ZERO, &rho, &sel_terms, &[], &sp, &mut ch_v)
-                .map_err(|e| format!("selection: {e}"))?;
+            let sel_point =
+                verify_column_relation(w_log, F128::ZERO, &rho, &sel_terms, &[], &sp, &mut ch_v)
+                    .map_err(|e| format!("selection: {e}"))?;
             let mut gv = [F128::ZERO; STATE_SIZE];
             for (r, v) in claimed_refs(&sel_terms).iter().zip(sp.final_values.iter()) {
                 match r {
@@ -939,7 +979,10 @@ mod tests {
                     _ => unreachable!(),
                 }
             }
-            let groups = vec![LaneClaimGroup { point: sel_point.clone(), values: gv }];
+            let groups = vec![LaneClaimGroup {
+                point: sel_point.clone(),
+                values: gv,
+            }];
             let (wp, _) = prove_deep_chain_walk(&cols.s0, &groups, &mut ch_p);
             let terminal = verify_deep_chain_walk(w_log, &groups, &wp, &mut ch_v)
                 .map_err(|e| format!("walk: {e}"))?;
@@ -957,12 +1000,27 @@ mod tests {
                 target,
                 &terminal.point,
                 &sub_terms,
-                &RelationColumns { committed: &committed, internal: &[], fixed: &[] },
+                &RelationColumns {
+                    committed: &committed,
+                    internal: &[],
+                    fixed: &[],
+                },
                 &mut ch_p,
             );
-            let sub_point = verify_column_relation(w_log, target, &terminal.point, &sub_terms, &[], &subp, &mut ch_v)
-                .map_err(|e| format!("substitution: {e}"))?;
-            for (r, v) in claimed_refs(&sub_terms).iter().zip(subp.final_values.iter()) {
+            let sub_point = verify_column_relation(
+                w_log,
+                target,
+                &terminal.point,
+                &sub_terms,
+                &[],
+                &subp,
+                &mut ch_v,
+            )
+            .map_err(|e| format!("substitution: {e}"))?;
+            for (r, v) in claimed_refs(&sub_terms)
+                .iter()
+                .zip(subp.final_values.iter())
+            {
                 match r {
                     ColRef::Committed(cc) => pending.push((*cc, sub_point.clone(), *v)),
                     _ => unreachable!(),
@@ -975,8 +1033,15 @@ mod tests {
                 }
             }
             for (t, dig) in digests.iter().enumerate() {
-                let dp: Vec<F128> =
-                    (0..w_log).map(|bb| if (t >> bb) & 1 == 1 { F128::ONE } else { F128::ZERO }).collect();
+                let dp: Vec<F128> = (0..w_log)
+                    .map(|bb| {
+                        if (t >> bb) & 1 == 1 {
+                            F128::ONE
+                        } else {
+                            F128::ZERO
+                        }
+                    })
+                    .collect();
                 if mle(&c[0], &dp) != dig[0] || mle(&c[1], &dp) != dig[1] {
                     return Err(format!("digest pin mismatch at tile {t}"));
                 }
@@ -988,12 +1053,18 @@ mod tests {
         {
             let mut bad = cols.in_[0].clone();
             bad[5] += F128::ONE;
-            assert!(run(&bad, &cols.in_[1], &cols.c).is_err(), "corrupted input symbol accepted");
+            assert!(
+                run(&bad, &cols.in_[1], &cols.c).is_err(),
+                "corrupted input symbol accepted"
+            );
         }
         {
             let mut bad = cols.c.clone();
             bad[0][5] += F128::ONE;
-            assert!(run(&cols.in_[0], &cols.in_[1], &bad).is_err(), "corrupted digest accepted");
+            assert!(
+                run(&cols.in_[0], &cols.in_[1], &bad).is_err(),
+                "corrupted digest accepted"
+            );
         }
     }
 
@@ -1036,7 +1107,11 @@ mod tests {
             F128::ZERO,
             &rho,
             &sel_terms,
-            &RelationColumns { committed: &committed, internal: &internal, fixed: &fixed },
+            &RelationColumns {
+                committed: &committed,
+                internal: &internal,
+                fixed: &fixed,
+            },
             &mut ch_p,
         );
         let sel_point =
@@ -1052,7 +1127,10 @@ mod tests {
         }
 
         // walk.
-        let groups = vec![LaneClaimGroup { point: sel_point.clone(), values: group_values }];
+        let groups = vec![LaneClaimGroup {
+            point: sel_point.clone(),
+            values: group_values,
+        }];
         let (wp, _) = prove_deep_chain_walk(s0, &groups, &mut ch_p);
         let terminal = verify_deep_chain_walk(w_log, &groups, &wp, &mut ch_v)
             .map_err(|e| format!("walk: {e}"))?;
@@ -1071,13 +1149,27 @@ mod tests {
             target,
             &terminal.point,
             &sub_terms,
-            &RelationColumns { committed: &committed, internal: &[], fixed: &fixed },
+            &RelationColumns {
+                committed: &committed,
+                internal: &[],
+                fixed: &fixed,
+            },
             &mut ch_p,
         );
-        let sub_point =
-            verify_column_relation(w_log, target, &terminal.point, &sub_terms, &fixed, &subp, &mut ch_v)
-                .map_err(|e| format!("substitution: {e}"))?;
-        for (r, v) in claimed_refs(&sub_terms).iter().zip(subp.final_values.iter()) {
+        let sub_point = verify_column_relation(
+            w_log,
+            target,
+            &terminal.point,
+            &sub_terms,
+            &fixed,
+            &subp,
+            &mut ch_v,
+        )
+        .map_err(|e| format!("substitution: {e}"))?;
+        for (r, v) in claimed_refs(&sub_terms)
+            .iter()
+            .zip(subp.final_values.iter())
+        {
             match r {
                 ColRef::Committed(cc) => pending.push((*cc, sub_point.clone(), *v)),
                 ColRef::CommittedShift(cc) => {
@@ -1107,7 +1199,13 @@ mod tests {
         // Per-tile digest pins.
         for (slot, dig) in pins {
             let digest_point: Vec<F128> = (0..w_log)
-                .map(|bb| if (slot >> bb) & 1 == 1 { F128::ONE } else { F128::ZERO })
+                .map(|bb| {
+                    if (slot >> bb) & 1 == 1 {
+                        F128::ONE
+                    } else {
+                        F128::ZERO
+                    }
+                })
                 .collect();
             if mle(&c[0], &digest_point) != dig[0] || mle(&c[1], &digest_point) != dig[1] {
                 return Err(format!("digest pin mismatch at slot {slot}"));
@@ -1132,14 +1230,19 @@ mod tests {
         let stride = chain.stride();
         let stride_log = stride.trailing_zeros() as usize;
         let w = 1usize << global_w_log;
-        assert_eq!(tiles.len() * stride, w, "tiles must exactly fill the domain");
+        assert_eq!(
+            tiles.len() * stride,
+            w,
+            "tiles must exactly fill the domain"
+        );
         let mut c: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; w]);
         let mut s0: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; w]);
         let mut s_out: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; w]);
         let mut in_: [Vec<F128>; 2] = std::array::from_fn(|_| vec![F128::ZERO; w]);
         let mut digests = Vec::with_capacity(tiles.len());
         for (t, (log_rows, leaf_index, symbols)) in tiles.iter().enumerate() {
-            let tile = build_source_leaf_columns(chain, *log_rows, *leaf_index, symbols, stride_log);
+            let tile =
+                build_source_leaf_columns(chain, *log_rows, *leaf_index, symbols, stride_log);
             let off = t * stride;
             for j in 0..STATE_SIZE {
                 c[j][off..off + stride].copy_from_slice(&tile.c[j]);
@@ -1152,7 +1255,16 @@ mod tests {
             digests.push(tile.digest);
         }
         let digest = digests[0];
-        (SourceLeafColumns { c, s0, s_out, in_, digest }, digests)
+        (
+            SourceLeafColumns {
+                c,
+                s0,
+                s_out,
+                in_,
+                digest,
+            },
+            digests,
+        )
     }
 
     /// The `[tx_hi | schedule_lo]` tiling: K source-leaf chains (distinct
@@ -1177,7 +1289,10 @@ mod tests {
             let mut z = seed;
             z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
             z ^= z >> 31;
-            F128 { lo: z, hi: z.rotate_left(23) }
+            F128 {
+                lo: z,
+                hi: z.rotate_left(23),
+            }
         };
         // Distinct (log_rows, leaf_index, symbols) per tile — the schedule is
         // the same, only the witness contents differ across txs.
@@ -1195,8 +1310,17 @@ mod tests {
             .map(|(t, &d)| (t * stride + chain.digest_slot(), d))
             .collect();
 
-        run_leaf_dag(&chain, &cols.in_[0], &cols.in_[1], &cols.c, &cols.s0, &cols.s_out, &pins, global_w_log)
-            .expect("tiled source-leaf DAG verifies with one walk + one relation set");
+        run_leaf_dag(
+            &chain,
+            &cols.in_[0],
+            &cols.in_[1],
+            &cols.c,
+            &cols.s0,
+            &cols.s_out,
+            &pins,
+            global_w_log,
+        )
+        .expect("tiled source-leaf DAG verifies with one walk + one relation set");
 
         // Corrupt tile 2's first column-hash symbol: exactly that tile's
         // wiring claim (and digest) breaks; the single relation set catches it.
@@ -1204,8 +1328,17 @@ mod tests {
             let mut bad = cols.in_[0].clone();
             bad[2 * stride + 4] += F128::ONE;
             assert!(
-                run_leaf_dag(&chain, &bad, &cols.in_[1], &cols.c, &cols.s0, &cols.s_out, &pins, global_w_log)
-                    .is_err(),
+                run_leaf_dag(
+                    &chain,
+                    &bad,
+                    &cols.in_[1],
+                    &cols.c,
+                    &cols.s0,
+                    &cols.s_out,
+                    &pins,
+                    global_w_log
+                )
+                .is_err(),
                 "corrupted tile symbol accepted"
             );
         }
@@ -1266,21 +1399,42 @@ mod tests {
             let mut z = seed;
             z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
             z ^= z >> 31;
-            F128 { lo: z, hi: z.rotate_left(29) }
+            F128 {
+                lo: z,
+                hi: z.rotate_left(29),
+            }
         };
         let symbols: Vec<F128> = (0..n_cols * 2).map(|_| next()).collect();
         let cols = build_source_leaf_columns(&chain, log_rows, leaf_index, &symbols, w_log);
 
-        run_leaf_dag(&chain, &cols.in_[0], &cols.in_[1], &cols.c, &cols.s0, &cols.s_out, &[(chain.digest_slot(), cols.digest)], w_log)
-            .expect("honest source leaf DAG verifies");
+        run_leaf_dag(
+            &chain,
+            &cols.in_[0],
+            &cols.in_[1],
+            &cols.c,
+            &cols.s0,
+            &cols.s_out,
+            &[(chain.digest_slot(), cols.digest)],
+            w_log,
+        )
+        .expect("honest source leaf DAG verifies");
 
         // A corrupted symbol input breaks a claim.
         {
             let mut bad = cols.in_[0].clone();
             bad[4] += F128::ONE; // first column hash_pair input
             assert!(
-                run_leaf_dag(&chain, &bad, &cols.in_[1], &cols.c, &cols.s0, &cols.s_out, &[(chain.digest_slot(), cols.digest)], w_log)
-                    .is_err(),
+                run_leaf_dag(
+                    &chain,
+                    &bad,
+                    &cols.in_[1],
+                    &cols.c,
+                    &cols.s0,
+                    &cols.s_out,
+                    &[(chain.digest_slot(), cols.digest)],
+                    w_log
+                )
+                .is_err(),
                 "corrupted IN accepted"
             );
         }
@@ -1289,8 +1443,17 @@ mod tests {
             let mut bad = cols.c.clone();
             bad[0][chain.digest_slot()] += F128::ONE;
             assert!(
-                run_leaf_dag(&chain, &cols.in_[0], &cols.in_[1], &bad, &cols.s0, &cols.s_out, &[(chain.digest_slot(), cols.digest)], w_log)
-                    .is_err(),
+                run_leaf_dag(
+                    &chain,
+                    &cols.in_[0],
+                    &cols.in_[1],
+                    &bad,
+                    &cols.s0,
+                    &cols.s_out,
+                    &[(chain.digest_slot(), cols.digest)],
+                    w_log
+                )
+                .is_err(),
                 "corrupted C accepted"
             );
         }
@@ -1308,7 +1471,10 @@ mod tests {
             z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
             z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
             z ^= z >> 31;
-            F128 { lo: z, hi: z.rotate_left(19) }
+            F128 {
+                lo: z,
+                hi: z.rotate_left(19),
+            }
         };
         let chain = high_pair_leaf_chain();
         let w_log = chain.stride().trailing_zeros() as usize;
@@ -1316,7 +1482,10 @@ mod tests {
             let (s0, s1) = (next(), next());
             let cols = build_high_pair_leaf_columns(layer_log, leaf_index, s0, s1, w_log);
             let direct = flat_high_pair_leaf_hash(layer_log, leaf_index, s0, s1);
-            assert_eq!(cols.digest, direct, "chain digest != flat_high_pair_leaf_hash");
+            assert_eq!(
+                cols.digest, direct,
+                "chain digest != flat_high_pair_leaf_hash"
+            );
             for slot in 0..(1usize << w_log) {
                 for j in 0..STATE_SIZE {
                     assert_eq!(cols.c[j][slot], cols.s_out[j][slot]);
@@ -1335,13 +1504,28 @@ mod tests {
         let w_log = chain.stride().trailing_zeros() as usize;
         let (layer_log, leaf_index) = (6usize, 5usize);
         let (s0, s1) = (
-            F128 { lo: 0x1234_5678, hi: 0x9ABC_DEF0 },
-            F128 { lo: 0x0FED_CBA9, hi: 0x8765_4321 },
+            F128 {
+                lo: 0x1234_5678,
+                hi: 0x9ABC_DEF0,
+            },
+            F128 {
+                lo: 0x0FED_CBA9,
+                hi: 0x8765_4321,
+            },
         );
         let cols = build_high_pair_leaf_columns(layer_log, leaf_index, s0, s1, w_log);
 
-        run_leaf_dag(&chain, &cols.in_[0], &cols.in_[1], &cols.c, &cols.s0, &cols.s_out, &[(chain.digest_slot(), cols.digest)], w_log)
-            .expect("honest high-pair leaf DAG verifies");
+        run_leaf_dag(
+            &chain,
+            &cols.in_[0],
+            &cols.in_[1],
+            &cols.c,
+            &cols.s0,
+            &cols.s_out,
+            &[(chain.digest_slot(), cols.digest)],
+            w_log,
+        )
+        .expect("honest high-pair leaf DAG verifies");
 
         // The symbol s0 sits at slot 1 (meta, IN1) and slot 4 (pair, IN0):
         // corrupting either input lane must break a claim.
@@ -1349,8 +1533,17 @@ mod tests {
             let mut bad = cols.in_[1].clone();
             bad[1] += F128::ONE; // s0 in the meta hash_pair
             assert!(
-                run_leaf_dag(&chain, &cols.in_[0], &bad, &cols.c, &cols.s0, &cols.s_out, &[(chain.digest_slot(), cols.digest)], w_log)
-                    .is_err(),
+                run_leaf_dag(
+                    &chain,
+                    &cols.in_[0],
+                    &bad,
+                    &cols.c,
+                    &cols.s0,
+                    &cols.s_out,
+                    &[(chain.digest_slot(), cols.digest)],
+                    w_log
+                )
+                .is_err(),
                 "corrupted meta symbol accepted"
             );
         }
@@ -1358,8 +1551,17 @@ mod tests {
             let mut bad = cols.in_[1].clone();
             bad[4] += F128::ONE; // s1 in the pair hash_pair
             assert!(
-                run_leaf_dag(&chain, &cols.in_[0], &bad, &cols.c, &cols.s0, &cols.s_out, &[(chain.digest_slot(), cols.digest)], w_log)
-                    .is_err(),
+                run_leaf_dag(
+                    &chain,
+                    &cols.in_[0],
+                    &bad,
+                    &cols.c,
+                    &cols.s0,
+                    &cols.s_out,
+                    &[(chain.digest_slot(), cols.digest)],
+                    w_log
+                )
+                .is_err(),
                 "corrupted pair symbol accepted"
             );
         }
@@ -1367,8 +1569,17 @@ mod tests {
             let mut bad = cols.c.clone();
             bad[1][chain.digest_slot()] += F128::ONE;
             assert!(
-                run_leaf_dag(&chain, &cols.in_[0], &cols.in_[1], &bad, &cols.s0, &cols.s_out, &[(chain.digest_slot(), cols.digest)], w_log)
-                    .is_err(),
+                run_leaf_dag(
+                    &chain,
+                    &cols.in_[0],
+                    &cols.in_[1],
+                    &bad,
+                    &cols.s0,
+                    &cols.s_out,
+                    &[(chain.digest_slot(), cols.digest)],
+                    w_log
+                )
+                .is_err(),
                 "corrupted digest accepted"
             );
         }
@@ -1434,8 +1645,16 @@ mod tests {
                 tower_flat(owner_hi),
                 tower_flat(owner_lo),
             );
-            assert_eq!(got[0], tower_flat(want[0]), "slot-leaf digest lane 0 diverges under phi");
-            assert_eq!(got[1], tower_flat(want[1]), "slot-leaf digest lane 1 diverges under phi");
+            assert_eq!(
+                got[0],
+                tower_flat(want[0]),
+                "slot-leaf digest lane 0 diverges under phi"
+            );
+            assert_eq!(
+                got[1],
+                tower_flat(want[1]),
+                "slot-leaf digest lane 1 diverges under phi"
+            );
         }
     }
 
@@ -1465,9 +1684,16 @@ mod tests {
 
         for (t, &(amount, owner_hi, owner_lo)) in leaves.iter().enumerate() {
             let direct = flat_sponge_leaf_hash(amount, owner_hi, owner_lo);
-            assert_eq!(digests[t], direct, "chain digest {t} != flat_sponge_leaf_hash");
+            assert_eq!(
+                digests[t], direct,
+                "chain digest {t} != flat_sponge_leaf_hash"
+            );
             let odd = SPONGE_LEAF_SLOTS * t + SPONGE_LEAF_DIGEST_SLOT;
-            assert_eq!([cols.c[0][odd], cols.c[1][odd]], direct, "column digest {t}");
+            assert_eq!(
+                [cols.c[0][odd], cols.c[1][odd]],
+                direct,
+                "column digest {t}"
+            );
         }
         for slot in 0..(1usize << w_log) {
             for j in 0..STATE_SIZE {
@@ -1512,7 +1738,11 @@ mod tests {
             F128::ZERO,
             &rho,
             &sel_terms,
-            &RelationColumns { committed: &committed, internal: &internal, fixed: &fixed },
+            &RelationColumns {
+                committed: &committed,
+                internal: &internal,
+                fixed: &fixed,
+            },
             &mut ch_p,
         );
         let sel_point =
@@ -1528,7 +1758,10 @@ mod tests {
         }
 
         // walk.
-        let groups = vec![LaneClaimGroup { point: sel_point.clone(), values: group_values }];
+        let groups = vec![LaneClaimGroup {
+            point: sel_point.clone(),
+            values: group_values,
+        }];
         let (wp, _) = prove_deep_chain_walk(s0, &groups, &mut ch_p);
         let terminal = verify_deep_chain_walk(w_log, &groups, &wp, &mut ch_v)
             .map_err(|e| format!("walk: {e}"))?;
@@ -1547,13 +1780,27 @@ mod tests {
             target,
             &terminal.point,
             &sub_terms,
-            &RelationColumns { committed: &committed, internal: &[], fixed: &fixed },
+            &RelationColumns {
+                committed: &committed,
+                internal: &[],
+                fixed: &fixed,
+            },
             &mut ch_p,
         );
-        let sub_point =
-            verify_column_relation(w_log, target, &terminal.point, &sub_terms, &fixed, &subp, &mut ch_v)
-                .map_err(|e| format!("substitution: {e}"))?;
-        for (r, v) in claimed_refs(&sub_terms).iter().zip(subp.final_values.iter()) {
+        let sub_point = verify_column_relation(
+            w_log,
+            target,
+            &terminal.point,
+            &sub_terms,
+            &fixed,
+            &subp,
+            &mut ch_v,
+        )
+        .map_err(|e| format!("substitution: {e}"))?;
+        for (r, v) in claimed_refs(&sub_terms)
+            .iter()
+            .zip(subp.final_values.iter())
+        {
             match r {
                 ColRef::Committed(cc) => pending.push((*cc, sub_point.clone(), *v)),
                 ColRef::CommittedShift(cc) => {
@@ -1576,7 +1823,13 @@ mod tests {
         // Per-tile digest pins.
         for (slot, dig) in pins {
             let digest_point: Vec<F128> = (0..w_log)
-                .map(|bb| if (slot >> bb) & 1 == 1 { F128::ONE } else { F128::ZERO })
+                .map(|bb| {
+                    if (slot >> bb) & 1 == 1 {
+                        F128::ONE
+                    } else {
+                        F128::ZERO
+                    }
+                })
                 .collect();
             if mle(&c[0], &digest_point) != dig[0] || mle(&c[1], &digest_point) != dig[1] {
                 return Err(format!("digest pin mismatch at slot {slot}"));
@@ -1600,7 +1853,10 @@ mod tests {
             let mut z = seed;
             z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
             z ^= z >> 31;
-            F128 { lo: z, hi: z.rotate_left(29) }
+            F128 {
+                lo: z,
+                hi: z.rotate_left(29),
+            }
         };
         let leaves: Vec<(F128, F128, F128)> = (0..k).map(|_| (next(), next(), next())).collect();
         let (cols, digests) = build_sponge_leaf_columns(&leaves, w_log);
@@ -1610,16 +1866,32 @@ mod tests {
             .map(|(t, &d)| (SPONGE_LEAF_SLOTS * t + SPONGE_LEAF_DIGEST_SLOT, d))
             .collect();
 
-        run_sponge_leaf_dag(&cols.in_[0], &cols.in_[1], &cols.c, &cols.s0, &cols.s_out, &pins, w_log)
-            .expect("honest sponge-leaf DAG verifies");
+        run_sponge_leaf_dag(
+            &cols.in_[0],
+            &cols.in_[1],
+            &cols.c,
+            &cols.s0,
+            &cols.s_out,
+            &pins,
+            w_log,
+        )
+        .expect("honest sponge-leaf DAG verifies");
 
         // Corrupt leaf 2's absorbed amount (IN0 at its even slot).
         {
             let mut bad = cols.in_[0].clone();
             bad[SPONGE_LEAF_SLOTS * 2] += F128::ONE;
             assert!(
-                run_sponge_leaf_dag(&bad, &cols.in_[1], &cols.c, &cols.s0, &cols.s_out, &pins, w_log)
-                    .is_err(),
+                run_sponge_leaf_dag(
+                    &bad,
+                    &cols.in_[1],
+                    &cols.c,
+                    &cols.s0,
+                    &cols.s_out,
+                    &pins,
+                    w_log
+                )
+                .is_err(),
                 "corrupted amount accepted"
             );
         }
@@ -1628,8 +1900,16 @@ mod tests {
             let mut bad = cols.in_[1].clone();
             bad[SPONGE_LEAF_SLOTS * 1] += F128::ONE;
             assert!(
-                run_sponge_leaf_dag(&cols.in_[0], &bad, &cols.c, &cols.s0, &cols.s_out, &pins, w_log)
-                    .is_err(),
+                run_sponge_leaf_dag(
+                    &cols.in_[0],
+                    &bad,
+                    &cols.c,
+                    &cols.s0,
+                    &cols.s_out,
+                    &pins,
+                    w_log
+                )
+                .is_err(),
                 "corrupted owner accepted"
             );
         }
@@ -1638,8 +1918,16 @@ mod tests {
             let mut bad = cols.c.clone();
             bad[0][SPONGE_LEAF_SLOTS * 3 + SPONGE_LEAF_DIGEST_SLOT] += F128::ONE;
             assert!(
-                run_sponge_leaf_dag(&cols.in_[0], &cols.in_[1], &bad, &cols.s0, &cols.s_out, &pins, w_log)
-                    .is_err(),
+                run_sponge_leaf_dag(
+                    &cols.in_[0],
+                    &cols.in_[1],
+                    &bad,
+                    &cols.s0,
+                    &cols.s_out,
+                    &pins,
+                    w_log
+                )
+                .is_err(),
                 "corrupted digest accepted"
             );
         }

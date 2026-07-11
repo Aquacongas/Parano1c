@@ -50,10 +50,7 @@ pub unsafe fn reduce_gcm_x2(hi: __m256i, lo: __m256i) -> __m256i {
     let v2_shift = _mm256_bslli_epi128(v2, 8);
     let v2_over = _mm256_bsrli_epi128(v2, 8);
     let v3 = _mm256_clmulepi64_epi128(v2_over, p, 0x00);
-    _mm256_xor_si256(
-        _mm256_xor_si256(lo, v1),
-        _mm256_xor_si256(v2_shift, v3),
-    )
+    _mm256_xor_si256(_mm256_xor_si256(lo, v1), _mm256_xor_si256(v2_shift, v3))
 }
 
 /// Two independent flat-basis GF(2^128) multiplications, one per 128-bit
@@ -105,10 +102,7 @@ pub unsafe fn packed_mul_flat_avx2(a: PackedBlock128, b: PackedBlock128) -> Pack
 /// Lane-parallel `clmul_gcm` of a packed flat-basis value by one flat
 /// scalar (broadcast into both lanes).
 #[inline(always)]
-pub unsafe fn packed_scalar_mul_flat_avx2(
-    a: PackedBlock128,
-    scalar_flat: u128,
-) -> PackedBlock128 {
+pub unsafe fn packed_scalar_mul_flat_avx2(a: PackedBlock128, scalar_flat: u128) -> PackedBlock128 {
     let s = _mm256_broadcastsi128_si256(core::mem::transmute::<u128, __m128i>(scalar_flat));
     store(mul_gcm_x2(load(&a), s))
 }
@@ -167,8 +161,7 @@ mod tests {
         for _ in 0..10_000 {
             let a = [rng(&mut s), rng(&mut s)];
             let c = rng(&mut s);
-            let got =
-                unsafe { packed_scalar_mul_flat_avx2(PackedBlock128 { lanes: a }, c) };
+            let got = unsafe { packed_scalar_mul_flat_avx2(PackedBlock128 { lanes: a }, c) };
             for i in 0..2 {
                 assert_eq!(got.lanes[i], clmul_gcm(a[i], c), "lane {i}");
             }

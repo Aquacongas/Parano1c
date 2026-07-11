@@ -119,6 +119,11 @@ pub struct AcceptedBlockValidationArtifacts {
     pub exact_state_inputs: crate::ExactStateTransitionInputs,
     pub exact_action_surface: ExactActionSurface,
     pub verified_transition: crate::VerifiedStateTransition,
+    /// Sealed native root audit reused only by the in-process retained prover.
+    /// Coinbase-only acceptance has no detached frontier proof, so its batch
+    /// replay reconstructs and verifies that frontier once later.
+    pub(crate) verified_exact_state_roots:
+        Option<crate::exact_state_transition::VerifiedExactStateRoots>,
 }
 
 #[derive(Debug, Clone)]
@@ -409,7 +414,12 @@ fn validate_block_full_inner<V: AuthorizationVerifier>(
         parent_active_slot_count: state.active_slot_count,
         parent_alloc_counter: state.alloc_counter,
     };
-    let verified = crate::verify_exact_state_transition(&inputs, &surface, &proof.state_transition)
+    let (verified, verified_exact_state_roots) =
+        crate::exact_state_transition::verify_exact_state_transition_with_roots(
+            &inputs,
+            &surface,
+            &proof.state_transition,
+        )
         .map_err(|e| {
             FullValidationError::ZkProof(crate::VerifyBlockError::ExactStateTransition(e))
         })?;
@@ -453,6 +463,7 @@ fn validate_block_full_inner<V: AuthorizationVerifier>(
             exact_state_inputs: inputs,
             exact_action_surface: surface,
             verified_transition: verified,
+            verified_exact_state_roots: Some(verified_exact_state_roots),
         },
     })
 }
@@ -900,7 +911,7 @@ fn accept_block_inner_with_artifacts<V: AuthorizationVerifier>(
     let user_txs = preflight.user_tx_count;
     let live_inputs = preflight.live_input_count;
     let outputs = preflight.output_count;
-    let state_frontier_nodes = preflight.action_count;
+    let state_frontier_nodes = preflight.state_frontier_node_count;
     if !block_resource_weight_ok(
         block_body_len,
         block_proof_bytes.len(),
@@ -1081,22 +1092,20 @@ fn derive_coinbase_only_validation_artifacts(
         exact_state_inputs: inputs,
         exact_action_surface: surface,
         verified_transition: verified,
+        verified_exact_state_roots: None,
     })
 }
 
-pub(crate) fn block_resource_counts(block: &Block) -> (usize, usize, usize, usize) {
-    let mut user_txs = 0usize;
-    let mut live_inputs = 0usize;
-    let mut outputs = 0usize;
-    for tx in &block.transactions {
-        if !tx.body.is_coinbase {
-            user_txs += 1;
-            live_inputs += tx.body.live_input_count();
-        }
-        outputs += tx.body.live_output_count();
-    }
-    let state_frontier_nodes = live_inputs.saturating_add(outputs);
-    (user_txs, live_inputs, outputs, state_frontier_nodes)
+pub(crate) fn block_resource_counts(
+    block: &Block,
+) -> Result<(usize, usize, usize, usize), noid_chain::consensus::ConsensusError> {
+    let preflight = validate_block_resource_preflight(block)?;
+    Ok((
+        preflight.user_tx_count,
+        preflight.live_input_count,
+        preflight.output_count,
+        preflight.state_frontier_node_count,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1364,7 +1373,10 @@ mod tests {
             transactions,
         };
 
-        assert_eq!(block_resource_counts(&block), (255, 1020, 511, 1531));
+        // The first three lanes are live resource counts. The final lane is
+        // now the actual canonical sibling frontier for this deliberately
+        // duplicate-heavy synthetic slot set, not an alias for action count.
+        assert_eq!(block_resource_counts(&block).unwrap(), (255, 1020, 511, 8));
     }
 
     #[test]

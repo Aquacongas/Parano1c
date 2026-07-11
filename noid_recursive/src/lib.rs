@@ -18,23 +18,21 @@ pub mod checkpoint_ivc_backend;
 pub mod checkpoint_proof;
 pub mod fs_transcript;
 pub mod header_integer;
-pub mod header_projection;
 pub mod pow_header;
+pub mod region_sidecar;
 
-pub use acceptance::{
-    verify_acceptance_against_projection, AcceptanceProof, AcceptanceRelationError,
-};
+pub use acceptance::{verify_acceptance_against_header, AcceptanceProof, AcceptanceRelationError};
 pub use accepted_batch::{
     accepted_claim_batch_digest, accepted_claim_batch_digest_hash_fields,
-    accepted_claim_batch_digest_hash_params,
-    prove_accepted_claim_batch_digest, verify_accepted_claim_batch_digest,
-    verify_accepted_claim_batch_native, verify_accepted_claim_batch_with_header_trace,
-    AcceptedClaimBatchDigestError, AcceptedClaimBatchDigestProof, AcceptedClaimBatchError,
-    AcceptedClaimBatchOutput, AcceptedClaimBatchWitness, ACCEPTED_CLAIM_BATCH_DIGEST_HASH_FIELDS,
+    accepted_claim_batch_digest_hash_params, prove_accepted_claim_batch_digest,
+    verify_accepted_claim_batch_digest, verify_accepted_claim_batch_native,
+    verify_accepted_claim_batch_with_header_trace, AcceptedClaimBatchDigestError,
+    AcceptedClaimBatchDigestProof, AcceptedClaimBatchError, AcceptedClaimBatchOutput,
+    AcceptedClaimBatchWitness, ACCEPTED_CLAIM_BATCH_DIGEST_HASH_FIELDS,
 };
 pub use accumulator::{
     genesis_accumulator, ChainAccumulator, ChainAccumulatorAdvanceError, ChainAccumulatorLaneError,
-    CHAIN_ACCUMULATOR_LANES,
+    ChainAccumulatorLocalBoundaryError, CHAIN_ACCUMULATOR_LANES,
 };
 pub use authorization::{
     verify_authorization_batch_native, verify_authorization_batch_native_with_traces,
@@ -128,12 +126,6 @@ pub use header_integer::{
     build_header_integer_trace, verify_header_integer_trace, HeaderIntegerBatchTrace,
     HeaderIntegerStepTrace, HeaderIntegerTraceError,
 };
-pub use header_projection::{
-    extend_header_projection_root_from_slot, header_projection_chunk_from_slots,
-    header_projection_slot_digest, validate_header_projection_chunk, HeaderProjectionChunk,
-    HeaderProjectionChunkError, HeaderProjectionSlot, HEADER_PROJECTION_CHUNK_CAPACITY,
-};
-
 pub use pow_header::{
     header_hash_proof_inputs, verify_pow_header_batch_native,
     verify_pow_header_witness_batch_native, HeaderWitness, PowHeaderBatchError,

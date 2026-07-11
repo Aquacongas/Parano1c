@@ -518,20 +518,29 @@ fn region_spine_families_multitx_with_ghosts() {
     )
     .expect("honest spine multitx+ghost PCS proof");
 
-    // Walk-A column slices are allocated first and in the meta order
-    // (KID0, KID1, IN0, IN1, C0..C3 — the source-tree CODE lanes ride IN) —
-    // recover KID0 as the FIRST distinct slice and the per-tx block size
-    // from its length / k.
+    // Native column families are physically allocated by descending domain,
+    // so recover meta KID0 by its known real-instance leaf cell rather than
+    // relying on family start order. Meta columns themselves remain contiguous
+    // in KID0,KID1,IN0,IN1,C0..C3 order.
     let mut uniq: Vec<WitnessSlice> = claims.iter().map(|c| c.slice).collect();
     uniq.sort_by_key(|s| s.start());
     uniq.dedup_by_key(|s| s.start());
-    let kid0 = uniq[0];
-    let c0 = uniq[4];
+    let inst2_l2 = spine.instances[2].flat.leaves[2][0];
+    let expected_l2_slot = 128 + SPINE_TREE_KID_LEAF_BASE + 2;
+    let kid0 = *uniq
+        .iter()
+        .find(|slice| {
+            expected_l2_slot < slice.len() && z[slice.start() + expected_l2_slot] == inst2_l2
+        })
+        .expect("meta KID0 contains instance 2's raw L2");
+    let c0 = WitnessSlice {
+        log2_len: kid0.log2_len,
+        index: kid0.index + 4,
+    };
     let p_col = 1usize << kid0.log2_len;
     let per_tx_block_a = p_col / k;
     // Recover the spine-tree base by locating instance 2's raw L2 lane inside tx block 1's
     // KID0 slice — robust against the wallet-family layout details.
-    let inst2_l2 = spine.instances[2].flat.leaves[2][0];
     let blk1 = kid0.start() + per_tx_block_a;
     let hit = (0..per_tx_block_a)
         .find(|&w| z[blk1 + w] == inst2_l2)
@@ -574,8 +583,8 @@ fn region_spine_families_multitx_with_ghosts() {
         );
     }
 
-    // Negative 3 (root→wrap→hash closure): C0 is the fifth walk-A meta
-    // slice.  Flip the real instance's one-slot wrap output; the direct cell
+    // Negative 3 (root→wrap→hash closure): flip the real instance's one-slot
+    // wrap output in meta C0; the direct cell
     // pin to the tx-hash statement must reject without relying on PCS chance.
     {
         let wrap_base = spine_tree_base + 2 * SPINE_TREE_SLOTS;

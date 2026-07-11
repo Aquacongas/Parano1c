@@ -13,7 +13,7 @@
 
 #![allow(clippy::format_in_format_args, clippy::print_literal)]
 
-use anyhow::{Context, bail};
+use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
 use noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH;
 use serde_json::Value;
@@ -2153,7 +2153,7 @@ fn print_json(v: &Value) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod amount_tests {
-    use super::{RpcCallError, input_limit_exceeded_message, noid_str, parse_noid_amount};
+    use super::{input_limit_exceeded_message, noid_str, parse_noid_amount, RpcCallError};
 
     #[test]
     fn decimal_amounts_are_exact_and_checked() {

@@ -1223,8 +1223,7 @@ mod path_expansion_tests {
 
         // Distinct + a duplicate query index.
         let query_indices = vec![3usize, 3, 10, 21, 0, 31];
-        let query_leaves: Vec<HashOutput> =
-            query_indices.iter().map(|&i| leaves[i]).collect();
+        let query_leaves: Vec<HashOutput> = query_indices.iter().map(|&i| leaves[i]).collect();
 
         let batch = build_batched_merkle_proof(&tree, &query_indices, depth);
         verify_batched_merkle_proof(&root, &batch, depth, &query_indices, &query_leaves, &hasher)
@@ -1259,8 +1258,7 @@ mod path_expansion_tests {
         let hasher = Poseidon2bSponge::new();
         let (tree, root, leaves, depth) = tree_and_queries();
         let query_indices = vec![3usize, 10, 21];
-        let query_leaves: Vec<HashOutput> =
-            query_indices.iter().map(|&i| leaves[i]).collect();
+        let query_leaves: Vec<HashOutput> = query_indices.iter().map(|&i| leaves[i]).collect();
         let mut batch = build_batched_merkle_proof(&tree, &query_indices, depth);
         assert!(!batch.siblings.is_empty());
         batch.siblings[0][0] ^= 0xFF;

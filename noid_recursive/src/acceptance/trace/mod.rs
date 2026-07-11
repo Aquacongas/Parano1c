@@ -32,20 +32,26 @@
 //!   algebra is associative, the VALUE is bit-identical and the FS schedule
 //!   is untouched. The FS schedule itself is never restructured.
 
+pub mod accepted_claim_batch;
 pub mod accepted_claim_hash;
+pub mod action_compaction;
 pub mod action_surface;
 pub mod batch_eval;
-pub mod deep_chain;
-pub mod fri_pcs;
 pub mod block_spine;
-pub mod accepted_claim_batch;
 pub mod checkpoint_poseidon;
+pub mod deep_chain;
 pub mod exact_state;
+pub mod fee_arithmetic;
+pub mod fri_pcs;
 pub mod matrix_fold;
 pub mod merkle_path;
 pub mod owner_auth;
+pub mod paired_merkle_update;
+pub mod permutation_network;
+pub mod public_arithmetic;
 pub mod r_pcs_region;
 pub mod region_source_binding;
+pub mod segment_compaction;
 pub mod self_verify;
 pub mod tx_body_spine;
 pub mod tx_epoch;
@@ -54,10 +60,10 @@ use std::collections::HashMap;
 
 use noid_core::Block128;
 
+pub use noid_ivc_core::field::F128;
 pub use noid_ivc_core::field_circuit::{
     flat_const, poseidon2b_permute, FieldR1csBuilder, LinExpr, RawChannelTrace, Wire,
 };
-pub use noid_ivc_core::field::F128;
 
 /// φ-map a tower value into the circuit (flat) basis.
 #[inline]
@@ -121,10 +127,7 @@ pub fn eq_ind_trace(b: &mut FieldR1csBuilder, x: &[LinExpr], y: &[LinExpr]) -> L
 /// Trace twin of `noid_core::mle::eq::eq_ind_partial_eval`: the tensor
 /// `(1−r_0, r_0) ⊗ … ⊗ (1−r_{n−1}, r_{n−1})` of length `2^n`, bit `i` of the
 /// index ↔ `point[i]`. Costs `2^n − 1` multiplications.
-pub fn eq_ind_partial_eval_trace(
-    b: &mut FieldR1csBuilder,
-    point: &[LinExpr],
-) -> Vec<LinExpr> {
+pub fn eq_ind_partial_eval_trace(b: &mut FieldR1csBuilder, point: &[LinExpr]) -> Vec<LinExpr> {
     let mut result = vec![LinExpr::constant(F128::ONE)];
     for r_i in point {
         let len = result.len();

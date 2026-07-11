@@ -43,6 +43,43 @@ impl ShapeClass {
         self.spend_capacity() + self.tier * noid_tx::TX_OUTPUTS + 1
     }
 
+    /// Maximum number of distinct 2^16-slot segments touched by the class.
+    /// Consensus caps the attack tier at 256; smaller classes cannot touch
+    /// more segments than they have actions.
+    pub fn segment_capacity(self) -> usize {
+        self.touched_capacity()
+            .min(noid_chain::consensus::params::BLOCK_MAX_DISTINCT_SEGMENTS)
+    }
+
+    /// Physical bitmap-selected rows scanned by the stable compactor: ten
+    /// positions per user body plus the already-canonical sole coinbase mint.
+    /// The B255 authorization PAD slot is deliberately not an action slot.
+    pub fn action_candidate_capacity(self) -> usize {
+        self.tier * noid_tx::TX_ACTIONS + 1
+    }
+
+    /// Power-of-two Beneš routing width for the action candidates.
+    pub fn action_sort_capacity(self) -> usize {
+        self.action_candidate_capacity().next_power_of_two()
+    }
+
+    /// Maximum digest-only structural-frontier witness rows at depth 32 under
+    /// the consensus 256-segment cap.
+    pub fn frontier_sibling_capacity(self) -> usize {
+        noid_chain::sparse_merkle::maximum_sibling_count_with_segment_cap(
+            self.touched_capacity(),
+            noid_gkr::MAX_MERKLE_DEPTH as u32,
+            noid_chain::consensus::params::LOG_SEGMENT_SIZE,
+            noid_chain::consensus::params::BLOCK_MAX_DISTINCT_SEGMENTS,
+        )
+    }
+
+    /// Binary hash-combine rows required to reconstruct one root from the
+    /// class's maximum touched leaves and frontier siblings.
+    pub fn frontier_combine_capacity(self) -> usize {
+        self.touched_capacity() + self.frontier_sibling_capacity() - 1
+    }
+
     /// Domain-separated identity of the class key and current structural
     /// parameters. This is not an R1CS statement digest.
     pub fn shape_digest(self) -> [u8; 32] {
@@ -51,6 +88,11 @@ impl ShapeClass {
             self.spend_capacity(),
             self.authorization_capacity(),
             self.touched_capacity(),
+            self.segment_capacity(),
+            self.action_candidate_capacity(),
+            self.action_sort_capacity(),
+            self.frontier_sibling_capacity(),
+            self.frontier_combine_capacity(),
             noid_tx::TX_INPUTS,
             noid_tx::TX_OUTPUTS,
             noid_tx::body_hash::BODY_HASH_LEAVES,
@@ -72,7 +114,7 @@ pub fn enumerate_shape_classes() -> impl Iterator<Item = ShapeClass> {
         .map(|tier| ShapeClass { tier })
 }
 
-const SHAPE_CLASS_DOMAIN: &[u8] = b"NOID-TX8X2-SHAPE-CLASS-V2";
+const SHAPE_CLASS_DOMAIN: &[u8] = b"NOID-TX8X2-SHAPE-CLASS-V3";
 
 #[cfg(test)]
 mod tests {
@@ -106,7 +148,85 @@ mod tests {
             ShapeClass::for_count(255).unwrap().touched_capacity(),
             1_531
         );
+        assert_eq!(
+            ShapeClass::for_count(255)
+                .unwrap()
+                .action_candidate_capacity(),
+            2_551
+        );
+        assert_eq!(
+            ShapeClass::for_count(255).unwrap().action_sort_capacity(),
+            4_096
+        );
         assert_eq!(noid_tx::body_hash::BODY_HASH_LEAVES, 16);
         assert_eq!(noid_gkr::N_SPINE_SLOTS, 31);
+    }
+
+    #[test]
+    fn analytical_frontier_table_matches_live_class_caps() {
+        let table: Vec<_> = enumerate_shape_classes()
+            .map(|class| {
+                (
+                    class.tier,
+                    class.touched_capacity(),
+                    class.frontier_sibling_capacity(),
+                    class.frontier_combine_capacity(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            table,
+            [
+                (8, 81, 2_072, 2_152),
+                (32, 321, 7_054, 7_374),
+                (64, 641, 11_405, 12_045),
+                (255, 1_531, 22_468, 23_998),
+            ]
+        );
+    }
+
+    #[test]
+    fn action_compactor_table_excludes_the_b255_auth_pad() {
+        let table: Vec<_> = enumerate_shape_classes()
+            .map(|class| {
+                (
+                    class.tier,
+                    class.action_candidate_capacity(),
+                    class.action_sort_capacity(),
+                    class.touched_capacity(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            table,
+            [
+                (8, 81, 128, 81),
+                (32, 321, 512, 321),
+                (64, 641, 1_024, 641),
+                (255, 2_551, 4_096, 1_531),
+            ]
+        );
+    }
+
+    #[test]
+    fn paired_segment_capacity_table_is_exact() {
+        let table: Vec<_> = enumerate_shape_classes()
+            .map(|class| {
+                (
+                    class.tier,
+                    class.touched_capacity(),
+                    class.segment_capacity(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            table,
+            [
+                (8, 81, 81),
+                (32, 321, 256),
+                (64, 641, 256),
+                (255, 1_531, 256)
+            ]
+        );
     }
 }

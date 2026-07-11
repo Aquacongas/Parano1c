@@ -1735,10 +1735,7 @@ pub fn prove_field<Ch: Challenger>(
     let mut r_inner_rest = r_rounds;
     r_inner_rest.reverse();
 
-    let proof = LincheckProof {
-        rounds,
-        z_partial,
-    };
+    let proof = LincheckProof { rounds, z_partial };
     let claim = LincheckClaim {
         r_inner_skip,
         r_inner_rest,
@@ -2684,11 +2681,9 @@ mod tests {
     fn field_lincheck_roundtrip() {
         use crate::field_r1cs::{FieldCscCircuit, SparseFieldMatrix, apply_block_diag_field};
 
-        for &(m, k_log, k_skip, seed) in &[
-            (9usize, 6usize, 6usize, 1u64),
-            (10, 7, 6, 2),
-            (12, 8, 6, 3),
-        ] {
+        for &(m, k_log, k_skip, seed) in
+            &[(9usize, 6usize, 6usize, 1u64), (10, 7, 6, 2), (12, 8, 6, 3)]
+        {
             let k = 1usize << k_log;
             let mut rng = Rng::new(0xF1E1D ^ seed);
             let gen_matrix = |rng: &mut Rng| {
@@ -2721,7 +2716,15 @@ mod tests {
 
             let mut ch_verify = FsChallenger::new(b"field-lc-test-v0");
             let claim_v = verify(
-                m, k_log, k_skip, &circuit, &x_ab, v_a, v_b, &proof, &mut ch_verify,
+                m,
+                k_log,
+                k_skip,
+                &circuit,
+                &x_ab,
+                v_a,
+                v_b,
+                &proof,
+                &mut ch_verify,
             )
             .unwrap_or_else(|e| {
                 panic!("verify rejected honest field lincheck (m={m}, k_log={k_log}): {e:?}")

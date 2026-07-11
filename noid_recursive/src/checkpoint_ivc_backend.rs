@@ -208,7 +208,10 @@ impl std::fmt::Display for HistoryCheckpointIvcChunkCoreError {
                 write!(f, "checkpoint IVC certificate mismatch at {index}")
             }
             Self::AccumulatorAdvance { index, source } => {
-                write!(f, "checkpoint IVC accumulator advance failed at {index}: {source:?}")
+                write!(
+                    f,
+                    "checkpoint IVC accumulator advance failed at {index}: {source:?}"
+                )
             }
             Self::CoreUnsatisfied { row } => {
                 write!(f, "checkpoint IVC core witness does not satisfy row {row}")
@@ -1421,9 +1424,11 @@ mod tests {
                 &fixture.certificate_batch_statement,
                 &bad_digest_fields,
             ),
-            Err(HistoryCheckpointIvcChunkCoreError::BadAcceptedClaimBatchDigest(
-                AcceptedClaimBatchDigestError::NonCanonicalHeader
-            ))
+            Err(
+                HistoryCheckpointIvcChunkCoreError::BadAcceptedClaimBatchDigest(
+                    AcceptedClaimBatchDigestError::NonCanonicalHeader
+                )
+            )
         ));
 
         let mut bad_pcs_params = prove_history_checkpoint_ivc_chunk_core(
@@ -1706,7 +1711,6 @@ mod tests {
             active_slot_count: consensus.active_slot_count,
             alloc_counter: consensus.alloc_counter,
             cumulative_chainwork: consensus.cumulative_chainwork,
-            projection_root: digest_with_seed((consensus.height as u8).wrapping_add(0x70)),
         }
     }
 

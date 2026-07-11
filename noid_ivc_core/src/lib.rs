@@ -36,6 +36,7 @@ pub mod proof;
 pub mod public_io;
 pub mod r1cs;
 pub mod scratch;
+pub mod tuple_permutation;
 pub mod verifier;
 pub mod zerocheck;
 

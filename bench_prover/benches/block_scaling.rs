@@ -4,8 +4,8 @@
 //! Minimal production block-proof scaling over the B8/B32/B64/B255 ladder.
 
 use bench_prover::{
-    bench_full_block_proof_minimal, fmt_bytes, fmt_ms, minimal_tx_fixture, tx8x2_scenario,
-    MinimalTxFixture,
+    bench_full_block_proof_minimal, fmt_bytes, fmt_ms, legal_block_scenarios, minimal_tx_fixture,
+    time_once, MinimalTxFixture,
 };
 use noid_chain::consensus::params::USER_TX_CLASS_TIERS;
 
@@ -26,17 +26,9 @@ fn requested_tiers() -> Vec<usize> {
 }
 
 fn fixtures(tier: usize) -> Vec<MinimalTxFixture> {
-    (0..tier)
-        .map(|index| {
-            let slot_base = (index * 2_048) as u32;
-            minimal_tx_fixture(tx8x2_scenario(
-                "block-user-tx",
-                8,
-                2,
-                slot_base,
-                0xB10C_0000 + index as u128,
-            ))
-        })
+    legal_block_scenarios("block-user-tx", tier, 0xB10C_0000)
+        .into_iter()
+        .map(minimal_tx_fixture)
         .collect()
 }
 
@@ -65,13 +57,16 @@ fn main() {
             "B{tier} body-spine geometry drift"
         );
         eprintln!("building B{tier} fixed-owner fixtures...");
-        let fixtures = fixtures(tier);
+        let (fixture_time, fixtures) = time_once(|| fixtures(tier));
         eprintln!("proving B{tier} minimal block...");
         let result = bench_full_block_proof_minimal(&fixtures);
+        let frontier_siblings = result.proof.state_transition.slot_siblings.len();
         println!("  B{tier} ({tier} user tx + coinbase)");
         println!(
             "    body spine:        {live_spine_slots} live / {spine_slot_domain} slots / m={spine_num_vars}"
         );
+        println!("    auth fixtures:     {}", fmt_ms(fixture_time));
+        println!("    exact-state seed:  {}", fmt_ms(result.state_seed_time));
         println!("    prove:             {}", fmt_ms(result.prove_time));
         println!("    verify:            {}", fmt_ms(result.verify_time));
         println!("    block proof:       {}", fmt_bytes(result.proof_bytes));
@@ -83,5 +78,6 @@ fn main() {
             "    exact transition: {}",
             fmt_bytes(result.state_transition_bytes)
         );
+        println!("    frontier siblings: {frontier_siblings}");
     }
 }

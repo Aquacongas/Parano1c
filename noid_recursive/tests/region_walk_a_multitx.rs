@@ -49,7 +49,10 @@ impl Rng {
         z ^ (z >> 31)
     }
     fn f128(&mut self) -> F128 {
-        F128 { lo: self.next_u64(), hi: self.next_u64() }
+        F128 {
+            lo: self.next_u64(),
+            hi: self.next_u64(),
+        }
     }
 }
 
@@ -178,7 +181,7 @@ fn build_walk_a(k_tx: usize, leaf_log: usize, nq: usize, seed: u64) -> WalkA {
         fixed.push(common_period(&pat.table, 0, 1, block_log));
     }
     let st_refs = source_tree_refs(CODE0, 0); // code=[0,1], kid=[2,3], c=[6..], patterns [0..5)
-    // Fix c refs to the global C columns (source_tree_refs uses col_base+4..).
+                                              // Fix c refs to the global C columns (source_tree_refs uses col_base+4..).
     let st_refs = SourceTreeRefs {
         code: [CODE0, CODE0 + 1],
         kid: [KID0, KID0 + 1],
@@ -220,7 +223,11 @@ fn build_walk_a(k_tx: usize, leaf_log: usize, nq: usize, seed: u64) -> WalkA {
 }
 
 /// Union native terms: source-tree substitution + every leaf family's.
-fn union_terms(st_refs: &SourceTreeRefs, leaf_refs: &[SourceLeafRefs], alpha: F128) -> Vec<RelationTerm> {
+fn union_terms(
+    st_refs: &SourceTreeRefs,
+    leaf_refs: &[SourceLeafRefs],
+    alpha: F128,
+) -> Vec<RelationTerm> {
     let mut terms = source_tree_substitution_terms(st_refs, alpha);
     for lr in leaf_refs {
         terms.extend(source_leaf_substitution_terms(lr, alpha));
@@ -245,14 +252,28 @@ fn run_walk_a(u: &WalkA) -> usize {
         F128::ZERO,
         &rho,
         &sel_terms,
-        &RelationColumns { committed: &committed, internal: &internal, fixed: &u.fixed },
+        &RelationColumns {
+            committed: &committed,
+            internal: &internal,
+            fixed: &u.fixed,
+        },
         &mut ch_p,
     );
-    let sel_point =
-        verify_column_relation(w_log, F128::ZERO, &rho, &sel_terms, &u.fixed, &sel_proof, &mut ch_v)
-            .expect("native selection");
+    let sel_point = verify_column_relation(
+        w_log,
+        F128::ZERO,
+        &rho,
+        &sel_terms,
+        &u.fixed,
+        &sel_proof,
+        &mut ch_v,
+    )
+    .expect("native selection");
     let mut gv = [F128::ZERO; STATE_SIZE];
-    for (r, v) in claimed_refs(&sel_terms).iter().zip(sel_proof.final_values.iter()) {
+    for (r, v) in claimed_refs(&sel_terms)
+        .iter()
+        .zip(sel_proof.final_values.iter())
+    {
         match r {
             ColRef::Committed(_) => {}
             ColRef::Internal(j) => gv[*j] = *v,
@@ -261,9 +282,13 @@ fn run_walk_a(u: &WalkA) -> usize {
     }
 
     // ONE walk.
-    let groups = vec![LaneClaimGroup { point: sel_point, values: gv }];
+    let groups = vec![LaneClaimGroup {
+        point: sel_point,
+        values: gv,
+    }];
     let (walk_proof, _) = prove_deep_chain_walk(&u.s0, &groups, &mut ch_p);
-    let terminal = verify_deep_chain_walk(w_log, &groups, &walk_proof, &mut ch_v).expect("native walk");
+    let terminal =
+        verify_deep_chain_walk(w_log, &groups, &walk_proof, &mut ch_v).expect("native walk");
 
     // ONE unioned substitution (source-tree + every leaf family).
     let alpha = ch_p.sample_f128();
@@ -279,7 +304,11 @@ fn run_walk_a(u: &WalkA) -> usize {
         target,
         &terminal.point,
         &sub_terms,
-        &RelationColumns { committed: &committed, internal: &[], fixed: &u.fixed },
+        &RelationColumns {
+            committed: &committed,
+            internal: &[],
+            fixed: &u.fixed,
+        },
         &mut ch_p,
     );
     let sub_point = verify_column_relation(
@@ -292,15 +321,20 @@ fn run_walk_a(u: &WalkA) -> usize {
         &mut ch_v,
     )
     .expect("native substitution");
-    for (r, v) in claimed_refs(&sub_terms).iter().zip(sub_proof.final_values.iter()) {
+    for (r, v) in claimed_refs(&sub_terms)
+        .iter()
+        .zip(sub_proof.final_values.iter())
+    {
         match r {
             ColRef::CommittedShift(c) => {
                 let (pr, _) = prove_shift_discharge(committed[*c], &sub_point, *v, &mut ch_p);
                 verify_shift_discharge(w_log, &sub_point, *v, &pr, &mut ch_v).expect("shift");
             }
             ColRef::CommittedShift2(c) => {
-                let (pr, _) = prove_shift_discharge_pow2(committed[*c], &sub_point, *v, 1, &mut ch_p);
-                verify_shift_discharge_pow2(w_log, &sub_point, *v, 1, &pr, &mut ch_v).expect("shift2");
+                let (pr, _) =
+                    prove_shift_discharge_pow2(committed[*c], &sub_point, *v, 1, &mut ch_p);
+                verify_shift_discharge_pow2(w_log, &sub_point, *v, 1, &pr, &mut ch_v)
+                    .expect("shift2");
             }
             _ => {}
         }
@@ -325,7 +359,11 @@ fn run_walk_a(u: &WalkA) -> usize {
             F128::ZERO,
             &rho_e,
             &expo_terms,
-            &RelationColumns { committed: &expo_committed, internal: &[], fixed: &[] },
+            &RelationColumns {
+                committed: &expo_committed,
+                internal: &[],
+                fixed: &[],
+            },
             &mut ch_p,
         );
         let expo_point = verify_column_relation(
@@ -338,16 +376,29 @@ fn run_walk_a(u: &WalkA) -> usize {
             &mut ch_v,
         )
         .expect("native exposure");
-        for (r, _v) in claimed_refs(&expo_terms).iter().zip(expo_proof.final_values.iter()) {
-            if let ColRef::Window { stride_log, offset, .. } = r {
+        for (r, _v) in claimed_refs(&expo_terms)
+            .iter()
+            .zip(expo_proof.final_values.iter())
+        {
+            if let ColRef::Window {
+                stride_log, offset, ..
+            } = r
+            {
                 let _ = window_discharge_point(*offset, *stride_log, &expo_point);
             }
         }
     }
 
-    assert_eq!(ch_p.sample_f128(), ch_v.sample_f128(), "native walk-a lockstep");
+    assert_eq!(
+        ch_p.sample_f128(),
+        ch_v.sample_f128(),
+        "native walk-a lockstep"
+    );
     let _ = (u.nq, u.leaf_stride, u.n_leaf_families);
-    walk_proof.layers.first().map_or(0, |l| l.round_coeffs.len())
+    walk_proof
+        .layers
+        .first()
+        .map_or(0, |l| l.round_coeffs.len())
 }
 
 /// Honest combined walk-A union (source_tree + 2 leaf families × K txs); one

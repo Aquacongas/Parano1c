@@ -38,13 +38,11 @@ use noid_ivc_core::deep_chain::leaf_hash::{
 };
 use noid_ivc_core::deep_chain::relations::{
     claimed_refs, prove_column_relation, prove_shift_discharge, prove_shift_discharge_pow2,
-    verify_column_relation, verify_shift_discharge, verify_shift_discharge_pow2, ColRef, FixedPattern,
-    RelationColumns, RelationTerm,
+    verify_column_relation, verify_shift_discharge, verify_shift_discharge_pow2, ColRef,
+    FixedPattern, RelationColumns, RelationTerm,
 };
 use noid_ivc_core::deep_chain::schedule::{carry_selection_terms, flat_of_tower_u128};
-use noid_ivc_core::deep_chain::{
-    prove_deep_chain_walk, verify_deep_chain_walk, LaneClaimGroup,
-};
+use noid_ivc_core::deep_chain::{prove_deep_chain_walk, verify_deep_chain_walk, LaneClaimGroup};
 use noid_ivc_core::field::F128;
 use noid_poseidon2b::native::domain::{capacity_iv, TAG_COMPRESS};
 use noid_poseidon2b::native::permutation::STATE_SIZE;
@@ -59,7 +57,10 @@ impl Rng {
         z ^ (z >> 31)
     }
     fn f128(&mut self) -> F128 {
-        F128 { lo: self.next_u64(), hi: self.next_u64() }
+        F128 {
+            lo: self.next_u64(),
+            hi: self.next_u64(),
+        }
     }
 }
 
@@ -114,7 +115,11 @@ fn build_leaf_union(k_tx: usize, nq: usize, seed: u64) -> LeafUnion {
     let n_fam = 2usize; // family 0 = source-leaf, family 1 = high-pair
     let per_tx_block = n_fam * nq * stride;
     let block_log = per_tx_block.trailing_zeros() as usize;
-    assert_eq!(1usize << block_log, per_tx_block, "per-tx block must be a power of two");
+    assert_eq!(
+        1usize << block_log,
+        per_tx_block,
+        "per-tx block must be a power of two"
+    );
     let total = k_tx * per_tx_block;
     let w_log = total.trailing_zeros() as usize;
     assert_eq!(1usize << w_log, total, "domain must be a power of two");
@@ -185,7 +190,14 @@ fn build_leaf_union(k_tx: usize, nq: usize, seed: u64) -> LeafUnion {
         leaf_refs.push(source_leaf_refs(0, fixed_base));
     }
 
-    LeafUnion { committed, s0, s_out, fixed, leaf_refs, w_log }
+    LeafUnion {
+        committed,
+        s0,
+        s_out,
+        fixed,
+        leaf_refs,
+        w_log,
+    }
 }
 
 fn union_sub_terms(leaf_refs: &[SourceLeafRefs], alpha: F128) -> Vec<RelationTerm> {
@@ -218,14 +230,28 @@ fn run_leaf_union(u: &LeafUnion) -> usize {
         F128::ZERO,
         &rho,
         &sel_terms,
-        &RelationColumns { committed: &committed, internal: &internal, fixed: &u.fixed },
+        &RelationColumns {
+            committed: &committed,
+            internal: &internal,
+            fixed: &u.fixed,
+        },
         &mut ch_p,
     );
-    let sel_point =
-        verify_column_relation(w_log, F128::ZERO, &rho, &sel_terms, &u.fixed, &sel_proof, &mut ch_v)
-            .expect("native selection");
+    let sel_point = verify_column_relation(
+        w_log,
+        F128::ZERO,
+        &rho,
+        &sel_terms,
+        &u.fixed,
+        &sel_proof,
+        &mut ch_v,
+    )
+    .expect("native selection");
     let mut gv = [F128::ZERO; STATE_SIZE];
-    for (r, v) in claimed_refs(&sel_terms).iter().zip(sel_proof.final_values.iter()) {
+    for (r, v) in claimed_refs(&sel_terms)
+        .iter()
+        .zip(sel_proof.final_values.iter())
+    {
         match r {
             ColRef::Committed(_) => {}
             ColRef::Internal(j) => gv[*j] = *v,
@@ -234,9 +260,13 @@ fn run_leaf_union(u: &LeafUnion) -> usize {
     }
 
     // ONE deep-chain walk over the shared s0.
-    let groups = vec![LaneClaimGroup { point: sel_point, values: gv }];
+    let groups = vec![LaneClaimGroup {
+        point: sel_point,
+        values: gv,
+    }];
     let (walk_proof, _) = prove_deep_chain_walk(&u.s0, &groups, &mut ch_p);
-    let terminal = verify_deep_chain_walk(w_log, &groups, &walk_proof, &mut ch_v).expect("native walk");
+    let terminal =
+        verify_deep_chain_walk(w_log, &groups, &walk_proof, &mut ch_v).expect("native walk");
 
     // ONE unioned substitution over EVERY family.
     let alpha = ch_p.sample_f128();
@@ -252,7 +282,11 @@ fn run_leaf_union(u: &LeafUnion) -> usize {
         target,
         &terminal.point,
         &sub_terms,
-        &RelationColumns { committed: &committed, internal: &[], fixed: &u.fixed },
+        &RelationColumns {
+            committed: &committed,
+            internal: &[],
+            fixed: &u.fixed,
+        },
         &mut ch_p,
     );
     let sub_point = verify_column_relation(
@@ -266,7 +300,10 @@ fn run_leaf_union(u: &LeafUnion) -> usize {
     )
     .expect("native substitution");
     // Discharge the shift claims (the distance-2 carry reads).
-    for (r, v) in claimed_refs(&sub_terms).iter().zip(sub_proof.final_values.iter()) {
+    for (r, v) in claimed_refs(&sub_terms)
+        .iter()
+        .zip(sub_proof.final_values.iter())
+    {
         match r {
             ColRef::Committed(_) => {}
             ColRef::CommittedShift(c) => {
@@ -274,14 +311,23 @@ fn run_leaf_union(u: &LeafUnion) -> usize {
                 verify_shift_discharge(w_log, &sub_point, *v, &pr, &mut ch_v).expect("shift");
             }
             ColRef::CommittedShift2(c) => {
-                let (pr, _) = prove_shift_discharge_pow2(committed[*c], &sub_point, *v, 1, &mut ch_p);
-                verify_shift_discharge_pow2(w_log, &sub_point, *v, 1, &pr, &mut ch_v).expect("shift2");
+                let (pr, _) =
+                    prove_shift_discharge_pow2(committed[*c], &sub_point, *v, 1, &mut ch_p);
+                verify_shift_discharge_pow2(w_log, &sub_point, *v, 1, &pr, &mut ch_v)
+                    .expect("shift2");
             }
             _ => unreachable!(),
         }
     }
-    assert_eq!(ch_p.sample_f128(), ch_v.sample_f128(), "native leaf-union lockstep");
-    walk_proof.layers.first().map_or(0, |l| l.round_coeffs.len())
+    assert_eq!(
+        ch_p.sample_f128(),
+        ch_v.sample_f128(),
+        "native leaf-union lockstep"
+    );
+    walk_proof
+        .layers
+        .first()
+        .map_or(0, |l| l.round_coeffs.len())
 }
 
 /// Honest multi-tx leaf union verifies; corrupting one tx's tile is caught by
@@ -304,7 +350,10 @@ fn common_period_multitx_leaf_union_native() {
     let before = bad.committed[0][bad_slot];
     bad.committed[0][bad_slot] += F128::ONE;
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_leaf_union(&bad)));
-    assert!(caught.is_err(), "corrupted tx-1 tile accepted by the shared relation set");
+    assert!(
+        caught.is_err(),
+        "corrupted tx-1 tile accepted by the shared relation set"
+    );
     bad.committed[0][bad_slot] = before; // restore (unused, clarity)
 }
 

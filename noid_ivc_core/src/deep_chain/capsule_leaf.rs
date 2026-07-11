@@ -76,7 +76,11 @@ pub fn capsule_leaf_iv_flat() -> [F128; 2] {
 /// boundary); `msg_log`/`leaf_index` enter as raw flat words. Matches the
 /// native flat-sponge `capsule_leaf_hash` lane-for-lane.
 pub fn flat_capsule_leaf_hash(msg_log: usize, leaf_index: usize, syms: &[F128]) -> [F128; 2] {
-    assert_eq!(syms.len(), CAPSULE_LEAF_SYMBOLS, "capsule leaf symbol count");
+    assert_eq!(
+        syms.len(),
+        CAPSULE_LEAF_SYMBOLS,
+        "capsule leaf symbol count"
+    );
     let iv = capsule_leaf_iv_flat();
     let mut s = permute_flat_state([
         raw_flat_lane(msg_log as u128),
@@ -119,7 +123,11 @@ pub fn build_capsule_leaf_columns(
     w_log: usize,
 ) -> (SourceLeafColumns, Vec<[F128; 2]>) {
     let w = 1usize << w_log;
-    assert_eq!(w % CAPSULE_LEAF_STRIDE, 0, "domain not a multiple of the tile");
+    assert_eq!(
+        w % CAPSULE_LEAF_STRIDE,
+        0,
+        "domain not a multiple of the tile"
+    );
     let num_tiles = w / CAPSULE_LEAF_STRIDE;
     assert!(leaves.len() <= num_tiles, "more leaves than tiles");
     let iv = capsule_leaf_iv_flat();
@@ -342,6 +350,10 @@ mod tests {
         // The ghost tile is the canonical all-zero leaf, a real sponge run.
         let ghost_native = native_leaf_digest(0, 0, &[F128::ZERO; CAPSULE_LEAF_SYMBOLS]);
         let gd = CAPSULE_LEAF_STRIDE * 3 + CAPSULE_LEAF_DIGEST_SLOT;
-        assert_eq!([cols.c[0][gd], cols.c[1][gd]], ghost_native, "ghost tile digest");
+        assert_eq!(
+            [cols.c[0][gd], cols.c[1][gd]],
+            ghost_native,
+            "ghost tile digest"
+        );
     }
 }

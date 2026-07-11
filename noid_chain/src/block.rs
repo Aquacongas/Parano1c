@@ -138,7 +138,7 @@ pub(crate) fn apply_block(
     crate::consensus::checks::validate_block_slot_conflicts(&block.transactions)
         .map_err(|_| BlockApplyError::SlotConflict)?;
     // Coinbase structure: at most one, must be first, zero inputs.
-    // Coinbase VALUE validation (≤ block_reward + fees) is in consensus checks.
+    // Coinbase VALUE validation (≤ block_reward + claimable fees) is in consensus checks.
     let coinbase_count = block
         .transactions
         .iter()

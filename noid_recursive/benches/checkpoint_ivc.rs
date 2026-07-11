@@ -364,7 +364,6 @@ fn anchor_from_consensus(
         active_slot_count: consensus.active_slot_count,
         alloc_counter: consensus.alloc_counter,
         cumulative_chainwork: consensus.cumulative_chainwork,
-        projection_root: digest_with_seed((consensus.height as u8).wrapping_add(0x70)),
     }
 }
 

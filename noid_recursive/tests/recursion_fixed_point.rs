@@ -160,12 +160,7 @@ fn recursion_fixed_point_two_links() {
 
     // ---- Negatives at the decider (the chain's outer boundary).
     // Any tampered IO lane must be rejected — the proof binds the IO.
-    for lane in [
-        layout.w_d,
-        layout.g,
-        layout.acc_point,
-        layout.acc_value,
-    ] {
+    for lane in [layout.w_d, layout.g, layout.acc_point, layout.acc_value] {
         let mut bad = LinkEnvelope {
             proof: prev_env.proof.clone(),
             commitment: prev_env.commitment.clone(),

@@ -623,8 +623,7 @@ pub fn packed_poseidon2b_permute_flat_many(states: &mut [[PackedBlock128; STATE_
             if is_full {
                 for s in states.iter_mut() {
                     for i in 0..STATE_SIZE {
-                        s[i] =
-                            s[i].xor(PackedBlock128::broadcast(Block128::from(tables.rc[i][r])));
+                        s[i] = s[i].xor(PackedBlock128::broadcast(Block128::from(tables.rc[i][r])));
                         s[i] = packed_sbox_x7_flat(s[i]);
                     }
                 }
@@ -873,7 +872,9 @@ pub fn leaf_sponge_flat_batch_with_iv_into(
             let base = (off + lane) * leaf_size + b * 32;
             w0 = w0.set_lane(
                 lane,
-                Block128::from(u128::from_le_bytes(data[base..base + 16].try_into().unwrap())),
+                Block128::from(u128::from_le_bytes(
+                    data[base..base + 16].try_into().unwrap(),
+                )),
             );
             w1 = w1.set_lane(
                 lane,
@@ -1215,7 +1216,7 @@ mod tests {
     /// scalar remainder.
     #[test]
     fn test_leaf_sponge_flat_batch_no_pad_matches_scalar() {
-        use crate::native::domain::{DomainTag, capacity_iv_flat};
+        use crate::native::domain::{capacity_iv_flat, DomainTag};
         use crate::native::Poseidon2bFlatSponge;
 
         let mut rng = rand::thread_rng();

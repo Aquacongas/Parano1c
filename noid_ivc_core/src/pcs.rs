@@ -28,9 +28,8 @@ pub mod ring_switch;
 pub mod tensor_algebra;
 
 pub use basefold::{
-    BaseFoldProof, DEFAULT_FRI_QUERIES, PLAINTEXT_TAIL_MAX_F128, QUERY_GRIND_BITS,
-    RoundCommitment, RoundMessage, default_fri_queries, fri_commit_layout,
-    sample_query_positions,
+    BaseFoldProof, DEFAULT_FRI_QUERIES, PLAINTEXT_TAIL_MAX_F128, QUERY_GRIND_BITS, RoundCommitment,
+    RoundMessage, default_fri_queries, fri_commit_layout, sample_query_positions,
 };
 pub use commit::{
     Commitment, LOG_FRI_ARITY, PcsParams, ProverData, commit, commit_into, compute_fri_arities,
@@ -162,10 +161,14 @@ pub struct QuirkyDirectClaimRef<'a> {
 /// BaseFold on the γ-combined quirky eq tensors. No ring-switch messages —
 /// the proof is a bare [`BaseFoldProof`].
 ///
-/// Transcript: label → per-claim (label + value observe) → γ per claim →
-/// BaseFold. The claim *points* are protocol challenges already bound to the
-/// transcript by the sub-protocols that produced them; only the values are
-/// fresh prover messages.
+/// Transcript: label → per-claim full descriptor
+/// `(z_skip, k_skip, x_rest, value)` → γ per claim → BaseFold.
+///
+/// Most claim points are already transcript-derived by their producing
+/// sub-protocol.  Absorbing the descriptor again is deliberate: it binds the
+/// batch order and also permits post-commit auxiliary protocols to append
+/// claims without relying on an implicit "the point was observed somewhere
+/// earlier" precondition.
 pub fn open_batch_quirky_direct<Ch: Challenger>(
     packed_witness: &[F128],
     prover_data: &ProverData,
@@ -180,15 +183,24 @@ pub fn open_batch_quirky_direct<Ch: Challenger>(
     debug_assert!(l.is_power_of_two());
     let l_log = l.trailing_zeros() as usize;
     for c in claims {
-        assert_eq!(c.x_rest.len() + c.k_skip, l_log, "claim point/witness L mismatch");
+        assert_eq!(
+            c.x_rest.len() + c.k_skip,
+            l_log,
+            "claim point/witness L mismatch"
+        );
     }
 
-    challenger.observe_label(b"history-pcs-open-field-v0");
+    challenger.observe_label(b"history-pcs-open-field-v1");
     for c in claims {
-        challenger.observe_label(b"history-pcs-quirky-direct-v0");
+        challenger.observe_label(b"history-pcs-quirky-direct-v1");
+        challenger.observe_f128(c.z_skip);
+        challenger.observe_f128(F128::new(c.k_skip as u64, 0));
+        challenger.observe_f128_slice(&c.x_rest);
         challenger.observe_f128(c.value);
     }
-    let gammas: Vec<F128> = (0..claims.len()).map(|_| challenger.sample_f128()).collect();
+    let gammas: Vec<F128> = (0..claims.len())
+        .map(|_| challenger.sample_f128())
+        .collect();
 
     let mut target_combined = F128::ZERO;
     for (c, g) in claims.iter().zip(gammas.iter()) {
@@ -201,10 +213,11 @@ pub fn open_batch_quirky_direct<Ch: Challenger>(
     // sub-protocol claims at K_SKIP next to plain k_skip = 0 point claims),
     // so each claim is accumulated at its own block granularity.
     let mut b_combined: Vec<F128> = crate::scratch::take_f128(l);
-    b_combined.par_iter_mut().for_each(|slot| *slot = F128::ZERO);
+    b_combined
+        .par_iter_mut()
+        .for_each(|slot| *slot = F128::ZERO);
     for (c, g) in claims.iter().zip(gammas.iter()) {
-        let mut weights =
-            crate::zerocheck::multilinear::lagrange_weights_naive(c.k_skip, c.z_skip);
+        let mut weights = crate::zerocheck::multilinear::lagrange_weights_naive(c.k_skip, c.z_skip);
         for w in weights.iter_mut() {
             *w *= *g;
         }
@@ -252,15 +265,24 @@ pub fn verify_opening_batch_quirky_direct<Ch: Challenger>(
     assert!(!claims.is_empty(), "need at least one claim");
     let l_log = commitment.params.m - LOG_PACKING;
     for c in claims {
-        assert_eq!(c.x_rest.len() + c.k_skip, l_log, "claim point/witness L mismatch");
+        assert_eq!(
+            c.x_rest.len() + c.k_skip,
+            l_log,
+            "claim point/witness L mismatch"
+        );
     }
 
-    challenger.observe_label(b"history-pcs-open-field-v0");
+    challenger.observe_label(b"history-pcs-open-field-v1");
     for c in claims {
-        challenger.observe_label(b"history-pcs-quirky-direct-v0");
+        challenger.observe_label(b"history-pcs-quirky-direct-v1");
+        challenger.observe_f128(c.z_skip);
+        challenger.observe_f128(F128::new(c.k_skip as u64, 0));
+        challenger.observe_f128_slice(c.x_rest);
         challenger.observe_f128(c.value);
     }
-    let gammas: Vec<F128> = (0..claims.len()).map(|_| challenger.sample_f128()).collect();
+    let gammas: Vec<F128> = (0..claims.len())
+        .map(|_| challenger.sample_f128())
+        .collect();
 
     let mut target_combined = F128::ZERO;
     for (c, g) in claims.iter().zip(gammas.iter()) {
@@ -1795,8 +1817,7 @@ mod tests {
     fn zhat_quirky_reference(v: &[F128], k_skip: usize, z_skip: F128, x_rest: &[F128]) -> F128 {
         let ell = 1usize << k_skip;
         assert_eq!(v.len(), ell << x_rest.len());
-        let weights =
-            crate::zerocheck::multilinear::lagrange_weights_naive(k_skip, z_skip);
+        let weights = crate::zerocheck::multilinear::lagrange_weights_naive(k_skip, z_skip);
         let eq = build_eq(x_rest);
         let mut acc = F128::ZERO;
         for (i, &x) in v.iter().enumerate() {
@@ -1833,8 +1854,7 @@ mod tests {
             let (commitment, prover_data) = commit(&z, &params);
 
             let mut ch_p = FsChallenger::new(b"history-test-v0");
-            let proof =
-                open_batch_quirky_direct(&z, &prover_data, &commitment, &claims, &mut ch_p);
+            let proof = open_batch_quirky_direct(&z, &prover_data, &commitment, &claims, &mut ch_p);
 
             let refs: Vec<QuirkyDirectClaimRef<'_>> = claims
                 .iter()

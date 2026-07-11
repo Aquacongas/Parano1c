@@ -3,7 +3,7 @@
 
 use noid_ivc_core::challenger::{Challenger, FsLaneChallenger};
 use noid_ivc_core::deep_chain::family::{
-    build_family, discharge, run_family, FamilyProofs, C, D, G0, O, SIB,
+    C, D, FamilyProofs, G0, O, SIB, build_family, discharge, run_family,
 };
 use noid_ivc_core::field::F128;
 
@@ -18,10 +18,15 @@ fn honest_family_end_to_end() {
     discharge(&fam, &pending_p).expect("prover-side claims true");
 
     let mut ch_v = FsLaneChallenger::new(b"deep-chain-family");
-    let pending_v = run_family(&fam, false, &mut ch_v, &mut proofs).expect("honest family verifies");
+    let pending_v =
+        run_family(&fam, false, &mut ch_v, &mut proofs).expect("honest family verifies");
     discharge(&fam, &pending_v).expect("verifier-side claims true");
 
-    assert_eq!(ch_p.sample_f128(), ch_v.sample_f128(), "transcript lockstep");
+    assert_eq!(
+        ch_p.sample_f128(),
+        ch_v.sample_f128(),
+        "transcript lockstep"
+    );
 }
 
 /// Corrupt each committed column in turn (one slot), regenerate the proof
@@ -64,11 +69,7 @@ fn forged_walk_lane_values_rejected() {
     run_family(&fam, true, &mut ch_p, &mut proofs).expect("prove");
 
     // Forge lane 2 of the first start group and re-run the verifier side.
-    proofs
-        .walk_groups
-        .as_mut()
-        .expect("groups recorded")[0]
-        .values[2] += F128::ONE;
+    proofs.walk_groups.as_mut().expect("groups recorded")[0].values[2] += F128::ONE;
     let mut ch_v = FsLaneChallenger::new(b"deep-chain-family");
     let caught = match run_family(&fam, false, &mut ch_v, &mut proofs) {
         Err(_) => true,

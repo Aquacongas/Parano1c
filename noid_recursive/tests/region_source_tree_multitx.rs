@@ -53,7 +53,10 @@ impl Rng {
         z ^ (z >> 31)
     }
     fn f128(&mut self) -> F128 {
-        F128 { lo: self.next_u64(), hi: self.next_u64() }
+        F128 {
+            lo: self.next_u64(),
+            hi: self.next_u64(),
+        }
     }
 }
 
@@ -119,7 +122,17 @@ fn build_source_tree_union(k_tx: usize, leaf_log: usize, seed: u64) -> SourceTre
     // so they cover every tree for free.
     let fixed = source_tree_fixed_patterns(&tree, iv);
 
-    SourceTreeUnion { committed, s0, s_out, fixed, c_refs, w_log, st_wlog, st_slots, k_tx }
+    SourceTreeUnion {
+        committed,
+        s0,
+        s_out,
+        fixed,
+        c_refs,
+        w_log,
+        st_wlog,
+        st_slots,
+        k_tx,
+    }
 }
 
 /// Union walk + selection + substitution over ALL trees, then K per-tree
@@ -142,14 +155,28 @@ fn run_source_tree_union(u: &SourceTreeUnion) -> usize {
         F128::ZERO,
         &rho,
         &sel_terms,
-        &RelationColumns { committed: &committed, internal: &internal, fixed: &u.fixed },
+        &RelationColumns {
+            committed: &committed,
+            internal: &internal,
+            fixed: &u.fixed,
+        },
         &mut ch_p,
     );
-    let sel_point =
-        verify_column_relation(w_log, F128::ZERO, &rho, &sel_terms, &u.fixed, &sel_proof, &mut ch_v)
-            .expect("native selection");
+    let sel_point = verify_column_relation(
+        w_log,
+        F128::ZERO,
+        &rho,
+        &sel_terms,
+        &u.fixed,
+        &sel_proof,
+        &mut ch_v,
+    )
+    .expect("native selection");
     let mut gv = [F128::ZERO; STATE_SIZE];
-    for (r, v) in claimed_refs(&sel_terms).iter().zip(sel_proof.final_values.iter()) {
+    for (r, v) in claimed_refs(&sel_terms)
+        .iter()
+        .zip(sel_proof.final_values.iter())
+    {
         match r {
             ColRef::Committed(_) => {}
             ColRef::Internal(j) => gv[*j] = *v,
@@ -158,7 +185,10 @@ fn run_source_tree_union(u: &SourceTreeUnion) -> usize {
     }
 
     // ONE deep-chain walk over all trees.
-    let groups = vec![LaneClaimGroup { point: sel_point, values: gv }];
+    let groups = vec![LaneClaimGroup {
+        point: sel_point,
+        values: gv,
+    }];
     let (walk_proof, _) = prove_deep_chain_walk(&u.s0, &groups, &mut ch_p);
     let terminal =
         verify_deep_chain_walk(w_log, &groups, &walk_proof, &mut ch_v).expect("native walk");
@@ -177,7 +207,11 @@ fn run_source_tree_union(u: &SourceTreeUnion) -> usize {
         target,
         &terminal.point,
         &sub_terms,
-        &RelationColumns { committed: &committed, internal: &[], fixed: &u.fixed },
+        &RelationColumns {
+            committed: &committed,
+            internal: &[],
+            fixed: &u.fixed,
+        },
         &mut ch_p,
     );
     let sub_point = verify_column_relation(
@@ -190,7 +224,10 @@ fn run_source_tree_union(u: &SourceTreeUnion) -> usize {
         &mut ch_v,
     )
     .expect("native substitution");
-    for (r, v) in claimed_refs(&sub_terms).iter().zip(sub_proof.final_values.iter()) {
+    for (r, v) in claimed_refs(&sub_terms)
+        .iter()
+        .zip(sub_proof.final_values.iter())
+    {
         if let ColRef::CommittedShift(c) = r {
             let (pr, _) = prove_shift_discharge(committed[*c], &sub_point, *v, &mut ch_p);
             verify_shift_discharge(w_log, &sub_point, *v, &pr, &mut ch_v).expect("shift");
@@ -217,7 +254,11 @@ fn run_source_tree_union(u: &SourceTreeUnion) -> usize {
             F128::ZERO,
             &rho_e,
             &expo_terms,
-            &RelationColumns { committed: &expo_committed, internal: &[], fixed: &[] },
+            &RelationColumns {
+                committed: &expo_committed,
+                internal: &[],
+                fixed: &[],
+            },
             &mut ch_p,
         );
         let expo_point = verify_column_relation(
@@ -231,15 +272,28 @@ fn run_source_tree_union(u: &SourceTreeUnion) -> usize {
         )
         .unwrap_or_else(|_| panic!("native exposure tree {t}"));
         // Window terminal discharges as a plain C opening at the re-indexed point.
-        for (r, _v) in claimed_refs(&expo_terms).iter().zip(expo_proof.final_values.iter()) {
-            if let ColRef::Window { stride_log, offset, .. } = r {
+        for (r, _v) in claimed_refs(&expo_terms)
+            .iter()
+            .zip(expo_proof.final_values.iter())
+        {
+            if let ColRef::Window {
+                stride_log, offset, ..
+            } = r
+            {
                 let _ = window_discharge_point(*offset, *stride_log, &expo_point);
             }
         }
     }
 
-    assert_eq!(ch_p.sample_f128(), ch_v.sample_f128(), "native source-tree-union lockstep");
-    walk_proof.layers.first().map_or(0, |l| l.round_coeffs.len())
+    assert_eq!(
+        ch_p.sample_f128(),
+        ch_v.sample_f128(),
+        "native source-tree-union lockstep"
+    );
+    walk_proof
+        .layers
+        .first()
+        .map_or(0, |l| l.round_coeffs.len())
 }
 
 /// Honest K trees verify (walk + substitution unioned, K exposures); corrupting
@@ -259,8 +313,12 @@ fn source_tree_union_native() {
     let mut bad = build_source_tree_union(2, leaf_log, 0xC0FFEE);
     let st_slots = SourceTree { leaf_log }.n_slots();
     bad.committed[2][st_slots] += F128::ONE; // tree 1, KID0, slot 0 (exposure-only)
-    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_source_tree_union(&bad)));
-    assert!(caught.is_err(), "corrupted tree-1 KID (exposure-only slot) accepted");
+    let caught =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_source_tree_union(&bad)));
+    assert!(
+        caught.is_err(),
+        "corrupted tree-1 KID (exposure-only slot) accepted"
+    );
 }
 
 /// Walk cost FLAT in tree count: doubling K adds exactly one walk round — the

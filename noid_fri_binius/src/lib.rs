@@ -42,9 +42,10 @@ pub mod interleaved_commit;
 pub mod mixed_open;
 
 pub use capsule::{
-    absorb_capsule_commitment, capsule_commit, capsule_open, capsule_verify, CapsuleCommitment,
+    absorb_capsule_commitment, capsule_commit, capsule_open, capsule_queries_from_seeds,
+    capsule_query_bit_location, capsule_query_seed_count, capsule_verify, CapsuleCommitment,
     CapsuleOpeningProof, CapsuleProverState, CAPSULE_CAP_DEPTH, CAPSULE_GRIND_BITS,
-    CAPSULE_LOG_RATE, CAPSULE_NUM_QUERIES, CAPSULE_TAU, CAPSULE_WIDE_LOG,
+    CAPSULE_LOG_RATE, CAPSULE_NUM_QUERIES, CAPSULE_QUERY_SEED_BITS, CAPSULE_TAU, CAPSULE_WIDE_LOG,
 };
 pub use compact_fri::{CompactEvalProof, COMPACT_NUM_QUERIES, COMPACT_TAU};
 pub use interleaved_commit::{

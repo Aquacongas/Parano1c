@@ -192,12 +192,7 @@ fn fold_table_pairs(table: &mut Vec<F128>, r: F128) {
 
 /// One degree-2 product-sumcheck round over paired tables: evaluations of
 /// `Σ_p Π_i tbl_i` at t ∈ {0, 1, 2} for two product terms.
-fn round_evals_two_products(
-    w1: &[F128],
-    g1: &[F128],
-    w2: &[F128],
-    g2: &[F128],
-) -> [F128; 3] {
+fn round_evals_two_products(w1: &[F128], g1: &[F128], w2: &[F128], g2: &[F128]) -> [F128; 3] {
     let half = w1.len() / 2;
     let two = F128 { lo: 2, hi: 0 };
     (0..half)
@@ -354,8 +349,7 @@ pub fn prove_matrix_claim_fold<Ch: Challenger>(
     w_in_row.par_iter_mut().for_each(|x| *x = *x * gg);
 
     let target1 = fresh.value + gg * incoming.value;
-    let (phase1_rounds, rho, claim1, finals1) =
-        run_phase(target1, w_u, g_v, w_in_row, g_e, ch);
+    let (phase1_rounds, rho, claim1, finals1) = run_phase(target1, w_u, g_v, w_in_row, g_e, ch);
     // finals1 = [ŵu~(ρ), G_v~(ρ), γ·gate·eq~(ρ), G_e~(ρ)].
     let g_v_val = finals1[1];
     let g_e_val = finals1[3];
@@ -405,8 +399,7 @@ pub fn prove_matrix_claim_fold<Ch: Challenger>(
     });
     let target2 = g_v_val + dg * g_e_val;
     let zero = vec![F128::ZERO; k];
-    let (phase2_rounds, sigma, claim2, finals2) =
-        run_phase(target2, w2, h, zero.clone(), zero, ch);
+    let (phase2_rounds, sigma, claim2, finals2) = run_phase(target2, w2, h, zero.clone(), zero, ch);
     let final_matrix_eval = finals2[1];
     debug_assert_eq!(
         finals2[0] * final_matrix_eval,
@@ -665,9 +658,8 @@ mod tests {
         // Link 1: fold a fresh claim with acc0.
         let fresh1 = random_fresh(&mut rng, &r1cs);
         let (proof1, acc1) = prove_matrix_claim_fold(&r1cs, &fresh1, &acc0, true, &mut ch_p);
-        let acc1_v =
-            verify_matrix_claim_fold(8, 6, &fresh1, &acc0, F128::ONE, &proof1, &mut ch_v)
-                .expect("link fold verifies");
+        let acc1_v = verify_matrix_claim_fold(8, 6, &fresh1, &acc0, F128::ONE, &proof1, &mut ch_v)
+            .expect("link fold verifies");
         assert_eq!(acc1, acc1_v);
         assert_eq!(
             stacked_matrix_mle_eval(&r1cs, &acc1),
@@ -729,9 +721,8 @@ mod tests {
         let mut ch_p = FsLaneChallenger::new(b"fold-false-g");
         let (proof, acc) = prove_matrix_claim_fold(&r1cs, &fresh, &acc_bad, false, &mut ch_p);
         let mut ch_v = FsLaneChallenger::new(b"fold-false-g");
-        let acc_v =
-            verify_matrix_claim_fold(8, 6, &fresh, &acc_bad, F128::ZERO, &proof, &mut ch_v)
-                .expect("gated-off incoming verifies");
+        let acc_v = verify_matrix_claim_fold(8, 6, &fresh, &acc_bad, F128::ZERO, &proof, &mut ch_v)
+            .expect("gated-off incoming verifies");
         assert_eq!(acc, acc_v);
         assert_eq!(
             stacked_matrix_mle_eval(&r1cs, &acc),

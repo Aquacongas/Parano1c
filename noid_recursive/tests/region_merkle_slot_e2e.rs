@@ -92,12 +92,23 @@ struct NativeArtifacts {
 /// Run the native MerklePathFamily region DAG (prover + verifier channels in
 /// lockstep, mirroring `merkle_region_dag_roundtrip_and_negatives`), returning
 /// every proof and the verifier-derived pending claims.
-fn run_merkle_native(family: &MerklePathFamily, cols: &MerklePathColumns, w_log: usize) -> NativeArtifacts {
+fn run_merkle_native(
+    family: &MerklePathFamily,
+    cols: &MerklePathColumns,
+    w_log: usize,
+) -> NativeArtifacts {
     let fixed = merkle_fixed_patterns(family, iv_flat());
     let refs = merkle_family_refs(0, 0);
     let committed: Vec<&[F128]> = vec![
-        &cols.e[0], &cols.e[1], &cols.sib[0], &cols.sib[1], &cols.d, &cols.c[0], &cols.c[1],
-        &cols.c[2], &cols.c[3],
+        &cols.e[0],
+        &cols.e[1],
+        &cols.sib[0],
+        &cols.sib[1],
+        &cols.d,
+        &cols.c[0],
+        &cols.c[1],
+        &cols.c[2],
+        &cols.c[3],
     ];
     let internal: Vec<&[F128]> = cols.s_out.iter().map(|c| c.as_slice()).collect();
     let mut ch_p = FsLaneChallenger::new(DOMAIN);
@@ -112,13 +123,27 @@ fn run_merkle_native(family: &MerklePathFamily, cols: &MerklePathColumns, w_log:
         F128::ZERO,
         &rho_b,
         &bool_terms,
-        &RelationColumns { committed: &committed, internal: &[], fixed: &fixed },
+        &RelationColumns {
+            committed: &committed,
+            internal: &[],
+            fixed: &fixed,
+        },
         &mut ch_p,
     );
-    let bool_point =
-        verify_column_relation(w_log, F128::ZERO, &rho_b, &bool_terms, &fixed, &bool_proof, &mut ch_v)
-            .expect("native booleanity");
-    pending.push(NativePending { point: bool_point, value: bool_proof.final_values[0] });
+    let bool_point = verify_column_relation(
+        w_log,
+        F128::ZERO,
+        &rho_b,
+        &bool_terms,
+        &fixed,
+        &bool_proof,
+        &mut ch_v,
+    )
+    .expect("native booleanity");
+    pending.push(NativePending {
+        point: bool_point,
+        value: bool_proof.final_values[0],
+    });
 
     // Selection → walk group.
     let beta = ch_p.sample_f128();
@@ -130,24 +155,45 @@ fn run_merkle_native(family: &MerklePathFamily, cols: &MerklePathColumns, w_log:
         F128::ZERO,
         &rho,
         &sel_terms,
-        &RelationColumns { committed: &committed, internal: &internal, fixed: &fixed },
+        &RelationColumns {
+            committed: &committed,
+            internal: &internal,
+            fixed: &fixed,
+        },
         &mut ch_p,
     );
-    let sel_point =
-        verify_column_relation(w_log, F128::ZERO, &rho, &sel_terms, &fixed, &sel_proof, &mut ch_v)
-            .expect("native selection");
+    let sel_point = verify_column_relation(
+        w_log,
+        F128::ZERO,
+        &rho,
+        &sel_terms,
+        &fixed,
+        &sel_proof,
+        &mut ch_v,
+    )
+    .expect("native selection");
     let mut group_values = [F128::ZERO; STATE_SIZE];
-    for (r, v) in claimed_refs(&sel_terms).iter().zip(sel_proof.final_values.iter()) {
+    for (r, v) in claimed_refs(&sel_terms)
+        .iter()
+        .zip(sel_proof.final_values.iter())
+    {
         match r {
-            ColRef::Committed(_) => pending.push(NativePending { point: sel_point.clone(), value: *v }),
+            ColRef::Committed(_) => pending.push(NativePending {
+                point: sel_point.clone(),
+                value: *v,
+            }),
             ColRef::Internal(j) => group_values[*j] = *v,
             _ => unreachable!(),
         }
     }
 
-    let groups = vec![LaneClaimGroup { point: sel_point.clone(), values: group_values }];
+    let groups = vec![LaneClaimGroup {
+        point: sel_point.clone(),
+        values: group_values,
+    }];
     let (walk_proof, _) = prove_deep_chain_walk(&cols.s0, &groups, &mut ch_p);
-    let terminal = verify_deep_chain_walk(w_log, &groups, &walk_proof, &mut ch_v).expect("native walk");
+    let terminal =
+        verify_deep_chain_walk(w_log, &groups, &walk_proof, &mut ch_v).expect("native walk");
 
     // Substitution through the compress wiring.
     let alpha = ch_p.sample_f128();
@@ -163,27 +209,53 @@ fn run_merkle_native(family: &MerklePathFamily, cols: &MerklePathColumns, w_log:
         target,
         &terminal.point,
         &sub_terms,
-        &RelationColumns { committed: &committed, internal: &[], fixed: &fixed },
+        &RelationColumns {
+            committed: &committed,
+            internal: &[],
+            fixed: &fixed,
+        },
         &mut ch_p,
     );
-    let sub_point =
-        verify_column_relation(w_log, target, &terminal.point, &sub_terms, &fixed, &sub_proof, &mut ch_v)
-            .expect("native substitution");
+    let sub_point = verify_column_relation(
+        w_log,
+        target,
+        &terminal.point,
+        &sub_terms,
+        &fixed,
+        &sub_proof,
+        &mut ch_v,
+    )
+    .expect("native substitution");
 
     let mut shifts = Vec::new();
-    for (r, v) in claimed_refs(&sub_terms).iter().zip(sub_proof.final_values.iter()) {
+    for (r, v) in claimed_refs(&sub_terms)
+        .iter()
+        .zip(sub_proof.final_values.iter())
+    {
         match r {
-            ColRef::Committed(_) => pending.push(NativePending { point: sub_point.clone(), value: *v }),
+            ColRef::Committed(_) => pending.push(NativePending {
+                point: sub_point.clone(),
+                value: *v,
+            }),
             ColRef::CommittedShift(c) => {
                 let (pr, _) = prove_shift_discharge(committed[*c], &sub_point, *v, &mut ch_p);
-                let pt = verify_shift_discharge(w_log, &sub_point, *v, &pr, &mut ch_v).expect("shift");
-                pending.push(NativePending { point: pt, value: pr.final_value });
+                let pt =
+                    verify_shift_discharge(w_log, &sub_point, *v, &pr, &mut ch_v).expect("shift");
+                pending.push(NativePending {
+                    point: pt,
+                    value: pr.final_value,
+                });
                 shifts.push((0usize, *c, pr));
             }
             ColRef::CommittedShift2(c) => {
-                let (pr, _) = prove_shift_discharge_pow2(committed[*c], &sub_point, *v, 1, &mut ch_p);
-                let pt = verify_shift_discharge_pow2(w_log, &sub_point, *v, 1, &pr, &mut ch_v).expect("shift2");
-                pending.push(NativePending { point: pt, value: pr.final_value });
+                let (pr, _) =
+                    prove_shift_discharge_pow2(committed[*c], &sub_point, *v, 1, &mut ch_p);
+                let pt = verify_shift_discharge_pow2(w_log, &sub_point, *v, 1, &pr, &mut ch_v)
+                    .expect("shift2");
+                pending.push(NativePending {
+                    point: pt,
+                    value: pr.final_value,
+                });
                 shifts.push((1usize, *c, pr));
             }
             _ => unreachable!(),
@@ -191,17 +263,31 @@ fn run_merkle_native(family: &MerklePathFamily, cols: &MerklePathColumns, w_log:
     }
     assert_eq!(ch_p.sample_f128(), ch_v.sample_f128(), "native lockstep");
 
-    NativeArtifacts { bool_proof, sel_proof, walk_proof, sub_proof, shifts, pending }
+    NativeArtifacts {
+        bool_proof,
+        sel_proof,
+        walk_proof,
+        sub_proof,
+        shifts,
+        pending,
+    }
 }
 
 /// Align the builder to a dyadic boundary and allocate one column as a slice.
-fn alloc_column_slice(b: &mut FieldR1csBuilder, col: &[F128], log2_len: usize) -> (WitnessSlice, Vec<LinExpr>) {
+fn alloc_column_slice(
+    b: &mut FieldR1csBuilder,
+    col: &[F128],
+    log2_len: usize,
+) -> (WitnessSlice, Vec<LinExpr>) {
     let block = 1usize << log2_len;
     while b.num_wires() % block != 0 {
         b.alloc_f128(F128::ZERO);
     }
     let index = b.num_wires() / block;
-    let wires: Vec<LinExpr> = col.iter().map(|&v| LinExpr::from_wire(b.alloc_f128(v))).collect();
+    let wires: Vec<LinExpr> = col
+        .iter()
+        .map(|&v| LinExpr::from_wire(b.alloc_f128(v)))
+        .collect();
     for _ in col.len()..block {
         b.alloc_f128(F128::ZERO);
     }
@@ -211,7 +297,10 @@ fn alloc_column_slice(b: &mut FieldR1csBuilder, col: &[F128], log2_len: usize) -
 fn const_terms(terms: &[RelationTerm]) -> Vec<RelationTermTrace> {
     terms
         .iter()
-        .map(|t| RelationTermTrace { coeff: LinExpr::constant(t.coeff), factors: t.factors.clone() })
+        .map(|t| RelationTermTrace {
+            coeff: LinExpr::constant(t.coeff),
+            factors: t.factors.clone(),
+        })
         .collect()
 }
 
@@ -262,12 +351,18 @@ fn merkle_substitution_terms_trace(
             vec![ColRef::Fixed(refs.oddns), d_sh, c_sh2],
             vec![ColRef::Fixed(refs.oddstart), d_sh, e_sh],
         ] {
-            terms.push(RelationTermTrace { coeff: m[i].clone(), factors });
+            terms.push(RelationTermTrace {
+                coeff: m[i].clone(),
+                factors,
+            });
         }
     }
     for j in 2..STATE_SIZE {
         let c_sh = ColRef::CommittedShift(refs.c[j]);
-        terms.push(RelationTermTrace { coeff: m[j].clone(), factors: vec![c_sh] });
+        terms.push(RelationTermTrace {
+            coeff: m[j].clone(),
+            factors: vec![c_sh],
+        });
         terms.push(RelationTermTrace {
             coeff: m[j].clone(),
             factors: vec![ColRef::Fixed(refs.even), c_sh],
@@ -309,8 +404,15 @@ fn region_merkle_slot_end_to_end() {
     // ---- Trace circuit: committed columns as slices, then the DAG twins.
     let mut b = FieldR1csBuilder::new();
     let column_data: [&[F128]; 9] = [
-        &cols.e[0], &cols.e[1], &cols.sib[0], &cols.sib[1], &cols.d, &cols.c[0], &cols.c[1],
-        &cols.c[2], &cols.c[3],
+        &cols.e[0],
+        &cols.e[1],
+        &cols.sib[0],
+        &cols.sib[1],
+        &cols.d,
+        &cols.c[0],
+        &cols.c[1],
+        &cols.c[2],
+        &cols.c[3],
     ];
     let mut slices = Vec::new();
     for col in column_data.iter() {
@@ -326,9 +428,20 @@ fn region_merkle_slot_end_to_end() {
     let rho_b = ch.sample_f128_vec(&mut b, w_log);
     let bool_e = ColumnRelationProofTrace::alloc(&mut b, &native.bool_proof, w_log, 1);
     let bool_point = verify_column_relation_trace(
-        &mut b, &mut ch, w_log, &zero, &rho_b, &const_terms(&bool_terms), &fixed, &bool_e,
+        &mut b,
+        &mut ch,
+        w_log,
+        &zero,
+        &rho_b,
+        &const_terms(&bool_terms),
+        &fixed,
+        &bool_e,
     );
-    pending.push(PendingClaimTrace { col: refs.d, point: bool_point, value: bool_e.final_values[0].clone() });
+    pending.push(PendingClaimTrace {
+        col: refs.d,
+        point: bool_point,
+        value: bool_e.final_values[0].clone(),
+    });
 
     // Selection → walk group (β-power coefficients, challenge-derived).
     let beta = ch.sample_f128(&mut b);
@@ -336,13 +449,26 @@ fn region_merkle_slot_end_to_end() {
     let mut sel_terms_e: Vec<RelationTermTrace> = Vec::new();
     for j in 0..STATE_SIZE {
         beta_pow = mul(&mut b, &beta_pow, &beta);
-        sel_terms_e.push(RelationTermTrace { coeff: beta_pow.clone(), factors: vec![ColRef::Committed(refs.c[j])] });
-        sel_terms_e.push(RelationTermTrace { coeff: beta_pow.clone(), factors: vec![ColRef::Internal(j)] });
+        sel_terms_e.push(RelationTermTrace {
+            coeff: beta_pow.clone(),
+            factors: vec![ColRef::Committed(refs.c[j])],
+        });
+        sel_terms_e.push(RelationTermTrace {
+            coeff: beta_pow.clone(),
+            factors: vec![ColRef::Internal(j)],
+        });
     }
     let rho = ch.sample_f128_vec(&mut b, w_log);
     let sel_e = ColumnRelationProofTrace::alloc(&mut b, &native.sel_proof, w_log, 2 * STATE_SIZE);
     let sel_point = verify_column_relation_trace(
-        &mut b, &mut ch, w_log, &zero, &rho, &sel_terms_e, &fixed, &sel_e,
+        &mut b,
+        &mut ch,
+        w_log,
+        &zero,
+        &rho,
+        &sel_terms_e,
+        &fixed,
+        &sel_e,
     );
     // Claimed-ref order is exactly [C0, Int0, C1, Int1, ...] per
     // carry_selection_terms; map back to pending / walk group values.
@@ -350,21 +476,28 @@ fn region_merkle_slot_end_to_end() {
     let mut group_values: [LinExpr; STATE_SIZE] = std::array::from_fn(|_| LinExpr::zero());
     for (r, v) in sel_claimed.iter().zip(sel_e.final_values.iter()) {
         match r {
-            ColRef::Committed(c) => pending.push(PendingClaimTrace { col: *c, point: sel_point.clone(), value: v.clone() }),
+            ColRef::Committed(c) => pending.push(PendingClaimTrace {
+                col: *c,
+                point: sel_point.clone(),
+                value: v.clone(),
+            }),
             ColRef::Internal(j) => group_values[*j] = v.clone(),
             _ => unreachable!(),
         }
     }
 
-    let groups_e = vec![LaneClaimGroupTrace { point: sel_point.clone(), values: group_values }];
+    let groups_e = vec![LaneClaimGroupTrace {
+        point: sel_point.clone(),
+        values: group_values,
+    }];
     let walk_e = DeepChainWalkProofTrace::alloc(&mut b, &native.walk_proof, w_log);
     let terminal = verify_deep_chain_walk_trace(&mut b, &mut ch, w_log, &groups_e, &walk_e);
 
     // Substitution through the compress wiring (α-power coefficients).
     let alpha = ch.sample_f128(&mut b);
     let sub_terms_native = merkle_substitution_terms(&refs, F128::ONE); // claimed-ref shape
-    // The substitution twin returns the α-power wires (α^1..α^STATE_SIZE) so
-    // the target reuses them instead of rebuilding the chain.
+                                                                        // The substitution twin returns the α-power wires (α^1..α^STATE_SIZE) so
+                                                                        // the target reuses them instead of rebuilding the chain.
     let (sub_terms_e, alpha_pows) = merkle_substitution_terms_trace(&mut b, &refs, &alpha);
     let mut target = LinExpr::zero();
     for e in 0..STATE_SIZE {
@@ -373,25 +506,46 @@ fn region_merkle_slot_end_to_end() {
     let n_sub_claims = claimed_refs(&sub_terms_native).len();
     let sub_e = ColumnRelationProofTrace::alloc(&mut b, &native.sub_proof, w_log, n_sub_claims);
     let sub_point = verify_column_relation_trace(
-        &mut b, &mut ch, w_log, &target, &terminal.point, &sub_terms_e, &fixed, &sub_e,
+        &mut b,
+        &mut ch,
+        w_log,
+        &target,
+        &terminal.point,
+        &sub_terms_e,
+        &fixed,
+        &sub_e,
     );
 
     let sub_claimed = claimed_refs(&sub_terms_native);
     let mut shift_cursor = 0usize;
     for (r, v) in sub_claimed.iter().zip(sub_e.final_values.iter()) {
         match r {
-            ColRef::Committed(c) => pending.push(PendingClaimTrace { col: *c, point: sub_point.clone(), value: v.clone() }),
+            ColRef::Committed(c) => pending.push(PendingClaimTrace {
+                col: *c,
+                point: sub_point.clone(),
+                value: v.clone(),
+            }),
             ColRef::CommittedShift(_) | ColRef::CommittedShift2(_) => {
                 let (shift_log, col, native_shift) = &native.shifts[shift_cursor];
                 shift_cursor += 1;
                 let shift_e = ShiftDischargeProofTrace::alloc(&mut b, native_shift, w_log);
-                let pt = verify_shift_discharge_trace(&mut b, &mut ch, w_log, &sub_point, v, *shift_log, &shift_e);
-                pending.push(PendingClaimTrace { col: *col, point: pt, value: shift_e.final_value.clone() });
+                let pt = verify_shift_discharge_trace(
+                    &mut b, &mut ch, w_log, &sub_point, v, *shift_log, &shift_e,
+                );
+                pending.push(PendingClaimTrace {
+                    col: *col,
+                    point: pt,
+                    value: shift_e.final_value.clone(),
+                });
             }
             _ => unreachable!(),
         }
     }
-    assert_eq!(shift_cursor, native.shifts.len(), "all shift proofs consumed");
+    assert_eq!(
+        shift_cursor,
+        native.shifts.len(),
+        "all shift proofs consumed"
+    );
 
     // ---- IO slice: (point ‖ value) lanes per pending claim, pinned to the
     // replayed wires; the spec derives one opening claim per entry.
@@ -429,7 +583,10 @@ fn region_merkle_slot_end_to_end() {
 
     // ---- The real proof.
     let (r1cs, z) = b.build();
-    assert!(r1cs.satisfies(&z), "honest region-merkle trace unsatisfiable");
+    assert!(
+        r1cs.satisfies(&z),
+        "honest region-merkle trace unsatisfiable"
+    );
     let params = PcsParams {
         m: r1cs.m + pcs::LOG_PACKING,
         log_inv_rate: 2,
@@ -441,8 +598,15 @@ fn region_merkle_slot_end_to_end() {
         &r1cs, &z, &params, &spec, &io_values, &mut ch_p,
     );
     let mut ch_v = FsLaneChallenger::new(OUTER_DOMAIN);
-    noid_ivc_core::verifier::verify_field_with_public_io(&r1cs, &commitment, &proof, &spec, &io_values, &mut ch_v)
-        .expect("the region merkle slot proof verifies");
+    noid_ivc_core::verifier::verify_field_with_public_io(
+        &r1cs,
+        &commitment,
+        &proof,
+        &spec,
+        &io_values,
+        &mut ch_v,
+    )
+    .expect("the region merkle slot proof verifies");
 
     eprintln!(
         "[region-merkle-slot] rows = {} (m = {}), opening claims = {}",
@@ -466,7 +630,12 @@ fn region_merkle_slot_end_to_end() {
     let mut ch_v = FsLaneChallenger::new(OUTER_DOMAIN);
     assert!(
         noid_ivc_core::verifier::verify_field_with_public_io(
-            &r1cs, &bad_commitment, &bad_proof, &spec, &io_values, &mut ch_v,
+            &r1cs,
+            &bad_commitment,
+            &bad_proof,
+            &spec,
+            &io_values,
+            &mut ch_v,
         )
         .is_err(),
         "a flipped committed column lane must break its opening claim"

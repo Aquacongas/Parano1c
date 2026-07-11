@@ -622,10 +622,7 @@ pub fn source_cap_depth(log_rows: usize) -> usize {
     SOURCE_CAP_DEPTH.min(source_tree_depth(log_rows))
 }
 
-pub fn source_cap_from_commitment_cap(
-    cap: &MerkleCap,
-    log_rows: usize,
-) -> Option<&[SourceHash]> {
+pub fn source_cap_from_commitment_cap(cap: &MerkleCap, log_rows: usize) -> Option<&[SourceHash]> {
     let cap_depth = source_cap_depth(log_rows);
     let source_cap_count = 1usize << cap_depth;
     let start = 1usize << MERKLE_CAP_DEPTH;

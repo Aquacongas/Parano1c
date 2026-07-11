@@ -105,11 +105,7 @@ pub struct BlockSpineShiftProofTrace {
 }
 
 impl BlockSpineShiftProofTrace {
-    pub fn alloc(
-        b: &mut FieldR1csBuilder,
-        native: &BlockSpineShiftProof,
-        num_vars: usize,
-    ) -> Self {
+    pub fn alloc(b: &mut FieldR1csBuilder, native: &BlockSpineShiftProof, num_vars: usize) -> Self {
         assert_eq!(
             native.round_polys.len(),
             num_vars,
@@ -201,8 +197,8 @@ fn fast_eval_block_schedules_trace(
 
             let is_partial = (F_ROUNDS / 2..F_ROUNDS / 2 + P_ROUNDS).contains(&prev);
             if !is_partial || elem == 0 {
-                rc_dec_inner =
-                    rc_dec_inner.add(&eq_re.scale(flat_of(Block128::from(ROUND_CONSTANTS[elem][prev]))));
+                rc_dec_inner = rc_dec_inner
+                    .add(&eq_re.scale(flat_of(Block128::from(ROUND_CONSTANTS[elem][prev]))));
             }
 
             for (j, inner) in mds_inner.iter_mut().enumerate().take(STATE_SIZE) {
@@ -710,7 +706,13 @@ impl ColumnAccumulator {
         }
 
         let final_row_weight = &self.eq_round[N_ROUNDS];
-        accumulate_row_trace(b, &mut slot_state, &current, final_row_weight, &self.eq_elem);
+        accumulate_row_trace(
+            b,
+            &mut slot_state,
+            &current,
+            final_row_weight,
+            &self.eq_elem,
+        );
 
         self.state_acc = self.state_acc.add(&mul(b, &slot_weight, &slot_state));
         self.sin_acc = self.sin_acc.add(&mul(b, &slot_weight, &slot_sin));
@@ -789,7 +791,10 @@ fn poseidon_flat_tables_ref() -> &'static PoseidonFlatTablesLocal {
     })
 }
 
-fn apply_mds_symbolic_local(state: &mut [LinExpr; STATE_SIZE], mds: &[[F128; STATE_SIZE]; STATE_SIZE]) {
+fn apply_mds_symbolic_local(
+    state: &mut [LinExpr; STATE_SIZE],
+    mds: &[[F128; STATE_SIZE]; STATE_SIZE],
+) {
     let old = state.clone();
     for (i, slot) in state.iter_mut().enumerate() {
         let mut acc = LinExpr::zero();
@@ -1007,10 +1012,7 @@ mod tests {
                     point: point.clone(),
                     value: iv
                 },
-                &BatchEvalReduction {
-                    point,
-                    value: ov
-                },
+                &BatchEvalReduction { point, value: ov },
             )
         );
     }

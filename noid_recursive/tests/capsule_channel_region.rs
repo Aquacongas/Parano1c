@@ -99,14 +99,12 @@ fn random_schedules_match_real_channel() {
         }
 
         let layout = compile_duplex(&ops);
-        let data_tower: Vec<Block128> =
-            (0..layout.n_data).map(|_| Block128::from(rng.u128())).collect();
+        let data_tower: Vec<Block128> = (0..layout.n_data)
+            .map(|_| Block128::from(rng.u128()))
+            .collect();
         let native = drive_channel(&ops, &data_tower);
 
-        let data_flat: Vec<F128> = data_tower
-            .iter()
-            .map(|v| flat_of_tower_u128(v.0))
-            .collect();
+        let data_flat: Vec<F128> = data_tower.iter().map(|v| flat_of_tower_u128(v.0)).collect();
         let w_log = layout.slots.len().next_power_of_two().trailing_zeros() as usize;
         let cols = build_duplex_columns(&layout, frichanl_iv_flat(), &data_flat, w_log);
 
@@ -121,7 +119,10 @@ fn random_schedules_match_real_channel() {
     }
 }
 
-fn capsule_fixture(num_vars: usize, seed: u64) -> (BatchEvalReduction, noid_gkr::auth_pcs::AuthMleOpeningProof) {
+fn capsule_fixture(
+    num_vars: usize,
+    seed: u64,
+) -> (BatchEvalReduction, noid_gkr::auth_pcs::AuthMleOpeningProof) {
     let mut rng = Rng(seed);
     let column: Vec<Block128> = (0..(1usize << num_vars))
         .map(|_| Block128::from(rng.u128()))

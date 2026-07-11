@@ -11,7 +11,7 @@
 
 use noid_core::{Block128, CanonicalSerialize};
 use noid_poseidon2b::native::compression::Poseidon2bSponge;
-use noid_poseidon2b::native::domain::{TAG_FRICHANL, capacity_iv};
+use noid_poseidon2b::native::domain::{capacity_iv, TAG_FRICHANL};
 
 use crate::merkle::VectorCommitment;
 use crate::prover::FriCommitment;
@@ -109,7 +109,8 @@ impl Channel {
     pub fn observe_vector_commitment(&mut self, commitment: &VectorCommitment) {
         self.enter_absorb_mode();
         self.sponge.update(&commitment.root);
-        self.sponge.update(&(commitment.depth as u128).to_le_bytes());
+        self.sponge
+            .update(&(commitment.depth as u128).to_le_bytes());
     }
 
     /// Absorb a `FriCommitment` (vector commitment + packing factor).

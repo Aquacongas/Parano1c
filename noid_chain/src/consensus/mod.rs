@@ -63,7 +63,8 @@ pub use conflict::resolve_slot_conflicts;
 pub use da_prune::{build_undo_log, prune_undo_logs, revert_block, BlockUndoLog};
 pub use difficulty::{add_work, block_work, le256_lt, next_target, work_gt};
 pub use emission::{
-    block_reward, format_noid, max_coinbase_value, max_coinbase_value_from_fee_sum, total_fees,
+    block_reward, format_noid, max_coinbase_value, max_coinbase_value_from_claimable_fee_sum,
+    total_fees,
 };
 pub use epoch_anchor::{
     checked_tx_epoch_height_decomposition, next_tx_epoch_anchor_id, resolve_user_epoch_anchor_id,

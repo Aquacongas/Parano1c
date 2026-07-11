@@ -14,8 +14,7 @@
 
 use noid_ivc_core::challenger::FsLaneChallenger;
 use noid_ivc_core::deep_chain::family::{
-    self, build_family, g0_terms, g1_terms, run_family, substitution_terms, FamilyProofs,
-    W_LOG,
+    self, build_family, g0_terms, g1_terms, run_family, substitution_terms, FamilyProofs, W_LOG,
 };
 use noid_ivc_core::deep_chain::relations::{ColRef, RelationTerm};
 use noid_ivc_core::field::F128;
@@ -142,7 +141,7 @@ fn region_slot_end_to_end() {
             &rho,
             &const_terms(&terms),
             &[],
-        &proof_e,
+            &proof_e,
         );
         for (r, v) in refs.iter().zip(proof_e.final_values.iter()) {
             if let ColRef::Committed(c) = r {
@@ -201,12 +200,8 @@ fn region_slot_end_to_end() {
         },
     ];
     let rho_out = ch.sample_f128_vec(&mut b, W_LOG);
-    let out_proof_e = ColumnRelationProofTrace::alloc(
-        &mut b,
-        proofs.output.as_ref().expect("output"),
-        W_LOG,
-        3,
-    );
+    let out_proof_e =
+        ColumnRelationProofTrace::alloc(&mut b, proofs.output.as_ref().expect("output"), W_LOG, 3);
     let out_point = verify_column_relation_trace(
         &mut b,
         &mut ch,
@@ -251,8 +246,7 @@ fn region_slot_end_to_end() {
             values,
         });
     }
-    let walk_e =
-        DeepChainWalkProofTrace::alloc(&mut b, proofs.walk.as_ref().expect("walk"), W_LOG);
+    let walk_e = DeepChainWalkProofTrace::alloc(&mut b, proofs.walk.as_ref().expect("walk"), W_LOG);
     let terminal = verify_deep_chain_walk_trace(&mut b, &mut ch, W_LOG, &groups_e, &walk_e);
 
     // Substitution at the walk terminal (challenge-derived coefficients).
@@ -325,11 +319,8 @@ fn region_slot_end_to_end() {
     }
 
     // Shift discharge for the carry column.
-    let shift_e = ShiftDischargeProofTrace::alloc(
-        &mut b,
-        proofs.shift.as_ref().expect("shift"),
-        W_LOG,
-    );
+    let shift_e =
+        ShiftDischargeProofTrace::alloc(&mut b, proofs.shift.as_ref().expect("shift"), W_LOG);
     let shift_point = verify_shift_discharge_trace(
         &mut b,
         &mut ch,
@@ -362,11 +353,7 @@ fn region_slot_end_to_end() {
         for (k, p) in claim.point.iter().enumerate() {
             noid_recursive::acceptance::trace::pin_eq(&mut b, p, &io_wires[base + k]);
         }
-        noid_recursive::acceptance::trace::pin_eq(
-            &mut b,
-            &claim.value,
-            &io_wires[base + W_LOG],
-        );
+        noid_recursive::acceptance::trace::pin_eq(&mut b, &claim.value, &io_wires[base + W_LOG]);
     }
     let spec = PublicIoSpec {
         io_slice,

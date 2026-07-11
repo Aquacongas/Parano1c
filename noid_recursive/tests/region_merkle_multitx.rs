@@ -49,7 +49,10 @@ impl Rng {
         z ^ (z >> 31)
     }
     fn f128(&mut self) -> F128 {
-        F128 { lo: self.next_u64(), hi: self.next_u64() }
+        F128 {
+            lo: self.next_u64(),
+            hi: self.next_u64(),
+        }
     }
     fn bit(&mut self) -> bool {
         self.next_u64() & 1 == 1
@@ -65,7 +68,12 @@ fn iv_flat() -> [F128; 2] {
 /// `2^block_log`: the single-path stride pattern placed `nq` times starting at
 /// `offset`, zero elsewhere; `low_log = block_log` so the pattern is periodic
 /// over the per-tx block and covers every tx for free.
-fn common_period(stride_table: &[F128], offset: usize, nq: usize, block_log: usize) -> FixedPattern {
+fn common_period(
+    stride_table: &[F128],
+    offset: usize,
+    nq: usize,
+    block_log: usize,
+) -> FixedPattern {
     let block = 1usize << block_log;
     let stride = stride_table.len();
     let mut t = vec![F128::ZERO; block];
@@ -116,7 +124,10 @@ fn build_merkle_union(k_tx: usize, leg_depths: &[usize], nq: usize, seed: u64) -
     let c_refs: [usize; STATE_SIZE] = std::array::from_fn(|i| i);
 
     // Per-tx block: legs packed contiguously, block padded to a power of two.
-    let strides: Vec<usize> = leg_depths.iter().map(|&d| (2 * d).next_power_of_two()).collect();
+    let strides: Vec<usize> = leg_depths
+        .iter()
+        .map(|&d| (2 * d).next_power_of_two())
+        .collect();
     let leg_slots: Vec<usize> = strides.iter().map(|&s| nq * s).collect();
     let offsets: Vec<usize> = {
         let mut o = Vec::with_capacity(l);
@@ -152,14 +163,19 @@ fn build_merkle_union(k_tx: usize, leg_depths: &[usize], nq: usize, seed: u64) -
     // Tile every tx's every leg.
     for t in 0..k_tx {
         for f in 0..l {
-            let family = MerklePathFamily { depth: leg_depths[f], n_paths: nq };
+            let family = MerklePathFamily {
+                depth: leg_depths[f],
+                n_paths: nq,
+            };
             let stride = strides[f];
             let fam_wlog = leg_slots[f].trailing_zeros() as usize;
             assert_eq!(1usize << fam_wlog, leg_slots[f], "leg block power of two");
             let witnesses: Vec<MerklePathWitness> = (0..nq)
                 .map(|_| MerklePathWitness {
                     entry: [rng.f128(), rng.f128()],
-                    siblings: (0..family.depth).map(|_| [rng.f128(), rng.f128()]).collect(),
+                    siblings: (0..family.depth)
+                        .map(|_| [rng.f128(), rng.f128()])
+                        .collect(),
                     directions: (0..family.depth).map(|_| rng.bit()).collect(),
                 })
                 .collect();
@@ -189,7 +205,10 @@ fn build_merkle_union(k_tx: usize, leg_depths: &[usize], nq: usize, seed: u64) -
     let mut refs: Vec<MerkleFamilyRefs> = Vec::new();
     let mut regions: Vec<usize> = Vec::new();
     for f in 0..l {
-        let family = MerklePathFamily { depth: leg_depths[f], n_paths: nq };
+        let family = MerklePathFamily {
+            depth: leg_depths[f],
+            n_paths: nq,
+        };
         let fixed_base = fixed.len();
         for pat in merkle_fixed_patterns(&family, iv) {
             fixed.push(common_period(&pat.table, offsets[f], nq, block_log));
@@ -204,7 +223,16 @@ fn build_merkle_union(k_tx: usize, leg_depths: &[usize], nq: usize, seed: u64) -
         fixed.push(FixedPattern::new(block_log, t));
     }
 
-    MerkleUnion { committed, s0, s_out, fixed, refs, regions, c_refs, w_log }
+    MerkleUnion {
+        committed,
+        s0,
+        s_out,
+        fixed,
+        refs,
+        regions,
+        c_refs,
+        w_log,
+    }
 }
 
 /// Union the legs' booleanity terms (each already gated by its own `even`
@@ -250,11 +278,23 @@ fn run_merkle_union(u: &MerkleUnion) -> usize {
         F128::ZERO,
         &rho_b,
         &bool_terms,
-        &RelationColumns { committed: &committed, internal: &[], fixed: &u.fixed },
+        &RelationColumns {
+            committed: &committed,
+            internal: &[],
+            fixed: &u.fixed,
+        },
         &mut ch_p,
     );
-    verify_column_relation(w_log, F128::ZERO, &rho_b, &bool_terms, &u.fixed, &bool_proof, &mut ch_v)
-        .expect("native merkle-union booleanity");
+    verify_column_relation(
+        w_log,
+        F128::ZERO,
+        &rho_b,
+        &bool_terms,
+        &u.fixed,
+        &bool_proof,
+        &mut ch_v,
+    )
+    .expect("native merkle-union booleanity");
 
     // ONE carry-selection over the shared C carries.
     let beta = ch_p.sample_f128();
@@ -266,14 +306,28 @@ fn run_merkle_union(u: &MerkleUnion) -> usize {
         F128::ZERO,
         &rho,
         &sel_terms,
-        &RelationColumns { committed: &committed, internal: &internal, fixed: &u.fixed },
+        &RelationColumns {
+            committed: &committed,
+            internal: &internal,
+            fixed: &u.fixed,
+        },
         &mut ch_p,
     );
-    let sel_point =
-        verify_column_relation(w_log, F128::ZERO, &rho, &sel_terms, &u.fixed, &sel_proof, &mut ch_v)
-            .expect("native merkle-union selection");
+    let sel_point = verify_column_relation(
+        w_log,
+        F128::ZERO,
+        &rho,
+        &sel_terms,
+        &u.fixed,
+        &sel_proof,
+        &mut ch_v,
+    )
+    .expect("native merkle-union selection");
     let mut gv = [F128::ZERO; STATE_SIZE];
-    for (r, v) in claimed_refs(&sel_terms).iter().zip(sel_proof.final_values.iter()) {
+    for (r, v) in claimed_refs(&sel_terms)
+        .iter()
+        .zip(sel_proof.final_values.iter())
+    {
         match r {
             ColRef::Committed(_) => {}
             ColRef::Internal(j) => gv[*j] = *v,
@@ -282,7 +336,10 @@ fn run_merkle_union(u: &MerkleUnion) -> usize {
     }
 
     // ONE deep-chain walk over the shared s0.
-    let groups = vec![LaneClaimGroup { point: sel_point, values: gv }];
+    let groups = vec![LaneClaimGroup {
+        point: sel_point,
+        values: gv,
+    }];
     let (walk_proof, _) = prove_deep_chain_walk(&u.s0, &groups, &mut ch_p);
     let terminal =
         verify_deep_chain_walk(w_log, &groups, &walk_proof, &mut ch_v).expect("native merkle walk");
@@ -301,7 +358,11 @@ fn run_merkle_union(u: &MerkleUnion) -> usize {
         target,
         &terminal.point,
         &sub_terms,
-        &RelationColumns { committed: &committed, internal: &[], fixed: &u.fixed },
+        &RelationColumns {
+            committed: &committed,
+            internal: &[],
+            fixed: &u.fixed,
+        },
         &mut ch_p,
     );
     let sub_point = verify_column_relation(
@@ -316,7 +377,10 @@ fn run_merkle_union(u: &MerkleUnion) -> usize {
     .expect("native merkle-union substitution");
 
     // Discharge the shift claims (the distance-1 / distance-2 carry reads).
-    for (r, v) in claimed_refs(&sub_terms).iter().zip(sub_proof.final_values.iter()) {
+    for (r, v) in claimed_refs(&sub_terms)
+        .iter()
+        .zip(sub_proof.final_values.iter())
+    {
         match r {
             ColRef::Committed(_) => {}
             ColRef::CommittedShift(c) => {
@@ -324,14 +388,23 @@ fn run_merkle_union(u: &MerkleUnion) -> usize {
                 verify_shift_discharge(w_log, &sub_point, *v, &pr, &mut ch_v).expect("shift");
             }
             ColRef::CommittedShift2(c) => {
-                let (pr, _) = prove_shift_discharge_pow2(committed[*c], &sub_point, *v, 1, &mut ch_p);
-                verify_shift_discharge_pow2(w_log, &sub_point, *v, 1, &pr, &mut ch_v).expect("shift2");
+                let (pr, _) =
+                    prove_shift_discharge_pow2(committed[*c], &sub_point, *v, 1, &mut ch_p);
+                verify_shift_discharge_pow2(w_log, &sub_point, *v, 1, &pr, &mut ch_v)
+                    .expect("shift2");
             }
             _ => unreachable!(),
         }
     }
-    assert_eq!(ch_p.sample_f128(), ch_v.sample_f128(), "native merkle-union lockstep");
-    walk_proof.layers.first().map_or(0, |l| l.round_coeffs.len())
+    assert_eq!(
+        ch_p.sample_f128(),
+        ch_v.sample_f128(),
+        "native merkle-union lockstep"
+    );
+    walk_proof
+        .layers
+        .first()
+        .map_or(0, |l| l.round_coeffs.len())
 }
 
 /// Honest multi-tx Merkle union (legs of depths 3/5/2 — mixed strides 8/16/4)
@@ -345,16 +418,22 @@ fn common_period_multitx_merkle_union_native() {
 
     // Negative: flip one sibling lane of tx 1, leg 1 (depth 5), path 0, level 0.
     let mut bad = build_merkle_union(2, &depths, nq, 0xC0FFEE);
-    let strides: Vec<usize> = depths.iter().map(|&d| (2 * d).next_power_of_two()).collect();
+    let strides: Vec<usize> = depths
+        .iter()
+        .map(|&d| (2 * d).next_power_of_two())
+        .collect();
     let leg_slots: Vec<usize> = strides.iter().map(|&s| nq * s).collect();
     let per_tx_block: usize = leg_slots.iter().sum::<usize>().next_power_of_two();
     let leg1_off: usize = leg_slots[0]; // leg 1 begins after leg 0
-    // tx 1, leg 1, path 0, level 0 sibling = column (4 + 5·1 + 2) = SIB0 of leg 1.
+                                        // tx 1, leg 1, path 0, level 0 sibling = column (4 + 5·1 + 2) = SIB0 of leg 1.
     let slot = per_tx_block + leg1_off;
     let sib_col = 4 + 5 * 1 + 2;
     bad.committed[sib_col][slot] += F128::ONE;
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_merkle_union(&bad)));
-    assert!(caught.is_err(), "corrupted tx-1 leg tile accepted by the shared relation set");
+    assert!(
+        caught.is_err(),
+        "corrupted tx-1 leg tile accepted by the shared relation set"
+    );
 }
 
 /// The walk cost is FLAT in tx count: doubling K adds only ~1 walk round

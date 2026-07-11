@@ -36,9 +36,9 @@
 //! (the linear coefficient is reconstructed from the running claim, so
 //! `p(0) + p(1) = claim` holds by construction).
 
+pub mod capsule_leaf;
 pub mod encode_kernel;
 pub mod family;
-pub mod capsule_leaf;
 pub mod ff_merkle;
 pub mod leaf_hash;
 pub mod relations;
@@ -173,7 +173,7 @@ pub struct LaneClaimGroup {
 
 /// One layer's wire data: `w_log` compressed degree-8 round polynomials
 /// plus the four next-layer lane evaluations at the derived point.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WalkLayerProof {
     /// Per sumcheck round: `[c_0, c_2..c_8]` (8 coefficients).
     pub round_coeffs: Vec<[F128; WALK_DEGREE]>,
@@ -181,9 +181,37 @@ pub struct WalkLayerProof {
 }
 
 /// The full walk: layer 66 first, down to layer 1.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DeepChainWalkProof {
     pub layers: Vec<WalkLayerProof>,
+}
+
+/// One layer of a multi-instance walk.
+///
+/// All instances share the aggregate degree-8 sumcheck messages and therefore
+/// the derived aggregate slot point. Their four layer-`l - 1` evaluations stay
+/// independent: the verifier checks one Fiat–Shamir random-linear aggregate of
+/// all instance transition terms before carrying one claim group per instance
+/// into the next layer.  V1 uses equal domains; the ragged V2 protocol reuses
+/// this wire shape with one round message per coordinate of the largest
+/// instance.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MultiWalkLayerProof {
+    /// Per aggregate sumcheck round: `[c_0, c_2..c_8]`.
+    pub round_coeffs: Vec<[F128; WALK_DEGREE]>,
+    /// Four next-layer values in canonical instance order.
+    pub next_values: Vec<[F128; STATE_SIZE]>,
+}
+
+/// Proof container for several independent Poseidon deep-chain instances.
+///
+/// The transcript label and verifier entry point select either the equal-domain
+/// V1 protocol or the ragged-domain V2 protocol.  In both cases the surrounding
+/// selection/substitution protocols remain independent and the proof returns
+/// one authenticated layer-0 claim per instance.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MultiDeepChainWalkProof {
+    pub layers: Vec<MultiWalkLayerProof>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -304,10 +332,7 @@ fn compress(full: &[F128; WALK_DEGREE + 1]) -> [F128; WALK_DEGREE] {
 // ---------------------------------------------------------------------------
 
 /// `c_{g,j} = Σ_i w_{g,i} · MDS[i][j]` for one group's lane weights.
-fn column_weights(
-    q: usize,
-    lane_weights: &[F128; STATE_SIZE],
-) -> [F128; STATE_SIZE] {
+fn column_weights(q: usize, lane_weights: &[F128; STATE_SIZE]) -> [F128; STATE_SIZE] {
     let sch = schedule();
     let mds = if is_full_round(q) {
         &sch.mds_full
@@ -354,6 +379,44 @@ fn absorb_groups<Ch: Challenger>(challenger: &mut Ch, groups: &[LaneClaimGroup])
     for g in groups {
         challenger.observe_f128_slice(&g.point);
         challenger.observe_f128_slice(&g.values);
+    }
+}
+
+/// Bind the complete ordered multi-instance claim shape before the first
+/// batching challenge.  Explicit instance/group counts prevent repartitioning
+/// one flat claim list into a different authority topology.
+fn absorb_multi_groups<Ch: Challenger>(challenger: &mut Ch, groups: &[Vec<LaneClaimGroup>]) {
+    challenger.observe_label(b"history-deep-chain-multi-walk-v1");
+    challenger.observe_f128(f128_of_u128(groups.len() as u128));
+    for instance in groups {
+        challenger.observe_f128(f128_of_u128(instance.len() as u128));
+        for group in instance {
+            challenger.observe_f128_slice(&group.point);
+            challenger.observe_f128_slice(&group.values);
+        }
+    }
+}
+
+/// V2 transcript prefix for a ragged multi-walk.  Domain widths are protocol
+/// constants supplied by the caller (and derived from the native columns by
+/// the prover), not proof fields.  Binding them in instance-major order before
+/// the first batching challenge prevents either a width reassignment or a
+/// repartitioning of the flat claim list.
+fn absorb_ragged_multi_groups<Ch: Challenger>(
+    challenger: &mut Ch,
+    w_logs: &[usize],
+    groups: &[Vec<LaneClaimGroup>],
+) {
+    debug_assert_eq!(w_logs.len(), groups.len());
+    challenger.observe_label(b"history-deep-chain-ragged-multi-walk-v2");
+    challenger.observe_f128(f128_of_u128(groups.len() as u128));
+    for (&w_log, instance) in w_logs.iter().zip(groups) {
+        challenger.observe_f128(f128_of_u128(w_log as u128));
+        challenger.observe_f128(f128_of_u128(instance.len() as u128));
+        for group in instance {
+            challenger.observe_f128_slice(&group.point);
+            challenger.observe_f128_slice(&group.values);
+        }
     }
 }
 
@@ -433,8 +496,7 @@ pub fn prove_deep_chain_walk<Ch: Challenger>(
                 claim += w_g[i] * g.values[i];
             }
         }
-        let mut e_tables: [Vec<F128>; STATE_SIZE] =
-            std::array::from_fn(|_| vec![F128::ZERO; w]);
+        let mut e_tables: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; w]);
         for (g, w_g) in groups.iter().zip(weights.iter()) {
             let c = column_weights(q, w_g);
             let eq = build_eq_table(&g.point);
@@ -539,6 +601,528 @@ pub fn prove_deep_chain_walk<Ch: Challenger>(
     )
 }
 
+/// Prove several independent walks of the same dyadic width with one aggregate
+/// sumcheck per Poseidon layer.
+///
+/// `s0_instances[a]` is instance `a`'s four layer-0 columns and
+/// `out_groups[a]` its non-empty set of layer-66 claims.  The transcript binds
+/// both nesting dimensions before sampling the weights.  One global power
+/// ladder random-linearly combines every `(instance, group, lane)` claim; the
+/// shared sumcheck point is then checked against each instance's own next-layer
+/// values.  The returned vector contains one true layer-0 claim per instance.
+pub fn prove_multi_deep_chain_walk<Ch: Challenger>(
+    s0_instances: &[&[Vec<F128>; STATE_SIZE]],
+    out_groups: &[Vec<LaneClaimGroup>],
+    challenger: &mut Ch,
+) -> (MultiDeepChainWalkProof, Vec<LaneClaimGroup>) {
+    assert!(!s0_instances.is_empty(), "at least one walk instance");
+    assert_eq!(
+        s0_instances.len(),
+        out_groups.len(),
+        "one claim-group list per walk instance"
+    );
+    let w = s0_instances[0][0].len();
+    assert!(w.is_power_of_two(), "column length must be a power of two");
+    let w_log = w.trailing_zeros() as usize;
+    for (instance, groups) in s0_instances.iter().zip(out_groups) {
+        assert!(instance.iter().all(|column| column.len() == w));
+        assert!(!groups.is_empty(), "every instance needs an output claim");
+        assert!(
+            groups.iter().all(|group| group.point.len() == w_log),
+            "claim point arity"
+        );
+    }
+
+    // Retain the same bounded-rebuild discipline as the single-instance
+    // prover. Checkpoints are independent; only their sumcheck messages are
+    // aggregated. The retained payload is
+    // `instances * 10 * 4 * 2^w_log * sizeof(F128)` at 66 rounds / spacing 8
+    // (20 MiB for the planned two-instance w_log=14 B8 group). A future wider
+    // ladder should stream/rebuild instances if that product becomes material.
+    let checkpoints: Vec<Vec<[Vec<F128>; STATE_SIZE]>> = s0_instances
+        .iter()
+        .map(|&s0| {
+            let mut instance_checkpoints = vec![s0.clone()];
+            let mut current = s0.clone();
+            let mut q = 0usize;
+            while q < N_ROUNDS {
+                let step = CHECKPOINT_SPACING.min(N_ROUNDS - q);
+                for dq in 0..step {
+                    apply_round_columns(q + dq, &mut current);
+                }
+                q += step;
+                instance_checkpoints.push(current.clone());
+            }
+            instance_checkpoints
+        })
+        .collect();
+
+    absorb_multi_groups(challenger, out_groups);
+
+    let mut groups = out_groups.to_vec();
+    let mut layers = Vec::with_capacity(N_ROUNDS);
+    for layer in (1..=N_ROUNDS).rev() {
+        let q = layer - 1;
+        let alpha = challenger.sample_f128();
+        let total_groups = groups.iter().map(Vec::len).sum();
+        let flat_weights = lane_weight_table(alpha, total_groups);
+        let mut weight_cursor = 0usize;
+        let weights: Vec<Vec<[F128; STATE_SIZE]>> = groups
+            .iter()
+            .map(|instance| {
+                let end = weight_cursor + instance.len();
+                let instance_weights = flat_weights[weight_cursor..end].to_vec();
+                weight_cursor = end;
+                instance_weights
+            })
+            .collect();
+        debug_assert_eq!(weight_cursor, flat_weights.len());
+
+        let mut claim = F128::ZERO;
+        let mut e_tables: Vec<[Vec<F128>; STATE_SIZE]> = groups
+            .iter()
+            .map(|_| std::array::from_fn(|_| vec![F128::ZERO; w]))
+            .collect();
+        for ((instance_groups, instance_weights), instance_e) in
+            groups.iter().zip(&weights).zip(&mut e_tables)
+        {
+            for (group, lane_weights) in instance_groups.iter().zip(instance_weights) {
+                for lane in 0..STATE_SIZE {
+                    claim += lane_weights[lane] * group.values[lane];
+                }
+                let columns = column_weights(q, lane_weights);
+                let eq = build_eq_table(&group.point);
+                for lane in 0..STATE_SIZE {
+                    if columns[lane] == F128::ZERO {
+                        continue;
+                    }
+                    instance_e[lane]
+                        .par_iter_mut()
+                        .zip(eq.par_iter())
+                        .for_each(|(slot, eq)| *slot += columns[lane] * *eq);
+                }
+            }
+        }
+
+        let mut s_tables: Vec<[Vec<F128>; STATE_SIZE]> = checkpoints
+            .iter()
+            .map(|instance_checkpoints| {
+                let checkpoint = q / CHECKPOINT_SPACING;
+                let mut columns = instance_checkpoints[checkpoint].clone();
+                for round in checkpoint * CHECKPOINT_SPACING..q {
+                    apply_round_columns(round, &mut columns);
+                }
+                columns
+            })
+            .collect();
+
+        let mut round_coeffs = Vec::with_capacity(w_log);
+        let mut point = Vec::with_capacity(w_log);
+        for _round in 0..w_log {
+            let half = e_tables[0][0].len() / 2;
+            let work = half * s0_instances.len();
+            let evals = (0..work)
+                .into_par_iter()
+                .fold(
+                    || [F128::ZERO; WALK_DEGREE + 1],
+                    |mut acc, work_index| {
+                        let instance = work_index / half;
+                        let p = work_index % half;
+                        let mut e_base = [F128::ZERO; STATE_SIZE];
+                        let mut e_delta = [F128::ZERO; STATE_SIZE];
+                        let mut s_base = [F128::ZERO; STATE_SIZE];
+                        let mut s_delta = [F128::ZERO; STATE_SIZE];
+                        for lane in 0..STATE_SIZE {
+                            e_base[lane] = e_tables[instance][lane][2 * p];
+                            e_delta[lane] = e_tables[instance][lane][2 * p]
+                                + e_tables[instance][lane][2 * p + 1];
+                            s_base[lane] = s_tables[instance][lane][2 * p];
+                            s_delta[lane] = s_tables[instance][lane][2 * p]
+                                + s_tables[instance][lane][2 * p + 1];
+                        }
+                        for (t, slot) in acc.iter_mut().enumerate() {
+                            let t_f = f128_of_u128(t as u128);
+                            let e_t: [F128; STATE_SIZE] =
+                                std::array::from_fn(|lane| e_base[lane] + t_f * e_delta[lane]);
+                            let s_t: [F128; STATE_SIZE] =
+                                std::array::from_fn(|lane| s_base[lane] + t_f * s_delta[lane]);
+                            let terms = layer_terms(q, &s_t);
+                            for lane in 0..STATE_SIZE {
+                                *slot += e_t[lane] * terms[lane];
+                            }
+                        }
+                        acc
+                    },
+                )
+                .reduce(
+                    || [F128::ZERO; WALK_DEGREE + 1],
+                    |mut left, right| {
+                        for (left, right) in left.iter_mut().zip(right) {
+                            *left += right;
+                        }
+                        left
+                    },
+                );
+            let full = interpolate(&evals);
+            debug_assert_eq!(full[0] + horner(&full, F128::ONE), claim);
+            let wire = compress(&full);
+            challenger.observe_f128_slice(&wire);
+            let challenge = challenger.sample_f128();
+            claim = horner(&full, challenge);
+            point.push(challenge);
+            round_coeffs.push(wire);
+            for instance in 0..s0_instances.len() {
+                for lane in 0..STATE_SIZE {
+                    fold_in_place(&mut e_tables[instance][lane], challenge);
+                    fold_in_place(&mut s_tables[instance][lane], challenge);
+                }
+            }
+        }
+
+        let next_values: Vec<[F128; STATE_SIZE]> = s_tables
+            .iter()
+            .map(|instance| std::array::from_fn(|lane| instance[lane][0]))
+            .collect();
+        let flat_next = next_values
+            .iter()
+            .flat_map(|values| values.iter().copied())
+            .collect::<Vec<_>>();
+        challenger.observe_f128_slice(&flat_next);
+
+        let mut expected = F128::ZERO;
+        for (((instance_groups, instance_weights), instance_e), instance_next) in
+            groups.iter().zip(&weights).zip(&e_tables).zip(&next_values)
+        {
+            let terms = layer_terms(q, instance_next);
+            for (group, lane_weights) in instance_groups.iter().zip(instance_weights) {
+                let columns = column_weights(q, lane_weights);
+                let eq = eq_eval(&group.point, &point);
+                let mut dot = F128::ZERO;
+                for lane in 0..STATE_SIZE {
+                    dot += columns[lane] * terms[lane];
+                }
+                expected += eq * dot;
+            }
+            debug_assert!(instance_e.iter().all(|table| table.len() == 1));
+        }
+        debug_assert_eq!(expected, claim, "layer {layer} prover-side final mismatch");
+
+        layers.push(MultiWalkLayerProof {
+            round_coeffs,
+            next_values: next_values.clone(),
+        });
+        groups = next_values
+            .into_iter()
+            .map(|values| {
+                vec![LaneClaimGroup {
+                    point: point.clone(),
+                    values,
+                }]
+            })
+            .collect();
+    }
+
+    let terminals = groups
+        .into_iter()
+        .map(|mut instance| instance.pop().expect("one terminal group per instance"))
+        .collect();
+    (MultiDeepChainWalkProof { layers }, terminals)
+}
+
+/// Prove independent walks with different dyadic widths using one aggregate
+/// sumcheck per Poseidon layer (ragged multi-walk V2).
+///
+/// Let instance `a` have width `w_a` and let `W = max_a w_a`.  Its transition
+/// relation is embedded into the `W`-variate aggregate as
+///
+/// ```text
+/// E_a(x_0..x_{w_a-1})
+///   * ∏_{j=w_a}^{W-1} (1 + x_j)
+///   * T(S_a(x_0..x_{w_a-1})).
+/// ```
+///
+/// Thus the original Boolean sum appears exactly once, at an all-zero high
+/// suffix.  `S_a` ignores (equivalently, repeats across) the high coordinates,
+/// but its four columns are never physically padded.  The degree bound remains
+/// `WALK_DEGREE = 8`: on a real coordinate, `E_a` is affine and the Poseidon
+/// transition has degree at most seven; on a high coordinate only the affine
+/// gate depends on that variable.  Summing instances cannot increase degree.
+///
+/// The proof has `W` round messages and one four-lane next value per instance.
+/// Returned terminal points are truncated back to their native `w_a`, so each
+/// one discharges directly against its original committed columns.
+pub fn prove_ragged_multi_deep_chain_walk<Ch: Challenger>(
+    s0_instances: &[&[Vec<F128>; STATE_SIZE]],
+    out_groups: &[Vec<LaneClaimGroup>],
+    challenger: &mut Ch,
+) -> (MultiDeepChainWalkProof, Vec<LaneClaimGroup>) {
+    assert!(!s0_instances.is_empty(), "at least one walk instance");
+    assert_eq!(
+        s0_instances.len(),
+        out_groups.len(),
+        "one claim-group list per walk instance"
+    );
+
+    let w_logs = s0_instances
+        .iter()
+        .map(|instance| {
+            let w = instance[0].len();
+            assert!(w.is_power_of_two(), "column length must be a power of two");
+            assert!(instance.iter().all(|column| column.len() == w));
+            w.trailing_zeros() as usize
+        })
+        .collect::<Vec<_>>();
+    let max_w_log = *w_logs.iter().max().expect("one walk instance");
+    for (&w_log, groups) in w_logs.iter().zip(out_groups) {
+        assert!(!groups.is_empty(), "every instance needs an output claim");
+        assert!(
+            groups.iter().all(|group| group.point.len() == w_log),
+            "claim point arity"
+        );
+    }
+
+    // Checkpoints retain each native width.  In particular, a smaller state
+    // is not cloned into a 2^W outer witness merely to share sumcheck rounds.
+    let checkpoints: Vec<Vec<[Vec<F128>; STATE_SIZE]>> = s0_instances
+        .iter()
+        .map(|&s0| {
+            let mut instance_checkpoints = vec![s0.clone()];
+            let mut current = s0.clone();
+            let mut q = 0usize;
+            while q < N_ROUNDS {
+                let step = CHECKPOINT_SPACING.min(N_ROUNDS - q);
+                for dq in 0..step {
+                    apply_round_columns(q + dq, &mut current);
+                }
+                q += step;
+                instance_checkpoints.push(current.clone());
+            }
+            instance_checkpoints
+        })
+        .collect();
+
+    absorb_ragged_multi_groups(challenger, &w_logs, out_groups);
+
+    let mut groups = out_groups.to_vec();
+    let mut layers = Vec::with_capacity(N_ROUNDS);
+    for layer in (1..=N_ROUNDS).rev() {
+        let q = layer - 1;
+        let alpha = challenger.sample_f128();
+        let total_groups = groups.iter().map(Vec::len).sum();
+        let flat_weights = lane_weight_table(alpha, total_groups);
+        let mut weight_cursor = 0usize;
+        let weights: Vec<Vec<[F128; STATE_SIZE]>> = groups
+            .iter()
+            .map(|instance| {
+                let end = weight_cursor + instance.len();
+                let instance_weights = flat_weights[weight_cursor..end].to_vec();
+                weight_cursor = end;
+                instance_weights
+            })
+            .collect();
+        debug_assert_eq!(weight_cursor, flat_weights.len());
+
+        let mut claim = F128::ZERO;
+        let mut e_tables: Vec<[Vec<F128>; STATE_SIZE]> = w_logs
+            .iter()
+            .map(|&w_log| {
+                let w = 1usize << w_log;
+                std::array::from_fn(|_| vec![F128::ZERO; w])
+            })
+            .collect();
+        for ((instance_groups, instance_weights), instance_e) in
+            groups.iter().zip(&weights).zip(&mut e_tables)
+        {
+            for (group, lane_weights) in instance_groups.iter().zip(instance_weights) {
+                for lane in 0..STATE_SIZE {
+                    claim += lane_weights[lane] * group.values[lane];
+                }
+                let columns = column_weights(q, lane_weights);
+                let eq = build_eq_table(&group.point);
+                for lane in 0..STATE_SIZE {
+                    if columns[lane] == F128::ZERO {
+                        continue;
+                    }
+                    instance_e[lane]
+                        .par_iter_mut()
+                        .zip(eq.par_iter())
+                        .for_each(|(slot, eq)| *slot += columns[lane] * *eq);
+                }
+            }
+        }
+
+        let mut s_tables: Vec<[Vec<F128>; STATE_SIZE]> = checkpoints
+            .iter()
+            .map(|instance_checkpoints| {
+                let checkpoint = q / CHECKPOINT_SPACING;
+                let mut columns = instance_checkpoints[checkpoint].clone();
+                for round in checkpoint * CHECKPOINT_SPACING..q {
+                    apply_round_columns(round, &mut columns);
+                }
+                columns
+            })
+            .collect();
+
+        let mut round_coeffs = Vec::with_capacity(max_w_log);
+        let mut point = Vec::with_capacity(max_w_log);
+        for round in 0..max_w_log {
+            // A native coordinate contributes one work item per Boolean pair.
+            // Once an instance is exhausted, one analytical item represents
+            // its `(1 + x_round)` alignment gate while S stays constant.
+            let work_lengths = w_logs
+                .iter()
+                .enumerate()
+                .map(|(instance, &w_log)| {
+                    if round < w_log {
+                        e_tables[instance][0].len() / 2
+                    } else {
+                        1
+                    }
+                })
+                .collect::<Vec<_>>();
+            let mut work_offsets = Vec::with_capacity(work_lengths.len() + 1);
+            work_offsets.push(0usize);
+            for &len in &work_lengths {
+                let next = work_offsets.last().copied().unwrap() + len;
+                work_offsets.push(next);
+            }
+            let total_work = *work_offsets.last().unwrap();
+            let evals = (0..total_work)
+                .into_par_iter()
+                .fold(
+                    || [F128::ZERO; WALK_DEGREE + 1],
+                    |mut acc, work_index| {
+                        let instance =
+                            work_offsets.partition_point(|&offset| offset <= work_index) - 1;
+                        let p = work_index - work_offsets[instance];
+                        let native_coordinate = round < w_logs[instance];
+                        let mut e_base = [F128::ZERO; STATE_SIZE];
+                        let mut e_delta = [F128::ZERO; STATE_SIZE];
+                        let mut s_base = [F128::ZERO; STATE_SIZE];
+                        let mut s_delta = [F128::ZERO; STATE_SIZE];
+                        for lane in 0..STATE_SIZE {
+                            if native_coordinate {
+                                e_base[lane] = e_tables[instance][lane][2 * p];
+                                e_delta[lane] = e_tables[instance][lane][2 * p]
+                                    + e_tables[instance][lane][2 * p + 1];
+                                s_base[lane] = s_tables[instance][lane][2 * p];
+                                s_delta[lane] = s_tables[instance][lane][2 * p]
+                                    + s_tables[instance][lane][2 * p + 1];
+                            } else {
+                                debug_assert_eq!(e_tables[instance][lane].len(), 1);
+                                debug_assert_eq!(s_tables[instance][lane].len(), 1);
+                                e_base[lane] = e_tables[instance][lane][0];
+                                // e * (1 + t) = e + t*e in characteristic 2.
+                                e_delta[lane] = e_tables[instance][lane][0];
+                                s_base[lane] = s_tables[instance][lane][0];
+                            }
+                        }
+                        for (t, slot) in acc.iter_mut().enumerate() {
+                            let t_f = f128_of_u128(t as u128);
+                            let e_t: [F128; STATE_SIZE] =
+                                std::array::from_fn(|lane| e_base[lane] + t_f * e_delta[lane]);
+                            let s_t: [F128; STATE_SIZE] =
+                                std::array::from_fn(|lane| s_base[lane] + t_f * s_delta[lane]);
+                            let terms = layer_terms(q, &s_t);
+                            for lane in 0..STATE_SIZE {
+                                *slot += e_t[lane] * terms[lane];
+                            }
+                        }
+                        acc
+                    },
+                )
+                .reduce(
+                    || [F128::ZERO; WALK_DEGREE + 1],
+                    |mut left, right| {
+                        for (left, right) in left.iter_mut().zip(right) {
+                            *left += right;
+                        }
+                        left
+                    },
+                );
+            let full = interpolate(&evals);
+            debug_assert_eq!(
+                full[0] + horner(&full, F128::ONE),
+                claim,
+                "ragged layer {layer}, coordinate {round} Boolean sum"
+            );
+            let wire = compress(&full);
+            challenger.observe_f128_slice(&wire);
+            let challenge = challenger.sample_f128();
+            claim = horner(&full, challenge);
+            point.push(challenge);
+            round_coeffs.push(wire);
+            for (instance, &w_log) in w_logs.iter().enumerate() {
+                for lane in 0..STATE_SIZE {
+                    if round < w_log {
+                        fold_in_place(&mut e_tables[instance][lane], challenge);
+                        fold_in_place(&mut s_tables[instance][lane], challenge);
+                    } else {
+                        e_tables[instance][lane][0] *= F128::ONE + challenge;
+                    }
+                }
+            }
+        }
+
+        let next_values: Vec<[F128; STATE_SIZE]> = s_tables
+            .iter()
+            .map(|instance| std::array::from_fn(|lane| instance[lane][0]))
+            .collect();
+        let flat_next = next_values
+            .iter()
+            .flat_map(|values| values.iter().copied())
+            .collect::<Vec<_>>();
+        challenger.observe_f128_slice(&flat_next);
+
+        let mut expected = F128::ZERO;
+        for (instance, ((instance_groups, instance_weights), instance_next)) in
+            groups.iter().zip(&weights).zip(&next_values).enumerate()
+        {
+            let terms = layer_terms(q, instance_next);
+            let w_log = w_logs[instance];
+            let mut high_gate = F128::ONE;
+            for &coordinate in &point[w_log..] {
+                high_gate *= F128::ONE + coordinate;
+            }
+            for (group, lane_weights) in instance_groups.iter().zip(instance_weights) {
+                let columns = column_weights(q, lane_weights);
+                let aligned_eq = eq_eval(&group.point, &point[..w_log]) * high_gate;
+                let mut dot = F128::ZERO;
+                for lane in 0..STATE_SIZE {
+                    dot += columns[lane] * terms[lane];
+                }
+                expected += aligned_eq * dot;
+            }
+            debug_assert!(e_tables[instance].iter().all(|table| table.len() == 1));
+        }
+        debug_assert_eq!(
+            expected, claim,
+            "ragged layer {layer} prover-side final mismatch"
+        );
+
+        layers.push(MultiWalkLayerProof {
+            round_coeffs,
+            next_values: next_values.clone(),
+        });
+        groups = next_values
+            .into_iter()
+            .enumerate()
+            .map(|(instance, values)| {
+                vec![LaneClaimGroup {
+                    point: point[..w_logs[instance]].to_vec(),
+                    values,
+                }]
+            })
+            .collect();
+    }
+
+    let terminals = groups
+        .into_iter()
+        .map(|mut instance| instance.pop().expect("one terminal group per instance"))
+        .collect();
+    (MultiDeepChainWalkProof { layers }, terminals)
+}
+
 fn apply_round_columns(q: usize, cols: &mut [Vec<F128>; STATE_SIZE]) {
     let w = cols[0].len();
     let mut out: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; w]);
@@ -552,8 +1136,7 @@ fn apply_round_columns(q: usize, cols: &mut [Vec<F128>; STATE_SIZE]) {
             .for_each(|(c, slots)| {
                 for (dw, slot) in slots.iter_mut().enumerate() {
                     let widx = c * chunk + dw;
-                    let state: [F128; STATE_SIZE] =
-                        std::array::from_fn(|j| cols[j][widx]);
+                    let state: [F128; STATE_SIZE] = std::array::from_fn(|j| cols[j][widx]);
                     *slot = apply_round(q, state)[i];
                 }
             });
@@ -590,10 +1173,7 @@ pub fn verify_deep_chain_walk<Ch: Challenger>(
     if out_groups.is_empty()
         || out_groups.iter().any(|g| g.point.len() != w_log)
         || proof.layers.len() != N_ROUNDS
-        || proof
-            .layers
-            .iter()
-            .any(|l| l.round_coeffs.len() != w_log)
+        || proof.layers.iter().any(|l| l.round_coeffs.len() != w_log)
     {
         return Err(WalkError::Shape);
     }
@@ -649,6 +1229,229 @@ pub fn verify_deep_chain_walk<Ch: Challenger>(
     Ok(groups.pop().expect("one terminal group"))
 }
 
+/// Verify an equal-`w_log` V1 multi-instance walk and return one terminal
+/// layer-0 claim per instance.
+pub fn verify_multi_deep_chain_walk<Ch: Challenger>(
+    w_log: usize,
+    out_groups: &[Vec<LaneClaimGroup>],
+    proof: &MultiDeepChainWalkProof,
+    challenger: &mut Ch,
+) -> Result<Vec<LaneClaimGroup>, WalkError> {
+    let instances = out_groups.len();
+    if instances == 0
+        || out_groups.iter().any(|groups| {
+            groups.is_empty() || groups.iter().any(|group| group.point.len() != w_log)
+        })
+        || proof.layers.len() != N_ROUNDS
+        || proof
+            .layers
+            .iter()
+            .any(|layer| layer.round_coeffs.len() != w_log || layer.next_values.len() != instances)
+    {
+        return Err(WalkError::Shape);
+    }
+
+    absorb_multi_groups(challenger, out_groups);
+
+    let mut groups = out_groups.to_vec();
+    for (layer_index, layer_proof) in proof.layers.iter().enumerate() {
+        let layer = N_ROUNDS - layer_index;
+        let q = layer - 1;
+        let alpha = challenger.sample_f128();
+        let total_groups = groups.iter().map(Vec::len).sum();
+        let flat_weights = lane_weight_table(alpha, total_groups);
+        let mut weight_cursor = 0usize;
+        let weights: Vec<Vec<[F128; STATE_SIZE]>> = groups
+            .iter()
+            .map(|instance| {
+                let end = weight_cursor + instance.len();
+                let instance_weights = flat_weights[weight_cursor..end].to_vec();
+                weight_cursor = end;
+                instance_weights
+            })
+            .collect();
+        debug_assert_eq!(weight_cursor, flat_weights.len());
+
+        let mut claim = F128::ZERO;
+        for (instance_groups, instance_weights) in groups.iter().zip(&weights) {
+            for (group, lane_weights) in instance_groups.iter().zip(instance_weights) {
+                for lane in 0..STATE_SIZE {
+                    claim += lane_weights[lane] * group.values[lane];
+                }
+            }
+        }
+
+        let mut point = Vec::with_capacity(w_log);
+        for wire in &layer_proof.round_coeffs {
+            challenger.observe_f128_slice(wire);
+            let full = reconstruct(wire, claim);
+            let challenge = challenger.sample_f128();
+            claim = horner(&full, challenge);
+            point.push(challenge);
+        }
+        let flat_next = layer_proof
+            .next_values
+            .iter()
+            .flat_map(|values| values.iter().copied())
+            .collect::<Vec<_>>();
+        challenger.observe_f128_slice(&flat_next);
+
+        let mut expected = F128::ZERO;
+        for ((instance_groups, instance_weights), instance_next) in
+            groups.iter().zip(&weights).zip(&layer_proof.next_values)
+        {
+            let terms = layer_terms(q, instance_next);
+            for (group, lane_weights) in instance_groups.iter().zip(instance_weights) {
+                let columns = column_weights(q, lane_weights);
+                let eq = eq_eval(&group.point, &point);
+                let mut dot = F128::ZERO;
+                for lane in 0..STATE_SIZE {
+                    dot += columns[lane] * terms[lane];
+                }
+                expected += eq * dot;
+            }
+        }
+        if expected != claim {
+            return Err(WalkError::LayerMismatch(layer));
+        }
+
+        groups = layer_proof
+            .next_values
+            .iter()
+            .map(|values| {
+                vec![LaneClaimGroup {
+                    point: point.clone(),
+                    values: *values,
+                }]
+            })
+            .collect();
+    }
+
+    Ok(groups
+        .into_iter()
+        .map(|mut instance| instance.pop().expect("one terminal group per instance"))
+        .collect())
+}
+
+/// Verify a ragged-domain V2 multi-instance walk.
+///
+/// `w_logs[a]` is instance `a`'s committed-column width.  The verifier
+/// derives `W = max(w_logs)`, checks exactly `W` aggregate rounds, and aligns
+/// every smaller relation with an all-zero high-coordinate suffix.  See
+/// [`prove_ragged_multi_deep_chain_walk`] for the embedded relation and degree
+/// argument.
+pub fn verify_ragged_multi_deep_chain_walk<Ch: Challenger>(
+    w_logs: &[usize],
+    out_groups: &[Vec<LaneClaimGroup>],
+    proof: &MultiDeepChainWalkProof,
+    challenger: &mut Ch,
+) -> Result<Vec<LaneClaimGroup>, WalkError> {
+    let instances = out_groups.len();
+    if instances == 0 || w_logs.len() != instances {
+        return Err(WalkError::Shape);
+    }
+    let max_w_log = *w_logs.iter().max().ok_or(WalkError::Shape)?;
+    if out_groups.iter().zip(w_logs).any(|(groups, &w_log)| {
+        groups.is_empty() || groups.iter().any(|group| group.point.len() != w_log)
+    }) || proof.layers.len() != N_ROUNDS
+        || proof.layers.iter().any(|layer| {
+            layer.round_coeffs.len() != max_w_log || layer.next_values.len() != instances
+        })
+    {
+        return Err(WalkError::Shape);
+    }
+
+    absorb_ragged_multi_groups(challenger, w_logs, out_groups);
+
+    let mut groups = out_groups.to_vec();
+    for (layer_index, layer_proof) in proof.layers.iter().enumerate() {
+        let layer = N_ROUNDS - layer_index;
+        let q = layer - 1;
+        let alpha = challenger.sample_f128();
+        let total_groups = groups.iter().map(Vec::len).sum();
+        let flat_weights = lane_weight_table(alpha, total_groups);
+        let mut weight_cursor = 0usize;
+        let weights: Vec<Vec<[F128; STATE_SIZE]>> = groups
+            .iter()
+            .map(|instance| {
+                let end = weight_cursor + instance.len();
+                let instance_weights = flat_weights[weight_cursor..end].to_vec();
+                weight_cursor = end;
+                instance_weights
+            })
+            .collect();
+        debug_assert_eq!(weight_cursor, flat_weights.len());
+
+        let mut claim = F128::ZERO;
+        for (instance_groups, instance_weights) in groups.iter().zip(&weights) {
+            for (group, lane_weights) in instance_groups.iter().zip(instance_weights) {
+                for lane in 0..STATE_SIZE {
+                    claim += lane_weights[lane] * group.values[lane];
+                }
+            }
+        }
+
+        let mut point = Vec::with_capacity(max_w_log);
+        for wire in &layer_proof.round_coeffs {
+            challenger.observe_f128_slice(wire);
+            let full = reconstruct(wire, claim);
+            let challenge = challenger.sample_f128();
+            claim = horner(&full, challenge);
+            point.push(challenge);
+        }
+        let flat_next = layer_proof
+            .next_values
+            .iter()
+            .flat_map(|values| values.iter().copied())
+            .collect::<Vec<_>>();
+        challenger.observe_f128_slice(&flat_next);
+
+        let mut expected = F128::ZERO;
+        for (instance, ((instance_groups, instance_weights), instance_next)) in groups
+            .iter()
+            .zip(&weights)
+            .zip(&layer_proof.next_values)
+            .enumerate()
+        {
+            let terms = layer_terms(q, instance_next);
+            let w_log = w_logs[instance];
+            let mut high_gate = F128::ONE;
+            for &coordinate in &point[w_log..] {
+                high_gate *= F128::ONE + coordinate;
+            }
+            for (group, lane_weights) in instance_groups.iter().zip(instance_weights) {
+                let columns = column_weights(q, lane_weights);
+                let aligned_eq = eq_eval(&group.point, &point[..w_log]) * high_gate;
+                let mut dot = F128::ZERO;
+                for lane in 0..STATE_SIZE {
+                    dot += columns[lane] * terms[lane];
+                }
+                expected += aligned_eq * dot;
+            }
+        }
+        if expected != claim {
+            return Err(WalkError::LayerMismatch(layer));
+        }
+
+        groups = layer_proof
+            .next_values
+            .iter()
+            .enumerate()
+            .map(|(instance, values)| {
+                vec![LaneClaimGroup {
+                    point: point[..w_logs[instance]].to_vec(),
+                    values: *values,
+                }]
+            })
+            .collect();
+    }
+
+    Ok(groups
+        .into_iter()
+        .map(|mut instance| instance.pop().expect("one terminal group per instance"))
+        .collect())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -702,6 +1505,76 @@ mod tests {
             }
         }
         out
+    }
+
+    fn multi_walk_fixture(
+        w_log: usize,
+    ) -> (Vec<[Vec<F128>; STATE_SIZE]>, Vec<Vec<LaneClaimGroup>>) {
+        let instances = vec![
+            random_columns(w_log, 0xB471_0001),
+            random_columns(w_log, 0xB471_0002),
+        ];
+        let outputs = instances.iter().map(output_columns).collect::<Vec<_>>();
+        let mut rng = Rng(0xB471_F5);
+        let groups = outputs
+            .iter()
+            .enumerate()
+            .map(|(instance, output)| {
+                (0..=instance)
+                    .map(|_| {
+                        let point = (0..w_log).map(|_| rng.f128()).collect::<Vec<_>>();
+                        let values = std::array::from_fn(|lane| mle_eval(&output[lane], &point));
+                        LaneClaimGroup { point, values }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        (instances, groups)
+    }
+
+    fn ragged_multi_walk_fixture(
+        w_logs: &[usize],
+    ) -> (Vec<[Vec<F128>; STATE_SIZE]>, Vec<Vec<LaneClaimGroup>>) {
+        let instances = w_logs
+            .iter()
+            .enumerate()
+            .map(|(instance, &w_log)| random_columns(w_log, 0xA11D_0000 + instance as u64))
+            .collect::<Vec<_>>();
+        let outputs = instances.iter().map(output_columns).collect::<Vec<_>>();
+        let mut rng = Rng(0xA11D_F5);
+        let groups = outputs
+            .iter()
+            .zip(w_logs)
+            .enumerate()
+            .map(|(instance, (output, &w_log))| {
+                (0..=instance % 2)
+                    .map(|_| {
+                        let point = (0..w_log).map(|_| rng.f128()).collect::<Vec<_>>();
+                        let values = std::array::from_fn(|lane| mle_eval(&output[lane], &point));
+                        LaneClaimGroup { point, values }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        (instances, groups)
+    }
+
+    fn multi_walk_terminals_are_honest(
+        w_log: usize,
+        instances: &[[Vec<F128>; STATE_SIZE]],
+        groups: &[Vec<LaneClaimGroup>],
+        proof: &MultiDeepChainWalkProof,
+    ) -> bool {
+        let mut challenger = FsLaneChallenger::new(b"deep-chain-multi-test");
+        let Ok(terminals) = verify_multi_deep_chain_walk(w_log, groups, proof, &mut challenger)
+        else {
+            return false;
+        };
+        terminals.len() == instances.len()
+            && terminals.iter().zip(instances).all(|(terminal, s0)| {
+                (0..STATE_SIZE)
+                    .all(|lane| mle_eval(&s0[lane], &terminal.point) == terminal.values[lane])
+            })
     }
 
     /// The layer schedule composed with `initial_mds` IS the production
@@ -771,6 +1644,326 @@ mod tests {
         }
     }
 
+    #[test]
+    fn multi_instance_walk_roundtrip_and_transcript_lockstep() {
+        let w_log = 3;
+        let (instances, groups) = multi_walk_fixture(w_log);
+        let instance_refs = instances.iter().collect::<Vec<_>>();
+        let mut prover_channel = FsLaneChallenger::new(b"deep-chain-multi-test");
+        let (proof, prover_terminals) =
+            prove_multi_deep_chain_walk(&instance_refs, &groups, &mut prover_channel);
+
+        assert_eq!(proof.layers.len(), N_ROUNDS);
+        assert!(proof.layers.iter().all(|layer| {
+            layer.round_coeffs.len() == w_log && layer.next_values.len() == instances.len()
+        }));
+        let mut verifier_channel = FsLaneChallenger::new(b"deep-chain-multi-test");
+        let verifier_terminals =
+            verify_multi_deep_chain_walk(w_log, &groups, &proof, &mut verifier_channel)
+                .expect("honest multi-instance walk");
+        assert_eq!(prover_terminals, verifier_terminals);
+        assert_eq!(
+            prover_channel.sample_f128(),
+            verifier_channel.sample_f128(),
+            "multi-walk transcript lockstep"
+        );
+        assert!(multi_walk_terminals_are_honest(
+            w_log, &instances, &groups, &proof
+        ));
+    }
+
+    #[test]
+    fn multi_instance_walk_rejects_mutation_swap_and_shape_drift() {
+        let w_log = 2;
+        let (instances, groups) = multi_walk_fixture(w_log);
+        let instance_refs = instances.iter().collect::<Vec<_>>();
+        let mut prover_channel = FsLaneChallenger::new(b"deep-chain-multi-test");
+        let (proof, _) = prove_multi_deep_chain_walk(&instance_refs, &groups, &mut prover_channel);
+
+        let mut bad_coeff = proof.clone();
+        bad_coeff.layers[N_ROUNDS / 2].round_coeffs[1][3] += F128::ONE;
+        assert!(!multi_walk_terminals_are_honest(
+            w_log, &instances, &groups, &bad_coeff
+        ));
+
+        let mut bad_instance = proof.clone();
+        bad_instance.layers[1].next_values[1][2] += F128::ONE;
+        assert!(!multi_walk_terminals_are_honest(
+            w_log,
+            &instances,
+            &groups,
+            &bad_instance
+        ));
+
+        let mut swapped = proof.clone();
+        swapped.layers[N_ROUNDS / 3].next_values.swap(0, 1);
+        assert!(!multi_walk_terminals_are_honest(
+            w_log, &instances, &groups, &swapped
+        ));
+
+        let mut malformed = proof.clone();
+        malformed.layers[0].next_values.pop();
+        let mut verifier_channel = FsLaneChallenger::new(b"deep-chain-multi-test");
+        assert_eq!(
+            verify_multi_deep_chain_walk(w_log, &groups, &malformed, &mut verifier_channel),
+            Err(WalkError::Shape)
+        );
+    }
+
+    #[test]
+    fn multi_instance_transcript_binds_group_boundaries() {
+        let w_log = 2;
+        let (_, groups) = multi_walk_fixture(w_log);
+        assert_eq!(groups.iter().map(Vec::len).collect::<Vec<_>>(), [1, 2]);
+        let flat = groups.iter().flatten().cloned().collect::<Vec<_>>();
+        let repartitioned = vec![flat[..2].to_vec(), flat[2..].to_vec()];
+
+        let mut canonical = FsLaneChallenger::new(b"deep-chain-multi-test");
+        absorb_multi_groups(&mut canonical, &groups);
+        let canonical_challenge = canonical.sample_f128();
+        let mut drifted = FsLaneChallenger::new(b"deep-chain-multi-test");
+        absorb_multi_groups(&mut drifted, &repartitioned);
+        let drifted_challenge = drifted.sample_f128();
+        assert_ne!(
+            canonical_challenge, drifted_challenge,
+            "instance/group boundary repartition left transcript unchanged"
+        );
+    }
+
+    #[test]
+    fn ragged_multi_instance_roundtrip_lockstep_and_individual_differential() {
+        let w_logs = [1usize, 3, 2];
+        let max_w_log = *w_logs.iter().max().unwrap();
+        let (instances, groups) = ragged_multi_walk_fixture(&w_logs);
+        let instance_refs = instances.iter().collect::<Vec<_>>();
+
+        let mut prover_channel = FsLaneChallenger::new(b"deep-chain-ragged-multi-test");
+        let (proof, prover_terminals) =
+            prove_ragged_multi_deep_chain_walk(&instance_refs, &groups, &mut prover_channel);
+        assert!(proof.layers.iter().all(|layer| {
+            layer.round_coeffs.len() == max_w_log && layer.next_values.len() == instances.len()
+        }));
+
+        let mut verifier_channel = FsLaneChallenger::new(b"deep-chain-ragged-multi-test");
+        let verifier_terminals =
+            verify_ragged_multi_deep_chain_walk(&w_logs, &groups, &proof, &mut verifier_channel)
+                .expect("honest ragged multi-instance walk");
+        assert_eq!(prover_terminals, verifier_terminals);
+        assert_eq!(
+            prover_channel.sample_f128(),
+            verifier_channel.sample_f128(),
+            "ragged multi-walk transcript lockstep"
+        );
+
+        // Differential baseline: each exact same output claim also survives
+        // its ordinary native-width walk, and both protocols return claims
+        // that discharge against the same unpadded input columns.
+        for (instance, (((s0, instance_groups), &w_log), ragged_terminal)) in instances
+            .iter()
+            .zip(&groups)
+            .zip(&w_logs)
+            .zip(&verifier_terminals)
+            .enumerate()
+        {
+            assert_eq!(ragged_terminal.point.len(), w_log);
+            for lane in 0..STATE_SIZE {
+                assert_eq!(
+                    mle_eval(&s0[lane], &ragged_terminal.point),
+                    ragged_terminal.values[lane],
+                    "ragged terminal {instance}, lane {lane}"
+                );
+            }
+
+            let mut individual_prover = FsLaneChallenger::new(b"deep-chain-ragged-individual-test");
+            let (individual_proof, individual_terminal_p) =
+                prove_deep_chain_walk(s0, instance_groups, &mut individual_prover);
+            let mut individual_verifier =
+                FsLaneChallenger::new(b"deep-chain-ragged-individual-test");
+            let individual_terminal_v = verify_deep_chain_walk(
+                w_log,
+                instance_groups,
+                &individual_proof,
+                &mut individual_verifier,
+            )
+            .expect("individual differential walk");
+            assert_eq!(individual_terminal_p, individual_terminal_v);
+            for lane in 0..STATE_SIZE {
+                assert_eq!(
+                    mle_eval(&s0[lane], &individual_terminal_v.point),
+                    individual_terminal_v.values[lane],
+                    "individual terminal {instance}, lane {lane}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ragged_multi_instance_rejects_mutation_swap_and_shape_drift() {
+        let w_logs = [1usize, 3];
+        let (instances, groups) = ragged_multi_walk_fixture(&w_logs);
+        let instance_refs = instances.iter().collect::<Vec<_>>();
+        let mut prover_channel = FsLaneChallenger::new(b"deep-chain-ragged-multi-test");
+        let (proof, _) =
+            prove_ragged_multi_deep_chain_walk(&instance_refs, &groups, &mut prover_channel);
+
+        let honest_terminals = |candidate: &MultiDeepChainWalkProof| {
+            let mut verifier = FsLaneChallenger::new(b"deep-chain-ragged-multi-test");
+            let Ok(terminals) =
+                verify_ragged_multi_deep_chain_walk(&w_logs, &groups, candidate, &mut verifier)
+            else {
+                return false;
+            };
+            terminals.iter().zip(&instances).all(|(terminal, s0)| {
+                (0..STATE_SIZE)
+                    .all(|lane| mle_eval(&s0[lane], &terminal.point) == terminal.values[lane])
+            })
+        };
+        assert!(honest_terminals(&proof));
+
+        let mut bad_coeff = proof.clone();
+        bad_coeff.layers[N_ROUNDS / 2].round_coeffs[2][3] += F128::ONE;
+        assert!(!honest_terminals(&bad_coeff));
+
+        let mut bad_instance = proof.clone();
+        bad_instance.layers[1].next_values[0][2] += F128::ONE;
+        assert!(!honest_terminals(&bad_instance));
+
+        let mut swapped = proof.clone();
+        swapped.layers[N_ROUNDS / 3].next_values.swap(0, 1);
+        assert!(!honest_terminals(&swapped));
+
+        let mut malformed = proof.clone();
+        malformed.layers[0].round_coeffs.pop();
+        let mut malformed_channel = FsLaneChallenger::new(b"deep-chain-ragged-multi-test");
+        assert_eq!(
+            verify_ragged_multi_deep_chain_walk(
+                &w_logs,
+                &groups,
+                &malformed,
+                &mut malformed_channel,
+            ),
+            Err(WalkError::Shape)
+        );
+
+        // Swapping complete instance metadata is still a different ordered
+        // authority.  The original proof cannot be replayed under it.
+        let swapped_w_logs = [w_logs[1], w_logs[0]];
+        let swapped_groups = vec![groups[1].clone(), groups[0].clone()];
+        let mut swapped_channel = FsLaneChallenger::new(b"deep-chain-ragged-multi-test");
+        assert!(verify_ragged_multi_deep_chain_walk(
+            &swapped_w_logs,
+            &swapped_groups,
+            &proof,
+            &mut swapped_channel,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn ragged_multi_transcript_binds_ordered_widths_and_group_counts() {
+        let w_logs = [1usize, 3];
+        let (_, groups) = ragged_multi_walk_fixture(&w_logs);
+
+        let mut canonical = FsLaneChallenger::new(b"deep-chain-ragged-multi-test");
+        absorb_ragged_multi_groups(&mut canonical, &w_logs, &groups);
+        let canonical_challenge = canonical.sample_f128();
+
+        let mut width_drift = FsLaneChallenger::new(b"deep-chain-ragged-multi-test");
+        absorb_ragged_multi_groups(&mut width_drift, &[3, 1], &groups);
+        assert_ne!(canonical_challenge, width_drift.sample_f128());
+
+        let flat = groups.iter().flatten().cloned().collect::<Vec<_>>();
+        let repartitioned = vec![flat[..2].to_vec(), flat[2..].to_vec()];
+        let mut group_drift = FsLaneChallenger::new(b"deep-chain-ragged-multi-test");
+        absorb_ragged_multi_groups(&mut group_drift, &w_logs, &repartitioned);
+        assert_ne!(canonical_challenge, group_drift.sample_f128());
+    }
+
+    #[test]
+    fn ragged_alignment_preserves_degree_eight_bound() {
+        let mut rng = Rng(0xDE6E_E8);
+        for q in [0usize, N_ROUNDS / 2] {
+            let e_base: [F128; STATE_SIZE] = std::array::from_fn(|_| rng.f128());
+            let e_delta: [F128; STATE_SIZE] = std::array::from_fn(|_| rng.f128());
+            let s_base: [F128; STATE_SIZE] = std::array::from_fn(|_| rng.f128());
+            let s_delta: [F128; STATE_SIZE] = std::array::from_fn(|_| rng.f128());
+            let native_eval = |t: usize| {
+                let t = f128_of_u128(t as u128);
+                let e: [F128; STATE_SIZE] =
+                    std::array::from_fn(|lane| e_base[lane] + t * e_delta[lane]);
+                let s: [F128; STATE_SIZE] =
+                    std::array::from_fn(|lane| s_base[lane] + t * s_delta[lane]);
+                let terms = layer_terms(q, &s);
+                (0..STATE_SIZE).fold(F128::ZERO, |acc, lane| acc + e[lane] * terms[lane])
+            };
+            let evals = std::array::from_fn(native_eval);
+            let coeffs = interpolate(&evals);
+            for t in [9usize, 10] {
+                assert_eq!(
+                    horner(&coeffs, f128_of_u128(t as u128)),
+                    native_eval(t),
+                    "native-coordinate transition exceeded degree eight"
+                );
+            }
+
+            let state: [F128; STATE_SIZE] = std::array::from_fn(|_| rng.f128());
+            let high_e: [F128; STATE_SIZE] = std::array::from_fn(|_| rng.f128());
+            let terms = layer_terms(q, &state);
+            let high_evals = std::array::from_fn(|t| {
+                let gate = F128::ONE + f128_of_u128(t as u128);
+                (0..STATE_SIZE).fold(F128::ZERO, |acc, lane| {
+                    acc + high_e[lane] * gate * terms[lane]
+                })
+            });
+            let high_coeffs = interpolate(&high_evals);
+            assert!(
+                high_coeffs[2..]
+                    .iter()
+                    .all(|coefficient| *coefficient == F128::ZERO),
+                "alignment-only coordinate exceeded affine degree"
+            );
+        }
+    }
+
+    #[test]
+    fn ragged_implicit_alignment_matches_explicit_tables() {
+        let w_log = 2usize;
+        let max_w_log = 4usize;
+        let w = 1usize << w_log;
+        let max_w = 1usize << max_w_log;
+        let mut rng = Rng(0xE7A1_16E0);
+        let state = (0..w).map(|_| rng.f128()).collect::<Vec<_>>();
+        let claim_point = (0..w_log).map(|_| rng.f128()).collect::<Vec<_>>();
+        let aggregate_point = (0..max_w_log).map(|_| rng.f128()).collect::<Vec<_>>();
+
+        // S repeats across every high-bit block; no padded copy is used by
+        // the actual prover, but this materialized reference locks the exact
+        // coordinate convention down.
+        let explicit_state = (0..max_w)
+            .map(|index| state[index & (w - 1)])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            mle_eval(&explicit_state, &aggregate_point),
+            mle_eval(&state, &aggregate_point[..w_log]),
+            "implicit state high-coordinate ignore != explicit repetition"
+        );
+
+        // E occupies only the first (all-zero high suffix) block.  Its MLE is
+        // exactly low-equality times the product of zero-selecting high gates.
+        let low_eq_table = build_eq_table(&claim_point);
+        let mut explicit_e = vec![F128::ZERO; max_w];
+        explicit_e[..w].copy_from_slice(&low_eq_table);
+        let mut high_gate = F128::ONE;
+        for &coordinate in &aggregate_point[w_log..] {
+            high_gate *= F128::ONE + coordinate;
+        }
+        assert_eq!(
+            mle_eval(&explicit_e, &aggregate_point),
+            eq_eval(&claim_point, &aggregate_point[..w_log]) * high_gate,
+            "implicit E high gate != explicit first-block zero extension"
+        );
+    }
+
     /// A forged output claim yields a walk whose terminal claim is FALSE
     /// against the true input columns — the discharge (committed-column
     /// opening) is what catches it, exactly as designed.
@@ -781,8 +1974,7 @@ mod tests {
         let out = output_columns(&s0);
         let mut rng = Rng(0x21FF);
         let point: Vec<F128> = (0..w_log).map(|_| rng.f128()).collect();
-        let mut values: [F128; STATE_SIZE] =
-            std::array::from_fn(|j| mle_eval(&out[j], &point));
+        let mut values: [F128; STATE_SIZE] = std::array::from_fn(|j| mle_eval(&out[j], &point));
         values[2] += F128::ONE;
         let groups = [LaneClaimGroup { point, values }];
 
@@ -795,9 +1987,12 @@ mod tests {
             // ...or the surviving terminal claim must be FALSE against the
             // true input columns, so the committed-column discharge kills it.
             Ok(claim) => {
-                let honest = (0..STATE_SIZE)
-                    .all(|j| mle_eval(&s0[j], &claim.point) == claim.values[j]);
-                assert!(!honest, "forged output claim survived to an honest terminal");
+                let honest =
+                    (0..STATE_SIZE).all(|j| mle_eval(&s0[j], &claim.point) == claim.values[j]);
+                assert!(
+                    !honest,
+                    "forged output claim survived to an honest terminal"
+                );
             }
         }
     }
@@ -828,9 +2023,8 @@ mod tests {
                     match verify_deep_chain_walk(w_log, &groups, &bad, &mut ch) {
                         Err(_) => {}
                         Ok(claim) => {
-                            let honest = (0..STATE_SIZE).all(|j| {
-                                mle_eval(&s0[j], &claim.point) == claim.values[j]
-                            });
+                            let honest = (0..STATE_SIZE)
+                                .all(|j| mle_eval(&s0[j], &claim.point) == claim.values[j]);
                             if honest {
                                 survivors.push((li, round, coeff));
                             }
@@ -854,7 +2048,10 @@ mod tests {
                 }
             }
         }
-        assert!(survivors.is_empty(), "walk mutation survivors: {survivors:?}");
+        assert!(
+            survivors.is_empty(),
+            "walk mutation survivors: {survivors:?}"
+        );
     }
 
     #[test]

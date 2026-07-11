@@ -81,8 +81,20 @@ pub struct FixedFieldHashProofKillShot {
 
 impl FixedFieldHashProofKillShot {
     pub fn byte_len(&self) -> usize {
-        let main_polys = self.kill_shot.main.round_polys.len() * 10 * 16;
-        let shift_polys = self.kill_shot.shift.round_polys.len() * 3 * 16;
+        let main_polys = self
+            .kill_shot
+            .main
+            .round_polys
+            .iter()
+            .map(|round| round.coeffs_no_linear.len() * 16)
+            .sum::<usize>();
+        let shift_polys = self
+            .kill_shot
+            .shift
+            .round_polys
+            .iter()
+            .map(|round| round.coeffs_no_linear.len() * 16)
+            .sum::<usize>();
         let main_finals = 12 * 16;
         let shift_finals = 3 * 16;
         main_polys
@@ -464,5 +476,47 @@ mod tests {
         bad[0].expected_digest[1] += Block128::ONE;
         let mut ch_v = Poseidon2bChannel::new();
         assert!(verify_fixed_field_hash_killshot(params, &proof, &bad, &mut ch_v).is_none());
+    }
+
+    #[test]
+    fn fixed_field_hash_byte_len_counts_compressed_round_fields_exactly() {
+        let params =
+            FixedFieldHashParams::with_default_relation_tag(TAG_HISTPRF, 4).expect("params");
+        let inputs = vec![input(9, 4), input(10, 4)];
+        let mut channel = Poseidon2bChannel::new();
+        let (proof, _) = prove_fixed_field_hash_killshot(params, &inputs, &mut channel);
+
+        let main_round_fields = proof
+            .kill_shot
+            .main
+            .round_polys
+            .iter()
+            .map(|round| round.coeffs_no_linear.len())
+            .sum::<usize>();
+        let shift_round_fields = proof
+            .kill_shot
+            .shift
+            .round_polys
+            .iter()
+            .map(|round| round.coeffs_no_linear.len())
+            .sum::<usize>();
+        assert!(proof
+            .kill_shot
+            .main
+            .round_polys
+            .iter()
+            .all(|round| round.coeffs_no_linear.len() == 9));
+        assert!(proof
+            .kill_shot
+            .shift
+            .round_polys
+            .iter()
+            .all(|round| round.coeffs_no_linear.len() == 2));
+
+        let exact = (main_round_fields + shift_round_fields + 12 + 3) * 16
+            + proof.chain.byte_len()
+            + proof.batch.byte_len();
+        assert_eq!(proof.byte_len(), exact);
+        assert_eq!(proof.byte_len(), 16 * (15 * proof.num_vars + 19));
     }
 }

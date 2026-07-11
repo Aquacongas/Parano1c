@@ -22,7 +22,8 @@ use noid_ivc_core::deep_chain::relations::{
 };
 use noid_ivc_core::deep_chain::schedule::flat_of_tower_u128;
 use noid_ivc_core::deep_chain::{
-    flat_mds, flat_round_constant, is_full_round, DeepChainWalkProof, WALK_DEGREE,
+    flat_mds, flat_round_constant, is_full_round, DeepChainWalkProof, MultiDeepChainWalkProof,
+    WALK_DEGREE,
 };
 use noid_ivc_core::field_circuit::FsChannelOps;
 #[cfg(test)]
@@ -36,6 +37,7 @@ use super::{mul, pin_eq, FieldR1csBuilder, LinExpr, F128};
 // ---------------------------------------------------------------------------
 
 /// A claim group as expressions.
+#[derive(Clone)]
 pub struct LaneClaimGroupTrace {
     pub point: Vec<LinExpr>,
     pub values: [LinExpr; STATE_SIZE],
@@ -73,6 +75,65 @@ impl DeepChainWalkProofTrace {
     }
 }
 
+/// Witness allocation of a multi-instance walk proof (equal-domain V1 or
+/// ragged-domain V2, according to the verifier entry point).
+pub struct MultiDeepChainWalkProofTrace {
+    pub layers: Vec<MultiWalkLayerProofTrace>,
+}
+
+pub struct MultiWalkLayerProofTrace {
+    pub round_coeffs: Vec<[LinExpr; WALK_DEGREE]>,
+    pub next_values: Vec<[LinExpr; STATE_SIZE]>,
+}
+
+impl MultiDeepChainWalkProofTrace {
+    pub fn alloc(
+        b: &mut FieldR1csBuilder,
+        native: &MultiDeepChainWalkProof,
+        w_log: usize,
+        instances: usize,
+    ) -> Self {
+        assert!(instances > 0, "multi-walk instance count");
+        assert_eq!(native.layers.len(), N_ROUNDS, "multi-walk layer count");
+        let layers = native
+            .layers
+            .iter()
+            .map(|layer| {
+                assert_eq!(layer.round_coeffs.len(), w_log, "multi-walk round count");
+                assert_eq!(
+                    layer.next_values.len(),
+                    instances,
+                    "multi-walk next-value instance count"
+                );
+                MultiWalkLayerProofTrace {
+                    round_coeffs: layer
+                        .round_coeffs
+                        .iter()
+                        .map(|wire| std::array::from_fn(|i| alloc_expr(b, wire[i])))
+                        .collect(),
+                    next_values: layer
+                        .next_values
+                        .iter()
+                        .map(|values| std::array::from_fn(|i| alloc_expr(b, values[i])))
+                        .collect(),
+                }
+            })
+            .collect();
+        Self { layers }
+    }
+
+    /// Allocate the V2 wire shape from its ordered native domain widths.
+    pub fn alloc_ragged(
+        b: &mut FieldR1csBuilder,
+        native: &MultiDeepChainWalkProof,
+        w_logs: &[usize],
+    ) -> Self {
+        assert!(!w_logs.is_empty(), "multi-walk instance count");
+        let max_w_log = *w_logs.iter().max().expect("one multi-walk instance");
+        Self::alloc(b, native, max_w_log, w_logs.len())
+    }
+}
+
 fn alloc_expr(b: &mut FieldR1csBuilder, v: F128) -> LinExpr {
     LinExpr::from_wire(b.alloc_f128(v))
 }
@@ -83,6 +144,28 @@ pub fn sbox7_trace(b: &mut FieldR1csBuilder, x: &LinExpr) -> LinExpr {
     let x4 = mul(b, &x2, &x2);
     let x3 = mul(b, x, &x2);
     mul(b, &x3, &x4)
+}
+
+fn layer_terms_trace(
+    b: &mut FieldR1csBuilder,
+    q: usize,
+    values: &[LinExpr; STATE_SIZE],
+) -> [LinExpr; STATE_SIZE] {
+    if is_full_round(q) {
+        std::array::from_fn(|lane| {
+            let x = values[lane].add(&LinExpr::constant(flat_round_constant(lane, q)));
+            sbox7_trace(b, &x)
+        })
+    } else {
+        std::array::from_fn(|lane| {
+            if lane == 0 {
+                let x = values[0].add(&LinExpr::constant(flat_round_constant(0, q)));
+                sbox7_trace(b, &x)
+            } else {
+                values[lane].clone()
+            }
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -140,8 +223,7 @@ pub fn verify_deep_chain_walk_trace(
         ch.observe_f128_slice(b, &g.values);
     }
 
-    let mut group_points: Vec<Vec<LinExpr>> =
-        out_groups.iter().map(|g| g.point.clone()).collect();
+    let mut group_points: Vec<Vec<LinExpr>> = out_groups.iter().map(|g| g.point.clone()).collect();
     let mut group_values: Vec<[LinExpr; STATE_SIZE]> =
         out_groups.iter().map(|g| g.values.clone()).collect();
 
@@ -152,8 +234,7 @@ pub fn verify_deep_chain_walk_trace(
         let alpha = ch.sample_f128(b);
 
         // Lane weights α^{4g+i+1} — a running product chain of wires.
-        let mut weights: Vec<[LinExpr; STATE_SIZE]> =
-            Vec::with_capacity(group_points.len());
+        let mut weights: Vec<[LinExpr; STATE_SIZE]> = Vec::with_capacity(group_points.len());
         let mut power = LinExpr::constant(F128::ONE);
         for _ in 0..group_points.len() {
             let w: [LinExpr; STATE_SIZE] = std::array::from_fn(|_| {
@@ -182,23 +263,7 @@ pub fn verify_deep_chain_walk_trace(
 
         // term_j on the claimed next values (round constants are free adds).
         let mds = flat_mds(is_full_round(q));
-        let terms: [LinExpr; STATE_SIZE] = if is_full_round(q) {
-            std::array::from_fn(|j| {
-                let x = layer_proof.next_values[j]
-                    .add(&LinExpr::constant(flat_round_constant(j, q)));
-                sbox7_trace(b, &x)
-            })
-        } else {
-            std::array::from_fn(|j| {
-                if j == 0 {
-                    let x = layer_proof.next_values[0]
-                        .add(&LinExpr::constant(flat_round_constant(0, q)));
-                    sbox7_trace(b, &x)
-                } else {
-                    layer_proof.next_values[j].clone()
-                }
-            })
-        };
+        let terms = layer_terms_trace(b, q, &layer_proof.next_values);
 
         // expected = Σ_g eq(ρ_g, point) · Σ_j c_{g,j}·term_j with
         // c_{g,j} = Σ_i w_{g,i}·MDS[i][j] — MDS entries are constants, so
@@ -226,6 +291,282 @@ pub fn verify_deep_chain_walk_trace(
         });
     }
     terminal.expect("N_ROUNDS ≥ 1")
+}
+
+/// Trace twin of `verify_multi_deep_chain_walk`.
+///
+/// Every instance has the same `w_log` but its own state columns and claim
+/// groups.  Instance count and each group count enter the V1 transcript before
+/// a single power ladder batches all claims.  The layer sumcheck point is
+/// shared; the four next-layer values and terminal claim remain per-instance.
+pub fn verify_multi_deep_chain_walk_trace(
+    b: &mut FieldR1csBuilder,
+    ch: &mut impl FsChannelOps,
+    w_log: usize,
+    out_groups: &[Vec<LaneClaimGroupTrace>],
+    proof: &MultiDeepChainWalkProofTrace,
+) -> Vec<LaneClaimGroupTrace> {
+    assert!(!out_groups.is_empty(), "at least one multi-walk instance");
+    for groups in out_groups {
+        assert!(!groups.is_empty(), "every instance needs an output claim");
+        assert!(
+            groups.iter().all(|group| group.point.len() == w_log),
+            "multi-walk claim point arity"
+        );
+    }
+    assert_eq!(proof.layers.len(), N_ROUNDS, "multi-walk layer count");
+    assert!(proof.layers.iter().all(|layer| {
+        layer.round_coeffs.len() == w_log && layer.next_values.len() == out_groups.len()
+    }));
+
+    let count_lane = |count: usize| {
+        LinExpr::constant(F128 {
+            lo: u64::try_from(count).expect("multi-walk count exceeds u64"),
+            hi: 0,
+        })
+    };
+    ch.observe_label(b, b"history-deep-chain-multi-walk-v1");
+    ch.observe_f128(b, &count_lane(out_groups.len()));
+    for groups in out_groups {
+        ch.observe_f128(b, &count_lane(groups.len()));
+        for group in groups {
+            ch.observe_f128_slice(b, &group.point);
+            ch.observe_f128_slice(b, &group.values);
+        }
+    }
+
+    let mut groups = out_groups.to_vec();
+    for (layer_index, layer_proof) in proof.layers.iter().enumerate() {
+        let layer = N_ROUNDS - layer_index;
+        let q = layer - 1;
+        let alpha = ch.sample_f128(b);
+
+        // One canonical power ladder across instance-major, group-major, then
+        // lane-major order, matching the native verifier exactly.
+        let mut power = LinExpr::constant(F128::ONE);
+        let weights: Vec<Vec<[LinExpr; STATE_SIZE]>> = groups
+            .iter()
+            .map(|instance| {
+                instance
+                    .iter()
+                    .map(|_| {
+                        std::array::from_fn(|_| {
+                            power = mul(b, &power, &alpha);
+                            power.clone()
+                        })
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let mut claim = LinExpr::zero();
+        for (instance_groups, instance_weights) in groups.iter().zip(&weights) {
+            for (group, lane_weights) in instance_groups.iter().zip(instance_weights) {
+                for lane in 0..STATE_SIZE {
+                    claim = claim.add(&mul(b, &lane_weights[lane], &group.values[lane]));
+                }
+            }
+        }
+
+        let mut point = Vec::with_capacity(w_log);
+        for wire in &layer_proof.round_coeffs {
+            ch.observe_f128_slice(b, wire);
+            let challenge = ch.sample_f128(b);
+            claim = compressed_horner(b, wire, &claim, &challenge);
+            point.push(challenge);
+        }
+        let flat_next = layer_proof
+            .next_values
+            .iter()
+            .flat_map(|values| values.iter().cloned())
+            .collect::<Vec<_>>();
+        ch.observe_f128_slice(b, &flat_next);
+
+        let mds = flat_mds(is_full_round(q));
+        let mut expected = LinExpr::zero();
+        for ((instance_groups, instance_weights), instance_next) in
+            groups.iter().zip(&weights).zip(&layer_proof.next_values)
+        {
+            let terms = layer_terms_trace(b, q, instance_next);
+            for (group, lane_weights) in instance_groups.iter().zip(instance_weights) {
+                let mut dot = LinExpr::zero();
+                for output_lane in 0..STATE_SIZE {
+                    let mut column_weight = LinExpr::zero();
+                    for input_lane in 0..STATE_SIZE {
+                        column_weight = column_weight
+                            .add(&lane_weights[input_lane].scale(mds[input_lane][output_lane]));
+                    }
+                    dot = dot.add(&mul(b, &column_weight, &terms[output_lane]));
+                }
+                let eq = b.eq_eval_trace(&group.point, &point);
+                expected = expected.add(&mul(b, &eq, &dot));
+            }
+        }
+        pin_eq(b, &expected, &claim);
+
+        groups = layer_proof
+            .next_values
+            .iter()
+            .map(|values| {
+                vec![LaneClaimGroupTrace {
+                    point: point.clone(),
+                    values: values.clone(),
+                }]
+            })
+            .collect();
+    }
+
+    groups
+        .into_iter()
+        .map(|mut instance| instance.pop().expect("one terminal group per instance"))
+        .collect()
+}
+
+/// Trace twin of `deep_chain::verify_ragged_multi_deep_chain_walk` (V2).
+///
+/// Each instance retains its native `w_logs[a]`-coordinate state columns.  A
+/// common `W = max(w_logs)` sumcheck aligns a smaller instance to the zero high
+/// suffix: its state MLE ignores high challenges while its equality weight is
+/// multiplied by `∏(1 + r_j)`.  Consequently its returned terminal point is
+/// the native low prefix, not a padded outer-column point.
+pub fn verify_ragged_multi_deep_chain_walk_trace(
+    b: &mut FieldR1csBuilder,
+    ch: &mut impl FsChannelOps,
+    w_logs: &[usize],
+    out_groups: &[Vec<LaneClaimGroupTrace>],
+    proof: &MultiDeepChainWalkProofTrace,
+) -> Vec<LaneClaimGroupTrace> {
+    assert!(!out_groups.is_empty(), "at least one multi-walk instance");
+    assert_eq!(w_logs.len(), out_groups.len(), "one width per instance");
+    let max_w_log = *w_logs.iter().max().expect("one multi-walk instance");
+    for (groups, &w_log) in out_groups.iter().zip(w_logs) {
+        assert!(!groups.is_empty(), "every instance needs an output claim");
+        assert!(
+            groups.iter().all(|group| group.point.len() == w_log),
+            "ragged multi-walk claim point arity"
+        );
+    }
+    assert_eq!(proof.layers.len(), N_ROUNDS, "multi-walk layer count");
+    assert!(proof.layers.iter().all(|layer| {
+        layer.round_coeffs.len() == max_w_log && layer.next_values.len() == out_groups.len()
+    }));
+
+    let count_lane = |count: usize| {
+        LinExpr::constant(F128 {
+            lo: u64::try_from(count).expect("multi-walk count exceeds u64"),
+            hi: 0,
+        })
+    };
+    ch.observe_label(b, b"history-deep-chain-ragged-multi-walk-v2");
+    ch.observe_f128(b, &count_lane(out_groups.len()));
+    for (&w_log, groups) in w_logs.iter().zip(out_groups) {
+        ch.observe_f128(b, &count_lane(w_log));
+        ch.observe_f128(b, &count_lane(groups.len()));
+        for group in groups {
+            ch.observe_f128_slice(b, &group.point);
+            ch.observe_f128_slice(b, &group.values);
+        }
+    }
+
+    let mut groups = out_groups.to_vec();
+    for (layer_index, layer_proof) in proof.layers.iter().enumerate() {
+        let layer = N_ROUNDS - layer_index;
+        let q = layer - 1;
+        let alpha = ch.sample_f128(b);
+
+        let mut power = LinExpr::constant(F128::ONE);
+        let weights: Vec<Vec<[LinExpr; STATE_SIZE]>> = groups
+            .iter()
+            .map(|instance| {
+                instance
+                    .iter()
+                    .map(|_| {
+                        std::array::from_fn(|_| {
+                            power = mul(b, &power, &alpha);
+                            power.clone()
+                        })
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let mut claim = LinExpr::zero();
+        for (instance_groups, instance_weights) in groups.iter().zip(&weights) {
+            for (group, lane_weights) in instance_groups.iter().zip(instance_weights) {
+                for lane in 0..STATE_SIZE {
+                    claim = claim.add(&mul(b, &lane_weights[lane], &group.values[lane]));
+                }
+            }
+        }
+
+        let mut point = Vec::with_capacity(max_w_log);
+        for wire in &layer_proof.round_coeffs {
+            ch.observe_f128_slice(b, wire);
+            let challenge = ch.sample_f128(b);
+            claim = compressed_horner(b, wire, &claim, &challenge);
+            point.push(challenge);
+        }
+        let flat_next = layer_proof
+            .next_values
+            .iter()
+            .flat_map(|values| values.iter().cloned())
+            .collect::<Vec<_>>();
+        ch.observe_f128_slice(b, &flat_next);
+
+        let mds = flat_mds(is_full_round(q));
+        let high_gates = w_logs
+            .iter()
+            .map(|&w_log| {
+                let mut gate = LinExpr::constant(F128::ONE);
+                for coordinate in &point[w_log..] {
+                    gate = mul(b, &gate, &coordinate.add_const(F128::ONE));
+                }
+                gate
+            })
+            .collect::<Vec<_>>();
+        let mut expected = LinExpr::zero();
+        for (instance, ((instance_groups, instance_weights), instance_next)) in groups
+            .iter()
+            .zip(&weights)
+            .zip(&layer_proof.next_values)
+            .enumerate()
+        {
+            let terms = layer_terms_trace(b, q, instance_next);
+            let w_log = w_logs[instance];
+            for (group, lane_weights) in instance_groups.iter().zip(instance_weights) {
+                let mut dot = LinExpr::zero();
+                for output_lane in 0..STATE_SIZE {
+                    let mut column_weight = LinExpr::zero();
+                    for input_lane in 0..STATE_SIZE {
+                        column_weight = column_weight
+                            .add(&lane_weights[input_lane].scale(mds[input_lane][output_lane]));
+                    }
+                    dot = dot.add(&mul(b, &column_weight, &terms[output_lane]));
+                }
+                let low_eq = b.eq_eval_trace(&group.point, &point[..w_log]);
+                let aligned_eq = mul(b, &low_eq, &high_gates[instance]);
+                expected = expected.add(&mul(b, &aligned_eq, &dot));
+            }
+        }
+        pin_eq(b, &expected, &claim);
+
+        groups = layer_proof
+            .next_values
+            .iter()
+            .enumerate()
+            .map(|(instance, values)| {
+                vec![LaneClaimGroupTrace {
+                    point: point[..w_logs[instance]].to_vec(),
+                    values: values.clone(),
+                }]
+            })
+            .collect();
+    }
+
+    groups
+        .into_iter()
+        .map(|mut instance| instance.pop().expect("one terminal group per instance"))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -343,7 +684,11 @@ fn fixed_pattern_dot_gate(
         assert_eq!(point.len(), first + bits.len(), "gated pattern point arity");
         for (j, bit) in bits.iter().enumerate() {
             let p = &point[first + j];
-            let f = if *bit { p.clone() } else { p.add_const(F128::ONE) };
+            let f = if *bit {
+                p.clone()
+            } else {
+                p.add_const(F128::ONE)
+            };
             acc = mul(b, &acc, &f);
         }
     }
@@ -443,10 +788,7 @@ pub fn verify_column_relation_trace(
             let value = match f {
                 ColRef::Fixed(i) => fixed_cache[*i].clone().expect("pre-evaluated"),
                 _ => {
-                    let fi = claimed
-                        .iter()
-                        .position(|r| r == f)
-                        .expect("claimed ref");
+                    let fi = claimed.iter().position(|r| r == f).expect("claimed ref");
                     proof.final_values[fi].clone()
                 }
             };
@@ -723,7 +1065,8 @@ mod tests {
         prove_column_relation, prove_shift_discharge, RelationColumns,
     };
     use noid_ivc_core::deep_chain::{
-        apply_round, prove_deep_chain_walk, LaneClaimGroup,
+        apply_round, prove_deep_chain_walk, prove_multi_deep_chain_walk,
+        prove_ragged_multi_deep_chain_walk, LaneClaimGroup,
     };
     use noid_ivc_core::lincheck::build_eq_table;
 
@@ -822,6 +1165,439 @@ mod tests {
         assert!(survivors.is_empty(), "walk twin survivors: {survivors:?}");
     }
 
+    /// Equal-domain multi-walk twin: native/trace lockstep, exact verifier-row
+    /// comparison against two sequential V0 walks, and targeted cross-instance
+    /// mutation checks with the returned terminals discharged.
+    #[test]
+    fn multi_walk_twin_lockstep_rows_and_mutations() {
+        let w_log = 2;
+        let w = 1usize << w_log;
+        let mut rng = Rng(0xB471_CE11);
+        let instances = (0..2)
+            .map(|_| std::array::from_fn(|_| (0..w).map(|_| rng.f128()).collect::<Vec<_>>()))
+            .collect::<Vec<[Vec<F128>; STATE_SIZE]>>();
+        let outputs = instances
+            .iter()
+            .map(|s0| {
+                let mut out: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; w]);
+                for widx in 0..w {
+                    let mut state: [F128; STATE_SIZE] = std::array::from_fn(|lane| s0[lane][widx]);
+                    for q in 0..N_ROUNDS {
+                        state = apply_round(q, state);
+                    }
+                    for lane in 0..STATE_SIZE {
+                        out[lane][widx] = state[lane];
+                    }
+                }
+                out
+            })
+            .collect::<Vec<_>>();
+        let groups = outputs
+            .iter()
+            .enumerate()
+            .map(|(instance, output)| {
+                (0..=instance)
+                    .map(|_| {
+                        let point = (0..w_log).map(|_| rng.f128()).collect::<Vec<_>>();
+                        let values = std::array::from_fn(|lane| mle_eval(&output[lane], &point));
+                        LaneClaimGroup { point, values }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(groups.iter().map(Vec::len).collect::<Vec<_>>(), [1, 2]);
+
+        let instance_refs = instances.iter().collect::<Vec<_>>();
+        let mut ch_native = FsLaneChallenger::new(b"multi-walk-twin-test");
+        let (proof, native_terminals) =
+            prove_multi_deep_chain_walk(&instance_refs, &groups, &mut ch_native);
+
+        let mut b = FieldR1csBuilder::new();
+        let mut ch = FsChannelTrace::new(&mut b, b"multi-walk-twin-test");
+        let groups_e = groups
+            .iter()
+            .map(|instance_groups| {
+                instance_groups
+                    .iter()
+                    .map(|group| LaneClaimGroupTrace {
+                        point: group
+                            .point
+                            .iter()
+                            .map(|&value| alloc_expr(&mut b, value))
+                            .collect(),
+                        values: std::array::from_fn(|lane| alloc_expr(&mut b, group.values[lane])),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let verifier_start = b.num_wires();
+        let mutation_start = b.num_wires();
+        let proof_e = MultiDeepChainWalkProofTrace::alloc(&mut b, &proof, w_log, instances.len());
+        let mutation_end = b.num_wires();
+        let terminals =
+            verify_multi_deep_chain_walk_trace(&mut b, &mut ch, w_log, &groups_e, &proof_e);
+        let multi_rows = b.num_wires() - verifier_start;
+
+        let c_native = ch_native.sample_f128();
+        let c_trace = ch.sample_f128(&mut b);
+        assert_eq!(
+            c_trace.eval(b.values()),
+            c_native,
+            "multi-walk twin transcript diverged"
+        );
+        assert_eq!(terminals.len(), native_terminals.len());
+        for ((terminal, native), s0) in terminals.iter().zip(&native_terminals).zip(&instances) {
+            for (coordinate, native_coordinate) in terminal.point.iter().zip(&native.point) {
+                assert_eq!(coordinate.eval(b.values()), *native_coordinate);
+                pin_eq(&mut b, coordinate, &LinExpr::constant(*native_coordinate));
+            }
+            for lane in 0..STATE_SIZE {
+                assert_eq!(terminal.values[lane].eval(b.values()), native.values[lane]);
+                assert_eq!(
+                    mle_eval(&s0[lane], &native.point),
+                    native.values[lane],
+                    "dishonest native terminal lane {lane}"
+                );
+                pin_eq(
+                    &mut b,
+                    &terminal.values[lane],
+                    &LinExpr::constant(native.values[lane]),
+                );
+            }
+        }
+
+        // Baseline the exact same two instances as sequential V0 walks on one
+        // transcript. Input-claim allocations are excluded from both counts.
+        let mut separate_native_ch = FsLaneChallenger::new(b"multi-walk-separate-test");
+        let mut separate_proofs = Vec::with_capacity(instances.len());
+        for (s0, instance_groups) in instances.iter().zip(&groups) {
+            let (separate_proof, _) =
+                prove_deep_chain_walk(s0, instance_groups, &mut separate_native_ch);
+            separate_proofs.push(separate_proof);
+        }
+        let mut separate_builder = FieldR1csBuilder::new();
+        let mut separate_ch =
+            FsChannelTrace::new(&mut separate_builder, b"multi-walk-separate-test");
+        let separate_groups_e = groups
+            .iter()
+            .map(|instance_groups| {
+                instance_groups
+                    .iter()
+                    .map(|group| LaneClaimGroupTrace {
+                        point: group
+                            .point
+                            .iter()
+                            .map(|&value| alloc_expr(&mut separate_builder, value))
+                            .collect(),
+                        values: std::array::from_fn(|lane| {
+                            alloc_expr(&mut separate_builder, group.values[lane])
+                        }),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let separate_start = separate_builder.num_wires();
+        for (instance_groups, separate_proof) in separate_groups_e.iter().zip(&separate_proofs) {
+            let separate_proof_e =
+                DeepChainWalkProofTrace::alloc(&mut separate_builder, separate_proof, w_log);
+            verify_deep_chain_walk_trace(
+                &mut separate_builder,
+                &mut separate_ch,
+                w_log,
+                instance_groups,
+                &separate_proof_e,
+            );
+        }
+        let separate_rows = separate_builder.num_wires() - separate_start;
+        let separate_native_post = separate_native_ch.sample_f128();
+        let separate_trace_post = separate_ch.sample_f128(&mut separate_builder);
+        assert_eq!(
+            separate_trace_post.eval(separate_builder.values()),
+            separate_native_post,
+            "sequential V0 baseline transcript diverged"
+        );
+        assert!(
+            multi_rows < separate_rows,
+            "multi-walk did not save verifier rows: multi={multi_rows}, separate={separate_rows}"
+        );
+        eprintln!(
+            "[deep-chain] multi walk twin rows @instances=2,w_log={w_log}: \
+             multi={multi_rows}, separate={separate_rows}, saved={}",
+            separate_rows - multi_rows
+        );
+
+        let per_layer = w_log * WALK_DEGREE + instances.len() * STATE_SIZE;
+        assert_eq!(
+            mutation_end - mutation_start,
+            N_ROUNDS * per_layer,
+            "unexpected multi-proof wire layout"
+        );
+        let (r1cs, z) = b.build();
+        assert!(r1cs.satisfies(&z), "honest multi-walk twin unsatisfiable");
+
+        let coeff_wire = mutation_start + (N_ROUNDS / 2) * per_layer + WALK_DEGREE + 3;
+        let mut bad_coeff = z.clone();
+        bad_coeff[coeff_wire] += F128::ONE;
+        assert!(
+            !r1cs.satisfies(&bad_coeff),
+            "aggregate round-coefficient mutation survived"
+        );
+
+        let next_values_offset = w_log * WALK_DEGREE;
+        let one_instance_wire =
+            mutation_start + (N_ROUNDS / 4) * per_layer + next_values_offset + STATE_SIZE + 2;
+        let mut bad_instance = z.clone();
+        bad_instance[one_instance_wire] += F128::ONE;
+        assert!(
+            !r1cs.satisfies(&bad_instance),
+            "one-instance next-value mutation survived"
+        );
+
+        let swap_base = mutation_start + (N_ROUNDS / 3) * per_layer + next_values_offset;
+        assert!(
+            (0..STATE_SIZE).any(|lane| z[swap_base + lane] != z[swap_base + STATE_SIZE + lane]),
+            "chosen instance next-value vectors unexpectedly coincide"
+        );
+        let mut swapped = z.clone();
+        for lane in 0..STATE_SIZE {
+            swapped.swap(swap_base + lane, swap_base + STATE_SIZE + lane);
+        }
+        assert!(
+            !r1cs.satisfies(&swapped),
+            "cross-instance next-value swap survived"
+        );
+    }
+
+    /// Ragged-domain V2 twin: mixed native widths stay unpadded, the trace is
+    /// transcript-identical to the native verifier, returned points have their
+    /// per-instance arity, and the shared proof is cheaper than two individual
+    /// walk replays while targeted coefficient/value/swap mutations fail.
+    #[test]
+    fn ragged_multi_walk_twin_lockstep_differential_and_mutations() {
+        let w_logs = [1usize, 3];
+        let max_w_log = *w_logs.iter().max().unwrap();
+        let mut rng = Rng(0xA11D_CE11);
+        let instances = w_logs
+            .iter()
+            .map(|&w_log| {
+                let w = 1usize << w_log;
+                std::array::from_fn(|_| (0..w).map(|_| rng.f128()).collect::<Vec<_>>())
+            })
+            .collect::<Vec<[Vec<F128>; STATE_SIZE]>>();
+        let outputs = instances
+            .iter()
+            .map(|s0| {
+                let w = s0[0].len();
+                let mut out: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; w]);
+                for widx in 0..w {
+                    let mut state: [F128; STATE_SIZE] = std::array::from_fn(|lane| s0[lane][widx]);
+                    for q in 0..N_ROUNDS {
+                        state = apply_round(q, state);
+                    }
+                    for lane in 0..STATE_SIZE {
+                        out[lane][widx] = state[lane];
+                    }
+                }
+                out
+            })
+            .collect::<Vec<_>>();
+        let groups = outputs
+            .iter()
+            .zip(&w_logs)
+            .enumerate()
+            .map(|(instance, (output, &w_log))| {
+                (0..=instance)
+                    .map(|_| {
+                        let point = (0..w_log).map(|_| rng.f128()).collect::<Vec<_>>();
+                        let values = std::array::from_fn(|lane| mle_eval(&output[lane], &point));
+                        LaneClaimGroup { point, values }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        let instance_refs = instances.iter().collect::<Vec<_>>();
+        let mut ch_native = FsLaneChallenger::new(b"ragged-multi-walk-twin-test");
+        let (proof, native_terminals) =
+            prove_ragged_multi_deep_chain_walk(&instance_refs, &groups, &mut ch_native);
+
+        let mut b = FieldR1csBuilder::new();
+        let mut ch = FsChannelTrace::new(&mut b, b"ragged-multi-walk-twin-test");
+        let groups_e = groups
+            .iter()
+            .map(|instance_groups| {
+                instance_groups
+                    .iter()
+                    .map(|group| LaneClaimGroupTrace {
+                        point: group
+                            .point
+                            .iter()
+                            .map(|&value| alloc_expr(&mut b, value))
+                            .collect(),
+                        values: std::array::from_fn(|lane| alloc_expr(&mut b, group.values[lane])),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let verifier_start = b.num_wires();
+        let mutation_start = b.num_wires();
+        let proof_e = MultiDeepChainWalkProofTrace::alloc_ragged(&mut b, &proof, &w_logs);
+        let mutation_end = b.num_wires();
+        let terminals = verify_ragged_multi_deep_chain_walk_trace(
+            &mut b, &mut ch, &w_logs, &groups_e, &proof_e,
+        );
+        let ragged_rows = b.num_wires() - verifier_start;
+
+        let native_post = ch_native.sample_f128();
+        let trace_post = ch.sample_f128(&mut b);
+        assert_eq!(
+            trace_post.eval(b.values()),
+            native_post,
+            "ragged multi-walk twin transcript diverged"
+        );
+        for (instance, (((terminal, native), s0), &w_log)) in terminals
+            .iter()
+            .zip(&native_terminals)
+            .zip(&instances)
+            .zip(&w_logs)
+            .enumerate()
+        {
+            assert_eq!(terminal.point.len(), w_log);
+            assert_eq!(native.point.len(), w_log);
+            for (coordinate, native_coordinate) in terminal.point.iter().zip(&native.point) {
+                assert_eq!(coordinate.eval(b.values()), *native_coordinate);
+                pin_eq(&mut b, coordinate, &LinExpr::constant(*native_coordinate));
+            }
+            for lane in 0..STATE_SIZE {
+                assert_eq!(terminal.values[lane].eval(b.values()), native.values[lane]);
+                assert_eq!(
+                    mle_eval(&s0[lane], &native.point),
+                    native.values[lane],
+                    "ragged terminal {instance}, lane {lane}"
+                );
+                pin_eq(
+                    &mut b,
+                    &terminal.values[lane],
+                    &LinExpr::constant(native.values[lane]),
+                );
+            }
+        }
+
+        // Differential trace baseline over the exact same claims and native
+        // columns.  It uses independent V0 transcripts, so equality means
+        // both terminals discharge honestly, not byte-identical challenges.
+        let mut separate_native_ch = FsLaneChallenger::new(b"ragged-multi-separate-test");
+        let separate_proofs = instances
+            .iter()
+            .zip(&groups)
+            .map(|(s0, instance_groups)| {
+                prove_deep_chain_walk(s0, instance_groups, &mut separate_native_ch).0
+            })
+            .collect::<Vec<_>>();
+        let mut separate_builder = FieldR1csBuilder::new();
+        let mut separate_ch =
+            FsChannelTrace::new(&mut separate_builder, b"ragged-multi-separate-test");
+        let separate_groups_e = groups
+            .iter()
+            .map(|instance_groups| {
+                instance_groups
+                    .iter()
+                    .map(|group| LaneClaimGroupTrace {
+                        point: group
+                            .point
+                            .iter()
+                            .map(|&value| alloc_expr(&mut separate_builder, value))
+                            .collect(),
+                        values: std::array::from_fn(|lane| {
+                            alloc_expr(&mut separate_builder, group.values[lane])
+                        }),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let separate_start = separate_builder.num_wires();
+        for (((instance_groups, separate_proof), &w_log), s0) in separate_groups_e
+            .iter()
+            .zip(&separate_proofs)
+            .zip(&w_logs)
+            .zip(&instances)
+        {
+            let separate_proof_e =
+                DeepChainWalkProofTrace::alloc(&mut separate_builder, separate_proof, w_log);
+            let terminal = verify_deep_chain_walk_trace(
+                &mut separate_builder,
+                &mut separate_ch,
+                w_log,
+                instance_groups,
+                &separate_proof_e,
+            );
+            for lane in 0..STATE_SIZE {
+                assert_eq!(
+                    mle_eval(
+                        &s0[lane],
+                        &terminal
+                            .point
+                            .iter()
+                            .map(|x| x.eval(separate_builder.values()))
+                            .collect::<Vec<_>>()
+                    ),
+                    terminal.values[lane].eval(separate_builder.values()),
+                    "individual trace terminal lane {lane}"
+                );
+            }
+        }
+        let separate_rows = separate_builder.num_wires() - separate_start;
+        let separate_native_post = separate_native_ch.sample_f128();
+        let separate_trace_post = separate_ch.sample_f128(&mut separate_builder);
+        assert_eq!(
+            separate_trace_post.eval(separate_builder.values()),
+            separate_native_post,
+            "ragged individual baseline transcript diverged"
+        );
+        assert!(
+            ragged_rows < separate_rows,
+            "ragged multi-walk did not save rows: ragged={ragged_rows}, separate={separate_rows}"
+        );
+        eprintln!(
+            "[deep-chain] ragged multi twin rows @w_logs={w_logs:?}: \
+             ragged={ragged_rows}, separate={separate_rows}, saved={}",
+            separate_rows - ragged_rows
+        );
+
+        let per_layer = max_w_log * WALK_DEGREE + instances.len() * STATE_SIZE;
+        assert_eq!(mutation_end - mutation_start, N_ROUNDS * per_layer);
+        let (r1cs, z) = b.build();
+        assert!(
+            r1cs.satisfies(&z),
+            "honest ragged multi-walk twin unsatisfiable"
+        );
+
+        let coeff_wire = mutation_start + (N_ROUNDS / 2) * per_layer + 2 * WALK_DEGREE + 3;
+        let mut bad_coeff = z.clone();
+        bad_coeff[coeff_wire] += F128::ONE;
+        assert!(
+            !r1cs.satisfies(&bad_coeff),
+            "ragged coefficient mutation survived"
+        );
+
+        let next_values_offset = max_w_log * WALK_DEGREE;
+        let instance_wire =
+            mutation_start + (N_ROUNDS / 4) * per_layer + next_values_offset + STATE_SIZE + 2;
+        let mut bad_instance = z.clone();
+        bad_instance[instance_wire] += F128::ONE;
+        assert!(
+            !r1cs.satisfies(&bad_instance),
+            "ragged next-value mutation survived"
+        );
+
+        let swap_base = mutation_start + (N_ROUNDS / 3) * per_layer + next_values_offset;
+        let mut swapped = z.clone();
+        for lane in 0..STATE_SIZE {
+            swapped.swap(swap_base + lane, swap_base + STATE_SIZE + lane);
+        }
+        assert!(!r1cs.satisfies(&swapped), "ragged instance swap survived");
+    }
+
     /// Fixed-pattern factors in the twin: a periodic selector gating a
     /// 3-factor term, lockstep with the native verifier, mutations
     /// rejected. Exercises the closed-form tensor evaluation.
@@ -890,7 +1666,14 @@ mod tests {
         let proof_e = ColumnRelationProofTrace::alloc(&mut b, &proof, w_log, 2);
         let mutation_end = b.num_wires();
         let point_e = verify_column_relation_trace(
-            &mut b, &mut ch, w_log, &target_e, &eq_point_e, &terms_e, &fixed, &proof_e,
+            &mut b,
+            &mut ch,
+            w_log,
+            &target_e,
+            &eq_point_e,
+            &terms_e,
+            &fixed,
+            &proof_e,
         );
 
         let c_n = ch_native.sample_f128();
@@ -979,7 +1762,14 @@ mod tests {
         let mutation_end = b.num_wires();
 
         let point_e = verify_column_relation_trace(
-            &mut b, &mut ch, w_log, &target_e, &eq_point_e, &terms_e, &[], &proof_e,
+            &mut b,
+            &mut ch,
+            w_log,
+            &target_e,
+            &eq_point_e,
+            &terms_e,
+            &[],
+            &proof_e,
         );
         let shift_point_e = verify_shift_discharge_trace(
             &mut b,
@@ -993,7 +1783,11 @@ mod tests {
 
         let c_n = ch_native.sample_f128();
         let c_t = ch.sample_f128(&mut b);
-        assert_eq!(c_t.eval(b.values()), c_n, "relation twin transcript diverged");
+        assert_eq!(
+            c_t.eval(b.values()),
+            c_n,
+            "relation twin transcript diverged"
+        );
         for (e, n) in point_e.iter().zip(native_point.iter()) {
             assert_eq!(e.eval(b.values()), *n);
         }
@@ -1013,7 +1807,10 @@ mod tests {
                 r1cs.satisfies(&bad)
             })
             .collect();
-        assert!(survivors.is_empty(), "relation twin survivors: {survivors:?}");
+        assert!(
+            survivors.is_empty(),
+            "relation twin survivors: {survivors:?}"
+        );
     }
 
     /// The source-binding discharge twin: the in-trace weighted-sum verifier
@@ -1062,14 +1859,10 @@ mod tests {
         let proof_e = WeightedSumProofTrace::alloc(&mut b, &proof, n_rounds);
         let mutation_end = b.num_wires();
 
-        let point_e = verify_weighted_sum_trace(
-            &mut b,
-            &mut ch,
-            n_rounds,
-            &target_e,
-            &proof_e,
-            |b, pt| source_weight_at_trace(b, &z_e, &right_e, pt, n_rounds),
-        );
+        let point_e =
+            verify_weighted_sum_trace(&mut b, &mut ch, n_rounds, &target_e, &proof_e, |b, pt| {
+                source_weight_at_trace(b, &z_e, &right_e, pt, n_rounds)
+            });
 
         let c_n = ch_native.sample_f128();
         let c_t = ch.sample_f128(&mut b);
@@ -1128,18 +1921,18 @@ mod tests {
         let proof_e = WeightedSumProofTrace::alloc(&mut b, &proof, n_rounds);
         let mutation_end = b.num_wires();
 
-        let point_e = verify_weighted_sum_trace(
-            &mut b,
-            &mut ch,
-            n_rounds,
-            &claim_e,
-            &proof_e,
-            |b, pt| eq_at_trace(b, &right_e, pt),
-        );
+        let point_e =
+            verify_weighted_sum_trace(&mut b, &mut ch, n_rounds, &claim_e, &proof_e, |b, pt| {
+                eq_at_trace(b, &right_e, pt)
+            });
 
         let c_n = ch_native.sample_f128();
         let c_t = ch.sample_f128(&mut b);
-        assert_eq!(c_t.eval(b.values()), c_n, "h-claim twin transcript diverged");
+        assert_eq!(
+            c_t.eval(b.values()),
+            c_n,
+            "h-claim twin transcript diverged"
+        );
         for (e, n) in point_e.iter().zip(native_point.iter()) {
             assert_eq!(e.eval(b.values()), *n);
         }
@@ -1156,6 +1949,9 @@ mod tests {
                 r1cs.satisfies(&bad)
             })
             .collect();
-        assert!(survivors.is_empty(), "h-claim twin survivors: {survivors:?}");
+        assert!(
+            survivors.is_empty(),
+            "h-claim twin survivors: {survivors:?}"
+        );
     }
 }

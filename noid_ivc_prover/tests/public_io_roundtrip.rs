@@ -38,10 +38,7 @@ fn free_instance(m: usize, k_log: usize, seed: u64) -> (FieldR1cs, Vec<F128>) {
             })
             .collect(),
     );
-    let b_0 = SparseFieldMatrix::from_rows(
-        k,
-        (0..k).map(|_| vec![(0u32, F128::ONE)]).collect(),
-    );
+    let b_0 = SparseFieldMatrix::from_rows(k, (0..k).map(|_| vec![(0u32, F128::ONE)]).collect());
     let r1cs = FieldR1cs {
         m,
         k_log,
@@ -90,11 +87,7 @@ fn slice_mle(z: &[F128], slice: &WitnessSlice, point: &[F128]) -> F128 {
 
 /// The shared fixture: an IO slice carrying [p0, p1, v, tag] and one derived
 /// claim `witness over TARGET at (p0, p1) == v`.
-fn fixture(
-    m: usize,
-    k_log: usize,
-    seed: u64,
-) -> (FieldR1cs, Vec<F128>, PublicIoSpec, Vec<F128>) {
+fn fixture(m: usize, k_log: usize, seed: u64) -> (FieldR1cs, Vec<F128>, PublicIoSpec, Vec<F128>) {
     let (r1cs, mut z) = free_instance(m, k_log, seed);
     let io_slice = WitnessSlice {
         log2_len: 3,

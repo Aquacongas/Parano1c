@@ -12,7 +12,7 @@
 //!
 //!  ✅  Header chain (prev_hash, height, difficulty, timestamp, PoW)     [P.6]
 //!  ✅  Mandatory canonical coinbase (exactly one, first, fixed bitmap)  [P.7 partial]
-//!  ✅  Coinbase value ≤ block_reward(log_slots) + Σ fees                [P.7 full]
+//!  ✅  Coinbase value ≤ block_reward(log_slots) + Σ claimable fees      [P.7 full]
 //!  ✅  Per-tx: fixed canonical body and anchor structure                 [P.8]
 //!  ✅  Cross-tx slot conflicts                                           [P.8]
 //!  ✅  Decoder tx cap and semantic block budget                          [P.9]
@@ -35,7 +35,7 @@ use crate::block::Block;
 use crate::block_header::BlockHeader;
 use crate::consensus::{
     checks::{validate_block_slot_conflicts, validate_tx_consensus},
-    emission::max_coinbase_value_from_fee_sum,
+    emission::max_coinbase_value_from_claimable_fee_sum,
     fees::{claimable_fee_for_tx_body, required_fee_for_tx_body},
     header::{validate_header, validate_header_timeless},
     params::{
@@ -67,6 +67,9 @@ pub struct BlockResourcePreflight {
     pub action_count: usize,
     pub touched_slot_count: usize,
     pub distinct_segment_count: usize,
+    /// Missing digest nodes in the canonical structural multiproof frontier at
+    /// this block's declared state depth.
+    pub state_frontier_node_count: usize,
 }
 
 fn resource_limit(
@@ -149,6 +152,14 @@ pub fn validate_block_resource_preflight(
         return resource_limit("actions", action_count, BLOCK_MAX_ACTIONS);
     }
 
+    let touched_indices: Vec<_> = touched_slots.iter().copied().collect();
+    let state_frontier_node_count = if touched_indices.is_empty() {
+        0
+    } else {
+        crate::sparse_merkle::expected_sibling_count(&touched_indices, block.header.log_slots)
+            .expect("preflight already produced sorted in-range unique slots")
+    };
+
     Ok(BlockResourcePreflight {
         user_tx_count,
         live_input_count,
@@ -156,6 +167,7 @@ pub fn validate_block_resource_preflight(
         action_count,
         touched_slot_count: touched_slots.len(),
         distinct_segment_count: segments.len(),
+        state_frontier_node_count,
     })
 }
 
@@ -324,8 +336,10 @@ fn validate_block_checks_inner(
                 .expect("mandatory coinbase has output zero live")
                 .1
                 .amount;
-            let max_allowed =
-                max_coinbase_value_from_fee_sum(block.header.log_slots, claimable_fee_sum);
+            let max_allowed = max_coinbase_value_from_claimable_fee_sum(
+                block.header.log_slots,
+                claimable_fee_sum,
+            );
             if u128::from(cb_value) > max_allowed {
                 return Err(ConsensusError::InflatedCoinbase);
             }
@@ -390,8 +404,10 @@ pub fn validate_block_consensus(
                 .1
                 .amount;
 
-            let max_allowed =
-                max_coinbase_value_from_fee_sum(block.header.log_slots, claimable_fee_sum);
+            let max_allowed = max_coinbase_value_from_claimable_fee_sum(
+                block.header.log_slots,
+                claimable_fee_sum,
+            );
             if u128::from(cb_value) > max_allowed {
                 return Err(ConsensusError::InflatedCoinbase);
             }

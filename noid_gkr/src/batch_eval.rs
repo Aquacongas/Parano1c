@@ -501,10 +501,7 @@ pub const RLC_LEVEL_BASE: usize = 64;
 ///
 /// The prover and the verifier derive the weights through this same helper,
 /// so the channel stays in lockstep by construction.
-pub(crate) fn squeeze_alphas<T: FiatShamir<Block128>>(
-    channel: &mut T,
-    m: usize,
-) -> Vec<Block128> {
+pub(crate) fn squeeze_alphas<T: FiatShamir<Block128>>(channel: &mut T, m: usize) -> Vec<Block128> {
     if m == 0 {
         return Vec::new();
     }

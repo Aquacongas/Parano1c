@@ -457,10 +457,7 @@ mod tests {
         assert_ne!(bad, poly);
         assert_eq!(bad.coeffs[1], poly.coeffs[1] + F::ONE);
         // Reconstruction pins the round identity by construction.
-        assert_eq!(
-            bad.evaluate(F::ZERO) + bad.evaluate(F::ONE),
-            claim + F::ONE
-        );
+        assert_eq!(bad.evaluate(F::ZERO) + bad.evaluate(F::ONE), claim + F::ONE);
     }
 
     #[test]

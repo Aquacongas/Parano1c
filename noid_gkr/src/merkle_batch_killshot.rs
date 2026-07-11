@@ -249,13 +249,9 @@ fn append_path_chain_claims_at_offset(
                     mds_coeff(lane, src_lane),
                 ));
             }
-            let mut value =
-                mds_constant(lane, &[(0, not_d * sibling[0]), (1, not_d * sibling[1])]);
+            let mut value = mds_constant(lane, &[(0, not_d * sibling[0]), (1, not_d * sibling[1])]);
             if level == 0 {
-                value += mds_constant(
-                    lane,
-                    &[(0, d * inputs.leaf[0]), (1, d * inputs.leaf[1])],
-                );
+                value += mds_constant(lane, &[(0, d * inputs.leaf[0]), (1, d * inputs.leaf[1])]);
             } else {
                 let prev_perm_b = perm_a_slot - 1;
                 terms.push(weighted_state_claim(

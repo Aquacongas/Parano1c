@@ -644,7 +644,11 @@ impl Challenger for FsLaneChallenger {
     }
 
     fn observe_f128_slice(&mut self, values: &[F128]) {
-        self.absorb_lane(fs_op_lane(FS_OP_OBSERVE, FS_KIND_SLICE, values.len() as u64));
+        self.absorb_lane(fs_op_lane(
+            FS_OP_OBSERVE,
+            FS_KIND_SLICE,
+            values.len() as u64,
+        ));
         for v in values {
             self.absorb_lane(*v);
         }

@@ -16,9 +16,7 @@
 use noid_core::{AdditiveNTT, Block128, TowerField};
 use noid_fri::code::{Code, LOG_RATE};
 use noid_ivc_core::challenger::{Challenger, FsLaneChallenger};
-use noid_ivc_core::deep_chain::encode_kernel::{
-    encode_mle_via_kernel, eq_at, source_weight_at,
-};
+use noid_ivc_core::deep_chain::encode_kernel::{encode_mle_via_kernel, eq_at, source_weight_at};
 use noid_ivc_core::deep_chain::relations::{prove_weighted_sum, verify_weighted_sum};
 use noid_ivc_core::deep_chain::schedule::flat_of_tower_u128;
 use noid_ivc_core::field::F128;
@@ -72,7 +70,11 @@ fn eq_table_tower(right: &[Block128]) -> Vec<Block128> {
     for (i, slot) in t.iter_mut().enumerate() {
         let mut e = Block128::ONE;
         for (l, &r) in right.iter().enumerate() {
-            e = e * if (i >> l) & 1 == 1 { r } else { Block128::ONE + r };
+            e = e * if (i >> l) & 1 == 1 {
+                r
+            } else {
+                Block128::ONE + r
+            };
         }
         *slot = e;
     }
@@ -207,7 +209,11 @@ fn source_binding_reduces_to_h_openings() {
         &mut ch_v,
     )
     .expect("H-claim discharge");
-    assert_eq!(mle_eval(&h_flat, &h_point), h_proof.final_value, "H-claim opening");
+    assert_eq!(
+        mle_eval(&h_flat, &h_point),
+        h_proof.final_value,
+        "H-claim opening"
+    );
 
     // Lockstep sanity across both channels.
     assert_eq!(ch_p.sample_f128(), ch_v.sample_f128());
@@ -274,7 +280,13 @@ fn sb1_2_code_tree_binds_encode_reduction() {
     let weights: Vec<F128> = (0..(1usize << n_rounds))
         .map(|i| {
             let x: Vec<F128> = (0..n_rounds)
-                .map(|l| if (i >> l) & 1 == 1 { F128::ONE } else { F128::ZERO })
+                .map(|l| {
+                    if (i >> l) & 1 == 1 {
+                        F128::ONE
+                    } else {
+                        F128::ZERO
+                    }
+                })
                 .collect();
             source_weight_at(&z, &right_flat, &x, n_rounds)
         })
@@ -290,7 +302,11 @@ fn sb1_2_code_tree_binds_encode_reduction() {
         &mut ch_v,
     )
     .expect("encode binding: codeword~(z) reduces to an H opening");
-    assert_eq!(mle_eval(&h_flat, &pt), proof.final_value, "H opening at reduced point");
+    assert_eq!(
+        mle_eval(&h_flat, &pt),
+        proof.final_value,
+        "H opening at reduced point"
+    );
 
     // A codeword NOT of the form Code(H·eq_right) fails the encode binding at z.
     {
@@ -325,5 +341,9 @@ fn sb1_2_code_tree_binds_encode_reduction() {
         &mut ch_v,
     )
     .expect("H-claim discharge");
-    assert_eq!(mle_eval(&h_flat, &h_pt), h_proof.final_value, "H-claim opening");
+    assert_eq!(
+        mle_eval(&h_flat, &h_pt),
+        h_proof.final_value,
+        "H-claim opening"
+    );
 }

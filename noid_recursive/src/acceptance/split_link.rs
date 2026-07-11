@@ -15,13 +15,13 @@
 //! and spec).
 //!
 //! Nothing of any LINK class is baked into a link matrix. The ladder's
-//! link-class digests ride the public IO as a WHITELIST lane block that
-//! every non-genesis link inherits unchanged from its predecessor and the
-//! decider pins natively at the tip; the digest `[R]_prev` verifies
-//! against is derived as `Σ_a β_a·WL_a + g·D_T` from one-hot selector
-//! bits `β` (`Σ β_a = 1 + g`), which also subsumes the genesis digest
-//! rule. The block-class digest IS baked (the block class has no
-//! self-reference, so it is an ordinary protocol constant).
+//! link-class matrix digests and their matrix/spec/PCS/sidecar composite
+//! digests ride public IO as two paired WHITELIST lane blocks. Every
+//! non-genesis link inherits both unchanged and the decider pins/recomputes
+//! them at the tip. `[R]_prev` selects both identities as
+//! `Σ_a β_a·WL_a + g·D_T`; the raw digest binds the Field statement and the
+//! composite digest binds its post-commit sidecar context. The block-class
+//! identities are baked because the block class has no self-reference.
 //!
 //! Deferred matrix claims accumulate in PER-MATRIX LANES: one lane per
 //! link class plus one lane per block class, each `2·k_log + 1` point
@@ -32,10 +32,9 @@
 //! starts dead at the chain root (the genesis dummy T carries all-zero
 //! IO) and gates each fold's incoming claim: the old genesis gating,
 //! generalized per lane. A selected lane's outgoing liveness is
-//! identically 1 (char-2 OR against any incoming value), so a malicious
-//! T cannot un-mark a folded claim; extra live lanes planted via T's
-//! unconstrained IO can only ADD claims the decider then evaluates —
-//! rejection-only power.
+//! identically 1 (char-2 OR against any incoming value). The `g = 1` arm pins
+//! T's commitment to the canonical full-identity ghost witness and pins its
+//! IO to zero, so bootstrap cannot plant accumulator lanes.
 //!
 //! Chain rules: the block proof's exposed `start_acc` must equal the
 //! previous link's exposed block accumulator (or the class's genesis
@@ -44,47 +43,64 @@
 //! (tip, state, depth, counters and epoch) is the block class's job.
 //!
 //! The decider verifies the tip natively against its published class
-//! matrix, pins the whitelist lanes to the true link-class digests,
-//! rejects genesis tips, and evaluates each LIVE lane's accumulated
-//! claim against that lane's matrix — one native MLE pass per USED
-//! matrix; dead lanes need no matrix at all.
+//! matrix, pins both whitelist blocks, and evaluates each LIVE lane's
+//! accumulated claim against the published matrix — one native MLE pass per
+//! USED matrix; dead lanes need no matrix at all. A first block link may be a
+//! tip with `g = 1`: the flag says its predecessor is T, not that the tip is T.
 
-use noid_ivc_core::challenger::FsLaneChallenger;
+use std::sync::Arc;
+
+use noid_chain::BlockHeader;
+use noid_ivc_core::challenger::{Challenger, FsLaneChallenger};
 use noid_ivc_core::field::F128;
 use noid_ivc_core::field_circuit::{FieldR1csBuilder, FsChannelTrace, LinExpr};
-use noid_ivc_core::field_r1cs::FieldR1cs;
+use noid_ivc_core::field_r1cs::{FieldR1cs, SparseFieldMatrix};
 use noid_ivc_core::matrix_claim::{
-    prove_matrix_claim_fold, stacked_matrix_mle_eval, MatrixAccClaim,
+    prove_matrix_claim_fold, stacked_matrix_mle_eval, MatrixAccClaim, MatrixFoldProof,
 };
-use noid_ivc_core::pcs::PcsParams;
-use noid_ivc_core::proof::FieldShape;
+use noid_ivc_core::pcs::{Commitment, PcsParams};
+use noid_ivc_core::proof::{pcs_params_statement_bytes, FieldR1csProof, FieldShape, R1csClaim};
 use noid_ivc_core::public_io::{PublicIoSpec, WitnessSlice};
-
-use super::block_class::{BlockClass, BLOCK_IO_END_ACC, BLOCK_IO_START_ACC};
-use super::link::{
-    block_acc_lanes, genesis_baked_claim_value, genesis_instance, genesis_witness, LinkEnvelope,
-    RegionFrozenClaim,
+use noid_ivc_core::verifier::{
+    verify_field_deferred_matrix_with_post_commit_context,
+    verify_field_with_public_io_and_post_commit_context, VerifyError,
 };
+
+use super::block_class::{
+    is_production_block_io_spec, BlockClass, BlockProofEnvelope, BLOCK_IO_END_ACC,
+    BLOCK_IO_START_ACC,
+};
+use super::link::block_acc_lanes;
 use super::trace::matrix_fold::{
     verify_matrix_claim_fold_trace, MatrixAccClaimTrace, MatrixFoldProofTrace,
 };
 use super::trace::r_pcs_region::{
-    alloc_r_pcs_columns, discharge_r_pcs_via_region, r_pcs_region_native, RPcsProof,
+    finalize_r_pcs_link_region, prepare_r_pcs_link_columns_universal,
+    prepare_r_pcs_link_genesis_ghost, RPcsLinkRegionPreparation, RPcsLinkUniversalGeometry,
+    RPcsProof,
 };
 use super::trace::self_verify::{
-    alloc_flat_digest, flat_digest_lanes, verify_field_trace_deferred_region, FieldR1csProofTrace,
+    alloc_flat_digest, flat_digest_lanes, lagrange_weights_window_trace,
+    verify_field_trace_deferred_region_with_post_commit_context,
+    verify_field_trace_deferred_region_with_post_commit_context_expr, FieldR1csProofTrace,
     FlatDigestExpr, PcsWalkObligations,
 };
 use super::trace::{mul, pin_eq};
 use crate::accumulator::{genesis_accumulator, ChainAccumulator, ChainAccumulatorLaneError};
+use crate::region_sidecar::{
+    block_post_commit_class_digest, decode_block_region_sidecar_bounded,
+    decode_link_region_sidecar_bounded, link_post_commit_class_digest,
+    verify_block_region_sidecar_post_commit, verify_block_region_sidecar_trace_post_commit,
+    verify_link_region_sidecar_post_commit, verify_link_region_sidecar_trace_post_commit,
+    LinkRegionProverPlan, LinkRegionSidecarProof, LinkRegionSidecarVk, RegionSidecarError,
+};
 use noid_core::Block128;
-use noid_ivc_core::public_io::IoClaimSpec;
-use noid_ivc_prover::field_prover::prove_field_with_public_io;
+use noid_ivc_prover::field_prover::prove_field_with_public_io_and_post_commit_context;
 
 /// One ladder slot's protocol constants, as seen by EVERY link class (the
 /// lane widths must be known to lay out the shared IO). The full block
 /// spec is only needed by the slot's OWN link class.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct LadderSlotInfo {
     /// The consensus user-tx capacity this slot hosts.
     pub tier: usize,
@@ -93,6 +109,706 @@ pub struct LadderSlotInfo {
     /// The block class statement digest ([R]_B verifies against it; baked
     /// into the slot's link-class matrix).
     pub b_digest: [u8; 32],
+    /// Exact block PCS geometry.  The whole ladder is frozen into one
+    /// universal link-sidecar descriptor; mixed query counts are rejected.
+    pub b_pcs_params: PcsParams,
+    /// Composite identity of the exact block matrix/spec/PCS/sidecar class.
+    pub b_post_commit_class_digest: [u8; 32],
+    /// Digest of the ordered six-child block sidecar VK.  Keeping this lane
+    /// separately makes a mismatched but internally valid block authority
+    /// detectable before its hosted link class is materialized.
+    pub b_sidecar_vk_digest: [u8; 32],
+}
+
+/// Frozen production Field dimensions for the four consensus Block classes.
+pub const CANONICAL_BLOCK_CLASS_MS: [usize;
+    noid_chain::consensus::params::USER_TX_CLASS_TIERS.len()] = [22, 23, 23, 24];
+/// Frozen production Field dimension shared by every Link class.
+pub const CANONICAL_LINK_CLASS_M: usize = 24;
+/// Frozen production BaseFold inverse-rate logarithm.
+pub const CANONICAL_PCS_LOG_INV_RATE: usize = 2;
+/// Frozen production BaseFold row-batch logarithm.
+pub const CANONICAL_PCS_LOG_BATCH_SIZE: usize = 5;
+
+/// Validation failures for the production four-slot universal ladder.
+///
+/// The legacy one-slot benchmark constructs [`SplitLinkClass`] directly.  A
+/// production deployment must instead enter through
+/// [`CanonicalSplitLinkLadder`], which makes the complete consensus ladder a
+/// typed, validated object before any per-slot link class is frozen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CanonicalLadderError {
+    SlotCount {
+        expected: usize,
+        actual: usize,
+    },
+    TierMismatch {
+        slot: usize,
+        expected: usize,
+        actual: usize,
+    },
+    LinkClassSize {
+        expected: usize,
+        actual: usize,
+    },
+    LinkShape,
+    LinkPcsShape,
+    LinkPcsParameters,
+    LinkIoDoesNotFit,
+    BlockClassSize {
+        slot: usize,
+        expected: usize,
+        actual: usize,
+    },
+    BlockShape {
+        slot: usize,
+    },
+    BlockPcsShape {
+        slot: usize,
+    },
+    BlockPcsParameters {
+        slot: usize,
+    },
+    UnsupportedUniversalPcs,
+    SlotOutOfRange {
+        slot: usize,
+    },
+    BlockClassTier {
+        slot: usize,
+    },
+    BlockClassIdentity {
+        slot: usize,
+    },
+    BlockClassShape {
+        slot: usize,
+    },
+    BlockClassDigest {
+        slot: usize,
+    },
+    BlockClassPcs {
+        slot: usize,
+    },
+    BlockClassPostCommit {
+        slot: usize,
+    },
+    BlockClassSidecarVk {
+        slot: usize,
+    },
+    BlockMatrixShape {
+        slot: usize,
+    },
+    BlockMatrixDigest {
+        slot: usize,
+    },
+    BlockEnvelopePcs {
+        slot: usize,
+    },
+    BlockEnvelopeIo {
+        slot: usize,
+    },
+    BlockEnvelopeSidecar {
+        slot: usize,
+    },
+    BlockEnvelopeProof {
+        slot: usize,
+    },
+    MaterializedClassCount {
+        expected: usize,
+        actual: usize,
+    },
+    MaterializedClassShape {
+        slot: usize,
+    },
+    MaterializedClassPcs {
+        slot: usize,
+    },
+    MaterializedClassLadder {
+        slot: usize,
+    },
+    MaterializedClassSlot {
+        slot: usize,
+        actual: usize,
+    },
+    MaterializedClassIdentity {
+        slot: usize,
+    },
+    MaterializedSidecarIdentity {
+        slot: usize,
+    },
+    MaterializedGenesisIdentity {
+        slot: usize,
+    },
+}
+
+impl std::fmt::Display for CanonicalLadderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SlotCount { expected, actual } => {
+                write!(
+                    f,
+                    "canonical ladder requires {expected} slots, got {actual}"
+                )
+            }
+            Self::TierMismatch {
+                slot,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "canonical ladder slot {slot} must be B{expected}, got B{actual}"
+            ),
+            Self::LinkClassSize { expected, actual } => write!(
+                f,
+                "canonical Link class must use m{expected}, got m{actual}"
+            ),
+            Self::LinkShape => write!(f, "split-link shape must be one full Field block"),
+            Self::LinkPcsShape => write!(f, "link PCS descriptor does not match link shape"),
+            Self::LinkPcsParameters => {
+                write!(
+                    f,
+                    "link PCS descriptor is not the frozen production profile"
+                )
+            }
+            Self::LinkIoDoesNotFit => {
+                write!(f, "canonical split-link IO does not fit the link shape")
+            }
+            Self::BlockClassSize {
+                slot,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "canonical block slot {slot} must use m{expected}, got m{actual}"
+            ),
+            Self::BlockShape { slot } => {
+                write!(f, "block slot {slot} must be one canonical Field block")
+            }
+            Self::BlockPcsShape { slot } => {
+                write!(f, "block PCS descriptor does not match slot {slot} shape")
+            }
+            Self::BlockPcsParameters { slot } => write!(
+                f,
+                "block slot {slot} PCS descriptor is not the frozen production profile"
+            ),
+            Self::UnsupportedUniversalPcs => write!(
+                f,
+                "link and block PCS descriptors do not share supported universal geometry"
+            ),
+            Self::SlotOutOfRange { slot } => write!(f, "ladder slot {slot} is out of range"),
+            Self::BlockClassTier { slot } => {
+                write!(f, "block class tier does not match ladder slot {slot}")
+            }
+            Self::BlockClassIdentity { slot } => {
+                write!(f, "block class {slot} has an invalid frozen identity")
+            }
+            Self::BlockClassShape { slot } => {
+                write!(f, "block class shape does not match ladder slot {slot}")
+            }
+            Self::BlockClassDigest { slot } => {
+                write!(f, "block class digest does not match ladder slot {slot}")
+            }
+            Self::BlockClassPcs { slot } => {
+                write!(f, "block class PCS does not match ladder slot {slot}")
+            }
+            Self::BlockClassPostCommit { slot } => write!(
+                f,
+                "block post-commit class identity does not match ladder slot {slot}"
+            ),
+            Self::BlockClassSidecarVk { slot } => {
+                write!(f, "block sidecar VK does not match ladder slot {slot}")
+            }
+            Self::BlockMatrixShape { slot } => {
+                write!(f, "block matrix shape does not match ladder slot {slot}")
+            }
+            Self::BlockMatrixDigest { slot } => {
+                write!(f, "block matrix digest does not match ladder slot {slot}")
+            }
+            Self::BlockEnvelopePcs { slot } => {
+                write!(f, "sample block PCS does not match ladder slot {slot}")
+            }
+            Self::BlockEnvelopeIo { slot } => {
+                write!(f, "sample block IO does not match ladder slot {slot}")
+            }
+            Self::BlockEnvelopeSidecar { slot } => {
+                write!(f, "sample block sidecar does not match ladder slot {slot}")
+            }
+            Self::BlockEnvelopeProof { slot } => {
+                write!(
+                    f,
+                    "sample block proof does not verify for ladder slot {slot}"
+                )
+            }
+            Self::MaterializedClassCount { expected, actual } => write!(
+                f,
+                "materialized ladder requires {expected} classes, got {actual}"
+            ),
+            Self::MaterializedClassShape { slot } => {
+                write!(f, "materialized link class {slot} has a different shape")
+            }
+            Self::MaterializedClassPcs { slot } => {
+                write!(
+                    f,
+                    "materialized link class {slot} has different PCS parameters"
+                )
+            }
+            Self::MaterializedClassLadder { slot } => {
+                write!(f, "materialized link class {slot} has a different ladder")
+            }
+            Self::MaterializedClassSlot { slot, actual } => write!(
+                f,
+                "materialized link class {slot} advertises ladder slot {actual}"
+            ),
+            Self::MaterializedClassIdentity { slot } => {
+                write!(
+                    f,
+                    "materialized link class {slot} has an invalid frozen identity"
+                )
+            }
+            Self::MaterializedSidecarIdentity { slot } => write!(
+                f,
+                "materialized link class {slot} has a different universal sidecar identity"
+            ),
+            Self::MaterializedGenesisIdentity { slot } => write!(
+                f,
+                "materialized link class {slot} has a different genesis identity"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CanonicalLadderError {}
+
+/// One slot's already-frozen block artifacts used to materialize its link
+/// class.  All four values are consumed under one
+/// [`CanonicalSplitLinkLadder`] descriptor, so shape/PCS/ladder drift between
+/// link classes is rejected before the expensive freeze begins.
+#[derive(Clone, Copy)]
+pub struct SplitLinkSlotMaterial<'a> {
+    pub block_class: &'a BlockClass,
+    pub sample_block: &'a BlockProofEnvelope,
+    pub block_matrix: &'a FieldR1cs,
+}
+
+/// The sole production universal-ladder descriptor.
+///
+/// Construction enforces the exact consensus order `B8, B32, B64, B255`,
+/// each block shape's exact PCS dimension, and the common query geometry used
+/// by the universal link sidecar.  Reusing this object to freeze every slot
+/// guarantees that all four link classes receive byte-identical ladder data,
+/// link shape, and link PCS parameters.
+#[derive(Clone, Debug)]
+pub struct CanonicalSplitLinkLadder {
+    link_shape: FieldShape,
+    link_pcs_params: PcsParams,
+    slots: [LadderSlotInfo; noid_chain::consensus::params::USER_TX_CLASS_TIERS.len()],
+}
+
+fn is_canonical_pcs_profile(params: &PcsParams) -> bool {
+    params.log_inv_rate == CANONICAL_PCS_LOG_INV_RATE
+        && params.log_batch_size == CANONICAL_PCS_LOG_BATCH_SIZE
+        && params.profile == Default::default()
+}
+
+/// Materialize an ordered fixed-size registry whose first entry constructs a
+/// shared bootstrap and whose remaining entries consume it.  Keeping this
+/// orchestration generic makes the one-bootstrap ownership rule testable
+/// without building production-size recursive matrices.
+fn materialize_with_shared_bootstrap<T, C, S, const N: usize>(
+    materials: [T; N],
+    mut freeze_first: impl FnMut(usize, T) -> (C, S),
+    mut freeze_shared: impl FnMut(usize, T, &S) -> C,
+) -> [C; N] {
+    let mut materials = materials.into_iter().enumerate();
+    let (first_slot, first_material) = materials
+        .next()
+        .expect("a shared-bootstrap registry has at least one slot");
+    let (first, shared) = freeze_first(first_slot, first_material);
+
+    let mut classes = Vec::with_capacity(N);
+    classes.push(first);
+    for (slot, material) in materials {
+        classes.push(freeze_shared(slot, material, &shared));
+    }
+    classes
+        .try_into()
+        .unwrap_or_else(|_| unreachable!("fixed registry count was preallocated"))
+}
+
+impl CanonicalSplitLinkLadder {
+    pub const SLOT_COUNT: usize = noid_chain::consensus::params::USER_TX_CLASS_TIERS.len();
+
+    /// Validate an externally materialized descriptor.  `slots` is a `Vec`
+    /// deliberately: decoded/configured ladders must prove their exact length,
+    /// not gain it from an array type supplied by the caller.
+    pub fn try_new(
+        link_shape: FieldShape,
+        link_pcs_params: PcsParams,
+        slots: Vec<LadderSlotInfo>,
+    ) -> Result<Self, CanonicalLadderError> {
+        let actual = slots.len();
+        let slots: [LadderSlotInfo; Self::SLOT_COUNT] =
+            slots
+                .try_into()
+                .map_err(|_| CanonicalLadderError::SlotCount {
+                    expected: Self::SLOT_COUNT,
+                    actual,
+                })?;
+
+        for (slot, (&expected, info)) in noid_chain::consensus::params::USER_TX_CLASS_TIERS
+            .iter()
+            .zip(&slots)
+            .enumerate()
+        {
+            if info.tier != expected {
+                return Err(CanonicalLadderError::TierMismatch {
+                    slot,
+                    expected,
+                    actual: info.tier,
+                });
+            }
+        }
+        if link_shape.m != CANONICAL_LINK_CLASS_M {
+            return Err(CanonicalLadderError::LinkClassSize {
+                expected: CANONICAL_LINK_CLASS_M,
+                actual: link_shape.m,
+            });
+        }
+        if link_shape.m >= usize::BITS as usize
+            || link_shape.m != link_shape.k_log
+            || link_shape.k_skip > link_shape.k_log
+            || link_shape.k_skip != noid_ivc_core::zerocheck::K_SKIP
+            || link_shape.const_pin != Some(0)
+        {
+            return Err(CanonicalLadderError::LinkShape);
+        }
+        if link_shape.m.checked_add(noid_ivc_core::pcs::LOG_PACKING) != Some(link_pcs_params.m) {
+            return Err(CanonicalLadderError::LinkPcsShape);
+        }
+        if !is_canonical_pcs_profile(&link_pcs_params) {
+            return Err(CanonicalLadderError::LinkPcsParameters);
+        }
+        for (slot, (info, &expected_m)) in slots.iter().zip(&CANONICAL_BLOCK_CLASS_MS).enumerate() {
+            if info.b_shape.m != expected_m {
+                return Err(CanonicalLadderError::BlockClassSize {
+                    slot,
+                    expected: expected_m,
+                    actual: info.b_shape.m,
+                });
+            }
+            if info.b_shape.m >= usize::BITS as usize
+                || info.b_shape.m != info.b_shape.k_log
+                || info.b_shape.k_skip > info.b_shape.k_log
+                || info.b_shape.k_skip != noid_ivc_core::zerocheck::K_SKIP
+                || info.b_shape.const_pin != Some(0)
+            {
+                return Err(CanonicalLadderError::BlockShape { slot });
+            }
+            if info.b_shape.m.checked_add(noid_ivc_core::pcs::LOG_PACKING)
+                != Some(info.b_pcs_params.m)
+            {
+                return Err(CanonicalLadderError::BlockPcsShape { slot });
+            }
+            if !is_canonical_pcs_profile(&info.b_pcs_params) {
+                return Err(CanonicalLadderError::BlockPcsParameters { slot });
+            }
+        }
+        let spec = split_io_spec(link_shape.k_log, &slots);
+        if !spec.io_slice.fits(link_shape.m) || spec.io_len > spec.io_slice.len() {
+            return Err(CanonicalLadderError::LinkIoDoesNotFit);
+        }
+
+        let link_rate = link_pcs_params.log_inv_rate;
+        // `default_fri_queries` is intentionally total only on the supported
+        // table and panics otherwise.  Check its domain before deriving the
+        // query count that the authoritative universal-geometry constructor
+        // requires as input; that constructor then validates every group.
+        if !(1..=5).contains(&link_rate) {
+            return Err(CanonicalLadderError::UnsupportedUniversalPcs);
+        }
+        let n_queries = noid_ivc_core::pcs::default_fri_queries(link_rate);
+        let block_params = slots
+            .iter()
+            .map(|slot| slot.b_pcs_params.clone())
+            .collect::<Vec<_>>();
+        RPcsLinkUniversalGeometry::new(&link_pcs_params, &block_params, n_queries)
+            .map_err(|_| CanonicalLadderError::UnsupportedUniversalPcs)?;
+
+        Ok(Self {
+            link_shape,
+            link_pcs_params,
+            slots,
+        })
+    }
+
+    /// Materialize the descriptor directly from the four frozen block
+    /// classes.  The input order is consensus-significant and checked by
+    /// [`try_new`](Self::try_new).
+    pub fn from_block_classes(
+        link_shape: FieldShape,
+        link_pcs_params: PcsParams,
+        block_classes: [&BlockClass; Self::SLOT_COUNT],
+    ) -> Result<Self, CanonicalLadderError> {
+        let mut slots = Vec::with_capacity(Self::SLOT_COUNT);
+        for (slot, block_class) in block_classes.into_iter().enumerate() {
+            let b_digest = block_class
+                .validate_frozen_identity()
+                .map_err(|_| CanonicalLadderError::BlockClassIdentity { slot })?;
+            slots.push(LadderSlotInfo {
+                tier: block_class.tier(),
+                b_shape: block_class.shape,
+                b_digest,
+                b_pcs_params: block_class.pcs_params.clone(),
+                b_post_commit_class_digest: *block_class.post_commit_class_digest(),
+                b_sidecar_vk_digest: block_class.sidecar_vk().transcript_digest(),
+            });
+        }
+        Self::try_new(link_shape, link_pcs_params, slots)
+    }
+
+    pub fn link_shape(&self) -> FieldShape {
+        self.link_shape
+    }
+
+    pub fn link_pcs_params(&self) -> &PcsParams {
+        &self.link_pcs_params
+    }
+
+    pub fn slots(&self) -> &[LadderSlotInfo; Self::SLOT_COUNT] {
+        &self.slots
+    }
+
+    /// Recoverable metadata/shape preflight for one hosted slot.  This is
+    /// separate from [`freeze_slot`](Self::freeze_slot): the actual recursive
+    /// class build is assertion-driven and can still fail if the supplied
+    /// proof is cryptographically invalid.
+    pub fn validate_slot_material(
+        &self,
+        slot: usize,
+        material: SplitLinkSlotMaterial<'_>,
+    ) -> Result<(), CanonicalLadderError> {
+        let info = self
+            .slots
+            .get(slot)
+            .ok_or(CanonicalLadderError::SlotOutOfRange { slot })?;
+        let b_digest = material
+            .block_class
+            .validate_frozen_identity()
+            .map_err(|_| CanonicalLadderError::BlockClassIdentity { slot })?;
+        if material.block_class.tier() != info.tier {
+            return Err(CanonicalLadderError::BlockClassTier { slot });
+        }
+        if material.block_class.shape != info.b_shape {
+            return Err(CanonicalLadderError::BlockClassShape { slot });
+        }
+        if b_digest != info.b_digest {
+            return Err(CanonicalLadderError::BlockClassDigest { slot });
+        }
+        if !same_pcs_params(&material.block_class.pcs_params, &info.b_pcs_params) {
+            return Err(CanonicalLadderError::BlockClassPcs { slot });
+        }
+        if material.block_class.post_commit_class_digest() != &info.b_post_commit_class_digest {
+            return Err(CanonicalLadderError::BlockClassPostCommit { slot });
+        }
+        if material.block_class.sidecar_vk().transcript_digest() != info.b_sidecar_vk_digest {
+            return Err(CanonicalLadderError::BlockClassSidecarVk { slot });
+        }
+        if FieldShape::of(material.block_matrix) != info.b_shape {
+            return Err(CanonicalLadderError::BlockMatrixShape { slot });
+        }
+        if material.block_matrix.structural_statement_digest() != info.b_digest {
+            return Err(CanonicalLadderError::BlockMatrixDigest { slot });
+        }
+        if !same_pcs_params(
+            &material.sample_block.commitment().params,
+            &info.b_pcs_params,
+        ) {
+            return Err(CanonicalLadderError::BlockEnvelopePcs { slot });
+        }
+        if material.sample_block.io().len() != material.block_class.spec.io_len {
+            return Err(CanonicalLadderError::BlockEnvelopeIo { slot });
+        }
+        for offset in [BLOCK_IO_START_ACC, BLOCK_IO_END_ACC] {
+            let lanes = std::array::from_fn(|lane| {
+                Block128::from(flat_to_block(material.sample_block.io()[offset + lane]))
+            });
+            ChainAccumulator::from_lanes(lanes)
+                .map_err(|_| CanonicalLadderError::BlockEnvelopeIo { slot })?;
+        }
+        let encoded = bincode::serialize(material.sample_block.region_sidecar())
+            .map_err(|_| CanonicalLadderError::BlockEnvelopeSidecar { slot })?;
+        decode_block_region_sidecar_bounded(
+            material.block_class.sidecar_vk(),
+            info.b_shape.m,
+            &encoded,
+        )
+        .map_err(|_| CanonicalLadderError::BlockEnvelopeSidecar { slot })?;
+        let mut challenger = FsLaneChallenger::new(b"history-block-v0");
+        verify_field_deferred_matrix_with_post_commit_context(
+            &info.b_shape,
+            &info.b_digest,
+            material.sample_block.commitment(),
+            material.sample_block.field_proof(),
+            &material.block_class.spec,
+            material.sample_block.io(),
+            &info.b_post_commit_class_digest,
+            material.sample_block.region_sidecar(),
+            &mut challenger,
+            |sidecar, context| {
+                verify_block_region_sidecar_post_commit(
+                    material.block_class.sidecar_vk(),
+                    sidecar,
+                    context,
+                )
+                .map_err(|_| VerifyError::Auxiliary)
+            },
+        )
+        .map_err(|_| CanonicalLadderError::BlockEnvelopeProof { slot })?;
+        Ok(())
+    }
+
+    /// Freeze one hosted link class.  Call
+    /// [`validate_slot_material`](Self::validate_slot_material) directly when
+    /// a recoverable preflight result is needed.
+    pub fn freeze_slot(&self, slot: usize, material: SplitLinkSlotMaterial<'_>) -> SplitLinkClass {
+        self.validate_slot_material(slot, material)
+            .expect("invalid canonical split-link slot material");
+        self.freeze_slot_preflighted(slot, material)
+    }
+
+    fn freeze_slot_preflighted(
+        &self,
+        slot: usize,
+        material: SplitLinkSlotMaterial<'_>,
+    ) -> SplitLinkClass {
+        self.freeze_slot_preflighted_with_genesis(slot, material, None)
+    }
+
+    fn freeze_slot_preflighted_with_genesis(
+        &self,
+        slot: usize,
+        material: SplitLinkSlotMaterial<'_>,
+        shared_genesis: Option<&SharedSplitLinkGenesis>,
+    ) -> SplitLinkClass {
+        SplitLinkClass::freeze(
+            self.link_shape,
+            self.link_pcs_params.clone(),
+            self.slots.to_vec(),
+            slot,
+            material.block_class,
+            material.sample_block,
+            material.block_matrix,
+            shared_genesis,
+        )
+    }
+
+    /// Freeze the complete universal ladder from ordered per-tier artifacts.
+    pub fn freeze_all(
+        &self,
+        materials: [SplitLinkSlotMaterial<'_>; Self::SLOT_COUNT],
+    ) -> [SplitLinkClass; Self::SLOT_COUNT] {
+        for (slot, material) in materials.iter().copied().enumerate() {
+            self.validate_slot_material(slot, material)
+                .expect("invalid canonical split-link ladder material");
+        }
+        let classes = materialize_with_shared_bootstrap(
+            materials,
+            |slot, material| {
+                let class = self.freeze_slot_preflighted(slot, material);
+                let shared_genesis = class.shared_genesis();
+                (class, shared_genesis)
+            },
+            |slot, material, shared_genesis| {
+                self.freeze_slot_preflighted_with_genesis(slot, material, Some(shared_genesis))
+            },
+        );
+        self.validate_materialized(&classes)
+            .expect("fresh canonical split-link ladder identity drift");
+        for class in &classes[1..] {
+            assert!(
+                classes[0].shares_genesis_artifacts_with(class),
+                "freeze_all must retain one shared canonical genesis bootstrap"
+            );
+        }
+        classes
+    }
+
+    /// Validate classes materialized elsewhere against this descriptor.  This
+    /// is useful when class construction is distributed or cached.
+    pub fn validate_materialized(
+        &self,
+        classes: &[SplitLinkClass],
+    ) -> Result<(), CanonicalLadderError> {
+        if classes.len() != Self::SLOT_COUNT {
+            return Err(CanonicalLadderError::MaterializedClassCount {
+                expected: Self::SLOT_COUNT,
+                actual: classes.len(),
+            });
+        }
+        let reference = &classes[0];
+        reference
+            .validate_materialized_identity()
+            .map_err(|_| CanonicalLadderError::MaterializedClassIdentity { slot: 0 })?;
+        let reference_sidecar_vk = reference
+            .sidecar_vk
+            .get()
+            .ok_or(CanonicalLadderError::MaterializedClassIdentity { slot: 0 })?;
+        let reference_genesis_envelope = reference
+            .genesis_envelope
+            .get()
+            .ok_or(CanonicalLadderError::MaterializedClassIdentity { slot: 0 })?;
+        let reference_genesis_bytes = bincode::serialize(reference_genesis_envelope.as_ref())
+            .map_err(|_| CanonicalLadderError::MaterializedClassIdentity { slot: 0 })?;
+        for (slot, class) in classes.iter().enumerate() {
+            class
+                .validate_materialized_identity()
+                .map_err(|_| CanonicalLadderError::MaterializedClassIdentity { slot })?;
+            if class.shape != self.link_shape {
+                return Err(CanonicalLadderError::MaterializedClassShape { slot });
+            }
+            if !same_pcs_params(&class.pcs_params, &self.link_pcs_params) {
+                return Err(CanonicalLadderError::MaterializedClassPcs { slot });
+            }
+            if !same_ladder(&class.ladder, &self.slots) {
+                return Err(CanonicalLadderError::MaterializedClassLadder { slot });
+            }
+            if class.slot != slot {
+                return Err(CanonicalLadderError::MaterializedClassSlot {
+                    slot,
+                    actual: class.slot,
+                });
+            }
+            if class.sidecar_vk.get() != Some(reference_sidecar_vk) {
+                return Err(CanonicalLadderError::MaterializedSidecarIdentity { slot });
+            }
+            let genesis_envelope = class
+                .genesis_envelope
+                .get()
+                .ok_or(CanonicalLadderError::MaterializedClassIdentity { slot })?;
+            let genesis_bytes = bincode::serialize(genesis_envelope.as_ref())
+                .map_err(|_| CanonicalLadderError::MaterializedClassIdentity { slot })?;
+            if class.genesis_digest != reference.genesis_digest
+                || class.genesis_post_commit_class_digest.get()
+                    != reference.genesis_post_commit_class_digest.get()
+                || class.genesis_block_accumulator != reference.genesis_block_accumulator
+                || genesis_bytes != reference_genesis_bytes
+            {
+                return Err(CanonicalLadderError::MaterializedGenesisIdentity { slot });
+            }
+        }
+        Ok(())
+    }
+}
+
+fn same_ladder(left: &[LadderSlotInfo], right: &[LadderSlotInfo]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            left.tier == right.tier
+                && left.b_shape == right.b_shape
+                && left.b_digest == right.b_digest
+                && same_pcs_params(&left.b_pcs_params, &right.b_pcs_params)
+                && left.b_post_commit_class_digest == right.b_post_commit_class_digest
+                && left.b_sidecar_vk_digest == right.b_sidecar_vk_digest
+        })
 }
 
 /// Offsets of one per-matrix accumulator lane within the link IO.
@@ -121,37 +837,31 @@ impl SplitLaneLayout {
 }
 
 /// The split-link public-IO layout, shared by every link class of a
-/// ladder: `[g | whitelist (2 lanes per slot) | link lanes | block
-/// lanes | block_acc (ACC_LANES)]`.
+/// ladder: `[g | matrix whitelist (2 lanes per slot) | post-commit whitelist
+/// (2 lanes per slot) | link lanes | block lanes | block_acc (ACC_LANES)]`.
 #[derive(Clone, Debug)]
 pub struct SplitIoLayout {
     pub g: usize,
     /// First whitelist lane (`2 · n_slots` lanes: the link-class
     /// statement digests, inherited along the chain).
     pub wl: usize,
+    /// First composite post-commit class-digest whitelist lane.
+    pub wl_post_commit: usize,
     /// Per-link-class accumulator lanes (all at the link k_log).
     pub link_lanes: Vec<SplitLaneLayout>,
     /// Per-block-class accumulator lanes (slot-specific k_log).
     pub b_lanes: Vec<SplitLaneLayout>,
     /// The covered block's end accumulator ([`ACC_LANES`] lanes).
     pub block_acc: usize,
-    /// First lane of the [R]-PCS walk opening-claim tail.
-    pub region_tail_offset: usize,
-    /// Region tail length (`n_claims × (max_arity + 1)`).
-    pub region_len: usize,
     pub len: usize,
 }
 
-pub fn split_io_layout(
-    link_k_log: usize,
-    ladder: &[LadderSlotInfo],
-    n_claims: usize,
-    max_arity: usize,
-) -> SplitIoLayout {
+pub fn split_io_layout(link_k_log: usize, ladder: &[LadderSlotInfo]) -> SplitIoLayout {
     let n = ladder.len();
     let g = 0usize;
     let wl = 1usize;
-    let mut off = wl + 2 * n;
+    let wl_post_commit = wl + 2 * n;
+    let mut off = wl_post_commit + 2 * n;
     let mut link_lanes = Vec::with_capacity(n);
     for _ in 0..n {
         let (lane, next) = SplitLaneLayout::new(off, link_k_log);
@@ -164,51 +874,281 @@ pub fn split_io_layout(
         b_lanes.push(lane);
         off = next;
     }
-    let region_tail_offset = off + super::link::ACC_LANES;
-    let region_len = n_claims * (max_arity + 1);
     SplitIoLayout {
         g,
         wl,
+        wl_post_commit,
         link_lanes,
         b_lanes,
         block_acc: off,
-        region_tail_offset,
-        region_len,
-        len: region_tail_offset + region_len,
+        len: off + super::link::ACC_LANES,
     }
 }
 
-/// The shared spec: one dyadic IO slice plus one derived opening claim
-/// per frozen [R]-PCS walk claim, reading its point/value out of the
-/// region tail lanes (identical mechanics to the block class's spec —
-/// the successor's `[R]_prev` replay enforces the walk claims against
-/// THIS link's committed walk columns).
-pub fn split_io_spec(
-    link_k_log: usize,
-    ladder: &[LadderSlotInfo],
-    frozen: &[RegionFrozenClaim],
-    max_arity: usize,
-) -> PublicIoSpec {
-    let layout = split_io_layout(link_k_log, ladder, frozen.len(), max_arity);
+/// The shared fixed statement. Link-region openings are verifier output of the
+/// mandatory post-commit sidecar and never public-IO claim descriptors.
+pub fn split_io_spec(link_k_log: usize, ladder: &[LadderSlotInfo]) -> PublicIoSpec {
+    let layout = split_io_layout(link_k_log, ladder);
     let log2_len = layout.len.next_power_of_two().trailing_zeros() as usize;
-    let stride = max_arity + 1;
-    let claims = frozen
-        .iter()
-        .enumerate()
-        .map(|(ci, fc)| {
-            let base = layout.region_tail_offset + ci * stride;
-            IoClaimSpec {
-                slice: fc.slice,
-                point: base..base + fc.arity,
-                value: base + max_arity,
-            }
-        })
-        .collect();
     PublicIoSpec {
         io_slice: WitnessSlice { log2_len, index: 1 },
         io_len: layout.len,
-        claims,
+        claims: Vec::new(),
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SplitTransitionSelection {
+    digest: [u8; 32],
+    post_commit: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SplitTransitionError {
+    PreviousSlot,
+    CurrentSlot,
+    PreviousIo,
+    WhitelistSize,
+    PostCommitWhitelistSize,
+    WhitelistInheritance,
+    PostCommitWhitelistInheritance,
+    SelectedLinkMatrix,
+    SelectedLinkPostCommit,
+    CurrentBlockMatrix,
+    AccumulatorWidth,
+    AccumulatorContinuity,
+    LinkClaimWidth,
+    BlockClaimWidth,
+}
+
+/// Cheap non-genesis preflight shared by every real class transition.
+///
+/// The cryptographic replay below still verifies the previous envelope.  This
+/// boundary additionally makes the native fold inputs unambiguous before any
+/// expensive work: `prev_slot` must select the matrix actually supplied to the
+/// fold, its paired post-commit identity, and the exact whitelist inherited in
+/// the previous public IO.  The hosted Block matrix and direct accumulator
+/// boundary are checked at the same time.
+#[allow(clippy::too_many_arguments)]
+fn preflight_split_transition(
+    layout: &SplitIoLayout,
+    prev_slot: usize,
+    current_slot: usize,
+    link_class_digests: &[[u8; 32]],
+    link_post_commit_class_digests: &[[u8; 32]],
+    prev_io: &[F128],
+    fold_link_matrix_digest: [u8; 32],
+    fold_link_post_commit: [u8; 32],
+    fold_block_matrix_digest: [u8; 32],
+    expected_block_matrix_digest: [u8; 32],
+    block_start_accumulator: &[F128],
+    expected_start_accumulator: &[F128],
+) -> Result<SplitTransitionSelection, SplitTransitionError> {
+    let n = layout.link_lanes.len();
+    if prev_slot >= n {
+        return Err(SplitTransitionError::PreviousSlot);
+    }
+    if current_slot >= n || layout.b_lanes.len() != n {
+        return Err(SplitTransitionError::CurrentSlot);
+    }
+    if prev_io.len() != layout.len {
+        return Err(SplitTransitionError::PreviousIo);
+    }
+    if link_class_digests.len() != n {
+        return Err(SplitTransitionError::WhitelistSize);
+    }
+    if link_post_commit_class_digests.len() != n {
+        return Err(SplitTransitionError::PostCommitWhitelistSize);
+    }
+    for (slot, digest) in link_class_digests.iter().enumerate() {
+        let lanes = flat_digest_lanes(digest);
+        if prev_io[layout.wl + 2 * slot] != lanes[0]
+            || prev_io[layout.wl + 2 * slot + 1] != lanes[1]
+        {
+            return Err(SplitTransitionError::WhitelistInheritance);
+        }
+    }
+    for (slot, digest) in link_post_commit_class_digests.iter().enumerate() {
+        let lanes = flat_digest_lanes(digest);
+        if prev_io[layout.wl_post_commit + 2 * slot] != lanes[0]
+            || prev_io[layout.wl_post_commit + 2 * slot + 1] != lanes[1]
+        {
+            return Err(SplitTransitionError::PostCommitWhitelistInheritance);
+        }
+    }
+    let selected = SplitTransitionSelection {
+        digest: link_class_digests[prev_slot],
+        post_commit: link_post_commit_class_digests[prev_slot],
+    };
+    if selected.digest != fold_link_matrix_digest {
+        return Err(SplitTransitionError::SelectedLinkMatrix);
+    }
+    if selected.post_commit != fold_link_post_commit {
+        return Err(SplitTransitionError::SelectedLinkPostCommit);
+    }
+    if fold_block_matrix_digest != expected_block_matrix_digest {
+        return Err(SplitTransitionError::CurrentBlockMatrix);
+    }
+    if block_start_accumulator.len() != super::link::ACC_LANES
+        || expected_start_accumulator.len() != super::link::ACC_LANES
+    {
+        return Err(SplitTransitionError::AccumulatorWidth);
+    }
+    if block_start_accumulator != expected_start_accumulator {
+        return Err(SplitTransitionError::AccumulatorContinuity);
+    }
+    Ok(selected)
+}
+
+/// Construct the transition-dependent public IO.  Keeping this routing in one
+/// production helper lets the exhaustive 4x4 gate cover downward and skipped
+/// transitions without constructing sixteen m24 recursive proofs.
+#[allow(clippy::too_many_arguments)]
+fn route_split_transition_io(
+    layout: &SplitIoLayout,
+    genesis: bool,
+    prev_slot: usize,
+    current_slot: usize,
+    link_class_digests: &[[u8; 32]],
+    link_post_commit_class_digests: &[[u8; 32]],
+    prev_io: &[F128],
+    acc_link: &MatrixAccClaim,
+    acc_block: &MatrixAccClaim,
+    block_end_accumulator: &[F128],
+) -> Result<Vec<F128>, SplitTransitionError> {
+    let n = layout.link_lanes.len();
+    if (!genesis && prev_slot >= n) || prev_io.len() != layout.len {
+        return Err(if prev_io.len() != layout.len {
+            SplitTransitionError::PreviousIo
+        } else {
+            SplitTransitionError::PreviousSlot
+        });
+    }
+    if current_slot >= n || layout.b_lanes.len() != n {
+        return Err(SplitTransitionError::CurrentSlot);
+    }
+    if link_class_digests.len() != n {
+        return Err(SplitTransitionError::WhitelistSize);
+    }
+    if link_post_commit_class_digests.len() != n {
+        return Err(SplitTransitionError::PostCommitWhitelistSize);
+    }
+    let link_lane = &layout.link_lanes[if genesis { 0 } else { prev_slot }];
+    if acc_link.point.len() != link_lane.value - link_lane.point {
+        return Err(SplitTransitionError::LinkClaimWidth);
+    }
+    let block_lane = &layout.b_lanes[current_slot];
+    if acc_block.point.len() != block_lane.value - block_lane.point {
+        return Err(SplitTransitionError::BlockClaimWidth);
+    }
+    if block_end_accumulator.len() != super::link::ACC_LANES {
+        return Err(SplitTransitionError::AccumulatorWidth);
+    }
+
+    let mut io = vec![F128::ZERO; layout.len];
+    io[layout.g] = if genesis { F128::ONE } else { F128::ZERO };
+    for (slot, digest) in link_class_digests.iter().enumerate() {
+        let lanes = flat_digest_lanes(digest);
+        io[layout.wl + 2 * slot] = lanes[0];
+        io[layout.wl + 2 * slot + 1] = lanes[1];
+    }
+    for (slot, digest) in link_post_commit_class_digests.iter().enumerate() {
+        let lanes = flat_digest_lanes(digest);
+        io[layout.wl_post_commit + 2 * slot] = lanes[0];
+        io[layout.wl_post_commit + 2 * slot + 1] = lanes[1];
+    }
+    for (slot, lane) in layout.link_lanes.iter().enumerate() {
+        if !genesis && slot == prev_slot {
+            io[lane.point..lane.value].copy_from_slice(&acc_link.point);
+            io[lane.value] = acc_link.value;
+            io[lane.live] = F128::ONE;
+        } else {
+            io[lane.point..=lane.live].copy_from_slice(&prev_io[lane.point..=lane.live]);
+        }
+    }
+    for (slot, lane) in layout.b_lanes.iter().enumerate() {
+        if slot == current_slot {
+            io[lane.point..lane.value].copy_from_slice(&acc_block.point);
+            io[lane.value] = acc_block.value;
+            io[lane.live] = F128::ONE;
+        } else {
+            io[lane.point..=lane.live].copy_from_slice(&prev_io[lane.point..=lane.live]);
+        }
+    }
+    io[layout.block_acc..layout.block_acc + super::link::ACC_LANES]
+        .copy_from_slice(block_end_accumulator);
+    Ok(io)
+}
+
+/// Bootstrap relation used only by split links.  Every row is the tautology
+/// `z_r · z_0 = z_r`, so the canonical nonzero L-A/L-B ghost columns can live
+/// in T's committed witness.  Its deferred matrix claim still has a compact
+/// closed form (see [`split_genesis_baked_claim_value`]); no T matrix is baked
+/// into the recursive class.
+fn split_genesis_instance(shape: &FieldShape) -> FieldR1cs {
+    assert_eq!(shape.m, shape.k_log, "split genesis is one Field block");
+    let k = 1usize << shape.k_log;
+    let row_offsets = (0..=k).collect::<Vec<_>>();
+    let width = u32::try_from(k).expect("split genesis width fits u32");
+    let a_0 = SparseFieldMatrix::from_dict(
+        k,
+        (0..width).collect(),
+        vec![0; k],
+        vec![F128::ONE],
+        row_offsets.clone(),
+    );
+    let b_0 = SparseFieldMatrix::from_dict(k, vec![0; k], vec![0; k], vec![F128::ONE], row_offsets);
+    FieldR1cs {
+        m: shape.m,
+        k_log: shape.k_log,
+        k_skip: shape.k_skip,
+        useful_rows: k,
+        a_0,
+        b_0,
+        const_pin: Some(0),
+        digest_cache: std::sync::OnceLock::new(),
+        csc_cache: std::sync::OnceLock::new(),
+    }
+}
+
+fn split_genesis_baked_claim_value(
+    b: &mut FieldR1csBuilder,
+    fresh: &super::trace::matrix_fold::FreshLincheckClaimTrace,
+) -> LinExpr {
+    let ell = fresh.z_partial.len();
+    assert!(ell.is_power_of_two(), "genesis z_partial window");
+    let one = LinExpr::constant(F128::ONE);
+    let lambda = lagrange_weights_window_trace(b, &fresh.z_skip, 0, ell, 0);
+    let mut low_diagonal = LinExpr::zero();
+    for row in 0..ell {
+        low_diagonal = low_diagonal.add(&mul(b, &lambda[row], &fresh.z_partial[row]));
+    }
+    let mut high_diagonal = LinExpr::constant(F128::ONE);
+    for (x, r) in fresh.x_inner_rest.iter().zip(&fresh.r_inner_rest) {
+        let both = mul(b, x, r);
+        let neither = mul(b, &one.add(x), &one.add(r));
+        high_diagonal = mul(b, &high_diagonal, &both.add(&neither));
+    }
+    let mut q0 = LinExpr::constant(F128::ONE);
+    for r in &fresh.r_inner_rest {
+        q0 = mul(b, &q0, &one.add(r));
+    }
+    let a = mul(b, &fresh.alpha, &low_diagonal);
+    let a = mul(b, &a, &high_diagonal);
+    let b_value = mul(b, &fresh.z_partial[0], &q0);
+    a.add(&b_value)
+}
+
+/// The slot-independent bootstrap retained by every class in one materialized
+/// ladder.  The matrix and proof envelope dominate its memory footprint, so
+/// `freeze_all` owns each exactly once and clones only these handles.
+#[derive(Clone)]
+struct SharedSplitLinkGenesis {
+    genesis: Arc<FieldR1cs>,
+    genesis_digest: [u8; 32],
+    sidecar_vk: Arc<LinkRegionSidecarVk>,
+    post_commit_class_digest: [u8; 32],
+    envelope: Arc<LinkProofEnvelope>,
 }
 
 /// One ladder slot's LINK class constants.
@@ -223,191 +1163,344 @@ pub struct SplitLinkClass {
     pub class_statement_digest: std::sync::OnceLock<[u8; 32]>,
     /// The genesis dummy T (shape + spec constants only — one T proof
     /// serves every class of the ladder).
-    pub genesis: FieldR1cs,
+    pub genesis: Arc<FieldR1cs>,
     pub genesis_digest: [u8; 32],
     /// The block accumulator a genesis link's block must start from.
     genesis_block_accumulator: ChainAccumulator,
-    pub ladder: Vec<LadderSlotInfo>,
+    ladder: Vec<LadderSlotInfo>,
     /// This class's ladder slot (selects the hosted block class).
-    pub slot: usize,
+    slot: usize,
     /// The slot's block-class spec ([R]_B replays it; a baked structural
     /// constant of this class).
-    pub b_spec: PublicIoSpec,
+    b_spec: PublicIoSpec,
     /// The slot's block-class PCS parameters.
-    pub b_pcs_params: PcsParams,
-    /// The frozen [R]-PCS walk opening-claim shape; every build
-    /// reproduces exactly these `(slice, arity)` pairs.
-    pub region_claims: Vec<RegionFrozenClaim>,
-    pub region_max_arity: usize,
+    b_pcs_params: PcsParams,
+    universal_geometry: RPcsLinkUniversalGeometry,
+    sidecar_vk: std::sync::OnceLock<Arc<LinkRegionSidecarVk>>,
+    post_commit_class_digest: std::sync::OnceLock<[u8; 32]>,
+    genesis_post_commit_class_digest: std::sync::OnceLock<[u8; 32]>,
+    genesis_envelope: std::sync::OnceLock<Arc<LinkProofEnvelope>>,
+    b_sidecar_vk: crate::region_sidecar::BlockRegionSidecarVk,
+    b_post_commit_class_digest: [u8; 32],
 }
 
 impl SplitLinkClass {
-    /// Freeze the slot's link class from the (already frozen AND once
-    /// built — the digest must exist) block class plus one sample
-    /// `π_block` envelope of the slot. Mirrors the block class's freeze
-    /// discipline for the [R]-PCS walk claims:
-    ///
-    /// 1. a BOOTSTRAP T proof (claimless base spec) feeds the native
-    ///    probe [`r_pcs_region_native`] — walk claim COUNT and ARITIES
-    ///    are functions of the two PCS parameter sets alone, which fixes
-    ///    the IO layout;
-    /// 2. a placeholder-claim spec of the final size, a second T proof
-    ///    over it, and one FREEZE-mode build (tail zeros, no tail pins)
-    ///    reveal the claims' committed-column SLICES — the freeze build
-    ///    shares the real builds' wire layout because the placeholder
-    ///    spec has the same claim count and IO-slice size;
-    /// 3. the real spec re-freezes the claims at their live slices.
-    ///
-    /// The class MATRIX is created by the first real build (the freeze
-    /// matrix omits the tail pin rows) and every later build must
-    /// reproduce it bit-exactly (I1; the per-class fixity gates).
-    pub fn freeze(
+    /// Freeze one slot against the universal link-sidecar key.  Bootstrap T
+    /// already carries the same mandatory two-child sidecar as an ordinary
+    /// link; its columns are the canonical zero-data/zero-path ghost.
+    fn freeze(
         shape: FieldShape,
         pcs_params: PcsParams,
         ladder: Vec<LadderSlotInfo>,
         slot: usize,
         block_class: &BlockClass,
-        sample_block: &LinkEnvelope,
+        sample_block: &BlockProofEnvelope,
         block_matrix: &FieldR1cs,
+        shared_genesis: Option<&SharedSplitLinkGenesis>,
     ) -> Self {
+        CanonicalSplitLinkLadder::try_new(shape, pcs_params.clone(), ladder.clone())
+            .expect("internal split-link freeze requires the canonical ladder");
         let genesis_block_accumulator = genesis_accumulator();
         assert!(slot < ladder.len(), "slot out of ladder");
+        assert_eq!(
+            pcs_params.m,
+            shape.m + noid_ivc_core::pcs::LOG_PACKING,
+            "link PCS m vs Field shape"
+        );
+        for (index, ladder_slot) in ladder.iter().enumerate() {
+            assert_eq!(
+                ladder_slot.b_pcs_params.m,
+                ladder_slot.b_shape.m + noid_ivc_core::pcs::LOG_PACKING,
+                "block slot {index}: PCS m vs Field shape"
+            );
+        }
         assert_eq!(
             ladder[slot].b_shape, block_class.shape,
             "slot shape vs block class"
         );
-        let b_digest = *block_class
-            .class_statement_digest
-            .get()
-            .expect("block class digest requires one real block build");
+        let b_digest = block_class
+            .validate_frozen_identity()
+            .expect("hosted block class must retain its frozen identity");
         assert_eq!(
             ladder[slot].b_digest, b_digest,
             "slot digest vs block class"
         );
-        let genesis = genesis_instance(&shape);
-        // statement_digest() also warms the instance's digest cache, so
-        // every T prove reads it instead of re-hashing the serialization.
-        let genesis_digest = genesis.statement_digest();
-
-        // ---- Phase 1: bootstrap T proof + native probe → count/arities.
-        let base_spec = split_io_spec(shape.k_log, &ladder, &[], 0);
-        let t_witness = genesis_witness(&shape);
-        let t_io = vec![F128::ZERO; base_spec.io_len];
-        let mut ch = FsLaneChallenger::new(b"history-link-v0");
-        let (t_proof, t_commitment, _) = prove_field_with_public_io(
-            &genesis,
-            &t_witness,
-            &pcs_params,
-            &base_spec,
-            &t_io,
-            &mut ch,
+        assert_eq!(
+            pcs_params_statement_bytes(&ladder[slot].b_pcs_params),
+            pcs_params_statement_bytes(&block_class.pcs_params),
+            "slot PCS descriptor vs block class"
         );
-        let probe = r_pcs_region_native(&[
-            RPcsProof {
-                native: &t_proof.pcs_open,
-                params: &pcs_params,
-                commitment_root: flat_digest_lanes(&t_commitment.root),
-            },
-            RPcsProof {
-                native: &sample_block.proof.pcs_open,
-                params: &block_class.pcs_params,
-                commitment_root: flat_digest_lanes(&sample_block.commitment.root),
-            },
-        ]);
-        let arities: Vec<usize> = probe.iter().map(|(pt, _)| pt.len()).collect();
-        let max_arity = arities.iter().copied().max().unwrap_or(0);
-        assert!(
-            !arities.is_empty(),
-            "walk discharge produced no opening claims"
+        assert_eq!(
+            ladder[slot].b_post_commit_class_digest,
+            *block_class.post_commit_class_digest(),
+            "slot post-commit identity vs block class"
         );
-
-        // ---- Phase 2: placeholder spec + freeze-mode genesis build.
-        let placeholders: Vec<RegionFrozenClaim> = arities
+        assert_eq!(
+            ladder[slot].b_sidecar_vk_digest,
+            block_class.sidecar_vk().transcript_digest(),
+            "slot sidecar VK identity vs block class"
+        );
+        let (genesis, genesis_digest) = match shared_genesis {
+            Some(shared) => (Arc::clone(&shared.genesis), shared.genesis_digest),
+            None => {
+                let genesis = split_genesis_instance(&shape);
+                // statement_digest() also warms the instance's digest cache,
+                // so proving T reads it instead of re-hashing serialization.
+                let genesis_digest = genesis.statement_digest();
+                (Arc::new(genesis), genesis_digest)
+            }
+        };
+        let block_params = ladder
             .iter()
-            .map(|&a| RegionFrozenClaim {
-                slice: WitnessSlice {
-                    log2_len: a,
-                    index: 1,
-                },
-                arity: a,
-            })
-            .collect();
-        let freeze_class = Self {
+            .map(|slot| slot.b_pcs_params.clone())
+            .collect::<Vec<_>>();
+        let n_queries = noid_ivc_core::pcs::default_fri_queries(pcs_params.log_inv_rate);
+        let universal_geometry =
+            RPcsLinkUniversalGeometry::new(&pcs_params, &block_params, n_queries)
+                .expect("link/block ladder must share one frozen query count");
+        let spec = split_io_spec(shape.k_log, &ladder);
+        let mut class = Self {
             shape,
             pcs_params: pcs_params.clone(),
-            spec: split_io_spec(shape.k_log, &ladder, &placeholders, max_arity),
+            spec,
             class_statement_digest: std::sync::OnceLock::new(),
             genesis,
             genesis_digest,
-            genesis_block_accumulator: genesis_block_accumulator.clone(),
+            genesis_block_accumulator,
             ladder,
             slot,
             b_spec: block_class.spec.clone(),
             b_pcs_params: block_class.pcs_params.clone(),
-            region_claims: placeholders,
-            region_max_arity: max_arity,
+            universal_geometry,
+            sidecar_vk: std::sync::OnceLock::new(),
+            post_commit_class_digest: std::sync::OnceLock::new(),
+            genesis_post_commit_class_digest: std::sync::OnceLock::new(),
+            genesis_envelope: std::sync::OnceLock::new(),
+            b_sidecar_vk: block_class.sidecar_vk().clone(),
+            b_post_commit_class_digest: *block_class.post_commit_class_digest(),
         };
-        let t_io = vec![F128::ZERO; freeze_class.spec.io_len];
-        let mut ch = FsLaneChallenger::new(b"history-link-v0");
-        let (t_proof, t_commitment, _) = prove_field_with_public_io(
-            &freeze_class.genesis,
-            &t_witness,
-            &pcs_params,
-            &freeze_class.spec,
-            &t_io,
-            &mut ch,
-        );
-        let env_t = LinkEnvelope {
-            proof: t_proof,
-            commitment: t_commitment,
-            io: t_io,
-        };
+
+        if let Some(shared) = shared_genesis {
+            assert_eq!(
+                FieldShape::of(shared.genesis.as_ref()),
+                class.shape,
+                "shared split-genesis shape"
+            );
+            assert_eq!(
+                shared.genesis.statement_digest(),
+                class.genesis_digest,
+                "shared split-genesis statement identity"
+            );
+            let expected_genesis_post_commit = link_post_commit_class_digest(
+                &class.genesis_digest,
+                &class.spec,
+                &class.pcs_params,
+                shared.sidecar_vk.as_ref(),
+            );
+            assert_eq!(
+                shared.post_commit_class_digest, expected_genesis_post_commit,
+                "shared split-genesis post-commit identity"
+            );
+            assert_eq!(
+                shared.envelope.io(),
+                vec![F128::ZERO; class.spec.io_len],
+                "shared split-genesis public IO"
+            );
+            assert!(
+                same_pcs_params(&shared.envelope.commitment().params, &class.pcs_params),
+                "shared split-genesis PCS parameters"
+            );
+            class
+                .sidecar_vk
+                .set(Arc::clone(&shared.sidecar_vk))
+                .expect("fresh shared universal link sidecar VK lock");
+            class
+                .genesis_post_commit_class_digest
+                .set(shared.post_commit_class_digest)
+                .expect("fresh shared genesis post-commit digest lock");
+            class
+                .genesis_envelope
+                .set(Arc::clone(&shared.envelope))
+                .expect("fresh shared genesis envelope lock");
+        } else {
+            let (t_witness, ghost_preparation) = class.build_genesis_ghost_witness();
+            assert!(
+                class.genesis.satisfies(&t_witness),
+                "canonical split-genesis ghost must satisfy full-identity T"
+            );
+            class
+                .sidecar_vk
+                .set(Arc::new(ghost_preparation.vk().clone()))
+                .expect("fresh universal link sidecar VK lock");
+            let genesis_post_commit = link_post_commit_class_digest(
+                &class.genesis_digest,
+                &class.spec,
+                &class.pcs_params,
+                class.sidecar_vk(),
+            );
+            class
+                .genesis_post_commit_class_digest
+                .set(genesis_post_commit)
+                .expect("fresh genesis post-commit digest lock");
+            let t_io = vec![F128::ZERO; class.spec.io_len];
+            let ghost_plan =
+                LinkRegionProverPlan::new(ghost_preparation.vk(), ghost_preparation.prover_input())
+                    .expect("canonical genesis ghost plan");
+            let mut ch = FsLaneChallenger::new(b"history-link-v0");
+            let (t_proof, t_sidecar, t_commitment, _) =
+                prove_field_with_public_io_and_post_commit_context(
+                    class.genesis.as_ref(),
+                    &t_witness,
+                    &pcs_params,
+                    &class.spec,
+                    &t_io,
+                    &genesis_post_commit,
+                    &mut ch,
+                    |context| ghost_plan.prove_post_commit(context),
+                );
+            // T is immutable after this point.  Its optional CSC transpose is
+            // derived verifier scratch and must not become part of the shared
+            // long-lived ladder allocation.
+            Arc::get_mut(&mut class.genesis)
+                .expect("new canonical genesis has one owner before sharing")
+                .release_csc_cache();
+            let env_t = Arc::new(LinkProofEnvelope {
+                field_proof: t_proof,
+                commitment: t_commitment,
+                io: t_io,
+                region_sidecar: t_sidecar.expect("canonical genesis ghost proof"),
+            });
+            class
+                .genesis_envelope
+                .set(env_t)
+                .expect("fresh genesis envelope lock");
+        }
         let built = build_split_link_inner(
-            &freeze_class,
+            &class,
             &SplitLinkInput {
-                prev: &env_t,
-                verified_digest: freeze_class.genesis_digest,
+                prev: class.genesis_envelope(),
                 prev_slot: 0,
                 genesis: true,
-                link_class_digests: vec![[0u8; 32]; freeze_class.ladder.len()],
+                link_class_digests: vec![[0u8; 32]; class.ladder.len()],
+                link_post_commit_class_digests: vec![[0u8; 32]; class.ladder.len()],
                 block: sample_block,
-                fold_matrix_link: &freeze_class.genesis,
+                fold_matrix_link: &class.genesis,
                 fold_matrix_block: block_matrix,
             },
             true,
         );
-        let frozen: Vec<RegionFrozenClaim> = built
-            .region_claims
-            .iter()
-            .map(|c| RegionFrozenClaim {
-                slice: c.slice,
-                arity: c.point.len(),
-            })
-            .collect();
         assert_eq!(
-            frozen.len(),
-            arities.len(),
-            "freeze claim count vs native probe"
+            built.region_preparation.vk(),
+            class.sidecar_vk(),
+            "genesis build must reproduce the universal link sidecar VK"
         );
-        drop(built);
-
-        // ---- Phase 3: the real spec (frozen slices).
-        let spec = split_io_spec(shape.k_log, &freeze_class.ladder, &frozen, max_arity);
-        Self {
-            spec,
-            class_statement_digest: std::sync::OnceLock::new(),
-            region_claims: frozen,
-            ..freeze_class
-        }
+        let matrix_digest = built.r1cs.statement_digest();
+        class
+            .class_statement_digest
+            .set(matrix_digest)
+            .expect("fresh link matrix digest lock");
+        let post_commit = link_post_commit_class_digest(
+            &matrix_digest,
+            &class.spec,
+            &class.pcs_params,
+            class.sidecar_vk(),
+        );
+        class
+            .post_commit_class_digest
+            .set(post_commit)
+            .expect("fresh link post-commit digest lock");
+        class
     }
 
     pub fn layout(&self) -> SplitIoLayout {
-        split_io_layout(
-            self.shape.k_log,
-            &self.ladder,
-            self.region_claims.len(),
-            self.region_max_arity,
-        )
+        split_io_layout(self.shape.k_log, &self.ladder)
+    }
+
+    pub fn ladder(&self) -> &[LadderSlotInfo] {
+        &self.ladder
+    }
+
+    pub fn slot(&self) -> usize {
+        self.slot
+    }
+
+    pub fn sidecar_vk(&self) -> &LinkRegionSidecarVk {
+        self.sidecar_vk
+            .get()
+            .expect("frozen link sidecar VK")
+            .as_ref()
+    }
+
+    pub fn post_commit_class_digest(&self) -> &[u8; 32] {
+        self.post_commit_class_digest
+            .get()
+            .expect("frozen link post-commit class")
+    }
+
+    pub fn genesis_envelope(&self) -> &LinkProofEnvelope {
+        self.genesis_envelope
+            .get()
+            .expect("frozen genesis envelope")
+            .as_ref()
+    }
+
+    fn shared_genesis(&self) -> SharedSplitLinkGenesis {
+        SharedSplitLinkGenesis {
+            genesis: Arc::clone(&self.genesis),
+            genesis_digest: self.genesis_digest,
+            sidecar_vk: Arc::clone(self.sidecar_vk.get().expect("frozen link sidecar VK")),
+            post_commit_class_digest: *self
+                .genesis_post_commit_class_digest
+                .get()
+                .expect("frozen genesis post-commit identity"),
+            envelope: Arc::clone(
+                self.genesis_envelope
+                    .get()
+                    .expect("frozen genesis envelope"),
+            ),
+        }
+    }
+
+    fn shares_genesis_artifacts_with(&self, other: &Self) -> bool {
+        self.genesis_digest == other.genesis_digest
+            && self.genesis_post_commit_class_digest.get()
+                == other.genesis_post_commit_class_digest.get()
+            && self.genesis_block_accumulator == other.genesis_block_accumulator
+            && Arc::ptr_eq(&self.genesis, &other.genesis)
+            && matches!(
+                (self.sidecar_vk.get(), other.sidecar_vk.get()),
+                (Some(left), Some(right)) if Arc::ptr_eq(left, right)
+            )
+            && matches!(
+                (self.genesis_envelope.get(), other.genesis_envelope.get()),
+                (Some(left), Some(right)) if Arc::ptr_eq(left, right)
+            )
+    }
+
+    fn build_genesis_ghost_witness(&self) -> (Vec<F128>, RPcsLinkRegionPreparation) {
+        assert_eq!(
+            self.shape.k_log, self.shape.m,
+            "genesis ghost currently requires one full-width Field block"
+        );
+        let mut builder = FieldR1csBuilder::new();
+        let io_start = self.spec.io_slice.start();
+        while builder.num_wires() < io_start {
+            builder.alloc_f128(F128::ZERO);
+        }
+        for _ in 0..1usize << self.spec.io_slice.log2_len {
+            builder.alloc_f128(F128::ZERO);
+        }
+        let preparation = prepare_r_pcs_link_genesis_ghost(&mut builder, &self.universal_geometry)
+            .expect("canonical genesis ghost columns");
+        let target = 1usize << self.shape.m;
+        assert!(
+            builder.num_wires() <= target,
+            "genesis ghost exceeds link shape"
+        );
+        let mut witness = builder.values().to_vec();
+        witness.resize(target, F128::ZERO);
+        witness[0] = F128::ONE;
+        (witness, preparation)
     }
 }
 
@@ -415,11 +1508,7 @@ impl SplitLinkClass {
 pub struct SplitLinkInput<'a> {
     /// The previous link envelope (or the genesis dummy T's proof when
     /// `genesis = true`).
-    pub prev: &'a LinkEnvelope,
-    /// Digest of the instance `prev` was proven over (`D_T` at genesis,
-    /// else the previous link class's statement digest — must equal the
-    /// whitelist entry at `prev_slot`).
-    pub verified_digest: [u8; 32],
+    pub prev: &'a LinkProofEnvelope,
     /// The previous link's ladder slot (drives β; ignored at genesis).
     pub prev_slot: usize,
     pub genesis: bool,
@@ -427,8 +1516,10 @@ pub struct SplitLinkInput<'a> {
     /// digest. Witness data (never baked); the decider pins the tip's.
     /// A throwaway matrix-derivation build passes zeros.
     pub link_class_digests: Vec<[u8; 32]>,
+    /// Composite post-commit identities paired with `link_class_digests`.
+    pub link_post_commit_class_digests: Vec<[u8; 32]>,
     /// The covered block's proof envelope (`π_block`, this class's slot).
-    pub block: &'a LinkEnvelope,
+    pub block: &'a BlockProofEnvelope,
     /// The matrix the PREVIOUS proof was proven over — native fold
     /// prover only (T at genesis, else the previous link class's
     /// matrix). Never enters the trace.
@@ -437,14 +1528,332 @@ pub struct SplitLinkInput<'a> {
     pub fold_matrix_block: &'a FieldR1cs,
 }
 
+/// Matrix-free half of one split-link build input.
+///
+/// Unlike [`SplitLinkInput`], this object owns both registry vectors and holds
+/// references only to the two proof envelopes. It is consumed by
+/// [`prepare_split_link_native`], whose result has no lifetime dependency on
+/// either fold matrix.
+pub struct SplitLinkTraceInput<'a> {
+    /// The previous link envelope (or the canonical T envelope at genesis).
+    pub prev: &'a LinkProofEnvelope,
+    /// Previous Link-class slot; ignored only when `genesis` is true.
+    pub prev_slot: usize,
+    pub genesis: bool,
+    pub link_class_digests: Vec<[u8; 32]>,
+    pub link_post_commit_class_digests: Vec<[u8; 32]>,
+    /// The covered Block proof envelope for the current Link class.
+    pub block: &'a BlockProofEnvelope,
+}
+
+impl<'a> SplitLinkTraceInput<'a> {
+    fn from_combined(input: &SplitLinkInput<'a>) -> Self {
+        Self {
+            prev: input.prev,
+            prev_slot: input.prev_slot,
+            genesis: input.genesis,
+            link_class_digests: input.link_class_digests.clone(),
+            link_post_commit_class_digests: input.link_post_commit_class_digests.clone(),
+            block: input.block,
+        }
+    }
+}
+
+/// One-shot native split-link preparation.
+///
+/// This owns every fold proof and routed IO value needed by trace assembly,
+/// but deliberately contains no reference to either matrix used by the native
+/// fold prover. A memory-governed caller can therefore release both matrices
+/// before calling [`Self::assemble`].
+#[must_use = "native split-link preparation must be assembled"]
+pub struct PreparedSplitLink<'a> {
+    class: &'a SplitLinkClass,
+    input: SplitLinkTraceInput<'a>,
+    fold_proof_link: MatrixFoldProof,
+    fold_proof_block: MatrixFoldProof,
+    io: Vec<F128>,
+    freeze: bool,
+}
+
+impl<'a> PreparedSplitLink<'a> {
+    /// Assemble the recursive trace without accessing either native fold
+    /// matrix. Consumes the preparation so it cannot be mixed or replayed with
+    /// another class/input pair.
+    pub fn assemble(self) -> BuiltSplitLink {
+        assemble_prepared_split_link(self)
+    }
+}
+
 /// A built split link.
 pub struct BuiltSplitLink {
     pub r1cs: FieldR1cs,
     pub witness: Vec<F128>,
     pub io: Vec<F128>,
-    /// The live [R]-PCS walk opening claims (the freeze pass reads their
-    /// slices; real builds assert them against the frozen class shape).
-    pub region_claims: Vec<super::trace::region_source_binding::RegionPcsClaim>,
+    region_preparation: RPcsLinkRegionPreparation,
+}
+
+/// Mandatory production link envelope.  Core-only downgrade is impossible
+/// through the typed API because the two-child sidecar is private/nonoptional.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct LinkProofEnvelope {
+    field_proof: FieldR1csProof,
+    commitment: Commitment,
+    io: Vec<F128>,
+    region_sidecar: LinkRegionSidecarProof,
+}
+
+impl LinkProofEnvelope {
+    pub fn field_proof(&self) -> &FieldR1csProof {
+        &self.field_proof
+    }
+    pub fn commitment(&self) -> &Commitment {
+        &self.commitment
+    }
+    pub fn io(&self) -> &[F128] {
+        &self.io
+    }
+    pub fn region_sidecar(&self) -> &LinkRegionSidecarProof {
+        &self.region_sidecar
+    }
+    pub fn byte_len(&self) -> usize {
+        bincode::serialized_size(self).expect("link proof envelope serialized length") as usize
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LinkProofError {
+    UnfrozenClass,
+    ClassIdentityMismatch,
+    PcsParamsMismatch,
+    InvalidIo,
+    MatrixMismatch,
+    SidecarVkMismatch,
+    Sidecar(RegionSidecarError),
+    Field(VerifyError),
+}
+
+impl std::fmt::Display for LinkProofError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnfrozenClass => write!(f, "link class is not frozen"),
+            Self::ClassIdentityMismatch => write!(f, "link post-commit class identity drift"),
+            Self::PcsParamsMismatch => write!(f, "link PCS parameters do not match the class"),
+            Self::InvalidIo => write!(f, "link public IO does not match the class"),
+            Self::MatrixMismatch => write!(f, "link matrix does not match its frozen class"),
+            Self::SidecarVkMismatch => write!(f, "link sidecar VK does not match its class"),
+            Self::Sidecar(error) => write!(f, "link sidecar error: {error:?}"),
+            Self::Field(error) => write!(f, "link Field proof error: {error:?}"),
+        }
+    }
+}
+
+impl std::error::Error for LinkProofError {}
+
+impl From<RegionSidecarError> for LinkProofError {
+    fn from(value: RegionSidecarError) -> Self {
+        Self::Sidecar(value)
+    }
+}
+
+impl From<VerifyError> for LinkProofError {
+    fn from(value: VerifyError) -> Self {
+        Self::Field(value)
+    }
+}
+
+impl SplitLinkClass {
+    fn validate_frozen_identity(&self) -> Result<[u8; 32], LinkProofError> {
+        let matrix_digest = self
+            .class_statement_digest
+            .get()
+            .copied()
+            .ok_or(LinkProofError::UnfrozenClass)?;
+        CanonicalSplitLinkLadder::try_new(self.shape, self.pcs_params.clone(), self.ladder.clone())
+            .map_err(|_| LinkProofError::ClassIdentityMismatch)?;
+        if self.shape.m.checked_add(noid_ivc_core::pcs::LOG_PACKING) != Some(self.pcs_params.m) {
+            return Err(LinkProofError::PcsParamsMismatch);
+        }
+        let layout = self.layout();
+        if !self.spec.claims.is_empty()
+            || self.spec.io_len != layout.len
+            || self.spec.io_slice.index != 1
+            || self.spec.io_slice.log2_len
+                != layout.len.next_power_of_two().trailing_zeros() as usize
+            || !self.spec.io_slice.fits(self.shape.m)
+            || self.spec.io_len > self.spec.io_slice.len()
+        {
+            return Err(LinkProofError::ClassIdentityMismatch);
+        }
+        let slot = self
+            .ladder
+            .get(self.slot)
+            .ok_or(LinkProofError::ClassIdentityMismatch)?;
+        if !is_production_block_io_spec(&self.b_spec)
+            || self.b_pcs_params.m != slot.b_shape.m + noid_ivc_core::pcs::LOG_PACKING
+            || !same_pcs_params(&self.b_pcs_params, &slot.b_pcs_params)
+            || self.b_sidecar_vk.transcript_digest() != slot.b_sidecar_vk_digest
+            || self.b_post_commit_class_digest != slot.b_post_commit_class_digest
+        {
+            return Err(LinkProofError::ClassIdentityMismatch);
+        }
+        let expected_block_post_commit = block_post_commit_class_digest(
+            &slot.b_digest,
+            &self.b_spec,
+            &self.b_pcs_params,
+            &self.b_sidecar_vk,
+        );
+        if expected_block_post_commit != self.b_post_commit_class_digest {
+            return Err(LinkProofError::ClassIdentityMismatch);
+        }
+        if FieldShape::of(&self.genesis) != self.shape
+            || self.genesis.statement_digest() != self.genesis_digest
+            || self.genesis_block_accumulator != genesis_accumulator()
+        {
+            return Err(LinkProofError::ClassIdentityMismatch);
+        }
+        let sidecar_vk = self.sidecar_vk.get().ok_or(LinkProofError::UnfrozenClass)?;
+        let expected =
+            link_post_commit_class_digest(&matrix_digest, &self.spec, &self.pcs_params, sidecar_vk);
+        if Some(&expected) != self.post_commit_class_digest.get() {
+            return Err(LinkProofError::ClassIdentityMismatch);
+        }
+        let expected_genesis_post_commit = link_post_commit_class_digest(
+            &self.genesis_digest,
+            &self.spec,
+            &self.pcs_params,
+            sidecar_vk,
+        );
+        if Some(&expected_genesis_post_commit) != self.genesis_post_commit_class_digest.get() {
+            return Err(LinkProofError::ClassIdentityMismatch);
+        }
+        let genesis_envelope = self
+            .genesis_envelope
+            .get()
+            .ok_or(LinkProofError::UnfrozenClass)?;
+        if genesis_envelope.io().len() != self.spec.io_len
+            || genesis_envelope
+                .io()
+                .iter()
+                .any(|value| *value != F128::ZERO)
+            || !same_pcs_params(&genesis_envelope.commitment().params, &self.pcs_params)
+        {
+            return Err(LinkProofError::ClassIdentityMismatch);
+        }
+        Ok(matrix_digest)
+    }
+
+    fn validate_materialized_identity(&self) -> Result<(), LinkProofError> {
+        self.validate_frozen_identity()?;
+        let sidecar_vk = self.sidecar_vk.get().ok_or(LinkProofError::UnfrozenClass)?;
+        let genesis_envelope = self
+            .genesis_envelope
+            .get()
+            .ok_or(LinkProofError::UnfrozenClass)?;
+        let encoded = bincode::serialize(genesis_envelope.region_sidecar())
+            .map_err(|_| LinkProofError::ClassIdentityMismatch)?;
+        decode_link_region_sidecar_bounded(sidecar_vk, self.shape.m, &encoded)
+            .map_err(LinkProofError::Sidecar)?;
+        let genesis_post_commit = self
+            .genesis_post_commit_class_digest
+            .get()
+            .ok_or(LinkProofError::UnfrozenClass)?;
+        let mut challenger = FsLaneChallenger::new(b"history-link-v0");
+        verify_field_deferred_matrix_with_post_commit_context(
+            &self.shape,
+            &self.genesis_digest,
+            genesis_envelope.commitment(),
+            genesis_envelope.field_proof(),
+            &self.spec,
+            genesis_envelope.io(),
+            genesis_post_commit,
+            genesis_envelope.region_sidecar(),
+            &mut challenger,
+            |sidecar, context| {
+                verify_link_region_sidecar_post_commit(sidecar_vk, sidecar, context)
+                    .map_err(|_| VerifyError::Auxiliary)
+            },
+        )?;
+        Ok(())
+    }
+}
+
+/// Commit one built link and prove its mandatory L-A/L-B authority on the
+/// same causally post-commit challenger.
+pub fn prove_built_split_link<Ch: Challenger>(
+    class: &SplitLinkClass,
+    built: &BuiltSplitLink,
+    challenger: &mut Ch,
+) -> Result<LinkProofEnvelope, LinkProofError> {
+    let matrix_digest = class.validate_frozen_identity()?;
+    if built.io.len() != class.spec.io_len {
+        return Err(LinkProofError::InvalidIo);
+    }
+    if built.r1cs.statement_digest() != matrix_digest || FieldShape::of(&built.r1cs) != class.shape
+    {
+        return Err(LinkProofError::MatrixMismatch);
+    }
+    if built.region_preparation.vk() != class.sidecar_vk() {
+        return Err(LinkProofError::SidecarVkMismatch);
+    }
+    let plan = LinkRegionProverPlan::new(
+        built.region_preparation.vk(),
+        built.region_preparation.prover_input(),
+    )?;
+    let (field_proof, sidecar, commitment, _) = prove_field_with_public_io_and_post_commit_context(
+        &built.r1cs,
+        &built.witness,
+        &class.pcs_params,
+        &class.spec,
+        &built.io,
+        class.post_commit_class_digest(),
+        challenger,
+        |context| plan.prove_post_commit(context),
+    );
+    Ok(LinkProofEnvelope {
+        field_proof,
+        commitment,
+        io: built.io.clone(),
+        region_sidecar: sidecar?,
+    })
+}
+
+/// Full native verification of a production link envelope. A plain Field
+/// proof is intentionally not accepted by this boundary.
+pub fn verify_split_link_proof<Ch: Challenger>(
+    class: &SplitLinkClass,
+    matrix: &FieldR1cs,
+    envelope: &LinkProofEnvelope,
+    challenger: &mut Ch,
+) -> Result<R1csClaim, LinkProofError> {
+    let matrix_digest = class.validate_frozen_identity()?;
+    if !same_pcs_params(&envelope.commitment().params, &class.pcs_params) {
+        return Err(LinkProofError::PcsParamsMismatch);
+    }
+    if envelope.io().len() != class.spec.io_len {
+        return Err(LinkProofError::InvalidIo);
+    }
+    if matrix.statement_digest() != matrix_digest || FieldShape::of(matrix) != class.shape {
+        return Err(LinkProofError::MatrixMismatch);
+    }
+    verify_field_with_public_io_and_post_commit_context(
+        matrix,
+        envelope.commitment(),
+        envelope.field_proof(),
+        &class.spec,
+        envelope.io(),
+        class.post_commit_class_digest(),
+        envelope.region_sidecar(),
+        challenger,
+        |sidecar, context| {
+            verify_link_region_sidecar_post_commit(class.sidecar_vk(), sidecar, context)
+                .map_err(|_| VerifyError::Auxiliary)
+        },
+    )
+    .map_err(LinkProofError::Field)
+}
+
+fn same_pcs_params(left: &PcsParams, right: &PcsParams) -> bool {
+    pcs_params_statement_bytes(left) == pcs_params_statement_bytes(right)
 }
 
 fn alloc_expr(b: &mut FieldR1csBuilder, v: F128) -> LinExpr {
@@ -461,54 +1870,187 @@ pub fn build_split_link(class: &SplitLinkClass, input: &SplitLinkInput<'_>) -> B
     build_split_link_inner(class, input, false)
 }
 
-/// [`build_split_link`] core. `freeze = true` is the walk-claim
-/// shape-freeze pass: the region tail stays zero and UNPINNED (the
-/// freeze matrix omits those rows) and the live claims are returned for
-/// the class to freeze; the class digest is never seeded.
+/// [`build_split_link`] core. `freeze = true` only suppresses the final matrix
+/// identity check while the one bootstrap matrix is being established.
 fn build_split_link_inner(
     class: &SplitLinkClass,
     input: &SplitLinkInput<'_>,
     freeze: bool,
 ) -> BuiltSplitLink {
+    prepare_split_link_native_inner(
+        class,
+        SplitLinkTraceInput::from_combined(input),
+        input.fold_matrix_link,
+        input.fold_matrix_block,
+        freeze,
+    )
+    .assemble()
+}
+
+/// Verify both child envelopes natively and produce their two matrix-fold
+/// proofs. The matrix borrows end when this function returns; the resulting
+/// [`PreparedSplitLink`] can outlive and assemble after both matrices are
+/// released.
+pub fn prepare_split_link_native<'a>(
+    class: &'a SplitLinkClass,
+    input: SplitLinkTraceInput<'a>,
+    fold_matrix_link: &FieldR1cs,
+    fold_matrix_block: &FieldR1cs,
+) -> PreparedSplitLink<'a> {
+    prepare_split_link_native_inner(class, input, fold_matrix_link, fold_matrix_block, false)
+}
+
+fn prepare_split_link_native_inner<'a>(
+    class: &'a SplitLinkClass,
+    input: SplitLinkTraceInput<'a>,
+    fold_matrix_link: &FieldR1cs,
+    fold_matrix_block: &FieldR1cs,
+    freeze: bool,
+) -> PreparedSplitLink<'a> {
     let layout = class.layout();
     let n = class.ladder.len();
     let k_l = class.shape.k_log;
     let slot = class.slot;
     let b_shape = class.ladder[slot].b_shape;
     assert_eq!(class.spec.io_len, layout.len);
-    assert_eq!(input.prev.io.len(), layout.len, "previous envelope IO");
+    assert_eq!(input.prev.io().len(), layout.len, "previous envelope IO");
     assert_eq!(
-        input.block.io.len(),
+        input.block.io().len(),
         class.b_spec.io_len,
         "block envelope IO"
     );
     assert_eq!(input.link_class_digests.len(), n, "whitelist size");
     assert!(
+        same_pcs_params(&input.prev.commitment().params, &class.pcs_params),
+        "previous link PCS parameters must equal the frozen link class"
+    );
+    assert!(
+        same_pcs_params(&input.block.commitment().params, &class.b_pcs_params),
+        "block PCS parameters must equal the hosted block class"
+    );
+    assert_eq!(
+        input.link_post_commit_class_digests.len(),
+        n,
+        "post-commit whitelist size"
+    );
+    assert!(
         input.genesis || input.prev_slot < n,
         "prev slot out of ladder"
     );
+    if input.genesis {
+        assert_eq!(
+            input.prev.commitment().root,
+            class.genesis_envelope().commitment().root,
+            "genesis predecessor must use the canonical ghost commitment"
+        );
+        assert_eq!(
+            input.prev.io(),
+            class.genesis_envelope().io(),
+            "genesis predecessor must use the canonical zero IO"
+        );
+    }
+    if !freeze {
+        // Both matrices cross the phased API boundary. Their ordinary digest
+        // cache is intentionally seedable after a trusted class rebuild, so a
+        // caller-supplied matrix must earn its identity from the CSR contents.
+        let fold_link_matrix_digest = fold_matrix_link.structural_statement_digest();
+        let fold_block_matrix_digest = fold_matrix_block.structural_statement_digest();
+        assert_eq!(
+            fold_block_matrix_digest, class.ladder[slot].b_digest,
+            "current Block fold matrix does not match its class",
+        );
+        if input.genesis {
+            assert_eq!(
+                fold_link_matrix_digest, class.genesis_digest,
+                "genesis Link fold matrix is not canonical T",
+            );
+        } else {
+            let fold_link_post_commit = link_post_commit_class_digest(
+                &fold_link_matrix_digest,
+                &class.spec,
+                &class.pcs_params,
+                class.sidecar_vk(),
+            );
+            for (digest, post_commit) in input
+                .link_class_digests
+                .iter()
+                .zip(&input.link_post_commit_class_digests)
+            {
+                assert_eq!(
+                    *post_commit,
+                    link_post_commit_class_digest(
+                        digest,
+                        &class.spec,
+                        &class.pcs_params,
+                        class.sidecar_vk(),
+                    ),
+                    "link whitelist matrix/post-commit pair",
+                );
+            }
+            preflight_split_transition(
+                &layout,
+                input.prev_slot,
+                slot,
+                &input.link_class_digests,
+                &input.link_post_commit_class_digests,
+                input.prev.io(),
+                fold_link_matrix_digest,
+                fold_link_post_commit,
+                fold_block_matrix_digest,
+                class.ladder[slot].b_digest,
+                &input.block.io()[BLOCK_IO_START_ACC..BLOCK_IO_START_ACC + super::link::ACC_LANES],
+                &input.prev.io()[layout.block_acc..layout.block_acc + super::link::ACC_LANES],
+            )
+            .expect("invalid non-genesis split-link transition inputs");
+        }
+    }
 
     // ---- Native pass.
+    let verified_digest = if input.genesis {
+        class.genesis_digest
+    } else {
+        input.link_class_digests[input.prev_slot]
+    };
+    let verified_post_commit = if input.genesis {
+        *class
+            .genesis_post_commit_class_digest
+            .get()
+            .expect("frozen genesis post-commit identity")
+    } else {
+        input.link_post_commit_class_digests[input.prev_slot]
+    };
     let mut ch_native = FsLaneChallenger::new(b"history-link-v0");
-    let (_pc, fresh_link) = noid_ivc_core::verifier::verify_field_deferred_matrix(
+    let (_pc, fresh_link) = verify_field_deferred_matrix_with_post_commit_context(
         &class.shape,
-        &input.verified_digest,
-        &input.prev.commitment,
-        &input.prev.proof,
+        &verified_digest,
+        input.prev.commitment(),
+        input.prev.field_proof(),
         &class.spec,
-        &input.prev.io,
+        input.prev.io(),
+        &verified_post_commit,
+        input.prev.region_sidecar(),
         &mut ch_native,
+        |sidecar, context| {
+            verify_link_region_sidecar_post_commit(class.sidecar_vk(), sidecar, context)
+                .map_err(|_| VerifyError::Auxiliary)
+        },
     )
     .expect("previous link proof must verify (deferred)");
     let mut chb_native = FsLaneChallenger::new(b"history-block-v0");
-    let (_bc, fresh_block) = noid_ivc_core::verifier::verify_field_deferred_matrix(
+    let (_bc, fresh_block) = verify_field_deferred_matrix_with_post_commit_context(
         &b_shape,
         &class.ladder[slot].b_digest,
-        &input.block.commitment,
-        &input.block.proof,
+        input.block.commitment(),
+        input.block.field_proof(),
         &class.b_spec,
-        &input.block.io,
+        input.block.io(),
+        &class.b_post_commit_class_digest,
+        input.block.region_sidecar(),
         &mut chb_native,
+        |sidecar, context| {
+            verify_block_region_sidecar_post_commit(&class.b_sidecar_vk, sidecar, context)
+                .map_err(|_| VerifyError::Auxiliary)
+        },
     )
     .expect("block proof must verify (deferred)");
 
@@ -526,16 +2068,16 @@ fn build_split_link_inner(
         let lane = &layout.link_lanes[input.prev_slot];
         (
             MatrixAccClaim {
-                point: input.prev.io[lane.point..lane.value].to_vec(),
-                value: input.prev.io[lane.value],
+                point: input.prev.io()[lane.point..lane.value].to_vec(),
+                value: input.prev.io()[lane.value],
             },
-            input.prev.io[lane.live],
+            input.prev.io()[lane.live],
         )
     };
     let gate_link = !input.genesis && in_live_link == F128::ONE;
     let mut chf_native = FsLaneChallenger::new(b"history-link-fold-v0");
     let (fold_proof_link, acc_link) = prove_matrix_claim_fold(
-        input.fold_matrix_link,
+        fold_matrix_link,
         &fresh_link,
         &incoming_link,
         gate_link,
@@ -546,13 +2088,13 @@ fn build_split_link_inner(
     // IO. NOT gated by g — a genesis link folds its block 0 claim too.
     let b_lane = &layout.b_lanes[slot];
     let incoming_block = MatrixAccClaim {
-        point: input.prev.io[b_lane.point..b_lane.value].to_vec(),
-        value: input.prev.io[b_lane.value],
+        point: input.prev.io()[b_lane.point..b_lane.value].to_vec(),
+        value: input.prev.io()[b_lane.value],
     };
-    let gate_block = input.prev.io[b_lane.live] == F128::ONE;
+    let gate_block = input.prev.io()[b_lane.live] == F128::ONE;
     let mut chf2_native = FsLaneChallenger::new(b"history-block-fold-v0");
     let (fold_proof_block, acc_block) = prove_matrix_claim_fold(
-        input.fold_matrix_block,
+        fold_matrix_block,
         &fresh_block,
         &incoming_block,
         gate_block,
@@ -560,72 +2102,60 @@ fn build_split_link_inner(
     );
 
     // ---- IO values.
-    let mut io = vec![F128::ZERO; layout.len];
-    io[layout.g] = if input.genesis { F128::ONE } else { F128::ZERO };
-    for (a, d) in input.link_class_digests.iter().enumerate() {
-        let lanes = flat_digest_lanes(d);
-        io[layout.wl + 2 * a] = lanes[0];
-        io[layout.wl + 2 * a + 1] = lanes[1];
-    }
-    for (a, lane) in layout.link_lanes.iter().enumerate() {
-        if !input.genesis && a == input.prev_slot {
-            io[lane.point..lane.value].copy_from_slice(&acc_link.point);
-            io[lane.value] = acc_link.value;
-            io[lane.live] = F128::ONE;
-        } else {
-            // Pass-through (T's lanes are zero at genesis).
-            io[lane.point..=lane.live].copy_from_slice(&input.prev.io[lane.point..=lane.live]);
-        }
-    }
-    for (t, lane) in layout.b_lanes.iter().enumerate() {
-        if t == slot {
-            io[lane.point..lane.value].copy_from_slice(&acc_block.point);
-            io[lane.value] = acc_block.value;
-            io[lane.live] = F128::ONE;
-        } else {
-            io[lane.point..=lane.live].copy_from_slice(&input.prev.io[lane.point..=lane.live]);
-        }
-    }
-    io[layout.block_acc..layout.block_acc + super::link::ACC_LANES].copy_from_slice(
-        &input.block.io[BLOCK_IO_END_ACC..BLOCK_IO_END_ACC + super::link::ACC_LANES],
-    );
+    let io = route_split_transition_io(
+        &layout,
+        input.genesis,
+        input.prev_slot,
+        slot,
+        &input.link_class_digests,
+        &input.link_post_commit_class_digests,
+        input.prev.io(),
+        &acc_link,
+        &acc_block,
+        &input.block.io()[BLOCK_IO_END_ACC..BLOCK_IO_END_ACC + super::link::ACC_LANES],
+    )
+    .expect("valid split-link transition routing");
 
-    // ---- [R]-PCS walk opening claims: NATIVE values into the IO tail
-    // (deterministic in the two proofs; the trace discharge below
-    // re-derives the same claims with their wires and asserts the frozen
-    // shape). The freeze pass leaves the tail zero.
+    PreparedSplitLink {
+        class,
+        input,
+        fold_proof_link,
+        fold_proof_block,
+        io,
+        freeze,
+    }
+}
+
+fn assemble_prepared_split_link(prepared: PreparedSplitLink<'_>) -> BuiltSplitLink {
+    let PreparedSplitLink {
+        class,
+        input,
+        fold_proof_link,
+        fold_proof_block,
+        io,
+        freeze,
+    } = prepared;
+    let layout = class.layout();
+    let n = class.ladder.len();
+    let k_l = class.shape.k_log;
+    let slot = class.slot;
+    let b_shape = class.ladder[slot].b_shape;
+    let b_lane = &layout.b_lanes[slot];
+
+    // ---- The two inner PCS carriers. Their openings are owned by the
+    // post-commit link sidecar, not copied into public IO.
     let r_pcs_proofs = [
         RPcsProof {
-            native: &input.prev.proof.pcs_open,
+            native: &input.prev.field_proof().pcs_open,
             params: &class.pcs_params,
-            commitment_root: flat_digest_lanes(&input.prev.commitment.root),
+            commitment_root: flat_digest_lanes(&input.prev.commitment().root),
         },
         RPcsProof {
-            native: &input.block.proof.pcs_open,
+            native: &input.block.field_proof().pcs_open,
             params: &class.b_pcs_params,
-            commitment_root: flat_digest_lanes(&input.block.commitment.root),
+            commitment_root: flat_digest_lanes(&input.block.commitment().root),
         },
     ];
-    if !freeze {
-        let region_native = r_pcs_region_native(&r_pcs_proofs);
-        assert_eq!(
-            region_native.len(),
-            class.region_claims.len(),
-            "region native claim count vs frozen"
-        );
-        let stride = class.region_max_arity + 1;
-        for (ci, (np, nv)) in region_native.iter().enumerate() {
-            let base = layout.region_tail_offset + ci * stride;
-            assert!(
-                np.len() <= class.region_max_arity,
-                "region claim arity over max"
-            );
-            for (kk, &p) in np.iter().enumerate() {
-                io[base + kk] = p;
-            }
-            io[base + class.region_max_arity] = *nv;
-        }
-    }
 
     // ---- Trace pass.
     let mut b = FieldR1csBuilder::new();
@@ -646,34 +2176,40 @@ fn build_split_link_inner(
     // columns' slices — hence the class's opening-claim spec — must be
     // identical across every link class of the ladder, so nothing
     // class-specific (envelope sizes differ per slot!) may precede them.
-    let r_cols = alloc_r_pcs_columns(&mut b, &r_pcs_proofs);
+    let r_cols = prepare_r_pcs_link_columns_universal(
+        &mut b,
+        &r_pcs_proofs,
+        &class.universal_geometry,
+        &[0, slot + 1],
+    )
+    .expect("universal recording-free link columns");
     crate::acceptance::row_ledger_mark(&b, &mut ledger, "split: walk columns");
 
     // Envelope wires: the previous link, then the block proof.
-    let prev_root = alloc_flat_digest(&mut b, &input.prev.commitment.root);
+    let prev_root = alloc_flat_digest(&mut b, &input.prev.commitment().root);
     let prev_io_wires: Vec<LinExpr> = input
         .prev
-        .io
+        .io()
         .iter()
         .map(|&v| alloc_expr(&mut b, v))
         .collect();
     let prev_proof_e = FieldR1csProofTrace::alloc_shape_mode(
         &mut b,
-        &input.prev.proof,
+        input.prev.field_proof(),
         &class.shape,
         &class.pcs_params,
         false,
     );
-    let block_root = alloc_flat_digest(&mut b, &input.block.commitment.root);
+    let block_root = alloc_flat_digest(&mut b, &input.block.commitment().root);
     let block_io_wires: Vec<LinExpr> = input
         .block
-        .io
+        .io()
         .iter()
         .map(|&v| alloc_expr(&mut b, v))
         .collect();
     let block_proof_e = FieldR1csProofTrace::alloc_shape_mode(
         &mut b,
-        &input.block.proof,
+        input.block.field_proof(),
         &b_shape,
         &class.b_pcs_params,
         false,
@@ -706,6 +2242,20 @@ fn build_split_link_inner(
     }
     pin_eq(&mut b, &beta_sum, &not_g);
 
+    // A g=1 link verifies the one canonical bootstrap witness.  Matrix and
+    // sidecar validity alone would also admit other full-identity T witnesses;
+    // the root and zero IO pins make the ghost instance unique across slots.
+    let canonical_t_root = flat_digest_lanes(&class.genesis_envelope().commitment().root);
+    for lane in 0..2 {
+        let delta = prev_root[lane].add(&LinExpr::constant(canonical_t_root[lane]));
+        let gated = mul(&mut b, &g, &delta);
+        pin_eq(&mut b, &gated, &LinExpr::zero());
+    }
+    for wire in &prev_io_wires {
+        let gated = mul(&mut b, &g, wire);
+        pin_eq(&mut b, &gated, &LinExpr::zero());
+    }
+
     // ---- The verified digest: w_D = Σ β_a·WL_a + g·D_T. Subsumes the
     // genesis rule (β all-zero under g = 1 by the sum pin).
     let d_t = flat_digest_lanes(&class.genesis_digest);
@@ -717,12 +2267,26 @@ fn build_split_link_inner(
         }
         acc
     });
+    let genesis_pc = flat_digest_lanes(
+        class
+            .genesis_post_commit_class_digest
+            .get()
+            .expect("frozen genesis post-commit identity"),
+    );
+    let w_post_commit: FlatDigestExpr = [0usize, 1usize].map(|lane| {
+        let mut acc = g.scale(genesis_pc[lane]);
+        for (a, ba) in beta.iter().enumerate() {
+            let wl_cell = &io_cells[layout.wl_post_commit + 2 * a + lane];
+            acc = acc.add(&mul(&mut b, ba, wl_cell));
+        }
+        acc
+    });
 
     // ---- [R]_prev: the deferred replay of the previous link's proof,
     // in REGION mode — its PCS hashing lands on the link walks below.
     let mut obs_prev = PcsWalkObligations::default();
     let mut ch = FsChannelTrace::new(&mut b, b"history-link-v0");
-    let (_pce, fresh_link_e) = verify_field_trace_deferred_region(
+    let (_pce, fresh_link_e) = verify_field_trace_deferred_region_with_post_commit_context_expr(
         &mut b,
         &mut ch,
         &class.shape,
@@ -732,7 +2296,17 @@ fn build_split_link_inner(
         &prev_proof_e,
         &class.spec,
         &prev_io_wires,
+        &w_post_commit,
         Some(&mut obs_prev),
+        |builder, context| {
+            verify_link_region_sidecar_trace_post_commit(
+                builder,
+                context,
+                class.sidecar_vk(),
+                input.prev.region_sidecar(),
+            )
+            .expect("previous link sidecar trace shape")
+        },
     );
     crate::acceptance::row_ledger_mark(&b, &mut ledger, "split: [R]_prev replay");
 
@@ -742,7 +2316,7 @@ fn build_split_link_inner(
     let w_b: FlatDigestExpr = [LinExpr::constant(d_b[0]), LinExpr::constant(d_b[1])];
     let mut obs_block = PcsWalkObligations::default();
     let mut chb = FsChannelTrace::new(&mut b, b"history-block-v0");
-    let (_bce, fresh_block_e) = verify_field_trace_deferred_region(
+    let (_bce, fresh_block_e) = verify_field_trace_deferred_region_with_post_commit_context(
         &mut b,
         &mut chb,
         &b_shape,
@@ -752,19 +2326,29 @@ fn build_split_link_inner(
         &block_proof_e,
         &class.b_spec,
         &block_io_wires,
+        &class.b_post_commit_class_digest,
         Some(&mut obs_block),
+        |builder, context| {
+            verify_block_region_sidecar_trace_post_commit(
+                builder,
+                context,
+                &class.b_sidecar_vk,
+                input.block.region_sidecar(),
+            )
+            .expect("block sidecar trace shape")
+        },
     );
     crate::acceptance::row_ledger_mark(&b, &mut ledger, "split: [R]_B replay");
 
     // ---- Genesis arm: the fresh [R]_prev claim equals T's baked
     // bilinear value under g = 1.
-    let baked = genesis_baked_claim_value(&mut b, &class.genesis, &fresh_link_e);
+    let baked = split_genesis_baked_claim_value(&mut b, &fresh_link_e);
     let diff = fresh_link_e.value.add(&baked);
     let gated = mul(&mut b, &g, &diff);
     pin_eq(&mut b, &gated, &LinExpr::zero());
 
     // ---- Whitelist inheritance (gated off only at genesis).
-    for j in 0..2 * n {
+    for j in 0..4 * n {
         let diff = io_cells[layout.wl + j].add(&prev_io_wires[layout.wl + j]);
         let gated = mul(&mut b, &not_g, &diff);
         pin_eq(&mut b, &gated, &LinExpr::zero());
@@ -888,36 +2472,14 @@ fn build_split_link_inner(
     }
     crate::acceptance::row_ledger_mark(&b, &mut ledger, "split: chain rules");
 
-    // ---- The [R]-PCS walk discharge: both replays' obligations land on
-    // the two link walks; the resulting committed-column opening claims
-    // thread through the region tail (frozen-shape asserted + pinned in
-    // real builds; the freeze pass returns them for the class to read).
-    let live_region = discharge_r_pcs_via_region(&mut b, r_cols, &[&obs_prev, &obs_block]);
-    if !freeze {
-        assert_eq!(
-            live_region.len(),
-            class.region_claims.len(),
-            "region claim count drift (trace): live {} vs frozen {}",
-            live_region.len(),
-            class.region_claims.len()
-        );
-        let stride = class.region_max_arity + 1;
-        for (ci, c) in live_region.iter().enumerate() {
-            let fc = &class.region_claims[ci];
-            assert_eq!(c.slice, fc.slice, "region claim {ci} slice drift (trace)");
-            assert_eq!(
-                c.point.len(),
-                fc.arity,
-                "region claim {ci} arity drift (trace)"
-            );
-            let base = layout.region_tail_offset + ci * stride;
-            for (kk, p) in c.point.iter().enumerate() {
-                pin_eq(&mut b, p, &io_cells[base + kk]);
-            }
-            pin_eq(&mut b, &c.value, &io_cells[base + class.region_max_arity]);
-        }
-    }
-    crate::acceptance::row_ledger_mark(&b, &mut ledger, "split: walk discharge + tail pins");
+    let region_preparation = finalize_r_pcs_link_region(&mut b, r_cols, &[&obs_prev, &obs_block])
+        .expect("recording-free link semantic binding");
+    assert_eq!(
+        region_preparation.vk(),
+        class.sidecar_vk(),
+        "link sidecar VK drifted from the universal frozen key"
+    );
+    crate::acceptance::row_ledger_mark(&b, &mut ledger, "split: link sidecar semantic pins");
 
     // ---- Pad to the class size.
     let target = 1usize << class.shape.m;
@@ -930,124 +2492,340 @@ fn build_split_link_inner(
         used <= target,
         "split link outgrew the class shape: {used} > {target}"
     );
-    while b.num_wires() < target {
-        b.alloc_f128(F128::ZERO);
-    }
     let (r1cs, witness) = b.build();
+    let (r1cs, witness) = super::expand_empty_field_tail(r1cs, witness, class.shape);
     assert_eq!(r1cs.m, class.shape.m, "class shape mismatch after padding");
+    assert_eq!(r1cs.useful_rows, used, "link useful-row accounting");
     if !freeze {
-        // The class matrix is a protocol constant (I1): hash it once per
-        // class — on the first real build — and seed every later
-        // instance. Freeze builds are excluded: their matrix omits the
-        // region tail pin rows.
         let class_digest = class
             .class_statement_digest
-            .get_or_init(|| r1cs.statement_digest());
+            .get()
+            .expect("frozen link matrix digest");
+        assert_eq!(
+            r1cs.statement_digest(),
+            *class_digest,
+            "same-slot link matrix drifted from its frozen class"
+        );
         r1cs.seed_statement_digest(*class_digest);
     }
     BuiltSplitLink {
         r1cs,
         witness,
         io,
-        region_claims: live_region,
+        region_preparation,
     }
 }
 
-/// The split-chain decider: natively verify the tip against its
-/// published class matrix, pin the whitelist to the true link-class
-/// digests, reject genesis tips and evaluate every LIVE lane's
-/// accumulated claim against its matrix. `link_matrices[a]` /
-/// `block_matrices[t]` may be `None` for DEAD lanes (unused classes need
-/// no local rebuild).
-pub fn decide_tip_split(
-    tip_class: &SplitLinkClass,
-    tip_class_r1cs: &FieldR1cs,
-    tip: &LinkEnvelope,
-    link_class_digests: &[[u8; 32]],
+enum PendingMatrixLane {
+    Dead,
+    Pending {
+        claim: MatrixAccClaim,
+        expected_digest: [u8; 32],
+    },
+    Checked,
+}
+
+/// A fully verified split tip whose live accumulated matrix lanes still need
+/// local structural evaluation.
+///
+/// The fields are deliberately private and the type is deliberately not
+/// `Clone`: callers may load/rebuild one matrix, check its lane, and release it,
+/// but acceptance is returned only by consuming [`Self::finish`] after every
+/// live lane has been checked.
+#[must_use = "a pending split-tip decision is not accepted until finish() succeeds"]
+pub struct PendingSplitTipDecision {
+    link_lanes: Vec<PendingMatrixLane>,
+    block_lanes: Vec<PendingMatrixLane>,
+}
+
+impl PendingSplitTipDecision {
+    fn link_lane_is_pending(&self, slot: usize) -> bool {
+        matches!(
+            self.link_lanes.get(slot),
+            Some(PendingMatrixLane::Pending { .. })
+        )
+    }
+
+    fn block_lane_is_pending(&self, slot: usize) -> bool {
+        matches!(
+            self.block_lanes.get(slot),
+            Some(PendingMatrixLane::Pending { .. })
+        )
+    }
+
+    fn check_lane(
+        lanes: &mut [PendingMatrixLane],
+        slot: usize,
+        matrix: &FieldR1cs,
+        family: &str,
+    ) -> Result<(), String> {
+        let what = format!("{family} lane {slot}");
+        let lane = lanes
+            .get(slot)
+            .ok_or_else(|| format!("{what}: slot out of range"))?;
+        let (claim, expected_digest) = match lane {
+            PendingMatrixLane::Dead => {
+                return Err(format!("{what}: matrix supplied for a dead lane"));
+            }
+            PendingMatrixLane::Checked => {
+                return Err(format!("{what}: matrix lane was already checked"));
+            }
+            PendingMatrixLane::Pending {
+                claim,
+                expected_digest,
+            } => (claim, expected_digest),
+        };
+
+        // This is a local-matrix trust boundary. `statement_digest()` may be
+        // deliberately seeded after a class matrix has already been checked;
+        // a matrix supplied to the final decider has not earned that trust.
+        if &matrix.structural_statement_digest() != expected_digest {
+            return Err(format!(
+                "{what}: matrix does not match the published digest"
+            ));
+        }
+        if claim.point.len() != 2 * matrix.k_log + 1 {
+            return Err(format!(
+                "{what}: lane width does not match the matrix shape"
+            ));
+        }
+        if stacked_matrix_mle_eval(matrix, claim) != claim.value {
+            return Err(format!("{what}: accumulated matrix claim is false"));
+        }
+        lanes[slot] = PendingMatrixLane::Checked;
+        Ok(())
+    }
+
+    /// Check one live Link-class accumulator lane against a transient local
+    /// matrix. The matrix may be released as soon as this method returns.
+    pub fn check_link_matrix(&mut self, slot: usize, matrix: &FieldR1cs) -> Result<(), String> {
+        Self::check_lane(&mut self.link_lanes, slot, matrix, "link")
+    }
+
+    /// Check one live Block-class accumulator lane against a transient local
+    /// matrix. The matrix may be released as soon as this method returns.
+    pub fn check_block_matrix(&mut self, slot: usize, matrix: &FieldR1cs) -> Result<(), String> {
+        Self::check_lane(&mut self.block_lanes, slot, matrix, "block")
+    }
+
+    /// Accept only after every live Link and Block lane was checked exactly
+    /// once. Dead lanes require no matrix and remain dead.
+    pub fn finish(self) -> Result<(), String> {
+        for (slot, lane) in self.link_lanes.iter().enumerate() {
+            if matches!(lane, PendingMatrixLane::Pending { .. }) {
+                return Err(format!(
+                    "link lane {slot}: live lane was not checked against its matrix"
+                ));
+            }
+        }
+        for (slot, lane) in self.block_lanes.iter().enumerate() {
+            if matches!(lane, PendingMatrixLane::Pending { .. }) {
+                return Err(format!(
+                    "block lane {slot}: live lane was not checked against its matrix"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn finish_tip_split_decision_with_matrix_banks(
+    mut pending: PendingSplitTipDecision,
     link_matrices: &[Option<&FieldR1cs>],
     block_matrices: &[Option<&FieldR1cs>],
 ) -> Result<(), String> {
+    assert_eq!(link_matrices.len(), pending.link_lanes.len());
+    assert_eq!(block_matrices.len(), pending.block_lanes.len());
+    for (slot, matrix) in link_matrices.iter().enumerate() {
+        if pending.link_lane_is_pending(slot) {
+            pending.check_link_matrix(
+                slot,
+                matrix.ok_or_else(|| format!("link lane {slot}: live lane without its matrix"))?,
+            )?;
+        }
+    }
+    for (slot, matrix) in block_matrices.iter().enumerate() {
+        if pending.block_lane_is_pending(slot) {
+            pending.check_block_matrix(
+                slot,
+                matrix.ok_or_else(|| format!("block lane {slot}: live lane without its matrix"))?,
+            )?;
+        }
+    }
+    pending.finish()
+}
+
+fn pending_lane(
+    tip: &LinkProofEnvelope,
+    lane: &SplitLaneLayout,
+    expected_digest: [u8; 32],
+    what: &str,
+) -> Result<PendingMatrixLane, String> {
+    match tip.io()[lane.live] {
+        F128::ZERO => Ok(PendingMatrixLane::Dead),
+        F128::ONE => Ok(PendingMatrixLane::Pending {
+            claim: MatrixAccClaim {
+                point: tip.io()[lane.point..lane.value].to_vec(),
+                value: tip.io()[lane.value],
+            },
+            expected_digest,
+        }),
+        _ => Err(format!("{what}: non-boolean liveness")),
+    }
+}
+
+/// Verify the tip proof and both published class whitelists, then return the
+/// one-shot set of live matrix claims. Matrix evaluation is intentionally
+/// deferred so a synchronizing node can rebuild/load and release one local
+/// class matrix at a time.
+pub fn begin_tip_split_decision(
+    tip_class: &SplitLinkClass,
+    tip_class_r1cs: &FieldR1cs,
+    tip: &LinkProofEnvelope,
+    link_class_digests: &[[u8; 32]],
+    link_post_commit_class_digests: &[[u8; 32]],
+) -> Result<PendingSplitTipDecision, String> {
     let layout = tip_class.layout();
     let n = tip_class.ladder.len();
     assert_eq!(link_class_digests.len(), n);
-    assert_eq!(link_matrices.len(), n);
-    assert_eq!(block_matrices.len(), n);
+    assert_eq!(link_post_commit_class_digests.len(), n);
 
-    let mut ch = FsLaneChallenger::new(b"history-link-v0");
-    noid_ivc_core::verifier::verify_field_with_public_io(
-        tip_class_r1cs,
-        &tip.commitment,
-        &tip.proof,
-        &tip_class.spec,
-        &tip.io,
-        &mut ch,
-    )
-    .map_err(|e| format!("tip proof rejected: {e:?}"))?;
-
-    if tip_class_r1cs.statement_digest() != link_class_digests[tip_class.slot] {
+    if tip_class_r1cs.structural_statement_digest() != link_class_digests[tip_class.slot] {
         return Err("tip class matrix is not the published one".into());
     }
-    if tip.io[layout.g] != F128::ZERO {
-        return Err("tip is a genesis link".into());
+
+    let mut ch = FsLaneChallenger::new(b"history-link-v0");
+    verify_split_link_proof(tip_class, tip_class_r1cs, tip, &mut ch)
+        .map_err(|e| format!("tip proof rejected: {e:?}"))?;
+
+    if tip_class.post_commit_class_digest() != &link_post_commit_class_digests[tip_class.slot] {
+        return Err("tip post-commit class is not the published one".into());
+    }
+    for (slot, matrix_digest) in link_class_digests.iter().enumerate() {
+        let expected = link_post_commit_class_digest(
+            matrix_digest,
+            &tip_class.spec,
+            &tip_class.pcs_params,
+            tip_class.sidecar_vk(),
+        );
+        if link_post_commit_class_digests[slot] != expected {
+            return Err(format!(
+                "link slot {slot}: composite digest is not derived from its matrix class"
+            ));
+        }
+    }
+    if tip.io()[layout.g] != F128::ZERO && tip.io()[layout.g] != F128::ONE {
+        return Err("tip has a non-boolean genesis-predecessor flag".into());
     }
     for (a, d) in link_class_digests.iter().enumerate() {
         let lanes = flat_digest_lanes(d);
-        if tip.io[layout.wl + 2 * a] != lanes[0] || tip.io[layout.wl + 2 * a + 1] != lanes[1] {
+        if tip.io()[layout.wl + 2 * a] != lanes[0] || tip.io()[layout.wl + 2 * a + 1] != lanes[1] {
             return Err(format!(
                 "whitelist lane {a} does not carry the class digest"
             ));
         }
     }
-    let check_lane =
-        |lane: &SplitLaneLayout, matrix: Option<&FieldR1cs>, what: &str| -> Result<(), String> {
-            let live = tip.io[lane.live];
-            if live == F128::ZERO {
-                return Ok(());
-            }
-            if live != F128::ONE {
-                return Err(format!("{what}: non-boolean liveness"));
-            }
-            let m = matrix.ok_or_else(|| format!("{what}: live lane without its matrix"))?;
-            let acc = MatrixAccClaim {
-                point: tip.io[lane.point..lane.value].to_vec(),
-                value: tip.io[lane.value],
-            };
-            if acc.point.len() != 2 * m.k_log + 1 {
-                return Err(format!(
-                    "{what}: lane width does not match the matrix shape"
-                ));
-            }
-            if stacked_matrix_mle_eval(m, &acc) != acc.value {
-                return Err(format!("{what}: accumulated matrix claim is false"));
-            }
-            Ok(())
-        };
-    for a in 0..n {
-        check_lane(
-            &layout.link_lanes[a],
-            link_matrices[a],
-            &format!("link lane {a}"),
-        )?;
+    for (a, digest) in link_post_commit_class_digests.iter().enumerate() {
+        let lanes = flat_digest_lanes(digest);
+        if tip.io()[layout.wl_post_commit + 2 * a] != lanes[0]
+            || tip.io()[layout.wl_post_commit + 2 * a + 1] != lanes[1]
+        {
+            return Err(format!(
+                "post-commit whitelist lane {a} does not carry the class digest"
+            ));
+        }
     }
-    for t in 0..n {
-        check_lane(
-            &layout.b_lanes[t],
-            block_matrices[t],
-            &format!("block lane {t}"),
-        )?;
+
+    let mut link_lanes = Vec::with_capacity(n);
+    let mut block_lanes = Vec::with_capacity(n);
+    for slot in 0..n {
+        link_lanes.push(pending_lane(
+            tip,
+            &layout.link_lanes[slot],
+            link_class_digests[slot],
+            &format!("link lane {slot}"),
+        )?);
+        block_lanes.push(pending_lane(
+            tip,
+            &layout.b_lanes[slot],
+            tip_class.ladder[slot].b_digest,
+            &format!("block lane {slot}"),
+        )?);
     }
-    Ok(())
+    Ok(PendingSplitTipDecision {
+        link_lanes,
+        block_lanes,
+    })
+}
+
+/// The split-chain decider: natively verify the tip against its published
+/// class matrix, pin the whitelist to the true link-class digests and evaluate
+/// every LIVE lane's accumulated claim against its matrix.
+///
+/// This compatibility entry point retains the simultaneous matrix-bank API;
+/// new synchronization code can call [`begin_tip_split_decision`] and stream
+/// the same checks one matrix at a time. `None` is valid only for DEAD lanes.
+pub fn decide_tip_split(
+    tip_class: &SplitLinkClass,
+    tip_class_r1cs: &FieldR1cs,
+    tip: &LinkProofEnvelope,
+    link_class_digests: &[[u8; 32]],
+    link_post_commit_class_digests: &[[u8; 32]],
+    link_matrices: &[Option<&FieldR1cs>],
+    block_matrices: &[Option<&FieldR1cs>],
+) -> Result<(), String> {
+    let n = tip_class.ladder.len();
+    assert_eq!(link_matrices.len(), n);
+    assert_eq!(block_matrices.len(), n);
+    let pending = begin_tip_split_decision(
+        tip_class,
+        tip_class_r1cs,
+        tip,
+        link_class_digests,
+        link_post_commit_class_digests,
+    )?;
+    finish_tip_split_decision_with_matrix_banks(pending, link_matrices, block_matrices)
+}
+
+/// Split-link final decider anchored to the node's locally selected canonical
+/// tip and transaction-epoch header.
+#[allow(clippy::too_many_arguments)]
+pub fn decide_block_tip_split(
+    tip_class: &SplitLinkClass,
+    tip_class_r1cs: &FieldR1cs,
+    tip: &LinkProofEnvelope,
+    link_class_digests: &[[u8; 32]],
+    link_post_commit_class_digests: &[[u8; 32]],
+    link_matrices: &[Option<&FieldR1cs>],
+    block_matrices: &[Option<&FieldR1cs>],
+    local_tip_header: &BlockHeader,
+    local_epoch_anchor_header: &BlockHeader,
+) -> Result<(), String> {
+    decide_tip_split(
+        tip_class,
+        tip_class_r1cs,
+        tip,
+        link_class_digests,
+        link_post_commit_class_digests,
+        link_matrices,
+        block_matrices,
+    )?;
+    let accumulator = tip_block_accumulator_split(tip_class, tip)
+        .map_err(|error| format!("tip accumulator decode failed: {error:?}"))?;
+    accumulator
+        .validate_local_header_boundary(local_tip_header, local_epoch_anchor_header)
+        .map_err(|error| format!("tip does not match local canonical headers: {error}"))
 }
 
 /// The tip's exposed block chain accumulator — the value a fresh peer
 /// anchors against its locally validated headers (I8).
 pub fn tip_block_accumulator_split(
     tip_class: &SplitLinkClass,
-    tip: &LinkEnvelope,
+    tip: &LinkProofEnvelope,
 ) -> Result<ChainAccumulator, ChainAccumulatorLaneError> {
     let layout = tip_class.layout();
     let lanes =
-        std::array::from_fn(|i| Block128::from(flat_to_block(tip.io[layout.block_acc + i])));
+        std::array::from_fn(|i| Block128::from(flat_to_block(tip.io()[layout.block_acc + i])));
     ChainAccumulator::from_lanes(lanes)
 }
 
@@ -1055,4 +2833,903 @@ pub fn tip_block_accumulator_split(
 fn flat_to_block(v: F128) -> u128 {
     use noid_core::hardware::flat_to_tower_u128;
     flat_to_tower_u128((v.lo as u128) | ((v.hi as u128) << 64))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use noid_ivc_core::matrix_claim::{fresh_claim_value, FreshLincheckClaim};
+
+    fn ladder_test_shape(m: usize) -> FieldShape {
+        FieldShape {
+            m,
+            k_log: m,
+            k_skip: noid_ivc_core::zerocheck::K_SKIP,
+            const_pin: Some(0),
+        }
+    }
+
+    fn ladder_test_pcs(m: usize) -> PcsParams {
+        PcsParams {
+            m: m + noid_ivc_core::pcs::LOG_PACKING,
+            log_inv_rate: CANONICAL_PCS_LOG_INV_RATE,
+            log_batch_size: CANONICAL_PCS_LOG_BATCH_SIZE,
+            profile: Default::default(),
+        }
+    }
+
+    fn canonical_test_slots() -> Vec<LadderSlotInfo> {
+        [
+            (8usize, 22usize),
+            (32usize, 23usize),
+            (64usize, 23usize),
+            (255usize, 24usize),
+        ]
+        .into_iter()
+        .map(|(tier, m)| LadderSlotInfo {
+            tier,
+            b_shape: ladder_test_shape(m),
+            b_digest: [tier as u8; 32],
+            b_pcs_params: ladder_test_pcs(m),
+            b_post_commit_class_digest: [tier.wrapping_add(1) as u8; 32],
+            b_sidecar_vk_digest: [tier.wrapping_add(2) as u8; 32],
+        })
+        .collect()
+    }
+
+    #[test]
+    fn canonical_split_link_ladder_accepts_only_the_consensus_table() {
+        let descriptor = CanonicalSplitLinkLadder::try_new(
+            ladder_test_shape(24),
+            ladder_test_pcs(24),
+            canonical_test_slots(),
+        )
+        .expect("canonical four-slot descriptor");
+        assert_eq!(
+            descriptor
+                .slots()
+                .iter()
+                .map(|slot| slot.tier)
+                .collect::<Vec<_>>(),
+            noid_chain::consensus::params::USER_TX_CLASS_TIERS
+        );
+        assert_eq!(descriptor.link_shape(), ladder_test_shape(24));
+        assert!(same_pcs_params(
+            descriptor.link_pcs_params(),
+            &ladder_test_pcs(24)
+        ));
+
+        let short = canonical_test_slots().into_iter().take(3).collect();
+        assert_eq!(
+            CanonicalSplitLinkLadder::try_new(ladder_test_shape(24), ladder_test_pcs(24), short,)
+                .unwrap_err(),
+            CanonicalLadderError::SlotCount {
+                expected: 4,
+                actual: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn canonical_split_link_ladder_rejects_tier_mutation_and_order_drift() {
+        let mut mutated = canonical_test_slots();
+        mutated[2].tier = 63;
+        assert_eq!(
+            CanonicalSplitLinkLadder::try_new(ladder_test_shape(24), ladder_test_pcs(24), mutated,)
+                .unwrap_err(),
+            CanonicalLadderError::TierMismatch {
+                slot: 2,
+                expected: 64,
+                actual: 63,
+            }
+        );
+
+        let mut reordered = canonical_test_slots();
+        reordered.swap(0, 1);
+        assert_eq!(
+            CanonicalSplitLinkLadder::try_new(
+                ladder_test_shape(24),
+                ladder_test_pcs(24),
+                reordered,
+            )
+            .unwrap_err(),
+            CanonicalLadderError::TierMismatch {
+                slot: 0,
+                expected: 8,
+                actual: 32,
+            }
+        );
+    }
+
+    #[test]
+    fn canonical_split_link_ladder_rejects_shape_and_pcs_drift() {
+        let mut non_block_shape = canonical_test_slots();
+        non_block_shape[2].b_shape.k_log -= 1;
+        assert_eq!(
+            CanonicalSplitLinkLadder::try_new(
+                ladder_test_shape(24),
+                ladder_test_pcs(24),
+                non_block_shape,
+            )
+            .unwrap_err(),
+            CanonicalLadderError::BlockShape { slot: 2 }
+        );
+
+        let mut bad_shape = canonical_test_slots();
+        bad_shape[1].b_pcs_params.m += 1;
+        assert_eq!(
+            CanonicalSplitLinkLadder::try_new(
+                ladder_test_shape(24),
+                ladder_test_pcs(24),
+                bad_shape,
+            )
+            .unwrap_err(),
+            CanonicalLadderError::BlockPcsShape { slot: 1 }
+        );
+
+        let mut bad_queries = canonical_test_slots();
+        bad_queries[3].b_pcs_params.log_inv_rate = 1;
+        assert_eq!(
+            CanonicalSplitLinkLadder::try_new(
+                ladder_test_shape(24),
+                ladder_test_pcs(24),
+                bad_queries,
+            )
+            .unwrap_err(),
+            CanonicalLadderError::BlockPcsParameters { slot: 3 }
+        );
+
+        assert_eq!(
+            CanonicalSplitLinkLadder::try_new(
+                ladder_test_shape(8),
+                ladder_test_pcs(8),
+                canonical_test_slots(),
+            )
+            .unwrap_err(),
+            CanonicalLadderError::LinkClassSize {
+                expected: CANONICAL_LINK_CLASS_M,
+                actual: 8,
+            }
+        );
+    }
+
+    #[test]
+    fn canonical_split_link_ladder_rejects_nonproduction_sizes_and_pcs() {
+        let mut non_block_link_shape = ladder_test_shape(CANONICAL_LINK_CLASS_M);
+        non_block_link_shape.k_log -= 1;
+        assert_eq!(
+            CanonicalSplitLinkLadder::try_new(
+                non_block_link_shape,
+                ladder_test_pcs(CANONICAL_LINK_CLASS_M),
+                canonical_test_slots(),
+            )
+            .unwrap_err(),
+            CanonicalLadderError::LinkShape
+        );
+
+        let mut wrong_link_pcs_m = ladder_test_pcs(CANONICAL_LINK_CLASS_M);
+        wrong_link_pcs_m.m += 1;
+        assert_eq!(
+            CanonicalSplitLinkLadder::try_new(
+                ladder_test_shape(CANONICAL_LINK_CLASS_M),
+                wrong_link_pcs_m,
+                canonical_test_slots(),
+            )
+            .unwrap_err(),
+            CanonicalLadderError::LinkPcsShape
+        );
+
+        let mut wrong_block_m = canonical_test_slots();
+        wrong_block_m[0].b_shape = ladder_test_shape(23);
+        wrong_block_m[0].b_pcs_params = ladder_test_pcs(23);
+        assert_eq!(
+            CanonicalSplitLinkLadder::try_new(
+                ladder_test_shape(CANONICAL_LINK_CLASS_M),
+                ladder_test_pcs(CANONICAL_LINK_CLASS_M),
+                wrong_block_m,
+            )
+            .unwrap_err(),
+            CanonicalLadderError::BlockClassSize {
+                slot: 0,
+                expected: CANONICAL_BLOCK_CLASS_MS[0],
+                actual: 23,
+            }
+        );
+
+        let mut wrong_link_rate = ladder_test_pcs(CANONICAL_LINK_CLASS_M);
+        wrong_link_rate.log_inv_rate = 1;
+        assert_eq!(
+            CanonicalSplitLinkLadder::try_new(
+                ladder_test_shape(CANONICAL_LINK_CLASS_M),
+                wrong_link_rate,
+                canonical_test_slots(),
+            )
+            .unwrap_err(),
+            CanonicalLadderError::LinkPcsParameters
+        );
+
+        let mut wrong_link_batch = ladder_test_pcs(CANONICAL_LINK_CLASS_M);
+        wrong_link_batch.log_batch_size = CANONICAL_PCS_LOG_BATCH_SIZE - 1;
+        assert_eq!(
+            CanonicalSplitLinkLadder::try_new(
+                ladder_test_shape(CANONICAL_LINK_CLASS_M),
+                wrong_link_batch,
+                canonical_test_slots(),
+            )
+            .unwrap_err(),
+            CanonicalLadderError::LinkPcsParameters
+        );
+
+        let mut wrong_link_profile = ladder_test_pcs(CANONICAL_LINK_CLASS_M);
+        wrong_link_profile.profile = noid_ivc_core::pcs::ligerito::LigeritoProfile::Slim;
+        assert_eq!(
+            CanonicalSplitLinkLadder::try_new(
+                ladder_test_shape(CANONICAL_LINK_CLASS_M),
+                wrong_link_profile,
+                canonical_test_slots(),
+            )
+            .unwrap_err(),
+            CanonicalLadderError::LinkPcsParameters
+        );
+
+        let mut wrong_block_batch = canonical_test_slots();
+        wrong_block_batch[2].b_pcs_params.log_batch_size = CANONICAL_PCS_LOG_BATCH_SIZE - 1;
+        assert_eq!(
+            CanonicalSplitLinkLadder::try_new(
+                ladder_test_shape(CANONICAL_LINK_CLASS_M),
+                ladder_test_pcs(CANONICAL_LINK_CLASS_M),
+                wrong_block_batch,
+            )
+            .unwrap_err(),
+            CanonicalLadderError::BlockPcsParameters { slot: 2 }
+        );
+    }
+
+    #[test]
+    fn canonical_ladder_slot_identity_includes_post_commit_and_sidecar_vk() {
+        let slots = canonical_test_slots();
+        let mut post_commit_drift = slots.clone();
+        post_commit_drift[1].b_post_commit_class_digest[0] ^= 1;
+        assert!(!same_ladder(&slots, &post_commit_drift));
+
+        let mut sidecar_drift = slots.clone();
+        sidecar_drift[3].b_sidecar_vk_digest[0] ^= 1;
+        assert!(!same_ladder(&slots, &sidecar_drift));
+    }
+
+    #[test]
+    fn arbitrary_four_class_transition_routing_is_exhaustive_and_rejects_misbinding() {
+        const N: usize = CanonicalSplitLinkLadder::SLOT_COUNT;
+        let ladder = canonical_test_slots();
+        let layout = split_io_layout(CANONICAL_LINK_CLASS_M, &ladder);
+        let link_digests: [[u8; 32]; N] = std::array::from_fn(|slot| [0x10 + slot as u8; 32]);
+        let post_commit_digests: [[u8; 32]; N] =
+            std::array::from_fn(|slot| [0x20 + slot as u8; 32]);
+        let marker = |family: u64, index: usize| {
+            F128::new(
+                family.wrapping_mul(0x0101_0101_0101_0101) ^ index as u64,
+                family,
+            )
+        };
+
+        let mut pair_count = 0usize;
+        let mut equal_count = 0usize;
+        let mut upward_count = 0usize;
+        let mut downward_count = 0usize;
+        let mut skipped_count = 0usize;
+        for prev_slot in 0..N {
+            for current_slot in 0..N {
+                pair_count += 1;
+                match current_slot.cmp(&prev_slot) {
+                    std::cmp::Ordering::Equal => equal_count += 1,
+                    std::cmp::Ordering::Greater => upward_count += 1,
+                    std::cmp::Ordering::Less => downward_count += 1,
+                }
+                if current_slot.abs_diff(prev_slot) > 1 {
+                    skipped_count += 1;
+                }
+
+                let mut prev_io = vec![F128::ZERO; layout.len];
+                for (slot, digest) in link_digests.iter().enumerate() {
+                    let lanes = flat_digest_lanes(digest);
+                    prev_io[layout.wl + 2 * slot] = lanes[0];
+                    prev_io[layout.wl + 2 * slot + 1] = lanes[1];
+                }
+                for (slot, digest) in post_commit_digests.iter().enumerate() {
+                    let lanes = flat_digest_lanes(digest);
+                    prev_io[layout.wl_post_commit + 2 * slot] = lanes[0];
+                    prev_io[layout.wl_post_commit + 2 * slot + 1] = lanes[1];
+                }
+                for (slot, lane) in layout.link_lanes.iter().enumerate() {
+                    for index in lane.point..=lane.value {
+                        prev_io[index] = marker(0x40 + slot as u64, index - lane.point);
+                    }
+                    prev_io[lane.live] = if slot % 2 == 0 { F128::ONE } else { F128::ZERO };
+                }
+                for (slot, lane) in layout.b_lanes.iter().enumerate() {
+                    for index in lane.point..=lane.value {
+                        prev_io[index] = marker(0x60 + slot as u64, index - lane.point);
+                    }
+                    prev_io[lane.live] = if slot % 2 == 1 { F128::ONE } else { F128::ZERO };
+                }
+                let previous_accumulator = (0..super::super::link::ACC_LANES)
+                    .map(|index| marker(0x80, index))
+                    .collect::<Vec<_>>();
+                prev_io[layout.block_acc..layout.block_acc + super::super::link::ACC_LANES]
+                    .copy_from_slice(&previous_accumulator);
+                let block_start_accumulator = previous_accumulator.clone();
+                let block_end_accumulator = (0..super::super::link::ACC_LANES)
+                    .map(|index| marker(0x90, index))
+                    .collect::<Vec<_>>();
+
+                let selection = preflight_split_transition(
+                    &layout,
+                    prev_slot,
+                    current_slot,
+                    &link_digests,
+                    &post_commit_digests,
+                    &prev_io,
+                    link_digests[prev_slot],
+                    post_commit_digests[prev_slot],
+                    ladder[current_slot].b_digest,
+                    ladder[current_slot].b_digest,
+                    &block_start_accumulator,
+                    &previous_accumulator,
+                )
+                .expect("every ordered class pair is a valid transition");
+                assert_eq!(selection.digest, link_digests[prev_slot]);
+                assert_eq!(selection.post_commit, post_commit_digests[prev_slot]);
+
+                let selected_link_lane = &layout.link_lanes[prev_slot];
+                let acc_link = MatrixAccClaim {
+                    point: (0..selected_link_lane.value - selected_link_lane.point)
+                        .map(|index| marker(0xA0, index))
+                        .collect(),
+                    value: marker(0xA1, 0),
+                };
+                let selected_block_lane = &layout.b_lanes[current_slot];
+                let acc_block = MatrixAccClaim {
+                    point: (0..selected_block_lane.value - selected_block_lane.point)
+                        .map(|index| marker(0xB0, index))
+                        .collect(),
+                    value: marker(0xB1, 0),
+                };
+                let io = route_split_transition_io(
+                    &layout,
+                    false,
+                    prev_slot,
+                    current_slot,
+                    &link_digests,
+                    &post_commit_digests,
+                    &prev_io,
+                    &acc_link,
+                    &acc_block,
+                    &block_end_accumulator,
+                )
+                .expect("production transition routing");
+                assert_eq!(io[layout.g], F128::ZERO);
+                for (slot, lane) in layout.link_lanes.iter().enumerate() {
+                    if slot == prev_slot {
+                        assert_eq!(&io[lane.point..lane.value], &acc_link.point);
+                        assert_eq!(io[lane.value], acc_link.value);
+                        assert_eq!(io[lane.live], F128::ONE);
+                    } else {
+                        assert_eq!(
+                            &io[lane.point..=lane.live],
+                            &prev_io[lane.point..=lane.live],
+                            "({prev_slot},{current_slot}) altered Link lane {slot}",
+                        );
+                    }
+                }
+                for (slot, lane) in layout.b_lanes.iter().enumerate() {
+                    if slot == current_slot {
+                        assert_eq!(&io[lane.point..lane.value], &acc_block.point);
+                        assert_eq!(io[lane.value], acc_block.value);
+                        assert_eq!(io[lane.live], F128::ONE);
+                    } else {
+                        assert_eq!(
+                            &io[lane.point..=lane.live],
+                            &prev_io[lane.point..=lane.live],
+                            "({prev_slot},{current_slot}) altered Block lane {slot}",
+                        );
+                    }
+                }
+                assert_eq!(
+                    &io[layout.block_acc..layout.block_acc + super::super::link::ACC_LANES],
+                    &block_end_accumulator,
+                    "({prev_slot},{current_slot}) direct accumulator output",
+                );
+
+                let wrong_prev_slot = (prev_slot + 1) % N;
+                assert_eq!(
+                    preflight_split_transition(
+                        &layout,
+                        wrong_prev_slot,
+                        current_slot,
+                        &link_digests,
+                        &post_commit_digests,
+                        &prev_io,
+                        link_digests[prev_slot],
+                        post_commit_digests[wrong_prev_slot],
+                        ladder[current_slot].b_digest,
+                        ladder[current_slot].b_digest,
+                        &block_start_accumulator,
+                        &previous_accumulator,
+                    ),
+                    Err(SplitTransitionError::SelectedLinkMatrix),
+                );
+
+                let mut wrong_whitelist = link_digests;
+                wrong_whitelist[prev_slot][0] ^= 1;
+                assert_eq!(
+                    preflight_split_transition(
+                        &layout,
+                        prev_slot,
+                        current_slot,
+                        &wrong_whitelist,
+                        &post_commit_digests,
+                        &prev_io,
+                        link_digests[prev_slot],
+                        post_commit_digests[prev_slot],
+                        ladder[current_slot].b_digest,
+                        ladder[current_slot].b_digest,
+                        &block_start_accumulator,
+                        &previous_accumulator,
+                    ),
+                    Err(SplitTransitionError::WhitelistInheritance),
+                );
+
+                let mut wrong_post_commit = post_commit_digests;
+                wrong_post_commit[prev_slot][0] ^= 1;
+                assert_eq!(
+                    preflight_split_transition(
+                        &layout,
+                        prev_slot,
+                        current_slot,
+                        &link_digests,
+                        &wrong_post_commit,
+                        &prev_io,
+                        link_digests[prev_slot],
+                        post_commit_digests[prev_slot],
+                        ladder[current_slot].b_digest,
+                        ladder[current_slot].b_digest,
+                        &block_start_accumulator,
+                        &previous_accumulator,
+                    ),
+                    Err(SplitTransitionError::PostCommitWhitelistInheritance),
+                );
+
+                let mut wrong_selected_post_commit = post_commit_digests[prev_slot];
+                wrong_selected_post_commit[0] ^= 1;
+                assert_eq!(
+                    preflight_split_transition(
+                        &layout,
+                        prev_slot,
+                        current_slot,
+                        &link_digests,
+                        &post_commit_digests,
+                        &prev_io,
+                        link_digests[prev_slot],
+                        wrong_selected_post_commit,
+                        ladder[current_slot].b_digest,
+                        ladder[current_slot].b_digest,
+                        &block_start_accumulator,
+                        &previous_accumulator,
+                    ),
+                    Err(SplitTransitionError::SelectedLinkPostCommit),
+                );
+
+                let mut wrong_link_matrix = link_digests[prev_slot];
+                wrong_link_matrix[0] ^= 1;
+                assert_eq!(
+                    preflight_split_transition(
+                        &layout,
+                        prev_slot,
+                        current_slot,
+                        &link_digests,
+                        &post_commit_digests,
+                        &prev_io,
+                        wrong_link_matrix,
+                        post_commit_digests[prev_slot],
+                        ladder[current_slot].b_digest,
+                        ladder[current_slot].b_digest,
+                        &block_start_accumulator,
+                        &previous_accumulator,
+                    ),
+                    Err(SplitTransitionError::SelectedLinkMatrix),
+                );
+
+                let mut wrong_block_matrix = ladder[current_slot].b_digest;
+                wrong_block_matrix[0] ^= 1;
+                assert_eq!(
+                    preflight_split_transition(
+                        &layout,
+                        prev_slot,
+                        current_slot,
+                        &link_digests,
+                        &post_commit_digests,
+                        &prev_io,
+                        link_digests[prev_slot],
+                        post_commit_digests[prev_slot],
+                        wrong_block_matrix,
+                        ladder[current_slot].b_digest,
+                        &block_start_accumulator,
+                        &previous_accumulator,
+                    ),
+                    Err(SplitTransitionError::CurrentBlockMatrix),
+                );
+
+                let mut wrong_start = block_start_accumulator.clone();
+                wrong_start[0] += F128::ONE;
+                assert_eq!(
+                    preflight_split_transition(
+                        &layout,
+                        prev_slot,
+                        current_slot,
+                        &link_digests,
+                        &post_commit_digests,
+                        &prev_io,
+                        link_digests[prev_slot],
+                        post_commit_digests[prev_slot],
+                        ladder[current_slot].b_digest,
+                        ladder[current_slot].b_digest,
+                        &wrong_start,
+                        &previous_accumulator,
+                    ),
+                    Err(SplitTransitionError::AccumulatorContinuity),
+                );
+            }
+        }
+        assert_eq!(pair_count, 16);
+        assert_eq!(equal_count, 4);
+        assert_eq!(upward_count, 6);
+        assert_eq!(downward_count, 6);
+        assert_eq!(skipped_count, 6);
+    }
+
+    #[test]
+    fn freeze_all_orchestration_shares_one_bootstrap_without_class_identity_drift() {
+        #[derive(Clone)]
+        struct DummyBootstrap {
+            matrix: Arc<&'static str>,
+            sidecar_vk: Arc<&'static str>,
+            envelope: Arc<&'static str>,
+            post_commit: [u8; 32],
+        }
+
+        struct DummyClass {
+            slot: usize,
+            class_identity: u8,
+            bootstrap: DummyBootstrap,
+        }
+
+        let first_calls = std::cell::Cell::new(0usize);
+        let shared_calls = std::cell::Cell::new(0usize);
+        let classes = materialize_with_shared_bootstrap(
+            [8u8, 32, 64, 255],
+            |slot, class_identity| {
+                first_calls.set(first_calls.get() + 1);
+                let bootstrap = DummyBootstrap {
+                    matrix: Arc::new("canonical T"),
+                    sidecar_vk: Arc::new("canonical VK"),
+                    envelope: Arc::new("canonical envelope"),
+                    post_commit: [0xA5; 32],
+                };
+                (
+                    DummyClass {
+                        slot,
+                        class_identity,
+                        bootstrap: bootstrap.clone(),
+                    },
+                    bootstrap,
+                )
+            },
+            |slot, class_identity, bootstrap| {
+                shared_calls.set(shared_calls.get() + 1);
+                DummyClass {
+                    slot,
+                    class_identity,
+                    bootstrap: bootstrap.clone(),
+                }
+            },
+        );
+
+        assert_eq!(first_calls.get(), 1, "T is built/proved once");
+        assert_eq!(shared_calls.get(), 3);
+        assert_eq!(
+            std::array::from_fn(|slot| (classes[slot].slot, classes[slot].class_identity)),
+            [(0, 8), (1, 32), (2, 64), (3, 255)],
+            "sharing bootstrap state must not alias per-slot class identity"
+        );
+        let reference = &classes[0].bootstrap;
+        for class in &classes[1..] {
+            assert!(Arc::ptr_eq(&reference.matrix, &class.bootstrap.matrix));
+            assert!(Arc::ptr_eq(
+                &reference.sidecar_vk,
+                &class.bootstrap.sidecar_vk
+            ));
+            assert!(Arc::ptr_eq(&reference.envelope, &class.bootstrap.envelope));
+            assert_eq!(reference.post_commit, class.bootstrap.post_commit);
+        }
+    }
+
+    fn decider_test_matrix(tag: u64) -> FieldR1cs {
+        let shape = FieldShape {
+            m: noid_ivc_core::zerocheck::K_SKIP,
+            k_log: noid_ivc_core::zerocheck::K_SKIP,
+            k_skip: noid_ivc_core::zerocheck::K_SKIP,
+            const_pin: Some(0),
+        };
+        let mut matrix = split_genesis_instance(&shape);
+        if tag != 0 {
+            matrix.a_0.value_table[0] = F128::new(tag + 1, 0);
+        }
+        matrix
+    }
+
+    fn pending_test_lane(matrix: &FieldR1cs) -> PendingMatrixLane {
+        let mut claim = MatrixAccClaim {
+            point: vec![F128::ZERO; 2 * matrix.k_log + 1],
+            value: F128::ZERO,
+        };
+        claim.value = stacked_matrix_mle_eval(matrix, &claim);
+        PendingMatrixLane::Pending {
+            claim,
+            expected_digest: matrix.structural_statement_digest(),
+        }
+    }
+
+    fn pending_test_decision(
+        link_matrices: &[Option<&FieldR1cs>],
+        block_matrices: &[Option<&FieldR1cs>],
+    ) -> PendingSplitTipDecision {
+        PendingSplitTipDecision {
+            link_lanes: link_matrices
+                .iter()
+                .map(|matrix| {
+                    matrix.map_or(PendingMatrixLane::Dead, |matrix| pending_test_lane(matrix))
+                })
+                .collect(),
+            block_lanes: block_matrices
+                .iter()
+                .map(|matrix| {
+                    matrix.map_or(PendingMatrixLane::Dead, |matrix| pending_test_lane(matrix))
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn streamed_tip_decision_rejects_skipped_live_lane() {
+        let matrix = decider_test_matrix(0);
+        let pending = pending_test_decision(&[Some(&matrix)], &[None]);
+        assert_eq!(
+            pending.finish().unwrap_err(),
+            "link lane 0: live lane was not checked against its matrix"
+        );
+    }
+
+    #[test]
+    fn streamed_tip_decision_rejects_duplicate_and_dead_lane_checks() {
+        let matrix = decider_test_matrix(0);
+        let mut pending = pending_test_decision(&[Some(&matrix), None], &[None, None]);
+        pending
+            .check_link_matrix(0, &matrix)
+            .expect("first live-lane check");
+        assert_eq!(
+            pending.check_link_matrix(0, &matrix).unwrap_err(),
+            "link lane 0: matrix lane was already checked"
+        );
+        assert_eq!(
+            pending.check_link_matrix(1, &matrix).unwrap_err(),
+            "link lane 1: matrix supplied for a dead lane"
+        );
+        assert_eq!(
+            pending.check_link_matrix(2, &matrix).unwrap_err(),
+            "link lane 2: slot out of range"
+        );
+        pending.finish().expect("only live lane was checked");
+    }
+
+    #[test]
+    fn streamed_tip_decision_rejects_wrong_slot_and_matrix() {
+        let matrix_a = decider_test_matrix(0);
+        let matrix_b = decider_test_matrix(7);
+        let mut pending =
+            pending_test_decision(&[Some(&matrix_a), Some(&matrix_b)], &[Some(&matrix_b)]);
+
+        assert_eq!(
+            pending.check_link_matrix(0, &matrix_b).unwrap_err(),
+            "link lane 0: matrix does not match the published digest"
+        );
+        pending
+            .check_link_matrix(0, &matrix_a)
+            .expect("slot 0 receives its matrix");
+        assert_eq!(
+            pending.check_link_matrix(1, &matrix_a).unwrap_err(),
+            "link lane 1: matrix does not match the published digest"
+        );
+        pending
+            .check_link_matrix(1, &matrix_b)
+            .expect("slot 1 receives its matrix");
+        assert_eq!(
+            pending.check_block_matrix(0, &matrix_a).unwrap_err(),
+            "block lane 0: matrix does not match the published digest"
+        );
+        pending
+            .check_block_matrix(0, &matrix_b)
+            .expect("block slot receives its matrix");
+        pending.finish().expect("all live lanes were checked");
+    }
+
+    #[test]
+    fn streamed_tip_decision_ignores_seeded_digest_substitution() {
+        let honest = decider_test_matrix(0);
+        let expected = honest.structural_statement_digest();
+        let substituted = decider_test_matrix(9);
+        substituted.seed_statement_digest(expected);
+        assert_eq!(substituted.statement_digest(), expected);
+
+        let mut pending = pending_test_decision(&[Some(&honest)], &[]);
+        assert_eq!(
+            pending.check_link_matrix(0, &substituted).unwrap_err(),
+            "link lane 0: matrix does not match the published digest"
+        );
+        pending
+            .check_link_matrix(0, &honest)
+            .expect("honest structural matrix remains accepted");
+        pending.finish().expect("honest replacement completed lane");
+    }
+
+    #[test]
+    fn streamed_and_matrix_bank_tip_decisions_have_parity() {
+        let link = decider_test_matrix(0);
+        let block = decider_test_matrix(11);
+
+        let mut streamed = pending_test_decision(&[Some(&link), None], &[Some(&block), None]);
+        streamed
+            .check_link_matrix(0, &link)
+            .expect("streamed Link check");
+        streamed
+            .check_block_matrix(0, &block)
+            .expect("streamed Block check");
+        streamed.finish().expect("streamed finish");
+
+        let banked = pending_test_decision(&[Some(&link), None], &[Some(&block), None]);
+        finish_tip_split_decision_with_matrix_banks(
+            banked,
+            &[Some(&link), Some(&block)],
+            &[Some(&block), Some(&link)],
+        )
+        .expect("dead-lane matrices stay ignored for compatibility");
+
+        let missing = pending_test_decision(&[Some(&link)], &[Some(&block)]);
+        assert_eq!(
+            finish_tip_split_decision_with_matrix_banks(missing, &[None], &[Some(&block)])
+                .unwrap_err(),
+            "link lane 0: live lane without its matrix"
+        );
+    }
+
+    fn phased_matrix_release_compile_contract<'a>(
+        class: &'a SplitLinkClass,
+        input: SplitLinkTraceInput<'a>,
+        link_matrix: FieldR1cs,
+        block_matrix: FieldR1cs,
+    ) -> BuiltSplitLink {
+        let prepared = prepare_split_link_native(class, input, &link_matrix, &block_matrix);
+        drop(link_matrix);
+        drop(block_matrix);
+        prepared.assemble()
+    }
+
+    fn combined_and_phased_build_parity_contract<'a>(
+        class: &'a SplitLinkClass,
+        input: &SplitLinkInput<'a>,
+    ) {
+        let combined = build_split_link(class, input);
+        let phased = prepare_split_link_native(
+            class,
+            SplitLinkTraceInput::from_combined(input),
+            input.fold_matrix_link,
+            input.fold_matrix_block,
+        )
+        .assemble();
+        assert_eq!(
+            combined.r1cs.structural_statement_digest(),
+            phased.r1cs.structural_statement_digest(),
+            "combined and phased matrix identities"
+        );
+        assert_eq!(combined.witness, phased.witness, "phased witness parity");
+        assert_eq!(combined.io, phased.io, "phased public-IO parity");
+        assert_eq!(
+            combined.region_preparation.vk(),
+            phased.region_preparation.vk(),
+            "phased sidecar preparation parity"
+        );
+    }
+
+    #[test]
+    fn phased_build_api_has_matrix_free_assembly_and_parity_contracts() {
+        let _release: for<'a> fn(
+            &'a SplitLinkClass,
+            SplitLinkTraceInput<'a>,
+            FieldR1cs,
+            FieldR1cs,
+        ) -> BuiltSplitLink = phased_matrix_release_compile_contract;
+        let _parity: for<'a> fn(&'a SplitLinkClass, &SplitLinkInput<'a>) =
+            combined_and_phased_build_parity_contract;
+    }
+
+    fn next(state: &mut u128) -> F128 {
+        *state = state
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15_D1B5_4A32_D192_ED03)
+            .wrapping_add(0xA5A5_5A5A_DEAD_BEEF_0123_4567_89AB_CDEF);
+        F128::new(*state as u64, (*state >> 64) as u64)
+    }
+
+    #[test]
+    fn split_genesis_full_identity_accepts_ghosts_and_baked_value_is_exact() {
+        let shape = FieldShape {
+            m: 9,
+            k_log: 9,
+            k_skip: noid_ivc_core::zerocheck::K_SKIP,
+            const_pin: Some(0),
+        };
+        let genesis = split_genesis_instance(&shape);
+        let mut seed = 7u128;
+        let mut witness = (0..1usize << shape.m)
+            .map(|_| next(&mut seed))
+            .collect::<Vec<_>>();
+        witness[0] = F128::ONE;
+        assert!(
+            genesis.satisfies(&witness),
+            "full-identity T permits canonical nonzero sidecar columns"
+        );
+
+        let mut fresh = FreshLincheckClaim {
+            alpha: next(&mut seed),
+            z_skip: next(&mut seed),
+            x_inner_rest: (shape.k_skip..shape.k_log)
+                .map(|_| next(&mut seed))
+                .collect(),
+            r_inner_rest: (shape.k_skip..shape.k_log)
+                .map(|_| next(&mut seed))
+                .collect(),
+            z_partial: (0..1usize << shape.k_skip)
+                .map(|_| next(&mut seed))
+                .collect(),
+            value: F128::ZERO,
+        };
+        fresh.value = fresh_claim_value(&genesis, &fresh);
+
+        let mut builder = FieldR1csBuilder::new();
+        let alloc =
+            |builder: &mut FieldR1csBuilder, value| LinExpr::from_wire(builder.alloc_f128(value));
+        let trace = super::super::trace::matrix_fold::FreshLincheckClaimTrace {
+            alpha: alloc(&mut builder, fresh.alpha),
+            z_skip: alloc(&mut builder, fresh.z_skip),
+            x_inner_rest: fresh
+                .x_inner_rest
+                .iter()
+                .map(|&value| alloc(&mut builder, value))
+                .collect(),
+            r_inner_rest: fresh
+                .r_inner_rest
+                .iter()
+                .map(|&value| alloc(&mut builder, value))
+                .collect(),
+            z_partial: fresh
+                .z_partial
+                .iter()
+                .map(|&value| alloc(&mut builder, value))
+                .collect(),
+            value: alloc(&mut builder, fresh.value),
+        };
+        let baked = split_genesis_baked_claim_value(&mut builder, &trace);
+        assert_eq!(baked.eval(builder.values()), fresh.value);
+        pin_eq(&mut builder, &baked, &trace.value);
+        let (relation, relation_witness) = builder.build();
+        assert!(relation.satisfies(&relation_witness));
+    }
 }

@@ -147,7 +147,12 @@ pub fn verify_auth_mle_opening(
     }
 
     let mut channel = Channel::new();
-    match capsule_verify(&proof.commitment, &reduction.point, &proof.opening, &mut channel) {
+    match capsule_verify(
+        &proof.commitment,
+        &reduction.point,
+        &proof.opening,
+        &mut channel,
+    ) {
         Ok(value) => value == reduction.value,
         Err(_) => false,
     }

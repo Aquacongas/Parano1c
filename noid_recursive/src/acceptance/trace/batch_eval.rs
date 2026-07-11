@@ -24,8 +24,8 @@ use noid_gkr::batch_eval::{
 };
 
 use super::{
-    alloc_block, eq_ind_trace, mul, pin_zero, BatchEvalReductionTrace,
-    BooleanPointEqCache, FieldR1csBuilder, LinExpr, RawChannelTrace, F128,
+    alloc_block, eq_ind_trace, mul, pin_zero, BatchEvalReductionTrace, BooleanPointEqCache,
+    FieldR1csBuilder, LinExpr, RawChannelTrace, F128,
 };
 
 // ---------------------------------------------------------------------------
@@ -49,12 +49,7 @@ impl BatchEvalRoundTrace {
 
     /// Trace twin of `batch_eval::lagrange_at_0_1_2` on the reconstructed
     /// triple (6 multiplications).
-    pub fn evaluate(
-        &self,
-        b: &mut FieldR1csBuilder,
-        claim: &LinExpr,
-        r: &LinExpr,
-    ) -> LinExpr {
+    pub fn evaluate(&self, b: &mut FieldR1csBuilder, claim: &LinExpr, r: &LinExpr) -> LinExpr {
         let e0 = claim.add(&self.evals_at_1_2[0]);
         let denom_inv = denom_inv_3_flat();
         let r0 = r.clone();
@@ -102,7 +97,11 @@ pub struct LinearEvalProofTrace {
 
 impl LinearEvalProofTrace {
     pub fn alloc(b: &mut FieldR1csBuilder, native: &LinearEvalProof, n: usize) -> Self {
-        assert_eq!(native.rounds.len(), n, "linear-eval proof off the trace shape");
+        assert_eq!(
+            native.rounds.len(),
+            n,
+            "linear-eval proof off the trace shape"
+        );
         Self {
             rounds: native
                 .rounds
@@ -127,7 +126,11 @@ impl MultiBatchEvalProofTrace {
         n: usize,
         n_columns: usize,
     ) -> Self {
-        assert_eq!(native.rounds.len(), n, "multi-batch proof off the trace shape");
+        assert_eq!(
+            native.rounds.len(),
+            n,
+            "multi-batch proof off the trace shape"
+        );
         assert_eq!(
             native.b_finals.len(),
             n_columns,
@@ -353,7 +356,11 @@ impl BatchEvalProofTrace {
         native: &noid_gkr::batch_eval::BatchEvalProof,
         n: usize,
     ) -> Self {
-        assert_eq!(native.rounds.len(), n, "batch-eval proof off the trace shape");
+        assert_eq!(
+            native.rounds.len(),
+            n,
+            "batch-eval proof off the trace shape"
+        );
         Self {
             rounds: native
                 .rounds
@@ -511,8 +518,8 @@ pub fn verify_multi_batch_eval_trace(
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::{assert_expr_is, tower_value};
     use super::super::flat_of;
+    use super::super::test_support::{assert_expr_is, tower_value};
     use super::*;
     use noid_core::mle::evaluate::evaluate_slice;
     use noid_core::transcript::FiatShamir;
@@ -617,8 +624,7 @@ mod tests {
                 value: super::super::alloc_block(&mut b, c.value),
             })
             .collect();
-        let red_t =
-            verify_linear_eval_prebound_trace(&mut b, &mut ch, &proof_t, &claims_t, n, TAG);
+        let red_t = verify_linear_eval_prebound_trace(&mut b, &mut ch, &proof_t, &claims_t, n, TAG);
 
         for (e, v) in red_t.point.iter().zip(red_native.point.iter()) {
             assert_expr_is(&b, e, *v, "reduction point");
@@ -638,8 +644,7 @@ mod tests {
     #[test]
     fn multi_batch_eval_trace_lockstep_and_tamper() {
         let n = 5usize;
-        let columns: Vec<Vec<Block128>> =
-            (0..3).map(|k| rand_blocks(100 + k, 1 << n)).collect();
+        let columns: Vec<Vec<Block128>> = (0..3).map(|k| rand_blocks(100 + k, 1 << n)).collect();
         let claims_by_column: Vec<Vec<EvalClaim>> = columns
             .iter()
             .enumerate()
@@ -654,8 +659,7 @@ mod tests {
             })
             .collect();
         let column_refs: Vec<&[Block128]> = columns.iter().map(Vec::as_slice).collect();
-        let claim_refs: Vec<&[EvalClaim]> =
-            claims_by_column.iter().map(Vec::as_slice).collect();
+        let claim_refs: Vec<&[EvalClaim]> = claims_by_column.iter().map(Vec::as_slice).collect();
 
         let mut ch_p = Poseidon2bChannel::new();
         let (proof, red_native) = prove_multi_batch_eval(&column_refs, &claim_refs, &mut ch_p);
@@ -664,26 +668,27 @@ mod tests {
             verify_multi_batch_eval(&proof, &claim_refs, n, &mut ch_n).expect("native accepts");
         assert_eq!(red_native, red_check);
 
-        let build_trace = |proof: &MultiBatchEvalProof| -> (FieldR1csBuilder, Vec<BatchEvalReductionTrace>) {
-            let mut b = FieldR1csBuilder::new();
-            let mut ch = RawChannelTrace::new();
-            let proof_t = MultiBatchEvalProofTrace::alloc(&mut b, proof, n, 3);
-            let claims_t: Vec<Vec<EvalClaimTrace>> = claims_by_column
-                .iter()
-                .map(|claims| {
-                    claims
-                        .iter()
-                        .map(|c| EvalClaimTrace {
-                            point: super::super::alloc_blocks(&mut b, &c.point),
-                            value: super::super::alloc_block(&mut b, c.value),
-                        })
-                        .collect()
-                })
-                .collect();
-            let refs: Vec<&[EvalClaimTrace]> = claims_t.iter().map(Vec::as_slice).collect();
-            let reds = verify_multi_batch_eval_trace(&mut b, &mut ch, &proof_t, &refs, n);
-            (b, reds)
-        };
+        let build_trace =
+            |proof: &MultiBatchEvalProof| -> (FieldR1csBuilder, Vec<BatchEvalReductionTrace>) {
+                let mut b = FieldR1csBuilder::new();
+                let mut ch = RawChannelTrace::new();
+                let proof_t = MultiBatchEvalProofTrace::alloc(&mut b, proof, n, 3);
+                let claims_t: Vec<Vec<EvalClaimTrace>> = claims_by_column
+                    .iter()
+                    .map(|claims| {
+                        claims
+                            .iter()
+                            .map(|c| EvalClaimTrace {
+                                point: super::super::alloc_blocks(&mut b, &c.point),
+                                value: super::super::alloc_block(&mut b, c.value),
+                            })
+                            .collect()
+                    })
+                    .collect();
+                let refs: Vec<&[EvalClaimTrace]> = claims_t.iter().map(Vec::as_slice).collect();
+                let reds = verify_multi_batch_eval_trace(&mut b, &mut ch, &proof_t, &refs, n);
+                (b, reds)
+            };
 
         let (b, reds) = build_trace(&proof);
         assert_eq!(reds.len(), red_native.len());
@@ -703,6 +708,9 @@ mod tests {
         assert!(verify_multi_batch_eval(&bad, &claim_refs, n, &mut ch_bad).is_none());
         let (b_bad, _) = build_trace(&bad);
         let (r1cs_bad, z_bad) = b_bad.build();
-        assert!(!r1cs_bad.satisfies(&z_bad), "tampered multi-batch trace satisfiable");
+        assert!(
+            !r1cs_bad.satisfies(&z_bad),
+            "tampered multi-batch trace satisfiable"
+        );
     }
 }

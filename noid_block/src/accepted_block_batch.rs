@@ -15,6 +15,7 @@ use noid_chain::hash_block_header;
 use noid_chain::header_anchor::{
     extend_header_chain_anchor, HeaderChainAnchor, HeaderChainAnchorError,
 };
+use noid_chain::segmented_state::ExactStateReadError;
 use noid_chain::state::ChainState;
 use noid_core::{Block128, TowerField};
 use noid_gkr::{
@@ -64,11 +65,10 @@ use crate::{
     accepted_block_certificate_batch_statement, accepted_block_certificate_chain_claim,
     accepted_block_claim_fields_from_transcript, accepted_block_claim_from_transcript,
     accepted_block_claim_transcript, block_proof_acceptance_receipt,
-    derive_exact_state_killshot_inputs, AcceptedBlockCertificateBatchError,
-    AcceptedBlockCertificateBatchStatement, AcceptedBlockCertificateRecord, AuthorizationProof,
-    AuthorizationVerifier, BlockAuthSidecar, BlockProof, CanonicalAuthorizationStatement,
-    ExactStateKillShotError, ExactStateKillShotProof, FullValidationError, VerifiedAuthorization,
-    VerifiedAuthorizationBatch, VerifyBlockError,
+    AcceptedBlockCertificateBatchError, AcceptedBlockCertificateBatchStatement,
+    AcceptedBlockCertificateRecord, AuthorizationProof, AuthorizationVerifier, BlockAuthSidecar,
+    BlockProof, CanonicalAuthorizationStatement, ExactStateKillShotError, ExactStateKillShotProof,
+    FullValidationError, VerifiedAuthorization, VerifiedAuthorizationBatch, VerifyBlockError,
 };
 use rayon::prelude::*;
 use std::sync::Mutex;
@@ -200,6 +200,10 @@ pub enum FullAcceptedBlockBatchError {
         index: usize,
         source: ExactStateKillShotError,
     },
+    ExactStateRead {
+        index: usize,
+        source: ExactStateReadError,
+    },
     AuthorizationComponent {
         index: usize,
         tx_index: usize,
@@ -328,6 +332,7 @@ pub fn verify_full_accepted_block_batch_native(
     let mut authorization_witnesses = Vec::new();
     let mut authorization_traces = Vec::new();
     let mut exact_state_killshot_inputs = Vec::new();
+    let mut exact_state_structural_inputs = Vec::new();
     let mut authorization_totals = VerifiedAuthorizationBatch {
         user_tx_count: 0,
         live_input_count_total: 0,
@@ -359,9 +364,8 @@ pub fn verify_full_accepted_block_batch_native(
         } else {
             (None, BlockAuthSidecar::default())
         };
-
         let auth_tracer = TracingOwnerAuthVerifier::default();
-        let validation = accept_block_timeless_with_artifacts_with_auth_verifier(
+        let mut validation = accept_block_timeless_with_artifacts_with_auth_verifier(
             &item.block,
             &item.block_proof_bytes,
             &item.block_auth_sidecar_bytes,
@@ -375,27 +379,69 @@ pub fn verify_full_accepted_block_batch_native(
         )
         .map_err(|source| FullAcceptedBlockBatchError::FullValidation { index, source })?;
 
-        if has_user_txs {
-            let artifacts = &validation.artifacts;
-            let proof = proof
-                .as_ref()
-                .expect("user-transaction block proof decoded above");
-            let (inputs, verified) = derive_exact_state_killshot_inputs(
-                &artifacts.exact_state_inputs,
-                &artifacts.exact_action_surface,
-                &proof.state_transition,
-            )
-            .map_err(|source| FullAcceptedBlockBatchError::ExactStateComponent { index, source })?;
-            if verified != artifacts.verified_transition {
+        let coinbase_state_transition = if has_user_txs {
+            None
+        } else {
+            // A multiproof frontier contains only subtrees disjoint from every
+            // touched leaf, so its siblings are identical in the accepted old
+            // and new states. Rebuild them from the already-applied child cache;
+            // the common derivation below then independently reconstructs and
+            // checks both roots against the sealed native transition.
+            let cache = state
+                .exact_sparse_cache()
+                .map_err(|source| FullAcceptedBlockBatchError::ExactStateRead { index, source })?;
+            if cache.depth() != validation.artifacts.exact_state_inputs.child_log_slots {
                 return Err(FullAcceptedBlockBatchError::ExactStateComponent {
                     index,
                     source: ExactStateKillShotError::ExactState(
-                        crate::ExactStateTransitionError::ChildRootMismatch,
+                        crate::ExactStateTransitionError::InvalidLogSlots,
                     ),
                 });
             }
-            exact_state_killshot_inputs.push(inputs);
+            Some(
+                crate::build_exact_state_transition_proof(
+                    &cache,
+                    &validation.artifacts.exact_action_surface,
+                )
+                .map_err(|source| {
+                    FullAcceptedBlockBatchError::ExactStateComponent {
+                        index,
+                        source: source.into(),
+                    }
+                })?,
+            )
+        };
+        let state_transition = proof
+            .as_ref()
+            .map(|proof| &proof.state_transition)
+            .or(coinbase_state_transition.as_ref())
+            .expect("every accepted block has a detached or reconstructed exact-state proof");
+        let verified_roots = match validation.artifacts.verified_exact_state_roots.take() {
+            Some(roots) => roots,
+            None if !has_user_txs => crate::exact_state_transition::verify_exact_state_roots(
+                &validation.artifacts.exact_state_inputs,
+                &validation.artifacts.exact_action_surface,
+                state_transition,
+            )
+            .map_err(|source| FullAcceptedBlockBatchError::ExactStateComponent {
+                index,
+                source: source.into(),
+            })?,
+            None => return Err(FullAcceptedBlockBatchError::ComponentShapeMismatch),
+        };
+        let (inputs, structural_inputs) =
+            crate::exact_state_killshot::derive_retained_exact_state_inputs_from_verified_roots(
+                &validation.artifacts.exact_state_inputs,
+                &validation.artifacts.exact_action_surface,
+                state_transition,
+                verified_roots,
+            )
+            .map_err(|source| FullAcceptedBlockBatchError::ExactStateComponent { index, source })?;
+        exact_state_killshot_inputs.push(inputs);
+        exact_state_structural_inputs.push(structural_inputs);
 
+        let artifacts = &validation.artifacts;
+        if has_user_txs {
             let captured_auth = auth_tracer.into_captured_ordered();
             if captured_auth.len() != sidecar.tx_auth.len()
                 || captured_auth.len() != artifacts.authorization.user_tx_count
@@ -539,6 +585,7 @@ pub fn verify_full_accepted_block_batch_native(
                 authorization_witnesses,
                 authorization_traces,
                 exact_state_killshot_inputs,
+                exact_state_structural_inputs,
                 authorization_totals,
             },
             accepted_block_acceptance_receipts,
@@ -571,7 +618,57 @@ pub(crate) fn prove_full_accepted_block_batch_components(
     {
         return Err(FullAcceptedBlockBatchError::ComponentShapeMismatch);
     }
+    let exact_state_count = components
+        .component_inputs
+        .exact_state_structural_inputs
+        .len();
+    if exact_state_count
+        != components
+            .component_inputs
+            .accepted_claim_witness
+            .headers
+            .len()
+        || components
+            .component_inputs
+            .exact_state_killshot_inputs
+            .len()
+            != exact_state_count
+    {
+        return Err(FullAcceptedBlockBatchError::ComponentShapeMismatch);
+    }
     validate_tx_body_component_shape(components)?;
+
+    // The default keeps independent components parallel for latency. The B255
+    // feasibility harness can force a serialized schedule to measure component
+    // peaks independently. This is an execution policy only; proof bytes and
+    // verification are identical.
+    if std::env::var_os("NOID_SERIAL_COMPONENT_PROOFS").is_some() {
+        let accepted_claim_hash = measure_component_proof("accepted-claim", || {
+            let mut channel = noid_poseidon2b::channel::Poseidon2bChannel::new();
+            Ok(prove_accepted_claim_hash_killshot(
+                &components.component_inputs.accepted_claim_hash_inputs,
+                &mut channel,
+            )
+            .0)
+        })?;
+        let tx_body =
+            measure_component_proof("tx-body-spine", || prove_tx_body_component(components))?;
+        let tx_root = measure_component_proof("tx-root", || prove_tx_root_component(components))?;
+        let checkpoint_poseidon = measure_component_proof("checkpoint-poseidon", || {
+            prove_checkpoint_poseidon(&components.component_inputs.accepted_claim_witness)
+                .map_err(FullAcceptedBlockBatchError::CheckpointPoseidon)
+        })?;
+        let exact_state =
+            measure_component_proof("exact-state", || prove_exact_state_components(components))?;
+        return Ok(RetainedFullAcceptedBlockBatchProof {
+            accepted_claim_hash,
+            tx_body,
+            tx_root,
+            checkpoint_poseidon,
+            exact_state,
+        });
+    }
+
     let claim_result = || -> Result<AcceptedClaimHashProofKillShot, FullAcceptedBlockBatchError> {
         let mut channel = noid_poseidon2b::channel::Poseidon2bChannel::new();
         Ok(prove_accepted_claim_hash_killshot(
@@ -631,6 +728,37 @@ pub(crate) fn prove_full_accepted_block_batch_components(
     })
 }
 
+fn measure_component_proof<T>(
+    label: &str,
+    prove: impl FnOnce() -> Result<T, FullAcceptedBlockBatchError>,
+) -> Result<T, FullAcceptedBlockBatchError> {
+    let profile = std::env::var_os("NOID_COMPONENT_LEDGER").is_some();
+    let before = profile
+        .then(noid_core::mem_profile::current_mem_snapshot)
+        .flatten();
+    let started = std::time::Instant::now();
+    let result = prove();
+    if profile {
+        let elapsed = started.elapsed();
+        let after = noid_core::mem_profile::current_mem_snapshot();
+        match (before, after) {
+            (Some(before), Some(after)) => eprintln!(
+                "[component-ledger] {label}: {:.3}s, RSS {:.1}->{:.1} MiB, HWM {:.1}->{:.1} MiB",
+                elapsed.as_secs_f64(),
+                before.rss_mb(),
+                after.rss_mb(),
+                before.hwm_mb(),
+                after.hwm_mb(),
+            ),
+            _ => eprintln!(
+                "[component-ledger] {label}: {:.3}s, RSS unavailable",
+                elapsed.as_secs_f64()
+            ),
+        }
+    }
+    result
+}
+
 /// Replays the retained batch with the timeless `AcceptBlock` predicate, derives
 /// proof component statements from that accepted replay, and proves them.
 ///
@@ -664,7 +792,10 @@ pub fn prove_retained_full_accepted_block_batch_proof(
 ///
 /// This is not a public O(1) history verifier: callers must still provide the
 /// retained block bodies, block proofs, auth sidecars, start parent, and start
-/// state so the timeless `AcceptBlock` relation can be replayed exactly.
+/// state so the timeless `AcceptBlock` relation can be replayed exactly. It is
+/// a retained-package audit boundary, not an additional per-block suffix-sync
+/// step: suffix sync runs the native acceptance predicate once, while prefix
+/// sync verifies the recursive checkpoint proof.
 pub fn verify_retained_full_accepted_block_batch_proof(
     start_consensus: &RecursiveConsensusState,
     start_accumulator: &ChainAccumulator,
@@ -1301,13 +1432,34 @@ fn prove_exact_state_components(
 ) -> Result<Vec<ExactStateKillShotProof>, FullAcceptedBlockBatchError> {
     components
         .component_inputs
-        .exact_state_killshot_inputs
+        .exact_state_structural_inputs
         .par_iter()
+        .zip(
+            components
+                .component_inputs
+                .exact_state_killshot_inputs
+                .par_iter(),
+        )
         .enumerate()
-        .map(|(index, inputs)| {
-            crate::prove_exact_state_killshot(inputs).map_err(|source| {
-                FullAcceptedBlockBatchError::ExactStateComponent { index, source }
-            })
+        .map(|(index, (structural, legacy))| {
+            let mut proof =
+                crate::prove_exact_state_structural_killshot(structural).map_err(|source| {
+                    FullAcceptedBlockBatchError::ExactStateComponent { index, source }
+                })?;
+            if !legacy.state_paths.is_empty() {
+                if legacy.state_paths.len()
+                    > crate::exact_state_killshot::TRANSITIONAL_INLINE_EXACT_STATE_MAX_PATHS
+                {
+                    return Err(FullAcceptedBlockBatchError::ComponentShapeMismatch);
+                }
+                proof.state_paths =
+                    crate::exact_state_killshot::prove_transitional_exact_state_path_chunks(legacy)
+                        .map_err(|source| FullAcceptedBlockBatchError::ExactStateComponent {
+                            index,
+                            source,
+                        })?;
+            }
+            Ok(proof)
         })
         .collect()
 }
@@ -1585,6 +1737,107 @@ mod tests {
     }
 
     #[test]
+    fn coinbase_only_retained_proof_has_one_exact_state_component_and_verifies() {
+        let parent = noid_chain::consensus::genesis_header();
+        let state = ChainState::with_log_slots(parent.log_slots as usize);
+        assert_eq!(state.cached_state_root(), parent.state_root);
+
+        let genesis_work = noid_chain::consensus::block_work(&parent.difficulty_target);
+        let start_consensus = RecursiveConsensusState::from_header(
+            &parent,
+            genesis_work,
+            0,
+            parent.timestamp,
+            parent.difficulty_target,
+            &[parent.timestamp],
+            &[parent.active_slot_count],
+        );
+        let start_accumulator = noid_recursive::genesis_accumulator();
+        let timestamp = parent
+            .timestamp
+            .checked_add(noid_chain::consensus::params::BLOCK_TIME)
+            .unwrap();
+        let difficulty_target = noid_chain::consensus::next_target(
+            start_consensus.asert_anchor_height,
+            start_consensus.asert_anchor_timestamp,
+            &start_consensus.asert_anchor_target,
+            parent.height + 1,
+            timestamp,
+        );
+        let template = noid_chain::consensus::build_block_template(
+            &parent,
+            &state,
+            start_consensus.active_counts(),
+            Vec::new(),
+            Address([0xC1; 32]),
+            timestamp,
+            difficulty_target,
+        )
+        .unwrap();
+        let transactions = template.all_txs();
+        let mut child = template.into_header(0);
+        child.nonce = noid_chain::consensus::pow::search_pow(&child, 0, 5_000_000)
+            .expect("easy canonical test target mines within the fixed range");
+        let witness = FullAcceptedBlockBatchWitness {
+            items: vec![FullAcceptedBlockBatchItem {
+                block: Block {
+                    header: child,
+                    transactions,
+                },
+                block_proof_bytes: Vec::new(),
+                block_auth_sidecar_bytes: Vec::new(),
+            }],
+        };
+
+        let (output, proof) = prove_retained_full_accepted_block_batch_proof(
+            &start_consensus,
+            &start_accumulator,
+            &parent,
+            &state,
+            &witness,
+        )
+        .unwrap();
+        assert_eq!(
+            output
+                .proof_components
+                .component_inputs
+                .exact_state_killshot_inputs
+                .len(),
+            1
+        );
+        assert_eq!(
+            output
+                .proof_components
+                .component_inputs
+                .exact_state_structural_inputs
+                .len(),
+            1
+        );
+        assert_eq!(proof.exact_state.len(), 1);
+        let legacy = &output
+            .proof_components
+            .component_inputs
+            .exact_state_killshot_inputs[0];
+        assert_eq!(legacy.slot_leaves.len(), 2);
+        assert_eq!(legacy.state_paths.len(), 2);
+        assert_eq!(proof.exact_state[0].state_paths.len(), 1);
+
+        let verified = verify_retained_full_accepted_block_batch_proof(
+            &start_consensus,
+            &start_accumulator,
+            &parent,
+            &state,
+            &witness,
+            &proof,
+        )
+        .unwrap();
+        assert_eq!(
+            verified.end_state.cached_state_root(),
+            output.end_state.cached_state_root()
+        );
+    }
+
+    #[test]
     fn tx_root_component_rejects_header_mismatch_and_nonzero_empty_root() {
         let transactions = vec![transaction(0, true)];
         let mut block = Block {
@@ -1619,7 +1872,6 @@ mod tests {
             active_slot_count: header.active_slot_count,
             alloc_counter: header.alloc_counter,
             cumulative_chainwork: [0x55; 32],
-            projection_root: [0x66; 32],
         };
         let accumulator = ChainAccumulator {
             height: header.height,

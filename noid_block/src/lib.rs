@@ -36,22 +36,29 @@ pub use accepted_block_certificate::{
     accepted_block_certificate_batch_statement, accepted_block_certificate_batch_statement_digest,
     accepted_block_certificate_chain_claim, accepted_block_certificate_record,
     accepted_block_certificate_statement, accepted_block_certificate_statement_digest,
-    block_proof_acceptance_receipt, block_proof_acceptance_receipt_digest,
-    verify_accepted_block_certificate_statement_native, AcceptedBlockCertificateBatchError,
-    AcceptedBlockCertificateBatchStatement, AcceptedBlockCertificateRecord,
-    AcceptedBlockCertificateRecordError, AcceptedBlockCertificateStatement,
+    accepted_block_post_validation_bundle, block_proof_acceptance_receipt,
+    block_proof_acceptance_receipt_digest, verify_accepted_block_certificate_statement_native,
+    AcceptedBlockCertificateBatchError, AcceptedBlockCertificateBatchStatement,
+    AcceptedBlockCertificateRecord, AcceptedBlockCertificateRecordError,
+    AcceptedBlockCertificateStatement, AcceptedBlockPostValidationBundle,
     BlockProofAcceptanceReceipt,
 };
 
 pub use exact_state_killshot::{
-    derive_exact_state_killshot_inputs, prove_exact_state_killshot, verify_exact_state_killshot,
-    ExactStateKillShotError, ExactStateKillShotInputs, ExactStateKillShotProof,
+    derive_exact_state_killshot_inputs, derive_exact_state_structural_killshot_inputs,
+    prove_exact_state_killshot, prove_exact_state_structural_killshot, verify_exact_state_killshot,
+    verify_exact_state_structural_killshot, ExactStateKillShotError, ExactStateKillShotInputs,
+    ExactStateKillShotProof, ExactStateStructuralFrontierInputs,
+    EXACT_STATE_STRUCTURAL_HASH_CHUNK_SIZE, TRANSITIONAL_INLINE_EXACT_STATE_MAX_PATHS,
 };
 pub use exact_state_transition::{
     build_exact_state_transition_proof, derive_exact_slot_leaf_batch_inputs,
-    derive_exact_state_merkle_batch_inputs, verify_exact_state_transition,
-    ExactSlotLeafBatchInputs, ExactStateMerkleBatchInputs, ExactStateTransitionError,
-    ExactStateTransitionInputs, ExactStateTransitionProof, VerifiedStateTransition,
+    derive_exact_state_merkle_batch_inputs, derive_exact_state_structural_hash_batch_inputs,
+    exact_state_structural_hash_chunk_plan, exact_state_structural_hash_ghost_input,
+    exact_state_structural_hash_params, verify_exact_state_transition, ExactSlotLeafBatchInputs,
+    ExactStateMerkleBatchInputs, ExactStateStructuralHashBatchInputs,
+    ExactStateStructuralHashChunkPlan, ExactStateTransitionError, ExactStateTransitionInputs,
+    ExactStateTransitionProof, VerifiedStateTransition,
 };
 pub use history_claim::{
     accepted_state_transition_chain_claim, accepted_state_transition_claim_digest,
@@ -206,6 +213,7 @@ pub struct AcceptedBlockResourceClaim {
     pub user_tx_count: u32,
     pub live_input_count: u32,
     pub output_count: u32,
+    /// Missing digest nodes in the canonical structural multiproof frontier.
     pub state_frontier_node_count: u32,
 }
 
@@ -231,7 +239,8 @@ pub fn accepted_block_claim_transcript(
         .map_err(|_| VerifyBlockError::BlockResourceWeightExceeded)?
         as u64;
     let (user_txs, live_inputs, outputs, state_frontier_nodes) =
-        crate::validate::block_resource_counts(block);
+        crate::validate::block_resource_counts(block)
+            .map_err(|_| VerifyBlockError::BlockResourceWeightExceeded)?;
     if user_txs == 0 {
         if proof.is_some() || !auth_sidecar.tx_auth.is_empty() {
             return Err(VerifyBlockError::AuthSidecarShapeMismatch);
@@ -604,7 +613,7 @@ mod tests {
         assert_eq!(transcript.resources.user_tx_count, 0);
         assert_eq!(transcript.resources.live_input_count, 0);
         assert_eq!(transcript.resources.output_count, 1);
-        assert_eq!(transcript.resources.state_frontier_node_count, 1);
+        assert_eq!(transcript.resources.state_frontier_node_count, 24);
         assert_eq!(
             accepted_block_claim_fields_from_transcript(&transcript).len(),
             ACCEPTED_BLOCK_CLAIM_FIELDS

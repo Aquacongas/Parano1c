@@ -61,8 +61,8 @@ use noid_core::mle::evaluate::evaluate_slice;
 use noid_core::{AdditiveNTT, Block128, TowerField};
 use noid_fri::hasher::{CryptographicHasher, HashOutput};
 use noid_fri::Channel;
-use noid_poseidon2b::native::compression::Poseidon2bFlatSponge;
 use noid_poseidon2b::native::compress_flat_feed_forward_with_tag;
+use noid_poseidon2b::native::compression::Poseidon2bFlatSponge;
 use noid_poseidon2b::native::domain::{TAG_CAPSLEAF, TAG_CAPSNODE};
 
 use crate::interleaved_commit::{
@@ -95,6 +95,48 @@ pub const CAPSULE_NUM_QUERIES: usize = 64;
 #[cfg(debug_assertions)]
 pub const CAPSULE_NUM_QUERIES: usize = 8;
 
+/// Entropy bits carried by one capsule query seed.
+pub const CAPSULE_QUERY_SEED_BITS: usize = u128::BITS as usize;
+
+/// Number of field-element transcript seeds needed to sample
+/// [`CAPSULE_NUM_QUERIES`] independent `log_len`-bit positions without
+/// throwing away the other bits of each 128-bit challenge.
+///
+/// Query bits are a single LSB-first bit stream: seed 0 bits 0..127, then
+/// seed 1 bits 0..127, and so on. Splitting that stream into consecutive
+/// `log_len`-bit words preserves exactly the same amount of query entropy as
+/// one field-element squeeze per query. In particular, the production owner
+/// capsule (`64 * (9 + CAPSULE_LOG_RATE)` bits) needs seven seeds; the debug
+/// capsule needs one.
+#[inline]
+pub const fn capsule_query_seed_count(log_len: usize) -> usize {
+    packed_query_seed_count(CAPSULE_NUM_QUERIES, log_len)
+}
+
+/// Locate one LSB-first query-index bit in the packed seed stream.
+///
+/// Returns `(seed_index, bit_index_within_seed)`. This is public so the
+/// recursive verifier can use the exact native packing rule without copying
+/// arithmetic from the protocol implementation.
+#[inline]
+pub const fn capsule_query_bit_location(
+    query_index: usize,
+    query_bit: usize,
+    log_len: usize,
+) -> (usize, usize) {
+    assert!(query_bit < log_len, "query bit is outside the index width");
+    let stream_bit = query_index * log_len + query_bit;
+    (
+        stream_bit / CAPSULE_QUERY_SEED_BITS,
+        stream_bit % CAPSULE_QUERY_SEED_BITS,
+    )
+}
+
+const fn packed_query_seed_count(num_queries: usize, log_len: usize) -> usize {
+    let bits = num_queries * log_len;
+    bits.div_ceil(CAPSULE_QUERY_SEED_BITS)
+}
+
 /// Pre-query transcript grind bits (prover cost ~2^bits sponge squeezes).
 #[cfg(not(debug_assertions))]
 pub const CAPSULE_GRIND_BITS: u32 = 16;
@@ -116,7 +158,11 @@ macro_rules! capsule_stage {
         if capsule_profile() {
             let t = std::time::Instant::now();
             let out = $body;
-            eprintln!("capsule {:<14} {:>9.3} ms", $label, t.elapsed().as_secs_f64() * 1e3);
+            eprintln!(
+                "capsule {:<14} {:>9.3} ms",
+                $label,
+                t.elapsed().as_secs_f64() * 1e3
+            );
             out
         } else {
             $body
@@ -218,7 +264,10 @@ pub fn capsule_encode(message: &[Block128], ntt: &AdditiveNTT<Block128>) -> Vec<
     };
     let windows: Vec<Vec<Block128>> = if message.len() >= 1024 {
         use rayon::prelude::*;
-        (0..CAPSULE_RATE as u32).into_par_iter().map(window).collect()
+        (0..CAPSULE_RATE as u32)
+            .into_par_iter()
+            .map(window)
+            .collect()
     } else {
         (0..CAPSULE_RATE as u32).map(window).collect()
     };
@@ -265,7 +314,13 @@ pub fn capsule_fold16(
         let half = cur.len() / 2;
         let mut next = Vec::with_capacity(half);
         for k in 0..half {
-            next.push(capsule_high_fold_step(r, rc, before_log, cur[k], cur[k + half]));
+            next.push(capsule_high_fold_step(
+                r,
+                rc,
+                before_log,
+                cur[k],
+                cur[k + half],
+            ));
         }
         cur = next;
     }
@@ -350,7 +405,11 @@ fn build_capsule_tree(codeword: &[Block128], msg_log: usize) -> SourceHashMerkle
             capsule_leaf_hash(msg_log, leaf, &syms)
         })
         .collect();
-    SourceHashMerkleTree::new(leaves, CommitmentHashBackend::Arithmetic, &CapsuleNodeHasher)
+    SourceHashMerkleTree::new(
+        leaves,
+        CommitmentHashBackend::Arithmetic,
+        &CapsuleNodeHasher,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -420,13 +479,44 @@ fn check_grind(channel: &mut Channel, nonce: u64) -> bool {
     channel.get_random_point().0 & mask == 0
 }
 
-fn draw_queries(channel: &mut Channel, log_len: usize) -> Vec<usize> {
-    let mask = (1u128 << log_len) - 1;
-    channel
-        .get_random_points(CAPSULE_NUM_QUERIES)
-        .iter()
-        .map(|e| (e.0 & mask) as usize)
+/// Decode the capsule's packed transcript seeds into query positions.
+///
+/// `Block128::0` is the channel's tower-basis bit pattern. Bits are consumed
+/// LSB-first across seed boundaries, then each consecutive `log_len`-bit
+/// word is interpreted LSB-first as one query index.
+pub fn capsule_queries_from_seeds(seeds: &[Block128], log_len: usize) -> Vec<usize> {
+    packed_queries_from_seeds(seeds, CAPSULE_NUM_QUERIES, log_len)
+}
+
+fn packed_queries_from_seeds(seeds: &[Block128], num_queries: usize, log_len: usize) -> Vec<usize> {
+    assert!(log_len > 0, "capsule query width must be non-zero");
+    assert!(
+        log_len <= usize::BITS as usize,
+        "capsule query width exceeds usize"
+    );
+    assert_eq!(
+        seeds.len(),
+        packed_query_seed_count(num_queries, log_len),
+        "capsule query seed count"
+    );
+
+    (0..num_queries)
+        .map(|query_index| {
+            let mut index = 0usize;
+            for query_bit in 0..log_len {
+                let (seed_index, seed_bit) =
+                    capsule_query_bit_location(query_index, query_bit, log_len);
+                let bit = ((seeds[seed_index].0 >> seed_bit) & 1) as usize;
+                index |= bit << query_bit;
+            }
+            index
+        })
         .collect()
+}
+
+fn draw_queries(channel: &mut Channel, log_len: usize) -> Vec<usize> {
+    let seeds = channel.get_random_points(capsule_query_seed_count(log_len));
+    capsule_queries_from_seeds(&seeds, log_len)
 }
 
 // ---------------------------------------------------------------------------
@@ -678,7 +768,8 @@ pub fn capsule_verify(
     let mut mid_leaf_hashes = Vec::with_capacity(nq);
     for (qi, &q) in queries.iter().enumerate() {
         let (leaf, rc, _) = capsule_leaf_of_position(nv, q);
-        let syms = &proof.source_symbols[qi * CAPSULE_LEAF_SYMBOLS..(qi + 1) * CAPSULE_LEAF_SYMBOLS];
+        let syms =
+            &proof.source_symbols[qi * CAPSULE_LEAF_SYMBOLS..(qi + 1) * CAPSULE_LEAF_SYMBOLS];
         source_leaves.push(leaf);
         source_leaf_hashes.push(capsule_leaf_hash(nv, leaf, syms));
         let folded = capsule_fold16(syms, rc, nv, &wide_hi);
@@ -689,7 +780,9 @@ pub fn capsule_verify(
         let mid_syms =
             &proof.mid_symbols[qi * CAPSULE_LEAF_SYMBOLS..(qi + 1) * CAPSULE_LEAF_SYMBOLS];
         if mid_syms[mid_k] != folded {
-            return Err(format!("query {qi}: source fold does not hit the mid layer"));
+            return Err(format!(
+                "query {qi}: source fold does not hit the mid layer"
+            ));
         }
         mid_leaves.push(mid_leaf);
         mid_leaf_hashes.push(capsule_leaf_hash(mid_log, mid_leaf, mid_syms));
@@ -734,6 +827,39 @@ pub fn capsule_verify(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packed_query_seed_count_and_bit_mapping() {
+        // Production owner geometry: 64 independent 14-bit indices consume
+        // exactly 896 bits, i.e. seven complete F128 transcript seeds. The
+        // debug geometry retains all 8 * 14 bits in one seed.
+        assert_eq!(packed_query_seed_count(64, 9 + CAPSULE_LOG_RATE), 7);
+        assert_eq!(packed_query_seed_count(8, 9 + CAPSULE_LOG_RATE), 1);
+        assert_eq!(
+            capsule_query_seed_count(9 + CAPSULE_LOG_RATE),
+            if cfg!(debug_assertions) { 1 } else { 7 }
+        );
+
+        // Query 9 straddles seed 0 / seed 1: its low two bits are seed-0
+        // bits 126..127, followed by seed-1 bits 0..11. Query 63 ends at
+        // the very last bit of seed 6.
+        assert_eq!(capsule_query_bit_location(9, 0, 14), (0, 126));
+        assert_eq!(capsule_query_bit_location(9, 1, 14), (0, 127));
+        assert_eq!(capsule_query_bit_location(9, 2, 14), (1, 0));
+        assert_eq!(capsule_query_bit_location(9, 13, 14), (1, 11));
+        assert_eq!(capsule_query_bit_location(63, 13, 14), (6, 127));
+
+        let mut seeds = vec![Block128::ZERO; 7];
+        seeds[0] = Block128::from(u128::MAX);
+        seeds[1] = Block128::from(0b1010_0110_1101u128 | (1u128 << 12) | (1u128 << 25));
+        seeds[6] = Block128::from(0x2A5Bu128 << 114);
+        let queries = packed_queries_from_seeds(&seeds, 64, 14);
+        assert_eq!(queries.len(), 64);
+        assert!(queries[..9].iter().all(|&q| q == 0x3FFF));
+        assert_eq!(queries[9], (0b1010_0110_1101usize << 2) | 0b11);
+        assert_eq!(queries[10], 1 | (1 << 13));
+        assert_eq!(queries[63], 0x2A5B);
+    }
 
     fn rng_column(nv: usize, seed: u64) -> Vec<Block128> {
         let mut s = seed;
@@ -789,7 +915,9 @@ mod tests {
         let column = rng_column(nv, 7);
         let ntt = AdditiveNTT::<Block128>::new(nv + CAPSULE_LOG_RATE);
         let encoded = capsule_encode(&column, &ntt);
-        let betas: Vec<Block128> = (0..CAPSULE_TAU as u64).map(|i| rng_column(0, 100 + i)[0]).collect();
+        let betas: Vec<Block128> = (0..CAPSULE_TAU as u64)
+            .map(|i| rng_column(0, 100 + i)[0])
+            .collect();
 
         // Layer 1: fold the top 4 vars.
         let wide_hi: Vec<Block128> = (0..4).map(|t| betas[CAPSULE_TAU - 1 - t]).collect();
@@ -893,6 +1021,11 @@ mod tests {
         let mut chv = Channel::new();
         let got = capsule_verify(&commitment, &point, &proof, &mut chv).expect("verifies");
         assert_eq!(got, proof.value);
+        assert_eq!(
+            ch.get_random_point(),
+            chv.get_random_point(),
+            "packed-query prover/verifier transcript drift"
+        );
 
         // Determinism: byte-identical proofs on re-prove.
         let (c2, s2) = capsule_commit(&column, nv);

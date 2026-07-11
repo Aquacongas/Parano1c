@@ -75,10 +75,7 @@ unsafe fn mds_full(s: &mut [__m256i; STATE_SIZE], t: &VecTables) {
 /// 4 multiplies and one shared sum instead of a dense row pass.
 #[inline(always)]
 unsafe fn mds_partial(s: &mut [__m256i; STATE_SIZE], t: &VecTables) {
-    let sum = _mm256_xor_si256(
-        _mm256_xor_si256(s[0], s[1]),
-        _mm256_xor_si256(s[2], s[3]),
-    );
+    let sum = _mm256_xor_si256(_mm256_xor_si256(s[0], s[1]), _mm256_xor_si256(s[2], s[3]));
     for i in 0..STATE_SIZE {
         let diag = mul_gcm_x2(s[i], bcast(t.mds_partial_diag[i]));
         s[i] = _mm256_xor_si256(diag, _mm256_xor_si256(sum, s[i]));
@@ -118,9 +115,7 @@ unsafe fn permute_groups<const G: usize>(st: &mut [[__m256i; STATE_SIZE]; G], t:
 
 #[inline(always)]
 unsafe fn load_group(s: &[PackedBlock128; STATE_SIZE]) -> [__m256i; STATE_SIZE] {
-    std::array::from_fn(|i| {
-        _mm256_loadu_si256(&s[i] as *const PackedBlock128 as *const __m256i)
-    })
+    std::array::from_fn(|i| _mm256_loadu_si256(&s[i] as *const PackedBlock128 as *const __m256i))
 }
 
 #[inline(always)]

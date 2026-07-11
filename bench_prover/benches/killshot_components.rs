@@ -8,8 +8,8 @@ use noid_core::Block128;
 use noid_gkr::{
     discharge_block_spine_reductions_native, owner_auth_gkr_channel, prove_block_spine_killshot,
     prove_owner_auth_killshot, reconstruct_slot_states, verify_block_spine_killshot,
-    verify_owner_auth_killshot, BlockSpineMle, OwnerAuthCircuit, SpineCircuit,
-    N_SPINE_SLOTS, N_SPINE_SLOTS_PADDED, N_SPINE_SLOT_VARS,
+    verify_owner_auth_killshot, BlockSpineMle, OwnerAuthCircuit, SpineCircuit, N_SPINE_SLOTS,
+    N_SPINE_SLOTS_PADDED, N_SPINE_SLOT_VARS,
 };
 use noid_poseidon2b::channel::Poseidon2bChannel;
 use noid_poseidon2b::primitives::TxBodyHash;

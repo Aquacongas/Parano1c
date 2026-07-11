@@ -50,7 +50,10 @@ impl Rng {
         z ^ (z >> 31)
     }
     fn f128(&mut self) -> F128 {
-        F128 { lo: self.next_u64(), hi: self.next_u64() }
+        F128 {
+            lo: self.next_u64(),
+            hi: self.next_u64(),
+        }
     }
 }
 
@@ -145,7 +148,16 @@ fn build_duplex_union(k_tx: usize, seed: u64) -> DuplexUnion {
     let fixed = duplex_fixed_patterns(&layout, iv, block_log);
     let refs = refs_for(4, 0, c_refs);
 
-    DuplexUnion { committed, s0, s_out, fixed, refs, c_refs, w_log, challenges }
+    DuplexUnion {
+        committed,
+        s0,
+        s_out,
+        fixed,
+        refs,
+        c_refs,
+        w_log,
+        challenges,
+    }
 }
 
 /// Full native discharge over every tx's channel chain in ONE walk; returns the
@@ -167,14 +179,28 @@ fn run_duplex_union(u: &DuplexUnion) -> usize {
         F128::ZERO,
         &rho,
         &sel_terms,
-        &RelationColumns { committed: &committed, internal: &internal, fixed: &u.fixed },
+        &RelationColumns {
+            committed: &committed,
+            internal: &internal,
+            fixed: &u.fixed,
+        },
         &mut ch_p,
     );
-    let sel_point =
-        verify_column_relation(w_log, F128::ZERO, &rho, &sel_terms, &u.fixed, &sel_proof, &mut ch_v)
-            .expect("native duplex-union selection");
+    let sel_point = verify_column_relation(
+        w_log,
+        F128::ZERO,
+        &rho,
+        &sel_terms,
+        &u.fixed,
+        &sel_proof,
+        &mut ch_v,
+    )
+    .expect("native duplex-union selection");
     let mut gv = [F128::ZERO; STATE_SIZE];
-    for (r, v) in claimed_refs(&sel_terms).iter().zip(sel_proof.final_values.iter()) {
+    for (r, v) in claimed_refs(&sel_terms)
+        .iter()
+        .zip(sel_proof.final_values.iter())
+    {
         match r {
             ColRef::Committed(_) => {}
             ColRef::Internal(j) => gv[*j] = *v,
@@ -183,7 +209,10 @@ fn run_duplex_union(u: &DuplexUnion) -> usize {
     }
 
     // ONE deep-chain walk over the shared s0.
-    let groups = vec![LaneClaimGroup { point: sel_point, values: gv }];
+    let groups = vec![LaneClaimGroup {
+        point: sel_point,
+        values: gv,
+    }];
     let (walk_proof, _) = prove_deep_chain_walk(&u.s0, &groups, &mut ch_p);
     let terminal =
         verify_deep_chain_walk(w_log, &groups, &walk_proof, &mut ch_v).expect("native duplex walk");
@@ -202,7 +231,11 @@ fn run_duplex_union(u: &DuplexUnion) -> usize {
         target,
         &terminal.point,
         &sub_terms,
-        &RelationColumns { committed: &committed, internal: &[], fixed: &u.fixed },
+        &RelationColumns {
+            committed: &committed,
+            internal: &[],
+            fixed: &u.fixed,
+        },
         &mut ch_p,
     );
     let sub_point = verify_column_relation(
@@ -217,7 +250,10 @@ fn run_duplex_union(u: &DuplexUnion) -> usize {
     .expect("native duplex-union substitution");
 
     // Discharge the distance-1 carry shift claims.
-    for (r, v) in claimed_refs(&sub_terms).iter().zip(sub_proof.final_values.iter()) {
+    for (r, v) in claimed_refs(&sub_terms)
+        .iter()
+        .zip(sub_proof.final_values.iter())
+    {
         match r {
             ColRef::Committed(_) => {}
             ColRef::CommittedShift(c) => {
@@ -227,8 +263,15 @@ fn run_duplex_union(u: &DuplexUnion) -> usize {
             _ => unreachable!(),
         }
     }
-    assert_eq!(ch_p.sample_f128(), ch_v.sample_f128(), "native duplex-union lockstep");
-    walk_proof.layers.first().map_or(0, |l| l.round_coeffs.len())
+    assert_eq!(
+        ch_p.sample_f128(),
+        ch_v.sample_f128(),
+        "native duplex-union lockstep"
+    );
+    walk_proof
+        .layers
+        .first()
+        .map_or(0, |l| l.round_coeffs.len())
 }
 
 /// Honest multi-tx channel union verifies; every tx squeezes its own
@@ -239,19 +282,28 @@ fn common_period_multitx_duplex_union_native() {
     let u = build_duplex_union(2, 0xC0FFEE);
     // Distinct data per tx ⇒ distinct squeezed challenges (the per-tx values the
     // downstream algebra reads), all recovered from the same tiled walk.
-    assert_ne!(u.challenges[0], u.challenges[1], "per-tx channels squeeze distinct challenges");
+    assert_ne!(
+        u.challenges[0], u.challenges[1],
+        "per-tx channels squeeze distinct challenges"
+    );
     let _ = run_duplex_union(&u);
 
     // Negative: flip tx 1's first absorbed lane (A0 at its block's slot 0). The
     // single relation set must reject (the absorb term changes the chain).
     let mut bad = build_duplex_union(2, 0xC0FFEE);
-    let per_tx_block = compile_duplex(&channel_ops()).slots.len().next_power_of_two();
+    let per_tx_block = compile_duplex(&channel_ops())
+        .slots
+        .len()
+        .next_power_of_two();
     let slot = per_tx_block; // tx 1, slot 0
     bad.committed[4][slot] += F128::ONE; // A0
-    // The carry column must move too, else selection catches it first; corrupt
-    // the absorbed A lane only and let the substitution catch the wiring break.
+                                         // The carry column must move too, else selection catches it first; corrupt
+                                         // the absorbed A lane only and let the substitution catch the wiring break.
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_duplex_union(&bad)));
-    assert!(caught.is_err(), "corrupted tx-1 absorbed lane accepted by the shared relation set");
+    assert!(
+        caught.is_err(),
+        "corrupted tx-1 absorbed lane accepted by the shared relation set"
+    );
 }
 
 /// The walk cost is FLAT in tx count: doubling K adds only ~1 walk round

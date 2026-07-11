@@ -9,7 +9,9 @@ use noid_ivc_core::field_r1cs::{FieldR1cs, FieldRowCircuit};
 use noid_ivc_core::lincheck::{self, QuirkyPoint};
 use noid_ivc_core::pcs::{self, Commitment, PcsParams, QuirkyDirectClaim};
 use noid_ivc_core::proof::{FieldR1csProof, R1csClaim, ZClaim, bind_statement_field};
-use noid_ivc_core::public_io::{PublicIoSpec, assert_witness_matches_io, bind_public_io};
+use noid_ivc_core::public_io::{
+    PublicIoSpec, assert_witness_matches_io, bind_post_commit_class, bind_public_io,
+};
 use noid_ivc_core::zerocheck;
 
 /// Resident set size in MiB (Linux `/proc/self/status`) for the env-gated
@@ -33,6 +35,99 @@ fn vmrss_mb() -> (u64, u64) {
         .unwrap_or((0, 0))
 }
 
+/// Opaque capability handed only to a causally post-commit prover callback.
+///
+/// It delegates the exact enclosing challenger and owns an internal PCS claim
+/// sink.  The constructor and sink extraction stay private, so callers cannot
+/// manufacture the capability or forget to return the accumulated claims to
+/// the enclosing proof.
+pub struct FieldPostCommitProverContext<'a, Ch> {
+    witness: &'a [F128],
+    commitment: &'a Commitment,
+    total_vars: usize,
+    challenger: &'a mut Ch,
+    claims: Vec<QuirkyDirectClaim>,
+}
+
+impl<'a, Ch> FieldPostCommitProverContext<'a, Ch> {
+    fn new(
+        witness: &'a [F128],
+        commitment: &'a Commitment,
+        total_vars: usize,
+        challenger: &'a mut Ch,
+    ) -> Self {
+        Self {
+            witness,
+            commitment,
+            total_vars,
+            challenger,
+            claims: Vec::new(),
+        }
+    }
+
+    fn finish(self) -> Vec<QuirkyDirectClaim> {
+        self.claims
+    }
+
+    pub fn witness(&self) -> &'a [F128] {
+        self.witness
+    }
+
+    pub fn commitment(&self) -> &'a Commitment {
+        self.commitment
+    }
+
+    pub fn total_vars(&self) -> usize {
+        self.total_vars
+    }
+
+    pub fn append_claim(&mut self, claim: QuirkyDirectClaim) {
+        self.claims.push(claim);
+    }
+
+    pub fn append_claims(&mut self, claims: impl IntoIterator<Item = QuirkyDirectClaim>) {
+        self.claims.extend(claims);
+    }
+
+    pub fn claim_count(&self) -> usize {
+        self.claims.len()
+    }
+}
+
+impl<Ch: Challenger> Challenger for FieldPostCommitProverContext<'_, Ch> {
+    fn observe_label(&mut self, label: &[u8]) {
+        self.challenger.observe_label(label);
+    }
+
+    fn observe_f128(&mut self, value: F128) {
+        self.challenger.observe_f128(value);
+    }
+
+    fn observe_f128_slice(&mut self, values: &[F128]) {
+        self.challenger.observe_f128_slice(values);
+    }
+
+    fn observe_bytes(&mut self, bytes: &[u8]) {
+        self.challenger.observe_bytes(bytes);
+    }
+
+    fn sample_f128(&mut self) -> F128 {
+        self.challenger.sample_f128()
+    }
+
+    fn sample_f128_vec(&mut self, n: usize) -> Vec<F128> {
+        self.challenger.sample_f128_vec(n)
+    }
+
+    fn grind_pow(&mut self, bits: u32) -> u64 {
+        self.challenger.grind_pow(bits)
+    }
+
+    fn verify_pow(&mut self, nonce: u64, bits: u32) -> bool {
+        self.challenger.verify_pow(nonce, bits)
+    }
+}
+
 /// Prove a FieldR1cs instance on a witness of `2^m` F128 elements.
 ///
 /// `pcs_params.m` counts **bits** (the PCS packing convention), so it must be
@@ -48,7 +143,11 @@ pub fn prove_field<Ch: Challenger>(
     pcs_params: &PcsParams,
     challenger: &mut Ch,
 ) -> (FieldR1csProof, Commitment, R1csClaim) {
-    prove_field_inner(r1cs, z, pcs_params, None, challenger)
+    let (proof, (), commitment, claim) =
+        prove_field_inner(r1cs, z, pcs_params, None, challenger, |_, _, _| {
+            ((), Vec::new())
+        });
+    (proof, commitment, claim)
 }
 
 /// [`prove_field`] with a public-IO envelope: right after the statement
@@ -64,16 +163,99 @@ pub fn prove_field_with_public_io<Ch: Challenger>(
     io: &[F128],
     challenger: &mut Ch,
 ) -> (FieldR1csProof, Commitment, R1csClaim) {
-    prove_field_inner(r1cs, z, pcs_params, Some((spec, io)), challenger)
+    let (proof, (), commitment, claim) = prove_field_inner(
+        r1cs,
+        z,
+        pcs_params,
+        Some((spec, io)),
+        challenger,
+        |_, _, _| ((), Vec::new()),
+    );
+    (proof, commitment, claim)
 }
 
-fn prove_field_inner<Ch: Challenger>(
+/// [`prove_field_with_public_io`] plus a post-commit auxiliary protocol.
+///
+/// `post_commit` is invoked only after the witness commitment, statement,
+/// and public-IO envelope have been absorbed.  It may sample challenges,
+/// return an auxiliary proof object, and append evaluation claims on the SAME
+/// committed witness to the final BaseFold batch.  This is the sound entry
+/// point for protocols whose challenge must be causally downstream of the
+/// witness commitment (for example, a column-relation sidecar); building such
+/// a proof while assembling `z` would make its Fiat--Shamir challenges
+/// pre-commit and is not equivalent.
+pub fn prove_field_with_public_io_and_post_commit<Ch, Aux, PostCommit>(
+    r1cs: &FieldR1cs,
+    z: &[F128],
+    pcs_params: &PcsParams,
+    spec: &PublicIoSpec,
+    io: &[F128],
+    challenger: &mut Ch,
+    post_commit: PostCommit,
+) -> (FieldR1csProof, Aux, Commitment, R1csClaim)
+where
+    Ch: Challenger,
+    PostCommit: FnOnce(&[F128], &Commitment, &mut Ch) -> (Aux, Vec<QuirkyDirectClaim>),
+{
+    prove_field_inner(
+        r1cs,
+        z,
+        pcs_params,
+        Some((spec, io)),
+        challenger,
+        post_commit,
+    )
+}
+
+/// Typestate variant of [`prove_field_with_public_io_and_post_commit`].
+///
+/// After commitment/statement/public-IO binding, this API additionally binds
+/// `post_commit_class_digest`, then gives the callback an opaque context that
+/// is both the SAME challenger and an append-only PCS claim sink.  Claims are
+/// appended to the enclosing batch automatically when the callback returns.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_field_with_public_io_and_post_commit_context<Ch, Aux, PostCommit>(
+    r1cs: &FieldR1cs,
+    z: &[F128],
+    pcs_params: &PcsParams,
+    spec: &PublicIoSpec,
+    io: &[F128],
+    post_commit_class_digest: &[u8; 32],
+    challenger: &mut Ch,
+    post_commit: PostCommit,
+) -> (FieldR1csProof, Aux, Commitment, R1csClaim)
+where
+    Ch: Challenger,
+    PostCommit: FnOnce(&mut FieldPostCommitProverContext<'_, Ch>) -> Aux,
+{
+    prove_field_inner(
+        r1cs,
+        z,
+        pcs_params,
+        Some((spec, io)),
+        challenger,
+        |witness, commitment, challenger| {
+            bind_post_commit_class(challenger, post_commit_class_digest);
+            let mut context =
+                FieldPostCommitProverContext::new(witness, commitment, r1cs.m, challenger);
+            let auxiliary = post_commit(&mut context);
+            (auxiliary, context.finish())
+        },
+    )
+}
+
+fn prove_field_inner<Ch, Aux, PostCommit>(
     r1cs: &FieldR1cs,
     z: &[F128],
     pcs_params: &PcsParams,
     public_io: Option<(&PublicIoSpec, &[F128])>,
     challenger: &mut Ch,
-) -> (FieldR1csProof, Commitment, R1csClaim) {
+    post_commit: PostCommit,
+) -> (FieldR1csProof, Aux, Commitment, R1csClaim)
+where
+    Ch: Challenger,
+    PostCommit: FnOnce(&[F128], &Commitment, &mut Ch) -> (Aux, Vec<QuirkyDirectClaim>),
+{
     r1cs.validate_shape();
     assert_eq!(z.len(), 1usize << r1cs.m);
     assert_eq!(
@@ -148,6 +330,10 @@ fn prove_field_inner<Ch: Challenger>(
         }
         None => Vec::new(),
     };
+
+    // The commitment root is already transcript-bound here. Auxiliary proof
+    // messages and every challenge they induce are therefore post-commit.
+    let (auxiliary, auxiliary_claims) = post_commit(z, &commitment, challenger);
 
     // ---- a = A·z, b = B·z over F128; c aliases z (C = I).
     let a = r1cs.apply_a(z);
@@ -227,6 +413,7 @@ fn prove_field_inner<Ch: Challenger>(
         },
     ];
     claims.extend(io_claims);
+    claims.extend(auxiliary_claims);
     let pcs_open = pcs::open_batch_quirky_direct(z, &prover_data, &commitment, &claims, challenger);
     lap("pcs open", &mut t);
 
@@ -235,5 +422,5 @@ fn prove_field_inner<Ch: Challenger>(
         lincheck: lc_proof,
         pcs_open,
     };
-    (proof, commitment, R1csClaim { ab, c })
+    (proof, auxiliary, commitment, R1csClaim { ab, c })
 }

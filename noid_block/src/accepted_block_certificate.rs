@@ -33,8 +33,9 @@ pub use noid_recursive::{
 
 use crate::{
     accepted_block_claim_hash_from_transcript, accepted_block_claim_transcript,
-    accepted_state_transition_claim_digest, AcceptedBlockValidationArtifacts,
-    AcceptedStateTransitionClaim, BlockAuthSidecar, BlockProof, VerifyBlockError,
+    accepted_state_transition_claim_digest, AcceptedBlockClaimTranscript,
+    AcceptedBlockValidationArtifacts, AcceptedStateTransitionClaim, BlockAuthSidecar, BlockProof,
+    VerifyBlockError,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -69,6 +70,25 @@ impl std::fmt::Display for AcceptedBlockCertificateRecordError {
 
 impl std::error::Error for AcceptedBlockCertificateRecordError {}
 
+/// Data derived once from a successful native `AcceptBlock` result and then
+/// split between the local history-claim store and the asynchronous
+/// certificate-record prover.
+///
+/// `history_claim_fields` intentionally remains a `Vec`: the persisted format
+/// predates this bundle and serializes a vector, including its length prefix.
+/// This type is an in-process ownership boundary, not a new wire schema.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptedBlockPostValidationBundle {
+    pub history_claim_fields: Vec<noid_core::Block128>,
+    pub acceptance_receipt: BlockProofAcceptanceReceipt,
+}
+
+struct AcceptedBlockReceiptDerivedValues {
+    transcript: AcceptedBlockClaimTranscript,
+    transition_claim: AcceptedStateTransitionClaim,
+    block_proof_meta_digest: [u8; 32],
+}
+
 pub fn accepted_block_certificate_record(
     acceptance_receipt: BlockProofAcceptanceReceipt,
 ) -> Result<AcceptedBlockCertificateRecord, AcceptedBlockCertificateRecordError> {
@@ -92,7 +112,7 @@ pub fn accepted_block_certificate_record(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn block_proof_acceptance_receipt(
+fn derive_accepted_block_receipt_values(
     block: &Block,
     parent: &BlockHeader,
     prev_timestamps: &[u64],
@@ -101,7 +121,7 @@ pub fn block_proof_acceptance_receipt(
     block_proof_bytes: &[u8],
     block_auth_sidecar_bytes: &[u8],
     artifacts: &AcceptedBlockValidationArtifacts,
-) -> Result<BlockProofAcceptanceReceipt, VerifyBlockError> {
+) -> Result<AcceptedBlockReceiptDerivedValues, VerifyBlockError> {
     let user_tx_count = block
         .transactions
         .iter()
@@ -149,12 +169,29 @@ pub fn block_proof_acceptance_receipt(
         proof.as_ref(),
         &sidecar,
     )?;
-    let accepted_block_claim_digest = accepted_block_claim_hash_from_transcript(&transcript);
     let transition_claim =
         AcceptedStateTransitionClaim::from_accepted_block(block, parent, artifacts)?;
+
+    Ok(AcceptedBlockReceiptDerivedValues {
+        transcript,
+        transition_claim,
+        block_proof_meta_digest,
+    })
+}
+
+fn block_proof_acceptance_receipt_from_derived(
+    block: &Block,
+    parent: &BlockHeader,
+    block_proof_bytes: &[u8],
+    block_auth_sidecar_bytes: &[u8],
+    derived: &AcceptedBlockReceiptDerivedValues,
+) -> BlockProofAcceptanceReceipt {
+    let transcript = &derived.transcript;
+    let transition_claim = &derived.transition_claim;
+    let accepted_block_claim_digest = accepted_block_claim_hash_from_transcript(transcript);
     let block_body = block.to_bytes();
 
-    Ok(BlockProofAcceptanceReceipt {
+    BlockProofAcceptanceReceipt {
         height: block.header.height,
         block_id: hash_block_header(&block.header),
         parent_block_id: hash_block_header(parent),
@@ -169,13 +206,13 @@ pub fn block_proof_acceptance_receipt(
         child_alloc_counter: transition_claim.child_alloc_counter,
         block_body_digest: accepted_block_certificate_block_body_digest(&block_body),
         block_proof_digest: accepted_block_certificate_block_proof_digest(block_proof_bytes),
-        block_proof_meta_digest,
+        block_proof_meta_digest: derived.block_proof_meta_digest,
         auth_sidecar_digest: accepted_block_certificate_auth_sidecar_digest(
             block_auth_sidecar_bytes,
         ),
         accepted_block_claim_digest,
         accepted_state_transition_claim_digest: accepted_state_transition_claim_digest(
-            &transition_claim,
+            transition_claim,
         ),
         exact_transition_digest: transition_claim.exact_transition_digest,
         tx_count: transcript.resources.tx_count,
@@ -188,7 +225,78 @@ pub fn block_proof_acceptance_receipt(
         block_body_len: transcript.resources.block_body_len,
         block_proof_len: transcript.resources.block_proof_len,
         auth_sidecar_len: transcript.resources.auth_sidecar_len,
+    }
+}
+
+/// Build both post-validation records from one transition claim and one
+/// accepted-block transcript.
+///
+/// The supplied artifacts must be the output of the successful `AcceptBlock`
+/// invocation for this exact block. The same fail-closed boundary checks as
+/// [`block_proof_acceptance_receipt`] run before either record is returned.
+#[allow(clippy::too_many_arguments)]
+pub fn accepted_block_post_validation_bundle(
+    block: &Block,
+    parent: &BlockHeader,
+    prev_timestamps: &[u64],
+    prev_active_counts: &[u64],
+    anchor: &AnchorInfo,
+    block_proof_bytes: &[u8],
+    block_auth_sidecar_bytes: &[u8],
+    artifacts: &AcceptedBlockValidationArtifacts,
+) -> Result<AcceptedBlockPostValidationBundle, VerifyBlockError> {
+    let derived = derive_accepted_block_receipt_values(
+        block,
+        parent,
+        prev_timestamps,
+        prev_active_counts,
+        anchor,
+        block_proof_bytes,
+        block_auth_sidecar_bytes,
+        artifacts,
+    )?;
+    let history_claim_fields = derived.transition_claim.fields().to_vec();
+    let acceptance_receipt = block_proof_acceptance_receipt_from_derived(
+        block,
+        parent,
+        block_proof_bytes,
+        block_auth_sidecar_bytes,
+        &derived,
+    );
+    Ok(AcceptedBlockPostValidationBundle {
+        history_claim_fields,
+        acceptance_receipt,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn block_proof_acceptance_receipt(
+    block: &Block,
+    parent: &BlockHeader,
+    prev_timestamps: &[u64],
+    prev_active_counts: &[u64],
+    anchor: &AnchorInfo,
+    block_proof_bytes: &[u8],
+    block_auth_sidecar_bytes: &[u8],
+    artifacts: &AcceptedBlockValidationArtifacts,
+) -> Result<BlockProofAcceptanceReceipt, VerifyBlockError> {
+    let derived = derive_accepted_block_receipt_values(
+        block,
+        parent,
+        prev_timestamps,
+        prev_active_counts,
+        anchor,
+        block_proof_bytes,
+        block_auth_sidecar_bytes,
+        artifacts,
+    )?;
+    Ok(block_proof_acceptance_receipt_from_derived(
+        block,
+        parent,
+        block_proof_bytes,
+        block_auth_sidecar_bytes,
+        &derived,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -246,6 +354,206 @@ pub fn verify_accepted_block_certificate_statement_native(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use noid_chain::{build_exact_action_surface, compute_tx_root, ChainState, SlotValue};
+    use noid_poseidon2b::primitives::Address;
+    use noid_tx::{
+        output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS,
+    };
+
+    struct PostValidationFixture {
+        block: Block,
+        parent: BlockHeader,
+        prev_timestamps: Vec<u64>,
+        prev_active_counts: Vec<u64>,
+        anchor: AnchorInfo,
+        block_proof_bytes: Vec<u8>,
+        auth_sidecar_bytes: Vec<u8>,
+        artifacts: AcceptedBlockValidationArtifacts,
+    }
+
+    fn post_validation_fixture(with_user: bool) -> PostValidationFixture {
+        let user_body = noid_gkr::ghost_tx::ghost_tx_body();
+        let mut state = if with_user {
+            ChainState::from_sparse_utxos(
+                6,
+                &[(
+                    0,
+                    SlotValue::with_owner_fields(1, 0, user_body.input_owner.as_fields()),
+                )],
+                0,
+            )
+            .expect("user pre-state")
+        } else {
+            ChainState::with_log_slots(6)
+        };
+        let miner = Address([0x41; 32]);
+        let parent = BlockHeader {
+            prev_block_hash: [0x10; 32],
+            state_root: state.cached_state_root(),
+            tx_root: [0x11; 32],
+            timestamp: 1_767_225_600,
+            height: 4,
+            miner_address: Address([0x40; 32]),
+            nonce: 7,
+            difficulty_target: [0xff; 32],
+            log_slots: 6,
+            active_slot_count: if with_user { 1 } else { 0 },
+            alloc_counter: 0,
+        };
+        let mut coinbase_outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        coinbase_outputs[0] = TxOutput {
+            slot_index: 2,
+            amount: 50,
+            owner: miner,
+        };
+        let coinbase = Transaction::new(TxBody {
+            epoch_anchor: hash_block_header(&parent),
+            fee: 0,
+            input_owner: Address([0; 32]),
+            inputs: [TxInput::dummy(); TX_INPUTS],
+            outputs: coinbase_outputs,
+            validity_bitmap: output_bitmap_bit(0),
+            is_coinbase: true,
+        });
+        let mut transactions = vec![coinbase];
+        if with_user {
+            transactions.push(Transaction::new(user_body));
+        }
+        let bodies = transactions
+            .iter()
+            .map(|tx| tx.body.clone())
+            .collect::<Vec<_>>();
+        let commitments = bodies
+            .iter()
+            .map(TxBody::claims_commitment)
+            .collect::<Vec<_>>();
+        let surface =
+            build_exact_action_surface(&state.state, &bodies, &commitments, state.alloc_counter)
+                .expect("exact action surface");
+        let slot_updates = surface
+            .touched_indices
+            .iter()
+            .copied()
+            .zip(surface.new_slots.iter().copied())
+            .collect::<Vec<_>>();
+        let child_state_root = state
+            .exact_utxo_root_after_slot_updates(6, &slot_updates)
+            .expect("child state root");
+        let block = Block {
+            header: BlockHeader {
+                prev_block_hash: hash_block_header(&parent),
+                state_root: child_state_root,
+                tx_root: compute_tx_root(&transactions),
+                timestamp: parent.timestamp + 60,
+                height: parent.height + 1,
+                miner_address: miner,
+                nonce: 9,
+                difficulty_target: parent.difficulty_target,
+                log_slots: 6,
+                active_slot_count: parent
+                    .active_slot_count
+                    .checked_sub(u64::from(surface.spends))
+                    .unwrap()
+                    + u64::from(surface.mints),
+                alloc_counter: parent.alloc_counter + u64::from(surface.mints),
+            },
+            transactions,
+        };
+        let exact_state_inputs = crate::ExactStateTransitionInputs {
+            parent_state_root: parent.state_root,
+            parent_log_slots: parent.log_slots,
+            child_state_root,
+            child_log_slots: block.header.log_slots,
+            parent_active_slot_count: parent.active_slot_count,
+            parent_alloc_counter: parent.alloc_counter,
+        };
+        let cache = state.exact_sparse_cache().expect("parent sparse cache");
+        let state_transition =
+            crate::build_exact_state_transition_proof(&cache, &surface).expect("state proof");
+        let verified_transition =
+            crate::verify_exact_state_transition(&exact_state_inputs, &surface, &state_transition)
+                .expect("verified transition");
+        let artifacts = AcceptedBlockValidationArtifacts {
+            authorization: crate::VerifiedAuthorizationBatch {
+                user_tx_count: if with_user { 1 } else { 0 },
+                live_input_count_total: if with_user { 1 } else { 0 },
+            },
+            exact_state_inputs,
+            exact_action_surface: surface,
+            verified_transition,
+            verified_exact_state_roots: None,
+        };
+        let (block_proof_bytes, auth_sidecar_bytes) = if with_user {
+            let proof = BlockProof::minimal(
+                parent.state_root,
+                block.header.state_root,
+                1,
+                state_transition,
+            );
+            let sidecar = BlockAuthSidecar {
+                tx_auth: vec![noid_gkr::ghost_tx::ghost_authorization().0.clone()],
+            };
+            (
+                bincode::serialize(&proof).expect("serialize block proof"),
+                bincode::serialize(&sidecar).expect("serialize auth sidecar"),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        PostValidationFixture {
+            block,
+            parent,
+            prev_timestamps: vec![1_767_225_540, 1_767_225_600],
+            prev_active_counts: vec![parent.active_slot_count],
+            anchor: AnchorInfo {
+                anchor_height: 0,
+                anchor_timestamp: 1_767_225_000,
+                anchor_target: [0xff; 32],
+            },
+            block_proof_bytes,
+            auth_sidecar_bytes,
+            artifacts,
+        }
+    }
+
+    fn assert_post_validation_bundle_parity(fixture: &PostValidationFixture) {
+        let legacy_claim = AcceptedStateTransitionClaim::from_accepted_block(
+            &fixture.block,
+            &fixture.parent,
+            &fixture.artifacts,
+        )
+        .expect("legacy history claim");
+        let legacy_receipt = block_proof_acceptance_receipt(
+            &fixture.block,
+            &fixture.parent,
+            &fixture.prev_timestamps,
+            &fixture.prev_active_counts,
+            &fixture.anchor,
+            &fixture.block_proof_bytes,
+            &fixture.auth_sidecar_bytes,
+            &fixture.artifacts,
+        )
+        .expect("legacy acceptance receipt");
+        let bundle = accepted_block_post_validation_bundle(
+            &fixture.block,
+            &fixture.parent,
+            &fixture.prev_timestamps,
+            &fixture.prev_active_counts,
+            &fixture.anchor,
+            &fixture.block_proof_bytes,
+            &fixture.auth_sidecar_bytes,
+            &fixture.artifacts,
+        )
+        .expect("post-validation bundle");
+
+        assert_eq!(bundle.history_claim_fields, legacy_claim.fields().to_vec());
+        assert_eq!(bundle.acceptance_receipt, legacy_receipt);
+        assert_eq!(
+            bincode::serialize(&bundle.history_claim_fields).unwrap(),
+            bincode::serialize(&legacy_claim.fields().to_vec()).unwrap(),
+            "persisted history-claim vector format must not change",
+        );
+    }
 
     fn acceptance_receipt() -> BlockProofAcceptanceReceipt {
         BlockProofAcceptanceReceipt {
@@ -311,5 +619,69 @@ mod tests {
         let decoded: AcceptedBlockCertificateRecord =
             bincode::deserialize(&encoded).expect("decode record");
         assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn post_validation_bundle_matches_legacy_user_records() {
+        assert_post_validation_bundle_parity(&post_validation_fixture(true));
+    }
+
+    #[test]
+    fn post_validation_bundle_matches_legacy_coinbase_records() {
+        assert_post_validation_bundle_parity(&post_validation_fixture(false));
+    }
+
+    #[test]
+    fn post_validation_bundle_preserves_boundary_mismatch_rejections() {
+        let fixture = post_validation_fixture(true);
+
+        let mut wrong_block = fixture.block.clone();
+        wrong_block.header.tx_root[0] ^= 1;
+        assert!(matches!(
+            accepted_block_post_validation_bundle(
+                &wrong_block,
+                &fixture.parent,
+                &fixture.prev_timestamps,
+                &fixture.prev_active_counts,
+                &fixture.anchor,
+                &fixture.block_proof_bytes,
+                &fixture.auth_sidecar_bytes,
+                &fixture.artifacts,
+            ),
+            Err(VerifyBlockError::HistoryClaimMismatch)
+        ));
+
+        let mut wrong_artifacts = fixture.artifacts.clone();
+        wrong_artifacts.exact_state_inputs.parent_alloc_counter ^= 1;
+        assert!(matches!(
+            accepted_block_post_validation_bundle(
+                &fixture.block,
+                &fixture.parent,
+                &fixture.prev_timestamps,
+                &fixture.prev_active_counts,
+                &fixture.anchor,
+                &fixture.block_proof_bytes,
+                &fixture.auth_sidecar_bytes,
+                &wrong_artifacts,
+            ),
+            Err(VerifyBlockError::HistoryClaimMismatch)
+        ));
+
+        let mut wrong_parent = fixture.parent;
+        wrong_parent.state_root[0] ^= 1;
+        assert!(matches!(
+            accepted_block_post_validation_bundle(
+                &fixture.block,
+                &wrong_parent,
+                &fixture.prev_timestamps,
+                &fixture.prev_active_counts,
+                &fixture.anchor,
+                &fixture.block_proof_bytes,
+                &fixture.auth_sidecar_bytes,
+                &fixture.artifacts,
+            ),
+            Err(VerifyBlockError::PrevStateRootMismatch)
+                | Err(VerifyBlockError::HistoryClaimMismatch)
+        ));
     }
 }

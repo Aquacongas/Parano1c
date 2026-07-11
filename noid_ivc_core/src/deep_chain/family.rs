@@ -17,8 +17,8 @@ use crate::deep_chain::relations::{
     ShiftDischargeProof,
 };
 use crate::deep_chain::{
-    apply_round, initial_mds, prove_deep_chain_walk, verify_deep_chain_walk,
-    DeepChainWalkProof, LaneClaimGroup,
+    apply_round, initial_mds, prove_deep_chain_walk, verify_deep_chain_walk, DeepChainWalkProof,
+    LaneClaimGroup,
 };
 use crate::field::F128;
 use crate::lincheck::build_eq_table;
@@ -477,8 +477,16 @@ pub fn run_family<Ch: Challenger>(
         pt
     } else {
         let pr = proofs.substitution.as_ref().ok_or("missing substitution")?;
-        verify_column_relation(W_LOG, target, &terminal.point, &sub_terms, &[], pr, transcript)
-            .map_err(|e| format!("substitution: {e}"))?
+        verify_column_relation(
+            W_LOG,
+            target,
+            &terminal.point,
+            &sub_terms,
+            &[],
+            pr,
+            transcript,
+        )
+        .map_err(|e| format!("substitution: {e}"))?
     };
     let sub_proof = proofs.substitution.as_ref().unwrap();
     let refs = distinct_refs(&sub_terms);
@@ -507,7 +515,8 @@ pub fn run_family<Ch: Challenger>(
     // ---- Shift discharge for the carried column claim.
     let shift_target = shift_target.expect("wiring references the carry shift");
     let shift_point = if prove {
-        let (pr, pt) = prove_shift_discharge(&fam.committed[C], &sub_point, shift_target, transcript);
+        let (pr, pt) =
+            prove_shift_discharge(&fam.committed[C], &sub_point, shift_target, transcript);
         proofs.shift = Some(pr);
         pt
     } else {
@@ -549,4 +558,3 @@ pub fn discharge(fam: &Family, pending: &[PendingClaim]) -> Result<(), String> {
     }
     Ok(())
 }
-

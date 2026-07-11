@@ -69,15 +69,15 @@ impl std::fmt::Display for AcceptedBlockReceiptProjectionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnsupportedRelation { actual } => {
-                            write!(f, "unsupported receipt-projection relation {actual}")
-                        }
-                        Self::BadReceiptProjection(source) => {
-                            write!(f, "bad certificate receipt projection: {source}")
-                        }
-                        Self::CircuitTooSmall => write!(f, "receipt-projection circuit is too small"),
-                        Self::CoreUnsatisfied => write!(f, "receipt-projection core is unsatisfied"),
-                        Self::EmptyCoreProof => write!(f, "empty receipt-projection core proof"),
-                        Self::DecodeCoreProof => write!(f, "could not decode receipt-projection proof"),
+                write!(f, "unsupported receipt-projection relation {actual}")
+            }
+            Self::BadReceiptProjection(source) => {
+                write!(f, "bad certificate receipt projection: {source}")
+            }
+            Self::CircuitTooSmall => write!(f, "receipt-projection circuit is too small"),
+            Self::CoreUnsatisfied => write!(f, "receipt-projection core is unsatisfied"),
+            Self::EmptyCoreProof => write!(f, "empty receipt-projection core proof"),
+            Self::DecodeCoreProof => write!(f, "could not decode receipt-projection proof"),
             Self::BadCoreParameters {
                 actual_m,
                 actual_log_inv_rate,
@@ -85,8 +85,8 @@ impl std::fmt::Display for AcceptedBlockReceiptProjectionError {
             } => write!(
                 f,
                 "bad receipt-projection PCS parameters: m={actual_m}, log_inv_rate={actual_log_inv_rate}, log_batch_size={actual_log_batch_size}"
-                            ),
-                            Self::CoreVerify => write!(f, "receipt-projection core proof rejected"),
+            ),
+            Self::CoreVerify => write!(f, "receipt-projection core proof rejected"),
         }
     }
 }

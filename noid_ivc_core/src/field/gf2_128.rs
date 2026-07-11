@@ -658,10 +658,8 @@ pub mod x86_64_clmul {
 
             F256Unreduced {
                 r0: _mm_extract_epi64::<0>(p_ll) as u64,
-                r1: (_mm_extract_epi64::<1>(p_ll) as u64)
-                    ^ (_mm_extract_epi64::<0>(cross) as u64),
-                r2: (_mm_extract_epi64::<0>(p_hh) as u64)
-                    ^ (_mm_extract_epi64::<1>(cross) as u64),
+                r1: (_mm_extract_epi64::<1>(p_ll) as u64) ^ (_mm_extract_epi64::<0>(cross) as u64),
+                r2: (_mm_extract_epi64::<0>(p_hh) as u64) ^ (_mm_extract_epi64::<1>(cross) as u64),
                 r3: _mm_extract_epi64::<1>(p_hh) as u64,
             }
         }

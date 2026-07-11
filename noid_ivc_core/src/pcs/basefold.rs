@@ -276,9 +276,17 @@ pub enum VerifyError {
     /// The pre-query transcript-grinding nonce fails its
     /// [`QUERY_GRIND_BITS`] leading-zero check.
     GrindingFailed,
-    InitialMerkleFailed { query_index: usize },
-    RoundMerkleFailed { query_index: usize, epoch: usize },
-    FoldMismatch { query_index: usize, epoch: usize },
+    InitialMerkleFailed {
+        query_index: usize,
+    },
+    RoundMerkleFailed {
+        query_index: usize,
+        epoch: usize,
+    },
+    FoldMismatch {
+        query_index: usize,
+        epoch: usize,
+    },
     InvalidProofShape,
 }
 

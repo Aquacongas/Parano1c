@@ -52,12 +52,12 @@ use crate::checkpoint_ivc_backend::{
 };
 use crate::pow_header::RecursiveConsensusState;
 
-pub const HISTORY_CHECKPOINT_ENGINE_STREAMING_TOWER_IVC: u32 = 1;
+pub const HISTORY_CHECKPOINT_ENGINE_STREAMING_TOWER_IVC: u32 = 2;
 pub const HISTORY_CHECKPOINT_BATCH_TARGET_BLOCKS: u32 = 16;
 pub const HISTORY_CHECKPOINT_RETAINED_WINDOW_BLOCKS: u32 = 18;
 pub const HISTORY_CHECKPOINT_STEP_STATEMENT_HASH_FIELDS: usize = 10;
 
-const HCP_ANC1: u128 = 0x4843_505F_414E_4331; // "HCP_ANC1"
+const HCP_ANC2: u128 = 0x4843_505F_414E_4332; // "HCP_ANC2"
 const HCP_ACC1: u128 = 0x4843_505F_4143_4331; // "HCP_ACC1"
 const HCP_CON1: u128 = 0x4843_505F_434F_4E31; // "HCP_CON1"
 const HCP_BND1: u128 = 0x4843_505F_424E_4431; // "HCP_BND1"
@@ -397,7 +397,10 @@ impl std::fmt::Display for HistoryCheckpointStepProofError {
                 write!(f, "bad checkpoint step statement digest proof")
             }
             Self::BadStepStatementDigestDischarge => {
-                write!(f, "checkpoint step statement digest proof failed native discharge")
+                write!(
+                    f,
+                    "checkpoint step statement digest proof failed native discharge"
+                )
             }
             Self::BadCertificateBatchStatement(source) => {
                 write!(f, "bad checkpoint certificate batch statement: {source}")
@@ -412,7 +415,10 @@ impl std::fmt::Display for HistoryCheckpointStepProofError {
                 )
             }
             Self::BadCertificateReceiptProjectionHandle(source) => {
-                write!(f, "bad checkpoint certificate receipt projection handle: {source}")
+                write!(
+                    f,
+                    "bad checkpoint certificate receipt projection handle: {source}"
+                )
             }
             Self::CertificateStatementLengthMismatch {
                 certificates,
@@ -473,7 +479,10 @@ impl std::fmt::Display for HistoryCheckpointStepProofError {
                 write!(f, "missing checkpoint IVC chunk core proof")
             }
             Self::BadAcceptedClaimBatchDigestProof(source) => {
-                write!(f, "bad checkpoint accepted-claim batch digest proof: {source}")
+                write!(
+                    f,
+                    "bad checkpoint accepted-claim batch digest proof: {source}"
+                )
             }
             Self::BadCheckpointIvcChunkCore(source) => {
                 write!(f, "bad checkpoint IVC chunk-core proof: {source}")
@@ -1435,7 +1444,7 @@ fn validate_checkpoint_step_accepted_claim_batch_binding(
 }
 
 pub fn history_checkpoint_anchor_digest(anchor: &HeaderChainAnchor) -> Digest {
-    let mut sponge = checkpoint_sponge(HCP_ANC1);
+    let mut sponge = checkpoint_sponge(HCP_ANC2);
     absorb_anchor(&mut sponge, anchor);
     sponge.finalize()
 }
@@ -1822,7 +1831,6 @@ fn absorb_anchor(sponge: &mut Poseidon2bSponge, anchor: &HeaderChainAnchor) {
     sponge.absorb(Block128::from(anchor.active_slot_count as u128));
     sponge.absorb(Block128::from(anchor.alloc_counter as u128));
     absorb_digest(sponge, &anchor.cumulative_chainwork);
-    absorb_digest(sponge, &anchor.projection_root);
 }
 
 fn absorb_accumulator(sponge: &mut Poseidon2bSponge, accumulator: &ChainAccumulator) {
@@ -2130,7 +2138,6 @@ mod tests {
             log_slots: consensus.log_slots,
             active_slot_count: consensus.active_slot_count,
             alloc_counter: consensus.alloc_counter,
-            projection_root: [0x71; 32],
             cumulative_chainwork: consensus.cumulative_chainwork,
         };
         let summary = HistoryCheckpointBatchSummary {

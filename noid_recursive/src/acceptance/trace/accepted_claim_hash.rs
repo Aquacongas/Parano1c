@@ -139,12 +139,7 @@ fn claim_chain_claims_trace(
     for (idx, input) in inputs.iter().enumerate() {
         let base = idx * ACCEPTED_CLAIM_BLOCKS;
         let blocks: Vec<[LinExpr; 2]> = (0..ACCEPTED_CLAIM_BLOCKS)
-            .map(|i| {
-                [
-                    input.fields[2 * i].clone(),
-                    input.fields[2 * i + 1].clone(),
-                ]
-            })
+            .map(|i| [input.fields[2 * i].clone(), input.fields[2 * i + 1].clone()])
             .collect();
         claims.extend(sponge_chain_claims_trace(
             &blocks,
@@ -174,8 +169,7 @@ pub fn verify_accepted_claim_hash_killshot_trace(
 
     let main_red =
         verify_block_spine_unified_trace(b, ch, &proof.main, proof.num_vars, proof.live_slots);
-    let shift_red =
-        verify_block_spine_shift_trace(b, ch, &proof.shift, &main_red, proof.num_vars);
+    let shift_red = verify_block_spine_shift_trace(b, ch, &proof.shift, &main_red, proof.num_vars);
 
     let chain_claims = claim_chain_claims_trace(inputs, proof.num_vars);
     let chain_red = verify_linear_eval_prebound_trace(
@@ -334,9 +328,7 @@ mod tests {
         }
     }
 
-    fn prove_fixture(
-        inputs: &[AcceptedClaimHashInputs],
-    ) -> AcceptedClaimHashProofKillShot {
+    fn prove_fixture(inputs: &[AcceptedClaimHashInputs]) -> AcceptedClaimHashProofKillShot {
         let mut ch_p = Poseidon2bChannel::new();
         let (proof, _) = prove_accepted_claim_hash_killshot(inputs, &mut ch_p);
         proof
@@ -346,7 +338,11 @@ mod tests {
     fn build_slot(
         proof: &AcceptedClaimHashProofKillShot,
         inputs: &[AcceptedClaimHashInputs],
-    ) -> (noid_ivc_core::field_r1cs::FieldR1cs, Vec<noid_ivc_core::field::F128>, bool) {
+    ) -> (
+        noid_ivc_core::field_r1cs::FieldR1cs,
+        Vec<noid_ivc_core::field::F128>,
+        bool,
+    ) {
         let mut b = FieldR1csBuilder::new();
         let mut ch = RawChannelTrace::new();
         let _ = build_accepted_claim_hash_slot(&mut b, &mut ch, proof, inputs);
@@ -376,12 +372,20 @@ mod tests {
         for (e, v) in red_t.state.point.iter().zip(red_native.state.point.iter()) {
             assert_expr_is(&b, e, *v, "terminal point");
         }
-        assert_expr_is(&b, &red_t.state.value, red_native.state.value, "state value");
+        assert_expr_is(
+            &b,
+            &red_t.state.value,
+            red_native.state.value,
+            "state value",
+        );
         assert_expr_is(&b, &red_t.sin.value, red_native.sin.value, "sin value");
         assert_expr_is(&b, &red_t.sout.value, red_native.sout.value, "sout value");
 
         let (r1cs, z) = b.build();
-        assert!(r1cs.satisfies(&z), "honest accepted_claim_hash trace unsatisfiable");
+        assert!(
+            r1cs.satisfies(&z),
+            "honest accepted_claim_hash trace unsatisfiable"
+        );
         eprintln!(
             "accepted_claim_hash slot: {} useful rows (k_log = {})",
             r1cs.useful_rows, r1cs.k_log
@@ -524,10 +528,9 @@ mod tests {
                 bad[0].expected_claim[target - ACCEPTED_CLAIM_FIELDS] += Block128::ONE;
             }
             let mut ch_n = Poseidon2bChannel::new();
-            let native_accepts =
-                verify_accepted_claim_hash_killshot(&proof, &bad, &mut ch_n)
-                    .map(|red| discharge_accepted_claim_hash_reductions_native(&bad, &red))
-                    .unwrap_or(false);
+            let native_accepts = verify_accepted_claim_hash_killshot(&proof, &bad, &mut ch_n)
+                .map(|red| discharge_accepted_claim_hash_reductions_native(&bad, &red))
+                .unwrap_or(false);
             assert!(!native_accepts, "native accepted statement mutant {target}");
             let (_, _, sat) = build_slot(&proof, &bad);
             if sat {
@@ -566,7 +569,10 @@ mod tests {
             let (proof_c, inputs_c) = if case % 2 == 0 {
                 (proof.clone(), inputs.clone())
             } else if next(2) == 0 {
-                (mutate_proof_field(&proof, next(n_fields as u128) as usize), inputs.clone())
+                (
+                    mutate_proof_field(&proof, next(n_fields as u128) as usize),
+                    inputs.clone(),
+                )
             } else {
                 let mut bad = inputs.clone();
                 let t = next((ACCEPTED_CLAIM_FIELDS + ACCEPTED_CLAIM_PIN_LANES) as u128) as usize;
@@ -581,13 +587,12 @@ mod tests {
             let mut ch_n = Poseidon2bChannel::new();
             let native_accepts =
                 verify_accepted_claim_hash_killshot(&proof_c, &inputs_c, &mut ch_n)
-                    .map(|red| {
-                        discharge_accepted_claim_hash_reductions_native(&inputs_c, &red)
-                    })
+                    .map(|red| discharge_accepted_claim_hash_reductions_native(&inputs_c, &red))
                     .unwrap_or(false);
             let (_, _, trace_accepts) = build_slot(&proof_c, &inputs_c);
             assert_eq!(
-                native_accepts, trace_accepts,
+                native_accepts,
+                trace_accepts,
                 "native/trace divergence on case {case} (honest = {})",
                 case % 2 == 0
             );

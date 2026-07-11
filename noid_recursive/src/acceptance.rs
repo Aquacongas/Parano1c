@@ -22,10 +22,10 @@
 //! This module currently provides the strategy-independent boundary:
 //!   * the [`AcceptanceProof`] envelope (v1; becomes the recursive-proof
 //!     envelope),
-//!   * the native reference relation [`verify_acceptance_against_projection`],
+//!   * the native reference relation [`verify_acceptance_against_header`],
 //!     which binds a [`BlockProofAcceptanceReceipt`] to the locally validated
-//!     [`HeaderProjectionSlot`] — pure equality, never re-proving PoW/ASERT/MTP
-//!     (this is the [B] slot of the trace), and
+//!     canonical header directly — equality plus local block-id recomputation,
+//!     never re-proving PoW/ASERT/MTP (this is the [B] slot of the trace), and
 //!   * [`shape`] — measured verifier statistics that size the trace.
 
 pub mod block_class;
@@ -46,15 +46,78 @@ pub(crate) fn row_ledger_mark(
 ) {
     if std::env::var_os("NOID_ROW_LEDGER").is_some() {
         let now = b.num_wires();
-        eprintln!("[ledger] {label:<32} +{:>9}  (total {:>9})", now - *last, now);
+        eprintln!(
+            "[ledger] {label:<32} +{:>9}  (total {:>9})",
+            now - *last,
+            now
+        );
         *last = now;
     }
 }
 
+/// Expand a naturally dyadic one-block Field trace to its frozen protocol
+/// shape without allocating identity constraints in the zero tail.
+pub(crate) fn expand_empty_field_tail(
+    mut r1cs: noid_ivc_core::field_r1cs::FieldR1cs,
+    mut witness: Vec<noid_ivc_core::field::F128>,
+    shape: noid_ivc_core::proof::FieldShape,
+) -> (
+    noid_ivc_core::field_r1cs::FieldR1cs,
+    Vec<noid_ivc_core::field::F128>,
+) {
+    use noid_ivc_core::field::F128;
+
+    assert_eq!(r1cs.m, r1cs.k_log, "builder emits one base block");
+    assert_eq!(shape.m, shape.k_log, "class must use one base block");
+    assert_eq!(r1cs.k_skip, shape.k_skip, "class k_skip drift");
+    assert_eq!(r1cs.const_pin, shape.const_pin, "class const pin drift");
+    assert!(r1cs.m <= shape.m, "cannot shrink a built Field class");
+    assert!(
+        r1cs.digest_cache.get().is_none() && r1cs.csc_cache.get().is_none(),
+        "padding must precede matrix digest/CSC caching"
+    );
+    let natural_rows = 1usize << r1cs.k_log;
+    let target_rows = 1usize << shape.k_log;
+    assert_eq!(witness.len(), natural_rows, "natural witness size");
+    assert!(
+        witness[r1cs.useful_rows..]
+            .iter()
+            .all(|value| *value == F128::ZERO),
+        "natural builder padding witness must be zero"
+    );
+    for matrix in [&r1cs.a_0, &r1cs.b_0] {
+        assert!(
+            matrix.row_offsets[r1cs.useful_rows..]
+                .windows(2)
+                .all(|pair| pair[0] == pair[1]),
+            "natural builder padding rows must be empty"
+        );
+    }
+    let expand = |matrix: &mut noid_ivc_core::field_r1cs::SparseFieldMatrix| {
+        let terminal = *matrix.row_offsets.last().expect("CSR terminal offset");
+        matrix.row_offsets.resize(target_rows + 1, terminal);
+        matrix.num_rows = target_rows;
+        matrix.num_cols = target_rows;
+    };
+    expand(&mut r1cs.a_0);
+    expand(&mut r1cs.b_0);
+    witness.resize(target_rows, F128::ZERO);
+    r1cs.m = shape.m;
+    r1cs.k_log = shape.k_log;
+    r1cs.validate_shape();
+    assert!(
+        witness[r1cs.useful_rows..]
+            .iter()
+            .all(|value| *value == F128::ZERO),
+        "expanded Field padding witness must be zero"
+    );
+    (r1cs, witness)
+}
+
+use noid_chain::block_header::{hash_block_header, BlockHeader};
 use noid_poseidon2b::primitives::Digest;
 
 use crate::block_certificate::BlockProofAcceptanceReceipt;
-use crate::header_projection::HeaderProjectionSlot;
 
 /// The tier-1 acceptance proof envelope.
 ///
@@ -71,7 +134,7 @@ pub struct AcceptanceProof {
     /// slice.
     pub deferred_fri_commit: Digest,
     /// In-circuit algebraic proof (sumcheck/GKR/composition + Poseidon perms +
-    /// receipt<->projection binding). Empty until the in-circuit slices land.
+    /// receipt<->local-header binding). Empty until the in-circuit slices land.
     pub r1cs_proof: Vec<u8>,
 }
 
@@ -82,10 +145,10 @@ impl AcceptanceProof {
     }
 }
 
-/// Rejection reasons for the receipt<->projection binding.
+/// Rejection reasons for the receipt<->local-header binding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AcceptanceRelationError {
-    Height { receipt: u64, projection: u64 },
+    Height { receipt: u64, header: u64 },
     BlockId,
     ParentBlockId,
     ChildStateRoot,
@@ -98,31 +161,28 @@ pub enum AcceptanceRelationError {
 impl std::fmt::Display for AcceptanceRelationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Height {
-                receipt,
-                projection,
-            } => write!(
+            Self::Height { receipt, header } => write!(
                 f,
-                "acceptance height mismatch: receipt h={receipt}, projection h={projection}"
+                "acceptance height mismatch: receipt h={receipt}, local header h={header}"
             ),
-            Self::BlockId => write!(f, "acceptance block id does not match header projection"),
+            Self::BlockId => write!(f, "acceptance block id does not match local header"),
             Self::ParentBlockId => {
-                write!(f, "acceptance parent block id does not match header projection")
+                write!(f, "acceptance parent block id does not match local header")
             }
             Self::ChildStateRoot => {
-                write!(f, "acceptance child state root does not match header projection")
+                write!(f, "acceptance child state root does not match local header")
             }
-            Self::TxRoot => write!(f, "acceptance tx root does not match header projection"),
+            Self::TxRoot => write!(f, "acceptance tx root does not match local header"),
             Self::ChildLogSlots => {
-                write!(f, "acceptance child log_slots does not match header projection")
+                write!(f, "acceptance child log_slots does not match local header")
             }
             Self::ChildActiveSlotCount => write!(
                 f,
-                "acceptance child active_slot_count does not match header projection"
+                "acceptance child active_slot_count does not match local header"
             ),
             Self::ChildAllocCounter => write!(
                 f,
-                "acceptance child alloc_counter does not match header projection"
+                "acceptance child alloc_counter does not match local header"
             ),
         }
     }
@@ -130,43 +190,42 @@ impl std::fmt::Display for AcceptanceRelationError {
 
 impl std::error::Error for AcceptanceRelationError {}
 
-/// Native reference relation for the tier-1 receipt<->header binding.
+/// Native reference relation for the tier-1 receipt<->local-header binding.
 ///
 /// It asserts that the child side of a production-acceptance receipt equals the
-/// locally validated header projection at that height. This is exactly the set
-/// of equalities the in-circuit acceptance proof must enforce as constraints —
-/// and nothing more: it must never re-prove PoW, ASERT, MTP, timestamp windows,
-/// or cumulative-work arithmetic. Those are header-layer responsibilities; here
-/// the projection is a projection of a header the node already validated.
-pub fn verify_acceptance_against_projection(
+/// locally validated header at that height. The block id is recomputed from the
+/// header, so it also commits to every header consensus field and the ancestry
+/// link. PoW, ASERT, MTP, timestamp windows, cumulative work, and fork choice
+/// remain native header-layer responsibilities.
+pub fn verify_acceptance_against_header(
     receipt: &BlockProofAcceptanceReceipt,
-    projection: &HeaderProjectionSlot,
+    header: &BlockHeader,
 ) -> Result<(), AcceptanceRelationError> {
-    if receipt.height != projection.height {
+    if receipt.height != header.height {
         return Err(AcceptanceRelationError::Height {
             receipt: receipt.height,
-            projection: projection.height,
+            header: header.height,
         });
     }
-    if receipt.block_id != projection.block_id {
+    if receipt.block_id != hash_block_header(header) {
         return Err(AcceptanceRelationError::BlockId);
     }
-    if receipt.parent_block_id != projection.parent_block_id {
+    if receipt.parent_block_id != header.prev_block_hash {
         return Err(AcceptanceRelationError::ParentBlockId);
     }
-    if receipt.child_state_root != projection.state_root {
+    if receipt.child_state_root != header.state_root {
         return Err(AcceptanceRelationError::ChildStateRoot);
     }
-    if receipt.tx_root != projection.tx_root {
+    if receipt.tx_root != header.tx_root {
         return Err(AcceptanceRelationError::TxRoot);
     }
-    if receipt.child_log_slots != projection.log_slots {
+    if receipt.child_log_slots != header.log_slots {
         return Err(AcceptanceRelationError::ChildLogSlots);
     }
-    if receipt.child_active_slot_count != projection.active_slot_count {
+    if receipt.child_active_slot_count != header.active_slot_count {
         return Err(AcceptanceRelationError::ChildActiveSlotCount);
     }
-    if receipt.child_alloc_counter != projection.alloc_counter {
+    if receipt.child_alloc_counter != header.alloc_counter {
         return Err(AcceptanceRelationError::ChildAllocCounter);
     }
     Ok(())
@@ -177,20 +236,37 @@ mod tests {
     use super::*;
     use noid_poseidon2b::primitives::Address;
 
-    fn receipt() -> BlockProofAcceptanceReceipt {
-        BlockProofAcceptanceReceipt {
-            height: 7,
-            block_id: [1u8; 32],
-            parent_block_id: [2u8; 32],
-            parent_state_root: [3u8; 32],
-            child_state_root: [4u8; 32],
+    fn local_header() -> BlockHeader {
+        BlockHeader {
+            prev_block_hash: [2u8; 32],
+            state_root: [4u8; 32],
             tx_root: [5u8; 32],
+            timestamp: 1_767_225_600,
+            height: 7,
+            miner_address: Address([0x44; 32]),
+            nonce: 7,
+            difficulty_target: [0x7f; 32],
+            log_slots: 24,
+            active_slot_count: 42,
+            alloc_counter: 100,
+        }
+    }
+
+    fn receipt() -> BlockProofAcceptanceReceipt {
+        let header = local_header();
+        BlockProofAcceptanceReceipt {
+            height: header.height,
+            block_id: hash_block_header(&header),
+            parent_block_id: header.prev_block_hash,
+            parent_state_root: [3u8; 32],
+            child_state_root: header.state_root,
+            tx_root: header.tx_root,
             parent_log_slots: 24,
-            child_log_slots: 24,
+            child_log_slots: header.log_slots,
             parent_active_slot_count: 40,
-            child_active_slot_count: 42,
+            child_active_slot_count: header.active_slot_count,
             parent_alloc_counter: 99,
-            child_alloc_counter: 100,
+            child_alloc_counter: header.alloc_counter,
             block_body_digest: [6u8; 32],
             block_proof_digest: [7u8; 32],
             block_proof_meta_digest: [12u8; 32],
@@ -211,101 +287,113 @@ mod tests {
         }
     }
 
-    fn projection_from(receipt: &BlockProofAcceptanceReceipt) -> HeaderProjectionSlot {
-        HeaderProjectionSlot {
-            height: receipt.height,
-            block_id: receipt.block_id,
-            parent_block_id: receipt.parent_block_id,
-            state_root: receipt.child_state_root,
-            tx_root: receipt.tx_root,
-            timestamp: 1_767_225_600,
-            miner_address: Address([0x44; 32]),
-            nonce: receipt.height as u128,
-            difficulty_target: [0x7f; 32],
-            log_slots: receipt.child_log_slots,
-            active_slot_count: receipt.child_active_slot_count,
-            alloc_counter: receipt.child_alloc_counter,
+    #[test]
+    fn matching_receipt_and_local_header_bind() {
+        let r = receipt();
+        verify_acceptance_against_header(&r, &local_header()).expect("binding holds");
+    }
+
+    #[test]
+    fn block_id_binding_commits_every_header_consensus_field() {
+        let r = receipt();
+        for mutated in [
+            {
+                let mut h = local_header();
+                h.timestamp ^= 0xFFFF;
+                h
+            },
+            {
+                let mut h = local_header();
+                h.nonce = h.nonce.wrapping_add(1);
+                h
+            },
+            {
+                let mut h = local_header();
+                h.difficulty_target = [0x00; 32];
+                h
+            },
+            {
+                let mut h = local_header();
+                h.miner_address = Address([0x99; 32]);
+                h
+            },
+        ] {
+            assert_eq!(
+                verify_acceptance_against_header(&r, &mutated),
+                Err(AcceptanceRelationError::BlockId)
+            );
         }
-    }
-
-    #[test]
-    fn matching_receipt_and_projection_bind() {
-        let r = receipt();
-        let p = projection_from(&r);
-        verify_acceptance_against_projection(&r, &p).expect("binding holds");
-    }
-
-    #[test]
-    fn binding_is_independent_of_header_consensus_fields() {
-        // timestamp / miner_address / nonce / difficulty_target are header
-        // consensus fields; tier-1 must not depend on them.
-        let r = receipt();
-        let mut p = projection_from(&r);
-        p.timestamp ^= 0xFFFF;
-        p.nonce = p.nonce.wrapping_add(1);
-        p.difficulty_target = [0x00; 32];
-        p.miner_address = Address([0x99; 32]);
-        verify_acceptance_against_projection(&r, &p)
-            .expect("binding ignores header consensus fields");
     }
 
     #[test]
     fn each_bound_field_mismatch_is_rejected() {
         let r = receipt();
 
-        let mut p = projection_from(&r);
+        let mut p = local_header();
         p.height += 1;
         assert!(matches!(
-            verify_acceptance_against_projection(&r, &p),
+            verify_acceptance_against_header(&r, &p),
             Err(AcceptanceRelationError::Height { .. })
         ));
 
-        let mut p = projection_from(&r);
-        p.block_id = [0xAA; 32];
+        let mut bad_id = r.clone();
+        bad_id.block_id = [0xAA; 32];
         assert_eq!(
-            verify_acceptance_against_projection(&r, &p),
+            verify_acceptance_against_header(&bad_id, &local_header()),
             Err(AcceptanceRelationError::BlockId)
         );
 
-        let mut p = projection_from(&r);
-        p.parent_block_id = [0xAA; 32];
+        let mut p = local_header();
+        p.prev_block_hash = [0xAA; 32];
+        let mut matching_id = r.clone();
+        matching_id.block_id = hash_block_header(&p);
         assert_eq!(
-            verify_acceptance_against_projection(&r, &p),
+            verify_acceptance_against_header(&matching_id, &p),
             Err(AcceptanceRelationError::ParentBlockId)
         );
 
-        let mut p = projection_from(&r);
+        let mut p = local_header();
         p.state_root = [0xAA; 32];
+        let mut matching_id = r.clone();
+        matching_id.block_id = hash_block_header(&p);
         assert_eq!(
-            verify_acceptance_against_projection(&r, &p),
+            verify_acceptance_against_header(&matching_id, &p),
             Err(AcceptanceRelationError::ChildStateRoot)
         );
 
-        let mut p = projection_from(&r);
+        let mut p = local_header();
         p.tx_root = [0xAA; 32];
+        let mut matching_id = r.clone();
+        matching_id.block_id = hash_block_header(&p);
         assert_eq!(
-            verify_acceptance_against_projection(&r, &p),
+            verify_acceptance_against_header(&matching_id, &p),
             Err(AcceptanceRelationError::TxRoot)
         );
 
-        let mut p = projection_from(&r);
+        let mut p = local_header();
         p.log_slots += 1;
+        let mut matching_id = r.clone();
+        matching_id.block_id = hash_block_header(&p);
         assert_eq!(
-            verify_acceptance_against_projection(&r, &p),
+            verify_acceptance_against_header(&matching_id, &p),
             Err(AcceptanceRelationError::ChildLogSlots)
         );
 
-        let mut p = projection_from(&r);
+        let mut p = local_header();
         p.active_slot_count += 1;
+        let mut matching_id = r.clone();
+        matching_id.block_id = hash_block_header(&p);
         assert_eq!(
-            verify_acceptance_against_projection(&r, &p),
+            verify_acceptance_against_header(&matching_id, &p),
             Err(AcceptanceRelationError::ChildActiveSlotCount)
         );
 
-        let mut p = projection_from(&r);
+        let mut p = local_header();
         p.alloc_counter += 1;
+        let mut matching_id = r.clone();
+        matching_id.block_id = hash_block_header(&p);
         assert_eq!(
-            verify_acceptance_against_projection(&r, &p),
+            verify_acceptance_against_header(&matching_id, &p),
             Err(AcceptanceRelationError::ChildAllocCounter)
         );
     }
@@ -338,7 +426,10 @@ mod tests {
 
     /// Native reference matching `poseidon2b_sponge_fixed_rate2_bits`: capacity in
     /// lanes 2,3; absorb two fields per permutation into lanes 0,1; squeeze 0,1.
-    fn poseidon2b_sponge_rate2_native(fields: &[Block128], capacity: [Block128; 2]) -> [Block128; 2] {
+    fn poseidon2b_sponge_rate2_native(
+        fields: &[Block128],
+        capacity: [Block128; 2],
+    ) -> [Block128; 2] {
         use noid_poseidon2b::native::permutation::Poseidon2bPermutation;
         let mut state = [Block128::ZERO, Block128::ZERO, capacity[0], capacity[1]];
         for chunk in fields.chunks(2) {

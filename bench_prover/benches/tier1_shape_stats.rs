@@ -7,8 +7,8 @@
 //! code. It contains no pre-cutover performance golden and freezes nothing.
 
 use bench_prover::{
-    bench_full_block_proof_minimal, fmt_bytes, fmt_ms, minimal_tx_fixture, time_once,
-    tx8x2_scenario,
+    bench_full_block_proof_minimal, fmt_bytes, fmt_ms, legal_block_scenarios, minimal_tx_fixture,
+    time_once,
 };
 use noid_chain::consensus::params::USER_TX_CLASS_TIERS;
 use noid_recursive::acceptance::shape::ShapeClass;
@@ -51,20 +51,19 @@ fn main() {
         );
         let spend_capacity = class.spend_capacity();
         let touched_capacity = class.touched_capacity();
+        let action_candidate_capacity = class.action_candidate_capacity();
+        let action_sort_capacity = class.action_sort_capacity();
+        let frontier_sibling_capacity = class.frontier_sibling_capacity();
+        let frontier_combine_capacity = class.frontier_combine_capacity();
         let (fixture_time, fixtures) = time_once(|| {
-            (0..tier)
-                .map(|index| {
-                    minimal_tx_fixture(tx8x2_scenario(
-                        "shape-ledger",
-                        noid_tx::TX_INPUTS,
-                        noid_tx::TX_OUTPUTS,
-                        (index * 2_048) as u32,
-                        0x7100_0000 + index as u128,
-                    ))
-                })
+            legal_block_scenarios("shape-ledger", tier, 0x7100_0000)
+                .into_iter()
+                .map(minimal_tx_fixture)
                 .collect::<Vec<_>>()
         });
         let result = bench_full_block_proof_minimal(&fixtures);
+        let frontier_siblings = result.proof.state_transition.slot_siblings.len();
+        assert!(frontier_siblings <= frontier_sibling_capacity);
         println!("  B{tier}");
         println!(
             "    shape_digest:      {}",
@@ -73,7 +72,12 @@ fn main() {
         println!("    tx capacity:       {tier}");
         println!("    spend capacity:    {spend_capacity}");
         println!("    auth capacity:     {}", class.authorization_capacity());
+        println!("    action candidates: {action_candidate_capacity}");
+        println!("    action sort rows:  {action_sort_capacity}");
         println!("    touched capacity:  {touched_capacity}");
+        println!("    frontier siblings:{frontier_sibling_capacity:>9}");
+        println!("    frontier combines:{frontier_combine_capacity:>9} / root");
+        println!("    fixture frontier: {frontier_siblings:>9} siblings");
         println!(
             "    body spine:        {live_spine_slots} live / {spine_slot_domain} slots / m={spine_num_vars}"
         );
@@ -83,6 +87,7 @@ fn main() {
             noid_chain::tx_tree::TX_TREE_DEPTH
         );
         println!("    fixture build:     {}", fmt_ms(fixture_time));
+        println!("    exact-state seed:  {}", fmt_ms(result.state_seed_time));
         println!("    block prove:       {}", fmt_ms(result.prove_time));
         println!("    block verify:      {}", fmt_ms(result.verify_time));
         println!("    block proof:       {}", fmt_bytes(result.proof_bytes));

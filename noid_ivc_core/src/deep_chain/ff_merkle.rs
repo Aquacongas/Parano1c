@@ -28,8 +28,10 @@
 //! - the CR-CHAIN zero-check on non-start node slots:
 //!   `0 = CR_i(w) + C_i(w-1) + mix_i(w-1)` — the previous node's digest;
 //! - path-start entry binding is a plain cell pin into `CR(start)`;
-//! - the recomputed root is the LinExpr `C_i(last) + mix_i(last)`, pinned
-//!   by the caller to the transcript-observed root wire.
+//! - when the dyadic stride has a spare tail slot, `NODENS` extends one slot
+//!   past the final node and the chain writes that recomputed digest into
+//!   `CR(root-copy)`. The caller can then pin the transcript-observed root
+//!   directly to one committed cell instead of rebuilding the final mix.
 //!
 //! Slot layout: path `p` occupies `[p·stride, p·stride + depth)` with
 //! `stride = depth.next_power_of_two()`; stride tails and slots past the
@@ -59,6 +61,13 @@ impl FfMerklePathFamily {
     pub fn n_slots(&self) -> usize {
         self.n_paths * self.stride()
     }
+
+    /// The in-stride slot used to expose the recomputed root as a committed
+    /// `CR` cell. A power-of-two depth has no spare tail and retains the
+    /// legacy composite-root handoff.
+    pub fn root_copy_offset(&self) -> Option<usize> {
+        (self.depth < self.stride()).then_some(self.depth)
+    }
 }
 
 /// Column/pattern indices of one ff-Merkle family inside caller-managed
@@ -78,7 +87,10 @@ pub struct FfMerkleFamilyRefs {
 
 /// The family's fixed patterns over one stride period, in the
 /// [`FfMerkleFamilyRefs`] order (`NODE, NODENS, START, IV0, IV1`).
-pub fn ff_merkle_fixed_patterns(family: &FfMerklePathFamily, iv_flat: [F128; 2]) -> Vec<FixedPattern> {
+pub fn ff_merkle_fixed_patterns(
+    family: &FfMerklePathFamily,
+    iv_flat: [F128; 2],
+) -> Vec<FixedPattern> {
     let low_log = family.stride_log();
     let period = family.stride();
     let mut node = vec![F128::ZERO; period];
@@ -95,6 +107,12 @@ pub fn ff_merkle_fixed_patterns(family: &FfMerklePathFamily, iv_flat: [F128; 2])
         } else {
             nodens[k] = F128::ONE;
         }
+    }
+    if let Some(root_copy) = family.root_copy_offset() {
+        // One extra CR-chain equation exposes the final feed-forward digest.
+        // NODE stays zero here, so the slot remains a ghost permutation and
+        // no additional compression is introduced.
+        nodens[root_copy] = F128::ONE;
     }
     vec![
         FixedPattern::new(low_log, node),
@@ -139,7 +157,10 @@ pub fn ff_merkle_substitution_terms(refs: &FfMerkleFamilyRefs, alpha: F128) -> V
             vec![node, d, cr],
             vec![node, d, sib],
         ] {
-            terms.push(RelationTerm { coeff: m[i], factors });
+            terms.push(RelationTerm {
+                coeff: m[i],
+                factors,
+            });
         }
         // Lane 2+i: cancel the ghost carry, add b + iv = mix + CR + SIB + IV
         // (the CR terms cancel: mix + CR = D·(CR+SIB)).
@@ -148,17 +169,29 @@ pub fn ff_merkle_substitution_terms(refs: &FfMerkleFamilyRefs, alpha: F128) -> V
         for factors in [
             vec![node, c_sh_j],
             vec![node, ColRef::Committed(refs.sib[i])],
-            vec![node, ColRef::Committed(refs.d), ColRef::Committed(refs.cr[i])],
-            vec![node, ColRef::Committed(refs.d), ColRef::Committed(refs.sib[i])],
+            vec![
+                node,
+                ColRef::Committed(refs.d),
+                ColRef::Committed(refs.cr[i]),
+            ],
+            vec![
+                node,
+                ColRef::Committed(refs.d),
+                ColRef::Committed(refs.sib[i]),
+            ],
             vec![ColRef::Fixed(refs.iv[i])],
         ] {
-            terms.push(RelationTerm { coeff: m[j], factors });
+            terms.push(RelationTerm {
+                coeff: m[j],
+                factors,
+            });
         }
     }
     terms
 }
 
-/// The CR-chain zero-check terms: on every non-start node slot,
+/// The CR-chain zero-check terms: on every non-start node slot (and the
+/// optional root-copy tail slot),
 /// `0 = CR_i(w) + C_i(w-1) + CR_i(w-1) + D(w-1)·(CR_i(w-1) + SIB_i(w-1))`
 /// — i.e. the carried-in digest equals the previous node's feed-forward
 /// output. One relation covers both lanes via the caller's per-lane
@@ -223,6 +256,8 @@ pub struct FfMerklePathColumns {
     pub s0: [Vec<F128>; STATE_SIZE],
     pub s_out: [Vec<F128>; STATE_SIZE],
     /// Per path: the recomputed root digest (`C + mix` at the last node).
+    /// When [`FfMerklePathFamily::root_copy_offset`] is present, the same
+    /// digest is also stored in `cr[*][p*stride + root_copy_offset]`.
     pub roots: Vec<[F128; 2]>,
 }
 
@@ -255,7 +290,11 @@ pub fn build_ff_merkle_path_columns(
         for k in 0..family.depth {
             sib[0][base + k] = path.siblings[k][0];
             sib[1][base + k] = path.siblings[k][1];
-            d[base + k] = if path.directions[k] { F128::ONE } else { F128::ZERO };
+            d[base + k] = if path.directions[k] {
+                F128::ONE
+            } else {
+                F128::ZERO
+            };
         }
     }
 
@@ -295,6 +334,12 @@ pub fn build_ff_merkle_path_columns(
             let digest = [stout[0] + raw[0], stout[1] + raw[1]];
             if local == family.depth - 1 {
                 roots.push(digest);
+                if family.root_copy_offset().is_some() {
+                    // The next slot is the spare tail selected by NODENS, so
+                    // the existing CR-chain relation proves this copy.
+                    cr[0][slot + 1] = digest[0];
+                    cr[1][slot + 1] = digest[1];
+                }
             } else {
                 // The next node's carried-in digest.
                 cr[0][slot + 1] = digest[0];
@@ -384,7 +429,23 @@ mod tests {
             directions: (0..depth).map(|k| (leaf_index >> k) & 1 == 1).collect(),
         };
         let cols = build_ff_merkle_path_columns(&family, iv_flat, &[witness], 3);
-        assert_eq!(cols.roots[0], expect, "ff chain root != native compress chain");
+        assert_eq!(
+            cols.roots[0], expect,
+            "ff chain root != native compress chain"
+        );
+        let root_copy = family.root_copy_offset().expect("depth-5 tail");
+        assert_eq!(
+            [cols.cr[0][root_copy], cols.cr[1][root_copy]],
+            expect,
+            "root-copy CR cell"
+        );
+        let fixed = ff_merkle_fixed_patterns(&family, iv_flat);
+        assert_eq!(
+            fixed[0].table[root_copy],
+            F128::ZERO,
+            "root copy is not NODE"
+        );
+        assert_eq!(fixed[1].table[root_copy], F128::ONE, "root copy is NODENS");
     }
 
     fn mle(col: &[F128], point: &[F128]) -> F128 {
@@ -463,13 +524,25 @@ mod tests {
                 let digest = [stout[0] + raw[0], stout[1] + raw[1]];
                 if local == family.depth - 1 {
                     roots.push(digest);
+                    if family.root_copy_offset().is_some() {
+                        cr[0][slot + 1] = digest[0];
+                        cr[1][slot + 1] = digest[1];
+                    }
                 } else {
                     cr[0][slot + 1] = digest[0];
                     cr[1][slot + 1] = digest[1];
                 }
             }
         }
-        FfMerklePathColumns { cr, sib, d, c, s0, s_out, roots }
+        FfMerklePathColumns {
+            cr,
+            sib,
+            d,
+            c,
+            s0,
+            s_out,
+            roots,
+        }
     }
 
     /// Run the family's full region DAG over the given column data: carry
@@ -507,11 +580,11 @@ mod tests {
 
         // A claim-discharge helper shared by every relation below.
         let discharge = |terms: &[RelationTerm],
-                             final_values: &[F128],
-                             point: &[F128],
-                             pending: &mut Vec<(usize, Vec<F128>, F128)>,
-                             ch_p: &mut FsLaneChallenger,
-                             ch_v: &mut FsLaneChallenger|
+                         final_values: &[F128],
+                         point: &[F128],
+                         pending: &mut Vec<(usize, Vec<F128>, F128)>,
+                         ch_p: &mut FsLaneChallenger,
+                         ch_v: &mut FsLaneChallenger|
          -> Result<[F128; STATE_SIZE], String> {
             let mut internal_values = [F128::ZERO; STATE_SIZE];
             for (r, v) in claimed_refs(terms).iter().zip(final_values.iter()) {
@@ -540,17 +613,30 @@ mod tests {
             F128::ZERO,
             &rho,
             &sel_terms,
-            &RelationColumns { committed, internal: &internal, fixed: &fixed },
+            &RelationColumns {
+                committed,
+                internal: &internal,
+                fixed: &fixed,
+            },
             &mut ch_p,
         );
         let sel_point =
             verify_column_relation(w_log, F128::ZERO, &rho, &sel_terms, &fixed, &sp, &mut ch_v)
                 .map_err(|e| format!("selection: {e}"))?;
-        let group_values =
-            discharge(&sel_terms, &sp.final_values, &sel_point, &mut pending, &mut ch_p, &mut ch_v)?;
+        let group_values = discharge(
+            &sel_terms,
+            &sp.final_values,
+            &sel_point,
+            &mut pending,
+            &mut ch_p,
+            &mut ch_v,
+        )?;
 
         // Walk.
-        let groups = vec![LaneClaimGroup { point: sel_point, values: group_values }];
+        let groups = vec![LaneClaimGroup {
+            point: sel_point,
+            values: group_values,
+        }];
         let (wp, _) = prove_deep_chain_walk(&cols.s0, &groups, &mut ch_p);
         let terminal = verify_deep_chain_walk(w_log, &groups, &wp, &mut ch_v)
             .map_err(|e| format!("walk: {e}"))?;
@@ -576,14 +662,31 @@ mod tests {
             target,
             &terminal.point,
             &sub_terms,
-            &RelationColumns { committed, internal: &[], fixed: &fixed },
+            &RelationColumns {
+                committed,
+                internal: &[],
+                fixed: &fixed,
+            },
             &mut ch_p,
         );
         let sub_point = verify_column_relation(
-            w_log, target, &terminal.point, &sub_terms, &fixed, &subp, &mut ch_v,
+            w_log,
+            target,
+            &terminal.point,
+            &sub_terms,
+            &fixed,
+            &subp,
+            &mut ch_v,
         )
         .map_err(|e| format!("substitution: {e}"))?;
-        discharge(&sub_terms, &subp.final_values, &sub_point, &mut pending, &mut ch_p, &mut ch_v)?;
+        discharge(
+            &sub_terms,
+            &subp.final_values,
+            &sub_point,
+            &mut pending,
+            &mut ch_p,
+            &mut ch_v,
+        )?;
 
         // CR-chain zero-check.
         if check_chain {
@@ -596,14 +699,31 @@ mod tests {
                 F128::ZERO,
                 &rho2,
                 &chain_terms,
-                &RelationColumns { committed, internal: &[], fixed: &fixed },
+                &RelationColumns {
+                    committed,
+                    internal: &[],
+                    fixed: &fixed,
+                },
                 &mut ch_p,
             );
             let chain_point = verify_column_relation(
-                w_log, F128::ZERO, &rho2, &chain_terms, &fixed, &cp, &mut ch_v,
+                w_log,
+                F128::ZERO,
+                &rho2,
+                &chain_terms,
+                &fixed,
+                &cp,
+                &mut ch_v,
             )
             .map_err(|e| format!("chain: {e}"))?;
-            discharge(&chain_terms, &cp.final_values, &chain_point, &mut pending, &mut ch_p, &mut ch_v)?;
+            discharge(
+                &chain_terms,
+                &cp.final_values,
+                &chain_point,
+                &mut pending,
+                &mut ch_p,
+                &mut ch_v,
+            )?;
         }
 
         // Direction booleanity zero-check.
@@ -615,14 +735,31 @@ mod tests {
                 F128::ZERO,
                 &rho3,
                 &bool_terms,
-                &RelationColumns { committed, internal: &[], fixed: &fixed },
+                &RelationColumns {
+                    committed,
+                    internal: &[],
+                    fixed: &fixed,
+                },
                 &mut ch_p,
             );
             let bool_point = verify_column_relation(
-                w_log, F128::ZERO, &rho3, &bool_terms, &fixed, &bp, &mut ch_v,
+                w_log,
+                F128::ZERO,
+                &rho3,
+                &bool_terms,
+                &fixed,
+                &bp,
+                &mut ch_v,
             )
             .map_err(|e| format!("booleanity: {e}"))?;
-            discharge(&bool_terms, &bp.final_values, &bool_point, &mut pending, &mut ch_p, &mut ch_v)?;
+            discharge(
+                &bool_terms,
+                &bp.final_values,
+                &bool_point,
+                &mut pending,
+                &mut ch_p,
+                &mut ch_v,
+            )?;
         }
 
         assert_eq!(ch_p.sample_f128(), ch_v.sample_f128(), "lockstep");
@@ -642,12 +779,16 @@ mod tests {
                     return Err(format!("entry pin mismatch on path {pi}"));
                 }
             }
-            let last = base + family.depth - 1;
             for i in 0..2 {
-                let crv = committed[refs.cr[i]][last];
-                let sibv = committed[refs.sib[i]][last];
-                let dv = committed[refs.d][last];
-                let root = committed[refs.c[i]][last] + crv + dv * (crv + sibv);
+                let root = if let Some(root_copy) = family.root_copy_offset() {
+                    committed[refs.cr[i]][base + root_copy]
+                } else {
+                    let last = base + family.depth - 1;
+                    let crv = committed[refs.cr[i]][last];
+                    let sibv = committed[refs.sib[i]][last];
+                    let dv = committed[refs.d][last];
+                    committed[refs.c[i]][last] + crv + dv * (crv + sibv)
+                };
                 if root != cols.roots[pi][i] {
                     return Err(format!("root pin mismatch on path {pi}"));
                 }
@@ -675,18 +816,26 @@ mod tests {
             let mut z = seed;
             z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
             z ^= z >> 31;
-            F128 { lo: z, hi: z.rotate_left(11) }
+            F128 {
+                lo: z,
+                hi: z.rotate_left(11),
+            }
         };
         let entries: Vec<[F128; 2]> = (0..2).map(|_| [next(), next()]).collect();
-        let sibs: Vec<Vec<[F128; 2]>> =
-            (0..2).map(|_| (0..depth).map(|_| [next(), next()]).collect()).collect();
+        let sibs: Vec<Vec<[F128; 2]>> = (0..2)
+            .map(|_| (0..depth).map(|_| [next(), next()]).collect())
+            .collect();
         let dir_bits: Vec<Vec<bool>> = vec![
             (0..depth).map(|k| (0b10110 >> k) & 1 == 1).collect(),
             (0..depth).map(|k| (0b01011 >> k) & 1 == 1).collect(),
         ];
         let dirs: Vec<Vec<F128>> = dir_bits
             .iter()
-            .map(|bits| bits.iter().map(|&b| if b { F128::ONE } else { F128::ZERO }).collect())
+            .map(|bits| {
+                bits.iter()
+                    .map(|&b| if b { F128::ONE } else { F128::ZERO })
+                    .collect()
+            })
             .collect();
 
         // The honest replay must agree with the production builder.
@@ -706,14 +855,27 @@ mod tests {
 
         let table = |c: &FfMerklePathColumns| -> Vec<Vec<F128>> {
             vec![
-                c.cr[0].clone(), c.cr[1].clone(), c.sib[0].clone(), c.sib[1].clone(),
-                c.d.clone(), c.c[0].clone(), c.c[1].clone(), c.c[2].clone(), c.c[3].clone(),
+                c.cr[0].clone(),
+                c.cr[1].clone(),
+                c.sib[0].clone(),
+                c.sib[1].clone(),
+                c.d.clone(),
+                c.c[0].clone(),
+                c.c[1].clone(),
+                c.c[2].clone(),
+                c.c[3].clone(),
             ]
         };
-        let run = |cols: &FfMerklePathColumns, committed: &[Vec<F128>], chain: bool, boolean: bool| {
-            let refs: Vec<&[F128]> = committed.iter().map(|c| c.as_slice()).collect();
-            run_dag(&family, iv_flat, cols, &refs, &entries, w_log, chain, boolean)
-        };
+        let run =
+            |cols: &FfMerklePathColumns, committed: &[Vec<F128>], chain: bool, boolean: bool| {
+                let refs: Vec<&[F128]> = committed.iter().map(|c| c.as_slice()).collect();
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_dag(
+                        &family, iv_flat, cols, &refs, &entries, w_log, chain, boolean,
+                    )
+                }))
+                .unwrap_or_else(|_| Err("native relation prover rejected witness".into()))
+            };
 
         let honest = table(&cols);
         run(&cols, &honest, true, true).expect("honest ff-merkle DAG verifies");
@@ -722,7 +884,22 @@ mod tests {
         {
             let mut bad = honest.clone();
             bad[2][3] += F128::ONE;
-            assert!(run(&cols, &bad, true, true).is_err(), "corrupted sibling accepted");
+            assert!(
+                run(&cols, &bad, true, true).is_err(),
+                "corrupted sibling accepted"
+            );
+        }
+
+        // The exposed root is not a free tail cell: NODENS extends the
+        // existing CR chain into it, and the direct root pin consumes it.
+        {
+            let mut bad = honest.clone();
+            let root_copy = family.root_copy_offset().expect("depth-5 tail");
+            bad[0][root_copy] += F128::ONE;
+            assert!(
+                run(&cols, &bad, true, true).is_err(),
+                "corrupted root-copy cell accepted"
+            );
         }
 
         // Broken carried-digest chain, everything downstream replayed
@@ -731,7 +908,10 @@ mod tests {
             let breaks = [(2usize, [next(), next()])];
             let forged = replay(&family, iv_flat, &entries, &sibs, &dirs, &breaks, w_log);
             let t = table(&forged);
-            assert!(run(&forged, &t, true, true).is_err(), "broken CR chain accepted");
+            assert!(
+                run(&forged, &t, true, true).is_err(),
+                "broken CR chain accepted"
+            );
             run(&forged, &t, false, true).expect("chain break must be invisible elsewhere");
         }
 
@@ -742,7 +922,10 @@ mod tests {
             dirs2[1][2] = next();
             let forged = replay(&family, iv_flat, &entries, &sibs, &dirs2, &[], w_log);
             let t = table(&forged);
-            assert!(run(&forged, &t, true, true).is_err(), "non-boolean direction accepted");
+            assert!(
+                run(&forged, &t, true, true).is_err(),
+                "non-boolean direction accepted"
+            );
             run(&forged, &t, true, false).expect("non-boolean dir must be invisible elsewhere");
         }
     }

@@ -27,9 +27,9 @@
 
 use noid_core::Block128;
 use noid_fri_binius::capsule::{capsule_tree_depth, CAPSULE_CAP_DEPTH};
-use noid_ivc_core::deep_chain::capsule_leaf::CAPSULE_LEAF_STRIDE;
 use noid_gkr::auth_pcs::{commit_auth_mle_column, open_auth_mle_committed};
 use noid_gkr::batch_eval::BatchEvalReduction;
+use noid_ivc_core::deep_chain::capsule_leaf::CAPSULE_LEAF_STRIDE;
 
 use noid_ivc_core::challenger::FsLaneChallenger;
 use noid_ivc_core::field::F128;
@@ -70,13 +70,22 @@ impl Rng {
 fn capsule_fixture(
     num_vars: usize,
     seed: u64,
-) -> (Vec<Block128>, BatchEvalReduction, noid_gkr::auth_pcs::AuthMleOpeningProof) {
+) -> (
+    Vec<Block128>,
+    BatchEvalReduction,
+    noid_gkr::auth_pcs::AuthMleOpeningProof,
+) {
     use noid_core::mle::evaluate::evaluate_slice;
     let mut rng = Rng(seed);
-    let column: Vec<Block128> = (0..(1usize << num_vars)).map(|_| rng.f128_block()).collect();
+    let column: Vec<Block128> = (0..(1usize << num_vars))
+        .map(|_| rng.f128_block())
+        .collect();
     let point: Vec<Block128> = (0..num_vars).map(|_| rng.f128_block()).collect();
     let value = evaluate_slice(&column, &point);
-    let reduction = BatchEvalReduction { point: point.clone(), value };
+    let reduction = BatchEvalReduction {
+        point: point.clone(),
+        value,
+    };
     let mut committed = commit_auth_mle_column(&column, num_vars);
     let proof = open_auth_mle_committed(&mut committed, num_vars, &reduction);
     (point, reduction, proof)
@@ -92,7 +101,10 @@ fn alloc_column_slice(
         b.alloc_f128(F128::ZERO);
     }
     let index = b.num_wires() / block;
-    let wires: Vec<LinExpr> = col.iter().map(|&v| LinExpr::from_wire(b.alloc_f128(v))).collect();
+    let wires: Vec<LinExpr> = col
+        .iter()
+        .map(|&v| LinExpr::from_wire(b.alloc_f128(v)))
+        .collect();
     for _ in col.len()..block {
         b.alloc_f128(F128::ZERO);
     }
@@ -104,7 +116,10 @@ fn alloc_column_slice(
 fn alloc_digest_raw(b: &mut FieldR1csBuilder, d: &[u8; 32]) -> [LinExpr; 2] {
     let lo = u128::from_le_bytes(d[..16].try_into().unwrap());
     let hi = u128::from_le_bytes(d[16..].try_into().unwrap());
-    let lane = |v: u128| F128 { lo: v as u64, hi: (v >> 64) as u64 };
+    let lane = |v: u128| F128 {
+        lo: v as u64,
+        hi: (v >> 64) as u64,
+    };
     [
         LinExpr::from_wire(b.alloc_f128(lane(lo))),
         LinExpr::from_wire(b.alloc_f128(lane(hi))),
@@ -127,14 +142,22 @@ fn region_source_binding_full_end_to_end() {
     // into (so the src fn drives the channel from THESE wires, not fresh ones).
     // -------------------------------------------------------------------
     let mut b = FieldR1csBuilder::new();
-    let cap_lanes: Vec<[LinExpr; 2]> =
-        proof.commitment.cap.hashes.iter().map(|h| alloc_digest_raw(&mut b, h)).collect();
+    let cap_lanes: Vec<[LinExpr; 2]> = proof
+        .commitment
+        .cap
+        .hashes
+        .iter()
+        .map(|h| alloc_digest_raw(&mut b, h))
+        .collect();
     let point_w = alloc_blocks(&mut b, &point);
     let value_w = alloc_block(&mut b, red.value);
     let obligation = PendingAuthPcsObligation {
         commitment_cap_lanes: cap_lanes,
         num_vars,
-        reduction: BatchEvalReductionTrace { point: point_w, value: value_w },
+        reduction: BatchEvalReductionTrace {
+            point: point_w,
+            value: value_w,
+        },
     };
     let params = RegionDischargeParams { nq: NQ };
 
@@ -154,7 +177,11 @@ fn region_source_binding_full_end_to_end() {
     let mut io_values = Vec::with_capacity(io_len);
     for c in &claims {
         for k in 0..max_arity {
-            io_values.push(if k < c.native_point.len() { c.native_point[k] } else { F128::ZERO });
+            io_values.push(if k < c.native_point.len() {
+                c.native_point[k]
+            } else {
+                F128::ZERO
+            });
         }
         io_values.push(c.native_value);
     }
@@ -180,14 +207,25 @@ fn region_source_binding_full_end_to_end() {
             .collect(),
     };
 
-    // Memory guard: with THREE union walks (A leaf tiles, B ff+2perm legs, C
-    // the FRICHANL channel duplex) this must stay under 2^23 wires.
+    // Memory guard: three semantic union walks (A leaf tiles, B ff legs, C the
+    // FRICHANL channel) plus recording-only D must stay under 2^23 wires.
     let n_wires = b.num_wires();
-    eprintln!("[src-full] wires before build = {n_wires}, claims = {}", claims.len());
+    eprintln!(
+        "[src-full] wires before build = {n_wires}, claims = {}",
+        claims.len()
+    );
+    // The recording-only D migration starts from the same 131,072-row C
+    // alignment boundary as the former inline-C host.  Its C/D proof + pin
+    // tail is 78,608 rows smaller; ten extra terminal claims add 924 IO rows,
+    // for an exact net saving of 77,684 rows (2,419,072 -> 2,341,388).
+    assert_eq!(n_wires, 2_341_388, "exact recorded-C/D K=1,nq=4 row count");
     assert!(n_wires < (1usize << 23), "wire guard {n_wires}");
 
     let (r1cs, z) = b.build();
-    assert!(r1cs.satisfies(&z), "honest source-binding-full trace unsatisfiable");
+    assert!(
+        r1cs.satisfies(&z),
+        "honest source-binding-full trace unsatisfiable"
+    );
     let params_pcs = PcsParams {
         m: r1cs.m + pcs::LOG_PACKING,
         log_inv_rate: 2,
@@ -196,15 +234,25 @@ fn region_source_binding_full_end_to_end() {
     };
     let mut chp = FsLaneChallenger::new(OUTER);
     let (pf, commitment, _) = noid_ivc_prover::field_prover::prove_field_with_public_io(
-        &r1cs, &z, &params_pcs, &spec, &io_values, &mut chp,
+        &r1cs,
+        &z,
+        &params_pcs,
+        &spec,
+        &io_values,
+        &mut chp,
     );
     let mut chv = FsLaneChallenger::new(OUTER);
     noid_ivc_core::verifier::verify_field_with_public_io(
-        &r1cs, &commitment, &pf, &spec, &io_values, &mut chv,
+        &r1cs,
+        &commitment,
+        &pf,
+        &spec,
+        &io_values,
+        &mut chv,
     )
     .expect("source-binding-full composition verifies");
     eprintln!(
-        "[src-full] ONE proof: rows = {} (m = {}), num_vars = {}, NQ = {}, claims = {}, walks = 3",
+        "[src-full] ONE proof: rows = {} (m = {}), num_vars = {}, NQ = {}, claims = {}, walks = 3+D",
         z.len(),
         r1cs.m,
         num_vars,
@@ -229,24 +277,30 @@ fn region_source_binding_full_end_to_end() {
 
     // Global column -> WitnessSlice. Claimed columns: walk A {IN0, IN1,
     // C0..C3} (KID0/1 exist but are unclaimed without the spine handoff),
-    // walk B all 9 {C0..C3, E0, E1, SIB0, SIB1, D}, walk C all 6. Committed
-    // slices are allocated strictly in order, so sorting the distinct claim
-    // slices by start() recovers a stable global order:
+    // walk B all 9 {C0..C3, E0, E1, SIB0, SIB1, D}, walk C all 6, and its
+    // recording-only host D all 6. Committed slices are allocated strictly in
+    // order, so sorting the distinct claim slices by start() recovers a stable
+    // global order:
     //   0..6   -> walk A IN0, IN1, C0..C3
     //   6..15  -> walk B C0..C3, E0, E1, SIB0, SIB1, D
     //   15..21 -> walk C A0, A1, C0..C3
+    //   21..27 -> walk D A0, A1, C0..C3
     let mut uniq: Vec<WitnessSlice> = claims.iter().map(|c| c.slice).collect();
     uniq.sort_by_key(|s| s.start());
     uniq.dedup_by_key(|s| s.start());
-    assert_eq!(uniq.len(), 6 + 9 + 6, "every claimed committed column accounted for");
+    assert_eq!(
+        uniq.len(),
+        6 + 9 + 6 + 6,
+        "every claimed committed column accounted for"
+    );
     let col_slice = |g: usize| uniq[g];
     let (a_in0, a_c0) = (0usize, 2usize);
-    let (b_c0, b_sib0) = (6usize, 12usize);
+    let (b_c0, b_e0, b_sib0) = (6usize, 10usize, 12usize);
 
     // -------------------------------------------------------------------
     // Negatives: flip a committed lane -> the tampering is CAUGHT. A cell
-    // reached by a Stage-2 `pin_eq` (symbols, meta lanes, digests, channel
-    // absorbs/challenges, ff roots) is trace-bound, so the flip breaks
+    // reached by direct fold input / A-to-B equality or a Stage-2 `pin_eq`
+    // (meta lanes, channel absorbs/challenges, ff roots) is trace-bound, so the flip breaks
     // satisfiability; a cell touched only by a walk discharge (e.g. a path
     // sibling) stays a free wire, so the flip breaks that column's opening
     // claim and the PCS rejects. Either path is a rejection.
@@ -259,7 +313,12 @@ fn region_source_binding_full_end_to_end() {
         }
         let mut chp = FsLaneChallenger::new(OUTER);
         let (bp, bc, _) = noid_ivc_prover::field_prover::prove_field_with_public_io(
-            &r1cs, &bad, &params_pcs, &spec, &io_values, &mut chp,
+            &r1cs,
+            &bad,
+            &params_pcs,
+            &spec,
+            &io_values,
+            &mut chp,
         );
         let mut chv = FsLaneChallenger::new(OUTER);
         noid_ivc_core::verifier::verify_field_with_public_io(
@@ -268,36 +327,53 @@ fn region_source_binding_full_end_to_end() {
         .is_err()
     };
     // (a) a source-coset symbol — walk-A IN0 at tile 0's first symbol slot.
-    assert!(flip(a_in0, src_fam_base + 1), "flipped source coset symbol accepted");
+    assert!(
+        flip(a_in0, src_fam_base + 1),
+        "flipped source coset symbol accepted"
+    );
     // (b) a mid-coset symbol — walk-A IN1 at mid tile 0's first symbol slot.
-    assert!(flip(a_in0 + 1, mid_fam_base + 1), "flipped mid coset symbol accepted");
+    assert!(
+        flip(a_in0 + 1, mid_fam_base + 1),
+        "flipped mid coset symbol accepted"
+    );
     // (c) a leaf-tile meta cell (the bit-recomposed leaf index) — IN1 at the
     //     tile's slot 0 is pinned to the transcript-derived position bits.
-    assert!(flip(a_in0 + 1, src_fam_base), "flipped leaf-index meta cell accepted");
-    // (d) a tile digest cell — walk-A C0 at tile 0's digest slot feeds the ff
-    //     leg entry through a shared wire pin.
-    assert!(flip(a_c0, src_fam_base + 8), "flipped tile digest cell accepted");
+    assert!(
+        flip(a_in0 + 1, src_fam_base),
+        "flipped leaf-index meta cell accepted"
+    );
+    // (d) a tile digest cell — walk-A C0 at tile 0's digest slot equals the ff
+    //     leg's committed CR/E start cell directly.
+    assert!(
+        flip(a_c0, src_fam_base + 8),
+        "flipped tile digest cell accepted"
+    );
     // (e) a path SIBLING lane in each ff leg (SIB0 at the leg's path-0 node 0
     //     -> the path misses its committed cap lane / mid root).
-    assert!(flip(b_sib0, ff_base_s), "flipped source-path sibling accepted");
+    assert!(
+        flip(b_sib0, ff_base_s),
+        "flipped source-path sibling accepted"
+    );
     assert!(flip(b_sib0, ff_base_m), "flipped mid-path sibling accepted");
     // (f) a direction cell (D at path-0 node 1) — pinned to the query bit.
-    assert!(flip(b_c0 + 8, ff_base_s + 1), "flipped direction cell accepted");
+    assert!(
+        flip(b_c0 + 8, ff_base_s + 1),
+        "flipped direction cell accepted"
+    );
 
     // -------------------------------------------------------------------
-    // Transcript-binding of the authentication roots: the recomputed ff root
-    // `C + CR + D·(CR+SIB)` at the last node slot is pinned to the
-    // FS-observed wire (cap-lane mux / mid_root). Flipping the C0 cell at the
-    // last node slot of path 0 breaks that pin — the honest witness is
-    // unsatisfiable. Together with the sibling flips (e) this proves the
-    // walk-authenticated root IS the transcript-seeded root.
+    // Transcript-binding of the authentication roots: NODENS copies the
+    // recomputed final digest into the first stride-tail E/CR cell, which is
+    // pinned to the FS-observed cap-lane/mid-root wire. Flipping that exact E0
+    // cell breaks satisfiability. Together with the sibling flips (e), this
+    // proves the walk-authenticated root IS the transcript-seeded root.
     // -------------------------------------------------------------------
     assert!(
-        flip(b_c0, ff_base_s + depth_s - 1),
+        flip(b_e0, ff_base_s + depth_s),
         "flipped source-leg recomputed-root cell accepted (root not transcript-bound)"
     );
     assert!(
-        flip(b_c0, ff_base_m + depth_m - 1),
+        flip(b_e0, ff_base_m + depth_m),
         "flipped mid-leg recomputed-root cell accepted (root not transcript-bound)"
     );
 }

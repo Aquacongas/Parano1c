@@ -150,9 +150,8 @@ fn absorb_public_batch_trace(
         for level in 0..input.active_depth {
             ch.absorb(b, &input.siblings[level][0]);
             ch.absorb(b, &input.siblings[level][1]);
-            directions = directions.add(
-                &input.direction_bits[level].scale(flat_of(Block128::from(1u128 << level))),
-            );
+            directions = directions
+                .add(&input.direction_bits[level].scale(flat_of(Block128::from(1u128 << level))));
         }
         ch.absorb(b, &directions);
     }
@@ -173,8 +172,7 @@ fn append_path_chain_claims_trace(
     let mds = |row: usize, col: usize| Block128::from(MDS_FULL[row][col]);
     let depth = input.active_depth;
     let [iv_hi, iv_lo] = capacity_iv(circuit.node_tag);
-    let iv_const =
-        |lane: usize| flat_of(mds(lane, 2) * iv_hi + mds(lane, 3) * iv_lo);
+    let iv_const = |lane: usize| flat_of(mds(lane, 2) * iv_hi + mds(lane, 3) * iv_lo);
     let mds_pair = |lane: usize, pair: &[LinExpr; 2]| {
         pair[0]
             .scale(flat_of(mds(lane, 0)))
@@ -194,8 +192,8 @@ fn append_path_chain_claims_trace(
 
         for lane in 0..STATE_SIZE {
             let mut terms = vec![state_term(perm_a_slot, 0, lane, const_coeff(Block128::ONE))];
-            let mut value = mul(b, d, &mds_pair(lane, &input.siblings[level]))
-                .add_const(iv_const(lane));
+            let mut value =
+                mul(b, d, &mds_pair(lane, &input.siblings[level])).add_const(iv_const(lane));
             if level == 0 {
                 value = value.add(&mul(b, &not_d, &mds_pair(lane, &input.leaf)));
             } else {
@@ -251,7 +249,12 @@ fn append_path_chain_claims_trace(
     let last_perm_b = slot_offset + (depth - 1) * 2 + 1;
     for lane in 0..MERKLE_PIN_LANES {
         claims.push(LinearEvalClaimTrace {
-            terms: vec![state_term(last_perm_b, N_ROUNDS, lane, const_coeff(Block128::ONE))],
+            terms: vec![state_term(
+                last_perm_b,
+                N_ROUNDS,
+                lane,
+                const_coeff(Block128::ONE),
+            )],
             value: input.expected_root[lane].clone(),
         });
     }
@@ -302,7 +305,15 @@ pub fn verify_batched_merkle_killshot_trace(
         MERKLE_CHAIN_LINEAR_RELATION_TAG,
     );
 
-    close_spine_family_batch(b, ch, &main_red, &shift_red, &chain_red, &proof.batch, proof.num_vars)
+    close_spine_family_batch(
+        b,
+        ch,
+        &main_red,
+        &shift_red,
+        &chain_red,
+        &proof.batch,
+        proof.num_vars,
+    )
 }
 
 /// Trace twin of `discharge_batched_merkle_reductions_native`: replay the
@@ -431,7 +442,11 @@ mod tests {
     fn make_fixture() -> Fixture {
         let circuit = MerkleCircuit::build();
         // Varied depths AND directions (exercises every claim branch).
-        let inputs = vec![fixture(1, 3, 0b101), fixture(2, 1, 0b1), fixture(3, 5, 0b01010)];
+        let inputs = vec![
+            fixture(1, 3, 0b101),
+            fixture(2, 1, 0b1),
+            fixture(3, 5, 0b01010),
+        ];
         let mut ch = Poseidon2bChannel::new();
         let (proof, _) = prove_batched_merkle_killshot(&circuit, &inputs, &mut ch);
         Fixture { proof, inputs }
@@ -563,7 +578,10 @@ mod tests {
                 proof: bad_proof,
                 inputs: f.inputs.clone(),
             };
-            assert!(!native_accepts(&bad), "native accepted proof mutant {target}");
+            assert!(
+                !native_accepts(&bad),
+                "native accepted proof mutant {target}"
+            );
             if trace_accepts(&bad) {
                 survivors.push(target);
             }

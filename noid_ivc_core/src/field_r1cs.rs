@@ -201,14 +201,11 @@ impl SparseFieldMatrix {
     pub fn row(&self, r: usize) -> impl Iterator<Item = (u32, F128)> + '_ {
         let range = self.row_range(r);
         let table = &self.value_table;
-        self.col_indices[range.clone()]
-            .iter()
-            .copied()
-            .zip(
-                self.value_indices[range]
-                    .iter()
-                    .map(move |&vi| table[vi as usize]),
-            )
+        self.col_indices[range.clone()].iter().copied().zip(
+            self.value_indices[range]
+                .iter()
+                .map(move |&vi| table[vi as usize]),
+        )
     }
 }
 
@@ -336,39 +333,46 @@ impl FieldR1cs {
     /// once and install it on fresh instances with
     /// [`Self::seed_statement_digest`] instead of re-hashing per instance.
     pub fn statement_digest(&self) -> [u8; 32] {
-        *self.digest_cache.get_or_init(|| {
-            let mut top = Vec::new();
-            push_u64(&mut top, self.m as u64);
-            push_u64(&mut top, self.k_log as u64);
-            push_u64(&mut top, self.k_skip as u64);
-            push_u64(&mut top, self.useful_rows as u64);
-            // Encode the pin unambiguously: 0 = None, 1 + col = Some(col).
-            push_u64(
-                &mut top,
-                self.const_pin.map(|c| 1 + c as u64).unwrap_or(0),
-            );
-            for m_0 in [&self.a_0, &self.b_0] {
-                push_u64(&mut top, m_0.num_rows as u64);
-                push_u64(&mut top, m_0.num_cols as u64);
-                for digest in matrix_span_digests(m_0) {
-                    top.extend_from_slice(&digest);
-                }
+        *self
+            .digest_cache
+            .get_or_init(|| self.structural_statement_digest())
+    }
+
+    /// Recompute the statement digest directly from the matrix structure,
+    /// deliberately ignoring [`Self::digest_cache`].
+    ///
+    /// Ordinary proof construction uses [`Self::statement_digest`] so a
+    /// locally established class constant can be seeded cheaply. Trust
+    /// boundaries that accept a matrix supplied by another component must use
+    /// this method instead: otherwise that component could seed the expected
+    /// digest onto different matrix contents and bypass the local structural
+    /// identity check.
+    pub fn structural_statement_digest(&self) -> [u8; 32] {
+        let mut top = Vec::new();
+        push_u64(&mut top, self.m as u64);
+        push_u64(&mut top, self.k_log as u64);
+        push_u64(&mut top, self.k_skip as u64);
+        push_u64(&mut top, self.useful_rows as u64);
+        // Encode the pin unambiguously: 0 = None, 1 + col = Some(col).
+        push_u64(&mut top, self.const_pin.map(|c| 1 + c as u64).unwrap_or(0));
+        for m_0 in [&self.a_0, &self.b_0] {
+            push_u64(&mut top, m_0.num_rows as u64);
+            push_u64(&mut top, m_0.num_cols as u64);
+            for digest in matrix_span_digests(m_0) {
+                top.extend_from_slice(&digest);
             }
-            noid_poseidon2b::native::poseidon2b_hash_byte_slices(
-                b"NOID/IVC/FIELD-R1CS-STMT",
-                &[&top],
-            )
-        })
+        }
+        noid_poseidon2b::native::poseidon2b_hash_byte_slices(b"NOID/IVC/FIELD-R1CS-STMT", &[&top])
     }
 
     /// Install a precomputed statement digest — the per-shape-class protocol
     /// constant — skipping the content hash entirely.
     ///
-    /// Safe against abuse by construction: verifiers bind the Fiat-Shamir
-    /// transcript to *their* digest value, so seeding a digest that does not
-    /// match the instance's true content hash cannot forge anything — it
-    /// only produces proofs (or verdicts) that disagree with every honest
-    /// party. Panics if a different digest is already cached.
+    /// This is safe only after the caller has already established that the
+    /// matrix contents have this identity (for example by reproducing a frozen
+    /// class relation). A verifier receiving a matrix from another component
+    /// must compare [`Self::structural_statement_digest`] instead of trusting
+    /// this seedable cache. Panics if a different digest is already cached.
     pub fn seed_statement_digest(&self, digest: [u8; 32]) {
         if self.digest_cache.set(digest).is_err() {
             assert_eq!(
@@ -385,6 +389,18 @@ impl FieldR1cs {
         self.csc_cache.get_or_init(|| {
             FieldCscCircuit::from_matrices(&self.a_0, &self.b_0).with_const_pin(self.const_pin)
         })
+    }
+
+    /// Release the lazily materialized CSC transpose while retaining the
+    /// canonical CSR statement.  Long-lived class registries and streaming
+    /// deciders call this after a proof phase so one verification cache per
+    /// frozen class does not remain resident between prover jobs.
+    ///
+    /// The cache is purely derived data and is rebuilt on the next
+    /// [`Self::csc_lincheck_circuit`] access. Returns whether a cache was
+    /// present.
+    pub fn release_csc_cache(&mut self) -> bool {
+        self.csc_cache.take().is_some()
     }
 }
 
@@ -597,10 +613,7 @@ impl<'a> FlipBattery<'a> {
 
     /// [`Self::survivors`] minus the pin-helper class — the standard gate
     /// for assembled traces where pin rows interleave with allocations.
-    pub fn survivors_excluding_pin_helpers(
-        &mut self,
-        range: std::ops::Range<usize>,
-    ) -> Vec<usize> {
+    pub fn survivors_excluding_pin_helpers(&mut self, range: std::ops::Range<usize>) -> Vec<usize> {
         range
             .filter(|&w| !self.is_pin_helper(w) && self.survives_flip(w))
             .collect()
@@ -908,25 +921,24 @@ pub fn synthetic_satisfiable(m: usize, k_log: usize, seed: u64) -> (FieldR1cs, V
         }
     };
 
-    let gen_matrix = |rng: &mut dyn FnMut() -> u64,
-                          coeff: &mut dyn FnMut() -> F128|
-     -> SparseFieldMatrix {
-        SparseFieldMatrix::from_rows(
-            k,
-            (0..k)
-                .map(|r| {
-                    if r == 0 {
-                        // Constant-wire row: z_0 · z_0 = z_0.
-                        return vec![(0u32, F128::ONE)];
-                    }
-                    let n_nonzero = 1 + (rng() % 4) as usize;
-                    (0..n_nonzero)
-                        .map(|_| ((rng() as usize % r) as u32, coeff()))
-                        .collect()
-                })
-                .collect(),
-        )
-    };
+    let gen_matrix =
+        |rng: &mut dyn FnMut() -> u64, coeff: &mut dyn FnMut() -> F128| -> SparseFieldMatrix {
+            SparseFieldMatrix::from_rows(
+                k,
+                (0..k)
+                    .map(|r| {
+                        if r == 0 {
+                            // Constant-wire row: z_0 · z_0 = z_0.
+                            return vec![(0u32, F128::ONE)];
+                        }
+                        let n_nonzero = 1 + (rng() % 4) as usize;
+                        (0..n_nonzero)
+                            .map(|_| ((rng() as usize % r) as u32, coeff()))
+                            .collect()
+                    })
+                    .collect(),
+            )
+        };
     let mut rng_a = {
         let mut s = seed ^ 0xA;
         move || {
@@ -1053,6 +1065,24 @@ mod tests {
         assert!(!r1cs.satisfies(&z), "non-idempotent element accepted");
     }
 
+    #[test]
+    fn csc_cache_can_be_released_and_rebuilt() {
+        let (mut r1cs, _) = random_satisfiable(10, 6, 0xC5C);
+        assert!(!r1cs.release_csc_cache(), "fresh instance has no CSC");
+        let first_shape = {
+            let csc = r1cs.csc_lincheck_circuit();
+            (csc.n_cols, csc.a_rows.len(), csc.b_rows.len())
+        };
+        assert!(r1cs.release_csc_cache(), "materialized CSC was released");
+        assert!(!r1cs.release_csc_cache(), "release is idempotent");
+        let rebuilt = r1cs.csc_lincheck_circuit();
+        assert_eq!(
+            (rebuilt.n_cols, rebuilt.a_rows.len(), rebuilt.b_rows.len()),
+            first_shape,
+            "rebuilt CSC shape drifted",
+        );
+    }
+
     /// FieldCscCircuit::fold_alpha_batched matches the direct definition
     /// `comb[c] = α·Σ_r A_0[r,c]·eq[r] + Σ_r B_0[r,c]·eq[r]`.
     #[test]
@@ -1143,11 +1173,40 @@ mod tests {
         // Seeding the already-computed digest again is a no-op.
         fresh.seed_statement_digest(true_digest);
 
-        // A seeded digest wins even if it is not the content hash — the
-        // documented trust model: honest verifiers bind their own value.
+        // A seeded digest wins even if it is not the content hash. Callers at
+        // a matrix trust boundary must use structural_statement_digest().
         let mislabeled = r1cs.clone();
         mislabeled.seed_statement_digest([0xAB; 32]);
         assert_eq!(mislabeled.statement_digest(), [0xAB; 32]);
+        assert_eq!(
+            mislabeled.structural_statement_digest(),
+            true_digest,
+            "cache-independent digest must recover the matrix's real identity",
+        );
+    }
+
+    #[test]
+    fn structural_statement_digest_rejects_seeded_content_substitution() {
+        let (honest, _) = random_satisfiable(8, 4, 0x51A7_E001);
+        let expected = honest.structural_statement_digest();
+        let mut substituted = honest.clone();
+        let entry = substituted.a_0.row_offsets[0];
+        let old = substituted.a_0.value_table[substituted.a_0.value_indices[entry] as usize];
+        let replacement = substituted.a_0.value_table.len() as u32;
+        substituted.a_0.value_table.push(old + F128::ONE);
+        substituted.a_0.value_indices[entry] = replacement;
+        substituted.seed_statement_digest(expected);
+
+        assert_eq!(
+            substituted.statement_digest(),
+            expected,
+            "the ordinary class cache is intentionally seedable",
+        );
+        assert_ne!(
+            substituted.structural_statement_digest(),
+            expected,
+            "a trust-boundary digest must ignore the seeded cache",
+        );
     }
 
     #[test]

@@ -21,6 +21,7 @@
 //! Filling slots to trigger expansion halves the miner reward.
 //! The natural economic consequence of network growth is decreasing inflation.
 
+use crate::consensus::fees::claimable_fee_for_tx_body;
 use crate::consensus::params::{
     BASE_REWARD_MICRONOID, FLOOR_REWARD_MICRONOID, LOG_SLOTS_GENESIS, MICRONOID_PER_NOID,
 };
@@ -48,10 +49,12 @@ pub fn block_reward(log_slots: u32) -> u64 {
         .max(FLOOR_REWARD_MICRONOID)
 }
 
-/// Sum all transaction fees (non-coinbase) in μNOID.
+/// Sum all gross transaction fees (non-coinbase) in μNOID.
 ///
 /// A block can contain 255 `u64` fees, so aggregation uses `u128`; consensus
-/// predicates never silently saturate a monetary total.
+/// predicates never silently saturate a monetary total. This is accounting
+/// data, not a coinbase ceiling: deterministic state-growth burn must first be
+/// removed via [`claimable_fee_for_tx_body`].
 pub fn total_fees(txs: &[TxBody]) -> u128 {
     txs.iter()
         .filter(|tx| !tx.is_coinbase)
@@ -61,19 +64,39 @@ pub fn total_fees(txs: &[TxBody]) -> u128 {
 
 /// Maximum value the coinbase output is permitted to carry (μNOID).
 ///
-/// `coinbase_value ≤ block_reward(log_slots) + total_fees(non_coinbase_txs)`
-pub fn max_coinbase_value(log_slots: u32, non_coinbase_txs: &[TxBody]) -> u128 {
-    u128::from(block_reward(log_slots)) + total_fees(non_coinbase_txs)
+/// Only miner-claimable fees are included. The deterministic state-growth
+/// component is burned and can never be recovered through coinbase.
+pub fn max_coinbase_value(
+    child_log_slots: u32,
+    parent_active_slot_count: u64,
+    parent_log_slots: u32,
+    non_coinbase_txs: &[TxBody],
+) -> u128 {
+    let claimable_fee_sum: u128 = non_coinbase_txs
+        .iter()
+        .filter(|tx| !tx.is_coinbase)
+        .map(|tx| {
+            u128::from(claimable_fee_for_tx_body(
+                tx,
+                parent_active_slot_count,
+                parent_log_slots,
+            ))
+        })
+        .sum();
+    max_coinbase_value_from_claimable_fee_sum(child_log_slots, claimable_fee_sum)
 }
 
-/// Same as `max_coinbase_value` but accepts a pre-computed fee sum.
+/// Same as [`max_coinbase_value`] but accepts an already checked sum of
+/// miner-claimable fees (paid fee minus deterministic burn).
 ///
 /// Used by `validate_block_consensus` to avoid cloning all non-coinbase
-/// `TxBody` objects just to sum their fees. Saves ~256 × (Vec allocs +
-/// TxInput/TxOutput copies) per block at 256 txs.
+/// bodies just to repeat fee accounting.
 #[inline]
-pub fn max_coinbase_value_from_fee_sum(log_slots: u32, fee_sum: u128) -> u128 {
-    u128::from(block_reward(log_slots)) + fee_sum
+pub fn max_coinbase_value_from_claimable_fee_sum(
+    child_log_slots: u32,
+    claimable_fee_sum: u128,
+) -> u128 {
+    u128::from(block_reward(child_log_slots)) + claimable_fee_sum
 }
 
 /// Format a μNOID amount as a human-readable string (not consensus-critical).
@@ -87,7 +110,7 @@ pub fn format_noid(micronoid: u64) -> String {
 mod tests {
     use super::*;
     use noid_poseidon2b::primitives::Address;
-    use noid_tx::{TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS};
+    use noid_tx::{output_bitmap_bit, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS};
 
     fn fee_body(fee: u64, coinbase: bool) -> TxBody {
         TxBody {
@@ -123,6 +146,21 @@ mod tests {
         assert_eq!(
             total_fees(&[fee_body(u64::MAX, false), fee_body(1, false)]),
             u128::from(u64::MAX) + 1
+        );
+    }
+
+    #[test]
+    fn coinbase_ceiling_excludes_state_growth_burn() {
+        let mut tx = fee_body(9_000, false);
+        tx.inputs[0].slot_index = 1;
+        tx.outputs[0].slot_index = 2;
+        tx.outputs[1].slot_index = 3;
+        tx.validity_bitmap = 1 | output_bitmap_bit(0) | output_bitmap_bit(1);
+        let ceiling = max_coinbase_value(LOG_SLOTS_GENESIS, 0, LOG_SLOTS_GENESIS, &[tx]);
+        assert_eq!(ceiling, u128::from(block_reward(LOG_SLOTS_GENESIS) + 6_500));
+        assert_eq!(
+            ceiling,
+            max_coinbase_value_from_claimable_fee_sum(LOG_SLOTS_GENESIS, 6_500)
         );
     }
 }

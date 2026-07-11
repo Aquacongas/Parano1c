@@ -90,10 +90,6 @@ pub const TAG_EXSTSLT: DomainTag = DomainTag::new(b"EXSTSLT_");
 pub const TAG_EXSTNOD: DomainTag = DomainTag::new(b"EXSTNOD_");
 /// Accepted-block claim field transcript for recursive chain accumulation.
 pub const TAG_ACCBLK: DomainTag = DomainTag::new(b"ACCBLK__");
-/// Header projection item for public history anchoring.
-pub const TAG_HDRPROJ: DomainTag = DomainTag::new(b"HDRPROJ_");
-/// Rolling header-chain anchor over canonical header projections.
-pub const TAG_HDRANCH: DomainTag = DomainTag::new(b"HDRANCH_");
 /// Accepted history/state transition digest for O(1) state sync.
 pub const TAG_HISTTRN: DomainTag = DomainTag::new(b"HISTTRN_");
 /// Accepted history/state claim digest for O(1) state sync.
@@ -135,8 +131,6 @@ mod tests {
             TAG_EXSTSLT,
             TAG_EXSTNOD,
             TAG_ACCBLK,
-            TAG_HDRPROJ,
-            TAG_HDRANCH,
             TAG_HISTTRN,
             TAG_HISTCLM,
             TAG_HISTPRF,

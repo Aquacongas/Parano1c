@@ -57,7 +57,7 @@ pub fn decode_header(bytes: &[u8]) -> Option<BlockHeader> {
 // HeaderChainAnchor
 // ---------------------------------------------------------------------------
 
-pub const ENCODED_HEADER_CHAIN_ANCHOR_BYTES: usize = 220;
+pub const ENCODED_HEADER_CHAIN_ANCHOR_BYTES: usize = 188;
 
 pub fn encode_header_chain_anchor(
     anchor: &HeaderChainAnchor,
@@ -82,8 +82,7 @@ pub fn encode_header_chain_anchor(
     pos += 8;
     out[pos..pos + 32].copy_from_slice(&anchor.cumulative_chainwork);
     pos += 32;
-    out[pos..pos + 32].copy_from_slice(&anchor.projection_root);
-    debug_assert_eq!(pos + 32, ENCODED_HEADER_CHAIN_ANCHOR_BYTES);
+    debug_assert_eq!(pos, ENCODED_HEADER_CHAIN_ANCHOR_BYTES);
     out
 }
 
@@ -110,7 +109,7 @@ pub fn decode_header_chain_anchor(bytes: &[u8]) -> Option<HeaderChainAnchor> {
     pos += 8;
     let cumulative_chainwork = bytes[pos..pos + 32].try_into().ok()?;
     pos += 32;
-    let projection_root = bytes[pos..pos + 32].try_into().ok()?;
+    debug_assert_eq!(pos, ENCODED_HEADER_CHAIN_ANCHOR_BYTES);
     Some(HeaderChainAnchor {
         height,
         block_id,
@@ -121,7 +120,6 @@ pub fn decode_header_chain_anchor(bytes: &[u8]) -> Option<HeaderChainAnchor> {
         active_slot_count,
         alloc_counter,
         cumulative_chainwork,
-        projection_root,
     })
 }
 
@@ -506,6 +504,29 @@ mod tests {
         assert_eq!(bytes.len(), BLOCK_HEADER_WIRE_SIZE);
         let h2 = decode_header(&bytes).expect("decode");
         assert_eq!(h, h2);
+    }
+
+    #[test]
+    fn header_chain_anchor_roundtrip_uses_only_direct_tip_fields() {
+        let anchor = HeaderChainAnchor {
+            height: 42,
+            block_id: [1u8; 32],
+            state_root: [2u8; 32],
+            tx_root: [3u8; 32],
+            miner_address: noid_poseidon2b::primitives::Address([4u8; 32]),
+            log_slots: 24,
+            active_slot_count: 100,
+            alloc_counter: 200,
+            cumulative_chainwork: [5u8; 32],
+        };
+        let bytes = encode_header_chain_anchor(&anchor);
+        assert_eq!(bytes.len(), 188);
+        assert_eq!(decode_header_chain_anchor(&bytes), Some(anchor));
+
+        let mut obsolete_rolling_layout = bytes.to_vec();
+        obsolete_rolling_layout.extend_from_slice(&[0xAA; 32]);
+        assert_eq!(obsolete_rolling_layout.len(), 220);
+        assert_eq!(decode_header_chain_anchor(&obsolete_rolling_layout), None);
     }
 
     #[test]

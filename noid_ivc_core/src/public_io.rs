@@ -31,6 +31,19 @@ use crate::field::F128;
 use crate::lincheck::build_eq_table;
 use crate::pcs::QuirkyDirectClaim;
 
+/// Domain separator for the verification-key/class identity of a post-commit
+/// auxiliary protocol.  Context-based APIs absorb this after public IO and
+/// before giving the callback access to the shared challenger.
+pub const POST_COMMIT_CLASS_BINDING_LABEL: &[u8] = b"history-post-commit-class-v1";
+
+/// Bind the exact auxiliary proof class at the post-commit transcript
+/// boundary.  Prover, full verifier, deferred verifier, and recursive trace
+/// twins must call this at the same position.
+pub fn bind_post_commit_class<Ch: Challenger>(challenger: &mut Ch, class_digest: &[u8; 32]) {
+    challenger.observe_label(POST_COMMIT_CLASS_BINDING_LABEL);
+    challenger.observe_bytes(class_digest);
+}
+
 /// A dyadic block of the committed element space: element indices
 /// `[index · 2^log2_len, (index + 1) · 2^log2_len)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,7 +63,9 @@ impl WitnessSlice {
 
     /// Check the slice fits a `2^total_vars`-element space.
     pub fn fits(&self, total_vars: usize) -> bool {
-        self.log2_len <= total_vars && self.index < (1usize << (total_vars - self.log2_len))
+        total_vars < usize::BITS as usize
+            && self.log2_len <= total_vars
+            && self.index < (1usize << (total_vars - self.log2_len))
     }
 
     /// The boolean coordinates of the slice-selecting high variables,
@@ -117,7 +132,10 @@ impl PublicIoSpec {
     /// The spec parameters as transcript lanes (a verification-key constant
     /// absorbed by both sides so distinct specs never share a transcript).
     pub fn transcript_lanes(&self) -> Vec<F128> {
-        let lane = |v: usize| F128 { lo: v as u64, hi: 0 };
+        let lane = |v: usize| F128 {
+            lo: v as u64,
+            hi: 0,
+        };
         let mut lanes = vec![
             lane(self.io_slice.log2_len),
             lane(self.io_slice.index),
@@ -220,6 +238,16 @@ mod tests {
     }
 
     #[test]
+    fn slice_fit_rejects_unrepresentable_total_log_without_panicking() {
+        let slice = WitnessSlice {
+            log2_len: 0,
+            index: 0,
+        };
+        assert!(!slice.fits(usize::BITS as usize));
+        assert!(!slice.fits(usize::MAX));
+    }
+
+    #[test]
     fn binding_claim_value_matches_direct_mle() {
         let spec = PublicIoSpec {
             io_slice: WitnessSlice {
@@ -248,10 +276,7 @@ mod tests {
         }
         assert_eq!(claims[0].value, expected);
         // Prefix selects block 3 of 8: 11b LSB-first.
-        assert_eq!(
-            claims[0].x_rest[2..],
-            [F128::ONE, F128::ONE, F128::ZERO]
-        );
+        assert_eq!(claims[0].x_rest[2..], [F128::ONE, F128::ONE, F128::ZERO]);
     }
 
     #[test]

@@ -8,8 +8,8 @@ use noid_ivc_core::challenger::{Challenger, FsLaneChallenger};
 use noid_ivc_core::field::F128;
 use noid_ivc_core::field_r1cs::{FieldR1cs, SparseFieldMatrix};
 use noid_ivc_core::matrix_claim::{
-    fresh_claim_value, prove_matrix_claim_fold, stacked_matrix_mle_eval,
-    verify_matrix_claim_fold, MatrixAccClaim,
+    MatrixAccClaim, fresh_claim_value, prove_matrix_claim_fold, stacked_matrix_mle_eval,
+    verify_matrix_claim_fold,
 };
 use noid_ivc_core::pcs::{self, PcsParams};
 use noid_ivc_core::proof::FieldShape;
@@ -42,10 +42,7 @@ fn free_instance(m: usize, k_log: usize, seed: u64) -> (FieldR1cs, Vec<F128>) {
             })
             .collect(),
     );
-    let b_0 = SparseFieldMatrix::from_rows(
-        k,
-        (0..k).map(|_| vec![(0u32, F128::ONE)]).collect(),
-    );
+    let b_0 = SparseFieldMatrix::from_rows(k, (0..k).map(|_| vec![(0u32, F128::ONE)]).collect());
     let r1cs = FieldR1cs {
         m,
         k_log,
@@ -106,10 +103,7 @@ fn deferred_matrix_pipeline_on_real_proofs() {
     let k_log = 7;
     let (r1cs, mut z) = free_instance(m, k_log, 0xDEF1);
     let (spec, io_slice) = tiny_spec(k_log);
-    let io: Vec<F128> = vec![
-        F128 { lo: 0xA1, hi: 0 },
-        F128 { lo: 0xB2, hi: 0 },
-    ];
+    let io: Vec<F128> = vec![F128 { lo: 0xA1, hi: 0 }, F128 { lo: 0xB2, hi: 0 }];
     z[io_slice.start()] = io[0];
     z[io_slice.start() + 1] = io[1];
 
@@ -127,16 +121,9 @@ fn deferred_matrix_pipeline_on_real_proofs() {
     let shape = FieldShape::of(&r1cs);
     let digest = r1cs.statement_digest();
     let mut ch_v2 = FsLaneChallenger::new(b"deferred-e2e");
-    let (_claim, fresh) = verify_field_deferred_matrix(
-        &shape,
-        &digest,
-        &commitment,
-        &proof,
-        &spec,
-        &io,
-        &mut ch_v2,
-    )
-    .expect("deferred verify accepts");
+    let (_claim, fresh) =
+        verify_field_deferred_matrix(&shape, &digest, &commitment, &proof, &spec, &io, &mut ch_v2)
+            .expect("deferred verify accepts");
     assert_eq!(
         ch_v1.sample_f128(),
         ch_v2.sample_f128(),

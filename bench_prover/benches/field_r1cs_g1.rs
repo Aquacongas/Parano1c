@@ -29,7 +29,7 @@ use bench_prover::{fmt_bytes, fmt_ms, poseidon_chain_field_instance};
 use noid_ivc_prover::challenger::FsLaneChallenger;
 use noid_ivc_prover::field::F128;
 use noid_ivc_prover::field_prover::prove_field;
-use noid_ivc_prover::field_r1cs::{FieldR1cs, synthetic_satisfiable};
+use noid_ivc_prover::field_r1cs::{synthetic_satisfiable, FieldR1cs};
 use noid_ivc_prover::pcs::{self, PcsParams};
 use noid_ivc_prover::verifier::verify_field;
 
@@ -155,7 +155,14 @@ fn main() {
         let (r1cs, z) = synthetic_satisfiable(m, 16, 0xC0FFEE ^ m as u64);
         let gen_time = t.elapsed();
         assert!(r1cs.satisfies(&z));
-        run_case("synthetic (comparison, not the gate)", &r1cs, &z, gen_time, 2, 5);
+        run_case(
+            "synthetic (comparison, not the gate)",
+            &r1cs,
+            &z,
+            gen_time,
+            2,
+            5,
+        );
     }
 
     let g1 = g1_result.expect("builder-shaped 2^19 gate case ran");

@@ -291,14 +291,20 @@ impl std::fmt::Display for AcceptedBlockCertificateBatchError {
         match self {
             Self::EmptyBatch => write!(f, "empty accepted-block certificate batch"),
             Self::TooManyStatements { actual } => {
-                write!(f, "too many accepted-block certificate statements: {actual}")
+                write!(
+                    f,
+                    "too many accepted-block certificate statements: {actual}"
+                )
             }
             Self::ClaimCountMismatch { statements, claims } => write!(
                 f,
                 "accepted-block certificate statement/claim count mismatch: {statements} statements, {claims} claims"
             ),
             Self::ClaimProjectionMismatch { index } => {
-                write!(f, "accepted-block certificate claim projection mismatch at {index}")
+                write!(
+                    f,
+                    "accepted-block certificate claim projection mismatch at {index}"
+                )
             }
         }
     }
