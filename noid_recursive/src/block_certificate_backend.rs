@@ -648,12 +648,10 @@ pub fn verify_accepted_block_batch_components(
                                                 structural, proof,
                                             )
                                             .and_then(|()| {
-                                                if legacy.state_paths.is_empty() {
-                                                    if proof.state_paths.is_empty() {
-                                                        Ok(())
-                                                    } else {
-                                                        Err(ExactStateKillShotError::NonCanonicalLegacyPathProof)
-                                                    }
+                                                if proof.state_paths.is_empty() {
+                                                    Ok(())
+                                                } else if legacy.state_paths.is_empty() {
+                                                    Err(ExactStateKillShotError::NonCanonicalLegacyPathProof)
                                                 } else {
                                                     verify_exact_state_killshot(legacy, proof)
                                                 }
