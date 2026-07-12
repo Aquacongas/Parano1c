@@ -56,12 +56,12 @@ pub const GOSSIP_MAX_TRANSMIT_BYTES: usize = 2 * 1024 * 1024;
 /// Inline block gossip threshold for block + proof + sidecar.
 pub const INLINE_BLOCK_GOSSIP_THRESHOLD: usize = 1024 * 1024;
 
-/// Maximum history proof bytes accepted over RPC/P2P.
+/// Maximum selected-history terminal proof bytes accepted over RPC/P2P.
 ///
-/// This must exceed the current checkpoint IVC chunk core wire padding
-/// (`100 KiB`) plus recursive envelope overhead. Tighten after the final O(1)
-/// proof format is measured.
-pub const MAX_HISTORY_PROOF_BYTES: usize = 256 * 1024;
+/// The production four-slot Link envelope currently measures 580,495 bytes.
+/// One MiB leaves bounded codec framing margin without coupling the wire cap to
+/// an exact serialization snapshot. This remains constant in chain height.
+pub const MAX_HISTORY_PROOF_BYTES: usize = 1024 * 1024;
 
 /// Maximum encoded block header bytes accepted over P2P/RPC paths.
 pub const MAX_HEADER_BYTES: usize = 512;
@@ -154,6 +154,7 @@ mod tests {
         assert_eq!(MAX_AUTHORIZATION_BYTES, noid_tx::MAX_TX_AUTHORIZATION_BYTES);
         assert_eq!(MAX_TX_INTENT_BYTES_GLOBAL, noid_tx::MAX_TX_INTENT_BYTES);
         assert_eq!(MAX_BLOCK_BYTES, 82_905);
+        assert!(MAX_HISTORY_PROOF_BYTES > 580_495);
     }
 
     #[test]
