@@ -339,11 +339,7 @@ impl Mempool {
     /// Store canonical raw TxIntent bytes for mempool-sync serving and retain
     /// only the authorization suffix length. The proof itself is borrowed from
     /// this one immutable allocation by miners and the block fast path.
-    pub fn set_intent_bytes(
-        &mut self,
-        hash: &TxBodyHash,
-        bytes: impl Into<Arc<[u8]>>,
-    ) {
+    pub fn set_intent_bytes(&mut self, hash: &TxBodyHash, bytes: impl Into<Arc<[u8]>>) {
         if let Some(entry) = self.entries.get_mut(hash) {
             let bytes = bytes.into();
             entry.cached_authorization_len = bytes

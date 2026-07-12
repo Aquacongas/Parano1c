@@ -1440,16 +1440,14 @@ impl ParanoidApiServer for RpcHandler {
         let txs: Vec<MempoolTxInfo> = snapshot
             .entries
             .iter()
-            .map(|e| {
-                MempoolTxInfo {
-                    tx_hash: hex::encode(e.tx_hash.0),
-                    fee_micronoid: e.fee_micronoid,
-                    fee_rate: e.fee_rate,
-                    n_inputs: usize::from(e.n_inputs),
-                    n_outputs: usize::from(e.n_outputs),
-                    admitted_height: e.admitted_height,
-                    has_authorization: e.has_authorization,
-                }
+            .map(|e| MempoolTxInfo {
+                tx_hash: hex::encode(e.tx_hash.0),
+                fee_micronoid: e.fee_micronoid,
+                fee_rate: e.fee_rate,
+                n_inputs: usize::from(e.n_inputs),
+                n_outputs: usize::from(e.n_outputs),
+                admitted_height: e.admitted_height,
+                has_authorization: e.has_authorization,
             })
             .collect();
 

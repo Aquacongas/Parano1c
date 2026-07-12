@@ -384,12 +384,7 @@ fn reconstruct_historical_exact_state_inner(
     }
 
     validate_required_segments(required_segment_ids, target_header.log_slots)?;
-    let grouped = collect_grouped_undo(
-        &snapshot,
-        target_height,
-        source_tip,
-        tip_effective_log,
-    )?;
+    let grouped = collect_grouped_undo(&snapshot, target_height, source_tip, tip_effective_log)?;
     after_undo_collection(store);
 
     // Non-required historical payloads are processed first and immediately
@@ -1387,7 +1382,10 @@ mod tests {
         assert_eq!(snapshot_view.source_tip(), source_tip);
         assert_eq!(snapshot_view.target_header(), &target);
         assert_eq!(snapshot_view.exact_state().state.slot(1), value0);
-        assert_eq!(snapshot_view.exact_state().cached_state_root(), target.state_root);
+        assert_eq!(
+            snapshot_view.exact_state().cached_state_root(),
+            target.state_root
+        );
         assert_eq!(
             context.store.get_chain_tip().unwrap().unwrap().0,
             tip.height + 1,

@@ -332,8 +332,7 @@ impl AsyncMempool {
         // broadcast subscriber. The miner's cached authorization is a borrowed
         // suffix of this allocation rather than a second retained proof copy.
         let intent_bytes: Arc<[u8]> = intent_bytes.into();
-        st.pool
-            .set_intent_bytes(&hash, Arc::clone(&intent_bytes));
+        st.pool.set_intent_bytes(&hash, Arc::clone(&intent_bytes));
         if !is_coinbase {
             st.floor.record(fee);
         }
@@ -1017,7 +1016,10 @@ mod tests {
 
         let single = pool.get_entry_metadata(&txid).await.unwrap();
         assert_eq!(single, snapshot.entries[0]);
-        assert_eq!(pool.state.lock().await.pool.total_intent_bytes(), 2 * 1024 * 1024);
+        assert_eq!(
+            pool.state.lock().await.pool.total_intent_bytes(),
+            2 * 1024 * 1024
+        );
     }
 
     #[test]

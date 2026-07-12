@@ -345,7 +345,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn load_rejects_public_permissions_and_symlinks() {
-        use std::os::unix::fs::{symlink, PermissionsExt};
+        use std::os::unix::fs::{PermissionsExt, symlink};
 
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("wallet.key");

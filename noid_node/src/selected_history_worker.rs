@@ -8,10 +8,10 @@
 //! Ordinary validating nodes never construct this worker.  One invocation
 //! claims at most one durable MDBX job and retains no in-memory work queue.
 
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use noid_block::{reconstruct_selected_recursive_block_artifacts, FullAcceptedBlockBatchItem};
+use noid_block::{FullAcceptedBlockBatchItem, reconstruct_selected_recursive_block_artifacts};
 use noid_chain::block::Block;
 use noid_chain::consensus::header::asert_anchor_height;
 use noid_chain::consensus::params::{
@@ -22,18 +22,17 @@ use noid_chain::storage::{
     CanonicalTipBinding, MdbxStore, RecursiveProofJob, RecursiveProofJobState,
     RecursiveProofJobTier,
 };
-use noid_chain::{block_id, reconstruct_historical_exact_state, BlockHeader, ChainState};
+use noid_chain::{BlockHeader, ChainState, block_id, reconstruct_historical_exact_state};
 use noid_miner::{
-    begin_selected_history_proof_session, selected_recursive_tier,
     LoadedSelectedRecursiveClassRegistry, LocalSelectedRecursiveClassRegistryStore,
     LocalSelectedRecursiveMatrixSource, SelectedHistoryProofSession, SelectedRecursiveBlockJob,
     SelectedRecursiveLinkJob, SelectedRecursiveLinkPredecessor, SelectedRecursiveProverError,
-    SelectedRecursiveTier,
+    SelectedRecursiveTier, begin_selected_history_proof_session, selected_recursive_tier,
 };
 use noid_recursive::acceptance::split_link::tip_block_accumulator_split;
 use noid_recursive::{
-    decode_selected_history_terminal_package, genesis_accumulator, ChainAccumulator,
-    RecursiveConsensusState, SelectedHistoryTerminalPackage,
+    ChainAccumulator, RecursiveConsensusState, SelectedHistoryTerminalPackage,
+    decode_selected_history_terminal_package, genesis_accumulator,
 };
 
 /// Small identity copied out of a durable claim for logging/backoff only.
@@ -953,7 +952,7 @@ mod tests {
     use super::*;
     use noid_chain::consensus::genesis::genesis_header;
     use noid_poseidon2b::primitives::Address;
-    use noid_tx::{output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, TX_INPUTS};
+    use noid_tx::{TX_INPUTS, Transaction, TxBody, TxInput, TxOutput, output_bitmap_bit};
     use std::sync::atomic::AtomicUsize;
 
     fn transaction(

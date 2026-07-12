@@ -3004,8 +3004,8 @@ mod tests {
     use crate::proof::FieldShape;
     use std::io::{Cursor, Read, Seek, SeekFrom};
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     };
 
     struct CountingCursor {
@@ -3101,8 +3101,8 @@ mod tests {
     #[test]
     fn seekable_artifact_evaluations_match_in_memory_without_csr_decode() {
         use crate::matrix_claim::{
-            fresh_claim_value, stacked_matrix_mle_eval, FreshLincheckClaim, MatrixAccClaim,
-            MatrixClaimEvaluator,
+            FreshLincheckClaim, MatrixAccClaim, MatrixClaimEvaluator, fresh_claim_value,
+            stacked_matrix_mle_eval,
         };
 
         let (r1cs, shape, digest, bytes) = artifact_fixture(0x51EA_4AB1);
@@ -3183,8 +3183,8 @@ mod tests {
     #[test]
     fn seekable_artifact_matches_across_digest_spans_and_entry_chunks() {
         use crate::matrix_claim::{
-            fresh_claim_value, stacked_matrix_mle_eval, FreshLincheckClaim, MatrixAccClaim,
-            MatrixClaimEvaluator,
+            FreshLincheckClaim, MatrixAccClaim, MatrixClaimEvaluator, fresh_claim_value,
+            stacked_matrix_mle_eval,
         };
 
         let k_log = 12usize;
@@ -3309,13 +3309,15 @@ mod tests {
             Err(FieldR1csArtifactError::BackingLengthMismatch { .. })
         ));
         let truncated = &bytes[..bytes.len() - 1];
-        assert!(SeekableFieldR1csArtifact::open(
-            Cursor::new(truncated),
-            shape,
-            digest,
-            bytes.len() as u64,
-        )
-        .is_err());
+        assert!(
+            SeekableFieldR1csArtifact::open(
+                Cursor::new(truncated),
+                shape,
+                digest,
+                bytes.len() as u64,
+            )
+            .is_err()
+        );
 
         let mut view = SeekableFieldR1csArtifact::open(
             Cursor::new(bytes.clone()),
@@ -3777,7 +3779,7 @@ mod tests {
     #[test]
     fn row_and_csc_lincheck_transcripts_and_acceptance_match() {
         use crate::challenger::FsChallenger;
-        use crate::lincheck::{prove_field, verify, QuirkyPoint};
+        use crate::lincheck::{QuirkyPoint, prove_field, verify};
 
         let (r1cs, z) = random_satisfiable(10, 7, 0x7E57_C5C0);
         let mut rng = Rng::new(0x7A4A_5C71);

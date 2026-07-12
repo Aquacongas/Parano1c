@@ -908,7 +908,7 @@ mod tests {
 
     #[test]
     fn seekable_view_matches_in_memory_claim_and_holds_admission() {
-        use noid_ivc_core::matrix_claim::{MatrixAccClaim, stacked_matrix_mle_eval};
+        use noid_ivc_core::matrix_claim::{stacked_matrix_mle_eval, MatrixAccClaim};
 
         let directory = tempdir().unwrap();
         let source = isolated_source(directory.path());
