@@ -192,10 +192,7 @@ impl MdbxHistoricalReadSnapshot<'_> {
         Ok(raw.and_then(|raw| decode_header(&raw)))
     }
 
-    pub(super) fn get_undo_log(
-        &self,
-        height: u64,
-    ) -> Result<Option<BlockUndoLog>, StoreError> {
+    pub(super) fn get_undo_log(&self, height: u64) -> Result<Option<BlockUndoLog>, StoreError> {
         let table = self.txn.open_table(Some(T_UNDO_LOGS))?;
         let raw: Option<Vec<u8>> = self.txn.get(&table, &u64_key(height))?;
         Ok(raw.and_then(|raw| decode_undo_log(&raw)))
@@ -281,7 +278,9 @@ const RECURSIVE_PROOF_RESULT_MAGIC: [u8; 4] = *b"RPR1";
 const RECURSIVE_PROOF_RESULT_HEADER_BYTES: usize = 40;
 const SELECTED_HISTORY_COVERAGE_MAGIC: [u8; 4] = *b"SHC1";
 const SELECTED_HISTORY_COVERAGE_ENCODED_BYTES: usize = 44;
-const SELECTED_HISTORY_TERMINAL_PREFIX_BYTES: usize = 2 + 8 + 32;
+// version + height + hash + canonical class slot + canonical tier.
+// The opaque recursive envelope follows this fixed metadata.
+const SELECTED_HISTORY_TERMINAL_PREFIX_BYTES: usize = 2 + 8 + 32 + 1 + 2;
 const SELECTED_HISTORY_TERMINAL_VERSION: u16 = 1;
 
 /// Hard storage cap for one opaque selected recursive proof result.
@@ -430,8 +429,8 @@ fn validate_claimed_recursive_proof_input_lengths(
     lengths: ClaimedRecursiveProofInputLengths,
 ) -> Result<(), StoreError> {
     use crate::consensus::wire_limits::{
-        MAX_BLOCK_AUTH_SIDECAR_BYTES, MAX_BLOCK_BYTES, MAX_BLOCK_PROOF_BYTES,
-        proof_sidecar_combined_len_ok,
+        proof_sidecar_combined_len_ok, MAX_BLOCK_AUTH_SIDECAR_BYTES, MAX_BLOCK_BYTES,
+        MAX_BLOCK_PROOF_BYTES,
     };
 
     let block_len = lengths.block.ok_or(StoreError::Decode(
@@ -489,8 +488,8 @@ fn inspect_recursive_proof_source_block(
     expected_tier: RecursiveProofJobTier,
 ) -> Result<usize, StoreError> {
     use crate::block::{
-        BLOCK_WIRE_FIXED_OVERHEAD, BLOCK_WIRE_HEADER_OFFSET, BLOCK_WIRE_MARKER,
-        canonical_block_wire_len,
+        canonical_block_wire_len, BLOCK_WIRE_FIXED_OVERHEAD, BLOCK_WIRE_HEADER_OFFSET,
+        BLOCK_WIRE_MARKER,
     };
     use crate::wire::BLOCK_HEADER_WIRE_SIZE;
 
@@ -656,10 +655,44 @@ fn selected_history_terminal_prefix_matches(
     height: u64,
     block_hash: [u8; 32],
 ) -> bool {
-    bytes.len() >= SELECTED_HISTORY_TERMINAL_PREFIX_BYTES
-        && u16::from_le_bytes(bytes[..2].try_into().unwrap()) == SELECTED_HISTORY_TERMINAL_VERSION
-        && u64::from_le_bytes(bytes[2..10].try_into().unwrap()) == height
-        && bytes[10..42] == block_hash
+    selected_history_terminal_metadata(bytes).is_some_and(|(actual_height, actual_hash, _)| {
+        actual_height == height && actual_hash == block_hash
+    })
+}
+
+fn selected_history_terminal_matches_job(
+    bytes: &[u8],
+    height: u64,
+    block_hash: [u8; 32],
+    tier: RecursiveProofJobTier,
+) -> bool {
+    selected_history_terminal_metadata(bytes).is_some_and(
+        |(actual_height, actual_hash, actual_tier)| {
+            actual_height == height && actual_hash == block_hash && actual_tier == tier
+        },
+    )
+}
+
+fn selected_history_terminal_metadata(
+    bytes: &[u8],
+) -> Option<(u64, [u8; 32], RecursiveProofJobTier)> {
+    if bytes.len() < SELECTED_HISTORY_TERMINAL_PREFIX_BYTES
+        || u16::from_le_bytes(bytes[..2].try_into().ok()?) != SELECTED_HISTORY_TERMINAL_VERSION
+    {
+        return None;
+    }
+    let height = u64::from_le_bytes(bytes[2..10].try_into().ok()?);
+    let block_hash = bytes[10..42].try_into().ok()?;
+    let slot = bytes[42];
+    let tier = u16::from_le_bytes(bytes[43..45].try_into().ok()?);
+    let job_tier = match (slot, tier) {
+        (0, 8) => RecursiveProofJobTier::B8,
+        (1, 32) => RecursiveProofJobTier::B32,
+        (2, 64) => RecursiveProofJobTier::B64,
+        (3, 255) => RecursiveProofJobTier::B255,
+        _ => return None,
+    };
+    Some((height, block_hash, job_tier))
 }
 
 /// Rewind only the compact serving pointer inside an existing canonical reorg
@@ -762,8 +795,9 @@ fn delete_height_keys_at_or_below(
                 let Some((key, _)) = item.take() else {
                     break true;
                 };
-                let height = u64_from_key(&key)
-                    .ok_or(StoreError::Decode("invalid durable height key during pruning"))?;
+                let height = u64_from_key(&key).ok_or(StoreError::Decode(
+                    "invalid durable height key during pruning",
+                ))?;
                 if height <= cutoff {
                     deletions.push(height);
                 }
@@ -1338,9 +1372,17 @@ impl MdbxStore {
             let decoded = decode_recursive_proof_result(parent_height, encoded).ok_or(
                 StoreError::Decode("previous recursive proof result is malformed"),
             )?;
-            if decoded.block_hash != previous_job.block_hash || decoded.block_hash != parent_hash {
+            if decoded.block_hash != previous_job.block_hash
+                || decoded.block_hash != parent_hash
+                || !selected_history_terminal_matches_job(
+                    &decoded.bytes,
+                    parent_height,
+                    parent_hash,
+                    previous_job.tier,
+                )
+            {
                 return Err(StoreError::Decode(
-                    "previous recursive proof result hash is not the current parent",
+                    "previous recursive proof result does not match the current parent job",
                 ));
             }
             Some(decoded)
@@ -1418,6 +1460,13 @@ impl MdbxStore {
                 "recursive proof completion does not match a running job",
             ));
         }
+        if promote_selected_history
+            && !selected_history_terminal_matches_job(result, height, block_hash, job.tier)
+        {
+            return Err(StoreError::Decode(
+                "selected history terminal class does not match its running job",
+            ));
+        }
         let headers = txn.open_table(Some(T_HEADERS))?;
         let header_raw: Option<Vec<u8>> = txn.get(&headers, &u64_key(height))?;
         let header = header_raw
@@ -1479,8 +1528,7 @@ impl MdbxStore {
                         "selected history predecessor is not complete and canonical",
                     ));
                 }
-                let parent_result_length: Option<ObjectLength> =
-                    txn.get(&results, &parent_key)?;
+                let parent_result_length: Option<ObjectLength> = txn.get(&results, &parent_key)?;
                 if !parent_result_length.is_some_and(|ObjectLength(length)| {
                     (RECURSIVE_PROOF_RESULT_HEADER_BYTES
                         ..=RECURSIVE_PROOF_RESULT_HEADER_BYTES
@@ -1701,10 +1749,11 @@ impl MdbxStore {
             StoreError::Decode("selected history terminal wrapper is malformed"),
         )?;
         if result.block_hash != coverage.block_hash
-            || !selected_history_terminal_prefix_matches(
+            || !selected_history_terminal_matches_job(
                 &result.bytes,
                 coverage.height,
                 coverage.block_hash,
+                job.tier,
             )
         {
             return Err(StoreError::Decode(
@@ -1774,7 +1823,7 @@ impl MdbxStore {
             "selected history terminal wrapper is malformed",
         ))?;
         if result.block_hash != block_hash
-            || !selected_history_terminal_prefix_matches(&result.bytes, height, block_hash)
+            || !selected_history_terminal_matches_job(&result.bytes, height, block_hash, job.tier)
         {
             return Err(StoreError::Decode(
                 "selected history terminal payload does not match requested boundary",
@@ -2788,20 +2837,19 @@ impl MdbxStore {
                     || seed.block_hash != tip_hash
                     || seed.terminal_package_bytes.len()
                         > crate::consensus::wire_limits::MAX_HISTORY_PROOF_BYTES
-                    || !selected_history_terminal_prefix_matches(
+                    || !selected_history_terminal_matches_job(
                         seed.terminal_package_bytes,
                         seed.height,
                         seed.block_hash,
+                        seed.tier,
                     )
                 {
                     return Err(StoreError::Decode(
                         "selected history snapshot seed does not match snapshot boundary",
                     ));
                 }
-                let encoded = encode_recursive_proof_result(
-                    seed.block_hash,
-                    seed.terminal_package_bytes,
-                )?;
+                let encoded =
+                    encode_recursive_proof_result(seed.block_hash, seed.terminal_package_bytes)?;
                 Ok((seed, encoded))
             })
             .transpose()?;
@@ -4208,17 +4256,16 @@ impl MdbxStore {
                             const PRUNE_KEY_CHUNK: usize = 64;
                             const PRUNE_SCAN_CHUNK: usize = 4096;
                             let mut cur = txn.cursor(&tbl)?;
-                            let mut item: Option<(Vec<u8>, ())> = if let Some(resume) =
-                                resume_after.as_deref()
-                            {
-                                let found: Option<(Vec<u8>, ())> = cur.set_range(resume)?;
-                                match found {
-                                    Some((key, _)) if key.as_slice() == resume => cur.next()?,
-                                    other => other,
-                                }
-                            } else {
-                                cur.first()?
-                            };
+                            let mut item: Option<(Vec<u8>, ())> =
+                                if let Some(resume) = resume_after.as_deref() {
+                                    let found: Option<(Vec<u8>, ())> = cur.set_range(resume)?;
+                                    match found {
+                                        Some((key, _)) if key.as_slice() == resume => cur.next()?,
+                                        other => other,
+                                    }
+                                } else {
+                                    cur.first()?
+                                };
                             let mut candidates = Vec::with_capacity(PRUNE_KEY_CHUNK);
                             let mut last_scanned = None;
                             let mut scanned = 0usize;
@@ -4274,10 +4321,11 @@ impl MdbxStore {
                                         .and_then(|raw| decode_recursive_proof_result(h, raw))
                                         .is_some_and(|result| {
                                             result.block_hash == job.block_hash
-                                                && selected_history_terminal_prefix_matches(
+                                                && selected_history_terminal_matches_job(
                                                     &result.bytes,
                                                     h,
                                                     job.block_hash,
+                                                    job.tier,
                                                 )
                                         })
                                 } else {
@@ -4400,7 +4448,7 @@ mod tests {
 
     fn recursive_loader_coinbase(tag: u8) -> noid_tx::Transaction {
         use noid_poseidon2b::primitives::Address;
-        use noid_tx::{TX_INPUTS, TX_OUTPUTS, TxBody, TxInput, TxOutput, output_bitmap_bit};
+        use noid_tx::{output_bitmap_bit, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS};
 
         let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
         outputs[0] = TxOutput {
@@ -4421,7 +4469,7 @@ mod tests {
 
     fn recursive_loader_user(tag: u8) -> noid_tx::Transaction {
         use noid_poseidon2b::primitives::Address;
-        use noid_tx::{TX_INPUTS, TX_OUTPUTS, TxBody, TxInput, TxOutput, output_bitmap_bit};
+        use noid_tx::{output_bitmap_bit, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS};
 
         let mut inputs = [TxInput::dummy(); TX_INPUTS];
         inputs[0] = TxInput {
@@ -4563,7 +4611,39 @@ mod tests {
         bytes.extend_from_slice(&SELECTED_HISTORY_TERMINAL_VERSION.to_le_bytes());
         bytes.extend_from_slice(&height.to_le_bytes());
         bytes.extend_from_slice(&block_hash);
+        bytes.push(0);
+        bytes.extend_from_slice(&8u16.to_le_bytes());
         bytes
+    }
+
+    #[test]
+    fn selected_terminal_metadata_binds_canonical_slot_tier_to_job() {
+        let hash = [0xA5; 32];
+        let mut bytes = selected_terminal_bytes(7, hash);
+        assert!(selected_history_terminal_matches_job(
+            &bytes,
+            7,
+            hash,
+            RecursiveProofJobTier::B8,
+        ));
+
+        bytes[42] = 1;
+        bytes[43..45].copy_from_slice(&32u16.to_le_bytes());
+        assert!(selected_history_terminal_matches_job(
+            &bytes,
+            7,
+            hash,
+            RecursiveProofJobTier::B32,
+        ));
+        assert!(!selected_history_terminal_matches_job(
+            &bytes,
+            7,
+            hash,
+            RecursiveProofJobTier::B8,
+        ));
+
+        bytes[42] = 0;
+        assert!(!selected_history_terminal_prefix_matches(&bytes, 7, hash));
     }
 
     fn overwrite_owner_index_record(store: &MdbxStore, key: &[u8], value: &[u8]) {
@@ -4649,20 +4729,16 @@ mod tests {
 
         let mut wrong_claim = fixture.claimed;
         wrong_claim.block_hash[0] ^= 1;
-        assert!(
-            store
-                .load_claimed_recursive_proof_job_inputs(wrong_claim)
-                .is_err()
-        );
+        assert!(store
+            .load_claimed_recursive_proof_job_inputs(wrong_claim)
+            .is_err());
 
         store
             .release_recursive_proof_job(fixture.claimed.height, fixture.claimed.block_hash)
             .unwrap();
-        assert!(
-            store
-                .load_claimed_recursive_proof_job_inputs(fixture.claimed)
-                .is_err()
-        );
+        assert!(store
+            .load_claimed_recursive_proof_job_inputs(fixture.claimed)
+            .is_err());
 
         let claimed = store.claim_next_recursive_proof_job().unwrap().unwrap();
         let mut fork_parent = fixture.parent_header;
@@ -4671,11 +4747,9 @@ mod tests {
         store
             .put_header_only(&fork_parent, &fork_parent_hash)
             .unwrap();
-        assert!(
-            store
-                .load_claimed_recursive_proof_job_inputs(claimed)
-                .is_err()
-        );
+        assert!(store
+            .load_claimed_recursive_proof_job_inputs(claimed)
+            .is_err());
     }
 
     #[test]
@@ -4689,11 +4763,9 @@ mod tests {
         let proofs = txn.open_table(Some(T_BLOCK_PROOFS)).unwrap();
         txn.del(&proofs, &u64_key(2), None).unwrap();
         txn.commit().unwrap();
-        assert!(
-            missing_store
-                .load_claimed_recursive_proof_job_inputs(missing_fixture.claimed)
-                .is_err()
-        );
+        assert!(missing_store
+            .load_claimed_recursive_proof_job_inputs(missing_fixture.claimed)
+            .is_err());
 
         let oversized_directory = tempfile::tempdir().unwrap();
         let oversized_store = MdbxStore::open(oversized_directory.path()).unwrap();
@@ -4704,11 +4776,9 @@ mod tests {
         txn.put(&recent, u64_key(2), &oversized, WriteFlags::empty())
             .unwrap();
         txn.commit().unwrap();
-        assert!(
-            oversized_store
-                .load_claimed_recursive_proof_job_inputs(oversized_fixture.claimed)
-                .is_err()
-        );
+        assert!(oversized_store
+            .load_claimed_recursive_proof_job_inputs(oversized_fixture.claimed)
+            .is_err());
     }
 
     #[test]
@@ -4733,11 +4803,9 @@ mod tests {
         .unwrap();
         txn.commit().unwrap();
 
-        assert!(
-            store
-                .load_claimed_recursive_proof_job_inputs(fixture.claimed)
-                .is_err()
-        );
+        assert!(store
+            .load_claimed_recursive_proof_job_inputs(fixture.claimed)
+            .is_err());
 
         let malformed_directory = tempfile::tempdir().unwrap();
         let malformed_store = MdbxStore::open(malformed_directory.path()).unwrap();
@@ -4792,9 +4860,7 @@ mod tests {
             },
             ClaimedRecursiveProofInputLengths {
                 previous_result: Some(
-                    RECURSIVE_PROOF_RESULT_HEADER_BYTES
-                        + MAX_RECURSIVE_PROOF_JOB_RESULT_BYTES
-                        + 1,
+                    RECURSIVE_PROOF_RESULT_HEADER_BYTES + MAX_RECURSIVE_PROOF_JOB_RESULT_BYTES + 1,
                 ),
                 ..valid
             },
@@ -4854,10 +4920,7 @@ mod tests {
             Some(b"bounded-proof"),
             Some(b"bounded-sidecar"),
         );
-        let (block, proof, sidecar) = store
-            .get_recent_block_bundle_bounded(3)
-            .unwrap()
-            .unwrap();
+        let (block, proof, sidecar) = store.get_recent_block_bundle_bounded(3).unwrap().unwrap();
         assert_eq!(block, b"bounded-block");
         assert_eq!(proof.as_deref(), Some(b"bounded-proof".as_slice()));
         assert_eq!(sidecar.as_deref(), Some(b"bounded-sidecar".as_slice()));
@@ -5153,9 +5216,7 @@ mod tests {
         second_header.timestamp = second_header.timestamp.saturating_add(1);
         second_header.nonce = 2;
         let second_hash = crate::hash_block_header(&second_header);
-        store
-            .put_header_only(&second_header, &second_hash)
-            .unwrap();
+        store.put_header_only(&second_header, &second_hash).unwrap();
         store
             .enqueue_recursive_proof_job(2, second_hash, RecursiveProofJobTier::B8)
             .unwrap();
@@ -5169,7 +5230,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            store.get_selected_history_coverage().unwrap().unwrap().height,
+            store
+                .get_selected_history_coverage()
+                .unwrap()
+                .unwrap()
+                .height,
             2
         );
         assert_eq!(
@@ -5231,9 +5296,7 @@ mod tests {
         second_header.timestamp = second_header.timestamp.saturating_add(1);
         second_header.nonce = 12;
         let second_hash = crate::hash_block_header(&second_header);
-        store
-            .put_header_only(&second_header, &second_hash)
-            .unwrap();
+        store.put_header_only(&second_header, &second_hash).unwrap();
         store
             .enqueue_recursive_proof_job(2, second_hash, RecursiveProofJobTier::B8)
             .unwrap();
