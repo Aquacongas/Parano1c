@@ -20,10 +20,8 @@ use noid_chain::{Block, BlockHeader, SlotValue};
 use noid_core::Block128;
 use noid_gkr::zk_authorization::ZkAuthorizationProof;
 use noid_gkr::{
-    owner_auth_gkr_channel, owner_auth_trace_inputs_from_body_and_secret,
-    prove_owner_auth_killshot, prove_wallet_authorization, spine_inputs_from_body,
-    verify_wallet_authorization_proof, OwnerAuthCircuit, OwnerAuthInputs, OwnerAuthProofKillShot,
-    OwnerAuthPublicInputs, OwnerAuthWitness, SpineInputs, WalletAuthorizationBundle,
+    prove_wallet_authorization, verify_wallet_authorization_proof, OwnerAuthWitness,
+    WalletAuthorizationBundle,
 };
 use noid_poseidon2b::primitives::{derive_address, Address, SpendSecret, TxBodyHash};
 use noid_tx::{output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS};
@@ -39,14 +37,6 @@ pub struct BenchScenario {
     pub body: TxBody,
     /// Wallet-local proving authority. It is never serialized into `body`.
     pub spend_secret: SpendSecret,
-}
-
-pub struct TxFixture {
-    pub scenario: BenchScenario,
-    pub spine_inputs: SpineInputs,
-    pub auth_inputs: OwnerAuthInputs,
-    pub auth_public: OwnerAuthPublicInputs,
-    pub auth_proof: OwnerAuthProofKillShot,
 }
 
 #[derive(Clone)]
@@ -473,28 +463,6 @@ pub fn state_shrinking_scenario(
     scenario
 }
 
-pub fn tx_fixture(scenario: BenchScenario) -> TxFixture {
-    scenario
-        .body
-        .validate_canonical()
-        .expect("Tx8x2 fixture public logic");
-    let auth_inputs =
-        owner_auth_trace_inputs_from_body_and_secret(&scenario.body, &scenario.spend_secret)
-            .expect("fixed one-owner inputs");
-    let auth_public = auth_inputs.to_public();
-    let circuit = OwnerAuthCircuit::build();
-    let mut channel = owner_auth_gkr_channel();
-    let (auth_proof, _) = prove_owner_auth_killshot(&circuit, &auth_inputs, &mut channel);
-    let spine_inputs = spine_inputs_from_body(&scenario.body);
-    TxFixture {
-        scenario,
-        spine_inputs,
-        auth_inputs,
-        auth_public,
-        auth_proof,
-    }
-}
-
 pub fn minimal_tx_fixture(scenario: BenchScenario) -> MinimalTxFixture {
     let proof = prove_wallet_authorization(
         &scenario.body,
@@ -508,7 +476,7 @@ pub fn minimal_tx_fixture(scenario: BenchScenario) -> MinimalTxFixture {
     }
 }
 
-pub fn prove_wallet(fixture: &TxFixture, samples: usize) -> WalletBench {
+pub fn prove_wallet(fixture: &MinimalTxFixture, samples: usize) -> WalletBench {
     let prove_time = time_median(samples, || {
         prove_wallet_authorization(
             &fixture.scenario.body,
@@ -1154,19 +1122,15 @@ pub fn accepted_two_coinbase_chain_fixture() -> [AcceptedSingleBlockFixture; 2] 
                 block_auth_sidecar_bytes: Vec::new(),
             }],
         };
-        let (output, mut component_proof) =
-            noid_block::prove_retained_full_accepted_block_batch_proof(
-                &consensus,
-                &accumulator,
-                &parent,
-                &state,
-                &witness,
-            )
-            .expect("canonical coinbase-only retained component proof");
+        let (output, component_proof) = noid_block::prove_retained_full_accepted_block_batch_proof(
+            &consensus,
+            &accumulator,
+            &parent,
+            &state,
+            &witness,
+        )
+        .expect("canonical coinbase-only retained component proof");
         assert_eq!(component_proof.exact_state.len(), 1);
-        for exact_state in &mut component_proof.exact_state {
-            exact_state.state_paths.clear();
-        }
 
         let next_consensus = output.accepted_claim_batch.consensus_state.clone();
         let next_accumulator = output.accepted_claim_batch.accumulator.clone();
@@ -1554,17 +1518,15 @@ fn accepted_sequential_chain_fixture(
                 block_auth_sidecar_bytes,
             }],
         };
-        let (output, mut component_proof) =
-            noid_block::prove_retained_full_accepted_block_batch_proof(
-                &consensus,
-                &accumulator,
-                &parent,
-                &state,
-                &witness,
-            )
-            .expect("four-tier retained component proof");
+        let (output, component_proof) = noid_block::prove_retained_full_accepted_block_batch_proof(
+            &consensus,
+            &accumulator,
+            &parent,
+            &state,
+            &witness,
+        )
+        .expect("four-tier retained component proof");
         assert_eq!(component_proof.exact_state.len(), 1);
-        component_proof.exact_state[0].state_paths.clear();
         noid_recursive::block_certificate_backend::verify_accepted_block_batch_components(
             &consensus,
             &accumulator,
@@ -1572,7 +1534,7 @@ fn accepted_sequential_chain_fixture(
             &output.proof_components.component_inputs,
             &component_proof,
         )
-        .expect("four-tier path-free retained component verification");
+        .expect("four-tier structural retained component verification");
 
         let next_consensus = output.accepted_claim_batch.consensus_state.clone();
         let next_accumulator = output.accepted_claim_batch.accumulator.clone();
@@ -1737,7 +1699,7 @@ mod tests {
     /// class selection) and is intentionally opt-in for ordinary unit runs.
     #[test]
     #[ignore = "heavy continuous B8/B32/B64/B255 retained-proof fixture"]
-    fn accepted_four_tier_chain_is_continuous_and_path_free() {
+    fn accepted_four_tier_chain_is_continuous_and_structural() {
         const EXPECTED_COUNTS: [usize; 4] = [8, 17, 33, 65];
         const EXPECTED_TIERS: [usize; 4] = [8, 32, 64, 255];
 
@@ -1764,11 +1726,15 @@ mod tests {
                 fixture.start_accumulator.state_root,
                 fixture.pre_state.cached_state_root()
             );
-            assert!(fixture
-                .component_proof
-                .exact_state
-                .iter()
-                .all(|proof| proof.state_paths.is_empty()));
+            assert_eq!(
+                fixture
+                    .output
+                    .proof_components
+                    .component_inputs
+                    .exact_state_structural_inputs
+                    .len(),
+                1
+            );
 
             if index == 0 {
                 continue;
@@ -1815,7 +1781,7 @@ mod tests {
 
     #[test]
     #[ignore = "heavy canonical-genesis eight-block retained-proof ladder"]
-    fn accepted_canonical_ladder_chain_has_direct_boundaries_and_no_paths() {
+    fn accepted_canonical_ladder_chain_has_direct_boundaries_and_structural_state() {
         const EXPECTED_COUNTS: [usize; 8] = [0, 1, 3, 7, 8, 17, 33, 65];
         const EXPECTED_TIERS: [usize; 8] = [8, 8, 8, 8, 8, 32, 64, 255];
 
@@ -1848,11 +1814,15 @@ mod tests {
                 noid_chain::hash_block_header(&fixture.parent)
             );
             assert_eq!(block.header.height, fixture.parent.height + 1);
-            assert!(fixture
-                .component_proof
-                .exact_state
-                .iter()
-                .all(|proof| proof.state_paths.is_empty()));
+            assert_eq!(
+                fixture
+                    .output
+                    .proof_components
+                    .component_inputs
+                    .exact_state_structural_inputs
+                    .len(),
+                1
+            );
 
             if index == 0 {
                 assert!(fixture.witness.items[0].block_proof_bytes.is_empty());
@@ -1941,11 +1911,15 @@ mod tests {
                 block.header.state_root
             );
             assert_eq!(fixture.component_proof.exact_state.len(), 1);
-            assert!(fixture
-                .component_proof
-                .exact_state
-                .iter()
-                .all(|proof| proof.state_paths.is_empty()));
+            assert_eq!(
+                fixture
+                    .output
+                    .proof_components
+                    .component_inputs
+                    .exact_state_structural_inputs
+                    .len(),
+                1
+            );
 
             if user_count == 0 {
                 assert!(fixture.witness.items[0].block_proof_bytes.is_empty());
@@ -2006,7 +1980,7 @@ mod tests {
 
     #[test]
     #[ignore = "heavy canonical saturated ladder plus real class-transition suffix"]
-    fn accepted_canonical_transition_suffix_is_continuous_and_path_free() {
+    fn accepted_canonical_transition_suffix_is_continuous_and_structural() {
         const EXPECTED_COUNTS: [usize; 14] = [0, 1, 3, 7, 8, 17, 33, 65, 131, 255, 8, 65, 17, 33];
         const EXPECTED_TIERS: [usize; 14] = [8, 8, 8, 8, 8, 32, 64, 255, 255, 255, 8, 255, 32, 64];
 
@@ -2029,11 +2003,15 @@ mod tests {
                 noid_chain::hash_block_header(&fixture.parent)
             );
             assert_eq!(fixture.component_proof.exact_state.len(), 1);
-            assert!(fixture
-                .component_proof
-                .exact_state
-                .iter()
-                .all(|proof| proof.state_paths.is_empty()));
+            assert_eq!(
+                fixture
+                    .output
+                    .proof_components
+                    .component_inputs
+                    .exact_state_structural_inputs
+                    .len(),
+                1
+            );
             if index > 0 {
                 let previous = &fixtures[index - 1];
                 assert_eq!(fixture.parent, previous.witness.items[0].block.header);
@@ -2288,8 +2266,6 @@ mod tests {
             assert_eq!(*hash, body.txid().as_fields());
         }
         assert_eq!(component.authorization_inputs.len(), 255);
-        assert_eq!(component.authorization_witnesses.len(), 255);
-        assert_eq!(component.authorization_traces.len(), 255);
         assert_eq!(component.authorization_totals.user_tx_count, 255);
         assert_eq!(component.authorization_totals.live_input_count_total, 1_020);
         for (index, authorization) in component.authorization_inputs.iter().enumerate() {
@@ -2314,13 +2290,6 @@ mod tests {
                 body.live_input_count()
             );
         }
-        assert_eq!(component.exact_state_killshot_inputs.len(), 1);
-        assert!(component.exact_state_killshot_inputs[0]
-            .slot_leaves
-            .is_empty());
-        assert!(component.exact_state_killshot_inputs[0]
-            .state_paths
-            .is_empty());
         assert_eq!(component.exact_state_structural_inputs.len(), 1);
         assert_eq!(
             component.exact_state_structural_inputs[0]
@@ -2343,127 +2312,6 @@ mod tests {
             expected_end,
             fixture.output.accepted_claim_batch.accumulator
         );
-    }
-
-    /// This is deliberately ignored in the ordinary unit suite: producing the
-    /// retained component proof is expensive. Run it explicitly whenever the
-    /// production block-slot assembly or its action surface changes.
-    #[test]
-    #[ignore = "expensive production recursive acceptance smoke"]
-    fn accepted_user_block_reaches_production_action_compactor() {
-        use noid_recursive::acceptance::block_slots::{
-            build_block_slots_with_config, BlockSlotsConfig,
-        };
-        use noid_recursive::acceptance::trace::FieldR1csBuilder;
-
-        let fixture = accepted_single_user_fixture(0xACCE_57ED);
-        assert_eq!(fixture.component_proof.exact_state.len(), 1);
-        assert!(
-            !fixture.component_proof.exact_state[0]
-                .state_paths
-                .is_empty(),
-            "small retained components keep the transitional inline path proof"
-        );
-        assert!(
-            !fixture.component_proof.exact_state[0]
-                .structural_hashes
-                .is_empty(),
-            "retained native verification is structural"
-        );
-        let mut builder = FieldR1csBuilder::new();
-        let slots = build_block_slots_with_config(
-            &mut builder,
-            &fixture.start_accumulator,
-            &fixture.output.accepted_claim_batch.accumulator,
-            &fixture.output.proof_components.component_inputs,
-            &fixture.component_proof,
-            BlockSlotsConfig::default(),
-        );
-        assert_eq!(slots.compacted_actions.source_rows, 11);
-        assert_eq!(slots.compacted_actions.rows.len(), 11);
-
-        let (r1cs, witness) = builder.build();
-        assert!(r1cs.satisfies(&witness));
-    }
-
-    /// Full production-region composition gate for the smallest class. This
-    /// exercises the structural (path-free) exact-state carrier all the way
-    /// through action leaves, paired local/upper walks, segment compaction,
-    /// and header roots without paying for an outer PCS proof.
-    #[test]
-    #[ignore = "expensive full-region production composition smoke"]
-    fn accepted_user_block_closes_structural_exact_state_region() {
-        use noid_recursive::acceptance::block_slots::{
-            build_block_slots_with_config, BlockSlotsConfig,
-        };
-        use noid_recursive::acceptance::trace::{FieldR1csBuilder, F128};
-
-        let fixture = accepted_single_user_fixture(0x57A7_E001);
-        let tier = noid_chain::consensus::params::user_tx_class_tier(1)
-            .expect("one user transaction belongs to B8");
-        let config = BlockSlotsConfig {
-            owner_auth_region: true,
-            exact_state_region: true,
-            tx_root_region: true,
-            spine_region: true,
-            tier_user_tx_capacity: Some(tier),
-            ..BlockSlotsConfig::default()
-        };
-        let mut region_proof = fixture.component_proof.clone();
-        region_proof.exact_state[0].state_paths.clear();
-        let mut builder = FieldR1csBuilder::new();
-        let slots = build_block_slots_with_config(
-            &mut builder,
-            &fixture.start_accumulator,
-            &fixture.output.accepted_claim_batch.accumulator,
-            &fixture.output.proof_components.component_inputs,
-            &region_proof,
-            config,
-        );
-        let class = noid_recursive::acceptance::shape::ShapeClass { tier };
-        assert_eq!(slots.compacted_actions.source_rows, 81);
-        assert_eq!(slots.compacted_actions.rows.len(), class.touched_capacity());
-        assert!(slots.exact_state.state_paths.is_empty());
-        assert_eq!(
-            slots.exact_state.slot_leaves.len(),
-            2 * class.touched_capacity()
-        );
-        assert!(!slots.pending_wallet_pcs.is_empty());
-
-        let (r1cs, witness) = builder.build();
-        assert!(r1cs.satisfies(&witness));
-
-        // A separately valid structural carrier from a same-tier block must
-        // not compose with this block's body/header/actions. Build only its
-        // witness and test it against the honest matrix, avoiding a second
-        // multi-million-row matrix allocation.
-        let other = accepted_user_block_fixture(vec![tx8x2_scenario(
-            "mixed-exact-state",
-            2,
-            2,
-            8_192,
-            0x57A7_E002,
-        )]);
-        let mut mixed_inputs = fixture.output.proof_components.component_inputs.clone();
-        mixed_inputs.exact_state_structural_inputs[0] = other
-            .output
-            .proof_components
-            .component_inputs
-            .exact_state_structural_inputs[0]
-            .clone();
-        let mut mixed_builder = FieldR1csBuilder::new_witness_only();
-        let _ = build_block_slots_with_config(
-            &mut mixed_builder,
-            &fixture.start_accumulator,
-            &fixture.output.accepted_claim_batch.accumulator,
-            &mixed_inputs,
-            &region_proof,
-            config,
-        );
-        let (mixed_rows, mut mixed_witness) = mixed_builder.build_witness_only();
-        assert_eq!(mixed_rows, r1cs.useful_rows);
-        mixed_witness.resize(witness.len(), F128::default());
-        assert!(!r1cs.satisfies(&mixed_witness));
     }
 }
 

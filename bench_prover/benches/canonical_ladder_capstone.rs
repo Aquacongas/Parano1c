@@ -45,18 +45,16 @@ use noid_ivc_prover::field_r1cs::FieldR1cs;
 use noid_ivc_prover::pcs::{self, PcsParams};
 use noid_ivc_prover::proof::FieldShape;
 use noid_recursive::acceptance::block_class::{
-    build_block_proof_trace, prove_built_block, verify_block_proof, BlockClass, BlockProofEnvelope,
-    BLOCK_IO_END_ACC, BLOCK_IO_START_ACC,
+    build_selected_zk_block_proof_trace, prove_built_block, verify_block_proof, BlockClass,
+    BlockProofEnvelope, BuiltBlock, BLOCK_IO_END_ACC, BLOCK_IO_START_ACC,
 };
-use noid_recursive::acceptance::block_slots::BlockSlotsConfig;
-use noid_recursive::acceptance::link::LinkBlock;
+use noid_recursive::acceptance::link::SelectedZkBlockInput;
 use noid_recursive::acceptance::split_link::{
     build_split_link, decide_block_tip_split, prove_built_split_link, tip_block_accumulator_split,
     verify_split_link_proof, CanonicalSplitLinkLadder, LinkProofEnvelope, SplitLinkInput,
     SplitLinkSlotMaterial, CANONICAL_BLOCK_CLASS_MS, CANONICAL_LINK_CLASS_M,
     CANONICAL_PCS_LOG_BATCH_SIZE, CANONICAL_PCS_LOG_INV_RATE,
 };
-use noid_recursive::acceptance::trace::region_source_binding::RegionDischargeParams;
 use noid_recursive::accumulator::{ChainAccumulator, CHAIN_ACCUMULATOR_LANES};
 
 const BLOCK_DOMAIN: &[u8] = b"history-block-v0";
@@ -97,25 +95,50 @@ fn pcs_params(m: usize) -> PcsParams {
     }
 }
 
-fn block_view<'a>(
-    fixture: &'a AcceptedSingleBlockFixture,
+fn selected_block_input<const TIER: usize>(
+    fixture: &AcceptedSingleBlockFixture,
+) -> SelectedZkBlockInput<'_, TIER> {
+    SelectedZkBlockInput::try_new(
+        &fixture.start_accumulator,
+        &fixture.output.accepted_claim_batch.accumulator,
+        &fixture.output.proof_components.component_inputs,
+        &fixture.component_proof,
+        fixture
+            .output
+            .proof_components
+            .selected_authorization_proofs
+            .clone(),
+        noid_gkr::ghost_tx::prove_selected_ghost_authorization()
+            .expect("fresh canonical selected ghost proof"),
+    )
+    .expect("canonical selected Block input")
+}
+
+fn freeze_block_class(
+    fixture: &AcceptedSingleBlockFixture,
     tier: usize,
-    region_params: RegionDischargeParams,
-) -> LinkBlock<'a> {
-    LinkBlock {
-        start_accumulator: &fixture.start_accumulator,
-        end_accumulator: &fixture.output.accepted_claim_batch.accumulator,
-        inputs: &fixture.output.proof_components.component_inputs,
-        proof: &fixture.component_proof,
-        config: BlockSlotsConfig {
-            discharge_wallet_pcs: true,
-            wallet_pcs_params: region_params,
-            owner_auth_region: true,
-            exact_state_region: true,
-            tx_root_region: true,
-            spine_region: true,
-            tier_user_tx_capacity: Some(tier),
-        },
+    params: PcsParams,
+) -> BlockClass {
+    match tier {
+        8 => BlockClass::freeze_selected_zk(params, selected_block_input::<8>(fixture)),
+        32 => BlockClass::freeze_selected_zk(params, selected_block_input::<32>(fixture)),
+        64 => BlockClass::freeze_selected_zk(params, selected_block_input::<64>(fixture)),
+        255 => BlockClass::freeze_selected_zk(params, selected_block_input::<255>(fixture)),
+        _ => unreachable!("canonical tier"),
+    }
+}
+
+fn build_block_trace(
+    class: &BlockClass,
+    fixture: &AcceptedSingleBlockFixture,
+    tier: usize,
+) -> BuiltBlock {
+    match tier {
+        8 => build_selected_zk_block_proof_trace(class, selected_block_input::<8>(fixture)),
+        32 => build_selected_zk_block_proof_trace(class, selected_block_input::<32>(fixture)),
+        64 => build_selected_zk_block_proof_trace(class, selected_block_input::<64>(fixture)),
+        255 => build_selected_zk_block_proof_trace(class, selected_block_input::<255>(fixture)),
+        _ => unreachable!("canonical tier"),
     }
 }
 
@@ -180,14 +203,6 @@ fn assert_fixture_chain(
             "step {step}: pre-state accumulator boundary",
         );
         assert_eq!(fixture.component_proof.exact_state.len(), 1);
-        assert!(
-            fixture
-                .component_proof
-                .exact_state
-                .iter()
-                .all(|proof| proof.state_paths.is_empty()),
-            "step {step}: retained exact-state component carried legacy paths",
-        );
         if step == 0 {
             assert_eq!(fixture.parent, genesis, "first parent is real genesis");
             assert_eq!(
@@ -216,9 +231,6 @@ fn assert_fixture_chain(
 
 fn main() {
     let _ = noid_ivc_prover::init_perf_thread_pool();
-    let region_params = RegionDischargeParams {
-        nq: noid_fri_binius::capsule::CAPSULE_NUM_QUERIES,
-    };
     let transition_suffix = std::env::var("NOID_CAPSTONE_TRANSITION_SUFFIX")
         .ok()
         .as_deref()
@@ -285,13 +297,10 @@ fn main() {
             step_slots[sample_step], slot,
             "class sample step must select its canonical slot",
         );
-        let sample = block_view(&fixtures[sample_step], TIERS[slot], region_params);
-        block_classes.push(BlockClass::freeze(
-            field_shape(CANONICAL_BLOCK_CLASS_MS[slot]),
-            pcs_params(CANONICAL_BLOCK_CLASS_MS[slot]),
-            region_params,
-            &sample,
+        block_classes.push(freeze_block_class(
+            &fixtures[sample_step],
             TIERS[slot],
+            pcs_params(CANONICAL_BLOCK_CLASS_MS[slot]),
         ));
     }
 
@@ -331,8 +340,7 @@ fn main() {
         let slot = step_slots[step];
         let tier = TIERS[slot];
         let block_started = Instant::now();
-        let view = block_view(fixture, tier, region_params);
-        let built = build_block_proof_trace(&block_classes[slot], &view);
+        let built = build_block_trace(&block_classes[slot], fixture, tier);
         assert_eq!(built.r1cs.m, CANONICAL_BLOCK_CLASS_MS[slot]);
         assert!(
             built.r1cs.useful_rows <= 1usize << CANONICAL_BLOCK_CLASS_MS[slot],

@@ -131,10 +131,7 @@ fn prepare_selected_fixture(live: usize, seed: u128) -> PreparedSelectedFixture 
         .iter()
         .map(|scenario| scenario.spend_secret.clone())
         .collect::<Vec<_>>();
-    let mut fixture = accepted_proved_user_block_fixture(scenarios.clone());
-    for exact_state in &mut fixture.component_proof.exact_state {
-        exact_state.state_paths.clear();
-    }
+    let fixture = accepted_proved_user_block_fixture(scenarios.clone());
 
     // The accepted fixture canonicalizes epoch/fee/output amounts.  Replace
     // the pre-canonical bodies before deriving ZK statements while retaining

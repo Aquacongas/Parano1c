@@ -94,7 +94,6 @@ fn main() {
         assert_geometry(&fixture.witness, &fixture.output);
         println!("    total:              {}", fmt_ms(elapsed));
         println!("    frontier siblings:  20,420");
-        println!("    exact path carrier: 3,062 paths (transitional; structural cut pending)");
         print_memory();
     }
 }

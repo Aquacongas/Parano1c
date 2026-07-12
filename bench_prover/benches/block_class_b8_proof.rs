@@ -9,10 +9,8 @@
 //! VK, proves the resulting class instance with fixed 20-lane public IO, and
 //! verifies the mandatory Field+sidecar envelope.
 //!
-//! The structural exact-state region is the production path. The retained
-//! component fixture still carries small transitional Merkle-path proofs, so
-//! this gate clears those proofs before class freeze/build and thereby ensures
-//! the outer proof cannot fall back to them.
+//! The retained component and outer relation both consume only the canonical
+//! sibling-frontier exact-state carrier.
 //!
 //! The selected-ZK terminal-sidecar cut leaves an 814,956-row natural m20
 //! relation while the published B8 ladder slot remains frozen at m22. The matrix/witness
@@ -74,23 +72,21 @@ fn print_phase(label: &str, phase: Phase) {
 fn main() {
     let _ = noid_ivc_prover::init_perf_thread_pool();
     println!("PARANOID B8 full BlockClass public-IO proof gate");
-    println!("  production region stack; structural exact state; no legacy path proofs");
+    println!("  production region stack; sibling-frontier exact state");
     println!("  rayon threads:       {}", rayon::current_num_threads());
     std::io::stdout().flush().expect("flush benchmark heading");
 
     let fixture_started = Instant::now();
-    let mut fixture = accepted_single_user_fixture(SEED);
+    let fixture = accepted_single_user_fixture(SEED);
     assert_eq!(fixture.component_proof.exact_state.len(), 1);
-    for exact_state in &mut fixture.component_proof.exact_state {
-        exact_state.state_paths.clear();
-    }
-    assert!(
+    assert_eq!(
         fixture
-            .component_proof
-            .exact_state
-            .iter()
-            .all(|proof| proof.state_paths.is_empty()),
-        "the production class gate must not carry legacy exact-state path proofs"
+            .output
+            .proof_components
+            .component_inputs
+            .exact_state_structural_inputs
+            .len(),
+        1,
     );
     assert_eq!(
         noid_chain::consensus::params::user_tx_class_tier(1)

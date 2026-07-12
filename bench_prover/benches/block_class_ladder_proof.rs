@@ -119,14 +119,20 @@ fn fixture_for(tier: usize) -> AcceptedSingleBlockFixture {
             )
         })
         .collect();
-    let mut fixture = accepted_proved_user_block_fixture(scenarios);
+    let fixture = accepted_proved_user_block_fixture(scenarios);
     assert_eq!(
         noid_chain::consensus::params::user_tx_class_tier(count),
         Some(tier),
     );
-    for exact_state in &mut fixture.component_proof.exact_state {
-        exact_state.state_paths.clear();
-    }
+    assert_eq!(
+        fixture
+            .output
+            .proof_components
+            .component_inputs
+            .exact_state_structural_inputs
+            .len(),
+        1,
+    );
     fixture
 }
 
@@ -171,7 +177,7 @@ fn main() {
     let _ = noid_ivc_prover::init_perf_thread_pool();
     let tiers = requested_tiers();
     println!("PARANOID full BlockClass ladder proof gates {tiers:?}");
-    println!("  mandatory selected V4 sidecar; structural exact state; no legacy paths");
+    println!("  mandatory selected V4 sidecar; sibling-frontier exact state");
     println!("  rayon threads: {}", rayon::current_num_threads());
     std::io::stdout().flush().expect("flush benchmark heading");
 

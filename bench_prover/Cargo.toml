@@ -65,10 +65,6 @@ name = "pcs_roofline"
 harness = false
 
 [[bench]]
-name = "zk_capsule_geometry_roofline"
-harness = false
-
-[[bench]]
 name = "selected_zk_b255_measurement"
 harness = false
 required-features = ["selected-zk-measurement"]
@@ -78,23 +74,11 @@ name = "accepted_b255_truth"
 harness = false
 
 [[bench]]
-name = "acceptance_row_ledger"
-harness = false
-
-[[bench]]
 name = "exact_state_structural_b255"
 harness = false
 
 [[bench]]
 name = "block_class_b8_proof"
-harness = false
-
-[[bench]]
-name = "block_link_tip_b8_vertical"
-harness = false
-
-[[bench]]
-name = "block_ladder_materialize"
 harness = false
 
 [[bench]]

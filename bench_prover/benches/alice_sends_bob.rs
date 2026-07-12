@@ -4,8 +4,8 @@
 //! Wallet authorization benchmark for the sole Tx8x2 form.
 
 use bench_prover::{
-    authorization_size, fmt_bytes, fmt_ms, live_counts, prove_wallet, state_shrinking_scenario,
-    tx8x2_scenario, tx_fixture, wallet_bundle_size, TxFixture, WalletBench,
+    authorization_size, fmt_bytes, fmt_ms, live_counts, minimal_tx_fixture, prove_wallet,
+    state_shrinking_scenario, tx8x2_scenario, wallet_bundle_size, MinimalTxFixture, WalletBench,
 };
 
 const DEFAULT_SAMPLES: usize = 5;
@@ -18,7 +18,7 @@ fn samples() -> usize {
         .unwrap_or(DEFAULT_SAMPLES)
 }
 
-fn print_case(fixture: &TxFixture, result: &WalletBench) {
+fn print_case(fixture: &MinimalTxFixture, result: &WalletBench) {
     let (inputs, outputs) = live_counts(&fixture.scenario.body);
     println!("  {}", fixture.scenario.label);
     println!("    body:            {}", fixture.scenario.desc);
@@ -47,7 +47,7 @@ fn main() {
     ];
 
     for scenario in cases {
-        let fixture = tx_fixture(scenario);
+        let fixture = minimal_tx_fixture(scenario);
         let result = prove_wallet(&fixture, samples);
         print_case(&fixture, &result);
     }

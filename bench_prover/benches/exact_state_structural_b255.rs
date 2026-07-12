@@ -21,11 +21,7 @@ fn main() {
     let fixture_time = fixture_started.elapsed();
     let inputs = &fixture.output.proof_components.component_inputs;
     assert_eq!(inputs.exact_state_structural_inputs.len(), 1);
-    assert_eq!(inputs.exact_state_killshot_inputs.len(), 1);
     let structural = &inputs.exact_state_structural_inputs[0];
-    let legacy = &inputs.exact_state_killshot_inputs[0];
-    assert!(legacy.slot_leaves.is_empty());
-    assert!(legacy.state_paths.is_empty());
     let plan = noid_chain::sparse_merkle::derive_structural_frontier_plan(
         &structural.touched_indices,
         structural.active_depth,
@@ -45,7 +41,6 @@ fn main() {
         structural.live_sibling_digests.len()
     );
     println!("combines/root:          {:>10}", plan.combines().len());
-    println!("legacy paths retained:  {:>10}", legacy.state_paths.len());
     std::io::stdout().flush().expect("flush fixture summary");
 
     let audit_started = Instant::now();
@@ -60,10 +55,6 @@ fn main() {
     let prove_time = prove_started.elapsed();
     let after_prove = current_mem_snapshot();
 
-    assert!(
-        proof.state_paths.is_empty(),
-        "B255 retained proof is path-free"
-    );
     let verify_started = Instant::now();
     noid_block::verify_exact_state_structural_killshot(structural, &proof)
         .expect("verify structural exact state");

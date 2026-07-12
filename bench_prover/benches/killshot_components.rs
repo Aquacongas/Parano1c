@@ -3,16 +3,16 @@
 
 //! Current Tx8x2 owner-auth and body-spine component measurements.
 
-use bench_prover::{fmt_bytes, fmt_ms, time_once, tx8x2_scenario, tx_fixture};
+use bench_prover::{fmt_bytes, fmt_ms, time_once, tx8x2_scenario};
 use noid_core::Block128;
 use noid_gkr::{
-    discharge_block_spine_reductions_native, owner_auth_gkr_channel, prove_block_spine_killshot,
-    prove_owner_auth_killshot, reconstruct_slot_states, verify_block_spine_killshot,
-    verify_owner_auth_killshot, BlockSpineMle, OwnerAuthCircuit, SpineCircuit, N_SPINE_SLOTS,
-    N_SPINE_SLOTS_PADDED, N_SPINE_SLOT_VARS,
+    discharge_block_spine_reductions_native, prove_block_spine_killshot,
+    prove_wallet_authorization, reconstruct_slot_states, spine_inputs_from_body,
+    verify_block_spine_killshot, verify_wallet_authorization_proof, BlockSpineMle,
+    OwnerAuthWitness, SpineCircuit, N_SPINE_SLOTS, N_SPINE_SLOTS_PADDED, N_SPINE_SLOT_VARS,
 };
 use noid_poseidon2b::channel::Poseidon2bChannel;
-use noid_poseidon2b::primitives::TxBodyHash;
+use noid_poseidon2b::primitives::{SpendSecret, TxBodyHash};
 
 fn requested_sizes() -> Vec<usize> {
     std::env::var("NOID_KILLSHOT_TX_COUNTS")
@@ -28,43 +28,48 @@ fn hash_fields(hash: TxBodyHash) -> [Block128; 2] {
 }
 
 fn bench_owner_auth() {
-    let fixture = tx_fixture(tx8x2_scenario("owner-auth-max", 8, 2, 0, 0xA011));
-    let circuit = OwnerAuthCircuit::build();
-    let (prove_time, (proof, reduction)) = time_once(|| {
-        let mut channel = owner_auth_gkr_channel();
-        prove_owner_auth_killshot(&circuit, &fixture.auth_inputs, &mut channel)
+    let scenario = tx8x2_scenario("owner-auth-max", 8, 2, 0, 0xA011);
+    let (prove_time, proof) = time_once(|| {
+        prove_wallet_authorization(
+            &scenario.body,
+            OwnerAuthWitness::new(SpendSecret(scenario.spend_secret.0)),
+        )
+        .expect("selected witness-hiding authorization")
+        .proof
     });
-    let (verify_time, verified) = time_once(|| {
-        let mut channel = owner_auth_gkr_channel();
-        verify_owner_auth_killshot(&proof, &circuit, &fixture.auth_public, &mut channel)
+    let (verify_time, ()) = time_once(|| {
+        verify_wallet_authorization_proof(&scenario.body, &proof)
+            .expect("selected authorization verifies")
     });
-    assert_eq!(verified, Some(reduction));
-    println!("  fixed one-owner authorization (Tx8x2 max actions)");
+    println!("  selected ZK one-owner authorization (Tx8x2 max actions)");
     println!("    prove: {}", fmt_ms(prove_time));
     println!("    verify:{}", fmt_ms(verify_time));
-    println!("    proof: {}", fmt_bytes(proof.byte_len()));
+    println!(
+        "    proof: {}",
+        fmt_bytes(proof.to_bytes().expect("canonical proof wire").len())
+    );
 }
 
 fn bench_body_spine(n: usize) {
     let circuit = SpineCircuit::build();
-    let fixtures: Vec<_> = (0..n)
+    let scenarios: Vec<_> = (0..n)
         .map(|index| {
-            tx_fixture(tx8x2_scenario(
+            tx8x2_scenario(
                 "body-spine",
                 8,
                 2,
                 (index * 2_048) as u32,
                 0x5A11 + index as u128,
-            ))
+            )
         })
         .collect();
-    let spine_inputs: Vec<_> = fixtures
+    let spine_inputs: Vec<_> = scenarios
         .iter()
-        .map(|fixture| fixture.spine_inputs.clone())
+        .map(|scenario| spine_inputs_from_body(&scenario.body))
         .collect();
-    let tx_hashes: Vec<_> = fixtures
+    let tx_hashes: Vec<_> = scenarios
         .iter()
-        .map(|fixture| hash_fields(fixture.scenario.body.txid()))
+        .map(|scenario| hash_fields(scenario.body.txid()))
         .collect();
     let (mle_time, (mle, state_ins)) = time_once(|| {
         let state_ins: Vec<_> = spine_inputs
