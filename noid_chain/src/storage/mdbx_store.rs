@@ -1699,6 +1699,75 @@ impl MdbxStore {
         Ok(Some(result))
     }
 
+    /// Load one exact canonical selected-history result by its locally chosen
+    /// boundary instead of implicitly using the newest coverage pointer.
+    ///
+    /// Snapshot serving uses this when local proof coverage has advanced past
+    /// finality: it serves the result at the finalized height without scanning
+    /// or collecting the intervening result table. All fixed metadata and the
+    /// stored object length are checked before allocating the one proof value.
+    pub fn get_selected_history_terminal_result_at(
+        &self,
+        height: u64,
+        block_hash: [u8; 32],
+    ) -> Result<Option<RecursiveProofJobResult>, StoreError> {
+        let txn = self.db.begin_ro_txn()?;
+        let headers = txn.open_table(Some(T_HEADERS))?;
+        let header_raw: Option<Vec<u8>> = txn.get(&headers, &u64_key(height))?;
+        if header_raw
+            .as_deref()
+            .and_then(canonical_hash_from_encoded_header)
+            != Some(block_hash)
+        {
+            return Ok(None);
+        }
+
+        let key = recursive_proof_height_key(height);
+        let jobs = txn.open_table(Some(T_RECURSIVE_PROOF_JOBS))?;
+        let job_raw: Option<[u8; RECURSIVE_PROOF_JOB_ENCODED_BYTES]> = txn.get(&jobs, &key)?;
+        let Some(job) = job_raw
+            .as_ref()
+            .and_then(|raw| decode_recursive_proof_job(height, raw))
+        else {
+            return Ok(None);
+        };
+        if job.state != RecursiveProofJobState::Complete || job.block_hash != block_hash {
+            return Ok(None);
+        }
+
+        let results = txn.open_table(Some(T_RECURSIVE_PROOF_RESULTS))?;
+        let result_length: Option<ObjectLength> = txn.get(&results, &key)?;
+        let Some(ObjectLength(result_length)) = result_length else {
+            return Ok(None);
+        };
+        let maximum = RECURSIVE_PROOF_RESULT_HEADER_BYTES
+            + crate::consensus::wire_limits::MAX_HISTORY_PROOF_BYTES;
+        if !(RECURSIVE_PROOF_RESULT_HEADER_BYTES..=maximum).contains(&result_length) {
+            return Err(StoreError::Decode(
+                "selected history terminal stored length exceeds hard bounds",
+            ));
+        }
+        let encoded: Vec<u8> = txn
+            .get(&results, &key)?
+            .ok_or(StoreError::Decode("selected history terminal disappeared"))?;
+        if encoded.len() != result_length {
+            return Err(StoreError::Decode(
+                "selected history terminal length changed during read",
+            ));
+        }
+        let result = decode_recursive_proof_result(height, encoded).ok_or(StoreError::Decode(
+            "selected history terminal wrapper is malformed",
+        ))?;
+        if result.block_hash != block_hash
+            || !selected_history_terminal_prefix_matches(&result.bytes, height, block_hash)
+        {
+            return Err(StoreError::Decode(
+                "selected history terminal payload does not match requested boundary",
+            ));
+        }
+        Ok(Some(result))
+    }
+
     /// Read fixed-width metadata for diagnostics without loading a result.
     pub fn get_recursive_proof_job(
         &self,
@@ -4870,6 +4939,27 @@ mod tests {
             store.get_selected_history_coverage().unwrap().unwrap().height,
             2
         );
+        assert_eq!(
+            store
+                .get_selected_history_terminal_result_at(1, first_hash)
+                .unwrap()
+                .unwrap()
+                .bytes,
+            first_terminal,
+            "finalized serving can select an older exact boundary without scanning results"
+        );
+        assert_eq!(
+            store
+                .get_selected_history_terminal_result_at(2, second_hash)
+                .unwrap()
+                .unwrap()
+                .bytes,
+            second_terminal
+        );
+        assert!(store
+            .get_selected_history_terminal_result_at(1, second_hash)
+            .unwrap()
+            .is_none());
 
         store.delete_recursive_proof_jobs_above(1).unwrap();
         assert_eq!(
