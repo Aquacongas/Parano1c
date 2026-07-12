@@ -124,6 +124,8 @@ pub fn selected_recursive_matrix_relative_path(kind: SelectedRecursiveMatrixKind
 /// Fail-closed local matrix artifact error.
 #[derive(Debug, Error)]
 pub enum LocalSelectedRecursiveMatrixError {
+    #[error("unsupported selected-recursive matrix tier {tier}")]
+    UnsupportedTier { tier: usize },
     #[error("another selected-recursive matrix is still resident")]
     MatrixAlreadyResident,
     #[error("matrix artifact path is a symlink: {path}")]

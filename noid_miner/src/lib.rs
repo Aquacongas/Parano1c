@@ -42,6 +42,7 @@ pub mod miner;
 pub mod pow;
 pub mod recursive_matrix_store;
 pub mod recursive_prover;
+pub mod selected_history_verifier;
 pub mod template;
 
 pub use miner::{BlockAppliedHook, BlockMiner, MinerConfig, MinerEvent};
@@ -59,6 +60,11 @@ pub use recursive_prover::{
     SelectedRecursiveLinkPredecessor, SelectedRecursiveLinkProof, SelectedRecursiveMatrixKind,
     SelectedRecursiveMatrixRequest, SelectedRecursiveMatrixSource, SelectedRecursiveProverError,
     SelectedRecursiveTier,
+};
+pub use selected_history_verifier::{
+    begin_selected_history_terminal_verification_session,
+    verify_selected_history_terminal_governed, SelectedHistoryTerminalVerificationSession,
+    SelectedHistoryTerminalVerifierError,
 };
 pub use template::{BlockTemplate, TemplateBuilder, TemplateRefreshTrigger};
 
