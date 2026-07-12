@@ -178,6 +178,7 @@ pub struct LocalSelectedRecursiveMatrixSource {
     root: PathBuf,
     max_artifact_bytes: u64,
     resident: Arc<AtomicBool>,
+    resident_evaluation: bool,
 }
 
 impl LocalSelectedRecursiveMatrixSource {
@@ -190,7 +191,17 @@ impl LocalSelectedRecursiveMatrixSource {
             root: root.into(),
             max_artifact_bytes,
             resident: process_matrix_residency(),
+            resident_evaluation: false,
         }
+    }
+
+    /// Choose the terminal claim-evaluation strategy for
+    /// [`Self::open_artifact_evaluator`]. Callers enable residency only under
+    /// an admission that covers one decoded CSR matrix
+    /// (`SELECTED_HISTORY_TERMINAL_RESIDENT_MATRIX_PEAK_MIB`); the default is
+    /// the bounded-memory streaming scanner.
+    pub fn set_resident_evaluation(&mut self, resident_evaluation: bool) {
+        self.resident_evaluation = resident_evaluation;
     }
 
     #[cfg(test)]
@@ -199,6 +210,7 @@ impl LocalSelectedRecursiveMatrixSource {
             root: root.into(),
             max_artifact_bytes,
             resident: Arc::new(AtomicBool::new(false)),
+            resident_evaluation: false,
         }
     }
 
@@ -246,6 +258,27 @@ impl LocalSelectedRecursiveMatrixSource {
             identity.shape(),
             identity.statement_digest(),
         )
+    }
+
+    /// Open one artifact for terminal claim evaluation under the source's
+    /// residency policy. Both variants recompute and authenticate the same
+    /// structural statement digest from the exact rows they evaluate;
+    /// residency changes only where those rows live — a decoded CSR with
+    /// parallel span hashing versus bounded single-pass streaming windows —
+    /// never the trust boundary.
+    pub fn open_artifact_evaluator(
+        &self,
+        identity: SelectedRecursiveMatrixArtifactIdentity,
+    ) -> Result<LoadedSelectedRecursiveMatrixEvaluator, LocalSelectedRecursiveMatrixError> {
+        if self.resident_evaluation {
+            Ok(LoadedSelectedRecursiveMatrixEvaluator::Resident(
+                self.load_artifact(identity)?,
+            ))
+        } else {
+            Ok(LoadedSelectedRecursiveMatrixEvaluator::Streamed(
+                self.open_artifact_view(identity)?,
+            ))
+        }
     }
 
     /// Atomically stream one canonical matrix to its fixed local path.
@@ -552,6 +585,37 @@ impl Drop for LoadedSelectedRecursiveMatrixView {
         drop(self.view.take());
         if let Some(release_callback) = self.release_callback.take() {
             release_callback();
+        }
+    }
+}
+
+/// One terminal claim-evaluation lease under the source's residency policy.
+/// Both variants hold the process-wide one-matrix admission until drop and
+/// recompute the structural statement digest from the exact rows they
+/// evaluate. Resident evaluation decodes the authenticated CSR once and
+/// hashes its spans in parallel; streamed evaluation keeps only bounded
+/// windows and re-scans the artifact per evaluation.
+pub enum LoadedSelectedRecursiveMatrixEvaluator {
+    Resident(crate::recursive_prover::LoadedSelectedRecursiveMatrix),
+    Streamed(LoadedSelectedRecursiveMatrixView),
+}
+
+impl MatrixClaimEvaluator for LoadedSelectedRecursiveMatrixEvaluator {
+    fn field_shape(&self) -> FieldShape {
+        match self {
+            Self::Resident(loaded) => FieldShape::of(loaded.matrix()),
+            Self::Streamed(view) => view.field_shape(),
+        }
+    }
+
+    fn evaluate_matrix_claims(
+        &mut self,
+        fresh: Option<&FreshLincheckClaim>,
+        accumulated: Option<&MatrixAccClaim>,
+    ) -> Result<AuthenticatedMatrixClaimEvaluations, FieldR1csArtifactError> {
+        match self {
+            Self::Resident(loaded) => loaded.matrix_mut().evaluate_matrix_claims(fresh, accumulated),
+            Self::Streamed(view) => view.evaluate_matrix_claims(fresh, accumulated),
         }
     }
 }
@@ -941,7 +1005,57 @@ mod tests {
     }
 
     #[test]
-    fn terminal_view_source_never_invokes_full_csr_decoder() {
+    fn resident_evaluator_matches_streamed_claims_and_holds_admission() {
+        use noid_ivc_core::matrix_claim::{stacked_matrix_mle_eval, MatrixAccClaim};
+
+        let directory = tempdir().unwrap();
+        let mut source = isolated_source(directory.path());
+        let matrix = tiny_matrix(0x9E51);
+        let matrix_identity = identity(SelectedRecursiveMatrixKind::GenesisLink, &matrix);
+        source.export_matrix(matrix_identity, &matrix).unwrap();
+        let mut claim = MatrixAccClaim {
+            point: vec![F128::new(3, 5); 2 * matrix.k_log + 1],
+            value: F128::ZERO,
+        };
+        claim.value = stacked_matrix_mle_eval(&matrix, &claim);
+
+        // The default policy serves the bounded streaming scanner.
+        let mut streamed = source.open_artifact_evaluator(matrix_identity).unwrap();
+        assert!(matches!(
+            streamed,
+            LoadedSelectedRecursiveMatrixEvaluator::Streamed(_)
+        ));
+        let streamed_eval = streamed.evaluate_matrix_claims(None, Some(&claim)).unwrap();
+        drop(streamed);
+
+        source.set_resident_evaluation(true);
+        let mut resident = source.open_artifact_evaluator(matrix_identity).unwrap();
+        assert!(matches!(
+            resident,
+            LoadedSelectedRecursiveMatrixEvaluator::Resident(_)
+        ));
+        // Both evaluator variants hold the same one-matrix admission.
+        assert!(matches!(
+            source.load_artifact(matrix_identity),
+            Err(LocalSelectedRecursiveMatrixError::MatrixAlreadyResident)
+        ));
+        let resident_eval = resident.evaluate_matrix_claims(None, Some(&claim)).unwrap();
+        assert_eq!(
+            resident_eval.structural_digest(),
+            matrix_identity.statement_digest()
+        );
+        assert_eq!(
+            resident_eval.structural_digest(),
+            streamed_eval.structural_digest()
+        );
+        assert_eq!(resident_eval.accumulated_value(), Some(claim.value));
+        assert_eq!(streamed_eval.accumulated_value(), Some(claim.value));
+        drop(resident);
+        drop(source.load_artifact(matrix_identity).unwrap());
+    }
+
+    #[test]
+    fn terminal_streaming_arm_never_invokes_full_csr_decoder() {
         let store = include_str!("recursive_matrix_store.rs");
         let view_entry = store
             .split("fn open_requested_view(")
@@ -962,6 +1076,19 @@ mod tests {
         assert!(!view_entry.contains("FieldR1cs::read_artifact"));
         assert!(!view_loader.contains("FieldR1cs::read_artifact"));
 
+        // Terminal claim evaluation dispatches on the residency policy: the
+        // resident arm is admitted only under the resident envelope, and the
+        // default remains the bounded streaming scanner.
+        let evaluator_entry = store
+            .split("pub fn open_artifact_evaluator(")
+            .nth(1)
+            .expect("terminal evaluator dispatch")
+            .split("fn load_requested(")
+            .next()
+            .expect("evaluator dispatch boundary");
+        assert!(evaluator_entry.contains("if self.resident_evaluation"));
+        assert!(evaluator_entry.contains("self.open_artifact_view(identity)"));
+
         let verifier = include_str!("selected_history_verifier.rs");
         let source_impl = verifier
             .split("impl SelectedHistoryMatrixSource for LocalSelectedRecursiveMatrixSource")
@@ -970,7 +1097,7 @@ mod tests {
             .split("/// Production terminal-verification failure")
             .next()
             .expect("source implementation boundary");
-        assert!(source_impl.contains("self.open_artifact_view("));
+        assert!(source_impl.contains("self.open_artifact_evaluator("));
         assert!(!source_impl.contains("load_artifact("));
     }
 

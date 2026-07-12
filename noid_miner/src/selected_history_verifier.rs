@@ -26,12 +26,19 @@ use crate::recursive_class_registry_store::{
     LocalSelectedRecursiveClassRegistryStore,
 };
 use crate::recursive_matrix_store::{
-    LoadedSelectedRecursiveMatrixView, LocalSelectedRecursiveMatrixError,
-    LocalSelectedRecursiveMatrixSource, SelectedRecursiveMatrixArtifactIdentity,
+    LoadedSelectedRecursiveMatrixEvaluator, LoadedSelectedRecursiveMatrixView,
+    LocalSelectedRecursiveMatrixError, LocalSelectedRecursiveMatrixSource,
+    SelectedRecursiveMatrixArtifactIdentity,
 };
 use crate::recursive_prover::{SelectedRecursiveMatrixKind, SelectedRecursiveTier};
 
 impl SelectedHistoryMatrixLease for LoadedSelectedRecursiveMatrixView {
+    fn evaluator(&mut self) -> &mut dyn noid_ivc_core::matrix_claim::MatrixClaimEvaluator {
+        self
+    }
+}
+
+impl SelectedHistoryMatrixLease for LoadedSelectedRecursiveMatrixEvaluator {
     fn evaluator(&mut self) -> &mut dyn noid_ivc_core::matrix_claim::MatrixClaimEvaluator {
         self
     }
@@ -66,14 +73,14 @@ fn history_matrix_kind(
 }
 
 impl SelectedHistoryMatrixSource for LocalSelectedRecursiveMatrixSource {
-    type Lease = LoadedSelectedRecursiveMatrixView;
+    type Lease = LoadedSelectedRecursiveMatrixEvaluator;
     type Error = LocalSelectedRecursiveMatrixError;
 
     fn load_matrix(
         &mut self,
         request: SelectedHistoryMatrixRequest,
     ) -> Result<Self::Lease, Self::Error> {
-        self.open_artifact_view(history_matrix_identity(request)?)
+        self.open_artifact_evaluator(history_matrix_identity(request)?)
     }
 }
 
@@ -168,9 +175,20 @@ pub struct SelectedHistoryTerminalVerificationSession {
     // Keeping the registry inside the session makes it impossible for the
     // pinned materialization performed through this API to outlive admission.
     loaded_registry: Option<LoadedSelectedRecursiveTerminalRegistry>,
+    // True when this admission covers one resident CSR matrix at a time, so
+    // matrix claims evaluate in RAM with parallel span hashing instead of the
+    // single-pass streaming scanner.
+    resident_matrices: bool,
 }
 
 impl SelectedHistoryTerminalVerificationSession {
+    /// Whether this admission covers resident one-at-a-time matrix
+    /// evaluation. Callers propagate this to
+    /// [`LocalSelectedRecursiveMatrixSource::set_resident_evaluation`].
+    pub fn matrix_residency(&self) -> bool {
+        self.resident_matrices
+    }
+
     /// Read, authenticate, preflight, and materialize the compact registry
     /// after this session has acquired the process-global 64 MiB envelope.
     /// The session admits exactly one load so two materialized registries can
@@ -245,10 +263,21 @@ pub fn begin_selected_history_terminal_verification_session(
 fn begin_terminal_verification_with_governor(
     governor: &ProofMemoryGovernor,
 ) -> Result<SelectedHistoryTerminalVerificationSession, SelectedHistoryTerminalVerifierError> {
-    Ok(SelectedHistoryTerminalVerificationSession {
-        _reservation: governor.try_reserve_for_selected_history_terminal_verification()?,
-        loaded_registry: None,
-    })
+    // Prefer the resident-matrix envelope: one decoded CSR at a time with
+    // parallel span hashing. Memory pressure falls back to the bounded
+    // streaming envelope so a low-RAM node can still verify from disk.
+    match governor.try_reserve_for_selected_history_terminal_verification_resident() {
+        Ok(reservation) => Ok(SelectedHistoryTerminalVerificationSession {
+            _reservation: reservation,
+            loaded_registry: None,
+            resident_matrices: true,
+        }),
+        Err(_pressure) => Ok(SelectedHistoryTerminalVerificationSession {
+            _reservation: governor.try_reserve_for_selected_history_terminal_verification()?,
+            loaded_registry: None,
+            resident_matrices: false,
+        }),
+    }
 }
 
 /// One-shot verifier for a registry that the caller already materialized under
@@ -276,16 +305,19 @@ pub fn verify_selected_history_terminal_governed<S: SelectedHistoryMatrixSource>
 /// Production pinned-registry entrypoint. Admission is acquired before the
 /// registry artifact is opened, and the same owning session retains both the
 /// registry and the process-global exclusion through terminal verification.
-pub fn verify_selected_history_terminal_pinned_governed<S: SelectedHistoryMatrixSource>(
+/// Matrix residency follows the granted admission: resident evaluation when
+/// the host has the memory, bounded streaming otherwise.
+pub fn verify_selected_history_terminal_pinned_governed(
     package: &SelectedHistoryTerminalPackage,
     registry_store: &LocalSelectedRecursiveClassRegistryStore,
     expected_registry_digest: [u8; 32],
     local_tip_header: &BlockHeader,
     local_epoch_anchor_header: &BlockHeader,
-    matrix_source: &mut S,
+    matrix_source: &mut LocalSelectedRecursiveMatrixSource,
 ) -> Result<ChainAccumulator, SelectedHistoryTerminalVerifierError> {
     let mut session = begin_selected_history_terminal_verification_session()?;
     session.load_pinned_registry(registry_store, expected_registry_digest)?;
+    matrix_source.set_resident_evaluation(session.matrix_residency());
     session.verify_with_loaded_registry(
         package,
         local_tip_header,
@@ -329,6 +361,7 @@ mod tests {
                 .try_reserve_selected_history_terminal_with_available(Some(2 * 1024))
                 .expect("first terminal verification admission"),
             loaded_registry: None,
+            resident_matrices: false,
         };
 
         assert!(governor
@@ -385,7 +418,7 @@ mod tests {
     fn pinned_entrypoint_reserves_before_loading_registry() {
         let source = include_str!("selected_history_verifier.rs");
         let entrypoint = source
-            .split("pub fn verify_selected_history_terminal_pinned_governed<")
+            .split("pub fn verify_selected_history_terminal_pinned_governed(")
             .nth(1)
             .expect("pinned governed entrypoint")
             .split("#[cfg(test)]")

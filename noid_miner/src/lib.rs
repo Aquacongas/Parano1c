@@ -60,9 +60,10 @@ pub use recursive_class_registry_store::{
     LocalSelectedRecursiveClassRegistryError, LocalSelectedRecursiveClassRegistryStore,
 };
 pub use recursive_matrix_store::{
-    selected_recursive_matrix_relative_path, LoadedSelectedRecursiveMatrixView,
-    LocalSelectedRecursiveMatrixError, LocalSelectedRecursiveMatrixSource,
-    SelectedRecursiveMatrixArtifactIdentity, MAX_SELECTED_RECURSIVE_MATRIX_ARTIFACT_BYTES,
+    selected_recursive_matrix_relative_path, LoadedSelectedRecursiveMatrixEvaluator,
+    LoadedSelectedRecursiveMatrixView, LocalSelectedRecursiveMatrixError,
+    LocalSelectedRecursiveMatrixSource, SelectedRecursiveMatrixArtifactIdentity,
+    MAX_SELECTED_RECURSIVE_MATRIX_ARTIFACT_BYTES,
 };
 pub use recursive_prover::{
     begin_selected_history_proof_session, prove_selected_recursive_block,

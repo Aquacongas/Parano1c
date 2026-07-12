@@ -2903,6 +2903,31 @@ impl LincheckCircuit for FieldRowCircuit<'_> {
 /// Poseidon2b round chains under option A). The witness is derived alongside,
 /// so `satisfies` holds by construction.
 pub fn synthetic_satisfiable(m: usize, k_log: usize, seed: u64) -> (FieldR1cs, Vec<F128>) {
+    synthetic_satisfiable_inner(m, k_log, seed, None)
+}
+
+/// Like [`synthetic_satisfiable`], but coefficients are drawn from a fixed
+/// pool of `dictionary_len` distinct nonzero values. Production verifier
+/// matrices carry only a few hundred distinct constants and the streaming
+/// artifact evaluator enforces that profile
+/// ([`STREAMING_FIELD_R1CS_MAX_DICTIONARY_VALUES`]); artifact/decider
+/// rooflines must match it or they reject at preflight.
+pub fn synthetic_satisfiable_bounded_dictionary(
+    m: usize,
+    k_log: usize,
+    seed: u64,
+    dictionary_len: usize,
+) -> (FieldR1cs, Vec<F128>) {
+    assert!(dictionary_len >= 1);
+    synthetic_satisfiable_inner(m, k_log, seed, Some(dictionary_len))
+}
+
+fn synthetic_satisfiable_inner(
+    m: usize,
+    k_log: usize,
+    seed: u64,
+    dictionary_len: Option<usize>,
+) -> (FieldR1cs, Vec<F128>) {
     let k = 1usize << k_log;
     assert!(k_log >= 1 && k_log <= m);
     let mut state = seed;
@@ -2913,15 +2938,31 @@ pub fn synthetic_satisfiable(m: usize, k_log: usize, seed: u64) -> (FieldR1cs, V
         z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
         z ^ (z >> 31)
     };
-    let mut next_f128_nonzero = move || loop {
-        let v = F128 {
-            lo: next_u64(),
-            hi: next_u64(),
-        };
-        if v != F128::ZERO {
-            return v;
+    let mut next_f128_nonzero: Box<dyn FnMut() -> F128> = match dictionary_len {
+        None => Box::new(move || loop {
+            let v = F128 {
+                lo: next_u64(),
+                hi: next_u64(),
+            };
+            if v != F128::ZERO {
+                return v;
+            }
+        }),
+        Some(len) => {
+            let mut pool = Vec::with_capacity(len);
+            while pool.len() < len {
+                let v = F128 {
+                    lo: next_u64(),
+                    hi: next_u64(),
+                };
+                if v != F128::ZERO && !pool.contains(&v) {
+                    pool.push(v);
+                }
+            }
+            Box::new(move || pool[(next_u64() as usize) % pool.len()])
         }
     };
+    let mut next_f128_nonzero = &mut *next_f128_nonzero;
 
     let gen_matrix =
         |rng: &mut dyn FnMut() -> u64, coeff: &mut dyn FnMut() -> F128| -> SparseFieldMatrix {

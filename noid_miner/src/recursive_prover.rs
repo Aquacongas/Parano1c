@@ -311,6 +311,14 @@ impl LoadedSelectedRecursiveMatrix {
             .expect("loaded recursive matrix exists until wrapper drop")
     }
 
+    /// Mutable borrow for resident claim evaluation; same RAII rules as
+    /// [`Self::matrix`].
+    pub(crate) fn matrix_mut(&mut self) -> &mut FieldR1cs {
+        self.matrix
+            .as_mut()
+            .expect("loaded recursive matrix exists until wrapper drop")
+    }
+
     pub(crate) fn with_release_callback(
         matrix: FieldR1cs,
         release_callback: impl FnOnce() + Send + 'static,

@@ -73,6 +73,20 @@ pub const SELECTED_HISTORY_TERMINAL_STREAMING_PEAK_MIB: usize = 16;
 pub const SELECTED_HISTORY_TERMINAL_VERIFY_PEAK_MIB: usize =
     SELECTED_RECURSIVE_TERMINAL_REGISTRY_MATERIALIZATION_PEAK_MIB
         + SELECTED_HISTORY_TERMINAL_STREAMING_PEAK_MIB;
+/// One resident terminal-verification matrix: the largest canonical m24 CSR
+/// decodes to under 2 GiB and both artifact decode scratch and parallel span
+/// hashing stay within the remainder of this envelope. Exactly one matrix is
+/// resident at a time under the same one-matrix lease as the prover path.
+pub const SELECTED_HISTORY_TERMINAL_RESIDENT_MATRIX_PEAK_MIB: usize = 3 * 1024;
+/// Terminal-verification admission with resident one-at-a-time matrix
+/// evaluation. Preferred whenever the host has the memory: every matrix scan
+/// is then RAM-resident with parallel span hashing instead of single-threaded
+/// bounded streaming. Falls back to
+/// [`SELECTED_HISTORY_TERMINAL_VERIFY_PEAK_MIB`] under memory pressure.
+pub const SELECTED_HISTORY_TERMINAL_VERIFY_RESIDENT_PEAK_MIB: usize =
+    SELECTED_RECURSIVE_TERMINAL_REGISTRY_MATERIALIZATION_PEAK_MIB
+        + SELECTED_HISTORY_TERMINAL_STREAMING_PEAK_MIB
+        + SELECTED_HISTORY_TERMINAL_RESIDENT_MATRIX_PEAK_MIB;
 
 /// Never let proof admission consume the complete host-visible allowance.
 const MIN_NODE_RESERVE_MIB: usize = 1024;
@@ -221,6 +235,18 @@ impl ProofMemoryGovernor {
         )
     }
 
+    /// Admit terminal verification with one resident matrix at a time. The
+    /// caller falls back to the streaming reservation above when this larger
+    /// envelope is refused, so low-RAM nodes keep the disk-backed path.
+    pub(crate) fn try_reserve_for_selected_history_terminal_verification_resident(
+        &self,
+    ) -> Result<ProofMemoryReservation, ProofMemoryPressure> {
+        self.try_reserve_required_mib(
+            SELECTED_HISTORY_TERMINAL_VERIFY_RESIDENT_PEAK_MIB,
+            system_available_memory_mib(),
+        )
+    }
+
     fn try_reserve_with_available(
         &self,
         user_txs: usize,
@@ -257,6 +283,17 @@ impl ProofMemoryGovernor {
         available_mib: Option<usize>,
     ) -> Result<ProofMemoryReservation, ProofMemoryPressure> {
         self.try_reserve_required_mib(SELECTED_HISTORY_TERMINAL_VERIFY_PEAK_MIB, available_mib)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_reserve_selected_history_terminal_resident_with_available(
+        &self,
+        available_mib: Option<usize>,
+    ) -> Result<ProofMemoryReservation, ProofMemoryPressure> {
+        self.try_reserve_required_mib(
+            SELECTED_HISTORY_TERMINAL_VERIFY_RESIDENT_PEAK_MIB,
+            available_mib,
+        )
     }
 
     fn try_reserve_required_mib(
@@ -465,6 +502,27 @@ mod tests {
             }
         );
         drop(reservation);
+    }
+
+    #[test]
+    fn terminal_resident_reservation_falls_back_to_streaming_envelope() {
+        // Plenty of memory: the resident envelope is admitted.
+        let governor = ProofMemoryGovernor::new(SELECTED_HISTORY_TERMINAL_VERIFY_RESIDENT_PEAK_MIB);
+        let resident = governor
+            .try_reserve_selected_history_terminal_resident_with_available(None)
+            .expect("resident terminal admission");
+        drop(resident);
+
+        // A low-RAM node refuses the resident envelope but still admits the
+        // bounded streaming envelope, exactly like the session fallback.
+        let low = ProofMemoryGovernor::new(SELECTED_HISTORY_TERMINAL_VERIFY_PEAK_MIB);
+        assert!(low
+            .try_reserve_selected_history_terminal_resident_with_available(None)
+            .is_err());
+        drop(
+            low.try_reserve_selected_history_terminal_with_available(None)
+                .expect("streaming terminal admission after resident refusal"),
+        );
     }
 
     #[test]

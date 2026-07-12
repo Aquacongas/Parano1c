@@ -294,7 +294,12 @@ fn start_selected_history_worker(
         .map_err(|error| format!("selected-history release registry rejected: {error}"))?;
     drop(registry_admission);
 
-    let matrix_source = noid_miner::LocalSelectedRecursiveMatrixSource::new(artifacts.root.clone());
+    let mut matrix_source =
+        noid_miner::LocalSelectedRecursiveMatrixSource::new(artifacts.root.clone());
+    // The worker verifies its own terminal package inside the retained
+    // 8 GiB proving session, after all transient proof matrices are gone;
+    // resident one-at-a-time claim evaluation always fits that admission.
+    matrix_source.set_resident_evaluation(true);
     let mut worker = selected_history_worker::SelectedHistoryProverWorker::new(
         store,
         registry_store,
