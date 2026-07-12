@@ -787,9 +787,8 @@ impl BlockMiner {
 ///
 /// # Correctness
 ///
-/// This uses the `WalletAuthorizationBundle` stored in each `MempoolEntry.cached_authorization`
-/// (when pre-proving cache is populated). When no bundles exist, the
-/// decoded from `authorization_bytes` at block assembly time.
+/// This uses the `WalletAuthorizationBundle` borrowed from each retained
+/// immutable mempool intent and copied only for the bounded selected template.
 ///
 /// # State correctness
 ///

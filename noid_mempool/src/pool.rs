@@ -28,8 +28,8 @@
 //! ## Pre-proving cache
 //!
 //! When a wallet submits a `TxIntent`, it includes a `WalletAuthorizationBundle`
-//! (one versioned witness-hiding proof). The pool stores this bundle in
-//! `MempoolEntry.cached_authorization` immediately at admission.
+//! (one versioned witness-hiding proof). The pool retains one immutable intent
+//! allocation and borrows the bundle suffix from it during block assembly.
 //! The block assembler uses cached bundles so that `prove_block` only
 //! needs to run the unified block-level SpineGKR + single FRI — the
 //! per-tx wallet work is already done.
@@ -47,7 +47,9 @@ use noid_chain::consensus::{
 use noid_chain::fri_state::SlotValue;
 use noid_chain::Mempool;
 use noid_poseidon2b::primitives::TxBodyHash;
-use noid_tx::{validate_public_tx_logic, Transaction, TxIntent};
+use noid_tx::{
+    validate_public_tx_logic, Transaction, TxIntent, TX_INTENT_FIXED_OVERHEAD, TX_INTENT_MARKER,
+};
 
 use crate::config::MempoolConfig;
 use crate::error::SubmitError;
@@ -118,7 +120,7 @@ fn entry_metadata(
         n_outputs: u8::try_from(entry.tx.body.live_output_count())
             .expect("fixed transaction output count fits u8"),
         admitted_height: entry.admitted_height,
-        has_authorization: entry.cached_authorization.is_some(),
+        has_authorization: entry.cached_authorization().is_some(),
     }
 }
 
@@ -204,6 +206,11 @@ impl AsyncMempool {
                 actual: intent_bytes.len(),
                 max: MAX_TX_INTENT_BYTES_GLOBAL,
             });
+        }
+        if !canonical_intent_bytes_match(&intent, &intent_bytes) {
+            return Err(SubmitError::MalformedIntent(
+                "decoded intent does not match retained canonical wire bytes".into(),
+            ));
         }
         // ── Stateless sanity check (no lock, no IO) ────────────────────
         // Canonical public logic rejects malformed intents before touching any
@@ -321,13 +328,9 @@ impl AsyncMempool {
             }
         }
 
-        // Store wallet proof bundle bytes for miner block assembly.
-        if !intent.authorization_bytes.is_empty() {
-            st.pool
-                .set_cached_authorization(&hash, intent.authorization_bytes);
-        }
         // One immutable allocation backs durable mempool serving and every
-        // broadcast subscriber; cloning the event is therefore O(1).
+        // broadcast subscriber. The miner's cached authorization is a borrowed
+        // suffix of this allocation rather than a second retained proof copy.
         let intent_bytes: Arc<[u8]> = intent_bytes.into();
         st.pool
             .set_intent_bytes(&hash, Arc::clone(&intent_bytes));
@@ -374,7 +377,7 @@ impl AsyncMempool {
             .into_iter()
             .map(|entry| SelectedMempoolEntry {
                 tx: entry.tx.clone(),
-                cached_authorization: entry.cached_authorization.clone(),
+                cached_authorization: entry.cached_authorization().map(<[u8]>::to_vec),
             })
             .collect()
     }
@@ -400,7 +403,7 @@ impl AsyncMempool {
             .take(limit)
             .map(|entry| SelectedMempoolEntry {
                 tx: entry.tx.clone(),
-                cached_authorization: entry.cached_authorization.clone(),
+                cached_authorization: entry.cached_authorization().map(<[u8]>::to_vec),
             })
             .collect()
     }
@@ -687,7 +690,7 @@ impl AsyncMempool {
                 state
                     .pool
                     .get(hash)
-                    .and_then(|entry| entry.cached_authorization.clone())
+                    .and_then(|entry| entry.cached_authorization().map(<[u8]>::to_vec))
             };
             let Some(authorization) = authorization else {
                 continue;
@@ -707,6 +710,28 @@ impl AsyncMempool {
 // ---------------------------------------------------------------------------
 // Helper: all cheap admission checks
 // ---------------------------------------------------------------------------
+
+/// Bind the semantic object to its retained wire allocation without encoding
+/// or cloning the potentially large authorization proof a second time.
+fn canonical_intent_bytes_match(intent: &TxIntent, bytes: &[u8]) -> bool {
+    let Ok(auth_len) = u32::try_from(intent.authorization_bytes.len()) else {
+        return false;
+    };
+    let Some(expected_len) = TX_INTENT_FIXED_OVERHEAD.checked_add(auth_len as usize) else {
+        return false;
+    };
+    if bytes.len() != expected_len {
+        return false;
+    }
+
+    let mut prefix = Vec::with_capacity(TX_INTENT_FIXED_OVERHEAD);
+    prefix.push(TX_INTENT_MARKER);
+    intent.tx_body.encode(&mut prefix);
+    prefix.extend_from_slice(&auth_len.to_le_bytes());
+    prefix.len() == TX_INTENT_FIXED_OVERHEAD
+        && bytes.starts_with(&prefix)
+        && bytes[TX_INTENT_FIXED_OVERHEAD..] == intent.authorization_bytes
+}
 
 /// Run every cheap admission check against `st`.
 ///
@@ -903,7 +928,8 @@ mod tests {
     use noid_chain::state::ChainState;
     use noid_poseidon2b::primitives::Address;
     use noid_tx::{
-        output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS,
+        output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, TX_INPUTS,
+        TX_INTENT_FIXED_OVERHEAD, TX_OUTPUTS,
     };
 
     use super::{check_input_slots, AsyncMempool};
@@ -920,6 +946,12 @@ mod tests {
             validity_bitmap: 0,
             is_coinbase: false,
         })
+    }
+
+    fn retained_intent(auth_byte: u8, auth_len: usize) -> Vec<u8> {
+        let mut bytes = vec![0; TX_INTENT_FIXED_OVERHEAD];
+        bytes.extend(std::iter::repeat_n(auth_byte, auth_len));
+        bytes
     }
 
     #[tokio::test]
@@ -943,10 +975,10 @@ mod tests {
             locked.pool.admit(low, 0).expect("admit low fee");
             locked
                 .pool
-                .set_cached_authorization(&high_id, vec![0xA5; 1024]);
+                .set_intent_bytes(&high_id, retained_intent(0xA5, 1024));
             locked
                 .pool
-                .set_cached_authorization(&low_id, vec![0x5A; 1024]);
+                .set_intent_bytes(&low_id, retained_intent(0x5A, 1024));
         }
 
         let one = pool.select_for_block_at_anchor(1, anchor).await;
@@ -972,9 +1004,6 @@ mod tests {
         {
             let mut locked = pool.state.lock().await;
             locked.pool.admit(tx, 7).expect("admit metadata fixture");
-            locked
-                .pool
-                .set_cached_authorization(&txid, vec![0xA5; 2 * 1024 * 1024]);
             locked
                 .pool
                 .set_intent_bytes(&txid, vec![0x5A; 2 * 1024 * 1024]);

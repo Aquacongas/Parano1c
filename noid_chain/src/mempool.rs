@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use noid_poseidon2b::primitives::{Digest, TxBodyHash};
-use noid_tx::Transaction;
+use noid_tx::{Transaction, TX_INTENT_FIXED_OVERHEAD};
 
 use crate::consensus::params::BLOCK_MAX_TXS;
 
@@ -71,13 +71,10 @@ pub struct MempoolEntry {
     /// transactions at similar fees.
     pub fee_rate: u64,
 
-    /// Cached versioned `WalletAuthorizationBundle` bytes provided
-    /// by the wallet at submission time.  Populated immediately on admission;
-    /// `None` only for coinbase or txs submitted without a proof bundle.
-    ///
-    /// The block assembler copies this into the public `BlockAuthSidecar`;
-    /// exact state-transition proving is built separately from the block body.
-    pub cached_authorization: Option<Vec<u8>>,
+    /// Length of the versioned `WalletAuthorizationBundle` suffix inside
+    /// `intent_bytes`. Zero means no retained authorization. Keeping only the
+    /// range metadata avoids retaining the same proof in a second allocation.
+    cached_authorization_len: u32,
 
     /// Raw `TxIntent` bytes as submitted by the wallet.
     /// Stored so the P2P mempool-sync protocol can re-serve existing TXs to
@@ -108,9 +105,19 @@ impl MempoolEntry {
             tx,
             admitted_height: current_height,
             fee_rate,
-            cached_authorization: None,
+            cached_authorization_len: 0,
             intent_bytes: Arc::from([]), // populated by AsyncMempool::submit
         }
+    }
+
+    /// Borrow the retained authorization directly from the immutable intent.
+    pub fn cached_authorization(&self) -> Option<&[u8]> {
+        let len = usize::try_from(self.cached_authorization_len).ok()?;
+        if len == 0 {
+            return None;
+        }
+        let end = TX_INTENT_FIXED_OVERHEAD.checked_add(len)?;
+        self.intent_bytes.get(TX_INTENT_FIXED_OVERHEAD..end)
     }
 }
 
@@ -329,23 +336,22 @@ impl Mempool {
         self.entries.iter()
     }
 
-    /// Store cached proof bytes for an admitted transaction.
-    /// Called by the async mempool after admission to attach the wallet's
-    /// `WalletAuthorizationBundle` bytes (from `TxIntent.authorization_bytes`).
-    pub fn set_cached_authorization(&mut self, hash: &TxBodyHash, proof_bytes: Vec<u8>) {
-        if let Some(entry) = self.entries.get_mut(hash) {
-            entry.cached_authorization = Some(proof_bytes);
-        }
-    }
-
-    /// Store raw TxIntent bytes for mempool-sync serving.
+    /// Store canonical raw TxIntent bytes for mempool-sync serving and retain
+    /// only the authorization suffix length. The proof itself is borrowed from
+    /// this one immutable allocation by miners and the block fast path.
     pub fn set_intent_bytes(
         &mut self,
         hash: &TxBodyHash,
         bytes: impl Into<Arc<[u8]>>,
     ) {
         if let Some(entry) = self.entries.get_mut(hash) {
-            entry.intent_bytes = bytes.into();
+            let bytes = bytes.into();
+            entry.cached_authorization_len = bytes
+                .len()
+                .checked_sub(TX_INTENT_FIXED_OVERHEAD)
+                .and_then(|len| u32::try_from(len).ok())
+                .unwrap_or(0);
+            entry.intent_bytes = bytes;
         }
     }
 
@@ -519,5 +525,24 @@ mod tests {
 
         let per_tx_rejected = pool.intent_bytes_prefix(4, usize::MAX, 3);
         assert!(per_tx_rejected.is_empty());
+    }
+
+    #[test]
+    fn cached_authorization_is_a_borrowed_intent_suffix() {
+        let mut pool = Mempool::new(1);
+        let transaction = tx(1, 2, 10, 1, [9u8; 32]);
+        let id = transaction.txid();
+        pool.admit(transaction, 0).unwrap();
+        let mut intent = vec![0u8; TX_INTENT_FIXED_OVERHEAD];
+        intent.extend_from_slice(&[0xA5; 64]);
+        pool.set_intent_bytes(&id, intent);
+
+        let entry = pool.get(&id).unwrap();
+        let authorization = entry.cached_authorization().unwrap();
+        assert_eq!(authorization, &[0xA5; 64]);
+        assert_eq!(
+            authorization.as_ptr(),
+            entry.intent_bytes[TX_INTENT_FIXED_OVERHEAD..].as_ptr()
+        );
     }
 }
