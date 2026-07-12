@@ -23,6 +23,8 @@ pub use accepted_block_batch::{
     prove_retained_block_certificate_batch_checkpoint_package,
     prove_retained_block_certificate_batch_checkpoint_package_from_boundary,
     prove_retained_full_accepted_block_batch_proof, public_history_checkpoint_proof_from_package,
+    reconstruct_selected_recursive_block_artifacts,
+    reconstruct_selected_recursive_block_artifacts_from_single_witness,
     verify_accepted_block_certificate_batch_checkpoint_package,
     verify_full_accepted_block_batch_native,
     verify_history_checkpoint_step_proof_with_verified_full_accepted_output,
@@ -31,6 +33,7 @@ pub use accepted_block_batch::{
     AcceptedBlockCertificateBatchWitness, FullAcceptedBlockBatchError, FullAcceptedBlockBatchItem,
     FullAcceptedBlockBatchOutput, FullAcceptedBlockBatchProofComponents,
     FullAcceptedBlockBatchWitness, RetainedFullAcceptedBlockBatchProof,
+    SelectedRecursiveBlockArtifacts,
 };
 pub use accepted_block_certificate::{
     accepted_block_certificate_batch_statement, accepted_block_certificate_batch_statement_digest,
