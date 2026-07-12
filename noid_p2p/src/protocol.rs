@@ -186,6 +186,11 @@ pub struct GetStateSegmentRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetStateSegmentResponse {
     pub segment_id: u16,
+    /// Exact snapshot height echoed from the request.
+    pub expected_tip_height: u64,
+    /// Exact snapshot hash echoed from the request. Together with the segment
+    /// ID and libp2p request ID this prevents cross-session response reuse.
+    pub expected_tip_hash: [u8; 32],
     pub eff_log: u8,
     /// Column data encoded by `noid_chain::storage::serial::encode_segment`.
     /// `None` if the peer cannot serve this segment.

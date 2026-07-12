@@ -35,7 +35,8 @@ use crate::behaviour::{NodeBehaviour, NodeBehaviourEvent};
 use crate::outbound_budget::OutboundResponseBudget;
 use crate::protocol::{
     BlockGossipMsg, GetHeadersResponse, GetHistoryProofResponse, GetMempoolResponse,
-    GetRecentBlockResponse, GetStateManifestResponse, GetStateSegmentResponse, NetworkTopics,
+    GetRecentBlockResponse, GetStateManifestResponse, GetStateSegmentRequest,
+    GetStateSegmentResponse, NetworkTopics,
 };
 
 struct PendingStateSegmentResponse {
@@ -94,6 +95,143 @@ const MAX_SNAPSHOT_EXPORTS: usize = 2;
 const MAX_OUTBOUND_BLOCK_RESPONSE_BYTES: usize =
     MAX_BLOCK_BYTES + MAX_BLOCK_PROOF_PLUS_SIDECAR_BYTES;
 const MAX_OUTBOUND_HISTORY_RESPONSE_BYTES: usize = MAX_HISTORY_PROOF_BYTES + MAX_HEADER_BYTES;
+const MAX_PENDING_RETAINED_BLOCK_REQUESTS: usize = 256;
+const MAX_PENDING_STATE_SEGMENT_REQUESTS: usize = 64;
+const _: () = assert!(
+    MAX_PENDING_STATE_SEGMENT_REQUESTS >= noid_chain::consensus::wire_limits::MAX_INFLIGHT_SEGMENTS
+);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingRetainedBlockRequest {
+    peer: PeerId,
+    height: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingStateSegmentRequest {
+    peer: PeerId,
+    segment_id: u16,
+    expected_tip_height: u64,
+    expected_tip_hash: [u8; 32],
+}
+
+/// A fixed-capacity request correlation table. Request IDs are local transport
+/// capabilities: a response is consumed exactly once and only by the peer and
+/// request tuple recorded when `send_request` returned that ID.
+struct BoundedPendingRequests<K, V> {
+    entries: std::collections::HashMap<K, V>,
+    max_len: usize,
+}
+
+impl<K: std::hash::Hash + Eq, V> BoundedPendingRequests<K, V> {
+    fn new(max_len: usize) -> Self {
+        Self {
+            entries: std::collections::HashMap::with_capacity(max_len),
+            max_len,
+        }
+    }
+
+    fn has_capacity(&self) -> bool {
+        self.entries.len() < self.max_len
+    }
+
+    fn try_insert(&mut self, request_id: K, pending: V) -> bool {
+        if !self.has_capacity() || self.entries.contains_key(&request_id) {
+            return false;
+        }
+        self.entries.insert(request_id, pending);
+        true
+    }
+
+    fn remove(&mut self, request_id: &K) -> Option<V> {
+        self.entries.remove(request_id)
+    }
+
+    fn retain(&mut self, keep: impl FnMut(&K, &mut V) -> bool) {
+        self.entries.retain(keep);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+fn retained_block_response_matches_pending(
+    pending: PendingRetainedBlockRequest,
+    peer: PeerId,
+    response_height: u64,
+) -> bool {
+    pending.peer == peer && pending.height == response_height
+}
+
+fn state_segment_response_matches_pending(
+    pending: PendingStateSegmentRequest,
+    peer: PeerId,
+    response: &GetStateSegmentResponse,
+) -> bool {
+    pending.peer == peer
+        && pending.segment_id == response.segment_id
+        && pending.expected_tip_height == response.expected_tip_height
+        && pending.expected_tip_hash == response.expected_tip_hash
+}
+
+fn unavailable_state_segment_response(request: &GetStateSegmentRequest) -> GetStateSegmentResponse {
+    GetStateSegmentResponse {
+        segment_id: request.segment_id,
+        expected_tip_height: request.expected_tip_height,
+        expected_tip_hash: request.expected_tip_hash,
+        eff_log: 0,
+        data: None,
+        inbound_memory_permit: None,
+        outbound_memory_permit: None,
+    }
+}
+
+fn notify_outbound_request_failed(
+    event_tx: &tokio::sync::broadcast::Sender<NetworkEvent>,
+    peer: PeerId,
+) {
+    // This is the same retry-driving signal used for request-response
+    // OutboundFailure. The connection may still be live; node sync state must
+    // nevertheless release the logical request and choose/retry a peer.
+    let _ = event_tx.send(NetworkEvent::PeerDisconnected(peer));
+}
+
+fn clear_peer_request_correlations(
+    pending_retained_block_requests: &mut BoundedPendingRequests<
+        request_response::OutboundRequestId,
+        PendingRetainedBlockRequest,
+    >,
+    pending_state_segment_requests: &mut BoundedPendingRequests<
+        request_response::OutboundRequestId,
+        PendingStateSegmentRequest,
+    >,
+    peer: PeerId,
+) {
+    pending_retained_block_requests.retain(|_, pending| pending.peer != peer);
+    pending_state_segment_requests.retain(|_, pending| pending.peer != peer);
+}
+
+fn fail_peer_requests(
+    pending_retained_block_requests: &mut BoundedPendingRequests<
+        request_response::OutboundRequestId,
+        PendingRetainedBlockRequest,
+    >,
+    pending_state_segment_requests: &mut BoundedPendingRequests<
+        request_response::OutboundRequestId,
+        PendingStateSegmentRequest,
+    >,
+    event_tx: &tokio::sync::broadcast::Sender<NetworkEvent>,
+    peer: PeerId,
+) {
+    clear_peer_request_correlations(
+        pending_retained_block_requests,
+        pending_state_segment_requests,
+        peer,
+    );
+    notify_outbound_request_failed(event_tx, peer);
+}
 
 // Hard caps on incoming response sizes are shared via noid_chain::consensus::wire_limits.
 
@@ -809,6 +947,10 @@ async fn run_swarm(
         std::collections::HashMap::new();
     let mut snapshot_segment_rate: std::collections::HashMap<PeerId, (u32, Instant)> =
         std::collections::HashMap::new();
+    let mut pending_retained_block_requests =
+        BoundedPendingRequests::new(MAX_PENDING_RETAINED_BLOCK_REQUESTS);
+    let mut pending_state_segment_requests =
+        BoundedPendingRequests::new(MAX_PENDING_STATE_SEGMENT_REQUESTS);
 
     // One waiting response of each kind is sufficient: the request-response
     // behaviour owns the next response while its codec writes it. Byte permits
@@ -859,7 +1001,15 @@ async fn run_swarm(
         // Drain all pending commands first (priority: outgoing blocks must propagate
         // immediately without waiting for swarm event processing).
         while let Ok(cmd) = cmd_rx.try_recv() {
-            handle_network_command(&mut swarm, cmd, &topics, &mut mempool_sync_last_request);
+            handle_network_command(
+                &mut swarm,
+                cmd,
+                &topics,
+                &mut mempool_sync_last_request,
+                &gossip_event_tx,
+                &mut pending_retained_block_requests,
+                &mut pending_state_segment_requests,
+            );
         }
 
         tokio::select! {
@@ -889,6 +1039,8 @@ async fn run_swarm(
                     &mut mempool_sync_last_request,
                     &mut snapshot_manifest_last_request,
                     &mut snapshot_segment_rate,
+                    &mut pending_retained_block_requests,
+                    &mut pending_state_segment_requests,
                 )
                 .await;
             }
@@ -979,6 +1131,9 @@ async fn run_swarm(
                         cmd,
                         &topics,
                         &mut mempool_sync_last_request,
+                        &gossip_event_tx,
+                        &mut pending_retained_block_requests,
+                        &mut pending_state_segment_requests,
                     ),
                     None => break, // cmd_tx dropped
                 }
@@ -1158,6 +1313,15 @@ fn handle_network_command(
     cmd: NetworkCommand,
     topics: &NetworkTopics,
     mempool_sync_last_request: &mut std::collections::HashMap<PeerId, Instant>,
+    failure_event_tx: &tokio::sync::broadcast::Sender<NetworkEvent>,
+    pending_retained_block_requests: &mut BoundedPendingRequests<
+        request_response::OutboundRequestId,
+        PendingRetainedBlockRequest,
+    >,
+    pending_state_segment_requests: &mut BoundedPendingRequests<
+        request_response::OutboundRequestId,
+        PendingStateSegmentRequest,
+    >,
 ) {
     match cmd {
         NetworkCommand::AnnounceBlock {
@@ -1230,17 +1394,53 @@ fn handle_network_command(
             // request queue after every applied response.
             const SYNC_WINDOW: u64 = 1;
             for h in from_height..(from_height + (count as u64).min(SYNC_WINDOW)) {
-                let _ = swarm
+                if !pending_retained_block_requests.has_capacity() {
+                    tracing::warn!(
+                        peer = %peer,
+                        height = h,
+                        limit = MAX_PENDING_RETAINED_BLOCK_REQUESTS,
+                        "retained-block request correlation table full"
+                    );
+                    fail_peer_requests(
+                        pending_retained_block_requests,
+                        pending_state_segment_requests,
+                        failure_event_tx,
+                        peer,
+                    );
+                    break;
+                }
+                let request_id = swarm
                     .behaviour_mut()
                     .block_sync
                     .send_request(&peer, crate::protocol::GetRecentBlockRequest { height: h });
+                let inserted = pending_retained_block_requests
+                    .try_insert(request_id, PendingRetainedBlockRequest { peer, height: h });
+                debug_assert!(inserted, "fresh block-sync request ID must be unique");
             }
         }
         NetworkCommand::RequestBlock { peer, height } => {
-            let _ = swarm
+            if !pending_retained_block_requests.has_capacity() {
+                tracing::warn!(
+                    peer = %peer,
+                    height,
+                    limit = MAX_PENDING_RETAINED_BLOCK_REQUESTS,
+                    "retained-block request correlation table full"
+                );
+                fail_peer_requests(
+                    pending_retained_block_requests,
+                    pending_state_segment_requests,
+                    failure_event_tx,
+                    peer,
+                );
+                return;
+            }
+            let request_id = swarm
                 .behaviour_mut()
                 .block_sync
                 .send_request(&peer, crate::protocol::GetRecentBlockRequest { height });
+            let inserted = pending_retained_block_requests
+                .try_insert(request_id, PendingRetainedBlockRequest { peer, height });
+            debug_assert!(inserted, "fresh block-sync request ID must be unique");
         }
         NetworkCommand::RequestStateManifest {
             peer,
@@ -1258,7 +1458,31 @@ fn handle_network_command(
             expected_tip_height,
             expected_tip_hash,
         } => {
-            let _ = swarm.behaviour_mut().state_segment_sync.send_request(
+            // The node owns exactly one active snapshot session. Retire request
+            // IDs from superseded sessions immediately instead of retaining
+            // them for the 60-second libp2p timeout. A delayed response for a
+            // retired ID is consequently unknown and inert.
+            pending_state_segment_requests.retain(|_, pending| {
+                pending.peer == peer
+                    && pending.expected_tip_height == expected_tip_height
+                    && pending.expected_tip_hash == expected_tip_hash
+            });
+            if !pending_state_segment_requests.has_capacity() {
+                tracing::warn!(
+                    peer = %peer,
+                    segment_id,
+                    limit = MAX_PENDING_STATE_SEGMENT_REQUESTS,
+                    "state-segment request correlation table full"
+                );
+                fail_peer_requests(
+                    pending_retained_block_requests,
+                    pending_state_segment_requests,
+                    failure_event_tx,
+                    peer,
+                );
+                return;
+            }
+            let request_id = swarm.behaviour_mut().state_segment_sync.send_request(
                 &peer,
                 crate::protocol::GetStateSegmentRequest {
                     segment_id,
@@ -1266,6 +1490,16 @@ fn handle_network_command(
                     expected_tip_hash,
                 },
             );
+            let inserted = pending_state_segment_requests.try_insert(
+                request_id,
+                PendingStateSegmentRequest {
+                    peer,
+                    segment_id,
+                    expected_tip_height,
+                    expected_tip_hash,
+                },
+            );
+            debug_assert!(inserted, "fresh segment-sync request ID must be unique");
             tracing::debug!(peer = %peer, segment_id, "requesting state segment");
         }
         NetworkCommand::RequestHistoryProof {
@@ -1340,7 +1574,26 @@ async fn handle_swarm_event(
     mempool_sync_last_request: &mut std::collections::HashMap<PeerId, Instant>,
     snapshot_manifest_last_request: &mut std::collections::HashMap<PeerId, Instant>,
     snapshot_segment_rate: &mut std::collections::HashMap<PeerId, (u32, Instant)>,
+    pending_retained_block_requests: &mut BoundedPendingRequests<
+        request_response::OutboundRequestId,
+        PendingRetainedBlockRequest,
+    >,
+    pending_state_segment_requests: &mut BoundedPendingRequests<
+        request_response::OutboundRequestId,
+        PendingStateSegmentRequest,
+    >,
 ) {
+    macro_rules! fail_peer {
+        ($peer:expr) => {
+            fail_peer_requests(
+                pending_retained_block_requests,
+                pending_state_segment_requests,
+                gossip_event_tx,
+                $peer,
+            )
+        };
+    }
+
     match event {
         // --- GossipSub: received broadcast ---
         SwarmEvent::Behaviour(NodeBehaviourEvent::Gossipsub(gossipsub::Event::Message {
@@ -1671,28 +1924,58 @@ async fn handle_swarm_event(
         // --- Block pull: client received block + proof ---
         SwarmEvent::Behaviour(NodeBehaviourEvent::BlockSync(
             request_response::Event::Message {
-                message: request_response::Message::Response { response, .. },
+                message:
+                    request_response::Message::Response {
+                        request_id,
+                        response,
+                    },
                 peer,
             },
         )) => {
+            let Some(pending) = pending_retained_block_requests.remove(&request_id) else {
+                tracing::warn!(
+                    peer = %peer,
+                    request_id = %request_id,
+                    response_height = response.height,
+                    "unknown or delayed retained-block response — dropped"
+                );
+                return;
+            };
+            if !retained_block_response_matches_pending(pending, peer, response.height) {
+                tracing::warn!(
+                    peer = %peer,
+                    request_id = %request_id,
+                    requested_peer = %pending.peer,
+                    requested_height = pending.height,
+                    response_height = response.height,
+                    "retained-block response does not match its exact request — dropped"
+                );
+                fail_peer!(pending.peer);
+                return;
+            }
             let inbound_memory_permit = response.inbound_memory_permit.clone();
             if let Some(block_bytes) = response.block_bytes {
                 if block_bytes.len() > MAX_BLOCK_BYTES {
                     tracing::warn!(peer = %peer, len = block_bytes.len(), "block pull response too large — dropped");
+                    fail_peer!(pending.peer);
                 } else if !pulled_block_bytes_match_height(&block_bytes, response.height) {
                     tracing::warn!(peer = %peer, response_height = response.height, "block pull response header/height mismatch — dropped");
+                    fail_peer!(pending.peer);
                 } else {
                     let proof_bytes = response.block_proof_bytes.unwrap_or_default();
                     let auth_sidecar_bytes = response.block_auth_sidecar_bytes.unwrap_or_default();
                     if proof_bytes.len() > MAX_BLOCK_PROOF_BYTES {
                         tracing::warn!(peer = %peer, len = proof_bytes.len(), "block proof too large — dropped");
+                        fail_peer!(pending.peer);
                     } else if auth_sidecar_bytes.len() > MAX_BLOCK_AUTH_SIDECAR_BYTES {
                         tracing::warn!(peer = %peer, len = auth_sidecar_bytes.len(), "block auth sidecar too large — dropped");
+                        fail_peer!(pending.peer);
                     } else if !proof_sidecar_combined_len_ok(
                         proof_bytes.len(),
                         auth_sidecar_bytes.len(),
                     ) {
                         tracing::warn!(peer = %peer, proof_len = proof_bytes.len(), sidecar_len = auth_sidecar_bytes.len(), "block proof+sidecar combined cap exceeded — dropped");
+                        fail_peer!(pending.peer);
                     } else {
                         const BLOCK_RATE_WINDOW: Duration = Duration::from_secs(10);
                         const BLOCK_RATE_MAX: u32 = 40;
@@ -1703,6 +1986,7 @@ async fn handle_swarm_event(
                             BLOCK_RATE_WINDOW,
                         ) {
                             tracing::debug!(peer = %peer, "pulled block response rate limit exceeded — dropped before event channel");
+                            fail_peer!(pending.peer);
                             return;
                         }
                         tracing::debug!(peer = %peer, "received block via pull");
@@ -2136,58 +2420,34 @@ async fn handle_swarm_event(
             }
             if entry.0 >= MAX_SEGMENT_REQUESTS_PER_WINDOW {
                 tracing::debug!(peer = %peer, "snapshot segment request rate limited");
-                let _ = swarm.behaviour_mut().state_segment_sync.send_response(
-                    channel,
-                    GetStateSegmentResponse {
-                        segment_id: request.segment_id,
-                        eff_log: 0,
-                        data: None,
-                        inbound_memory_permit: None,
-                        outbound_memory_permit: None,
-                    },
-                );
+                let _ = swarm
+                    .behaviour_mut()
+                    .state_segment_sync
+                    .send_response(channel, unavailable_state_segment_response(&request));
                 return;
             }
             entry.0 += 1;
             prune_snapshot_exports(snapshot_exports);
             let key = (request.expected_tip_height, request.expected_tip_hash);
             let Some(export) = snapshot_exports.get(&key).cloned() else {
-                let _ = swarm.behaviour_mut().state_segment_sync.send_response(
-                    channel,
-                    GetStateSegmentResponse {
-                        segment_id: request.segment_id,
-                        eff_log: 0,
-                        data: None,
-                        inbound_memory_permit: None,
-                        outbound_memory_permit: None,
-                    },
-                );
+                let _ = swarm
+                    .behaviour_mut()
+                    .state_segment_sync
+                    .send_response(channel, unavailable_state_segment_response(&request));
                 return;
             };
             let Some(descriptor) = export.manifest().segment(request.segment_id).copied() else {
-                let _ = swarm.behaviour_mut().state_segment_sync.send_response(
-                    channel,
-                    GetStateSegmentResponse {
-                        segment_id: request.segment_id,
-                        eff_log: 0,
-                        data: None,
-                        inbound_memory_permit: None,
-                        outbound_memory_permit: None,
-                    },
-                );
+                let _ = swarm
+                    .behaviour_mut()
+                    .state_segment_sync
+                    .send_response(channel, unavailable_state_segment_response(&request));
                 return;
             };
             let Ok(permit) = segment_encode_semaphore.clone().try_acquire_owned() else {
-                let _ = swarm.behaviour_mut().state_segment_sync.send_response(
-                    channel,
-                    GetStateSegmentResponse {
-                        segment_id: request.segment_id,
-                        eff_log: 0,
-                        data: None,
-                        inbound_memory_permit: None,
-                        outbound_memory_permit: None,
-                    },
-                );
+                let _ = swarm
+                    .behaviour_mut()
+                    .state_segment_sync
+                    .send_response(channel, unavailable_state_segment_response(&request));
                 return;
             };
             let effective_log = export.manifest().effective_log_segment_size;
@@ -2199,18 +2459,14 @@ async fn handle_swarm_event(
                     declared_len,
                     "snapshot descriptor has non-canonical segment length"
                 );
-                let _ = swarm.behaviour_mut().state_segment_sync.send_response(
-                    channel,
-                    GetStateSegmentResponse {
-                        segment_id: request.segment_id,
-                        eff_log: 0,
-                        data: None,
-                        inbound_memory_permit: None,
-                        outbound_memory_permit: None,
-                    },
-                );
+                let _ = swarm
+                    .behaviour_mut()
+                    .state_segment_sync
+                    .send_response(channel, unavailable_state_segment_response(&request));
                 return;
             }
+            let requested_tip_height = request.expected_tip_height;
+            let requested_tip_hash = request.expected_tip_hash;
             let completion = segment_response_tx.clone();
             let budget = outbound_response_budget.clone();
             tokio::spawn(async move {
@@ -2227,6 +2483,8 @@ async fn handle_swarm_event(
                 let response = match loaded {
                     Ok(Ok(data)) => GetStateSegmentResponse {
                         segment_id: descriptor.segment_id,
+                        expected_tip_height: requested_tip_height,
+                        expected_tip_hash: requested_tip_hash,
                         eff_log: effective_log,
                         data: Some(data),
                         inbound_memory_permit: None,
@@ -2236,6 +2494,8 @@ async fn handle_swarm_event(
                         tracing::warn!(segment = descriptor.segment_id, err = %error, "disk snapshot segment read failed");
                         GetStateSegmentResponse {
                             segment_id: descriptor.segment_id,
+                            expected_tip_height: requested_tip_height,
+                            expected_tip_hash: requested_tip_hash,
                             eff_log: 0,
                             data: None,
                             inbound_memory_permit: None,
@@ -2248,6 +2508,8 @@ async fn handle_swarm_event(
                         tracing::warn!(segment = descriptor.segment_id, err = %error, "snapshot segment worker failed");
                         GetStateSegmentResponse {
                             segment_id: descriptor.segment_id,
+                            expected_tip_height: requested_tip_height,
+                            expected_tip_hash: requested_tip_hash,
                             eff_log: 0,
                             data: None,
                             inbound_memory_permit: None,
@@ -2264,13 +2526,41 @@ async fn handle_swarm_event(
         // --- State sync: segment client (step 2 response) ---
         SwarmEvent::Behaviour(NodeBehaviourEvent::StateSegmentSync(
             request_response::Event::Message {
-                message: request_response::Message::Response { response, .. },
+                message:
+                    request_response::Message::Response {
+                        request_id,
+                        response,
+                    },
                 peer,
             },
         )) => {
+            let Some(pending) = pending_state_segment_requests.remove(&request_id) else {
+                tracing::warn!(
+                    peer = %peer,
+                    request_id = %request_id,
+                    segment = response.segment_id,
+                    "unknown or delayed state-segment response — dropped"
+                );
+                return;
+            };
+            if !state_segment_response_matches_pending(pending, peer, &response) {
+                tracing::warn!(
+                    peer = %peer,
+                    request_id = %request_id,
+                    requested_peer = %pending.peer,
+                    requested_segment = pending.segment_id,
+                    requested_height = pending.expected_tip_height,
+                    response_segment = response.segment_id,
+                    response_height = response.expected_tip_height,
+                    "state-segment response does not match its exact request — dropped"
+                );
+                fail_peer!(pending.peer);
+                return;
+            }
             if let Some(ref data) = response.data {
                 let Some(expected_len) = encoded_segment_len_for_eff_log(response.eff_log) else {
                     tracing::warn!(peer = %peer, segment = response.segment_id, eff_log = response.eff_log, "segment response has invalid effective segment log — dropped");
+                    fail_peer!(pending.peer);
                     return;
                 };
                 if data.len() != expected_len {
@@ -2281,10 +2571,12 @@ async fn handle_swarm_event(
                         expected = expected_len,
                         "segment response encoded length mismatch — dropped"
                     );
+                    fail_peer!(pending.peer);
                     return;
                 }
                 if data.len() > MAX_SEGMENT_BYTES {
                     tracing::warn!(peer = %peer, segment = response.segment_id, len = data.len(), "segment response too large — dropped");
+                    fail_peer!(pending.peer);
                     return;
                 }
             }
@@ -2427,6 +2719,11 @@ async fn handle_swarm_event(
                 mempool_sync_last_request.remove(&peer_id);
                 snapshot_manifest_last_request.remove(&peer_id);
                 snapshot_segment_rate.remove(&peer_id);
+                clear_peer_request_correlations(
+                    pending_retained_block_requests,
+                    pending_state_segment_requests,
+                    peer_id,
+                );
                 // Schedule reconnect for peers we dialled (outbound connections).
                 // We don't attempt to reconnect inbound peers — they should re-dial us.
                 if let libp2p::core::ConnectedPoint::Dialer { address, .. } = endpoint {
@@ -2449,11 +2746,22 @@ async fn handle_swarm_event(
 
         // --- Request-response failure: emit event so consumers can retry ---
         SwarmEvent::Behaviour(NodeBehaviourEvent::BlockSync(
-            request_response::Event::OutboundFailure { peer, error, .. },
+            request_response::Event::OutboundFailure {
+                peer,
+                request_id,
+                error,
+            },
         )) => {
             tracing::debug!(peer = %peer, err = %error, "block sync request failed");
+            let correlated = pending_retained_block_requests
+                .remove(&request_id)
+                .is_some_and(|pending| pending.peer == peer);
+            if !correlated {
+                tracing::debug!(peer = %peer, request_id = %request_id, "ignoring stale block-sync failure");
+                return;
+            }
             // Emit a generic disconnect so the sync state machine can retry.
-            let _ = gossip_event_tx.send(NetworkEvent::PeerDisconnected(peer));
+            fail_peer!(peer);
         }
 
         SwarmEvent::Behaviour(NodeBehaviourEvent::StateManifestSync(
@@ -2464,10 +2772,21 @@ async fn handle_swarm_event(
         }
 
         SwarmEvent::Behaviour(NodeBehaviourEvent::StateSegmentSync(
-            request_response::Event::OutboundFailure { peer, error, .. },
+            request_response::Event::OutboundFailure {
+                peer,
+                request_id,
+                error,
+            },
         )) => {
             tracing::debug!(peer = %peer, err = %error, "segment sync request failed");
-            let _ = gossip_event_tx.send(NetworkEvent::PeerDisconnected(peer));
+            let correlated = pending_state_segment_requests
+                .remove(&request_id)
+                .is_some_and(|pending| pending.peer == peer);
+            if !correlated {
+                tracing::debug!(peer = %peer, request_id = %request_id, "ignoring stale segment-sync failure");
+                return;
+            }
+            fail_peer!(peer);
         }
 
         SwarmEvent::Behaviour(NodeBehaviourEvent::ProofSync(
@@ -2538,6 +2857,107 @@ mod tests {
         let response =
             sanitize_stored_block_response(78, Some(bytes), Some(vec![1]), Some(vec![2]));
         assert_eq!(response, (None, None, None));
+    }
+
+    #[test]
+    fn retained_block_transport_rejects_unknown_peer_height_and_replay() {
+        let peer = PeerId::random();
+        let other_peer = PeerId::random();
+        let pending = PendingRetainedBlockRequest { peer, height: 77 };
+        assert!(retained_block_response_matches_pending(pending, peer, 77));
+        assert!(!retained_block_response_matches_pending(
+            pending, other_peer, 77
+        ));
+        assert!(!retained_block_response_matches_pending(pending, peer, 78));
+
+        let mut registry = BoundedPendingRequests::new(2);
+        assert!(registry.try_insert(10u64, pending));
+        assert!(registry.try_insert(11, PendingRetainedBlockRequest { peer, height: 78 }));
+        assert!(!registry.try_insert(12, PendingRetainedBlockRequest { peer, height: 79 }));
+        assert_eq!(registry.len(), 2);
+        assert!(
+            registry.remove(&999).is_none(),
+            "unknown delayed ID is inert"
+        );
+        assert_eq!(registry.remove(&10), Some(pending));
+        assert!(
+            registry.remove(&10).is_none(),
+            "one request ID is single-use"
+        );
+        assert!(registry.try_insert(12, PendingRetainedBlockRequest { peer, height: 79 }));
+        registry.retain(|_, entry| entry.peer != peer);
+        assert_eq!(registry.len(), 0, "disconnect clears peer-owned requests");
+
+        let (failure_tx, mut failure_rx) = tokio::sync::broadcast::channel(1);
+        notify_outbound_request_failed(&failure_tx, peer);
+        assert!(matches!(
+            failure_rx.try_recv(),
+            Ok(NetworkEvent::PeerDisconnected(failed_peer)) if failed_peer == peer
+        ));
+    }
+
+    #[test]
+    fn state_segment_transport_rejects_same_peer_cross_session_response() {
+        let peer = PeerId::random();
+        let old = PendingStateSegmentRequest {
+            peer,
+            segment_id: 7,
+            expected_tip_height: 144,
+            expected_tip_hash: [0xA5; 32],
+        };
+        let response = GetStateSegmentResponse {
+            segment_id: 7,
+            expected_tip_height: 144,
+            expected_tip_hash: [0xA5; 32],
+            eff_log: 0,
+            data: None,
+            inbound_memory_permit: None,
+            outbound_memory_permit: None,
+        };
+        assert!(state_segment_response_matches_pending(old, peer, &response));
+
+        let new_session = PendingStateSegmentRequest {
+            expected_tip_height: 145,
+            expected_tip_hash: [0x5A; 32],
+            ..old
+        };
+        assert!(!state_segment_response_matches_pending(
+            new_session,
+            peer,
+            &response
+        ));
+        assert!(!state_segment_response_matches_pending(
+            old,
+            PeerId::random(),
+            &response
+        ));
+
+        let mut registry = BoundedPendingRequests::new(2);
+        assert!(registry.try_insert(1u64, old));
+        assert!(registry.try_insert(
+            2,
+            PendingStateSegmentRequest {
+                segment_id: 8,
+                ..old
+            }
+        ));
+        registry.retain(|_, pending| {
+            pending.peer == new_session.peer
+                && pending.expected_tip_height == new_session.expected_tip_height
+                && pending.expected_tip_hash == new_session.expected_tip_hash
+        });
+        assert_eq!(registry.len(), 0, "new snapshot session retires old IDs");
+        assert!(registry.try_insert(3, new_session));
+
+        let request = GetStateSegmentRequest {
+            segment_id: 9,
+            expected_tip_height: 200,
+            expected_tip_hash: [0xCC; 32],
+        };
+        let unavailable = unavailable_state_segment_response(&request);
+        assert_eq!(unavailable.segment_id, request.segment_id);
+        assert_eq!(unavailable.expected_tip_height, request.expected_tip_height);
+        assert_eq!(unavailable.expected_tip_hash, request.expected_tip_hash);
     }
 
     #[test]

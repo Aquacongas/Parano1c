@@ -286,9 +286,9 @@ impl NodeBehaviour {
         // 16 concurrent streams lets us pipeline downloads aggressively.
         let state_segment_sync = request_response::Behaviour::new(
             [(
-                // v2 validates the fixed length header before allocation and
-                // streams the segment without a duplicate CBOR buffer.
-                StreamProtocol::try_from_owned(format!("{}/sync/segment/2", protocol_id))?,
+                // v3 additionally echoes the exact snapshot boundary in every
+                // response, while retaining pre-allocation length validation.
+                StreamProtocol::try_from_owned(format!("{}/sync/segment/3", protocol_id))?,
                 ProtocolSupport::Full,
             )],
             request_response::Config::default()

@@ -2059,15 +2059,38 @@ fn validate_p2p_block_proof_binding(
     Ok(())
 }
 
+fn state_segment_response_matches_snapshot_boundary(
+    response_tip_height: u64,
+    response_tip_hash: [u8; 32],
+    expected_tip_height: u64,
+    expected_tip_hash: [u8; 32],
+) -> bool {
+    response_tip_height == expected_tip_height && response_tip_hash == expected_tip_hash
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         compare_manifest_fork_choice, gap_requires_snapshot_sync, snapshot_header_next_action,
+        state_segment_response_matches_snapshot_boundary,
         validate_selected_terminal_tip_future_drift, validate_snapshot_header_batch_admission,
         validate_snapshot_staged_header_boundary, BoundedRelayTerminalPeers, OrphanBlock,
         ProvedBlockCandidate, RemoteSelectedHistoryRequestKey, SelectedTerminalHeaderBoundary,
         SnapshotHeaderNextAction, MAX_TRACKED_RELAY_TERMINAL_PEERS,
     };
+
+    #[test]
+    fn snapshot_segment_rejects_delayed_same_peer_cross_session_boundary() {
+        assert!(state_segment_response_matches_snapshot_boundary(
+            144, [0xA5; 32], 144, [0xA5; 32]
+        ));
+        assert!(!state_segment_response_matches_snapshot_boundary(
+            144, [0xA5; 32], 145, [0xA5; 32]
+        ));
+        assert!(!state_segment_response_matches_snapshot_boundary(
+            144, [0xA5; 32], 144, [0x5A; 32]
+        ));
+    }
 
     #[test]
     fn relay_terminal_response_correlation_rejects_every_identity_mismatch() {
@@ -4224,6 +4247,42 @@ async fn handle_p2p_events(
                         from = %from,
                         segment = response.segment_id,
                         "snapshot install active — releasing stale segment response"
+                    );
+                    drop(response);
+                    continue;
+                }
+                let Some((selected_peer, selected_tip_height, selected_tip_hash)) =
+                    pending_manifest.as_ref().map(|pending| {
+                        (
+                            pending.from,
+                            pending.manifest.tip_height,
+                            pending.manifest.tip_hash,
+                        )
+                    })
+                else {
+                    tracing::warn!(
+                        from = %from,
+                        segment = response.segment_id,
+                        "snapshot segment has no active manifest — dropped"
+                    );
+                    drop(response);
+                    continue;
+                };
+                if selected_peer != from
+                    || !state_segment_response_matches_snapshot_boundary(
+                        response.expected_tip_height,
+                        response.expected_tip_hash,
+                        selected_tip_height,
+                        selected_tip_hash,
+                    )
+                {
+                    tracing::warn!(
+                        from = %from,
+                        selected_peer = %selected_peer,
+                        segment = response.segment_id,
+                        response_height = response.expected_tip_height,
+                        selected_height = selected_tip_height,
+                        "snapshot segment belongs to another peer/session boundary — dropped"
                     );
                     drop(response);
                     continue;

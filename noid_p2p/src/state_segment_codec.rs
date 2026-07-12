@@ -22,10 +22,10 @@ use crate::{
     protocol::{GetStateSegmentRequest, GetStateSegmentResponse},
 };
 
-const REQUEST_MAGIC: [u8; 4] = *b"NSR2";
-const RESPONSE_MAGIC: [u8; 4] = *b"NSS2";
+const REQUEST_MAGIC: [u8; 4] = *b"NSR3";
+const RESPONSE_MAGIC: [u8; 4] = *b"NSS3";
 const REQUEST_HEADER_BYTES: usize = 48;
-const RESPONSE_HEADER_BYTES: usize = 12;
+const RESPONSE_HEADER_BYTES: usize = 52;
 const NONE_LEN: u32 = u32::MAX;
 #[derive(Debug, Clone)]
 pub struct StateSegmentCodec {
@@ -116,10 +116,10 @@ impl request_response::Codec for StateSegmentCodec {
     {
         let mut header = [0u8; RESPONSE_HEADER_BYTES];
         io.read_exact(&mut header).await?;
-        let (segment_id, eff_log, encoded_len) = parse_response_header(&header)?;
-        let payload_len = decoded_len(encoded_len);
+        let fields = parse_response_header(&header)?;
+        let payload_len = decoded_len(fields.encoded_len);
         let inbound_memory_permit = self.acquire_inbound(payload_len).await?;
-        let data = if encoded_len == NONE_LEN {
+        let data = if fields.encoded_len == NONE_LEN {
             None
         } else {
             let mut bytes = Vec::new();
@@ -132,8 +132,10 @@ impl request_response::Codec for StateSegmentCodec {
         };
         ensure_eof(io).await?;
         Ok(GetStateSegmentResponse {
-            segment_id,
-            eff_log,
+            segment_id: fields.segment_id,
+            expected_tip_height: fields.expected_tip_height,
+            expected_tip_hash: fields.expected_tip_hash,
+            eff_log: fields.eff_log,
             data,
             inbound_memory_permit,
             outbound_memory_permit: None,
@@ -168,6 +170,8 @@ impl request_response::Codec for StateSegmentCodec {
     {
         let GetStateSegmentResponse {
             segment_id,
+            expected_tip_height,
+            expected_tip_hash,
             eff_log,
             data,
             inbound_memory_permit,
@@ -188,7 +192,9 @@ impl request_response::Codec for StateSegmentCodec {
         header[..4].copy_from_slice(&RESPONSE_MAGIC);
         header[4..6].copy_from_slice(&segment_id.to_le_bytes());
         header[6] = eff_log;
-        header[8..12].copy_from_slice(&encoded_len.to_le_bytes());
+        header[8..16].copy_from_slice(&expected_tip_height.to_le_bytes());
+        header[16..48].copy_from_slice(&expected_tip_hash);
+        header[48..52].copy_from_slice(&encoded_len.to_le_bytes());
         io.write_all(&header).await?;
         if let Some(bytes) = data {
             io.write_all(&bytes).await?;
@@ -197,7 +203,16 @@ impl request_response::Codec for StateSegmentCodec {
     }
 }
 
-fn parse_response_header(header: &[u8; RESPONSE_HEADER_BYTES]) -> io::Result<(u16, u8, u32)> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResponseHeaderFields {
+    segment_id: u16,
+    expected_tip_height: u64,
+    expected_tip_hash: [u8; 32],
+    eff_log: u8,
+    encoded_len: u32,
+}
+
+fn parse_response_header(header: &[u8; RESPONSE_HEADER_BYTES]) -> io::Result<ResponseHeaderFields> {
     if header[..4] != RESPONSE_MAGIC {
         return Err(invalid_data("invalid state-segment response magic/version"));
     }
@@ -208,9 +223,18 @@ fn parse_response_header(header: &[u8; RESPONSE_HEADER_BYTES]) -> io::Result<(u1
     }
     let segment_id = u16::from_le_bytes(header[4..6].try_into().expect("fixed segment id"));
     let eff_log = header[6];
-    let encoded_len = u32::from_le_bytes(header[8..12].try_into().expect("fixed length"));
+    let expected_tip_height =
+        u64::from_le_bytes(header[8..16].try_into().expect("fixed tip height"));
+    let expected_tip_hash = header[16..48].try_into().expect("fixed tip hash");
+    let encoded_len = u32::from_le_bytes(header[48..52].try_into().expect("fixed length"));
     validate_response_length(eff_log, encoded_len)?;
-    Ok((segment_id, eff_log, encoded_len))
+    Ok(ResponseHeaderFields {
+        segment_id,
+        expected_tip_height,
+        expected_tip_hash,
+        eff_log,
+        encoded_len,
+    })
 }
 
 fn validate_response_length(eff_log: u8, encoded_len: u32) -> io::Result<()> {
@@ -283,7 +307,7 @@ mod tests {
     use super::*;
 
     fn protocol() -> StreamProtocol {
-        StreamProtocol::new("/noid/test/sync/segment/2")
+        StreamProtocol::new("/noid/test/sync/segment/3")
     }
 
     fn response_header(eff_log: u8, encoded_len: u32) -> Vec<u8> {
@@ -291,7 +315,9 @@ mod tests {
         header[..4].copy_from_slice(&RESPONSE_MAGIC);
         header[4..6].copy_from_slice(&7u16.to_le_bytes());
         header[6] = eff_log;
-        header[8..12].copy_from_slice(&encoded_len.to_le_bytes());
+        header[8..16].copy_from_slice(&77u64.to_le_bytes());
+        header[16..48].copy_from_slice(&[0xA5; 32]);
+        header[48..52].copy_from_slice(&encoded_len.to_le_bytes());
         header
     }
 
@@ -369,6 +395,8 @@ mod tests {
         let len = encoded_segment_len_for_eff_log(10).unwrap();
         let response = GetStateSegmentResponse {
             segment_id: 7,
+            expected_tip_height: 77,
+            expected_tip_hash: [0xA5; 32],
             eff_log: 10,
             data: Some(vec![0x5a; len]),
             inbound_memory_permit: None,
@@ -386,6 +414,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(decoded.segment_id, 7);
+        assert_eq!(decoded.expected_tip_height, 77);
+        assert_eq!(decoded.expected_tip_hash, [0xA5; 32]);
         assert_eq!(decoded.data.unwrap(), vec![0x5a; len]);
     }
 
@@ -441,6 +471,8 @@ mod tests {
         let permit = budget.acquire(len).await.unwrap().unwrap();
         let response = GetStateSegmentResponse {
             segment_id: 3,
+            expected_tip_height: 77,
+            expected_tip_hash: [0xA5; 32],
             eff_log: 6,
             data: Some(vec![0x33; len]),
             inbound_memory_permit: None,
