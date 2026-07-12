@@ -24,6 +24,7 @@ noid-ivc-prover = { path = "../noid_ivc_prover" }
 rayon = "1.10"
 bincode = "1"
 hex = "0.4"
+zstd = { version = "0.13", features = ["zstdmt"] }
 
 [[bench]]
 name = "alice_sends_bob"
