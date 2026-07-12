@@ -268,6 +268,27 @@ pub struct MdbxStore {
     db: Arc<Database<NoWriteMap>>,
 }
 
+/// Maximum authenticated header records promoted by one MDBX write
+/// transaction.  Deep snapshot sync streams as many bounded batches as
+/// necessary instead of collecting the candidate chain in memory.
+pub const MAX_VERIFIED_HEADER_BATCH_RECORDS: usize = 512;
+
+/// One owned, already native-validated canonical header staged for durable
+/// promotion after selected-history verification authenticates its tip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerifiedHeaderBatchRecord {
+    pub header: BlockHeader,
+    pub hash: [u8; 32],
+    pub cumulative_chainwork: [u8; 32],
+}
+
+/// Exact outcome of one idempotent bounded header promotion transaction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VerifiedHeaderBatchOutcome {
+    pub existing: usize,
+    pub promoted: usize,
+}
+
 /// One stable MVCC view used by bounded historical-state reconstruction.
 ///
 /// The transaction owns no decoded payload collection. Each requested header,
@@ -2986,6 +3007,207 @@ impl MdbxStore {
         txn.commit()?;
         authoritative_mutation_boundary!(VerifiedHeaderAfterCommit);
         Ok(())
+    }
+
+    /// Atomically promote at most 512 contiguous authenticated headers.
+    ///
+    /// The transaction accepts an exact already-present prefix followed by a
+    /// missing suffix.  Every existing row and secondary record must match;
+    /// every new child must extend a complete parent record and exact
+    /// cumulative chainwork in this same MDBX view.  Consequently retry after
+    /// a crash is idempotent, while any gap, partial row, or canonical conflict
+    /// aborts the complete batch without exposing a partial prefix.
+    pub fn put_verified_headers_batch(
+        &self,
+        records: &[VerifiedHeaderBatchRecord],
+    ) -> Result<VerifiedHeaderBatchOutcome, StoreError> {
+        if records.is_empty() {
+            return Ok(VerifiedHeaderBatchOutcome::default());
+        }
+        if records.len() > MAX_VERIFIED_HEADER_BATCH_RECORDS {
+            return Err(StoreError::Decode(
+                "verified header batch exceeds bounded record cap",
+            ));
+        }
+
+        for (index, record) in records.iter().enumerate() {
+            if crate::block_header::block_id(&record.header) != record.hash {
+                return Err(StoreError::Decode(
+                    "verified header batch supplied hash mismatch",
+                ));
+            }
+            if let Some(previous) = index.checked_sub(1).map(|i| &records[i]) {
+                let expected_height = previous
+                    .header
+                    .height
+                    .checked_add(1)
+                    .ok_or(StoreError::Decode("verified header batch height overflow"))?;
+                if record.header.height != expected_height {
+                    return Err(StoreError::Decode(
+                        "verified header batch heights are not contiguous",
+                    ));
+                }
+            }
+        }
+
+        let txn = self.db.begin_rw_txn()?;
+        let hdr_tbl = txn.open_table(Some(T_HEADERS))?;
+        let h2h_tbl = txn.open_table(Some(T_HASH_TO_HEIGHT))?;
+        let work_tbl = txn.open_table(Some(T_CHAIN_WORK))?;
+        let anchor_tbl = txn.open_table(Some(T_HEADER_ANCHORS))?;
+        let mut outcome = VerifiedHeaderBatchOutcome::default();
+        let mut encountered_missing = false;
+
+        for record in records {
+            let height_key = u64_key(record.header.height);
+
+            let anchor = if record.header.height == 0 {
+                compute_header_chain_anchor(
+                    std::iter::once(&record.header),
+                    record.cumulative_chainwork,
+                )?
+            } else {
+                let parent_height = record.header.height - 1;
+                let parent_key = u64_key(parent_height);
+                let parent_header_raw: Option<Vec<u8>> = txn.get(&hdr_tbl, &parent_key)?;
+                let parent_header = parent_header_raw.as_deref().and_then(decode_header).ok_or(
+                    StoreError::Decode("verified header batch parent header is missing or invalid"),
+                )?;
+                let parent_hash = crate::block_header::block_id(&parent_header);
+                if record.header.prev_block_hash != parent_hash {
+                    return Err(StoreError::Decode(
+                        "verified header batch parent hash mismatch",
+                    ));
+                }
+                let parent_height_raw: Option<Vec<u8>> =
+                    txn.get(&h2h_tbl, parent_hash.as_slice())?;
+                if parent_height_raw.as_deref().and_then(u64_from_key) != Some(parent_height) {
+                    return Err(StoreError::Decode(
+                        "verified header batch parent hash index is missing or inconsistent",
+                    ));
+                }
+                let parent_work_raw: Option<Vec<u8>> = txn.get(&work_tbl, &parent_key)?;
+                let parent_work = parent_work_raw
+                    .as_deref()
+                    .and_then(decode_chain_work)
+                    .ok_or(StoreError::Decode(
+                        "verified header batch parent chainwork is missing or invalid",
+                    ))?;
+                let parent_anchor_raw: Option<Vec<u8>> = txn.get(&anchor_tbl, &parent_key)?;
+                let parent_anchor = parent_anchor_raw
+                    .as_deref()
+                    .and_then(decode_header_chain_anchor)
+                    .ok_or(StoreError::Decode(
+                        "verified header batch parent anchor is missing or invalid",
+                    ))?;
+                let expected_parent_anchor = HeaderChainAnchor {
+                    height: parent_height,
+                    block_id: parent_hash,
+                    state_root: parent_header.state_root,
+                    tx_root: parent_header.tx_root,
+                    miner_address: parent_header.miner_address,
+                    log_slots: parent_header.log_slots,
+                    active_slot_count: parent_header.active_slot_count,
+                    alloc_counter: parent_header.alloc_counter,
+                    cumulative_chainwork: parent_work,
+                };
+                if parent_anchor != expected_parent_anchor {
+                    return Err(StoreError::Decode(
+                        "verified header batch parent anchor is inconsistent",
+                    ));
+                }
+                let expected_work = crate::consensus::add_work(
+                    &parent_work,
+                    &crate::consensus::block_work(&record.header.difficulty_target),
+                );
+                if record.cumulative_chainwork != expected_work {
+                    return Err(StoreError::Decode(
+                        "verified header batch cumulative chainwork mismatch",
+                    ));
+                }
+                extend_header_chain_anchor(
+                    &parent_anchor,
+                    &record.header,
+                    record.cumulative_chainwork,
+                )?
+            };
+            if anchor.block_id != record.hash {
+                return Err(StoreError::Decode(
+                    "verified header batch anchor block id mismatch",
+                ));
+            }
+
+            let stored_header_raw: Option<Vec<u8>> = txn.get(&hdr_tbl, &height_key)?;
+            let stored_hash_height_raw: Option<Vec<u8>> =
+                txn.get(&h2h_tbl, record.hash.as_slice())?;
+            let stored_work_raw: Option<Vec<u8>> = txn.get(&work_tbl, &height_key)?;
+            let stored_anchor_raw: Option<Vec<u8>> = txn.get(&anchor_tbl, &height_key)?;
+
+            if let Some(stored_header_raw) = stored_header_raw {
+                if encountered_missing {
+                    return Err(StoreError::Decode(
+                        "verified header batch canonical table contains a gap",
+                    ));
+                }
+                if decode_header(&stored_header_raw) != Some(record.header)
+                    || stored_hash_height_raw.as_deref().and_then(u64_from_key)
+                        != Some(record.header.height)
+                    || stored_work_raw.as_deref().and_then(decode_chain_work)
+                        != Some(record.cumulative_chainwork)
+                    || stored_anchor_raw
+                        .as_deref()
+                        .and_then(decode_header_chain_anchor)
+                        != Some(anchor)
+                {
+                    return Err(StoreError::Decode(
+                        "verified header batch conflicts with canonical records",
+                    ));
+                }
+                outcome.existing += 1;
+                continue;
+            }
+
+            encountered_missing = true;
+            if stored_hash_height_raw.is_some()
+                || stored_work_raw.is_some()
+                || stored_anchor_raw.is_some()
+            {
+                return Err(StoreError::Decode(
+                    "verified header batch found partial canonical records",
+                ));
+            }
+
+            txn.put(
+                &hdr_tbl,
+                height_key,
+                encode_header(&record.header),
+                WriteFlags::empty(),
+            )?;
+            txn.put(
+                &h2h_tbl,
+                record.hash.as_slice(),
+                height_key,
+                WriteFlags::empty(),
+            )?;
+            txn.put(
+                &work_tbl,
+                height_key,
+                encode_chain_work(&record.cumulative_chainwork),
+                WriteFlags::empty(),
+            )?;
+            txn.put(
+                &anchor_tbl,
+                height_key,
+                encode_header_chain_anchor(&anchor),
+                WriteFlags::empty(),
+            )?;
+            outcome.promoted += 1;
+        }
+
+        authoritative_mutation_boundary!(VerifiedHeaderBeforeCommit);
+        txn.commit()?;
+        authoritative_mutation_boundary!(VerifiedHeaderAfterCommit);
+        Ok(outcome)
     }
 
     pub fn get_undo_log(&self, height: u64) -> Result<Option<BlockUndoLog>, StoreError> {
@@ -8449,6 +8671,264 @@ mod tests {
             store.latest_history_checkpoint_head_height().unwrap(),
             Some(16)
         );
+    }
+
+    fn verified_header_batch_chain(count: usize) -> Vec<VerifiedHeaderBatchRecord> {
+        assert!(count > 0);
+        let genesis = crate::consensus::genesis::genesis_header();
+        let genesis_hash = crate::hash_block_header(&genesis);
+        let genesis_work = crate::block_work(&genesis.difficulty_target);
+        let mut records = Vec::with_capacity(count);
+        records.push(VerifiedHeaderBatchRecord {
+            header: genesis,
+            hash: genesis_hash,
+            cumulative_chainwork: genesis_work,
+        });
+
+        while records.len() < count {
+            let parent = *records.last().unwrap();
+            let height = parent.header.height + 1;
+            let mut header = parent.header;
+            header.height = height;
+            header.prev_block_hash = parent.hash;
+            header.timestamp = genesis.timestamp.saturating_add(height);
+            header.nonce = u128::from(height);
+            header.state_root[0] = height as u8;
+            let hash = crate::hash_block_header(&header);
+            let cumulative_chainwork = crate::add_work(
+                &parent.cumulative_chainwork,
+                &crate::block_work(&header.difficulty_target),
+            );
+            records.push(VerifiedHeaderBatchRecord {
+                header,
+                hash,
+                cumulative_chainwork,
+            });
+        }
+        records
+    }
+
+    #[test]
+    fn verified_header_batch_enforces_512_record_cap() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let records = verified_header_batch_chain(MAX_VERIFIED_HEADER_BATCH_RECORDS + 1);
+
+        assert!(store.put_verified_headers_batch(&records).is_err());
+        assert_eq!(store.get_header(0).unwrap(), None);
+
+        let outcome = store
+            .put_verified_headers_batch(&records[..MAX_VERIFIED_HEADER_BATCH_RECORDS])
+            .unwrap();
+        assert_eq!(
+            outcome,
+            VerifiedHeaderBatchOutcome {
+                existing: 0,
+                promoted: MAX_VERIFIED_HEADER_BATCH_RECORDS,
+            }
+        );
+        assert_eq!(
+            store
+                .get_header((MAX_VERIFIED_HEADER_BATCH_RECORDS - 1) as u64)
+                .unwrap(),
+            Some(records[MAX_VERIFIED_HEADER_BATCH_RECORDS - 1].header)
+        );
+        assert_eq!(
+            store
+                .put_verified_headers_batch(&[])
+                .expect("empty batch is a bounded no-op"),
+            VerifiedHeaderBatchOutcome::default()
+        );
+    }
+
+    #[test]
+    fn verified_header_batch_retry_is_exactly_idempotent() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let records = verified_header_batch_chain(4);
+
+        assert_eq!(
+            store.put_verified_headers_batch(&records).unwrap(),
+            VerifiedHeaderBatchOutcome {
+                existing: 0,
+                promoted: 4,
+            }
+        );
+        assert_eq!(
+            store.put_verified_headers_batch(&records).unwrap(),
+            VerifiedHeaderBatchOutcome {
+                existing: 4,
+                promoted: 0,
+            }
+        );
+
+        for record in records {
+            assert_eq!(
+                store.get_header(record.header.height).unwrap(),
+                Some(record.header)
+            );
+            assert_eq!(
+                store.get_header_by_hash(&record.hash).unwrap(),
+                Some(record.header)
+            );
+            assert_eq!(
+                store.get_chain_work(record.header.height).unwrap(),
+                Some(record.cumulative_chainwork)
+            );
+            assert_eq!(
+                store.get_header_anchor(record.header.height).unwrap(),
+                Some(HeaderChainAnchor {
+                    height: record.header.height,
+                    block_id: record.hash,
+                    state_root: record.header.state_root,
+                    tx_root: record.header.tx_root,
+                    miner_address: record.header.miner_address,
+                    log_slots: record.header.log_slots,
+                    active_slot_count: record.header.active_slot_count,
+                    alloc_counter: record.header.alloc_counter,
+                    cumulative_chainwork: record.cumulative_chainwork,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn verified_header_batch_rejects_invalid_input_without_partial_write() {
+        let records = verified_header_batch_chain(3);
+
+        {
+            let directory = tempfile::tempdir().unwrap();
+            let store = MdbxStore::open(directory.path()).unwrap();
+            let mut discontinuous = records[..2].to_vec();
+            discontinuous[1].header.height = 2;
+            discontinuous[1].hash = crate::hash_block_header(&discontinuous[1].header);
+            assert!(store.put_verified_headers_batch(&discontinuous).is_err());
+            assert_eq!(store.get_header(0).unwrap(), None);
+        }
+
+        {
+            let directory = tempfile::tempdir().unwrap();
+            let store = MdbxStore::open(directory.path()).unwrap();
+            let mut bad_hash = records.clone();
+            bad_hash[2].hash[0] ^= 1;
+            assert!(store.put_verified_headers_batch(&bad_hash).is_err());
+            assert_eq!(store.get_header(0).unwrap(), None);
+            assert_eq!(store.get_header(1).unwrap(), None);
+        }
+
+        {
+            let directory = tempfile::tempdir().unwrap();
+            let store = MdbxStore::open(directory.path()).unwrap();
+            let mut bad_work = records.clone();
+            bad_work[2].cumulative_chainwork[0] ^= 1;
+            assert!(store.put_verified_headers_batch(&bad_work).is_err());
+            assert_eq!(store.get_header(0).unwrap(), None);
+            assert_eq!(store.get_header(1).unwrap(), None);
+        }
+
+        {
+            let directory = tempfile::tempdir().unwrap();
+            let store = MdbxStore::open(directory.path()).unwrap();
+            let mut bad_parent = records.clone();
+            bad_parent[2].header.prev_block_hash[0] ^= 1;
+            bad_parent[2].hash = crate::hash_block_header(&bad_parent[2].header);
+            assert!(store.put_verified_headers_batch(&bad_parent).is_err());
+            assert_eq!(store.get_header(0).unwrap(), None);
+            assert_eq!(store.get_header(1).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn verified_header_batch_rejects_partial_parent_conflict_and_gap() {
+        let records = verified_header_batch_chain(3);
+
+        {
+            let directory = tempfile::tempdir().unwrap();
+            let store = MdbxStore::open(directory.path()).unwrap();
+            store
+                .put_header_only(&records[0].header, &records[0].hash)
+                .unwrap();
+            assert!(store.put_verified_headers_batch(&records[..1]).is_err());
+            assert!(store.put_verified_headers_batch(&records[1..2]).is_err());
+            assert_eq!(store.get_header(1).unwrap(), None);
+        }
+
+        {
+            let directory = tempfile::tempdir().unwrap();
+            let store = MdbxStore::open(directory.path()).unwrap();
+            store.put_verified_headers_batch(&records[..1]).unwrap();
+            let mut conflict = records[0];
+            conflict.header.state_root[0] ^= 1;
+            conflict.hash = crate::hash_block_header(&conflict.header);
+            assert!(store.put_verified_headers_batch(&[conflict]).is_err());
+            assert_eq!(store.get_header(0).unwrap(), Some(records[0].header));
+        }
+
+        {
+            let directory = tempfile::tempdir().unwrap();
+            let store = MdbxStore::open(directory.path()).unwrap();
+            store
+                .put_header_only(&records[2].header, &records[2].hash)
+                .unwrap();
+            assert!(store.put_verified_headers_batch(&records).is_err());
+            assert_eq!(store.get_header(0).unwrap(), None);
+            assert_eq!(store.get_header(1).unwrap(), None);
+            assert_eq!(store.get_header(2).unwrap(), Some(records[2].header));
+        }
+    }
+
+    #[test]
+    fn verified_header_batch_crash_restart_is_exactly_old_or_new() {
+        for (fault, committed) in [
+            (
+                AuthoritativeMutationFault::VerifiedHeaderBeforeCommit,
+                false,
+            ),
+            (AuthoritativeMutationFault::VerifiedHeaderAfterCommit, true),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = MdbxStore::open(directory.path()).unwrap();
+            let records = verified_header_batch_chain(3);
+            store
+                .put_verified_headers_batch(&records[..1])
+                .expect("seed exact genesis parent");
+
+            let guard = arm_authoritative_mutation_fault(fault);
+            assert_injected_crash(store.put_verified_headers_batch(&records[1..]), fault);
+            drop(guard);
+            drop(store);
+
+            let reopened = MdbxStore::open(directory.path()).unwrap();
+            assert_eq!(reopened.get_header(0).unwrap(), Some(records[0].header));
+            for record in &records[1..] {
+                assert_eq!(
+                    reopened.get_header(record.header.height).unwrap(),
+                    committed.then_some(record.header)
+                );
+                assert_eq!(
+                    reopened.get_header_by_hash(&record.hash).unwrap(),
+                    committed.then_some(record.header)
+                );
+                assert_eq!(
+                    reopened.get_chain_work(record.header.height).unwrap(),
+                    committed.then_some(record.cumulative_chainwork)
+                );
+                assert_eq!(
+                    reopened.get_header_anchor(record.header.height).unwrap(),
+                    committed.then_some(HeaderChainAnchor {
+                        height: record.header.height,
+                        block_id: record.hash,
+                        state_root: record.header.state_root,
+                        tx_root: record.header.tx_root,
+                        miner_address: record.header.miner_address,
+                        log_slots: record.header.log_slots,
+                        active_slot_count: record.header.active_slot_count,
+                        alloc_counter: record.header.alloc_counter,
+                        cumulative_chainwork: record.cumulative_chainwork,
+                    })
+                );
+            }
+        }
     }
 
     #[test]
