@@ -296,37 +296,39 @@ impl SelectedRecursiveMatrixRequest {
 /// borrow and is explicitly dropped before the next loader call.
 pub struct LoadedSelectedRecursiveMatrix {
     matrix: FieldR1cs,
-    release_probe: Option<Box<dyn FnOnce() + Send + 'static>>,
+    release_callback: Option<Box<dyn FnOnce() + Send + 'static>>,
 }
 
 impl LoadedSelectedRecursiveMatrix {
     pub fn new(matrix: FieldR1cs) -> Self {
         Self {
             matrix,
-            release_probe: None,
+            release_callback: None,
         }
     }
 
-    fn matrix(&self) -> &FieldR1cs {
+    /// Borrow the transient matrix without separating it from its release
+    /// callback. Callers must retain this RAII wrapper for the entire borrow;
+    /// dropping it releases the source's one-matrix admission.
+    pub fn matrix(&self) -> &FieldR1cs {
         &self.matrix
     }
 
-    #[cfg(test)]
-    fn with_release_probe(
+    pub(crate) fn with_release_callback(
         matrix: FieldR1cs,
-        release_probe: impl FnOnce() + Send + 'static,
+        release_callback: impl FnOnce() + Send + 'static,
     ) -> Self {
         Self {
             matrix,
-            release_probe: Some(Box::new(release_probe)),
+            release_callback: Some(Box::new(release_callback)),
         }
     }
 }
 
 impl Drop for LoadedSelectedRecursiveMatrix {
     fn drop(&mut self) {
-        if let Some(release_probe) = self.release_probe.take() {
-            release_probe();
+        if let Some(release_callback) = self.release_callback.take() {
+            release_callback();
         }
     }
 }
@@ -1193,7 +1195,7 @@ mod tests {
             }
             .ok_or("requested matrix is unavailable")?;
             let resident = Arc::clone(&self.resident);
-            Ok(LoadedSelectedRecursiveMatrix::with_release_probe(
+            Ok(LoadedSelectedRecursiveMatrix::with_release_callback(
                 matrix,
                 move || resident.store(false, Ordering::Release),
             ))
