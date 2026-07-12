@@ -869,6 +869,18 @@ impl<'a> BlockRegionProverPlan<'a> {
         z: &[F128],
         challenger: &mut Ch,
     ) -> Result<(BlockRegionSidecarProof, Vec<QuirkyDirectClaim>), RegionSidecarError> {
+        // Env-gated stage timing, mirroring NOIDH_FIELD_PROVE_TIMING.
+        let timing = std::env::var_os("NOIDH_SIDECAR_TIMING").is_some();
+        let mut t = std::time::Instant::now();
+        let lap = move |label: &str, t: &mut std::time::Instant| {
+            if timing {
+                eprintln!(
+                    "[block-sidecar] {label}: {:.1} ms",
+                    t.elapsed().as_secs_f64() * 1e3
+                );
+            }
+            *t = std::time::Instant::now();
+        };
         bind_block_vk(challenger, self.vk);
         let mut claims = Vec::new();
 
@@ -889,7 +901,9 @@ impl<'a> BlockRegionProverPlan<'a> {
             self.input.meta_b.s_out(),
         )?;
         let wallet_a_prefix = wallet_a_plan.prove_walk_deferred_prefix(z, challenger)?;
+        lap("wallet-A prefix", &mut t);
         let meta_b_prefix = meta_b_plan.prove_walk_deferred_prefix(z, challenger)?;
+        lap("meta-B prefix", &mut t);
         let groups = vec![
             vec![wallet_a_prefix.group().clone()],
             vec![meta_b_prefix.group().clone()],
@@ -897,6 +911,7 @@ impl<'a> BlockRegionProverPlan<'a> {
         let s0 = [wallet_a_prefix.s0(), meta_b_prefix.s0()];
         let (wallet_a_meta_b_walk, terminals) =
             prove_ragged_multi_deep_chain_walk(&s0, &groups, challenger);
+        lap("wallet-A/meta-B multi-walk", &mut t);
         let [wallet_a_terminal, meta_b_terminal]: [_; 2] = terminals
             .try_into()
             .expect("wallet-A/meta-B multi-walk terminal count");
@@ -904,6 +919,7 @@ impl<'a> BlockRegionProverPlan<'a> {
         claims.extend(child_claims);
         let (meta_b, child_claims) = meta_b_prefix.finish(&meta_b_terminal, challenger)?;
         claims.extend(child_claims);
+        lap("wallet-A/meta-B finish", &mut t);
 
         let meta_a_plan = WalkARegionProverPlan::new(
             self.vk.meta_a(),
@@ -921,8 +937,11 @@ impl<'a> BlockRegionProverPlan<'a> {
             self.input.main_c.s_out(),
         )?;
         let meta_a_prefix = meta_a_plan.prove_walk_deferred_prefix(z, challenger)?;
+        lap("meta-A prefix", &mut t);
         let owner_c_prefix = owner_c_plan.prove_walk_deferred_prefix(z, challenger)?;
+        lap("owner-C prefix", &mut t);
         let main_c_prefix = main_c_plan.prove_walk_deferred_prefix(z, challenger)?;
+        lap("main-C prefix", &mut t);
         let groups = vec![
             vec![meta_a_prefix.group().clone()],
             vec![owner_c_prefix.group().clone()],
@@ -931,6 +950,7 @@ impl<'a> BlockRegionProverPlan<'a> {
         let s0 = [meta_a_prefix.s0(), owner_c_prefix.s0(), main_c_prefix.s0()];
         let (meta_a_owner_main_walk, terminals) =
             prove_ragged_multi_deep_chain_walk(&s0, &groups, challenger);
+        lap("meta-A/owner-C/main-C multi-walk", &mut t);
         let [meta_a_terminal, owner_c_terminal, main_c_terminal]: [_; 3] = terminals
             .try_into()
             .expect("meta-A/owner-C/main-C multi-walk terminal count");
@@ -940,6 +960,7 @@ impl<'a> BlockRegionProverPlan<'a> {
         claims.extend(child_claims);
         let (main_c, child_claims) = main_c_prefix.finish(&main_c_terminal, challenger)?;
         claims.extend(child_claims);
+        lap("meta/owner/main finish", &mut t);
 
         // wallet-B has the only unmatched production domain and therefore
         // retains its ordinary single-instance authority.
@@ -950,6 +971,7 @@ impl<'a> BlockRegionProverPlan<'a> {
             challenger,
             &mut claims,
         )?;
+        lap("wallet-B full", &mut t);
 
         Ok((
             BlockRegionSidecarProof {

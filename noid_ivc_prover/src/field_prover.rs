@@ -334,6 +334,7 @@ where
     // The commitment root is already transcript-bound here. Auxiliary proof
     // messages and every challenge they induce are therefore post-commit.
     let (auxiliary, auxiliary_claims) = post_commit(z, &commitment, challenger);
+    lap("post-commit aux", &mut t);
 
     // ---- a = A·z, b = B·z over F128; c aliases z (C = I).
     let a = r1cs.apply_a(z);

@@ -457,28 +457,8 @@ pub fn prove_deep_chain_walk<Ch: Challenger>(
         assert_eq!(g.point.len(), w_log, "claim point arity");
     }
 
-    // Layer checkpoints S_0, S_8, …: rebuild any layer with ≤7 round passes.
-    let mut checkpoints: Vec<[Vec<F128>; STATE_SIZE]> = vec![s0.clone()];
-    {
-        let mut current = s0.clone();
-        let mut q = 0usize;
-        while q < N_ROUNDS {
-            let step = CHECKPOINT_SPACING.min(N_ROUNDS - q);
-            for dq in 0..step {
-                apply_round_columns(q + dq, &mut current);
-            }
-            q += step;
-            checkpoints.push(current.clone());
-        }
-    }
-    let rebuild = |layer_minus_1: usize| -> [Vec<F128>; STATE_SIZE] {
-        let cp = layer_minus_1 / CHECKPOINT_SPACING;
-        let mut cols = checkpoints[cp].clone();
-        for q in cp * CHECKPOINT_SPACING..layer_minus_1 {
-            apply_round_columns(q, &mut cols);
-        }
-        cols
-    };
+    // Layer checkpoints S_0, S_8, … served backward one window at a time.
+    let mut layer_states = DescendingLayerStates::new(s0);
 
     absorb_groups(challenger, out_groups);
 
@@ -510,7 +490,7 @@ pub fn prove_deep_chain_walk<Ch: Challenger>(
                     .for_each(|(slot, e)| *slot += c[j] * *e);
             }
         }
-        let mut s_tables = rebuild(q);
+        let mut s_tables = layer_states.state(q);
 
         let mut round_coeffs = Vec::with_capacity(w_log);
         let mut point = Vec::with_capacity(w_log);
@@ -639,22 +619,9 @@ pub fn prove_multi_deep_chain_walk<Ch: Challenger>(
     // `instances * 10 * 4 * 2^w_log * sizeof(F128)` at 66 rounds / spacing 8
     // (20 MiB for the planned two-instance w_log=14 B8 group). A future wider
     // ladder should stream/rebuild instances if that product becomes material.
-    let checkpoints: Vec<Vec<[Vec<F128>; STATE_SIZE]>> = s0_instances
+    let mut layer_states: Vec<DescendingLayerStates> = s0_instances
         .iter()
-        .map(|&s0| {
-            let mut instance_checkpoints = vec![s0.clone()];
-            let mut current = s0.clone();
-            let mut q = 0usize;
-            while q < N_ROUNDS {
-                let step = CHECKPOINT_SPACING.min(N_ROUNDS - q);
-                for dq in 0..step {
-                    apply_round_columns(q + dq, &mut current);
-                }
-                q += step;
-                instance_checkpoints.push(current.clone());
-            }
-            instance_checkpoints
-        })
+        .map(|&s0| DescendingLayerStates::new(s0))
         .collect();
 
     absorb_multi_groups(challenger, out_groups);
@@ -704,16 +671,9 @@ pub fn prove_multi_deep_chain_walk<Ch: Challenger>(
             }
         }
 
-        let mut s_tables: Vec<[Vec<F128>; STATE_SIZE]> = checkpoints
-            .iter()
-            .map(|instance_checkpoints| {
-                let checkpoint = q / CHECKPOINT_SPACING;
-                let mut columns = instance_checkpoints[checkpoint].clone();
-                for round in checkpoint * CHECKPOINT_SPACING..q {
-                    apply_round_columns(round, &mut columns);
-                }
-                columns
-            })
+        let mut s_tables: Vec<[Vec<F128>; STATE_SIZE]> = layer_states
+            .iter_mut()
+            .map(|instance_states| instance_states.state(q))
             .collect();
 
         let mut round_coeffs = Vec::with_capacity(w_log);
@@ -881,24 +841,11 @@ pub fn prove_ragged_multi_deep_chain_walk<Ch: Challenger>(
         );
     }
 
-    // Checkpoints retain each native width.  In particular, a smaller state
+    // Layer states retain each native width.  In particular, a smaller state
     // is not cloned into a 2^W outer witness merely to share sumcheck rounds.
-    let checkpoints: Vec<Vec<[Vec<F128>; STATE_SIZE]>> = s0_instances
+    let mut layer_states: Vec<DescendingLayerStates> = s0_instances
         .iter()
-        .map(|&s0| {
-            let mut instance_checkpoints = vec![s0.clone()];
-            let mut current = s0.clone();
-            let mut q = 0usize;
-            while q < N_ROUNDS {
-                let step = CHECKPOINT_SPACING.min(N_ROUNDS - q);
-                for dq in 0..step {
-                    apply_round_columns(q + dq, &mut current);
-                }
-                q += step;
-                instance_checkpoints.push(current.clone());
-            }
-            instance_checkpoints
-        })
+        .map(|&s0| DescendingLayerStates::new(s0))
         .collect();
 
     absorb_ragged_multi_groups(challenger, &w_logs, out_groups);
@@ -951,16 +898,9 @@ pub fn prove_ragged_multi_deep_chain_walk<Ch: Challenger>(
             }
         }
 
-        let mut s_tables: Vec<[Vec<F128>; STATE_SIZE]> = checkpoints
-            .iter()
-            .map(|instance_checkpoints| {
-                let checkpoint = q / CHECKPOINT_SPACING;
-                let mut columns = instance_checkpoints[checkpoint].clone();
-                for round in checkpoint * CHECKPOINT_SPACING..q {
-                    apply_round_columns(round, &mut columns);
-                }
-                columns
-            })
+        let mut s_tables: Vec<[Vec<F128>; STATE_SIZE]> = layer_states
+            .iter_mut()
+            .map(|instance_states| instance_states.state(q))
             .collect();
 
         let mut round_coeffs = Vec::with_capacity(max_w_log);
@@ -1125,23 +1065,93 @@ pub fn prove_ragged_multi_deep_chain_walk<Ch: Challenger>(
 
 fn apply_round_columns(q: usize, cols: &mut [Vec<F128>; STATE_SIZE]) {
     let w = cols[0].len();
-    let mut out: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; w]);
     let chunk = 1usize.max(w / (rayon::current_num_threads().max(1) * 4));
-    out.par_iter_mut().enumerate().for_each(|(i, out_col)| {
-        // Recompute per output lane to keep the loop embarrassingly
-        // parallel without slot-major transposes.
-        out_col
-            .par_chunks_mut(chunk)
+    // One `apply_round` per position into a position-major buffer, then a
+    // memory-bound scatter back to lane-major columns. The earlier form
+    // recomputed the full round once per output lane (STATE_SIZE× the
+    // multiplications) to avoid the transpose; the round function dominates,
+    // so paying the scatter is the cheaper side. Values and their in-lane
+    // order are bit-identical.
+    let mut rows: Vec<[F128; STATE_SIZE]> = vec![[F128::ZERO; STATE_SIZE]; w];
+    rows.par_chunks_mut(chunk).enumerate().for_each(|(c, slots)| {
+        let base = c * chunk;
+        for (dw, slot) in slots.iter_mut().enumerate() {
+            let widx = base + dw;
+            let state: [F128; STATE_SIZE] = std::array::from_fn(|j| cols[j][widx]);
+            *slot = apply_round(q, state);
+        }
+    });
+    for (lane, col) in cols.iter_mut().enumerate() {
+        col.par_chunks_mut(chunk)
             .enumerate()
             .for_each(|(c, slots)| {
+                let base = c * chunk;
                 for (dw, slot) in slots.iter_mut().enumerate() {
-                    let widx = c * chunk + dw;
-                    let state: [F128; STATE_SIZE] = std::array::from_fn(|j| cols[j][widx]);
-                    *slot = apply_round(q, state)[i];
+                    *slot = rows[base + dw][lane];
                 }
             });
-    });
-    *cols = out;
+    }
+}
+
+/// Backward layer-state server for the walk provers.
+///
+/// The walk consumes `S_q` for `q = N_ROUNDS-1 .. 0` while states are only
+/// computable forward, so some replay is unavoidable. The former per-layer
+/// rebuild replayed up to `CHECKPOINT_SPACING-1` rounds for every layer
+/// (~3.5·N_ROUNDS extra applies); this server materializes one checkpoint
+/// window at a time and hands each state out exactly once, bounding total
+/// work to one forward pass plus one window replay (~2·N_ROUNDS applies)
+/// and extra memory to `CHECKPOINT_SPACING` column sets. Values are
+/// bit-identical to the per-layer rebuild.
+struct DescendingLayerStates {
+    checkpoints: Vec<[Vec<F128>; STATE_SIZE]>,
+    /// `window[i]` is `S_{window_base + i}`; slots are taken (emptied) as the
+    /// walk consumes them.
+    window: Vec<[Vec<F128>; STATE_SIZE]>,
+    window_base: usize,
+}
+
+impl DescendingLayerStates {
+    fn new(s0: &[Vec<F128>; STATE_SIZE]) -> Self {
+        let mut checkpoints = vec![s0.clone()];
+        let mut current = s0.clone();
+        let mut q = 0usize;
+        while q < N_ROUNDS {
+            let step = CHECKPOINT_SPACING.min(N_ROUNDS - q);
+            for dq in 0..step {
+                apply_round_columns(q + dq, &mut current);
+            }
+            q += step;
+            checkpoints.push(current.clone());
+        }
+        Self {
+            checkpoints,
+            window: Vec::new(),
+            window_base: usize::MAX,
+        }
+    }
+
+    /// Owned columns of `S_q` (the state after `q` rounds). Each `q` may be
+    /// requested once per walk; requests must not revisit a window that a
+    /// smaller `q` has already replaced.
+    fn state(&mut self, q: usize) -> [Vec<F128>; STATE_SIZE] {
+        let base = (q / CHECKPOINT_SPACING) * CHECKPOINT_SPACING;
+        if self.window_base != base {
+            let len = CHECKPOINT_SPACING.min(N_ROUNDS - base);
+            let mut window = Vec::with_capacity(len);
+            window.push(self.checkpoints[base / CHECKPOINT_SPACING].clone());
+            for i in 1..len {
+                let mut next = window[i - 1].clone();
+                apply_round_columns(base + i - 1, &mut next);
+                window.push(next);
+            }
+            self.window = window;
+            self.window_base = base;
+        }
+        let slot = &mut self.window[q - self.window_base];
+        assert!(!slot[0].is_empty(), "layer state S_{q} requested twice");
+        std::mem::take(slot)
+    }
 }
 
 #[inline]
