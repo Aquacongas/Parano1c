@@ -87,9 +87,35 @@ pub struct FreshLincheckClaim {
 /// matrix never needs to be materialized as a resident [`FieldR1cs`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AuthenticatedMatrixClaimEvaluations {
-    pub structural_digest: [u8; 32],
-    pub fresh_value: Option<F128>,
-    pub accumulated_value: Option<F128>,
+    structural_digest: [u8; 32],
+    fresh_value: Option<F128>,
+    accumulated_value: Option<F128>,
+}
+
+impl AuthenticatedMatrixClaimEvaluations {
+    pub const fn structural_digest(&self) -> [u8; 32] {
+        self.structural_digest
+    }
+
+    pub const fn fresh_value(&self) -> Option<F128> {
+        self.fresh_value
+    }
+
+    pub const fn accumulated_value(&self) -> Option<F128> {
+        self.accumulated_value
+    }
+
+    pub(crate) const fn new(
+        structural_digest: [u8; 32],
+        fresh_value: Option<F128>,
+        accumulated_value: Option<F128>,
+    ) -> Self {
+        Self {
+            structural_digest,
+            fresh_value,
+            accumulated_value,
+        }
+    }
 }
 
 /// Bounded matrix-evaluation boundary used by the terminal history decider.
@@ -99,7 +125,9 @@ pub struct AuthenticatedMatrixClaimEvaluations {
 /// both canonical matrices once with fixed-size buffers.  Implementations
 /// must recompute `structural_digest` from the same decoded rows used for the
 /// evaluations; cached or externally supplied digest metadata is not valid
-/// authority here.
+/// authority here. The success object has no public constructor: external
+/// adapters may delegate to a core evaluator, but cannot manufacture a digest
+/// or claim value in safe Rust.
 pub trait MatrixClaimEvaluator {
     fn field_shape(&self) -> FieldShape;
 
@@ -138,11 +166,11 @@ impl MatrixClaimEvaluator for FieldR1cs {
                 "accumulated point width",
             ));
         }
-        Ok(AuthenticatedMatrixClaimEvaluations {
-            structural_digest: self.structural_statement_digest(),
-            fresh_value: fresh.map(|claim| fresh_claim_value(self, claim)),
-            accumulated_value: accumulated.map(|claim| stacked_matrix_mle_eval(self, claim)),
-        })
+        Ok(AuthenticatedMatrixClaimEvaluations::new(
+            self.structural_statement_digest(),
+            fresh.map(|claim| fresh_claim_value(self, claim)),
+            accumulated.map(|claim| stacked_matrix_mle_eval(self, claim)),
+        ))
     }
 }
 

@@ -392,6 +392,7 @@ pub enum FieldR1csArtifactError {
         maximum: u64,
     },
     MatrixClaimShape(&'static str),
+    MatrixEvaluatorAlreadyConsumed,
 }
 
 impl fmt::Display for FieldR1csArtifactError {
@@ -1491,7 +1492,7 @@ impl FieldR1cs {
 /// artifact from turning its dictionary into a second multi-gigabyte matrix.
 pub const STREAMING_FIELD_R1CS_MAX_DICTIONARY_VALUES: usize = 1 << 16;
 
-const STREAMING_FIELD_R1CS_ENTRY_CHUNK: usize = 8 * 1024;
+const STREAMING_FIELD_R1CS_ENTRY_CHUNK: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug)]
 struct SeekableArtifactMatrixLayout {
@@ -1509,7 +1510,7 @@ struct SeekableArtifactMatrixLayout {
 /// structural statement digest without allocating CSR arrays. Every later
 /// claim evaluation scans and authenticates the exact rows again, protecting
 /// callers against same-length mutation after preflight. Retained memory is
-/// bounded by two 64-KiB entry buffers, one 2049-entry offset window, the
+/// bounded by two 256-KiB entry buffers, one 2049-entry offset window, the
 /// factorized equality tables, and one capped coefficient dictionary.
 pub struct SeekableFieldR1csArtifact<R> {
     reader: R,
@@ -1525,6 +1526,22 @@ impl<R: Read + Seek> SeekableFieldR1csArtifact<R> {
     /// Open, preflight, fully validate, and structurally authenticate a
     /// canonical artifact without materializing either sparse matrix.
     pub fn open(
+        reader: R,
+        expected_shape: crate::proof::FieldShape,
+        expected_structural_digest: [u8; 32],
+        max_bytes: u64,
+    ) -> Result<Self, FieldR1csArtifactError> {
+        let mut artifact = Self::preflight_header(
+            reader,
+            expected_shape,
+            expected_structural_digest,
+            max_bytes,
+        )?;
+        artifact.scan_authenticated(None, None)?;
+        Ok(artifact)
+    }
+
+    fn preflight_header(
         mut reader: R,
         expected_shape: crate::proof::FieldShape,
         expected_structural_digest: [u8; 32],
@@ -1756,7 +1773,7 @@ impl<R: Read + Seek> SeekableFieldR1csArtifact<R> {
         }
         debug_assert_eq!(cursor, total_bytes);
 
-        let mut artifact = Self {
+        Ok(Self {
             reader,
             shape: expected_shape,
             useful_rows,
@@ -1764,15 +1781,7 @@ impl<R: Read + Seek> SeekableFieldR1csArtifact<R> {
             header_bytes,
             layouts,
             expected_structural_digest,
-        };
-        let preflight = artifact.scan_authenticated(None, None)?;
-        if preflight.structural_digest != expected_structural_digest {
-            return Err(FieldR1csArtifactError::StructuralDigestMismatch {
-                expected: expected_structural_digest,
-                actual: preflight.structural_digest,
-            });
-        }
-        Ok(artifact)
+        })
     }
 
     pub fn reader(&self) -> &R {
@@ -1918,11 +1927,13 @@ impl<R: Read + Seek> SeekableFieldR1csArtifact<R> {
                 actual: structural_digest,
             });
         }
-        Ok(crate::matrix_claim::AuthenticatedMatrixClaimEvaluations {
-            structural_digest,
-            fresh_value: fresh.map(|_| fresh_total),
-            accumulated_value: accumulated.map(|_| accumulated_total),
-        })
+        Ok(
+            crate::matrix_claim::AuthenticatedMatrixClaimEvaluations::new(
+                structural_digest,
+                fresh.map(|_| fresh_total),
+                accumulated.map(|_| accumulated_total),
+            ),
+        )
     }
 
     fn scan_matrix_rows(
@@ -1943,18 +1954,19 @@ impl<R: Read + Seek> SeekableFieldR1csArtifact<R> {
         let mut previous_offset = 0usize;
         let mut fresh_matrix = F128::ZERO;
         let mut accumulated_matrix = F128::ZERO;
+        let mut offset_bytes = vec![0u8; (DIGEST_SPAN_ROWS + 1) * 8];
+        let mut offsets = Vec::with_capacity(DIGEST_SPAN_ROWS + 1);
 
         for span_index in 0..num_rows.div_ceil(DIGEST_SPAN_ROWS) {
             let first_row = span_index * DIGEST_SPAN_ROWS;
             let rows = (num_rows - first_row).min(DIGEST_SPAN_ROWS);
             let offsets_len = rows + 1;
-            let mut offset_bytes = vec![0u8; offsets_len * 8];
+            offsets.clear();
             self.read_at(
                 layout.row_offsets_at + (first_row as u64) * 8,
-                &mut offset_bytes,
+                &mut offset_bytes[..offsets_len * 8],
             )?;
-            let mut offsets = Vec::with_capacity(offsets_len);
-            for (local, bytes) in offset_bytes.chunks_exact(8).enumerate() {
+            for (local, bytes) in offset_bytes[..offsets_len * 8].chunks_exact(8).enumerate() {
                 let raw = u64::from_le_bytes(bytes.try_into().expect("row offset"));
                 let actual =
                     usize::try_from(raw).map_err(|_| FieldR1csArtifactError::InvalidRowOffset {
@@ -1996,16 +2008,7 @@ impl<R: Read + Seek> SeekableFieldR1csArtifact<R> {
             let mut cursor = first_entry;
             let mut fresh_row = F128::ZERO;
             let mut accumulated_row = F128::ZERO;
-            streaming_begin_empty_rows(
-                first_row,
-                &offsets,
-                &mut row,
-                &mut span,
-                &mut fresh_matrix,
-                &mut accumulated_matrix,
-                fresh,
-                accumulated,
-            );
+            streaming_begin_empty_rows(&offsets, &mut row, &mut span);
             while cursor < final_entry {
                 if row >= rows {
                     return Err(FieldR1csArtifactError::InvalidRowOffset {
@@ -2041,16 +2044,7 @@ impl<R: Read + Seek> SeekableFieldR1csArtifact<R> {
                             accumulated,
                         );
                         row += 1;
-                        streaming_begin_empty_rows(
-                            first_row,
-                            &offsets,
-                            &mut row,
-                            &mut span,
-                            &mut fresh_matrix,
-                            &mut accumulated_matrix,
-                            fresh,
-                            accumulated,
-                        );
+                        streaming_begin_empty_rows(&offsets, &mut row, &mut span);
                         if row < rows && absolute == offsets[row] {
                             span.update(&((offsets[row + 1] - offsets[row]) as u64).to_le_bytes());
                         }
@@ -2119,6 +2113,8 @@ impl<R: Read + Seek> SeekableFieldR1csArtifact<R> {
                 }
                 if offsets[row] == offsets[row + 1] {
                     span.update(&0u64.to_le_bytes());
+                    row += 1;
+                    continue;
                 }
                 streaming_finish_row(
                     first_row + row,
@@ -2149,6 +2145,63 @@ impl<R: Read + Seek> SeekableFieldR1csArtifact<R> {
             });
         }
         Ok((fresh_matrix, accumulated_matrix))
+    }
+}
+
+/// Header/layout-only typestate for one terminal claim evaluation.
+///
+/// Construction validates the exact backing length, frozen shape, count
+/// arithmetic, dictionary cap, and section boundaries, but deliberately does
+/// not authenticate payload rows. The only operation that can produce an
+/// authenticated result consumes its one-shot evaluation right and performs
+/// canonical validation, structural hashing, and all requested claim
+/// evaluations in the same full payload pass.
+pub struct PreflightSeekableFieldR1csArtifact<R> {
+    artifact: SeekableFieldR1csArtifact<R>,
+    consumed: bool,
+}
+
+impl<R: Read + Seek> PreflightSeekableFieldR1csArtifact<R> {
+    pub fn open(
+        reader: R,
+        expected_shape: crate::proof::FieldShape,
+        expected_structural_digest: [u8; 32],
+        max_bytes: u64,
+    ) -> Result<Self, FieldR1csArtifactError> {
+        Ok(Self {
+            artifact: SeekableFieldR1csArtifact::preflight_header(
+                reader,
+                expected_shape,
+                expected_structural_digest,
+                max_bytes,
+            )?,
+            consumed: false,
+        })
+    }
+
+    pub fn reader(&self) -> &R {
+        self.artifact.reader()
+    }
+}
+
+impl<R: Read + Seek> crate::matrix_claim::MatrixClaimEvaluator
+    for PreflightSeekableFieldR1csArtifact<R>
+{
+    fn field_shape(&self) -> crate::proof::FieldShape {
+        self.artifact.shape
+    }
+
+    fn evaluate_matrix_claims(
+        &mut self,
+        fresh: Option<&crate::matrix_claim::FreshLincheckClaim>,
+        accumulated: Option<&crate::matrix_claim::MatrixAccClaim>,
+    ) -> Result<crate::matrix_claim::AuthenticatedMatrixClaimEvaluations, FieldR1csArtifactError>
+    {
+        if self.consumed {
+            return Err(FieldR1csArtifactError::MatrixEvaluatorAlreadyConsumed);
+        }
+        self.consumed = true;
+        self.artifact.scan_authenticated(fresh, accumulated)
     }
 }
 
@@ -2294,26 +2347,13 @@ impl StreamingAccumulatedWeights {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn streaming_begin_empty_rows(
-    first_row: usize,
     offsets: &[usize],
     row: &mut usize,
     span: &mut StreamingOnePieceByteHash,
-    fresh_matrix: &mut F128,
-    accumulated_matrix: &mut F128,
-    fresh: Option<&StreamingFreshWeights<'_>>,
-    accumulated: Option<&StreamingAccumulatedWeights>,
 ) {
     while *row + 1 < offsets.len() && offsets[*row] == offsets[*row + 1] {
         span.update(&0u64.to_le_bytes());
-        let absolute = first_row + *row;
-        if let Some(weights) = fresh {
-            *fresh_matrix += F128::ZERO * weights.row_weight(absolute);
-        }
-        if let Some(weights) = accumulated {
-            *accumulated_matrix += F128::ZERO * weights.row_weight(absolute);
-        }
         *row += 1;
     }
 }
@@ -2960,7 +3000,30 @@ mod tests {
     use super::*;
     use crate::lincheck::build_eq_table;
     use crate::proof::FieldShape;
-    use std::io::Cursor;
+    use std::io::{Cursor, Read, Seek, SeekFrom};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    struct CountingCursor {
+        inner: Cursor<Vec<u8>>,
+        bytes_read: Arc<AtomicUsize>,
+    }
+
+    impl Read for CountingCursor {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            let read = self.inner.read(bytes)?;
+            self.bytes_read.fetch_add(read, Ordering::Relaxed);
+            Ok(read)
+        }
+    }
+
+    impl Seek for CountingCursor {
+        fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+            self.inner.seek(position)
+        }
+    }
 
     struct Rng(u64);
     impl Rng {
@@ -3068,10 +3131,51 @@ mod tests {
         let evaluated = view
             .evaluate_matrix_claims(Some(&fresh), Some(&accumulated))
             .unwrap();
-        assert_eq!(evaluated.structural_digest, digest);
-        assert_eq!(evaluated.fresh_value, Some(expected_fresh));
-        assert_eq!(evaluated.accumulated_value, Some(expected_accumulated));
+        assert_eq!(evaluated.structural_digest(), digest);
+        assert_eq!(evaluated.fresh_value(), Some(expected_fresh));
+        assert_eq!(evaluated.accumulated_value(), Some(expected_accumulated));
         assert_eq!(view.useful_rows(), r1cs.useful_rows);
+    }
+
+    #[test]
+    fn terminal_preflight_reads_payload_exactly_once() {
+        use crate::matrix_claim::{MatrixAccClaim, MatrixClaimEvaluator};
+
+        let (_r1cs, shape, digest, bytes) = artifact_fixture(0x0A11_CE55);
+        // The fixture has fewer than DIGEST_SPAN_ROWS rows, so neither
+        // matrix rereads an overlapping span-boundary offset.
+        assert!((1usize << shape.k_log) < DIGEST_SPAN_ROWS);
+        let bytes_read = Arc::new(AtomicUsize::new(0));
+        let reader = CountingCursor {
+            inner: Cursor::new(bytes.clone()),
+            bytes_read: Arc::clone(&bytes_read),
+        };
+        let mut preflight =
+            PreflightSeekableFieldR1csArtifact::open(reader, shape, digest, bytes.len() as u64)
+                .unwrap();
+        assert_eq!(
+            bytes_read.load(Ordering::Relaxed),
+            FIELD_R1CS_ARTIFACT_HEADER_BYTES,
+            "header preflight must not scan the payload",
+        );
+
+        let claim = MatrixAccClaim {
+            point: vec![F128::ZERO; 2 * shape.k_log + 1],
+            value: F128::ZERO,
+        };
+        preflight
+            .evaluate_matrix_claims(None, Some(&claim))
+            .unwrap();
+        let payload = bytes.len() - FIELD_R1CS_ARTIFACT_HEADER_BYTES;
+        assert_eq!(
+            bytes_read.load(Ordering::Relaxed),
+            3 * FIELD_R1CS_ARTIFACT_HEADER_BYTES + payload,
+            "one header preflight, two identity-header reads, and exactly one payload pass",
+        );
+        assert!(matches!(
+            preflight.evaluate_matrix_claims(None, Some(&claim)),
+            Err(FieldR1csArtifactError::MatrixEvaluatorAlreadyConsumed)
+        ));
     }
 
     #[test]
@@ -3084,15 +3188,20 @@ mod tests {
         let k_log = 12usize;
         let k = 1usize << k_log;
         let mut a_rows = vec![Vec::new(); k];
-        a_rows[7] = (0..STREAMING_FIELD_R1CS_ENTRY_CHUNK + 37)
+        // Row 7 ends exactly at an entry-chunk boundary; row 8 begins the
+        // next chunk. The last/first rows around DIGEST_SPAN_ROWS exercise
+        // the independent span boundary, including adjacent empty padding.
+        a_rows[7] = (0..STREAMING_FIELD_R1CS_ENTRY_CHUNK)
             .map(|index| ((index % k) as u32, F128::ONE))
             .collect();
-        a_rows[DIGEST_SPAN_ROWS + 3].push((19, F128::new(5, 9)));
+        a_rows[8].push((17, F128::new(3, 7)));
+        a_rows[DIGEST_SPAN_ROWS - 1].push((18, F128::new(4, 8)));
+        a_rows[DIGEST_SPAN_ROWS].push((19, F128::new(5, 9)));
         let r1cs = FieldR1cs {
             m: k_log,
             k_log,
             k_skip: 6,
-            useful_rows: DIGEST_SPAN_ROWS + 4,
+            useful_rows: DIGEST_SPAN_ROWS + 1,
             a_0: SparseFieldMatrix::from_rows(k, a_rows),
             b_0: SparseFieldMatrix::zero(k),
             const_pin: Some(0),
@@ -3127,11 +3236,11 @@ mod tests {
             .evaluate_matrix_claims(Some(&fresh), Some(&accumulated))
             .unwrap();
         assert_eq!(
-            evaluated.fresh_value,
+            evaluated.fresh_value(),
             Some(fresh_claim_value(&r1cs, &fresh))
         );
         assert_eq!(
-            evaluated.accumulated_value,
+            evaluated.accumulated_value(),
             Some(stacked_matrix_mle_eval(&r1cs, &accumulated))
         );
     }
@@ -3155,6 +3264,29 @@ mod tests {
             view.evaluate_matrix_claims(None, None),
             Err(FieldR1csArtifactError::StructuralDigestMismatch { .. })
                 | Err(FieldR1csArtifactError::InvalidColumn { .. })
+        ));
+    }
+
+    #[test]
+    fn terminal_preflight_defers_but_never_skips_payload_rejection() {
+        use crate::matrix_claim::MatrixClaimEvaluator;
+
+        let (_r1cs, shape, digest, mut bytes) = artifact_fixture(0xDEFE_22ED);
+        let a_offsets = header_u64(&bytes, 80) as usize;
+        let a_columns_at = FIELD_R1CS_ARTIFACT_HEADER_BYTES + a_offsets * 8;
+        bytes[a_columns_at..a_columns_at + 4].copy_from_slice(&(1u32 << shape.k_log).to_le_bytes());
+
+        let mut preflight = PreflightSeekableFieldR1csArtifact::open(
+            Cursor::new(bytes.clone()),
+            shape,
+            digest,
+            bytes.len() as u64,
+        )
+        .expect("header/layout preflight deliberately does not authenticate payload rows");
+        assert!(matches!(
+            preflight.evaluate_matrix_claims(None, None),
+            Err(FieldR1csArtifactError::InvalidColumn { .. })
+                | Err(FieldR1csArtifactError::StructuralDigestMismatch { .. })
         ));
     }
 
@@ -3268,7 +3400,7 @@ mod tests {
 
     #[test]
     fn seekable_artifact_scratch_is_protocol_bounded() {
-        assert!(STREAMING_FIELD_R1CS_ENTRY_CHUNK * 8 <= 64 * 1024);
+        assert!(STREAMING_FIELD_R1CS_ENTRY_CHUNK * 8 <= 512 * 1024);
         assert!(STREAMING_FIELD_R1CS_MAX_DICTIONARY_VALUES * 16 <= 1024 * 1024);
         let source = include_str!("field_r1cs.rs");
         let implementation = source

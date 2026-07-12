@@ -3,19 +3,21 @@
 
 //! Atomic local store for the compact selected-recursive class registry.
 
-use std::ffi::OsString;
-use std::fs::{self, File, Metadata, OpenOptions};
+use std::fs::{self, File, Metadata};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::MetadataExt;
+
+#[cfg(test)]
+use std::fs::OpenOptions;
 
 use noid_recursive::acceptance::block_class::BlockClass;
 use noid_recursive::acceptance::split_link::{CanonicalSplitLinkLadder, SplitLinkClass};
 use noid_recursive::class_registry::{
-    decode_selected_recursive_class_registry, encode_selected_recursive_class_registry,
+    decode_selected_recursive_class_registry_pinned, encode_selected_recursive_class_registry,
     OwnedSelectedRecursiveClassRegistry, SelectedRecursiveClassRegistryError,
     MAX_SELECTED_RECURSIVE_CLASS_REGISTRY_BYTES,
 };
@@ -43,6 +45,8 @@ pub enum LocalSelectedRecursiveClassRegistryError {
     ArtifactTooLarge { actual: u64, max: u64 },
     #[error("class registry artifact changed between path preflight and decode: {path}")]
     ArtifactChanged { path: PathBuf },
+    #[error("secure descriptor-relative class registry storage is unsupported on this platform")]
+    UnsupportedPlatform,
     #[error("class registry artifact rejected: {0}")]
     Registry(#[from] SelectedRecursiveClassRegistryError),
     #[error("cannot {operation} class registry {path}: {source}")]
@@ -121,52 +125,70 @@ impl LocalSelectedRecursiveClassRegistryStore {
             .join(REGISTRY_ARTIFACT_FILE)
     }
 
-    pub fn load(
+    /// Load only under an externally provisioned release pin.  The expected
+    /// digest must not be derived from the artifact being opened.
+    pub fn load_pinned(
         &self,
+        expected_registry_digest: [u8; 32],
     ) -> Result<LoadedSelectedRecursiveClassRegistry, LocalSelectedRecursiveClassRegistryError>
     {
-        let path = self.artifact_path();
-        let parent = path.parent().expect("fixed registry artifact has parent");
-        validate_directory(&self.root)?;
-        validate_directory(parent)?;
-
-        let before =
-            fs::symlink_metadata(&path).map_err(|source| io_error("stat", &path, source))?;
-        validate_regular_file(&path, &before)?;
-        reject_oversize(before.len(), self.effective_max_bytes())?;
-
-        let mut file = open_read_only(&path)?;
-        let opened = file
-            .metadata()
-            .map_err(|source| io_error("inspect opened", &path, source))?;
-        validate_regular_file(&path, &opened)?;
-        if !same_file_and_length(&before, &opened) {
-            return Err(LocalSelectedRecursiveClassRegistryError::ArtifactChanged { path });
+        #[cfg(not(unix))]
+        {
+            let _ = expected_registry_digest;
+            return Err(LocalSelectedRecursiveClassRegistryError::UnsupportedPlatform);
         }
-        reject_oversize(opened.len(), self.effective_max_bytes())?;
-
-        let len = usize::try_from(opened.len()).map_err(|_| {
-            LocalSelectedRecursiveClassRegistryError::ArtifactTooLarge {
-                actual: opened.len(),
-                max: self.effective_max_bytes(),
+        #[cfg(unix)]
+        {
+            let path = self.artifact_path();
+            let parent = self.open_version_directory(false)?;
+            match parent
+                .leaf_kind(REGISTRY_ARTIFACT_FILE)
+                .map_err(|source| io_error("inspect anchored leaf", &path, source))?
+            {
+                anchored_artifact_fs::LeafKind::Regular => {}
+                anchored_artifact_fs::LeafKind::Symlink => {
+                    return Err(LocalSelectedRecursiveClassRegistryError::Symlink { path });
+                }
+                anchored_artifact_fs::LeafKind::Other => {
+                    return Err(LocalSelectedRecursiveClassRegistryError::NotRegularFile { path });
+                }
+                anchored_artifact_fs::LeafKind::Missing => {
+                    return Err(io_error(
+                        "open anchored leaf",
+                        &path,
+                        io::Error::new(io::ErrorKind::NotFound, "registry artifact is missing"),
+                    ));
+                }
             }
-        })?;
-        let mut bytes = Vec::with_capacity(len);
-        file.read_to_end(&mut bytes)
-            .map_err(|source| io_error("read", &path, source))?;
-        if bytes.len() != len {
-            return Err(LocalSelectedRecursiveClassRegistryError::ArtifactChanged { path });
-        }
-        let after = file
-            .metadata()
-            .map_err(|source| io_error("inspect decoded", &path, source))?;
-        if !same_file_and_length(&opened, &after) {
-            return Err(LocalSelectedRecursiveClassRegistryError::ArtifactChanged { path });
-        }
-        drop(file);
 
-        let registry = decode_selected_recursive_class_registry(&bytes)?;
-        Ok(LoadedSelectedRecursiveClassRegistry { registry })
+            let mut file = parent
+                .open_read_only(REGISTRY_ARTIFACT_FILE)
+                .map_err(|source| io_error("open anchored leaf", &path, source))?;
+            let opened = file
+                .metadata()
+                .map_err(|source| io_error("inspect opened", &path, source))?;
+            validate_regular_file(&path, &opened)?;
+            reject_oversize(opened.len(), self.effective_max_bytes())?;
+
+            let len = usize::try_from(opened.len()).map_err(|_| {
+                LocalSelectedRecursiveClassRegistryError::ArtifactTooLarge {
+                    actual: opened.len(),
+                    max: self.effective_max_bytes(),
+                }
+            })?;
+            let bytes = read_exact_artifact_bytes(&mut file, len, &path)?;
+            let after = file
+                .metadata()
+                .map_err(|source| io_error("inspect decoded", &path, source))?;
+            if !same_file_and_length(&opened, &after) {
+                return Err(LocalSelectedRecursiveClassRegistryError::ArtifactChanged { path });
+            }
+            drop(file);
+
+            let registry =
+                decode_selected_recursive_class_registry_pinned(&bytes, expected_registry_digest)?;
+            Ok(LoadedSelectedRecursiveClassRegistry { registry })
+        }
     }
 
     pub fn export(
@@ -180,32 +202,51 @@ impl LocalSelectedRecursiveClassRegistryStore {
     }
 
     fn export_encoded(&self, bytes: &[u8]) -> Result<(), LocalSelectedRecursiveClassRegistryError> {
-        reject_oversize(bytes.len() as u64, self.effective_max_bytes())?;
-        self.prepare_layout()?;
-        let target = self.artifact_path();
-        match fs::symlink_metadata(&target) {
-            Ok(metadata) => validate_regular_file(&target, &metadata)?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(source) => return Err(io_error("stat", &target, source)),
+        #[cfg(not(unix))]
+        {
+            let _ = bytes;
+            return Err(LocalSelectedRecursiveClassRegistryError::UnsupportedPlatform);
         }
-        let parent = target.parent().expect("fixed registry artifact has parent");
-        validate_directory(parent)?;
+        #[cfg(unix)]
+        {
+            reject_oversize(bytes.len() as u64, self.effective_max_bytes())?;
+            let target = self.artifact_path();
+            let parent = self.open_version_directory(true)?;
+            match parent
+                .leaf_kind(REGISTRY_ARTIFACT_FILE)
+                .map_err(|source| io_error("inspect anchored target", &target, source))?
+            {
+                anchored_artifact_fs::LeafKind::Missing
+                | anchored_artifact_fs::LeafKind::Regular => {}
+                anchored_artifact_fs::LeafKind::Symlink => {
+                    return Err(LocalSelectedRecursiveClassRegistryError::Symlink { path: target });
+                }
+                anchored_artifact_fs::LeafKind::Other => {
+                    return Err(LocalSelectedRecursiveClassRegistryError::NotRegularFile {
+                        path: target,
+                    });
+                }
+            }
 
-        let (temporary, mut file) = create_temporary_file(parent, &target)?;
-        let mut cleanup = TemporaryCleanup::new(temporary.clone());
-        file.write_all(bytes)
-            .map_err(|source| io_error("write", &temporary, source))?;
-        file.flush()
-            .map_err(|source| io_error("flush", &temporary, source))?;
-        file.sync_all()
-            .map_err(|source| io_error("sync", &temporary, source))?;
-        drop(file);
-        fs::rename(&temporary, &target).map_err(|source| io_error("rename", &target, source))?;
-        cleanup.disarm();
-        File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|source| io_error("sync directory", parent, source))?;
-        Ok(())
+            let (temporary_name, mut file) = create_temporary_file(&parent, &target)?;
+            let mut cleanup =
+                TemporaryCleanup::new(&parent, temporary_name.clone(), target.clone())?;
+            file.write_all(bytes)
+                .map_err(|source| io_error("write", &target, source))?;
+            file.flush()
+                .map_err(|source| io_error("flush", &target, source))?;
+            file.sync_all()
+                .map_err(|source| io_error("sync", &target, source))?;
+            drop(file);
+            parent
+                .rename(&temporary_name, REGISTRY_ARTIFACT_FILE)
+                .map_err(|source| io_error("rename anchored artifact", &target, source))?;
+            cleanup.disarm();
+            parent
+                .sync_all()
+                .map_err(|source| io_error("sync anchored directory", &target, source))?;
+            Ok(())
+        }
     }
 
     fn effective_max_bytes(&self) -> u64 {
@@ -214,35 +255,75 @@ impl LocalSelectedRecursiveClassRegistryStore {
             .min(usize::MAX as u64)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn prepare_layout(&self) -> Result<(), LocalSelectedRecursiveClassRegistryError> {
-        if !self.root.exists() {
-            fs::create_dir_all(&self.root)
-                .map_err(|source| io_error("create directory", &self.root, source))?;
+        #[cfg(not(unix))]
+        {
+            return Err(LocalSelectedRecursiveClassRegistryError::UnsupportedPlatform);
         }
-        validate_directory(&self.root)?;
-        let version = self.root.join(REGISTRY_VERSION_DIRECTORY);
-        match fs::create_dir(&version) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(source) => return Err(io_error("create directory", &version, source)),
+        #[cfg(unix)]
+        {
+            self.open_version_directory(true).map(|_| ())
         }
-        validate_directory(&version)
+    }
+
+    #[cfg(unix)]
+    fn open_version_directory(
+        &self,
+        create: bool,
+    ) -> Result<anchored_artifact_fs::AnchoredDirectory, LocalSelectedRecursiveClassRegistryError>
+    {
+        let root = anchored_artifact_fs::AnchoredDirectory::open_tree(&self.root, create)
+            .map_err(|source| directory_open_error(&self.root, source))?;
+        let version_path = self.root.join(REGISTRY_VERSION_DIRECTORY);
+        root.open_child_directory(REGISTRY_VERSION_DIRECTORY, create)
+            .map_err(|source| directory_open_error(&version_path, source))
     }
 }
 
-fn validate_directory(path: &Path) -> Result<(), LocalSelectedRecursiveClassRegistryError> {
-    let metadata = fs::symlink_metadata(path).map_err(|source| io_error("stat", path, source))?;
-    if metadata.file_type().is_symlink() {
-        return Err(LocalSelectedRecursiveClassRegistryError::Symlink {
+/// Read exactly the stat-preflighted regular-file length, then prove EOF with
+/// one bounded byte.  `read_to_end` is deliberately forbidden here: an
+/// in-place appender could otherwise grow the Vec without the 4 MiB cap even
+/// though the post-read metadata check eventually rejects the file.
+fn read_exact_artifact_bytes(
+    file: &mut File,
+    len: usize,
+    path: &Path,
+) -> Result<Vec<u8>, LocalSelectedRecursiveClassRegistryError> {
+    let mut bytes = vec![0u8; len];
+    file.read_exact(&mut bytes)
+        .map_err(|source| io_error("read exact", path, source))?;
+    let mut extra = [0u8; 1];
+    match file.read(&mut extra) {
+        Ok(0) => Ok(bytes),
+        Ok(_) => Err(LocalSelectedRecursiveClassRegistryError::ArtifactChanged {
             path: path.to_path_buf(),
-        });
+        }),
+        Err(source) => Err(io_error("probe artifact EOF", path, source)),
     }
-    if !metadata.is_dir() {
-        return Err(LocalSelectedRecursiveClassRegistryError::NotDirectory {
-            path: path.to_path_buf(),
-        });
+}
+
+#[cfg(unix)]
+fn directory_open_error(
+    path: &Path,
+    source: io::Error,
+) -> LocalSelectedRecursiveClassRegistryError {
+    // Classification is diagnostic only. Security comes from the descriptor-
+    // relative O_NOFOLLOW walk below, so a race in this best-effort path stat
+    // can change the error variant but cannot redirect an operation.
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink() {
+            return LocalSelectedRecursiveClassRegistryError::Symlink {
+                path: path.to_path_buf(),
+            };
+        }
+        if !metadata.is_dir() {
+            return LocalSelectedRecursiveClassRegistryError::NotDirectory {
+                path: path.to_path_buf(),
+            };
+        }
     }
-    Ok(())
+    io_error("open anchored directory", path, source)
 }
 
 fn validate_regular_file(
@@ -279,45 +360,30 @@ fn same_file_and_length(left: &Metadata, right: &Metadata) -> bool {
     left.len() == right.len() && left.is_file() == right.is_file()
 }
 
-fn open_read_only(path: &Path) -> Result<File, LocalSelectedRecursiveClassRegistryError> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
-    options
-        .open(path)
-        .map_err(|source| io_error("open", path, source))
-}
-
+#[cfg(unix)]
 fn create_temporary_file(
-    parent: &Path,
+    parent: &anchored_artifact_fs::AnchoredDirectory,
     target: &Path,
-) -> Result<(PathBuf, File), LocalSelectedRecursiveClassRegistryError> {
+) -> Result<(String, File), LocalSelectedRecursiveClassRegistryError> {
     let leaf = target
         .file_name()
-        .expect("fixed registry artifact has a file name");
+        .and_then(|value| value.to_str())
+        .expect("fixed ASCII registry artifact has a file name");
     let mut last_error = None;
     for _ in 0..TEMP_CREATE_ATTEMPTS {
         let sequence = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
-        let mut name = OsString::from(".");
-        name.push(leaf);
-        name.push(format!(".tmp-{}-{sequence}", std::process::id()));
-        let temporary = parent.join(name);
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
-        match options.open(&temporary) {
+        let temporary = format!(".{leaf}.tmp-{}-{sequence}", std::process::id());
+        match parent.create_new(&temporary) {
             Ok(file) => return Ok((temporary, file)),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 last_error = Some(error);
             }
-            Err(source) => return Err(io_error("create temporary", &temporary, source)),
+            Err(source) => return Err(io_error("create anchored temporary", target, source)),
         }
     }
     Err(io_error(
-        "create temporary",
-        parent,
+        "create anchored temporary",
+        target,
         last_error.unwrap_or_else(|| io::Error::new(io::ErrorKind::AlreadyExists, "collision")),
     ))
 }
@@ -334,24 +400,241 @@ fn io_error(
     }
 }
 
+#[cfg(unix)]
 struct TemporaryCleanup {
-    path: PathBuf,
+    parent: anchored_artifact_fs::AnchoredDirectory,
+    name: String,
+    display_path: PathBuf,
     armed: bool,
 }
 
+#[cfg(unix)]
 impl TemporaryCleanup {
-    fn new(path: PathBuf) -> Self {
-        Self { path, armed: true }
+    fn new(
+        parent: &anchored_artifact_fs::AnchoredDirectory,
+        name: String,
+        display_path: PathBuf,
+    ) -> Result<Self, LocalSelectedRecursiveClassRegistryError> {
+        Ok(Self {
+            parent: parent
+                .try_clone()
+                .map_err(|source| io_error("clone anchored directory", &display_path, source))?,
+            name,
+            display_path,
+            armed: true,
+        })
     }
     fn disarm(&mut self) {
         self.armed = false;
     }
 }
 
+#[cfg(unix)]
 impl Drop for TemporaryCleanup {
     fn drop(&mut self) {
         if self.armed {
-            let _ = fs::remove_file(&self.path);
+            let _ = self.parent.unlink(&self.name);
+            let _ = &self.display_path;
+        }
+    }
+}
+
+/// Reusable Unix descriptor-relative filesystem boundary for large local
+/// protocol artifacts. Every directory component is opened with O_NOFOLLOW;
+/// leaf open/create/rename/unlink operations are relative to the held parent
+/// descriptor, so path replacement cannot redirect I/O outside the root.
+#[cfg(unix)]
+pub(crate) mod anchored_artifact_fs {
+    use std::ffi::{CStr, CString};
+    use std::fs::{File, OpenOptions};
+    use std::io;
+    use std::mem::MaybeUninit;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::path::{Component, Path};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum LeafKind {
+        Missing,
+        Regular,
+        Symlink,
+        Other,
+    }
+
+    pub(crate) struct AnchoredDirectory {
+        file: File,
+    }
+
+    impl AnchoredDirectory {
+        pub(crate) fn open_tree(path: &Path, create: bool) -> io::Result<Self> {
+            let mut current = open_start(path.is_absolute())?;
+            for component in path.components() {
+                match component {
+                    Component::RootDir | Component::CurDir => {}
+                    Component::Normal(name) => {
+                        current = current.open_child_directory_os(name.as_bytes(), create)?;
+                    }
+                    Component::ParentDir | Component::Prefix(_) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "anchored artifact root cannot contain parent/prefix components",
+                        ));
+                    }
+                }
+            }
+            Ok(current)
+        }
+
+        pub(crate) fn open_child_directory(&self, name: &str, create: bool) -> io::Result<Self> {
+            self.open_child_directory_os(name.as_bytes(), create)
+        }
+
+        fn open_child_directory_os(&self, name: &[u8], create: bool) -> io::Result<Self> {
+            let name = cstring(name)?;
+            match open_directory_at(self.file.as_raw_fd(), &name) {
+                Ok(file) => Ok(Self { file }),
+                Err(error) if create && error.kind() == io::ErrorKind::NotFound => {
+                    let result = unsafe {
+                        libc::mkdirat(self.file.as_raw_fd(), name.as_ptr(), 0o755 as libc::mode_t)
+                    };
+                    if result != 0 {
+                        let mkdir_error = io::Error::last_os_error();
+                        if mkdir_error.kind() != io::ErrorKind::AlreadyExists {
+                            return Err(mkdir_error);
+                        }
+                    }
+                    open_directory_at(self.file.as_raw_fd(), &name).map(|file| Self { file })
+                }
+                Err(error) => Err(error),
+            }
+        }
+
+        pub(crate) fn leaf_kind(&self, name: &str) -> io::Result<LeafKind> {
+            let name = cstring(name.as_bytes())?;
+            let mut stat = MaybeUninit::<libc::stat>::uninit();
+            let result = unsafe {
+                libc::fstatat(
+                    self.file.as_raw_fd(),
+                    name.as_ptr(),
+                    stat.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if result != 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::NotFound {
+                    return Ok(LeafKind::Missing);
+                }
+                return Err(error);
+            }
+            let mode = unsafe { stat.assume_init() }.st_mode & libc::S_IFMT;
+            Ok(if mode == libc::S_IFREG {
+                LeafKind::Regular
+            } else if mode == libc::S_IFLNK {
+                LeafKind::Symlink
+            } else {
+                LeafKind::Other
+            })
+        }
+
+        pub(crate) fn open_read_only(&self, name: &str) -> io::Result<File> {
+            open_file_at(
+                self.file.as_raw_fd(),
+                &cstring(name.as_bytes())?,
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0,
+            )
+        }
+
+        pub(crate) fn create_new(&self, name: &str) -> io::Result<File> {
+            open_file_at(
+                self.file.as_raw_fd(),
+                &cstring(name.as_bytes())?,
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0o600,
+            )
+        }
+
+        pub(crate) fn rename(&self, from: &str, to: &str) -> io::Result<()> {
+            let from = cstring(from.as_bytes())?;
+            let to = cstring(to.as_bytes())?;
+            let result = unsafe {
+                libc::renameat(
+                    self.file.as_raw_fd(),
+                    from.as_ptr(),
+                    self.file.as_raw_fd(),
+                    to.as_ptr(),
+                )
+            };
+            cvt(result)
+        }
+
+        pub(crate) fn unlink(&self, name: &str) -> io::Result<()> {
+            let name = cstring(name.as_bytes())?;
+            let result = unsafe { libc::unlinkat(self.file.as_raw_fd(), name.as_ptr(), 0) };
+            cvt(result)
+        }
+
+        pub(crate) fn sync_all(&self) -> io::Result<()> {
+            self.file.sync_all()
+        }
+
+        pub(crate) fn try_clone(&self) -> io::Result<Self> {
+            self.file.try_clone().map(|file| Self { file })
+        }
+    }
+
+    fn open_start(absolute: bool) -> io::Result<AnchoredDirectory> {
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        options
+            .open(if absolute {
+                Path::new("/")
+            } else {
+                Path::new(".")
+            })
+            .map(|file| AnchoredDirectory { file })
+    }
+
+    fn open_directory_at(parent: libc::c_int, name: &CStr) -> io::Result<File> {
+        open_file_at(
+            parent,
+            name,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0,
+        )
+    }
+
+    fn open_file_at(
+        parent: libc::c_int,
+        name: &CStr,
+        flags: libc::c_int,
+        mode: libc::mode_t,
+    ) -> io::Result<File> {
+        let fd = unsafe { libc::openat(parent, name.as_ptr(), flags, mode) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    fn cstring(bytes: &[u8]) -> io::Result<CString> {
+        CString::new(bytes).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "artifact path component contains NUL",
+            )
+        })
+    }
+
+    fn cvt(result: libc::c_int) -> io::Result<()> {
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
         }
     }
 }
@@ -369,7 +652,7 @@ mod tests {
         store.prepare_layout().unwrap();
         fs::write(store.artifact_path(), [0u8; 9]).unwrap();
         assert!(matches!(
-            store.load(),
+            store.load_pinned([0u8; 32]),
             Err(LocalSelectedRecursiveClassRegistryError::ArtifactTooLarge { actual: 9, max: 8 })
         ));
     }
@@ -386,7 +669,7 @@ mod tests {
         fs::write(&target, [0u8; 64]).unwrap();
         symlink(&target, store.artifact_path()).unwrap();
         assert!(matches!(
-            store.load(),
+            store.load_pinned([0u8; 32]),
             Err(LocalSelectedRecursiveClassRegistryError::Symlink { .. })
         ));
     }
@@ -403,5 +686,48 @@ mod tests {
             Err(LocalSelectedRecursiveClassRegistryError::ArtifactTooLarge { .. })
         ));
         assert_eq!(fs::read(store.artifact_path()).unwrap(), b"old");
+    }
+
+    #[test]
+    fn exact_reader_rejects_growth_without_reading_past_preflight_length() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("artifact");
+        fs::write(&path, b"bounded").unwrap();
+        let mut opened = File::open(&path).unwrap();
+        let preflight_len = usize::try_from(opened.metadata().unwrap().len()).unwrap();
+
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"growth")
+            .unwrap();
+
+        assert!(matches!(
+            read_exact_artifact_bytes(&mut opened, preflight_len, &path),
+            Err(LocalSelectedRecursiveClassRegistryError::ArtifactChanged { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn held_directory_descriptor_cannot_be_redirected_by_symlink_swap() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().unwrap();
+        let store = LocalSelectedRecursiveClassRegistryStore::new(directory.path().join("root"));
+        store.prepare_layout().unwrap();
+        let anchored = store.open_version_directory(false).unwrap();
+        let held = directory.path().join("root/held-v1");
+        let outside = directory.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::rename(directory.path().join("root/v1"), &held).unwrap();
+        symlink(&outside, directory.path().join("root/v1")).unwrap();
+
+        let mut file = anchored.create_new("probe").unwrap();
+        file.write_all(b"anchored").unwrap();
+        file.sync_all().unwrap();
+        assert_eq!(fs::read(held.join("probe")).unwrap(), b"anchored");
+        assert!(!outside.join("probe").exists());
     }
 }

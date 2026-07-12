@@ -29,8 +29,10 @@ use crate::region_sidecar::{
     BlockRegionSidecarVk, CombinedDuplexRegionDescriptor, CombinedDuplexRegionVk,
     CombinedDuplexSubChannelDescriptor, LinkRegionSidecarVk, MerkleRegionFamily, MerkleRegionVk,
     RegionSidecarError, SelectedZkBlockRegionVkSlices, COMBINED_DUPLEX_REGION_COMMITTED_COLUMNS,
+    MAX_COMBINED_DUPLEX_CHALLENGES, MAX_COMBINED_DUPLEX_DATA_LANES,
     MAX_COMBINED_DUPLEX_SCHEDULE_OPS, MAX_COMBINED_DUPLEX_SUBCHANNELS,
-    MAX_COMBINED_DUPLEX_TX_TILE_LOG, MERKLE_REGION_COMMITTED_COLUMNS,
+    MAX_COMBINED_DUPLEX_SUBCHANNEL_SLOTS, MAX_COMBINED_DUPLEX_TX_TILE_LOG,
+    MAX_COMBINED_DUPLEX_W_LOG, MERKLE_REGION_COMMITTED_COLUMNS,
 };
 use crate::selected_history::{
     decode_selected_history_terminal_package, SelectedHistoryCodecError,
@@ -48,7 +50,6 @@ const CLASS_COUNT: usize = USER_TX_CLASS_TIERS.len();
 const MAX_PUBLIC_IO_CLAIMS: usize = 16;
 const MAX_GENESIS_PACKAGE_BYTES: usize = MAX_SELECTED_HISTORY_TERMINAL_PACKAGE_BYTES;
 const MAX_MERKLE_FAMILIES: usize = 64;
-const MAX_TRANSCRIPT_ABSORB_LANES: usize = 4096;
 
 /// An owned registry decoded from local release material.  It contains no
 /// `FieldR1cs`, sample Block envelope, witness, or per-tier proof.
@@ -97,6 +98,10 @@ pub enum SelectedRecursiveClassRegistryError {
         actual: usize,
     },
     DigestMismatch,
+    PinnedDigestMismatch {
+        expected: [u8; 32],
+        actual: [u8; 32],
+    },
     InvalidLength {
         field: &'static str,
         actual: u64,
@@ -133,6 +138,9 @@ impl fmt::Display for SelectedRecursiveClassRegistryError {
                 "class registry length mismatch: expected {expected}, got {actual}"
             ),
             Self::DigestMismatch => f.write_str("class registry payload digest mismatch"),
+            Self::PinnedDigestMismatch { .. } => {
+                f.write_str("class registry does not match the externally supplied release pin")
+            }
             Self::InvalidLength { field, actual, max } => {
                 write!(f, "class registry {field} length {actual} exceeds {max}")
             }
@@ -284,13 +292,37 @@ pub fn encode_selected_recursive_class_registry(
     finish_artifact(body.finish())
 }
 
-/// Allocation-free outer length preflight followed by bounded manual decode
-/// and canonical rehydration.  Every nested count is checked against a fixed
-/// protocol maximum and remaining bytes before a `Vec` reserves storage.
-pub fn decode_selected_recursive_class_registry(
+/// Production decoder for one externally pinned release registry.
+///
+/// The expected digest is authority supplied by the binary/release manifest,
+/// not a value read from the artifact itself.  It is checked before nested
+/// preflight, allocation, or class materialization, so a self-consistent
+/// replacement file cannot select weaker recursive statement identities.
+pub fn decode_selected_recursive_class_registry_pinned(
+    bytes: &[u8],
+    expected_registry_digest: [u8; 32],
+) -> Result<OwnedSelectedRecursiveClassRegistry, SelectedRecursiveClassRegistryError> {
+    let (body, actual_registry_digest) = preflight_artifact(bytes)?;
+    if actual_registry_digest != expected_registry_digest {
+        return Err(SelectedRecursiveClassRegistryError::PinnedDigestMismatch {
+            expected: expected_registry_digest,
+            actual: actual_registry_digest,
+        });
+    }
+    preflight_registry_body(body)?;
+    let wire = decode_registry_body(body)?;
+    materialize_registry(wire)
+}
+
+/// Explicitly unpinned decoder for offline release generation and inspection.
+///
+/// Runtime verification must use
+/// [`decode_selected_recursive_class_registry_pinned`].  The artifact's own
+/// trailer is only an integrity checksum and is not an authorization source.
+pub fn decode_selected_recursive_class_registry_unpinned_for_offline_inspection(
     bytes: &[u8],
 ) -> Result<OwnedSelectedRecursiveClassRegistry, SelectedRecursiveClassRegistryError> {
-    let body = preflight_artifact(bytes)?;
+    let (body, _) = preflight_artifact(bytes)?;
     preflight_registry_body(body)?;
     let wire = decode_registry_body(body)?;
     materialize_registry(wire)
@@ -317,7 +349,9 @@ fn finish_artifact(body: Vec<u8>) -> Result<Vec<u8>, SelectedRecursiveClassRegis
     Ok(bytes)
 }
 
-fn preflight_artifact(bytes: &[u8]) -> Result<&[u8], SelectedRecursiveClassRegistryError> {
+fn preflight_artifact(
+    bytes: &[u8],
+) -> Result<(&[u8], [u8; 32]), SelectedRecursiveClassRegistryError> {
     if bytes.len() > MAX_SELECTED_RECURSIVE_CLASS_REGISTRY_BYTES {
         return Err(SelectedRecursiveClassRegistryError::TooLarge {
             actual: bytes.len(),
@@ -360,10 +394,11 @@ fn preflight_artifact(bytes: &[u8]) -> Result<&[u8], SelectedRecursiveClassRegis
     let advertised: [u8; 32] = bytes[REGISTRY_HEADER_BYTES + body_len..]
         .try_into()
         .unwrap();
-    if registry_digest(body) != advertised {
+    let actual = registry_digest(body);
+    if actual != advertised {
         return Err(SelectedRecursiveClassRegistryError::DigestMismatch);
     }
-    Ok(body)
+    Ok((body, actual))
 }
 
 fn registry_digest(body: &[u8]) -> [u8; 32] {
@@ -760,39 +795,40 @@ fn preflight_link_vk(input: &mut Reader<'_>) -> Result<(), SelectedRecursiveClas
         "combined duplex subchannels",
         MAX_COMBINED_DUPLEX_SUBCHANNELS,
     )?;
+    if channel_count < 2 {
+        return Err(SelectedRecursiveClassRegistryError::InvalidValue(
+            "combined duplex subchannel count",
+        ));
+    }
+    let mut max_channel_slots = 0usize;
     for _ in 0..channel_count {
-        let op_count =
-            input.len_u16("combined duplex schedule", MAX_COMBINED_DUPLEX_SCHEDULE_OPS)?;
-        for _ in 0..op_count {
-            match input.u8()? {
-                0 => {
-                    let lane_count = input
-                        .len_u16("combined duplex absorb lanes", MAX_TRANSCRIPT_ABSORB_LANES)?;
-                    for _ in 0..lane_count {
-                        match input.u8()? {
-                            0 => {}
-                            1 => {
-                                input.take(16)?;
-                            }
-                            _ => {
-                                return Err(SelectedRecursiveClassRegistryError::InvalidValue(
-                                    "transcript lane tag",
-                                ))
-                            }
-                        }
-                    }
-                }
-                1 => {
-                    input.take(2)?;
-                }
-                _ => {
-                    return Err(SelectedRecursiveClassRegistryError::InvalidValue(
-                        "transcript operation tag",
-                    ))
-                }
-            }
-        }
+        let shape = preflight_transcript_schedule(input)?;
+        max_channel_slots = max_channel_slots.max(shape.slots);
         input.take(2 * 16)?;
+    }
+    let padded_channels = channel_count
+        .checked_next_power_of_two()
+        .ok_or(SelectedRecursiveClassRegistryError::LengthOverflow)?;
+    let common_slots = max_channel_slots
+        .max(1)
+        .checked_next_power_of_two()
+        .ok_or(SelectedRecursiveClassRegistryError::LengthOverflow)?;
+    let per_tile = padded_channels
+        .checked_mul(common_slots)
+        .ok_or(SelectedRecursiveClassRegistryError::LengthOverflow)?;
+    let tile_count = 1usize
+        .checked_shl(tile_log as u32)
+        .ok_or(SelectedRecursiveClassRegistryError::LengthOverflow)?;
+    let total_slots = per_tile
+        .checked_mul(tile_count)
+        .ok_or(SelectedRecursiveClassRegistryError::LengthOverflow)?;
+    if !per_tile.is_power_of_two()
+        || !total_slots.is_power_of_two()
+        || total_slots.trailing_zeros() as usize > MAX_COMBINED_DUPLEX_W_LOG
+    {
+        return Err(SelectedRecursiveClassRegistryError::InvalidValue(
+            "combined duplex schedule geometry",
+        ));
     }
     input.take(COMBINED_DUPLEX_REGION_COMMITTED_COLUMNS * 9)?;
     input.take(32 + 32 + 1 + 1)?;
@@ -815,6 +851,166 @@ fn preflight_link_vk(input: &mut Reader<'_>) -> Result<(), SelectedRecursiveClas
     }
     input.take(32 + 32)?;
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct PreflightScheduleShape {
+    slots: usize,
+}
+
+/// Allocation-free mirror of the canonical combined-duplex schedule compiler.
+/// Per-operation lengths alone are insufficient: many individually bounded
+/// `Absorb` records can otherwise expand a compact body into hundreds of MiB
+/// of `Option<u128>` lanes before the descriptor constructor rejects their
+/// cumulative geometry.
+fn preflight_transcript_schedule(
+    input: &mut Reader<'_>,
+) -> Result<PreflightScheduleShape, SelectedRecursiveClassRegistryError> {
+    let op_count = input.len_u16("combined duplex schedule", MAX_COMBINED_DUPLEX_SCHEDULE_OPS)?;
+    if op_count == 0 {
+        return Err(SelectedRecursiveClassRegistryError::InvalidValue(
+            "empty combined duplex schedule",
+        ));
+    }
+
+    let mut slots = 0usize;
+    let mut data_lanes = 0usize;
+    let mut schedule_lanes = 0usize;
+    let mut challenges = 0usize;
+    let mut filled = 0usize;
+    let mut squeezing = false;
+    let mut pending = false;
+
+    for _ in 0..op_count {
+        match input.u8()? {
+            0 => {
+                let lane_count = input.len_u16(
+                    "combined duplex absorb lanes",
+                    MAX_COMBINED_DUPLEX_DATA_LANES,
+                )?;
+                if lane_count == 0 {
+                    return Err(SelectedRecursiveClassRegistryError::InvalidValue(
+                        "empty combined duplex absorb",
+                    ));
+                }
+                schedule_lanes = schedule_lanes
+                    .checked_add(lane_count)
+                    .ok_or(SelectedRecursiveClassRegistryError::LengthOverflow)?;
+                if schedule_lanes > MAX_COMBINED_DUPLEX_DATA_LANES {
+                    return Err(SelectedRecursiveClassRegistryError::InvalidLength {
+                        field: "combined duplex cumulative schedule lanes",
+                        actual: schedule_lanes as u64,
+                        max: MAX_COMBINED_DUPLEX_DATA_LANES,
+                    });
+                }
+                for _ in 0..lane_count {
+                    match input.u8()? {
+                        0 => {
+                            data_lanes = data_lanes
+                                .checked_add(1)
+                                .ok_or(SelectedRecursiveClassRegistryError::LengthOverflow)?;
+                        }
+                        1 => {
+                            input.take(16)?;
+                        }
+                        _ => {
+                            return Err(SelectedRecursiveClassRegistryError::InvalidValue(
+                                "transcript lane tag",
+                            ));
+                        }
+                    }
+                }
+                if data_lanes > MAX_COMBINED_DUPLEX_DATA_LANES {
+                    return Err(SelectedRecursiveClassRegistryError::InvalidLength {
+                        field: "combined duplex cumulative data lanes",
+                        actual: data_lanes as u64,
+                        max: MAX_COMBINED_DUPLEX_DATA_LANES,
+                    });
+                }
+                if squeezing {
+                    squeezing = false;
+                    pending = false;
+                }
+                let buffered = filled
+                    .checked_add(lane_count)
+                    .ok_or(SelectedRecursiveClassRegistryError::LengthOverflow)?;
+                slots = slots
+                    .checked_add(buffered / 2)
+                    .ok_or(SelectedRecursiveClassRegistryError::LengthOverflow)?;
+                filled = buffered % 2;
+            }
+            1 => {
+                let count = input.usize_u16()?;
+                if count == 0 || count > MAX_COMBINED_DUPLEX_CHALLENGES {
+                    return Err(SelectedRecursiveClassRegistryError::InvalidLength {
+                        field: "combined duplex squeeze count",
+                        actual: count as u64,
+                        max: MAX_COMBINED_DUPLEX_CHALLENGES,
+                    });
+                }
+                if !squeezing {
+                    if filled == 1 {
+                        slots = slots
+                            .checked_add(1)
+                            .ok_or(SelectedRecursiveClassRegistryError::LengthOverflow)?;
+                        filled = 0;
+                    }
+                    squeezing = true;
+                    pending = false;
+                }
+                if slots == 0 {
+                    return Err(SelectedRecursiveClassRegistryError::InvalidValue(
+                        "combined duplex squeeze before absorb",
+                    ));
+                }
+                challenges = challenges
+                    .checked_add(count)
+                    .ok_or(SelectedRecursiveClassRegistryError::LengthOverflow)?;
+                if challenges > MAX_COMBINED_DUPLEX_CHALLENGES {
+                    return Err(SelectedRecursiveClassRegistryError::InvalidLength {
+                        field: "combined duplex cumulative challenges",
+                        actual: challenges as u64,
+                        max: MAX_COMBINED_DUPLEX_CHALLENGES,
+                    });
+                }
+                let consumed_pending = usize::from(pending);
+                let remaining = count
+                    .checked_sub(consumed_pending)
+                    .ok_or(SelectedRecursiveClassRegistryError::LengthOverflow)?;
+                let eager_slots = remaining
+                    .checked_add(1)
+                    .ok_or(SelectedRecursiveClassRegistryError::LengthOverflow)?
+                    / 2;
+                slots = slots
+                    .checked_add(eager_slots)
+                    .ok_or(SelectedRecursiveClassRegistryError::LengthOverflow)?;
+                pending = remaining % 2 == 1;
+            }
+            _ => {
+                return Err(SelectedRecursiveClassRegistryError::InvalidValue(
+                    "transcript operation tag",
+                ));
+            }
+        }
+        if slots > MAX_COMBINED_DUPLEX_SUBCHANNEL_SLOTS {
+            return Err(SelectedRecursiveClassRegistryError::InvalidLength {
+                field: "combined duplex cumulative slots",
+                actual: slots as u64,
+                max: MAX_COMBINED_DUPLEX_SUBCHANNEL_SLOTS,
+            });
+        }
+    }
+    if filled == 1 {
+        slots = slots
+            .checked_add(1)
+            .ok_or(SelectedRecursiveClassRegistryError::LengthOverflow)?;
+    }
+    if slots == 0 || slots > MAX_COMBINED_DUPLEX_SUBCHANNEL_SLOTS || data_lanes == 0 {
+        return Err(SelectedRecursiveClassRegistryError::InvalidValue(
+            "combined duplex schedule geometry",
+        ));
+    }
+    Ok(PreflightScheduleShape { slots })
 }
 
 fn preflight_shape(input: &mut Reader<'_>) -> Result<(), SelectedRecursiveClassRegistryError> {
@@ -996,8 +1192,10 @@ fn decode_link_vk(
             let tag = input.u8()?;
             match tag {
                 0 => {
-                    let lane_count = input
-                        .len_u16("combined duplex absorb lanes", MAX_TRANSCRIPT_ABSORB_LANES)?;
+                    let lane_count = input.len_u16(
+                        "combined duplex absorb lanes",
+                        MAX_COMBINED_DUPLEX_DATA_LANES,
+                    )?;
                     let mut lanes = Vec::with_capacity(lane_count);
                     for _ in 0..lane_count {
                         lanes.push(match input.u8()? {
@@ -1587,13 +1785,22 @@ mod tests {
             link_vk: LinkVkWire {
                 leaf_purpose: [80; 32],
                 leaf_tx_tile_log: 1,
-                leaf_subchannels: vec![SubchannelWire {
-                    schedule: vec![
-                        TranscriptOp::Absorb(vec![None, Some(7)]),
-                        TranscriptOp::Squeeze(2),
-                    ],
-                    iv: [F128::new(1, 2), F128::new(3, 4)],
-                }],
+                leaf_subchannels: vec![
+                    SubchannelWire {
+                        schedule: vec![
+                            TranscriptOp::Absorb(vec![None, Some(7)]),
+                            TranscriptOp::Squeeze(2),
+                        ],
+                        iv: [F128::new(1, 2), F128::new(3, 4)],
+                    },
+                    SubchannelWire {
+                        schedule: vec![
+                            TranscriptOp::Absorb(vec![Some(9), None]),
+                            TranscriptOp::Squeeze(1),
+                        ],
+                        iv: [F128::new(5, 6), F128::new(7, 8)],
+                    },
+                ],
                 leaf_slices: fixture_slices(8, 70),
                 leaf_digest: [81; 32],
                 path_purpose: [82; 32],
@@ -1617,7 +1824,15 @@ mod tests {
     fn outer_artifact_roundtrip_and_tamper_fail_closed() {
         let body = b"compact-registry-fixture".to_vec();
         let encoded = finish_artifact(body.clone()).unwrap();
-        assert_eq!(preflight_artifact(&encoded).unwrap(), body);
+        let (decoded_body, digest) = preflight_artifact(&encoded).unwrap();
+        assert_eq!(decoded_body, body);
+        assert_eq!(digest, registry_digest(&body));
+        let mut wrong_pin = digest;
+        wrong_pin[0] ^= 1;
+        assert!(matches!(
+            decode_selected_recursive_class_registry_pinned(&encoded, wrong_pin),
+            Err(SelectedRecursiveClassRegistryError::PinnedDigestMismatch { .. })
+        ));
 
         let mut tampered = encoded.clone();
         tampered[REGISTRY_HEADER_BYTES] ^= 1;
@@ -1682,6 +1897,63 @@ mod tests {
             preflight_registry_body(&body),
             Err(SelectedRecursiveClassRegistryError::LengthOverflow)
                 | Err(SelectedRecursiveClassRegistryError::InvalidLength { .. })
+        ));
+    }
+
+    fn preflight_encoded_link_vk(
+        wire: &LinkVkWire,
+    ) -> Result<(), SelectedRecursiveClassRegistryError> {
+        let mut writer = Writer::new();
+        encode_link_vk(&mut writer, wire);
+        let bytes = writer.finish();
+        let mut reader = Reader::new(&bytes);
+        preflight_link_vk(&mut reader)?;
+        reader.finish()
+    }
+
+    #[test]
+    fn cumulative_absorb_lane_bomb_is_rejected_before_decode_allocation() {
+        let mut wire = fixture_wire().link_vk;
+        wire.leaf_subchannels[0].schedule = vec![
+            TranscriptOp::Absorb(vec![None; MAX_COMBINED_DUPLEX_DATA_LANES / 2]),
+            TranscriptOp::Absorb(vec![None; MAX_COMBINED_DUPLEX_DATA_LANES / 2 + 1]),
+        ];
+        assert!(matches!(
+            preflight_encoded_link_vk(&wire),
+            Err(SelectedRecursiveClassRegistryError::InvalidLength {
+                field: "combined duplex cumulative schedule lanes",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn cumulative_challenge_and_slot_bombs_are_rejected_in_preflight() {
+        let mut challenge_wire = fixture_wire().link_vk;
+        challenge_wire.leaf_subchannels[0].schedule = vec![
+            TranscriptOp::Absorb(vec![None, None]),
+            TranscriptOp::Squeeze(MAX_COMBINED_DUPLEX_CHALLENGES),
+            TranscriptOp::Squeeze(1),
+        ];
+        assert!(matches!(
+            preflight_encoded_link_vk(&challenge_wire),
+            Err(SelectedRecursiveClassRegistryError::InvalidLength {
+                field: "combined duplex cumulative challenges",
+                ..
+            })
+        ));
+
+        let mut slot_wire = fixture_wire().link_vk;
+        slot_wire.leaf_subchannels[0].schedule = vec![
+            TranscriptOp::Absorb(vec![None; MAX_COMBINED_DUPLEX_DATA_LANES]),
+            TranscriptOp::Squeeze(2),
+        ];
+        assert!(matches!(
+            preflight_encoded_link_vk(&slot_wire),
+            Err(SelectedRecursiveClassRegistryError::InvalidLength {
+                field: "combined duplex cumulative slots",
+                ..
+            })
         ));
     }
 

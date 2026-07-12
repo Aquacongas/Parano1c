@@ -1220,7 +1220,7 @@ pub struct SplitLinkClass {
     post_commit_class_digest: std::sync::OnceLock<[u8; 32]>,
     genesis_post_commit_class_digest: std::sync::OnceLock<[u8; 32]>,
     genesis_envelope: std::sync::OnceLock<Arc<LinkProofEnvelope>>,
-    b_sidecar_vk: crate::region_sidecar::BlockRegionSidecarVk,
+    b_sidecar_vk: Arc<crate::region_sidecar::BlockRegionSidecarVk>,
     b_post_commit_class_digest: [u8; 32],
 }
 
@@ -1328,7 +1328,7 @@ impl SplitLinkClass {
             post_commit_class_digest: post_commit_lock,
             genesis_post_commit_class_digest: genesis_post_commit_lock,
             genesis_envelope: genesis_envelope_lock,
-            b_sidecar_vk: block_class.sidecar_vk().clone(),
+            b_sidecar_vk: block_class.sidecar_vk_arc(),
             b_post_commit_class_digest,
         };
         class.validate_frozen_identity()?;
@@ -1463,7 +1463,7 @@ impl SplitLinkClass {
             post_commit_class_digest: std::sync::OnceLock::new(),
             genesis_post_commit_class_digest: std::sync::OnceLock::new(),
             genesis_envelope: std::sync::OnceLock::new(),
-            b_sidecar_vk: block_class.sidecar_vk().clone(),
+            b_sidecar_vk: block_class.sidecar_vk_arc(),
             b_post_commit_class_digest: *block_class.post_commit_class_digest(),
         };
 
@@ -3010,8 +3010,8 @@ impl PendingSplitTipDecision {
             slot,
             family,
             shape,
-            evaluated.structural_digest,
-            evaluated.accumulated_value,
+            evaluated.structural_digest(),
+            evaluated.accumulated_value(),
         )
     }
 
@@ -3247,10 +3247,10 @@ impl DeferredSplitTipDecision {
         let evaluated = tip_class_r1cs
             .evaluate_matrix_claims(Some(&self.fresh), tip_claim)
             .map_err(|_| LinkProofError::MatrixMismatch)?;
-        if evaluated.structural_digest != self.expected_digest {
+        if evaluated.structural_digest() != self.expected_digest {
             return Err(LinkProofError::MatrixMismatch);
         }
-        if evaluated.fresh_value != Some(self.fresh.value) {
+        if evaluated.fresh_value() != Some(self.fresh.value) {
             return Err(LinkProofError::MatrixClaimMismatch);
         }
         let mut pending = self.pending;
@@ -3260,8 +3260,8 @@ impl DeferredSplitTipDecision {
                 self.tip_slot,
                 "link",
                 self.expected_shape,
-                evaluated.structural_digest,
-                evaluated.accumulated_value,
+                evaluated.structural_digest(),
+                evaluated.accumulated_value(),
             )
             .map_err(|_| LinkProofError::AccumulatorClaimMismatch)?;
         }
@@ -4032,8 +4032,9 @@ mod tests {
     }
 
     #[test]
-    fn split_link_registry_schema_cannot_retain_a_genesis_matrix() {
+    fn split_link_registry_schema_shares_heavy_keys_and_cannot_retain_a_genesis_matrix() {
         let source = include_str!("split_link.rs");
+        let block_source = include_str!("block_class.rs");
         let shared_fields = source
             .split("struct SharedSplitLinkGenesis {")
             .nth(1)
@@ -4052,6 +4053,14 @@ mod tests {
         assert!(!shared_fields.contains("genesis: Arc"));
         assert!(!fields.contains("FieldR1cs"));
         assert!(!fields.contains("genesis: Arc"));
+        assert!(fields.contains("b_sidecar_vk: Arc<crate::region_sidecar::BlockRegionSidecarVk>"));
+        assert!(
+            source
+                .matches("b_sidecar_vk: block_class.sidecar_vk_arc()")
+                .count()
+                >= 2
+        );
+        assert!(block_source.contains("Arc::clone(&self.sidecar_vk)"));
         assert!(source.contains("pub fn rebuild_genesis_matrix"));
     }
 
@@ -4207,7 +4216,7 @@ mod tests {
         assert!(!declaration.contains("pub fn finish("));
         assert!(!declaration.contains("pub fresh:"));
         assert!(source.contains("evaluate_matrix_claims(Some(&self.fresh), tip_claim)"));
-        assert!(source.contains("evaluated.fresh_value != Some(self.fresh.value)"));
+        assert!(source.contains("evaluated.fresh_value() != Some(self.fresh.value)"));
     }
 
     #[test]

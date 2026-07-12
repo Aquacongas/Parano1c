@@ -16,7 +16,7 @@
 //! only production envelope in this module is [`BlockProofEnvelope`], whose
 //! sidecar field is private and non-optional.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use noid_ivc_core::challenger::Challenger;
 use noid_ivc_core::field::F128;
@@ -89,7 +89,7 @@ pub struct BlockClass {
     pub pcs_params: PcsParams,
     pub spec: PublicIoSpec,
     config_template: BlockSlotsConfig,
-    sidecar_vk: BlockRegionSidecarVk,
+    sidecar_vk: Arc<BlockRegionSidecarVk>,
     post_commit_class_digest: [u8; 32],
     authorization_backend: BlockClassAuthorizationBackend,
 }
@@ -134,7 +134,7 @@ impl BlockClass {
                 },
                 tier,
             ),
-            sidecar_vk,
+            sidecar_vk: Arc::new(sidecar_vk),
             post_commit_class_digest,
             authorization_backend: BlockClassAuthorizationBackend::SelectedZk,
         };
@@ -177,7 +177,7 @@ impl BlockClass {
         let (r1cs, _witness, preparation) =
             build_block_trace_parts(shape, sample, config_template, &spec, &io, tier, None);
         let matrix_digest = r1cs.statement_digest();
-        let sidecar_vk = preparation.vk().clone();
+        let sidecar_vk = Arc::new(preparation.vk().clone());
         let post_commit_class_digest =
             block_post_commit_class_digest(&matrix_digest, &spec, &pcs_params, &sidecar_vk);
         let class_statement_digest = OnceLock::new();
@@ -214,7 +214,7 @@ impl BlockClass {
         );
         let built = build_selected_zk_trace_parts(sample, None);
         let matrix_digest = built.r1cs.statement_digest();
-        let sidecar_vk = built.region_preparation.vk().clone();
+        let sidecar_vk = Arc::new(built.region_preparation.vk().clone());
         assert_eq!(
             sidecar_vk.version(),
             BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION,
@@ -273,7 +273,13 @@ impl BlockClass {
     }
 
     pub fn sidecar_vk(&self) -> &BlockRegionSidecarVk {
-        &self.sidecar_vk
+        self.sidecar_vk.as_ref()
+    }
+
+    /// Share the immutable hosted VK with its Link class without copying the
+    /// descriptor-derived fixed tables.
+    pub(crate) fn sidecar_vk_arc(&self) -> Arc<BlockRegionSidecarVk> {
+        Arc::clone(&self.sidecar_vk)
     }
 
     pub fn tier(&self) -> usize {
@@ -339,7 +345,7 @@ impl BlockClass {
             &matrix_digest,
             &self.spec,
             &self.pcs_params,
-            &self.sidecar_vk,
+            self.sidecar_vk.as_ref(),
         );
         if expected != self.post_commit_class_digest {
             return Err(BlockProofError::ClassIdentityMismatch);
@@ -602,7 +608,7 @@ pub fn build_block_proof_trace(class: &BlockClass, block: &LinkBlock<'_>) -> Bui
         &class.spec,
         &io,
         class.tier,
-        Some(&class.sidecar_vk),
+        Some(class.sidecar_vk()),
     );
     let actual_digest = r1cs.statement_digest();
     assert_eq!(
@@ -635,7 +641,7 @@ pub fn build_selected_zk_block_proof_trace<const TIER: usize>(
     let matrix_digest = class
         .validate_frozen_identity()
         .expect("selected BlockClass must remain freeze-locked");
-    let built = build_selected_zk_trace_parts(input, Some(&class.sidecar_vk));
+    let built = build_selected_zk_trace_parts(input, Some(class.sidecar_vk()));
     let actual_digest = built.r1cs.statement_digest();
     assert_eq!(
         actual_digest, matrix_digest,
@@ -774,7 +780,7 @@ pub fn prove_built_block<Ch: Challenger>(
     {
         return Err(BlockProofError::MatrixMismatch);
     }
-    if built.region_preparation.vk() != &class.sidecar_vk {
+    if built.region_preparation.vk() != class.sidecar_vk() {
         return Err(BlockProofError::SidecarVkMismatch);
     }
     if built.io.len() != BLOCK_IO_LEN {
@@ -829,7 +835,7 @@ pub fn verify_block_proof<Ch: Challenger>(
         &envelope.region_sidecar,
         challenger,
         |sidecar, context| {
-            verify_block_region_sidecar_post_commit(&class.sidecar_vk, sidecar, context)
+            verify_block_region_sidecar_post_commit(class.sidecar_vk(), sidecar, context)
                 .map_err(|_| VerifyError::Auxiliary)
         },
     )

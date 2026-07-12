@@ -19,7 +19,9 @@ use std::sync::{Arc, OnceLock};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
-use noid_ivc_core::field_r1cs::{FieldR1cs, FieldR1csArtifactError, SeekableFieldR1csArtifact};
+use noid_ivc_core::field_r1cs::{
+    FieldR1cs, FieldR1csArtifactError, PreflightSeekableFieldR1csArtifact,
+};
 use noid_ivc_core::matrix_claim::{
     AuthenticatedMatrixClaimEvaluations, FreshLincheckClaim, MatrixAccClaim, MatrixClaimEvaluator,
 };
@@ -227,7 +229,7 @@ impl LocalSelectedRecursiveMatrixSource {
         )
     }
 
-    /// Open one canonical artifact as a bounded-memory seekable evaluator.
+    /// Preflight one artifact as a bounded-memory, one-shot seekable evaluator.
     /// No CSR index, offset, or coefficient array proportional to matrix size
     /// is retained. The returned lease owns the opened inode and process-wide
     /// matrix admission until its file view is dropped.
@@ -380,12 +382,12 @@ impl LocalSelectedRecursiveMatrixSource {
         if !same_file_and_length(&before, &opened) {
             return Err(LocalSelectedRecursiveMatrixError::ArtifactChanged { path });
         }
-        let view = SeekableFieldR1csArtifact::open(file, shape, statement_digest, cap)
+        let view = PreflightSeekableFieldR1csArtifact::open(file, shape, statement_digest, cap)
             .map_err(LocalSelectedRecursiveMatrixError::Codec)?;
         let after = view
             .reader()
             .metadata()
-            .map_err(|source| io_error("inspect validated", &path, source))?;
+            .map_err(|source| io_error("inspect preflighted", &path, source))?;
         if !same_file_and_length(&opened, &after) {
             return Err(LocalSelectedRecursiveMatrixError::ArtifactChanged { path });
         }
@@ -429,11 +431,12 @@ impl SelectedRecursiveMatrixSource for LocalSelectedRecursiveMatrixSource {
     }
 }
 
-/// RAII lease over an authenticated seekable artifact.  The opened file is
+/// RAII lease over a preflighted one-shot seekable evaluator. Authentication
+/// and claim evaluation happen together on first use; the opened file is
 /// destroyed before process-global residency is released, matching the
 /// decoded-matrix lease's ordering while retaining only bounded scratch.
 pub struct LoadedSelectedRecursiveMatrixView {
-    view: Option<SeekableFieldR1csArtifact<File>>,
+    view: Option<PreflightSeekableFieldR1csArtifact<File>>,
     opened: Metadata,
     release_callback: Option<Box<dyn FnOnce() + Send + 'static>>,
 }
@@ -528,7 +531,13 @@ fn reject_oversize(actual: u64, max: u64) -> Result<(), LocalSelectedRecursiveMa
 
 #[cfg(unix)]
 fn same_file_and_length(left: &Metadata, right: &Metadata) -> bool {
-    left.dev() == right.dev() && left.ino() == right.ino() && left.len() == right.len()
+    left.dev() == right.dev()
+        && left.ino() == right.ino()
+        && left.len() == right.len()
+        && left.mtime() == right.mtime()
+        && left.mtime_nsec() == right.mtime_nsec()
+        && left.ctime() == right.ctime()
+        && left.ctime_nsec() == right.ctime_nsec()
 }
 
 #[cfg(not(unix))]
@@ -797,7 +806,7 @@ mod tests {
 
     #[test]
     fn seekable_view_matches_in_memory_claim_and_holds_admission() {
-        use noid_ivc_core::matrix_claim::{stacked_matrix_mle_eval, MatrixAccClaim};
+        use noid_ivc_core::matrix_claim::{MatrixAccClaim, stacked_matrix_mle_eval};
 
         let directory = tempdir().unwrap();
         let source = isolated_source(directory.path());
@@ -817,10 +826,14 @@ mod tests {
         ));
         let evaluated = view.evaluate_matrix_claims(None, Some(&claim)).unwrap();
         assert_eq!(
-            evaluated.structural_digest,
+            evaluated.structural_digest(),
             matrix_identity.statement_digest()
         );
-        assert_eq!(evaluated.accumulated_value, Some(claim.value));
+        assert_eq!(evaluated.accumulated_value(), Some(claim.value));
+        assert!(matches!(
+            view.evaluate_matrix_claims(None, Some(&claim)),
+            Err(FieldR1csArtifactError::MatrixEvaluatorAlreadyConsumed)
+        ));
         drop(view);
         drop(source.load_artifact(matrix_identity).unwrap());
     }
@@ -835,7 +848,7 @@ mod tests {
             .split("fn effective_max_bytes")
             .next()
             .expect("view loader boundary");
-        assert!(view_loader.contains("SeekableFieldR1csArtifact::open"));
+        assert!(view_loader.contains("PreflightSeekableFieldR1csArtifact::open"));
         assert!(!view_loader.contains("FieldR1cs::read_artifact"));
 
         let verifier = include_str!("selected_history_verifier.rs");
@@ -848,6 +861,22 @@ mod tests {
             .expect("source implementation boundary");
         assert!(source_impl.contains("self.open_artifact_view("));
         assert!(!source_impl.contains("load_artifact("));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opened_file_identity_includes_content_change_timestamps() {
+        let source = include_str!("recursive_matrix_store.rs");
+        let identity = source
+            .split("fn same_file_and_length(left: &Metadata, right: &Metadata) -> bool {")
+            .nth(1)
+            .expect("Unix opened-file identity")
+            .split("#[cfg(not(unix))]")
+            .next()
+            .expect("Unix identity boundary");
+        for field in ["mtime()", "mtime_nsec()", "ctime()", "ctime_nsec()"] {
+            assert!(identity.contains(field), "missing metadata field {field}");
+        }
     }
 
     #[test]
