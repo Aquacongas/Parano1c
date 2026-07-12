@@ -31,7 +31,8 @@ pub use mdbx_context::{
 pub use mdbx_store::{
     AcceptedBlockCommitData, ClaimedRecursiveProofJobInputs, MdbxStore, RecursiveProofJob,
     RecursiveProofJobResult, RecursiveProofJobState, RecursiveProofJobTier,
-    SelectedHistoryCoverage, StoreError, VerifiedOwnerSnapshot, VerifiedOwnerUtxo,
+    SelectedHistoryCoverage, SelectedHistorySnapshotSeed, StoreError, VerifiedOwnerSnapshot,
+    VerifiedOwnerUtxo,
     MAX_RECURSIVE_PROOF_JOB_RESULT_BYTES,
 };
 pub use memory::RamBackend;

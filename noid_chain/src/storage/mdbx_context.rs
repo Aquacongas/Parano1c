@@ -1557,6 +1557,30 @@ impl MdbxChainContext {
         staging: &FinalizedSnapshotStaging,
         recent_headers_bytes: &[Vec<u8>],
     ) -> Result<(), MdbxContextError> {
+        self.apply_staged_state_snapshot_inner(staging, recent_headers_bytes, None)
+    }
+
+    /// Install a peer snapshot and its already-decided selected-history
+    /// terminal boundary in one durable state epoch.
+    pub fn apply_staged_state_snapshot_with_selected_history(
+        &mut self,
+        staging: &FinalizedSnapshotStaging,
+        recent_headers_bytes: &[Vec<u8>],
+        selected_history: crate::storage::SelectedHistorySnapshotSeed<'_>,
+    ) -> Result<(), MdbxContextError> {
+        self.apply_staged_state_snapshot_inner(
+            staging,
+            recent_headers_bytes,
+            Some(selected_history),
+        )
+    }
+
+    fn apply_staged_state_snapshot_inner(
+        &mut self,
+        staging: &FinalizedSnapshotStaging,
+        recent_headers_bytes: &[Vec<u8>],
+        selected_history: Option<crate::storage::SelectedHistorySnapshotSeed<'_>>,
+    ) -> Result<(), MdbxContextError> {
         if self.reorg_staging.is_some() {
             return Err(MdbxContextError::Corrupt(
                 "snapshot install cannot run during reorg staging",
@@ -1657,11 +1681,21 @@ impl MdbxChainContext {
         // transaction has committed. Every operation below is an infallible
         // in-memory swap, so no post-commit error can leave hot and durable
         // state at different boundaries.
-        let snapshot_state = self.store.install_finalized_snapshot_staging(
-            staging,
-            &consensus_meta,
-            &decoded_recent,
-        )?;
+        let snapshot_state = match selected_history {
+            Some(seed) => self
+                .store
+                .install_finalized_snapshot_staging_with_selected_history(
+                    staging,
+                    &consensus_meta,
+                    &decoded_recent,
+                    seed,
+                )?,
+            None => self.store.install_finalized_snapshot_staging(
+                staging,
+                &consensus_meta,
+                &decoded_recent,
+            )?,
+        };
         debug_assert_eq!(snapshot_state.state.materialized_segment_ids().count(), 0);
 
         self.state = snapshot_state;

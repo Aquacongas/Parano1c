@@ -380,6 +380,21 @@ pub struct SelectedHistoryCoverage {
     pub block_hash: [u8; 32],
 }
 
+/// A selected terminal package already verified by the recursive decider and
+/// bound to the snapshot header chosen by local header consensus.
+///
+/// The chain store remains recursion-independent: it rechecks canonical
+/// height/hash, fixed wire framing, byte bounds and tier metadata, then seeds
+/// the Complete job/result/coverage records in the same transaction that
+/// installs snapshot state.
+#[derive(Debug, Clone, Copy)]
+pub struct SelectedHistorySnapshotSeed<'a> {
+    pub height: u64,
+    pub block_hash: [u8; 32],
+    pub tier: RecursiveProofJobTier,
+    pub terminal_package_bytes: &'a [u8],
+}
+
 /// One atomically loaded, ownership-transferring input bundle for the selected
 /// recursive proof worker.
 ///
@@ -2083,6 +2098,97 @@ impl MdbxStore {
         Ok(txn.get(&tbl, &u64_key(height))?)
     }
 
+    /// Load one retained block/proof/authorization bundle from a single MDBX
+    /// snapshot after checking every stored length with `ObjectLength`.
+    ///
+    /// This is the P2P serving boundary: corrupt or substituted database values
+    /// cannot make the node allocate beyond consensus wire caps before their
+    /// lengths are rejected. The three payloads are mutually snapshot-stable.
+    #[allow(clippy::type_complexity)]
+    pub fn get_recent_block_bundle_bounded(
+        &self,
+        height: u64,
+    ) -> Result<Option<(Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>)>, StoreError> {
+        use crate::consensus::wire_limits::{
+            proof_sidecar_combined_len_ok, MAX_BLOCK_AUTH_SIDECAR_BYTES, MAX_BLOCK_BYTES,
+            MAX_BLOCK_PROOF_BYTES,
+        };
+
+        let txn = self.db.begin_ro_txn()?;
+        let key = u64_key(height);
+        let blocks = txn.open_table(Some(T_RECENT_BLOCKS))?;
+        let proofs = txn.open_table(Some(T_BLOCK_PROOFS))?;
+        let sidecars = txn.open_table(Some(T_BLOCK_AUTH_SIDECARS))?;
+        let block_len: Option<ObjectLength> = txn.get(&blocks, &key)?;
+        let proof_len: Option<ObjectLength> = txn.get(&proofs, &key)?;
+        let sidecar_len: Option<ObjectLength> = txn.get(&sidecars, &key)?;
+
+        let Some(ObjectLength(block_len)) = block_len else {
+            if proof_len.is_some() || sidecar_len.is_some() {
+                return Err(StoreError::Decode(
+                    "retained proof material exists without its block",
+                ));
+            }
+            return Ok(None);
+        };
+        if block_len == 0 || block_len > MAX_BLOCK_BYTES {
+            return Err(StoreError::Decode(
+                "retained block stored length exceeds hard bounds",
+            ));
+        }
+        if proof_len.is_some() != sidecar_len.is_some() {
+            return Err(StoreError::Decode(
+                "retained block proof and authorization sidecar presence mismatch",
+            ));
+        }
+        let proof_bytes_len = proof_len.map_or(0, |ObjectLength(length)| length);
+        let sidecar_bytes_len = sidecar_len.map_or(0, |ObjectLength(length)| length);
+        if proof_bytes_len > MAX_BLOCK_PROOF_BYTES
+            || sidecar_bytes_len > MAX_BLOCK_AUTH_SIDECAR_BYTES
+            || !proof_sidecar_combined_len_ok(proof_bytes_len, sidecar_bytes_len)
+        {
+            return Err(StoreError::Decode(
+                "retained block proof material exceeds hard bounds",
+            ));
+        }
+
+        let block: Vec<u8> = txn
+            .get(&blocks, &key)?
+            .ok_or(StoreError::Decode("retained block disappeared during read"))?;
+        if block.len() != block_len {
+            return Err(StoreError::Decode(
+                "retained block length changed during read",
+            ));
+        }
+        let proof = if let Some(ObjectLength(expected)) = proof_len {
+            let bytes: Vec<u8> = txn.get(&proofs, &key)?.ok_or(StoreError::Decode(
+                "retained block proof disappeared during read",
+            ))?;
+            if bytes.len() != expected {
+                return Err(StoreError::Decode(
+                    "retained block proof length changed during read",
+                ));
+            }
+            Some(bytes)
+        } else {
+            None
+        };
+        let sidecar = if let Some(ObjectLength(expected)) = sidecar_len {
+            let bytes: Vec<u8> = txn.get(&sidecars, &key)?.ok_or(StoreError::Decode(
+                "retained block authorization sidecar disappeared during read",
+            ))?;
+            if bytes.len() != expected {
+                return Err(StoreError::Decode(
+                    "retained block authorization sidecar length changed during read",
+                ));
+            }
+            Some(bytes)
+        } else {
+            None
+        };
+        Ok(Some((block, proof, sidecar)))
+    }
+
     /// Store a serialised `BlockProof` for `height`.
     /// Retained until a real immutable checkpoint proof covers `height`.
     pub fn put_block_proof(&self, height: u64, bytes: &[u8]) -> Result<(), StoreError> {
@@ -2606,6 +2712,40 @@ impl MdbxStore {
         consensus_meta: &ConsensusMeta,
         canonical_recent_headers: &[BlockHeader],
     ) -> Result<ChainState, StoreError> {
+        self.install_finalized_snapshot_staging_inner(
+            staging,
+            consensus_meta,
+            canonical_recent_headers,
+            None,
+        )
+    }
+
+    /// Production snapshot installer that atomically seeds the recursive
+    /// boundary used by the next selected-history job. A crash can expose
+    /// neither snapshot state without its verified terminal package nor the
+    /// package without the matching state epoch.
+    pub(crate) fn install_finalized_snapshot_staging_with_selected_history(
+        &self,
+        staging: &FinalizedSnapshotStaging,
+        consensus_meta: &ConsensusMeta,
+        canonical_recent_headers: &[BlockHeader],
+        selected_history: SelectedHistorySnapshotSeed<'_>,
+    ) -> Result<ChainState, StoreError> {
+        self.install_finalized_snapshot_staging_inner(
+            staging,
+            consensus_meta,
+            canonical_recent_headers,
+            Some(selected_history),
+        )
+    }
+
+    fn install_finalized_snapshot_staging_inner(
+        &self,
+        staging: &FinalizedSnapshotStaging,
+        consensus_meta: &ConsensusMeta,
+        canonical_recent_headers: &[BlockHeader],
+        selected_history: Option<SelectedHistorySnapshotSeed<'_>>,
+    ) -> Result<ChainState, StoreError> {
         let metadata = staging.metadata();
         let tip_header = *metadata.header();
         let tip_hash = metadata.tip_hash();
@@ -2641,6 +2781,30 @@ impl MdbxStore {
                 "staged snapshot effective segment log mismatch",
             ));
         }
+        let selected_history = selected_history
+            .map(|seed| {
+                if seed.height == 0
+                    || seed.height != tip_header.height
+                    || seed.block_hash != tip_hash
+                    || seed.terminal_package_bytes.len()
+                        > crate::consensus::wire_limits::MAX_HISTORY_PROOF_BYTES
+                    || !selected_history_terminal_prefix_matches(
+                        seed.terminal_package_bytes,
+                        seed.height,
+                        seed.block_hash,
+                    )
+                {
+                    return Err(StoreError::Decode(
+                        "selected history snapshot seed does not match snapshot boundary",
+                    ));
+                }
+                let encoded = encode_recursive_proof_result(
+                    seed.block_hash,
+                    seed.terminal_package_bytes,
+                )?;
+                Ok((seed, encoded))
+            })
+            .transpose()?;
 
         let mut segmented =
             crate::segmented_state::SegmentedFriState::new_empty(tip_header.log_slots as usize);
@@ -2746,6 +2910,36 @@ impl MdbxStore {
         ] {
             let table = txn.open_table(Some(name))?;
             txn.clear_table(&table)?;
+        }
+
+        if let Some((seed, encoded_result)) = selected_history {
+            let job = RecursiveProofJob {
+                height: seed.height,
+                block_hash: seed.block_hash,
+                tier: seed.tier,
+                state: RecursiveProofJobState::Complete,
+                attempt_counter: 0,
+            };
+            let key = recursive_proof_height_key(seed.height);
+            let jobs = txn.open_table(Some(T_RECURSIVE_PROOF_JOBS))?;
+            txn.put(
+                &jobs,
+                key,
+                encode_recursive_proof_job(&job),
+                WriteFlags::empty(),
+            )?;
+            let results = txn.open_table(Some(T_RECURSIVE_PROOF_RESULTS))?;
+            txn.put(&results, key, encoded_result, WriteFlags::empty())?;
+            let coverage = txn.open_table(Some(T_CHECKPOINT_COVERAGE))?;
+            txn.put(
+                &coverage,
+                KEY_SELECTED_HISTORY_COVERAGE,
+                encode_selected_history_coverage(SelectedHistoryCoverage {
+                    height: seed.height,
+                    block_hash: seed.block_hash,
+                }),
+                WriteFlags::empty(),
+            )?;
         }
 
         let segment_tbl = txn.open_table(Some(T_SEGMENTS))?;
@@ -4649,6 +4843,45 @@ mod tests {
     }
 
     #[test]
+    fn p2p_block_bundle_is_snapshot_stable_and_presence_gated() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        put_recursive_loader_records(
+            &store,
+            3,
+            [3; 32],
+            b"bounded-block",
+            Some(b"bounded-proof"),
+            Some(b"bounded-sidecar"),
+        );
+        let (block, proof, sidecar) = store
+            .get_recent_block_bundle_bounded(3)
+            .unwrap()
+            .unwrap();
+        assert_eq!(block, b"bounded-block");
+        assert_eq!(proof.as_deref(), Some(b"bounded-proof".as_slice()));
+        assert_eq!(sidecar.as_deref(), Some(b"bounded-sidecar".as_slice()));
+
+        let txn = store.db.begin_rw_txn().unwrap();
+        let sidecars = txn.open_table(Some(T_BLOCK_AUTH_SIDECARS)).unwrap();
+        txn.del(&sidecars, &u64_key(3), None).unwrap();
+        txn.commit().unwrap();
+        assert!(store.get_recent_block_bundle_bounded(3).is_err());
+
+        let source = include_str!("mdbx_store.rs");
+        let body = source
+            .split("pub fn get_recent_block_bundle_bounded(")
+            .nth(1)
+            .expect("bounded P2P block loader")
+            .split("/// Store a serialised `BlockProof`")
+            .next()
+            .expect("bounded loader boundary");
+        let length_preflight = body.find("let block_len: Option<ObjectLength>").unwrap();
+        let first_payload = body.find("let block: Vec<u8>").unwrap();
+        assert!(length_preflight < first_payload);
+    }
+
+    #[test]
     fn pruning_waits_for_canonical_selected_recursive_result() {
         let dir = tempfile::tempdir().unwrap();
         let store = MdbxStore::open(dir.path()).unwrap();
@@ -5794,8 +6027,33 @@ mod tests {
             .complete_recursive_proof_job(0, old_hash, b"stale-proof-result")
             .unwrap();
 
+        let terminal = selected_terminal_bytes(1, new_hash);
+        assert!(store
+            .install_finalized_snapshot_staging_with_selected_history(
+                &staging,
+                &meta,
+                &[old_header, new_header],
+                SelectedHistorySnapshotSeed {
+                    height: 1,
+                    block_hash: old_hash,
+                    tier: RecursiveProofJobTier::B8,
+                    terminal_package_bytes: &selected_terminal_bytes(1, old_hash),
+                },
+            )
+            .is_err());
+        assert_eq!(store.get_chain_tip().unwrap(), Some((0, old_hash)));
         let hot_state = store
-            .install_finalized_snapshot_staging(&staging, &meta, &[old_header, new_header])
+            .install_finalized_snapshot_staging_with_selected_history(
+                &staging,
+                &meta,
+                &[old_header, new_header],
+                SelectedHistorySnapshotSeed {
+                    height: 1,
+                    block_hash: new_hash,
+                    tier: RecursiveProofJobTier::B8,
+                    terminal_package_bytes: &terminal,
+                },
+            )
             .unwrap();
         assert_eq!(store.get_chain_tip().unwrap(), Some((1, new_hash)));
         assert_eq!(store.get_state_meta().unwrap(), Some((3, 1, 2)));
@@ -5809,6 +6067,18 @@ mod tests {
         assert_eq!(store.get_history_checkpoint_head_record(0).unwrap(), None);
         assert!(store.get_recursive_proof_job(0).unwrap().is_none());
         assert!(store.get_recursive_proof_job_result(0).unwrap().is_none());
+        assert_eq!(
+            store.get_recursive_proof_job(1).unwrap().unwrap().state,
+            RecursiveProofJobState::Complete
+        );
+        assert_eq!(
+            store
+                .get_selected_history_terminal_result()
+                .unwrap()
+                .unwrap()
+                .bytes,
+            terminal
+        );
         assert_eq!(
             store
                 .get_accepted_block_batch_certificate_package(0)
