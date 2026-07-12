@@ -69,6 +69,13 @@ const T_HISTORY_CLAIMS: &str = "history_claims";
 /// Accepted-block certificate records produced at block acceptance time.
 /// Key: height (u64 LE). Value: raw bincode bytes owned by noid_block/noid_recursive.
 const T_ACCEPTED_BLOCK_CERTIFICATES: &str = "accepted_block_certificates";
+/// Fixed-width canonical bindings for opaque accepted-block certificates.
+/// Key: height (u64 LE). Value: magic, height, canonical block hash and the
+/// exact opaque certificate byte length.  The chain crate cannot deserialize
+/// `noid_block` proof types without introducing a dependency cycle, so this
+/// acceptance-time record is the durable fail-closed authority used by
+/// retained-payload maintenance.
+const T_ACCEPTED_BLOCK_CERTIFICATE_BINDINGS: &str = "accepted_block_certificate_bindings";
 /// Full accepted-block checkpoint batch packages.
 /// Key: end height (u64 LE). Value: raw bincode bytes owned by noid_block/noid_recursive.
 const T_ACCEPTED_BLOCK_BATCH_CERTIFICATE_PACKAGES: &str =
@@ -102,6 +109,7 @@ const KEY_META: &[u8] = &[0u8];
 const KEY_CONSENSUS_META: &[u8] = &[0u8];
 const KEY_CHECKPOINT_COVERAGE: &[u8] = &[0u8];
 const KEY_SELECTED_HISTORY_COVERAGE: &[u8] = &[1u8];
+const KEY_RETAINED_PAYLOAD_PRUNE_WATERMARK: &[u8] = &[2u8];
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -282,6 +290,19 @@ const SELECTED_HISTORY_COVERAGE_ENCODED_BYTES: usize = 44;
 // The opaque recursive envelope follows this fixed metadata.
 const SELECTED_HISTORY_TERMINAL_PREFIX_BYTES: usize = 2 + 8 + 32 + 1 + 2;
 const SELECTED_HISTORY_TERMINAL_VERSION: u16 = 1;
+const ACCEPTED_BLOCK_CERTIFICATE_BINDING_MAGIC: [u8; 4] = *b"ACB1";
+const ACCEPTED_BLOCK_CERTIFICATE_BINDING_BYTES: usize = 4 + 8 + 32 + 8;
+const RETAINED_PAYLOAD_PRUNE_WATERMARK_MAGIC: [u8; 4] = *b"RPW1";
+const RETAINED_PAYLOAD_PRUNE_WATERMARK_BYTES: usize = 4 + 8;
+/// Bound numeric work even when selected coverage jumps millions of heights.
+const RETAINED_PAYLOAD_PRUNE_HEIGHT_LIMIT: usize = 16;
+/// A valid accepted block is bounded to 48 MiB of proof/sidecar bytes plus a
+/// small body and derived acceptance material.  A corrupt oversized record
+/// fails closed instead of turning maintenance into an unbounded page-retire.
+const RETAINED_PAYLOAD_PRUNE_BYTE_LIMIT: usize = 64 * 1024 * 1024;
+/// Bound page deletions independently from the height cap. A fully populated
+/// height consumes six deletes, so at most ten such heights retire per call.
+const RETAINED_PAYLOAD_PRUNE_DELETE_LIMIT: usize = 64;
 /// Bound both page retirement and cursor work in one selected-history journal
 /// maintenance transaction. One result may occupy the full history-proof wire
 /// cap, so this count is deliberately small and maintenance is incremental.
@@ -680,6 +701,109 @@ fn decode_selected_history_coverage(bytes: &[u8]) -> Option<SelectedHistoryCover
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AcceptedBlockCertificateBinding {
+    height: u64,
+    block_hash: [u8; 32],
+    certificate_len: u64,
+}
+
+fn encode_accepted_block_certificate_binding(
+    height: u64,
+    block_hash: [u8; 32],
+    certificate_len: usize,
+) -> Result<[u8; ACCEPTED_BLOCK_CERTIFICATE_BINDING_BYTES], StoreError> {
+    let certificate_len = u64::try_from(certificate_len)
+        .map_err(|_| StoreError::Decode("accepted block certificate length exceeds u64"))?;
+    let mut encoded = [0u8; ACCEPTED_BLOCK_CERTIFICATE_BINDING_BYTES];
+    encoded[..4].copy_from_slice(&ACCEPTED_BLOCK_CERTIFICATE_BINDING_MAGIC);
+    encoded[4..12].copy_from_slice(&height.to_le_bytes());
+    encoded[12..44].copy_from_slice(&block_hash);
+    encoded[44..52].copy_from_slice(&certificate_len.to_le_bytes());
+    Ok(encoded)
+}
+
+fn decode_accepted_block_certificate_binding(
+    encoded: &[u8],
+) -> Option<AcceptedBlockCertificateBinding> {
+    if encoded.len() != ACCEPTED_BLOCK_CERTIFICATE_BINDING_BYTES
+        || encoded[..4] != ACCEPTED_BLOCK_CERTIFICATE_BINDING_MAGIC
+    {
+        return None;
+    }
+    Some(AcceptedBlockCertificateBinding {
+        height: u64::from_le_bytes(encoded[4..12].try_into().ok()?),
+        block_hash: encoded[12..44].try_into().ok()?,
+        certificate_len: u64::from_le_bytes(encoded[44..52].try_into().ok()?),
+    })
+}
+
+fn encode_retained_payload_prune_watermark(
+    height: u64,
+) -> [u8; RETAINED_PAYLOAD_PRUNE_WATERMARK_BYTES] {
+    let mut encoded = [0u8; RETAINED_PAYLOAD_PRUNE_WATERMARK_BYTES];
+    encoded[..4].copy_from_slice(&RETAINED_PAYLOAD_PRUNE_WATERMARK_MAGIC);
+    encoded[4..].copy_from_slice(&height.to_le_bytes());
+    encoded
+}
+
+fn decode_retained_payload_prune_watermark(encoded: &[u8]) -> Option<u64> {
+    if encoded.len() != RETAINED_PAYLOAD_PRUNE_WATERMARK_BYTES
+        || encoded[..4] != RETAINED_PAYLOAD_PRUNE_WATERMARK_MAGIC
+    {
+        return None;
+    }
+    Some(u64::from_le_bytes(encoded[4..12].try_into().ok()?))
+}
+
+fn retained_payload_prune_watermark_in_rw_txn(
+    txn: &Transaction<'_, RW, NoWriteMap>,
+) -> Result<Option<u64>, StoreError> {
+    let table = txn.open_table(Some(T_CHECKPOINT_COVERAGE))?;
+    let raw: Option<[u8; RETAINED_PAYLOAD_PRUNE_WATERMARK_BYTES]> =
+        txn.get(&table, KEY_RETAINED_PAYLOAD_PRUNE_WATERMARK)?;
+    raw.as_ref()
+        .map(|raw| {
+            decode_retained_payload_prune_watermark(raw).ok_or(StoreError::Decode(
+                "invalid retained payload prune watermark",
+            ))
+        })
+        .transpose()
+}
+
+fn set_retained_payload_prune_watermark(
+    txn: &Transaction<'_, RW, NoWriteMap>,
+    height: u64,
+) -> Result<(), StoreError> {
+    let table = txn.open_table(Some(T_CHECKPOINT_COVERAGE))?;
+    txn.put(
+        &table,
+        KEY_RETAINED_PAYLOAD_PRUNE_WATERMARK,
+        encode_retained_payload_prune_watermark(height),
+        WriteFlags::empty(),
+    )?;
+    Ok(())
+}
+
+fn rewind_retained_payload_prune_watermark(
+    txn: &Transaction<'_, RW, NoWriteMap>,
+    ancestor_height: u64,
+) -> Result<(), StoreError> {
+    let Some(current) = retained_payload_prune_watermark_in_rw_txn(txn)? else {
+        return Ok(());
+    };
+    if current <= ancestor_height {
+        return Ok(());
+    }
+    if ancestor_height == 0 {
+        let table = txn.open_table(Some(T_CHECKPOINT_COVERAGE))?;
+        let _ = txn.del(&table, KEY_RETAINED_PAYLOAD_PRUNE_WATERMARK, None);
+    } else {
+        set_retained_payload_prune_watermark(txn, ancestor_height)?;
+    }
+    Ok(())
+}
+
 fn selected_history_terminal_prefix_matches(
     bytes: &[u8],
     height: u64,
@@ -898,6 +1022,227 @@ fn rewind_selected_history_coverage(
     Ok(())
 }
 
+#[inline]
+fn retained_payload_prune_budget_allows(
+    retired_bytes: usize,
+    deletes: usize,
+    height_bytes: usize,
+    height_deletes: usize,
+) -> bool {
+    retired_bytes
+        .checked_add(height_bytes)
+        .is_some_and(|total| total <= RETAINED_PAYLOAD_PRUNE_BYTE_LIMIT)
+        && deletes
+            .checked_add(height_deletes)
+            .is_some_and(|total| total <= RETAINED_PAYLOAD_PRUNE_DELETE_LIMIT)
+}
+
+/// Delete at most one fixed numeric batch of selected-history-covered payloads.
+///
+/// Height tables retain legacy little-endian keys, so cursor order is not
+/// numeric.  The durable watermark makes direct `u64_key(height)` reads both
+/// crash-resumable and independent of table cardinality.  Every candidate
+/// height is preflighted in full before the first delete at that height; the
+/// transaction therefore never exposes a partially-pruned watermark.
+fn prune_retained_payloads_bounded(
+    txn: &Transaction<'_, RW, NoWriteMap>,
+    current_height: u64,
+) -> Result<(), StoreError> {
+    if current_height <= RECENT_BLOCK_RETENTION_DEPTH {
+        return Ok(());
+    }
+
+    let Some(coverage) = validated_selected_history_coverage_in_rw_txn(txn)? else {
+        // Absence of recursive prefix authority is a normal prover/relay state.
+        // In particular, it must not manufacture a prune frontier.
+        return Ok(());
+    };
+
+    let consensus_table = txn.open_table(Some(T_CONSENSUS_META))?;
+    let consensus_raw: Option<Cow<'_, [u8]>> = txn.get(&consensus_table, KEY_CONSENSUS_META)?;
+    let consensus = consensus_raw
+        .as_deref()
+        .and_then(decode_consensus_meta)
+        .ok_or(StoreError::Decode(
+            "consensus metadata is missing during retained payload pruning",
+        ))?;
+    if consensus.tip_height != current_height || consensus.finalized.height > current_height {
+        return Err(StoreError::Decode(
+            "consensus heights disagree during retained payload pruning",
+        ));
+    }
+    let headers = txn.open_table(Some(T_HEADERS))?;
+    let finalized_raw: Option<Cow<'_, [u8]>> =
+        txn.get(&headers, &u64_key(consensus.finalized.height))?;
+    let finalized = finalized_raw
+        .as_deref()
+        .and_then(decode_header)
+        .ok_or(StoreError::Decode(
+            "finalized header is missing during retained payload pruning",
+        ))?;
+    if finalized.height != consensus.finalized.height
+        || crate::block_header::block_id(&finalized) != consensus.finalized.hash
+    {
+        return Err(StoreError::Decode(
+            "finalized checkpoint is not canonical during retained payload pruning",
+        ));
+    }
+
+    let cutoff = (current_height - RECENT_BLOCK_RETENTION_DEPTH)
+        .min(consensus.finalized.height)
+        .min(coverage.height);
+    let watermark = retained_payload_prune_watermark_in_rw_txn(txn)?;
+    if watermark.is_some_and(|height| height > current_height) {
+        return Err(StoreError::Decode(
+            "retained payload prune watermark exceeds canonical tip",
+        ));
+    }
+    let Some(mut height) = watermark.unwrap_or(0).checked_add(1) else {
+        return Ok(());
+    };
+    if height > cutoff {
+        return Ok(());
+    }
+
+    let recent = txn.open_table(Some(T_RECENT_BLOCKS))?;
+    let proofs = txn.open_table(Some(T_BLOCK_PROOFS))?;
+    let sidecars = txn.open_table(Some(T_BLOCK_AUTH_SIDECARS))?;
+    let history = txn.open_table(Some(T_HISTORY_CLAIMS))?;
+    let certificates = txn.open_table(Some(T_ACCEPTED_BLOCK_CERTIFICATES))?;
+    let certificate_bindings = txn.open_table(Some(T_ACCEPTED_BLOCK_CERTIFICATE_BINDINGS))?;
+
+    let mut processed_heights = 0usize;
+    let mut retired_bytes = 0usize;
+    let mut deletes = 0usize;
+    let mut last_processed = None;
+    while height <= cutoff && processed_heights < RETAINED_PAYLOAD_PRUNE_HEIGHT_LIMIT {
+        let key = u64_key(height);
+        let header_raw: Option<Cow<'_, [u8]>> = txn.get(&headers, &key)?;
+        let canonical_hash = header_raw
+            .as_deref()
+            .and_then(decode_header)
+            .filter(|header| header.height == height)
+            .map(|header| crate::block_header::block_id(&header))
+            .ok_or(StoreError::Decode(
+                "canonical header is missing during retained payload pruning",
+            ))?;
+
+        let payload_lengths = [
+            txn.get::<ObjectLength>(&recent, &key)?
+                .map(|ObjectLength(length)| length),
+            txn.get::<ObjectLength>(&proofs, &key)?
+                .map(|ObjectLength(length)| length),
+            txn.get::<ObjectLength>(&sidecars, &key)?
+                .map(|ObjectLength(length)| length),
+            txn.get::<ObjectLength>(&history, &key)?
+                .map(|ObjectLength(length)| length),
+        ];
+        let certificate_len = txn
+            .get::<ObjectLength>(&certificates, &key)?
+            .map(|ObjectLength(length)| length);
+        let binding_len = txn
+            .get::<ObjectLength>(&certificate_bindings, &key)?
+            .map(|ObjectLength(length)| length);
+
+        match (certificate_len, binding_len) {
+            (None, None) if payload_lengths.iter().all(Option::is_none) => {}
+            (None, None) => {
+                return Err(StoreError::Decode(
+                    "retained payload has no accepted block certificate",
+                ));
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(StoreError::Decode(
+                    "accepted block certificate binding is missing during pruning",
+                ));
+            }
+            (Some(certificate_len), Some(binding_len)) => {
+                if certificate_len == 0 || binding_len != ACCEPTED_BLOCK_CERTIFICATE_BINDING_BYTES {
+                    return Err(StoreError::Decode(
+                        "accepted block certificate is malformed during pruning",
+                    ));
+                }
+                let binding_raw: [u8; ACCEPTED_BLOCK_CERTIFICATE_BINDING_BYTES] = txn
+                    .get(&certificate_bindings, &key)?
+                    .ok_or(StoreError::Decode(
+                        "accepted block certificate binding disappeared during pruning",
+                    ))?;
+                let binding = decode_accepted_block_certificate_binding(&binding_raw).ok_or(
+                    StoreError::Decode(
+                        "accepted block certificate binding is malformed during pruning",
+                    ),
+                )?;
+                if binding.height != height
+                    || binding.block_hash != canonical_hash
+                    || usize::try_from(binding.certificate_len).ok() != Some(certificate_len)
+                {
+                    return Err(StoreError::Decode(
+                        "accepted block certificate is not canonical during pruning",
+                    ));
+                }
+            }
+        }
+
+        let height_bytes = payload_lengths
+            .iter()
+            .flatten()
+            .copied()
+            .chain(certificate_len)
+            .chain(binding_len)
+            .try_fold(0usize, |total, length| total.checked_add(length))
+            .ok_or(StoreError::Decode(
+                "retained payload prune byte accounting overflow",
+            ))?;
+        let height_deletes = payload_lengths.iter().flatten().count()
+            + usize::from(certificate_len.is_some())
+            + usize::from(binding_len.is_some());
+        if height_bytes > RETAINED_PAYLOAD_PRUNE_BYTE_LIMIT
+            || height_deletes > RETAINED_PAYLOAD_PRUNE_DELETE_LIMIT
+        {
+            return Err(StoreError::Decode(
+                "one retained payload height exceeds maintenance budget",
+            ));
+        }
+        if !retained_payload_prune_budget_allows(
+            retired_bytes,
+            deletes,
+            height_bytes,
+            height_deletes,
+        ) {
+            break;
+        }
+
+        for (table, present) in [
+            (&recent, payload_lengths[0].is_some()),
+            (&proofs, payload_lengths[1].is_some()),
+            (&sidecars, payload_lengths[2].is_some()),
+            (&history, payload_lengths[3].is_some()),
+        ] {
+            if present {
+                txn.del(table, &key, None)?;
+            }
+        }
+        if certificate_len.is_some() {
+            txn.del(&certificates, &key, None)?;
+            txn.del(&certificate_bindings, &key, None)?;
+        }
+
+        retired_bytes += height_bytes;
+        deletes += height_deletes;
+        processed_heights += 1;
+        last_processed = Some(height);
+        let Some(next) = height.checked_add(1) else {
+            break;
+        };
+        height = next;
+    }
+
+    if let Some(last_processed) = last_processed {
+        set_retained_payload_prune_watermark(txn, last_processed)?;
+    }
+    Ok(())
+}
+
 /// Delete legacy little-endian height keys without collecting the table or
 /// assuming that lexicographic cursor order is numeric.
 fn delete_height_keys_at_or_below(
@@ -1109,6 +1454,7 @@ impl MdbxStore {
             T_BLOCK_AUTH_SIDECARS,
             T_HISTORY_CLAIMS,
             T_ACCEPTED_BLOCK_CERTIFICATES,
+            T_ACCEPTED_BLOCK_CERTIFICATE_BINDINGS,
             T_ACCEPTED_BLOCK_BATCH_CERTIFICATE_PACKAGES,
             T_HISTORY_CHECKPOINT_HEADS,
             T_OWNER_INDEX,
@@ -2350,6 +2696,7 @@ impl MdbxStore {
             }
         }
         rewind_selected_history_coverage(&txn, ancestor_height)?;
+        rewind_retained_payload_prune_watermark(&txn, ancestor_height)?;
         txn.commit()?;
         Ok(())
     }
@@ -2741,9 +3088,27 @@ impl MdbxStore {
         height: u64,
         bytes: &[u8],
     ) -> Result<(), StoreError> {
+        if bytes.is_empty() {
+            return Err(StoreError::Decode("accepted block certificate is empty"));
+        }
         let txn = self.db.begin_rw_txn()?;
+        let headers = txn.open_table(Some(T_HEADERS))?;
+        let header_raw: Option<Vec<u8>> = txn.get(&headers, &u64_key(height))?;
+        let block_hash = header_raw
+            .as_deref()
+            .and_then(canonical_hash_from_encoded_header)
+            .ok_or(StoreError::Decode(
+                "accepted block certificate canonical header is missing",
+            ))?;
         let tbl = txn.open_table(Some(T_ACCEPTED_BLOCK_CERTIFICATES))?;
         txn.put(&tbl, u64_key(height), bytes, WriteFlags::empty())?;
+        let bindings = txn.open_table(Some(T_ACCEPTED_BLOCK_CERTIFICATE_BINDINGS))?;
+        txn.put(
+            &bindings,
+            u64_key(height),
+            encode_accepted_block_certificate_binding(height, block_hash, bytes.len())?,
+            WriteFlags::empty(),
+        )?;
         txn.commit()?;
         Ok(())
     }
@@ -2755,7 +3120,51 @@ impl MdbxStore {
     ) -> Result<Option<Vec<u8>>, StoreError> {
         let txn = self.db.begin_ro_txn()?;
         let tbl = txn.open_table(Some(T_ACCEPTED_BLOCK_CERTIFICATES))?;
-        Ok(txn.get(&tbl, &u64_key(height))?)
+        let certificate_len = txn
+            .get::<ObjectLength>(&tbl, &u64_key(height))?
+            .map(|ObjectLength(length)| length);
+        let bindings = txn.open_table(Some(T_ACCEPTED_BLOCK_CERTIFICATE_BINDINGS))?;
+        let binding_raw: Option<[u8; ACCEPTED_BLOCK_CERTIFICATE_BINDING_BYTES]> =
+            txn.get(&bindings, &u64_key(height))?;
+        let (Some(certificate_len), Some(binding_raw)) = (certificate_len, binding_raw) else {
+            if certificate_len.is_none() && binding_raw.is_none() {
+                return Ok(None);
+            }
+            return Err(StoreError::Decode(
+                "accepted block certificate and binding disagree",
+            ));
+        };
+        if certificate_len == 0 {
+            return Err(StoreError::Decode("accepted block certificate is empty"));
+        }
+        let binding = decode_accepted_block_certificate_binding(&binding_raw).ok_or(
+            StoreError::Decode("accepted block certificate binding is malformed"),
+        )?;
+        let headers = txn.open_table(Some(T_HEADERS))?;
+        let header_raw: Option<Vec<u8>> = txn.get(&headers, &u64_key(height))?;
+        let canonical_hash = header_raw
+            .as_deref()
+            .and_then(canonical_hash_from_encoded_header)
+            .ok_or(StoreError::Decode(
+                "accepted block certificate canonical header is missing",
+            ))?;
+        if binding.height != height
+            || binding.block_hash != canonical_hash
+            || usize::try_from(binding.certificate_len).ok() != Some(certificate_len)
+        {
+            return Err(StoreError::Decode(
+                "accepted block certificate binding is not canonical",
+            ));
+        }
+        let certificate: Vec<u8> = txn.get(&tbl, &u64_key(height))?.ok_or(StoreError::Decode(
+            "accepted block certificate disappeared after preflight",
+        ))?;
+        if certificate.len() != certificate_len {
+            return Err(StoreError::Decode(
+                "accepted block certificate length changed during read",
+            ));
+        }
+        Ok(Some(certificate))
     }
 
     /// Store full accepted-block checkpoint batch package material.
@@ -3389,6 +3798,7 @@ impl MdbxStore {
             T_BLOCK_AUTH_SIDECARS,
             T_HISTORY_CLAIMS,
             T_ACCEPTED_BLOCK_CERTIFICATES,
+            T_ACCEPTED_BLOCK_CERTIFICATE_BINDINGS,
             T_ACCEPTED_BLOCK_BATCH_CERTIFICATE_PACKAGES,
             T_HISTORY_CHECKPOINT_HEADS,
             T_OWNER_INDEX,
@@ -3400,6 +3810,11 @@ impl MdbxStore {
             let table = txn.open_table(Some(name))?;
             txn.clear_table(&table)?;
         }
+
+        // Every older retained payload table was cleared atomically above.
+        // Seed the numeric maintenance frontier at the installed boundary so
+        // a later selected-coverage jump never rescans the absent prefix.
+        set_retained_payload_prune_watermark(&txn, tip_header.height)?;
 
         if let Some((seed, encoded_result)) = selected_history {
             let job = RecursiveProofJob {
@@ -3621,6 +4036,7 @@ impl MdbxStore {
             T_BLOCK_AUTH_SIDECARS,
             T_HISTORY_CLAIMS,
             T_ACCEPTED_BLOCK_CERTIFICATES,
+            T_ACCEPTED_BLOCK_CERTIFICATE_BINDINGS,
             T_ACCEPTED_BLOCK_BATCH_CERTIFICATE_PACKAGES,
             T_HISTORY_CHECKPOINT_HEADS,
             T_OWNER_INDEX,
@@ -3632,6 +4048,8 @@ impl MdbxStore {
             let tbl = txn.open_table(Some(name))?;
             txn.clear_table(&tbl)?;
         }
+
+        set_retained_payload_prune_watermark(&txn, tip_header.height)?;
 
         let seg_tbl = txn.open_table(Some(T_SEGMENTS))?;
         for &(seg_id, eff_log, cols) in segments {
@@ -4003,6 +4421,18 @@ impl MdbxStore {
                 &certificate_tbl,
                 height_key,
                 accepted.accepted_block_certificate_bytes,
+                WriteFlags::empty(),
+            )?;
+            let certificate_binding_tbl =
+                txn.open_table(Some(T_ACCEPTED_BLOCK_CERTIFICATE_BINDINGS))?;
+            txn.put(
+                &certificate_binding_tbl,
+                height_key,
+                encode_accepted_block_certificate_binding(
+                    header.height,
+                    *hash,
+                    accepted.accepted_block_certificate_bytes.len(),
+                )?,
                 WriteFlags::empty(),
             )?;
         }
@@ -4385,6 +4815,7 @@ impl MdbxStore {
             T_BLOCK_AUTH_SIDECARS,
             T_HISTORY_CLAIMS,
             T_ACCEPTED_BLOCK_CERTIFICATES,
+            T_ACCEPTED_BLOCK_CERTIFICATE_BINDINGS,
         ] {
             truncate_height_table_above!(table_name);
         }
@@ -4413,6 +4844,7 @@ impl MdbxStore {
             }
         }
         rewind_selected_history_coverage(&txn, ancestor_height)?;
+        rewind_retained_payload_prune_watermark(&txn, ancestor_height)?;
 
         let tx_idx_tbl = txn.open_table(Some(T_TX_INDEX))?;
         for tx_hash in reverted_tx_hashes {
@@ -4434,6 +4866,8 @@ impl MdbxStore {
         let sidecar_tbl = txn.open_table(Some(T_BLOCK_AUTH_SIDECARS))?;
         let history_tbl = txn.open_table(Some(T_HISTORY_CLAIMS))?;
         let certificate_tbl = txn.open_table(Some(T_ACCEPTED_BLOCK_CERTIFICATES))?;
+        let certificate_binding_tbl =
+            txn.open_table(Some(T_ACCEPTED_BLOCK_CERTIFICATE_BINDINGS))?;
         let recursive_jobs_tbl = txn.open_table(Some(T_RECURSIVE_PROOF_JOBS))?;
         let recursive_results_tbl = txn.open_table(Some(T_RECURSIVE_PROOF_RESULTS))?;
 
@@ -4510,6 +4944,16 @@ impl MdbxStore {
                 &certificate_tbl,
                 height_key,
                 &block.accepted_block_certificate_bytes,
+                WriteFlags::empty(),
+            )?;
+            txn.put(
+                &certificate_binding_tbl,
+                height_key,
+                encode_accepted_block_certificate_binding(
+                    block.header.height,
+                    block.hash,
+                    block.accepted_block_certificate_bytes.len(),
+                )?,
                 WriteFlags::empty(),
             )?;
             if block.header.height != 0 {
@@ -4633,121 +5077,21 @@ impl MdbxStore {
     }
 
     fn prune_after_commit(&self, current_height: u64) -> Result<(), StoreError> {
+        // Retained payload maintenance owns one short transaction whose work
+        // is bounded simultaneously by numeric heights, retired bytes, and
+        // delete count. The watermark and deletions commit atomically.
         let txn = self.db.begin_rw_txn()?;
+        prune_retained_payloads_bounded(&txn, current_height)?;
+        txn.commit()?;
+
         // --- Prune undo_logs older than UNDO_RETENTION_DEPTH ---
         if current_height > UNDO_RETENTION_DEPTH {
+            let txn = self.db.begin_rw_txn()?;
             let undo_tbl = txn.open_table(Some(T_UNDO_LOGS))?;
             let cutoff = current_height - UNDO_RETENTION_DEPTH;
             delete_height_keys_at_or_below(&txn, &undo_tbl, cutoff)?;
+            txn.commit()?;
         }
-
-        // --- Prune retained block payloads after O(1) history coverage ---
-        //
-        // The node stores headers forever. Full block bytes, BlockProof bytes,
-        // Auth sidecars, and accepted-claim witnesses are transient witnesses.
-        // They may be deleted once both conditions are true:
-        //
-        // 1. The height is outside the recent serving/reorg window.
-        // 2. The locally verified selected Link chain has consumed it.
-        //
-        // A height is pruned only after accepted-block certificate material
-        // exists for it and selected-history coverage explicitly reaches it.
-        if current_height > RECENT_BLOCK_RETENTION_DEPTH {
-            let retention_cutoff = current_height - RECENT_BLOCK_RETENTION_DEPTH;
-            let selected_history_coverage = {
-                let cov_tbl = txn.open_table(Some(T_CHECKPOINT_COVERAGE))?;
-                let raw: Option<[u8; SELECTED_HISTORY_COVERAGE_ENCODED_BYTES]> =
-                    txn.get(&cov_tbl, KEY_SELECTED_HISTORY_COVERAGE)?;
-                raw.map(|raw| {
-                    decode_selected_history_coverage(&raw).ok_or(StoreError::Decode(
-                        "invalid selected history coverage pointer during pruning",
-                    ))
-                })
-                .transpose()?
-            };
-            if let Some(coverage) = selected_history_coverage {
-                // A selected terminal recursively covers the entire prefix.
-                // Validate that one durable authority once, directly from its
-                // MDBX page, rather than loading one proof for every old height
-                // and every payload table. Remote coverage jumps intentionally
-                // compact those redundant intermediate job/result records.
-                validate_selected_history_coverage_in_rw_txn(&txn, coverage)?;
-                let cutoff = retention_cutoff.min(coverage.height);
-                let cert_tbl = txn.open_table(Some(T_ACCEPTED_BLOCK_CERTIFICATES))?;
-                for table_name in [
-                    T_RECENT_BLOCKS,
-                    T_BLOCK_PROOFS,
-                    T_BLOCK_AUTH_SIDECARS,
-                    T_HISTORY_CLAIMS,
-                ] {
-                    let tbl = txn.open_table(Some(table_name))?;
-                    let mut resume_after: Option<Vec<u8>> = None;
-                    loop {
-                        // Height tables use legacy little-endian keys, so their
-                        // cursor order is not numeric. Scan keys in bounded
-                        // chunks and test each decoded height instead of
-                        // collecting the entire prunable prefix.
-                        let (candidates, last_scanned, reached_end) = {
-                            const PRUNE_KEY_CHUNK: usize = 64;
-                            const PRUNE_SCAN_CHUNK: usize = 4096;
-                            let mut cur = txn.cursor(&tbl)?;
-                            let mut item: Option<(Vec<u8>, ())> =
-                                if let Some(resume) = resume_after.as_deref() {
-                                    let found: Option<(Vec<u8>, ())> = cur.set_range(resume)?;
-                                    match found {
-                                        Some((key, _)) if key.as_slice() == resume => cur.next()?,
-                                        other => other,
-                                    }
-                                } else {
-                                    cur.first()?
-                                };
-                            let mut candidates = Vec::with_capacity(PRUNE_KEY_CHUNK);
-                            let mut last_scanned = None;
-                            let mut scanned = 0usize;
-                            let reached_end = loop {
-                                let Some((key, _)) = item.take() else {
-                                    break true;
-                                };
-                                let height = u64_from_key(&key).ok_or(StoreError::Decode(
-                                    "invalid retained payload height key during pruning",
-                                ))?;
-                                if height <= cutoff {
-                                    candidates.push(height);
-                                }
-                                last_scanned = Some(key);
-                                scanned += 1;
-                                if candidates.len() == PRUNE_KEY_CHUNK
-                                    || scanned == PRUNE_SCAN_CHUNK
-                                {
-                                    break false;
-                                }
-                                item = cur.next()?;
-                            };
-                            (candidates, last_scanned, reached_end)
-                        };
-
-                        for h in candidates {
-                            let certificate: Option<ObjectLength> =
-                                txn.get(&cert_tbl, &u64_key(h))?;
-                            // A certificate is not selected recursive authority.
-                            // The validated target terminal above is the one
-                            // prefix authority; the certificate only proves
-                            // this payload came from local block acceptance.
-                            if certificate.is_some() {
-                                txn.del(&tbl, u64_key(h), None)?;
-                            }
-                        }
-
-                        if reached_end {
-                            break;
-                        }
-                        resume_after = last_scanned;
-                    }
-                }
-            }
-        }
-
-        txn.commit()?;
         // Journal cleanup is deliberately a separate short transaction. The
         // accepted block/pruning transaction is already durable and must not
         // be reported as failed if retryable maintenance cannot run.
@@ -4778,6 +5122,7 @@ impl MdbxStore {
             T_BLOCK_AUTH_SIDECARS,
             T_HISTORY_CLAIMS,
             T_ACCEPTED_BLOCK_CERTIFICATES,
+            T_ACCEPTED_BLOCK_CERTIFICATE_BINDINGS,
             T_ACCEPTED_BLOCK_BATCH_CERTIFICATE_PACKAGES,
             T_HISTORY_CHECKPOINT_HEADS,
             T_OWNER_INDEX,
@@ -5056,6 +5401,59 @@ mod tests {
             })
             .unwrap();
         chain
+    }
+
+    fn retained_payload_prune_watermark(store: &MdbxStore) -> Option<u64> {
+        let txn = store.db.begin_ro_txn().unwrap();
+        let table = txn.open_table(Some(T_CHECKPOINT_COVERAGE)).unwrap();
+        let raw: Option<[u8; RETAINED_PAYLOAD_PRUNE_WATERMARK_BYTES]> = txn
+            .get(&table, KEY_RETAINED_PAYLOAD_PRUNE_WATERMARK)
+            .unwrap();
+        raw.as_ref().map(|raw| {
+            decode_retained_payload_prune_watermark(raw)
+                .expect("valid retained payload prune watermark")
+        })
+    }
+
+    fn put_retained_payload_fixture(store: &MdbxStore, height: u64) {
+        let txn = store.db.begin_rw_txn().unwrap();
+        for (table_name, bytes) in [
+            (T_RECENT_BLOCKS, b"retained-block".as_slice()),
+            (T_BLOCK_PROOFS, b"retained-proof".as_slice()),
+            (T_BLOCK_AUTH_SIDECARS, b"retained-sidecar".as_slice()),
+            (T_HISTORY_CLAIMS, b"retained-claim".as_slice()),
+        ] {
+            let table = txn.open_table(Some(table_name)).unwrap();
+            txn.put(&table, u64_key(height), bytes, WriteFlags::empty())
+                .unwrap();
+        }
+        txn.commit().unwrap();
+        store
+            .put_accepted_block_certificate(height, b"accepted-certificate")
+            .unwrap();
+    }
+
+    fn install_selected_prune_authority(
+        store: &MdbxStore,
+        coverage_height: u64,
+    ) -> (Vec<(BlockHeader, [u8; 32])>, u64) {
+        let current_height = coverage_height + RECENT_BLOCK_RETENTION_DEPTH;
+        let chain = put_selected_history_header_chain(store, current_height);
+        let block_hash = chain[coverage_height as usize].1;
+        store
+            .enqueue_recursive_proof_job(coverage_height, block_hash, RecursiveProofJobTier::B8)
+            .unwrap();
+        store
+            .import_verified_selected_history_terminal(VerifiedSelectedHistoryTerminalImport {
+                height: coverage_height,
+                block_hash,
+                epoch_anchor_height: 0,
+                epoch_anchor_hash: chain[0].1,
+                tier: RecursiveProofJobTier::B8,
+                terminal_package_bytes: &selected_terminal_bytes(coverage_height, block_hash),
+            })
+            .unwrap();
+        (chain, current_height)
     }
 
     #[test]
@@ -5390,21 +5788,10 @@ mod tests {
     fn pruning_waits_for_canonical_selected_recursive_result() {
         let dir = tempfile::tempdir().unwrap();
         let store = MdbxStore::open(dir.path()).unwrap();
-        let (_header, hash) = put_recursive_job_header(&store, 1, 0xA11CE);
-
-        let txn = store.db.begin_rw_txn().unwrap();
-        for (table_name, bytes) in [
-            (T_RECENT_BLOCKS, b"retained-block".as_slice()),
-            (T_BLOCK_PROOFS, b"retained-proof".as_slice()),
-            (T_BLOCK_AUTH_SIDECARS, b"retained-sidecar".as_slice()),
-            (T_HISTORY_CLAIMS, b"retained-claim".as_slice()),
-            (T_ACCEPTED_BLOCK_CERTIFICATES, b"certificate".as_slice()),
-        ] {
-            let table = txn.open_table(Some(table_name)).unwrap();
-            txn.put(&table, u64_key(1), bytes, WriteFlags::empty())
-                .unwrap();
-        }
-        txn.commit().unwrap();
+        let pruning_height = 1 + RECENT_BLOCK_RETENTION_DEPTH;
+        let chain = put_selected_history_header_chain(&store, pruning_height);
+        let hash = chain[1].1;
+        put_retained_payload_fixture(&store, 1);
         store
             .put_checkpoint_coverage(&crate::checkpoint::CheckpointCoverage {
                 checkpoint_id: [1u8; 32],
@@ -5419,8 +5806,8 @@ mod tests {
             .enqueue_recursive_proof_job(1, hash, RecursiveProofJobTier::B8)
             .unwrap();
 
-        let pruning_height = RECENT_BLOCK_RETENTION_DEPTH + 1;
         store.prune_after_commit(pruning_height).unwrap();
+        assert_eq!(retained_payload_prune_watermark(&store), None);
         assert_eq!(
             store.get_recent_block(1).unwrap().as_deref(),
             Some(b"retained-block".as_slice())
@@ -5447,8 +5834,221 @@ mod tests {
         assert!(store.get_block_proof(1).unwrap().is_none());
         assert!(store.get_block_auth_sidecar(1).unwrap().is_none());
         assert!(store.get_history_claim(1).unwrap().is_none());
-        assert!(store.get_accepted_block_certificate(1).unwrap().is_some());
+        assert!(store.get_accepted_block_certificate(1).unwrap().is_none());
+        assert_eq!(retained_payload_prune_watermark(&store), Some(1));
         assert!(store.get_recursive_proof_job_result(1).unwrap().is_some());
+    }
+
+    #[test]
+    fn retained_payload_pruning_resumes_after_restart_and_caps_far_jumps() {
+        let directory = tempfile::tempdir().unwrap();
+        let coverage_height = RETAINED_PAYLOAD_PRUNE_HEIGHT_LIMIT as u64 + 3;
+        let current_height;
+        let coverage_hash;
+        let full_payload_batch = (RETAINED_PAYLOAD_PRUNE_DELETE_LIMIT / 6)
+            .min(RETAINED_PAYLOAD_PRUNE_HEIGHT_LIMIT) as u64;
+        {
+            let store = MdbxStore::open(directory.path()).unwrap();
+            let (chain, current) = install_selected_prune_authority(&store, coverage_height);
+            current_height = current;
+            coverage_hash = chain[coverage_height as usize].1;
+            for height in 1..=coverage_height + 1 {
+                put_retained_payload_fixture(&store, height);
+            }
+
+            store.prune_after_commit(current_height).unwrap();
+            assert_eq!(
+                retained_payload_prune_watermark(&store),
+                Some(full_payload_batch)
+            );
+            assert!(store
+                .get_recent_block(full_payload_batch)
+                .unwrap()
+                .is_none());
+            assert!(store
+                .get_recent_block(full_payload_batch + 1)
+                .unwrap()
+                .is_some());
+        }
+
+        let reopened = MdbxStore::open(directory.path()).unwrap();
+        reopened.prune_after_commit(current_height).unwrap();
+        assert_eq!(
+            retained_payload_prune_watermark(&reopened),
+            Some(coverage_height)
+        );
+        assert!(reopened
+            .get_recent_block(coverage_height)
+            .unwrap()
+            .is_none());
+        assert!(reopened
+            .get_recent_block(coverage_height + 1)
+            .unwrap()
+            .is_some());
+        assert!(reopened
+            .get_accepted_block_certificate(coverage_height + 1)
+            .unwrap()
+            .is_some());
+        assert!(reopened
+            .get_selected_history_terminal_result_at(coverage_height, coverage_hash)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn retained_payload_pruning_missing_or_malformed_certificate_rolls_back_batch() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let (_chain, current_height) = install_selected_prune_authority(&store, 2);
+        put_retained_payload_fixture(&store, 1);
+
+        let txn = store.db.begin_rw_txn().unwrap();
+        for table_name in [
+            T_RECENT_BLOCKS,
+            T_BLOCK_PROOFS,
+            T_BLOCK_AUTH_SIDECARS,
+            T_HISTORY_CLAIMS,
+        ] {
+            let table = txn.open_table(Some(table_name)).unwrap();
+            txn.put(&table, u64_key(2), b"uncertified", WriteFlags::empty())
+                .unwrap();
+        }
+        txn.commit().unwrap();
+
+        assert!(store.prune_after_commit(current_height).is_err());
+        assert_eq!(retained_payload_prune_watermark(&store), None);
+        assert!(store.get_recent_block(1).unwrap().is_some());
+        assert!(store.get_accepted_block_certificate(1).unwrap().is_some());
+
+        // A raw opaque record without its fixed-width acceptance-time binding
+        // is malformed, not sufficient authorization for deletion.
+        let txn = store.db.begin_rw_txn().unwrap();
+        let certificates = txn.open_table(Some(T_ACCEPTED_BLOCK_CERTIFICATES)).unwrap();
+        txn.put(
+            &certificates,
+            u64_key(2),
+            b"unbound-certificate",
+            WriteFlags::empty(),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+        assert!(store.prune_after_commit(current_height).is_err());
+        assert_eq!(retained_payload_prune_watermark(&store), None);
+        assert!(store.get_recent_block(1).unwrap().is_some());
+
+        let txn = store.db.begin_rw_txn().unwrap();
+        let certificates = txn.open_table(Some(T_ACCEPTED_BLOCK_CERTIFICATES)).unwrap();
+        txn.del(&certificates, u64_key(2), None).unwrap();
+        txn.commit().unwrap();
+        store
+            .put_accepted_block_certificate(2, b"accepted-certificate")
+            .unwrap();
+        store.prune_after_commit(current_height).unwrap();
+        assert_eq!(retained_payload_prune_watermark(&store), Some(2));
+        assert!(store.get_recent_block(1).unwrap().is_none());
+        assert!(store.get_recent_block(2).unwrap().is_none());
+    }
+
+    #[test]
+    fn retained_payload_pruning_stops_at_durable_finality_and_keeps_terminal() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let (chain, current_height) = install_selected_prune_authority(&store, 3);
+        put_retained_payload_fixture(&store, 2);
+        put_retained_payload_fixture(&store, 3);
+        store
+            .put_consensus_meta(&ConsensusMeta {
+                tip_height: current_height,
+                tip_hash: chain[current_height as usize].1,
+                cumulative_chainwork: [0u8; 32],
+                finalized: crate::storage::meta::FinalizedCheckpoint {
+                    height: 2,
+                    hash: chain[2].1,
+                },
+            })
+            .unwrap();
+
+        store.prune_after_commit(current_height).unwrap();
+        assert_eq!(retained_payload_prune_watermark(&store), Some(2));
+        assert!(store.get_recent_block(2).unwrap().is_none());
+        assert!(store.get_recent_block(3).unwrap().is_some());
+        assert!(store
+            .get_selected_history_terminal_result_at(3, chain[3].1)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn retained_payload_prune_watermark_rewinds_and_clears_with_epoch() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let (_chain, current_height) = install_selected_prune_authority(&store, 20);
+        store.prune_after_commit(current_height).unwrap();
+        assert_eq!(
+            retained_payload_prune_watermark(&store),
+            Some(RETAINED_PAYLOAD_PRUNE_HEIGHT_LIMIT as u64)
+        );
+
+        store.delete_recursive_proof_jobs_above(5).unwrap();
+        assert_eq!(retained_payload_prune_watermark(&store), Some(5));
+        assert!(store.get_selected_history_coverage().unwrap().is_none());
+        store.prune_after_commit(current_height).unwrap();
+        assert_eq!(
+            retained_payload_prune_watermark(&store),
+            Some(5),
+            "ordinary no-coverage maintenance must not advance the frontier"
+        );
+
+        store.clear_all().unwrap();
+        assert_eq!(retained_payload_prune_watermark(&store), None);
+    }
+
+    #[test]
+    fn retained_payload_pruner_has_no_prefix_scan_or_payload_allocation() {
+        assert!(retained_payload_prune_budget_allows(
+            0,
+            0,
+            RETAINED_PAYLOAD_PRUNE_BYTE_LIMIT,
+            RETAINED_PAYLOAD_PRUNE_DELETE_LIMIT,
+        ));
+        assert!(!retained_payload_prune_budget_allows(
+            1,
+            0,
+            RETAINED_PAYLOAD_PRUNE_BYTE_LIMIT,
+            0,
+        ));
+        assert!(!retained_payload_prune_budget_allows(
+            0,
+            1,
+            0,
+            RETAINED_PAYLOAD_PRUNE_DELETE_LIMIT,
+        ));
+        assert!(!retained_payload_prune_budget_allows(
+            usize::MAX,
+            usize::MAX,
+            1,
+            1,
+        ));
+
+        let source = include_str!("mdbx_store.rs");
+        let body = source
+            .split("fn prune_retained_payloads_bounded(")
+            .nth(1)
+            .expect("bounded retained payload pruner")
+            .split("/// Delete legacy little-endian height keys")
+            .next()
+            .expect("bounded retained payload pruner boundary");
+        assert!(!body.contains("cursor("));
+        assert!(!body.contains("Vec::"));
+        assert!(!body.contains("Vec<"));
+        assert!(body.contains("RETAINED_PAYLOAD_PRUNE_HEIGHT_LIMIT"));
+        assert!(body.contains("RETAINED_PAYLOAD_PRUNE_BYTE_LIMIT"));
+        assert!(body.contains("RETAINED_PAYLOAD_PRUNE_DELETE_LIMIT"));
+        assert!(body.contains("ObjectLength"));
+        assert!(body.contains("let key = u64_key(height)"));
+        let preflight = body.find("let payload_lengths").unwrap();
+        let first_delete = body.find("txn.del(table").unwrap();
+        assert!(preflight < first_delete);
     }
 
     #[test]
@@ -5761,7 +6361,8 @@ mod tests {
     fn verified_selected_history_import_jumps_and_compacts_in_constant_space() {
         let directory = tempfile::tempdir().unwrap();
         let store = MdbxStore::open(directory.path()).unwrap();
-        let chain = put_selected_history_header_chain(&store, 5);
+        let pruning_height = 4 + RECENT_BLOCK_RETENTION_DEPTH;
+        let chain = put_selected_history_header_chain(&store, pruning_height);
         for height in 1..=5 {
             store
                 .enqueue_recursive_proof_job(
@@ -5773,7 +6374,6 @@ mod tests {
         }
         let txn = store.db.begin_rw_txn().unwrap();
         let recent = txn.open_table(Some(T_RECENT_BLOCKS)).unwrap();
-        let certificates = txn.open_table(Some(T_ACCEPTED_BLOCK_CERTIFICATES)).unwrap();
         txn.put(
             &recent,
             u64_key(2),
@@ -5781,14 +6381,10 @@ mod tests {
             WriteFlags::empty(),
         )
         .unwrap();
-        txn.put(
-            &certificates,
-            u64_key(2),
-            b"accepted-certificate",
-            WriteFlags::empty(),
-        )
-        .unwrap();
         txn.commit().unwrap();
+        store
+            .put_accepted_block_certificate(2, b"accepted-certificate")
+            .unwrap();
 
         // Establish a valid older pointer. The relay import below skips two
         // Pending intermediates and does not require exact predecessor proof
@@ -5849,9 +6445,7 @@ mod tests {
             RecursiveProofJobState::Pending,
             "future work must not be compacted by the imported prefix"
         );
-        store
-            .prune_after_commit(4 + RECENT_BLOCK_RETENTION_DEPTH)
-            .unwrap();
+        store.prune_after_commit(pruning_height).unwrap();
         assert!(store.get_recent_block(2).unwrap().is_none());
 
         // A reorg below the imported target cannot rewind to a compacted proof
@@ -7012,7 +7606,7 @@ mod tests {
     }
 
     #[test]
-    fn finalized_staging_installs_segments_owner_index_and_compact_hot_state_atomically() {
+    fn finalized_staging_installs_state_and_seeds_retained_payload_prune_watermark_atomically() {
         let database = tempfile::tempdir().unwrap();
         let staging_parent = tempfile::tempdir().unwrap();
         let store = MdbxStore::open(database.path()).unwrap();
@@ -7072,6 +7666,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(store.get_chain_tip().unwrap(), Some((1, new_hash)));
+        assert_eq!(retained_payload_prune_watermark(&store), Some(1));
         assert_eq!(store.get_state_meta().unwrap(), Some((3, 1, 2)));
         assert_eq!(hot_state.cached_state_root(), new_header.state_root);
         assert_eq!(hot_state.state.materialized_segment_ids().count(), 0);
@@ -7629,6 +8224,7 @@ mod tests {
         let bytes = b"certificate-record".to_vec();
 
         assert_eq!(store.get_accepted_block_certificate(7).unwrap(), None);
+        put_recursive_job_header(&store, 7, 7);
         store
             .put_accepted_block_certificate(7, &bytes)
             .expect("store certificate bytes");
