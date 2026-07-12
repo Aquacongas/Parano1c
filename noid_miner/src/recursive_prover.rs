@@ -295,14 +295,14 @@ impl SelectedRecursiveMatrixRequest {
 /// One owned transient matrix returned to the coordinator.  It exposes only a
 /// borrow and is explicitly dropped before the next loader call.
 pub struct LoadedSelectedRecursiveMatrix {
-    matrix: FieldR1cs,
+    matrix: Option<FieldR1cs>,
     release_callback: Option<Box<dyn FnOnce() + Send + 'static>>,
 }
 
 impl LoadedSelectedRecursiveMatrix {
     pub fn new(matrix: FieldR1cs) -> Self {
         Self {
-            matrix,
+            matrix: Some(matrix),
             release_callback: None,
         }
     }
@@ -311,7 +311,9 @@ impl LoadedSelectedRecursiveMatrix {
     /// callback. Callers must retain this RAII wrapper for the entire borrow;
     /// dropping it releases the source's one-matrix admission.
     pub fn matrix(&self) -> &FieldR1cs {
-        &self.matrix
+        self.matrix
+            .as_ref()
+            .expect("loaded recursive matrix exists until wrapper drop")
     }
 
     pub(crate) fn with_release_callback(
@@ -319,7 +321,7 @@ impl LoadedSelectedRecursiveMatrix {
         release_callback: impl FnOnce() + Send + 'static,
     ) -> Self {
         Self {
-            matrix,
+            matrix: Some(matrix),
             release_callback: Some(Box::new(release_callback)),
         }
     }
@@ -327,6 +329,10 @@ impl LoadedSelectedRecursiveMatrix {
 
 impl Drop for LoadedSelectedRecursiveMatrix {
     fn drop(&mut self) {
+        // Release admission only after the multi-GiB matrix vectors have been
+        // destroyed. Firing the callback first would let another thread begin
+        // decoding while the old allocation is still being freed.
+        drop(self.matrix.take());
         if let Some(release_callback) = self.release_callback.take() {
             release_callback();
         }

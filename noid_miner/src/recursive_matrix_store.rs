@@ -14,7 +14,7 @@ use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -39,6 +39,11 @@ const ARTIFACT_VERSION_DIRECTORY: &str = "v1";
 const ARTIFACT_READ_BUFFER_BYTES: usize = 64 * 1024;
 const TEMP_CREATE_ATTEMPTS: usize = 32;
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
+static PROCESS_MATRIX_RESIDENT: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+
+fn process_matrix_residency() -> Arc<AtomicBool> {
+    Arc::clone(PROCESS_MATRIX_RESIDENT.get_or_init(|| Arc::new(AtomicBool::new(false))))
+}
 
 /// Declared identity used by the offline matrix materializer/exporter.
 ///
@@ -170,6 +175,15 @@ impl LocalSelectedRecursiveMatrixSource {
     }
 
     pub fn with_max_artifact_bytes(root: impl Into<PathBuf>, max_artifact_bytes: u64) -> Self {
+        Self {
+            root: root.into(),
+            max_artifact_bytes,
+            resident: process_matrix_residency(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_isolated_residency(root: impl Into<PathBuf>, max_artifact_bytes: u64) -> Self {
         Self {
             root: root.into(),
             max_artifact_bytes,
@@ -600,6 +614,17 @@ mod tests {
         ]
     }
 
+    fn isolated_source(root: &Path) -> LocalSelectedRecursiveMatrixSource {
+        LocalSelectedRecursiveMatrixSource::with_isolated_residency(
+            root,
+            MAX_SELECTED_RECURSIVE_MATRIX_ARTIFACT_BYTES,
+        )
+    }
+
+    fn isolated_source_with_cap(root: &Path, cap: u64) -> LocalSelectedRecursiveMatrixSource {
+        LocalSelectedRecursiveMatrixSource::with_isolated_residency(root, cap)
+    }
+
     #[test]
     fn fixed_mapping_covers_nine_distinct_versioned_paths() {
         let actual = all_kinds()
@@ -627,7 +652,7 @@ mod tests {
     #[test]
     fn atomic_export_roundtrips_without_serialized_vec_or_temp_residue() {
         let directory = tempdir().unwrap();
-        let source = LocalSelectedRecursiveMatrixSource::new(directory.path());
+        let source = isolated_source(directory.path());
         let matrix = tiny_matrix(7);
         let identity = identity(SelectedRecursiveMatrixKind::GenesisLink, &matrix);
         source.export_matrix(identity, &matrix).unwrap();
@@ -651,7 +676,7 @@ mod tests {
     #[test]
     fn truncated_artifact_is_rejected_by_canonical_decoder() {
         let directory = tempdir().unwrap();
-        let source = LocalSelectedRecursiveMatrixSource::new(directory.path());
+        let source = isolated_source(directory.path());
         let matrix = tiny_matrix(8);
         let identity = identity(
             SelectedRecursiveMatrixKind::CurrentBlock(SelectedRecursiveTier::B8),
@@ -682,7 +707,7 @@ mod tests {
     #[test]
     fn path_substitution_is_rejected_by_request_digest() {
         let directory = tempdir().unwrap();
-        let source = LocalSelectedRecursiveMatrixSource::new(directory.path());
+        let source = isolated_source(directory.path());
         let expected = tiny_matrix(11);
         let substitute = tiny_matrix(22);
         let expected_identity = identity(
@@ -718,7 +743,7 @@ mod tests {
     #[test]
     fn file_size_cap_rejects_before_decode() {
         let directory = tempdir().unwrap();
-        let writer = LocalSelectedRecursiveMatrixSource::new(directory.path());
+        let writer = isolated_source(directory.path());
         let matrix = tiny_matrix(33);
         let identity = identity(
             SelectedRecursiveMatrixKind::PreviousLink(SelectedRecursiveTier::B64),
@@ -728,10 +753,7 @@ mod tests {
         let actual = fs::metadata(writer.artifact_path(identity.kind()))
             .unwrap()
             .len();
-        let reader = LocalSelectedRecursiveMatrixSource::with_max_artifact_bytes(
-            directory.path(),
-            actual - 1,
-        );
+        let reader = isolated_source_with_cap(directory.path(), actual - 1);
 
         assert!(matches!(
             reader.load_requested(
@@ -749,8 +771,7 @@ mod tests {
     #[test]
     fn export_cap_removes_temporary_and_never_creates_target() {
         let directory = tempdir().unwrap();
-        let source =
-            LocalSelectedRecursiveMatrixSource::with_max_artifact_bytes(directory.path(), 127);
+        let source = isolated_source_with_cap(directory.path(), 127);
         let matrix = tiny_matrix(44);
         let identity = identity(
             SelectedRecursiveMatrixKind::CurrentBlock(SelectedRecursiveTier::B255),
@@ -771,7 +792,7 @@ mod tests {
     #[test]
     fn second_load_waits_for_first_matrix_drop() {
         let directory = tempdir().unwrap();
-        let source = LocalSelectedRecursiveMatrixSource::new(directory.path());
+        let source = isolated_source(directory.path());
         let previous = tiny_matrix(55);
         let block = tiny_matrix(66);
         let previous_identity = identity(
@@ -801,13 +822,62 @@ mod tests {
         drop(second);
     }
 
+    #[test]
+    fn independent_production_sources_share_process_matrix_admission() {
+        let directory = tempdir().unwrap();
+        let writer = isolated_source(directory.path());
+        let first_matrix = tiny_matrix(101);
+        let second_matrix = tiny_matrix(102);
+        let first_identity = identity(
+            SelectedRecursiveMatrixKind::PreviousLink(SelectedRecursiveTier::B8),
+            &first_matrix,
+        );
+        let second_identity = identity(
+            SelectedRecursiveMatrixKind::CurrentBlock(SelectedRecursiveTier::B8),
+            &second_matrix,
+        );
+        writer.export_matrix(first_identity, &first_matrix).unwrap();
+        writer
+            .export_matrix(second_identity, &second_matrix)
+            .unwrap();
+
+        let first_source = LocalSelectedRecursiveMatrixSource::new(directory.path());
+        let second_source = LocalSelectedRecursiveMatrixSource::new(directory.path());
+        let first = first_source.load_artifact(first_identity).unwrap();
+        assert!(matches!(
+            second_source.load_artifact(second_identity),
+            Err(LocalSelectedRecursiveMatrixError::MatrixAlreadyResident)
+        ));
+        drop(first);
+        drop(second_source.load_artifact(second_identity).unwrap());
+    }
+
+    #[test]
+    fn loaded_wrapper_releases_admission_after_matrix_storage_drop() {
+        let source = include_str!("recursive_prover.rs");
+        let drop_body = source
+            .split("impl Drop for LoadedSelectedRecursiveMatrix")
+            .nth(1)
+            .expect("loaded matrix Drop implementation")
+            .split("/// On-demand local matrix provider")
+            .next()
+            .expect("loaded matrix Drop boundary");
+        let matrix_drop = drop_body
+            .find("drop(self.matrix.take())")
+            .expect("matrix storage is explicitly dropped");
+        let callback = drop_body
+            .find("self.release_callback.take()")
+            .expect("release callback exists");
+        assert!(matrix_drop < callback);
+    }
+
     #[cfg(unix)]
     #[test]
     fn symlink_leaf_is_rejected_without_following_it() {
         use std::os::unix::fs::symlink;
 
         let directory = tempdir().unwrap();
-        let source = LocalSelectedRecursiveMatrixSource::new(directory.path());
+        let source = isolated_source(directory.path());
         let expected = tiny_matrix(77);
         let target = tiny_matrix(88);
         let expected_identity = identity(
