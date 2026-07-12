@@ -955,73 +955,70 @@ pub fn prove_ragged_multi_deep_chain_walk<Ch: Challenger>(
         let mut round_coeffs = Vec::with_capacity(max_w_log);
         let mut point = Vec::with_capacity(max_w_log);
         for round in 0..max_w_log {
-            // A native coordinate contributes one work item per Boolean pair.
-            // Once an instance is exhausted, one analytical item represents
-            // its `(1 + x_round)` alignment gate while S stays constant.
-            let work_lengths = w_logs
-                .iter()
-                .enumerate()
-                .map(|(instance, &w_log)| {
-                    if round < w_log {
-                        e_tables[instance][0].len() / 2
-                    } else {
-                        1
+            // A native coordinate contributes one work item per Boolean
+            // pair; an exhausted instance contributes one analytical item
+            // for its `(1 + x_round)` alignment gate while S stays constant.
+            // Instances run as separate parallel folds — the coefficient
+            // sums are XOR-accumulated, so regrouping by instance is
+            // bit-identical to the earlier flat work list and drops the
+            // per-pair offset search from the hot loop.
+            let mut full = [F128::ZERO; WALK_DEGREE + 1];
+            for (instance, &w_log) in w_logs.iter().enumerate() {
+                let instance_e = &e_tables[instance];
+                let instance_s = &s_tables[instance];
+                let contribution = if round < w_log {
+                    (0..instance_e[0].len() / 2)
+                        .into_par_iter()
+                        .fold(
+                            || [F128::ZERO; WALK_DEGREE + 1],
+                            |mut acc, p| {
+                                let mut e_base = [F128::ZERO; STATE_SIZE];
+                                let mut e_delta = [F128::ZERO; STATE_SIZE];
+                                let mut s_base = [F128::ZERO; STATE_SIZE];
+                                let mut s_delta = [F128::ZERO; STATE_SIZE];
+                                for lane in 0..STATE_SIZE {
+                                    e_base[lane] = instance_e[lane][2 * p];
+                                    e_delta[lane] =
+                                        instance_e[lane][2 * p] + instance_e[lane][2 * p + 1];
+                                    s_base[lane] = instance_s[lane][2 * p];
+                                    s_delta[lane] =
+                                        instance_s[lane][2 * p] + instance_s[lane][2 * p + 1];
+                                }
+                                accumulate_pair_round_coeffs(
+                                    q, &e_base, &e_delta, &s_base, &s_delta, &mut acc,
+                                );
+                                acc
+                            },
+                        )
+                        .reduce(
+                            || [F128::ZERO; WALK_DEGREE + 1],
+                            |mut left, right| {
+                                for (left, right) in left.iter_mut().zip(right) {
+                                    *left += right;
+                                }
+                                left
+                            },
+                        )
+                } else {
+                    let mut acc = [F128::ZERO; WALK_DEGREE + 1];
+                    let mut e_base = [F128::ZERO; STATE_SIZE];
+                    let mut s_base = [F128::ZERO; STATE_SIZE];
+                    let s_delta = [F128::ZERO; STATE_SIZE];
+                    for lane in 0..STATE_SIZE {
+                        debug_assert_eq!(instance_e[lane].len(), 1);
+                        debug_assert_eq!(instance_s[lane].len(), 1);
+                        e_base[lane] = instance_e[lane][0];
+                        s_base[lane] = instance_s[lane][0];
                     }
-                })
-                .collect::<Vec<_>>();
-            let mut work_offsets = Vec::with_capacity(work_lengths.len() + 1);
-            work_offsets.push(0usize);
-            for &len in &work_lengths {
-                let next = work_offsets.last().copied().unwrap() + len;
-                work_offsets.push(next);
+                    // e * (1 + t) = e + t*e in characteristic 2.
+                    let e_delta = e_base;
+                    accumulate_pair_round_coeffs(q, &e_base, &e_delta, &s_base, &s_delta, &mut acc);
+                    acc
+                };
+                for (slot, value) in full.iter_mut().zip(&contribution) {
+                    *slot += *value;
+                }
             }
-            let total_work = *work_offsets.last().unwrap();
-            let evals = (0..total_work)
-                .into_par_iter()
-                .fold(
-                    || [F128::ZERO; WALK_DEGREE + 1],
-                    |mut acc, work_index| {
-                        let instance =
-                            work_offsets.partition_point(|&offset| offset <= work_index) - 1;
-                        let p = work_index - work_offsets[instance];
-                        let native_coordinate = round < w_logs[instance];
-                        let mut e_base = [F128::ZERO; STATE_SIZE];
-                        let mut e_delta = [F128::ZERO; STATE_SIZE];
-                        let mut s_base = [F128::ZERO; STATE_SIZE];
-                        let mut s_delta = [F128::ZERO; STATE_SIZE];
-                        for lane in 0..STATE_SIZE {
-                            if native_coordinate {
-                                e_base[lane] = e_tables[instance][lane][2 * p];
-                                e_delta[lane] = e_tables[instance][lane][2 * p]
-                                    + e_tables[instance][lane][2 * p + 1];
-                                s_base[lane] = s_tables[instance][lane][2 * p];
-                                s_delta[lane] = s_tables[instance][lane][2 * p]
-                                    + s_tables[instance][lane][2 * p + 1];
-                            } else {
-                                debug_assert_eq!(e_tables[instance][lane].len(), 1);
-                                debug_assert_eq!(s_tables[instance][lane].len(), 1);
-                                e_base[lane] = e_tables[instance][lane][0];
-                                // e * (1 + t) = e + t*e in characteristic 2.
-                                e_delta[lane] = e_tables[instance][lane][0];
-                                s_base[lane] = s_tables[instance][lane][0];
-                            }
-                        }
-                        accumulate_pair_round_coeffs(
-                            q, &e_base, &e_delta, &s_base, &s_delta, &mut acc,
-                        );
-                        acc
-                    },
-                )
-                .reduce(
-                    || [F128::ZERO; WALK_DEGREE + 1],
-                    |mut left, right| {
-                        for (left, right) in left.iter_mut().zip(right) {
-                            *left += right;
-                        }
-                        left
-                    },
-                );
-            let full = evals;
             debug_assert_eq!(
                 full[0] + horner(&full, F128::ONE),
                 claim,
