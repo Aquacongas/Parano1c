@@ -17,22 +17,16 @@
 //! AVX-512 is not — i.e. the PACKED_LANES == 2 configuration with the wide
 //! carry-less multiply extension (Alder/Raptor Lake class cores).
 
-#![cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx2",
-    target_feature = "vpclmulqdq",
-    not(target_feature = "avx512f"),
-))]
+#![cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
 
 use super::PackedBlock128;
 use core::arch::x86_64::*;
 
-// NOTE: the functions below deliberately carry NO `#[target_feature]`
-// attribute — the `#![cfg(target_feature = ...)]` module gate already
-// guarantees the features are enabled crate-wide (the workspace builds with
-// `-C target-cpu=native`), and a `#[target_feature]` boundary would inhibit
-// the `#[inline(always)]` fusion the hot loops depend on (same convention
-// as `simd_square_avx2`).
+// NOTE: every function carries the SAME `#[target_feature]` set, so the
+// `#[inline(always)]` fusion between them is preserved (rustc inlines across
+// matching target_feature boundaries). The module is compiled on all
+// x86_64 (except avx512f layout builds) and entered only through runtime
+// `is_x86_feature_detected!` dispatch or a statically-enabled build.
 
 /// Reduce two 256-bit carry-less products (per 128-bit lane: `hi:lo`)
 /// modulo x^128 + x^7 + x^2 + x + 1.
@@ -42,7 +36,8 @@ use core::arch::x86_64::*;
 ///   lo ^= clmul(hi.lo64, P)                       (degree ≤ 70)
 ///   lo ^= clmul(hi.hi64, P) << 64; of = same >> 64 (degree ≤ 133)
 ///   lo ^= clmul(of, P)                            (degree ≤ 13)
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "avx2,vpclmulqdq")]
 pub unsafe fn reduce_gcm_x2(hi: __m256i, lo: __m256i) -> __m256i {
     let p = _mm256_set1_epi64x(0x87);
     let v1 = _mm256_clmulepi64_epi128(hi, p, 0x00);
@@ -56,7 +51,8 @@ pub unsafe fn reduce_gcm_x2(hi: __m256i, lo: __m256i) -> __m256i {
 /// Two independent flat-basis GF(2^128) multiplications, one per 128-bit
 /// lane of the 256-bit registers — the register-domain core shared by the
 /// packed wrappers below and the vector permutation kernels.
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "avx2,vpclmulqdq")]
 pub unsafe fn mul_gcm_x2(a: __m256i, b: __m256i) -> __m256i {
     let t_ll = _mm256_clmulepi64_epi128(a, b, 0x00);
     let t_hh = _mm256_clmulepi64_epi128(a, b, 0x11);
@@ -74,19 +70,22 @@ pub unsafe fn mul_gcm_x2(a: __m256i, b: __m256i) -> __m256i {
 /// with the reduction, versus ~25 port-5 shuffle/shift µops for the
 /// bit-spread square. Preferable when squares sit between multiplies (the
 /// S-box), where the shuffle pressure on the CLMUL port is what hurts.
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "avx2,vpclmulqdq")]
 pub unsafe fn square_gcm_clmul_x2(a: __m256i) -> __m256i {
     let lo = _mm256_clmulepi64_epi128(a, a, 0x00);
     let hi = _mm256_clmulepi64_epi128(a, a, 0x11);
     reduce_gcm_x2(hi, lo)
 }
 
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "avx2,vpclmulqdq")]
 unsafe fn load(x: &PackedBlock128) -> __m256i {
     _mm256_loadu_si256(x as *const PackedBlock128 as *const __m256i)
 }
 
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "avx2,vpclmulqdq")]
 unsafe fn store(v: __m256i) -> PackedBlock128 {
     let mut out = core::mem::MaybeUninit::<PackedBlock128>::uninit();
     _mm256_storeu_si256(out.as_mut_ptr() as *mut __m256i, v);
@@ -94,14 +93,16 @@ unsafe fn store(v: __m256i) -> PackedBlock128 {
 }
 
 /// Lane-parallel `clmul_gcm` of two packed flat-basis values.
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "avx2,vpclmulqdq")]
 pub unsafe fn packed_mul_flat_avx2(a: PackedBlock128, b: PackedBlock128) -> PackedBlock128 {
     store(mul_gcm_x2(load(&a), load(&b)))
 }
 
 /// Lane-parallel `clmul_gcm` of a packed flat-basis value by one flat
 /// scalar (broadcast into both lanes).
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "avx2,vpclmulqdq")]
 pub unsafe fn packed_scalar_mul_flat_avx2(a: PackedBlock128, scalar_flat: u128) -> PackedBlock128 {
     let s = _mm256_broadcastsi128_si256(core::mem::transmute::<u128, __m128i>(scalar_flat));
     store(mul_gcm_x2(load(&a), s))
@@ -111,6 +112,11 @@ pub unsafe fn packed_scalar_mul_flat_avx2(a: PackedBlock128, scalar_flat: u128) 
 mod tests {
     use super::*;
     use crate::hardware::clmul_gcm;
+
+    fn kernel_supported() -> bool {
+        std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("vpclmulqdq")
+    }
 
     fn rng(seed: &mut u64) -> u128 {
         let mut next = || {

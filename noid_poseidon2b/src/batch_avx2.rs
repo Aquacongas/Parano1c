@@ -16,12 +16,7 @@
 //!
 //! Bit-identical to `native::permutation::permute_flat_u128` per lane.
 
-#![cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx2",
-    target_feature = "vpclmulqdq",
-    not(target_feature = "avx512f"),
-))]
+#![cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
 
 use core::arch::x86_64::*;
 
@@ -40,12 +35,14 @@ pub(crate) struct VecTables {
     pub mds_partial_diag: [u128; STATE_SIZE],
 }
 
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "avx2,vpclmulqdq")]
 unsafe fn bcast(c: u128) -> __m256i {
     _mm256_broadcastsi128_si256(core::mem::transmute::<u128, __m128i>(c))
 }
 
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "avx2,vpclmulqdq")]
 unsafe fn sbox_x7(x: __m256i) -> __m256i {
     let x2 = square_gcm_clmul_x2(x);
     let x4 = square_gcm_clmul_x2(x2);
@@ -54,7 +51,8 @@ unsafe fn sbox_x7(x: __m256i) -> __m256i {
 }
 
 /// Full-round MDS: generic 4×4 with the is-one entries as bare XORs.
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "avx2,vpclmulqdq")]
 unsafe fn mds_full(s: &mut [__m256i; STATE_SIZE], t: &VecTables) {
     let input = *s;
     for i in 0..STATE_SIZE {
@@ -73,7 +71,8 @@ unsafe fn mds_full(s: &mut [__m256i; STATE_SIZE], t: &VecTables) {
 /// Partial-round MDS: diagonal entries `c_i`, all off-diagonals 1, so
 /// `out_i = c_i·s_i + (S + s_i)` with `S` the XOR of the whole state —
 /// 4 multiplies and one shared sum instead of a dense row pass.
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "avx2,vpclmulqdq")]
 unsafe fn mds_partial(s: &mut [__m256i; STATE_SIZE], t: &VecTables) {
     let sum = _mm256_xor_si256(_mm256_xor_si256(s[0], s[1]), _mm256_xor_si256(s[2], s[3]));
     for i in 0..STATE_SIZE {
@@ -84,7 +83,8 @@ unsafe fn mds_partial(s: &mut [__m256i; STATE_SIZE], t: &VecTables) {
 
 /// The full Poseidon2b schedule over `G` independent state groups held in
 /// `__m256i` registers (each group = PACKED_LANES independent permutations).
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "avx2,vpclmulqdq")]
 unsafe fn permute_groups<const G: usize>(st: &mut [[__m256i; STATE_SIZE]; G], t: &VecTables) {
     for g in 0..G {
         mds_full(&mut st[g], t);
@@ -113,12 +113,14 @@ unsafe fn permute_groups<const G: usize>(st: &mut [[__m256i; STATE_SIZE]; G], t:
     }
 }
 
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "avx2,vpclmulqdq")]
 unsafe fn load_group(s: &[PackedBlock128; STATE_SIZE]) -> [__m256i; STATE_SIZE] {
     std::array::from_fn(|i| _mm256_loadu_si256(&s[i] as *const PackedBlock128 as *const __m256i))
 }
 
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "avx2,vpclmulqdq")]
 unsafe fn store_group(v: &[__m256i; STATE_SIZE], s: &mut [PackedBlock128; STATE_SIZE]) {
     for i in 0..STATE_SIZE {
         _mm256_storeu_si256(&mut s[i] as *mut PackedBlock128 as *mut __m256i, v[i]);
@@ -127,7 +129,12 @@ unsafe fn store_group(v: &[__m256i; STATE_SIZE], s: &mut [PackedBlock128; STATE_
 
 /// Permute `states.len()` independent packed groups: G-wide register-domain
 /// chunks first, then a single-group pass over the remainder.
-pub(crate) fn permute_flat_groups(states: &mut [[PackedBlock128; STATE_SIZE]], t: &VecTables) {
+///
+/// # Safety
+/// The CPU must support AVX2 and VPCLMULQDQ — callers gate on
+/// `is_x86_feature_detected!` (or a statically-enabled build).
+#[target_feature(enable = "avx2,vpclmulqdq")]
+pub(crate) unsafe fn permute_flat_groups(states: &mut [[PackedBlock128; STATE_SIZE]], t: &VecTables) {
     /// Groups per register-domain chunk. 4 groups × 4 state words = 16 ymm
     /// values plus multiply temporaries: the working set spills a little,
     /// but the interleaving keeps the CLMUL port saturated, which measures
@@ -153,7 +160,11 @@ pub(crate) fn permute_flat_groups(states: &mut [[PackedBlock128; STATE_SIZE]], t
 
 /// Single-group register-domain permutation (the `packed_poseidon2b_permute_flat`
 /// fast path).
-pub(crate) fn permute_flat_one(states: &mut [PackedBlock128; STATE_SIZE], t: &VecTables) {
+///
+/// # Safety
+/// See [`permute_flat_groups`].
+#[target_feature(enable = "avx2,vpclmulqdq")]
+pub(crate) unsafe fn permute_flat_one(states: &mut [PackedBlock128; STATE_SIZE], t: &VecTables) {
     unsafe {
         let mut regs = [load_group(states)];
         permute_groups(&mut regs, t);
@@ -166,7 +177,11 @@ pub(crate) fn permute_flat_one(states: &mut [PackedBlock128; STATE_SIZE], t: &Ve
 /// garbage that never crosses lanes (every kernel op is per-128-bit-lane).
 /// Still ~2.5× faster than the general-register scalar path — the CLMUL
 /// products and the reduction stay in the vector domain.
-pub(crate) fn permute_flat_single_u128(flat: &mut [u128; STATE_SIZE], t: &VecTables) {
+///
+/// # Safety
+/// See [`permute_flat_groups`].
+#[target_feature(enable = "avx2,vpclmulqdq")]
+pub(crate) unsafe fn permute_flat_single_u128(flat: &mut [u128; STATE_SIZE], t: &VecTables) {
     unsafe {
         let mut regs: [[__m256i; STATE_SIZE]; 1] = [std::array::from_fn(|i| {
             _mm256_zextsi128_si256(_mm_loadu_si128(&flat[i] as *const u128 as *const __m128i))

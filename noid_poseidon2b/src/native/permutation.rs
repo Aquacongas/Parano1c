@@ -47,14 +47,12 @@ impl Poseidon2bPermutation {
 /// the flat basis (lane-oriented transcripts, the proof-core PCS Merkle
 /// primitives) use this entry point and skip both conversions.
 pub fn permute_flat_u128(flat: &mut [u128; STATE_SIZE]) {
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx2",
-        target_feature = "vpclmulqdq",
-        not(target_feature = "avx512f"),
-    ))]
-    {
-        return crate::batch_avx2::permute_flat_single_u128(flat, crate::batch::vec_tables());
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+    if crate::batch::avx2_vpclmul_runtime() {
+        // SAFETY: gated on runtime AVX2+VPCLMULQDQ detection.
+        return unsafe {
+            crate::batch_avx2::permute_flat_single_u128(flat, crate::batch::vec_tables())
+        };
     }
     #[allow(unreachable_code)]
     let tables = flat_tables();

@@ -538,12 +538,23 @@ fn flat_tables() -> &'static FlatTables {
     })
 }
 
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx2",
-    target_feature = "vpclmulqdq",
-    not(target_feature = "avx512f"),
-))]
+/// Runtime gate for the register-domain AVX2+VPCLMULQDQ kernels. In a build
+/// where both features are statically enabled this folds to `true` at
+/// compile time; a portable release binary probes the CPU once at first use
+/// (Alder/Raptor-Lake class cores and every AVX-512 part pass). New ISA
+/// tiers (AVX-512, aarch64 PMULL) plug their kernels into the same dispatch
+/// points.
+#[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+#[inline]
+pub(crate) fn avx2_vpclmul_runtime() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("vpclmulqdq")
+    })
+}
+
+#[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
 pub(crate) fn vec_tables() -> &'static crate::batch_avx2::VecTables {
     static TABLES: OnceLock<crate::batch_avx2::VecTables> = OnceLock::new();
     TABLES.get_or_init(|| {
@@ -600,14 +611,10 @@ const PERM_INTERLEAVE: usize = 4;
 /// multiply chains. Bit-identical per group to
 /// [`packed_poseidon2b_permute_flat`].
 pub fn packed_poseidon2b_permute_flat_many(states: &mut [[PackedBlock128; STATE_SIZE]]) {
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx2",
-        target_feature = "vpclmulqdq",
-        not(target_feature = "avx512f"),
-    ))]
-    {
-        return crate::batch_avx2::permute_flat_groups(states, vec_tables());
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+    if avx2_vpclmul_runtime() {
+        // SAFETY: gated on runtime AVX2+VPCLMULQDQ detection.
+        return unsafe { crate::batch_avx2::permute_flat_groups(states, vec_tables()) };
     }
     #[allow(unreachable_code)]
     {
@@ -648,14 +655,10 @@ pub fn packed_poseidon2b_permute_flat_many(states: &mut [[PackedBlock128; STATE_
 /// (GCM) basis** bit patterns — the batched twin of
 /// `native::permutation::permute_flat_u128`, with no boundary conversion.
 pub fn packed_poseidon2b_permute_flat(states: &mut [PackedBlock128; STATE_SIZE]) {
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx2",
-        target_feature = "vpclmulqdq",
-        not(target_feature = "avx512f"),
-    ))]
-    {
-        return crate::batch_avx2::permute_flat_one(states, vec_tables());
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+    if avx2_vpclmul_runtime() {
+        // SAFETY: gated on runtime AVX2+VPCLMULQDQ detection.
+        return unsafe { crate::batch_avx2::permute_flat_one(states, vec_tables()) };
     }
     #[allow(unreachable_code)]
     let tables = flat_tables();

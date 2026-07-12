@@ -11,11 +11,7 @@
 //! The module is only compiled when AVX2 is available and AVX-512 is not —
 //! i.e. exactly the configuration where `PACKED_LANES == 2`.
 
-#![cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx2",
-    not(target_feature = "avx512f"),
-))]
+#![cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
 
 use super::PackedBlock128;
 use core::arch::x86_64::*;
@@ -38,7 +34,8 @@ macro_rules! shl_u128 {
 /// Bit-spread: each 128-bit lane holds a u64 in its low-u64 slot (hi-u64
 /// is zero). Output: each bit `i` of the input u64 lands at position `2*i`
 /// of the output u128 lane.
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "avx2")]
 unsafe fn bit_spread(x: __m256i) -> __m256i {
     let mask32 = _mm256_set1_epi64x(0x00000000FFFFFFFFu64 as i64);
     let mask16 = _mm256_set1_epi64x(0x0000FFFF0000FFFFu64 as i64);
@@ -57,7 +54,8 @@ unsafe fn bit_spread(x: __m256i) -> __m256i {
 
 /// Multiply each 128-bit lane by the GCM tail polynomial
 /// P = x^7 + x^2 + x + 1 (= 0x87). Matches `clmul_u128_by_87` scalar.
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "avx2")]
 unsafe fn clmul_by_87(a: __m256i) -> __m256i {
     let s1 = shl_u128!(a, 1);
     let s2 = shl_u128!(a, 2);
@@ -69,7 +67,8 @@ unsafe fn clmul_by_87(a: __m256i) -> __m256i {
 /// `reduce_gcm_256` in `hardware.rs`. Each 128-bit lane is reduced
 /// independently; the scalar algorithm splits `x_hi` into two u64 halves
 /// to avoid overflow during the multiplication by P.
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "avx2")]
 unsafe fn reduce_gcm_256(x_hi: __m256i, x_lo: __m256i) -> __m256i {
     // `low_half_mask` per 128-bit lane: lo-u64 all-ones, hi-u64 zero.
     let low_half_mask = _mm256_set_epi64x(0, -1, 0, -1);
@@ -101,7 +100,8 @@ unsafe fn reduce_gcm_256(x_hi: __m256i, x_lo: __m256i) -> __m256i {
 ///
 /// # Safety
 /// Requires AVX2; the module-level cfg gate guarantees it at compile time.
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "avx2")]
 pub unsafe fn square_gcm_x2(val: __m256i) -> __m256i {
     let low_half_mask = _mm256_set_epi64x(0, -1, 0, -1);
     // Extract lo-u64 of each 128-bit lane (zero the hi-u64).
@@ -122,7 +122,8 @@ pub unsafe fn square_gcm_x2(val: __m256i) -> __m256i {
 /// # Safety
 /// Requires runtime AVX2 support. The module-level cfg gate guarantees
 /// this at compile time.
-#[inline(always)]
+#[inline]
+#[target_feature(enable = "avx2")]
 pub unsafe fn packed_square_flat_avx2(x: PackedBlock128) -> PackedBlock128 {
     // PackedBlock128 is repr(C) { lanes: [u128; 2] } = 32 bytes, layout-
     // compatible with __m256i. loadu/storeu handle arbitrary alignment.

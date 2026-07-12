@@ -9,6 +9,25 @@ use crate::hardware::{
 };
 use crate::Block128;
 
+/// Runtime gate for the two-lane AVX2 fast paths; folds to a constant when
+/// the features are statically enabled.
+#[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+#[inline]
+fn avx2_vpclmul_runtime() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("vpclmulqdq")
+    })
+}
+
+#[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+#[inline]
+fn avx2_runtime() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| std::arch::is_x86_feature_detected!("avx2"))
+}
+
 impl PackedBlock128 {
     /// Packed multiplication using CLMUL hardware acceleration.
     ///
@@ -96,13 +115,9 @@ impl PackedBlock128 {
     /// Multiply two flat-basis packed values (no basis conversion).
     #[inline(always)]
     pub fn flat_mul(self, other: Self) -> Self {
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx2",
-            target_feature = "vpclmulqdq",
-            not(target_feature = "avx512f"),
-        ))]
-        {
+        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+        if avx2_vpclmul_runtime() {
+            // SAFETY: gated on runtime AVX2+VPCLMULQDQ detection.
             return unsafe { super::clmul_avx2::packed_mul_flat_avx2(self, other) };
         }
         #[allow(unreachable_code)]
@@ -114,12 +129,9 @@ impl PackedBlock128 {
     /// Square a flat-basis packed value (no basis conversion).
     #[inline(always)]
     pub fn flat_square(self) -> Self {
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx2",
-            not(target_feature = "avx512f"),
-        ))]
-        {
+        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+        if avx2_runtime() {
+            // SAFETY: gated on runtime AVX2 detection.
             return unsafe { super::simd_square_avx2::packed_square_flat_avx2(self) };
         }
         #[allow(unreachable_code)]
@@ -131,13 +143,9 @@ impl PackedBlock128 {
     /// Multiply every flat-basis lane by a single flat-basis scalar.
     #[inline(always)]
     pub fn flat_scalar_mul(self, scalar_flat: u128) -> Self {
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "avx2",
-            target_feature = "vpclmulqdq",
-            not(target_feature = "avx512f"),
-        ))]
-        {
+        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+        if avx2_vpclmul_runtime() {
+            // SAFETY: gated on runtime AVX2+VPCLMULQDQ detection.
             return unsafe { super::clmul_avx2::packed_scalar_mul_flat_avx2(self, scalar_flat) };
         }
         #[allow(unreachable_code)]

@@ -19,20 +19,18 @@ pub mod square;
 use crate::{Block128, TowerField};
 
 /// Number of Block128 lanes per packed value.
+///
+/// The two-lane layout is fixed for every x86_64 build without a static
+/// AVX-512 layout: whether the AVX2+VPCLMULQDQ kernels actually run is a
+/// RUNTIME dispatch decision, so a portable baseline binary shares the
+/// layout and picks the fast kernels on capable CPUs.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
 pub const PACKED_LANES: usize = 4;
 
-#[cfg(all(
-    target_arch = "x86_64",
-    not(target_feature = "avx512f"),
-    target_feature = "avx2"
-))]
+#[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
 pub const PACKED_LANES: usize = 2;
 
-#[cfg(not(all(
-    target_arch = "x86_64",
-    any(target_feature = "avx512f", target_feature = "avx2")
-)))]
+#[cfg(not(target_arch = "x86_64"))]
 pub const PACKED_LANES: usize = 1;
 
 /// SIMD-packed block of Block128 values.
@@ -43,21 +41,14 @@ pub struct PackedBlock128 {
     lanes: [u128; 4],
 }
 
-#[cfg(all(
-    target_arch = "x86_64",
-    not(target_feature = "avx512f"),
-    target_feature = "avx2"
-))]
+#[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PackedBlock128 {
     lanes: [u128; 2],
 }
 
-#[cfg(not(all(
-    target_arch = "x86_64",
-    any(target_feature = "avx512f", target_feature = "avx2")
-)))]
+#[cfg(not(target_arch = "x86_64"))]
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PackedBlock128 {
