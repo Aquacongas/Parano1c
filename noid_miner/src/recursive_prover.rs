@@ -34,7 +34,7 @@ use noid_recursive::block_certificate_backend::{
 };
 use noid_recursive::{ChainAccumulator, RecursiveConsensusState};
 
-use crate::memory_governor::{ProofMemoryGovernor, ProofMemoryPressure};
+use crate::memory_governor::{ProofMemoryGovernor, ProofMemoryPressure, ProofMemoryReservation};
 
 /// One of the four canonical standalone recursive Block classes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -192,6 +192,70 @@ pub struct SelectedRecursiveLinkJob {
 pub struct SelectedRecursiveLinkProof {
     pub tier: SelectedRecursiveTier,
     pub envelope: LinkProofEnvelope,
+}
+
+/// One process-global m24 admission spanning a selected Block+Link sequence.
+///
+/// Production callers must begin the session before reconstructing the
+/// `noid_block` accepted-batch artifacts used to construct
+/// [`SelectedRecursiveBlockJob`].  The single reservation then remains live
+/// through both proof phases, preventing native mining and standalone history
+/// workers from overlapping either reconstruction or proving.  The type is
+/// intentionally not `Clone`; its `&mut self` methods serialize use of the one
+/// reservation. Dropping it releases admission during normal return, unwind,
+/// or cancellation.
+#[must_use = "dropping the session releases the selected-history memory reservation"]
+pub struct SelectedHistoryProofSession {
+    _reservation: ProofMemoryReservation,
+}
+
+impl SelectedHistoryProofSession {
+    /// Prove the selected Block while reusing this session's already-held m24
+    /// reservation. No second governor admission is attempted.
+    pub fn prove_block(
+        &mut self,
+        classes: &SelectedRecursiveBlockClasses<'_>,
+        job: SelectedRecursiveBlockJob<'_>,
+    ) -> Result<SelectedRecursiveBlockProof, SelectedRecursiveProverError> {
+        prove_selected_recursive_block_in_reserved_session(classes, job)
+    }
+
+    /// Prove the following Link while retaining the same reservation acquired
+    /// before Block artifact reconstruction.
+    pub fn prove_link<S: SelectedRecursiveMatrixSource>(
+        &mut self,
+        classes: &SelectedRecursiveLinkClasses<'_>,
+        job: SelectedRecursiveLinkJob,
+        matrices: &mut S,
+    ) -> Result<SelectedRecursiveLinkProof, SelectedRecursiveProverError> {
+        prove_selected_recursive_link_in_reserved_session(classes, job, matrices)
+    }
+}
+
+/// Acquire the full m24/8 GiB selected-history envelope from the process-wide
+/// proof governor. Call this before reconstructing any accepted-block proof
+/// artifacts that will feed [`SelectedHistoryProofSession::prove_block`].
+pub fn begin_selected_history_proof_session(
+) -> Result<SelectedHistoryProofSession, SelectedRecursiveProverError> {
+    begin_selected_history_proof_session_with_governor(&ProofMemoryGovernor::global(0))
+}
+
+fn begin_selected_history_proof_session_with_governor(
+    governor: &ProofMemoryGovernor,
+) -> Result<SelectedHistoryProofSession, SelectedRecursiveProverError> {
+    Ok(SelectedHistoryProofSession {
+        _reservation: governor.try_reserve_for_selected_history_session()?,
+    })
+}
+
+#[cfg(test)]
+fn begin_selected_history_proof_session_with_available(
+    governor: &ProofMemoryGovernor,
+    available_mib: Option<usize>,
+) -> Result<SelectedHistoryProofSession, SelectedRecursiveProverError> {
+    Ok(SelectedHistoryProofSession {
+        _reservation: governor.try_reserve_selected_history_with_available(available_mib)?,
+    })
 }
 
 /// Which transient protocol matrix a Link step requests from its local class
@@ -550,6 +614,17 @@ fn prove_selected_recursive_link_with_governor<S: SelectedRecursiveMatrixSource>
     governor: &ProofMemoryGovernor,
 ) -> Result<SelectedRecursiveLinkProof, SelectedRecursiveProverError> {
     let _memory_reservation = governor.try_reserve_for_recursive_link()?;
+    prove_selected_recursive_link_in_reserved_session(classes, job, matrices)
+}
+
+/// Cryptographic Link body entered only after a standalone or session-level
+/// reservation has been acquired. Keep governor admission out of this path so
+/// a Block+Link session never self-conflicts on the single-proof ledger.
+fn prove_selected_recursive_link_in_reserved_session<S: SelectedRecursiveMatrixSource>(
+    classes: &SelectedRecursiveLinkClasses<'_>,
+    job: SelectedRecursiveLinkJob,
+    matrices: &mut S,
+) -> Result<SelectedRecursiveLinkProof, SelectedRecursiveProverError> {
     let SelectedRecursiveLinkJob {
         predecessor,
         current_block,
@@ -676,6 +751,26 @@ fn prove_selected_recursive_block_with_governor(
     job: SelectedRecursiveBlockJob<'_>,
     governor: &ProofMemoryGovernor,
 ) -> Result<SelectedRecursiveBlockProof, SelectedRecursiveProverError> {
+    let tier = preflight_selected_recursive_block(classes, &job)?;
+    let _memory_reservation = governor.try_reserve_for_recursive_tier(tier.capacity())?;
+    prove_selected_recursive_block_after_admission(classes, job, tier)
+}
+
+/// Selected Block entry for an already-admitted history session.  The caller
+/// owns the full m24 reservation before artifact reconstruction, so this path
+/// must never attempt a tier-local reservation.
+fn prove_selected_recursive_block_in_reserved_session(
+    classes: &SelectedRecursiveBlockClasses<'_>,
+    job: SelectedRecursiveBlockJob<'_>,
+) -> Result<SelectedRecursiveBlockProof, SelectedRecursiveProverError> {
+    let tier = preflight_selected_recursive_block(classes, &job)?;
+    prove_selected_recursive_block_after_admission(classes, job, tier)
+}
+
+fn preflight_selected_recursive_block(
+    classes: &SelectedRecursiveBlockClasses<'_>,
+    job: &SelectedRecursiveBlockJob<'_>,
+) -> Result<SelectedRecursiveTier, SelectedRecursiveProverError> {
     let live_count = job.component_inputs.authorization_inputs.len();
     let tier = selected_recursive_tier(live_count)?;
     validate_selected_carrier_shape(
@@ -690,9 +785,16 @@ fn prove_selected_recursive_block_with_governor(
             tier: tier.capacity(),
             source,
         })?;
+    Ok(tier)
+}
 
-    let _memory_reservation = governor.try_reserve_for_recursive_tier(tier.capacity())?;
-
+/// The byte-for-byte cryptographic Block path shared by standalone and
+/// session-level admission.
+fn prove_selected_recursive_block_after_admission(
+    classes: &SelectedRecursiveBlockClasses<'_>,
+    job: SelectedRecursiveBlockJob<'_>,
+    tier: SelectedRecursiveTier,
+) -> Result<SelectedRecursiveBlockProof, SelectedRecursiveProverError> {
     validate_authorization_body_bindings(
         &job.component_inputs.authorization_inputs,
         &job.component_inputs.tx_body_inputs,
@@ -909,6 +1011,56 @@ mod tests {
         atomic::{AtomicBool, Ordering},
         Arc,
     };
+
+    #[test]
+    fn selected_history_session_maps_pressure_excludes_overlap_and_reopens() {
+        let undersized = ProofMemoryGovernor::new(4 * 1024);
+        assert!(matches!(
+            begin_selected_history_proof_session_with_available(&undersized, None),
+            Err(SelectedRecursiveProverError::MemoryPressure {
+                required_mib: 8192,
+                available_mib: 4096,
+            })
+        ));
+
+        let governor = ProofMemoryGovernor::new(8 * 1024);
+        let session = begin_selected_history_proof_session_with_available(&governor, None)
+            .expect("full m24 session admission");
+        assert!(matches!(
+            governor.try_reserve_for_user_txs(1),
+            Err(ProofMemoryPressure {
+                required_mib: 2048,
+                available_mib: 0,
+            })
+        ));
+        assert!(matches!(
+            governor.try_reserve_for_recursive_tier(8),
+            Err(ProofMemoryPressure {
+                required_mib: 2048,
+                available_mib: 0,
+            })
+        ));
+        assert!(matches!(
+            governor.try_reserve_for_recursive_link(),
+            Err(ProofMemoryPressure {
+                required_mib: 8192,
+                available_mib: 0,
+            })
+        ));
+
+        drop(session);
+        assert!(begin_selected_history_proof_session_with_available(&governor, None).is_ok());
+
+        let unwind_governor = governor.clone();
+        let unwound = std::panic::catch_unwind(move || {
+            let _session =
+                begin_selected_history_proof_session_with_available(&unwind_governor, None)
+                    .expect("session admission before synthetic panic");
+            panic!("synthetic selected-history session panic");
+        });
+        assert!(unwound.is_err());
+        assert!(begin_selected_history_proof_session_with_available(&governor, None).is_ok());
+    }
 
     #[test]
     fn dispatches_all_four_canonical_tiers() {
@@ -1187,14 +1339,24 @@ mod tests {
     #[test]
     fn production_link_coordinator_uses_only_consuming_phased_api() {
         let source = include_str!("recursive_prover.rs");
-        let coordinator = source
+        let standalone = source
             .split("fn prove_selected_recursive_link_with_governor")
             .nth(1)
-            .expect("production Link coordinator")
+            .expect("standalone Link admission")
+            .split("fn prove_selected_recursive_link_in_reserved_session")
+            .next()
+            .expect("standalone admission boundary");
+        assert!(standalone.contains("try_reserve_for_recursive_link"));
+        assert!(standalone.contains("prove_selected_recursive_link_in_reserved_session"));
+
+        let coordinator = source
+            .split("fn prove_selected_recursive_link_in_reserved_session")
+            .nth(1)
+            .expect("reserved production Link coordinator")
             .split("fn map_sequential_link_error")
             .next()
             .expect("coordinator boundary");
-        assert!(coordinator.contains("try_reserve_for_recursive_link"));
+        assert!(!coordinator.contains("try_reserve"));
         assert!(coordinator.contains("begin_split_link_native_preparation"));
         assert!(coordinator.contains("run_sequential_matrix_phases"));
         assert!(coordinator.contains(".prepare_previous_link(class.genesis.as_ref())"));
@@ -1204,5 +1366,58 @@ mod tests {
         assert!(coordinator.contains("prove_built_split_link"));
         assert!(!coordinator.contains("build_split_link("));
         assert!(!coordinator.contains("SplitLinkInput"));
+    }
+
+    #[test]
+    fn reserved_session_paths_never_reenter_memory_governor() {
+        let source = include_str!("recursive_prover.rs");
+        let session_impl = source
+            .split("impl SelectedHistoryProofSession")
+            .nth(1)
+            .expect("selected-history session impl")
+            .split("pub fn begin_selected_history_proof_session")
+            .next()
+            .expect("session impl boundary");
+        assert!(session_impl.contains("&mut self"));
+        assert!(session_impl.contains("prove_selected_recursive_block_in_reserved_session"));
+        assert!(session_impl.contains("prove_selected_recursive_link_in_reserved_session"));
+        assert!(!session_impl.contains("try_reserve"));
+
+        let block_reserved = source
+            .split("fn prove_selected_recursive_block_in_reserved_session")
+            .nth(1)
+            .expect("reserved Block path")
+            .split("fn preflight_selected_recursive_block")
+            .next()
+            .expect("reserved Block boundary");
+        assert!(!block_reserved.contains("try_reserve"));
+
+        let block_body = source
+            .split("fn preflight_selected_recursive_block")
+            .nth(1)
+            .expect("reserved Block preflight/body")
+            .split("fn build_and_prove_selected")
+            .next()
+            .expect("reserved Block body boundary");
+        assert!(!block_body.contains("try_reserve"));
+
+        let link_reserved = source
+            .split("fn prove_selected_recursive_link_in_reserved_session")
+            .nth(1)
+            .expect("reserved Link path")
+            .split("fn map_sequential_link_error")
+            .next()
+            .expect("reserved Link boundary");
+        assert!(!link_reserved.contains("try_reserve"));
+
+        let declaration = source
+            .split("pub struct SelectedHistoryProofSession")
+            .next()
+            .expect("session declaration prefix")
+            .rsplit_once('\n')
+            .map(|(prefix, _)| prefix)
+            .unwrap_or_default();
+        let declaration_tail = &declaration[declaration.len().saturating_sub(160)..];
+        assert!(!declaration_tail.contains("derive(Clone"));
     }
 }

@@ -26,6 +26,10 @@ const B255_PEAK_MIB: usize = 8 * 1024;
 /// only one transient fold matrix resident, but trace assembly/proving still
 /// requires the measured m24 admission envelope.
 const RECURSIVE_LINK_PEAK_MIB: usize = B255_PEAK_MIB;
+/// A selected-history session spans artifact reconstruction, one selected
+/// Block proof, and its following Link proof.  Its admission must therefore
+/// cover the largest phase for the entire sequence, regardless of Block tier.
+const SELECTED_HISTORY_SESSION_PEAK_MIB: usize = RECURSIVE_LINK_PEAK_MIB;
 
 /// Never let proof admission consume the complete host-visible allowance.
 const MIN_NODE_RESERVE_MIB: usize = 1024;
@@ -149,6 +153,18 @@ impl ProofMemoryGovernor {
         self.try_reserve_required_mib(RECURSIVE_LINK_PEAK_MIB, system_available_memory_mib())
     }
 
+    /// Reserve the complete m24/8 GiB envelope for one sequential selected
+    /// history session.  The owning session acquires this before reconstructing
+    /// accepted-block artifacts and retains it through both Block and Link.
+    pub(crate) fn try_reserve_for_selected_history_session(
+        &self,
+    ) -> Result<ProofMemoryReservation, ProofMemoryPressure> {
+        self.try_reserve_required_mib(
+            SELECTED_HISTORY_SESSION_PEAK_MIB,
+            system_available_memory_mib(),
+        )
+    }
+
     fn try_reserve_with_available(
         &self,
         user_txs: usize,
@@ -169,6 +185,14 @@ impl ProofMemoryGovernor {
     ) -> Result<ProofMemoryReservation, ProofMemoryPressure> {
         let required_mib = recursive_proof_peak_mib(tier).unwrap_or(usize::MAX);
         self.try_reserve_required_mib(required_mib, available_mib)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_reserve_selected_history_with_available(
+        &self,
+        available_mib: Option<usize>,
+    ) -> Result<ProofMemoryReservation, ProofMemoryPressure> {
+        self.try_reserve_required_mib(SELECTED_HISTORY_SESSION_PEAK_MIB, available_mib)
     }
 
     fn try_reserve_required_mib(
@@ -377,6 +401,63 @@ mod tests {
             }
         );
         drop(reservation);
+    }
+
+    #[test]
+    fn selected_history_session_excludes_all_proof_workers_until_drop() {
+        let governor = ProofMemoryGovernor::new(SELECTED_HISTORY_SESSION_PEAK_MIB);
+        let session = governor
+            .try_reserve_selected_history_with_available(None)
+            .expect("full selected-history session admission");
+
+        assert_eq!(
+            governor
+                .try_reserve_with_available(1, None)
+                .expect_err("native proof cannot overlap selected history"),
+            ProofMemoryPressure {
+                required_mib: B8_PEAK_MIB,
+                available_mib: 0,
+            }
+        );
+        assert_eq!(
+            governor
+                .try_reserve_recursive_with_available(8, None)
+                .expect_err("standalone Block cannot overlap selected history"),
+            ProofMemoryPressure {
+                required_mib: B8_PEAK_MIB,
+                available_mib: 0,
+            }
+        );
+        assert_eq!(
+            governor
+                .try_reserve_required_mib(RECURSIVE_LINK_PEAK_MIB, None)
+                .expect_err("standalone Link cannot overlap selected history"),
+            ProofMemoryPressure {
+                required_mib: RECURSIVE_LINK_PEAK_MIB,
+                available_mib: 0,
+            }
+        );
+
+        drop(session);
+        assert!(governor
+            .try_reserve_recursive_with_available(8, None)
+            .is_ok());
+    }
+
+    #[test]
+    fn selected_history_reservation_releases_during_unwind() {
+        let governor = ProofMemoryGovernor::new(SELECTED_HISTORY_SESSION_PEAK_MIB);
+        let unwind_governor = governor.clone();
+        let unwound = std::panic::catch_unwind(move || {
+            let _session = unwind_governor
+                .try_reserve_selected_history_with_available(None)
+                .expect("selected-history reservation before panic");
+            panic!("synthetic selected-history worker panic");
+        });
+        assert!(unwound.is_err());
+        assert!(governor
+            .try_reserve_selected_history_with_available(None)
+            .is_ok());
     }
 
     #[test]

@@ -46,8 +46,9 @@ pub mod template;
 pub use miner::{BlockAppliedHook, BlockMiner, MinerConfig, MinerEvent};
 pub use pow::{search_pow_parallel, PowSolution};
 pub use recursive_prover::{
-    prove_selected_recursive_block, prove_selected_recursive_link, selected_recursive_tier,
-    LoadedSelectedRecursiveMatrix, SelectedRecursiveBlockClasses, SelectedRecursiveBlockJob,
+    begin_selected_history_proof_session, prove_selected_recursive_block,
+    prove_selected_recursive_link, selected_recursive_tier, LoadedSelectedRecursiveMatrix,
+    SelectedHistoryProofSession, SelectedRecursiveBlockClasses, SelectedRecursiveBlockJob,
     SelectedRecursiveBlockProof, SelectedRecursiveLinkClasses, SelectedRecursiveLinkJob,
     SelectedRecursiveLinkPredecessor, SelectedRecursiveLinkProof, SelectedRecursiveMatrixKind,
     SelectedRecursiveMatrixRequest, SelectedRecursiveMatrixSource, SelectedRecursiveProverError,
