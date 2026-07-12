@@ -10,7 +10,10 @@
 //! declared length is checked before any payload allocation and payload bytes
 //! are read directly into the vectors delivered to the node.
 
-use std::io;
+use std::{
+    io,
+    sync::{Arc, OnceLock},
+};
 
 use async_trait::async_trait;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -36,20 +39,26 @@ pub const INBOUND_BLOCK_SYNC_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 /// Block-sync codec with a canonical, allocation-bounded wire format.
 #[derive(Debug, Clone)]
 pub struct BlockSyncCodec {
-    inbound_budget: std::sync::Arc<tokio::sync::Semaphore>,
+    inbound_budget: Arc<tokio::sync::Semaphore>,
     outbound_budget: OutboundResponseBudget,
 }
 
 impl Default for BlockSyncCodec {
     fn default() -> Self {
-        Self::with_inbound_budget(INBOUND_BLOCK_SYNC_BUDGET_BYTES)
+        static INBOUND_BUDGET: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+        Self {
+            inbound_budget: Arc::clone(INBOUND_BUDGET.get_or_init(|| {
+                Arc::new(tokio::sync::Semaphore::new(INBOUND_BLOCK_SYNC_BUDGET_BYTES))
+            })),
+            outbound_budget: OutboundResponseBudget::process_global(),
+        }
     }
 }
 
 impl BlockSyncCodec {
     fn with_inbound_budget(bytes: usize) -> Self {
         Self {
-            inbound_budget: std::sync::Arc::new(tokio::sync::Semaphore::new(bytes)),
+            inbound_budget: Arc::new(tokio::sync::Semaphore::new(bytes)),
             outbound_budget: OutboundResponseBudget::process_global(),
         }
     }
@@ -190,7 +199,7 @@ impl BlockSyncCodec {
     async fn acquire_inbound_permit(
         &self,
         lengths: ResponseLengths,
-    ) -> io::Result<Option<std::sync::Arc<tokio::sync::OwnedSemaphorePermit>>> {
+    ) -> io::Result<Option<Arc<tokio::sync::OwnedSemaphorePermit>>> {
         let bytes = if lengths.block_len == NONE_LEN {
             0
         } else {
@@ -210,7 +219,7 @@ impl BlockSyncCodec {
             .acquire_many_owned(permits)
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "block-sync budget closed"))?;
-        Ok(Some(std::sync::Arc::new(permit)))
+        Ok(Some(Arc::new(permit)))
     }
 }
 
@@ -330,6 +339,8 @@ fn invalid_data(message: &str) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use futures::io::Cursor;
     use libp2p::request_response::Codec;
 
@@ -347,6 +358,13 @@ mod tests {
         header[16..20].copy_from_slice(&proof_len.to_le_bytes());
         header[20..24].copy_from_slice(&sidecar_len.to_le_bytes());
         header
+    }
+
+    #[test]
+    fn production_codecs_share_one_process_inbound_budget() {
+        let first = BlockSyncCodec::default();
+        let second = BlockSyncCodec::default();
+        assert!(Arc::ptr_eq(&first.inbound_budget, &second.inbound_budget));
     }
 
     #[tokio::test]

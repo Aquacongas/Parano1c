@@ -7,7 +7,10 @@
 //! are streamed directly from/to the response Vec, avoiding the second full
 //! serialization buffer used by the generic CBOR codec.
 
-use std::io;
+use std::{
+    io,
+    sync::{Arc, OnceLock},
+};
 
 use async_trait::async_trait;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -30,20 +33,28 @@ pub const INBOUND_STATE_SEGMENT_BUDGET_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct StateSegmentCodec {
-    inbound_budget: std::sync::Arc<tokio::sync::Semaphore>,
+    inbound_budget: Arc<tokio::sync::Semaphore>,
     outbound_budget: OutboundResponseBudget,
 }
 
 impl Default for StateSegmentCodec {
     fn default() -> Self {
-        Self::with_inbound_budget(INBOUND_STATE_SEGMENT_BUDGET_BYTES)
+        static INBOUND_BUDGET: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+        Self {
+            inbound_budget: Arc::clone(INBOUND_BUDGET.get_or_init(|| {
+                Arc::new(tokio::sync::Semaphore::new(
+                    INBOUND_STATE_SEGMENT_BUDGET_BYTES,
+                ))
+            })),
+            outbound_budget: OutboundResponseBudget::process_global(),
+        }
     }
 }
 
 impl StateSegmentCodec {
     fn with_inbound_budget(bytes: usize) -> Self {
         Self {
-            inbound_budget: std::sync::Arc::new(tokio::sync::Semaphore::new(bytes)),
+            inbound_budget: Arc::new(tokio::sync::Semaphore::new(bytes)),
             outbound_budget: OutboundResponseBudget::process_global(),
         }
     }
@@ -51,7 +62,7 @@ impl StateSegmentCodec {
     async fn acquire_inbound(
         &self,
         bytes: usize,
-    ) -> io::Result<Option<std::sync::Arc<tokio::sync::OwnedSemaphorePermit>>> {
+    ) -> io::Result<Option<Arc<tokio::sync::OwnedSemaphorePermit>>> {
         if bytes == 0 {
             return Ok(None);
         }
@@ -65,7 +76,7 @@ impl StateSegmentCodec {
             .map_err(|_| {
                 io::Error::new(io::ErrorKind::BrokenPipe, "state-segment budget closed")
             })?;
-        Ok(Some(std::sync::Arc::new(permit)))
+        Ok(Some(Arc::new(permit)))
     }
 }
 
@@ -290,6 +301,13 @@ mod tests {
         header[6] = eff_log;
         header[8..12].copy_from_slice(&encoded_len.to_le_bytes());
         header
+    }
+
+    #[test]
+    fn production_codecs_share_one_process_inbound_budget() {
+        let first = StateSegmentCodec::default();
+        let second = StateSegmentCodec::default();
+        assert!(Arc::ptr_eq(&first.inbound_budget, &second.inbound_budget));
     }
 
     struct GatedWriter {
