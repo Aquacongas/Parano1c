@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Production-disconnected recursive Phase-B upper/tail linkage.
+//! Production recursive Phase-B upper/tail linkage.
 //!
 //! The capsule publishes `upper[256]`, the contraction of the three HIGH
 //! bank variables at Phase A's terminal coordinates `s[8..11]`.  This trace

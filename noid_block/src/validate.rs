@@ -111,7 +111,7 @@ pub use noid_gkr::{
     CanonicalAuthorizationStatement, VerifiedAuthorization, VerifiedAuthorizationBatch,
 };
 
-pub type AuthorizationProof = noid_gkr::OwnerAuthProofKillShot;
+pub type AuthorizationProof = noid_gkr::zk_authorization::ZkAuthorizationProof;
 
 #[derive(Debug, Clone)]
 pub struct AcceptedBlockValidationArtifacts {
@@ -206,7 +206,9 @@ pub(crate) fn map_verify_authorization_error(
     tx_index: usize,
 ) -> VerifyBlockError {
     match error {
-        VerifyAuthorizationError::AuthProof => VerifyBlockError::AuthKillShot(tx_index),
+        VerifyAuthorizationError::AuthProof => {
+            VerifyBlockError::AuthorizationProofRejected(tx_index)
+        }
         VerifyAuthorizationError::OwnerAuthStatement(_)
         | VerifyAuthorizationError::PublicLogic(_) => VerifyBlockError::AuthSpineBridge(tx_index),
     }
@@ -561,13 +563,19 @@ fn build_exact_surface_for_block(
     block: &Block,
     state: &ChainState,
 ) -> Result<ExactActionSurface, VerifyBlockError> {
-    let mut surface_state = state.state.clone();
-    while surface_state.log_slots() < block.header.log_slots as usize {
-        surface_state.expand();
-    }
-    if surface_state.log_slots() != block.header.log_slots as usize {
+    let child_log_slots = block.header.log_slots as usize;
+    let mut expanded_state;
+    let surface_state = if state.state.log_slots() == child_log_slots {
+        &state.state
+    } else if state.state.log_slots().saturating_add(1) == child_log_slots {
+        // Expansion is rare.  Ordinary blocks borrow the resident state
+        // directly and allocate no second full segment image.
+        expanded_state = state.state.clone();
+        expanded_state.expand();
+        &expanded_state
+    } else {
         return Err(VerifyBlockError::ShapeMismatch);
-    }
+    };
 
     // Preserve the consensus block order exactly.  In particular the coinbase
     // is first, so its live outputs consume the first creation IDs.  Reordering
@@ -579,7 +587,7 @@ fn build_exact_surface_for_block(
         .map(|tx| tx.body.clone())
         .collect();
     let commitments: Vec<[u8; 32]> = bodies.iter().map(|body| body.claims_commitment()).collect();
-    build_exact_action_surface(&surface_state, &bodies, &commitments, state.alloc_counter)
+    build_exact_action_surface(surface_state, &bodies, &commitments, state.alloc_counter)
         .map_err(map_state_delta_error)
 }
 
@@ -817,9 +825,9 @@ pub fn accept_block_timeless_with_artifacts(
 /// authorization verifier.
 ///
 /// The batch replay (`verify_full_accepted_block_batch_native`) injects a
-/// tracing verifier here so each owner-auth killshot is verified exactly once,
-/// with its FS transcript captured for the recursive component inputs, instead
-/// of re-verifying the sidecar in a second pass.
+/// tracing verifier here so each selected authorization proof is verified exactly once,
+/// with its canonical public statement captured for the recursive component
+/// inputs, instead of reconstructing those statements in a second native pass.
 #[allow(clippy::too_many_arguments)]
 pub fn accept_block_timeless_with_artifacts_with_auth_verifier<V: AuthorizationVerifier>(
     block: &Block,
@@ -998,10 +1006,9 @@ fn accept_block_inner_with_artifacts<V: AuthorizationVerifier>(
     }
     let proof: BlockProof = bincode::deserialize(block_proof_bytes)
         .map_err(|_| FullValidationError::ZkProof(crate::VerifyBlockError::ShapeMismatch))?;
-    let sidecar: BlockAuthSidecar =
-        bincode::deserialize(block_auth_sidecar_bytes).map_err(|_| {
-            FullValidationError::ZkProof(crate::VerifyBlockError::AuthSidecarShapeMismatch)
-        })?;
+    let sidecar = BlockAuthSidecar::from_bytes(block_auth_sidecar_bytes).map_err(|_| {
+        FullValidationError::ZkProof(crate::VerifyBlockError::AuthSidecarShapeMismatch)
+    })?;
 
     validate_block_full_inner(
         block,

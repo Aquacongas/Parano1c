@@ -13,6 +13,7 @@ use noid_core::Block128;
 use crate::block_header::BlockHeader;
 use crate::checkpoint::{CheckpointCoverage, ImmutableCheckpointPackage};
 use crate::consensus::da_prune::BlockUndoLog;
+use crate::consensus::params::{BLOCK_MAX_ACTIONS, BLOCK_MAX_TXS};
 use crate::fri_state::SlotValue;
 use crate::header_anchor::HeaderChainAnchor;
 use crate::segmented_state::SegmentColumns;
@@ -203,6 +204,12 @@ pub fn decode_undo_log(bytes: &[u8]) -> Option<BlockUndoLog> {
     let alloc_counter_before = u64::from_le_bytes(bytes[20..28].try_into().ok()?);
     let n = u32::from_le_bytes(bytes[28..32].try_into().ok()?) as usize;
     let n_hashes = u32::from_le_bytes(bytes[32..36].try_into().ok()?) as usize;
+    // These lengths originate in a consensus-bounded block.  Reject corrupt
+    // storage before either the size arithmetic or the Vec reservations so a
+    // malformed MDBX value cannot turn restart/reorg into an allocation DoS.
+    if n > BLOCK_MAX_ACTIONS || n_hashes > BLOCK_MAX_TXS {
+        return None;
+    }
     let payload_min = 36usize
         .checked_add(n.checked_mul(52)?)?
         .checked_add(n_hashes.checked_mul(32)?)?;
@@ -585,6 +592,10 @@ mod tests {
         let mut malformed = bytes;
         malformed[28..32].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(decode_undo_log(&malformed).is_none());
+
+        let mut too_many_hashes = encode_undo_log(&BlockUndoLog::empty(42, 24));
+        too_many_hashes[32..36].copy_from_slice(&((BLOCK_MAX_TXS as u32) + 1).to_le_bytes());
+        assert!(decode_undo_log(&too_many_hashes).is_none());
     }
 
     #[test]

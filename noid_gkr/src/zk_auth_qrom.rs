@@ -2002,13 +2002,16 @@ pub fn conditional_selected_zk_auth_qrom_feasibility_ledger(
     Ok(ledger)
 }
 
-pub const ZK_AUTH_SELECTED_QROM_DIAGNOSTIC_TARGET_BITS: u32 = 80;
+pub const ZK_AUTH_SELECTED_QROM_DIAGNOSTIC_TARGET_BITS: u32 = 79;
 pub const ZK_AUTH_SELECTED_QROM_DIAGNOSTIC_QUERY_BUDGET_EXPONENT: u32 = 8;
 pub const ZK_AUTH_SELECTED_QROM_DIAGNOSTIC_LIFETIME_EXPONENT: u32 = 0;
 pub const ZK_AUTH_SELECTED_QROM_DIAGNOSTIC_ORACLE_OUTPUT_BITS: u32 = 128;
 
-/// An intentionally weak arithmetic screen, not a selected adversary budget
-/// or a deployment target.  It changes no capsule/PCS parameter.
+/// The selected executable arithmetic gate for the q64/rate-1/32 capsule.
+///
+/// This remains a pre-hidden-constant diagnostic rather than a claimed QROM
+/// work factor until the obligations recorded by this module are discharged.
+/// It changes no capsule/PCS geometry.
 pub fn conditional_selected_zk_auth_qrom_diagnostic(
 ) -> Result<ZkAuthConditionalQromFeasibilityLedger, ZkAuthQromFeasibilityError> {
     conditional_selected_zk_auth_qrom_feasibility_ledger(
@@ -3811,7 +3814,7 @@ mod tests {
     fn conditional_qrom_diagnostic_uses_exact_selected_base_error_and_fails_closed() {
         let ledger = conditional_selected_zk_auth_qrom_diagnostic()
             .expect("selected conditional QROM diagnostic");
-        assert_eq!(ledger.target_bits, 80);
+        assert_eq!(ledger.target_bits, 79);
         assert_eq!(ledger.oracle_query_budget_exponent, 8);
         assert_eq!(ledger.lifetime_union_exponent, 0);
         assert_eq!(ledger.oracle_output_bits, 128);
@@ -3834,7 +3837,7 @@ mod tests {
         assert!((ledger.diagnostic_preconstant_lifetime_union_bits() - 79.049_175_7).abs() < 1e-7);
         assert_eq!(
             ledger.status,
-            ZkAuthConditionalQromStatus::TheoremBoundCannotCertifyTarget
+            ZkAuthConditionalQromStatus::PreconstantScreenPassesButEvidenceIsIncomplete
         );
         assert_eq!(
             ledger.evidence,

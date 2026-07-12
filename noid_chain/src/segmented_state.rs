@@ -65,6 +65,7 @@ pub const MAX_SEGTREE_DEPTH: usize = 16;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExactStateReadError {
     EvictedSegment { seg_id: u16 },
+    SegmentRootMismatch { seg_id: u16 },
     SparseMerkle(SparseMerkleError),
 }
 
@@ -108,6 +109,9 @@ impl core::fmt::Display for ExactStateReadError {
         match self {
             Self::EvictedSegment { seg_id } => {
                 write!(f, "exact state rebuild needs evicted segment {seg_id}")
+            }
+            Self::SegmentRootMismatch { seg_id } => {
+                write!(f, "exact root summary mismatch for segment {seg_id}")
             }
             Self::SparseMerkle(err) => write!(f, "{err}"),
         }
@@ -343,6 +347,11 @@ pub struct SegmentedFriState {
     /// This set is NOT cleared by FRI-root recomputation — only by `clear_dirty()`.
     /// Used by the MDBX backend to decide which segments to persist on each block.
     mdbx_dirty: HashSet<u16>,
+    /// Segment payloads whose exact sparse-Merkle subtree root is stale in the
+    /// chain-level compact root cache.  Unlike the FRI dirty set this survives
+    /// FRI flushing and is cleared only after `ChainState` recomputes the exact
+    /// segment root from the resident columns.
+    exact_dirty: HashSet<u16>,
     /// Segment IDs that have been explicitly evicted from RAM but have non-zero
     /// data in MDBX. A segment in this set must be reloaded from MDBX before
     /// any slot within it can be read or written.
@@ -394,9 +403,41 @@ impl SegmentedFriState {
             tree_dirty: false,
             dirty: HashSet::new(),
             mdbx_dirty: HashSet::new(),
+            exact_dirty: HashSet::new(),
             evicted: HashSet::new(),
             dirty_tree_leaves: HashSet::new(),
         }
+    }
+
+    /// Clone only compact state metadata, dropping every resident 3 MiB column
+    /// payload.  The caller must use this only at a durable block boundary;
+    /// each live segment is marked evicted and can then be faulted in from
+    /// MDBX on demand.
+    pub(crate) fn durable_metadata_clone(&self) -> Option<Self> {
+        if !self.mdbx_dirty.is_empty() || !self.exact_dirty.is_empty() {
+            return None;
+        }
+        let mut evicted = self.evicted.clone();
+        for (index, live_count) in self.live_counts.iter().copied().enumerate() {
+            if live_count != 0 {
+                evicted.insert(index as u16);
+            }
+        }
+        Some(Self {
+            log_slots: self.log_slots,
+            effective_log_seg: self.effective_log_seg,
+            num_segments: self.num_segments,
+            segments: vec![None; self.num_segments],
+            seg_roots: self.seg_roots.clone(),
+            live_counts: self.live_counts.clone(),
+            tree: self.tree.clone(),
+            tree_dirty: self.tree_dirty,
+            dirty: self.dirty.clone(),
+            mdbx_dirty: HashSet::new(),
+            exact_dirty: HashSet::new(),
+            evicted,
+            dirty_tree_leaves: self.dirty_tree_leaves.clone(),
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -557,6 +598,7 @@ impl SegmentedFriState {
             self.seg_roots[seg_idx] = None;
             self.dirty.insert(seg);
             self.mdbx_dirty.insert(seg);
+            self.exact_dirty.insert(seg);
             self.tree_dirty = true;
         }
         Ok(())
@@ -675,18 +717,25 @@ impl SegmentedFriState {
         self.mdbx_dirty.clear();
     }
 
+    /// Exact-root cache entries that must be refreshed from resident columns.
+    pub(crate) fn exact_dirty_segment_ids(&self) -> impl Iterator<Item = u16> + '_ {
+        self.exact_dirty.iter().copied()
+    }
+
+    /// Mark exact-root summaries current after a successful bounded refresh.
+    pub(crate) fn clear_exact_dirty(&mut self) {
+        self.exact_dirty.clear();
+    }
+
     /// Directly install pre-loaded column data for a segment.
     ///
-    /// Used exclusively by the MDBX restore path to reload persisted segment
-    /// data without triggering the slot-by-slot `set_slot` path and without
-    /// marking the segment as MDBX-dirty (the data is already in MDBX).
+    /// Test-only materialized snapshot helper. Production restore/install uses
+    /// evicted summaries and never reconstructs all segment columns in RAM.
     ///
     /// The FRI root for this segment is invalidated and will be recomputed
     /// lazily on the next `root()` call.
     ///
-    /// Visibility is `pub(crate)` to prevent accidental misuse from outside
-    /// the storage layer — callers outside this crate must go through the
-    /// normal `set_slot` / `apply_delta` API.
+    #[cfg(test)]
     pub(crate) fn set_segment_columns(&mut self, seg_id: u16, cols: SegmentColumns) {
         let id = seg_id as usize;
         if id >= self.num_segments {
@@ -707,6 +756,7 @@ impl SegmentedFriState {
         self.tree_dirty = true;
         // Mark FRI-dirty (NOT mdbx_dirty: data is already in MDBX).
         self.dirty.insert(seg_id);
+        self.exact_dirty.insert(seg_id);
     }
 
     /// Segment IDs that currently contain at least one live UTXO.
@@ -878,6 +928,39 @@ impl SegmentedFriState {
         self.tree_dirty = true;
     }
 
+    /// Install the durable summary of a live segment without retaining its
+    /// 3 MiB column payload.  Startup/reorg recovery computes `segment_root`
+    /// while decoding one segment, then immediately drops the columns.
+    pub(crate) fn install_evicted_segment_summary(
+        &mut self,
+        seg_id: u16,
+        live_count: u32,
+        segment_root: StateRoot,
+    ) -> Result<(), &'static str> {
+        let id = seg_id as usize;
+        if id >= self.num_segments || live_count == 0 {
+            return Err("invalid durable segment summary");
+        }
+        self.segments[id] = None;
+        self.live_counts[id] = live_count;
+        self.seg_roots[id] = Some(segment_root);
+        self.evicted.insert(seg_id);
+        if self.num_segments > 1 {
+            self.tree[self.num_segments + id] = segment_root;
+            self.dirty_tree_leaves.insert(seg_id);
+            self.tree_dirty = true;
+        }
+        Ok(())
+    }
+
+    /// Finish a batch of summary installs and leave no false persistence dirt.
+    pub(crate) fn finish_evicted_segment_summaries(&mut self) {
+        self.flush_tree();
+        self.dirty.clear();
+        self.mdbx_dirty.clear();
+        self.exact_dirty.clear();
+    }
+
     /// Evict all segment columns that are not in the MDBX-dirty set.
     ///
     /// Call this AFTER `clear_dirty()` + a successful MDBX commit.
@@ -896,6 +979,22 @@ impl SegmentedFriState {
                 self.segments[id] = None;
                 self.evicted.insert(seg_id);
                 // seg_roots[id] stays valid.
+            }
+        }
+    }
+
+    /// Drop every live column payload after its enclosing MDBX transaction has
+    /// committed.  Exact roots remain available through `ChainState`'s compact
+    /// hierarchy; any later raw/FRI access must hydrate the segment first.
+    pub fn evict_all_persisted_segments(&mut self) {
+        assert!(
+            self.mdbx_dirty.is_empty(),
+            "cannot evict segments before durable dirty tracking is cleared"
+        );
+        for id in 0..self.num_segments {
+            if self.segments[id].is_some() && self.live_counts[id] != 0 {
+                self.segments[id] = None;
+                self.evicted.insert(id as u16);
             }
         }
     }
@@ -1042,6 +1141,7 @@ impl SegmentedFriState {
             }
             self.seg_roots[0] = None;
             self.dirty.insert(0);
+            self.exact_dirty.insert(0);
             self.tree_dirty = true;
             self.flush_all_dirty();
             return;
@@ -1126,6 +1226,7 @@ impl SegmentedFriState {
                 self.seg_roots[0] = None;
                 self.dirty.insert(0);
                 self.mdbx_dirty.insert(0);
+                self.exact_dirty.insert(0);
                 self.tree_dirty = true;
                 self.flush_all_dirty();
                 continue;
@@ -1150,6 +1251,8 @@ impl SegmentedFriState {
             self.evicted.retain(|id| (*id as usize) < new_num_segments);
             self.dirty.retain(|id| (*id as usize) < new_num_segments);
             self.mdbx_dirty
+                .retain(|id| (*id as usize) < new_num_segments);
+            self.exact_dirty
                 .retain(|id| (*id as usize) < new_num_segments);
             self.dirty_tree_leaves
                 .retain(|id| (*id as usize) < new_num_segments);
@@ -1186,6 +1289,10 @@ impl SegmentedFriState {
         if !self.dirty.contains(&seg_id) && self.seg_roots[seg_id as usize].is_some() {
             return;
         }
+        assert!(
+            !self.evicted.contains(&seg_id),
+            "FRI root requested for evicted segment {seg_id}; hydrate it first"
+        );
         let id = seg_id as usize;
         let eff = self.effective_log_seg;
         let seg_root = match &self.segments[id] {

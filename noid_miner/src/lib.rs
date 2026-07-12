@@ -37,12 +37,19 @@
 //! the coinbase without regenerating the block certificate — the miner only
 //! brute-forces the nonce.
 
+mod memory_governor;
 pub mod miner;
 pub mod pow;
+pub mod recursive_prover;
 pub mod template;
 
 pub use miner::{BlockAppliedHook, BlockMiner, MinerConfig, MinerEvent};
 pub use pow::{search_pow_parallel, PowSolution};
+pub use recursive_prover::{
+    prove_selected_recursive_block, selected_recursive_tier, SelectedRecursiveBlockClasses,
+    SelectedRecursiveBlockJob, SelectedRecursiveBlockProof, SelectedRecursiveProverError,
+    SelectedRecursiveTier,
+};
 pub use template::{BlockTemplate, TemplateBuilder, TemplateRefreshTrigger};
 
 pub type ProvedBlockParts = (Vec<u8>, Vec<u8>);

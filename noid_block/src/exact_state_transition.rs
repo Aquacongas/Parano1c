@@ -13,9 +13,9 @@ use noid_chain::exact_state_hash::{slot_leaf_hash, state_node_hash, zero_slot_ro
 use noid_chain::fri_state::SlotValue;
 use noid_chain::sparse_merkle::{
     build_multiproof, derive_structural_frontier_plan, evaluate_structural_frontier,
-    expand_multiproof_paths, maximum_sibling_count_with_segment_cap, ExpandedMerklePath,
-    SparseMerkleCache, SparseMerkleError, StructuralFrontierEvaluation, StructuralFrontierPlan,
-    StructuralNodeRef, STRUCTURAL_FRONTIER_PAD,
+    expand_multiproof_paths, frontier_sibling_positions, maximum_sibling_count_with_segment_cap,
+    ExpandedMerklePath, SparseMerkleCache, SparseMerkleError, StructuralFrontierEvaluation,
+    StructuralFrontierPlan, StructuralNodeRef, STRUCTURAL_FRONTIER_PAD,
 };
 use noid_chain::state_delta::ExactActionSurface;
 use noid_core::{Block128, TowerField};
@@ -245,6 +245,32 @@ pub fn build_exact_state_transition_proof(
     Ok(ExactStateTransitionProof {
         slot_siblings: proof.siblings,
     })
+}
+
+/// Seal a canonical sibling frontier produced by a bounded chain-state reader.
+/// This performs the same surface, length and consensus-cap checks as the
+/// full-cache builder without requiring a global sparse-node map.
+pub fn build_exact_state_transition_proof_from_siblings(
+    surface: &ExactActionSurface,
+    slot_siblings: Vec<StateHash>,
+    depth: u32,
+) -> Result<ExactStateTransitionProof, ExactStateTransitionError> {
+    validate_surface(surface)?;
+    let expected = frontier_sibling_positions(&surface.touched_indices, depth)?.len();
+    if slot_siblings.len() != expected {
+        return Err(ExactStateTransitionError::SparseMerkle(
+            SparseMerkleError::ProofLengthMismatch {
+                expected,
+                actual: slot_siblings.len(),
+            },
+        ));
+    }
+    if slot_siblings.len() > MAX_EXACT_SLOT_SIBLINGS {
+        return Err(ExactStateTransitionError::ProofTooLarge {
+            siblings: slot_siblings.len(),
+        });
+    }
+    Ok(ExactStateTransitionProof { slot_siblings })
 }
 
 /// Derive and fully bind the old/new EXSTNOD path statements.

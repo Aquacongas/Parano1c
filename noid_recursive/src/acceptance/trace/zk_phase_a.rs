@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Production-disconnected recursive verifier trace for capsule Phase A.
+//! Production recursive verifier trace for capsule Phase A.
 //!
 //! This is the fixed-shape arithmetic twin of
 //! [`noid_fri_binius::zk_phase_a::verify_phase_a`], excluding transcript

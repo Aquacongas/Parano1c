@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Production-disconnected trace for the owner-capsule post-claim relation.
+//! Production trace for the owner-capsule post-claim relation.
 //!
 //! The AuthGKR exposes five ZK-padded operand evaluations and two Libra-mask
 //! evaluations.

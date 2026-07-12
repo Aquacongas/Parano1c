@@ -81,6 +81,9 @@ impl std::error::Error for AcceptedBlockCertificateRecordError {}
 pub struct AcceptedBlockPostValidationBundle {
     pub history_claim_fields: Vec<noid_core::Block128>,
     pub acceptance_receipt: BlockProofAcceptanceReceipt,
+    /// Reused by the retained prover in this crate so it does not rebuild the
+    /// accepted-block resource/context transcript after native acceptance.
+    pub(crate) accepted_claim_transcript: AcceptedBlockClaimTranscript,
 }
 
 struct AcceptedBlockReceiptDerivedValues {
@@ -142,7 +145,7 @@ fn derive_accepted_block_receipt_values(
     } else {
         let proof = bincode::deserialize::<BlockProof>(block_proof_bytes)
             .map_err(|_| VerifyBlockError::ShapeMismatch)?;
-        let sidecar = bincode::deserialize::<BlockAuthSidecar>(block_auth_sidecar_bytes)
+        let sidecar = BlockAuthSidecar::from_bytes(block_auth_sidecar_bytes)
             .map_err(|_| VerifyBlockError::AuthSidecarShapeMismatch)?;
         if proof.meta.prev_block_state_root != parent.state_root {
             return Err(VerifyBlockError::PrevStateRootMismatch);
@@ -266,6 +269,7 @@ pub fn accepted_block_post_validation_bundle(
     Ok(AcceptedBlockPostValidationBundle {
         history_claim_fields,
         acceptance_receipt,
+        accepted_claim_transcript: derived.transcript,
     })
 }
 
@@ -355,6 +359,7 @@ pub fn verify_accepted_block_certificate_statement_native(
 mod tests {
     use super::*;
     use noid_chain::{build_exact_action_surface, compute_tx_root, ChainState, SlotValue};
+    use noid_core::TowerField;
     use noid_poseidon2b::primitives::Address;
     use noid_tx::{
         output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS,
@@ -491,11 +496,12 @@ mod tests {
                 state_transition,
             );
             let sidecar = BlockAuthSidecar {
-                tx_auth: vec![noid_gkr::ghost_tx::ghost_authorization().0.clone()],
+                tx_auth: vec![noid_gkr::ghost_tx::prove_selected_ghost_authorization()
+                    .expect("fresh selected ghost authorization")],
             };
             (
                 bincode::serialize(&proof).expect("serialize block proof"),
-                bincode::serialize(&sidecar).expect("serialize auth sidecar"),
+                sidecar.to_bytes().expect("serialize auth sidecar"),
             )
         } else {
             (Vec::new(), Vec::new())
@@ -514,6 +520,30 @@ mod tests {
             auth_sidecar_bytes,
             artifacts,
         }
+    }
+
+    #[test]
+    fn selected_sidecar_verifies_the_canonical_block_statement_and_rejects_tamper() {
+        let fixture = post_validation_fixture(true);
+        let sidecar = BlockAuthSidecar::from_bytes(&fixture.auth_sidecar_bytes)
+            .expect("bounded selected sidecar decode");
+        crate::validate_block_authorizations(
+            &fixture.block,
+            &sidecar,
+            &crate::OwnerAuthAuthorizationVerifier,
+        )
+        .expect("selected authorization verifies against canonical block body");
+
+        let mut tampered = sidecar;
+        tampered.tx_auth[0].owner.mask_mu += noid_core::Block128::ONE;
+        assert!(matches!(
+            crate::validate_block_authorizations(
+                &fixture.block,
+                &tampered,
+                &crate::OwnerAuthAuthorizationVerifier,
+            ),
+            Err(crate::VerifyBlockError::AuthorizationProofRejected(1))
+        ));
     }
 
     fn assert_post_validation_bundle_parity(fixture: &PostValidationFixture) {

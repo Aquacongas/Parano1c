@@ -198,7 +198,10 @@ mod tests {
     use super::*;
     use noid_chain::BlockHeader;
     use noid_core::TowerField;
-    use noid_gkr::OwnerAuthWitness;
+    use noid_gkr::{
+        owner_auth_gkr_channel, owner_auth_trace_inputs_from_body_and_secret,
+        prove_owner_auth_killshot,
+    };
     use noid_poseidon2b::primitives::{derive_address, Address, SpendSecret};
     use noid_tx::{
         output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS,
@@ -258,9 +261,11 @@ mod tests {
     fn authorization_batch_accepts_and_rejects_tamper() {
         let (body, secret) = body_and_secret();
         let raw_secret = secret.0;
-        let proof = noid_gkr::prove_wallet_authorization(&body, OwnerAuthWitness::new(secret))
-            .expect("wallet auth")
-            .proof;
+        let auth_inputs = owner_auth_trace_inputs_from_body_and_secret(&body, &secret)
+            .expect("legacy trace fixture inputs");
+        let circuit = OwnerAuthCircuit::build();
+        let mut channel = owner_auth_gkr_channel();
+        let (proof, _) = prove_owner_auth_killshot(&circuit, &auth_inputs, &mut channel);
         let block = block(tx(body));
 
         let verified = verify_authorization_batch_native(&block, std::slice::from_ref(&proof))

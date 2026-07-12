@@ -10,7 +10,7 @@
 //! The core operation is `commit_block`, which writes all block-related data in
 //! one atomic MDBX transaction.
 
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 use libmdbx::{Database, DatabaseOptions, Mode, NoWriteMap, TableFlags, WriteFlags};
 use noid_poseidon2b::primitives::TxBodyHash;
@@ -20,11 +20,14 @@ use crate::block_header::BlockHeader;
 use crate::checkpoint::{CheckpointCoverage, ImmutableCheckpointPackage};
 use crate::consensus::da_prune::BlockUndoLog;
 use crate::consensus::params::{RECENT_BLOCK_RETENTION_DEPTH, UNDO_RETENTION_DEPTH};
+use crate::exact_state_hash::slot_leaf_hash;
+use crate::fri_state::{compute_segment_root, SlotValue};
 use crate::header_anchor::{
     compute_header_chain_anchor, extend_header_chain_anchor, HeaderChainAnchor,
     HeaderChainAnchorError,
 };
 use crate::segmented_state::SegmentColumns;
+use crate::state::{exact_segment_root_from_columns, ChainState, StreamingSparseRoot};
 use crate::storage::meta::ConsensusMeta;
 use crate::storage::serial::{
     decode_chain_tip, decode_chain_work, decode_checkpoint_coverage, decode_checkpoint_package,
@@ -34,6 +37,7 @@ use crate::storage::serial::{
     encode_header_chain_anchor, encode_segment, encode_state_meta, encode_tx_index_value,
     encode_undo_log, u64_from_key, u64_key,
 };
+use crate::storage::snapshot_staging::{FinalizedSnapshotStaging, SnapshotStagingError};
 
 // ---------------------------------------------------------------------------
 // Table names
@@ -69,11 +73,13 @@ const T_ACCEPTED_BLOCK_BATCH_CERTIFICATE_PACKAGES: &str =
 /// Verified recursive checkpoint head records.
 /// Key: checkpoint height (u64 LE). Value: raw bincode bytes owned by noid_recursive.
 const T_HISTORY_CHECKPOINT_HEADS: &str = "history_checkpoint_heads";
-/// Owner UTXO index. Key: owner[32]. Value: packed
-/// `(slot:u32, packed_value:u128)[]` records. `packed_value` contains both the
-/// amount and the allocation-counter creation id, so an index lookup can be
-/// checked exactly against the durable state segment before it is exposed.
-/// Maintained incrementally in `commit_block`.
+/// Owner UTXO index. Key: `owner[32] || slot_be[4]`. Value:
+/// `packed_value_le[16]`. `packed_value` contains both the amount and the
+/// allocation-counter creation id, so an index lookup can be checked exactly
+/// against the durable state segment before it is exposed.  One MDBX record
+/// per live slot avoids ever materializing one owner's complete UTXO set while
+/// updating or rebuilding the index. Maintained incrementally in
+/// `commit_block`.
 const T_OWNER_INDEX: &str = "owner_idx";
 /// Immutable checkpoint package. Key: checkpoint height (u64 LE).
 const T_CHECKPOINT_PACKAGES: &str = "checkpoint_packages";
@@ -96,6 +102,7 @@ pub enum StoreError {
     Mdbx(libmdbx::Error),
     Decode(&'static str),
     HeaderAnchor(HeaderChainAnchorError),
+    SnapshotStaging(SnapshotStagingError),
 }
 
 impl std::fmt::Display for StoreError {
@@ -104,11 +111,21 @@ impl std::fmt::Display for StoreError {
             Self::Mdbx(e) => write!(f, "mdbx: {e}"),
             Self::Decode(ctx) => write!(f, "decode error: {ctx}"),
             Self::HeaderAnchor(e) => write!(f, "header anchor: {e}"),
+            Self::SnapshotStaging(e) => write!(f, "snapshot staging: {e}"),
         }
     }
 }
 
-impl std::error::Error for StoreError {}
+impl std::error::Error for StoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Mdbx(error) => Some(error),
+            Self::HeaderAnchor(error) => Some(error),
+            Self::SnapshotStaging(error) => Some(error),
+            Self::Decode(_) => None,
+        }
+    }
+}
 
 impl From<libmdbx::Error> for StoreError {
     fn from(e: libmdbx::Error) -> Self {
@@ -122,25 +139,27 @@ impl From<HeaderChainAnchorError> for StoreError {
     }
 }
 
+impl From<SnapshotStagingError> for StoreError {
+    fn from(e: SnapshotStagingError) -> Self {
+        Self::SnapshotStaging(e)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // MdbxStore
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub struct MdbxStore {
-    db: Database<NoWriteMap>,
+    db: Arc<Database<NoWriteMap>>,
 }
 
 // ---------------------------------------------------------------------------
 // Owner index helpers
 // ---------------------------------------------------------------------------
 
-const OWNER_INDEX_RECORD_BYTES: usize = 4 + 16;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct OwnerIndexEntry {
-    slot_index: u32,
-    packed_value: u128,
-}
+const OWNER_INDEX_KEY_BYTES: usize = 32 + 4;
+const OWNER_INDEX_VALUE_BYTES: usize = 16;
 
 /// One owner-index entry after exact verification against the durable state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,6 +183,34 @@ pub struct VerifiedOwnerSnapshot {
     pub utxos: Vec<VerifiedOwnerUtxo>,
 }
 
+/// Detached proof material committed atomically with one accepted block.
+///
+/// The byte payloads remain owned by the block/recursive crates so the chain
+/// store does not depend on their proof types.  An empty proof/sidecar pair is
+/// canonical for a coinbase-only block and deletes any stale same-height
+/// payload left by a reverted branch.  History and certificate bytes are
+/// mandatory for every accepted non-genesis block.
+#[derive(Debug, Clone, Copy)]
+pub struct AcceptedBlockCommitData<'a> {
+    pub block_proof_bytes: &'a [u8],
+    pub block_auth_sidecar_bytes: &'a [u8],
+    pub history_claim_bytes: &'a [u8],
+    pub accepted_block_certificate_bytes: &'a [u8],
+}
+
+/// Owned per-block material accumulated while a replacement branch is fully
+/// validated in RAM.  `commit_reorg` writes the entire vector together with
+/// the final exact state in one MDBX transaction.
+#[derive(Debug, Clone)]
+pub(crate) struct StagedAcceptedBlockCommit {
+    pub header: BlockHeader,
+    pub hash: [u8; 32],
+    pub cumulative_chainwork: [u8; 32],
+    pub undo_log: BlockUndoLog,
+    pub history_claim_bytes: Vec<u8>,
+    pub accepted_block_certificate_bytes: Vec<u8>,
+}
+
 /// Extract the 32-byte owner key from a slot's owner fields.
 #[inline]
 fn owner_key_from_fields(owner_hi: noid_core::Block128, owner_lo: noid_core::Block128) -> [u8; 32] {
@@ -173,57 +220,48 @@ fn owner_key_from_fields(owner_hi: noid_core::Block128, owner_lo: noid_core::Blo
     key
 }
 
-/// Encode a strictly sorted, duplicate-free owner index value.
-fn encode_owner_entries(entries: &[OwnerIndexEntry]) -> Result<Vec<u8>, StoreError> {
-    if entries.is_empty() {
-        return Err(StoreError::Decode("empty owner-index value"));
-    }
-    if !entries
-        .windows(2)
-        .all(|pair| pair[0].slot_index < pair[1].slot_index)
-    {
-        return Err(StoreError::Decode(
-            "owner-index slots are not strictly sorted and unique",
-        ));
-    }
-    let capacity = entries
-        .len()
-        .checked_mul(OWNER_INDEX_RECORD_BYTES)
-        .ok_or(StoreError::Decode("owner-index encoded length overflow"))?;
-    let mut buf = Vec::with_capacity(capacity);
-    for entry in entries {
-        buf.extend_from_slice(&entry.slot_index.to_le_bytes());
-        buf.extend_from_slice(&entry.packed_value.to_le_bytes());
-    }
-    Ok(buf)
+#[inline]
+fn owner_index_key(owner: &[u8; 32], slot_index: u32) -> [u8; OWNER_INDEX_KEY_BYTES] {
+    let mut key = [0u8; OWNER_INDEX_KEY_BYTES];
+    key[..32].copy_from_slice(owner);
+    // Big endian is consensus-adjacent storage canonicalization: MDBX prefix
+    // iteration is then also strictly increasing by physical slot.
+    key[32..].copy_from_slice(&slot_index.to_be_bytes());
+    key
 }
 
-/// Decode the only accepted pre-launch owner-index format. There is
-/// deliberately no legacy 12-byte amount-only decoder.
-fn decode_owner_entries(bytes: &[u8]) -> Result<Vec<OwnerIndexEntry>, StoreError> {
-    if bytes.is_empty() {
-        return Err(StoreError::Decode("empty owner-index value"));
+/// Decode the only accepted pre-launch owner-index key format. There is no
+/// aggregate `owner -> Vec<entry>` legacy decoder.
+#[inline]
+fn decode_owner_index_key(bytes: &[u8]) -> Result<([u8; 32], u32), StoreError> {
+    if bytes.len() != OWNER_INDEX_KEY_BYTES {
+        return Err(StoreError::Decode("invalid owner-index key length"));
     }
-    if bytes.len() % OWNER_INDEX_RECORD_BYTES != 0 {
-        return Err(StoreError::Decode("invalid owner-index encoded length"));
-    }
+    let mut owner = [0u8; 32];
+    owner.copy_from_slice(&bytes[..32]);
+    let slot_index = u32::from_be_bytes(bytes[32..].try_into().unwrap());
+    Ok((owner, slot_index))
+}
 
-    let mut entries = Vec::with_capacity(bytes.len() / OWNER_INDEX_RECORD_BYTES);
-    for chunk in bytes.chunks_exact(OWNER_INDEX_RECORD_BYTES) {
-        entries.push(OwnerIndexEntry {
-            slot_index: u32::from_le_bytes(chunk[..4].try_into().unwrap()),
-            packed_value: u128::from_le_bytes(chunk[4..20].try_into().unwrap()),
-        });
+#[inline]
+fn encode_owner_index_value(packed_value: u128) -> [u8; OWNER_INDEX_VALUE_BYTES] {
+    packed_value.to_le_bytes()
+}
+
+#[inline]
+fn decode_owner_index_value(bytes: &[u8]) -> Result<u128, StoreError> {
+    if bytes.len() != OWNER_INDEX_VALUE_BYTES {
+        return Err(StoreError::Decode("invalid owner-index value length"));
     }
-    if !entries
-        .windows(2)
-        .all(|pair| pair[0].slot_index < pair[1].slot_index)
-    {
-        return Err(StoreError::Decode(
-            "owner-index slots are not strictly sorted and unique",
-        ));
+    Ok(u128::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+fn sort_unique_segment_ids(mut segment_ids: Vec<u16>) -> Result<Vec<u16>, StoreError> {
+    segment_ids.sort_unstable();
+    if segment_ids.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(StoreError::Decode("duplicate stored segment key"));
     }
-    Ok(entries)
+    Ok(segment_ids)
 }
 
 #[inline]
@@ -231,6 +269,50 @@ fn segment_columns_empty(cols: &SegmentColumns) -> bool {
     cols.values.iter().all(|v| v.0 == 0)
         && cols.owners_hi.iter().all(|v| v.0 == 0)
         && cols.owners_lo.iter().all(|v| v.0 == 0)
+}
+
+/// Stream every live owner-index record in one segment without building an
+/// owner map or a segment-sized side vector.
+fn visit_live_owner_records(
+    segment_id: u16,
+    effective_log: u8,
+    columns: &SegmentColumns,
+    mut visitor: impl FnMut([u8; 32], u32, u128) -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
+    if columns.values.len() != columns.owners_hi.len()
+        || columns.values.len() != columns.owners_lo.len()
+    {
+        return Err(StoreError::Decode("owner-index segment columns disagree"));
+    }
+    let segment_capacity = 1usize
+        .checked_shl(u32::from(effective_log))
+        .ok_or(StoreError::Decode("owner-index segment log is invalid"))?;
+    if columns.values.len() > segment_capacity {
+        return Err(StoreError::Decode(
+            "owner-index segment exceeds effective domain",
+        ));
+    }
+    let segment_base = u64::from(segment_id)
+        .checked_shl(u32::from(effective_log))
+        .ok_or(StoreError::Decode("owner-index segment base overflow"))?;
+    for local in 0..columns.values.len() {
+        let value = columns.values[local];
+        let owner_hi = columns.owners_hi[local];
+        let owner_lo = columns.owners_lo[local];
+        if value.0 == 0 && owner_hi.0 == 0 && owner_lo.0 == 0 {
+            continue;
+        }
+        let slot_index = segment_base
+            .checked_add(local as u64)
+            .and_then(|slot| u32::try_from(slot).ok())
+            .ok_or(StoreError::Decode("owner-index slot exceeds u32 domain"))?;
+        visitor(
+            owner_key_from_fields(owner_hi, owner_lo),
+            slot_index,
+            value.0,
+        )?;
+    }
+    Ok(())
 }
 
 impl MdbxStore {
@@ -290,7 +372,7 @@ impl MdbxStore {
             txn.create_table(Some(name), TableFlags::empty())?;
         }
         txn.commit()?;
-        Ok(Self { db })
+        Ok(Self { db: Arc::new(db) })
     }
 
     // -----------------------------------------------------------------------
@@ -493,6 +575,27 @@ impl MdbxStore {
         Ok(raw.and_then(|b| decode_segment(&b)))
     }
 
+    /// Read one segment from the same MDBX snapshot that still names the
+    /// caller's expected canonical tip.  Mempool views use this to avoid
+    /// mixing slot data from a newly committed block with old anchor metadata.
+    pub fn get_segment_at_tip(
+        &self,
+        expected_height: u64,
+        expected_hash: [u8; 32],
+        seg_id: u16,
+    ) -> Result<Option<(u8, SegmentColumns)>, StoreError> {
+        let txn = self.db.begin_ro_txn()?;
+        let tip_tbl = txn.open_table(Some(T_CHAIN_TIP))?;
+        let tip_raw: Option<Vec<u8>> = txn.get(&tip_tbl, KEY_TIP)?;
+        if tip_raw.as_deref().and_then(decode_chain_tip) != Some((expected_height, expected_hash)) {
+            return Ok(None);
+        }
+        let segment_tbl = txn.open_table(Some(T_SEGMENTS))?;
+        let raw: Option<Vec<u8>> = txn.get(&segment_tbl, &seg_id.to_le_bytes())?;
+        raw.map(|bytes| decode_segment(&bytes).ok_or(StoreError::Decode("invalid stored segment")))
+            .transpose()
+    }
+
     #[cfg(test)]
     pub(crate) fn overwrite_segment_for_test(
         &self,
@@ -508,6 +611,19 @@ impl MdbxStore {
             encode_segment(cols, effective_log_seg),
             WriteFlags::empty(),
         )?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn put_raw_segment_record_for_test(
+        &self,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<(), StoreError> {
+        let txn = self.db.begin_rw_txn()?;
+        let tbl = txn.open_table(Some(T_SEGMENTS))?;
+        txn.put(&tbl, key, value, WriteFlags::empty())?;
         txn.commit()?;
         Ok(())
     }
@@ -842,38 +958,45 @@ impl MdbxStore {
         let slot_domain = 1u64 << log_slots;
 
         let owner_tbl = txn.open_table(Some(T_OWNER_INDEX))?;
-        let raw: Option<Vec<u8>> = txn.get(&owner_tbl, owner.as_slice())?;
-        let Some(raw) = raw else {
-            return Ok(VerifiedOwnerSnapshot {
-                owner: *owner,
-                height,
-                tip_hash,
-                state_root: header.state_root,
-                log_slots,
-                active_slot_count,
-                alloc_counter,
-                utxos: Vec::new(),
-            });
-        };
-        if (raw.len() / OWNER_INDEX_RECORD_BYTES) as u64 > slot_domain {
-            return Err(StoreError::Decode(
-                "owner-index entry count exceeds slot domain",
-            ));
-        }
-        let entries = decode_owner_entries(&raw)?;
-
         let segment_tbl = txn.open_table(Some(T_SEGMENTS))?;
-        // Entries are strictly slot-sorted, hence segment-sorted. Retain only
-        // one decoded dense segment at a time rather than O(owner segments).
+        // Composite keys are strictly slot-sorted within this owner prefix,
+        // hence segment-sorted. Verify records as the cursor yields them and
+        // retain only one decoded dense segment at a time.
+        let mut owner_cursor = txn.cursor(&owner_tbl)?;
+        let mut item: Option<(Vec<u8>, Vec<u8>)> = owner_cursor.set_range(owner.as_slice())?;
         let mut current_segment: Option<(u16, SegmentColumns)> = None;
-        let mut verified = Vec::with_capacity(entries.len());
-        for entry in entries {
-            if entry.slot_index as u64 >= slot_domain {
+        let mut previous_slot = None;
+        let mut verified = Vec::new();
+        while let Some((key, raw_value)) = item {
+            // Reaching another owner's prefix is the canonical end of this
+            // owner's range. A key that begins with the requested owner but
+            // has any non-canonical length is corruption, including the old
+            // aggregate owner-only encoding.
+            if key.get(..32) != Some(owner.as_slice()) {
+                break;
+            }
+            let (indexed_owner, slot_index) = decode_owner_index_key(&key)?;
+            if indexed_owner != *owner {
+                return Err(StoreError::Decode("owner-index prefix mismatch"));
+            }
+            if previous_slot.is_some_and(|previous| previous >= slot_index) {
+                return Err(StoreError::Decode(
+                    "owner-index slots are not strictly sorted and unique",
+                ));
+            }
+            previous_slot = Some(slot_index);
+            if verified.len() as u64 >= slot_domain {
+                return Err(StoreError::Decode(
+                    "owner-index entry count exceeds slot domain",
+                ));
+            }
+            if slot_index as u64 >= slot_domain {
                 return Err(StoreError::Decode(
                     "owner-index slot is outside current state domain",
                 ));
             }
-            let segment_id = (entry.slot_index >> effective_log) as u16;
+            let packed_value = decode_owner_index_value(&raw_value)?;
+            let segment_id = (slot_index >> effective_log) as u16;
             if current_segment
                 .as_ref()
                 .is_none_or(|(loaded_id, _)| *loaded_id != segment_id)
@@ -895,7 +1018,7 @@ impl MdbxStore {
             }
 
             let local_mask = (1u32 << effective_log) - 1;
-            let local = (entry.slot_index & local_mask) as usize;
+            let local = (slot_index & local_mask) as usize;
             let columns = &current_segment
                 .as_ref()
                 .expect("segment was inserted above")
@@ -921,17 +1044,18 @@ impl MdbxStore {
                     "owner-index owner does not match durable state",
                 ));
             }
-            if value.0 != entry.packed_value {
+            if value.0 != packed_value {
                 return Err(StoreError::Decode(
                     "owner-index packed value does not match durable state",
                 ));
             }
             let (amount, creation_id) = unpack_amount_creation_id(value);
             verified.push(VerifiedOwnerUtxo {
-                slot_index: entry.slot_index,
+                slot_index,
                 amount,
                 creation_id,
             });
+            item = owner_cursor.next()?;
         }
         Ok(VerifiedOwnerSnapshot {
             owner: *owner,
@@ -949,62 +1073,33 @@ impl MdbxStore {
     /// applying a state snapshot when the index is empty).
     ///
     /// Clears the existing index and rebuilds it from scratch. O(active_slots).
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub fn rebuild_owner_index_from_segments(
         &self,
         segments: &[(u16, u8, &crate::segmented_state::SegmentColumns)],
     ) -> Result<(), StoreError> {
-        use std::collections::HashMap;
-
-        // Build in-memory map: owner_key → exact packed state entries.
-        let mut owner_map: HashMap<[u8; 32], Vec<OwnerIndexEntry>> = HashMap::new();
-        for &(seg_id, eff_log, cols) in segments {
-            let eff_log = eff_log as u32;
-            let seg_size = cols.values.len();
-            for local in 0..seg_size {
-                let v = cols.values[local];
-                let oh = cols.owners_hi[local];
-                let ol = cols.owners_lo[local];
-                if v.0 == 0 && oh.0 == 0 && ol.0 == 0 {
-                    continue; // empty slot
-                }
-                let owner_key = owner_key_from_fields(oh, ol);
-                let slot = ((seg_id as u32) << eff_log) | (local as u32);
-                owner_map
-                    .entry(owner_key)
-                    .or_default()
-                    .push(OwnerIndexEntry {
-                        slot_index: slot,
-                        packed_value: v.0,
-                    });
-            }
-        }
-
-        // Write to MDBX atomically.
+        // Clear and stream directly into MDBX in one transaction. The caller
+        // may already hold all snapshot segments, but the index rebuild adds
+        // only constant auxiliary memory rather than a second state-sized map.
         let txn = self.db.begin_rw_txn()?;
         let tbl = txn.open_table(Some(T_OWNER_INDEX))?;
-
-        // Clear existing entries (cursor-based delete all).
-        {
-            let mut cur = txn.cursor(&tbl)?;
-            let mut item: Option<(Vec<u8>, Vec<u8>)> = cur.first()?;
-            let mut keys: Vec<Vec<u8>> = Vec::new();
-            while let Some((k, _)) = item {
-                keys.push(k);
-                item = cur.next()?;
-            }
-            drop(cur);
-            for k in keys {
-                let _ = txn.del(&tbl, &k, None);
-            }
-        }
-
-        // Write new entries.
-        for entries in owner_map.values_mut() {
-            entries.sort_unstable_by_key(|entry| entry.slot_index);
-        }
-        for (owner_key, entries) in &owner_map {
-            let encoded = encode_owner_entries(entries)?;
-            txn.put(&tbl, owner_key.as_slice(), &encoded, WriteFlags::empty())?;
+        txn.clear_table(&tbl)?;
+        for &(segment_id, effective_log, columns) in segments {
+            visit_live_owner_records(
+                segment_id,
+                effective_log,
+                columns,
+                |owner, slot_index, packed_value| {
+                    txn.put(
+                        &tbl,
+                        owner_index_key(&owner, slot_index),
+                        encode_owner_index_value(packed_value),
+                        WriteFlags::empty(),
+                    )?;
+                    Ok(())
+                },
+            )?;
         }
 
         txn.commit()?;
@@ -1044,10 +1139,336 @@ impl MdbxStore {
         Ok(())
     }
 
+    /// Atomically install a finalized, disk-staged snapshot without ever
+    /// materializing the complete state in process RAM.
+    ///
+    /// The staging handle has already passed receiver finalization, but every
+    /// file is re-opened and independently checked inside this single RW
+    /// transaction.  Segment payload, composite owner-index records, exact and
+    /// FRI summaries are consumed one segment at a time.  Any error drops the
+    /// transaction, preserving the complete previous volatile state epoch.
+    ///
+    /// The returned `ChainState` contains only compact exact/FRI summaries and
+    /// evicted-segment metadata.  It is returned only after MDBX commit, so the
+    /// context can switch hot state without a fallible post-commit disk reload.
+    pub(crate) fn install_finalized_snapshot_staging(
+        &self,
+        staging: &FinalizedSnapshotStaging,
+        consensus_meta: &ConsensusMeta,
+        canonical_recent_headers: &[BlockHeader],
+    ) -> Result<ChainState, StoreError> {
+        let metadata = staging.metadata();
+        let tip_header = *metadata.header();
+        let tip_hash = metadata.tip_hash();
+        let effective_log = metadata.effective_log_segment();
+
+        if crate::block_header::block_id(&tip_header) != tip_hash
+            || consensus_meta.tip_height != tip_header.height
+            || consensus_meta.tip_hash != tip_hash
+            || consensus_meta.finalized.height != tip_header.height
+            || consensus_meta.finalized.hash != tip_hash
+        {
+            return Err(StoreError::Decode(
+                "staged snapshot metadata and consensus boundary disagree",
+            ));
+        }
+        if canonical_recent_headers.last() != Some(&tip_header)
+            || canonical_recent_headers.is_empty()
+            || canonical_recent_headers.windows(2).any(|pair| {
+                pair[1].height != pair[0].height.saturating_add(1)
+                    || pair[1].prev_block_hash != crate::block_header::block_id(&pair[0])
+            })
+        {
+            return Err(StoreError::Decode(
+                "staged snapshot recent header window is not canonical",
+            ));
+        }
+        let expected_effective_log = tip_header
+            .log_slots
+            .min(crate::consensus::params::LOG_SEGMENT_SIZE)
+            as u8;
+        if effective_log != expected_effective_log {
+            return Err(StoreError::Decode(
+                "staged snapshot effective segment log mismatch",
+            ));
+        }
+
+        let mut segmented =
+            crate::segmented_state::SegmentedFriState::new_empty(tip_header.log_slots as usize);
+        let expected_segment_len =
+            1usize
+                .checked_shl(u32::from(effective_log))
+                .ok_or(StoreError::Decode(
+                    "staged snapshot segment geometry overflows",
+                ))?;
+        let mut exact = StreamingSparseRoot::new(tip_header.log_slots)
+            .map_err(|_| StoreError::Decode("invalid staged snapshot exact-root depth"))?;
+        let mut exact_segment_roots = Vec::with_capacity(staging.descriptors().len());
+        let mut counted_live = 0u64;
+        let mut previous_segment = None;
+
+        let txn = self.db.begin_rw_txn()?;
+
+        // Recheck the authenticated boundary in the same transaction that
+        // replaces state. Context-level checks alone would leave a race if a
+        // second store handle changed canonical headers between validation and
+        // this commit.
+        let header_tbl = txn.open_table(Some(T_HEADERS))?;
+        let stored_header_raw: Option<Vec<u8>> =
+            txn.get(&header_tbl, &u64_key(tip_header.height))?;
+        let stored_header =
+            stored_header_raw
+                .as_deref()
+                .and_then(decode_header)
+                .ok_or(StoreError::Decode(
+                    "staged snapshot canonical header is missing",
+                ))?;
+        if stored_header != tip_header {
+            return Err(StoreError::Decode(
+                "staged snapshot header differs from canonical store",
+            ));
+        }
+        for header in canonical_recent_headers {
+            let raw: Option<Vec<u8>> = txn.get(&header_tbl, &u64_key(header.height))?;
+            if raw.as_deref().and_then(decode_header) != Some(*header) {
+                return Err(StoreError::Decode(
+                    "staged snapshot recent header changed before install",
+                ));
+            }
+        }
+        let hash_to_height_tbl = txn.open_table(Some(T_HASH_TO_HEIGHT))?;
+        let stored_height: Option<Vec<u8>> = txn.get(&hash_to_height_tbl, tip_hash.as_slice())?;
+        if stored_height.as_deref().and_then(u64_from_key) != Some(tip_header.height) {
+            return Err(StoreError::Decode(
+                "staged snapshot canonical hash index mismatch",
+            ));
+        }
+        let work_tbl = txn.open_table(Some(T_CHAIN_WORK))?;
+        let stored_work: Option<Vec<u8>> = txn.get(&work_tbl, &u64_key(tip_header.height))?;
+        if stored_work.as_deref().and_then(decode_chain_work)
+            != Some(consensus_meta.cumulative_chainwork)
+        {
+            return Err(StoreError::Decode(
+                "staged snapshot cumulative chainwork mismatch",
+            ));
+        }
+        let anchor_tbl = txn.open_table(Some(T_HEADER_ANCHORS))?;
+        let stored_anchor_raw: Option<Vec<u8>> =
+            txn.get(&anchor_tbl, &u64_key(tip_header.height))?;
+        let stored_anchor = stored_anchor_raw
+            .as_deref()
+            .and_then(decode_header_chain_anchor)
+            .ok_or(StoreError::Decode(
+                "staged snapshot canonical header anchor is missing",
+            ))?;
+        let expected_anchor = HeaderChainAnchor {
+            height: tip_header.height,
+            block_id: tip_hash,
+            state_root: tip_header.state_root,
+            tx_root: tip_header.tx_root,
+            miner_address: tip_header.miner_address,
+            log_slots: tip_header.log_slots,
+            active_slot_count: tip_header.active_slot_count,
+            alloc_counter: tip_header.alloc_counter,
+            cumulative_chainwork: consensus_meta.cumulative_chainwork,
+        };
+        if stored_anchor != expected_anchor {
+            return Err(StoreError::Decode(
+                "staged snapshot canonical header anchor mismatch",
+            ));
+        }
+
+        for name in [
+            T_SEGMENTS,
+            T_UNDO_LOGS,
+            T_RECENT_BLOCKS,
+            T_TX_INDEX,
+            T_BLOCK_PROOFS,
+            T_BLOCK_AUTH_SIDECARS,
+            T_HISTORY_CLAIMS,
+            T_ACCEPTED_BLOCK_CERTIFICATES,
+            T_ACCEPTED_BLOCK_BATCH_CERTIFICATE_PACKAGES,
+            T_HISTORY_CHECKPOINT_HEADS,
+            T_OWNER_INDEX,
+            T_CHECKPOINT_PACKAGES,
+            T_CHECKPOINT_COVERAGE,
+        ] {
+            let table = txn.open_table(Some(name))?;
+            txn.clear_table(&table)?;
+        }
+
+        let segment_tbl = txn.open_table(Some(T_SEGMENTS))?;
+        let owner_tbl = txn.open_table(Some(T_OWNER_INDEX))?;
+        for staged_file in staging.encoded_files() {
+            let descriptor = *staged_file.descriptor();
+            if previous_segment.is_some_and(|previous| previous >= descriptor.segment_id) {
+                return Err(StoreError::Decode(
+                    "staged snapshot segment ids are not strictly increasing",
+                ));
+            }
+            previous_segment = Some(descriptor.segment_id);
+            if staged_file.effective_log_segment() != effective_log {
+                return Err(StoreError::Decode(
+                    "staged snapshot file effective log mismatch",
+                ));
+            }
+
+            // `read_encoded` closes finalize-to-install file corruption. Decode
+            // again here because MDBX installation and owner-index construction
+            // consume the typed columns; the encoded bytes are written directly
+            // after all checks, without a second state-sized collection.
+            let encoded = staged_file.read_encoded()?;
+            let (encoded_log, columns) = decode_segment(&encoded).ok_or(StoreError::Decode(
+                "staged snapshot segment decode failed during install",
+            ))?;
+            if encoded_log != effective_log
+                || columns.values.len() != expected_segment_len
+                || columns.owners_hi.len() != expected_segment_len
+                || columns.owners_lo.len() != expected_segment_len
+            {
+                return Err(StoreError::Decode(
+                    "staged snapshot decoded segment shape mismatch",
+                ));
+            }
+            let fri_root = compute_segment_root(
+                effective_log as usize,
+                &columns.values,
+                &columns.owners_hi,
+                &columns.owners_lo,
+            );
+            if fri_root != descriptor.segment_root {
+                return Err(StoreError::Decode(
+                    "staged snapshot segment FRI root mismatch during install",
+                ));
+            }
+
+            let segment_base = u64::from(descriptor.segment_id) << effective_log;
+            let mut segment_live = 0u32;
+            for local in 0..expected_segment_len {
+                let slot = SlotValue {
+                    value: columns.values[local],
+                    owner_hi: columns.owners_hi[local],
+                    owner_lo: columns.owners_lo[local],
+                };
+                if slot.is_empty() {
+                    continue;
+                }
+                if slot.creation_id() > tip_header.alloc_counter {
+                    return Err(StoreError::Decode(
+                        "staged snapshot creation_id exceeds target allocator",
+                    ));
+                }
+                segment_live = segment_live.checked_add(1).ok_or(StoreError::Decode(
+                    "staged snapshot segment live-count overflow",
+                ))?;
+                counted_live = counted_live
+                    .checked_add(1)
+                    .ok_or(StoreError::Decode("staged snapshot active-count overflow"))?;
+                let global = segment_base
+                    .checked_add(local as u64)
+                    .and_then(|index| u32::try_from(index).ok())
+                    .ok_or(StoreError::Decode(
+                        "staged snapshot live slot exceeds u32 domain",
+                    ))?;
+                exact.push_leaf(global, slot_leaf_hash(slot)).map_err(|_| {
+                    StoreError::Decode("staged snapshot exact leaf is out of range")
+                })?;
+                let owner = owner_key_from_fields(slot.owner_hi, slot.owner_lo);
+                txn.put(
+                    &owner_tbl,
+                    owner_index_key(&owner, global),
+                    encode_owner_index_value(slot.value.0),
+                    WriteFlags::empty(),
+                )?;
+            }
+            if segment_live == 0 {
+                return Err(StoreError::Decode(
+                    "staged snapshot advertises an empty segment",
+                ));
+            }
+
+            txn.put(
+                &segment_tbl,
+                descriptor.segment_id.to_le_bytes(),
+                &encoded,
+                WriteFlags::empty(),
+            )?;
+            segmented
+                .install_evicted_segment_summary(descriptor.segment_id, segment_live, fri_root)
+                .map_err(StoreError::Decode)?;
+            exact_segment_roots.push((
+                descriptor.segment_id,
+                exact_segment_root_from_columns(effective_log as usize, &columns),
+            ));
+            // `columns` and `encoded` drop here before the iterator opens the
+            // next file. Only compact roots/counts survive the pass.
+        }
+
+        if counted_live != tip_header.active_slot_count {
+            return Err(StoreError::Decode(
+                "staged snapshot active count does not match target header",
+            ));
+        }
+        let exact_root = exact
+            .finish()
+            .map_err(|_| StoreError::Decode("staged snapshot exact-root build failed"))?;
+        if exact_root != tip_header.state_root {
+            return Err(StoreError::Decode(
+                "staged snapshot exact root does not match target header",
+            ));
+        }
+        segmented.finish_evicted_segment_summaries();
+        let hot_state = ChainState::from_evicted_parts(
+            segmented,
+            tip_header.active_slot_count,
+            tip_header.alloc_counter,
+            exact_root,
+            &exact_segment_roots,
+        )
+        .map_err(|_| StoreError::Decode("staged snapshot compact exact cache mismatch"))?;
+
+        let tip_tbl = txn.open_table(Some(T_CHAIN_TIP))?;
+        txn.put(
+            &tip_tbl,
+            KEY_TIP,
+            encode_chain_tip(tip_header.height, &tip_hash),
+            WriteFlags::empty(),
+        )?;
+        let consensus_tbl = txn.open_table(Some(T_CONSENSUS_META))?;
+        txn.put(
+            &consensus_tbl,
+            KEY_CONSENSUS_META,
+            encode_consensus_meta(consensus_meta),
+            WriteFlags::empty(),
+        )?;
+        txn.put(
+            &work_tbl,
+            u64_key(tip_header.height),
+            encode_chain_work(&consensus_meta.cumulative_chainwork),
+            WriteFlags::empty(),
+        )?;
+        let state_meta_tbl = txn.open_table(Some(T_STATE_META))?;
+        txn.put(
+            &state_meta_tbl,
+            KEY_META,
+            encode_state_meta(
+                tip_header.log_slots,
+                tip_header.active_slot_count,
+                tip_header.alloc_counter,
+            ),
+            WriteFlags::empty(),
+        )?;
+
+        txn.commit()?;
+        Ok(hot_state)
+    }
+
     /// Atomically install a snapshot state at an already-verified canonical header.
     ///
-    /// This replaces volatile state tables only. Canonical headers, hash->height,
-    /// chainwork, and local history/checkpoint tables are preserved.
+    /// Test-only transitional materialized installer. Production uses
+    /// `install_finalized_snapshot_staging`; this helper retains no release
+    /// entry point that could accidentally collect every segment in RAM.
+    #[cfg(test)]
     pub fn install_state_snapshot(
         &self,
         tip_header: &BlockHeader,
@@ -1055,8 +1476,6 @@ impl MdbxStore {
         consensus_meta: &ConsensusMeta,
         segments: &[(u16, u8, &SegmentColumns)],
     ) -> Result<(), StoreError> {
-        use std::collections::HashMap;
-
         let txn = self.db.begin_rw_txn()?;
 
         for name in [
@@ -1069,22 +1488,13 @@ impl MdbxStore {
             T_HISTORY_CLAIMS,
             T_ACCEPTED_BLOCK_CERTIFICATES,
             T_ACCEPTED_BLOCK_BATCH_CERTIFICATE_PACKAGES,
+            T_HISTORY_CHECKPOINT_HEADS,
             T_OWNER_INDEX,
+            T_CHECKPOINT_PACKAGES,
+            T_CHECKPOINT_COVERAGE,
         ] {
             let tbl = txn.open_table(Some(name))?;
-            let keys: Vec<Vec<u8>> = {
-                let mut cur = txn.cursor(&tbl)?;
-                let mut keys = Vec::new();
-                let mut item: Option<(Vec<u8>, Vec<u8>)> = cur.first()?;
-                while let Some((k, _)) = item {
-                    keys.push(k);
-                    item = cur.next()?;
-                }
-                keys
-            };
-            for key in keys {
-                let _ = txn.del(&tbl, &key, None);
-            }
+            txn.clear_table(&tbl)?;
         }
 
         let seg_tbl = txn.open_table(Some(T_SEGMENTS))?;
@@ -1136,35 +1546,21 @@ impl MdbxStore {
             WriteFlags::empty(),
         )?;
 
-        let mut owner_map: HashMap<[u8; 32], Vec<OwnerIndexEntry>> = HashMap::new();
-        for &(seg_id, eff_log, cols) in segments {
-            let eff_log = eff_log as u32;
-            for local in 0..cols.values.len() {
-                let value = cols.values[local];
-                let owner_hi = cols.owners_hi[local];
-                let owner_lo = cols.owners_lo[local];
-                if value.0 == 0 && owner_hi.0 == 0 && owner_lo.0 == 0 {
-                    continue;
-                }
-                let owner = owner_key_from_fields(owner_hi, owner_lo);
-                let slot = ((seg_id as u32) << eff_log) | (local as u32);
-                owner_map.entry(owner).or_default().push(OwnerIndexEntry {
-                    slot_index: slot,
-                    packed_value: value.0,
-                });
-            }
-        }
-
         let owner_tbl = txn.open_table(Some(T_OWNER_INDEX))?;
-        for entries in owner_map.values_mut() {
-            entries.sort_unstable_by_key(|entry| entry.slot_index);
-        }
-        for (owner, entries) in owner_map {
-            txn.put(
-                &owner_tbl,
-                owner.as_slice(),
-                encode_owner_entries(&entries)?,
-                WriteFlags::empty(),
+        for &(segment_id, effective_log, columns) in segments {
+            visit_live_owner_records(
+                segment_id,
+                effective_log,
+                columns,
+                |owner, slot_index, packed_value| {
+                    txn.put(
+                        &owner_tbl,
+                        owner_index_key(&owner, slot_index),
+                        encode_owner_index_value(packed_value),
+                        WriteFlags::empty(),
+                    )?;
+                    Ok(())
+                },
             )?;
         }
 
@@ -1180,24 +1576,45 @@ impl MdbxStore {
         Ok(raw.and_then(|b| decode_tx_index_value(&b)))
     }
 
-    /// Iterate over all stored segment IDs and their column data.
-    pub fn all_segments(&self) -> Result<Vec<(u16, u8, SegmentColumns)>, StoreError> {
+    /// Return the numeric, strictly unique durable segment ID set without
+    /// copying or decoding any segment payload.
+    ///
+    /// Segment keys predate this API and are little-endian, so MDBX's
+    /// lexicographic cursor order is not numeric once IDs exceed 255.  The
+    /// complete u16 namespace costs at most 128 KiB here; values are decoded
+    /// as `()` so even corrupt or very large payloads are not materialized.
+    pub(crate) fn segment_ids(&self) -> Result<Vec<u16>, StoreError> {
         let txn = self.db.begin_ro_txn()?;
         let tbl = txn.open_table(Some(T_SEGMENTS))?;
         let mut cursor = txn.cursor(&tbl)?;
-        let mut results = Vec::new();
-        // Use first() to position at the start, then next() to advance.
-        let mut item: Option<(Vec<u8>, Vec<u8>)> = cursor.first()?;
-        while let Some((k, v)) = item {
-            if k.len() >= 2 {
-                let seg_id = u16::from_le_bytes([k[0], k[1]]);
-                if let Some((eff, cols)) = decode_segment(&v) {
-                    results.push((seg_id, eff, cols));
-                }
+        let mut segment_ids = Vec::new();
+        let mut item: Option<(Vec<u8>, ())> = cursor.first()?;
+        while let Some((key, ())) = item {
+            if key.len() != 2 {
+                return Err(StoreError::Decode("invalid stored segment key"));
             }
+            segment_ids.push(u16::from_le_bytes([key[0], key[1]]));
             item = cursor.next()?;
         }
-        Ok(results)
+        sort_unique_segment_ids(segment_ids)
+    }
+
+    /// Stream stored segments through a one-segment ownership boundary.
+    ///
+    /// Startup and reorg recovery use this path so the node never materializes
+    /// a second `Vec` containing the complete durable state.  Peak temporary
+    /// memory is one encoded segment plus one decoded `SegmentColumns`.
+    pub(crate) fn visit_segments(
+        &self,
+        mut visitor: impl FnMut(u16, u8, SegmentColumns) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        for segment_id in self.segment_ids()? {
+            let (effective_log, columns) = self.get_segment(segment_id)?.ok_or(
+                StoreError::Decode("stored segment disappeared while streaming"),
+            )?;
+            visitor(segment_id, effective_log, columns)?;
+        }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1228,10 +1645,11 @@ impl MdbxStore {
         header: &BlockHeader,
         hash: &[u8; 32],
         undo_log: &BlockUndoLog,
-        dirty_segments: &[(u16, u8, &SegmentColumns)], // (seg_id, effective_log_seg, cols)
+        dirty_segments: &[(u16, u8, Option<&SegmentColumns>)],
         tx_hashes: &[TxBodyHash],
         tx_index_deletes: &[TxBodyHash],
         block_bytes: Option<&[u8]>, // None = don't store (DA already pruned)
+        accepted_block: Option<AcceptedBlockCommitData<'_>>,
         consensus_meta: &ConsensusMeta,
         rebuild_owner_index: bool,
     ) -> Result<(), StoreError> {
@@ -1241,13 +1659,19 @@ impl MdbxStore {
         let seg_tbl = txn.open_table(Some(T_SEGMENTS))?;
         for (seg_id, eff_log, cols) in dirty_segments {
             let key = seg_id.to_le_bytes();
-            if segment_columns_empty(cols) {
-                // Do not persist fully-empty segments. This keeps disk and snapshot
-                // size proportional to live UTXOs, not historical touched ranges.
-                let _ = txn.del(&seg_tbl, key, None);
-            } else {
-                let val = encode_segment(cols, *eff_log);
-                txn.put(&seg_tbl, key, val, WriteFlags::empty())?;
+            match cols {
+                None => {
+                    // Do not persist fully-empty segments. This keeps disk and
+                    // snapshot size proportional to live UTXOs.
+                    let _ = txn.del(&seg_tbl, key, None);
+                }
+                Some(cols) => {
+                    if segment_columns_empty(cols) {
+                        return Err(StoreError::Decode("non-delete dirty segment is empty"));
+                    }
+                    let val = encode_segment(cols, *eff_log);
+                    txn.put(&seg_tbl, key, val, WriteFlags::empty())?;
+                }
             }
         }
         // Reorg rollback may cross a slot-domain expansion. Purge every
@@ -1389,6 +1813,64 @@ impl MdbxStore {
             )?;
         }
 
+        // --- 8.25. Detached accepted-block proof material ---
+        //
+        // These records are part of the same durability boundary as the tip,
+        // exact state, undo log, and body.  A restart can therefore never see
+        // an accepted canonical block without the witnesses needed by the
+        // checkpoint worker.  Explicit deletion on an empty coinbase pair is
+        // required when a reorg replaces a user block at the same height.
+        if let Some(accepted) = accepted_block {
+            if accepted.block_proof_bytes.is_empty() != accepted.block_auth_sidecar_bytes.is_empty()
+            {
+                return Err(StoreError::Decode(
+                    "accepted proof and auth sidecar presence mismatch",
+                ));
+            }
+            if accepted.history_claim_bytes.is_empty() {
+                return Err(StoreError::Decode("accepted history claim is empty"));
+            }
+            if accepted.accepted_block_certificate_bytes.is_empty() {
+                return Err(StoreError::Decode("accepted block certificate is empty"));
+            }
+
+            let height_key = u64_key(header.height);
+            let proof_tbl = txn.open_table(Some(T_BLOCK_PROOFS))?;
+            let sidecar_tbl = txn.open_table(Some(T_BLOCK_AUTH_SIDECARS))?;
+            if accepted.block_proof_bytes.is_empty() {
+                let _ = txn.del(&proof_tbl, height_key, None);
+                let _ = txn.del(&sidecar_tbl, height_key, None);
+            } else {
+                txn.put(
+                    &proof_tbl,
+                    height_key,
+                    accepted.block_proof_bytes,
+                    WriteFlags::empty(),
+                )?;
+                txn.put(
+                    &sidecar_tbl,
+                    height_key,
+                    accepted.block_auth_sidecar_bytes,
+                    WriteFlags::empty(),
+                )?;
+            }
+
+            let history_tbl = txn.open_table(Some(T_HISTORY_CLAIMS))?;
+            txn.put(
+                &history_tbl,
+                height_key,
+                accepted.history_claim_bytes,
+                WriteFlags::empty(),
+            )?;
+            let certificate_tbl = txn.open_table(Some(T_ACCEPTED_BLOCK_CERTIFICATES))?;
+            txn.put(
+                &certificate_tbl,
+                height_key,
+                accepted.accepted_block_certificate_bytes,
+                WriteFlags::empty(),
+            )?;
+        }
+
         // --- 8.5. tx_index: TxBodyHash → (height, position_in_block) ---
         // Enables O(1) receipt lookup: given a tx_body_hash, find the block
         // and position to reconstruct the Merkle inclusion path. Reorg
@@ -1427,57 +1909,33 @@ impl MdbxStore {
             use crate::fri_state::SlotValue;
             let oidx_tbl = txn.open_table(Some(T_OWNER_INDEX))?;
             if rebuild_owner_index {
-                let mut old_keys = Vec::new();
-                {
-                    let mut cursor = txn.cursor(&oidx_tbl)?;
-                    let mut item: Option<(Vec<u8>, Vec<u8>)> = cursor.first()?;
-                    while let Some((key, _)) = item {
-                        old_keys.push(key);
-                        item = cursor.next()?;
+                txn.clear_table(&oidx_tbl)?;
+                let mut cursor = txn.cursor(&seg_tbl)?;
+                let mut item: Option<(Vec<u8>, Vec<u8>)> = cursor.first()?;
+                while let Some((key, raw)) = item {
+                    if key.len() != 2 {
+                        return Err(StoreError::Decode(
+                            "invalid segment key during owner rebuild",
+                        ));
                     }
-                }
-                for key in old_keys {
-                    let _ = txn.del(&oidx_tbl, key, None);
-                }
-
-                let mut owner_map: std::collections::HashMap<[u8; 32], Vec<OwnerIndexEntry>> =
-                    std::collections::HashMap::new();
-                {
-                    let mut cursor = txn.cursor(&seg_tbl)?;
-                    let mut item: Option<(Vec<u8>, Vec<u8>)> = cursor.first()?;
-                    while let Some((key, raw)) = item {
-                        if key.len() >= 2 {
-                            let seg_id = u16::from_le_bytes([key[0], key[1]]);
-                            let (eff_log, cols) = decode_segment(&raw).ok_or(
-                                StoreError::Decode("invalid segment during owner rebuild"),
+                    let segment_id = u16::from_le_bytes([key[0], key[1]]);
+                    let (effective_log, columns) = decode_segment(&raw)
+                        .ok_or(StoreError::Decode("invalid segment during owner rebuild"))?;
+                    visit_live_owner_records(
+                        segment_id,
+                        effective_log,
+                        &columns,
+                        |owner, slot_index, packed_value| {
+                            txn.put(
+                                &oidx_tbl,
+                                owner_index_key(&owner, slot_index),
+                                encode_owner_index_value(packed_value),
+                                WriteFlags::empty(),
                             )?;
-                            for local in 0..cols.values.len() {
-                                let value = cols.values[local];
-                                let owner_hi = cols.owners_hi[local];
-                                let owner_lo = cols.owners_lo[local];
-                                if value.0 != 0 || owner_hi.0 != 0 || owner_lo.0 != 0 {
-                                    let owner = owner_key_from_fields(owner_hi, owner_lo);
-                                    let slot = ((seg_id as u32) << eff_log) | local as u32;
-                                    owner_map.entry(owner).or_default().push(OwnerIndexEntry {
-                                        slot_index: slot,
-                                        packed_value: value.0,
-                                    });
-                                }
-                            }
-                        }
-                        item = cursor.next()?;
-                    }
-                }
-                for entries in owner_map.values_mut() {
-                    entries.sort_unstable_by_key(|entry| entry.slot_index);
-                }
-                for (owner, entries) in owner_map {
-                    txn.put(
-                        &oidx_tbl,
-                        owner.as_slice(),
-                        encode_owner_entries(&entries)?,
-                        WriteFlags::empty(),
+                            Ok(())
+                        },
                     )?;
+                    item = cursor.next()?;
                 }
             } else {
                 // eff_log = log2(slots_per_segment) — same for every dirty segment.
@@ -1491,23 +1949,14 @@ impl MdbxStore {
                     if *prev_value != SlotValue::EMPTY {
                         let owner_key =
                             owner_key_from_fields(prev_value.owner_hi, prev_value.owner_lo);
-                        let existing: Option<Vec<u8>> = txn.get(&oidx_tbl, owner_key.as_slice())?;
-                        if let Some(raw) = existing {
-                            let entries: Vec<OwnerIndexEntry> = decode_owner_entries(&raw)?
-                                .into_iter()
-                                .filter(|entry| entry.slot_index != slot_index)
-                                .collect();
-                            if entries.is_empty() {
-                                let _ = txn.del(&oidx_tbl, owner_key.as_slice(), None);
-                            } else {
-                                txn.put(
-                                    &oidx_tbl,
-                                    owner_key.as_slice(),
-                                    encode_owner_entries(&entries)?,
-                                    WriteFlags::empty(),
-                                )?;
-                            }
+                        let index_key = owner_index_key(&owner_key, slot_index);
+                        let existing: Option<Vec<u8>> = txn.get(&oidx_tbl, &index_key)?;
+                        let existing = existing
+                            .ok_or(StoreError::Decode("missing pre-block owner-index record"))?;
+                        if decode_owner_index_value(&existing)? != prev_value.value.0 {
+                            return Err(StoreError::Decode("pre-block owner-index value mismatch"));
                         }
+                        txn.del(&oidx_tbl, index_key, None)?;
                     }
 
                     // Add the post-block owner, if any. Doing both halves for
@@ -1523,8 +1972,8 @@ impl MdbxStore {
                         // Spending the last live slot dematerializes the dirty
                         // segment; persistence represents its post-state as an
                         // empty/zero-length column payload.
-                        Some((_, _, cols)) if segment_columns_empty(cols) => SlotValue::EMPTY,
-                        Some((_, _, cols)) => {
+                        Some((_, _, None)) => SlotValue::EMPTY,
+                        Some((_, _, Some(cols))) => {
                             if local >= cols.values.len()
                                 || local >= cols.owners_hi.len()
                                 || local >= cols.owners_lo.len()
@@ -1547,21 +1996,16 @@ impl MdbxStore {
                     } = post_value;
                     if value.0 != 0 || owner_hi.0 != 0 || owner_lo.0 != 0 {
                         let owner_key = owner_key_from_fields(owner_hi, owner_lo);
-                        let existing: Option<Vec<u8>> = txn.get(&oidx_tbl, owner_key.as_slice())?;
-                        let mut entries = match existing {
-                            Some(raw) => decode_owner_entries(&raw)?,
-                            None => Vec::new(),
-                        };
-                        entries.retain(|entry| entry.slot_index != slot_index);
-                        entries.push(OwnerIndexEntry {
-                            slot_index,
-                            packed_value: value.0,
-                        });
-                        entries.sort_unstable_by_key(|entry| entry.slot_index);
+                        let index_key = owner_index_key(&owner_key, slot_index);
+                        if txn.get::<Vec<u8>>(&oidx_tbl, &index_key)?.is_some() {
+                            return Err(StoreError::Decode(
+                                "duplicate post-block owner-index record",
+                            ));
+                        }
                         txn.put(
                             &oidx_tbl,
-                            owner_key.as_slice(),
-                            encode_owner_entries(&entries)?,
+                            index_key,
+                            encode_owner_index_value(value.0),
                             WriteFlags::empty(),
                         )?;
                     }
@@ -1583,6 +2027,355 @@ impl MdbxStore {
             // Safe to ignore: prune is retried on the next commit.
         }
 
+        Ok(())
+    }
+
+    /// Atomically replace the canonical suffix above `ancestor_height`.
+    ///
+    /// Every replacement block has already passed the normal proof-native
+    /// `AcceptBlock` path in RAM.  This transaction installs the final exact
+    /// state, all replacement headers/undo/proof records, and the final tip at
+    /// once.  A validation or MDBX failure therefore leaves the old canonical
+    /// branch byte-for-byte durable.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn commit_reorg(
+        &self,
+        ancestor_height: u64,
+        final_header: &BlockHeader,
+        final_hash: &[u8; 32],
+        final_dirty_segments: &[(u16, u8, Option<&SegmentColumns>)],
+        reverted_tx_hashes: &[TxBodyHash],
+        replacement_payloads: &[crate::storage::mdbx_context::ReorgBlockPayload<'_>],
+        replacement: &[StagedAcceptedBlockCommit],
+        consensus_meta: &ConsensusMeta,
+    ) -> Result<(), StoreError> {
+        if final_header.height < ancestor_height
+            || consensus_meta.tip_height != final_header.height
+            || consensus_meta.tip_hash != *final_hash
+        {
+            return Err(StoreError::Decode("invalid staged reorg tip"));
+        }
+        if replacement_payloads.len() != replacement.len() {
+            return Err(StoreError::Decode("staged reorg payload count mismatch"));
+        }
+        let mut expected_height = ancestor_height.saturating_add(1);
+        for (payload, block) in replacement_payloads.iter().zip(replacement) {
+            if block.header.height != expected_height
+                || payload.block.header != block.header
+                || block.hash != crate::hash_block_header(&block.header)
+                || payload.block_proof_bytes.is_empty()
+                    != payload.block_auth_sidecar_bytes.is_empty()
+                || block.history_claim_bytes.is_empty()
+                || block.accepted_block_certificate_bytes.is_empty()
+            {
+                return Err(StoreError::Decode("invalid staged reorg block"));
+            }
+            expected_height = expected_height
+                .checked_add(1)
+                .ok_or(StoreError::Decode("staged reorg height overflow"))?;
+        }
+        match replacement.last() {
+            Some(last)
+                if last.header != *final_header
+                    || last.hash != *final_hash
+                    || last.cumulative_chainwork != consensus_meta.cumulative_chainwork =>
+            {
+                return Err(StoreError::Decode("staged reorg final block mismatch"));
+            }
+            None if final_header.height != ancestor_height => {
+                return Err(StoreError::Decode("empty staged reorg changed height"));
+            }
+            _ => {}
+        }
+
+        let txn = self.db.begin_rw_txn()?;
+
+        // Install the final post-reorg exact segments once.  Dirty tracking is
+        // deliberately retained across every staged block, so this is the
+        // union of rollback and replacement writes.
+        let seg_tbl = txn.open_table(Some(T_SEGMENTS))?;
+        for (seg_id, eff_log, cols) in final_dirty_segments {
+            let key = seg_id.to_le_bytes();
+            match cols {
+                None => {
+                    let _ = txn.del(&seg_tbl, key, None);
+                }
+                Some(cols) => {
+                    if segment_columns_empty(cols) {
+                        return Err(StoreError::Decode("non-delete reorg segment is empty"));
+                    }
+                    txn.put(
+                        &seg_tbl,
+                        key,
+                        encode_segment(cols, *eff_log),
+                        WriteFlags::empty(),
+                    )?;
+                }
+            }
+        }
+        let domain_segments = if final_header.log_slots > crate::consensus::params::LOG_SEGMENT_SIZE
+        {
+            1usize
+                .checked_shl(final_header.log_slots - crate::consensus::params::LOG_SEGMENT_SIZE)
+                .ok_or(StoreError::Decode(
+                    "reorg final log_slots exceeds segment domain",
+                ))?
+        } else {
+            1
+        };
+        let out_of_domain_keys: Vec<Vec<u8>> = {
+            let mut cursor = txn.cursor(&seg_tbl)?;
+            let mut keys = Vec::new();
+            let mut item: Option<(Vec<u8>, Vec<u8>)> = cursor.first()?;
+            while let Some((key, _)) = item {
+                if key.len() != 2 {
+                    return Err(StoreError::Decode("invalid segment key"));
+                }
+                if u16::from_le_bytes([key[0], key[1]]) as usize >= domain_segments {
+                    keys.push(key);
+                }
+                item = cursor.next()?;
+            }
+            keys
+        };
+        for key in out_of_domain_keys {
+            txn.del(&seg_tbl, &key, None)?;
+        }
+
+        // Remove every old canonical height record above the ancestor before
+        // installing the replacement.  Hash and tx indexes are cleaned in the
+        // same transaction, so shorter replacement branches cannot expose a
+        // stale suffix after restart.
+        let hdr_tbl = txn.open_table(Some(T_HEADERS))?;
+        let old_headers: Vec<(u64, [u8; 32])> = {
+            let mut cursor = txn.cursor(&hdr_tbl)?;
+            let mut old = Vec::new();
+            let mut item: Option<(Vec<u8>, Vec<u8>)> = cursor.first()?;
+            while let Some((key, raw)) = item {
+                if let Some(height) = u64_from_key(&key) {
+                    if height > ancestor_height {
+                        let header = decode_header(&raw)
+                            .ok_or(StoreError::Decode("invalid header during reorg"))?;
+                        old.push((height, crate::hash_block_header(&header)));
+                    }
+                }
+                item = cursor.next()?;
+            }
+            old
+        };
+        let h2h_tbl = txn.open_table(Some(T_HASH_TO_HEIGHT))?;
+        for (height, hash) in &old_headers {
+            txn.del(&hdr_tbl, u64_key(*height), None)?;
+            let _ = txn.del(&h2h_tbl, hash.as_slice(), None);
+        }
+
+        macro_rules! truncate_height_table_above {
+            ($name:expr) => {{
+                let table = txn.open_table(Some($name))?;
+                let keys: Vec<u64> = {
+                    let mut cursor = txn.cursor(&table)?;
+                    let mut keys = Vec::new();
+                    let mut item: Option<(Vec<u8>, Vec<u8>)> = cursor.first()?;
+                    while let Some((key, _)) = item {
+                        if let Some(height) = u64_from_key(&key) {
+                            if height > ancestor_height {
+                                keys.push(height);
+                            }
+                        }
+                        item = cursor.next()?;
+                    }
+                    keys
+                };
+                for height in keys {
+                    txn.del(&table, u64_key(height), None)?;
+                }
+            }};
+        }
+        for table_name in [
+            T_HEADER_ANCHORS,
+            T_CHAIN_WORK,
+            T_UNDO_LOGS,
+            T_RECENT_BLOCKS,
+            T_BLOCK_PROOFS,
+            T_BLOCK_AUTH_SIDECARS,
+            T_HISTORY_CLAIMS,
+            T_ACCEPTED_BLOCK_CERTIFICATES,
+        ] {
+            truncate_height_table_above!(table_name);
+        }
+
+        let tx_idx_tbl = txn.open_table(Some(T_TX_INDEX))?;
+        for tx_hash in reverted_tx_hashes {
+            let raw: Option<Vec<u8>> = txn.get(&tx_idx_tbl, tx_hash.0.as_slice())?;
+            if raw
+                .as_deref()
+                .and_then(decode_tx_index_value)
+                .is_some_and(|(height, _)| height > ancestor_height)
+            {
+                txn.del(&tx_idx_tbl, tx_hash.0.as_slice(), None)?;
+            }
+        }
+
+        let anchor_tbl = txn.open_table(Some(T_HEADER_ANCHORS))?;
+        let work_tbl = txn.open_table(Some(T_CHAIN_WORK))?;
+        let undo_tbl = txn.open_table(Some(T_UNDO_LOGS))?;
+        let recent_tbl = txn.open_table(Some(T_RECENT_BLOCKS))?;
+        let proof_tbl = txn.open_table(Some(T_BLOCK_PROOFS))?;
+        let sidecar_tbl = txn.open_table(Some(T_BLOCK_AUTH_SIDECARS))?;
+        let history_tbl = txn.open_table(Some(T_HISTORY_CLAIMS))?;
+        let certificate_tbl = txn.open_table(Some(T_ACCEPTED_BLOCK_CERTIFICATES))?;
+
+        for (payload, block) in replacement_payloads.iter().zip(replacement) {
+            let height_key = u64_key(block.header.height);
+            txn.put(
+                &hdr_tbl,
+                height_key,
+                encode_header(&block.header),
+                WriteFlags::empty(),
+            )?;
+            txn.put(
+                &h2h_tbl,
+                block.hash.as_slice(),
+                height_key,
+                WriteFlags::empty(),
+            )?;
+            txn.put(
+                &work_tbl,
+                height_key,
+                encode_chain_work(&block.cumulative_chainwork),
+                WriteFlags::empty(),
+            )?;
+
+            let previous_raw: Option<Vec<u8>> =
+                txn.get(&anchor_tbl, &u64_key(block.header.height - 1))?;
+            let previous = previous_raw
+                .as_deref()
+                .and_then(decode_header_chain_anchor)
+                .ok_or(StoreError::Decode("missing staged reorg parent anchor"))?;
+            let anchor =
+                extend_header_chain_anchor(&previous, &block.header, block.cumulative_chainwork)?;
+            if anchor.block_id != block.hash {
+                return Err(StoreError::Decode("staged reorg anchor mismatch"));
+            }
+            txn.put(
+                &anchor_tbl,
+                height_key,
+                encode_header_chain_anchor(&anchor),
+                WriteFlags::empty(),
+            )?;
+            txn.put(
+                &undo_tbl,
+                height_key,
+                encode_undo_log(&block.undo_log),
+                WriteFlags::empty(),
+            )?;
+            let block_bytes = payload.block.to_bytes();
+            txn.put(&recent_tbl, height_key, &block_bytes, WriteFlags::empty())?;
+            if payload.block_proof_bytes.is_empty() {
+                let _ = txn.del(&proof_tbl, height_key, None);
+                let _ = txn.del(&sidecar_tbl, height_key, None);
+            } else {
+                txn.put(
+                    &proof_tbl,
+                    height_key,
+                    payload.block_proof_bytes,
+                    WriteFlags::empty(),
+                )?;
+                txn.put(
+                    &sidecar_tbl,
+                    height_key,
+                    payload.block_auth_sidecar_bytes,
+                    WriteFlags::empty(),
+                )?;
+            }
+            txn.put(
+                &history_tbl,
+                height_key,
+                &block.history_claim_bytes,
+                WriteFlags::empty(),
+            )?;
+            txn.put(
+                &certificate_tbl,
+                height_key,
+                &block.accepted_block_certificate_bytes,
+                WriteFlags::empty(),
+            )?;
+            for (position, transaction) in payload.block.transactions.iter().enumerate() {
+                let tx_hash = transaction.txid();
+                txn.put(
+                    &tx_idx_tbl,
+                    tx_hash.0,
+                    encode_tx_index_value(block.header.height, position as u32),
+                    WriteFlags::empty(),
+                )?;
+            }
+        }
+
+        let tip_tbl = txn.open_table(Some(T_CHAIN_TIP))?;
+        txn.put(
+            &tip_tbl,
+            KEY_TIP,
+            encode_chain_tip(final_header.height, final_hash),
+            WriteFlags::empty(),
+        )?;
+        let consensus_tbl = txn.open_table(Some(T_CONSENSUS_META))?;
+        txn.put(
+            &consensus_tbl,
+            KEY_CONSENSUS_META,
+            encode_consensus_meta(consensus_meta),
+            WriteFlags::empty(),
+        )?;
+        let meta_tbl = txn.open_table(Some(T_STATE_META))?;
+        txn.put(
+            &meta_tbl,
+            KEY_META,
+            encode_state_meta(
+                final_header.log_slots,
+                final_header.active_slot_count,
+                final_header.alloc_counter,
+            ),
+            WriteFlags::empty(),
+        )?;
+
+        // Rebuild the owner accelerator from the exact post-reorg segment
+        // table. Clear is an MDBX operation (no all-key Vec), and records are
+        // written as each single decoded segment is visited (no owner map).
+        let owner_tbl = txn.open_table(Some(T_OWNER_INDEX))?;
+        txn.clear_table(&owner_tbl)?;
+        let mut cursor = txn.cursor(&seg_tbl)?;
+        let mut item: Option<(Vec<u8>, Vec<u8>)> = cursor.first()?;
+        while let Some((key, raw)) = item {
+            if key.len() != 2 {
+                return Err(StoreError::Decode(
+                    "invalid segment key during reorg owner rebuild",
+                ));
+            }
+            let segment_id = u16::from_le_bytes([key[0], key[1]]);
+            let (effective_log, columns) = decode_segment(&raw).ok_or(StoreError::Decode(
+                "invalid segment during reorg owner rebuild",
+            ))?;
+            visit_live_owner_records(
+                segment_id,
+                effective_log,
+                &columns,
+                |owner, slot_index, packed_value| {
+                    txn.put(
+                        &owner_tbl,
+                        owner_index_key(&owner, slot_index),
+                        encode_owner_index_value(packed_value),
+                        WriteFlags::empty(),
+                    )?;
+                    Ok(())
+                },
+            )?;
+            item = cursor.next()?;
+        }
+
+        txn.commit()?;
+        if let Err(_error) = self.prune_after_commit(final_header.height) {
+            // The accepted branch is already durable.  Pruning is retryable
+            // maintenance and must not masquerade as a failed reorg.
+        }
         Ok(())
     }
 
@@ -1703,19 +2496,7 @@ impl MdbxStore {
         ];
         for name in tables {
             let tbl = txn.open_table(Some(name))?;
-            let keys: Vec<Vec<u8>> = {
-                let mut cur = txn.cursor(&tbl)?;
-                let mut keys = Vec::new();
-                let mut item: Option<(Vec<u8>, Vec<u8>)> = cur.first()?;
-                while let Some((k, _)) = item {
-                    keys.push(k);
-                    item = cur.next()?;
-                }
-                keys
-            };
-            for k in keys {
-                let _ = txn.del(&tbl, &k, None);
-            }
+            txn.clear_table(&tbl)?;
         }
         txn.commit()?;
         Ok(())
@@ -1763,20 +2544,11 @@ impl crate::storage::BlockStore for MdbxStore {
 mod tests {
     use super::*;
 
-    fn owner_index_raw(entries: &[(u32, u128)]) -> Vec<u8> {
-        let mut raw = Vec::with_capacity(entries.len() * OWNER_INDEX_RECORD_BYTES);
-        for &(slot_index, packed_value) in entries {
-            raw.extend_from_slice(&slot_index.to_le_bytes());
-            raw.extend_from_slice(&packed_value.to_le_bytes());
-        }
-        raw
-    }
-
-    fn overwrite_owner_index(store: &MdbxStore, owner: &[u8; 32], raw: &[u8]) {
+    fn overwrite_owner_index_record(store: &MdbxStore, key: &[u8], value: &[u8]) {
         let txn = store.db.begin_rw_txn().unwrap();
         let table = txn.open_table(Some(T_OWNER_INDEX)).unwrap();
-        txn.put(&table, owner.as_slice(), raw, WriteFlags::empty())
-            .unwrap();
+        txn.clear_table(&table).unwrap();
+        txn.put(&table, key, value, WriteFlags::empty()).unwrap();
         txn.commit().unwrap();
     }
 
@@ -1825,9 +2597,10 @@ mod tests {
                 &header,
                 &hash,
                 &undo,
-                &[(0, 3, &columns)],
+                &[(0, 3, Some(&columns))],
                 &[],
                 &[],
+                None,
                 None,
                 &meta,
                 false,
@@ -1838,23 +2611,52 @@ mod tests {
 
     #[test]
     fn owner_index_codec_rejects_noncanonical_values() {
-        let first = OwnerIndexEntry {
-            slot_index: 1,
-            packed_value: 7,
-        };
-        let second = OwnerIndexEntry {
-            slot_index: 2,
-            packed_value: 8,
-        };
-        let encoded = encode_owner_entries(&[first, second]).unwrap();
-        assert_eq!(decode_owner_entries(&encoded).unwrap(), vec![first, second]);
+        let owner = [0x31; 32];
+        let first = owner_index_key(&owner, 1);
+        let second = owner_index_key(&owner, 256);
+        assert!(first < second, "slot_be must preserve numeric cursor order");
+        assert_eq!(decode_owner_index_key(&first).unwrap(), (owner, 1));
+        assert_eq!(decode_owner_index_key(&second).unwrap(), (owner, 256));
+        assert!(decode_owner_index_key(&first[..35]).is_err());
+        assert!(decode_owner_index_key(&owner).is_err());
 
-        assert!(decode_owner_entries(&[]).is_err());
-        assert!(decode_owner_entries(&encoded[..encoded.len() - 1]).is_err());
-        assert!(encode_owner_entries(&[second, first]).is_err());
-        assert!(encode_owner_entries(&[first, first]).is_err());
-        assert!(decode_owner_entries(&owner_index_raw(&[(2, 8), (1, 7)])).is_err());
-        assert!(decode_owner_entries(&owner_index_raw(&[(1, 7), (1, 8)])).is_err());
+        let value = encode_owner_index_value(7);
+        assert_eq!(decode_owner_index_value(&value).unwrap(), 7);
+        assert!(decode_owner_index_value(&value[..15]).is_err());
+    }
+
+    #[test]
+    fn segment_ids_ignore_payloads_and_sort_keys_numerically() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(dir.path()).unwrap();
+        for segment_id in [511u16, 1, 256] {
+            store
+                .put_raw_segment_record_for_test(
+                    &segment_id.to_le_bytes(),
+                    b"deliberately not a segment payload",
+                )
+                .unwrap();
+        }
+
+        assert_eq!(store.segment_ids().unwrap(), vec![1, 256, 511]);
+    }
+
+    #[test]
+    fn segment_ids_reject_malformed_and_duplicate_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(dir.path()).unwrap();
+        store
+            .put_raw_segment_record_for_test(&[0xAA], b"payload is irrelevant")
+            .unwrap();
+        assert!(matches!(
+            store.segment_ids(),
+            Err(StoreError::Decode("invalid stored segment key"))
+        ));
+
+        assert!(matches!(
+            sort_unique_segment_ids(vec![7, 2, 7]),
+            Err(StoreError::Decode("duplicate stored segment key"))
+        ));
     }
 
     #[test]
@@ -1866,6 +2668,19 @@ mod tests {
         let owner = Address([0x41; 32]);
         let other = Address([0x42; 32]);
         let (header, _) = commit_owner_fixture(&store, owner);
+
+        {
+            let txn = store.db.begin_ro_txn().unwrap();
+            let table = txn.open_table(Some(T_OWNER_INDEX)).unwrap();
+            let mut cursor = txn.cursor(&table).unwrap();
+            let (first_key, first_value): (Vec<u8>, Vec<u8>) = cursor.first().unwrap().unwrap();
+            let (second_key, second_value): (Vec<u8>, Vec<u8>) = cursor.next().unwrap().unwrap();
+            assert_eq!(decode_owner_index_key(&first_key).unwrap(), (owner.0, 1));
+            assert_eq!(decode_owner_index_key(&second_key).unwrap(), (owner.0, 6));
+            assert_eq!(first_value.len(), OWNER_INDEX_VALUE_BYTES);
+            assert_eq!(second_value.len(), OWNER_INDEX_VALUE_BYTES);
+            assert!(cursor.next::<Vec<u8>, Vec<u8>>().unwrap().is_none());
+        }
 
         let snapshot = store.get_verified_utxos_by_owner(&owner.0).unwrap();
         assert_eq!(snapshot.owner, owner.0);
@@ -1924,26 +2739,37 @@ mod tests {
         let owner = Address([0x51; 32]);
         let (_header, _) = commit_owner_fixture(&store, owner);
         let amount_11_id_7 = pack_amount_creation_id(11, 7).0;
-        let amount_22_id_8 = pack_amount_creation_id(22, 8).0;
 
-        for raw in [
-            vec![0xAA],
-            owner_index_raw(&[(1, amount_11_id_7), (1, amount_11_id_7)]),
-            owner_index_raw(&[(6, amount_22_id_8), (1, amount_11_id_7)]),
-            owner_index_raw(&[(1, pack_amount_creation_id(12, 7).0)]),
-            owner_index_raw(&[(1, pack_amount_creation_id(11, 9).0)]),
-            owner_index_raw(&[(2, amount_11_id_7)]),
-            owner_index_raw(&[(8, amount_11_id_7)]),
+        for (key, value) in [
+            (owner_index_key(&owner.0, 1).to_vec(), vec![0xAA]),
+            // The removed aggregate owner -> Vec format must fail closed.
+            (owner.0.to_vec(), amount_11_id_7.to_le_bytes().to_vec()),
+            (
+                owner_index_key(&owner.0, 1).to_vec(),
+                encode_owner_index_value(pack_amount_creation_id(12, 7).0).to_vec(),
+            ),
+            (
+                owner_index_key(&owner.0, 1).to_vec(),
+                encode_owner_index_value(pack_amount_creation_id(11, 9).0).to_vec(),
+            ),
+            (
+                owner_index_key(&owner.0, 2).to_vec(),
+                encode_owner_index_value(amount_11_id_7).to_vec(),
+            ),
+            (
+                owner_index_key(&owner.0, 8).to_vec(),
+                encode_owner_index_value(amount_11_id_7).to_vec(),
+            ),
         ] {
-            overwrite_owner_index(&store, &owner.0, &raw);
+            overwrite_owner_index_record(&store, &key, &value);
             assert!(store.get_verified_utxos_by_owner(&owner.0).is_err());
         }
 
         let wrong_owner = Address([0x52; 32]);
-        overwrite_owner_index(
+        overwrite_owner_index_record(
             &store,
-            &wrong_owner.0,
-            &owner_index_raw(&[(1, amount_11_id_7)]),
+            &owner_index_key(&wrong_owner.0, 1),
+            &encode_owner_index_value(amount_11_id_7),
         );
         assert!(store.get_verified_utxos_by_owner(&wrong_owner.0).is_err());
     }
@@ -1989,6 +2815,218 @@ mod tests {
         );
     }
 
+    fn staged_snapshot_install_fixture(
+        store: &MdbxStore,
+        staging_parent: &std::path::Path,
+    ) -> (
+        crate::storage::FinalizedSnapshotStaging,
+        BlockHeader,
+        BlockHeader,
+        noid_poseidon2b::primitives::Address,
+        noid_poseidon2b::primitives::Address,
+    ) {
+        use crate::state::ChainState;
+        use crate::storage::{
+            AuthenticatedSnapshotMetadata, SnapshotSegmentDescriptor, SnapshotStagingSession,
+        };
+        use noid_poseidon2b::primitives::Address;
+
+        let old_owner = Address([0x71; 32]);
+        let new_owner = Address([0x72; 32]);
+        let old_slot = SlotValue::with_owner_fields(41, 1, old_owner.as_fields());
+        let new_slot = SlotValue::with_owner_fields(73, 2, new_owner.as_fields());
+        let old_state = ChainState::from_sparse_utxos(3, &[(1, old_slot)], 1).unwrap();
+        let new_state = ChainState::from_sparse_utxos(3, &[(6, new_slot)], 2).unwrap();
+
+        let mut old_header = crate::consensus::genesis::genesis_header();
+        old_header.log_slots = 3;
+        old_header.active_slot_count = 1;
+        old_header.alloc_counter = 1;
+        old_header.state_root = old_state.utxo_root;
+        let old_hash = crate::hash_block_header(&old_header);
+        store
+            .put_verified_header_only(&old_header, &old_hash, &[1; 32])
+            .unwrap();
+        let old_meta = ConsensusMeta {
+            tip_height: 0,
+            tip_hash: old_hash,
+            cumulative_chainwork: [1; 32],
+            finalized: crate::storage::meta::FinalizedCheckpoint {
+                height: 0,
+                hash: old_hash,
+            },
+        };
+        let mut old_columns = SegmentColumns::new_zero(8);
+        old_columns.values[1] = old_slot.value;
+        old_columns.owners_hi[1] = old_slot.owner_hi;
+        old_columns.owners_lo[1] = old_slot.owner_lo;
+        store
+            .install_state_snapshot(&old_header, &old_hash, &old_meta, &[(0, 3, &old_columns)])
+            .unwrap();
+
+        let mut new_header = old_header;
+        new_header.height = 1;
+        new_header.prev_block_hash = old_hash;
+        new_header.active_slot_count = 1;
+        new_header.alloc_counter = 2;
+        new_header.state_root = new_state.utxo_root;
+        let new_hash = crate::hash_block_header(&new_header);
+        store
+            .put_verified_header_only(&new_header, &new_hash, &[2; 32])
+            .unwrap();
+
+        let mut new_columns = SegmentColumns::new_zero(8);
+        new_columns.values[6] = new_slot.value;
+        new_columns.owners_hi[6] = new_slot.owner_hi;
+        new_columns.owners_lo[6] = new_slot.owner_lo;
+        let encoded = encode_segment(&new_columns, 3);
+        let descriptor = SnapshotSegmentDescriptor {
+            segment_id: 0,
+            segment_root: compute_segment_root(
+                3,
+                &new_columns.values,
+                &new_columns.owners_hi,
+                &new_columns.owners_lo,
+            ),
+            encoded_len: encoded.len() as u32,
+        };
+        let authenticated =
+            AuthenticatedSnapshotMetadata::from_authenticated_header(new_header, new_hash, 3)
+                .unwrap();
+        let mut session =
+            SnapshotStagingSession::new(staging_parent, authenticated, vec![descriptor]).unwrap();
+        session.accept_segment(0, 3, &encoded).unwrap();
+        let finalized = session.finalize().unwrap();
+        (finalized, old_header, new_header, old_owner, new_owner)
+    }
+
+    #[test]
+    fn finalized_staging_installs_segments_owner_index_and_compact_hot_state_atomically() {
+        let database = tempfile::tempdir().unwrap();
+        let staging_parent = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(database.path()).unwrap();
+        let (staging, old_header, new_header, old_owner, new_owner) =
+            staged_snapshot_install_fixture(&store, staging_parent.path());
+        let new_hash = crate::hash_block_header(&new_header);
+        let meta = ConsensusMeta {
+            tip_height: 1,
+            tip_hash: new_hash,
+            cumulative_chainwork: [2; 32],
+            finalized: crate::storage::meta::FinalizedCheckpoint {
+                height: 1,
+                hash: new_hash,
+            },
+        };
+        store
+            .put_history_checkpoint_head_record(0, b"stale-history-head")
+            .unwrap();
+        store
+            .put_accepted_block_batch_certificate_package(0, b"stale-batch")
+            .unwrap();
+
+        let hot_state = store
+            .install_finalized_snapshot_staging(&staging, &meta, &[old_header, new_header])
+            .unwrap();
+        assert_eq!(store.get_chain_tip().unwrap(), Some((1, new_hash)));
+        assert_eq!(store.get_state_meta().unwrap(), Some((3, 1, 2)));
+        assert_eq!(hot_state.cached_state_root(), new_header.state_root);
+        assert_eq!(hot_state.state.materialized_segment_ids().count(), 0);
+        assert_eq!(
+            hot_state.state.active_segment_ids().collect::<Vec<_>>(),
+            vec![0]
+        );
+        assert!(hot_state.state.is_evicted(0));
+        assert_eq!(store.get_history_checkpoint_head_record(0).unwrap(), None);
+        assert_eq!(
+            store
+                .get_accepted_block_batch_certificate_package(0)
+                .unwrap(),
+            None
+        );
+        assert!(store
+            .get_verified_utxos_by_owner(&old_owner.0)
+            .unwrap()
+            .utxos
+            .is_empty());
+        assert_eq!(
+            store
+                .get_verified_utxos_by_owner(&new_owner.0)
+                .unwrap()
+                .utxos,
+            vec![VerifiedOwnerUtxo {
+                slot_index: 6,
+                amount: 73,
+                creation_id: 2,
+            }]
+        );
+    }
+
+    #[test]
+    fn finalized_staging_failure_aborts_clears_and_preserves_old_state_epoch() {
+        let database = tempfile::tempdir().unwrap();
+        let staging_parent = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(database.path()).unwrap();
+        let (staging, old_header, new_header, old_owner, new_owner) =
+            staged_snapshot_install_fixture(&store, staging_parent.path());
+        let old_hash = crate::hash_block_header(&old_header);
+        let new_hash = crate::hash_block_header(&new_header);
+        let staged_path = staging.staging_directory().join("segment-00000.bin");
+        let mut permissions = std::fs::metadata(&staged_path).unwrap().permissions();
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&staged_path, permissions).unwrap();
+        let mut tampered = std::fs::read(&staged_path).unwrap();
+        *tampered.last_mut().unwrap() ^= 1;
+        std::fs::write(&staged_path, tampered).unwrap();
+        store
+            .put_history_checkpoint_head_record(0, b"old-authority")
+            .unwrap();
+        store
+            .put_accepted_block_batch_certificate_package(0, b"old-batch")
+            .unwrap();
+
+        let meta = ConsensusMeta {
+            tip_height: 1,
+            tip_hash: new_hash,
+            cumulative_chainwork: [2; 32],
+            finalized: crate::storage::meta::FinalizedCheckpoint {
+                height: 1,
+                hash: new_hash,
+            },
+        };
+        assert!(store
+            .install_finalized_snapshot_staging(&staging, &meta, &[old_header, new_header])
+            .is_err());
+
+        assert_eq!(store.get_chain_tip().unwrap(), Some((0, old_hash)));
+        assert_eq!(store.get_state_meta().unwrap(), Some((3, 1, 1)));
+        assert_eq!(
+            store.get_history_checkpoint_head_record(0).unwrap(),
+            Some(b"old-authority".to_vec())
+        );
+        assert_eq!(
+            store
+                .get_accepted_block_batch_certificate_package(0)
+                .unwrap(),
+            Some(b"old-batch".to_vec())
+        );
+        assert_eq!(
+            store
+                .get_verified_utxos_by_owner(&old_owner.0)
+                .unwrap()
+                .utxos,
+            vec![VerifiedOwnerUtxo {
+                slot_index: 1,
+                amount: 41,
+                creation_id: 1,
+            }]
+        );
+        assert!(store
+            .get_verified_utxos_by_owner(&new_owner.0)
+            .unwrap()
+            .utxos
+            .is_empty());
+    }
+
     #[test]
     fn clear_all_removes_chain_and_certificate_epochs_together() {
         let dir = tempfile::tempdir().unwrap();
@@ -2004,7 +3042,18 @@ mod tests {
         };
 
         store
-            .commit_block(&header, &hash, &undo, &[], &[], &[], None, &meta, false)
+            .commit_block(
+                &header,
+                &hash,
+                &undo,
+                &[],
+                &[],
+                &[],
+                None,
+                None,
+                &meta,
+                false,
+            )
             .unwrap();
         store.put_history_claim(0, b"history").unwrap();
         store
@@ -2033,6 +3082,109 @@ mod tests {
     }
 
     #[test]
+    fn accepted_material_is_atomic_and_coinbase_replacement_clears_stale_proof() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(dir.path()).unwrap();
+        let header = crate::consensus::genesis::genesis_header();
+        let hash = crate::hash_block_header(&header);
+        let undo = BlockUndoLog::empty(0, header.log_slots);
+        let meta = ConsensusMeta {
+            tip_height: 0,
+            tip_hash: hash,
+            cumulative_chainwork: [1u8; 32],
+            finalized: crate::storage::meta::FinalizedCheckpoint { height: 0, hash },
+        };
+
+        store
+            .commit_block(
+                &header,
+                &hash,
+                &undo,
+                &[],
+                &[],
+                &[],
+                Some(b"first-body"),
+                Some(AcceptedBlockCommitData {
+                    block_proof_bytes: b"first-proof",
+                    block_auth_sidecar_bytes: b"first-sidecar",
+                    history_claim_bytes: b"first-history",
+                    accepted_block_certificate_bytes: b"first-certificate",
+                }),
+                &meta,
+                false,
+            )
+            .unwrap();
+
+        let invalid = store.commit_block(
+            &header,
+            &hash,
+            &undo,
+            &[],
+            &[],
+            &[],
+            Some(b"uncommitted-body"),
+            Some(AcceptedBlockCommitData {
+                block_proof_bytes: b"uncommitted-proof",
+                block_auth_sidecar_bytes: b"uncommitted-sidecar",
+                history_claim_bytes: b"",
+                accepted_block_certificate_bytes: b"uncommitted-certificate",
+            }),
+            &meta,
+            false,
+        );
+        assert!(matches!(
+            invalid,
+            Err(StoreError::Decode("accepted history claim is empty"))
+        ));
+        assert_eq!(
+            store.get_recent_block(0).unwrap().as_deref(),
+            Some(b"first-body".as_slice())
+        );
+        assert_eq!(
+            store.get_block_proof(0).unwrap().as_deref(),
+            Some(b"first-proof".as_slice())
+        );
+        assert_eq!(
+            store.get_block_auth_sidecar(0).unwrap().as_deref(),
+            Some(b"first-sidecar".as_slice())
+        );
+        assert_eq!(
+            store.get_history_claim(0).unwrap().as_deref(),
+            Some(b"first-history".as_slice())
+        );
+
+        store
+            .commit_block(
+                &header,
+                &hash,
+                &undo,
+                &[],
+                &[],
+                &[],
+                Some(b"replacement-body"),
+                Some(AcceptedBlockCommitData {
+                    block_proof_bytes: b"",
+                    block_auth_sidecar_bytes: b"",
+                    history_claim_bytes: b"replacement-history",
+                    accepted_block_certificate_bytes: b"replacement-certificate",
+                }),
+                &meta,
+                false,
+            )
+            .unwrap();
+        assert_eq!(store.get_block_proof(0).unwrap(), None);
+        assert_eq!(store.get_block_auth_sidecar(0).unwrap(), None);
+        assert_eq!(
+            store.get_history_claim(0).unwrap().as_deref(),
+            Some(b"replacement-history".as_slice())
+        );
+        assert_eq!(
+            store.get_accepted_block_certificate(0).unwrap().as_deref(),
+            Some(b"replacement-certificate".as_slice())
+        );
+    }
+
+    #[test]
     fn tx_index_reorg_delete_preserves_ancestor_entry() {
         let dir = tempfile::tempdir().unwrap();
         let store = MdbxStore::open(dir.path()).unwrap();
@@ -2056,6 +3208,7 @@ mod tests {
                 std::slice::from_ref(&ancestor_tx),
                 &[],
                 None,
+                None,
                 &meta,
                 false,
             )
@@ -2068,6 +3221,7 @@ mod tests {
                 &[],
                 &[],
                 std::slice::from_ref(&ancestor_tx),
+                None,
                 None,
                 &meta,
                 false,
@@ -2110,6 +3264,7 @@ mod tests {
                     &[],
                     &undo.tx_hashes,
                     &[],
+                    None,
                     None,
                     &meta,
                     false,
@@ -2160,9 +3315,10 @@ mod tests {
                 &header,
                 &hash,
                 &undo,
-                &[(0, 1, &branch_cols)],
+                &[(0, 1, Some(&branch_cols))],
                 &[],
                 &[],
+                None,
                 None,
                 &meta,
                 false,
@@ -2188,9 +3344,10 @@ mod tests {
                 &header,
                 &hash,
                 &undo,
-                &[(0, 1, &restored_cols)],
+                &[(0, 1, Some(&restored_cols))],
                 &[],
                 &[],
+                None,
                 None,
                 &meta,
                 true,
@@ -2229,9 +3386,10 @@ mod tests {
                 &header,
                 &hash,
                 &replacement_undo,
-                &[(0, 1, &replacement_cols)],
+                &[(0, 1, Some(&replacement_cols))],
                 &[],
                 &[],
+                None,
                 None,
                 &meta,
                 false,
@@ -2258,15 +3416,15 @@ mod tests {
             slot_changes: vec![(1, replacement)],
             ..undo.clone()
         };
-        let empty_cols = SegmentColumns::new_zero(0);
         store
             .commit_block(
                 &header,
                 &hash,
                 &spent_undo,
-                &[(0, 1, &empty_cols)],
+                &[(0, 1, None)],
                 &[],
                 &[],
+                None,
                 None,
                 &meta,
                 false,

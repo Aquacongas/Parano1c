@@ -324,6 +324,9 @@ pub fn build_block_template(
                     .into_iter()
                     .find(|&slot| {
                         !reserved.contains(&slot)
+                            && !scratch.state.is_evicted(
+                                (slot >> scratch.state.effective_log_segment_size()) as u16,
+                            )
                             && scratch.state.slot(slot) == crate::fri_state::SlotValue::EMPTY
                     });
                 count *= 2;

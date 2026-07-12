@@ -8,13 +8,13 @@
 //!
 //! ```text
 //!  wallet
-//!    │  TxIntent (body + AuthGKR bytes)
+//!    │  TxIntent (body + selected-ZK authorization bytes)
 //!    ▼
 //!  AsyncMempool::submit()
 //!    ├─ stateless body-hash and size checks
 //!    ├─ cheap pre-filter under lock:
 //!    │  fee floor, consensus, anchor, slot conflicts/state
-//!    ├─ AuthGKR verification outside lock (`spawn_blocking`, semaphore-bounded)
+//!    ├─ authorization verification outside lock (`spawn_blocking`, semaphore-bounded)
 //!    └─ final admission under lock: re-run cheap checks against current view
 //!         │
 //!         ▼ admitted only after proof verification
@@ -24,7 +24,7 @@
 //!         ├──► RPC WebSocket: notify subscribed wallets
 //!         └──► Block builder: wake up if 100+ new txs
 //!
-//!  Cached proof reuse: admitted entries keep verified AuthGKR bytes for block assembly
+//!  Cached proof reuse: admitted entries keep verified selected-ZK bytes for block assembly
 //! ```
 //!
 //! ## Usage

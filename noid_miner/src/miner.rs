@@ -49,17 +49,45 @@ use noid_chain::storage::MdbxChainContext;
 use noid_mempool::AsyncMempool;
 use noid_poseidon2b::primitives::Address;
 
+use crate::memory_governor::ProofMemoryGovernor;
 use crate::template::{TemplateBuilder, TemplateChainSnapshot, TemplateRefreshTrigger};
 
-fn history_claim_fields_bytes(
+#[allow(clippy::too_many_arguments)]
+fn accepted_block_validation(
     block: &Block,
     parent: &noid_chain::BlockHeader,
+    prev_timestamps: &[u64],
+    prev_active_counts: &[u64],
+    anchor: &noid_chain::consensus::validation::AnchorInfo,
+    block_proof_bytes: &[u8],
+    block_auth_sidecar_bytes: &[u8],
     artifacts: &noid_block::AcceptedBlockValidationArtifacts,
-) -> Result<Vec<u8>, noid_block::FullValidationError> {
-    let claim =
-        noid_block::AcceptedStateTransitionClaim::from_accepted_block(block, parent, artifacts)
-            .map_err(noid_block::FullValidationError::from)?;
-    Ok(bincode::serialize(&claim.fields().to_vec()).expect("history claim fields serialize"))
+    state_root: [u8; 32],
+) -> Result<noid_chain::AppliedBlockValidation, noid_block::FullValidationError> {
+    let post_validation = noid_block::accepted_block_post_validation_bundle(
+        block,
+        parent,
+        prev_timestamps,
+        prev_active_counts,
+        anchor,
+        block_proof_bytes,
+        block_auth_sidecar_bytes,
+        artifacts,
+    )?;
+    let record = noid_block::accepted_block_certificate_record(post_validation.acceptance_receipt)
+        .map_err(|error| {
+            noid_block::FullValidationError::Consensus(
+                noid_chain::consensus::ConsensusError::ShapeMismatch(format!(
+                    "accepted-block certificate record build failed: {error}"
+                )),
+            )
+        })?;
+    Ok(noid_chain::AppliedBlockValidation::new(
+        state_root,
+        bincode::serialize(&post_validation.history_claim_fields)
+            .expect("history claim fields serialize"),
+        bincode::serialize(&record).expect("accepted-block certificate record serializes"),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -84,6 +112,12 @@ pub struct MinerConfig {
     /// Must be > BLOCK_TIME to avoid firing during active proving and
     /// inserting unnecessary coinbase blocks.  Default: 5 × BLOCK_TIME = 75s.
     pub refresh_interval_secs: u64,
+    /// Maximum resident-memory envelope admitted for block proof workers, MiB.
+    ///
+    /// `0` selects a host-aware ceiling from currently available memory while
+    /// reserving capacity for validation, networking, and the OS. This is a
+    /// local scheduler policy and never changes consensus block limits.
+    pub proof_memory_budget_mib: usize,
 }
 
 impl Default for MinerConfig {
@@ -92,6 +126,7 @@ impl Default for MinerConfig {
             miner_address: Address([0u8; 32]),
             mining_threads: 0,
             refresh_interval_secs: 75, // 5 × BLOCK_TIME; real triggers are sync_ready + TxAdmitted
+            proof_memory_budget_mib: 0,
         }
     }
 }
@@ -122,7 +157,7 @@ pub enum MinerEvent {
         /// Serialized BlockProof bytes for P2P broadcast.
         /// Empty for coinbase-only blocks.
         block_proof_bytes: Vec<u8>,
-        /// Serialized public AuthGKR sidecar bytes carried as detached witness.
+        /// Versioned selected-ZK authorization sidecar bytes carried as detached witness.
         /// Empty for coinbase-only blocks.
         block_auth_sidecar_bytes: Vec<u8>,
     },
@@ -221,6 +256,9 @@ pub struct BlockMiner {
     /// Each heartbeat/mempool refresh drops the JoinHandle but NOT the blocking task;
     /// without this guard repeated refreshes can pile up blocking proof work.
     prove_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Shared resident-memory admission gate held for the complete lifetime of
+    /// each blocking proof job. It rejects work before Tokio can queue it.
+    proof_memory_governor: ProofMemoryGovernor,
     /// Optional hook called synchronously after block is applied to chain, before
     /// the mempool is updated. Used by the built-in wallet to generate receipts
     /// race-free (receipt ready before getMempoolSize → 0 is observable).
@@ -240,7 +278,13 @@ impl BlockMiner {
         let (events, rx) = broadcast::channel(32);
         let mining_threads = effective_mining_threads(config.mining_threads);
         let prover_threads = effective_prover_threads(config.mining_threads);
-        tracing::info!(mining_threads, prover_threads, "internal miner CPU split");
+        let proof_memory_governor = ProofMemoryGovernor::global(config.proof_memory_budget_mib);
+        tracing::info!(
+            mining_threads,
+            prover_threads,
+            proof_memory_budget_mib = proof_memory_governor.configured_budget_mib(),
+            "internal miner CPU and memory budgets"
+        );
         let miner = Self {
             config,
             mempool,
@@ -264,6 +308,7 @@ impl BlockMiner {
             stopped: Arc::new(AtomicBool::new(false)),
             sync_ready,
             prove_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+            proof_memory_governor,
             on_block_applied: None,
             payout_resolver: None,
         };
@@ -405,7 +450,9 @@ impl BlockMiner {
                 }
             };
             let prev_state_root = snapshot.prev_state_root();
-            let max_user_txs = adaptive_user_tx_limit(prove_ms_per_tx_ewma);
+            let memory_user_tx_limit = self.proof_memory_governor.max_user_txs_now();
+            let max_user_txs =
+                adaptive_user_tx_limit(prove_ms_per_tx_ewma).min(memory_user_tx_limit);
             let tmpl = match builder
                 .build_from_snapshot_with_limit(&snapshot, addr, now, max_user_txs)
                 .await
@@ -430,6 +477,7 @@ impl BlockMiner {
                 height,
                 n_txs,
                 max_user_txs,
+                memory_user_tx_limit,
                 prove_ms_per_tx_ewma,
                 "mining template ready"
             );
@@ -568,25 +616,7 @@ impl BlockMiner {
                             // if we fire the event before storing, a fast peer gets None.
                             if let Err(e) = self.apply_found_block(&block, &block_proof_bytes, &block_auth_sidecar_bytes).await {
                                 tracing::warn!(height, "miner: block superseded (reorg in progress): {e}");
-                            }
-
-                            // Store block proof + public auth sidecar bytes for local
-                            // finalized-history coverage and compact P2P pull requests.
-                            if !block_proof_bytes.is_empty() {
-                                let ctx = self.chain.read().await;
-                                if let Err(e) = ctx.store.put_block_proof(height, &block_proof_bytes) {
-                                    tracing::warn!(height, err = %e, "failed to store block proof bytes");
-                                } else {
-                                    tracing::debug!(height, bytes = block_proof_bytes.len(), "block proof stored");
-                                }
-                                if let Err(e) = ctx
-                                    .store
-                                    .put_block_auth_sidecar(height, &block_auth_sidecar_bytes)
-                                {
-                                    tracing::warn!(height, err = %e, "failed to store block auth sidecar bytes");
-                                } else {
-                                    tracing::debug!(height, bytes = block_auth_sidecar_bytes.len(), "block auth sidecar stored");
-                                }
+                                continue;
                             }
 
                             // Now safe to announce — block and proof are in MDBX.
@@ -683,7 +713,6 @@ impl BlockMiner {
             let hook = self.on_block_applied.clone();
             tokio::task::spawn_blocking(move || {
                 let mut ctx = chain_clone.blocking_write();
-                let mut history_claim_bytes = None;
                 ctx.apply_next_block(
                     &block_owned,
                     &proof_bytes,
@@ -698,7 +727,6 @@ impl BlockMiner {
                      local_time,
                      tx_epoch_anchor_id,
                      anchor,
-                     _pre_state,
                      state| {
                         let tx_epoch = noid_block::BlockTxEpochContext {
                             expected_user_epoch_anchor_id: *tx_epoch_anchor_id,
@@ -715,26 +743,19 @@ impl BlockMiner {
                             anchor,
                             state,
                         )?;
-                        history_claim_bytes = Some(history_claim_fields_bytes(
+                        accepted_block_validation(
                             block,
                             parent,
+                            prev_timestamps,
+                            prev_active_counts,
+                            anchor,
+                            proof_bytes,
+                            auth_sidecar_bytes,
                             &output.artifacts,
-                        )?);
-                        Ok::<[u8; 32], noid_block::FullValidationError>(output.state_root)
+                            output.state_root,
+                        )
                     },
                 )?;
-                if let Some(bytes) = &history_claim_bytes {
-                    if let Err(e) = ctx
-                        .store
-                        .put_history_claim(block_owned.header.height, bytes)
-                    {
-                        tracing::warn!(
-                            height = block_owned.header.height,
-                            err = %e,
-                            "failed to store mined history claim fields"
-                        );
-                    }
-                }
                 if let Some(h) = &hook {
                     h(&block_owned);
                 }
@@ -792,6 +813,9 @@ pub(crate) fn run_prove_block(
         );
         return Ok((vec![], vec![]));
     }
+    let _proof_memory_reservation = tmpl
+        .take_proof_memory_reservation()
+        .ok_or_else(|| "unbudgeted or already-consumed proof template rejected".to_string())?;
 
     let mut bundles: Vec<WalletAuthorizationBundle> = Vec::with_capacity(non_cb_count);
     for (idx, opt) in tmpl.authorization_bytes.iter().enumerate() {
@@ -819,7 +843,8 @@ pub(crate) fn run_prove_block(
     let auth_sidecar = BlockAuthSidecar {
         tx_auth: bundles.into_iter().map(|bundle| bundle.proof).collect(),
     };
-    let auth_sidecar_bytes = bincode::serialize(&auth_sidecar)
+    let auth_sidecar_bytes = auth_sidecar
+        .to_bytes()
         .map_err(|e| format!("BlockAuthSidecar serialize failed: {e}"))?;
 
     let n_tx = tmpl.n_user_txs() as u32;

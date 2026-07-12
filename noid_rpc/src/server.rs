@@ -112,15 +112,42 @@ fn read_canonical_slot(
     })
 }
 
-fn history_claim_fields_bytes(
+#[allow(clippy::too_many_arguments)]
+fn accepted_block_validation(
     block: &Block,
     parent: &noid_chain::BlockHeader,
+    prev_timestamps: &[u64],
+    prev_active_counts: &[u64],
+    anchor: &noid_chain::consensus::validation::AnchorInfo,
+    block_proof_bytes: &[u8],
+    block_auth_sidecar_bytes: &[u8],
     artifacts: &noid_block::AcceptedBlockValidationArtifacts,
-) -> Result<Vec<u8>, noid_block::FullValidationError> {
-    let claim =
-        noid_block::AcceptedStateTransitionClaim::from_accepted_block(block, parent, artifacts)
-            .map_err(noid_block::FullValidationError::from)?;
-    Ok(bincode::serialize(&claim.fields().to_vec()).expect("history claim fields serialize"))
+    state_root: [u8; 32],
+) -> Result<noid_chain::AppliedBlockValidation, noid_block::FullValidationError> {
+    let post_validation = noid_block::accepted_block_post_validation_bundle(
+        block,
+        parent,
+        prev_timestamps,
+        prev_active_counts,
+        anchor,
+        block_proof_bytes,
+        block_auth_sidecar_bytes,
+        artifacts,
+    )?;
+    let record = noid_block::accepted_block_certificate_record(post_validation.acceptance_receipt)
+        .map_err(|error| {
+            noid_block::FullValidationError::Consensus(
+                noid_chain::consensus::ConsensusError::ShapeMismatch(format!(
+                    "accepted-block certificate record build failed: {error}"
+                )),
+            )
+        })?;
+    Ok(noid_chain::AppliedBlockValidation::new(
+        state_root,
+        bincode::serialize(&post_validation.history_claim_fields)
+            .expect("history claim fields serialize"),
+        bincode::serialize(&record).expect("accepted-block certificate record serializes"),
+    ))
 }
 
 #[inline]
@@ -1033,7 +1060,6 @@ impl ParanoidApiServer for RpcHandler {
         // proven transition, then commit atomically to MDBX.
         let (hash, new_view) = {
             let mut ctx = self.chain.write().await;
-            let mut history_claim_bytes = None;
             ctx.apply_next_block(
                 &block,
                 &block_proof_bytes,
@@ -1048,7 +1074,6 @@ impl ParanoidApiServer for RpcHandler {
                  local_time,
                  tx_epoch_anchor_id,
                  anchor,
-                 _pre_state,
                  state| {
                     let tx_epoch = noid_block::BlockTxEpochContext {
                         expected_user_epoch_anchor_id: *tx_epoch_anchor_id,
@@ -1065,28 +1090,20 @@ impl ParanoidApiServer for RpcHandler {
                         anchor,
                         state,
                     )?;
-                    history_claim_bytes = Some(history_claim_fields_bytes(
+                    accepted_block_validation(
                         block,
                         parent,
+                        prev_timestamps,
+                        prev_active_counts,
+                        anchor,
+                        proof_bytes,
+                        auth_sidecar_bytes,
                         &output.artifacts,
-                    )?);
-                    Ok::<[u8; 32], noid_block::FullValidationError>(output.state_root)
+                        output.state_root,
+                    )
                 },
             )
             .map_err(|e| rpc_err(format!("consensus: {e}")))?;
-            if let Some(bytes) = &history_claim_bytes {
-                ctx.store
-                    .put_history_claim(block.header.height, bytes)
-                    .map_err(|e| rpc_err(format!("store history claim: {e}")))?;
-            }
-            if !block_proof_bytes.is_empty() {
-                ctx.store
-                    .put_block_proof(block.header.height, &block_proof_bytes)
-                    .map_err(|e| rpc_err(format!("store block proof: {e}")))?;
-                ctx.store
-                    .put_block_auth_sidecar(block.header.height, &block_auth_sidecar_bytes)
-                    .map_err(|e| rpc_err(format!("store block auth sidecar: {e}")))?;
-            }
             // The block is already durably committed. Keep the chain write
             // guard while applying its wallet delta (`chain -> wallet`), but a
             // wallet artifact failure must never report or attempt a consensus

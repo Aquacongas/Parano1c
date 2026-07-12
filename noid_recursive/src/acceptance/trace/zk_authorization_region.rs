@@ -3,7 +3,7 @@
 
 #![allow(dead_code)]
 
-//! Raw selected B255 authorization-region reconstruction.
+//! Raw selected authorization-region reconstruction for the canonical ladder.
 //!
 //! This module reconstructs the four authorization children changed by the ZK
 //! capsule: Owner/Main duplex, Wallet-A capsule leaves and Wallet-B FF paths.
@@ -58,11 +58,6 @@ use super::region_source_binding::{build_duplex_union, DuplexUnion};
 use super::zk_authorization_candidate::SelectedZkAuthorizationProofBatch;
 use crate::acceptance::zk_auth_capsule_schedule::ZkAuthCapsuleDuplexSchedules;
 
-const SELECTED_AUTH_COUNT: usize = 256;
-const OWNER_W_LOG: usize = 15;
-const MAIN_W_LOG: usize = 16;
-const WALLET_A_W_LOG: usize = 19;
-const WALLET_B_W_LOG: usize = 18;
 const WALLET_A_TILE_LOG: usize = 11;
 const WALLET_B_TILE_LOG: usize = 10;
 const WALLET_A_FAMILY_SLOTS: usize = ZK_CAPSULE_PCS_QUERY_COUNT * CAPSULE_LEAF_STRIDE;
@@ -76,10 +71,6 @@ const _: () = assert!(ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH == WALLET_B_PATH_DEPTH);
 const _: () = assert!(ZK_CAPSULE_PCS_MID_PATH_DEPTH == WALLET_B_PATH_DEPTH);
 const _: () = assert!(2 * WALLET_A_FAMILY_SLOTS == 1 << WALLET_A_TILE_LOG);
 const _: () = assert!(2 * WALLET_B_FAMILY_SLOTS == 1 << WALLET_B_TILE_LOG);
-const _: () = assert!(SELECTED_AUTH_COUNT << ZK_AUTH_OWNER_TILE_LOG == 1 << OWNER_W_LOG);
-const _: () = assert!(SELECTED_AUTH_COUNT << ZK_AUTH_MAIN_TILE_LOG == 1 << MAIN_W_LOG);
-const _: () = assert!(SELECTED_AUTH_COUNT << WALLET_A_TILE_LOG == 1 << WALLET_A_W_LOG);
-const _: () = assert!(SELECTED_AUTH_COUNT << WALLET_B_TILE_LOG == 1 << WALLET_B_W_LOG);
 const _: () = assert!(SELECTED_CHANGED_COMMITTED_COLUMNS == 27);
 
 #[derive(Debug)]
@@ -204,24 +195,23 @@ impl SelectedZkAuthorizationRegionDraft {
     }
 }
 
-/// Reconstruct all 256 selected authorization tiles from the sole
-/// policy-verified batch. Native proof verification and duplicate policy have
-/// already completed before this boundary.
+/// Reconstruct every selected authorization tile of one canonical class from
+/// the sole policy-verified batch. Native proof verification and duplicate
+/// policy have already completed before this boundary.
 pub(super) fn build_selected_zk_authorization_region_draft(
     batch: &SelectedZkAuthorizationProofBatch,
 ) -> Result<SelectedZkAuthorizationRegionDraft, SelectedZkAuthorizationRegionError> {
-    if batch.len() != SELECTED_AUTH_COUNT {
-        return Err(SelectedZkAuthorizationRegionError::Geometry(
-            "selected authorization batch is not B255/256",
-        ));
-    }
+    let geometry = crate::region_sidecar::selected_zk_block_geometry_for_auth_tiles(batch.len())
+        .ok_or(SelectedZkAuthorizationRegionError::Geometry(
+            "selected authorization batch is not a canonical class",
+        ))?;
     let schedules = ZkAuthCapsuleDuplexSchedules::selected();
     let owner_layout = schedules.owner_layout();
     let main_layout = schedules.main_layout();
     let iv = kschannl_iv_flat();
 
-    let mut owner_streams = Vec::with_capacity(SELECTED_AUTH_COUNT);
-    let mut main_streams = Vec::with_capacity(SELECTED_AUTH_COUNT);
+    let mut owner_streams = Vec::with_capacity(geometry.auth_tiles);
+    let mut main_streams = Vec::with_capacity(geometry.auth_tiles);
     let mut ghost_streams: Option<(Vec<F128>, Vec<F128>)> = None;
     for tx in 0..batch.len() {
         let entry = batch.entry_for_slot(tx);
@@ -243,14 +233,21 @@ pub(super) fn build_selected_zk_authorization_region_draft(
 
     let owner_union = build_duplex_union(&owner_layout, iv, &owner_streams);
     let main_union = build_duplex_union(&main_layout, iv, &main_streams);
-    if owner_union.w_log != OWNER_W_LOG || owner_union.block_log != ZK_AUTH_OWNER_TILE_LOG {
+    // The unions own their reconstructed columns; the per-tile absorbed-data
+    // streams are no longer needed while the much larger Wallet columns are
+    // materialized below.
+    drop(owner_streams);
+    drop(main_streams);
+    drop(ghost_streams);
+    if owner_union.w_log != geometry.owner_w_log || owner_union.block_log != ZK_AUTH_OWNER_TILE_LOG
+    {
         return Err(SelectedZkAuthorizationRegionError::Geometry(
-            "selected Owner union is not m15/m7",
+            "selected Owner union has the wrong canonical class geometry",
         ));
     }
-    if main_union.w_log != MAIN_W_LOG || main_union.block_log != ZK_AUTH_MAIN_TILE_LOG {
+    if main_union.w_log != geometry.main_w_log || main_union.block_log != ZK_AUTH_MAIN_TILE_LOG {
         return Err(SelectedZkAuthorizationRegionError::Geometry(
-            "selected Main union is not m16/m8",
+            "selected Main union has the wrong canonical class geometry",
         ));
     }
     for tx in 0..batch.len() {
@@ -278,7 +275,7 @@ pub(super) fn build_selected_zk_authorization_region_draft(
         wallet_b_columns,
         wallet_b_s0,
         wallet_b_s_out,
-    ) = build_wallet_columns(batch)?;
+    ) = build_wallet_columns(batch, geometry.wallet_a_w_log, geometry.wallet_b_w_log)?;
 
     Ok(SelectedZkAuthorizationRegionDraft {
         owner: owner_union,
@@ -345,24 +342,30 @@ type WalletColumns = (
 
 fn build_wallet_columns(
     batch: &SelectedZkAuthorizationProofBatch,
+    wallet_a_w_log: usize,
+    wallet_b_w_log: usize,
 ) -> Result<WalletColumns, SelectedZkAuthorizationRegionError> {
-    if batch.len() != SELECTED_AUTH_COUNT {
+    let expected = crate::region_sidecar::selected_zk_block_geometry_for_auth_tiles(batch.len())
+        .ok_or(SelectedZkAuthorizationRegionError::Geometry(
+            "wallet assembly requires a canonical authorization class",
+        ))?;
+    if wallet_a_w_log != expected.wallet_a_w_log || wallet_b_w_log != expected.wallet_b_w_log {
         return Err(SelectedZkAuthorizationRegionError::Geometry(
-            "wallet assembly requires exactly 256 entries",
+            "wallet assembly class geometry drift",
         ));
     }
     let mut wallet_a: [Vec<F128>; 6] =
-        std::array::from_fn(|_| vec![F128::ZERO; 1 << WALLET_A_W_LOG]);
+        std::array::from_fn(|_| vec![F128::ZERO; 1 << wallet_a_w_log]);
     let mut wallet_a_s0: [Vec<F128>; 4] =
-        std::array::from_fn(|_| vec![F128::ZERO; 1 << WALLET_A_W_LOG]);
+        std::array::from_fn(|_| vec![F128::ZERO; 1 << wallet_a_w_log]);
     let mut wallet_a_s_out: [Vec<F128>; 4] =
-        std::array::from_fn(|_| vec![F128::ZERO; 1 << WALLET_A_W_LOG]);
+        std::array::from_fn(|_| vec![F128::ZERO; 1 << wallet_a_w_log]);
     let mut wallet_b: [Vec<F128>; 9] =
-        std::array::from_fn(|_| vec![F128::ZERO; 1 << WALLET_B_W_LOG]);
+        std::array::from_fn(|_| vec![F128::ZERO; 1 << wallet_b_w_log]);
     let mut wallet_b_s0: [Vec<F128>; 4] =
-        std::array::from_fn(|_| vec![F128::ZERO; 1 << WALLET_B_W_LOG]);
+        std::array::from_fn(|_| vec![F128::ZERO; 1 << wallet_b_w_log]);
     let mut wallet_b_s_out: [Vec<F128>; 4] =
-        std::array::from_fn(|_| vec![F128::ZERO; 1 << WALLET_B_W_LOG]);
+        std::array::from_fn(|_| vec![F128::ZERO; 1 << wallet_b_w_log]);
 
     let mut first_ghost_tile = None;
     for tx in 0..batch.len() {
@@ -748,7 +751,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_b255_geometry_is_exact_and_not_a_four_tier_claim() {
+    fn selected_four_class_authorization_geometry_is_exact() {
         let schedules = ZkAuthCapsuleDuplexSchedules::selected();
         assert_eq!(
             schedules.owner_layout().slots.len().next_power_of_two(),
@@ -758,10 +761,13 @@ mod tests {
             schedules.main_layout().slots.len().next_power_of_two(),
             1 << 8
         );
-        assert_eq!(SELECTED_AUTH_COUNT << 7, 1 << OWNER_W_LOG);
-        assert_eq!(SELECTED_AUTH_COUNT << 8, 1 << MAIN_W_LOG);
-        assert_eq!(SELECTED_AUTH_COUNT << 11, 1 << WALLET_A_W_LOG);
-        assert_eq!(SELECTED_AUTH_COUNT << 10, 1 << WALLET_B_W_LOG);
+        for tier in [8usize, 32, 64, 255] {
+            let geometry = crate::region_sidecar::selected_zk_block_geometry(tier).unwrap();
+            assert_eq!(geometry.auth_tiles << 7, 1 << geometry.owner_w_log);
+            assert_eq!(geometry.auth_tiles << 8, 1 << geometry.main_w_log);
+            assert_eq!(geometry.auth_tiles << 11, 1 << geometry.wallet_a_w_log);
+            assert_eq!(geometry.auth_tiles << 10, 1 << geometry.wallet_b_w_log);
+        }
         assert_eq!(SELECTED_CHANGED_COMMITTED_COLUMNS, 27);
     }
 

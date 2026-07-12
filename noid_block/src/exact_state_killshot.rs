@@ -109,8 +109,8 @@ pub fn derive_exact_state_structural_killshot_inputs(
 /// old/new path count exceeds the audited inline cap.
 pub(crate) fn derive_retained_exact_state_inputs_from_verified_roots(
     inputs: &ExactStateTransitionInputs,
-    surface: &ExactActionSurface,
-    proof: &ExactStateTransitionProof,
+    surface: ExactActionSurface,
+    proof: ExactStateTransitionProof,
     roots: VerifiedExactStateRoots,
 ) -> Result<(ExactStateKillShotInputs, ExactStateStructuralFrontierInputs), ExactStateKillShotError>
 {
@@ -121,7 +121,7 @@ pub(crate) fn derive_retained_exact_state_inputs_from_verified_roots(
         return Err(ExactStateTransitionError::ChildRootMismatch.into());
     }
 
-    let leaf_inputs = derive_exact_slot_leaf_batch_inputs(surface)?;
+    let leaf_inputs = derive_exact_slot_leaf_batch_inputs(&surface)?;
     let total_paths = surface
         .touched_indices
         .len()
@@ -129,7 +129,7 @@ pub(crate) fn derive_retained_exact_state_inputs_from_verified_roots(
         .unwrap_or(usize::MAX);
     let legacy = if total_paths <= TRANSITIONAL_INLINE_EXACT_STATE_MAX_PATHS {
         let state_inputs = derive_exact_state_merkle_batch_inputs_from_verified_roots(
-            inputs, surface, proof, &roots,
+            inputs, &surface, &proof, &roots,
         )?;
         let mut slot_leaves = Vec::with_capacity(total_paths);
         slot_leaves.extend(leaf_inputs.old_leaves.iter().cloned());
@@ -148,8 +148,32 @@ pub(crate) fn derive_retained_exact_state_inputs_from_verified_roots(
         }
     };
     let structural =
-        structural_inputs_from_verified_roots(inputs, surface, proof, leaf_inputs, roots);
+        structural_inputs_from_verified_roots_owned(inputs, surface, proof, leaf_inputs, roots);
     Ok((legacy, structural))
+}
+
+/// Consuming retained projection: the large sibling frontier and touched-index
+/// vector move into the structural carrier instead of being cloned after
+/// native verification.  The borrowed projector below remains for standalone
+/// diagnostic construction where the source witness is still needed.
+fn structural_inputs_from_verified_roots_owned(
+    inputs: &ExactStateTransitionInputs,
+    surface: ExactActionSurface,
+    proof: ExactStateTransitionProof,
+    leaf_inputs: crate::exact_state_transition::ExactSlotLeafBatchInputs,
+    roots: VerifiedExactStateRoots,
+) -> ExactStateStructuralFrontierInputs {
+    ExactStateStructuralFrontierInputs {
+        touched_indices: surface.touched_indices,
+        active_depth: inputs.child_log_slots,
+        old_slot_leaves: leaf_inputs.old_leaves,
+        new_slot_leaves: leaf_inputs.new_leaves,
+        live_sibling_digests: proof.slot_siblings,
+        old_combine_digests: roots.old_combine_digests,
+        new_combine_digests: roots.new_combine_digests,
+        old_root: roots.old_root,
+        new_root: roots.new_root,
+    }
 }
 
 fn structural_inputs_from_verified_roots(
@@ -509,10 +533,9 @@ mod tests {
                 &inputs, &surface, &proof,
             )
             .unwrap();
-        let (legacy, structural) = derive_retained_exact_state_inputs_from_verified_roots(
-            &inputs, &surface, &proof, roots,
-        )
-        .unwrap();
+        let (legacy, structural) =
+            derive_retained_exact_state_inputs_from_verified_roots(&inputs, surface, proof, roots)
+                .unwrap();
 
         assert_eq!(verified.child_state_root(), inputs.child_state_root);
         assert_eq!(legacy.slot_leaves.len(), 256);
@@ -529,10 +552,9 @@ mod tests {
                 &inputs, &surface, &proof,
             )
             .unwrap();
-        let (legacy, structural) = derive_retained_exact_state_inputs_from_verified_roots(
-            &inputs, &surface, &proof, roots,
-        )
-        .unwrap();
+        let (legacy, structural) =
+            derive_retained_exact_state_inputs_from_verified_roots(&inputs, surface, proof, roots)
+                .unwrap();
 
         assert!(legacy.slot_leaves.is_empty());
         assert!(legacy.state_paths.is_empty());

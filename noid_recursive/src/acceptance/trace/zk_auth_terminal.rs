@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Production-disconnected recursive terminal evaluator for the owner-
+//! Production recursive terminal evaluator for the owner-
 //! authorization ZK capsule.
 //!
 //! This is the fixed-shape F128 trace twin of

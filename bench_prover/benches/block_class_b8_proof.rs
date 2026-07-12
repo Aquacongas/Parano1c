@@ -14,8 +14,8 @@
 //! this gate clears those proofs before class freeze/build and thereby ensures
 //! the outer proof cannot fall back to them.
 //!
-//! The terminal-sidecar cut leaves an 808,858-row natural m20 relation while
-//! the published B8 ladder slot remains frozen at m22. The matrix/witness
+//! The selected-ZK terminal-sidecar cut leaves an 814,956-row natural m20
+//! relation while the published B8 ladder slot remains frozen at m22. The matrix/witness
 //! suffix is genuinely empty zero padding (not identity rows), and
 //! `useful_rows` records the raw relation size so the padded proof kernels can
 //! skip it. Any growth beyond the frozen m22 class remains a gate failure,
@@ -28,20 +28,17 @@ use bench_prover::{accepted_single_user_fixture, fmt_bytes};
 use noid_core::mem_profile::{current_mem_snapshot, MemSnapshot};
 use noid_ivc_prover::challenger::FsLaneChallenger;
 use noid_ivc_prover::pcs::{self, PcsParams};
-use noid_ivc_prover::proof::FieldShape;
 use noid_recursive::acceptance::block_class::{
-    build_block_proof_trace, prove_built_block, verify_block_proof, BlockClass, BlockProofEnvelope,
-    BlockProofError, BuiltBlock, BLOCK_IO_LEN,
+    build_selected_zk_b8_block_proof_trace, prove_built_block, verify_block_proof, BlockClass,
+    BlockProofEnvelope, BlockProofError, BuiltBlock, BLOCK_IO_LEN,
 };
-use noid_recursive::acceptance::block_slots::BlockSlotsConfig;
-use noid_recursive::acceptance::link::LinkBlock;
-use noid_recursive::acceptance::trace::region_source_binding::RegionDischargeParams;
+use noid_recursive::acceptance::link::SelectedZkB8BlockInput;
 
 const DOMAIN: &[u8] = b"history-block-v0";
 const SEED: u128 = 0xB8_B10C_C1A5_5001;
 const TIER: usize = 8;
 const CLASS_M: usize = 22;
-const EXPECTED_USEFUL_ROWS: usize = 808_858;
+const EXPECTED_USEFUL_ROWS: usize = 814_956;
 const K_SKIP: usize = 6;
 const LOG_INV_RATE: usize = 2;
 const LOG_BATCH_SIZE: usize = 5;
@@ -103,48 +100,55 @@ fn main() {
     );
     let fixture_phase = finish_phase(fixture_started);
 
-    let region_params = RegionDischargeParams {
-        nq: noid_fri_binius::capsule::CAPSULE_NUM_QUERIES,
-    };
-    let config = BlockSlotsConfig {
-        discharge_wallet_pcs: true,
-        wallet_pcs_params: region_params,
-        owner_auth_region: true,
-        exact_state_region: true,
-        tx_root_region: true,
-        spine_region: true,
-        tier_user_tx_capacity: Some(TIER),
-    };
-    let block = LinkBlock {
-        start_accumulator: &fixture.start_accumulator,
-        end_accumulator: &fixture.output.accepted_claim_batch.accumulator,
-        inputs: &fixture.output.proof_components.component_inputs,
-        proof: &fixture.component_proof,
-        config,
-    };
-    let shape = FieldShape {
-        m: CLASS_M,
-        k_log: CLASS_M,
-        k_skip: K_SKIP,
-        const_pin: Some(0),
-    };
+    let freeze_live = fixture
+        .output
+        .proof_components
+        .selected_authorization_proofs
+        .clone();
+    let build_live = fixture
+        .output
+        .proof_components
+        .selected_authorization_proofs
+        .clone();
+    let freeze_ghost = noid_gkr::ghost_tx::prove_selected_ghost_authorization()
+        .expect("fresh selected freeze ghost");
+    let build_ghost = noid_gkr::ghost_tx::prove_selected_ghost_authorization()
+        .expect("fresh selected build ghost");
+    let freeze_input = SelectedZkB8BlockInput::try_new(
+        &fixture.start_accumulator,
+        &fixture.output.accepted_claim_batch.accumulator,
+        &fixture.output.proof_components.component_inputs,
+        &fixture.component_proof,
+        freeze_live,
+        freeze_ghost,
+    )
+    .expect("canonical selected B8 freeze input");
     let pcs_params = PcsParams {
-        m: shape.m + pcs::LOG_PACKING,
+        m: CLASS_M + pcs::LOG_PACKING,
         log_inv_rate: LOG_INV_RATE,
         log_batch_size: LOG_BATCH_SIZE,
         profile: Default::default(),
     };
 
     let freeze_started = Instant::now();
-    let mut class = BlockClass::freeze(shape, pcs_params, region_params, &block, TIER);
+    let mut class = BlockClass::freeze_selected_zk_b8(pcs_params, freeze_input);
     let freeze_phase = finish_phase(freeze_started);
-    assert_eq!(class.shape, shape);
-    assert_eq!(class.pcs_params.m, shape.m + pcs::LOG_PACKING);
+    assert_eq!(class.shape.m, CLASS_M);
+    assert_eq!(class.pcs_params.m, CLASS_M + pcs::LOG_PACKING);
     assert_eq!(class.spec.io_len, BLOCK_IO_LEN);
     assert!(class.spec.claims.is_empty());
 
+    let build_input = SelectedZkB8BlockInput::try_new(
+        &fixture.start_accumulator,
+        &fixture.output.accepted_claim_batch.accumulator,
+        &fixture.output.proof_components.component_inputs,
+        &fixture.component_proof,
+        build_live,
+        build_ghost,
+    )
+    .expect("canonical selected B8 build input");
     let build_started = Instant::now();
-    let built = build_block_proof_trace(&class, &block);
+    let built = build_selected_zk_b8_block_proof_trace(&class, build_input);
     let build_phase = finish_phase(build_started);
     assert_block_shape(&built, &class);
 

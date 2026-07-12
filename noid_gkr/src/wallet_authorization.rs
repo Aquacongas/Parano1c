@@ -1,22 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Auth-only wallet authorization artifact.
+//! Production witness-hiding wallet authorization artifact.
 
-use bincode::Options;
 use noid_core::Block128;
+use noid_poseidon2b::native::domain::{capacity_iv, TAG_ADDRFIX};
 use noid_poseidon2b::primitives::SpendSecret;
 use noid_tx::{canonical_owner_auth, validate_public_tx_logic, PublicLogicError, TxBody};
-use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
-use crate::owner_auth::owner_auth_trace_inputs_from_body_and_secret;
 use crate::{
-    owner_auth_gkr_channel, owner_auth_public_from_statement, prove_owner_auth_killshot,
-    verify_owner_auth_killshot, OwnerAuthCircuit, OwnerAuthProofKillShot, OwnerAuthPublicInputs,
-    OwnerAuthStatementError,
+    evaluate_permutation, owner_auth_public_from_statement,
+    zk_auth_capsule::ZkAuthCapsuleStateTable,
+    zk_authorization::{
+        prove_zk_authorization_from_state, verify_zk_authorization, ZkAuthCapsuleOwnerStatement,
+        ZkAuthorizationProof,
+    },
+    OwnerAuthPublicInputs, OwnerAuthStatementError,
 };
 
 pub const MAX_AUTHORIZATION_BUNDLE_BYTES: usize = noid_tx::MAX_TX_AUTHORIZATION_BYTES;
+const AUTHORIZATION_BUNDLE_MAGIC: [u8; 8] = *b"NOIDWZK1";
+const AUTHORIZATION_BUNDLE_HEADER_BYTES: usize = AUTHORIZATION_BUNDLE_MAGIC.len() + 4;
 /// Absolute cap for the transitional live-input-count metadata. The exact
 /// shape-specific count is derived from the canonical body at production
 /// boundaries and will be pinned to the validity bitmap by ActionSurface C'.
@@ -70,16 +75,33 @@ pub struct VerifiedAuthorizationBatch {
     pub live_input_count_total: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct WalletAuthorizationBundle {
-    pub proof: OwnerAuthProofKillShot,
+    pub proof: ZkAuthorizationProof,
 }
 
 impl WalletAuthorizationBundle {
     pub fn to_bytes(&self) -> Result<Vec<u8>, AuthorizationEncodeError> {
-        bincode_options()
-            .serialize(self)
-            .map_err(|e| AuthorizationEncodeError::Bincode(e.to_string()))
+        let proof = self
+            .proof
+            .to_bytes()
+            .map_err(|error| AuthorizationEncodeError::Proof(error.to_string()))?;
+        let proof_len =
+            u32::try_from(proof.len()).map_err(|_| AuthorizationEncodeError::LengthOverflow)?;
+        let total = AUTHORIZATION_BUNDLE_HEADER_BYTES
+            .checked_add(proof.len())
+            .ok_or(AuthorizationEncodeError::LengthOverflow)?;
+        if total > MAX_AUTHORIZATION_BUNDLE_BYTES {
+            return Err(AuthorizationEncodeError::TooLarge {
+                actual: total,
+                max: MAX_AUTHORIZATION_BUNDLE_BYTES,
+            });
+        }
+        let mut bytes = Vec::with_capacity(total);
+        bytes.extend_from_slice(&AUTHORIZATION_BUNDLE_MAGIC);
+        bytes.extend_from_slice(&proof_len.to_le_bytes());
+        bytes.extend_from_slice(&proof);
+        Ok(bytes)
     }
 
     /// Canonical wire bytes of the bundled proof alone — the byte-exact
@@ -96,9 +118,37 @@ impl WalletAuthorizationBundle {
                 max: MAX_AUTHORIZATION_BUNDLE_BYTES,
             });
         }
-        bincode_options()
-            .deserialize(bytes)
-            .map_err(|e| AuthorizationDecodeError::Bincode(e.to_string()))
+        if bytes.len() < AUTHORIZATION_BUNDLE_HEADER_BYTES {
+            return Err(AuthorizationDecodeError::Truncated);
+        }
+        if bytes[..AUTHORIZATION_BUNDLE_MAGIC.len()] != AUTHORIZATION_BUNDLE_MAGIC {
+            return Err(AuthorizationDecodeError::InvalidMagic);
+        }
+        let proof_len = u32::from_le_bytes(
+            bytes[AUTHORIZATION_BUNDLE_MAGIC.len()..AUTHORIZATION_BUNDLE_HEADER_BYTES]
+                .try_into()
+                .expect("four authorization bundle length bytes"),
+        ) as usize;
+        if proof_len > crate::ZK_AUTHORIZATION_MAX_WIRE_BYTES {
+            return Err(AuthorizationDecodeError::ProofTooLarge {
+                actual: proof_len,
+                max: crate::ZK_AUTHORIZATION_MAX_WIRE_BYTES,
+            });
+        }
+        let expected = AUTHORIZATION_BUNDLE_HEADER_BYTES
+            .checked_add(proof_len)
+            .ok_or(AuthorizationDecodeError::LengthOverflow)?;
+        if expected > bytes.len() {
+            return Err(AuthorizationDecodeError::Truncated);
+        }
+        if expected != bytes.len() {
+            return Err(AuthorizationDecodeError::TrailingBytes {
+                remaining: bytes.len() - expected,
+            });
+        }
+        ZkAuthorizationProof::from_bytes(&bytes[AUTHORIZATION_BUNDLE_HEADER_BYTES..])
+            .map(|proof| Self { proof })
+            .map_err(|error| AuthorizationDecodeError::Proof(error.to_string()))
     }
 
     pub fn byte_len(&self) -> Result<usize, AuthorizationEncodeError> {
@@ -106,16 +156,11 @@ impl WalletAuthorizationBundle {
     }
 }
 
-fn bincode_options() -> impl Options {
-    bincode::DefaultOptions::new()
-        .with_fixint_encoding()
-        .with_limit(MAX_AUTHORIZATION_BUNDLE_BYTES as u64)
-        .reject_trailing_bytes()
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthorizationEncodeError {
-    Bincode(String),
+    TooLarge { actual: usize, max: usize },
+    LengthOverflow,
+    Proof(String),
 }
 
 impl std::fmt::Display for AuthorizationEncodeError {
@@ -129,7 +174,12 @@ impl std::error::Error for AuthorizationEncodeError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthorizationDecodeError {
     TooLarge { actual: usize, max: usize },
-    Bincode(String),
+    InvalidMagic,
+    Truncated,
+    ProofTooLarge { actual: usize, max: usize },
+    LengthOverflow,
+    TrailingBytes { remaining: usize },
+    Proof(String),
 }
 
 impl std::fmt::Display for AuthorizationDecodeError {
@@ -144,6 +194,7 @@ impl std::error::Error for AuthorizationDecodeError {}
 pub enum ProveAuthorizationError {
     PublicLogic(PublicLogicError),
     OwnerAuthStatement(String),
+    Proof(String),
     BoundaryMismatch {
         input_index: usize,
         field: &'static str,
@@ -215,11 +266,36 @@ pub fn prove_wallet_authorization(
     witness: OwnerAuthWitness,
 ) -> Result<WalletAuthorizationBundle, ProveAuthorizationError> {
     validate_public_tx_logic(body)?;
-    let auth_inputs = owner_auth_trace_inputs_from_body_and_secret(body, witness.spend_secret())
-        .map_err(map_owner_auth_prove_error)?;
-    let circuit = OwnerAuthCircuit::build();
-    let mut channel = owner_auth_gkr_channel();
-    let (proof, _) = prove_owner_auth_killshot(&circuit, &auth_inputs, &mut channel);
+    let canonical = canonical_owner_auth(body)
+        .map_err(|error| ProveAuthorizationError::OwnerAuthStatement(error.to_string()))?;
+    let input_position = body
+        .live_inputs()
+        .next()
+        .map(|(index, _)| index)
+        .expect("canonical user transaction has a live input");
+
+    // The selected capsule commits exactly the address-permutation state
+    // table. Keep every secret-bearing temporary zeroizing and never expose a
+    // reusable state/bank constructor at the wallet boundary.
+    let mut secret = witness.spend_secret().as_fields();
+    let iv = capacity_iv(TAG_ADDRFIX);
+    let mut permutation_input = [secret[0], secret[1], iv[0], iv[1]];
+    let permutation = evaluate_permutation(permutation_input);
+    permutation_input.zeroize();
+    secret.zeroize();
+    if permutation.final_state()[..2] != canonical.input_owner.as_fields() {
+        return Err(ProveAuthorizationError::BoundaryMismatch {
+            input_index: input_position,
+            field: "owner_auth",
+        });
+    }
+    let state = ZkAuthCapsuleStateTable::from_permutation_witness(&permutation)
+        .map_err(|error| ProveAuthorizationError::Proof(format!("{error:?}")))?;
+    let public =
+        owner_auth_public_from_statement(&canonical).map_err(map_owner_auth_prove_error)?;
+    let statement = selected_statement(&public);
+    let proof = prove_zk_authorization_from_state(state.cells(), statement)
+        .map_err(|error| ProveAuthorizationError::Proof(format!("{error:?}")))?;
     Ok(WalletAuthorizationBundle { proof })
 }
 
@@ -232,7 +308,7 @@ pub fn verify_wallet_authorization(
 
 pub fn verify_wallet_authorization_proof(
     body: &TxBody,
-    proof: &OwnerAuthProofKillShot,
+    proof: &ZkAuthorizationProof,
 ) -> Result<(), VerifyAuthorizationError> {
     validate_public_tx_logic(body)?;
     let canonical = canonical_owner_auth(body)
@@ -280,24 +356,29 @@ pub fn canonical_authorization_statement_from_body(
 /// Canonical wire bytes of one owner-auth proof (the encoding block
 /// sidecars use). Both sides of the verified-authorization fast path —
 /// mempool admission and block acceptance — compare these bytes.
-pub fn authorization_proof_wire_bytes(proof: &OwnerAuthProofKillShot) -> Option<Vec<u8>> {
-    bincode_options().serialize(proof).ok()
+pub fn authorization_proof_wire_bytes(proof: &ZkAuthorizationProof) -> Option<Vec<u8>> {
+    proof.to_bytes().ok()
 }
 
 pub fn verify_authorization_statement_proof(
     statement: &CanonicalAuthorizationStatement,
-    proof: &OwnerAuthProofKillShot,
+    proof: &ZkAuthorizationProof,
 ) -> Result<VerifiedAuthorization, VerifyAuthorizationError> {
     validate_authorization_statement(statement)?;
-    let circuit = OwnerAuthCircuit::build();
-    let mut channel = owner_auth_gkr_channel();
-    verify_owner_auth_killshot(proof, &circuit, &statement.public, &mut channel)
-        .ok_or(VerifyAuthorizationError::AuthProof)?;
+    verify_zk_authorization(selected_statement(&statement.public), proof)
+        .map_err(|_| VerifyAuthorizationError::AuthProof)?;
 
     Ok(VerifiedAuthorization {
         tx_index: statement.tx_index,
         live_input_count: usize::from(statement.live_input_count),
     })
+}
+
+fn selected_statement(public: &OwnerAuthPublicInputs) -> ZkAuthCapsuleOwnerStatement {
+    ZkAuthCapsuleOwnerStatement {
+        tx_body_hash: public.tx_body_hash,
+        address: public.expected_address,
+    }
 }
 
 fn map_owner_auth_prove_error(err: OwnerAuthStatementError) -> ProveAuthorizationError {
@@ -398,16 +479,36 @@ mod tests {
     fn strict_decoder_rejects_trailing_bytes_and_unknown_discriminant() {
         let (_, _, bundle) = prove_standard_fixture();
         let mut bytes = bundle.to_bytes().expect("serialize authorization");
+        assert_eq!(
+            bytes.len(),
+            AUTHORIZATION_BUNDLE_HEADER_BYTES + bundle.proof.to_bytes().unwrap().len()
+        );
+
+        let mut oversized = bytes.clone();
+        oversized[AUTHORIZATION_BUNDLE_MAGIC.len()..AUTHORIZATION_BUNDLE_HEADER_BYTES]
+            .copy_from_slice(&((crate::ZK_AUTHORIZATION_MAX_WIRE_BYTES + 1) as u32).to_le_bytes());
+        assert!(matches!(
+            WalletAuthorizationBundle::from_bytes(&oversized),
+            Err(AuthorizationDecodeError::ProofTooLarge { .. })
+        ));
+
         bytes.push(0);
         assert!(matches!(
             WalletAuthorizationBundle::from_bytes(&bytes),
-            Err(AuthorizationDecodeError::Bincode(_))
+            Err(AuthorizationDecodeError::TrailingBytes { remaining: 1 })
         ));
 
         let unknown_payload = [9u8, 0, 0, 0];
         assert!(matches!(
             WalletAuthorizationBundle::from_bytes(&unknown_payload),
-            Err(AuthorizationDecodeError::Bincode(_))
+            Err(AuthorizationDecodeError::Truncated)
+        ));
+
+        let legacy = bincode::serialize(&crate::ghost_tx::ghost_authorization().0)
+            .expect("serialize legacy owner-auth proof");
+        assert!(matches!(
+            WalletAuthorizationBundle::from_bytes(&legacy),
+            Err(AuthorizationDecodeError::InvalidMagic)
         ));
     }
 
@@ -415,7 +516,7 @@ mod tests {
     fn proof_and_body_tamper_reject() {
         let (mut body, _, mut bundle) = prove_standard_fixture();
 
-        bundle.proof.kill_shot.main.state_at_r += Block128::ONE;
+        bundle.proof.owner.mask_mu += Block128::ONE;
         assert!(matches!(
             verify_wallet_authorization(&body, &bundle),
             Err(VerifyAuthorizationError::AuthProof)

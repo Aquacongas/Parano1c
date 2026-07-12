@@ -60,7 +60,6 @@ use super::trace::self_verify::{
     alloc_flat_digest, flat_digest_lanes, lagrange_weights_window_trace,
     verify_field_trace_deferred, FieldR1csProofTrace, FlatDigestExpr,
 };
-#[cfg(feature = "selected-zk-measurement")]
 use super::trace::zk_authorization_candidate::SelectedZkAuthorizationProofBundle;
 use super::trace::{flat_of, mul, pin_eq};
 use crate::accumulator::{
@@ -71,7 +70,6 @@ use crate::block_certificate_backend::{
 };
 use noid_chain::BlockHeader;
 use noid_core::Block128;
-#[cfg(feature = "selected-zk-measurement")]
 use noid_gkr::zk_authorization::ZkAuthorizationProof;
 use noid_ivc_prover::field_prover::prove_field_with_public_io;
 
@@ -486,63 +484,71 @@ pub struct LinkBlock<'a> {
     pub config: BlockSlotsConfig,
 }
 
-/// Owned, consuming input carrier for the opt-in selected-ZK B255
-/// measurement facade.
+/// Owned, consuming input carrier for one production selected-ZK Block class.
 ///
 /// This is deliberately not a wire or proof-envelope type.  Its private,
-/// mandatory authorization bundle prevents a selected measurement from being
-/// assembled without either its exact live proof set or its PAD255 proof,
+/// mandatory authorization bundle prevents a selected Block from being
+/// assembled without its exact live proof set plus one canonical ghost proof,
 /// while constructing the inner [`LinkBlock`] here prevents callers from
-/// selecting a legacy or partial region configuration.  The production
-/// [`LinkBlock`] and every serialized envelope remain unchanged until the
-/// authorization carrier hard cut.
-#[cfg(feature = "selected-zk-measurement")]
-#[must_use = "selected B255 measurement input must be consumed by a measurement build"]
-pub struct SelectedZkB255MeasurementInput<'a> {
+/// selecting a legacy or partial region configuration.  It is consumed by
+/// matrix freeze or witness assembly, so proof ownership cannot be replayed
+/// accidentally by the recursive authoring API.
+#[must_use = "selected input must be consumed by a production Block build"]
+pub struct SelectedZkBlockInput<'a, const TIER: usize> {
     block: LinkBlock<'a>,
     authorization: SelectedZkAuthorizationProofBundle,
 }
 
-/// Structural rejection at the selected B255 measurement input boundary.
-#[cfg(feature = "selected-zk-measurement")]
+/// Structural rejection at the selected production input boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SelectedZkB255MeasurementInputError {
+pub enum SelectedZkBlockInputError {
+    /// The const-generic class is not one of B8/B32/B64/B255.
+    NonCanonicalTier { tier: usize },
     /// The owned proof vector does not cover every canonical live
     /// authorization statement exactly once.
     AuthorizationProofCardinality { expected: usize, actual: usize },
     /// The canonical component input belongs to a different transaction
     /// capacity tier.
-    NonB255Tier {
+    WrongTier {
+        expected_tier: usize,
         live_authorizations: usize,
         actual_tier: Option<usize>,
     },
+    /// The retained component still carries the rejected transparent
+    /// authorization proof or its verifier transcript.
+    LegacyAuthorizationCarrier { proofs: usize, traces: usize },
 }
 
-#[cfg(feature = "selected-zk-measurement")]
-impl core::fmt::Display for SelectedZkB255MeasurementInputError {
+impl core::fmt::Display for SelectedZkBlockInputError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            Self::NonCanonicalTier { tier } => {
+                write!(f, "selected input tier B{tier} is not canonical")
+            }
             Self::AuthorizationProofCardinality { expected, actual } => write!(
                 f,
-                "selected B255 authorization proof count {actual} does not match canonical live count {expected}"
+                "selected authorization proof count {actual} does not match canonical live count {expected}"
             ),
-            Self::NonB255Tier {
+            Self::WrongTier {
+                expected_tier,
                 live_authorizations,
                 actual_tier,
             } => write!(
                 f,
-                "selected B255 input has {live_authorizations} live authorizations (tier {actual_tier:?})"
+                "selected B{expected_tier} input has {live_authorizations} live authorizations (tier {actual_tier:?})"
+            ),
+            Self::LegacyAuthorizationCarrier { proofs, traces } => write!(
+                f,
+                "selected input retains {proofs} legacy authorization proofs and {traces} traces"
             ),
         }
     }
 }
 
-#[cfg(feature = "selected-zk-measurement")]
-impl std::error::Error for SelectedZkB255MeasurementInputError {}
+impl std::error::Error for SelectedZkBlockInputError {}
 
-#[cfg(feature = "selected-zk-measurement")]
-impl<'a> SelectedZkB255MeasurementInput<'a> {
-    /// Bind one canonical B255 component input to an owned selected-ZK proof
+impl<'a, const TIER: usize> SelectedZkBlockInput<'a, TIER> {
+    /// Bind one canonical class component input to an owned selected-ZK proof
     /// set.  This constructor performs only shape/cardinality checks; the
     /// canonical Block assembly still verifies every proof against its body
     /// and owner statement before minting the private authorization
@@ -554,21 +560,29 @@ impl<'a> SelectedZkB255MeasurementInput<'a> {
         proof: &'a AcceptedBlockBatchComponentProof,
         live_proofs: Vec<ZkAuthorizationProof>,
         ghost_proof: ZkAuthorizationProof,
-    ) -> Result<Self, SelectedZkB255MeasurementInputError> {
+    ) -> Result<Self, SelectedZkBlockInputError> {
+        if crate::region_sidecar::selected_zk_block_geometry(TIER).is_none() {
+            return Err(SelectedZkBlockInputError::NonCanonicalTier { tier: TIER });
+        }
         let live_authorizations = inputs.authorization_inputs.len();
         if live_proofs.len() != live_authorizations {
-            return Err(
-                SelectedZkB255MeasurementInputError::AuthorizationProofCardinality {
-                    expected: live_authorizations,
-                    actual: live_proofs.len(),
-                },
-            );
+            return Err(SelectedZkBlockInputError::AuthorizationProofCardinality {
+                expected: live_authorizations,
+                actual: live_proofs.len(),
+            });
         }
         let actual_tier = noid_chain::consensus::params::user_tx_class_tier(live_authorizations);
-        if actual_tier != Some(noid_chain::consensus::params::BLOCK_MAX_USER_TXS) {
-            return Err(SelectedZkB255MeasurementInputError::NonB255Tier {
+        if actual_tier != Some(TIER) {
+            return Err(SelectedZkBlockInputError::WrongTier {
+                expected_tier: TIER,
                 live_authorizations,
                 actual_tier,
+            });
+        }
+        if !inputs.authorization_witnesses.is_empty() || !inputs.authorization_traces.is_empty() {
+            return Err(SelectedZkBlockInputError::LegacyAuthorizationCarrier {
+                proofs: inputs.authorization_witnesses.len(),
+                traces: inputs.authorization_traces.len(),
             });
         }
 
@@ -587,7 +601,7 @@ impl<'a> SelectedZkB255MeasurementInput<'a> {
                     exact_state_region: true,
                     tx_root_region: true,
                     spine_region: true,
-                    tier_user_tx_capacity: Some(noid_chain::consensus::params::BLOCK_MAX_USER_TXS),
+                    tier_user_tx_capacity: Some(TIER),
                 },
             },
             authorization: SelectedZkAuthorizationProofBundle::new(live_proofs, ghost_proof),
@@ -600,6 +614,20 @@ impl<'a> SelectedZkB255MeasurementInput<'a> {
         (self.block, self.authorization)
     }
 }
+
+pub type SelectedZkB8BlockInput<'a> = SelectedZkBlockInput<'a, 8>;
+pub type SelectedZkB32BlockInput<'a> = SelectedZkBlockInput<'a, 32>;
+pub type SelectedZkB64BlockInput<'a> = SelectedZkBlockInput<'a, 64>;
+pub type SelectedZkB255BlockInput<'a> = SelectedZkBlockInput<'a, 255>;
+pub type SelectedZkB255BlockInputError = SelectedZkBlockInputError;
+
+/// Compatibility spelling retained only for the geometry benchmark target.
+/// Production code uses [`SelectedZkB255BlockInput`].
+#[cfg(feature = "selected-zk-measurement")]
+pub type SelectedZkB255MeasurementInput<'a> = SelectedZkB255BlockInput<'a>;
+
+#[cfg(feature = "selected-zk-measurement")]
+pub type SelectedZkB255MeasurementInputError = SelectedZkBlockInputError;
 
 /// Everything a link exposes to its successor.
 pub struct LinkEnvelope {

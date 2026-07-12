@@ -28,17 +28,19 @@ use noid_ivc_core::public_io::{PublicIoSpec, WitnessSlice};
 use noid_ivc_core::verifier::{verify_field_with_public_io_and_post_commit_context, VerifyError};
 use noid_ivc_prover::field_prover::prove_field_with_public_io_and_post_commit_context;
 
-#[cfg(feature = "selected-zk-measurement")]
-use super::block_slots::{build_block_slots_selected_zk_b255, SelectedZkBlockSlotsAssembly};
+use super::block_slots::{build_block_slots_selected_zk, SelectedZkBlockSlotsAssembly};
 use super::block_slots::{build_block_slots_with_config, BlockSlots, BlockSlotsConfig};
-#[cfg(feature = "selected-zk-measurement")]
-use super::link::SelectedZkB255MeasurementInput;
 use super::link::{block_acc_lanes, LinkBlock, ACC_LANES};
+use super::link::{
+    SelectedZkB255BlockInput, SelectedZkB32BlockInput, SelectedZkB64BlockInput,
+    SelectedZkB8BlockInput, SelectedZkBlockInput,
+};
 use super::trace::pin_eq;
 use super::trace::region_source_binding::RegionDischargeParams;
 use crate::region_sidecar::{
     block_post_commit_class_digest, verify_block_region_sidecar_post_commit,
     BlockRegionPreparation, BlockRegionSidecarProof, BlockRegionSidecarVk, RegionSidecarError,
+    BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION, BLOCK_REGION_SIDECAR_VERSION,
 };
 
 /// Fixed public-IO offsets of every production block class.
@@ -52,6 +54,9 @@ pub struct BlockIoLayout {
 pub const BLOCK_IO_START_ACC: usize = 0;
 pub const BLOCK_IO_END_ACC: usize = ACC_LANES;
 pub const BLOCK_IO_LEN: usize = 2 * ACC_LANES;
+/// Canonical Fiat--Shamir domain for every standalone production Block class.
+/// Production coordinators must not accept a caller-selected domain.
+pub const BLOCK_PROOF_TRANSCRIPT_DOMAIN: &[u8] = b"history-block-v0";
 
 pub const fn block_io_layout() -> BlockIoLayout {
     BlockIoLayout {
@@ -86,6 +91,13 @@ pub struct BlockClass {
     config_template: BlockSlotsConfig,
     sidecar_vk: BlockRegionSidecarVk,
     post_commit_class_digest: [u8; 32],
+    authorization_backend: BlockClassAuthorizationBackend,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockClassAuthorizationBackend {
+    Legacy,
+    SelectedZk,
 }
 
 impl BlockClass {
@@ -100,6 +112,10 @@ impl BlockClass {
         sample: &LinkBlock<'_>,
         tier: usize,
     ) -> Self {
+        assert!(
+            !noid_chain::consensus::params::USER_TX_CLASS_TIERS.contains(&tier),
+            "production tier authoring requires freeze_selected_zk"
+        );
         assert_eq!(
             region_params.nq,
             noid_fri_binius::capsule::CAPSULE_NUM_QUERIES,
@@ -133,7 +149,82 @@ impl BlockClass {
             config_template,
             sidecar_vk,
             post_commit_class_digest,
+            authorization_backend: BlockClassAuthorizationBackend::Legacy,
         }
+    }
+
+    /// Freeze one canonical production selected-ZK relation from a consuming
+    /// class-typed sample. The resulting identity commits both its exact
+    /// matrix and V4 six-child sidecar key; no legacy owner-auth relation can
+    /// reproduce either identity.
+    pub fn freeze_selected_zk<const TIER: usize>(
+        pcs_params: PcsParams,
+        sample: SelectedZkBlockInput<'_, TIER>,
+    ) -> Self {
+        let shape = selected_zk_shape(TIER);
+        assert_eq!(
+            pcs_params.m,
+            shape.m + LOG_PACKING,
+            "selected PCS m must match its Field witness shape"
+        );
+        let built = build_selected_zk_trace_parts(sample, None);
+        let matrix_digest = built.r1cs.statement_digest();
+        let sidecar_vk = built.region_preparation.vk().clone();
+        assert_eq!(
+            sidecar_vk.version(),
+            BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION,
+            "selected class requires V4 sidecar"
+        );
+        let spec = block_io_spec();
+        let post_commit_class_digest =
+            block_post_commit_class_digest(&matrix_digest, &spec, &pcs_params, &sidecar_vk);
+        let class_statement_digest = OnceLock::new();
+        class_statement_digest
+            .set(matrix_digest)
+            .expect("fresh selected matrix digest lock");
+        let region_params = RegionDischargeParams {
+            nq: noid_fri_binius::capsule::CAPSULE_NUM_QUERIES,
+        };
+
+        Self {
+            tier: TIER,
+            shape,
+            class_statement_digest,
+            pcs_params,
+            spec,
+            config_template: production_config(region_params, TIER),
+            sidecar_vk,
+            post_commit_class_digest,
+            authorization_backend: BlockClassAuthorizationBackend::SelectedZk,
+        }
+    }
+
+    pub fn freeze_selected_zk_b8(
+        pcs_params: PcsParams,
+        sample: SelectedZkB8BlockInput<'_>,
+    ) -> Self {
+        Self::freeze_selected_zk(pcs_params, sample)
+    }
+
+    pub fn freeze_selected_zk_b32(
+        pcs_params: PcsParams,
+        sample: SelectedZkB32BlockInput<'_>,
+    ) -> Self {
+        Self::freeze_selected_zk(pcs_params, sample)
+    }
+
+    pub fn freeze_selected_zk_b64(
+        pcs_params: PcsParams,
+        sample: SelectedZkB64BlockInput<'_>,
+    ) -> Self {
+        Self::freeze_selected_zk(pcs_params, sample)
+    }
+
+    pub fn freeze_selected_zk_b255(
+        pcs_params: PcsParams,
+        sample: SelectedZkB255BlockInput<'_>,
+    ) -> Self {
+        Self::freeze_selected_zk(pcs_params, sample)
     }
 
     pub fn sidecar_vk(&self) -> &BlockRegionSidecarVk {
@@ -142,6 +233,27 @@ impl BlockClass {
 
     pub fn tier(&self) -> usize {
         self.tier
+    }
+
+    /// Fail-closed preflight for a production selected-ZK registry slot.
+    ///
+    /// This is the public coordinator boundary: callers can validate a cached
+    /// class before allocating an m22/m23/m24 witness, rather than reaching an
+    /// assertion inside the consuming trace builder with a legacy class.
+    pub fn validate_selected_zk_identity_for_tier(
+        &self,
+        expected_tier: usize,
+    ) -> Result<(), BlockProofError> {
+        if self.tier != expected_tier {
+            return Err(BlockProofError::TierMismatch {
+                expected: expected_tier,
+                actual: self.tier,
+            });
+        }
+        if self.authorization_backend != BlockClassAuthorizationBackend::SelectedZk {
+            return Err(BlockProofError::LegacyAuthorizationBackend);
+        }
+        self.validate_frozen_identity().map(|_| ())
     }
 
     pub fn post_commit_class_digest(&self) -> &[u8; 32] {
@@ -164,6 +276,17 @@ impl BlockClass {
         if !is_production_block_io_spec(&self.spec)
             || self.shape.m.checked_add(LOG_PACKING) != Some(self.pcs_params.m)
             || !is_production_config(&self.config_template, self.tier)
+            || match self.authorization_backend {
+                BlockClassAuthorizationBackend::Legacy => {
+                    self.tier == noid_chain::consensus::params::BLOCK_MAX_USER_TXS
+                        || self.sidecar_vk.version() != BLOCK_REGION_SIDECAR_VERSION
+                }
+                BlockClassAuthorizationBackend::SelectedZk => {
+                    crate::region_sidecar::selected_zk_block_geometry(self.tier).is_none()
+                        || self.shape != selected_zk_shape(self.tier)
+                        || self.sidecar_vk.version() != BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION
+                }
+            }
         {
             return Err(BlockProofError::ClassIdentityMismatch);
         }
@@ -268,20 +391,24 @@ impl SelectedZkB255WitnessMeasurement {
     }
 }
 
-#[cfg(feature = "selected-zk-measurement")]
-fn selected_zk_b255_measurement_shape() -> FieldShape {
+fn selected_zk_shape(tier: usize) -> FieldShape {
+    let m = match tier {
+        8 => 22,
+        32 | 64 => 23,
+        255 => 24,
+        _ => panic!("selected tier is not canonical"),
+    };
     FieldShape {
-        m: 24,
-        k_log: 24,
+        m,
+        k_log: m,
         k_skip: 6,
         const_pin: Some(0),
     }
 }
 
-#[cfg(feature = "selected-zk-measurement")]
-fn assert_selected_zk_b255_measurement_inputs(block: &LinkBlock<'_>) {
-    let shape = selected_zk_b255_measurement_shape();
-    assert_eq!((shape.m, shape.k_log), (24, 24), "selected Block is m24");
+fn assert_selected_zk_inputs(block: &LinkBlock<'_>, tier: usize) {
+    let shape = selected_zk_shape(tier);
+    assert_eq!(shape.m, shape.k_log, "selected Block square shape");
     assert_eq!(shape.k_skip, 6, "selected Block k-skip drift");
     assert_eq!(shape.const_pin, Some(0), "selected Block const pin drift");
     let config = block.config;
@@ -291,31 +418,30 @@ fn assert_selected_zk_b255_measurement_inputs(block: &LinkBlock<'_>) {
             && config.exact_state_region
             && config.tx_root_region
             && config.spine_region,
-        "selected measurement requires the complete canonical region stack"
+        "selected Block requires the complete canonical region stack"
     );
     assert_eq!(
         config.tier_user_tx_capacity,
-        Some(noid_chain::consensus::params::BLOCK_MAX_USER_TXS),
-        "selected measurement is B255-only"
+        Some(tier),
+        "selected production backend tier mismatch"
     );
     assert_eq!(
         config.wallet_pcs_params.nq,
         noid_fri_binius::capsule::CAPSULE_NUM_QUERIES,
-        "selected measurement requires every capsule query"
+        "selected production backend requires every capsule query"
     );
 }
 
-#[cfg(feature = "selected-zk-measurement")]
-fn assemble_selected_zk_b255_measurement(
+fn assemble_selected_zk<const TIER: usize>(
     mut builder: FieldR1csBuilder,
-    input: SelectedZkB255MeasurementInput<'_>,
+    input: SelectedZkBlockInput<'_, TIER>,
 ) -> (FieldR1csBuilder, Vec<F128>, SelectedZkBlockSlotsAssembly) {
     let (block, authorization) = input.into_parts();
-    assert_selected_zk_b255_measurement_inputs(&block);
+    assert_selected_zk_inputs(&block, TIER);
     let spec = block_io_spec();
     let io = accumulator_io(&block);
     let io_cells = allocate_block_io_cells(&mut builder, &spec, &io);
-    let assembly = build_block_slots_selected_zk_b255(
+    let assembly = build_block_slots_selected_zk(
         &mut builder,
         block.start_accumulator,
         block.end_accumulator,
@@ -328,32 +454,50 @@ fn assemble_selected_zk_b255_measurement(
     (builder, io, assembly)
 }
 
-/// Materialize the exact selected-ZK B255 replacement matrix.  This facade is
-/// compiled only for the opt-in measurement feature and is deliberately not
-/// connected to `BlockClass`, `LinkBlock` proof serialization, or any
-/// verification entry point.
-#[cfg(feature = "selected-zk-measurement")]
-pub fn build_selected_zk_b255_measurement_full(
-    input: SelectedZkB255MeasurementInput<'_>,
-) -> SelectedZkB255FullMeasurement {
-    let shape = selected_zk_b255_measurement_shape();
-    let (builder, io, assembly) =
-        assemble_selected_zk_b255_measurement(FieldR1csBuilder::new(), input);
+fn build_selected_zk_trace_parts<const TIER: usize>(
+    input: SelectedZkBlockInput<'_, TIER>,
+    expected_vk: Option<&BlockRegionSidecarVk>,
+) -> BuiltBlock {
+    let shape = selected_zk_shape(TIER);
+    let (builder, io, assembly) = assemble_selected_zk(FieldR1csBuilder::new(), input);
     let useful_rows = builder.num_wires();
-    let frozen_vk = assembly.region_vk().clone();
     let binding = assembly.into_region_binding();
     let (r1cs, witness) = builder.build();
     let (r1cs, witness) = expand_empty_field_tail(r1cs, witness, shape);
     assert_eq!(r1cs.useful_rows, useful_rows, "selected useful-row drift");
     let seal = SelectedBlockAssemblyFinalizationSeal(());
-    let preparation = binding
+    let region_preparation = binding
         .finalize_after_block_build(seal, r1cs.m)
-        .expect("selected V4 preparation after full matrix build");
-    assert_eq!(preparation.vk(), &frozen_vk, "selected V4 key drift");
-    SelectedZkB255FullMeasurement {
+        .expect("selected V4 preparation after matrix build");
+    if let Some(expected) = expected_vk {
+        assert_eq!(
+            region_preparation.vk(),
+            expected,
+            "selected sidecar VK drifted from the frozen class"
+        );
+    }
+    BuiltBlock {
         r1cs,
         witness,
         io,
+        region_preparation,
+    }
+}
+
+/// Materialize the exact selected-ZK B255 production matrix through the
+/// opt-in geometry benchmark facade.  It calls the same consuming trace
+/// builder as [`BlockClass::freeze_selected_zk_b255`] but does not author a
+/// proof envelope.
+#[cfg(feature = "selected-zk-measurement")]
+pub fn build_selected_zk_b255_measurement_full(
+    input: SelectedZkB255BlockInput<'_>,
+) -> SelectedZkB255FullMeasurement {
+    let built = build_selected_zk_trace_parts(input, None);
+    let frozen_vk = built.region_preparation.vk().clone();
+    SelectedZkB255FullMeasurement {
+        r1cs: built.r1cs,
+        witness: built.witness,
+        io: built.io,
         region_vk: frozen_vk,
     }
 }
@@ -363,13 +507,12 @@ pub fn build_selected_zk_b255_measurement_full(
 /// V4 key equality are checked before returning the witness.
 #[cfg(feature = "selected-zk-measurement")]
 pub fn build_selected_zk_b255_measurement_witness_only(
-    input: SelectedZkB255MeasurementInput<'_>,
+    input: SelectedZkB255BlockInput<'_>,
     frozen: &SelectedZkB255FullMeasurement,
 ) -> SelectedZkB255WitnessMeasurement {
-    let shape = selected_zk_b255_measurement_shape();
+    let shape = selected_zk_shape(255);
     assert_eq!(FieldShape::of(&frozen.r1cs), shape, "frozen shape drift");
-    let (builder, io, assembly) =
-        assemble_selected_zk_b255_measurement(FieldR1csBuilder::new_witness_only(), input);
+    let (builder, io, assembly) = assemble_selected_zk(FieldR1csBuilder::new_witness_only(), input);
     let rebuilt_vk = assembly.region_vk().clone();
     let binding = assembly.into_region_binding();
     let (useful_rows, mut witness) = builder.build_witness_only();
@@ -398,6 +541,11 @@ pub fn build_selected_zk_b255_measurement_witness_only(
 /// Assemble a block instance and require bit-exact reproduction of both the
 /// frozen matrix and the frozen sidecar VK.
 pub fn build_block_proof_trace(class: &BlockClass, block: &LinkBlock<'_>) -> BuiltBlock {
+    assert_eq!(
+        class.authorization_backend,
+        BlockClassAuthorizationBackend::Legacy,
+        "selected class requires build_selected_zk_block_proof_trace"
+    );
     let matrix_digest = class
         .validate_frozen_identity()
         .expect("production BlockClass must remain freeze-locked");
@@ -423,6 +571,61 @@ pub fn build_block_proof_trace(class: &BlockClass, block: &LinkBlock<'_>) -> Bui
         io,
         region_preparation,
     }
+}
+
+/// Assemble one production selected witness against a class frozen by
+/// [`BlockClass::freeze_selected_zk`]. The consuming input makes the
+/// exact live proof set plus the canonical ghost proof mandatory, while the
+/// frozen matrix and V4 key checks reject any fallback to legacy authoring.
+pub fn build_selected_zk_block_proof_trace<const TIER: usize>(
+    class: &BlockClass,
+    input: SelectedZkBlockInput<'_, TIER>,
+) -> BuiltBlock {
+    assert_eq!(
+        class.authorization_backend,
+        BlockClassAuthorizationBackend::SelectedZk,
+        "selected build requires a selected-ZK class"
+    );
+    assert_eq!(class.tier, TIER, "selected input/class tier mismatch");
+    let matrix_digest = class
+        .validate_frozen_identity()
+        .expect("selected BlockClass must remain freeze-locked");
+    let built = build_selected_zk_trace_parts(input, Some(&class.sidecar_vk));
+    let actual_digest = built.r1cs.statement_digest();
+    assert_eq!(
+        actual_digest, matrix_digest,
+        "selected matrix drifted from the frozen class"
+    );
+    built.r1cs.seed_statement_digest(matrix_digest);
+    built
+}
+
+pub fn build_selected_zk_b8_block_proof_trace(
+    class: &BlockClass,
+    input: SelectedZkB8BlockInput<'_>,
+) -> BuiltBlock {
+    build_selected_zk_block_proof_trace(class, input)
+}
+
+pub fn build_selected_zk_b32_block_proof_trace(
+    class: &BlockClass,
+    input: SelectedZkB32BlockInput<'_>,
+) -> BuiltBlock {
+    build_selected_zk_block_proof_trace(class, input)
+}
+
+pub fn build_selected_zk_b64_block_proof_trace(
+    class: &BlockClass,
+    input: SelectedZkB64BlockInput<'_>,
+) -> BuiltBlock {
+    build_selected_zk_block_proof_trace(class, input)
+}
+
+pub fn build_selected_zk_b255_block_proof_trace(
+    class: &BlockClass,
+    input: SelectedZkB255BlockInput<'_>,
+) -> BuiltBlock {
+    build_selected_zk_block_proof_trace(class, input)
 }
 
 /// Mandatory wire-format object for a production block proof.  Private fields
@@ -460,6 +663,8 @@ impl BlockProofEnvelope {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BlockProofError {
     UnfrozenClass,
+    TierMismatch { expected: usize, actual: usize },
+    LegacyAuthorizationBackend,
     ClassIdentityMismatch,
     MatrixMismatch,
     SidecarVkMismatch,
@@ -473,6 +678,18 @@ impl std::fmt::Display for BlockProofError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnfrozenClass => write!(f, "block class has no frozen matrix digest"),
+            Self::TierMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "selected block class B{actual} occupies B{expected} registry slot"
+                )
+            }
+            Self::LegacyAuthorizationBackend => {
+                write!(
+                    f,
+                    "legacy authorization backend is not production-authorable"
+                )
+            }
             Self::ClassIdentityMismatch => write!(f, "block post-commit class identity drift"),
             Self::MatrixMismatch => write!(f, "block matrix does not match its frozen class"),
             Self::SidecarVkMismatch => write!(f, "block sidecar VK does not match its class"),
@@ -607,9 +824,8 @@ pub(in crate::acceptance) fn accumulator_io(block: &LinkBlock<'_>) -> Vec<F128> 
 }
 
 /// Allocate the canonical fixed-position Block IO slice.  The selected-ZK
-/// measurement path reuses this exact helper so its row ledger cannot drift
-/// from the production Block class merely because it is not yet a protocol
-/// entry point.
+/// production path reuses this exact helper so its row ledger cannot drift
+/// from the other Block classes.
 pub(in crate::acceptance) fn allocate_block_io_cells(
     b: &mut FieldR1csBuilder,
     spec: &PublicIoSpec,
@@ -855,36 +1071,36 @@ mod tests {
     }
 
     #[test]
-    fn selected_measurement_carrier_is_consuming_fixed_and_not_a_wire_envelope() {
+    fn selected_production_carrier_is_consuming_fixed_and_not_a_wire_envelope() {
         let link_source = include_str!("link.rs");
         let carrier_attributes = link_source
-            .split("pub struct SelectedZkB255MeasurementInput")
+            .split("pub struct SelectedZkBlockInput")
             .next()
-            .expect("selected measurement carrier declaration prefix")
+            .expect("selected production carrier declaration prefix")
             .rsplit("/// Owned, consuming input carrier")
             .next()
-            .expect("selected measurement carrier attributes");
+            .expect("selected production carrier attributes");
         assert!(
             !carrier_attributes.contains("#[derive"),
-            "selected measurement carrier became derivably clonable or serializable"
+            "selected production carrier became derivably clonable or serializable"
         );
         let carrier = link_source
-            .split("pub struct SelectedZkB255MeasurementInput")
+            .split("pub struct SelectedZkBlockInput")
             .nth(1)
-            .expect("selected measurement carrier declaration")
+            .expect("selected production carrier declaration")
             .split("/// Everything a link exposes to its successor")
             .next()
-            .expect("bounded selected measurement carrier source");
+            .expect("bounded selected production carrier source");
         let fields = carrier
             .split('}')
             .next()
-            .expect("selected measurement carrier fields");
+            .expect("selected production carrier fields");
         assert!(fields.contains("block: LinkBlock<'a>"));
         assert!(fields.contains("authorization: SelectedZkAuthorizationProofBundle"));
         assert!(!fields.contains("pub "), "carrier field became public");
         assert!(!fields.contains("Option<"), "authorization became optional");
-        assert!(!carrier.contains("impl Clone for SelectedZkB255MeasurementInput"));
-        assert!(!carrier.contains("impl Default for SelectedZkB255MeasurementInput"));
+        assert!(!carrier.contains("impl Clone for SelectedZkBlockInput"));
+        assert!(!carrier.contains("impl Default for SelectedZkBlockInput"));
         assert!(!carrier.contains("Serialize"));
         assert!(!carrier.contains("Deserialize"));
         assert!(carrier.contains("pub fn try_new("));
@@ -908,15 +1124,18 @@ mod tests {
             "owned authorization bundle became clonable"
         );
 
-        let full = include_str!("block_class.rs")
-            .split("pub fn build_selected_zk_b255_measurement_full")
+        let production = include_str!("block_class.rs")
+            .split("pub fn build_selected_zk_block_proof_trace")
             .nth(1)
-            .expect("full selected measurement facade");
-        let full_signature = full.split('{').next().expect("full facade signature");
-        assert!(full_signature.contains("input: SelectedZkB255MeasurementInput<'_>"));
-        assert!(!full_signature.contains("FieldShape"));
-        assert!(!full_signature.contains("Vec<ZkAuthorizationProof>"));
-        assert!(!full_signature.contains("ghost_proof"));
+            .expect("selected production Block facade");
+        let production_signature = production
+            .split('{')
+            .next()
+            .expect("production facade signature");
+        assert!(production_signature.contains("input: SelectedZkBlockInput<'_, TIER>"));
+        assert!(!production_signature.contains("FieldShape"));
+        assert!(!production_signature.contains("Vec<ZkAuthorizationProof>"));
+        assert!(!production_signature.contains("ghost_proof"));
 
         let envelope = include_str!("block_class.rs")
             .split("pub struct BlockProofEnvelope")
@@ -926,7 +1145,7 @@ mod tests {
             .next()
             .expect("Block proof envelope fields");
         assert!(!envelope.contains("ZkAuthorizationProof"));
-        assert!(!envelope.contains("SelectedZkB255MeasurementInput"));
+        assert!(!envelope.contains("SelectedZkBlockInput"));
     }
 
     #[test]

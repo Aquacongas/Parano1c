@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Production-disconnected recursive selector for the affine capsule tail.
+//! Production recursive selector for the affine capsule tail.
 //!
 //! After seven LOW-to-HIGH folds the selected affine LCH code commits a
 //! 16-coefficient tail as a 512-cell codeword.  Evaluating one transcript-
@@ -10,9 +10,8 @@
 //! coefficient-form Horner tree costs exactly `8 + 4 + 2 + 1 = 15` field
 //! multiplications.
 //!
-//! This module is deliberately disconnected from the active authorization
-//! verifier and wire format.  It fixes and tests the trace primitive that the
-//! future capsule region will call; it does not switch consensus production.
+//! The selected capsule region calls this fixed and independently tested trace
+//! primitive for every Phase-B query.
 
 use std::sync::OnceLock;
 

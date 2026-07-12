@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Production-disconnected duplex schedules for the future ZK authorization
-//! capsule.
+//! Production duplex schedules for the selected ZK authorization capsule.
 //!
 //! The selected construction keeps the existing two channel families. The
 //! Owner schedule fits m7 and Main remains m8. Owner binds the public
@@ -10,8 +9,8 @@
 //! scalars. It then closes on one fixed full absorb block. All four resulting
 //! sponge-state lanes are shared wires into the Main channel before `sigma`
 //! and `gamma`; they are never serialized.
-//! This is only the executable schedule/bridge contract. It does not change
-//! the active authorization verifier, proof wire, or recursive assembly.
+//! This executable schedule/bridge contract is consumed by the selected B255
+//! recursive assembly.
 
 use noid_ivc_core::deep_chain::schedule::{compile_duplex, DuplexLayout, TranscriptOp};
 use noid_poseidon2b::native::poseidon2b_hash_byte_slices;

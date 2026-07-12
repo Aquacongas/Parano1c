@@ -15,15 +15,15 @@
 //! User-transaction block acceptance uses the exact authenticated transition
 //! proof, then commits the sealed verifier result atomically.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use noid_poseidon2b::primitives::Digest;
-use noid_tx::{TxBody, TxInput, TxOutput};
+use noid_tx::TxBody;
 
 use crate::exact_state_hash::{slot_leaf_hash, state_node_hash, zero_slot_roots, StateHash};
 use crate::fri_state::{SlotValue, StateError, STATE_LOG_SLOTS};
-use crate::segmented_state::{ExactStateReadError, SegmentedFriState};
-use crate::sparse_merkle::{SparseMerkleCache, SparseMerkleError};
+use crate::segmented_state::{ExactStateReadError, SegmentColumns, SegmentedFriState};
+use crate::sparse_merkle::{frontier_sibling_positions, SparseMerkleError};
 
 /// Chain-level mutable state.
 ///
@@ -47,6 +47,309 @@ pub struct ChainState {
     /// live output stores `creation_id = alloc_counter + 1`; the updated value
     /// also seeds deterministic wallet slot hints.
     pub alloc_counter: u64,
+    /// Compact exact-root hierarchy: one 32-byte root per 2^16-slot segment
+    /// plus its upper binary tree.  Raw columns remain an MDBX-backed cache;
+    /// exact root updates therefore need only the segments touched by a block.
+    exact_roots: ExactSegmentRootCache,
+}
+
+/// O(depth)-memory builder for a sparse Merkle root from sorted non-default
+/// leaves.  Gaps are emitted as maximal aligned canonical-zero subtrees, so no
+/// live-leaf vector or all-node cache is materialized.
+pub(crate) struct StreamingSparseRoot {
+    depth: u32,
+    position: u64,
+    zero_roots: Vec<StateHash>,
+    stack: Vec<(u32, StateHash)>,
+}
+
+impl StreamingSparseRoot {
+    pub(crate) fn new(depth: u32) -> Result<Self, ApplyExactTransitionError> {
+        let _ = 1u64
+            .checked_shl(depth)
+            .ok_or(ApplyExactTransitionError::HeaderLogSlotsMismatch)?;
+        Ok(Self {
+            depth,
+            position: 0,
+            zero_roots: zero_slot_roots(depth as usize),
+            stack: Vec::with_capacity(depth as usize + 1),
+        })
+    }
+
+    fn append_block(&mut self, mut level: u32, mut hash: StateHash) {
+        while self
+            .stack
+            .last()
+            .is_some_and(|(pending_level, _)| *pending_level == level)
+        {
+            let (_, left) = self.stack.pop().expect("level checked above");
+            hash = state_node_hash(left, hash);
+            level += 1;
+        }
+        self.stack.push((level, hash));
+    }
+
+    fn fill_zero_gap(&mut self, end: u64) -> Result<(), ApplyExactTransitionError> {
+        let limit = 1u64
+            .checked_shl(self.depth)
+            .ok_or(ApplyExactTransitionError::HeaderLogSlotsMismatch)?;
+        if end < self.position || end > limit {
+            return Err(ApplyExactTransitionError::SlotOutOfRange);
+        }
+        while self.position < end {
+            let remaining = end - self.position;
+            let by_remaining = 63 - remaining.leading_zeros();
+            let by_alignment = if self.position == 0 {
+                self.depth
+            } else {
+                self.position.trailing_zeros().min(self.depth)
+            };
+            let level = by_remaining.min(by_alignment);
+            self.append_block(level, self.zero_roots[level as usize]);
+            self.position += 1u64 << level;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn push_leaf(
+        &mut self,
+        index: u32,
+        hash: StateHash,
+    ) -> Result<(), ApplyExactTransitionError> {
+        let index = u64::from(index);
+        self.fill_zero_gap(index)?;
+        self.append_block(0, hash);
+        self.position = index + 1;
+        Ok(())
+    }
+
+    pub(crate) fn finish(mut self) -> Result<StateHash, ApplyExactTransitionError> {
+        let limit = 1u64
+            .checked_shl(self.depth)
+            .ok_or(ApplyExactTransitionError::HeaderLogSlotsMismatch)?;
+        self.fill_zero_gap(limit)?;
+        match self.stack.as_slice() {
+            [(level, root)] if *level == self.depth => Ok(*root),
+            _ => Err(ApplyExactTransitionError::HeaderLogSlotsMismatch),
+        }
+    }
+}
+
+/// Compact two-level exact-state root cache.
+///
+/// At mainnet depth 24 this is 256 segment roots plus 255 upper nodes (under
+/// 17 KiB), independent of the number of live UTXOs.  It deliberately stores
+/// no slot leaves and no full Merkle paths.
+#[derive(Debug, Clone)]
+struct ExactSegmentRootCache {
+    log_slots: usize,
+    effective_log_seg: usize,
+    segment_roots: Vec<StateHash>,
+    tree: Vec<StateHash>,
+}
+
+impl ExactSegmentRootCache {
+    fn empty(log_slots: usize) -> Self {
+        let effective_log_seg = log_slots.min(crate::fri_state::LOG_SEGMENT_SIZE);
+        let segment_count = if log_slots > crate::fri_state::LOG_SEGMENT_SIZE {
+            1usize << (log_slots - crate::fri_state::LOG_SEGMENT_SIZE)
+        } else {
+            1
+        };
+        let zero_segment = zero_slot_roots(effective_log_seg)[effective_log_seg];
+        let segment_roots = vec![zero_segment; segment_count];
+        let tree = Self::build_tree(&segment_roots);
+        Self {
+            log_slots,
+            effective_log_seg,
+            segment_roots,
+            tree,
+        }
+    }
+
+    fn build_tree(segment_roots: &[StateHash]) -> Vec<StateHash> {
+        let count = segment_roots.len();
+        let mut tree = vec![[0u8; 32]; 2 * count];
+        for (index, root) in segment_roots.iter().copied().enumerate() {
+            tree[count + index] = root;
+        }
+        for index in (1..count).rev() {
+            tree[index] = state_node_hash(tree[2 * index], tree[2 * index + 1]);
+        }
+        tree
+    }
+
+    #[inline]
+    fn root(&self) -> StateHash {
+        if self.segment_roots.len() == 1 {
+            self.segment_roots[0]
+        } else {
+            self.tree[1]
+        }
+    }
+
+    fn set_segment_root(&mut self, segment_id: u16, root: StateHash) {
+        let index = segment_id as usize;
+        self.segment_roots[index] = root;
+        if self.segment_roots.len() == 1 {
+            return;
+        }
+        let count = self.segment_roots.len();
+        let mut node = count + index;
+        self.tree[node] = root;
+        while node > 1 {
+            node /= 2;
+            self.tree[node] = state_node_hash(self.tree[2 * node], self.tree[2 * node + 1]);
+        }
+    }
+
+    fn segment_node_hash(&self, level: u32, node_index: u64) -> Option<StateHash> {
+        let count = self.segment_roots.len();
+        let upper_depth = count.ilog2();
+        if level > upper_depth || node_index >= ((count as u64) >> level) {
+            return None;
+        }
+        if level == 0 {
+            return self.segment_roots.get(node_index as usize).copied();
+        }
+        let base = count >> level;
+        self.tree.get(base + node_index as usize).copied()
+    }
+
+    fn expand_one(&mut self) {
+        let old_log_slots = self.log_slots;
+        let old_root = self.root();
+        self.log_slots += 1;
+        if self.log_slots <= crate::fri_state::LOG_SEGMENT_SIZE {
+            self.effective_log_seg = self.log_slots;
+            let empty_right = zero_slot_roots(old_log_slots)[old_log_slots];
+            self.segment_roots[0] = state_node_hash(old_root, empty_right);
+            self.tree = Self::build_tree(&self.segment_roots);
+            return;
+        }
+
+        let old_count = self.segment_roots.len();
+        let zero_segment = zero_slot_roots(self.effective_log_seg)[self.effective_log_seg];
+        self.segment_roots.resize(old_count * 2, zero_segment);
+        self.tree = Self::build_tree(&self.segment_roots);
+        debug_assert_eq!(
+            self.root(),
+            state_node_hash(old_root, zero_slot_roots(old_log_slots)[old_log_slots])
+        );
+    }
+
+    fn shrink_to(&mut self, target: usize) {
+        while self.log_slots > target {
+            if self.log_slots <= crate::fri_state::LOG_SEGMENT_SIZE {
+                self.log_slots -= 1;
+                self.effective_log_seg = self.log_slots;
+                // The resident segment is recomputed immediately after the raw
+                // state shrink; use the canonical empty root as a placeholder.
+                self.segment_roots = vec![zero_slot_roots(self.log_slots)[self.log_slots]];
+                self.tree = Self::build_tree(&self.segment_roots);
+            } else {
+                self.log_slots -= 1;
+                self.segment_roots.truncate(self.segment_roots.len() / 2);
+                self.tree = Self::build_tree(&self.segment_roots);
+            }
+        }
+    }
+}
+
+fn exact_segment_root_with_updates(
+    effective_log_seg: usize,
+    columns: Option<&SegmentColumns>,
+    updates: &BTreeMap<u32, SlotValue>,
+) -> StateHash {
+    let segment_len = 1usize << effective_log_seg;
+    let mut stream = StreamingSparseRoot::new(effective_log_seg as u32)
+        .expect("effective segment depth is always a valid sparse depth");
+    for local in 0..segment_len {
+        let local = local as u32;
+        let slot = updates.get(&local).copied().unwrap_or_else(|| {
+            let Some(columns) = columns else {
+                return SlotValue::EMPTY;
+            };
+            let local = local as usize;
+            if local >= columns.values.len() {
+                return SlotValue::EMPTY;
+            }
+            SlotValue {
+                value: columns.values[local],
+                owner_hi: columns.owners_hi[local],
+                owner_lo: columns.owners_lo[local],
+            }
+        });
+        if !slot.is_empty() {
+            stream
+                .push_leaf(local, slot_leaf_hash(slot))
+                .expect("local indices are streamed in canonical order");
+        }
+    }
+    stream
+        .finish()
+        .expect("complete segment stream has the declared depth")
+}
+
+pub(crate) fn exact_segment_root_from_columns(
+    effective_log_seg: usize,
+    columns: &SegmentColumns,
+) -> StateHash {
+    exact_segment_root_with_updates(effective_log_seg, Some(columns), &BTreeMap::new())
+}
+
+#[derive(Debug)]
+pub enum ExactFrontierError {
+    SparseMerkle(SparseMerkleError),
+    ExactStateRead(ExactStateReadError),
+    CompactRootMismatch,
+}
+
+impl core::fmt::Display for ExactFrontierError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::SparseMerkle(error) => write!(f, "{error}"),
+            Self::ExactStateRead(error) => write!(f, "{error}"),
+            Self::CompactRootMismatch => write!(f, "compact exact-root cache mismatch"),
+        }
+    }
+}
+
+impl std::error::Error for ExactFrontierError {}
+
+impl From<SparseMerkleError> for ExactFrontierError {
+    fn from(error: SparseMerkleError) -> Self {
+        Self::SparseMerkle(error)
+    }
+}
+
+fn exact_local_subtree_root(
+    columns: Option<&SegmentColumns>,
+    local_start: usize,
+    level: u32,
+) -> StateHash {
+    let Some(columns) = columns else {
+        return zero_slot_roots(level as usize)[level as usize];
+    };
+    let subtree_len = 1usize << level;
+    let mut stream = StreamingSparseRoot::new(level)
+        .expect("frontier level is bounded by the exact segment depth");
+    for offset in 0..subtree_len {
+        let local = local_start + offset;
+        let slot = SlotValue {
+            value: columns.values[local],
+            owner_hi: columns.owners_hi[local],
+            owner_lo: columns.owners_lo[local],
+        };
+        if !slot.is_empty() {
+            stream
+                .push_leaf(offset as u32, slot_leaf_hash(slot))
+                .expect("subtree offsets are canonical and in range");
+        }
+    }
+    stream
+        .finish()
+        .expect("complete local subtree stream has the declared depth")
 }
 
 #[derive(Debug)]
@@ -78,7 +381,19 @@ impl ChainState {
             utxo_root,
             active_slot_count: 0,
             alloc_counter: 0,
+            exact_roots: ExactSegmentRootCache::empty(log_slots),
         }
+    }
+
+    /// Snapshot a durable chain boundary without cloning resident raw columns.
+    pub fn durable_metadata_clone(&self) -> Option<Self> {
+        Some(Self {
+            state: self.state.durable_metadata_clone()?,
+            utxo_root: self.utxo_root,
+            active_slot_count: self.active_slot_count,
+            alloc_counter: self.alloc_counter,
+            exact_roots: self.exact_roots.clone(),
+        })
     }
 
     /// Build chain state from fully loaded raw segment columns.
@@ -87,14 +402,45 @@ impl ChainState {
         active_slot_count: u64,
         alloc_counter: u64,
     ) -> Result<Self, ExactStateReadError> {
+        let exact_roots = ExactSegmentRootCache::empty(state.log_slots());
         let mut out = Self {
             utxo_root: zero_slot_roots(state.log_slots())[state.log_slots()],
             state,
             active_slot_count,
             alloc_counter,
+            exact_roots,
         };
         out.rebuild_exact_utxo_root_loaded()?;
         Ok(out)
+    }
+
+    /// Build a hot state from durable per-segment summaries without retaining
+    /// any segment columns.  Startup computes and validates each summary while
+    /// streaming one MDBX record at a time.
+    pub(crate) fn from_evicted_parts(
+        state: SegmentedFriState,
+        active_slot_count: u64,
+        alloc_counter: u64,
+        expected_root: StateHash,
+        exact_segment_roots: &[(u16, StateHash)],
+    ) -> Result<Self, ExactStateReadError> {
+        let mut exact_roots = ExactSegmentRootCache::empty(state.log_slots());
+        for &(segment_id, root) in exact_segment_roots {
+            if segment_id as usize >= exact_roots.segment_roots.len() {
+                return Err(ExactStateReadError::SegmentRootMismatch { seg_id: segment_id });
+            }
+            exact_roots.set_segment_root(segment_id, root);
+        }
+        if exact_roots.root() != expected_root {
+            return Err(ExactStateReadError::SegmentRootMismatch { seg_id: 0 });
+        }
+        Ok(Self {
+            state,
+            utxo_root: expected_root,
+            active_slot_count,
+            alloc_counter,
+            exact_roots,
+        })
     }
 
     /// Build state from a sparse set of live UTXO slots.
@@ -112,7 +458,6 @@ impl ChainState {
         let max_slots = 1u64
             .checked_shl(log_slots as u32)
             .ok_or(SparseUtxoBuildError::SlotOutOfRange)?;
-        let mut leaves = Vec::with_capacity(slots.len());
         for &(index, slot) in slots {
             if (index as u64) >= max_slots {
                 return Err(SparseUtxoBuildError::SlotOutOfRange);
@@ -130,7 +475,6 @@ impl ChainState {
                     alloc_counter,
                 });
             }
-            leaves.push((index, slot_leaf_hash(slot)));
         }
 
         let mut state = Self::with_log_slots(log_slots);
@@ -138,14 +482,14 @@ impl ChainState {
             .state
             .apply_delta_unrooted(slots)
             .map_err(SparseUtxoBuildError::State)?;
-        let cache = SparseMerkleCache::from_leaves(log_slots as u32, &leaves)
-            .map_err(SparseUtxoBuildError::SparseMerkle)?;
-        state.utxo_root = cache.root();
         state.active_slot_count = slots.len() as u64;
         // The highest historical creation ID may already have been spent, so
         // it cannot be reconstructed from the live sparse set. Callers must
         // supply the trusted header/checkpoint counter explicitly.
         state.alloc_counter = alloc_counter;
+        state
+            .rebuild_exact_utxo_root_loaded()
+            .expect("fresh sparse constructor has every live segment resident");
         Ok(state)
     }
 
@@ -173,21 +517,42 @@ impl ChainState {
         let old_log_slots = self.state.log_slots();
         let empty_right = zero_slot_roots(old_log_slots)[old_log_slots];
         self.state.expand();
+        self.exact_roots.expand_one();
         self.utxo_root = state_node_hash(self.utxo_root, empty_right);
+        debug_assert_eq!(self.exact_roots.root(), self.utxo_root);
     }
 
     #[inline]
     pub fn state_root(&mut self) -> Digest {
         self.try_state_root()
-            .expect("state_root requires every live segment to be loaded; use cached_state_root for a trusted persisted root")
+            .expect("dirty exact-state segments must be resident")
     }
 
-    /// Rebuild and return the exact root, failing if any required segment is
-    /// evicted. Consensus mutation paths must use this method rather than
-    /// silently treating the cached pre-state root as a recomputed post-root.
+    /// Refresh only exact subtree roots dirtied by local slot updates.
+    /// Untouched live segments may remain evicted; their verified 32-byte
+    /// summaries are sufficient for the upper tree.
     #[inline]
     pub fn try_state_root(&mut self) -> Result<Digest, ExactStateReadError> {
-        let root = self.state.exact_utxo_root()?;
+        while self.exact_roots.log_slots < self.state.log_slots() {
+            self.exact_roots.expand_one();
+        }
+        if self.exact_roots.log_slots > self.state.log_slots() {
+            self.exact_roots.shrink_to(self.state.log_slots());
+        }
+        let dirty: Vec<u16> = self.state.exact_dirty_segment_ids().collect();
+        for segment_id in dirty {
+            if self.state.is_evicted(segment_id) {
+                return Err(ExactStateReadError::EvictedSegment { seg_id: segment_id });
+            }
+            let root = exact_segment_root_with_updates(
+                self.state.effective_log_segment_size(),
+                self.state.try_get_segment_columns(segment_id),
+                &BTreeMap::new(),
+            );
+            self.exact_roots.set_segment_root(segment_id, root);
+        }
+        self.state.clear_exact_dirty();
+        let root = self.exact_roots.root();
         self.utxo_root = root;
         Ok(root)
     }
@@ -198,9 +563,90 @@ impl ChainState {
     }
 
     pub fn rebuild_exact_utxo_root_loaded(&mut self) -> Result<StateHash, ExactStateReadError> {
-        let root = self.state.exact_utxo_root()?;
-        self.utxo_root = root;
-        Ok(root)
+        self.try_state_root()
+    }
+
+    /// Reinstall one durable segment after checking it against the compact
+    /// exact-root summary retained in RAM.
+    pub fn restore_evicted_segment(
+        &mut self,
+        segment_id: u16,
+        columns: SegmentColumns,
+    ) -> Result<(), ExactStateReadError> {
+        let actual = exact_segment_root_with_updates(
+            self.state.effective_log_segment_size(),
+            Some(&columns),
+            &BTreeMap::new(),
+        );
+        if self
+            .exact_roots
+            .segment_roots
+            .get(segment_id as usize)
+            .copied()
+            != Some(actual)
+        {
+            return Err(ExactStateReadError::SegmentRootMismatch { seg_id: segment_id });
+        }
+        self.state.restore_evicted_segment(segment_id, columns);
+        Ok(())
+    }
+
+    /// Read the canonical exact-state sibling frontier without building a
+    /// global sparse-node map.  Local sibling subtrees are streamed from the
+    /// already-hydrated touched segments; upper siblings come from the compact
+    /// per-segment tree.
+    pub fn exact_frontier_siblings(
+        &self,
+        touched_indices: &[u32],
+        depth: u32,
+    ) -> Result<Vec<StateHash>, ExactFrontierError> {
+        if depth as usize != self.state.log_slots()
+            || self.exact_roots.log_slots != self.state.log_slots()
+        {
+            return Err(ExactFrontierError::SparseMerkle(
+                SparseMerkleError::CacheDepthMismatch {
+                    cache_depth: self.exact_roots.log_slots as u32,
+                    requested_depth: depth,
+                },
+            ));
+        }
+        if self.state.exact_dirty_segment_ids().next().is_some()
+            || self.exact_roots.root() != self.utxo_root
+        {
+            return Err(ExactFrontierError::CompactRootMismatch);
+        }
+
+        let positions = frontier_sibling_positions(touched_indices, depth)?;
+        let effective_log = self.state.effective_log_segment_size() as u32;
+        let mut siblings = Vec::with_capacity(positions.len());
+        for position in positions {
+            let level = u32::from(position.level);
+            if level >= effective_log {
+                let root = self
+                    .exact_roots
+                    .segment_node_hash(level - effective_log, position.node_index)
+                    .ok_or(ExactFrontierError::CompactRootMismatch)?;
+                siblings.push(root);
+                continue;
+            }
+
+            let nodes_per_segment_shift = effective_log - level;
+            let segment_id = (position.node_index >> nodes_per_segment_shift) as u16;
+            if self.state.is_evicted(segment_id) {
+                return Err(ExactFrontierError::ExactStateRead(
+                    ExactStateReadError::EvictedSegment { seg_id: segment_id },
+                ));
+            }
+            let local_node_mask = (1u64 << nodes_per_segment_shift) - 1;
+            let local_node = position.node_index & local_node_mask;
+            let local_start = (local_node << level) as usize;
+            siblings.push(exact_local_subtree_root(
+                self.state.try_get_segment_columns(segment_id),
+                local_start,
+                level,
+            ));
+        }
+        Ok(siblings)
     }
 
     pub fn exact_sparse_cache(
@@ -216,20 +662,65 @@ impl ChainState {
         log_slots: u32,
         slot_updates: &[(u32, SlotValue)],
     ) -> Result<StateHash, ApplyExactTransitionError> {
-        let mut snapshot = self.clone();
-        while log_slots as usize > snapshot.state.log_slots() {
-            snapshot.expand_one();
-        }
-        if log_slots as usize != snapshot.state.log_slots() {
+        let current_depth = self.state.log_slots() as u32;
+        if log_slots < current_depth || log_slots > current_depth.saturating_add(1) {
             return Err(ApplyExactTransitionError::HeaderLogSlotsMismatch);
         }
-        snapshot
-            .state
-            .apply_delta_unrooted(slot_updates)
-            .map_err(|_| ApplyExactTransitionError::SlotOutOfRange)?;
-        snapshot
-            .rebuild_exact_utxo_root_loaded()
-            .map_err(ApplyExactTransitionError::ExactStateRead)
+        let target_slots = 1u64
+            .checked_shl(log_slots)
+            .ok_or(ApplyExactTransitionError::HeaderLogSlotsMismatch)?;
+        let mut updates_by_segment: BTreeMap<u16, BTreeMap<u32, SlotValue>> = BTreeMap::new();
+        let target_effective_log = (log_slots as usize).min(crate::fri_state::LOG_SEGMENT_SIZE);
+        let local_mask = (1u32 << target_effective_log) - 1;
+        for &(index, value) in slot_updates {
+            if u64::from(index) >= target_slots {
+                return Err(ApplyExactTransitionError::SlotOutOfRange);
+            }
+            updates_by_segment
+                .entry((index >> target_effective_log) as u16)
+                .or_default()
+                .insert(index & local_mask, value);
+        }
+
+        // Refresh any pre-existing local dirt in a temporary compact cache so
+        // this read-only derivation never mutates or clones raw state columns.
+        let mut exact_roots = self.exact_roots.clone();
+        for segment_id in self.state.exact_dirty_segment_ids() {
+            if self.state.is_evicted(segment_id) {
+                return Err(ApplyExactTransitionError::ExactStateRead(
+                    ExactStateReadError::EvictedSegment { seg_id: segment_id },
+                ));
+            }
+            let root = exact_segment_root_with_updates(
+                self.state.effective_log_segment_size(),
+                self.state.try_get_segment_columns(segment_id),
+                &BTreeMap::new(),
+            );
+            exact_roots.set_segment_root(segment_id, root);
+        }
+        if exact_roots.root() != self.utxo_root {
+            return Err(ApplyExactTransitionError::CachedRootMismatch);
+        }
+
+        if log_slots > current_depth {
+            exact_roots.expand_one();
+        }
+        for (segment_id, local_updates) in updates_by_segment {
+            let columns = if segment_id as usize >= self.state.num_segments() {
+                None
+            } else {
+                if self.state.is_evicted(segment_id) {
+                    return Err(ApplyExactTransitionError::ExactStateRead(
+                        ExactStateReadError::EvictedSegment { seg_id: segment_id },
+                    ));
+                }
+                self.state.try_get_segment_columns(segment_id)
+            };
+            let root =
+                exact_segment_root_with_updates(target_effective_log, columns, &local_updates);
+            exact_roots.set_segment_root(segment_id, root);
+        }
+        Ok(exact_roots.root())
     }
 
     pub fn apply_verified_exact_transition(
@@ -240,23 +731,38 @@ impl ChainState {
         active_slot_count: u64,
         alloc_counter: u64,
     ) -> Result<Digest, ApplyExactTransitionError> {
-        let mut snapshot = self.clone();
-        while log_slots as usize > snapshot.state.log_slots() {
-            snapshot.expand_one();
-        }
-        if log_slots as usize != snapshot.state.log_slots() {
+        let current_log_slots = self.state.log_slots();
+        if (log_slots as usize) < current_log_slots
+            || (log_slots as usize) > current_log_slots.saturating_add(1)
+        {
             return Err(ApplyExactTransitionError::HeaderLogSlotsMismatch);
         }
-        snapshot
-            .state
+        let target_slots = 1u64
+            .checked_shl(log_slots)
+            .ok_or(ApplyExactTransitionError::HeaderLogSlotsMismatch)?;
+        if slot_updates
+            .iter()
+            .any(|(slot_index, _)| u64::from(*slot_index) >= target_slots)
+        {
+            return Err(ApplyExactTransitionError::SlotOutOfRange);
+        }
+        let computed_child = self.exact_utxo_root_after_slot_updates(log_slots, slot_updates)?;
+        if computed_child != child_state_root {
+            return Err(ApplyExactTransitionError::CachedRootMismatch);
+        }
+        if log_slots as usize == current_log_slots + 1 {
+            self.expand_one();
+        }
+        self.state
             .apply_delta_unrooted(slot_updates)
             .map_err(|_| ApplyExactTransitionError::SlotOutOfRange)?;
-        snapshot.utxo_root = child_state_root;
-        snapshot.active_slot_count = active_slot_count;
-        snapshot.alloc_counter = alloc_counter;
-        let root = snapshot.cached_state_root();
-        *self = snapshot;
-        Ok(root)
+        let applied_root = self
+            .try_state_root()
+            .map_err(ApplyExactTransitionError::ExactStateRead)?;
+        debug_assert_eq!(applied_root, computed_child);
+        self.active_slot_count = active_slot_count;
+        self.alloc_counter = alloc_counter;
+        Ok(applied_root)
     }
 }
 
@@ -309,6 +815,7 @@ pub enum ApplyExactTransitionError {
     SlotOutOfRange,
     HeaderLogSlotsMismatch,
     ExactStateRead(ExactStateReadError),
+    CachedRootMismatch,
 }
 
 /// Apply a `TxBody` to `state` in place, returning the post-transition
@@ -340,12 +847,12 @@ pub(crate) fn apply_tx_checked_deferred_root(
     state: &mut ChainState,
     body: &TxBody,
 ) -> Result<(), ApplyError> {
-    let mut snapshot = state.clone();
-
-    let input_slots: HashSet<u32> = body
-        .live_inputs()
-        .map(|(_, input)| input.slot_index)
-        .collect();
+    let mut input_slots = HashSet::new();
+    for (_, input) in body.live_inputs() {
+        if !input_slots.insert(input.slot_index) {
+            return Err(ApplyError::UnknownOrSpentInput);
+        }
+    }
 
     // Wallet-chosen output slots: reject duplicates *within this tx*
     // up-front so we don't silently overwrite our own earlier write.
@@ -359,67 +866,68 @@ pub(crate) fn apply_tx_checked_deferred_root(
         }
     }
 
+    let effective_log = state.state.effective_log_segment_size();
+    let mut deltas = Vec::with_capacity(input_slots.len() + seen.len());
     for (_, input) in body.live_inputs() {
-        spend_input(&mut snapshot, input, &body.input_owner)?;
+        if (input.slot_index as u64) >= state.state.num_slots() {
+            return Err(ApplyError::SlotOutOfRange);
+        }
+        let segment_id = (input.slot_index >> effective_log) as u16;
+        if state.state.is_evicted(segment_id) {
+            return Err(ApplyError::ExactStateUnavailable);
+        }
+        let expected = SlotValue::with_owner_fields(
+            input.amount,
+            input.creation_id,
+            body.input_owner.as_fields(),
+        );
+        if state.state.slot(input.slot_index) != expected {
+            return Err(ApplyError::UnknownOrSpentInput);
+        }
+        deltas.push((input.slot_index, SlotValue::EMPTY));
     }
 
-    for (_, output) in body.live_outputs() {
-        insert_output(&mut snapshot, output)?;
-    }
-
-    *state = snapshot;
-    Ok(())
-}
-
-fn spend_input(
-    state: &mut ChainState,
-    input: &TxInput,
-    input_owner: &noid_poseidon2b::primitives::Address,
-) -> Result<(), ApplyError> {
-    if (input.slot_index as u64) >= state.state.num_slots() {
-        return Err(ApplyError::SlotOutOfRange);
-    }
-    let expected =
-        SlotValue::with_owner_fields(input.amount, input.creation_id, input_owner.as_fields());
-    let current = state.state.slot(input.slot_index);
-    if current != expected {
-        return Err(ApplyError::UnknownOrSpentInput);
-    }
-    state
-        .state
-        .apply_delta_unrooted(&[(input.slot_index, SlotValue::EMPTY)])
-        .expect("bounds checked above");
-    state.active_slot_count = state
+    let input_count = body.live_input_count() as u64;
+    let output_count = body.live_output_count() as u64;
+    let active_after_spends = state
         .active_slot_count
-        .checked_sub(1)
+        .checked_sub(input_count)
         .ok_or(ApplyError::ActiveSlotCountUnderflow)?;
-    Ok(())
-}
-
-fn insert_output(state: &mut ChainState, out: &TxOutput) -> Result<(), ApplyError> {
-    let idx = out.slot_index;
-    if (idx as u64) >= state.state.num_slots() {
-        return Err(ApplyError::SlotOutOfRange);
-    }
-    // The wallet-chosen destination must be empty in the current state.
-    if state.state.slot(idx) != SlotValue::EMPTY {
-        return Err(ApplyError::OutputSlotNotEmpty);
-    }
-    let creation_id = state
-        .alloc_counter
-        .checked_add(1)
-        .ok_or(ApplyError::AllocCounterOverflow)?;
-    let active_slot_count = state
-        .active_slot_count
-        .checked_add(1)
+    let active_after = active_after_spends
+        .checked_add(output_count)
         .ok_or(ApplyError::ActiveSlotCountOverflow)?;
-    let slot = SlotValue::with_owner_fields(out.amount, creation_id, out.owner.as_fields());
+    let final_alloc_counter = state
+        .alloc_counter
+        .checked_add(output_count)
+        .ok_or(ApplyError::AllocCounterOverflow)?;
+
+    let mut creation_id = state.alloc_counter;
+    for (_, output) in body.live_outputs() {
+        if (output.slot_index as u64) >= state.state.num_slots() {
+            return Err(ApplyError::SlotOutOfRange);
+        }
+        let segment_id = (output.slot_index >> effective_log) as u16;
+        if state.state.is_evicted(segment_id) {
+            return Err(ApplyError::ExactStateUnavailable);
+        }
+        if state.state.slot(output.slot_index) != SlotValue::EMPTY {
+            return Err(ApplyError::OutputSlotNotEmpty);
+        }
+        creation_id = creation_id
+            .checked_add(1)
+            .ok_or(ApplyError::AllocCounterOverflow)?;
+        deltas.push((
+            output.slot_index,
+            SlotValue::with_owner_fields(output.amount, creation_id, output.owner.as_fields()),
+        ));
+    }
+
     state
         .state
-        .apply_delta_unrooted(&[(idx, slot)])
-        .expect("bounds checked above");
-    state.active_slot_count = active_slot_count;
-    state.alloc_counter = creation_id;
+        .apply_delta_unrooted(&deltas)
+        .expect("all transaction delta indices were preflighted");
+    state.active_slot_count = active_after;
+    state.alloc_counter = final_alloc_counter;
     Ok(())
 }
 
@@ -504,5 +1012,124 @@ mod tests {
             apply_tx(&mut funded(), &body),
             Err(ApplyError::DuplicateOutputSlot)
         );
+    }
+
+    #[test]
+    fn streaming_exact_update_root_matches_full_rebuild_without_state_clone() {
+        let owner = Address([0x51; 32]);
+        let slots = [
+            (0, SlotValue::with_owner_fields(3, 1, owner.as_fields())),
+            (1, SlotValue::with_owner_fields(5, 2, owner.as_fields())),
+            (7, SlotValue::with_owner_fields(7, 3, owner.as_fields())),
+            (31, SlotValue::with_owner_fields(11, 4, owner.as_fields())),
+            (63, SlotValue::with_owner_fields(13, 5, owner.as_fields())),
+        ];
+        let state = ChainState::from_sparse_utxos(6, &slots, 5).unwrap();
+        let updates = [
+            (1, SlotValue::EMPTY),
+            (8, SlotValue::with_owner_fields(17, 6, owner.as_fields())),
+            (31, SlotValue::with_owner_fields(19, 7, owner.as_fields())),
+        ];
+
+        let mut reference = state.clone();
+        reference.state.apply_delta_unrooted(&updates).unwrap();
+        let expected = reference.rebuild_exact_utxo_root_loaded().unwrap();
+        assert_eq!(
+            state
+                .exact_utxo_root_after_slot_updates(6, &updates)
+                .unwrap(),
+            expected
+        );
+
+        let expansion_update = [(100, SlotValue::with_owner_fields(23, 8, owner.as_fields()))];
+        let mut expanded_reference = state.clone();
+        expanded_reference.expand_one();
+        expanded_reference
+            .state
+            .apply_delta_unrooted(&expansion_update)
+            .unwrap();
+        let expanded_expected = expanded_reference.rebuild_exact_utxo_root_loaded().unwrap();
+        assert_eq!(
+            state
+                .exact_utxo_root_after_slot_updates(7, &expansion_update)
+                .unwrap(),
+            expanded_expected
+        );
+    }
+
+    #[test]
+    fn streaming_exact_update_rebinds_cached_parent_root() {
+        let mut state = ChainState::from_sparse_utxos(
+            4,
+            &[(
+                3,
+                SlotValue::with_owner_fields(9, 1, Address([0x61; 32]).as_fields()),
+            )],
+            1,
+        )
+        .unwrap();
+        state.utxo_root = [0xA5; 32];
+        assert_eq!(
+            state.exact_utxo_root_after_slot_updates(4, &[]),
+            Err(ApplyExactTransitionError::CachedRootMismatch)
+        );
+    }
+
+    #[test]
+    fn compact_frontier_matches_full_cache_with_unrelated_segment_evicted() {
+        let owner = Address([0x69; 32]);
+        let mut state = ChainState::from_sparse_utxos(
+            17,
+            &[
+                (3, SlotValue::with_owner_fields(9, 1, owner.as_fields())),
+                (
+                    (1 << 16) + 5,
+                    SlotValue::with_owner_fields(11, 2, owner.as_fields()),
+                ),
+            ],
+            2,
+        )
+        .unwrap();
+        let touched = [3, 7];
+        let full = crate::sparse_merkle::build_multiproof(
+            &state.state.exact_sparse_cache().unwrap(),
+            &touched,
+            17,
+        )
+        .unwrap();
+
+        state.state.evict_segment(1);
+        assert_eq!(
+            state.exact_frontier_siblings(&touched, 17).unwrap(),
+            full.siblings
+        );
+        assert!(matches!(
+            state.exact_frontier_siblings(&[(1 << 16) + 5], 17),
+            Err(ExactFrontierError::ExactStateRead(
+                ExactStateReadError::EvictedSegment { seg_id: 1 }
+            ))
+        ));
+    }
+
+    #[test]
+    fn verified_transition_rejects_shape_before_in_place_mutation() {
+        let mut state = ChainState::from_sparse_utxos(
+            4,
+            &[(
+                3,
+                SlotValue::with_owner_fields(9, 1, Address([0x71; 32]).as_fields()),
+            )],
+            1,
+        )
+        .unwrap();
+        let root = state.cached_state_root();
+        let slot = state.state.slot(3);
+        assert_eq!(
+            state.apply_verified_exact_transition(4, [0x11; 32], &[(16, SlotValue::EMPTY)], 0, 1,),
+            Err(ApplyExactTransitionError::SlotOutOfRange)
+        );
+        assert_eq!(state.cached_state_root(), root);
+        assert_eq!(state.state.slot(3), slot);
+        assert_eq!(state.state.log_slots(), 4);
     }
 }

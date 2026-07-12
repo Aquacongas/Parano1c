@@ -68,18 +68,137 @@ use super::{
 pub const BLOCK_REGION_SIDECAR_VERSION: u8 = 3;
 pub const BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION: u8 = 4;
 
-/// Exact selected B255 authorization screening geometry.  This first
-/// provenance gate is intentionally B255-only; it is not the final four-tier
-/// selected registry.
-pub(crate) const SELECTED_ZK_AUTH_TILE_COUNT: usize = 256;
-const SELECTED_ZK_AUTH_TX_LOG: usize = 8;
+/// Exact selected authorization geometry for one canonical block class.
+///
+/// The four entries below are protocol certificates, not estimates.  Keeping
+/// them explicit makes it impossible for a lower class to silently inherit
+/// B255's 256 authorization tiles (and its RAM footprint), while the V4 VK
+/// validation still rejects every geometry outside the canonical ladder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SelectedZkBlockGeometry {
+    pub tier: usize,
+    pub auth_tiles: usize,
+    pub tx_log: usize,
+    pub owner_w_log: usize,
+    pub main_w_log: usize,
+    pub wallet_a_w_log: usize,
+    pub wallet_b_w_log: usize,
+    pub exact_state_region_log: usize,
+    pub spine_cap_log: usize,
+    pub meta_a_w_log: usize,
+    pub meta_b_w_log: usize,
+    pub meta_b_block_log: usize,
+    pub touched_capacity: usize,
+    pub segment_capacity: usize,
+    pub paired_caps_per_block: [usize; 2],
+    pub paired_bases: [usize; 2],
+    pub tx_root_base: usize,
+    pub tx_root_paths_per_block: usize,
+}
+
+pub(crate) const fn selected_zk_block_geometry(tier: usize) -> Option<SelectedZkBlockGeometry> {
+    let geometry = match tier {
+        8 => SelectedZkBlockGeometry {
+            tier: 8,
+            auth_tiles: 8,
+            tx_log: 3,
+            owner_w_log: 10,
+            main_w_log: 11,
+            wallet_a_w_log: 14,
+            wallet_b_w_log: 13,
+            exact_state_region_log: 9,
+            spine_cap_log: 1,
+            meta_a_w_log: 11,
+            meta_b_w_log: 14,
+            meta_b_block_log: 11,
+            touched_capacity: 81,
+            segment_capacity: 81,
+            paired_caps_per_block: [11, 11],
+            paired_bases: [0, 704],
+            tx_root_base: 1_408,
+            tx_root_paths_per_block: 32,
+        },
+        32 => SelectedZkBlockGeometry {
+            tier: 32,
+            auth_tiles: 32,
+            tx_log: 5,
+            owner_w_log: 12,
+            main_w_log: 13,
+            wallet_a_w_log: 16,
+            wallet_b_w_log: 15,
+            exact_state_region_log: 11,
+            spine_cap_log: 1,
+            meta_a_w_log: 13,
+            meta_b_w_log: 16,
+            meta_b_block_log: 11,
+            touched_capacity: 321,
+            segment_capacity: 256,
+            paired_caps_per_block: [11, 8],
+            paired_bases: [0, 704],
+            tx_root_base: 1_216,
+            tx_root_paths_per_block: 8,
+        },
+        64 => SelectedZkBlockGeometry {
+            tier: 64,
+            auth_tiles: 64,
+            tx_log: 6,
+            owner_w_log: 13,
+            main_w_log: 14,
+            wallet_a_w_log: 17,
+            wallet_b_w_log: 16,
+            exact_state_region_log: 12,
+            spine_cap_log: 1,
+            meta_a_w_log: 14,
+            meta_b_w_log: 16,
+            meta_b_block_log: 10,
+            touched_capacity: 641,
+            segment_capacity: 256,
+            paired_caps_per_block: [11, 4],
+            paired_bases: [0, 704],
+            tx_root_base: 960,
+            tx_root_paths_per_block: 4,
+        },
+        255 => SelectedZkBlockGeometry {
+            tier: 255,
+            auth_tiles: 256,
+            tx_log: 8,
+            owner_w_log: 15,
+            main_w_log: 16,
+            wallet_a_w_log: 19,
+            wallet_b_w_log: 18,
+            exact_state_region_log: 13,
+            spine_cap_log: 0,
+            meta_a_w_log: 15,
+            meta_b_w_log: 17,
+            meta_b_block_log: 9,
+            touched_capacity: 1_531,
+            segment_capacity: 256,
+            paired_caps_per_block: [6, 1],
+            paired_bases: [0, 384],
+            tx_root_base: 448,
+            tx_root_paths_per_block: 1,
+        },
+        _ => return None,
+    };
+    Some(geometry)
+}
+
+pub(crate) fn selected_zk_block_geometry_for_auth_tiles(
+    auth_tiles: usize,
+) -> Option<SelectedZkBlockGeometry> {
+    noid_chain::consensus::params::USER_TX_CLASS_TIERS
+        .into_iter()
+        .filter_map(selected_zk_block_geometry)
+        .find(|geometry| geometry.auth_tiles == auth_tiles)
+}
+
 const SELECTED_ZK_AUTH_QUERY_LOG: usize = 6;
+#[cfg(test)]
+const SELECTED_ZK_AUTH_TX_LOG: usize = 8;
+#[cfg(test)]
 const SELECTED_ZK_AUTH_OWNER_W_LOG: usize = 15;
-const SELECTED_ZK_AUTH_MAIN_W_LOG: usize = 16;
+#[cfg(test)]
 const SELECTED_ZK_AUTH_WALLET_A_W_LOG: usize = 19;
-const SELECTED_ZK_AUTH_WALLET_B_W_LOG: usize = 18;
-const SELECTED_ZK_AUTH_META_A_W_LOG: usize = 15;
-const SELECTED_ZK_AUTH_META_B_W_LOG: usize = 17;
 
 const BLOCK_REGION_VK_DIGEST_DOMAIN: &[u8] = b"NOID/REGION-SIDECAR/BLOCK-VK/V3";
 const BLOCK_REGION_SELECTED_ZK_VK_DIGEST_DOMAIN: &[u8] = b"NOID/REGION-SIDECAR/BLOCK-ZK-AUTH-VK/V4";
@@ -132,7 +251,7 @@ impl BlockRegionSidecarVk {
     ///
     /// This is a VK shape certificate only.  It is deliberately not a
     /// committed-region capability: the only path to a selected mandatory
-    /// preparation additionally consumes the all-256-tile binding typestate.
+    /// preparation additionally consumes the all-class-tiles binding typestate.
     pub(crate) fn new_selected_zk(
         wallet_a: WalkARegionVk,
         meta_a: WalkARegionVk,
@@ -267,12 +386,26 @@ impl BlockRegionSidecarVk {
         }
     }
 
-    /// Exact selected-B255 certificate over all six child roles, layouts,
-    /// domains and slices.  Success does not by itself authorize proving: the
-    /// Block builder must still bind every tile and consume the resulting
-    /// private typestate before a selected preparation can exist.
+    /// Exact four-class selected certificate over all six child roles,
+    /// layouts, domains and slices. Success does not by itself authorize
+    /// proving: the Block builder must still bind every class tile and consume
+    /// the resulting private typestate before a selected preparation can
+    /// exist.
     pub(crate) fn validate_selected_zk_roles(&self) -> Result<(), RegionSidecarError> {
         use super::{MerkleRegionFamily, WalkARegionDescriptor};
+
+        let tx_log = match self.wallet_a.descriptor() {
+            WalkARegionDescriptor::Wallet {
+                tx_log,
+                nq_log: SELECTED_ZK_AUTH_QUERY_LOG,
+            } => tx_log,
+            _ => return Err(RegionSidecarError::UnsupportedVkShape),
+        };
+        let geometry = noid_chain::consensus::params::USER_TX_CLASS_TIERS
+            .into_iter()
+            .filter_map(selected_zk_block_geometry)
+            .find(|geometry| geometry.tx_log == tx_log)
+            .ok_or(RegionSidecarError::UnsupportedVkShape)?;
 
         if self.version != BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION
             || self.wallet_a.purpose() != &selected_zk_auth_wallet_a_sidecar_purpose()
@@ -283,21 +416,21 @@ impl BlockRegionSidecarVk {
             || self.main_c.purpose() != &selected_zk_auth_main_sidecar_purpose()
             || self.wallet_a.descriptor()
                 != (WalkARegionDescriptor::Wallet {
-                    tx_log: SELECTED_ZK_AUTH_TX_LOG,
+                    tx_log: geometry.tx_log,
                     nq_log: SELECTED_ZK_AUTH_QUERY_LOG,
                 })
-            || self.wallet_a.w_log() != SELECTED_ZK_AUTH_WALLET_A_W_LOG
+            || self.wallet_a.w_log() != geometry.wallet_a_w_log
             || self.meta_a.descriptor()
                 != (WalkARegionDescriptor::Meta {
-                    tx_log: SELECTED_ZK_AUTH_TX_LOG,
-                    exact_state_region_log: Some(13),
-                    spine_cap_log: Some(0),
+                    tx_log: geometry.tx_log,
+                    exact_state_region_log: Some(geometry.exact_state_region_log),
+                    spine_cap_log: Some(geometry.spine_cap_log),
                 })
-            || self.meta_a.w_log() != SELECTED_ZK_AUTH_META_A_W_LOG
-            || self.wallet_b.w_log() != SELECTED_ZK_AUTH_WALLET_B_W_LOG
+            || self.meta_a.w_log() != geometry.meta_a_w_log
+            || self.wallet_b.w_log() != geometry.wallet_b_w_log
             || self.wallet_b.block_log() != 10
-            || self.meta_b.w_log() != SELECTED_ZK_AUTH_META_B_W_LOG
-            || self.meta_b.block_log() != 9
+            || self.meta_b.w_log() != geometry.meta_b_w_log
+            || self.meta_b.block_log() != geometry.meta_b_block_log
         {
             return Err(RegionSidecarError::UnsupportedVkShape);
         }
@@ -324,19 +457,19 @@ impl BlockRegionSidecarVk {
         let exact_state_iv = capacity_iv_flat(TAG_EXSTNOD).map(raw_flat_lane);
         let expected_meta_b = [
             MerkleRegionFamily::PairedUpdate {
-                offset: 0,
-                n_updates: 6,
+                offset: geometry.paired_bases[0],
+                n_updates: geometry.paired_caps_per_block[0],
                 iv: exact_state_iv,
             },
             MerkleRegionFamily::PairedUpdate {
-                offset: 384,
-                n_updates: 1,
+                offset: geometry.paired_bases[1],
+                n_updates: geometry.paired_caps_per_block[1],
                 iv: exact_state_iv,
             },
             MerkleRegionFamily::TwoPermutation {
-                offset: 448,
+                offset: geometry.tx_root_base,
                 depth: 8,
-                n_paths: 1,
+                n_paths: geometry.tx_root_paths_per_block,
                 iv: compress_iv_flat(),
             },
         ];
@@ -349,13 +482,13 @@ impl BlockRegionSidecarVk {
             self.owner_c(),
             &schedules.owner_layout(),
             selected_zk_auth_owner_sidecar_purpose(),
-            SELECTED_ZK_AUTH_OWNER_W_LOG,
+            geometry.owner_w_log,
             ZK_AUTH_OWNER_TILE_LOG,
         ) || !selected_duplex_vk_matches(
             self.main_c(),
             &schedules.main_layout(),
             selected_zk_auth_main_sidecar_purpose(),
-            SELECTED_ZK_AUTH_MAIN_W_LOG,
+            geometry.main_w_log,
             ZK_AUTH_MAIN_TILE_LOG,
         ) {
             return Err(RegionSidecarError::UnsupportedVkShape);
@@ -1238,28 +1371,29 @@ mod tests {
         .expect("selected duplex VK fixture")
     }
 
-    fn selected_b255_vk_fixture() -> BlockRegionSidecarVk {
+    fn selected_vk_fixture(tier: usize) -> BlockRegionSidecarVk {
+        let geometry = selected_zk_block_geometry(tier).unwrap();
         let mut cursor = 0usize;
         let wallet_a = WalkARegionVk::new_wallet(
             selected_zk_auth_wallet_a_sidecar_purpose(),
-            SELECTED_ZK_AUTH_TX_LOG,
+            geometry.tx_log,
             SELECTED_ZK_AUTH_QUERY_LOG,
-            aligned_slices(&mut cursor, SELECTED_ZK_AUTH_WALLET_A_W_LOG),
+            aligned_slices(&mut cursor, geometry.wallet_a_w_log),
         )
         .unwrap();
         let meta_a = WalkARegionVk::new_meta(
             auth_pcs_meta_a_sidecar_purpose(),
-            SELECTED_ZK_AUTH_TX_LOG,
-            Some(13),
-            Some(0),
-            aligned_slices(&mut cursor, SELECTED_ZK_AUTH_META_A_W_LOG),
+            geometry.tx_log,
+            Some(geometry.exact_state_region_log),
+            Some(geometry.spine_cap_log),
+            aligned_slices(&mut cursor, geometry.meta_a_w_log),
         )
         .unwrap();
         let capsule_iv = capacity_iv_flat(TAG_CAPSNODE).map(raw_flat_lane);
         let wallet_b = MerkleRegionVk::new(
             selected_zk_auth_wallet_b_sidecar_purpose(),
-            SELECTED_ZK_AUTH_WALLET_B_W_LOG,
-            aligned_slices(&mut cursor, SELECTED_ZK_AUTH_WALLET_B_W_LOG),
+            geometry.wallet_b_w_log,
+            aligned_slices(&mut cursor, geometry.wallet_b_w_log),
             10,
             vec![
                 super::super::MerkleRegionFamily::FeedForward {
@@ -1280,24 +1414,24 @@ mod tests {
         let exact_state_iv = capacity_iv_flat(TAG_EXSTNOD).map(raw_flat_lane);
         let meta_b = MerkleRegionVk::new(
             auth_pcs_meta_b_sidecar_purpose(),
-            SELECTED_ZK_AUTH_META_B_W_LOG,
-            aligned_slices(&mut cursor, SELECTED_ZK_AUTH_META_B_W_LOG),
-            9,
+            geometry.meta_b_w_log,
+            aligned_slices(&mut cursor, geometry.meta_b_w_log),
+            geometry.meta_b_block_log,
             vec![
                 super::super::MerkleRegionFamily::PairedUpdate {
-                    offset: 0,
-                    n_updates: 6,
+                    offset: geometry.paired_bases[0],
+                    n_updates: geometry.paired_caps_per_block[0],
                     iv: exact_state_iv,
                 },
                 super::super::MerkleRegionFamily::PairedUpdate {
-                    offset: 384,
-                    n_updates: 1,
+                    offset: geometry.paired_bases[1],
+                    n_updates: geometry.paired_caps_per_block[1],
                     iv: exact_state_iv,
                 },
                 super::super::MerkleRegionFamily::TwoPermutation {
-                    offset: 448,
+                    offset: geometry.tx_root_base,
                     depth: 8,
-                    n_paths: 1,
+                    n_paths: geometry.tx_root_paths_per_block,
                     iv: compress_iv_flat(),
                 },
             ],
@@ -1307,19 +1441,43 @@ mod tests {
         let owner_c = selected_duplex_vk(
             selected_zk_auth_owner_sidecar_purpose(),
             &schedules.owner_layout(),
-            SELECTED_ZK_AUTH_OWNER_W_LOG,
+            geometry.owner_w_log,
             ZK_AUTH_OWNER_TILE_LOG,
-            aligned_slices(&mut cursor, SELECTED_ZK_AUTH_OWNER_W_LOG),
+            aligned_slices(&mut cursor, geometry.owner_w_log),
         );
         let main_c = selected_duplex_vk(
             selected_zk_auth_main_sidecar_purpose(),
             &schedules.main_layout(),
-            SELECTED_ZK_AUTH_MAIN_W_LOG,
+            geometry.main_w_log,
             ZK_AUTH_MAIN_TILE_LOG,
-            aligned_slices(&mut cursor, SELECTED_ZK_AUTH_MAIN_W_LOG),
+            aligned_slices(&mut cursor, geometry.main_w_log),
         );
         BlockRegionSidecarVk::new_selected_zk(wallet_a, meta_a, wallet_b, meta_b, owner_c, main_c)
             .unwrap()
+    }
+
+    fn selected_b255_vk_fixture() -> BlockRegionSidecarVk {
+        selected_vk_fixture(255)
+    }
+
+    #[test]
+    fn selected_v4_registry_accepts_exactly_four_canonical_geometries() {
+        let mut digests = std::collections::BTreeSet::new();
+        for tier in [8usize, 32, 64, 255] {
+            let geometry = selected_zk_block_geometry(tier).unwrap();
+            let vk = selected_vk_fixture(tier);
+            vk.validate_selected_zk_roles().unwrap();
+            assert_eq!(vk.wallet_a().w_log(), geometry.wallet_a_w_log);
+            assert_eq!(vk.wallet_b().w_log(), geometry.wallet_b_w_log);
+            assert_eq!(vk.meta_a().w_log(), geometry.meta_a_w_log);
+            assert_eq!(vk.meta_b().w_log(), geometry.meta_b_w_log);
+            assert_eq!(vk.owner_c().w_log(), geometry.owner_w_log);
+            assert_eq!(vk.main_c().w_log(), geometry.main_w_log);
+            assert!(digests.insert(vk.transcript_digest()));
+        }
+        assert!(selected_zk_block_geometry(0).is_none());
+        assert!(selected_zk_block_geometry(9).is_none());
+        assert!(selected_zk_block_geometry(256).is_none());
     }
 
     #[test]

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Production-disconnected composition of one complete authorization
+//! Production composition of one complete authorization
 //! capsule Phase B.
 //!
 //! This region consumes the exact aliases owned by the surrounding

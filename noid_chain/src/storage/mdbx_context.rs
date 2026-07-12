@@ -51,19 +51,26 @@ use crate::checkpoint::{
     CHECKPOINT_SEGMENT_PAYLOAD_ROOT_DOMAIN,
 };
 use crate::consensus::{
-    da_prune::{build_undo_log, revert_block},
+    da_prune::{build_undo_log, revert_block, BlockUndoLog},
     difficulty::{add_work, block_work},
     epoch_anchor::{tx_epoch_anchor_height_for_child, validate_block_epoch_anchors},
     header::asert_anchor_height,
-    params::{CONSENSUS_FINALITY_DEPTH, EXPANSION_WINDOW, GENESIS_TARGET, MEDIAN_TIME_BLOCKS},
+    params::{
+        CONSENSUS_FINALITY_DEPTH, EXPANSION_WINDOW, GENESIS_TARGET, MEDIAN_TIME_BLOCKS,
+        TX_EPOCH_BLOCKS,
+    },
     pow::block_id,
     validation::{validate_block_checks, AnchorInfo},
     ConsensusError,
 };
 use crate::segmented_state::SegmentedFriState;
-use crate::state::ChainState;
+use crate::state::{ChainState, StreamingSparseRoot};
+use crate::storage::mdbx_store::StagedAcceptedBlockCommit;
 use crate::storage::serial::encode_segment;
-use crate::storage::{ConsensusMeta, FinalizedCheckpoint, MdbxStore, StoreError};
+use crate::storage::{
+    AcceptedBlockCommitData, ConsensusMeta, FinalizedCheckpoint, FinalizedSnapshotStaging,
+    MdbxStore, StoreError,
+};
 use noid_poseidon2b::primitives::TxBodyHash;
 
 // ---------------------------------------------------------------------------
@@ -96,6 +103,59 @@ impl From<StoreError> for MdbxContextError {
 impl From<ConsensusError> for MdbxContextError {
     fn from(e: ConsensusError) -> Self {
         Self::Consensus(e)
+    }
+}
+
+/// Output of the single proof-native acceptance call that is persisted with
+/// the resulting state transition.
+///
+/// `history_claim_bytes` and `accepted_block_certificate_bytes` are opaque to
+/// `noid_chain`, but mandatory at this boundary so a successful block commit
+/// cannot leave the O(1)-history worker without its accepted inputs.
+#[derive(Debug)]
+pub struct AppliedBlockValidation {
+    pub state_root: [u8; 32],
+    pub history_claim_bytes: Vec<u8>,
+    pub accepted_block_certificate_bytes: Vec<u8>,
+}
+
+impl AppliedBlockValidation {
+    pub fn new(
+        state_root: [u8; 32],
+        history_claim_bytes: Vec<u8>,
+        accepted_block_certificate_bytes: Vec<u8>,
+    ) -> Self {
+        Self {
+            state_root,
+            history_claim_bytes,
+            accepted_block_certificate_bytes,
+        }
+    }
+}
+
+/// Borrowed large payloads for one candidate reorg block.
+///
+/// The reorg validator and final MDBX transaction both read these slices from
+/// the caller's existing candidate buffer.  Staging never clones a block,
+/// proof, or authorization sidecar into node RAM.
+#[derive(Debug, Clone, Copy)]
+pub struct ReorgBlockPayload<'a> {
+    pub block: &'a Block,
+    pub block_proof_bytes: &'a [u8],
+    pub block_auth_sidecar_bytes: &'a [u8],
+}
+
+impl<'a> ReorgBlockPayload<'a> {
+    pub fn new(
+        block: &'a Block,
+        block_proof_bytes: &'a [u8],
+        block_auth_sidecar_bytes: &'a [u8],
+    ) -> Self {
+        Self {
+            block,
+            block_proof_bytes,
+            block_auth_sidecar_bytes,
+        }
     }
 }
 
@@ -138,12 +198,107 @@ pub struct MdbxChainContext {
     /// Internal guard used during batch reorg application: finality is advanced
     /// only after the whole replacement branch has been applied successfully.
     defer_finality_updates: bool,
+
+    /// Owned commits produced while a replacement branch is validated in RAM.
+    /// `Some` suppresses per-block MDBX writes; the complete vector is installed
+    /// together only after every replacement block succeeds.
+    reorg_staging: Option<Vec<StagedAcceptedBlockCommit>>,
 }
 
 impl MdbxChainContext {
     // -----------------------------------------------------------------------
     // Initialisation
     // -----------------------------------------------------------------------
+
+    fn load_streamed_chain_state(
+        store: &MdbxStore,
+        log_slots: u32,
+        active_slot_count: u64,
+        alloc_counter: u64,
+        expected_root: [u8; 32],
+    ) -> Result<ChainState, MdbxContextError> {
+        let mut segmented = SegmentedFriState::new_empty(log_slots as usize);
+        let effective_log = segmented.effective_log_segment_size();
+        let expected_segment_len = 1usize << effective_log;
+        let mut exact = StreamingSparseRoot::new(log_slots)
+            .map_err(|_| MdbxContextError::Corrupt("invalid durable state depth"))?;
+        let mut exact_segment_roots = Vec::new();
+        let mut counted_live = 0u64;
+        store.visit_segments(|segment_id, stored_log, columns| {
+            if usize::from(stored_log) != effective_log
+                || columns.values.len() != expected_segment_len
+                || columns.owners_hi.len() != expected_segment_len
+                || columns.owners_lo.len() != expected_segment_len
+            {
+                return Err(StoreError::Decode("invalid durable segment shape"));
+            }
+            let mut segment_live = 0u32;
+            let base = (segment_id as u32) << effective_log;
+            for local in 0..expected_segment_len {
+                let slot = crate::fri_state::SlotValue {
+                    value: columns.values[local],
+                    owner_hi: columns.owners_hi[local],
+                    owner_lo: columns.owners_lo[local],
+                };
+                if slot.is_empty() {
+                    continue;
+                }
+                if slot.creation_id() > alloc_counter {
+                    return Err(StoreError::Decode(
+                        "persisted slot creation_id exceeds alloc_counter",
+                    ));
+                }
+                segment_live = segment_live
+                    .checked_add(1)
+                    .ok_or(StoreError::Decode("durable segment live-count overflow"))?;
+                exact
+                    .push_leaf(
+                        base | local as u32,
+                        crate::exact_state_hash::slot_leaf_hash(slot),
+                    )
+                    .map_err(|_| StoreError::Decode("durable exact leaf is out of range"))?;
+            }
+            counted_live = counted_live
+                .checked_add(u64::from(segment_live))
+                .ok_or(StoreError::Decode("durable active count overflow"))?;
+            let segment_root = crate::fri_state::compute_segment_root(
+                effective_log,
+                &columns.values,
+                &columns.owners_hi,
+                &columns.owners_lo,
+            );
+            segmented
+                .install_evicted_segment_summary(segment_id, segment_live, segment_root)
+                .map_err(StoreError::Decode)?;
+            exact_segment_roots.push((
+                segment_id,
+                crate::state::exact_segment_root_from_columns(effective_log, &columns),
+            ));
+            Ok(())
+        })?;
+        if counted_live != active_slot_count {
+            return Err(MdbxContextError::Corrupt(
+                "durable active count does not match exact segments",
+            ));
+        }
+        segmented.finish_evicted_segment_summaries();
+        let root = exact
+            .finish()
+            .map_err(|_| MdbxContextError::Corrupt("durable exact root build failed"))?;
+        if root != expected_root {
+            return Err(MdbxContextError::Corrupt(
+                "durable exact state root mismatch",
+            ));
+        }
+        ChainState::from_evicted_parts(
+            segmented,
+            active_slot_count,
+            alloc_counter,
+            root,
+            &exact_segment_roots,
+        )
+        .map_err(|_| MdbxContextError::Corrupt("durable exact segment summary mismatch"))
+    }
 
     /// Open an existing MDBX database, or initialise a fresh one from genesis.
     ///
@@ -182,6 +337,7 @@ impl MdbxChainContext {
                 tip_chain_work,
                 finalized,
                 defer_finality_updates: false,
+                reorg_staging: None,
             };
             ctx.persist_genesis()?;
             Ok(ctx)
@@ -215,6 +371,7 @@ impl MdbxChainContext {
                         tip_chain_work,
                         finalized,
                         defer_finality_updates: false,
+                        reorg_staging: None,
                     };
                     ctx.persist_genesis()?;
                     Ok(ctx)
@@ -247,6 +404,7 @@ impl MdbxChainContext {
                 tip_chain_work,
                 finalized,
                 defer_finality_updates: false,
+                reorg_staging: None,
             };
             // Persist easy genesis.
             {
@@ -269,6 +427,7 @@ impl MdbxChainContext {
                     &[],
                     &[],
                     &[],
+                    None,
                     None,
                     &meta,
                     false,
@@ -303,6 +462,7 @@ impl MdbxChainContext {
             &[],
             &[],
             None, // no block bytes for genesis
+            None,
             &meta,
             false,
         )?;
@@ -341,41 +501,7 @@ impl MdbxChainContext {
         let (log_slots, active_slot_count, alloc_counter) = store
             .get_state_meta()?
             .ok_or(MdbxContextError::Corrupt("missing state_meta"))?;
-        // 3. Rebuild SegmentedFriState from stored segments.
-        //    Use `set_segment_columns` (not `set_slot`) so that restored
-        //    segments are NOT marked as MDBX-dirty — they are already in MDBX.
-        let mut seg_state = SegmentedFriState::new_empty(log_slots as usize);
-        let all_segs = store.all_segments()?;
-        for (seg_id, _eff, cols) in all_segs {
-            for ((&value, &owner_hi), &owner_lo) in cols
-                .values
-                .iter()
-                .zip(cols.owners_hi.iter())
-                .zip(cols.owners_lo.iter())
-            {
-                let slot = crate::fri_state::SlotValue {
-                    value,
-                    owner_hi,
-                    owner_lo,
-                };
-                if !slot.is_empty() && slot.creation_id() > alloc_counter {
-                    return Err(MdbxContextError::Corrupt(
-                        "persisted slot creation_id exceeds alloc_counter",
-                    ));
-                }
-            }
-            seg_state.set_segment_columns(seg_id, cols);
-        }
-        // Confirm: after restore, mdbx_dirty must be empty.
-        debug_assert_eq!(
-            seg_state.dirty_segment_ids().count(),
-            0,
-            "set_segment_columns must not pollute mdbx_dirty"
-        );
-
-        // 3b. Integrity check: verify the reloaded state produces the correct
-        //     state root.  This catches silent disk corruption or MDBX bit-rot
-        //     in the segment columns before the node starts serving requests.
+        // 3. Validate the canonical metadata before streaming state columns.
         let tip_hdr = store
             .get_header(tip_height)?
             .ok_or(MdbxContextError::Corrupt("tip header missing from store"))?;
@@ -403,18 +529,16 @@ impl MdbxChainContext {
                 "finalized hash mismatch with persisted finalized header",
             ));
         }
-        // 4. Rebuild ChainState and the direct exact UTXO root.
-        let mut state = ChainState::from_loaded_parts(seg_state, active_slot_count, alloc_counter)
-            .map_err(|_| MdbxContextError::Corrupt("exact state root rebuild failed"))?;
-        if state
-            .try_state_root()
-            .map_err(|_| MdbxContextError::Corrupt("exact state root rebuild failed"))?
-            != tip_hdr.state_root
-        {
-            return Err(MdbxContextError::Corrupt(
-                "state root mismatch after restore: segment data is corrupt",
-            ));
-        }
+        // 4. Verify the exact root and per-segment FRI roots while decoding
+        //    one durable segment at a time.  The returned hot state retains
+        //    only summaries; columns are faulted in lazily on first access.
+        let state = Self::load_streamed_chain_state(
+            &store,
+            log_slots,
+            active_slot_count,
+            alloc_counter,
+            tip_hdr.state_root,
+        )?;
 
         // 5. Rebuild the bounded header window used by native header checks.
         let window = (MEDIAN_TIME_BLOCKS as u64).max(EXPANSION_WINDOW);
@@ -438,7 +562,80 @@ impl MdbxChainContext {
             tip_chain_work,
             finalized,
             defer_finality_updates: false,
+            reorg_staging: None,
         })
+    }
+
+    /// Reload the durable canonical tip without retaining a second full state
+    /// image in RAM.  Used only to abort a staged reorg; MDBX is still on the
+    /// old branch until the final atomic replacement transaction commits.
+    fn reload_hot_state_from_mdbx(&mut self) -> Result<(), MdbxContextError> {
+        let meta = self
+            .store
+            .get_consensus_meta()?
+            .ok_or(MdbxContextError::Corrupt("missing consensus_meta"))?;
+        let (log_slots, active_slot_count, alloc_counter) = self
+            .store
+            .get_state_meta()?
+            .ok_or(MdbxContextError::Corrupt("missing state_meta"))?;
+        let tip_header = self
+            .store
+            .get_header(meta.tip_height)?
+            .ok_or(MdbxContextError::Corrupt("durable tip header missing"))?;
+        if block_id(&tip_header) != meta.tip_hash
+            || tip_header.log_slots != log_slots
+            || tip_header.active_slot_count != active_slot_count
+            || tip_header.alloc_counter != alloc_counter
+        {
+            return Err(MdbxContextError::Corrupt(
+                "durable reorg recovery metadata mismatch",
+            ));
+        }
+
+        // Release the failed candidate before decoding durable segments.  The
+        // replacement is a sparse virtual-zero state and does not allocate the
+        // full slot domain.
+        self.state = ChainState::with_log_slots(log_slots as usize);
+        self.recent_headers.clear();
+        let state = Self::load_streamed_chain_state(
+            &self.store,
+            log_slots,
+            active_slot_count,
+            alloc_counter,
+            tip_header.state_root,
+        )?;
+
+        let window = (MEDIAN_TIME_BLOCKS as u64).max(EXPANSION_WINDOW);
+        let start_height = meta.tip_height.saturating_sub(window);
+        let mut recent_headers = HashMap::new();
+        for height in start_height..=meta.tip_height {
+            if let Some(header) = self.store.get_header(height)? {
+                recent_headers.insert(height, header);
+            }
+        }
+        if !recent_headers.contains_key(&meta.tip_height) {
+            return Err(MdbxContextError::Corrupt(
+                "durable recent header window misses tip",
+            ));
+        }
+
+        self.state = state;
+        self.recent_headers = recent_headers;
+        self.tip_height = meta.tip_height;
+        self.tip_hash = meta.tip_hash;
+        self.tip_chain_work = meta.cumulative_chainwork;
+        self.finalized = meta.finalized;
+        self.defer_finality_updates = false;
+        self.reorg_staging = None;
+        Ok(())
+    }
+
+    fn abort_staged_reorg(&mut self, original: MdbxContextError) -> MdbxContextError {
+        self.reorg_staging = None;
+        match self.reload_hot_state_from_mdbx() {
+            Ok(()) => original,
+            Err(reload) => reload,
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -461,26 +658,46 @@ impl MdbxChainContext {
         })
     }
 
+    /// Restore an uncommitted in-place transition from its bounded touched-set
+    /// undo.  The durable store still points to `parent`, so retaining another
+    /// full `ChainState` image solely for error handling is unnecessary.
+    fn rollback_uncommitted_block(
+        &mut self,
+        undo: &crate::consensus::da_prune::BlockUndoLog,
+        parent: &BlockHeader,
+    ) -> Result<(), MdbxContextError> {
+        self.state
+            .state
+            .apply_delta_unrooted(&undo.slot_changes)
+            .map_err(|_| MdbxContextError::Corrupt("uncommitted block undo is out of range"))?;
+        self.state
+            .state
+            .shrink_to_log_slots(undo.log_slots_before as usize)
+            .map_err(|_| MdbxContextError::Corrupt("uncommitted block depth rollback failed"))?;
+        self.state.active_slot_count = undo.active_slot_count_before;
+        self.state.alloc_counter = undo.alloc_counter_before;
+        self.state.utxo_root = parent.state_root;
+        if self.state.state.log_slots() as u32 != parent.log_slots
+            || self.state.active_slot_count != parent.active_slot_count
+            || self.state.alloc_counter != parent.alloc_counter
+        {
+            return Err(MdbxContextError::Corrupt(
+                "uncommitted block undo does not restore parent boundary",
+            ));
+        }
+        self.state.state.clear_dirty();
+        Ok(())
+    }
+
     fn commit_applied_next_block(
         &mut self,
         block: &Block,
+        block_proof_bytes: &[u8],
+        block_auth_sidecar_bytes: &[u8],
+        validation: &AppliedBlockValidation,
         undo: &crate::consensus::da_prune::BlockUndoLog,
-        state_before_apply: &ChainState,
+        parent: &BlockHeader,
     ) -> Result<(), MdbxContextError> {
-        let dirty_ids: Vec<u16> = self.state.state.dirty_segment_ids().collect();
-        let eff_log = self.state.state.effective_log_segment_size() as u8;
-        let dirty_segments: Vec<(u16, u8, _)> = dirty_ids
-            .iter()
-            .map(|&seg_id| {
-                let cols = self.state.state.segment_columns_for_persistence(seg_id);
-                (seg_id, eff_log, cols)
-            })
-            .collect();
-        let dirty_refs: Vec<(u16, u8, &_)> = dirty_segments
-            .iter()
-            .map(|(id, eff, cols)| (*id, *eff, cols))
-            .collect();
-
         let tx_hashes: Vec<TxBodyHash> = block.transactions.iter().map(|tx| tx.txid()).collect();
         let block_hash = block_id(&block.header);
         let new_tip_chain_work = add_work(
@@ -492,26 +709,66 @@ impl MdbxChainContext {
         } else {
             self.finalized_for_tip(block.header.height)?
         };
-        let consensus_meta = ConsensusMeta {
-            tip_height: block.header.height,
-            tip_hash: block_hash,
-            cumulative_chainwork: new_tip_chain_work,
-            finalized: new_finalized,
-        };
-        if let Err(e) = self.store.commit_block(
-            &block.header,
-            &block_hash,
-            undo,
-            &dirty_refs,
-            &tx_hashes,
-            &[],
-            Some(&block.to_bytes()),
-            &consensus_meta,
-            false,
-        ) {
-            self.state = state_before_apply.clone();
-            self.state.state.clear_dirty();
-            return Err(e.into());
+        let staged = self.reorg_staging.is_some();
+        if let Some(replacement) = self.reorg_staging.as_mut() {
+            replacement.push(StagedAcceptedBlockCommit {
+                header: block.header,
+                hash: block_hash,
+                cumulative_chainwork: new_tip_chain_work,
+                undo_log: undo.clone(),
+                history_claim_bytes: validation.history_claim_bytes.clone(),
+                accepted_block_certificate_bytes: validation
+                    .accepted_block_certificate_bytes
+                    .clone(),
+            });
+        } else {
+            let consensus_meta = ConsensusMeta {
+                tip_height: block.header.height,
+                tip_hash: block_hash,
+                cumulative_chainwork: new_tip_chain_work,
+                finalized: new_finalized,
+            };
+            let commit_result = (|| -> Result<(), StoreError> {
+                let dirty_ids: Vec<u16> = self.state.state.dirty_segment_ids().collect();
+                let eff_log = self.state.state.effective_log_segment_size() as u8;
+                let mut dirty_refs = Vec::with_capacity(dirty_ids.len());
+                for segment_id in dirty_ids {
+                    let columns =
+                        if self.state.state.segment_live_count(segment_id) == 0 {
+                            None
+                        } else {
+                            Some(self.state.state.try_get_segment_columns(segment_id).ok_or(
+                                StoreError::Decode("dirty accepted segment is not resident"),
+                            )?)
+                        };
+                    dirty_refs.push((segment_id, eff_log, columns));
+                }
+                self.store.commit_block(
+                    &block.header,
+                    &block_hash,
+                    undo,
+                    &dirty_refs,
+                    &tx_hashes,
+                    &[],
+                    Some(&block.to_bytes()),
+                    Some(AcceptedBlockCommitData {
+                        block_proof_bytes,
+                        block_auth_sidecar_bytes,
+                        history_claim_bytes: &validation.history_claim_bytes,
+                        accepted_block_certificate_bytes: &validation
+                            .accepted_block_certificate_bytes,
+                    }),
+                    &consensus_meta,
+                    false,
+                )
+            })();
+            if let Err(e) = commit_result {
+                let commit_error = MdbxContextError::from(e);
+                return match self.rollback_uncommitted_block(undo, parent) {
+                    Ok(()) => Err(commit_error),
+                    Err(rollback_error) => Err(rollback_error),
+                };
+            }
         }
 
         self.recent_headers
@@ -520,7 +777,13 @@ impl MdbxChainContext {
         self.tip_hash = block_hash;
         self.tip_chain_work = new_tip_chain_work;
         self.finalized = new_finalized;
-        self.state.state.clear_dirty();
+        if !staged {
+            self.state.state.clear_dirty();
+            // The exact hierarchy is compact and current. Raw columns have
+            // reached MDBX atomically, so retain no full segment merely because
+            // it was touched by the latest block.
+            self.state.state.evict_all_persisted_segments();
+        }
 
         let window = (MEDIAN_TIME_BLOCKS as u64).max(EXPANSION_WINDOW);
         if self.tip_height > window {
@@ -558,9 +821,8 @@ impl MdbxChainContext {
             u64,
             &[u8; 32],
             &AnchorInfo,
-            &SegmentedFriState,
             &mut ChainState,
-        ) -> Result<[u8; 32], E>,
+        ) -> Result<AppliedBlockValidation, E>,
         E: std::fmt::Display,
     {
         let parent = *self.tip_header();
@@ -620,18 +882,9 @@ impl MdbxChainContext {
         }
 
         self.preload_segments_for_preflighted_block(block)?;
-        if !has_user_txs {
-            // The native coinbase-only path recomputes the exact post-root.
-            // Until it has an incremental exact-tree cache, every live segment
-            // must be resident so an unrelated eviction cannot turn the cached
-            // parent root into a false post-root acceptance.
-            self.preload_all_evicted_segments()?;
-        }
-        let pre_state = self.state.state.clone();
-        let state_before_validation = self.state.clone();
         let undo = build_undo_log(&self.state, block);
 
-        let new_state_root = match validate_and_apply(
+        let validation = match validate_and_apply(
             block,
             block_proof_bytes,
             block_auth_sidecar_bytes,
@@ -641,21 +894,39 @@ impl MdbxChainContext {
             local_time,
             &tx_epoch_anchor_id,
             &anchor,
-            &pre_state,
             &mut self.state,
         ) {
-            Ok(root) => root,
+            Ok(validation) => validation,
             Err(e) => {
-                self.state = state_before_validation;
-                self.state.state.clear_dirty();
+                self.rollback_uncommitted_block(&undo, &parent)?;
                 return Err(MdbxContextError::Consensus(ConsensusError::ShapeMismatch(
                     format!("proof-native validation failed: {e}"),
                 )));
             }
         };
 
-        self.commit_applied_next_block(block, &undo, &state_before_validation)?;
-        Ok(new_state_root)
+        if validation.state_root != block.header.state_root {
+            self.rollback_uncommitted_block(&undo, &parent)?;
+            return Err(MdbxContextError::Consensus(ConsensusError::BadStateRoot));
+        }
+        if validation.history_claim_bytes.is_empty()
+            || validation.accepted_block_certificate_bytes.is_empty()
+        {
+            self.rollback_uncommitted_block(&undo, &parent)?;
+            return Err(MdbxContextError::Consensus(ConsensusError::ShapeMismatch(
+                "proof-native acceptance returned incomplete durable artifacts".to_string(),
+            )));
+        }
+
+        self.commit_applied_next_block(
+            block,
+            block_proof_bytes,
+            block_auth_sidecar_bytes,
+            &validation,
+            &undo,
+            &parent,
+        )?;
+        Ok(validation.state_root)
     }
 
     // -----------------------------------------------------------------------
@@ -767,7 +1038,6 @@ impl MdbxChainContext {
     }
 
     fn reconstruct_state_at_height(&mut self, height: u64) -> Result<ChainState, MdbxContextError> {
-        self.preload_all_evicted_segments()?;
         let mut checkpoint_state = self.state.clone();
         for h in (height + 1..=self.tip_height).rev() {
             let undo = self
@@ -776,6 +1046,7 @@ impl MdbxChainContext {
                 .ok_or(MdbxContextError::Corrupt(
                     "checkpoint reconstruction undo log missing",
                 ))?;
+            Self::preload_segments_for_undo_in_state(&self.store, &mut checkpoint_state, &undo)?;
             revert_block(&mut checkpoint_state.state, &undo);
             checkpoint_state
                 .state
@@ -960,12 +1231,12 @@ impl MdbxChainContext {
     pub fn apply_reorg_mdbx_with_applier<F>(
         &mut self,
         ancestor_height: u64,
-        new_blocks: &[Block],
+        replacement: &[ReorgBlockPayload<'_>],
         local_time: u64,
         mut apply_block: F,
     ) -> Result<crate::consensus::reorg::ReorgResult, MdbxContextError>
     where
-        F: FnMut(&mut Self, &Block, u64) -> Result<(), MdbxContextError>,
+        F: FnMut(&mut Self, &ReorgBlockPayload<'_>, u64) -> Result<(), MdbxContextError>,
     {
         use crate::consensus::reorg::{revert_state_counters, ReorgResult};
 
@@ -1013,23 +1284,16 @@ impl MdbxChainContext {
             });
         }
 
-        let state_before_reorg = self.state.clone();
-        let recent_headers_before_reorg = self.recent_headers.clone();
-        let tip_height_before_reorg = self.tip_height;
-        let tip_hash_before_reorg = self.tip_hash;
-        let tip_chain_work_before_reorg = self.tip_chain_work;
-
-        #[allow(unused_assignments)]
-        let mut reclaimed_tx_hashes: Vec<TxBodyHash> = Vec::new();
-        #[allow(unused_assignments)]
-        let mut reverted_heights: Vec<u64> = Vec::new();
+        if self.reorg_staging.is_some() {
+            return Err(MdbxContextError::Corrupt("nested reorg staging"));
+        }
 
         tracing::info!(
             "reorg: reverting height {}..{} depth={} new_blocks={}",
             self.tip_height,
             ancestor_height,
             reorg_depth,
-            new_blocks.len()
+            replacement.len()
         );
 
         // Load the ancestor metadata before installing any reverted RAM
@@ -1059,16 +1323,14 @@ impl MdbxChainContext {
         // By validating upfront, we either succeed fully or fail before touching
         // any in-memory state.
         // -----------------------------------------------------------------------
-        {
+        let (reclaimed_tx_hashes, reverted_heights) = {
             if ancestor_height != 0 && self.store.get_undo_log(ancestor_height)?.is_none() {
                 return Err(MdbxContextError::Corrupt("reorg ancestor undo log missing"));
             }
-            let range = ancestor_height + 1..=self.tip_height;
-            let total = self.tip_height.saturating_sub(ancestor_height) as usize;
-            let mut loaded = Vec::with_capacity(total);
-            for height in range.rev() {
+            let old_tip_height = self.tip_height;
+            for height in (ancestor_height + 1..=old_tip_height).rev() {
                 match self.store.get_undo_log(height) {
-                    Ok(Some(u)) => loaded.push((height, u)),
+                    Ok(Some(_)) => {}
                     Ok(None) => {
                         tracing::error!(
                             height,
@@ -1083,60 +1345,61 @@ impl MdbxChainContext {
                     Err(e) => return Err(e.into()),
                 }
             }
-            // All undo logs present — store them.
-            // (We traverse in reverse above to fail-fast on missing entries, so
-            // re-sort to descending order for the revert loop below.)
-            loaded.sort_by_key(|(h, _)| std::cmp::Reverse(*h));
 
             // -----------------------------------------------------------------------
             // Revert blocks from tip to ancestor (RAM only).
-            // Safe to execute: all undo logs validated.
+            // Safe to execute: all undo logs were validated above.  Read them
+            // again one at a time so peak RAM is one decoded undo log instead
+            // of the complete finality window.
             // -----------------------------------------------------------------------
-            let mut reclaimed_tx_hashes_inner: Vec<TxBodyHash> = Vec::new();
-            let mut reverted_heights_inner: Vec<u64> = Vec::new();
+            let mut reclaimed_tx_hashes = Vec::new();
+            let mut reverted_heights = Vec::new();
 
-            self.preload_all_evicted_segments()?;
-            let mut candidate_state = self.state.clone();
-            let mut candidate_headers = self.recent_headers.clone();
-
-            for (height, undo) in &loaded {
-                reclaimed_tx_hashes_inner.extend_from_slice(&undo.tx_hashes);
-                revert_block(&mut candidate_state.state, undo);
-                candidate_state
-                    .state
-                    .shrink_to_log_slots(undo.log_slots_before as usize)
-                    .map_err(|_| MdbxContextError::Corrupt("state shrink after reorg failed"))?;
-                revert_state_counters(&mut candidate_state, undo);
-                candidate_state
-                    .rebuild_exact_utxo_root_loaded()
-                    .map_err(|_| {
+            let revert_result = (|| -> Result<(), MdbxContextError> {
+                for height in (ancestor_height + 1..=old_tip_height).rev() {
+                    let undo =
+                        self.store
+                            .get_undo_log(height)?
+                            .ok_or(MdbxContextError::Corrupt(
+                                "validated reorg undo disappeared",
+                            ))?;
+                    Self::preload_segments_for_undo_in_state(&self.store, &mut self.state, &undo)?;
+                    reclaimed_tx_hashes.extend_from_slice(&undo.tx_hashes);
+                    revert_block(&mut self.state.state, &undo);
+                    self.state
+                        .state
+                        .shrink_to_log_slots(undo.log_slots_before as usize)
+                        .map_err(|_| {
+                            MdbxContextError::Corrupt("state shrink after reorg failed")
+                        })?;
+                    revert_state_counters(&mut self.state, &undo);
+                    self.state.rebuild_exact_utxo_root_loaded().map_err(|_| {
                         MdbxContextError::Corrupt("exact root rebuild after reorg failed")
                     })?;
-                let parent_header = self
-                    .store
-                    .get_header(height - 1)?
-                    .ok_or(MdbxContextError::Corrupt("reorg parent header missing"))?;
-                if undo.log_slots_before != parent_header.log_slots
-                    || candidate_state.state.log_slots() as u32 != parent_header.log_slots
-                    || candidate_state.utxo_root != parent_header.state_root
-                    || candidate_state.active_slot_count != parent_header.active_slot_count
-                    || candidate_state.alloc_counter != parent_header.alloc_counter
-                {
-                    return Err(MdbxContextError::Corrupt(
-                        "reorg undo does not restore parent header state",
-                    ));
+                    let parent_header = self
+                        .store
+                        .get_header(height - 1)?
+                        .ok_or(MdbxContextError::Corrupt("reorg parent header missing"))?;
+                    if undo.log_slots_before != parent_header.log_slots
+                        || self.state.state.log_slots() as u32 != parent_header.log_slots
+                        || self.state.utxo_root != parent_header.state_root
+                        || self.state.active_slot_count != parent_header.active_slot_count
+                        || self.state.alloc_counter != parent_header.alloc_counter
+                    {
+                        return Err(MdbxContextError::Corrupt(
+                            "reorg undo does not restore parent header state",
+                        ));
+                    }
+                    self.recent_headers.remove(&height);
+                    reverted_heights.push(height);
                 }
-                candidate_headers.remove(height);
-                reverted_heights_inner.push(*height);
+                Ok(())
+            })();
+            if let Err(error) = revert_result {
+                return Err(self.abort_staged_reorg(error));
             }
-
-            self.state = candidate_state;
-            self.recent_headers = candidate_headers;
-
-            // Move into outer scope variables.
-            reclaimed_tx_hashes = reclaimed_tx_hashes_inner;
-            reverted_heights = reverted_heights_inner;
-        }
+            (reclaimed_tx_hashes, reverted_heights)
+        };
 
         // -----------------------------------------------------------------------
         // Update tip pointers to the ancestor.
@@ -1146,59 +1409,85 @@ impl MdbxChainContext {
         self.tip_chain_work = ancestor_chain_work;
 
         // -----------------------------------------------------------------------
-        // Persist the reverted state to MDBX atomically.
-        // dirty segments are written before new blocks so crash
-        // recovery always sees a consistent ancestor checkpoint.
-        //
-        // MDBX commit is atomic. If it fails, restore the pre-reorg RAM snapshot
-        // so local state and the still-old durable tip remain consistent.
-        // -----------------------------------------------------------------------
-        if let Err(e) = self.persist_reorg_checkpoint(&ancestor_header, &reclaimed_tx_hashes) {
-            tracing::error!(
-                ancestor_height,
-                "persist_reorg_checkpoint failed — restored pre-reorg RAM state"
-            );
-            self.state = state_before_reorg;
-            self.recent_headers = recent_headers_before_reorg;
-            self.tip_height = tip_height_before_reorg;
-            self.tip_hash = tip_hash_before_reorg;
-            self.tip_chain_work = tip_chain_work_before_reorg;
-            return Err(e);
-        }
-
-        // -----------------------------------------------------------------------
-        // Apply fork blocks via the caller's proof-native applier.
+        // Validate the entire fork through the normal proof-native applier,
+        // but stage every resulting commit in RAM.  The old canonical MDBX
+        // branch remains untouched until every replacement block succeeds.
         // -----------------------------------------------------------------------
         let mut applied_heights: Vec<u64> = Vec::new();
-        let previous_defer_finality = self.defer_finality_updates;
         self.defer_finality_updates = true;
+        self.reorg_staging = Some(Vec::with_capacity(replacement.len()));
 
-        for block in new_blocks {
-            match apply_block(self, block, local_time) {
+        for candidate in replacement {
+            match apply_block(self, candidate, local_time) {
                 Ok(()) => {
-                    applied_heights.push(block.header.height);
-                    tracing::info!(height = block.header.height, "reorg: applied new block");
+                    applied_heights.push(candidate.block.header.height);
+                    tracing::info!(
+                        height = candidate.block.header.height,
+                        "reorg: applied new block"
+                    );
                 }
                 Err(e) => {
-                    self.defer_finality_updates = previous_defer_finality;
-                    tracing::error!(height = block.header.height, err = ?e, "reorg: failed to apply block");
-                    return Err(e);
+                    tracing::error!(height = candidate.block.header.height, err = ?e, "reorg: failed to apply block");
+                    return Err(self.abort_staged_reorg(e));
                 }
             }
         }
 
-        self.defer_finality_updates = previous_defer_finality;
-        let finalized_after_reorg = self.finalized_for_tip(self.tip_height)?;
-        if finalized_after_reorg != self.finalized {
-            let meta = ConsensusMeta {
-                tip_height: self.tip_height,
-                tip_hash: self.tip_hash,
-                cumulative_chainwork: self.tip_chain_work,
-                finalized: finalized_after_reorg,
-            };
-            self.store.put_consensus_meta(&meta)?;
-            self.finalized = finalized_after_reorg;
+        let staged = match self.reorg_staging.take() {
+            Some(staged) => staged,
+            None => {
+                return Err(
+                    self.abort_staged_reorg(MdbxContextError::Corrupt("reorg staging disappeared"))
+                );
+            }
+        };
+        let finalized_after_reorg = match self.finalized_for_tip(self.tip_height) {
+            Ok(finalized) => finalized,
+            Err(error) => {
+                return Err(self.abort_staged_reorg(error));
+            }
+        };
+        let final_header = *self.tip_header();
+        let final_hash = self.tip_hash;
+        let consensus_meta = ConsensusMeta {
+            tip_height: self.tip_height,
+            tip_hash: final_hash,
+            cumulative_chainwork: self.tip_chain_work,
+            finalized: finalized_after_reorg,
+        };
+        let commit_result = (|| -> Result<(), MdbxContextError> {
+            let dirty_ids: Vec<u16> = self.state.state.dirty_segment_ids().collect();
+            let eff_log = self.state.state.effective_log_segment_size() as u8;
+            let mut dirty_refs = Vec::with_capacity(dirty_ids.len());
+            for segment_id in dirty_ids {
+                let columns = if self.state.state.segment_live_count(segment_id) == 0 {
+                    None
+                } else {
+                    Some(self.state.state.try_get_segment_columns(segment_id).ok_or(
+                        MdbxContextError::Corrupt("dirty reorg segment is not resident"),
+                    )?)
+                };
+                dirty_refs.push((segment_id, eff_log, columns));
+            }
+            self.store.commit_reorg(
+                ancestor_height,
+                &final_header,
+                &final_hash,
+                &dirty_refs,
+                &reclaimed_tx_hashes,
+                replacement,
+                &staged,
+                &consensus_meta,
+            )?;
+            Ok(())
+        })();
+        if let Err(error) = commit_result {
+            return Err(self.abort_staged_reorg(error));
         }
+        self.state.state.clear_dirty();
+        self.state.state.evict_all_persisted_segments();
+        self.finalized = finalized_after_reorg;
+        self.defer_finality_updates = false;
 
         tracing::info!(
             reverted = reverted_heights.len(),
@@ -1214,99 +1503,33 @@ impl MdbxChainContext {
         })
     }
 
-    /// Persist the reverted chain state to MDBX after the reorg revert phase.
-    ///
-    /// Writes all segments marked dirty by `revert_block`, updates `chain_tip`
-    /// and `state_meta`, and preserves the existing undo log at `ancestor_height`
-    /// — all in one atomic MDBX transaction.
-    fn persist_reorg_checkpoint(
-        &mut self,
-        ancestor_header: &BlockHeader,
-        reverted_tx_hashes: &[TxBodyHash],
+    fn preload_segments_for_undo_in_state(
+        store: &MdbxStore,
+        state: &mut ChainState,
+        undo: &BlockUndoLog,
     ) -> Result<(), MdbxContextError> {
-        use crate::consensus::da_prune::BlockUndoLog;
-
-        // Collect all segments dirtied by the revert_block calls.
-        let dirty_ids: Vec<u16> = self.state.state.dirty_segment_ids().collect();
-        let eff_log = self.state.state.effective_log_segment_size() as u8;
-        let dirty_segments: Vec<(u16, u8, _)> = dirty_ids
+        let effective_log = state.state.effective_log_segment_size();
+        let mut needed: Vec<u16> = undo
+            .slot_changes
             .iter()
-            .map(|&seg_id| {
-                let cols = self.state.state.segment_columns_for_persistence(seg_id);
-                (seg_id, eff_log, cols)
-            })
+            .map(|(slot_index, _)| (*slot_index >> effective_log) as u16)
             .collect();
-        let dirty_refs: Vec<(u16, u8, &_)> = dirty_segments
-            .iter()
-            .map(|(id, eff, cols)| (*id, *eff, cols))
-            .collect();
-
-        let ancestor_hash = block_id(ancestor_header);
-        let consensus_meta = ConsensusMeta {
-            tip_height: ancestor_header.height,
-            tip_hash: ancestor_hash,
-            cumulative_chainwork: self.tip_chain_work,
-            finalized: self.finalized,
-        };
-
-        // Read the ancestor's existing undo log so we don't overwrite it with
-        // empty — it must remain intact for any future reorg within finality.
-        let existing_undo = match self.store.get_undo_log(ancestor_header.height)? {
-            Some(undo) => undo,
-            None if ancestor_header.height == 0 => {
-                BlockUndoLog::empty(0, ancestor_header.log_slots)
+        needed.sort_unstable();
+        needed.dedup();
+        for segment_id in needed {
+            if !state.state.is_evicted(segment_id) {
+                continue;
             }
-            None => {
-                return Err(MdbxContextError::Corrupt("reorg ancestor undo log missing"));
-            }
-        };
-
-        // Atomic commit: dirty segments + updated chain_tip + state_meta.
-        // The ancestor's header and hash→height index are idempotently re-written.
-        self.store
-            .commit_block(
-                ancestor_header,
-                &ancestor_hash,
-                &existing_undo,
-                &dirty_refs,
-                &[],
-                reverted_tx_hashes,
-                None, // no block bytes (stored earlier or DA-pruned)
-                &consensus_meta,
-                true,
-            )
-            .map_err(MdbxContextError::Store)?;
-
-        // Clear dirty tracking so apply_next_block starts with a clean slate.
-        self.state.state.clear_dirty();
-
-        Ok(())
-    }
-
-    /// Preload ALL evicted segments back into RAM.
-    ///
-    /// Must be called before cloning the state for the block template builder.
-    /// The template builder clones `ctx.state` to a scratch state; if any
-    /// segments are evicted (None but with data in MDBX), `apply_delta` would
-    /// materialise them as all-zeros, producing a wrong FRI root and a
-    /// `BadStateRoot` consensus error.
-    ///
-    /// Cost: one MDBX read per evicted segment, O(evicted_count). Called once
-    /// per block template refresh; negligible at mainnet (15 s blocks).
-    pub fn preload_all_evicted_segments(&mut self) -> Result<(), MdbxContextError> {
-        let evicted: Vec<u16> = self.state.state.evicted_segment_ids().collect();
-        for seg_id in evicted {
-            match self.store.get_segment(seg_id) {
-                Ok(Some((_eff, cols))) => {
-                    self.state.state.restore_evicted_segment(seg_id, cols);
-                }
-                Ok(None) => {
-                    return Err(MdbxContextError::Corrupt(
-                        "evicted live segment is missing from MDBX",
-                    ));
-                }
-                Err(e) => return Err(MdbxContextError::Store(e)),
-            }
+            let (_, columns) = store
+                .get_segment(segment_id)?
+                .ok_or(MdbxContextError::Corrupt(
+                    "evicted undo segment is missing from MDBX",
+                ))?;
+            state
+                .restore_evicted_segment(segment_id, columns)
+                .map_err(|_| {
+                    MdbxContextError::Corrupt("evicted undo segment exact summary mismatch")
+                })?;
         }
         Ok(())
     }
@@ -1346,7 +1569,11 @@ impl MdbxChainContext {
                 // Reload from MDBX.
                 match self.store.get_segment(seg_id) {
                     Ok(Some((_eff_log, cols))) => {
-                        self.state.state.restore_evicted_segment(seg_id, cols);
+                        self.state
+                            .restore_evicted_segment(seg_id, cols)
+                            .map_err(|_| {
+                                MdbxContextError::Corrupt("evicted segment exact summary mismatch")
+                            })?;
                     }
                     Ok(None) => {
                         return Err(MdbxContextError::Corrupt(
@@ -1364,10 +1591,140 @@ impl MdbxChainContext {
     // State snapshot sync
     // -----------------------------------------------------------------------
 
+    /// Atomically install a finalized disk-staged snapshot and switch the hot
+    /// context to a metadata-only exact state.
+    ///
+    /// `staging` must come from the authenticated receiver staging state
+    /// machine. This boundary deliberately accepts no caller-supplied height,
+    /// root, counters, or segment vectors: all state identity comes from the
+    /// authenticated metadata and locally persisted canonical headers.
+    pub fn apply_staged_state_snapshot(
+        &mut self,
+        staging: &FinalizedSnapshotStaging,
+        recent_headers_bytes: &[Vec<u8>],
+    ) -> Result<(), MdbxContextError> {
+        if self.reorg_staging.is_some() {
+            return Err(MdbxContextError::Corrupt(
+                "snapshot install cannot run during reorg staging",
+            ));
+        }
+
+        let authenticated = staging.metadata();
+        let tip_header = *authenticated.header();
+        let tip_height = tip_header.height;
+        let tip_hash = authenticated.tip_hash();
+        if tip_height <= self.tip_height {
+            return Err(MdbxContextError::Corrupt(
+                "snapshot tip is not ahead of local state",
+            ));
+        }
+        if block_id(&tip_header) != tip_hash {
+            return Err(MdbxContextError::Corrupt(
+                "staged snapshot tip hash does not match authenticated header",
+            ));
+        }
+        let stored_tip_header =
+            self.store
+                .get_header(tip_height)?
+                .ok_or(MdbxContextError::Corrupt(
+                    "staged snapshot tip header is missing from canonical store",
+                ))?;
+        if stored_tip_header != tip_header {
+            return Err(MdbxContextError::Corrupt(
+                "staged snapshot tip header conflicts with canonical store",
+            ));
+        }
+
+        // Keep exactly the bounded header window used by MTP, expansion and
+        // transaction-epoch checks. Requiring the complete suffix avoids a
+        // successful install followed by fallback-to-tip header semantics.
+        let history_window = MEDIAN_TIME_BLOCKS as u64 + TX_EPOCH_BLOCKS;
+        let expected_first = tip_height.saturating_sub(history_window);
+        let expected_header_count =
+            tip_height.saturating_sub(expected_first).saturating_add(1) as usize;
+        if recent_headers_bytes.len() != expected_header_count {
+            return Err(MdbxContextError::Corrupt(
+                "staged snapshot recent header window has wrong length",
+            ));
+        }
+
+        let mut decoded_recent = Vec::with_capacity(expected_header_count);
+        for bytes in recent_headers_bytes {
+            decoded_recent.push(BlockHeader::from_bytes(bytes).map_err(|_| {
+                MdbxContextError::Corrupt("staged snapshot recent header decode failed")
+            })?);
+        }
+        if decoded_recent.first().map(|header| header.height) != Some(expected_first)
+            || decoded_recent.last().copied() != Some(tip_header)
+        {
+            return Err(MdbxContextError::Corrupt(
+                "staged snapshot recent headers do not cover the required boundary",
+            ));
+        }
+        for pair in decoded_recent.windows(2) {
+            if pair[1].height != pair[0].height.saturating_add(1)
+                || pair[1].prev_block_hash != block_id(&pair[0])
+            {
+                return Err(MdbxContextError::Corrupt(
+                    "staged snapshot recent headers are not canonical and contiguous",
+                ));
+            }
+        }
+        for header in &decoded_recent {
+            if self.store.get_header(header.height)? != Some(*header) {
+                return Err(MdbxContextError::Corrupt(
+                    "staged snapshot recent header conflicts with canonical store",
+                ));
+            }
+        }
+
+        let cumulative_chainwork =
+            self.store
+                .get_chain_work(tip_height)?
+                .ok_or(MdbxContextError::Corrupt(
+                    "staged snapshot tip chainwork is missing",
+                ))?;
+        let finalized = FinalizedCheckpoint {
+            height: tip_height,
+            hash: tip_hash,
+        };
+        let consensus_meta = ConsensusMeta {
+            tip_height,
+            tip_hash,
+            cumulative_chainwork,
+            finalized,
+        };
+        let mut recent_headers = HashMap::with_capacity(decoded_recent.len());
+        for &header in &decoded_recent {
+            recent_headers.insert(header.height, header);
+        }
+
+        // The installer returns a compact state only after the single RW
+        // transaction has committed. Every operation below is an infallible
+        // in-memory swap, so no post-commit error can leave hot and durable
+        // state at different boundaries.
+        let snapshot_state = self.store.install_finalized_snapshot_staging(
+            staging,
+            &consensus_meta,
+            &decoded_recent,
+        )?;
+        debug_assert_eq!(snapshot_state.state.materialized_segment_ids().count(), 0);
+
+        self.state = snapshot_state;
+        self.recent_headers = recent_headers;
+        self.tip_height = tip_height;
+        self.tip_hash = tip_hash;
+        self.tip_chain_work = cumulative_chainwork;
+        self.finalized = finalized;
+        self.defer_finality_updates = false;
+        Ok(())
+    }
+
     /// Apply a full state snapshot received from a peer during initial sync.
     ///
     /// The caller must already have validated and persisted the canonical header
     /// chain through `tip_height` and accepted the snapshot proof policy.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn apply_state_snapshot<I>(
         &mut self,
@@ -1716,6 +2073,11 @@ mod tests {
             is_coinbase: true,
         });
         let mut child = ctx.state.clone();
+        let segment_id = (slot >> child.state.effective_log_segment_size()) as u16;
+        if child.state.is_evicted(segment_id) {
+            let (_, columns) = ctx.store.get_segment(segment_id).unwrap().unwrap();
+            child.restore_evicted_segment(segment_id, columns).unwrap();
+        }
         crate::state::apply_tx(&mut child, &tx.body).unwrap();
         Block {
             header: BlockHeader {
@@ -1753,14 +2115,147 @@ mod tests {
              _local,
              _tx_epoch,
              _anchor,
-             _pre_state,
              state|
-             -> Result<[u8; 32], String> {
+             -> Result<AppliedBlockValidation, String> {
                 crate::block::apply_block(state, block)
-                    .map(|transition| transition.new_state_root)
+                    .map(|transition| {
+                        AppliedBlockValidation::new(
+                            transition.new_state_root,
+                            b"test-history-claim".to_vec(),
+                            b"test-accepted-certificate".to_vec(),
+                        )
+                    })
                     .map_err(|error| format!("{error:?}"))
             },
         )
+    }
+
+    #[test]
+    fn staged_snapshot_context_switches_to_compact_state_and_restarts_consistently() {
+        use crate::consensus::da_prune::BlockUndoLog;
+        use crate::fri_state::{compute_segment_root, SlotValue};
+        use crate::segmented_state::SegmentColumns;
+        use crate::storage::{
+            AuthenticatedSnapshotMetadata, SnapshotSegmentDescriptor, SnapshotStagingSession,
+        };
+
+        let database = tempfile::tempdir().unwrap();
+        let staging_parent = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(database.path()).unwrap();
+        let empty_state = ChainState::with_log_slots(3);
+        let mut genesis = crate::consensus::genesis::genesis_header();
+        genesis.log_slots = 3;
+        genesis.active_slot_count = 0;
+        genesis.alloc_counter = 0;
+        genesis.state_root = empty_state.utxo_root;
+        let genesis_hash = block_id(&genesis);
+        let genesis_finalized = FinalizedCheckpoint {
+            height: 0,
+            hash: genesis_hash,
+        };
+        let genesis_meta = ConsensusMeta {
+            tip_height: 0,
+            tip_hash: genesis_hash,
+            cumulative_chainwork: [1; 32],
+            finalized: genesis_finalized,
+        };
+        store
+            .commit_block(
+                &genesis,
+                &genesis_hash,
+                &BlockUndoLog::empty(0, 3),
+                &[],
+                &[],
+                &[],
+                None,
+                None,
+                &genesis_meta,
+                false,
+            )
+            .unwrap();
+        let mut initial_headers = HashMap::new();
+        initial_headers.insert(0, genesis);
+        let mut ctx = MdbxChainContext {
+            store,
+            state: empty_state,
+            recent_headers: initial_headers,
+            tip_height: 0,
+            tip_hash: genesis_hash,
+            tip_chain_work: [1; 32],
+            finalized: genesis_finalized,
+            defer_finality_updates: false,
+            reorg_staging: None,
+        };
+
+        let owner = Address([0x81; 32]);
+        let live = SlotValue::with_owner_fields(99, 1, owner.as_fields());
+        let target_state = ChainState::from_sparse_utxos(3, &[(5, live)], 1).unwrap();
+        let mut target = genesis;
+        target.height = 1;
+        target.prev_block_hash = genesis_hash;
+        target.timestamp = target.timestamp.saturating_add(1);
+        target.state_root = target_state.utxo_root;
+        target.active_slot_count = 1;
+        target.alloc_counter = 1;
+        let target_hash = block_id(&target);
+        ctx.store
+            .put_verified_header_only(&target, &target_hash, &[2; 32])
+            .unwrap();
+
+        let mut columns = SegmentColumns::new_zero(8);
+        columns.values[5] = live.value;
+        columns.owners_hi[5] = live.owner_hi;
+        columns.owners_lo[5] = live.owner_lo;
+        let encoded = encode_segment(&columns, 3);
+        let descriptor = SnapshotSegmentDescriptor {
+            segment_id: 0,
+            segment_root: compute_segment_root(
+                3,
+                &columns.values,
+                &columns.owners_hi,
+                &columns.owners_lo,
+            ),
+            encoded_len: encoded.len() as u32,
+        };
+        let authenticated =
+            AuthenticatedSnapshotMetadata::from_authenticated_header(target, target_hash, 3)
+                .unwrap();
+        let mut session =
+            SnapshotStagingSession::new(staging_parent.path(), authenticated, vec![descriptor])
+                .unwrap();
+        session.accept_segment(0, 3, &encoded).unwrap();
+        let staging = session.finalize().unwrap();
+        let recent_headers = vec![genesis.to_bytes().to_vec(), target.to_bytes().to_vec()];
+
+        ctx.apply_staged_state_snapshot(&staging, &recent_headers)
+            .unwrap();
+        assert_eq!(ctx.tip_height(), 1);
+        assert_eq!(ctx.tip_hash(), target_hash);
+        assert_eq!(ctx.state.cached_state_root(), target.state_root);
+        assert_eq!(ctx.state.state.materialized_segment_ids().count(), 0);
+        assert!(ctx.state.state.is_evicted(0));
+        assert_eq!(ctx.store.get_undo_log(0).unwrap(), None);
+        assert_eq!(
+            ctx.store
+                .get_verified_utxos_by_owner(&owner.0)
+                .unwrap()
+                .utxos,
+            vec![crate::storage::VerifiedOwnerUtxo {
+                slot_index: 5,
+                amount: 99,
+                creation_id: 1,
+            }]
+        );
+
+        drop(staging);
+        drop(ctx);
+        let reopened_store = MdbxStore::open(database.path()).unwrap();
+        let reopened = MdbxChainContext::restore_from_mdbx(reopened_store).unwrap();
+        assert_eq!(reopened.tip_height(), 1);
+        assert_eq!(reopened.tip_hash(), target_hash);
+        assert_eq!(reopened.state.cached_state_root(), target.state_root);
+        assert_eq!(reopened.state.state.materialized_segment_ids().count(), 0);
+        assert!(reopened.state.state.is_evicted(0));
     }
 
     #[test]
@@ -1785,12 +2280,39 @@ mod tests {
             let block = coinbase_block(&ctx, 7, Address([1u8; 32]));
             txid = block.transactions[0].txid();
             root = apply_coinbase(&mut ctx, &block).unwrap();
+            assert_eq!(ctx.state.state.materialized_segment_ids().count(), 0);
             assert_eq!(ctx.store.get_tx_index(&txid.0).unwrap(), Some((1, 0)));
+            assert_eq!(
+                ctx.store.get_history_claim(1).unwrap().as_deref(),
+                Some(b"test-history-claim".as_slice())
+            );
+            assert_eq!(
+                ctx.store
+                    .get_accepted_block_certificate(1)
+                    .unwrap()
+                    .as_deref(),
+                Some(b"test-accepted-certificate".as_slice())
+            );
+            assert_eq!(ctx.store.get_block_proof(1).unwrap(), None);
+            assert_eq!(ctx.store.get_block_auth_sidecar(1).unwrap(), None);
         }
         let reopened = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
         assert_eq!(reopened.tip_height(), 1);
         assert_eq!(reopened.state.cached_state_root(), root);
+        assert_eq!(reopened.state.state.materialized_segment_ids().count(), 0);
         assert_eq!(reopened.store.get_tx_index(&txid.0).unwrap(), Some((1, 0)));
+        assert_eq!(
+            reopened.store.get_history_claim(1).unwrap().as_deref(),
+            Some(b"test-history-claim".as_slice())
+        );
+        assert_eq!(
+            reopened
+                .store
+                .get_accepted_block_certificate(1)
+                .unwrap()
+                .as_deref(),
+            Some(b"test-accepted-certificate".as_slice())
+        );
     }
 
     #[test]
@@ -1862,5 +2384,134 @@ mod tests {
             Err(MdbxContextError::Consensus(ConsensusError::BadEpochAnchor))
         ));
         assert_eq!(ctx.tip_height(), 0);
+    }
+
+    #[test]
+    fn failed_multi_block_reorg_leaves_ram_and_mdbx_on_old_branch() {
+        let canonical_dir = tempfile::tempdir().unwrap();
+        let replacement_dir = tempfile::tempdir().unwrap();
+        let mut canonical =
+            MdbxChainContext::open_or_create_for_test(canonical_dir.path()).unwrap();
+        let old_one = coinbase_block(&canonical, 7, Address([1u8; 32]));
+        apply_coinbase(&mut canonical, &old_one).unwrap();
+        let old_two = coinbase_block(&canonical, 8, Address([1u8; 32]));
+        apply_coinbase(&mut canonical, &old_two).unwrap();
+        let old_tip = canonical.tip_hash();
+        let old_root = canonical.state.cached_state_root();
+        let old_txid = old_two.transactions[0].txid();
+
+        let mut replacement =
+            MdbxChainContext::open_or_create_for_test(replacement_dir.path()).unwrap();
+        let replacement_one = coinbase_block(&replacement, 9, Address([2u8; 32]));
+        apply_coinbase(&mut replacement, &replacement_one).unwrap();
+        let mut replacement_two = coinbase_block(&replacement, 10, Address([2u8; 32]));
+        replacement_two.header.prev_block_hash = [0xA5; 32];
+        let replacement_txid = replacement_one.transactions[0].txid();
+        let payloads = [
+            ReorgBlockPayload::new(&replacement_one, &[], &[]),
+            ReorgBlockPayload::new(&replacement_two, &[], &[]),
+        ];
+
+        let result = canonical.apply_reorg_mdbx_with_applier(
+            0,
+            &payloads,
+            replacement_two.header.timestamp + 1,
+            |ctx, candidate, _local_time| apply_coinbase(ctx, candidate.block).map(|_| ()),
+        );
+        assert!(result.is_err());
+        assert_eq!(canonical.tip_height(), 2);
+        assert_eq!(canonical.tip_hash(), old_tip);
+        assert_eq!(canonical.state.cached_state_root(), old_root);
+        assert_eq!(
+            canonical.store.get_tx_index(&old_txid.0).unwrap(),
+            Some((2, 0))
+        );
+        assert_eq!(
+            canonical.store.get_tx_index(&replacement_txid.0).unwrap(),
+            None
+        );
+        drop(canonical);
+
+        let reopened = MdbxChainContext::open_or_create_for_test(canonical_dir.path()).unwrap();
+        assert_eq!(reopened.tip_height(), 2);
+        assert_eq!(reopened.tip_hash(), old_tip);
+        assert_eq!(reopened.state.cached_state_root(), old_root);
+        assert_eq!(
+            reopened.store.get_tx_index(&old_txid.0).unwrap(),
+            Some((2, 0))
+        );
+        assert_eq!(
+            reopened.store.get_tx_index(&replacement_txid.0).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn successful_multi_block_reorg_commits_one_restart_consistent_suffix() {
+        let canonical_dir = tempfile::tempdir().unwrap();
+        let replacement_dir = tempfile::tempdir().unwrap();
+        let mut canonical =
+            MdbxChainContext::open_or_create_for_test(canonical_dir.path()).unwrap();
+        let old_one = coinbase_block(&canonical, 7, Address([1u8; 32]));
+        apply_coinbase(&mut canonical, &old_one).unwrap();
+        let old_two = coinbase_block(&canonical, 8, Address([1u8; 32]));
+        apply_coinbase(&mut canonical, &old_two).unwrap();
+        let old_txid = old_two.transactions[0].txid();
+
+        let mut replacement =
+            MdbxChainContext::open_or_create_for_test(replacement_dir.path()).unwrap();
+        let replacement_one = coinbase_block(&replacement, 9, Address([2u8; 32]));
+        apply_coinbase(&mut replacement, &replacement_one).unwrap();
+        let replacement_two = coinbase_block(&replacement, 10, Address([2u8; 32]));
+        apply_coinbase(&mut replacement, &replacement_two).unwrap();
+        let replacement_one_txid = replacement_one.transactions[0].txid();
+        let replacement_two_txid = replacement_two.transactions[0].txid();
+        let expected_tip = block_id(&replacement_two.header);
+        let expected_root = replacement_two.header.state_root;
+        let payloads = [
+            ReorgBlockPayload::new(&replacement_one, &[], &[]),
+            ReorgBlockPayload::new(&replacement_two, &[], &[]),
+        ];
+
+        let result = canonical
+            .apply_reorg_mdbx_with_applier(
+                0,
+                &payloads,
+                replacement_two.header.timestamp + 1,
+                |ctx, candidate, _local_time| apply_coinbase(ctx, candidate.block).map(|_| ()),
+            )
+            .unwrap();
+        assert_eq!(result.reverted_heights, vec![2, 1]);
+        assert_eq!(result.applied_heights, vec![1, 2]);
+        assert_eq!(canonical.tip_hash(), expected_tip);
+        assert_eq!(canonical.state.cached_state_root(), expected_root);
+        assert_eq!(canonical.store.get_tx_index(&old_txid.0).unwrap(), None);
+        assert_eq!(
+            canonical
+                .store
+                .get_tx_index(&replacement_one_txid.0)
+                .unwrap(),
+            Some((1, 0))
+        );
+        assert_eq!(
+            canonical
+                .store
+                .get_tx_index(&replacement_two_txid.0)
+                .unwrap(),
+            Some((2, 0))
+        );
+        drop(canonical);
+
+        let reopened = MdbxChainContext::open_or_create_for_test(canonical_dir.path()).unwrap();
+        assert_eq!(reopened.tip_height(), 2);
+        assert_eq!(reopened.tip_hash(), expected_tip);
+        assert_eq!(reopened.state.cached_state_root(), expected_root);
+        assert_eq!(
+            reopened
+                .store
+                .get_tx_index(&replacement_two_txid.0)
+                .unwrap(),
+            Some((2, 0))
+        );
     }
 }

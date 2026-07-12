@@ -131,7 +131,7 @@ pub fn install_reorg_snapshot_and_artifacts(
     reserved_input_slots: &std::collections::HashSet<u32>,
     reserved_output_slots: &std::collections::HashSet<u32>,
     reclaimed_tx_hashes: &[noid_poseidon2b::primitives::TxBodyHash],
-    replacement_blocks: &[noid_chain::block::Block],
+    replacement_blocks: &[&noid_chain::block::Block],
 ) -> Result<(), String> {
     let mut guard = wallet
         .lock()

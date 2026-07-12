@@ -44,7 +44,12 @@ use noid_chain::consensus::wire_limits::{
     MAX_SNAPSHOT_MANIFEST_SEGMENTS, MAX_TX_INTENT_BYTES_GLOBAL,
 };
 use noid_chain::consensus::NetworkConfig;
-use noid_chain::storage::{encoded_segment_len_for_eff_log, MdbxChainContext};
+use noid_chain::storage::snapshot_staging::{
+    AuthenticatedSnapshotMetadata, FinalizedSnapshotStaging, SnapshotStagingSession,
+};
+use noid_chain::storage::{
+    encoded_segment_len_for_eff_log, MdbxChainContext, SnapshotSegmentDescriptor,
+};
 use noid_mempool::{AsyncMempool, ChainView, MempoolConfig};
 use noid_miner::{BlockMiner, MinerConfig};
 use noid_p2p::{NetworkEvent, P2PNetwork};
@@ -87,19 +92,6 @@ impl OrphanBlock {
             .saturating_add(self.block_auth_sidecar_bytes.len())
     }
 }
-
-struct PrefetchedSnapshotBlock {
-    block: noid_chain::block::Block,
-    block_proof_bytes: Vec<u8>,
-    block_auth_sidecar_bytes: Vec<u8>,
-}
-
-type VerifiedSnapshotSegment = (
-    u16,
-    u8,
-    noid_chain::segmented_state::SegmentColumns,
-    [u8; 32],
-);
 
 fn gap_requires_snapshot_sync(local_height: u64, peer_height: u64) -> bool {
     peer_height
@@ -405,6 +397,28 @@ async fn main() -> anyhow::Result<()> {
     };
     std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("create data dir: {}", data_dir.display()))?;
+    // Receiver snapshots are transactional scratch data.  A crash can leave
+    // sealed segment files behind, but they are never authoritative and must
+    // not survive into a new sync session.
+    let snapshot_staging_root = data_dir.join("snapshot-staging");
+    match std::fs::remove_dir_all(&snapshot_staging_root) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "remove stale snapshot staging: {}",
+                    snapshot_staging_root.display()
+                )
+            });
+        }
+    }
+    std::fs::create_dir_all(&snapshot_staging_root).with_context(|| {
+        format!(
+            "create snapshot staging directory: {}",
+            snapshot_staging_root.display()
+        )
+    })?;
 
     // --- Storage ---
     tracing::debug!(path = %data_dir.display(), "opening MDBX");
@@ -564,6 +578,7 @@ async fn main() -> anyhow::Result<()> {
     let p2p_cmd_for_events = p2p.cmd_tx.clone();
     let p2p_sync_ready = Arc::clone(&sync_ready);
     let p2p_wallet_operation_gate = Arc::clone(&wallet_operation_gate);
+    let p2p_snapshot_staging_root = snapshot_staging_root.clone();
     tokio::spawn(async move {
         handle_p2p_events(
             p2p_events,
@@ -573,6 +588,7 @@ async fn main() -> anyhow::Result<()> {
             p2p_cmd_for_events,
             p2p_sync_ready,
             p2p_wallet_operation_gate,
+            p2p_snapshot_staging_root,
         )
         .await;
     });
@@ -1182,8 +1198,8 @@ async fn preverified_authorization_bytes(
 /// then atomically commit to MDBX. Coinbase-only blocks carry no block proof.
 /// `preverified_auth` holds mempool-verified proof bytes per tx body hash;
 /// matching sidecar proofs skip cryptographic re-verification. The
-/// certificate record (receipt-projection prove) is built after the chain
-/// write lock is released and stored under a read lock.
+/// history claim, detached proof material, and certificate record are committed
+/// in the same MDBX transaction as the exact post-state.
 async fn apply_p2p_block_offthread(
     chain: &Arc<RwLock<MdbxChainContext>>,
     wallet: &SharedWallet,
@@ -1196,10 +1212,6 @@ async fn apply_p2p_block_offthread(
     let chain = chain.clone();
     let wallet = wallet.clone();
     tokio::task::spawn_blocking(move || {
-        let block_height = block.header.height;
-        let mut history_claim_bytes = None;
-        let mut acceptance_receipt = None;
-
         let mut ctx = chain.blocking_write();
         let hash = ctx.apply_next_block(
             &block,
@@ -1215,7 +1227,6 @@ async fn apply_p2p_block_offthread(
              local_time,
              tx_epoch_anchor_id,
              anchor,
-             _pre_state,
              state| {
                 let auth_verifier = noid_block::PreverifiedAuthorizationVerifier {
                     verified_proof_bytes: &preverified_auth,
@@ -1246,63 +1257,25 @@ async fn apply_p2p_block_offthread(
                     auth_sidecar_bytes,
                     &output.artifacts,
                 )?;
-                history_claim_bytes = Some(
-                    bincode::serialize(&post_validation.history_claim_fields)
-                        .expect("history claim fields serialize"),
-                );
-                acceptance_receipt = Some(post_validation.acceptance_receipt);
-                Ok::<[u8; 32], noid_block::FullValidationError>(output.state_root)
+                let history_claim_bytes = bincode::serialize(&post_validation.history_claim_fields)
+                    .expect("history claim fields serialize");
+                let accepted_block_certificate_bytes =
+                    accepted_block_certificate_record_bytes(post_validation.acceptance_receipt)?;
+                Ok::<noid_chain::AppliedBlockValidation, noid_block::FullValidationError>(
+                    noid_chain::AppliedBlockValidation::new(
+                        output.state_root,
+                        history_claim_bytes,
+                        accepted_block_certificate_bytes,
+                    ),
+                )
             },
         )?;
-        if let Some(bytes) = &history_claim_bytes {
-            if let Err(e) = ctx.store.put_history_claim(block_height, bytes) {
-                tracing::warn!(height = block_height, err = %e, "failed to store history claim fields");
-            }
-        }
-        if !block_proof_bytes.is_empty() {
-            if let Err(e) = ctx.store.put_block_proof(block_height, &block_proof_bytes) {
-                tracing::warn!(height = block_height, err = %e, "failed to store P2P block proof bytes");
-            }
-            if let Err(e) = ctx
-                .store
-                .put_block_auth_sidecar(block_height, &block_auth_sidecar_bytes)
-            {
-                tracing::warn!(height = block_height, err = %e, "failed to store P2P block auth sidecar");
-            }
-        }
         // Keep the chain writer through the incremental wallet update. This
         // shares the same `chain -> wallet` order as account activation and
         // prevents an exact newer snapshot from receiving this delta twice.
         update_wallet_for_block(&wallet, &block);
         let view = ChainView::from_mdbx(&ctx);
         drop(ctx);
-
-        // The certificate record (receipt-projection prove) runs after the
-        // write lock is released; the store put only needs a read guard.
-        match acceptance_receipt {
-            Some(receipt) => {
-                match accepted_block_certificate_record_bytes(receipt) {
-                    Ok(bytes) => {
-                        let ctx = chain.blocking_read();
-                        if let Err(e) = ctx
-                            .store
-                            .put_accepted_block_certificate(block_height, &bytes)
-                        {
-                            tracing::warn!(height = block_height, err = %e, "failed to store accepted-block certificate record");
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(height = block_height, err = %e, "accepted-block certificate record build failed");
-                    }
-                }
-            }
-            None => {
-                tracing::warn!(
-                    height = block_height,
-                    "accepted block committed without post-validation acceptance receipt"
-                );
-            }
-        }
         Ok((hash, view))
     })
     .await
@@ -1339,42 +1312,25 @@ async fn apply_reorg_offthread(
                 None,
             );
         }
-        let proof_by_hash: std::collections::HashMap<[u8; 32], (Vec<u8>, Vec<u8>)> = new_blocks
+        let replacement_payloads: Vec<_> = new_blocks
             .iter()
             .map(|candidate| {
-                (
-                    noid_chain::consensus::pow::block_id(&candidate.block.header),
-                    (
-                        candidate.block_proof_bytes.clone(),
-                        candidate.block_auth_sidecar_bytes.clone(),
-                    ),
+                noid_chain::ReorgBlockPayload::new(
+                    &candidate.block,
+                    &candidate.block_proof_bytes,
+                    &candidate.block_auth_sidecar_bytes,
                 )
             })
             .collect();
-        let block_bodies: Vec<_> = new_blocks
-            .iter()
-            .map(|candidate| candidate.block.clone())
-            .collect();
         let result = ctx.apply_reorg_mdbx_with_applier(
             ancestor_height,
-            &block_bodies,
+            &replacement_payloads,
             local_time,
-            |ctx, block, block_local_time| {
-                let block_hash = noid_chain::consensus::pow::block_id(&block.header);
-                let (proof_bytes, auth_sidecar_bytes) =
-                    proof_by_hash.get(&block_hash).ok_or_else(|| {
-                        noid_chain::storage::MdbxContextError::Consensus(
-                            noid_chain::consensus::ConsensusError::ShapeMismatch(
-                                "missing proof/sidecar bytes for reorg candidate".to_string(),
-                            ),
-                        )
-                    })?;
-                let mut history_claim_bytes = None;
-                let mut certificate_record_bytes = None;
+            |ctx, candidate, block_local_time| {
                 ctx.apply_next_block(
-                    block,
-                    proof_bytes,
-                    auth_sidecar_bytes,
+                    candidate.block,
+                    candidate.block_proof_bytes,
+                    candidate.block_auth_sidecar_bytes,
                     block_local_time,
                     |block,
                      proof_bytes,
@@ -1385,7 +1341,6 @@ async fn apply_reorg_offthread(
                      local_time,
                      tx_epoch_anchor_id,
                      anchor,
-                     _pre_state,
                      state| {
                         let tx_epoch = noid_block::BlockTxEpochContext {
                             expected_user_epoch_anchor_id: *tx_epoch_anchor_id,
@@ -1412,72 +1367,25 @@ async fn apply_reorg_offthread(
                             auth_sidecar_bytes,
                             &output.artifacts,
                         )?;
-                        history_claim_bytes = Some(
+                        let history_claim_bytes =
                             bincode::serialize(&post_validation.history_claim_fields)
-                                .expect("history claim fields serialize"),
-                        );
-                        certificate_record_bytes = Some(
-                            accepted_block_certificate_record_bytes(
-                                post_validation.acceptance_receipt,
-                            )?,
-                        );
-                        Ok::<[u8; 32], noid_block::FullValidationError>(output.state_root)
+                                .expect("history claim fields serialize");
+                        let certificate_record_bytes = accepted_block_certificate_record_bytes(
+                            post_validation.acceptance_receipt,
+                        )?;
+                        Ok::<noid_chain::AppliedBlockValidation, noid_block::FullValidationError>(
+                            noid_chain::AppliedBlockValidation::new(
+                                output.state_root,
+                                history_claim_bytes,
+                                certificate_record_bytes,
+                            ),
+                        )
                     },
                 )?;
-                if let Some(bytes) = &history_claim_bytes {
-                    if let Err(e) = ctx.store.put_history_claim(block.header.height, bytes) {
-                        tracing::warn!(
-                            height = block.header.height,
-                            err = %e,
-                            "failed to store reorg history claim fields"
-                        );
-                    }
-                }
-                if let Some(bytes) = &certificate_record_bytes {
-                    if let Err(e) = ctx
-                        .store
-                        .put_accepted_block_certificate(block.header.height, bytes)
-                    {
-                        tracing::warn!(
-                            height = block.header.height,
-                            err = %e,
-                            "failed to store reorg accepted-block certificate record"
-                        );
-                    }
-                } else {
-                    tracing::warn!(
-                        height = block.header.height,
-                        "reorg block committed without certificate record bytes"
-                    );
-                }
                 Ok(())
             },
         );
         let view = if result.is_ok() {
-            for candidate in &new_blocks {
-                if !candidate.block_proof_bytes.is_empty() {
-                    if let Err(e) = ctx.store.put_block_proof(
-                        candidate.block.header.height,
-                        &candidate.block_proof_bytes,
-                    ) {
-                        tracing::warn!(
-                            height = candidate.block.header.height,
-                            err = %e,
-                            "failed to store reorg block proof"
-                        );
-                    }
-                    if let Err(e) = ctx.store.put_block_auth_sidecar(
-                        candidate.block.header.height,
-                        &candidate.block_auth_sidecar_bytes,
-                    ) {
-                        tracing::warn!(
-                            height = candidate.block.header.height,
-                            err = %e,
-                            "failed to store reorg block auth sidecar"
-                        );
-                    }
-                }
-            }
             if let Ok(reorg) = &result {
                 let selection = match wallet.lock() {
                     Ok(guard) => guard
@@ -1491,6 +1399,10 @@ async fn apply_reorg_offthread(
                 if let Some((active_index, next_index, owner)) = selection {
                     match ctx.store.get_verified_utxos_by_owner(&owner) {
                         Ok(snapshot) => {
+                            let replacement_blocks: Vec<_> = replacement_payloads
+                                .iter()
+                                .map(|candidate| candidate.block)
+                                .collect();
                             if let Err(error) = wallet::install_reorg_snapshot_and_artifacts(
                                 &wallet,
                                 active_index,
@@ -1500,7 +1412,7 @@ async fn apply_reorg_offthread(
                                 &reserved_input_slots,
                                 &reserved_output_slots,
                                 &reorg.reclaimed_tx_hashes,
-                                &block_bodies,
+                                &replacement_blocks,
                             ) {
                                 tracing::error!(%error, "post-reorg wallet snapshot install failed");
                                 wallet::invalidate_active_cache(&wallet);
@@ -1559,8 +1471,8 @@ fn validate_p2p_block_proof_binding(
     if proof.meta.n_tx as usize != user_txs {
         return Err("proof/header binding invalid: BlockProof tx count mismatch".to_string());
     }
-    let sidecar: noid_block::BlockAuthSidecar = bincode::deserialize(block_auth_sidecar_bytes)
-        .map_err(|e| {
+    let sidecar =
+        noid_block::BlockAuthSidecar::from_bytes(block_auth_sidecar_bytes).map_err(|e| {
             format!("proof/header binding invalid: auth sidecar deserialize failed: {e}")
         })?;
     if sidecar.tx_auth.len() != user_txs {
@@ -1865,6 +1777,7 @@ async fn handle_p2p_events(
     p2p_cmd: tokio::sync::mpsc::Sender<noid_p2p::NetworkCommand>,
     sync_ready: Arc<tokio::sync::Notify>,
     wallet_operation_gate: WalletOperationGate,
+    snapshot_staging_root: PathBuf,
 ) {
     // Orphan pool: blocks whose parent is not yet known.
     // When the parent arrives, we re-apply the orphan.
@@ -1895,7 +1808,6 @@ async fn handle_p2p_events(
     struct PendingManifest {
         from: libp2p::PeerId,
         manifest: Box<noid_p2p::protocol::GetStateManifestResponse>,
-        prefetched_suffix: Vec<PrefetchedSnapshotBlock>,
     }
     struct PendingSnapshotHeaderSync {
         from: libp2p::PeerId,
@@ -1903,16 +1815,8 @@ async fn handle_p2p_events(
         next_height: u64,
         target_height: u64,
     }
-    struct PendingSnapshotSuffix {
-        from: libp2p::PeerId,
-        manifest: Box<noid_p2p::protocol::GetStateManifestResponse>,
-        next_height: u64,
-        end_height: u64,
-        blocks: Vec<PrefetchedSnapshotBlock>,
-    }
     let mut pending_manifest: Option<PendingManifest> = None;
     let mut pending_snapshot_header_sync: Option<PendingSnapshotHeaderSync> = None;
-    let mut pending_snapshot_suffix: Option<PendingSnapshotSuffix> = None;
     let mut manifest_candidates: Vec<(
         libp2p::PeerId,
         Box<noid_p2p::protocol::GetStateManifestResponse>,
@@ -1932,13 +1836,9 @@ async fn handle_p2p_events(
     // within 10 seconds of the first candidate arriving, proceed anyway —
     // some peers may be offline, behind NAT, or not yet synced.
     let mut manifest_first_candidate_at: Option<std::time::Instant> = None;
-    // Segments collected so far: segment_id → (eff_log, decoded columns, verified root).
-    // Incoming bytes are decoded and checked against the authenticated manifest
-    // segment root before they enter this map.
-    let mut collected_segments: std::collections::HashMap<
-        u16,
-        (u8, noid_chain::segmented_state::SegmentColumns, [u8; 32]),
-    > = std::collections::HashMap::new();
+    // Payloads are authenticated one at a time and sealed to disk.  The
+    // session retains only compact descriptors and a received bitset.
+    let mut snapshot_staging: Option<SnapshotStagingSession> = None;
     // Segment IDs still outstanding.
     let mut pending_segment_ids: std::collections::HashSet<u16> = std::collections::HashSet::new();
     // Segment IDs queued but not yet requested (concurrency cap).
@@ -1951,13 +1851,12 @@ async fn handle_p2p_events(
         () => {{
             pending_manifest = None;
             pending_snapshot_header_sync = None;
-            pending_snapshot_suffix = None;
             manifest_candidates.clear();
             manifest_requested_peers.clear();
             manifest_force_snapshot_peers.clear();
             manifest_response_count = 0;
             manifest_first_candidate_at = None;
-            collected_segments.clear();
+            snapshot_staging = None;
             pending_segment_ids.clear();
             segment_queue.clear();
             tracing::debug!("sync state reset — ready for fresh manifest retry");
@@ -2102,7 +2001,6 @@ async fn handle_p2p_events(
                     );
                     if pending_manifest.is_none()
                         && pending_snapshot_header_sync.is_none()
-                        && pending_snapshot_suffix.is_none()
                         && pending_segment_ids.is_empty()
                         && segment_queue.is_empty()
                         && manifest_requested_peers.insert(from)
@@ -2196,126 +2094,6 @@ async fn handle_p2p_events(
                 block_proof_bytes,
                 block_auth_sidecar_bytes,
             }) => {
-                if pending_snapshot_suffix.is_some() {
-                    let Some(pending) = pending_snapshot_suffix.as_mut() else {
-                        unreachable!();
-                    };
-                    if pending.from != from {
-                        tracing::debug!(
-                            peer = %from,
-                            expected_peer = %pending.from,
-                            "dropping block while snapshot suffix prefetch is active"
-                        );
-                        continue;
-                    }
-                    let block = match noid_chain::block::Block::from_bytes(&block_bytes) {
-                        Ok(block) => block,
-                        Err(e) => {
-                            tracing::warn!(peer = %from, err = ?e, "snapshot suffix block decode failed");
-                            reset_sync_state!();
-                            continue;
-                        }
-                    };
-                    let expected_height = pending.next_height;
-                    if block.header.height != expected_height {
-                        tracing::warn!(
-                            peer = %from,
-                            expected_height,
-                            got_height = block.header.height,
-                            "snapshot suffix block height mismatch"
-                        );
-                        reset_sync_state!();
-                        continue;
-                    }
-                    let expected_prev_hash = pending
-                        .blocks
-                        .last()
-                        .map(|item| noid_chain::consensus::pow::block_id(&item.block.header))
-                        .unwrap_or(pending.manifest.tip_hash);
-                    if block.header.prev_block_hash != expected_prev_hash {
-                        tracing::warn!(
-                            peer = %from,
-                            height = block.header.height,
-                            "snapshot suffix block does not extend snapshot/prefetched suffix"
-                        );
-                        reset_sync_state!();
-                        continue;
-                    }
-                    if let Err(e) = validate_p2p_block_proof_binding(
-                        &block,
-                        &block_proof_bytes,
-                        &block_auth_sidecar_bytes,
-                    ) {
-                        tracing::warn!(
-                            peer = %from,
-                            height = block.header.height,
-                            err = %e,
-                            "snapshot suffix block proof/header binding invalid"
-                        );
-                        reset_sync_state!();
-                        continue;
-                    }
-                    pending.blocks.push(PrefetchedSnapshotBlock {
-                        block,
-                        block_proof_bytes,
-                        block_auth_sidecar_bytes,
-                    });
-                    if expected_height < pending.end_height {
-                        pending.next_height = expected_height + 1;
-                        let _ = p2p_cmd
-                            .send(noid_p2p::NetworkCommand::RequestBlock {
-                                peer: from,
-                                height: pending.next_height,
-                            })
-                            .await;
-                    } else {
-                        let pending = pending_snapshot_suffix
-                            .take()
-                            .expect("suffix prefetch exists");
-                        tracing::info!(
-                            from = %from,
-                            snapshot_height = pending.manifest.tip_height,
-                            suffix_end = pending.end_height,
-                            suffix_blocks = pending.blocks.len(),
-                            "snapshot suffix prefetched — starting segment download"
-                        );
-                        queue_snapshot_segment_download(
-                            &p2p_cmd,
-                            from,
-                            &pending.manifest,
-                            &mut pending_segment_ids,
-                            &mut segment_queue,
-                        )
-                        .await;
-                        pending_manifest = Some(PendingManifest {
-                            from,
-                            manifest: pending.manifest,
-                            prefetched_suffix: pending.blocks,
-                        });
-                        if pending_segment_ids.is_empty() && segment_queue.is_empty() {
-                            let pending = pending_manifest.take().unwrap();
-                            if let Err(e) = apply_verified_snapshot_with_suffix(
-                                &chain,
-                                &mempool,
-                                &wallet,
-                                &sync_ready,
-                                &p2p_cmd,
-                                from,
-                                *pending.manifest,
-                                Vec::new(),
-                                pending.prefetched_suffix,
-                                &wallet_operation_gate,
-                            )
-                            .await
-                            {
-                                tracing::error!(err = %e, "failed to apply empty snapshot after suffix prefetch");
-                                reset_sync_state!();
-                            }
-                        }
-                    }
-                    continue;
-                }
-
                 // Per-peer block rate limit: prevents flood DoS.
                 // Each block requires chain.write() + PoW validation.
                 {
@@ -2409,32 +2187,7 @@ async fn handle_p2p_events(
                                 mempool.on_new_block(&confirmed, height, new_view).await;
                                 tracing::info!(height, "applied P2P block");
                                 last_tip_advance = Instant::now();
-                                sync_ready.notify_one(); // safe: no-op after first waiter wakes
-
-                                // Store proof/sidecar bytes only for retained full-block replay
-                                // and local audit while the block remains inside the recent window.
-                                if !block_proof_bytes.is_empty() {
-                                    let ctx = chain.read().await;
-                                    if let Err(e) =
-                                        ctx.store.put_block_proof(height, &block_proof_bytes)
-                                    {
-                                        tracing::warn!(
-                                            height,
-                                            err = %e,
-                                            "failed to store received block proof"
-                                        );
-                                    }
-                                    if let Err(e) = ctx
-                                        .store
-                                        .put_block_auth_sidecar(height, &block_auth_sidecar_bytes)
-                                    {
-                                        tracing::warn!(
-                                            height,
-                                            err = %e,
-                                            "failed to store received block auth sidecar"
-                                        );
-                                    }
-                                }
+                                sync_ready.notify_one(); // cancel/rebuild any active stale template
 
                                 // Auto-continue sync: immediately request the next batch from
                                 // the same peer. This pulls the chain all the way to the peer's
@@ -2481,15 +2234,6 @@ async fn handle_p2p_events(
                                                 .map(|tx| tx.txid())
                                                 .collect();
                                             mempool.on_new_block(&conf, h, nv).await;
-                                            if !orphan_proof_bytes.is_empty() {
-                                                let ctx = chain.read().await;
-                                                if let Err(e) = ctx.store.put_block_proof(h, &orphan_proof_bytes) {
-                                                    tracing::warn!(height = h, err = %e, "failed to store orphan block proof");
-                                                }
-                                                if let Err(e) = ctx.store.put_block_auth_sidecar(h, &orphan_auth_sidecar_bytes) {
-                                                    tracing::warn!(height = h, err = %e, "failed to store orphan block auth sidecar");
-                                                }
-                                            }
                                             tracing::info!(
                                                 height = h,
                                                 age_ms = orphan_age_ms,
@@ -2660,7 +2404,6 @@ async fn handle_p2p_events(
                                                     );
                                                     if pending_manifest.is_none()
                                                         && pending_snapshot_header_sync.is_none()
-                                                        && pending_snapshot_suffix.is_none()
                                                         && pending_segment_ids.is_empty()
                                                         && segment_queue.is_empty()
                                                     {
@@ -2734,7 +2477,6 @@ async fn handle_p2p_events(
                                             );
                                             if pending_manifest.is_none()
                                                 && pending_snapshot_header_sync.is_none()
-                                                && pending_snapshot_suffix.is_none()
                                                 && pending_segment_ids.is_empty()
                                                 && segment_queue.is_empty()
                                                 && manifest_requested_peers.insert(from)
@@ -2801,27 +2543,6 @@ async fn handle_p2p_events(
                 }
             }
             Ok(NetworkEvent::RecentBlockUnavailable { from, height }) => {
-                if let Some(pending) = pending_snapshot_suffix.as_ref() {
-                    if pending.from == from && pending.next_height == height {
-                        let requester_height = chain.read().await.tip_height();
-                        tracing::warn!(
-                            peer = %from,
-                            requested_height = height,
-                            requester_height,
-                            "snapshot suffix block unavailable — requesting fresh manifest"
-                        );
-                        reset_sync_state!();
-                        manifest_requested_peers.insert(from);
-                        manifest_force_snapshot_peers.insert(from);
-                        let _ = p2p_cmd
-                            .send(noid_p2p::NetworkCommand::RequestStateManifest {
-                                peer: from,
-                                requester_height,
-                            })
-                            .await;
-                        continue;
-                    }
-                }
                 let our_tip = {
                     let ctx = chain.read().await;
                     ctx.tip_height()
@@ -2835,7 +2556,6 @@ async fn handle_p2p_events(
                     );
                     if pending_manifest.is_none()
                         && pending_snapshot_header_sync.is_none()
-                        && pending_snapshot_suffix.is_none()
                         && pending_segment_ids.is_empty()
                         && segment_queue.is_empty()
                     {
@@ -3080,7 +2800,6 @@ async fn handle_p2p_events(
                         pending_manifest = Some(PendingManifest {
                             from,
                             manifest: sync.manifest,
-                            prefetched_suffix: Vec::new(),
                         });
                         let _ = p2p_cmd
                             .send(noid_p2p::NetworkCommand::RequestHistoryProof { peer: from })
@@ -3202,7 +2921,6 @@ async fn handle_p2p_events(
                             *depth = 0; // reset for next time
                             if pending_manifest.is_none()
                                 && pending_snapshot_header_sync.is_none()
-                                && pending_snapshot_suffix.is_none()
                                 && pending_segment_ids.is_empty()
                                 && segment_queue.is_empty()
                                 && manifest_requested_peers.insert(from)
@@ -3381,7 +3099,6 @@ async fn handle_p2p_events(
                         pending_manifest = Some(PendingManifest {
                             from: best_peer,
                             manifest: best_manifest,
-                            prefetched_suffix: Vec::new(),
                         });
                         let _ = p2p_cmd
                             .send(noid_p2p::NetworkCommand::RequestHistoryProof {
@@ -3401,108 +3118,37 @@ async fn handle_p2p_events(
 
             Ok(NetworkEvent::StateSegment { from, response }) => {
                 // Received one segment (step 2 of snapshot sync).
-                // Collect until all pending segments are received, then apply.
+                // Authenticate and seal it to disk immediately; decoded state
+                // never accumulates in the node process.
                 if pending_segment_ids.contains(&response.segment_id) {
+                    if pending_manifest
+                        .as_ref()
+                        .is_some_and(|pending| pending.from != from)
+                    {
+                        tracing::warn!(from = %from, segment = response.segment_id, "ignoring snapshot segment from non-selected peer");
+                        continue;
+                    }
                     if let Some(data) = response.data {
-                        if data.len() > MAX_SEGMENT_BYTES {
-                            tracing::warn!(
-                                from = %from, segment = response.segment_id,
-                                bytes = data.len(),
-                                max = MAX_SEGMENT_BYTES,
-                                "segment too large — aborting sync"
-                            );
-                            reset_sync_state!();
-                            continue;
-                        }
-                        let Some(expected_response_bytes) =
-                            encoded_segment_len_for_eff_log(response.eff_log)
-                        else {
-                            tracing::warn!(
-                                from = %from,
-                                segment = response.segment_id,
-                                eff_log = response.eff_log,
-                                "segment has invalid effective segment log — aborting sync"
-                            );
+                        let Some(staging) = snapshot_staging.as_mut() else {
+                            tracing::warn!(from = %from, "segment received without snapshot staging session");
                             reset_sync_state!();
                             continue;
                         };
-                        if data.len() != expected_response_bytes {
+                        if let Err(error) = staging.accept_segment(
+                            response.segment_id,
+                            response.eff_log,
+                            &data,
+                        ) {
                             tracing::warn!(
                                 from = %from,
                                 segment = response.segment_id,
-                                bytes = data.len(),
-                                expected = expected_response_bytes,
-                                "segment encoded length mismatch — aborting sync"
+                                err = %error,
+                                "snapshot segment authentication/staging failed"
                             );
                             reset_sync_state!();
                             continue;
                         }
-                        let Some(pending) = pending_manifest.as_ref() else {
-                            tracing::warn!(from = %from, "segment received without pending manifest — aborting sync");
-                            reset_sync_state!();
-                            continue;
-                        };
-                        let Ok(root_idx) = pending
-                            .manifest
-                            .segment_ids
-                            .binary_search(&response.segment_id)
-                        else {
-                            tracing::warn!(
-                                from = %from,
-                                segment = response.segment_id,
-                                "segment not present in authenticated manifest — aborting sync"
-                            );
-                            reset_sync_state!();
-                            continue;
-                        };
-                        let expected_root = pending.manifest.segment_roots[root_idx];
-                        if response.eff_log != pending.manifest.eff_log {
-                            tracing::warn!(
-                                from = %from,
-                                segment = response.segment_id,
-                                got = response.eff_log,
-                                expected = pending.manifest.eff_log,
-                                "segment eff_log mismatch — aborting sync"
-                            );
-                            reset_sync_state!();
-                            continue;
-                        }
-
-                        let Some((encoded_eff_log, cols)) =
-                            noid_chain::storage::serial::decode_segment(&data)
-                        else {
-                            tracing::warn!(from = %from, segment = response.segment_id, "segment decode failed — aborting sync");
-                            reset_sync_state!();
-                            continue;
-                        };
-                        if encoded_eff_log != response.eff_log {
-                            tracing::warn!(
-                                from = %from,
-                                segment = response.segment_id,
-                                encoded = encoded_eff_log,
-                                response = response.eff_log,
-                                "encoded segment eff_log mismatch — aborting sync"
-                            );
-                            reset_sync_state!();
-                            continue;
-                        }
-                        let computed_root = noid_chain::fri_state::compute_segment_root(
-                            encoded_eff_log as usize,
-                            &cols.values,
-                            &cols.owners_hi,
-                            &cols.owners_lo,
-                        );
-                        if computed_root != expected_root {
-                            tracing::warn!(
-                                from = %from,
-                                segment = response.segment_id,
-                                "segment root mismatch against authenticated manifest — aborting sync"
-                            );
-                            reset_sync_state!();
-                            continue;
-                        }
-
-                        collected_segments.insert(response.segment_id, (response.eff_log, cols, expected_root));
+                        drop(data);
                         pending_segment_ids.remove(&response.segment_id);
                         // Dispatch next queued segment if available.
                         if !segment_queue.is_empty() {
@@ -3553,42 +3199,46 @@ async fn handle_p2p_events(
                         continue;
                     }
 
-                    // All segments received: assemble + apply snapshot.
-                    if pending_segment_ids.is_empty()
-                        && segment_queue.is_empty()
-                        && !collected_segments.is_empty()
-                    {
+                    // All segments received: independently verify the complete
+                    // exact root in a one-segment second pass, then install.
+                    if pending_segment_ids.is_empty() && segment_queue.is_empty() {
                         if let Some(pending) = pending_manifest.take() {
-                            let segments: Vec<VerifiedSnapshotSegment> = {
-                                let decoded: Vec<_> = collected_segments
-                                    .drain()
-                                    .map(|(seg_id, (eff_log, cols, root))| {
-                                        (seg_id, eff_log, cols, root)
-                                    })
-                                    .collect();
-                                decoded
+                            let Some(staging) = snapshot_staging.take() else {
+                                tracing::warn!(from = %from, "snapshot completed without staging session");
+                                reset_sync_state!();
+                                continue;
+                            };
+                            let segment_count = staging.descriptors().len();
+                            let finalized = match staging.finalize() {
+                                Ok(finalized) => finalized,
+                                Err(error) => {
+                                    tracing::warn!(from = %from, err = %error, "snapshot exact-state finalization failed");
+                                    reset_sync_state!();
+                                    continue;
+                                }
                             };
                             tracing::info!(
-                                segments = segments.len(),
+                                segments = segment_count,
                                 tip = pending.manifest.tip_height,
-                                "snapshot: all segments received, writing to MDBX…"
+                                "snapshot: all segments finalized on disk, writing to MDBX…"
                             );
-                            if let Err(e) = apply_verified_snapshot_with_suffix(
+                            match apply_verified_snapshot(
                                 &chain,
                                 &mempool,
                                 &wallet,
-                                &sync_ready,
                                 &p2p_cmd,
                                 from,
                                 *pending.manifest,
-                                segments,
-                                pending.prefetched_suffix,
+                                finalized,
                                 &wallet_operation_gate,
                             )
                             .await
                             {
-                                tracing::error!(err = %e, "failed to apply verified state snapshot");
-                                reset_sync_state!();
+                                Ok(_) => sync_ready.notify_one(),
+                                Err(e) => {
+                                    tracing::error!(err = %e, "failed to apply verified state snapshot");
+                                    reset_sync_state!();
+                                }
                             }
                         }
                     }
@@ -3608,10 +3258,7 @@ async fn handle_p2p_events(
                 // If segment collection is already in progress (pending_segment_ids non-empty),
                 // a second HistoryProof event would corrupt the active session.
                 // Ignore it to protect the in-flight segment download.
-                if !pending_segment_ids.is_empty()
-                    || !segment_queue.is_empty()
-                    || pending_snapshot_suffix.is_some()
-                {
+                if !pending_segment_ids.is_empty() || !segment_queue.is_empty() {
                     tracing::debug!(
                         from = %from,
                         "ignoring history proof — segment collection already in progress"
@@ -3692,12 +3339,8 @@ async fn handle_p2p_events(
                                     &tip_header_bytes,
                                 ) {
                                     Ok(header) => header.height,
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            from = %from,
-                                            err = ?e,
-                                            "snapshot proof response carried bad peer tip header"
-                                        );
+                                    Err(error) => {
+                                        tracing::warn!(from = %from, err = ?error, "snapshot proof response carried bad peer tip header");
                                         reset_sync_state!();
                                         continue;
                                     }
@@ -3717,55 +3360,39 @@ async fn handle_p2p_events(
                             if suffix_len
                                 > noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH
                             {
-                                let requester_height = chain.read().await.tip_height();
                                 tracing::warn!(
                                     from = %from,
                                     snapshot_height = snap.manifest.tip_height,
                                     peer_tip_height,
                                     suffix_len,
-                                    retention = noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH,
-                                    "snapshot suffix exceeds retained window — requesting fresh manifest"
+                                    "snapshot boundary is outside the peer's retained suffix"
                                 );
                                 reset_sync_state!();
-                                manifest_requested_peers.insert(from);
-                                let _ = p2p_cmd
-                                    .send(noid_p2p::NetworkCommand::RequestStateManifest {
-                                        peer: from,
-                                        requester_height,
-                                    })
-                                    .await;
                                 continue;
                             }
-                            if suffix_len > 0 {
-                                let first_suffix_height = snap.manifest.tip_height + 1;
-                                tracing::info!(
-                                    from = %from,
-                                    snapshot_height = snap.manifest.tip_height,
-                                    peer_tip_height,
-                                    suffix_len,
-                                    "snapshot manifest accepted — prefetching retained suffix before segments"
-                                );
-                                pending_snapshot_suffix = Some(PendingSnapshotSuffix {
-                                    from,
-                                    manifest: snap.manifest,
-                                    next_height: first_suffix_height,
-                                    end_height: peer_tip_height,
-                                    blocks: Vec::with_capacity(suffix_len as usize),
-                                });
-                                let _ = p2p_cmd
-                                    .send(noid_p2p::NetworkCommand::RequestBlock {
-                                        peer: from,
-                                        height: first_suffix_height,
-                                    })
-                                    .await;
-                                continue;
+                            if peer_tip_height > highest_announced {
+                                highest_announced = peer_tip_height;
+                                last_announcement_peer = Some(from);
                             }
                             tracing::info!(
                                 from = %from,
                                 tip = snap.manifest.tip_height,
+                                peer_tip_height,
                                 segments = snap.manifest.segment_ids.len(),
-                                "snapshot manifest accepted — starting segment download"
+                                "snapshot manifest accepted — staging authenticated boundary"
                             );
+                            let staging = match create_snapshot_staging_session(
+                                &snapshot_staging_root,
+                                &snap.manifest,
+                            ) {
+                                Ok(staging) => staging,
+                                Err(error) => {
+                                    tracing::warn!(peer = %from, err = %error, "snapshot staging initialization failed");
+                                    reset_sync_state!();
+                                    continue;
+                                }
+                            };
+                            snapshot_staging = Some(staging);
                             queue_snapshot_segment_download(
                                 &p2p_cmd,
                                 from,
@@ -3778,28 +3405,40 @@ async fn handle_p2p_events(
                             pending_manifest = Some(PendingManifest {
                                 from,
                                 manifest: snap.manifest,
-                                prefetched_suffix: Vec::new(),
                             });
                             if pending_segment_ids.is_empty() && segment_queue.is_empty() {
                                 // No segments (fresh network, no UTXOs yet).
-                                // Apply directly with empty segment list.
+                                // Finalize the authenticated empty-state session.
                                 let pending = pending_manifest.take().unwrap();
-                                if let Err(e) = apply_verified_snapshot_with_suffix(
+                                let finalized = match snapshot_staging
+                                    .take()
+                                    .expect("snapshot staging exists before segment download")
+                                    .finalize()
+                                {
+                                    Ok(finalized) => finalized,
+                                    Err(error) => {
+                                        tracing::warn!(peer = %from, err = %error, "empty snapshot finalization failed");
+                                        reset_sync_state!();
+                                        continue;
+                                    }
+                                };
+                                match apply_verified_snapshot(
                                     &chain,
                                     &mempool,
                                     &wallet,
-                                    &sync_ready,
                                     &p2p_cmd,
                                     from,
                                     *pending.manifest,
-                                    Vec::new(),
-                                    pending.prefetched_suffix,
+                                    finalized,
                                     &wallet_operation_gate,
                                 )
                                 .await
                                 {
-                                    tracing::error!(err = %e, "failed to apply empty snapshot");
-                                    reset_sync_state!();
+                                    Ok(_) => sync_ready.notify_one(),
+                                    Err(e) => {
+                                        tracing::error!(err = %e, "failed to apply empty snapshot");
+                                        reset_sync_state!();
+                                    }
                                 }
                             }
                         }
@@ -3816,6 +3455,16 @@ async fn handle_p2p_events(
             }
             Ok(NetworkEvent::PeerDisconnected(peer)) => {
                 tracing::debug!(peer = %peer, "peer disconnected");
+                let snapshot_sync_lost = pending_manifest
+                    .as_ref()
+                    .is_some_and(|pending| pending.from == peer)
+                    || pending_snapshot_header_sync
+                        .as_ref()
+                        .is_some_and(|pending| pending.from == peer);
+                if snapshot_sync_lost {
+                    tracing::warn!(peer = %peer, "selected snapshot peer lost; discarding disk staging session");
+                    reset_sync_state!();
+                }
                 fetch_in_progress.remove(&peer);
                 recent_header_fetches.retain(|(p, _, _), _| *p != peer);
                 recent_block_fetches.retain(|(p, _), _| *p != peer);
@@ -3895,7 +3544,6 @@ async fn handle_p2p_events(
                     pending_manifest = Some(PendingManifest {
                         from: best_peer,
                         manifest: best_manifest,
-                        prefetched_suffix: Vec::new(),
                     });
                     let _ = p2p_cmd
                         .send(noid_p2p::NetworkCommand::RequestHistoryProof { peer: best_peer })
@@ -3923,6 +3571,48 @@ fn compare_manifest_fork_choice(
         return std::cmp::Ordering::Less;
     }
     a.tip_height.cmp(&b.tip_height)
+}
+
+fn create_snapshot_staging_session(
+    staging_root: &Path,
+    manifest: &noid_p2p::protocol::GetStateManifestResponse,
+) -> Result<SnapshotStagingSession, String> {
+    let header_bytes = manifest
+        .recent_headers
+        .last()
+        .ok_or_else(|| "snapshot manifest has no boundary header".to_owned())?;
+    let header = noid_chain::block_header::BlockHeader::from_bytes(header_bytes)
+        .map_err(|_| "snapshot boundary header decode failed".to_owned())?;
+    if header.height != manifest.tip_height
+        || header.log_slots != manifest.log_slots
+        || header.active_slot_count != manifest.active_slot_count
+        || header.alloc_counter != manifest.alloc_counter
+    {
+        return Err("snapshot boundary header/manifest metadata mismatch".into());
+    }
+    let metadata = AuthenticatedSnapshotMetadata::from_authenticated_header(
+        header,
+        manifest.tip_hash,
+        manifest.eff_log,
+    )
+    .map_err(|error| format!("snapshot staging metadata rejected: {error}"))?;
+    let encoded_len = encoded_segment_len_for_eff_log(manifest.eff_log)
+        .ok_or_else(|| "snapshot manifest effective segment log is invalid".to_owned())?;
+    let encoded_len = u32::try_from(encoded_len)
+        .map_err(|_| "snapshot segment encoding length does not fit u32".to_owned())?;
+    let descriptors = manifest
+        .segment_ids
+        .iter()
+        .copied()
+        .zip(manifest.segment_roots.iter().copied())
+        .map(|(segment_id, segment_root)| SnapshotSegmentDescriptor {
+            segment_id,
+            segment_root,
+            encoded_len,
+        })
+        .collect();
+    SnapshotStagingSession::new(staging_root, metadata, descriptors)
+        .map_err(|error| format!("snapshot staging session creation failed: {error}"))
 }
 
 async fn queue_snapshot_segment_download(
@@ -4053,137 +3743,65 @@ async fn rescan_wallet_from_chain(
     Ok(())
 }
 
-async fn replay_prefetched_snapshot_suffix(
-    chain: &Arc<RwLock<MdbxChainContext>>,
-    mempool: &AsyncMempool,
-    wallet: &SharedWallet,
-    suffix: Vec<PrefetchedSnapshotBlock>,
-) -> Result<u64, String> {
-    let mut current_height = chain.read().await.tip_height();
-    for item in suffix {
-        let expected_height = current_height.saturating_add(1);
-        if item.block.header.height != expected_height {
-            return Err(format!(
-                "prefetched suffix height mismatch: expected h={expected_height}, got h={}",
-                item.block.header.height
-            ));
-        }
-        let confirmed: Vec<_> = item.block.transactions.iter().map(|tx| tx.txid()).collect();
-        let preverified_auth = preverified_authorization_bytes(mempool, &item.block).await;
-        let (_hash, view) = apply_p2p_block_offthread(
-            chain,
-            wallet,
-            item.block.clone(),
-            item.block_proof_bytes,
-            item.block_auth_sidecar_bytes,
-            unix_now(),
-            preverified_auth,
-        )
-        .await
-        .map_err(|e| format!("prefetched suffix apply failed h={expected_height}: {e:?}"))?;
-        current_height = expected_height;
-        mempool.on_new_block(&confirmed, current_height, view).await;
-        tracing::info!(
-            height = current_height,
-            "snapshot: replayed prefetched suffix block"
-        );
-    }
-    Ok(current_height)
-}
-
 #[allow(clippy::too_many_arguments)]
-async fn apply_verified_snapshot_with_suffix(
+async fn apply_verified_snapshot(
     chain: &Arc<RwLock<MdbxChainContext>>,
     mempool: &AsyncMempool,
     wallet: &SharedWallet,
-    sync_ready: &Arc<tokio::sync::Notify>,
     p2p_cmd: &tokio::sync::mpsc::Sender<noid_p2p::NetworkCommand>,
     peer: libp2p::PeerId,
     manifest: noid_p2p::protocol::GetStateManifestResponse,
-    segments: Vec<VerifiedSnapshotSegment>,
-    suffix: Vec<PrefetchedSnapshotBlock>,
+    staging: FinalizedSnapshotStaging,
     wallet_operation_gate: &WalletOperationGate,
 ) -> Result<u64, String> {
     // Global order for operations that can replace the active wallet cache:
     // wallet_operation_gate -> mempool snapshot/view -> chain -> SharedWallet.
-    // Keep this single acquisition across snapshot install, the checkpoint
-    // baseline, suffix replay, and the final reload. None of those helpers may
-    // enter wallet RPC code that acquires the same gate.
+    // Keep this single acquisition across snapshot install and wallet reload.
+    // None of those helpers may enter wallet RPC code that acquires the same gate.
     let wallet_operation = wallet_operation_gate.lock().await;
     let snapshot_height = manifest.tip_height;
-    let segment_count = segments.len();
-    let result = {
-        let mut ctx = chain.write().await;
-        let r = ctx.apply_state_snapshot(
-            manifest.tip_height,
-            manifest.tip_hash,
-            manifest.log_slots,
-            manifest.active_slot_count,
-            manifest.alloc_counter,
-            segments,
-            &manifest.recent_headers,
-        );
-        r.map(|_| {
-            let view = ChainView::from_mdbx(&ctx);
-            let height = ctx.tip_height();
-            (height, view)
-        })
-    }
-    .map_err(|e| format!("failed to apply verified state snapshot: {e:?}"))?;
+    let segment_count = staging.descriptors().len();
+    let recent_headers = manifest.recent_headers;
+    let install_chain = Arc::clone(chain);
+    let result = tokio::task::spawn_blocking(move || {
+        let mut ctx = install_chain.blocking_write();
+        ctx.apply_staged_state_snapshot(&staging, &recent_headers)?;
+        // The atomic MDBX commit now owns the state; release temporary files
+        // before constructing consumers of the new durable view.
+        drop(staging);
+        let view = ChainView::from_mdbx(&ctx);
+        let height = ctx.tip_height();
+        Ok::<_, noid_chain::storage::MdbxContextError>((height, view))
+    })
+    .await
+    .map_err(|error| format!("snapshot install worker panicked: {error}"))?
+    .map_err(|error| format!("failed to apply verified state snapshot: {error:?}"))?;
 
     let (applied_height, view) = result;
     mempool.on_new_block(&[], applied_height, view).await;
 
-    // Establish the exact active-owner cache at the snapshot checkpoint before
-    // replaying any retained suffix. Incremental wallet deltas must never run
-    // on the pre-snapshot chain's UTXO cache: that would corrupt sent/received
-    // amounts and receipts even if a final balance reload repaired the UTXOs.
-    if let Err(error) =
-        rescan_wallet_from_chain(wallet, chain, mempool, "snapshot checkpoint baseline").await
-    {
+    // Establish the exact active-owner cache at the installed snapshot boundary.
+    if let Err(error) = rescan_wallet_from_chain(wallet, chain, mempool, "snapshot sync").await {
         wallet::invalidate_active_cache(wallet);
         return Err(format!(
-            "snapshot applied but active-wallet baseline reload failed: {error}"
+            "snapshot applied but active-wallet reload failed: {error}"
         ));
     }
 
-    let final_height = match replay_prefetched_snapshot_suffix(chain, mempool, wallet, suffix).await
-    {
-        Ok(height) => height,
-        Err(e) => {
-            tracing::warn!(
-                err = %e,
-                snapshot_height,
-                "snapshot applied but prefetched suffix replay failed; falling back to shallow catch-up"
-            );
-            chain.read().await.tip_height()
-        }
-    };
-
-    sync_ready.notify_one();
     tracing::info!(
         snapshot_height,
-        final_height,
         segments = segment_count,
-        "snapshot: fully applied"
+        "snapshot boundary fully applied"
     );
-    tracing::info!(
-        height = final_height,
-        "chain snapshot applied — mining can begin"
-    );
-    if let Err(error) = rescan_wallet_from_chain(wallet, chain, mempool, "snapshot sync").await {
-        tracing::error!(%error, "final post-snapshot wallet reload failed");
-        wallet::invalidate_active_cache(wallet);
-    }
     drop(wallet_operation);
     let _ = p2p_cmd
         .send(noid_p2p::NetworkCommand::SyncBlocksFrom {
             peer,
-            from_height: final_height + 1,
+            from_height: snapshot_height.saturating_add(1),
             count: noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH as u16,
         })
         .await;
-    Ok(final_height)
+    Ok(snapshot_height)
 }
 
 /// Apply a newly confirmed block to the in-process wallet state.

@@ -13,9 +13,9 @@
 //!    ├─ Pre-proof filter (lock, brief): all cheap checks on current view
 //!    │   fee floor → consensus → epoch_anchor → slot conflicts → slot state
 //!    │   Extracts log_slots: u32 only — NO ChainView clone.
-//!    │   DoS guard: invalid txs rejected here, never reach AuthGKR verification.
+//!    │   DoS guard: invalid txs rejected here, never reach proof verification.
 //!    │
-//!    ├─ AuthGKR verification (no lock): ~84ms, semaphore-bounded
+//!    ├─ selected-ZK authorization verification (no lock), semaphore-bounded
 //!    │
 //!    └─ Final admission (lock): re-run all checks against current state (TOCTOU guard)
 //!                        anchor_height derived here → pool.admit
@@ -28,7 +28,7 @@
 //! ## Pre-proving cache
 //!
 //! When a wallet submits a `TxIntent`, it includes a `WalletAuthorizationBundle`
-//! (AuthGKR + auth_slices). The pool stores this bundle in
+//! (one versioned witness-hiding proof). The pool stores this bundle in
 //! `MempoolEntry.cached_authorization` immediately at admission.
 //! The block assembler uses cached bundles so that `prove_block` only
 //! needs to run the unified block-level SpineGKR + single FRI — the
@@ -84,7 +84,7 @@ pub struct AsyncMempool {
     state: Arc<Mutex<MempoolState>>,
     events: broadcast::Sender<MempoolEvent>,
     config: Arc<MempoolConfig>,
-    /// Semaphore limiting concurrent AuthGKR verification tasks.
+    /// Semaphore limiting concurrent authorization verification tasks.
     /// Bounds CPU usage: at most `config.auth_verify_workers` proofs in flight.
     /// Set to 0 in config → semaphore with MAX permits (no limit).
     auth_verify_semaphore: Arc<Semaphore>,
@@ -139,7 +139,7 @@ impl AsyncMempool {
     /// 4. No slot conflict with admitted mempool txs
     /// 5. Input slots live in state, output slots empty
     ///
-    /// AuthGKR authorization verification is performed synchronously (in a
+    /// Selected-ZK authorization verification is performed synchronously (in a
     /// `spawn_blocking` task) BEFORE the pool mutex is acquired, so invalid
     /// proofs are rejected at the mempool boundary without holding the lock.
     ///
@@ -196,7 +196,7 @@ impl AsyncMempool {
             let _ = run_admission_checks(&tx, &st)?;
         }
 
-        // ── AuthGKR verification (CPU-heavy, outside lock, semaphore-bounded) ─
+        // ── Authorization verification (CPU-heavy, outside lock, semaphore-bounded) ─
         // Runs only when the pre-filter passed — invalid fee/anchor/slot txs are
         // already gone.  Semaphore caps concurrent CPU threads.
         if needs_zk {
@@ -218,7 +218,7 @@ impl AsyncMempool {
 
         // ── Final admission under lock ───────────────────────
         // Re-run all cheap checks against CURRENT state: the chain may have
-        // advanced during the ~84 ms AuthGKR verification window (new block → new
+        // advanced during the authorization verification window (new block → new
         // spent slots and changed fee floor). This is the
         // authoritative check; the pre-filter was the DoS guard.
         let mut st = self.state.lock().await;
@@ -323,6 +323,29 @@ impl AsyncMempool {
             .collect()
     }
 
+    /// Select the same fee-ordered current-anchor prefix used by block
+    /// assembly, cloning only the entries the caller can actually prove.
+    ///
+    /// The scan remains bounded by the consensus block maximum. Filtering is
+    /// performed while entries are borrowed under the pool lock, so a
+    /// memory-governed B8 template does not first clone up to 255 cached proof
+    /// bundles and discard 247 of them.
+    pub async fn select_for_block_at_anchor(
+        &self,
+        max_txs: usize,
+        epoch_anchor: [u8; 32],
+    ) -> Vec<noid_chain::mempool::MempoolEntry> {
+        let st = self.state.lock().await;
+        let limit = max_txs.min(BLOCK_MAX_USER_TXS);
+        st.pool
+            .select_for_block(BLOCK_MAX_USER_TXS)
+            .into_iter()
+            .filter(|entry| entry.tx.body.epoch_anchor == epoch_anchor)
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+
     // -----------------------------------------------------------------------
     // Block confirmation
     // -----------------------------------------------------------------------
@@ -379,11 +402,11 @@ impl AsyncMempool {
             .pool
             .iter()
             .filter_map(|(hash, entry)| {
-                let occupied = entry
-                    .tx
-                    .body
-                    .live_outputs()
-                    .any(|(_, out)| st.view.slot(out.slot_index) != SlotValue::EMPTY);
+                let occupied = entry.tx.body.live_outputs().any(|(_, out)| {
+                    st.view
+                        .try_slot(out.slot_index)
+                        .map_or(true, |slot| slot != SlotValue::EMPTY)
+                });
                 if occupied {
                     Some(*hash)
                 } else {
@@ -425,7 +448,9 @@ impl AsyncMempool {
                         inp.creation_id,
                         entry.tx.body.input_owner.as_fields(),
                     );
-                    st.view.slot(inp.slot_index) != expected
+                    st.view
+                        .try_slot(inp.slot_index)
+                        .map_or(true, |slot| slot != expected)
                 });
                 if stale {
                     Some(*hash)
@@ -469,11 +494,11 @@ impl AsyncMempool {
     ///
     /// These TXs were in reverted blocks. We log the count for observability
     /// and evict any that happen to be sitting in the pool already (duplicate
-    /// re-submission race). Full re-admission with fresh AuthGKRs is the
+    /// re-submission race). Full re-admission with fresh authorizations is the
     /// wallet's responsibility — wallets detect the unconfirmed state via
     /// wallet scan and resubmit.
     ///
-    /// NOTE: We do not have the original AuthGKR bytes after a reorg (they
+    /// NOTE: We do not have the original authorization bytes after a reorg (they
     /// are not persisted). Durable TX storage could enable
     /// automatic re-admission without wallet involvement.
     pub async fn readmit_after_reorg(&self, tx_hashes: Vec<TxBodyHash>) {
@@ -735,17 +760,16 @@ fn check_input_slots(tx: &Transaction, view: &ChainView) -> Result<(), SubmitErr
             inp.creation_id,
             tx.body.input_owner.as_fields(),
         );
-        let actual = view.slot(idx);
+        let actual = view
+            .try_slot(idx)
+            .map_err(|error| SubmitError::Internal(format!("chain state read failed: {error}")))?;
         if actual != expected {
-            // Log diagnostic: expected non-empty slot but got EMPTY.
-            // Common cause: the segment containing this slot was evicted from
-            // the ChainView's SegmentedFriState. Check preload_all_evicted_segments.
             tracing::warn!(
                 slot_index = idx,
                 expected_value = inp.amount,
                 expected_creation_id = inp.creation_id,
                 actual_empty = actual.is_empty(),
-                "check_input_slots: slot mismatch — likely evicted segment in ChainView"
+                "check_input_slots: canonical slot mismatch"
             );
             return Err(SubmitError::Consensus(
                 noid_chain::consensus::ConsensusError::BadStateRoot,
@@ -769,7 +793,11 @@ fn check_output_slots(tx: &Transaction, view: &ChainView) -> Result<(), SubmitEr
                 )),
             ));
         }
-        if view.slot(idx) != SlotValue::EMPTY {
+        if view
+            .try_slot(idx)
+            .map_err(|error| SubmitError::Internal(format!("chain state read failed: {error}")))?
+            != SlotValue::EMPTY
+        {
             return Err(SubmitError::Consensus(
                 noid_chain::consensus::ConsensusError::SlotConflict,
             ));
@@ -807,8 +835,59 @@ mod tests {
         output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS,
     };
 
-    use super::check_input_slots;
+    use super::{check_input_slots, AsyncMempool};
+    use crate::config::MempoolConfig;
     use crate::view::ChainView;
+
+    fn empty_user_tx(epoch_anchor: [u8; 32], fee: u64) -> Transaction {
+        Transaction::new(TxBody {
+            epoch_anchor,
+            fee,
+            input_owner: Address([0xA5; 32]),
+            inputs: [TxInput::dummy(); TX_INPUTS],
+            outputs: [TxOutput::dummy(); TX_OUTPUTS],
+            validity_bitmap: 0,
+            is_coinbase: false,
+        })
+    }
+
+    #[tokio::test]
+    async fn anchored_selection_filters_before_cloning_bounded_prefix() {
+        let state = ChainState::with_log_slots(6);
+        let pool = AsyncMempool::new(
+            ChainView::new(0, HashMap::new(), 0, state.state),
+            MempoolConfig::default().with_capacity(8),
+        );
+        let anchor = [0x11; 32];
+        let wrong_anchor = [0x22; 32];
+        let high = empty_user_tx(anchor, 300);
+        let wrong = empty_user_tx(wrong_anchor, 200);
+        let low = empty_user_tx(anchor, 100);
+        let high_id = high.txid();
+        let low_id = low.txid();
+        {
+            let mut locked = pool.state.lock().await;
+            locked.pool.admit(high, 0).expect("admit high fee");
+            locked.pool.admit(wrong, 0).expect("admit wrong anchor");
+            locked.pool.admit(low, 0).expect("admit low fee");
+            locked
+                .pool
+                .set_cached_authorization(&high_id, vec![0xA5; 1024]);
+            locked
+                .pool
+                .set_cached_authorization(&low_id, vec![0x5A; 1024]);
+        }
+
+        let one = pool.select_for_block_at_anchor(1, anchor).await;
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].tx.txid(), high_id);
+        assert_eq!(one[0].cached_authorization.as_ref().unwrap().len(), 1024);
+
+        let two = pool.select_for_block_at_anchor(2, anchor).await;
+        assert_eq!(two.len(), 2);
+        assert_eq!(two[0].tx.txid(), high_id);
+        assert_eq!(two[1].tx.txid(), low_id);
+    }
 
     #[test]
     fn input_state_match_binds_creation_id() {

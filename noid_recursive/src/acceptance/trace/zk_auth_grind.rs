@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Production-disconnected check for the authorization capsule's pre-query
+//! Production check for the authorization capsule's pre-query
 //! transcript grind.
 //!
 //! The input is the exact post-nonce transcript squeeze alias, already

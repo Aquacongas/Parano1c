@@ -70,7 +70,7 @@ pub struct MempoolEntry {
     /// transactions at similar fees.
     pub fee_rate: u64,
 
-    /// Cached `WalletAuthorizationBundle` bytes (AuthGKR authorization) provided
+    /// Cached versioned `WalletAuthorizationBundle` bytes provided
     /// by the wallet at submission time.  Populated immediately on admission;
     /// `None` only for coinbase or txs submitted without a proof bundle.
     ///

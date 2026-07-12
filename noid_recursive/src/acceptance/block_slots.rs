@@ -105,7 +105,6 @@ use super::trace::region_source_binding::{
 };
 use super::trace::segment_compaction::{bind_segment_upper_chain, compact_segment_updates};
 use super::trace::tx_body_spine::{build_tx_body_slot, SpineInputsTrace};
-#[cfg(any(test, feature = "selected-zk-measurement"))]
 use super::trace::zk_authorization_candidate::{
     bind_selected_zk_block_region, SelectedZkAuthorizationProofBundle, SelectedZkBlockRegionBinding,
 };
@@ -190,6 +189,40 @@ mod selected_zk_capability_tests {
     }
 
     #[test]
+    fn selected_capability_uses_each_canonical_class_capacity() {
+        for tier in [8usize, 32, 64, 255] {
+            let geometry = crate::region_sidecar::selected_zk_block_geometry(tier).unwrap();
+            for live_count in [0usize, tier] {
+                let (b, capability) =
+                    canonical_selected_zk_authorization_fixture_for_tier(tier, live_count);
+                assert_eq!(capability.len(), geometry.auth_tiles);
+                assert_eq!(capability.live_count(), live_count);
+                for index in 0..tier {
+                    assert!(capability.slot(index).body_aliases().is_some());
+                    assert_eq!(
+                        capability.slot(index).liveness().eval(b.values()),
+                        if index < live_count {
+                            F128::ONE
+                        } else {
+                            F128::ZERO
+                        }
+                    );
+                }
+                if tier == 255 {
+                    assert_eq!(
+                        capability.slot(255).kind(),
+                        CanonicalSelectedZkAuthorizationSlotKind::Pad255
+                    );
+                    assert!(capability.slot(255).body_aliases().is_none());
+                } else {
+                    assert_eq!(capability.len(), tier);
+                    assert!(capability.slot(tier - 1).body_aliases().is_some());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn capability_carrier_has_no_clone_or_raw_constructor_surface() {
         let source = include_str!("block_slots.rs");
         let capability_name = ["CanonicalSelectedZkAuthorization", "Capability"].concat();
@@ -234,9 +267,11 @@ mod selected_zk_capability_tests {
             .rsplit("pub fn build_block_slots_with_config")
             .next()
             .expect("public BlockSlots wrapper")
-            .split("/// Measurement-only B255 replacement entry")
+            .split("/// Canonical selected-authorization entry")
             .next()
             .expect("public wrapper body");
+        assert!(public_wrapper
+            .contains("production tier authoring requires a selected-ZK consuming Block input"));
         assert!(public_wrapper.contains("BlockAuthorizationBackend::Legacy"));
         assert!(!public_wrapper.contains("BlockAuthorizationBackend::Selected"));
 
@@ -495,7 +530,6 @@ fn append_user_action_surface(
 /// action surface range-checks the canonical L15 bitmap, public arithmetic
 /// recomputes its selected popcount, and `append_user_action_surface` pins that
 /// result to the freshly allocated 1..=8 count exactly as on the legacy path.
-#[cfg(any(test, feature = "selected-zk-measurement"))]
 fn selected_declared_live_input_count(b: &FieldR1csBuilder, spine: &SpineInputsTrace) -> u8 {
     use noid_tx::body_hash::TX8X2_LEAF_FLAGS;
 
@@ -1009,7 +1043,7 @@ fn bind_tx_epoch_anchors(
 // Assembly
 // ---------------------------------------------------------------------------
 
-/// Canonical role of one selected B255 authorization slot. The role is
+/// Canonical role of one selected authorization slot. The role is
 /// derived from the already boolean, monotone Block liveness prefix; callers
 /// cannot supply or mutate it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1086,8 +1120,8 @@ fn block_from_alias(b: &FieldR1csBuilder, expression: &LinExpr) -> Block128 {
     Block128::from(flat_to_tower_u128(flat))
 }
 
-/// Zero-row extraction of the exact B255 selected statement surface. Body
-/// slots retain the original Block aliases. PAD255 has no body, so this
+/// Zero-row extraction of one exact selected-class statement surface. Body
+/// slots retain the original Block aliases. B255's PAD has no body, so this
 /// capability carries only its native protocol constants; the owning
 /// selected assembly later materializes and pins the four PAD wires in its
 /// still-owned builder.
@@ -1099,15 +1133,22 @@ fn mint_canonical_selected_zk_authorization_capability(
 ) -> CanonicalSelectedZkAuthorizationCapability {
     use noid_tx::body_hash::TX8X2_LEAF_INPUT_OWNER;
 
-    const BODY_AUTH_SLOTS: usize = noid_chain::consensus::params::BLOCK_MAX_USER_TXS;
-    const AUTH_SLOTS: usize = 256;
     const TX_DELTA: usize = 1;
-    const _: () = assert!(BODY_AUTH_SLOTS == 255);
+    let body_auth_slots = spine_inputs
+        .len()
+        .checked_sub(TX_DELTA)
+        .expect("selected class includes coinbase spine");
+    let auth_slots = live_bits.len();
+    let geometry = crate::region_sidecar::selected_zk_block_geometry_for_auth_tiles(auth_slots)
+        .expect("selected authorization capacity is canonical");
+    assert_eq!(body_auth_slots, geometry.tier);
+    assert_eq!(auth_slots, geometry.auth_tiles);
 
-    assert_eq!(tx_hashes.len(), TX_DELTA + BODY_AUTH_SLOTS);
-    assert_eq!(spine_inputs.len(), TX_DELTA + BODY_AUTH_SLOTS);
-    assert_eq!(live_bits.len(), AUTH_SLOTS);
-    assert_eq!(live_bits[AUTH_SLOTS - 1].eval(b.values()), F128::ZERO);
+    assert_eq!(tx_hashes.len(), TX_DELTA + body_auth_slots);
+    if auth_slots > body_auth_slots {
+        assert_eq!(geometry.tier, 255, "only B255 has an authorization PAD");
+        assert_eq!(live_bits[auth_slots - 1].eval(b.values()), F128::ZERO);
+    }
 
     let ghost_body = noid_gkr::ghost_tx::ghost_tx_body();
     let ghost_hash = noid_gkr::ghost_tx::ghost_tx_body_hash();
@@ -1117,8 +1158,8 @@ fn mint_canonical_selected_zk_authorization_capability(
         address: ghost_address,
     };
 
-    let mut slots = Vec::with_capacity(AUTH_SLOTS);
-    for index in 0..BODY_AUTH_SLOTS {
+    let mut slots = Vec::with_capacity(auth_slots);
+    for index in 0..body_auth_slots {
         let body_index = index + TX_DELTA;
         let tx_body_hash = tx_hashes[body_index].clone();
         let expected_address = spine_inputs[body_index].leaves[TX8X2_LEAF_INPUT_OWNER].clone();
@@ -1144,13 +1185,15 @@ fn mint_canonical_selected_zk_authorization_capability(
             kind,
         });
     }
-    slots.push(CanonicalSelectedZkAuthorizationSlot {
-        tx_body_hash: None,
-        expected_address: None,
-        liveness: live_bits[AUTH_SLOTS - 1].clone(),
-        native_statement: ghost_statement,
-        kind: CanonicalSelectedZkAuthorizationSlotKind::Pad255,
-    });
+    if auth_slots > body_auth_slots {
+        slots.push(CanonicalSelectedZkAuthorizationSlot {
+            tx_body_hash: None,
+            expected_address: None,
+            liveness: live_bits[auth_slots - 1].clone(),
+            native_statement: ghost_statement,
+            kind: CanonicalSelectedZkAuthorizationSlotKind::Pad255,
+        });
+    }
     CanonicalSelectedZkAuthorizationCapability { slots }
 }
 
@@ -1158,19 +1201,29 @@ fn mint_canonical_selected_zk_authorization_capability(
 pub(in crate::acceptance) fn canonical_selected_zk_authorization_fixture(
     live_count: usize,
 ) -> (FieldR1csBuilder, CanonicalSelectedZkAuthorizationCapability) {
-    const BODY_AUTH_SLOTS: usize = 255;
-    assert!(live_count <= BODY_AUTH_SLOTS);
+    canonical_selected_zk_authorization_fixture_for_tier(255, live_count)
+}
+
+#[cfg(test)]
+pub(in crate::acceptance) fn canonical_selected_zk_authorization_fixture_for_tier(
+    tier: usize,
+    live_count: usize,
+) -> (FieldR1csBuilder, CanonicalSelectedZkAuthorizationCapability) {
+    let geometry = crate::region_sidecar::selected_zk_block_geometry(tier)
+        .expect("test fixture tier is canonical");
+    let body_auth_slots = geometry.tier;
+    assert!(live_count <= body_auth_slots);
     let mut b = FieldR1csBuilder::new();
     let ghost_body = noid_gkr::ghost_tx::ghost_tx_body();
     let ghost_spine = noid_gkr::spine_statement::spine_inputs_from_body(&ghost_body);
     let ghost_hash = noid_gkr::ghost_tx::ghost_tx_body_hash();
-    let spine_inputs = (0..=BODY_AUTH_SLOTS)
+    let spine_inputs = (0..=body_auth_slots)
         .map(|_| SpineInputsTrace::alloc(&mut b, &ghost_spine))
         .collect::<Vec<_>>();
-    let tx_hashes = (0..=BODY_AUTH_SLOTS)
+    let tx_hashes = (0..=body_auth_slots)
         .map(|_| ghost_hash.map(|value| alloc_block(&mut b, value)))
         .collect::<Vec<_>>();
-    let live_bits = (0..256)
+    let live_bits = (0..geometry.auth_tiles)
         .map(|index| LinExpr::from_wire(b.alloc_bool(index < live_count)))
         .collect::<Vec<_>>();
     let before_mint = b.num_wires();
@@ -1330,7 +1383,6 @@ impl Default for BlockSlotsConfig {
 
 enum BlockAuthorizationBackend {
     Legacy,
-    #[cfg(any(test, feature = "selected-zk-measurement"))]
     Selected(SelectedZkAuthorizationProofBundle),
 }
 
@@ -1338,7 +1390,6 @@ impl BlockAuthorizationBackend {
     fn is_selected(&self) -> bool {
         match self {
             Self::Legacy => false,
-            #[cfg(any(test, feature = "selected-zk-measurement"))]
             Self::Selected(_) => true,
         }
     }
@@ -1346,26 +1397,24 @@ impl BlockAuthorizationBackend {
 
 struct BlockSlotsCoreAssembly {
     slots: BlockSlots,
-    #[cfg(any(test, feature = "selected-zk-measurement"))]
     selected_region: Option<SelectedZkBlockRegionBinding>,
 }
 
-/// Private selected-B255 handoff for the diagnostic outer Block owner.  It
+/// Private selected-B255 handoff for the production outer Block owner.  It
 /// keeps the ordinary Block statement aliases and the opaque bound V4 region
 /// together until the owner has appended its public-IO pins and built the
 /// same builder.
-#[cfg(any(test, feature = "selected-zk-measurement"))]
 pub(in crate::acceptance) struct SelectedZkBlockSlotsAssembly {
     slots: BlockSlots,
     region: SelectedZkBlockRegionBinding,
 }
 
-#[cfg(any(test, feature = "selected-zk-measurement"))]
 impl SelectedZkBlockSlotsAssembly {
     pub(in crate::acceptance) fn slots(&self) -> &BlockSlots {
         &self.slots
     }
 
+    #[cfg(feature = "selected-zk-measurement")]
     pub(in crate::acceptance) fn region_vk(&self) -> &BlockRegionSidecarVk {
         self.region.vk()
     }
@@ -1404,6 +1453,10 @@ pub fn build_block_slots_with_config(
     proof: &AcceptedBlockBatchComponentProof,
     config: BlockSlotsConfig,
 ) -> BlockSlots {
+    assert!(
+        config.tier_user_tx_capacity.is_none(),
+        "production tier authoring requires a selected-ZK consuming Block input"
+    );
     let assembly = build_block_slots_with_authorization_backend(
         b,
         start_accumulator,
@@ -1413,7 +1466,6 @@ pub fn build_block_slots_with_config(
         config,
         BlockAuthorizationBackend::Legacy,
     );
-    #[cfg(any(test, feature = "selected-zk-measurement"))]
     assert!(
         assembly.selected_region.is_none(),
         "public BlockSlots wrapper is strictly legacy"
@@ -1421,11 +1473,9 @@ pub fn build_block_slots_with_config(
     assembly.slots
 }
 
-/// Measurement-only B255 replacement entry.  The production/public wrapper
-/// above cannot select this backend; the proof bundle is an owned private
-/// side input until a future network carrier is designed.
-#[cfg(any(test, feature = "selected-zk-measurement"))]
-pub(in crate::acceptance) fn build_block_slots_selected_zk_b255(
+/// Canonical selected-authorization entry. The proof bundle is an owned
+/// private side input and cannot be omitted or replaced with a legacy proof.
+pub(in crate::acceptance) fn build_block_slots_selected_zk(
     b: &mut FieldR1csBuilder,
     start_accumulator: &ChainAccumulator,
     end_accumulator: &ChainAccumulator,
@@ -1434,14 +1484,16 @@ pub(in crate::acceptance) fn build_block_slots_selected_zk_b255(
     config: BlockSlotsConfig,
     proofs: SelectedZkAuthorizationProofBundle,
 ) -> SelectedZkBlockSlotsAssembly {
-    assert_eq!(
-        config.tier_user_tx_capacity,
-        Some(noid_chain::consensus::params::BLOCK_MAX_USER_TXS),
-        "selected backend is defined only for B255"
+    let tier = config
+        .tier_user_tx_capacity
+        .expect("selected backend requires a canonical tier");
+    assert!(
+        crate::region_sidecar::selected_zk_block_geometry(tier).is_some(),
+        "selected backend tier is not canonical"
     );
     assert!(
         config.exact_state_region && config.tx_root_region && config.spine_region,
-        "selected B255 requires canonical exact-state/tx-root/spine Meta carriers"
+        "selected backend requires canonical exact-state/tx-root/spine Meta carriers"
     );
     let mut assembly = build_block_slots_with_authorization_backend(
         b,
@@ -1484,10 +1536,21 @@ fn build_block_slots_with_authorization_backend(
     assert_eq!(inputs.exact_state_killshot_inputs.len(), 1);
     assert_eq!(inputs.exact_state_structural_inputs.len(), 1);
     assert_eq!(proof.exact_state.len(), 1);
-    assert_eq!(
-        inputs.authorization_inputs.len(),
-        inputs.authorization_witnesses.len()
-    );
+    if selected_authorization_backend {
+        assert!(
+            inputs.authorization_witnesses.is_empty() && inputs.authorization_traces.is_empty(),
+            "selected Block input must not retain legacy authorization proofs or traces"
+        );
+    } else {
+        assert_eq!(
+            inputs.authorization_inputs.len(),
+            inputs.authorization_witnesses.len()
+        );
+        assert_eq!(
+            inputs.authorization_traces.len(),
+            inputs.authorization_witnesses.len()
+        );
+    }
     assert_eq!(inputs.tx_body_inputs.len(), inputs.tx_body_hashes.len());
     // verify_authorization_components count check (structural side).
     assert_eq!(
@@ -1935,9 +1998,7 @@ fn build_block_slots_with_authorization_backend(
     let mut paired_exact_state_cells: Option<PairedExactStateCells> = None;
     let mut region_preparation: Option<BlockRegionPreparation> = None;
     let mut owner_region_parts = None;
-    #[cfg(any(test, feature = "selected-zk-measurement"))]
     let mut selected_region: Option<SelectedZkBlockRegionBinding> = None;
-    #[cfg(any(test, feature = "selected-zk-measurement"))]
     let mut selected_pending: Option<(
         CanonicalSelectedZkAuthorizationCapability,
         SelectedZkAuthorizationProofBundle,
@@ -2068,16 +2129,16 @@ fn build_block_slots_with_authorization_backend(
                 }
             }
         }
-        #[cfg(any(test, feature = "selected-zk-measurement"))]
         BlockAuthorizationBackend::Selected(proofs) => {
             use noid_tx::body_hash::TX8X2_LEAF_INPUT_OWNER;
 
-            assert_eq!(
-                body_user_slots,
-                noid_chain::consensus::params::BLOCK_MAX_USER_TXS,
-                "selected authorization has exactly 255 body slots"
-            );
-            assert_eq!(n_auth_slots, 256, "selected authorization includes PAD255");
+            let tier = config
+                .tier_user_tx_capacity
+                .expect("selected authorization requires a tier");
+            let geometry = crate::region_sidecar::selected_zk_block_geometry(tier)
+                .expect("selected authorization tier is canonical");
+            assert_eq!(body_user_slots, geometry.tier);
+            assert_eq!(n_auth_slots, geometry.auth_tiles);
             assert_eq!(tx_delta, 1, "selected body aliases begin after coinbase");
             assert_eq!(
                 spine_inputs.len(),
@@ -2127,7 +2188,6 @@ fn build_block_slots_with_authorization_backend(
         &coinbase_amount_bits,
     );
     crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: fee/burn/coinbase arithmetic");
-    #[cfg(any(test, feature = "selected-zk-measurement"))]
     if selected_authorization_backend {
         let (canonical, proofs) = selected_pending
             .take()
@@ -2291,10 +2351,7 @@ fn build_block_slots_with_authorization_backend(
             }
         }
     }
-    #[cfg(any(test, feature = "selected-zk-measurement"))]
     let selected_paired = selected_region.is_some();
-    #[cfg(not(any(test, feature = "selected-zk-measurement")))]
-    let selected_paired = false;
     assert_eq!(
         paired_exact_state_cells.is_some() || selected_paired,
         config.exact_state_region,
@@ -2316,7 +2373,6 @@ fn build_block_slots_with_authorization_backend(
         );
     }
     if selected_authorization_backend {
-        #[cfg(any(test, feature = "selected-zk-measurement"))]
         assert!(
             selected_pending.is_none() && selected_region.is_some(),
             "selected proof/capability handoff must be consumed exactly once"
@@ -2400,13 +2456,10 @@ fn build_block_slots_with_authorization_backend(
     let compacted_actions = compact_action_rows(b, &action_candidates, action_live_capacity);
     crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: action allocator+route+order");
 
-    #[cfg(any(test, feature = "selected-zk-measurement"))]
     let paired_cells = selected_region
         .as_ref()
         .map(SelectedZkBlockRegionBinding::paired)
         .or(paired_exact_state_cells.as_ref());
-    #[cfg(not(any(test, feature = "selected-zk-measurement")))]
-    let paired_cells = paired_exact_state_cells.as_ref();
     if let Some(paired) = paired_cells {
         bind_paired_exact_state_transition(
             b,
@@ -2475,7 +2528,6 @@ fn build_block_slots_with_authorization_backend(
     };
     BlockSlotsCoreAssembly {
         slots,
-        #[cfg(any(test, feature = "selected-zk-measurement"))]
         selected_region,
     }
 }

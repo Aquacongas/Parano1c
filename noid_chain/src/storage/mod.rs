@@ -17,9 +17,15 @@ pub mod mdbx_store;
 pub mod memory;
 pub mod meta;
 pub mod serial;
+pub mod snapshot_generation;
+pub mod snapshot_staging;
 
-pub use mdbx_context::{MdbxChainContext, MdbxContextError};
-pub use mdbx_store::{MdbxStore, StoreError, VerifiedOwnerSnapshot, VerifiedOwnerUtxo};
+pub use mdbx_context::{
+    AppliedBlockValidation, MdbxChainContext, MdbxContextError, ReorgBlockPayload,
+};
+pub use mdbx_store::{
+    AcceptedBlockCommitData, MdbxStore, StoreError, VerifiedOwnerSnapshot, VerifiedOwnerUtxo,
+};
 pub use memory::RamBackend;
 pub use meta::{ConsensusMeta, FinalizedCheckpoint};
 pub use serial::{
@@ -29,6 +35,14 @@ pub use serial::{
     encode_header_chain_anchor, encode_segment, encode_slot_value, encode_state_meta,
     encode_tx_index_value, encode_undo_log, encoded_segment_len_for_eff_log,
     encoded_segments_total_len, u64_key,
+};
+pub use snapshot_generation::{
+    export_snapshot_generation, open_snapshot_generation, SnapshotGeneration,
+    SnapshotGenerationError, SnapshotGenerationManifest, SnapshotSegmentDescriptor,
+};
+pub use snapshot_staging::{
+    AuthenticatedSnapshotMetadata, FinalizedSnapshotStaging, SnapshotStagingError,
+    SnapshotStagingSession,
 };
 
 use crate::block_header::BlockHeader;

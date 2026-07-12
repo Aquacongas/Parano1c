@@ -63,7 +63,7 @@ impl MasterSecret {
     ///
     /// `spend_secret_n = Poseidon2b(master_secret, n, domain_tag)`
     ///
-    /// The derived secret is used by the wallet authorization prover to generate AuthGKR proofs.
+    /// The derived secret is used only by the wallet's witness-hiding authorization prover.
     /// It NEVER leaves the daemon.
     pub fn derive_spend_secret(&self, index: u32) -> SpendSecret {
         use noid_core::{Block128, TowerField};

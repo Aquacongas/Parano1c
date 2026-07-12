@@ -22,10 +22,13 @@ use tokio::sync::{mpsc, RwLock, Semaphore};
 use noid_chain::consensus::wire_limits::{
     proof_sidecar_combined_len_ok, INLINE_BLOCK_GOSSIP_THRESHOLD, MAX_BLOCK_AUTH_SIDECAR_BYTES,
     MAX_BLOCK_BYTES, MAX_BLOCK_PROOF_BYTES, MAX_HEADER_BYTES, MAX_HISTORY_PROOF_BYTES,
-    MAX_INFLIGHT_SEGMENTS, MAX_MEMPOOL_SYNC_BYTES, MAX_MEMPOOL_SYNC_TXS, MAX_SEGMENT_BYTES,
+    MAX_MEMPOOL_SYNC_BYTES, MAX_MEMPOOL_SYNC_TXS, MAX_SEGMENT_BYTES,
     MAX_SNAPSHOT_MANIFEST_SEGMENTS, MAX_TX_INTENT_BYTES_GLOBAL,
 };
-use noid_chain::storage::{encode_segment, encoded_segment_len_for_eff_log, MdbxChainContext};
+use noid_chain::storage::{encoded_segment_len_for_eff_log, MdbxChainContext};
+use noid_chain::storage::{
+    export_snapshot_generation, open_snapshot_generation, SnapshotGeneration,
+};
 use noid_mempool::AsyncMempool;
 
 use crate::behaviour::{NodeBehaviour, NodeBehaviourEvent};
@@ -40,16 +43,9 @@ struct PendingStateSegmentResponse {
 }
 
 type SnapshotExportKey = (u64, [u8; 32]);
+type SnapshotExport = Arc<SnapshotGeneration>;
 
-struct SnapshotExport {
-    created_at: Instant,
-    manifest: GetStateManifestResponse,
-    segments: std::collections::HashMap<u16, Vec<u8>>,
-}
-
-const SNAPSHOT_EXPORT_TTL: Duration = Duration::from_secs(120);
 const MAX_SNAPSHOT_EXPORTS: usize = 2;
-const MAX_SNAPSHOT_EXPORT_BYTES: usize = MAX_SEGMENT_BYTES * MAX_INFLIGHT_SEGMENTS;
 
 // Hard caps on incoming response sizes are shared via noid_chain::consensus::wire_limits.
 
@@ -541,12 +537,23 @@ async fn run_swarm(
         std::collections::HashMap::new();
     let mut mempool_sync_last_request: std::collections::HashMap<PeerId, Instant> =
         std::collections::HashMap::new();
+    let mut snapshot_manifest_last_request: std::collections::HashMap<PeerId, Instant> =
+        std::collections::HashMap::new();
+    let mut snapshot_segment_rate: std::collections::HashMap<PeerId, (u32, Instant)> =
+        std::collections::HashMap::new();
 
     let (segment_response_tx, mut segment_response_rx) =
         mpsc::channel::<PendingStateSegmentResponse>(32);
     let segment_encode_semaphore = Arc::new(Semaphore::new(2));
-    let mut snapshot_exports: std::collections::HashMap<SnapshotExportKey, SnapshotExport> =
-        std::collections::HashMap::new();
+    let snapshot_export_root = data_dir.join("snapshot-exports");
+    std::fs::create_dir_all(&snapshot_export_root)?;
+    let mut snapshot_exports = load_snapshot_exports(&snapshot_export_root);
+    prune_snapshot_exports(&mut snapshot_exports);
+    let (snapshot_export_tx, mut snapshot_export_rx) =
+        mpsc::channel::<(SnapshotExportKey, Result<SnapshotGeneration, String>)>(1);
+    let mut snapshot_export_inflight: Option<SnapshotExportKey> = None;
+    let mut snapshot_export_timer = tokio::time::interval(Duration::from_secs(30));
+    snapshot_export_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     // Reconnect timer: poll the reconnect list every 5 seconds.
     let mut reconnect_timer = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -592,18 +599,63 @@ async fn run_swarm(
                     &mut reconnect,
                     &mut block_event_rate,
                     &mut tx_gossip_rate,
+                    &mut mempool_sync_last_request,
+                    &mut snapshot_manifest_last_request,
+                    &mut snapshot_segment_rate,
                 )
                 .await;
             }
 
-            // Completed state-segment encodes. Responses must be sent from the
-            // swarm task, but the CPU-heavy encoding runs on blocking workers.
+            // Completed bounded disk reads. Responses must be sent from the
+            // swarm task, while segment authentication/I/O runs on workers.
             encoded = segment_response_rx.recv() => {
                 if let Some(encoded) = encoded {
                     let _ = swarm
                         .behaviour_mut()
                         .state_segment_sync
                         .send_response(encoded.channel, encoded.response);
+                }
+            }
+
+            completed = snapshot_export_rx.recv() => {
+                if let Some((key, result)) = completed {
+                    snapshot_export_inflight = None;
+                    match result {
+                        Ok(generation) if generation.key() == key => {
+                            tracing::info!(height = key.0, "published bounded disk snapshot generation");
+                            snapshot_exports.insert(key, Arc::new(generation));
+                            prune_snapshot_exports(&mut snapshot_exports);
+                        }
+                        Ok(_) => tracing::warn!(height = key.0, "snapshot generation boundary mismatch"),
+                        Err(error) => tracing::warn!(height = key.0, err = %error, "snapshot generation build failed"),
+                    }
+                }
+            }
+
+            _ = snapshot_export_timer.tick() => {
+                if snapshot_export_inflight.is_none() {
+                    let candidate = {
+                        let ctx = chain.read().await;
+                        local_public_history_proof(&ctx).and_then(|(height, _)| {
+                            let header = ctx.store.get_header(height).ok().flatten()?;
+                            let key = (height, noid_chain::hash_block_header(&header));
+                            if snapshot_exports.contains_key(&key) {
+                                None
+                            } else {
+                                Some((key, ctx.store.clone()))
+                            }
+                        })
+                    };
+                    if let Some((key, store)) = candidate {
+                        snapshot_export_inflight = Some(key);
+                        let export_root = snapshot_export_root.clone();
+                        let completion = snapshot_export_tx.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let result = export_snapshot_generation(&store, &export_root, key.0)
+                                .map_err(|error| error.to_string());
+                            let _ = completion.blocking_send((key, result));
+                        });
+                    }
                 }
             }
 
@@ -693,20 +745,45 @@ async fn run_swarm(
     Ok(())
 }
 
+fn load_snapshot_exports(
+    root: &std::path::Path,
+) -> std::collections::HashMap<SnapshotExportKey, SnapshotExport> {
+    let mut exports = std::collections::HashMap::new();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return exports;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        match open_snapshot_generation(entry.path()) {
+            Ok(generation) => {
+                exports.insert(generation.key(), Arc::new(generation));
+            }
+            Err(error) => {
+                tracing::warn!(path = %entry.path().display(), err = %error, "ignoring invalid snapshot generation");
+            }
+        }
+    }
+    exports
+}
+
 fn prune_snapshot_exports(
     exports: &mut std::collections::HashMap<SnapshotExportKey, SnapshotExport>,
 ) {
-    let now = Instant::now();
-    exports.retain(|_, export| now.duration_since(export.created_at) <= SNAPSHOT_EXPORT_TTL);
-    while exports.len() > MAX_SNAPSHOT_EXPORTS {
-        let Some(oldest_key) = exports
-            .iter()
-            .min_by_key(|(_, export)| export.created_at)
-            .map(|(key, _)| *key)
-        else {
-            break;
-        };
-        exports.remove(&oldest_key);
+    let mut keys: Vec<_> = exports.keys().copied().collect();
+    keys.sort_unstable_by_key(|(height, _)| std::cmp::Reverse(*height));
+    for key in keys.into_iter().skip(MAX_SNAPSHOT_EXPORTS) {
+        let removable = exports
+            .get(&key)
+            .is_some_and(|generation| Arc::strong_count(generation) == 1);
+        if removable {
+            if let Some(generation) = exports.remove(&key) {
+                if let Err(error) = std::fs::remove_dir_all(generation.directory()) {
+                    tracing::warn!(path = %generation.directory().display(), err = %error, "snapshot generation GC failed");
+                }
+            }
+        }
     }
 }
 
@@ -921,8 +998,8 @@ async fn handle_swarm_event(
     chain: &Arc<RwLock<MdbxChainContext>>,
     mempool: &AsyncMempool,
     topics: &NetworkTopics,
-    _segment_response_tx: &mpsc::Sender<PendingStateSegmentResponse>,
-    _segment_encode_semaphore: &Arc<Semaphore>,
+    segment_response_tx: &mpsc::Sender<PendingStateSegmentResponse>,
+    segment_encode_semaphore: &Arc<Semaphore>,
     snapshot_exports: &mut std::collections::HashMap<SnapshotExportKey, SnapshotExport>,
     reconnect: &mut std::collections::HashMap<
         libp2p::PeerId,
@@ -930,6 +1007,9 @@ async fn handle_swarm_event(
     >,
     block_event_rate: &mut std::collections::HashMap<PeerId, (u32, Instant)>,
     tx_gossip_rate: &mut std::collections::HashMap<PeerId, (u32, Instant)>,
+    mempool_sync_last_request: &mut std::collections::HashMap<PeerId, Instant>,
+    snapshot_manifest_last_request: &mut std::collections::HashMap<PeerId, Instant>,
+    snapshot_segment_rate: &mut std::collections::HashMap<PeerId, (u32, Instant)>,
 ) {
     match event {
         // --- GossipSub: received broadcast ---
@@ -1446,202 +1526,110 @@ async fn handle_swarm_event(
 
         // --- State sync: manifest server (step 1) ---
         //
-        // Serve a manifest together with a short-lived in-memory segment export
-        // keyed by the advertised snapshot boundary, so live mining cannot make
-        // the manifest stale before peers request its segments.
+        // Serve only a fully validated immutable disk generation keyed by the
+        // advertised boundary. Live mining cannot mutate its segment files.
         SwarmEvent::Behaviour(NodeBehaviourEvent::StateManifestSync(
             request_response::Event::Message {
                 message:
                     request_response::Message::Request {
                         request, channel, ..
                     },
+                peer,
                 ..
             },
         )) => {
+            const MANIFEST_REQUEST_COOLDOWN: Duration = Duration::from_secs(10);
+            let now = Instant::now();
+            if snapshot_manifest_last_request
+                .get(&peer)
+                .is_some_and(|last| now.duration_since(*last) < MANIFEST_REQUEST_COOLDOWN)
+            {
+                tracing::debug!(peer = %peer, "snapshot manifest request suppressed by cooldown");
+                let _ = swarm
+                    .behaviour_mut()
+                    .state_manifest_sync
+                    .send_response(channel, GetStateManifestResponse::default());
+                return;
+            }
+            snapshot_manifest_last_request.insert(peer, now);
             prune_snapshot_exports(snapshot_exports);
-            let (response, export_segments) = 'build_manifest: {
-                let mut ctx = chain.write().await;
-                let our_height = ctx.tip_height();
-                let snapshot_height = match local_public_history_proof(&ctx) {
-                    Some((height, _)) if height <= our_height => height,
-                    Some((height, _)) => {
-                        tracing::warn!(
-                            height,
-                            our_height,
-                            "state manifest build skipped: public proof height is ahead of local tip"
-                        );
-                        0
-                    }
-                    None => {
-                        tracing::debug!(
-                            our_height,
-                            "state manifest build skipped: no finalized public history proof yet"
-                        );
-                        0
-                    }
+            let response = 'ready_manifest: {
+                let ctx = chain.read().await;
+                let Some((snapshot_height, _)) = local_public_history_proof(&ctx) else {
+                    break 'ready_manifest GetStateManifestResponse::default();
                 };
-                if snapshot_height == 0 || snapshot_height <= request.requester_height {
-                    break 'build_manifest (GetStateManifestResponse::default(), None);
+                if snapshot_height == 0
+                    || snapshot_height <= request.requester_height
+                    || snapshot_height > ctx.tip_height()
+                    || ctx.tip_height().saturating_sub(snapshot_height)
+                        > noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH
+                {
+                    break 'ready_manifest GetStateManifestResponse::default();
                 }
-
-                let snapshot_header = match ctx.store.get_header(snapshot_height) {
-                    Ok(Some(header)) => header,
-                    Ok(None) => {
-                        tracing::warn!(
-                            snapshot_height,
-                            "state manifest build failed: snapshot header missing"
-                        );
-                        break 'build_manifest (GetStateManifestResponse::default(), None);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            snapshot_height,
-                            err = %e,
-                            "state manifest build failed: snapshot header read"
-                        );
-                        break 'build_manifest (GetStateManifestResponse::default(), None);
-                    }
+                let Some(snapshot_header) = ctx.store.get_header(snapshot_height).ok().flatten()
+                else {
+                    break 'ready_manifest GetStateManifestResponse::default();
                 };
-                let tip_hash = noid_chain::hash_block_header(&snapshot_header);
-                let mut snapshot_state = match ctx.reconstruct_state_snapshot_at(snapshot_height) {
-                    Ok(state) => state,
-                    Err(e) => {
-                        tracing::warn!(
-                            snapshot_height,
-                            err = ?e,
-                            "state manifest build failed: finalized state reconstruction"
-                        );
-                        break 'build_manifest (GetStateManifestResponse::default(), None);
-                    }
+                let key = (
+                    snapshot_height,
+                    noid_chain::hash_block_header(&snapshot_header),
+                );
+                let Some(generation) = snapshot_exports.get(&key) else {
+                    tracing::debug!(snapshot_height, "bounded snapshot generation is not ready");
+                    break 'ready_manifest GetStateManifestResponse::default();
                 };
-                if snapshot_state.try_state_root().ok() != Some(snapshot_header.state_root) {
-                    tracing::warn!(
-                        snapshot_height,
-                        "state manifest build failed: reconstructed state root mismatch"
-                    );
-                    break 'build_manifest (GetStateManifestResponse::default(), None);
-                }
-                let eff_log = snapshot_state.state.effective_log_segment_size() as u8;
-
-                let mut segments_ok = true;
-                let active_segment_ids: Vec<u16> =
-                    snapshot_state.state.active_segment_ids().collect();
-                let mut segment_ids = Vec::with_capacity(active_segment_ids.len());
-                let mut segment_roots = Vec::with_capacity(active_segment_ids.len());
-                let mut encoded_segments =
-                    std::collections::HashMap::with_capacity(active_segment_ids.len());
-                let mut encoded_total_bytes = 0usize;
-                for segment_id in active_segment_ids {
-                    let cols = snapshot_state.state.segment_columns(segment_id).clone();
-                    let root = noid_chain::fri_state::compute_segment_root(
-                        eff_log as usize,
-                        &cols.values,
-                        &cols.owners_hi,
-                        &cols.owners_lo,
-                    );
-                    segment_ids.push(segment_id);
-                    segment_roots.push(root);
-                    let encoded = encode_segment(&cols, eff_log);
-                    encoded_total_bytes = encoded_total_bytes.saturating_add(encoded.len());
-                    if encoded_total_bytes > MAX_SNAPSHOT_EXPORT_BYTES {
-                        segments_ok = false;
-                        tracing::warn!(
-                            snapshot_height,
-                            encoded_total_bytes,
-                            max = MAX_SNAPSHOT_EXPORT_BYTES,
-                            "state manifest build skipped: snapshot export exceeds memory cap"
-                        );
-                        break;
-                    }
-                    encoded_segments.insert(segment_id, encoded);
+                let manifest = generation.manifest();
+                if manifest.state_root != snapshot_header.state_root
+                    || manifest.log_slots != snapshot_header.log_slots
+                    || manifest.active_slot_count != snapshot_header.active_slot_count
+                    || manifest.alloc_counter != snapshot_header.alloc_counter
+                {
+                    tracing::warn!(snapshot_height, "disk snapshot manifest/header mismatch");
+                    break 'ready_manifest GetStateManifestResponse::default();
                 }
 
                 let header_window = noid_chain::consensus::params::MEDIAN_TIME_BLOCKS as u64
                     + noid_chain::consensus::params::TX_EPOCH_BLOCKS;
                 let start_height = snapshot_height.saturating_sub(header_window);
-                let mut recent_headers = Vec::new();
-                let mut headers_ok = true;
-                for h in start_height..=snapshot_height {
-                    match ctx.get_header_from_store(h) {
-                        Ok(Some(hdr)) => {
-                            let mut buf = Vec::new();
-                            hdr.encode(&mut buf);
-                            recent_headers.push(buf);
-                        }
-                        Ok(None) => {
-                            headers_ok = false;
-                            tracing::warn!(
-                                height = h,
-                                "state manifest build failed: missing header"
-                            );
-                            break;
-                        }
-                        Err(e) => {
-                            headers_ok = false;
-                            tracing::warn!(height = h, err = %e, "state manifest build failed: header read");
-                            break;
-                        }
-                    }
+                let mut recent_headers =
+                    Vec::with_capacity(snapshot_height.saturating_sub(start_height) as usize + 1);
+                for height in start_height..=snapshot_height {
+                    let Some(header) = ctx.get_header_from_store(height).ok().flatten() else {
+                        break 'ready_manifest GetStateManifestResponse::default();
+                    };
+                    let mut encoded = Vec::new();
+                    header.encode(&mut encoded);
+                    recent_headers.push(encoded);
                 }
-
-                let cumulative_chainwork = match ctx.store.get_chain_work(snapshot_height) {
-                    Ok(Some(work)) => Some(work),
-                    Ok(None) => {
-                        tracing::warn!(
-                            height = snapshot_height,
-                            "state manifest build failed: missing chainwork"
-                        );
-                        None
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            height = snapshot_height,
-                            err = %e,
-                            "state manifest build failed: chainwork read"
-                        );
-                        None
-                    }
-                };
-
-                if !headers_ok || !segments_ok || cumulative_chainwork.is_none() {
-                    break 'build_manifest (GetStateManifestResponse::default(), None);
-                }
-
-                let cumulative_chainwork =
-                    cumulative_chainwork.expect("checked cumulative_chainwork");
+                let segment_ids = manifest
+                    .segments
+                    .iter()
+                    .map(|descriptor| descriptor.segment_id)
+                    .collect();
+                let segment_roots = manifest
+                    .segments
+                    .iter()
+                    .map(|descriptor| descriptor.segment_root)
+                    .collect();
                 tracing::info!(
                     requester_height = request.requester_height,
-                    our_height,
                     snapshot_height,
-                    segments = segment_ids.len(),
-                    export_bytes = encoded_total_bytes,
-                    "serving state snapshot manifest"
+                    segments = manifest.segments.len(),
+                    "serving precomputed disk snapshot manifest"
                 );
-                let response = GetStateManifestResponse {
+                GetStateManifestResponse {
                     tip_height: snapshot_height,
-                    tip_hash,
-                    cumulative_chainwork,
-                    log_slots: snapshot_header.log_slots,
-                    active_slot_count: snapshot_header.active_slot_count,
-                    alloc_counter: snapshot_header.alloc_counter,
-                    eff_log,
+                    tip_hash: key.1,
+                    cumulative_chainwork: manifest.cumulative_chainwork,
+                    log_slots: manifest.log_slots,
+                    active_slot_count: manifest.active_slot_count,
+                    alloc_counter: manifest.alloc_counter,
+                    eff_log: manifest.effective_log_segment_size,
                     segment_ids,
                     segment_roots,
                     recent_headers,
-                };
-                break 'build_manifest (response, Some(encoded_segments));
+                }
             };
-            if let Some(segments) = export_segments {
-                snapshot_exports.insert(
-                    (response.tip_height, response.tip_hash),
-                    SnapshotExport {
-                        created_at: Instant::now(),
-                        manifest: response.clone(),
-                        segments,
-                    },
-                );
-                prune_snapshot_exports(snapshot_exports);
-            }
             let _ = swarm
                 .behaviour_mut()
                 .state_manifest_sync
@@ -1741,108 +1729,94 @@ async fn handle_swarm_event(
         // --- State sync: segment server (step 2) ---
         //
         // Responses are pinned to the exact manifest snapshot boundary
-        // (height + hash). A short in-memory export cache keeps the advertised
-        // snapshot available while a live miner advances.
+        // (height + hash). The immutable disk generation remains available
+        // while a live miner advances; only one segment is read per worker.
         SwarmEvent::Behaviour(NodeBehaviourEvent::StateSegmentSync(
             request_response::Event::Message {
                 message:
                     request_response::Message::Request {
                         request, channel, ..
                     },
+                peer,
                 ..
             },
         )) => {
-            prune_snapshot_exports(snapshot_exports);
-            let key = (request.expected_tip_height, request.expected_tip_hash);
-            let response = if let Some(export) = snapshot_exports.get(&key) {
-                match export.segments.get(&request.segment_id) {
-                    Some(data) => {
-                        tracing::debug!(
-                            segment = request.segment_id,
-                            tip_height = request.expected_tip_height,
-                            bytes = data.len(),
-                            "serving cached state snapshot segment"
-                        );
-                        GetStateSegmentResponse {
-                            segment_id: request.segment_id,
-                            eff_log: export.manifest.eff_log,
-                            data: Some(data.clone()),
-                        }
-                    }
-                    None => {
-                        tracing::debug!(
-                            segment = request.segment_id,
-                            tip_height = request.expected_tip_height,
-                            "cached state snapshot segment not present"
-                        );
-                        GetStateSegmentResponse {
-                            segment_id: request.segment_id,
-                            eff_log: 0,
-                            data: None,
-                        }
-                    }
-                }
-            } else {
-                let ctx = chain.read().await;
-                if ctx.tip_height() != request.expected_tip_height
-                    || ctx.tip_hash() != request.expected_tip_hash
-                {
-                    tracing::debug!(
-                        segment = request.segment_id,
-                        expected_tip_height = request.expected_tip_height,
-                        our_height = ctx.tip_height(),
-                        "state segment request stale"
-                    );
+            const SEGMENT_RATE_WINDOW: Duration = Duration::from_secs(1);
+            const MAX_SEGMENT_REQUESTS_PER_WINDOW: u32 = 64;
+            let now = Instant::now();
+            let entry = snapshot_segment_rate.entry(peer).or_insert((0, now));
+            if now.duration_since(entry.1) >= SEGMENT_RATE_WINDOW {
+                *entry = (0, now);
+            }
+            if entry.0 >= MAX_SEGMENT_REQUESTS_PER_WINDOW {
+                tracing::debug!(peer = %peer, "snapshot segment request rate limited");
+                let _ = swarm.behaviour_mut().state_segment_sync.send_response(
+                    channel,
                     GetStateSegmentResponse {
                         segment_id: request.segment_id,
                         eff_log: 0,
                         data: None,
-                    }
-                } else {
-                    match ctx.store.get_segment(request.segment_id) {
-                        Ok(Some((eff_log, cols))) => {
-                            let data = encode_segment(&cols, eff_log);
-                            tracing::debug!(
-                                segment = request.segment_id,
-                                bytes = data.len(),
-                                "serving state snapshot segment"
-                            );
-                            GetStateSegmentResponse {
-                                segment_id: request.segment_id,
-                                eff_log,
-                                data: Some(data),
-                            }
-                        }
-                        Ok(None) => {
-                            tracing::debug!(
-                                segment = request.segment_id,
-                                "state segment not present"
-                            );
-                            GetStateSegmentResponse {
-                                segment_id: request.segment_id,
-                                eff_log: 0,
-                                data: None,
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                segment = request.segment_id,
-                                err = %e,
-                                "state segment read failed"
-                            );
-                            GetStateSegmentResponse {
-                                segment_id: request.segment_id,
-                                eff_log: 0,
-                                data: None,
-                            }
-                        }
-                    }
-                }
+                    },
+                );
+                return;
+            }
+            entry.0 += 1;
+            prune_snapshot_exports(snapshot_exports);
+            let key = (request.expected_tip_height, request.expected_tip_hash);
+            let Some(export) = snapshot_exports.get(&key).cloned() else {
+                let _ = swarm.behaviour_mut().state_segment_sync.send_response(
+                    channel,
+                    GetStateSegmentResponse {
+                        segment_id: request.segment_id,
+                        eff_log: 0,
+                        data: None,
+                    },
+                );
+                return;
             };
-            let _ = swarm
-                .behaviour_mut()
-                .state_segment_sync
-                .send_response(channel, response);
+            let Some(descriptor) = export.manifest().segment(request.segment_id).copied() else {
+                let _ = swarm.behaviour_mut().state_segment_sync.send_response(
+                    channel,
+                    GetStateSegmentResponse {
+                        segment_id: request.segment_id,
+                        eff_log: 0,
+                        data: None,
+                    },
+                );
+                return;
+            };
+            let Ok(permit) = segment_encode_semaphore.clone().try_acquire_owned() else {
+                let _ = swarm.behaviour_mut().state_segment_sync.send_response(
+                    channel,
+                    GetStateSegmentResponse {
+                        segment_id: request.segment_id,
+                        eff_log: 0,
+                        data: None,
+                    },
+                );
+                return;
+            };
+            let completion = segment_response_tx.clone();
+            let effective_log = export.manifest().effective_log_segment_size;
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                let response = match export.read_encoded_segment(descriptor.segment_id) {
+                    Ok(data) => GetStateSegmentResponse {
+                        segment_id: descriptor.segment_id,
+                        eff_log: effective_log,
+                        data: Some(data),
+                    },
+                    Err(error) => {
+                        tracing::warn!(segment = descriptor.segment_id, err = %error, "disk snapshot segment read failed");
+                        GetStateSegmentResponse {
+                            segment_id: descriptor.segment_id,
+                            eff_log: 0,
+                            data: None,
+                        }
+                    }
+                };
+                let _ = completion.blocking_send(PendingStateSegmentResponse { channel, response });
+            });
         }
 
         // --- State sync: segment client (step 2 response) ---
@@ -1989,6 +1963,11 @@ async fn handle_swarm_event(
             if num_established == 0 {
                 let _ = event_tx.send(NetworkEvent::PeerDisconnected(peer_id));
                 tracing::debug!(peer = %peer_id, cause = ?cause, "peer disconnected");
+                block_event_rate.remove(&peer_id);
+                tx_gossip_rate.remove(&peer_id);
+                mempool_sync_last_request.remove(&peer_id);
+                snapshot_manifest_last_request.remove(&peer_id);
+                snapshot_segment_rate.remove(&peer_id);
                 // Schedule reconnect for peers we dialled (outbound connections).
                 // We don't attempt to reconnect inbound peers — they should re-dial us.
                 if let libp2p::core::ConnectedPoint::Dialer { address, .. } = endpoint {
@@ -2022,12 +2001,14 @@ async fn handle_swarm_event(
             request_response::Event::OutboundFailure { peer, error, .. },
         )) => {
             tracing::debug!(peer = %peer, err = %error, "manifest sync request failed");
+            let _ = event_tx.send(NetworkEvent::PeerDisconnected(peer));
         }
 
         SwarmEvent::Behaviour(NodeBehaviourEvent::StateSegmentSync(
             request_response::Event::OutboundFailure { peer, error, .. },
         )) => {
             tracing::debug!(peer = %peer, err = %error, "segment sync request failed");
+            let _ = event_tx.send(NetworkEvent::PeerDisconnected(peer));
         }
 
         SwarmEvent::Behaviour(NodeBehaviourEvent::ProofSync(

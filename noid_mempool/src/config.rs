@@ -18,8 +18,8 @@ pub struct MempoolConfig {
     /// Floor = max(MIN_FEE_BASE, median(last N fees) × 0.9).
     pub fee_floor_window: usize,
 
-    /// Number of concurrent AuthGKR verification workers (tokio::spawn_blocking slots).
-    /// 0 = no concurrency limit; AuthGKR verification is still required.
+    /// Number of concurrent authorization verification workers (`spawn_blocking` slots).
+    /// 0 = no concurrency limit; authorization verification is still required.
     /// Recommended: number of physical cores.
     pub auth_verify_workers: usize,
 }

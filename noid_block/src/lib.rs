@@ -52,13 +52,14 @@ pub use exact_state_killshot::{
     EXACT_STATE_STRUCTURAL_HASH_CHUNK_SIZE, TRANSITIONAL_INLINE_EXACT_STATE_MAX_PATHS,
 };
 pub use exact_state_transition::{
-    build_exact_state_transition_proof, derive_exact_slot_leaf_batch_inputs,
-    derive_exact_state_merkle_batch_inputs, derive_exact_state_structural_hash_batch_inputs,
-    exact_state_structural_hash_chunk_plan, exact_state_structural_hash_ghost_input,
-    exact_state_structural_hash_params, verify_exact_state_transition, ExactSlotLeafBatchInputs,
-    ExactStateMerkleBatchInputs, ExactStateStructuralHashBatchInputs,
-    ExactStateStructuralHashChunkPlan, ExactStateTransitionError, ExactStateTransitionInputs,
-    ExactStateTransitionProof, VerifiedStateTransition,
+    build_exact_state_transition_proof, build_exact_state_transition_proof_from_siblings,
+    derive_exact_slot_leaf_batch_inputs, derive_exact_state_merkle_batch_inputs,
+    derive_exact_state_structural_hash_batch_inputs, exact_state_structural_hash_chunk_plan,
+    exact_state_structural_hash_ghost_input, exact_state_structural_hash_params,
+    verify_exact_state_transition, ExactSlotLeafBatchInputs, ExactStateMerkleBatchInputs,
+    ExactStateStructuralHashBatchInputs, ExactStateStructuralHashChunkPlan,
+    ExactStateTransitionError, ExactStateTransitionInputs, ExactStateTransitionProof,
+    VerifiedStateTransition,
 };
 pub use history_claim::{
     accepted_state_transition_chain_claim, accepted_state_transition_claim_digest,
@@ -82,7 +83,7 @@ use noid_chain::consensus::params::{EXPANSION_WINDOW, MEDIAN_TIME_BLOCKS};
 use noid_chain::consensus::validation::AnchorInfo;
 use noid_chain::{hash_block_header, Block, BlockHeader};
 use noid_core::{Block128, TowerField};
-use noid_gkr::OwnerAuthProofKillShot;
+use noid_gkr::zk_authorization::ZkAuthorizationProof;
 use noid_poseidon2b::native::compression::Poseidon2bSponge;
 use noid_poseidon2b::native::domain::{capacity_iv, TAG_ACCBLK};
 use noid_poseidon2b::primitives::Address;
@@ -143,15 +144,187 @@ impl BlockProof {
 /// raw wallet secrets. It is a detached validation witness: validators check it
 /// against canonical authorization statements derived from the block body and
 /// authenticated state context, not against semantic block identity.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default)]
 pub struct BlockAuthSidecar {
     /// One auth proof per non-coinbase transaction in canonical block order.
-    pub tx_auth: Vec<OwnerAuthProofKillShot>,
+    pub tx_auth: Vec<ZkAuthorizationProof>,
 }
 
+const BLOCK_AUTH_SIDECAR_MAGIC: [u8; 8] = *b"NOIDAZK1";
+const BLOCK_AUTH_SIDECAR_HEADER_BYTES: usize = BLOCK_AUTH_SIDECAR_MAGIC.len() + 2;
+const BLOCK_AUTH_SIDECAR_PROOF_LEN_BYTES: usize = 4;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockAuthSidecarCodecError {
+    TooLarge {
+        actual: usize,
+        max: usize,
+    },
+    InvalidMagic,
+    ProofCount {
+        actual: usize,
+        max: usize,
+    },
+    Truncated,
+    ProofLength {
+        index: usize,
+        actual: usize,
+        max: usize,
+    },
+    ProofEncode {
+        index: usize,
+    },
+    ProofDecode {
+        index: usize,
+    },
+    TrailingBytes {
+        remaining: usize,
+    },
+    LengthOverflow,
+}
+
+impl std::fmt::Display for BlockAuthSidecarCodecError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl std::error::Error for BlockAuthSidecarCodecError {}
+
 impl BlockAuthSidecar {
+    /// Encode the versioned production sidecar. Each selected proof first
+    /// passes its own allocation-bounded canonical codec.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, BlockAuthSidecarCodecError> {
+        use noid_chain::consensus::params::BLOCK_MAX_USER_TXS;
+        use noid_chain::consensus::wire_limits::MAX_BLOCK_AUTH_SIDECAR_BYTES;
+        use noid_gkr::ZK_AUTHORIZATION_MAX_WIRE_BYTES;
+
+        if self.tx_auth.len() > BLOCK_MAX_USER_TXS {
+            return Err(BlockAuthSidecarCodecError::ProofCount {
+                actual: self.tx_auth.len(),
+                max: BLOCK_MAX_USER_TXS,
+            });
+        }
+        let capacity = self
+            .tx_auth
+            .len()
+            .checked_mul(BLOCK_AUTH_SIDECAR_PROOF_LEN_BYTES + ZK_AUTHORIZATION_MAX_WIRE_BYTES)
+            .and_then(|proofs| BLOCK_AUTH_SIDECAR_HEADER_BYTES.checked_add(proofs))
+            .ok_or(BlockAuthSidecarCodecError::LengthOverflow)?;
+        if capacity > MAX_BLOCK_AUTH_SIDECAR_BYTES {
+            return Err(BlockAuthSidecarCodecError::TooLarge {
+                actual: capacity,
+                max: MAX_BLOCK_AUTH_SIDECAR_BYTES,
+            });
+        }
+
+        let mut bytes = Vec::with_capacity(capacity);
+        bytes.extend_from_slice(&BLOCK_AUTH_SIDECAR_MAGIC);
+        bytes.extend_from_slice(&(self.tx_auth.len() as u16).to_le_bytes());
+        for (index, proof) in self.tx_auth.iter().enumerate() {
+            let proof = proof
+                .to_bytes()
+                .map_err(|_| BlockAuthSidecarCodecError::ProofEncode { index })?;
+            let proof_len = u32::try_from(proof.len())
+                .map_err(|_| BlockAuthSidecarCodecError::LengthOverflow)?;
+            bytes.extend_from_slice(&proof_len.to_le_bytes());
+            bytes.extend_from_slice(&proof);
+        }
+        debug_assert_eq!(bytes.len(), self.byte_len());
+        Ok(bytes)
+    }
+
+    /// Decode the versioned production sidecar without trusting any
+    /// attacker-controlled allocation length. Count and every proof length
+    /// are checked before allocating or invoking the selected proof decoder.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, BlockAuthSidecarCodecError> {
+        use noid_chain::consensus::params::BLOCK_MAX_USER_TXS;
+        use noid_chain::consensus::wire_limits::MAX_BLOCK_AUTH_SIDECAR_BYTES;
+        use noid_gkr::ZK_AUTHORIZATION_MAX_WIRE_BYTES;
+
+        if bytes.len() > MAX_BLOCK_AUTH_SIDECAR_BYTES {
+            return Err(BlockAuthSidecarCodecError::TooLarge {
+                actual: bytes.len(),
+                max: MAX_BLOCK_AUTH_SIDECAR_BYTES,
+            });
+        }
+        if bytes.len() < BLOCK_AUTH_SIDECAR_HEADER_BYTES {
+            return Err(BlockAuthSidecarCodecError::Truncated);
+        }
+        if bytes[..BLOCK_AUTH_SIDECAR_MAGIC.len()] != BLOCK_AUTH_SIDECAR_MAGIC {
+            return Err(BlockAuthSidecarCodecError::InvalidMagic);
+        }
+        let mut offset = BLOCK_AUTH_SIDECAR_MAGIC.len();
+        let count = u16::from_le_bytes(
+            bytes[offset..offset + 2]
+                .try_into()
+                .expect("two sidecar count bytes"),
+        ) as usize;
+        offset += 2;
+        if count > BLOCK_MAX_USER_TXS {
+            return Err(BlockAuthSidecarCodecError::ProofCount {
+                actual: count,
+                max: BLOCK_MAX_USER_TXS,
+            });
+        }
+        let minimum = offset
+            .checked_add(
+                count
+                    .checked_mul(BLOCK_AUTH_SIDECAR_PROOF_LEN_BYTES)
+                    .ok_or(BlockAuthSidecarCodecError::LengthOverflow)?,
+            )
+            .ok_or(BlockAuthSidecarCodecError::LengthOverflow)?;
+        if minimum > bytes.len() {
+            return Err(BlockAuthSidecarCodecError::Truncated);
+        }
+
+        let mut tx_auth = Vec::with_capacity(count);
+        for index in 0..count {
+            let length_end = offset
+                .checked_add(BLOCK_AUTH_SIDECAR_PROOF_LEN_BYTES)
+                .ok_or(BlockAuthSidecarCodecError::LengthOverflow)?;
+            if length_end > bytes.len() {
+                return Err(BlockAuthSidecarCodecError::Truncated);
+            }
+            let proof_len = u32::from_le_bytes(
+                bytes[offset..length_end]
+                    .try_into()
+                    .expect("four sidecar proof-length bytes"),
+            ) as usize;
+            offset = length_end;
+            if proof_len > ZK_AUTHORIZATION_MAX_WIRE_BYTES {
+                return Err(BlockAuthSidecarCodecError::ProofLength {
+                    index,
+                    actual: proof_len,
+                    max: ZK_AUTHORIZATION_MAX_WIRE_BYTES,
+                });
+            }
+            let proof_end = offset
+                .checked_add(proof_len)
+                .ok_or(BlockAuthSidecarCodecError::LengthOverflow)?;
+            if proof_end > bytes.len() {
+                return Err(BlockAuthSidecarCodecError::Truncated);
+            }
+            let proof = ZkAuthorizationProof::from_bytes(&bytes[offset..proof_end])
+                .map_err(|_| BlockAuthSidecarCodecError::ProofDecode { index })?;
+            tx_auth.push(proof);
+            offset = proof_end;
+        }
+        if offset != bytes.len() {
+            return Err(BlockAuthSidecarCodecError::TrailingBytes {
+                remaining: bytes.len() - offset,
+            });
+        }
+        Ok(Self { tx_auth })
+    }
+
     pub fn byte_len(&self) -> usize {
-        bincode::serialized_size(self).map_or(0, |len| len as usize)
+        BLOCK_AUTH_SIDECAR_HEADER_BYTES
+            + self
+                .tx_auth
+                .iter()
+                .map(|proof| BLOCK_AUTH_SIDECAR_PROOF_LEN_BYTES + proof.serialized_byte_len())
+                .sum::<usize>()
     }
 }
 
@@ -259,9 +432,8 @@ pub fn accepted_block_claim_transcript(
     let auth_sidecar_len = if user_txs == 0 {
         0
     } else {
-        bincode::serialized_size(auth_sidecar)
+        u64::try_from(auth_sidecar.byte_len())
             .map_err(|_| VerifyBlockError::AuthSidecarShapeMismatch)?
-            .min(u64::MAX)
     };
     Ok(AcceptedBlockClaimTranscript {
         block: AcceptedBlockHeaderClaim::from_header(&block.header),
@@ -457,7 +629,7 @@ pub enum VerifyBlockError {
         tx_index: usize,
         error: noid_tx::PublicLogicError,
     },
-    AuthKillShot(usize),
+    AuthorizationProofRejected(usize),
     AuthSpineBridge(usize),
     /// Exact action-surface reconstruction found an input whose tx-body
     /// `(slot,value,owner)` claim does not match the sequential pre-state view.
@@ -522,6 +694,64 @@ mod tests {
     use noid_tx::{
         output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS,
     };
+
+    #[test]
+    fn selected_authorization_sidecar_codec_is_bounded_and_rejects_legacy() {
+        let proof = noid_gkr::ghost_tx::prove_selected_ghost_authorization()
+            .expect("fresh selected ghost proof");
+        let sidecar = BlockAuthSidecar {
+            tx_auth: vec![proof],
+        };
+        let bytes = sidecar.to_bytes().expect("encode selected sidecar");
+        assert_eq!(bytes.len(), sidecar.byte_len());
+        let decoded = BlockAuthSidecar::from_bytes(&bytes).expect("decode selected sidecar");
+        assert_eq!(decoded.tx_auth.len(), 1);
+        assert_eq!(
+            decoded.tx_auth[0].to_bytes().unwrap(),
+            sidecar.tx_auth[0].to_bytes().unwrap()
+        );
+
+        let mut bad_magic = bytes.clone();
+        bad_magic[0] ^= 1;
+        assert!(matches!(
+            BlockAuthSidecar::from_bytes(&bad_magic),
+            Err(BlockAuthSidecarCodecError::InvalidMagic)
+        ));
+
+        let mut too_many = bytes.clone();
+        too_many[BLOCK_AUTH_SIDECAR_MAGIC.len()..BLOCK_AUTH_SIDECAR_HEADER_BYTES]
+            .copy_from_slice(&256u16.to_le_bytes());
+        assert!(matches!(
+            BlockAuthSidecar::from_bytes(&too_many),
+            Err(BlockAuthSidecarCodecError::ProofCount { .. })
+        ));
+
+        let mut oversized_proof = bytes.clone();
+        oversized_proof[BLOCK_AUTH_SIDECAR_HEADER_BYTES
+            ..BLOCK_AUTH_SIDECAR_HEADER_BYTES + BLOCK_AUTH_SIDECAR_PROOF_LEN_BYTES]
+            .copy_from_slice(
+                &((noid_gkr::ZK_AUTHORIZATION_MAX_WIRE_BYTES + 1) as u32).to_le_bytes(),
+            );
+        assert!(matches!(
+            BlockAuthSidecar::from_bytes(&oversized_proof),
+            Err(BlockAuthSidecarCodecError::ProofLength { index: 0, .. })
+        ));
+
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert!(matches!(
+            BlockAuthSidecar::from_bytes(&trailing),
+            Err(BlockAuthSidecarCodecError::TrailingBytes { remaining: 1 })
+        ));
+
+        let legacy = bincode::serialize(&noid_gkr::ghost_tx::ghost_authorization().0)
+            .expect("encode legacy proof fixture");
+        assert!(matches!(
+            BlockAuthSidecar::from_bytes(&legacy),
+            Err(BlockAuthSidecarCodecError::InvalidMagic)
+                | Err(BlockAuthSidecarCodecError::Truncated)
+        ));
+    }
 
     fn header(height: u64, txs: &[Transaction]) -> BlockHeader {
         BlockHeader {

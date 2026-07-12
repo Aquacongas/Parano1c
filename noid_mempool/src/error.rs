@@ -42,7 +42,7 @@ pub enum SubmitError {
     #[error("auth authorization too large: {actual} bytes (max {max})")]
     ProofTooLarge { actual: usize, max: usize },
 
-    /// AuthGKR verification failed.
+    /// Selected-ZK authorization verification failed.
     #[error("invalid auth authorization: {0}")]
     InvalidProof(String),
 

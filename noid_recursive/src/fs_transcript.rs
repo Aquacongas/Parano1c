@@ -811,7 +811,10 @@ mod tests {
     use super::*;
     use crate::authorization::verify_authorization_batch_native_with_traces;
     use noid_chain::{Block, BlockHeader};
-    use noid_gkr::OwnerAuthWitness;
+    use noid_gkr::{
+        owner_auth_gkr_channel, owner_auth_trace_inputs_from_body_and_secret,
+        prove_owner_auth_killshot, OwnerAuthCircuit,
+    };
     use noid_poseidon2b::channel::Poseidon2bChannel;
     use noid_poseidon2b::primitives::{derive_address, Address, SpendSecret};
     use noid_tx::{
@@ -861,9 +864,11 @@ mod tests {
             is_coinbase: false,
         };
         let tx = Transaction::new(body);
-        let proof = noid_gkr::prove_wallet_authorization(&tx.body, OwnerAuthWitness::new(secret))
-            .expect("wallet auth")
-            .proof;
+        let auth_inputs = owner_auth_trace_inputs_from_body_and_secret(&tx.body, &secret)
+            .expect("legacy trace fixture inputs");
+        let circuit = OwnerAuthCircuit::build();
+        let mut channel = owner_auth_gkr_channel();
+        let (proof, _) = prove_owner_auth_killshot(&circuit, &auth_inputs, &mut channel);
         let block = Block {
             header: BlockHeader {
                 prev_block_hash: [0u8; 32],

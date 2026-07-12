@@ -458,20 +458,10 @@ impl AuthPcsRegionPreparation {
     }
 }
 
-// Exact B255 selected-ZK region geometry. These constants are deliberately
-// local to the common allocator: the public V4 certificate independently
-// validates the same shape in `region_sidecar::block`.
-const SELECTED_ZK_REGION_TILE_COUNT: usize = 256;
-const SELECTED_ZK_REGION_TX_LOG: usize = 8;
+// Selected-ZK column counts shared by all four canonical geometries. Domain
+// logs and class capacities come from the exact V4 geometry certificate in
+// `region_sidecar::block`; lower tiers never allocate B255-sized columns.
 const SELECTED_ZK_REGION_QUERY_LOG: usize = 6;
-const SELECTED_ZK_REGION_TOUCHED_CAPACITY: usize = 1_531;
-const SELECTED_ZK_REGION_SEGMENT_CAPACITY: usize = 256;
-const SELECTED_ZK_REGION_WALLET_A_LOG: usize = 19;
-const SELECTED_ZK_REGION_WALLET_B_LOG: usize = 18;
-const SELECTED_ZK_REGION_META_B_LOG: usize = 17;
-const SELECTED_ZK_REGION_MAIN_LOG: usize = 16;
-const SELECTED_ZK_REGION_META_A_LOG: usize = 15;
-const SELECTED_ZK_REGION_OWNER_LOG: usize = 15;
 const SELECTED_ZK_REGION_WALLET_A_COLUMNS: usize = 6;
 const SELECTED_ZK_REGION_WALLET_B_COLUMNS: usize = 9;
 const SELECTED_ZK_REGION_META_B_COLUMNS: usize = 9;
@@ -479,9 +469,29 @@ const SELECTED_ZK_REGION_MAIN_COLUMNS: usize = 6;
 const SELECTED_ZK_REGION_META_A_COLUMNS: usize = 8;
 const SELECTED_ZK_REGION_OWNER_COLUMNS: usize = 6;
 const SELECTED_ZK_REGION_COMMITTED_COLUMNS: usize = 44;
+
+// B255 snapshot spellings retained only by the exact regression tests below.
+#[cfg(test)]
+const SELECTED_ZK_REGION_TX_LOG: usize = 8;
+#[cfg(test)]
+const SELECTED_ZK_REGION_TOUCHED_CAPACITY: usize = 1_531;
+#[cfg(test)]
+const SELECTED_ZK_REGION_SEGMENT_CAPACITY: usize = 256;
+#[cfg(test)]
+const SELECTED_ZK_REGION_WALLET_A_LOG: usize = 19;
+#[cfg(test)]
+const SELECTED_ZK_REGION_WALLET_B_LOG: usize = 18;
+#[cfg(test)]
+const SELECTED_ZK_REGION_META_B_LOG: usize = 17;
+#[cfg(test)]
+const SELECTED_ZK_REGION_MAIN_LOG: usize = 16;
+#[cfg(test)]
+const SELECTED_ZK_REGION_META_A_LOG: usize = 15;
+#[cfg(test)]
+const SELECTED_ZK_REGION_OWNER_LOG: usize = 15;
+#[cfg(test)]
 const SELECTED_ZK_REGION_COMMITTED_CELLS: usize = 7_536_640;
 
-const _: () = assert!(SELECTED_ZK_REGION_TILE_COUNT == 1 << SELECTED_ZK_REGION_TX_LOG);
 const _: () = assert!(SELECTED_ZK_QUERY_COUNT == 1 << SELECTED_ZK_REGION_QUERY_LOG);
 const _: () = assert!(
     SELECTED_ZK_REGION_WALLET_A_COLUMNS
@@ -492,17 +502,8 @@ const _: () = assert!(
         + SELECTED_ZK_REGION_OWNER_COLUMNS
         == SELECTED_ZK_REGION_COMMITTED_COLUMNS
 );
-const _: () = assert!(
-    SELECTED_ZK_REGION_WALLET_A_COLUMNS * (1 << SELECTED_ZK_REGION_WALLET_A_LOG)
-        + SELECTED_ZK_REGION_WALLET_B_COLUMNS * (1 << SELECTED_ZK_REGION_WALLET_B_LOG)
-        + SELECTED_ZK_REGION_META_B_COLUMNS * (1 << SELECTED_ZK_REGION_META_B_LOG)
-        + SELECTED_ZK_REGION_MAIN_COLUMNS * (1 << SELECTED_ZK_REGION_MAIN_LOG)
-        + SELECTED_ZK_REGION_META_A_COLUMNS * (1 << SELECTED_ZK_REGION_META_A_LOG)
-        + SELECTED_ZK_REGION_OWNER_COLUMNS * (1 << SELECTED_ZK_REGION_OWNER_LOG)
-        == SELECTED_ZK_REGION_COMMITTED_CELLS
-);
 
-/// Allocation-free input failures for the private selected B255 common
+/// Allocation-free input failures for the private selected common
 /// allocator. Every variant is returned before the builder is touched.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum SelectedZkAuthPcsRegionAllocationError {
@@ -516,7 +517,7 @@ pub(super) enum SelectedZkAuthPcsRegionAllocationError {
 
 /// Opaque result of the one selected authorization+Meta allocation boundary.
 /// It is not a preparation and carries no finalization token. The owning Block
-/// assembly may borrow the draft to bind all 256 authorization tiles, then
+/// assembly may borrow the draft to bind all class authorization tiles, then
 /// consume this value to recover the draft and paired exact-state handoff.
 pub(super) struct SelectedZkAuthPcsRegionAllocation {
     draft: crate::region_sidecar::SelectedZkBlockRegionDraft,
@@ -551,20 +552,33 @@ struct SelectedZkRegionAllocationLedger {
 }
 
 impl SelectedZkRegionAllocationLedger {
-    fn new(before: usize) -> Self {
+    fn new(before: usize, geometry: crate::region_sidecar::SelectedZkBlockGeometry) -> Self {
         let wallet_a = before
-            .checked_next_multiple_of(1 << SELECTED_ZK_REGION_WALLET_A_LOG)
+            .checked_next_multiple_of(1 << geometry.wallet_a_w_log)
             .expect("selected wallet-A alignment overflow");
-        let wallet_b =
-            wallet_a + SELECTED_ZK_REGION_WALLET_A_COLUMNS * (1 << SELECTED_ZK_REGION_WALLET_A_LOG);
-        let meta_b =
-            wallet_b + SELECTED_ZK_REGION_WALLET_B_COLUMNS * (1 << SELECTED_ZK_REGION_WALLET_B_LOG);
-        let main =
-            meta_b + SELECTED_ZK_REGION_META_B_COLUMNS * (1 << SELECTED_ZK_REGION_META_B_LOG);
-        let meta_a = main + SELECTED_ZK_REGION_MAIN_COLUMNS * (1 << SELECTED_ZK_REGION_MAIN_LOG);
-        let owner =
-            meta_a + SELECTED_ZK_REGION_META_A_COLUMNS * (1 << SELECTED_ZK_REGION_META_A_LOG);
-        let after = owner + SELECTED_ZK_REGION_OWNER_COLUMNS * (1 << SELECTED_ZK_REGION_OWNER_LOG);
+        let wallet_a_end =
+            wallet_a + SELECTED_ZK_REGION_WALLET_A_COLUMNS * (1 << geometry.wallet_a_w_log);
+        let wallet_b = wallet_a_end
+            .checked_next_multiple_of(1 << geometry.wallet_b_w_log)
+            .expect("selected wallet-B alignment overflow");
+        let wallet_b_end =
+            wallet_b + SELECTED_ZK_REGION_WALLET_B_COLUMNS * (1 << geometry.wallet_b_w_log);
+        let meta_b = wallet_b_end
+            .checked_next_multiple_of(1 << geometry.meta_b_w_log)
+            .expect("selected Meta-B alignment overflow");
+        let meta_b_end = meta_b + SELECTED_ZK_REGION_META_B_COLUMNS * (1 << geometry.meta_b_w_log);
+        let main = meta_b_end
+            .checked_next_multiple_of(1 << geometry.main_w_log)
+            .expect("selected Main alignment overflow");
+        let main_end = main + SELECTED_ZK_REGION_MAIN_COLUMNS * (1 << geometry.main_w_log);
+        let meta_a = main_end
+            .checked_next_multiple_of(1 << geometry.meta_a_w_log)
+            .expect("selected Meta-A alignment overflow");
+        let meta_a_end = meta_a + SELECTED_ZK_REGION_META_A_COLUMNS * (1 << geometry.meta_a_w_log);
+        let owner = meta_a_end
+            .checked_next_multiple_of(1 << geometry.owner_w_log)
+            .expect("selected Owner alignment overflow");
+        let after = owner + SELECTED_ZK_REGION_OWNER_COLUMNS * (1 << geometry.owner_w_log);
         Self {
             before,
             wallet_a,
@@ -3886,7 +3900,12 @@ fn bind_auth_pcs_meta_paired_handoff(
 
 fn preflight_selected_zk_authorization_draft(
     authorization: &super::zk_authorization_region::SelectedZkAuthorizationRegionDraft,
-) -> Result<(), SelectedZkAuthPcsRegionAllocationError> {
+) -> Result<crate::region_sidecar::SelectedZkBlockGeometry, SelectedZkAuthPcsRegionAllocationError>
+{
+    let geometry = crate::region_sidecar::selected_zk_block_geometry_for_auth_tiles(
+        authorization.owner().challenges.len(),
+    )
+    .ok_or(SelectedZkAuthPcsRegionAllocationError::AuthorizationShape)?;
     let exact_duplex = |union: &DuplexUnion, w_log: usize, block_log: usize| {
         let len = 1usize << w_log;
         union.w_log == w_log
@@ -3894,7 +3913,7 @@ fn preflight_selected_zk_authorization_draft(
             && union.committed.iter().all(|column| column.len() == len)
             && union.s0.iter().all(|column| column.len() == len)
             && union.s_out.iter().all(|column| column.len() == len)
-            && union.challenges.len() == SELECTED_ZK_REGION_TILE_COUNT
+            && union.challenges.len() == geometry.auth_tiles
             && union.rec_blocks.is_empty()
             && union.rec_refs.is_empty()
             && union.rec_challenges.is_empty()
@@ -3915,31 +3934,31 @@ fn preflight_selected_zk_authorization_draft(
     let wallet_b = authorization.wallet_b();
     let valid = authorization.changed_committed_columns() == 27
         && authorization.committed_cells()
-            == SELECTED_ZK_REGION_WALLET_A_COLUMNS * (1 << SELECTED_ZK_REGION_WALLET_A_LOG)
-                + SELECTED_ZK_REGION_WALLET_B_COLUMNS * (1 << SELECTED_ZK_REGION_WALLET_B_LOG)
-                + SELECTED_ZK_REGION_OWNER_COLUMNS * (1 << SELECTED_ZK_REGION_OWNER_LOG)
-                + SELECTED_ZK_REGION_MAIN_COLUMNS * (1 << SELECTED_ZK_REGION_MAIN_LOG)
-        && exact_duplex(authorization.owner(), SELECTED_ZK_REGION_OWNER_LOG, 7)
-        && exact_duplex(authorization.main(), SELECTED_ZK_REGION_MAIN_LOG, 8)
+            == SELECTED_ZK_REGION_WALLET_A_COLUMNS * (1 << geometry.wallet_a_w_log)
+                + SELECTED_ZK_REGION_WALLET_B_COLUMNS * (1 << geometry.wallet_b_w_log)
+                + SELECTED_ZK_REGION_OWNER_COLUMNS * (1 << geometry.owner_w_log)
+                + SELECTED_ZK_REGION_MAIN_COLUMNS * (1 << geometry.main_w_log)
+        && exact_duplex(authorization.owner(), geometry.owner_w_log, 7)
+        && exact_duplex(authorization.main(), geometry.main_w_log, 8)
         && exact_raw_walk(
             wallet_a.committed(),
             wallet_a.s0(),
             wallet_a.s_out(),
             SELECTED_ZK_REGION_WALLET_A_COLUMNS,
-            SELECTED_ZK_REGION_WALLET_A_LOG,
+            geometry.wallet_a_w_log,
         )
         && exact_raw_walk(
             wallet_b.committed(),
             wallet_b.s0(),
             wallet_b.s_out(),
             SELECTED_ZK_REGION_WALLET_B_COLUMNS,
-            SELECTED_ZK_REGION_WALLET_B_LOG,
+            geometry.wallet_b_w_log,
         )
         && wallet_b.committed()[8]
             .iter()
             .all(|&value| value == F128::ZERO || value == F128::ONE);
     if valid {
-        Ok(())
+        Ok(geometry)
     } else {
         Err(SelectedZkAuthPcsRegionAllocationError::AuthorizationShape)
     }
@@ -3949,6 +3968,7 @@ fn preflight_selected_zk_meta_inputs(
     es: &ExactStateRegionData,
     txr: &TxRootRegionData,
     spine: &SpineRegionData,
+    geometry: crate::region_sidecar::SelectedZkBlockGeometry,
 ) -> Result<(), SelectedZkAuthPcsRegionAllocationError> {
     if !es.paths.is_empty() {
         return Err(SelectedZkAuthPcsRegionAllocationError::LegacyExactStatePaths);
@@ -3957,9 +3977,9 @@ fn preflight_selected_zk_meta_inputs(
         .paired
         .as_ref()
         .ok_or(SelectedZkAuthPcsRegionAllocationError::MissingPairedExactState)?;
-    if es.leaves.len() != 2 * SELECTED_ZK_REGION_TOUCHED_CAPACITY
-        || paired.touched_capacity != SELECTED_ZK_REGION_TOUCHED_CAPACITY
-        || paired.segment_capacity != SELECTED_ZK_REGION_SEGMENT_CAPACITY
+    if es.leaves.len() != 2 * geometry.touched_capacity
+        || paired.touched_capacity != geometry.touched_capacity
+        || paired.segment_capacity != geometry.segment_capacity
         || paired.local_updates.len() != paired.local_update_count
         || paired.upper_updates.len() != paired.upper_update_count
         || paired.local_update_count > paired.touched_capacity
@@ -3969,7 +3989,7 @@ fn preflight_selected_zk_meta_inputs(
         return Err(SelectedZkAuthPcsRegionAllocationError::ExactStateShape);
     }
     if txr.depth != 8
-        || txr.paths.len() != SELECTED_ZK_REGION_TILE_COUNT
+        || txr.paths.len() != 1 << noid_chain::tx_tree::TX_TREE_DEPTH
         || txr
             .paths
             .iter()
@@ -3978,7 +3998,7 @@ fn preflight_selected_zk_meta_inputs(
     {
         return Err(SelectedZkAuthPcsRegionAllocationError::TxRootShape);
     }
-    if spine.instances.len() != SELECTED_ZK_REGION_TILE_COUNT {
+    if spine.instances.len() != geometry.tier + 1 {
         return Err(SelectedZkAuthPcsRegionAllocationError::SpineShape);
     }
     Ok(())
@@ -4044,7 +4064,7 @@ fn alloc_selected_columns<const N: usize>(
     })
 }
 
-/// Allocate and close the exact selected B255 authorization+Meta region.
+/// Allocate and close one exact selected-class authorization+Meta region.
 ///
 /// This is the sole common six-child allocator. It consumes the verified raw
 /// authorization draft and accepts only the canonical production Meta inputs.
@@ -4060,8 +4080,8 @@ pub(super) fn allocate_selected_zk_auth_pcs_region(
     txr: &TxRootRegionData,
     spine: &SpineRegionData,
 ) -> Result<SelectedZkAuthPcsRegionAllocation, SelectedZkAuthPcsRegionAllocationError> {
-    preflight_selected_zk_authorization_draft(&authorization)?;
-    preflight_selected_zk_meta_inputs(es, txr, spine)?;
+    let geometry = preflight_selected_zk_authorization_draft(&authorization)?;
+    preflight_selected_zk_meta_inputs(es, txr, spine, geometry)?;
 
     let (owner, main, wallet_a, wallet_b) = authorization.into_parts();
     let (wallet_a_columns, wallet_a_s0, wallet_a_s_out) = wallet_a.into_parts();
@@ -4093,26 +4113,28 @@ pub(super) fn allocate_selected_zk_auth_pcs_region(
         acc_root_wires,
         acc_path_slots,
         ..
-    } = build_auth_pcs_meta_region_draft(
-        b,
-        SELECTED_ZK_REGION_TILE_COUNT,
-        Some(es),
-        Some(txr),
-        Some(spine),
-    );
+    } = build_auth_pcs_meta_region_draft(b, geometry.auth_tiles, Some(es), Some(txr), Some(spine));
     let meta_b_layout = meta_b
         .as_ref()
         .expect("selected paired Meta input must construct Meta-B");
     assert!(has_meta && has_both_a_families, "selected Meta-A families");
-    assert_eq!(es_region_slots, 1 << 13, "selected exact-state region");
-    assert_eq!(spine_cap, 1, "selected spine capacity per tile");
-    assert_eq!(meta_w_log, SELECTED_ZK_REGION_META_A_LOG);
-    assert_eq!(meta_b_layout.w_log, SELECTED_ZK_REGION_META_B_LOG);
-    assert_eq!(meta_b_layout.block_log, 9);
-    assert_eq!(paired_caps_per_block, Some([6, 1]));
-    assert_eq!(paired_bases, Some([0, 384]));
+    assert_eq!(
+        es_region_slots,
+        1 << geometry.exact_state_region_log,
+        "selected exact-state region"
+    );
+    assert_eq!(
+        spine_cap,
+        1 << geometry.spine_cap_log,
+        "selected spine capacity per tile"
+    );
+    assert_eq!(meta_w_log, geometry.meta_a_w_log);
+    assert_eq!(meta_b_layout.w_log, geometry.meta_b_w_log);
+    assert_eq!(meta_b_layout.block_log, geometry.meta_b_block_log);
+    assert_eq!(paired_caps_per_block, Some(geometry.paired_caps_per_block));
+    assert_eq!(paired_bases, Some(geometry.paired_bases));
     assert_eq!(leg_depths, vec![8]);
-    assert_eq!(leg_caps, vec![1]);
+    assert_eq!(leg_caps, vec![geometry.tx_root_paths_per_block]);
     assert_eq!(meta_cols.len(), SELECTED_ZK_REGION_META_A_COLUMNS);
     assert_eq!(cb_meta_b.len(), SELECTED_ZK_REGION_META_B_COLUMNS);
     assert!(cb_meta_b[8]
@@ -4132,43 +4154,73 @@ pub(super) fn allocate_selected_zk_auth_pcs_region(
     // One exact descending-domain allocation. Because every family begins at
     // the preceding family's end, only Wallet-A may insert alignment padding:
     // WA6@m19, WB9@m18, MetaB9@m17, Main6@m16, MetaA8@m15, Owner6@m15.
-    let allocation_ledger = SelectedZkRegionAllocationLedger::new(b.num_wires());
+    let allocation_ledger = SelectedZkRegionAllocationLedger::new(b.num_wires(), geometry);
     let wallet_a_slices = alloc_selected_columns::<SELECTED_ZK_REGION_WALLET_A_COLUMNS>(
         b,
         &wallet_a_columns,
-        SELECTED_ZK_REGION_WALLET_A_LOG,
+        geometry.wallet_a_w_log,
         None,
     );
+    drop(wallet_a_columns);
     let wallet_b_slices = alloc_selected_columns::<SELECTED_ZK_REGION_WALLET_B_COLUMNS>(
         b,
         &wallet_b_columns,
-        SELECTED_ZK_REGION_WALLET_B_LOG,
+        geometry.wallet_b_w_log,
         Some(8),
     );
+    drop(wallet_b_columns);
     let meta_b_slices = alloc_selected_columns::<SELECTED_ZK_REGION_META_B_COLUMNS>(
         b,
         &cb_meta_b,
-        SELECTED_ZK_REGION_META_B_LOG,
+        geometry.meta_b_w_log,
         Some(8),
     );
+    drop(cb_meta_b);
     let main_slices = alloc_selected_columns::<SELECTED_ZK_REGION_MAIN_COLUMNS>(
         b,
         &main.committed,
-        SELECTED_ZK_REGION_MAIN_LOG,
+        geometry.main_w_log,
         None,
     );
     let meta_a_slices = alloc_selected_columns::<SELECTED_ZK_REGION_META_A_COLUMNS>(
         b,
         &meta_cols,
-        SELECTED_ZK_REGION_META_A_LOG,
+        geometry.meta_a_w_log,
         None,
     );
+    drop(meta_cols);
     let owner_slices = alloc_selected_columns::<SELECTED_ZK_REGION_OWNER_COLUMNS>(
         b,
         &owner.committed,
-        SELECTED_ZK_REGION_OWNER_LOG,
+        geometry.owner_w_log,
         None,
     );
+    let owner_vk = crate::region_sidecar::DuplexRegionVk::from_union(
+        selected_zk_auth_owner_sidecar_purpose(),
+        owner_slices,
+        &owner,
+    )
+    .expect("preflighted selected Owner VK drift");
+    let main_vk = crate::region_sidecar::DuplexRegionVk::from_union(
+        selected_zk_auth_main_sidecar_purpose(),
+        main_slices,
+        &main,
+    )
+    .expect("preflighted selected Main VK drift");
+    let DuplexUnion {
+        committed: owner_committed,
+        s0: owner_s0,
+        s_out: owner_s_out,
+        ..
+    } = owner;
+    drop(owner_committed);
+    let DuplexUnion {
+        committed: main_committed,
+        s0: main_s0,
+        s_out: main_s_out,
+        ..
+    } = main;
+    drop(main_committed);
     assert_eq!(wallet_a_slices[0].start(), allocation_ledger.wallet_a);
     assert_eq!(wallet_b_slices[0].start(), allocation_ledger.wallet_b);
     assert_eq!(meta_b_slices[0].start(), allocation_ledger.meta_b);
@@ -4189,25 +4241,29 @@ pub(super) fn allocate_selected_zk_auth_pcs_region(
         es.paired.as_ref(),
     )
     .expect("selected paired Meta preflight made the handoff mandatory");
+    let allocated_updates = geometry.auth_tiles
+        * (geometry.paired_caps_per_block[0] + geometry.paired_caps_per_block[1]);
+    let class_updates = geometry.touched_capacity + geometry.segment_capacity;
+    let consistency_rows_per_update = 7 * PAIRED_UPDATE_DEPTH - 2;
+    let expected_paired_rows = consistency_rows_per_update * allocated_updates
+        + 9 * PAIRED_UPDATE_STRIDE * (allocated_updates - class_updates);
     assert_eq!(
         b.num_wires() - before_paired_closure,
-        200_000,
-        "selected B255 paired copy/overhang ledger"
+        expected_paired_rows,
+        "selected paired copy/overhang ledger"
     );
-    assert_eq!(cell_pins_meta.len(), 28_100, "selected Meta-A pin ledger");
-    assert_eq!(cell_pins_meta_b.len(), 3_072, "selected Meta-B pin ledger");
     let before_statement_pins = b.num_wires();
     pin_stage2_cells(b, &meta_a_slices, &cell_pins_meta);
     pin_stage2_cells(b, &meta_b_slices, &cell_pins_meta_b);
     assert_eq!(
         b.num_wires() - before_statement_pins,
-        31_172,
-        "selected B255 Meta statement-pin ledger"
+        cell_pins_meta.len() + cell_pins_meta_b.len(),
+        "selected Meta statement-pin ledger"
     );
 
     let wallet_a_vk = crate::region_sidecar::WalkARegionVk::new_wallet(
         selected_zk_auth_wallet_a_sidecar_purpose(),
-        SELECTED_ZK_REGION_TX_LOG,
+        geometry.tx_log,
         SELECTED_ZK_REGION_QUERY_LOG,
         wallet_a_slices,
     )
@@ -4215,7 +4271,7 @@ pub(super) fn allocate_selected_zk_auth_pcs_region(
     let capsule_iv = iv_flat_of_tag(TAG_CAPSNODE);
     let wallet_b_vk = crate::region_sidecar::MerkleRegionVk::new(
         selected_zk_auth_wallet_b_sidecar_purpose(),
-        SELECTED_ZK_REGION_WALLET_B_LOG,
+        geometry.wallet_b_w_log,
         wallet_b_slices,
         10,
         vec![
@@ -4236,32 +4292,20 @@ pub(super) fn allocate_selected_zk_auth_pcs_region(
     .expect("preflighted selected wallet-B VK drift");
     let meta_a_vk = crate::region_sidecar::WalkARegionVk::new_meta(
         auth_pcs_meta_a_sidecar_purpose(),
-        SELECTED_ZK_REGION_TX_LOG,
-        Some(13),
-        Some(0),
+        geometry.tx_log,
+        Some(geometry.exact_state_region_log),
+        Some(geometry.spine_cap_log),
         meta_a_slices,
     )
     .expect("preflighted selected Meta-A VK drift");
     let meta_b_vk = crate::region_sidecar::MerkleRegionVk::new(
         auth_pcs_meta_b_sidecar_purpose(),
-        SELECTED_ZK_REGION_META_B_LOG,
+        geometry.meta_b_w_log,
         meta_b_slices,
-        9,
+        geometry.meta_b_block_log,
         meta_b_families,
     )
     .expect("preflighted selected Meta-B VK drift");
-    let owner_vk = crate::region_sidecar::DuplexRegionVk::from_union(
-        selected_zk_auth_owner_sidecar_purpose(),
-        owner_slices,
-        &owner,
-    )
-    .expect("preflighted selected Owner VK drift");
-    let main_vk = crate::region_sidecar::DuplexRegionVk::from_union(
-        selected_zk_auth_main_sidecar_purpose(),
-        main_slices,
-        &main,
-    )
-    .expect("preflighted selected Main VK drift");
     let vk = crate::region_sidecar::BlockRegionSidecarVk::new_selected_zk(
         wallet_a_vk,
         meta_a_vk,
@@ -4277,8 +4321,8 @@ pub(super) fn allocate_selected_zk_auth_pcs_region(
         crate::region_sidecar::RegionWalkEndpoints::new(meta_s0, meta_s_out),
         crate::region_sidecar::RegionWalkEndpoints::new(wallet_b_s0, wallet_b_s_out),
         crate::region_sidecar::RegionWalkEndpoints::new(s0_meta_b, sout_meta_b),
-        crate::region_sidecar::RegionWalkEndpoints::new(owner.s0, owner.s_out),
-        crate::region_sidecar::RegionWalkEndpoints::new(main.s0, main.s_out),
+        crate::region_sidecar::RegionWalkEndpoints::new(owner_s0, owner_s_out),
+        crate::region_sidecar::RegionWalkEndpoints::new(main_s0, main_s_out),
     )
     .expect("preflighted selected prover input drift");
     let draft = crate::region_sidecar::SelectedZkBlockRegionDraft::new(vk, input)
@@ -4344,7 +4388,8 @@ mod selected_zk_common_allocator_tests {
 
     #[test]
     fn selected_b255_column_ledger_is_exact_and_only_initially_aligned() {
-        let ledger = SelectedZkRegionAllocationLedger::new(966_647);
+        let geometry = crate::region_sidecar::selected_zk_block_geometry(255).unwrap();
+        let ledger = SelectedZkRegionAllocationLedger::new(966_647, geometry);
         assert_eq!(ledger.before, 966_647);
         assert_eq!(ledger.wallet_a, 1_048_576);
         assert_eq!(ledger.wallet_b, 4_194_304);
@@ -4415,8 +4460,32 @@ mod selected_zk_common_allocator_tests {
     }
 
     #[test]
+    fn selected_lower_classes_keep_their_own_committed_domains() {
+        for (tier, expected_cells, expected_span, class_m) in [
+            (8usize, 354_304usize, 362_496usize, 22usize),
+            (32, 1_417_216, 1_449_984, 23),
+            (64, 2_244_608, 2_244_608, 23),
+            (255, 7_536_640, 7_536_640, 24),
+        ] {
+            let geometry = crate::region_sidecar::selected_zk_block_geometry(tier).unwrap();
+            let ledger = SelectedZkRegionAllocationLedger::new(0, geometry);
+            let committed_cells = SELECTED_ZK_REGION_WALLET_A_COLUMNS
+                * (1 << geometry.wallet_a_w_log)
+                + SELECTED_ZK_REGION_WALLET_B_COLUMNS * (1 << geometry.wallet_b_w_log)
+                + SELECTED_ZK_REGION_META_B_COLUMNS * (1 << geometry.meta_b_w_log)
+                + SELECTED_ZK_REGION_MAIN_COLUMNS * (1 << geometry.main_w_log)
+                + SELECTED_ZK_REGION_META_A_COLUMNS * (1 << geometry.meta_a_w_log)
+                + SELECTED_ZK_REGION_OWNER_COLUMNS * (1 << geometry.owner_w_log);
+            assert_eq!(committed_cells, expected_cells, "B{tier} committed cells");
+            assert_eq!(ledger.after, expected_span, "B{tier} allocation span");
+            assert!(ledger.after < 1usize << class_m, "B{tier} class domain");
+        }
+    }
+
+    #[test]
     fn selected_b255_planned_slices_form_the_exact_v4_certificate() {
-        let ledger = SelectedZkRegionAllocationLedger::new(966_647);
+        let geometry = crate::region_sidecar::selected_zk_block_geometry(255).unwrap();
+        let ledger = SelectedZkRegionAllocationLedger::new(966_647, geometry);
         let wallet_a = crate::region_sidecar::WalkARegionVk::new_wallet(
             selected_zk_auth_wallet_a_sidecar_purpose(),
             SELECTED_ZK_REGION_TX_LOG,
@@ -4523,10 +4592,11 @@ mod selected_zk_common_allocator_tests {
     #[test]
     fn selected_meta_preflight_rejects_before_any_builder_row() {
         let (txr, spine) = irrelevant_meta_companions();
+        let geometry = crate::region_sidecar::selected_zk_block_geometry(255).unwrap();
         let b = FieldR1csBuilder::new();
         let before = b.num_wires();
         assert_eq!(
-            preflight_selected_zk_meta_inputs(&empty_exact_state(None), &txr, &spine),
+            preflight_selected_zk_meta_inputs(&empty_exact_state(None), &txr, &spine, geometry,),
             Err(SelectedZkAuthPcsRegionAllocationError::MissingPairedExactState)
         );
         assert_eq!(b.num_wires(), before);
@@ -4541,7 +4611,7 @@ mod selected_zk_common_allocator_tests {
             },
         );
         assert_eq!(
-            preflight_selected_zk_meta_inputs(&legacy, &txr, &spine),
+            preflight_selected_zk_meta_inputs(&legacy, &txr, &spine, geometry),
             Err(SelectedZkAuthPcsRegionAllocationError::LegacyExactStatePaths)
         );
         assert_eq!(b.num_wires(), before);

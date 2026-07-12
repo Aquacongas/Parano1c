@@ -16,7 +16,10 @@
 //! 2. First `TxAdmitted` while a coinbase-only no-proof block is being mined
 //! 3. New chain tip from P2P (block received or snapshot applied via `sync_ready`)
 
-use std::collections::HashMap;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex},
+};
 
 use noid_chain::block::Block;
 use noid_chain::block_header::BlockHeader;
@@ -25,9 +28,11 @@ use noid_chain::consensus::pow::block_id;
 use noid_chain::consensus::template::BlockTemplate as ChainTemplate;
 use noid_chain::consensus::AnchorInfo;
 use noid_chain::state::ChainState;
-use noid_chain::storage::{MdbxChainContext, MdbxContextError};
+use noid_chain::storage::{MdbxChainContext, MdbxContextError, MdbxStore};
 use noid_mempool::AsyncMempool;
 use noid_poseidon2b::primitives::Address;
+
+use crate::memory_governor::{ProofMemoryGovernor, ProofMemoryReservation};
 
 /// Why the template was refreshed (carried in `MinerEvent::TemplateRefreshed`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +69,10 @@ pub struct BlockTemplate {
     pub authorization_bytes: Vec<Option<Vec<u8>>>,
     /// Exact authenticated state transition proof for user-transaction blocks.
     pub exact_state_transition: Option<noid_block::ExactStateTransitionProof>,
+    /// Process-wide proof-memory reservation acquired before cached proof bytes
+    /// or exact-state artifacts are cloned into this template. Shared clones
+    /// keep the reservation alive until the blocking prover actually exits.
+    proof_memory_reservation: Option<Arc<Mutex<Option<ProofMemoryReservation>>>>,
 }
 
 impl BlockTemplate {
@@ -87,14 +96,20 @@ impl BlockTemplate {
     pub fn n_user_txs(&self) -> usize {
         self.inner.txs.len()
     }
+
+    /// Consume the one proof-job reservation shared by every clone of this
+    /// immutable template. Exactly one blocking worker can cross this edge.
+    pub(crate) fn take_proof_memory_reservation(&self) -> Option<ProofMemoryReservation> {
+        self.proof_memory_reservation.as_ref()?.lock().ok()?.take()
+    }
 }
 
 /// Immutable chain view used for template construction.
 ///
 /// Capture this under the chain lock, then drop the lock before awaiting mempool
-/// selection or doing proof/template work. `from_context()` preloads evicted
-/// segments before cloning so the scratch state used by block assembly sees the
-/// same slots as the durable chain state.
+/// selection or doing proof/template work. Raw segment columns are deliberately
+/// excluded; selected transaction segments are faulted in from the cloned MDBX
+/// handle only after the memory governor admits the job.
 pub struct TemplateChainSnapshot {
     pub parent: BlockHeader,
     pub prev_active_counts: Vec<u64>,
@@ -102,12 +117,11 @@ pub struct TemplateChainSnapshot {
     pub anchor: AnchorInfo,
     pub state: ChainState,
     user_epoch_anchor: [u8; 32],
+    store: MdbxStore,
 }
 
 impl TemplateChainSnapshot {
     pub fn from_context(ctx: &mut MdbxChainContext) -> Result<Self, MdbxContextError> {
-        ctx.preload_all_evicted_segments()?;
-
         let parent = *ctx.tip_header();
         let anchor_height =
             noid_chain::consensus::tx_epoch_anchor_height_for_child(parent.height + 1);
@@ -123,13 +137,53 @@ impl TemplateChainSnapshot {
             prev_active_counts: ctx.prev_active_counts(),
             prev_timestamps: ctx.prev_timestamps(),
             anchor: ctx.anchor_info(),
-            state: ctx.state.clone(),
+            state: ctx
+                .state
+                .durable_metadata_clone()
+                .ok_or(MdbxContextError::Corrupt(
+                    "template snapshot requested outside durable state boundary",
+                ))?,
             user_epoch_anchor,
+            store: ctx.store.clone(),
         })
     }
 
     pub fn prev_state_root(&self) -> [u8; 32] {
         self.parent.state_root
+    }
+
+    fn hydrate_transaction_segments(
+        &self,
+        state: &mut ChainState,
+        txs: &[noid_tx::Transaction],
+    ) -> Result<(), MdbxContextError> {
+        let effective_log = state.state.effective_log_segment_size();
+        let mut needed = HashSet::new();
+        for tx in txs {
+            for (_, input) in tx.body.live_inputs() {
+                needed.insert((input.slot_index >> effective_log) as u16);
+            }
+            for (_, output) in tx.body.live_outputs() {
+                needed.insert((output.slot_index >> effective_log) as u16);
+            }
+        }
+        for segment_id in needed {
+            if !state.state.is_evicted(segment_id) {
+                continue;
+            }
+            let (_, columns) =
+                self.store
+                    .get_segment(segment_id)?
+                    .ok_or(MdbxContextError::Corrupt(
+                        "template segment is missing from durable state",
+                    ))?;
+            state
+                .restore_evicted_segment(segment_id, columns)
+                .map_err(|_| {
+                    MdbxContextError::Corrupt("template segment exact summary mismatch")
+                })?;
+        }
+        Ok(())
     }
 }
 
@@ -200,8 +254,30 @@ impl TemplateBuilder {
 
         // Select top txs from mempool (coinbase is added separately by the chain template).
         let consensus_max = noid_chain::consensus::params::BLOCK_MAX_USER_TXS;
-        let max_user_txs = max_user_txs.min(consensus_max);
-        let entries = self.mempool.select_for_block(consensus_max).await;
+        let memory_governor = ProofMemoryGovernor::global(0);
+        let max_user_txs = max_user_txs
+            .min(consensus_max)
+            .min(memory_governor.max_user_txs_now());
+        let proof_memory_reservation = match memory_governor.try_reserve_for_user_txs(max_user_txs)
+        {
+            Ok(reservation) => reservation,
+            Err(pressure) => {
+                tracing::warn!(
+                    max_user_txs,
+                    required_mib = pressure.required_mib,
+                    available_mib = pressure.available_mib,
+                    "proof template rejected by process memory governor"
+                );
+                return None;
+            }
+        };
+        // Filter against the captured anchor while entries are still borrowed
+        // under the mempool lock. This preserves the same fee-ordered prefix
+        // but clones only the proof bundles admitted by the runtime budget.
+        let entries = self
+            .mempool
+            .select_for_block_at_anchor(max_user_txs, snapshot.user_epoch_anchor)
+            .await;
         // Single-pass: move authorization bytes and transactions together (no clone).
         let (authorization_bytes, txs): (Vec<Option<Vec<u8>>>, Vec<_>) = entries
             .into_iter()
@@ -223,10 +299,17 @@ impl TemplateBuilder {
                 .map(|(proof, hash)| (hash, proof))
                 .collect();
 
-        let state = &snapshot.state;
+        // Fault in only segments referenced by the admitted transaction set.
+        // The canonical snapshot itself remains metadata-only, so template
+        // construction never clones unrelated UTXO columns.
+        let mut state = snapshot.state.clone();
+        if let Err(error) = snapshot.hydrate_transaction_segments(&mut state, &txs) {
+            tracing::warn!(err = %error, "template touched-segment hydration failed");
+            return None;
+        }
         match build_block_template(
             parent,
-            state,
+            &state,
             prev_active_counts,
             txs,
             miner_address,
@@ -234,6 +317,12 @@ impl TemplateBuilder {
             difficulty_target,
         ) {
             Ok(inner) => {
+                let proof_memory_reservation = if inner.txs.is_empty() {
+                    None
+                } else {
+                    proof_memory_reservation
+                        .map(|reservation| Arc::new(Mutex::new(Some(reservation))))
+                };
                 let exact_state_transition = if inner.txs.is_empty() {
                     None
                 } else {
@@ -242,10 +331,10 @@ impl TemplateBuilder {
                     // template always shares the snapshot state's log_slots
                     // and the action surface builds against the snapshot
                     // directly — no expanded whole-state copy.
-                    if inner.log_slots as usize != snapshot.state.state.log_slots() {
+                    if inner.log_slots as usize != state.state.log_slots() {
                         tracing::warn!(
                             template_log_slots = inner.log_slots,
-                            state_log_slots = snapshot.state.state.log_slots(),
+                            state_log_slots = state.state.log_slots(),
                             "tx-bearing template log_slots diverges from snapshot state"
                         );
                         return None;
@@ -258,10 +347,10 @@ impl TemplateBuilder {
                         .map(noid_tx::compute_claims_commitment)
                         .collect();
                     let surface = match noid_chain::build_exact_action_surface(
-                        &snapshot.state.state,
+                        &state.state,
                         &bodies,
                         &commitments,
-                        snapshot.state.alloc_counter,
+                        state.alloc_counter,
                     ) {
                         Ok(surface) => surface,
                         Err(e) => {
@@ -269,17 +358,23 @@ impl TemplateBuilder {
                             return None;
                         }
                     };
-                    let cache = match snapshot.state.state.exact_sparse_cache() {
-                        Ok(cache) => cache,
+                    let siblings = match state
+                        .exact_frontier_siblings(&surface.touched_indices, inner.log_slots)
+                    {
+                        Ok(siblings) => siblings,
                         Err(e) => {
-                            tracing::warn!(err = %e, "exact parent sparse cache build failed");
+                            tracing::warn!(err = %e, "compact exact frontier build failed");
                             return None;
                         }
                     };
-                    match noid_block::build_exact_state_transition_proof(&cache, &surface) {
+                    match noid_block::build_exact_state_transition_proof_from_siblings(
+                        &surface,
+                        siblings,
+                        inner.log_slots,
+                    ) {
                         Ok(proof) => Some(proof),
-                        Err(e) => {
-                            tracing::warn!(err = ?e, "exact state proof build failed");
+                        Err(error) => {
+                            tracing::warn!(err = ?error, "bounded exact state proof build failed");
                             return None;
                         }
                     }
@@ -298,6 +393,7 @@ impl TemplateBuilder {
                     parent: *parent,
                     authorization_bytes,
                     exact_state_transition,
+                    proof_memory_reservation,
                 })
             }
             Err(e) => {

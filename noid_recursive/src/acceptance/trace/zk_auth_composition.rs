@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Production-disconnected authorization-capsule algebra composition.
+//! Production authorization-capsule algebra composition.
 //!
 //! This is the first fixed-shape wrapper which joins the complete Owner
 //! AuthGKR verifier, the transparent post-claim relation, and Phase A.  It

@@ -3,7 +3,7 @@
 
 //! Full production BlockClass proof gates for the canonical ladder.
 //!
-//! Defaults to B64, the first class whose V3 batched children have unequal
+//! Defaults to B64, the first class whose selected V4 children have unequal
 //! native walk widths. Select a comma-separated subset with
 //! `NOID_BLOCK_CLASS_TIERS=8,32,64,255`. Each class uses its smallest accepted
 //! member (1/9/33/65 user transactions); the tier-capacity relation and
@@ -18,13 +18,11 @@ use bench_prover::{
 use noid_core::mem_profile::{current_mem_snapshot, MemSnapshot};
 use noid_ivc_prover::challenger::FsLaneChallenger;
 use noid_ivc_prover::pcs::{self, PcsParams};
-use noid_ivc_prover::proof::FieldShape;
 use noid_recursive::acceptance::block_class::{
-    build_block_proof_trace, prove_built_block, verify_block_proof, BlockClass,
+    build_selected_zk_block_proof_trace, prove_built_block, verify_block_proof, BlockClass,
+    BuiltBlock,
 };
-use noid_recursive::acceptance::block_slots::BlockSlotsConfig;
-use noid_recursive::acceptance::link::LinkBlock;
-use noid_recursive::acceptance::trace::region_source_binding::RegionDischargeParams;
+use noid_recursive::acceptance::link::SelectedZkBlockInput;
 
 const BLOCK_DOMAIN: &[u8] = b"history-block-v0";
 const K_SKIP: usize = 6;
@@ -88,6 +86,16 @@ fn class_m(tier: usize) -> usize {
     }
 }
 
+fn expected_useful_rows(tier: usize) -> usize {
+    match tier {
+        8 => 814_956,
+        32 => 2_476_136,
+        64 => 4_015_399,
+        255 => 13_058_193,
+        _ => unreachable!("canonical tier"),
+    }
+}
+
 fn tier_floor_user_txs(tier: usize) -> usize {
     match tier {
         8 => 1,
@@ -122,47 +130,53 @@ fn fixture_for(tier: usize) -> AcceptedSingleBlockFixture {
     fixture
 }
 
-fn block_view<'a>(
-    fixture: &'a AcceptedSingleBlockFixture,
-    tier: usize,
-    region_params: RegionDischargeParams,
-) -> LinkBlock<'a> {
-    LinkBlock {
-        start_accumulator: &fixture.start_accumulator,
-        end_accumulator: &fixture.output.accepted_claim_batch.accumulator,
-        inputs: &fixture.output.proof_components.component_inputs,
-        proof: &fixture.component_proof,
-        config: BlockSlotsConfig {
-            discharge_wallet_pcs: true,
-            wallet_pcs_params: region_params,
-            owner_auth_region: true,
-            exact_state_region: true,
-            tx_root_region: true,
-            spine_region: true,
-            tier_user_tx_capacity: Some(tier),
-        },
-    }
+fn freeze_and_build<const TIER: usize>(
+    fixture: &AcceptedSingleBlockFixture,
+    pcs_params: PcsParams,
+) -> (BlockClass, BuiltBlock, Phase, Phase) {
+    let freeze_input = SelectedZkBlockInput::<TIER>::try_new(
+        &fixture.start_accumulator,
+        &fixture.output.accepted_claim_batch.accumulator,
+        &fixture.output.proof_components.component_inputs,
+        &fixture.component_proof,
+        fixture
+            .output
+            .proof_components
+            .selected_authorization_proofs
+            .clone(),
+        noid_gkr::ghost_tx::prove_selected_ghost_authorization()
+            .expect("fresh selected freeze ghost"),
+    )
+    .expect("canonical selected freeze input");
+    let (class, freeze_phase) = timed(|| BlockClass::freeze_selected_zk(pcs_params, freeze_input));
+    let build_input = SelectedZkBlockInput::<TIER>::try_new(
+        &fixture.start_accumulator,
+        &fixture.output.accepted_claim_batch.accumulator,
+        &fixture.output.proof_components.component_inputs,
+        &fixture.component_proof,
+        fixture
+            .output
+            .proof_components
+            .selected_authorization_proofs
+            .clone(),
+        noid_gkr::ghost_tx::prove_selected_ghost_authorization()
+            .expect("fresh selected build ghost"),
+    )
+    .expect("canonical selected build input");
+    let (built, build_phase) = timed(|| build_selected_zk_block_proof_trace(&class, build_input));
+    (class, built, freeze_phase, build_phase)
 }
 
 fn main() {
     let _ = noid_ivc_prover::init_perf_thread_pool();
     let tiers = requested_tiers();
-    let region_params = RegionDischargeParams {
-        nq: noid_fri_binius::capsule::CAPSULE_NUM_QUERIES,
-    };
     println!("PARANOID full BlockClass ladder proof gates {tiers:?}");
-    println!("  mandatory V3 sidecar; structural exact state; no legacy paths");
+    println!("  mandatory selected V4 sidecar; structural exact state; no legacy paths");
     println!("  rayon threads: {}", rayon::current_num_threads());
     std::io::stdout().flush().expect("flush benchmark heading");
 
     for tier in tiers {
         let m = class_m(tier);
-        let shape = FieldShape {
-            m,
-            k_log: m,
-            k_skip: K_SKIP,
-            const_pin: Some(0),
-        };
         let pcs_params = PcsParams {
             m: m + pcs::LOG_PACKING,
             log_inv_rate: LOG_INV_RATE,
@@ -171,11 +185,20 @@ fn main() {
         };
 
         let (fixture, fixture_phase) = timed(|| fixture_for(tier));
-        let block = block_view(&fixture, tier, region_params);
-        let (class, freeze_phase) =
-            timed(|| BlockClass::freeze(shape, pcs_params, region_params, &block, tier));
-        let (built, build_phase) = timed(|| build_block_proof_trace(&class, &block));
+        let (class, built, freeze_phase, build_phase) = match tier {
+            8 => freeze_and_build::<8>(&fixture, pcs_params),
+            32 => freeze_and_build::<32>(&fixture, pcs_params),
+            64 => freeze_and_build::<64>(&fixture, pcs_params),
+            255 => freeze_and_build::<255>(&fixture, pcs_params),
+            _ => unreachable!("canonical tier"),
+        };
         assert_eq!(built.r1cs.m, m);
+        assert_eq!(built.r1cs.k_skip, K_SKIP);
+        assert_eq!(
+            built.r1cs.useful_rows,
+            expected_useful_rows(tier),
+            "B{tier} selected production row snapshot drift"
+        );
         assert!(built.r1cs.useful_rows <= 1usize << m);
         let ((), satisfy_phase) = timed(|| {
             assert!(built.r1cs.satisfies(&built.witness), "B{tier} relation");

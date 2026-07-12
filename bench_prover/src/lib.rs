@@ -18,11 +18,12 @@ use noid_chain::sparse_merkle::reconstruct_root;
 use noid_chain::state::ChainState;
 use noid_chain::{Block, BlockHeader, SlotValue};
 use noid_core::Block128;
+use noid_gkr::zk_authorization::ZkAuthorizationProof;
 use noid_gkr::{
     owner_auth_gkr_channel, owner_auth_trace_inputs_from_body_and_secret,
-    prove_owner_auth_killshot, spine_inputs_from_body, verify_owner_auth_killshot,
-    OwnerAuthCircuit, OwnerAuthInputs, OwnerAuthProofKillShot, OwnerAuthPublicInputs, SpineInputs,
-    WalletAuthorizationBundle,
+    prove_owner_auth_killshot, prove_wallet_authorization, spine_inputs_from_body,
+    verify_wallet_authorization_proof, OwnerAuthCircuit, OwnerAuthInputs, OwnerAuthProofKillShot,
+    OwnerAuthPublicInputs, OwnerAuthWitness, SpineInputs, WalletAuthorizationBundle,
 };
 use noid_poseidon2b::primitives::{derive_address, Address, SpendSecret, TxBodyHash};
 use noid_tx::{output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS};
@@ -51,13 +52,13 @@ pub struct TxFixture {
 #[derive(Clone)]
 pub struct MinimalTxFixture {
     pub scenario: BenchScenario,
-    pub auth_proof: OwnerAuthProofKillShot,
+    pub auth_proof: ZkAuthorizationProof,
 }
 
 pub struct WalletBench {
     pub prove_time: Duration,
     pub verify_time: Duration,
-    pub proof: OwnerAuthProofKillShot,
+    pub proof: ZkAuthorizationProof,
 }
 
 pub struct FullBlockProofBench {
@@ -495,25 +496,35 @@ pub fn tx_fixture(scenario: BenchScenario) -> TxFixture {
 }
 
 pub fn minimal_tx_fixture(scenario: BenchScenario) -> MinimalTxFixture {
-    let fixture = tx_fixture(scenario);
+    let proof = prove_wallet_authorization(
+        &scenario.body,
+        OwnerAuthWitness::new(SpendSecret(scenario.spend_secret.0)),
+    )
+    .expect("selected witness-hiding authorization")
+    .proof;
     MinimalTxFixture {
-        scenario: fixture.scenario,
-        auth_proof: fixture.auth_proof,
+        scenario,
+        auth_proof: proof,
     }
 }
 
 pub fn prove_wallet(fixture: &TxFixture, samples: usize) -> WalletBench {
-    let circuit = OwnerAuthCircuit::build();
     let prove_time = time_median(samples, || {
-        let mut channel = owner_auth_gkr_channel();
-        let _ = prove_owner_auth_killshot(&circuit, &fixture.auth_inputs, &mut channel);
+        prove_wallet_authorization(
+            &fixture.scenario.body,
+            OwnerAuthWitness::new(SpendSecret(fixture.scenario.spend_secret.0)),
+        )
+        .expect("prove selected wallet authorization");
     });
-    let mut channel = owner_auth_gkr_channel();
-    let (proof, _) = prove_owner_auth_killshot(&circuit, &fixture.auth_inputs, &mut channel);
+    let proof = prove_wallet_authorization(
+        &fixture.scenario.body,
+        OwnerAuthWitness::new(SpendSecret(fixture.scenario.spend_secret.0)),
+    )
+    .expect("prove selected wallet authorization")
+    .proof;
     let verify_time = time_median(samples, || {
-        let mut channel = owner_auth_gkr_channel();
-        verify_owner_auth_killshot(&proof, &circuit, &fixture.auth_public, &mut channel)
-            .expect("verify fixed owner authorization");
+        verify_wallet_authorization_proof(&fixture.scenario.body, &proof)
+            .expect("verify selected wallet authorization");
     });
     WalletBench {
         prove_time,
@@ -522,16 +533,19 @@ pub fn prove_wallet(fixture: &TxFixture, samples: usize) -> WalletBench {
     }
 }
 
-pub fn authorization_size(proof: &OwnerAuthProofKillShot) -> usize {
-    proof.byte_len()
+pub fn authorization_size(proof: &ZkAuthorizationProof) -> usize {
+    proof
+        .to_bytes()
+        .expect("encode selected authorization")
+        .len()
 }
 
-pub fn wallet_bundle_size(proof: &OwnerAuthProofKillShot) -> usize {
+pub fn wallet_bundle_size(proof: &ZkAuthorizationProof) -> usize {
     WalletAuthorizationBundle {
         proof: proof.clone(),
     }
     .to_bytes()
-    .expect("serialize fixed authorization")
+    .expect("encode selected wallet bundle")
     .len()
 }
 
@@ -677,7 +691,7 @@ fn bench_block_from_parts(
 fn prove_full_block_from_fixtures(
     pre_state: ChainState,
     user_bodies: Vec<TxBody>,
-    tx_auth: Vec<OwnerAuthProofKillShot>,
+    tx_auth: Vec<ZkAuthorizationProof>,
 ) -> (
     BlockProof,
     Block,
@@ -998,7 +1012,8 @@ fn accepted_user_block_seed(mut scenarios: Vec<BenchScenario>) -> AcceptedBlockS
             block,
             block_proof_bytes: bincode::serialize(&block_proof)
                 .expect("accepted fixture block proof bytes"),
-            block_auth_sidecar_bytes: bincode::serialize(&sidecar)
+            block_auth_sidecar_bytes: sidecar
+                .to_bytes()
                 .expect("accepted fixture auth sidecar bytes"),
         }],
     };
@@ -1521,7 +1536,8 @@ fn accepted_sequential_chain_fixture(
             (
                 bincode::serialize(&block_proof)
                     .expect("sequential fixture detached block proof bytes"),
-                bincode::serialize(&sidecar)
+                sidecar
+                    .to_bytes()
                     .expect("sequential fixture authorization sidecar bytes"),
             )
         };

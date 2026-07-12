@@ -13,8 +13,8 @@
 //! `WalletAuthorizationBundle` — the wallet's owner-batched auth proof artifact
 //! submitted to the local mempool via `submitTxIntent`. The bundle is
 //! forwarded from the mempool to the block prover inside the daemon.
-//! AuthGKR witness tables remain wallet-local; the bundle carries one
-//! self-contained owner-auth KillShot proof capsule.
+//! Secret-bearing Poseidon state remains wallet-local; the bundle carries one
+//! self-contained witness-hiding selected authorization capsule.
 //!
 //! # SpendSecret handling
 //!
@@ -34,7 +34,7 @@ pub enum ProveError {
 
 /// Prove wallet authorization for a transaction inside the daemon.
 ///
-/// This produces only the AuthGKR Kill-Shot authorization bundle. Public
+/// This produces only the selected witness-hiding authorization bundle. Public
 /// transaction arithmetic is checked exactly before proving, and the canonical
 /// block prover rebuilds the public AIR from `TxBody` at inclusion time.
 pub fn prove_tx(

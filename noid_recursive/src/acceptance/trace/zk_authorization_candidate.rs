@@ -1,18 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Selected-ZK authorization trace and private B255 measurement bridge over
+//! Selected-ZK authorization trace and private production B255 bridge over
 //! transcript and Wallet-B aliases.
 //!
-//! This module does not expose a production authorization entry point.  Its
-//! raw-slice tile adapter is private.  Shape-compatible [`WitnessSlice`]
+//! Its raw-slice tile adapter is private.  Shape-compatible [`WitnessSlice`]
 //! values alone do not establish canonical sidecar provenance, and a
-//! per-tile call cannot establish complete block coverage.  Under the
-//! non-default measurement feature, the private BlockSlots backend owns the
+//! per-tile call cannot establish complete block coverage.  The private
+//! production BlockSlots backend owns the
 //! canonical statement aliases and consumes unverified proofs through one
-//! policy -> raw Owner/Main/Wallet -> common Meta allocator -> all-256-tiles
+//! policy -> raw Owner/Main/Wallet -> common Meta allocator -> all-class-tiles
 //! bridge.  It returns only an opaque bound region and paired handoff.  The
-//! feature-gated Block facade retains the sole builder through all Block and
+//! owning Block facade retains the sole builder through all Block and
 //! public-IO rows, calls `build`/`build_witness_only`, and only then consumes
 //! that binding through the sealed preparation finalizer.
 //!
@@ -50,10 +49,8 @@ use noid_ivc_core::deep_chain::capsule_leaf::{
 use noid_ivc_core::deep_chain::schedule::DuplexLayout;
 use noid_ivc_core::public_io::WitnessSlice;
 
-#[cfg(any(test, feature = "selected-zk-measurement"))]
 use super::exact_state::ExactStateRegionData;
 use super::region_source_binding::slot_cell;
-#[cfg(any(test, feature = "selected-zk-measurement"))]
 use super::region_source_binding::{
     allocate_selected_zk_auth_pcs_region, PairedExactStateCells, SpineRegionData, TxRootRegionData,
 };
@@ -88,15 +85,13 @@ use super::zk_split_bridge::{
     pin_zk_auth_split_bridge_at, ZkAuthSplitBridgeCells, ZK_AUTH_SPLIT_BRIDGE_PIN_ROWS,
 };
 use super::{const_block, flat_of, mul, pin_eq, FieldR1csBuilder, LinExpr, F128};
-#[cfg(any(test, feature = "selected-zk-measurement"))]
 use crate::acceptance::block_class::SelectedBlockAssemblyFinalizationSeal;
 use crate::acceptance::block_slots::{
     CanonicalSelectedZkAuthorizationCapability, CanonicalSelectedZkAuthorizationSlotKind,
 };
 use crate::acceptance::zk_auth_capsule_schedule::{ZK_AUTH_MAIN_TILE_LOG, ZK_AUTH_OWNER_TILE_LOG};
-#[cfg(any(test, feature = "selected-zk-measurement"))]
+use crate::region_sidecar::SelectedZkBlockRegionDraft;
 use crate::region_sidecar::{BlockRegionPreparation, RegionSidecarError};
-use crate::region_sidecar::{SelectedZkBlockRegionDraft, SELECTED_ZK_AUTH_TILE_COUNT};
 
 /// Exact incremental ledger after all transcript and Wallet-B aliases exist.
 /// The four split-bridge pins are intentionally not included.
@@ -483,9 +478,15 @@ impl SelectedZkAuthorizationProofPolicy {
         real_proofs: Vec<ZkAuthorizationProof>,
         ghost_proof: ZkAuthorizationProof,
     ) -> Result<SelectedZkAuthorizationProofBatch, SelectedZkAuthorizationProofPolicyError> {
-        if canonical.len() != SELECTED_ZK_AUTH_TILE_COUNT {
+        let geometry =
+            crate::region_sidecar::selected_zk_block_geometry_for_auth_tiles(canonical.len())
+                .ok_or(SelectedZkAuthorizationProofPolicyError::SlotCount {
+                    expected: canonical.len().next_power_of_two(),
+                    actual: canonical.len(),
+                })?;
+        if canonical.len() != geometry.auth_tiles {
             return Err(SelectedZkAuthorizationProofPolicyError::SlotCount {
-                expected: SELECTED_ZK_AUTH_TILE_COUNT,
+                expected: geometry.auth_tiles,
                 actual: canonical.len(),
             });
         }
@@ -498,11 +499,13 @@ impl SelectedZkAuthorizationProofPolicy {
         }
 
         let ghost_statement = canonical_selected_zk_ghost_statement();
-        assert_eq!(
-            canonical.slot(canonical.len() - 1).native_statement(),
-            ghost_statement,
-            "PAD255 statement is not the canonical ghost constant"
-        );
+        if geometry.tier == noid_chain::consensus::params::BLOCK_MAX_USER_TXS {
+            assert_eq!(
+                canonical.slot(canonical.len() - 1).native_statement(),
+                ghost_statement,
+                "PAD255 statement is not the canonical ghost constant"
+            );
+        }
         for index in 0..canonical.len() {
             let slot = canonical.slot(index);
             assert_eq!(
@@ -535,7 +538,7 @@ impl SelectedZkAuthorizationProofPolicy {
                 selected_zk_authorization_artifact_identity(&proof).map_err(|source| {
                     SelectedZkAuthorizationProofPolicyError::WireEncoding { index, source }
                 })?;
-            live_identities.push(identity.clone());
+            live_identities.push(identity);
             live_entries.push(SelectedZkAuthorizationVerifiedEntry {
                 statement,
                 proof,
@@ -562,17 +565,15 @@ impl SelectedZkAuthorizationProofPolicy {
     }
 }
 
-/// Owned, still-unverified inputs for the private selected-B255 measurement
+/// Owned, still-unverified inputs for the private selected-B255 production
 /// backend.  Keeping the fields private prevents callers from pairing a
 /// pre-verified batch (and therefore a capability minted by some other
 /// builder) with the current Block assembly.
-#[cfg(any(test, feature = "selected-zk-measurement"))]
 pub(in crate::acceptance) struct SelectedZkAuthorizationProofBundle {
     live: Vec<ZkAuthorizationProof>,
     ghost: ZkAuthorizationProof,
 }
 
-#[cfg(any(test, feature = "selected-zk-measurement"))]
 impl SelectedZkAuthorizationProofBundle {
     pub(in crate::acceptance) fn new(
         live: Vec<ZkAuthorizationProof>,
@@ -585,21 +586,20 @@ impl SelectedZkAuthorizationProofBundle {
 /// Opaque result of the one private proof-policy -> raw authorization ->
 /// common authorization/Meta allocator -> all-tiles binding boundary.  The
 /// draft never escapes this module; BlockSlots may only borrow the paired
-/// exact-state cells needed by its common continuation.  The feature-gated
-/// Block facade carries this value through its IO pins and final builder build
+/// exact-state cells needed by its common continuation.  The owning Block
+/// facade carries this value through its IO pins and final builder build
 /// before consuming `finalize_after_block_build`.
-#[cfg(any(test, feature = "selected-zk-measurement"))]
 pub(in crate::acceptance) struct SelectedZkBlockRegionBinding {
     draft: SelectedZkBlockRegionDraft,
     paired: PairedExactStateCells,
 }
 
-#[cfg(any(test, feature = "selected-zk-measurement"))]
 impl SelectedZkBlockRegionBinding {
     pub(in crate::acceptance) fn paired(&self) -> &PairedExactStateCells {
         &self.paired
     }
 
+    #[cfg(feature = "selected-zk-measurement")]
     pub(in crate::acceptance) fn vk(&self) -> &crate::region_sidecar::BlockRegionSidecarVk {
         self.draft.vk()
     }
@@ -619,10 +619,9 @@ impl SelectedZkBlockRegionBinding {
 
 /// Consume every selected authorization input while the caller still borrows
 /// the sole Block builder.  Capability verification, raw-column derivation,
-/// common six-child allocation and all 256 statement bindings are atomic from
+/// common six-child allocation and all class statement bindings are atomic from
 /// BlockSlots' point of view: no raw draft, canonical capability, transferable
 /// finalization seal, or partially bound sidecar is returned.
-#[cfg(any(test, feature = "selected-zk-measurement"))]
 pub(in crate::acceptance) fn bind_selected_zk_block_region(
     b: &mut FieldR1csBuilder,
     canonical: CanonicalSelectedZkAuthorizationCapability,
@@ -633,23 +632,23 @@ pub(in crate::acceptance) fn bind_selected_zk_block_region(
 ) -> SelectedZkBlockRegionBinding {
     let SelectedZkAuthorizationProofBundle { live, ghost } = proofs;
     let batch = SelectedZkAuthorizationProofPolicy::verify_and_expand(canonical, live, ghost)
-        .expect("selected B255 proof-policy preflight");
+        .expect("selected proof-policy preflight");
     let (canonical, authorization) = batch
         .into_canonical_and_raw_draft()
-        .expect("selected B255 raw authorization draft");
+        .expect("selected raw authorization draft");
     let allocation =
         allocate_selected_zk_auth_pcs_region(b, authorization, exact_state, tx_root, spine)
-            .expect("selected B255 authorization/Meta allocation");
+            .expect("selected authorization/Meta allocation");
     bind_selected_zk_authorization_all_tiles_trace(b, allocation.draft(), &canonical)
-        .expect("selected B255 all-tiles binding");
+        .expect("selected all-tiles binding");
     let (draft, paired) = allocation.into_parts();
     SelectedZkBlockRegionBinding { draft, paired }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ZkAuthorizationAllTilesTraceError {
-    /// Every selected B255 class has exactly 256 authorization slots,
-    /// including the canonical dead PAD at index 255.
+    /// Every selected class has exactly its canonical dyadic authorization
+    /// capacity; B255 alone includes the dead PAD at index 255.
     StatementCount { expected: usize, actual: usize },
     Tile {
         index: usize,
@@ -659,11 +658,12 @@ enum ZkAuthorizationAllTilesTraceError {
 
 fn visit_all_selected_zk_authorization_tiles<T, E>(
     statements: &[T],
+    expected: usize,
     mut visit: impl FnMut(usize, &T) -> Result<(), E>,
 ) -> Result<(), ZkAuthorizationBatchVisitError<E>> {
-    if statements.len() != SELECTED_ZK_AUTH_TILE_COUNT {
+    if statements.len() != expected {
         return Err(ZkAuthorizationBatchVisitError::StatementCount {
-            expected: SELECTED_ZK_AUTH_TILE_COUNT,
+            expected,
             actual: statements.len(),
         });
     }
@@ -683,10 +683,11 @@ enum ZkAuthorizationBatchVisitError<E> {
 fn preflight_then_visit_all_selected_zk_authorization_tiles<T, E, C>(
     context: &mut C,
     statements: &[T],
+    expected: usize,
     mut preflight: impl FnMut(&C, usize, &T) -> Result<(), E>,
     mut visit: impl FnMut(&mut C, usize, &T),
 ) -> Result<(), ZkAuthorizationBatchVisitError<E>> {
-    visit_all_selected_zk_authorization_tiles(statements, |index, statement| {
+    visit_all_selected_zk_authorization_tiles(statements, expected, |index, statement| {
         preflight(context, index, statement)
     })?;
     for (index, statement) in statements.iter().enumerate() {
@@ -723,7 +724,7 @@ fn materialize_selected_zk_authorization_statements(
             if let Some((tx_body_hash, expected_address)) = slot.body_aliases() {
                 return selected_zk_statement_from_body_aliases(tx_body_hash, expected_address);
             }
-            assert_eq!(index + 1, SELECTED_ZK_AUTH_TILE_COUNT);
+            assert_eq!(index + 1, canonical.len());
             assert_eq!(
                 slot.kind(),
                 CanonicalSelectedZkAuthorizationSlotKind::Pad255
@@ -751,9 +752,16 @@ fn bind_selected_zk_authorization_all_tiles_trace(
     draft: &SelectedZkBlockRegionDraft,
     canonical: &CanonicalSelectedZkAuthorizationCapability,
 ) -> Result<(), ZkAuthorizationAllTilesTraceError> {
-    if canonical.len() != SELECTED_ZK_AUTH_TILE_COUNT {
+    let geometry = crate::region_sidecar::selected_zk_block_geometry_for_auth_tiles(
+        canonical.len(),
+    )
+    .ok_or(ZkAuthorizationAllTilesTraceError::StatementCount {
+        expected: canonical.len().next_power_of_two(),
+        actual: canonical.len(),
+    })?;
+    if canonical.len() != geometry.auth_tiles {
         return Err(ZkAuthorizationAllTilesTraceError::StatementCount {
-            expected: SELECTED_ZK_AUTH_TILE_COUNT,
+            expected: geometry.auth_tiles,
             actual: canonical.len(),
         });
     }
@@ -777,12 +785,12 @@ fn bind_selected_zk_authorization_all_tiles_trace(
     let wallet_b = *vk.wallet_b().slices();
 
     let ghost_statement = canonical_selected_zk_ghost_statement();
-    assert_eq!(
-        canonical
-            .slot(SELECTED_ZK_AUTH_TILE_COUNT - 1)
-            .native_statement(),
-        ghost_statement
-    );
+    if geometry.tier == noid_chain::consensus::params::BLOCK_MAX_USER_TXS {
+        assert_eq!(
+            canonical.slot(geometry.auth_tiles - 1).native_statement(),
+            ghost_statement
+        );
+    }
     let fallback = canonical
         .slot(0)
         .body_aliases()
@@ -817,7 +825,8 @@ fn bind_selected_zk_authorization_all_tiles_trace(
                     assert_eq!(slot.native_statement(), ghost_statement);
                 }
                 CanonicalSelectedZkAuthorizationSlotKind::Pad255 => {
-                    assert_eq!(index + 1, SELECTED_ZK_AUTH_TILE_COUNT);
+                    assert_eq!(geometry.tier, 255);
+                    assert_eq!(index + 1, geometry.auth_tiles);
                     assert_eq!(live, F128::ZERO);
                     assert!(slot.body_aliases().is_none());
                     assert_eq!(slot.native_statement(), ghost_statement);
@@ -833,6 +842,7 @@ fn bind_selected_zk_authorization_all_tiles_trace(
     preflight_then_visit_all_selected_zk_authorization_tiles(
         b,
         &preview,
+        geometry.auth_tiles,
         |b, tile_index, statement| {
             preflight_zk_authorization_raw_slice_tile_candidate_trace(
                 b,
@@ -1732,6 +1742,8 @@ fn verify_zk_authorization_raw_slice_tile_candidate_trace(
 
 #[cfg(test)]
 mod tests {
+    const SELECTED_ZK_AUTH_TILE_COUNT: usize = 256;
+
     use noid_core::mle::evaluate::evaluate_slice;
     use noid_core::mle::fold::fold_variable_inplace;
     use noid_core::{Block128, TowerField};
@@ -1768,7 +1780,10 @@ mod tests {
         ZK_PHASE_B_MID_CAP_NODES, ZK_PHASE_B_SOURCE_CAP_NODES,
     };
     use super::*;
-    use crate::acceptance::block_slots::canonical_selected_zk_authorization_fixture;
+    use crate::acceptance::block_slots::{
+        canonical_selected_zk_authorization_fixture,
+        canonical_selected_zk_authorization_fixture_for_tier,
+    };
     use crate::acceptance::zk_auth_capsule_schedule::ZkAuthCapsuleDuplexSchedules;
 
     #[derive(Clone)]
@@ -2839,6 +2854,7 @@ mod tests {
         preflight_then_visit_all_selected_zk_authorization_tiles(
             &mut visited,
             &statements,
+            SELECTED_ZK_AUTH_TILE_COUNT,
             |_visited, index, statement| {
                 assert_eq!(index, *statement);
                 Ok::<(), ()>(())
@@ -2855,6 +2871,7 @@ mod tests {
         let error = preflight_then_visit_all_selected_zk_authorization_tiles(
             &mut omitted,
             &statements[..SELECTED_ZK_AUTH_TILE_COUNT - 1],
+            SELECTED_ZK_AUTH_TILE_COUNT,
             |_visited, _, _| Ok::<(), ()>(()),
             |visited, index, _| visited.push(index),
         )
@@ -2871,6 +2888,23 @@ mod tests {
     }
 
     #[test]
+    fn selected_four_class_all_tiles_row_ledger_is_exact() {
+        for (tier, expected_rows) in [
+            (8usize, 97_928usize),
+            (32, 391_712),
+            (64, 783_424),
+            (255, 3_133_696),
+        ] {
+            let geometry = crate::region_sidecar::selected_zk_block_geometry(tier).unwrap();
+            assert_eq!(
+                geometry.auth_tiles * ZK_AUTH_RAW_SLICE_TILE_TRACE_ROWS,
+                expected_rows,
+                "B{tier} selected all-tiles rows"
+            );
+        }
+    }
+
+    #[test]
     fn bad_middle_and_last_statement_fail_atomically_before_append() {
         let statements = (0..SELECTED_ZK_AUTH_TILE_COUNT).collect::<Vec<_>>();
         for bad_index in [
@@ -2881,6 +2915,7 @@ mod tests {
             let error = preflight_then_visit_all_selected_zk_authorization_tiles(
                 &mut appended,
                 &statements,
+                SELECTED_ZK_AUTH_TILE_COUNT,
                 |_appended, index, _| (index != bad_index).then_some(()).ok_or(index),
                 |appended, _, _| *appended += 1,
             )
@@ -3081,6 +3116,46 @@ mod tests {
     }
 
     #[test]
+    fn native_policy_live0_reconstructs_each_lower_class_without_b255_padding() {
+        let ghost = selected_ghost_proof();
+        for (tier, expected_cells) in [(8usize, 190_464usize), (32, 761_856), (64, 1_523_712)] {
+            let geometry = crate::region_sidecar::selected_zk_block_geometry(tier).unwrap();
+            let (_builder, capability) =
+                canonical_selected_zk_authorization_fixture_for_tier(tier, 0);
+            let batch = SelectedZkAuthorizationProofPolicy::verify_and_expand(
+                capability,
+                vec![],
+                ghost.clone(),
+            )
+            .expect("one canonical ghost artifact verifies lower class");
+            let ghost_entry = batch.entry_for_slot(0);
+            for index in 0..geometry.auth_tiles {
+                assert!(std::ptr::eq(ghost_entry, batch.entry_for_slot(index)));
+            }
+            let (canonical, raw) = batch
+                .into_canonical_and_raw_draft()
+                .expect("lower class raw selected region");
+            assert_eq!(canonical.len(), geometry.auth_tiles);
+            assert!((0..canonical.len()).all(|index| {
+                canonical.slot(index).kind() != CanonicalSelectedZkAuthorizationSlotKind::Pad255
+            }));
+            assert_eq!(raw.committed_cells(), expected_cells);
+            assert_eq!(raw.owner().w_log, geometry.owner_w_log);
+            assert_eq!(raw.main().w_log, geometry.main_w_log);
+            assert!(raw
+                .wallet_a()
+                .committed()
+                .iter()
+                .all(|column| column.len() == 1 << geometry.wallet_a_w_log));
+            assert!(raw
+                .wallet_b()
+                .committed()
+                .iter()
+                .all(|column| column.len() == 1 << geometry.wallet_b_w_log));
+        }
+    }
+
+    #[test]
     fn pad255_hash_and_address_are_four_constant_materialized_wires() {
         let (mut b, capability) = canonical_selected_zk_authorization_fixture(0);
         let before = b.num_wires();
@@ -3190,12 +3265,12 @@ mod tests {
 
         let outer = include_str!("../block_class.rs");
         let full = outer
-            .split("pub fn build_selected_zk_b255_measurement_full")
+            .split("fn build_selected_zk_trace_parts")
             .nth(1)
-            .expect("full selected measurement facade")
+            .expect("selected production trace builder")
             .split("pub fn build_selected_zk_b255_measurement_witness_only")
             .next()
-            .expect("full selected facade body");
+            .expect("selected production trace-builder body");
         let full_build = full.find("builder.build()").expect("full matrix build");
         let full_seal = full
             .find("SelectedBlockAssemblyFinalizationSeal(())")

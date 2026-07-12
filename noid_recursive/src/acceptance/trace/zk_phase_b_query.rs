@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Production-disconnected recursive algebra for one selected capsule
-//! Phase-B query.
+//! Production recursive algebra for one selected capsule Phase-B query.
 //!
 //! The caller supplies one already transcript-bound, LSB-first source query
 //! `q0..q12` and the three authenticated openings belonging to it:
@@ -31,10 +30,8 @@
 //! total                              84
 //! ```
 //!
-//! This module remains disconnected from the active acceptance region and
-//! wire format.  It fixes the arithmetic unit that the capsule region can
-//! instantiate once per query without making its matrix depend on query
-//! values or proof contents.
+//! The selected capsule region instantiates this arithmetic unit once per
+//! query without making its matrix depend on query values or proof contents.
 
 use std::sync::OnceLock;
 
