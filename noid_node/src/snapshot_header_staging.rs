@@ -18,7 +18,9 @@ use std::path::{Path, PathBuf};
 
 use noid_chain::block_header::BlockHeader;
 use noid_chain::consensus::header::validate_header_timeless;
-use noid_chain::consensus::params::{EXPANSION_WINDOW, MEDIAN_TIME_BLOCKS, TX_EPOCH_BLOCKS};
+use noid_chain::consensus::params::{
+    EPOCH_LENGTH, EXPANSION_WINDOW, MEDIAN_TIME_BLOCKS, TX_EPOCH_BLOCKS,
+};
 use noid_chain::consensus::{add_work, asert_anchor_height, block_work};
 use noid_chain::storage::MdbxStore;
 use noid_chain::wire::BLOCK_HEADER_WIRE_SIZE;
@@ -195,6 +197,22 @@ impl SnapshotHeaderStaging {
             });
         }
 
+        Self::create_file(path, base)
+    }
+
+    /// Create an empty candidate at an already-canonical exact target. This
+    /// keeps zero-missing-header syncs on the same terminal-verification
+    /// typestate path without pretending that the target's child is missing.
+    pub fn create_at_canonical_boundary(
+        path: &Path,
+        store: &MdbxStore,
+        base: CanonicalHeaderBoundary,
+    ) -> Result<Self> {
+        base.validate_against(store)?;
+        Self::create_file(path, base)
+    }
+
+    fn create_file(path: &Path, base: CanonicalHeaderBoundary) -> Result<Self> {
         let mut file = secure_create_new(path)?;
         write_file_header(&mut file, &base)?;
         file.sync_all()?;
@@ -250,6 +268,10 @@ impl SnapshotHeaderStaging {
 
     pub fn base(&self) -> CanonicalHeaderBoundary {
         self.base
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     pub fn staged_len(&self) -> u64 {
@@ -558,6 +580,10 @@ impl VerifiedSnapshotHeaderStaging {
         self.boundary
     }
 
+    pub fn path(&self) -> &Path {
+        self.staging.path()
+    }
+
     /// Promote the authenticated suffix with a full read-only conflict pass
     /// before the first write.  Each subsequent MDBX write is independently
     /// linked and exact-work checked, so a crash leaves only an authenticated
@@ -723,6 +749,7 @@ fn consensus_window_len() -> usize {
     usize::try_from(EXPANSION_WINDOW)
         .unwrap_or(usize::MAX)
         .max(MEDIAN_TIME_BLOCKS)
+        .max(usize::try_from(EPOCH_LENGTH).unwrap_or(usize::MAX))
         .max(1)
 }
 
@@ -1009,6 +1036,37 @@ mod tests {
         ));
         assert!(store.get_header(1).unwrap().is_none());
         assert!(store.get_chain_work(1).unwrap().is_none());
+    }
+
+    #[test]
+    fn empty_exact_target_uses_typestate_even_with_canonical_child() {
+        let db = tempfile::tempdir().unwrap();
+        let stage_dir = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(db.path()).unwrap();
+        let genesis_base = canonical_base(&store);
+        let child = fixture_chain()[1];
+        let child_work = add_work(
+            &genesis_base.cumulative_chainwork,
+            &block_work(&child.difficulty_target),
+        );
+        store
+            .put_verified_header_only(&child, &hash_block_header(&child), &child_work)
+            .unwrap();
+
+        let ordinary =
+            SnapshotHeaderStaging::create(&stage_dir.path().join("ordinary"), &store, genesis_base);
+        assert!(matches!(
+            ordinary,
+            Err(SnapshotHeaderStagingError::CanonicalConflict { height: 1, .. })
+        ));
+        let exact = SnapshotHeaderStaging::create_at_canonical_boundary(
+            &stage_dir.path().join("exact"),
+            &store,
+            genesis_base,
+        )
+        .unwrap();
+        assert_eq!(exact.staged_len(), 0);
+        assert_eq!(exact.next_height().unwrap(), 1);
     }
 
     #[test]
