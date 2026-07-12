@@ -200,4 +200,64 @@ mod production_auth_hard_cut_tests {
             "retired standalone owner-auth PCS source was restored"
         );
     }
+
+    #[test]
+    fn selected_wallet_secret_surface_stays_opaque_and_errors_stay_redacted() {
+        let wallet = include_str!("wallet_authorization.rs");
+        let ghost = include_str!("ghost_tx.rs");
+
+        assert!(wallet.contains("spend_secret: SpendSecret"));
+        assert!(!wallet.contains("pub spend_secret: SpendSecret"));
+        assert!(!wallet.contains("pub fn spend_secret("));
+        let prove_error = wallet
+            .split("pub enum ProveAuthorizationError")
+            .nth(1)
+            .expect("prover error declaration")
+            .split("impl From<PublicLogicError> for ProveAuthorizationError")
+            .next()
+            .expect("prover error declaration boundary");
+        assert!(!prove_error.contains("Proof(String)"));
+        assert!(!wallet.contains("ProveAuthorizationError::Proof(format!"));
+        assert_eq!(
+            wallet.matches("with_exposed_prover_fields").count(),
+            1,
+            "only the reviewed wallet-to-GKR closure may expose secret limbs"
+        );
+
+        // The ghost authority is a public padding constant, not wallet
+        // material. Keep this exclusion explicit rather than weakening the
+        // live-secret gates above.
+        assert!(ghost.contains("DELIBERATELY PUBLIC"));
+        assert!(ghost.contains("PARANOID-GHOST-TX-SPEND-SECRET.0"));
+
+        let authorization = include_str!("zk_authorization.rs");
+        let state = include_str!("zk_auth_capsule.rs");
+        assert!(!authorization.contains("pub fn prove_zk_authorization_from_state("));
+        assert!(authorization.contains("pub fn prove_zk_authorization_from_state_table("));
+        let state_owner = state
+            .split("impl ZkAuthCapsuleStateTable")
+            .nth(1)
+            .expect("state owner implementation")
+            .split("/// Natural low-to-high state address")
+            .next()
+            .expect("state owner implementation boundary");
+        assert!(!state_owner.contains("pub fn cells(&self)"));
+        assert!(state_owner.contains("pub(crate) fn cells(&self)"));
+    }
+
+    #[test]
+    fn secret_bearing_zk_owners_are_noncloneable_nonformattable_and_nonserializable() {
+        static_assertions::assert_not_impl_any!(
+            crate::OwnerAuthWitness:
+                Copy, Clone, std::fmt::Debug, serde::Serialize, serde::de::DeserializeOwned
+        );
+        static_assertions::assert_not_impl_any!(
+            crate::zk_auth_capsule::ZkAuthCapsuleStateTable:
+                Copy, Clone, std::fmt::Debug, serde::Serialize, serde::de::DeserializeOwned
+        );
+        static_assertions::assert_not_impl_any!(
+            crate::layers::PermLayerWitness:
+                Copy, Clone, std::fmt::Debug, serde::Serialize, serde::de::DeserializeOwned
+        );
+    }
 }

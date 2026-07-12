@@ -229,8 +229,17 @@ impl ZkAuthCapsuleStateTable {
         Ok(Self { cells })
     }
 
-    pub fn cells(&self) -> &[Block128; ZK_AUTH_CAPSULE_STATE_LEN] {
+    pub(crate) fn cells(&self) -> &[Block128; ZK_AUTH_CAPSULE_STATE_LEN] {
         &self.cells
+    }
+
+    /// Fixed public geometry without exposing any state cell.
+    pub const fn len(&self) -> usize {
+        ZK_AUTH_CAPSULE_STATE_LEN
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        false
     }
 }
 

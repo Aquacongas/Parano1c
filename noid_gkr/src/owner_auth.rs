@@ -101,7 +101,7 @@ mod tests {
     use noid_tx::{output_bitmap_bit, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS};
 
     fn canonical_body() -> TxBody {
-        let secret = SpendSecret([0x31; 32]);
+        let secret = SpendSecret::from_bytes([0x31; 32]);
         let mut inputs = [TxInput::dummy(); TX_INPUTS];
         inputs[0] = TxInput {
             slot_index: 7,

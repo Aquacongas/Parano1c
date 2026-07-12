@@ -36,6 +36,40 @@ pub use state::{SharedWallet, WalletState};
 #[cfg(test)]
 use state::MAX_WALLET_ADDRESSES;
 
+#[cfg(test)]
+mod secret_surface_source_tests {
+    #[test]
+    fn wallet_secret_capabilities_stay_module_private_and_unlogged() {
+        static_assertions::assert_not_impl_any!(
+            super::state::WalletState:
+                Copy, Clone, std::fmt::Debug, serde::Serialize, serde::de::DeserializeOwned
+        );
+        static_assertions::assert_not_impl_any!(
+            super::builder::TxBuildData:
+                Copy, Clone, std::fmt::Debug, serde::Serialize, serde::de::DeserializeOwned
+        );
+
+        let keystore = include_str!("keystore.rs");
+        let state = include_str!("state.rs");
+        let builder = include_str!("builder.rs");
+        let prover = include_str!("prover.rs");
+
+        assert!(keystore.contains("pub(super) struct MasterSecret("));
+        assert!(!keystore.contains("pub struct MasterSecret("));
+        assert!(state.contains("pub(super) fn spend_secret_for("));
+        assert!(!state.contains("pub fn spend_secret_for("));
+
+        for source in [keystore, state, builder, prover] {
+            for line in source.lines().filter(|line| line.contains("tracing::")) {
+                assert!(
+                    !line.contains("secret") && !line.contains("witness"),
+                    "wallet logging statement mentions secret material: {line}"
+                );
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // WalletHandle — implements WalletOps for RPC layer
 // ---------------------------------------------------------------------------

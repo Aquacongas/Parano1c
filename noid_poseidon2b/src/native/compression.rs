@@ -8,6 +8,7 @@
 use super::domain::{capacity_iv, capacity_iv_flat, DomainTag, TAG_BYTEHASH, TAG_COMPRESS};
 use super::permutation::{permute_flat_u128, Poseidon2bPermutation};
 use noid_core::{Block128, CanonicalSerialize, TowerField};
+use zeroize::Zeroize;
 
 const STATE_SIZE: usize = 4;
 const RATE: usize = 2;
@@ -16,13 +17,35 @@ const PADDING_START: u8 = 0x80;
 const PADDING_END: u8 = 0x01;
 
 /// Poseidon2b sponge with t=4, rate=2, capacity=2.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Poseidon2bSponge {
     state: [Block128; STATE_SIZE],
     buffer: [u8; 32],
     filled_bytes: usize,
     permutation: Poseidon2bPermutation,
 }
+
+impl std::fmt::Debug for Poseidon2bSponge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Poseidon2bSponge([REDACTED])")
+    }
+}
+
+impl Zeroize for Poseidon2bSponge {
+    fn zeroize(&mut self) {
+        self.state.zeroize();
+        self.buffer.zeroize();
+        self.filled_bytes = 0;
+    }
+}
+
+impl Drop for Poseidon2bSponge {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+impl zeroize::ZeroizeOnDrop for Poseidon2bSponge {}
 
 impl Default for Poseidon2bSponge {
     fn default() -> Self {
@@ -80,17 +103,22 @@ impl Poseidon2bSponge {
     }
 
     /// Absorb a single field element.
-    pub fn absorb(&mut self, elem: Block128) {
-        let bytes = elem.to_bytes();
+    pub fn absorb(&mut self, mut elem: Block128) {
+        let mut bytes = elem.to_bytes();
         self.update(&bytes);
+        bytes.zeroize();
+        elem.zeroize();
     }
 
     /// Absorb two field elements (one rate block).
-    pub fn absorb_pair(&mut self, a: Block128, b: Block128) {
+    pub fn absorb_pair(&mut self, mut a: Block128, mut b: Block128) {
         let mut bytes = [0u8; 32];
         bytes[..16].copy_from_slice(&a.to_bytes());
         bytes[16..].copy_from_slice(&b.to_bytes());
         self.update(&bytes);
+        bytes.zeroize();
+        a.zeroize();
+        b.zeroize();
     }
 
     /// Finalize and squeeze a 32-byte digest.
@@ -171,8 +199,10 @@ impl Poseidon2bSponge {
         for i in 0..RATE {
             let mut word = [0u8; 16];
             word.copy_from_slice(&self.buffer[i * 16..(i + 1) * 16]);
-            let elem = Block128::from(u128::from_le_bytes(word));
+            let mut elem = Block128::from(u128::from_le_bytes(word));
             self.state[i] += elem;
+            elem.zeroize();
+            word.zeroize();
         }
         self.permutation.permute_mut(&mut self.state);
     }
@@ -315,12 +345,34 @@ pub fn compress_flat_feed_forward_with_tag(tag: DomainTag, a: &[u8; 32], b: &[u8
 /// [`Poseidon2bSponge`], but absorbed bytes are interpreted as flat-basis
 /// lanes and the permutation runs with no boundary conversion. Used for the
 /// proof-core PCS Merkle leaves, whose payloads are flat F_{2^128} values.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Poseidon2bFlatSponge {
     state: [u128; STATE_SIZE],
     buffer: [u8; 32],
     filled_bytes: usize,
 }
+
+impl std::fmt::Debug for Poseidon2bFlatSponge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Poseidon2bFlatSponge([REDACTED])")
+    }
+}
+
+impl Zeroize for Poseidon2bFlatSponge {
+    fn zeroize(&mut self) {
+        self.state.zeroize();
+        self.buffer.zeroize();
+        self.filled_bytes = 0;
+    }
+}
+
+impl Drop for Poseidon2bFlatSponge {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+impl zeroize::ZeroizeOnDrop for Poseidon2bFlatSponge {}
 
 impl Poseidon2bFlatSponge {
     /// Construct a flat sponge seeded with the tag's capacity IV (flat).
@@ -419,6 +471,21 @@ mod tests {
         let d2 = s2.finalize();
 
         assert_eq!(d1, d2);
+    }
+
+    #[test]
+    fn sponge_debug_is_redacted_and_owned_state_is_zeroizing() {
+        fn assert_zeroize<T: Zeroize + zeroize::ZeroizeOnDrop>() {}
+        assert_zeroize::<Poseidon2bSponge>();
+        assert_zeroize::<Poseidon2bFlatSponge>();
+
+        let mut sponge = Poseidon2bSponge::new();
+        sponge.update(&[0xA7; 32]);
+        assert_eq!(format!("{sponge:?}"), "Poseidon2bSponge([REDACTED])");
+
+        let mut flat = Poseidon2bFlatSponge::with_iv_flat([0xA7; 2]);
+        flat.update(&[0x5C; 32]);
+        assert_eq!(format!("{flat:?}"), "Poseidon2bFlatSponge([REDACTED])");
     }
 
     #[test]

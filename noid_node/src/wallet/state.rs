@@ -163,7 +163,7 @@ impl WalletState {
     }
 
     /// Spend secret for a specific key index.
-    pub fn spend_secret_for(&self, key_index: u32) -> SpendSecret {
+    pub(super) fn spend_secret_for(&self, key_index: u32) -> SpendSecret {
         self.secret.derive_spend_secret(key_index)
     }
 
@@ -910,5 +910,77 @@ mod tests {
             entry.own_address.as_deref(),
             Some(expected_address.as_str())
         );
+    }
+
+    #[test]
+    fn wallet_sidecars_never_persist_master_or_derived_spend_secret() {
+        use zeroize::Zeroize;
+
+        fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+            !needle.is_empty() && haystack.windows(needle.len()).any(|part| part == needle)
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("wallet.key");
+        let mut wallet = WalletState::create_or_load(key_path.clone()).unwrap();
+        let spend_secret = wallet.spend_secret_for(0);
+        let mut spend_bytes = spend_secret.with_exposed_prover_fields(|fields| {
+            let mut bytes = [0u8; 32];
+            bytes[..16].copy_from_slice(&fields[0].0.to_le_bytes());
+            bytes[16..].copy_from_slice(&fields[1].0.to_le_bytes());
+            bytes
+        });
+
+        wallet.next_index = 7;
+        wallet.history.push(TxHistoryEntry {
+            tx_hash: [0x11; 32],
+            height: 9,
+            direction: TxDirection::Sent,
+            amount_micronoid: 77,
+            peer_address: Some([0x22; 32]),
+            timestamp: 123,
+            own_address: Some(wallet.active_address().to_bech32()),
+            own_key_index: Some(0),
+        });
+        wallet.receipts.insert([0x33; 32], vec![0x44; 96]);
+        wallet.save_metadata();
+        wallet.save_history();
+        wallet.save_receipts();
+
+        let mut key_file = std::fs::read(&key_path).unwrap();
+        assert_eq!(key_file.len(), 48);
+        let mut master_bytes = [0u8; 32];
+        master_bytes.copy_from_slice(&key_file[16..]);
+        let master_hex = hex::encode(master_bytes);
+        let spend_hex = hex::encode(spend_bytes);
+
+        for path in [
+            metadata_path(&key_path),
+            history_path(&key_path),
+            receipts_path(&key_path),
+        ] {
+            let mut persisted = std::fs::read(&path).unwrap();
+            assert!(
+                !contains(&persisted, &master_bytes),
+                "master secret in {path:?}"
+            );
+            assert!(
+                !contains(&persisted, &spend_bytes),
+                "spend secret in {path:?}"
+            );
+            assert!(
+                !contains(&persisted, master_hex.as_bytes()),
+                "hex master secret in {path:?}"
+            );
+            assert!(
+                !contains(&persisted, spend_hex.as_bytes()),
+                "hex spend secret in {path:?}"
+            );
+            persisted.zeroize();
+        }
+
+        key_file.zeroize();
+        master_bytes.zeroize();
+        spend_bytes.zeroize();
     }
 }

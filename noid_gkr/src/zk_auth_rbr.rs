@@ -592,7 +592,7 @@ impl ZkAuthKnowledgeWitness {
         let mut bytes = Zeroizing::new([0u8; 32]);
         bytes[..16].copy_from_slice(&self.secret[0].0.to_le_bytes());
         bytes[16..].copy_from_slice(&self.secret[1].0.to_le_bytes());
-        let spend_secret = SpendSecret(*bytes);
+        let spend_secret = SpendSecret::from_bytes(*bytes);
         derive_address(&spend_secret).as_fields() == statement.address
     }
 }

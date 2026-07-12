@@ -50,12 +50,12 @@ mod tests {
     use noid_poseidon2b::primitives::{derive_address, Address, SpendSecret};
     use noid_tx::{output_bitmap_bit, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS};
 
-    fn secret(seed: u8) -> SpendSecret {
+    fn secret_bytes(seed: u8) -> [u8; 32] {
         let mut bytes = [0u8; 32];
         for (i, b) in bytes.iter_mut().enumerate() {
             *b = seed.wrapping_mul(37).wrapping_add(i as u8).wrapping_add(3);
         }
-        SpendSecret(bytes)
+        bytes
     }
 
     fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
@@ -94,8 +94,8 @@ mod tests {
 
     #[test]
     fn wallet_bundle_does_not_serialize_spend_secret_bytes() {
-        let spend_secret = secret(11);
-        let raw_secret = spend_secret.0;
+        let raw_secret = secret_bytes(11);
+        let spend_secret = SpendSecret::from_bytes(raw_secret);
         let body = body(&spend_secret, 1);
 
         let bundle =
@@ -111,8 +111,8 @@ mod tests {
     #[test]
     #[cfg_attr(debug_assertions, ignore = "release-only eight-input proof regression")]
     fn eight_input_wallet_bundle_does_not_serialize_spend_secret_bytes() {
-        let spend_secret = secret(21);
-        let raw_secret = spend_secret.0;
+        let raw_secret = secret_bytes(21);
+        let spend_secret = SpendSecret::from_bytes(raw_secret);
         let body = body(&spend_secret, TX_INPUTS);
 
         let bundle = prove_tx(&body, OwnerAuthWitness::new(spend_secret))

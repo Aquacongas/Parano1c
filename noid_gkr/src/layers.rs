@@ -33,7 +33,7 @@ use noid_core::Block128;
 use noid_poseidon2b::native::permutation::{
     F_ROUNDS, MDS_FULL, MDS_PARTIAL, N_ROUNDS, P_ROUNDS, ROUND_CONSTANTS, STATE_SIZE,
 };
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 #[cfg(test)]
 use noid_poseidon2b::native::permutation::sbox_x7;
@@ -113,10 +113,9 @@ impl PermLayerWitness {
 /// The function is a native re-implementation of
 /// `Poseidon2bPermutation::permute_mut` instrumented to keep every
 /// intermediate value. It must never diverge from native.
-pub fn evaluate_permutation(input: [Block128; STATE_SIZE]) -> PermLayerWitness {
+pub fn evaluate_permutation(mut current: [Block128; STATE_SIZE]) -> PermLayerWitness {
     // Row 0's state is the post-initial-MDS state (native applies
     // MDS_FULL before the round loop).
-    let mut current = input;
     apply_mds_full(&mut current);
 
     let n_rows = N_ROUNDS + 1;
@@ -135,11 +134,11 @@ pub fn evaluate_permutation(input: [Block128; STATE_SIZE]) -> PermLayerWitness {
 
         let (row_sin, row_x2, row_x4, row_x3, row_sout) = match k {
             RoundKind::Full => {
-                let mut sn = [Block128::from(0u128); STATE_SIZE];
-                let mut x2r = [Block128::from(0u128); STATE_SIZE];
-                let mut x4r = [Block128::from(0u128); STATE_SIZE];
-                let mut x3r = [Block128::from(0u128); STATE_SIZE];
-                let mut so = [Block128::from(0u128); STATE_SIZE];
+                let mut sn = Zeroizing::new([Block128::from(0u128); STATE_SIZE]);
+                let mut x2r = Zeroizing::new([Block128::from(0u128); STATE_SIZE]);
+                let mut x4r = Zeroizing::new([Block128::from(0u128); STATE_SIZE]);
+                let mut x3r = Zeroizing::new([Block128::from(0u128); STATE_SIZE]);
+                let mut so = Zeroizing::new([Block128::from(0u128); STATE_SIZE]);
                 for i in 0..STATE_SIZE {
                     sn[i] = current[i] + Block128::from(ROUND_CONSTANTS[i][r]);
                     x2r[i] = sn[i] * sn[i];
@@ -147,17 +146,18 @@ pub fn evaluate_permutation(input: [Block128; STATE_SIZE]) -> PermLayerWitness {
                     x3r[i] = x2r[i] * sn[i];
                     so[i] = x4r[i] * x3r[i];
                 }
-                let mut next = so;
+                let mut next = *so;
                 apply_mds_full(&mut next);
                 current = next;
+                next.zeroize();
                 (sn, x2r, x4r, x3r, so)
             }
             RoundKind::Partial => {
-                let mut sn = [Block128::from(0u128); STATE_SIZE];
-                let mut x2r = [Block128::from(0u128); STATE_SIZE];
-                let mut x4r = [Block128::from(0u128); STATE_SIZE];
-                let mut x3r = [Block128::from(0u128); STATE_SIZE];
-                let mut so = [Block128::from(0u128); STATE_SIZE];
+                let mut sn = Zeroizing::new([Block128::from(0u128); STATE_SIZE]);
+                let mut x2r = Zeroizing::new([Block128::from(0u128); STATE_SIZE]);
+                let mut x4r = Zeroizing::new([Block128::from(0u128); STATE_SIZE]);
+                let mut x3r = Zeroizing::new([Block128::from(0u128); STATE_SIZE]);
+                let mut so = Zeroizing::new([Block128::from(0u128); STATE_SIZE]);
                 sn[0] = current[0] + Block128::from(ROUND_CONSTANTS[0][r]);
                 x2r[0] = sn[0] * sn[0];
                 x4r[0] = x2r[0] * x2r[0];
@@ -166,19 +166,21 @@ pub fn evaluate_permutation(input: [Block128; STATE_SIZE]) -> PermLayerWitness {
                 // Build the partial-MDS input: lane 0 uses the S-box
                 // output, lanes 1..3 use the raw state (the AIR pins
                 // sin/x2/x3/x4/sout to zero on those lanes).
-                let mut partial_input = [current[0], current[1], current[2], current[3]];
+                let mut partial_input =
+                    Zeroizing::new([current[0], current[1], current[2], current[3]]);
                 partial_input[0] = so[0];
-                let next = apply_mds_partial(partial_input);
+                let mut next = apply_mds_partial(*partial_input);
                 current = next;
+                next.zeroize();
                 (sn, x2r, x4r, x3r, so)
             }
         };
 
-        sin.push(row_sin);
-        x2.push(row_x2);
-        x4.push(row_x4);
-        x3.push(row_x3);
-        sout.push(row_sout);
+        sin.push(*row_sin);
+        x2.push(*row_x2);
+        x4.push(*row_x4);
+        x3.push(*row_x3);
+        sout.push(*row_sout);
     }
 
     // Output row (index = N_ROUNDS): state only, all S-box cells zero.
@@ -206,7 +208,7 @@ pub fn evaluate_permutation(input: [Block128; STATE_SIZE]) -> PermLayerWitness {
 /// here from the public `MDS_FULL` constant.
 #[inline]
 pub fn apply_mds_full(state: &mut [Block128; STATE_SIZE]) {
-    let input = *state;
+    let mut input = *state;
     for i in 0..STATE_SIZE {
         let mut out = Block128::from(0u128);
         for j in 0..STATE_SIZE {
@@ -218,6 +220,7 @@ pub fn apply_mds_full(state: &mut [Block128; STATE_SIZE]) {
         }
         state[i] = out;
     }
+    input.zeroize();
 }
 
 /// Apply `MDS_PARTIAL` and return the result. Operates on a passed-in
@@ -225,7 +228,7 @@ pub fn apply_mds_full(state: &mut [Block128; STATE_SIZE]) {
 /// which rule builds the input (for partial rounds: `[sout[0],
 /// state[1..3]]`).
 #[inline]
-pub fn apply_mds_partial(input: [Block128; STATE_SIZE]) -> [Block128; STATE_SIZE] {
+pub fn apply_mds_partial(mut input: [Block128; STATE_SIZE]) -> [Block128; STATE_SIZE] {
     let mut out = [Block128::from(0u128); STATE_SIZE];
     for i in 0..STATE_SIZE {
         let mut acc = Block128::from(0u128);
@@ -238,6 +241,7 @@ pub fn apply_mds_partial(input: [Block128; STATE_SIZE]) -> [Block128; STATE_SIZE
         }
         out[i] = acc;
     }
+    input.zeroize();
     out
 }
 

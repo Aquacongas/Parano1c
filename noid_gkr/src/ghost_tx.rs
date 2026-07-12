@@ -28,7 +28,7 @@ use noid_tx::{output_bitmap_bit, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUT
 /// The public protocol "secret" of the ghost owner (ASCII domain tag,
 /// exactly 32 bytes). See the module doc for why this is public by design.
 pub fn ghost_spend_secret() -> SpendSecret {
-    SpendSecret(*b"PARANOID-GHOST-TX-SPEND-SECRET.0")
+    SpendSecret::from_bytes(*b"PARANOID-GHOST-TX-SPEND-SECRET.0")
 }
 
 /// The canonical ghost body: fixed Tx8x2, zero epoch anchor, zero

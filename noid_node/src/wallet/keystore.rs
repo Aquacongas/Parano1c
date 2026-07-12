@@ -55,8 +55,11 @@ const PLAIN_FILE_LEN: usize = 16 + SECRET_LEN; // 48 bytes
 // ---------------------------------------------------------------------------
 
 /// The decrypted master secret (zeroized on drop).
+///
+/// The field and the type are private to the wallet module. There is no raw
+/// getter, formatter, clone, comparison, hash, or serialization surface.
 #[derive(Zeroize, ZeroizeOnDrop)]
-pub struct MasterSecret(pub [u8; SECRET_LEN]);
+pub(super) struct MasterSecret([u8; SECRET_LEN]);
 
 impl MasterSecret {
     /// Derive the spending secret for address index `n`.
@@ -65,23 +68,28 @@ impl MasterSecret {
     ///
     /// The derived secret is used only by the wallet's witness-hiding authorization prover.
     /// It NEVER leaves the daemon.
-    pub fn derive_spend_secret(&self, index: u32) -> SpendSecret {
+    pub(super) fn derive_spend_secret(&self, index: u32) -> SpendSecret {
         use noid_core::{Block128, TowerField};
         use noid_poseidon2b::native::compression::Poseidon2bSponge;
 
         let mut sponge = Poseidon2bSponge::with_iv([Block128::ZERO; 2]);
-        let lo = u128::from_le_bytes(self.0[..16].try_into().unwrap());
-        let hi = u128::from_le_bytes(self.0[16..].try_into().unwrap());
-        sponge.absorb(Block128::from(lo));
-        sponge.absorb(Block128::from(hi));
+        let mut master_fields = Zeroizing::new([
+            Block128::from(u128::from_le_bytes(self.0[..16].try_into().unwrap())),
+            Block128::from(u128::from_le_bytes(self.0[16..].try_into().unwrap())),
+        ]);
+        sponge.absorb(master_fields[0]);
+        sponge.absorb(master_fields[1]);
+        master_fields.zeroize();
         sponge.absorb(Block128::from(index as u128));
         sponge.absorb(Block128::from(0x6E6F69642D64657269_u128)); // "noid-deri"
-        let digest = sponge.finalize();
-        SpendSecret(digest)
+        let mut digest = sponge.finalize();
+        let secret = SpendSecret::from_bytes(digest);
+        digest.zeroize();
+        secret
     }
 
     /// Derive the public address for index `n` (safe to share).
-    pub fn derive_address(&self, index: u32) -> Address {
+    pub(super) fn derive_address(&self, index: u32) -> Address {
         let secret = self.derive_spend_secret(index);
         noid_poseidon2b::primitives::derive_address(&secret)
     }
@@ -92,7 +100,7 @@ impl MasterSecret {
 // ---------------------------------------------------------------------------
 
 /// Manages the plaintext wallet key file on disk.
-pub struct Keystore {
+pub(super) struct Keystore {
     path: PathBuf,
 }
 
@@ -122,20 +130,20 @@ impl Drop for TemporaryKeyFile {
 }
 
 impl Keystore {
-    pub fn new(path: impl AsRef<Path>) -> Self {
+    pub(super) fn new(path: impl AsRef<Path>) -> Self {
         Self {
             path: path.as_ref().to_path_buf(),
         }
     }
 
-    pub fn exists(&self) -> bool {
+    pub(super) fn exists(&self) -> bool {
         self.path.exists()
     }
 
     /// Create a new wallet with a randomly generated secret.
     /// Writes `magic[16] + secret[32]` = 48 bytes with mode 0o600.
     /// Fails if the file already exists.
-    pub fn create_plain(&self) -> Result<MasterSecret, KeystoreError> {
+    pub(super) fn create_plain(&self) -> Result<MasterSecret, KeystoreError> {
         if self.exists() {
             return Err(KeystoreError::AlreadyExists(self.path.clone()));
         }
@@ -189,11 +197,13 @@ impl Keystore {
             File::open(parent)?.sync_all()?;
         }
 
-        Ok(MasterSecret(*secret))
+        let master = MasterSecret(*secret);
+        secret.zeroize();
+        Ok(master)
     }
 
     /// Load a plaintext wallet key file.
-    pub fn load_plain(&self) -> Result<MasterSecret, KeystoreError> {
+    pub(super) fn load_plain(&self) -> Result<MasterSecret, KeystoreError> {
         if !self.exists() {
             return Err(KeystoreError::NotFound(self.path.clone()));
         }
@@ -233,9 +243,11 @@ impl Keystore {
         if &data[..16] != PLAIN_MAGIC.as_ref() {
             return Err(KeystoreError::InvalidFormat);
         }
-        let mut secret = [0u8; SECRET_LEN];
+        let mut secret = Zeroizing::new([0u8; SECRET_LEN]);
         secret.copy_from_slice(&data[16..]);
-        Ok(MasterSecret(secret))
+        let master = MasterSecret(*secret);
+        secret.zeroize();
+        Ok(master)
     }
 }
 
@@ -254,7 +266,8 @@ mod tests {
         let ks = Keystore::new(dir.path().join("wallet.key"));
         let secret = ks.create_plain().unwrap();
         let loaded = ks.load_plain().unwrap();
-        assert_eq!(secret.0, loaded.0);
+        assert_eq!(secret.derive_address(0), loaded.derive_address(0));
+        assert_eq!(secret.derive_address(99), loaded.derive_address(99));
     }
 
     #[test]
@@ -289,10 +302,27 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let ks = Keystore::new(dir.path().join("wallet.key"));
         let master = ks.create_plain().unwrap();
-        assert_ne!(
-            master.derive_spend_secret(0).0,
-            master.derive_spend_secret(1).0
+        assert_ne!(master.derive_address(0), master.derive_address(1));
+    }
+
+    #[test]
+    fn master_secret_traits_and_explicit_zeroize_are_pinned() {
+        static_assertions::assert_not_impl_any!(
+            MasterSecret: Copy,
+            Clone,
+            std::fmt::Debug,
+            PartialEq,
+            Eq,
+            std::hash::Hash,
+            serde::Serialize,
+            serde::de::DeserializeOwned
         );
+        fn assert_zeroize<T: Zeroize + ZeroizeOnDrop>() {}
+        assert_zeroize::<MasterSecret>();
+
+        let mut secret = MasterSecret([0xA6; SECRET_LEN]);
+        secret.zeroize();
+        assert_eq!(secret.0, [0u8; SECRET_LEN]);
     }
 
     #[cfg(unix)]

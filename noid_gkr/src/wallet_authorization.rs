@@ -13,8 +13,8 @@ use crate::{
     evaluate_permutation, owner_auth_public_from_statement,
     zk_auth_capsule::ZkAuthCapsuleStateTable,
     zk_authorization::{
-        prove_zk_authorization_from_state, verify_zk_authorization, ZkAuthCapsuleOwnerStatement,
-        ZkAuthorizationProof,
+        prove_zk_authorization_from_state_table, verify_zk_authorization,
+        ZkAuthCapsuleOwnerStatement, ZkAuthorizationProof,
     },
     OwnerAuthPublicInputs, OwnerAuthStatementError,
 };
@@ -194,7 +194,9 @@ impl std::error::Error for AuthorizationDecodeError {}
 pub enum ProveAuthorizationError {
     PublicLogic(PublicLogicError),
     OwnerAuthStatement(String),
-    Proof(String),
+    /// The witness-hiding prover failed. Internal field values are
+    /// deliberately not retained in the wallet/RPC-facing error.
+    Proof,
     BoundaryMismatch {
         input_index: usize,
         field: &'static str,
@@ -277,12 +279,13 @@ pub fn prove_wallet_authorization(
     // The selected capsule commits exactly the address-permutation state
     // table. Keep every secret-bearing temporary zeroizing and never expose a
     // reusable state/bank constructor at the wallet boundary.
-    let mut secret = witness.spend_secret().as_fields();
     let iv = capacity_iv(TAG_ADDRFIX);
-    let mut permutation_input = [secret[0], secret[1], iv[0], iv[1]];
-    let permutation = evaluate_permutation(permutation_input);
-    permutation_input.zeroize();
-    secret.zeroize();
+    let permutation = witness.spend_secret().with_exposed_prover_fields(|secret| {
+        let mut permutation_input = [secret[0], secret[1], iv[0], iv[1]];
+        let permutation = evaluate_permutation(permutation_input);
+        permutation_input.zeroize();
+        permutation
+    });
     if permutation.final_state()[..2] != canonical.input_owner.as_fields() {
         return Err(ProveAuthorizationError::BoundaryMismatch {
             input_index: input_position,
@@ -290,12 +293,12 @@ pub fn prove_wallet_authorization(
         });
     }
     let state = ZkAuthCapsuleStateTable::from_permutation_witness(&permutation)
-        .map_err(|error| ProveAuthorizationError::Proof(format!("{error:?}")))?;
+        .map_err(|_| ProveAuthorizationError::Proof)?;
     let public =
         owner_auth_public_from_statement(&canonical).map_err(map_owner_auth_prove_error)?;
     let statement = selected_statement(&public);
-    let proof = prove_zk_authorization_from_state(state.cells(), statement)
-        .map_err(|error| ProveAuthorizationError::Proof(format!("{error:?}")))?;
+    let proof = prove_zk_authorization_from_state_table(&state, statement)
+        .map_err(|_| ProveAuthorizationError::Proof)?;
     Ok(WalletAuthorizationBundle { proof })
 }
 
@@ -393,16 +396,21 @@ mod tests {
     use noid_poseidon2b::primitives::{derive_address, Address};
     use noid_tx::{output_bitmap_bit, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS};
 
-    fn mk_secret(seed: u8) -> SpendSecret {
+    fn mk_secret_bytes(seed: u8) -> [u8; 32] {
         let mut bytes = [0u8; 32];
         for (i, byte) in bytes.iter_mut().enumerate() {
             *byte = seed.wrapping_mul(31).wrapping_add(i as u8).wrapping_add(11);
         }
-        SpendSecret(bytes)
+        bytes
     }
 
-    fn standard_body_and_secret() -> (TxBody, SpendSecret) {
-        let secret = mk_secret(7);
+    fn mk_secret(seed: u8) -> SpendSecret {
+        SpendSecret::from_bytes(mk_secret_bytes(seed))
+    }
+
+    fn standard_body_and_secret() -> (TxBody, [u8; 32]) {
+        let secret_bytes = mk_secret_bytes(7);
+        let secret = SpendSecret::from_bytes(secret_bytes);
         let mut inputs = [TxInput::dummy(); TX_INPUTS];
         inputs[0] = TxInput {
             slot_index: 17,
@@ -424,11 +432,12 @@ mod tests {
             validity_bitmap: 1 | output_bitmap_bit(0),
             is_coinbase: false,
         };
-        (body, secret)
+        (body, secret_bytes)
     }
 
-    fn repeated_owner_body_and_secret() -> (TxBody, SpendSecret) {
-        let secret = mk_secret(17);
+    fn repeated_owner_body_and_secret() -> (TxBody, [u8; 32]) {
+        let secret_bytes = mk_secret_bytes(17);
+        let secret = SpendSecret::from_bytes(secret_bytes);
         let mut inputs = [TxInput::dummy(); TX_INPUTS];
         inputs[0] = TxInput {
             slot_index: 17,
@@ -455,16 +464,16 @@ mod tests {
             validity_bitmap: (1 << 0) | (1 << 1) | output_bitmap_bit(0),
             is_coinbase: false,
         };
-        (body, secret)
+        (body, secret_bytes)
     }
 
-    fn prove_standard_fixture() -> (TxBody, SpendSecret, WalletAuthorizationBundle) {
-        let (body, secret) = standard_body_and_secret();
-        let witness = OwnerAuthWitness::new(SpendSecret(secret.0));
+    fn prove_standard_fixture() -> (TxBody, [u8; 32], WalletAuthorizationBundle) {
+        let (body, secret_bytes) = standard_body_and_secret();
+        let witness = OwnerAuthWitness::new(SpendSecret::from_bytes(secret_bytes));
         let bundle =
             prove_wallet_authorization(&body, witness).expect("prove standard authorization");
         verify_wallet_authorization(&body, &bundle).expect("verify standard authorization");
-        (body, secret, bundle)
+        (body, secret_bytes, bundle)
     }
 
     #[test]
@@ -528,7 +537,7 @@ mod tests {
 
     #[test]
     fn wrong_secret_rejects_before_proving() {
-        let (mut body, secret) = standard_body_and_secret();
+        let (mut body, secret_bytes) = standard_body_and_secret();
 
         assert!(matches!(
             prove_wallet_authorization(&body, OwnerAuthWitness::new(mk_secret(8))),
@@ -540,7 +549,10 @@ mod tests {
 
         body.input_owner = Address([0x55; 32]);
         assert!(matches!(
-            prove_wallet_authorization(&body, OwnerAuthWitness::new(SpendSecret(secret.0)),),
+            prove_wallet_authorization(
+                &body,
+                OwnerAuthWitness::new(SpendSecret::from_bytes(secret_bytes)),
+            ),
             Err(ProveAuthorizationError::BoundaryMismatch {
                 input_index: 0,
                 field: "owner_auth",
@@ -550,10 +562,12 @@ mod tests {
 
     #[test]
     fn repeated_inputs_use_fixed_owner_layout() {
-        let (body, secret) = repeated_owner_body_and_secret();
-        let bundle =
-            prove_wallet_authorization(&body, OwnerAuthWitness::new(SpendSecret(secret.0)))
-                .expect("prove repeated-owner authorization");
+        let (body, secret_bytes) = repeated_owner_body_and_secret();
+        let bundle = prove_wallet_authorization(
+            &body,
+            OwnerAuthWitness::new(SpendSecret::from_bytes(secret_bytes)),
+        )
+        .expect("prove repeated-owner authorization");
         verify_wallet_authorization(&body, &bundle).expect("verify repeated-owner authorization");
 
         let public = owner_auth_public_from_body(&body).expect("public owner auth");
@@ -567,6 +581,15 @@ mod tests {
     fn owner_auth_witness_is_send() {
         fn assert_send<T: Send>() {}
         assert_send::<OwnerAuthWitness>();
+        static_assertions::assert_not_impl_any!(
+            OwnerAuthWitness: Copy,
+            Clone,
+            std::fmt::Debug,
+            serde::Serialize,
+            serde::de::DeserializeOwned
+        );
+        fn assert_zeroize<T: zeroize::Zeroize + zeroize::ZeroizeOnDrop>() {}
+        assert_zeroize::<OwnerAuthWitness>();
     }
 
     #[test]
@@ -603,13 +626,27 @@ mod tests {
 
     #[test]
     fn spend_secret_bytes_are_absent_from_serialization() {
-        let (_, secret, bundle) = prove_standard_fixture();
+        let (_, secret_bytes, bundle) = prove_standard_fixture();
         let bytes = bundle.to_bytes().expect("serialize authorization");
         assert!(
             !bytes
-                .windows(secret.0.len())
-                .any(|window| window == secret.0),
+                .windows(secret_bytes.len())
+                .any(|window| window == secret_bytes),
             "raw spend secret must not be serialized in wallet authorization"
         );
+    }
+
+    #[test]
+    fn wallet_facing_prover_errors_do_not_embed_secret_or_field_state() {
+        let (mut body, secret_bytes) = standard_body_and_secret();
+        body.input_owner = Address([0x55; 32]);
+        let error = prove_wallet_authorization(
+            &body,
+            OwnerAuthWitness::new(SpendSecret::from_bytes(secret_bytes)),
+        )
+        .expect_err("changed owner must reject before proving");
+        let rendered = error.to_string();
+        assert!(!rendered.contains(&hex::encode(secret_bytes)));
+        assert!(!rendered.contains("Block128"));
     }
 }

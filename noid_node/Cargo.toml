@@ -64,3 +64,4 @@ tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
 
 [dev-dependencies]
 tempfile = "3"
+static_assertions = "1.1"

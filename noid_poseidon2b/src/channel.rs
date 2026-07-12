@@ -22,12 +22,18 @@ use crate::native::compression::Poseidon2bSponge;
 use crate::native::domain::{capacity_iv, TAG_KSCHANNL};
 
 /// Fiat-Shamir channel backed by a Poseidon2b sponge.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Poseidon2bChannel {
     sponge: Poseidon2bSponge,
     /// When we squeeze a rate block (two Block128s) we hand out the second
     /// one on the next call before advancing the sponge again.
     pending: Option<Block128>,
+}
+
+impl std::fmt::Debug for Poseidon2bChannel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Poseidon2bChannel([REDACTED])")
+    }
 }
 
 impl Default for Poseidon2bChannel {
@@ -128,6 +134,13 @@ mod tests {
         let [bare_a, _] = bare.squeeze();
 
         assert_ne!(iv_challenge, bare_a);
+    }
+
+    #[test]
+    fn channel_debug_never_formats_transcript_state() {
+        let mut channel = Poseidon2bChannel::new();
+        channel.absorb(Block128::from(0xA7A7_A7A7_A7A7_A7A7u128));
+        assert_eq!(format!("{channel:?}"), "Poseidon2bChannel([REDACTED])");
     }
 
     #[test]

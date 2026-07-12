@@ -12,6 +12,7 @@ use noid_core::{
     hardware::{clmul_gcm, flat_to_tower_u128, square_flat_u128, tower_to_flat_u128},
     Block128,
 };
+use zeroize::Zeroize;
 
 pub const STATE_SIZE: usize = 4;
 pub const F_ROUNDS: usize = 8;
@@ -33,6 +34,7 @@ impl Poseidon2bPermutation {
         for i in 0..STATE_SIZE {
             state[i] = Block128(flat_to_tower_u128(flat[i]));
         }
+        flat.zeroize();
     }
 }
 
@@ -125,7 +127,7 @@ fn flat_tables() -> &'static FlatTables {
 
 #[inline(always)]
 fn apply_mds_full_flat(state: &mut [u128; STATE_SIZE], tables: &FlatTables) {
-    let input = *state;
+    let mut input = *state;
     for (i, state_i) in state.iter_mut().enumerate() {
         let mut out = 0u128;
         for (j, input_j) in input.iter().enumerate() {
@@ -137,11 +139,12 @@ fn apply_mds_full_flat(state: &mut [u128; STATE_SIZE], tables: &FlatTables) {
         }
         *state_i = out;
     }
+    input.zeroize();
 }
 
 #[inline(always)]
 fn apply_mds_partial_flat(state: &mut [u128; STATE_SIZE], tables: &FlatTables) {
-    let input = *state;
+    let mut input = *state;
     for (i, state_i) in state.iter_mut().enumerate() {
         let mut out = 0u128;
         for (j, input_j) in input.iter().enumerate() {
@@ -153,6 +156,7 @@ fn apply_mds_partial_flat(state: &mut [u128; STATE_SIZE], tables: &FlatTables) {
         }
         *state_i = out;
     }
+    input.zeroize();
 }
 
 /// The x^7 S-box in GF(2^128).

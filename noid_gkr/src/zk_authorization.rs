@@ -42,7 +42,7 @@ use crate::zk_auth_capsule::{
     compute_terminal_operand_claims, evaluate_auth_main_terminal_from_claims,
     validate_auth_main_relation, validate_sparse_boundary, AuthCapsuleBoundaryPublic,
     AuthCapsulePostClaimRelation, AuthCapsulePostClaims, AuthCapsuleTerminalOperandClaims,
-    ZkAuthCapsuleBankView, ZkAuthCapsuleError, ZK_AUTH_CAPSULE_BANK_VARS,
+    ZkAuthCapsuleBankView, ZkAuthCapsuleError, ZkAuthCapsuleStateTable, ZK_AUTH_CAPSULE_BANK_VARS,
     ZK_AUTH_CAPSULE_LIBRA_MASK_LEN, ZK_AUTH_CAPSULE_PCS_COINS_LEN, ZK_AUTH_CAPSULE_STATE_LEN,
     ZK_AUTH_CAPSULE_TERMINAL_OPERAND_CLAIMS,
 };
@@ -1098,12 +1098,25 @@ pub fn zk_authorization_main_dynamic_data(
 /// `OsRng` fails closed by panicking rather than emitting a proof; this is an
 /// availability tradeoff.  This boundary does not provide durable protection
 /// against whole-system or VM rollback that also rolls back the OS RNG state.
-pub fn prove_zk_authorization_from_state(
+pub(crate) fn prove_zk_authorization_from_state(
     state: &[Block128],
     statement: ZkAuthCapsuleOwnerStatement,
 ) -> Result<ZkAuthorizationProof, ZkAuthorizationError> {
     let mut rng = OsRng;
     prove_zk_authorization_from_state_with_rng(state, statement, &mut rng)
+}
+
+/// Construct one complete authorization proof from an opaque, zeroizing
+/// address-permutation state owner.
+///
+/// This is the public low-level prover seam. Unlike the retired raw-slice
+/// entry point, it does not let callers borrow, format, clone, serialize, or
+/// persist any state cell.
+pub fn prove_zk_authorization_from_state_table(
+    state: &ZkAuthCapsuleStateTable,
+    statement: ZkAuthCapsuleOwnerStatement,
+) -> Result<ZkAuthorizationProof, ZkAuthorizationError> {
+    prove_zk_authorization_from_state(state.cells(), statement)
 }
 
 /// Internal deterministic seam used to exercise the entropy boundary.

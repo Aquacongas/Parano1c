@@ -359,7 +359,13 @@ mod tests {
     #[test]
     fn standard_builder_keeps_secret_only_in_owner_witness() {
         let (_dir, wallet) = wallet_with_utxos(1, 20_000);
-        let raw_secret = wallet.spend_secret_for(0).0;
+        let secret = wallet.spend_secret_for(0);
+        let mut raw_secret = secret.with_exposed_prover_fields(|fields| {
+            let mut bytes = [0u8; 32];
+            bytes[..16].copy_from_slice(&fields[0].0.to_le_bytes());
+            bytes[16..].copy_from_slice(&fields[1].0.to_le_bytes());
+            bytes
+        });
         let data = extract_for(&wallet, 10_000, 1_000).unwrap();
 
         let (txid, intent_bytes) =
@@ -373,6 +379,7 @@ mod tests {
                 .any(|window| window == raw_secret),
             "public intent serialized the active owner's spend secret"
         );
+        zeroize::Zeroize::zeroize(&mut raw_secret);
         let bundle = noid_gkr::WalletAuthorizationBundle::from_bytes(&intent.authorization_bytes)
             .expect("decode standard authorization bundle");
         noid_gkr::verify_wallet_authorization(&intent.tx_body, &bundle)
@@ -383,7 +390,13 @@ mod tests {
     #[cfg_attr(debug_assertions, ignore = "release-only eight-input proof regression")]
     fn build_and_prove_tx_emits_eight_input_secret_free_intent() {
         let (_dir, wallet) = wallet_with_utxos(8, 20_000);
-        let raw_secret = wallet.spend_secret_for(0).0;
+        let secret = wallet.spend_secret_for(0);
+        let mut raw_secret = secret.with_exposed_prover_fields(|fields| {
+            let mut bytes = [0u8; 32];
+            bytes[..16].copy_from_slice(&fields[0].0.to_le_bytes());
+            bytes[16..].copy_from_slice(&fields[1].0.to_le_bytes());
+            bytes
+        });
         let amount = 140_000;
         let fee = 18_500;
         let data = extract_for(&wallet, amount, fee).unwrap();
@@ -408,6 +421,7 @@ mod tests {
                 .any(|window| window == raw_secret),
             "public intent serialized the active owner's spend secret"
         );
+        zeroize::Zeroize::zeroize(&mut raw_secret);
 
         let bundle = noid_gkr::WalletAuthorizationBundle::from_bytes(&intent.authorization_bytes)
             .expect("decode wallet authorization bundle");

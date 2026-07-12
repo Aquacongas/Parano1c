@@ -15,7 +15,7 @@
 //! wrappers prevent cross-domain digest mix-ups at the type level.
 
 use noid_core::Block128;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::batch::compress_batch_interleaved_into;
 use crate::native::compression::Poseidon2bSponge;
@@ -186,38 +186,69 @@ impl std::fmt::Display for TxBodyHash {
 /// current daemon keystore stores its master secret in plaintext behind
 /// owner-only filesystem permissions; it does not claim encryption at rest.
 ///
-/// SECURITY: NOT `Copy` — prevents accidental bitwise copies that bypass
-/// the `ZeroizeOnDrop` destructor. NOT `Debug` — prevents printing in
-/// logs, panics, or test output. Use `derive_address` to derive the public
-/// address without exposing the raw bytes.
-#[derive(Clone, PartialEq, Eq, Hash, Zeroize, ZeroizeOnDrop)]
-pub struct SpendSecret(pub [u8; 32]);
+/// SECURITY: the byte field is private and this type is neither `Copy`,
+/// `Clone`, comparable, hashable, nor serializable. This prevents the common
+/// accidental copies and public-container insertion paths. Its explicit
+/// `Debug` implementation is redacted. Use [`derive_address`] to derive the
+/// public address without exposing the raw bytes.
+///
+/// ```compile_fail
+/// use noid_poseidon2b::primitives::SpendSecret;
+/// fn require_copy<T: Copy>() {}
+/// require_copy::<SpendSecret>();
+/// ```
+///
+/// ```compile_fail
+/// use noid_poseidon2b::primitives::SpendSecret;
+/// fn require_clone<T: Clone>() {}
+/// require_clone::<SpendSecret>();
+/// ```
+///
+/// ```compile_fail
+/// use noid_poseidon2b::primitives::SpendSecret;
+/// fn require_serialize<T: serde::Serialize>() {}
+/// require_serialize::<SpendSecret>();
+/// ```
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct SpendSecret([u8; 32]);
 
 impl SpendSecret {
+    /// Import 32 bytes into the zeroizing secret owner.
+    ///
+    /// There is deliberately no inverse raw-byte accessor. Callers importing
+    /// a secret already own the source bytes and remain responsible for
+    /// clearing that source after this constructor returns.
     #[inline]
-    pub const fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
     }
+
     #[inline]
-    pub fn into_bytes(self) -> [u8; 32] {
-        let b = self.0;
-        // self drops here -> ZeroizeOnDrop fires on the moved-out copy too
-        // (the [u8;32] returned is a plain value; caller is responsible
-        // for clearing it if needed).
-        b
-    }
-    /// Interpret the 32-byte secret as two little-endian `Block128` words.
-    /// Used only inside GKR witness construction. Do NOT log the result.
-    #[inline]
-    pub fn as_fields(&self) -> [Block128; 2] {
+    fn prover_fields(&self) -> Zeroizing<[Block128; 2]> {
         let mut a = [0u8; 16];
         let mut b = [0u8; 16];
         a.copy_from_slice(&self.0[..16]);
         b.copy_from_slice(&self.0[16..]);
-        [
+        let fields = Zeroizing::new([
             Block128::from(u128::from_le_bytes(a)),
             Block128::from(u128::from_le_bytes(b)),
-        ]
+        ]);
+        a.zeroize();
+        b.zeroize();
+        fields
+    }
+
+    /// Run one prover-side operation with the two secret field limbs.
+    ///
+    /// This is the sole intentional cross-crate exposure seam. It does not
+    /// return raw bytes or a reusable field owner: the temporary limbs are
+    /// zeroized immediately after the closure returns. The closure must not
+    /// copy, log, serialize, or persist either limb.
+    #[doc(hidden)]
+    #[inline]
+    pub fn with_exposed_prover_fields<R>(&self, use_fields: impl FnOnce(&[Block128; 2]) -> R) -> R {
+        let fields = self.prover_fields();
+        use_fields(&fields)
     }
 }
 
@@ -268,8 +299,8 @@ pub fn hash_utxo_leaf(value: u128, owner: &Address) -> Commitment {
 /// `H_ADDR = Poseidon2b_fixed(ADDRFIX_, secret_hi, secret_lo)`.
 pub fn derive_address(secret: &SpendSecret) -> Address {
     let mut s = sponge(TAG_ADDRFIX);
-    let [a, b] = secret.as_fields();
-    s.absorb_pair(a, b);
+    let fields = secret.prover_fields();
+    s.absorb_pair(fields[0], fields[1]);
     Address(s.finalize_no_pad())
 }
 
@@ -320,7 +351,7 @@ mod tests {
     #![allow(clippy::needless_range_loop)]
     use super::*;
 
-    const SS: SpendSecret = SpendSecret([7u8; 32]);
+    const SS: SpendSecret = SpendSecret::from_bytes([7u8; 32]);
 
     #[test]
     fn determinism_all_primitives() {
@@ -362,9 +393,58 @@ mod tests {
 
     #[test]
     fn address_changes_per_secret() {
-        let s1 = SpendSecret([1u8; 32]);
-        let s2 = SpendSecret([2u8; 32]);
+        let s1 = SpendSecret::from_bytes([1u8; 32]);
+        let s2 = SpendSecret::from_bytes([2u8; 32]);
         assert_ne!(derive_address(&s1), derive_address(&s2));
+    }
+
+    #[test]
+    fn spend_secret_traits_and_redaction_are_pinned() {
+        static_assertions::assert_not_impl_any!(
+            SpendSecret: Copy,
+            Clone,
+            PartialEq,
+            Eq,
+            std::hash::Hash,
+            serde::Serialize,
+            serde::de::DeserializeOwned
+        );
+        fn assert_zeroize<T: Zeroize + ZeroizeOnDrop>() {}
+        assert_zeroize::<SpendSecret>();
+
+        let secret = SpendSecret::from_bytes([0xA7; 32]);
+        let rendered = format!("{secret:?}");
+        assert_eq!(rendered, "SpendSecret([REDACTED])");
+        assert!(!rendered.contains("a7"));
+    }
+
+    #[test]
+    fn explicit_zeroize_clears_owned_secret_bytes() {
+        let mut secret = SpendSecret::from_bytes([0x5C; 32]);
+        secret.zeroize();
+        assert_eq!(secret.0, [0u8; 32]);
+    }
+
+    #[test]
+    fn spend_secret_source_has_no_raw_output_surface() {
+        let source = include_str!("primitives.rs");
+        let secret_section = source
+            .split("pub struct SpendSecret")
+            .nth(1)
+            .expect("SpendSecret declaration")
+            .split("#[inline]\nfn sponge")
+            .next()
+            .expect("SpendSecret implementation section");
+        assert!(!secret_section.starts_with("(pub "));
+        assert!(!secret_section.contains("pub fn as_bytes"));
+        assert!(!secret_section.contains("pub fn into_bytes"));
+        assert_eq!(
+            secret_section
+                .matches("pub fn with_exposed_prover_fields")
+                .count(),
+            1,
+            "the reviewed closure seam is the only prover exposure"
+        );
     }
 
     // -----------------------------------------------------------------------
