@@ -75,6 +75,10 @@ pub struct GetRecentBlockResponse {
     pub block_proof_bytes: Option<Vec<u8>>,
     /// `BlockAuthSidecar` bincode bytes.  `None` for coinbase-only blocks.
     pub block_auth_sidecar_bytes: Option<Vec<u8>>,
+    /// Process-global inbound block-byte budget retained until the node has
+    /// consumed this response. It is local flow-control state, never wire data.
+    #[serde(skip)]
+    pub(crate) inbound_memory_permit: Option<std::sync::Arc<tokio::sync::OwnedSemaphorePermit>>,
 }
 
 // ---------------------------------------------------------------------------

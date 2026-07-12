@@ -245,6 +245,9 @@ pub enum NetworkEvent {
         block_proof_bytes: Vec<u8>,
         /// `BlockAuthSidecar` bincode bytes. Empty Vec for coinbase-only blocks.
         block_auth_sidecar_bytes: Vec<u8>,
+        /// Holds the process-global inbound byte budget until node-side
+        /// validation and persistence have consumed the pulled response.
+        inbound_memory_permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     },
     /// A requested retained full block is no longer available from this peer.
     RecentBlockUnavailable { from: PeerId, height: u64 },
@@ -289,12 +292,84 @@ pub enum NetworkEvent {
     PeerDisconnected(PeerId),
 }
 
+/// Receive side for node-facing P2P events.
+///
+/// Required request/response results use a bounded, backpressured MPSC queue;
+/// recoverable gossip and peer-lifecycle notifications use broadcast and may
+/// report lag.  This prevents a slow proof verifier from either retaining 256
+/// maximum-sized blocks or silently losing a requested suffix response.
+pub struct NetworkEventReceiver {
+    required_rx: mpsc::Receiver<NetworkEvent>,
+    gossip_rx: tokio::sync::broadcast::Receiver<NetworkEvent>,
+    required_closed: bool,
+    gossip_closed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkEventRecvError {
+    /// Recoverable gossip notifications were overwritten while the consumer
+    /// was busy. Required sync responses never use this queue.
+    Lagged(u64),
+    /// Both event producers have closed.
+    Closed,
+}
+
+impl NetworkEventReceiver {
+    pub async fn recv(&mut self) -> Result<NetworkEvent, NetworkEventRecvError> {
+        loop {
+            match (self.required_closed, self.gossip_closed) {
+                (true, true) => return Err(NetworkEventRecvError::Closed),
+                (true, false) => match self.gossip_rx.recv().await {
+                    Ok(event) => return Ok(event),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        return Err(NetworkEventRecvError::Lagged(skipped));
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        self.gossip_closed = true;
+                    }
+                },
+                (false, true) => match self.required_rx.recv().await {
+                    Some(event) => return Ok(event),
+                    None => self.required_closed = true,
+                },
+                (false, false) => {
+                    tokio::select! {
+                        // Sync progress is authoritative and should not sit behind
+                        // a flood of replaceable announcements.
+                        biased;
+                        event = self.required_rx.recv() => match event {
+                            Some(event) => return Ok(event),
+                            None => self.required_closed = true,
+                        },
+                        event = self.gossip_rx.recv() => match event {
+                            Ok(event) => return Ok(event),
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                return Err(NetworkEventRecvError::Lagged(skipped));
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                self.gossip_closed = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// The node requests at most eight authenticated state segments concurrently;
+// block pull is one stream and other bounded sync responses occupy the
+// remaining slots. Backpressure begins before a second wave can accumulate.
+const REQUIRED_EVENT_QUEUE_CAPACITY: usize = 16;
+const GOSSIP_EVENT_QUEUE_CAPACITY: usize = 64;
+
 /// The P2P network manager.
 pub struct P2PNetwork {
     /// Channel to send commands to the event loop.
     pub cmd_tx: mpsc::Sender<NetworkCommand>,
     /// Subscribe to events from the event loop.
-    pub event_tx: tokio::sync::broadcast::Sender<NetworkEvent>,
+    gossip_event_tx: tokio::sync::broadcast::Sender<NetworkEvent>,
+    required_event_rx: std::sync::Mutex<Option<mpsc::Receiver<NetworkEvent>>>,
 }
 
 impl P2PNetwork {
@@ -311,14 +386,16 @@ impl P2PNetwork {
         data_dir: std::path::PathBuf,
     ) -> (Self, tokio::task::JoinHandle<()>) {
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
-        let (event_tx, _) = tokio::sync::broadcast::channel(256);
+        let (gossip_event_tx, _) = tokio::sync::broadcast::channel(GOSSIP_EVENT_QUEUE_CAPACITY);
+        let (required_event_tx, required_event_rx) = mpsc::channel(REQUIRED_EVENT_QUEUE_CAPACITY);
 
-        let event_tx_clone = event_tx.clone();
+        let gossip_event_tx_clone = gossip_event_tx.clone();
         let handle = tokio::spawn(async move {
             if let Err(e) = run_swarm(
                 listen_addr,
                 cmd_rx,
-                event_tx_clone,
+                gossip_event_tx_clone,
+                required_event_tx,
                 chain,
                 mempool,
                 topics,
@@ -330,11 +407,33 @@ impl P2PNetwork {
             }
         });
 
-        (Self { cmd_tx, event_tx }, handle)
+        (
+            Self {
+                cmd_tx,
+                gossip_event_tx,
+                required_event_rx: std::sync::Mutex::new(Some(required_event_rx)),
+            },
+            handle,
+        )
     }
 
-    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<NetworkEvent> {
-        self.event_tx.subscribe()
+    /// Attach the node's single authoritative event consumer.
+    ///
+    /// Sync responses cannot be broadcast safely because lagging receivers
+    /// silently lose entries. There is deliberately exactly one such consumer.
+    pub fn subscribe(&self) -> NetworkEventReceiver {
+        let required_rx = self
+            .required_event_rx
+            .lock()
+            .expect("P2P required event receiver mutex poisoned")
+            .take()
+            .expect("P2P event receiver may only be subscribed once");
+        NetworkEventReceiver {
+            required_rx,
+            gossip_rx: self.gossip_event_tx.subscribe(),
+            required_closed: false,
+            gossip_closed: false,
+        }
     }
 
     /// Announce a new block to all peers.  Small blocks are inlined in gossip.
@@ -462,7 +561,8 @@ impl P2PNetwork {
 async fn run_swarm(
     listen_addr: Multiaddr,
     mut cmd_rx: mpsc::Receiver<NetworkCommand>,
-    event_tx: tokio::sync::broadcast::Sender<NetworkEvent>,
+    gossip_event_tx: tokio::sync::broadcast::Sender<NetworkEvent>,
+    required_event_tx: mpsc::Sender<NetworkEvent>,
     chain: Arc<RwLock<MdbxChainContext>>,
     mempool: AsyncMempool,
     topics: NetworkTopics,
@@ -589,7 +689,8 @@ async fn run_swarm(
                 handle_swarm_event(
                     &mut swarm,
                     event,
-                    &event_tx,
+                    &gossip_event_tx,
+                    &required_event_tx,
                     &chain,
                     &mempool,
                     &topics,
@@ -907,10 +1008,12 @@ fn handle_network_command(
             from_height,
             count,
         } => {
-            // Only send the first SYNC_WINDOW requests simultaneously.
-            // Remaining blocks are requested as responses arrive, preventing
-            // a burst of N parallel requests to a single peer.
-            const SYNC_WINDOW: u64 = 4;
+            // Proof-native responses may consume the full 64 MiB inbound byte
+            // budget. Request exactly one suffix block; after it is validated
+            // and committed the node asks for height+1. This also prevents the
+            // old overlapping four-wide windows from growing libp2p's pending
+            // request queue after every applied response.
+            const SYNC_WINDOW: u64 = 1;
             for h in from_height..(from_height + (count as u64).min(SYNC_WINDOW)) {
                 let _ = swarm
                     .behaviour_mut()
@@ -994,7 +1097,8 @@ fn handle_network_command(
 async fn handle_swarm_event(
     swarm: &mut libp2p::Swarm<NodeBehaviour>,
     event: SwarmEvent<NodeBehaviourEvent>,
-    event_tx: &tokio::sync::broadcast::Sender<NetworkEvent>,
+    gossip_event_tx: &tokio::sync::broadcast::Sender<NetworkEvent>,
+    required_event_tx: &mpsc::Sender<NetworkEvent>,
     chain: &Arc<RwLock<MdbxChainContext>>,
     mempool: &AsyncMempool,
     topics: &NetworkTopics,
@@ -1046,7 +1150,7 @@ async fn handle_swarm_event(
                             tracing::debug!(peer = %origin, "block announcement rate limit exceeded — dropped before event channel");
                             return;
                         }
-                        let _ = event_tx.send(NetworkEvent::NewBlockAnnouncement {
+                        let _ = gossip_event_tx.send(NetworkEvent::NewBlockAnnouncement {
                             from: origin,
                             height,
                             hash,
@@ -1084,11 +1188,12 @@ async fn handle_swarm_event(
                                 return;
                             }
                             tracing::debug!(height, peer = %propagation_source, "received inline block via gossip");
-                            let _ = event_tx.send(NetworkEvent::NewBlock {
+                            let _ = gossip_event_tx.send(NetworkEvent::NewBlock {
                                 from: origin,
                                 block_bytes,
                                 block_proof_bytes,
                                 block_auth_sidecar_bytes,
+                                inbound_memory_permit: None,
                             });
                         }
                     }
@@ -1115,7 +1220,7 @@ async fn handle_swarm_event(
                         tracing::debug!(peer = %propagation_source, "tx gossip rate limit exceeded — dropped before event channel");
                         return;
                     }
-                    let _ = event_tx.send(NetworkEvent::NewTx {
+                    let _ = gossip_event_tx.send(NetworkEvent::NewTx {
                         from: propagation_source,
                         intent_bytes: message.data,
                     });
@@ -1301,10 +1406,12 @@ async fn handle_swarm_event(
                     decoded.push(hdr);
                 }
             }
-            let _ = event_tx.send(NetworkEvent::HeadersBatch {
-                from: peer,
-                headers: decoded,
-            });
+            let _ = required_event_tx
+                .send(NetworkEvent::HeadersBatch {
+                    from: peer,
+                    headers: decoded,
+                })
+                .await;
         }
 
         // --- Request-Response: headers server side ---
@@ -1342,6 +1449,7 @@ async fn handle_swarm_event(
                 peer,
             },
         )) => {
+            let inbound_memory_permit = response.inbound_memory_permit.clone();
             if let Some(block_bytes) = response.block_bytes {
                 if block_bytes.len() > MAX_BLOCK_BYTES {
                     tracing::warn!(peer = %peer, len = block_bytes.len(), "block pull response too large — dropped");
@@ -1370,12 +1478,15 @@ async fn handle_swarm_event(
                             return;
                         }
                         tracing::debug!(peer = %peer, "received block via pull");
-                        let _ = event_tx.send(NetworkEvent::NewBlock {
-                            from: peer,
-                            block_bytes,
-                            block_proof_bytes: proof_bytes,
-                            block_auth_sidecar_bytes: auth_sidecar_bytes,
-                        });
+                        let _ = required_event_tx
+                            .send(NetworkEvent::NewBlock {
+                                from: peer,
+                                block_bytes,
+                                block_proof_bytes: proof_bytes,
+                                block_auth_sidecar_bytes: auth_sidecar_bytes,
+                                inbound_memory_permit,
+                            })
+                            .await;
                     }
                 }
             } else {
@@ -1384,10 +1495,12 @@ async fn handle_swarm_event(
                     height = response.height,
                     "requested recent block unavailable"
                 );
-                let _ = event_tx.send(NetworkEvent::RecentBlockUnavailable {
-                    from: peer,
-                    height: response.height,
-                });
+                let _ = required_event_tx
+                    .send(NetworkEvent::RecentBlockUnavailable {
+                        from: peer,
+                        height: response.height,
+                    })
+                    .await;
             }
         }
 
@@ -1467,6 +1580,7 @@ async fn handle_swarm_event(
                     block_bytes,
                     block_proof_bytes,
                     block_auth_sidecar_bytes,
+                    inbound_memory_permit: None,
                 },
             );
         }
@@ -1517,11 +1631,13 @@ async fn handle_swarm_event(
                 proof_len = proof_bytes.len(),
                 "received history proof from peer"
             );
-            let _ = event_tx.send(NetworkEvent::HistoryProof {
-                from: peer,
-                proof_bytes,
-                tip_header_bytes,
-            });
+            let _ = required_event_tx
+                .send(NetworkEvent::HistoryProof {
+                    from: peer,
+                    proof_bytes,
+                    tip_header_bytes,
+                })
+                .await;
         }
 
         // --- State sync: manifest server (step 1) ---
@@ -1709,20 +1825,24 @@ async fn handle_swarm_event(
                     segments = response.segment_ids.len(),
                     "received state manifest"
                 );
-                let _ = event_tx.send(NetworkEvent::StateManifest {
-                    from: peer,
-                    manifest: Box::new(response),
-                });
+                let _ = required_event_tx
+                    .send(NetworkEvent::StateManifest {
+                        from: peer,
+                        manifest: Box::new(response),
+                    })
+                    .await;
             } else {
                 // tip=0 is still a valid response for sync coordination: the node
                 // layer counts it as "peer responded but has no usable state", so
                 // it can proceed with another valid candidate without waiting for
                 // the manifest timeout.
                 tracing::debug!(from = %peer, "received empty state manifest");
-                let _ = event_tx.send(NetworkEvent::StateManifest {
-                    from: peer,
-                    manifest: Box::new(response),
-                });
+                let _ = required_event_tx
+                    .send(NetworkEvent::StateManifest {
+                        from: peer,
+                        manifest: Box::new(response),
+                    })
+                    .await;
             }
         }
 
@@ -1852,10 +1972,12 @@ async fn handle_swarm_event(
                 present = response.data.is_some(),
                 "received state segment"
             );
-            let _ = event_tx.send(NetworkEvent::StateSegment {
-                from: peer,
-                response,
-            });
+            let _ = required_event_tx
+                .send(NetworkEvent::StateSegment {
+                    from: peer,
+                    response,
+                })
+                .await;
         }
 
         // --- Mempool sync: server side (peer requests our mempool) ---
@@ -1924,7 +2046,7 @@ async fn handle_swarm_event(
                     tx_count = txs.len(),
                     "received mempool sync response"
                 );
-                let _ = event_tx.send(NetworkEvent::MempoolSyncResponse { from: peer, txs });
+                let _ = gossip_event_tx.send(NetworkEvent::MempoolSyncResponse { from: peer, txs });
             }
         }
 
@@ -1946,7 +2068,7 @@ async fn handle_swarm_event(
             // mDNS re-discovery, relay + direct). Emitting for each one causes
             // redundant SyncBlocksFrom and RequestMempoolSync from the node handler.
             if num_established.get() == 1 {
-                let _ = event_tx.send(NetworkEvent::PeerConnected(peer_id));
+                let _ = gossip_event_tx.send(NetworkEvent::PeerConnected(peer_id));
                 tracing::debug!(peer = %peer_id, "peer connected");
             }
             // Clear any pending reconnect entry — connection succeeded.
@@ -1961,7 +2083,7 @@ async fn handle_swarm_event(
         } => {
             // Only emit PeerDisconnected when the LAST connection to a peer closes.
             if num_established == 0 {
-                let _ = event_tx.send(NetworkEvent::PeerDisconnected(peer_id));
+                let _ = gossip_event_tx.send(NetworkEvent::PeerDisconnected(peer_id));
                 tracing::debug!(peer = %peer_id, cause = ?cause, "peer disconnected");
                 block_event_rate.remove(&peer_id);
                 tx_gossip_rate.remove(&peer_id);
@@ -1994,21 +2116,21 @@ async fn handle_swarm_event(
         )) => {
             tracing::debug!(peer = %peer, err = %error, "block sync request failed");
             // Emit a generic disconnect so the sync state machine can retry.
-            let _ = event_tx.send(NetworkEvent::PeerDisconnected(peer));
+            let _ = gossip_event_tx.send(NetworkEvent::PeerDisconnected(peer));
         }
 
         SwarmEvent::Behaviour(NodeBehaviourEvent::StateManifestSync(
             request_response::Event::OutboundFailure { peer, error, .. },
         )) => {
             tracing::debug!(peer = %peer, err = %error, "manifest sync request failed");
-            let _ = event_tx.send(NetworkEvent::PeerDisconnected(peer));
+            let _ = gossip_event_tx.send(NetworkEvent::PeerDisconnected(peer));
         }
 
         SwarmEvent::Behaviour(NodeBehaviourEvent::StateSegmentSync(
             request_response::Event::OutboundFailure { peer, error, .. },
         )) => {
             tracing::debug!(peer = %peer, err = %error, "segment sync request failed");
-            let _ = event_tx.send(NetworkEvent::PeerDisconnected(peer));
+            let _ = gossip_event_tx.send(NetworkEvent::PeerDisconnected(peer));
         }
 
         SwarmEvent::Behaviour(NodeBehaviourEvent::ProofSync(
@@ -2062,5 +2184,76 @@ mod tests {
         assert!(MAX_TX_INTENT_BYTES_GLOBAL < INLINE_BLOCK_GOSSIP_THRESHOLD);
         assert!(MAX_MEMPOOL_SYNC_BYTES >= MAX_TX_INTENT_BYTES_GLOBAL);
         assert!(MAX_HISTORY_PROOF_BYTES < MAX_BLOCK_PROOF_BYTES);
+    }
+
+    #[tokio::test]
+    async fn required_event_queue_is_hard_bounded_and_backpressured() {
+        let (tx, mut rx) = mpsc::channel(REQUIRED_EVENT_QUEUE_CAPACITY);
+        let peer = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id();
+        for height in 0..REQUIRED_EVENT_QUEUE_CAPACITY {
+            tx.try_send(NetworkEvent::RecentBlockUnavailable {
+                from: peer,
+                height: height as u64,
+            })
+            .unwrap();
+        }
+        assert!(matches!(
+            tx.try_send(NetworkEvent::RecentBlockUnavailable {
+                from: peer,
+                height: u64::MAX,
+            }),
+            Err(mpsc::error::TrySendError::Full(_))
+        ));
+
+        assert!(rx.recv().await.is_some());
+        tx.try_send(NetworkEvent::RecentBlockUnavailable {
+            from: peer,
+            height: u64::MAX,
+        })
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn required_response_survives_recoverable_gossip_lag() {
+        let (required_tx, required_rx) = mpsc::channel(1);
+        let (gossip_tx, gossip_rx) = tokio::sync::broadcast::channel(2);
+        let peer = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id();
+        let mut receiver = NetworkEventReceiver {
+            required_rx,
+            gossip_rx,
+            required_closed: false,
+            gossip_closed: false,
+        };
+
+        for height in 0..3 {
+            gossip_tx
+                .send(NetworkEvent::NewBlockAnnouncement {
+                    from: peer,
+                    height,
+                    hash: [height as u8; 32],
+                    header_bytes: Vec::new(),
+                })
+                .unwrap();
+        }
+        required_tx
+            .send(NetworkEvent::RecentBlockUnavailable {
+                from: peer,
+                height: 99,
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            receiver.recv().await,
+            Ok(NetworkEvent::RecentBlockUnavailable { height: 99, .. })
+        ));
+        assert!(matches!(
+            receiver.recv().await,
+            Err(NetworkEventRecvError::Lagged(1))
+        ));
     }
 }

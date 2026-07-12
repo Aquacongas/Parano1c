@@ -9,9 +9,12 @@
 //! - Identify + Ping for peer management
 
 pub mod behaviour;
+pub mod block_sync_codec;
 pub mod network;
 pub mod peer_store;
 pub mod protocol;
 
-pub use network::{NetworkCommand, NetworkEvent, P2PNetwork};
+pub use network::{
+    NetworkCommand, NetworkEvent, NetworkEventReceiver, NetworkEventRecvError, P2PNetwork,
+};
 pub use protocol::{NetworkTopics, Topics};

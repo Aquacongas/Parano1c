@@ -1770,7 +1770,7 @@ mod tests {
 }
 
 async fn handle_p2p_events(
-    mut rx: tokio::sync::broadcast::Receiver<NetworkEvent>,
+    mut rx: noid_p2p::NetworkEventReceiver,
     chain: Arc<RwLock<MdbxChainContext>>,
     mempool: AsyncMempool,
     wallet: SharedWallet,
@@ -2093,6 +2093,7 @@ async fn handle_p2p_events(
                 block_bytes,
                 block_proof_bytes,
                 block_auth_sidecar_bytes,
+                inbound_memory_permit: _inbound_memory_permit,
             }) => {
                 // Per-peer block rate limit: prevents flood DoS.
                 // Each block requires chain.write() + PoW validation.
@@ -3474,10 +3475,10 @@ async fn handle_p2p_events(
                 peer_tx_rate.remove(&peer);
                 peer_block_rate.remove(&peer);
             }
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                tracing::warn!(n, "P2P event receiver lagged — some events dropped");
+            Err(noid_p2p::NetworkEventRecvError::Lagged(n)) => {
+                tracing::warn!(n, "P2P gossip receiver lagged — recoverable gossip events dropped");
             }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+            Err(noid_p2p::NetworkEventRecvError::Closed) => {
                 tracing::info!("P2P event channel closed");
                 break;
             }

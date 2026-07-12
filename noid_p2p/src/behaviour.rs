@@ -35,11 +35,11 @@ use noid_poseidon2b::native::poseidon2b_hash_bytes;
 
 const GOSSIPSUB_MESSAGE_ID_DOMAIN: &[u8] = b"NOID_P2P_GOSSIPSUB_MESSAGE_ID";
 
+use crate::block_sync_codec::BlockSyncCodec;
 use crate::protocol::{
     GetHeadersRequest, GetHeadersResponse, GetHistoryProofRequest, GetHistoryProofResponse,
-    GetMempoolRequest, GetMempoolResponse, GetRecentBlockRequest, GetRecentBlockResponse,
-    GetStateManifestRequest, GetStateManifestResponse, GetStateSegmentRequest,
-    GetStateSegmentResponse,
+    GetMempoolRequest, GetMempoolResponse, GetStateManifestRequest, GetStateManifestResponse,
+    GetStateSegmentRequest, GetStateSegmentResponse,
 };
 
 /// All P2P behaviours composed via the derive macro.
@@ -55,8 +55,7 @@ pub struct NodeBehaviour {
     pub chain_sync: request_response::cbor::Behaviour<GetHeadersRequest, GetHeadersResponse>,
 
     /// Block sync (recent blocks).
-    pub block_sync:
-        request_response::cbor::Behaviour<GetRecentBlockRequest, GetRecentBlockResponse>,
+    pub block_sync: request_response::Behaviour<BlockSyncCodec>,
 
     /// History proof sync (O(1) chain-history verification).
     pub proof_sync:
@@ -242,17 +241,21 @@ impl NodeBehaviour {
             request_response::Config::default().with_request_timeout(Duration::from_secs(30)),
         );
 
-        let block_sync = request_response::cbor::Behaviour::new(
+        let block_sync = request_response::Behaviour::new(
             [(
-                StreamProtocol::try_from_owned(format!("{}/sync/block/1", protocol_id))?,
+                // v2 is an allocation-bounded fixed-header stream codec.  It
+                // intentionally cannot negotiate with the old 10 MiB CBOR wire.
+                StreamProtocol::try_from_owned(format!("{}/sync/block/2", protocol_id))?,
                 ProtocolSupport::Full,
             )],
             request_response::Config::default()
                 .with_request_timeout(Duration::from_secs(30))
-                // Full proof-native block responses can be tens of MiB. Keep this
-                // below the generic libp2p default so a large miner set cannot
-                // force multi-GiB simultaneous block/proof transfers.
-                .with_max_concurrent_streams(8),
+                // A response can contain 48 MiB of proof material. One stream
+                // per connection reduces scheduling pressure; the codec's
+                // process-global 64 MiB permit is the peer-count-independent
+                // RAM bound. Suffix advancement requests the next block only
+                // after the current block has been consumed.
+                .with_max_concurrent_streams(1),
         );
 
         let proof_sync = request_response::cbor::Behaviour::new(
