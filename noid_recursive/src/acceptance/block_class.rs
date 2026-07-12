@@ -101,6 +101,51 @@ enum BlockClassAuthorizationBackend {
 }
 
 impl BlockClass {
+    /// Rehydrate one selected production class from a compact, locally
+    /// provisioned registry artifact.  The artifact supplies identities, not
+    /// a matrix or witness: every deterministic class component is rebuilt
+    /// here and the complete composite identity is checked before the class
+    /// can escape.
+    pub(crate) fn from_selected_registry_parts(
+        tier: usize,
+        shape: FieldShape,
+        pcs_params: PcsParams,
+        spec: PublicIoSpec,
+        matrix_digest: [u8; 32],
+        sidecar_vk: BlockRegionSidecarVk,
+        post_commit_class_digest: [u8; 32],
+    ) -> Result<Self, BlockProofError> {
+        if !noid_chain::consensus::params::USER_TX_CLASS_TIERS.contains(&tier) {
+            return Err(BlockProofError::ClassIdentityMismatch);
+        }
+        let class_statement_digest = OnceLock::new();
+        class_statement_digest
+            .set(matrix_digest)
+            .map_err(|_| BlockProofError::ClassIdentityMismatch)?;
+        let class = Self {
+            tier,
+            shape,
+            class_statement_digest,
+            pcs_params,
+            spec,
+            config_template: production_config(
+                RegionDischargeParams {
+                    nq: noid_fri_binius::capsule::CAPSULE_NUM_QUERIES,
+                },
+                tier,
+            ),
+            sidecar_vk,
+            post_commit_class_digest,
+            authorization_backend: BlockClassAuthorizationBackend::SelectedZk,
+        };
+        class.validate_selected_zk_identity_for_tier(tier)?;
+        Ok(class)
+    }
+
+    pub(crate) fn registry_matrix_digest(&self) -> Result<[u8; 32], BlockProofError> {
+        self.matrix_digest()
+    }
+
     /// Freeze both halves of the class from one tier-valid sample: the exact
     /// matrix and the exact ordered six-child sidecar VK.  Since the region
     /// discharge no longer contributes proof-shaped rows or public IO, this is

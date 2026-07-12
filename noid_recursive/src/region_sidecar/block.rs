@@ -22,7 +22,7 @@ use noid_ivc_core::deep_chain::{
 use noid_ivc_core::field::F128;
 use noid_ivc_core::field_circuit::FsChannelOps;
 use noid_ivc_core::pcs::{PcsParams, QuirkyDirectClaim};
-use noid_ivc_core::public_io::PublicIoSpec;
+use noid_ivc_core::public_io::{PublicIoSpec, WitnessSlice};
 use noid_ivc_core::verifier::FieldPostCommitVerifierContext;
 use noid_ivc_prover::field_prover::FieldPostCommitProverContext;
 use noid_poseidon2b::native::domain::{
@@ -67,6 +67,22 @@ use super::{
 
 pub const BLOCK_REGION_SIDECAR_VERSION: u8 = 3;
 pub const BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION: u8 = 4;
+
+/// Compact retained portion of a selected Block sidecar VK.
+///
+/// Every schedule, purpose, family descriptor, fixed table and walk geometry
+/// is canonical for the tier and is regenerated on load.  Only the outer
+/// witness locations vary with the frozen matrix layout and therefore need to
+/// be persisted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SelectedZkBlockRegionVkSlices {
+    pub wallet_a: [WitnessSlice; super::WALK_A_WALLET_COMMITTED_COLUMNS],
+    pub meta_a: [WitnessSlice; super::WALK_A_META_COMMITTED_COLUMNS],
+    pub wallet_b: [WitnessSlice; super::MERKLE_REGION_COMMITTED_COLUMNS],
+    pub meta_b: [WitnessSlice; super::MERKLE_REGION_COMMITTED_COLUMNS],
+    pub owner_c: [WitnessSlice; super::DUPLEX_REGION_COMMITTED_COLUMNS],
+    pub main_c: [WitnessSlice; super::DUPLEX_REGION_COMMITTED_COLUMNS],
+}
 
 /// Exact selected authorization geometry for one canonical block class.
 ///
@@ -226,6 +242,122 @@ pub struct BlockRegionSidecarVk {
 }
 
 impl BlockRegionSidecarVk {
+    /// Rebuild a selected VK from its compact registry carrier.  This is a
+    /// checked constructor, not a raw-field deserializer: all omitted data is
+    /// regenerated from the canonical tier certificate, and the final
+    /// six-child role validator compares the resulting duplex schedules and
+    /// Merkle families byte-for-byte with production geometry.
+    pub(crate) fn from_selected_registry_slices(
+        tier: usize,
+        slices: SelectedZkBlockRegionVkSlices,
+    ) -> Result<Self, RegionSidecarError> {
+        let geometry =
+            selected_zk_block_geometry(tier).ok_or(RegionSidecarError::UnsupportedVkShape)?;
+        let wallet_a = WalkARegionVk::new_wallet(
+            selected_zk_auth_wallet_a_sidecar_purpose(),
+            geometry.tx_log,
+            SELECTED_ZK_AUTH_QUERY_LOG,
+            slices.wallet_a,
+        )?;
+        let meta_a = WalkARegionVk::new_meta(
+            auth_pcs_meta_a_sidecar_purpose(),
+            geometry.tx_log,
+            Some(geometry.exact_state_region_log),
+            Some(geometry.spine_cap_log),
+            slices.meta_a,
+        )?;
+        let capsule_iv = capacity_iv_flat(TAG_CAPSNODE).map(raw_flat_lane);
+        let wallet_b = MerkleRegionVk::new(
+            selected_zk_auth_wallet_b_sidecar_purpose(),
+            geometry.wallet_b_w_log,
+            slices.wallet_b,
+            10,
+            vec![
+                super::MerkleRegionFamily::FeedForward {
+                    offset: 0,
+                    depth: 8,
+                    n_paths: 64,
+                    iv: capsule_iv,
+                },
+                super::MerkleRegionFamily::FeedForward {
+                    offset: 512,
+                    depth: 8,
+                    n_paths: 64,
+                    iv: capsule_iv,
+                },
+            ],
+        )?;
+        let exact_state_iv = capacity_iv_flat(TAG_EXSTNOD).map(raw_flat_lane);
+        let meta_b = MerkleRegionVk::new(
+            auth_pcs_meta_b_sidecar_purpose(),
+            geometry.meta_b_w_log,
+            slices.meta_b,
+            geometry.meta_b_block_log,
+            vec![
+                super::MerkleRegionFamily::PairedUpdate {
+                    offset: geometry.paired_bases[0],
+                    n_updates: geometry.paired_caps_per_block[0],
+                    iv: exact_state_iv,
+                },
+                super::MerkleRegionFamily::PairedUpdate {
+                    offset: geometry.paired_bases[1],
+                    n_updates: geometry.paired_caps_per_block[1],
+                    iv: exact_state_iv,
+                },
+                super::MerkleRegionFamily::TwoPermutation {
+                    offset: geometry.tx_root_base,
+                    depth: 8,
+                    n_paths: geometry.tx_root_paths_per_block,
+                    iv: compress_iv_flat(),
+                },
+            ],
+        )?;
+        let schedules = ZkAuthCapsuleDuplexSchedules::selected();
+        let [iv_hi, iv_lo] = capacity_iv(TAG_KSCHANNL);
+        let iv = [flat_of_tower_u128(iv_hi.0), flat_of_tower_u128(iv_lo.0)];
+        let owner_layout = schedules.owner_layout();
+        let owner_c = DuplexRegionVk::new(
+            selected_zk_auth_owner_sidecar_purpose(),
+            geometry.owner_w_log,
+            slices.owner_c,
+            duplex_fixed_patterns(&owner_layout, iv, ZK_AUTH_OWNER_TILE_LOG),
+            duplex_family_refs(0, 0),
+            &owner_layout,
+        )?;
+        let main_layout = schedules.main_layout();
+        let main_c = DuplexRegionVk::new(
+            selected_zk_auth_main_sidecar_purpose(),
+            geometry.main_w_log,
+            slices.main_c,
+            duplex_fixed_patterns(&main_layout, iv, ZK_AUTH_MAIN_TILE_LOG),
+            duplex_family_refs(0, 0),
+            &main_layout,
+        )?;
+        Self::new_selected_zk(wallet_a, meta_a, wallet_b, meta_b, owner_c, main_c)
+    }
+
+    pub(crate) fn selected_registry_slices(
+        &self,
+    ) -> Result<SelectedZkBlockRegionVkSlices, RegionSidecarError> {
+        self.validate_selected_zk_roles()?;
+        Ok(SelectedZkBlockRegionVkSlices {
+            wallet_a: self
+                .wallet_a
+                .slices()
+                .try_into()
+                .map_err(|_| RegionSidecarError::UnsupportedVkShape)?,
+            meta_a: self
+                .meta_a
+                .slices()
+                .try_into()
+                .map_err(|_| RegionSidecarError::UnsupportedVkShape)?,
+            wallet_b: *self.wallet_b.slices(),
+            meta_b: *self.meta_b.slices(),
+            owner_c: *self.owner_c.slices(),
+            main_c: *self.main_c.slices(),
+        })
+    }
+
     pub fn new(
         wallet_a: WalkARegionVk,
         meta_a: WalkARegionVk,
@@ -1478,6 +1610,20 @@ mod tests {
         assert!(selected_zk_block_geometry(0).is_none());
         assert!(selected_zk_block_geometry(9).is_none());
         assert!(selected_zk_block_geometry(256).is_none());
+    }
+
+    #[test]
+    fn compact_selected_vk_slices_rehydrate_exact_identity() {
+        for tier in noid_chain::consensus::params::USER_TX_CLASS_TIERS {
+            let original = selected_vk_fixture(tier);
+            let slices = original
+                .selected_registry_slices()
+                .expect("canonical selected VK compact carrier");
+            let restored = BlockRegionSidecarVk::from_selected_registry_slices(tier, slices)
+                .expect("compact carrier must regenerate the canonical VK");
+            assert_eq!(restored, original);
+            assert_eq!(restored.transcript_digest(), original.transcript_digest());
+        }
     }
 
     #[test]

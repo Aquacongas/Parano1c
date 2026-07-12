@@ -40,6 +40,7 @@
 mod memory_governor;
 pub mod miner;
 pub mod pow;
+mod recursive_class_registry_store;
 pub mod recursive_matrix_store;
 pub mod recursive_prover;
 pub mod selected_history_verifier;
@@ -47,10 +48,14 @@ pub mod template;
 
 pub use miner::{BlockAppliedHook, BlockMiner, MinerConfig, MinerEvent};
 pub use pow::{search_pow_parallel, PowSolution};
+pub use recursive_class_registry_store::{
+    LoadedSelectedRecursiveClassRegistry, LocalSelectedRecursiveClassRegistryError,
+    LocalSelectedRecursiveClassRegistryStore,
+};
 pub use recursive_matrix_store::{
-    selected_recursive_matrix_relative_path, LocalSelectedRecursiveMatrixError,
-    LocalSelectedRecursiveMatrixSource, SelectedRecursiveMatrixArtifactIdentity,
-    MAX_SELECTED_RECURSIVE_MATRIX_ARTIFACT_BYTES,
+    selected_recursive_matrix_relative_path, LoadedSelectedRecursiveMatrixView,
+    LocalSelectedRecursiveMatrixError, LocalSelectedRecursiveMatrixSource,
+    SelectedRecursiveMatrixArtifactIdentity, MAX_SELECTED_RECURSIVE_MATRIX_ARTIFACT_BYTES,
 };
 pub use recursive_prover::{
     begin_selected_history_proof_session, prove_selected_recursive_block,

@@ -30,6 +30,11 @@ const RECURSIVE_LINK_PEAK_MIB: usize = B255_PEAK_MIB;
 /// Block proof, and its following Link proof.  Its admission must therefore
 /// cover the largest phase for the entire sequence, regardless of Block tier.
 const SELECTED_HISTORY_SESSION_PEAK_MIB: usize = RECURSIVE_LINK_PEAK_MIB;
+/// Terminal verification streams canonical matrices from disk. Two bounded
+/// coefficient/scratch buffers and factorized equality tables stay below a
+/// few MiB at m24; 16 MiB leaves conservative allocator and I/O headroom while
+/// the shared active-job gate still excludes every proof worker.
+const SELECTED_HISTORY_TERMINAL_VERIFY_PEAK_MIB: usize = 16;
 
 /// Never let proof admission consume the complete host-visible allowance.
 const MIN_NODE_RESERVE_MIB: usize = 1024;
@@ -165,6 +170,19 @@ impl ProofMemoryGovernor {
         )
     }
 
+    /// Admit bounded-memory terminal verification while excluding all native
+    /// and recursive proof workers process-wide. This is intentionally not an
+    /// m24 proving reservation: requiring 8 GiB here would prevent a low-RAM
+    /// non-mining node from synchronizing even though matrices remain on disk.
+    pub(crate) fn try_reserve_for_selected_history_terminal_verification(
+        &self,
+    ) -> Result<ProofMemoryReservation, ProofMemoryPressure> {
+        self.try_reserve_required_mib(
+            SELECTED_HISTORY_TERMINAL_VERIFY_PEAK_MIB,
+            system_available_memory_mib(),
+        )
+    }
+
     fn try_reserve_with_available(
         &self,
         user_txs: usize,
@@ -193,6 +211,14 @@ impl ProofMemoryGovernor {
         available_mib: Option<usize>,
     ) -> Result<ProofMemoryReservation, ProofMemoryPressure> {
         self.try_reserve_required_mib(SELECTED_HISTORY_SESSION_PEAK_MIB, available_mib)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_reserve_selected_history_terminal_with_available(
+        &self,
+        available_mib: Option<usize>,
+    ) -> Result<ProofMemoryReservation, ProofMemoryPressure> {
+        self.try_reserve_required_mib(SELECTED_HISTORY_TERMINAL_VERIFY_PEAK_MIB, available_mib)
     }
 
     fn try_reserve_required_mib(
@@ -458,6 +484,58 @@ mod tests {
         assert!(governor
             .try_reserve_selected_history_with_available(None)
             .is_ok());
+    }
+
+    #[test]
+    fn low_memory_admits_streaming_terminal_but_not_a_prover() {
+        let governor = ProofMemoryGovernor::new(B255_PEAK_MIB);
+        // host_safe_budget_mib(2048) = 1024 MiB: ample for the 16-MiB
+        // streaming verifier but below even the smallest B8 proof envelope.
+        let terminal = governor
+            .try_reserve_selected_history_terminal_with_available(Some(2048))
+            .expect("low-memory node must still verify terminal history");
+        assert_eq!(
+            governor
+                .try_reserve_recursive_with_available(8, Some(2048))
+                .expect_err("terminal verification excludes proof overlap"),
+            ProofMemoryPressure {
+                required_mib: B8_PEAK_MIB,
+                available_mib: 0,
+            }
+        );
+        drop(terminal);
+        assert_eq!(
+            governor
+                .try_reserve_recursive_with_available(8, Some(2048))
+                .expect_err("host pressure still rejects a B8 prover"),
+            ProofMemoryPressure {
+                required_mib: B8_PEAK_MIB,
+                available_mib: 1024,
+            }
+        );
+        drop(
+            governor
+                .try_reserve_selected_history_terminal_with_available(Some(2048))
+                .expect("terminal RAII drop releases process-wide exclusion"),
+        );
+    }
+
+    #[test]
+    fn terminal_verification_reservation_releases_during_unwind() {
+        let governor = ProofMemoryGovernor::new(B255_PEAK_MIB);
+        let unwind_governor = governor.clone();
+        let unwound = std::panic::catch_unwind(move || {
+            let _terminal = unwind_governor
+                .try_reserve_selected_history_terminal_with_available(Some(2048))
+                .expect("streaming terminal admission before panic");
+            panic!("synthetic terminal verifier panic");
+        });
+        assert!(unwound.is_err());
+        drop(
+            governor
+                .try_reserve_selected_history_terminal_with_available(Some(2048))
+                .expect("unwind releases terminal verification admission"),
+        );
     }
 
     #[test]

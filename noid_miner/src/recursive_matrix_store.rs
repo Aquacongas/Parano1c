@@ -19,7 +19,10 @@ use std::sync::{Arc, OnceLock};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
-use noid_ivc_core::field_r1cs::{FieldR1cs, FieldR1csArtifactError};
+use noid_ivc_core::field_r1cs::{FieldR1cs, FieldR1csArtifactError, SeekableFieldR1csArtifact};
+use noid_ivc_core::matrix_claim::{
+    AuthenticatedMatrixClaimEvaluations, FreshLincheckClaim, MatrixAccClaim, MatrixClaimEvaluator,
+};
 use noid_ivc_core::proof::FieldShape;
 use thiserror::Error;
 
@@ -224,6 +227,21 @@ impl LocalSelectedRecursiveMatrixSource {
         )
     }
 
+    /// Open one canonical artifact as a bounded-memory seekable evaluator.
+    /// No CSR index, offset, or coefficient array proportional to matrix size
+    /// is retained. The returned lease owns the opened inode and process-wide
+    /// matrix admission until its file view is dropped.
+    pub fn open_artifact_view(
+        &self,
+        identity: SelectedRecursiveMatrixArtifactIdentity,
+    ) -> Result<LoadedSelectedRecursiveMatrixView, LocalSelectedRecursiveMatrixError> {
+        self.open_requested_view(
+            identity.kind(),
+            identity.shape(),
+            identity.statement_digest(),
+        )
+    }
+
     /// Atomically stream one canonical matrix to its fixed local path.
     ///
     /// The matrix is checked against the request before any target mutation.
@@ -336,6 +354,50 @@ impl LocalSelectedRecursiveMatrixSource {
         ))
     }
 
+    fn open_requested_view(
+        &self,
+        kind: SelectedRecursiveMatrixKind,
+        shape: FieldShape,
+        statement_digest: [u8; 32],
+    ) -> Result<LoadedSelectedRecursiveMatrixView, LocalSelectedRecursiveMatrixError> {
+        let lease = ResidentMatrixLease::acquire(Arc::clone(&self.resident))?;
+        let path = self.artifact_path(kind);
+        let parent = path.parent().expect("fixed matrix path has parent");
+        validate_directory(&self.root)?;
+        validate_directory(parent)?;
+
+        let before =
+            fs::symlink_metadata(&path).map_err(|source| io_error("stat", &path, source))?;
+        validate_regular_file_metadata(&path, &before)?;
+        let cap = self.effective_max_bytes();
+        reject_oversize(before.len(), cap)?;
+
+        let file = open_artifact_read_only(&path)?;
+        let opened = file
+            .metadata()
+            .map_err(|source| io_error("inspect opened", &path, source))?;
+        validate_regular_file_metadata(&path, &opened)?;
+        if !same_file_and_length(&before, &opened) {
+            return Err(LocalSelectedRecursiveMatrixError::ArtifactChanged { path });
+        }
+        let view = SeekableFieldR1csArtifact::open(file, shape, statement_digest, cap)
+            .map_err(LocalSelectedRecursiveMatrixError::Codec)?;
+        let after = view
+            .reader()
+            .metadata()
+            .map_err(|source| io_error("inspect validated", &path, source))?;
+        if !same_file_and_length(&opened, &after) {
+            return Err(LocalSelectedRecursiveMatrixError::ArtifactChanged { path });
+        }
+
+        let resident = lease.transfer();
+        Ok(LoadedSelectedRecursiveMatrixView {
+            view: Some(view),
+            opened,
+            release_callback: Some(Box::new(move || resident.store(false, Ordering::Release))),
+        })
+    }
+
     fn effective_max_bytes(&self) -> u64 {
         self.max_artifact_bytes.min(usize::MAX as u64)
     }
@@ -364,6 +426,64 @@ impl SelectedRecursiveMatrixSource for LocalSelectedRecursiveMatrixSource {
         request: SelectedRecursiveMatrixRequest,
     ) -> Result<LoadedSelectedRecursiveMatrix, Self::Error> {
         self.load_requested(request.kind(), request.shape(), request.statement_digest())
+    }
+}
+
+/// RAII lease over an authenticated seekable artifact.  The opened file is
+/// destroyed before process-global residency is released, matching the
+/// decoded-matrix lease's ordering while retaining only bounded scratch.
+pub struct LoadedSelectedRecursiveMatrixView {
+    view: Option<SeekableFieldR1csArtifact<File>>,
+    opened: Metadata,
+    release_callback: Option<Box<dyn FnOnce() + Send + 'static>>,
+}
+
+impl LoadedSelectedRecursiveMatrixView {
+    fn ensure_opened_file_identity(&self) -> Result<(), FieldR1csArtifactError> {
+        let current = self
+            .view
+            .as_ref()
+            .expect("matrix view exists until lease drop")
+            .reader()
+            .metadata()
+            .map_err(FieldR1csArtifactError::Io)?;
+        if !same_file_and_length(&self.opened, &current) {
+            return Err(FieldR1csArtifactError::BackingFileChanged);
+        }
+        Ok(())
+    }
+}
+
+impl MatrixClaimEvaluator for LoadedSelectedRecursiveMatrixView {
+    fn field_shape(&self) -> FieldShape {
+        self.view
+            .as_ref()
+            .expect("matrix view exists until lease drop")
+            .field_shape()
+    }
+
+    fn evaluate_matrix_claims(
+        &mut self,
+        fresh: Option<&FreshLincheckClaim>,
+        accumulated: Option<&MatrixAccClaim>,
+    ) -> Result<AuthenticatedMatrixClaimEvaluations, FieldR1csArtifactError> {
+        self.ensure_opened_file_identity()?;
+        let evaluated = self
+            .view
+            .as_mut()
+            .expect("matrix view exists until lease drop")
+            .evaluate_matrix_claims(fresh, accumulated)?;
+        self.ensure_opened_file_identity()?;
+        Ok(evaluated)
+    }
+}
+
+impl Drop for LoadedSelectedRecursiveMatrixView {
+    fn drop(&mut self) {
+        drop(self.view.take());
+        if let Some(release_callback) = self.release_callback.take() {
+            release_callback();
+        }
     }
 }
 
@@ -673,6 +793,61 @@ mod tests {
             version_entries,
             vec![OsString::from("genesis-link.field-r1cs")]
         );
+    }
+
+    #[test]
+    fn seekable_view_matches_in_memory_claim_and_holds_admission() {
+        use noid_ivc_core::matrix_claim::{stacked_matrix_mle_eval, MatrixAccClaim};
+
+        let directory = tempdir().unwrap();
+        let source = isolated_source(directory.path());
+        let matrix = tiny_matrix(0x51EA);
+        let matrix_identity = identity(SelectedRecursiveMatrixKind::GenesisLink, &matrix);
+        source.export_matrix(matrix_identity, &matrix).unwrap();
+        let mut claim = MatrixAccClaim {
+            point: vec![F128::new(7, 11); 2 * matrix.k_log + 1],
+            value: F128::ZERO,
+        };
+        claim.value = stacked_matrix_mle_eval(&matrix, &claim);
+
+        let mut view = source.open_artifact_view(matrix_identity).unwrap();
+        assert!(matches!(
+            source.load_artifact(matrix_identity),
+            Err(LocalSelectedRecursiveMatrixError::MatrixAlreadyResident)
+        ));
+        let evaluated = view.evaluate_matrix_claims(None, Some(&claim)).unwrap();
+        assert_eq!(
+            evaluated.structural_digest,
+            matrix_identity.statement_digest()
+        );
+        assert_eq!(evaluated.accumulated_value, Some(claim.value));
+        drop(view);
+        drop(source.load_artifact(matrix_identity).unwrap());
+    }
+
+    #[test]
+    fn terminal_view_source_never_invokes_full_csr_decoder() {
+        let store = include_str!("recursive_matrix_store.rs");
+        let view_loader = store
+            .split("fn open_requested_view(")
+            .nth(1)
+            .expect("seekable view loader")
+            .split("fn effective_max_bytes")
+            .next()
+            .expect("view loader boundary");
+        assert!(view_loader.contains("SeekableFieldR1csArtifact::open"));
+        assert!(!view_loader.contains("FieldR1cs::read_artifact"));
+
+        let verifier = include_str!("selected_history_verifier.rs");
+        let source_impl = verifier
+            .split("impl SelectedHistoryMatrixSource for LocalSelectedRecursiveMatrixSource")
+            .nth(1)
+            .expect("selected-history source implementation")
+            .split("/// Production terminal-verification failure")
+            .next()
+            .expect("source implementation boundary");
+        assert!(source_impl.contains("self.open_artifact_view("));
+        assert!(!source_impl.contains("load_artifact("));
     }
 
     #[test]

@@ -24,6 +24,7 @@ use noid_chain::consensus::wire_limits::MAX_HISTORY_PROOF_BYTES;
 use noid_chain::{block_id, BlockHeader};
 use noid_ivc_core::field::F128;
 use noid_ivc_core::field_r1cs::FieldR1cs;
+use noid_ivc_core::matrix_claim::MatrixClaimEvaluator;
 use noid_ivc_core::proof::FieldShape;
 use serde::de::{
     self, DeserializeOwned, DeserializeSeed, EnumAccess, MapAccess, SeqAccess, VariantAccess,
@@ -308,13 +309,13 @@ fn preflight_wire(bytes: &[u8]) -> Result<WirePreflight<'_>, SelectedHistoryCode
             return Err(SelectedHistoryCodecError::TruncatedEnvelope {
                 expected: expected_total,
                 actual: bytes.len(),
-            })
+            });
         }
         std::cmp::Ordering::Greater => {
             return Err(SelectedHistoryCodecError::TrailingBytes {
                 expected: expected_total,
                 actual: bytes.len(),
-            })
+            });
         }
         std::cmp::Ordering::Equal => {}
     }
@@ -995,15 +996,16 @@ impl SelectedHistoryMatrixRequest {
     }
 }
 
-/// One transient matrix whose admission remains held for as long as its CSR
-/// can be borrowed.  Implementations may attach process-global residency or
-/// file-mapping guards; the verifier never unwraps the matrix from the lease.
+/// One transient matrix evaluator whose admission remains held for the full
+/// authenticated scan. Implementations may attach process-global residency,
+/// opened-file, or mapping guards; the verifier never unwraps storage from
+/// the lease and never requires a resident CSR.
 pub trait SelectedHistoryMatrixLease {
-    fn matrix(&self) -> &FieldR1cs;
+    fn evaluator(&mut self) -> &mut dyn MatrixClaimEvaluator;
 }
 
 impl SelectedHistoryMatrixLease for FieldR1cs {
-    fn matrix(&self) -> &FieldR1cs {
+    fn evaluator(&mut self) -> &mut dyn MatrixClaimEvaluator {
         self
     }
 }
@@ -1184,9 +1186,9 @@ pub fn verify_selected_history_terminal<S: SelectedHistoryMatrixSource>(
     )
     .map_err(SelectedHistoryVerificationError::TipDecision)?;
     let tip_matrix_request = matrix_request(SelectedHistoryMatrixFamily::Link, tip_slot, registry);
-    let tip_matrix = load_matrix(matrix_source, tip_matrix_request)?;
+    let mut tip_matrix = load_matrix(matrix_source, tip_matrix_request)?;
     let mut pending = deferred
-        .discharge_tip_matrix(tip_matrix.matrix())
+        .discharge_tip_matrix(tip_matrix.evaluator())
         .map_err(|error| SelectedHistoryVerificationError::TipDecision(error.to_string()))?;
 
     // Discharge also consumed the tip's live accumulator lane against this
@@ -1198,9 +1200,9 @@ pub fn verify_selected_history_terminal<S: SelectedHistoryMatrixSource>(
             continue;
         }
         let request = matrix_request(SelectedHistoryMatrixFamily::Link, slot, registry);
-        let matrix = load_matrix(matrix_source, request)?;
+        let mut matrix = load_matrix(matrix_source, request)?;
         pending
-            .check_link_matrix(slot, matrix.matrix())
+            .check_link_matrix(slot, matrix.evaluator())
             .map_err(SelectedHistoryVerificationError::TipDecision)?;
         drop(matrix);
     }
@@ -1209,9 +1211,9 @@ pub fn verify_selected_history_terminal<S: SelectedHistoryMatrixSource>(
             continue;
         }
         let request = matrix_request(SelectedHistoryMatrixFamily::Block, slot, registry);
-        let matrix = load_matrix(matrix_source, request)?;
+        let mut matrix = load_matrix(matrix_source, request)?;
         pending
-            .check_block_matrix(slot, matrix.matrix())
+            .check_block_matrix(slot, matrix.evaluator())
             .map_err(SelectedHistoryVerificationError::TipDecision)?;
         drop(matrix);
     }
@@ -1365,10 +1367,10 @@ mod tests {
             .find("begin_tip_split_decision_deferred_matrix(")
             .expect("matrix-free deferred replay");
         let load = verifier
-            .find("let tip_matrix = load_matrix(")
+            .find("let mut tip_matrix = load_matrix(")
             .expect("leased tip matrix load");
         let discharge = verifier
-            .find(".discharge_tip_matrix(tip_matrix.matrix())")
+            .find(".discharge_tip_matrix(tip_matrix.evaluator())")
             .expect("mandatory fresh-claim discharge");
         let release = verifier
             .find("drop(tip_matrix);")
@@ -1377,5 +1379,6 @@ mod tests {
         assert!(!verifier.contains("begin_tip_split_decision("));
         assert!(!verifier.contains("verify_split_link_proof("));
         assert!(!verifier.contains("csc_lincheck_circuit"));
+        assert!(!verifier.contains("FieldR1cs::read_artifact"));
     }
 }

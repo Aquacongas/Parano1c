@@ -5,8 +5,9 @@
 //!
 //! The recursive verifier owns cryptographic policy and the dependency-clean
 //! matrix lease contract.  This node/miner layer connects that contract to the
-//! disk-backed production matrix source and the same process-global m24
-//! governor used by native and recursive proving.
+//! disk-backed production matrix source and the same process-global exclusion
+//! ledger used by native and recursive proving. Its byte reservation covers
+//! only bounded streaming scratch; it does not pretend to allocate an m24 CSR.
 
 use std::fmt;
 
@@ -19,16 +20,14 @@ use noid_recursive::{
 
 use crate::memory_governor::{ProofMemoryGovernor, ProofMemoryPressure, ProofMemoryReservation};
 use crate::recursive_matrix_store::{
-    LocalSelectedRecursiveMatrixError, LocalSelectedRecursiveMatrixSource,
-    SelectedRecursiveMatrixArtifactIdentity,
+    LoadedSelectedRecursiveMatrixView, LocalSelectedRecursiveMatrixError,
+    LocalSelectedRecursiveMatrixSource, SelectedRecursiveMatrixArtifactIdentity,
 };
-use crate::recursive_prover::{
-    LoadedSelectedRecursiveMatrix, SelectedRecursiveMatrixKind, SelectedRecursiveTier,
-};
+use crate::recursive_prover::{SelectedRecursiveMatrixKind, SelectedRecursiveTier};
 
-impl SelectedHistoryMatrixLease for LoadedSelectedRecursiveMatrix {
-    fn matrix(&self) -> &noid_ivc_core::field_r1cs::FieldR1cs {
-        self.matrix()
+impl SelectedHistoryMatrixLease for LoadedSelectedRecursiveMatrixView {
+    fn evaluator(&mut self) -> &mut dyn noid_ivc_core::matrix_claim::MatrixClaimEvaluator {
+        self
     }
 }
 
@@ -61,14 +60,14 @@ fn history_matrix_kind(
 }
 
 impl SelectedHistoryMatrixSource for LocalSelectedRecursiveMatrixSource {
-    type Lease = LoadedSelectedRecursiveMatrix;
+    type Lease = LoadedSelectedRecursiveMatrixView;
     type Error = LocalSelectedRecursiveMatrixError;
 
     fn load_matrix(
         &mut self,
         request: SelectedHistoryMatrixRequest,
     ) -> Result<Self::Lease, Self::Error> {
-        self.load_artifact(history_matrix_identity(request)?)
+        self.open_artifact_view(history_matrix_identity(request)?)
     }
 }
 
@@ -160,7 +159,7 @@ fn begin_terminal_verification_with_governor(
     governor: &ProofMemoryGovernor,
 ) -> Result<SelectedHistoryTerminalVerificationSession, SelectedHistoryTerminalVerifierError> {
     Ok(SelectedHistoryTerminalVerificationSession {
-        _reservation: governor.try_reserve_for_selected_history_session()?,
+        _reservation: governor.try_reserve_for_selected_history_terminal_verification()?,
     })
 }
 
@@ -216,18 +215,18 @@ mod tests {
         let governor = ProofMemoryGovernor::new(8 * 1024);
         let session = SelectedHistoryTerminalVerificationSession {
             _reservation: governor
-                .try_reserve_selected_history_with_available(Some(16 * 1024))
+                .try_reserve_selected_history_terminal_with_available(Some(2 * 1024))
                 .expect("first terminal verification admission"),
         };
 
         assert!(governor
-            .try_reserve_selected_history_with_available(Some(16 * 1024))
+            .try_reserve_selected_history_terminal_with_available(Some(2 * 1024))
             .is_err());
         assert!(governor.try_reserve_for_recursive_tier(8).is_err());
 
         drop(session);
         governor
-            .try_reserve_selected_history_with_available(Some(16 * 1024))
+            .try_reserve_selected_history_terminal_with_available(Some(2 * 1024))
             .expect("dropping terminal session releases shared admission");
     }
 

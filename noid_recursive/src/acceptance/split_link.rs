@@ -56,8 +56,8 @@ use noid_ivc_core::field::F128;
 use noid_ivc_core::field_circuit::{FieldR1csBuilder, FsChannelTrace, LinExpr};
 use noid_ivc_core::field_r1cs::{FieldR1cs, SparseFieldMatrix};
 use noid_ivc_core::matrix_claim::{
-    fresh_claim_value, prove_matrix_claim_fold, stacked_matrix_mle_eval, FreshLincheckClaim,
-    MatrixAccClaim, MatrixFoldProof,
+    prove_matrix_claim_fold, stacked_matrix_mle_eval, FreshLincheckClaim, MatrixAccClaim,
+    MatrixClaimEvaluator, MatrixFoldProof,
 };
 use noid_ivc_core::pcs::{Commitment, PcsParams};
 use noid_ivc_core::proof::{pcs_params_statement_bytes, FieldR1csProof, FieldShape, R1csClaim};
@@ -1225,6 +1225,123 @@ pub struct SplitLinkClass {
 }
 
 impl SplitLinkClass {
+    /// Rehydrate one selected production Link class from compact registry
+    /// metadata.  Matrices and sample Block proofs are deliberately absent:
+    /// the constructor rebuilds all derived geometry, installs only published
+    /// identities, and validates the complete post-commit binding before the
+    /// class can escape.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_selected_registry_parts(
+        descriptor: &CanonicalSplitLinkLadder,
+        slot: usize,
+        block_class: &BlockClass,
+        shape: FieldShape,
+        pcs_params: PcsParams,
+        spec: PublicIoSpec,
+        matrix_digest: [u8; 32],
+        post_commit_class_digest: [u8; 32],
+        genesis_digest: [u8; 32],
+        genesis_post_commit_class_digest: [u8; 32],
+        sidecar_vk: Arc<LinkRegionSidecarVk>,
+        genesis_envelope: Arc<LinkProofEnvelope>,
+        b_spec: PublicIoSpec,
+        b_pcs_params: PcsParams,
+        b_sidecar_vk_digest: [u8; 32],
+        b_post_commit_class_digest: [u8; 32],
+    ) -> Result<Self, LinkProofError> {
+        let ladder_slot = descriptor
+            .slots()
+            .get(slot)
+            .ok_or(LinkProofError::ClassIdentityMismatch)?;
+        block_class
+            .validate_selected_zk_identity_for_tier(ladder_slot.tier)
+            .map_err(|_| LinkProofError::ClassIdentityMismatch)?;
+        let block_digest = block_class
+            .class_statement_digest
+            .get()
+            .copied()
+            .ok_or(LinkProofError::ClassIdentityMismatch)?;
+        if shape != descriptor.link_shape()
+            || !same_pcs_params(&pcs_params, descriptor.link_pcs_params())
+            || ladder_slot.b_shape != block_class.shape
+            || ladder_slot.b_digest != block_digest
+            || !same_pcs_params(&ladder_slot.b_pcs_params, &block_class.pcs_params)
+            || ladder_slot.b_sidecar_vk_digest != block_class.sidecar_vk().transcript_digest()
+            || ladder_slot.b_post_commit_class_digest != *block_class.post_commit_class_digest()
+            || !is_production_block_io_spec(&b_spec)
+            || !same_pcs_params(&b_pcs_params, &block_class.pcs_params)
+            || b_sidecar_vk_digest != block_class.sidecar_vk().transcript_digest()
+            || b_post_commit_class_digest != *block_class.post_commit_class_digest()
+        {
+            return Err(LinkProofError::ClassIdentityMismatch);
+        }
+        let expected_spec = split_io_spec(shape.k_log, descriptor.slots());
+        if spec.io_slice != expected_spec.io_slice
+            || spec.io_len != expected_spec.io_len
+            || !spec.claims.is_empty()
+        {
+            return Err(LinkProofError::ClassIdentityMismatch);
+        }
+        let block_params = descriptor
+            .slots()
+            .iter()
+            .map(|slot| slot.b_pcs_params.clone())
+            .collect::<Vec<_>>();
+        let n_queries = noid_ivc_core::pcs::default_fri_queries(pcs_params.log_inv_rate);
+        let universal_geometry =
+            RPcsLinkUniversalGeometry::new(&pcs_params, &block_params, n_queries)
+                .map_err(|_| LinkProofError::ClassIdentityMismatch)?;
+
+        let class_statement_digest = std::sync::OnceLock::new();
+        class_statement_digest
+            .set(matrix_digest)
+            .map_err(|_| LinkProofError::ClassIdentityMismatch)?;
+        let sidecar_vk_lock = std::sync::OnceLock::new();
+        sidecar_vk_lock
+            .set(sidecar_vk)
+            .map_err(|_| LinkProofError::ClassIdentityMismatch)?;
+        let post_commit_lock = std::sync::OnceLock::new();
+        post_commit_lock
+            .set(post_commit_class_digest)
+            .map_err(|_| LinkProofError::ClassIdentityMismatch)?;
+        let genesis_post_commit_lock = std::sync::OnceLock::new();
+        genesis_post_commit_lock
+            .set(genesis_post_commit_class_digest)
+            .map_err(|_| LinkProofError::ClassIdentityMismatch)?;
+        let genesis_envelope_lock = std::sync::OnceLock::new();
+        genesis_envelope_lock
+            .set(genesis_envelope)
+            .map_err(|_| LinkProofError::ClassIdentityMismatch)?;
+        let class = Self {
+            shape,
+            pcs_params,
+            spec,
+            class_statement_digest,
+            genesis_digest,
+            genesis_block_accumulator: genesis_accumulator(),
+            ladder: descriptor.slots().to_vec(),
+            slot,
+            b_spec,
+            b_pcs_params,
+            universal_geometry,
+            sidecar_vk: sidecar_vk_lock,
+            post_commit_class_digest: post_commit_lock,
+            genesis_post_commit_class_digest: genesis_post_commit_lock,
+            genesis_envelope: genesis_envelope_lock,
+            b_sidecar_vk: block_class.sidecar_vk().clone(),
+            b_post_commit_class_digest,
+        };
+        class.validate_frozen_identity()?;
+        Ok(class)
+    }
+
+    pub(crate) fn registry_genesis_post_commit_digest(&self) -> Result<[u8; 32], LinkProofError> {
+        self.genesis_post_commit_class_digest
+            .get()
+            .copied()
+            .ok_or(LinkProofError::UnfrozenClass)
+    }
+
     /// Freeze one slot against the universal link-sidecar key.  Bootstrap T
     /// already carries the same mandatory two-child sidecar as an ordinary
     /// link; its columns are the canonical zero-data/zero-path ghost.
@@ -2825,12 +2942,13 @@ impl PendingSplitTipDecision {
         )
     }
 
-    fn check_lane_with_digest(
+    fn check_lane_with_evaluation(
         lanes: &mut [PendingMatrixLane],
         slot: usize,
-        matrix: &FieldR1cs,
         family: &str,
+        shape: FieldShape,
         actual_digest: [u8; 32],
+        actual_value: Option<F128>,
     ) -> Result<(), String> {
         let what = format!("{family} lane {slot}");
         let lane = lanes
@@ -2854,12 +2972,12 @@ impl PendingSplitTipDecision {
                 "{what}: matrix does not match the published digest"
             ));
         }
-        if claim.point.len() != 2 * matrix.k_log + 1 {
+        if claim.point.len() != 2 * shape.k_log + 1 {
             return Err(format!(
                 "{what}: lane width does not match the matrix shape"
             ));
         }
-        if stacked_matrix_mle_eval(matrix, claim) != claim.value {
+        if actual_value != Some(claim.value) {
             return Err(format!("{what}: accumulated matrix claim is false"));
         }
         lanes[slot] = PendingMatrixLane::Checked;
@@ -2869,25 +2987,81 @@ impl PendingSplitTipDecision {
     fn check_lane(
         lanes: &mut [PendingMatrixLane],
         slot: usize,
+        matrix: &mut dyn MatrixClaimEvaluator,
+        family: &str,
+    ) -> Result<(), String> {
+        let what = format!("{family} lane {slot}");
+        let claim = match lanes.get(slot) {
+            Some(PendingMatrixLane::Pending { claim, .. }) => claim.clone(),
+            Some(PendingMatrixLane::Dead) => {
+                return Err(format!("{what}: matrix supplied for a dead lane"));
+            }
+            Some(PendingMatrixLane::Checked) => {
+                return Err(format!("{what}: matrix lane was already checked"));
+            }
+            None => return Err(format!("{what}: slot out of range")),
+        };
+        let shape = matrix.field_shape();
+        let evaluated = matrix
+            .evaluate_matrix_claims(None, Some(&claim))
+            .map_err(|error| format!("{what}: matrix evaluation failed: {error}"))?;
+        Self::check_lane_with_evaluation(
+            lanes,
+            slot,
+            family,
+            shape,
+            evaluated.structural_digest,
+            evaluated.accumulated_value,
+        )
+    }
+
+    fn check_lane_field_r1cs(
+        lanes: &mut [PendingMatrixLane],
+        slot: usize,
         matrix: &FieldR1cs,
         family: &str,
     ) -> Result<(), String> {
-        // This is a local-matrix trust boundary. `statement_digest()` may be
-        // deliberately seeded after a class matrix has already been checked;
-        // a matrix supplied to the final decider has not earned that trust.
-        let actual_digest = matrix.structural_statement_digest();
-        Self::check_lane_with_digest(lanes, slot, matrix, family, actual_digest)
+        let claim = match lanes.get(slot) {
+            Some(PendingMatrixLane::Pending { claim, .. }) => claim,
+            Some(PendingMatrixLane::Dead) => {
+                return Err(format!(
+                    "{family} lane {slot}: matrix supplied for a dead lane"
+                ));
+            }
+            Some(PendingMatrixLane::Checked) => {
+                return Err(format!(
+                    "{family} lane {slot}: matrix lane was already checked"
+                ));
+            }
+            None => return Err(format!("{family} lane {slot}: slot out of range")),
+        };
+        Self::check_lane_with_evaluation(
+            lanes,
+            slot,
+            family,
+            FieldShape::of(matrix),
+            matrix.structural_statement_digest(),
+            Some(stacked_matrix_mle_eval(matrix, claim)),
+        )
     }
 
     /// Check one live Link-class accumulator lane against a transient local
     /// matrix. The matrix may be released as soon as this method returns.
-    pub fn check_link_matrix(&mut self, slot: usize, matrix: &FieldR1cs) -> Result<(), String> {
+    pub fn check_link_matrix(
+        &mut self,
+        slot: usize,
+        matrix: &mut dyn MatrixClaimEvaluator,
+    ) -> Result<(), String> {
         Self::check_lane(&mut self.link_lanes, slot, matrix, "link")
     }
 
     /// Check one live Block-class accumulator lane against a transient local
     /// matrix. The matrix may be released as soon as this method returns.
-    pub fn check_block_matrix(&mut self, slot: usize, matrix: &FieldR1cs) -> Result<(), String> {
+    pub fn check_block_matrix(
+        &mut self,
+        slot: usize,
+        matrix: &mut dyn MatrixClaimEvaluator,
+    ) -> Result<(), String> {
         Self::check_lane(&mut self.block_lanes, slot, matrix, "block")
     }
 
@@ -2921,17 +3095,21 @@ fn finish_tip_split_decision_with_matrix_banks(
     assert_eq!(block_matrices.len(), pending.block_lanes.len());
     for (slot, matrix) in link_matrices.iter().enumerate() {
         if pending.link_lane_is_pending(slot) {
-            pending.check_link_matrix(
+            PendingSplitTipDecision::check_lane_field_r1cs(
+                &mut pending.link_lanes,
                 slot,
                 matrix.ok_or_else(|| format!("link lane {slot}: live lane without its matrix"))?,
+                "link",
             )?;
         }
     }
     for (slot, matrix) in block_matrices.iter().enumerate() {
         if pending.block_lane_is_pending(slot) {
-            pending.check_block_matrix(
+            PendingSplitTipDecision::check_lane_field_r1cs(
+                &mut pending.block_lanes,
                 slot,
                 matrix.ok_or_else(|| format!("block lane {slot}: live lane without its matrix"))?,
+                "block",
             )?;
         }
     }
@@ -3049,34 +3227,41 @@ pub struct DeferredSplitTipDecision {
 
 impl DeferredSplitTipDecision {
     /// Consume the deferred state and evaluate its fresh lincheck claim
-    /// directly over the leased CSR. Shape and structural digest checks run
-    /// before evaluation; a seeded digest cache cannot authenticate mutated
-    /// sparse rows. If the tip Link accumulator lane is live, it is evaluated
-    /// against the same authenticated CSR before the pending decision is
-    /// returned. Thus neither tip obligation can be omitted and the large CSR
-    /// is structurally hashed only once.
+    /// through the leased authenticated matrix evaluator. Shape and structural
+    /// digest checks bind the exact rows used for evaluation; a seeded digest
+    /// cache cannot authenticate mutated sparse rows. If the tip Link
+    /// accumulator lane is live, it is evaluated in the same pass before the
+    /// pending decision is returned. Thus neither tip obligation can be
+    /// omitted and an on-disk matrix never needs a resident CSR.
     pub fn discharge_tip_matrix(
         self,
-        tip_class_r1cs: &FieldR1cs,
+        tip_class_r1cs: &mut dyn MatrixClaimEvaluator,
     ) -> Result<PendingSplitTipDecision, LinkProofError> {
-        if FieldShape::of(tip_class_r1cs) != self.expected_shape {
+        if tip_class_r1cs.field_shape() != self.expected_shape {
             return Err(LinkProofError::MatrixMismatch);
         }
-        let actual_digest = tip_class_r1cs.structural_statement_digest();
-        if actual_digest != self.expected_digest {
+        let tip_claim = match self.pending.link_lanes.get(self.tip_slot) {
+            Some(PendingMatrixLane::Pending { claim, .. }) => Some(claim),
+            _ => None,
+        };
+        let evaluated = tip_class_r1cs
+            .evaluate_matrix_claims(Some(&self.fresh), tip_claim)
+            .map_err(|_| LinkProofError::MatrixMismatch)?;
+        if evaluated.structural_digest != self.expected_digest {
             return Err(LinkProofError::MatrixMismatch);
         }
-        if fresh_claim_value(tip_class_r1cs, &self.fresh) != self.fresh.value {
+        if evaluated.fresh_value != Some(self.fresh.value) {
             return Err(LinkProofError::MatrixClaimMismatch);
         }
         let mut pending = self.pending;
         if pending.link_lane_is_pending(self.tip_slot) {
-            PendingSplitTipDecision::check_lane_with_digest(
+            PendingSplitTipDecision::check_lane_with_evaluation(
                 &mut pending.link_lanes,
                 self.tip_slot,
-                tip_class_r1cs,
                 "link",
-                actual_digest,
+                self.expected_shape,
+                evaluated.structural_digest,
+                evaluated.accumulated_value,
             )
             .map_err(|_| LinkProofError::AccumulatorClaimMismatch)?;
         }
@@ -3931,10 +4116,10 @@ mod tests {
 
     #[test]
     fn deferred_tip_csr_discharge_accepts_exact_fresh_claim() {
-        let matrix = decider_test_matrix(0);
+        let mut matrix = decider_test_matrix(0);
         let fresh = fold_test_fresh(&matrix, 0xD15C_AA6E);
         deferred_test_decision(&matrix, fresh)
-            .discharge_tip_matrix(&matrix)
+            .discharge_tip_matrix(&mut matrix)
             .expect("honest fresh claim must discharge")
             .finish()
             .expect("empty test lane set is complete");
@@ -3942,7 +4127,7 @@ mod tests {
 
     #[test]
     fn deferred_tip_csr_discharge_rejects_omitted_wrong_and_mutated_claim_authority() {
-        let matrix = decider_test_matrix(0);
+        let mut matrix = decider_test_matrix(0);
 
         // An omitted/defaulted final value cannot turn deferred verification
         // into acceptance.  Make the sentinel differ deterministically even
@@ -3955,7 +4140,7 @@ mod tests {
         }
         assert_eq!(
             deferred_test_decision(&matrix, omitted)
-                .discharge_tip_matrix(&matrix)
+                .discharge_tip_matrix(&mut matrix)
                 .err()
                 .expect("omitted claim value must reject"),
             LinkProofError::MatrixClaimMismatch
@@ -3965,18 +4150,18 @@ mod tests {
         wrong.value += F128::ONE;
         assert_eq!(
             deferred_test_decision(&matrix, wrong)
-                .discharge_tip_matrix(&matrix)
+                .discharge_tip_matrix(&mut matrix)
                 .err()
                 .expect("wrong claim value must reject"),
             LinkProofError::MatrixClaimMismatch
         );
 
         let fresh = fold_test_fresh(&matrix, 0x51A7_EE55);
-        let substituted = decider_test_matrix(91);
+        let mut substituted = decider_test_matrix(91);
         substituted.seed_statement_digest(matrix.structural_statement_digest());
         assert_eq!(
             deferred_test_decision(&matrix, fresh.clone())
-                .discharge_tip_matrix(&substituted)
+                .discharge_tip_matrix(&mut substituted)
                 .err()
                 .expect("mutated CSR must reject"),
             LinkProofError::MatrixMismatch,
@@ -3987,7 +4172,7 @@ mod tests {
         wrong_shape.m += 1;
         assert_eq!(
             deferred_test_decision(&matrix, fresh)
-                .discharge_tip_matrix(&wrong_shape)
+                .discharge_tip_matrix(&mut wrong_shape)
                 .err()
                 .expect("wrong matrix shape must reject"),
             LinkProofError::MatrixMismatch
@@ -4001,7 +4186,7 @@ mod tests {
         }
         assert_eq!(
             false_accumulator
-                .discharge_tip_matrix(&matrix)
+                .discharge_tip_matrix(&mut matrix)
                 .err()
                 .expect("false tip accumulator must reject"),
             LinkProofError::AccumulatorClaimMismatch
@@ -4021,9 +4206,8 @@ mod tests {
         assert!(declaration.contains("pub fn discharge_tip_matrix("));
         assert!(!declaration.contains("pub fn finish("));
         assert!(!declaration.contains("pub fresh:"));
-        assert!(
-            source.contains("fresh_claim_value(tip_class_r1cs, &self.fresh) != self.fresh.value")
-        );
+        assert!(source.contains("evaluate_matrix_claims(Some(&self.fresh), tip_claim)"));
+        assert!(source.contains("evaluated.fresh_value != Some(self.fresh.value)"));
     }
 
     #[test]
@@ -4038,21 +4222,21 @@ mod tests {
 
     #[test]
     fn streamed_tip_decision_rejects_duplicate_and_dead_lane_checks() {
-        let matrix = decider_test_matrix(0);
+        let mut matrix = decider_test_matrix(0);
         let mut pending = pending_test_decision(&[Some(&matrix), None], &[None, None]);
         pending
-            .check_link_matrix(0, &matrix)
+            .check_link_matrix(0, &mut matrix)
             .expect("first live-lane check");
         assert_eq!(
-            pending.check_link_matrix(0, &matrix).unwrap_err(),
+            pending.check_link_matrix(0, &mut matrix).unwrap_err(),
             "link lane 0: matrix lane was already checked"
         );
         assert_eq!(
-            pending.check_link_matrix(1, &matrix).unwrap_err(),
+            pending.check_link_matrix(1, &mut matrix).unwrap_err(),
             "link lane 1: matrix supplied for a dead lane"
         );
         assert_eq!(
-            pending.check_link_matrix(2, &matrix).unwrap_err(),
+            pending.check_link_matrix(2, &mut matrix).unwrap_err(),
             "link lane 2: slot out of range"
         );
         pending.finish().expect("only live lane was checked");
@@ -4060,65 +4244,65 @@ mod tests {
 
     #[test]
     fn streamed_tip_decision_rejects_wrong_slot_and_matrix() {
-        let matrix_a = decider_test_matrix(0);
-        let matrix_b = decider_test_matrix(7);
+        let mut matrix_a = decider_test_matrix(0);
+        let mut matrix_b = decider_test_matrix(7);
         let mut pending =
             pending_test_decision(&[Some(&matrix_a), Some(&matrix_b)], &[Some(&matrix_b)]);
 
         assert_eq!(
-            pending.check_link_matrix(0, &matrix_b).unwrap_err(),
+            pending.check_link_matrix(0, &mut matrix_b).unwrap_err(),
             "link lane 0: matrix does not match the published digest"
         );
         pending
-            .check_link_matrix(0, &matrix_a)
+            .check_link_matrix(0, &mut matrix_a)
             .expect("slot 0 receives its matrix");
         assert_eq!(
-            pending.check_link_matrix(1, &matrix_a).unwrap_err(),
+            pending.check_link_matrix(1, &mut matrix_a).unwrap_err(),
             "link lane 1: matrix does not match the published digest"
         );
         pending
-            .check_link_matrix(1, &matrix_b)
+            .check_link_matrix(1, &mut matrix_b)
             .expect("slot 1 receives its matrix");
         assert_eq!(
-            pending.check_block_matrix(0, &matrix_a).unwrap_err(),
+            pending.check_block_matrix(0, &mut matrix_a).unwrap_err(),
             "block lane 0: matrix does not match the published digest"
         );
         pending
-            .check_block_matrix(0, &matrix_b)
+            .check_block_matrix(0, &mut matrix_b)
             .expect("block slot receives its matrix");
         pending.finish().expect("all live lanes were checked");
     }
 
     #[test]
     fn streamed_tip_decision_ignores_seeded_digest_substitution() {
-        let honest = decider_test_matrix(0);
+        let mut honest = decider_test_matrix(0);
         let expected = honest.structural_statement_digest();
-        let substituted = decider_test_matrix(9);
+        let mut substituted = decider_test_matrix(9);
         substituted.seed_statement_digest(expected);
         assert_eq!(substituted.statement_digest(), expected);
 
         let mut pending = pending_test_decision(&[Some(&honest)], &[]);
         assert_eq!(
-            pending.check_link_matrix(0, &substituted).unwrap_err(),
+            pending.check_link_matrix(0, &mut substituted).unwrap_err(),
             "link lane 0: matrix does not match the published digest"
         );
         pending
-            .check_link_matrix(0, &honest)
+            .check_link_matrix(0, &mut honest)
             .expect("honest structural matrix remains accepted");
         pending.finish().expect("honest replacement completed lane");
     }
 
     #[test]
     fn streamed_and_matrix_bank_tip_decisions_have_parity() {
-        let link = decider_test_matrix(0);
-        let block = decider_test_matrix(11);
+        let mut link = decider_test_matrix(0);
+        let mut block = decider_test_matrix(11);
 
         let mut streamed = pending_test_decision(&[Some(&link), None], &[Some(&block), None]);
         streamed
-            .check_link_matrix(0, &link)
+            .check_link_matrix(0, &mut link)
             .expect("streamed Link check");
         streamed
-            .check_block_matrix(0, &block)
+            .check_block_matrix(0, &mut block)
             .expect("streamed Block check");
         streamed.finish().expect("streamed finish");
 

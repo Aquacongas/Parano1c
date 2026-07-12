@@ -473,7 +473,10 @@ impl core::fmt::Display for SelectedRecursiveProverError {
                 write!(f, "recursive Link native preparation failed: {source}")
             }
             Self::LinkPreparationRejected => {
-                write!(f, "selected recursive Link preparation panicked and was rejected")
+                write!(
+                    f,
+                    "selected recursive Link preparation panicked and was rejected"
+                )
             }
             Self::MemoryPressure {
                 required_mib,

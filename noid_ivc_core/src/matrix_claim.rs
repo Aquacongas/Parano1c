@@ -42,7 +42,9 @@
 use crate::challenger::Challenger;
 use crate::field::F128;
 use crate::field_r1cs::FieldR1cs;
+use crate::field_r1cs::FieldR1csArtifactError;
 use crate::lincheck::build_eq_table;
+use crate::proof::FieldShape;
 use crate::zerocheck::multilinear::lagrange_weights_naive;
 use rayon::prelude::*;
 
@@ -74,6 +76,74 @@ pub struct FreshLincheckClaim {
     pub r_inner_rest: Vec<F128>,
     pub z_partial: Vec<F128>,
     pub value: F128,
+}
+
+/// Authenticated evaluations produced by a matrix claim source in one pass.
+///
+/// The structural digest is deliberately returned alongside the values: a
+/// caller must compare it with its canonical class registry before accepting
+/// either optional evaluation.  Disk-backed implementations compute all
+/// requested values from the exact row bytes fed into this digest, so a
+/// matrix never needs to be materialized as a resident [`FieldR1cs`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuthenticatedMatrixClaimEvaluations {
+    pub structural_digest: [u8; 32],
+    pub fresh_value: Option<F128>,
+    pub accumulated_value: Option<F128>,
+}
+
+/// Bounded matrix-evaluation boundary used by the terminal history decider.
+///
+/// At most one fresh and one accumulated claim are needed for a class at a
+/// time.  Keeping that bound in the API lets an on-disk implementation scan
+/// both canonical matrices once with fixed-size buffers.  Implementations
+/// must recompute `structural_digest` from the same decoded rows used for the
+/// evaluations; cached or externally supplied digest metadata is not valid
+/// authority here.
+pub trait MatrixClaimEvaluator {
+    fn field_shape(&self) -> FieldShape;
+
+    fn evaluate_matrix_claims(
+        &mut self,
+        fresh: Option<&FreshLincheckClaim>,
+        accumulated: Option<&MatrixAccClaim>,
+    ) -> Result<AuthenticatedMatrixClaimEvaluations, FieldR1csArtifactError>;
+}
+
+impl MatrixClaimEvaluator for FieldR1cs {
+    fn field_shape(&self) -> FieldShape {
+        FieldShape::of(self)
+    }
+
+    fn evaluate_matrix_claims(
+        &mut self,
+        fresh: Option<&FreshLincheckClaim>,
+        accumulated: Option<&MatrixAccClaim>,
+    ) -> Result<AuthenticatedMatrixClaimEvaluations, FieldR1csArtifactError> {
+        if let Some(claim) = fresh {
+            let rest = self.k_log - self.k_skip;
+            if claim.x_inner_rest.len() != rest || claim.r_inner_rest.len() != rest {
+                return Err(FieldR1csArtifactError::MatrixClaimShape(
+                    "fresh inner-rest width",
+                ));
+            }
+            if claim.z_partial.len() != 1usize << self.k_skip {
+                return Err(FieldR1csArtifactError::MatrixClaimShape(
+                    "fresh partial window",
+                ));
+            }
+        }
+        if accumulated.is_some_and(|claim| claim.point.len() != 2 * self.k_log + 1) {
+            return Err(FieldR1csArtifactError::MatrixClaimShape(
+                "accumulated point width",
+            ));
+        }
+        Ok(AuthenticatedMatrixClaimEvaluations {
+            structural_digest: self.structural_statement_digest(),
+            fresh_value: fresh.map(|claim| fresh_claim_value(self, claim)),
+            accumulated_value: accumulated.map(|claim| stacked_matrix_mle_eval(self, claim)),
+        })
+    }
 }
 
 /// Proof wires of one accumulator fold: phase-1 rounds (`k_log + 1`),
