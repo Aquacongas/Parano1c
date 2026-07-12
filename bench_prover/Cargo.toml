@@ -18,6 +18,7 @@ noid_tx = { path = "../noid_tx" }
 noid_block = { path = "../noid_block" }
 noid_chain = { path = "../noid_chain" }
 noid_recursive = { path = "../noid_recursive" }
+noid_miner = { path = "../noid_miner" }
 noid-ivc-core = { path = "../noid_ivc_core" }
 noid-ivc-prover = { path = "../noid_ivc_prover" }
 rayon = "1.10"
