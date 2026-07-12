@@ -337,6 +337,12 @@ pub fn build_block_template(
                     });
                 count *= 2;
             }
+            // The residency filter above means callers must keep the
+            // allocator's hint-window segments resident (or hydrated from
+            // durable storage) — see the miner snapshot's
+            // hydrate_coinbase_allocator_segments. An all-evicted hint
+            // window otherwise reports NoCoinbaseSlot with the whole state
+            // nearly empty.
             found.ok_or(TemplateBuildError::NoCoinbaseSlot)?
         }
     };

@@ -167,6 +167,40 @@ impl TemplateChainSnapshot {
                 needed.insert((output.slot_index >> effective_log) as u16);
             }
         }
+        self.hydrate_segments(state, needed)
+    }
+
+    /// The coinbase allocator probes a bounded virgin-zone hint window that
+    /// touches at most two segments for the snapshot's `alloc_counter`. A
+    /// freshly committed chain evicts exactly those segments — only
+    /// block-dirty segments stay resident — so without hydrating them every
+    /// hint fails the template's residency filter and mining halts with
+    /// `NoCoinbaseSlot` on the next block while the state is almost empty
+    /// (live-test finding, 2026-07-12). The needed segments are derived from
+    /// the production hint stream itself, so any future allocator change
+    /// keeps this in lockstep; the cost is bounded by two 3-MiB segments.
+    fn hydrate_coinbase_allocator_segments(
+        &self,
+        state: &mut ChainState,
+    ) -> Result<(), MdbxContextError> {
+        let effective_log = state.state.effective_log_segment_size();
+        let log_slots = state.state.log_slots() as u32;
+        let needed: HashSet<u16> = noid_chain::consensus::generate_slot_hints(
+            state.alloc_counter,
+            log_slots,
+            65_536,
+        )
+        .into_iter()
+        .map(|slot| (slot >> effective_log) as u16)
+        .collect();
+        self.hydrate_segments(state, needed)
+    }
+
+    fn hydrate_segments(
+        &self,
+        state: &mut ChainState,
+        needed: HashSet<u16>,
+    ) -> Result<(), MdbxContextError> {
         for segment_id in needed {
             if !state.state.is_evicted(segment_id) {
                 continue;
@@ -305,6 +339,10 @@ impl TemplateBuilder {
         let mut state = snapshot.state.clone();
         if let Err(error) = snapshot.hydrate_transaction_segments(&mut state, &txs) {
             tracing::warn!(err = %error, "template touched-segment hydration failed");
+            return None;
+        }
+        if let Err(error) = snapshot.hydrate_coinbase_allocator_segments(&mut state) {
+            tracing::warn!(err = %error, "template allocator-segment hydration failed");
             return None;
         }
         match build_block_template(
