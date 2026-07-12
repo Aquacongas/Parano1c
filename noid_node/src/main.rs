@@ -39,25 +39,25 @@ use clap::Parser;
 use tokio::sync::RwLock;
 use tracing_subscriber::EnvFilter;
 
+use noid_chain::consensus::NetworkConfig;
 use noid_chain::consensus::wire_limits::{
     MAX_INFLIGHT_SEGMENTS, MAX_ORPHAN_POOL, MAX_ORPHAN_POOL_BYTES, MAX_SEGMENT_BYTES,
     MAX_SNAPSHOT_MANIFEST_SEGMENTS, MAX_TX_INTENT_BYTES_GLOBAL,
 };
-use noid_chain::consensus::NetworkConfig;
 use noid_chain::storage::snapshot_staging::{
     AuthenticatedSnapshotMetadata, FinalizedSnapshotStaging, SnapshotStagingSession,
 };
 use noid_chain::storage::{
-    encoded_segment_len_for_eff_log, MdbxChainContext, SnapshotSegmentDescriptor,
+    MdbxChainContext, SnapshotSegmentDescriptor, encoded_segment_len_for_eff_log,
 };
 use noid_mempool::{AsyncMempool, ChainView, MempoolConfig};
 use noid_miner::{BlockMiner, MinerConfig};
 use noid_node::snapshot_header_staging::{
-    CanonicalHeaderBoundary, SelectedTerminalHeaderBoundary, SnapshotHeaderStaging,
-    VerifiedSnapshotHeaderStaging, MAX_STAGED_HEADER_BATCH,
+    CanonicalHeaderBoundary, MAX_STAGED_HEADER_BATCH, SelectedTerminalHeaderBoundary,
+    SnapshotHeaderStaging, VerifiedSnapshotHeaderStaging,
 };
 use noid_p2p::{NetworkEvent, P2PNetwork};
-use noid_rpc::{start_rpc_server, WalletOperationGate};
+use noid_rpc::{WalletOperationGate, start_rpc_server};
 
 struct ProvedBlockCandidate {
     block: noid_chain::block::Block,
@@ -402,8 +402,10 @@ fn start_selected_history_worker(
 mod config;
 #[allow(dead_code)]
 mod selected_history_worker;
+mod sync_phase_telemetry;
 mod wallet;
 use config::NodeConfig;
+use sync_phase_telemetry::{SnapshotSyncTelemetry, SyncPhase, SyncPhaseMeasurement};
 use wallet::{SharedWallet, WalletHandle, WalletState};
 
 // ---------------------------------------------------------------------------
@@ -1233,6 +1235,23 @@ async fn main() -> anyhow::Result<()> {
 // P2P event handler
 // ---------------------------------------------------------------------------
 
+fn log_sync_phase_measurement(measurement: SyncPhaseMeasurement) {
+    tracing::info!(
+        phase = measurement.phase.label(),
+        scaling = measurement.phase.scaling(),
+        count = measurement.count,
+        bytes = measurement.bytes,
+        elapsed_ms = measurement.elapsed_ms(),
+        timing_basis = "active_work",
+        outcome = if measurement.succeeded {
+            "accepted"
+        } else {
+            "rejected"
+        },
+        "snapshot sync phase measurement"
+    );
+}
+
 struct PendingSnapshotHeaderSync {
     from: libp2p::PeerId,
     manifest: Box<noid_p2p::protocol::GetStateManifestResponse>,
@@ -1418,11 +1437,19 @@ struct VerifiedSelectedHistorySnapshot {
     height: u64,
     block_hash: [u8; 32],
     tier: noid_chain::storage::RecursiveProofJobTier,
+    staged_header_count: u64,
     terminal_package_bytes: Vec<u8>,
     verified_headers: VerifiedSnapshotHeaderStaging,
     /// The exact inbound allocation remains charged until the terminal bytes
     /// have entered the same MDBX transaction as the snapshot state.
     inbound_memory_permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+}
+
+struct AppliedVerifiedSnapshot {
+    height: u64,
+    staged_header_count: u64,
+    header_promotion_elapsed: std::time::Duration,
+    state_install_elapsed: std::time::Duration,
 }
 
 fn validate_snapshot_staged_header_boundary(
@@ -2071,12 +2098,12 @@ fn state_segment_response_matches_snapshot_boundary(
 #[cfg(test)]
 mod tests {
     use super::{
-        compare_manifest_fork_choice, gap_requires_snapshot_sync, snapshot_header_next_action,
-        state_segment_response_matches_snapshot_boundary,
-        validate_selected_terminal_tip_future_drift, validate_snapshot_header_batch_admission,
-        validate_snapshot_staged_header_boundary, BoundedRelayTerminalPeers, OrphanBlock,
+        BoundedRelayTerminalPeers, MAX_TRACKED_RELAY_TERMINAL_PEERS, OrphanBlock,
         ProvedBlockCandidate, RemoteSelectedHistoryRequestKey, SelectedTerminalHeaderBoundary,
-        SnapshotHeaderNextAction, MAX_TRACKED_RELAY_TERMINAL_PEERS,
+        SnapshotHeaderNextAction, compare_manifest_fork_choice, gap_requires_snapshot_sync,
+        snapshot_header_next_action, state_segment_response_matches_snapshot_boundary,
+        validate_selected_terminal_tip_future_drift, validate_snapshot_header_batch_admission,
+        validate_snapshot_staged_header_boundary,
     };
 
     #[test]
@@ -2386,6 +2413,56 @@ mod tests {
     }
 
     #[test]
+    fn production_sync_telemetry_is_bounded_and_keeps_proof_time_separate() {
+        let telemetry = include_str!("sync_phase_telemetry.rs");
+        assert!(!telemetry.contains("Vec<"));
+        assert!(!telemetry.contains("HashMap<"));
+        assert!(!telemetry.contains("VecDeque<"));
+        assert!(telemetry.contains("size_of::<SnapshotSyncTelemetry>() <= 128"));
+
+        let source = include_str!("main.rs");
+        let proof_marker = ["Ok(NetworkEvent::", "HistoryProof"].concat();
+        let disconnect_marker = ["Ok(NetworkEvent::", "PeerDisconnected"].concat();
+        let proof_arm = source
+            .split_once(&proof_marker)
+            .expect("history proof event arm exists")
+            .1
+            .split_once(&disconnect_marker)
+            .expect("peer disconnect follows history proof")
+            .0;
+        let boundary_at = proof_arm
+            .find("validate_snapshot_staged_header_boundary")
+            .expect("fixed-width boundary validates before terminal proof");
+        let timer_at = proof_arm
+            .find("let terminal_started = Instant::now()")
+            .expect("exact proof timer starts inside the verifier closure");
+        let proof_at = timer_at
+            + proof_arm[timer_at..]
+                .find("verify_snapshot_selected_history_terminal")
+                .expect("exact selected-terminal verifier exists");
+        let stop_at = proof_at
+            + proof_arm[proof_at..]
+                .find("let terminal_elapsed = terminal_started.elapsed()")
+                .expect("exact proof timer stops immediately after verifier");
+        let subtract_at = stop_at
+            + proof_arm[stop_at..]
+                .find("combined_elapsed.saturating_sub(terminal_elapsed)")
+                .expect("header validation excludes exact proof duration");
+        assert!(boundary_at < timer_at && timer_at < proof_at && proof_at < stop_at);
+        assert!(stop_at < subtract_at);
+
+        for field in ["phase =", "scaling =", "count =", "bytes =", "elapsed_ms ="] {
+            assert!(
+                source.contains(field),
+                "missing structured telemetry field {field}"
+            );
+        }
+        assert!(source.contains("sync_phase_telemetry.reset()"));
+        assert!(source.contains("record_state_segment(payload_bytes, work_elapsed)"));
+        assert!(source.contains("record_suffix_block("));
+    }
+
+    #[test]
     fn snapshot_header_progress_rejects_delayed_and_oversized_batches() {
         assert_eq!(
             snapshot_header_next_action(10, 20).unwrap(),
@@ -2404,12 +2481,10 @@ mod tests {
         assert!(validate_snapshot_header_batch_admission(21, 20, 1).is_err());
         assert!(validate_snapshot_header_batch_admission(20, 20, 0).is_err());
         assert!(validate_snapshot_header_batch_admission(20, 20, 2).is_err());
-        assert!(validate_snapshot_header_batch_admission(
-            1,
-            1_000,
-            super::MAX_STAGED_HEADER_BATCH + 1,
-        )
-        .is_err());
+        assert!(
+            validate_snapshot_header_batch_admission(1, 1_000, super::MAX_STAGED_HEADER_BATCH + 1,)
+                .is_err()
+        );
     }
 
     fn test_coinbase_child(
@@ -2540,13 +2615,15 @@ mod tests {
             cumulative_chainwork: low_work,
             ..boundary
         };
-        assert!(validate_snapshot_staged_header_boundary(
-            &low_work_manifest,
-            &low_work_boundary,
-            &high_start_work,
-        )
-        .expect_err("below minimum snapshot work must reject")
-        .contains("minimum snapshot work"));
+        assert!(
+            validate_snapshot_staged_header_boundary(
+                &low_work_manifest,
+                &low_work_boundary,
+                &high_start_work,
+            )
+            .expect_err("below minimum snapshot work must reject")
+            .contains("minimum snapshot work")
+        );
     }
 
     #[test]
@@ -2663,6 +2740,7 @@ async fn handle_p2p_events(
     }
     struct SnapshotHeaderStagingCompletion {
         key: SnapshotHeaderStagingOperationKey,
+        work_elapsed: std::time::Duration,
         result: Result<PendingSnapshotHeaderSync, String>,
     }
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2677,6 +2755,9 @@ async fn handle_p2p_events(
         generation: u64,
         manifest: Box<noid_p2p::protocol::GetStateManifestResponse>,
         peer_tip_height: u64,
+        header_validation_elapsed: std::time::Duration,
+        terminal_proof_measurement: Option<SyncPhaseMeasurement>,
+        staged_header_count: u64,
         result: Result<VerifiedSelectedHistorySnapshot, String>,
     }
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2694,11 +2775,14 @@ async fn handle_p2p_events(
     enum SnapshotStagingCompletion {
         Accepted {
             key: SnapshotStagingOperationKey,
+            payload_bytes: u64,
+            work_elapsed: std::time::Duration,
             result: Result<SnapshotStagingSession, String>,
         },
         Finalized {
             key: SnapshotStagingOperationKey,
             segment_count: usize,
+            work_elapsed: std::time::Duration,
             result: Result<FinalizedSnapshotStaging, String>,
         },
     }
@@ -2711,7 +2795,7 @@ async fn handle_p2p_events(
     }
     struct SnapshotInstallCompletion {
         key: SnapshotInstallKey,
-        result: Result<u64, String>,
+        result: Result<AppliedVerifiedSnapshot, String>,
     }
     let mut pending_manifest: Option<PendingManifest> = None;
     let mut pending_snapshot_header_sync: Option<PendingSnapshotHeaderSync> = None;
@@ -2747,6 +2831,9 @@ async fn handle_p2p_events(
     let mut snapshot_install_inflight: Option<SnapshotInstallKey> = None;
     let mut snapshot_sync_generation = 0u64;
     let snapshot_sync_generation_guard = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // One fixed-size set of scalar phase totals for the active snapshot sync.
+    // No per-header, per-segment, or per-block timing history is retained.
+    let mut sync_phase_telemetry = SnapshotSyncTelemetry::default();
     let snapshot_header_store = {
         let ctx = chain.read().await;
         ctx.store.clone()
@@ -2788,6 +2875,7 @@ async fn handle_p2p_events(
     macro_rules! reset_sync_state {
         () => {{
             snapshot_sync_generation = snapshot_sync_generation.wrapping_add(1);
+            sync_phase_telemetry.reset();
             snapshot_sync_generation_guard.store(
                 snapshot_sync_generation,
                 std::sync::atomic::Ordering::Release,
@@ -2829,6 +2917,7 @@ async fn handle_p2p_events(
 
     macro_rules! begin_snapshot_header_staging {
         ($from:expr, $manifest:expr) => {{
+            sync_phase_telemetry.begin_snapshot();
             debug_assert!(remote_selected_history_verification_inflight.is_none());
             if pending_remote_selected_history_request.take().is_some() {
                 remote_selected_history_request_token =
@@ -2850,12 +2939,17 @@ async fn handle_p2p_events(
             let store = snapshot_header_store.clone();
             let staging_root = snapshot_header_staging_root.clone();
             tokio::task::spawn_blocking(move || {
+                let started = Instant::now();
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     prepare_snapshot_header_sync(&staging_root, &store, from, manifest)
                 }))
                 .map_err(|_| "snapshot header preparation worker panicked".to_owned())
                 .and_then(|result| result);
-                let _ = completion.blocking_send(SnapshotHeaderStagingCompletion { key, result });
+                let _ = completion.blocking_send(SnapshotHeaderStagingCompletion {
+                    key,
+                    work_elapsed: started.elapsed(),
+                    result,
+                });
             });
         }};
     }
@@ -2946,6 +3040,7 @@ async fn handle_p2p_events(
                 if snapshot_install_inflight.is_some() {
                     if height > highest_announced {
                         highest_announced = height;
+                        sync_phase_telemetry.extend_suffix_target(height);
                         last_announcement_peer = Some(from);
                     }
                     tracing::debug!(
@@ -2985,6 +3080,7 @@ async fn handle_p2p_events(
 
                 if height > highest_announced {
                     highest_announced = height;
+                    sync_phase_telemetry.extend_suffix_target(height);
                     last_announcement_peer = Some(from);
                 }
                 // Compact block announcement: validate the advertised header before
@@ -3197,6 +3293,7 @@ async fn handle_p2p_events(
                             }
                         }
 
+                        let suffix_apply_started = Instant::now();
                         let preverified_auth =
                             preverified_authorization_bytes(&mempool, &block).await;
                         let candidate = ProvedBlockCandidate {
@@ -3205,6 +3302,11 @@ async fn handle_p2p_events(
                             block_proof_bytes,
                             block_auth_sidecar_bytes,
                         };
+                        let suffix_block_bytes = candidate
+                            .block_bytes_len
+                            .saturating_add(candidate.block_proof_bytes.len())
+                            .saturating_add(candidate.block_auth_sidecar_bytes.len())
+                            as u64;
                         let apply_result = apply_p2p_block_offthread(
                             &chain,
                             &wallet,
@@ -3228,6 +3330,13 @@ async fn handle_p2p_events(
                                         applied.view,
                                     )
                                     .await;
+                                if let Some(measurement) = sync_phase_telemetry.record_suffix_block(
+                                    height,
+                                    suffix_block_bytes,
+                                    suffix_apply_started.elapsed(),
+                                ) {
+                                    log_sync_phase_measurement(measurement);
+                                }
                                 tracing::info!(height, "applied P2P block");
                                 last_tip_advance = Instant::now();
                                 sync_ready.notify_one(); // cancel/rebuild any active stale template
@@ -3250,7 +3359,9 @@ async fn handle_p2p_events(
                                 while let Some(orphan) = orphan_pool.remove(&next_hash) {
                                     let orphan_local_time = unix_now();
                                     let orphan_age_ms = orphan.received_at.elapsed().as_millis();
+                                    let orphan_suffix_bytes = orphan.retained_bytes() as u64;
                                     let orphan_candidate = orphan.into_candidate();
+                                    let orphan_suffix_started = Instant::now();
                                     let orphan_preverified =
                                         preverified_authorization_bytes(
                                             &mempool,
@@ -3276,6 +3387,15 @@ async fn handle_p2p_events(
                                                     applied_orphan.view,
                                                 )
                                                 .await;
+                                            if let Some(measurement) =
+                                                sync_phase_telemetry.record_suffix_block(
+                                                    h,
+                                                    orphan_suffix_bytes,
+                                                    orphan_suffix_started.elapsed(),
+                                                )
+                                            {
+                                                log_sync_phase_measurement(measurement);
+                                            }
                                             tracing::info!(
                                                 height = h,
                                                 age_ms = orphan_age_ms,
@@ -3916,6 +4036,7 @@ async fn handle_p2p_events(
                     let store = snapshot_header_store.clone();
                     let staging_path = sync.staging.path().to_owned();
                     tokio::task::spawn_blocking(move || {
+                        let started = Instant::now();
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
                             move || {
                                 let mut sync = sync;
@@ -3934,6 +4055,7 @@ async fn handle_p2p_events(
                         }
                         let _ = completion.blocking_send(SnapshotHeaderStagingCompletion {
                             key,
+                            work_elapsed: started.elapsed(),
                             result,
                         });
                     });
@@ -4380,7 +4502,12 @@ async fn handle_p2p_events(
                         let completion = snapshot_staging_completion_tx.clone();
                         let response_effective_log = response.eff_log;
                         let segment_id = response.segment_id;
+                        let payload_bytes = response
+                            .data
+                            .as_ref()
+                            .map_or(0u64, |data| data.len() as u64);
                         tokio::task::spawn_blocking(move || {
+                            let started = Instant::now();
                             let result = std::panic::catch_unwind(
                                 std::panic::AssertUnwindSafe(move || {
                                     let result = staging
@@ -4404,7 +4531,12 @@ async fn handle_p2p_events(
                             .map_err(|_| "snapshot segment staging worker panicked".to_owned())
                             .and_then(|result| result);
                             let _ = completion.blocking_send(
-                                SnapshotStagingCompletion::Accepted { key, result },
+                                SnapshotStagingCompletion::Accepted {
+                                    key,
+                                    payload_bytes,
+                                    work_elapsed: started.elapsed(),
+                                    result,
+                                },
                             );
                         });
                         tracing::debug!(
@@ -4745,9 +4877,12 @@ async fn handle_p2p_events(
                 let store = snapshot_header_store.clone();
                 let manifest = sync.manifest;
                 let staging = sync.staging;
+                let staged_header_count = staging.staged_len();
                 let staging_path = staging.path().to_owned();
                 selected_history_verification_inflight = Some(key);
                 tokio::task::spawn_blocking(move || {
+                    let mut header_validation_elapsed = std::time::Duration::ZERO;
+                    let mut terminal_proof_measurement = None;
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         if generation_guard.load(std::sync::atomic::Ordering::Acquire)
                             != generation
@@ -4757,8 +4892,8 @@ async fn handle_p2p_events(
                             );
                         }
                         let mut verified_tier = None;
-                        let verified_headers = staging
-                            .verify_terminal(
+                        let header_and_terminal_started = Instant::now();
+                        let verified_headers_result = staging.verify_terminal(
                                 &store,
                                 expected_height,
                                 expected_hash,
@@ -4773,19 +4908,41 @@ async fn handle_p2p_events(
                                         boundary,
                                         unix_now(),
                                     )?;
-                                    verified_tier = Some(
+                                    // Time only the exact selected-terminal verifier.
+                                    // Header boundary checks above and the complete-file
+                                    // revalidation performed by `verify_terminal` stay in
+                                    // the independent O(H) accumulator.
+                                    let terminal_started = Instant::now();
+                                    let terminal_result =
                                         verify_snapshot_selected_history_terminal(
-                                            expected_height,
-                                            expected_hash,
-                                            &proof_bytes,
-                                            boundary,
-                                            &artifacts,
-                                        )?,
+                                        expected_height,
+                                        expected_hash,
+                                        &proof_bytes,
+                                        boundary,
+                                        &artifacts,
                                     );
+                                    let terminal_elapsed = terminal_started.elapsed();
+                                    terminal_proof_measurement = Some(
+                                        SyncPhaseMeasurement::new(
+                                            SyncPhase::SelectedTerminalProof,
+                                            1,
+                                            proof_bytes.len() as u64,
+                                            terminal_elapsed,
+                                            terminal_result.is_ok(),
+                                        ),
+                                    );
+                                    verified_tier = Some(terminal_result?);
                                     Ok(())
                                 },
-                            )
-                            .map_err(|error| error.to_string())?;
+                            );
+                        let combined_elapsed = header_and_terminal_started.elapsed();
+                        let terminal_elapsed = terminal_proof_measurement
+                            .map(|measurement| measurement.elapsed)
+                            .unwrap_or_default();
+                        header_validation_elapsed =
+                            combined_elapsed.saturating_sub(terminal_elapsed);
+                        let verified_headers =
+                            verified_headers_result.map_err(|error| error.to_string())?;
                         if generation_guard.load(std::sync::atomic::Ordering::Acquire)
                             != generation
                         {
@@ -4802,6 +4959,7 @@ async fn handle_p2p_events(
                             height: expected_height,
                             block_hash: expected_hash,
                             tier,
+                            staged_header_count,
                             terminal_package_bytes: proof_bytes,
                             verified_headers,
                             inbound_memory_permit,
@@ -4817,6 +4975,9 @@ async fn handle_p2p_events(
                         generation,
                         manifest,
                         peer_tip_height,
+                        header_validation_elapsed,
+                        terminal_proof_measurement,
+                        staged_header_count,
                         result,
                     });
                 });
@@ -4909,6 +5070,7 @@ async fn handle_p2p_events(
                 );
                 continue;
             }
+            sync_phase_telemetry.record_header_work(completed.work_elapsed);
             let sync = match completed.result {
                 Ok(sync) => sync,
                 Err(error) => {
@@ -5005,7 +5167,12 @@ async fn handle_p2p_events(
             snapshot_staging_inflight = None;
 
             match completed {
-                SnapshotStagingCompletion::Accepted { key, result } => {
+                SnapshotStagingCompletion::Accepted {
+                    key,
+                    payload_bytes,
+                    work_elapsed,
+                    result,
+                } => {
                     let SnapshotStagingOperationKey::Accept {
                         generation,
                         from,
@@ -5038,6 +5205,7 @@ async fn handle_p2p_events(
                             continue;
                         }
                     };
+                    sync_phase_telemetry.record_state_segment(payload_bytes, work_elapsed);
                     if !pending_manifest.as_ref().is_some_and(|pending| pending.from == from)
                         || !pending_segment_ids.remove(&segment_id)
                     {
@@ -5086,6 +5254,7 @@ async fn handle_p2p_events(
                         snapshot_staging_inflight = Some(key);
                         let completion = snapshot_staging_completion_tx.clone();
                         tokio::task::spawn_blocking(move || {
+                            let started = Instant::now();
                             let result = std::panic::catch_unwind(
                                 std::panic::AssertUnwindSafe(move || {
                                     staging.finalize().map_err(|error| error.to_string())
@@ -5097,6 +5266,7 @@ async fn handle_p2p_events(
                                 SnapshotStagingCompletion::Finalized {
                                     key,
                                     segment_count,
+                                    work_elapsed: started.elapsed(),
                                     result,
                                 },
                             );
@@ -5106,6 +5276,7 @@ async fn handle_p2p_events(
                 SnapshotStagingCompletion::Finalized {
                     key,
                     segment_count,
+                    work_elapsed,
                     result,
                 } => {
                     let SnapshotStagingOperationKey::Finalize { generation, from } = key else {
@@ -5133,6 +5304,7 @@ async fn handle_p2p_events(
                             continue;
                         }
                     };
+                    sync_phase_telemetry.record_state_work(work_elapsed);
                     let Some(mut pending) = pending_manifest.take() else {
                         tracing::warn!(from = %from, "snapshot finalized without selected manifest");
                         cleanup_finalized_snapshot_staging_offthread(finalized);
@@ -5209,9 +5381,27 @@ async fn handle_p2p_events(
             }
             snapshot_install_inflight = None;
             match completed.result {
-                Ok(height) => {
+                Ok(applied) => {
+                    sync_phase_telemetry
+                        .record_header_work(applied.header_promotion_elapsed);
+                    sync_phase_telemetry.observe_header_scale(
+                        applied.staged_header_count,
+                        applied
+                            .staged_header_count
+                            .saturating_mul(noid_chain::BLOCK_HEADER_WIRE_SIZE as u64),
+                    );
+                    sync_phase_telemetry.record_state_work(applied.state_install_elapsed);
+                    log_sync_phase_measurement(sync_phase_telemetry.finish_headers());
+                    log_sync_phase_measurement(sync_phase_telemetry.finish_state());
+
+                    let height = applied.height;
                     tracing::info!(height, from = %completed.key.from, "snapshot install completed");
                     reset_sync_state!();
+                    if let Some(empty_suffix) =
+                        sync_phase_telemetry.begin_suffix(height, highest_announced)
+                    {
+                        log_sync_phase_measurement(empty_suffix);
+                    }
                     last_tip_advance = Instant::now();
                     sync_ready.notify_one();
                     if highest_announced > height {
@@ -5272,6 +5462,17 @@ async fn handle_p2p_events(
                     "discarding selected-history verification from a reset sync generation"
                 );
                 continue;
+            }
+
+            sync_phase_telemetry.record_header_work(completed.header_validation_elapsed);
+            sync_phase_telemetry.observe_header_scale(
+                completed.staged_header_count,
+                completed
+                    .staged_header_count
+                    .saturating_mul(noid_chain::BLOCK_HEADER_WIRE_SIZE as u64),
+            );
+            if let Some(measurement) = completed.terminal_proof_measurement {
+                log_sync_phase_measurement(measurement);
             }
 
             let from = completed.key.from;
@@ -5341,6 +5542,7 @@ async fn handle_p2p_events(
                 snapshot_staging_inflight = Some(key);
                 let completion = snapshot_staging_completion_tx.clone();
                 tokio::task::spawn_blocking(move || {
+                    let started = Instant::now();
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                         staging.finalize().map_err(|error| error.to_string())
                     }))
@@ -5349,6 +5551,7 @@ async fn handle_p2p_events(
                     let _ = completion.blocking_send(SnapshotStagingCompletion::Finalized {
                         key,
                         segment_count,
+                        work_elapsed: started.elapsed(),
                         result,
                     });
                 });
@@ -5866,7 +6069,7 @@ async fn apply_verified_snapshot(
     staging: FinalizedSnapshotStaging,
     selected_history: VerifiedSelectedHistorySnapshot,
     wallet_operation_gate: &WalletOperationGate,
-) -> Result<u64, String> {
+) -> Result<AppliedVerifiedSnapshot, String> {
     if selected_history.height != manifest.tip_height
         || selected_history.block_hash != manifest.tip_hash
     {
@@ -5879,6 +6082,7 @@ async fn apply_verified_snapshot(
         height,
         block_hash,
         tier,
+        staged_header_count,
         terminal_package_bytes,
         verified_headers,
         inbound_memory_permit,
@@ -5895,23 +6099,25 @@ async fn apply_verified_snapshot(
         let ctx = chain.read().await;
         ctx.store.clone()
     };
-    let (verified_headers, promotion) = tokio::task::spawn_blocking(move || {
-        let mut verified_headers = verified_headers;
-        match verified_headers.promote(&header_store) {
-            Ok(promotion) => Ok((verified_headers, promotion)),
-            Err(error) => {
-                if let Err(cleanup_error) = verified_headers.discard() {
-                    tracing::warn!(
-                        err = %cleanup_error,
-                        "rejected snapshot header staging cleanup deferred"
-                    );
+    let (verified_headers, promotion, header_promotion_elapsed) =
+        tokio::task::spawn_blocking(move || {
+            let started = Instant::now();
+            let mut verified_headers = verified_headers;
+            match verified_headers.promote(&header_store) {
+                Ok(promotion) => Ok((verified_headers, promotion, started.elapsed())),
+                Err(error) => {
+                    if let Err(cleanup_error) = verified_headers.discard() {
+                        tracing::warn!(
+                            err = %cleanup_error,
+                            "rejected snapshot header staging cleanup deferred"
+                        );
+                    }
+                    Err(format!("promote authenticated snapshot headers: {error}"))
                 }
-                Err(format!("promote authenticated snapshot headers: {error}"))
             }
-        }
-    })
-    .await
-    .map_err(|error| format!("snapshot header promotion worker panicked: {error}"))??;
+        })
+        .await
+        .map_err(|error| format!("snapshot header promotion worker panicked: {error}"))??;
 
     // Global order for operations that can replace the active wallet cache:
     // wallet_operation_gate -> mempool snapshot/view -> chain -> SharedWallet.
@@ -5919,6 +6125,7 @@ async fn apply_verified_snapshot(
     // reload, but not across the independently crash-safe header stream above.
     // None of those helpers may enter wallet RPC code that acquires the same gate.
     let wallet_operation = wallet_operation_gate.lock().await;
+    let state_install_started = Instant::now();
     let install_chain = Arc::clone(chain);
     let result = tokio::task::spawn_blocking(move || {
         // Keep both the wire allocation and its process-global inbound charge
@@ -5982,6 +6189,7 @@ async fn apply_verified_snapshot(
         "snapshot boundary fully applied"
     );
     drop(wallet_operation);
+    let state_install_elapsed = state_install_started.elapsed();
     let _ = p2p_cmd
         .send(noid_p2p::NetworkCommand::SyncBlocksFrom {
             peer,
@@ -5989,7 +6197,12 @@ async fn apply_verified_snapshot(
             count: noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH as u16,
         })
         .await;
-    Ok(snapshot_height)
+    Ok(AppliedVerifiedSnapshot {
+        height: snapshot_height,
+        staged_header_count,
+        header_promotion_elapsed,
+        state_install_elapsed,
+    })
 }
 
 /// Apply a newly confirmed block to the in-process wallet state.
