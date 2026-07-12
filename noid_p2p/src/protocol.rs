@@ -211,6 +211,15 @@ pub struct GetMempoolResponse {
     /// Raw `TxIntent` bytes, one per pending transaction.
     /// Empty when the peer's mempool is empty or the node is just starting.
     pub txs: Vec<Vec<u8>>,
+    /// Process-wide inbound byte admission retained until node-side mempool
+    /// submission has consumed every decoded intent. Local flow-control state;
+    /// never serialized.
+    #[serde(skip)]
+    pub(crate) inbound_memory_permit: Option<std::sync::Arc<tokio::sync::OwnedSemaphorePermit>>,
+    /// Process-wide outbound byte admission retained through the codec write.
+    /// Local flow-control state; never serialized.
+    #[serde(skip)]
+    pub(crate) outbound_memory_permit: Option<crate::outbound_budget::OutboundMemoryPermit>,
 }
 
 // ---------------------------------------------------------------------------

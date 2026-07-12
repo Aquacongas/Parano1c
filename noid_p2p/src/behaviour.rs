@@ -37,9 +37,9 @@ const GOSSIPSUB_MESSAGE_ID_DOMAIN: &[u8] = b"NOID_P2P_GOSSIPSUB_MESSAGE_ID";
 
 use crate::block_sync_codec::BlockSyncCodec;
 use crate::history_proof_codec::HistoryProofCodec;
+use crate::mempool_sync_codec::MempoolSyncCodec;
 use crate::protocol::{
-    GetHeadersRequest, GetHeadersResponse, GetMempoolRequest, GetMempoolResponse,
-    GetStateManifestRequest, GetStateManifestResponse,
+    GetHeadersRequest, GetHeadersResponse, GetStateManifestRequest, GetStateManifestResponse,
 };
 use crate::state_segment_codec::StateSegmentCodec;
 
@@ -132,7 +132,7 @@ pub struct NodeBehaviour {
     /// TXs submitted before connection are immediately propagated.
     /// This complements gossipsub (which only delivers NEW events) with a
     /// state-sync mechanism for existing mempool entries.
-    pub mempool_sync: request_response::cbor::Behaviour<GetMempoolRequest, GetMempoolResponse>,
+    pub mempool_sync: request_response::Behaviour<MempoolSyncCodec>,
 }
 
 impl NodeBehaviour {
@@ -292,17 +292,16 @@ impl NodeBehaviour {
                 .with_max_concurrent_streams(8),
         );
 
-        // Mempool sync: exchange pending TXs on peer connect.
-        // Response contains raw TxIntent bytes for all pending transactions.
-        // 10s timeout is generous for a few KB of mempool data.
-        let mempool_sync = request_response::cbor::Behaviour::new(
+        // Mempool sync v2 declares and validates every intent length before
+        // allocation and streams payload slices without a duplicate CBOR Vec.
+        let mempool_sync = request_response::Behaviour::new(
             [(
-                StreamProtocol::try_from_owned(format!("{}/mempool/1", protocol_id))?,
+                StreamProtocol::try_from_owned(format!("{}/sync/mempool/2", protocol_id))?,
                 ProtocolSupport::Full,
             )],
             request_response::Config::default()
                 .with_request_timeout(Duration::from_secs(10))
-                .with_max_concurrent_streams(4),
+                .with_max_concurrent_streams(1),
         );
 
         // ----------------------------------------------------------------

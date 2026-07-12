@@ -34,8 +34,8 @@ use noid_mempool::AsyncMempool;
 use crate::behaviour::{NodeBehaviour, NodeBehaviourEvent};
 use crate::outbound_budget::OutboundResponseBudget;
 use crate::protocol::{
-    BlockGossipMsg, GetHeadersResponse, GetHistoryProofResponse, GetRecentBlockResponse,
-    GetStateManifestResponse, GetStateSegmentResponse, NetworkTopics,
+    BlockGossipMsg, GetHeadersResponse, GetHistoryProofResponse, GetMempoolResponse,
+    GetRecentBlockResponse, GetStateManifestResponse, GetStateSegmentResponse, NetworkTopics,
 };
 
 struct PendingStateSegmentResponse {
@@ -51,6 +51,40 @@ struct PendingBlockResponse {
 struct PendingHistoryProofResponse {
     channel: request_response::ResponseChannel<GetHistoryProofResponse>,
     response: GetHistoryProofResponse,
+}
+
+struct PendingMempoolResponse {
+    channel: request_response::ResponseChannel<GetMempoolResponse>,
+    response: GetMempoolResponse,
+}
+
+/// Admit the maximum legal response before invoking the payload loader.
+/// Keeping this boundary in one helper makes it impossible for a serving path
+/// to accidentally move mempool cloning ahead of process-wide byte admission.
+async fn prepare_mempool_response_after_admission<Load, Loaded>(
+    budget: OutboundResponseBudget,
+    load: Load,
+) -> std::io::Result<GetMempoolResponse>
+where
+    Load: FnOnce() -> Loaded,
+    Loaded: std::future::Future<Output = Vec<Vec<u8>>>,
+{
+    let outbound_memory_permit =
+        budget
+            .acquire(MAX_MEMPOOL_SYNC_BYTES)
+            .await?
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "non-empty mempool reservation returned no permit",
+                )
+            })?;
+    let txs = load().await;
+    Ok(GetMempoolResponse {
+        txs,
+        inbound_memory_permit: None,
+        outbound_memory_permit: Some(outbound_memory_permit),
+    })
 }
 
 type SnapshotExportKey = (u64, [u8; 32]);
@@ -365,6 +399,9 @@ pub enum NetworkEvent {
         from: PeerId,
         /// Raw TxIntent bytes, one per pending transaction.
         txs: Vec<Vec<u8>>,
+        /// Holds the process-global inbound mempool byte budget until node-side
+        /// submission has consumed this response.
+        inbound_memory_permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     },
     /// A peer connected.
     PeerConnected(PeerId),
@@ -732,9 +769,11 @@ async fn run_swarm(
         mpsc::channel::<PendingHistoryProofResponse>(1);
     let (segment_response_tx, mut segment_response_rx) =
         mpsc::channel::<PendingStateSegmentResponse>(1);
+    let (mempool_response_tx, mut mempool_response_rx) = mpsc::channel::<PendingMempoolResponse>(1);
     let block_response_prepare_semaphore = Arc::new(Semaphore::new(2));
     let history_response_prepare_semaphore = Arc::new(Semaphore::new(4));
     let segment_encode_semaphore = Arc::new(Semaphore::new(2));
+    let mempool_response_prepare_semaphore = Arc::new(Semaphore::new(1));
     let outbound_response_budget = OutboundResponseBudget::process_global();
     let snapshot_export_root = data_dir.join("snapshot-exports");
     std::fs::create_dir_all(&snapshot_export_root)?;
@@ -791,6 +830,8 @@ async fn run_swarm(
                     &history_response_prepare_semaphore,
                     &segment_response_tx,
                     &segment_encode_semaphore,
+                    &mempool_response_tx,
+                    &mempool_response_prepare_semaphore,
                     &outbound_response_budget,
                     &mut snapshot_exports,
                     &mut reconnect,
@@ -829,6 +870,15 @@ async fn run_swarm(
                         .behaviour_mut()
                         .state_segment_sync
                         .send_response(encoded.channel, encoded.response);
+                }
+            }
+
+            prepared = mempool_response_rx.recv() => {
+                if let Some(prepared) = prepared {
+                    let _ = swarm
+                        .behaviour_mut()
+                        .mempool_sync
+                        .send_response(prepared.channel, prepared.response);
                 }
             }
 
@@ -1226,6 +1276,8 @@ async fn handle_swarm_event(
     history_response_prepare_semaphore: &Arc<Semaphore>,
     segment_response_tx: &mpsc::Sender<PendingStateSegmentResponse>,
     segment_encode_semaphore: &Arc<Semaphore>,
+    mempool_response_tx: &mpsc::Sender<PendingMempoolResponse>,
+    mempool_response_prepare_semaphore: &Arc<Semaphore>,
     outbound_response_budget: &OutboundResponseBudget,
     snapshot_exports: &mut std::collections::HashMap<SnapshotExportKey, SnapshotExport>,
     reconnect: &mut std::collections::HashMap<
@@ -2191,24 +2243,51 @@ async fn handle_swarm_event(
                 peer,
             },
         )) => {
-            let txs = mempool
-                .intent_bytes_prefix(
-                    MAX_MEMPOOL_SYNC_TXS,
-                    MAX_MEMPOOL_SYNC_BYTES,
-                    MAX_TX_INTENT_BYTES_GLOBAL,
-                )
-                .await;
-            let total_bytes: usize = txs.iter().map(Vec::len).sum();
-            tracing::debug!(
-                peer = %peer,
-                tx_count = txs.len(),
-                total_bytes,
-                "serving mempool sync request"
-            );
-            let _ = swarm
-                .behaviour_mut()
-                .mempool_sync
-                .send_response(channel, crate::protocol::GetMempoolResponse { txs });
+            let Ok(preparation_permit) =
+                Arc::clone(mempool_response_prepare_semaphore).try_acquire_owned()
+            else {
+                // Mempool state is recoverable through gossip and a later sync.
+                // Dropping the channel rejects excess preparation without ever
+                // stalling the swarm task or cloning payload bytes.
+                tracing::debug!(peer = %peer, "mempool sync preparation already occupied");
+                return;
+            };
+            let budget = outbound_response_budget.clone();
+            let mempool = mempool.clone();
+            let completion = mempool_response_tx.clone();
+            tokio::spawn(async move {
+                // Reserve the maximum legal response before taking the mempool
+                // lock or cloning the first retained intent. The same permit is
+                // carried by the response until the codec's final write.
+                let response = match prepare_mempool_response_after_admission(budget, || async {
+                    mempool
+                        .intent_bytes_prefix(
+                            MAX_MEMPOOL_SYNC_TXS,
+                            MAX_MEMPOOL_SYNC_BYTES,
+                            MAX_TX_INTENT_BYTES_GLOBAL,
+                        )
+                        .await
+                })
+                .await
+                {
+                    Ok(response) => response,
+                    Err(error) => {
+                        tracing::debug!(peer = %peer, err = %error, "mempool sync byte admission failed");
+                        return;
+                    }
+                };
+                let total_bytes: usize = response.txs.iter().map(Vec::len).sum();
+                tracing::debug!(
+                    peer = %peer,
+                    tx_count = response.txs.len(),
+                    total_bytes,
+                    "serving mempool sync request"
+                );
+                let _preparation_permit = preparation_permit;
+                let _ = completion
+                    .send(PendingMempoolResponse { channel, response })
+                    .await;
+            });
         }
 
         // --- Mempool sync: client side (response to our request) ---
@@ -2218,35 +2297,27 @@ async fn handle_swarm_event(
                 peer,
             },
         )) => {
-            let mut txs = response.txs;
-            if txs.len() > MAX_MEMPOOL_SYNC_TXS {
-                tracing::warn!(
-                    from = %peer,
-                    count = txs.len(),
-                    "mempool sync response oversized, truncating to {MAX_MEMPOOL_SYNC_TXS}"
-                );
-                txs.truncate(MAX_MEMPOOL_SYNC_TXS);
-            }
-            let mut total_bytes = 0usize;
-            txs.retain(|tx| {
-                if tx.len() > MAX_TX_INTENT_BYTES_GLOBAL {
-                    tracing::warn!(from = %peer, len = tx.len(), "mempool sync tx too large — dropped");
-                    return false;
-                }
-                total_bytes = total_bytes.saturating_add(tx.len());
-                if total_bytes > MAX_MEMPOOL_SYNC_BYTES {
-                    tracing::warn!(from = %peer, total_bytes, "mempool sync response total bytes exceeded cap — truncating");
-                    return false;
-                }
-                true
-            });
+            let GetMempoolResponse {
+                txs,
+                inbound_memory_permit,
+                outbound_memory_permit: _,
+            } = response;
             if !txs.is_empty() {
                 tracing::debug!(
                     from = %peer,
                     tx_count = txs.len(),
                     "received mempool sync response"
                 );
-                let _ = gossip_event_tx.send(NetworkEvent::MempoolSyncResponse { from: peer, txs });
+                // The fixed codec has already validated all caps. Mempool sync
+                // is recoverable, so do not block the swarm if authoritative
+                // sync events currently occupy the bounded node queue.
+                if let Err(error) = required_event_tx.try_send(NetworkEvent::MempoolSyncResponse {
+                    from: peer,
+                    txs,
+                    inbound_memory_permit,
+                }) {
+                    tracing::debug!(peer = %peer, err = %error, "mempool sync response dropped under node backpressure");
+                }
             }
         }
 
@@ -2349,6 +2420,8 @@ async fn handle_swarm_event(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::*;
 
     #[test]
@@ -2455,5 +2528,26 @@ mod tests {
             receiver.recv().await,
             Err(NetworkEventRecvError::Lagged(1))
         ));
+    }
+
+    #[tokio::test]
+    async fn mempool_serving_admits_bytes_before_invoking_payload_source() {
+        let budget = OutboundResponseBudget::with_capacity(MAX_MEMPOOL_SYNC_BYTES);
+        let source_invoked = Arc::new(AtomicBool::new(false));
+        let observed_budget = budget.clone();
+        let observed_source = source_invoked.clone();
+        let response =
+            prepare_mempool_response_after_admission(budget.clone(), move || async move {
+                assert_eq!(observed_budget.available_bytes(), 0);
+                observed_source.store(true, Ordering::SeqCst);
+                vec![vec![0xA5]]
+            })
+            .await
+            .unwrap();
+
+        assert!(source_invoked.load(Ordering::SeqCst));
+        assert_eq!(budget.available_bytes(), 0);
+        drop(response);
+        assert_eq!(budget.available_bytes(), MAX_MEMPOOL_SYNC_BYTES);
     }
 }

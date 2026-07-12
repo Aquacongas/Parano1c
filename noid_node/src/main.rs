@@ -2679,7 +2679,11 @@ async fn handle_p2p_events(
                     );
                 }
             }
-            Ok(NetworkEvent::MempoolSyncResponse { from, txs }) => {
+            Ok(NetworkEvent::MempoolSyncResponse {
+                from,
+                txs,
+                inbound_memory_permit,
+            }) => {
                 tracing::info!(
                     peer = %from,
                     tx_count = txs.len(),
@@ -2719,6 +2723,10 @@ async fn handle_p2p_events(
                             }
                         }
                     }
+                    // The decoded response owns one process-global inbound
+                    // reservation. Release it only after every intent has been
+                    // submitted or rejected by the local admission pipeline.
+                    drop(inbound_memory_permit);
                 });
             }
             Ok(NetworkEvent::NewTx { from, intent_bytes }) => {
