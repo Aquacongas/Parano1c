@@ -24,7 +24,9 @@ pub use mdbx_context::{
     AppliedBlockValidation, MdbxChainContext, MdbxContextError, ReorgBlockPayload,
 };
 pub use mdbx_store::{
-    AcceptedBlockCommitData, MdbxStore, StoreError, VerifiedOwnerSnapshot, VerifiedOwnerUtxo,
+    AcceptedBlockCommitData, MdbxStore, RecursiveProofJob, RecursiveProofJobResult,
+    RecursiveProofJobState, RecursiveProofJobTier, StoreError, VerifiedOwnerSnapshot,
+    VerifiedOwnerUtxo, MAX_RECURSIVE_PROOF_JOB_RESULT_BYTES,
 };
 pub use memory::RamBackend;
 pub use meta::{ConsensusMeta, FinalizedCheckpoint};

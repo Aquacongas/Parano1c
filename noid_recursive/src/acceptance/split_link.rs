@@ -1531,9 +1531,9 @@ pub struct SplitLinkInput<'a> {
 /// Matrix-free half of one split-link build input.
 ///
 /// Unlike [`SplitLinkInput`], this object owns both registry vectors and holds
-/// references only to the two proof envelopes. It is consumed by
-/// [`prepare_split_link_native`], whose result has no lifetime dependency on
-/// either fold matrix.
+/// references only to the two proof envelopes. Production consumes it through
+/// [`begin_split_link_native_preparation`]; neither consuming matrix phase
+/// retains a borrow of the matrix it just authenticated and folded.
 pub struct SplitLinkTraceInput<'a> {
     /// The previous link envelope (or the canonical T envelope at genesis).
     pub prev: &'a LinkProofEnvelope,
@@ -1557,6 +1557,115 @@ impl<'a> SplitLinkTraceInput<'a> {
             block: input.block,
         }
     }
+}
+
+/// Fail-closed native preparation error raised before recursive trace
+/// allocation.  The phased API reports structural/class mixing instead of
+/// reaching the assertion-only compatibility wrapper.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SplitLinkPreparationError {
+    ClassIdentity,
+    PreviousEnvelopeIo,
+    BlockEnvelopeIo,
+    RegistryShape,
+    PreviousPcsParameters,
+    BlockPcsParameters,
+    PreviousSlot,
+    GenesisPredecessor,
+    TransitionBinding,
+    PreviousMatrixShape,
+    PreviousMatrixDigest,
+    BlockMatrixShape,
+    BlockMatrixDigest,
+    PreviousProof,
+    BlockProof,
+    IoRouting,
+}
+
+impl core::fmt::Display for SplitLinkPreparationError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let message = match self {
+            Self::ClassIdentity => "split-link class identity is not frozen",
+            Self::PreviousEnvelopeIo => "previous Link envelope IO shape mismatch",
+            Self::BlockEnvelopeIo => "current Block envelope IO shape mismatch",
+            Self::RegistryShape => "split-link registry shape mismatch",
+            Self::PreviousPcsParameters => "previous Link PCS parameters mismatch",
+            Self::BlockPcsParameters => "current Block PCS parameters mismatch",
+            Self::PreviousSlot => "previous Link slot is outside the canonical ladder",
+            Self::GenesisPredecessor => "genesis predecessor is not canonical T",
+            Self::TransitionBinding => "split-link transition/class binding mismatch",
+            Self::PreviousMatrixShape => "previous Link matrix shape mismatch",
+            Self::PreviousMatrixDigest => "previous Link matrix structural digest mismatch",
+            Self::BlockMatrixShape => "current Block matrix shape mismatch",
+            Self::BlockMatrixDigest => "current Block matrix structural digest mismatch",
+            Self::PreviousProof => "previous Link envelope verification failed",
+            Self::BlockProof => "current Block envelope verification failed",
+            Self::IoRouting => "split-link accumulated-claim IO routing failed",
+        };
+        f.write_str(message)
+    }
+}
+
+impl std::error::Error for SplitLinkPreparationError {}
+
+/// First consuming phase of production native Link preparation.
+///
+/// It owns the immutable proof/input binding but no matrix. Supplying the
+/// previous-Link matrix consumes this state and returns a block-only phase, so
+/// the previous matrix may be released before the block matrix is loaded.
+#[must_use = "previous-Link matrix phase must be consumed"]
+pub struct SplitLinkPreviousMatrixPhase<'a> {
+    core: SplitLinkNativePreparationCore<'a>,
+}
+
+/// Second consuming phase. The previous-Link fold proof and output claim are
+/// owned here; neither the previous matrix nor a way to replace its class/slot
+/// remains reachable.
+#[must_use = "current-Block matrix phase must be consumed"]
+pub struct SplitLinkBlockMatrixPhase<'a> {
+    core: SplitLinkNativePreparationCore<'a>,
+    fold_proof_link: MatrixFoldProof,
+    acc_link: MatrixAccClaim,
+}
+
+struct SplitLinkNativePreparationCore<'a> {
+    class: &'a SplitLinkClass,
+    input: SplitLinkTraceInput<'a>,
+    layout: SplitIoLayout,
+    expected_link_matrix_digest: [u8; 32],
+    expected_link_post_commit: [u8; 32],
+    expected_block_matrix_digest: [u8; 32],
+    freeze: bool,
+}
+
+fn validate_split_fold_matrix_identity(
+    matrix: &FieldR1cs,
+    expected_shape: FieldShape,
+    expected_digest: [u8; 32],
+    shape_error: SplitLinkPreparationError,
+    digest_error: SplitLinkPreparationError,
+) -> Result<(), SplitLinkPreparationError> {
+    if FieldShape::of(matrix) != expected_shape {
+        return Err(shape_error);
+    }
+    // `statement_digest()` has a seedable cache for trusted rebuilt class
+    // artifacts.  A matrix crossing this public phased boundary is untrusted,
+    // so authenticate its CSR contents directly before proof replay.
+    if matrix.structural_statement_digest() != expected_digest {
+        return Err(digest_error);
+    }
+    Ok(())
+}
+
+fn prove_split_matrix_fold(
+    transcript_domain: &'static [u8],
+    matrix: &FieldR1cs,
+    fresh: &noid_ivc_core::matrix_claim::FreshLincheckClaim,
+    incoming: &MatrixAccClaim,
+    gate: bool,
+) -> (MatrixFoldProof, MatrixAccClaim) {
+    let mut challenger = FsLaneChallenger::new(transcript_domain);
+    prove_matrix_claim_fold(matrix, fresh, incoming, gate, &mut challenger)
 }
 
 /// One-shot native split-link preparation.
@@ -1887,10 +1996,270 @@ fn build_split_link_inner(
     .assemble()
 }
 
-/// Verify both child envelopes natively and produce their two matrix-fold
-/// proofs. The matrix borrows end when this function returns; the resulting
-/// [`PreparedSplitLink`] can outlive and assemble after both matrices are
-/// released.
+/// Begin production native preparation without loading either child matrix.
+///
+/// This performs class, registry, IO, PCS and transition preflight only. The
+/// returned consuming phase accepts exactly the previous-Link matrix; after it
+/// returns, that matrix can be dropped before the current Block matrix is
+/// loaded.
+pub fn begin_split_link_native_preparation<'a>(
+    class: &'a SplitLinkClass,
+    input: SplitLinkTraceInput<'a>,
+) -> Result<SplitLinkPreviousMatrixPhase<'a>, SplitLinkPreparationError> {
+    begin_split_link_native_preparation_inner(class, input, false)
+}
+
+fn begin_split_link_native_preparation_inner<'a>(
+    class: &'a SplitLinkClass,
+    input: SplitLinkTraceInput<'a>,
+    freeze: bool,
+) -> Result<SplitLinkPreviousMatrixPhase<'a>, SplitLinkPreparationError> {
+    if !freeze {
+        class
+            .validate_frozen_identity()
+            .map_err(|_| SplitLinkPreparationError::ClassIdentity)?;
+    }
+    let layout = class.layout();
+    let n = class.ladder.len();
+    let slot = class.slot;
+    if class.spec.io_len != layout.len || layout.b_lanes.len() != n || slot >= n {
+        return Err(SplitLinkPreparationError::RegistryShape);
+    }
+    if input.prev.io().len() != layout.len {
+        return Err(SplitLinkPreparationError::PreviousEnvelopeIo);
+    }
+    if input.block.io().len() != class.b_spec.io_len {
+        return Err(SplitLinkPreparationError::BlockEnvelopeIo);
+    }
+    if input.link_class_digests.len() != n || input.link_post_commit_class_digests.len() != n {
+        return Err(SplitLinkPreparationError::RegistryShape);
+    }
+    if !same_pcs_params(&input.prev.commitment().params, &class.pcs_params) {
+        return Err(SplitLinkPreparationError::PreviousPcsParameters);
+    }
+    if !same_pcs_params(&input.block.commitment().params, &class.b_pcs_params) {
+        return Err(SplitLinkPreparationError::BlockPcsParameters);
+    }
+    if !input.genesis && input.prev_slot >= n {
+        return Err(SplitLinkPreparationError::PreviousSlot);
+    }
+    if input.genesis
+        && (input.prev.commitment().root != class.genesis_envelope().commitment().root
+            || input.prev.io() != class.genesis_envelope().io())
+    {
+        return Err(SplitLinkPreparationError::GenesisPredecessor);
+    }
+
+    let expected_link_matrix_digest = if input.genesis {
+        class.genesis_digest
+    } else {
+        input.link_class_digests[input.prev_slot]
+    };
+    let expected_link_post_commit = if input.genesis {
+        *class
+            .genesis_post_commit_class_digest
+            .get()
+            .ok_or(SplitLinkPreparationError::ClassIdentity)?
+    } else {
+        input.link_post_commit_class_digests[input.prev_slot]
+    };
+    let expected_block_matrix_digest = class.ladder[slot].b_digest;
+
+    if !freeze && !input.genesis {
+        for (digest, post_commit) in input
+            .link_class_digests
+            .iter()
+            .zip(&input.link_post_commit_class_digests)
+        {
+            if *post_commit
+                != link_post_commit_class_digest(
+                    digest,
+                    &class.spec,
+                    &class.pcs_params,
+                    class.sidecar_vk(),
+                )
+            {
+                return Err(SplitLinkPreparationError::TransitionBinding);
+            }
+        }
+        preflight_split_transition(
+            &layout,
+            input.prev_slot,
+            slot,
+            &input.link_class_digests,
+            &input.link_post_commit_class_digests,
+            input.prev.io(),
+            expected_link_matrix_digest,
+            expected_link_post_commit,
+            expected_block_matrix_digest,
+            class.ladder[slot].b_digest,
+            &input.block.io()[BLOCK_IO_START_ACC..BLOCK_IO_START_ACC + super::link::ACC_LANES],
+            &input.prev.io()[layout.block_acc..layout.block_acc + super::link::ACC_LANES],
+        )
+        .map_err(|_| SplitLinkPreparationError::TransitionBinding)?;
+    }
+
+    Ok(SplitLinkPreviousMatrixPhase {
+        core: SplitLinkNativePreparationCore {
+            class,
+            input,
+            layout,
+            expected_link_matrix_digest,
+            expected_link_post_commit,
+            expected_block_matrix_digest,
+            freeze,
+        },
+    })
+}
+
+impl<'a> SplitLinkPreviousMatrixPhase<'a> {
+    /// Verify/fold the previous Link against one structurally authenticated
+    /// matrix and consume this phase. No matrix borrow enters the returned
+    /// block phase.
+    pub fn prepare_previous_link(
+        self,
+        fold_matrix_link: &FieldR1cs,
+    ) -> Result<SplitLinkBlockMatrixPhase<'a>, SplitLinkPreparationError> {
+        let core = self.core;
+        validate_split_fold_matrix_identity(
+            fold_matrix_link,
+            core.class.shape,
+            core.expected_link_matrix_digest,
+            SplitLinkPreparationError::PreviousMatrixShape,
+            SplitLinkPreparationError::PreviousMatrixDigest,
+        )?;
+
+        let mut ch_native = FsLaneChallenger::new(b"history-link-v0");
+        let (_previous_claim, fresh_link) = verify_field_deferred_matrix_with_post_commit_context(
+            &core.class.shape,
+            &core.expected_link_matrix_digest,
+            core.input.prev.commitment(),
+            core.input.prev.field_proof(),
+            &core.class.spec,
+            core.input.prev.io(),
+            &core.expected_link_post_commit,
+            core.input.prev.region_sidecar(),
+            &mut ch_native,
+            |sidecar, context| {
+                verify_link_region_sidecar_post_commit(core.class.sidecar_vk(), sidecar, context)
+                    .map_err(|_| VerifyError::Auxiliary)
+            },
+        )
+        .map_err(|_| SplitLinkPreparationError::PreviousProof)?;
+
+        let k_l = core.class.shape.k_log;
+        let (incoming_link, in_live_link) = if core.input.genesis {
+            (MatrixAccClaim::zero(k_l), F128::ZERO)
+        } else {
+            let lane = &core.layout.link_lanes[core.input.prev_slot];
+            (
+                MatrixAccClaim {
+                    point: core.input.prev.io()[lane.point..lane.value].to_vec(),
+                    value: core.input.prev.io()[lane.value],
+                },
+                core.input.prev.io()[lane.live],
+            )
+        };
+        let gate_link = !core.input.genesis && in_live_link == F128::ONE;
+        let (fold_proof_link, acc_link) = prove_split_matrix_fold(
+            b"history-link-fold-v0",
+            fold_matrix_link,
+            &fresh_link,
+            &incoming_link,
+            gate_link,
+        );
+        Ok(SplitLinkBlockMatrixPhase {
+            core,
+            fold_proof_link,
+            acc_link,
+        })
+    }
+}
+
+impl<'a> SplitLinkBlockMatrixPhase<'a> {
+    /// Verify/fold the current Block against its one class matrix, route the
+    /// exact accumulated claims and return matrix-free recursive assembly
+    /// material.
+    pub fn prepare_current_block(
+        self,
+        fold_matrix_block: &FieldR1cs,
+    ) -> Result<PreparedSplitLink<'a>, SplitLinkPreparationError> {
+        let Self {
+            core,
+            fold_proof_link,
+            acc_link,
+        } = self;
+        let class = core.class;
+        let slot = class.slot;
+        let b_shape = class.ladder[slot].b_shape;
+        validate_split_fold_matrix_identity(
+            fold_matrix_block,
+            b_shape,
+            core.expected_block_matrix_digest,
+            SplitLinkPreparationError::BlockMatrixShape,
+            SplitLinkPreparationError::BlockMatrixDigest,
+        )?;
+
+        let mut ch_native = FsLaneChallenger::new(b"history-block-v0");
+        let (_block_claim, fresh_block) = verify_field_deferred_matrix_with_post_commit_context(
+            &b_shape,
+            &core.expected_block_matrix_digest,
+            core.input.block.commitment(),
+            core.input.block.field_proof(),
+            &class.b_spec,
+            core.input.block.io(),
+            &class.b_post_commit_class_digest,
+            core.input.block.region_sidecar(),
+            &mut ch_native,
+            |sidecar, context| {
+                verify_block_region_sidecar_post_commit(&class.b_sidecar_vk, sidecar, context)
+                    .map_err(|_| VerifyError::Auxiliary)
+            },
+        )
+        .map_err(|_| SplitLinkPreparationError::BlockProof)?;
+
+        let b_lane = &core.layout.b_lanes[slot];
+        let incoming_block = MatrixAccClaim {
+            point: core.input.prev.io()[b_lane.point..b_lane.value].to_vec(),
+            value: core.input.prev.io()[b_lane.value],
+        };
+        let gate_block = core.input.prev.io()[b_lane.live] == F128::ONE;
+        let (fold_proof_block, acc_block) = prove_split_matrix_fold(
+            b"history-block-fold-v0",
+            fold_matrix_block,
+            &fresh_block,
+            &incoming_block,
+            gate_block,
+        );
+        let io = route_split_transition_io(
+            &core.layout,
+            core.input.genesis,
+            core.input.prev_slot,
+            slot,
+            &core.input.link_class_digests,
+            &core.input.link_post_commit_class_digests,
+            core.input.prev.io(),
+            &acc_link,
+            &acc_block,
+            &core.input.block.io()[BLOCK_IO_END_ACC..BLOCK_IO_END_ACC + super::link::ACC_LANES],
+        )
+        .map_err(|_| SplitLinkPreparationError::IoRouting)?;
+
+        Ok(PreparedSplitLink {
+            class,
+            input: core.input,
+            fold_proof_link,
+            fold_proof_block,
+            io,
+            freeze: core.freeze,
+        })
+    }
+}
+
+/// Compatibility wrapper that accepts both matrix borrows at once.
+/// Production proof coordinators should use
+/// [`begin_split_link_native_preparation`] and release the previous matrix
+/// before loading the current Block matrix.
 pub fn prepare_split_link_native<'a>(
     class: &'a SplitLinkClass,
     input: SplitLinkTraceInput<'a>,
@@ -1907,223 +2276,12 @@ fn prepare_split_link_native_inner<'a>(
     fold_matrix_block: &FieldR1cs,
     freeze: bool,
 ) -> PreparedSplitLink<'a> {
-    let layout = class.layout();
-    let n = class.ladder.len();
-    let k_l = class.shape.k_log;
-    let slot = class.slot;
-    let b_shape = class.ladder[slot].b_shape;
-    assert_eq!(class.spec.io_len, layout.len);
-    assert_eq!(input.prev.io().len(), layout.len, "previous envelope IO");
-    assert_eq!(
-        input.block.io().len(),
-        class.b_spec.io_len,
-        "block envelope IO"
-    );
-    assert_eq!(input.link_class_digests.len(), n, "whitelist size");
-    assert!(
-        same_pcs_params(&input.prev.commitment().params, &class.pcs_params),
-        "previous link PCS parameters must equal the frozen link class"
-    );
-    assert!(
-        same_pcs_params(&input.block.commitment().params, &class.b_pcs_params),
-        "block PCS parameters must equal the hosted block class"
-    );
-    assert_eq!(
-        input.link_post_commit_class_digests.len(),
-        n,
-        "post-commit whitelist size"
-    );
-    assert!(
-        input.genesis || input.prev_slot < n,
-        "prev slot out of ladder"
-    );
-    if input.genesis {
-        assert_eq!(
-            input.prev.commitment().root,
-            class.genesis_envelope().commitment().root,
-            "genesis predecessor must use the canonical ghost commitment"
-        );
-        assert_eq!(
-            input.prev.io(),
-            class.genesis_envelope().io(),
-            "genesis predecessor must use the canonical zero IO"
-        );
-    }
-    if !freeze {
-        // Both matrices cross the phased API boundary. Their ordinary digest
-        // cache is intentionally seedable after a trusted class rebuild, so a
-        // caller-supplied matrix must earn its identity from the CSR contents.
-        let fold_link_matrix_digest = fold_matrix_link.structural_statement_digest();
-        let fold_block_matrix_digest = fold_matrix_block.structural_statement_digest();
-        assert_eq!(
-            fold_block_matrix_digest, class.ladder[slot].b_digest,
-            "current Block fold matrix does not match its class",
-        );
-        if input.genesis {
-            assert_eq!(
-                fold_link_matrix_digest, class.genesis_digest,
-                "genesis Link fold matrix is not canonical T",
-            );
-        } else {
-            let fold_link_post_commit = link_post_commit_class_digest(
-                &fold_link_matrix_digest,
-                &class.spec,
-                &class.pcs_params,
-                class.sidecar_vk(),
-            );
-            for (digest, post_commit) in input
-                .link_class_digests
-                .iter()
-                .zip(&input.link_post_commit_class_digests)
-            {
-                assert_eq!(
-                    *post_commit,
-                    link_post_commit_class_digest(
-                        digest,
-                        &class.spec,
-                        &class.pcs_params,
-                        class.sidecar_vk(),
-                    ),
-                    "link whitelist matrix/post-commit pair",
-                );
-            }
-            preflight_split_transition(
-                &layout,
-                input.prev_slot,
-                slot,
-                &input.link_class_digests,
-                &input.link_post_commit_class_digests,
-                input.prev.io(),
-                fold_link_matrix_digest,
-                fold_link_post_commit,
-                fold_block_matrix_digest,
-                class.ladder[slot].b_digest,
-                &input.block.io()[BLOCK_IO_START_ACC..BLOCK_IO_START_ACC + super::link::ACC_LANES],
-                &input.prev.io()[layout.block_acc..layout.block_acc + super::link::ACC_LANES],
-            )
-            .expect("invalid non-genesis split-link transition inputs");
-        }
-    }
-
-    // ---- Native pass.
-    let verified_digest = if input.genesis {
-        class.genesis_digest
-    } else {
-        input.link_class_digests[input.prev_slot]
-    };
-    let verified_post_commit = if input.genesis {
-        *class
-            .genesis_post_commit_class_digest
-            .get()
-            .expect("frozen genesis post-commit identity")
-    } else {
-        input.link_post_commit_class_digests[input.prev_slot]
-    };
-    let mut ch_native = FsLaneChallenger::new(b"history-link-v0");
-    let (_pc, fresh_link) = verify_field_deferred_matrix_with_post_commit_context(
-        &class.shape,
-        &verified_digest,
-        input.prev.commitment(),
-        input.prev.field_proof(),
-        &class.spec,
-        input.prev.io(),
-        &verified_post_commit,
-        input.prev.region_sidecar(),
-        &mut ch_native,
-        |sidecar, context| {
-            verify_link_region_sidecar_post_commit(class.sidecar_vk(), sidecar, context)
-                .map_err(|_| VerifyError::Auxiliary)
-        },
-    )
-    .expect("previous link proof must verify (deferred)");
-    let mut chb_native = FsLaneChallenger::new(b"history-block-v0");
-    let (_bc, fresh_block) = verify_field_deferred_matrix_with_post_commit_context(
-        &b_shape,
-        &class.ladder[slot].b_digest,
-        input.block.commitment(),
-        input.block.field_proof(),
-        &class.b_spec,
-        input.block.io(),
-        &class.b_post_commit_class_digest,
-        input.block.region_sidecar(),
-        &mut chb_native,
-        |sidecar, context| {
-            verify_block_region_sidecar_post_commit(&class.b_sidecar_vk, sidecar, context)
-                .map_err(|_| VerifyError::Auxiliary)
-        },
-    )
-    .expect("block proof must verify (deferred)");
-
-    // Link-lane fold: incoming = the β-selected lane of the previous IO
-    // (identically zero at genesis — β is all-zero and T's IO is zero).
-    let (incoming_link, in_live_link) = if input.genesis {
-        (
-            MatrixAccClaim {
-                point: vec![F128::ZERO; 2 * k_l + 1],
-                value: F128::ZERO,
-            },
-            F128::ZERO,
-        )
-    } else {
-        let lane = &layout.link_lanes[input.prev_slot];
-        (
-            MatrixAccClaim {
-                point: input.prev.io()[lane.point..lane.value].to_vec(),
-                value: input.prev.io()[lane.value],
-            },
-            input.prev.io()[lane.live],
-        )
-    };
-    let gate_link = !input.genesis && in_live_link == F128::ONE;
-    let mut chf_native = FsLaneChallenger::new(b"history-link-fold-v0");
-    let (fold_proof_link, acc_link) = prove_matrix_claim_fold(
-        fold_matrix_link,
-        &fresh_link,
-        &incoming_link,
-        gate_link,
-        &mut chf_native,
-    );
-
-    // Block-lane fold: incoming = this slot's block lane of the previous
-    // IO. NOT gated by g — a genesis link folds its block 0 claim too.
-    let b_lane = &layout.b_lanes[slot];
-    let incoming_block = MatrixAccClaim {
-        point: input.prev.io()[b_lane.point..b_lane.value].to_vec(),
-        value: input.prev.io()[b_lane.value],
-    };
-    let gate_block = input.prev.io()[b_lane.live] == F128::ONE;
-    let mut chf2_native = FsLaneChallenger::new(b"history-block-fold-v0");
-    let (fold_proof_block, acc_block) = prove_matrix_claim_fold(
-        fold_matrix_block,
-        &fresh_block,
-        &incoming_block,
-        gate_block,
-        &mut chf2_native,
-    );
-
-    // ---- IO values.
-    let io = route_split_transition_io(
-        &layout,
-        input.genesis,
-        input.prev_slot,
-        slot,
-        &input.link_class_digests,
-        &input.link_post_commit_class_digests,
-        input.prev.io(),
-        &acc_link,
-        &acc_block,
-        &input.block.io()[BLOCK_IO_END_ACC..BLOCK_IO_END_ACC + super::link::ACC_LANES],
-    )
-    .expect("valid split-link transition routing");
-
-    PreparedSplitLink {
-        class,
-        input,
-        fold_proof_link,
-        fold_proof_block,
-        io,
-        freeze,
-    }
+    begin_split_link_native_preparation_inner(class, input, freeze)
+        .expect("invalid split-link native preparation")
+        .prepare_previous_link(fold_matrix_link)
+        .expect("previous Link native phase")
+        .prepare_current_block(fold_matrix_block)
+        .expect("current Block native phase")
 }
 
 fn assemble_prepared_split_link(prepared: PreparedSplitLink<'_>) -> BuiltSplitLink {
@@ -3617,8 +3775,15 @@ mod tests {
         link_matrix: FieldR1cs,
         block_matrix: FieldR1cs,
     ) -> BuiltSplitLink {
-        let prepared = prepare_split_link_native(class, input, &link_matrix, &block_matrix);
+        let previous_phase =
+            begin_split_link_native_preparation(class, input).expect("split-link preflight");
+        let block_phase = previous_phase
+            .prepare_previous_link(&link_matrix)
+            .expect("previous Link phase");
         drop(link_matrix);
+        let prepared = block_phase
+            .prepare_current_block(&block_matrix)
+            .expect("current Block phase");
         drop(block_matrix);
         prepared.assemble()
     }
@@ -3628,13 +3793,16 @@ mod tests {
         input: &SplitLinkInput<'a>,
     ) {
         let combined = build_split_link(class, input);
-        let phased = prepare_split_link_native(
-            class,
-            SplitLinkTraceInput::from_combined(input),
-            input.fold_matrix_link,
-            input.fold_matrix_block,
-        )
-        .assemble();
+        let previous_phase =
+            begin_split_link_native_preparation(class, SplitLinkTraceInput::from_combined(input))
+                .expect("split-link preflight");
+        let block_phase = previous_phase
+            .prepare_previous_link(input.fold_matrix_link)
+            .expect("previous Link phase");
+        let phased = block_phase
+            .prepare_current_block(input.fold_matrix_block)
+            .expect("current Block phase")
+            .assemble();
         assert_eq!(
             combined.r1cs.structural_statement_digest(),
             phased.r1cs.structural_statement_digest(),
@@ -3659,6 +3827,160 @@ mod tests {
         ) -> BuiltSplitLink = phased_matrix_release_compile_contract;
         let _parity: for<'a> fn(&'a SplitLinkClass, &SplitLinkInput<'a>) =
             combined_and_phased_build_parity_contract;
+    }
+
+    fn fold_test_fresh(matrix: &FieldR1cs, mut seed: u128) -> FreshLincheckClaim {
+        let mut fresh = FreshLincheckClaim {
+            alpha: next(&mut seed),
+            z_skip: next(&mut seed),
+            x_inner_rest: (matrix.k_skip..matrix.k_log)
+                .map(|_| next(&mut seed))
+                .collect(),
+            r_inner_rest: (matrix.k_skip..matrix.k_log)
+                .map(|_| next(&mut seed))
+                .collect(),
+            z_partial: (0..1usize << matrix.k_skip)
+                .map(|_| next(&mut seed))
+                .collect(),
+            value: F128::ZERO,
+        };
+        fresh.value = fresh_claim_value(matrix, &fresh);
+        fresh
+    }
+
+    #[test]
+    fn phased_fold_transcripts_match_legacy_small_matrix_path() {
+        let link_matrix = decider_test_matrix(0);
+        let block_matrix = decider_test_matrix(17);
+        let fresh_link = fold_test_fresh(&link_matrix, 0x11);
+        let fresh_block = fold_test_fresh(&block_matrix, 0x22);
+
+        let incoming_link = MatrixAccClaim::zero(link_matrix.k_log);
+        let mut incoming_block = MatrixAccClaim::zero(block_matrix.k_log);
+        incoming_block.value = stacked_matrix_mle_eval(&block_matrix, &incoming_block);
+
+        let mut legacy_link_challenger = FsLaneChallenger::new(b"history-link-fold-v0");
+        let legacy_link = prove_matrix_claim_fold(
+            &link_matrix,
+            &fresh_link,
+            &incoming_link,
+            false,
+            &mut legacy_link_challenger,
+        );
+        let mut legacy_block_challenger = FsLaneChallenger::new(b"history-block-fold-v0");
+        let legacy_block = prove_matrix_claim_fold(
+            &block_matrix,
+            &fresh_block,
+            &incoming_block,
+            true,
+            &mut legacy_block_challenger,
+        );
+
+        let phased_link = prove_split_matrix_fold(
+            b"history-link-fold-v0",
+            &link_matrix,
+            &fresh_link,
+            &incoming_link,
+            false,
+        );
+        let phased_block = prove_split_matrix_fold(
+            b"history-block-fold-v0",
+            &block_matrix,
+            &fresh_block,
+            &incoming_block,
+            true,
+        );
+
+        assert_eq!(phased_link, legacy_link, "Link fold bytes/claim parity");
+        assert_eq!(phased_block, legacy_block, "Block fold bytes/claim parity");
+    }
+
+    #[test]
+    fn phased_matrix_identity_rejects_mutation_shape_and_class_mix() {
+        let honest = decider_test_matrix(0);
+        let expected_shape = FieldShape::of(&honest);
+        let expected_digest = honest.structural_statement_digest();
+        validate_split_fold_matrix_identity(
+            &honest,
+            expected_shape,
+            expected_digest,
+            SplitLinkPreparationError::PreviousMatrixShape,
+            SplitLinkPreparationError::PreviousMatrixDigest,
+        )
+        .expect("honest previous Link matrix");
+
+        let substituted = decider_test_matrix(9);
+        substituted.seed_statement_digest(expected_digest);
+        assert_eq!(
+            substituted.statement_digest(),
+            expected_digest,
+            "test substitution reaches the seedable digest cache"
+        );
+        assert_eq!(
+            validate_split_fold_matrix_identity(
+                &substituted,
+                expected_shape,
+                expected_digest,
+                SplitLinkPreparationError::PreviousMatrixShape,
+                SplitLinkPreparationError::PreviousMatrixDigest,
+            ),
+            Err(SplitLinkPreparationError::PreviousMatrixDigest),
+            "phased input authenticates CSR contents, not a seeded cache"
+        );
+
+        let foreign_slot_matrix = decider_test_matrix(23);
+        assert_eq!(
+            validate_split_fold_matrix_identity(
+                &foreign_slot_matrix,
+                expected_shape,
+                expected_digest,
+                SplitLinkPreparationError::BlockMatrixShape,
+                SplitLinkPreparationError::BlockMatrixDigest,
+            ),
+            Err(SplitLinkPreparationError::BlockMatrixDigest),
+            "a same-shape matrix from another class/slot cannot be mixed in"
+        );
+
+        let mut wrong_shape = decider_test_matrix(0);
+        wrong_shape.m += 1;
+        assert_eq!(
+            validate_split_fold_matrix_identity(
+                &wrong_shape,
+                expected_shape,
+                expected_digest,
+                SplitLinkPreparationError::PreviousMatrixShape,
+                SplitLinkPreparationError::PreviousMatrixDigest,
+            ),
+            Err(SplitLinkPreparationError::PreviousMatrixShape),
+            "shape is rejected before digest work"
+        );
+    }
+
+    #[test]
+    fn production_phased_api_is_public_consuming_and_compatibility_is_thin() {
+        let source = include_str!("split_link.rs");
+        assert!(source.contains("pub fn begin_split_link_native_preparation<'a>("));
+        assert!(source.contains("pub struct SplitLinkPreviousMatrixPhase<'a>"));
+        assert!(source.contains("pub struct SplitLinkBlockMatrixPhase<'a>"));
+        assert!(source.contains(
+            "pub fn prepare_previous_link(\n        self,\n        fold_matrix_link: &FieldR1cs,"
+        ));
+        assert!(source.contains(
+            "pub fn prepare_current_block(\n        self,\n        fold_matrix_block: &FieldR1cs,"
+        ));
+
+        let compatibility = source
+            .split("fn prepare_split_link_native_inner<'a>(")
+            .nth(1)
+            .expect("compatibility wrapper")
+            .split("fn assemble_prepared_split_link(")
+            .next()
+            .expect("compatibility wrapper boundary");
+        assert!(compatibility.contains("begin_split_link_native_preparation_inner"));
+        assert!(compatibility.contains(".prepare_previous_link(fold_matrix_link)"));
+        assert!(compatibility.contains(".prepare_current_block(fold_matrix_block)"));
+        assert!(!compatibility.contains("verify_field_deferred_matrix"));
+        assert!(!compatibility.contains("prove_matrix_claim_fold"));
     }
 
     fn next(state: &mut u128) -> F128 {

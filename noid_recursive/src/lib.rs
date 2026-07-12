@@ -20,6 +20,7 @@ pub mod fs_transcript;
 pub mod header_integer;
 pub mod pow_header;
 pub mod region_sidecar;
+pub mod selected_history;
 
 pub use acceptance::{verify_acceptance_against_header, AcceptanceProof, AcceptanceRelationError};
 pub use accepted_batch::{
@@ -130,4 +131,12 @@ pub use pow_header::{
     header_hash_proof_inputs, verify_pow_header_batch_native,
     verify_pow_header_witness_batch_native, HeaderWitness, PowHeaderBatchError,
     RecursiveConsensusState,
+};
+pub use selected_history::{
+    decode_selected_history_terminal_package, encode_selected_history_terminal_package,
+    verify_selected_history_terminal, CanonicalSelectedHistoryRegistry, SelectedHistoryCodecError,
+    SelectedHistoryMatrixFamily, SelectedHistoryMatrixRequest, SelectedHistoryRegistryError,
+    SelectedHistoryTerminalPackage, SelectedHistoryVerificationError,
+    MAX_SELECTED_HISTORY_TERMINAL_ENVELOPE_BYTES, MAX_SELECTED_HISTORY_TERMINAL_PACKAGE_BYTES,
+    SELECTED_HISTORY_LINK_IO_LANES, SELECTED_HISTORY_TERMINAL_VERSION,
 };

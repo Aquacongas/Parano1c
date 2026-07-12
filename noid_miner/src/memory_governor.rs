@@ -22,6 +22,10 @@ use std::sync::{
 const B8_PEAK_MIB: usize = 2 * 1024;
 const B32_B64_PEAK_MIB: usize = 4 * 1024;
 const B255_PEAK_MIB: usize = 8 * 1024;
+/// Every production Split-Link class is m24.  The phased coordinator keeps
+/// only one transient fold matrix resident, but trace assembly/proving still
+/// requires the measured m24 admission envelope.
+const RECURSIVE_LINK_PEAK_MIB: usize = B255_PEAK_MIB;
 
 /// Never let proof admission consume the complete host-visible allowance.
 const MIN_NODE_RESERVE_MIB: usize = 1024;
@@ -134,6 +138,15 @@ impl ProofMemoryGovernor {
     ) -> Result<ProofMemoryReservation, ProofMemoryPressure> {
         let required_mib = recursive_proof_peak_mib(tier).unwrap_or(usize::MAX);
         self.try_reserve_required_mib(required_mib, system_available_memory_mib())
+    }
+
+    /// Reserve one universal m24 Split-Link proof. Matrix residency inside the
+    /// job is sequential, but Link trace construction remains an m24 worker
+    /// and therefore shares the process-wide single-proof ledger.
+    pub(crate) fn try_reserve_for_recursive_link(
+        &self,
+    ) -> Result<ProofMemoryReservation, ProofMemoryPressure> {
+        self.try_reserve_required_mib(RECURSIVE_LINK_PEAK_MIB, system_available_memory_mib())
     }
 
     fn try_reserve_with_available(
@@ -346,6 +359,24 @@ mod tests {
         assert!(governor
             .try_reserve_recursive_with_available(8, None)
             .is_ok());
+    }
+
+    #[test]
+    fn recursive_link_reserves_the_m24_envelope_and_excludes_overlap() {
+        let governor = ProofMemoryGovernor::new(RECURSIVE_LINK_PEAK_MIB);
+        let reservation = governor
+            .try_reserve_required_mib(RECURSIVE_LINK_PEAK_MIB, None)
+            .expect("m24 Link admission");
+        assert_eq!(
+            governor
+                .try_reserve_for_recursive_link()
+                .expect_err("Link cannot overlap another proof worker"),
+            ProofMemoryPressure {
+                required_mib: RECURSIVE_LINK_PEAK_MIB,
+                available_mib: 0,
+            }
+        );
+        drop(reservation);
     }
 
     #[test]

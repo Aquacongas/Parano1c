@@ -12,7 +12,7 @@
 
 use std::{path::Path, sync::Arc};
 
-use libmdbx::{Database, DatabaseOptions, Mode, NoWriteMap, TableFlags, WriteFlags};
+use libmdbx::{Database, DatabaseOptions, Mode, NoWriteMap, ObjectLength, TableFlags, WriteFlags};
 use noid_poseidon2b::primitives::TxBodyHash;
 use noid_tx::unpack_amount_creation_id;
 
@@ -85,6 +85,12 @@ const T_OWNER_INDEX: &str = "owner_idx";
 const T_CHECKPOINT_PACKAGES: &str = "checkpoint_packages";
 /// Latest local checkpoint package coverage metadata. Key: KEY_CHECKPOINT_COVERAGE.
 const T_CHECKPOINT_COVERAGE: &str = "checkpoint_coverage";
+/// Crash-resumable selected recursive proof work queue. Key: canonical height
+/// as u64 big-endian; value: fixed-width [`RecursiveProofJob`] metadata.
+const T_RECURSIVE_PROOF_JOBS: &str = "recursive_proof_jobs";
+/// Opaque bounded selected recursive proof result, keyed by the same numeric
+/// big-endian height and hash-bound independently from the job record.
+const T_RECURSIVE_PROOF_RESULTS: &str = "recursive_proof_results";
 const N_TABLES: u64 = 32;
 
 // Single-entry table keys
@@ -209,6 +215,191 @@ pub(crate) struct StagedAcceptedBlockCommit {
     pub undo_log: BlockUndoLog,
     pub history_claim_bytes: Vec<u8>,
     pub accepted_block_certificate_bytes: Vec<u8>,
+}
+
+// ---------------------------------------------------------------------------
+// Selected recursive proof-job journal
+// ---------------------------------------------------------------------------
+
+const RECURSIVE_PROOF_JOB_MAGIC: [u8; 4] = *b"RPJ1";
+const RECURSIVE_PROOF_JOB_ENCODED_BYTES: usize = 44;
+const RECURSIVE_PROOF_RESULT_MAGIC: [u8; 4] = *b"RPR1";
+const RECURSIVE_PROOF_RESULT_HEADER_BYTES: usize = 40;
+
+/// Hard storage cap for one opaque selected recursive proof result.
+///
+/// The chain store does not decode recursive proofs, but it must bound every
+/// allocation before accepting bytes from a worker. Four MiB leaves margin
+/// above the measured selected envelopes while preventing a worker from using
+/// the durable queue as an unbounded blob store.
+pub const MAX_RECURSIVE_PROOF_JOB_RESULT_BYTES: usize = 4 * 1024 * 1024;
+
+/// The only selected recursive block-class tiers. This storage type remains
+/// independent of `noid_recursive`; workers map it to their own class type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RecursiveProofJobTier {
+    B8 = 0,
+    B32 = 1,
+    B64 = 2,
+    B255 = 3,
+}
+
+impl RecursiveProofJobTier {
+    pub fn for_user_transaction_count(count: usize) -> Option<Self> {
+        match crate::consensus::params::user_tx_class_tier(count)? {
+            8 => Some(Self::B8),
+            32 => Some(Self::B32),
+            64 => Some(Self::B64),
+            255 => Some(Self::B255),
+            _ => None,
+        }
+    }
+
+    pub const fn capacity(self) -> usize {
+        match self {
+            Self::B8 => 8,
+            Self::B32 => 32,
+            Self::B64 => 64,
+            Self::B255 => 255,
+        }
+    }
+
+    fn decode(byte: u8) -> Option<Self> {
+        match byte {
+            0 => Some(Self::B8),
+            1 => Some(Self::B32),
+            2 => Some(Self::B64),
+            3 => Some(Self::B255),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RecursiveProofJobState {
+    Pending = 0,
+    Running = 1,
+    Complete = 2,
+}
+
+impl RecursiveProofJobState {
+    fn decode(byte: u8) -> Option<Self> {
+        match byte {
+            0 => Some(Self::Pending),
+            1 => Some(Self::Running),
+            2 => Some(Self::Complete),
+            _ => None,
+        }
+    }
+}
+
+/// Fixed-width crash-resumable metadata for one canonical block height.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecursiveProofJob {
+    pub height: u64,
+    pub block_hash: [u8; 32],
+    pub tier: RecursiveProofJobTier,
+    pub state: RecursiveProofJobState,
+    /// Number of successful Pending -> Running claims across restarts.
+    pub attempt_counter: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecursiveProofJobResult {
+    pub height: u64,
+    pub block_hash: [u8; 32],
+    pub bytes: Vec<u8>,
+}
+
+#[inline]
+fn recursive_proof_height_key(height: u64) -> [u8; 8] {
+    height.to_be_bytes()
+}
+
+#[inline]
+fn recursive_proof_height_from_key(key: &[u8]) -> Option<u64> {
+    Some(u64::from_be_bytes(key.try_into().ok()?))
+}
+
+fn encode_recursive_proof_job(job: &RecursiveProofJob) -> [u8; RECURSIVE_PROOF_JOB_ENCODED_BYTES] {
+    let mut encoded = [0u8; RECURSIVE_PROOF_JOB_ENCODED_BYTES];
+    encoded[..4].copy_from_slice(&RECURSIVE_PROOF_JOB_MAGIC);
+    encoded[4] = job.tier as u8;
+    encoded[5] = job.state as u8;
+    // bytes 6..8 are reserved and must remain zero.
+    encoded[8..12].copy_from_slice(&job.attempt_counter.to_le_bytes());
+    encoded[12..44].copy_from_slice(&job.block_hash);
+    encoded
+}
+
+fn decode_recursive_proof_job(height: u64, bytes: &[u8]) -> Option<RecursiveProofJob> {
+    if bytes.len() != RECURSIVE_PROOF_JOB_ENCODED_BYTES
+        || bytes[..4] != RECURSIVE_PROOF_JOB_MAGIC
+        || bytes[6..8] != [0u8; 2]
+    {
+        return None;
+    }
+    Some(RecursiveProofJob {
+        height,
+        tier: RecursiveProofJobTier::decode(bytes[4])?,
+        state: RecursiveProofJobState::decode(bytes[5])?,
+        attempt_counter: u32::from_le_bytes(bytes[8..12].try_into().ok()?),
+        block_hash: bytes[12..44].try_into().ok()?,
+    })
+}
+
+fn encode_recursive_proof_result(
+    block_hash: [u8; 32],
+    result: &[u8],
+) -> Result<Vec<u8>, StoreError> {
+    if result.len() > MAX_RECURSIVE_PROOF_JOB_RESULT_BYTES {
+        return Err(StoreError::Decode(
+            "recursive proof result exceeds hard byte cap",
+        ));
+    }
+    let result_len = u32::try_from(result.len())
+        .map_err(|_| StoreError::Decode("recursive proof result length exceeds u32"))?;
+    let mut encoded = Vec::with_capacity(RECURSIVE_PROOF_RESULT_HEADER_BYTES + result.len());
+    encoded.extend_from_slice(&RECURSIVE_PROOF_RESULT_MAGIC);
+    encoded.extend_from_slice(&block_hash);
+    encoded.extend_from_slice(&result_len.to_le_bytes());
+    encoded.extend_from_slice(result);
+    Ok(encoded)
+}
+
+fn decode_recursive_proof_result(
+    height: u64,
+    mut encoded: Vec<u8>,
+) -> Option<RecursiveProofJobResult> {
+    if encoded.len() < RECURSIVE_PROOF_RESULT_HEADER_BYTES
+        || encoded.len()
+            > RECURSIVE_PROOF_RESULT_HEADER_BYTES
+                .checked_add(MAX_RECURSIVE_PROOF_JOB_RESULT_BYTES)?
+        || encoded[..4] != RECURSIVE_PROOF_RESULT_MAGIC
+    {
+        return None;
+    }
+    let block_hash: [u8; 32] = encoded[4..36].try_into().ok()?;
+    let declared = u32::from_le_bytes(encoded[36..40].try_into().ok()?) as usize;
+    if declared > MAX_RECURSIVE_PROOF_JOB_RESULT_BYTES
+        || encoded.len() != RECURSIVE_PROOF_RESULT_HEADER_BYTES.checked_add(declared)?
+    {
+        return None;
+    }
+    encoded.copy_within(RECURSIVE_PROOF_RESULT_HEADER_BYTES.., 0);
+    encoded.truncate(declared);
+    Some(RecursiveProofJobResult {
+        height,
+        block_hash,
+        bytes: encoded,
+    })
+}
+
+#[inline]
+fn canonical_hash_from_encoded_header(bytes: &[u8]) -> Option<[u8; 32]> {
+    decode_header(bytes).map(|header| crate::block_header::block_id(&header))
 }
 
 /// Extract the 32-byte owner key from a slot's owner fields.
@@ -368,11 +559,15 @@ impl MdbxStore {
             T_OWNER_INDEX,
             T_CHECKPOINT_PACKAGES,
             T_CHECKPOINT_COVERAGE,
+            T_RECURSIVE_PROOF_JOBS,
+            T_RECURSIVE_PROOF_RESULTS,
         ] {
             txn.create_table(Some(name), TableFlags::empty())?;
         }
         txn.commit()?;
-        Ok(Self { db: Arc::new(db) })
+        let store = Self { db: Arc::new(db) };
+        store.reset_running_recursive_proof_jobs()?;
+        Ok(store)
     }
 
     // -----------------------------------------------------------------------
@@ -398,6 +593,355 @@ impl MdbxStore {
         let tbl = txn.open_table(Some(T_CHAIN_WORK))?;
         let raw: Option<Vec<u8>> = txn.get(&tbl, &u64_key(height))?;
         Ok(raw.and_then(|b| decode_chain_work(&b)))
+    }
+
+    // -----------------------------------------------------------------------
+    // Crash-resumable selected recursive proof jobs
+    // -----------------------------------------------------------------------
+
+    /// Atomically enqueue one canonical-height proof job.
+    ///
+    /// The caller supplies the selected tier because the chain store does not
+    /// depend on the recursive prover. The block hash is checked against the
+    /// canonical header in this same transaction. Re-enqueue of the identical
+    /// `(height, hash, tier)` is idempotent; a canonical fork replacement
+    /// overwrites old metadata and deletes its result.
+    pub fn enqueue_recursive_proof_job(
+        &self,
+        height: u64,
+        block_hash: [u8; 32],
+        tier: RecursiveProofJobTier,
+    ) -> Result<RecursiveProofJob, StoreError> {
+        let txn = self.db.begin_rw_txn()?;
+        let header_tbl = txn.open_table(Some(T_HEADERS))?;
+        let header_raw: Option<Vec<u8>> = txn.get(&header_tbl, &u64_key(height))?;
+        if header_raw
+            .as_deref()
+            .and_then(canonical_hash_from_encoded_header)
+            != Some(block_hash)
+        {
+            return Err(StoreError::Decode(
+                "recursive proof job hash is not canonical at height",
+            ));
+        }
+
+        let key = recursive_proof_height_key(height);
+        let jobs = txn.open_table(Some(T_RECURSIVE_PROOF_JOBS))?;
+        let existing_raw: Option<[u8; RECURSIVE_PROOF_JOB_ENCODED_BYTES]> = txn.get(&jobs, &key)?;
+        if let Some(raw) = existing_raw {
+            let existing = decode_recursive_proof_job(height, &raw)
+                .ok_or(StoreError::Decode("invalid recursive proof job metadata"))?;
+            if existing.block_hash == block_hash {
+                if existing.tier != tier {
+                    return Err(StoreError::Decode(
+                        "recursive proof job tier changed for the same block",
+                    ));
+                }
+                txn.commit()?;
+                return Ok(existing);
+            }
+        }
+
+        let results = txn.open_table(Some(T_RECURSIVE_PROOF_RESULTS))?;
+        let _ = txn.del(&results, &key, None);
+        let job = RecursiveProofJob {
+            height,
+            block_hash,
+            tier,
+            state: RecursiveProofJobState::Pending,
+            attempt_counter: 0,
+        };
+        txn.put(
+            &jobs,
+            key,
+            encode_recursive_proof_job(&job),
+            WriteFlags::empty(),
+        )?;
+        txn.commit()?;
+        Ok(job)
+    }
+
+    /// Claim the numerically-lowest canonical pending job.
+    ///
+    /// Big-endian height keys make the cursor order numeric even across byte
+    /// boundaries such as 255 -> 256. Only the selected fixed-width record is
+    /// retained; no queue or result payload collection is allocated.
+    pub fn claim_next_recursive_proof_job(&self) -> Result<Option<RecursiveProofJob>, StoreError> {
+        let txn = self.db.begin_rw_txn()?;
+        let jobs = txn.open_table(Some(T_RECURSIVE_PROOF_JOBS))?;
+        let headers = txn.open_table(Some(T_HEADERS))?;
+        let selected = {
+            let mut cursor = txn.cursor(&jobs)?;
+            let mut item: Option<([u8; 8], [u8; RECURSIVE_PROOF_JOB_ENCODED_BYTES])> =
+                cursor.first()?;
+            let mut selected = None;
+            while let Some((key, raw)) = item {
+                let height = recursive_proof_height_from_key(&key)
+                    .ok_or(StoreError::Decode("invalid recursive proof job height key"))?;
+                let job = decode_recursive_proof_job(height, &raw)
+                    .ok_or(StoreError::Decode("invalid recursive proof job metadata"))?;
+                if job.state == RecursiveProofJobState::Pending {
+                    let header_raw: Option<Vec<u8>> = txn.get(&headers, &u64_key(height))?;
+                    if header_raw
+                        .as_deref()
+                        .and_then(canonical_hash_from_encoded_header)
+                        == Some(job.block_hash)
+                    {
+                        selected = Some(job);
+                        break;
+                    }
+                }
+                item = cursor.next()?;
+            }
+            selected
+        };
+
+        let Some(mut job) = selected else {
+            txn.commit()?;
+            return Ok(None);
+        };
+        job.attempt_counter = job
+            .attempt_counter
+            .checked_add(1)
+            .ok_or(StoreError::Decode(
+                "recursive proof job attempt counter overflow",
+            ))?;
+        job.state = RecursiveProofJobState::Running;
+        txn.put(
+            &jobs,
+            recursive_proof_height_key(job.height),
+            encode_recursive_proof_job(&job),
+            WriteFlags::empty(),
+        )?;
+        txn.commit()?;
+        Ok(Some(job))
+    }
+
+    /// Store one bounded opaque proof and mark its running job complete in the
+    /// same transaction. A failure cannot expose either half independently.
+    pub fn complete_recursive_proof_job(
+        &self,
+        height: u64,
+        block_hash: [u8; 32],
+        result: &[u8],
+    ) -> Result<RecursiveProofJob, StoreError> {
+        let encoded_result = encode_recursive_proof_result(block_hash, result)?;
+        let txn = self.db.begin_rw_txn()?;
+        let key = recursive_proof_height_key(height);
+        let jobs = txn.open_table(Some(T_RECURSIVE_PROOF_JOBS))?;
+        let raw: Option<[u8; RECURSIVE_PROOF_JOB_ENCODED_BYTES]> = txn.get(&jobs, &key)?;
+        let mut job = raw
+            .as_ref()
+            .and_then(|raw| decode_recursive_proof_job(height, raw))
+            .ok_or(StoreError::Decode("recursive proof job is missing"))?;
+        if job.block_hash != block_hash || job.state != RecursiveProofJobState::Running {
+            return Err(StoreError::Decode(
+                "recursive proof completion does not match a running job",
+            ));
+        }
+        let headers = txn.open_table(Some(T_HEADERS))?;
+        let header_raw: Option<Vec<u8>> = txn.get(&headers, &u64_key(height))?;
+        if header_raw
+            .as_deref()
+            .and_then(canonical_hash_from_encoded_header)
+            != Some(block_hash)
+        {
+            return Err(StoreError::Decode(
+                "recursive proof completion block is no longer canonical",
+            ));
+        }
+
+        let results = txn.open_table(Some(T_RECURSIVE_PROOF_RESULTS))?;
+        txn.put(&results, key, encoded_result, WriteFlags::empty())?;
+        job.state = RecursiveProofJobState::Complete;
+        txn.put(
+            &jobs,
+            key,
+            encode_recursive_proof_job(&job),
+            WriteFlags::empty(),
+        )?;
+        txn.commit()?;
+        Ok(job)
+    }
+
+    /// Cancellation/backpressure handoff: release one canonical running job
+    /// back to Pending without erasing its attempt history.
+    ///
+    /// Complete jobs and stale/fork-mismatched hashes are rejected. Any
+    /// impossible partial result is deleted in the same transaction.
+    pub fn release_recursive_proof_job(
+        &self,
+        height: u64,
+        block_hash: [u8; 32],
+    ) -> Result<RecursiveProofJob, StoreError> {
+        let txn = self.db.begin_rw_txn()?;
+        let key = recursive_proof_height_key(height);
+        let jobs = txn.open_table(Some(T_RECURSIVE_PROOF_JOBS))?;
+        let raw: Option<[u8; RECURSIVE_PROOF_JOB_ENCODED_BYTES]> = txn.get(&jobs, &key)?;
+        let mut job = raw
+            .as_ref()
+            .and_then(|raw| decode_recursive_proof_job(height, raw))
+            .ok_or(StoreError::Decode("recursive proof job is missing"))?;
+        if job.block_hash != block_hash || job.state != RecursiveProofJobState::Running {
+            return Err(StoreError::Decode(
+                "recursive proof release does not match a running job",
+            ));
+        }
+        let headers = txn.open_table(Some(T_HEADERS))?;
+        let header_raw: Option<Vec<u8>> = txn.get(&headers, &u64_key(height))?;
+        if header_raw
+            .as_deref()
+            .and_then(canonical_hash_from_encoded_header)
+            != Some(block_hash)
+        {
+            return Err(StoreError::Decode(
+                "recursive proof release block is no longer canonical",
+            ));
+        }
+
+        job.state = RecursiveProofJobState::Pending;
+        txn.put(
+            &jobs,
+            key,
+            encode_recursive_proof_job(&job),
+            WriteFlags::empty(),
+        )?;
+        let results = txn.open_table(Some(T_RECURSIVE_PROOF_RESULTS))?;
+        let _ = txn.del(&results, &key, None);
+        txn.commit()?;
+        Ok(job)
+    }
+
+    /// Read one completed result only if job, result and the current canonical
+    /// header all bind the same block hash.
+    pub fn get_recursive_proof_job_result(
+        &self,
+        height: u64,
+    ) -> Result<Option<RecursiveProofJobResult>, StoreError> {
+        let txn = self.db.begin_ro_txn()?;
+        let key = recursive_proof_height_key(height);
+        let jobs = txn.open_table(Some(T_RECURSIVE_PROOF_JOBS))?;
+        let job_raw: Option<[u8; RECURSIVE_PROOF_JOB_ENCODED_BYTES]> = txn.get(&jobs, &key)?;
+        let Some(job) = job_raw
+            .as_ref()
+            .and_then(|raw| decode_recursive_proof_job(height, raw))
+        else {
+            return Ok(None);
+        };
+        if job.state != RecursiveProofJobState::Complete {
+            return Ok(None);
+        }
+        let headers = txn.open_table(Some(T_HEADERS))?;
+        let header_raw: Option<Vec<u8>> = txn.get(&headers, &u64_key(height))?;
+        if header_raw
+            .as_deref()
+            .and_then(canonical_hash_from_encoded_header)
+            != Some(job.block_hash)
+        {
+            return Ok(None);
+        }
+        let results = txn.open_table(Some(T_RECURSIVE_PROOF_RESULTS))?;
+        let result_length: Option<ObjectLength> = txn.get(&results, &key)?;
+        let Some(ObjectLength(result_length)) = result_length else {
+            return Ok(None);
+        };
+        if result_length < RECURSIVE_PROOF_RESULT_HEADER_BYTES
+            || result_length
+                > RECURSIVE_PROOF_RESULT_HEADER_BYTES + MAX_RECURSIVE_PROOF_JOB_RESULT_BYTES
+        {
+            return Err(StoreError::Decode(
+                "recursive proof result stored length exceeds hard bounds",
+            ));
+        }
+        let result_raw: Option<Vec<u8>> = txn.get(&results, &key)?;
+        let Some(result) = result_raw.and_then(|raw| decode_recursive_proof_result(height, raw))
+        else {
+            return Ok(None);
+        };
+        if result.block_hash != job.block_hash {
+            return Ok(None);
+        }
+        Ok(Some(result))
+    }
+
+    /// Read fixed-width metadata for diagnostics without loading a result.
+    pub fn get_recursive_proof_job(
+        &self,
+        height: u64,
+    ) -> Result<Option<RecursiveProofJob>, StoreError> {
+        let txn = self.db.begin_ro_txn()?;
+        let jobs = txn.open_table(Some(T_RECURSIVE_PROOF_JOBS))?;
+        let raw: Option<[u8; RECURSIVE_PROOF_JOB_ENCODED_BYTES]> =
+            txn.get(&jobs, &recursive_proof_height_key(height))?;
+        raw.map(|raw| {
+            decode_recursive_proof_job(height, &raw)
+                .ok_or(StoreError::Decode("invalid recursive proof job metadata"))
+        })
+        .transpose()
+    }
+
+    /// Startup recovery: every interrupted Running job becomes Pending while
+    /// retaining its attempt counter. Any impossible partial result is removed
+    /// in the same transaction.
+    pub fn reset_running_recursive_proof_jobs(&self) -> Result<u64, StoreError> {
+        let txn = self.db.begin_rw_txn()?;
+        let jobs = txn.open_table(Some(T_RECURSIVE_PROOF_JOBS))?;
+        let results = txn.open_table(Some(T_RECURSIVE_PROOF_RESULTS))?;
+        let mut reset = 0u64;
+        let mut cursor = txn.cursor(&jobs)?;
+        let mut item: Option<([u8; 8], [u8; RECURSIVE_PROOF_JOB_ENCODED_BYTES])> =
+            cursor.first()?;
+        while let Some((key, raw)) = item {
+            let height = recursive_proof_height_from_key(&key)
+                .ok_or(StoreError::Decode("invalid recursive proof job height key"))?;
+            let mut job = decode_recursive_proof_job(height, &raw)
+                .ok_or(StoreError::Decode("invalid recursive proof job metadata"))?;
+            if job.state == RecursiveProofJobState::Running {
+                job.state = RecursiveProofJobState::Pending;
+                cursor.put(&key, &encode_recursive_proof_job(&job), WriteFlags::CURRENT)?;
+                let _ = txn.del(&results, &key, None);
+                reset = reset
+                    .checked_add(1)
+                    .ok_or(StoreError::Decode("recursive proof reset count overflow"))?;
+            }
+            item = cursor.next()?;
+        }
+        drop(cursor);
+        txn.commit()?;
+        Ok(reset)
+    }
+
+    /// Delete every job and result strictly above a retained canonical
+    /// ancestor. Used by reorg and explicit epoch-reset paths.
+    pub fn delete_recursive_proof_jobs_above(
+        &self,
+        ancestor_height: u64,
+    ) -> Result<(), StoreError> {
+        let Some(first_deleted) = ancestor_height.checked_add(1) else {
+            return Ok(());
+        };
+        let txn = self.db.begin_rw_txn()?;
+        let start = recursive_proof_height_key(first_deleted);
+        for name in [T_RECURSIVE_PROOF_JOBS, T_RECURSIVE_PROOF_RESULTS] {
+            let table = txn.open_table(Some(name))?;
+            loop {
+                let deleted = {
+                    let mut cursor = txn.cursor(&table)?;
+                    let item: Option<([u8; 8], ())> = cursor.set_range(&start)?;
+                    if item.is_some() {
+                        cursor.del(WriteFlags::empty())?;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if !deleted {
+                    break;
+                }
+            }
+        }
+        txn.commit()?;
+        Ok(())
     }
 
     pub fn put_consensus_meta(&self, meta: &ConsensusMeta) -> Result<(), StoreError> {
@@ -1292,6 +1836,8 @@ impl MdbxStore {
             T_OWNER_INDEX,
             T_CHECKPOINT_PACKAGES,
             T_CHECKPOINT_COVERAGE,
+            T_RECURSIVE_PROOF_JOBS,
+            T_RECURSIVE_PROOF_RESULTS,
         ] {
             let table = txn.open_table(Some(name))?;
             txn.clear_table(&table)?;
@@ -1492,6 +2038,8 @@ impl MdbxStore {
             T_OWNER_INDEX,
             T_CHECKPOINT_PACKAGES,
             T_CHECKPOINT_COVERAGE,
+            T_RECURSIVE_PROOF_JOBS,
+            T_RECURSIVE_PROOF_RESULTS,
         ] {
             let tbl = txn.open_table(Some(name))?;
             txn.clear_table(&tbl)?;
@@ -1871,6 +2419,55 @@ impl MdbxStore {
             )?;
         }
 
+        // --- 8.4. Selected recursive proof job ---
+        //
+        // Tier is derived from the canonical transaction count already owned
+        // by this commit, so no recursive-crate type or new accepted-material
+        // field crosses the storage boundary. Genesis and commits without
+        // accepted proof-native material deliberately enqueue nothing.
+        if header.height != 0 && accepted_block.is_some() {
+            let user_transaction_count = tx_hashes.len().checked_sub(1).ok_or(
+                StoreError::Decode("accepted block proof job is missing coinbase tx hash"),
+            )?;
+            let tier = RecursiveProofJobTier::for_user_transaction_count(user_transaction_count)
+                .ok_or(StoreError::Decode(
+                    "accepted block transaction count has no canonical proof tier",
+                ))?;
+            let job_key = recursive_proof_height_key(header.height);
+            let jobs = txn.open_table(Some(T_RECURSIVE_PROOF_JOBS))?;
+            let existing_raw: Option<[u8; RECURSIVE_PROOF_JOB_ENCODED_BYTES]> =
+                txn.get(&jobs, &job_key)?;
+            match existing_raw {
+                Some(raw) => {
+                    let existing = decode_recursive_proof_job(header.height, &raw).ok_or(
+                        StoreError::Decode("invalid existing recursive proof job metadata"),
+                    )?;
+                    if existing.block_hash != *hash || existing.tier != tier {
+                        return Err(StoreError::Decode(
+                            "accepted block conflicts with existing recursive proof job",
+                        ));
+                    }
+                }
+                None => {
+                    let results = txn.open_table(Some(T_RECURSIVE_PROOF_RESULTS))?;
+                    let _ = txn.del(&results, &job_key, None);
+                    let job = RecursiveProofJob {
+                        height: header.height,
+                        block_hash: *hash,
+                        tier,
+                        state: RecursiveProofJobState::Pending,
+                        attempt_counter: 0,
+                    };
+                    txn.put(
+                        &jobs,
+                        job_key,
+                        encode_recursive_proof_job(&job),
+                        WriteFlags::empty(),
+                    )?;
+                }
+            }
+        }
+
         // --- 8.5. tx_index: TxBodyHash → (height, position_in_block) ---
         // Enables O(1) receipt lookup: given a tx_body_hash, find the block
         // and position to reconstruct the Merkle inclusion path. Reorg
@@ -2203,6 +2800,30 @@ impl MdbxStore {
         ] {
             truncate_height_table_above!(table_name);
         }
+        if let Some(first_reverted_height) = ancestor_height.checked_add(1) {
+            let start = recursive_proof_height_key(first_reverted_height);
+            for table_name in [T_RECURSIVE_PROOF_JOBS, T_RECURSIVE_PROOF_RESULTS] {
+                let table = txn.open_table(Some(table_name))?;
+                // Re-open at the same numeric lower bound after every delete.
+                // This is constant-memory and avoids depending on cursor
+                // post-delete positioning semantics.
+                loop {
+                    let deleted = {
+                        let mut cursor = txn.cursor(&table)?;
+                        let item: Option<([u8; 8], ())> = cursor.set_range(&start)?;
+                        if item.is_some() {
+                            cursor.del(WriteFlags::empty())?;
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if !deleted {
+                        break;
+                    }
+                }
+            }
+        }
 
         let tx_idx_tbl = txn.open_table(Some(T_TX_INDEX))?;
         for tx_hash in reverted_tx_hashes {
@@ -2224,6 +2845,8 @@ impl MdbxStore {
         let sidecar_tbl = txn.open_table(Some(T_BLOCK_AUTH_SIDECARS))?;
         let history_tbl = txn.open_table(Some(T_HISTORY_CLAIMS))?;
         let certificate_tbl = txn.open_table(Some(T_ACCEPTED_BLOCK_CERTIFICATES))?;
+        let recursive_jobs_tbl = txn.open_table(Some(T_RECURSIVE_PROOF_JOBS))?;
+        let recursive_results_tbl = txn.open_table(Some(T_RECURSIVE_PROOF_RESULTS))?;
 
         for (payload, block) in replacement_payloads.iter().zip(replacement) {
             let height_key = u64_key(block.header.height);
@@ -2300,6 +2923,47 @@ impl MdbxStore {
                 &block.accepted_block_certificate_bytes,
                 WriteFlags::empty(),
             )?;
+            if block.header.height != 0 {
+                if block.undo_log.tx_hashes.len() != payload.block.transactions.len() {
+                    return Err(StoreError::Decode(
+                        "staged reorg tx hashes disagree with canonical block",
+                    ));
+                }
+                let user_transaction_count =
+                    block
+                        .undo_log
+                        .tx_hashes
+                        .len()
+                        .checked_sub(1)
+                        .ok_or(StoreError::Decode(
+                            "staged reorg proof job is missing coinbase tx hash",
+                        ))?;
+                let tier =
+                    RecursiveProofJobTier::for_user_transaction_count(user_transaction_count)
+                        .ok_or(StoreError::Decode(
+                            "staged reorg transaction count has no canonical proof tier",
+                        ))?;
+                let job_key = recursive_proof_height_key(block.header.height);
+                if txn.get::<()>(&recursive_jobs_tbl, &job_key)?.is_some() {
+                    return Err(StoreError::Decode(
+                        "staged reorg recursive proof job was not truncated",
+                    ));
+                }
+                let _ = txn.del(&recursive_results_tbl, &job_key, None);
+                let job = RecursiveProofJob {
+                    height: block.header.height,
+                    block_hash: block.hash,
+                    tier,
+                    state: RecursiveProofJobState::Pending,
+                    attempt_counter: 0,
+                };
+                txn.put(
+                    &recursive_jobs_tbl,
+                    job_key,
+                    encode_recursive_proof_job(&job),
+                    WriteFlags::empty(),
+                )?;
+            }
             for (position, transaction) in payload.block.transactions.iter().enumerate() {
                 let tx_hash = transaction.txid();
                 txn.put(
@@ -2493,6 +3157,8 @@ impl MdbxStore {
             T_OWNER_INDEX,
             T_CHECKPOINT_PACKAGES,
             T_CHECKPOINT_COVERAGE,
+            T_RECURSIVE_PROOF_JOBS,
+            T_RECURSIVE_PROOF_RESULTS,
         ];
         for name in tables {
             let tbl = txn.open_table(Some(name))?;
@@ -2544,12 +3210,553 @@ impl crate::storage::BlockStore for MdbxStore {
 mod tests {
     use super::*;
 
+    fn put_recursive_job_header(
+        store: &MdbxStore,
+        height: u64,
+        nonce_tag: u128,
+    ) -> (BlockHeader, [u8; 32]) {
+        let mut header = crate::consensus::genesis::genesis_header();
+        header.height = height;
+        header.timestamp = header.timestamp.saturating_add(height);
+        header.nonce = nonce_tag;
+        let hash = crate::hash_block_header(&header);
+        store.put_header_only(&header, &hash).unwrap();
+        (header, hash)
+    }
+
     fn overwrite_owner_index_record(store: &MdbxStore, key: &[u8], value: &[u8]) {
         let txn = store.db.begin_rw_txn().unwrap();
         let table = txn.open_table(Some(T_OWNER_INDEX)).unwrap();
         txn.clear_table(&table).unwrap();
         txn.put(&table, key, value, WriteFlags::empty()).unwrap();
         txn.commit().unwrap();
+    }
+
+    #[test]
+    fn recursive_proof_job_codec_is_fixed_width_and_fail_closed() {
+        let job = RecursiveProofJob {
+            height: 256,
+            block_hash: [0xA5; 32],
+            tier: RecursiveProofJobTier::B255,
+            state: RecursiveProofJobState::Running,
+            attempt_counter: 7,
+        };
+        let encoded = encode_recursive_proof_job(&job);
+        assert_eq!(encoded.len(), RECURSIVE_PROOF_JOB_ENCODED_BYTES);
+        assert_eq!(decode_recursive_proof_job(job.height, &encoded), Some(job));
+
+        for index in [0usize, 4, 5, 6] {
+            let mut malformed = encoded;
+            malformed[index] = 0xFF;
+            assert!(decode_recursive_proof_job(job.height, &malformed).is_none());
+        }
+        assert!(decode_recursive_proof_job(job.height, &encoded[..43]).is_none());
+        let mut trailing = encoded.to_vec();
+        trailing.push(0);
+        assert!(decode_recursive_proof_job(job.height, &trailing).is_none());
+
+        let mut keys = [256u64, 1, 255, 2].map(recursive_proof_height_key);
+        keys.sort_unstable();
+        assert_eq!(
+            keys.map(|key| recursive_proof_height_from_key(&key).unwrap()),
+            [1, 2, 255, 256]
+        );
+    }
+
+    #[test]
+    fn recursive_proof_claim_uses_numeric_height_order_without_queue_collection() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        for (height, tier) in [
+            (256, RecursiveProofJobTier::B255),
+            (1, RecursiveProofJobTier::B8),
+            (255, RecursiveProofJobTier::B64),
+            (2, RecursiveProofJobTier::B32),
+        ] {
+            let (_, hash) = put_recursive_job_header(&store, height, height as u128);
+            store
+                .enqueue_recursive_proof_job(height, hash, tier)
+                .unwrap();
+        }
+
+        for expected in [1, 2, 255, 256] {
+            let claimed = store.claim_next_recursive_proof_job().unwrap().unwrap();
+            assert_eq!(claimed.height, expected);
+            assert_eq!(claimed.state, RecursiveProofJobState::Running);
+            assert_eq!(claimed.attempt_counter, 1);
+        }
+        assert!(store.claim_next_recursive_proof_job().unwrap().is_none());
+    }
+
+    #[test]
+    fn recursive_proof_running_job_resumes_pending_after_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let hash;
+        {
+            let store = MdbxStore::open(directory.path()).unwrap();
+            (_, hash) = put_recursive_job_header(&store, 7, 1);
+            store
+                .enqueue_recursive_proof_job(7, hash, RecursiveProofJobTier::B8)
+                .unwrap();
+            let claimed = store.claim_next_recursive_proof_job().unwrap().unwrap();
+            assert_eq!(claimed.state, RecursiveProofJobState::Running);
+            assert_eq!(claimed.attempt_counter, 1);
+        }
+
+        let reopened = MdbxStore::open(directory.path()).unwrap();
+        let resumed = reopened.get_recursive_proof_job(7).unwrap().unwrap();
+        assert_eq!(resumed.state, RecursiveProofJobState::Pending);
+        assert_eq!(resumed.attempt_counter, 1);
+        let reclaimed = reopened.claim_next_recursive_proof_job().unwrap().unwrap();
+        assert_eq!(reclaimed.block_hash, hash);
+        assert_eq!(reclaimed.state, RecursiveProofJobState::Running);
+        assert_eq!(reclaimed.attempt_counter, 2);
+    }
+
+    #[test]
+    fn recursive_proof_running_job_can_be_released_for_backpressure() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let (_, hash) = put_recursive_job_header(&store, 9, 1);
+        store
+            .enqueue_recursive_proof_job(9, hash, RecursiveProofJobTier::B8)
+            .unwrap();
+        let claimed = store.claim_next_recursive_proof_job().unwrap().unwrap();
+        assert_eq!(claimed.attempt_counter, 1);
+        assert!(store.release_recursive_proof_job(9, [0xFF; 32]).is_err());
+        assert_eq!(
+            store.get_recursive_proof_job(9).unwrap().unwrap().state,
+            RecursiveProofJobState::Running
+        );
+
+        let released = store.release_recursive_proof_job(9, hash).unwrap();
+        assert_eq!(released.state, RecursiveProofJobState::Pending);
+        assert_eq!(released.attempt_counter, 1);
+        let reclaimed = store.claim_next_recursive_proof_job().unwrap().unwrap();
+        assert_eq!(reclaimed.attempt_counter, 2);
+        store
+            .complete_recursive_proof_job(9, hash, b"complete")
+            .unwrap();
+        assert!(store.release_recursive_proof_job(9, hash).is_err());
+        assert_eq!(
+            store.get_recursive_proof_job(9).unwrap().unwrap().state,
+            RecursiveProofJobState::Complete
+        );
+    }
+
+    #[test]
+    fn recursive_proof_result_is_atomic_bounded_and_fork_gated() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let (_, first_hash) = put_recursive_job_header(&store, 10, 1);
+        store
+            .enqueue_recursive_proof_job(10, first_hash, RecursiveProofJobTier::B32)
+            .unwrap();
+        store.claim_next_recursive_proof_job().unwrap().unwrap();
+
+        let oversized = vec![0u8; MAX_RECURSIVE_PROOF_JOB_RESULT_BYTES + 1];
+        assert!(store
+            .complete_recursive_proof_job(10, first_hash, &oversized)
+            .is_err());
+        drop(oversized);
+        assert_eq!(
+            store.get_recursive_proof_job(10).unwrap().unwrap().state,
+            RecursiveProofJobState::Running
+        );
+        assert!(store.get_recursive_proof_job_result(10).unwrap().is_none());
+
+        let proof = b"opaque-selected-recursive-proof";
+        let completed = store
+            .complete_recursive_proof_job(10, first_hash, proof)
+            .unwrap();
+        assert_eq!(completed.state, RecursiveProofJobState::Complete);
+        assert_eq!(
+            store
+                .get_recursive_proof_job_result(10)
+                .unwrap()
+                .unwrap()
+                .bytes,
+            proof
+        );
+
+        let (_, replacement_hash) = put_recursive_job_header(&store, 10, 2);
+        assert_ne!(first_hash, replacement_hash);
+        assert!(store.get_recursive_proof_job_result(10).unwrap().is_none());
+        let replacement = store
+            .enqueue_recursive_proof_job(10, replacement_hash, RecursiveProofJobTier::B32)
+            .unwrap();
+        assert_eq!(replacement.state, RecursiveProofJobState::Pending);
+        assert_eq!(replacement.attempt_counter, 0);
+        assert!(store.get_recursive_proof_job_result(10).unwrap().is_none());
+    }
+
+    #[test]
+    fn recursive_proof_delete_above_removes_jobs_and_results_numerically() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        for height in [1u64, 2, 256] {
+            let (_, hash) = put_recursive_job_header(&store, height, height as u128);
+            store
+                .enqueue_recursive_proof_job(height, hash, RecursiveProofJobTier::B8)
+                .unwrap();
+        }
+        for height in [1u64, 2, 256] {
+            let job = store.claim_next_recursive_proof_job().unwrap().unwrap();
+            assert_eq!(job.height, height);
+            store
+                .complete_recursive_proof_job(height, job.block_hash, &[height as u8])
+                .unwrap();
+        }
+
+        store.delete_recursive_proof_jobs_above(1).unwrap();
+        assert!(store.get_recursive_proof_job(1).unwrap().is_some());
+        assert!(store.get_recursive_proof_job_result(1).unwrap().is_some());
+        for height in [2u64, 256] {
+            assert!(store.get_recursive_proof_job(height).unwrap().is_none());
+            assert!(store
+                .get_recursive_proof_job_result(height)
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn accepted_block_commit_enqueues_job_and_failed_commit_leaves_none() {
+        use noid_poseidon2b::primitives::{Address, TxBodyHash};
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let (parent, parent_meta) = commit_owner_fixture(&store, Address([0x91; 32]));
+        let parent_hash = crate::hash_block_header(&parent);
+
+        let mut accepted_header = parent;
+        accepted_header.height = 1;
+        accepted_header.prev_block_hash = parent_hash;
+        accepted_header.timestamp = accepted_header.timestamp.saturating_add(1);
+        accepted_header.nonce = accepted_header.nonce.wrapping_add(1);
+        let accepted_hash = crate::hash_block_header(&accepted_header);
+        let accepted_meta = ConsensusMeta {
+            tip_height: 1,
+            tip_hash: accepted_hash,
+            cumulative_chainwork: [2; 32],
+            finalized: crate::storage::meta::FinalizedCheckpoint {
+                height: 1,
+                hash: accepted_hash,
+            },
+        };
+        let accepted_artifacts = AcceptedBlockCommitData {
+            block_proof_bytes: &[],
+            block_auth_sidecar_bytes: &[],
+            history_claim_bytes: b"history-one",
+            accepted_block_certificate_bytes: b"certificate-one",
+        };
+        let coinbase_hash = TxBodyHash([0x11; 32]);
+        store
+            .commit_block(
+                &accepted_header,
+                &accepted_hash,
+                &BlockUndoLog::empty(1, accepted_header.log_slots),
+                &[],
+                &[coinbase_hash],
+                &[],
+                None,
+                Some(accepted_artifacts),
+                &accepted_meta,
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            store.get_recursive_proof_job(1).unwrap(),
+            Some(RecursiveProofJob {
+                height: 1,
+                block_hash: accepted_hash,
+                tier: RecursiveProofJobTier::B8,
+                state: RecursiveProofJobState::Pending,
+                attempt_counter: 0,
+            })
+        );
+
+        let mut rejected_header = accepted_header;
+        rejected_header.height = 2;
+        rejected_header.prev_block_hash = accepted_hash;
+        rejected_header.timestamp = rejected_header.timestamp.saturating_add(1);
+        rejected_header.nonce = rejected_header.nonce.wrapping_add(1);
+        let rejected_hash = crate::hash_block_header(&rejected_header);
+        let rejected_meta = ConsensusMeta {
+            tip_height: 2,
+            tip_hash: rejected_hash,
+            cumulative_chainwork: [3; 32],
+            finalized: crate::storage::meta::FinalizedCheckpoint {
+                height: 2,
+                hash: rejected_hash,
+            },
+        };
+        let nonexistent_preimage =
+            SlotValue::with_owner_fields(5, 1, Address([0xEE; 32]).as_fields());
+        let rejected_coinbase_hash = TxBodyHash([0x22; 32]);
+        assert!(store
+            .commit_block(
+                &rejected_header,
+                &rejected_hash,
+                &BlockUndoLog {
+                    block_height: 2,
+                    log_slots_before: rejected_header.log_slots,
+                    active_slot_count_before: rejected_header.active_slot_count,
+                    alloc_counter_before: rejected_header.alloc_counter,
+                    // The proof job is inserted first; owner-index validation
+                    // later rejects this nonexistent pre-block record.
+                    slot_changes: vec![(2, nonexistent_preimage)],
+                    tx_hashes: vec![rejected_coinbase_hash],
+                },
+                &[],
+                &[rejected_coinbase_hash],
+                &[],
+                None,
+                Some(AcceptedBlockCommitData {
+                    block_proof_bytes: &[],
+                    block_auth_sidecar_bytes: &[],
+                    history_claim_bytes: b"history-two",
+                    accepted_block_certificate_bytes: b"certificate-two",
+                }),
+                &rejected_meta,
+                false,
+            )
+            .is_err());
+        assert_eq!(store.get_chain_tip().unwrap(), Some((1, accepted_hash)));
+        assert!(store.get_header(2).unwrap().is_none());
+        assert!(store.get_recursive_proof_job(2).unwrap().is_none());
+        assert_eq!(parent_meta.tip_height, 0);
+    }
+
+    #[test]
+    fn reorg_atomically_replaces_proof_jobs_and_failed_replacement_preserves_them() {
+        use crate::block::Block;
+        use crate::storage::mdbx_context::ReorgBlockPayload;
+        use noid_poseidon2b::primitives::Address;
+        use noid_tx::{
+            output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS,
+        };
+
+        fn coinbase(tag: u8) -> Transaction {
+            let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+            outputs[0] = TxOutput {
+                slot_index: u32::from(tag),
+                amount: 1,
+                owner: Address([tag; 32]),
+            };
+            Transaction::new(TxBody {
+                epoch_anchor: [tag; 32],
+                fee: 0,
+                input_owner: Address([0; 32]),
+                inputs: [TxInput::dummy(); TX_INPUTS],
+                outputs,
+                validity_bitmap: output_bitmap_bit(0),
+                is_coinbase: true,
+            })
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let genesis = crate::consensus::genesis::genesis_header();
+        let genesis_hash = crate::hash_block_header(&genesis);
+        let genesis_meta = ConsensusMeta {
+            tip_height: 0,
+            tip_hash: genesis_hash,
+            cumulative_chainwork: [1; 32],
+            finalized: crate::storage::meta::FinalizedCheckpoint {
+                height: 0,
+                hash: genesis_hash,
+            },
+        };
+        store
+            .commit_block(
+                &genesis,
+                &genesis_hash,
+                &BlockUndoLog::empty(0, genesis.log_slots),
+                &[],
+                &[],
+                &[],
+                None,
+                None,
+                &genesis_meta,
+                false,
+            )
+            .unwrap();
+
+        let old_tx = coinbase(1);
+        let mut old_header = genesis;
+        old_header.height = 1;
+        old_header.prev_block_hash = genesis_hash;
+        old_header.timestamp = old_header.timestamp.saturating_add(1);
+        old_header.nonce = 1;
+        let old_hash = crate::hash_block_header(&old_header);
+        let old_meta = ConsensusMeta {
+            tip_height: 1,
+            tip_hash: old_hash,
+            cumulative_chainwork: [2; 32],
+            finalized: crate::storage::meta::FinalizedCheckpoint {
+                height: 0,
+                hash: genesis_hash,
+            },
+        };
+        let old_tx_hash = old_tx.txid();
+        let old_undo = BlockUndoLog {
+            block_height: 1,
+            log_slots_before: genesis.log_slots,
+            active_slot_count_before: genesis.active_slot_count,
+            alloc_counter_before: genesis.alloc_counter,
+            slot_changes: vec![],
+            tx_hashes: vec![old_tx_hash],
+        };
+        let old_block = Block {
+            header: old_header,
+            transactions: vec![old_tx],
+        };
+        let old_bytes = old_block.to_bytes();
+        store
+            .commit_block(
+                &old_header,
+                &old_hash,
+                &old_undo,
+                &[],
+                &[old_tx_hash],
+                &[],
+                Some(&old_bytes),
+                Some(AcceptedBlockCommitData {
+                    block_proof_bytes: &[],
+                    block_auth_sidecar_bytes: &[],
+                    history_claim_bytes: b"old-history",
+                    accepted_block_certificate_bytes: b"old-certificate",
+                }),
+                &old_meta,
+                false,
+            )
+            .unwrap();
+        store.claim_next_recursive_proof_job().unwrap().unwrap();
+        store
+            .complete_recursive_proof_job(1, old_hash, b"old-result")
+            .unwrap();
+
+        let replacement_tx = coinbase(2);
+        let replacement_tx_hash = replacement_tx.txid();
+        let mut replacement_header = old_header;
+        replacement_header.nonce = 2;
+        let replacement_hash = crate::hash_block_header(&replacement_header);
+        let replacement_block = Block {
+            header: replacement_header,
+            transactions: vec![replacement_tx],
+        };
+        let replacement_undo = BlockUndoLog {
+            block_height: 1,
+            log_slots_before: genesis.log_slots,
+            active_slot_count_before: genesis.active_slot_count,
+            alloc_counter_before: genesis.alloc_counter,
+            slot_changes: vec![],
+            tx_hashes: vec![replacement_tx_hash],
+        };
+        let replacement_staged = StagedAcceptedBlockCommit {
+            header: replacement_header,
+            hash: replacement_hash,
+            cumulative_chainwork: [3; 32],
+            undo_log: replacement_undo,
+            history_claim_bytes: b"replacement-history".to_vec(),
+            accepted_block_certificate_bytes: b"replacement-certificate".to_vec(),
+        };
+        let replacement_payload = ReorgBlockPayload::new(&replacement_block, &[], &[]);
+        let replacement_meta = ConsensusMeta {
+            tip_height: 1,
+            tip_hash: replacement_hash,
+            cumulative_chainwork: [3; 32],
+            finalized: crate::storage::meta::FinalizedCheckpoint {
+                height: 0,
+                hash: genesis_hash,
+            },
+        };
+        store
+            .commit_reorg(
+                0,
+                &replacement_header,
+                &replacement_hash,
+                &[],
+                &[old_tx_hash],
+                &[replacement_payload],
+                &[replacement_staged],
+                &replacement_meta,
+            )
+            .unwrap();
+        assert_eq!(
+            store.get_recursive_proof_job(1).unwrap(),
+            Some(RecursiveProofJob {
+                height: 1,
+                block_hash: replacement_hash,
+                tier: RecursiveProofJobTier::B8,
+                state: RecursiveProofJobState::Pending,
+                attempt_counter: 0,
+            })
+        );
+        assert!(store.get_recursive_proof_job_result(1).unwrap().is_none());
+
+        store.claim_next_recursive_proof_job().unwrap().unwrap();
+        store
+            .complete_recursive_proof_job(1, replacement_hash, b"replacement-result")
+            .unwrap();
+
+        let failed_tx = coinbase(3);
+        let mut failed_header = replacement_header;
+        failed_header.height = 2;
+        failed_header.prev_block_hash = replacement_hash;
+        failed_header.timestamp = failed_header.timestamp.saturating_add(1);
+        failed_header.nonce = 3;
+        let failed_hash = crate::hash_block_header(&failed_header);
+        let failed_block = Block {
+            header: failed_header,
+            transactions: vec![failed_tx],
+        };
+        let failed_staged = StagedAcceptedBlockCommit {
+            header: failed_header,
+            hash: failed_hash,
+            cumulative_chainwork: [4; 32],
+            undo_log: BlockUndoLog {
+                block_height: 2,
+                log_slots_before: replacement_header.log_slots,
+                active_slot_count_before: replacement_header.active_slot_count,
+                alloc_counter_before: replacement_header.alloc_counter,
+                slot_changes: vec![],
+                tx_hashes: vec![], // fails after the RW transaction has started
+            },
+            history_claim_bytes: b"failed-history".to_vec(),
+            accepted_block_certificate_bytes: b"failed-certificate".to_vec(),
+        };
+        let failed_payload = ReorgBlockPayload::new(&failed_block, &[], &[]);
+        let failed_meta = ConsensusMeta {
+            tip_height: 2,
+            tip_hash: failed_hash,
+            cumulative_chainwork: [4; 32],
+            finalized: replacement_meta.finalized,
+        };
+        assert!(store
+            .commit_reorg(
+                1,
+                &failed_header,
+                &failed_hash,
+                &[],
+                &[],
+                &[failed_payload],
+                &[failed_staged],
+                &failed_meta,
+            )
+            .is_err());
+        assert_eq!(store.get_chain_tip().unwrap(), Some((1, replacement_hash)));
+        assert!(store.get_header(2).unwrap().is_none());
+        assert!(store.get_recursive_proof_job(2).unwrap().is_none());
+        assert_eq!(
+            store
+                .get_recursive_proof_job_result(1)
+                .unwrap()
+                .unwrap()
+                .bytes,
+            b"replacement-result"
+        );
     }
 
     fn commit_owner_fixture(
@@ -2923,6 +4130,14 @@ mod tests {
         store
             .put_accepted_block_batch_certificate_package(0, b"stale-batch")
             .unwrap();
+        let old_hash = crate::hash_block_header(&old_header);
+        store
+            .enqueue_recursive_proof_job(0, old_hash, RecursiveProofJobTier::B8)
+            .unwrap();
+        store.claim_next_recursive_proof_job().unwrap().unwrap();
+        store
+            .complete_recursive_proof_job(0, old_hash, b"stale-proof-result")
+            .unwrap();
 
         let hot_state = store
             .install_finalized_snapshot_staging(&staging, &meta, &[old_header, new_header])
@@ -2937,6 +4152,8 @@ mod tests {
         );
         assert!(hot_state.state.is_evicted(0));
         assert_eq!(store.get_history_checkpoint_head_record(0).unwrap(), None);
+        assert!(store.get_recursive_proof_job(0).unwrap().is_none());
+        assert!(store.get_recursive_proof_job_result(0).unwrap().is_none());
         assert_eq!(
             store
                 .get_accepted_block_batch_certificate_package(0)
@@ -3065,6 +4282,13 @@ mod tests {
         store
             .put_history_checkpoint_head_record(0, b"head")
             .unwrap();
+        store
+            .enqueue_recursive_proof_job(0, hash, RecursiveProofJobTier::B8)
+            .unwrap();
+        store.claim_next_recursive_proof_job().unwrap().unwrap();
+        store
+            .complete_recursive_proof_job(0, hash, b"proof-result")
+            .unwrap();
 
         store.clear_all().unwrap();
 
@@ -3079,6 +4303,8 @@ mod tests {
             None
         );
         assert_eq!(store.get_history_checkpoint_head_record(0).unwrap(), None);
+        assert!(store.get_recursive_proof_job(0).unwrap().is_none());
+        assert!(store.get_recursive_proof_job_result(0).unwrap().is_none());
     }
 
     #[test]
