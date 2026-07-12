@@ -314,6 +314,11 @@ impl LocalSelectedRecursiveMatrixSource {
     /// A same-directory `create_new` temporary file is synced and renamed,
     /// then the containing directory is synced. Failed writes remove only the
     /// temporary file and leave an existing target intact.
+    ///
+    /// The exporter holds the fully validated matrix, so the artifact is
+    /// trusted by construction: a matching install-time trust record is
+    /// written alongside it (best effort) and the first terminal
+    /// verification pays no re-authentication.
     pub fn export_matrix(
         &self,
         identity: SelectedRecursiveMatrixArtifactIdentity,
@@ -329,7 +334,18 @@ impl LocalSelectedRecursiveMatrixSource {
         #[cfg(unix)]
         {
             let parent = self.open_version_directory(true)?;
-            self.export_matrix_anchored(&parent, identity.kind(), matrix)
+            self.export_matrix_anchored(&parent, identity.kind(), matrix)?;
+            // Best effort: a failed record write only costs the first
+            // terminal verification one rehash.
+            if let Ok((_, exported, _)) = self.open_anchored_artifact(&parent, identity.kind()) {
+                let _ = self.write_artifact_trust_record(
+                    &parent,
+                    identity.kind(),
+                    &exported,
+                    identity.statement_digest(),
+                );
+            }
+            Ok(())
         }
     }
 
@@ -1225,13 +1241,17 @@ mod tests {
             identity.statement_digest()
         );
         drop(loaded);
-        let version_entries = fs::read_dir(directory.path().join("v1"))
+        let mut version_entries = fs::read_dir(directory.path().join("v1"))
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect::<Vec<_>>();
+        version_entries.sort();
         assert_eq!(
             version_entries,
-            vec![OsString::from("genesis-link.field-r1cs")]
+            vec![
+                OsString::from("genesis-link.field-r1cs"),
+                OsString::from("genesis-link.field-r1cs.trust"),
+            ]
         );
     }
 
@@ -1294,6 +1314,9 @@ mod tests {
         drop(streamed);
 
         source.set_resident_evaluation(true);
+        // Paranoid mode keeps this a plain full-authentication resident load;
+        // export-time trust is covered by the dedicated trust-record test.
+        source.set_artifact_trust(false);
         let mut resident = source.open_artifact_evaluator(matrix_identity).unwrap();
         assert!(matches!(
             resident,
@@ -1340,7 +1363,11 @@ mod tests {
             .join("v1")
             .join("genesis-link.field-r1cs.trust");
 
-        // Paranoid mode consults and writes no record.
+        // The exporter held the validated matrix, so the artifact is trusted
+        // by construction.
+        assert!(trust_path.exists());
+
+        // Paranoid mode ignores the record and re-authenticates fully.
         source.set_artifact_trust(false);
         let mut first = source.open_artifact_evaluator(matrix_identity).unwrap();
         assert!(matches!(
@@ -1350,47 +1377,41 @@ mod tests {
         let eval = first.evaluate_matrix_claims(None, Some(&claim)).unwrap();
         assert_eq!(eval.accumulated_value(), Some(claim.value));
         drop(first);
-        assert!(!trust_path.exists());
 
-        // The first trusted-mode load re-authenticates fully and records.
+        // The export-time record admits the trusted fast path directly, with
+        // identical results.
         source.set_artifact_trust(true);
-        let second = source.open_artifact_evaluator(matrix_identity).unwrap();
+        let mut second = source.open_artifact_evaluator(matrix_identity).unwrap();
         assert!(matches!(
             second,
-            LoadedSelectedRecursiveMatrixEvaluator::Resident(_)
-        ));
-        drop(second);
-        assert!(trust_path.exists());
-
-        // The record admits the trusted fast path with identical results.
-        let mut third = source.open_artifact_evaluator(matrix_identity).unwrap();
-        assert!(matches!(
-            third,
             LoadedSelectedRecursiveMatrixEvaluator::TrustedResident(_)
         ));
-        let eval = third.evaluate_matrix_claims(None, Some(&claim)).unwrap();
+        let eval = second.evaluate_matrix_claims(None, Some(&claim)).unwrap();
         assert_eq!(
             eval.structural_digest(),
             matrix_identity.statement_digest()
         );
         assert_eq!(eval.accumulated_value(), Some(claim.value));
-        drop(third);
+        drop(second);
 
-        // Re-exporting even identical bytes produces a new file identity:
-        // the record is stale, the next open re-authenticates and re-records.
-        source.export_matrix(matrix_identity, &matrix).unwrap();
+        // A corrupt record falls back to one full authentication, which
+        // rewrites it; trust is then re-admitted.
+        let record_bytes = fs::read(&trust_path).unwrap();
+        let mut corrupt = record_bytes.clone();
+        corrupt[0] ^= 1;
+        fs::write(&trust_path, &corrupt).unwrap();
+        let third = source.open_artifact_evaluator(matrix_identity).unwrap();
+        assert!(matches!(
+            third,
+            LoadedSelectedRecursiveMatrixEvaluator::Resident(_)
+        ));
+        drop(third);
         let fourth = source.open_artifact_evaluator(matrix_identity).unwrap();
         assert!(matches!(
             fourth,
-            LoadedSelectedRecursiveMatrixEvaluator::Resident(_)
-        ));
-        drop(fourth);
-        let fifth = source.open_artifact_evaluator(matrix_identity).unwrap();
-        assert!(matches!(
-            fifth,
             LoadedSelectedRecursiveMatrixEvaluator::TrustedResident(_)
         ));
-        drop(fifth);
+        drop(fourth);
 
         // A forged record whose digest differs from the requested identity is
         // ignored and replaced by a fresh full authentication.
@@ -1398,12 +1419,30 @@ mod tests {
         let digest_at = forged.len() - 32;
         forged[digest_at] ^= 1;
         fs::write(&trust_path, &forged).unwrap();
+        let fifth = source.open_artifact_evaluator(matrix_identity).unwrap();
+        assert!(matches!(
+            fifth,
+            LoadedSelectedRecursiveMatrixEvaluator::Resident(_)
+        ));
+        drop(fifth);
+
+        // Rewriting the artifact itself (same bytes, new file identity)
+        // invalidates the record until one re-authentication.
+        let artifact_path = directory.path().join("v1").join("genesis-link.field-r1cs");
+        let artifact_bytes = fs::read(&artifact_path).unwrap();
+        fs::write(&artifact_path, &artifact_bytes).unwrap();
         let sixth = source.open_artifact_evaluator(matrix_identity).unwrap();
         assert!(matches!(
             sixth,
             LoadedSelectedRecursiveMatrixEvaluator::Resident(_)
         ));
         drop(sixth);
+        let seventh = source.open_artifact_evaluator(matrix_identity).unwrap();
+        assert!(matches!(
+            seventh,
+            LoadedSelectedRecursiveMatrixEvaluator::TrustedResident(_)
+        ));
+        drop(seventh);
     }
 
     #[test]

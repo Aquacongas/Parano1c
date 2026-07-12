@@ -94,9 +94,11 @@ fn main() {
         open_s + eval_s
     );
 
-    // Resident decider path: decode + parallel span authentication once, then
+    // Resident decider path with paranoid rehash forced (export already
+    // wrote a trust record): decode + parallel span authentication, then
     // in-memory evaluation.
     source.set_resident_evaluation(true);
+    source.set_artifact_trust(false);
     let t = Instant::now();
     let mut resident = source.open_artifact_evaluator(identity).expect("resident open");
     let open_s = t.elapsed().as_secs_f64();
@@ -112,9 +114,10 @@ fn main() {
         open_s + eval_s
     );
 
-    // Trusted-resident decider path: the install-time record written by the
-    // full load above admits decode with no Poseidon pass at all; evaluation
+    // Trusted-resident decider path: the install-time record (written at
+    // export) admits decode with no Poseidon pass at all; evaluation
     // authenticates against the established digest.
+    source.set_artifact_trust(true);
     let t = Instant::now();
     let mut trusted = source
         .open_artifact_evaluator(identity)
