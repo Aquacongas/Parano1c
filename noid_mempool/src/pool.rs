@@ -72,6 +72,45 @@ pub(crate) struct MempoolState {
     pub admitted_output_slots: HashSet<u32>,
 }
 
+/// Compact immutable RPC/diagnostic projection of one mempool entry.
+///
+/// This type deliberately contains no intent or authorization byte vector, so
+/// inspecting a full pool cannot duplicate its retained proof payloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MempoolEntryMetadata {
+    pub tx_hash: TxBodyHash,
+    pub fee_micronoid: u64,
+    pub fee_rate: u64,
+    pub n_inputs: u8,
+    pub n_outputs: u8,
+    pub admitted_height: u64,
+    pub has_authorization: bool,
+}
+
+/// One lock-consistent compact view of fee floor and all entry metadata.
+#[derive(Debug, PartialEq, Eq)]
+pub struct MempoolMetadataSnapshot {
+    pub fee_floor: u64,
+    pub entries: Vec<MempoolEntryMetadata>,
+}
+
+fn entry_metadata(
+    hash: TxBodyHash,
+    entry: &noid_chain::mempool::MempoolEntry,
+) -> MempoolEntryMetadata {
+    MempoolEntryMetadata {
+        tx_hash: hash,
+        fee_micronoid: entry.tx.body.fee,
+        fee_rate: entry.fee_rate,
+        n_inputs: u8::try_from(entry.tx.body.live_input_count())
+            .expect("fixed transaction input count fits u8"),
+        n_outputs: u8::try_from(entry.tx.body.live_output_count())
+            .expect("fixed transaction output count fits u8"),
+        admitted_height: entry.admitted_height,
+        has_authorization: entry.cached_authorization.is_some(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // AsyncMempool
 // ---------------------------------------------------------------------------
@@ -570,19 +609,23 @@ impl AsyncMempool {
         (st.view.active_slot_count, st.view.log_slots())
     }
 
-    /// Snapshot all current mempool entries (for RPC inspection).
-    pub async fn get_all_entries(&self) -> Vec<noid_chain::mempool::MempoolEntry> {
+    /// Snapshot compact RPC metadata without cloning intent/proof payloads.
+    pub async fn metadata_snapshot(&self) -> MempoolMetadataSnapshot {
         let st = self.state.lock().await;
-        st.pool.iter().map(|(_, e)| e.clone()).collect()
+        MempoolMetadataSnapshot {
+            fee_floor: st.floor.current(),
+            entries: st
+                .pool
+                .iter()
+                .map(|(hash, entry)| entry_metadata(*hash, entry))
+                .collect(),
+        }
     }
 
-    /// O(1) lookup of a single entry by derived txid.
-    pub async fn get_entry_by_hash(
-        &self,
-        hash: &TxBodyHash,
-    ) -> Option<noid_chain::mempool::MempoolEntry> {
+    /// O(1) compact lookup without cloning the entry's retained byte payloads.
+    pub async fn get_entry_metadata(&self, hash: &TxBodyHash) -> Option<MempoolEntryMetadata> {
         let st = self.state.lock().await;
-        st.pool.get(hash).cloned()
+        st.pool.get(hash).map(|entry| entry_metadata(*hash, entry))
     }
 
     /// All raw TxIntent bytes for every pending transaction (for mempool sync).
@@ -887,6 +930,37 @@ mod tests {
         assert_eq!(two.len(), 2);
         assert_eq!(two[0].tx.txid(), high_id);
         assert_eq!(two[1].tx.txid(), low_id);
+    }
+
+    #[tokio::test]
+    async fn metadata_snapshot_never_carries_retained_intent_or_authorization_bytes() {
+        let state = ChainState::with_log_slots(6);
+        let pool = AsyncMempool::new(
+            ChainView::new(0, HashMap::new(), 0, state.state),
+            MempoolConfig::default().with_capacity(8),
+        );
+        let tx = empty_user_tx([0x31; 32], 400);
+        let txid = tx.txid();
+        {
+            let mut locked = pool.state.lock().await;
+            locked.pool.admit(tx, 7).expect("admit metadata fixture");
+            locked
+                .pool
+                .set_cached_authorization(&txid, vec![0xA5; 2 * 1024 * 1024]);
+            locked
+                .pool
+                .set_intent_bytes(&txid, vec![0x5A; 2 * 1024 * 1024]);
+        }
+
+        let snapshot = pool.metadata_snapshot().await;
+        assert_eq!(snapshot.entries.len(), 1);
+        assert_eq!(snapshot.entries[0].tx_hash, txid);
+        assert!(snapshot.entries[0].has_authorization);
+        assert!(std::mem::size_of::<super::MempoolEntryMetadata>() <= 64);
+
+        let single = pool.get_entry_metadata(&txid).await.unwrap();
+        assert_eq!(single, snapshot.entries[0]);
+        assert_eq!(pool.state.lock().await.pool.total_intent_bytes(), 2 * 1024 * 1024);
     }
 
     #[test]

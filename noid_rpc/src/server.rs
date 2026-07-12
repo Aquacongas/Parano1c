@@ -819,15 +819,15 @@ impl ParanoidApiServer for RpcHandler {
     async fn get_mempool_entry(&self, txhash: String) -> RpcResult<Option<MempoolTxInfo>> {
         let hash_bytes = decode_32_byte_hex("txhash", &txhash)?;
         let hash = noid_poseidon2b::primitives::TxBodyHash(hash_bytes);
-        let found = self.mempool.get_entry_by_hash(&hash).await;
+        let found = self.mempool.get_entry_metadata(&hash).await;
         Ok(found.map(|e| MempoolTxInfo {
             tx_hash: txhash,
-            fee_micronoid: e.tx.body.fee,
+            fee_micronoid: e.fee_micronoid,
             fee_rate: e.fee_rate,
-            n_inputs: e.tx.body.live_input_count(),
-            n_outputs: e.tx.body.live_output_count(),
+            n_inputs: usize::from(e.n_inputs),
+            n_outputs: usize::from(e.n_outputs),
             admitted_height: e.admitted_height,
-            has_authorization: e.cached_authorization.is_some(),
+            has_authorization: e.has_authorization,
         }))
     }
 
@@ -1433,29 +1433,27 @@ impl ParanoidApiServer for RpcHandler {
     // -----------------------------------------------------------------------
 
     async fn get_mempool_info(&self) -> RpcResult<MempoolInfo> {
-        let entries = self.mempool.get_all_entries().await;
-        let fee_floor = self.mempool.fee_floor().await;
+        let snapshot = self.mempool.metadata_snapshot().await;
 
-        let txs: Vec<MempoolTxInfo> = entries
+        let txs: Vec<MempoolTxInfo> = snapshot
+            .entries
             .iter()
             .map(|e| {
-                let n_inputs = e.tx.body.live_input_count();
-                let n_outputs = e.tx.body.live_output_count();
                 MempoolTxInfo {
-                    tx_hash: hex::encode(e.tx.txid().0),
-                    fee_micronoid: e.tx.body.fee,
+                    tx_hash: hex::encode(e.tx_hash.0),
+                    fee_micronoid: e.fee_micronoid,
                     fee_rate: e.fee_rate,
-                    n_inputs,
-                    n_outputs,
+                    n_inputs: usize::from(e.n_inputs),
+                    n_outputs: usize::from(e.n_outputs),
                     admitted_height: e.admitted_height,
-                    has_authorization: e.cached_authorization.is_some(),
+                    has_authorization: e.has_authorization,
                 }
             })
             .collect();
 
         Ok(MempoolInfo {
             size: txs.len(),
-            fee_floor,
+            fee_floor: snapshot.fee_floor,
             txs,
         })
     }
