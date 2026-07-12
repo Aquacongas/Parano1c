@@ -170,6 +170,12 @@ pub struct QuirkyDirectClaimRef<'a> {
 /// batch order and also permits post-commit auxiliary protocols to append
 /// claims without relying on an implicit "the point was observed somewhere
 /// earlier" precondition.
+/// Low index bits covered by each claim's fused lo table in
+/// [`open_batch_quirky_direct`]. Must be at least the largest production
+/// `k_skip` (6) and small enough that one lo block and the per-claim tables
+/// stay cache-resident: 2^12 · 16 B = 64 KiB per table.
+const B_COMBINED_SPLIT_LOG: usize = 12;
+
 pub fn open_batch_quirky_direct<Ch: Challenger>(
     packed_witness: &[F128],
     prover_data: &ProverData,
@@ -208,34 +214,83 @@ pub fn open_batch_quirky_direct<Ch: Challenger>(
         target_combined += *g * c.value;
     }
 
+    let trace = std::env::var("PCS_TRACE").is_ok();
+    let mut t = std::time::Instant::now();
+    let lap = move |label: &str, t: &mut std::time::Instant| {
+        if trace {
+            eprintln!(
+                "  [open_batch_quirky] {label}: {:.2} ms",
+                t.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        *t = std::time::Instant::now();
+    };
+    if trace {
+        eprintln!("  [open_batch_quirky] claims: {}", claims.len());
+    }
+
     // b_combined[i] = Σ_k γ_k · L_{i_skip}(z_skip_k) · eq(x_rest_k, i_rest).
-    // γ_k is baked into the (tiny) Lagrange table; the outer eq tables are
-    // built once per claim. Claims may carry DIFFERENT k_skip (quirky
-    // sub-protocol claims at K_SKIP next to plain k_skip = 0 point claims),
-    // so each claim is accumulated at its own block granularity.
-    let mut b_combined: Vec<F128> = crate::scratch::take_f128(l);
-    b_combined
-        .par_iter_mut()
-        .for_each(|slot| *slot = F128::ZERO);
+    // γ_k is baked into the (tiny) Lagrange table. Claims may carry
+    // DIFFERENT k_skip (quirky sub-protocol claims at K_SKIP next to plain
+    // k_skip = 0 point claims).
+    //
+    // The eq tensor is split per claim into one lo table over the low
+    // `B_COMBINED_SPLIT_LOG` index bits (Lagrange block ⊗ low eq coords,
+    // γ folded in) and one hi table over the remaining coords, and every
+    // claim is accumulated in a single fused pass per lo-sized block. The
+    // earlier per-claim form materialized a full 2^l eq table and one full
+    // read-modify-write pass per claim — with the ~10² deferred sidecar
+    // claims of a production Block that was tens of GiB of memory traffic;
+    // the fused pass touches `b_combined` once while every per-claim table
+    // stays cache-resident. Addition is XOR, so the regrouped accumulation
+    // is bit-identical.
+    let split = B_COMBINED_SPLIT_LOG.min(l_log);
+    let lo_len = 1usize << split;
+    let mut lo_tables: Vec<Vec<F128>> = Vec::with_capacity(claims.len());
+    let mut hi_tables: Vec<Vec<F128>> = Vec::with_capacity(claims.len());
     for (c, g) in claims.iter().zip(gammas.iter()) {
+        assert!(
+            c.k_skip <= split,
+            "quirky claim k_skip {} exceeds the b_combined split {split}",
+            c.k_skip
+        );
         let mut weights = crate::zerocheck::multilinear::lagrange_weights_naive(c.k_skip, c.z_skip);
         for w in weights.iter_mut() {
             *w *= *g;
         }
-        let eq_rest = crate::lincheck::build_eq_table(&c.x_rest);
-        let block = 1usize << c.k_skip;
-        b_combined
-            .par_chunks_mut(block)
-            .enumerate()
-            .for_each(|(hi, out_block)| {
-                let e_hi = eq_rest[hi];
-                for (slot, w) in out_block.iter_mut().zip(weights.iter()) {
-                    *slot += *w * e_hi;
-                }
-            });
+        let eq_lo = crate::lincheck::build_eq_table(&c.x_rest[..split - c.k_skip]);
+        let mut lo = Vec::with_capacity(lo_len);
+        for &e_lo in &eq_lo {
+            for w in &weights {
+                lo.push(e_lo * *w);
+            }
+        }
+        debug_assert_eq!(lo.len(), lo_len);
+        lo_tables.push(lo);
+        hi_tables.push(crate::lincheck::build_eq_table(
+            &c.x_rest[split - c.k_skip..],
+        ));
     }
+    let mut b_combined: Vec<F128> = crate::scratch::take_f128(l);
+    b_combined
+        .par_chunks_mut(lo_len)
+        .enumerate()
+        .for_each(|(hi, out_block)| {
+            out_block.fill(F128::ZERO);
+            for (lo_table, hi_table) in lo_tables.iter().zip(&hi_tables) {
+                let scale = hi_table[hi];
+                if scale == F128::ZERO {
+                    continue;
+                }
+                for (slot, lo_value) in out_block.iter_mut().zip(lo_table) {
+                    *slot += scale * *lo_value;
+                }
+            }
+        });
+    lap("b_combined build", &mut t);
 
     let ntt = crate::ntt::AdditiveNttF128::standard(commitment.params.k_code());
+    lap("ntt tables", &mut t);
     basefold::prove(
         packed_witness,
         b_combined,
