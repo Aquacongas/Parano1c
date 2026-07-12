@@ -348,6 +348,42 @@ fn column_weights(q: usize, lane_weights: &[F128; STATE_SIZE]) -> [F128; STATE_S
     })
 }
 
+/// Accumulate `columns[j] · eq[i]` into all four lane tables in one fused
+/// pass over the eq table. The per-lane form walked the eq table once per
+/// nonzero lane (up to five memory sweeps per group); the fused sweep reads
+/// each eq entry once and updates every lane while it is hot. Pure XOR
+/// accumulation of the same terms — bit-identical.
+fn accumulate_lane_tables(
+    tables: &mut [Vec<F128>; STATE_SIZE],
+    eq: &[F128],
+    columns: &[F128; STATE_SIZE],
+) {
+    use rayon::prelude::*;
+    const CHUNK: usize = 4096;
+    let [t0, t1, t2, t3] = tables;
+    t0.par_chunks_mut(CHUNK)
+        .zip(t1.par_chunks_mut(CHUNK))
+        .zip(t2.par_chunks_mut(CHUNK))
+        .zip(t3.par_chunks_mut(CHUNK))
+        .zip(eq.par_chunks(CHUNK))
+        .for_each(|((((c0, c1), c2), c3), eq_chunk)| {
+            for (i, &e) in eq_chunk.iter().enumerate() {
+                if columns[0] != F128::ZERO {
+                    c0[i] += columns[0] * e;
+                }
+                if columns[1] != F128::ZERO {
+                    c1[i] += columns[1] * e;
+                }
+                if columns[2] != F128::ZERO {
+                    c2[i] += columns[2] * e;
+                }
+                if columns[3] != F128::ZERO {
+                    c3[i] += columns[3] * e;
+                }
+            }
+        });
+}
+
 /// `term_j` of the layer relation applied to next-layer lane values.
 fn layer_terms(q: usize, u: &[F128; STATE_SIZE]) -> [F128; STATE_SIZE] {
     let sch = schedule();
@@ -548,15 +584,7 @@ pub fn prove_deep_chain_walk<Ch: Challenger>(
         for (g, w_g) in groups.iter().zip(weights.iter()) {
             let c = column_weights(q, w_g);
             let eq = build_eq_table(&g.point);
-            for j in 0..STATE_SIZE {
-                if c[j] == F128::ZERO {
-                    continue;
-                }
-                e_tables[j]
-                    .par_iter_mut()
-                    .zip(eq.par_iter())
-                    .for_each(|(slot, e)| *slot += c[j] * *e);
-            }
+            accumulate_lane_tables(&mut e_tables, &eq, &c);
         }
         let mut s_tables = layer_states.state(q);
 
@@ -716,15 +744,7 @@ pub fn prove_multi_deep_chain_walk<Ch: Challenger>(
                 }
                 let columns = column_weights(q, lane_weights);
                 let eq = build_eq_table(&group.point);
-                for lane in 0..STATE_SIZE {
-                    if columns[lane] == F128::ZERO {
-                        continue;
-                    }
-                    instance_e[lane]
-                        .par_iter_mut()
-                        .zip(eq.par_iter())
-                        .for_each(|(slot, eq)| *slot += columns[lane] * *eq);
-                }
+                accumulate_lane_tables(instance_e, &eq, &columns);
             }
         }
 
@@ -935,15 +955,7 @@ pub fn prove_ragged_multi_deep_chain_walk<Ch: Challenger>(
                 }
                 let columns = column_weights(q, lane_weights);
                 let eq = build_eq_table(&group.point);
-                for lane in 0..STATE_SIZE {
-                    if columns[lane] == F128::ZERO {
-                        continue;
-                    }
-                    instance_e[lane]
-                        .par_iter_mut()
-                        .zip(eq.par_iter())
-                        .for_each(|(slot, eq)| *slot += columns[lane] * *eq);
-                }
+                accumulate_lane_tables(instance_e, &eq, &columns);
             }
         }
 
