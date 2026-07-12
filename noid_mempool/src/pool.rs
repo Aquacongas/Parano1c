@@ -326,15 +326,18 @@ impl AsyncMempool {
             st.pool
                 .set_cached_authorization(&hash, intent.authorization_bytes);
         }
-        // Store raw intent bytes for mempool-sync serving to new peers.
-        st.pool.set_intent_bytes(&hash, intent_bytes.clone());
+        // One immutable allocation backs durable mempool serving and every
+        // broadcast subscriber; cloning the event is therefore O(1).
+        let intent_bytes: Arc<[u8]> = intent_bytes.into();
+        st.pool
+            .set_intent_bytes(&hash, Arc::clone(&intent_bytes));
         if !is_coinbase {
             st.floor.record(fee);
         }
         let _ = self.events.send(MempoolEvent::TxAdmitted {
             hash,
             fee,
-            intent_bytes,
+            intent_bytes: Arc::clone(&intent_bytes),
         });
         if has_authorization {
             let _ = self
@@ -645,10 +648,17 @@ impl AsyncMempool {
         st.pool.get(hash).map(|entry| entry_metadata(*hash, entry))
     }
 
-    /// All raw TxIntent bytes for every pending transaction (for mempool sync).
-    pub async fn all_intent_bytes(&self) -> Vec<Vec<u8>> {
+    /// Clone at most one bounded mempool-sync response while holding one
+    /// consistent pool lock.
+    pub async fn intent_bytes_prefix(
+        &self,
+        max_txs: usize,
+        max_total_bytes: usize,
+        max_tx_bytes: usize,
+    ) -> Vec<Vec<u8>> {
         let st = self.state.lock().await;
-        st.pool.all_intent_bytes()
+        st.pool
+            .intent_bytes_prefix(max_txs, max_total_bytes, max_tx_bytes)
     }
 
     /// Update the chain view without applying a new block.

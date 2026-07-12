@@ -20,6 +20,7 @@
 //! that does not bind the chain's one current transaction-epoch anchor.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use noid_poseidon2b::primitives::{Digest, TxBodyHash};
 use noid_tx::Transaction;
@@ -82,7 +83,7 @@ pub struct MempoolEntry {
     /// Stored so the P2P mempool-sync protocol can re-serve existing TXs to
     /// newly connected peers (gossipsub deduplication prevents re-gossiping;
     /// a dedicated request-response exchange is the only reliable mechanism).
-    pub intent_bytes: Vec<u8>,
+    pub intent_bytes: Arc<[u8]>,
 }
 
 impl MempoolEntry {
@@ -108,7 +109,7 @@ impl MempoolEntry {
             admitted_height: current_height,
             fee_rate,
             cached_authorization: None,
-            intent_bytes: Vec::new(), // populated by AsyncMempool::submit
+            intent_bytes: Arc::from([]), // populated by AsyncMempool::submit
         }
     }
 }
@@ -338,19 +339,48 @@ impl Mempool {
     }
 
     /// Store raw TxIntent bytes for mempool-sync serving.
-    pub fn set_intent_bytes(&mut self, hash: &TxBodyHash, bytes: Vec<u8>) {
+    pub fn set_intent_bytes(
+        &mut self,
+        hash: &TxBodyHash,
+        bytes: impl Into<Arc<[u8]>>,
+    ) {
         if let Some(entry) = self.entries.get_mut(hash) {
-            entry.intent_bytes = bytes;
+            entry.intent_bytes = bytes.into();
         }
     }
 
-    /// All intent_bytes for all pending transactions (for mempool sync).
-    pub fn all_intent_bytes(&self) -> Vec<Vec<u8>> {
-        self.entries
-            .values()
-            .filter(|e| !e.intent_bytes.is_empty())
-            .map(|e| e.intent_bytes.clone())
-            .collect()
+    /// Clone a bounded prefix of retained intents for one mempool-sync reply.
+    ///
+    /// Bounds are enforced before cloning each payload.  In particular this
+    /// never constructs a full-pool `Vec<Vec<u8>>` only to truncate it at the
+    /// network boundary.
+    pub fn intent_bytes_prefix(
+        &self,
+        max_txs: usize,
+        max_total_bytes: usize,
+        max_tx_bytes: usize,
+    ) -> Vec<Vec<u8>> {
+        let mut out = Vec::with_capacity(max_txs.min(self.entries.len()));
+        let mut total_bytes = 0usize;
+
+        for entry in self.entries.values() {
+            if out.len() == max_txs {
+                break;
+            }
+            let bytes = entry.intent_bytes.as_ref();
+            if bytes.is_empty() || bytes.len() > max_tx_bytes {
+                continue;
+            }
+            let Some(next_total) = total_bytes.checked_add(bytes.len()) else {
+                break;
+            };
+            if next_total > max_total_bytes {
+                break;
+            }
+            out.push(bytes.to_vec());
+            total_bytes = next_total;
+        }
+        out
     }
 
     /// Total serialized TxIntent bytes retained by this mempool.
@@ -463,5 +493,31 @@ mod tests {
             pool.admit(tx(5, 6, 10, 3, [9u8; 32]), 0),
             Err(MempoolError::Full)
         );
+    }
+
+    #[test]
+    fn mempool_sync_clones_only_within_requested_byte_and_count_bounds() {
+        let mut pool = Mempool::new(4);
+        let a = tx(1, 2, 10, 1, [9u8; 32]);
+        let b = tx(3, 4, 10, 2, [9u8; 32]);
+        let c = tx(5, 6, 10, 3, [9u8; 32]);
+        let ids = [a.txid(), b.txid(), c.txid()];
+        pool.admit(a, 0).unwrap();
+        pool.admit(b, 0).unwrap();
+        pool.admit(c, 0).unwrap();
+        for id in ids {
+            pool.set_intent_bytes(&id, vec![0xA5; 4]);
+        }
+
+        let by_count = pool.intent_bytes_prefix(2, usize::MAX, usize::MAX);
+        assert_eq!(by_count.len(), 2);
+        assert_eq!(by_count.iter().map(Vec::len).sum::<usize>(), 8);
+
+        let by_bytes = pool.intent_bytes_prefix(4, 7, usize::MAX);
+        assert_eq!(by_bytes.len(), 1);
+        assert_eq!(by_bytes[0].len(), 4);
+
+        let per_tx_rejected = pool.intent_bytes_prefix(4, usize::MAX, 3);
+        assert!(per_tx_rejected.is_empty());
     }
 }

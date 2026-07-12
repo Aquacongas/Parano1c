@@ -3,6 +3,8 @@
 
 //! Mempool events broadcast to P2P, RPC subscribers, and the block builder.
 
+use std::sync::Arc;
+
 use noid_poseidon2b::primitives::TxBodyHash;
 
 /// An event emitted by the mempool and broadcast to all subscribers.
@@ -19,7 +21,7 @@ pub enum MempoolEvent {
         hash: TxBodyHash,
         fee: u64,
         /// Raw `TxIntent` bytes for P2P rebroadcast.
-        intent_bytes: Vec<u8>,
+        intent_bytes: Arc<[u8]>,
     },
 
     /// A transaction was evicted (epoch changed or pool pressure).

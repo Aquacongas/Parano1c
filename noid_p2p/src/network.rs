@@ -174,7 +174,7 @@ pub enum NetworkCommand {
         block_auth_sidecar_bytes: Vec<u8>,
     },
     /// Broadcast a new TxIntent to all peers.
-    BroadcastTx { intent_bytes: Vec<u8> },
+    BroadcastTx { intent_bytes: Arc<[u8]> },
     /// Connect to a seed peer.
     Dial { addr: Multiaddr },
     /// Get current peer count.
@@ -462,7 +462,9 @@ impl P2PNetwork {
     pub async fn broadcast_tx(&self, intent_bytes: Vec<u8>) {
         let _ = self
             .cmd_tx
-            .send(NetworkCommand::BroadcastTx { intent_bytes })
+            .send(NetworkCommand::BroadcastTx {
+                intent_bytes: intent_bytes.into(),
+            })
             .await;
     }
 
@@ -990,7 +992,11 @@ fn handle_network_command(
         }
         NetworkCommand::BroadcastTx { intent_bytes } => {
             let topic = gossipsub::IdentTopic::new(topics.txs.clone());
-            if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, intent_bytes) {
+            if let Err(e) = swarm
+                .behaviour_mut()
+                .gossipsub
+                .publish(topic, intent_bytes.as_ref().to_vec())
+            {
                 tracing::debug!("gossipsub: {e} (block delivered via direct peer connections)");
             }
         }
@@ -1987,18 +1993,14 @@ async fn handle_swarm_event(
                 peer,
             },
         )) => {
-            let mut txs = mempool.all_intent_bytes().await;
-            if txs.len() > MAX_MEMPOOL_SYNC_TXS {
-                txs.truncate(MAX_MEMPOOL_SYNC_TXS);
-            }
-            let mut total_bytes = 0usize;
-            txs.retain(|tx| {
-                if tx.len() > MAX_TX_INTENT_BYTES_GLOBAL {
-                    return false;
-                }
-                total_bytes = total_bytes.saturating_add(tx.len());
-                total_bytes <= MAX_MEMPOOL_SYNC_BYTES
-            });
+            let txs = mempool
+                .intent_bytes_prefix(
+                    MAX_MEMPOOL_SYNC_TXS,
+                    MAX_MEMPOOL_SYNC_BYTES,
+                    MAX_TX_INTENT_BYTES_GLOBAL,
+                )
+                .await;
+            let total_bytes: usize = txs.iter().map(Vec::len).sum();
             tracing::debug!(
                 peer = %peer,
                 tx_count = txs.len(),
