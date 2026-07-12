@@ -259,10 +259,11 @@ fn begin_selected_history_proof_session_with_available(
 }
 
 /// Which transient protocol matrix a Link step requests from its local class
-/// cache/rebuilder. Genesis uses the canonical matrix already owned by the
-/// frozen Link registry and therefore never enters this loader boundary.
+/// cache/rebuilder.  Every child matrix, including canonical genesis T, enters
+/// through this boundary so the frozen registry never pins an m24 `FieldR1cs`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SelectedRecursiveMatrixKind {
+    GenesisLink,
     PreviousLink(SelectedRecursiveTier),
     CurrentBlock(SelectedRecursiveTier),
 }
@@ -639,7 +640,16 @@ fn prove_selected_recursive_link_in_reserved_session<S: SelectedRecursiveMatrixS
     )?;
 
     let (previous_envelope, previous_slot, genesis, previous_request) = match &predecessor {
-        SelectedRecursiveLinkPredecessor::Genesis => (class.genesis_envelope(), 0usize, true, None),
+        SelectedRecursiveLinkPredecessor::Genesis => (
+            class.genesis_envelope(),
+            0usize,
+            true,
+            SelectedRecursiveMatrixRequest {
+                kind: SelectedRecursiveMatrixKind::GenesisLink,
+                shape: class.shape,
+                statement_digest: class.genesis_digest,
+            },
+        ),
         SelectedRecursiveLinkPredecessor::Previous { tier, envelope } => {
             let previous_class = classes.get(*tier);
             validate_link_class_binding(
@@ -652,11 +662,11 @@ fn prove_selected_recursive_link_in_reserved_session<S: SelectedRecursiveMatrixS
                 envelope,
                 tier.slot(),
                 false,
-                Some(SelectedRecursiveMatrixRequest {
+                SelectedRecursiveMatrixRequest {
                     kind: SelectedRecursiveMatrixKind::PreviousLink(*tier),
                     shape: previous_class.shape,
                     statement_digest: classes.link_class_digests[tier.slot()],
-                }),
+                },
             )
         }
     };
@@ -679,36 +689,15 @@ fn prove_selected_recursive_link_in_reserved_session<S: SelectedRecursiveMatrixS
     .map_err(SelectedRecursiveProverError::LinkPreparation)?;
 
     let prepare_matrices = AssertUnwindSafe(|| {
-        if let Some(previous_request) = previous_request {
-            run_sequential_matrix_phases(
-                matrices,
-                previous_request,
-                block_request,
-                previous_phase,
-                |phase, matrix| phase.prepare_previous_link(matrix),
-                |phase, matrix| phase.prepare_current_block(matrix),
-            )
-            .map_err(map_sequential_link_error)
-        } else {
-            // The canonical genesis matrix is already owned once by the
-            // frozen registry. Finish its fold before asking the source for
-            // the current Block matrix; no additional genesis matrix is
-            // rebuilt or cloned.
-            let block_phase = previous_phase
-                .prepare_previous_link(class.genesis.as_ref())
-                .map_err(SelectedRecursiveProverError::LinkPreparation)?;
-            let block_matrix = matrices.load_matrix(block_request).map_err(|source| {
-                SelectedRecursiveProverError::MatrixLoad {
-                    kind: block_request.kind,
-                    detail: source.to_string(),
-                }
-            })?;
-            let prepared = block_phase
-                .prepare_current_block(block_matrix.matrix())
-                .map_err(SelectedRecursiveProverError::LinkPreparation)?;
-            drop(block_matrix);
-            Ok(prepared)
-        }
+        run_sequential_matrix_phases(
+            matrices,
+            previous_request,
+            block_request,
+            previous_phase,
+            |phase, matrix| phase.prepare_previous_link(matrix),
+            |phase, matrix| phase.prepare_current_block(matrix),
+        )
+        .map_err(map_sequential_link_error)
     });
     let prepared = catch_unwind(prepare_matrices)
         .map_err(|_| SelectedRecursiveProverError::LinkPreparationRejected)??;
@@ -1198,7 +1187,8 @@ mod tests {
             }
             self.calls.push(request.kind());
             let matrix = match request.kind() {
-                SelectedRecursiveMatrixKind::PreviousLink(_) => self.previous.take(),
+                SelectedRecursiveMatrixKind::GenesisLink
+                | SelectedRecursiveMatrixKind::PreviousLink(_) => self.previous.take(),
                 SelectedRecursiveMatrixKind::CurrentBlock(_) => self.block.take(),
             }
             .ok_or("requested matrix is unavailable")?;
@@ -1266,6 +1256,51 @@ mod tests {
         assert_eq!(
             source.calls,
             vec![previous_request.kind(), block_request.kind()]
+        );
+        assert!(!resident.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn sequential_link_driver_releases_genesis_before_loading_block() {
+        let genesis = tiny_matrix(23);
+        let block = tiny_matrix(24);
+        let genesis_request = request(SelectedRecursiveMatrixKind::GenesisLink, &genesis);
+        let block_request = request(
+            SelectedRecursiveMatrixKind::CurrentBlock(SelectedRecursiveTier::B8),
+            &block,
+        );
+        let resident = Arc::new(AtomicBool::new(false));
+        let mut source = OrderedMatrixSource {
+            previous: Some(genesis),
+            block: Some(block),
+            resident: Arc::clone(&resident),
+            calls: Vec::new(),
+        };
+
+        run_sequential_matrix_phases(
+            &mut source,
+            genesis_request,
+            block_request,
+            (),
+            |(), matrix| {
+                (matrix.structural_statement_digest() == genesis_request.statement_digest())
+                    .then_some(())
+                    .ok_or("genesis matrix identity")
+            },
+            |(), matrix| {
+                (matrix.structural_statement_digest() == block_request.statement_digest())
+                    .then_some(())
+                    .ok_or("block matrix identity")
+            },
+        )
+        .expect("honest genesis-to-block phases");
+
+        assert_eq!(
+            source.calls,
+            vec![
+                SelectedRecursiveMatrixKind::GenesisLink,
+                block_request.kind()
+            ]
         );
         assert!(!resident.load(Ordering::Acquire));
     }
@@ -1359,9 +1394,9 @@ mod tests {
         assert!(!coordinator.contains("try_reserve"));
         assert!(coordinator.contains("begin_split_link_native_preparation"));
         assert!(coordinator.contains("run_sequential_matrix_phases"));
-        assert!(coordinator.contains(".prepare_previous_link(class.genesis.as_ref())"));
-        assert!(coordinator.contains(".prepare_current_block(block_matrix.matrix())"));
-        assert!(coordinator.contains("drop(block_matrix)"));
+        assert!(coordinator.contains("SelectedRecursiveMatrixKind::GenesisLink"));
+        assert!(!coordinator.contains("class.genesis.as_ref()"));
+        assert!(coordinator.contains(".prepare_current_block(matrix)"));
         assert!(coordinator.contains("prepared.assemble()"));
         assert!(coordinator.contains("prove_built_split_link"));
         assert!(!coordinator.contains("build_split_link("));

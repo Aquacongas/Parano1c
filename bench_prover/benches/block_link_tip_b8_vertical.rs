@@ -355,9 +355,12 @@ fn main() {
         *link_class.post_commit_class_digest(),
         "hosted B8 composite identity",
     );
+    let genesis_matrix = link_class
+        .rebuild_genesis_matrix()
+        .expect("canonical transient genesis matrix");
     let genesis_metrics = ArtifactMetrics {
-        useful_rows: link_class.genesis.useful_rows,
-        class_m: link_class.genesis.m,
+        useful_rows: genesis_matrix.useful_rows,
+        class_m: genesis_matrix.m,
         sidecar_bytes: link_class.genesis_envelope().region_sidecar().byte_len(),
         envelope_bytes: link_class.genesis_envelope().byte_len(),
     };
@@ -374,7 +377,7 @@ fn main() {
             link_class_digests: link_class_digests.clone(),
             link_post_commit_class_digests: link_post_commit_digests.clone(),
             block: &block1_envelope,
-            fold_matrix_link: &link_class.genesis,
+            fold_matrix_link: &genesis_matrix,
             fold_matrix_block: &block_matrix,
         };
         let (built, build) = timed(|| build_split_link(&link_class, &input));

@@ -413,6 +413,7 @@ fn is_canonical_pcs_profile(params: &PcsParams) -> bool {
 /// shared bootstrap and whose remaining entries consume it.  Keeping this
 /// orchestration generic makes the one-bootstrap ownership rule testable
 /// without building production-size recursive matrices.
+#[cfg(test)]
 fn materialize_with_shared_bootstrap<T, C, S, const N: usize>(
     materials: [T; N],
     mut freeze_first: impl FnMut(usize, T) -> (C, S),
@@ -701,6 +702,26 @@ impl CanonicalSplitLinkLadder {
         )
     }
 
+    fn freeze_slot_preflighted_with_transient_genesis(
+        &self,
+        slot: usize,
+        material: SplitLinkSlotMaterial<'_>,
+        genesis: &mut FieldR1cs,
+        shared_genesis: Option<&SharedSplitLinkGenesis>,
+    ) -> SplitLinkClass {
+        SplitLinkClass::freeze_with_transient_genesis(
+            self.link_shape,
+            self.link_pcs_params.clone(),
+            self.slots.to_vec(),
+            slot,
+            material.block_class,
+            material.sample_block,
+            material.block_matrix,
+            genesis,
+            shared_genesis,
+        )
+    }
+
     /// Freeze the complete universal ladder from ordered per-tier artifacts.
     pub fn freeze_all(
         &self,
@@ -710,17 +731,35 @@ impl CanonicalSplitLinkLadder {
             self.validate_slot_material(slot, material)
                 .expect("invalid canonical split-link ladder material");
         }
-        let classes = materialize_with_shared_bootstrap(
-            materials,
-            |slot, material| {
-                let class = self.freeze_slot_preflighted(slot, material);
-                let shared_genesis = class.shared_genesis();
-                (class, shared_genesis)
-            },
-            |slot, material, shared_genesis| {
-                self.freeze_slot_preflighted_with_genesis(slot, material, Some(shared_genesis))
-            },
+        // Build T once for this materialization pass.  Every slot consumes the
+        // same transient allocation sequentially, then the complete registry
+        // drops it instead of retaining it behind an Arc.
+        let mut genesis = split_genesis_instance(&self.link_shape);
+        let mut materials = materials.into_iter().enumerate();
+        let (first_slot, first_material) = materials
+            .next()
+            .expect("canonical ladder has at least one slot");
+        let first = self.freeze_slot_preflighted_with_transient_genesis(
+            first_slot,
+            first_material,
+            &mut genesis,
+            None,
         );
+        let shared_genesis = first.shared_genesis();
+        let mut materialized = Vec::with_capacity(Self::SLOT_COUNT);
+        materialized.push(first);
+        for (slot, material) in materials {
+            materialized.push(self.freeze_slot_preflighted_with_transient_genesis(
+                slot,
+                material,
+                &mut genesis,
+                Some(&shared_genesis),
+            ));
+        }
+        let classes: [SplitLinkClass; Self::SLOT_COUNT] = materialized
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("canonical ladder count was prevalidated"));
+        drop(genesis);
         self.validate_materialized(&classes)
             .expect("fresh canonical split-link ladder identity drift");
         for class in &classes[1..] {
@@ -1140,11 +1179,11 @@ fn split_genesis_baked_claim_value(
 }
 
 /// The slot-independent bootstrap retained by every class in one materialized
-/// ladder.  The matrix and proof envelope dominate its memory footprint, so
-/// `freeze_all` owns each exactly once and clones only these handles.
+/// ladder.  The m24 genesis matrix is deliberately absent: it is needed only
+/// while freezing a class or proving a genesis Link and must be rebuilt/loaded
+/// transiently at those boundaries.
 #[derive(Clone)]
 struct SharedSplitLinkGenesis {
-    genesis: Arc<FieldR1cs>,
     genesis_digest: [u8; 32],
     sidecar_vk: Arc<LinkRegionSidecarVk>,
     post_commit_class_digest: [u8; 32],
@@ -1161,9 +1200,9 @@ pub struct SplitLinkClass {
     /// Statement digest of THIS class's matrix — filled by the first
     /// build, seeded into every later instance.
     pub class_statement_digest: std::sync::OnceLock<[u8; 32]>,
-    /// The genesis dummy T (shape + spec constants only — one T proof
-    /// serves every class of the ladder).
-    pub genesis: Arc<FieldR1cs>,
+    /// Statement identity of the canonical genesis dummy T.  The T matrix is
+    /// not retained by the class; one T proof serves every class of the
+    /// ladder and provers load/rebuild the matrix only on demand.
     pub genesis_digest: [u8; 32],
     /// The block accumulator a genesis link's block must start from.
     genesis_block_accumulator: ChainAccumulator,
@@ -1196,6 +1235,35 @@ impl SplitLinkClass {
         block_class: &BlockClass,
         sample_block: &BlockProofEnvelope,
         block_matrix: &FieldR1cs,
+        shared_genesis: Option<&SharedSplitLinkGenesis>,
+    ) -> Self {
+        let mut genesis = split_genesis_instance(&shape);
+        Self::freeze_with_transient_genesis(
+            shape,
+            pcs_params,
+            ladder,
+            slot,
+            block_class,
+            sample_block,
+            block_matrix,
+            &mut genesis,
+            shared_genesis,
+        )
+    }
+
+    /// Freeze one slot while borrowing the caller's sole transient T matrix.
+    /// `freeze_all` uses this to avoid rebuilding T for each slot without
+    /// transferring it into any materialized class.
+    #[allow(clippy::too_many_arguments)]
+    fn freeze_with_transient_genesis(
+        shape: FieldShape,
+        pcs_params: PcsParams,
+        ladder: Vec<LadderSlotInfo>,
+        slot: usize,
+        block_class: &BlockClass,
+        sample_block: &BlockProofEnvelope,
+        block_matrix: &FieldR1cs,
+        genesis: &mut FieldR1cs,
         shared_genesis: Option<&SharedSplitLinkGenesis>,
     ) -> Self {
         CanonicalSplitLinkLadder::try_new(shape, pcs_params.clone(), ladder.clone())
@@ -1240,16 +1308,18 @@ impl SplitLinkClass {
             block_class.sidecar_vk().transcript_digest(),
             "slot sidecar VK identity vs block class"
         );
-        let (genesis, genesis_digest) = match shared_genesis {
-            Some(shared) => (Arc::clone(&shared.genesis), shared.genesis_digest),
-            None => {
-                let genesis = split_genesis_instance(&shape);
-                // statement_digest() also warms the instance's digest cache,
-                // so proving T reads it instead of re-hashing serialization.
-                let genesis_digest = genesis.statement_digest();
-                (Arc::new(genesis), genesis_digest)
-            }
-        };
+        // Class freezing needs T once to derive the hosted Link matrix.  Keep
+        // it local so a materialized registry never pins an m24 FieldR1cs.
+        assert_eq!(FieldShape::of(&*genesis), shape, "split-genesis shape");
+        // statement_digest() also warms the transient instance's digest cache,
+        // so proving T reads it instead of re-hashing serialization.
+        let genesis_digest = genesis.statement_digest();
+        if let Some(shared) = shared_genesis {
+            assert_eq!(
+                genesis_digest, shared.genesis_digest,
+                "rebuilt split-genesis statement identity"
+            );
+        }
         let block_params = ladder
             .iter()
             .map(|slot| slot.b_pcs_params.clone())
@@ -1259,12 +1329,11 @@ impl SplitLinkClass {
             RPcsLinkUniversalGeometry::new(&pcs_params, &block_params, n_queries)
                 .expect("link/block ladder must share one frozen query count");
         let spec = split_io_spec(shape.k_log, &ladder);
-        let mut class = Self {
+        let class = Self {
             shape,
             pcs_params: pcs_params.clone(),
             spec,
             class_statement_digest: std::sync::OnceLock::new(),
-            genesis,
             genesis_digest,
             genesis_block_accumulator,
             ladder,
@@ -1281,16 +1350,6 @@ impl SplitLinkClass {
         };
 
         if let Some(shared) = shared_genesis {
-            assert_eq!(
-                FieldShape::of(shared.genesis.as_ref()),
-                class.shape,
-                "shared split-genesis shape"
-            );
-            assert_eq!(
-                shared.genesis.statement_digest(),
-                class.genesis_digest,
-                "shared split-genesis statement identity"
-            );
             let expected_genesis_post_commit = link_post_commit_class_digest(
                 &class.genesis_digest,
                 &class.spec,
@@ -1325,7 +1384,7 @@ impl SplitLinkClass {
         } else {
             let (t_witness, ghost_preparation) = class.build_genesis_ghost_witness();
             assert!(
-                class.genesis.satisfies(&t_witness),
+                genesis.satisfies(&t_witness),
                 "canonical split-genesis ghost must satisfy full-identity T"
             );
             class
@@ -1349,7 +1408,7 @@ impl SplitLinkClass {
             let mut ch = FsLaneChallenger::new(b"history-link-v0");
             let (t_proof, t_sidecar, t_commitment, _) =
                 prove_field_with_public_io_and_post_commit_context(
-                    class.genesis.as_ref(),
+                    &*genesis,
                     &t_witness,
                     &pcs_params,
                     &class.spec,
@@ -1361,9 +1420,7 @@ impl SplitLinkClass {
             // T is immutable after this point.  Its optional CSC transpose is
             // derived verifier scratch and must not become part of the shared
             // long-lived ladder allocation.
-            Arc::get_mut(&mut class.genesis)
-                .expect("new canonical genesis has one owner before sharing")
-                .release_csc_cache();
+            genesis.release_csc_cache();
             let env_t = Arc::new(LinkProofEnvelope {
                 field_proof: t_proof,
                 commitment: t_commitment,
@@ -1384,7 +1441,7 @@ impl SplitLinkClass {
                 link_class_digests: vec![[0u8; 32]; class.ladder.len()],
                 link_post_commit_class_digests: vec![[0u8; 32]; class.ladder.len()],
                 block: sample_block,
-                fold_matrix_link: &class.genesis,
+                fold_matrix_link: &*genesis,
                 fold_matrix_block: block_matrix,
             },
             true,
@@ -1444,9 +1501,21 @@ impl SplitLinkClass {
             .as_ref()
     }
 
+    /// Rebuild the canonical genesis matrix for an on-demand proving source.
+    ///
+    /// The returned matrix is owned by the caller and is not cached by the
+    /// class.  Its structural identity is checked before it crosses the
+    /// production loader boundary.
+    pub fn rebuild_genesis_matrix(&self) -> Result<FieldR1cs, LinkProofError> {
+        let matrix = split_genesis_instance(&self.shape);
+        if matrix.statement_digest() != self.genesis_digest {
+            return Err(LinkProofError::ClassIdentityMismatch);
+        }
+        Ok(matrix)
+    }
+
     fn shared_genesis(&self) -> SharedSplitLinkGenesis {
         SharedSplitLinkGenesis {
-            genesis: Arc::clone(&self.genesis),
             genesis_digest: self.genesis_digest,
             sidecar_vk: Arc::clone(self.sidecar_vk.get().expect("frozen link sidecar VK")),
             post_commit_class_digest: *self
@@ -1466,7 +1535,6 @@ impl SplitLinkClass {
             && self.genesis_post_commit_class_digest.get()
                 == other.genesis_post_commit_class_digest.get()
             && self.genesis_block_accumulator == other.genesis_block_accumulator
-            && Arc::ptr_eq(&self.genesis, &other.genesis)
             && matches!(
                 (self.sidecar_vk.get(), other.sidecar_vk.get()),
                 (Some(left), Some(right)) if Arc::ptr_eq(left, right)
@@ -1814,10 +1882,7 @@ impl SplitLinkClass {
         if expected_block_post_commit != self.b_post_commit_class_digest {
             return Err(LinkProofError::ClassIdentityMismatch);
         }
-        if FieldShape::of(&self.genesis) != self.shape
-            || self.genesis.statement_digest() != self.genesis_digest
-            || self.genesis_block_accumulator != genesis_accumulator()
-        {
+        if self.genesis_block_accumulator != genesis_accumulator() {
             return Err(LinkProofError::ClassIdentityMismatch);
         }
         let sidecar_vk = self.sidecar_vk.get().ok_or(LinkProofError::UnfrozenClass)?;
@@ -3546,10 +3611,9 @@ mod tests {
     }
 
     #[test]
-    fn freeze_all_orchestration_shares_one_bootstrap_without_class_identity_drift() {
+    fn freeze_all_orchestration_shares_only_compact_bootstrap_without_identity_drift() {
         #[derive(Clone)]
         struct DummyBootstrap {
-            matrix: Arc<&'static str>,
             sidecar_vk: Arc<&'static str>,
             envelope: Arc<&'static str>,
             post_commit: [u8; 32],
@@ -3568,7 +3632,6 @@ mod tests {
             |slot, class_identity| {
                 first_calls.set(first_calls.get() + 1);
                 let bootstrap = DummyBootstrap {
-                    matrix: Arc::new("canonical T"),
                     sidecar_vk: Arc::new("canonical VK"),
                     envelope: Arc::new("canonical envelope"),
                     post_commit: [0xA5; 32],
@@ -3592,7 +3655,11 @@ mod tests {
             },
         );
 
-        assert_eq!(first_calls.get(), 1, "T is built/proved once");
+        assert_eq!(
+            first_calls.get(),
+            1,
+            "compact T proof metadata is built once"
+        );
         assert_eq!(shared_calls.get(), 3);
         assert_eq!(
             std::array::from_fn(|slot| (classes[slot].slot, classes[slot].class_identity)),
@@ -3601,7 +3668,6 @@ mod tests {
         );
         let reference = &classes[0].bootstrap;
         for class in &classes[1..] {
-            assert!(Arc::ptr_eq(&reference.matrix, &class.bootstrap.matrix));
             assert!(Arc::ptr_eq(
                 &reference.sidecar_vk,
                 &class.bootstrap.sidecar_vk
@@ -3609,6 +3675,30 @@ mod tests {
             assert!(Arc::ptr_eq(&reference.envelope, &class.bootstrap.envelope));
             assert_eq!(reference.post_commit, class.bootstrap.post_commit);
         }
+    }
+
+    #[test]
+    fn split_link_registry_schema_cannot_retain_a_genesis_matrix() {
+        let source = include_str!("split_link.rs");
+        let shared_fields = source
+            .split("struct SharedSplitLinkGenesis {")
+            .nth(1)
+            .expect("SharedSplitLinkGenesis declaration")
+            .split("pub struct SplitLinkClass {")
+            .next()
+            .expect("SharedSplitLinkGenesis fields");
+        let fields = source
+            .split("pub struct SplitLinkClass {")
+            .nth(1)
+            .expect("SplitLinkClass declaration")
+            .split("impl SplitLinkClass {")
+            .next()
+            .expect("SplitLinkClass fields");
+        assert!(!shared_fields.contains("FieldR1cs"));
+        assert!(!shared_fields.contains("genesis: Arc"));
+        assert!(!fields.contains("FieldR1cs"));
+        assert!(!fields.contains("genesis: Arc"));
+        assert!(source.contains("pub fn rebuild_genesis_matrix"));
     }
 
     fn decider_test_matrix(tag: u64) -> FieldR1cs {

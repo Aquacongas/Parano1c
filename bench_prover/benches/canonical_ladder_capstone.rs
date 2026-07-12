@@ -493,6 +493,11 @@ fn main() {
         let tier = TIERS[slot];
         let class = &link_classes[slot];
         let link_started = Instant::now();
+        let genesis_matrix = (step == 0).then(|| {
+            class
+                .rebuild_genesis_matrix()
+                .expect("canonical transient genesis matrix")
+        });
         let (envelope, matrix, useful_rows) = {
             let genesis = step == 0;
             let prev = if genesis {
@@ -501,7 +506,9 @@ fn main() {
                 previous_link.as_ref().expect("previous recursive Link")
             };
             let fold_matrix_link = if genesis {
-                &class.genesis
+                genesis_matrix
+                    .as_ref()
+                    .expect("genesis matrix loaded for genesis step")
             } else {
                 link_matrices[previous_slot]
                     .as_ref()

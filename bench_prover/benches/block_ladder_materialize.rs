@@ -227,6 +227,9 @@ fn main() {
     }
 
     let link_class = &link_classes[hosted_slot];
+    let genesis_matrix = link_class
+        .rebuild_genesis_matrix()
+        .expect("canonical transient genesis matrix");
     assert_ne!(
         &start_accumulators[hosted_slot],
         &noid_recursive::genesis_accumulator(),
@@ -241,7 +244,7 @@ fn main() {
             link_class_digests: link_class_digests.clone(),
             link_post_commit_class_digests: link_post_commit_class_digests.clone(),
             block: &block_envelopes[hosted_slot],
-            fold_matrix_link: &link_class.genesis,
+            fold_matrix_link: &genesis_matrix,
             fold_matrix_block: &block_matrices[hosted_slot],
         },
     );
