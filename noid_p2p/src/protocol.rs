@@ -89,18 +89,26 @@ pub struct GetRecentBlockResponse {
 // Public history proof
 // ---------------------------------------------------------------------------
 
-/// Request the current constant-size public history/checkpoint proof envelope.
+/// Request the constant-size selected-history proof at one exact manifest
+/// boundary. Height alone is insufficient across a reorg; the server must
+/// return no proof unless both fields still name its canonical retained chain.
 ///
-/// A peer may return `None` while promoted checkpoint package coverage is not
-/// ready or cannot be served with the retained suffix. Snapshot acceptance
-/// depends on the local checkpoint verifier and the node-validated header
-/// boundary.
+/// A peer returns `None` until verified selected-history coverage reaches this
+/// finalized retained boundary. Snapshot acceptance depends on the local
+/// recursive decider and the node-selected header chain.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GetHistoryProofRequest;
+pub struct GetHistoryProofRequest {
+    pub height: u64,
+    pub block_hash: [u8; 32],
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetHistoryProofResponse {
-    /// Serialized public history/checkpoint proof envelope bytes.
+    /// Exact request boundary echoed by the server so delayed responses cannot
+    /// consume a newer manifest session for the same peer.
+    pub height: u64,
+    pub block_hash: [u8; 32],
+    /// Serialized selected-history terminal package bytes.
     pub proof_bytes: Option<Vec<u8>>,
     /// Serialized tip BlockHeader bytes (276 bytes).
     pub tip_header_bytes: Option<Vec<u8>>,
@@ -120,7 +128,7 @@ pub struct GetHistoryProofResponse {
 /// Request the state manifest: metadata + list of active segment IDs.
 ///
 /// The manifest describes the state snapshot authorized by the corresponding
-/// O(1) history/checkpoint proof envelope.
+/// O(1) selected-history terminal package.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetStateManifestRequest {
     /// Requester's current tip height (0 for fresh nodes).

@@ -103,89 +103,59 @@ fn snapshot_suffix_is_retained(tip_height: u64, proof_height: u64) -> bool {
             <= noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH
 }
 
-fn local_checkpoint_history_proof(ctx: &MdbxChainContext) -> Option<(u64, Vec<u8>)> {
-    let coverage = ctx.store.get_checkpoint_coverage().ok().flatten()?;
-    let height = coverage.history_proof_covered_to?;
-    if height == 0 || height > ctx.tip_height() {
+/// Choose one finalized selected-history boundary without loading its proof.
+/// Local proving may be ahead of finality; snapshot generation therefore uses
+/// the exact result at `min(coverage, finalized)` rather than retaining a
+/// 580-KiB envelope on every timer tick.
+fn local_selected_history_boundary(ctx: &MdbxChainContext) -> Option<(u64, [u8; 32])> {
+    let coverage = ctx.store.get_selected_history_coverage().ok().flatten()?;
+    let finalized = ctx.finalized_checkpoint();
+    let height = coverage.height.min(finalized.height);
+    if height == 0
+        || height > ctx.tip_height()
+        || !snapshot_suffix_is_retained(ctx.tip_height(), height)
+    {
         return None;
     }
-    if !snapshot_suffix_is_retained(ctx.tip_height(), height) {
-        tracing::debug!(
-            proof_height = height,
-            tip_height = ctx.tip_height(),
-            retention = noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH,
-            "checkpoint proof is too old to serve with retained suffix"
-        );
+    let header = ctx.store.get_header(height).ok().flatten()?;
+    let block_hash = noid_chain::hash_block_header(&header);
+    if height == coverage.height && block_hash != coverage.block_hash {
         return None;
     }
-    let record_bytes = ctx
-        .store
-        .get_history_checkpoint_head_record(height)
-        .ok()
-        .flatten()?;
-    let record: noid_recursive::StoredHistoryCheckpointHeadRecord =
-        match bincode::deserialize(&record_bytes) {
-            Ok(record) => record,
-            Err(e) => {
-                tracing::warn!(
-                    height,
-                    err = ?e,
-                    "checkpoint head record decode failed while serving proof"
-                );
-                return None;
-            }
-        };
-    if record.height != height {
-        tracing::warn!(
-            height,
-            record_height = record.height,
-            "checkpoint head record height mismatch while serving proof"
-        );
+    if height == finalized.height && block_hash != finalized.hash {
         return None;
     }
-    if let Err(e) = noid_recursive::verify_history_checkpoint_head_record(&record) {
-        tracing::warn!(height, err = ?e, "checkpoint head record self-check failed");
+    let job = ctx.store.get_recursive_proof_job(height).ok().flatten()?;
+    if job.state != noid_chain::storage::RecursiveProofJobState::Complete
+        || job.block_hash != block_hash
+    {
         return None;
     }
-    let local_end_anchor = ctx.store.get_header_anchor(height).ok().flatten()?;
-    let proof = match noid_recursive::public_history_checkpoint_proof_from_head_record(&record) {
-        Ok(proof) => proof,
-        Err(e) => {
-            tracing::warn!(
-                height,
-                err = ?e,
-                "checkpoint public proof decode failed while serving proof"
-            );
-            return None;
-        }
-    };
-    if let Err(e) = noid_recursive::verify_history_checkpoint_proof_checkpoint(
-        &proof,
-        &proof.start_anchor,
-        &local_end_anchor,
-    ) {
-        tracing::warn!(
-            height,
-            err = ?e,
-            "checkpoint public proof self-check failed while serving proof"
-        );
-        return None;
-    }
-    let bytes = record.proof_bytes;
-    if bytes.len() > MAX_HISTORY_PROOF_BYTES {
-        tracing::warn!(
-            height,
-            len = bytes.len(),
-            cap = MAX_HISTORY_PROOF_BYTES,
-            "checkpoint public proof exceeds wire cap"
-        );
-        return None;
-    }
-    Some((height, bytes))
+    Some((height, block_hash))
 }
 
-fn local_public_history_proof(ctx: &MdbxChainContext) -> Option<(u64, Vec<u8>)> {
-    local_checkpoint_history_proof(ctx)
+/// Load only the exact selected terminal requested by the peer's previously
+/// advertised manifest. Advancement of local finality/coverage cannot switch
+/// this response to a different boundary.
+fn local_public_history_proof(
+    ctx: &MdbxChainContext,
+    height: u64,
+    block_hash: [u8; 32],
+) -> Option<Vec<u8>> {
+    let coverage = ctx.store.get_selected_history_coverage().ok().flatten()?;
+    let finalized = ctx.finalized_checkpoint();
+    if height == 0
+        || height > coverage.height
+        || height > finalized.height
+        || !snapshot_suffix_is_retained(ctx.tip_height(), height)
+    {
+        return None;
+    }
+    ctx.store
+        .get_selected_history_terminal_result_at(height, block_hash)
+        .ok()
+        .flatten()
+        .map(|result| result.bytes)
 }
 
 fn sanitize_stored_block_response(
@@ -327,7 +297,11 @@ pub enum NetworkCommand {
     /// Request the public checkpoint/history proof from a peer.
     /// Peers return no proof until promoted checkpoint package coverage is ready.
     /// Emits `NetworkEvent::HistoryProof` when the response arrives.
-    RequestHistoryProof { peer: PeerId },
+    RequestHistoryProof {
+        peer: PeerId,
+        height: u64,
+        block_hash: [u8; 32],
+    },
     /// Request a peer's mempool contents (all pending TxIntent bytes).
     /// Triggered on peer connect so late-joining nodes receive existing TXs.
     /// Emits `NetworkEvent::MempoolSyncResponse` when the response arrives.
@@ -382,10 +356,12 @@ pub enum NetworkEvent {
     },
     /// Public checkpoint/history proof envelope response received from a peer.
     ///
-    /// Empty `proof_bytes` means the peer has no servable checkpoint proof ready.
+    /// Empty `proof_bytes` means the peer has no servable selected-history terminal.
     HistoryProof {
         from: PeerId,
-        /// Serialized public checkpoint/history proof envelope bytes, or empty.
+        height: u64,
+        block_hash: [u8; 32],
+        /// Serialized selected-history terminal package bytes, or empty.
         proof_bytes: Vec<u8>,
         /// Serialized tip `BlockHeader` bytes (276 bytes), or empty.
         tip_header_bytes: Vec<u8>,
@@ -640,10 +616,14 @@ impl P2PNetwork {
 
     /// Request the public history proof from a peer.
     /// The response arrives as `NetworkEvent::HistoryProof`.
-    pub async fn request_history_proof(&self, peer: PeerId) {
+    pub async fn request_history_proof(&self, peer: PeerId, height: u64, block_hash: [u8; 32]) {
         let _ = self
             .cmd_tx
-            .send(NetworkCommand::RequestHistoryProof { peer })
+            .send(NetworkCommand::RequestHistoryProof {
+                peer,
+                height,
+                block_hash,
+            })
             .await;
     }
 
@@ -901,9 +881,7 @@ async fn run_swarm(
                 if snapshot_export_inflight.is_none() {
                     let candidate = {
                         let ctx = chain.read().await;
-                        local_public_history_proof(&ctx).and_then(|(height, _)| {
-                            let header = ctx.store.get_header(height).ok().flatten()?;
-                            let key = (height, noid_chain::hash_block_header(&header));
+                        local_selected_history_boundary(&ctx).and_then(|key| {
                             if snapshot_exports.contains_key(&key) {
                                 None
                             } else {
@@ -1221,12 +1199,16 @@ fn handle_network_command(
             );
             tracing::debug!(peer = %peer, segment_id, "requesting state segment");
         }
-        NetworkCommand::RequestHistoryProof { peer } => {
-            let _ = swarm
-                .behaviour_mut()
-                .proof_sync
-                .send_request(&peer, crate::protocol::GetHistoryProofRequest);
-            tracing::debug!(peer = %peer, "requesting history proof for snapshot verification");
+        NetworkCommand::RequestHistoryProof {
+            peer,
+            height,
+            block_hash,
+        } => {
+            let _ = swarm.behaviour_mut().proof_sync.send_request(
+                &peer,
+                crate::protocol::GetHistoryProofRequest { height, block_hash },
+            );
+            tracing::debug!(peer = %peer, height, "requesting exact history proof for snapshot verification");
         }
         NetworkCommand::FetchHeaders {
             peer,
@@ -1759,7 +1741,10 @@ async fn handle_swarm_event(
         // --- Request-Response: public history proof ---
         SwarmEvent::Behaviour(NodeBehaviourEvent::ProofSync(
             request_response::Event::Message {
-                message: request_response::Message::Request { channel, .. },
+                message:
+                    request_response::Message::Request {
+                        request, channel, ..
+                    },
                 ..
             },
         )) => {
@@ -1773,6 +1758,8 @@ async fn handle_swarm_event(
             let chain = chain.clone();
             let budget = outbound_response_budget.clone();
             let completion = history_response_tx.clone();
+            let request_height = request.height;
+            let request_hash = request.block_hash;
             tokio::spawn(async move {
                 let _preparation_permit = preparation_permit;
                 let Ok(Some(outbound_memory_permit)) =
@@ -1782,7 +1769,8 @@ async fn handle_swarm_event(
                 };
                 let loaded = tokio::task::spawn_blocking(move || {
                     let ctx = chain.blocking_read();
-                    let proof_bytes = local_public_history_proof(&ctx).map(|(_, bytes)| bytes);
+                    let proof_bytes =
+                        local_public_history_proof(&ctx, request_height, request_hash);
                     let mut tip_header_bytes = Vec::new();
                     ctx.tip_header().encode(&mut tip_header_bytes);
                     (proof_bytes, Some(tip_header_bytes))
@@ -1796,6 +1784,8 @@ async fn handle_swarm_event(
                     }
                 };
                 let response = GetHistoryProofResponse {
+                    height: request_height,
+                    block_hash: request_hash,
                     proof_bytes,
                     tip_header_bytes,
                     inbound_memory_permit: None,
@@ -1815,6 +1805,8 @@ async fn handle_swarm_event(
             },
         )) => {
             let inbound_memory_permit = response.inbound_memory_permit.clone();
+            let height = response.height;
+            let block_hash = response.block_hash;
             let proof_bytes = response.proof_bytes.unwrap_or_default();
             let tip_header_bytes = response.tip_header_bytes.unwrap_or_default();
             if proof_bytes.len() > MAX_HISTORY_PROOF_BYTES {
@@ -1833,6 +1825,8 @@ async fn handle_swarm_event(
             let _ = required_event_tx
                 .send(NetworkEvent::HistoryProof {
                     from: peer,
+                    height,
+                    block_hash,
                     proof_bytes,
                     tip_header_bytes,
                     inbound_memory_permit,
@@ -1871,7 +1865,8 @@ async fn handle_swarm_event(
             prune_snapshot_exports(snapshot_exports);
             let response = 'ready_manifest: {
                 let ctx = chain.read().await;
-                let Some((snapshot_height, _)) = local_public_history_proof(&ctx) else {
+                let Some((snapshot_height, snapshot_hash)) = local_selected_history_boundary(&ctx)
+                else {
                     break 'ready_manifest GetStateManifestResponse::default();
                 };
                 if snapshot_height == 0
@@ -1886,10 +1881,10 @@ async fn handle_swarm_event(
                 else {
                     break 'ready_manifest GetStateManifestResponse::default();
                 };
-                let key = (
-                    snapshot_height,
-                    noid_chain::hash_block_header(&snapshot_header),
-                );
+                let key = (snapshot_height, snapshot_hash);
+                if noid_chain::hash_block_header(&snapshot_header) != snapshot_hash {
+                    break 'ready_manifest GetStateManifestResponse::default();
+                }
                 let Some(generation) = snapshot_exports.get(&key) else {
                     tracing::debug!(snapshot_height, "bounded snapshot generation is not ready");
                     break 'ready_manifest GetStateManifestResponse::default();
@@ -2447,6 +2442,44 @@ mod tests {
         assert!(snapshot_suffix_is_retained(100, 100 - retention));
         assert!(!snapshot_suffix_is_retained(100, 100 - retention - 1));
         assert!(!snapshot_suffix_is_retained(100, 101));
+    }
+
+    #[test]
+    fn selected_history_serving_is_exact_and_finalized() {
+        use noid_chain::storage::{FinalizedCheckpoint, MdbxChainContext, RecursiveProofJobTier};
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut ctx = MdbxChainContext::open_or_create(directory.path()).unwrap();
+        let genesis = noid_chain::consensus::genesis::genesis_header();
+        let mut header = genesis;
+        header.height = 1;
+        header.prev_block_hash = noid_chain::hash_block_header(&genesis);
+        header.timestamp = header.timestamp.saturating_add(1);
+        header.nonce = 0x5151;
+        let hash = noid_chain::hash_block_header(&header);
+        ctx.store.put_header_only(&header, &hash).unwrap();
+        ctx.store
+            .enqueue_recursive_proof_job(1, hash, RecursiveProofJobTier::B8)
+            .unwrap();
+        ctx.store.claim_next_recursive_proof_job().unwrap().unwrap();
+        let mut terminal = Vec::new();
+        terminal.extend_from_slice(&1u16.to_le_bytes());
+        terminal.extend_from_slice(&1u64.to_le_bytes());
+        terminal.extend_from_slice(&hash);
+        terminal.push(0);
+        terminal.extend_from_slice(&8u16.to_le_bytes());
+        ctx.store
+            .complete_recursive_proof_job_and_promote_selected_history(1, hash, &terminal)
+            .unwrap();
+        ctx.tip_height = 1;
+        ctx.tip_hash = hash;
+
+        // Coverage above the finalized boundary is not snapshot authority.
+        assert!(local_selected_history_boundary(&ctx).is_none());
+        ctx.finalized = FinalizedCheckpoint { height: 1, hash };
+        assert_eq!(local_selected_history_boundary(&ctx), Some((1, hash)));
+        assert_eq!(local_public_history_proof(&ctx, 1, hash), Some(terminal));
+        assert!(local_public_history_proof(&ctx, 1, [0xA5; 32]).is_none());
     }
 
     #[test]

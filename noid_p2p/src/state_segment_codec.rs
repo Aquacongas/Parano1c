@@ -52,6 +52,7 @@ impl Default for StateSegmentCodec {
 }
 
 impl StateSegmentCodec {
+    #[cfg(test)]
     fn with_inbound_budget(bytes: usize) -> Self {
         Self {
             inbound_budget: Arc::new(tokio::sync::Semaphore::new(bytes)),
