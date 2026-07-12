@@ -9,9 +9,10 @@
 //! verifier authority and are derived exclusively from a locally materialized
 //! [`CanonicalSplitLinkLadder`] registry.
 //!
-//! Verification is bounded-memory: the terminal Link matrix is loaded first,
-//! used both for proof verification and (when live) its accumulator lane, and
-//! released.  Every other live Link/Block matrix is then loaded, checked, and
+//! Verification is bounded-memory: the terminal proof is replayed with the
+//! matrix-free deferred Field verifier, then the terminal Link matrix is
+//! leased once to discharge its fresh claim and (when live) its accumulator
+//! lane. Every other live Link/Block matrix is then leased, checked, and
 //! released one at a time before the one-shot tip decision can finish.
 
 use std::fmt;
@@ -23,13 +24,14 @@ use noid_chain::consensus::wire_limits::MAX_HISTORY_PROOF_BYTES;
 use noid_chain::{block_id, BlockHeader};
 use noid_ivc_core::field::F128;
 use noid_ivc_core::field_r1cs::FieldR1cs;
+use noid_ivc_core::proof::FieldShape;
 use serde::de::{
     self, DeserializeOwned, DeserializeSeed, EnumAccess, MapAccess, SeqAccess, VariantAccess,
     Visitor,
 };
 
 use crate::acceptance::split_link::{
-    begin_tip_split_decision, tip_block_accumulator_split, CanonicalLadderError,
+    begin_tip_split_decision_deferred_matrix, tip_block_accumulator_split, CanonicalLadderError,
     CanonicalSplitLinkLadder, LinkProofEnvelope, SplitLinkClass, CANONICAL_BLOCK_CLASS_MS,
     CANONICAL_LINK_CLASS_M,
 };
@@ -977,6 +979,62 @@ pub struct SelectedHistoryMatrixRequest {
     pub family: SelectedHistoryMatrixFamily,
     pub slot: usize,
     pub tier: usize,
+    shape: FieldShape,
+    statement_digest: [u8; 32],
+}
+
+impl SelectedHistoryMatrixRequest {
+    /// Frozen shape the local artifact must decode to.
+    pub const fn shape(&self) -> FieldShape {
+        self.shape
+    }
+
+    /// Frozen structural statement identity the local artifact must match.
+    pub const fn statement_digest(&self) -> [u8; 32] {
+        self.statement_digest
+    }
+}
+
+/// One transient matrix whose admission remains held for as long as its CSR
+/// can be borrowed.  Implementations may attach process-global residency or
+/// file-mapping guards; the verifier never unwraps the matrix from the lease.
+pub trait SelectedHistoryMatrixLease {
+    fn matrix(&self) -> &FieldR1cs;
+}
+
+impl SelectedHistoryMatrixLease for FieldR1cs {
+    fn matrix(&self) -> &FieldR1cs {
+        self
+    }
+}
+
+/// Dependency-clean local source contract for streaming terminal
+/// verification.  At most one returned lease is live when the next load is
+/// requested.
+pub trait SelectedHistoryMatrixSource {
+    type Lease: SelectedHistoryMatrixLease;
+    type Error: fmt::Display;
+
+    fn load_matrix(
+        &mut self,
+        request: SelectedHistoryMatrixRequest,
+    ) -> Result<Self::Lease, Self::Error>;
+}
+
+impl<F, E> SelectedHistoryMatrixSource for F
+where
+    F: FnMut(SelectedHistoryMatrixRequest) -> Result<FieldR1cs, E>,
+    E: fmt::Display,
+{
+    type Lease = FieldR1cs;
+    type Error = E;
+
+    fn load_matrix(
+        &mut self,
+        request: SelectedHistoryMatrixRequest,
+    ) -> Result<Self::Lease, Self::Error> {
+        self(request)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1034,20 +1092,37 @@ impl From<SelectedHistoryCodecError> for SelectedHistoryVerificationError {
 fn matrix_request(
     family: SelectedHistoryMatrixFamily,
     slot: usize,
+    registry: &CanonicalSelectedHistoryRegistry<'_>,
 ) -> SelectedHistoryMatrixRequest {
+    let (shape, statement_digest) = match family {
+        SelectedHistoryMatrixFamily::Link => (
+            registry.class(slot).shape,
+            registry.link_class_digests[slot],
+        ),
+        SelectedHistoryMatrixFamily::Block => {
+            let info = &registry.class(slot).ladder()[slot];
+            (info.b_shape, info.b_digest)
+        }
+    };
     SelectedHistoryMatrixRequest {
         family,
         slot,
         tier: USER_TX_CLASS_TIERS[slot],
+        shape,
+        statement_digest,
     }
 }
 
-fn load_matrix(
-    source: &mut impl FnMut(SelectedHistoryMatrixRequest) -> Result<FieldR1cs, String>,
+fn load_matrix<S: SelectedHistoryMatrixSource>(
+    source: &mut S,
     request: SelectedHistoryMatrixRequest,
-) -> Result<FieldR1cs, SelectedHistoryVerificationError> {
-    source(request)
-        .map_err(|error| SelectedHistoryVerificationError::MatrixSource { request, error })
+) -> Result<S::Lease, SelectedHistoryVerificationError> {
+    source
+        .load_matrix(request)
+        .map_err(|error| SelectedHistoryVerificationError::MatrixSource {
+            request,
+            error: error.to_string(),
+        })
 }
 
 /// Verify one selected-history terminal package against local canonical
@@ -1056,12 +1131,12 @@ fn load_matrix(
 /// `matrix_source` must rebuild/load matrices from the node's own published
 /// class registry.  Returned matrices are owned by this function and dropped
 /// after their single check; at no point is a full matrix bank retained.
-pub fn verify_selected_history_terminal(
+pub fn verify_selected_history_terminal<S: SelectedHistoryMatrixSource>(
     package: &SelectedHistoryTerminalPackage,
     registry: &CanonicalSelectedHistoryRegistry<'_>,
     local_tip_header: &BlockHeader,
     local_epoch_anchor_header: &BlockHeader,
-    mut matrix_source: impl FnMut(SelectedHistoryMatrixRequest) -> Result<FieldR1cs, String>,
+    matrix_source: &mut S,
 ) -> Result<ChainAccumulator, SelectedHistoryVerificationError> {
     if package.version != SELECTED_HISTORY_TERMINAL_VERSION {
         return Err(SelectedHistoryCodecError::UnsupportedVersion {
@@ -1098,45 +1173,47 @@ pub fn verify_selected_history_terminal(
     let tip_slot = package.canonical_tip_slot();
     let tip_class = registry.class(tip_slot);
     let layout = tip_class.layout();
-    let tip_matrix_request = matrix_request(SelectedHistoryMatrixFamily::Link, tip_slot);
-    let tip_matrix = load_matrix(&mut matrix_source, tip_matrix_request)?;
-    let mut pending = begin_tip_split_decision(
+    // Replay the Field proof without a matrix first.  Only a valid proof can
+    // trigger the large local artifact load, and the returned typestate still
+    // cannot be accepted until its fresh claim is discharged below.
+    let deferred = begin_tip_split_decision_deferred_matrix(
         tip_class,
-        &tip_matrix,
         &package.terminal_envelope,
         &registry.link_class_digests,
         &registry.link_post_commit_class_digests,
     )
     .map_err(SelectedHistoryVerificationError::TipDecision)?;
+    let tip_matrix_request = matrix_request(SelectedHistoryMatrixFamily::Link, tip_slot, registry);
+    let tip_matrix = load_matrix(matrix_source, tip_matrix_request)?;
+    let mut pending = deferred
+        .discharge_tip_matrix(tip_matrix.matrix())
+        .map_err(|error| SelectedHistoryVerificationError::TipDecision(error.to_string()))?;
 
-    // Reuse the already resident tip matrix for its accumulator lane, then
-    // drop it before any other matrix is requested.
-    if package.terminal_envelope.io()[layout.link_lanes[tip_slot].live] == F128::ONE {
-        pending
-            .check_link_matrix(tip_slot, &tip_matrix)
-            .map_err(SelectedHistoryVerificationError::TipDecision)?;
-    }
+    // Discharge also consumed the tip's live accumulator lane against this
+    // same structurally authenticated CSR. Release it before any next load.
     drop(tip_matrix);
 
     for (slot, lane) in layout.link_lanes.iter().enumerate() {
         if slot == tip_slot || package.terminal_envelope.io()[lane.live] != F128::ONE {
             continue;
         }
-        let request = matrix_request(SelectedHistoryMatrixFamily::Link, slot);
-        let matrix = load_matrix(&mut matrix_source, request)?;
+        let request = matrix_request(SelectedHistoryMatrixFamily::Link, slot, registry);
+        let matrix = load_matrix(matrix_source, request)?;
         pending
-            .check_link_matrix(slot, &matrix)
+            .check_link_matrix(slot, matrix.matrix())
             .map_err(SelectedHistoryVerificationError::TipDecision)?;
+        drop(matrix);
     }
     for (slot, lane) in layout.b_lanes.iter().enumerate() {
         if package.terminal_envelope.io()[lane.live] != F128::ONE {
             continue;
         }
-        let request = matrix_request(SelectedHistoryMatrixFamily::Block, slot);
-        let matrix = load_matrix(&mut matrix_source, request)?;
+        let request = matrix_request(SelectedHistoryMatrixFamily::Block, slot, registry);
+        let matrix = load_matrix(matrix_source, request)?;
         pending
-            .check_block_matrix(slot, &matrix)
+            .check_block_matrix(slot, matrix.matrix())
             .map_err(SelectedHistoryVerificationError::TipDecision)?;
+        drop(matrix);
     }
     pending
         .finish()
@@ -1272,5 +1349,33 @@ mod tests {
             deserialize_envelope_allocation_safe::<SequenceFixture>(&trailing),
             Err(SelectedHistoryCodecError::TrailingBytes { .. })
         ));
+    }
+
+    #[test]
+    fn terminal_verifier_uses_deferred_csr_discharge_before_any_tip_acceptance() {
+        let source = include_str!("selected_history.rs");
+        let verifier = source
+            .split("pub fn verify_selected_history_terminal<")
+            .nth(1)
+            .expect("selected terminal verifier")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("selected terminal verifier boundary");
+        let replay = verifier
+            .find("begin_tip_split_decision_deferred_matrix(")
+            .expect("matrix-free deferred replay");
+        let load = verifier
+            .find("let tip_matrix = load_matrix(")
+            .expect("leased tip matrix load");
+        let discharge = verifier
+            .find(".discharge_tip_matrix(tip_matrix.matrix())")
+            .expect("mandatory fresh-claim discharge");
+        let release = verifier
+            .find("drop(tip_matrix);")
+            .expect("tip matrix release");
+        assert!(replay < load && load < discharge && discharge < release);
+        assert!(!verifier.contains("begin_tip_split_decision("));
+        assert!(!verifier.contains("verify_split_link_proof("));
+        assert!(!verifier.contains("csc_lincheck_circuit"));
     }
 }

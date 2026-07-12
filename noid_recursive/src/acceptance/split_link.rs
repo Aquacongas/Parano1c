@@ -56,7 +56,8 @@ use noid_ivc_core::field::F128;
 use noid_ivc_core::field_circuit::{FieldR1csBuilder, FsChannelTrace, LinExpr};
 use noid_ivc_core::field_r1cs::{FieldR1cs, SparseFieldMatrix};
 use noid_ivc_core::matrix_claim::{
-    prove_matrix_claim_fold, stacked_matrix_mle_eval, MatrixAccClaim, MatrixFoldProof,
+    fresh_claim_value, prove_matrix_claim_fold, stacked_matrix_mle_eval, FreshLincheckClaim,
+    MatrixAccClaim, MatrixFoldProof,
 };
 use noid_ivc_core::pcs::{Commitment, PcsParams};
 use noid_ivc_core::proof::{pcs_params_statement_bytes, FieldR1csProof, FieldShape, R1csClaim};
@@ -1804,6 +1805,8 @@ pub enum LinkProofError {
     PcsParamsMismatch,
     InvalidIo,
     MatrixMismatch,
+    MatrixClaimMismatch,
+    AccumulatorClaimMismatch,
     SidecarVkMismatch,
     Sidecar(RegionSidecarError),
     Field(VerifyError),
@@ -1817,6 +1820,15 @@ impl std::fmt::Display for LinkProofError {
             Self::PcsParamsMismatch => write!(f, "link PCS parameters do not match the class"),
             Self::InvalidIo => write!(f, "link public IO does not match the class"),
             Self::MatrixMismatch => write!(f, "link matrix does not match its frozen class"),
+            Self::MatrixClaimMismatch => {
+                write!(
+                    f,
+                    "link deferred matrix claim is false for its frozen class"
+                )
+            }
+            Self::AccumulatorClaimMismatch => {
+                write!(f, "link accumulated matrix claim is false")
+            }
             Self::SidecarVkMismatch => write!(f, "link sidecar VK does not match its class"),
             Self::Sidecar(error) => write!(f, "link sidecar error: {error:?}"),
             Self::Field(error) => write!(f, "link Field proof error: {error:?}"),
@@ -2011,6 +2023,43 @@ pub fn verify_split_link_proof<Ch: Challenger>(
     }
     verify_field_with_public_io_and_post_commit_context(
         matrix,
+        envelope.commitment(),
+        envelope.field_proof(),
+        &class.spec,
+        envelope.io(),
+        class.post_commit_class_digest(),
+        envelope.region_sidecar(),
+        challenger,
+        |sidecar, context| {
+            verify_link_region_sidecar_post_commit(class.sidecar_vk(), sidecar, context)
+                .map_err(|_| VerifyError::Auxiliary)
+        },
+    )
+    .map_err(LinkProofError::Field)
+}
+
+/// Verify the complete production Link envelope while deferring only the
+/// lincheck final against the class matrix.
+///
+/// This is transcript-identical to [`verify_split_link_proof`], including the
+/// mandatory post-commit sidecar.  The returned claim is not an acceptance
+/// result: a caller must evaluate it against the structurally authenticated
+/// class matrix before using the proof.
+fn verify_split_link_proof_deferred_matrix<Ch: Challenger>(
+    class: &SplitLinkClass,
+    envelope: &LinkProofEnvelope,
+    challenger: &mut Ch,
+) -> Result<(R1csClaim, FreshLincheckClaim), LinkProofError> {
+    let matrix_digest = class.validate_frozen_identity()?;
+    if !same_pcs_params(&envelope.commitment().params, &class.pcs_params) {
+        return Err(LinkProofError::PcsParamsMismatch);
+    }
+    if envelope.io().len() != class.spec.io_len {
+        return Err(LinkProofError::InvalidIo);
+    }
+    verify_field_deferred_matrix_with_post_commit_context(
+        &class.shape,
+        &matrix_digest,
         envelope.commitment(),
         envelope.field_proof(),
         &class.spec,
@@ -2776,11 +2825,12 @@ impl PendingSplitTipDecision {
         )
     }
 
-    fn check_lane(
+    fn check_lane_with_digest(
         lanes: &mut [PendingMatrixLane],
         slot: usize,
         matrix: &FieldR1cs,
         family: &str,
+        actual_digest: [u8; 32],
     ) -> Result<(), String> {
         let what = format!("{family} lane {slot}");
         let lane = lanes
@@ -2799,10 +2849,7 @@ impl PendingSplitTipDecision {
             } => (claim, expected_digest),
         };
 
-        // This is a local-matrix trust boundary. `statement_digest()` may be
-        // deliberately seeded after a class matrix has already been checked;
-        // a matrix supplied to the final decider has not earned that trust.
-        if &matrix.structural_statement_digest() != expected_digest {
+        if &actual_digest != expected_digest {
             return Err(format!(
                 "{what}: matrix does not match the published digest"
             ));
@@ -2817,6 +2864,19 @@ impl PendingSplitTipDecision {
         }
         lanes[slot] = PendingMatrixLane::Checked;
         Ok(())
+    }
+
+    fn check_lane(
+        lanes: &mut [PendingMatrixLane],
+        slot: usize,
+        matrix: &FieldR1cs,
+        family: &str,
+    ) -> Result<(), String> {
+        // This is a local-matrix trust boundary. `statement_digest()` may be
+        // deliberately seeded after a class matrix has already been checked;
+        // a matrix supplied to the final decider has not earned that trust.
+        let actual_digest = matrix.structural_statement_digest();
+        Self::check_lane_with_digest(lanes, slot, matrix, family, actual_digest)
     }
 
     /// Check one live Link-class accumulator lane against a transient local
@@ -2897,13 +2957,8 @@ fn pending_lane(
     }
 }
 
-/// Verify the tip proof and both published class whitelists, then return the
-/// one-shot set of live matrix claims. Matrix evaluation is intentionally
-/// deferred so a synchronizing node can rebuild/load and release one local
-/// class matrix at a time.
-pub fn begin_tip_split_decision(
+fn pending_tip_split_decision_after_verified_proof(
     tip_class: &SplitLinkClass,
-    tip_class_r1cs: &FieldR1cs,
     tip: &LinkProofEnvelope,
     link_class_digests: &[[u8; 32]],
     link_post_commit_class_digests: &[[u8; 32]],
@@ -2913,13 +2968,9 @@ pub fn begin_tip_split_decision(
     assert_eq!(link_class_digests.len(), n);
     assert_eq!(link_post_commit_class_digests.len(), n);
 
-    if tip_class_r1cs.structural_statement_digest() != link_class_digests[tip_class.slot] {
-        return Err("tip class matrix is not the published one".into());
+    if tip_class.class_statement_digest.get().copied() != Some(link_class_digests[tip_class.slot]) {
+        return Err("tip class is not the published one".into());
     }
-
-    let mut ch = FsLaneChallenger::new(b"history-link-v0");
-    verify_split_link_proof(tip_class, tip_class_r1cs, tip, &mut ch)
-        .map_err(|e| format!("tip proof rejected: {e:?}"))?;
 
     if tip_class.post_commit_class_digest() != &link_post_commit_class_digests[tip_class.slot] {
         return Err("tip post-commit class is not the published one".into());
@@ -2979,6 +3030,124 @@ pub fn begin_tip_split_decision(
         link_lanes,
         block_lanes,
     })
+}
+
+/// A completely replayed tip proof whose sole remaining obligation is its
+/// deferred lincheck final against the canonical Link CSR.
+///
+/// The fresh claim is private and this type exposes no `finish`: acceptance
+/// can only continue by consuming [`Self::discharge_tip_matrix`].  This makes
+/// accidentally dropping the matrix check distinct from accepting the tip.
+#[must_use = "the deferred tip claim must be discharged against its class matrix"]
+pub struct DeferredSplitTipDecision {
+    pending: PendingSplitTipDecision,
+    fresh: FreshLincheckClaim,
+    tip_slot: usize,
+    expected_shape: FieldShape,
+    expected_digest: [u8; 32],
+}
+
+impl DeferredSplitTipDecision {
+    /// Consume the deferred state and evaluate its fresh lincheck claim
+    /// directly over the leased CSR. Shape and structural digest checks run
+    /// before evaluation; a seeded digest cache cannot authenticate mutated
+    /// sparse rows. If the tip Link accumulator lane is live, it is evaluated
+    /// against the same authenticated CSR before the pending decision is
+    /// returned. Thus neither tip obligation can be omitted and the large CSR
+    /// is structurally hashed only once.
+    pub fn discharge_tip_matrix(
+        self,
+        tip_class_r1cs: &FieldR1cs,
+    ) -> Result<PendingSplitTipDecision, LinkProofError> {
+        if FieldShape::of(tip_class_r1cs) != self.expected_shape {
+            return Err(LinkProofError::MatrixMismatch);
+        }
+        let actual_digest = tip_class_r1cs.structural_statement_digest();
+        if actual_digest != self.expected_digest {
+            return Err(LinkProofError::MatrixMismatch);
+        }
+        if fresh_claim_value(tip_class_r1cs, &self.fresh) != self.fresh.value {
+            return Err(LinkProofError::MatrixClaimMismatch);
+        }
+        let mut pending = self.pending;
+        if pending.link_lane_is_pending(self.tip_slot) {
+            PendingSplitTipDecision::check_lane_with_digest(
+                &mut pending.link_lanes,
+                self.tip_slot,
+                tip_class_r1cs,
+                "link",
+                actual_digest,
+            )
+            .map_err(|_| LinkProofError::AccumulatorClaimMismatch)?;
+        }
+        Ok(pending)
+    }
+}
+
+/// Replay the tip proof and both published whitelists without constructing a
+/// generic lincheck comb or a CSC matrix.  The returned typestate is still not
+/// an acceptance result and must be discharged against the canonical CSR.
+pub fn begin_tip_split_decision_deferred_matrix(
+    tip_class: &SplitLinkClass,
+    tip: &LinkProofEnvelope,
+    link_class_digests: &[[u8; 32]],
+    link_post_commit_class_digests: &[[u8; 32]],
+) -> Result<DeferredSplitTipDecision, String> {
+    let n = tip_class.ladder.len();
+    assert_eq!(link_class_digests.len(), n);
+    assert_eq!(link_post_commit_class_digests.len(), n);
+
+    let mut ch = FsLaneChallenger::new(b"history-link-v0");
+    let (_claim, fresh) = verify_split_link_proof_deferred_matrix(tip_class, tip, &mut ch)
+        .map_err(|error| format!("tip proof rejected: {error:?}"))?;
+    let pending = pending_tip_split_decision_after_verified_proof(
+        tip_class,
+        tip,
+        link_class_digests,
+        link_post_commit_class_digests,
+    )?;
+    Ok(DeferredSplitTipDecision {
+        pending,
+        fresh,
+        tip_slot: tip_class.slot,
+        expected_shape: tip_class.shape,
+        expected_digest: link_class_digests[tip_class.slot],
+    })
+}
+
+/// Verify the tip proof and both published class whitelists, then return the
+/// one-shot set of live matrix claims. Matrix evaluation is intentionally
+/// deferred so a synchronizing node can rebuild/load and release one local
+/// class matrix at a time.
+///
+/// This compatibility path retains the generic full Field verifier. New
+/// bounded-memory terminal verification uses
+/// [`begin_tip_split_decision_deferred_matrix`] and discharges its typestate
+/// over the already leased CSR.
+pub fn begin_tip_split_decision(
+    tip_class: &SplitLinkClass,
+    tip_class_r1cs: &FieldR1cs,
+    tip: &LinkProofEnvelope,
+    link_class_digests: &[[u8; 32]],
+    link_post_commit_class_digests: &[[u8; 32]],
+) -> Result<PendingSplitTipDecision, String> {
+    let n = tip_class.ladder.len();
+    assert_eq!(link_class_digests.len(), n);
+    assert_eq!(link_post_commit_class_digests.len(), n);
+
+    if tip_class_r1cs.structural_statement_digest() != link_class_digests[tip_class.slot] {
+        return Err("tip class matrix is not the published one".into());
+    }
+
+    let mut ch = FsLaneChallenger::new(b"history-link-v0");
+    verify_split_link_proof(tip_class, tip_class_r1cs, tip, &mut ch)
+        .map_err(|e| format!("tip proof rejected: {e:?}"))?;
+    pending_tip_split_decision_after_verified_proof(
+        tip_class,
+        tip,
+        link_class_digests,
+        link_post_commit_class_digests,
+    )
 }
 
 /// The split-chain decider: natively verify the tip against its published
@@ -3745,6 +3914,116 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    fn deferred_test_decision(
+        matrix: &FieldR1cs,
+        fresh: FreshLincheckClaim,
+    ) -> DeferredSplitTipDecision {
+        DeferredSplitTipDecision {
+            pending: pending_test_decision(&[Some(matrix)], &[]),
+            fresh,
+            tip_slot: 0,
+            expected_shape: FieldShape::of(matrix),
+            expected_digest: matrix.structural_statement_digest(),
+        }
+    }
+
+    #[test]
+    fn deferred_tip_csr_discharge_accepts_exact_fresh_claim() {
+        let matrix = decider_test_matrix(0);
+        let fresh = fold_test_fresh(&matrix, 0xD15C_AA6E);
+        deferred_test_decision(&matrix, fresh)
+            .discharge_tip_matrix(&matrix)
+            .expect("honest fresh claim must discharge")
+            .finish()
+            .expect("empty test lane set is complete");
+    }
+
+    #[test]
+    fn deferred_tip_csr_discharge_rejects_omitted_wrong_and_mutated_claim_authority() {
+        let matrix = decider_test_matrix(0);
+
+        // An omitted/defaulted final value cannot turn deferred verification
+        // into acceptance.  Make the sentinel differ deterministically even
+        // in the negligible case where the true value itself is zero.
+        let mut omitted = fold_test_fresh(&matrix, 0x0A11_77ED);
+        let true_value = omitted.value;
+        omitted.value = F128::ZERO;
+        if omitted.value == true_value {
+            omitted.value = F128::ONE;
+        }
+        assert_eq!(
+            deferred_test_decision(&matrix, omitted)
+                .discharge_tip_matrix(&matrix)
+                .err()
+                .expect("omitted claim value must reject"),
+            LinkProofError::MatrixClaimMismatch
+        );
+
+        let mut wrong = fold_test_fresh(&matrix, 0xBAD0_C1A1);
+        wrong.value += F128::ONE;
+        assert_eq!(
+            deferred_test_decision(&matrix, wrong)
+                .discharge_tip_matrix(&matrix)
+                .err()
+                .expect("wrong claim value must reject"),
+            LinkProofError::MatrixClaimMismatch
+        );
+
+        let fresh = fold_test_fresh(&matrix, 0x51A7_EE55);
+        let substituted = decider_test_matrix(91);
+        substituted.seed_statement_digest(matrix.structural_statement_digest());
+        assert_eq!(
+            deferred_test_decision(&matrix, fresh.clone())
+                .discharge_tip_matrix(&substituted)
+                .err()
+                .expect("mutated CSR must reject"),
+            LinkProofError::MatrixMismatch,
+            "a seeded digest cache cannot hide mutated CSR entries"
+        );
+
+        let mut wrong_shape = decider_test_matrix(0);
+        wrong_shape.m += 1;
+        assert_eq!(
+            deferred_test_decision(&matrix, fresh)
+                .discharge_tip_matrix(&wrong_shape)
+                .err()
+                .expect("wrong matrix shape must reject"),
+            LinkProofError::MatrixMismatch
+        );
+
+        let fresh = fold_test_fresh(&matrix, 0xACC0_0BAD);
+        let mut false_accumulator = deferred_test_decision(&matrix, fresh);
+        match &mut false_accumulator.pending.link_lanes[0] {
+            PendingMatrixLane::Pending { claim, .. } => claim.value += F128::ONE,
+            _ => panic!("test tip lane must be live and pending"),
+        }
+        assert_eq!(
+            false_accumulator
+                .discharge_tip_matrix(&matrix)
+                .err()
+                .expect("false tip accumulator must reject"),
+            LinkProofError::AccumulatorClaimMismatch
+        );
+    }
+
+    #[test]
+    fn deferred_tip_typestate_exposes_no_omission_acceptance_path() {
+        let source = include_str!("split_link.rs");
+        let declaration = source
+            .split("pub struct DeferredSplitTipDecision {")
+            .nth(1)
+            .expect("deferred tip typestate")
+            .split("pub fn begin_tip_split_decision_deferred_matrix(")
+            .next()
+            .expect("deferred tip implementation boundary");
+        assert!(declaration.contains("pub fn discharge_tip_matrix("));
+        assert!(!declaration.contains("pub fn finish("));
+        assert!(!declaration.contains("pub fresh:"));
+        assert!(
+            source.contains("fresh_claim_value(tip_class_r1cs, &self.fresh) != self.fresh.value")
+        );
     }
 
     #[test]

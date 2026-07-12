@@ -135,8 +135,9 @@ pub use pow_header::{
 pub use selected_history::{
     decode_selected_history_terminal_package, encode_selected_history_terminal_package,
     verify_selected_history_terminal, CanonicalSelectedHistoryRegistry, SelectedHistoryCodecError,
-    SelectedHistoryMatrixFamily, SelectedHistoryMatrixRequest, SelectedHistoryRegistryError,
-    SelectedHistoryTerminalPackage, SelectedHistoryVerificationError,
-    MAX_SELECTED_HISTORY_TERMINAL_ENVELOPE_BYTES, MAX_SELECTED_HISTORY_TERMINAL_PACKAGE_BYTES,
-    SELECTED_HISTORY_LINK_IO_LANES, SELECTED_HISTORY_TERMINAL_VERSION,
+    SelectedHistoryMatrixFamily, SelectedHistoryMatrixLease, SelectedHistoryMatrixRequest,
+    SelectedHistoryMatrixSource, SelectedHistoryRegistryError, SelectedHistoryTerminalPackage,
+    SelectedHistoryVerificationError, MAX_SELECTED_HISTORY_TERMINAL_ENVELOPE_BYTES,
+    MAX_SELECTED_HISTORY_TERMINAL_PACKAGE_BYTES, SELECTED_HISTORY_LINK_IO_LANES,
+    SELECTED_HISTORY_TERMINAL_VERSION,
 };
