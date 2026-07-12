@@ -22,6 +22,8 @@
 
 use crate::field::F128;
 use crate::lincheck::LincheckCircuit;
+use std::fmt;
+use std::io::{self, Read, Write};
 
 /// Interns F128 coefficients into a dedup'd table + `u32` indices, preserving
 /// first-seen order (deterministic for a fixed construction sequence).
@@ -256,7 +258,1071 @@ impl Clone for FieldR1cs {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Canonical matrix artifact codec
+// ---------------------------------------------------------------------------
+
+/// Magic prefix of the canonical on-disk [`FieldR1cs`] artifact.
+pub const FIELD_R1CS_ARTIFACT_MAGIC: [u8; 8] = *b"NOIDR1CS";
+/// First canonical artifact version. All integers, including field limbs, are
+/// encoded little-endian.
+pub const FIELD_R1CS_ARTIFACT_VERSION: u16 = 1;
+
+// The complete fixed header is deliberately 128 bytes:
+// magic/version/header-size/total-size, the FieldR1cs parameters, then two
+// five-u64 matrix descriptors (rows, columns, nnz, values, offsets).
+const FIELD_R1CS_ARTIFACT_HEADER_BYTES: usize = 128;
+const FIELD_R1CS_ARTIFACT_IO_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Identifies one base matrix in a malformed artifact error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FieldR1csArtifactMatrix {
+    A,
+    B,
+}
+
+/// Fail-closed error returned by the canonical matrix artifact codec.
+#[derive(Debug)]
+pub enum FieldR1csArtifactError {
+    Io(io::Error),
+    Truncated {
+        offset: u64,
+        needed: usize,
+    },
+    TrailingBytes,
+    InvalidMagic,
+    UnsupportedVersion {
+        actual: u16,
+    },
+    InvalidHeaderLength {
+        actual: u16,
+    },
+    InvalidShape(&'static str),
+    ShapeMismatch {
+        field: &'static str,
+        expected: u64,
+        actual: u64,
+    },
+    MatrixDimensions {
+        matrix: FieldR1csArtifactMatrix,
+        expected: u64,
+        rows: u64,
+        cols: u64,
+    },
+    MatrixLengthMismatch {
+        matrix: FieldR1csArtifactMatrix,
+        field: &'static str,
+        expected: u64,
+        actual: u64,
+    },
+    CountOutOfRange {
+        matrix: FieldR1csArtifactMatrix,
+        field: &'static str,
+        actual: u64,
+        maximum: u64,
+    },
+    LengthArithmetic,
+    TotalLengthMismatch {
+        declared: u64,
+        computed: u64,
+    },
+    TooLarge {
+        actual: u64,
+        max: usize,
+    },
+    Allocation {
+        matrix: FieldR1csArtifactMatrix,
+        field: &'static str,
+    },
+    InvalidRowOffset {
+        matrix: FieldR1csArtifactMatrix,
+        index: usize,
+        previous: usize,
+        actual: u64,
+        nnz: usize,
+    },
+    InvalidColumn {
+        matrix: FieldR1csArtifactMatrix,
+        index: usize,
+        actual: u32,
+        num_cols: usize,
+    },
+    InvalidValueIndex {
+        matrix: FieldR1csArtifactMatrix,
+        index: usize,
+        actual: u32,
+        value_count: usize,
+    },
+    NonCanonicalValueCount {
+        matrix: FieldR1csArtifactMatrix,
+        values: u64,
+        nnz: u64,
+    },
+    NonCanonicalValueIndexOrder {
+        matrix: FieldR1csArtifactMatrix,
+        index: usize,
+        expected_next: usize,
+        actual: u32,
+    },
+    UnusedCoefficient {
+        matrix: FieldR1csArtifactMatrix,
+        index: usize,
+    },
+    ZeroCoefficient {
+        matrix: FieldR1csArtifactMatrix,
+        index: usize,
+    },
+    DuplicateCoefficient {
+        matrix: FieldR1csArtifactMatrix,
+        first: usize,
+        duplicate: usize,
+    },
+    StructuralDigestMismatch {
+        expected: [u8; 32],
+        actual: [u8; 32],
+    },
+}
+
+impl fmt::Display for FieldR1csArtifactError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => write!(f, "FieldR1cs artifact I/O: {error}"),
+            other => write!(f, "{other:?}"),
+        }
+    }
+}
+
+impl std::error::Error for FieldR1csArtifactError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<io::Error> for FieldR1csArtifactError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ArtifactMatrixCounts {
+    rows: u64,
+    cols: u64,
+    nnz: u64,
+    values: u64,
+    offsets: u64,
+}
+
+impl ArtifactMatrixCounts {
+    fn encoded_bytes(self) -> Result<u64, FieldR1csArtifactError> {
+        self.offsets
+            .checked_mul(8)
+            .and_then(|bytes| self.nnz.checked_mul(8).and_then(|n| bytes.checked_add(n)))
+            .and_then(|bytes| {
+                self.values
+                    .checked_mul(16)
+                    .and_then(|n| bytes.checked_add(n))
+            })
+            .ok_or(FieldR1csArtifactError::LengthArithmetic)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ArtifactHeader {
+    total_bytes: u64,
+    m: u32,
+    k_log: u32,
+    k_skip: u32,
+    useful_rows: u64,
+    const_pin_plus_one: u64,
+    matrices: [ArtifactMatrixCounts; 2],
+}
+
+/// Small canonical coefficient dictionary prepared for one matrix while its
+/// existing CSR arrays stay in place. Builder-produced matrices may share a
+/// superset dictionary between A and B; the artifact never persists that
+/// non-canonical representation.
+struct CanonicalArtifactDictionary {
+    by_value: std::collections::HashMap<u128, u32>,
+    values: Vec<F128>,
+}
+
+impl ArtifactHeader {
+    fn computed_bytes(self) -> Result<u64, FieldR1csArtifactError> {
+        self.matrices
+            .iter()
+            .try_fold(FIELD_R1CS_ARTIFACT_HEADER_BYTES as u64, |total, matrix| {
+                total
+                    .checked_add(matrix.encoded_bytes()?)
+                    .ok_or(FieldR1csArtifactError::LengthArithmetic)
+            })
+    }
+}
+
+fn artifact_matrix_name(index: usize) -> FieldR1csArtifactMatrix {
+    if index == 0 {
+        FieldR1csArtifactMatrix::A
+    } else {
+        FieldR1csArtifactMatrix::B
+    }
+}
+
+fn checked_u64(value: usize) -> Result<u64, FieldR1csArtifactError> {
+    u64::try_from(value).map_err(|_| FieldR1csArtifactError::LengthArithmetic)
+}
+
+fn validate_artifact_shape(
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_rows: usize,
+    const_pin: Option<usize>,
+) -> Result<usize, FieldR1csArtifactError> {
+    if k_skip > k_log {
+        return Err(FieldR1csArtifactError::InvalidShape("k_skip > k_log"));
+    }
+    if k_log > m {
+        return Err(FieldR1csArtifactError::InvalidShape("k_log > m"));
+    }
+    if m >= usize::BITS as usize {
+        return Err(FieldR1csArtifactError::InvalidShape(
+            "m is outside the usize power-of-two domain",
+        ));
+    }
+    let k = 1usize
+        .checked_shl(
+            u32::try_from(k_log)
+                .map_err(|_| FieldR1csArtifactError::InvalidShape("k_log is too large"))?,
+        )
+        .ok_or(FieldR1csArtifactError::InvalidShape(
+            "k_log is outside the usize power-of-two domain",
+        ))?;
+    if useful_rows > k {
+        return Err(FieldR1csArtifactError::InvalidShape("useful_rows > k"));
+    }
+    if const_pin.is_some_and(|column| column >= k) {
+        return Err(FieldR1csArtifactError::InvalidShape(
+            "const_pin is outside the base matrix",
+        ));
+    }
+    Ok(k)
+}
+
+fn validate_sparse_artifact_matrix(
+    matrix: &SparseFieldMatrix,
+    side: FieldR1csArtifactMatrix,
+    k: usize,
+) -> Result<(ArtifactMatrixCounts, CanonicalArtifactDictionary), FieldR1csArtifactError> {
+    let expected = checked_u64(k)?;
+    if matrix.num_rows != k || matrix.num_cols != k {
+        return Err(FieldR1csArtifactError::MatrixDimensions {
+            matrix: side,
+            expected,
+            rows: checked_u64(matrix.num_rows)?,
+            cols: checked_u64(matrix.num_cols)?,
+        });
+    }
+    let nnz = matrix.col_indices.len();
+    if matrix.value_indices.len() != nnz {
+        return Err(FieldR1csArtifactError::MatrixLengthMismatch {
+            matrix: side,
+            field: "value_indices",
+            expected: checked_u64(nnz)?,
+            actual: checked_u64(matrix.value_indices.len())?,
+        });
+    }
+    let expected_offsets = k
+        .checked_add(1)
+        .ok_or(FieldR1csArtifactError::LengthArithmetic)?;
+    if matrix.row_offsets.len() != expected_offsets {
+        return Err(FieldR1csArtifactError::MatrixLengthMismatch {
+            matrix: side,
+            field: "row_offsets",
+            expected: checked_u64(expected_offsets)?,
+            actual: checked_u64(matrix.row_offsets.len())?,
+        });
+    }
+    if checked_u64(nnz)? > u32::MAX as u64 {
+        return Err(FieldR1csArtifactError::CountOutOfRange {
+            matrix: side,
+            field: "nnz",
+            actual: checked_u64(nnz)?,
+            maximum: u32::MAX as u64,
+        });
+    }
+    if checked_u64(matrix.value_table.len())? > u32::MAX as u64 {
+        return Err(FieldR1csArtifactError::CountOutOfRange {
+            matrix: side,
+            field: "values",
+            actual: checked_u64(matrix.value_table.len())?,
+            maximum: u32::MAX as u64,
+        });
+    }
+
+    let mut previous = 0usize;
+    for (index, &actual) in matrix.row_offsets.iter().enumerate() {
+        if (index == 0 && actual != 0) || actual < previous || actual > nnz {
+            return Err(FieldR1csArtifactError::InvalidRowOffset {
+                matrix: side,
+                index,
+                previous,
+                actual: checked_u64(actual)?,
+                nnz,
+            });
+        }
+        previous = actual;
+    }
+    if previous != nnz {
+        return Err(FieldR1csArtifactError::InvalidRowOffset {
+            matrix: side,
+            index: matrix.row_offsets.len() - 1,
+            previous,
+            actual: checked_u64(previous)?,
+            nnz,
+        });
+    }
+    for (index, &column) in matrix.col_indices.iter().enumerate() {
+        if column as usize >= matrix.num_cols {
+            return Err(FieldR1csArtifactError::InvalidColumn {
+                matrix: side,
+                index,
+                actual: column,
+                num_cols: matrix.num_cols,
+            });
+        }
+    }
+    for (index, &value_index) in matrix.value_indices.iter().enumerate() {
+        if value_index as usize >= matrix.value_table.len() {
+            return Err(FieldR1csArtifactError::InvalidValueIndex {
+                matrix: side,
+                index,
+                actual: value_index,
+                value_count: matrix.value_table.len(),
+            });
+        }
+    }
+    for (index, &value) in matrix.value_table.iter().enumerate() {
+        if value == F128::ZERO {
+            return Err(FieldR1csArtifactError::ZeroCoefficient {
+                matrix: side,
+                index,
+            });
+        }
+    }
+
+    // Re-intern by decoded coefficient in first-use order. This is bounded by
+    // the small protocol coefficient alphabet and does not copy either CSR
+    // index array.
+    let mut dictionary = CanonicalArtifactDictionary {
+        by_value: std::collections::HashMap::new(),
+        values: Vec::new(),
+    };
+    for &source_index in &matrix.value_indices {
+        let value = matrix.value_table[source_index as usize];
+        let key = ((value.hi as u128) << 64) | value.lo as u128;
+        if !dictionary.by_value.contains_key(&key) {
+            dictionary
+                .by_value
+                .try_reserve(1)
+                .map_err(|_| FieldR1csArtifactError::Allocation {
+                    matrix: side,
+                    field: "canonical coefficient map",
+                })?;
+            dictionary
+                .values
+                .try_reserve(1)
+                .map_err(|_| FieldR1csArtifactError::Allocation {
+                    matrix: side,
+                    field: "canonical coefficient table",
+                })?;
+            let actual = checked_u64(dictionary.values.len())?;
+            let canonical_index = u32::try_from(dictionary.values.len()).map_err(|_| {
+                FieldR1csArtifactError::CountOutOfRange {
+                    matrix: side,
+                    field: "canonical values",
+                    actual,
+                    maximum: u32::MAX as u64,
+                }
+            })?;
+            dictionary.by_value.insert(key, canonical_index);
+            dictionary.values.push(value);
+        }
+    }
+
+    Ok((
+        ArtifactMatrixCounts {
+            rows: expected,
+            cols: expected,
+            nnz: checked_u64(nnz)?,
+            values: checked_u64(dictionary.values.len())?,
+            offsets: checked_u64(expected_offsets)?,
+        },
+        dictionary,
+    ))
+}
+
+fn validate_unique_nonzero_coefficients(
+    value_table: &[F128],
+    matrix: FieldR1csArtifactMatrix,
+) -> Result<(), FieldR1csArtifactError> {
+    // A u32 permutation costs 4 bytes per 16-byte coefficient, substantially
+    // less peak memory than a HashSet while preserving O(v log v) rejection
+    // for a maliciously large declared dictionary.
+    let mut order = Vec::new();
+    order
+        .try_reserve_exact(value_table.len())
+        .map_err(|_| FieldR1csArtifactError::Allocation {
+            matrix,
+            field: "coefficient uniqueness order",
+        })?;
+    for (index, &value) in value_table.iter().enumerate() {
+        if value == F128::ZERO {
+            return Err(FieldR1csArtifactError::ZeroCoefficient { matrix, index });
+        }
+        order.push(
+            u32::try_from(index).map_err(|_| FieldR1csArtifactError::CountOutOfRange {
+                matrix,
+                field: "values",
+                actual: index as u64,
+                maximum: u32::MAX as u64,
+            })?,
+        );
+    }
+    order.sort_unstable_by_key(|&index| {
+        let value = value_table[index as usize];
+        ((value.hi as u128) << 64) | value.lo as u128
+    });
+    for pair in order.windows(2) {
+        let first = pair[0] as usize;
+        let duplicate = pair[1] as usize;
+        if value_table[first] == value_table[duplicate] {
+            return Err(FieldR1csArtifactError::DuplicateCoefficient {
+                matrix,
+                first,
+                duplicate,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn write_u32_slice<W: Write + ?Sized>(
+    writer: &mut W,
+    values: &[u32],
+) -> Result<(), FieldR1csArtifactError> {
+    let mut scratch = [0u8; FIELD_R1CS_ARTIFACT_IO_CHUNK_BYTES];
+    for chunk in values.chunks(FIELD_R1CS_ARTIFACT_IO_CHUNK_BYTES / 4) {
+        for (bytes, value) in scratch.chunks_exact_mut(4).zip(chunk) {
+            bytes.copy_from_slice(&value.to_le_bytes());
+        }
+        writer.write_all(&scratch[..chunk.len() * 4])?;
+    }
+    Ok(())
+}
+
+fn write_canonical_value_indices<W: Write + ?Sized>(
+    writer: &mut W,
+    matrix: &SparseFieldMatrix,
+    dictionary: &CanonicalArtifactDictionary,
+) -> Result<(), FieldR1csArtifactError> {
+    let mut scratch = [0u8; FIELD_R1CS_ARTIFACT_IO_CHUNK_BYTES];
+    for chunk in matrix
+        .value_indices
+        .chunks(FIELD_R1CS_ARTIFACT_IO_CHUNK_BYTES / 4)
+    {
+        for (bytes, &source_index) in scratch.chunks_exact_mut(4).zip(chunk) {
+            let value = matrix.value_table[source_index as usize];
+            let key = ((value.hi as u128) << 64) | value.lo as u128;
+            let canonical_index = dictionary
+                .by_value
+                .get(&key)
+                .copied()
+                .expect("validated coefficient was installed in canonical dictionary");
+            bytes.copy_from_slice(&canonical_index.to_le_bytes());
+        }
+        writer.write_all(&scratch[..chunk.len() * 4])?;
+    }
+    Ok(())
+}
+
+fn write_usize_as_u64_slice<W: Write + ?Sized>(
+    writer: &mut W,
+    values: &[usize],
+) -> Result<(), FieldR1csArtifactError> {
+    let mut scratch = [0u8; FIELD_R1CS_ARTIFACT_IO_CHUNK_BYTES];
+    for chunk in values.chunks(FIELD_R1CS_ARTIFACT_IO_CHUNK_BYTES / 8) {
+        for (bytes, &value) in scratch.chunks_exact_mut(8).zip(chunk) {
+            bytes.copy_from_slice(&checked_u64(value)?.to_le_bytes());
+        }
+        writer.write_all(&scratch[..chunk.len() * 8])?;
+    }
+    Ok(())
+}
+
+fn write_f128_slice<W: Write + ?Sized>(
+    writer: &mut W,
+    values: &[F128],
+) -> Result<(), FieldR1csArtifactError> {
+    let mut scratch = [0u8; FIELD_R1CS_ARTIFACT_IO_CHUNK_BYTES];
+    for chunk in values.chunks(FIELD_R1CS_ARTIFACT_IO_CHUNK_BYTES / 16) {
+        for (bytes, value) in scratch.chunks_exact_mut(16).zip(chunk) {
+            bytes[..8].copy_from_slice(&value.lo.to_le_bytes());
+            bytes[8..].copy_from_slice(&value.hi.to_le_bytes());
+        }
+        writer.write_all(&scratch[..chunk.len() * 16])?;
+    }
+    Ok(())
+}
+
+fn read_exact_artifact<R: Read + ?Sized>(
+    reader: &mut R,
+    bytes: &mut [u8],
+    offset: &mut u64,
+) -> Result<(), FieldR1csArtifactError> {
+    match reader.read_exact(bytes) {
+        Ok(()) => {
+            *offset = offset
+                .checked_add(bytes.len() as u64)
+                .ok_or(FieldR1csArtifactError::LengthArithmetic)?;
+            Ok(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+            Err(FieldR1csArtifactError::Truncated {
+                offset: *offset,
+                needed: bytes.len(),
+            })
+        }
+        Err(error) => Err(FieldR1csArtifactError::Io(error)),
+    }
+}
+
+fn reserve_artifact_vec<T>(
+    length: usize,
+    matrix: FieldR1csArtifactMatrix,
+    field: &'static str,
+) -> Result<Vec<T>, FieldR1csArtifactError> {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(length)
+        .map_err(|_| FieldR1csArtifactError::Allocation { matrix, field })?;
+    Ok(values)
+}
+
+fn read_u32_vec<R: Read + ?Sized, F>(
+    reader: &mut R,
+    offset: &mut u64,
+    length: usize,
+    matrix: FieldR1csArtifactMatrix,
+    field: &'static str,
+    mut validate: F,
+) -> Result<Vec<u32>, FieldR1csArtifactError>
+where
+    F: FnMut(usize, u32) -> Result<(), FieldR1csArtifactError>,
+{
+    let mut values = reserve_artifact_vec(length, matrix, field)?;
+    let mut scratch = [0u8; FIELD_R1CS_ARTIFACT_IO_CHUNK_BYTES];
+    while values.len() < length {
+        let count = (length - values.len()).min(FIELD_R1CS_ARTIFACT_IO_CHUNK_BYTES / 4);
+        read_exact_artifact(reader, &mut scratch[..count * 4], offset)?;
+        for bytes in scratch[..count * 4].chunks_exact(4) {
+            let value = u32::from_le_bytes(bytes.try_into().expect("four-byte chunk"));
+            validate(values.len(), value)?;
+            values.push(value);
+        }
+    }
+    Ok(values)
+}
+
+fn read_row_offsets<R: Read + ?Sized>(
+    reader: &mut R,
+    offset: &mut u64,
+    length: usize,
+    nnz: usize,
+    matrix: FieldR1csArtifactMatrix,
+) -> Result<Vec<usize>, FieldR1csArtifactError> {
+    let mut values = reserve_artifact_vec(length, matrix, "row_offsets")?;
+    let mut scratch = [0u8; FIELD_R1CS_ARTIFACT_IO_CHUNK_BYTES];
+    while values.len() < length {
+        let count = (length - values.len()).min(FIELD_R1CS_ARTIFACT_IO_CHUNK_BYTES / 8);
+        read_exact_artifact(reader, &mut scratch[..count * 8], offset)?;
+        for bytes in scratch[..count * 8].chunks_exact(8) {
+            let raw = u64::from_le_bytes(bytes.try_into().expect("eight-byte chunk"));
+            let index = values.len();
+            let previous = values.last().copied().unwrap_or(0);
+            let value =
+                usize::try_from(raw).map_err(|_| FieldR1csArtifactError::InvalidRowOffset {
+                    matrix,
+                    index,
+                    previous,
+                    actual: raw,
+                    nnz,
+                })?;
+            if (index == 0 && value != 0) || value < previous || value > nnz {
+                return Err(FieldR1csArtifactError::InvalidRowOffset {
+                    matrix,
+                    index,
+                    previous,
+                    actual: raw,
+                    nnz,
+                });
+            }
+            values.push(value);
+        }
+    }
+    let final_offset = values.last().copied().unwrap_or(usize::MAX);
+    if final_offset != nnz {
+        return Err(FieldR1csArtifactError::InvalidRowOffset {
+            matrix,
+            index: length.saturating_sub(1),
+            previous: final_offset,
+            actual: final_offset as u64,
+            nnz,
+        });
+    }
+    Ok(values)
+}
+
+fn read_f128_vec<R: Read + ?Sized>(
+    reader: &mut R,
+    offset: &mut u64,
+    length: usize,
+    matrix: FieldR1csArtifactMatrix,
+) -> Result<Vec<F128>, FieldR1csArtifactError> {
+    let mut values = reserve_artifact_vec(length, matrix, "value_table")?;
+    let mut scratch = [0u8; FIELD_R1CS_ARTIFACT_IO_CHUNK_BYTES];
+    while values.len() < length {
+        let count = (length - values.len()).min(FIELD_R1CS_ARTIFACT_IO_CHUNK_BYTES / 16);
+        read_exact_artifact(reader, &mut scratch[..count * 16], offset)?;
+        for bytes in scratch[..count * 16].chunks_exact(16) {
+            let value = F128 {
+                lo: u64::from_le_bytes(bytes[..8].try_into().expect("low limb")),
+                hi: u64::from_le_bytes(bytes[8..].try_into().expect("high limb")),
+            };
+            if value == F128::ZERO {
+                return Err(FieldR1csArtifactError::ZeroCoefficient {
+                    matrix,
+                    index: values.len(),
+                });
+            }
+            values.push(value);
+        }
+    }
+    Ok(values)
+}
+
+fn push_header_u16(
+    header: &mut [u8; FIELD_R1CS_ARTIFACT_HEADER_BYTES],
+    at: &mut usize,
+    value: u16,
+) {
+    header[*at..*at + 2].copy_from_slice(&value.to_le_bytes());
+    *at += 2;
+}
+
+fn push_header_u32(
+    header: &mut [u8; FIELD_R1CS_ARTIFACT_HEADER_BYTES],
+    at: &mut usize,
+    value: u32,
+) {
+    header[*at..*at + 4].copy_from_slice(&value.to_le_bytes());
+    *at += 4;
+}
+
+fn push_header_u64(
+    header: &mut [u8; FIELD_R1CS_ARTIFACT_HEADER_BYTES],
+    at: &mut usize,
+    value: u64,
+) {
+    header[*at..*at + 8].copy_from_slice(&value.to_le_bytes());
+    *at += 8;
+}
+
+fn take_header_u16(header: &[u8; FIELD_R1CS_ARTIFACT_HEADER_BYTES], at: &mut usize) -> u16 {
+    let value = u16::from_le_bytes(header[*at..*at + 2].try_into().expect("header u16"));
+    *at += 2;
+    value
+}
+
+fn take_header_u32(header: &[u8; FIELD_R1CS_ARTIFACT_HEADER_BYTES], at: &mut usize) -> u32 {
+    let value = u32::from_le_bytes(header[*at..*at + 4].try_into().expect("header u32"));
+    *at += 4;
+    value
+}
+
+fn take_header_u64(header: &[u8; FIELD_R1CS_ARTIFACT_HEADER_BYTES], at: &mut usize) -> u64 {
+    let value = u64::from_le_bytes(header[*at..*at + 8].try_into().expect("header u64"));
+    *at += 8;
+    value
+}
+
 impl FieldR1cs {
+    /// Stream this canonical matrix artifact to `writer` without constructing
+    /// a second serialized matrix in memory.
+    ///
+    /// The writer is expected to be buffered by the caller when it is a raw
+    /// file. This method itself uses only one fixed 64-KiB conversion buffer.
+    pub fn write_artifact<W: Write + ?Sized>(
+        &self,
+        writer: &mut W,
+    ) -> Result<(), FieldR1csArtifactError> {
+        let k = validate_artifact_shape(
+            self.m,
+            self.k_log,
+            self.k_skip,
+            self.useful_rows,
+            self.const_pin,
+        )?;
+        let (a_counts, a_dictionary) =
+            validate_sparse_artifact_matrix(&self.a_0, FieldR1csArtifactMatrix::A, k)?;
+        let (b_counts, b_dictionary) =
+            validate_sparse_artifact_matrix(&self.b_0, FieldR1csArtifactMatrix::B, k)?;
+        let matrices = [a_counts, b_counts];
+        let m = u32::try_from(self.m)
+            .map_err(|_| FieldR1csArtifactError::InvalidShape("m does not fit u32"))?;
+        let k_log = u32::try_from(self.k_log)
+            .map_err(|_| FieldR1csArtifactError::InvalidShape("k_log does not fit u32"))?;
+        let k_skip = u32::try_from(self.k_skip)
+            .map_err(|_| FieldR1csArtifactError::InvalidShape("k_skip does not fit u32"))?;
+        let const_pin_plus_one = match self.const_pin {
+            None => 0,
+            Some(column) => checked_u64(
+                column
+                    .checked_add(1)
+                    .ok_or(FieldR1csArtifactError::LengthArithmetic)?,
+            )?,
+        };
+        let mut artifact = ArtifactHeader {
+            total_bytes: 0,
+            m,
+            k_log,
+            k_skip,
+            useful_rows: checked_u64(self.useful_rows)?,
+            const_pin_plus_one,
+            matrices,
+        };
+        artifact.total_bytes = artifact.computed_bytes()?;
+
+        let mut header = [0u8; FIELD_R1CS_ARTIFACT_HEADER_BYTES];
+        header[..FIELD_R1CS_ARTIFACT_MAGIC.len()].copy_from_slice(&FIELD_R1CS_ARTIFACT_MAGIC);
+        let mut at = FIELD_R1CS_ARTIFACT_MAGIC.len();
+        push_header_u16(&mut header, &mut at, FIELD_R1CS_ARTIFACT_VERSION);
+        push_header_u16(
+            &mut header,
+            &mut at,
+            FIELD_R1CS_ARTIFACT_HEADER_BYTES as u16,
+        );
+        push_header_u64(&mut header, &mut at, artifact.total_bytes);
+        push_header_u32(&mut header, &mut at, artifact.m);
+        push_header_u32(&mut header, &mut at, artifact.k_log);
+        push_header_u32(&mut header, &mut at, artifact.k_skip);
+        push_header_u64(&mut header, &mut at, artifact.useful_rows);
+        push_header_u64(&mut header, &mut at, artifact.const_pin_plus_one);
+        for matrix in artifact.matrices {
+            push_header_u64(&mut header, &mut at, matrix.rows);
+            push_header_u64(&mut header, &mut at, matrix.cols);
+            push_header_u64(&mut header, &mut at, matrix.nnz);
+            push_header_u64(&mut header, &mut at, matrix.values);
+            push_header_u64(&mut header, &mut at, matrix.offsets);
+        }
+        debug_assert_eq!(at, FIELD_R1CS_ARTIFACT_HEADER_BYTES);
+        writer.write_all(&header)?;
+
+        for (matrix, dictionary) in [(&self.a_0, &a_dictionary), (&self.b_0, &b_dictionary)] {
+            write_usize_as_u64_slice(writer, &matrix.row_offsets)?;
+            write_u32_slice(writer, &matrix.col_indices)?;
+            write_canonical_value_indices(writer, matrix, dictionary)?;
+            write_f128_slice(writer, &dictionary.values)?;
+        }
+        Ok(())
+    }
+
+    /// Load one canonical matrix artifact under local shape and structural
+    /// digest authority.
+    ///
+    /// Both descriptors and the complete byte arithmetic are checked against
+    /// `max_bytes` before the first matrix vector is allocated. The returned
+    /// object has empty digest and CSC caches; in particular the externally
+    /// supplied digest is never installed into the seedable digest cache.
+    pub fn read_artifact<R: Read + ?Sized>(
+        reader: &mut R,
+        expected_shape: crate::proof::FieldShape,
+        expected_structural_digest: [u8; 32],
+        max_bytes: usize,
+    ) -> Result<Self, FieldR1csArtifactError> {
+        if max_bytes < FIELD_R1CS_ARTIFACT_HEADER_BYTES {
+            return Err(FieldR1csArtifactError::TooLarge {
+                actual: FIELD_R1CS_ARTIFACT_HEADER_BYTES as u64,
+                max: max_bytes,
+            });
+        }
+        let expected_k = validate_artifact_shape(
+            expected_shape.m,
+            expected_shape.k_log,
+            expected_shape.k_skip,
+            0,
+            expected_shape.const_pin,
+        )?;
+        let expected_k_u64 = checked_u64(expected_k)?;
+
+        let mut offset = 0u64;
+        let mut header_bytes = [0u8; FIELD_R1CS_ARTIFACT_HEADER_BYTES];
+        read_exact_artifact(reader, &mut header_bytes, &mut offset)?;
+        if header_bytes[..FIELD_R1CS_ARTIFACT_MAGIC.len()] != FIELD_R1CS_ARTIFACT_MAGIC {
+            return Err(FieldR1csArtifactError::InvalidMagic);
+        }
+        let mut at = FIELD_R1CS_ARTIFACT_MAGIC.len();
+        let version = take_header_u16(&header_bytes, &mut at);
+        if version != FIELD_R1CS_ARTIFACT_VERSION {
+            return Err(FieldR1csArtifactError::UnsupportedVersion { actual: version });
+        }
+        let header_length = take_header_u16(&header_bytes, &mut at);
+        if header_length as usize != FIELD_R1CS_ARTIFACT_HEADER_BYTES {
+            return Err(FieldR1csArtifactError::InvalidHeaderLength {
+                actual: header_length,
+            });
+        }
+        let total_bytes = take_header_u64(&header_bytes, &mut at);
+        let m = take_header_u32(&header_bytes, &mut at);
+        let k_log = take_header_u32(&header_bytes, &mut at);
+        let k_skip = take_header_u32(&header_bytes, &mut at);
+        let useful_rows = take_header_u64(&header_bytes, &mut at);
+        let const_pin_plus_one = take_header_u64(&header_bytes, &mut at);
+        let mut matrices = [ArtifactMatrixCounts {
+            rows: 0,
+            cols: 0,
+            nnz: 0,
+            values: 0,
+            offsets: 0,
+        }; 2];
+        for matrix in &mut matrices {
+            matrix.rows = take_header_u64(&header_bytes, &mut at);
+            matrix.cols = take_header_u64(&header_bytes, &mut at);
+            matrix.nnz = take_header_u64(&header_bytes, &mut at);
+            matrix.values = take_header_u64(&header_bytes, &mut at);
+            matrix.offsets = take_header_u64(&header_bytes, &mut at);
+        }
+        debug_assert_eq!(at, FIELD_R1CS_ARTIFACT_HEADER_BYTES);
+        let artifact = ArtifactHeader {
+            total_bytes,
+            m,
+            k_log,
+            k_skip,
+            useful_rows,
+            const_pin_plus_one,
+            matrices,
+        };
+
+        let compare_shape = |field: &'static str,
+                             expected: usize,
+                             actual: u64|
+         -> Result<(), FieldR1csArtifactError> {
+            let expected = checked_u64(expected)?;
+            if actual != expected {
+                return Err(FieldR1csArtifactError::ShapeMismatch {
+                    field,
+                    expected,
+                    actual,
+                });
+            }
+            Ok(())
+        };
+        compare_shape("m", expected_shape.m, u64::from(artifact.m))?;
+        compare_shape("k_log", expected_shape.k_log, u64::from(artifact.k_log))?;
+        compare_shape("k_skip", expected_shape.k_skip, u64::from(artifact.k_skip))?;
+        let expected_pin_plus_one = match expected_shape.const_pin {
+            None => 0,
+            Some(column) => checked_u64(
+                column
+                    .checked_add(1)
+                    .ok_or(FieldR1csArtifactError::LengthArithmetic)?,
+            )?,
+        };
+        if artifact.const_pin_plus_one != expected_pin_plus_one {
+            return Err(FieldR1csArtifactError::ShapeMismatch {
+                field: "const_pin",
+                expected: expected_pin_plus_one,
+                actual: artifact.const_pin_plus_one,
+            });
+        }
+        let useful_rows = usize::try_from(artifact.useful_rows)
+            .map_err(|_| FieldR1csArtifactError::InvalidShape("useful_rows does not fit usize"))?;
+        validate_artifact_shape(
+            expected_shape.m,
+            expected_shape.k_log,
+            expected_shape.k_skip,
+            useful_rows,
+            expected_shape.const_pin,
+        )?;
+
+        let expected_offsets = expected_k_u64
+            .checked_add(1)
+            .ok_or(FieldR1csArtifactError::LengthArithmetic)?;
+        for (index, matrix) in artifact.matrices.iter().copied().enumerate() {
+            let side = artifact_matrix_name(index);
+            if matrix.rows != expected_k_u64 || matrix.cols != expected_k_u64 {
+                return Err(FieldR1csArtifactError::MatrixDimensions {
+                    matrix: side,
+                    expected: expected_k_u64,
+                    rows: matrix.rows,
+                    cols: matrix.cols,
+                });
+            }
+            if matrix.offsets != expected_offsets {
+                return Err(FieldR1csArtifactError::MatrixLengthMismatch {
+                    matrix: side,
+                    field: "row_offsets",
+                    expected: expected_offsets,
+                    actual: matrix.offsets,
+                });
+            }
+            for (field, count) in [("nnz", matrix.nnz), ("values", matrix.values)] {
+                if count > u32::MAX as u64 {
+                    return Err(FieldR1csArtifactError::CountOutOfRange {
+                        matrix: side,
+                        field,
+                        actual: count,
+                        maximum: u32::MAX as u64,
+                    });
+                }
+            }
+            if matrix.values > matrix.nnz || (matrix.nnz != 0 && matrix.values == 0) {
+                return Err(FieldR1csArtifactError::NonCanonicalValueCount {
+                    matrix: side,
+                    values: matrix.values,
+                    nnz: matrix.nnz,
+                });
+            }
+        }
+
+        let computed_bytes = artifact.computed_bytes()?;
+        if artifact.total_bytes != computed_bytes {
+            return Err(FieldR1csArtifactError::TotalLengthMismatch {
+                declared: artifact.total_bytes,
+                computed: computed_bytes,
+            });
+        }
+        let max_u64 = u64::try_from(max_bytes).unwrap_or(u64::MAX);
+        if computed_bytes > max_u64 {
+            return Err(FieldR1csArtifactError::TooLarge {
+                actual: computed_bytes,
+                max: max_bytes,
+            });
+        }
+
+        let mut decoded = Vec::with_capacity(2);
+        for (index, counts) in artifact.matrices.iter().copied().enumerate() {
+            let side = artifact_matrix_name(index);
+            let nnz = usize::try_from(counts.nnz)
+                .map_err(|_| FieldR1csArtifactError::LengthArithmetic)?;
+            let value_count = usize::try_from(counts.values)
+                .map_err(|_| FieldR1csArtifactError::LengthArithmetic)?;
+            let offset_count = usize::try_from(counts.offsets)
+                .map_err(|_| FieldR1csArtifactError::LengthArithmetic)?;
+            let row_offsets = read_row_offsets(reader, &mut offset, offset_count, nnz, side)?;
+            let col_indices = read_u32_vec(
+                reader,
+                &mut offset,
+                nnz,
+                side,
+                "col_indices",
+                |entry, column| {
+                    if column as usize >= expected_k {
+                        return Err(FieldR1csArtifactError::InvalidColumn {
+                            matrix: side,
+                            index: entry,
+                            actual: column,
+                            num_cols: expected_k,
+                        });
+                    }
+                    Ok(())
+                },
+            )?;
+            let mut next_value_index = 0usize;
+            let value_indices = read_u32_vec(
+                reader,
+                &mut offset,
+                nnz,
+                side,
+                "value_indices",
+                |entry, value_index| {
+                    if value_index as usize >= value_count {
+                        return Err(FieldR1csArtifactError::InvalidValueIndex {
+                            matrix: side,
+                            index: entry,
+                            actual: value_index,
+                            value_count,
+                        });
+                    }
+                    let actual = value_index as usize;
+                    if actual > next_value_index {
+                        return Err(FieldR1csArtifactError::NonCanonicalValueIndexOrder {
+                            matrix: side,
+                            index: entry,
+                            expected_next: next_value_index,
+                            actual: value_index,
+                        });
+                    }
+                    if actual == next_value_index {
+                        next_value_index += 1;
+                    }
+                    Ok(())
+                },
+            )?;
+            if next_value_index != value_count {
+                return Err(FieldR1csArtifactError::UnusedCoefficient {
+                    matrix: side,
+                    index: next_value_index,
+                });
+            }
+            let value_table = read_f128_vec(reader, &mut offset, value_count, side)?;
+            validate_unique_nonzero_coefficients(&value_table, side)?;
+            decoded.push(SparseFieldMatrix {
+                num_rows: expected_k,
+                num_cols: expected_k,
+                col_indices,
+                value_indices,
+                value_table,
+                row_offsets,
+            });
+        }
+        debug_assert_eq!(offset, computed_bytes);
+
+        let mut trailing = [0u8; 1];
+        loop {
+            match reader.read(&mut trailing) {
+                Ok(0) => break,
+                Ok(_) => return Err(FieldR1csArtifactError::TrailingBytes),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(FieldR1csArtifactError::Io(error)),
+            }
+        }
+
+        let b_0 = decoded.pop().expect("two matrices decoded");
+        let a_0 = decoded.pop().expect("two matrices decoded");
+        let r1cs = Self {
+            m: expected_shape.m,
+            k_log: expected_shape.k_log,
+            k_skip: expected_shape.k_skip,
+            useful_rows,
+            a_0,
+            b_0,
+            const_pin: expected_shape.const_pin,
+            digest_cache: std::sync::OnceLock::new(),
+            csc_cache: std::sync::OnceLock::new(),
+        };
+        let actual_digest = r1cs.structural_statement_digest();
+        if actual_digest != expected_structural_digest {
+            return Err(FieldR1csArtifactError::StructuralDigestMismatch {
+                expected: expected_structural_digest,
+                actual: actual_digest,
+            });
+        }
+        Ok(r1cs)
+    }
+
     pub fn n_outer(&self) -> usize {
         1usize << self.n_log()
     }
@@ -999,6 +2065,8 @@ pub fn synthetic_satisfiable(m: usize, k_log: usize, seed: u64) -> (FieldR1cs, V
 mod tests {
     use super::*;
     use crate::lincheck::build_eq_table;
+    use crate::proof::FieldShape;
+    use std::io::Cursor;
 
     struct Rng(u64);
     impl Rng {
@@ -1022,6 +2090,288 @@ mod tests {
 
     fn random_satisfiable(m: usize, k_log: usize, seed: u64) -> (FieldR1cs, Vec<F128>) {
         synthetic_satisfiable(m, k_log, seed)
+    }
+
+    fn artifact_fixture(seed: u64) -> (FieldR1cs, FieldShape, [u8; 32], Vec<u8>) {
+        let (r1cs, _) = random_satisfiable(8, 4, seed);
+        let shape = FieldShape::of(&r1cs);
+        let digest = r1cs.structural_statement_digest();
+        let mut bytes = Vec::new();
+        r1cs.write_artifact(&mut bytes).unwrap();
+        (r1cs, shape, digest, bytes)
+    }
+
+    fn decode_fixture(
+        bytes: &[u8],
+        shape: FieldShape,
+        digest: [u8; 32],
+    ) -> Result<FieldR1cs, FieldR1csArtifactError> {
+        FieldR1cs::read_artifact(&mut Cursor::new(bytes), shape, digest, bytes.len())
+    }
+
+    fn header_u64(bytes: &[u8], offset: usize) -> u64 {
+        u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+    }
+
+    fn set_header_u64(bytes: &mut [u8], offset: usize, value: u64) {
+        bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    #[test]
+    fn field_r1cs_artifact_roundtrip_has_empty_derived_caches() {
+        let (expected, shape, digest, bytes) = artifact_fixture(0xA271_FAC7);
+        assert_eq!(
+            header_u64(&bytes, 12) as usize,
+            bytes.len(),
+            "fixed header must bind the exact artifact length",
+        );
+
+        let decoded = decode_fixture(&bytes, shape, digest).unwrap();
+        assert_eq!(decoded.m, expected.m);
+        assert_eq!(decoded.k_log, expected.k_log);
+        assert_eq!(decoded.k_skip, expected.k_skip);
+        assert_eq!(decoded.useful_rows, expected.useful_rows);
+        assert_eq!(decoded.const_pin, expected.const_pin);
+        assert_eq!(decoded.a_0, expected.a_0);
+        assert_eq!(decoded.b_0, expected.b_0);
+        assert!(decoded.digest_cache.get().is_none());
+        assert!(decoded.csc_cache.get().is_none());
+        assert_eq!(decoded.structural_statement_digest(), digest);
+    }
+
+    #[test]
+    fn field_r1cs_artifact_writer_canonicalizes_shared_dictionary() {
+        let (honest, shape, digest, canonical_bytes) = artifact_fixture(0xCA10_D1C7);
+        let mut shared = honest.clone();
+
+        // Model the builder's shared A/B dictionary: reorder all A entries,
+        // remap the references so decoded rows stay identical, then retain an
+        // unused duplicate entry from the shared superset.
+        let value_count = shared.a_0.value_table.len();
+        assert!(value_count > 2);
+        shared.a_0.value_table.rotate_left(1);
+        for value_index in &mut shared.a_0.value_indices {
+            *value_index = (*value_index + value_count as u32 - 1) % value_count as u32;
+        }
+        shared.a_0.value_table.push(shared.a_0.value_table[0]);
+        assert_eq!(shared.a_0, honest.a_0);
+        assert_eq!(shared.structural_statement_digest(), digest);
+
+        let mut canonicalized = Vec::new();
+        shared.write_artifact(&mut canonicalized).unwrap();
+        assert_eq!(
+            canonicalized, canonical_bytes,
+            "writer must emit first-use per-matrix dictionaries, independent of builder interning",
+        );
+        let decoded = decode_fixture(&canonicalized, shape, digest).unwrap();
+        assert_eq!(decoded.a_0, honest.a_0);
+        assert_eq!(decoded.b_0, honest.b_0);
+    }
+
+    #[test]
+    fn field_r1cs_artifact_reader_rejects_semantic_dictionary_reordering() {
+        let (honest, shape, digest, mut bytes) = artifact_fixture(0x57A1_C7D1);
+        let a_nnz = header_u64(&bytes, 64) as usize;
+        let a_values = header_u64(&bytes, 72) as usize;
+        let a_offsets = header_u64(&bytes, 80) as usize;
+        assert!(a_values >= 2);
+        let value_indices_start = FIELD_R1CS_ARTIFACT_HEADER_BYTES + a_offsets * 8 + a_nnz * 4;
+        let values_start = value_indices_start + a_nnz * 4;
+
+        // Swap dictionary entries 0/1 and all of their references. The
+        // decoded coefficient in every row is unchanged, but the first used
+        // artifact index is now 1 rather than canonical index 0.
+        for encoded in bytes[value_indices_start..values_start].chunks_exact_mut(4) {
+            let index = u32::from_le_bytes(encoded.try_into().unwrap());
+            let remapped = match index {
+                0 => 1u32,
+                1 => 0u32,
+                other => other,
+            };
+            encoded.copy_from_slice(&remapped.to_le_bytes());
+        }
+        let first: [u8; 16] = bytes[values_start..values_start + 16].try_into().unwrap();
+        let second: [u8; 16] = bytes[values_start + 16..values_start + 32]
+            .try_into()
+            .unwrap();
+        bytes[values_start..values_start + 16].copy_from_slice(&second);
+        bytes[values_start + 16..values_start + 32].copy_from_slice(&first);
+
+        assert!(matches!(
+            decode_fixture(&bytes, shape, digest),
+            Err(FieldR1csArtifactError::NonCanonicalValueIndexOrder {
+                matrix: FieldR1csArtifactMatrix::A,
+                expected_next: 0,
+                actual: 1,
+                ..
+            })
+        ));
+        // Keep the semantic equivalence premise explicit and independent of
+        // the decoder under test.
+        let mut equivalent = honest.clone();
+        equivalent.a_0.value_table.swap(0, 1);
+        for index in &mut equivalent.a_0.value_indices {
+            *index = match *index {
+                0 => 1,
+                1 => 0,
+                other => other,
+            };
+        }
+        assert_eq!(equivalent.structural_statement_digest(), digest);
+    }
+
+    #[test]
+    fn field_r1cs_artifact_rejects_seeded_content_substitution() {
+        let (honest, shape, expected_digest, _) = artifact_fixture(0x0D16_5E57);
+        let mut substituted = honest.clone();
+        let entry = substituted.a_0.row_offsets[1];
+        substituted.a_0.col_indices[entry] =
+            (substituted.a_0.col_indices[entry] + 1) % substituted.a_0.num_cols as u32;
+        assert_ne!(substituted.structural_statement_digest(), expected_digest,);
+        substituted.seed_statement_digest(expected_digest);
+
+        let mut bytes = Vec::new();
+        substituted.write_artifact(&mut bytes).unwrap();
+        assert!(matches!(
+            decode_fixture(&bytes, shape, expected_digest),
+            Err(FieldR1csArtifactError::StructuralDigestMismatch { .. })
+        ));
+    }
+
+    struct CountingReader<'a> {
+        inner: Cursor<&'a [u8]>,
+        bytes_read: usize,
+    }
+
+    impl Read for CountingReader<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let read = self.inner.read(buffer)?;
+            self.bytes_read += read;
+            Ok(read)
+        }
+    }
+
+    #[test]
+    fn field_r1cs_artifact_rejects_forged_huge_counts_before_payload() {
+        let (_, shape, digest, mut bytes) = artifact_fixture(0xC0A1_7001);
+        // A.nnz is the third u64 of the first descriptor.
+        set_header_u64(&mut bytes, 64, u64::MAX);
+        let max_bytes = bytes.len();
+        let mut reader = CountingReader {
+            inner: Cursor::new(bytes.as_slice()),
+            bytes_read: 0,
+        };
+        assert!(matches!(
+            FieldR1cs::read_artifact(&mut reader, shape, digest, max_bytes),
+            Err(FieldR1csArtifactError::CountOutOfRange {
+                matrix: FieldR1csArtifactMatrix::A,
+                field: "nnz",
+                ..
+            })
+        ));
+        assert_eq!(
+            reader.bytes_read, FIELD_R1CS_ARTIFACT_HEADER_BYTES,
+            "untrusted vector counts must fail before payload reads or allocations",
+        );
+    }
+
+    #[test]
+    fn field_r1cs_artifact_rejects_bad_dimensions_and_offsets() {
+        let (_, shape, digest, bytes) = artifact_fixture(0xBAD0_FF5E7);
+
+        let mut bad_dimensions = bytes.clone();
+        set_header_u64(&mut bad_dimensions, 48, (1u64 << shape.k_log) - 1);
+        assert!(matches!(
+            decode_fixture(&bad_dimensions, shape, digest),
+            Err(FieldR1csArtifactError::MatrixDimensions {
+                matrix: FieldR1csArtifactMatrix::A,
+                ..
+            })
+        ));
+
+        let mut bad_first_offset = bytes;
+        set_header_u64(&mut bad_first_offset, FIELD_R1CS_ARTIFACT_HEADER_BYTES, 1);
+        assert!(matches!(
+            decode_fixture(&bad_first_offset, shape, digest),
+            Err(FieldR1csArtifactError::InvalidRowOffset {
+                matrix: FieldR1csArtifactMatrix::A,
+                index: 0,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn field_r1cs_artifact_rejects_bad_indices_and_zero_coefficients() {
+        let (_, shape, digest, bytes) = artifact_fixture(0xBAD1_D1CE5);
+        let a_nnz = header_u64(&bytes, 64) as usize;
+        let a_values = header_u64(&bytes, 72) as usize;
+        let a_offsets = header_u64(&bytes, 80) as usize;
+        assert!(a_values >= 2);
+        let columns_start = FIELD_R1CS_ARTIFACT_HEADER_BYTES + a_offsets * 8;
+        let value_indices_start = columns_start + a_nnz * 4;
+        let values_start = value_indices_start + a_nnz * 4;
+
+        let mut bad_column = bytes.clone();
+        bad_column[columns_start..columns_start + 4]
+            .copy_from_slice(&(1u32 << shape.k_log).to_le_bytes());
+        assert!(matches!(
+            decode_fixture(&bad_column, shape, digest),
+            Err(FieldR1csArtifactError::InvalidColumn {
+                matrix: FieldR1csArtifactMatrix::A,
+                ..
+            })
+        ));
+
+        let mut bad_value_index = bytes.clone();
+        bad_value_index[value_indices_start..value_indices_start + 4]
+            .copy_from_slice(&(a_values as u32).to_le_bytes());
+        assert!(matches!(
+            decode_fixture(&bad_value_index, shape, digest),
+            Err(FieldR1csArtifactError::InvalidValueIndex {
+                matrix: FieldR1csArtifactMatrix::A,
+                ..
+            })
+        ));
+
+        let mut zero_coefficient = bytes;
+        let mut duplicate_coefficient = zero_coefficient.clone();
+        duplicate_coefficient[values_start + 16..values_start + 32]
+            .copy_from_slice(&zero_coefficient[values_start..values_start + 16]);
+        assert!(matches!(
+            decode_fixture(&duplicate_coefficient, shape, digest),
+            Err(FieldR1csArtifactError::DuplicateCoefficient {
+                matrix: FieldR1csArtifactMatrix::A,
+                ..
+            })
+        ));
+
+        zero_coefficient[values_start..values_start + 16].fill(0);
+        assert!(matches!(
+            decode_fixture(&zero_coefficient, shape, digest),
+            Err(FieldR1csArtifactError::ZeroCoefficient {
+                matrix: FieldR1csArtifactMatrix::A,
+                index: 0,
+            })
+        ));
+    }
+
+    #[test]
+    fn field_r1cs_artifact_rejects_trailing_and_truncated_bytes() {
+        let (_, shape, digest, bytes) = artifact_fixture(0x7A11_1A7E);
+
+        let mut trailing = bytes.clone();
+        trailing.push(0xA5);
+        assert!(matches!(
+            decode_fixture(&trailing, shape, digest),
+            Err(FieldR1csArtifactError::TrailingBytes)
+        ));
+
+        let truncated = &bytes[..bytes.len() - 1];
+        assert!(matches!(
+            FieldR1cs::read_artifact(&mut Cursor::new(truncated), shape, digest, bytes.len(),),
+            Err(FieldR1csArtifactError::Truncated { .. })
+        ));
     }
 
     #[test]
