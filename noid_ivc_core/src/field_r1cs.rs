@@ -1064,6 +1064,44 @@ impl FieldR1cs {
         expected_structural_digest: [u8; 32],
         max_bytes: usize,
     ) -> Result<Self, FieldR1csArtifactError> {
+        let r1cs = Self::read_artifact_undigested(reader, expected_shape, max_bytes)?;
+        let actual_digest = r1cs.structural_statement_digest();
+        if actual_digest != expected_structural_digest {
+            return Err(FieldR1csArtifactError::StructuralDigestMismatch {
+                expected: expected_structural_digest,
+                actual: actual_digest,
+            });
+        }
+        Ok(r1cs)
+    }
+
+    /// Load one canonical matrix artifact whose structural digest was already
+    /// established by a prior complete authentication of the exact same bytes
+    /// (an install-time trust record). The span rehash is skipped and
+    /// `established_digest` is installed into the seedable digest cache, so
+    /// [`Self::statement_digest`] returns it while
+    /// [`Self::structural_statement_digest`] still recomputes from rows.
+    ///
+    /// The caller owns the binding between the trust record and the artifact
+    /// bytes; this trust domain is the node's local disk and database, the
+    /// same domain that already holds the chain state. Operators who want
+    /// per-run re-authentication use [`Self::read_artifact`] instead.
+    pub fn read_artifact_with_established_digest<R: Read + ?Sized>(
+        reader: &mut R,
+        expected_shape: crate::proof::FieldShape,
+        established_digest: [u8; 32],
+        max_bytes: usize,
+    ) -> Result<Self, FieldR1csArtifactError> {
+        let r1cs = Self::read_artifact_undigested(reader, expected_shape, max_bytes)?;
+        r1cs.seed_statement_digest(established_digest);
+        Ok(r1cs)
+    }
+
+    fn read_artifact_undigested<R: Read + ?Sized>(
+        reader: &mut R,
+        expected_shape: crate::proof::FieldShape,
+        max_bytes: usize,
+    ) -> Result<Self, FieldR1csArtifactError> {
         if max_bytes < FIELD_R1CS_ARTIFACT_HEADER_BYTES {
             return Err(FieldR1csArtifactError::TooLarge {
                 actual: FIELD_R1CS_ARTIFACT_HEADER_BYTES as u64,
@@ -1314,7 +1352,7 @@ impl FieldR1cs {
 
         let b_0 = decoded.pop().expect("two matrices decoded");
         let a_0 = decoded.pop().expect("two matrices decoded");
-        let r1cs = Self {
+        Ok(Self {
             m: expected_shape.m,
             k_log: expected_shape.k_log,
             k_skip: expected_shape.k_skip,
@@ -1324,15 +1362,7 @@ impl FieldR1cs {
             const_pin: expected_shape.const_pin,
             digest_cache: std::sync::OnceLock::new(),
             csc_cache: std::sync::OnceLock::new(),
-        };
-        let actual_digest = r1cs.structural_statement_digest();
-        if actual_digest != expected_structural_digest {
-            return Err(FieldR1csArtifactError::StructuralDigestMismatch {
-                expected: expected_structural_digest,
-                actual: actual_digest,
-            });
-        }
-        Ok(r1cs)
+        })
     }
 
     pub fn n_outer(&self) -> usize {

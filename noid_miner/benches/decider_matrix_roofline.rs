@@ -17,8 +17,8 @@ use noid_ivc_core::field_r1cs::synthetic_satisfiable_bounded_dictionary;
 use noid_ivc_core::matrix_claim::{stacked_matrix_mle_eval, MatrixAccClaim, MatrixClaimEvaluator};
 use noid_ivc_core::proof::FieldShape;
 use noid_miner::{
-    LocalSelectedRecursiveMatrixSource, SelectedRecursiveMatrixArtifactIdentity,
-    SelectedRecursiveMatrixKind,
+    LoadedSelectedRecursiveMatrixEvaluator, LocalSelectedRecursiveMatrixSource,
+    SelectedRecursiveMatrixArtifactIdentity, SelectedRecursiveMatrixKind,
 };
 
 fn main() {
@@ -109,6 +109,31 @@ fn main() {
     drop(resident);
     println!(
         "  resident         load {open_s:>8.3} s + eval {eval_s:>8.3} s = {:>8.3} s",
+        open_s + eval_s
+    );
+
+    // Trusted-resident decider path: the install-time record written by the
+    // full load above admits decode with no Poseidon pass at all; evaluation
+    // authenticates against the established digest.
+    let t = Instant::now();
+    let mut trusted = source
+        .open_artifact_evaluator(identity)
+        .expect("trusted open");
+    assert!(matches!(
+        trusted,
+        LoadedSelectedRecursiveMatrixEvaluator::TrustedResident(_)
+    ));
+    let open_s = t.elapsed().as_secs_f64();
+    let t = Instant::now();
+    let evaluated = trusted
+        .evaluate_matrix_claims(None, Some(&claim))
+        .expect("trusted evaluation");
+    assert_eq!(evaluated.accumulated_value(), Some(claim.value));
+    assert_eq!(evaluated.structural_digest(), digest);
+    let eval_s = t.elapsed().as_secs_f64();
+    drop(trusted);
+    println!(
+        "  trusted          load {open_s:>8.3} s + eval {eval_s:>8.3} s = {:>8.3} s",
         open_s + eval_s
     );
 }

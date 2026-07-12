@@ -300,6 +300,9 @@ fn start_selected_history_worker(
     // 8 GiB proving session, after all transient proof matrices are gone;
     // resident one-at-a-time claim evaluation always fits that admission.
     matrix_source.set_resident_evaluation(true);
+    if std::env::var_os("NOID_ALWAYS_REHASH_MATRICES").is_some() {
+        matrix_source.set_artifact_trust(false);
+    }
     let mut worker = selected_history_worker::SelectedHistoryProverWorker::new(
         store,
         registry_store,
@@ -1528,6 +1531,9 @@ fn verify_snapshot_selected_history_terminal(
         noid_miner::LocalSelectedRecursiveClassRegistryStore::new(artifacts.root.clone());
     let mut matrix_source =
         noid_miner::LocalSelectedRecursiveMatrixSource::new(artifacts.root.clone());
+    if std::env::var_os("NOID_ALWAYS_REHASH_MATRICES").is_some() {
+        matrix_source.set_artifact_trust(false);
+    }
     noid_miner::verify_selected_history_terminal_pinned_governed(
         &package,
         &registry_store,

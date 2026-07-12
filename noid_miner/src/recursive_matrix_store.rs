@@ -179,6 +179,7 @@ pub struct LocalSelectedRecursiveMatrixSource {
     max_artifact_bytes: u64,
     resident: Arc<AtomicBool>,
     resident_evaluation: bool,
+    artifact_trust: bool,
 }
 
 impl LocalSelectedRecursiveMatrixSource {
@@ -192,6 +193,7 @@ impl LocalSelectedRecursiveMatrixSource {
             max_artifact_bytes,
             resident: process_matrix_residency(),
             resident_evaluation: false,
+            artifact_trust: true,
         }
     }
 
@@ -204,6 +206,18 @@ impl LocalSelectedRecursiveMatrixSource {
         self.resident_evaluation = resident_evaluation;
     }
 
+    /// Enable or disable the install-time artifact trust record for resident
+    /// evaluation. When enabled (default), the first fully authenticated load
+    /// of an artifact writes a sidecar record binding the file identity to
+    /// its structural digest; later resident opens of the byte-identical file
+    /// skip the span rehash. The record lives in the same local disk trust
+    /// domain as the chain database. Disabling forces a complete Poseidon
+    /// re-authentication on every open (`NOID_ALWAYS_REHASH_MATRICES` in the
+    /// node).
+    pub fn set_artifact_trust(&mut self, artifact_trust: bool) {
+        self.artifact_trust = artifact_trust;
+    }
+
     #[cfg(test)]
     fn with_isolated_residency(root: impl Into<PathBuf>, max_artifact_bytes: u64) -> Self {
         Self {
@@ -211,6 +225,7 @@ impl LocalSelectedRecursiveMatrixSource {
             max_artifact_bytes,
             resident: Arc::new(AtomicBool::new(false)),
             resident_evaluation: false,
+            artifact_trust: true,
         }
     }
 
@@ -261,19 +276,31 @@ impl LocalSelectedRecursiveMatrixSource {
     }
 
     /// Open one artifact for terminal claim evaluation under the source's
-    /// residency policy. Both variants recompute and authenticate the same
-    /// structural statement digest from the exact rows they evaluate;
-    /// residency changes only where those rows live — a decoded CSR with
-    /// parallel span hashing versus bounded single-pass streaming windows —
-    /// never the trust boundary.
+    /// residency policy.
+    ///
+    /// Streamed and plain resident evaluation recompute and authenticate the
+    /// structural statement digest from the exact rows they evaluate. With
+    /// residency and artifact trust enabled, a valid install-time trust
+    /// record — same digest as the requested identity and a byte-identical
+    /// backing file — admits a trusted-resident load that skips the span
+    /// rehash; the record is created by the first fully authenticated load
+    /// and shares the local-disk trust domain with the chain database.
     pub fn open_artifact_evaluator(
         &self,
         identity: SelectedRecursiveMatrixArtifactIdentity,
     ) -> Result<LoadedSelectedRecursiveMatrixEvaluator, LocalSelectedRecursiveMatrixError> {
         if self.resident_evaluation {
-            Ok(LoadedSelectedRecursiveMatrixEvaluator::Resident(
-                self.load_artifact(identity)?,
-            ))
+            #[cfg(not(unix))]
+            {
+                let _ = identity;
+                Err(LocalSelectedRecursiveMatrixError::UnsupportedPlatform)
+            }
+            #[cfg(unix)]
+            {
+                let lease = ResidentMatrixLease::acquire(Arc::clone(&self.resident))?;
+                let parent = self.open_version_directory(false)?;
+                self.load_requested_evaluator_anchored(&parent, identity, lease)
+            }
         } else {
             Ok(LoadedSelectedRecursiveMatrixEvaluator::Streamed(
                 self.open_artifact_view(identity)?,
@@ -405,6 +432,132 @@ impl LocalSelectedRecursiveMatrixSource {
             opened,
             release_callback: Some(Box::new(move || resident.store(false, Ordering::Release))),
         })
+    }
+
+    /// Resident terminal-evaluator load with the optional install-time trust
+    /// fast path. A record is honored only when its digest equals the
+    /// requested identity's digest and the backing file is byte-identical to
+    /// the one that was fully authenticated; anything else re-authenticates
+    /// and rewrites the record.
+    #[cfg(unix)]
+    fn load_requested_evaluator_anchored(
+        &self,
+        parent: &anchored_artifact_fs::AnchoredDirectory,
+        identity: SelectedRecursiveMatrixArtifactIdentity,
+        lease: ResidentMatrixLease,
+    ) -> Result<LoadedSelectedRecursiveMatrixEvaluator, LocalSelectedRecursiveMatrixError> {
+        let kind = identity.kind();
+        let expected_digest = identity.statement_digest();
+        let (file, opened, path) = self.open_anchored_artifact(parent, kind)?;
+        let trusted = self.artifact_trust
+            && self
+                .read_artifact_trust_record(parent, kind)
+                .is_some_and(|record| record.digest == expected_digest && record.matches(&opened));
+        let decoder_cap = usize::try_from(self.effective_max_bytes()).unwrap_or(usize::MAX);
+        let mut reader = BufReader::with_capacity(ARTIFACT_READ_BUFFER_BYTES, file);
+        let matrix = if trusted {
+            FieldR1cs::read_artifact_with_established_digest(
+                &mut reader,
+                identity.shape(),
+                expected_digest,
+                decoder_cap,
+            )
+        } else {
+            FieldR1cs::read_artifact(&mut reader, identity.shape(), expected_digest, decoder_cap)
+        }
+        .map_err(LocalSelectedRecursiveMatrixError::Codec)?;
+        let after = reader
+            .get_ref()
+            .metadata()
+            .map_err(|source| io_error("inspect decoded", &path, source))?;
+        if !same_file_and_length(&opened, &after) {
+            return Err(LocalSelectedRecursiveMatrixError::ArtifactChanged { path });
+        }
+        drop(reader);
+        if !trusted && self.artifact_trust {
+            // Best effort: the load above is fully authenticated; a failed
+            // record write only costs the next open one more rehash.
+            let _ = self.write_artifact_trust_record(parent, kind, &after, expected_digest);
+        }
+
+        let resident = lease.transfer();
+        let loaded = crate::recursive_prover::LoadedSelectedRecursiveMatrix::with_release_callback(
+            matrix,
+            move || resident.store(false, Ordering::Release),
+        );
+        Ok(if trusted {
+            LoadedSelectedRecursiveMatrixEvaluator::TrustedResident(loaded)
+        } else {
+            LoadedSelectedRecursiveMatrixEvaluator::Resident(loaded)
+        })
+    }
+
+    #[cfg(unix)]
+    fn read_artifact_trust_record(
+        &self,
+        parent: &anchored_artifact_fs::AnchoredDirectory,
+        kind: SelectedRecursiveMatrixKind,
+    ) -> Option<ArtifactTrustRecord> {
+        let leaf = artifact_trust_leaf(kind);
+        match parent.leaf_kind(&leaf) {
+            Ok(anchored_artifact_fs::LeafKind::Regular) => {}
+            _ => return None,
+        }
+        let mut file = parent.open_read_only(&leaf).ok()?;
+        let mut bytes = [0u8; ARTIFACT_TRUST_RECORD_BYTES + 1];
+        let mut filled = 0usize;
+        loop {
+            match io::Read::read(&mut file, &mut bytes[filled..]) {
+                Ok(0) => break,
+                Ok(count) => {
+                    filled += count;
+                    if filled > ARTIFACT_TRUST_RECORD_BYTES {
+                        return None;
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => return None,
+            }
+        }
+        if filled != ARTIFACT_TRUST_RECORD_BYTES {
+            return None;
+        }
+        ArtifactTrustRecord::decode(&bytes[..ARTIFACT_TRUST_RECORD_BYTES])
+    }
+
+    #[cfg(unix)]
+    fn write_artifact_trust_record(
+        &self,
+        parent: &anchored_artifact_fs::AnchoredDirectory,
+        kind: SelectedRecursiveMatrixKind,
+        authenticated: &Metadata,
+        digest: [u8; 32],
+    ) -> Result<(), LocalSelectedRecursiveMatrixError> {
+        let leaf = artifact_trust_leaf(kind);
+        let target = self
+            .root
+            .join(ARTIFACT_VERSION_DIRECTORY)
+            .join(leaf.as_str());
+        let (temporary_name, mut file) = create_temporary_file(parent, &target)?;
+        let temporary_path = target
+            .parent()
+            .expect("fixed trust path has parent")
+            .join(&temporary_name);
+        let mut cleanup = TemporaryCleanup::new(parent, temporary_name.clone(), target.clone())?;
+        let record = ArtifactTrustRecord::from_metadata(authenticated, digest);
+        io::Write::write_all(&mut file, &record.encode())
+            .map_err(|source| io_error("write trust record", &temporary_path, source))?;
+        file.sync_all()
+            .map_err(|source| io_error("sync trust record", &temporary_path, source))?;
+        drop(file);
+        parent
+            .rename(&temporary_name, &leaf)
+            .map_err(|source| io_error("rename trust record", &target, source))?;
+        cleanup.disarm();
+        parent
+            .sync_all()
+            .map_err(|source| io_error("sync trust directory", &target, source))?;
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -590,20 +743,25 @@ impl Drop for LoadedSelectedRecursiveMatrixView {
 }
 
 /// One terminal claim-evaluation lease under the source's residency policy.
-/// Both variants hold the process-wide one-matrix admission until drop and
-/// recompute the structural statement digest from the exact rows they
-/// evaluate. Resident evaluation decodes the authenticated CSR once and
-/// hashes its spans in parallel; streamed evaluation keeps only bounded
-/// windows and re-scans the artifact per evaluation.
+/// Every variant holds the process-wide one-matrix admission until drop.
+///
+/// `Resident` and `Streamed` recompute the structural statement digest from
+/// the exact rows they evaluate. `TrustedResident` is admitted only by a
+/// valid install-time trust record for the byte-identical artifact; its
+/// digest authority is the recorded prior full authentication, and the
+/// caller still compares that digest against the registry pin.
 pub enum LoadedSelectedRecursiveMatrixEvaluator {
     Resident(crate::recursive_prover::LoadedSelectedRecursiveMatrix),
+    TrustedResident(crate::recursive_prover::LoadedSelectedRecursiveMatrix),
     Streamed(LoadedSelectedRecursiveMatrixView),
 }
 
 impl MatrixClaimEvaluator for LoadedSelectedRecursiveMatrixEvaluator {
     fn field_shape(&self) -> FieldShape {
         match self {
-            Self::Resident(loaded) => FieldShape::of(loaded.matrix()),
+            Self::Resident(loaded) | Self::TrustedResident(loaded) => {
+                FieldShape::of(loaded.matrix())
+            }
             Self::Streamed(view) => view.field_shape(),
         }
     }
@@ -615,6 +773,8 @@ impl MatrixClaimEvaluator for LoadedSelectedRecursiveMatrixEvaluator {
     ) -> Result<AuthenticatedMatrixClaimEvaluations, FieldR1csArtifactError> {
         match self {
             Self::Resident(loaded) => loaded.matrix_mut().evaluate_matrix_claims(fresh, accumulated),
+            Self::TrustedResident(loaded) => noid_ivc_core::matrix_claim::
+                evaluate_matrix_claims_established(loaded.matrix(), fresh, accumulated),
             Self::Streamed(view) => view.evaluate_matrix_claims(fresh, accumulated),
         }
     }
@@ -646,6 +806,111 @@ fn selected_recursive_matrix_leaf(kind: SelectedRecursiveMatrixKind) -> &'static
         .file_name()
         .and_then(|value| value.to_str())
         .expect("fixed ASCII matrix path has a file name")
+}
+
+#[cfg(unix)]
+fn artifact_trust_leaf(kind: SelectedRecursiveMatrixKind) -> String {
+    format!("{}.trust", selected_recursive_matrix_leaf(kind))
+}
+
+#[cfg(unix)]
+const ARTIFACT_TRUST_MAGIC: [u8; 12] = *b"NOIDMTRUST1\0";
+#[cfg(unix)]
+const ARTIFACT_TRUST_RECORD_BYTES: usize = 12 + 7 * 8 + 32;
+
+/// Install-time artifact trust record: the structural digest of one fully
+/// authenticated artifact bound to the exact file identity (device, inode,
+/// length, mtime, ctime) that produced it. Fixed 100-byte encoding; any
+/// shape or decode anomaly invalidates the record and the next open
+/// re-authenticates and rewrites it. The record shares the node's local-disk
+/// trust domain with the chain database.
+#[cfg(unix)]
+struct ArtifactTrustRecord {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+    ctime: i64,
+    ctime_nsec: i64,
+    digest: [u8; 32],
+}
+
+#[cfg(unix)]
+impl ArtifactTrustRecord {
+    fn from_metadata(metadata: &Metadata, digest: [u8; 32]) -> Self {
+        Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            len: metadata.len(),
+            mtime: metadata.mtime(),
+            mtime_nsec: metadata.mtime_nsec(),
+            ctime: metadata.ctime(),
+            ctime_nsec: metadata.ctime_nsec(),
+            digest,
+        }
+    }
+
+    fn matches(&self, metadata: &Metadata) -> bool {
+        self.dev == metadata.dev()
+            && self.ino == metadata.ino()
+            && self.len == metadata.len()
+            && self.mtime == metadata.mtime()
+            && self.mtime_nsec == metadata.mtime_nsec()
+            && self.ctime == metadata.ctime()
+            && self.ctime_nsec == metadata.ctime_nsec()
+    }
+
+    fn encode(&self) -> [u8; ARTIFACT_TRUST_RECORD_BYTES] {
+        let mut bytes = [0u8; ARTIFACT_TRUST_RECORD_BYTES];
+        bytes[..12].copy_from_slice(&ARTIFACT_TRUST_MAGIC);
+        let mut at = 12;
+        for value in [
+            self.dev,
+            self.ino,
+            self.len,
+            self.mtime as u64,
+            self.mtime_nsec as u64,
+            self.ctime as u64,
+            self.ctime_nsec as u64,
+        ] {
+            bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
+            at += 8;
+        }
+        bytes[at..].copy_from_slice(&self.digest);
+        bytes
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != ARTIFACT_TRUST_RECORD_BYTES || bytes[..12] != ARTIFACT_TRUST_MAGIC {
+            return None;
+        }
+        let mut at = 12;
+        let mut next_u64 = || {
+            let value = u64::from_le_bytes(bytes[at..at + 8].try_into().expect("eight bytes"));
+            at += 8;
+            value
+        };
+        let dev = next_u64();
+        let ino = next_u64();
+        let len = next_u64();
+        let mtime = next_u64() as i64;
+        let mtime_nsec = next_u64() as i64;
+        let ctime = next_u64() as i64;
+        let ctime_nsec = next_u64() as i64;
+        let mut digest = [0u8; 32];
+        digest.copy_from_slice(&bytes[at..]);
+        Some(Self {
+            dev,
+            ino,
+            len,
+            mtime,
+            mtime_nsec,
+            ctime,
+            ctime_nsec,
+            digest,
+        })
+    }
 }
 
 #[cfg(unix)]
@@ -1054,6 +1319,93 @@ mod tests {
         drop(source.load_artifact(matrix_identity).unwrap());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn artifact_trust_record_roundtrip_and_invalidation() {
+        use noid_ivc_core::matrix_claim::{stacked_matrix_mle_eval, MatrixAccClaim};
+
+        let directory = tempdir().unwrap();
+        let mut source = isolated_source(directory.path());
+        source.set_resident_evaluation(true);
+        let matrix = tiny_matrix(0x7757);
+        let matrix_identity = identity(SelectedRecursiveMatrixKind::GenesisLink, &matrix);
+        source.export_matrix(matrix_identity, &matrix).unwrap();
+        let mut claim = MatrixAccClaim {
+            point: vec![F128::new(2, 3); 2 * matrix.k_log + 1],
+            value: F128::ZERO,
+        };
+        claim.value = stacked_matrix_mle_eval(&matrix, &claim);
+        let trust_path = directory
+            .path()
+            .join("v1")
+            .join("genesis-link.field-r1cs.trust");
+
+        // Paranoid mode consults and writes no record.
+        source.set_artifact_trust(false);
+        let mut first = source.open_artifact_evaluator(matrix_identity).unwrap();
+        assert!(matches!(
+            first,
+            LoadedSelectedRecursiveMatrixEvaluator::Resident(_)
+        ));
+        let eval = first.evaluate_matrix_claims(None, Some(&claim)).unwrap();
+        assert_eq!(eval.accumulated_value(), Some(claim.value));
+        drop(first);
+        assert!(!trust_path.exists());
+
+        // The first trusted-mode load re-authenticates fully and records.
+        source.set_artifact_trust(true);
+        let second = source.open_artifact_evaluator(matrix_identity).unwrap();
+        assert!(matches!(
+            second,
+            LoadedSelectedRecursiveMatrixEvaluator::Resident(_)
+        ));
+        drop(second);
+        assert!(trust_path.exists());
+
+        // The record admits the trusted fast path with identical results.
+        let mut third = source.open_artifact_evaluator(matrix_identity).unwrap();
+        assert!(matches!(
+            third,
+            LoadedSelectedRecursiveMatrixEvaluator::TrustedResident(_)
+        ));
+        let eval = third.evaluate_matrix_claims(None, Some(&claim)).unwrap();
+        assert_eq!(
+            eval.structural_digest(),
+            matrix_identity.statement_digest()
+        );
+        assert_eq!(eval.accumulated_value(), Some(claim.value));
+        drop(third);
+
+        // Re-exporting even identical bytes produces a new file identity:
+        // the record is stale, the next open re-authenticates and re-records.
+        source.export_matrix(matrix_identity, &matrix).unwrap();
+        let fourth = source.open_artifact_evaluator(matrix_identity).unwrap();
+        assert!(matches!(
+            fourth,
+            LoadedSelectedRecursiveMatrixEvaluator::Resident(_)
+        ));
+        drop(fourth);
+        let fifth = source.open_artifact_evaluator(matrix_identity).unwrap();
+        assert!(matches!(
+            fifth,
+            LoadedSelectedRecursiveMatrixEvaluator::TrustedResident(_)
+        ));
+        drop(fifth);
+
+        // A forged record whose digest differs from the requested identity is
+        // ignored and replaced by a fresh full authentication.
+        let mut forged = fs::read(&trust_path).unwrap();
+        let digest_at = forged.len() - 32;
+        forged[digest_at] ^= 1;
+        fs::write(&trust_path, &forged).unwrap();
+        let sixth = source.open_artifact_evaluator(matrix_identity).unwrap();
+        assert!(matches!(
+            sixth,
+            LoadedSelectedRecursiveMatrixEvaluator::Resident(_)
+        ));
+        drop(sixth);
+    }
+
     #[test]
     fn terminal_streaming_arm_never_invokes_full_csr_decoder() {
         let store = include_str!("recursive_matrix_store.rs");
@@ -1068,7 +1420,7 @@ mod tests {
             .split("fn open_requested_view_anchored(")
             .nth(1)
             .expect("anchored seekable view loader")
-            .split("fn open_anchored_artifact")
+            .split("fn load_requested_evaluator_anchored")
             .next()
             .expect("anchored view boundary");
         assert!(view_entry.contains("open_requested_view_anchored"));

@@ -202,6 +202,39 @@ pub trait MatrixClaimEvaluator {
     ) -> Result<AuthenticatedMatrixClaimEvaluations, FieldR1csArtifactError>;
 }
 
+fn evaluate_field_r1cs_claims(
+    matrix: &FieldR1cs,
+    fresh: Option<&FreshLincheckClaim>,
+    accumulated: Option<&MatrixAccClaim>,
+    digest: [u8; 32],
+) -> Result<AuthenticatedMatrixClaimEvaluations, FieldR1csArtifactError> {
+    if let Some(claim) = fresh {
+        let rest = matrix.k_log - matrix.k_skip;
+        if claim.x_inner_rest.len() != rest || claim.r_inner_rest.len() != rest {
+            return Err(FieldR1csArtifactError::MatrixClaimShape(
+                "fresh inner-rest width",
+            ));
+        }
+        if claim.z_partial.len() != 1usize << matrix.k_skip {
+            return Err(FieldR1csArtifactError::MatrixClaimShape(
+                "fresh partial window",
+            ));
+        }
+    }
+    if accumulated.is_some_and(|claim| claim.point.len() != 2 * matrix.k_log + 1) {
+        return Err(FieldR1csArtifactError::MatrixClaimShape(
+            "accumulated point width",
+        ));
+    }
+    Ok(AuthenticatedMatrixClaimEvaluations::new(
+        digest,
+        fresh,
+        accumulated,
+        fresh.map(|claim| fresh_claim_value(matrix, claim)),
+        accumulated.map(|claim| stacked_matrix_mle_eval(matrix, claim)),
+    ))
+}
+
 impl MatrixClaimEvaluator for FieldR1cs {
     fn field_shape(&self) -> FieldShape {
         FieldShape::of(self)
@@ -212,32 +245,26 @@ impl MatrixClaimEvaluator for FieldR1cs {
         fresh: Option<&FreshLincheckClaim>,
         accumulated: Option<&MatrixAccClaim>,
     ) -> Result<AuthenticatedMatrixClaimEvaluations, FieldR1csArtifactError> {
-        if let Some(claim) = fresh {
-            let rest = self.k_log - self.k_skip;
-            if claim.x_inner_rest.len() != rest || claim.r_inner_rest.len() != rest {
-                return Err(FieldR1csArtifactError::MatrixClaimShape(
-                    "fresh inner-rest width",
-                ));
-            }
-            if claim.z_partial.len() != 1usize << self.k_skip {
-                return Err(FieldR1csArtifactError::MatrixClaimShape(
-                    "fresh partial window",
-                ));
-            }
-        }
-        if accumulated.is_some_and(|claim| claim.point.len() != 2 * self.k_log + 1) {
-            return Err(FieldR1csArtifactError::MatrixClaimShape(
-                "accumulated point width",
-            ));
-        }
-        Ok(AuthenticatedMatrixClaimEvaluations::new(
-            self.structural_statement_digest(),
-            fresh,
-            accumulated,
-            fresh.map(|claim| fresh_claim_value(self, claim)),
-            accumulated.map(|claim| stacked_matrix_mle_eval(self, claim)),
-        ))
+        let digest = self.structural_statement_digest();
+        evaluate_field_r1cs_claims(self, fresh, accumulated, digest)
     }
+}
+
+/// Same evaluations as the [`MatrixClaimEvaluator`] impl for [`FieldR1cs`],
+/// but the digest authority is the instance's already-established statement
+/// digest — installed by
+/// [`FieldR1cs::read_artifact_with_established_digest`] from an install-time
+/// trust record — instead of a fresh span recompute. The record's binding to
+/// the artifact bytes lives in the node's local disk/database trust domain,
+/// the same domain that already holds the chain state; per-run paranoid
+/// re-authentication remains available through the ordinary evaluator.
+pub fn evaluate_matrix_claims_established(
+    matrix: &FieldR1cs,
+    fresh: Option<&FreshLincheckClaim>,
+    accumulated: Option<&MatrixAccClaim>,
+) -> Result<AuthenticatedMatrixClaimEvaluations, FieldR1csArtifactError> {
+    let digest = matrix.statement_digest();
+    evaluate_field_r1cs_claims(matrix, fresh, accumulated, digest)
 }
 
 /// Proof wires of one accumulator fold: phase-1 rounds (`k_log + 1`),
