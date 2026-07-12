@@ -137,6 +137,9 @@ pub enum StateDeltaError {
     BlockSlotConflict { tx_index: usize, op_index: usize },
     /// A valid input/output references a slot outside the current state domain.
     SlotOutOfRange { tx_index: usize },
+    /// The requested exact surface domain is neither the parent depth nor its
+    /// single permitted expansion.
+    InvalidSlotDomain,
     /// Assigning the next live output's creation ID would overflow the
     /// consensus allocation counter.
     AllocationCounterOverflow {
@@ -160,13 +163,32 @@ pub fn build_state_delta_action_surface(
     expected_commitments: &[Digest],
     parent_alloc_counter: u64,
 ) -> Result<StateDeltaActionSurface, StateDeltaError> {
+    build_state_delta_action_surface_in_domain(
+        state,
+        state.num_slots(),
+        bodies,
+        expected_commitments,
+        parent_alloc_counter,
+    )
+}
+
+fn build_state_delta_action_surface_in_domain(
+    state: &SegmentedFriState,
+    slot_domain: u64,
+    bodies: &[TxBody],
+    expected_commitments: &[Digest],
+    parent_alloc_counter: u64,
+) -> Result<StateDeltaActionSurface, StateDeltaError> {
     assert_eq!(
         bodies.len(),
         expected_commitments.len(),
         "one claims commitment per tx body required"
     );
 
-    let n_slots = state.num_slots();
+    let parent_slot_domain = state.num_slots();
+    if slot_domain < parent_slot_domain {
+        return Err(StateDeltaError::InvalidSlotDomain);
+    }
     let mut overlay: HashMap<u32, SlotValue> = HashMap::new();
     let mut actions = Vec::new();
     let mut spends = 0u32;
@@ -183,7 +205,7 @@ pub fn build_state_delta_action_surface(
         }
 
         for (i, input) in body.live_inputs() {
-            if (input.slot_index as u64) >= n_slots {
+            if (input.slot_index as u64) >= slot_domain {
                 return Err(StateDeltaError::SlotOutOfRange { tx_index: tx_idx });
             }
             if !block_touched.insert(input.slot_index) {
@@ -193,10 +215,13 @@ pub fn build_state_delta_action_surface(
                 });
             }
 
-            let pre = overlay
-                .get(&input.slot_index)
-                .copied()
-                .unwrap_or_else(|| state.slot(input.slot_index));
+            let pre = overlay.get(&input.slot_index).copied().unwrap_or_else(|| {
+                if u64::from(input.slot_index) < parent_slot_domain {
+                    state.slot(input.slot_index)
+                } else {
+                    SlotValue::EMPTY
+                }
+            });
             let post = SlotValue::EMPTY;
             if pre != slot_value_from_input(input, &body.input_owner) {
                 return Err(StateDeltaError::InputMismatch {
@@ -220,7 +245,7 @@ pub fn build_state_delta_action_surface(
         }
 
         for (j, output) in body.live_outputs() {
-            if (output.slot_index as u64) >= n_slots {
+            if (output.slot_index as u64) >= slot_domain {
                 return Err(StateDeltaError::SlotOutOfRange { tx_index: tx_idx });
             }
             if !block_touched.insert(output.slot_index) {
@@ -230,10 +255,13 @@ pub fn build_state_delta_action_surface(
                 });
             }
 
-            let pre = overlay
-                .get(&output.slot_index)
-                .copied()
-                .unwrap_or_else(|| state.slot(output.slot_index));
+            let pre = overlay.get(&output.slot_index).copied().unwrap_or_else(|| {
+                if u64::from(output.slot_index) < parent_slot_domain {
+                    state.slot(output.slot_index)
+                } else {
+                    SlotValue::EMPTY
+                }
+            });
             if pre != SlotValue::EMPTY {
                 return Err(StateDeltaError::OutputSlotOccupied {
                     tx_index: tx_idx,
@@ -281,6 +309,39 @@ pub fn build_exact_action_surface(
 ) -> Result<ExactActionSurface, StateDeltaError> {
     let surface = build_state_delta_action_surface(
         state,
+        bodies,
+        expected_commitments,
+        parent_alloc_counter,
+    )?;
+    Ok(exact_action_surface_from_surface(surface))
+}
+
+/// Build the exact surface at the current depth or its one-level expansion
+/// without cloning or expanding the resident segment payloads.
+///
+/// Slots in the newly introduced upper half are canonical virtual zero. They
+/// may therefore receive outputs, while an input there deterministically fails
+/// its claimed pre-image check. This is the native exact-state expansion seam;
+/// it creates no FRI matrix/tree authority.
+pub fn build_exact_action_surface_at_log_slots(
+    state: &SegmentedFriState,
+    target_log_slots: u32,
+    bodies: &[TxBody],
+    expected_commitments: &[Digest],
+    parent_alloc_counter: u64,
+) -> Result<ExactActionSurface, StateDeltaError> {
+    let current = state.log_slots();
+    let target =
+        usize::try_from(target_log_slots).map_err(|_| StateDeltaError::InvalidSlotDomain)?;
+    if target != current && target != current.saturating_add(1) {
+        return Err(StateDeltaError::InvalidSlotDomain);
+    }
+    let slot_domain = 1u64
+        .checked_shl(target_log_slots)
+        .ok_or(StateDeltaError::InvalidSlotDomain)?;
+    let surface = build_state_delta_action_surface_in_domain(
+        state,
+        slot_domain,
         bodies,
         expected_commitments,
         parent_alloc_counter,
@@ -422,6 +483,24 @@ mod tests {
         }
     }
 
+    fn coinbase_body(output_slot: u32) -> TxBody {
+        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        outputs[0] = TxOutput {
+            slot_index: output_slot,
+            amount: 10,
+            owner: Address([7u8; 32]),
+        };
+        TxBody {
+            epoch_anchor: [0u8; 32],
+            fee: 0,
+            input_owner: Address([0u8; 32]),
+            inputs: [TxInput::dummy(); TX_INPUTS],
+            outputs,
+            validity_bitmap: output_bitmap_bit(0),
+            is_coinbase: true,
+        }
+    }
+
     fn state() -> SegmentedFriState {
         let mut state = SegmentedFriState::new_empty(8);
         for slot in [1u32, 3, 5] {
@@ -489,6 +568,45 @@ mod tests {
         assert!(matches!(
             build_state_delta_action_surface(&state(), &[body], &[[0u8; 32]], 1),
             Err(StateDeltaError::ClaimsCommitmentMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn exact_expansion_reads_new_upper_half_as_virtual_zero_without_state_clone() {
+        let state = state();
+        let mint = coinbase_body(300);
+        let surface = build_exact_action_surface_at_log_slots(
+            &state,
+            9,
+            std::slice::from_ref(&mint),
+            &[mint.claims_commitment()],
+            3,
+        )
+        .unwrap();
+        assert_eq!(surface.touched_indices, vec![300]);
+        assert_eq!(surface.old_slots, vec![SlotValue::EMPTY]);
+        assert_eq!(surface.mints, 1);
+
+        let impossible_spend = body(300, 2, Address([1u8; 32]));
+        assert!(matches!(
+            build_exact_action_surface_at_log_slots(
+                &state,
+                9,
+                std::slice::from_ref(&impossible_spend),
+                &[impossible_spend.claims_commitment()],
+                3,
+            ),
+            Err(StateDeltaError::InputMismatch { .. })
+        ));
+        assert!(matches!(
+            build_exact_action_surface_at_log_slots(
+                &state,
+                10,
+                std::slice::from_ref(&mint),
+                &[mint.claims_commitment()],
+                3,
+            ),
+            Err(StateDeltaError::InvalidSlotDomain)
         ));
     }
 }

@@ -35,7 +35,9 @@ use noid_chain::consensus::wire_limits::{
 };
 use noid_chain::consensus::ConsensusError;
 use noid_chain::state::ChainState;
-use noid_chain::state_delta::{build_exact_action_surface, ExactActionSurface, StateDeltaError};
+use noid_chain::state_delta::{
+    build_exact_action_surface_at_log_slots, ExactActionSurface, StateDeltaError,
+};
 
 use crate::{BlockAuthSidecar, BlockProof, VerifyBlockError};
 
@@ -563,20 +565,6 @@ fn build_exact_surface_for_block(
     block: &Block,
     state: &ChainState,
 ) -> Result<ExactActionSurface, VerifyBlockError> {
-    let child_log_slots = block.header.log_slots as usize;
-    let mut expanded_state;
-    let surface_state = if state.state.log_slots() == child_log_slots {
-        &state.state
-    } else if state.state.log_slots().saturating_add(1) == child_log_slots {
-        // Expansion is rare.  Ordinary blocks borrow the resident state
-        // directly and allocate no second full segment image.
-        expanded_state = state.state.clone();
-        expanded_state.expand();
-        &expanded_state
-    } else {
-        return Err(VerifyBlockError::ShapeMismatch);
-    };
-
     // Preserve the consensus block order exactly.  In particular the coinbase
     // is first, so its live outputs consume the first creation IDs.  Reordering
     // it behind user transactions would reconstruct a different packed state
@@ -587,8 +575,14 @@ fn build_exact_surface_for_block(
         .map(|tx| tx.body.clone())
         .collect();
     let commitments: Vec<[u8; 32]> = bodies.iter().map(|body| body.claims_commitment()).collect();
-    build_exact_action_surface(surface_state, &bodies, &commitments, state.alloc_counter)
-        .map_err(map_state_delta_error)
+    build_exact_action_surface_at_log_slots(
+        &state.state,
+        block.header.log_slots,
+        &bodies,
+        &commitments,
+        state.alloc_counter,
+    )
+    .map_err(map_state_delta_error)
 }
 
 fn map_state_delta_error(err: StateDeltaError) -> VerifyBlockError {
@@ -625,6 +619,7 @@ fn map_state_delta_error(err: StateDeltaError) -> VerifyBlockError {
         StateDeltaError::SlotOutOfRange { tx_index } => {
             VerifyBlockError::ExactStateSurfaceSlotOutOfRange { tx_index }
         }
+        StateDeltaError::InvalidSlotDomain => VerifyBlockError::ShapeMismatch,
         StateDeltaError::AllocationCounterOverflow {
             tx_index,
             output_index,
@@ -1398,5 +1393,21 @@ mod tests {
                 op_index: 7,
             }
         ));
+    }
+
+    #[test]
+    fn exact_surface_expansion_path_never_clones_segment_payloads() {
+        let source = include_str!("validate.rs");
+        let function = source
+            .split("fn build_exact_surface_for_block(")
+            .nth(1)
+            .expect("exact surface builder")
+            .split("fn map_state_delta_error")
+            .next()
+            .expect("exact surface builder boundary");
+        assert!(function.contains("build_exact_action_surface_at_log_slots"));
+        assert!(!function.contains("state.state.clone"));
+        assert!(!function.contains("expanded_state"));
+        assert!(!function.contains(".expand()"));
     }
 }
