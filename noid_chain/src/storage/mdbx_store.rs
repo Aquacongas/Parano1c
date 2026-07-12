@@ -313,6 +313,156 @@ pub struct RecursiveProofJobResult {
     pub bytes: Vec<u8>,
 }
 
+/// One atomically loaded, ownership-transferring input bundle for the selected
+/// recursive proof worker.
+///
+/// All fields come from one MDBX read snapshot.  In particular,
+/// `source_tip` names the exact canonical tip against which the current and
+/// parent headers were checked.  Large records are length-preflighted before
+/// allocation and this type deliberately does not implement `Clone`: the
+/// worker must move each payload into the next phase instead of duplicating a
+/// block proof or authorization sidecar in RAM.
+#[derive(Debug)]
+pub struct ClaimedRecursiveProofJobInputs {
+    pub job: RecursiveProofJob,
+    pub source_tip: (u64, [u8; 32]),
+    pub parent_header: BlockHeader,
+    pub block_header: BlockHeader,
+    pub user_transaction_count: usize,
+    pub block_bytes: Vec<u8>,
+    pub block_proof_bytes: Vec<u8>,
+    pub block_auth_sidecar_bytes: Vec<u8>,
+    pub previous_result: Option<RecursiveProofJobResult>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ClaimedRecursiveProofInputLengths {
+    block: Option<usize>,
+    proof: Option<usize>,
+    sidecar: Option<usize>,
+    previous_result: Option<usize>,
+}
+
+fn validate_claimed_recursive_proof_input_lengths(
+    height: u64,
+    lengths: ClaimedRecursiveProofInputLengths,
+) -> Result<(), StoreError> {
+    use crate::consensus::wire_limits::{
+        MAX_BLOCK_AUTH_SIDECAR_BYTES, MAX_BLOCK_BYTES, MAX_BLOCK_PROOF_BYTES,
+        proof_sidecar_combined_len_ok,
+    };
+
+    let block_len = lengths.block.ok_or(StoreError::Decode(
+        "recursive proof source block is missing or pruned",
+    ))?;
+    if block_len == 0 || block_len > MAX_BLOCK_BYTES {
+        return Err(StoreError::Decode(
+            "recursive proof source block stored length exceeds hard bounds",
+        ));
+    }
+
+    if lengths.proof.is_some() != lengths.sidecar.is_some() {
+        return Err(StoreError::Decode(
+            "recursive proof source proof/sidecar presence mismatch",
+        ));
+    }
+    if let (Some(proof_len), Some(sidecar_len)) = (lengths.proof, lengths.sidecar) {
+        if proof_len > MAX_BLOCK_PROOF_BYTES
+            || sidecar_len > MAX_BLOCK_AUTH_SIDECAR_BYTES
+            || !proof_sidecar_combined_len_ok(proof_len, sidecar_len)
+        {
+            return Err(StoreError::Decode(
+                "recursive proof source proof/sidecar stored length exceeds hard bounds",
+            ));
+        }
+    }
+
+    if height == 1 {
+        if lengths.previous_result.is_some() {
+            return Err(StoreError::Decode(
+                "height-one recursive proof input unexpectedly selected a predecessor result",
+            ));
+        }
+    } else {
+        let result_len = lengths.previous_result.ok_or(StoreError::Decode(
+            "previous recursive proof result is missing",
+        ))?;
+        if result_len < RECURSIVE_PROOF_RESULT_HEADER_BYTES
+            || result_len
+                > RECURSIVE_PROOF_RESULT_HEADER_BYTES + MAX_RECURSIVE_PROOF_JOB_RESULT_BYTES
+        {
+            return Err(StoreError::Decode(
+                "previous recursive proof result stored length exceeds hard bounds",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Check the retained block framing and detached-witness class without
+/// materializing a second transaction vector.
+fn inspect_recursive_proof_source_block(
+    bytes: &[u8],
+    expected_header: &BlockHeader,
+    expected_tier: RecursiveProofJobTier,
+) -> Result<usize, StoreError> {
+    use crate::block::{
+        BLOCK_WIRE_FIXED_OVERHEAD, BLOCK_WIRE_HEADER_OFFSET, BLOCK_WIRE_MARKER,
+        canonical_block_wire_len,
+    };
+    use crate::wire::BLOCK_HEADER_WIRE_SIZE;
+
+    if bytes.len() < BLOCK_WIRE_FIXED_OVERHEAD || bytes[0] != BLOCK_WIRE_MARKER {
+        return Err(StoreError::Decode(
+            "recursive proof source block framing is invalid",
+        ));
+    }
+    let header_end = BLOCK_WIRE_HEADER_OFFSET + BLOCK_HEADER_WIRE_SIZE;
+    let stored_header = decode_header(&bytes[BLOCK_WIRE_HEADER_OFFSET..header_end]).ok_or(
+        StoreError::Decode("recursive proof source block header is invalid"),
+    )?;
+    if stored_header != *expected_header {
+        return Err(StoreError::Decode(
+            "recursive proof source block header is not canonical",
+        ));
+    }
+    let tx_count = u32::from_le_bytes(
+        bytes[header_end..BLOCK_WIRE_FIXED_OVERHEAD]
+            .try_into()
+            .map_err(|_| StoreError::Decode("recursive proof source tx count is invalid"))?,
+    ) as usize;
+    let expected_len = canonical_block_wire_len(tx_count)
+        .map_err(|_| StoreError::Decode("recursive proof source tx count exceeds hard bounds"))?;
+    if bytes.len() != expected_len || tx_count == 0 {
+        return Err(StoreError::Decode(
+            "recursive proof source block has a non-canonical stored length",
+        ));
+    }
+
+    let transaction_bytes = &bytes[BLOCK_WIRE_FIXED_OVERHEAD..];
+    for (index, encoded) in transaction_bytes
+        .chunks_exact(noid_tx::TX_BODY_WIRE_SIZE)
+        .enumerate()
+    {
+        let body = noid_tx::TxBody::from_bytes(encoded)
+            .map_err(|_| StoreError::Decode("recursive proof source transaction is invalid"))?;
+        if (index == 0) != body.is_coinbase {
+            return Err(StoreError::Decode(
+                "recursive proof source block has a non-canonical coinbase position",
+            ));
+        }
+    }
+    let user_transaction_count = tx_count - 1;
+    if RecursiveProofJobTier::for_user_transaction_count(user_transaction_count)
+        != Some(expected_tier)
+    {
+        return Err(StoreError::Decode(
+            "recursive proof job tier does not match its retained block",
+        ));
+    }
+    Ok(user_transaction_count)
+}
+
 #[inline]
 fn recursive_proof_height_key(height: u64) -> [u8; 8] {
     height.to_be_bytes()
@@ -715,6 +865,253 @@ impl MdbxStore {
         )?;
         txn.commit()?;
         Ok(Some(job))
+    }
+
+    /// Load every retained byte object needed to prove one already-claimed
+    /// selected recursive job from a single canonical MDBX snapshot.
+    ///
+    /// The exact fixed-width `claimed` record must still be Running. The
+    /// method validates the source tip, current/parent header link, retained
+    /// block framing and tier, detached witness presence, and (above height
+    /// one) the canonical completed predecessor. Every large value is queried
+    /// as [`ObjectLength`] and all individual/combined limits are checked
+    /// before the first large `Vec` is allocated.
+    pub fn load_claimed_recursive_proof_job_inputs(
+        &self,
+        claimed: RecursiveProofJob,
+    ) -> Result<ClaimedRecursiveProofJobInputs, StoreError> {
+        use crate::wire::BLOCK_HEADER_WIRE_SIZE;
+
+        if claimed.height == 0 {
+            return Err(StoreError::Decode(
+                "genesis cannot be a selected recursive proof job",
+            ));
+        }
+        if claimed.state != RecursiveProofJobState::Running {
+            return Err(StoreError::Decode(
+                "recursive proof input loader requires a running claim",
+            ));
+        }
+
+        let txn = self.db.begin_ro_txn()?;
+        let jobs = txn.open_table(Some(T_RECURSIVE_PROOF_JOBS))?;
+        let key = recursive_proof_height_key(claimed.height);
+        let durable_job_raw: Option<[u8; RECURSIVE_PROOF_JOB_ENCODED_BYTES]> =
+            txn.get(&jobs, &key)?;
+        let durable_job = durable_job_raw
+            .as_ref()
+            .and_then(|raw| decode_recursive_proof_job(claimed.height, raw))
+            .ok_or(StoreError::Decode(
+                "recursive proof job is missing or malformed",
+            ))?;
+        if durable_job != claimed || durable_job.state != RecursiveProofJobState::Running {
+            return Err(StoreError::Decode(
+                "recursive proof input does not match the running durable claim",
+            ));
+        }
+
+        let tip_table = txn.open_table(Some(T_CHAIN_TIP))?;
+        let tip_raw: Option<[u8; 40]> = txn.get(&tip_table, KEY_TIP)?;
+        let source_tip = tip_raw
+            .as_ref()
+            .and_then(|raw| decode_chain_tip(raw))
+            .ok_or(StoreError::Decode(
+                "canonical source tip is missing or malformed",
+            ))?;
+        if source_tip.0 < claimed.height {
+            return Err(StoreError::Decode(
+                "recursive proof job is above the canonical source tip",
+            ));
+        }
+
+        let headers = txn.open_table(Some(T_HEADERS))?;
+        let header_raw: Option<[u8; BLOCK_HEADER_WIRE_SIZE]> =
+            txn.get(&headers, &u64_key(claimed.height))?;
+        let block_header = header_raw
+            .as_ref()
+            .and_then(|raw| decode_header(raw))
+            .ok_or(StoreError::Decode(
+                "recursive proof current canonical header is missing or malformed",
+            ))?;
+        if block_header.height != claimed.height
+            || crate::block_header::block_id(&block_header) != claimed.block_hash
+        {
+            return Err(StoreError::Decode(
+                "recursive proof job hash is not canonical at height",
+            ));
+        }
+
+        let parent_height = claimed.height - 1;
+        let parent_raw: Option<[u8; BLOCK_HEADER_WIRE_SIZE]> =
+            txn.get(&headers, &u64_key(parent_height))?;
+        let parent_header = parent_raw
+            .as_ref()
+            .and_then(|raw| decode_header(raw))
+            .ok_or(StoreError::Decode(
+                "recursive proof parent canonical header is missing or malformed",
+            ))?;
+        let parent_hash = crate::block_header::block_id(&parent_header);
+        if parent_header.height != parent_height || block_header.prev_block_hash != parent_hash {
+            return Err(StoreError::Decode(
+                "recursive proof current/parent canonical header link is invalid",
+            ));
+        }
+
+        if source_tip.0 == claimed.height {
+            if source_tip.1 != claimed.block_hash {
+                return Err(StoreError::Decode(
+                    "recursive proof source tip hash disagrees with current header",
+                ));
+            }
+        } else {
+            let source_header_raw: Option<[u8; BLOCK_HEADER_WIRE_SIZE]> =
+                txn.get(&headers, &u64_key(source_tip.0))?;
+            let source_header = source_header_raw
+                .as_ref()
+                .and_then(|raw| decode_header(raw))
+                .ok_or(StoreError::Decode(
+                    "recursive proof source tip header is missing or malformed",
+                ))?;
+            if source_header.height != source_tip.0
+                || crate::block_header::block_id(&source_header) != source_tip.1
+            {
+                return Err(StoreError::Decode(
+                    "recursive proof source tip is not bound to its canonical header",
+                ));
+            }
+        }
+
+        // Query all large record lengths before allocating any of their byte
+        // vectors. A malformed combined proof/sidecar therefore cannot leave
+        // a valid 32 MiB sibling resident while failing its second preflight.
+        let recent_blocks = txn.open_table(Some(T_RECENT_BLOCKS))?;
+        let block_length: Option<ObjectLength> =
+            txn.get(&recent_blocks, &u64_key(claimed.height))?;
+        let block_proofs = txn.open_table(Some(T_BLOCK_PROOFS))?;
+        let proof_length: Option<ObjectLength> =
+            txn.get(&block_proofs, &u64_key(claimed.height))?;
+        let sidecars = txn.open_table(Some(T_BLOCK_AUTH_SIDECARS))?;
+        let sidecar_length: Option<ObjectLength> = txn.get(&sidecars, &u64_key(claimed.height))?;
+
+        let results = txn.open_table(Some(T_RECURSIVE_PROOF_RESULTS))?;
+        let mut previous_job = None;
+        let previous_result_length = if claimed.height == 1 {
+            None
+        } else {
+            let previous_key = recursive_proof_height_key(parent_height);
+            let previous_job_raw: Option<[u8; RECURSIVE_PROOF_JOB_ENCODED_BYTES]> =
+                txn.get(&jobs, &previous_key)?;
+            let decoded = previous_job_raw
+                .as_ref()
+                .and_then(|raw| decode_recursive_proof_job(parent_height, raw))
+                .ok_or(StoreError::Decode(
+                    "previous recursive proof job is missing or malformed",
+                ))?;
+            if decoded.state != RecursiveProofJobState::Complete
+                || decoded.block_hash != parent_hash
+            {
+                return Err(StoreError::Decode(
+                    "previous recursive proof job is not complete and canonical",
+                ));
+            }
+            previous_job = Some(decoded);
+            txn.get::<ObjectLength>(&results, &previous_key)?
+        };
+
+        let lengths = ClaimedRecursiveProofInputLengths {
+            block: block_length.map(|ObjectLength(length)| length),
+            proof: proof_length.map(|ObjectLength(length)| length),
+            sidecar: sidecar_length.map(|ObjectLength(length)| length),
+            previous_result: previous_result_length.map(|ObjectLength(length)| length),
+        };
+        validate_claimed_recursive_proof_input_lengths(claimed.height, lengths)?;
+
+        let block_bytes: Vec<u8> =
+            txn.get(&recent_blocks, &u64_key(claimed.height))?
+                .ok_or(StoreError::Decode(
+                    "recursive proof source block disappeared during atomic load",
+                ))?;
+        if Some(block_bytes.len()) != lengths.block {
+            return Err(StoreError::Decode(
+                "recursive proof source block length changed during atomic load",
+            ));
+        }
+        let user_transaction_count =
+            inspect_recursive_proof_source_block(&block_bytes, &block_header, claimed.tier)?;
+
+        let (block_proof_bytes, block_auth_sidecar_bytes) = match (lengths.proof, lengths.sidecar) {
+            (None, None) => (Vec::new(), Vec::new()),
+            (Some(expected_proof_len), Some(expected_sidecar_len)) => {
+                let proof: Vec<u8> =
+                    txn.get(&block_proofs, &u64_key(claimed.height))?
+                        .ok_or(StoreError::Decode(
+                            "recursive proof source BlockProof disappeared during atomic load",
+                        ))?;
+                if proof.len() != expected_proof_len {
+                    return Err(StoreError::Decode(
+                        "recursive proof source BlockProof length changed during atomic load",
+                    ));
+                }
+                let sidecar: Vec<u8> =
+                    txn.get(&sidecars, &u64_key(claimed.height))?
+                        .ok_or(StoreError::Decode(
+                            "recursive proof source auth sidecar disappeared during atomic load",
+                        ))?;
+                if sidecar.len() != expected_sidecar_len {
+                    return Err(StoreError::Decode(
+                        "recursive proof source auth sidecar length changed during atomic load",
+                    ));
+                }
+                (proof, sidecar)
+            }
+            _ => unreachable!("presence equality checked before allocation"),
+        };
+        if user_transaction_count == 0 {
+            if lengths.proof.is_some() {
+                return Err(StoreError::Decode(
+                    "coinbase-only recursive proof source retained detached witnesses",
+                ));
+            }
+        } else if block_proof_bytes.is_empty() || block_auth_sidecar_bytes.is_empty() {
+            return Err(StoreError::Decode(
+                "user recursive proof source is missing detached witnesses",
+            ));
+        }
+
+        let previous_result = if let Some(previous_job) = previous_job {
+            let previous_key = recursive_proof_height_key(parent_height);
+            let encoded: Vec<u8> = txn.get(&results, &previous_key)?.ok_or(StoreError::Decode(
+                "previous recursive proof result disappeared during atomic load",
+            ))?;
+            if Some(encoded.len()) != lengths.previous_result {
+                return Err(StoreError::Decode(
+                    "previous recursive proof result length changed during atomic load",
+                ));
+            }
+            let decoded = decode_recursive_proof_result(parent_height, encoded).ok_or(
+                StoreError::Decode("previous recursive proof result is malformed"),
+            )?;
+            if decoded.block_hash != previous_job.block_hash || decoded.block_hash != parent_hash {
+                return Err(StoreError::Decode(
+                    "previous recursive proof result hash is not the current parent",
+                ));
+            }
+            Some(decoded)
+        } else {
+            None
+        };
+
+        Ok(ClaimedRecursiveProofJobInputs {
+            job: claimed,
+            source_tip,
+            parent_header,
+            block_header,
+            user_transaction_count,
+            block_bytes,
+            block_proof_bytes,
+            block_auth_sidecar_bytes,
+            previous_result,
+        })
     }
 
     /// Store one bounded opaque proof and mark its running job complete in the
@@ -3248,6 +3645,162 @@ impl crate::storage::BlockStore for MdbxStore {
 mod tests {
     use super::*;
 
+    struct RecursiveLoaderFixture {
+        claimed: RecursiveProofJob,
+        parent_header: BlockHeader,
+        block_header: BlockHeader,
+        block_bytes: Vec<u8>,
+        block_proof_bytes: Vec<u8>,
+        block_auth_sidecar_bytes: Vec<u8>,
+        previous_result_bytes: Vec<u8>,
+    }
+
+    fn recursive_loader_coinbase(tag: u8) -> noid_tx::Transaction {
+        use noid_poseidon2b::primitives::Address;
+        use noid_tx::{TX_INPUTS, TX_OUTPUTS, TxBody, TxInput, TxOutput, output_bitmap_bit};
+
+        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        outputs[0] = TxOutput {
+            slot_index: u32::from(tag),
+            amount: 50,
+            owner: Address([tag; 32]),
+        };
+        noid_tx::Transaction::new(TxBody {
+            epoch_anchor: [tag; 32],
+            fee: 0,
+            input_owner: Address([0; 32]),
+            inputs: [TxInput::dummy(); TX_INPUTS],
+            outputs,
+            validity_bitmap: output_bitmap_bit(0),
+            is_coinbase: true,
+        })
+    }
+
+    fn recursive_loader_user(tag: u8) -> noid_tx::Transaction {
+        use noid_poseidon2b::primitives::Address;
+        use noid_tx::{TX_INPUTS, TX_OUTPUTS, TxBody, TxInput, TxOutput, output_bitmap_bit};
+
+        let mut inputs = [TxInput::dummy(); TX_INPUTS];
+        inputs[0] = TxInput {
+            slot_index: 100 + u32::from(tag),
+            amount: 11,
+            creation_id: u64::from(tag),
+        };
+        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        outputs[0] = TxOutput {
+            slot_index: 200 + u32::from(tag),
+            amount: 10,
+            owner: Address([tag.wrapping_add(1); 32]),
+        };
+        noid_tx::Transaction::new(TxBody {
+            epoch_anchor: [tag; 32],
+            fee: 1,
+            input_owner: Address([tag; 32]),
+            inputs,
+            outputs,
+            validity_bitmap: 1 | output_bitmap_bit(0),
+            is_coinbase: false,
+        })
+    }
+
+    fn put_recursive_loader_records(
+        store: &MdbxStore,
+        height: u64,
+        tip_hash: [u8; 32],
+        block_bytes: &[u8],
+        proof: Option<&[u8]>,
+        sidecar: Option<&[u8]>,
+    ) {
+        let txn = store.db.begin_rw_txn().unwrap();
+        let tip_table = txn.open_table(Some(T_CHAIN_TIP)).unwrap();
+        txn.put(
+            &tip_table,
+            KEY_TIP,
+            encode_chain_tip(height, &tip_hash),
+            WriteFlags::empty(),
+        )
+        .unwrap();
+        let recent = txn.open_table(Some(T_RECENT_BLOCKS)).unwrap();
+        txn.put(&recent, u64_key(height), block_bytes, WriteFlags::empty())
+            .unwrap();
+        if let Some(proof) = proof {
+            let table = txn.open_table(Some(T_BLOCK_PROOFS)).unwrap();
+            txn.put(&table, u64_key(height), proof, WriteFlags::empty())
+                .unwrap();
+        }
+        if let Some(sidecar) = sidecar {
+            let table = txn.open_table(Some(T_BLOCK_AUTH_SIDECARS)).unwrap();
+            txn.put(&table, u64_key(height), sidecar, WriteFlags::empty())
+                .unwrap();
+        }
+        txn.commit().unwrap();
+    }
+
+    fn recursive_loader_fixture(store: &MdbxStore) -> RecursiveLoaderFixture {
+        use crate::block::Block;
+
+        let genesis = crate::consensus::genesis::genesis_header();
+        let genesis_hash = crate::hash_block_header(&genesis);
+        store.put_header_only(&genesis, &genesis_hash).unwrap();
+
+        let block_one_transactions = vec![recursive_loader_coinbase(1)];
+        let mut parent_header = genesis;
+        parent_header.height = 1;
+        parent_header.prev_block_hash = genesis_hash;
+        parent_header.timestamp = parent_header.timestamp.saturating_add(1);
+        parent_header.nonce = 0x101;
+        parent_header.tx_root = crate::block::compute_tx_root(&block_one_transactions);
+        let parent_hash = crate::hash_block_header(&parent_header);
+        store.put_header_only(&parent_header, &parent_hash).unwrap();
+        store
+            .enqueue_recursive_proof_job(1, parent_hash, RecursiveProofJobTier::B8)
+            .unwrap();
+        let parent_claim = store.claim_next_recursive_proof_job().unwrap().unwrap();
+        let previous_result_bytes = b"selected-link-height-one".to_vec();
+        store
+            .complete_recursive_proof_job(1, parent_claim.block_hash, &previous_result_bytes)
+            .unwrap();
+
+        let transactions = vec![recursive_loader_coinbase(2), recursive_loader_user(2)];
+        let mut block_header = parent_header;
+        block_header.height = 2;
+        block_header.prev_block_hash = parent_hash;
+        block_header.timestamp = block_header.timestamp.saturating_add(1);
+        block_header.nonce = 0x202;
+        block_header.tx_root = crate::block::compute_tx_root(&transactions);
+        let block_hash = crate::hash_block_header(&block_header);
+        store.put_header_only(&block_header, &block_hash).unwrap();
+        let block_bytes = Block {
+            header: block_header,
+            transactions,
+        }
+        .to_bytes();
+        let block_proof_bytes = b"bounded-block-proof".to_vec();
+        let block_auth_sidecar_bytes = b"bounded-auth-sidecar".to_vec();
+        put_recursive_loader_records(
+            store,
+            2,
+            block_hash,
+            &block_bytes,
+            Some(&block_proof_bytes),
+            Some(&block_auth_sidecar_bytes),
+        );
+        store
+            .enqueue_recursive_proof_job(2, block_hash, RecursiveProofJobTier::B8)
+            .unwrap();
+        let claimed = store.claim_next_recursive_proof_job().unwrap().unwrap();
+
+        RecursiveLoaderFixture {
+            claimed,
+            parent_header,
+            block_header,
+            block_bytes,
+            block_proof_bytes,
+            block_auth_sidecar_bytes,
+            previous_result_bytes,
+        }
+    }
+
     fn put_recursive_job_header(
         store: &MdbxStore,
         height: u64,
@@ -3268,6 +3821,274 @@ mod tests {
         txn.clear_table(&table).unwrap();
         txn.put(&table, key, value, WriteFlags::empty()).unwrap();
         txn.commit().unwrap();
+    }
+
+    #[test]
+    fn claimed_recursive_proof_inputs_load_one_atomic_owned_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let fixture = recursive_loader_fixture(&store);
+
+        let loaded = store
+            .load_claimed_recursive_proof_job_inputs(fixture.claimed)
+            .unwrap();
+        assert_eq!(loaded.job, fixture.claimed);
+        assert_eq!(loaded.source_tip, (2, fixture.claimed.block_hash));
+        assert_eq!(loaded.parent_header, fixture.parent_header);
+        assert_eq!(loaded.block_header, fixture.block_header);
+        assert_eq!(loaded.user_transaction_count, 1);
+        assert_eq!(loaded.block_bytes, fixture.block_bytes);
+        assert_eq!(loaded.block_proof_bytes, fixture.block_proof_bytes);
+        assert_eq!(
+            loaded.block_auth_sidecar_bytes,
+            fixture.block_auth_sidecar_bytes
+        );
+        let predecessor = loaded.previous_result.unwrap();
+        assert_eq!(predecessor.height, 1);
+        assert_eq!(
+            predecessor.block_hash,
+            crate::hash_block_header(&fixture.parent_header)
+        );
+        assert_eq!(predecessor.bytes, fixture.previous_result_bytes);
+    }
+
+    #[test]
+    fn height_one_recursive_proof_inputs_have_no_predecessor_allocation() {
+        use crate::block::Block;
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let genesis = crate::consensus::genesis::genesis_header();
+        let genesis_hash = crate::hash_block_header(&genesis);
+        store.put_header_only(&genesis, &genesis_hash).unwrap();
+        let transactions = vec![recursive_loader_coinbase(7)];
+        let mut header = genesis;
+        header.height = 1;
+        header.prev_block_hash = genesis_hash;
+        header.timestamp = header.timestamp.saturating_add(1);
+        header.nonce = 7;
+        header.tx_root = crate::block::compute_tx_root(&transactions);
+        let hash = crate::hash_block_header(&header);
+        store.put_header_only(&header, &hash).unwrap();
+        let block = Block {
+            header,
+            transactions,
+        }
+        .to_bytes();
+        put_recursive_loader_records(&store, 1, hash, &block, None, None);
+        store
+            .enqueue_recursive_proof_job(1, hash, RecursiveProofJobTier::B8)
+            .unwrap();
+        let claimed = store.claim_next_recursive_proof_job().unwrap().unwrap();
+
+        let loaded = store
+            .load_claimed_recursive_proof_job_inputs(claimed)
+            .unwrap();
+        assert_eq!(loaded.user_transaction_count, 0);
+        assert!(loaded.block_proof_bytes.is_empty());
+        assert!(loaded.block_auth_sidecar_bytes.is_empty());
+        assert!(loaded.previous_result.is_none());
+    }
+
+    #[test]
+    fn claimed_recursive_proof_input_loader_rejects_fork_hash_and_job_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let fixture = recursive_loader_fixture(&store);
+
+        let mut wrong_claim = fixture.claimed;
+        wrong_claim.block_hash[0] ^= 1;
+        assert!(
+            store
+                .load_claimed_recursive_proof_job_inputs(wrong_claim)
+                .is_err()
+        );
+
+        store
+            .release_recursive_proof_job(fixture.claimed.height, fixture.claimed.block_hash)
+            .unwrap();
+        assert!(
+            store
+                .load_claimed_recursive_proof_job_inputs(fixture.claimed)
+                .is_err()
+        );
+
+        let claimed = store.claim_next_recursive_proof_job().unwrap().unwrap();
+        let mut fork_parent = fixture.parent_header;
+        fork_parent.nonce = fork_parent.nonce.wrapping_add(1);
+        let fork_parent_hash = crate::hash_block_header(&fork_parent);
+        store
+            .put_header_only(&fork_parent, &fork_parent_hash)
+            .unwrap();
+        assert!(
+            store
+                .load_claimed_recursive_proof_job_inputs(claimed)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn claimed_recursive_proof_input_loader_rejects_missing_and_oversized_material() {
+        use crate::consensus::wire_limits::MAX_BLOCK_BYTES;
+
+        let missing_directory = tempfile::tempdir().unwrap();
+        let missing_store = MdbxStore::open(missing_directory.path()).unwrap();
+        let missing_fixture = recursive_loader_fixture(&missing_store);
+        let txn = missing_store.db.begin_rw_txn().unwrap();
+        let proofs = txn.open_table(Some(T_BLOCK_PROOFS)).unwrap();
+        txn.del(&proofs, &u64_key(2), None).unwrap();
+        txn.commit().unwrap();
+        assert!(
+            missing_store
+                .load_claimed_recursive_proof_job_inputs(missing_fixture.claimed)
+                .is_err()
+        );
+
+        let oversized_directory = tempfile::tempdir().unwrap();
+        let oversized_store = MdbxStore::open(oversized_directory.path()).unwrap();
+        let oversized_fixture = recursive_loader_fixture(&oversized_store);
+        let oversized = vec![0u8; MAX_BLOCK_BYTES + 1];
+        let txn = oversized_store.db.begin_rw_txn().unwrap();
+        let recent = txn.open_table(Some(T_RECENT_BLOCKS)).unwrap();
+        txn.put(&recent, u64_key(2), &oversized, WriteFlags::empty())
+            .unwrap();
+        txn.commit().unwrap();
+        assert!(
+            oversized_store
+                .load_claimed_recursive_proof_job_inputs(oversized_fixture.claimed)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn claimed_recursive_proof_input_loader_requires_completed_predecessor() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let fixture = recursive_loader_fixture(&store);
+
+        let txn = store.db.begin_rw_txn().unwrap();
+        let jobs = txn.open_table(Some(T_RECURSIVE_PROOF_JOBS)).unwrap();
+        let previous_key = recursive_proof_height_key(1);
+        let previous_raw: [u8; RECURSIVE_PROOF_JOB_ENCODED_BYTES] =
+            txn.get(&jobs, &previous_key).unwrap().unwrap();
+        let mut previous = decode_recursive_proof_job(1, &previous_raw).unwrap();
+        previous.state = RecursiveProofJobState::Pending;
+        txn.put(
+            &jobs,
+            previous_key,
+            encode_recursive_proof_job(&previous),
+            WriteFlags::empty(),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+
+        assert!(
+            store
+                .load_claimed_recursive_proof_job_inputs(fixture.claimed)
+                .is_err()
+        );
+
+        let malformed_directory = tempfile::tempdir().unwrap();
+        let malformed_store = MdbxStore::open(malformed_directory.path()).unwrap();
+        let malformed_fixture = recursive_loader_fixture(&malformed_store);
+        let txn = malformed_store.db.begin_rw_txn().unwrap();
+        let results = txn.open_table(Some(T_RECURSIVE_PROOF_RESULTS)).unwrap();
+        let previous_key = recursive_proof_height_key(1);
+        let mut encoded: Vec<u8> = txn.get(&results, &previous_key).unwrap().unwrap();
+        encoded[36..40].copy_from_slice(&u32::MAX.to_le_bytes());
+        txn.put(&results, previous_key, encoded, WriteFlags::empty())
+            .unwrap();
+        txn.commit().unwrap();
+        assert!(malformed_store
+            .load_claimed_recursive_proof_job_inputs(malformed_fixture.claimed)
+            .is_err());
+    }
+
+    #[test]
+    fn claimed_recursive_proof_input_length_preflight_covers_all_large_records() {
+        use crate::consensus::wire_limits::{
+            MAX_BLOCK_AUTH_SIDECAR_BYTES, MAX_BLOCK_BYTES, MAX_BLOCK_PROOF_BYTES,
+            MAX_BLOCK_PROOF_PLUS_SIDECAR_BYTES,
+        };
+
+        let valid = ClaimedRecursiveProofInputLengths {
+            block: Some(MAX_BLOCK_BYTES),
+            proof: Some(MAX_BLOCK_PROOF_BYTES),
+            sidecar: Some(MAX_BLOCK_PROOF_PLUS_SIDECAR_BYTES - MAX_BLOCK_PROOF_BYTES),
+            previous_result: Some(RECURSIVE_PROOF_RESULT_HEADER_BYTES),
+        };
+        assert!(validate_claimed_recursive_proof_input_lengths(2, valid).is_ok());
+        for invalid in [
+            ClaimedRecursiveProofInputLengths {
+                block: Some(MAX_BLOCK_BYTES + 1),
+                ..valid
+            },
+            ClaimedRecursiveProofInputLengths {
+                proof: Some(MAX_BLOCK_PROOF_BYTES + 1),
+                ..valid
+            },
+            ClaimedRecursiveProofInputLengths {
+                sidecar: Some(MAX_BLOCK_AUTH_SIDECAR_BYTES + 1),
+                ..valid
+            },
+            ClaimedRecursiveProofInputLengths {
+                sidecar: Some(MAX_BLOCK_PROOF_PLUS_SIDECAR_BYTES - MAX_BLOCK_PROOF_BYTES + 1),
+                ..valid
+            },
+            ClaimedRecursiveProofInputLengths {
+                previous_result: Some(RECURSIVE_PROOF_RESULT_HEADER_BYTES - 1),
+                ..valid
+            },
+            ClaimedRecursiveProofInputLengths {
+                previous_result: Some(
+                    RECURSIVE_PROOF_RESULT_HEADER_BYTES
+                        + MAX_RECURSIVE_PROOF_JOB_RESULT_BYTES
+                        + 1,
+                ),
+                ..valid
+            },
+        ] {
+            assert!(validate_claimed_recursive_proof_input_lengths(2, invalid).is_err());
+        }
+        assert!(validate_claimed_recursive_proof_input_lengths(
+            2,
+            ClaimedRecursiveProofInputLengths {
+                sidecar: None,
+                ..valid
+            },
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn claimed_recursive_proof_loader_source_keeps_preflight_and_no_clone_contract() {
+        let source = include_str!("mdbx_store.rs");
+        let dto = source
+            .find("pub struct ClaimedRecursiveProofJobInputs")
+            .unwrap();
+        let dto_prefix = &source[dto.saturating_sub(32)..dto];
+        assert!(dto_prefix.contains("#[derive(Debug)]"));
+        assert!(!dto_prefix.contains("Clone"));
+
+        let method = source
+            .find("pub fn load_claimed_recursive_proof_job_inputs")
+            .unwrap();
+        let body = &source[method..];
+        let block_length = body.find("let block_length: Option<ObjectLength>").unwrap();
+        let proof_length = body.find("let proof_length: Option<ObjectLength>").unwrap();
+        let sidecar_length = body
+            .find("let sidecar_length: Option<ObjectLength>")
+            .unwrap();
+        let predecessor_length = body.find("let previous_result_length").unwrap();
+        let all_limits = body
+            .find("validate_claimed_recursive_proof_input_lengths")
+            .unwrap();
+        let first_large_get = body.find("let block_bytes: Vec<u8>").unwrap();
+        assert!(block_length < all_limits);
+        assert!(proof_length < all_limits);
+        assert!(sidecar_length < all_limits);
+        assert!(predecessor_length < all_limits);
+        assert!(all_limits < first_large_get);
     }
 
     #[test]
