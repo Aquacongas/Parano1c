@@ -2080,6 +2080,45 @@ mod tests {
     };
 
     #[test]
+    fn accepted_wallet_callback_stays_post_commit_pre_mempool_and_non_rejecting() {
+        let miner_source = include_str!("../../noid_miner/src/miner.rs");
+        let apply = miner_source
+            .split_once("async fn apply_found_block(")
+            .expect("miner accepted-block apply exists")
+            .1
+            .split_once("// Block certificate assembly")
+            .expect("accepted-block apply has a bounded source section")
+            .0;
+        let durable_apply = apply
+            .find("ctx.apply_next_block(")
+            .expect("canonical durable apply precedes callbacks");
+        let wallet_callback = apply
+            .find("h(&block_owned);")
+            .expect("wallet callback exists in accepted apply");
+        let mempool_publish = apply
+            .find(".on_new_block(&confirmed, block.header.height, new_view)")
+            .expect("mempool publication follows accepted apply");
+        assert!(durable_apply < wallet_callback);
+        assert!(wallet_callback < mempool_publish);
+
+        let node_source = include_str!("main.rs");
+        let wallet_wrapper_marker = ["fn update_wallet_", "for_block("].concat();
+        let wallet_wrapper = node_source
+            .split_once(&wallet_wrapper_marker)
+            .expect("node wallet callback wrapper exists")
+            .1
+            .split_once("// Helpers")
+            .expect("wallet callback wrapper has a bounded source section")
+            .0;
+        assert!(wallet_wrapper.contains("if let Err(error) = wallet::update_for_accepted_block"));
+        assert!(wallet_wrapper.contains("\"committed block but wallet update failed\""));
+        assert!(
+            !wallet_wrapper.contains("-> Result"),
+            "an already-committed block must not become a rejection through its wallet callback"
+        );
+    }
+
+    #[test]
     fn snapshot_segment_rejects_delayed_same_peer_cross_session_boundary() {
         assert!(state_segment_response_matches_snapshot_boundary(
             144, [0xA5; 32], 144, [0xA5; 32]

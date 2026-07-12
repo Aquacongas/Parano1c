@@ -9012,6 +9012,177 @@ mod tests {
         })
     }
 
+    struct ProductionResizeRestartFixture {
+        parent: BlockHeader,
+        parent_hash: [u8; 32],
+        parent_meta: ConsensusMeta,
+        child: BlockHeader,
+        child_hash: [u8; 32],
+        child_meta: ConsensusMeta,
+        child_tx_hash: TxBodyHash,
+        child_undo: BlockUndoLog,
+        lower_owner: noid_poseidon2b::primitives::Address,
+        upper_owner: noid_poseidon2b::primitives::Address,
+        upper_slot_index: u32,
+    }
+
+    /// Install a depth-24 parent and its accepted depth-25 child using the
+    /// production 2^16-slot segment geometry.  Only segments 0 and 256 are
+    /// materialized, so this exercises the real grow/shrink boundary while
+    /// retaining bounded memory and disk work.
+    fn install_production_resize_restart_fixture(
+        store: &MdbxStore,
+        promote_child_coverage: bool,
+        child_fault: Option<AuthoritativeMutationFault>,
+    ) -> ProductionResizeRestartFixture {
+        use crate::consensus::params::LOG_SEGMENT_SIZE;
+        use noid_poseidon2b::primitives::Address;
+
+        const PARENT_LOG_SLOTS: u32 = 24;
+        const CHILD_LOG_SLOTS: u32 = PARENT_LOG_SLOTS + 1;
+        const LOWER_SLOT_INDEX: u32 = 1;
+
+        let upper_slot_index = 1u32 << PARENT_LOG_SLOTS;
+        let upper_segment_id = (upper_slot_index >> LOG_SEGMENT_SIZE) as u16;
+        assert_eq!(upper_segment_id, 256);
+
+        let lower_owner = Address([0xD1; 32]);
+        let upper_owner = Address([0xD2; 32]);
+        let lower_slot = SlotValue::with_owner_fields(41, 1, lower_owner.as_fields());
+        let upper_slot = SlotValue::with_owner_fields(73, 2, upper_owner.as_fields());
+
+        let mut lower_columns = SegmentColumns::new_zero(1usize << LOG_SEGMENT_SIZE);
+        lower_columns.values[LOWER_SLOT_INDEX as usize] = lower_slot.value;
+        lower_columns.owners_hi[LOWER_SLOT_INDEX as usize] = lower_slot.owner_hi;
+        lower_columns.owners_lo[LOWER_SLOT_INDEX as usize] = lower_slot.owner_lo;
+
+        let mut parent = crate::consensus::genesis::genesis_header();
+        parent.log_slots = PARENT_LOG_SLOTS;
+        parent.state_root = [0x31; 32];
+        parent.active_slot_count = 1;
+        parent.alloc_counter = 1;
+        let parent_hash = crate::hash_block_header(&parent);
+        let parent_meta = ConsensusMeta {
+            tip_height: 0,
+            tip_hash: parent_hash,
+            cumulative_chainwork: [1; 32],
+            finalized: crate::storage::meta::FinalizedCheckpoint {
+                height: 0,
+                hash: parent_hash,
+            },
+        };
+        let parent_undo = BlockUndoLog {
+            block_height: 0,
+            log_slots_before: PARENT_LOG_SLOTS,
+            active_slot_count_before: 0,
+            alloc_counter_before: 0,
+            slot_changes: vec![(LOWER_SLOT_INDEX, SlotValue::EMPTY)],
+            tx_hashes: vec![],
+        };
+        store
+            .commit_block(
+                &parent,
+                &parent_hash,
+                &parent_undo,
+                &[(0, LOG_SEGMENT_SIZE as u8, Some(&lower_columns))],
+                &[],
+                &[],
+                None,
+                None,
+                &parent_meta,
+                false,
+            )
+            .unwrap();
+        drop(lower_columns);
+
+        let mut upper_columns = SegmentColumns::new_zero(1usize << LOG_SEGMENT_SIZE);
+        upper_columns.values[0] = upper_slot.value;
+        upper_columns.owners_hi[0] = upper_slot.owner_hi;
+        upper_columns.owners_lo[0] = upper_slot.owner_lo;
+
+        let mut child = parent;
+        child.height = 1;
+        child.prev_block_hash = parent_hash;
+        child.timestamp = child.timestamp.saturating_add(1);
+        child.nonce = 0xD25;
+        child.log_slots = CHILD_LOG_SLOTS;
+        child.state_root = [0x32; 32];
+        child.active_slot_count = 2;
+        child.alloc_counter = 2;
+        let child_hash = crate::hash_block_header(&child);
+        let child_tx_hash = TxBodyHash([0xD3; 32]);
+        let child_undo = BlockUndoLog {
+            block_height: 1,
+            log_slots_before: PARENT_LOG_SLOTS,
+            active_slot_count_before: 1,
+            alloc_counter_before: 1,
+            slot_changes: vec![(upper_slot_index, SlotValue::EMPTY)],
+            tx_hashes: vec![child_tx_hash],
+        };
+        let child_meta = ConsensusMeta {
+            tip_height: 1,
+            tip_hash: child_hash,
+            cumulative_chainwork: [2; 32],
+            finalized: parent_meta.finalized,
+        };
+        let fault_guard = child_fault.map(arm_authoritative_mutation_fault);
+        let child_commit = store.commit_block(
+            &child,
+            &child_hash,
+            &child_undo,
+            &[(
+                upper_segment_id,
+                LOG_SEGMENT_SIZE as u8,
+                Some(&upper_columns),
+            )],
+            &[child_tx_hash],
+            &[],
+            Some(b"production-grow-body"),
+            Some(AcceptedBlockCommitData {
+                block_proof_bytes: b"production-grow-proof",
+                block_auth_sidecar_bytes: b"production-grow-sidecar",
+                history_claim_bytes: b"production-grow-history",
+                accepted_block_certificate_bytes: b"production-grow-certificate",
+            }),
+            &child_meta,
+            false,
+        );
+        if let Some(fault) = child_fault {
+            assert_injected_crash(child_commit, fault);
+        } else {
+            child_commit.unwrap();
+        }
+        drop(fault_guard);
+        drop(upper_columns);
+
+        if promote_child_coverage {
+            assert!(child_fault.is_none());
+            let claimed = store.claim_next_recursive_proof_job().unwrap().unwrap();
+            assert_eq!((claimed.height, claimed.block_hash), (1, child_hash));
+            store
+                .complete_recursive_proof_job_and_promote_selected_history(
+                    1,
+                    child_hash,
+                    &selected_terminal_bytes(1, child_hash),
+                )
+                .unwrap();
+        }
+
+        ProductionResizeRestartFixture {
+            parent,
+            parent_hash,
+            parent_meta,
+            child,
+            child_hash,
+            child_meta,
+            child_tx_hash,
+            child_undo,
+            lower_owner,
+            upper_owner,
+            upper_slot_index,
+        }
+    }
+
     #[test]
     fn verified_header_crash_restart_is_exactly_old_or_new() {
         for (fault, committed) in [
@@ -9230,6 +9401,278 @@ mod tests {
                 committed.then_some((hash, RecursiveProofJobState::Pending))
             );
             assert_eq!(reopened.get_selected_history_coverage().unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn production_geometry_grow_crash_restart_keeps_one_exact_epoch() {
+        use crate::consensus::params::LOG_SEGMENT_SIZE;
+
+        for (fault, committed) in [
+            (AuthoritativeMutationFault::AcceptedBlockBeforeCommit, false),
+            (AuthoritativeMutationFault::AcceptedBlockAfterCommit, true),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = MdbxStore::open(directory.path()).unwrap();
+            let fixture = install_production_resize_restart_fixture(&store, false, Some(fault));
+            drop(store);
+
+            let reopened = MdbxStore::open(directory.path()).unwrap();
+            assert_eq!(
+                reopened.get_chain_tip().unwrap(),
+                Some(if committed {
+                    (1, fixture.child_hash)
+                } else {
+                    (0, fixture.parent_hash)
+                })
+            );
+            assert_eq!(
+                reopened.get_consensus_meta().unwrap(),
+                Some(if committed {
+                    fixture.child_meta.clone()
+                } else {
+                    fixture.parent_meta.clone()
+                })
+            );
+            assert_eq!(
+                reopened.get_header(1).unwrap(),
+                committed.then_some(fixture.child)
+            );
+            assert_eq!(
+                reopened.get_state_meta().unwrap(),
+                Some(if committed { (25, 2, 2) } else { (24, 1, 1) })
+            );
+            assert_eq!(
+                reopened.segment_ids().unwrap(),
+                if committed { vec![0, 256] } else { vec![0] }
+            );
+
+            let (effective_log, lower_columns) =
+                reopened.get_segment(0).unwrap().expect("lower segment");
+            assert_eq!(effective_log, LOG_SEGMENT_SIZE as u8);
+            let lower_value = SlotValue {
+                value: lower_columns.values[1],
+                owner_hi: lower_columns.owners_hi[1],
+                owner_lo: lower_columns.owners_lo[1],
+            };
+            assert_eq!(
+                lower_value,
+                SlotValue::with_owner_fields(41, 1, fixture.lower_owner.as_fields())
+            );
+            drop(lower_columns);
+
+            let upper = reopened.get_segment(256).unwrap();
+            assert_eq!(upper.is_some(), committed);
+            if let Some((effective_log, upper_columns)) = upper {
+                assert_eq!(effective_log, LOG_SEGMENT_SIZE as u8);
+                let upper_value = SlotValue {
+                    value: upper_columns.values[0],
+                    owner_hi: upper_columns.owners_hi[0],
+                    owner_lo: upper_columns.owners_lo[0],
+                };
+                assert_eq!(
+                    upper_value,
+                    SlotValue::with_owner_fields(73, 2, fixture.upper_owner.as_fields())
+                );
+            }
+
+            let lower_snapshot = reopened
+                .get_verified_utxos_by_owner(&fixture.lower_owner.0)
+                .unwrap();
+            assert_eq!(
+                lower_snapshot.utxos,
+                vec![VerifiedOwnerUtxo {
+                    slot_index: 1,
+                    amount: 41,
+                    creation_id: 1,
+                }]
+            );
+            assert_eq!(lower_snapshot.height, u64::from(committed));
+            assert_eq!(
+                lower_snapshot.tip_hash,
+                if committed {
+                    fixture.child_hash
+                } else {
+                    fixture.parent_hash
+                }
+            );
+            assert_eq!(lower_snapshot.log_slots, if committed { 25 } else { 24 });
+            assert_eq!(
+                lower_snapshot.active_slot_count,
+                if committed { 2 } else { 1 }
+            );
+            assert_eq!(lower_snapshot.alloc_counter, if committed { 2 } else { 1 });
+
+            let upper_snapshot = reopened
+                .get_verified_utxos_by_owner(&fixture.upper_owner.0)
+                .unwrap();
+            assert_eq!(
+                upper_snapshot.utxos,
+                if committed {
+                    vec![VerifiedOwnerUtxo {
+                        slot_index: fixture.upper_slot_index,
+                        amount: 73,
+                        creation_id: 2,
+                    }]
+                } else {
+                    vec![]
+                }
+            );
+            assert_eq!(
+                reopened.get_tx_index(&fixture.child_tx_hash.0).unwrap(),
+                committed.then_some((1, 0))
+            );
+            assert_eq!(
+                reopened.get_undo_log(1).unwrap(),
+                committed.then_some(fixture.child_undo.clone())
+            );
+            assert_eq!(
+                reopened.get_block_proof(1).unwrap().as_deref(),
+                committed.then_some(b"production-grow-proof".as_slice())
+            );
+            assert_eq!(
+                reopened
+                    .get_recursive_proof_job(1)
+                    .unwrap()
+                    .map(|job| (job.block_hash, job.state)),
+                committed.then_some((fixture.child_hash, RecursiveProofJobState::Pending))
+            );
+            assert_eq!(reopened.get_selected_history_coverage().unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn production_geometry_shrink_reorg_crash_restart_rewinds_complete_epoch() {
+        for (fault, committed) in [
+            (AuthoritativeMutationFault::ReorgBeforeCommit, false),
+            (AuthoritativeMutationFault::ReorgAfterCommit, true),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = MdbxStore::open(directory.path()).unwrap();
+            let fixture = install_production_resize_restart_fixture(&store, true, None);
+            assert_eq!(
+                store.get_selected_history_coverage().unwrap(),
+                Some(SelectedHistoryCoverage {
+                    height: 1,
+                    block_hash: fixture.child_hash,
+                })
+            );
+
+            let guard = arm_authoritative_mutation_fault(fault);
+            assert_injected_crash(
+                store.commit_reorg(
+                    0,
+                    &fixture.parent,
+                    &fixture.parent_hash,
+                    &[],
+                    &[fixture.child_tx_hash],
+                    &[],
+                    &[],
+                    &fixture.parent_meta,
+                ),
+                fault,
+            );
+            drop(guard);
+            drop(store);
+
+            let reopened = MdbxStore::open(directory.path()).unwrap();
+            assert_eq!(
+                reopened.get_chain_tip().unwrap(),
+                Some(if committed {
+                    (0, fixture.parent_hash)
+                } else {
+                    (1, fixture.child_hash)
+                })
+            );
+            assert_eq!(
+                reopened.get_consensus_meta().unwrap(),
+                Some(if committed {
+                    fixture.parent_meta.clone()
+                } else {
+                    fixture.child_meta.clone()
+                })
+            );
+            assert_eq!(
+                reopened.get_header(1).unwrap(),
+                (!committed).then_some(fixture.child)
+            );
+            assert_eq!(
+                reopened.get_state_meta().unwrap(),
+                Some(if committed { (24, 1, 1) } else { (25, 2, 2) })
+            );
+            assert_eq!(
+                reopened.segment_ids().unwrap(),
+                if committed { vec![0] } else { vec![0, 256] }
+            );
+            assert_eq!(reopened.get_segment(256).unwrap().is_some(), !committed);
+
+            let lower_snapshot = reopened
+                .get_verified_utxos_by_owner(&fixture.lower_owner.0)
+                .unwrap();
+            assert_eq!(
+                lower_snapshot.utxos,
+                vec![VerifiedOwnerUtxo {
+                    slot_index: 1,
+                    amount: 41,
+                    creation_id: 1,
+                }]
+            );
+            assert_eq!(lower_snapshot.height, if committed { 0 } else { 1 });
+            assert_eq!(lower_snapshot.log_slots, if committed { 24 } else { 25 });
+            assert_eq!(
+                lower_snapshot.active_slot_count,
+                if committed { 1 } else { 2 }
+            );
+            assert_eq!(lower_snapshot.alloc_counter, if committed { 1 } else { 2 });
+
+            let upper_snapshot = reopened
+                .get_verified_utxos_by_owner(&fixture.upper_owner.0)
+                .unwrap();
+            assert_eq!(
+                upper_snapshot.utxos,
+                if committed {
+                    vec![]
+                } else {
+                    vec![VerifiedOwnerUtxo {
+                        slot_index: fixture.upper_slot_index,
+                        amount: 73,
+                        creation_id: 2,
+                    }]
+                }
+            );
+            assert_eq!(
+                reopened.get_tx_index(&fixture.child_tx_hash.0).unwrap(),
+                (!committed).then_some((1, 0))
+            );
+            assert_eq!(
+                reopened.get_undo_log(1).unwrap(),
+                (!committed).then_some(fixture.child_undo.clone())
+            );
+            assert_eq!(
+                reopened.get_block_proof(1).unwrap().as_deref(),
+                (!committed).then_some(b"production-grow-proof".as_slice())
+            );
+            assert_eq!(
+                reopened.get_selected_history_coverage().unwrap(),
+                (!committed).then_some(SelectedHistoryCoverage {
+                    height: 1,
+                    block_hash: fixture.child_hash,
+                })
+            );
+            assert_eq!(
+                reopened
+                    .get_recursive_proof_job(1)
+                    .unwrap()
+                    .map(|job| (job.block_hash, job.state)),
+                (!committed).then_some((fixture.child_hash, RecursiveProofJobState::Complete))
+            );
+            assert_eq!(
+                reopened
+                    .get_recursive_proof_job_result(1)
+                    .unwrap()
+                    .map(|result| result.bytes),
+                (!committed).then_some(selected_terminal_bytes(1, fixture.child_hash))
+            );
         }
     }
 
