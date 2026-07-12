@@ -22,7 +22,7 @@ use noid_recursive::class_registry::{
     OwnedSelectedRecursiveClassRegistry, OwnedSelectedRecursiveTerminalRegistry,
     SelectedRecursiveClassRegistryError, MAX_SELECTED_RECURSIVE_CLASS_REGISTRY_BYTES,
 };
-use noid_recursive::{CanonicalSelectedHistoryRegistry, SelectedHistoryRegistryError};
+use noid_recursive::CanonicalSelectedHistoryRegistry;
 use thiserror::Error;
 
 #[cfg(unix)]
@@ -88,13 +88,8 @@ impl LoadedSelectedRecursiveClassRegistry {
         )
     }
 
-    pub fn terminal_registry(
-        &self,
-    ) -> Result<CanonicalSelectedHistoryRegistry<'_>, SelectedHistoryRegistryError> {
-        CanonicalSelectedHistoryRegistry::try_new(
-            self.registry.descriptor(),
-            self.registry.link_classes(),
-        )
+    pub fn terminal_registry(&self) -> CanonicalSelectedHistoryRegistry<'_> {
+        self.registry.selected_history_registry()
     }
 }
 
@@ -106,13 +101,8 @@ pub struct LoadedSelectedRecursiveTerminalRegistry {
 }
 
 impl LoadedSelectedRecursiveTerminalRegistry {
-    pub fn terminal_registry(
-        &self,
-    ) -> Result<CanonicalSelectedHistoryRegistry<'_>, SelectedHistoryRegistryError> {
-        CanonicalSelectedHistoryRegistry::try_new(
-            self.registry.descriptor(),
-            self.registry.link_classes(),
-        )
+    pub fn terminal_registry(&self) -> CanonicalSelectedHistoryRegistry<'_> {
+        self.registry.selected_history_registry()
     }
 }
 

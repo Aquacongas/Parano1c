@@ -185,9 +185,9 @@ impl SelectedHistoryTerminalVerificationSession {
             return Err(SelectedHistoryTerminalVerifierError::RegistryAlreadyLoaded);
         }
         let loaded = store.load_terminal_pinned(expected_registry_digest)?;
-        // Validate the terminal-only borrowed view before publishing the
-        // loaded registry into session state.
-        loaded.terminal_registry()?;
+        // The pinned decoder publishes only an already-validated owned
+        // terminal registry. Reborrowing its view below is allocation-free
+        // and cannot repeat the shared-genesis proof replay.
         self.loaded_registry = Some(loaded);
         Ok(())
     }
@@ -206,7 +206,7 @@ impl SelectedHistoryTerminalVerificationSession {
             .loaded_registry
             .as_ref()
             .ok_or(SelectedHistoryTerminalVerifierError::RegistryNotLoaded)?;
-        let registry = loaded.terminal_registry()?;
+        let registry = loaded.terminal_registry();
         self.verify(
             package,
             &registry,
@@ -424,5 +424,31 @@ mod tests {
             .expect("terminal session fields");
         assert!(session.contains("Option<LoadedSelectedRecursiveTerminalRegistry>"));
         assert!(!session.contains("LoadedSelectedRecursiveClassRegistry"));
+    }
+
+    #[test]
+    fn loaded_terminal_verification_reborrows_without_registry_revalidation() {
+        let source = include_str!("selected_history_verifier.rs");
+        let load = source
+            .split("pub fn load_pinned_registry(")
+            .nth(1)
+            .expect("terminal session registry loader")
+            .split("/// Verify with the pinned registry")
+            .next()
+            .expect("terminal loader boundary");
+        assert!(load.contains("store.load_terminal_pinned("));
+        assert!(!load.contains(".terminal_registry("));
+        assert!(!load.contains("CanonicalSelectedHistoryRegistry::try_new("));
+
+        let verify = source
+            .split("pub fn verify_with_loaded_registry<")
+            .nth(1)
+            .expect("loaded terminal verifier")
+            .split("pub fn verify<")
+            .next()
+            .expect("loaded verifier boundary");
+        assert_eq!(verify.matches("loaded.terminal_registry()").count(), 1);
+        assert!(!verify.contains("CanonicalSelectedHistoryRegistry::try_new("));
+        assert!(!verify.contains("validate_materialized("));
     }
 }

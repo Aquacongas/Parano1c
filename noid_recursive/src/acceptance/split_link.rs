@@ -98,6 +98,17 @@ use crate::region_sidecar::{
 use noid_core::Block128;
 use noid_ivc_prover::field_prover::prove_field_with_public_io_and_post_commit_context;
 
+#[cfg(test)]
+thread_local! {
+    static MATERIALIZED_GENESIS_PROOF_VALIDATIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn materialized_genesis_proof_validation_count() -> usize {
+    MATERIALIZED_GENESIS_PROOF_VALIDATIONS.get()
+}
+
 /// One ladder slot's protocol constants, as seen by EVERY link class (the
 /// lane widths must be known to lay out the shared IO). The full block
 /// spec is only needed by the slot's OWN link class.
@@ -785,6 +796,12 @@ impl CanonicalSplitLinkLadder {
             });
         }
         let reference = &classes[0];
+        // The genesis envelope is one shared statement for the whole ladder,
+        // not four independent authorities.  Replay it exactly once, then
+        // bind every remaining class to the byte-identical envelope and to
+        // the same derived genesis identities below.  Replaying the same
+        // proof once per slot adds no soundness and made every borrowed
+        // registry view repeat the expensive cryptographic work.
         reference
             .validate_materialized_identity()
             .map_err(|_| CanonicalLadderError::MaterializedClassIdentity { slot: 0 })?;
@@ -799,9 +816,11 @@ impl CanonicalSplitLinkLadder {
         let reference_genesis_bytes = bincode::serialize(reference_genesis_envelope.as_ref())
             .map_err(|_| CanonicalLadderError::MaterializedClassIdentity { slot: 0 })?;
         for (slot, class) in classes.iter().enumerate() {
-            class
-                .validate_materialized_identity()
-                .map_err(|_| CanonicalLadderError::MaterializedClassIdentity { slot })?;
+            if slot != 0 {
+                class
+                    .validate_frozen_identity()
+                    .map_err(|_| CanonicalLadderError::MaterializedClassIdentity { slot })?;
+            }
             if class.shape != self.link_shape {
                 return Err(CanonicalLadderError::MaterializedClassShape { slot });
             }
@@ -1220,6 +1239,11 @@ pub struct SplitLinkClass {
     post_commit_class_digest: std::sync::OnceLock<[u8; 32]>,
     genesis_post_commit_class_digest: std::sync::OnceLock<[u8; 32]>,
     genesis_envelope: std::sync::OnceLock<Arc<LinkProofEnvelope>>,
+    /// Set only by the crate-private terminal decoder after the shared
+    /// envelope has passed the complete materialized-ladder validation.  A
+    /// relay can then drop the decoded proof while retaining all identities
+    /// baked into the pinned Link verifier authority.
+    terminal_genesis_envelope_discarded: bool,
     /// Present only in prover-capable materialization.  Terminal verification
     /// needs the pinned aggregate identity, not the child Block VK tables:
     /// the nested Block proof has already been verified inside the Link
@@ -1434,6 +1458,7 @@ impl SplitLinkClass {
             post_commit_class_digest: post_commit_lock,
             genesis_post_commit_class_digest: genesis_post_commit_lock,
             genesis_envelope: genesis_envelope_lock,
+            terminal_genesis_envelope_discarded: false,
             b_sidecar_vk,
             b_sidecar_vk_digest,
             b_post_commit_class_digest,
@@ -1570,6 +1595,7 @@ impl SplitLinkClass {
             post_commit_class_digest: std::sync::OnceLock::new(),
             genesis_post_commit_class_digest: std::sync::OnceLock::new(),
             genesis_envelope: std::sync::OnceLock::new(),
+            terminal_genesis_envelope_discarded: false,
             b_sidecar_vk: Some(block_class.sidecar_vk_arc()),
             b_sidecar_vk_digest: block_class.sidecar_vk().transcript_digest(),
             b_post_commit_class_digest: *block_class.post_commit_class_digest(),
@@ -1723,8 +1749,34 @@ impl SplitLinkClass {
     pub fn genesis_envelope(&self) -> &LinkProofEnvelope {
         self.genesis_envelope
             .get()
-            .expect("frozen genesis envelope")
+            .expect("genesis envelope is retained only by prover-capable classes")
             .as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retains_genesis_envelope(&self) -> bool {
+        self.genesis_envelope.get().is_some()
+    }
+
+    /// Release the already-verified shared genesis proof from a relay-only
+    /// class.  This transition is unavailable outside this crate and is used
+    /// only after `CanonicalSplitLinkLadder::validate_materialized` succeeds
+    /// for the complete four-slot materialization.
+    pub(crate) fn discard_validated_terminal_genesis_envelope(
+        &mut self,
+    ) -> Result<(), LinkProofError> {
+        if self.b_sidecar_vk.is_some()
+            || self.terminal_genesis_envelope_discarded
+            || self.genesis_envelope.get().is_none()
+        {
+            return Err(LinkProofError::ClassIdentityMismatch);
+        }
+        let _ = self
+            .genesis_envelope
+            .take()
+            .ok_or(LinkProofError::ClassIdentityMismatch)?;
+        self.terminal_genesis_envelope_discarded = true;
+        Ok(())
     }
 
     /// Rebuild the canonical genesis matrix for an on-demand proving source.
@@ -2137,23 +2189,27 @@ impl SplitLinkClass {
         if Some(&expected_genesis_post_commit) != self.genesis_post_commit_class_digest.get() {
             return Err(LinkProofError::ClassIdentityMismatch);
         }
-        let genesis_envelope = self
-            .genesis_envelope
-            .get()
-            .ok_or(LinkProofError::UnfrozenClass)?;
-        if genesis_envelope.io().len() != self.spec.io_len
-            || genesis_envelope
-                .io()
-                .iter()
-                .any(|value| *value != F128::ZERO)
-            || !same_pcs_params(&genesis_envelope.commitment().params, &self.pcs_params)
-        {
-            return Err(LinkProofError::ClassIdentityMismatch);
+        if let Some(genesis_envelope) = self.genesis_envelope.get() {
+            if self.terminal_genesis_envelope_discarded
+                || genesis_envelope.io().len() != self.spec.io_len
+                || genesis_envelope
+                    .io()
+                    .iter()
+                    .any(|value| *value != F128::ZERO)
+                || !same_pcs_params(&genesis_envelope.commitment().params, &self.pcs_params)
+            {
+                return Err(LinkProofError::ClassIdentityMismatch);
+            }
+        } else if !self.terminal_genesis_envelope_discarded || self.b_sidecar_vk.is_some() {
+            return Err(LinkProofError::UnfrozenClass);
         }
         Ok(matrix_digest)
     }
 
     fn validate_materialized_identity(&self) -> Result<(), LinkProofError> {
+        #[cfg(test)]
+        MATERIALIZED_GENESIS_PROOF_VALIDATIONS
+            .set(MATERIALIZED_GENESIS_PROOF_VALIDATIONS.get() + 1);
         self.validate_frozen_identity()?;
         let sidecar_vk = self.sidecar_vk.get().ok_or(LinkProofError::UnfrozenClass)?;
         let genesis_envelope = self
@@ -4213,6 +4269,58 @@ mod tests {
         assert!(native_preflight.contains("class.b_sidecar_vk.is_none()"));
         assert!(block_source.contains("Arc::clone(&self.sidecar_vk)"));
         assert!(source.contains("pub fn rebuild_genesis_matrix"));
+    }
+
+    #[test]
+    fn materialized_ladder_replays_the_shared_genesis_proof_once() {
+        let source = include_str!("split_link.rs");
+        let validation = source
+            .split("pub fn validate_materialized(")
+            .nth(1)
+            .expect("materialized ladder validation")
+            .split("fn same_ladder(")
+            .next()
+            .expect("validation boundary");
+        assert_eq!(
+            validation
+                .matches(".validate_materialized_identity()")
+                .count(),
+            1,
+            "the shared genesis proof must have one cryptographic replay"
+        );
+        assert_eq!(
+            validation.matches(".validate_frozen_identity()").count(),
+            1,
+            "all non-reference slots use the loop's cheap frozen-identity check"
+        );
+        let proof_replay = validation
+            .find(".validate_materialized_identity()")
+            .expect("shared proof replay");
+        let exact_envelope_binding = validation
+            .find("genesis_bytes != reference_genesis_bytes")
+            .expect("exact shared-envelope binding");
+        assert!(proof_replay < exact_envelope_binding);
+    }
+
+    #[test]
+    fn terminal_genesis_discard_is_internal_and_fail_closed() {
+        let source = include_str!("split_link.rs");
+        let production = source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production source boundary");
+        let transition = production
+            .split("pub(crate) fn discard_validated_terminal_genesis_envelope(")
+            .nth(1)
+            .expect("terminal genesis discard transition")
+            .split("/// Rebuild the canonical genesis matrix")
+            .next()
+            .expect("transition boundary");
+        assert!(transition.contains("self.b_sidecar_vk.is_some()"));
+        assert!(transition.contains("self.genesis_envelope.get().is_none()"));
+        assert_eq!(transition.matches(".take()").count(), 1);
+        assert!(transition.contains("self.terminal_genesis_envelope_discarded = true"));
+        assert!(!production.contains("pub fn discard_validated_terminal_genesis_envelope("));
     }
 
     fn decider_test_matrix(tag: u64) -> FieldR1cs {

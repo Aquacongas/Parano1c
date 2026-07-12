@@ -38,8 +38,9 @@ use crate::region_sidecar::{
     MAX_COMBINED_DUPLEX_W_LOG, MERKLE_REGION_COMMITTED_COLUMNS,
 };
 use crate::selected_history::{
-    decode_selected_history_terminal_package, SelectedHistoryCodecError,
-    SelectedHistoryTerminalPackage, MAX_SELECTED_HISTORY_TERMINAL_PACKAGE_BYTES,
+    decode_selected_history_terminal_package, CanonicalSelectedHistoryRegistry,
+    SelectedHistoryCodecError, SelectedHistoryRegistryError, SelectedHistoryTerminalPackage,
+    ValidatedSelectedHistoryRegistryIdentities, MAX_SELECTED_HISTORY_TERMINAL_PACKAGE_BYTES,
 };
 
 pub const SELECTED_RECURSIVE_CLASS_REGISTRY_VERSION: u16 = 1;
@@ -67,6 +68,7 @@ pub struct OwnedSelectedRecursiveClassRegistry {
     block_classes: [BlockClass; CLASS_COUNT],
     descriptor: CanonicalSplitLinkLadder,
     link_classes: [SplitLinkClass; CLASS_COUNT],
+    selected_history_identities: ValidatedSelectedHistoryRegistryIdentities,
 }
 
 impl OwnedSelectedRecursiveClassRegistry {
@@ -80,6 +82,15 @@ impl OwnedSelectedRecursiveClassRegistry {
 
     pub fn link_classes(&self) -> &[SplitLinkClass; CLASS_COUNT] {
         &self.link_classes
+    }
+
+    /// Cheap borrowed verifier view over the materialization validated by the
+    /// decoder.  No proof or class validation is repeated here.
+    pub fn selected_history_registry(&self) -> CanonicalSelectedHistoryRegistry<'_> {
+        CanonicalSelectedHistoryRegistry::from_validated_materialization(
+            &self.link_classes,
+            self.selected_history_identities,
+        )
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, SelectedRecursiveClassRegistryError> {
@@ -100,6 +111,7 @@ impl OwnedSelectedRecursiveClassRegistry {
 pub struct OwnedSelectedRecursiveTerminalRegistry {
     descriptor: CanonicalSplitLinkLadder,
     link_classes: [SplitLinkClass; CLASS_COUNT],
+    selected_history_identities: ValidatedSelectedHistoryRegistryIdentities,
 }
 
 impl OwnedSelectedRecursiveTerminalRegistry {
@@ -107,8 +119,14 @@ impl OwnedSelectedRecursiveTerminalRegistry {
         &self.descriptor
     }
 
-    pub fn link_classes(&self) -> &[SplitLinkClass; CLASS_COUNT] {
-        &self.link_classes
+    /// Cheap borrowed verifier view over the one-pass pinned materialization.
+    /// Its constructor is crate-private, so an external caller cannot assemble
+    /// this authority from unchecked classes or digest arrays.
+    pub fn selected_history_registry(&self) -> CanonicalSelectedHistoryRegistry<'_> {
+        CanonicalSelectedHistoryRegistry::from_validated_materialization(
+            &self.link_classes,
+            self.selected_history_identities,
+        )
     }
 }
 
@@ -643,11 +661,15 @@ fn materialize_registry(
     let links: [SplitLinkClass; CLASS_COUNT] = links_vec
         .try_into()
         .map_err(|_| SelectedRecursiveClassRegistryError::InvalidValue("Link count"))?;
-    descriptor.validate_materialized(&links)?;
+    let selected_history_identities =
+        CanonicalSelectedHistoryRegistry::try_new(&descriptor, &links)
+            .map_err(map_selected_history_registry_error)?
+            .validated_identities();
     Ok(OwnedSelectedRecursiveClassRegistry {
         block_classes: blocks,
         descriptor,
         link_classes: links,
+        selected_history_identities,
     })
 }
 
@@ -749,14 +771,44 @@ fn materialize_terminal_registry(
             .map_err(|source| SelectedRecursiveClassRegistryError::Link { slot, source })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let links: [SplitLinkClass; CLASS_COUNT] = links_vec
+    let mut links: [SplitLinkClass; CLASS_COUNT] = links_vec
         .try_into()
         .map_err(|_| SelectedRecursiveClassRegistryError::InvalidValue("Link count"))?;
-    descriptor.validate_materialized(&links)?;
+    let selected_history_identities =
+        CanonicalSelectedHistoryRegistry::try_new(&descriptor, &links)
+            .map_err(map_selected_history_registry_error)?
+            .validated_identities();
+    // The one shared genesis envelope has now been cryptographically checked
+    // and byte-bound to every slot.  Relay verification needs only its pinned
+    // class identities; dropping the decoded proof avoids retaining it beside
+    // an incoming terminal package.  Prover-capable materialization above is
+    // intentionally unchanged.
+    for class in &mut links {
+        class
+            .discard_validated_terminal_genesis_envelope()
+            .map_err(|source| SelectedRecursiveClassRegistryError::Link {
+                slot: class.slot(),
+                source,
+            })?;
+    }
     Ok(OwnedSelectedRecursiveTerminalRegistry {
         descriptor,
         link_classes: links,
+        selected_history_identities,
     })
+}
+
+fn map_selected_history_registry_error(
+    error: SelectedHistoryRegistryError,
+) -> SelectedRecursiveClassRegistryError {
+    match error {
+        SelectedHistoryRegistryError::NonCanonical(source) => {
+            SelectedRecursiveClassRegistryError::Ladder(source)
+        }
+        SelectedHistoryRegistryError::MissingLinkClassDigest { .. } => {
+            SelectedRecursiveClassRegistryError::InvalidValue("materialized Link statement digest")
+        }
+    }
 }
 
 fn validate_terminal_block_wire(
@@ -2214,18 +2266,42 @@ mod tests {
         preflight_registry_body(&encoded).unwrap();
         let actual = decode_registry_body(&encoded).unwrap();
         assert_eq!(actual.blocks[3].tier, 255);
-        assert_eq!(
-            actual.blocks[2].matrix_digest,
-            expected.blocks[2].matrix_digest
-        );
         assert_eq!(actual.descriptor_shape, expected.descriptor_shape);
         assert_eq!(actual.descriptor_slots[1].tier, 32);
         assert_eq!(actual.link_vk.leaf_subchannels[0].schedule.len(), 2);
         assert_eq!(actual.link_vk.path_families, expected.link_vk.path_families);
-        assert_eq!(
-            actual.links[3].post_commit_digest,
-            expected.links[3].post_commit_digest
-        );
+        for slot in 0..CLASS_COUNT {
+            assert_eq!(actual.blocks[slot].tier, USER_TX_CLASS_TIERS[slot]);
+            assert_eq!(
+                actual.blocks[slot].matrix_digest,
+                expected.blocks[slot].matrix_digest,
+            );
+            assert_eq!(
+                actual.blocks[slot].vk_digest,
+                expected.blocks[slot].vk_digest
+            );
+            assert_eq!(
+                actual.blocks[slot].post_commit_digest,
+                expected.blocks[slot].post_commit_digest,
+            );
+            assert_eq!(actual.links[slot].slot, slot);
+            assert_eq!(
+                actual.links[slot].matrix_digest,
+                expected.links[slot].matrix_digest,
+            );
+            assert_eq!(
+                actual.links[slot].post_commit_digest,
+                expected.links[slot].post_commit_digest,
+            );
+            assert_eq!(
+                actual.links[slot].b_sidecar_vk_digest,
+                expected.links[slot].b_sidecar_vk_digest,
+            );
+            assert_eq!(
+                actual.links[slot].b_post_commit_digest,
+                expected.links[slot].b_post_commit_digest,
+            );
+        }
         assert_eq!(actual.genesis_package, expected.genesis_package);
     }
 
@@ -2255,19 +2331,37 @@ mod tests {
 
     #[test]
     fn terminal_block_identity_binds_ordered_children_matrix_and_post_commit() {
-        let mut block = fixture_block(0);
-        block.spec = crate::acceptance::block_class::block_io_spec();
-        block.child_vk_digests = std::array::from_fn(|child| [child as u8 + 1; 32]);
-        block.vk_digest = selected_zk_block_vk_digest_from_child_digests(&block.child_vk_digests);
-        block.post_commit_digest = selected_zk_block_post_commit_class_digest_from_vk_digest(
-            &block.matrix_digest,
-            &block.spec,
-            &block.pcs,
-            block.vk_digest,
-        );
-        validate_terminal_block_wire(0, &block).expect("compact Block identity");
+        let blocks: [BlockWire; CLASS_COUNT] = std::array::from_fn(|slot| {
+            let mut block = fixture_block(slot);
+            block.spec = crate::acceptance::block_class::block_io_spec();
+            block.child_vk_digests =
+                std::array::from_fn(|child| [slot as u8 * 8 + child as u8 + 1; 32]);
+            block.vk_digest =
+                selected_zk_block_vk_digest_from_child_digests(&block.child_vk_digests);
+            block.post_commit_digest = selected_zk_block_post_commit_class_digest_from_vk_digest(
+                &block.matrix_digest,
+                &block.spec,
+                &block.pcs,
+                block.vk_digest,
+            );
+            block
+        });
+        for (slot, block) in blocks.iter().enumerate() {
+            validate_terminal_block_wire(slot, block).expect("compact Block identity");
+            assert_eq!(block.tier, USER_TX_CLASS_TIERS[slot]);
+            assert_eq!(
+                block.post_commit_digest,
+                selected_zk_block_post_commit_class_digest_from_vk_digest(
+                    &block.matrix_digest,
+                    &block.spec,
+                    &block.pcs,
+                    block.vk_digest,
+                ),
+                "full and compact post-commit projection at slot {slot}"
+            );
+        }
 
-        let mut reordered = block.clone();
+        let mut reordered = blocks[0].clone();
         reordered.child_vk_digests.swap(0, 1);
         assert!(matches!(
             validate_terminal_block_wire(0, &reordered),
@@ -2276,7 +2370,7 @@ mod tests {
             ))
         ));
 
-        let mut wrong_matrix = block;
+        let mut wrong_matrix = blocks[0].clone();
         wrong_matrix.matrix_digest[0] ^= 1;
         assert!(matches!(
             validate_terminal_block_wire(0, &wrong_matrix),
@@ -2284,6 +2378,127 @@ mod tests {
                 "terminal Block post-commit identity"
             ))
         ));
+    }
+
+    #[test]
+    fn pinned_terminal_materialization_is_one_pass_and_views_are_reborrows() {
+        let source = include_str!("class_registry.rs");
+        let materializer = source
+            .split("fn materialize_terminal_registry(")
+            .nth(1)
+            .expect("terminal registry materializer")
+            .split("fn map_selected_history_registry_error(")
+            .next()
+            .expect("materializer boundary");
+        assert_eq!(
+            materializer
+                .matches("CanonicalSelectedHistoryRegistry::try_new(")
+                .count(),
+            1,
+            "terminal materialization must perform one complete policy validation"
+        );
+        let validate = materializer
+            .find("CanonicalSelectedHistoryRegistry::try_new(")
+            .expect("complete registry validation");
+        let discard = materializer
+            .find("discard_validated_terminal_genesis_envelope()")
+            .expect("verified genesis proof release");
+        assert!(validate < discard);
+
+        let owned = source
+            .split("impl OwnedSelectedRecursiveTerminalRegistry {")
+            .nth(1)
+            .expect("owned terminal registry")
+            .split("#[derive(Debug)]")
+            .next()
+            .expect("owned terminal boundary");
+        assert!(owned.contains("from_validated_materialization("));
+        assert!(!owned.contains("try_new("));
+        assert!(!owned.contains("validate_materialized("));
+    }
+
+    #[test]
+    fn canonical_registry_unchecked_constructor_is_not_public() {
+        let source = include_str!("selected_history.rs");
+        assert!(source.contains("pub(crate) fn from_validated_materialization("));
+        assert!(!source.contains("pub fn from_validated_materialization("));
+        assert!(source.contains("pub(crate) struct ValidatedSelectedHistoryRegistryIdentities"));
+    }
+
+    /// Exact release-artifact gate.  It is fixture-driven because generating
+    /// the production m24 genesis proof inside a unit test would defeat the
+    /// low-RAM test contract.  CI/release runs point the variable at the
+    /// already-generated canonical registry artifact.
+    #[test]
+    #[ignore = "set NOID_SELECTED_RECURSIVE_REGISTRY_FIXTURE to a canonical release artifact"]
+    fn release_registry_full_encode_to_terminal_pinned_decode_is_equivalent() {
+        let path = std::env::var_os("NOID_SELECTED_RECURSIVE_REGISTRY_FIXTURE")
+            .expect("NOID_SELECTED_RECURSIVE_REGISTRY_FIXTURE");
+        let source = std::fs::read(path).expect("read canonical registry fixture");
+        let full =
+            decode_selected_recursive_class_registry_unpinned_for_offline_inspection(&source)
+                .expect("decode full canonical registry");
+        let encoded = full.encode().expect("encode full canonical registry");
+        let pin: [u8; 32] = encoded[encoded.len() - REGISTRY_TRAILER_BYTES..]
+            .try_into()
+            .expect("registry pin trailer");
+        let genesis_validations_before =
+            crate::acceptance::split_link::materialized_genesis_proof_validation_count();
+        let terminal = decode_selected_recursive_terminal_registry_pinned(&encoded, pin)
+            .expect("terminal pinned decode");
+        assert_eq!(
+            crate::acceptance::split_link::materialized_genesis_proof_validation_count(),
+            genesis_validations_before + 1,
+            "one pinned terminal load must replay the shared genesis proof once"
+        );
+
+        let full_view = full.selected_history_registry();
+        let terminal_view = terminal.selected_history_registry();
+        assert_eq!(
+            full.descriptor().link_shape(),
+            terminal.descriptor().link_shape()
+        );
+        assert!(same_pcs(
+            full.descriptor().link_pcs_params(),
+            terminal.descriptor().link_pcs_params(),
+        ));
+        for slot in 0..CLASS_COUNT {
+            assert_eq!(
+                full_view.link_class_digest(slot),
+                terminal_view.link_class_digest(slot),
+                "Link matrix authority at slot {slot}"
+            );
+            assert_eq!(
+                full_view.link_post_commit_class_digest(slot),
+                terminal_view.link_post_commit_class_digest(slot),
+                "Link post-commit authority at slot {slot}"
+            );
+            let full_link = &full.link_classes()[slot];
+            let terminal_link = &terminal.link_classes[slot];
+            assert_eq!(full_link.slot(), terminal_link.slot());
+            assert_eq!(full_link.shape, terminal_link.shape);
+            assert!(same_pcs(&full_link.pcs_params, &terminal_link.pcs_params));
+            assert_eq!(
+                full_link.sidecar_vk().transcript_digest(),
+                terminal_link.sidecar_vk().transcript_digest(),
+            );
+            let full_block = &full_link.ladder()[slot];
+            let terminal_block = &terminal_link.ladder()[slot];
+            assert_eq!(full_block.tier, USER_TX_CLASS_TIERS[slot]);
+            assert_eq!(full_block.tier, terminal_block.tier);
+            assert_eq!(full_block.b_shape, terminal_block.b_shape);
+            assert_eq!(full_block.b_digest, terminal_block.b_digest);
+            assert_eq!(
+                full_block.b_sidecar_vk_digest,
+                terminal_block.b_sidecar_vk_digest,
+            );
+            assert_eq!(
+                full_block.b_post_commit_class_digest,
+                terminal_block.b_post_commit_class_digest,
+            );
+            assert!(full_link.retains_genesis_envelope());
+            assert!(!terminal_link.retains_genesis_envelope());
+        }
     }
 
     #[test]

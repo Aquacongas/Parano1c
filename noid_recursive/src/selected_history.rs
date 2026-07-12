@@ -912,6 +912,15 @@ pub struct CanonicalSelectedHistoryRegistry<'a> {
     link_post_commit_class_digests: [[u8; 32]; USER_TX_CLASS_TIERS.len()],
 }
 
+/// Copy-only authority derived while a complete materialization is being
+/// validated.  The type and its constructor stay crate-private so external
+/// callers cannot turn arbitrary digest tables into a canonical registry.
+#[derive(Clone, Copy)]
+pub(crate) struct ValidatedSelectedHistoryRegistryIdentities {
+    link_class_digests: [[u8; 32]; USER_TX_CLASS_TIERS.len()],
+    link_post_commit_class_digests: [[u8; 32]; USER_TX_CLASS_TIERS.len()],
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelectedHistoryRegistryError {
     NonCanonical(CanonicalLadderError),
@@ -943,6 +952,13 @@ impl<'a> CanonicalSelectedHistoryRegistry<'a> {
         descriptor
             .validate_materialized(classes)
             .map_err(SelectedHistoryRegistryError::NonCanonical)?;
+        let identities = Self::capture_validated_identities(classes)?;
+        Ok(Self::from_validated_materialization(classes, identities))
+    }
+
+    fn capture_validated_identities(
+        classes: &[SplitLinkClass],
+    ) -> Result<ValidatedSelectedHistoryRegistryIdentities, SelectedHistoryRegistryError> {
         let mut link_class_digests = [[0u8; 32]; USER_TX_CLASS_TIERS.len()];
         let mut link_post_commit_class_digests = [[0u8; 32]; USER_TX_CLASS_TIERS.len()];
         for (slot, class) in classes.iter().enumerate() {
@@ -953,15 +969,45 @@ impl<'a> CanonicalSelectedHistoryRegistry<'a> {
                 .ok_or(SelectedHistoryRegistryError::MissingLinkClassDigest { slot })?;
             link_post_commit_class_digests[slot] = *class.post_commit_class_digest();
         }
-        Ok(Self {
-            classes,
+        Ok(ValidatedSelectedHistoryRegistryIdentities {
             link_class_digests,
             link_post_commit_class_digests,
         })
     }
 
+    /// Reborrow a materialization whose owning decoder already performed the
+    /// complete descriptor, class, sidecar, and shared-genesis validation.
+    /// This is deliberately unavailable outside `noid_recursive`.
+    pub(crate) fn from_validated_materialization(
+        classes: &'a [SplitLinkClass],
+        identities: ValidatedSelectedHistoryRegistryIdentities,
+    ) -> Self {
+        Self {
+            classes,
+            link_class_digests: identities.link_class_digests,
+            link_post_commit_class_digests: identities.link_post_commit_class_digests,
+        }
+    }
+
+    pub(crate) const fn validated_identities(&self) -> ValidatedSelectedHistoryRegistryIdentities {
+        ValidatedSelectedHistoryRegistryIdentities {
+            link_class_digests: self.link_class_digests,
+            link_post_commit_class_digests: self.link_post_commit_class_digests,
+        }
+    }
+
     fn class(&self, slot: usize) -> &SplitLinkClass {
         &self.classes[slot]
+    }
+
+    /// Frozen Link matrix identity for one canonical tier slot.
+    pub fn link_class_digest(&self, slot: usize) -> Option<[u8; 32]> {
+        self.link_class_digests.get(slot).copied()
+    }
+
+    /// Frozen Link matrix/VK post-commit identity for one canonical tier slot.
+    pub fn link_post_commit_class_digest(&self, slot: usize) -> Option<[u8; 32]> {
+        self.link_post_commit_class_digests.get(slot).copied()
     }
 }
 

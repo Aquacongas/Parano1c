@@ -593,9 +593,7 @@ fn process_claimed_job(
                 "canonical epoch-anchor header is missing",
             )
         })?;
-    let terminal_registry = loaded_registry
-        .terminal_registry()
-        .map_err(|error| retryable("validate terminal class registry", error))?;
+    let terminal_registry = loaded_registry.terminal_registry();
 
     // All proof artifacts and transient resident CSR matrices are gone here,
     // but retain the stronger 8 GiB admission through streaming verification.
