@@ -165,6 +165,16 @@ fn sanitize_stored_block_response(
     mut block_auth_sidecar_bytes: Option<Vec<u8>>,
 ) -> (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>) {
     if block_bytes
+        .as_deref()
+        .is_some_and(|bytes| !pulled_block_bytes_match_height(bytes, height))
+    {
+        tracing::warn!(
+            height,
+            "stored block header does not match requested height — not serving"
+        );
+        return (None, None, None);
+    }
+    if block_bytes
         .as_ref()
         .is_some_and(|bytes| bytes.len() > MAX_BLOCK_BYTES)
     {
@@ -221,6 +231,65 @@ fn sanitize_stored_block_response(
     )
 }
 
+/// Allocation-free transport identity check for a pulled block response.
+/// Consensus still performs the complete canonical block decode; this early
+/// check only prevents a peer (or corrupt local suffix record) from answering
+/// request `h` with bytes whose canonical header declares another height.
+fn pulled_block_bytes_match_height(bytes: &[u8], expected_height: u64) -> bool {
+    use noid_chain::block::{BLOCK_WIRE_HEADER_OFFSET, BLOCK_WIRE_MARKER};
+
+    if bytes.first() != Some(&BLOCK_WIRE_MARKER) {
+        return false;
+    }
+    let Some(header_end) = BLOCK_WIRE_HEADER_OFFSET.checked_add(noid_chain::BLOCK_HEADER_WIRE_SIZE)
+    else {
+        return false;
+    };
+    let Some(header_bytes) = bytes.get(BLOCK_WIRE_HEADER_OFFSET..header_end) else {
+        return false;
+    };
+    let mut source = header_bytes;
+    noid_chain::block_header::BlockHeader::decode(&mut source)
+        .is_ok_and(|header| source.is_empty() && header.height == expected_height)
+}
+
+/// Decode one fixed-framed batch as a single contiguous chain fragment.
+/// A malformed entry invalidates the complete response; silently shortening a
+/// hostile batch would make its transport identity ambiguous to the sync FSM.
+fn decode_linked_header_batch(
+    encoded_headers: Vec<Vec<u8>>,
+) -> Result<Vec<noid_chain::block_header::BlockHeader>, &'static str> {
+    if encoded_headers.len() > 512 {
+        return Err("header count exceeds cap");
+    }
+    let mut decoded: Vec<noid_chain::block_header::BlockHeader> = Vec::new();
+    decoded
+        .try_reserve_exact(encoded_headers.len())
+        .map_err(|_| "header batch allocation failed")?;
+    for encoded in encoded_headers {
+        if encoded.len() != noid_chain::BLOCK_HEADER_WIRE_SIZE {
+            return Err("noncanonical header length");
+        }
+        let header = noid_chain::block_header::BlockHeader::from_bytes(&encoded)
+            .map_err(|_| "header decode failed")?;
+        if let Some(parent) = decoded.last() {
+            if header.height
+                != parent
+                    .height
+                    .checked_add(1)
+                    .ok_or("header height overflow")?
+            {
+                return Err("header batch is not height-contiguous");
+            }
+            if header.prev_block_hash != noid_chain::hash_block_header(parent) {
+                return Err("header batch is not hash-linked");
+            }
+        }
+        decoded.push(header);
+    }
+    Ok(decoded)
+}
+
 #[inline]
 fn should_inline_block_gossip(
     block_bytes_len: usize,
@@ -245,7 +314,7 @@ pub enum NetworkCommand {
     AnnounceBlock {
         height: u64,
         hash: [u8; 32],
-        /// Wire-encoded BlockHeader (276 bytes).
+        /// Canonical wire-encoded BlockHeader (212 bytes).
         header_bytes: Vec<u8>,
         /// Full block bytes (for inline mode). Empty = compact-only.
         block_bytes: Vec<u8>,
@@ -319,7 +388,7 @@ pub enum NetworkEvent {
         from: PeerId,
         height: u64,
         hash: [u8; 32],
-        /// Wire-encoded BlockHeader (276 bytes).
+        /// Canonical wire-encoded BlockHeader (212 bytes).
         header_bytes: Vec<u8>,
     },
     /// A full block + proof + public AuthGKR sidecar arrived.
@@ -363,7 +432,7 @@ pub enum NetworkEvent {
         block_hash: [u8; 32],
         /// Serialized selected-history terminal package bytes, or empty.
         proof_bytes: Vec<u8>,
-        /// Serialized tip `BlockHeader` bytes (276 bytes), or empty.
+        /// Canonical serialized tip `BlockHeader` bytes (212 bytes), or empty.
         tip_header_bytes: Vec<u8>,
         /// Holds the process-global inbound history byte budget until the node
         /// finishes verifying this response.
@@ -1556,13 +1625,13 @@ async fn handle_swarm_event(
                 peer,
             },
         )) => {
-            // Decode wire-format headers into BlockHeader structs.
-            let mut decoded = Vec::with_capacity(response.headers.len());
-            for bytes in &response.headers {
-                if let Ok(hdr) = noid_chain::block_header::BlockHeader::from_bytes(bytes) {
-                    decoded.push(hdr);
+            let decoded = match decode_linked_header_batch(response.headers) {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    tracing::warn!(from = %peer, error, "invalid header batch response — dropped");
+                    return;
                 }
-            }
+            };
             let _ = required_event_tx
                 .send(NetworkEvent::HeadersBatch {
                     from: peer,
@@ -1610,6 +1679,8 @@ async fn handle_swarm_event(
             if let Some(block_bytes) = response.block_bytes {
                 if block_bytes.len() > MAX_BLOCK_BYTES {
                     tracing::warn!(peer = %peer, len = block_bytes.len(), "block pull response too large — dropped");
+                } else if !pulled_block_bytes_match_height(&block_bytes, response.height) {
+                    tracing::warn!(peer = %peer, response_height = response.height, "block pull response header/height mismatch — dropped");
                 } else {
                     let proof_bytes = response.block_proof_bytes.unwrap_or_default();
                     let auth_sidecar_bytes = response.block_auth_sidecar_bytes.unwrap_or_default();
@@ -2442,6 +2513,68 @@ mod tests {
         assert!(snapshot_suffix_is_retained(100, 100 - retention));
         assert!(!snapshot_suffix_is_retained(100, 100 - retention - 1));
         assert!(!snapshot_suffix_is_retained(100, 101));
+    }
+
+    #[test]
+    fn retained_block_response_is_bound_to_requested_height_without_allocating_decode() {
+        let mut header = noid_chain::consensus::genesis::genesis_header();
+        header.height = 77;
+        let block = noid_chain::block::Block {
+            header,
+            transactions: Vec::new(),
+        };
+        let bytes = block.to_bytes();
+        assert!(pulled_block_bytes_match_height(&bytes, 77));
+        assert!(!pulled_block_bytes_match_height(&bytes, 78));
+
+        let mut bad_marker = bytes.clone();
+        bad_marker[0] ^= 1;
+        assert!(!pulled_block_bytes_match_height(&bad_marker, 77));
+        assert!(!pulled_block_bytes_match_height(
+            &bytes[..noid_chain::BLOCK_HEADER_WIRE_SIZE],
+            77
+        ));
+
+        let response =
+            sanitize_stored_block_response(78, Some(bytes), Some(vec![1]), Some(vec![2]));
+        assert_eq!(response, (None, None, None));
+    }
+
+    #[test]
+    fn header_batch_rejects_partial_decode_noncontiguity_and_broken_links() {
+        let mut first = noid_chain::consensus::genesis::genesis_header();
+        first.height = 77;
+        let mut second = first;
+        second.height = 78;
+        second.prev_block_hash = noid_chain::hash_block_header(&first);
+        let valid =
+            decode_linked_header_batch(vec![first.to_bytes().to_vec(), second.to_bytes().to_vec()])
+                .unwrap();
+        assert_eq!(valid.len(), 2);
+
+        let mut skipped = second;
+        skipped.height = 79;
+        assert_eq!(
+            decode_linked_header_batch(vec![
+                first.to_bytes().to_vec(),
+                skipped.to_bytes().to_vec(),
+            ]),
+            Err("header batch is not height-contiguous")
+        );
+
+        let mut wrong_parent = second;
+        wrong_parent.prev_block_hash[0] ^= 1;
+        assert_eq!(
+            decode_linked_header_batch(vec![
+                first.to_bytes().to_vec(),
+                wrong_parent.to_bytes().to_vec(),
+            ]),
+            Err("header batch is not hash-linked")
+        );
+        assert_eq!(
+            decode_linked_header_batch(vec![vec![0; noid_chain::BLOCK_HEADER_WIRE_SIZE - 1]]),
+            Err("noncanonical header length")
+        );
     }
 
     #[test]

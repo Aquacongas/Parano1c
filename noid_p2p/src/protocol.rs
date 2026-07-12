@@ -45,7 +45,7 @@ pub struct GetHeadersRequest {
     pub count: u16, // max 512
 }
 
-/// Response: serialized BlockHeader bytes, one per header (276 bytes each).
+/// Response: canonical serialized BlockHeader bytes, 212 bytes each.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetHeadersResponse {
     pub headers: Vec<Vec<u8>>,
@@ -110,7 +110,7 @@ pub struct GetHistoryProofResponse {
     pub block_hash: [u8; 32],
     /// Serialized selected-history terminal package bytes.
     pub proof_bytes: Option<Vec<u8>>,
-    /// Serialized tip BlockHeader bytes (276 bytes).
+    /// Canonical serialized tip BlockHeader bytes (212 bytes).
     pub tip_header_bytes: Option<Vec<u8>>,
     /// Process-wide inbound byte admission retained until node-side proof
     /// verification has consumed the response.

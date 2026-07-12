@@ -9,7 +9,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::{request_response, swarm::StreamProtocol};
-use noid_chain::consensus::wire_limits::{MAX_HEADER_BYTES, MAX_HISTORY_PROOF_BYTES};
+use noid_chain::{consensus::wire_limits::MAX_HISTORY_PROOF_BYTES, BLOCK_HEADER_WIRE_SIZE};
 
 use crate::{
     inbound_budget::process_global_inbound_budget,
@@ -201,8 +201,10 @@ fn validate_lengths(proof_len: u32, tip_len: u32) -> io::Result<()> {
     if decoded_len(proof_len) > MAX_HISTORY_PROOF_BYTES {
         return Err(invalid_data("declared history proof exceeds wire cap"));
     }
-    if decoded_len(tip_len) > MAX_HEADER_BYTES {
-        return Err(invalid_data("declared history tip header exceeds wire cap"));
+    if tip_len != NONE_LEN && decoded_len(tip_len) != BLOCK_HEADER_WIRE_SIZE {
+        return Err(invalid_data(
+            "declared history tip header length is noncanonical",
+        ));
     }
     Ok(())
 }
@@ -325,7 +327,7 @@ mod tests {
             height: 77,
             block_hash: [0xA5; 32],
             proof_bytes: Some(vec![1; 4096]),
-            tip_header_bytes: Some(vec![2; 276]),
+            tip_header_bytes: Some(vec![2; BLOCK_HEADER_WIRE_SIZE]),
             inbound_memory_permit: None,
             outbound_memory_permit: None,
         };
@@ -334,7 +336,10 @@ mod tests {
             .write_response(&protocol(), &mut wire, response)
             .await
             .unwrap();
-        assert_eq!(wire.get_ref().len(), RESPONSE_HEADER_BYTES + 4096 + 276);
+        assert_eq!(
+            wire.get_ref().len(),
+            RESPONSE_HEADER_BYTES + 4096 + BLOCK_HEADER_WIRE_SIZE
+        );
         wire.set_position(0);
         let decoded = HistoryProofCodec::default()
             .read_response(&protocol(), &mut wire)
@@ -343,7 +348,10 @@ mod tests {
         assert_eq!(decoded.height, 77);
         assert_eq!(decoded.block_hash, [0xA5; 32]);
         assert_eq!(decoded.proof_bytes.unwrap(), vec![1; 4096]);
-        assert_eq!(decoded.tip_header_bytes.unwrap(), vec![2; 276]);
+        assert_eq!(
+            decoded.tip_header_bytes.unwrap(),
+            vec![2; BLOCK_HEADER_WIRE_SIZE]
+        );
     }
 
     #[tokio::test]
@@ -358,6 +366,24 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("history proof"));
+    }
+
+    #[tokio::test]
+    async fn noncanonical_tip_header_length_rejects_before_payload_read() {
+        let mut header = vec![0u8; RESPONSE_HEADER_BYTES];
+        header[..4].copy_from_slice(&RESPONSE_MAGIC);
+        header[4..8].copy_from_slice(&NONE_LEN.to_le_bytes());
+        header[8..12].copy_from_slice(
+            &u32::try_from(BLOCK_HEADER_WIRE_SIZE - 1)
+                .unwrap()
+                .to_le_bytes(),
+        );
+        let error = HistoryProofCodec::default()
+            .read_response(&protocol(), &mut Cursor::new(header))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("noncanonical"));
     }
 
     #[tokio::test]

@@ -304,6 +304,37 @@ mod tests {
         assert!(Arc::ptr_eq(&first.inbound_budget, &shared));
     }
 
+    #[tokio::test]
+    async fn request_round_trip_binds_segment_and_exact_snapshot_boundary() {
+        let request = GetStateSegmentRequest {
+            segment_id: 0x1234,
+            expected_tip_height: 77,
+            expected_tip_hash: [0xA5; 32],
+        };
+        let mut wire = Cursor::new(Vec::new());
+        StateSegmentCodec::default()
+            .write_request(&protocol(), &mut wire, request)
+            .await
+            .unwrap();
+        assert_eq!(wire.get_ref().len(), REQUEST_HEADER_BYTES);
+        wire.set_position(0);
+        let decoded = StateSegmentCodec::default()
+            .read_request(&protocol(), &mut wire)
+            .await
+            .unwrap();
+        assert_eq!(decoded.segment_id, 0x1234);
+        assert_eq!(decoded.expected_tip_height, 77);
+        assert_eq!(decoded.expected_tip_hash, [0xA5; 32]);
+
+        let mut noncanonical = wire.into_inner();
+        noncanonical[6] = 1;
+        let error = StateSegmentCodec::default()
+            .read_request(&protocol(), &mut Cursor::new(noncanonical))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
     struct GatedWriter {
         started: Arc<AtomicBool>,
         released: Arc<AtomicBool>,

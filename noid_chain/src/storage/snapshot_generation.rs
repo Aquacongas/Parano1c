@@ -1183,4 +1183,45 @@ mod tests {
             Err(SnapshotGenerationError::InvalidSegment(0, _))
         ));
     }
+
+    #[test]
+    fn manifest_sequence_length_bomb_is_bounded_and_rejected() {
+        let manifest = SnapshotGenerationManifest {
+            version: SNAPSHOT_GENERATION_VERSION,
+            target_height: 1,
+            target_hash: [1; 32],
+            cumulative_chainwork: [2; 32],
+            log_slots: 16,
+            active_slot_count: 0,
+            alloc_counter: 0,
+            state_root: crate::exact_state_hash::zero_slot_roots(16)[16],
+            effective_log_segment_size: 16,
+            segments: Vec::new(),
+        };
+        let mut encoded = encode_manifest(&manifest).unwrap();
+        // Fixed-int bincode places the Vec length in the final eight bytes for
+        // this empty fixture.  The decoder limit and Serde cautious reserve
+        // must reject the hostile declaration without attempting that capacity.
+        let length_offset = encoded.len() - core::mem::size_of::<u64>();
+        encoded[length_offset..].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(matches!(
+            decode_manifest(&encoded),
+            Err(SnapshotGenerationError::ManifestCodec(_))
+        ));
+    }
+
+    #[test]
+    fn oversized_manifest_file_rejects_before_payload_allocation() {
+        let generation = tempfile::tempdir().unwrap();
+        let path = generation.path().join(MANIFEST_FILE_NAME);
+        let file = File::create(path).unwrap();
+        file.set_len(MAX_MANIFEST_BYTES + 1).unwrap();
+        drop(file);
+        assert!(matches!(
+            open_snapshot_generation(generation.path()),
+            Err(SnapshotGenerationError::Corrupt(
+                "snapshot manifest length is outside bounds"
+            ))
+        ));
+    }
 }

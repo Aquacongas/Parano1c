@@ -36,11 +36,10 @@ use noid_poseidon2b::native::poseidon2b_hash_bytes;
 const GOSSIPSUB_MESSAGE_ID_DOMAIN: &[u8] = b"NOID_P2P_GOSSIPSUB_MESSAGE_ID";
 
 use crate::block_sync_codec::BlockSyncCodec;
+use crate::header_sync_codec::HeaderSyncCodec;
 use crate::history_proof_codec::HistoryProofCodec;
 use crate::mempool_sync_codec::MempoolSyncCodec;
-use crate::protocol::{
-    GetHeadersRequest, GetHeadersResponse, GetStateManifestRequest, GetStateManifestResponse,
-};
+use crate::state_manifest_codec::StateManifestCodec;
 use crate::state_segment_codec::StateSegmentCodec;
 
 /// All P2P behaviours composed via the derive macro.
@@ -53,7 +52,7 @@ pub struct NodeBehaviour {
     pub gossipsub: gossipsub::Behaviour,
 
     /// Typed request-response for chain sync (headers, blocks, history proof).
-    pub chain_sync: request_response::cbor::Behaviour<GetHeadersRequest, GetHeadersResponse>,
+    pub chain_sync: request_response::Behaviour<HeaderSyncCodec>,
 
     /// Block sync (recent blocks).
     pub block_sync: request_response::Behaviour<BlockSyncCodec>,
@@ -120,8 +119,7 @@ pub struct NodeBehaviour {
 
     /// State manifest sync — step 1: request chain metadata + active segment IDs.
     /// Tiny response (~few KB), establishes what needs downloading.
-    pub state_manifest_sync:
-        request_response::cbor::Behaviour<GetStateManifestRequest, GetStateManifestResponse>,
+    pub state_manifest_sync: request_response::Behaviour<StateManifestCodec>,
 
     /// State segment sync — step 2: request individual segments (~3 MB each).
     /// Downloaded in parallel after manifest is received.
@@ -232,12 +230,16 @@ impl NodeBehaviour {
         //
         // Network-aware protocol IDs — use the network's protocol_id prefix.
         // This ensures mainnet and testnet sync protocols are fully isolated.
-        let chain_sync = request_response::cbor::Behaviour::new(
+        let chain_sync = request_response::Behaviour::new(
             [(
-                StreamProtocol::try_from_owned(format!("{}/sync/headers/1", protocol_id))?,
+                // v2 validates the header count before reserving the batch and
+                // carries only exact canonical 212-byte headers.
+                StreamProtocol::try_from_owned(format!("{}/sync/headers/2", protocol_id))?,
                 ProtocolSupport::Full,
             )],
-            request_response::Config::default().with_request_timeout(Duration::from_secs(30)),
+            request_response::Config::default()
+                .with_request_timeout(Duration::from_secs(30))
+                .with_max_concurrent_streams(8),
         );
 
         let block_sync = request_response::Behaviour::new(
@@ -268,9 +270,11 @@ impl NodeBehaviour {
         );
 
         // Manifest: tiny request/response, short timeout is fine.
-        let state_manifest_sync = request_response::cbor::Behaviour::new(
+        let state_manifest_sync = request_response::Behaviour::new(
             [(
-                StreamProtocol::try_from_owned(format!("{}/sync/manifest/1", protocol_id))?,
+                // v2 checks segment/header counts and snapshot geometry before
+                // allocating either manifest vector.
+                StreamProtocol::try_from_owned(format!("{}/sync/manifest/2", protocol_id))?,
                 ProtocolSupport::Full,
             )],
             request_response::Config::default()

@@ -1023,6 +1023,57 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_manifest_boundary_and_geometry_fail_closed_before_staging() {
+        let parent = tempfile::tempdir().unwrap();
+        let (metadata, descriptor, _) = fixture();
+        let hdr = *metadata.header();
+
+        let mut wrong_hash = block_id(&hdr);
+        wrong_hash[0] ^= 1;
+        assert!(matches!(
+            AuthenticatedSnapshotMetadata::from_authenticated_header(hdr, wrong_hash, 3),
+            Err(SnapshotStagingError::TipHashMismatch)
+        ));
+        assert!(matches!(
+            AuthenticatedSnapshotMetadata::from_authenticated_header(hdr, block_id(&hdr), 2),
+            Err(SnapshotStagingError::EffectiveLogMismatch {
+                expected: 3,
+                actual: 2,
+            })
+        ));
+
+        let mut impossible_count = hdr;
+        impossible_count.active_slot_count = 9;
+        assert!(matches!(
+            AuthenticatedSnapshotMetadata::from_authenticated_header(
+                impossible_count,
+                block_id(&impossible_count),
+                3,
+            ),
+            Err(SnapshotStagingError::InvalidMetadata(
+                "active slot count exceeds snapshot domain"
+            ))
+        ));
+
+        let mut out_of_domain = descriptor;
+        out_of_domain.segment_id = 1;
+        assert!(matches!(
+            SnapshotStagingSession::new(parent.path(), metadata, vec![out_of_domain]),
+            Err(SnapshotStagingError::SegmentIdOutOfRange {
+                segment_id: 1,
+                maximum: 1,
+            })
+        ));
+        let mut noncanonical_len = descriptor;
+        noncanonical_len.encoded_len += 1;
+        assert!(matches!(
+            SnapshotStagingSession::new(parent.path(), metadata, vec![noncanonical_len]),
+            Err(SnapshotStagingError::DescriptorLength { segment_id: 0, .. })
+        ));
+        assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 0);
+    }
+
+    #[test]
     fn duplicate_reject_aborts_and_cleans_the_session() {
         let parent = tempfile::tempdir().unwrap();
         let (metadata, descriptor, encoded) = fixture();
