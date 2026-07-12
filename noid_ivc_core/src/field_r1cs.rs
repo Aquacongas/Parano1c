@@ -1823,8 +1823,8 @@ impl LincheckCircuit for FieldCscCircuit {
 /// F128-coefficient matrices `(a_0, b_0)`.
 ///
 /// It folds directly off the row-major [`SparseFieldMatrix`] storage the
-/// prover already owns, so — unlike [`FieldCscCircuit`] — it allocates **no**
-/// transposed CSC copy. During the prover's lincheck+open window only ONE
+/// caller already owns, so — unlike [`FieldCscCircuit`] — it allocates **no**
+/// transposed CSC copy. During a prover or verifier lincheck window only ONE
 /// matrix representation (the un-droppable row-major `a_0`/`b_0`) stays
 /// resident, roughly halving constraint-matrix RAM.
 ///
@@ -1874,10 +1874,14 @@ impl LincheckCircuit for FieldRowCircuit<'_> {
         assert_eq!(eq_inner.len(), n);
 
         let nnz = self.a_0.nnz() + self.b_0.nnz();
+        let threads = rayon::current_num_threads().max(1);
 
-        // Serial scatter for small instances: one output comb, `comb[c] +=
-        // weight·coeff·eq[r]` over each matrix's rows (weight α for A, 1 for B).
-        if nnz < FIELD_FOLD_PAR_THRESHOLD {
+        // Serial scatter for small instances and for the deliberately
+        // single-threaded production verifier: one output comb,
+        // `comb[c] += weight·coeff·eq[r]` over both matrices' rows (weight α
+        // for A, 1 for B). Besides avoiding parallel overhead, the verifier
+        // therefore never holds separate width-n A and B partial combs.
+        if nnz < FIELD_FOLD_PAR_THRESHOLD || threads == 1 {
             let mut comb = vec![F128::ZERO; n];
             for r in 0..self.a_0.num_rows {
                 let er = eq_inner[r];
@@ -1908,7 +1912,6 @@ impl LincheckCircuit for FieldRowCircuit<'_> {
         // density load-balances the equal ranges), trading a little
         // work-steal slack for the memory. Preserves the CSC fold's
         // column-parallelism without materializing a transpose.
-        let threads = rayon::current_num_threads().max(1);
         // Cap the chunk count so the live per-chunk combs fit the memory budget
         // (see FOLD_COMB_BUDGET_BYTES): one comb per worker was ~threads * n_cols
         // F128, and `reduce`'s per-segment identity seed doubled that. Bound the
@@ -2460,6 +2463,141 @@ mod tests {
             }
         }
         assert_eq!(got, expected);
+
+        let row = FieldRowCircuit::new(&r1cs.a_0, &r1cs.b_0, r1cs.const_pin);
+        let row_got = row.fold_alpha_batched(alpha, &eq_inner);
+        assert_eq!(row_got, got, "row-major fold drifted from CSC fold");
+    }
+
+    /// The borrowing row fold is value-identical to the legacy CSC gather in
+    /// both its one-comb verifier path and its parallel prover path.
+    #[test]
+    fn row_fold_matches_csc_in_serial_and_parallel_pools() {
+        let (r1cs, _) = random_satisfiable(13, 12, 0xA11C_E551);
+        let mut rng = Rng::new(0xF01D_E001);
+        let point: Vec<F128> = (0..r1cs.k_log).map(|_| rng.f128()).collect();
+        let eq_inner = build_eq_table(&point);
+        let alpha = rng.f128();
+        let csc =
+            FieldCscCircuit::from_matrices(&r1cs.a_0, &r1cs.b_0).with_const_pin(r1cs.const_pin);
+        let expected = csc.fold_alpha_batched(alpha, &eq_inner);
+        let row = FieldRowCircuit::new(&r1cs.a_0, &r1cs.b_0, r1cs.const_pin);
+
+        let serial = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("one-thread test pool")
+            .install(|| row.fold_alpha_batched(alpha, &eq_inner));
+        let parallel = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .expect("two-thread test pool")
+            .install(|| row.fold_alpha_batched(alpha, &eq_inner));
+
+        assert_eq!(serial, expected, "single-comb verifier fold drifted");
+        assert_eq!(parallel, expected, "parallel row fold drifted");
+    }
+
+    /// A proof produced against either circuit representation is byte-for-byte
+    /// identical and the shared verifier accepts it with the same terminal
+    /// claim. This pins the transcript/acceptance semantics while production
+    /// verification switches from retained CSC to borrowing CSR.
+    #[test]
+    fn row_and_csc_lincheck_transcripts_and_acceptance_match() {
+        use crate::challenger::FsChallenger;
+        use crate::lincheck::{QuirkyPoint, prove_field, verify};
+
+        let (r1cs, z) = random_satisfiable(10, 7, 0x7E57_C5C0);
+        let mut rng = Rng::new(0x7A4A_5C71);
+        let x_ab = QuirkyPoint {
+            z_skip: rng.f128(),
+            x_inner_rest: (0..r1cs.k_log - r1cs.k_skip).map(|_| rng.f128()).collect(),
+            x_outer: (0..r1cs.m - r1cs.k_log).map(|_| rng.f128()).collect(),
+        };
+        let row = FieldRowCircuit::new(&r1cs.a_0, &r1cs.b_0, r1cs.const_pin);
+        let csc =
+            FieldCscCircuit::from_matrices(&r1cs.a_0, &r1cs.b_0).with_const_pin(r1cs.const_pin);
+
+        let mut ch_row = FsChallenger::new(b"field-row-csc-parity-v0");
+        let (proof_row, claim_row) = prove_field(
+            &z,
+            r1cs.m,
+            r1cs.k_log,
+            r1cs.k_skip,
+            r1cs.useful_rows,
+            &row,
+            &x_ab,
+            &mut ch_row,
+        );
+        let mut ch_csc = FsChallenger::new(b"field-row-csc-parity-v0");
+        let (proof_csc, claim_csc) = prove_field(
+            &z,
+            r1cs.m,
+            r1cs.k_log,
+            r1cs.k_skip,
+            r1cs.useful_rows,
+            &csc,
+            &x_ab,
+            &mut ch_csc,
+        );
+        assert_eq!(proof_row, proof_csc, "lincheck proof/transcript drifted");
+        assert_eq!(claim_row, claim_csc, "prover terminal claim drifted");
+
+        let a = apply_block_diag_field(&r1cs.a_0, &z, r1cs.k_log);
+        let b = apply_block_diag_field(&r1cs.b_0, &z, r1cs.k_log);
+        let eval = |values: &[F128]| {
+            let skip =
+                crate::zerocheck::multilinear::lagrange_weights_naive(r1cs.k_skip, x_ab.z_skip);
+            let rest = build_eq_table(&x_ab.x_inner_rest);
+            let outer = build_eq_table(&x_ab.x_outer);
+            let inner_mask = (1usize << r1cs.k_log) - 1;
+            let skip_mask = (1usize << r1cs.k_skip) - 1;
+            values
+                .iter()
+                .enumerate()
+                .fold(F128::ZERO, |acc, (i, value)| {
+                    let inner = i & inner_mask;
+                    acc + *value
+                        * skip[inner & skip_mask]
+                        * rest[inner >> r1cs.k_skip]
+                        * outer[i >> r1cs.k_log]
+                })
+        };
+        let (v_a, v_b) = (eval(&a), eval(&b));
+
+        let mut ch_verify_row = FsChallenger::new(b"field-row-csc-parity-v0");
+        let accepted_row = verify(
+            r1cs.m,
+            r1cs.k_log,
+            r1cs.k_skip,
+            &row,
+            &x_ab,
+            v_a,
+            v_b,
+            &proof_row,
+            &mut ch_verify_row,
+        )
+        .expect("borrowing row verifier rejected the parity proof");
+        let mut ch_verify_csc = FsChallenger::new(b"field-row-csc-parity-v0");
+        let accepted_csc = verify(
+            r1cs.m,
+            r1cs.k_log,
+            r1cs.k_skip,
+            &csc,
+            &x_ab,
+            v_a,
+            v_b,
+            &proof_row,
+            &mut ch_verify_csc,
+        )
+        .expect("legacy CSC verifier rejected the parity proof");
+
+        assert_eq!(accepted_row, claim_row);
+        assert_eq!(accepted_row, accepted_csc, "verifier acceptance drifted");
+        assert!(
+            r1cs.csc_cache.get().is_none(),
+            "row verification populated the retained CSC cache",
+        );
     }
 
     #[test]

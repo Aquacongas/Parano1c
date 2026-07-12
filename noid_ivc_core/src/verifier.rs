@@ -766,11 +766,18 @@ fn verify_field_inner<Ch: Challenger>(
         x_inner_rest: zc_claim.mlv_challenges[..inner_rest_len].to_vec(),
         x_outer: zc_claim.mlv_challenges[inner_rest_len..].to_vec(),
     };
+    // The canonical statement is already resident as dictionary-encoded CSR.
+    // Fold directly from those rows: materializing the derived CSC transpose
+    // here would retain a second full matrix representation on every loaded
+    // production verifier class. `FieldRowCircuit` computes the exact same
+    // `comb_vec`, hence leaves every transcript challenge and acceptance
+    // decision unchanged.
+    let row_circuit = crate::field_r1cs::FieldRowCircuit::new(&r1cs.a_0, &r1cs.b_0, r1cs.const_pin);
     let lc_claim = lincheck::verify(
         r1cs.m,
         r1cs.k_log,
         r1cs.k_skip,
-        r1cs.csc_lincheck_circuit(),
+        &row_circuit,
         &x_ab,
         zc_claim.a_eval,
         zc_claim.b_eval,
@@ -839,6 +846,8 @@ fn verify_field_inner<Ch: Challenger>(
 
 #[cfg(test)]
 mod tests {
+    use crate::field_r1cs::{FieldRowCircuit, synthetic_satisfiable};
+
     /// The verifier is intentionally single-threaded: every `par_*` reached
     /// from a verify core must collapse onto the one-thread `verifier_pool`.
     /// Guard the invariant so a future `ThreadPoolBuilder` tweak can't silently
@@ -851,5 +860,36 @@ mod tests {
     fn verifier_pool_is_single_threaded() {
         let n = super::verifier_pool().install(rayon::current_num_threads);
         assert_eq!(n, 1, "verifier_pool must have exactly one worker thread");
+    }
+
+    /// Production field verification must borrow the canonical CSR matrices;
+    /// constructing its circuit may not populate the retained CSC cache.
+    #[test]
+    fn field_verifier_circuit_is_borrowing_and_csc_free() {
+        let (r1cs, _) = synthetic_satisfiable(8, 6, 0xC5C0_FEEE);
+        assert!(r1cs.csc_cache.get().is_none());
+
+        let circuit = FieldRowCircuit::new(&r1cs.a_0, &r1cs.b_0, r1cs.const_pin);
+        assert_eq!(
+            crate::lincheck::LincheckCircuit::n_cols(&circuit),
+            1usize << r1cs.k_log,
+        );
+        assert!(
+            r1cs.csc_cache.get().is_none(),
+            "borrowing verifier circuit unexpectedly retained a CSC transpose",
+        );
+    }
+
+    /// Structural regression guard: the production verifier source must not
+    /// regain either lazy or direct CSC construction. The end-to-end fold and
+    /// transcript parity is covered in `field_r1cs` tests.
+    #[test]
+    fn production_field_verifier_source_contains_no_csc_construction() {
+        let production = include_str!("verifier.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("verifier has a production section");
+        assert!(!production.contains(".csc_lincheck_circuit()"));
+        assert!(!production.contains("FieldCscCircuit::from_matrices"));
     }
 }
