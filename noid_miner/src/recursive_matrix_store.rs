@@ -544,6 +544,30 @@ impl LocalSelectedRecursiveMatrixSource {
         })
     }
 
+    /// Install-time trust adoption: bind `statement_digest` to the exact
+    /// current identity of the artifact leaf without a Poseidon pass. The
+    /// caller owns the authentication of the installed bytes (the release
+    /// pack pins verified against the running binary); this writes the same
+    /// binding the first fully authenticated load would have recorded, so
+    /// the very first sync already runs at trusted-open speed.
+    pub fn adopt_artifact_trust(
+        &self,
+        kind: SelectedRecursiveMatrixKind,
+        statement_digest: [u8; 32],
+    ) -> Result<(), LocalSelectedRecursiveMatrixError> {
+        #[cfg(not(unix))]
+        {
+            let _ = (kind, statement_digest);
+            Err(LocalSelectedRecursiveMatrixError::UnsupportedPlatform)
+        }
+        #[cfg(unix)]
+        {
+            let parent = self.open_version_directory(false)?;
+            let (_, metadata, _, compressed) = self.open_anchored_artifact(&parent, kind)?;
+            self.write_artifact_trust_record(&parent, kind, compressed, &metadata, statement_digest)
+        }
+    }
+
     #[cfg(unix)]
     fn read_artifact_trust_record(
         &self,
@@ -1639,6 +1663,57 @@ mod tests {
             LoadedSelectedRecursiveMatrixEvaluator::TrustedResident(_)
         ));
         drop(seventh);
+    }
+
+    #[test]
+    fn adopted_trust_admits_fast_path_and_rejects_wrong_digest() {
+        let directory = tempdir().unwrap();
+        let mut source = isolated_source(directory.path());
+        source.set_resident_evaluation(true);
+        let matrix = tiny_matrix(0xAD07);
+        let matrix_identity = identity(SelectedRecursiveMatrixKind::GenesisLink, &matrix);
+        source.export_matrix(matrix_identity, &matrix).unwrap();
+        let trust_path = directory
+            .path()
+            .join("v1")
+            .join("genesis-link.field-r1cs.zst.trust");
+
+        // Model the install flow: a fresh data directory has the verified
+        // leaf but no record yet.
+        fs::remove_file(&trust_path).unwrap();
+        source
+            .adopt_artifact_trust(
+                SelectedRecursiveMatrixKind::GenesisLink,
+                matrix_identity.statement_digest(),
+            )
+            .unwrap();
+        assert!(trust_path.exists());
+        let adopted = source.open_artifact_evaluator(matrix_identity).unwrap();
+        assert!(matches!(
+            adopted,
+            LoadedSelectedRecursiveMatrixEvaluator::TrustedResident(_)
+        ));
+        drop(adopted);
+
+        // An adoption carrying the wrong digest is just an unusable record:
+        // the requested identity mismatch falls back to one full
+        // authentication and the fresh record replaces it.
+        fs::remove_file(&trust_path).unwrap();
+        source
+            .adopt_artifact_trust(SelectedRecursiveMatrixKind::GenesisLink, [7u8; 32])
+            .unwrap();
+        let mismatched = source.open_artifact_evaluator(matrix_identity).unwrap();
+        assert!(matches!(
+            mismatched,
+            LoadedSelectedRecursiveMatrixEvaluator::Resident(_)
+        ));
+        drop(mismatched);
+        let recovered = source.open_artifact_evaluator(matrix_identity).unwrap();
+        assert!(matches!(
+            recovered,
+            LoadedSelectedRecursiveMatrixEvaluator::TrustedResident(_)
+        ));
+        drop(recovered);
     }
 
     #[test]

@@ -140,6 +140,43 @@ impl<'a> SelectedRecursiveLinkClasses<'a> {
     fn get(&self, tier: SelectedRecursiveTier) -> &'a SplitLinkClass {
         &self.classes[tier.slot()]
     }
+
+    /// Every canonical matrix artifact identity a node must hold locally, in
+    /// preflight order: genesis T, the four Link tiers, the four Block tiers.
+    /// All shapes and digests come from the validated frozen registry — a
+    /// pack file can therefore be trust-installed only against these pins.
+    pub fn canonical_artifact_identities(
+        &self,
+    ) -> [crate::SelectedRecursiveMatrixArtifactIdentity; 9] {
+        use crate::SelectedRecursiveMatrixArtifactIdentity as Identity;
+        let tiers = [
+            SelectedRecursiveTier::B8,
+            SelectedRecursiveTier::B32,
+            SelectedRecursiveTier::B64,
+            SelectedRecursiveTier::B255,
+        ];
+        let genesis_class = &self.classes[0];
+        let mut identities = [Identity::new(
+            SelectedRecursiveMatrixKind::GenesisLink,
+            genesis_class.shape,
+            genesis_class.genesis_digest,
+        ); 9];
+        for (index, tier) in tiers.into_iter().enumerate() {
+            let class = self.get(tier);
+            identities[1 + index] = Identity::new(
+                SelectedRecursiveMatrixKind::PreviousLink(tier),
+                class.shape,
+                self.link_class_digests[tier.slot()],
+            );
+            let info = &class.ladder()[class.slot()];
+            identities[5 + index] = Identity::new(
+                SelectedRecursiveMatrixKind::CurrentBlock(tier),
+                info.b_shape,
+                info.b_digest,
+            );
+        }
+        identities
+    }
 }
 
 /// Consuming authority for exactly one natively accepted and component-

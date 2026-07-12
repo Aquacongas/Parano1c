@@ -131,6 +131,17 @@ fn gap_requires_snapshot_sync(local_height: u64, peer_height: u64) -> bool {
 const SELECTED_RECURSIVE_REGISTRY_RELEASE_DIGEST_HEX: Option<&str> =
     option_env!("NOID_SELECTED_RECURSIVE_REGISTRY_RELEASE_DIGEST");
 const SELECTED_RECURSIVE_ARTIFACT_DIRECTORY: &str = "selected-recursive";
+/// Release-pack leaf pins: nine concatenated 32-byte Poseidon2b hashes of the
+/// compressed artifact files, hex-encoded, in canonical identity order
+/// (genesis T, Link B8/B32/B64/B255, Block B8/B32/B64/B255). A build without
+/// pins still seeds files from the distribution folder, but the one-time full
+/// authentication then runs on first sync instead of at install.
+const SELECTED_RECURSIVE_PACK_LEAF_DIGESTS_HEX: Option<&str> =
+    option_env!("NOID_SELECTED_RECURSIVE_PACK_LEAF_DIGESTS");
+const SELECTED_RECURSIVE_PACK_LEAF_HASH_DOMAIN: &[u8] = b"NOID/SELECTED-RECURSIVE/PACK-LEAF";
+/// Hard per-file bound when reading distribution-pack candidates; the real
+/// compressed leaves are two orders of magnitude below this.
+const SELECTED_RECURSIVE_PACK_LEAF_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 #[derive(Clone)]
 struct SelectedHistoryVerifierArtifacts {
@@ -271,10 +282,266 @@ fn preflight_selected_recursive_artifacts(artifacts: &SelectedHistoryVerifierArt
             root = %artifacts.root.display(),
             missing = %missing.join(", "),
             "selected-recursive artifacts incomplete: proof-native snapshot admission and the \
-             proving worker stay disabled until the canonical artifacts are installed \
-             (one-time first-run generation; ordinary full-block sync remains available)"
+             proving worker stay disabled until the canonical artifacts are installed. Install \
+             by placing the release matrix pack next to this binary and restarting (the node \
+             adopts it automatically), by copying the files into the directory above, or by \
+             rebuilding them with the standalone `noid_matrix_gen` tool. Ordinary full-block \
+             sync remains available meanwhile"
         );
     }
+}
+
+/// First-run installation: seed missing canonical artifacts from the
+/// directory the running executable was launched from (the unpacked release
+/// folder). Fail-closed at every step: the registry candidate must decode
+/// under the embedded release pin before it is installed, and each matrix
+/// leaf must match its embedded pack pin before it is installed and
+/// trust-adopted. A verified install is removed from the distribution folder
+/// (best effort) so the user is never left with a second stale copy; an
+/// unverifiable candidate is left in place and reported.
+fn seed_selected_recursive_artifacts_from_distribution(
+    artifacts: &SelectedHistoryVerifierArtifacts,
+) {
+    use noid_miner::{selected_recursive_matrix_relative_path, SelectedRecursiveMatrixKind as Kind};
+
+    let registry_store =
+        noid_miner::LocalSelectedRecursiveClassRegistryStore::new(artifacts.root.clone());
+    let registry_path = registry_store.artifact_path();
+    let version_directory = artifacts.root.join("v1");
+
+    let leaf_of = |kind: Kind| {
+        let compressed = artifacts
+            .root
+            .join(selected_recursive_matrix_relative_path(kind))
+            .with_extension("field-r1cs.zst");
+        let name = compressed
+            .file_name()
+            .expect("compressed artifact leaf has a file name")
+            .to_owned();
+        (compressed, name)
+    };
+    let kinds = [
+        Kind::GenesisLink,
+        Kind::PreviousLink(noid_miner::SelectedRecursiveTier::B8),
+        Kind::PreviousLink(noid_miner::SelectedRecursiveTier::B32),
+        Kind::PreviousLink(noid_miner::SelectedRecursiveTier::B64),
+        Kind::PreviousLink(noid_miner::SelectedRecursiveTier::B255),
+        Kind::CurrentBlock(noid_miner::SelectedRecursiveTier::B8),
+        Kind::CurrentBlock(noid_miner::SelectedRecursiveTier::B32),
+        Kind::CurrentBlock(noid_miner::SelectedRecursiveTier::B64),
+        Kind::CurrentBlock(noid_miner::SelectedRecursiveTier::B255),
+    ];
+
+    let registry_missing = !registry_path.is_file();
+    let missing_kinds: Vec<Kind> = kinds
+        .iter()
+        .copied()
+        .filter(|kind| {
+            let (compressed, _) = leaf_of(*kind);
+            !compressed.is_file() && !compressed.with_extension("").is_file()
+        })
+        .collect();
+    if !registry_missing && missing_kinds.is_empty() {
+        return;
+    }
+
+    let Some(distribution) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+    else {
+        return;
+    };
+    // A development binary running out of the artifact root must not seed
+    // from itself.
+    let same_tree = |left: &Path, right: &Path| match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    };
+    if same_tree(&distribution, &artifacts.root) || same_tree(&distribution, &version_directory) {
+        return;
+    }
+
+    if registry_missing {
+        let candidate = distribution.join("selected-recursive.classes");
+        match std::fs::read(&candidate) {
+            Err(_) => {}
+            Ok(bytes) if bytes.len() > noid_recursive::MAX_SELECTED_RECURSIVE_CLASS_REGISTRY_BYTES => {
+                tracing::warn!(
+                    candidate = %candidate.display(),
+                    "distribution registry candidate exceeds the registry size cap; ignored"
+                );
+            }
+            Ok(bytes) => {
+                match noid_recursive::decode_selected_recursive_terminal_registry_pinned(
+                    &bytes,
+                    artifacts.registry_digest,
+                ) {
+                    Ok(_) => {
+                        if let Err(error) = install_distribution_file(
+                            &version_directory,
+                            &registry_path,
+                            &bytes,
+                            &candidate,
+                        ) {
+                            tracing::warn!(
+                                candidate = %candidate.display(),
+                                %error,
+                                "failed to install the verified distribution registry"
+                            );
+                        } else {
+                            tracing::info!(
+                                registry = %registry_path.display(),
+                                "installed the pinned class registry from the distribution folder"
+                            );
+                        }
+                    }
+                    Err(error) => tracing::warn!(
+                        candidate = %candidate.display(),
+                        %error,
+                        "distribution registry candidate does not match the embedded release pin; ignored"
+                    ),
+                }
+            }
+        }
+    }
+
+    if missing_kinds.is_empty() {
+        return;
+    }
+    let loaded = match registry_store.load_pinned(artifacts.registry_digest) {
+        Ok(loaded) => loaded,
+        // No verified registry: nothing can pin the matrices. The preflight
+        // warning that follows lists everything that is still missing.
+        Err(_) => return,
+    };
+    let link_classes = match loaded.link_classes() {
+        Ok(classes) => classes,
+        Err(error) => {
+            tracing::warn!(%error, "pinned registry rejected while enumerating identities");
+            return;
+        }
+    };
+    let identities = link_classes.canonical_artifact_identities();
+
+    let leaf_pins: Option<Vec<[u8; 32]>> = SELECTED_RECURSIVE_PACK_LEAF_DIGESTS_HEX
+        .filter(|encoded| encoded.len() == 9 * 64)
+        .and_then(|encoded| {
+            let mut pins = Vec::with_capacity(9);
+            for index in 0..9 {
+                let mut pin = [0u8; 32];
+                hex::decode_to_slice(&encoded[index * 64..(index + 1) * 64], &mut pin).ok()?;
+                pins.push(pin);
+            }
+            Some(pins)
+        });
+    if leaf_pins.is_none() {
+        tracing::warn!(
+            "release pack leaf pins are not embedded in this build: distribution matrices are \
+             installed unverified and the first sync performs the one-time full authentication"
+        );
+    }
+
+    let matrix_source = noid_miner::LocalSelectedRecursiveMatrixSource::new(artifacts.root.clone());
+    let mut installed = 0usize;
+    for kind in missing_kinds {
+        let (final_path, leaf_name) = leaf_of(kind);
+        let candidate = distribution.join(&leaf_name);
+        let Ok(metadata) = std::fs::metadata(&candidate) else {
+            continue;
+        };
+        if !metadata.is_file() || metadata.len() > SELECTED_RECURSIVE_PACK_LEAF_MAX_BYTES {
+            continue;
+        }
+        let index = identities
+            .iter()
+            .position(|identity| identity.kind() == kind)
+            .expect("canonical identities cover every preflight kind");
+        let bytes = match std::fs::read(&candidate) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::warn!(candidate = %candidate.display(), %error, "cannot read pack candidate");
+                continue;
+            }
+        };
+        if let Some(pins) = &leaf_pins {
+            let digest = noid_poseidon2b::native::poseidon2b_hash_byte_slices(
+                SELECTED_RECURSIVE_PACK_LEAF_HASH_DOMAIN,
+                &[&bytes],
+            );
+            if digest != pins[index] {
+                tracing::warn!(
+                    candidate = %candidate.display(),
+                    "pack candidate does not match its embedded release pin; left in place, not installed"
+                );
+                continue;
+            }
+        }
+        if let Err(error) =
+            install_distribution_file(&version_directory, &final_path, &bytes, &candidate)
+        {
+            tracing::warn!(
+                candidate = %candidate.display(),
+                %error,
+                "failed to install verified pack candidate"
+            );
+            continue;
+        }
+        if leaf_pins.is_some() {
+            let identity = identities[index];
+            if let Err(error) =
+                matrix_source.adopt_artifact_trust(kind, identity.statement_digest())
+            {
+                tracing::warn!(
+                    leaf = %final_path.display(),
+                    %error,
+                    "trust adoption failed; the first authenticated load will rehash once"
+                );
+            }
+        }
+        installed += 1;
+        tracing::info!(
+            leaf = %final_path.display(),
+            verified = leaf_pins.is_some(),
+            "installed canonical matrix from the distribution folder"
+        );
+    }
+    if installed > 0 {
+        tracing::info!(
+            installed,
+            root = %artifacts.root.display(),
+            "distribution pack adopted into the data directory"
+        );
+    }
+}
+
+/// Write `bytes` into `final_path` atomically (temp + rename inside the
+/// version directory), then best-effort remove the verified source file.
+fn install_distribution_file(
+    version_directory: &Path,
+    final_path: &Path,
+    bytes: &[u8],
+    source: &Path,
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(version_directory)?;
+    let temporary = final_path.with_extension("install-tmp");
+    {
+        let mut file = std::fs::File::create(&temporary)?;
+        use std::io::Write as _;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    if let Err(error) = std::fs::rename(&temporary, final_path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::remove_file(source) {
+        tracing::debug!(
+            source = %source.display(),
+            %error,
+            "verified distribution source could not be removed; leaving it in place"
+        );
+    }
+    Ok(())
 }
 
 fn selected_history_verifier_artifacts(
@@ -795,7 +1062,10 @@ async fn main() -> anyhow::Result<()> {
         None => tracing::warn!(
             "selected-history snapshot admission disabled: release registry authority is not embedded"
         ),
-        Some(artifacts) => preflight_selected_recursive_artifacts(artifacts),
+        Some(artifacts) => {
+            seed_selected_recursive_artifacts_from_distribution(artifacts);
+            preflight_selected_recursive_artifacts(artifacts);
+        }
     }
 
     // --- Storage ---
