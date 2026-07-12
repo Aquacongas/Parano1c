@@ -278,6 +278,12 @@ pub fn build_block_template(
     }
     let ordered_winners = applied_winners;
 
+    // Selection and final replay need the same logical parent state, but never
+    // at the same time.  Release the first dense scratch image before cloning
+    // the final replay state; otherwise a maximal state keeps two additional
+    // resident state images alive across the rest of template construction.
+    drop(selection_scratch);
+
     // Rebuild the final scratch state in semantic block order. Selection runs
     // users first because coinbase value depends on the selected fee set, but
     // the actual block and exact action stream are coinbase -> users.
