@@ -105,13 +105,66 @@ pub struct FullAcceptedBlockBatchOutput {
 /// Consuming single-block carrier handed directly to the selected recursive
 /// miner.  It deliberately has no `Clone` or serde implementation: large
 /// component inputs and decoded authorization proofs move once from native
-/// replay into the recursive worker.
+/// replay into the recursive worker.  Every field is private so the type is
+/// also a provenance seal: only this module's successful native replay plus
+/// retained-component verification can mint it.
 #[derive(Debug)]
 pub struct SelectedRecursiveBlockArtifacts {
-    pub end_accumulator: ChainAccumulator,
-    pub component_inputs: RecursiveBlockBatchComponentInputs,
-    pub component_proof: RecursiveBlockBatchComponentProof,
-    pub selected_authorization_proofs: Vec<noid_gkr::zk_authorization::ZkAuthorizationProof>,
+    start_accumulator: ChainAccumulator,
+    end_accumulator: ChainAccumulator,
+    component_inputs: RecursiveBlockBatchComponentInputs,
+    component_proof: RecursiveBlockBatchComponentProof,
+    selected_authorization_proofs: Vec<noid_gkr::zk_authorization::ZkAuthorizationProof>,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static SELECTED_RECONSTRUCTION_COMPONENT_VERIFY_CALLS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+impl SelectedRecursiveBlockArtifacts {
+    /// Number of live selected authorizations in the sealed carrier.
+    ///
+    /// This is the only datum the miner needs before consuming the seal: it
+    /// selects one of the four freeze-locked recursive classes without
+    /// walking or cloning any retained component vectors.
+    pub fn live_authorization_count(&self) -> usize {
+        self.component_inputs.authorization_inputs.len()
+    }
+
+    /// Borrow the fixed-size recursive boundary for the worker's final
+    /// terminal-envelope equality check. This exposes no mutable component
+    /// authority and avoids retaining any B255-sized carrier after Block
+    /// construction.
+    pub fn end_accumulator(&self) -> &ChainAccumulator {
+        &self.end_accumulator
+    }
+
+    /// Consume the native-verified seal at the recursive builder boundary.
+    ///
+    /// The tuple is deliberately not accepted by any public miner entrypoint;
+    /// callers cannot edit fields and then recreate the seal.  Ownership of
+    /// the B255-sized inputs/proofs moves directly into the one selected Block
+    /// assembly and is never serialized or cloned.
+    #[allow(clippy::type_complexity)]
+    pub fn into_recursive_builder_parts(
+        self,
+    ) -> (
+        ChainAccumulator,
+        ChainAccumulator,
+        RecursiveBlockBatchComponentInputs,
+        RecursiveBlockBatchComponentProof,
+        Vec<noid_gkr::zk_authorization::ZkAuthorizationProof>,
+    ) {
+        (
+            self.start_accumulator,
+            self.end_accumulator,
+            self.component_inputs,
+            self.component_proof,
+            self.selected_authorization_proofs,
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -818,9 +871,9 @@ pub fn prove_retained_full_accepted_block_batch_proof(
 /// hold the process-global proof-memory reservation before entering; governor
 /// wiring remains outside this dependency-clean crate.
 pub fn reconstruct_selected_recursive_block_artifacts(
-    start_consensus: &RecursiveConsensusState,
-    start_accumulator: &ChainAccumulator,
-    start_parent: &BlockHeader,
+    start_consensus: RecursiveConsensusState,
+    start_accumulator: ChainAccumulator,
+    start_parent: BlockHeader,
     start_state: ChainState,
     item: FullAcceptedBlockBatchItem,
 ) -> Result<SelectedRecursiveBlockArtifacts, FullAcceptedBlockBatchError> {
@@ -837,13 +890,13 @@ pub fn reconstruct_selected_recursive_block_artifacts(
 /// [`reconstruct_selected_recursive_block_artifacts`]. Exactly one direct
 /// child of `start_parent` is admitted before any proof decode or state replay.
 pub fn reconstruct_selected_recursive_block_artifacts_from_single_witness(
-    start_consensus: &RecursiveConsensusState,
-    start_accumulator: &ChainAccumulator,
-    start_parent: &BlockHeader,
+    start_consensus: RecursiveConsensusState,
+    start_accumulator: ChainAccumulator,
+    start_parent: BlockHeader,
     start_state: ChainState,
     witness: FullAcceptedBlockBatchWitness,
 ) -> Result<SelectedRecursiveBlockArtifacts, FullAcceptedBlockBatchError> {
-    validate_single_block_reconstruction_input(start_parent, &witness)?;
+    validate_single_block_reconstruction_input(&start_parent, &witness)?;
     let transaction_count = witness.items[0].block.transactions.len();
     let user_transaction_count = witness.items[0]
         .block
@@ -856,9 +909,9 @@ pub fn reconstruct_selected_recursive_block_artifacts_from_single_witness(
     // reconstruction path. It reuses the bounded proof/sidecar decoders and
     // derives every recursive statement from accepted raw material.
     let output = verify_full_accepted_block_batch_native_with_owned_state(
-        start_consensus,
-        start_accumulator,
-        start_parent,
+        &start_consensus,
+        &start_accumulator,
+        &start_parent,
         start_state,
         &witness,
     )?;
@@ -883,9 +936,11 @@ pub fn reconstruct_selected_recursive_block_artifacts_from_single_witness(
         return Err(FullAcceptedBlockBatchError::ComponentShapeMismatch);
     }
 
+    #[cfg(test)]
+    SELECTED_RECONSTRUCTION_COMPONENT_VERIFY_CALLS.with(|calls| calls.set(calls.get() + 1));
     let verified = verify_full_accepted_block_batch_components(
-        start_consensus,
-        start_accumulator,
+        &start_consensus,
+        &start_accumulator,
         &accepted_claim_batch.accumulator,
         &proof_components,
         &component_proof,
@@ -915,6 +970,7 @@ pub fn reconstruct_selected_recursive_block_artifacts_from_single_witness(
     ));
 
     Ok(SelectedRecursiveBlockArtifacts {
+        start_accumulator,
         end_accumulator,
         component_inputs,
         component_proof,
@@ -2111,39 +2167,45 @@ mod tests {
         let (start_consensus, start_accumulator, parent, state, item) =
             canonical_coinbase_fixture();
         let child_header = item.block.header.clone();
+        SELECTED_RECONSTRUCTION_COMPONENT_VERIFY_CALLS.with(|calls| calls.set(0));
         let artifacts = reconstruct_selected_recursive_block_artifacts(
-            &start_consensus,
-            &start_accumulator,
-            &parent,
+            start_consensus.clone(),
+            start_accumulator.clone(),
+            parent,
             state,
             item,
         )
         .expect("canonical coinbase selected-recursive reconstruction");
+        SELECTED_RECONSTRUCTION_COMPONENT_VERIFY_CALLS
+            .with(|calls| assert_eq!(calls.get(), 1, "one retained-component verification"));
 
-        assert_eq!(artifacts.end_accumulator.height, child_header.height);
+        assert_eq!(artifacts.live_authorization_count(), 0);
+        let (
+            sealed_start_accumulator,
+            end_accumulator,
+            component_inputs,
+            component_proof,
+            selected_authorization_proofs,
+        ) = artifacts.into_recursive_builder_parts();
+
+        assert_eq!(sealed_start_accumulator, start_accumulator);
+        assert_eq!(end_accumulator.height, child_header.height);
         assert_eq!(
-            artifacts.end_accumulator.tip_block_id,
+            end_accumulator.tip_block_id,
             hash_block_header(&child_header)
         );
-        assert_eq!(
-            artifacts
-                .component_inputs
-                .accepted_claim_witness
-                .headers
-                .len(),
-            1
-        );
-        assert_eq!(artifacts.component_inputs.tx_body_inputs.len(), 1);
-        assert!(artifacts.component_inputs.authorization_inputs.is_empty());
-        assert!(artifacts.selected_authorization_proofs.is_empty());
-        assert_eq!(artifacts.component_proof.exact_state.len(), 1);
+        assert_eq!(component_inputs.accepted_claim_witness.headers.len(), 1);
+        assert_eq!(component_inputs.tx_body_inputs.len(), 1);
+        assert!(component_inputs.authorization_inputs.is_empty());
+        assert!(selected_authorization_proofs.is_empty());
+        assert_eq!(component_proof.exact_state.len(), 1);
 
         verify_recursive_accepted_block_batch_components(
             &start_consensus,
             &start_accumulator,
-            &artifacts.end_accumulator,
-            &artifacts.component_inputs,
-            &artifacts.component_proof,
+            &end_accumulator,
+            &component_inputs,
+            &component_proof,
         )
         .expect("returned carrier remains exact after ownership transfer");
     }
@@ -2176,9 +2238,9 @@ mod tests {
 
         assert!(matches!(
             reconstruct_selected_recursive_block_artifacts_from_single_witness(
-                &start_consensus,
-                &start_accumulator,
-                &parent,
+                start_consensus.clone(),
+                start_accumulator.clone(),
+                parent.clone(),
                 ChainState::with_log_slots(8),
                 FullAcceptedBlockBatchWitness { items: Vec::new() },
             ),
@@ -2186,9 +2248,9 @@ mod tests {
         ));
         assert!(matches!(
             reconstruct_selected_recursive_block_artifacts_from_single_witness(
-                &start_consensus,
-                &start_accumulator,
-                &parent,
+                start_consensus.clone(),
+                start_accumulator.clone(),
+                parent.clone(),
                 ChainState::with_log_slots(8),
                 FullAcceptedBlockBatchWitness {
                     items: vec![item.clone(), item.clone()],
@@ -2201,9 +2263,9 @@ mod tests {
         tampered.block.header.prev_block_hash[0] ^= 1;
         assert!(matches!(
             reconstruct_selected_recursive_block_artifacts(
-                &start_consensus,
-                &start_accumulator,
-                &parent,
+                start_consensus,
+                start_accumulator,
+                parent,
                 ChainState::with_log_slots(8),
                 tampered,
             ),
@@ -2218,12 +2280,22 @@ mod tests {
             .split("pub struct SelectedRecursiveBlockArtifacts")
             .nth(1)
             .expect("selected recursive carrier")
-            .split("#[derive(Debug, Clone)]")
+            .split("impl SelectedRecursiveBlockArtifacts")
             .next()
             .expect("carrier boundary");
         assert!(!carrier.contains("Clone"));
         assert!(!carrier.contains("Serialize"));
         assert!(!carrier.contains("Deserialize"));
+        for private_field in [
+            "start_accumulator: ChainAccumulator",
+            "end_accumulator: ChainAccumulator",
+            "component_inputs: RecursiveBlockBatchComponentInputs",
+            "component_proof: RecursiveBlockBatchComponentProof",
+            "selected_authorization_proofs: Vec<",
+        ] {
+            assert!(carrier.contains(private_field));
+            assert!(!carrier.contains(&format!("pub {private_field}")));
+        }
 
         let reconstructor = source
             .split("pub fn reconstruct_selected_recursive_block_artifacts_from_single_witness")
@@ -2244,7 +2316,14 @@ mod tests {
         assert!(reconstructor.contains("drop(witness)"));
         assert!(reconstructor.contains("drop(end_state)"));
         assert!(reconstructor.contains("prove_full_accepted_block_batch_components"));
-        assert!(reconstructor.contains("verify_full_accepted_block_batch_components"));
+        assert_eq!(
+            reconstructor
+                .matches("verify_full_accepted_block_batch_components(")
+                .count(),
+            1,
+            "retained components are natively verified exactly once before sealing"
+        );
+        assert!(reconstructor.contains("start_accumulator,"));
         assert!(reconstructor.contains("drop(("));
         assert!(!reconstructor.contains("bincode::serialize"));
         assert!(!reconstructor.contains(".clone()"));

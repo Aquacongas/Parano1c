@@ -11,10 +11,7 @@
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use noid_block::{
-    reconstruct_selected_recursive_block_artifacts, FullAcceptedBlockBatchItem,
-    SelectedRecursiveBlockArtifacts,
-};
+use noid_block::{reconstruct_selected_recursive_block_artifacts, FullAcceptedBlockBatchItem};
 use noid_chain::block::Block;
 use noid_chain::consensus::header::asert_anchor_height;
 use noid_chain::consensus::params::{
@@ -519,9 +516,9 @@ fn process_claimed_job(
     check_cancelled(cancelled)?;
 
     let artifacts = reconstruct_selected_recursive_block_artifacts(
-        &start_consensus,
-        &start_accumulator,
-        &parent_header,
+        start_consensus,
+        start_accumulator,
+        parent_header,
         start_state,
         FullAcceptedBlockBatchItem {
             block,
@@ -531,33 +528,19 @@ fn process_claimed_job(
     )
     .map_err(|error| retryable("reconstruct selected Block artifacts", error))?;
     check_cancelled(cancelled)?;
+    // Keep only the fixed ten-lane terminal identity. The consuming job moves
+    // every B255-sized component/proof vector into Block construction.
+    let expected_end_accumulator = artifacts.end_accumulator().clone();
 
-    let SelectedRecursiveBlockArtifacts {
-        end_accumulator,
-        component_inputs,
-        component_proof,
-        selected_authorization_proofs,
-    } = artifacts;
     let current_block = proof_session
         .prove_block(
             &block_classes,
-            SelectedRecursiveBlockJob {
-                start_consensus: &start_consensus,
-                start_accumulator: &start_accumulator,
-                end_accumulator: &end_accumulator,
-                component_inputs: &component_inputs,
-                component_proof: &component_proof,
-                selected_authorization_proofs,
-            },
+            SelectedRecursiveBlockJob::from_native_verified(artifacts),
         )
         .map_err(|error| retryable("prove selected Block", error))?;
 
-    // The retained component carrier can be multi-GiB at B255. It is not
-    // needed by Link proving and must die before the next phase.
-    drop(component_inputs);
-    drop(component_proof);
-    drop(start_consensus);
-    drop(start_accumulator);
+    // The consuming Block job drops its B255-sized retained carrier before
+    // Link proving; only the standalone Block envelope crosses this boundary.
     check_cancelled(cancelled)?;
 
     let linked = proof_session
@@ -610,7 +593,7 @@ fn process_claimed_job(
     )
     .map_err(|error| retryable("stream-verify selected terminal", error))?;
     drop(proof_session);
-    if verified_accumulator != end_accumulator {
+    if verified_accumulator != expected_end_accumulator {
         return Err(retryable_message(
             "validate terminal accumulator",
             "streaming verifier result differs from accepted Block reconstruction",
@@ -1252,9 +1235,19 @@ mod tests {
             "block_proof_bytes.clone()",
             "block_auth_sidecar_bytes.clone()",
             "previous_result.clone()",
+            "SelectedRecursiveBlockArtifacts {",
+            "component_inputs.clone()",
+            "component_proof.clone()",
         ] {
             assert!(!production.contains(forbidden), "found {forbidden}");
         }
+        assert_eq!(
+            production
+                .matches("SelectedRecursiveBlockJob::from_native_verified(artifacts)")
+                .count(),
+            1,
+            "worker must transfer the sole native-verified seal"
+        );
 
         let reserve = production
             .find("begin_selected_history_proof_session()")

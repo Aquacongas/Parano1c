@@ -11,10 +11,9 @@
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-use noid_core::TowerField;
-use noid_gkr::zk_authorization::{
-    verify_zk_authorization, ZkAuthCapsuleOwnerStatement, ZkAuthorizationProof,
-};
+use crate::memory_governor::{ProofMemoryGovernor, ProofMemoryPressure, ProofMemoryReservation};
+use noid_block::SelectedRecursiveBlockArtifacts;
+use noid_gkr::zk_authorization::ZkAuthorizationProof;
 use noid_ivc_core::field_r1cs::FieldR1cs;
 use noid_ivc_core::proof::FieldShape;
 use noid_ivc_prover::challenger::FsLaneChallenger;
@@ -28,13 +27,6 @@ use noid_recursive::acceptance::split_link::{
     CanonicalSplitLinkLadder, LinkProofEnvelope, LinkProofError, SplitLinkClass,
     SplitLinkPreparationError, SplitLinkTraceInput,
 };
-use noid_recursive::block_certificate_backend::{
-    verify_accepted_block_batch_components, AcceptedBlockBatchComponentError,
-    AcceptedBlockBatchComponentInputs, AcceptedBlockBatchComponentProof,
-};
-use noid_recursive::{ChainAccumulator, RecursiveConsensusState};
-
-use crate::memory_governor::{ProofMemoryGovernor, ProofMemoryPressure, ProofMemoryReservation};
 
 /// One of the four canonical standalone recursive Block classes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -150,18 +142,21 @@ impl<'a> SelectedRecursiveLinkClasses<'a> {
     }
 }
 
-/// Consuming inputs for exactly one native-verified accepted block.
+/// Consuming authority for exactly one natively accepted and component-
+/// verified block.
 ///
-/// The selected proof vector is intentionally owned and the job is neither
-/// Clone nor serializable. Callers must transfer it from the bounded native
-/// sidecar replay; no legacy proof or padding vector is accepted.
-pub struct SelectedRecursiveBlockJob<'a> {
-    pub start_consensus: &'a RecursiveConsensusState,
-    pub start_accumulator: &'a ChainAccumulator,
-    pub end_accumulator: &'a ChainAccumulator,
-    pub component_inputs: &'a AcceptedBlockBatchComponentInputs,
-    pub component_proof: &'a AcceptedBlockBatchComponentProof,
-    pub selected_authorization_proofs: Vec<ZkAuthorizationProof>,
+/// The field is private and the job is neither Clone nor serializable.  The
+/// only constructor requires the opaque seal minted by `noid_block` after its
+/// sole native component verification; arbitrary DTOs, proofs, accumulator
+/// substitutions, legacy proofs, and padding vectors cannot enter this API.
+pub struct SelectedRecursiveBlockJob {
+    artifacts: SelectedRecursiveBlockArtifacts,
+}
+
+impl SelectedRecursiveBlockJob {
+    pub fn from_native_verified(artifacts: SelectedRecursiveBlockArtifacts) -> Self {
+        Self { artifacts }
+    }
 }
 
 /// Complete standalone selected Block envelope plus its canonical class.
@@ -215,7 +210,7 @@ impl SelectedHistoryProofSession {
     pub fn prove_block(
         &mut self,
         classes: &SelectedRecursiveBlockClasses<'_>,
-        job: SelectedRecursiveBlockJob<'_>,
+        job: SelectedRecursiveBlockJob,
     ) -> Result<SelectedRecursiveBlockProof, SelectedRecursiveProverError> {
         prove_selected_recursive_block_in_reserved_session(classes, job)
     }
@@ -356,27 +351,7 @@ pub enum SelectedRecursiveProverError {
     NonCanonicalLiveCount {
         actual: usize,
     },
-    NotSingleBlock {
-        actual: usize,
-    },
-    ComponentShape(&'static str),
-    AuthorizationProofCardinality {
-        expected: usize,
-        actual: usize,
-    },
-    AuthorizationBodyBinding {
-        index: usize,
-    },
-    DuplicateLiveCommitment {
-        first: usize,
-        second: usize,
-    },
     GhostProofGeneration,
-    GhostProofRejected,
-    LiveGhostCommitmentReuse {
-        live_index: usize,
-    },
-    ComponentProof(AcceptedBlockBatchComponentError),
     Input(SelectedZkBlockInputError),
     ClassIdentity {
         tier: usize,
@@ -415,30 +390,7 @@ impl core::fmt::Display for SelectedRecursiveProverError {
                     "{actual} live user transactions exceed the recursive ladder"
                 )
             }
-            Self::NotSingleBlock { actual } => {
-                write!(f, "selected Block job contains {actual} accepted headers")
-            }
-            Self::ComponentShape(message) => write!(f, "selected component shape: {message}"),
-            Self::AuthorizationProofCardinality { expected, actual } => write!(
-                f,
-                "selected proof count {actual} does not match live user count {expected}"
-            ),
-            Self::AuthorizationBodyBinding { index } => {
-                write!(f, "authorization {index} does not bind its canonical body")
-            }
-            Self::DuplicateLiveCommitment { first, second } => write!(
-                f,
-                "selected authorizations {first} and {second} reuse one source commitment"
-            ),
             Self::GhostProofGeneration => write!(f, "fresh selected ghost proof failed"),
-            Self::GhostProofRejected => write!(f, "fresh selected ghost proof was rejected"),
-            Self::LiveGhostCommitmentReuse { live_index } => write!(
-                f,
-                "selected authorization {live_index} reuses the ghost source commitment"
-            ),
-            Self::ComponentProof(source) => {
-                write!(f, "retained selected component proof rejected: {source:?}")
-            }
             Self::Input(source) => write!(f, "selected recursive input rejected: {source}"),
             Self::ClassIdentity { tier, source } => {
                 write!(f, "selected B{tier} class rejected: {source}")
@@ -586,7 +538,7 @@ where
 /// and this background job cannot overlap the miner's native proof worker.
 pub fn prove_selected_recursive_block(
     classes: &SelectedRecursiveBlockClasses<'_>,
-    job: SelectedRecursiveBlockJob<'_>,
+    job: SelectedRecursiveBlockJob,
 ) -> Result<SelectedRecursiveBlockProof, SelectedRecursiveProverError> {
     prove_selected_recursive_block_with_governor(classes, job, &ProofMemoryGovernor::global(0))
 }
@@ -740,7 +692,7 @@ fn map_sequential_link_error<SourceError: core::fmt::Display>(
 
 fn prove_selected_recursive_block_with_governor(
     classes: &SelectedRecursiveBlockClasses<'_>,
-    job: SelectedRecursiveBlockJob<'_>,
+    job: SelectedRecursiveBlockJob,
     governor: &ProofMemoryGovernor,
 ) -> Result<SelectedRecursiveBlockProof, SelectedRecursiveProverError> {
     let tier = preflight_selected_recursive_block(classes, &job)?;
@@ -753,7 +705,7 @@ fn prove_selected_recursive_block_with_governor(
 /// must never attempt a tier-local reservation.
 fn prove_selected_recursive_block_in_reserved_session(
     classes: &SelectedRecursiveBlockClasses<'_>,
-    job: SelectedRecursiveBlockJob<'_>,
+    job: SelectedRecursiveBlockJob,
 ) -> Result<SelectedRecursiveBlockProof, SelectedRecursiveProverError> {
     let tier = preflight_selected_recursive_block(classes, &job)?;
     prove_selected_recursive_block_after_admission(classes, job, tier)
@@ -761,15 +713,10 @@ fn prove_selected_recursive_block_in_reserved_session(
 
 fn preflight_selected_recursive_block(
     classes: &SelectedRecursiveBlockClasses<'_>,
-    job: &SelectedRecursiveBlockJob<'_>,
+    job: &SelectedRecursiveBlockJob,
 ) -> Result<SelectedRecursiveTier, SelectedRecursiveProverError> {
-    let live_count = job.component_inputs.authorization_inputs.len();
+    let live_count = job.artifacts.live_authorization_count();
     let tier = selected_recursive_tier(live_count)?;
-    validate_selected_carrier_shape(
-        job.component_inputs,
-        job.component_proof,
-        job.selected_authorization_proofs.len(),
-    )?;
     classes
         .get(tier)
         .validate_selected_zk_identity_for_tier(tier.capacity())
@@ -784,38 +731,11 @@ fn preflight_selected_recursive_block(
 /// session-level admission.
 fn prove_selected_recursive_block_after_admission(
     classes: &SelectedRecursiveBlockClasses<'_>,
-    job: SelectedRecursiveBlockJob<'_>,
+    job: SelectedRecursiveBlockJob,
     tier: SelectedRecursiveTier,
 ) -> Result<SelectedRecursiveBlockProof, SelectedRecursiveProverError> {
-    validate_authorization_body_bindings(
-        &job.component_inputs.authorization_inputs,
-        &job.component_inputs.tx_body_inputs,
-        &job.component_inputs.tx_body_hashes,
-    )?;
-    // Do not add a third full authorization verification pass here. Native
-    // accepted-batch replay already verified these exact proofs, and the
-    // consuming selected builder verifies them once more against body-derived
-    // aliases before exposing any recursive columns. Shape/body mismatch is
-    // rejected above, and a malformed proof makes the caught assembly fail.
-    verify_accepted_block_batch_components(
-        job.start_consensus,
-        job.start_accumulator,
-        job.end_accumulator,
-        job.component_inputs,
-        job.component_proof,
-    )
-    .map_err(SelectedRecursiveProverError::ComponentProof)?;
-
     let ghost = noid_gkr::ghost_tx::prove_selected_ghost_authorization()
         .map_err(|_| SelectedRecursiveProverError::GhostProofGeneration)?;
-    let ghost_body = noid_gkr::ghost_tx::ghost_tx_body();
-    let ghost_statement = ZkAuthCapsuleOwnerStatement {
-        tx_body_hash: noid_gkr::ghost_tx::ghost_tx_body_hash(),
-        address: ghost_body.input_owner.as_fields(),
-    };
-    verify_zk_authorization(ghost_statement, &ghost)
-        .map_err(|_| SelectedRecursiveProverError::GhostProofRejected)?;
-    reject_source_commitment_reuse(&job.selected_authorization_proofs, &ghost)?;
 
     let class = classes.get(tier);
     let build_and_prove = AssertUnwindSafe(|| match tier {
@@ -831,15 +751,22 @@ fn prove_selected_recursive_block_after_admission(
 
 fn build_and_prove_selected<const TIER: usize>(
     class: &BlockClass,
-    job: SelectedRecursiveBlockJob<'_>,
+    job: SelectedRecursiveBlockJob,
     ghost: ZkAuthorizationProof,
 ) -> Result<BlockProofEnvelope, SelectedRecursiveProverError> {
+    let (
+        start_accumulator,
+        end_accumulator,
+        component_inputs,
+        component_proof,
+        selected_authorization_proofs,
+    ) = job.artifacts.into_recursive_builder_parts();
     let input = SelectedZkBlockInput::<TIER>::try_new(
-        job.start_accumulator,
-        job.end_accumulator,
-        job.component_inputs,
-        job.component_proof,
-        job.selected_authorization_proofs,
+        &start_accumulator,
+        &end_accumulator,
+        &component_inputs,
+        &component_proof,
+        selected_authorization_proofs,
         ghost,
     )
     .map_err(SelectedRecursiveProverError::Input)?;
@@ -849,143 +776,11 @@ fn build_and_prove_selected<const TIER: usize>(
         .map_err(SelectedRecursiveProverError::BlockProof)
 }
 
-fn validate_selected_carrier_shape(
-    inputs: &AcceptedBlockBatchComponentInputs,
-    proof: &AcceptedBlockBatchComponentProof,
-    selected_proof_count: usize,
-) -> Result<(), SelectedRecursiveProverError> {
-    validate_selected_carrier_counts(SelectedCarrierCounts {
-        block_count: inputs.accepted_claim_witness.headers.len(),
-        accepted_claim_count: inputs.accepted_claim_witness.accepted_block_claims.len(),
-        accepted_claim_hash_count: inputs.accepted_claim_hash_inputs.len(),
-        authorization_count: inputs.authorization_inputs.len(),
-        selected_proof_count,
-        authorization_total: inputs.authorization_totals.user_tx_count,
-        tx_body_count: inputs.tx_body_inputs.len(),
-        tx_body_hash_count: inputs.tx_body_hashes.len(),
-        structural_exact_state_count: inputs.exact_state_structural_inputs.len(),
-        exact_state_proof_count: proof.exact_state.len(),
-    })
-}
-
-#[derive(Clone, Copy)]
-struct SelectedCarrierCounts {
-    block_count: usize,
-    accepted_claim_count: usize,
-    accepted_claim_hash_count: usize,
-    authorization_count: usize,
-    selected_proof_count: usize,
-    authorization_total: usize,
-    tx_body_count: usize,
-    tx_body_hash_count: usize,
-    structural_exact_state_count: usize,
-    exact_state_proof_count: usize,
-}
-
-fn validate_selected_carrier_counts(
-    counts: SelectedCarrierCounts,
-) -> Result<(), SelectedRecursiveProverError> {
-    if counts.block_count != 1 {
-        return Err(SelectedRecursiveProverError::NotSingleBlock {
-            actual: counts.block_count,
-        });
-    }
-    if counts.accepted_claim_count != 1
-        || counts.accepted_claim_hash_count != 1
-        || counts.structural_exact_state_count != 1
-        || counts.exact_state_proof_count != 1
-    {
-        return Err(SelectedRecursiveProverError::ComponentShape(
-            "one block requires one claim and one exact-state component",
-        ));
-    }
-    if counts.selected_proof_count != counts.authorization_count {
-        return Err(
-            SelectedRecursiveProverError::AuthorizationProofCardinality {
-                expected: counts.authorization_count,
-                actual: counts.selected_proof_count,
-            },
-        );
-    }
-    if counts.authorization_total != counts.authorization_count {
-        return Err(SelectedRecursiveProverError::ComponentShape(
-            "authorization total differs from the canonical live prefix",
-        ));
-    }
-    if counts.tx_body_count != counts.authorization_count + 1
-        || counts.tx_body_hash_count != counts.tx_body_count
-    {
-        return Err(SelectedRecursiveProverError::ComponentShape(
-            "body spine count differs from coinbase plus live users",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_authorization_body_bindings(
-    authorization_inputs: &[noid_recursive::block_certificate_backend::AuthorizationComponentInput],
-    tx_body_inputs: &[noid_gkr::SpineInputs],
-    tx_body_hashes: &[[noid_core::Block128; 2]],
-) -> Result<(), SelectedRecursiveProverError> {
-    use noid_tx::body_hash::{TX8X2_LEAF_FLAGS, TX8X2_LEAF_INPUT_OWNER};
-
-    let circuit = noid_gkr::SpineCircuit::build();
-    for (index, authorization) in authorization_inputs.iter().enumerate() {
-        let body_index = index + 1;
-        let body = &tx_body_inputs[body_index];
-        let body_hash = noid_gkr::compute_tx_body_hash(&circuit, body);
-        let flags = body.leaves[TX8X2_LEAF_FLAGS];
-        let validity_bitmap = u16::try_from(flags[0].0).ok();
-        let live_input_count = validity_bitmap
-            .map(|bitmap| (bitmap & ((1u16 << noid_tx::TX_INPUTS) - 1)).count_ones() as u8);
-        if authorization.block_index != 0
-            || authorization.tx_index != body_index
-            || authorization.tx_body_hash != body_hash
-            || authorization.public.tx_body_hash != body_hash
-            || tx_body_hashes[body_index] != body_hash
-            || authorization.public.expected_address != body.leaves[TX8X2_LEAF_INPUT_OWNER]
-            || flags[1] != noid_core::Block128::ZERO
-            || live_input_count != Some(authorization.live_input_count)
-        {
-            return Err(SelectedRecursiveProverError::AuthorizationBodyBinding { index });
-        }
-    }
-    Ok(())
-}
-
-fn reject_source_commitment_reuse(
-    live: &[ZkAuthorizationProof],
-    ghost: &ZkAuthorizationProof,
-) -> Result<(), SelectedRecursiveProverError> {
-    for second in 0..live.len() {
-        for first in 0..second {
-            if live[first].source_commitment.cap.hashes == live[second].source_commitment.cap.hashes
-            {
-                return Err(SelectedRecursiveProverError::DuplicateLiveCommitment {
-                    first,
-                    second,
-                });
-            }
-        }
-        if live[second].source_commitment.cap.hashes == ghost.source_commitment.cap.hashes {
-            return Err(SelectedRecursiveProverError::LiveGhostCommitmentReuse {
-                live_index: second,
-            });
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use noid_core::Block128;
-    use noid_gkr::{OwnerAuthLayout, OwnerAuthPublicInputs};
     use noid_ivc_core::field::F128;
     use noid_ivc_core::field_circuit::FieldR1csBuilder;
-    use noid_poseidon2b::primitives::Address;
-    use noid_recursive::block_certificate_backend::AuthorizationComponentInput;
-    use noid_tx::{output_bitmap_bit, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS};
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -1057,83 +852,39 @@ mod tests {
         ));
     }
 
-    fn user_body() -> TxBody {
-        let owner = Address([0x42; 32]);
-        let mut inputs = [TxInput::dummy(); TX_INPUTS];
-        inputs[0] = TxInput {
-            slot_index: 7,
-            amount: 11,
-            creation_id: 3,
-        };
-        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
-        outputs[0] = TxOutput {
-            slot_index: 9,
-            amount: 10,
-            owner,
-        };
-        TxBody {
-            epoch_anchor: [3u8; 32],
-            fee: 1,
-            input_owner: owner,
-            inputs,
-            outputs,
-            validity_bitmap: 1 | output_bitmap_bit(0),
-            is_coinbase: false,
-        }
-    }
-
     #[test]
-    fn body_binding_rejects_statement_mismatch_before_recursive_build() {
-        let body = user_body();
-        let user_spine = noid_gkr::spine_inputs_from_body(&body);
-        let circuit = noid_gkr::SpineCircuit::build();
-        let hash = noid_gkr::compute_tx_body_hash(&circuit, &user_spine);
-        let authorization = AuthorizationComponentInput {
-            block_index: 0,
-            tx_index: 1,
-            tx_body_hash: hash,
-            live_input_count: 1,
-            public: OwnerAuthPublicInputs {
-                layout: OwnerAuthLayout::FIXED,
-                tx_body_hash: hash,
-                expected_address: body.input_owner.as_fields(),
-            },
-        };
-        let bodies = vec![user_spine.clone(), user_spine];
-        let hashes = vec![hash, hash];
-        let mut authorizations = vec![authorization];
-        validate_authorization_body_bindings(&authorizations, &bodies, &hashes).unwrap();
+    fn selected_block_consumes_native_verified_seal_without_reverification() {
+        let source = include_str!("recursive_prover.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        assert!(production.contains("use noid_block::SelectedRecursiveBlockArtifacts;"));
+        assert!(!production.contains("verify_accepted_block_batch_components"));
+        assert!(!production.contains("compute_tx_body_hash"));
+        assert!(!production.contains("verify_zk_authorization"));
 
-        authorizations[0].public.expected_address[0] += Block128::ONE;
-        assert!(matches!(
-            validate_authorization_body_bindings(&authorizations, &bodies, &hashes),
-            Err(SelectedRecursiveProverError::AuthorizationBodyBinding { index: 0 })
-        ));
-    }
+        let job = production
+            .split("pub struct SelectedRecursiveBlockJob")
+            .nth(1)
+            .expect("selected job declaration")
+            .split("impl SelectedRecursiveBlockJob")
+            .next()
+            .expect("selected job boundary");
+        assert!(job.contains("artifacts: SelectedRecursiveBlockArtifacts"));
+        assert!(!job.contains("pub artifacts:"));
 
-    #[test]
-    fn carrier_shape_rejects_selected_count_mismatch() {
-        let canonical = SelectedCarrierCounts {
-            block_count: 1,
-            accepted_claim_count: 1,
-            accepted_claim_hash_count: 1,
-            authorization_count: 0,
-            selected_proof_count: 1,
-            authorization_total: 0,
-            tx_body_count: 1,
-            tx_body_hash_count: 1,
-            structural_exact_state_count: 1,
-            exact_state_proof_count: 1,
-        };
-        assert!(matches!(
-            validate_selected_carrier_counts(canonical),
-            Err(
-                SelectedRecursiveProverError::AuthorizationProofCardinality {
-                    expected: 0,
-                    actual: 1
-                }
-            )
-        ));
+        let builder = production
+            .split("fn build_and_prove_selected<const TIER: usize>")
+            .nth(1)
+            .expect("selected builder")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert_eq!(
+            builder.matches("into_recursive_builder_parts()").count(),
+            1,
+            "the sealed B255 carrier is consumed exactly once"
+        );
+        assert!(builder.contains("SelectedZkBlockInput::<TIER>::try_new("));
+        assert!(builder.contains("build_selected_zk_block_proof_trace(class, input)"));
     }
 
     fn tiny_matrix(tag: u64) -> FieldR1cs {
