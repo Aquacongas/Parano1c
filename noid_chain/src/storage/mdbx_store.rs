@@ -12,7 +12,10 @@
 
 use std::{path::Path, sync::Arc};
 
-use libmdbx::{Database, DatabaseOptions, Mode, NoWriteMap, ObjectLength, TableFlags, WriteFlags};
+use libmdbx::{
+    Database, DatabaseOptions, Mode, NoWriteMap, ObjectLength, Table, TableFlags, Transaction,
+    WriteFlags, RW,
+};
 use noid_poseidon2b::primitives::TxBodyHash;
 use noid_tx::unpack_amount_creation_id;
 
@@ -98,6 +101,7 @@ const KEY_TIP: &[u8] = &[0u8];
 const KEY_META: &[u8] = &[0u8];
 const KEY_CONSENSUS_META: &[u8] = &[0u8];
 const KEY_CHECKPOINT_COVERAGE: &[u8] = &[0u8];
+const KEY_SELECTED_HISTORY_COVERAGE: &[u8] = &[1u8];
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -225,6 +229,10 @@ const RECURSIVE_PROOF_JOB_MAGIC: [u8; 4] = *b"RPJ1";
 const RECURSIVE_PROOF_JOB_ENCODED_BYTES: usize = 44;
 const RECURSIVE_PROOF_RESULT_MAGIC: [u8; 4] = *b"RPR1";
 const RECURSIVE_PROOF_RESULT_HEADER_BYTES: usize = 40;
+const SELECTED_HISTORY_COVERAGE_MAGIC: [u8; 4] = *b"SHC1";
+const SELECTED_HISTORY_COVERAGE_ENCODED_BYTES: usize = 44;
+const SELECTED_HISTORY_TERMINAL_PREFIX_BYTES: usize = 2 + 8 + 32;
+const SELECTED_HISTORY_TERMINAL_VERSION: u16 = 1;
 
 /// Hard storage cap for one opaque selected recursive proof result.
 ///
@@ -311,6 +319,15 @@ pub struct RecursiveProofJobResult {
     pub height: u64,
     pub block_hash: [u8; 32],
     pub bytes: Vec<u8>,
+}
+
+/// Fixed-width pointer to the newest locally verified contiguous selected
+/// history result. The proof bytes remain in the result table and are loaded
+/// only by an explicit serving/snapshot request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectedHistoryCoverage {
+    pub height: u64,
+    pub block_hash: [u8; 32],
 }
 
 /// One atomically loaded, ownership-transferring input bundle for the selected
@@ -545,6 +562,163 @@ fn decode_recursive_proof_result(
         block_hash,
         bytes: encoded,
     })
+}
+
+fn encode_selected_history_coverage(
+    coverage: SelectedHistoryCoverage,
+) -> [u8; SELECTED_HISTORY_COVERAGE_ENCODED_BYTES] {
+    let mut encoded = [0u8; SELECTED_HISTORY_COVERAGE_ENCODED_BYTES];
+    encoded[..4].copy_from_slice(&SELECTED_HISTORY_COVERAGE_MAGIC);
+    encoded[4..12].copy_from_slice(&coverage.height.to_le_bytes());
+    encoded[12..44].copy_from_slice(&coverage.block_hash);
+    encoded
+}
+
+fn decode_selected_history_coverage(bytes: &[u8]) -> Option<SelectedHistoryCoverage> {
+    if bytes.len() != SELECTED_HISTORY_COVERAGE_ENCODED_BYTES
+        || bytes[..4] != SELECTED_HISTORY_COVERAGE_MAGIC
+    {
+        return None;
+    }
+    Some(SelectedHistoryCoverage {
+        height: u64::from_le_bytes(bytes[4..12].try_into().ok()?),
+        block_hash: bytes[12..44].try_into().ok()?,
+    })
+}
+
+fn selected_history_terminal_prefix_matches(
+    bytes: &[u8],
+    height: u64,
+    block_hash: [u8; 32],
+) -> bool {
+    bytes.len() >= SELECTED_HISTORY_TERMINAL_PREFIX_BYTES
+        && u16::from_le_bytes(bytes[..2].try_into().unwrap()) == SELECTED_HISTORY_TERMINAL_VERSION
+        && u64::from_le_bytes(bytes[2..10].try_into().unwrap()) == height
+        && bytes[10..42] == block_hash
+}
+
+/// Rewind only the compact serving pointer inside an existing canonical reorg
+/// transaction. Proof payloads are neither decoded nor loaded here.
+fn rewind_selected_history_coverage(
+    txn: &Transaction<'_, RW, NoWriteMap>,
+    ancestor_height: u64,
+) -> Result<(), StoreError> {
+    let coverage_table = txn.open_table(Some(T_CHECKPOINT_COVERAGE))?;
+    let raw: Option<[u8; SELECTED_HISTORY_COVERAGE_ENCODED_BYTES]> =
+        txn.get(&coverage_table, KEY_SELECTED_HISTORY_COVERAGE)?;
+    let Some(current) = raw
+        .as_ref()
+        .and_then(|raw| decode_selected_history_coverage(raw))
+    else {
+        if raw.is_some() {
+            return Err(StoreError::Decode(
+                "invalid selected history coverage pointer",
+            ));
+        }
+        return Ok(());
+    };
+    if current.height <= ancestor_height {
+        return Ok(());
+    }
+
+    let replacement = if ancestor_height == 0 {
+        None
+    } else {
+        let key = recursive_proof_height_key(ancestor_height);
+        let jobs = txn.open_table(Some(T_RECURSIVE_PROOF_JOBS))?;
+        let job_raw: Option<[u8; RECURSIVE_PROOF_JOB_ENCODED_BYTES]> = txn.get(&jobs, &key)?;
+        let job = job_raw
+            .as_ref()
+            .and_then(|raw| decode_recursive_proof_job(ancestor_height, raw));
+        let headers = txn.open_table(Some(T_HEADERS))?;
+        let canonical_hash = txn
+            .get::<Vec<u8>>(&headers, &u64_key(ancestor_height))?
+            .as_deref()
+            .and_then(canonical_hash_from_encoded_header);
+        let results = txn.open_table(Some(T_RECURSIVE_PROOF_RESULTS))?;
+        let result_length = txn
+            .get::<ObjectLength>(&results, &key)?
+            .map(|ObjectLength(length)| length);
+        job.filter(|job| {
+            job.state == RecursiveProofJobState::Complete
+                && canonical_hash == Some(job.block_hash)
+                && result_length.is_some_and(|length| {
+                    (RECURSIVE_PROOF_RESULT_HEADER_BYTES
+                        ..=RECURSIVE_PROOF_RESULT_HEADER_BYTES
+                            + crate::consensus::wire_limits::MAX_HISTORY_PROOF_BYTES)
+                        .contains(&length)
+                })
+        })
+        .map(|job| SelectedHistoryCoverage {
+            height: ancestor_height,
+            block_hash: job.block_hash,
+        })
+    };
+
+    if let Some(replacement) = replacement {
+        txn.put(
+            &coverage_table,
+            KEY_SELECTED_HISTORY_COVERAGE,
+            encode_selected_history_coverage(replacement),
+            WriteFlags::empty(),
+        )?;
+    } else {
+        let _ = txn.del(&coverage_table, KEY_SELECTED_HISTORY_COVERAGE, None);
+    }
+    Ok(())
+}
+
+/// Delete legacy little-endian height keys without collecting the table or
+/// assuming that lexicographic cursor order is numeric.
+fn delete_height_keys_at_or_below(
+    txn: &Transaction<'_, RW, NoWriteMap>,
+    table: &Table<'_>,
+    cutoff: u64,
+) -> Result<(), StoreError> {
+    const DELETE_KEY_CHUNK: usize = 64;
+    const DELETE_SCAN_CHUNK: usize = 4096;
+    let mut resume_after: Option<Vec<u8>> = None;
+    loop {
+        let (deletions, last_scanned, reached_end) = {
+            let mut cursor = txn.cursor(table)?;
+            let mut item: Option<(Vec<u8>, ())> = if let Some(resume) = resume_after.as_deref() {
+                let found: Option<(Vec<u8>, ())> = cursor.set_range(resume)?;
+                match found {
+                    Some((key, _)) if key.as_slice() == resume => cursor.next()?,
+                    other => other,
+                }
+            } else {
+                cursor.first()?
+            };
+            let mut deletions = Vec::with_capacity(DELETE_KEY_CHUNK);
+            let mut last_scanned = None;
+            let mut scanned = 0usize;
+            let reached_end = loop {
+                let Some((key, _)) = item.take() else {
+                    break true;
+                };
+                let height = u64_from_key(&key)
+                    .ok_or(StoreError::Decode("invalid durable height key during pruning"))?;
+                if height <= cutoff {
+                    deletions.push(height);
+                }
+                last_scanned = Some(key);
+                scanned += 1;
+                if deletions.len() == DELETE_KEY_CHUNK || scanned == DELETE_SCAN_CHUNK {
+                    break false;
+                }
+                item = cursor.next()?;
+            };
+            (deletions, last_scanned, reached_end)
+        };
+        for height in deletions {
+            txn.del(table, u64_key(height), None)?;
+        }
+        if reached_end {
+            return Ok(());
+        }
+        resume_after = last_scanned;
+    }
 }
 
 #[inline]
@@ -1122,6 +1296,41 @@ impl MdbxStore {
         block_hash: [u8; 32],
         result: &[u8],
     ) -> Result<RecursiveProofJob, StoreError> {
+        self.complete_recursive_proof_job_inner(height, block_hash, result, false)
+    }
+
+    /// Atomically complete one locally verified selected terminal package and
+    /// advance its fixed-width serving pointer. The pointer never owns proof
+    /// bytes, and promotion checks the immediately preceding completed job
+    /// without loading its envelope.
+    pub fn complete_recursive_proof_job_and_promote_selected_history(
+        &self,
+        height: u64,
+        block_hash: [u8; 32],
+        result: &[u8],
+    ) -> Result<RecursiveProofJob, StoreError> {
+        self.complete_recursive_proof_job_inner(height, block_hash, result, true)
+    }
+
+    fn complete_recursive_proof_job_inner(
+        &self,
+        height: u64,
+        block_hash: [u8; 32],
+        result: &[u8],
+        promote_selected_history: bool,
+    ) -> Result<RecursiveProofJob, StoreError> {
+        if promote_selected_history {
+            if result.len() > crate::consensus::wire_limits::MAX_HISTORY_PROOF_BYTES {
+                return Err(StoreError::Decode(
+                    "selected history terminal result exceeds wire cap",
+                ));
+            }
+            if !selected_history_terminal_prefix_matches(result, height, block_hash) {
+                return Err(StoreError::Decode(
+                    "selected history terminal result prefix does not match its job",
+                ));
+            }
+        }
         let encoded_result = encode_recursive_proof_result(block_hash, result)?;
         let txn = self.db.begin_rw_txn()?;
         let key = recursive_proof_height_key(height);
@@ -1138,17 +1347,79 @@ impl MdbxStore {
         }
         let headers = txn.open_table(Some(T_HEADERS))?;
         let header_raw: Option<Vec<u8>> = txn.get(&headers, &u64_key(height))?;
-        if header_raw
+        let header = header_raw
             .as_deref()
-            .and_then(canonical_hash_from_encoded_header)
-            != Some(block_hash)
-        {
+            .and_then(decode_header)
+            .ok_or(StoreError::Decode(
+                "recursive proof completion canonical header is missing",
+            ))?;
+        if crate::block_header::block_id(&header) != block_hash {
             return Err(StoreError::Decode(
                 "recursive proof completion block is no longer canonical",
             ));
         }
 
         let results = txn.open_table(Some(T_RECURSIVE_PROOF_RESULTS))?;
+        if promote_selected_history {
+            let coverage_table = txn.open_table(Some(T_CHECKPOINT_COVERAGE))?;
+            let coverage_raw: Option<[u8; SELECTED_HISTORY_COVERAGE_ENCODED_BYTES]> =
+                txn.get(&coverage_table, KEY_SELECTED_HISTORY_COVERAGE)?;
+            let previous_coverage = coverage_raw
+                .as_ref()
+                .map(|raw| {
+                    decode_selected_history_coverage(raw).ok_or(StoreError::Decode(
+                        "invalid selected history predecessor coverage pointer",
+                    ))
+                })
+                .transpose()?;
+            if height == 1 {
+                if previous_coverage.is_some() {
+                    return Err(StoreError::Decode(
+                        "selected history genesis successor requires empty coverage",
+                    ));
+                }
+            } else {
+                let parent_height = height - 1;
+                if previous_coverage
+                    != Some(SelectedHistoryCoverage {
+                        height: parent_height,
+                        block_hash: header.prev_block_hash,
+                    })
+                {
+                    return Err(StoreError::Decode(
+                        "selected history coverage is not the exact predecessor",
+                    ));
+                }
+                let parent_key = recursive_proof_height_key(parent_height);
+                let parent_raw: Option<[u8; RECURSIVE_PROOF_JOB_ENCODED_BYTES]> =
+                    txn.get(&jobs, &parent_key)?;
+                let parent = parent_raw
+                    .as_ref()
+                    .and_then(|raw| decode_recursive_proof_job(parent_height, raw))
+                    .ok_or(StoreError::Decode(
+                        "selected history predecessor job is missing",
+                    ))?;
+                if parent.state != RecursiveProofJobState::Complete
+                    || parent.block_hash != header.prev_block_hash
+                {
+                    return Err(StoreError::Decode(
+                        "selected history predecessor is not complete and canonical",
+                    ));
+                }
+                let parent_result_length: Option<ObjectLength> =
+                    txn.get(&results, &parent_key)?;
+                if !parent_result_length.is_some_and(|ObjectLength(length)| {
+                    (RECURSIVE_PROOF_RESULT_HEADER_BYTES
+                        ..=RECURSIVE_PROOF_RESULT_HEADER_BYTES
+                            + crate::consensus::wire_limits::MAX_HISTORY_PROOF_BYTES)
+                        .contains(&length)
+                }) {
+                    return Err(StoreError::Decode(
+                        "selected history predecessor result is missing or oversized",
+                    ));
+                }
+            }
+        }
         txn.put(&results, key, encoded_result, WriteFlags::empty())?;
         job.state = RecursiveProofJobState::Complete;
         txn.put(
@@ -1157,6 +1428,15 @@ impl MdbxStore {
             encode_recursive_proof_job(&job),
             WriteFlags::empty(),
         )?;
+        if promote_selected_history {
+            let coverage = txn.open_table(Some(T_CHECKPOINT_COVERAGE))?;
+            txn.put(
+                &coverage,
+                KEY_SELECTED_HISTORY_COVERAGE,
+                encode_selected_history_coverage(SelectedHistoryCoverage { height, block_hash }),
+                WriteFlags::empty(),
+            )?;
+        }
         txn.commit()?;
         Ok(job)
     }
@@ -1261,6 +1541,106 @@ impl MdbxStore {
         Ok(Some(result))
     }
 
+    /// Read only the compact selected-history serving pointer.
+    pub fn get_selected_history_coverage(
+        &self,
+    ) -> Result<Option<SelectedHistoryCoverage>, StoreError> {
+        let txn = self.db.begin_ro_txn()?;
+        let table = txn.open_table(Some(T_CHECKPOINT_COVERAGE))?;
+        let raw: Option<[u8; SELECTED_HISTORY_COVERAGE_ENCODED_BYTES]> =
+            txn.get(&table, KEY_SELECTED_HISTORY_COVERAGE)?;
+        raw.map(|raw| {
+            decode_selected_history_coverage(&raw).ok_or(StoreError::Decode(
+                "invalid selected history coverage pointer",
+            ))
+        })
+        .transpose()
+    }
+
+    /// Load the single promoted terminal package from one read snapshot.
+    ///
+    /// No result queue is collected or scanned. Fixed metadata, canonical
+    /// header and object length are checked before the one proof `Vec` is
+    /// allocated, then the stored wrapper is decoded in place.
+    pub fn get_selected_history_terminal_result(
+        &self,
+    ) -> Result<Option<RecursiveProofJobResult>, StoreError> {
+        let txn = self.db.begin_ro_txn()?;
+        let coverage_table = txn.open_table(Some(T_CHECKPOINT_COVERAGE))?;
+        let coverage_raw: Option<[u8; SELECTED_HISTORY_COVERAGE_ENCODED_BYTES]> =
+            txn.get(&coverage_table, KEY_SELECTED_HISTORY_COVERAGE)?;
+        let Some(coverage) = coverage_raw
+            .as_ref()
+            .and_then(|raw| decode_selected_history_coverage(raw))
+        else {
+            if coverage_raw.is_some() {
+                return Err(StoreError::Decode(
+                    "invalid selected history coverage pointer",
+                ));
+            }
+            return Ok(None);
+        };
+
+        let headers = txn.open_table(Some(T_HEADERS))?;
+        let header_raw: Option<Vec<u8>> = txn.get(&headers, &u64_key(coverage.height))?;
+        if header_raw
+            .as_deref()
+            .and_then(canonical_hash_from_encoded_header)
+            != Some(coverage.block_hash)
+        {
+            return Ok(None);
+        }
+
+        let key = recursive_proof_height_key(coverage.height);
+        let jobs = txn.open_table(Some(T_RECURSIVE_PROOF_JOBS))?;
+        let job_raw: Option<[u8; RECURSIVE_PROOF_JOB_ENCODED_BYTES]> = txn.get(&jobs, &key)?;
+        let Some(job) = job_raw
+            .as_ref()
+            .and_then(|raw| decode_recursive_proof_job(coverage.height, raw))
+        else {
+            return Ok(None);
+        };
+        if job.state != RecursiveProofJobState::Complete || job.block_hash != coverage.block_hash {
+            return Ok(None);
+        }
+
+        let results = txn.open_table(Some(T_RECURSIVE_PROOF_RESULTS))?;
+        let result_length: Option<ObjectLength> = txn.get(&results, &key)?;
+        let Some(ObjectLength(result_length)) = result_length else {
+            return Ok(None);
+        };
+        let maximum = RECURSIVE_PROOF_RESULT_HEADER_BYTES
+            + crate::consensus::wire_limits::MAX_HISTORY_PROOF_BYTES;
+        if !(RECURSIVE_PROOF_RESULT_HEADER_BYTES..=maximum).contains(&result_length) {
+            return Err(StoreError::Decode(
+                "selected history terminal stored length exceeds hard bounds",
+            ));
+        }
+        let encoded: Vec<u8> = txn
+            .get(&results, &key)?
+            .ok_or(StoreError::Decode("selected history terminal disappeared"))?;
+        if encoded.len() != result_length {
+            return Err(StoreError::Decode(
+                "selected history terminal length changed during read",
+            ));
+        }
+        let result = decode_recursive_proof_result(coverage.height, encoded).ok_or(
+            StoreError::Decode("selected history terminal wrapper is malformed"),
+        )?;
+        if result.block_hash != coverage.block_hash
+            || !selected_history_terminal_prefix_matches(
+                &result.bytes,
+                coverage.height,
+                coverage.block_hash,
+            )
+        {
+            return Err(StoreError::Decode(
+                "selected history terminal payload does not match coverage",
+            ));
+        }
+        Ok(Some(result))
+    }
+
     /// Read fixed-width metadata for diagnostics without loading a result.
     pub fn get_recursive_proof_job(
         &self,
@@ -1337,6 +1717,7 @@ impl MdbxStore {
                 }
             }
         }
+        rewind_selected_history_coverage(&txn, ancestor_height)?;
         txn.commit()?;
         Ok(())
     }
@@ -3221,6 +3602,7 @@ impl MdbxStore {
                 }
             }
         }
+        rewind_selected_history_coverage(&txn, ancestor_height)?;
 
         let tx_idx_tbl = txn.open_table(Some(T_TX_INDEX))?;
         for tx_hash in reverted_tx_hashes {
@@ -3442,32 +3824,11 @@ impl MdbxStore {
 
     fn prune_after_commit(&self, current_height: u64) -> Result<(), StoreError> {
         let txn = self.db.begin_rw_txn()?;
-        macro_rules! prune_height_table {
-            ($tbl:expr, $cutoff:expr) => {{
-                let keys_to_del: Vec<u64> = {
-                    let mut cur = txn.cursor(&$tbl)?;
-                    let mut keys = Vec::new();
-                    let mut item: Option<(Vec<u8>, Vec<u8>)> = cur.first()?;
-                    while let Some((k, _)) = item {
-                        match u64_from_key(&k) {
-                            Some(h) if h <= $cutoff => keys.push(h),
-                            _ => break,
-                        }
-                        item = cur.next()?;
-                    }
-                    keys
-                };
-                for h in keys_to_del {
-                    txn.del(&$tbl, u64_key(h), None)?;
-                }
-            }};
-        }
-
         // --- Prune undo_logs older than UNDO_RETENTION_DEPTH ---
         if current_height > UNDO_RETENTION_DEPTH {
             let undo_tbl = txn.open_table(Some(T_UNDO_LOGS))?;
             let cutoff = current_height - UNDO_RETENTION_DEPTH;
-            prune_height_table!(undo_tbl, cutoff);
+            delete_height_keys_at_or_below(&txn, &undo_tbl, cutoff)?;
         }
 
         // --- Prune retained block payloads after O(1) history coverage ---
@@ -3477,24 +3838,38 @@ impl MdbxStore {
         // They may be deleted once both conditions are true:
         //
         // 1. The height is outside the recent serving/reorg window.
-        // 2. The local O(1) checkpoint package coverage has consumed it.
+        // 2. The locally verified selected Link chain has consumed it.
         //
         // A height is pruned only after accepted-block certificate material
-        // exists for it and proven checkpoint coverage explicitly reaches it.
+        // exists for it and selected-history coverage explicitly reaches it.
         if current_height > RECENT_BLOCK_RETENTION_DEPTH {
             let retention_cutoff = current_height - RECENT_BLOCK_RETENTION_DEPTH;
-            let real_checkpoint_coverage = {
+            let selected_history_coverage = {
                 let cov_tbl = txn.open_table(Some(T_CHECKPOINT_COVERAGE))?;
-                let raw: Option<Vec<u8>> = txn.get(&cov_tbl, KEY_CHECKPOINT_COVERAGE)?;
-                raw.and_then(|b| decode_checkpoint_coverage(&b))
-                    .and_then(|coverage| coverage.history_proof_covered_to)
+                let raw: Option<[u8; SELECTED_HISTORY_COVERAGE_ENCODED_BYTES]> =
+                    txn.get(&cov_tbl, KEY_SELECTED_HISTORY_COVERAGE)?;
+                raw.map(|raw| {
+                    decode_selected_history_coverage(&raw).ok_or(StoreError::Decode(
+                        "invalid selected history coverage pointer during pruning",
+                    ))
+                })
+                .transpose()?
             };
-            if let Some(coverage_height) = real_checkpoint_coverage {
-                let cutoff = retention_cutoff.min(coverage_height);
+            if let Some(coverage) = selected_history_coverage {
+                let headers_tbl = txn.open_table(Some(T_HEADERS))?;
+                let coverage_hash = txn
+                    .get::<Vec<u8>>(&headers_tbl, &u64_key(coverage.height))?
+                    .as_deref()
+                    .and_then(canonical_hash_from_encoded_header);
+                if coverage_hash != Some(coverage.block_hash) {
+                    return Err(StoreError::Decode(
+                        "selected history coverage is not canonical during pruning",
+                    ));
+                }
+                let cutoff = retention_cutoff.min(coverage.height);
                 let cert_tbl = txn.open_table(Some(T_ACCEPTED_BLOCK_CERTIFICATES))?;
                 let jobs_tbl = txn.open_table(Some(T_RECURSIVE_PROOF_JOBS))?;
                 let results_tbl = txn.open_table(Some(T_RECURSIVE_PROOF_RESULTS))?;
-                let headers_tbl = txn.open_table(Some(T_HEADERS))?;
                 for table_name in [
                     T_RECENT_BLOCKS,
                     T_BLOCK_PROOFS,
@@ -3502,59 +3877,106 @@ impl MdbxStore {
                     T_HISTORY_CLAIMS,
                 ] {
                     let tbl = txn.open_table(Some(table_name))?;
-                    let candidates: Vec<u64> = {
-                        let mut cur = txn.cursor(&tbl)?;
-                        let mut keys = Vec::new();
-                        let mut item: Option<(Vec<u8>, Vec<u8>)> = cur.first()?;
-                        while let Some((k, _)) = item {
-                            match u64_from_key(&k) {
-                                Some(h) if h <= cutoff => keys.push(h),
-                                _ => break,
-                            }
-                            item = cur.next()?;
-                        }
-                        keys
-                    };
-                    for h in candidates {
-                        let certificate: Option<Vec<u8>> = txn.get(&cert_tbl, &u64_key(h))?;
-                        let job_key = recursive_proof_height_key(h);
-                        let completed_job: Option<RecursiveProofJob> = txn
-                            .get::<[u8; RECURSIVE_PROOF_JOB_ENCODED_BYTES]>(&jobs_tbl, &job_key)?
-                            .and_then(|raw| decode_recursive_proof_job(h, &raw))
-                            .filter(|job| job.state == RecursiveProofJobState::Complete);
-                        let selected_result_is_canonical = if let Some(job) = completed_job {
-                            let canonical_hash = txn
-                                .get::<Vec<u8>>(&headers_tbl, &u64_key(h))?
-                                .as_deref()
-                                .and_then(canonical_hash_from_encoded_header);
-                            let result_length = txn
-                                .get::<ObjectLength>(&results_tbl, &job_key)?
-                                .map(|ObjectLength(length)| length);
-                            if canonical_hash == Some(job.block_hash)
-                                && result_length.is_some_and(|length| {
-                                    (RECURSIVE_PROOF_RESULT_HEADER_BYTES
-                                        ..=RECURSIVE_PROOF_RESULT_HEADER_BYTES
-                                            + MAX_RECURSIVE_PROOF_JOB_RESULT_BYTES)
-                                        .contains(&length)
-                                })
+                    let mut resume_after: Option<Vec<u8>> = None;
+                    loop {
+                        // Height tables use legacy little-endian keys, so their
+                        // cursor order is not numeric. Scan keys in bounded
+                        // chunks and test each decoded height instead of
+                        // collecting the entire prunable prefix.
+                        let (candidates, last_scanned, reached_end) = {
+                            const PRUNE_KEY_CHUNK: usize = 64;
+                            const PRUNE_SCAN_CHUNK: usize = 4096;
+                            let mut cur = txn.cursor(&tbl)?;
+                            let mut item: Option<(Vec<u8>, ())> = if let Some(resume) =
+                                resume_after.as_deref()
                             {
-                                txn.get::<Vec<u8>>(&results_tbl, &job_key)?
-                                    .and_then(|raw| decode_recursive_proof_result(h, raw))
-                                    .is_some_and(|result| result.block_hash == job.block_hash)
+                                let found: Option<(Vec<u8>, ())> = cur.set_range(resume)?;
+                                match found {
+                                    Some((key, _)) if key.as_slice() == resume => cur.next()?,
+                                    other => other,
+                                }
+                            } else {
+                                cur.first()?
+                            };
+                            let mut candidates = Vec::with_capacity(PRUNE_KEY_CHUNK);
+                            let mut last_scanned = None;
+                            let mut scanned = 0usize;
+                            let reached_end = loop {
+                                let Some((key, _)) = item.take() else {
+                                    break true;
+                                };
+                                let height = u64_from_key(&key).ok_or(StoreError::Decode(
+                                    "invalid retained payload height key during pruning",
+                                ))?;
+                                if height <= cutoff {
+                                    candidates.push(height);
+                                }
+                                last_scanned = Some(key);
+                                scanned += 1;
+                                if candidates.len() == PRUNE_KEY_CHUNK
+                                    || scanned == PRUNE_SCAN_CHUNK
+                                {
+                                    break false;
+                                }
+                                item = cur.next()?;
+                            };
+                            (candidates, last_scanned, reached_end)
+                        };
+
+                        for h in candidates {
+                            let certificate: Option<ObjectLength> =
+                                txn.get(&cert_tbl, &u64_key(h))?;
+                            let job_key = recursive_proof_height_key(h);
+                            let completed_job: Option<RecursiveProofJob> = txn
+                                .get::<[u8; RECURSIVE_PROOF_JOB_ENCODED_BYTES]>(
+                                    &jobs_tbl, &job_key,
+                                )?
+                                .and_then(|raw| decode_recursive_proof_job(h, &raw))
+                                .filter(|job| job.state == RecursiveProofJobState::Complete);
+                            let selected_result_is_canonical = if let Some(job) = completed_job {
+                                let canonical_hash = txn
+                                    .get::<Vec<u8>>(&headers_tbl, &u64_key(h))?
+                                    .as_deref()
+                                    .and_then(canonical_hash_from_encoded_header);
+                                let result_length = txn
+                                    .get::<ObjectLength>(&results_tbl, &job_key)?
+                                    .map(|ObjectLength(length)| length);
+                                if canonical_hash == Some(job.block_hash)
+                                    && result_length.is_some_and(|length| {
+                                        (RECURSIVE_PROOF_RESULT_HEADER_BYTES
+                                            ..=RECURSIVE_PROOF_RESULT_HEADER_BYTES
+                                                + crate::consensus::wire_limits::MAX_HISTORY_PROOF_BYTES)
+                                            .contains(&length)
+                                    })
+                                {
+                                    txn.get::<Vec<u8>>(&results_tbl, &job_key)?
+                                        .and_then(|raw| decode_recursive_proof_result(h, raw))
+                                        .is_some_and(|result| {
+                                            result.block_hash == job.block_hash
+                                                && selected_history_terminal_prefix_matches(
+                                                    &result.bytes,
+                                                    h,
+                                                    job.block_hash,
+                                                )
+                                        })
+                                } else {
+                                    false
+                                }
                             } else {
                                 false
+                            };
+                            // A certificate is not selected recursive authority.
+                            // Retain raw material until its canonical selected
+                            // Link result is durably complete and prefix-bound.
+                            if certificate.is_some() && selected_result_is_canonical {
+                                txn.del(&tbl, u64_key(h), None)?;
                             }
-                        } else {
-                            false
-                        };
-                        // The certificate checkpoint is not selected recursive
-                        // authority. Retain every raw block/proof/sidecar until
-                        // its canonical selected Link result is durably complete;
-                        // otherwise a slow or restarted prover could lose the
-                        // only material from which its queued job is rebuilt.
-                        if certificate.is_some() && selected_result_is_canonical {
-                            txn.del(&tbl, u64_key(h), None)?;
                         }
+
+                        if reached_end {
+                            break;
+                        }
+                        resume_after = last_scanned;
                     }
                 }
             }
@@ -3813,6 +4235,14 @@ mod tests {
         let hash = crate::hash_block_header(&header);
         store.put_header_only(&header, &hash).unwrap();
         (header, hash)
+    }
+
+    fn selected_terminal_bytes(height: u64, block_hash: [u8; 32]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(SELECTED_HISTORY_TERMINAL_PREFIX_BYTES);
+        bytes.extend_from_slice(&SELECTED_HISTORY_TERMINAL_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&height.to_le_bytes());
+        bytes.extend_from_slice(&block_hash);
+        bytes
     }
 
     fn overwrite_owner_index_record(store: &MdbxStore, key: &[u8], value: &[u8]) {
@@ -4141,7 +4571,11 @@ mod tests {
 
         store.claim_next_recursive_proof_job().unwrap().unwrap();
         store
-            .complete_recursive_proof_job(1, hash, b"selected-link-result")
+            .complete_recursive_proof_job_and_promote_selected_history(
+                1,
+                hash,
+                &selected_terminal_bytes(1, hash),
+            )
             .unwrap();
         store.prune_after_commit(pruning_height).unwrap();
         assert!(store.get_recent_block(1).unwrap().is_none());
@@ -4308,6 +4742,159 @@ mod tests {
         assert_eq!(replacement.state, RecursiveProofJobState::Pending);
         assert_eq!(replacement.attempt_counter, 0);
         assert!(store.get_recursive_proof_job_result(10).unwrap().is_none());
+    }
+
+    #[test]
+    fn selected_history_completion_promotes_one_bounded_pointer_and_rewinds_on_reorg() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+
+        let (first_header, first_hash) = put_recursive_job_header(&store, 1, 1);
+        store
+            .enqueue_recursive_proof_job(1, first_hash, RecursiveProofJobTier::B8)
+            .unwrap();
+        store.claim_next_recursive_proof_job().unwrap().unwrap();
+        assert!(store
+            .complete_recursive_proof_job_and_promote_selected_history(
+                1,
+                first_hash,
+                b"opaque-not-a-terminal-package",
+            )
+            .is_err());
+        assert!(store.get_selected_history_coverage().unwrap().is_none());
+
+        let first_terminal = selected_terminal_bytes(1, first_hash);
+        store
+            .complete_recursive_proof_job_and_promote_selected_history(
+                1,
+                first_hash,
+                &first_terminal,
+            )
+            .unwrap();
+        assert_eq!(
+            store.get_selected_history_coverage().unwrap(),
+            Some(SelectedHistoryCoverage {
+                height: 1,
+                block_hash: first_hash,
+            })
+        );
+        assert_eq!(
+            store
+                .get_selected_history_terminal_result()
+                .unwrap()
+                .unwrap()
+                .bytes,
+            first_terminal
+        );
+
+        let mut second_header = first_header;
+        second_header.height = 2;
+        second_header.prev_block_hash = first_hash;
+        second_header.timestamp = second_header.timestamp.saturating_add(1);
+        second_header.nonce = 2;
+        let second_hash = crate::hash_block_header(&second_header);
+        store
+            .put_header_only(&second_header, &second_hash)
+            .unwrap();
+        store
+            .enqueue_recursive_proof_job(2, second_hash, RecursiveProofJobTier::B8)
+            .unwrap();
+        store.claim_next_recursive_proof_job().unwrap().unwrap();
+        let second_terminal = selected_terminal_bytes(2, second_hash);
+        store
+            .complete_recursive_proof_job_and_promote_selected_history(
+                2,
+                second_hash,
+                &second_terminal,
+            )
+            .unwrap();
+        assert_eq!(
+            store.get_selected_history_coverage().unwrap().unwrap().height,
+            2
+        );
+
+        store.delete_recursive_proof_jobs_above(1).unwrap();
+        assert_eq!(
+            store.get_selected_history_coverage().unwrap(),
+            Some(SelectedHistoryCoverage {
+                height: 1,
+                block_hash: first_hash,
+            })
+        );
+        assert_eq!(
+            store
+                .get_selected_history_terminal_result()
+                .unwrap()
+                .unwrap()
+                .bytes,
+            first_terminal
+        );
+    }
+
+    #[test]
+    fn selected_history_promotion_rejects_an_opaque_complete_predecessor() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let (first_header, first_hash) = put_recursive_job_header(&store, 1, 11);
+        store
+            .enqueue_recursive_proof_job(1, first_hash, RecursiveProofJobTier::B8)
+            .unwrap();
+        store.claim_next_recursive_proof_job().unwrap().unwrap();
+        store
+            .complete_recursive_proof_job(1, first_hash, b"opaque")
+            .unwrap();
+
+        let mut second_header = first_header;
+        second_header.height = 2;
+        second_header.prev_block_hash = first_hash;
+        second_header.timestamp = second_header.timestamp.saturating_add(1);
+        second_header.nonce = 12;
+        let second_hash = crate::hash_block_header(&second_header);
+        store
+            .put_header_only(&second_header, &second_hash)
+            .unwrap();
+        store
+            .enqueue_recursive_proof_job(2, second_hash, RecursiveProofJobTier::B8)
+            .unwrap();
+        store.claim_next_recursive_proof_job().unwrap().unwrap();
+        assert!(store
+            .complete_recursive_proof_job_and_promote_selected_history(
+                2,
+                second_hash,
+                &selected_terminal_bytes(2, second_hash),
+            )
+            .is_err());
+        assert!(store.get_selected_history_coverage().unwrap().is_none());
+        assert_eq!(
+            store.get_recursive_proof_job(2).unwrap().unwrap().state,
+            RecursiveProofJobState::Running
+        );
+    }
+
+    #[test]
+    fn bounded_height_pruner_handles_little_endian_cursor_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let txn = store.db.begin_rw_txn().unwrap();
+        let table = txn.open_table(Some(T_UNDO_LOGS)).unwrap();
+        for height in [1u64, 2, 255, 256, 257, 65_536] {
+            txn.put(&table, u64_key(height), [0xAA], WriteFlags::empty())
+                .unwrap();
+        }
+        delete_height_keys_at_or_below(&txn, &table, 256).unwrap();
+        for height in [1u64, 2, 255, 256] {
+            assert!(txn
+                .get::<ObjectLength>(&table, &u64_key(height))
+                .unwrap()
+                .is_none());
+        }
+        for height in [257u64, 65_536] {
+            assert!(txn
+                .get::<ObjectLength>(&table, &u64_key(height))
+                .unwrap()
+                .is_some());
+        }
+        txn.commit().unwrap();
     }
 
     #[test]

@@ -30,8 +30,9 @@ pub use mdbx_context::{
 };
 pub use mdbx_store::{
     AcceptedBlockCommitData, ClaimedRecursiveProofJobInputs, MdbxStore, RecursiveProofJob,
-    RecursiveProofJobResult, RecursiveProofJobState, RecursiveProofJobTier, StoreError,
-    VerifiedOwnerSnapshot, VerifiedOwnerUtxo, MAX_RECURSIVE_PROOF_JOB_RESULT_BYTES,
+    RecursiveProofJobResult, RecursiveProofJobState, RecursiveProofJobTier,
+    SelectedHistoryCoverage, StoreError, VerifiedOwnerSnapshot, VerifiedOwnerUtxo,
+    MAX_RECURSIVE_PROOF_JOB_RESULT_BYTES,
 };
 pub use memory::RamBackend;
 pub use meta::{ConsensusMeta, FinalizedCheckpoint};
