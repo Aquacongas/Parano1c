@@ -234,6 +234,9 @@ pub type BlockAppliedHook = Arc<dyn Fn(&noid_chain::block::Block) + Send + Sync>
 /// Resolves the payout address immediately before each template is built.
 /// Used by the built-in wallet when no explicit mining address is configured.
 pub type MiningPayoutResolver = Arc<dyn Fn() -> Address + Send + Sync>;
+/// Optional node-wide ordering gate for canonical chain operations which also
+/// replace wallet/mempool views (snapshot install, reorg, mining apply).
+pub type ChainOperationGate = Arc<tokio::sync::Mutex<()>>;
 fn resolve_mining_payout(configured: Address, resolver: Option<&MiningPayoutResolver>) -> Address {
     resolver.map(|resolve| resolve()).unwrap_or(configured)
 }
@@ -266,6 +269,11 @@ pub struct BlockMiner {
     /// Optional dynamic payout. Explicitly configured miner addresses leave
     /// this unset and continue to use `config.miner_address`.
     payout_resolver: Option<MiningPayoutResolver>,
+    /// When installed by the full node, prevents a template capture or found
+    /// block apply from entering the interval between snapshot commit and the
+    /// corresponding mempool/wallet reload. Library-only miners may leave it
+    /// unset when no external state-replacement path exists.
+    chain_operation_gate: Option<ChainOperationGate>,
 }
 
 impl BlockMiner {
@@ -311,6 +319,7 @@ impl BlockMiner {
             proof_memory_governor,
             on_block_applied: None,
             payout_resolver: None,
+            chain_operation_gate: None,
         };
         (miner, rx)
     }
@@ -325,6 +334,13 @@ impl BlockMiner {
     /// Resolve the wallet's active address for every future template.
     pub fn set_payout_resolver(&mut self, resolver: MiningPayoutResolver) {
         self.payout_resolver = Some(resolver);
+    }
+
+    /// Serialize template capture and canonical apply with node-wide snapshot
+    /// and reorg replacement. The gate is held only while shared boundaries
+    /// are captured/updated, never while certificate proving or PoW runs.
+    pub fn set_chain_operation_gate(&mut self, gate: ChainOperationGate) {
+        self.chain_operation_gate = Some(gate);
     }
 
     /// Cancel the current PoW search (call when a new P2P block arrives).
@@ -435,12 +451,17 @@ impl BlockMiner {
             // template snapshot. Account activation takes `chain -> wallet`
             // too, so the selected owner and parent snapshot form one instant.
             // An already-built template remains immutable.
+            let chain_operation = match &self.chain_operation_gate {
+                Some(gate) => Some(gate.lock().await),
+                None => None,
+            };
             let (snapshot_result, addr) = {
                 let mut ctx = self.chain.write().await;
                 let addr =
                     resolve_mining_payout(self.config.miner_address, self.payout_resolver.as_ref());
                 (TemplateChainSnapshot::from_context(&mut ctx), addr)
             };
+            drop(chain_operation);
             let snapshot = match snapshot_result {
                 Ok(snapshot) => snapshot,
                 Err(e) => {
@@ -692,6 +713,15 @@ impl BlockMiner {
     ) -> anyhow::Result<()> {
         use noid_mempool::ChainView;
 
+        // Snapshot installation retains this gate from before its atomic MDBX
+        // commit through mempool and wallet reload. A mined block therefore
+        // cannot observe the new parent and publish a newer ChainView halfway
+        // through that replacement sequence.
+        let chain_operation = match &self.chain_operation_gate {
+            Some(gate) => Some(gate.lock().await),
+            None => None,
+        };
+
         let local_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -772,6 +802,7 @@ impl BlockMiner {
         self.mempool
             .on_new_block(&confirmed, block.header.height, new_view)
             .await;
+        drop(chain_operation);
 
         Ok(())
     }
