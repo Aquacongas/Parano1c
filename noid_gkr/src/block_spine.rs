@@ -371,6 +371,7 @@ fn sigma_dec_value(live_slots: usize, y: usize) -> Block128 {
     sigma_at(dec_round, elem_of_dyn(y))
 }
 
+#[cfg(test)]
 fn build_sigma_dec_table_flat_dyn(live_slots: usize, n_cells: usize) -> Vec<u128> {
     use rayon::prelude::*;
     (0..n_cells)
@@ -379,6 +380,7 @@ fn build_sigma_dec_table_flat_dyn(live_slots: usize, n_cells: usize) -> Vec<u128
         .collect()
 }
 
+#[cfg(test)]
 fn build_sigma_lane_dec_table_flat_dyn(
     lane: usize,
     live_slots: usize,
@@ -395,6 +397,7 @@ fn build_sigma_lane_dec_table_flat_dyn(
         .collect()
 }
 
+#[cfg(test)]
 fn build_rc_dec_table_flat_dyn(live_slots: usize, n_cells: usize) -> Vec<u128> {
     use rayon::prelude::*;
     (0..n_cells)
@@ -419,6 +422,7 @@ fn build_rc_dec_table_flat_dyn(live_slots: usize, n_cells: usize) -> Vec<u128> {
         .collect()
 }
 
+#[cfg(test)]
 fn build_mds_lane_table_flat_dyn(lane: usize, live_slots: usize, n_cells: usize) -> Vec<u128> {
     use rayon::prelude::*;
     (0..n_cells)
@@ -438,6 +442,7 @@ fn build_mds_lane_table_flat_dyn(lane: usize, live_slots: usize, n_cells: usize)
         .collect()
 }
 
+#[cfg(test)]
 fn build_u_table_flat_dyn(rho: &[Block128], live_slots: usize, n_cells: usize) -> Vec<u128> {
     use rayon::prelude::*;
     let eq_tab = eq_ind_partial_eval::<Block128>(rho);
@@ -469,7 +474,9 @@ fn permute_by_dec_flat_dyn(src: &[Block128]) -> Vec<u128> {
 // ---------------------------------------------------------------------------
 //
 // All block-spine public-schedule tables (sigma, rc, mds, sigma_lane) share
-// the same slot-independent structure:
+// the same slot-independent structure.  The prover keeps this factorization
+// throughout sumcheck; the verifier evaluates the factors directly at its
+// terminal point:
 //
 //   table(slot, round, elem) = f(prev_round, elem)   for slot < live_slots
 //                             = 0                      otherwise
@@ -492,8 +499,8 @@ fn permute_by_dec_flat_dyn(src: &[Block128]) -> Vec<u128> {
 /// Direct evaluation of all public-schedule MLEs at a single point `r_prime`.
 ///
 /// Returns `(u_at_r, sigma_dec_at_r, rc_dec_at_r, mds_lane_at_r, sigma_lane_at_r)`.
-/// Correctness invariant: each returned value equals the result of the
-/// corresponding build-then-evaluate path in the prover.
+/// Correctness invariant: each returned value equals the terminal evaluation
+/// of the corresponding separable prover schedule.
 fn fast_eval_block_schedules(
     rho: &[Block128],
     r_prime: &[Block128],
@@ -614,6 +621,7 @@ fn fast_eval_block_schedules(
     )
 }
 
+#[cfg(test)]
 fn project_lane_dec_flat_dyn(src: &[Block128], lane: usize) -> Vec<u128> {
     use rayon::prelude::*;
     let n = src.len();
@@ -657,19 +665,34 @@ pub struct BlockSpineUnifiedReduction {
     pub gamma: Block128,
 }
 
-/// Internal table bundle for the block-level sumcheck (flat basis for hw acceleration).
+/// Public schedules factor over `(slot, round || elem)`.  Keeping the two
+/// factors instead of their tensor product is important at the production
+/// m22 shape: the largest factor has one entry per slot rather than one entry
+/// per cell.
+struct BlockPublicFlatSchedules {
+    live_slot: Vec<u128>,
+    u_slot: Vec<u128>,
+    u_inner: Vec<u128>,
+    sigma_dec_inner: Vec<u128>,
+    rc_dec_inner: Vec<u128>,
+    mds_lane_dec_inner: [Vec<u128>; STATE_SIZE],
+    sigma_lane_dec_inner: [Vec<u128>; STATE_SIZE],
+}
+
+/// Internal table bundle for the block-level sumcheck (flat basis for hw
+/// acceleration).  Only the four actual witness columns are materialized.
+/// Public schedules are separable, while lane projections are views over the
+/// two corresponding witness columns.
 struct BlockUnifiedFlatTables {
-    u: Vec<u128>,
-    sigma_dec: Vec<u128>,
-    rc_dec: Vec<u128>,
-    mds_lane_dec: [Vec<u128>; STATE_SIZE],
-    sigma_lane_dec: [Vec<u128>; STATE_SIZE],
+    public: BlockPublicFlatSchedules,
     s_in_dec: Vec<u128>,
     s_out_dec: Vec<u128>,
     state_dec: Vec<u128>,
     state: Vec<u128>,
-    s_out_lane_dec: [Vec<u128>; STATE_SIZE],
-    state_lane_dec: [Vec<u128>; STATE_SIZE],
+    // Once the slot and round variables have been fixed, these are the four
+    // lane values.  The lane MLEs are constant in the remaining y.elem vars.
+    s_out_lane_claims: Option<[u128; STATE_SIZE]>,
+    state_lane_claims: Option<[u128; STATE_SIZE]>,
 }
 
 #[inline]
@@ -685,113 +708,194 @@ fn vec_to_flat(v: &[Block128]) -> Vec<u128> {
     }
 }
 
+impl BlockPublicFlatSchedules {
+    fn new(rho: &[Block128], live_slots: usize, num_vars: usize) -> Self {
+        const INNER_BITS: usize = ROUND_BITS + ELEM_BITS;
+        const INNER_CELLS: usize = 1 << INNER_BITS;
+
+        debug_assert_eq!(rho.len(), num_vars);
+        let slot_cells = 1usize << (num_vars - INNER_BITS);
+        let rho_elem = &rho[..ELEM_BITS];
+        let rho_round = &rho[ELEM_BITS..INNER_BITS];
+        let rho_slot = &rho[INNER_BITS..];
+        let eq_rho_elem = eq_ind_partial_eval::<Block128>(rho_elem);
+        let eq_rho_round = eq_ind_partial_eval::<Block128>(rho_round);
+        let eq_rho_slot = eq_ind_partial_eval::<Block128>(rho_slot);
+
+        let live_slot: Vec<u128> = (0..slot_cells)
+            .map(|slot| u128::from(slot < live_slots))
+            .collect();
+        let u_slot: Vec<u128> = (0..slot_cells)
+            .map(|slot| {
+                if slot < live_slots {
+                    tower_to_flat_u128(eq_rho_slot[slot].to_u128())
+                } else {
+                    0
+                }
+            })
+            .collect();
+
+        let u_inner = (0..INNER_CELLS)
+            .map(|y| {
+                let dec_round = round_of_dyn(dec_round_dyn(y));
+                if dec_round >= N_ROUNDS {
+                    return 0;
+                }
+                let elem = elem_of_dyn(y);
+                tower_to_flat_u128((eq_rho_round[dec_round] * eq_rho_elem[elem]).to_u128())
+            })
+            .collect();
+        let sigma_dec_inner = (0..INNER_CELLS)
+            .map(|y| tower_to_flat_u128(sigma_dec_value(1, y).to_u128()))
+            .collect();
+        let rc_dec_inner = (0..INNER_CELLS)
+            .map(|y| {
+                let dec_round = round_of_dyn(dec_round_dyn(y));
+                if dec_round >= N_ROUNDS {
+                    return 0;
+                }
+                let elem = elem_of_dyn(y);
+                let is_partial = (F_ROUNDS / 2..F_ROUNDS / 2 + P_ROUNDS).contains(&dec_round);
+                if is_partial && elem != 0 {
+                    0
+                } else {
+                    tower_to_flat_u128(ROUND_CONSTANTS[elem][dec_round])
+                }
+            })
+            .collect();
+        let mds_lane_dec_inner = std::array::from_fn(|lane| {
+            (0..INNER_CELLS)
+                .map(|y| {
+                    let dec_round = round_of_dyn(dec_round_dyn(y));
+                    if dec_round >= N_ROUNDS {
+                        return 0;
+                    }
+                    let elem = elem_of_dyn(y);
+                    tower_to_flat_u128(mds_coeff_dyn(dec_round, elem, lane).to_u128())
+                })
+                .collect()
+        });
+        let sigma_lane_dec_inner = std::array::from_fn(|lane| {
+            (0..INNER_CELLS)
+                .map(|y| {
+                    let row_base = y & !(STATE_SIZE - 1);
+                    tower_to_flat_u128(sigma_dec_value(1, row_base | lane).to_u128())
+                })
+                .collect()
+        });
+
+        Self {
+            live_slot,
+            u_slot,
+            u_inner,
+            sigma_dec_inner,
+            rc_dec_inner,
+            mds_lane_dec_inner,
+            sigma_lane_dec_inner,
+        }
+    }
+
+    fn fold(&mut self, r_flat: u128) {
+        if self.live_slot.len() > 1 {
+            fold_flat_inplace(&mut self.live_slot, r_flat);
+            fold_flat_inplace(&mut self.u_slot, r_flat);
+        } else {
+            fold_flat_inplace(&mut self.u_inner, r_flat);
+            fold_flat_inplace(&mut self.sigma_dec_inner, r_flat);
+            fold_flat_inplace(&mut self.rc_dec_inner, r_flat);
+            for lane in 0..STATE_SIZE {
+                fold_flat_inplace(&mut self.mds_lane_dec_inner[lane], r_flat);
+                fold_flat_inplace(&mut self.sigma_lane_dec_inner[lane], r_flat);
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn factored_pair(outer: &[u128], inner: &[u128], i: usize, half: usize) -> [u128; 2] {
+        if outer.len() > 1 {
+            debug_assert_eq!(outer.len() * inner.len(), half * 2);
+            let inner_i = i % inner.len();
+            let outer_i = i / inner.len();
+            let outer_hi = (i + half) / inner.len();
+            let inner_v = inner[inner_i];
+            [
+                clmul_gcm(outer[outer_i], inner_v),
+                clmul_gcm(outer[outer_i] ^ outer[outer_hi], inner_v),
+            ]
+        } else {
+            debug_assert_eq!(inner.len(), half * 2);
+            [
+                clmul_gcm(outer[0], inner[i]),
+                clmul_gcm(outer[0], inner[i] ^ inner[i + half]),
+            ]
+        }
+    }
+
+    #[inline(always)]
+    fn round_pairs(&self, i: usize, half: usize) -> BlockPublicRoundPairs {
+        BlockPublicRoundPairs {
+            u: Self::factored_pair(&self.u_slot, &self.u_inner, i, half),
+            sigma_dec: Self::factored_pair(&self.live_slot, &self.sigma_dec_inner, i, half),
+            rc_dec: Self::factored_pair(&self.live_slot, &self.rc_dec_inner, i, half),
+            mds_lane_dec: std::array::from_fn(|lane| {
+                Self::factored_pair(&self.live_slot, &self.mds_lane_dec_inner[lane], i, half)
+            }),
+            sigma_lane_dec: std::array::from_fn(|lane| {
+                Self::factored_pair(&self.live_slot, &self.sigma_lane_dec_inner[lane], i, half)
+            }),
+        }
+    }
+}
+
+struct BlockPublicRoundPairs {
+    u: [u128; 2],
+    sigma_dec: [u128; 2],
+    rc_dec: [u128; 2],
+    mds_lane_dec: [[u128; 2]; STATE_SIZE],
+    sigma_lane_dec: [[u128; 2]; STATE_SIZE],
+}
+
+struct BlockRoundPairs {
+    public: BlockPublicRoundPairs,
+    s_in_dec: [u128; 2],
+    s_out_dec: [u128; 2],
+    state_dec: [u128; 2],
+    state: [u128; 2],
+    s_out_lane_dec: [[u128; 2]; STATE_SIZE],
+    state_lane_dec: [[u128; 2]; STATE_SIZE],
+}
+
 fn build_block_unified_flat_tables(
     mle: &BlockSpineMle,
     rho: &[Block128],
 ) -> BlockUnifiedFlatTables {
-    use rayon::prelude::*;
-    let n_cells = 1 << mle.num_vars;
-    let live = mle.live_slots;
+    let public = BlockPublicFlatSchedules::new(rho, mle.live_slots, mle.num_vars);
 
-    // Build the shared permuted tables in parallel (each is independent).
-    let (
-        sigma_dec_flat,
-        (rc_dec_flat, (u_flat, (s_in_dec_flat, (s_out_dec_flat, state_dec_flat)))),
-    ) = rayon::join(
-        || build_sigma_dec_table_flat_dyn(live, n_cells),
+    // The four full-size tables are independent.  Build them in parallel, but
+    // do not overlap this allocation with any full-size public schedule.
+    let ((s_in_dec_flat, s_out_dec_flat), (state_dec_flat, state_flat)) = rayon::join(
         || {
             rayon::join(
-                || build_rc_dec_table_flat_dyn(live, n_cells),
-                || {
-                    rayon::join(
-                        || build_u_table_flat_dyn(rho, live, n_cells),
-                        || {
-                            rayon::join(
-                                || permute_by_dec_flat_dyn(&mle.s_in),
-                                || {
-                                    rayon::join(
-                                        || permute_by_dec_flat_dyn(&mle.s_out),
-                                        || permute_by_dec_flat_dyn(&mle.state),
-                                    )
-                                },
-                            )
-                        },
-                    )
-                },
+                || permute_by_dec_flat_dyn(&mle.s_in),
+                || permute_by_dec_flat_dyn(&mle.s_out),
+            )
+        },
+        || {
+            rayon::join(
+                || permute_by_dec_flat_dyn(&mle.state),
+                || vec_to_flat(&mle.state),
             )
         },
     );
 
-    // s_out/state/sigma dec tables were built directly in flat basis above
-    // to avoid Block128 intermediates.
-    let state_flat = vec_to_flat(&mle.state);
-
-    // Parallel lane table construction (STATE_SIZE = 4 lanes each).
-    // mds_lane and sigma_lane/s_out_lane/state_lane are all independent.
-    let lane_idx: Vec<usize> = (0..STATE_SIZE).collect();
-    let (mds_vecs, sigma_lane_vecs, s_out_lane_vecs, state_lane_vecs) = {
-        let (mds, (sig, (sout, stt))) = rayon::join(
-            || {
-                lane_idx
-                    .par_iter()
-                    .map(|&j| build_mds_lane_table_flat_dyn(j, live, n_cells))
-                    .collect::<Vec<_>>()
-            },
-            || {
-                rayon::join(
-                    || {
-                        lane_idx
-                            .par_iter()
-                            .map(|&j| build_sigma_lane_dec_table_flat_dyn(j, live, n_cells))
-                            .collect::<Vec<_>>()
-                    },
-                    || {
-                        rayon::join(
-                            || {
-                                lane_idx
-                                    .par_iter()
-                                    .map(|&j| project_lane_dec_flat_dyn(&mle.s_out, j))
-                                    .collect::<Vec<_>>()
-                            },
-                            || {
-                                lane_idx
-                                    .par_iter()
-                                    .map(|&j| project_lane_dec_flat_dyn(&mle.state, j))
-                                    .collect::<Vec<_>>()
-                            },
-                        )
-                    },
-                )
-            },
-        );
-        (mds, sig, sout, stt)
-    };
-
-    let mds_flat: [Vec<u128>; STATE_SIZE] = mds_vecs
-        .try_into()
-        .unwrap_or_else(|_| unreachable!("STATE_SIZE lane tables"));
-    let sigma_lane_flat: [Vec<u128>; STATE_SIZE] = sigma_lane_vecs
-        .try_into()
-        .unwrap_or_else(|_| unreachable!("STATE_SIZE lane tables"));
-    let s_out_lane_flat: [Vec<u128>; STATE_SIZE] = s_out_lane_vecs
-        .try_into()
-        .unwrap_or_else(|_| unreachable!("STATE_SIZE lane tables"));
-    let state_lane_flat: [Vec<u128>; STATE_SIZE] = state_lane_vecs
-        .try_into()
-        .unwrap_or_else(|_| unreachable!("STATE_SIZE lane tables"));
-
     BlockUnifiedFlatTables {
-        u: u_flat,
-        sigma_dec: sigma_dec_flat,
-        rc_dec: rc_dec_flat,
-        mds_lane_dec: mds_flat,
-        sigma_lane_dec: sigma_lane_flat,
+        public,
         s_in_dec: s_in_dec_flat,
         s_out_dec: s_out_dec_flat,
         state_dec: state_dec_flat,
         state: state_flat,
-        s_out_lane_dec: s_out_lane_flat,
-        state_lane_dec: state_lane_flat,
+        s_out_lane_claims: None,
+        state_lane_claims: None,
     }
 }
 
@@ -812,35 +916,102 @@ fn fold_flat_inplace(evals: &mut Vec<u128>, r_flat: u128) {
         }
     }
     evals.truncate(half);
+    // `truncate` alone retains the original m22 allocation through the whole
+    // proof.  The allocator can normally release the tail in place; even when
+    // it must move, the next round operates on half as many elements.
+    evals.shrink_to_fit();
 }
 
 impl BlockUnifiedFlatTables {
+    #[inline]
+    fn len(&self) -> usize {
+        self.state.len()
+    }
+
+    #[inline(always)]
+    fn table_pair(table: &[u128], i: usize, half: usize) -> [u128; 2] {
+        [table[i], table[i] ^ table[i + half]]
+    }
+
+    #[inline(always)]
+    fn lane_pair(
+        table: &[u128],
+        captured: Option<&[u128; STATE_SIZE]>,
+        lane: usize,
+        i: usize,
+        half: usize,
+    ) -> [u128; 2] {
+        if table.len() > STATE_SIZE {
+            let row_mask = !(STATE_SIZE - 1);
+            let lo = table[(i & row_mask) | lane];
+            let hi = table[((i + half) & row_mask) | lane];
+            [lo, lo ^ hi]
+        } else if table.len() == STATE_SIZE {
+            // The lane projection fixes source.elem=lane and is therefore
+            // constant in both remaining y.elem variables.
+            [table[lane], 0]
+        } else {
+            [captured.expect("lane claims captured")[lane], 0]
+        }
+    }
+
+    #[inline(always)]
+    fn round_pairs(&self, i: usize, half: usize) -> BlockRoundPairs {
+        BlockRoundPairs {
+            public: self.public.round_pairs(i, half),
+            s_in_dec: Self::table_pair(&self.s_in_dec, i, half),
+            s_out_dec: Self::table_pair(&self.s_out_dec, i, half),
+            state_dec: Self::table_pair(&self.state_dec, i, half),
+            state: Self::table_pair(&self.state, i, half),
+            s_out_lane_dec: std::array::from_fn(|lane| {
+                Self::lane_pair(
+                    &self.s_out_dec,
+                    self.s_out_lane_claims.as_ref(),
+                    lane,
+                    i,
+                    half,
+                )
+            }),
+            state_lane_dec: std::array::from_fn(|lane| {
+                Self::lane_pair(
+                    &self.state_dec,
+                    self.state_lane_claims.as_ref(),
+                    lane,
+                    i,
+                    half,
+                )
+            }),
+        }
+    }
+
     fn fold(&mut self, r_flat: u128) {
-        fold_flat_inplace(&mut self.u, r_flat);
-        fold_flat_inplace(&mut self.sigma_dec, r_flat);
-        fold_flat_inplace(&mut self.rc_dec, r_flat);
+        if self.len() == STATE_SIZE && self.s_out_lane_claims.is_none() {
+            self.s_out_lane_claims = Some(std::array::from_fn(|j| self.s_out_dec[j]));
+            self.state_lane_claims = Some(std::array::from_fn(|j| self.state_dec[j]));
+        }
+        self.public.fold(r_flat);
         fold_flat_inplace(&mut self.s_in_dec, r_flat);
         fold_flat_inplace(&mut self.s_out_dec, r_flat);
         fold_flat_inplace(&mut self.state_dec, r_flat);
         fold_flat_inplace(&mut self.state, r_flat);
-        for j in 0..STATE_SIZE {
-            fold_flat_inplace(&mut self.mds_lane_dec[j], r_flat);
-            fold_flat_inplace(&mut self.sigma_lane_dec[j], r_flat);
-            fold_flat_inplace(&mut self.s_out_lane_dec[j], r_flat);
-            fold_flat_inplace(&mut self.state_lane_dec[j], r_flat);
-        }
     }
 
     fn final_claims_tower(&self) -> BlockFinalClaims {
-        debug_assert_eq!(self.u.len(), 1);
+        debug_assert_eq!(self.len(), 1);
         let f = |x: u128| Block128::from(flat_to_tower_u128(x));
         BlockFinalClaims {
             s_in_dec: f(self.s_in_dec[0]),
             s_out_dec: f(self.s_out_dec[0]),
             state_dec: f(self.state_dec[0]),
             state: f(self.state[0]),
-            s_out_lane_dec: std::array::from_fn(|j| f(self.s_out_lane_dec[j][0])),
-            state_lane_dec: std::array::from_fn(|j| f(self.state_lane_dec[j][0])),
+            s_out_lane_dec: self
+                .s_out_lane_claims
+                .expect("lane claims captured before elem folding")
+                .map(f),
+            state_lane_dec: self
+                .state_lane_claims
+                .expect("lane claims captured before elem folding")
+                .map(f),
         }
     }
 }
@@ -920,7 +1091,7 @@ fn compute_block_round_polynomial_flat(
     gamma_flat: u128,
 ) -> RoundPolynomial<Block128> {
     use rayon::prelude::*;
-    let half = tabs.u.len() / 2;
+    let half = tabs.len() / 2;
     const ONE_FLAT: u128 = 1u128;
 
     // Parallel reduce: each position i contributes independently to acc via XOR.
@@ -930,23 +1101,14 @@ fn compute_block_round_polynomial_flat(
             .fold(
                 || [0u128; BLOCK_SPINE_ROUND_DEGREE + 1],
                 |mut local_acc, i| {
-                    let u_p: [u128; 2] = [tabs.u[i], tabs.u[i] ^ tabs.u[i + half]];
-                    let sg_p: [u128; 2] = [
-                        tabs.sigma_dec[i],
-                        tabs.sigma_dec[i] ^ tabs.sigma_dec[i + half],
-                    ];
-                    let rc_p: [u128; 2] = [tabs.rc_dec[i], tabs.rc_dec[i] ^ tabs.rc_dec[i + half]];
-                    let si_p: [u128; 2] =
-                        [tabs.s_in_dec[i], tabs.s_in_dec[i] ^ tabs.s_in_dec[i + half]];
-                    let so_p: [u128; 2] = [
-                        tabs.s_out_dec[i],
-                        tabs.s_out_dec[i] ^ tabs.s_out_dec[i + half],
-                    ];
-                    let st_p: [u128; 2] = [
-                        tabs.state_dec[i],
-                        tabs.state_dec[i] ^ tabs.state_dec[i + half],
-                    ];
-                    let stmain_p: [u128; 2] = [tabs.state[i], tabs.state[i] ^ tabs.state[i + half]];
+                    let pairs = tabs.round_pairs(i, half);
+                    let u_p = pairs.public.u;
+                    let sg_p = pairs.public.sigma_dec;
+                    let rc_p = pairs.public.rc_dec;
+                    let si_p = pairs.s_in_dec;
+                    let so_p = pairs.s_out_dec;
+                    let st_p = pairs.state_dec;
+                    let stmain_p = pairs.state;
 
                     // Q1(t) = sg(t) * si(t)^7 + so(t) + si(t) + sg(t) * si(t)
                     let si7_p: [u128; 8] = pow7_poly_t(si_p[0], si_p[1]);
@@ -968,22 +1130,10 @@ fn compute_block_round_polynomial_flat(
                     q2_p[0] ^= stmain_p[0];
                     q2_p[1] ^= stmain_p[1];
                     for j in 0..STATE_SIZE {
-                        let m_p: [u128; 2] = [
-                            tabs.mds_lane_dec[j][i],
-                            tabs.mds_lane_dec[j][i] ^ tabs.mds_lane_dec[j][i + half],
-                        ];
-                        let sgl_p: [u128; 2] = [
-                            tabs.sigma_lane_dec[j][i],
-                            tabs.sigma_lane_dec[j][i] ^ tabs.sigma_lane_dec[j][i + half],
-                        ];
-                        let sol_p: [u128; 2] = [
-                            tabs.s_out_lane_dec[j][i],
-                            tabs.s_out_lane_dec[j][i] ^ tabs.s_out_lane_dec[j][i + half],
-                        ];
-                        let stl_p: [u128; 2] = [
-                            tabs.state_lane_dec[j][i],
-                            tabs.state_lane_dec[j][i] ^ tabs.state_lane_dec[j][i + half],
-                        ];
+                        let m_p = pairs.public.mds_lane_dec[j];
+                        let sgl_p = pairs.public.sigma_lane_dec[j];
+                        let sol_p = pairs.s_out_lane_dec[j];
+                        let stl_p = pairs.state_lane_dec[j];
                         let one_plus_sgl_p: [u128; 2] = [ONE_FLAT ^ sgl_p[0], sgl_p[1]];
                         let sgl_sol_p: [u128; 3] = poly_mul_t::<2, 2, 3>(&sgl_p, &sol_p);
                         let onep_stl_p: [u128; 3] = poly_mul_t::<2, 2, 3>(&one_plus_sgl_p, &stl_p);
@@ -1031,22 +1181,14 @@ fn compute_block_round_polynomial_flat(
         // Small table: serial loop (no rayon overhead for tiny blocks).
         let mut acc = [0u128; BLOCK_SPINE_ROUND_DEGREE + 1];
         for i in 0..half {
-            let u_p: [u128; 2] = [tabs.u[i], tabs.u[i] ^ tabs.u[i + half]];
-            let sg_p: [u128; 2] = [
-                tabs.sigma_dec[i],
-                tabs.sigma_dec[i] ^ tabs.sigma_dec[i + half],
-            ];
-            let rc_p: [u128; 2] = [tabs.rc_dec[i], tabs.rc_dec[i] ^ tabs.rc_dec[i + half]];
-            let si_p: [u128; 2] = [tabs.s_in_dec[i], tabs.s_in_dec[i] ^ tabs.s_in_dec[i + half]];
-            let so_p: [u128; 2] = [
-                tabs.s_out_dec[i],
-                tabs.s_out_dec[i] ^ tabs.s_out_dec[i + half],
-            ];
-            let st_p: [u128; 2] = [
-                tabs.state_dec[i],
-                tabs.state_dec[i] ^ tabs.state_dec[i + half],
-            ];
-            let stmain_p: [u128; 2] = [tabs.state[i], tabs.state[i] ^ tabs.state[i + half]];
+            let pairs = tabs.round_pairs(i, half);
+            let u_p = pairs.public.u;
+            let sg_p = pairs.public.sigma_dec;
+            let rc_p = pairs.public.rc_dec;
+            let si_p = pairs.s_in_dec;
+            let so_p = pairs.s_out_dec;
+            let st_p = pairs.state_dec;
+            let stmain_p = pairs.state;
             let si7_p: [u128; 8] = pow7_poly_t(si_p[0], si_p[1]);
             let sg_si7_p: [u128; 9] = poly_mul_t::<2, 8, 9>(&sg_p, &si7_p);
             let sg_si_p: [u128; 3] = poly_mul_t::<2, 2, 3>(&sg_p, &si_p);
@@ -1061,22 +1203,10 @@ fn compute_block_round_polynomial_flat(
             q2_p[0] ^= stmain_p[0];
             q2_p[1] ^= stmain_p[1];
             for j in 0..STATE_SIZE {
-                let m_p: [u128; 2] = [
-                    tabs.mds_lane_dec[j][i],
-                    tabs.mds_lane_dec[j][i] ^ tabs.mds_lane_dec[j][i + half],
-                ];
-                let sgl_p: [u128; 2] = [
-                    tabs.sigma_lane_dec[j][i],
-                    tabs.sigma_lane_dec[j][i] ^ tabs.sigma_lane_dec[j][i + half],
-                ];
-                let sol_p: [u128; 2] = [
-                    tabs.s_out_lane_dec[j][i],
-                    tabs.s_out_lane_dec[j][i] ^ tabs.s_out_lane_dec[j][i + half],
-                ];
-                let stl_p: [u128; 2] = [
-                    tabs.state_lane_dec[j][i],
-                    tabs.state_lane_dec[j][i] ^ tabs.state_lane_dec[j][i + half],
-                ];
+                let m_p = pairs.public.mds_lane_dec[j];
+                let sgl_p = pairs.public.sigma_lane_dec[j];
+                let sol_p = pairs.s_out_lane_dec[j];
+                let stl_p = pairs.state_lane_dec[j];
                 let one_plus_sgl_p: [u128; 2] = [ONE_FLAT ^ sgl_p[0], sgl_p[1]];
                 let sgl_sol_p: [u128; 3] = poly_mul_t::<2, 2, 3>(&sgl_p, &sol_p);
                 let onep_stl_p: [u128; 3] = poly_mul_t::<2, 2, 3>(&one_plus_sgl_p, &stl_p);
@@ -2117,6 +2247,56 @@ mod tests {
         all
     }
 
+    struct LegacyVirtualTables {
+        u: Vec<u128>,
+        sigma_dec: Vec<u128>,
+        rc_dec: Vec<u128>,
+        mds_lane_dec: [Vec<u128>; STATE_SIZE],
+        sigma_lane_dec: [Vec<u128>; STATE_SIZE],
+        s_out_lane_dec: [Vec<u128>; STATE_SIZE],
+        state_lane_dec: [Vec<u128>; STATE_SIZE],
+    }
+
+    impl LegacyVirtualTables {
+        fn build(mle: &BlockSpineMle, rho: &[Block128]) -> Self {
+            let n_cells = 1usize << mle.num_vars;
+            Self {
+                u: build_u_table_flat_dyn(rho, mle.live_slots, n_cells),
+                sigma_dec: build_sigma_dec_table_flat_dyn(mle.live_slots, n_cells),
+                rc_dec: build_rc_dec_table_flat_dyn(mle.live_slots, n_cells),
+                mds_lane_dec: std::array::from_fn(|lane| {
+                    build_mds_lane_table_flat_dyn(lane, mle.live_slots, n_cells)
+                }),
+                sigma_lane_dec: std::array::from_fn(|lane| {
+                    build_sigma_lane_dec_table_flat_dyn(lane, mle.live_slots, n_cells)
+                }),
+                s_out_lane_dec: std::array::from_fn(|lane| {
+                    project_lane_dec_flat_dyn(&mle.s_out, lane)
+                }),
+                state_lane_dec: std::array::from_fn(|lane| {
+                    project_lane_dec_flat_dyn(&mle.state, lane)
+                }),
+            }
+        }
+
+        fn fold(&mut self, challenge: u128) {
+            fold_flat_inplace(&mut self.u, challenge);
+            fold_flat_inplace(&mut self.sigma_dec, challenge);
+            fold_flat_inplace(&mut self.rc_dec, challenge);
+            for lane in 0..STATE_SIZE {
+                fold_flat_inplace(&mut self.mds_lane_dec[lane], challenge);
+                fold_flat_inplace(&mut self.sigma_lane_dec[lane], challenge);
+                fold_flat_inplace(&mut self.s_out_lane_dec[lane], challenge);
+                fold_flat_inplace(&mut self.state_lane_dec[lane], challenge);
+            }
+        }
+    }
+
+    #[inline]
+    fn legacy_pair(table: &[u128], i: usize, half: usize) -> [u128; 2] {
+        [table[i], table[i] ^ table[i + half]]
+    }
+
     #[test]
     fn slot_vars_computation() {
         assert_eq!(slot_vars_for(31), 5); // 1 tx
@@ -2145,6 +2325,107 @@ mod tests {
             assert_eq!(actual_live.next_power_of_two(), slot_domain);
             assert_eq!(num_vars_for(actual_live), num_vars);
         }
+    }
+
+    #[test]
+    fn separable_and_virtual_tables_match_materialized_tables_every_round() {
+        let circuit = SpineCircuit::build();
+        let inputs = fixture_inputs(17);
+        let all_state_ins = collect_slot_state_ins(&circuit, &[inputs]);
+        let mle = BlockSpineMle::build(1, &all_state_ins);
+        let rho: Vec<Block128> = (0..mle.num_vars)
+            .map(|i| Block128::from(0x100 + i as u128 * 17))
+            .collect();
+        let mut compact = build_block_unified_flat_tables(&mle, &rho);
+        let mut legacy = LegacyVirtualTables::build(&mle, &rho);
+
+        for round in 0..mle.num_vars {
+            let half = compact.len() / 2;
+            assert_eq!(legacy.u.len(), compact.len());
+            for i in 0..half {
+                let pairs = compact.round_pairs(i, half);
+                assert_eq!(pairs.public.u, legacy_pair(&legacy.u, i, half));
+                assert_eq!(
+                    pairs.public.sigma_dec,
+                    legacy_pair(&legacy.sigma_dec, i, half)
+                );
+                assert_eq!(pairs.public.rc_dec, legacy_pair(&legacy.rc_dec, i, half));
+                for lane in 0..STATE_SIZE {
+                    assert_eq!(
+                        pairs.public.mds_lane_dec[lane],
+                        legacy_pair(&legacy.mds_lane_dec[lane], i, half)
+                    );
+                    assert_eq!(
+                        pairs.public.sigma_lane_dec[lane],
+                        legacy_pair(&legacy.sigma_lane_dec[lane], i, half)
+                    );
+                    assert_eq!(
+                        pairs.s_out_lane_dec[lane],
+                        legacy_pair(&legacy.s_out_lane_dec[lane], i, half)
+                    );
+                    assert_eq!(
+                        pairs.state_lane_dec[lane],
+                        legacy_pair(&legacy.state_lane_dec[lane], i, half)
+                    );
+                }
+            }
+
+            let challenge =
+                tower_to_flat_u128(Block128::from(0x400 + round as u128 * 29).to_u128());
+            compact.fold(challenge);
+            legacy.fold(challenge);
+        }
+
+        let claims = compact.final_claims_tower();
+        assert_eq!(
+            claims.s_out_lane_dec,
+            std::array::from_fn(|lane| Block128::from(flat_to_tower_u128(
+                legacy.s_out_lane_dec[lane][0]
+            )))
+        );
+        assert_eq!(
+            claims.state_lane_dec,
+            std::array::from_fn(|lane| Block128::from(flat_to_tower_u128(
+                legacy.state_lane_dec[lane][0]
+            )))
+        );
+    }
+
+    #[test]
+    fn production_shape_keeps_public_schedule_storage_sublinear_in_cells() {
+        let live_slots = 256 * N_SPINE_SLOTS;
+        let num_vars = num_vars_for(live_slots);
+        assert_eq!(num_vars, 22);
+        let schedules =
+            BlockPublicFlatSchedules::new(&vec![Block128::ZERO; num_vars], live_slots, num_vars);
+        let resident_entries = schedules.live_slot.len()
+            + schedules.u_slot.len()
+            + schedules.u_inner.len()
+            + schedules.sigma_dec_inner.len()
+            + schedules.rc_dec_inner.len()
+            + schedules
+                .mds_lane_dec_inner
+                .iter()
+                .map(Vec::len)
+                .sum::<usize>()
+            + schedules
+                .sigma_lane_dec_inner
+                .iter()
+                .map(Vec::len)
+                .sum::<usize>();
+        assert_eq!(schedules.live_slot.len(), 8_192);
+        assert_eq!(schedules.u_inner.len(), 512);
+        assert_eq!(resident_entries, 2 * 8_192 + 11 * 512);
+        assert!(resident_entries < (1usize << num_vars) / 100);
+    }
+
+    #[test]
+    fn flat_fold_releases_truncated_capacity() {
+        let mut table = vec![0u128; 1 << 16];
+        let original_capacity = table.capacity();
+        fold_flat_inplace(&mut table, 7);
+        assert_eq!(table.len(), 1 << 15);
+        assert!(table.capacity() < original_capacity);
     }
 
     #[test]
