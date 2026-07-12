@@ -17,9 +17,10 @@ use std::fs::OpenOptions;
 use noid_recursive::acceptance::block_class::BlockClass;
 use noid_recursive::acceptance::split_link::{CanonicalSplitLinkLadder, SplitLinkClass};
 use noid_recursive::class_registry::{
-    MAX_SELECTED_RECURSIVE_CLASS_REGISTRY_BYTES, OwnedSelectedRecursiveClassRegistry,
-    SelectedRecursiveClassRegistryError, decode_selected_recursive_class_registry_pinned,
-    encode_selected_recursive_class_registry,
+    decode_selected_recursive_class_registry_pinned,
+    decode_selected_recursive_terminal_registry_pinned, encode_selected_recursive_class_registry,
+    OwnedSelectedRecursiveClassRegistry, OwnedSelectedRecursiveTerminalRegistry,
+    SelectedRecursiveClassRegistryError, MAX_SELECTED_RECURSIVE_CLASS_REGISTRY_BYTES,
 };
 use noid_recursive::{CanonicalSelectedHistoryRegistry, SelectedHistoryRegistryError};
 use thiserror::Error;
@@ -97,6 +98,24 @@ impl LoadedSelectedRecursiveClassRegistry {
     }
 }
 
+/// Relay-only pinned registry.  Its Link classes retain the mandatory Link
+/// sidecar VK but only compact selected-ZK Block identities, so no Block VK
+/// fixed-table bank can become a node-RAM baseline.
+pub struct LoadedSelectedRecursiveTerminalRegistry {
+    registry: OwnedSelectedRecursiveTerminalRegistry,
+}
+
+impl LoadedSelectedRecursiveTerminalRegistry {
+    pub fn terminal_registry(
+        &self,
+    ) -> Result<CanonicalSelectedHistoryRegistry<'_>, SelectedHistoryRegistryError> {
+        CanonicalSelectedHistoryRegistry::try_new(
+            self.registry.descriptor(),
+            self.registry.link_classes(),
+        )
+    }
+}
+
 /// Fixed-path, fail-closed registry source.  The root is trusted local
 /// configuration; both the `v1` directory and leaf reject symlinks.
 pub struct LocalSelectedRecursiveClassRegistryStore {
@@ -134,10 +153,29 @@ impl LocalSelectedRecursiveClassRegistryStore {
         expected_registry_digest: [u8; 32],
     ) -> Result<LoadedSelectedRecursiveClassRegistry, LocalSelectedRecursiveClassRegistryError>
     {
+        let bytes = self.read_artifact_bytes()?;
+        let registry =
+            decode_selected_recursive_class_registry_pinned(&bytes, expected_registry_digest)?;
+        Ok(LoadedSelectedRecursiveClassRegistry { registry })
+    }
+
+    /// Load the same fd-anchored artifact through the terminal-only pinned
+    /// decoder.  This API intentionally exposes no Block/prover class view.
+    pub fn load_terminal_pinned(
+        &self,
+        expected_registry_digest: [u8; 32],
+    ) -> Result<LoadedSelectedRecursiveTerminalRegistry, LocalSelectedRecursiveClassRegistryError>
+    {
+        let bytes = self.read_artifact_bytes()?;
+        let registry =
+            decode_selected_recursive_terminal_registry_pinned(&bytes, expected_registry_digest)?;
+        Ok(LoadedSelectedRecursiveTerminalRegistry { registry })
+    }
+
+    fn read_artifact_bytes(&self) -> Result<Vec<u8>, LocalSelectedRecursiveClassRegistryError> {
         #[cfg(not(unix))]
         {
-            let _ = expected_registry_digest;
-            return Err(LocalSelectedRecursiveClassRegistryError::UnsupportedPlatform);
+            Err(LocalSelectedRecursiveClassRegistryError::UnsupportedPlatform)
         }
         #[cfg(unix)]
         {
@@ -185,11 +223,7 @@ impl LocalSelectedRecursiveClassRegistryStore {
             if !same_file_and_length(&opened, &after) {
                 return Err(LocalSelectedRecursiveClassRegistryError::ArtifactChanged { path });
             }
-            drop(file);
-
-            let registry =
-                decode_selected_recursive_class_registry_pinned(&bytes, expected_registry_digest)?;
-            Ok(LoadedSelectedRecursiveClassRegistry { registry })
+            Ok(bytes)
         }
     }
 
@@ -455,6 +489,10 @@ mod tests {
         fs::write(store.artifact_path(), [0u8; 9]).unwrap();
         assert!(matches!(
             store.load_pinned([0u8; 32]),
+            Err(LocalSelectedRecursiveClassRegistryError::ArtifactTooLarge { actual: 9, max: 8 })
+        ));
+        assert!(matches!(
+            store.load_terminal_pinned([0u8; 32]),
             Err(LocalSelectedRecursiveClassRegistryError::ArtifactTooLarge { actual: 9, max: 8 })
         ));
     }

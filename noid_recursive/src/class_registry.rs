@@ -25,10 +25,13 @@ use crate::acceptance::block_class::{BlockClass, BlockProofError};
 use crate::acceptance::split_link::{
     CanonicalLadderError, CanonicalSplitLinkLadder, LadderSlotInfo, LinkProofError, SplitLinkClass,
 };
+use crate::acceptance::trace::r_pcs_region::canonical_selected_link_region_sidecar_vk;
 use crate::region_sidecar::{
-    BlockRegionSidecarVk, CombinedDuplexRegionDescriptor, CombinedDuplexRegionVk,
-    CombinedDuplexSubChannelDescriptor, LinkRegionSidecarVk, MerkleRegionFamily, MerkleRegionVk,
-    RegionSidecarError, SelectedZkBlockRegionVkSlices, COMBINED_DUPLEX_REGION_COMMITTED_COLUMNS,
+    selected_zk_block_post_commit_class_digest_from_vk_digest,
+    selected_zk_block_vk_digest_from_child_digests, BlockRegionSidecarVk,
+    CombinedDuplexRegionDescriptor, CombinedDuplexRegionVk, CombinedDuplexSubChannelDescriptor,
+    LinkRegionSidecarVk, MerkleRegionFamily, MerkleRegionVk, RegionSidecarError,
+    SelectedZkBlockRegionVkSlices, COMBINED_DUPLEX_REGION_COMMITTED_COLUMNS,
     MAX_COMBINED_DUPLEX_CHALLENGES, MAX_COMBINED_DUPLEX_DATA_LANES,
     MAX_COMBINED_DUPLEX_SCHEDULE_OPS, MAX_COMBINED_DUPLEX_SUBCHANNELS,
     MAX_COMBINED_DUPLEX_SUBCHANNEL_SLOTS, MAX_COMBINED_DUPLEX_TX_TILE_LOG,
@@ -50,6 +53,13 @@ const CLASS_COUNT: usize = USER_TX_CLASS_TIERS.len();
 const MAX_PUBLIC_IO_CLAIMS: usize = 16;
 const MAX_GENESIS_PACKAGE_BYTES: usize = MAX_SELECTED_HISTORY_TERMINAL_PACKAGE_BYTES;
 const MAX_MERKLE_FAMILIES: usize = 64;
+const TERMINAL_LINK_TILE_LOG: usize = 8;
+const TERMINAL_LINK_SUBCHANNELS: usize = 4;
+const TERMINAL_LINK_SCHEDULE_OPS: usize = 1;
+const TERMINAL_LINK_MAX_LANES_PER_SUBCHANNEL: usize = 32;
+const TERMINAL_LINK_PATH_W_LOG: usize = 15;
+const TERMINAL_LINK_PATH_BLOCK_LOG: usize = 7;
+const TERMINAL_LINK_PATH_FAMILIES: usize = 4;
 
 /// An owned registry decoded from local release material.  It contains no
 /// `FieldR1cs`, sample Block envelope, witness, or per-tier proof.
@@ -78,6 +88,27 @@ impl OwnedSelectedRecursiveClassRegistry {
             &self.descriptor,
             &self.link_classes,
         )
+    }
+}
+
+/// Relay-only materialization of the same externally pinned release body.
+///
+/// It owns the canonical ladder and four Link verifier classes but no
+/// `BlockClass` or `BlockRegionSidecarVk`.  Nested Block accumulator claims
+/// remain bound to the exact per-slot matrix identities in the ladder and are
+/// still discharged by the terminal verifier's streaming matrix source.
+pub struct OwnedSelectedRecursiveTerminalRegistry {
+    descriptor: CanonicalSplitLinkLadder,
+    link_classes: [SplitLinkClass; CLASS_COUNT],
+}
+
+impl OwnedSelectedRecursiveTerminalRegistry {
+    pub fn descriptor(&self) -> &CanonicalSplitLinkLadder {
+        &self.descriptor
+    }
+
+    pub fn link_classes(&self) -> &[SplitLinkClass; CLASS_COUNT] {
+        &self.link_classes
     }
 }
 
@@ -312,6 +343,30 @@ pub fn decode_selected_recursive_class_registry_pinned(
     preflight_registry_body(body)?;
     let wire = decode_registry_body(body)?;
     materialize_registry(wire)
+}
+
+/// Decode the same release artifact into the strictly verifier-only registry.
+///
+/// The external digest is checked before the allocation-bearing body decode,
+/// exactly as in the full loader.  A second terminal preflight additionally
+/// caps Link topology to the frozen production geometry; materialization then
+/// rebuilds that geometry from the canonical PCS ladder and rejects any wire
+/// descriptor that differs from it.  Block child VKs are represented only by
+/// their ordered, pinned aggregate identities and never expanded.
+pub fn decode_selected_recursive_terminal_registry_pinned(
+    bytes: &[u8],
+    expected_registry_digest: [u8; 32],
+) -> Result<OwnedSelectedRecursiveTerminalRegistry, SelectedRecursiveClassRegistryError> {
+    let (body, actual_registry_digest) = preflight_artifact(bytes)?;
+    if actual_registry_digest != expected_registry_digest {
+        return Err(SelectedRecursiveClassRegistryError::PinnedDigestMismatch {
+            expected: expected_registry_digest,
+            actual: actual_registry_digest,
+        });
+    }
+    preflight_terminal_registry_body(body)?;
+    let wire = decode_registry_body(body)?;
+    materialize_terminal_registry(wire)
 }
 
 /// Explicitly unpinned decoder for offline release generation and inspection.
@@ -596,6 +651,175 @@ fn materialize_registry(
     })
 }
 
+fn materialize_terminal_registry(
+    wire: RegistryWire,
+) -> Result<OwnedSelectedRecursiveTerminalRegistry, SelectedRecursiveClassRegistryError> {
+    for (slot, block) in wire.blocks.iter().enumerate() {
+        validate_terminal_block_wire(slot, block)?;
+    }
+
+    let descriptor = CanonicalSplitLinkLadder::try_new(
+        wire.descriptor_shape,
+        wire.descriptor_pcs,
+        wire.descriptor_slots.to_vec(),
+    )?;
+    for (slot, (info, block)) in descriptor.slots().iter().zip(&wire.blocks).enumerate() {
+        if info.tier != block.tier
+            || info.b_shape != block.shape
+            || info.b_digest != block.matrix_digest
+            || !same_pcs(&info.b_pcs_params, &block.pcs)
+            || info.b_post_commit_class_digest != block.post_commit_digest
+            || info.b_sidecar_vk_digest != block.vk_digest
+        {
+            return Err(SelectedRecursiveClassRegistryError::InvalidValue(
+                "terminal Block/ladder binding",
+            ));
+        }
+        if slot > 0 && block.tier == wire.blocks[slot - 1].tier {
+            return Err(SelectedRecursiveClassRegistryError::InvalidValue(
+                "terminal Block tier order",
+            ));
+        }
+    }
+
+    let block_params = descriptor
+        .slots()
+        .iter()
+        .map(|slot| slot.b_pcs_params.clone())
+        .collect::<Vec<_>>();
+    let canonical_link_vk = canonical_selected_link_region_sidecar_vk(
+        descriptor.link_pcs_params(),
+        &block_params,
+        wire.link_vk.leaf_slices,
+        wire.link_vk.path_slices,
+    )?;
+    if !link_vk_wire_matches_canonical(&wire.link_vk, &canonical_link_vk) {
+        return Err(SelectedRecursiveClassRegistryError::InvalidValue(
+            "terminal canonical Link sidecar VK",
+        ));
+    }
+    let sidecar_vk = Arc::new(canonical_link_vk);
+
+    let package = decode_selected_history_terminal_package(&wire.genesis_package)?;
+    if package.terminal_height() != 0
+        || package.terminal_hash() != [0u8; 32]
+        || package.canonical_tip_slot() != 0
+        || package.canonical_tip_tier() != USER_TX_CLASS_TIERS[0]
+    {
+        return Err(SelectedRecursiveClassRegistryError::InvalidValue(
+            "genesis package metadata",
+        ));
+    }
+    let genesis_envelope = Arc::new(package.into_terminal_envelope());
+
+    let links_vec = wire
+        .links
+        .into_iter()
+        .enumerate()
+        .map(|(slot, link)| {
+            let block = &wire.blocks[slot];
+            if link.slot != slot
+                || link.sidecar_vk_digest != sidecar_vk.transcript_digest()
+                || !same_spec(&link.b_spec, &block.spec)
+                || !same_pcs(&link.b_pcs, &block.pcs)
+                || link.b_sidecar_vk_digest != block.vk_digest
+                || link.b_post_commit_digest != block.post_commit_digest
+            {
+                return Err(SelectedRecursiveClassRegistryError::InvalidValue(
+                    "terminal Link/Block binding",
+                ));
+            }
+            SplitLinkClass::from_selected_terminal_registry_parts(
+                &descriptor,
+                slot,
+                link.shape,
+                link.pcs,
+                link.spec,
+                link.matrix_digest,
+                link.post_commit_digest,
+                link.genesis_digest,
+                link.genesis_post_commit_digest,
+                Arc::clone(&sidecar_vk),
+                Arc::clone(&genesis_envelope),
+                link.b_spec,
+                link.b_pcs,
+                link.b_sidecar_vk_digest,
+                link.b_post_commit_digest,
+            )
+            .map_err(|source| SelectedRecursiveClassRegistryError::Link { slot, source })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let links: [SplitLinkClass; CLASS_COUNT] = links_vec
+        .try_into()
+        .map_err(|_| SelectedRecursiveClassRegistryError::InvalidValue("Link count"))?;
+    descriptor.validate_materialized(&links)?;
+    Ok(OwnedSelectedRecursiveTerminalRegistry {
+        descriptor,
+        link_classes: links,
+    })
+}
+
+fn validate_terminal_block_wire(
+    slot: usize,
+    wire: &BlockWire,
+) -> Result<(), SelectedRecursiveClassRegistryError> {
+    let expected_tier = USER_TX_CLASS_TIERS[slot];
+    if wire.tier != expected_tier
+        || wire.config_bits != 0x1f
+        || wire.config_queries != noid_fri_binius::capsule::CAPSULE_NUM_QUERIES
+        || wire.config_tier != expected_tier
+        || !same_spec(&wire.spec, &crate::acceptance::block_class::block_io_spec())
+    {
+        return Err(SelectedRecursiveClassRegistryError::InvalidValue(
+            "terminal Block production config",
+        ));
+    }
+    let vk_digest = selected_zk_block_vk_digest_from_child_digests(&wire.child_vk_digests);
+    if vk_digest != wire.vk_digest {
+        return Err(SelectedRecursiveClassRegistryError::InvalidValue(
+            "terminal Block aggregate sidecar VK digest",
+        ));
+    }
+    let post_commit = selected_zk_block_post_commit_class_digest_from_vk_digest(
+        &wire.matrix_digest,
+        &wire.spec,
+        &wire.pcs,
+        wire.vk_digest,
+    );
+    if post_commit != wire.post_commit_digest {
+        return Err(SelectedRecursiveClassRegistryError::InvalidValue(
+            "terminal Block post-commit identity",
+        ));
+    }
+    Ok(())
+}
+
+fn link_vk_wire_matches_canonical(wire: &LinkVkWire, vk: &LinkRegionSidecarVk) -> bool {
+    let leaf = vk.leaf_a();
+    let leaf_descriptor = leaf.descriptor();
+    let leaf_matches = wire.leaf_purpose == *leaf.purpose()
+        && wire.leaf_tx_tile_log == leaf_descriptor.tx_tile_log()
+        && wire.leaf_slices == *leaf.slices()
+        && wire.leaf_digest == leaf.transcript_digest()
+        && wire.leaf_subchannels.len() == leaf_descriptor.subchannels().len()
+        && wire
+            .leaf_subchannels
+            .iter()
+            .zip(leaf_descriptor.subchannels())
+            .all(|(actual, expected)| {
+                actual.schedule == expected.schedule() && actual.iv == expected.iv_flat()
+            });
+    let path = vk.path_b();
+    leaf_matches
+        && wire.path_purpose == *path.purpose()
+        && wire.path_w_log == path.w_log()
+        && wire.path_block_log == path.block_log()
+        && wire.path_slices == *path.slices()
+        && wire.path_families == path.families()
+        && wire.path_digest == path.transcript_digest()
+        && wire.vk_digest == vk.transcript_digest()
+}
+
 fn materialize_block(
     slot: usize,
     wire: BlockWire,
@@ -681,6 +905,15 @@ fn same_pcs(left: &PcsParams, right: &PcsParams) -> bool {
         && left.profile == right.profile
 }
 
+fn same_spec(left: &PublicIoSpec, right: &PublicIoSpec) -> bool {
+    left.io_slice == right.io_slice
+        && left.io_len == right.io_len
+        && left.claims.len() == right.claims.len()
+        && left.claims.iter().zip(&right.claims).all(|(left, right)| {
+            left.slice == right.slice && left.point == right.point && left.value == right.value
+        })
+}
+
 fn encode_registry_body(out: &mut Writer, wire: &RegistryWire) {
     out.u8(CLASS_COUNT as u8);
     for block in &wire.blocks {
@@ -746,6 +979,116 @@ fn preflight_registry_body(bytes: &[u8]) -> Result<(), SelectedRecursiveClassReg
     }
     input.byte_slice("genesis package", MAX_GENESIS_PACKAGE_BYTES)?;
     input.finish()
+}
+
+/// Allocation-free verifier-only preflight.  It parses the complete body but
+/// replaces the generic Link-VK expansion caps with the exact production
+/// rate-1/4 four-tree topology.  Consequently even a caller-authorized bad
+/// artifact cannot allocate the generic 64-channel/2^22-fixed-cell envelope
+/// before canonical reconstruction rejects it.
+fn preflight_terminal_registry_body(
+    bytes: &[u8],
+) -> Result<(), SelectedRecursiveClassRegistryError> {
+    let mut input = Reader::new(bytes);
+    input.exact_count("Block count", CLASS_COUNT)?;
+    for _ in 0..CLASS_COUNT {
+        preflight_block(&mut input)?;
+    }
+    preflight_shape(&mut input)?;
+    preflight_pcs(&mut input)?;
+    input.exact_count("ladder slot count", CLASS_COUNT)?;
+    for _ in 0..CLASS_COUNT {
+        preflight_ladder_slot(&mut input)?;
+    }
+    preflight_terminal_link_vk(&mut input)?;
+    input.exact_count("Link count", CLASS_COUNT)?;
+    for _ in 0..CLASS_COUNT {
+        preflight_link(&mut input)?;
+    }
+    input.byte_slice("genesis package", MAX_GENESIS_PACKAGE_BYTES)?;
+    input.finish()
+}
+
+fn preflight_terminal_link_vk(
+    input: &mut Reader<'_>,
+) -> Result<(), SelectedRecursiveClassRegistryError> {
+    input.take(32)?;
+    if input.usize_u8()? != TERMINAL_LINK_TILE_LOG {
+        return Err(SelectedRecursiveClassRegistryError::InvalidValue(
+            "terminal Link tile log",
+        ));
+    }
+    let channel_count = input.len_u16("terminal Link subchannels", TERMINAL_LINK_SUBCHANNELS)?;
+    if channel_count != TERMINAL_LINK_SUBCHANNELS {
+        return Err(SelectedRecursiveClassRegistryError::InvalidValue(
+            "terminal Link subchannel count",
+        ));
+    }
+    for _ in 0..channel_count {
+        let op_count = input.len_u16("terminal Link schedule", TERMINAL_LINK_SCHEDULE_OPS)?;
+        if op_count != TERMINAL_LINK_SCHEDULE_OPS || input.u8()? != 0 {
+            return Err(SelectedRecursiveClassRegistryError::InvalidValue(
+                "terminal Link absorb-only schedule",
+            ));
+        }
+        let lane_count = input.len_u16(
+            "terminal Link absorb lanes",
+            TERMINAL_LINK_MAX_LANES_PER_SUBCHANNEL,
+        )?;
+        if lane_count == 0 {
+            return Err(SelectedRecursiveClassRegistryError::InvalidValue(
+                "terminal Link empty absorb",
+            ));
+        }
+        for _ in 0..lane_count {
+            match input.u8()? {
+                0 => {}
+                1 => {
+                    input.take(16)?;
+                }
+                _ => {
+                    return Err(SelectedRecursiveClassRegistryError::InvalidValue(
+                        "terminal Link lane tag",
+                    ))
+                }
+            }
+        }
+        input.take(2 * 16)?;
+    }
+    input.take(COMBINED_DUPLEX_REGION_COMMITTED_COLUMNS * 9)?;
+    input.take(32 + 32)?;
+    if input.usize_u8()? != TERMINAL_LINK_PATH_W_LOG
+        || input.usize_u8()? != TERMINAL_LINK_PATH_BLOCK_LOG
+    {
+        return Err(SelectedRecursiveClassRegistryError::InvalidValue(
+            "terminal Link path geometry",
+        ));
+    }
+    input.take(MERKLE_REGION_COMMITTED_COLUMNS * 9)?;
+    let family_count =
+        input.len_u8("terminal Link Merkle families", TERMINAL_LINK_PATH_FAMILIES)?;
+    if family_count != TERMINAL_LINK_PATH_FAMILIES {
+        return Err(SelectedRecursiveClassRegistryError::InvalidValue(
+            "terminal Link Merkle family count",
+        ));
+    }
+    for _ in 0..family_count {
+        match input.u8()? {
+            0 | 1 => {
+                input.take(4 + 2 + 4 + 2 * 16)?;
+            }
+            2 => {
+                input.take(4 + 4 + 2 * 16)?;
+            }
+            _ => {
+                return Err(SelectedRecursiveClassRegistryError::InvalidValue(
+                    "terminal Link Merkle family tag",
+                ))
+            }
+        }
+    }
+    input.take(32 + 32)?;
+    Ok(())
 }
 
 fn preflight_block(input: &mut Reader<'_>) -> Result<(), SelectedRecursiveClassRegistryError> {
@@ -1820,6 +2163,19 @@ mod tests {
         }
     }
 
+    fn canonical_terminal_link_wire() -> LinkVkWire {
+        let link_params = fixture_pcs(24);
+        let block_params = crate::acceptance::split_link::CANONICAL_BLOCK_CLASS_MS.map(fixture_pcs);
+        let vk = canonical_selected_link_region_sidecar_vk(
+            &link_params,
+            &block_params,
+            fixture_slices(14, 70),
+            fixture_slices(15, 80),
+        )
+        .expect("canonical terminal Link VK");
+        link_vk_wire(&vk).expect("compact canonical Link VK wire")
+    }
+
     #[test]
     fn outer_artifact_roundtrip_and_tamper_fail_closed() {
         let body = b"compact-registry-fixture".to_vec();
@@ -1871,6 +2227,63 @@ mod tests {
             expected.links[3].post_commit_digest
         );
         assert_eq!(actual.genesis_package, expected.genesis_package);
+    }
+
+    #[test]
+    fn terminal_preflight_accepts_only_the_bounded_canonical_link_topology() {
+        let mut wire = fixture_wire();
+        wire.link_vk = canonical_terminal_link_wire();
+        let mut writer = Writer::new();
+        encode_registry_body(&mut writer, &wire);
+        let canonical = writer.finish();
+        preflight_terminal_registry_body(&canonical).expect("canonical terminal topology");
+
+        wire.link_vk.leaf_subchannels.push(SubchannelWire {
+            schedule: vec![TranscriptOp::Absorb(vec![None; 2])],
+            iv: [F128::ZERO; 2],
+        });
+        let mut writer = Writer::new();
+        encode_registry_body(&mut writer, &wire);
+        assert!(matches!(
+            preflight_terminal_registry_body(&writer.finish()),
+            Err(SelectedRecursiveClassRegistryError::InvalidLength {
+                field: "terminal Link subchannels",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn terminal_block_identity_binds_ordered_children_matrix_and_post_commit() {
+        let mut block = fixture_block(0);
+        block.spec = crate::acceptance::block_class::block_io_spec();
+        block.child_vk_digests = std::array::from_fn(|child| [child as u8 + 1; 32]);
+        block.vk_digest = selected_zk_block_vk_digest_from_child_digests(&block.child_vk_digests);
+        block.post_commit_digest = selected_zk_block_post_commit_class_digest_from_vk_digest(
+            &block.matrix_digest,
+            &block.spec,
+            &block.pcs,
+            block.vk_digest,
+        );
+        validate_terminal_block_wire(0, &block).expect("compact Block identity");
+
+        let mut reordered = block.clone();
+        reordered.child_vk_digests.swap(0, 1);
+        assert!(matches!(
+            validate_terminal_block_wire(0, &reordered),
+            Err(SelectedRecursiveClassRegistryError::InvalidValue(
+                "terminal Block aggregate sidecar VK digest"
+            ))
+        ));
+
+        let mut wrong_matrix = block;
+        wrong_matrix.matrix_digest[0] ^= 1;
+        assert!(matches!(
+            validate_terminal_block_wire(0, &wrong_matrix),
+            Err(SelectedRecursiveClassRegistryError::InvalidValue(
+                "terminal Block post-commit identity"
+            ))
+        ));
     }
 
     #[test]

@@ -682,6 +682,70 @@ pub fn block_post_commit_class_digest(
     pcs_params: &PcsParams,
     sidecar_vk: &BlockRegionSidecarVk,
 ) -> [u8; 32] {
+    block_post_commit_class_digest_from_vk_digest(
+        matrix_digest,
+        spec,
+        pcs_params,
+        sidecar_vk.version(),
+        sidecar_vk.transcript_digest(),
+    )
+}
+
+/// Recompute the selected-ZK Block composite identity from the compact VK
+/// digest carried by an externally pinned class registry.
+///
+/// This is deliberately fixed to the selected-ZK version and domain.  It is
+/// used by terminal-only registry materialization, which never verifies a
+/// standalone Block sidecar and therefore does not need the large child VK
+/// tables resident.  Prover materialization continues to rebuild the full VK.
+pub(crate) fn selected_zk_block_post_commit_class_digest_from_vk_digest(
+    matrix_digest: &[u8; 32],
+    spec: &PublicIoSpec,
+    pcs_params: &PcsParams,
+    sidecar_vk_digest: [u8; 32],
+) -> [u8; 32] {
+    block_post_commit_class_digest_from_vk_digest(
+        matrix_digest,
+        spec,
+        pcs_params,
+        BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION,
+        sidecar_vk_digest,
+    )
+}
+
+/// Rebuild the aggregate selected-ZK Block VK identity without expanding any
+/// child key.  The ordered child identities are already authenticated by the
+/// external registry pin; this check prevents an inconsistent aggregate
+/// carrier from entering the terminal class binding.
+pub(crate) fn selected_zk_block_vk_digest_from_child_digests(child: &[[u8; 32]; 6]) -> [u8; 32] {
+    let version = [BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION];
+    poseidon2b_hash_byte_slices(
+        BLOCK_REGION_SELECTED_ZK_VK_DIGEST_DOMAIN,
+        &[
+            &version,
+            b"wallet-a",
+            &child[0],
+            b"meta-a",
+            &child[1],
+            b"wallet-b",
+            &child[2],
+            b"meta-b",
+            &child[3],
+            b"owner-c",
+            &child[4],
+            b"main-c",
+            &child[5],
+        ],
+    )
+}
+
+fn block_post_commit_class_digest_from_vk_digest(
+    matrix_digest: &[u8; 32],
+    spec: &PublicIoSpec,
+    pcs_params: &PcsParams,
+    sidecar_vk_version: u8,
+    sidecar_vk_digest: [u8; 32],
+) -> [u8; 32] {
     let mut spec_bytes = Vec::new();
     push_u64(&mut spec_bytes, spec.io_slice.log2_len);
     push_u64(&mut spec_bytes, spec.io_slice.index);
@@ -703,7 +767,7 @@ pub fn block_post_commit_class_digest(
     push_u64(&mut pcs_bytes, profile.len());
     pcs_bytes.extend_from_slice(profile);
 
-    let (domain, role) = match sidecar_vk.version() {
+    let (domain, role) = match sidecar_vk_version {
         BLOCK_REGION_SIDECAR_VERSION => (BLOCK_POST_COMMIT_CLASS_DIGEST_DOMAIN, b"block" as &[u8]),
         BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION => (
             BLOCK_SELECTED_ZK_POST_COMMIT_CLASS_DIGEST_DOMAIN,
@@ -714,7 +778,7 @@ pub fn block_post_commit_class_digest(
             b"unsupported" as &[u8],
         ),
     };
-    let version = [sidecar_vk.version()];
+    let version = [sidecar_vk_version];
     poseidon2b_hash_byte_slices(
         domain,
         &[
@@ -723,7 +787,7 @@ pub fn block_post_commit_class_digest(
             matrix_digest,
             &spec_bytes,
             &pcs_bytes,
-            &sidecar_vk.transcript_digest(),
+            &sidecar_vk_digest,
         ],
     )
 }
@@ -1623,6 +1687,37 @@ mod tests {
                 .expect("compact carrier must regenerate the canonical VK");
             assert_eq!(restored, original);
             assert_eq!(restored.transcript_digest(), original.transcript_digest());
+            let child = [
+                original.wallet_a().transcript_digest(),
+                original.meta_a().transcript_digest(),
+                original.wallet_b().transcript_digest(),
+                original.meta_b().transcript_digest(),
+                original.owner_c().transcript_digest(),
+                original.main_c().transcript_digest(),
+            ];
+            assert_eq!(
+                selected_zk_block_vk_digest_from_child_digests(&child),
+                original.transcript_digest(),
+                "compact aggregate digest must be transcript-identical"
+            );
+            let matrix_digest = [tier as u8; 32];
+            let spec = crate::acceptance::block_class::block_io_spec();
+            let pcs = PcsParams {
+                m: selected_zk_block_geometry(tier).unwrap().main_w_log + 12,
+                log_inv_rate: 2,
+                log_batch_size: 5,
+                profile: Default::default(),
+            };
+            assert_eq!(
+                selected_zk_block_post_commit_class_digest_from_vk_digest(
+                    &matrix_digest,
+                    &spec,
+                    &pcs,
+                    original.transcript_digest(),
+                ),
+                block_post_commit_class_digest(&matrix_digest, &spec, &pcs, &original),
+                "compact post-commit computation must be transcript-identical"
+            );
         }
     }
 

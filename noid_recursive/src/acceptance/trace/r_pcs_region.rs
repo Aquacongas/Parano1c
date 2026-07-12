@@ -822,6 +822,83 @@ fn combined_leaf_descriptor(
     CombinedDuplexRegionDescriptor::new(tx_tile_log, subchannels)
 }
 
+/// Rebuild the unique production Link sidecar VK from the canonical PCS
+/// ladder and the compact outer-witness slices retained by the registry.
+///
+/// Unlike the general manual VK codec this constructor admits no caller-
+/// selected schedule or Merkle family topology.  Terminal-only registry
+/// loading uses it to keep the materialization bound tied to the four frozen
+/// BaseFold tree positions instead of the much larger generic codec caps.
+pub(crate) fn canonical_selected_link_region_sidecar_vk(
+    link_params: &PcsParams,
+    block_params: &[PcsParams],
+    leaf_slices: [WitnessSlice; 6],
+    path_slices: [WitnessSlice; N_COMMITTED_B],
+) -> Result<LinkRegionSidecarVk, RegionSidecarError> {
+    if !(1..=5).contains(&link_params.log_inv_rate) {
+        return Err(RegionSidecarError::UnsupportedVkShape);
+    }
+    let n_queries = pcs::default_fri_queries(link_params.log_inv_rate);
+    let geometry = RPcsLinkUniversalGeometry::new(link_params, block_params, n_queries)?;
+
+    let leaf = CombinedDuplexRegionVk::new(
+        link_r_pcs_leaf_sidecar_purpose(),
+        combined_leaf_descriptor(&geometry)?,
+        leaf_slices,
+    )?;
+
+    let carrier_depths = geometry.path_carrier_depths()?;
+    let block_log = geometry.path_block_log()?;
+    let mut offset = 0usize;
+    let mut families = Vec::with_capacity(carrier_depths.len());
+    for depth in carrier_depths {
+        families.push(MerkleRegionFamily::FeedForward {
+            offset,
+            depth,
+            n_paths: 1,
+            iv: pcs_node_iv_flat(),
+        });
+        offset = offset
+            .checked_add(
+                depth
+                    .checked_next_power_of_two()
+                    .ok_or(RegionSidecarError::BadVk)?,
+            )
+            .ok_or(RegionSidecarError::BadVk)?;
+    }
+    if offset
+        .checked_next_power_of_two()
+        .ok_or(RegionSidecarError::BadVk)?
+        .trailing_zeros() as usize
+        != block_log
+    {
+        return Err(RegionSidecarError::BadVk);
+    }
+    let live_blocks = 2usize
+        .checked_mul(n_queries)
+        .ok_or(RegionSidecarError::BadVk)?;
+    let blocks = live_blocks
+        .max(1)
+        .checked_next_power_of_two()
+        .ok_or(RegionSidecarError::BadVk)?;
+    let block = 1usize
+        .checked_shl(block_log as u32)
+        .ok_or(RegionSidecarError::BadVk)?;
+    let cells = blocks.checked_mul(block).ok_or(RegionSidecarError::BadVk)?;
+    let w_log = cells.trailing_zeros() as usize;
+    if !cells.is_power_of_two() {
+        return Err(RegionSidecarError::BadVk);
+    }
+    let path = MerkleRegionVk::new(
+        link_r_pcs_path_sidecar_purpose(),
+        w_log,
+        path_slices,
+        block_log,
+        families,
+    )?;
+    LinkRegionSidecarVk::new(leaf, path)
+}
+
 #[allow(dead_code)]
 fn build_recording_free_link_assembly(
     proofs: &[RPcsProof<'_>],
@@ -1934,6 +2011,53 @@ mod tests {
                 Err(RegionSidecarError::UnsupportedVkShape)
             ),
             "query-count drift must fail before column allocation"
+        );
+    }
+
+    #[test]
+    fn terminal_link_vk_reconstruction_has_exact_small_fixed_table_footprint() {
+        let params = |field_m| PcsParams {
+            m: field_m + LOG_PACKING,
+            log_inv_rate: 2,
+            log_batch_size: 5,
+            profile: Default::default(),
+        };
+        let link = params(24);
+        let blocks = [params(22), params(23), params(23), params(24)];
+        let leaf_slices = std::array::from_fn(|column| WitnessSlice {
+            log2_len: 14,
+            index: 10 + column,
+        });
+        let path_slices = std::array::from_fn(|column| WitnessSlice {
+            log2_len: 15,
+            index: 20 + column,
+        });
+        let vk =
+            canonical_selected_link_region_sidecar_vk(&link, &blocks, leaf_slices, path_slices)
+                .expect("canonical terminal Link VK");
+
+        assert_eq!(vk.leaf_a().descriptor().subchannels().len(), 4);
+        assert_eq!(vk.leaf_a().descriptor().tx_tile_log(), 8);
+        assert_eq!(vk.leaf_a().block_log(), 6);
+        assert_eq!(vk.leaf_a().w_log(), 14);
+        assert_eq!(
+            vk.leaf_a()
+                .fixed()
+                .iter()
+                .map(|pattern| pattern.table.len())
+                .sum::<usize>(),
+            448
+        );
+        assert_eq!(vk.path_b().families().len(), 4);
+        assert_eq!(vk.path_b().block_log(), 7);
+        assert_eq!(vk.path_b().w_log(), 15);
+        assert_eq!(
+            vk.path_b()
+                .fixed()
+                .iter()
+                .map(|pattern| pattern.table.len())
+                .sum::<usize>(),
+            3_072
         );
     }
 

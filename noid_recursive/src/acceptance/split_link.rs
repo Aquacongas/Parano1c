@@ -89,8 +89,8 @@ use super::trace::self_verify::{
 use super::trace::{mul, pin_eq};
 use crate::accumulator::{genesis_accumulator, ChainAccumulator, ChainAccumulatorLaneError};
 use crate::region_sidecar::{
-    block_post_commit_class_digest, decode_block_region_sidecar_bounded,
-    decode_link_region_sidecar_bounded, link_post_commit_class_digest,
+    decode_block_region_sidecar_bounded, decode_link_region_sidecar_bounded,
+    link_post_commit_class_digest, selected_zk_block_post_commit_class_digest_from_vk_digest,
     verify_block_region_sidecar_post_commit, verify_block_region_sidecar_trace_post_commit,
     verify_link_region_sidecar_post_commit, verify_link_region_sidecar_trace_post_commit,
     LinkRegionProverPlan, LinkRegionSidecarProof, LinkRegionSidecarVk, RegionSidecarError,
@@ -1220,7 +1220,13 @@ pub struct SplitLinkClass {
     post_commit_class_digest: std::sync::OnceLock<[u8; 32]>,
     genesis_post_commit_class_digest: std::sync::OnceLock<[u8; 32]>,
     genesis_envelope: std::sync::OnceLock<Arc<LinkProofEnvelope>>,
-    b_sidecar_vk: Arc<crate::region_sidecar::BlockRegionSidecarVk>,
+    /// Present only in prover-capable materialization.  Terminal verification
+    /// needs the pinned aggregate identity, not the child Block VK tables:
+    /// the nested Block proof has already been verified inside the Link
+    /// relation and live Block accumulator lanes are discharged separately
+    /// against their exact structural matrix digests.
+    b_sidecar_vk: Option<Arc<crate::region_sidecar::BlockRegionSidecarVk>>,
+    b_sidecar_vk_digest: [u8; 32],
     b_post_commit_class_digest: [u8; 32],
 }
 
@@ -1275,6 +1281,106 @@ impl SplitLinkClass {
         {
             return Err(LinkProofError::ClassIdentityMismatch);
         }
+        Self::from_selected_registry_parts_inner(
+            descriptor,
+            slot,
+            shape,
+            pcs_params,
+            spec,
+            matrix_digest,
+            post_commit_class_digest,
+            genesis_digest,
+            genesis_post_commit_class_digest,
+            sidecar_vk,
+            genesis_envelope,
+            b_spec,
+            b_pcs_params,
+            Some(block_class.sidecar_vk_arc()),
+            b_sidecar_vk_digest,
+            b_post_commit_class_digest,
+        )
+    }
+
+    /// Rehydrate the relay-only Link authority without materializing a Block
+    /// VK.  All supplied identities are compact fields of the same externally
+    /// pinned registry body and are cross-checked against the canonical ladder
+    /// before this class can escape.  Prover preparation rejects this backend.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_selected_terminal_registry_parts(
+        descriptor: &CanonicalSplitLinkLadder,
+        slot: usize,
+        shape: FieldShape,
+        pcs_params: PcsParams,
+        spec: PublicIoSpec,
+        matrix_digest: [u8; 32],
+        post_commit_class_digest: [u8; 32],
+        genesis_digest: [u8; 32],
+        genesis_post_commit_class_digest: [u8; 32],
+        sidecar_vk: Arc<LinkRegionSidecarVk>,
+        genesis_envelope: Arc<LinkProofEnvelope>,
+        b_spec: PublicIoSpec,
+        b_pcs_params: PcsParams,
+        b_sidecar_vk_digest: [u8; 32],
+        b_post_commit_class_digest: [u8; 32],
+    ) -> Result<Self, LinkProofError> {
+        let ladder_slot = descriptor
+            .slots()
+            .get(slot)
+            .ok_or(LinkProofError::ClassIdentityMismatch)?;
+        if shape != descriptor.link_shape()
+            || !same_pcs_params(&pcs_params, descriptor.link_pcs_params())
+            || !is_production_block_io_spec(&b_spec)
+            || !same_pcs_params(&b_pcs_params, &ladder_slot.b_pcs_params)
+            || b_sidecar_vk_digest != ladder_slot.b_sidecar_vk_digest
+            || b_post_commit_class_digest != ladder_slot.b_post_commit_class_digest
+            || selected_zk_block_post_commit_class_digest_from_vk_digest(
+                &ladder_slot.b_digest,
+                &b_spec,
+                &b_pcs_params,
+                b_sidecar_vk_digest,
+            ) != b_post_commit_class_digest
+        {
+            return Err(LinkProofError::ClassIdentityMismatch);
+        }
+        Self::from_selected_registry_parts_inner(
+            descriptor,
+            slot,
+            shape,
+            pcs_params,
+            spec,
+            matrix_digest,
+            post_commit_class_digest,
+            genesis_digest,
+            genesis_post_commit_class_digest,
+            sidecar_vk,
+            genesis_envelope,
+            b_spec,
+            b_pcs_params,
+            None,
+            b_sidecar_vk_digest,
+            b_post_commit_class_digest,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_selected_registry_parts_inner(
+        descriptor: &CanonicalSplitLinkLadder,
+        slot: usize,
+        shape: FieldShape,
+        pcs_params: PcsParams,
+        spec: PublicIoSpec,
+        matrix_digest: [u8; 32],
+        post_commit_class_digest: [u8; 32],
+        genesis_digest: [u8; 32],
+        genesis_post_commit_class_digest: [u8; 32],
+        sidecar_vk: Arc<LinkRegionSidecarVk>,
+        genesis_envelope: Arc<LinkProofEnvelope>,
+        b_spec: PublicIoSpec,
+        b_pcs_params: PcsParams,
+        b_sidecar_vk: Option<Arc<crate::region_sidecar::BlockRegionSidecarVk>>,
+        b_sidecar_vk_digest: [u8; 32],
+        b_post_commit_class_digest: [u8; 32],
+    ) -> Result<Self, LinkProofError> {
         let expected_spec = split_io_spec(shape.k_log, descriptor.slots());
         if spec.io_slice != expected_spec.io_slice
             || spec.io_len != expected_spec.io_len
@@ -1328,7 +1434,8 @@ impl SplitLinkClass {
             post_commit_class_digest: post_commit_lock,
             genesis_post_commit_class_digest: genesis_post_commit_lock,
             genesis_envelope: genesis_envelope_lock,
-            b_sidecar_vk: block_class.sidecar_vk_arc(),
+            b_sidecar_vk,
+            b_sidecar_vk_digest,
             b_post_commit_class_digest,
         };
         class.validate_frozen_identity()?;
@@ -1463,7 +1570,8 @@ impl SplitLinkClass {
             post_commit_class_digest: std::sync::OnceLock::new(),
             genesis_post_commit_class_digest: std::sync::OnceLock::new(),
             genesis_envelope: std::sync::OnceLock::new(),
-            b_sidecar_vk: block_class.sidecar_vk_arc(),
+            b_sidecar_vk: Some(block_class.sidecar_vk_arc()),
+            b_sidecar_vk_digest: block_class.sidecar_vk().transcript_digest(),
             b_post_commit_class_digest: *block_class.post_commit_class_digest(),
         };
 
@@ -1997,16 +2105,16 @@ impl SplitLinkClass {
         if !is_production_block_io_spec(&self.b_spec)
             || self.b_pcs_params.m != slot.b_shape.m + noid_ivc_core::pcs::LOG_PACKING
             || !same_pcs_params(&self.b_pcs_params, &slot.b_pcs_params)
-            || self.b_sidecar_vk.transcript_digest() != slot.b_sidecar_vk_digest
+            || self.b_sidecar_vk_digest != slot.b_sidecar_vk_digest
             || self.b_post_commit_class_digest != slot.b_post_commit_class_digest
         {
             return Err(LinkProofError::ClassIdentityMismatch);
         }
-        let expected_block_post_commit = block_post_commit_class_digest(
+        let expected_block_post_commit = selected_zk_block_post_commit_class_digest_from_vk_digest(
             &slot.b_digest,
             &self.b_spec,
             &self.b_pcs_params,
-            &self.b_sidecar_vk,
+            self.b_sidecar_vk_digest,
         );
         if expected_block_post_commit != self.b_post_commit_class_digest {
             return Err(LinkProofError::ClassIdentityMismatch);
@@ -2245,6 +2353,9 @@ fn begin_split_link_native_preparation_inner<'a>(
     input: SplitLinkTraceInput<'a>,
     freeze: bool,
 ) -> Result<SplitLinkPreviousMatrixPhase<'a>, SplitLinkPreparationError> {
+    if class.b_sidecar_vk.is_none() {
+        return Err(SplitLinkPreparationError::ClassIdentity);
+    }
     if !freeze {
         class
             .validate_frozen_identity()
@@ -2423,6 +2534,10 @@ impl<'a> SplitLinkBlockMatrixPhase<'a> {
         let class = core.class;
         let slot = class.slot;
         let b_shape = class.ladder[slot].b_shape;
+        let b_sidecar_vk = class
+            .b_sidecar_vk
+            .as_deref()
+            .ok_or(SplitLinkPreparationError::ClassIdentity)?;
         validate_split_fold_matrix_identity(
             fold_matrix_block,
             b_shape,
@@ -2443,7 +2558,7 @@ impl<'a> SplitLinkBlockMatrixPhase<'a> {
             core.input.block.region_sidecar(),
             &mut ch_native,
             |sidecar, context| {
-                verify_block_region_sidecar_post_commit(&class.b_sidecar_vk, sidecar, context)
+                verify_block_region_sidecar_post_commit(b_sidecar_vk, sidecar, context)
                     .map_err(|_| VerifyError::Auxiliary)
             },
         )
@@ -2530,6 +2645,10 @@ fn assemble_prepared_split_link(prepared: PreparedSplitLink<'_>) -> BuiltSplitLi
     let slot = class.slot;
     let b_shape = class.ladder[slot].b_shape;
     let b_lane = &layout.b_lanes[slot];
+    let b_sidecar_vk = class
+        .b_sidecar_vk
+        .as_deref()
+        .expect("native preparation rejects terminal-only Link authorities");
 
     // ---- The two inner PCS carriers. Their openings are owned by the
     // post-commit link sidecar, not copied into public IO.
@@ -2721,7 +2840,7 @@ fn assemble_prepared_split_link(prepared: PreparedSplitLink<'_>) -> BuiltSplitLi
             verify_block_region_sidecar_trace_post_commit(
                 builder,
                 context,
-                &class.b_sidecar_vk,
+                b_sidecar_vk,
                 input.block.region_sidecar(),
             )
             .expect("block sidecar trace shape")
@@ -4061,13 +4180,37 @@ mod tests {
         assert!(!shared_fields.contains("genesis: Arc"));
         assert!(!fields.contains("FieldR1cs"));
         assert!(!fields.contains("genesis: Arc"));
-        assert!(fields.contains("b_sidecar_vk: Arc<crate::region_sidecar::BlockRegionSidecarVk>"));
+        assert!(fields
+            .contains("b_sidecar_vk: Option<Arc<crate::region_sidecar::BlockRegionSidecarVk>>"));
+        assert!(fields.contains("b_sidecar_vk_digest: [u8; 32]"));
         assert!(
             source
-                .matches("b_sidecar_vk: block_class.sidecar_vk_arc()")
+                .matches("b_sidecar_vk: Some(block_class.sidecar_vk_arc())")
                 .count()
-                >= 2
+                >= 1
         );
+        let block_phase = source
+            .split("pub fn prepare_current_block(")
+            .nth(1)
+            .expect("Block matrix phase")
+            .split("Ok(PreparedSplitLink")
+            .next()
+            .expect("Block matrix phase boundary");
+        let require_vk = block_phase
+            .find(".b_sidecar_vk")
+            .expect("prover requires a materialized Block VK");
+        let replay = block_phase
+            .find("verify_block_region_sidecar_post_commit")
+            .expect("mandatory native nested Block post-commit replay");
+        assert!(require_vk < replay);
+        let native_preflight = source
+            .split("fn begin_split_link_native_preparation_inner")
+            .nth(1)
+            .expect("native prover preflight")
+            .split("impl<'a> SplitLinkPreviousMatrixPhase")
+            .next()
+            .expect("native prover preflight boundary");
+        assert!(native_preflight.contains("class.b_sidecar_vk.is_none()"));
         assert!(block_source.contains("Arc::clone(&self.sidecar_vk)"));
         assert!(source.contains("pub fn rebuild_genesis_matrix"));
     }

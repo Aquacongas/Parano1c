@@ -117,7 +117,8 @@ pub use checkpoint_proof::{
 pub use class_registry::{
     decode_selected_recursive_class_registry_pinned,
     decode_selected_recursive_class_registry_unpinned_for_offline_inspection,
-    encode_selected_recursive_class_registry, OwnedSelectedRecursiveClassRegistry,
+    decode_selected_recursive_terminal_registry_pinned, encode_selected_recursive_class_registry,
+    OwnedSelectedRecursiveClassRegistry, OwnedSelectedRecursiveTerminalRegistry,
     SelectedRecursiveClassRegistryError, MAX_SELECTED_RECURSIVE_CLASS_REGISTRY_BYTES,
     SELECTED_RECURSIVE_CLASS_REGISTRY_VERSION,
 };

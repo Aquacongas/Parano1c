@@ -48,15 +48,16 @@ pub mod recursive_prover;
 pub mod selected_history_verifier;
 pub mod template;
 
-pub use miner::{BlockAppliedHook, BlockMiner, MinerConfig, MinerEvent};
 pub use memory_governor::{
     SELECTED_HISTORY_TERMINAL_STREAMING_PEAK_MIB, SELECTED_HISTORY_TERMINAL_VERIFY_PEAK_MIB,
     SELECTED_RECURSIVE_REGISTRY_MATERIALIZATION_PEAK_MIB,
+    SELECTED_RECURSIVE_TERMINAL_REGISTRY_MATERIALIZATION_PEAK_MIB,
 };
+pub use miner::{BlockAppliedHook, BlockMiner, MinerConfig, MinerEvent};
 pub use pow::{search_pow_parallel, PowSolution};
 pub use recursive_class_registry_store::{
-    LoadedSelectedRecursiveClassRegistry, LocalSelectedRecursiveClassRegistryError,
-    LocalSelectedRecursiveClassRegistryStore,
+    LoadedSelectedRecursiveClassRegistry, LoadedSelectedRecursiveTerminalRegistry,
+    LocalSelectedRecursiveClassRegistryError, LocalSelectedRecursiveClassRegistryStore,
 };
 pub use recursive_matrix_store::{
     selected_recursive_matrix_relative_path, LoadedSelectedRecursiveMatrixView,

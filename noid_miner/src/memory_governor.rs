@@ -46,9 +46,24 @@ const SELECTED_HISTORY_SESSION_PEAK_MIB: usize = RECURSIVE_LINK_PEAK_MIB;
 ///
 /// Every multiplicand above is fixed by a codec or region-VK preflight cap.
 /// The final 64 MiB is larger than the complete 1 MiB genesis wire budget and
-/// all four canonical Block-key fixed tables combined.  Registry loading must
-/// happen while the owning terminal-verification reservation is already live.
+/// all four canonical Block-key fixed tables combined.  Full registry loading
+/// is a prover-only operation and must remain inside the owning 8 GiB proof
+/// session; ordinary terminal verification uses the separate bound below.
 pub const SELECTED_RECURSIVE_REGISTRY_MATERIALIZATION_PEAK_MIB: usize = 368;
+/// Hard bound for the terminal-only registry loader.  Its allocation-free
+/// preflight admits only the frozen four-subchannel/four-family Link topology,
+/// and its materializer never constructs a Block VK:
+///
+/// - 4 MiB exact pinned artifact cap;
+/// - 4 MiB decoded compact carriers while the artifact bytes are still live;
+/// - 1 MiB canonical Link VK fixed tables and digest encoders (the exact
+///   topology has 448 combined-duplex and 3,072 Merkle F128 fixed cells);
+/// - 32 MiB for the allocation-safe <=1 MiB serialized genesis envelope and
+///   its bounded proof representation;
+/// - 7 MiB allocator/vector-metadata rounding.
+///
+/// The full 368 MiB loader remains unchanged for prover roles.
+pub const SELECTED_RECURSIVE_TERMINAL_REGISTRY_MATERIALIZATION_PEAK_MIB: usize = 48;
 /// Matrix replay itself is streaming: two bounded coefficient/scratch buffers
 /// and factorized equality tables remain within this independent allowance.
 pub const SELECTED_HISTORY_TERMINAL_STREAMING_PEAK_MIB: usize = 16;
@@ -56,7 +71,7 @@ pub const SELECTED_HISTORY_TERMINAL_STREAMING_PEAK_MIB: usize = 16;
 /// this before reading/materializing the pinned registry and retains it through
 /// sequential disk-backed matrix replay; no CSR matrix is charged or resident.
 pub const SELECTED_HISTORY_TERMINAL_VERIFY_PEAK_MIB: usize =
-    SELECTED_RECURSIVE_REGISTRY_MATERIALIZATION_PEAK_MIB
+    SELECTED_RECURSIVE_TERMINAL_REGISTRY_MATERIALIZATION_PEAK_MIB
         + SELECTED_HISTORY_TERMINAL_STREAMING_PEAK_MIB;
 
 /// Never let proof admission consume the complete host-visible allowance.
@@ -513,8 +528,8 @@ mod tests {
     fn low_memory_admits_streaming_terminal_but_not_a_prover() {
         let governor = ProofMemoryGovernor::new(B255_PEAK_MIB);
         // host_safe_budget_mib(2048) = 1024 MiB: ample for the complete
-        // 384-MiB pinned-registry + streaming verifier session, but below even
-        // the smallest B8 proof envelope.
+        // 64-MiB terminal-only pinned-registry + streaming verifier session,
+        // but below even the smallest B8 proof envelope.
         let terminal = governor
             .try_reserve_selected_history_terminal_with_available(Some(2048))
             .expect("low-memory node must still verify terminal history");
@@ -569,20 +584,24 @@ mod tests {
             4 + 16 + 28 + 256 + 64
         );
         assert_eq!(SELECTED_HISTORY_TERMINAL_STREAMING_PEAK_MIB, 16);
-        assert_eq!(SELECTED_HISTORY_TERMINAL_VERIFY_PEAK_MIB, 384);
+        assert_eq!(
+            SELECTED_RECURSIVE_TERMINAL_REGISTRY_MATERIALIZATION_PEAK_MIB,
+            4 + 4 + 1 + 32 + 7
+        );
+        assert_eq!(SELECTED_HISTORY_TERMINAL_VERIFY_PEAK_MIB, 64);
 
         let governor = ProofMemoryGovernor::new(B255_PEAK_MIB);
         assert_eq!(
             governor
-                .try_reserve_selected_history_terminal_with_available(Some(1400))
-                .expect_err("host reserve leaves only 376 MiB")
+                .try_reserve_selected_history_terminal_with_available(Some(1080))
+                .expect_err("host reserve leaves only 56 MiB")
                 .required_mib,
             SELECTED_HISTORY_TERMINAL_VERIFY_PEAK_MIB
         );
         drop(
             governor
-                .try_reserve_selected_history_terminal_with_available(Some(1408))
-                .expect("host reserve leaves the exact 384-MiB envelope"),
+                .try_reserve_selected_history_terminal_with_available(Some(1088))
+                .expect("host reserve leaves the exact 64-MiB envelope"),
         );
     }
 

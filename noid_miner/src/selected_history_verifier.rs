@@ -22,7 +22,7 @@ use noid_recursive::{
 
 use crate::memory_governor::{ProofMemoryGovernor, ProofMemoryPressure, ProofMemoryReservation};
 use crate::recursive_class_registry_store::{
-    LoadedSelectedRecursiveClassRegistry, LocalSelectedRecursiveClassRegistryError,
+    LoadedSelectedRecursiveTerminalRegistry, LocalSelectedRecursiveClassRegistryError,
     LocalSelectedRecursiveClassRegistryStore,
 };
 use crate::recursive_matrix_store::{
@@ -167,12 +167,12 @@ pub struct SelectedHistoryTerminalVerificationSession {
     _reservation: ProofMemoryReservation,
     // Keeping the registry inside the session makes it impossible for the
     // pinned materialization performed through this API to outlive admission.
-    loaded_registry: Option<LoadedSelectedRecursiveClassRegistry>,
+    loaded_registry: Option<LoadedSelectedRecursiveTerminalRegistry>,
 }
 
 impl SelectedHistoryTerminalVerificationSession {
     /// Read, authenticate, preflight, and materialize the compact registry
-    /// after this session has acquired the process-global 384 MiB envelope.
+    /// after this session has acquired the process-global 64 MiB envelope.
     /// The session admits exactly one load so two materialized registries can
     /// never overlap inside the single-registry envelope. The loaded value is
     /// never returned detached from its owning admission guard.
@@ -184,7 +184,7 @@ impl SelectedHistoryTerminalVerificationSession {
         if self.loaded_registry.is_some() {
             return Err(SelectedHistoryTerminalVerifierError::RegistryAlreadyLoaded);
         }
-        let loaded = store.load_pinned(expected_registry_digest)?;
+        let loaded = store.load_terminal_pinned(expected_registry_digest)?;
         // Validate the terminal-only borrowed view before publishing the
         // loaded registry into session state.
         loaded.terminal_registry()?;
@@ -401,5 +401,28 @@ mod tests {
             .find("session.verify_with_loaded_registry(")
             .expect("terminal verification");
         assert!(reserve < load && load < verify);
+    }
+
+    #[test]
+    fn terminal_session_cannot_materialize_prover_block_classes() {
+        let source = include_str!("selected_history_verifier.rs");
+        let load = source
+            .split("pub fn load_pinned_registry(")
+            .nth(1)
+            .expect("terminal session registry loader")
+            .split("/// Verify with the pinned registry")
+            .next()
+            .expect("terminal loader boundary");
+        assert!(load.contains("store.load_terminal_pinned("));
+        assert!(!load.contains("store.load_pinned("));
+        let session = source
+            .split("pub struct SelectedHistoryTerminalVerificationSession {")
+            .nth(1)
+            .expect("terminal session declaration")
+            .split("impl SelectedHistoryTerminalVerificationSession")
+            .next()
+            .expect("terminal session fields");
+        assert!(session.contains("Option<LoadedSelectedRecursiveTerminalRegistry>"));
+        assert!(!session.contains("LoadedSelectedRecursiveClassRegistry"));
     }
 }
