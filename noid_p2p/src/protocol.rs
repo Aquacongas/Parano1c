@@ -79,6 +79,10 @@ pub struct GetRecentBlockResponse {
     /// consumed this response. It is local flow-control state, never wire data.
     #[serde(skip)]
     pub(crate) inbound_memory_permit: Option<std::sync::Arc<tokio::sync::OwnedSemaphorePermit>>,
+    /// Process-wide outbound byte admission retained through the codec write.
+    /// Local flow-control state; never serialized.
+    #[serde(skip)]
+    pub(crate) outbound_memory_permit: Option<crate::outbound_budget::OutboundMemoryPermit>,
 }
 
 // ---------------------------------------------------------------------------
@@ -100,6 +104,13 @@ pub struct GetHistoryProofResponse {
     pub proof_bytes: Option<Vec<u8>>,
     /// Serialized tip BlockHeader bytes (276 bytes).
     pub tip_header_bytes: Option<Vec<u8>>,
+    /// Process-wide inbound byte admission retained until node-side proof
+    /// verification has consumed the response.
+    #[serde(skip)]
+    pub(crate) inbound_memory_permit: Option<std::sync::Arc<tokio::sync::OwnedSemaphorePermit>>,
+    /// Process-wide outbound byte admission retained through the codec write.
+    #[serde(skip)]
+    pub(crate) outbound_memory_permit: Option<crate::outbound_budget::OutboundMemoryPermit>,
 }
 
 // ---------------------------------------------------------------------------
@@ -171,6 +182,12 @@ pub struct GetStateSegmentResponse {
     /// Column data encoded by `noid_chain::storage::serial::encode_segment`.
     /// `None` if the peer cannot serve this segment.
     pub data: Option<Vec<u8>>,
+    /// Inbound payload admission retained until the node consumes the segment.
+    #[serde(skip)]
+    pub(crate) inbound_memory_permit: Option<std::sync::Arc<tokio::sync::OwnedSemaphorePermit>>,
+    /// Process-wide outbound byte admission retained through the codec write.
+    #[serde(skip)]
+    pub(crate) outbound_memory_permit: Option<crate::outbound_budget::OutboundMemoryPermit>,
 }
 
 // ---------------------------------------------------------------------------

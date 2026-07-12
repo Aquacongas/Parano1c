@@ -21,8 +21,8 @@ use tokio::sync::{mpsc, RwLock, Semaphore};
 
 use noid_chain::consensus::wire_limits::{
     proof_sidecar_combined_len_ok, INLINE_BLOCK_GOSSIP_THRESHOLD, MAX_BLOCK_AUTH_SIDECAR_BYTES,
-    MAX_BLOCK_BYTES, MAX_BLOCK_PROOF_BYTES, MAX_HEADER_BYTES, MAX_HISTORY_PROOF_BYTES,
-    MAX_MEMPOOL_SYNC_BYTES, MAX_MEMPOOL_SYNC_TXS, MAX_SEGMENT_BYTES,
+    MAX_BLOCK_BYTES, MAX_BLOCK_PROOF_BYTES, MAX_BLOCK_PROOF_PLUS_SIDECAR_BYTES, MAX_HEADER_BYTES,
+    MAX_HISTORY_PROOF_BYTES, MAX_MEMPOOL_SYNC_BYTES, MAX_MEMPOOL_SYNC_TXS, MAX_SEGMENT_BYTES,
     MAX_SNAPSHOT_MANIFEST_SEGMENTS, MAX_TX_INTENT_BYTES_GLOBAL,
 };
 use noid_chain::storage::{encoded_segment_len_for_eff_log, MdbxChainContext};
@@ -32,6 +32,7 @@ use noid_chain::storage::{
 use noid_mempool::AsyncMempool;
 
 use crate::behaviour::{NodeBehaviour, NodeBehaviourEvent};
+use crate::outbound_budget::OutboundResponseBudget;
 use crate::protocol::{
     BlockGossipMsg, GetHeadersResponse, GetHistoryProofResponse, GetRecentBlockResponse,
     GetStateManifestResponse, GetStateSegmentResponse, NetworkTopics,
@@ -42,10 +43,23 @@ struct PendingStateSegmentResponse {
     response: GetStateSegmentResponse,
 }
 
+struct PendingBlockResponse {
+    channel: request_response::ResponseChannel<GetRecentBlockResponse>,
+    response: GetRecentBlockResponse,
+}
+
+struct PendingHistoryProofResponse {
+    channel: request_response::ResponseChannel<GetHistoryProofResponse>,
+    response: GetHistoryProofResponse,
+}
+
 type SnapshotExportKey = (u64, [u8; 32]);
 type SnapshotExport = Arc<SnapshotGeneration>;
 
 const MAX_SNAPSHOT_EXPORTS: usize = 2;
+const MAX_OUTBOUND_BLOCK_RESPONSE_BYTES: usize =
+    MAX_BLOCK_BYTES + MAX_BLOCK_PROOF_PLUS_SIDECAR_BYTES;
+const MAX_OUTBOUND_HISTORY_RESPONSE_BYTES: usize = MAX_HISTORY_PROOF_BYTES + MAX_HEADER_BYTES;
 
 // Hard caps on incoming response sizes are shared via noid_chain::consensus::wire_limits.
 
@@ -138,6 +152,69 @@ fn local_checkpoint_history_proof(ctx: &MdbxChainContext) -> Option<(u64, Vec<u8
 
 fn local_public_history_proof(ctx: &MdbxChainContext) -> Option<(u64, Vec<u8>)> {
     local_checkpoint_history_proof(ctx)
+}
+
+fn sanitize_stored_block_response(
+    height: u64,
+    mut block_bytes: Option<Vec<u8>>,
+    mut block_proof_bytes: Option<Vec<u8>>,
+    mut block_auth_sidecar_bytes: Option<Vec<u8>>,
+) -> (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>) {
+    if block_bytes
+        .as_ref()
+        .is_some_and(|bytes| bytes.len() > MAX_BLOCK_BYTES)
+    {
+        tracing::warn!(height, "stored block exceeds wire cap — not serving");
+        return (None, None, None);
+    }
+    if block_bytes.is_none() {
+        return (None, None, None);
+    }
+    if block_proof_bytes
+        .as_ref()
+        .is_some_and(|bytes| bytes.len() > MAX_BLOCK_PROOF_BYTES)
+    {
+        tracing::warn!(
+            height,
+            "stored block proof exceeds wire cap — not serving proof"
+        );
+        block_proof_bytes = None;
+    }
+    if block_auth_sidecar_bytes
+        .as_ref()
+        .is_some_and(|bytes| bytes.len() > MAX_BLOCK_AUTH_SIDECAR_BYTES)
+    {
+        tracing::warn!(
+            height,
+            "stored auth sidecar exceeds wire cap — not serving sidecar"
+        );
+        block_auth_sidecar_bytes = None;
+    }
+    let proof_len = block_proof_bytes.as_ref().map_or(0, Vec::len);
+    let sidecar_len = block_auth_sidecar_bytes.as_ref().map_or(0, Vec::len);
+    if !proof_sidecar_combined_len_ok(proof_len, sidecar_len) {
+        tracing::warn!(
+            height,
+            proof_len,
+            sidecar_len,
+            "stored proof+sidecar exceed combined wire cap — not serving proof data"
+        );
+        block_proof_bytes = None;
+        block_auth_sidecar_bytes = None;
+    }
+    if block_proof_bytes.is_some() != block_auth_sidecar_bytes.is_some() {
+        tracing::warn!(
+            height,
+            "stored proof/authorization sidecar presence mismatch — not serving proof data"
+        );
+        block_proof_bytes = None;
+        block_auth_sidecar_bytes = None;
+    }
+    (
+        block_bytes.take(),
+        block_proof_bytes,
+        block_auth_sidecar_bytes,
+    )
 }
 
 #[inline]
@@ -278,6 +355,9 @@ pub enum NetworkEvent {
         proof_bytes: Vec<u8>,
         /// Serialized tip `BlockHeader` bytes (276 bytes), or empty.
         tip_header_bytes: Vec<u8>,
+        /// Holds the process-global inbound history byte budget until the node
+        /// finishes verifying this response.
+        inbound_memory_permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     },
     /// Mempool sync response: raw TxIntent bytes from a peer's mempool.
     /// Received after sending `RequestMempoolSync` on peer connect.
@@ -644,9 +724,18 @@ async fn run_swarm(
     let mut snapshot_segment_rate: std::collections::HashMap<PeerId, (u32, Instant)> =
         std::collections::HashMap::new();
 
+    // One waiting response of each kind is sufficient: the request-response
+    // behaviour owns the next response while its codec writes it. Byte permits
+    // retained by both stages are the process-wide RAM bound.
+    let (block_response_tx, mut block_response_rx) = mpsc::channel::<PendingBlockResponse>(1);
+    let (history_response_tx, mut history_response_rx) =
+        mpsc::channel::<PendingHistoryProofResponse>(1);
     let (segment_response_tx, mut segment_response_rx) =
-        mpsc::channel::<PendingStateSegmentResponse>(32);
+        mpsc::channel::<PendingStateSegmentResponse>(1);
+    let block_response_prepare_semaphore = Arc::new(Semaphore::new(2));
+    let history_response_prepare_semaphore = Arc::new(Semaphore::new(4));
     let segment_encode_semaphore = Arc::new(Semaphore::new(2));
+    let outbound_response_budget = OutboundResponseBudget::process_global();
     let snapshot_export_root = data_dir.join("snapshot-exports");
     std::fs::create_dir_all(&snapshot_export_root)?;
     let mut snapshot_exports = load_snapshot_exports(&snapshot_export_root);
@@ -696,8 +785,13 @@ async fn run_swarm(
                     &chain,
                     &mempool,
                     &topics,
+                    &block_response_tx,
+                    &block_response_prepare_semaphore,
+                    &history_response_tx,
+                    &history_response_prepare_semaphore,
                     &segment_response_tx,
                     &segment_encode_semaphore,
+                    &outbound_response_budget,
                     &mut snapshot_exports,
                     &mut reconnect,
                     &mut block_event_rate,
@@ -707,6 +801,24 @@ async fn run_swarm(
                     &mut snapshot_segment_rate,
                 )
                 .await;
+            }
+
+            prepared = block_response_rx.recv() => {
+                if let Some(prepared) = prepared {
+                    let _ = swarm
+                        .behaviour_mut()
+                        .block_sync
+                        .send_response(prepared.channel, prepared.response);
+                }
+            }
+
+            prepared = history_response_rx.recv() => {
+                if let Some(prepared) = prepared {
+                    let _ = swarm
+                        .behaviour_mut()
+                        .proof_sync
+                        .send_response(prepared.channel, prepared.response);
+                }
             }
 
             // Completed bounded disk reads. Responses must be sent from the
@@ -1108,8 +1220,13 @@ async fn handle_swarm_event(
     chain: &Arc<RwLock<MdbxChainContext>>,
     mempool: &AsyncMempool,
     topics: &NetworkTopics,
+    block_response_tx: &mpsc::Sender<PendingBlockResponse>,
+    block_response_prepare_semaphore: &Arc<Semaphore>,
+    history_response_tx: &mpsc::Sender<PendingHistoryProofResponse>,
+    history_response_prepare_semaphore: &Arc<Semaphore>,
     segment_response_tx: &mpsc::Sender<PendingStateSegmentResponse>,
     segment_encode_semaphore: &Arc<Semaphore>,
+    outbound_response_budget: &OutboundResponseBudget,
     snapshot_exports: &mut std::collections::HashMap<SnapshotExportKey, SnapshotExport>,
     reconnect: &mut std::collections::HashMap<
         libp2p::PeerId,
@@ -1523,72 +1640,68 @@ async fn handle_swarm_event(
                 ..
             },
         )) => {
-            let ctx = chain.read().await;
-            let mut block_bytes = ctx.store.get_recent_block(request.height).ok().flatten();
-            // Also load the block proof if we have it.
-            // Proofs are stored temporarily (last FINALITY_DEPTH blocks) for the
-            // recursive prover and for serving to syncing peers.
-            let mut block_proof_bytes = ctx.store.get_block_proof(request.height).ok().flatten();
-            let mut block_auth_sidecar_bytes = ctx
-                .store
-                .get_block_auth_sidecar(request.height)
-                .ok()
-                .flatten();
-            drop(ctx);
-            if block_bytes
-                .as_ref()
-                .is_some_and(|bytes| bytes.len() > MAX_BLOCK_BYTES)
-            {
-                tracing::warn!(
+            // Reserve the consensus upper bound before the first MDBX value is
+            // copied into a Vec. The task waits off the swarm loop so the
+            // current response can continue being polled/written and release
+            // its permit. The permit then follows the response into the codec.
+            let Ok(preparation_permit) =
+                block_response_prepare_semaphore.clone().try_acquire_owned()
+            else {
+                tracing::debug!(
                     height = request.height,
-                    "stored block exceeds wire cap — not serving"
+                    "block response preparation saturated"
                 );
-                block_bytes = None;
-                block_proof_bytes = None;
-                block_auth_sidecar_bytes = None;
-            }
-            if block_proof_bytes
-                .as_ref()
-                .is_some_and(|bytes| bytes.len() > MAX_BLOCK_PROOF_BYTES)
-            {
-                tracing::warn!(
-                    height = request.height,
-                    "stored block proof exceeds wire cap — not serving proof"
-                );
-                block_proof_bytes = None;
-            }
-            if block_auth_sidecar_bytes
-                .as_ref()
-                .is_some_and(|bytes| bytes.len() > MAX_BLOCK_AUTH_SIDECAR_BYTES)
-            {
-                tracing::warn!(
-                    height = request.height,
-                    "stored auth sidecar exceeds wire cap — not serving sidecar"
-                );
-                block_auth_sidecar_bytes = None;
-            }
-            let proof_len = block_proof_bytes.as_ref().map_or(0, Vec::len);
-            let sidecar_len = block_auth_sidecar_bytes.as_ref().map_or(0, Vec::len);
-            if !proof_sidecar_combined_len_ok(proof_len, sidecar_len) {
-                tracing::warn!(
-                    height = request.height,
-                    proof_len,
-                    sidecar_len,
-                    "stored proof+sidecar exceed combined wire cap — not serving proof data"
-                );
-                block_proof_bytes = None;
-                block_auth_sidecar_bytes = None;
-            }
-            let _ = swarm.behaviour_mut().block_sync.send_response(
-                channel,
-                GetRecentBlockResponse {
-                    height: request.height,
+                // Dropping the response channel reports a transient outbound
+                // failure; it must not masquerade as a durable pruned block.
+                return;
+            };
+            let chain = chain.clone();
+            let budget = outbound_response_budget.clone();
+            let completion = block_response_tx.clone();
+            let height = request.height;
+            tokio::spawn(async move {
+                let _preparation_permit = preparation_permit;
+                let Ok(Some(outbound_memory_permit)) =
+                    budget.acquire(MAX_OUTBOUND_BLOCK_RESPONSE_BYTES).await
+                else {
+                    return;
+                };
+                let loaded = tokio::task::spawn_blocking(move || {
+                    let ctx = chain.blocking_read();
+                    match ctx.store.get_recent_block_bundle_bounded(height) {
+                        Ok(Some((block, proof, sidecar))) => sanitize_stored_block_response(
+                            height,
+                            Some(block),
+                            proof,
+                            sidecar,
+                        ),
+                        Ok(None) => (None, None, None),
+                        Err(error) => {
+                            tracing::warn!(height, err = %error, "bounded block response read failed");
+                            (None, None, None)
+                        }
+                    }
+                })
+                .await;
+                let (block_bytes, block_proof_bytes, block_auth_sidecar_bytes) = match loaded {
+                    Ok(loaded) => loaded,
+                    Err(error) => {
+                        tracing::warn!(height, err = %error, "block response storage worker failed");
+                        (None, None, None)
+                    }
+                };
+                let response = GetRecentBlockResponse {
+                    height,
                     block_bytes,
                     block_proof_bytes,
                     block_auth_sidecar_bytes,
                     inbound_memory_permit: None,
-                },
-            );
+                    outbound_memory_permit: Some(outbound_memory_permit),
+                };
+                let _ = completion
+                    .send(PendingBlockResponse { channel, response })
+                    .await;
+            });
         }
 
         // --- Request-Response: public history proof ---
@@ -1598,21 +1711,48 @@ async fn handle_swarm_event(
                 ..
             },
         )) => {
-            let ctx = chain.read().await;
-            let proof_bytes = local_public_history_proof(&ctx).map(|(_, bytes)| bytes);
-            let tip_bytes = {
-                let mut buf = Vec::new();
-                ctx.tip_header().encode(&mut buf);
-                Some(buf)
+            let Ok(preparation_permit) = history_response_prepare_semaphore
+                .clone()
+                .try_acquire_owned()
+            else {
+                tracing::debug!("history response preparation saturated");
+                return;
             };
-            drop(ctx);
-            let _ = swarm.behaviour_mut().proof_sync.send_response(
-                channel,
-                GetHistoryProofResponse {
+            let chain = chain.clone();
+            let budget = outbound_response_budget.clone();
+            let completion = history_response_tx.clone();
+            tokio::spawn(async move {
+                let _preparation_permit = preparation_permit;
+                let Ok(Some(outbound_memory_permit)) =
+                    budget.acquire(MAX_OUTBOUND_HISTORY_RESPONSE_BYTES).await
+                else {
+                    return;
+                };
+                let loaded = tokio::task::spawn_blocking(move || {
+                    let ctx = chain.blocking_read();
+                    let proof_bytes = local_public_history_proof(&ctx).map(|(_, bytes)| bytes);
+                    let mut tip_header_bytes = Vec::new();
+                    ctx.tip_header().encode(&mut tip_header_bytes);
+                    (proof_bytes, Some(tip_header_bytes))
+                })
+                .await;
+                let (proof_bytes, tip_header_bytes) = match loaded {
+                    Ok(loaded) => loaded,
+                    Err(error) => {
+                        tracing::warn!(err = %error, "history response storage worker failed");
+                        (None, None)
+                    }
+                };
+                let response = GetHistoryProofResponse {
                     proof_bytes,
-                    tip_header_bytes: tip_bytes,
-                },
-            );
+                    tip_header_bytes,
+                    inbound_memory_permit: None,
+                    outbound_memory_permit: Some(outbound_memory_permit),
+                };
+                let _ = completion
+                    .send(PendingHistoryProofResponse { channel, response })
+                    .await;
+            });
         }
 
         // --- Request-Response: public history proof client side ---
@@ -1622,6 +1762,7 @@ async fn handle_swarm_event(
                 peer,
             },
         )) => {
+            let inbound_memory_permit = response.inbound_memory_permit.clone();
             let proof_bytes = response.proof_bytes.unwrap_or_default();
             let tip_header_bytes = response.tip_header_bytes.unwrap_or_default();
             if proof_bytes.len() > MAX_HISTORY_PROOF_BYTES {
@@ -1642,6 +1783,7 @@ async fn handle_swarm_event(
                     from: peer,
                     proof_bytes,
                     tip_header_bytes,
+                    inbound_memory_permit,
                 })
                 .await;
         }
@@ -1882,6 +2024,8 @@ async fn handle_swarm_event(
                         segment_id: request.segment_id,
                         eff_log: 0,
                         data: None,
+                        inbound_memory_permit: None,
+                        outbound_memory_permit: None,
                     },
                 );
                 return;
@@ -1896,6 +2040,8 @@ async fn handle_swarm_event(
                         segment_id: request.segment_id,
                         eff_log: 0,
                         data: None,
+                        inbound_memory_permit: None,
+                        outbound_memory_permit: None,
                     },
                 );
                 return;
@@ -1907,6 +2053,8 @@ async fn handle_swarm_event(
                         segment_id: request.segment_id,
                         eff_log: 0,
                         data: None,
+                        inbound_memory_permit: None,
+                        outbound_memory_permit: None,
                     },
                 );
                 return;
@@ -1918,30 +2066,80 @@ async fn handle_swarm_event(
                         segment_id: request.segment_id,
                         eff_log: 0,
                         data: None,
+                        inbound_memory_permit: None,
+                        outbound_memory_permit: None,
                     },
                 );
                 return;
             };
-            let completion = segment_response_tx.clone();
             let effective_log = export.manifest().effective_log_segment_size;
-            tokio::task::spawn_blocking(move || {
-                let _permit = permit;
-                let response = match export.read_encoded_segment(descriptor.segment_id) {
-                    Ok(data) => GetStateSegmentResponse {
+            let expected_len = encoded_segment_len_for_eff_log(effective_log);
+            let declared_len = descriptor.encoded_len as usize;
+            if expected_len != Some(declared_len) || declared_len > MAX_SEGMENT_BYTES {
+                tracing::warn!(
+                    segment = descriptor.segment_id,
+                    declared_len,
+                    "snapshot descriptor has non-canonical segment length"
+                );
+                let _ = swarm.behaviour_mut().state_segment_sync.send_response(
+                    channel,
+                    GetStateSegmentResponse {
+                        segment_id: request.segment_id,
+                        eff_log: 0,
+                        data: None,
+                        inbound_memory_permit: None,
+                        outbound_memory_permit: None,
+                    },
+                );
+                return;
+            }
+            let completion = segment_response_tx.clone();
+            let budget = outbound_response_budget.clone();
+            tokio::spawn(async move {
+                let Ok(Some(outbound_memory_permit)) = budget.acquire(declared_len).await else {
+                    return;
+                };
+                // The exact descriptor length has been admitted before the
+                // generation opens or allocates its encoded payload Vec.
+                let loaded = tokio::task::spawn_blocking(move || {
+                    let _encode_permit = permit;
+                    export.read_encoded_segment(descriptor.segment_id)
+                })
+                .await;
+                let response = match loaded {
+                    Ok(Ok(data)) => GetStateSegmentResponse {
                         segment_id: descriptor.segment_id,
                         eff_log: effective_log,
                         data: Some(data),
+                        inbound_memory_permit: None,
+                        outbound_memory_permit: Some(outbound_memory_permit),
                     },
-                    Err(error) => {
+                    Ok(Err(error)) => {
                         tracing::warn!(segment = descriptor.segment_id, err = %error, "disk snapshot segment read failed");
                         GetStateSegmentResponse {
                             segment_id: descriptor.segment_id,
                             eff_log: 0,
                             data: None,
+                            inbound_memory_permit: None,
+                            // The permit is harmless for an empty response and
+                            // is retained until the codec reports completion.
+                            outbound_memory_permit: Some(outbound_memory_permit),
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(segment = descriptor.segment_id, err = %error, "snapshot segment worker failed");
+                        GetStateSegmentResponse {
+                            segment_id: descriptor.segment_id,
+                            eff_log: 0,
+                            data: None,
+                            inbound_memory_permit: None,
+                            outbound_memory_permit: Some(outbound_memory_permit),
                         }
                     }
                 };
-                let _ = completion.blocking_send(PendingStateSegmentResponse { channel, response });
+                let _ = completion
+                    .send(PendingStateSegmentResponse { channel, response })
+                    .await;
             });
         }
 

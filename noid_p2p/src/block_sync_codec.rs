@@ -20,6 +20,7 @@ use noid_chain::consensus::wire_limits::{
     MAX_BLOCK_PROOF_BYTES,
 };
 
+use crate::outbound_budget::OutboundResponseBudget;
 use crate::protocol::{GetRecentBlockRequest, GetRecentBlockResponse};
 
 const REQUEST_MAGIC: [u8; 4] = *b"NBR2";
@@ -36,6 +37,7 @@ pub const INBOUND_BLOCK_SYNC_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 #[derive(Debug, Clone)]
 pub struct BlockSyncCodec {
     inbound_budget: std::sync::Arc<tokio::sync::Semaphore>,
+    outbound_budget: OutboundResponseBudget,
 }
 
 impl Default for BlockSyncCodec {
@@ -48,6 +50,7 @@ impl BlockSyncCodec {
     fn with_inbound_budget(bytes: usize) -> Self {
         Self {
             inbound_budget: std::sync::Arc::new(tokio::sync::Semaphore::new(bytes)),
+            outbound_budget: OutboundResponseBudget::process_global(),
         }
     }
 }
@@ -106,6 +109,7 @@ impl request_response::Codec for BlockSyncCodec {
             block_proof_bytes,
             block_auth_sidecar_bytes,
             inbound_memory_permit,
+            outbound_memory_permit: None,
         })
     }
 
@@ -133,17 +137,35 @@ impl request_response::Codec for BlockSyncCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        let block_len = optional_len(&response.block_bytes, "block")?;
-        let proof_len = optional_len(&response.block_proof_bytes, "block proof")?;
-        let sidecar_len = optional_len(
-            &response.block_auth_sidecar_bytes,
-            "block authorization sidecar",
-        )?;
+        let GetRecentBlockResponse {
+            height,
+            block_bytes,
+            block_proof_bytes,
+            block_auth_sidecar_bytes,
+            inbound_memory_permit,
+            outbound_memory_permit,
+        } = response;
+        let block_len = optional_len(&block_bytes, "block")?;
+        let proof_len = optional_len(&block_proof_bytes, "block proof")?;
+        let sidecar_len = optional_len(&block_auth_sidecar_bytes, "block authorization sidecar")?;
         validate_response_lengths(block_len, proof_len, sidecar_len)?;
+
+        let payload_len = decoded_optional_len(block_len)
+            .checked_add(decoded_optional_len(proof_len))
+            .and_then(|sum| sum.checked_add(decoded_optional_len(sidecar_len)))
+            .ok_or_else(|| invalid_data("block-sync response length overflow"))?;
+        // Production response workers acquire this before touching storage.
+        // The codec fallback preserves the process-wide write bound for any
+        // future call site that constructs an already-resident response.
+        let outbound_memory_permit = match outbound_memory_permit {
+            Some(permit) => Some(permit),
+            None => self.outbound_budget.acquire(payload_len).await?,
+        };
+        let _memory_permits = (inbound_memory_permit, outbound_memory_permit);
 
         let mut header = [0u8; RESPONSE_HEADER_BYTES];
         header[..4].copy_from_slice(&RESPONSE_MAGIC);
-        header[4..12].copy_from_slice(&response.height.to_le_bytes());
+        header[4..12].copy_from_slice(&height.to_le_bytes());
         header[12..16].copy_from_slice(&block_len.to_le_bytes());
         header[16..20].copy_from_slice(&proof_len.to_le_bytes());
         header[20..24].copy_from_slice(&sidecar_len.to_le_bytes());
@@ -151,13 +173,13 @@ impl request_response::Codec for BlockSyncCodec {
 
         // Write directly from the owned response fields.  Unlike CBOR, this
         // does not construct a second response-sized serialization buffer.
-        if let Some(bytes) = response.block_bytes {
+        if let Some(bytes) = block_bytes {
             io.write_all(&bytes).await?;
         }
-        if let Some(bytes) = response.block_proof_bytes {
+        if let Some(bytes) = block_proof_bytes {
             io.write_all(&bytes).await?;
         }
-        if let Some(bytes) = response.block_auth_sidecar_bytes {
+        if let Some(bytes) = block_auth_sidecar_bytes {
             io.write_all(&bytes).await?;
         }
         Ok(())
@@ -242,6 +264,11 @@ fn validate_response_lengths(block_len: u32, proof_len: u32, sidecar_len: u32) -
     if sidecar_len > MAX_BLOCK_AUTH_SIDECAR_BYTES {
         return Err(invalid_data(
             "declared block authorization sidecar length exceeds consensus cap",
+        ));
+    }
+    if (proof_len == 0) != (sidecar_len == 0) {
+        return Err(invalid_data(
+            "block proof and authorization sidecar presence must match",
         ));
     }
     if !proof_sidecar_combined_len_ok(proof_len, sidecar_len) {
@@ -330,6 +357,7 @@ mod tests {
             block_proof_bytes: Some(vec![0x22; 11 * 1024 * 1024]),
             block_auth_sidecar_bytes: Some(vec![0x33; 1024]),
             inbound_memory_permit: None,
+            outbound_memory_permit: None,
         };
         let mut encoded = Cursor::new(Vec::new());
         BlockSyncCodec::default()

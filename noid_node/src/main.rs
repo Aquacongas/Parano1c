@@ -3346,6 +3346,7 @@ async fn handle_p2p_events(
                 from,
                 proof_bytes,
                 tip_header_bytes,
+                inbound_memory_permit: _inbound_memory_permit,
             }) => {
                 // Check the current checkpoint proof envelope before applying an
                 // immutable snapshot. Header consensus is checked natively from

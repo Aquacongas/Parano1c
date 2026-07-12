@@ -36,11 +36,12 @@ use noid_poseidon2b::native::poseidon2b_hash_bytes;
 const GOSSIPSUB_MESSAGE_ID_DOMAIN: &[u8] = b"NOID_P2P_GOSSIPSUB_MESSAGE_ID";
 
 use crate::block_sync_codec::BlockSyncCodec;
+use crate::history_proof_codec::HistoryProofCodec;
 use crate::protocol::{
-    GetHeadersRequest, GetHeadersResponse, GetHistoryProofRequest, GetHistoryProofResponse,
-    GetMempoolRequest, GetMempoolResponse, GetStateManifestRequest, GetStateManifestResponse,
-    GetStateSegmentRequest, GetStateSegmentResponse,
+    GetHeadersRequest, GetHeadersResponse, GetMempoolRequest, GetMempoolResponse,
+    GetStateManifestRequest, GetStateManifestResponse,
 };
+use crate::state_segment_codec::StateSegmentCodec;
 
 /// All P2P behaviours composed via the derive macro.
 ///
@@ -58,8 +59,7 @@ pub struct NodeBehaviour {
     pub block_sync: request_response::Behaviour<BlockSyncCodec>,
 
     /// History proof sync (O(1) chain-history verification).
-    pub proof_sync:
-        request_response::cbor::Behaviour<GetHistoryProofRequest, GetHistoryProofResponse>,
+    pub proof_sync: request_response::Behaviour<HistoryProofCodec>,
 
     /// Kademlia DHT — primary peer discovery mechanism.
     ///
@@ -125,8 +125,7 @@ pub struct NodeBehaviour {
 
     /// State segment sync — step 2: request individual segments (~3 MB each).
     /// Downloaded in parallel after manifest is received.
-    pub state_segment_sync:
-        request_response::cbor::Behaviour<GetStateSegmentRequest, GetStateSegmentResponse>,
+    pub state_segment_sync: request_response::Behaviour<StateSegmentCodec>,
 
     /// Mempool sync — exchange pending TXs on peer connect.
     /// When a new peer joins, both sides request each other's mempool so that
@@ -258,12 +257,14 @@ impl NodeBehaviour {
                 .with_max_concurrent_streams(1),
         );
 
-        let proof_sync = request_response::cbor::Behaviour::new(
+        let proof_sync = request_response::Behaviour::new(
             [(
-                StreamProtocol::try_from_owned(format!("{}/sync/proof/1", protocol_id))?,
+                StreamProtocol::try_from_owned(format!("{}/sync/proof/2", protocol_id))?,
                 ProtocolSupport::Full,
             )],
-            request_response::Config::default().with_request_timeout(Duration::from_secs(10)),
+            request_response::Config::default()
+                .with_request_timeout(Duration::from_secs(10))
+                .with_max_concurrent_streams(4),
         );
 
         // Manifest: tiny request/response, short timeout is fine.
@@ -279,14 +280,16 @@ impl NodeBehaviour {
 
         // Segment: each response is ~3 MB; 60s per segment is generous.
         // 16 concurrent streams lets us pipeline downloads aggressively.
-        let state_segment_sync = request_response::cbor::Behaviour::new(
+        let state_segment_sync = request_response::Behaviour::new(
             [(
-                StreamProtocol::try_from_owned(format!("{}/sync/segment/1", protocol_id))?,
+                // v2 validates the fixed length header before allocation and
+                // streams the segment without a duplicate CBOR buffer.
+                StreamProtocol::try_from_owned(format!("{}/sync/segment/2", protocol_id))?,
                 ProtocolSupport::Full,
             )],
             request_response::Config::default()
                 .with_request_timeout(Duration::from_secs(60))
-                .with_max_concurrent_streams(16),
+                .with_max_concurrent_streams(8),
         );
 
         // Mempool sync: exchange pending TXs on peer connect.
