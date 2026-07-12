@@ -409,6 +409,44 @@ impl SegmentedFriState {
         }
     }
 
+    /// Test-only segmented geometry with small raw columns. Production always
+    /// uses [`LOG_SEGMENT_SIZE`], but storage/rollback tests need multiple
+    /// independently evictable segments without allocating and hashing 3 MiB
+    /// per fixture segment.
+    #[cfg(test)]
+    pub(crate) fn new_empty_with_segment_log_for_test(
+        log_slots: usize,
+        effective_log_seg: usize,
+    ) -> Self {
+        assert!(effective_log_seg >= 1);
+        assert!(effective_log_seg <= LOG_SEGMENT_SIZE);
+        assert!(effective_log_seg <= log_slots);
+        let num_segments = 1usize << (log_slots - effective_log_seg);
+        let zero_leaf = zero_seg_root_for(effective_log_seg);
+        let mut tree = vec![[0u8; 32]; 2 * num_segments + 1];
+        for index in 0..num_segments {
+            tree[num_segments + index] = zero_leaf;
+        }
+        for index in (1..num_segments).rev() {
+            tree[index] = compress(&tree[2 * index], &tree[2 * index + 1]);
+        }
+        Self {
+            log_slots,
+            effective_log_seg,
+            num_segments,
+            segments: vec![None; num_segments],
+            seg_roots: vec![Some(zero_leaf); num_segments],
+            live_counts: vec![0; num_segments],
+            tree,
+            tree_dirty: false,
+            dirty: HashSet::new(),
+            mdbx_dirty: HashSet::new(),
+            exact_dirty: HashSet::new(),
+            evicted: HashSet::new(),
+            dirty_tree_leaves: HashSet::new(),
+        }
+    }
+
     /// Build production geometry without constructing any FRI commitment.
     /// Exact-only expansion tests use this to exercise depth-16 segment
     /// metadata without a 2^16-cell hash. The resulting FRI fields are not
@@ -916,6 +954,17 @@ impl SegmentedFriState {
         self.evicted.contains(&seg_id)
     }
 
+    /// Return the currently authenticated FRI summary without trying to
+    /// hydrate or hash the raw segment columns.
+    ///
+    /// A `None` result is deliberately not repaired here: exact-only block
+    /// acceptance may carry FRI-unavailable metadata, and asking for a FRI
+    /// root in that state must continue to fail closed until the columns are
+    /// explicitly hydrated.
+    pub(crate) fn cached_segment_root(&self, seg_id: u16) -> Option<StateRoot> {
+        self.seg_roots.get(seg_id as usize).copied().flatten()
+    }
+
     /// Evict a segment's column data from RAM while keeping its FRI root cached.
     ///
     /// This is safe ONLY after the segment has been committed to MDBX.
@@ -951,6 +1000,55 @@ impl SegmentedFriState {
         self.seg_roots[id] = None;
         self.dirty.insert(seg_id);
         self.tree_dirty = true;
+    }
+
+    /// Restore the pre-attempt FRI summary and discard a clean raw payload
+    /// after an uncommitted transition has been rolled back exactly.
+    ///
+    /// The caller must first prove that the raw columns again match the
+    /// durable exact-state boundary and clear MDBX/exact dirty tracking.  This
+    /// method then reinstalls the compact FRI summary captured before
+    /// hydration.  It never invents a summary when the parent carried none.
+    pub(crate) fn restore_persisted_segment_summary_and_evict(
+        &mut self,
+        seg_id: u16,
+        parent_root: Option<StateRoot>,
+    ) -> Result<(), &'static str> {
+        let id = seg_id as usize;
+        if id >= self.num_segments {
+            return Err("persisted segment summary is out of range");
+        }
+        if self.mdbx_dirty.contains(&seg_id) || self.exact_dirty.contains(&seg_id) {
+            return Err("persisted segment summary restored while segment is dirty");
+        }
+
+        self.segments[id] = None;
+        let root = if self.live_counts[id] == 0 {
+            self.evicted.remove(&seg_id);
+            Some(zero_seg_root_for(self.effective_log_seg))
+        } else {
+            self.evicted.insert(seg_id);
+            parent_root
+        };
+        self.seg_roots[id] = root;
+
+        if root.is_some() {
+            self.dirty.remove(&seg_id);
+        } else {
+            // FRI authority was already unavailable at the durable parent.
+            // Keep the marker so a later root request cannot consume a stale
+            // tree leaf without first hydrating this segment.
+            self.dirty.insert(seg_id);
+        }
+
+        if self.num_segments > 1 {
+            if let Some(root) = root {
+                self.tree[self.num_segments + id] = root;
+                self.dirty_tree_leaves.insert(seg_id);
+            }
+            self.tree_dirty = true;
+        }
+        Ok(())
     }
 
     /// Install the durable summary of a live segment without retaining its

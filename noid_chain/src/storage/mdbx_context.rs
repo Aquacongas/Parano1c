@@ -155,6 +155,12 @@ pub struct ReorgBlockPayload<'a> {
 /// plus one replacement block is supported; larger unions use snapshot sync.
 const MAX_REORG_RESIDENT_SEGMENTS: usize = BLOCK_MAX_DISTINCT_SEGMENTS * 2;
 
+/// Compact pre-hydration FRI authority for one block-touched segment.
+/// Raw columns are never retained for rollback: the exact parent commitment
+/// proves the restored bytes, while this optional 32-byte value restores the
+/// non-consensus FRI cache to precisely the authority it had beforehand.
+type ParentSegmentSummary = (u16, Option<[u8; 32]>);
+
 fn track_reorg_segment(
     segment_ids: &mut std::collections::HashSet<u16>,
     slot_index: u32,
@@ -690,18 +696,57 @@ impl MdbxChainContext {
         &mut self,
         undo: &crate::consensus::da_prune::BlockUndoLog,
         parent: &BlockHeader,
+        parent_segment_summaries: &[ParentSegmentSummary],
     ) -> Result<(), MdbxContextError> {
-        self.state
-            .state
-            .apply_delta_unrooted(&undo.slot_changes)
-            .map_err(|_| MdbxContextError::Corrupt("uncommitted block undo is out of range"))?;
-        self.state
-            .state
-            .shrink_to_log_slots(undo.log_slots_before as usize)
-            .map_err(|_| MdbxContextError::Corrupt("uncommitted block depth rollback failed"))?;
+        let current_log_slots = self.state.state.log_slots() as u32;
+        if current_log_slots != parent.log_slots
+            && current_log_slots != parent.log_slots.saturating_add(1)
+        {
+            return Err(MdbxContextError::Corrupt(
+                "uncommitted block has invalid rollback geometry",
+            ));
+        }
+        let current_slots = self.state.state.num_slots();
+        for &(slot_index, previous) in &undo.slot_changes {
+            if u64::from(slot_index) >= current_slots {
+                // A verifier may reject an expansion candidate before growing
+                // the parent state. Its new upper-half pre-images are already
+                // canonical zero and require no write.
+                if previous.is_empty() && current_log_slots == parent.log_slots {
+                    continue;
+                }
+                return Err(MdbxContextError::Corrupt(
+                    "uncommitted block undo is out of range",
+                ));
+            }
+            self.state
+                .state
+                .apply_delta_unrooted(std::slice::from_ref(&(slot_index, previous)))
+                .map_err(|_| MdbxContextError::Corrupt("uncommitted block undo is out of range"))?;
+        }
+        let rollback_log_slots = undo.log_slots_before as usize;
+        if self.state.state.log_slots() > rollback_log_slots
+            && rollback_log_slots >= LOG_SEGMENT_SIZE as usize
+        {
+            // Production state roots are exact-only. Avoid forcing unrelated
+            // evicted FRI-dirty payloads back into RAM merely to discard the
+            // canonical-zero expansion half during rollback.
+            self.state
+                .state
+                .shrink_exact_metadata_to_log_slots(rollback_log_slots)
+                .map_err(|_| {
+                    MdbxContextError::Corrupt("uncommitted block depth rollback failed")
+                })?;
+        } else {
+            self.state
+                .state
+                .shrink_to_log_slots(rollback_log_slots)
+                .map_err(|_| {
+                    MdbxContextError::Corrupt("uncommitted block depth rollback failed")
+                })?;
+        }
         self.state.active_slot_count = undo.active_slot_count_before;
         self.state.alloc_counter = undo.alloc_counter_before;
-        self.state.utxo_root = parent.state_root;
         if self.state.state.log_slots() as u32 != parent.log_slots
             || self.state.active_slot_count != parent.active_slot_count
             || self.state.alloc_counter != parent.alloc_counter
@@ -710,8 +755,51 @@ impl MdbxChainContext {
                 "uncommitted block undo does not restore parent boundary",
             ));
         }
-        self.state.state.clear_dirty();
+        let restored_root = self.state.try_state_root().map_err(|_| {
+            MdbxContextError::Corrupt("uncommitted block exact-root rollback failed")
+        })?;
+        if restored_root != parent.state_root {
+            return Err(MdbxContextError::Corrupt(
+                "uncommitted block undo does not restore parent exact root",
+            ));
+        }
+
+        // A normal next-block parent is already durable.  Once both its exact
+        // commitment and counters have been re-established, every touched raw
+        // payload is again backed by MDBX and may be discarded.  Staged reorg
+        // parents are intentionally excluded: their dirty predecessor state is
+        // not durable until the final replacement transaction commits.
+        if self.reorg_staging.is_none() {
+            self.state.state.clear_dirty();
+            for &(segment_id, parent_fri_root) in parent_segment_summaries {
+                self.state
+                    .state
+                    .restore_persisted_segment_summary_and_evict(segment_id, parent_fri_root)
+                    .map_err(MdbxContextError::Corrupt)?;
+            }
+            self.state.state.evict_all_persisted_segments();
+        }
         Ok(())
+    }
+
+    /// Return the original rejection after a successful bounded rollback.  If
+    /// rollback detects any root/counter/cache corruption, discard the entire
+    /// candidate state and reconstruct the canonical boundary from MDBX before
+    /// exposing the context again.
+    fn reject_uncommitted_block(
+        &mut self,
+        undo: &crate::consensus::da_prune::BlockUndoLog,
+        parent: &BlockHeader,
+        parent_segment_summaries: &[ParentSegmentSummary],
+        original: MdbxContextError,
+    ) -> MdbxContextError {
+        match self.rollback_uncommitted_block(undo, parent, parent_segment_summaries) {
+            Ok(()) => original,
+            Err(rollback_error) => match self.reload_hot_state_from_mdbx() {
+                Ok(()) => rollback_error,
+                Err(reload_error) => reload_error,
+            },
+        }
     }
 
     fn commit_applied_next_block(
@@ -722,6 +810,7 @@ impl MdbxChainContext {
         validation: &AppliedBlockValidation,
         undo: &crate::consensus::da_prune::BlockUndoLog,
         parent: &BlockHeader,
+        parent_segment_summaries: &[ParentSegmentSummary],
     ) -> Result<(), MdbxContextError> {
         let tx_hashes: Vec<TxBodyHash> = block.transactions.iter().map(|tx| tx.txid()).collect();
         let block_hash = block_id(&block.header);
@@ -789,10 +878,12 @@ impl MdbxChainContext {
             })();
             if let Err(e) = commit_result {
                 let commit_error = MdbxContextError::from(e);
-                return match self.rollback_uncommitted_block(undo, parent) {
-                    Ok(()) => Err(commit_error),
-                    Err(rollback_error) => Err(rollback_error),
-                };
+                return Err(self.reject_uncommitted_block(
+                    undo,
+                    parent,
+                    parent_segment_summaries,
+                    commit_error,
+                ));
             }
         }
 
@@ -906,7 +997,14 @@ impl MdbxChainContext {
             }
         }
 
-        self.preload_segments_for_preflighted_block(block)?;
+        let touched_segment_ids = self.segment_ids_for_block(block);
+        let parent_segment_summaries: Vec<ParentSegmentSummary> = touched_segment_ids
+            .iter()
+            .copied()
+            .filter(|segment_id| (*segment_id as usize) < self.state.state.num_segments())
+            .map(|segment_id| (segment_id, self.state.state.cached_segment_root(segment_id)))
+            .collect();
+        self.preload_segment_ids(&touched_segment_ids)?;
         let undo = build_undo_log(&self.state, block);
 
         let validation = match validate_and_apply(
@@ -923,24 +1021,37 @@ impl MdbxChainContext {
         ) {
             Ok(validation) => validation,
             Err(e) => {
-                self.rollback_uncommitted_block(&undo, &parent)?;
-                return Err(MdbxContextError::Consensus(ConsensusError::ShapeMismatch(
-                    format!("proof-native validation failed: {e}"),
+                let original = MdbxContextError::Consensus(ConsensusError::ShapeMismatch(format!(
+                    "proof-native validation failed: {e}"
                 )));
+                return Err(self.reject_uncommitted_block(
+                    &undo,
+                    &parent,
+                    &parent_segment_summaries,
+                    original,
+                ));
             }
         };
 
         if validation.state_root != block.header.state_root {
-            self.rollback_uncommitted_block(&undo, &parent)?;
-            return Err(MdbxContextError::Consensus(ConsensusError::BadStateRoot));
+            return Err(self.reject_uncommitted_block(
+                &undo,
+                &parent,
+                &parent_segment_summaries,
+                MdbxContextError::Consensus(ConsensusError::BadStateRoot),
+            ));
         }
         if validation.history_claim_bytes.is_empty()
             || validation.accepted_block_certificate_bytes.is_empty()
         {
-            self.rollback_uncommitted_block(&undo, &parent)?;
-            return Err(MdbxContextError::Consensus(ConsensusError::ShapeMismatch(
-                "proof-native acceptance returned incomplete durable artifacts".to_string(),
-            )));
+            return Err(self.reject_uncommitted_block(
+                &undo,
+                &parent,
+                &parent_segment_summaries,
+                MdbxContextError::Consensus(ConsensusError::ShapeMismatch(
+                    "proof-native acceptance returned incomplete durable artifacts".to_string(),
+                )),
+            ));
         }
 
         self.commit_applied_next_block(
@@ -950,6 +1061,7 @@ impl MdbxChainContext {
             &validation,
             &undo,
             &parent,
+            &parent_segment_summaries,
         )?;
         Ok(validation.state_root)
     }
@@ -1323,46 +1435,108 @@ impl MdbxChainContext {
         // Keep the public preload helper fail-closed even when a caller does
         // not come through `apply_next_block`.
         crate::consensus::validate_block_resource_preflight(block)?;
-        self.preload_segments_for_preflighted_block(block)
+        let segment_ids = self.segment_ids_for_block(block);
+        self.preload_segment_ids(&segment_ids)
     }
 
-    fn preload_segments_for_preflighted_block(
-        &mut self,
-        block: &Block,
-    ) -> Result<(), MdbxContextError> {
-        let eff_log = self.state.state.effective_log_segment_size();
-        let mut needed: std::collections::HashSet<u16> = std::collections::HashSet::new();
+    fn segment_ids_for_block(&self, block: &Block) -> Vec<u16> {
+        let parent_log = self.state.state.log_slots();
+        let mapped_log = if block.header.log_slots as usize == parent_log.saturating_add(1) {
+            parent_log + 1
+        } else {
+            parent_log
+        };
+        // Below the production 2^16 segment boundary, a one-level expansion
+        // grows the existing segment rather than introducing segment 1. Map
+        // against the validated child geometry so an evicted segment 0 is
+        // hydrated before the verifier touches its new upper half.
+        let eff_log = mapped_log.min(LOG_SEGMENT_SIZE as usize);
+        let mut needed = Vec::new();
 
         for tx in &block.transactions {
             for (_, inp) in tx.body.live_inputs() {
-                needed.insert((inp.slot_index >> eff_log) as u16);
+                needed.push((inp.slot_index >> eff_log) as u16);
             }
             for (_, out) in tx.body.live_outputs() {
-                needed.insert((out.slot_index >> eff_log) as u16);
+                needed.push((out.slot_index >> eff_log) as u16);
             }
             // Coinbase slot (splitmix64 assigned): include all recently-checked
             // slots from the allocator hints by checking coinbase outputs too.
         }
+        needed.sort_unstable();
+        needed.dedup();
+        needed
+    }
 
-        for seg_id in needed {
+    fn preload_segment_ids(&mut self, needed: &[u16]) -> Result<(), MdbxContextError> {
+        let mut hydrated: Vec<ParentSegmentSummary> = Vec::new();
+        let expected_log = self.state.state.effective_log_segment_size() as u8;
+        let expected_len = 1usize << usize::from(expected_log);
+
+        for &seg_id in needed {
+            // A legal one-level expansion may address the canonical-zero new
+            // upper half. It has no parent MDBX payload to hydrate.
+            if seg_id as usize >= self.state.state.num_segments() {
+                continue;
+            }
             if self.state.state.is_evicted(seg_id) {
+                let parent_fri_root = self.state.state.cached_segment_root(seg_id);
                 // Reload from MDBX.
                 match self.store.get_segment(seg_id) {
-                    Ok(Some((_eff_log, cols))) => {
-                        self.state
-                            .restore_evicted_segment(seg_id, cols)
-                            .map_err(|_| {
-                                MdbxContextError::Corrupt("evicted segment exact summary mismatch")
-                            })?;
+                    Ok(Some((stored_log, cols))) => {
+                        if stored_log != expected_log
+                            || cols.values.len() != expected_len
+                            || cols.owners_hi.len() != expected_len
+                            || cols.owners_lo.len() != expected_len
+                        {
+                            let original = MdbxContextError::Corrupt(
+                                "evicted segment has invalid durable geometry",
+                            );
+                            return match self.evict_preloaded_segments(&hydrated) {
+                                Ok(()) => Err(original),
+                                Err(cleanup) => Err(cleanup),
+                            };
+                        }
+                        if self.state.restore_evicted_segment(seg_id, cols).is_err() {
+                            let original =
+                                MdbxContextError::Corrupt("evicted segment exact summary mismatch");
+                            return match self.evict_preloaded_segments(&hydrated) {
+                                Ok(()) => Err(original),
+                                Err(cleanup) => Err(cleanup),
+                            };
+                        }
+                        hydrated.push((seg_id, parent_fri_root));
                     }
                     Ok(None) => {
-                        return Err(MdbxContextError::Corrupt(
-                            "evicted live segment is missing from MDBX",
-                        ));
+                        let original =
+                            MdbxContextError::Corrupt("evicted live segment is missing from MDBX");
+                        return match self.evict_preloaded_segments(&hydrated) {
+                            Ok(()) => Err(original),
+                            Err(cleanup) => Err(cleanup),
+                        };
                     }
-                    Err(e) => return Err(MdbxContextError::Store(e)),
+                    Err(e) => {
+                        let original = MdbxContextError::Store(e);
+                        return match self.evict_preloaded_segments(&hydrated) {
+                            Ok(()) => Err(original),
+                            Err(cleanup) => Err(cleanup),
+                        };
+                    }
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn evict_preloaded_segments(
+        &mut self,
+        hydrated: &[ParentSegmentSummary],
+    ) -> Result<(), MdbxContextError> {
+        for &(segment_id, parent_fri_root) in hydrated {
+            self.state
+                .state
+                .restore_persisted_segment_summary_and_evict(segment_id, parent_fri_root)
+                .map_err(MdbxContextError::Corrupt)?;
         }
         Ok(())
     }
@@ -1874,6 +2048,48 @@ mod tests {
         }
     }
 
+    /// Build a header-valid coinbase candidate without executing its state
+    /// transition. Tests whose validator intentionally rejects the candidate
+    /// do not need to allocate a second 3 MiB segment merely to derive an
+    /// unreachable post-state root.
+    fn rejected_coinbase_candidate(ctx: &MdbxChainContext, slot: u32, owner: Address) -> Block {
+        let parent = *ctx.tip_header();
+        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        outputs[0] = TxOutput {
+            slot_index: slot,
+            amount: block_reward(parent.log_slots),
+            owner,
+        };
+        let tx = Transaction::new(TxBody {
+            epoch_anchor: block_id(&parent),
+            fee: 0,
+            input_owner: Address([0u8; 32]),
+            inputs: [TxInput::dummy(); TX_INPUTS],
+            outputs,
+            validity_bitmap: output_bitmap_bit(0),
+            is_coinbase: true,
+        });
+        Block {
+            header: BlockHeader {
+                prev_block_hash: block_id(&parent),
+                // The rejecting verifier never authenticates a child state;
+                // rollback must restore this parent independently of the
+                // candidate's untrusted commitment fields.
+                state_root: parent.state_root,
+                tx_root: compute_tx_root(std::slice::from_ref(&tx)),
+                timestamp: parent.timestamp + BLOCK_TIME,
+                height: parent.height + 1,
+                miner_address: owner,
+                nonce: 0,
+                difficulty_target: TEST_TARGET,
+                log_slots: parent.log_slots,
+                active_slot_count: parent.active_slot_count,
+                alloc_counter: parent.alloc_counter,
+            },
+            transactions: vec![tx],
+        }
+    }
+
     fn apply_coinbase(
         ctx: &mut MdbxChainContext,
         block: &Block,
@@ -1905,6 +2121,184 @@ mod tests {
                     .map_err(|error| format!("{error:?}"))
             },
         )
+    }
+
+    fn install_populated_segment_genesis_for_test(
+        path: &std::path::Path,
+        segment_count: u16,
+    ) -> MdbxChainContext {
+        use crate::consensus::da_prune::BlockUndoLog;
+        use crate::fri_state::SlotValue;
+
+        const TEST_LOG_SLOTS: usize = 8;
+        const TEST_LOG_SEGMENT_SIZE: usize = 3;
+        let store = MdbxStore::open(path).unwrap();
+        assert!(store.is_empty().unwrap());
+        let slots: Vec<(u32, SlotValue)> = (0..segment_count)
+            .map(|segment_id| {
+                (
+                    (u32::from(segment_id) << TEST_LOG_SEGMENT_SIZE) | 1,
+                    SlotValue::with_owner_fields(
+                        10,
+                        u64::from(segment_id) + 1,
+                        Address([segment_id.saturating_add(1) as u8; 32]).as_fields(),
+                    ),
+                )
+            })
+            .collect();
+        let mut state =
+            ChainState::with_segment_log_for_test(TEST_LOG_SLOTS, TEST_LOG_SEGMENT_SIZE);
+        state.state.apply_delta_unrooted(&slots).unwrap();
+        state.active_slot_count = u64::from(segment_count);
+        state.alloc_counter = u64::from(segment_count);
+        state.try_state_root().unwrap();
+        state.state.root();
+        let mut genesis = crate::consensus::genesis::genesis_header();
+        genesis.difficulty_target = TEST_TARGET;
+        genesis.nonce = 0;
+        genesis.log_slots = TEST_LOG_SLOTS as u32;
+        genesis.state_root = state.cached_state_root();
+        genesis.active_slot_count = state.active_slot_count;
+        genesis.alloc_counter = state.alloc_counter;
+        let genesis_hash = block_id(&genesis);
+        let tip_chain_work = block_work(&TEST_TARGET);
+        let finalized = FinalizedCheckpoint {
+            height: 0,
+            hash: genesis_hash,
+        };
+        let meta = ConsensusMeta {
+            tip_height: 0,
+            tip_hash: genesis_hash,
+            cumulative_chainwork: tip_chain_work,
+            finalized,
+        };
+        let dirty_ids: Vec<u16> = state.state.dirty_segment_ids().collect();
+        let effective_log = state.state.effective_log_segment_size() as u8;
+        {
+            let dirty_refs: Vec<_> = dirty_ids
+                .iter()
+                .map(|&segment_id| {
+                    (
+                        segment_id,
+                        effective_log,
+                        state.state.try_get_segment_columns(segment_id),
+                    )
+                })
+                .collect();
+            store
+                .commit_block(
+                    &genesis,
+                    &genesis_hash,
+                    &BlockUndoLog::empty(0, genesis.log_slots),
+                    &dirty_refs,
+                    &[],
+                    &[],
+                    None,
+                    None,
+                    &meta,
+                    false,
+                )
+                .unwrap();
+        }
+        // `commit_block` correctly enforces production's fixed 2^16 segment
+        // geometry and therefore purges test-only IDs above zero at depth 8.
+        // Reinstall the tiny-column fixtures explicitly after the canonical
+        // metadata transaction; this helper never participates in restart.
+        for &segment_id in &dirty_ids {
+            store
+                .overwrite_segment_for_test(
+                    segment_id,
+                    effective_log,
+                    state
+                        .state
+                        .try_get_segment_columns(segment_id)
+                        .expect("test fixture segment is resident"),
+                )
+                .unwrap();
+        }
+        state.state.clear_dirty();
+        state.state.evict_all_persisted_segments();
+        let mut recent_headers = HashMap::new();
+        recent_headers.insert(0, genesis);
+        MdbxChainContext {
+            store,
+            state,
+            recent_headers,
+            tip_height: 0,
+            tip_hash: genesis_hash,
+            tip_chain_work,
+            finalized,
+            defer_finality_updates: false,
+            reorg_staging: None,
+        }
+    }
+
+    fn install_evicted_subsegment_expansion_parent_for_test(ctx: &mut MdbxChainContext) {
+        use crate::consensus::da_prune::BlockUndoLog;
+        use crate::fri_state::SlotValue;
+
+        const EXPANSION_ACTIVE: u64 = 192;
+        let slots: Vec<(u32, SlotValue)> = (0..EXPANSION_ACTIVE as u32)
+            .map(|slot_index| {
+                (
+                    slot_index,
+                    SlotValue::with_owner_fields(
+                        1,
+                        u64::from(slot_index) + 1,
+                        Address([0x31; 32]).as_fields(),
+                    ),
+                )
+            })
+            .collect();
+        ctx.state.state.apply_delta_unrooted(&slots).unwrap();
+        ctx.state.active_slot_count = EXPANSION_ACTIVE;
+        ctx.state.alloc_counter = EXPANSION_ACTIVE;
+        ctx.state.try_state_root().unwrap();
+        ctx.state.state.root();
+
+        let mut parent = *ctx.tip_header();
+        parent.state_root = ctx.state.cached_state_root();
+        parent.active_slot_count = EXPANSION_ACTIVE;
+        parent.alloc_counter = EXPANSION_ACTIVE;
+        let parent_hash = block_id(&parent);
+        let finalized = FinalizedCheckpoint {
+            height: 0,
+            hash: parent_hash,
+        };
+        let meta = ConsensusMeta {
+            tip_height: 0,
+            tip_hash: parent_hash,
+            cumulative_chainwork: ctx.tip_chain_work,
+            finalized,
+        };
+        let columns = ctx
+            .state
+            .state
+            .try_get_segment_columns(0)
+            .expect("expansion parent segment is resident");
+        ctx.store
+            .commit_block(
+                &parent,
+                &parent_hash,
+                &BlockUndoLog::empty(0, parent.log_slots),
+                &[(
+                    0,
+                    ctx.state.state.effective_log_segment_size() as u8,
+                    Some(columns),
+                )],
+                &[],
+                &[],
+                None,
+                None,
+                &meta,
+                false,
+            )
+            .unwrap();
+        ctx.state.state.clear_dirty();
+        ctx.state.state.evict_all_persisted_segments();
+        ctx.recent_headers.insert(0, parent);
+        ctx.tip_hash = parent_hash;
+        ctx.finalized = finalized;
     }
 
     #[test]
@@ -2090,6 +2484,192 @@ mod tests {
                 .as_deref(),
             Some(b"test-accepted-certificate".as_slice())
         );
+    }
+
+    #[test]
+    fn repeated_rejected_candidates_do_not_accumulate_hydrated_segments() {
+        const SEGMENT_COUNT: u32 = 8;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = install_populated_segment_genesis_for_test(dir.path(), SEGMENT_COUNT as u16);
+        assert_eq!(ctx.state.state.materialized_segment_ids().count(), 0);
+        let parent_tip = ctx.tip_hash();
+        let parent_root = ctx.state.cached_state_root();
+        let parent_active = ctx.state.active_slot_count;
+        let parent_alloc = ctx.state.alloc_counter;
+        let resident_before = ctx.state.state.materialized_segment_ids().count();
+        assert_eq!(resident_before, 0);
+
+        for segment_id in 0..SEGMENT_COUNT {
+            let cached_fri_before = ctx
+                .state
+                .state
+                .cached_segment_root(segment_id as u16)
+                .expect("restart authenticated every persisted FRI summary");
+            let candidate = rejected_coinbase_candidate(
+                &ctx,
+                (segment_id << 3) | 2,
+                Address([0x80 | segment_id as u8; 32]),
+            );
+            let result = ctx.apply_next_block(
+                &candidate,
+                &[],
+                &[],
+                candidate.header.timestamp + 1,
+                |_block,
+                 _proof,
+                 _sidecar,
+                 _parent,
+                 _timestamps,
+                 _active,
+                 _local,
+                 _tx_epoch,
+                 _anchor,
+                 _state|
+                 -> Result<AppliedBlockValidation, &'static str> {
+                    Err("deliberately invalid proof")
+                },
+            );
+            assert!(
+                matches!(
+                    &result,
+                    Err(MdbxContextError::Consensus(ConsensusError::ShapeMismatch(
+                        _
+                    )))
+                ),
+                "unexpected rejection: {result:?}"
+            );
+            assert_eq!(ctx.tip_hash(), parent_tip);
+            assert_eq!(ctx.state.cached_state_root(), parent_root);
+            assert_eq!(ctx.state.active_slot_count, parent_active);
+            assert_eq!(ctx.state.alloc_counter, parent_alloc);
+            assert_eq!(
+                ctx.state.state.materialized_segment_ids().count(),
+                resident_before,
+                "rejection {segment_id} retained a hydrated segment"
+            );
+            assert!(ctx.state.state.is_evicted(segment_id as u16));
+            assert_eq!(
+                ctx.state.state.cached_segment_root(segment_id as u16),
+                Some(cached_fri_before),
+                "rejection {segment_id} degraded its parent FRI summary"
+            );
+            assert!(ctx.state.durable_metadata_clone().is_some());
+        }
+    }
+
+    #[test]
+    fn rejected_subsegment_expansion_hydrates_and_re_evicts_parent_segment_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
+        install_evicted_subsegment_expansion_parent_for_test(&mut ctx);
+        assert_eq!(ctx.tip_header().log_slots, 8);
+        assert!(ctx.state.state.is_evicted(0));
+        assert_eq!(ctx.state.state.materialized_segment_ids().count(), 0);
+        let parent_root = ctx.state.cached_state_root();
+        let parent_fri = ctx.state.state.cached_segment_root(0);
+
+        let mut candidate = rejected_coinbase_candidate(&ctx, 1 << 8, Address([0x42; 32]));
+        candidate.header.log_slots = 9;
+        candidate.transactions[0].body.outputs[0].amount = block_reward(9);
+        candidate.header.tx_root = compute_tx_root(&candidate.transactions);
+        let result = ctx.apply_next_block(
+            &candidate,
+            &[],
+            &[],
+            candidate.header.timestamp + 1,
+            |_block,
+             _proof,
+             _sidecar,
+             _parent,
+             _timestamps,
+             _active,
+             _local,
+             _tx_epoch,
+             _anchor,
+             state|
+             -> Result<AppliedBlockValidation, &'static str> {
+                assert!(!state.state.is_evicted(0));
+                assert!(state.state.try_get_segment_columns(0).is_some());
+                Err("reject before applying expansion")
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(MdbxContextError::Consensus(ConsensusError::ShapeMismatch(
+                _
+            )))
+        ));
+        assert_eq!(ctx.tip_header().log_slots, 8);
+        assert_eq!(ctx.state.cached_state_root(), parent_root);
+        assert_eq!(ctx.state.state.cached_segment_root(0), parent_fri);
+        assert!(ctx.state.state.is_evicted(0));
+        assert_eq!(ctx.state.state.materialized_segment_ids().count(), 0);
+    }
+
+    #[test]
+    fn rollback_exact_root_corruption_recovers_from_mdbx_and_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
+            let block = coinbase_block(&ctx, 7, Address([1u8; 32]));
+            apply_coinbase(&mut ctx, &block).unwrap();
+        }
+
+        let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
+        let parent_tip = ctx.tip_hash();
+        let parent_root = ctx.state.cached_state_root();
+        let parent_active = ctx.state.active_slot_count;
+        let parent_alloc = ctx.state.alloc_counter;
+        let candidate = rejected_coinbase_candidate(&ctx, 8, Address([2u8; 32]));
+        let result = ctx.apply_next_block(
+            &candidate,
+            &[],
+            &[],
+            candidate.header.timestamp + 1,
+            |_block,
+             _proof,
+             _sidecar,
+             _parent,
+             _timestamps,
+             _active,
+             _local,
+             _tx_epoch,
+             _anchor,
+             state|
+             -> Result<AppliedBlockValidation, &'static str> {
+                // This write deliberately escapes the block action surface, so
+                // its bounded undo cannot restore the parent exact root.
+                state
+                    .state
+                    .apply_delta_unrooted(&[(
+                        9,
+                        crate::fri_state::SlotValue::with_owner_fields(
+                            5,
+                            state.alloc_counter,
+                            Address([0xA5; 32]).as_fields(),
+                        ),
+                    )])
+                    .unwrap();
+                Err("corrupt validator transition")
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(MdbxContextError::Corrupt(
+                "uncommitted block undo does not restore parent exact root"
+            ))
+        ));
+
+        // A rollback-integrity failure is never returned with poisoned hot
+        // state: the durable canonical boundary is reloaded first.
+        assert_eq!(ctx.tip_hash(), parent_tip);
+        assert_eq!(ctx.state.cached_state_root(), parent_root);
+        assert_eq!(ctx.state.active_slot_count, parent_active);
+        assert_eq!(ctx.state.alloc_counter, parent_alloc);
+        assert_eq!(ctx.state.state.materialized_segment_ids().count(), 0);
+        assert!(ctx.state.state.is_evicted(0));
+        assert!(ctx.state.durable_metadata_clone().is_some());
     }
 
     #[test]

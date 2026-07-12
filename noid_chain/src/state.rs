@@ -153,11 +153,11 @@ struct ExactSegmentRootCache {
 impl ExactSegmentRootCache {
     fn empty(log_slots: usize) -> Self {
         let effective_log_seg = log_slots.min(crate::fri_state::LOG_SEGMENT_SIZE);
-        let segment_count = if log_slots > crate::fri_state::LOG_SEGMENT_SIZE {
-            1usize << (log_slots - crate::fri_state::LOG_SEGMENT_SIZE)
-        } else {
-            1
-        };
+        Self::empty_with_segment_log(log_slots, effective_log_seg)
+    }
+
+    fn empty_with_segment_log(log_slots: usize, effective_log_seg: usize) -> Self {
+        let segment_count = 1usize << (log_slots - effective_log_seg);
         let zero_segment = zero_slot_roots(effective_log_seg)[effective_log_seg];
         let segment_roots = vec![zero_segment; segment_count];
         let tree = Self::build_tree(&segment_roots);
@@ -384,6 +384,25 @@ impl ChainState {
             active_slot_count: 0,
             alloc_counter: 0,
             exact_roots: ExactSegmentRootCache::empty(log_slots),
+        }
+    }
+
+    /// Small-column multi-segment state used only by eviction/rollback tests.
+    #[cfg(test)]
+    pub(crate) fn with_segment_log_for_test(log_slots: usize, effective_log_seg: usize) -> Self {
+        let utxo_root = zero_slot_roots(log_slots)[log_slots];
+        Self {
+            state: SegmentedFriState::new_empty_with_segment_log_for_test(
+                log_slots,
+                effective_log_seg,
+            ),
+            utxo_root,
+            active_slot_count: 0,
+            alloc_counter: 0,
+            exact_roots: ExactSegmentRootCache::empty_with_segment_log(
+                log_slots,
+                effective_log_seg,
+            ),
         }
     }
 
