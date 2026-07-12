@@ -16,7 +16,7 @@
 //! changes the seed.
 
 use noid_core::transcript::FiatShamir;
-use noid_core::Block128;
+use noid_core::{Block128, TowerField};
 
 use crate::native::compression::Poseidon2bSponge;
 use crate::native::domain::{capacity_iv, TAG_KSCHANNL};
@@ -42,6 +42,23 @@ impl Poseidon2bChannel {
             sponge: Poseidon2bSponge::with_iv(capacity_iv(TAG_KSCHANNL)),
             pending: None,
         }
+    }
+
+    /// Consume the transcript and return an exact four-lane bridge state.
+    ///
+    /// The construction-specific `close_tag` and a fixed zero lane form one
+    /// complete final rate block, forcing exactly one final permutation. Any
+    /// buffered second challenge is invalidated by the absorb. Returning all
+    /// four lanes avoids introducing an unproved compression boundary between
+    /// independently replayed transcript channels.
+    pub fn close_into_bridge(mut self, close_tag: Block128) -> [Block128; 4] {
+        assert!(
+            self.sponge.absorb_is_aligned(),
+            "bridge close must start at a fresh rate block"
+        );
+        self.absorb(close_tag);
+        self.absorb(Block128::ZERO);
+        self.sponge.full_state_after_aligned_absorb()
     }
 }
 
@@ -111,5 +128,33 @@ mod tests {
         let [bare_a, _] = bare.squeeze();
 
         assert_ne!(iv_challenge, bare_a);
+    }
+
+    #[test]
+    fn consuming_bridge_closes_with_one_exact_full_block() {
+        let close_tag = Block128::from(0x5A4B_BA1D_0000_0001u128);
+        let mut channel = Poseidon2bChannel::new();
+        channel.absorb(Block128::from(7u128));
+        channel.absorb(Block128::from(9u128));
+        let _eta = channel.squeeze();
+
+        let bridge = channel.clone().close_into_bridge(close_tag);
+        let same = channel.close_into_bridge(close_tag);
+        assert_eq!(bridge, same);
+
+        let mut changed = Poseidon2bChannel::new();
+        changed.absorb(Block128::from(7u128));
+        changed.absorb(Block128::from(10u128));
+        let _eta = changed.squeeze();
+        assert_ne!(bridge, changed.close_into_bridge(close_tag));
+        assert!(bridge.iter().any(|&lane| lane != Block128::ZERO));
+    }
+
+    #[test]
+    #[should_panic(expected = "bridge close must start at a fresh rate block")]
+    fn consuming_bridge_rejects_a_half_filled_close_schedule() {
+        let mut channel = Poseidon2bChannel::new();
+        channel.absorb(Block128::from(7u128));
+        let _ = channel.close_into_bridge(Block128::from(0x5A4B_BA1D_0000_0001u128));
     }
 }

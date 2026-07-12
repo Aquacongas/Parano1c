@@ -55,6 +55,24 @@ pub mod segment_compaction;
 pub mod self_verify;
 pub mod tx_body_spine;
 pub mod tx_epoch;
+pub mod zk_affine_fold;
+pub mod zk_affine_tail;
+pub mod zk_auth_composition;
+pub mod zk_auth_grind;
+pub mod zk_auth_nonce;
+pub mod zk_auth_terminal;
+pub mod zk_auth_transcript_cells;
+pub mod zk_authorization_candidate;
+mod zk_authorization_region;
+pub mod zk_mlecheck;
+pub mod zk_owner_verifier;
+pub mod zk_phase_a;
+pub mod zk_phase_b_composition;
+pub mod zk_phase_b_query;
+pub mod zk_phase_b_upper_link;
+pub mod zk_post_claim_relation;
+pub mod zk_query_carriers;
+pub mod zk_split_bridge;
 
 use std::collections::HashMap;
 

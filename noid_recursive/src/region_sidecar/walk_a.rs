@@ -48,6 +48,9 @@ pub const WALK_A_META_COMMITTED_COLUMNS: usize = 8;
 pub const MAX_WALK_A_PATTERN_LOG: usize = 20;
 /// Four production tiers cover at most the padded B255 class (`2^8` slots).
 pub const MAX_WALK_A_TX_LOG: usize = 8;
+/// Published selected capsule geometry.  VK validity must not depend on
+/// debug-only reductions of the native prover's exercised query count.
+pub const MAX_WALK_A_QUERY_LOG: usize = 6;
 
 const MAX_WALK_A_FIXED_CELLS: usize = 1 << 22;
 const WALK_A_LAYOUT_DIGEST_DOMAIN: &[u8] = b"NOID/REGION-SIDECAR/WALK-A-LAYOUT/V1";
@@ -692,10 +695,10 @@ fn canonical_protocol(
                 return Err(RegionSidecarError::UnsupportedVkShape);
             }
             let tx_count = checked_pow2(tx_log)?;
-            let nq = checked_pow2(nq_log)?;
-            if nq > noid_fri_binius::capsule::CAPSULE_NUM_QUERIES {
+            if nq_log > MAX_WALK_A_QUERY_LOG {
                 return Err(RegionSidecarError::UnsupportedVkShape);
             }
+            let nq = checked_pow2(nq_log)?;
             let family_slots = nq
                 .checked_mul(CAPSULE_LEAF_STRIDE)
                 .ok_or(RegionSidecarError::BadVk)?;
@@ -2246,7 +2249,7 @@ pub(in crate::region_sidecar) mod tests {
             slices.try_into().unwrap();
         assert_eq!(
             WalkARegionVk::new_wallet([0; 32], 0, usize::BITS as usize, wallet_slices),
-            Err(RegionSidecarError::BadVk)
+            Err(RegionSidecarError::UnsupportedVkShape)
         );
         assert_eq!(
             WalkARegionVk::new_wallet([0; 32], MAX_WALK_A_TX_LOG + 1, 0, wallet_slices),

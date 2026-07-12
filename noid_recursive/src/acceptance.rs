@@ -35,6 +35,7 @@ pub mod region;
 pub mod shape;
 pub mod split_link;
 pub mod trace;
+pub mod zk_auth_capsule_schedule;
 
 /// Env-gated (`NOID_ROW_LEDGER=1`) wire-count checkpoint: prints the delta
 /// since the previous mark and the running total. The Stage-0 per-subsystem

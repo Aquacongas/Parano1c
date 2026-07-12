@@ -1850,13 +1850,15 @@ mod tests {
         let swapped_w_logs = [w_logs[1], w_logs[0]];
         let swapped_groups = vec![groups[1].clone(), groups[0].clone()];
         let mut swapped_channel = FsLaneChallenger::new(b"deep-chain-ragged-multi-test");
-        assert!(verify_ragged_multi_deep_chain_walk(
-            &swapped_w_logs,
-            &swapped_groups,
-            &proof,
-            &mut swapped_channel,
-        )
-        .is_err());
+        assert!(
+            verify_ragged_multi_deep_chain_walk(
+                &swapped_w_logs,
+                &swapped_groups,
+                &proof,
+                &mut swapped_channel,
+            )
+            .is_err()
+        );
     }
 
     #[test]

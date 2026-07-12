@@ -60,6 +60,8 @@ use super::trace::self_verify::{
     alloc_flat_digest, flat_digest_lanes, lagrange_weights_window_trace,
     verify_field_trace_deferred, FieldR1csProofTrace, FlatDigestExpr,
 };
+#[cfg(feature = "selected-zk-measurement")]
+use super::trace::zk_authorization_candidate::SelectedZkAuthorizationProofBundle;
 use super::trace::{flat_of, mul, pin_eq};
 use crate::accumulator::{
     genesis_accumulator, ChainAccumulator, ChainAccumulatorLaneError, CHAIN_ACCUMULATOR_LANES,
@@ -69,6 +71,8 @@ use crate::block_certificate_backend::{
 };
 use noid_chain::BlockHeader;
 use noid_core::Block128;
+#[cfg(feature = "selected-zk-measurement")]
+use noid_gkr::zk_authorization::ZkAuthorizationProof;
 use noid_ivc_prover::field_prover::prove_field_with_public_io;
 
 /// The canonical direct accumulator-boundary lane count.
@@ -480,6 +484,121 @@ pub struct LinkBlock<'a> {
     pub inputs: &'a AcceptedBlockBatchComponentInputs,
     pub proof: &'a AcceptedBlockBatchComponentProof,
     pub config: BlockSlotsConfig,
+}
+
+/// Owned, consuming input carrier for the opt-in selected-ZK B255
+/// measurement facade.
+///
+/// This is deliberately not a wire or proof-envelope type.  Its private,
+/// mandatory authorization bundle prevents a selected measurement from being
+/// assembled without either its exact live proof set or its PAD255 proof,
+/// while constructing the inner [`LinkBlock`] here prevents callers from
+/// selecting a legacy or partial region configuration.  The production
+/// [`LinkBlock`] and every serialized envelope remain unchanged until the
+/// authorization carrier hard cut.
+#[cfg(feature = "selected-zk-measurement")]
+#[must_use = "selected B255 measurement input must be consumed by a measurement build"]
+pub struct SelectedZkB255MeasurementInput<'a> {
+    block: LinkBlock<'a>,
+    authorization: SelectedZkAuthorizationProofBundle,
+}
+
+/// Structural rejection at the selected B255 measurement input boundary.
+#[cfg(feature = "selected-zk-measurement")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectedZkB255MeasurementInputError {
+    /// The owned proof vector does not cover every canonical live
+    /// authorization statement exactly once.
+    AuthorizationProofCardinality { expected: usize, actual: usize },
+    /// The canonical component input belongs to a different transaction
+    /// capacity tier.
+    NonB255Tier {
+        live_authorizations: usize,
+        actual_tier: Option<usize>,
+    },
+}
+
+#[cfg(feature = "selected-zk-measurement")]
+impl core::fmt::Display for SelectedZkB255MeasurementInputError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::AuthorizationProofCardinality { expected, actual } => write!(
+                f,
+                "selected B255 authorization proof count {actual} does not match canonical live count {expected}"
+            ),
+            Self::NonB255Tier {
+                live_authorizations,
+                actual_tier,
+            } => write!(
+                f,
+                "selected B255 input has {live_authorizations} live authorizations (tier {actual_tier:?})"
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "selected-zk-measurement")]
+impl std::error::Error for SelectedZkB255MeasurementInputError {}
+
+#[cfg(feature = "selected-zk-measurement")]
+impl<'a> SelectedZkB255MeasurementInput<'a> {
+    /// Bind one canonical B255 component input to an owned selected-ZK proof
+    /// set.  This constructor performs only shape/cardinality checks; the
+    /// canonical Block assembly still verifies every proof against its body
+    /// and owner statement before minting the private authorization
+    /// capability.
+    pub fn try_new(
+        start_accumulator: &'a ChainAccumulator,
+        end_accumulator: &'a ChainAccumulator,
+        inputs: &'a AcceptedBlockBatchComponentInputs,
+        proof: &'a AcceptedBlockBatchComponentProof,
+        live_proofs: Vec<ZkAuthorizationProof>,
+        ghost_proof: ZkAuthorizationProof,
+    ) -> Result<Self, SelectedZkB255MeasurementInputError> {
+        let live_authorizations = inputs.authorization_inputs.len();
+        if live_proofs.len() != live_authorizations {
+            return Err(
+                SelectedZkB255MeasurementInputError::AuthorizationProofCardinality {
+                    expected: live_authorizations,
+                    actual: live_proofs.len(),
+                },
+            );
+        }
+        let actual_tier = noid_chain::consensus::params::user_tx_class_tier(live_authorizations);
+        if actual_tier != Some(noid_chain::consensus::params::BLOCK_MAX_USER_TXS) {
+            return Err(SelectedZkB255MeasurementInputError::NonB255Tier {
+                live_authorizations,
+                actual_tier,
+            });
+        }
+
+        Ok(Self {
+            block: LinkBlock {
+                start_accumulator,
+                end_accumulator,
+                inputs,
+                proof,
+                config: BlockSlotsConfig {
+                    discharge_wallet_pcs: true,
+                    wallet_pcs_params: RegionDischargeParams {
+                        nq: noid_fri_binius::capsule::CAPSULE_NUM_QUERIES,
+                    },
+                    owner_auth_region: true,
+                    exact_state_region: true,
+                    tx_root_region: true,
+                    spine_region: true,
+                    tier_user_tx_capacity: Some(noid_chain::consensus::params::BLOCK_MAX_USER_TXS),
+                },
+            },
+            authorization: SelectedZkAuthorizationProofBundle::new(live_proofs, ghost_proof),
+        })
+    }
+
+    pub(in crate::acceptance) fn into_parts(
+        self,
+    ) -> (LinkBlock<'a>, SelectedZkAuthorizationProofBundle) {
+        (self.block, self.authorization)
+    }
 }
 
 /// Everything a link exposes to its successor.

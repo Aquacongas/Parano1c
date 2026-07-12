@@ -131,6 +131,26 @@ impl Poseidon2bSponge {
         [self.state[0], self.state[1]]
     }
 
+    /// Complete current sponge state after a whole-rate-block absorb.
+    ///
+    /// Kept crate-private: protocol channels may use it for an exact typed
+    /// cross-channel bridge, while ordinary hash callers must not treat the
+    /// capacity lanes as a digest or ad-hoc public output.
+    pub(crate) fn full_state_after_aligned_absorb(&self) -> [Block128; STATE_SIZE] {
+        assert_eq!(
+            self.filled_bytes, 0,
+            "full-state bridge requires a whole absorb block"
+        );
+        self.state
+    }
+
+    /// Whether the next absorb starts at a fresh rate block. Protocol-level
+    /// full-state bridges use this to reject a half-filled transcript rather
+    /// than silently changing the close schedule in release builds.
+    pub(crate) fn absorb_is_aligned(&self) -> bool {
+        self.filled_bytes == 0
+    }
+
     /// Flush any buffered absorb bytes into the state via one padded
     /// permutation, so subsequent `squeeze()` calls are guaranteed to
     /// commit to everything absorbed so far.

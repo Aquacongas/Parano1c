@@ -364,15 +364,15 @@ mod tests {
     use super::*;
     use crate::challenger::{Challenger, FsLaneChallenger};
     use crate::deep_chain::relations::{
-        claimed_refs, prove_column_relation, prove_shift_discharge, verify_column_relation,
-        verify_shift_discharge, RelationColumns,
+        RelationColumns, claimed_refs, prove_column_relation, prove_shift_discharge,
+        verify_column_relation, verify_shift_discharge,
     };
     use crate::deep_chain::schedule::carry_selection_terms;
     use crate::deep_chain::source_tree::mds_weights_pub;
-    use crate::deep_chain::{prove_deep_chain_walk, verify_deep_chain_walk, LaneClaimGroup};
+    use crate::deep_chain::{LaneClaimGroup, prove_deep_chain_walk, verify_deep_chain_walk};
     use crate::lincheck::build_eq_table;
     use noid_poseidon2b::native::compress_flat_feed_forward_with_tag;
-    use noid_poseidon2b::native::domain::{capacity_iv_flat, TAG_CAPSNODE};
+    use noid_poseidon2b::native::domain::{TAG_CAPSNODE, capacity_iv_flat};
 
     fn flat_lane(x: u128) -> F128 {
         F128::new(x as u64, (x >> 64) as u64)
@@ -927,6 +927,92 @@ mod tests {
                 "non-boolean direction accepted"
             );
             run(&forged, &t, true, false).expect("non-boolean dir must be invisible elsewhere");
+        }
+    }
+
+    /// A power-of-two path has no spare stride slot for the historical
+    /// root-copy cell.  Its public root is therefore pinned to the final
+    /// node's already-constrained feed-forward expression
+    ///
+    /// `C_i + CR_i + D * (CR_i + SIB_i)`.
+    ///
+    /// This is the exact depth/stride shape selected for both capsule
+    /// authentication paths.  Exercise the full DAG and every committed
+    /// input to that expression so a missing composite-root wire cannot be
+    /// hidden by the otherwise-honest Merkle walk.
+    #[test]
+    fn depth8_composite_root_roundtrip_and_final_cell_negatives() {
+        let iv = capacity_iv_flat(TAG_CAPSNODE);
+        let iv_flat = [flat_lane(iv[0]), flat_lane(iv[1])];
+        let family = FfMerklePathFamily {
+            depth: 8,
+            n_paths: 1,
+        };
+        let w_log = 3usize;
+        assert_eq!(family.stride(), 8);
+        assert_eq!(family.root_copy_offset(), None);
+
+        let entry = [
+            F128::new(0x1020_3040_5060_7080, 0x90a0_b0c0_d0e0_f001),
+            F128::new(0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210),
+        ];
+        let siblings: Vec<[F128; 2]> = (0..family.depth)
+            .map(|k| {
+                [
+                    F128::new(0x100 + k as u64, 0x200 + (3 * k) as u64),
+                    F128::new(0x300 + (5 * k) as u64, 0x400 + (7 * k) as u64),
+                ]
+            })
+            .collect();
+        let directions: Vec<bool> = (0..family.depth)
+            .map(|k| (0b1010_0110usize >> k) & 1 == 1)
+            .collect();
+        let witness = FfMerklePathWitness {
+            entry,
+            siblings,
+            directions,
+        };
+        let cols = build_ff_merkle_path_columns(&family, iv_flat, &[witness], w_log);
+        let last = family.depth - 1;
+        for lane in 0..2 {
+            let cr = cols.cr[lane][last];
+            let sib = cols.sib[lane][last];
+            let d = cols.d[last];
+            let composite = cols.c[lane][last] + cr + d * (cr + sib);
+            assert_eq!(composite, cols.roots[0][lane], "lane {lane} root");
+        }
+
+        let table = |c: &FfMerklePathColumns| -> Vec<Vec<F128>> {
+            vec![
+                c.cr[0].clone(),
+                c.cr[1].clone(),
+                c.sib[0].clone(),
+                c.sib[1].clone(),
+                c.d.clone(),
+                c.c[0].clone(),
+                c.c[1].clone(),
+                c.c[2].clone(),
+                c.c[3].clone(),
+            ]
+        };
+        let run = |committed: &[Vec<F128>]| {
+            let refs: Vec<&[F128]> = committed.iter().map(Vec::as_slice).collect();
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_dag(&family, iv_flat, &cols, &refs, &[entry], w_log, true, true)
+            }))
+            .unwrap_or_else(|_| Err("native relation prover rejected witness".into()))
+        };
+
+        let honest = table(&cols);
+        run(&honest).expect("honest depth-8 composite-root DAG verifies");
+
+        for (name, column) in [("CR", 0usize), ("SIB", 2), ("D", 4), ("C", 5)] {
+            let mut bad = honest.clone();
+            bad[column][last] += F128::ONE;
+            assert!(
+                run(&bad).is_err(),
+                "final {name} mutation survived the composite-root DAG"
+            );
         }
     }
 }

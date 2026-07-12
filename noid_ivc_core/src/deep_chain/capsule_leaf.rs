@@ -28,7 +28,7 @@ use crate::deep_chain::leaf_hash::SourceLeafColumns;
 use crate::deep_chain::relations::{ColRef, FixedPattern, RelationTerm};
 use crate::deep_chain::source_tree::{mds_weights_pub, permute_flat_state, run_perm};
 use crate::field::F128;
-use noid_poseidon2b::native::domain::{capacity_iv_flat, TAG_CAPSLEAF};
+use noid_poseidon2b::native::domain::{TAG_CAPSLEAF, capacity_iv_flat};
 use noid_poseidon2b::native::permutation::STATE_SIZE;
 
 /// Symbols per capsule leaf — mirrors

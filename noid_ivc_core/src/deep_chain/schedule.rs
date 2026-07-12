@@ -773,11 +773,11 @@ mod tests {
     use super::*;
     use crate::challenger::{Challenger, FsLaneChallenger};
     use crate::deep_chain::relations::{
-        claimed_refs, prove_column_relation, prove_shift_discharge, prove_shift_discharge_pow2,
-        verify_column_relation, verify_shift_discharge, verify_shift_discharge_pow2,
-        RelationColumns,
+        RelationColumns, claimed_refs, prove_column_relation, prove_shift_discharge,
+        prove_shift_discharge_pow2, verify_column_relation, verify_shift_discharge,
+        verify_shift_discharge_pow2,
     };
-    use crate::deep_chain::{prove_deep_chain_walk, verify_deep_chain_walk, LaneClaimGroup};
+    use crate::deep_chain::{LaneClaimGroup, prove_deep_chain_walk, verify_deep_chain_walk};
     use crate::lincheck::build_eq_table;
 
     struct Rng(u64);
@@ -1008,7 +1008,7 @@ mod tests {
     #[test]
     fn merkle_family_matches_native_compress_chain() {
         use noid_poseidon2b::native::compression::compress;
-        use noid_poseidon2b::native::domain::{capacity_iv, TAG_COMPRESS};
+        use noid_poseidon2b::native::domain::{TAG_COMPRESS, capacity_iv};
 
         let mut rng = Rng(0x3E7A);
         let depth = 3;
@@ -1068,7 +1068,7 @@ mod tests {
     /// direction bit rejected.
     #[test]
     fn merkle_region_dag_roundtrip_and_negatives() {
-        use noid_poseidon2b::native::domain::{capacity_iv, TAG_COMPRESS};
+        use noid_poseidon2b::native::domain::{TAG_COMPRESS, capacity_iv};
 
         let mut rng = Rng(0x3E7B);
         let depth = 3;

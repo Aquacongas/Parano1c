@@ -74,10 +74,11 @@ use noid_fri_binius::capsule::{
 use noid_fri_binius::compact_fri::{
     expand_batched_merkle_proof, expand_batched_merkle_proof_to_cap, BatchedMerkleProof,
 };
+use noid_fri_binius::zk_capsule_pcs::ZK_CAPSULE_PCS_QUERY_COUNT as SELECTED_ZK_QUERY_COUNT;
 use noid_gkr::auth_pcs::AuthMleOpeningProof;
 use noid_gkr::owner_auth::{OwnerAuthProofKillShot, OwnerAuthPublicInputs, OWNER_AUTH_NUM_VARS};
 use noid_poseidon2b::native::domain::{
-    capacity_iv, DomainTag, TAG_EXSTNOD, TAG_FRICHANL, TAG_KSCHANNL,
+    capacity_iv, DomainTag, TAG_CAPSNODE, TAG_EXSTNOD, TAG_FRICHANL, TAG_KSCHANNL,
 };
 use noid_poseidon2b::native::permutation::STATE_SIZE;
 
@@ -154,6 +155,10 @@ use super::{alloc_blocks, eq_ind_trace, flat_of, mul, pin_eq, pin_zero, BatchEva
 use crate::acceptance::region::{
     capsule_pcs_channel_schedule, owner_auth_channel_schedule, CAPSULE_OPEN_TAG,
 };
+use crate::acceptance::zk_auth_capsule_schedule::{
+    selected_zk_auth_main_sidecar_purpose, selected_zk_auth_owner_sidecar_purpose,
+    selected_zk_auth_wallet_a_sidecar_purpose, selected_zk_auth_wallet_b_sidecar_purpose,
+};
 
 // FS domains for the region walks (self-contained sub-protocols; the soundness
 // of the discharge lives in the committed-column opening claims the caller
@@ -196,6 +201,52 @@ struct TiledWalkLayout {
     block_slots: usize,
     w_log: usize,
     slots: usize,
+}
+
+/// Raw block-metadata half of the authorization PCS region assembly.
+///
+/// This draft deliberately knows nothing about wallet obligations or native
+/// capsule proofs.  It owns the canonical Meta-A/Meta-B geometry, filled
+/// columns and endpoints, exact cell-pin intents, and the ordered Meta-B
+/// family descriptors.  The enclosing assembler still owns physical column
+/// allocation and the legacy/selected finalization policy.
+struct AuthPcsMetaRegionDraft {
+    has_meta: bool,
+    has_both_a_families: bool,
+    es_region_slots: usize,
+    spine_cap: usize,
+    spine_tree_base: usize,
+    spine_wrap_base: usize,
+    spine_block_log: usize,
+    spine_region_slots: usize,
+    meta_w_log: usize,
+    es_meta_base: usize,
+    spine_meta_base: usize,
+    meta_b: Option<TiledWalkLayout>,
+    paired_caps_per_block: Option<[usize; 2]>,
+    paired_bases: Option<[usize; 2]>,
+    meta_bases: Vec<usize>,
+    leg_depths: Vec<usize>,
+    leg_caps: Vec<usize>,
+    leg_ivs: Vec<[F128; 2]>,
+    meta_b_families: Vec<crate::region_sidecar::MerkleRegionFamily>,
+    meta_cols: Vec<Vec<F128>>,
+    meta_s0: [Vec<F128>; STATE_SIZE],
+    meta_s_out: [Vec<F128>; STATE_SIZE],
+    cb_meta_b: Vec<Vec<F128>>,
+    s0_meta_b: [Vec<F128>; STATE_SIZE],
+    sout_meta_b: [Vec<F128>; STATE_SIZE],
+    cell_pins_meta: Vec<(usize, usize, LinExpr)>,
+    cell_pins_meta_b: Vec<(usize, usize, LinExpr)>,
+    spine_expo_kid0: Vec<F128>,
+    spine_expo_kid1: Vec<F128>,
+    spine_expo_c0: Vec<F128>,
+    spine_expo_c1: Vec<F128>,
+    acc_committed_roots: Vec<Vec<[F128; 2]>>,
+    acc_recomputed_roots: Vec<Vec<[F128; 2]>>,
+    acc_entry_wires: Vec<Vec<[LinExpr; 2]>>,
+    acc_root_wires: Vec<Vec<[LinExpr; 2]>>,
+    acc_path_slots: Vec<Vec<usize>>,
 }
 
 /// Lay out non-empty, disjoint leg slot ranges in one K-tiled walk.
@@ -404,6 +455,126 @@ impl AuthPcsRegionPreparation {
             self.main_c_endpoints.s0(),
             self.main_c_endpoints.s_out(),
         )
+    }
+}
+
+// Exact B255 selected-ZK region geometry. These constants are deliberately
+// local to the common allocator: the public V4 certificate independently
+// validates the same shape in `region_sidecar::block`.
+const SELECTED_ZK_REGION_TILE_COUNT: usize = 256;
+const SELECTED_ZK_REGION_TX_LOG: usize = 8;
+const SELECTED_ZK_REGION_QUERY_LOG: usize = 6;
+const SELECTED_ZK_REGION_TOUCHED_CAPACITY: usize = 1_531;
+const SELECTED_ZK_REGION_SEGMENT_CAPACITY: usize = 256;
+const SELECTED_ZK_REGION_WALLET_A_LOG: usize = 19;
+const SELECTED_ZK_REGION_WALLET_B_LOG: usize = 18;
+const SELECTED_ZK_REGION_META_B_LOG: usize = 17;
+const SELECTED_ZK_REGION_MAIN_LOG: usize = 16;
+const SELECTED_ZK_REGION_META_A_LOG: usize = 15;
+const SELECTED_ZK_REGION_OWNER_LOG: usize = 15;
+const SELECTED_ZK_REGION_WALLET_A_COLUMNS: usize = 6;
+const SELECTED_ZK_REGION_WALLET_B_COLUMNS: usize = 9;
+const SELECTED_ZK_REGION_META_B_COLUMNS: usize = 9;
+const SELECTED_ZK_REGION_MAIN_COLUMNS: usize = 6;
+const SELECTED_ZK_REGION_META_A_COLUMNS: usize = 8;
+const SELECTED_ZK_REGION_OWNER_COLUMNS: usize = 6;
+const SELECTED_ZK_REGION_COMMITTED_COLUMNS: usize = 44;
+const SELECTED_ZK_REGION_COMMITTED_CELLS: usize = 7_536_640;
+
+const _: () = assert!(SELECTED_ZK_REGION_TILE_COUNT == 1 << SELECTED_ZK_REGION_TX_LOG);
+const _: () = assert!(SELECTED_ZK_QUERY_COUNT == 1 << SELECTED_ZK_REGION_QUERY_LOG);
+const _: () = assert!(
+    SELECTED_ZK_REGION_WALLET_A_COLUMNS
+        + SELECTED_ZK_REGION_WALLET_B_COLUMNS
+        + SELECTED_ZK_REGION_META_B_COLUMNS
+        + SELECTED_ZK_REGION_MAIN_COLUMNS
+        + SELECTED_ZK_REGION_META_A_COLUMNS
+        + SELECTED_ZK_REGION_OWNER_COLUMNS
+        == SELECTED_ZK_REGION_COMMITTED_COLUMNS
+);
+const _: () = assert!(
+    SELECTED_ZK_REGION_WALLET_A_COLUMNS * (1 << SELECTED_ZK_REGION_WALLET_A_LOG)
+        + SELECTED_ZK_REGION_WALLET_B_COLUMNS * (1 << SELECTED_ZK_REGION_WALLET_B_LOG)
+        + SELECTED_ZK_REGION_META_B_COLUMNS * (1 << SELECTED_ZK_REGION_META_B_LOG)
+        + SELECTED_ZK_REGION_MAIN_COLUMNS * (1 << SELECTED_ZK_REGION_MAIN_LOG)
+        + SELECTED_ZK_REGION_META_A_COLUMNS * (1 << SELECTED_ZK_REGION_META_A_LOG)
+        + SELECTED_ZK_REGION_OWNER_COLUMNS * (1 << SELECTED_ZK_REGION_OWNER_LOG)
+        == SELECTED_ZK_REGION_COMMITTED_CELLS
+);
+
+/// Allocation-free input failures for the private selected B255 common
+/// allocator. Every variant is returned before the builder is touched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SelectedZkAuthPcsRegionAllocationError {
+    AuthorizationShape,
+    MissingPairedExactState,
+    LegacyExactStatePaths,
+    ExactStateShape,
+    TxRootShape,
+    SpineShape,
+}
+
+/// Opaque result of the one selected authorization+Meta allocation boundary.
+/// It is not a preparation and carries no finalization token. The owning Block
+/// assembly may borrow the draft to bind all 256 authorization tiles, then
+/// consume this value to recover the draft and paired exact-state handoff.
+pub(super) struct SelectedZkAuthPcsRegionAllocation {
+    draft: crate::region_sidecar::SelectedZkBlockRegionDraft,
+    paired: PairedExactStateCells,
+}
+
+impl SelectedZkAuthPcsRegionAllocation {
+    pub(super) fn draft(&self) -> &crate::region_sidecar::SelectedZkBlockRegionDraft {
+        &self.draft
+    }
+
+    pub(super) fn into_parts(
+        self,
+    ) -> (
+        crate::region_sidecar::SelectedZkBlockRegionDraft,
+        PairedExactStateCells,
+    ) {
+        (self.draft, self.paired)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SelectedZkRegionAllocationLedger {
+    before: usize,
+    wallet_a: usize,
+    wallet_b: usize,
+    meta_b: usize,
+    main: usize,
+    meta_a: usize,
+    owner: usize,
+    after: usize,
+}
+
+impl SelectedZkRegionAllocationLedger {
+    fn new(before: usize) -> Self {
+        let wallet_a = before
+            .checked_next_multiple_of(1 << SELECTED_ZK_REGION_WALLET_A_LOG)
+            .expect("selected wallet-A alignment overflow");
+        let wallet_b =
+            wallet_a + SELECTED_ZK_REGION_WALLET_A_COLUMNS * (1 << SELECTED_ZK_REGION_WALLET_A_LOG);
+        let meta_b =
+            wallet_b + SELECTED_ZK_REGION_WALLET_B_COLUMNS * (1 << SELECTED_ZK_REGION_WALLET_B_LOG);
+        let main =
+            meta_b + SELECTED_ZK_REGION_META_B_COLUMNS * (1 << SELECTED_ZK_REGION_META_B_LOG);
+        let meta_a = main + SELECTED_ZK_REGION_MAIN_COLUMNS * (1 << SELECTED_ZK_REGION_MAIN_LOG);
+        let owner =
+            meta_a + SELECTED_ZK_REGION_META_A_COLUMNS * (1 << SELECTED_ZK_REGION_META_A_LOG);
+        let after = owner + SELECTED_ZK_REGION_OWNER_COLUMNS * (1 << SELECTED_ZK_REGION_OWNER_LOG);
+        Self {
+            before,
+            wallet_a,
+            wallet_b,
+            meta_b,
+            main,
+            meta_a,
+            owner,
+            after,
+        }
     }
 }
 
@@ -647,43 +818,6 @@ fn auth_pcs_obligations_via_region_impl(
     let wallet_w_log = wallet_p.trailing_zeros() as usize;
     let leaf_base = |f: usize| f * leaf_family_slots; // within a wallet tx block
 
-    // Block-meta walk A packs EXSTSLT and the body spine into separate aligned
-    // dyadic regions.  EXSTSLT uses the minimal power of two covering all 2T
-    // sponge slots.  Spine keeps trees first and wraps second within a compact
-    // per-tx block; one spare dyadic half makes exposure re-pointing constant.
-    let es_region_slots = es.map_or(0, |e| {
-        assert!(!e.leaves.is_empty(), "exact-state handoff without leaves");
-        (e.leaves.len() * SPONGE_LEAF_SLOTS).next_power_of_two()
-    });
-    let spine_cap = spine.map_or(0, |s| {
-        assert!(!s.instances.is_empty(), "spine handoff without instances");
-        s.instances.len().div_ceil(k)
-    });
-    assert!(
-        spine_cap == 0 || spine_cap.is_power_of_two(),
-        "spine per-block capacity must be a power of two (got {spine_cap})"
-    );
-    let spine_tree_base = 0usize;
-    let spine_wrap_base = spine_cap * SPINE_TREE_SLOTS;
-    let spine_per_tx = if spine_cap > 0 {
-        (spine_cap * (SPINE_TREE_SLOTS + SPINE_WRAP_SLOTS)).next_power_of_two()
-    } else {
-        0
-    };
-    let spine_block_log = spine_per_tx.trailing_zeros() as usize;
-    let spine_region_slots = k * spine_per_tx;
-    let has_meta = es.is_some() || spine.is_some();
-    let has_both_meta_families = es.is_some() && spine.is_some();
-    let meta_half = es_region_slots.max(spine_region_slots);
-    let meta_p = if has_both_meta_families {
-        2 * meta_half
-    } else {
-        meta_half.max(1)
-    };
-    let meta_w_log = meta_p.trailing_zeros() as usize;
-    let es_meta_base = 0usize;
-    let spine_meta_base = if has_both_meta_families { meta_half } else { 0 };
-
     // Split walk-B leg layouts (class constant). The two wallet legs are
     // FEED-FORWARD (1 slot per node, stride = depth.next_pow2): the source
     // paths run to the committed cap (depth = tree − cap), the mid paths to
@@ -697,43 +831,8 @@ fn auth_pcs_obligations_via_region_impl(
     let depth_s = ff_depths[0];
     let depth_m = ff_depths[1];
     let ff_strides: [usize; 2] = std::array::from_fn(|f| ff_depths[f].next_power_of_two());
-    let paired_es: Option<&ExactStatePairedRegionData> = es.and_then(|e| e.paired.as_ref());
-    let mut leg_depths: Vec<usize> = Vec::new();
-    let mut leg_caps: Vec<usize> = Vec::new();
-    let mut leg_ivs: Vec<[F128; 2]> = Vec::new();
-    let mut es_state_leg: Option<usize> = None;
-    if let Some(e) = es {
-        if e.paired.is_some() {
-            assert!(
-                e.paths.is_empty(),
-                "paired exact-state handoff must not retain legacy paths"
-            );
-        } else {
-            assert!(
-                !e.paths.is_empty(),
-                "legacy exact-state path handoff is empty"
-            );
-            es_state_leg = Some(leg_depths.len());
-            leg_depths.push(e.d_state);
-            leg_caps.push(e.paths.len().div_ceil(k));
-            leg_ivs.push(iv_flat_of_tag(TAG_EXSTNOD));
-        }
-    }
-    // Tx-root paths: one TAG_COMPRESS leg, one path per user tx chunked
-    // across the tx blocks.
-    let mut txr_leg: Option<usize> = None;
-    if let Some(t) = txr {
-        assert!(!t.paths.is_empty(), "tx-root region handoff without paths");
-        txr_leg = Some(leg_depths.len());
-        leg_depths.push(t.depth);
-        leg_caps.push(t.paths.len().div_ceil(k));
-        leg_ivs.push(compress_iv_flat());
-    }
-    let n_legs = leg_depths.len();
-    // Split walk B at the semantic boundary. Wallet-B contains exactly the
-    // two feed-forward capsule legs; optional meta-B contains only the legacy
-    // exact-state / tx-root legs. Each side rounds its own per-tx geometry,
-    // which is the measured B255 saving over rounding their sum.
+    // Wallet-B contains exactly the two feed-forward capsule legs.  Meta-B is
+    // assembled independently by `build_auth_pcs_meta_region_draft` below.
     let wallet_leg_slots: [usize; 2] = std::array::from_fn(|f| nq * ff_strides[f]);
     let wallet_b = tiled_walk_layout(k, &wallet_leg_slots);
     let ff_bases: [usize; 2] = wallet_b
@@ -741,39 +840,6 @@ fn auth_pcs_obligations_via_region_impl(
         .as_slice()
         .try_into()
         .expect("exactly two wallet-B legs");
-    let paired_caps_per_block: Option<[usize; 2]> = paired_es.map(|paired| {
-        assert!(
-            paired.touched_capacity > 0,
-            "paired local capacity is empty"
-        );
-        assert!(
-            paired.segment_capacity > 0,
-            "paired upper capacity is empty"
-        );
-        [
-            paired.touched_capacity.div_ceil(k),
-            paired.segment_capacity.div_ceil(k),
-        ]
-    });
-    let mut meta_slot_families: Vec<usize> = paired_caps_per_block
-        .map(|caps| caps.map(|cap| cap * PAIRED_UPDATE_STRIDE).to_vec())
-        .unwrap_or_default();
-    let paired_family_count = meta_slot_families.len();
-    let meta_leg_slots: Vec<usize> = (0..n_legs)
-        .map(|f| leg_caps[f] * (2 * leg_depths[f]).next_power_of_two())
-        .collect();
-    meta_slot_families.extend(meta_leg_slots);
-    let meta_b =
-        (!meta_slot_families.is_empty()).then(|| tiled_walk_layout(k, &meta_slot_families));
-    let paired_bases: Option<[usize; 2]> = paired_caps_per_block.map(|_| {
-        meta_b.as_ref().expect("paired carrier needs meta-B").bases[..paired_family_count]
-            .try_into()
-            .expect("local and upper paired bases")
-    });
-    let meta_bases: Vec<usize> = meta_b.as_ref().map_or_else(Vec::new, |layout| {
-        layout.bases[paired_family_count..].to_vec()
-    });
-
     // Each walk-B committed set is leg-count FLAT: its legs' slot ranges are
     // disjoint, every relation term is gated by a leg-specific fixed pattern
     // (zero outside its own slots), and the only cross-boundary shifted
@@ -792,9 +858,8 @@ fn auth_pcs_obligations_via_region_impl(
     };
 
     // ===================================================================
-    // Wallet/meta columns, each ghost-filled once with perm([0;4]).  The
-    // wallet set is deliberately only IN(2)+C(4); block metadata retains the
-    // full KID/IN/C set on its much smaller domain.
+    // Wallet columns, ghost-filled once with perm([0;4]).  Block metadata is
+    // built independently by `build_auth_pcs_meta_region_draft` below.
     // ===================================================================
     let mut wallet_cols: Vec<Vec<F128>> = (0..N_WALLET_COMMITTED)
         .map(|_| vec![F128::ZERO; wallet_p])
@@ -803,11 +868,6 @@ fn auth_pcs_obligations_via_region_impl(
         std::array::from_fn(|_| vec![F128::ZERO; wallet_p]);
     let mut wallet_s_out: [Vec<F128>; STATE_SIZE] =
         std::array::from_fn(|_| vec![F128::ZERO; wallet_p]);
-    let mut meta_cols: Vec<Vec<F128>> = (0..N_META_COMMITTED)
-        .map(|_| vec![F128::ZERO; meta_p])
-        .collect();
-    let mut meta_s0: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; meta_p]);
-    let mut meta_s_out: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; meta_p]);
     let (ghost_s0, ghost_out) =
         noid_ivc_core::deep_chain::source_tree::run_perm([F128::ZERO; STATE_SIZE]);
     for slot in 0..wallet_p {
@@ -817,13 +877,6 @@ fn auth_pcs_obligations_via_region_impl(
             wallet_cols[WALLET_C0 + j][slot] = ghost_out[j];
         }
     }
-    for slot in 0..meta_p {
-        for j in 0..STATE_SIZE {
-            meta_s0[j][slot] = ghost_s0[j];
-            meta_s_out[j][slot] = ghost_out[j];
-            meta_cols[C0 + j][slot] = ghost_out[j];
-        }
-    }
     let mut cb_wallet_b: Vec<Vec<F128>> = (0..n_committed_b)
         .map(|_| vec![F128::ZERO; wallet_b.slots])
         .collect();
@@ -831,27 +884,12 @@ fn auth_pcs_obligations_via_region_impl(
         std::array::from_fn(|_| vec![F128::ZERO; wallet_b.slots]);
     let mut sout_wallet_b: [Vec<F128>; STATE_SIZE] =
         std::array::from_fn(|_| vec![F128::ZERO; wallet_b.slots]);
-    let meta_b_slots = meta_b.as_ref().map_or(0, |layout| layout.slots);
-    let mut cb_meta_b: Vec<Vec<F128>> = (0..n_committed_b)
-        .map(|_| vec![F128::ZERO; meta_b_slots])
-        .collect();
-    let mut s0_meta_b: [Vec<F128>; STATE_SIZE] =
-        std::array::from_fn(|_| vec![F128::ZERO; meta_b_slots]);
-    let mut sout_meta_b: [Vec<F128>; STATE_SIZE] =
-        std::array::from_fn(|_| vec![F128::ZERO; meta_b_slots]);
     let (ghb0, ghbo) = noid_ivc_core::deep_chain::source_tree::run_perm([F128::ZERO; STATE_SIZE]);
     for slot in 0..wallet_b.slots {
         for j in 0..STATE_SIZE {
             s0_wallet_b[j][slot] = ghb0[j];
             sout_wallet_b[j][slot] = ghbo[j];
             cb_wallet_b[j][slot] = ghbo[j];
-        }
-    }
-    for slot in 0..meta_b_slots {
-        for j in 0..STATE_SIZE {
-            s0_meta_b[j][slot] = ghb0[j];
-            sout_meta_b[j][slot] = ghbo[j];
-            cb_meta_b[j][slot] = ghbo[j];
         }
     }
 
@@ -864,27 +902,12 @@ fn auth_pcs_obligations_via_region_impl(
     // is bound. Collected as (col, slot, wire) and resolved post-loop as
     // pin_eq(wire, cell). Wallet-A, meta-A and walk-B use explicit slices below.
     let mut cell_pins_wallet: Vec<(usize, usize, LinExpr)> = Vec::new();
-    let mut cell_pins_meta: Vec<(usize, usize, LinExpr)> = Vec::new();
     let mut cell_pins_wallet_b: Vec<(usize, usize, LinExpr)> = Vec::new();
-    let mut cell_pins_meta_b: Vec<(usize, usize, LinExpr)> = Vec::new();
-    // Tiled SPINE-tree exposure: every instance (real + ghost, block-major)
-    // appends its KID low half (2L cells) and full C (4L cells); ONE gated
-    // sumcheck after the loop discharges every spine tree, re-pointing 4
-    // terminal claims into walk A — flat (O(1)) in tx count.
-    let mut spine_expo_kid0: Vec<F128> = Vec::new();
-    let mut spine_expo_kid1: Vec<F128> = Vec::new();
-    let mut spine_expo_c0: Vec<F128> = Vec::new();
-    let mut spine_expo_c1: Vec<F128> = Vec::new();
-    // Per-leg-type walk-B accumulators (each grows to K·cap across the loop).
-    let mut acc_committed_roots: Vec<Vec<[F128; 2]>> = vec![Vec::new(); n_legs];
-    let mut acc_recomputed_roots: Vec<Vec<[F128; 2]>> = vec![Vec::new(); n_legs];
-    let mut acc_entry_wires: Vec<Vec<[LinExpr; 2]>> = vec![Vec::new(); n_legs];
-    let mut acc_root_wires: Vec<Vec<[LinExpr; 2]>> = vec![Vec::new(); n_legs];
-    let mut acc_path_slots: Vec<Vec<usize>> = vec![Vec::new(); n_legs];
     // Feed-forward wallet legs: entry pins go through `cell_pins_wallet_b`.
-    // The existing CR chain exposes each final digest in the first spare
-    // stride-tail CR cell, so roots need only one direct equality per lane.
-    let mut ff_root_copy_pins: Vec<(usize, [LinExpr; 2])> = Vec::new();
+    // A short path exposes its root in the first stride-tail CR cell. A
+    // power-of-two-depth path has no tail, so its root pin consumes the final
+    // node's constrained feed-forward expression instead.
+    let mut ff_root_pins: Vec<WalletFfRootPin> = Vec::new();
     let mut all_expands_ok = true;
 
     // -------------------------------------------------------------------
@@ -1113,17 +1136,27 @@ fn auth_pcs_obligations_via_region_impl(
                     lanes_raw(&opening.mid_root)
                 };
                 assert_eq!(fcols.roots[q], committed, "ff leg root != committed root");
-                let root_copy = family
-                    .root_copy_offset()
-                    .expect("wallet ff depth must leave one stride-tail slot");
-                assert_eq!(
-                    [
-                        fcols.cr[0][q * ff_strides[fam] + root_copy],
-                        fcols.cr[1][q * ff_strides[fam] + root_copy],
-                    ],
-                    committed,
-                    "ff root-copy cell != committed root"
-                );
+                if let Some(root_copy) = family.root_copy_offset() {
+                    assert_eq!(
+                        [
+                            fcols.cr[0][q * ff_strides[fam] + root_copy],
+                            fcols.cr[1][q * ff_strides[fam] + root_copy],
+                        ],
+                        committed,
+                        "ff root-copy cell != committed root"
+                    );
+                } else {
+                    let last = q * ff_strides[fam] + family.depth - 1;
+                    let composite = std::array::from_fn(|lane| {
+                        let cr = fcols.cr[lane][last];
+                        let sib = fcols.sib[lane][last];
+                        fcols.c[lane][last] + cr + fcols.d[last] * (cr + sib)
+                    });
+                    assert_eq!(
+                        composite, committed,
+                        "ff composite-root expression != committed root"
+                    );
+                }
             }
         }
         fill_wallet_query_bit_carriers(
@@ -1138,327 +1171,46 @@ fn auth_pcs_obligations_via_region_impl(
         );
     } // end native column assembly over txs
 
-    // ===================================================================
-    // Paired exact-state families (optional): fixed-capacity local and upper
-    // updates are independently chunked over the K meta-B blocks. Every
-    // update occupies exactly 64 slots; overhang in the final K tile is the
-    // paired builder's canonical ghost. Stage 2 pins every such committed
-    // cell to that canonical value and the handoff does not expose it.
-    // ===================================================================
-    if let Some(paired) = paired_es {
-        let packed = paired.packed_updates();
-        assert_eq!(
-            packed.updates.len(),
-            paired.touched_capacity + paired.segment_capacity,
-            "paired packed capacity"
-        );
-        assert_eq!(
-            packed.active_slots,
-            packed.updates.len() * PAIRED_UPDATE_STRIDE,
-            "paired packed active slots"
-        );
-        let (local_updates, upper_updates) = packed.updates.split_at(paired.touched_capacity);
-        let partitions = [local_updates, upper_updates];
-        let caps = paired_caps_per_block.expect("paired per-block capacities");
-        let bases = paired_bases.expect("paired meta-B bases");
-        let layout = meta_b.as_ref().expect("paired carrier needs meta-B");
-        let iv = iv_flat_of_tag(TAG_EXSTNOD);
-        for blk in 0..k {
-            for family in 0..2 {
-                let cap = caps[family];
-                let lo = (blk * cap).min(partitions[family].len());
-                let hi = ((blk + 1) * cap).min(partitions[family].len());
-                let family_slots = cap * PAIRED_UPDATE_STRIDE;
-                let family_w_log = family_slots.next_power_of_two().trailing_zeros() as usize;
-                let columns = build_paired_merkle_update_columns(
-                    &partitions[family][lo..hi],
-                    iv,
-                    family_w_log,
-                );
-                place_paired_merkle_updates(
-                    &mut cb_meta_b,
-                    &mut s0_meta_b,
-                    &mut sout_meta_b,
-                    &columns,
-                    blk * layout.block_slots + bases[family],
-                    family_slots,
-                );
-            }
-        }
-    }
-
-    // ===================================================================
-    // Exact-state families.  All 2T slot-leaf sponge tiles fill their minimal
-    // dyadic block-meta region contiguously (the tail is canonical sponge
-    // ghosts); state Merkle paths retain their K-way chunking in walk B.
-    // ===================================================================
-    if let Some(e) = es {
-        let n_es = e.leaves.len();
-        let pad_flat = slot_leaf_pad_flat();
-        let leaf_data: Vec<(F128, F128, F128)> = e
-            .leaves
-            .iter()
-            .map(|l| (l.packed_value_flat, l.owner_hi_flat, l.owner_lo_flat))
-            .collect();
-        let es_w_log = es_region_slots.trailing_zeros() as usize;
-        let (tc, tile_digests) = build_sponge_leaf_columns(&leaf_data, es_w_log);
-        let base = es_meta_base;
-        for j in 0..2 {
-            meta_cols[IN0 + j][base..base + es_region_slots].copy_from_slice(&tc.in_[j]);
-        }
-        for j in 0..STATE_SIZE {
-            meta_cols[C0 + j][base..base + es_region_slots].copy_from_slice(&tc.c[j]);
-            meta_s0[j][base..base + es_region_slots].copy_from_slice(&tc.s0[j]);
-            meta_s_out[j][base..base + es_region_slots].copy_from_slice(&tc.s_out[j]);
-        }
-        for (g, leaf) in e.leaves.iter().enumerate() {
-            assert_eq!(
-                tile_digests[g], leaf.expected_leaf_flat,
-                "es sponge tile digest != the statement's expected leaf"
-            );
-            let off = base + g * SPONGE_LEAF_SLOTS;
-            // Statement wires pinned to the committed absorb cells; the PAD
-            // lane is a protocol constant (`pad_after_one_field`).
-            cell_pins_meta.push((IN0, off, leaf.packed_value_w.clone()));
-            cell_pins_meta.push((IN0 + 1, off, leaf.owner_hi_w.clone()));
-            cell_pins_meta.push((IN0, off + 1, leaf.owner_lo_w.clone()));
-            cell_pins_meta.push((IN0 + 1, off + 1, LinExpr::constant(pad_flat)));
-            // Digest cells == the expected-leaf statement wires — the SAME
-            // wires the state leg reads as its Merkle entries.
-            let dslot = off + SPONGE_LEAF_DIGEST_SLOT;
-            cell_pins_meta.push((C0, dslot, leaf.expected_leaf_w[0].clone()));
-            cell_pins_meta.push((C0 + 1, dslot, leaf.expected_leaf_w[1].clone()));
-        }
-
-        if let Some(state_leg) = es_state_leg {
-            assert_eq!(e.paths.len(), n_es, "one state path per slot leaf");
-            let state_cap = leg_caps[state_leg];
-            for blk in 0..k {
-                let lo = (blk * state_cap).min(n_es);
-                let hi = ((blk + 1) * state_cap).min(n_es);
-                // --- Walk B: this block's state-path chunk;
-                // entries = the paired slot-leaf digest wires, roots = the
-                // old/new expected-root statement wires). ---
-                let state_paths: Vec<EsPathReal> = (lo..hi)
-                    .map(|g| {
-                        let path = &e.paths[g];
-                        assert_eq!(
-                            path.entry_leaf_index, g,
-                            "leaf↔path pairing is index-aligned"
-                        );
-                        assert_eq!(path.siblings.len(), e.d_state, "state path depth");
-                        let leaf = &e.leaves[g];
-                        let (root_w, root_flat) = if path.is_old {
-                            (e.old_root_w.clone(), e.old_root_flat)
-                        } else {
-                            (e.new_root_w.clone(), e.new_root_flat)
-                        };
-                        EsPathReal {
-                            entry_flat: leaf.expected_leaf_flat,
-                            entry_w: leaf.expected_leaf_w.clone(),
-                            siblings: path.siblings.clone(),
-                            directions: path.directions.clone(),
-                            root_flat,
-                            root_w,
-                        }
-                    })
-                    .collect();
-                fill_es_merkle_leg(
-                    &mut cb_meta_b,
-                    &mut s0_meta_b,
-                    &mut sout_meta_b,
-                    &mut acc_entry_wires[state_leg],
-                    &mut acc_root_wires[state_leg],
-                    &mut acc_committed_roots[state_leg],
-                    &mut acc_path_slots[state_leg],
-                    &mut acc_recomputed_roots[state_leg],
-                    e.d_state,
-                    state_cap,
-                    leg_ivs[state_leg],
-                    4,
-                    blk * meta_b.as_ref().expect("state leg needs meta-B").block_slots
-                        + meta_bases[state_leg],
-                    &state_paths,
-                );
-            }
-        }
-    }
-
-    // ===================================================================
-    // Tx-root paths (block-level, chunked like the exact-state families):
-    // one TAG_COMPRESS walk-B leg, entries = the spine tx-hash wires, every
-    // root = the underlying universal-tree Merkle root M wires. The leaf POSITION is bound by
-    // const-pinning the committed direction cells to the leaf-index bits
-    // (block content never moves a tx to another slot), and the padding rim
-    // by const-pinning the LAST real path's right-hand sibling cells to the
-    // zero-subtree constants — the exact bindings the inline slot pinned on
-    // its statement wires. Const pins are self-testing: a wrong bit or rim
-    // constant makes the HONEST witness unsatisfiable.
-    // ===================================================================
-    if let Some(t) = txr {
-        let txr_leg = txr_leg.expect("tx-root leg index");
-        let cap = leg_caps[txr_leg];
-        let stride = (2 * t.depth).next_power_of_two();
-        let d_col = 8;
-        let sib_cols = [6, 7];
-        let n_paths = t.paths.len();
-        // Tier-capacity handoffs authenticate EVERY padded-tree leaf and carry
-        // no rim constants (the padding leaves are proven zero directly);
-        // exact-count handoffs carry one rim constant per level for the last
-        // real path's right-hand siblings.
-        assert!(
-            t.rim_flat.is_empty() || t.rim_flat.len() == t.depth,
-            "one rim constant per level (or none at tier capacity)"
-        );
-        for blk in 0..k {
-            let lo = (blk * cap).min(n_paths);
-            let hi = ((blk + 1) * cap).min(n_paths);
-            let real: Vec<EsPathReal> = (lo..hi)
-                .map(|j| {
-                    let p = &t.paths[j];
-                    assert_eq!(p.siblings.len(), t.depth, "tx-root path depth");
-                    EsPathReal {
-                        entry_flat: p.entry_flat,
-                        entry_w: p.entry_w.clone(),
-                        siblings: p.siblings.clone(),
-                        directions: (0..t.depth).map(|l| (j >> l) & 1 == 1).collect(),
-                        root_flat: t.root_flat,
-                        root_w: t.root_w.clone(),
-                    }
-                })
-                .collect();
-            let region_base = blk
-                * meta_b
-                    .as_ref()
-                    .expect("tx-root leg needs meta-B")
-                    .block_slots
-                + meta_bases[txr_leg];
-            fill_es_merkle_leg(
-                &mut cb_meta_b,
-                &mut s0_meta_b,
-                &mut sout_meta_b,
-                &mut acc_entry_wires[txr_leg],
-                &mut acc_root_wires[txr_leg],
-                &mut acc_committed_roots[txr_leg],
-                &mut acc_path_slots[txr_leg],
-                &mut acc_recomputed_roots[txr_leg],
-                t.depth,
-                cap,
-                leg_ivs[txr_leg],
-                4,
-                region_base,
-                &real,
-            );
-            for (i, j) in (lo..hi).enumerate() {
-                let base = region_base + i * stride;
-                for level in 0..t.depth {
-                    let bit = (j >> level) & 1 == 1;
-                    cell_pins_meta_b.push((
-                        d_col,
-                        base + 2 * level,
-                        LinExpr::constant(if bit { F128::ONE } else { F128::ZERO }),
-                    ));
-                }
-                if !t.rim_flat.is_empty() && j == n_paths - 1 {
-                    for level in 0..t.depth {
-                        if (j >> level) & 1 == 0 {
-                            for lane in 0..2 {
-                                cell_pins_meta_b.push((
-                                    sib_cols[lane],
-                                    base + 2 * level,
-                                    LinExpr::constant(t.rim_flat[level][lane]),
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // ===================================================================
-    // Tx-body spine (block-level, chunked like the exact-state families):
-    // per instance, one 32-slot compress tree plus one independent wrap slot
-    // fill block-meta A's spine region. Real instances pin all sixteen raw body-leaf
-    // statement pairs directly to the tree KID leaf cells, feed the tree root
-    // into the TAG_TX8X2 wrap, and pin its digest to the tx-hash statement.
-    // Ghost instances are the deterministic all-zero raw-leaf body; nothing
-    // downstream reads their digest.
-    // ===================================================================
-    if let Some(sp) = spine {
-        let n_inst = sp.instances.len();
-        for blk in 0..k {
-            for i in 0..spine_cap {
-                let g = blk * spine_cap + i;
-                let inst_flat = sp
-                    .instances
-                    .get(g)
-                    .map(|inst| inst.flat.clone())
-                    .unwrap_or_else(SpineInstanceFlat::ghost);
-                let icols = build_spine_instance_columns(&inst_flat);
-                let tree_abs =
-                    spine_meta_base + blk * spine_per_tx + spine_tree_base + i * SPINE_TREE_SLOTS;
-                let wrap_abs =
-                    spine_meta_base + blk * spine_per_tx + spine_wrap_base + i * SPINE_WRAP_SLOTS;
-                for j in 0..STATE_SIZE {
-                    meta_cols[C0 + j][tree_abs..tree_abs + SPINE_TREE_SLOTS]
-                        .copy_from_slice(&icols.tree_c[j]);
-                    meta_s0[j][tree_abs..tree_abs + SPINE_TREE_SLOTS]
-                        .copy_from_slice(&icols.tree_s0[j]);
-                    meta_s_out[j][tree_abs..tree_abs + SPINE_TREE_SLOTS]
-                        .copy_from_slice(&icols.tree_s_out[j]);
-                    meta_cols[C0 + j][wrap_abs..wrap_abs + SPINE_WRAP_SLOTS]
-                        .copy_from_slice(&icols.wrap_c[j]);
-                    meta_s0[j][wrap_abs..wrap_abs + SPINE_WRAP_SLOTS]
-                        .copy_from_slice(&icols.wrap_s0[j]);
-                    meta_s_out[j][wrap_abs..wrap_abs + SPINE_WRAP_SLOTS]
-                        .copy_from_slice(&icols.wrap_s_out[j]);
-                }
-                for lane in 0..2 {
-                    meta_cols[KID0 + lane][tree_abs..tree_abs + SPINE_TREE_SLOTS]
-                        .copy_from_slice(&icols.tree_kid[lane]);
-                    meta_cols[IN0 + lane][wrap_abs..wrap_abs + SPINE_WRAP_SLOTS]
-                        .copy_from_slice(&icols.wrap_in[lane]);
-                }
-                let kid_half = SPINE_TREE_SLOTS / 2;
-                spine_expo_kid0.extend_from_slice(&icols.tree_kid[0][..kid_half]);
-                spine_expo_kid1.extend_from_slice(&icols.tree_kid[1][..kid_half]);
-                spine_expo_c0.extend_from_slice(&icols.tree_c[0]);
-                spine_expo_c1.extend_from_slice(&icols.tree_c[1]);
-
-                if g >= n_inst {
-                    continue; // ghost: no statement, no pins
-                }
-                let inst = &sp.instances[g];
-                assert_eq!(
-                    icols.tx_hash, inst.tx_hash_flat,
-                    "spine instance {g}: region tx-body hash != the statement wires"
-                );
-                // Every raw statement leaf feeds the corresponding external
-                // KID position. There is no record-leaf hash family.
-                for (leaf, wpair) in inst.leaves_w.iter().enumerate() {
-                    let kslot = tree_abs + SPINE_TREE_KID_LEAF_BASE + leaf;
-                    cell_pins_meta.push((KID0, kslot, wpair[0].clone()));
-                    cell_pins_meta.push((KID0 + 1, kslot, wpair[1].clone()));
-                }
-                // Tree root → wrap IN (shared wire; the root cell is the
-                // tree's C0/C1 at heap node 1's odd slot, index 3).
-                for lane in 0..2 {
-                    let w = LinExpr::from_wire(b.alloc_f128(icols.root[lane]));
-                    cell_pins_meta.push((C0 + lane, tree_abs + 3, w.clone()));
-                    cell_pins_meta.push((IN0 + lane, wrap_abs + SPINE_WRAP_SLOT, w));
-                }
-                // Wrap digest → the tx-hash statement wires.
-                for lane in 0..2 {
-                    cell_pins_meta.push((
-                        C0 + lane,
-                        wrap_abs + SPINE_WRAP_SLOT,
-                        inst.tx_hash_w[lane].clone(),
-                    ));
-                }
-            }
-        }
-    }
+    let AuthPcsMetaRegionDraft {
+        has_meta,
+        has_both_a_families: has_both_meta_families,
+        es_region_slots,
+        spine_cap,
+        spine_tree_base,
+        spine_wrap_base,
+        spine_block_log,
+        spine_region_slots,
+        meta_w_log,
+        es_meta_base,
+        spine_meta_base,
+        meta_b,
+        paired_caps_per_block,
+        paired_bases,
+        meta_bases,
+        leg_depths,
+        leg_caps,
+        leg_ivs,
+        meta_b_families,
+        meta_cols,
+        meta_s0,
+        meta_s_out,
+        cb_meta_b,
+        s0_meta_b,
+        sout_meta_b,
+        cell_pins_meta,
+        mut cell_pins_meta_b,
+        spine_expo_kid0,
+        spine_expo_kid1,
+        spine_expo_c0,
+        spine_expo_c1,
+        mut acc_committed_roots,
+        mut acc_recomputed_roots,
+        mut acc_entry_wires,
+        mut acc_root_wires,
+        mut acc_path_slots,
+    } = build_auth_pcs_meta_region_draft(b, k, es, txr, spine);
+    let n_legs = leg_depths.len();
+    let paired_es: Option<&ExactStatePairedRegionData> = es.and_then(|e| e.paired.as_ref());
 
     assert!(
         all_expands_ok,
@@ -1548,22 +1300,14 @@ fn auth_pcs_obligations_via_region_impl(
     let meta_b_slice_base = slices.len();
     slices.extend(meta_b_slices.iter().copied());
 
-    let paired_handoff = paired_es.map(|paired| {
-        let layout = meta_b.as_ref().expect("paired carrier needs meta-B slices");
-        let bases = paired_bases.expect("paired family bases");
-        let caps = paired_caps_per_block.expect("paired family capacities");
-        pin_paired_consistency_cells(b, &meta_b_slices, layout, bases, caps);
-        pin_paired_overhang_ghost_cells(
-            b,
-            &meta_b_slices,
-            layout,
-            bases,
-            caps,
-            [paired.touched_capacity, paired.segment_capacity],
-            iv_flat_of_tag(TAG_EXSTNOD),
-        );
-        paired_exact_state_cells(&meta_b_slices, layout, bases, caps, paired)
-    });
+    let paired_handoff = bind_auth_pcs_meta_paired_handoff(
+        b,
+        &meta_b_slices,
+        meta_b.as_ref(),
+        paired_bases,
+        paired_caps_per_block,
+        paired_es,
+    );
     if paired_handoff.is_some() {
         crate::acceptance::row_ledger_mark(
             b,
@@ -1803,9 +1547,10 @@ fn auth_pcs_obligations_via_region_impl(
             );
             let cap_root =
                 std::array::from_fn(|lane| mle_evaluate_small_trace(b, &cap_lanes[lane], rc_bits));
-            ff_root_copy_pins.push((s_slot + depth_s, cap_root));
-            ff_root_copy_pins.push((
-                m_slot + depth_m,
+            ff_root_pins.push(WalletFfRootPin::new(s_slot, depth_s, cap_root));
+            ff_root_pins.push(WalletFfRootPin::new(
+                m_slot,
+                depth_m,
                 [mid_root_w[0].clone(), mid_root_w[1].clone()],
             ));
         }
@@ -1846,7 +1591,7 @@ fn auth_pcs_obligations_via_region_impl(
         pin_stage2_cells(b, &meta_slices, &cell_pins_meta);
         pin_stage2_cells(b, &wallet_b_slices, &cell_pins_wallet_b);
         pin_stage2_cells(b, &meta_b_slices, &cell_pins_meta_b);
-        pin_wallet_b_root_cells(b, &wallet_b_slices, &ff_root_copy_pins);
+        pin_wallet_b_roots(b, &wallet_b_slices, &ff_root_pins);
         crate::acceptance::row_ledger_mark(
             b,
             &mut ledger,
@@ -1931,23 +1676,19 @@ fn auth_pcs_obligations_via_region_impl(
         )
         .expect("canonical wallet-B sidecar VK");
 
-        let paired_iv = iv_flat_of_tag(TAG_EXSTNOD);
-        let mut meta_b_families = Vec::with_capacity(2 + n_legs);
-        for family in 0..2 {
-            meta_b_families.push(crate::region_sidecar::MerkleRegionFamily::PairedUpdate {
-                offset: paired_offsets[family],
-                n_updates: paired_caps[family],
-                iv: paired_iv,
-            });
-        }
-        for family in 0..n_legs {
-            meta_b_families.push(crate::region_sidecar::MerkleRegionFamily::TwoPermutation {
-                offset: meta_bases[family],
-                depth: leg_depths[family],
-                n_paths: leg_caps[family],
-                iv: leg_ivs[family],
-            });
-        }
+        assert_eq!(
+            meta_b_families.len(),
+            2 + n_legs,
+            "production Meta-B family descriptor count"
+        );
+        debug_assert_eq!(
+            meta_b_families[0],
+            crate::region_sidecar::MerkleRegionFamily::PairedUpdate {
+                offset: paired_offsets[0],
+                n_updates: paired_caps[0],
+                iv: iv_flat_of_tag(TAG_EXSTNOD),
+            }
+        );
         let meta_b_vk = crate::region_sidecar::MerkleRegionVk::new(
             auth_pcs_meta_b_sidecar_purpose(),
             meta_b_layout.w_log,
@@ -2266,61 +2007,79 @@ fn auth_pcs_obligations_via_region_impl(
     if let Some(layout) = meta_b.as_ref() {
         let mut fixed_meta_b: Vec<FixedPattern> = Vec::new();
         let mut paired_specs: Vec<PairedMerkleSpec> = Vec::new();
-        if let (Some(caps), Some(bases)) = (paired_caps_per_block, paired_bases) {
-            let iv = iv_flat_of_tag(TAG_EXSTNOD);
-            for family in 0..2 {
-                let fixed_base = fixed_meta_b.len();
-                for pattern in paired_merkle_update_fixed_patterns(iv) {
-                    fixed_meta_b.push(common_period_pattern(
-                        &pattern.table,
-                        bases[family],
-                        caps[family],
+        let mut meta_legs: Vec<MerkleLeg> = Vec::with_capacity(n_legs);
+        let mut leg_index = 0usize;
+        for descriptor in &meta_b_families {
+            match *descriptor {
+                crate::region_sidecar::MerkleRegionFamily::PairedUpdate {
+                    offset,
+                    n_updates,
+                    iv,
+                } => {
+                    let fixed_base = fixed_meta_b.len();
+                    for pattern in paired_merkle_update_fixed_patterns(iv) {
+                        fixed_meta_b.push(common_period_pattern(
+                            &pattern.table,
+                            offset,
+                            n_updates,
+                            layout.block_log,
+                        ));
+                    }
+                    fixed_meta_b.push(common_period_ones(
+                        offset,
+                        n_updates * PAIRED_UPDATE_STRIDE,
                         layout.block_log,
                     ));
+                    paired_specs.push(PairedMerkleSpec {
+                        refs: paired_merkle_update_refs(0, fixed_base),
+                        region: fixed_base + 11,
+                    });
                 }
-                fixed_meta_b.push(common_period_ones(
-                    bases[family],
-                    caps[family] * PAIRED_UPDATE_STRIDE,
-                    layout.block_log,
-                ));
-                paired_specs.push(PairedMerkleSpec {
-                    refs: paired_merkle_update_refs(0, fixed_base),
-                    region: fixed_base + 11,
-                });
+                crate::region_sidecar::MerkleRegionFamily::TwoPermutation {
+                    offset,
+                    depth,
+                    n_paths,
+                    iv,
+                } => {
+                    let f = leg_index;
+                    assert!(f < n_legs, "too many Meta-B path descriptors");
+                    debug_assert_eq!(
+                        (offset, depth, n_paths, iv),
+                        (meta_bases[f], leg_depths[f], leg_caps[f], leg_ivs[f])
+                    );
+                    let fixed_base = fixed_meta_b.len();
+                    let family = MerklePathFamily { depth, n_paths };
+                    for pat in merkle_fixed_patterns(&family, iv) {
+                        fixed_meta_b.push(common_period_pattern(
+                            &pat.table,
+                            offset,
+                            n_paths,
+                            layout.block_log,
+                        ));
+                    }
+                    fixed_meta_b.push(common_period_ones(
+                        offset,
+                        family.n_slots(),
+                        layout.block_log,
+                    ));
+                    meta_legs.push(MerkleLeg {
+                        family,
+                        refs: union_merkle_refs(fixed_base),
+                        region: fixed_base + 8,
+                        committed_roots: std::mem::take(&mut acc_committed_roots[f]),
+                        entry_wires: std::mem::take(&mut acc_entry_wires[f]),
+                        root_wires: std::mem::take(&mut acc_root_wires[f]),
+                        path_slots: std::mem::take(&mut acc_path_slots[f]),
+                        recomputed_roots: std::mem::take(&mut acc_recomputed_roots[f]),
+                    });
+                    leg_index += 1;
+                }
+                crate::region_sidecar::MerkleRegionFamily::FeedForward { .. } => {
+                    unreachable!("wallet family in Meta-B draft")
+                }
             }
         }
-        let mut meta_legs: Vec<MerkleLeg> = Vec::with_capacity(n_legs);
-        for f in 0..n_legs {
-            let depth = leg_depths[f];
-            let fixed_base = fixed_meta_b.len();
-            let family = MerklePathFamily {
-                depth,
-                n_paths: leg_caps[f],
-            };
-            for pat in merkle_fixed_patterns(&family, leg_ivs[f]) {
-                fixed_meta_b.push(common_period_pattern(
-                    &pat.table,
-                    meta_bases[f],
-                    leg_caps[f],
-                    layout.block_log,
-                ));
-            }
-            fixed_meta_b.push(common_period_ones(
-                meta_bases[f],
-                family.n_slots(),
-                layout.block_log,
-            ));
-            meta_legs.push(MerkleLeg {
-                family,
-                refs: union_merkle_refs(fixed_base),
-                region: fixed_base + 8,
-                committed_roots: std::mem::take(&mut acc_committed_roots[f]),
-                entry_wires: std::mem::take(&mut acc_entry_wires[f]),
-                root_wires: std::mem::take(&mut acc_root_wires[f]),
-                path_slots: std::mem::take(&mut acc_path_slots[f]),
-                recomputed_roots: std::mem::take(&mut acc_recomputed_roots[f]),
-            });
-        }
+        assert_eq!(leg_index, n_legs, "missing Meta-B path descriptor");
         let committed_meta_b: Vec<&[F128]> = cb_meta_b.iter().map(|c| c.as_slice()).collect();
         let native_meta_b = run_merkle_union_native_with_paired(
             &committed_meta_b,
@@ -2364,10 +2123,9 @@ fn auth_pcs_obligations_via_region_impl(
     pin_stage2_cells(b, &meta_slices, &cell_pins_meta);
     pin_stage2_cells(b, &wallet_b_slices, &cell_pins_wallet_b);
     pin_stage2_cells(b, &meta_b_slices, &cell_pins_meta_b);
-    // Feed-forward root pins: NODENS extends the existing CR-chain one slot
-    // into the spare stride tail, so the recomputed root is already one
-    // committed CR cell. Bind that cell directly to the FS-observed root.
-    pin_wallet_b_root_cells(b, &wallet_b_slices, &ff_root_copy_pins);
+    // Feed-forward root pins: short paths use the NODENS-constrained CR tail;
+    // exact-stride paths use the final node's constrained composite digest.
+    pin_wallet_b_roots(b, &wallet_b_slices, &ff_root_pins);
     crate::acceptance::row_ledger_mark(b, &mut ledger, "plural: stage-2 A/B cell pins");
 
     // ===================================================================
@@ -2694,18 +2452,50 @@ fn pin_stage2_cells(
     }
 }
 
-fn pin_wallet_b_root_cells(
+#[derive(Clone)]
+struct WalletFfRootPin {
+    base_slot: usize,
+    depth: usize,
+    root_wires: [LinExpr; 2],
+}
+
+impl WalletFfRootPin {
+    fn new(base_slot: usize, depth: usize, root_wires: [LinExpr; 2]) -> Self {
+        assert!(depth > 0, "ff-Merkle root pin needs a non-empty path");
+        Self {
+            base_slot,
+            depth,
+            root_wires,
+        }
+    }
+}
+
+/// Pin the public root of each wallet-B feed-forward path. Non-power-of-two
+/// depths use the CR root-copy cell constrained by `NODENS`. At an exact
+/// power-of-two depth there is no spare stride slot, so reconstruct the final
+/// feed-forward digest from committed cells already constrained by the node
+/// substitution and CR-chain relations:
+///
+/// `root_i = C_i + CR_i + D * (CR_i + SIB_i)`.
+fn pin_wallet_b_roots(
     b: &mut FieldR1csBuilder,
     slices: &[WitnessSlice],
-    root_pins: &[(usize, [LinExpr; 2])],
+    root_pins: &[WalletFfRootPin],
 ) {
-    for (root_copy_slot, root_wires) in root_pins {
+    for pin in root_pins {
+        let stride = pin.depth.next_power_of_two();
         for lane in 0..2 {
-            pin_eq(
-                b,
-                &slot_cell(&slices[4 + lane], *root_copy_slot),
-                &root_wires[lane],
-            );
+            let root = if pin.depth < stride {
+                slot_cell(&slices[4 + lane], pin.base_slot + pin.depth)
+            } else {
+                let last = pin.base_slot + pin.depth - 1;
+                let cr = slot_cell(&slices[4 + lane], last);
+                let sib = slot_cell(&slices[6 + lane], last);
+                let direction = slot_cell(&slices[8], last);
+                let selected_delta = mul(b, &direction, &cr.add(&sib));
+                slot_cell(&slices[lane], last).add(&cr).add(&selected_delta)
+            };
+            pin_eq(b, &root, &pin.root_wires[lane]);
         }
     }
 }
@@ -3572,6 +3362,1231 @@ pub struct SpineInstanceRegion {
     pub tx_hash_flat: [F128; 2],
 }
 
+/// Assemble the complete raw Meta-A/Meta-B draft without observing wallet
+/// obligations or native capsule proofs.  This is intentionally called at the
+/// old metadata-fill point in the enclosing monolith, so the spine bridge-wire
+/// allocation order remains byte-for-byte/matrix-for-matrix unchanged.
+fn build_auth_pcs_meta_region_draft(
+    b: &mut FieldR1csBuilder,
+    k: usize,
+    es: Option<&ExactStateRegionData>,
+    txr: Option<&TxRootRegionData>,
+    spine: Option<&SpineRegionData>,
+) -> AuthPcsMetaRegionDraft {
+    assert!(k.is_power_of_two(), "meta region tile count must be dyadic");
+
+    // Meta-A geometry: EXSTSLT and the body spine occupy separate aligned
+    // dyadic regions when both are present.
+    let es_region_slots = es.map_or(0, |e| {
+        assert!(!e.leaves.is_empty(), "exact-state handoff without leaves");
+        (e.leaves.len() * SPONGE_LEAF_SLOTS).next_power_of_two()
+    });
+    let spine_cap = spine.map_or(0, |s| {
+        assert!(!s.instances.is_empty(), "spine handoff without instances");
+        s.instances.len().div_ceil(k)
+    });
+    assert!(
+        spine_cap == 0 || spine_cap.is_power_of_two(),
+        "spine per-block capacity must be a power of two (got {spine_cap})"
+    );
+    let spine_tree_base = 0usize;
+    let spine_wrap_base = spine_cap * SPINE_TREE_SLOTS;
+    let spine_per_tx = if spine_cap > 0 {
+        (spine_cap * (SPINE_TREE_SLOTS + SPINE_WRAP_SLOTS)).next_power_of_two()
+    } else {
+        0
+    };
+    let spine_block_log = spine_per_tx.trailing_zeros() as usize;
+    let spine_region_slots = k * spine_per_tx;
+    let has_meta = es.is_some() || spine.is_some();
+    let has_both_a_families = es.is_some() && spine.is_some();
+    let meta_half = es_region_slots.max(spine_region_slots);
+    let meta_p = if has_both_a_families {
+        2 * meta_half
+    } else {
+        meta_half.max(1)
+    };
+    let meta_w_log = meta_p.trailing_zeros() as usize;
+    let es_meta_base = 0usize;
+    let spine_meta_base = if has_both_a_families { meta_half } else { 0 };
+
+    // Meta-B geometry: paired exact-state families first, followed by the
+    // transitional legacy exact-state path and tx-root path families.
+    let paired_es = es.and_then(|e| e.paired.as_ref());
+    let mut leg_depths = Vec::new();
+    let mut leg_caps = Vec::new();
+    let mut leg_ivs = Vec::new();
+    let mut es_state_leg = None;
+    if let Some(e) = es {
+        if e.paired.is_some() {
+            assert!(
+                e.paths.is_empty(),
+                "paired exact-state handoff must not retain legacy paths"
+            );
+        } else {
+            assert!(
+                !e.paths.is_empty(),
+                "legacy exact-state path handoff is empty"
+            );
+            es_state_leg = Some(leg_depths.len());
+            leg_depths.push(e.d_state);
+            leg_caps.push(e.paths.len().div_ceil(k));
+            leg_ivs.push(iv_flat_of_tag(TAG_EXSTNOD));
+        }
+    }
+    let mut txr_leg = None;
+    if let Some(t) = txr {
+        assert!(!t.paths.is_empty(), "tx-root region handoff without paths");
+        txr_leg = Some(leg_depths.len());
+        leg_depths.push(t.depth);
+        leg_caps.push(t.paths.len().div_ceil(k));
+        leg_ivs.push(compress_iv_flat());
+    }
+    let n_legs = leg_depths.len();
+    let paired_caps_per_block = paired_es.map(|paired| {
+        assert!(
+            paired.touched_capacity > 0,
+            "paired local capacity is empty"
+        );
+        assert!(
+            paired.segment_capacity > 0,
+            "paired upper capacity is empty"
+        );
+        [
+            paired.touched_capacity.div_ceil(k),
+            paired.segment_capacity.div_ceil(k),
+        ]
+    });
+    let mut meta_slot_families: Vec<usize> = paired_caps_per_block
+        .map(|caps| caps.map(|cap| cap * PAIRED_UPDATE_STRIDE).to_vec())
+        .unwrap_or_default();
+    let paired_family_count = meta_slot_families.len();
+    meta_slot_families
+        .extend((0..n_legs).map(|f| leg_caps[f] * (2 * leg_depths[f]).next_power_of_two()));
+    let meta_b =
+        (!meta_slot_families.is_empty()).then(|| tiled_walk_layout(k, &meta_slot_families));
+    let paired_bases: Option<[usize; 2]> = paired_caps_per_block.map(|_| {
+        meta_b.as_ref().expect("paired carrier needs meta-B").bases[..paired_family_count]
+            .try_into()
+            .expect("local and upper paired bases")
+    });
+    let meta_bases = meta_b.as_ref().map_or_else(Vec::new, |layout| {
+        layout.bases[paired_family_count..].to_vec()
+    });
+    let mut meta_b_families = Vec::with_capacity(paired_family_count + n_legs);
+    if let (Some(caps), Some(bases)) = (paired_caps_per_block, paired_bases) {
+        let iv = iv_flat_of_tag(TAG_EXSTNOD);
+        for family in 0..2 {
+            meta_b_families.push(crate::region_sidecar::MerkleRegionFamily::PairedUpdate {
+                offset: bases[family],
+                n_updates: caps[family],
+                iv,
+            });
+        }
+    }
+    for family in 0..n_legs {
+        meta_b_families.push(crate::region_sidecar::MerkleRegionFamily::TwoPermutation {
+            offset: meta_bases[family],
+            depth: leg_depths[family],
+            n_paths: leg_caps[family],
+            iv: leg_ivs[family],
+        });
+    }
+
+    // Canonical ghost initialization for both metadata walks.
+    let mut meta_cols: Vec<Vec<F128>> = (0..N_META_COMMITTED)
+        .map(|_| vec![F128::ZERO; meta_p])
+        .collect();
+    let mut meta_s0: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; meta_p]);
+    let mut meta_s_out: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; meta_p]);
+    let (ghost_s0, ghost_out) =
+        noid_ivc_core::deep_chain::source_tree::run_perm([F128::ZERO; STATE_SIZE]);
+    for slot in 0..meta_p {
+        for j in 0..STATE_SIZE {
+            meta_s0[j][slot] = ghost_s0[j];
+            meta_s_out[j][slot] = ghost_out[j];
+            meta_cols[C0 + j][slot] = ghost_out[j];
+        }
+    }
+
+    let meta_b_slots = meta_b.as_ref().map_or(0, |layout| layout.slots);
+    let mut cb_meta_b: Vec<Vec<F128>> = (0..9).map(|_| vec![F128::ZERO; meta_b_slots]).collect();
+    let mut s0_meta_b: [Vec<F128>; STATE_SIZE] =
+        std::array::from_fn(|_| vec![F128::ZERO; meta_b_slots]);
+    let mut sout_meta_b: [Vec<F128>; STATE_SIZE] =
+        std::array::from_fn(|_| vec![F128::ZERO; meta_b_slots]);
+    let (ghost_b_s0, ghost_b_out) =
+        noid_ivc_core::deep_chain::source_tree::run_perm([F128::ZERO; STATE_SIZE]);
+    for slot in 0..meta_b_slots {
+        for j in 0..STATE_SIZE {
+            s0_meta_b[j][slot] = ghost_b_s0[j];
+            sout_meta_b[j][slot] = ghost_b_out[j];
+            cb_meta_b[j][slot] = ghost_b_out[j];
+        }
+    }
+
+    let mut cell_pins_meta = Vec::new();
+    let mut cell_pins_meta_b = Vec::new();
+    let mut spine_expo_kid0 = Vec::new();
+    let mut spine_expo_kid1 = Vec::new();
+    let mut spine_expo_c0 = Vec::new();
+    let mut spine_expo_c1 = Vec::new();
+    let mut acc_committed_roots = vec![Vec::new(); n_legs];
+    let mut acc_recomputed_roots = vec![Vec::new(); n_legs];
+    let mut acc_entry_wires = vec![Vec::new(); n_legs];
+    let mut acc_root_wires = vec![Vec::new(); n_legs];
+    let mut acc_path_slots = vec![Vec::new(); n_legs];
+
+    // Paired exact-state families.
+    if let Some(paired) = paired_es {
+        let packed = paired.packed_updates();
+        assert_eq!(
+            packed.updates.len(),
+            paired.touched_capacity + paired.segment_capacity,
+            "paired packed capacity"
+        );
+        assert_eq!(
+            packed.active_slots,
+            packed.updates.len() * PAIRED_UPDATE_STRIDE,
+            "paired packed active slots"
+        );
+        let (local_updates, upper_updates) = packed.updates.split_at(paired.touched_capacity);
+        let partitions = [local_updates, upper_updates];
+        let caps = paired_caps_per_block.expect("paired per-block capacities");
+        let bases = paired_bases.expect("paired meta-B bases");
+        let layout = meta_b.as_ref().expect("paired carrier needs meta-B");
+        let iv = iv_flat_of_tag(TAG_EXSTNOD);
+        for blk in 0..k {
+            for family in 0..2 {
+                let cap = caps[family];
+                let lo = (blk * cap).min(partitions[family].len());
+                let hi = ((blk + 1) * cap).min(partitions[family].len());
+                let family_slots = cap * PAIRED_UPDATE_STRIDE;
+                let family_w_log = family_slots.next_power_of_two().trailing_zeros() as usize;
+                let columns = build_paired_merkle_update_columns(
+                    &partitions[family][lo..hi],
+                    iv,
+                    family_w_log,
+                );
+                place_paired_merkle_updates(
+                    &mut cb_meta_b,
+                    &mut s0_meta_b,
+                    &mut sout_meta_b,
+                    &columns,
+                    blk * layout.block_slots + bases[family],
+                    family_slots,
+                );
+            }
+        }
+    }
+
+    // Exact-state Meta-A leaves and transitional Meta-B state paths.
+    if let Some(e) = es {
+        let n_es = e.leaves.len();
+        let pad_flat = slot_leaf_pad_flat();
+        let leaf_data: Vec<(F128, F128, F128)> = e
+            .leaves
+            .iter()
+            .map(|l| (l.packed_value_flat, l.owner_hi_flat, l.owner_lo_flat))
+            .collect();
+        let es_w_log = es_region_slots.trailing_zeros() as usize;
+        let (tc, tile_digests) = build_sponge_leaf_columns(&leaf_data, es_w_log);
+        let base = es_meta_base;
+        for j in 0..2 {
+            meta_cols[IN0 + j][base..base + es_region_slots].copy_from_slice(&tc.in_[j]);
+        }
+        for j in 0..STATE_SIZE {
+            meta_cols[C0 + j][base..base + es_region_slots].copy_from_slice(&tc.c[j]);
+            meta_s0[j][base..base + es_region_slots].copy_from_slice(&tc.s0[j]);
+            meta_s_out[j][base..base + es_region_slots].copy_from_slice(&tc.s_out[j]);
+        }
+        for (g, leaf) in e.leaves.iter().enumerate() {
+            assert_eq!(
+                tile_digests[g], leaf.expected_leaf_flat,
+                "es sponge tile digest != the statement's expected leaf"
+            );
+            let off = base + g * SPONGE_LEAF_SLOTS;
+            cell_pins_meta.push((IN0, off, leaf.packed_value_w.clone()));
+            cell_pins_meta.push((IN0 + 1, off, leaf.owner_hi_w.clone()));
+            cell_pins_meta.push((IN0, off + 1, leaf.owner_lo_w.clone()));
+            cell_pins_meta.push((IN0 + 1, off + 1, LinExpr::constant(pad_flat)));
+            let dslot = off + SPONGE_LEAF_DIGEST_SLOT;
+            cell_pins_meta.push((C0, dslot, leaf.expected_leaf_w[0].clone()));
+            cell_pins_meta.push((C0 + 1, dslot, leaf.expected_leaf_w[1].clone()));
+        }
+
+        if let Some(state_leg) = es_state_leg {
+            assert_eq!(e.paths.len(), n_es, "one state path per slot leaf");
+            let state_cap = leg_caps[state_leg];
+            for blk in 0..k {
+                let lo = (blk * state_cap).min(n_es);
+                let hi = ((blk + 1) * state_cap).min(n_es);
+                let state_paths: Vec<EsPathReal> = (lo..hi)
+                    .map(|g| {
+                        let path = &e.paths[g];
+                        assert_eq!(
+                            path.entry_leaf_index, g,
+                            "leaf↔path pairing is index-aligned"
+                        );
+                        assert_eq!(path.siblings.len(), e.d_state, "state path depth");
+                        let leaf = &e.leaves[g];
+                        let (root_w, root_flat) = if path.is_old {
+                            (e.old_root_w.clone(), e.old_root_flat)
+                        } else {
+                            (e.new_root_w.clone(), e.new_root_flat)
+                        };
+                        EsPathReal {
+                            entry_flat: leaf.expected_leaf_flat,
+                            entry_w: leaf.expected_leaf_w.clone(),
+                            siblings: path.siblings.clone(),
+                            directions: path.directions.clone(),
+                            root_flat,
+                            root_w,
+                        }
+                    })
+                    .collect();
+                fill_es_merkle_leg(
+                    &mut cb_meta_b,
+                    &mut s0_meta_b,
+                    &mut sout_meta_b,
+                    &mut acc_entry_wires[state_leg],
+                    &mut acc_root_wires[state_leg],
+                    &mut acc_committed_roots[state_leg],
+                    &mut acc_path_slots[state_leg],
+                    &mut acc_recomputed_roots[state_leg],
+                    e.d_state,
+                    state_cap,
+                    leg_ivs[state_leg],
+                    4,
+                    blk * meta_b.as_ref().expect("state leg needs meta-B").block_slots
+                        + meta_bases[state_leg],
+                    &state_paths,
+                );
+            }
+        }
+    }
+
+    // Tx-root Meta-B family, including exact direction and padding-rim pins.
+    if let Some(t) = txr {
+        let txr_leg = txr_leg.expect("tx-root leg index");
+        let cap = leg_caps[txr_leg];
+        let stride = (2 * t.depth).next_power_of_two();
+        let n_paths = t.paths.len();
+        assert!(
+            t.rim_flat.is_empty() || t.rim_flat.len() == t.depth,
+            "one rim constant per level (or none at tier capacity)"
+        );
+        for blk in 0..k {
+            let lo = (blk * cap).min(n_paths);
+            let hi = ((blk + 1) * cap).min(n_paths);
+            let real: Vec<EsPathReal> = (lo..hi)
+                .map(|j| {
+                    let p = &t.paths[j];
+                    assert_eq!(p.siblings.len(), t.depth, "tx-root path depth");
+                    EsPathReal {
+                        entry_flat: p.entry_flat,
+                        entry_w: p.entry_w.clone(),
+                        siblings: p.siblings.clone(),
+                        directions: (0..t.depth).map(|level| (j >> level) & 1 == 1).collect(),
+                        root_flat: t.root_flat,
+                        root_w: t.root_w.clone(),
+                    }
+                })
+                .collect();
+            let region_base = blk
+                * meta_b
+                    .as_ref()
+                    .expect("tx-root leg needs meta-B")
+                    .block_slots
+                + meta_bases[txr_leg];
+            fill_es_merkle_leg(
+                &mut cb_meta_b,
+                &mut s0_meta_b,
+                &mut sout_meta_b,
+                &mut acc_entry_wires[txr_leg],
+                &mut acc_root_wires[txr_leg],
+                &mut acc_committed_roots[txr_leg],
+                &mut acc_path_slots[txr_leg],
+                &mut acc_recomputed_roots[txr_leg],
+                t.depth,
+                cap,
+                leg_ivs[txr_leg],
+                4,
+                region_base,
+                &real,
+            );
+            for (i, j) in (lo..hi).enumerate() {
+                let base = region_base + i * stride;
+                for level in 0..t.depth {
+                    let bit = (j >> level) & 1 == 1;
+                    cell_pins_meta_b.push((
+                        8,
+                        base + 2 * level,
+                        LinExpr::constant(if bit { F128::ONE } else { F128::ZERO }),
+                    ));
+                }
+                if !t.rim_flat.is_empty() && j == n_paths - 1 {
+                    for level in 0..t.depth {
+                        if (j >> level) & 1 == 0 {
+                            for lane in 0..2 {
+                                cell_pins_meta_b.push((
+                                    6 + lane,
+                                    base + 2 * level,
+                                    LinExpr::constant(t.rim_flat[level][lane]),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Tx-body spine Meta-A family.  This is the only raw-meta step that
+    // allocates builder wires; its position relative to the monolith is fixed.
+    if let Some(sp) = spine {
+        let n_inst = sp.instances.len();
+        for blk in 0..k {
+            for i in 0..spine_cap {
+                let g = blk * spine_cap + i;
+                let inst_flat = sp
+                    .instances
+                    .get(g)
+                    .map(|inst| inst.flat.clone())
+                    .unwrap_or_else(SpineInstanceFlat::ghost);
+                let icols = build_spine_instance_columns(&inst_flat);
+                let tree_abs =
+                    spine_meta_base + blk * spine_per_tx + spine_tree_base + i * SPINE_TREE_SLOTS;
+                let wrap_abs =
+                    spine_meta_base + blk * spine_per_tx + spine_wrap_base + i * SPINE_WRAP_SLOTS;
+                for j in 0..STATE_SIZE {
+                    meta_cols[C0 + j][tree_abs..tree_abs + SPINE_TREE_SLOTS]
+                        .copy_from_slice(&icols.tree_c[j]);
+                    meta_s0[j][tree_abs..tree_abs + SPINE_TREE_SLOTS]
+                        .copy_from_slice(&icols.tree_s0[j]);
+                    meta_s_out[j][tree_abs..tree_abs + SPINE_TREE_SLOTS]
+                        .copy_from_slice(&icols.tree_s_out[j]);
+                    meta_cols[C0 + j][wrap_abs..wrap_abs + SPINE_WRAP_SLOTS]
+                        .copy_from_slice(&icols.wrap_c[j]);
+                    meta_s0[j][wrap_abs..wrap_abs + SPINE_WRAP_SLOTS]
+                        .copy_from_slice(&icols.wrap_s0[j]);
+                    meta_s_out[j][wrap_abs..wrap_abs + SPINE_WRAP_SLOTS]
+                        .copy_from_slice(&icols.wrap_s_out[j]);
+                }
+                for lane in 0..2 {
+                    meta_cols[KID0 + lane][tree_abs..tree_abs + SPINE_TREE_SLOTS]
+                        .copy_from_slice(&icols.tree_kid[lane]);
+                    meta_cols[IN0 + lane][wrap_abs..wrap_abs + SPINE_WRAP_SLOTS]
+                        .copy_from_slice(&icols.wrap_in[lane]);
+                }
+                let kid_half = SPINE_TREE_SLOTS / 2;
+                spine_expo_kid0.extend_from_slice(&icols.tree_kid[0][..kid_half]);
+                spine_expo_kid1.extend_from_slice(&icols.tree_kid[1][..kid_half]);
+                spine_expo_c0.extend_from_slice(&icols.tree_c[0]);
+                spine_expo_c1.extend_from_slice(&icols.tree_c[1]);
+
+                if g >= n_inst {
+                    continue;
+                }
+                let inst = &sp.instances[g];
+                assert_eq!(
+                    icols.tx_hash, inst.tx_hash_flat,
+                    "spine instance {g}: region tx-body hash != the statement wires"
+                );
+                for (leaf, wpair) in inst.leaves_w.iter().enumerate() {
+                    let kslot = tree_abs + SPINE_TREE_KID_LEAF_BASE + leaf;
+                    cell_pins_meta.push((KID0, kslot, wpair[0].clone()));
+                    cell_pins_meta.push((KID0 + 1, kslot, wpair[1].clone()));
+                }
+                for lane in 0..2 {
+                    let w = LinExpr::from_wire(b.alloc_f128(icols.root[lane]));
+                    cell_pins_meta.push((C0 + lane, tree_abs + 3, w.clone()));
+                    cell_pins_meta.push((IN0 + lane, wrap_abs + SPINE_WRAP_SLOT, w));
+                }
+                for lane in 0..2 {
+                    cell_pins_meta.push((
+                        C0 + lane,
+                        wrap_abs + SPINE_WRAP_SLOT,
+                        inst.tx_hash_w[lane].clone(),
+                    ));
+                }
+            }
+        }
+    }
+
+    AuthPcsMetaRegionDraft {
+        has_meta,
+        has_both_a_families,
+        es_region_slots,
+        spine_cap,
+        spine_tree_base,
+        spine_wrap_base,
+        spine_block_log,
+        spine_region_slots,
+        meta_w_log,
+        es_meta_base,
+        spine_meta_base,
+        meta_b,
+        paired_caps_per_block,
+        paired_bases,
+        meta_bases,
+        leg_depths,
+        leg_caps,
+        leg_ivs,
+        meta_b_families,
+        meta_cols,
+        meta_s0,
+        meta_s_out,
+        cb_meta_b,
+        s0_meta_b,
+        sout_meta_b,
+        cell_pins_meta,
+        cell_pins_meta_b,
+        spine_expo_kid0,
+        spine_expo_kid1,
+        spine_expo_c0,
+        spine_expo_c1,
+        acc_committed_roots,
+        acc_recomputed_roots,
+        acc_entry_wires,
+        acc_root_wires,
+        acc_path_slots,
+    }
+}
+
+/// Resolve the paired exact-state portion of a raw metadata draft after its
+/// Meta-B columns have received physical witness slices.  Keeping this here
+/// makes the exact copy/overhang pins and the typed handoff part of the same
+/// metadata-only construction boundary as the raw columns.
+fn bind_auth_pcs_meta_paired_handoff(
+    b: &mut FieldR1csBuilder,
+    meta_b_slices: &[WitnessSlice],
+    meta_b: Option<&TiledWalkLayout>,
+    paired_bases: Option<[usize; 2]>,
+    paired_caps_per_block: Option<[usize; 2]>,
+    paired: Option<&ExactStatePairedRegionData>,
+) -> Option<PairedExactStateCells> {
+    paired.map(|paired| {
+        let layout = meta_b.expect("paired carrier needs meta-B slices");
+        let bases = paired_bases.expect("paired family bases");
+        let caps = paired_caps_per_block.expect("paired family capacities");
+        pin_paired_consistency_cells(b, meta_b_slices, layout, bases, caps);
+        pin_paired_overhang_ghost_cells(
+            b,
+            meta_b_slices,
+            layout,
+            bases,
+            caps,
+            [paired.touched_capacity, paired.segment_capacity],
+            iv_flat_of_tag(TAG_EXSTNOD),
+        );
+        paired_exact_state_cells(meta_b_slices, layout, bases, caps, paired)
+    })
+}
+
+fn preflight_selected_zk_authorization_draft(
+    authorization: &super::zk_authorization_region::SelectedZkAuthorizationRegionDraft,
+) -> Result<(), SelectedZkAuthPcsRegionAllocationError> {
+    let exact_duplex = |union: &DuplexUnion, w_log: usize, block_log: usize| {
+        let len = 1usize << w_log;
+        union.w_log == w_log
+            && union.block_log == block_log
+            && union.committed.iter().all(|column| column.len() == len)
+            && union.s0.iter().all(|column| column.len() == len)
+            && union.s_out.iter().all(|column| column.len() == len)
+            && union.challenges.len() == SELECTED_ZK_REGION_TILE_COUNT
+            && union.rec_blocks.is_empty()
+            && union.rec_refs.is_empty()
+            && union.rec_challenges.is_empty()
+    };
+    let exact_raw_walk = |committed: &[Vec<F128>],
+                          s0: &[Vec<F128>; STATE_SIZE],
+                          s_out: &[Vec<F128>; STATE_SIZE],
+                          columns: usize,
+                          w_log: usize| {
+        let len = 1usize << w_log;
+        committed.len() == columns
+            && committed.iter().all(|column| column.len() == len)
+            && s0.iter().all(|column| column.len() == len)
+            && s_out.iter().all(|column| column.len() == len)
+    };
+
+    let wallet_a = authorization.wallet_a();
+    let wallet_b = authorization.wallet_b();
+    let valid = authorization.changed_committed_columns() == 27
+        && authorization.committed_cells()
+            == SELECTED_ZK_REGION_WALLET_A_COLUMNS * (1 << SELECTED_ZK_REGION_WALLET_A_LOG)
+                + SELECTED_ZK_REGION_WALLET_B_COLUMNS * (1 << SELECTED_ZK_REGION_WALLET_B_LOG)
+                + SELECTED_ZK_REGION_OWNER_COLUMNS * (1 << SELECTED_ZK_REGION_OWNER_LOG)
+                + SELECTED_ZK_REGION_MAIN_COLUMNS * (1 << SELECTED_ZK_REGION_MAIN_LOG)
+        && exact_duplex(authorization.owner(), SELECTED_ZK_REGION_OWNER_LOG, 7)
+        && exact_duplex(authorization.main(), SELECTED_ZK_REGION_MAIN_LOG, 8)
+        && exact_raw_walk(
+            wallet_a.committed(),
+            wallet_a.s0(),
+            wallet_a.s_out(),
+            SELECTED_ZK_REGION_WALLET_A_COLUMNS,
+            SELECTED_ZK_REGION_WALLET_A_LOG,
+        )
+        && exact_raw_walk(
+            wallet_b.committed(),
+            wallet_b.s0(),
+            wallet_b.s_out(),
+            SELECTED_ZK_REGION_WALLET_B_COLUMNS,
+            SELECTED_ZK_REGION_WALLET_B_LOG,
+        )
+        && wallet_b.committed()[8]
+            .iter()
+            .all(|&value| value == F128::ZERO || value == F128::ONE);
+    if valid {
+        Ok(())
+    } else {
+        Err(SelectedZkAuthPcsRegionAllocationError::AuthorizationShape)
+    }
+}
+
+fn preflight_selected_zk_meta_inputs(
+    es: &ExactStateRegionData,
+    txr: &TxRootRegionData,
+    spine: &SpineRegionData,
+) -> Result<(), SelectedZkAuthPcsRegionAllocationError> {
+    if !es.paths.is_empty() {
+        return Err(SelectedZkAuthPcsRegionAllocationError::LegacyExactStatePaths);
+    }
+    let paired = es
+        .paired
+        .as_ref()
+        .ok_or(SelectedZkAuthPcsRegionAllocationError::MissingPairedExactState)?;
+    if es.leaves.len() != 2 * SELECTED_ZK_REGION_TOUCHED_CAPACITY
+        || paired.touched_capacity != SELECTED_ZK_REGION_TOUCHED_CAPACITY
+        || paired.segment_capacity != SELECTED_ZK_REGION_SEGMENT_CAPACITY
+        || paired.local_updates.len() != paired.local_update_count
+        || paired.upper_updates.len() != paired.upper_update_count
+        || paired.local_update_count > paired.touched_capacity
+        || paired.upper_update_count > paired.segment_capacity
+        || !(8..=PAIRED_UPDATE_DEPTH).contains(&paired.active_upper_depth)
+    {
+        return Err(SelectedZkAuthPcsRegionAllocationError::ExactStateShape);
+    }
+    if txr.depth != 8
+        || txr.paths.len() != SELECTED_ZK_REGION_TILE_COUNT
+        || txr
+            .paths
+            .iter()
+            .any(|path| path.siblings.len() != txr.depth)
+        || !(txr.rim_flat.is_empty() || txr.rim_flat.len() == txr.depth)
+    {
+        return Err(SelectedZkAuthPcsRegionAllocationError::TxRootShape);
+    }
+    if spine.instances.len() != SELECTED_ZK_REGION_TILE_COUNT {
+        return Err(SelectedZkAuthPcsRegionAllocationError::SpineShape);
+    }
+    Ok(())
+}
+
+fn alloc_selected_column_slice(
+    b: &mut FieldR1csBuilder,
+    column: &[F128],
+    w_log: usize,
+) -> WitnessSlice {
+    let len = 1usize << w_log;
+    assert_eq!(column.len(), len, "selected committed column length");
+    while b.num_wires() % len != 0 {
+        b.alloc_f128(F128::ZERO);
+    }
+    let index = b.num_wires() / len;
+    for &value in column {
+        b.alloc_f128(value);
+    }
+    WitnessSlice {
+        log2_len: w_log,
+        index,
+    }
+}
+
+fn alloc_selected_boolean_column_slice(
+    b: &mut FieldR1csBuilder,
+    column: &[F128],
+    w_log: usize,
+) -> WitnessSlice {
+    let len = 1usize << w_log;
+    assert_eq!(column.len(), len, "selected boolean column length");
+    while b.num_wires() % len != 0 {
+        b.alloc_f128(F128::ZERO);
+    }
+    let index = b.num_wires() / len;
+    for (slot, &value) in column.iter().enumerate() {
+        assert!(
+            value == F128::ZERO || value == F128::ONE,
+            "selected boolean column slot {slot}"
+        );
+        b.alloc_bool(value == F128::ONE);
+    }
+    WitnessSlice {
+        log2_len: w_log,
+        index,
+    }
+}
+
+fn alloc_selected_columns<const N: usize>(
+    b: &mut FieldR1csBuilder,
+    columns: &[Vec<F128>],
+    w_log: usize,
+    boolean_column: Option<usize>,
+) -> [WitnessSlice; N] {
+    assert_eq!(columns.len(), N, "selected committed column count");
+    std::array::from_fn(|column| {
+        if boolean_column == Some(column) {
+            alloc_selected_boolean_column_slice(b, &columns[column], w_log)
+        } else {
+            alloc_selected_column_slice(b, &columns[column], w_log)
+        }
+    })
+}
+
+/// Allocate and close the exact selected B255 authorization+Meta region.
+///
+/// This is the sole common six-child allocator. It consumes the verified raw
+/// authorization draft and accepts only the canonical production Meta inputs.
+/// All input-shape rejection happens before the builder is touched. The raw
+/// Meta draft is constructed, allocated, statement-pinned and converted into
+/// its paired handoff entirely inside this function; no partially closed Meta
+/// value can escape. The result is still only a draft owned by the private
+/// Block assembly, never a post-commit preparation or finalization token.
+pub(super) fn allocate_selected_zk_auth_pcs_region(
+    b: &mut FieldR1csBuilder,
+    authorization: super::zk_authorization_region::SelectedZkAuthorizationRegionDraft,
+    es: &ExactStateRegionData,
+    txr: &TxRootRegionData,
+    spine: &SpineRegionData,
+) -> Result<SelectedZkAuthPcsRegionAllocation, SelectedZkAuthPcsRegionAllocationError> {
+    preflight_selected_zk_authorization_draft(&authorization)?;
+    preflight_selected_zk_meta_inputs(es, txr, spine)?;
+
+    let (owner, main, wallet_a, wallet_b) = authorization.into_parts();
+    let (wallet_a_columns, wallet_a_s0, wallet_a_s_out) = wallet_a.into_parts();
+    let (wallet_b_columns, wallet_b_s0, wallet_b_s_out) = wallet_b.into_parts();
+
+    let AuthPcsMetaRegionDraft {
+        has_meta,
+        has_both_a_families,
+        es_region_slots,
+        spine_cap,
+        meta_w_log,
+        meta_b,
+        paired_caps_per_block,
+        paired_bases,
+        leg_depths,
+        leg_caps,
+        meta_b_families,
+        meta_cols,
+        meta_s0,
+        meta_s_out,
+        cb_meta_b,
+        s0_meta_b,
+        sout_meta_b,
+        cell_pins_meta,
+        mut cell_pins_meta_b,
+        acc_committed_roots,
+        acc_recomputed_roots,
+        acc_entry_wires,
+        acc_root_wires,
+        acc_path_slots,
+        ..
+    } = build_auth_pcs_meta_region_draft(
+        b,
+        SELECTED_ZK_REGION_TILE_COUNT,
+        Some(es),
+        Some(txr),
+        Some(spine),
+    );
+    let meta_b_layout = meta_b
+        .as_ref()
+        .expect("selected paired Meta input must construct Meta-B");
+    assert!(has_meta && has_both_a_families, "selected Meta-A families");
+    assert_eq!(es_region_slots, 1 << 13, "selected exact-state region");
+    assert_eq!(spine_cap, 1, "selected spine capacity per tile");
+    assert_eq!(meta_w_log, SELECTED_ZK_REGION_META_A_LOG);
+    assert_eq!(meta_b_layout.w_log, SELECTED_ZK_REGION_META_B_LOG);
+    assert_eq!(meta_b_layout.block_log, 9);
+    assert_eq!(paired_caps_per_block, Some([6, 1]));
+    assert_eq!(paired_bases, Some([0, 384]));
+    assert_eq!(leg_depths, vec![8]);
+    assert_eq!(leg_caps, vec![1]);
+    assert_eq!(meta_cols.len(), SELECTED_ZK_REGION_META_A_COLUMNS);
+    assert_eq!(cb_meta_b.len(), SELECTED_ZK_REGION_META_B_COLUMNS);
+    assert!(cb_meta_b[8]
+        .iter()
+        .all(|&value| value == F128::ZERO || value == F128::ONE));
+
+    append_meta_b_statement_pins(
+        &mut cell_pins_meta_b,
+        &leg_depths,
+        &acc_entry_wires,
+        &acc_root_wires,
+        &acc_committed_roots,
+        &acc_recomputed_roots,
+        &acc_path_slots,
+    );
+
+    // One exact descending-domain allocation. Because every family begins at
+    // the preceding family's end, only Wallet-A may insert alignment padding:
+    // WA6@m19, WB9@m18, MetaB9@m17, Main6@m16, MetaA8@m15, Owner6@m15.
+    let allocation_ledger = SelectedZkRegionAllocationLedger::new(b.num_wires());
+    let wallet_a_slices = alloc_selected_columns::<SELECTED_ZK_REGION_WALLET_A_COLUMNS>(
+        b,
+        &wallet_a_columns,
+        SELECTED_ZK_REGION_WALLET_A_LOG,
+        None,
+    );
+    let wallet_b_slices = alloc_selected_columns::<SELECTED_ZK_REGION_WALLET_B_COLUMNS>(
+        b,
+        &wallet_b_columns,
+        SELECTED_ZK_REGION_WALLET_B_LOG,
+        Some(8),
+    );
+    let meta_b_slices = alloc_selected_columns::<SELECTED_ZK_REGION_META_B_COLUMNS>(
+        b,
+        &cb_meta_b,
+        SELECTED_ZK_REGION_META_B_LOG,
+        Some(8),
+    );
+    let main_slices = alloc_selected_columns::<SELECTED_ZK_REGION_MAIN_COLUMNS>(
+        b,
+        &main.committed,
+        SELECTED_ZK_REGION_MAIN_LOG,
+        None,
+    );
+    let meta_a_slices = alloc_selected_columns::<SELECTED_ZK_REGION_META_A_COLUMNS>(
+        b,
+        &meta_cols,
+        SELECTED_ZK_REGION_META_A_LOG,
+        None,
+    );
+    let owner_slices = alloc_selected_columns::<SELECTED_ZK_REGION_OWNER_COLUMNS>(
+        b,
+        &owner.committed,
+        SELECTED_ZK_REGION_OWNER_LOG,
+        None,
+    );
+    assert_eq!(wallet_a_slices[0].start(), allocation_ledger.wallet_a);
+    assert_eq!(wallet_b_slices[0].start(), allocation_ledger.wallet_b);
+    assert_eq!(meta_b_slices[0].start(), allocation_ledger.meta_b);
+    assert_eq!(main_slices[0].start(), allocation_ledger.main);
+    assert_eq!(meta_a_slices[0].start(), allocation_ledger.meta_a);
+    assert_eq!(owner_slices[0].start(), allocation_ledger.owner);
+    assert_eq!(b.num_wires(), allocation_ledger.after);
+
+    // Complete every unchanged Meta closure in the canonical legacy order:
+    // paired copy/overhang first, then the Meta-A/B statement-cell pins.
+    let before_paired_closure = b.num_wires();
+    let paired = bind_auth_pcs_meta_paired_handoff(
+        b,
+        &meta_b_slices,
+        Some(meta_b_layout),
+        paired_bases,
+        paired_caps_per_block,
+        es.paired.as_ref(),
+    )
+    .expect("selected paired Meta preflight made the handoff mandatory");
+    assert_eq!(
+        b.num_wires() - before_paired_closure,
+        200_000,
+        "selected B255 paired copy/overhang ledger"
+    );
+    assert_eq!(cell_pins_meta.len(), 28_100, "selected Meta-A pin ledger");
+    assert_eq!(cell_pins_meta_b.len(), 3_072, "selected Meta-B pin ledger");
+    let before_statement_pins = b.num_wires();
+    pin_stage2_cells(b, &meta_a_slices, &cell_pins_meta);
+    pin_stage2_cells(b, &meta_b_slices, &cell_pins_meta_b);
+    assert_eq!(
+        b.num_wires() - before_statement_pins,
+        31_172,
+        "selected B255 Meta statement-pin ledger"
+    );
+
+    let wallet_a_vk = crate::region_sidecar::WalkARegionVk::new_wallet(
+        selected_zk_auth_wallet_a_sidecar_purpose(),
+        SELECTED_ZK_REGION_TX_LOG,
+        SELECTED_ZK_REGION_QUERY_LOG,
+        wallet_a_slices,
+    )
+    .expect("preflighted selected wallet-A VK drift");
+    let capsule_iv = iv_flat_of_tag(TAG_CAPSNODE);
+    let wallet_b_vk = crate::region_sidecar::MerkleRegionVk::new(
+        selected_zk_auth_wallet_b_sidecar_purpose(),
+        SELECTED_ZK_REGION_WALLET_B_LOG,
+        wallet_b_slices,
+        10,
+        vec![
+            crate::region_sidecar::MerkleRegionFamily::FeedForward {
+                offset: 0,
+                depth: 8,
+                n_paths: SELECTED_ZK_QUERY_COUNT,
+                iv: capsule_iv,
+            },
+            crate::region_sidecar::MerkleRegionFamily::FeedForward {
+                offset: 512,
+                depth: 8,
+                n_paths: SELECTED_ZK_QUERY_COUNT,
+                iv: capsule_iv,
+            },
+        ],
+    )
+    .expect("preflighted selected wallet-B VK drift");
+    let meta_a_vk = crate::region_sidecar::WalkARegionVk::new_meta(
+        auth_pcs_meta_a_sidecar_purpose(),
+        SELECTED_ZK_REGION_TX_LOG,
+        Some(13),
+        Some(0),
+        meta_a_slices,
+    )
+    .expect("preflighted selected Meta-A VK drift");
+    let meta_b_vk = crate::region_sidecar::MerkleRegionVk::new(
+        auth_pcs_meta_b_sidecar_purpose(),
+        SELECTED_ZK_REGION_META_B_LOG,
+        meta_b_slices,
+        9,
+        meta_b_families,
+    )
+    .expect("preflighted selected Meta-B VK drift");
+    let owner_vk = crate::region_sidecar::DuplexRegionVk::from_union(
+        selected_zk_auth_owner_sidecar_purpose(),
+        owner_slices,
+        &owner,
+    )
+    .expect("preflighted selected Owner VK drift");
+    let main_vk = crate::region_sidecar::DuplexRegionVk::from_union(
+        selected_zk_auth_main_sidecar_purpose(),
+        main_slices,
+        &main,
+    )
+    .expect("preflighted selected Main VK drift");
+    let vk = crate::region_sidecar::BlockRegionSidecarVk::new_selected_zk(
+        wallet_a_vk,
+        meta_a_vk,
+        wallet_b_vk,
+        meta_b_vk,
+        owner_vk,
+        main_vk,
+    )
+    .expect("preflighted selected block VK drift");
+    let input = crate::region_sidecar::BlockRegionProverInput::new_selected_zk(
+        &vk,
+        crate::region_sidecar::RegionWalkEndpoints::new(wallet_a_s0, wallet_a_s_out),
+        crate::region_sidecar::RegionWalkEndpoints::new(meta_s0, meta_s_out),
+        crate::region_sidecar::RegionWalkEndpoints::new(wallet_b_s0, wallet_b_s_out),
+        crate::region_sidecar::RegionWalkEndpoints::new(s0_meta_b, sout_meta_b),
+        crate::region_sidecar::RegionWalkEndpoints::new(owner.s0, owner.s_out),
+        crate::region_sidecar::RegionWalkEndpoints::new(main.s0, main.s_out),
+    )
+    .expect("preflighted selected prover input drift");
+    let draft = crate::region_sidecar::SelectedZkBlockRegionDraft::new(vk, input)
+        .expect("preflighted selected draft drift");
+    Ok(SelectedZkAuthPcsRegionAllocation { draft, paired })
+}
+
+#[cfg(test)]
+mod selected_zk_common_allocator_tests {
+    use noid_ivc_core::deep_chain::schedule::{duplex_family_refs, duplex_fixed_patterns};
+
+    use super::*;
+
+    fn family_slices<const N: usize>(start: usize, w_log: usize) -> [WitnessSlice; N] {
+        let len = 1usize << w_log;
+        assert_eq!(start % len, 0);
+        let first = start / len;
+        std::array::from_fn(|column| WitnessSlice {
+            log2_len: w_log,
+            index: first + column,
+        })
+    }
+
+    fn empty_exact_state(paired: Option<ExactStatePairedRegionData>) -> ExactStateRegionData {
+        ExactStateRegionData {
+            leaves: Vec::new(),
+            paired,
+            paths: Vec::new(),
+            d_state: 24,
+            old_root_w: [LinExpr::zero(), LinExpr::zero()],
+            old_root_flat: [F128::ZERO; 2],
+            new_root_w: [LinExpr::zero(), LinExpr::zero()],
+            new_root_flat: [F128::ZERO; 2],
+        }
+    }
+
+    fn empty_paired() -> ExactStatePairedRegionData {
+        ExactStatePairedRegionData {
+            local_updates: Vec::new(),
+            upper_updates: Vec::new(),
+            local_update_count: 0,
+            upper_update_count: 0,
+            touched_capacity: SELECTED_ZK_REGION_TOUCHED_CAPACITY,
+            segment_capacity: SELECTED_ZK_REGION_SEGMENT_CAPACITY,
+            active_upper_depth: 8,
+        }
+    }
+
+    fn irrelevant_meta_companions() -> (TxRootRegionData, SpineRegionData) {
+        (
+            TxRootRegionData {
+                depth: 8,
+                root_w: [LinExpr::zero(), LinExpr::zero()],
+                root_flat: [F128::ZERO; 2],
+                paths: Vec::new(),
+                rim_flat: Vec::new(),
+            },
+            SpineRegionData {
+                instances: Vec::new(),
+            },
+        )
+    }
+
+    #[test]
+    fn selected_b255_column_ledger_is_exact_and_only_initially_aligned() {
+        let ledger = SelectedZkRegionAllocationLedger::new(966_647);
+        assert_eq!(ledger.before, 966_647);
+        assert_eq!(ledger.wallet_a, 1_048_576);
+        assert_eq!(ledger.wallet_b, 4_194_304);
+        assert_eq!(ledger.meta_b, 6_553_600);
+        assert_eq!(ledger.main, 7_733_248);
+        assert_eq!(ledger.meta_a, 8_126_464);
+        assert_eq!(ledger.owner, 8_388_608);
+        assert_eq!(ledger.after, 8_585_216);
+        assert_eq!(ledger.wallet_a - ledger.before, 81_929);
+        assert_eq!(
+            ledger.after - ledger.wallet_a,
+            SELECTED_ZK_REGION_COMMITTED_CELLS
+        );
+
+        let families = [
+            (
+                ledger.wallet_a,
+                SELECTED_ZK_REGION_WALLET_A_LOG,
+                SELECTED_ZK_REGION_WALLET_A_COLUMNS,
+            ),
+            (
+                ledger.wallet_b,
+                SELECTED_ZK_REGION_WALLET_B_LOG,
+                SELECTED_ZK_REGION_WALLET_B_COLUMNS,
+            ),
+            (
+                ledger.meta_b,
+                SELECTED_ZK_REGION_META_B_LOG,
+                SELECTED_ZK_REGION_META_B_COLUMNS,
+            ),
+            (
+                ledger.main,
+                SELECTED_ZK_REGION_MAIN_LOG,
+                SELECTED_ZK_REGION_MAIN_COLUMNS,
+            ),
+            (
+                ledger.meta_a,
+                SELECTED_ZK_REGION_META_A_LOG,
+                SELECTED_ZK_REGION_META_A_COLUMNS,
+            ),
+            (
+                ledger.owner,
+                SELECTED_ZK_REGION_OWNER_LOG,
+                SELECTED_ZK_REGION_OWNER_COLUMNS,
+            ),
+        ];
+        let mut ranges = Vec::new();
+        let mut cursor = ledger.wallet_a;
+        for (start, w_log, columns) in families {
+            assert_eq!(start, cursor, "only Wallet-A may add alignment");
+            let len = 1usize << w_log;
+            for column in 0..columns {
+                ranges.push(start + column * len..start + (column + 1) * len);
+            }
+            cursor += columns * len;
+        }
+        assert_eq!(ranges.len(), SELECTED_ZK_REGION_COMMITTED_COLUMNS);
+        assert_eq!(cursor, ledger.after);
+        assert!(
+            ledger.after < 1 << 24,
+            "selected slices fit the B255 witness"
+        );
+        for (index, left) in ranges.iter().enumerate() {
+            for right in &ranges[index + 1..] {
+                assert!(left.end <= right.start || right.end <= left.start);
+            }
+        }
+    }
+
+    #[test]
+    fn selected_b255_planned_slices_form_the_exact_v4_certificate() {
+        let ledger = SelectedZkRegionAllocationLedger::new(966_647);
+        let wallet_a = crate::region_sidecar::WalkARegionVk::new_wallet(
+            selected_zk_auth_wallet_a_sidecar_purpose(),
+            SELECTED_ZK_REGION_TX_LOG,
+            SELECTED_ZK_REGION_QUERY_LOG,
+            family_slices(ledger.wallet_a, SELECTED_ZK_REGION_WALLET_A_LOG),
+        )
+        .unwrap();
+        let meta_a = crate::region_sidecar::WalkARegionVk::new_meta(
+            auth_pcs_meta_a_sidecar_purpose(),
+            SELECTED_ZK_REGION_TX_LOG,
+            Some(13),
+            Some(0),
+            family_slices(ledger.meta_a, SELECTED_ZK_REGION_META_A_LOG),
+        )
+        .unwrap();
+        let capsule_iv = iv_flat_of_tag(TAG_CAPSNODE);
+        let wallet_b = crate::region_sidecar::MerkleRegionVk::new(
+            selected_zk_auth_wallet_b_sidecar_purpose(),
+            SELECTED_ZK_REGION_WALLET_B_LOG,
+            family_slices(ledger.wallet_b, SELECTED_ZK_REGION_WALLET_B_LOG),
+            10,
+            vec![
+                crate::region_sidecar::MerkleRegionFamily::FeedForward {
+                    offset: 0,
+                    depth: 8,
+                    n_paths: SELECTED_ZK_QUERY_COUNT,
+                    iv: capsule_iv,
+                },
+                crate::region_sidecar::MerkleRegionFamily::FeedForward {
+                    offset: 512,
+                    depth: 8,
+                    n_paths: SELECTED_ZK_QUERY_COUNT,
+                    iv: capsule_iv,
+                },
+            ],
+        )
+        .unwrap();
+        let exact_state_iv = iv_flat_of_tag(TAG_EXSTNOD);
+        let meta_b = crate::region_sidecar::MerkleRegionVk::new(
+            auth_pcs_meta_b_sidecar_purpose(),
+            SELECTED_ZK_REGION_META_B_LOG,
+            family_slices(ledger.meta_b, SELECTED_ZK_REGION_META_B_LOG),
+            9,
+            vec![
+                crate::region_sidecar::MerkleRegionFamily::PairedUpdate {
+                    offset: 0,
+                    n_updates: 6,
+                    iv: exact_state_iv,
+                },
+                crate::region_sidecar::MerkleRegionFamily::PairedUpdate {
+                    offset: 384,
+                    n_updates: 1,
+                    iv: exact_state_iv,
+                },
+                crate::region_sidecar::MerkleRegionFamily::TwoPermutation {
+                    offset: 448,
+                    depth: 8,
+                    n_paths: 1,
+                    iv: compress_iv_flat(),
+                },
+            ],
+        )
+        .unwrap();
+        let schedules =
+            crate::acceptance::zk_auth_capsule_schedule::ZkAuthCapsuleDuplexSchedules::selected();
+        let channel_iv = iv_flat_of_tag(TAG_KSCHANNL);
+        let owner_layout = schedules.owner_layout();
+        let owner = crate::region_sidecar::DuplexRegionVk::new(
+            selected_zk_auth_owner_sidecar_purpose(),
+            SELECTED_ZK_REGION_OWNER_LOG,
+            family_slices(ledger.owner, SELECTED_ZK_REGION_OWNER_LOG),
+            duplex_fixed_patterns(&owner_layout, channel_iv, 7),
+            duplex_family_refs(0, 0),
+            &owner_layout,
+        )
+        .unwrap();
+        let main_layout = schedules.main_layout();
+        let main = crate::region_sidecar::DuplexRegionVk::new(
+            selected_zk_auth_main_sidecar_purpose(),
+            SELECTED_ZK_REGION_MAIN_LOG,
+            family_slices(ledger.main, SELECTED_ZK_REGION_MAIN_LOG),
+            duplex_fixed_patterns(&main_layout, channel_iv, 8),
+            duplex_family_refs(0, 0),
+            &main_layout,
+        )
+        .unwrap();
+        let vk = crate::region_sidecar::BlockRegionSidecarVk::new_selected_zk(
+            wallet_a, meta_a, wallet_b, meta_b, owner, main,
+        )
+        .unwrap();
+        vk.validate_selected_zk_roles().unwrap();
+        assert_eq!(
+            vk.version(),
+            crate::region_sidecar::BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION
+        );
+        assert_eq!(vk.wallet_a().slices()[0].start(), ledger.wallet_a);
+        assert_eq!(vk.wallet_b().slices()[0].start(), ledger.wallet_b);
+        assert_eq!(vk.meta_b().slices()[0].start(), ledger.meta_b);
+        assert_eq!(vk.main_c().slices()[0].start(), ledger.main);
+        assert_eq!(vk.meta_a().slices()[0].start(), ledger.meta_a);
+        assert_eq!(vk.owner_c().slices()[0].start(), ledger.owner);
+    }
+
+    #[test]
+    fn selected_meta_preflight_rejects_before_any_builder_row() {
+        let (txr, spine) = irrelevant_meta_companions();
+        let b = FieldR1csBuilder::new();
+        let before = b.num_wires();
+        assert_eq!(
+            preflight_selected_zk_meta_inputs(&empty_exact_state(None), &txr, &spine),
+            Err(SelectedZkAuthPcsRegionAllocationError::MissingPairedExactState)
+        );
+        assert_eq!(b.num_wires(), before);
+
+        let mut legacy = empty_exact_state(Some(empty_paired()));
+        legacy.paths.push(
+            crate::acceptance::trace::exact_state::ExactStatePathRegion {
+                siblings: Vec::new(),
+                directions: Vec::new(),
+                entry_leaf_index: 0,
+                is_old: true,
+            },
+        );
+        assert_eq!(
+            preflight_selected_zk_meta_inputs(&legacy, &txr, &spine),
+            Err(SelectedZkAuthPcsRegionAllocationError::LegacyExactStatePaths)
+        );
+        assert_eq!(b.num_wires(), before);
+    }
+
+    #[test]
+    fn meta_statement_entry_and_root_pins_reject_mutations() {
+        let depth = 2usize;
+        let root_slot = 2 * (depth - 1) + 1;
+        let entry = [F128::new(5, 0), F128::new(7, 0)];
+        let root = [F128::new(11, 0), F128::new(13, 0)];
+        let mut columns = vec![vec![F128::ZERO; 16]; 9];
+        for lane in 0..2 {
+            columns[4 + lane][0] = entry[lane];
+            columns[lane][root_slot] = root[lane];
+        }
+        let mut b = FieldR1csBuilder::new();
+        let slices = columns
+            .iter()
+            .map(|column| alloc_column_slice(&mut b, column, 4).0)
+            .collect::<Vec<_>>();
+        let mut pins = Vec::new();
+        append_meta_b_statement_pins(
+            &mut pins,
+            &[depth],
+            &[vec![entry.map(LinExpr::constant)]],
+            &[vec![root.map(LinExpr::constant)]],
+            &[vec![root]],
+            &[vec![root]],
+            &[vec![0]],
+        );
+        assert_eq!(pins.len(), 4);
+        pin_stage2_cells(&mut b, &slices, &pins);
+        let (r1cs, witness) = b.build();
+        assert!(r1cs.satisfies(&witness));
+
+        let mut bad_entry = witness.clone();
+        bad_entry[slices[4].start()] += F128::ONE;
+        assert!(!r1cs.satisfies(&bad_entry));
+        let mut bad_root = witness;
+        bad_root[slices[0].start() + root_slot] += F128::ONE;
+        assert!(!r1cs.satisfies(&bad_root));
+    }
+}
+
 /// The flat-basis capacity IV of a consensus domain tag (mirror of the
 /// TAG_FRICHANL conversion at the walk-C setup: `[φ(iv_hi), φ(iv_lo)]`).
 fn iv_flat_of_tag(tag: DomainTag) -> [F128; 2] {
@@ -4032,6 +5047,63 @@ pub(crate) fn pattern_in_dyadic_region(
 mod split_walk_a_layout_tests {
     use super::*;
 
+    #[test]
+    fn meta_region_draft_spine_only_matches_direct_raw_columns() {
+        let flat = SpineInstanceFlat::ghost();
+        let direct = build_spine_instance_columns(&flat);
+        let spine = SpineRegionData {
+            instances: vec![SpineInstanceRegion {
+                leaves_w: flat.leaves.clone().map(|pair| pair.map(LinExpr::constant)),
+                tx_hash_w: direct.tx_hash.map(LinExpr::constant),
+                tx_hash_flat: direct.tx_hash,
+                flat,
+            }],
+        };
+        let mut b = FieldR1csBuilder::new();
+        let before = b.num_wires();
+        let draft = build_auth_pcs_meta_region_draft(&mut b, 1, None, None, Some(&spine));
+
+        assert!(draft.has_meta);
+        assert!(!draft.has_both_a_families);
+        assert_eq!(draft.spine_cap, 1);
+        assert_eq!(draft.spine_region_slots, 64);
+        assert_eq!(draft.meta_w_log, 6);
+        assert!(draft.meta_b.is_none());
+        assert!(draft.meta_b_families.is_empty());
+        assert_eq!(b.num_wires() - before, 2, "two spine root bridge wires");
+        assert_eq!(
+            draft.cell_pins_meta.len(),
+            38,
+            "32 KID + 4 root + 2 digest pins"
+        );
+
+        for lane in 0..2 {
+            assert_eq!(
+                &draft.meta_cols[KID0 + lane][..SPINE_TREE_SLOTS],
+                direct.tree_kid[lane].as_slice()
+            );
+            assert_eq!(
+                &draft.meta_cols[IN0 + lane]
+                    [draft.spine_wrap_base..draft.spine_wrap_base + SPINE_WRAP_SLOTS],
+                direct.wrap_in[lane].as_slice()
+            );
+        }
+        for lane in 0..STATE_SIZE {
+            assert_eq!(
+                &draft.meta_cols[C0 + lane][..SPINE_TREE_SLOTS],
+                direct.tree_c[lane].as_slice()
+            );
+            assert_eq!(
+                &draft.meta_s0[lane][..SPINE_TREE_SLOTS],
+                direct.tree_s0[lane].as_slice()
+            );
+            assert_eq!(
+                &draft.meta_s_out[lane][..SPINE_TREE_SLOTS],
+                direct.tree_s_out[lane].as_slice()
+            );
+        }
+    }
+
     fn production_split_b(k: usize) -> (TiledWalkLayout, TiledWalkLayout, TiledWalkLayout) {
         // Owner-auth capsule: nq=64, source/mid depths 5/6, both stride 8.
         let wallet_slots: [usize; 2] = [64 * 8, 64 * 8];
@@ -4183,6 +5255,84 @@ mod split_walk_a_layout_tests {
             !r1cs.satisfies(&bad),
             "non-boolean committed D cell survived exact allocation row"
         );
+    }
+
+    #[test]
+    fn wallet_ff_root_pin_uses_composite_only_at_power_of_two_depth() {
+        let iv = iv_flat_of_tag(noid_poseidon2b::native::domain::TAG_CAPSNODE);
+        let build = |depth: usize| {
+            build_ff_merkle_path_columns(
+                &FfMerklePathFamily { depth, n_paths: 1 },
+                iv,
+                &[FfMerklePathWitness {
+                    entry: [F128::new(5, 7), F128::new(11, 13)],
+                    siblings: (0..depth)
+                        .map(|level| {
+                            [
+                                F128::new(17 + level as u64, 19 + level as u64),
+                                F128::new(23 + level as u64, 29 + level as u64),
+                            ]
+                        })
+                        .collect(),
+                    directions: (0..depth).map(|level| level & 1 == 1).collect(),
+                }],
+                3,
+            )
+        };
+        let allocate =
+            |b: &mut FieldR1csBuilder,
+             cols: &noid_ivc_core::deep_chain::ff_merkle::FfMerklePathColumns| {
+                let mut slices = Vec::with_capacity(9);
+                for column in cols.c.iter() {
+                    slices.push(alloc_column_slice(b, column, 3).0);
+                }
+                for column in cols.cr.iter() {
+                    slices.push(alloc_column_slice(b, column, 3).0);
+                }
+                for column in cols.sib.iter() {
+                    slices.push(alloc_column_slice(b, column, 3).0);
+                }
+                slices.push(alloc_boolean_column_slice(b, &cols.d, 3).0);
+                slices
+            };
+
+        // Depth five retains the chain-constrained root-copy cell: only the
+        // two equality pins are new at the statement boundary.
+        let short = build(5);
+        let mut short_builder = FieldR1csBuilder::new();
+        let short_slices = allocate(&mut short_builder, &short);
+        let before_short = short_builder.num_wires();
+        pin_wallet_b_roots(
+            &mut short_builder,
+            &short_slices,
+            &[WalletFfRootPin::new(
+                0,
+                5,
+                short.roots[0].map(LinExpr::constant),
+            )],
+        );
+        assert_eq!(short_builder.num_wires() - before_short, 2);
+        let (short_r1cs, short_witness) = short_builder.build();
+        assert!(short_r1cs.satisfies(&short_witness));
+
+        // Depth eight has no tail. Two products plus the same two public-root
+        // equalities are exactly the four rows charged per path.
+        let full = build(8);
+        let mut full_builder = FieldR1csBuilder::new();
+        let full_slices = allocate(&mut full_builder, &full);
+        let before_full = full_builder.num_wires();
+        pin_wallet_b_roots(
+            &mut full_builder,
+            &full_slices,
+            &[WalletFfRootPin::new(
+                0,
+                8,
+                full.roots[0].map(LinExpr::constant),
+            )],
+        );
+        assert_eq!(full_builder.num_wires() - before_full, 4);
+        let (full_r1cs, full_witness) = full_builder.build();
+        assert!(full_r1cs.satisfies(&full_witness));
     }
 
     fn paired_meta_layout(

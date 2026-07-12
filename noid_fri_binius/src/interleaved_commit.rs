@@ -71,6 +71,14 @@ pub struct SourceBatchedMerkleProof {
     pub siblings: Vec<SourceHash>,
 }
 
+/// One canonical missing-sibling position in a batched path to a Merkle cap.
+/// `depth_from_root == depth` denotes the leaf layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SourceMerkleSiblingPosition {
+    pub depth_from_root: usize,
+    pub index: usize,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SourceHashMerkleTree {
     nodes: Vec<SourceHash>,
@@ -310,17 +318,24 @@ pub(crate) fn source_compress(
     hasher.compress(left, right)
 }
 
-fn build_source_batched_merkle_proof_with_getter_to_cap<F>(
+/// Canonical sibling schedule shared by native builders, recursive geometry,
+/// and security-model differentials.
+pub fn canonical_source_batched_merkle_sibling_positions(
     depth: usize,
     cap_depth: usize,
     leaf_indices: &[usize],
-    mut get_node_at_depth: F,
-) -> SourceBatchedMerkleProof
-where
-    F: FnMut(usize, usize) -> SourceHash,
-{
-    assert!(cap_depth <= depth);
-    let mut siblings = Vec::new();
+) -> Result<Vec<SourceMerkleSiblingPosition>, String> {
+    if cap_depth > depth {
+        return Err("source cap depth exceeds tree depth".into());
+    }
+    let leaf_bound = 1usize
+        .checked_shl(depth as u32)
+        .ok_or_else(|| "source tree depth exceeds usize".to_string())?;
+    if let Some(&index) = leaf_indices.iter().find(|&&index| index >= leaf_bound) {
+        return Err(format!("source leaf index {index} out of range"));
+    }
+
+    let mut positions = Vec::new();
     let mut known = sorted_unique_usize(leaf_indices);
     for d in 0..(depth - cap_depth) {
         let parents = sorted_unique_parents(&known);
@@ -332,9 +347,15 @@ where
             let right_known = known.binary_search(&right_child).is_ok();
             if left_known && right_known {
             } else if left_known {
-                siblings.push(get_node_at_depth(depth - d, right_child));
+                positions.push(SourceMerkleSiblingPosition {
+                    depth_from_root: depth - d,
+                    index: right_child,
+                });
             } else if right_known {
-                siblings.push(get_node_at_depth(depth - d, left_child));
+                positions.push(SourceMerkleSiblingPosition {
+                    depth_from_root: depth - d,
+                    index: left_child,
+                });
             }
             if left_known || right_known {
                 next.push(parent);
@@ -342,6 +363,25 @@ where
         }
         known = next;
     }
+    Ok(positions)
+}
+
+fn build_source_batched_merkle_proof_with_getter_to_cap<F>(
+    depth: usize,
+    cap_depth: usize,
+    leaf_indices: &[usize],
+    mut get_node_at_depth: F,
+) -> SourceBatchedMerkleProof
+where
+    F: FnMut(usize, usize) -> SourceHash,
+{
+    let positions =
+        canonical_source_batched_merkle_sibling_positions(depth, cap_depth, leaf_indices)
+            .expect("internal source Merkle opening shape");
+    let siblings = positions
+        .into_iter()
+        .map(|position| get_node_at_depth(position.depth_from_root, position.index))
+        .collect();
     SourceBatchedMerkleProof { siblings }
 }
 

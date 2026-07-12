@@ -39,6 +39,13 @@ pub mod spine_unified;
 pub mod state_leaf_killshot;
 pub mod tx_body_layout;
 pub mod wallet_authorization;
+pub mod zk_auth_capsule;
+pub mod zk_auth_hiding;
+pub mod zk_auth_qrom;
+pub mod zk_auth_rbr;
+pub mod zk_authorization;
+pub mod zk_authorization_wire;
+pub mod zk_mlecheck;
 
 pub use accepted_claim_killshot::{
     discharge_accepted_claim_hash_reductions_native, prove_accepted_claim_hash_killshot,
@@ -147,4 +154,17 @@ pub use wallet_authorization::{
     CanonicalAuthorizationStatement, OwnerAuthWitness, ProveAuthorizationError,
     VerifiedAuthorization, VerifiedAuthorizationBatch, VerifyAuthorizationError,
     WalletAuthorizationBundle, MAX_AUTHORIZATION_BUNDLE_BYTES, MAX_AUTHORIZATION_LIVE_INPUTS,
+};
+pub use zk_auth_hiding::{
+    certify_zk_auth_companion_change_of_variables,
+    certify_zk_auth_conditioned_companion_hyperplane, certify_zk_auth_joint_hiding_rank,
+    ZkAuthCompanionChangeOfVariablesCertificate, ZkAuthConditionedCompanionHyperplaneCertificate,
+    ZkAuthHidingRankError, ZkAuthJointHidingRankCertificate, ZkAuthRandomBlock,
+    ZK_AUTH_COMPANION_CHANGE_DIMENSION, ZK_AUTH_COMPANION_CHANGE_RANK,
+    ZK_AUTH_COMPANION_HYPERPLANE_DIMENSION, ZK_AUTH_FRESH_BANK_SUFFIX_CELLS,
+    ZK_AUTH_FRESH_COMPANION_CELLS, ZK_AUTH_LIBRA_RANDOM_BLOCK, ZK_AUTH_SOURCE_COIN_RANDOM_BLOCK,
+    ZK_AUTH_TERMINAL_OPERAND_PAD_RANDOM_BLOCK, ZK_AUTH_TOTAL_FRESH_CELLS,
+};
+pub use zk_authorization_wire::{
+    ZkAuthorizationWireDecodeError, ZkAuthorizationWireEncodeError, ZK_AUTHORIZATION_MAX_WIRE_BYTES,
 };

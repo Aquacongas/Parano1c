@@ -13,7 +13,7 @@ use noid_core::mem_profile::current_mem_snapshot;
 use noid_core::Block128;
 use noid_recursive::acceptance::shape::ShapeClass;
 use noid_recursive::acceptance::trace::action_compaction::{
-    bind_mint_creation_ids_body_order, compact_action_rows,
+    bind_mint_packed_values_body_order, compact_action_rows,
 };
 use noid_recursive::acceptance::trace::action_surface::ActionRowTrace;
 use noid_recursive::acceptance::trace::{alloc_block, FieldR1csBuilder, LinExpr};
@@ -41,7 +41,6 @@ fn row(b: &mut FieldR1csBuilder, ordinal: usize, live: bool, is_mint: bool) -> A
         live: live_w.clone(),
         slot_index: selected(b, ordinal as u128 + 1),
         value: selected(b, ordinal as u128 + 10_000),
-        creation_id: LinExpr::zero(),
         owner: [
             selected(b, ordinal as u128 + 20_000),
             selected(b, ordinal as u128 + 30_000),
@@ -93,7 +92,7 @@ fn main() {
             .count();
         let parent_alloc = alloc_block(&mut b, Block128::from(100u128));
         let child_alloc = alloc_block(&mut b, Block128::from(100u128 + mint_count as u128));
-        bind_mint_creation_ids_body_order(&mut b, &mut candidates, &parent_alloc, &child_alloc);
+        bind_mint_packed_values_body_order(&mut b, &mut candidates, &parent_alloc, &child_alloc);
         let compact = compact_action_rows(&mut b, &candidates, class.touched_capacity());
         assert_eq!(compact.source_rows, class.action_candidate_capacity());
         assert_eq!(compact.sort_rows, class.action_sort_capacity());

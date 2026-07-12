@@ -23,7 +23,7 @@
 use crate::deep_chain::relations::{ColRef, FixedPattern, RelationTerm};
 use crate::deep_chain::source_tree::run_perm;
 use crate::field::F128;
-use noid_poseidon2b::native::domain::{capacity_iv_flat, TAG_COMPRESS, TAG_TX8X2};
+use noid_poseidon2b::native::domain::{TAG_COMPRESS, TAG_TX8X2, capacity_iv_flat};
 use noid_poseidon2b::native::permutation::STATE_SIZE;
 
 /// Number of raw, two-lane body leaves.
@@ -276,14 +276,14 @@ pub fn spine_tree_exposure_terms(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::deep_chain::leaf_hash::{sponge_leaf_substitution_terms, SpongeLeafRefs};
+    use crate::deep_chain::leaf_hash::{SpongeLeafRefs, sponge_leaf_substitution_terms};
     use crate::deep_chain::relations::{
-        claimed_refs, prove_column_relation, prove_shift_discharge, verify_column_relation,
-        verify_shift_discharge, window_discharge_point, RelationColumns,
+        RelationColumns, claimed_refs, prove_column_relation, prove_shift_discharge,
+        verify_column_relation, verify_shift_discharge, window_discharge_point,
     };
     use crate::deep_chain::schedule::carry_selection_terms;
-    use crate::deep_chain::source_tree::{source_tree_substitution_terms, SourceTreeRefs};
-    use crate::deep_chain::{prove_deep_chain_walk, verify_deep_chain_walk, LaneClaimGroup};
+    use crate::deep_chain::source_tree::{SourceTreeRefs, source_tree_substitution_terms};
+    use crate::deep_chain::{LaneClaimGroup, prove_deep_chain_walk, verify_deep_chain_walk};
     use crate::lincheck::build_eq_table;
     use noid_core::{Block128, TowerField};
     use noid_poseidon2b::native::domain::capacity_iv;

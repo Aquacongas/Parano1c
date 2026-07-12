@@ -14,7 +14,7 @@ use crate::deep_chain::source_tree::{
     compress_iv_flat, flat_compress, flat_hash_pair, permute_flat_state, run_perm,
 };
 use crate::field::F128;
-use noid_poseidon2b::native::domain::{capacity_iv_flat, TAG_EXSTSLT};
+use noid_poseidon2b::native::domain::{TAG_EXSTSLT, capacity_iv_flat};
 use noid_poseidon2b::native::permutation::STATE_SIZE;
 
 /// Domain tag for encoded-source leaf hashes — the flat image of
@@ -874,13 +874,13 @@ mod tests {
     use super::*;
     use crate::challenger::{Challenger, FsLaneChallenger};
     use crate::deep_chain::relations::{
-        claimed_refs, prove_column_relation, prove_shift_discharge, prove_shift_discharge_pow2,
-        verify_column_relation, verify_shift_discharge, verify_shift_discharge_pow2, ColRef,
-        RelationColumns,
+        ColRef, RelationColumns, claimed_refs, prove_column_relation, prove_shift_discharge,
+        prove_shift_discharge_pow2, verify_column_relation, verify_shift_discharge,
+        verify_shift_discharge_pow2,
     };
     use crate::deep_chain::schedule::carry_selection_terms;
     use crate::deep_chain::source_tree::compress_iv_flat;
-    use crate::deep_chain::{prove_deep_chain_walk, verify_deep_chain_walk, LaneClaimGroup};
+    use crate::deep_chain::{LaneClaimGroup, prove_deep_chain_walk, verify_deep_chain_walk};
     use crate::lincheck::build_eq_table;
 
     fn mle(col: &[F128], point: &[F128]) -> F128 {
@@ -1598,7 +1598,7 @@ mod tests {
     fn sponge_leaf_digest_matches_native_slot_leaf_hash() {
         use noid_core::Block128;
         use noid_poseidon2b::native::compression::Poseidon2bSponge;
-        use noid_poseidon2b::native::domain::{capacity_iv, TAG_EXSTSLT};
+        use noid_poseidon2b::native::domain::{TAG_EXSTSLT, capacity_iv};
 
         // φ: tower Block128 → flat F128 lane (per 16-byte lane).
         let tower_flat = |b: Block128| -> F128 {

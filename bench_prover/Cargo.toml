@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 
+[features]
+default = []
+selected-zk-measurement = ["noid_recursive/selected-zk-measurement"]
+
 [dependencies]
 noid_core = { path = "../noid_core" }
 noid_fri = { path = "../noid_fri" }
@@ -14,6 +18,7 @@ noid_tx = { path = "../noid_tx" }
 noid_block = { path = "../noid_block" }
 noid_chain = { path = "../noid_chain" }
 noid_recursive = { path = "../noid_recursive" }
+noid-ivc-core = { path = "../noid_ivc_core" }
 noid-ivc-prover = { path = "../noid_ivc_prover" }
 rayon = "1.10"
 bincode = "1"
@@ -58,6 +63,15 @@ harness = false
 [[bench]]
 name = "pcs_roofline"
 harness = false
+
+[[bench]]
+name = "zk_capsule_geometry_roofline"
+harness = false
+
+[[bench]]
+name = "selected_zk_b255_measurement"
+harness = false
+required-features = ["selected-zk-measurement"]
 
 [[bench]]
 name = "accepted_b255_truth"

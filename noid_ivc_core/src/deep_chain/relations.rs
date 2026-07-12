@@ -1203,16 +1203,18 @@ mod tests {
 
         // Forged target and wire mutations rejected.
         let mut ch = FsLaneChallenger::new(b"relation-test");
-        assert!(verify_column_relation(
-            w_log,
-            target + F128::ONE,
-            &eq_point,
-            &terms,
-            &[],
-            &proof,
-            &mut ch
-        )
-        .is_err());
+        assert!(
+            verify_column_relation(
+                w_log,
+                target + F128::ONE,
+                &eq_point,
+                &terms,
+                &[],
+                &proof,
+                &mut ch
+            )
+            .is_err()
+        );
 
         let mut survivors = Vec::new();
         for round in 0..w_log {
@@ -1419,16 +1421,18 @@ mod tests {
         // Forged target and every wire mutation rejected (or land on a false
         // terminal claim after a shifted derived point).
         let mut ch = FsLaneChallenger::new(b"window-test");
-        assert!(verify_column_relation(
-            w_log,
-            target + F128::ONE,
-            &eq_point,
-            &terms,
-            &[],
-            &proof,
-            &mut ch
-        )
-        .is_err());
+        assert!(
+            verify_column_relation(
+                w_log,
+                target + F128::ONE,
+                &eq_point,
+                &terms,
+                &[],
+                &proof,
+                &mut ch
+            )
+            .is_err()
+        );
 
         let mut survivors = Vec::new();
         for round in 0..w_log {

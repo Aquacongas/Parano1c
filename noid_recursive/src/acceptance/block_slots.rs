@@ -60,6 +60,7 @@
 //! production proof additionally requires the post-commit region sidecar to
 //! make the shared hashing-column reductions sound.
 
+use noid_core::hardware::flat_to_tower_u128;
 use noid_core::Block128;
 use noid_gkr::merkle_circuit::MerkleCircuit;
 use noid_poseidon2b::native::compression::compress;
@@ -104,6 +105,10 @@ use super::trace::region_source_binding::{
 };
 use super::trace::segment_compaction::{bind_segment_upper_chain, compact_segment_updates};
 use super::trace::tx_body_spine::{build_tx_body_slot, SpineInputsTrace};
+#[cfg(any(test, feature = "selected-zk-measurement"))]
+use super::trace::zk_authorization_candidate::{
+    bind_selected_zk_block_region, SelectedZkAuthorizationProofBundle, SelectedZkBlockRegionBinding,
+};
 use super::trace::{
     alloc_block, const_block, flat_const, flat_of, integer_add_no_overflow, mul, pin_eq,
     pin_lt_strict, pin_zero, range_check_bits, FieldR1csBuilder, LinExpr, RawChannelTrace, Wire,
@@ -117,6 +122,7 @@ use crate::pow_header::header_hash_proof_inputs;
 use crate::region_sidecar::{BlockRegionPreparation, BlockRegionProverInput, BlockRegionSidecarVk};
 use noid_gkr::SpineInputs;
 use noid_ivc_core::deep_chain::spine::SpineInstanceFlat;
+use noid_ivc_core::field_circuit::f128_to_u128;
 
 // ---------------------------------------------------------------------------
 // Fixed field positions (protocol constants of the two statement encodings)
@@ -138,6 +144,134 @@ pub mod header_claim {
     pub const ACTIVE_SLOT_COUNT: usize = 16;
     pub const ALLOC_COUNTER: usize = 17;
     pub const FIELDS: usize = 18;
+}
+
+#[cfg(test)]
+mod selected_zk_capability_tests {
+    use super::*;
+
+    #[test]
+    fn b255_capability_is_zero_row_exact_and_pad_is_constant_metadata() {
+        let ghost_body = noid_gkr::ghost_tx::ghost_tx_body();
+        let ghost_statement = noid_gkr::zk_authorization::ZkAuthCapsuleOwnerStatement {
+            tx_body_hash: noid_gkr::ghost_tx::ghost_tx_body_hash(),
+            address: ghost_body.input_owner.as_fields(),
+        };
+        for live_count in [0usize, 1, 17, 254, 255] {
+            let (b, capability) = canonical_selected_zk_authorization_fixture(live_count);
+            assert_eq!(capability.len(), 256);
+            assert_eq!(capability.live_count(), live_count);
+            for index in 0..255 {
+                let slot = capability.slot(index);
+                assert!(slot.body_aliases().is_some());
+                assert_eq!(
+                    slot.kind(),
+                    if index < live_count {
+                        CanonicalSelectedZkAuthorizationSlotKind::Live
+                    } else {
+                        CanonicalSelectedZkAuthorizationSlotKind::Ghost
+                    }
+                );
+                assert_eq!(
+                    slot.liveness().eval(b.values()),
+                    if index < live_count {
+                        F128::ONE
+                    } else {
+                        F128::ZERO
+                    }
+                );
+            }
+            let pad = capability.slot(255);
+            assert_eq!(pad.kind(), CanonicalSelectedZkAuthorizationSlotKind::Pad255);
+            assert!(pad.body_aliases().is_none());
+            assert_eq!(pad.liveness().eval(b.values()), F128::ZERO);
+            assert_eq!(pad.native_statement(), ghost_statement);
+        }
+    }
+
+    #[test]
+    fn capability_carrier_has_no_clone_or_raw_constructor_surface() {
+        let source = include_str!("block_slots.rs");
+        let capability_name = ["CanonicalSelectedZkAuthorization", "Capability"].concat();
+        let declaration_marker = format!("struct {capability_name}");
+        let declaration = source
+            .split(&declaration_marker)
+            .nth(1)
+            .expect("capability declaration");
+        let header = declaration.split('}').next().expect("capability header");
+        assert!(!header.contains("pub "), "capability field became public");
+        assert!(!source.contains(&format!("impl Clone for {capability_name}")));
+        let raw_constructor =
+            ["fn new_canonical_selected_zk_", "authorization_capability"].concat();
+        assert!(!source.contains(&raw_constructor));
+        let free_take = ["fn take_selected_zk_", "authorization_capability"].concat();
+        assert!(!source.contains(&free_take));
+    }
+
+    #[test]
+    fn selected_declared_count_is_a_zero_row_canonical_bitmap_hint() {
+        for expected in 1u8..=noid_gkr::MAX_AUTHORIZATION_LIVE_INPUTS {
+            let mut body = noid_gkr::ghost_tx::ghost_tx_body();
+            let output_bits = body.validity_bitmap & !((1u16 << noid_tx::TX_INPUTS) - 1);
+            body.validity_bitmap = output_bits | ((1u16 << expected) - 1);
+            let native = noid_gkr::spine_statement::spine_inputs_from_body(&body);
+            let mut b = FieldR1csBuilder::new();
+            let spine = SpineInputsTrace::alloc(&mut b, &native);
+            let before = b.num_wires();
+            assert_eq!(selected_declared_live_input_count(&b, &spine), expected);
+            assert_eq!(
+                b.num_wires(),
+                before,
+                "native bitmap hint must not add rows"
+            );
+        }
+    }
+
+    #[test]
+    fn selected_backend_replaces_legacy_before_owner_and_preserves_column_order() {
+        let source = include_str!("block_slots.rs");
+        let public_wrapper = source
+            .rsplit("pub fn build_block_slots_with_config")
+            .next()
+            .expect("public BlockSlots wrapper")
+            .split("/// Measurement-only B255 replacement entry")
+            .next()
+            .expect("public wrapper body");
+        assert!(public_wrapper.contains("BlockAuthorizationBackend::Legacy"));
+        assert!(!public_wrapper.contains("BlockAuthorizationBackend::Selected"));
+
+        let core = source
+            .rsplit("fn build_block_slots_with_authorization_backend")
+            .next()
+            .expect("private authorization backend core");
+        let branch = core
+            .find("match authorization_backend")
+            .expect("backend branch");
+        let legacy_owner = core
+            .find("OwnerAuthPublicInputsTrace::alloc")
+            .expect("legacy Owner allocation");
+        let selected_public = core
+            .find("selected_declared_live_input_count")
+            .expect("selected canonical public arithmetic");
+        assert!(branch < legacy_owner && branch < selected_public);
+
+        let fee = core
+            .find("bind_block_fee_arithmetic")
+            .expect("common fee arithmetic");
+        let selected_region = core
+            .find("selected_region = Some(bind_selected_zk_block_region")
+            .expect("selected region bridge");
+        assert!(
+            fee < selected_region,
+            "selected columns moved before the frozen fee-row prefix"
+        );
+        assert_eq!(
+            core.matches("mint_canonical_selected_zk_authorization_capability")
+                .count(),
+            1,
+            "selected capability must be minted once inside the selected branch"
+        );
+    }
 }
 
 /// Absolute lane positions inside the 80-field accepted-block claim
@@ -354,6 +488,26 @@ fn append_user_action_surface(
     output_selectors.extend(surface.selected_outputs.iter().cloned());
     candidates.extend(surface.ordered_rows());
     arithmetic
+}
+
+/// Recover only the native value hint for the existing fixed-shape declared
+/// input-count relation.  The hint adds no rows and carries no authority: the
+/// action surface range-checks the canonical L15 bitmap, public arithmetic
+/// recomputes its selected popcount, and `append_user_action_surface` pins that
+/// result to the freshly allocated 1..=8 count exactly as on the legacy path.
+#[cfg(any(test, feature = "selected-zk-measurement"))]
+fn selected_declared_live_input_count(b: &FieldR1csBuilder, spine: &SpineInputsTrace) -> u8 {
+    use noid_tx::body_hash::TX8X2_LEAF_FLAGS;
+
+    let flat = f128_to_u128(spine.leaves[TX8X2_LEAF_FLAGS][0].eval(b.values()));
+    let bitmap = flat_to_tower_u128(flat);
+    let input_mask = (1u128 << noid_tx::TX_INPUTS) - 1;
+    let count = (bitmap & input_mask).count_ones() as u8;
+    assert!(
+        (1..=noid_gkr::MAX_AUTHORIZATION_LIVE_INPUTS).contains(&count),
+        "selected user bitmap must contain 1..=8 live inputs"
+    );
+    count
 }
 
 /// Allocate the native authorization count and pin it to bitmap popcount in
@@ -855,6 +1009,181 @@ fn bind_tx_epoch_anchors(
 // Assembly
 // ---------------------------------------------------------------------------
 
+/// Canonical role of one selected B255 authorization slot. The role is
+/// derived from the already boolean, monotone Block liveness prefix; callers
+/// cannot supply or mutate it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::acceptance) enum CanonicalSelectedZkAuthorizationSlotKind {
+    Live,
+    Ghost,
+    Pad255,
+}
+
+/// One statement/liveness tuple owned by the canonical Block relation.
+/// Fields stay private to this module: the selected all-tiles assembly can
+/// borrow only the audited views below, never construct a raw statement.
+pub(in crate::acceptance) struct CanonicalSelectedZkAuthorizationSlot {
+    tx_body_hash: Option<[LinExpr; 2]>,
+    expected_address: Option<[LinExpr; 2]>,
+    liveness: LinExpr,
+    native_statement: noid_gkr::zk_authorization::ZkAuthCapsuleOwnerStatement,
+    kind: CanonicalSelectedZkAuthorizationSlotKind,
+}
+
+impl CanonicalSelectedZkAuthorizationSlot {
+    pub(in crate::acceptance) fn body_aliases(&self) -> Option<(&[LinExpr; 2], &[LinExpr; 2])> {
+        self.tx_body_hash
+            .as_ref()
+            .zip(self.expected_address.as_ref())
+    }
+
+    pub(in crate::acceptance) fn liveness(&self) -> &LinExpr {
+        &self.liveness
+    }
+
+    pub(in crate::acceptance) fn native_statement(
+        &self,
+    ) -> noid_gkr::zk_authorization::ZkAuthCapsuleOwnerStatement {
+        self.native_statement
+    }
+
+    pub(in crate::acceptance) fn kind(&self) -> CanonicalSelectedZkAuthorizationSlotKind {
+        self.kind
+    }
+}
+
+/// Non-Clone statement authority minted only by `BlockSlots` after
+/// boolean/monotone liveness, complete dead-body ghost pins and PAD255=0 are
+/// already in the same matrix. It intentionally has no raw constructor or
+/// statement-Vec extractor. Builder affinity comes from the private owning
+/// selected assembly choke point, not from this carrier by itself.
+pub(in crate::acceptance) struct CanonicalSelectedZkAuthorizationCapability {
+    slots: Vec<CanonicalSelectedZkAuthorizationSlot>,
+}
+
+impl CanonicalSelectedZkAuthorizationCapability {
+    pub(in crate::acceptance) fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub(in crate::acceptance) fn slot(
+        &self,
+        index: usize,
+    ) -> &CanonicalSelectedZkAuthorizationSlot {
+        &self.slots[index]
+    }
+
+    pub(in crate::acceptance) fn live_count(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|slot| slot.kind == CanonicalSelectedZkAuthorizationSlotKind::Live)
+            .count()
+    }
+}
+
+fn block_from_alias(b: &FieldR1csBuilder, expression: &LinExpr) -> Block128 {
+    let flat = f128_to_u128(expression.eval(b.values()));
+    Block128::from(flat_to_tower_u128(flat))
+}
+
+/// Zero-row extraction of the exact B255 selected statement surface. Body
+/// slots retain the original Block aliases. PAD255 has no body, so this
+/// capability carries only its native protocol constants; the owning
+/// selected assembly later materializes and pins the four PAD wires in its
+/// still-owned builder.
+fn mint_canonical_selected_zk_authorization_capability(
+    b: &FieldR1csBuilder,
+    tx_hashes: &[[LinExpr; 2]],
+    spine_inputs: &[SpineInputsTrace],
+    live_bits: &[LinExpr],
+) -> CanonicalSelectedZkAuthorizationCapability {
+    use noid_tx::body_hash::TX8X2_LEAF_INPUT_OWNER;
+
+    const BODY_AUTH_SLOTS: usize = noid_chain::consensus::params::BLOCK_MAX_USER_TXS;
+    const AUTH_SLOTS: usize = 256;
+    const TX_DELTA: usize = 1;
+    const _: () = assert!(BODY_AUTH_SLOTS == 255);
+
+    assert_eq!(tx_hashes.len(), TX_DELTA + BODY_AUTH_SLOTS);
+    assert_eq!(spine_inputs.len(), TX_DELTA + BODY_AUTH_SLOTS);
+    assert_eq!(live_bits.len(), AUTH_SLOTS);
+    assert_eq!(live_bits[AUTH_SLOTS - 1].eval(b.values()), F128::ZERO);
+
+    let ghost_body = noid_gkr::ghost_tx::ghost_tx_body();
+    let ghost_hash = noid_gkr::ghost_tx::ghost_tx_body_hash();
+    let ghost_address = ghost_body.input_owner.as_fields();
+    let ghost_statement = noid_gkr::zk_authorization::ZkAuthCapsuleOwnerStatement {
+        tx_body_hash: ghost_hash,
+        address: ghost_address,
+    };
+
+    let mut slots = Vec::with_capacity(AUTH_SLOTS);
+    for index in 0..BODY_AUTH_SLOTS {
+        let body_index = index + TX_DELTA;
+        let tx_body_hash = tx_hashes[body_index].clone();
+        let expected_address = spine_inputs[body_index].leaves[TX8X2_LEAF_INPUT_OWNER].clone();
+        let live = live_bits[index].eval(b.values());
+        assert!(live == F128::ZERO || live == F128::ONE);
+        let kind = if live == F128::ONE {
+            CanonicalSelectedZkAuthorizationSlotKind::Live
+        } else {
+            CanonicalSelectedZkAuthorizationSlotKind::Ghost
+        };
+        let native_statement = noid_gkr::zk_authorization::ZkAuthCapsuleOwnerStatement {
+            tx_body_hash: std::array::from_fn(|lane| block_from_alias(b, &tx_body_hash[lane])),
+            address: std::array::from_fn(|lane| block_from_alias(b, &expected_address[lane])),
+        };
+        if kind == CanonicalSelectedZkAuthorizationSlotKind::Ghost {
+            assert_eq!(native_statement, ghost_statement);
+        }
+        slots.push(CanonicalSelectedZkAuthorizationSlot {
+            tx_body_hash: Some(tx_body_hash),
+            expected_address: Some(expected_address),
+            liveness: live_bits[index].clone(),
+            native_statement,
+            kind,
+        });
+    }
+    slots.push(CanonicalSelectedZkAuthorizationSlot {
+        tx_body_hash: None,
+        expected_address: None,
+        liveness: live_bits[AUTH_SLOTS - 1].clone(),
+        native_statement: ghost_statement,
+        kind: CanonicalSelectedZkAuthorizationSlotKind::Pad255,
+    });
+    CanonicalSelectedZkAuthorizationCapability { slots }
+}
+
+#[cfg(test)]
+pub(in crate::acceptance) fn canonical_selected_zk_authorization_fixture(
+    live_count: usize,
+) -> (FieldR1csBuilder, CanonicalSelectedZkAuthorizationCapability) {
+    const BODY_AUTH_SLOTS: usize = 255;
+    assert!(live_count <= BODY_AUTH_SLOTS);
+    let mut b = FieldR1csBuilder::new();
+    let ghost_body = noid_gkr::ghost_tx::ghost_tx_body();
+    let ghost_spine = noid_gkr::spine_statement::spine_inputs_from_body(&ghost_body);
+    let ghost_hash = noid_gkr::ghost_tx::ghost_tx_body_hash();
+    let spine_inputs = (0..=BODY_AUTH_SLOTS)
+        .map(|_| SpineInputsTrace::alloc(&mut b, &ghost_spine))
+        .collect::<Vec<_>>();
+    let tx_hashes = (0..=BODY_AUTH_SLOTS)
+        .map(|_| ghost_hash.map(|value| alloc_block(&mut b, value)))
+        .collect::<Vec<_>>();
+    let live_bits = (0..256)
+        .map(|index| LinExpr::from_wire(b.alloc_bool(index < live_count)))
+        .collect::<Vec<_>>();
+    let before_mint = b.num_wires();
+    let capability = mint_canonical_selected_zk_authorization_capability(
+        &b,
+        &tx_hashes,
+        &spine_inputs,
+        &live_bits,
+    );
+    assert_eq!(b.num_wires(), before_mint, "capability mint added rows");
+    (b, capability)
+}
+
 /// The primary statement wires of one assembled block, returned for the
 /// link-level bindings (IO exposure and cross-link chain pins).
 pub struct BlockSlots {
@@ -999,6 +1328,53 @@ impl Default for BlockSlotsConfig {
     }
 }
 
+enum BlockAuthorizationBackend {
+    Legacy,
+    #[cfg(any(test, feature = "selected-zk-measurement"))]
+    Selected(SelectedZkAuthorizationProofBundle),
+}
+
+impl BlockAuthorizationBackend {
+    fn is_selected(&self) -> bool {
+        match self {
+            Self::Legacy => false,
+            #[cfg(any(test, feature = "selected-zk-measurement"))]
+            Self::Selected(_) => true,
+        }
+    }
+}
+
+struct BlockSlotsCoreAssembly {
+    slots: BlockSlots,
+    #[cfg(any(test, feature = "selected-zk-measurement"))]
+    selected_region: Option<SelectedZkBlockRegionBinding>,
+}
+
+/// Private selected-B255 handoff for the diagnostic outer Block owner.  It
+/// keeps the ordinary Block statement aliases and the opaque bound V4 region
+/// together until the owner has appended its public-IO pins and built the
+/// same builder.
+#[cfg(any(test, feature = "selected-zk-measurement"))]
+pub(in crate::acceptance) struct SelectedZkBlockSlotsAssembly {
+    slots: BlockSlots,
+    region: SelectedZkBlockRegionBinding,
+}
+
+#[cfg(any(test, feature = "selected-zk-measurement"))]
+impl SelectedZkBlockSlotsAssembly {
+    pub(in crate::acceptance) fn slots(&self) -> &BlockSlots {
+        &self.slots
+    }
+
+    pub(in crate::acceptance) fn region_vk(&self) -> &BlockRegionSidecarVk {
+        self.region.vk()
+    }
+
+    pub(in crate::acceptance) fn into_region_binding(self) -> SelectedZkBlockRegionBinding {
+        self.region
+    }
+}
+
 /// Assemble the single-block component replay. `inputs`/`proof` are the
 /// native component objects; `start/end_accumulator` the block's
 /// accumulator boundary. Every class has one Tx8x2 user-transaction tier.
@@ -1028,6 +1404,78 @@ pub fn build_block_slots_with_config(
     proof: &AcceptedBlockBatchComponentProof,
     config: BlockSlotsConfig,
 ) -> BlockSlots {
+    let assembly = build_block_slots_with_authorization_backend(
+        b,
+        start_accumulator,
+        end_accumulator,
+        inputs,
+        proof,
+        config,
+        BlockAuthorizationBackend::Legacy,
+    );
+    #[cfg(any(test, feature = "selected-zk-measurement"))]
+    assert!(
+        assembly.selected_region.is_none(),
+        "public BlockSlots wrapper is strictly legacy"
+    );
+    assembly.slots
+}
+
+/// Measurement-only B255 replacement entry.  The production/public wrapper
+/// above cannot select this backend; the proof bundle is an owned private
+/// side input until a future network carrier is designed.
+#[cfg(any(test, feature = "selected-zk-measurement"))]
+pub(in crate::acceptance) fn build_block_slots_selected_zk_b255(
+    b: &mut FieldR1csBuilder,
+    start_accumulator: &ChainAccumulator,
+    end_accumulator: &ChainAccumulator,
+    inputs: &AcceptedBlockBatchComponentInputs,
+    proof: &AcceptedBlockBatchComponentProof,
+    config: BlockSlotsConfig,
+    proofs: SelectedZkAuthorizationProofBundle,
+) -> SelectedZkBlockSlotsAssembly {
+    assert_eq!(
+        config.tier_user_tx_capacity,
+        Some(noid_chain::consensus::params::BLOCK_MAX_USER_TXS),
+        "selected backend is defined only for B255"
+    );
+    assert!(
+        config.exact_state_region && config.tx_root_region && config.spine_region,
+        "selected B255 requires canonical exact-state/tx-root/spine Meta carriers"
+    );
+    let mut assembly = build_block_slots_with_authorization_backend(
+        b,
+        start_accumulator,
+        end_accumulator,
+        inputs,
+        proof,
+        config,
+        BlockAuthorizationBackend::Selected(proofs),
+    );
+    assert!(
+        assembly.slots.region_preparation.is_none(),
+        "selected preparation must remain unminted before outer build"
+    );
+    let region = assembly
+        .selected_region
+        .take()
+        .expect("selected backend returned its opaque bound region");
+    SelectedZkBlockSlotsAssembly {
+        slots: assembly.slots,
+        region,
+    }
+}
+
+fn build_block_slots_with_authorization_backend(
+    b: &mut FieldR1csBuilder,
+    start_accumulator: &ChainAccumulator,
+    end_accumulator: &ChainAccumulator,
+    inputs: &AcceptedBlockBatchComponentInputs,
+    proof: &AcceptedBlockBatchComponentProof,
+    config: BlockSlotsConfig,
+    authorization_backend: BlockAuthorizationBackend,
+) -> BlockSlotsCoreAssembly {
+    let selected_authorization_backend = authorization_backend.is_selected();
     // validate_component_shape + the single-block batch shape, as asserts.
     let witness = &inputs.accepted_claim_witness;
     assert_eq!(witness.headers.len(), 1, "one block per link");
@@ -1081,7 +1529,8 @@ pub fn build_block_slots_with_config(
         && config.owner_auth_region
         && config.exact_state_region
         && config.tx_root_region
-        && config.spine_region;
+        && config.spine_region
+        && !selected_authorization_backend;
 
     let mut ledger = b.num_wires();
 
@@ -1486,6 +1935,13 @@ pub fn build_block_slots_with_config(
     let mut paired_exact_state_cells: Option<PairedExactStateCells> = None;
     let mut region_preparation: Option<BlockRegionPreparation> = None;
     let mut owner_region_parts = None;
+    #[cfg(any(test, feature = "selected-zk-measurement"))]
+    let mut selected_region: Option<SelectedZkBlockRegionBinding> = None;
+    #[cfg(any(test, feature = "selected-zk-measurement"))]
+    let mut selected_pending: Option<(
+        CanonicalSelectedZkAuthorizationCapability,
+        SelectedZkAuthorizationProofBundle,
+    )> = None;
     // Region path: collect every tx's obligation; the whole block's wallet-PCS
     // discharges in ONE tiled plural call after the loop (all txs' capsule
     // families tile into one walk A/B/C, opening claims flat in tx count) so the
@@ -1510,99 +1966,149 @@ pub fn build_block_slots_with_config(
     // discharge in the plural), with the tx_body_hash pinned to the capacity
     // tx-hash wires (whose values ARE the ghost body hash by the spine
     // padding above).
-    let ghost_auth = (n_auth_slots > n_real_user).then(noid_gkr::ghost_tx::ghost_authorization);
-    for i in 0..n_auth_slots {
-        let (public_native, witness_proof, hash_idx, live_input_count) = if i < n_real_user {
-            let input = &inputs.authorization_inputs[i];
-            assert_eq!(input.block_index, 0, "one block per link");
-            assert_eq!(
-                input.tx_index,
-                i + tx_delta,
-                "authorization inputs must follow canonical block transaction order"
-            );
-            // Native `verify_authorization_statement_proof` statement check.
-            assert_eq!(input.tx_body_hash, input.public.tx_body_hash);
-            (
-                &input.public,
-                &inputs.authorization_witnesses[i],
-                input.tx_index,
-                input.live_input_count,
-            )
-        } else {
-            let (proof, public) = ghost_auth.expect("ghost authorization derives");
-            (public, proof, i + tx_delta, 1)
-        };
-        assert_eq!(
-            public_native.layout,
-            noid_gkr::OwnerAuthLayout::FIXED,
-            "block owner-auth component must use the fixed layout"
-        );
-        if config.owner_auth_region {
-            // Region path: alloc the two trace objects EXACTLY as the inline slot
-            // (`build_owner_auth_slot`) does, but do NOT run the inline killshot —
-            // the KSCHANNL transcript is replayed by the shared walk-C discharge
-            // after the loop. The statement bindings (tx_body_hash pin, owner /
-            // live-input counts) are identical to the inline path.
-            let inputs_t = OwnerAuthPublicInputsTrace::alloc(b, public_native);
-            let proof_t = OwnerAuthProofTrace::alloc(b, witness_proof, public_native.layout);
-            if hash_idx < tx_hashes.len() {
-                pin_eq2(b, &inputs_t.tx_body_hash, &tx_hashes[hash_idx]);
-            } else {
-                // PAD slot (the capacity rounded up to a power of two): no
-                // tx slot exists past the capacity, so the body-hash pin
-                // lands on the ghost-body protocol constant — the same value
-                // the in-capacity ghost slots read from their tx-hash wires.
-                let gh = noid_gkr::ghost_tx::ghost_tx_body_hash();
-                let gw = [const_block(gh[0]), const_block(gh[1])];
-                pin_eq2(b, &inputs_t.tx_body_hash, &gw);
+    match authorization_backend {
+        BlockAuthorizationBackend::Legacy => {
+            let ghost_auth =
+                (n_auth_slots > n_real_user).then(noid_gkr::ghost_tx::ghost_authorization);
+            for i in 0..n_auth_slots {
+                let (public_native, witness_proof, hash_idx, live_input_count) = if i < n_real_user
+                {
+                    let input = &inputs.authorization_inputs[i];
+                    assert_eq!(input.block_index, 0, "one block per link");
+                    assert_eq!(
+                        input.tx_index,
+                        i + tx_delta,
+                        "authorization inputs must follow canonical block transaction order"
+                    );
+                    // Native `verify_authorization_statement_proof` statement check.
+                    assert_eq!(input.tx_body_hash, input.public.tx_body_hash);
+                    (
+                        &input.public,
+                        &inputs.authorization_witnesses[i],
+                        input.tx_index,
+                        input.live_input_count,
+                    )
+                } else {
+                    let (proof, public) = ghost_auth.expect("ghost authorization derives");
+                    (public, proof, i + tx_delta, 1)
+                };
+                assert_eq!(
+                    public_native.layout,
+                    noid_gkr::OwnerAuthLayout::FIXED,
+                    "block owner-auth component must use the fixed layout"
+                );
+                if config.owner_auth_region {
+                    // Region path: alloc the two trace objects EXACTLY as the inline slot
+                    // (`build_owner_auth_slot`) does, but do NOT run the inline killshot —
+                    // the KSCHANNL transcript is replayed by the shared walk-C discharge
+                    // after the loop. The statement bindings (tx_body_hash pin, owner /
+                    // live-input counts) are identical to the inline path.
+                    let inputs_t = OwnerAuthPublicInputsTrace::alloc(b, public_native);
+                    let proof_t =
+                        OwnerAuthProofTrace::alloc(b, witness_proof, public_native.layout);
+                    if hash_idx < tx_hashes.len() {
+                        pin_eq2(b, &inputs_t.tx_body_hash, &tx_hashes[hash_idx]);
+                    } else {
+                        // PAD slot (the capacity rounded up to a power of two): no
+                        // tx slot exists past the capacity, so the body-hash pin
+                        // lands on the ghost-body protocol constant — the same value
+                        // the in-capacity ghost slots read from their tx-hash wires.
+                        let gh = noid_gkr::ghost_tx::ghost_tx_body_hash();
+                        let gw = [const_block(gh[0]), const_block(gh[1])];
+                        pin_eq2(b, &inputs_t.tx_body_hash, &gw);
+                    }
+                    if hash_idx < spine_inputs.len() {
+                        user_public_arithmetic.push(append_user_action_surface(
+                            b,
+                            &spine_inputs[hash_idx],
+                            &live_bits[i],
+                            &inputs_t.expected_address,
+                            live_input_count,
+                            &mut action_candidates,
+                            &mut selected_input_bits,
+                            &mut selected_output_bits,
+                        ));
+                    } else {
+                        assert_eq!(
+                            config.tier_user_tx_capacity,
+                            Some(noid_chain::consensus::params::BLOCK_MAX_USER_TXS),
+                            "only the B255 authorization PAD lacks an action slot"
+                        );
+                        assert_eq!(i + 1, n_auth_slots);
+                    }
+                    oa_trace_proofs.push(proof_t);
+                    oa_natives.push(witness_proof.clone());
+                    oa_native_inputs.push(public_native.clone());
+                    // The wallet-PCS discharge still consumes each tx's capsule proof.
+                    region_natives.push(witness_proof.pcs.clone());
+                    auth_inputs.push(inputs_t);
+                } else {
+                    // Inline per-tx owner-auth killshot replay (never at capacity:
+                    // the config assert requires the full region stack).
+                    let (inputs_t, obligation) =
+                        build_owner_auth_slot(b, witness_proof, public_native);
+                    if config.discharge_wallet_pcs {
+                        // Shape-fixed region discharge: defer to ONE tiled call below
+                        // (the region layer is the ONLY wallet-PCS mode).
+                        region_obligations.push(obligation);
+                        region_natives.push(witness_proof.pcs.clone());
+                    }
+                    pin_eq2(b, &inputs_t.tx_body_hash, &tx_hashes[hash_idx]);
+                    user_public_arithmetic.push(append_user_action_surface(
+                        b,
+                        &spine_inputs[hash_idx],
+                        &live_bits[i],
+                        &inputs_t.expected_address,
+                        live_input_count,
+                        &mut action_candidates,
+                        &mut selected_input_bits,
+                        &mut selected_output_bits,
+                    ));
+                    auth_inputs.push(inputs_t);
+                }
             }
-            if hash_idx < spine_inputs.len() {
+        }
+        #[cfg(any(test, feature = "selected-zk-measurement"))]
+        BlockAuthorizationBackend::Selected(proofs) => {
+            use noid_tx::body_hash::TX8X2_LEAF_INPUT_OWNER;
+
+            assert_eq!(
+                body_user_slots,
+                noid_chain::consensus::params::BLOCK_MAX_USER_TXS,
+                "selected authorization has exactly 255 body slots"
+            );
+            assert_eq!(n_auth_slots, 256, "selected authorization includes PAD255");
+            assert_eq!(tx_delta, 1, "selected body aliases begin after coinbase");
+            assert_eq!(
+                spine_inputs.len(),
+                body_user_slots + tx_delta,
+                "selected authorization requires every canonical body spine"
+            );
+
+            for i in 0..body_user_slots {
+                let hash_idx = i + tx_delta;
+                let declared_live_inputs =
+                    selected_declared_live_input_count(b, &spine_inputs[hash_idx]);
+                let expected_owner = spine_inputs[hash_idx].leaves[TX8X2_LEAF_INPUT_OWNER].clone();
                 user_public_arithmetic.push(append_user_action_surface(
                     b,
                     &spine_inputs[hash_idx],
                     &live_bits[i],
-                    &inputs_t.expected_address,
-                    live_input_count,
+                    &expected_owner,
+                    declared_live_inputs,
                     &mut action_candidates,
                     &mut selected_input_bits,
                     &mut selected_output_bits,
                 ));
-            } else {
-                assert_eq!(
-                    config.tier_user_tx_capacity,
-                    Some(noid_chain::consensus::params::BLOCK_MAX_USER_TXS),
-                    "only the B255 authorization PAD lacks an action slot"
-                );
-                assert_eq!(i + 1, n_auth_slots);
             }
-            oa_trace_proofs.push(proof_t);
-            oa_natives.push(witness_proof.clone());
-            oa_native_inputs.push(public_native.clone());
-            // The wallet-PCS discharge still consumes each tx's capsule proof.
-            region_natives.push(witness_proof.pcs.clone());
-            auth_inputs.push(inputs_t);
-        } else {
-            // Inline per-tx owner-auth killshot replay (never at capacity:
-            // the config assert requires the full region stack).
-            let (inputs_t, obligation) = build_owner_auth_slot(b, witness_proof, public_native);
-            if config.discharge_wallet_pcs {
-                // Shape-fixed region discharge: defer to ONE tiled call below
-                // (the region layer is the ONLY wallet-PCS mode).
-                region_obligations.push(obligation);
-                region_natives.push(witness_proof.pcs.clone());
-            }
-            pin_eq2(b, &inputs_t.tx_body_hash, &tx_hashes[hash_idx]);
-            user_public_arithmetic.push(append_user_action_surface(
+
+            let canonical = mint_canonical_selected_zk_authorization_capability(
                 b,
-                &spine_inputs[hash_idx],
-                &live_bits[i],
-                &inputs_t.expected_address,
-                live_input_count,
-                &mut action_candidates,
-                &mut selected_input_bits,
-                &mut selected_output_bits,
-            ));
-            auth_inputs.push(inputs_t);
+                &tx_hashes,
+                &spine_inputs,
+                &live_bits,
+            );
+            selected_pending = Some((canonical, proofs));
         }
     }
     assert_eq!(
@@ -1621,147 +2127,178 @@ pub fn build_block_slots_with_config(
         &coinbase_amount_bits,
     );
     crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: fee/burn/coinbase arithmetic");
+    #[cfg(any(test, feature = "selected-zk-measurement"))]
+    if selected_authorization_backend {
+        let (canonical, proofs) = selected_pending
+            .take()
+            .expect("selected proof ownership and Block capability");
+        selected_region = Some(bind_selected_zk_block_region(
+            b,
+            canonical,
+            proofs,
+            es_region_data
+                .as_ref()
+                .expect("selected exact-state region data"),
+            tx_root_region_data
+                .as_ref()
+                .expect("selected tx-root region data"),
+            spine_region_data
+                .as_ref()
+                .expect("selected spine region data"),
+        ));
+        crate::acceptance::row_ledger_mark(
+            b,
+            &mut ledger,
+            "slots: selected auth+Meta/all-tiles assembly",
+        );
+    }
     // Region owner-auth assembly (once, after the loop). Full production stops
     // at recording-free C' columns/VK/endpoints; transitional configurations
     // retain the former discharge + recording handoff into wallet main-C.
-    let mut oa_recording = None;
-    if config.owner_auth_region {
-        assert!(
-            config.discharge_wallet_pcs,
-            "owner_auth_region requires the wallet-PCS discharge (the produced obligation must be discharged)"
-        );
-        if production_region_sidecar {
-            let owner = prepare_owner_auth_killshots_via_region(
-                b,
-                &oa_trace_proofs,
-                &auth_inputs,
-                &oa_natives,
-                &oa_native_inputs,
-            );
-            let (obligations, vk, endpoints) = owner.into_block_parts();
-            region_obligations = obligations;
-            owner_region_parts = Some((vk, endpoints));
-        } else {
-            let (obligations, oa_claims, recording) = discharge_owner_auth_killshots_via_region(
-                b,
-                &oa_trace_proofs,
-                &auth_inputs,
-                &oa_natives,
-                &oa_native_inputs,
-            );
-            region_obligations = obligations;
-            pending_wallet_pcs.extend(oa_claims);
-            // The transitional C′ discharge transcript recording rides the
-            // wallet plural's recording region.
-            oa_recording = Some(recording);
-        }
-    }
-    crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: owner-auth walk C' assembly");
-    // ONE tiled wallet/meta assembly for the whole block. Production returns
-    // five mandatory post-commit children; transitional configurations retain
-    // the old RegionPcsClaim/recording/D discharge.
-    if config.discharge_wallet_pcs {
-        let params = config.wallet_pcs_params;
-        if config.exact_state_region || config.tx_root_region || config.spine_region {
-            // The exact-state / tx-root / spine families ride the plural
-            // discharge's walks; a block-bearing region class always carries
-            // at least one tx, so an empty obligation set (which would skip
-            // the plural and leave that hashing undischarged) is unreachable
-            // by construction.
+    if !selected_authorization_backend {
+        let mut oa_recording = None;
+        if config.owner_auth_region {
             assert!(
-                !region_obligations.is_empty(),
-                "exact_state_region/tx_root_region/spine_region with no wallet-PCS \
-                 obligations (a block-bearing region class always has txs)"
+                config.discharge_wallet_pcs,
+                "owner_auth_region requires the wallet-PCS discharge (the produced obligation must be discharged)"
             );
-        }
-        if !region_obligations.is_empty() {
             if production_region_sidecar {
-                assert!(
-                    oa_recording.is_none(),
-                    "production owner-C must not create a transcript recording"
-                );
-                assert_eq!(
-                    params.nq,
-                    noid_fri_binius::capsule::CAPSULE_NUM_QUERIES,
-                    "production block sidecar must authenticate every capsule query"
-                );
-                let auth = prepare_auth_pcs_obligations_via_region_with_paired_handoff(
+                let owner = prepare_owner_auth_killshots_via_region(
                     b,
-                    &region_obligations,
-                    &region_natives,
-                    params,
-                    es_region_data
-                        .as_ref()
-                        .expect("production exact-state region data"),
-                    tx_root_region_data
-                        .as_ref()
-                        .expect("production tx-root region data"),
-                    spine_region_data
-                        .as_ref()
-                        .expect("production spine region data"),
+                    &oa_trace_proofs,
+                    &auth_inputs,
+                    &oa_natives,
+                    &oa_native_inputs,
                 );
-                let AuthPcsRegionPreparation {
-                    wallet_a_vk,
-                    wallet_a_endpoints,
-                    meta_a_vk,
-                    meta_a_endpoints,
-                    wallet_b_vk,
-                    wallet_b_endpoints,
-                    meta_b_vk,
-                    meta_b_endpoints,
-                    main_c_vk,
-                    main_c_endpoints,
-                    paired,
-                } = auth;
-                let (owner_c_vk, owner_c_endpoints) = owner_region_parts
-                    .take()
-                    .expect("production owner-C preparation");
-                let vk = BlockRegionSidecarVk::new(
-                    wallet_a_vk,
-                    meta_a_vk,
-                    wallet_b_vk,
-                    meta_b_vk,
-                    owner_c_vk,
-                    main_c_vk,
-                )
-                .expect("canonical mandatory block-region VK");
-                let input = BlockRegionProverInput::new(
-                    &vk,
-                    wallet_a_endpoints,
-                    meta_a_endpoints,
-                    wallet_b_endpoints,
-                    meta_b_endpoints,
-                    owner_c_endpoints,
-                    main_c_endpoints,
-                )
-                .expect("canonical mandatory block-region endpoints");
-                region_preparation = Some(
-                    BlockRegionPreparation::new(vk, input)
-                        .expect("validated mandatory block-region preparation"),
-                );
-                paired_exact_state_cells = Some(paired);
+                let (obligations, vk, endpoints) = owner.into_block_parts();
+                region_obligations = obligations;
+                owner_region_parts = Some((vk, endpoints));
             } else {
-                // Extend (not assign): transitional owner-auth may already
-                // have pushed its C' opening claims, which must be kept.
-                let discharge = discharge_auth_pcs_obligations_via_region_with_paired_handoff(
+                let (obligations, oa_claims, recording) = discharge_owner_auth_killshots_via_region(
                     b,
-                    &region_obligations,
-                    &region_natives,
-                    params,
-                    es_region_data.as_ref(),
-                    tx_root_region_data.as_ref(),
-                    spine_region_data.as_ref(),
-                    oa_recording.as_ref(),
+                    &oa_trace_proofs,
+                    &auth_inputs,
+                    &oa_natives,
+                    &oa_native_inputs,
                 );
-                pending_wallet_pcs.extend(discharge.claims);
-                paired_exact_state_cells = discharge.paired;
+                region_obligations = obligations;
+                pending_wallet_pcs.extend(oa_claims);
+                // The transitional C′ discharge transcript recording rides the
+                // wallet plural's recording region.
+                oa_recording = Some(recording);
+            }
+        }
+        crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: owner-auth walk C' assembly");
+        // ONE tiled wallet/meta assembly for the whole block. Production returns
+        // five mandatory post-commit children; transitional configurations retain
+        // the old RegionPcsClaim/recording/D discharge.
+        if config.discharge_wallet_pcs {
+            let params = config.wallet_pcs_params;
+            if config.exact_state_region || config.tx_root_region || config.spine_region {
+                // The exact-state / tx-root / spine families ride the plural
+                // discharge's walks; a block-bearing region class always carries
+                // at least one tx, so an empty obligation set (which would skip
+                // the plural and leave that hashing undischarged) is unreachable
+                // by construction.
+                assert!(
+                    !region_obligations.is_empty(),
+                    "exact_state_region/tx_root_region/spine_region with no wallet-PCS \
+                 obligations (a block-bearing region class always has txs)"
+                );
+            }
+            if !region_obligations.is_empty() {
+                if production_region_sidecar {
+                    assert!(
+                        oa_recording.is_none(),
+                        "production owner-C must not create a transcript recording"
+                    );
+                    assert_eq!(
+                        params.nq,
+                        noid_fri_binius::capsule::CAPSULE_NUM_QUERIES,
+                        "production block sidecar must authenticate every capsule query"
+                    );
+                    let auth = prepare_auth_pcs_obligations_via_region_with_paired_handoff(
+                        b,
+                        &region_obligations,
+                        &region_natives,
+                        params,
+                        es_region_data
+                            .as_ref()
+                            .expect("production exact-state region data"),
+                        tx_root_region_data
+                            .as_ref()
+                            .expect("production tx-root region data"),
+                        spine_region_data
+                            .as_ref()
+                            .expect("production spine region data"),
+                    );
+                    let AuthPcsRegionPreparation {
+                        wallet_a_vk,
+                        wallet_a_endpoints,
+                        meta_a_vk,
+                        meta_a_endpoints,
+                        wallet_b_vk,
+                        wallet_b_endpoints,
+                        meta_b_vk,
+                        meta_b_endpoints,
+                        main_c_vk,
+                        main_c_endpoints,
+                        paired,
+                    } = auth;
+                    let (owner_c_vk, owner_c_endpoints) = owner_region_parts
+                        .take()
+                        .expect("production owner-C preparation");
+                    let vk = BlockRegionSidecarVk::new(
+                        wallet_a_vk,
+                        meta_a_vk,
+                        wallet_b_vk,
+                        meta_b_vk,
+                        owner_c_vk,
+                        main_c_vk,
+                    )
+                    .expect("canonical mandatory block-region VK");
+                    let input = BlockRegionProverInput::new(
+                        &vk,
+                        wallet_a_endpoints,
+                        meta_a_endpoints,
+                        wallet_b_endpoints,
+                        meta_b_endpoints,
+                        owner_c_endpoints,
+                        main_c_endpoints,
+                    )
+                    .expect("canonical mandatory block-region endpoints");
+                    region_preparation = Some(
+                        BlockRegionPreparation::new(vk, input)
+                            .expect("validated mandatory block-region preparation"),
+                    );
+                    paired_exact_state_cells = Some(paired);
+                } else {
+                    // Extend (not assign): transitional owner-auth may already
+                    // have pushed its C' opening claims, which must be kept.
+                    let discharge = discharge_auth_pcs_obligations_via_region_with_paired_handoff(
+                        b,
+                        &region_obligations,
+                        &region_natives,
+                        params,
+                        es_region_data.as_ref(),
+                        tx_root_region_data.as_ref(),
+                        spine_region_data.as_ref(),
+                        oa_recording.as_ref(),
+                    );
+                    pending_wallet_pcs.extend(discharge.claims);
+                    paired_exact_state_cells = discharge.paired;
+                }
             }
         }
     }
+    #[cfg(any(test, feature = "selected-zk-measurement"))]
+    let selected_paired = selected_region.is_some();
+    #[cfg(not(any(test, feature = "selected-zk-measurement")))]
+    let selected_paired = false;
     assert_eq!(
-        paired_exact_state_cells.is_some(),
+        paired_exact_state_cells.is_some() || selected_paired,
         config.exact_state_region,
-        "production exact-state region must return its paired cell handoff"
+        "exact-state region must return exactly one paired cell handoff"
     );
     assert_eq!(
         region_preparation.is_some(),
@@ -1776,6 +2313,17 @@ pub fn build_block_slots_with_config(
         assert!(
             owner_region_parts.is_none(),
             "owner-C preparation must be consumed by the block envelope"
+        );
+    }
+    if selected_authorization_backend {
+        #[cfg(any(test, feature = "selected-zk-measurement"))]
+        assert!(
+            selected_pending.is_none() && selected_region.is_some(),
+            "selected proof/capability handoff must be consumed exactly once"
+        );
+        assert!(
+            pending_wallet_pcs.is_empty() && region_preparation.is_none(),
+            "selected backend cannot export legacy region authority"
         );
     }
     crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: wallet plural/sidecar assembly");
@@ -1852,7 +2400,14 @@ pub fn build_block_slots_with_config(
     let compacted_actions = compact_action_rows(b, &action_candidates, action_live_capacity);
     crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: action allocator+route+order");
 
-    if let Some(paired) = paired_exact_state_cells.as_ref() {
+    #[cfg(any(test, feature = "selected-zk-measurement"))]
+    let paired_cells = selected_region
+        .as_ref()
+        .map(SelectedZkBlockRegionBinding::paired)
+        .or(paired_exact_state_cells.as_ref());
+    #[cfg(not(any(test, feature = "selected-zk-measurement")))]
+    let paired_cells = paired_exact_state_cells.as_ref();
+    if let Some(paired) = paired_cells {
         bind_paired_exact_state_transition(
             b,
             &compacted_actions,
@@ -1903,7 +2458,7 @@ pub fn build_block_slots_with_config(
 
     crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: direct accumulator + header hash");
 
-    BlockSlots {
+    let slots = BlockSlots {
         header,
         claim,
         start_acc,
@@ -1917,6 +2472,11 @@ pub fn build_block_slots_with_config(
         exact_state,
         pending_wallet_pcs,
         region_preparation,
+    };
+    BlockSlotsCoreAssembly {
+        slots,
+        #[cfg(any(test, feature = "selected-zk-measurement"))]
+        selected_region,
     }
 }
 

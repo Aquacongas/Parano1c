@@ -49,7 +49,7 @@ use crate::deep_chain::relations::{ColRef, FixedPattern, RelationTerm};
 use crate::deep_chain::schedule::flat_of_tower_u128;
 use crate::deep_chain::{apply_round, initial_mds};
 use crate::field::F128;
-use noid_poseidon2b::native::domain::{capacity_iv_flat, TAG_COMPRESS};
+use noid_poseidon2b::native::domain::{TAG_COMPRESS, capacity_iv_flat};
 use noid_poseidon2b::native::permutation::{MDS_FULL, N_ROUNDS, STATE_SIZE};
 
 /// The flat-basis `compress` capacity IV (`TAG_COMPRESS`), as F128 lanes.
@@ -560,11 +560,11 @@ mod tests {
     fn source_tree_region_dag_roundtrip_and_negatives() {
         use crate::challenger::{Challenger, FsLaneChallenger};
         use crate::deep_chain::relations::{
-            claimed_refs, prove_column_relation, prove_shift_discharge, verify_column_relation,
-            verify_shift_discharge, window_discharge_point, RelationColumns,
+            RelationColumns, claimed_refs, prove_column_relation, prove_shift_discharge,
+            verify_column_relation, verify_shift_discharge, window_discharge_point,
         };
         use crate::deep_chain::schedule::carry_selection_terms;
-        use crate::deep_chain::{prove_deep_chain_walk, verify_deep_chain_walk, LaneClaimGroup};
+        use crate::deep_chain::{LaneClaimGroup, prove_deep_chain_walk, verify_deep_chain_walk};
 
         let leaf_log = 3usize;
         let tree = SourceTree { leaf_log };

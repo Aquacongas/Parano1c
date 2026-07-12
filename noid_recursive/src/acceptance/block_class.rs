@@ -28,7 +28,11 @@ use noid_ivc_core::public_io::{PublicIoSpec, WitnessSlice};
 use noid_ivc_core::verifier::{verify_field_with_public_io_and_post_commit_context, VerifyError};
 use noid_ivc_prover::field_prover::prove_field_with_public_io_and_post_commit_context;
 
-use super::block_slots::{build_block_slots_with_config, BlockSlotsConfig};
+#[cfg(feature = "selected-zk-measurement")]
+use super::block_slots::{build_block_slots_selected_zk_b255, SelectedZkBlockSlotsAssembly};
+use super::block_slots::{build_block_slots_with_config, BlockSlots, BlockSlotsConfig};
+#[cfg(feature = "selected-zk-measurement")]
+use super::link::SelectedZkB255MeasurementInput;
 use super::link::{block_acc_lanes, LinkBlock, ACC_LANES};
 use super::trace::pin_eq;
 use super::trace::region_source_binding::RegionDischargeParams;
@@ -183,6 +187,212 @@ pub struct BuiltBlock {
     pub witness: Vec<F128>,
     pub io: Vec<F128>,
     pub region_preparation: BlockRegionPreparation,
+}
+
+/// Unforgeable selected-region finalization authority.  The type is visible
+/// to the consuming candidate/sidecar boundary, but its field is private to
+/// this owning Block module.  Consequently only code here can create a seal,
+/// and the two constructors below do so strictly after builder completion.
+pub(crate) struct SelectedBlockAssemblyFinalizationSeal(());
+
+/// Full matrix build produced by the non-default selected-ZK measurement
+/// facade.  No production verifier accepts this object: it exists only to
+/// measure the mutually exclusive B255 replacement and freeze a matrix for
+/// the witness-only fixity pass.
+#[cfg(feature = "selected-zk-measurement")]
+pub struct SelectedZkB255FullMeasurement {
+    r1cs: FieldR1cs,
+    witness: Vec<F128>,
+    io: Vec<F128>,
+    region_vk: BlockRegionSidecarVk,
+}
+
+#[cfg(feature = "selected-zk-measurement")]
+impl SelectedZkB255FullMeasurement {
+    pub fn r1cs(&self) -> &FieldR1cs {
+        &self.r1cs
+    }
+
+    pub fn witness(&self) -> &[F128] {
+        &self.witness
+    }
+
+    pub fn io(&self) -> &[F128] {
+        &self.io
+    }
+
+    pub fn region_vk(&self) -> &BlockRegionSidecarVk {
+        &self.region_vk
+    }
+
+    /// Exact decoded relation equality, independent of coefficient-table
+    /// interning order and any seeded digest cache.
+    pub fn has_identical_relation(&self, other: &Self) -> bool {
+        self.r1cs.m == other.r1cs.m
+            && self.r1cs.k_log == other.r1cs.k_log
+            && self.r1cs.k_skip == other.r1cs.k_skip
+            && self.r1cs.useful_rows == other.r1cs.useful_rows
+            && self.r1cs.const_pin == other.r1cs.const_pin
+            && self.r1cs.a_0 == other.r1cs.a_0
+            && self.r1cs.b_0 == other.r1cs.b_0
+    }
+}
+
+/// Witness-only replay against a previously materialized selected B255
+/// matrix.  The V4 key is rebuilt independently from the new witness and must
+/// match the frozen key before this value is returned.
+#[cfg(feature = "selected-zk-measurement")]
+pub struct SelectedZkB255WitnessMeasurement {
+    useful_rows: usize,
+    witness: Vec<F128>,
+    io: Vec<F128>,
+    region_vk: BlockRegionSidecarVk,
+}
+
+#[cfg(feature = "selected-zk-measurement")]
+impl SelectedZkB255WitnessMeasurement {
+    pub fn useful_rows(&self) -> usize {
+        self.useful_rows
+    }
+
+    pub fn witness(&self) -> &[F128] {
+        &self.witness
+    }
+
+    pub fn io(&self) -> &[F128] {
+        &self.io
+    }
+
+    pub fn region_vk(&self) -> &BlockRegionSidecarVk {
+        &self.region_vk
+    }
+}
+
+#[cfg(feature = "selected-zk-measurement")]
+fn selected_zk_b255_measurement_shape() -> FieldShape {
+    FieldShape {
+        m: 24,
+        k_log: 24,
+        k_skip: 6,
+        const_pin: Some(0),
+    }
+}
+
+#[cfg(feature = "selected-zk-measurement")]
+fn assert_selected_zk_b255_measurement_inputs(block: &LinkBlock<'_>) {
+    let shape = selected_zk_b255_measurement_shape();
+    assert_eq!((shape.m, shape.k_log), (24, 24), "selected Block is m24");
+    assert_eq!(shape.k_skip, 6, "selected Block k-skip drift");
+    assert_eq!(shape.const_pin, Some(0), "selected Block const pin drift");
+    let config = block.config;
+    assert!(
+        config.discharge_wallet_pcs
+            && config.owner_auth_region
+            && config.exact_state_region
+            && config.tx_root_region
+            && config.spine_region,
+        "selected measurement requires the complete canonical region stack"
+    );
+    assert_eq!(
+        config.tier_user_tx_capacity,
+        Some(noid_chain::consensus::params::BLOCK_MAX_USER_TXS),
+        "selected measurement is B255-only"
+    );
+    assert_eq!(
+        config.wallet_pcs_params.nq,
+        noid_fri_binius::capsule::CAPSULE_NUM_QUERIES,
+        "selected measurement requires every capsule query"
+    );
+}
+
+#[cfg(feature = "selected-zk-measurement")]
+fn assemble_selected_zk_b255_measurement(
+    mut builder: FieldR1csBuilder,
+    input: SelectedZkB255MeasurementInput<'_>,
+) -> (FieldR1csBuilder, Vec<F128>, SelectedZkBlockSlotsAssembly) {
+    let (block, authorization) = input.into_parts();
+    assert_selected_zk_b255_measurement_inputs(&block);
+    let spec = block_io_spec();
+    let io = accumulator_io(&block);
+    let io_cells = allocate_block_io_cells(&mut builder, &spec, &io);
+    let assembly = build_block_slots_selected_zk_b255(
+        &mut builder,
+        block.start_accumulator,
+        block.end_accumulator,
+        block.inputs,
+        block.proof,
+        block.config,
+        authorization,
+    );
+    pin_block_io_cells(&mut builder, assembly.slots(), &io_cells);
+    (builder, io, assembly)
+}
+
+/// Materialize the exact selected-ZK B255 replacement matrix.  This facade is
+/// compiled only for the opt-in measurement feature and is deliberately not
+/// connected to `BlockClass`, `LinkBlock` proof serialization, or any
+/// verification entry point.
+#[cfg(feature = "selected-zk-measurement")]
+pub fn build_selected_zk_b255_measurement_full(
+    input: SelectedZkB255MeasurementInput<'_>,
+) -> SelectedZkB255FullMeasurement {
+    let shape = selected_zk_b255_measurement_shape();
+    let (builder, io, assembly) =
+        assemble_selected_zk_b255_measurement(FieldR1csBuilder::new(), input);
+    let useful_rows = builder.num_wires();
+    let frozen_vk = assembly.region_vk().clone();
+    let binding = assembly.into_region_binding();
+    let (r1cs, witness) = builder.build();
+    let (r1cs, witness) = expand_empty_field_tail(r1cs, witness, shape);
+    assert_eq!(r1cs.useful_rows, useful_rows, "selected useful-row drift");
+    let seal = SelectedBlockAssemblyFinalizationSeal(());
+    let preparation = binding
+        .finalize_after_block_build(seal, r1cs.m)
+        .expect("selected V4 preparation after full matrix build");
+    assert_eq!(preparation.vk(), &frozen_vk, "selected V4 key drift");
+    SelectedZkB255FullMeasurement {
+        r1cs,
+        witness,
+        io,
+        region_vk: frozen_vk,
+    }
+}
+
+/// Rebuild only the selected B255 witness against the frozen matrix.  The
+/// same assembly code runs with row recording disabled; exact wire count and
+/// V4 key equality are checked before returning the witness.
+#[cfg(feature = "selected-zk-measurement")]
+pub fn build_selected_zk_b255_measurement_witness_only(
+    input: SelectedZkB255MeasurementInput<'_>,
+    frozen: &SelectedZkB255FullMeasurement,
+) -> SelectedZkB255WitnessMeasurement {
+    let shape = selected_zk_b255_measurement_shape();
+    assert_eq!(FieldShape::of(&frozen.r1cs), shape, "frozen shape drift");
+    let (builder, io, assembly) =
+        assemble_selected_zk_b255_measurement(FieldR1csBuilder::new_witness_only(), input);
+    let rebuilt_vk = assembly.region_vk().clone();
+    let binding = assembly.into_region_binding();
+    let (useful_rows, mut witness) = builder.build_witness_only();
+    assert_eq!(
+        useful_rows, frozen.r1cs.useful_rows,
+        "selected witness-only wire-count drift"
+    );
+    witness.resize(1usize << shape.m, F128::ZERO);
+    let seal = SelectedBlockAssemblyFinalizationSeal(());
+    let preparation = binding
+        .finalize_after_block_build(seal, shape.m)
+        .expect("selected V4 preparation after witness-only build");
+    assert_eq!(preparation.vk(), &rebuilt_vk, "rebuilt V4 key drift");
+    assert_eq!(
+        rebuilt_vk, frozen.region_vk,
+        "selected witness-only V4 key differs from frozen key"
+    );
+    SelectedZkB255WitnessMeasurement {
+        useful_rows,
+        witness,
+        io,
+        region_vk: rebuilt_vk,
+    }
 }
 
 /// Assemble a block instance and require bit-exact reproduction of both the
@@ -386,7 +596,7 @@ fn is_production_config(config: &BlockSlotsConfig, tier: usize) -> bool {
         && config.wallet_pcs_params.nq == noid_fri_binius::capsule::CAPSULE_NUM_QUERIES
 }
 
-fn accumulator_io(block: &LinkBlock<'_>) -> Vec<F128> {
+pub(in crate::acceptance) fn accumulator_io(block: &LinkBlock<'_>) -> Vec<F128> {
     let layout = block_io_layout();
     let mut io = vec![F128::ZERO; layout.len];
     io[layout.start_acc..layout.start_acc + ACC_LANES]
@@ -394,6 +604,49 @@ fn accumulator_io(block: &LinkBlock<'_>) -> Vec<F128> {
     io[layout.end_acc..layout.end_acc + ACC_LANES]
         .copy_from_slice(&block_acc_lanes(block.end_accumulator));
     io
+}
+
+/// Allocate the canonical fixed-position Block IO slice.  The selected-ZK
+/// measurement path reuses this exact helper so its row ledger cannot drift
+/// from the production Block class merely because it is not yet a protocol
+/// entry point.
+pub(in crate::acceptance) fn allocate_block_io_cells(
+    b: &mut FieldR1csBuilder,
+    spec: &PublicIoSpec,
+    io_vals: &[F128],
+) -> Vec<LinExpr> {
+    assert!(
+        is_production_block_io_spec(spec),
+        "production block IO spec drift"
+    );
+    assert_eq!(io_vals.len(), BLOCK_IO_LEN, "production block IO length");
+    let io_start = 1usize << spec.io_slice.log2_len;
+    while b.num_wires() < io_start {
+        b.alloc_f128(F128::ZERO);
+    }
+    (0..1usize << spec.io_slice.log2_len)
+        .map(|index| {
+            let value = io_vals.get(index).copied().unwrap_or(F128::ZERO);
+            LinExpr::from_wire(b.alloc_f128(value))
+        })
+        .collect()
+}
+
+/// Bind the canonical Block accumulator aliases to the fixed IO slice.
+/// Keeping this common with the production builder makes the selected
+/// diagnostic an exact replacement measurement, not a reduced proxy.
+pub(in crate::acceptance) fn pin_block_io_cells(
+    b: &mut FieldR1csBuilder,
+    slots: &BlockSlots,
+    io_cells: &[LinExpr],
+) {
+    let layout = block_io_layout();
+    for (index, wire) in slots.start_acc.ordered_lanes().iter().enumerate() {
+        pin_eq(b, wire, &io_cells[layout.start_acc + index]);
+    }
+    for (index, wire) in slots.end_acc.ordered_lanes().iter().enumerate() {
+        pin_eq(b, wire, &io_cells[layout.end_acc + index]);
+    }
 }
 
 /// Shared production assembly.  There is no freeze mode, native region probe,
@@ -416,16 +669,7 @@ fn build_block_trace_parts(
     let mut b = FieldR1csBuilder::new();
     let mut ledger = 0usize;
 
-    let io_start = 1usize << spec.io_slice.log2_len;
-    while b.num_wires() < io_start {
-        b.alloc_f128(F128::ZERO);
-    }
-    let io_cells: Vec<LinExpr> = (0..1usize << spec.io_slice.log2_len)
-        .map(|index| {
-            let value = io_vals.get(index).copied().unwrap_or(F128::ZERO);
-            LinExpr::from_wire(b.alloc_f128(value))
-        })
-        .collect();
+    let io_cells = allocate_block_io_cells(&mut b, spec, io_vals);
     crate::acceptance::row_ledger_mark(&b, &mut ledger, "block: IO cells");
 
     let mut slots = build_block_slots_with_config(
@@ -453,13 +697,7 @@ fn build_block_trace_parts(
     }
     crate::acceptance::row_ledger_mark(&b, &mut ledger, "block: slots total");
 
-    let layout = block_io_layout();
-    for (index, wire) in slots.start_acc.ordered_lanes().iter().enumerate() {
-        pin_eq(&mut b, wire, &io_cells[layout.start_acc + index]);
-    }
-    for (index, wire) in slots.end_acc.ordered_lanes().iter().enumerate() {
-        pin_eq(&mut b, wire, &io_cells[layout.end_acc + index]);
-    }
+    pin_block_io_cells(&mut b, &slots, &io_cells);
     crate::acceptance::row_ledger_mark(&b, &mut ledger, "block: IO pins");
 
     let used = b.num_wires();
@@ -614,6 +852,81 @@ mod tests {
         config = production_config(params, 8);
         config.wallet_pcs_params.nq -= 1;
         assert!(!is_production_config(&config, 8));
+    }
+
+    #[test]
+    fn selected_measurement_carrier_is_consuming_fixed_and_not_a_wire_envelope() {
+        let link_source = include_str!("link.rs");
+        let carrier_attributes = link_source
+            .split("pub struct SelectedZkB255MeasurementInput")
+            .next()
+            .expect("selected measurement carrier declaration prefix")
+            .rsplit("/// Owned, consuming input carrier")
+            .next()
+            .expect("selected measurement carrier attributes");
+        assert!(
+            !carrier_attributes.contains("#[derive"),
+            "selected measurement carrier became derivably clonable or serializable"
+        );
+        let carrier = link_source
+            .split("pub struct SelectedZkB255MeasurementInput")
+            .nth(1)
+            .expect("selected measurement carrier declaration")
+            .split("/// Everything a link exposes to its successor")
+            .next()
+            .expect("bounded selected measurement carrier source");
+        let fields = carrier
+            .split('}')
+            .next()
+            .expect("selected measurement carrier fields");
+        assert!(fields.contains("block: LinkBlock<'a>"));
+        assert!(fields.contains("authorization: SelectedZkAuthorizationProofBundle"));
+        assert!(!fields.contains("pub "), "carrier field became public");
+        assert!(!fields.contains("Option<"), "authorization became optional");
+        assert!(!carrier.contains("impl Clone for SelectedZkB255MeasurementInput"));
+        assert!(!carrier.contains("impl Default for SelectedZkB255MeasurementInput"));
+        assert!(!carrier.contains("Serialize"));
+        assert!(!carrier.contains("Deserialize"));
+        assert!(carrier.contains("pub fn try_new("));
+        assert!(carrier.contains("live_proofs: Vec<ZkAuthorizationProof>"));
+        assert!(carrier.contains("ghost_proof: ZkAuthorizationProof"));
+        assert!(carrier.contains("tier_user_tx_capacity: Some("));
+        assert!(carrier.contains("CAPSULE_NUM_QUERIES"));
+        assert!(carrier.contains("pub(in crate::acceptance) fn into_parts("));
+
+        let bundle_source = include_str!("trace/zk_authorization_candidate.rs");
+        let bundle_prefix = bundle_source
+            .split("pub(in crate::acceptance) struct SelectedZkAuthorizationProofBundle")
+            .next()
+            .expect("selected proof-bundle declaration prefix");
+        let bundle_attributes = bundle_prefix
+            .rsplit("/// Owned, still-unverified inputs")
+            .next()
+            .expect("selected proof-bundle attributes");
+        assert!(
+            !bundle_attributes.contains("derive(Clone)"),
+            "owned authorization bundle became clonable"
+        );
+
+        let full = include_str!("block_class.rs")
+            .split("pub fn build_selected_zk_b255_measurement_full")
+            .nth(1)
+            .expect("full selected measurement facade");
+        let full_signature = full.split('{').next().expect("full facade signature");
+        assert!(full_signature.contains("input: SelectedZkB255MeasurementInput<'_>"));
+        assert!(!full_signature.contains("FieldShape"));
+        assert!(!full_signature.contains("Vec<ZkAuthorizationProof>"));
+        assert!(!full_signature.contains("ghost_proof"));
+
+        let envelope = include_str!("block_class.rs")
+            .split("pub struct BlockProofEnvelope")
+            .nth(1)
+            .expect("Block proof envelope")
+            .split('}')
+            .next()
+            .expect("Block proof envelope fields");
+        assert!(!envelope.contains("ZkAuthorizationProof"));
+        assert!(!envelope.contains("SelectedZkB255MeasurementInput"));
     }
 
     #[test]

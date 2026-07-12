@@ -22,12 +22,14 @@
 //!   is revealed and the verifier recomputes `Code(h)` itself — there are
 //!   no FRI tail rounds, no final-codeword tree and no second query set.
 //! - **16-bit pre-query transcript grind** (`CAPSULE_GRIND_BITS`): the
-//!   prover pays ~2^16 sponge squeezes once (milliseconds), every provable
-//!   soundness figure gains the grind bits.
+//!   honest prover pays an accepted-output search cost. This is not an
+//!   unconditional 16-bit soundness credit: a malicious prover may return
+//!   any satisfying nonce, and quantum search is charged through its oracle
+//!   query budget.
 //!
-//! At 64 queries this is ~77 UDR / ~176 Johnson provable (~336 under the
-//! capacity conjecture) — the whole-chain accounting lives in the design
-//! document's soundness budget.
+//! The 64-query, rate-1/32 geometry is a performance configuration, not a
+//! release soundness claim. A finite-length proximity/RBR derivation and the
+//! whole-chain lifetime union are separate protocol gates.
 //!
 //! ## Opening protocol (one column, one point)
 //!
@@ -87,9 +89,9 @@ pub const CAPSULE_LEAF_SYMBOLS: usize = 1 << CAPSULE_WIDE_LOG;
 /// Source-tree cap depth (the commitment ships this layer).
 pub const CAPSULE_CAP_DEPTH: usize = 5;
 
-/// Query count. 64 at rate 1/32 with the grind gives ~77 UDR / ~176
-/// Johnson provable. Debug builds use fewer queries to keep test time sane;
-/// any consumer quoting security must use the release figure.
+/// Query count. Debug builds use fewer queries to keep test time sane. The
+/// release value is fixed by geometry; security still requires the reviewed
+/// finite-length proximity/RBR and lifetime analyses.
 #[cfg(not(debug_assertions))]
 pub const CAPSULE_NUM_QUERIES: usize = 64;
 #[cfg(debug_assertions)]
@@ -137,7 +139,8 @@ const fn packed_query_seed_count(num_queries: usize, log_len: usize) -> usize {
     bits.div_ceil(CAPSULE_QUERY_SEED_BITS)
 }
 
-/// Pre-query transcript grind bits (prover cost ~2^bits sponge squeezes).
+/// Pre-query accepted-output grind bits (honest prover cost ~2^bits sponge
+/// squeezes; not a fixed ROM/QROM soundness credit).
 #[cfg(not(debug_assertions))]
 pub const CAPSULE_GRIND_BITS: u32 = 16;
 #[cfg(debug_assertions)]

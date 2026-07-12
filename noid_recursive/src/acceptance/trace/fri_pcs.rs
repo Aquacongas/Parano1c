@@ -19,8 +19,7 @@
 use noid_core::hardware::flat_to_tower_u128;
 use noid_core::Block128;
 use noid_fri_binius::capsule::{
-    capsule_queries_from_seeds, capsule_query_bit_location, capsule_query_seed_count,
-    CAPSULE_NUM_QUERIES, CAPSULE_QUERY_SEED_BITS,
+    capsule_query_bit_location, CAPSULE_NUM_QUERIES, CAPSULE_QUERY_SEED_BITS,
 };
 
 use super::{flat_const, mul, pin_zero, FieldR1csBuilder, LinExpr};
@@ -79,19 +78,57 @@ pub fn packed_capsule_queries_from_seeds_with_bits(
 /// recomposition still binds it exactly to the transcript seed, so this only
 /// removes duplicate storage/pointwise equality rows; it does not weaken the
 /// query derivation.
+///
+/// The active capsule's cfg-selected [`CAPSULE_NUM_QUERIES`] is authoritative;
+/// the optional carrier matrix cannot change verifier shape. Fixed-count
+/// protocol candidates use
+/// [`packed_queries_from_seeds_with_bound_bits_for_count`] explicitly.
 pub fn packed_capsule_queries_from_seeds_with_bound_bits(
     b: &mut FieldR1csBuilder,
     seeds: &[LinExpr],
     log_max_len: usize,
     bound_query_bits: Option<&[Vec<Option<LinExpr>>]>,
 ) -> (Vec<usize>, Vec<Vec<LinExpr>>) {
+    packed_queries_from_seeds_with_bound_bits_for_count(
+        b,
+        seeds,
+        CAPSULE_NUM_QUERIES,
+        log_max_len,
+        bound_query_bits,
+    )
+}
+
+/// Explicit-count packed query binding for disconnected, fixed-shape protocol
+/// candidates.
+///
+/// Unlike [`packed_capsule_queries_from_seeds_with_bound_bits`], this helper
+/// does not inherit the active capsule's debug/release query-count cfg. The
+/// caller must pass a protocol constant and the optional carrier matrix must
+/// have exactly that many rows; witness data cannot choose the count.
+pub fn packed_queries_from_seeds_with_bound_bits_for_count(
+    b: &mut FieldR1csBuilder,
+    seeds: &[LinExpr],
+    query_count: usize,
+    log_max_len: usize,
+    bound_query_bits: Option<&[Vec<Option<LinExpr>>]>,
+) -> (Vec<usize>, Vec<Vec<LinExpr>>) {
+    assert!(log_max_len > 0, "capsule query width must be non-zero");
+    assert!(
+        log_max_len <= usize::BITS as usize,
+        "capsule query width exceeds usize"
+    );
+    assert!(query_count > 0, "packed capsule query count");
+    let packed_seed_count = query_count
+        .checked_mul(log_max_len)
+        .expect("packed capsule query bit count")
+        .div_ceil(CAPSULE_QUERY_SEED_BITS);
     assert_eq!(
         seeds.len(),
-        capsule_query_seed_count(log_max_len),
+        packed_seed_count,
         "packed capsule query seed count"
     );
     if let Some(bound) = bound_query_bits {
-        assert_eq!(bound.len(), CAPSULE_NUM_QUERIES, "bound query count");
+        assert_eq!(bound.len(), query_count, "bound query count");
         assert!(
             bound.iter().all(|query| query.len() == log_max_len),
             "bound query bit width"
@@ -101,8 +138,14 @@ pub fn packed_capsule_queries_from_seeds_with_bound_bits(
         .iter()
         .map(|seed| expr_tower_value(b, seed))
         .collect::<Vec<_>>();
-    let indices = capsule_queries_from_seeds(&native_seeds, log_max_len);
-    assert_eq!(indices.len(), CAPSULE_NUM_QUERIES);
+    let indices = (0..query_count)
+        .map(|query| {
+            (0..log_max_len).fold(0usize, |index, query_bit| {
+                let (seed, bit) = capsule_query_bit_location(query, query_bit, log_max_len);
+                index | ((((native_seeds[seed].0 >> bit) & 1) as usize) << query_bit)
+            })
+        })
+        .collect::<Vec<_>>();
 
     let mut carried_seed_bits = vec![vec![None; CAPSULE_QUERY_SEED_BITS]; seeds.len()];
     if let Some(bound) = bound_query_bits {
@@ -126,7 +169,7 @@ pub fn packed_capsule_queries_from_seeds_with_bound_bits(
             decompose_squeeze_bits_with_carriers(b, seed, &carried_seed_bits[seed_index]).1
         })
         .collect::<Vec<_>>();
-    let all_bits = (0..CAPSULE_NUM_QUERIES)
+    let all_bits = (0..query_count)
         .map(|query| {
             (0..log_max_len)
                 .map(|query_bit| {
@@ -253,6 +296,7 @@ mod tests {
     use super::super::test_support::assert_expr_is;
     use super::*;
     use noid_core::AdditiveNTT;
+    use noid_fri_binius::capsule::{capsule_queries_from_seeds, capsule_query_seed_count};
 
     struct Rng(u128);
     impl Rng {

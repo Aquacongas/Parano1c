@@ -12,13 +12,12 @@
 
 use crate::challenger::Challenger;
 use crate::deep_chain::relations::{
-    distinct_refs, prove_column_relation, prove_shift_discharge, verify_column_relation,
-    verify_shift_discharge, ColRef, ColumnRelationProof, RelationColumns, RelationTerm,
-    ShiftDischargeProof,
+    ColRef, ColumnRelationProof, RelationColumns, RelationTerm, ShiftDischargeProof, distinct_refs,
+    prove_column_relation, prove_shift_discharge, verify_column_relation, verify_shift_discharge,
 };
 use crate::deep_chain::{
-    apply_round, initial_mds, prove_deep_chain_walk, verify_deep_chain_walk, DeepChainWalkProof,
-    LaneClaimGroup,
+    DeepChainWalkProof, LaneClaimGroup, apply_round, initial_mds, prove_deep_chain_walk,
+    verify_deep_chain_walk,
 };
 use crate::field::F128;
 use crate::lincheck::build_eq_table;
