@@ -10,10 +10,7 @@
 //! declared length is checked before any payload allocation and payload bytes
 //! are read directly into the vectors delivered to the node.
 
-use std::{
-    io,
-    sync::{Arc, OnceLock},
-};
+use std::{io, sync::Arc};
 
 use async_trait::async_trait;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -23,6 +20,7 @@ use noid_chain::consensus::wire_limits::{
     MAX_BLOCK_PROOF_BYTES,
 };
 
+use crate::inbound_budget::process_global_inbound_budget;
 use crate::outbound_budget::OutboundResponseBudget;
 use crate::protocol::{GetRecentBlockRequest, GetRecentBlockResponse};
 
@@ -31,11 +29,6 @@ const RESPONSE_MAGIC: [u8; 4] = *b"NBS2";
 const REQUEST_HEADER_BYTES: usize = 12;
 const RESPONSE_HEADER_BYTES: usize = 24;
 const NONE_LEN: u32 = u32::MAX;
-/// Maximum aggregate bytes held by decoded inbound block-sync responses.
-/// One maximum proof-native block fits, while a second peer must wait until
-/// the node releases the first response.
-pub const INBOUND_BLOCK_SYNC_BUDGET_BYTES: usize = 64 * 1024 * 1024;
-
 /// Block-sync codec with a canonical, allocation-bounded wire format.
 #[derive(Debug, Clone)]
 pub struct BlockSyncCodec {
@@ -45,11 +38,8 @@ pub struct BlockSyncCodec {
 
 impl Default for BlockSyncCodec {
     fn default() -> Self {
-        static INBOUND_BUDGET: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
         Self {
-            inbound_budget: Arc::clone(INBOUND_BUDGET.get_or_init(|| {
-                Arc::new(tokio::sync::Semaphore::new(INBOUND_BLOCK_SYNC_BUDGET_BYTES))
-            })),
+            inbound_budget: process_global_inbound_budget(),
             outbound_budget: OutboundResponseBudget::process_global(),
         }
     }
@@ -365,7 +355,9 @@ mod tests {
     fn production_codecs_share_one_process_inbound_budget() {
         let first = BlockSyncCodec::default();
         let second = BlockSyncCodec::default();
+        let shared = process_global_inbound_budget();
         assert!(Arc::ptr_eq(&first.inbound_budget, &second.inbound_budget));
+        assert!(Arc::ptr_eq(&first.inbound_budget, &shared));
     }
 
     #[tokio::test]

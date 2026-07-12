@@ -7,10 +7,7 @@
 //! are streamed directly from/to the response Vec, avoiding the second full
 //! serialization buffer used by the generic CBOR codec.
 
-use std::{
-    io,
-    sync::{Arc, OnceLock},
-};
+use std::{io, sync::Arc};
 
 use async_trait::async_trait;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -20,6 +17,7 @@ use noid_chain::{
 };
 
 use crate::{
+    inbound_budget::process_global_inbound_budget,
     outbound_budget::OutboundResponseBudget,
     protocol::{GetStateSegmentRequest, GetStateSegmentResponse},
 };
@@ -29,8 +27,6 @@ const RESPONSE_MAGIC: [u8; 4] = *b"NSS2";
 const REQUEST_HEADER_BYTES: usize = 48;
 const RESPONSE_HEADER_BYTES: usize = 12;
 const NONE_LEN: u32 = u32::MAX;
-pub const INBOUND_STATE_SEGMENT_BUDGET_BYTES: usize = 16 * 1024 * 1024;
-
 #[derive(Debug, Clone)]
 pub struct StateSegmentCodec {
     inbound_budget: Arc<tokio::sync::Semaphore>,
@@ -39,13 +35,8 @@ pub struct StateSegmentCodec {
 
 impl Default for StateSegmentCodec {
     fn default() -> Self {
-        static INBOUND_BUDGET: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
         Self {
-            inbound_budget: Arc::clone(INBOUND_BUDGET.get_or_init(|| {
-                Arc::new(tokio::sync::Semaphore::new(
-                    INBOUND_STATE_SEGMENT_BUDGET_BYTES,
-                ))
-            })),
+            inbound_budget: process_global_inbound_budget(),
             outbound_budget: OutboundResponseBudget::process_global(),
         }
     }
@@ -308,7 +299,9 @@ mod tests {
     fn production_codecs_share_one_process_inbound_budget() {
         let first = StateSegmentCodec::default();
         let second = StateSegmentCodec::default();
+        let shared = process_global_inbound_budget();
         assert!(Arc::ptr_eq(&first.inbound_budget, &second.inbound_budget));
+        assert!(Arc::ptr_eq(&first.inbound_budget, &shared));
     }
 
     struct GatedWriter {

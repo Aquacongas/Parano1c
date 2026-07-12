@@ -4,7 +4,7 @@
 //! Fixed-framing codec for the constant-size public history proof endpoint.
 
 use std::io;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -12,6 +12,7 @@ use libp2p::{request_response, swarm::StreamProtocol};
 use noid_chain::consensus::wire_limits::{MAX_HEADER_BYTES, MAX_HISTORY_PROOF_BYTES};
 
 use crate::{
+    inbound_budget::process_global_inbound_budget,
     outbound_budget::OutboundResponseBudget,
     protocol::{GetHistoryProofRequest, GetHistoryProofResponse},
 };
@@ -21,23 +22,16 @@ const REQUEST_BYTES: usize = 4 + 8 + 32;
 const RESPONSE_MAGIC: [u8; 4] = *b"NHS2";
 const RESPONSE_HEADER_BYTES: usize = 4 + 4 + 4 + 8 + 32;
 const NONE_LEN: u32 = u32::MAX;
-pub const INBOUND_HISTORY_PROOF_BUDGET_BYTES: usize = 8 * 1024 * 1024;
-
 #[derive(Debug, Clone)]
 pub struct HistoryProofCodec {
-    inbound_budget: std::sync::Arc<tokio::sync::Semaphore>,
+    inbound_budget: Arc<tokio::sync::Semaphore>,
     outbound_budget: OutboundResponseBudget,
 }
 
 impl Default for HistoryProofCodec {
     fn default() -> Self {
-        static INBOUND_BUDGET: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
         Self {
-            inbound_budget: Arc::clone(INBOUND_BUDGET.get_or_init(|| {
-                Arc::new(tokio::sync::Semaphore::new(
-                    INBOUND_HISTORY_PROOF_BUDGET_BYTES,
-                ))
-            })),
+            inbound_budget: process_global_inbound_budget(),
             outbound_budget: OutboundResponseBudget::process_global(),
         }
     }
@@ -171,7 +165,7 @@ impl HistoryProofCodec {
     async fn acquire_inbound(
         &self,
         bytes: usize,
-    ) -> io::Result<Option<std::sync::Arc<tokio::sync::OwnedSemaphorePermit>>> {
+    ) -> io::Result<Option<Arc<tokio::sync::OwnedSemaphorePermit>>> {
         if bytes == 0 {
             return Ok(None);
         }
@@ -185,7 +179,7 @@ impl HistoryProofCodec {
             .map_err(|_| {
                 io::Error::new(io::ErrorKind::BrokenPipe, "history-proof budget closed")
             })?;
-        Ok(Some(std::sync::Arc::new(permit)))
+        Ok(Some(Arc::new(permit)))
     }
 }
 
@@ -320,7 +314,9 @@ mod tests {
     fn production_codecs_share_one_history_inbound_budget() {
         let first = HistoryProofCodec::default();
         let second = HistoryProofCodec::default();
+        let shared = process_global_inbound_budget();
         assert!(Arc::ptr_eq(&first.inbound_budget, &second.inbound_budget));
+        assert!(Arc::ptr_eq(&first.inbound_budget, &shared));
     }
 
     #[tokio::test]

@@ -11,6 +11,7 @@
 pub mod behaviour;
 pub mod block_sync_codec;
 pub mod history_proof_codec;
+mod inbound_budget;
 pub mod mempool_sync_codec;
 pub mod network;
 mod outbound_budget;
