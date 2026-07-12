@@ -16,7 +16,7 @@ use noid_chain::header_anchor::{
     extend_header_chain_anchor, HeaderChainAnchor, HeaderChainAnchorError,
 };
 use noid_chain::segmented_state::ExactStateReadError;
-use noid_chain::state::ChainState;
+use noid_chain::state::{ChainState, ExactFrontierError};
 use noid_core::{Block128, TowerField};
 use noid_gkr::{
     prove_accepted_claim_hash_killshot, prove_batched_merkle_killshot, prove_block_spine_killshot,
@@ -224,6 +224,10 @@ pub enum FullAcceptedBlockBatchError {
     ExactStateRead {
         index: usize,
         source: ExactStateReadError,
+    },
+    ExactStateFrontier {
+        index: usize,
+        source: ExactFrontierError,
     },
     AuthorizationComponent {
         index: usize,
@@ -434,23 +438,25 @@ fn verify_full_accepted_block_batch_native_with_owned_state(
             // and new states. Rebuild them from the already-applied child cache;
             // the common derivation below then independently reconstructs and
             // checks both roots against the sealed native transition.
-            let cache = state
-                .exact_sparse_cache()
-                .map_err(|source| FullAcceptedBlockBatchError::ExactStateRead { index, source })?;
-            if cache.depth() != artifacts.exact_state_inputs.child_log_slots {
-                return Err(FullAcceptedBlockBatchError::ExactStateComponent {
+            let depth = artifacts.exact_state_inputs.child_log_slots;
+            let siblings = state
+                .exact_frontier_siblings(&artifacts.exact_action_surface.touched_indices, depth)
+                .map_err(|source| FullAcceptedBlockBatchError::ExactStateFrontier {
                     index,
-                    source: ExactStateKillShotError::ExactState(
-                        crate::ExactStateTransitionError::InvalidLogSlots,
-                    ),
-                });
-            }
+                    source,
+                })?;
             Some(
-                crate::build_exact_state_transition_proof(&cache, &artifacts.exact_action_surface)
-                    .map_err(|source| FullAcceptedBlockBatchError::ExactStateComponent {
+                crate::build_exact_state_transition_proof_from_siblings(
+                    &artifacts.exact_action_surface,
+                    siblings,
+                    depth,
+                )
+                .map_err(|source| {
+                    FullAcceptedBlockBatchError::ExactStateComponent {
                         index,
                         source: source.into(),
-                    })?,
+                    }
+                })?,
             )
         };
         // Native acceptance decoded and dropped its own bounded detached
@@ -1876,14 +1882,16 @@ mod tests {
         })
     }
 
-    fn canonical_coinbase_fixture() -> (
+    fn canonical_coinbase_fixture_from_state(
+        mut state: ChainState,
+    ) -> (
         RecursiveConsensusState,
         ChainAccumulator,
         BlockHeader,
         ChainState,
         FullAcceptedBlockBatchItem,
     ) {
-        let mut state = ChainState::with_log_slots(8);
+        let log_slots = state.state.log_slots() as u32;
         let parent = BlockHeader {
             prev_block_hash: [0u8; 32],
             state_root: state.state_root(),
@@ -1893,9 +1901,9 @@ mod tests {
             miner_address: Address([0xA1; 32]),
             nonce: 0,
             difficulty_target: [0xff; 32],
-            log_slots: 8,
-            active_slot_count: 0,
-            alloc_counter: 0,
+            log_slots,
+            active_slot_count: state.active_slot_count,
+            alloc_counter: state.alloc_counter,
         };
         let parent_id = hash_block_header(&parent);
         let genesis_work = noid_chain::consensus::block_work(&parent.difficulty_target);
@@ -1960,6 +1968,16 @@ mod tests {
             block_auth_sidecar_bytes: Vec::new(),
         };
         (start_consensus, start_accumulator, parent, state, item)
+    }
+
+    fn canonical_coinbase_fixture() -> (
+        RecursiveConsensusState,
+        ChainAccumulator,
+        BlockHeader,
+        ChainState,
+        FullAcceptedBlockBatchItem,
+    ) {
+        canonical_coinbase_fixture_from_state(ChainState::with_log_slots(8))
     }
 
     fn merkle_256_root(transactions: &[Transaction]) -> [u8; 32] {
@@ -2102,6 +2120,53 @@ mod tests {
             verified.end_state.cached_state_root(),
             output.end_state.cached_state_root()
         );
+    }
+
+    #[test]
+    fn coinbase_replay_uses_compact_frontier_with_unrelated_live_segment_evicted() {
+        let owner = Address([0xD1; 32]);
+        let first_segment_slot = 3;
+        let second_segment_slot = (1 << noid_chain::fri_state::LOG_SEGMENT_SIZE) + 5;
+        let initial_state = ChainState::from_sparse_utxos(
+            noid_chain::fri_state::LOG_SEGMENT_SIZE + 1,
+            &[
+                (
+                    first_segment_slot,
+                    noid_chain::fri_state::SlotValue::with_owner_fields(9, 1, owner.as_fields()),
+                ),
+                (
+                    second_segment_slot as u32,
+                    noid_chain::fri_state::SlotValue::with_owner_fields(11, 2, owner.as_fields()),
+                ),
+            ],
+            2,
+        )
+        .unwrap();
+        let (start_consensus, start_accumulator, parent, mut state, item) =
+            canonical_coinbase_fixture_from_state(initial_state);
+
+        let coinbase_slot = item.block.transactions[0].body.outputs[0].slot_index;
+        let touched_segment = (coinbase_slot >> noid_chain::fri_state::LOG_SEGMENT_SIZE) as u16;
+        let evicted_segment = if touched_segment == 0 { 1 } else { 0 };
+        state.state.evict_segment(evicted_segment);
+        assert!(state.state.is_evicted(evicted_segment));
+        assert!(matches!(
+            state.state.exact_sparse_cache(),
+            Err(ExactStateReadError::EvictedSegment { seg_id }) if seg_id == evicted_segment
+        ));
+
+        let expected_child_root = item.block.header.state_root;
+        let output = verify_full_accepted_block_batch_native(
+            &start_consensus,
+            &start_accumulator,
+            &parent,
+            &state,
+            &FullAcceptedBlockBatchWitness { items: vec![item] },
+        )
+        .expect("coinbase replay needs only its touched segment and compact upper frontier");
+
+        assert_eq!(output.end_state.cached_state_root(), expected_child_root);
+        assert!(output.end_state.state.is_evicted(evicted_segment));
     }
 
     #[test]
