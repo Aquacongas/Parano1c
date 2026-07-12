@@ -60,7 +60,9 @@ pub use config::MempoolConfig;
 pub use error::SubmitError;
 pub use event::{EvictReason, MempoolEvent};
 pub use floor::FeeFloor;
-pub use pool::{AsyncMempool, MempoolEntryMetadata, MempoolMetadataSnapshot};
+pub use pool::{
+    AsyncMempool, MempoolEntryMetadata, MempoolMetadataSnapshot, SelectedMempoolEntry,
+};
 pub use view::ChainView;
 
 // Re-export `MempoolEntry` from noid_chain for block builder convenience.

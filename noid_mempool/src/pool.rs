@@ -94,6 +94,17 @@ pub struct MempoolMetadataSnapshot {
     pub entries: Vec<MempoolEntryMetadata>,
 }
 
+/// Minimal owned block-template selection.
+///
+/// Raw `TxIntent` bytes are a networking cache and are never cloned into the
+/// miner. Only the semantic body and the cached authorization bundle cross the
+/// mempool lock.
+#[derive(Debug)]
+pub struct SelectedMempoolEntry {
+    pub tx: Transaction,
+    pub cached_authorization: Option<Vec<u8>>,
+}
+
 fn entry_metadata(
     hash: TxBodyHash,
     entry: &noid_chain::mempool::MempoolEntry,
@@ -352,13 +363,16 @@ impl AsyncMempool {
     /// The caller (block builder) applies conflict resolution and coinbase on top.
     ///
     /// Returned txs are in descending fee-rate order with txid tie-break.
-    pub async fn select_for_block(&self, max_txs: usize) -> Vec<noid_chain::mempool::MempoolEntry> {
+    pub async fn select_for_block(&self, max_txs: usize) -> Vec<SelectedMempoolEntry> {
         let st = self.state.lock().await;
         let limit = max_txs.min(BLOCK_MAX_USER_TXS);
         st.pool
             .select_for_block(limit)
             .into_iter()
-            .cloned()
+            .map(|entry| SelectedMempoolEntry {
+                tx: entry.tx.clone(),
+                cached_authorization: entry.cached_authorization.clone(),
+            })
             .collect()
     }
 
@@ -373,7 +387,7 @@ impl AsyncMempool {
         &self,
         max_txs: usize,
         epoch_anchor: [u8; 32],
-    ) -> Vec<noid_chain::mempool::MempoolEntry> {
+    ) -> Vec<SelectedMempoolEntry> {
         let st = self.state.lock().await;
         let limit = max_txs.min(BLOCK_MAX_USER_TXS);
         st.pool
@@ -381,7 +395,10 @@ impl AsyncMempool {
             .into_iter()
             .filter(|entry| entry.tx.body.epoch_anchor == epoch_anchor)
             .take(limit)
-            .cloned()
+            .map(|entry| SelectedMempoolEntry {
+                tx: entry.tx.clone(),
+                cached_authorization: entry.cached_authorization.clone(),
+            })
             .collect()
     }
 
@@ -650,27 +667,28 @@ impl AsyncMempool {
         hashes: &[TxBodyHash],
     ) -> std::collections::HashMap<[u8; 32], Vec<u8>> {
         use noid_gkr::WalletAuthorizationBundle;
-        let intents: Vec<Vec<u8>> = {
-            let st = self.state.lock().await;
-            hashes
-                .iter()
-                .filter_map(|hash| st.pool.get(hash))
-                .map(|entry| entry.intent_bytes.clone())
-                .collect()
-        };
-        let mut out = std::collections::HashMap::with_capacity(intents.len());
-        for intent_bytes in intents {
-            let Ok(intent) = TxIntent::from_bytes(&intent_bytes) else {
+        let mut out = std::collections::HashMap::with_capacity(hashes.len());
+        for hash in hashes {
+            // Clone only this one bounded bundle while holding the lock. The
+            // raw intent (which contains the same authorization again) remains
+            // resident in the pool and no all-entry byte snapshot is built.
+            let authorization = {
+                let state = self.state.lock().await;
+                state
+                    .pool
+                    .get(hash)
+                    .and_then(|entry| entry.cached_authorization.clone())
+            };
+            let Some(authorization) = authorization else {
                 continue;
             };
-            let Ok(bundle) = WalletAuthorizationBundle::from_bytes(&intent.authorization_bytes)
-            else {
+            let Ok(bundle) = WalletAuthorizationBundle::from_bytes(&authorization) else {
                 continue;
             };
             let Some(proof_bytes) = bundle.proof_wire_bytes() else {
                 continue;
             };
-            out.insert(intent.txid().0, proof_bytes);
+            out.insert(hash.0, proof_bytes);
         }
         out
     }
@@ -961,6 +979,30 @@ mod tests {
         let single = pool.get_entry_metadata(&txid).await.unwrap();
         assert_eq!(single, snapshot.entries[0]);
         assert_eq!(pool.state.lock().await.pool.total_intent_bytes(), 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn template_and_preverified_paths_never_clone_raw_intent_payloads() {
+        let source = include_str!("pool.rs");
+        let selection = source
+            .split("pub async fn select_for_block(")
+            .nth(1)
+            .expect("selection method")
+            .split("// -----------------------------------------------------------------------\n    // Block confirmation")
+            .next()
+            .expect("selection boundary");
+        assert!(!selection.contains("intent_bytes"));
+        assert!(!selection.contains(".cloned()"));
+
+        let preverified = source
+            .split("pub async fn verified_authorization_proof_bytes(")
+            .nth(1)
+            .expect("preverified method")
+            .split("// ---------------------------------------------------------------------------\n// Helper: all cheap admission checks")
+            .next()
+            .expect("preverified boundary");
+        assert!(!preverified.contains("intent_bytes.clone"));
+        assert!(!preverified.contains("Vec<Vec<u8>>"));
     }
 
     #[test]
