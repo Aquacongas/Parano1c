@@ -44,7 +44,7 @@ pub trait ParanoidApi {
     #[method(name = "getHeaderByHash")]
     async fn get_header_by_hash(&self, hash: String) -> RpcResult<Option<String>>;
 
-    /// Current public checkpoint proof envelope, if promoted checkpoint coverage is ready.
+    /// Current finalized selected-history terminal, when locally available.
     #[method(name = "getHistoryProof")]
     async fn get_history_proof(&self) -> RpcResult<Option<String>>;
 
@@ -79,7 +79,7 @@ pub trait ParanoidApi {
     // Network / mining
     // =========================================================================
 
-    /// Mining and network state: difficulty, block reward, checkpoint proof height.
+    /// Mining and network state: difficulty, block reward, history-proof height.
     #[method(name = "getMiningInfo")]
     async fn get_mining_info(&self) -> RpcResult<MiningInfo>;
 

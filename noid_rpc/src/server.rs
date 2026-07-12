@@ -157,58 +157,46 @@ fn snapshot_suffix_is_retained(tip_height: u64, proof_height: u64) -> bool {
             <= noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH
 }
 
-fn checkpoint_history_proof_bytes(ctx: &MdbxChainContext) -> Result<Option<Vec<u8>>, String> {
+fn selected_history_proof_bytes(ctx: &MdbxChainContext) -> Result<Option<Vec<u8>>, String> {
     let Some(coverage) = ctx
         .store
-        .get_checkpoint_coverage()
-        .map_err(|e| format!("checkpoint coverage read failed: {e}"))?
+        .get_selected_history_coverage()
+        .map_err(|e| format!("selected-history coverage read failed: {e}"))?
     else {
         return Ok(None);
     };
-    let Some(height) = coverage.history_proof_covered_to else {
-        return Ok(None);
-    };
+    let finalized = ctx.finalized_checkpoint();
+    let height = coverage.height.min(finalized.height);
     if height == 0
         || height > ctx.tip_height()
         || !snapshot_suffix_is_retained(ctx.tip_height(), height)
     {
         return Ok(None);
     }
-    let Some(record_bytes) = ctx
+    let header = ctx
         .store
-        .get_history_checkpoint_head_record(height)
-        .map_err(|e| format!("checkpoint head record read h={height} failed: {e}"))?
+        .get_header(height)
+        .map_err(|e| format!("selected-history header read h={height} failed: {e}"))?;
+    let Some(header) = header else {
+        return Ok(None);
+    };
+    let block_hash = noid_chain::hash_block_header(&header);
+    if (height == coverage.height && block_hash != coverage.block_hash)
+        || (height == finalized.height && block_hash != finalized.hash)
+    {
+        return Ok(None);
+    }
+    let Some(result) = ctx
+        .store
+        .get_selected_history_terminal_result_at(height, block_hash)
+        .map_err(|e| format!("selected-history result read h={height} failed: {e}"))?
     else {
         return Ok(None);
     };
-    let record: noid_recursive::StoredHistoryCheckpointHeadRecord =
-        bincode::deserialize(&record_bytes)
-            .map_err(|e| format!("checkpoint head record decode h={height} failed: {e}"))?;
-    if record.height != height {
-        return Err(format!(
-            "checkpoint head record height mismatch: coverage h={height}, record h={}",
-            record.height
-        ));
-    }
-    noid_recursive::verify_history_checkpoint_head_record(&record)
-        .map_err(|e| format!("checkpoint head record self-check failed: {e}"))?;
-    let local_end_anchor = ctx
-        .store
-        .get_header_anchor(height)
-        .map_err(|e| format!("checkpoint end anchor read failed: {e}"))?
-        .ok_or_else(|| format!("missing checkpoint end anchor h={height}"))?;
-    let proof = noid_recursive::public_history_checkpoint_proof_from_head_record(&record)
-        .map_err(|e| format!("checkpoint proof decode failed: {e:?}"))?;
-    noid_recursive::verify_history_checkpoint_proof_checkpoint(
-        &proof,
-        &proof.start_anchor,
-        &local_end_anchor,
-    )
-    .map_err(|e| format!("checkpoint proof self-check failed: {e}"))?;
-    let bytes = record.proof_bytes;
+    let bytes = result.bytes;
     if bytes.len() > MAX_HISTORY_PROOF_BYTES {
         return Err(format!(
-            "checkpoint proof too large: {} > {}",
+            "selected-history proof too large: {} > {}",
             bytes.len(),
             MAX_HISTORY_PROOF_BYTES
         ));
@@ -476,7 +464,7 @@ impl ParanoidApiServer for RpcHandler {
 
     async fn get_history_proof(&self) -> RpcResult<Option<String>> {
         let chain = self.chain.read().await;
-        checkpoint_history_proof_bytes(&chain)
+        selected_history_proof_bytes(&chain)
             .map(|bytes| bytes.map(hex::encode))
             .map_err(rpc_err)
     }
@@ -705,12 +693,12 @@ impl ParanoidApiServer for RpcHandler {
             }
         });
         let reward = block_reward(tip.log_slots);
-        let checkpoint_proof_height = chain
+        let history_proof_height = chain
             .store
-            .get_checkpoint_coverage()
+            .get_selected_history_coverage()
             .ok()
             .flatten()
-            .and_then(|coverage| coverage.history_proof_covered_to);
+            .map(|coverage| coverage.height);
         Ok(MiningInfo {
             height,
             difficulty_bits: diff_bits,
@@ -718,7 +706,7 @@ impl ParanoidApiServer for RpcHandler {
             block_reward_micronoid: reward,
             block_reward_noid: reward as f64 / 1_000_000.0,
             active_slot_count: tip.active_slot_count,
-            checkpoint_proof_height,
+            history_proof_height,
         })
     }
 
@@ -903,6 +891,12 @@ impl ParanoidApiServer for RpcHandler {
             .as_secs();
 
         let builder = TemplateBuilder::new(self.mempool.clone());
+        // Snapshot/reorg installation holds the same gate while it replaces
+        // chain, mempool and wallet views.  Capture only the parent+payout
+        // boundary under that gate, then release it before the expensive
+        // detached proof is assembled.  A later snapshot makes the template
+        // stale and submitBlock rejects it by parent hash.
+        let wallet_operation = self.wallet_operation_gate.lock().await;
         // Resolve the default payout under the same chain guard that captures
         // the template parent. Account activation also takes `chain -> wallet`,
         // so a new template cannot pair a new account with an old snapshot (or
@@ -927,6 +921,7 @@ impl ParanoidApiServer for RpcHandler {
                 .map_err(|e| rpc_err(format!("template snapshot: {e:?}")))?;
             (snapshot, addr)
         };
+        drop(wallet_operation);
         let prev_state_root = snapshot.prev_state_root();
         let tmpl = builder
             .build_from_snapshot(&snapshot, addr, now)
@@ -1056,6 +1051,12 @@ impl ParanoidApiServer for RpcHandler {
             .unwrap_or_default()
             .as_secs();
 
+        // Serialize the complete canonical apply + wallet delta + mempool
+        // view update against snapshot/reorg replacement.  Decoding and wire
+        // caps above need no shared state, so malformed submissions never
+        // occupy this gate.
+        let wallet_operation = self.wallet_operation_gate.lock().await;
+
         // Single production path: verify the minimal block proof, apply the
         // proven transition, then commit atomically to MDBX.
         let (hash, new_view) = {
@@ -1125,6 +1126,7 @@ impl ParanoidApiServer for RpcHandler {
         self.mempool
             .on_new_block(&confirmed, block.header.height, new_view)
             .await;
+        drop(wallet_operation);
 
         tracing::info!(
             height = block.header.height,
@@ -1549,7 +1551,7 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_proof_serving_requires_retained_suffix() {
+    fn selected_history_serving_requires_retained_suffix() {
         let retention = noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH;
         assert!(snapshot_suffix_is_retained(100, 100));
         assert!(snapshot_suffix_is_retained(100, 100 - retention));
