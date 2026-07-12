@@ -55,9 +55,10 @@ pub use segmented_state::{
 // ---------------------------------------------------------------------------
 
 pub use storage::{
-    AcceptedBlockCommitData, AppliedBlockValidation, ConsensusMeta, FinalizedCheckpoint,
-    MdbxChainContext, MdbxContextError, MdbxStore, RamBackend, ReorgBlockPayload, StateBackend,
-    StoreError,
+    reconstruct_historical_exact_state, AcceptedBlockCommitData, AppliedBlockValidation,
+    CanonicalTipBinding, ClaimedRecursiveProofJobInputs, ConsensusMeta, FinalizedCheckpoint,
+    HistoricalExactStateView, HistoricalStateError, MdbxChainContext, MdbxContextError, MdbxStore,
+    RamBackend, ReorgBlockPayload, StateBackend, StoreError,
 };
 
 // ---------------------------------------------------------------------------

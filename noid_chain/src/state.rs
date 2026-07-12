@@ -21,8 +21,10 @@ use noid_poseidon2b::primitives::Digest;
 use noid_tx::TxBody;
 
 use crate::exact_state_hash::{slot_leaf_hash, state_node_hash, zero_slot_roots, StateHash};
-use crate::fri_state::{SlotValue, StateError, STATE_LOG_SLOTS};
-use crate::segmented_state::{ExactStateReadError, SegmentColumns, SegmentedFriState};
+use crate::fri_state::{SlotValue, StateError, LOG_SEGMENT_SIZE, STATE_LOG_SLOTS};
+use crate::segmented_state::{
+    ExactStateReadError, SegmentColumns, SegmentedFriState, StateResizeError,
+};
 use crate::sparse_merkle::{frontier_sibling_positions, SparseMerkleError};
 
 /// Chain-level mutable state.
@@ -522,6 +524,21 @@ impl ChainState {
         debug_assert_eq!(self.exact_roots.root(), self.utxo_root);
     }
 
+    /// Expand one production slot-domain level for exact-only replay.
+    ///
+    /// The consensus exact cache/root is updated with the same O(1) rule as
+    /// [`Self::expand_one`], while segmented FRI metadata is resized without
+    /// hashing and remains explicitly unavailable to the caller.
+    pub fn expand_exact_metadata_for_replay(&mut self) -> Result<(), StateResizeError> {
+        let old_log_slots = self.state.log_slots();
+        let empty_right = zero_slot_roots(old_log_slots)[old_log_slots];
+        self.state.expand_exact_metadata_for_replay()?;
+        self.exact_roots.expand_one();
+        self.utxo_root = state_node_hash(self.utxo_root, empty_right);
+        debug_assert_eq!(self.exact_roots.root(), self.utxo_root);
+        Ok(())
+    }
+
     #[inline]
     pub fn state_root(&mut self) -> Digest {
         self.try_state_root()
@@ -751,7 +768,12 @@ impl ChainState {
             return Err(ApplyExactTransitionError::CachedRootMismatch);
         }
         if log_slots as usize == current_log_slots + 1 {
-            self.expand_one();
+            if current_log_slots >= LOG_SEGMENT_SIZE {
+                self.expand_exact_metadata_for_replay()
+                    .map_err(|_| ApplyExactTransitionError::HeaderLogSlotsMismatch)?;
+            } else {
+                self.expand_one();
+            }
         }
         self.state
             .apply_delta_unrooted(slot_updates)
@@ -1055,6 +1077,27 @@ mod tests {
                 .unwrap(),
             expanded_expected
         );
+    }
+
+    #[test]
+    fn exact_only_production_expansion_matches_normal_exact_root_rule() {
+        let log_slots = LOG_SEGMENT_SIZE;
+        let old_root = zero_slot_roots(log_slots)[log_slots];
+        let expected = state_node_hash(old_root, old_root);
+        let mut state = ChainState {
+            state: SegmentedFriState::new_exact_metadata_only_for_test(log_slots),
+            utxo_root: old_root,
+            active_slot_count: 0,
+            alloc_counter: 0,
+            exact_roots: ExactSegmentRootCache::empty(log_slots),
+        };
+
+        state.expand_exact_metadata_for_replay().unwrap();
+        assert_eq!(state.state.log_slots(), log_slots + 1);
+        assert_eq!(state.state.num_segments(), 2);
+        assert_eq!(state.cached_state_root(), expected);
+        assert_eq!(state.exact_roots.root(), expected);
+        assert_eq!(state.state.materialized_segment_ids().count(), 0);
     }
 
     #[test]

@@ -12,6 +12,7 @@
 //! instead of materializing `Vec<Block128>` when large state sizes make memcpy
 //! bandwidth relevant.
 
+pub mod historical_state;
 pub mod mdbx_context;
 pub mod mdbx_store;
 pub mod memory;
@@ -20,13 +21,17 @@ pub mod serial;
 pub mod snapshot_generation;
 pub mod snapshot_staging;
 
+pub use historical_state::{
+    reconstruct_historical_exact_state, CanonicalTipBinding, HistoricalExactStateView,
+    HistoricalStateError,
+};
 pub use mdbx_context::{
     AppliedBlockValidation, MdbxChainContext, MdbxContextError, ReorgBlockPayload,
 };
 pub use mdbx_store::{
-    AcceptedBlockCommitData, MdbxStore, RecursiveProofJob, RecursiveProofJobResult,
-    RecursiveProofJobState, RecursiveProofJobTier, StoreError, VerifiedOwnerSnapshot,
-    VerifiedOwnerUtxo, MAX_RECURSIVE_PROOF_JOB_RESULT_BYTES,
+    AcceptedBlockCommitData, ClaimedRecursiveProofJobInputs, MdbxStore, RecursiveProofJob,
+    RecursiveProofJobResult, RecursiveProofJobState, RecursiveProofJobTier, StoreError,
+    VerifiedOwnerSnapshot, VerifiedOwnerUtxo, MAX_RECURSIVE_PROOF_JOB_RESULT_BYTES,
 };
 pub use memory::RamBackend;
 pub use meta::{ConsensusMeta, FinalizedCheckpoint};

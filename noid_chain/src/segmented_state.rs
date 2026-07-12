@@ -409,6 +409,31 @@ impl SegmentedFriState {
         }
     }
 
+    /// Build production geometry without constructing any FRI commitment.
+    /// Exact-only expansion tests use this to exercise depth-16 segment
+    /// metadata without a 2^16-cell hash. The resulting FRI fields are not
+    /// authoritative and no FRI API may be called on it.
+    #[cfg(test)]
+    pub(crate) fn new_exact_metadata_only_for_test(log_slots: usize) -> Self {
+        assert!((LOG_SEGMENT_SIZE..=32).contains(&log_slots));
+        let num_segments = 1usize << (log_slots - LOG_SEGMENT_SIZE);
+        Self {
+            log_slots,
+            effective_log_seg: LOG_SEGMENT_SIZE,
+            num_segments,
+            segments: vec![None; num_segments],
+            seg_roots: vec![None; num_segments],
+            live_counts: vec![0; num_segments],
+            tree: vec![[0u8; 32]; 2 * num_segments + 1],
+            tree_dirty: true,
+            dirty: HashSet::new(),
+            mdbx_dirty: HashSet::new(),
+            exact_dirty: HashSet::new(),
+            evicted: HashSet::new(),
+            dirty_tree_leaves: HashSet::new(),
+        }
+    }
+
     /// Clone only compact state metadata, dropping every resident 3 MiB column
     /// payload.  The caller must use this only at a durable block boundary;
     /// each live segment is marked evicted and can then be faulted in from
@@ -1271,6 +1296,113 @@ impl SegmentedFriState {
         Ok(())
     }
 
+    /// Exact-only rollback of segmented residency metadata across expansions.
+    ///
+    /// This primitive is for [`crate::storage::HistoricalExactStateView`]. It
+    /// never flushes or hashes FRI summaries: the returned carrier explicitly
+    /// provides no FRI-root authority. Production geometry starts at
+    /// `LOG_SEGMENT_SIZE`, so every real shrink drops whole upper segments
+    /// while preserving the fixed 2^16-slot local geometry.
+    ///
+    /// The caller must subsequently refresh/check the chain-level exact root.
+    /// Dropped upper segments must already be canonical zero according to raw
+    /// residency metadata; otherwise the operation fails before mutation.
+    pub(crate) fn shrink_exact_metadata_to_log_slots(
+        &mut self,
+        target: usize,
+    ) -> Result<(), StateResizeError> {
+        if target == self.log_slots {
+            return Ok(());
+        }
+        if self.effective_log_seg != LOG_SEGMENT_SIZE
+            || target < LOG_SEGMENT_SIZE
+            || target > self.log_slots
+        {
+            return Err(StateResizeError::InvalidTarget {
+                current: self.log_slots,
+                target,
+            });
+        }
+
+        // Preflight every segment that any shrink step would discard. No FRI
+        // field is changed until the complete upper suffix is proven empty.
+        let target_num_segments = 1usize << (target - LOG_SEGMENT_SIZE);
+        for index in target_num_segments..self.num_segments {
+            let segment_id = index as u16;
+            if self.evicted.contains(&segment_id) {
+                return Err(StateResizeError::EvictedUpperSegment { seg_id: segment_id });
+            }
+            if self.live_counts[index] != 0 || self.segments[index].is_some() {
+                return Err(StateResizeError::NonEmptyUpperHalf { seg_id: segment_id });
+            }
+        }
+
+        self.log_slots = target;
+        self.num_segments = target_num_segments;
+        self.segments.truncate(target_num_segments);
+        self.seg_roots.truncate(target_num_segments);
+        self.live_counts.truncate(target_num_segments);
+        self.evicted
+            .retain(|id| (*id as usize) < target_num_segments);
+        self.dirty.retain(|id| (*id as usize) < target_num_segments);
+        self.mdbx_dirty
+            .retain(|id| (*id as usize) < target_num_segments);
+        self.exact_dirty
+            .retain(|id| (*id as usize) < target_num_segments);
+        self.dirty_tree_leaves
+            .retain(|id| (*id as usize) < target_num_segments);
+
+        // Preserve compact leaves without claiming an upper FRI root. A later
+        // general-state caller would have to rebuild the tree explicitly; the
+        // exact historical carrier forbids that path altogether.
+        self.tree = vec![[0u8; 32]; 2 * target_num_segments + 1];
+        for (index, root) in self.seg_roots.iter().copied().enumerate() {
+            if let Some(root) = root {
+                self.tree[target_num_segments + index] = root;
+            }
+        }
+        self.tree_dirty = true;
+        self.dirty_tree_leaves.clear();
+        Ok(())
+    }
+
+    /// Grow production segment metadata by one level for exact-only replay.
+    ///
+    /// No FRI zero commitment or upper tree node is hashed. The resulting FRI
+    /// fields are placeholders and remain unavailable under the exact replay
+    /// contract, while raw lower segments and virtual-zero upper segments have
+    /// the correct geometry for exact action application.
+    pub fn expand_exact_metadata_for_replay(&mut self) -> Result<(), StateResizeError> {
+        if self.effective_log_seg != LOG_SEGMENT_SIZE || self.log_slots >= 32 {
+            return Err(StateResizeError::InvalidTarget {
+                current: self.log_slots,
+                target: self.log_slots.saturating_add(1),
+            });
+        }
+        let new_num_segments =
+            self.num_segments
+                .checked_mul(2)
+                .ok_or(StateResizeError::InvalidTarget {
+                    current: self.log_slots,
+                    target: self.log_slots.saturating_add(1),
+                })?;
+        self.log_slots += 1;
+        self.num_segments = new_num_segments;
+        self.segments.resize(new_num_segments, None);
+        self.seg_roots.resize(new_num_segments, None);
+        self.live_counts.resize(new_num_segments, 0);
+
+        self.tree = vec![[0u8; 32]; 2 * new_num_segments + 1];
+        for (index, root) in self.seg_roots.iter().copied().enumerate() {
+            if let Some(root) = root {
+                self.tree[new_num_segments + index] = root;
+            }
+        }
+        self.tree_dirty = true;
+        self.dirty_tree_leaves.clear();
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // Private: dirty-flush helpers
     // -----------------------------------------------------------------------
@@ -1619,6 +1751,74 @@ mod tests {
         // LOG_SEGMENT_SIZE + 1 (2 segments of 2^16 slots each).
         // This is slow because of the FRI commit, so we skip unless running
         // in a dedicated environment. Mark with #[ignore] by default.
+    }
+
+    fn synthetic_two_segment_metadata() -> SegmentedFriState {
+        SegmentedFriState {
+            log_slots: LOG_SEGMENT_SIZE + 1,
+            effective_log_seg: LOG_SEGMENT_SIZE,
+            num_segments: 2,
+            segments: vec![None, None],
+            seg_roots: vec![Some([1u8; 32]), Some([2u8; 32])],
+            live_counts: vec![1, 0],
+            tree: vec![[0u8; 32]; 5],
+            tree_dirty: false,
+            dirty: HashSet::from([1]),
+            mdbx_dirty: HashSet::from([1]),
+            exact_dirty: HashSet::from([1]),
+            evicted: HashSet::from([0]),
+            dirty_tree_leaves: HashSet::from([1]),
+        }
+    }
+
+    #[test]
+    fn exact_only_metadata_shrink_drops_zero_upper_segment_without_fri_hashing() {
+        let mut state = synthetic_two_segment_metadata();
+        state
+            .shrink_exact_metadata_to_log_slots(LOG_SEGMENT_SIZE)
+            .unwrap();
+        assert_eq!(state.log_slots(), LOG_SEGMENT_SIZE);
+        assert_eq!(state.num_segments(), 1);
+        assert_eq!(state.segment_live_count(0), 1);
+        assert!(state.is_evicted(0));
+        assert!(state.dirty.is_empty());
+        assert!(state.mdbx_dirty.is_empty());
+        assert!(state.exact_dirty.is_empty());
+        assert_eq!(state.tree.len(), 3);
+        assert!(state.tree_dirty);
+    }
+
+    #[test]
+    fn exact_only_metadata_shrink_rejects_live_upper_segment_before_mutation() {
+        let mut state = synthetic_two_segment_metadata();
+        state.live_counts[1] = 1;
+        let before = state.clone();
+        assert_eq!(
+            state.shrink_exact_metadata_to_log_slots(LOG_SEGMENT_SIZE),
+            Err(StateResizeError::NonEmptyUpperHalf { seg_id: 1 })
+        );
+        assert_eq!(state.log_slots, before.log_slots);
+        assert_eq!(state.num_segments, before.num_segments);
+        assert_eq!(state.live_counts, before.live_counts);
+        assert_eq!(state.seg_roots, before.seg_roots);
+    }
+
+    #[test]
+    fn exact_only_metadata_expansion_preserves_lower_residency_without_hashing() {
+        let mut state = synthetic_two_segment_metadata();
+        state
+            .shrink_exact_metadata_to_log_slots(LOG_SEGMENT_SIZE)
+            .unwrap();
+        state.expand_exact_metadata_for_replay().unwrap();
+        assert_eq!(state.log_slots(), LOG_SEGMENT_SIZE + 1);
+        assert_eq!(state.num_segments(), 2);
+        assert_eq!(state.segment_live_count(0), 1);
+        assert_eq!(state.segment_live_count(1), 0);
+        assert!(state.is_evicted(0));
+        assert!(!state.is_evicted(1));
+        assert!(state.try_get_segment_columns(1).is_none());
+        assert_eq!(state.tree.len(), 5);
+        assert!(state.tree_dirty);
     }
 
     #[test]
