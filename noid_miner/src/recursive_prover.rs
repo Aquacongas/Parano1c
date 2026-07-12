@@ -855,7 +855,9 @@ mod tests {
     #[test]
     fn selected_block_consumes_native_verified_seal_without_reverification() {
         let source = include_str!("recursive_prover.rs");
-        let production = source.split("#[cfg(test)]").next().unwrap();
+        // Split at the test module, not the first `#[cfg(test)]` item: the
+        // file carries one test-gated session helper mid-file.
+        let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
         assert!(production.contains("use noid_block::SelectedRecursiveBlockArtifacts;"));
         assert!(!production.contains("verify_accepted_block_batch_components"));
         assert!(!production.contains("compute_tx_body_hash"));

@@ -902,8 +902,8 @@ mod tests {
         assert!(carrier.contains("pub fn try_new("));
         assert!(carrier.contains("live_proofs: Vec<ZkAuthorizationProof>"));
         assert!(carrier.contains("ghost_proof: ZkAuthorizationProof"));
-        assert!(carrier.contains("tier_user_tx_capacity: Some("));
-        assert!(carrier.contains("CAPSULE_NUM_QUERIES"));
+        assert!(carrier.contains("selected_zk_block_geometry(TIER)"));
+        assert!(carrier.contains("user_tx_class_tier(live_authorizations)"));
         assert!(carrier.contains("pub(in crate::acceptance) fn into_parts("));
 
         let bundle_source = include_str!("trace/zk_authorization_candidate.rs");
