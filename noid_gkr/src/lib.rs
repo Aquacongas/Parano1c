@@ -1,21 +1,35 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! GKR-based proving for the Paranoid transaction system.
+//! Proof components for the Paranoid transaction system.
 //!
-//! This crate implements the Kill-Shot GKR protocol for Poseidon2b
-//! permutation chains. It provides:
+//! This crate provides:
 //!
-//! - **Owner Auth GKR**: proves the transaction's single input owner from one
-//!   wallet spend secret.
+//! - **Selected ZK authorization**: a witness-hiding AuthGKR/Binary BaseFold
+//!   proof of the transaction's single input owner.
 //! - **Poseidon2b spine components**: reusable Kill-Shot proofs for fixed
 //!   permutation batches such as tx-body hashing, accepted-claim hashing,
 //!   state-root hashing, and chain accumulation.
 //! - **Merkle GKR**: proves batches of Poseidon2b Merkle paths through the
 //!   same Kill-Shot permutation relation.
+//!
+//! The pre-ZK owner-auth proof and its standalone capsule PCS were removed
+//! from the production API. These compile-fail gates prevent either surface
+//! from being restored accidentally:
+//!
+//! ```compile_fail
+//! use noid_gkr::{prove_owner_auth_killshot, OwnerAuthProofKillShot};
+//! ```
+//!
+//! ```compile_fail
+//! use noid_gkr::auth_pcs::AuthMleOpeningProof;
+//! ```
+//!
+//! ```compile_fail
+//! let _ = noid_gkr::ghost_tx::ghost_authorization();
+//! ```
 
 pub mod accepted_claim_killshot;
-pub mod auth_pcs;
 pub mod batch_eval;
 pub mod block_spine;
 pub mod circuit;
@@ -29,7 +43,7 @@ pub mod merkle_circuit;
 pub mod merkle_oracle;
 pub mod mle_layout;
 pub mod oracle;
-pub mod owner_auth;
+mod owner_auth;
 pub mod spine_killshot;
 pub mod spine_mle;
 pub mod spine_shift;
@@ -52,7 +66,6 @@ pub use accepted_claim_killshot::{
     verify_accepted_claim_hash_killshot, AcceptedClaimHashInputs, AcceptedClaimHashProofKillShot,
     AcceptedClaimHashReductions, ACCEPTED_CLAIM_FIELDS,
 };
-pub use auth_pcs::{verify_auth_mle_opening, AuthMleOpeningProof, AUTH_PCS_BASE_LOG};
 pub use batch_eval::{
     prove_batch_eval, prove_multi_batch_eval, verify_batch_eval, verify_multi_batch_eval,
     BatchEvalProof, BatchEvalReduction, BatchEvalRound, EvalClaim, MultiBatchEvalProof,
@@ -95,19 +108,8 @@ pub use merkle_oracle::{compute_merkle_root, evaluate_merkle, MerkleSlotState, M
 pub use mle_layout::{pack_column, PermColumn, PermMle, N_PERM_CELLS, N_PERM_VARS};
 pub use oracle::{evaluate_spine, SpineWitness};
 pub use owner_auth::{
-    build_owner_auth_unified_from_inputs, build_owner_auth_unified_mle,
-    compute_owner_auth_boundary, discharge_owner_auth_reductions_native, evaluate_owner_auth,
-    init_owner_auth_gkr_channel, owner_auth_gkr_channel, owner_auth_public_from_body,
-    owner_auth_public_from_statement, owner_auth_trace_inputs_from_body_and_secret,
-    prove_owner_auth_killshot, prove_owner_auth_killshot_from_mle, verify_owner_auth_killshot,
-    verify_owner_auth_killshot_with_claims, OwnerAuthBoundaryProof, OwnerAuthBoundaryReduction,
-    OwnerAuthCircuit, OwnerAuthInputs, OwnerAuthKillShotProof, OwnerAuthKillShotReductions,
-    OwnerAuthLayout, OwnerAuthProofKillShot, OwnerAuthPublicInputs, OwnerAuthShiftProof,
-    OwnerAuthShiftReduction, OwnerAuthSlotDescriptor, OwnerAuthSlotRole, OwnerAuthSlotState,
-    OwnerAuthStatementError, OwnerAuthTraceWitness, OwnerAuthUnifiedProof,
-    OwnerAuthUnifiedReduction, OwnerAuthVerifierClaims, OWNER_AUTH_LIVE_SLOTS, OWNER_AUTH_NUM_VARS,
-    OWNER_AUTH_PADDED_SLOTS, OWNER_AUTH_PIN_LANES, OWNER_AUTH_SHIFT_ROUND_DEGREE,
-    OWNER_AUTH_SLOT_BITS, OWNER_AUTH_STATE_ROUND_DEGREE, OWNER_AUTH_UNIFIED_ROUND_DEGREE,
+    owner_auth_public_from_body, owner_auth_public_from_statement, OwnerAuthLayout,
+    OwnerAuthPublicInputs, OwnerAuthStatementError, OWNER_AUTH_NUM_VARS,
 };
 pub use spine_killshot::{
     build_unified_from_inputs, build_unified_from_states, discharge_reductions_native,
@@ -168,3 +170,34 @@ pub use zk_auth_hiding::{
 pub use zk_authorization_wire::{
     ZkAuthorizationWireDecodeError, ZkAuthorizationWireEncodeError, ZK_AUTHORIZATION_MAX_WIRE_BYTES,
 };
+
+#[cfg(test)]
+mod production_auth_hard_cut_tests {
+    use std::path::Path;
+
+    #[test]
+    fn retired_owner_auth_sources_and_default_exports_stay_absent() {
+        let retired_proof = concat!("OwnerAuthProof", "KillShot");
+        let retired_prover = concat!("prove_owner_auth_", "killshot");
+        let retired_ghost = concat!("pub fn ghost_", "authorization(");
+        let owner_source = include_str!("owner_auth.rs");
+        let ghost_source = include_str!("ghost_tx.rs");
+        assert!(!owner_source.contains(retired_proof));
+        assert!(!owner_source.contains(retired_prover));
+        assert!(!ghost_source.contains(retired_ghost));
+
+        let default_code: String = include_str!("lib.rs")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect();
+        assert!(!default_code.contains(retired_proof));
+        assert!(!default_code.contains(retired_prover));
+        assert!(!default_code.contains(concat!("pub mod auth_", "pcs")));
+
+        let retired_pcs = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/auth_pcs.rs");
+        assert!(
+            !retired_pcs.exists(),
+            "retired standalone owner-auth PCS source was restored"
+        );
+    }
+}

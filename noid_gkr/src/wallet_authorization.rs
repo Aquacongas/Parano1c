@@ -382,15 +382,7 @@ fn selected_statement(public: &OwnerAuthPublicInputs) -> ZkAuthCapsuleOwnerState
 }
 
 fn map_owner_auth_prove_error(err: OwnerAuthStatementError) -> ProveAuthorizationError {
-    match err {
-        OwnerAuthStatementError::SecretMismatch { input_position } => {
-            ProveAuthorizationError::BoundaryMismatch {
-                input_index: input_position,
-                field: "owner_auth",
-            }
-        }
-        other => ProveAuthorizationError::OwnerAuthStatement(other.to_string()),
-    }
+    ProveAuthorizationError::OwnerAuthStatement(err.to_string())
 }
 
 #[cfg(test)]
@@ -504,10 +496,13 @@ mod tests {
             Err(AuthorizationDecodeError::Truncated)
         ));
 
-        let legacy = bincode::serialize(&crate::ghost_tx::ghost_authorization().0)
-            .expect("serialize legacy owner-auth proof");
+        // A pinned pre-hard-cut envelope prefix. Decoder rejection must not
+        // depend on retaining or running the retired owner-auth prover.
+        const RETIRED_OWNER_AUTH_FIXTURE: &[u8] = &[
+            0x01, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00,
+        ];
         assert!(matches!(
-            WalletAuthorizationBundle::from_bytes(&legacy),
+            WalletAuthorizationBundle::from_bytes(RETIRED_OWNER_AUTH_FIXTURE),
             Err(AuthorizationDecodeError::InvalidMagic)
         ));
     }

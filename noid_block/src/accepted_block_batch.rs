@@ -27,7 +27,7 @@ use noid_gkr::{
 use noid_poseidon2b::native::compress;
 use noid_poseidon2b::primitives::Digest;
 use noid_recursive::block_certificate_backend::{
-    verify_accepted_block_batch_components_selected_zk as verify_recursive_accepted_block_batch_components,
+    verify_accepted_block_batch_components as verify_recursive_accepted_block_batch_components,
     AcceptedBlockBatchComponentError as RecursiveBlockBatchComponentError,
     AcceptedBlockBatchComponentInputs as RecursiveBlockBatchComponentInputs,
     AcceptedBlockBatchComponentProof as RecursiveBlockBatchComponentProof,
@@ -121,9 +121,8 @@ pub struct FullAcceptedBlockBatchProofComponents {
     pub component_inputs: RecursiveBlockBatchComponentInputs,
     /// Canonical selected-ZK proofs in the same order as
     /// `component_inputs.authorization_inputs`. The B255 production builder
-    /// consumes this vector; it is intentionally outside the legacy recursive
-    /// component DTO and never serde-decoded without the bounded sidecar
-    /// codec.
+    /// consumes this vector; it is intentionally outside the public component
+    /// DTO and never serde-decoded without the bounded sidecar codec.
     pub selected_authorization_proofs: Vec<noid_gkr::zk_authorization::ZkAuthorizationProof>,
     pub accepted_block_acceptance_receipts: Vec<BlockProofAcceptanceReceipt>,
     pub accepted_block_certificate_proofs: Vec<AcceptedBlockCertificateProof>,
@@ -228,10 +227,6 @@ pub enum FullAcceptedBlockBatchError {
     ExactStateFrontier {
         index: usize,
         source: ExactFrontierError,
-    },
-    AuthorizationComponent {
-        index: usize,
-        tx_index: usize,
     },
     TxBodyHashComponent,
     TxRootComponent,
@@ -369,8 +364,6 @@ fn verify_full_accepted_block_batch_native_with_owned_state(
     let mut tx_body_hashes = Vec::new();
     let mut tx_root_inputs = Vec::new();
     let mut authorization_inputs = Vec::new();
-    let authorization_witnesses = Vec::new();
-    let authorization_traces = Vec::new();
     let mut selected_authorization_proofs = Vec::new();
     let mut exact_state_killshot_inputs = Vec::new();
     let mut exact_state_structural_inputs = Vec::new();
@@ -629,8 +622,6 @@ fn verify_full_accepted_block_batch_native_with_owned_state(
                 tx_root_inputs,
                 header_integer_trace,
                 authorization_inputs,
-                authorization_witnesses,
-                authorization_traces,
                 exact_state_killshot_inputs,
                 exact_state_structural_inputs,
                 authorization_totals,
@@ -974,8 +965,6 @@ fn validate_single_block_recursive_components(
         || inputs.tx_root_inputs.len() != transaction_count
         || inputs.authorization_inputs.len() != user_transaction_count
         || inputs.authorization_totals.user_tx_count != user_transaction_count
-        || !inputs.authorization_witnesses.is_empty()
-        || !inputs.authorization_traces.is_empty()
         || components.selected_authorization_proofs.len() != user_transaction_count
         || components.accepted_block_acceptance_receipts.len() != 1
         || components.accepted_block_certificate_proofs.len() != 1
@@ -1563,13 +1552,8 @@ pub(crate) fn verify_full_accepted_block_batch_components(
 fn validate_selected_authorization_carrier(
     components: &FullAcceptedBlockBatchProofComponents,
 ) -> Result<(), FullAcceptedBlockBatchError> {
-    if !components
-        .component_inputs
-        .authorization_witnesses
-        .is_empty()
-        || !components.component_inputs.authorization_traces.is_empty()
-        || components.component_inputs.authorization_inputs.len()
-            != components.selected_authorization_proofs.len()
+    if components.component_inputs.authorization_inputs.len()
+        != components.selected_authorization_proofs.len()
     {
         return Err(FullAcceptedBlockBatchError::ComponentShapeMismatch);
     }
@@ -1591,9 +1575,6 @@ fn map_recursive_component_error(
         }
         RecursiveBlockBatchComponentError::TxRootProofRejected => {
             FullAcceptedBlockBatchError::TxRootComponent
-        }
-        RecursiveBlockBatchComponentError::AuthorizationProofRejected { index, tx_index } => {
-            FullAcceptedBlockBatchError::AuthorizationComponent { index, tx_index }
         }
         RecursiveBlockBatchComponentError::AcceptedClaimBatch(source) => {
             FullAcceptedBlockBatchError::AcceptedClaimBatch(source)
@@ -2198,11 +2179,6 @@ mod tests {
         );
         assert_eq!(artifacts.component_inputs.tx_body_inputs.len(), 1);
         assert!(artifacts.component_inputs.authorization_inputs.is_empty());
-        assert!(artifacts
-            .component_inputs
-            .authorization_witnesses
-            .is_empty());
-        assert!(artifacts.component_inputs.authorization_traces.is_empty());
         assert!(artifacts.selected_authorization_proofs.is_empty());
         assert_eq!(artifacts.component_proof.exact_state.len(), 1);
 

@@ -36,9 +36,7 @@ use crate::acceptance::trace::deep_chain::{
     verify_ragged_multi_deep_chain_walk_trace, MultiDeepChainWalkProofTrace,
 };
 use crate::acceptance::trace::region_source_binding::{
-    auth_pcs_main_c_sidecar_purpose, auth_pcs_meta_a_sidecar_purpose,
-    auth_pcs_meta_b_sidecar_purpose, auth_pcs_wallet_a_sidecar_purpose,
-    auth_pcs_wallet_b_sidecar_purpose, owner_auth_duplex_sidecar_purpose,
+    auth_pcs_meta_a_sidecar_purpose, auth_pcs_meta_b_sidecar_purpose,
 };
 use crate::acceptance::trace::self_verify::FieldPostCommitTraceContext;
 use crate::acceptance::trace::FieldR1csBuilder;
@@ -65,7 +63,6 @@ use super::{
     WalkARegionProverPlan, WalkARegionVk, WalkARegionWalkDeferredProof,
 };
 
-pub const BLOCK_REGION_SIDECAR_VERSION: u8 = 3;
 pub const BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION: u8 = 4;
 
 /// Compact retained portion of a selected Block sidecar VK.
@@ -216,13 +213,9 @@ const SELECTED_ZK_AUTH_OWNER_W_LOG: usize = 15;
 #[cfg(test)]
 const SELECTED_ZK_AUTH_WALLET_A_W_LOG: usize = 19;
 
-const BLOCK_REGION_VK_DIGEST_DOMAIN: &[u8] = b"NOID/REGION-SIDECAR/BLOCK-VK/V3";
 const BLOCK_REGION_SELECTED_ZK_VK_DIGEST_DOMAIN: &[u8] = b"NOID/REGION-SIDECAR/BLOCK-ZK-AUTH-VK/V4";
-const BLOCK_POST_COMMIT_CLASS_DIGEST_DOMAIN: &[u8] =
-    b"NOID/REGION-SIDECAR/BLOCK-POST-COMMIT-CLASS/V3";
 const BLOCK_SELECTED_ZK_POST_COMMIT_CLASS_DIGEST_DOMAIN: &[u8] =
     b"NOID/REGION-SIDECAR/BLOCK-ZK-AUTH-POST-COMMIT-CLASS/V4";
-const BLOCK_REGION_TRANSCRIPT_LABEL: &[u8] = b"history-region-sidecar-block-v3";
 const BLOCK_REGION_SELECTED_ZK_TRANSCRIPT_LABEL: &[u8] = b"history-region-sidecar-block-zk-auth-v4";
 
 /// Canonical verification key for all six production block-region verticals.
@@ -232,7 +225,6 @@ const BLOCK_REGION_SELECTED_ZK_TRANSCRIPT_LABEL: &[u8] = b"history-region-sideca
 /// and order into one digest.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockRegionSidecarVk {
-    version: u8,
     wallet_a: WalkARegionVk,
     meta_a: WalkARegionVk,
     wallet_b: MerkleRegionVk,
@@ -358,27 +350,6 @@ impl BlockRegionSidecarVk {
         })
     }
 
-    pub fn new(
-        wallet_a: WalkARegionVk,
-        meta_a: WalkARegionVk,
-        wallet_b: MerkleRegionVk,
-        meta_b: MerkleRegionVk,
-        owner_c: DuplexRegionVk,
-        main_c: DuplexRegionVk,
-    ) -> Result<Self, RegionSidecarError> {
-        let vk = Self {
-            version: BLOCK_REGION_SIDECAR_VERSION,
-            wallet_a,
-            meta_a,
-            wallet_b,
-            meta_b,
-            owner_c,
-            main_c,
-        };
-        vk.validate_roles()?;
-        Ok(vk)
-    }
-
     /// Construct the selected ZK-authorization six-child key.
     ///
     /// This is a VK shape certificate only.  It is deliberately not a
@@ -393,7 +364,6 @@ impl BlockRegionSidecarVk {
         main_c: DuplexRegionVk,
     ) -> Result<Self, RegionSidecarError> {
         let vk = Self {
-            version: BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION,
             wallet_a,
             meta_a,
             wallet_b,
@@ -430,7 +400,7 @@ impl BlockRegionSidecarVk {
     }
 
     pub fn version(&self) -> u8 {
-        self.version
+        BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION
     }
 
     /// Digest of the complete ordered block sidecar VK.  This digest is a
@@ -445,9 +415,9 @@ impl BlockRegionSidecarVk {
             self.owner_c.transcript_digest(),
             self.main_c.transcript_digest(),
         ];
-        let version = [self.version];
+        let version = [BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION];
         poseidon2b_hash_byte_slices(
-            self.vk_digest_domain(),
+            BLOCK_REGION_SELECTED_ZK_VK_DIGEST_DOMAIN,
             &[
                 &version,
                 b"wallet-a",
@@ -466,56 +436,8 @@ impl BlockRegionSidecarVk {
         )
     }
 
-    fn validate_roles(&self) -> Result<(), RegionSidecarError> {
-        use super::WalkARegionDescriptor;
-
-        if self.version != BLOCK_REGION_SIDECAR_VERSION
-            || !matches!(
-                self.wallet_a.descriptor(),
-                WalkARegionDescriptor::Wallet { .. }
-            )
-            || !matches!(
-                self.meta_a.descriptor(),
-                WalkARegionDescriptor::Meta {
-                    exact_state_region_log: Some(_),
-                    spine_cap_log: Some(_),
-                    ..
-                }
-            )
-            || self.wallet_a.purpose() != &auth_pcs_wallet_a_sidecar_purpose()
-            || self.meta_a.purpose() != &auth_pcs_meta_a_sidecar_purpose()
-            || self.wallet_b.purpose() != &auth_pcs_wallet_b_sidecar_purpose()
-            || self.meta_b.purpose() != &auth_pcs_meta_b_sidecar_purpose()
-            || self.owner_c.purpose() != &owner_auth_duplex_sidecar_purpose()
-            || self.main_c.purpose() != &auth_pcs_main_c_sidecar_purpose()
-        {
-            return Err(RegionSidecarError::UnsupportedVkShape);
-        }
-        Ok(())
-    }
-
-    fn validate_versioned_roles(&self) -> Result<(), RegionSidecarError> {
-        match self.version {
-            BLOCK_REGION_SIDECAR_VERSION => self.validate_roles(),
-            BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION => self.validate_selected_zk_roles(),
-            _ => Err(RegionSidecarError::UnsupportedVersion),
-        }
-    }
-
-    fn vk_digest_domain(&self) -> &'static [u8] {
-        match self.version {
-            BLOCK_REGION_SIDECAR_VERSION => BLOCK_REGION_VK_DIGEST_DOMAIN,
-            BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION => BLOCK_REGION_SELECTED_ZK_VK_DIGEST_DOMAIN,
-            _ => b"NOID/REGION-SIDECAR/BLOCK-UNSUPPORTED",
-        }
-    }
-
     fn transcript_label(&self) -> &'static [u8] {
-        match self.version {
-            BLOCK_REGION_SIDECAR_VERSION => BLOCK_REGION_TRANSCRIPT_LABEL,
-            BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION => BLOCK_REGION_SELECTED_ZK_TRANSCRIPT_LABEL,
-            _ => b"history-region-sidecar-block-unsupported",
-        }
+        BLOCK_REGION_SELECTED_ZK_TRANSCRIPT_LABEL
     }
 
     /// Exact four-class selected certificate over all six child roles,
@@ -539,8 +461,7 @@ impl BlockRegionSidecarVk {
             .find(|geometry| geometry.tx_log == tx_log)
             .ok_or(RegionSidecarError::UnsupportedVkShape)?;
 
-        if self.version != BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION
-            || self.wallet_a.purpose() != &selected_zk_auth_wallet_a_sidecar_purpose()
+        if self.wallet_a.purpose() != &selected_zk_auth_wallet_a_sidecar_purpose()
             || self.meta_a.purpose() != &auth_pcs_meta_a_sidecar_purpose()
             || self.wallet_b.purpose() != &selected_zk_auth_wallet_b_sidecar_purpose()
             || self.meta_b.purpose() != &auth_pcs_meta_b_sidecar_purpose()
@@ -686,7 +607,6 @@ pub fn block_post_commit_class_digest(
         matrix_digest,
         spec,
         pcs_params,
-        sidecar_vk.version(),
         sidecar_vk.transcript_digest(),
     )
 }
@@ -708,7 +628,6 @@ pub(crate) fn selected_zk_block_post_commit_class_digest_from_vk_digest(
         matrix_digest,
         spec,
         pcs_params,
-        BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION,
         sidecar_vk_digest,
     )
 }
@@ -743,7 +662,6 @@ fn block_post_commit_class_digest_from_vk_digest(
     matrix_digest: &[u8; 32],
     spec: &PublicIoSpec,
     pcs_params: &PcsParams,
-    sidecar_vk_version: u8,
     sidecar_vk_digest: [u8; 32],
 ) -> [u8; 32] {
     let mut spec_bytes = Vec::new();
@@ -767,23 +685,12 @@ fn block_post_commit_class_digest_from_vk_digest(
     push_u64(&mut pcs_bytes, profile.len());
     pcs_bytes.extend_from_slice(profile);
 
-    let (domain, role) = match sidecar_vk_version {
-        BLOCK_REGION_SIDECAR_VERSION => (BLOCK_POST_COMMIT_CLASS_DIGEST_DOMAIN, b"block" as &[u8]),
-        BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION => (
-            BLOCK_SELECTED_ZK_POST_COMMIT_CLASS_DIGEST_DOMAIN,
-            b"block-zk-auth" as &[u8],
-        ),
-        _ => (
-            b"NOID/REGION-SIDECAR/BLOCK-POST-COMMIT-UNSUPPORTED" as &[u8],
-            b"unsupported" as &[u8],
-        ),
-    };
-    let version = [sidecar_vk_version];
+    let version = [BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION];
     poseidon2b_hash_byte_slices(
-        domain,
+        BLOCK_SELECTED_ZK_POST_COMMIT_CLASS_DIGEST_DOMAIN,
         &[
             &version,
-            role,
+            b"block-zk-auth",
             matrix_digest,
             &spec_bytes,
             &pcs_bytes,
@@ -830,27 +737,6 @@ pub struct BlockRegionProverInput {
 }
 
 impl BlockRegionProverInput {
-    pub fn new(
-        vk: &BlockRegionSidecarVk,
-        wallet_a: RegionWalkEndpoints,
-        meta_a: RegionWalkEndpoints,
-        wallet_b: RegionWalkEndpoints,
-        meta_b: RegionWalkEndpoints,
-        owner_c: RegionWalkEndpoints,
-        main_c: RegionWalkEndpoints,
-    ) -> Result<Self, RegionSidecarError> {
-        let input = Self {
-            wallet_a,
-            meta_a,
-            wallet_b,
-            meta_b,
-            owner_c,
-            main_c,
-        };
-        input.validate(vk)?;
-        Ok(input)
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_selected_zk(
         vk: &BlockRegionSidecarVk,
@@ -871,11 +757,6 @@ impl BlockRegionProverInput {
         };
         input.validate_selected_zk(vk)?;
         Ok(input)
-    }
-
-    fn validate(&self, vk: &BlockRegionSidecarVk) -> Result<(), RegionSidecarError> {
-        vk.validate_roles()?;
-        self.validate_children(vk)
     }
 
     fn validate_selected_zk(&self, vk: &BlockRegionSidecarVk) -> Result<(), RegionSidecarError> {
@@ -907,13 +788,6 @@ pub struct BlockRegionProverPlan<'a> {
 pub struct BlockRegionPreparation {
     vk: BlockRegionSidecarVk,
     input: BlockRegionProverInput,
-    kind: BlockRegionPreparationKind,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BlockRegionPreparationKind {
-    Legacy,
-    SelectedZkOwnedAssembly,
 }
 
 /// Unbound selected preparation state.  It owns the exact six-child key and
@@ -944,18 +818,6 @@ impl SelectedZkBlockRegionDraft {
 }
 
 impl BlockRegionPreparation {
-    pub fn new(
-        vk: BlockRegionSidecarVk,
-        input: BlockRegionProverInput,
-    ) -> Result<Self, RegionSidecarError> {
-        input.validate(&vk)?;
-        Ok(Self {
-            vk,
-            input,
-            kind: BlockRegionPreparationKind::Legacy,
-        })
-    }
-
     /// Selected-ZK finalization is sealed by the owning Block assembly. The
     /// seal's field is private to that module, so no draft/VK-only caller can
     /// construct it or obtain a preparation before the same owner has bound
@@ -973,11 +835,7 @@ impl BlockRegionPreparation {
         // that the owner just built. Reject availability drift atomically at
         // finish rather than deferring it to a prover-plan failure.
         let _ = block_bounded_shapes(&vk, total_vars)?;
-        Ok(Self {
-            vk,
-            input,
-            kind: BlockRegionPreparationKind::SelectedZkOwnedAssembly,
-        })
+        Ok(Self { vk, input })
     }
 
     pub fn vk(&self) -> &BlockRegionSidecarVk {
@@ -989,12 +847,7 @@ impl BlockRegionPreparation {
     }
 
     pub fn prover_plan(&self) -> Result<BlockRegionProverPlan<'_>, RegionSidecarError> {
-        match self.kind {
-            BlockRegionPreparationKind::Legacy => BlockRegionProverPlan::new(&self.vk, &self.input),
-            BlockRegionPreparationKind::SelectedZkOwnedAssembly => {
-                BlockRegionProverPlan::new_selected_zk(&self.vk, &self.input)
-            }
-        }
+        BlockRegionProverPlan::new_selected_zk(&self.vk, &self.input)
     }
 
     pub fn into_parts(self) -> (BlockRegionSidecarVk, BlockRegionProverInput) {
@@ -1003,15 +856,6 @@ impl BlockRegionPreparation {
 }
 
 impl<'a> BlockRegionProverPlan<'a> {
-    pub fn new(
-        vk: &'a BlockRegionSidecarVk,
-        input: &'a BlockRegionProverInput,
-    ) -> Result<Self, RegionSidecarError> {
-        vk.validate_roles()?;
-        input.validate(vk)?;
-        Ok(Self { vk, input })
-    }
-
     fn new_selected_zk(
         vk: &'a BlockRegionSidecarVk,
         input: &'a BlockRegionProverInput,
@@ -1029,11 +873,11 @@ impl<'a> BlockRegionProverPlan<'a> {
         let mut claims = Vec::new();
 
         // Batch only the deep-chain walk shared by these ordered children.
-        // V3's ragged embedding retains every child's native domain width;
-        // no committed column or outer witness is padded to the group max.
+        // The ragged embedding retains every child's native domain width; no
+        // committed column or outer witness is padded to the group max.
         // Every prefix/suffix relation and every terminal opening remains a
-        // separate role-bound proof.  The exact order below is the V3 block
-        // sidecar transcript and is mirrored by both verifier twins.
+        // separate role-bound proof.  The exact order below is the canonical
+        // V4 block sidecar transcript and is mirrored by both verifier twins.
         let wallet_a_plan = WalkARegionProverPlan::new(
             self.vk.wallet_a(),
             self.input.wallet_a.s0(),
@@ -1109,7 +953,7 @@ impl<'a> BlockRegionProverPlan<'a> {
 
         Ok((
             BlockRegionSidecarProof {
-                version: self.vk.version(),
+                version: BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION,
                 wallet_a,
                 meta_b,
                 wallet_a_meta_b_walk,
@@ -1138,7 +982,7 @@ impl<'a> BlockRegionProverPlan<'a> {
     }
 }
 
-/// The fixed-shape block sidecar envelope (legacy V3 or selected-ZK V4).
+/// The fixed-shape selected-ZK V4 block sidecar envelope.
 ///
 /// Five children carry independent prefix/suffix authority with their walk
 /// deliberately absent; two mandatory multi-walks reduce those exact child
@@ -1187,7 +1031,7 @@ impl BlockRegionSidecarProof {
     }
 }
 
-/// Decode the mandatory version-keyed block envelope only after every deferred child,
+/// Decode the mandatory V4 block envelope only after every deferred child,
 /// both multi-walks, and the unmatched full child have passed one
 /// allocation-free class-aware scan.
 pub fn decode_block_region_sidecar_bounded(
@@ -1196,11 +1040,11 @@ pub fn decode_block_region_sidecar_bounded(
     bytes: &[u8],
 ) -> Result<BlockRegionSidecarProof, RegionSidecarError> {
     let shapes = block_bounded_shapes(vk, total_vars)?;
-    preflight_composite_proof(bytes, vk.version(), &shapes)?;
+    preflight_composite_proof(bytes, BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION, &shapes)?;
     record_serde_attempt();
     let proof: BlockRegionSidecarProof =
         bincode::deserialize(bytes).map_err(|_| RegionSidecarError::InvalidProof)?;
-    if proof.version != vk.version() {
+    if proof.version != BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION {
         return Err(RegionSidecarError::UnsupportedVersion);
     }
     Ok(proof)
@@ -1210,7 +1054,7 @@ fn block_bounded_shapes(
     vk: &BlockRegionSidecarVk,
     total_vars: usize,
 ) -> Result<[SidecarProofShape; 8], RegionSidecarError> {
-    vk.validate_versioned_roles()?;
+    vk.validate_selected_zk_roles()?;
     let wallet_meta_w_logs = wallet_meta_w_logs(vk);
     let meta_duplex_w_logs = meta_duplex_w_logs(vk);
     Ok([
@@ -1241,7 +1085,7 @@ fn block_bounded_shapes(
     ])
 }
 
-/// Replay the version-keyed phased block authority and derive the complete outer PCS
+/// Replay the canonical phased block authority and derive the complete outer PCS
 /// claim list. No claim descriptor is accepted from the prover.
 fn verify_block_region_sidecar<Ch: Challenger>(
     vk: &BlockRegionSidecarVk,
@@ -1249,8 +1093,8 @@ fn verify_block_region_sidecar<Ch: Challenger>(
     proof: &BlockRegionSidecarProof,
     challenger: &mut Ch,
 ) -> Result<Vec<QuirkyDirectClaim>, RegionSidecarError> {
-    vk.validate_versioned_roles()?;
-    if proof.version != vk.version() {
+    vk.validate_selected_zk_roles()?;
+    if proof.version != BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION {
         return Err(RegionSidecarError::UnsupportedVersion);
     }
 
@@ -1345,7 +1189,7 @@ pub fn verify_block_region_sidecar_post_commit<Ch: Challenger>(
     Ok(())
 }
 
-/// Recursive trace verifier for the fixed version-keyed block authority. Every deferred
+/// Recursive trace verifier for the fixed V4 block authority. Every deferred
 /// child, multi-walk, and the unmatched wallet-B proof is shape-preflighted
 /// before the first proof witness allocation. Prefixes and suffixes remain
 /// role-local; only the ragged-domain deep walks are random-linearly batched.
@@ -1355,8 +1199,8 @@ pub fn verify_block_region_sidecar_trace_post_commit<C: FsChannelOps>(
     vk: &BlockRegionSidecarVk,
     proof: &BlockRegionSidecarProof,
 ) -> Result<(), RegionSidecarError> {
-    vk.validate_versioned_roles()?;
-    if proof.version != vk.version() {
+    vk.validate_selected_zk_roles()?;
+    if proof.version != BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION {
         return Err(RegionSidecarError::UnsupportedVersion);
     }
     let total_vars = context.total_vars();
@@ -1526,14 +1370,8 @@ fn push_u64(bytes: &mut Vec<u8>, value: usize) {
 
 #[cfg(test)]
 mod tests {
-    use noid_ivc_core::deep_chain::{DeepChainWalkProof, MultiWalkLayerProof};
     use noid_ivc_core::public_io::WitnessSlice;
 
-    use super::super::bounded_decode;
-    use super::super::tests::{
-        duplex_decode_fixture_with_purpose, merkle_decode_fixture_with_purpose,
-    };
-    use super::super::walk_a::tests::composite_decode_fixture as walk_a_fixture;
     use super::*;
 
     fn aligned_slices<const N: usize>(cursor: &mut usize, w_log: usize) -> [WitnessSlice; N] {
@@ -1722,7 +1560,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_b255_certificate_is_exact_v4_and_domain_separated() {
+    fn selected_b255_certificate_is_exact_v4() {
         let vk = selected_b255_vk_fixture();
         assert_eq!(vk.version(), BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION);
         vk.validate_selected_zk_roles().unwrap();
@@ -1735,46 +1573,11 @@ mod tests {
             RegionSidecarError::BadSlice,
             "selected child slice outside the enclosing witness survived preflight"
         );
-
-        let mut legacy_framed = vk.clone();
-        legacy_framed.version = BLOCK_REGION_SIDECAR_VERSION;
-        assert_ne!(vk.transcript_digest(), legacy_framed.transcript_digest());
-        assert_eq!(
-            legacy_framed.validate_roles(),
-            Err(RegionSidecarError::UnsupportedVkShape)
-        );
     }
 
     #[test]
     fn selected_certificate_rejects_purpose_layout_domain_k_and_mixed_pairs() {
         let exact = selected_b255_vk_fixture();
-
-        let mut wrong_purpose = exact.clone();
-        wrong_purpose.wallet_a = WalkARegionVk::new_wallet(
-            auth_pcs_wallet_a_sidecar_purpose(),
-            SELECTED_ZK_AUTH_TX_LOG,
-            SELECTED_ZK_AUTH_QUERY_LOG,
-            exact.wallet_a().slices().try_into().unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            wrong_purpose.validate_selected_zk_roles(),
-            Err(RegionSidecarError::UnsupportedVkShape)
-        );
-
-        let mut wrong_wallet_b_purpose = exact.clone();
-        wrong_wallet_b_purpose.wallet_b = MerkleRegionVk::new(
-            auth_pcs_wallet_b_sidecar_purpose(),
-            exact.wallet_b().w_log(),
-            *exact.wallet_b().slices(),
-            exact.wallet_b().block_log(),
-            exact.wallet_b().families().to_vec(),
-        )
-        .unwrap();
-        assert_eq!(
-            wrong_wallet_b_purpose.validate_selected_zk_roles(),
-            Err(RegionSidecarError::UnsupportedVkShape)
-        );
 
         let mut wrong_layout = exact.clone();
         wrong_layout.owner_c.layout_digest = [0xA5; 32];
@@ -1812,17 +1615,6 @@ mod tests {
             Err(RegionSidecarError::UnsupportedVkShape)
         );
 
-        let mut mixed = exact.clone();
-        mixed.main_c.purpose = auth_pcs_main_c_sidecar_purpose();
-        assert_eq!(
-            mixed.validate_selected_zk_roles(),
-            Err(RegionSidecarError::UnsupportedVkShape)
-        );
-        assert_eq!(
-            mixed.validate_roles(),
-            Err(RegionSidecarError::UnsupportedVkShape)
-        );
-
         let mut overlap = exact.clone();
         let owner_layout = ZkAuthCapsuleDuplexSchedules::selected().owner_layout();
         overlap.owner_c = selected_duplex_vk(
@@ -1850,216 +1642,6 @@ mod tests {
         assert_eq!(
             wrong_meta.validate_selected_zk_roles(),
             Err(RegionSidecarError::UnsupportedVkShape)
-        );
-    }
-
-    fn resize_merkle_vk(mut vk: MerkleRegionVk, w_log: usize) -> MerkleRegionVk {
-        vk.w_log = w_log;
-        vk.slices = std::array::from_fn(|index| WitnessSlice {
-            log2_len: w_log,
-            index,
-        });
-        vk.layout_digest =
-            super::super::merkle_layout_digest(vk.w_log, vk.block_log, &vk.fixed, &vk.families);
-        vk
-    }
-
-    fn resize_duplex_vk(mut vk: DuplexRegionVk, w_log: usize) -> DuplexRegionVk {
-        vk.w_log = w_log;
-        vk.slices = std::array::from_fn(|index| WitnessSlice {
-            log2_len: w_log,
-            index,
-        });
-        vk
-    }
-
-    fn shape_only_multi_walk(walks: &[DeepChainWalkProof]) -> MultiDeepChainWalkProof {
-        assert!(!walks.is_empty());
-        assert!(walks.iter().all(|walk| walk.layers.len() == N_ROUNDS));
-        let widest = walks
-            .iter()
-            .max_by_key(|walk| walk.layers[0].round_coeffs.len())
-            .expect("one shape-only walk");
-        MultiDeepChainWalkProof {
-            layers: (0..N_ROUNDS)
-                .map(|layer| MultiWalkLayerProof {
-                    round_coeffs: widest.layers[layer].round_coeffs.clone(),
-                    next_values: walks
-                        .iter()
-                        .map(|walk| walk.layers[layer].next_values)
-                        .collect(),
-                })
-                .collect(),
-        }
-    }
-
-    #[test]
-    fn block_bounded_decode_preflights_every_child_before_serde() {
-        let (wallet_a_vk, wallet_a_vars, wallet_a) =
-            walk_a_fixture(false, auth_pcs_wallet_a_sidecar_purpose());
-        let (meta_a_vk, meta_a_vars, meta_a) =
-            walk_a_fixture(true, auth_pcs_meta_a_sidecar_purpose());
-        let (wallet_b_vk, wallet_b_vars, wallet_b, _) =
-            merkle_decode_fixture_with_purpose(auth_pcs_wallet_b_sidecar_purpose());
-        let (meta_b_vk, _meta_b_vars, meta_b, _) =
-            merkle_decode_fixture_with_purpose(auth_pcs_meta_b_sidecar_purpose());
-        let (owner_c_vk, _owner_c_vars, owner_c, _) =
-            duplex_decode_fixture_with_purpose(owner_auth_duplex_sidecar_purpose());
-        let (main_c_vk, _main_c_vars, main_c, _) =
-            duplex_decode_fixture_with_purpose(auth_pcs_main_c_sidecar_purpose());
-        let wallet_a_w_log = wallet_a_vk.w_log();
-        let meta_b_w_log = wallet_a_w_log
-            .checked_sub(1)
-            .expect("wallet fixture has a non-trivial walk domain");
-        let meta_a_w_log = meta_a_vk.w_log();
-        let owner_c_w_log = meta_a_w_log + 1;
-        let main_c_w_log = meta_a_w_log
-            .checked_sub(1)
-            .expect("meta fixture has a non-trivial walk domain");
-        let meta_b_vk = resize_merkle_vk(meta_b_vk, meta_b_w_log);
-        let owner_c_vk = resize_duplex_vk(owner_c_vk, owner_c_w_log);
-        let main_c_vk = resize_duplex_vk(main_c_vk, main_c_w_log);
-        let total_vars = [
-            wallet_a_vars,
-            meta_a_vars,
-            wallet_b_vars,
-            wallet_a_w_log + 4,
-            meta_b_w_log + 4,
-            meta_a_w_log + 3,
-            owner_c_w_log + 3,
-            main_c_w_log + 3,
-        ]
-        .into_iter()
-        .max()
-        .unwrap();
-        let vk = BlockRegionSidecarVk::new(
-            wallet_a_vk,
-            meta_a_vk,
-            wallet_b_vk,
-            meta_b_vk,
-            owner_c_vk,
-            main_c_vk,
-        )
-        .unwrap();
-        let (wallet_a, wallet_a_walk) = wallet_a.into_walk_deferred_parts(wallet_a_w_log);
-        let (meta_b, meta_b_walk) = meta_b.into_walk_deferred_parts(meta_b_w_log);
-        let wallet_a_meta_b_walk = shape_only_multi_walk(&[wallet_a_walk, meta_b_walk]);
-        let (meta_a, meta_a_walk) = meta_a.into_walk_deferred_parts(meta_a_w_log);
-        let (owner_c, owner_c_walk) = owner_c.into_walk_deferred_parts(owner_c_w_log);
-        let (main_c, main_c_walk) = main_c.into_walk_deferred_parts(main_c_w_log);
-        let meta_a_owner_main_walk =
-            shape_only_multi_walk(&[meta_a_walk, owner_c_walk, main_c_walk]);
-        let proof = BlockRegionSidecarProof {
-            version: BLOCK_REGION_SIDECAR_VERSION,
-            wallet_a,
-            meta_b,
-            wallet_a_meta_b_walk,
-            meta_a,
-            owner_c,
-            main_c,
-            meta_a_owner_main_walk,
-            wallet_b,
-        };
-        let encoded = bincode::serialize(&proof).unwrap();
-
-        // Envelope versions are keyed, not negotiable. A legacy V3 proof is
-        // rejected before child parsing under the selected V4 composite VK.
-        assert_eq!(encoded[0], BLOCK_REGION_SIDECAR_VERSION);
-        assert_eq!(
-            decode_block_region_sidecar_bounded(&selected_b255_vk_fixture(), 30, &encoded)
-                .unwrap_err(),
-            RegionSidecarError::UnsupportedVersion
-        );
-
-        let before = bounded_decode::serde_attempts();
-        assert_eq!(
-            decode_block_region_sidecar_bounded(&vk, total_vars, &encoded).unwrap(),
-            proof
-        );
-        assert_eq!(bounded_decode::serde_attempts(), before + 1);
-        let malformed_start = bounded_decode::serde_attempts();
-
-        let mut trailing = encoded.clone();
-        trailing.push(0);
-        assert_eq!(
-            decode_block_region_sidecar_bounded(&vk, total_vars, &trailing).unwrap_err(),
-            RegionSidecarError::InvalidProof
-        );
-        assert_eq!(
-            decode_block_region_sidecar_bounded(&vk, total_vars, &encoded[..encoded.len() - 1],)
-                .unwrap_err(),
-            RegionSidecarError::InvalidProof
-        );
-        let mut wrong_version = encoded.clone();
-        wrong_version[0] = BLOCK_REGION_SIDECAR_VERSION.wrapping_add(1);
-        assert_eq!(
-            decode_block_region_sidecar_bounded(&vk, total_vars, &wrong_version).unwrap_err(),
-            RegionSidecarError::UnsupportedVersion
-        );
-
-        let shapes = block_bounded_shapes(&vk, total_vars).unwrap();
-        let offsets = bounded_decode::composite_layout_offsets(
-            &encoded,
-            BLOCK_REGION_SIDECAR_VERSION,
-            &shapes,
-        )
-        .unwrap();
-        let versions = offsets
-            .iter()
-            .filter_map(|(field, offset)| {
-                (*field == bounded_decode::LayoutField::Version).then_some(*offset)
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(versions.len(), 7, "envelope plus six child versions");
-        for offset in &versions[1..] {
-            let mut forged = encoded.clone();
-            forged[*offset] ^= 1;
-            assert_eq!(
-                decode_block_region_sidecar_bounded(&vk, total_vars, &forged).unwrap_err(),
-                RegionSidecarError::UnsupportedVersion
-            );
-        }
-
-        for child in 0..6 {
-            let start = versions[child + 1];
-            let end = versions.get(child + 2).copied().unwrap_or(encoded.len());
-            let offset = offsets
-                .iter()
-                .find_map(|(field, offset)| {
-                    (matches!(field, bounded_decode::LayoutField::VecLength(_))
-                        && *offset > start
-                        && *offset < end)
-                        .then_some(*offset)
-                })
-                .expect("child Vec length");
-            let mut forged = encoded.clone();
-            forged[offset..offset + 8].copy_from_slice(&u64::MAX.to_le_bytes());
-            assert_eq!(
-                decode_block_region_sidecar_bounded(&vk, total_vars, &forged).unwrap_err(),
-                RegionSidecarError::InvalidProof
-            );
-        }
-
-        let option_offsets = offsets
-            .iter()
-            .filter_map(|(field, offset)| {
-                (*field == bounded_decode::LayoutField::OptionTag).then_some(*offset)
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(option_offsets.len(), 2, "wallet/meta Walk-A options");
-        for offset in option_offsets {
-            let mut forged = encoded.clone();
-            forged[offset] ^= 1;
-            assert_eq!(
-                decode_block_region_sidecar_bounded(&vk, total_vars, &forged).unwrap_err(),
-                RegionSidecarError::InvalidProof
-            );
-        }
-
-        assert_eq!(
-            bounded_decode::serde_attempts(),
-            malformed_start,
-            "malformed block envelope reached allocation-bearing serde"
         );
     }
 }

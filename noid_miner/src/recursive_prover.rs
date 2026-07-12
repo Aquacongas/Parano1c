@@ -29,7 +29,7 @@ use noid_recursive::acceptance::split_link::{
     SplitLinkPreparationError, SplitLinkTraceInput,
 };
 use noid_recursive::block_certificate_backend::{
-    verify_accepted_block_batch_components_selected_zk, AcceptedBlockBatchComponentError,
+    verify_accepted_block_batch_components, AcceptedBlockBatchComponentError,
     AcceptedBlockBatchComponentInputs, AcceptedBlockBatchComponentProof,
 };
 use noid_recursive::{ChainAccumulator, RecursiveConsensusState};
@@ -364,10 +364,6 @@ pub enum SelectedRecursiveProverError {
         expected: usize,
         actual: usize,
     },
-    LegacyAuthorizationCarrier {
-        proofs: usize,
-        traces: usize,
-    },
     AuthorizationBodyBinding {
         index: usize,
     },
@@ -426,10 +422,6 @@ impl core::fmt::Display for SelectedRecursiveProverError {
             Self::AuthorizationProofCardinality { expected, actual } => write!(
                 f,
                 "selected proof count {actual} does not match live user count {expected}"
-            ),
-            Self::LegacyAuthorizationCarrier { proofs, traces } => write!(
-                f,
-                "selected job retains {proofs} legacy proofs and {traces} legacy traces"
             ),
             Self::AuthorizationBodyBinding { index } => {
                 write!(f, "authorization {index} does not bind its canonical body")
@@ -805,7 +797,7 @@ fn prove_selected_recursive_block_after_admission(
     // consuming selected builder verifies them once more against body-derived
     // aliases before exposing any recursive columns. Shape/body mismatch is
     // rejected above, and a malformed proof makes the caught assembly fail.
-    verify_accepted_block_batch_components_selected_zk(
+    verify_accepted_block_batch_components(
         job.start_consensus,
         job.start_accumulator,
         job.end_accumulator,
@@ -866,8 +858,6 @@ fn validate_selected_carrier_shape(
         block_count: inputs.accepted_claim_witness.headers.len(),
         accepted_claim_count: inputs.accepted_claim_witness.accepted_block_claims.len(),
         accepted_claim_hash_count: inputs.accepted_claim_hash_inputs.len(),
-        legacy_proof_count: inputs.authorization_witnesses.len(),
-        legacy_trace_count: inputs.authorization_traces.len(),
         authorization_count: inputs.authorization_inputs.len(),
         selected_proof_count,
         authorization_total: inputs.authorization_totals.user_tx_count,
@@ -884,8 +874,6 @@ struct SelectedCarrierCounts {
     block_count: usize,
     accepted_claim_count: usize,
     accepted_claim_hash_count: usize,
-    legacy_proof_count: usize,
-    legacy_trace_count: usize,
     authorization_count: usize,
     selected_proof_count: usize,
     authorization_total: usize,
@@ -913,12 +901,6 @@ fn validate_selected_carrier_counts(
         return Err(SelectedRecursiveProverError::ComponentShape(
             "one block requires one claim and one exact-state component",
         ));
-    }
-    if counts.legacy_proof_count != 0 || counts.legacy_trace_count != 0 {
-        return Err(SelectedRecursiveProverError::LegacyAuthorizationCarrier {
-            proofs: counts.legacy_proof_count,
-            traces: counts.legacy_trace_count,
-        });
     }
     if counts.selected_proof_count != counts.authorization_count {
         return Err(
@@ -1001,7 +983,7 @@ fn reject_source_commitment_reuse(
 mod tests {
     use super::*;
     use noid_core::Block128;
-    use noid_gkr::owner_auth::{OwnerAuthLayout, OwnerAuthPublicInputs};
+    use noid_gkr::{OwnerAuthLayout, OwnerAuthPublicInputs};
     use noid_ivc_core::field::F128;
     use noid_ivc_core::field_circuit::FieldR1csBuilder;
     use noid_poseidon2b::primitives::Address;
@@ -1133,13 +1115,11 @@ mod tests {
     }
 
     #[test]
-    fn carrier_shape_rejects_count_mismatch_and_legacy_vectors() {
+    fn carrier_shape_rejects_selected_count_mismatch() {
         let canonical = SelectedCarrierCounts {
             block_count: 1,
             accepted_claim_count: 1,
             accepted_claim_hash_count: 1,
-            legacy_proof_count: 0,
-            legacy_trace_count: 0,
             authorization_count: 0,
             selected_proof_count: 1,
             authorization_total: 0,
@@ -1157,19 +1137,6 @@ mod tests {
                     actual: 1
                 }
             )
-        ));
-
-        let legacy = SelectedCarrierCounts {
-            selected_proof_count: 0,
-            legacy_proof_count: 1,
-            ..canonical
-        };
-        assert!(matches!(
-            validate_selected_carrier_counts(legacy),
-            Err(SelectedRecursiveProverError::LegacyAuthorizationCarrier {
-                proofs: 1,
-                traces: 0
-            })
         ));
     }
 

@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Prototype affine LCH additive Reed–Solomon code for the ZK capsule.
+//! Selected affine LCH additive Reed–Solomon code for the production ZK
+//! authorization capsule.
 //!
 //! This is one rate-1/32 code over the single affine domain
-//! `beta + span{b_0, ..., b_15}`. It does not use the active capsule's
-//! independent-window encoder and is disconnected from every production
-//! proof, wire, commitment, and transcript path.
+//! `beta + span{b_0, ..., b_15}`. The production capsule PCS uses this code for
+//! its source, mid, and tail oracles and applies the selected low-to-high
+//! binary BaseFold schedule between its arity-16 commitment stages.
 //!
 //! The committed bank is already the coefficient/oracle vector in natural
 //! LCH novel-basis order. It is zero-padded without a permutation. Therefore

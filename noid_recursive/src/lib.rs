@@ -9,7 +9,6 @@
 pub mod acceptance;
 pub mod accepted_batch;
 pub mod accumulator;
-pub mod authorization;
 pub mod block_certificate;
 pub mod block_certificate_backend;
 pub mod block_certificate_ivc;
@@ -17,7 +16,6 @@ pub mod checkpoint;
 pub mod checkpoint_ivc_backend;
 pub mod checkpoint_proof;
 pub mod class_registry;
-pub mod fs_transcript;
 pub mod header_integer;
 pub mod pow_header;
 pub mod region_sidecar;
@@ -35,11 +33,6 @@ pub use accepted_batch::{
 pub use accumulator::{
     genesis_accumulator, ChainAccumulator, ChainAccumulatorAdvanceError, ChainAccumulatorLaneError,
     ChainAccumulatorLocalBoundaryError, CHAIN_ACCUMULATOR_LANES,
-};
-pub use authorization::{
-    verify_authorization_batch_native, verify_authorization_batch_native_with_traces,
-    verify_authorization_statement_proof_with_trace, AuthorizationBatchError,
-    AuthorizationVerifierTrace, FiatShamirTraceOp,
 };
 pub use block_certificate::{
     accepted_block_certificate_auth_sidecar_digest, accepted_block_certificate_batch_statement,
@@ -121,16 +114,6 @@ pub use class_registry::{
     OwnedSelectedRecursiveClassRegistry, OwnedSelectedRecursiveTerminalRegistry,
     SelectedRecursiveClassRegistryError, MAX_SELECTED_RECURSIVE_CLASS_REGISTRY_BYTES,
     SELECTED_RECURSIVE_CLASS_REGISTRY_VERSION,
-};
-pub use fs_transcript::{
-    discharge_fiat_shamir_transcript_batch_reductions_native,
-    discharge_fiat_shamir_transcript_reductions_native,
-    prove_fiat_shamir_transcript_batch_killshot, prove_fiat_shamir_transcript_killshot,
-    verify_fiat_shamir_transcript_batch_killshot, verify_fiat_shamir_transcript_killshot,
-    FiatShamirTranscriptBatchProofKillShot, FiatShamirTranscriptError,
-    FiatShamirTranscriptProofKillShot, FiatShamirTranscriptReductions,
-    FIAT_SHAMIR_TRANSCRIPT_MAX_OPS_PER_TRACE, FIAT_SHAMIR_TRANSCRIPT_MAX_PERMUTATIONS_PER_BATCH,
-    FIAT_SHAMIR_TRANSCRIPT_MAX_TRACES_PER_BATCH,
 };
 pub use header_integer::{
     build_header_integer_trace, verify_header_integer_trace, HeaderIntegerBatchTrace,

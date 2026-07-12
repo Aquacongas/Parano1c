@@ -1,10 +1,7 @@
 //! [G] step 4 Stage 1 — the load-bearing multi-tx flatness mechanism, proven
 //! NATIVELY (fast; no heavy prove).
 //!
-//! The production wallet-PCS discharge (`discharge_auth_pcs_obligation_via_region`)
-//! is called ONCE PER TX by `block_slots`, so K transactions build K separate
-//! deep-chain walks — linear in K, and the memory note's "combine many → 2^24 /
-//! 30 GB / OOM". The design is tx-INDEPENDENT: lay all K txs' families into ONE
+//! The selected region design lays all K transactions' families into ONE
 //! walk at a `[tx_hi | schedule_lo]` tiling so the walk/relation cost is
 //! logarithmic in the domain (the `FixedPattern` MLE reads only the low
 //! `schedule_lo` bits; the high `tx_hi` coordinates integrate out).

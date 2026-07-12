@@ -31,7 +31,6 @@
 pub mod block_class;
 pub mod block_slots;
 pub mod link;
-pub mod region;
 pub mod shape;
 pub mod split_link;
 pub mod trace;

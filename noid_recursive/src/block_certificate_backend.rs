@@ -29,9 +29,9 @@ use noid_gkr::{
     verify_batched_slot_leaf_killshot, verify_block_spine_killshot,
     verify_fixed_field_hash_killshot, AcceptedClaimHashInputs, AcceptedClaimHashProofKillShot,
     BatchedMerkleProofKillShot, BatchedSlotLeafProofKillShot, BlockSpineProof,
-    CanonicalAuthorizationStatement, FixedFieldHashInputs, FixedFieldHashParams,
-    FixedFieldHashProofKillShot, MerkleCircuit, MerklePathInputs, OwnerAuthProofKillShot,
-    OwnerAuthPublicInputs, SlotLeafInputs, SpineCircuit, SpineInputs, VerifiedAuthorizationBatch,
+    FixedFieldHashInputs, FixedFieldHashParams, FixedFieldHashProofKillShot, MerkleCircuit,
+    MerklePathInputs, OwnerAuthPublicInputs, SlotLeafInputs, SpineCircuit, SpineInputs,
+    VerifiedAuthorizationBatch,
 };
 use noid_poseidon2b::channel::Poseidon2bChannel;
 use noid_poseidon2b::native::domain::TAG_EXSTNOD;
@@ -42,9 +42,6 @@ use crate::accepted_batch::{
     AcceptedClaimBatchOutput, AcceptedClaimBatchWitness,
 };
 use crate::accumulator::ChainAccumulator;
-use crate::authorization::{
-    verify_authorization_statement_proof_with_trace, AuthorizationVerifierTrace,
-};
 use crate::block_certificate::{
     accepted_block_certificate_chain_claim, AcceptedBlockCertificateStatement,
 };
@@ -513,8 +510,6 @@ pub struct AcceptedBlockBatchComponentInputs {
     pub tx_root_inputs: Vec<MerklePathInputs>,
     pub header_integer_trace: HeaderIntegerBatchTrace,
     pub authorization_inputs: Vec<AuthorizationComponentInput>,
-    pub authorization_witnesses: Vec<OwnerAuthProofKillShot>,
-    pub authorization_traces: Vec<AuthorizationVerifierTrace>,
     /// Transitional expanded paths consumed only by the not-yet-migrated
     /// outer trace. Native retained verification does not trust or verify
     /// these paths once the sibling-only structural carrier is present.
@@ -571,10 +566,6 @@ pub enum AcceptedBlockBatchComponentError {
     AcceptedClaimHashProofRejected,
     TxBodyHashProofRejected,
     TxRootProofRejected,
-    AuthorizationProofRejected {
-        index: usize,
-        tx_index: usize,
-    },
     AcceptedClaimBatch(AcceptedClaimBatchError),
     CheckpointPoseidon(CheckpointPoseidonError),
     ExactState {
@@ -583,6 +574,13 @@ pub enum AcceptedBlockBatchComponentError {
     },
 }
 
+/// Verify the canonical component carrier consumed by the selected-ZK B255
+/// Block relation.
+///
+/// Authorization proofs are not accepted by this DTO. This boundary binds
+/// their canonical public statements and aggregate counts; the consuming B255
+/// input owns and verifies the corresponding ZK authorization proofs exactly
+/// once.
 pub fn verify_accepted_block_batch_components(
     start_consensus: &RecursiveConsensusState,
     start_accumulator: &ChainAccumulator,
@@ -590,55 +588,7 @@ pub fn verify_accepted_block_batch_components(
     inputs: &AcceptedBlockBatchComponentInputs,
     proof: &AcceptedBlockBatchComponentProof,
 ) -> Result<AcceptedClaimBatchOutput, AcceptedBlockBatchComponentError> {
-    verify_accepted_block_batch_components_with_authorization_mode(
-        start_consensus,
-        start_accumulator,
-        end_accumulator,
-        inputs,
-        proof,
-        AuthorizationComponentMode::Legacy,
-    )
-}
-
-/// Verify the retained non-authorization components for the selected-ZK Block
-/// authoring path.  The selected authorization proofs are deliberately not
-/// duplicated in this carrier: the consuming B255 Block input owns them and
-/// the recursive selected region verifies and binds them to these canonical
-/// authorization statements.  Consequently this boundary requires both
-/// legacy proof/trace vectors to be empty and checks only their public shape
-/// and totals here.
-pub fn verify_accepted_block_batch_components_selected_zk(
-    start_consensus: &RecursiveConsensusState,
-    start_accumulator: &ChainAccumulator,
-    end_accumulator: &ChainAccumulator,
-    inputs: &AcceptedBlockBatchComponentInputs,
-    proof: &AcceptedBlockBatchComponentProof,
-) -> Result<AcceptedClaimBatchOutput, AcceptedBlockBatchComponentError> {
-    verify_accepted_block_batch_components_with_authorization_mode(
-        start_consensus,
-        start_accumulator,
-        end_accumulator,
-        inputs,
-        proof,
-        AuthorizationComponentMode::SelectedZk,
-    )
-}
-
-#[derive(Clone, Copy)]
-enum AuthorizationComponentMode {
-    Legacy,
-    SelectedZk,
-}
-
-fn verify_accepted_block_batch_components_with_authorization_mode(
-    start_consensus: &RecursiveConsensusState,
-    start_accumulator: &ChainAccumulator,
-    end_accumulator: &ChainAccumulator,
-    inputs: &AcceptedBlockBatchComponentInputs,
-    proof: &AcceptedBlockBatchComponentProof,
-    authorization_mode: AuthorizationComponentMode,
-) -> Result<AcceptedClaimBatchOutput, AcceptedBlockBatchComponentError> {
-    validate_component_shape(inputs, proof, authorization_mode)?;
+    validate_component_shape(inputs, proof)?;
     validate_certificate_statement_component_shape(inputs)?;
 
     // All component verifications are independent, so run them as one parallel
@@ -663,14 +613,7 @@ fn verify_accepted_block_batch_components_with_authorization_mode(
                 || {
                     rayon::join(
                         || verify_tx_root_component(inputs, proof),
-                        || match authorization_mode {
-                            AuthorizationComponentMode::Legacy => {
-                                verify_authorization_components(inputs)
-                            }
-                            AuthorizationComponentMode::SelectedZk => {
-                                verify_selected_authorization_component_shape(inputs)
-                            }
-                        },
+                        || verify_authorization_component_shape(inputs),
                     )
                 },
                 || {
@@ -886,22 +829,11 @@ pub fn verify_exact_state_structural_hash_chunk_proofs(
 fn validate_component_shape(
     inputs: &AcceptedBlockBatchComponentInputs,
     proof: &AcceptedBlockBatchComponentProof,
-    authorization_mode: AuthorizationComponentMode,
 ) -> Result<(), AcceptedBlockBatchComponentError> {
     let block_count = inputs.accepted_claim_witness.headers.len();
-    let authorization_shape_ok = match authorization_mode {
-        AuthorizationComponentMode::Legacy => {
-            inputs.authorization_inputs.len() == inputs.authorization_witnesses.len()
-                && inputs.authorization_traces.len() == inputs.authorization_witnesses.len()
-        }
-        AuthorizationComponentMode::SelectedZk => {
-            inputs.authorization_witnesses.is_empty() && inputs.authorization_traces.is_empty()
-        }
-    };
     if inputs.exact_state_structural_inputs.len() != block_count
         || inputs.exact_state_structural_inputs.len() != proof.exact_state.len()
         || inputs.exact_state_killshot_inputs.len() != inputs.exact_state_structural_inputs.len()
-        || !authorization_shape_ok
         || inputs.accepted_claim_hash_inputs.len()
             != inputs.accepted_claim_witness.accepted_block_claims.len()
         || inputs.tx_body_inputs.len() != inputs.tx_body_hashes.len()
@@ -1077,61 +1009,31 @@ fn verify_tx_root_component(
     }
 }
 
-fn verify_authorization_components(
+/// Bind the public authorization statement carrier to the totals consumed by
+/// the selected ZK authorization region. The proofs themselves have a single
+/// owner: the consuming B255 Block input.
+fn verify_authorization_component_shape(
     inputs: &AcceptedBlockBatchComponentInputs,
 ) -> Result<(), AcceptedBlockBatchComponentError> {
-    if inputs.authorization_inputs.len() != inputs.authorization_totals.user_tx_count {
-        return Err(AcceptedBlockBatchComponentError::ComponentShapeMismatch);
-    }
-    let auth_counts = inputs
-        .authorization_inputs
-        .par_iter()
-        .zip(inputs.authorization_witnesses.par_iter())
-        .enumerate()
-        .map(|(index, (input, proof))| {
-            let statement = CanonicalAuthorizationStatement {
-                tx_index: input.tx_index,
-                tx_body_hash: input.tx_body_hash,
-                live_input_count: input.live_input_count,
-                public: input.public.clone(),
-            };
-            let (verified, _) = verify_authorization_statement_proof_with_trace(&statement, proof)
-                .map_err(
-                    |_| AcceptedBlockBatchComponentError::AuthorizationProofRejected {
-                        index,
-                        tx_index: input.tx_index,
-                    },
-                )?;
-            Ok(verified.live_input_count)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let live_input_count_total = auth_counts.iter().sum::<usize>();
-    if live_input_count_total != inputs.authorization_totals.live_input_count_total {
+    if !authorization_component_totals_match(
+        &inputs.authorization_inputs,
+        &inputs.authorization_totals,
+    ) {
         return Err(AcceptedBlockBatchComponentError::ComponentShapeMismatch);
     }
     Ok(())
 }
 
-fn verify_selected_authorization_component_shape(
-    inputs: &AcceptedBlockBatchComponentInputs,
-) -> Result<(), AcceptedBlockBatchComponentError> {
-    if inputs.authorization_inputs.len() != inputs.authorization_totals.user_tx_count
-        || !inputs.authorization_witnesses.is_empty()
-        || !inputs.authorization_traces.is_empty()
-    {
-        return Err(AcceptedBlockBatchComponentError::ComponentShapeMismatch);
-    }
-    let live_input_count_total = inputs
-        .authorization_inputs
-        .iter()
-        .try_fold(0usize, |sum, input| {
-            sum.checked_add(usize::from(input.live_input_count))
-        })
-        .ok_or(AcceptedBlockBatchComponentError::ComponentShapeMismatch)?;
-    if live_input_count_total != inputs.authorization_totals.live_input_count_total {
-        return Err(AcceptedBlockBatchComponentError::ComponentShapeMismatch);
-    }
-    Ok(())
+fn authorization_component_totals_match(
+    inputs: &[AuthorizationComponentInput],
+    totals: &VerifiedAuthorizationBatch,
+) -> bool {
+    let Some(live_input_count_total) = inputs.iter().try_fold(0usize, |sum, input| {
+        sum.checked_add(usize::from(input.live_input_count))
+    }) else {
+        return false;
+    };
+    inputs.len() == totals.user_tx_count && live_input_count_total == totals.live_input_count_total
 }
 
 fn validate_exact_state_inputs(
@@ -1304,6 +1206,41 @@ mod tests {
             bad_count.live_input_count = count;
             assert!(!authorization_component_input_shape_ok(&bad_count));
         }
+    }
+
+    #[test]
+    fn authorization_component_totals_bind_selected_proof_cardinality() {
+        let first = authorization_component_input();
+        let mut second = first.clone();
+        second.tx_index = 1;
+        second.live_input_count = 2;
+        let inputs = vec![first, second];
+        let live_input_count_total = inputs
+            .iter()
+            .map(|input| usize::from(input.live_input_count))
+            .sum::<usize>();
+
+        assert!(authorization_component_totals_match(
+            &inputs,
+            &VerifiedAuthorizationBatch {
+                user_tx_count: 2,
+                live_input_count_total,
+            },
+        ));
+        assert!(!authorization_component_totals_match(
+            &inputs,
+            &VerifiedAuthorizationBatch {
+                user_tx_count: 1,
+                live_input_count_total,
+            },
+        ));
+        assert!(!authorization_component_totals_match(
+            &inputs,
+            &VerifiedAuthorizationBatch {
+                user_tx_count: 2,
+                live_input_count_total: 2,
+            },
+        ));
     }
 
     #[test]

@@ -45,7 +45,6 @@ pub mod fee_arithmetic;
 pub mod fri_pcs;
 pub mod matrix_fold;
 pub mod merkle_path;
-pub mod owner_auth;
 pub mod paired_merkle_update;
 pub mod permutation_network;
 pub mod public_arithmetic;

@@ -28,19 +28,17 @@ use noid_ivc_core::public_io::{PublicIoSpec, WitnessSlice};
 use noid_ivc_core::verifier::{verify_field_with_public_io_and_post_commit_context, VerifyError};
 use noid_ivc_prover::field_prover::prove_field_with_public_io_and_post_commit_context;
 
-use super::block_slots::{build_block_slots_selected_zk, SelectedZkBlockSlotsAssembly};
-use super::block_slots::{build_block_slots_with_config, BlockSlots, BlockSlotsConfig};
+use super::block_slots::{build_block_slots_selected_zk, BlockSlots, SelectedZkBlockSlotsAssembly};
 use super::link::{block_acc_lanes, LinkBlock, ACC_LANES};
 use super::link::{
     SelectedZkB255BlockInput, SelectedZkB32BlockInput, SelectedZkB64BlockInput,
     SelectedZkB8BlockInput, SelectedZkBlockInput,
 };
 use super::trace::pin_eq;
-use super::trace::region_source_binding::RegionDischargeParams;
 use crate::region_sidecar::{
     block_post_commit_class_digest, verify_block_region_sidecar_post_commit,
     BlockRegionPreparation, BlockRegionSidecarProof, BlockRegionSidecarVk, RegionSidecarError,
-    BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION, BLOCK_REGION_SIDECAR_VERSION,
+    BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION,
 };
 
 /// Fixed public-IO offsets of every production block class.
@@ -83,21 +81,13 @@ pub fn block_io_spec() -> PublicIoSpec {
 pub struct BlockClass {
     tier: usize,
     pub shape: FieldShape,
-    /// Kept public while the transitional split-link reads the matrix-class
-    /// constant.  It is populated during `freeze`, never by a later proof.
+    /// Kept public while split-Link reads the matrix-class constant.  It is
+    /// populated during canonical selected-ZK freeze, never by a later proof.
     pub class_statement_digest: OnceLock<[u8; 32]>,
     pub pcs_params: PcsParams,
     pub spec: PublicIoSpec,
-    config_template: BlockSlotsConfig,
     sidecar_vk: Arc<BlockRegionSidecarVk>,
     post_commit_class_digest: [u8; 32],
-    authorization_backend: BlockClassAuthorizationBackend,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BlockClassAuthorizationBackend {
-    Legacy,
-    SelectedZk,
 }
 
 impl BlockClass {
@@ -128,15 +118,8 @@ impl BlockClass {
             class_statement_digest,
             pcs_params,
             spec,
-            config_template: production_config(
-                RegionDischargeParams {
-                    nq: noid_fri_binius::capsule::CAPSULE_NUM_QUERIES,
-                },
-                tier,
-            ),
             sidecar_vk: Arc::new(sidecar_vk),
             post_commit_class_digest,
-            authorization_backend: BlockClassAuthorizationBackend::SelectedZk,
         };
         class.validate_selected_zk_identity_for_tier(tier)?;
         Ok(class)
@@ -146,61 +129,9 @@ impl BlockClass {
         self.matrix_digest()
     }
 
-    /// Freeze both halves of the class from one tier-valid sample: the exact
-    /// matrix and the exact ordered six-child sidecar VK.  Since the region
-    /// discharge no longer contributes proof-shaped rows or public IO, this is
-    /// a real production build rather than the former native-claim probe.
-    pub fn freeze(
-        shape: FieldShape,
-        pcs_params: PcsParams,
-        region_params: RegionDischargeParams,
-        sample: &LinkBlock<'_>,
-        tier: usize,
-    ) -> Self {
-        assert!(
-            !noid_chain::consensus::params::USER_TX_CLASS_TIERS.contains(&tier),
-            "production tier authoring requires freeze_selected_zk"
-        );
-        assert_eq!(
-            region_params.nq,
-            noid_fri_binius::capsule::CAPSULE_NUM_QUERIES,
-            "production block class requires the full capsule query count"
-        );
-        assert_eq!(
-            pcs_params.m,
-            shape.m + LOG_PACKING,
-            "block class PCS m must match its Field witness shape"
-        );
-        let config_template = production_config(region_params, tier);
-        let spec = block_io_spec();
-        let io = accumulator_io(sample);
-        let (r1cs, _witness, preparation) =
-            build_block_trace_parts(shape, sample, config_template, &spec, &io, tier, None);
-        let matrix_digest = r1cs.statement_digest();
-        let sidecar_vk = Arc::new(preparation.vk().clone());
-        let post_commit_class_digest =
-            block_post_commit_class_digest(&matrix_digest, &spec, &pcs_params, &sidecar_vk);
-        let class_statement_digest = OnceLock::new();
-        class_statement_digest
-            .set(matrix_digest)
-            .expect("fresh block class matrix digest lock");
-
-        Self {
-            tier,
-            shape,
-            class_statement_digest,
-            pcs_params,
-            spec,
-            config_template,
-            sidecar_vk,
-            post_commit_class_digest,
-            authorization_backend: BlockClassAuthorizationBackend::Legacy,
-        }
-    }
-
     /// Freeze one canonical production selected-ZK relation from a consuming
     /// class-typed sample. The resulting identity commits both its exact
-    /// matrix and V4 six-child sidecar key; no legacy owner-auth relation can
+    /// matrix and V4 six-child sidecar key; no transparent relation can
     /// reproduce either identity.
     pub fn freeze_selected_zk<const TIER: usize>(
         pcs_params: PcsParams,
@@ -227,20 +158,14 @@ impl BlockClass {
         class_statement_digest
             .set(matrix_digest)
             .expect("fresh selected matrix digest lock");
-        let region_params = RegionDischargeParams {
-            nq: noid_fri_binius::capsule::CAPSULE_NUM_QUERIES,
-        };
-
         Self {
             tier: TIER,
             shape,
             class_statement_digest,
             pcs_params,
             spec,
-            config_template: production_config(region_params, TIER),
             sidecar_vk,
             post_commit_class_digest,
-            authorization_backend: BlockClassAuthorizationBackend::SelectedZk,
         }
     }
 
@@ -290,7 +215,7 @@ impl BlockClass {
     ///
     /// This is the public coordinator boundary: callers can validate a cached
     /// class before allocating an m22/m23/m24 witness, rather than reaching an
-    /// assertion inside the consuming trace builder with a legacy class.
+    /// assertion inside the consuming trace builder with a wrong class.
     pub fn validate_selected_zk_identity_for_tier(
         &self,
         expected_tier: usize,
@@ -300,9 +225,6 @@ impl BlockClass {
                 expected: expected_tier,
                 actual: self.tier,
             });
-        }
-        if self.authorization_backend != BlockClassAuthorizationBackend::SelectedZk {
-            return Err(BlockProofError::LegacyAuthorizationBackend);
         }
         self.validate_frozen_identity().map(|_| ())
     }
@@ -326,18 +248,9 @@ impl BlockClass {
         let matrix_digest = self.matrix_digest()?;
         if !is_production_block_io_spec(&self.spec)
             || self.shape.m.checked_add(LOG_PACKING) != Some(self.pcs_params.m)
-            || !is_production_config(&self.config_template, self.tier)
-            || match self.authorization_backend {
-                BlockClassAuthorizationBackend::Legacy => {
-                    self.tier == noid_chain::consensus::params::BLOCK_MAX_USER_TXS
-                        || self.sidecar_vk.version() != BLOCK_REGION_SIDECAR_VERSION
-                }
-                BlockClassAuthorizationBackend::SelectedZk => {
-                    crate::region_sidecar::selected_zk_block_geometry(self.tier).is_none()
-                        || self.shape != selected_zk_shape(self.tier)
-                        || self.sidecar_vk.version() != BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION
-                }
-            }
+            || crate::region_sidecar::selected_zk_block_geometry(self.tier).is_none()
+            || self.shape != selected_zk_shape(self.tier)
+            || self.sidecar_vk.version() != BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION
         {
             return Err(BlockProofError::ClassIdentityMismatch);
         }
@@ -462,24 +375,10 @@ fn assert_selected_zk_inputs(block: &LinkBlock<'_>, tier: usize) {
     assert_eq!(shape.m, shape.k_log, "selected Block square shape");
     assert_eq!(shape.k_skip, 6, "selected Block k-skip drift");
     assert_eq!(shape.const_pin, Some(0), "selected Block const pin drift");
-    let config = block.config;
-    assert!(
-        config.discharge_wallet_pcs
-            && config.owner_auth_region
-            && config.exact_state_region
-            && config.tx_root_region
-            && config.spine_region,
-        "selected Block requires the complete canonical region stack"
-    );
     assert_eq!(
-        config.tier_user_tx_capacity,
+        noid_chain::consensus::params::user_tx_class_tier(block.inputs.authorization_inputs.len()),
         Some(tier),
-        "selected production backend tier mismatch"
-    );
-    assert_eq!(
-        config.wallet_pcs_params.nq,
-        noid_fri_binius::capsule::CAPSULE_NUM_QUERIES,
-        "selected production backend requires every capsule query"
+        "selected production input tier mismatch"
     );
 }
 
@@ -498,7 +397,7 @@ fn assemble_selected_zk<const TIER: usize>(
         block.end_accumulator,
         block.inputs,
         block.proof,
-        block.config,
+        TIER,
         authorization,
     );
     pin_block_io_cells(&mut builder, assembly.slots(), &io_cells);
@@ -589,54 +488,14 @@ pub fn build_selected_zk_b255_measurement_witness_only(
     }
 }
 
-/// Assemble a block instance and require bit-exact reproduction of both the
-/// frozen matrix and the frozen sidecar VK.
-pub fn build_block_proof_trace(class: &BlockClass, block: &LinkBlock<'_>) -> BuiltBlock {
-    assert_eq!(
-        class.authorization_backend,
-        BlockClassAuthorizationBackend::Legacy,
-        "selected class requires build_selected_zk_block_proof_trace"
-    );
-    let matrix_digest = class
-        .validate_frozen_identity()
-        .expect("production BlockClass must remain freeze-locked");
-    let io = accumulator_io(block);
-    let (r1cs, witness, region_preparation) = build_block_trace_parts(
-        class.shape,
-        block,
-        class.config_template,
-        &class.spec,
-        &io,
-        class.tier,
-        Some(class.sidecar_vk()),
-    );
-    let actual_digest = r1cs.statement_digest();
-    assert_eq!(
-        actual_digest, matrix_digest,
-        "same-tier block matrix drifted from the frozen class"
-    );
-    r1cs.seed_statement_digest(matrix_digest);
-    BuiltBlock {
-        r1cs,
-        witness,
-        io,
-        region_preparation,
-    }
-}
-
 /// Assemble one production selected witness against a class frozen by
 /// [`BlockClass::freeze_selected_zk`]. The consuming input makes the
 /// exact live proof set plus the canonical ghost proof mandatory, while the
-/// frozen matrix and V4 key checks reject any fallback to legacy authoring.
+/// frozen matrix and V4 key checks reject any alternate authoring relation.
 pub fn build_selected_zk_block_proof_trace<const TIER: usize>(
     class: &BlockClass,
     input: SelectedZkBlockInput<'_, TIER>,
 ) -> BuiltBlock {
-    assert_eq!(
-        class.authorization_backend,
-        BlockClassAuthorizationBackend::SelectedZk,
-        "selected build requires a selected-ZK class"
-    );
     assert_eq!(class.tier, TIER, "selected input/class tier mismatch");
     let matrix_digest = class
         .validate_frozen_identity()
@@ -715,7 +574,6 @@ impl BlockProofEnvelope {
 pub enum BlockProofError {
     UnfrozenClass,
     TierMismatch { expected: usize, actual: usize },
-    LegacyAuthorizationBackend,
     ClassIdentityMismatch,
     MatrixMismatch,
     SidecarVkMismatch,
@@ -733,12 +591,6 @@ impl std::fmt::Display for BlockProofError {
                 write!(
                     f,
                     "selected block class B{actual} occupies B{expected} registry slot"
-                )
-            }
-            Self::LegacyAuthorizationBackend => {
-                write!(
-                    f,
-                    "legacy authorization backend is not production-authorable"
                 )
             }
             Self::ClassIdentityMismatch => write!(f, "block post-commit class identity drift"),
@@ -842,28 +694,6 @@ pub fn verify_block_proof<Ch: Challenger>(
     .map_err(BlockProofError::Field)
 }
 
-fn production_config(region_params: RegionDischargeParams, tier: usize) -> BlockSlotsConfig {
-    BlockSlotsConfig {
-        discharge_wallet_pcs: true,
-        wallet_pcs_params: region_params,
-        owner_auth_region: true,
-        exact_state_region: true,
-        tx_root_region: true,
-        spine_region: true,
-        tier_user_tx_capacity: Some(tier),
-    }
-}
-
-fn is_production_config(config: &BlockSlotsConfig, tier: usize) -> bool {
-    config.discharge_wallet_pcs
-        && config.owner_auth_region
-        && config.exact_state_region
-        && config.tx_root_region
-        && config.spine_region
-        && config.tier_user_tx_capacity == Some(tier)
-        && config.wallet_pcs_params.nq == noid_fri_binius::capsule::CAPSULE_NUM_QUERIES
-}
-
 pub(in crate::acceptance) fn accumulator_io(block: &LinkBlock<'_>) -> Vec<F128> {
     let layout = block_io_layout();
     let mut io = vec![F128::ZERO; layout.len];
@@ -914,75 +744,6 @@ pub(in crate::acceptance) fn pin_block_io_cells(
     for (index, wire) in slots.end_acc.ordered_lanes().iter().enumerate() {
         pin_eq(b, wire, &io_cells[layout.end_acc + index]);
     }
-}
-
-/// Shared production assembly.  There is no freeze mode, native region probe,
-/// `RegionPcsClaim`, or claim-tail pinning: every call builds the exact class
-/// relation and returns the mandatory post-commit preparation.
-fn build_block_trace_parts(
-    shape: FieldShape,
-    block: &LinkBlock<'_>,
-    config: BlockSlotsConfig,
-    spec: &PublicIoSpec,
-    io_vals: &[F128],
-    tier: usize,
-    expected_vk: Option<&BlockRegionSidecarVk>,
-) -> (FieldR1cs, Vec<F128>, BlockRegionPreparation) {
-    assert!(
-        is_production_block_io_spec(spec),
-        "production block IO spec drift"
-    );
-    assert_eq!(io_vals.len(), BLOCK_IO_LEN, "production block IO length");
-    let mut b = FieldR1csBuilder::new();
-    let mut ledger = 0usize;
-
-    let io_cells = allocate_block_io_cells(&mut b, spec, io_vals);
-    crate::acceptance::row_ledger_mark(&b, &mut ledger, "block: IO cells");
-
-    let mut slots = build_block_slots_with_config(
-        &mut b,
-        block.start_accumulator,
-        block.end_accumulator,
-        block.inputs,
-        block.proof,
-        config,
-    );
-    assert!(
-        slots.pending_wallet_pcs.is_empty(),
-        "production block cannot export a RegionPcsClaim tail"
-    );
-    let preparation = slots
-        .region_preparation
-        .take()
-        .expect("production block must return six-region preparation");
-    if let Some(expected) = expected_vk {
-        assert_eq!(
-            preparation.vk(),
-            expected,
-            "same-tier block sidecar VK drifted from the frozen class"
-        );
-    }
-    crate::acceptance::row_ledger_mark(&b, &mut ledger, "block: slots total");
-
-    pin_block_io_cells(&mut b, &slots, &io_cells);
-    crate::acceptance::row_ledger_mark(&b, &mut ledger, "block: IO pins");
-
-    let used = b.num_wires();
-    eprintln!("[block-class] build: {used} wires (tier {tier})");
-    let target = 1usize << shape.m;
-    assert!(
-        used <= target,
-        "block trace outgrew the class: {used} > {target}"
-    );
-    let (r1cs, witness) = b.build();
-    let (r1cs, witness) = expand_empty_field_tail(r1cs, witness, shape);
-    assert_eq!(
-        FieldShape::of(&r1cs),
-        shape,
-        "block class shape after padding"
-    );
-    assert_eq!(r1cs.useful_rows, used, "block useful-row accounting");
-    (r1cs, witness, preparation)
 }
 
 /// Expand the builder's natural dyadic matrix to the protocol class without
@@ -1103,22 +864,6 @@ mod tests {
         mutated = canonical.clone();
         mutated.profile = LigeritoProfile::Secure;
         assert!(!same_pcs_params(&canonical, &mutated));
-    }
-
-    #[test]
-    fn production_config_metadata_is_tier_and_query_locked() {
-        let params = RegionDischargeParams {
-            nq: noid_fri_binius::capsule::CAPSULE_NUM_QUERIES,
-        };
-        let mut config = production_config(params, 8);
-        assert!(is_production_config(&config, 8));
-        assert!(!is_production_config(&config, 32));
-
-        config.owner_auth_region = false;
-        assert!(!is_production_config(&config, 8));
-        config = production_config(params, 8);
-        config.wallet_pcs_params.nq -= 1;
-        assert!(!is_production_config(&config, 8));
     }
 
     #[test]

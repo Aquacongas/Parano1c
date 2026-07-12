@@ -2,9 +2,9 @@
 //! family in ONE trace, the leaf digest WIRED into the path entry, all
 //! discharged through ONE outer PCS via public-IO.
 //!
-//! This is the decisive multi-family composition — the structural core of
-//! `discharge_auth_pcs_obligation_via_region`. Two real wallet-PCS families
-//! live as separate witness slices in the SAME FieldR1csBuilder; both claim
+//! This is the generic multi-family composition used by the selected region
+//! protocols. Two real region families live as separate witness slices in the
+//! SAME FieldR1csBuilder; both claim
 //! DAGs are replayed by the in-trace twins; the source-leaf digest (C0/C1 at
 //! its digest slot) and the Merkle entry (E0/E1 at the path's entry slot) are
 //! pinned to the SAME io lanes, so a single opening value binds them — the
