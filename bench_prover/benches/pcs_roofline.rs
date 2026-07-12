@@ -287,7 +287,7 @@ fn run_case(logical_m: usize) {
         "  FRI             : log_dim={}, arities={:?}, queries={}",
         params.log_dim(),
         params.fri_arities(),
-        pcs::default_fri_queries(params.log_inv_rate),
+        pcs::default_fri_queries(params.log_dim(), params.log_inv_rate),
     );
     println!("  witness bytes   : {}", fmt_bytes(witness_bytes));
     println!(

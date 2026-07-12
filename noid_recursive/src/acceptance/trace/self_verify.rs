@@ -988,7 +988,7 @@ impl BaseFoldProofTrace {
         // soundness parameter, not a prover choice.
         assert_eq!(
             native.queries.len(),
-            default_fri_queries(params.log_inv_rate),
+            default_fri_queries(params.log_dim(), params.log_inv_rate),
             "query count off shape"
         );
         assert_eq!(

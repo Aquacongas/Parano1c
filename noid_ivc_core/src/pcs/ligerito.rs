@@ -704,7 +704,7 @@ fn paper_per_query_bits(log_inv_rate: usize, eta: f64) -> f64 {
 /// (`proximity_loss`) optional extra slack below the maximum (`0` in shipped
 /// configs → exactly the maximal radius). The `3/(δ·n)` backoff is the
 /// theorem-mandated minimum and shrinks with the codeword length.
-fn udr_gamma(log_inv_rate: usize, log_msg_cols: usize, proximity_loss: f64) -> f64 {
+pub(crate) fn udr_gamma(log_inv_rate: usize, log_msg_cols: usize, proximity_loss: f64) -> f64 {
     let rho = (-(log_inv_rate as f64)).exp2();
     let delta = 1.0 - rho;
     let n = ((log_msg_cols + log_inv_rate) as f64).exp2();
@@ -713,7 +713,11 @@ fn udr_gamma(log_inv_rate: usize, log_msg_cols: usize, proximity_loss: f64) -> f
 
 /// Per-query log₂(1/(1−γ)) under the UDR regime at the maximal radius
 /// `γ = δ/2 − 3/(δ·n) − ε*` (see [`udr_gamma`]).
-fn udr_per_query_bits(log_inv_rate: usize, log_msg_cols: usize, proximity_loss: f64) -> f64 {
+pub(crate) fn udr_per_query_bits(
+    log_inv_rate: usize,
+    log_msg_cols: usize,
+    proximity_loss: f64,
+) -> f64 {
     let gamma = udr_gamma(log_inv_rate, log_msg_cols, proximity_loss);
     (1.0 / (1.0 - gamma)).log2()
 }
@@ -747,7 +751,11 @@ fn udr_per_query_bits_asymptotic(log_inv_rate: usize) -> f64 {
 /// ε directly, unlike the Johnson regime's `2^{ℓ-1}` factor. This replaced an
 /// earlier length-independent `a ≤ 2/ε*` form, which did not match the paper's
 /// stated bound.
-fn paper_thm_1_4_log_a(log_inv_rate: usize, log_msg_cols: usize, proximity_loss: f64) -> f64 {
+pub(crate) fn paper_thm_1_4_log_a(
+    log_inv_rate: usize,
+    log_msg_cols: usize,
+    proximity_loss: f64,
+) -> f64 {
     let gamma = udr_gamma(log_inv_rate, log_msg_cols, proximity_loss);
     let n = ((log_msg_cols + log_inv_rate) as f64).exp2();
     (gamma * n + 1.0).log2()

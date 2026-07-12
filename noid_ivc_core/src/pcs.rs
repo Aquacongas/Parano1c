@@ -28,8 +28,9 @@ pub mod ring_switch;
 pub mod tensor_algebra;
 
 pub use basefold::{
-    BaseFoldProof, DEFAULT_FRI_QUERIES, PLAINTEXT_TAIL_MAX_F128, QUERY_GRIND_BITS, RoundCommitment,
-    RoundMessage, default_fri_queries, fri_commit_layout, sample_query_positions,
+    BASEFOLD_UDR_TARGET_BITS, BaseFoldProof, BaseFoldUdrConfigError, BaseFoldUdrConfiguration,
+    DEFAULT_FRI_QUERIES, PLAINTEXT_TAIL_MAX_F128, QUERY_GRIND_BITS, RoundCommitment, RoundMessage,
+    checked_fri_configuration, default_fri_queries, fri_commit_layout, sample_query_positions,
 };
 pub use commit::{
     Commitment, LOG_FRI_ARITY, PcsParams, ProverData, commit, commit_into, compute_fri_arities,
@@ -244,7 +245,7 @@ pub fn open_batch_quirky_direct<Ch: Challenger>(
         &ntt,
         commitment.params.log_inv_rate,
         commitment.params.log_batch_size,
-        default_fri_queries(commitment.params.log_inv_rate),
+        default_fri_queries(commitment.params.log_dim(), commitment.params.log_inv_rate),
         challenger,
     )
 }
@@ -344,7 +345,7 @@ pub fn open<Ch: Challenger>(
         &ntt,
         commitment.params.log_inv_rate,
         commitment.params.log_batch_size,
-        default_fri_queries(commitment.params.log_inv_rate),
+        default_fri_queries(commitment.params.log_dim(), commitment.params.log_inv_rate),
         challenger,
     );
     OpeningProof {
@@ -506,7 +507,7 @@ pub fn open_batch_mixed_with_precomputed_s_hat_v<Ch: Challenger>(
         &ntt,
         commitment.params.log_inv_rate,
         commitment.params.log_batch_size,
-        default_fri_queries(commitment.params.log_inv_rate),
+        default_fri_queries(commitment.params.log_dim(), commitment.params.log_inv_rate),
         Some(combined.round0_prime),
         challenger,
     );
@@ -1340,7 +1341,10 @@ mod tests {
     fn default_params(m: usize) -> PcsParams {
         PcsParams {
             m,
-            log_inv_rate: 1,
+            // Tiny algebra/codec fixtures still enter the same fail-closed
+            // finite-length BaseFold configuration path. Rate 1/32 keeps
+            // their smallest n=32 domain inside the reviewed UDR range.
+            log_inv_rate: 5,
             log_batch_size: 1,
             profile: Default::default(),
         }

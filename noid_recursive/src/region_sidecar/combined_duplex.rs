@@ -1939,7 +1939,7 @@ pub(in crate::region_sidecar) mod tests {
     #[test]
     fn combined_descriptor_preflight_is_checked_and_bounded() {
         assert_eq!(
-            (2 * noid_ivc_core::pcs::basefold::default_fri_queries(1))
+            (2 * noid_ivc_core::pcs::basefold::default_fri_queries(17, 1))
                 .next_power_of_two()
                 .trailing_zeros() as usize,
             MAX_COMBINED_DUPLEX_TX_TILE_LOG,

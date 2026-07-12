@@ -140,8 +140,14 @@ impl RPcsLinkUniversalGeometry {
             return Err(RegionSidecarError::BadVk);
         }
         let query_count_matches = |params: &PcsParams| {
-            (1..=5).contains(&params.log_inv_rate)
-                && pcs::default_fri_queries(params.log_inv_rate) == n_queries
+            let Some(log_msg_len) = params.m.checked_sub(pcs::LOG_PACKING) else {
+                return false;
+            };
+            let Some(log_dim) = log_msg_len.checked_sub(params.log_batch_size) else {
+                return false;
+            };
+            pcs::checked_fri_configuration(log_dim, params.log_inv_rate)
+                .is_ok_and(|config| config.query_count == n_queries)
         };
         if !query_count_matches(link_params)
             || block_params
@@ -838,7 +844,7 @@ pub(crate) fn canonical_selected_link_region_sidecar_vk(
     if !(1..=5).contains(&link_params.log_inv_rate) {
         return Err(RegionSidecarError::UnsupportedVkShape);
     }
-    let n_queries = pcs::default_fri_queries(link_params.log_inv_rate);
+    let n_queries = pcs::default_fri_queries(link_params.log_dim(), link_params.log_inv_rate);
     let geometry = RPcsLinkUniversalGeometry::new(link_params, block_params, n_queries)?;
 
     let leaf = CombinedDuplexRegionVk::new(
@@ -1806,8 +1812,11 @@ mod tests {
                 digest,
             )
         };
-        let (shape0, params0, spec0, io0, proof0, com0, dig0) = mk(10, 0xA11CE);
-        let (shape1, params1, spec1, io1, proof1, com1, dig1) = mk(11, 0xB0B);
+        // m=11/m=12 are different shapes that share the domain-derived
+        // 125-query count; the shared-walk assembly requires equal counts,
+        // exactly like the production m22..m24 ladder.
+        let (shape0, params0, spec0, io0, proof0, com0, dig0) = mk(11, 0xA11CE);
+        let (shape1, params1, spec1, io1, proof1, com1, dig1) = mk(12, 0xB0B);
 
         let mut b = FieldR1csBuilder::new();
         let run = |b: &mut FieldR1csBuilder,
@@ -1937,14 +1946,14 @@ mod tests {
 
     #[test]
     fn recording_free_link_descriptor_covers_two_rate_half_proofs() {
-        let n_queries = noid_ivc_core::pcs::basefold::default_fri_queries(1);
-        assert_eq!(n_queries, 204);
         let params = PcsParams {
             m: 24 + LOG_PACKING,
             log_inv_rate: 1,
             log_batch_size: 6,
             profile: Default::default(),
         };
+        let n_queries = noid_ivc_core::pcs::basefold::default_fri_queries(params.log_dim(), 1);
+        assert_eq!(n_queries, 204);
         let geometry =
             RPcsLinkUniversalGeometry::new(&params, std::slice::from_ref(&params), n_queries)
                 .expect("rate-1/2 proof groups share a leaf signature");
@@ -1972,7 +1981,7 @@ mod tests {
         // Canonical capacity slots may share a Field shape; they select only
         // role/tile data under one four-position carrier topology.
         let blocks = [params(22), params(23), params(23), params(24)];
-        let n_queries = pcs::default_fri_queries(link.log_inv_rate);
+        let n_queries = pcs::default_fri_queries(link.log_dim(), link.log_inv_rate);
         let geometry = RPcsLinkUniversalGeometry::new(&link, &blocks, n_queries)
             .expect("canonical ladder has one leaf signature");
         assert_eq!(geometry.group_count(), 5);
@@ -2071,7 +2080,7 @@ mod tests {
         };
         let link_params = params(24);
         let block_params = [params(22), params(23), params(23), params(24)];
-        let n_queries = pcs::default_fri_queries(link_params.log_inv_rate);
+        let n_queries = pcs::default_fri_queries(link_params.log_dim(), link_params.log_inv_rate);
         let geometry =
             RPcsLinkUniversalGeometry::new(&link_params, &block_params, n_queries).unwrap();
         let (link_proof, link_root) = mock_basefold_geometry(&link_params, n_queries);
@@ -2122,7 +2131,7 @@ mod tests {
             log_batch_size: 5,
             profile: Default::default(),
         };
-        let n_queries = pcs::default_fri_queries(1);
+        let n_queries = pcs::default_fri_queries(valid.log_dim(), 1);
         let malformed = [
             PcsParams {
                 m: LOG_PACKING - 1,

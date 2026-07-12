@@ -84,7 +84,7 @@ fn measure(label: &str, r1cs: &FieldR1cs, z: &[F128], lir: usize, lb: usize) {
 
     println!(
         "{label}: m=2^{m} lir={lir} lb={lb} (queries {q}) → [R] rows = {rows_total} (2^{log:.1})",
-        q = pcs::default_fri_queries(lir),
+        q = pcs::default_fri_queries(params.log_dim(), lir),
         log = (rows_total as f64).log2(),
     );
     println!(

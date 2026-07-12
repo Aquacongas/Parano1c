@@ -74,18 +74,24 @@ use serde::{Deserialize, Serialize};
 /// prover's grind under ~0.5 s single-threaded.
 pub const QUERY_GRIND_BITS: u32 = 16;
 
-/// Default FRI query count at **rate 1/2** (= `log_inv_rate = 1`). 204
-/// queries give `100 − QUERY_GRIND_BITS = 84` bits of provable soundness in
-/// the **unique-decoding regime** (UDR); the grinding contributes the
-/// remaining 16 to the 100-bit query-phase target. See
-/// [`default_fri_queries`] for the rate-aware lookup used by
-/// [`super::open`] / [`super::open_batch_padded`].
+/// Historical query-count floor at **rate 1/2** (`log_inv_rate = 1`). The
+/// active count is derived by [`checked_fri_configuration`] from both the
+/// rate and the actual codeword length, and is never allowed below this
+/// floor. Keeping the floor avoids silently weakening an already-published
+/// configuration when the finite-length calculation happens to round down.
 ///
-/// Within distance `γ = (1−ρ)/2 − ε*` of the RS code (strictly inside the
-/// unique decoding radius, with proximity loss `ε* = 10⁻³` so BCHKS25
-/// Theorem 1.4 covers the folding steps), the prover is consistent with
-/// **at most one** codeword — no list, no union bound, no OOD step. Each
-/// query catches a γ-far prover with probability ≥ γ:
+/// For an RS word of length `n`, rate `rho`, and relative distance
+/// `delta = 1-rho`, the finite UDR radius used here is
+///
+/// ```text
+/// gamma(n,rho) = delta/2 - 3/(delta*n).
+/// ```
+///
+/// This is the same corrected finite-length radius used by Ligerito's UDR
+/// ledger. The configuration check enforces the theorem range
+/// `delta/3 <= gamma`, not merely `gamma > 0`. Within that radius the prover
+/// is consistent with at most one codeword, and each query catches a
+/// `gamma`-far prover with probability at least `gamma`:
 ///
 /// ```text
 /// soundness error ≤ 2^−QUERY_GRIND_BITS · (1 − γ)^t
@@ -97,34 +103,123 @@ pub const QUERY_GRIND_BITS: u32 = 16;
 /// t · (−log₂(1 − γ)) ≥ 100 − QUERY_GRIND_BITS.
 /// ```
 ///
-/// The fold-consistency (proximity-gap) term is `a ≤ 2/ε*` by Theorem 1.4,
-/// independent of codeword length, so over F128 it sits ≥ 115 bits below the
-/// challenge space and needs no grinding. Matches ligerito's `udr_queries` /
-/// `UDR_PROXIMITY_LOSS` derivation.
+/// The fold-consistency exceptional-set factor is
+/// `a = gamma(n,rho)*n + 1`, so its error is `a/2^128`: it is explicitly
+/// length-dependent and loses about one bit whenever `n` doubles.
+/// [`checked_fri_configuration`] rejects a domain/rate whose proximity term
+/// falls below the 100-bit BaseFold target. BaseFold has no fold-challenge
+/// grind with which to repair such a domain.
 pub const DEFAULT_FRI_QUERIES: usize = 204;
 
-/// FRI query count required for the 100-bit query-phase target at the given
-/// `log_inv_rate` — [`QUERY_GRIND_BITS`] of it from transcript grinding,
-/// the rest from queries in the unique-decoding regime documented on
-/// [`DEFAULT_FRI_QUERIES`]. Slimmer codes (larger `log_inv_rate`) have
-/// larger γ, so each query closes more soundness — but per-query soundness
-/// saturates below 1 bit (γ < 1/2 always), unlike the Johnson regime where
-/// it grows without bound as the rate drops.
+/// BaseFold's published classical query/proximity target. This is separate
+/// from the authorization capsule's QROM diagnostic.
+pub const BASEFOLD_UDR_TARGET_BITS: u32 = 100;
+
+const BASEFOLD_MAX_PUBLISHED_LOG_INV_RATE: usize = 5;
+const BASEFOLD_QUERY_FLOORS: [usize; BASEFOLD_MAX_PUBLISHED_LOG_INV_RATE] =
+    [DEFAULT_FRI_QUERIES, 125, 102, 93, 89];
+
+/// Reviewed finite-length UDR configuration for one actual BaseFold domain.
+/// `log_domain_len = log_msg_cols + log_inv_rate` and therefore identifies
+/// the RS codeword length, not the total interleaved witness length.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BaseFoldUdrConfiguration {
+    pub log_msg_cols: usize,
+    pub log_inv_rate: usize,
+    pub log_domain_len: usize,
+    pub domain_len: usize,
+    pub relative_distance: f64,
+    pub proximity_radius: f64,
+    pub per_query_bits: f64,
+    pub query_count: usize,
+    pub query_term_bits: f64,
+    pub proximity_term_bits: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BaseFoldUdrConfigError {
+    UnsupportedInverseRate,
+    DomainLengthOverflow,
+    FiniteLengthTheoremPrecondition,
+    ProximityTargetNotMet,
+}
+
+/// Derive and validate the exact domain/rate-dependent BaseFold UDR ledger.
 ///
-/// Panics on unsupported rates so we notice if a new rate is added without
-/// updating the table.
-pub fn default_fri_queries(log_inv_rate: usize) -> usize {
-    match log_inv_rate {
-        1 => DEFAULT_FRI_QUERIES, // rate 1/2: γ ≈ 0.249, ~0.413 bits/query
-        2 => 125,                 // rate 1/4: γ ≈ 0.374, ~0.676 bits/query
-        3 => 102,                 // rate 1/8: γ ≈ 0.436, ~0.828 bits/query
-        4 => 93,                  // rate 1/16: γ ≈ 0.468, ~0.910 bits/query
-        5 => 89,                  // rate 1/32: γ ≈ 0.483, ~0.953 bits/query
-        _ => panic!(
-            "default_fri_queries: unsupported log_inv_rate {log_inv_rate} \
-             — add a soundness-derived entry to the table"
-        ),
+/// The integer precondition is `delta^2*n >= 18`, which is equivalent to the
+/// required lower endpoint `gamma >= delta/3` for the selected maximal
+/// finite radius. Query counts are the minimum needed for the remaining
+/// `100-QUERY_GRIND_BITS` query bits, clamped to the already-published
+/// rate-specific floors. The grind is a classical BaseFold transcript cost;
+/// this function makes no QROM claim and is not used by the auth capsule.
+pub fn checked_fri_configuration(
+    log_msg_cols: usize,
+    log_inv_rate: usize,
+) -> Result<BaseFoldUdrConfiguration, BaseFoldUdrConfigError> {
+    if !(1..=BASEFOLD_MAX_PUBLISHED_LOG_INV_RATE).contains(&log_inv_rate) {
+        return Err(BaseFoldUdrConfigError::UnsupportedInverseRate);
     }
+    let log_domain_len = log_msg_cols
+        .checked_add(log_inv_rate)
+        .ok_or(BaseFoldUdrConfigError::DomainLengthOverflow)?;
+    if log_domain_len >= usize::BITS as usize {
+        return Err(BaseFoldUdrConfigError::DomainLengthOverflow);
+    }
+    let domain_len = 1usize << log_domain_len;
+
+    // delta=(R-1)/R. Check delta^2*n >= 18 without floating-point
+    // comparison; all supported R and platform-sized n fit comfortably in
+    // u128.
+    let inverse_rate = 1u128 << log_inv_rate;
+    let distance_numerator = inverse_rate - 1;
+    let n = domain_len as u128;
+    if distance_numerator * distance_numerator * n < 18 * inverse_rate * inverse_rate {
+        return Err(BaseFoldUdrConfigError::FiniteLengthTheoremPrecondition);
+    }
+
+    let relative_distance = distance_numerator as f64 / inverse_rate as f64;
+    let proximity_radius = relative_distance / 2.0 - 3.0 / (relative_distance * domain_len as f64);
+    let per_query_bits = -(1.0 - proximity_radius).log2();
+    let query_bits_needed = BASEFOLD_UDR_TARGET_BITS.saturating_sub(QUERY_GRIND_BITS) as f64;
+    let derived_query_count = (query_bits_needed / per_query_bits).ceil() as usize;
+    let query_count = derived_query_count.max(BASEFOLD_QUERY_FLOORS[log_inv_rate - 1]);
+    let query_term_bits = query_count as f64 * per_query_bits + QUERY_GRIND_BITS as f64;
+
+    // Corrected UDR exceptional-set factor, shared algebraically with the
+    // Ligerito analysis: a=gamma*n+1 and eps_pg=128-log2(a).
+    let proximity_term_bits = 128.0 - (proximity_radius * domain_len as f64 + 1.0).log2();
+    if proximity_term_bits + 1e-9 < BASEFOLD_UDR_TARGET_BITS as f64 {
+        return Err(BaseFoldUdrConfigError::ProximityTargetNotMet);
+    }
+    debug_assert!(query_term_bits + 1e-9 >= BASEFOLD_UDR_TARGET_BITS as f64);
+
+    Ok(BaseFoldUdrConfiguration {
+        log_msg_cols,
+        log_inv_rate,
+        log_domain_len,
+        domain_len,
+        relative_distance,
+        proximity_radius,
+        per_query_bits,
+        query_count,
+        query_term_bits,
+        proximity_term_bits,
+    })
+}
+
+/// Fail-closed query count for one actual BaseFold message domain and rate.
+/// New rates or domains outside the reviewed finite-length envelope panic at
+/// configuration construction rather than silently inheriting a rate-only
+/// count.
+pub fn default_fri_queries(log_msg_cols: usize, log_inv_rate: usize) -> usize {
+    checked_fri_configuration(log_msg_cols, log_inv_rate)
+        .unwrap_or_else(|error| {
+            panic!(
+                "unsupported BaseFold UDR configuration: log_msg_cols={log_msg_cols}, \
+                 log_inv_rate={log_inv_rate}, error={error:?}"
+            )
+        })
+        .query_count
 }
 
 /// FRI layers of at most this many F_{2^128} elements are sent PLAINTEXT
@@ -969,8 +1064,9 @@ pub fn verify<Ch: Challenger>(
     // SECURITY: the number of FRI queries is a soundness parameter, not a
     // prover choice. A malicious prover that sends fewer queries (down to
     // zero) strips the codeword-to-commitment binding and can prove a false
-    // evaluation. Enforce the rate-derived count before sampling positions.
-    if proof.queries.len() != default_fri_queries(log_inv_rate) {
+    // evaluation. Enforce the finite domain-and-rate-derived count before
+    // sampling positions.
+    if proof.queries.len() != default_fri_queries(log_dim, log_inv_rate) {
         return Err(VerifyError::InvalidProofShape);
     }
 
@@ -1231,4 +1327,84 @@ pub fn verify<Ch: Challenger>(
     }
 
     Ok(challenges)
+}
+
+#[cfg(test)]
+mod security_configuration_tests {
+    use super::*;
+
+    #[test]
+    fn every_published_basefold_domain_rate_is_finite_length_checked() {
+        // Production recursive ladder: B8, B32/B64, B255/Link. Production
+        // fixed helpers: checkpoint chunk core and receipt projection.
+        let published = [
+            ("recursive-m22", 17usize, 2usize, 125usize),
+            ("recursive-m23", 18, 2, 125),
+            ("recursive-m24", 19, 2, 125),
+            ("checkpoint-chunk", 4, 4, 96),
+            ("receipt-projection", 5, 4, 94),
+        ];
+
+        for (name, log_msg_cols, log_inv_rate, expected_queries) in published {
+            let config = checked_fri_configuration(log_msg_cols, log_inv_rate)
+                .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+            assert_eq!(config.query_count, expected_queries, "{name}");
+            assert!(
+                config.query_term_bits + 1e-9 >= BASEFOLD_UDR_TARGET_BITS as f64,
+                "{name}: query term {}",
+                config.query_term_bits
+            );
+            assert!(
+                config.proximity_term_bits + 1e-9 >= BASEFOLD_UDR_TARGET_BITS as f64,
+                "{name}: proximity term {}",
+                config.proximity_term_bits
+            );
+        }
+    }
+
+    #[test]
+    fn basefold_and_ligerito_share_the_corrected_finite_udr_algebra() {
+        for log_inv_rate in 1..=5 {
+            for log_msg_cols in 4..=19 {
+                let Ok(config) = checked_fri_configuration(log_msg_cols, log_inv_rate) else {
+                    continue;
+                };
+                let ligerito_gamma = crate::pcs::ligerito::udr_gamma(
+                    log_inv_rate,
+                    log_msg_cols,
+                    crate::pcs::ligerito::UDR_PROXIMITY_LOSS,
+                );
+                let ligerito_query = crate::pcs::ligerito::udr_per_query_bits(
+                    log_inv_rate,
+                    log_msg_cols,
+                    crate::pcs::ligerito::UDR_PROXIMITY_LOSS,
+                );
+                let ligerito_pg = 128.0
+                    - crate::pcs::ligerito::paper_thm_1_4_log_a(
+                        log_inv_rate,
+                        log_msg_cols,
+                        crate::pcs::ligerito::UDR_PROXIMITY_LOSS,
+                    );
+                assert!((config.proximity_radius - ligerito_gamma).abs() < 1e-12);
+                assert!((config.per_query_bits - ligerito_query).abs() < 1e-12);
+                assert!((config.proximity_term_bits - ligerito_pg).abs() < 1e-12);
+            }
+        }
+    }
+
+    #[test]
+    fn finite_length_gate_rejects_short_large_and_unpublished_configs() {
+        assert_eq!(
+            checked_fri_configuration(0, 1),
+            Err(BaseFoldUdrConfigError::FiniteLengthTheoremPrecondition)
+        );
+        assert_eq!(
+            checked_fri_configuration(30, 1),
+            Err(BaseFoldUdrConfigError::ProximityTargetNotMet)
+        );
+        assert_eq!(
+            checked_fri_configuration(19, 6),
+            Err(BaseFoldUdrConfigError::UnsupportedInverseRate)
+        );
+    }
 }

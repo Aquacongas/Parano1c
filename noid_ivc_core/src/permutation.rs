@@ -859,9 +859,11 @@ mod tests {
 
     #[test]
     fn honest_roundtrip_and_claim_match() {
-        // Spans both backend regimes for `v` (log_n = μ+1): BaseFold at μ≤6
-        // (log_n ≤ 7 < 8) and Ligerito at μ≥7 (log_n ≥ 8).
-        for mu in 1..=8 {
+        // Spans both backend regimes for `v` (log_n = μ+1): BaseFold at μ=6
+        // (log_n = 7 < 8) and Ligerito at μ≥7 (log_n ≥ 8). μ=6 is also the
+        // smallest size whose rate-1/2 BaseFold codeword (2^(μ+1) = 128) sits
+        // inside the reviewed finite-length UDR envelope.
+        for mu in 6..=8 {
             let (f, g, sigma) = honest_instance(mu, 0xC0FFEE ^ mu as u64);
             let (proof, claim_p) = run_prove(&f, &g, &sigma);
             assert_eq!(proof.claimed_product, F128::ONE, "μ={mu}: ∏ℓ ≠ 1");
@@ -917,7 +919,7 @@ mod tests {
 
     #[test]
     fn tampered_witness_rejected() {
-        let mu = 5;
+        let mu = 6;
         let (f, g, sigma) = honest_instance(mu, 0x1234);
         let (proof, _) = run_prove(&f, &g, &sigma);
 
@@ -935,7 +937,7 @@ mod tests {
     #[test]
     fn non_permutation_relation_rejected() {
         // f is NOT a permutation of g ⇒ honest prover's ∏h ≠ 1 ⇒ RootNotOne.
-        let mu = 4;
+        let mu = 6;
         let n = 1usize << mu;
         let mut rng = Rng::new(0x9999);
         let g: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
@@ -949,11 +951,11 @@ mod tests {
 
     #[test]
     fn tampered_basefold_opening_rejected() {
-        // μ=5 → v has log_n=6, below Ligerito's floor, so it opens with BaseFold.
+        // μ=6 → v has log_n=7, below Ligerito's floor, so it opens with BaseFold.
         // Corrupt its final value: the sumcheck and root checks still pass (evals
         // + claimed_product are untouched), so the rejection comes purely from the
         // PCS opening no longer matching the committed `v`.
-        let mu = 5;
+        let mu = 6;
         let (f, g, sigma) = honest_instance(mu, 0x2468);
         let (mut proof, _) = run_prove(&f, &g, &sigma);
         match &mut proof.v_open {

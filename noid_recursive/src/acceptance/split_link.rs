@@ -538,7 +538,8 @@ impl CanonicalSplitLinkLadder {
         if !(1..=5).contains(&link_rate) {
             return Err(CanonicalLadderError::UnsupportedUniversalPcs);
         }
-        let n_queries = noid_ivc_core::pcs::default_fri_queries(link_rate);
+        let n_queries =
+            noid_ivc_core::pcs::default_fri_queries(link_pcs_params.log_dim(), link_rate);
         let block_params = slots
             .iter()
             .map(|slot| slot.b_pcs_params.clone())
@@ -1417,7 +1418,8 @@ impl SplitLinkClass {
             .iter()
             .map(|slot| slot.b_pcs_params.clone())
             .collect::<Vec<_>>();
-        let n_queries = noid_ivc_core::pcs::default_fri_queries(pcs_params.log_inv_rate);
+        let n_queries =
+            noid_ivc_core::pcs::default_fri_queries(pcs_params.log_dim(), pcs_params.log_inv_rate);
         let universal_geometry =
             RPcsLinkUniversalGeometry::new(&pcs_params, &block_params, n_queries)
                 .map_err(|_| LinkProofError::ClassIdentityMismatch)?;
@@ -1574,7 +1576,8 @@ impl SplitLinkClass {
             .iter()
             .map(|slot| slot.b_pcs_params.clone())
             .collect::<Vec<_>>();
-        let n_queries = noid_ivc_core::pcs::default_fri_queries(pcs_params.log_inv_rate);
+        let n_queries =
+            noid_ivc_core::pcs::default_fri_queries(pcs_params.log_dim(), pcs_params.log_inv_rate);
         let universal_geometry =
             RPcsLinkUniversalGeometry::new(&pcs_params, &block_params, n_queries)
                 .expect("link/block ladder must share one frozen query count");
