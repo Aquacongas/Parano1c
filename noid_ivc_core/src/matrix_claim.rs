@@ -496,15 +496,51 @@ pub fn verify_matrix_claim_fold<Ch: Challenger>(
     })
 }
 
+/// Exact tensor-factored eq table.
+///
+/// A dense table over `d` variables retains `2^d` field elements. Splitting
+/// the low/high coordinates retains only `2^floor(d/2) + 2^ceil(d/2)` and
+/// reconstructs an entry with one multiplication. Indexing remains LSB-first,
+/// exactly matching [`build_eq_table`].
+struct FactoredEqTable {
+    low: Vec<F128>,
+    high: Vec<F128>,
+    low_bits: usize,
+    low_mask: usize,
+}
+
+impl FactoredEqTable {
+    fn new(point: &[F128]) -> Self {
+        let low_bits = point.len() / 2;
+        let low = build_eq_table(&point[..low_bits]);
+        let high = build_eq_table(&point[low_bits..]);
+        Self {
+            low,
+            high,
+            low_bits,
+            low_mask: (1usize << low_bits) - 1,
+        }
+    }
+
+    #[inline(always)]
+    fn value(&self, index: usize) -> F128 {
+        self.low[index & self.low_mask] * self.high[index >> self.low_bits]
+    }
+}
+
 /// The decider's native check of an accumulated claim: evaluate the
 /// stacked matrix MLE `M̂~(point)` directly from the sparse rows.
+///
+/// Both row and column equality tensors are factored, so the retained scratch
+/// is `O(2^(k_log/2))`, not `O(2^k_log)`. At production `k_log = 24`, four
+/// 4096-element factors replace two 16,777,216-element dense tables.
 pub fn stacked_matrix_mle_eval(r1cs: &FieldR1cs, claim: &MatrixAccClaim) -> F128 {
     let k_log = r1cs.k_log;
     assert_eq!(claim.point.len(), 2 * k_log + 1);
     let (p_row, p_col) = claim.point.split_at(k_log + 1);
     let x_b = p_row[k_log];
-    let eq_row = build_eq_table(&p_row[..k_log]);
-    let eq_col = build_eq_table(p_col);
+    let eq_row = FactoredEqTable::new(&p_row[..k_log]);
+    let eq_col = FactoredEqTable::new(p_col);
     let halves = [
         (&r1cs.a_0, F128::ONE + x_b), // b = 0 side
         (&r1cs.b_0, x_b),             // b = 1 side
@@ -517,9 +553,9 @@ pub fn stacked_matrix_mle_eval(r1cs: &FieldR1cs, claim: &MatrixAccClaim) -> F128
                 .map(|r| {
                     let mut acc = F128::ZERO;
                     for (c, kappa) in m.row(r) {
-                        acc += kappa * eq_col[c as usize];
+                        acc += kappa * eq_col.value(c as usize);
                     }
-                    acc * eq_row[r]
+                    acc * eq_row.value(r)
                 })
                 .reduce(|| F128::ZERO, |a, b| a + b)
                 * *w_b
@@ -533,8 +569,8 @@ pub fn stacked_matrix_mle_eval(r1cs: &FieldR1cs, claim: &MatrixAccClaim) -> F128
 pub fn fresh_claim_value(r1cs: &FieldR1cs, fresh: &FreshLincheckClaim) -> F128 {
     let k_skip = r1cs.k_skip;
     let lambda = lagrange_weights_naive(k_skip, fresh.z_skip);
-    let e_tensor = build_eq_table(&fresh.x_inner_rest);
-    let q_tensor = build_eq_table(&fresh.r_inner_rest);
+    let e_tensor = FactoredEqTable::new(&fresh.x_inner_rest);
+    let q_tensor = FactoredEqTable::new(&fresh.r_inner_rest);
     let mask = (1usize << k_skip) - 1;
     let halves = [(&r1cs.a_0, fresh.alpha), (&r1cs.b_0, F128::ONE)];
     halves
@@ -543,11 +579,11 @@ pub fn fresh_claim_value(r1cs: &FieldR1cs, fresh: &FreshLincheckClaim) -> F128 {
             (0..m.num_rows)
                 .into_par_iter()
                 .map(|r| {
-                    let u = lambda[r & mask] * e_tensor[r >> k_skip];
+                    let u = lambda[r & mask] * e_tensor.value(r >> k_skip);
                     let mut acc = F128::ZERO;
                     for (c, kappa) in m.row(r) {
                         let c = c as usize;
-                        acc += kappa * fresh.z_partial[c & mask] * q_tensor[c >> k_skip];
+                        acc += kappa * fresh.z_partial[c & mask] * q_tensor.value(c >> k_skip);
                     }
                     acc * u
                 })
@@ -628,6 +664,82 @@ mod tests {
         };
         acc.value = stacked_matrix_mle_eval(r1cs, &acc);
         acc
+    }
+
+    fn stacked_matrix_mle_eval_dense_reference(r1cs: &FieldR1cs, claim: &MatrixAccClaim) -> F128 {
+        let k_log = r1cs.k_log;
+        let (p_row, p_col) = claim.point.split_at(k_log + 1);
+        let x_b = p_row[k_log];
+        let eq_row = build_eq_table(&p_row[..k_log]);
+        let eq_col = build_eq_table(p_col);
+        let mut total = F128::ZERO;
+        for (matrix, weight) in [(&r1cs.a_0, F128::ONE + x_b), (&r1cs.b_0, x_b)] {
+            let mut half = F128::ZERO;
+            for r in 0..matrix.num_rows {
+                let mut row = F128::ZERO;
+                for (c, kappa) in matrix.row(r) {
+                    row += kappa * eq_col[c as usize];
+                }
+                half += row * eq_row[r];
+            }
+            total += half * weight;
+        }
+        total
+    }
+
+    fn fresh_claim_value_dense_reference(r1cs: &FieldR1cs, fresh: &FreshLincheckClaim) -> F128 {
+        let lambda = lagrange_weights_naive(r1cs.k_skip, fresh.z_skip);
+        let e_tensor = build_eq_table(&fresh.x_inner_rest);
+        let q_tensor = build_eq_table(&fresh.r_inner_rest);
+        let mask = (1usize << r1cs.k_skip) - 1;
+        let mut total = F128::ZERO;
+        for (matrix, weight) in [(&r1cs.a_0, fresh.alpha), (&r1cs.b_0, F128::ONE)] {
+            let mut half = F128::ZERO;
+            for r in 0..matrix.num_rows {
+                let u = lambda[r & mask] * e_tensor[r >> r1cs.k_skip];
+                let mut row = F128::ZERO;
+                for (c, kappa) in matrix.row(r) {
+                    let c = c as usize;
+                    row += kappa * fresh.z_partial[c & mask] * q_tensor[c >> r1cs.k_skip];
+                }
+                half += row * u;
+            }
+            total += half * weight;
+        }
+        total
+    }
+
+    #[test]
+    fn factored_eq_lookup_and_matrix_evaluators_match_dense_reference() {
+        let mut rng = Rng(0xFAC7_0E0D);
+        for dimensions in 0..=12 {
+            let point = (0..dimensions).map(|_| rng.f128()).collect::<Vec<_>>();
+            let dense = build_eq_table(&point);
+            let factored = FactoredEqTable::new(&point);
+            for (index, expected) in dense.into_iter().enumerate() {
+                assert_eq!(factored.value(index), expected);
+            }
+        }
+
+        for k_log in 6..=10 {
+            let r1cs = random_instance(&mut rng, k_log, 3);
+            let claim = MatrixAccClaim {
+                point: (0..2 * k_log + 1).map(|_| rng.f128()).collect(),
+                value: F128::ZERO,
+            };
+            assert_eq!(
+                stacked_matrix_mle_eval(&r1cs, &claim),
+                stacked_matrix_mle_eval_dense_reference(&r1cs, &claim),
+                "factored accumulated claim at k_log={k_log}"
+            );
+
+            let fresh = random_fresh(&mut rng, &r1cs);
+            assert_eq!(
+                fresh_claim_value(&r1cs, &fresh),
+                fresh_claim_value_dense_reference(&r1cs, &fresh),
+                "factored fresh claim at k_log={k_log}"
+            );
+        }
     }
 
     /// Honest fold roundtrip: chained accumulators stay TRUE against the
