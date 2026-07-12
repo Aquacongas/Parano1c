@@ -55,12 +55,21 @@ fn main() {
         digest,
     );
     let t = Instant::now();
+    // Streamed evaluation needs the seekable plaintext; the compressed form
+    // serves the resident/trusted arms below.
+    source
+        .export_matrix_uncompressed(identity, &matrix)
+        .expect("export uncompressed");
     source.export_matrix(identity, &matrix).expect("export");
-    let bytes = std::fs::metadata(source.artifact_path(SelectedRecursiveMatrixKind::GenesisLink))
-        .expect("artifact metadata")
-        .len();
+    let bytes = std::fs::metadata(
+        source
+            .artifact_path(SelectedRecursiveMatrixKind::GenesisLink)
+            .with_extension("field-r1cs.zst"),
+    )
+    .expect("artifact metadata")
+    .len();
     println!(
-        "  export           {:>8.3} s  ({:.1} MiB artifact)",
+        "  export           {:>8.3} s  ({:.1} MiB compressed artifact)",
         t.elapsed().as_secs_f64(),
         bytes as f64 / (1024.0 * 1024.0)
     );

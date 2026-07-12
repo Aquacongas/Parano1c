@@ -23,6 +23,7 @@ tracing       = { workspace = true }
 thiserror     = { workspace = true }
 anyhow        = { workspace = true }
 bincode       = "1"
+zstd          = { version = "0.13", features = ["zstdmt"] }
 
 [dev-dependencies]
 bench_prover = { path = "../bench_prover" }

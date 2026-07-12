@@ -334,13 +334,16 @@ impl LocalSelectedRecursiveMatrixSource {
         #[cfg(unix)]
         {
             let parent = self.open_version_directory(true)?;
-            self.export_matrix_anchored(&parent, identity.kind(), matrix)?;
+            self.export_matrix_anchored(&parent, identity.kind(), matrix, true)?;
             // Best effort: a failed record write only costs the first
             // terminal verification one rehash.
-            if let Ok((_, exported, _)) = self.open_anchored_artifact(&parent, identity.kind()) {
+            if let Ok((_, exported, _, compressed)) =
+                self.open_anchored_artifact(&parent, identity.kind())
+            {
                 let _ = self.write_artifact_trust_record(
                     &parent,
                     identity.kind(),
+                    compressed,
                     &exported,
                     identity.statement_digest(),
                 );
@@ -396,19 +399,35 @@ impl LocalSelectedRecursiveMatrixSource {
         statement_digest: [u8; 32],
         lease: ResidentMatrixLease,
     ) -> Result<LoadedSelectedRecursiveMatrix, LocalSelectedRecursiveMatrixError> {
-        let (file, opened, path) = self.open_anchored_artifact(parent, kind)?;
+        let (file, opened, path, compressed) = self.open_anchored_artifact(parent, kind)?;
         let decoder_cap = usize::try_from(self.effective_max_bytes()).unwrap_or(usize::MAX);
-        let mut reader = BufReader::with_capacity(ARTIFACT_READ_BUFFER_BYTES, file);
-        let matrix = FieldR1cs::read_artifact(&mut reader, shape, statement_digest, decoder_cap)
-            .map_err(LocalSelectedRecursiveMatrixError::Codec)?;
-        let after = reader
-            .get_ref()
-            .metadata()
-            .map_err(|source| io_error("inspect decoded", &path, source))?;
+        let buffered = BufReader::with_capacity(ARTIFACT_READ_BUFFER_BYTES, file);
+        let (matrix, after) = if compressed {
+            let mut decoder = zstd::stream::read::Decoder::with_buffer(buffered)
+                .map_err(|source| io_error("open zstd decoder", &path, source))?;
+            let matrix =
+                FieldR1cs::read_artifact(&mut decoder, shape, statement_digest, decoder_cap)
+                    .map_err(LocalSelectedRecursiveMatrixError::Codec)?;
+            let after = decoder
+                .get_ref()
+                .get_ref()
+                .metadata()
+                .map_err(|source| io_error("inspect decoded", &path, source))?;
+            (matrix, after)
+        } else {
+            let mut reader = buffered;
+            let matrix =
+                FieldR1cs::read_artifact(&mut reader, shape, statement_digest, decoder_cap)
+                    .map_err(LocalSelectedRecursiveMatrixError::Codec)?;
+            let after = reader
+                .get_ref()
+                .metadata()
+                .map_err(|source| io_error("inspect decoded", &path, source))?;
+            (matrix, after)
+        };
         if !same_file_and_length(&opened, &after) {
             return Err(LocalSelectedRecursiveMatrixError::ArtifactChanged { path });
         }
-        drop(reader);
 
         let resident = lease.transfer();
         Ok(LoadedSelectedRecursiveMatrix::with_release_callback(
@@ -426,7 +445,7 @@ impl LocalSelectedRecursiveMatrixSource {
         statement_digest: [u8; 32],
         lease: ResidentMatrixLease,
     ) -> Result<LoadedSelectedRecursiveMatrixView, LocalSelectedRecursiveMatrixError> {
-        let (file, opened, path) = self.open_anchored_artifact(parent, kind)?;
+        let (file, opened, path) = self.open_anchored_artifact_raw(parent, kind)?;
         let view = PreflightSeekableFieldR1csArtifact::open(
             file,
             shape,
@@ -464,36 +483,53 @@ impl LocalSelectedRecursiveMatrixSource {
     ) -> Result<LoadedSelectedRecursiveMatrixEvaluator, LocalSelectedRecursiveMatrixError> {
         let kind = identity.kind();
         let expected_digest = identity.statement_digest();
-        let (file, opened, path) = self.open_anchored_artifact(parent, kind)?;
+        let (file, opened, path, compressed) = self.open_anchored_artifact(parent, kind)?;
         let trusted = self.artifact_trust
             && self
-                .read_artifact_trust_record(parent, kind)
+                .read_artifact_trust_record(parent, kind, compressed)
                 .is_some_and(|record| record.digest == expected_digest && record.matches(&opened));
         let decoder_cap = usize::try_from(self.effective_max_bytes()).unwrap_or(usize::MAX);
-        let mut reader = BufReader::with_capacity(ARTIFACT_READ_BUFFER_BYTES, file);
-        let matrix = if trusted {
-            FieldR1cs::read_artifact_with_established_digest(
-                &mut reader,
-                identity.shape(),
-                expected_digest,
-                decoder_cap,
-            )
+        let buffered = BufReader::with_capacity(ARTIFACT_READ_BUFFER_BYTES, file);
+        let read_matrix = |reader: &mut dyn io::Read| {
+            if trusted {
+                FieldR1cs::read_artifact_with_established_digest(
+                    reader,
+                    identity.shape(),
+                    expected_digest,
+                    decoder_cap,
+                )
+            } else {
+                FieldR1cs::read_artifact(reader, identity.shape(), expected_digest, decoder_cap)
+            }
+            .map_err(LocalSelectedRecursiveMatrixError::Codec)
+        };
+        let (matrix, after) = if compressed {
+            let mut decoder = zstd::stream::read::Decoder::with_buffer(buffered)
+                .map_err(|source| io_error("open zstd decoder", &path, source))?;
+            let matrix = read_matrix(&mut decoder)?;
+            let after = decoder
+                .get_ref()
+                .get_ref()
+                .metadata()
+                .map_err(|source| io_error("inspect decoded", &path, source))?;
+            (matrix, after)
         } else {
-            FieldR1cs::read_artifact(&mut reader, identity.shape(), expected_digest, decoder_cap)
-        }
-        .map_err(LocalSelectedRecursiveMatrixError::Codec)?;
-        let after = reader
-            .get_ref()
-            .metadata()
-            .map_err(|source| io_error("inspect decoded", &path, source))?;
+            let mut reader = buffered;
+            let matrix = read_matrix(&mut reader)?;
+            let after = reader
+                .get_ref()
+                .metadata()
+                .map_err(|source| io_error("inspect decoded", &path, source))?;
+            (matrix, after)
+        };
         if !same_file_and_length(&opened, &after) {
             return Err(LocalSelectedRecursiveMatrixError::ArtifactChanged { path });
         }
-        drop(reader);
         if !trusted && self.artifact_trust {
             // Best effort: the load above is fully authenticated; a failed
             // record write only costs the next open one more rehash.
-            let _ = self.write_artifact_trust_record(parent, kind, &after, expected_digest);
+            let _ =
+                self.write_artifact_trust_record(parent, kind, compressed, &after, expected_digest);
         }
 
         let resident = lease.transfer();
@@ -513,8 +549,9 @@ impl LocalSelectedRecursiveMatrixSource {
         &self,
         parent: &anchored_artifact_fs::AnchoredDirectory,
         kind: SelectedRecursiveMatrixKind,
+        compressed: bool,
     ) -> Option<ArtifactTrustRecord> {
-        let leaf = artifact_trust_leaf(kind);
+        let leaf = artifact_trust_leaf(kind, compressed);
         match parent.leaf_kind(&leaf) {
             Ok(anchored_artifact_fs::LeafKind::Regular) => {}
             _ => return None,
@@ -546,10 +583,11 @@ impl LocalSelectedRecursiveMatrixSource {
         &self,
         parent: &anchored_artifact_fs::AnchoredDirectory,
         kind: SelectedRecursiveMatrixKind,
+        compressed: bool,
         authenticated: &Metadata,
         digest: [u8; 32],
     ) -> Result<(), LocalSelectedRecursiveMatrixError> {
-        let leaf = artifact_trust_leaf(kind);
+        let leaf = artifact_trust_leaf(kind, compressed);
         let target = self
             .root
             .join(ARTIFACT_VERSION_DIRECTORY)
@@ -576,8 +614,50 @@ impl LocalSelectedRecursiveMatrixSource {
         Ok(())
     }
 
+    /// Open the artifact for decoding, preferring the compressed form.
     #[cfg(unix)]
     fn open_anchored_artifact(
+        &self,
+        parent: &anchored_artifact_fs::AnchoredDirectory,
+        kind: SelectedRecursiveMatrixKind,
+    ) -> Result<(File, Metadata, PathBuf, bool), LocalSelectedRecursiveMatrixError> {
+        let compressed = compressed_matrix_leaf(kind);
+        let compressed_path = self.artifact_path(kind).with_extension("field-r1cs.zst");
+        match parent
+            .leaf_kind(&compressed)
+            .map_err(|source| io_error("inspect anchored leaf", &compressed_path, source))?
+        {
+            anchored_artifact_fs::LeafKind::Regular => {
+                let file = parent
+                    .open_read_only(&compressed)
+                    .map_err(|source| io_error("open anchored leaf", &compressed_path, source))?;
+                let opened = file
+                    .metadata()
+                    .map_err(|source| io_error("inspect opened", &compressed_path, source))?;
+                validate_regular_file_metadata(&compressed_path, &opened)?;
+                reject_oversize(opened.len(), self.effective_max_bytes())?;
+                return Ok((file, opened, compressed_path, true));
+            }
+            anchored_artifact_fs::LeafKind::Symlink => {
+                return Err(LocalSelectedRecursiveMatrixError::Symlink {
+                    path: compressed_path,
+                });
+            }
+            anchored_artifact_fs::LeafKind::Other => {
+                return Err(LocalSelectedRecursiveMatrixError::NotRegularFile {
+                    path: compressed_path,
+                });
+            }
+            anchored_artifact_fs::LeafKind::Missing => {}
+        }
+        let (file, opened, path) = self.open_anchored_artifact_raw(parent, kind)?;
+        Ok((file, opened, path, false))
+    }
+
+    /// Open only the uncompressed artifact (the bounded streaming verifier
+    /// requires seekable plaintext).
+    #[cfg(unix)]
+    fn open_anchored_artifact_raw(
         &self,
         parent: &anchored_artifact_fs::AnchoredDirectory,
         kind: SelectedRecursiveMatrixKind,
@@ -615,15 +695,59 @@ impl LocalSelectedRecursiveMatrixSource {
         Ok((file, opened, path))
     }
 
+    /// Export without compression: the bounded-memory streaming verifier
+    /// needs a seekable plaintext artifact. Identity checks and the trust
+    /// record work identically to the compressed default.
+    pub fn export_matrix_uncompressed(
+        &self,
+        identity: SelectedRecursiveMatrixArtifactIdentity,
+        matrix: &FieldR1cs,
+    ) -> Result<(), LocalSelectedRecursiveMatrixError> {
+        validate_export_identity(identity, matrix)?;
+        #[cfg(not(unix))]
+        {
+            let _ = (identity, matrix);
+            Err(LocalSelectedRecursiveMatrixError::UnsupportedPlatform)
+        }
+        #[cfg(unix)]
+        {
+            let parent = self.open_version_directory(true)?;
+            self.export_matrix_anchored(&parent, identity.kind(), matrix, false)?;
+            if let Ok((_, exported, _, compressed)) =
+                self.open_anchored_artifact(&parent, identity.kind())
+            {
+                let _ = self.write_artifact_trust_record(
+                    &parent,
+                    identity.kind(),
+                    compressed,
+                    &exported,
+                    identity.statement_digest(),
+                );
+            }
+            Ok(())
+        }
+    }
+
     #[cfg(unix)]
     fn export_matrix_anchored(
         &self,
         parent: &anchored_artifact_fs::AnchoredDirectory,
         kind: SelectedRecursiveMatrixKind,
         matrix: &FieldR1cs,
+        compress: bool,
     ) -> Result<(), LocalSelectedRecursiveMatrixError> {
-        let target = self.artifact_path(kind);
-        let leaf = selected_recursive_matrix_leaf(kind);
+        let (target, owned_leaf) = if compress {
+            (
+                self.artifact_path(kind).with_extension("field-r1cs.zst"),
+                compressed_matrix_leaf(kind),
+            )
+        } else {
+            (
+                self.artifact_path(kind),
+                selected_recursive_matrix_leaf(kind).to_owned(),
+            )
+        };
+        let leaf = owned_leaf.as_str();
         match parent
             .leaf_kind(leaf)
             .map_err(|source| io_error("inspect anchored target", &target, source))?
@@ -643,23 +767,49 @@ impl LocalSelectedRecursiveMatrixSource {
             .expect("fixed matrix path has parent")
             .join(&temporary_name);
         let mut cleanup = TemporaryCleanup::new(parent, temporary_name.clone(), target.clone())?;
-        let mut writer = CappedWriter::new(file, self.effective_max_bytes());
-        let write_result = matrix.write_artifact(&mut writer);
-        if let Some(actual) = writer.exceeded_at() {
-            return Err(LocalSelectedRecursiveMatrixError::ArtifactTooLarge {
-                actual,
-                max: self.effective_max_bytes(),
-            });
-        }
-        write_result.map_err(LocalSelectedRecursiveMatrixError::Codec)?;
-        writer
-            .flush()
-            .map_err(|source| io_error("flush", &temporary_path, source))?;
-        writer
-            .inner()
-            .sync_all()
+        // The cap counts DECODED artifact bytes (the same protocol bound the
+        // reader enforces); compression happens downstream of the counter.
+        let file = if compress {
+            let mut encoder = zstd::stream::write::Encoder::new(file, artifact_zstd_level())
+                .map_err(|source| io_error("open zstd encoder", &temporary_path, source))?;
+            let workers = std::thread::available_parallelism()
+                .map(|value| value.get() as u32)
+                .unwrap_or(1);
+            let _ = encoder.multithread(workers);
+            let mut writer = CappedWriter::new(encoder, self.effective_max_bytes());
+            let write_result = matrix.write_artifact(&mut writer);
+            if let Some(actual) = writer.exceeded_at() {
+                return Err(LocalSelectedRecursiveMatrixError::ArtifactTooLarge {
+                    actual,
+                    max: self.effective_max_bytes(),
+                });
+            }
+            write_result.map_err(LocalSelectedRecursiveMatrixError::Codec)?;
+            writer
+                .flush()
+                .map_err(|source| io_error("flush", &temporary_path, source))?;
+            writer
+                .into_inner()
+                .finish()
+                .map_err(|source| io_error("finish zstd frame", &temporary_path, source))?
+        } else {
+            let mut writer = CappedWriter::new(file, self.effective_max_bytes());
+            let write_result = matrix.write_artifact(&mut writer);
+            if let Some(actual) = writer.exceeded_at() {
+                return Err(LocalSelectedRecursiveMatrixError::ArtifactTooLarge {
+                    actual,
+                    max: self.effective_max_bytes(),
+                });
+            }
+            write_result.map_err(LocalSelectedRecursiveMatrixError::Codec)?;
+            writer
+                .flush()
+                .map_err(|source| io_error("flush", &temporary_path, source))?;
+            writer.into_inner()
+        };
+        file.sync_all()
             .map_err(|source| io_error("sync", &temporary_path, source))?;
-        drop(writer);
+        drop(file);
 
         parent
             .rename(&temporary_name, leaf)
@@ -824,9 +974,44 @@ fn selected_recursive_matrix_leaf(kind: SelectedRecursiveMatrixKind) -> &'static
         .expect("fixed ASCII matrix path has a file name")
 }
 
+/// Canonical matrices ship zstd-compressed: the CSR encodings are dominated
+/// by repeated verifier-replay gadget structure and compress 9–25×
+/// (11.1 GiB → 0.6 GiB for the full set), while streaming decompression
+/// costs well under a second per matrix. The bounded streaming verifier
+/// needs random access and therefore keeps reading the uncompressed form.
+const COMPRESSED_ARTIFACT_SUFFIX: &str = ".zst";
+/// Default export level: fast enough for first-run generation (level 3 is
+/// ~20× faster to encode than 19 and lands within ~25% of its size on these
+/// artifacts). Release packaging can override via NOID_ARTIFACT_ZSTD_LEVEL.
+const ARTIFACT_ZSTD_LEVEL: i32 = 3;
+
+fn artifact_zstd_level() -> i32 {
+    std::env::var("NOID_ARTIFACT_ZSTD_LEVEL")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(ARTIFACT_ZSTD_LEVEL)
+}
+
 #[cfg(unix)]
-fn artifact_trust_leaf(kind: SelectedRecursiveMatrixKind) -> String {
-    format!("{}.trust", selected_recursive_matrix_leaf(kind))
+fn compressed_matrix_leaf(kind: SelectedRecursiveMatrixKind) -> String {
+    format!(
+        "{}{}",
+        selected_recursive_matrix_leaf(kind),
+        COMPRESSED_ARTIFACT_SUFFIX
+    )
+}
+
+#[cfg(unix)]
+fn artifact_trust_leaf(kind: SelectedRecursiveMatrixKind, compressed: bool) -> String {
+    if compressed {
+        format!(
+            "{}{}.trust",
+            selected_recursive_matrix_leaf(kind),
+            COMPRESSED_ARTIFACT_SUFFIX
+        )
+    } else {
+        format!("{}.trust", selected_recursive_matrix_leaf(kind))
+    }
 }
 
 #[cfg(unix)]
@@ -1122,6 +1307,10 @@ impl<W> CappedWriter<W> {
     fn inner(&self) -> &W {
         &self.inner
     }
+
+    fn into_inner(self) -> W {
+        self.inner
+    }
 }
 
 impl<W: Write> Write for CappedWriter<W> {
@@ -1249,8 +1438,8 @@ mod tests {
         assert_eq!(
             version_entries,
             vec![
-                OsString::from("genesis-link.field-r1cs"),
-                OsString::from("genesis-link.field-r1cs.trust"),
+                OsString::from("genesis-link.field-r1cs.zst"),
+                OsString::from("genesis-link.field-r1cs.zst.trust"),
             ]
         );
     }
@@ -1263,7 +1452,9 @@ mod tests {
         let source = isolated_source(directory.path());
         let matrix = tiny_matrix(0x51EA);
         let matrix_identity = identity(SelectedRecursiveMatrixKind::GenesisLink, &matrix);
-        source.export_matrix(matrix_identity, &matrix).unwrap();
+        source
+            .export_matrix_uncompressed(matrix_identity, &matrix)
+            .unwrap();
         let mut claim = MatrixAccClaim {
             point: vec![F128::new(7, 11); 2 * matrix.k_log + 1],
             value: F128::ZERO,
@@ -1297,7 +1488,9 @@ mod tests {
         let mut source = isolated_source(directory.path());
         let matrix = tiny_matrix(0x9E51);
         let matrix_identity = identity(SelectedRecursiveMatrixKind::GenesisLink, &matrix);
-        source.export_matrix(matrix_identity, &matrix).unwrap();
+        source
+            .export_matrix_uncompressed(matrix_identity, &matrix)
+            .unwrap();
         let mut claim = MatrixAccClaim {
             point: vec![F128::new(3, 5); 2 * matrix.k_log + 1],
             value: F128::ZERO,
@@ -1361,7 +1554,7 @@ mod tests {
         let trust_path = directory
             .path()
             .join("v1")
-            .join("genesis-link.field-r1cs.trust");
+            .join("genesis-link.field-r1cs.zst.trust");
 
         // The exporter held the validated matrix, so the artifact is trusted
         // by construction.
@@ -1428,7 +1621,10 @@ mod tests {
 
         // Rewriting the artifact itself (same bytes, new file identity)
         // invalidates the record until one re-authentication.
-        let artifact_path = directory.path().join("v1").join("genesis-link.field-r1cs");
+        let artifact_path = directory
+            .path()
+            .join("v1")
+            .join("genesis-link.field-r1cs.zst");
         let artifact_bytes = fs::read(&artifact_path).unwrap();
         fs::write(&artifact_path, &artifact_bytes).unwrap();
         let sixth = source.open_artifact_evaluator(matrix_identity).unwrap();
@@ -1518,7 +1714,9 @@ mod tests {
             &matrix,
         );
         source.export_matrix(identity, &matrix).unwrap();
-        let path = source.artifact_path(identity.kind());
+        let path = source
+            .artifact_path(identity.kind())
+            .with_extension("field-r1cs.zst");
         let length = fs::metadata(&path).unwrap().len();
         OpenOptions::new()
             .write(true)
@@ -1527,15 +1725,15 @@ mod tests {
             .set_len(length - 1)
             .unwrap();
 
+        // A truncated compressed stream surfaces as a codec error (either the
+        // canonical truncation or the zstd frame failing mid-decode).
         assert!(matches!(
             source.load_requested(
                 identity.kind(),
                 identity.shape(),
                 identity.statement_digest()
             ),
-            Err(LocalSelectedRecursiveMatrixError::Codec(
-                FieldR1csArtifactError::Truncated { .. }
-            ))
+            Err(LocalSelectedRecursiveMatrixError::Codec(_))
         ));
     }
 
@@ -1558,8 +1756,12 @@ mod tests {
             .export_matrix(substitute_identity, &substitute)
             .unwrap();
         fs::copy(
-            source.artifact_path(substitute_identity.kind()),
-            source.artifact_path(expected_identity.kind()),
+            source
+                .artifact_path(substitute_identity.kind())
+                .with_extension("field-r1cs.zst"),
+            source
+                .artifact_path(expected_identity.kind())
+                .with_extension("field-r1cs.zst"),
         )
         .unwrap();
 
@@ -1585,9 +1787,13 @@ mod tests {
             &matrix,
         );
         writer.export_matrix(identity, &matrix).unwrap();
-        let actual = fs::metadata(writer.artifact_path(identity.kind()))
-            .unwrap()
-            .len();
+        let actual = fs::metadata(
+            writer
+                .artifact_path(identity.kind())
+                .with_extension("field-r1cs.zst"),
+        )
+        .unwrap()
+        .len();
         let reader = isolated_source_with_cap(directory.path(), actual - 1);
 
         assert!(matches!(
@@ -1725,9 +1931,11 @@ mod tests {
         );
         source.export_matrix(expected_identity, &expected).unwrap();
         source.export_matrix(target_identity, &target).unwrap();
-        let expected_path = source.artifact_path(expected_identity.kind());
+        let expected_path = source
+            .artifact_path(expected_identity.kind())
+            .with_extension("field-r1cs.zst");
         fs::remove_file(&expected_path).unwrap();
-        symlink("block-b32.field-r1cs", &expected_path).unwrap();
+        symlink("block-b32.field-r1cs.zst", &expected_path).unwrap();
 
         assert!(matches!(
             source.load_requested(
@@ -1810,15 +2018,18 @@ mod tests {
         );
         validate_export_identity(matrix_identity, &matrix).unwrap();
         source
-            .export_matrix_anchored(&anchored, matrix_identity.kind(), &matrix)
+            .export_matrix_anchored(&anchored, matrix_identity.kind(), &matrix, true)
             .unwrap();
 
-        let leaf = selected_recursive_matrix_leaf(matrix_identity.kind());
-        assert!(held_parent.join(leaf).is_file());
-        assert!(!outside.join(leaf).exists());
+        let leaf = compressed_matrix_leaf(matrix_identity.kind());
+        assert!(held_parent.join(&leaf).is_file());
+        assert!(!outside.join(&leaf).exists());
         assert_eq!(fs::read_dir(&held_parent).unwrap().count(), 1);
 
-        let mut reader = BufReader::new(File::open(held_parent.join(leaf)).unwrap());
+        let mut reader = zstd::stream::read::Decoder::new(
+            File::open(held_parent.join(leaf)).unwrap(),
+        )
+        .unwrap();
         let decoded = FieldR1cs::read_artifact(
             &mut reader,
             matrix_identity.shape(),

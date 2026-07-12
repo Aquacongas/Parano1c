@@ -254,7 +254,9 @@ fn preflight_selected_recursive_artifacts(artifacts: &SelectedHistoryVerifierArt
     ];
     for kind in kinds {
         let relative = selected_recursive_matrix_relative_path(kind);
-        if !artifacts.root.join(&relative).is_file() {
+        let raw = artifacts.root.join(&relative);
+        let compressed = raw.with_extension("field-r1cs.zst");
+        if !raw.is_file() && !compressed.is_file() {
             missing.push(relative.display().to_string());
         }
     }
