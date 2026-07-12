@@ -36,7 +36,7 @@ use noid_chain::consensus::wire_limits::{
 use noid_chain::consensus::ConsensusError;
 use noid_chain::state::ChainState;
 use noid_chain::state_delta::{
-    build_exact_action_surface_at_log_slots, ExactActionSurface, StateDeltaError,
+    build_exact_action_surface_for_transactions_at_log_slots, ExactActionSurface, StateDeltaError,
 };
 
 use crate::{BlockAuthSidecar, BlockProof, VerifyBlockError};
@@ -569,17 +569,10 @@ fn build_exact_surface_for_block(
     // is first, so its live outputs consume the first creation IDs.  Reordering
     // it behind user transactions would reconstruct a different packed state
     // surface even when every amount/owner/slot matched.
-    let bodies: Vec<_> = block
-        .transactions
-        .iter()
-        .map(|tx| tx.body.clone())
-        .collect();
-    let commitments: Vec<[u8; 32]> = bodies.iter().map(|body| body.claims_commitment()).collect();
-    build_exact_action_surface_at_log_slots(
+    build_exact_action_surface_for_transactions_at_log_slots(
         &state.state,
         block.header.log_slots,
-        &bodies,
-        &commitments,
+        &block.transactions,
         state.alloc_counter,
     )
     .map_err(map_state_delta_error)
@@ -1405,7 +1398,9 @@ mod tests {
             .split("fn map_state_delta_error")
             .next()
             .expect("exact surface builder boundary");
-        assert!(function.contains("build_exact_action_surface_at_log_slots"));
+        assert!(function.contains("build_exact_action_surface_for_transactions_at_log_slots"));
+        assert!(!function.contains("Vec<_>"));
+        assert!(!function.contains("claims_commitment"));
         assert!(!function.contains("state.state.clone"));
         assert!(!function.contains("expanded_state"));
         assert!(!function.contains(".expand()"));

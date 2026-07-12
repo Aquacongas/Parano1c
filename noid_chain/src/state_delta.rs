@@ -20,7 +20,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use noid_poseidon2b::primitives::Digest;
-use noid_tx::{TxBody, TxInput, TxOutput};
+use noid_tx::{Transaction, TxBody, TxInput, TxOutput};
 
 use crate::fri_state::{SlotValue, StateRoot};
 use crate::segmented_state::SegmentedFriState;
@@ -163,28 +163,29 @@ pub fn build_state_delta_action_surface(
     expected_commitments: &[Digest],
     parent_alloc_counter: u64,
 ) -> Result<StateDeltaActionSurface, StateDeltaError> {
-    build_state_delta_action_surface_in_domain(
-        state,
-        state.num_slots(),
-        bodies,
-        expected_commitments,
-        parent_alloc_counter,
-    )
-}
-
-fn build_state_delta_action_surface_in_domain(
-    state: &SegmentedFriState,
-    slot_domain: u64,
-    bodies: &[TxBody],
-    expected_commitments: &[Digest],
-    parent_alloc_counter: u64,
-) -> Result<StateDeltaActionSurface, StateDeltaError> {
     assert_eq!(
         bodies.len(),
         expected_commitments.len(),
         "one claims commitment per tx body required"
     );
+    build_state_delta_action_surface_in_domain(
+        state,
+        state.num_slots(),
+        bodies.len(),
+        |tx_index| &bodies[tx_index],
+        |tx_index| Some(expected_commitments[tx_index]),
+        parent_alloc_counter,
+    )
+}
 
+fn build_state_delta_action_surface_in_domain<'a>(
+    state: &SegmentedFriState,
+    slot_domain: u64,
+    body_count: usize,
+    mut body_at: impl FnMut(usize) -> &'a TxBody,
+    mut expected_commitment_at: impl FnMut(usize) -> Option<Digest>,
+    parent_alloc_counter: u64,
+) -> Result<StateDeltaActionSurface, StateDeltaError> {
     let parent_slot_domain = state.num_slots();
     if slot_domain < parent_slot_domain {
         return Err(StateDeltaError::InvalidSlotDomain);
@@ -196,12 +197,14 @@ fn build_state_delta_action_surface_in_domain(
     let mut alloc_counter = parent_alloc_counter;
     let mut block_touched = HashSet::new();
 
-    for (tx_idx, body) in bodies.iter().enumerate() {
+    for tx_idx in 0..body_count {
+        let body = body_at(tx_idx);
         check_tx_slot_shape(body, tx_idx)?;
 
-        let recomputed = body.claims_commitment();
-        if recomputed != expected_commitments[tx_idx] {
-            return Err(StateDeltaError::ClaimsCommitmentMismatch { tx_index: tx_idx });
+        if let Some(expected_commitment) = expected_commitment_at(tx_idx) {
+            if body.claims_commitment() != expected_commitment {
+                return Err(StateDeltaError::ClaimsCommitmentMismatch { tx_index: tx_idx });
+            }
         }
 
         for (i, input) in body.live_inputs() {
@@ -330,6 +333,48 @@ pub fn build_exact_action_surface_at_log_slots(
     expected_commitments: &[Digest],
     parent_alloc_counter: u64,
 ) -> Result<ExactActionSurface, StateDeltaError> {
+    assert_eq!(
+        bodies.len(),
+        expected_commitments.len(),
+        "one claims commitment per tx body required"
+    );
+    build_exact_action_surface_at_log_slots_from_source(
+        state,
+        target_log_slots,
+        bodies.len(),
+        |tx_index| &bodies[tx_index],
+        |tx_index| Some(expected_commitments[tx_index]),
+        parent_alloc_counter,
+    )
+}
+
+/// Build the exact block surface directly from the resident transaction
+/// vector. Bodies and their commitments are borrowed/derived in place, so the
+/// verifier does not allocate a second block-sized `Vec<TxBody>`.
+pub fn build_exact_action_surface_for_transactions_at_log_slots(
+    state: &SegmentedFriState,
+    target_log_slots: u32,
+    transactions: &[Transaction],
+    parent_alloc_counter: u64,
+) -> Result<ExactActionSurface, StateDeltaError> {
+    build_exact_action_surface_at_log_slots_from_source(
+        state,
+        target_log_slots,
+        transactions.len(),
+        |tx_index| &transactions[tx_index].body,
+        |_| None,
+        parent_alloc_counter,
+    )
+}
+
+fn build_exact_action_surface_at_log_slots_from_source<'a>(
+    state: &SegmentedFriState,
+    target_log_slots: u32,
+    body_count: usize,
+    body_at: impl FnMut(usize) -> &'a TxBody,
+    expected_commitment_at: impl FnMut(usize) -> Option<Digest>,
+    parent_alloc_counter: u64,
+) -> Result<ExactActionSurface, StateDeltaError> {
     let current = state.log_slots();
     let target =
         usize::try_from(target_log_slots).map_err(|_| StateDeltaError::InvalidSlotDomain)?;
@@ -342,8 +387,9 @@ pub fn build_exact_action_surface_at_log_slots(
     let surface = build_state_delta_action_surface_in_domain(
         state,
         slot_domain,
-        bodies,
-        expected_commitments,
+        body_count,
+        body_at,
+        expected_commitment_at,
         parent_alloc_counter,
     )?;
     Ok(exact_action_surface_from_surface(surface))
