@@ -55,11 +55,24 @@ use noid_miner::{BlockMiner, MinerConfig};
 use noid_p2p::{NetworkEvent, P2PNetwork};
 use noid_rpc::{start_rpc_server, WalletOperationGate};
 
-#[derive(Clone)]
 struct ProvedBlockCandidate {
     block: noid_chain::block::Block,
+    block_bytes_len: usize,
     block_proof_bytes: Vec<u8>,
     block_auth_sidecar_bytes: Vec<u8>,
+}
+
+struct AppliedP2pBlock {
+    block_hash: [u8; 32],
+    height: u64,
+    confirmed_tx_hashes: Vec<noid_poseidon2b::primitives::TxBodyHash>,
+    view: ChainView,
+}
+
+struct AppliedReorg {
+    result: noid_chain::consensus::ReorgResult,
+    confirmed_tx_hashes: Vec<noid_poseidon2b::primitives::TxBodyHash>,
+    view: ChainView,
 }
 
 struct OrphanBlock {
@@ -71,18 +84,28 @@ struct OrphanBlock {
 }
 
 impl OrphanBlock {
-    fn new(
-        block: noid_chain::block::Block,
-        block_bytes_len: usize,
-        block_proof_bytes: Vec<u8>,
-        block_auth_sidecar_bytes: Vec<u8>,
-    ) -> Self {
+    fn from_candidate(candidate: ProvedBlockCandidate) -> Self {
+        let ProvedBlockCandidate {
+            block,
+            block_bytes_len,
+            block_proof_bytes,
+            block_auth_sidecar_bytes,
+        } = candidate;
         Self {
             block,
             block_bytes_len,
             block_proof_bytes,
             block_auth_sidecar_bytes,
             received_at: Instant::now(),
+        }
+    }
+
+    fn into_candidate(self) -> ProvedBlockCandidate {
+        ProvedBlockCandidate {
+            block: self.block,
+            block_bytes_len: self.block_bytes_len,
+            block_proof_bytes: self.block_proof_bytes,
+            block_auth_sidecar_bytes: self.block_auth_sidecar_bytes,
         }
     }
 
@@ -1203,20 +1226,18 @@ async fn preverified_authorization_bytes(
 async fn apply_p2p_block_offthread(
     chain: &Arc<RwLock<MdbxChainContext>>,
     wallet: &SharedWallet,
-    block: noid_chain::block::Block,
-    block_proof_bytes: Vec<u8>,
-    block_auth_sidecar_bytes: Vec<u8>,
+    candidate: ProvedBlockCandidate,
     local_time: u64,
     preverified_auth: std::collections::HashMap<[u8; 32], Vec<u8>>,
-) -> Result<([u8; 32], ChainView), noid_chain::storage::MdbxContextError> {
+) -> Result<AppliedP2pBlock, (noid_chain::storage::MdbxContextError, ProvedBlockCandidate)> {
     let chain = chain.clone();
     let wallet = wallet.clone();
     tokio::task::spawn_blocking(move || {
         let mut ctx = chain.blocking_write();
-        let hash = ctx.apply_next_block(
-            &block,
-            &block_proof_bytes,
-            &block_auth_sidecar_bytes,
+        let apply_result = ctx.apply_next_block(
+            &candidate.block,
+            &candidate.block_proof_bytes,
+            &candidate.block_auth_sidecar_bytes,
             local_time,
             |block,
              proof_bytes,
@@ -1269,14 +1290,32 @@ async fn apply_p2p_block_offthread(
                     ),
                 )
             },
-        )?;
+        );
+        let hash = match apply_result {
+            Ok(hash) => hash,
+            Err(error) => return Err((error, candidate)),
+        };
         // Keep the chain writer through the incremental wallet update. This
         // shares the same `chain -> wallet` order as account activation and
         // prevents an exact newer snapshot from receiving this delta twice.
-        update_wallet_for_block(&wallet, &block);
+        update_wallet_for_block(&wallet, &candidate.block);
+        let height = candidate.block.header.height;
+        let confirmed_tx_hashes = candidate
+            .block
+            .transactions
+            .iter()
+            .map(|tx| tx.txid())
+            .collect();
         let view = ChainView::from_mdbx(&ctx);
         drop(ctx);
-        Ok((hash, view))
+        // `candidate` (including proof and authorization sidecar buffers) is
+        // dropped before this compact success value crosses back to async code.
+        Ok(AppliedP2pBlock {
+            block_hash: hash,
+            height,
+            confirmed_tx_hashes,
+            view,
+        })
     })
     .await
     .expect("apply_p2p_block_offthread panicked in spawn_blocking")
@@ -1284,8 +1323,9 @@ async fn apply_p2p_block_offthread(
 
 /// Apply a chain reorg off the tokio executor.  Same `fsync` rationale.
 ///
-/// Returns `(result, new_blocks, view)` so the caller can use blocks and view
-/// in the success path without an extra clone or read lock.
+/// The owned replacement payloads are retained only on failure.  On success
+/// they are dropped on the blocking worker and only compact mempool metadata
+/// crosses back to async code.
 async fn apply_reorg_offthread(
     chain: &Arc<RwLock<MdbxChainContext>>,
     wallet: &SharedWallet,
@@ -1294,23 +1334,24 @@ async fn apply_reorg_offthread(
     ancestor_height: u64,
     new_blocks: Vec<ProvedBlockCandidate>,
     local_time: u64,
-) -> (
-    Result<noid_chain::consensus::ReorgResult, noid_chain::storage::MdbxContextError>,
-    Vec<ProvedBlockCandidate>,
-    Option<ChainView>,
-) {
+) -> Result<
+    AppliedReorg,
+    (
+        noid_chain::storage::MdbxContextError,
+        Vec<ProvedBlockCandidate>,
+    ),
+> {
     let chain = chain.clone();
     let wallet = wallet.clone();
     tokio::task::spawn_blocking(move || {
         let mut ctx = chain.blocking_write();
         if ancestor_height > ctx.tip_height() {
-            return (
-                Err(noid_chain::storage::MdbxContextError::Consensus(
+            return Err((
+                noid_chain::storage::MdbxContextError::Consensus(
                     noid_chain::consensus::ConsensusError::BadParentHash,
-                )),
+                ),
                 new_blocks,
-                None,
-            );
+            ));
         }
         let replacement_payloads: Vec<_> = new_blocks
             .iter()
@@ -1385,8 +1426,8 @@ async fn apply_reorg_offthread(
                 Ok(())
             },
         );
-        let view = if result.is_ok() {
-            if let Ok(reorg) = &result {
+        match result {
+            Ok(reorg) => {
                 let selection = match wallet.lock() {
                     Ok(guard) => guard
                         .as_ref()
@@ -1424,12 +1465,24 @@ async fn apply_reorg_offthread(
                         }
                     }
                 }
+                let confirmed_tx_hashes = new_blocks
+                    .iter()
+                    .flat_map(|candidate| {
+                        candidate.block.transactions.iter().map(|tx| tx.txid())
+                    })
+                    .collect();
+                let view = ChainView::from_mdbx(&ctx);
+                Ok(AppliedReorg {
+                    result: reorg,
+                    confirmed_tx_hashes,
+                    view,
+                })
             }
-            Some(ChainView::from_mdbx(&ctx))
-        } else {
-            None
-        };
-        (result, new_blocks, view)
+            Err(error) => {
+                drop(replacement_payloads);
+                Err((error, new_blocks))
+            }
+        }
     })
     .await
     .expect("apply_reorg_mdbx panicked in spawn_blocking")
@@ -1485,8 +1538,36 @@ fn validate_p2p_block_proof_binding(
 mod tests {
     use super::{
         compare_manifest_fork_choice, gap_requires_snapshot_sync,
-        verify_snapshot_history_proof_headers_anchored_with_minimum,
+        verify_snapshot_history_proof_headers_anchored_with_minimum, OrphanBlock,
+        ProvedBlockCandidate,
     };
+
+    #[test]
+    fn orphan_transfer_keeps_single_owned_proof_allocations() {
+        let block = noid_chain::block::Block {
+            header: noid_chain::consensus::genesis_header(),
+            transactions: Vec::new(),
+        };
+        let proof = vec![0xA5; 257];
+        let sidecar = vec![0x5A; 129];
+        let proof_ptr = proof.as_ptr();
+        let sidecar_ptr = sidecar.as_ptr();
+        let candidate = ProvedBlockCandidate {
+            block,
+            block_bytes_len: 33,
+            block_proof_bytes: proof,
+            block_auth_sidecar_bytes: sidecar,
+        };
+
+        let orphan = OrphanBlock::from_candidate(candidate);
+        assert_eq!(orphan.block_proof_bytes.as_ptr(), proof_ptr);
+        assert_eq!(orphan.block_auth_sidecar_bytes.as_ptr(), sidecar_ptr);
+        assert_eq!(orphan.retained_bytes(), 33 + 257 + 129);
+
+        let candidate = orphan.into_candidate();
+        assert_eq!(candidate.block_proof_bytes.as_ptr(), proof_ptr);
+        assert_eq!(candidate.block_auth_sidecar_bytes.as_ptr(), sidecar_ptr);
+    }
 
     #[test]
     fn sync_mode_uses_retained_block_window_boundary() {
@@ -2093,7 +2174,7 @@ async fn handle_p2p_events(
                 block_bytes,
                 block_proof_bytes,
                 block_auth_sidecar_bytes,
-                inbound_memory_permit: _inbound_memory_permit,
+                mut inbound_memory_permit,
             }) => {
                 // Per-peer block rate limit: prevents flood DoS.
                 // Each block requires chain.write() + PoW validation.
@@ -2117,8 +2198,13 @@ async fn handle_p2p_events(
                 }
 
                 tracing::debug!(peer = %from, "received block from P2P");
+                let block_bytes_len = block_bytes.len();
                 match noid_chain::block::Block::from_bytes(&block_bytes) {
                     Ok(block) => {
+                        // The decoded block is now the only retained block body.  Keep
+                        // the inbound permit until the owned candidate is committed,
+                        // rejected, or transferred to the byte-capped orphan pool.
+                        drop(block_bytes);
                         let local_time = unix_now();
                         let block_hash = noid_chain::consensus::pow::block_id(&block.header);
                         pending_block_fetches.remove(&(block.header.height, block_hash));
@@ -2166,26 +2252,35 @@ async fn handle_p2p_events(
 
                         let preverified_auth =
                             preverified_authorization_bytes(&mempool, &block).await;
+                        let candidate = ProvedBlockCandidate {
+                            block,
+                            block_bytes_len,
+                            block_proof_bytes,
+                            block_auth_sidecar_bytes,
+                        };
                         let apply_result = apply_p2p_block_offthread(
                             &chain,
                             &wallet,
-                            block.clone(),
-                            block_proof_bytes.clone(),
-                            block_auth_sidecar_bytes.clone(),
+                            candidate,
                             local_time,
                             preverified_auth,
                         )
                         .await;
 
                         match apply_result {
-                            Ok((_hash, new_view)) => {
-                                let height = block.header.height;
-                                let confirmed: Vec<_> = block
-                                    .transactions
-                                    .iter()
-                                    .map(|tx| tx.txid())
-                                    .collect();
-                                mempool.on_new_block(&confirmed, height, new_view).await;
+                            Ok(applied) => {
+                                // Proof/body buffers were consumed and dropped by the
+                                // blocking worker, so release the transport reservation
+                                // before any network or mempool await below.
+                                drop(inbound_memory_permit.take());
+                                let height = applied.height;
+                                mempool
+                                    .on_new_block(
+                                        &applied.confirmed_tx_hashes,
+                                        height,
+                                        applied.view,
+                                    )
+                                    .await;
                                 tracing::info!(height, "applied P2P block");
                                 last_tip_advance = Instant::now();
                                 sync_ready.notify_one(); // cancel/rebuild any active stale template
@@ -2204,37 +2299,36 @@ async fn handle_p2p_events(
                                     .await;
 
                                 // Apply the chain of orphans that build on the new block.
-                                let mut next_hash = block_hash;
+                                let mut next_hash = applied.block_hash;
                                 while let Some(orphan) = orphan_pool.remove(&next_hash) {
                                     let orphan_local_time = unix_now();
                                     let orphan_age_ms = orphan.received_at.elapsed().as_millis();
-                                    let orphan_block = orphan.block;
-                                    let orphan_proof_bytes = orphan.block_proof_bytes;
-                                    let orphan_auth_sidecar_bytes = orphan.block_auth_sidecar_bytes;
-                                    next_hash =
-                                        noid_chain::consensus::pow::block_id(&orphan_block.header);
+                                    let orphan_candidate = orphan.into_candidate();
                                     let orphan_preverified =
-                                        preverified_authorization_bytes(&mempool, &orphan_block)
-                                            .await;
+                                        preverified_authorization_bytes(
+                                            &mempool,
+                                            &orphan_candidate.block,
+                                        )
+                                        .await;
                                     let orphan_result = apply_p2p_block_offthread(
                                         &chain,
                                         &wallet,
-                                        orphan_block.clone(),
-                                        orphan_proof_bytes.clone(),
-                                        orphan_auth_sidecar_bytes.clone(),
+                                        orphan_candidate,
                                         orphan_local_time,
                                         orphan_preverified,
                                     )
                                     .await;
                                     match orphan_result {
-                                        Ok((_hash, nv)) => {
-                                            let h = orphan_block.header.height;
-                                            let conf: Vec<_> = orphan_block
-                                                .transactions
-                                                .iter()
-                                                .map(|tx| tx.txid())
-                                                .collect();
-                                            mempool.on_new_block(&conf, h, nv).await;
+                                        Ok(applied_orphan) => {
+                                            next_hash = applied_orphan.block_hash;
+                                            let h = applied_orphan.height;
+                                            mempool
+                                                .on_new_block(
+                                                    &applied_orphan.confirmed_tx_hashes,
+                                                    h,
+                                                    applied_orphan.view,
+                                                )
+                                                .await;
                                             tracing::info!(
                                                 height = h,
                                                 age_ms = orphan_age_ms,
@@ -2242,18 +2336,22 @@ async fn handle_p2p_events(
                                             );
                                             last_tip_advance = Instant::now();
                                         }
-                                        Err(e) => {
+                                        Err((e, rejected_orphan)) => {
+                                            drop(rejected_orphan);
                                             tracing::warn!(err = %e, "chained orphan apply failed");
                                             break;
                                         }
                                     }
                                 }
                             }
-                            Err(noid_chain::storage::MdbxContextError::Consensus(
-                                noid_chain::consensus::ConsensusError::BadParentHash,
+                            Err((
+                                noid_chain::storage::MdbxContextError::Consensus(
+                                    noid_chain::consensus::ConsensusError::BadParentHash,
+                                ),
+                                candidate,
                             )) => {
                                 // Check if the block's parent is already in our chain (potential reorg point).
-                                let parent_hash = block.header.prev_block_hash;
+                                let parent_hash = candidate.block.header.prev_block_hash;
                                 let our_tip = {
                                     let ctx = chain.read().await;
                                     (ctx.tip_height(), ctx.find_ancestor_height(&parent_hash))
@@ -2264,24 +2362,15 @@ async fn handle_p2p_events(
                                     Some(ancestor_height) if ancestor_height < our_tip_height => {
                                         // Parent IS in our chain — this block starts or extends a competing fork.
                                         // Collect the new chain: this block + any buffered orphans on top.
-                                        let mut new_chain = vec![ProvedBlockCandidate {
-                                            block: block.clone(),
-                                            block_proof_bytes: block_proof_bytes.clone(),
-                                            block_auth_sidecar_bytes: block_auth_sidecar_bytes.clone(),
-                                        }];
-                                        let mut next_hash =
-                                            noid_chain::consensus::pow::block_id(
-                                                &block.header,
-                                            );
+                                        let mut next_hash = noid_chain::consensus::pow::block_id(
+                                            &candidate.block.header,
+                                        );
+                                        let mut new_chain = vec![candidate];
                                         while let Some(orphan) = orphan_pool.remove(&next_hash) {
                                             next_hash = noid_chain::consensus::pow::block_id(
                                                 &orphan.block.header,
                                             );
-                                            new_chain.push(ProvedBlockCandidate {
-                                                block: orphan.block,
-                                                block_proof_bytes: orphan.block_proof_bytes,
-                                                block_auth_sidecar_bytes: orphan.block_auth_sidecar_bytes,
-                                            });
+                                            new_chain.push(orphan.into_candidate());
                                         }
 
                                         // Compare cumulative chainwork: the chain with MORE TOTAL PoW wins.
@@ -2352,7 +2441,7 @@ async fn handle_p2p_events(
                                                 mempool.reserved_slots().await;
                                             // Reorg off the async executor (MDBX fsync is blocking).
                                             // ChainView is built inside write lock (no extra read lock needed).
-                                            let (reorg_result, new_chain, maybe_reorg_view) = apply_reorg_offthread(
+                                            let reorg_result = apply_reorg_offthread(
                                                 &chain,
                                                 &wallet,
                                                 reorg_reserved_inputs,
@@ -2364,26 +2453,26 @@ async fn handle_p2p_events(
                                             .await;
 
                                             match reorg_result {
-                                                Ok(result) => {
-                                                    let new_view = maybe_reorg_view.unwrap();
-                                                    let confirmed_in_new: Vec<_> = new_chain
-                                                        .iter()
-                                                        .flat_map(|b| {
-                                                            b.block
-                                                                .transactions
-                                                                .iter()
-                                                                .map(|tx| tx.txid())
-                                                        })
-                                                        .collect();
+                                                Ok(applied_reorg) => {
+                                                    drop(inbound_memory_permit.take());
                                                     mempool
                                                         .on_new_block(
-                                                            &confirmed_in_new,
+                                                            &applied_reorg.confirmed_tx_hashes,
                                                             new_tip_height,
-                                                            new_view,
+                                                            applied_reorg.view,
                                                         )
                                                         .await;
 
-                                                    let reclaimed = result.reclaimed_tx_hashes.clone();
+                                                    let reverted = applied_reorg
+                                                        .result
+                                                        .reverted_heights
+                                                        .len();
+                                                    let applied = applied_reorg
+                                                        .result
+                                                        .applied_heights
+                                                        .len();
+                                                    let reclaimed =
+                                                        applied_reorg.result.reclaimed_tx_hashes;
                                                     mempool
                                                         .readmit_after_reorg(reclaimed)
                                                         .await;
@@ -2391,12 +2480,14 @@ async fn handle_p2p_events(
                                                     let new_tip = new_tip_height;
                                                     tracing::info!(
                                                         new_tip,
-                                                        reverted = result.reverted_heights.len(),
-                                                        applied = result.applied_heights.len(),
+                                                        reverted,
+                                                        applied,
                                                         "reorg complete"
                                                     );
                                                 }
-                                                Err(e) => {
+                                                Err((e, rejected_chain)) => {
+                                                    drop(rejected_chain);
+                                                    drop(inbound_memory_permit.take());
                                                     tracing::warn!(err = ?e, "reorg failed, keeping current chain");
                                                     tracing::info!(
                                                         peer = %from,
@@ -2431,20 +2522,25 @@ async fn handle_p2p_events(
                                                 "reorg: competing chain not longer, keeping current chain"
                                             );
                                             // Still buffer in case more blocks arrive from this fork.
+                                            let candidate = new_chain
+                                                .into_iter()
+                                                .next()
+                                                .expect("competing chain starts with received block");
+                                            // The synchronous insert below immediately transfers
+                                            // accounting to the byte-capped orphan pool.
+                                            drop(inbound_memory_permit.take());
                                             insert_orphan(
                                                 &mut orphan_pool,
-                                                OrphanBlock::new(
-                                                    block,
-                                                    block_bytes.len(),
-                                                    block_proof_bytes.clone(),
-                                                    block_auth_sidecar_bytes.clone(),
-                                                ),
+                                                OrphanBlock::from_candidate(candidate),
                                             );
                                         }
                                     }
                                     Some(_) => {
                                         // Ancestor IS our current tip — block just has wrong parent somehow.
-                                        tracing::debug!(peer = %from, height = block.header.height, "block rejected: already at tip height");
+                                        let height = candidate.block.header.height;
+                                        drop(candidate);
+                                        drop(inbound_memory_permit.take());
+                                        tracing::debug!(peer = %from, height, "block rejected: already at tip height");
                                     }
                                     None => {
                                         // Parent NOT in our chain.
@@ -2454,18 +2550,16 @@ async fn handle_p2p_events(
                                         //
                                         // FetchHeaders is only worth doing for shallow forks (within CONSENSUS_FINALITY_DEPTH)
                                         // where block-by-block reorg is possible.
-                                        let block_height = block.header.height;
+                                        let block_height = candidate.block.header.height;
                                         let is_deep_fork = block_height > our_tip_height
                                             && (block_height - our_tip_height) > CONSENSUS_FINALITY_DEPTH;
 
+                                        // Avoid double-reserving the same bytes: the synchronous
+                                        // insert enforces the independent orphan-pool byte cap.
+                                        drop(inbound_memory_permit.take());
                                         insert_orphan(
                                             &mut orphan_pool,
-                                            OrphanBlock::new(
-                                                block,
-                                                block_bytes.len(),
-                                                block_proof_bytes.clone(),
-                                                block_auth_sidecar_bytes.clone(),
-                                            ),
+                                            OrphanBlock::from_candidate(candidate),
                                         );
 
                                         if is_deep_fork {
@@ -2533,7 +2627,9 @@ async fn handle_p2p_events(
                                     }
                                 }
                             }
-                            Err(e) => {
+                            Err((e, rejected_candidate)) => {
+                                drop(rejected_candidate);
+                                drop(inbound_memory_permit.take());
                                 tracing::warn!(peer = %from, err = %e, "P2P block rejected");
                             }
                         }
