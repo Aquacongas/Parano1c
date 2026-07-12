@@ -7,7 +7,8 @@
 //! matrix lease contract.  This node/miner layer connects that contract to the
 //! disk-backed production matrix source and the same process-global exclusion
 //! ledger used by native and recursive proving. Its byte reservation covers
-//! only bounded streaming scratch; it does not pretend to allocate an m24 CSR.
+//! the hard-cap-derived compact-registry materialization envelope plus bounded
+//! streaming scratch; it does not pretend to allocate an m24 CSR.
 
 use std::fmt;
 
@@ -15,10 +16,15 @@ use noid_chain::BlockHeader;
 use noid_recursive::{
     verify_selected_history_terminal, CanonicalSelectedHistoryRegistry, ChainAccumulator,
     SelectedHistoryMatrixFamily, SelectedHistoryMatrixLease, SelectedHistoryMatrixRequest,
-    SelectedHistoryMatrixSource, SelectedHistoryTerminalPackage, SelectedHistoryVerificationError,
+    SelectedHistoryMatrixSource, SelectedHistoryRegistryError, SelectedHistoryTerminalPackage,
+    SelectedHistoryVerificationError,
 };
 
 use crate::memory_governor::{ProofMemoryGovernor, ProofMemoryPressure, ProofMemoryReservation};
+use crate::recursive_class_registry_store::{
+    LoadedSelectedRecursiveClassRegistry, LocalSelectedRecursiveClassRegistryError,
+    LocalSelectedRecursiveClassRegistryStore,
+};
 use crate::recursive_matrix_store::{
     LoadedSelectedRecursiveMatrixView, LocalSelectedRecursiveMatrixError,
     LocalSelectedRecursiveMatrixSource, SelectedRecursiveMatrixArtifactIdentity,
@@ -71,14 +77,18 @@ impl SelectedHistoryMatrixSource for LocalSelectedRecursiveMatrixSource {
     }
 }
 
-/// Production terminal-verification failure.  Memory pressure is reported
-/// before any matrix artifact is opened.
+/// Production terminal-verification failure.  The pinned production entrypoint
+/// reports memory pressure before the registry or any matrix artifact opens.
 #[derive(Debug)]
 pub enum SelectedHistoryTerminalVerifierError {
     MemoryPressure {
         required_mib: usize,
         available_mib: usize,
     },
+    RegistryLoad(LocalSelectedRecursiveClassRegistryError),
+    RegistryPolicy(SelectedHistoryRegistryError),
+    RegistryNotLoaded,
+    RegistryAlreadyLoaded,
     Verification(SelectedHistoryVerificationError),
 }
 
@@ -92,6 +102,18 @@ impl fmt::Display for SelectedHistoryTerminalVerifierError {
                 f,
                 "selected-history verification needs {required_mib} MiB; {available_mib} MiB is available"
             ),
+            Self::RegistryLoad(error) => {
+                write!(f, "selected-history pinned registry load: {error}")
+            }
+            Self::RegistryPolicy(error) => {
+                write!(f, "selected-history terminal registry policy: {error}")
+            }
+            Self::RegistryNotLoaded => {
+                f.write_str("selected-history pinned registry was not loaded in this session")
+            }
+            Self::RegistryAlreadyLoaded => {
+                f.write_str("selected-history session already owns a pinned registry")
+            }
             Self::Verification(error) => write!(f, "selected-history verification: {error}"),
         }
     }
@@ -101,6 +123,10 @@ impl std::error::Error for SelectedHistoryTerminalVerifierError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::MemoryPressure { .. } => None,
+            Self::RegistryLoad(error) => Some(error),
+            Self::RegistryPolicy(error) => Some(error),
+            Self::RegistryNotLoaded => None,
+            Self::RegistryAlreadyLoaded => None,
             Self::Verification(error) => Some(error),
         }
     }
@@ -121,17 +147,77 @@ impl From<SelectedHistoryVerificationError> for SelectedHistoryTerminalVerifierE
     }
 }
 
-/// One process-global m24 admission held throughout terminal proof replay,
-/// every sequential matrix lease, all live-lane checks, and the final local
-/// accumulator boundary decision.
+impl From<LocalSelectedRecursiveClassRegistryError> for SelectedHistoryTerminalVerifierError {
+    fn from(value: LocalSelectedRecursiveClassRegistryError) -> Self {
+        Self::RegistryLoad(value)
+    }
+}
+
+impl From<SelectedHistoryRegistryError> for SelectedHistoryTerminalVerifierError {
+    fn from(value: SelectedHistoryRegistryError) -> Self {
+        Self::RegistryPolicy(value)
+    }
+}
+
+/// One process-global admission held throughout pinned-registry
+/// materialization, terminal proof replay, every sequential matrix lease, all
+/// live-lane checks, and the final local accumulator boundary decision.
 #[must_use = "dropping the session releases selected-history verification admission"]
 pub struct SelectedHistoryTerminalVerificationSession {
     _reservation: ProofMemoryReservation,
+    // Keeping the registry inside the session makes it impossible for the
+    // pinned materialization performed through this API to outlive admission.
+    loaded_registry: Option<LoadedSelectedRecursiveClassRegistry>,
 }
 
 impl SelectedHistoryTerminalVerificationSession {
-    pub fn verify<S: SelectedHistoryMatrixSource>(
+    /// Read, authenticate, preflight, and materialize the compact registry
+    /// after this session has acquired the process-global 384 MiB envelope.
+    /// The session admits exactly one load so two materialized registries can
+    /// never overlap inside the single-registry envelope. The loaded value is
+    /// never returned detached from its owning admission guard.
+    pub fn load_pinned_registry(
         &mut self,
+        store: &LocalSelectedRecursiveClassRegistryStore,
+        expected_registry_digest: [u8; 32],
+    ) -> Result<(), SelectedHistoryTerminalVerifierError> {
+        if self.loaded_registry.is_some() {
+            return Err(SelectedHistoryTerminalVerifierError::RegistryAlreadyLoaded);
+        }
+        let loaded = store.load_pinned(expected_registry_digest)?;
+        // Validate the terminal-only borrowed view before publishing the
+        // loaded registry into session state.
+        loaded.terminal_registry()?;
+        self.loaded_registry = Some(loaded);
+        Ok(())
+    }
+
+    /// Verify with the pinned registry materialized by this same admission
+    /// session. Registry ownership, the process-global proof exclusion and all
+    /// sequential matrix leases therefore share one lexical lifetime.
+    pub fn verify_with_loaded_registry<S: SelectedHistoryMatrixSource>(
+        &self,
+        package: &SelectedHistoryTerminalPackage,
+        local_tip_header: &BlockHeader,
+        local_epoch_anchor_header: &BlockHeader,
+        matrix_source: &mut S,
+    ) -> Result<ChainAccumulator, SelectedHistoryTerminalVerifierError> {
+        let loaded = self
+            .loaded_registry
+            .as_ref()
+            .ok_or(SelectedHistoryTerminalVerifierError::RegistryNotLoaded)?;
+        let registry = loaded.terminal_registry()?;
+        self.verify(
+            package,
+            &registry,
+            local_tip_header,
+            local_epoch_anchor_header,
+            matrix_source,
+        )
+    }
+
+    pub fn verify<S: SelectedHistoryMatrixSource>(
+        &self,
         package: &SelectedHistoryTerminalPackage,
         registry: &CanonicalSelectedHistoryRegistry<'_>,
         local_tip_header: &BlockHeader,
@@ -149,7 +235,8 @@ impl SelectedHistoryTerminalVerificationSession {
     }
 }
 
-/// Acquire production terminal-verification admission before any matrix load.
+/// Acquire the complete production terminal-verification admission before
+/// pinned-registry materialization or any matrix load.
 pub fn begin_selected_history_terminal_verification_session(
 ) -> Result<SelectedHistoryTerminalVerificationSession, SelectedHistoryTerminalVerifierError> {
     begin_terminal_verification_with_governor(&ProofMemoryGovernor::global(0))
@@ -160,12 +247,15 @@ fn begin_terminal_verification_with_governor(
 ) -> Result<SelectedHistoryTerminalVerificationSession, SelectedHistoryTerminalVerifierError> {
     Ok(SelectedHistoryTerminalVerificationSession {
         _reservation: governor.try_reserve_for_selected_history_terminal_verification()?,
+        loaded_registry: None,
     })
 }
 
-/// Production one-shot entrypoint.  The shared m24 reservation is acquired
+/// One-shot verifier for a registry that the caller already materialized under
+/// an equal or larger owning admission. The terminal reservation is acquired
 /// before the recursive verifier can request its first disk matrix and is
-/// released only after the accumulator/tip decision returns.
+/// released only after the accumulator/tip decision returns. New runtime code
+/// should prefer [`verify_selected_history_terminal_pinned_governed`].
 pub fn verify_selected_history_terminal_governed<S: SelectedHistoryMatrixSource>(
     package: &SelectedHistoryTerminalPackage,
     registry: &CanonicalSelectedHistoryRegistry<'_>,
@@ -173,10 +263,31 @@ pub fn verify_selected_history_terminal_governed<S: SelectedHistoryMatrixSource>
     local_epoch_anchor_header: &BlockHeader,
     matrix_source: &mut S,
 ) -> Result<ChainAccumulator, SelectedHistoryTerminalVerifierError> {
-    let mut session = begin_selected_history_terminal_verification_session()?;
+    let session = begin_selected_history_terminal_verification_session()?;
     session.verify(
         package,
         registry,
+        local_tip_header,
+        local_epoch_anchor_header,
+        matrix_source,
+    )
+}
+
+/// Production pinned-registry entrypoint. Admission is acquired before the
+/// registry artifact is opened, and the same owning session retains both the
+/// registry and the process-global exclusion through terminal verification.
+pub fn verify_selected_history_terminal_pinned_governed<S: SelectedHistoryMatrixSource>(
+    package: &SelectedHistoryTerminalPackage,
+    registry_store: &LocalSelectedRecursiveClassRegistryStore,
+    expected_registry_digest: [u8; 32],
+    local_tip_header: &BlockHeader,
+    local_epoch_anchor_header: &BlockHeader,
+    matrix_source: &mut S,
+) -> Result<ChainAccumulator, SelectedHistoryTerminalVerifierError> {
+    let mut session = begin_selected_history_terminal_verification_session()?;
+    session.load_pinned_registry(registry_store, expected_registry_digest)?;
+    session.verify_with_loaded_registry(
+        package,
         local_tip_header,
         local_epoch_anchor_header,
         matrix_source,
@@ -217,6 +328,7 @@ mod tests {
             _reservation: governor
                 .try_reserve_selected_history_terminal_with_available(Some(2 * 1024))
                 .expect("first terminal verification admission"),
+            loaded_registry: None,
         };
 
         assert!(governor
@@ -228,6 +340,28 @@ mod tests {
         governor
             .try_reserve_selected_history_terminal_with_available(Some(2 * 1024))
             .expect("dropping terminal session releases shared admission");
+    }
+
+    #[test]
+    fn pinned_registry_load_stays_inside_terminal_admission() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = LocalSelectedRecursiveClassRegistryStore::new(directory.path());
+        let governor = ProofMemoryGovernor::new(8 * 1024);
+        let mut session = begin_terminal_verification_with_governor(&governor)
+            .expect("terminal admission before registry I/O");
+
+        assert!(session.load_pinned_registry(&store, [0u8; 32]).is_err());
+        assert!(
+            governor.try_reserve_for_recursive_tier(8).is_err(),
+            "a failed registry load must not release the owning session"
+        );
+
+        drop(session);
+        drop(
+            governor
+                .try_reserve_for_recursive_tier(8)
+                .expect("session drop releases process-global proof exclusion"),
+        );
     }
 
     #[test]
@@ -245,5 +379,27 @@ mod tests {
             .expect("terminal reservation");
         let verify = entrypoint.find("session.verify(").expect("terminal verify");
         assert!(reserve < verify);
+    }
+
+    #[test]
+    fn pinned_entrypoint_reserves_before_loading_registry() {
+        let source = include_str!("selected_history_verifier.rs");
+        let entrypoint = source
+            .split("pub fn verify_selected_history_terminal_pinned_governed<")
+            .nth(1)
+            .expect("pinned governed entrypoint")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("entrypoint boundary");
+        let reserve = entrypoint
+            .find("begin_selected_history_terminal_verification_session()")
+            .expect("terminal reservation");
+        let load = entrypoint
+            .find("session.load_pinned_registry(")
+            .expect("pinned registry load");
+        let verify = entrypoint
+            .find("session.verify_with_loaded_registry(")
+            .expect("terminal verification");
+        assert!(reserve < load && load < verify);
     }
 }

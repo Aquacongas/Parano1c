@@ -9,15 +9,14 @@
 //! lease until the returned value is dropped. It never caches a matrix or a
 //! complete serialized artifact.
 
-use std::ffi::OsString;
-use std::fs::{self, File, Metadata, OpenOptions};
+use std::fs::{self, File, Metadata};
 use std::io::{self, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::MetadataExt;
 
 use noid_ivc_core::field_r1cs::{
     FieldR1cs, FieldR1csArtifactError, PreflightSeekableFieldR1csArtifact,
@@ -28,6 +27,8 @@ use noid_ivc_core::matrix_claim::{
 use noid_ivc_core::proof::FieldShape;
 use thiserror::Error;
 
+#[cfg(unix)]
+use crate::anchored_artifact_fs;
 use crate::recursive_prover::{
     LoadedSelectedRecursiveMatrix, SelectedRecursiveMatrixKind, SelectedRecursiveMatrixRequest,
     SelectedRecursiveMatrixSource, SelectedRecursiveTier,
@@ -141,8 +142,10 @@ pub enum LocalSelectedRecursiveMatrixError {
     NotRegularFile { path: PathBuf },
     #[error("matrix artifact is too large: {actual} bytes exceeds cap {max}")]
     ArtifactTooLarge { actual: u64, max: u64 },
-    #[error("matrix artifact changed between path preflight and file open: {path}")]
+    #[error("matrix artifact changed while its opened file was being consumed: {path}")]
     ArtifactChanged { path: PathBuf },
+    #[error("secure descriptor-relative matrix storage is unsupported on this platform")]
+    UnsupportedPlatform,
     #[error("matrix export shape does not match the requested canonical identity")]
     ExportShapeMismatch {
         expected: FieldShape,
@@ -166,10 +169,11 @@ pub enum LocalSelectedRecursiveMatrixError {
 
 /// Local disk-backed matrix source and atomic exporter.
 ///
-/// `root` is a trusted node-local directory boundary. Every path below it is
-/// fixed by [`SelectedRecursiveMatrixKind`]; the `v1` directory and artifact
-/// leaf are checked against symlinks. The artifact's shape and digest remain
-/// the cryptographic authority even if local files are substituted.
+/// Every root and version-directory component is opened with `O_NOFOLLOW`, and
+/// all leaf I/O is relative to the held version-directory descriptor. Paths
+/// are fixed by [`SelectedRecursiveMatrixKind`]. The artifact's shape and
+/// digest remain the cryptographic authority even if local files are
+/// substituted.
 pub struct LocalSelectedRecursiveMatrixSource {
     root: PathBuf,
     max_artifact_bytes: u64,
@@ -255,57 +259,18 @@ impl LocalSelectedRecursiveMatrixSource {
         identity: SelectedRecursiveMatrixArtifactIdentity,
         matrix: &FieldR1cs,
     ) -> Result<(), LocalSelectedRecursiveMatrixError> {
-        let actual_shape = FieldShape::of(matrix);
-        if actual_shape != identity.shape() {
-            return Err(LocalSelectedRecursiveMatrixError::ExportShapeMismatch {
-                expected: identity.shape(),
-                actual: actual_shape,
-            });
-        }
-        let actual_digest = matrix.structural_statement_digest();
-        if actual_digest != identity.statement_digest() {
-            return Err(LocalSelectedRecursiveMatrixError::ExportDigestMismatch {
-                expected: identity.statement_digest(),
-                actual: actual_digest,
-            });
-        }
+        validate_export_identity(identity, matrix)?;
 
-        self.prepare_write_layout()?;
-        let target = self.artifact_path(identity.kind());
-        match fs::symlink_metadata(&target) {
-            Ok(metadata) => validate_regular_file_metadata(&target, &metadata)?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(source) => return Err(io_error("stat", &target, source)),
+        #[cfg(not(unix))]
+        {
+            let _ = (identity, matrix);
+            Err(LocalSelectedRecursiveMatrixError::UnsupportedPlatform)
         }
-        let parent = target.parent().expect("fixed matrix path has parent");
-        validate_directory(parent)?;
-
-        let (temporary, file) = create_temporary_file(parent, &target)?;
-        let mut cleanup = TemporaryCleanup::new(temporary.clone());
-        let mut writer = CappedWriter::new(file, self.effective_max_bytes());
-        let write_result = matrix.write_artifact(&mut writer);
-        if let Some(actual) = writer.exceeded_at() {
-            return Err(LocalSelectedRecursiveMatrixError::ArtifactTooLarge {
-                actual,
-                max: self.effective_max_bytes(),
-            });
+        #[cfg(unix)]
+        {
+            let parent = self.open_version_directory(true)?;
+            self.export_matrix_anchored(&parent, identity.kind(), matrix)
         }
-        write_result.map_err(LocalSelectedRecursiveMatrixError::Codec)?;
-        writer
-            .flush()
-            .map_err(|source| io_error("flush", &temporary, source))?;
-        writer
-            .inner()
-            .sync_all()
-            .map_err(|source| io_error("sync", &temporary, source))?;
-        drop(writer);
-
-        fs::rename(&temporary, &target).map_err(|source| io_error("rename", &target, source))?;
-        cleanup.disarm();
-        File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|source| io_error("sync directory", parent, source))?;
-        Ok(())
     }
 
     fn load_requested(
@@ -314,29 +279,49 @@ impl LocalSelectedRecursiveMatrixSource {
         shape: FieldShape,
         statement_digest: [u8; 32],
     ) -> Result<LoadedSelectedRecursiveMatrix, LocalSelectedRecursiveMatrixError> {
-        let lease = ResidentMatrixLease::acquire(Arc::clone(&self.resident))?;
-        let path = self.artifact_path(kind);
-        let parent = path.parent().expect("fixed matrix path has parent");
-        validate_directory(&self.root)?;
-        validate_directory(parent)?;
-
-        let before =
-            fs::symlink_metadata(&path).map_err(|source| io_error("stat", &path, source))?;
-        validate_regular_file_metadata(&path, &before)?;
-        let cap = self.effective_max_bytes();
-        reject_oversize(before.len(), cap)?;
-
-        let file = open_artifact_read_only(&path)?;
-        let opened = file
-            .metadata()
-            .map_err(|source| io_error("inspect opened", &path, source))?;
-        validate_regular_file_metadata(&path, &opened)?;
-        if !same_file_and_length(&before, &opened) {
-            return Err(LocalSelectedRecursiveMatrixError::ArtifactChanged { path });
+        #[cfg(not(unix))]
+        {
+            let _ = (kind, shape, statement_digest);
+            Err(LocalSelectedRecursiveMatrixError::UnsupportedPlatform)
         }
-        reject_oversize(opened.len(), cap)?;
+        #[cfg(unix)]
+        {
+            let lease = ResidentMatrixLease::acquire(Arc::clone(&self.resident))?;
+            let parent = self.open_version_directory(false)?;
+            self.load_requested_anchored(&parent, kind, shape, statement_digest, lease)
+        }
+    }
 
-        let decoder_cap = usize::try_from(cap).unwrap_or(usize::MAX);
+    fn open_requested_view(
+        &self,
+        kind: SelectedRecursiveMatrixKind,
+        shape: FieldShape,
+        statement_digest: [u8; 32],
+    ) -> Result<LoadedSelectedRecursiveMatrixView, LocalSelectedRecursiveMatrixError> {
+        #[cfg(not(unix))]
+        {
+            let _ = (kind, shape, statement_digest);
+            Err(LocalSelectedRecursiveMatrixError::UnsupportedPlatform)
+        }
+        #[cfg(unix)]
+        {
+            let lease = ResidentMatrixLease::acquire(Arc::clone(&self.resident))?;
+            let parent = self.open_version_directory(false)?;
+            self.open_requested_view_anchored(&parent, kind, shape, statement_digest, lease)
+        }
+    }
+
+    #[cfg(unix)]
+    fn load_requested_anchored(
+        &self,
+        parent: &anchored_artifact_fs::AnchoredDirectory,
+        kind: SelectedRecursiveMatrixKind,
+        shape: FieldShape,
+        statement_digest: [u8; 32],
+        lease: ResidentMatrixLease,
+    ) -> Result<LoadedSelectedRecursiveMatrix, LocalSelectedRecursiveMatrixError> {
+        let (file, opened, path) = self.open_anchored_artifact(parent, kind)?;
+        let decoder_cap = usize::try_from(self.effective_max_bytes()).unwrap_or(usize::MAX);
         let mut reader = BufReader::with_capacity(ARTIFACT_READ_BUFFER_BYTES, file);
         let matrix = FieldR1cs::read_artifact(&mut reader, shape, statement_digest, decoder_cap)
             .map_err(LocalSelectedRecursiveMatrixError::Codec)?;
@@ -356,34 +341,23 @@ impl LocalSelectedRecursiveMatrixSource {
         ))
     }
 
-    fn open_requested_view(
+    #[cfg(unix)]
+    fn open_requested_view_anchored(
         &self,
+        parent: &anchored_artifact_fs::AnchoredDirectory,
         kind: SelectedRecursiveMatrixKind,
         shape: FieldShape,
         statement_digest: [u8; 32],
+        lease: ResidentMatrixLease,
     ) -> Result<LoadedSelectedRecursiveMatrixView, LocalSelectedRecursiveMatrixError> {
-        let lease = ResidentMatrixLease::acquire(Arc::clone(&self.resident))?;
-        let path = self.artifact_path(kind);
-        let parent = path.parent().expect("fixed matrix path has parent");
-        validate_directory(&self.root)?;
-        validate_directory(parent)?;
-
-        let before =
-            fs::symlink_metadata(&path).map_err(|source| io_error("stat", &path, source))?;
-        validate_regular_file_metadata(&path, &before)?;
-        let cap = self.effective_max_bytes();
-        reject_oversize(before.len(), cap)?;
-
-        let file = open_artifact_read_only(&path)?;
-        let opened = file
-            .metadata()
-            .map_err(|source| io_error("inspect opened", &path, source))?;
-        validate_regular_file_metadata(&path, &opened)?;
-        if !same_file_and_length(&before, &opened) {
-            return Err(LocalSelectedRecursiveMatrixError::ArtifactChanged { path });
-        }
-        let view = PreflightSeekableFieldR1csArtifact::open(file, shape, statement_digest, cap)
-            .map_err(LocalSelectedRecursiveMatrixError::Codec)?;
+        let (file, opened, path) = self.open_anchored_artifact(parent, kind)?;
+        let view = PreflightSeekableFieldR1csArtifact::open(
+            file,
+            shape,
+            statement_digest,
+            self.effective_max_bytes(),
+        )
+        .map_err(LocalSelectedRecursiveMatrixError::Codec)?;
         let after = view
             .reader()
             .metadata()
@@ -400,23 +374,115 @@ impl LocalSelectedRecursiveMatrixSource {
         })
     }
 
-    fn effective_max_bytes(&self) -> u64 {
-        self.max_artifact_bytes.min(usize::MAX as u64)
+    #[cfg(unix)]
+    fn open_anchored_artifact(
+        &self,
+        parent: &anchored_artifact_fs::AnchoredDirectory,
+        kind: SelectedRecursiveMatrixKind,
+    ) -> Result<(File, Metadata, PathBuf), LocalSelectedRecursiveMatrixError> {
+        let path = self.artifact_path(kind);
+        let leaf = selected_recursive_matrix_leaf(kind);
+        match parent
+            .leaf_kind(leaf)
+            .map_err(|source| io_error("inspect anchored leaf", &path, source))?
+        {
+            anchored_artifact_fs::LeafKind::Regular => {}
+            anchored_artifact_fs::LeafKind::Symlink => {
+                return Err(LocalSelectedRecursiveMatrixError::Symlink { path });
+            }
+            anchored_artifact_fs::LeafKind::Other => {
+                return Err(LocalSelectedRecursiveMatrixError::NotRegularFile { path });
+            }
+            anchored_artifact_fs::LeafKind::Missing => {
+                return Err(io_error(
+                    "open anchored leaf",
+                    &path,
+                    io::Error::new(io::ErrorKind::NotFound, "matrix artifact is missing"),
+                ));
+            }
+        }
+
+        let file = parent
+            .open_read_only(leaf)
+            .map_err(|source| io_error("open anchored leaf", &path, source))?;
+        let opened = file
+            .metadata()
+            .map_err(|source| io_error("inspect opened", &path, source))?;
+        validate_regular_file_metadata(&path, &opened)?;
+        reject_oversize(opened.len(), self.effective_max_bytes())?;
+        Ok((file, opened, path))
     }
 
-    fn prepare_write_layout(&self) -> Result<(), LocalSelectedRecursiveMatrixError> {
-        if !self.root.exists() {
-            fs::create_dir_all(&self.root)
-                .map_err(|source| io_error("create directory", &self.root, source))?;
+    #[cfg(unix)]
+    fn export_matrix_anchored(
+        &self,
+        parent: &anchored_artifact_fs::AnchoredDirectory,
+        kind: SelectedRecursiveMatrixKind,
+        matrix: &FieldR1cs,
+    ) -> Result<(), LocalSelectedRecursiveMatrixError> {
+        let target = self.artifact_path(kind);
+        let leaf = selected_recursive_matrix_leaf(kind);
+        match parent
+            .leaf_kind(leaf)
+            .map_err(|source| io_error("inspect anchored target", &target, source))?
+        {
+            anchored_artifact_fs::LeafKind::Missing | anchored_artifact_fs::LeafKind::Regular => {}
+            anchored_artifact_fs::LeafKind::Symlink => {
+                return Err(LocalSelectedRecursiveMatrixError::Symlink { path: target });
+            }
+            anchored_artifact_fs::LeafKind::Other => {
+                return Err(LocalSelectedRecursiveMatrixError::NotRegularFile { path: target });
+            }
         }
-        validate_directory(&self.root)?;
-        let version = self.root.join(ARTIFACT_VERSION_DIRECTORY);
-        match fs::create_dir(&version) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(source) => return Err(io_error("create directory", &version, source)),
+
+        let (temporary_name, file) = create_temporary_file(parent, &target)?;
+        let temporary_path = target
+            .parent()
+            .expect("fixed matrix path has parent")
+            .join(&temporary_name);
+        let mut cleanup = TemporaryCleanup::new(parent, temporary_name.clone(), target.clone())?;
+        let mut writer = CappedWriter::new(file, self.effective_max_bytes());
+        let write_result = matrix.write_artifact(&mut writer);
+        if let Some(actual) = writer.exceeded_at() {
+            return Err(LocalSelectedRecursiveMatrixError::ArtifactTooLarge {
+                actual,
+                max: self.effective_max_bytes(),
+            });
         }
-        validate_directory(&version)
+        write_result.map_err(LocalSelectedRecursiveMatrixError::Codec)?;
+        writer
+            .flush()
+            .map_err(|source| io_error("flush", &temporary_path, source))?;
+        writer
+            .inner()
+            .sync_all()
+            .map_err(|source| io_error("sync", &temporary_path, source))?;
+        drop(writer);
+
+        parent
+            .rename(&temporary_name, leaf)
+            .map_err(|source| io_error("rename anchored artifact", &target, source))?;
+        cleanup.disarm();
+        parent
+            .sync_all()
+            .map_err(|source| io_error("sync anchored directory", &target, source))?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn open_version_directory(
+        &self,
+        create: bool,
+    ) -> Result<anchored_artifact_fs::AnchoredDirectory, LocalSelectedRecursiveMatrixError> {
+        let root = anchored_artifact_fs::AnchoredDirectory::open_tree(&self.root, create)
+            .map_err(|source| directory_open_error(&self.root, source))?;
+        let version_path = self.root.join(ARTIFACT_VERSION_DIRECTORY);
+        root.open_child_directory(ARTIFACT_VERSION_DIRECTORY, create)
+            .map_err(|source| directory_open_error(&version_path, source))
+    }
+
+    fn effective_max_bytes(&self) -> u64 {
+        self.max_artifact_bytes.min(usize::MAX as u64)
     }
 }
 
@@ -490,19 +556,51 @@ impl Drop for LoadedSelectedRecursiveMatrixView {
     }
 }
 
-fn validate_directory(path: &Path) -> Result<(), LocalSelectedRecursiveMatrixError> {
-    let metadata = fs::symlink_metadata(path).map_err(|source| io_error("stat", path, source))?;
-    if metadata.file_type().is_symlink() {
-        return Err(LocalSelectedRecursiveMatrixError::Symlink {
-            path: path.to_path_buf(),
+fn validate_export_identity(
+    identity: SelectedRecursiveMatrixArtifactIdentity,
+    matrix: &FieldR1cs,
+) -> Result<(), LocalSelectedRecursiveMatrixError> {
+    let actual_shape = FieldShape::of(matrix);
+    if actual_shape != identity.shape() {
+        return Err(LocalSelectedRecursiveMatrixError::ExportShapeMismatch {
+            expected: identity.shape(),
+            actual: actual_shape,
         });
     }
-    if !metadata.is_dir() {
-        return Err(LocalSelectedRecursiveMatrixError::NotDirectory {
-            path: path.to_path_buf(),
+    let actual_digest = matrix.structural_statement_digest();
+    if actual_digest != identity.statement_digest() {
+        return Err(LocalSelectedRecursiveMatrixError::ExportDigestMismatch {
+            expected: identity.statement_digest(),
+            actual: actual_digest,
         });
     }
     Ok(())
+}
+
+fn selected_recursive_matrix_leaf(kind: SelectedRecursiveMatrixKind) -> &'static str {
+    selected_recursive_matrix_relative_path(kind)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .expect("fixed ASCII matrix path has a file name")
+}
+
+#[cfg(unix)]
+fn directory_open_error(path: &Path, source: io::Error) -> LocalSelectedRecursiveMatrixError {
+    // This path lookup is diagnostic only. Security comes from the held
+    // descriptor and its component-wise O_NOFOLLOW walk.
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink() {
+            return LocalSelectedRecursiveMatrixError::Symlink {
+                path: path.to_path_buf(),
+            };
+        }
+        if !metadata.is_dir() {
+            return LocalSelectedRecursiveMatrixError::NotDirectory {
+                path: path.to_path_buf(),
+            };
+        }
+    }
+    io_error("open anchored directory", path, source)
 }
 
 fn validate_regular_file_metadata(
@@ -545,45 +643,30 @@ fn same_file_and_length(left: &Metadata, right: &Metadata) -> bool {
     left.len() == right.len() && left.is_file() == right.is_file()
 }
 
-fn open_artifact_read_only(path: &Path) -> Result<File, LocalSelectedRecursiveMatrixError> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
-    options
-        .open(path)
-        .map_err(|source| io_error("open", path, source))
-}
-
+#[cfg(unix)]
 fn create_temporary_file(
-    parent: &Path,
+    parent: &anchored_artifact_fs::AnchoredDirectory,
     target: &Path,
-) -> Result<(PathBuf, File), LocalSelectedRecursiveMatrixError> {
+) -> Result<(String, File), LocalSelectedRecursiveMatrixError> {
     let leaf = target
         .file_name()
-        .expect("fixed matrix artifact path has a file name");
+        .and_then(|value| value.to_str())
+        .expect("fixed ASCII matrix artifact has a file name");
     let mut last_error = None;
     for _ in 0..TEMP_CREATE_ATTEMPTS {
         let sequence = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
-        let mut temporary_name = OsString::from(".");
-        temporary_name.push(leaf);
-        temporary_name.push(format!(".tmp-{}-{sequence}", std::process::id()));
-        let temporary = parent.join(temporary_name);
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
-        match options.open(&temporary) {
+        let temporary = format!(".{leaf}.tmp-{}-{sequence}", std::process::id());
+        match parent.create_new(&temporary) {
             Ok(file) => return Ok((temporary, file)),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 last_error = Some(error);
             }
-            Err(source) => return Err(io_error("create temporary", &temporary, source)),
+            Err(source) => return Err(io_error("create anchored temporary", target, source)),
         }
     }
     Err(io_error(
-        "create temporary",
-        parent,
+        "create anchored temporary",
+        target,
         last_error.unwrap_or_else(|| io::Error::new(io::ErrorKind::AlreadyExists, "collision")),
     ))
 }
@@ -630,14 +713,29 @@ impl Drop for ResidentMatrixLease {
     }
 }
 
+#[cfg(unix)]
 struct TemporaryCleanup {
-    path: PathBuf,
+    parent: anchored_artifact_fs::AnchoredDirectory,
+    name: String,
+    display_path: PathBuf,
     armed: bool,
 }
 
+#[cfg(unix)]
 impl TemporaryCleanup {
-    fn new(path: PathBuf) -> Self {
-        Self { path, armed: true }
+    fn new(
+        parent: &anchored_artifact_fs::AnchoredDirectory,
+        name: String,
+        display_path: PathBuf,
+    ) -> Result<Self, LocalSelectedRecursiveMatrixError> {
+        Ok(Self {
+            parent: parent
+                .try_clone()
+                .map_err(|source| io_error("clone anchored directory", &display_path, source))?,
+            name,
+            display_path,
+            armed: true,
+        })
     }
 
     fn disarm(&mut self) {
@@ -645,10 +743,12 @@ impl TemporaryCleanup {
     }
 }
 
+#[cfg(unix)]
 impl Drop for TemporaryCleanup {
     fn drop(&mut self) {
         if self.armed {
-            let _ = fs::remove_file(&self.path);
+            let _ = self.parent.unlink(&self.name);
+            let _ = &self.display_path;
         }
     }
 }
@@ -706,6 +806,8 @@ impl<W: Write> Write for CappedWriter<W> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::ffi::OsString;
+    use std::fs::OpenOptions;
 
     use noid_ivc_core::field::F128;
     use noid_ivc_core::field_circuit::FieldR1csBuilder;
@@ -841,14 +943,23 @@ mod tests {
     #[test]
     fn terminal_view_source_never_invokes_full_csr_decoder() {
         let store = include_str!("recursive_matrix_store.rs");
-        let view_loader = store
+        let view_entry = store
             .split("fn open_requested_view(")
             .nth(1)
             .expect("seekable view loader")
-            .split("fn effective_max_bytes")
+            .split("fn load_requested_anchored")
             .next()
-            .expect("view loader boundary");
+            .expect("view entry boundary");
+        let view_loader = store
+            .split("fn open_requested_view_anchored(")
+            .nth(1)
+            .expect("anchored seekable view loader")
+            .split("fn open_anchored_artifact")
+            .next()
+            .expect("anchored view boundary");
+        assert!(view_entry.contains("open_requested_view_anchored"));
         assert!(view_loader.contains("PreflightSeekableFieldR1csArtifact::open"));
+        assert!(!view_entry.contains("FieldR1cs::read_artifact"));
         assert!(!view_loader.contains("FieldR1cs::read_artifact"));
 
         let verifier = include_str!("selected_history_verifier.rs");
@@ -1108,5 +1219,98 @@ mod tests {
             ),
             Err(LocalSelectedRecursiveMatrixError::Symlink { .. })
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn anchored_read_cannot_be_redirected_by_parent_symlink_swap() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("root");
+        let source = isolated_source(&root);
+        let expected = tiny_matrix(0xA11CE);
+        let substitute = tiny_matrix(0xBAD);
+        let expected_identity = identity(
+            SelectedRecursiveMatrixKind::PreviousLink(SelectedRecursiveTier::B32),
+            &expected,
+        );
+        source.export_matrix(expected_identity, &expected).unwrap();
+
+        let anchored = source.open_version_directory(false).unwrap();
+        let held_parent = root.join("held-v1");
+        let outside = directory.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::rename(root.join(ARTIFACT_VERSION_DIRECTORY), &held_parent).unwrap();
+        symlink(&outside, root.join(ARTIFACT_VERSION_DIRECTORY)).unwrap();
+
+        let outside_path = outside.join(selected_recursive_matrix_leaf(expected_identity.kind()));
+        let mut outside_file = File::create(&outside_path).unwrap();
+        substitute.write_artifact(&mut outside_file).unwrap();
+        outside_file.sync_all().unwrap();
+        drop(outside_file);
+
+        let lease = ResidentMatrixLease::acquire(Arc::clone(&source.resident)).unwrap();
+        let loaded = source
+            .load_requested_anchored(
+                &anchored,
+                expected_identity.kind(),
+                expected_identity.shape(),
+                expected_identity.statement_digest(),
+                lease,
+            )
+            .unwrap();
+        assert_eq!(
+            loaded.matrix().structural_statement_digest(),
+            expected_identity.statement_digest()
+        );
+        assert_ne!(
+            loaded.matrix().structural_statement_digest(),
+            substitute.structural_statement_digest()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn anchored_export_cannot_be_redirected_by_parent_symlink_swap() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("root");
+        let source = isolated_source(&root);
+        let anchored = source.open_version_directory(true).unwrap();
+        let held_parent = root.join("held-v1");
+        let outside = directory.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::rename(root.join(ARTIFACT_VERSION_DIRECTORY), &held_parent).unwrap();
+        symlink(&outside, root.join(ARTIFACT_VERSION_DIRECTORY)).unwrap();
+
+        let matrix = tiny_matrix(0xE77047);
+        let matrix_identity = identity(
+            SelectedRecursiveMatrixKind::CurrentBlock(SelectedRecursiveTier::B64),
+            &matrix,
+        );
+        validate_export_identity(matrix_identity, &matrix).unwrap();
+        source
+            .export_matrix_anchored(&anchored, matrix_identity.kind(), &matrix)
+            .unwrap();
+
+        let leaf = selected_recursive_matrix_leaf(matrix_identity.kind());
+        assert!(held_parent.join(leaf).is_file());
+        assert!(!outside.join(leaf).exists());
+        assert_eq!(fs::read_dir(&held_parent).unwrap().count(), 1);
+
+        let mut reader = BufReader::new(File::open(held_parent.join(leaf)).unwrap());
+        let decoded = FieldR1cs::read_artifact(
+            &mut reader,
+            matrix_identity.shape(),
+            matrix_identity.statement_digest(),
+            usize::MAX,
+        )
+        .unwrap();
+        assert_eq!(
+            decoded.structural_statement_digest(),
+            matrix_identity.statement_digest()
+        );
     }
 }

@@ -30,11 +30,34 @@ const RECURSIVE_LINK_PEAK_MIB: usize = B255_PEAK_MIB;
 /// Block proof, and its following Link proof.  Its admission must therefore
 /// cover the largest phase for the entire sequence, regardless of Block tier.
 const SELECTED_HISTORY_SESSION_PEAK_MIB: usize = RECURSIVE_LINK_PEAK_MIB;
-/// Terminal verification streams canonical matrices from disk. Two bounded
-/// coefficient/scratch buffers and factorized equality tables stay below a
-/// few MiB at m24; 16 MiB leaves conservative allocator and I/O headroom while
-/// the shared active-job gate still excludes every proof worker.
-const SELECTED_HISTORY_TERMINAL_VERIFY_PEAK_MIB: usize = 16;
+/// Hard-cap-derived envelope for materializing one pinned compact recursive
+/// class registry.  This is deliberately much larger than the <=4 MiB wire
+/// artifact because Rust's checked in-memory representation expands fixed
+/// tables and transcript schedules:
+///
+/// - 4 MiB for the exact artifact bytes;
+/// - 16 MiB for at most 64 * 8192 `Option<u128>` schedule lanes;
+/// - 28 MiB for seven 64 * 4096 combined-duplex fixed tables;
+/// - 256 MiB for the largest permitted Merkle-key validation phase: two
+///   2^22-cell F128 fixed-table sets plus the digest encoder's conservatively
+///   rounded 128 MiB capacity;
+/// - 64 MiB for the bounded genesis envelope, canonical Block keys, decoded
+///   wire carriers, vector metadata, and allocator rounding.
+///
+/// Every multiplicand above is fixed by a codec or region-VK preflight cap.
+/// The final 64 MiB is larger than the complete 1 MiB genesis wire budget and
+/// all four canonical Block-key fixed tables combined.  Registry loading must
+/// happen while the owning terminal-verification reservation is already live.
+pub const SELECTED_RECURSIVE_REGISTRY_MATERIALIZATION_PEAK_MIB: usize = 368;
+/// Matrix replay itself is streaming: two bounded coefficient/scratch buffers
+/// and factorized equality tables remain within this independent allowance.
+pub const SELECTED_HISTORY_TERMINAL_STREAMING_PEAK_MIB: usize = 16;
+/// Complete ordinary-node terminal-verification admission.  A node reserves
+/// this before reading/materializing the pinned registry and retains it through
+/// sequential disk-backed matrix replay; no CSR matrix is charged or resident.
+pub const SELECTED_HISTORY_TERMINAL_VERIFY_PEAK_MIB: usize =
+    SELECTED_RECURSIVE_REGISTRY_MATERIALIZATION_PEAK_MIB
+        + SELECTED_HISTORY_TERMINAL_STREAMING_PEAK_MIB;
 
 /// Never let proof admission consume the complete host-visible allowance.
 const MIN_NODE_RESERVE_MIB: usize = 1024;
@@ -489,8 +512,9 @@ mod tests {
     #[test]
     fn low_memory_admits_streaming_terminal_but_not_a_prover() {
         let governor = ProofMemoryGovernor::new(B255_PEAK_MIB);
-        // host_safe_budget_mib(2048) = 1024 MiB: ample for the 16-MiB
-        // streaming verifier but below even the smallest B8 proof envelope.
+        // host_safe_budget_mib(2048) = 1024 MiB: ample for the complete
+        // 384-MiB pinned-registry + streaming verifier session, but below even
+        // the smallest B8 proof envelope.
         let terminal = governor
             .try_reserve_selected_history_terminal_with_available(Some(2048))
             .expect("low-memory node must still verify terminal history");
@@ -535,6 +559,30 @@ mod tests {
             governor
                 .try_reserve_selected_history_terminal_with_available(Some(2048))
                 .expect("unwind releases terminal verification admission"),
+        );
+    }
+
+    #[test]
+    fn terminal_envelope_accounts_for_registry_before_streaming_scratch() {
+        assert_eq!(
+            SELECTED_RECURSIVE_REGISTRY_MATERIALIZATION_PEAK_MIB,
+            4 + 16 + 28 + 256 + 64
+        );
+        assert_eq!(SELECTED_HISTORY_TERMINAL_STREAMING_PEAK_MIB, 16);
+        assert_eq!(SELECTED_HISTORY_TERMINAL_VERIFY_PEAK_MIB, 384);
+
+        let governor = ProofMemoryGovernor::new(B255_PEAK_MIB);
+        assert_eq!(
+            governor
+                .try_reserve_selected_history_terminal_with_available(Some(1400))
+                .expect_err("host reserve leaves only 376 MiB")
+                .required_mib,
+            SELECTED_HISTORY_TERMINAL_VERIFY_PEAK_MIB
+        );
+        drop(
+            governor
+                .try_reserve_selected_history_terminal_with_available(Some(1408))
+                .expect("host reserve leaves the exact 384-MiB envelope"),
         );
     }
 

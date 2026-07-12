@@ -37,6 +37,8 @@
 //! the coinbase without regenerating the block certificate — the miner only
 //! brute-forces the nonce.
 
+#[cfg(unix)]
+mod anchored_artifact_fs;
 mod memory_governor;
 pub mod miner;
 pub mod pow;
@@ -47,6 +49,10 @@ pub mod selected_history_verifier;
 pub mod template;
 
 pub use miner::{BlockAppliedHook, BlockMiner, MinerConfig, MinerEvent};
+pub use memory_governor::{
+    SELECTED_HISTORY_TERMINAL_STREAMING_PEAK_MIB, SELECTED_HISTORY_TERMINAL_VERIFY_PEAK_MIB,
+    SELECTED_RECURSIVE_REGISTRY_MATERIALIZATION_PEAK_MIB,
+};
 pub use pow::{search_pow_parallel, PowSolution};
 pub use recursive_class_registry_store::{
     LoadedSelectedRecursiveClassRegistry, LocalSelectedRecursiveClassRegistryError,
@@ -68,8 +74,8 @@ pub use recursive_prover::{
 };
 pub use selected_history_verifier::{
     begin_selected_history_terminal_verification_session,
-    verify_selected_history_terminal_governed, SelectedHistoryTerminalVerificationSession,
-    SelectedHistoryTerminalVerifierError,
+    verify_selected_history_terminal_governed, verify_selected_history_terminal_pinned_governed,
+    SelectedHistoryTerminalVerificationSession, SelectedHistoryTerminalVerifierError,
 };
 pub use template::{BlockTemplate, TemplateBuilder, TemplateRefreshTrigger};
 
