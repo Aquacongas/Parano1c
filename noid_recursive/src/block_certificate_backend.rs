@@ -67,12 +67,6 @@ fn authorization_component_input_shape_ok(input: &AuthorizationComponentInput) -
         && (1..=noid_gkr::MAX_AUTHORIZATION_LIVE_INPUTS).contains(&input.live_input_count)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ExactStateKillShotInputs {
-    pub slot_leaves: Vec<SlotLeafInputs>,
-    pub state_paths: Vec<MerklePathInputs>,
-}
-
 /// Sibling-only exact-state carrier with verifier-derived Merkle topology.
 ///
 /// `live_sibling_digests` contains exactly the live structural frontier in the
@@ -464,34 +458,14 @@ fn digest_to_fields(digest: StateHash) -> [Block128; 2] {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExactStateKillShotProof {
     pub slot_leaves: BatchedSlotLeafProofKillShot,
-    /// Depth-32-safe chunks keep the transitional full-path prover below an
-    /// m24+ monolith while the outer trace still consumes legacy paths.
-    /// Small transitional proofs may populate it for the not-yet-migrated
-    /// inline outer trace. It is never an alternative to structural retained
-    /// verification: when present, the component verifier checks both.
-    pub state_paths: Vec<BatchedMerkleProofKillShot>,
     /// Live old-root then new-root EXSTNOD combines over the sibling-only
     /// verifier-derived structural frontier.
     pub structural_hashes: Vec<FixedFieldHashProofKillShot>,
 }
 
-/// At maximum depth each path contributes 64 permutation slots, so 256 paths
-/// cap every transitional Merkle batch at 16,384 live slots.
-pub const EXACT_STATE_MERKLE_PATH_CHUNK_SIZE: usize = 256;
-
 impl ExactStateKillShotProof {
-    pub fn byte_len(&self, inputs: &ExactStateKillShotInputs) -> usize {
+    pub fn byte_len(&self) -> usize {
         self.slot_leaves.byte_len()
-            + self
-                .state_paths
-                .iter()
-                .zip(
-                    inputs
-                        .state_paths
-                        .chunks(EXACT_STATE_MERKLE_PATH_CHUNK_SIZE),
-                )
-                .map(|(proof, paths)| proof.byte_len(paths))
-                .sum::<usize>()
             + self
                 .structural_hashes
                 .iter()
@@ -510,10 +484,6 @@ pub struct AcceptedBlockBatchComponentInputs {
     pub tx_root_inputs: Vec<MerklePathInputs>,
     pub header_integer_trace: HeaderIntegerBatchTrace,
     pub authorization_inputs: Vec<AuthorizationComponentInput>,
-    /// Transitional expanded paths consumed only by the not-yet-migrated
-    /// outer trace. Native retained verification does not trust or verify
-    /// these paths once the sibling-only structural carrier is present.
-    pub exact_state_killshot_inputs: Vec<ExactStateKillShotInputs>,
     /// Authoritative sibling-only exact-state inputs for retained native
     /// verification and retained structural hash proofs.
     pub exact_state_structural_inputs: Vec<ExactStateStructuralFrontierInputs>,
@@ -541,8 +511,7 @@ impl AcceptedBlockBatchComponentProof {
             + self
                 .exact_state
                 .iter()
-                .zip(inputs.exact_state_killshot_inputs.iter())
-                .map(|(proof, inputs)| proof.byte_len(inputs))
+                .map(ExactStateKillShotProof::byte_len)
                 .sum::<usize>()
     }
 }
@@ -551,10 +520,8 @@ impl AcceptedBlockBatchComponentProof {
 pub enum ExactStateKillShotError {
     EmptyDerivedInput,
     SlotLeafProofRejected,
-    StateMerkleProofRejected,
     StructuralFrontier(ExactStateStructuralFrontierError),
     StructuralHashProofRejected,
-    NonCanonicalLegacyPathProof,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -640,22 +607,12 @@ pub fn verify_accepted_block_batch_components(
                                     inputs
                                         .exact_state_structural_inputs
                                         .par_iter()
-                                        .zip(inputs.exact_state_killshot_inputs.par_iter())
                                         .zip(proof.exact_state.par_iter())
                                         .enumerate()
-                                        .try_for_each(|(index, ((structural, legacy), proof))| {
+                                        .try_for_each(|(index, (structural, proof))| {
                                             verify_exact_state_structural_killshot(
                                                 structural, proof,
                                             )
-                                            .and_then(|()| {
-                                                if proof.state_paths.is_empty() {
-                                                    Ok(())
-                                                } else if legacy.state_paths.is_empty() {
-                                                    Err(ExactStateKillShotError::NonCanonicalLegacyPathProof)
-                                                } else {
-                                                    verify_exact_state_killshot(legacy, proof)
-                                                }
-                                            })
                                             .map_err(
                                                 |source| {
                                                     AcceptedBlockBatchComponentError::ExactState {
@@ -688,64 +645,11 @@ pub fn verify_accepted_block_batch_components(
     Ok(accepted_claim_batch)
 }
 
-pub fn verify_exact_state_killshot(
-    inputs: &ExactStateKillShotInputs,
-    proof: &ExactStateKillShotProof,
-) -> Result<(), ExactStateKillShotError> {
-    validate_exact_state_inputs(inputs)?;
-
-    let (slot_result, state_result) = rayon::join(
-        || {
-            let mut channel = Poseidon2bChannel::new();
-            let reductions = verify_batched_slot_leaf_killshot(
-                &proof.slot_leaves,
-                &inputs.slot_leaves,
-                &mut channel,
-            )
-            .ok_or(ExactStateKillShotError::SlotLeafProofRejected)?;
-            if discharge_batched_slot_leaf_reductions_native(&inputs.slot_leaves, &reductions) {
-                Ok(())
-            } else {
-                Err(ExactStateKillShotError::SlotLeafProofRejected)
-            }
-        },
-        || {
-            let circuit = MerkleCircuit::build_with_tag(TAG_EXSTNOD);
-            let mut channel = Poseidon2bChannel::new();
-            let expected_chunks = inputs
-                .state_paths
-                .len()
-                .div_ceil(EXACT_STATE_MERKLE_PATH_CHUNK_SIZE);
-            if proof.state_paths.len() != expected_chunks {
-                return Err(ExactStateKillShotError::StateMerkleProofRejected);
-            }
-            for (path_chunk, chunk_proof) in inputs
-                .state_paths
-                .chunks(EXACT_STATE_MERKLE_PATH_CHUNK_SIZE)
-                .zip(proof.state_paths.iter())
-            {
-                let reductions =
-                    verify_batched_merkle_killshot(&circuit, chunk_proof, path_chunk, &mut channel)
-                        .ok_or(ExactStateKillShotError::StateMerkleProofRejected)?;
-                if !discharge_batched_merkle_reductions_native(&circuit, path_chunk, &reductions) {
-                    return Err(ExactStateKillShotError::StateMerkleProofRejected);
-                }
-            }
-            Ok(())
-        },
-    );
-    slot_result?;
-    state_result?;
-    Ok(())
-}
-
 /// Verify the authoritative retained exact-state proof over the sibling-only
 /// structural carrier.
 ///
 /// The old/new slot leaves are hashed once, while the canonical verifier-
-/// derived combine stream is proved in bounded fixed-field chunks. Optional
-/// legacy paths are ignored here and, when present on an accepted component,
-/// verified separately only for transitional inline-outer compatibility.
+/// derived combine stream is proved in bounded fixed-field chunks.
 pub fn verify_exact_state_structural_killshot(
     inputs: &ExactStateStructuralFrontierInputs,
     proof: &ExactStateKillShotProof,
@@ -833,7 +737,6 @@ fn validate_component_shape(
     let block_count = inputs.accepted_claim_witness.headers.len();
     if inputs.exact_state_structural_inputs.len() != block_count
         || inputs.exact_state_structural_inputs.len() != proof.exact_state.len()
-        || inputs.exact_state_killshot_inputs.len() != inputs.exact_state_structural_inputs.len()
         || inputs.accepted_claim_hash_inputs.len()
             != inputs.accepted_claim_witness.accepted_block_claims.len()
         || inputs.tx_body_inputs.len() != inputs.tx_body_hashes.len()
@@ -847,45 +750,7 @@ fn validate_component_shape(
     {
         return Err(AcceptedBlockBatchComponentError::ComponentShapeMismatch);
     }
-    if inputs
-        .exact_state_killshot_inputs
-        .iter()
-        .zip(inputs.exact_state_structural_inputs.iter())
-        .any(|(legacy, structural)| !legacy_exact_state_matches_structural(legacy, structural))
-    {
-        return Err(AcceptedBlockBatchComponentError::ComponentShapeMismatch);
-    }
     Ok(())
-}
-
-fn legacy_exact_state_matches_structural(
-    legacy: &ExactStateKillShotInputs,
-    structural: &ExactStateStructuralFrontierInputs,
-) -> bool {
-    let touched = structural.touched_indices.len();
-    let Some(double_touched) = touched.checked_mul(2) else {
-        return false;
-    };
-    if double_touched > EXACT_STATE_MERKLE_PATH_CHUNK_SIZE {
-        return legacy.slot_leaves.is_empty() && legacy.state_paths.is_empty();
-    }
-    if legacy.slot_leaves.len() != double_touched
-        || legacy.state_paths.len() != double_touched
-        || legacy.slot_leaves[..touched] != structural.old_slot_leaves
-        || legacy.slot_leaves[touched..] != structural.new_slot_leaves
-    {
-        return false;
-    }
-    legacy.state_paths.iter().enumerate().all(|(index, path)| {
-        path.active_depth == structural.active_depth as usize
-            && path.leaf == legacy.slot_leaves[index].expected_leaf
-            && fields_to_digest(path.expected_root)
-                == if index < touched {
-                    structural.old_root
-                } else {
-                    structural.new_root
-                }
-    })
 }
 
 fn validate_certificate_statement_component_shape(
@@ -1036,29 +901,6 @@ fn authorization_component_totals_match(
     inputs.len() == totals.user_tx_count && live_input_count_total == totals.live_input_count_total
 }
 
-fn validate_exact_state_inputs(
-    inputs: &ExactStateKillShotInputs,
-) -> Result<(), ExactStateKillShotError> {
-    if inputs.slot_leaves.is_empty() || inputs.state_paths.is_empty() {
-        return Err(ExactStateKillShotError::EmptyDerivedInput);
-    }
-    if inputs.slot_leaves.len() != inputs.state_paths.len() || inputs.state_paths.len() % 2 != 0 {
-        return Err(ExactStateKillShotError::EmptyDerivedInput);
-    }
-    let half = inputs.state_paths.len() / 2;
-    let depth = inputs.state_paths[0].active_depth;
-    let old_root = inputs.state_paths[0].expected_root;
-    let new_root = inputs.state_paths[half].expected_root;
-    if inputs.state_paths.iter().enumerate().any(|(index, path)| {
-        path.active_depth != depth
-            || path.leaf != inputs.slot_leaves[index].expected_leaf
-            || path.expected_root != if index < half { old_root } else { new_root }
-    }) {
-        return Err(ExactStateKillShotError::StateMerkleProofRejected);
-    }
-    Ok(())
-}
-
 fn tx_body_slot_state_ins(inputs: &[SpineInputs]) -> Vec<[Block128; 4]> {
     let circuit = SpineCircuit::build();
     let mut slot_state_ins = Vec::new();
@@ -1137,52 +979,6 @@ mod tests {
         }
     }
 
-    fn structural_parity_fixture(touched: usize) -> ExactStateStructuralFrontierInputs {
-        ExactStateStructuralFrontierInputs {
-            touched_indices: (0..touched as u32).collect(),
-            active_depth: 8,
-            old_slot_leaves: (0..touched)
-                .map(|index| structural_slot_leaf(index as u128 + 1))
-                .collect(),
-            new_slot_leaves: (0..touched)
-                .map(|index| structural_slot_leaf(index as u128 + 10_001))
-                .collect(),
-            live_sibling_digests: Vec::new(),
-            old_combine_digests: Vec::new(),
-            new_combine_digests: Vec::new(),
-            old_root: [0x11; 32],
-            new_root: [0x22; 32],
-        }
-    }
-
-    fn matching_legacy_inputs(
-        structural: &ExactStateStructuralFrontierInputs,
-    ) -> ExactStateKillShotInputs {
-        let touched = structural.touched_indices.len();
-        let mut slot_leaves = Vec::with_capacity(2 * touched);
-        slot_leaves.extend(structural.old_slot_leaves.iter().cloned());
-        slot_leaves.extend(structural.new_slot_leaves.iter().cloned());
-        let state_paths = slot_leaves
-            .iter()
-            .enumerate()
-            .map(|(index, leaf)| {
-                let mut path = MerklePathInputs::zero();
-                path.leaf = leaf.expected_leaf;
-                path.expected_root = digest_to_fields(if index < touched {
-                    structural.old_root
-                } else {
-                    structural.new_root
-                });
-                path.active_depth = structural.active_depth as usize;
-                path
-            })
-            .collect();
-        ExactStateKillShotInputs {
-            slot_leaves,
-            state_paths,
-        }
-    }
-
     fn authorization_component_input() -> AuthorizationComponentInput {
         AuthorizationComponentInput {
             block_index: 0,
@@ -1241,34 +1037,6 @@ mod tests {
                 live_input_count_total: 2,
             },
         ));
-    }
-
-    #[test]
-    fn legacy_structural_parity_keeps_exact_256_path_boundary() {
-        let structural = structural_parity_fixture(128);
-        let legacy = matching_legacy_inputs(&structural);
-        assert_eq!(legacy.state_paths.len(), EXACT_STATE_MERKLE_PATH_CHUNK_SIZE);
-        assert!(legacy_exact_state_matches_structural(&legacy, &structural));
-
-        let empty = ExactStateKillShotInputs {
-            slot_leaves: Vec::new(),
-            state_paths: Vec::new(),
-        };
-        assert!(!legacy_exact_state_matches_structural(&empty, &structural));
-    }
-
-    #[test]
-    fn legacy_structural_parity_requires_empty_large_projection() {
-        let structural = structural_parity_fixture(129);
-        let empty = ExactStateKillShotInputs {
-            slot_leaves: Vec::new(),
-            state_paths: Vec::new(),
-        };
-        assert!(legacy_exact_state_matches_structural(&empty, &structural));
-
-        let legacy = matching_legacy_inputs(&structural);
-        assert_eq!(legacy.state_paths.len(), 258);
-        assert!(!legacy_exact_state_matches_structural(&legacy, &structural));
     }
 
     #[test]

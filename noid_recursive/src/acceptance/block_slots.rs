@@ -1174,7 +1174,6 @@ fn build_selected_zk_block_slots_core(
     assert_eq!(witness.headers.len(), 1, "one block per link");
     assert_eq!(witness.accepted_block_claims.len(), 1);
     assert_eq!(inputs.accepted_claim_hash_inputs.len(), 1);
-    assert_eq!(inputs.exact_state_killshot_inputs.len(), 1);
     assert_eq!(inputs.exact_state_structural_inputs.len(), 1);
     assert_eq!(proof.exact_state.len(), 1);
     assert_eq!(inputs.tx_body_inputs.len(), inputs.tx_body_hashes.len());
@@ -1444,10 +1443,9 @@ fn build_selected_zk_block_slots_core(
     );
 
     crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: tx-root");
-    // ---- exact_state component + its statement anchors. Production region
-    // mode consumes only the authoritative sibling frontier and derives the
-    // fixed-capacity paired local/upper schedule. Expanded directed paths are
-    // retained solely by the small transitional inline mode.
+    // ---- exact_state component + its statement anchors. The production
+    // relation consumes the authoritative sibling frontier and derives the
+    // fixed-capacity paired local/upper schedule.
     let structural_es = &inputs.exact_state_structural_inputs[0];
     let (touched_capacity, segment_capacity) =
         exact_state_region_capacities(structural_es, Some(tier));
@@ -1924,7 +1922,6 @@ mod paired_exact_state_connection_tests {
         };
         let exact_state = ExactStateSlotWires {
             slot_leaves: old_leaves.into_iter().chain(new_leaves).collect(),
-            state_paths: Vec::new(),
             roots,
         };
 

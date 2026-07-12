@@ -6,85 +6,46 @@
 //! This does not replace the C' action/counter/recombination obligation. It
 //! proves only the two Poseidon2b families derived from the canonical exact
 //! transition. Retained production proofs use the sibling-only structural
-//! frontier; directed Merkle paths remain temporarily for the not-yet-migrated
-//! outer trace.
+//! frontier exclusively.
 
 use noid_chain::state_delta::ExactActionSurface;
 use noid_gkr::{
-    prove_batched_merkle_killshot, prove_batched_slot_leaf_killshot,
-    prove_fixed_field_hash_killshot, FixedFieldHashInputs, FixedFieldHashProofKillShot,
-    MerkleCircuit,
+    prove_batched_slot_leaf_killshot, prove_fixed_field_hash_killshot, FixedFieldHashInputs,
+    FixedFieldHashProofKillShot,
 };
 use noid_poseidon2b::channel::Poseidon2bChannel;
-use noid_poseidon2b::native::domain::TAG_EXSTNOD;
 use noid_recursive::block_certificate_backend::{
     derive_exact_state_structural_hash_chunks, exact_state_structural_chunk_channel,
     exact_state_structural_hash_params, exact_state_structural_proof_lanes,
-    verify_exact_state_killshot as verify_exact_state_killshot_backend,
     verify_exact_state_structural_killshot as verify_exact_state_structural_killshot_backend,
     ExactStateKillShotError as BackendExactStateKillShotError,
 };
 use rayon::prelude::*;
 
 use crate::exact_state_transition::{
-    derive_exact_slot_leaf_batch_inputs, derive_exact_state_merkle_batch_inputs,
-    derive_exact_state_merkle_batch_inputs_from_verified_roots, seal_exact_state_transition,
-    verify_exact_state_roots, ExactStateTransitionError, ExactStateTransitionInputs,
-    ExactStateTransitionProof, VerifiedExactStateRoots, VerifiedStateTransition,
+    derive_exact_slot_leaf_batch_inputs, seal_exact_state_transition, verify_exact_state_roots,
+    ExactStateTransitionError, ExactStateTransitionInputs, ExactStateTransitionProof,
+    VerifiedExactStateRoots, VerifiedStateTransition,
 };
 
 pub use noid_recursive::block_certificate_backend::{
-    ExactStateKillShotInputs, ExactStateKillShotProof, ExactStateStructuralFrontierInputs,
-    EXACT_STATE_MERKLE_PATH_CHUNK_SIZE, EXACT_STATE_STRUCTURAL_HASH_CHUNK_SIZE,
+    ExactStateKillShotProof, ExactStateStructuralFrontierInputs,
+    EXACT_STATE_STRUCTURAL_HASH_CHUNK_SIZE,
 };
-
-/// Maximum legacy directed paths retained solely for the transitional inline
-/// outer trace. Larger production statements (including B255) carry no path
-/// proofs and must use the full structural-region configuration.
-pub const TRANSITIONAL_INLINE_EXACT_STATE_MAX_PATHS: usize = EXACT_STATE_MERKLE_PATH_CHUNK_SIZE;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExactStateKillShotError {
     ExactState(ExactStateTransitionError),
     EmptyDerivedInput,
     SlotLeafProofRejected,
-    StateMerkleProofRejected,
     StructuralFrontierRejected,
     StructuralHashProofRejected,
-    NonCanonicalLegacyPathProof,
 }
 
 impl From<ExactStateTransitionError> for ExactStateKillShotError {
     fn from(error: ExactStateTransitionError) -> Self {
         Self::ExactState(error)
     }
-}
-
-pub fn derive_exact_state_killshot_inputs(
-    inputs: &ExactStateTransitionInputs,
-    surface: &ExactActionSurface,
-    proof: &ExactStateTransitionProof,
-) -> Result<(ExactStateKillShotInputs, VerifiedStateTransition), ExactStateKillShotError> {
-    let leaf_inputs = derive_exact_slot_leaf_batch_inputs(surface)?;
-    let mut slot_leaves =
-        Vec::with_capacity(leaf_inputs.old_leaves.len() + leaf_inputs.new_leaves.len());
-    slot_leaves.extend(leaf_inputs.old_leaves);
-    slot_leaves.extend(leaf_inputs.new_leaves);
-
-    let state_inputs = derive_exact_state_merkle_batch_inputs(inputs, surface, proof)?;
-    let mut state_paths =
-        Vec::with_capacity(state_inputs.old_paths.len() + state_inputs.new_paths.len());
-    state_paths.extend(state_inputs.old_paths);
-    state_paths.extend(state_inputs.new_paths);
-    let verified = seal_exact_state_transition(inputs, surface)?;
-
-    Ok((
-        ExactStateKillShotInputs {
-            slot_leaves,
-            state_paths,
-        },
-        verified,
-    ))
 }
 
 /// Derive the authoritative retained sibling-only exact-state carrier without
@@ -102,18 +63,14 @@ pub fn derive_exact_state_structural_killshot_inputs(
     Ok((carrier, verified))
 }
 
-/// Project retained exact-state inputs from the sealed native root audit.
-///
-/// The structural carrier is unconditional. Directed paths are a transitional
-/// inline-only projection and are not even materialized once the combined
-/// old/new path count exceeds the audited inline cap.
-pub(crate) fn derive_retained_exact_state_inputs_from_verified_roots(
+/// Move the retained sibling-only carrier out of an already sealed native root
+/// audit without cloning the frontier or touched-index vector.
+pub(crate) fn derive_retained_exact_state_structural_inputs_from_verified_roots(
     inputs: &ExactStateTransitionInputs,
     surface: ExactActionSurface,
     proof: ExactStateTransitionProof,
     roots: VerifiedExactStateRoots,
-) -> Result<(ExactStateKillShotInputs, ExactStateStructuralFrontierInputs), ExactStateKillShotError>
-{
+) -> Result<ExactStateStructuralFrontierInputs, ExactStateKillShotError> {
     if roots.new_root != inputs.child_state_root
         || roots.old_leaf_hashes.len() != surface.touched_indices.len()
         || roots.new_leaf_hashes.len() != surface.touched_indices.len()
@@ -122,34 +79,13 @@ pub(crate) fn derive_retained_exact_state_inputs_from_verified_roots(
     }
 
     let leaf_inputs = derive_exact_slot_leaf_batch_inputs(&surface)?;
-    let total_paths = surface
-        .touched_indices
-        .len()
-        .checked_mul(2)
-        .unwrap_or(usize::MAX);
-    let legacy = if total_paths <= TRANSITIONAL_INLINE_EXACT_STATE_MAX_PATHS {
-        let state_inputs = derive_exact_state_merkle_batch_inputs_from_verified_roots(
-            inputs, &surface, &proof, &roots,
-        )?;
-        let mut slot_leaves = Vec::with_capacity(total_paths);
-        slot_leaves.extend(leaf_inputs.old_leaves.iter().cloned());
-        slot_leaves.extend(leaf_inputs.new_leaves.iter().cloned());
-        let mut state_paths = Vec::with_capacity(total_paths);
-        state_paths.extend(state_inputs.old_paths);
-        state_paths.extend(state_inputs.new_paths);
-        ExactStateKillShotInputs {
-            slot_leaves,
-            state_paths,
-        }
-    } else {
-        ExactStateKillShotInputs {
-            slot_leaves: Vec::new(),
-            state_paths: Vec::new(),
-        }
-    };
-    let structural =
-        structural_inputs_from_verified_roots_owned(inputs, surface, proof, leaf_inputs, roots);
-    Ok((legacy, structural))
+    Ok(structural_inputs_from_verified_roots_owned(
+        inputs,
+        surface,
+        proof,
+        leaf_inputs,
+        roots,
+    ))
 }
 
 /// Consuming retained projection: the large sibling frontier and touched-index
@@ -196,47 +132,6 @@ fn structural_inputs_from_verified_roots(
     }
 }
 
-fn validate_inputs(inputs: &ExactStateKillShotInputs) -> Result<(), ExactStateKillShotError> {
-    if inputs.slot_leaves.is_empty() || inputs.state_paths.is_empty() {
-        return Err(ExactStateKillShotError::EmptyDerivedInput);
-    }
-    Ok(())
-}
-
-pub(crate) fn prove_transitional_exact_state_path_chunks(
-    inputs: &ExactStateKillShotInputs,
-) -> Result<Vec<noid_gkr::BatchedMerkleProofKillShot>, ExactStateKillShotError> {
-    validate_inputs(inputs)?;
-    let circuit = MerkleCircuit::build_with_tag(TAG_EXSTNOD);
-    let mut channel = Poseidon2bChannel::new();
-    Ok(inputs
-        .state_paths
-        .chunks(EXACT_STATE_MERKLE_PATH_CHUNK_SIZE)
-        .map(|paths| prove_batched_merkle_killshot(&circuit, paths, &mut channel).0)
-        .collect())
-}
-
-pub fn prove_exact_state_killshot(
-    inputs: &ExactStateKillShotInputs,
-) -> Result<ExactStateKillShotProof, ExactStateKillShotError> {
-    validate_inputs(inputs)?;
-    let (slot_leaves, state_paths) = rayon::join(
-        || {
-            let mut channel = Poseidon2bChannel::new();
-            prove_batched_slot_leaf_killshot(&inputs.slot_leaves, &mut channel).0
-        },
-        || {
-            prove_transitional_exact_state_path_chunks(inputs)
-                .expect("inputs were validated before the parallel proof")
-        },
-    );
-    Ok(ExactStateKillShotProof {
-        slot_leaves,
-        state_paths,
-        structural_hashes: Vec::new(),
-    })
-}
-
 /// Prove the retained exact-state relation over only live structural combines.
 pub fn prove_exact_state_structural_killshot(
     inputs: &ExactStateStructuralFrontierInputs,
@@ -263,7 +158,6 @@ pub fn prove_exact_state_structural_killshot(
     );
     Ok(ExactStateKillShotProof {
         slot_leaves,
-        state_paths: Vec::new(),
         structural_hashes,
     })
 }
@@ -304,32 +198,6 @@ fn prove_structural_hash_chunks_with_lanes(
     indexed.into_iter().map(|(_, proof)| proof).collect()
 }
 
-pub fn verify_exact_state_killshot(
-    inputs: &ExactStateKillShotInputs,
-    proof: &ExactStateKillShotProof,
-) -> Result<(), ExactStateKillShotError> {
-    verify_exact_state_killshot_backend(inputs, proof).map_err(|error| match error {
-        BackendExactStateKillShotError::EmptyDerivedInput => {
-            ExactStateKillShotError::EmptyDerivedInput
-        }
-        BackendExactStateKillShotError::SlotLeafProofRejected => {
-            ExactStateKillShotError::SlotLeafProofRejected
-        }
-        BackendExactStateKillShotError::StateMerkleProofRejected => {
-            ExactStateKillShotError::StateMerkleProofRejected
-        }
-        BackendExactStateKillShotError::StructuralFrontier(_) => {
-            ExactStateKillShotError::StructuralFrontierRejected
-        }
-        BackendExactStateKillShotError::StructuralHashProofRejected => {
-            ExactStateKillShotError::StructuralHashProofRejected
-        }
-        BackendExactStateKillShotError::NonCanonicalLegacyPathProof => {
-            ExactStateKillShotError::NonCanonicalLegacyPathProof
-        }
-    })
-}
-
 pub fn verify_exact_state_structural_killshot(
     inputs: &ExactStateStructuralFrontierInputs,
     proof: &ExactStateKillShotProof,
@@ -341,17 +209,11 @@ pub fn verify_exact_state_structural_killshot(
         BackendExactStateKillShotError::SlotLeafProofRejected => {
             ExactStateKillShotError::SlotLeafProofRejected
         }
-        BackendExactStateKillShotError::StateMerkleProofRejected => {
-            ExactStateKillShotError::StateMerkleProofRejected
-        }
         BackendExactStateKillShotError::StructuralFrontier(_) => {
             ExactStateKillShotError::StructuralFrontierRejected
         }
         BackendExactStateKillShotError::StructuralHashProofRejected => {
             ExactStateKillShotError::StructuralHashProofRejected
-        }
-        BackendExactStateKillShotError::NonCanonicalLegacyPathProof => {
-            ExactStateKillShotError::NonCanonicalLegacyPathProof
         }
     })
 }
@@ -367,7 +229,7 @@ mod tests {
         exact_action_surface_from_surface, StateDeltaAction, StateDeltaActionKind,
         StateDeltaActionSurface,
     };
-    use noid_core::{Block128, TowerField};
+    use noid_core::Block128;
 
     fn hash_fields(hash: StateHash) -> [Block128; 2] {
         [
@@ -487,31 +349,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_state_killshot_roundtrip() {
-        let (inputs, surface, exact_proof) = fixture();
-        let (killshot_inputs, verified) =
-            derive_exact_state_killshot_inputs(&inputs, &surface, &exact_proof).unwrap();
-        assert_eq!(verified.child_state_root(), inputs.child_state_root);
-        let proof = prove_exact_state_killshot(&killshot_inputs).unwrap();
-        verify_exact_state_killshot(&killshot_inputs, &proof).unwrap();
-        assert!(proof.byte_len(&killshot_inputs) > 0);
-    }
-
-    #[test]
-    fn exact_state_killshot_rejects_tampered_path_root() {
-        let (inputs, surface, exact_proof) = fixture();
-        let (mut killshot_inputs, _) =
-            derive_exact_state_killshot_inputs(&inputs, &surface, &exact_proof).unwrap();
-        let proof = prove_exact_state_killshot(&killshot_inputs).unwrap();
-        killshot_inputs.state_paths[0].expected_root[0] += Block128::ONE;
-        assert_eq!(
-            verify_exact_state_killshot(&killshot_inputs, &proof),
-            Err(ExactStateKillShotError::StateMerkleProofRejected)
-        );
-    }
-
-    #[test]
-    fn structural_exact_state_killshot_roundtrip_has_no_paths() {
+    fn structural_exact_state_killshot_roundtrip() {
         let (inputs, surface, exact_proof) = fixture();
         let (structural, verified) =
             derive_exact_state_structural_killshot_inputs(&inputs, &surface, &exact_proof).unwrap();
@@ -520,50 +358,61 @@ mod tests {
         assert_eq!(structural.live_sibling_digests, exact_proof.slot_siblings);
 
         let proof = prove_exact_state_structural_killshot(&structural).unwrap();
-        assert!(proof.state_paths.is_empty());
         assert!(!proof.structural_hashes.is_empty());
+        assert!(proof.byte_len() > 0);
         verify_exact_state_structural_killshot(&structural, &proof).unwrap();
     }
 
     #[test]
-    fn retained_projection_keeps_legacy_at_exact_inline_path_cap() {
-        let (inputs, surface, proof) = retained_projection_fixture(128);
+    fn retained_projection_moves_only_structural_frontier() {
+        let (inputs, surface, proof) = retained_projection_fixture(129);
         let (verified, roots) =
             crate::exact_state_transition::verify_exact_state_transition_with_roots(
                 &inputs, &surface, &proof,
             )
             .unwrap();
-        let (legacy, structural) =
-            derive_retained_exact_state_inputs_from_verified_roots(&inputs, surface, proof, roots)
-                .unwrap();
+        let structural = derive_retained_exact_state_structural_inputs_from_verified_roots(
+            &inputs, surface, proof, roots,
+        )
+        .unwrap();
 
         assert_eq!(verified.child_state_root(), inputs.child_state_root);
-        assert_eq!(legacy.slot_leaves.len(), 256);
-        assert_eq!(legacy.state_paths.len(), 256);
-        assert_eq!(structural.old_slot_leaves.len(), 128);
-        assert_eq!(structural.new_slot_leaves.len(), 128);
-    }
-
-    #[test]
-    fn retained_projection_omits_legacy_above_inline_path_cap() {
-        let (inputs, surface, proof) = retained_projection_fixture(129);
-        let (_verified, roots) =
-            crate::exact_state_transition::verify_exact_state_transition_with_roots(
-                &inputs, &surface, &proof,
-            )
-            .unwrap();
-        let (legacy, structural) =
-            derive_retained_exact_state_inputs_from_verified_roots(&inputs, surface, proof, roots)
-                .unwrap();
-
-        assert!(legacy.slot_leaves.is_empty());
-        assert!(legacy.state_paths.is_empty());
         assert_eq!(structural.old_slot_leaves.len(), 129);
         assert_eq!(structural.new_slot_leaves.len(), 129);
         noid_recursive::block_certificate_backend::verify_exact_state_structural_frontier(
             &structural,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn retained_exact_state_full_path_surface_is_absent() {
+        let production_sources = [
+            include_str!("exact_state_killshot.rs"),
+            include_str!("exact_state_transition.rs"),
+            include_str!("accepted_block_batch.rs"),
+            include_str!("../../noid_recursive/src/block_certificate_backend.rs"),
+            include_str!("../../noid_recursive/src/acceptance/block_slots.rs"),
+            include_str!("../../noid_recursive/src/acceptance/trace/exact_state.rs"),
+            include_str!("../../noid_recursive/src/acceptance/trace/region_source_binding.rs"),
+        ];
+        let forbidden = [
+            concat!("ExactState", "KillShotInputs"),
+            concat!("exact_state_", "killshot_inputs"),
+            concat!("state_", "paths"),
+            concat!("EXACT_STATE_MERKLE_", "PATH_CHUNK_SIZE"),
+            concat!("derive_exact_state_", "merkle_batch_inputs"),
+            concat!("prove_transitional_exact_state_", "path_chunks"),
+            concat!("ExactState", "PathRegion"),
+        ];
+        for symbol in forbidden {
+            assert!(
+                production_sources
+                    .iter()
+                    .all(|source| !source.contains(symbol)),
+                "removed exact-state path surface reappeared: {symbol}"
+            );
+        }
     }
 
     #[test]
@@ -618,14 +467,6 @@ mod tests {
             verify_exact_state_structural_killshot(&structural, &missing_chunk),
             Err(ExactStateKillShotError::StructuralHashProofRejected)
         );
-
-        let (legacy_inputs, _) =
-            derive_exact_state_killshot_inputs(&inputs, &surface, &exact_proof).unwrap();
-        let legacy_proof = prove_exact_state_killshot(&legacy_inputs).unwrap();
-        let mut mixed = proof;
-        mixed.state_paths = legacy_proof.state_paths;
-        verify_exact_state_structural_killshot(&structural, &mixed).unwrap();
-        verify_exact_state_killshot(&legacy_inputs, &mixed).unwrap();
     }
 
     #[test]

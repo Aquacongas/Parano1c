@@ -863,7 +863,6 @@ fn validate_selected_carrier_shape(
         authorization_total: inputs.authorization_totals.user_tx_count,
         tx_body_count: inputs.tx_body_inputs.len(),
         tx_body_hash_count: inputs.tx_body_hashes.len(),
-        legacy_exact_state_count: inputs.exact_state_killshot_inputs.len(),
         structural_exact_state_count: inputs.exact_state_structural_inputs.len(),
         exact_state_proof_count: proof.exact_state.len(),
     })
@@ -879,7 +878,6 @@ struct SelectedCarrierCounts {
     authorization_total: usize,
     tx_body_count: usize,
     tx_body_hash_count: usize,
-    legacy_exact_state_count: usize,
     structural_exact_state_count: usize,
     exact_state_proof_count: usize,
 }
@@ -894,7 +892,6 @@ fn validate_selected_carrier_counts(
     }
     if counts.accepted_claim_count != 1
         || counts.accepted_claim_hash_count != 1
-        || counts.legacy_exact_state_count != 1
         || counts.structural_exact_state_count != 1
         || counts.exact_state_proof_count != 1
     {
@@ -1125,7 +1122,6 @@ mod tests {
             authorization_total: 0,
             tx_body_count: 1,
             tx_body_hash_count: 1,
-            legacy_exact_state_count: 1,
             structural_exact_state_count: 1,
             exact_state_proof_count: 1,
         };

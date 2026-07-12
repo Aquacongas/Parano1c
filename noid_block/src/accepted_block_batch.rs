@@ -365,7 +365,6 @@ fn verify_full_accepted_block_batch_native_with_owned_state(
     let mut tx_root_inputs = Vec::new();
     let mut authorization_inputs = Vec::new();
     let mut selected_authorization_proofs = Vec::new();
-    let mut exact_state_killshot_inputs = Vec::new();
     let mut exact_state_structural_inputs = Vec::new();
     let mut authorization_totals = VerifiedAuthorizationBatch {
         user_tx_count: 0,
@@ -481,15 +480,14 @@ fn verify_full_accepted_block_batch_native_with_owned_state(
             })?,
             None => return Err(FullAcceptedBlockBatchError::ComponentShapeMismatch),
         };
-        let (inputs, structural_inputs) =
-            crate::exact_state_killshot::derive_retained_exact_state_inputs_from_verified_roots(
+        let structural_inputs = crate::exact_state_killshot::
+            derive_retained_exact_state_structural_inputs_from_verified_roots(
                 &artifacts.exact_state_inputs,
                 artifacts.exact_action_surface,
                 state_transition,
                 verified_roots,
             )
             .map_err(|source| FullAcceptedBlockBatchError::ExactStateComponent { index, source })?;
-        exact_state_killshot_inputs.push(inputs);
         exact_state_structural_inputs.push(structural_inputs);
 
         if has_user_txs {
@@ -622,7 +620,6 @@ fn verify_full_accepted_block_batch_native_with_owned_state(
                 tx_root_inputs,
                 header_integer_trace,
                 authorization_inputs,
-                exact_state_killshot_inputs,
                 exact_state_structural_inputs,
                 authorization_totals,
             },
@@ -658,11 +655,6 @@ pub(crate) fn prove_full_accepted_block_batch_components(
             .accepted_claim_witness
             .headers
             .len()
-        || components
-            .component_inputs
-            .exact_state_killshot_inputs
-            .len()
-            != exact_state_count
     {
         return Err(FullAcceptedBlockBatchError::ComponentShapeMismatch);
     }
@@ -958,7 +950,6 @@ fn validate_single_block_recursive_components(
         || inputs.accepted_claim_witness.accepted_block_claims.len() != 1
         || inputs.accepted_block_certificate_statements.len() != 1
         || inputs.accepted_claim_hash_inputs.len() != 1
-        || inputs.exact_state_killshot_inputs.len() != 1
         || inputs.exact_state_structural_inputs.len() != 1
         || inputs.tx_body_inputs.len() != transaction_count
         || inputs.tx_body_hashes.len() != transaction_count
@@ -1632,32 +1623,11 @@ fn prove_exact_state_components(
         .component_inputs
         .exact_state_structural_inputs
         .par_iter()
-        .zip(
-            components
-                .component_inputs
-                .exact_state_killshot_inputs
-                .par_iter(),
-        )
         .enumerate()
-        .map(|(index, (structural, legacy))| {
-            let mut proof =
-                crate::prove_exact_state_structural_killshot(structural).map_err(|source| {
-                    FullAcceptedBlockBatchError::ExactStateComponent { index, source }
-                })?;
-            if !legacy.state_paths.is_empty() {
-                if legacy.state_paths.len()
-                    > crate::exact_state_killshot::TRANSITIONAL_INLINE_EXACT_STATE_MAX_PATHS
-                {
-                    return Err(FullAcceptedBlockBatchError::ComponentShapeMismatch);
-                }
-                proof.state_paths =
-                    crate::exact_state_killshot::prove_transitional_exact_state_path_chunks(legacy)
-                        .map_err(|source| FullAcceptedBlockBatchError::ExactStateComponent {
-                            index,
-                            source,
-                        })?;
-            }
-            Ok(proof)
+        .map(|(index, structural)| {
+            crate::prove_exact_state_structural_killshot(structural).map_err(|source| {
+                FullAcceptedBlockBatchError::ExactStateComponent { index, source }
+            })
         })
         .collect()
 }
@@ -2067,26 +2037,12 @@ mod tests {
             output
                 .proof_components
                 .component_inputs
-                .exact_state_killshot_inputs
-                .len(),
-            1
-        );
-        assert_eq!(
-            output
-                .proof_components
-                .component_inputs
                 .exact_state_structural_inputs
                 .len(),
             1
         );
         assert_eq!(proof.exact_state.len(), 1);
-        let legacy = &output
-            .proof_components
-            .component_inputs
-            .exact_state_killshot_inputs[0];
-        assert_eq!(legacy.slot_leaves.len(), 2);
-        assert_eq!(legacy.state_paths.len(), 2);
-        assert_eq!(proof.exact_state[0].state_paths.len(), 1);
+        assert!(!proof.exact_state[0].structural_hashes.is_empty());
 
         let verified = verify_retained_full_accepted_block_batch_proof(
             &start_consensus,
@@ -2307,7 +2263,7 @@ mod tests {
             .find("bincode::deserialize::<BlockProof>")
             .expect("post-accept Block proof extraction");
         let proof_consumed = owned_native
-            .find("derive_retained_exact_state_inputs_from_verified_roots")
+            .find("derive_retained_exact_state_structural_inputs_from_verified_roots")
             .expect("detached state transition consumption");
         let sidecar_decode = owned_native
             .find("BlockAuthSidecar::from_bytes")

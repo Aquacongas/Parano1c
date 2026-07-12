@@ -326,8 +326,6 @@ const _: () = assert!(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum SelectedZkAuthPcsRegionAllocationError {
     AuthorizationShape,
-    MissingPairedExactState,
-    LegacyExactStatePaths,
     ExactStateShape,
     TxRootShape,
     SpineShape,
@@ -645,29 +643,11 @@ fn build_auth_pcs_meta_region_draft(
     let spine_meta_base = if has_both_a_families { meta_half } else { 0 };
 
     // Meta-B geometry: paired exact-state families first, followed by the
-    // transitional legacy exact-state path and tx-root path families.
-    let paired_es = es.and_then(|e| e.paired.as_ref());
+    // transaction-root path family.
+    let paired_es = es.map(|e| &e.paired);
     let mut leg_depths = Vec::new();
     let mut leg_caps = Vec::new();
     let mut leg_ivs = Vec::new();
-    let mut es_state_leg = None;
-    if let Some(e) = es {
-        if e.paired.is_some() {
-            assert!(
-                e.paths.is_empty(),
-                "paired exact-state handoff must not retain legacy paths"
-            );
-        } else {
-            assert!(
-                !e.paths.is_empty(),
-                "legacy exact-state path handoff is empty"
-            );
-            es_state_leg = Some(leg_depths.len());
-            leg_depths.push(e.d_state);
-            leg_caps.push(e.paths.len().div_ceil(k));
-            leg_ivs.push(iv_flat_of_tag(TAG_EXSTNOD));
-        }
-    }
     let mut txr_leg = None;
     if let Some(t) = txr {
         assert!(!t.paths.is_empty(), "tx-root region handoff without paths");
@@ -814,9 +794,9 @@ fn build_auth_pcs_meta_region_draft(
         }
     }
 
-    // Exact-state Meta-A leaves and transitional Meta-B state paths.
+    // Exact-state Meta-A leaves. Its state transition is carried exclusively
+    // by the paired local/upper Meta-B families above.
     if let Some(e) = es {
-        let n_es = e.leaves.len();
         let pad_flat = slot_leaf_pad_flat();
         let leaf_data: Vec<(F128, F128, F128)> = e
             .leaves
@@ -847,56 +827,6 @@ fn build_auth_pcs_meta_region_draft(
             let dslot = off + SPONGE_LEAF_DIGEST_SLOT;
             cell_pins_meta.push((C0, dslot, leaf.expected_leaf_w[0].clone()));
             cell_pins_meta.push((C0 + 1, dslot, leaf.expected_leaf_w[1].clone()));
-        }
-
-        if let Some(state_leg) = es_state_leg {
-            assert_eq!(e.paths.len(), n_es, "one state path per slot leaf");
-            let state_cap = leg_caps[state_leg];
-            for blk in 0..k {
-                let lo = (blk * state_cap).min(n_es);
-                let hi = ((blk + 1) * state_cap).min(n_es);
-                let state_paths: Vec<EsPathReal> = (lo..hi)
-                    .map(|g| {
-                        let path = &e.paths[g];
-                        assert_eq!(
-                            path.entry_leaf_index, g,
-                            "leaf↔path pairing is index-aligned"
-                        );
-                        assert_eq!(path.siblings.len(), e.d_state, "state path depth");
-                        let leaf = &e.leaves[g];
-                        let (root_w, root_flat) = if path.is_old {
-                            (e.old_root_w.clone(), e.old_root_flat)
-                        } else {
-                            (e.new_root_w.clone(), e.new_root_flat)
-                        };
-                        EsPathReal {
-                            entry_flat: leaf.expected_leaf_flat,
-                            entry_w: leaf.expected_leaf_w.clone(),
-                            siblings: path.siblings.clone(),
-                            directions: path.directions.clone(),
-                            root_flat,
-                            root_w,
-                        }
-                    })
-                    .collect();
-                fill_es_merkle_leg(
-                    &mut cb_meta_b,
-                    &mut s0_meta_b,
-                    &mut sout_meta_b,
-                    &mut acc_entry_wires[state_leg],
-                    &mut acc_root_wires[state_leg],
-                    &mut acc_committed_roots[state_leg],
-                    &mut acc_path_slots[state_leg],
-                    &mut acc_recomputed_roots[state_leg],
-                    e.d_state,
-                    state_cap,
-                    leg_ivs[state_leg],
-                    4,
-                    blk * meta_b.as_ref().expect("state leg needs meta-B").block_slots
-                        + meta_bases[state_leg],
-                    &state_paths,
-                );
-            }
         }
     }
 
@@ -1190,13 +1120,7 @@ fn preflight_selected_zk_meta_inputs(
     spine: &SpineRegionData,
     geometry: crate::region_sidecar::SelectedZkBlockGeometry,
 ) -> Result<(), SelectedZkAuthPcsRegionAllocationError> {
-    if !es.paths.is_empty() {
-        return Err(SelectedZkAuthPcsRegionAllocationError::LegacyExactStatePaths);
-    }
-    let paired = es
-        .paired
-        .as_ref()
-        .ok_or(SelectedZkAuthPcsRegionAllocationError::MissingPairedExactState)?;
+    let paired = &es.paired;
     if es.leaves.len() != 2 * geometry.touched_capacity
         || paired.touched_capacity != geometry.touched_capacity
         || paired.segment_capacity != geometry.segment_capacity
@@ -1458,7 +1382,7 @@ pub(super) fn allocate_selected_zk_auth_pcs_region(
         Some(meta_b_layout),
         paired_bases,
         paired_caps_per_block,
-        es.paired.as_ref(),
+        Some(&es.paired),
     )
     .expect("selected paired Meta preflight made the handoff mandatory");
     let allocated_updates = geometry.auth_tiles
@@ -1564,46 +1488,6 @@ mod selected_zk_common_allocator_tests {
             log2_len: w_log,
             index: first + column,
         })
-    }
-
-    fn empty_exact_state(paired: Option<ExactStatePairedRegionData>) -> ExactStateRegionData {
-        ExactStateRegionData {
-            leaves: Vec::new(),
-            paired,
-            paths: Vec::new(),
-            d_state: 24,
-            old_root_w: [LinExpr::zero(), LinExpr::zero()],
-            old_root_flat: [F128::ZERO; 2],
-            new_root_w: [LinExpr::zero(), LinExpr::zero()],
-            new_root_flat: [F128::ZERO; 2],
-        }
-    }
-
-    fn empty_paired() -> ExactStatePairedRegionData {
-        ExactStatePairedRegionData {
-            local_updates: Vec::new(),
-            upper_updates: Vec::new(),
-            local_update_count: 0,
-            upper_update_count: 0,
-            touched_capacity: SELECTED_ZK_REGION_TOUCHED_CAPACITY,
-            segment_capacity: SELECTED_ZK_REGION_SEGMENT_CAPACITY,
-            active_upper_depth: 8,
-        }
-    }
-
-    fn irrelevant_meta_companions() -> (TxRootRegionData, SpineRegionData) {
-        (
-            TxRootRegionData {
-                depth: 8,
-                root_w: [LinExpr::zero(), LinExpr::zero()],
-                root_flat: [F128::ZERO; 2],
-                paths: Vec::new(),
-                rim_flat: Vec::new(),
-            },
-            SpineRegionData {
-                instances: Vec::new(),
-            },
-        )
     }
 
     #[test]
@@ -1807,34 +1691,6 @@ mod selected_zk_common_allocator_tests {
         assert_eq!(vk.main_c().slices()[0].start(), ledger.main);
         assert_eq!(vk.meta_a().slices()[0].start(), ledger.meta_a);
         assert_eq!(vk.owner_c().slices()[0].start(), ledger.owner);
-    }
-
-    #[test]
-    fn selected_meta_preflight_rejects_before_any_builder_row() {
-        let (txr, spine) = irrelevant_meta_companions();
-        let geometry = crate::region_sidecar::selected_zk_block_geometry(255).unwrap();
-        let b = FieldR1csBuilder::new();
-        let before = b.num_wires();
-        assert_eq!(
-            preflight_selected_zk_meta_inputs(&empty_exact_state(None), &txr, &spine, geometry,),
-            Err(SelectedZkAuthPcsRegionAllocationError::MissingPairedExactState)
-        );
-        assert_eq!(b.num_wires(), before);
-
-        let mut legacy = empty_exact_state(Some(empty_paired()));
-        legacy.paths.push(
-            crate::acceptance::trace::exact_state::ExactStatePathRegion {
-                siblings: Vec::new(),
-                directions: Vec::new(),
-                entry_leaf_index: 0,
-                is_old: true,
-            },
-        );
-        assert_eq!(
-            preflight_selected_zk_meta_inputs(&legacy, &txr, &spine, geometry),
-            Err(SelectedZkAuthPcsRegionAllocationError::LegacyExactStatePaths)
-        );
-        assert_eq!(b.num_wires(), before);
     }
 
     #[test]

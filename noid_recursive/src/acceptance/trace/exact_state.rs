@@ -3,16 +3,9 @@
 
 //! Exact-state slot-leaf and EXSTNOD verification in the recursive trace.
 //!
-//! Root/depth binding is direct: every old path is tied to the parent header
-//! root (or its one-level grow with the canonical zero subtree), every new path
-//! to the child header root, and every path depth to the child `log_slots`.
-//! C' still owns the compacted-action/slot-sort recombination relation binding
-//! the canonical body actions to these packed leaves.
-//!
-//! The sibling-only structural carrier currently has a preparation layer in
-//! this module. It materializes one verifier-derived tuple stream but does not
-//! yet constrain topology or bind those tuples to the shared region walk; its
-//! type and constructor deliberately say `Preparation` until that cut lands.
+//! Root/depth binding is derived from the canonical sibling-only structural
+//! frontier. C' still owns the compacted-action/slot-sort recombination
+//! relation binding the canonical body actions to these packed leaves.
 
 use noid_chain::exact_state_hash::{slot_leaf_hash, state_node_hash, zero_slot_roots, StateHash};
 use noid_chain::sparse_merkle::{
@@ -21,13 +14,10 @@ use noid_chain::sparse_merkle::{
 };
 use noid_chain::SlotValue;
 use noid_core::Block128;
-use noid_gkr::merkle_circuit::MerkleCircuit;
-use noid_gkr::state_leaf_killshot::{
-    SlotLeafInputs, SLOT_LEAF_LINEAR_RELATION_TAG, SLOT_LEAF_PERMS, SLOT_LEAF_PIN_LANES,
-};
+use noid_gkr::state_leaf_killshot::SlotLeafInputs;
 use noid_ivc_core::deep_chain::leaf_hash::flat_sponge_leaf_hash;
 use noid_ivc_core::field_circuit::Wire;
-use noid_poseidon2b::native::domain::{capacity_iv, TAG_EXSTNOD, TAG_EXSTSLT};
+use noid_poseidon2b::native::domain::{capacity_iv, TAG_EXSTNOD};
 
 use crate::block_certificate_backend::{
     derive_exact_state_segmented_updates, verify_exact_state_structural_frontier,
@@ -35,95 +25,13 @@ use crate::block_certificate_backend::{
 };
 
 use super::action_surface::ActionRowTrace;
-use super::batch_eval::{
-    verify_linear_eval_prebound_trace, LinearEvalProofTrace, MultiBatchEvalProofTrace,
-};
-use super::block_spine::{
-    close_spine_family_batch, discharge_sponge_chains_trace, sponge_chain_claims_trace,
-    verify_block_spine_shift_trace, verify_block_spine_unified_trace, BlockSpineShiftProofTrace,
-    BlockSpineUnifiedProofTrace, SpongeChainTrace,
-};
-use super::merkle_path::{
-    discharge_batched_merkle_trace, verify_batched_merkle_killshot_trace, BatchedMerkleProofTrace,
-    MerklePathInputsTrace,
-};
 use super::paired_merkle_update::{
     PairedMerkleUpdateWitness, PAIRED_UPDATE_DEPTH, PAIRED_UPDATE_STRIDE,
 };
 use super::{
     alloc_block, const_block, flat_const, flat_of, mul, pin_eq, pin_zero, poseidon2b_permute,
-    range_check_bits, BatchEvalReductionTrace, FieldR1csBuilder, LinExpr, RawChannelTrace, F128,
+    range_check_bits, FieldR1csBuilder, LinExpr, F128,
 };
-
-fn pad_after_one_field() -> Block128 {
-    let mut bytes = [0u8; 16];
-    bytes[0] = 0x80;
-    bytes[15] = 0x01;
-    Block128::from(u128::from_le_bytes(bytes))
-}
-
-pub struct SpongeFamilyProofTrace {
-    pub main: BlockSpineUnifiedProofTrace,
-    pub shift: BlockSpineShiftProofTrace,
-    pub chain: LinearEvalProofTrace,
-    pub batch: MultiBatchEvalProofTrace,
-    pub num_vars: usize,
-    pub live_slots: usize,
-}
-
-impl SpongeFamilyProofTrace {
-    fn alloc(
-        b: &mut FieldR1csBuilder,
-        kill_shot: &noid_gkr::BlockSpineKillShotProof,
-        chain: &noid_gkr::batch_eval::LinearEvalProof,
-        batch: &noid_gkr::batch_eval::MultiBatchEvalProof,
-        proof_num_vars: usize,
-        proof_live_slots: usize,
-        live_slots: usize,
-    ) -> Self {
-        let num_vars = noid_gkr::block_spine::num_vars_for(live_slots);
-        assert_eq!(proof_live_slots, live_slots, "proof off the trace shape");
-        assert_eq!(proof_num_vars, num_vars, "proof off the trace shape");
-        Self {
-            main: BlockSpineUnifiedProofTrace::alloc(b, &kill_shot.main, num_vars),
-            shift: BlockSpineShiftProofTrace::alloc(b, &kill_shot.shift, num_vars),
-            chain: LinearEvalProofTrace::alloc(b, chain, num_vars),
-            batch: MultiBatchEvalProofTrace::alloc(b, batch, num_vars, 3),
-            num_vars,
-            live_slots,
-        }
-    }
-
-    fn verify_tail(
-        &self,
-        b: &mut FieldR1csBuilder,
-        ch: &mut RawChannelTrace,
-        chain_claims: &[super::batch_eval::LinearEvalClaimTrace],
-        relation_tag: u128,
-    ) -> [BatchEvalReductionTrace; 3] {
-        let main_red =
-            verify_block_spine_unified_trace(b, ch, &self.main, self.num_vars, self.live_slots);
-        let shift_red =
-            verify_block_spine_shift_trace(b, ch, &self.shift, &main_red, self.num_vars);
-        let chain_red = verify_linear_eval_prebound_trace(
-            b,
-            ch,
-            &self.chain,
-            chain_claims,
-            self.num_vars,
-            relation_tag,
-        );
-        close_spine_family_batch(
-            b,
-            ch,
-            &main_red,
-            &shift_red,
-            &chain_red,
-            &self.batch,
-            self.num_vars,
-        )
-    }
-}
 
 pub struct SlotLeafInputsTrace {
     pub packed_value: LinExpr,
@@ -140,13 +48,6 @@ impl SlotLeafInputsTrace {
             owner_lo: alloc_block(b, native.owner_lo),
             expected_leaf: std::array::from_fn(|i| alloc_block(b, native.expected_leaf[i])),
         }
-    }
-
-    fn blocks(&self) -> Vec<[LinExpr; 2]> {
-        vec![
-            [self.packed_value.clone(), self.owner_hi.clone()],
-            [self.owner_lo.clone(), const_block(pad_after_one_field())],
-        ]
     }
 }
 
@@ -1035,52 +936,6 @@ fn constant_unsigned_bits(value: usize) -> Vec<LinExpr> {
         .collect()
 }
 
-pub fn verify_batched_slot_leaf_killshot_trace(
-    b: &mut FieldR1csBuilder,
-    ch: &mut RawChannelTrace,
-    proof: &SpongeFamilyProofTrace,
-    inputs: &[SlotLeafInputsTrace],
-) -> [BatchEvalReductionTrace; 3] {
-    assert!(!inputs.is_empty());
-    assert_eq!(proof.live_slots, inputs.len() * SLOT_LEAF_PERMS);
-    ch.absorb_const_tower(b, inputs.len() as u128);
-    ch.absorb_const_tower(b, TAG_EXSTSLT.as_u64() as u128);
-    for input in inputs {
-        ch.absorb(b, &input.packed_value);
-        ch.absorb(b, &input.owner_hi);
-        ch.absorb(b, &input.owner_lo);
-        ch.absorb(b, &input.expected_leaf[0]);
-        ch.absorb(b, &input.expected_leaf[1]);
-    }
-    let mut chain_claims = Vec::new();
-    for (idx, input) in inputs.iter().enumerate() {
-        chain_claims.extend(sponge_chain_claims_trace(
-            &input.blocks(),
-            capacity_iv(TAG_EXSTSLT),
-            &input.expected_leaf[..SLOT_LEAF_PIN_LANES],
-            idx * SLOT_LEAF_PERMS,
-            proof.num_vars,
-        ));
-    }
-    proof.verify_tail(b, ch, &chain_claims, SLOT_LEAF_LINEAR_RELATION_TAG)
-}
-
-pub fn discharge_batched_slot_leaf_trace(
-    b: &mut FieldR1csBuilder,
-    inputs: &[SlotLeafInputsTrace],
-    reductions: &[BatchEvalReductionTrace; 3],
-) {
-    let chains: Vec<SpongeChainTrace> = inputs
-        .iter()
-        .map(|input| SpongeChainTrace {
-            blocks: input.blocks(),
-            iv: capacity_iv(TAG_EXSTSLT),
-            expected: input.expected_leaf.clone(),
-        })
-        .collect();
-    discharge_sponge_chains_trace(b, &chains, reductions);
-}
-
 pub struct ExactStateRootWires {
     pub old_root: [LinExpr; 2],
     pub new_root: [LinExpr; 2],
@@ -1089,8 +944,6 @@ pub struct ExactStateRootWires {
 
 pub struct ExactStateSlotWires {
     pub slot_leaves: Vec<SlotLeafInputsTrace>,
-    /// Empty in region mode; the walk-B leg carries the path hashing there.
-    pub state_paths: Vec<MerklePathInputsTrace>,
     pub roots: ExactStateRootWires,
 }
 
@@ -1105,21 +958,11 @@ pub struct ExactStateLeafRegion {
     pub expected_leaf_flat: [F128; 2],
 }
 
-pub struct ExactStatePathRegion {
-    pub siblings: Vec<[F128; 2]>,
-    pub directions: Vec<bool>,
-    pub entry_leaf_index: usize,
-    pub is_old: bool,
-}
-
 pub struct ExactStateRegionData {
     pub leaves: Vec<ExactStateLeafRegion>,
-    /// `Some` is the production sequential old/new update schedule derived
-    /// from the authoritative structural frontier. `paths` then stays empty.
-    /// `None` retains the transitional directed-path region.
-    pub paired: Option<ExactStatePairedRegionData>,
-    pub paths: Vec<ExactStatePathRegion>,
-    pub d_state: usize,
+    /// Production sequential old/new update schedule derived from the
+    /// authoritative structural frontier.
+    pub paired: ExactStatePairedRegionData,
     pub old_root_w: [LinExpr; 2],
     pub old_root_flat: [F128; 2],
     pub new_root_w: [LinExpr; 2],
@@ -1128,69 +971,6 @@ pub struct ExactStateRegionData {
 
 fn flat2(fields: [Block128; 2]) -> [F128; 2] {
     [flat_of(fields[0]), flat_of(fields[1])]
-}
-
-fn alloc_exact_roots(
-    b: &mut FieldR1csBuilder,
-    inputs: &crate::block_certificate_backend::ExactStateKillShotInputs,
-) -> ExactStateRootWires {
-    assert_eq!(inputs.slot_leaves.len(), inputs.state_paths.len());
-    assert!(!inputs.state_paths.is_empty());
-    assert_eq!(inputs.state_paths.len() % 2, 0, "old ++ new halves");
-    let t = inputs.state_paths.len() / 2;
-    let active_depth = inputs.state_paths[0].active_depth;
-    let old_native = inputs.state_paths[0].expected_root;
-    let new_native = inputs.state_paths[t].expected_root;
-    for (j, path) in inputs.state_paths.iter().enumerate() {
-        assert_eq!(
-            path.active_depth, active_depth,
-            "all state paths share depth"
-        );
-        assert_eq!(path.leaf, inputs.slot_leaves[j].expected_leaf);
-        assert_eq!(
-            path.expected_root,
-            if j < t { old_native } else { new_native },
-            "path half must share one expected root"
-        );
-    }
-    ExactStateRootWires {
-        old_root: std::array::from_fn(|i| alloc_block(b, old_native[i])),
-        new_root: std::array::from_fn(|i| alloc_block(b, new_native[i])),
-        active_depth,
-    }
-}
-
-fn assemble_exact_state_region_data(
-    inputs: &crate::block_certificate_backend::ExactStateKillShotInputs,
-    slot_leaves: &[SlotLeafInputsTrace],
-    roots: &ExactStateRootWires,
-) -> ExactStateRegionData {
-    let t = inputs.state_paths.len() / 2;
-    let leaves = assemble_exact_state_leaf_region(&inputs.slot_leaves, slot_leaves);
-    let paths = inputs
-        .state_paths
-        .iter()
-        .enumerate()
-        .map(|(j, path)| ExactStatePathRegion {
-            siblings: path.siblings[..roots.active_depth]
-                .iter()
-                .map(|s| flat2(*s))
-                .collect(),
-            directions: path.directions[..roots.active_depth].to_vec(),
-            entry_leaf_index: j,
-            is_old: j < t,
-        })
-        .collect();
-    ExactStateRegionData {
-        leaves,
-        paired: None,
-        paths,
-        d_state: roots.active_depth,
-        old_root_w: roots.old_root.clone(),
-        old_root_flat: flat2(inputs.state_paths[0].expected_root),
-        new_root_w: roots.new_root.clone(),
-        new_root_flat: flat2(inputs.state_paths[t].expected_root),
-    }
 }
 
 fn assemble_exact_state_leaf_region(
@@ -1265,118 +1045,13 @@ pub fn build_exact_state_structural_region_slot(
     };
     let region = ExactStateRegionData {
         leaves: assemble_exact_state_leaf_region(&natives, &slot_leaves),
-        paired: Some(paired),
-        paths: Vec::new(),
-        d_state: inputs.active_depth as usize,
+        paired,
         old_root_w: roots.old_root.clone(),
         old_root_flat: flat_state_hash(inputs.old_root),
         new_root_w: roots.new_root.clone(),
         new_root_flat: flat_state_hash(inputs.new_root),
     };
-    Ok((
-        ExactStateSlotWires {
-            slot_leaves,
-            state_paths: Vec::new(),
-            roots,
-        },
-        region,
-    ))
-}
-
-pub fn scratch_exact_state_region_data(
-    b: &mut FieldR1csBuilder,
-    inputs: &crate::block_certificate_backend::ExactStateKillShotInputs,
-) -> ExactStateRegionData {
-    let slot_leaves = inputs
-        .slot_leaves
-        .iter()
-        .map(|input| SlotLeafInputsTrace::alloc(b, input))
-        .collect::<Vec<_>>();
-    let roots = alloc_exact_roots(b, inputs);
-    assemble_exact_state_region_data(inputs, &slot_leaves, &roots)
-}
-
-pub fn build_exact_state_slot(
-    b: &mut FieldR1csBuilder,
-    inputs: &crate::block_certificate_backend::ExactStateKillShotInputs,
-    proof: &crate::block_certificate_backend::ExactStateKillShotProof,
-) -> ExactStateSlotWires {
-    build_exact_state_slot_with_config(b, inputs, proof, false).0
-}
-
-pub fn build_exact_state_slot_with_config(
-    b: &mut FieldR1csBuilder,
-    inputs: &crate::block_certificate_backend::ExactStateKillShotInputs,
-    proof: &crate::block_certificate_backend::ExactStateKillShotProof,
-    region: bool,
-) -> (ExactStateSlotWires, Option<ExactStateRegionData>) {
-    assert!(!inputs.slot_leaves.is_empty());
-    assert!(!inputs.state_paths.is_empty());
-    let slot_leaves = inputs
-        .slot_leaves
-        .iter()
-        .map(|input| SlotLeafInputsTrace::alloc(b, input))
-        .collect::<Vec<_>>();
-    let roots = alloc_exact_roots(b, inputs);
-
-    let state_paths = if region {
-        Vec::new()
-    } else {
-        let mut ch = RawChannelTrace::new();
-        let family = SpongeFamilyProofTrace::alloc(
-            b,
-            &proof.slot_leaves.kill_shot,
-            &proof.slot_leaves.chain,
-            &proof.slot_leaves.batch,
-            proof.slot_leaves.num_vars,
-            proof.slot_leaves.live_slots,
-            inputs.slot_leaves.len() * SLOT_LEAF_PERMS,
-        );
-        let reductions = verify_batched_slot_leaf_killshot_trace(b, &mut ch, &family, &slot_leaves);
-        discharge_batched_slot_leaf_trace(b, &slot_leaves, &reductions);
-
-        let paths = inputs
-            .state_paths
-            .iter()
-            .map(|input| MerklePathInputsTrace::alloc(b, input))
-            .collect::<Vec<_>>();
-        let circuit = MerkleCircuit::build_with_tag(TAG_EXSTNOD);
-        let mut ch = RawChannelTrace::new();
-        let chunk_size = crate::block_certificate_backend::EXACT_STATE_MERKLE_PATH_CHUNK_SIZE;
-        assert_eq!(proof.state_paths.len(), paths.len().div_ceil(chunk_size));
-        for (chunk_proof, path_chunk) in proof.state_paths.iter().zip(paths.chunks(chunk_size)) {
-            let path_proof = BatchedMerkleProofTrace::alloc(b, chunk_proof, path_chunk);
-            let reductions =
-                verify_batched_merkle_killshot_trace(b, &mut ch, &circuit, &path_proof, path_chunk);
-            discharge_batched_merkle_trace(b, &circuit, path_chunk, &reductions);
-        }
-
-        let t = paths.len() / 2;
-        for (j, path) in paths.iter().enumerate() {
-            pin_pair(b, &path.leaf, &slot_leaves[j].expected_leaf);
-            pin_pair(
-                b,
-                &path.expected_root,
-                if j < t {
-                    &roots.old_root
-                } else {
-                    &roots.new_root
-                },
-            );
-        }
-        paths
-    };
-
-    let region_data =
-        region.then(|| assemble_exact_state_region_data(inputs, &slot_leaves, &roots));
-    (
-        ExactStateSlotWires {
-            slot_leaves,
-            state_paths,
-            roots,
-        },
-        region_data,
-    )
+    Ok((ExactStateSlotWires { slot_leaves, roots }, region))
 }
 
 fn pin_pair(b: &mut FieldR1csBuilder, a: &[LinExpr; 2], c: &[LinExpr; 2]) {
@@ -1899,9 +1574,10 @@ mod tests {
             segment_capacity,
         )
         .unwrap();
-        assert!(slot.state_paths.is_empty());
-        assert!(region.paths.is_empty());
-        assert!(region.paired.is_some());
+        assert_eq!(
+            region.paired.local_update_count,
+            inputs.touched_indices.len()
+        );
         assert_eq!(slot.slot_leaves.len(), 2 * touched_capacity);
         let old_pad = slot.slot_leaves[touched_capacity - 1].expected_leaf.clone();
         let new_pad = slot.slot_leaves[2 * touched_capacity - 1]

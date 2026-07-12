@@ -48,18 +48,15 @@ pub use accepted_block_certificate::{
 };
 
 pub use exact_state_killshot::{
-    derive_exact_state_killshot_inputs, derive_exact_state_structural_killshot_inputs,
-    prove_exact_state_killshot, prove_exact_state_structural_killshot, verify_exact_state_killshot,
-    verify_exact_state_structural_killshot, ExactStateKillShotError, ExactStateKillShotInputs,
-    ExactStateKillShotProof, ExactStateStructuralFrontierInputs,
-    EXACT_STATE_STRUCTURAL_HASH_CHUNK_SIZE, TRANSITIONAL_INLINE_EXACT_STATE_MAX_PATHS,
+    derive_exact_state_structural_killshot_inputs, prove_exact_state_structural_killshot,
+    verify_exact_state_structural_killshot, ExactStateKillShotError, ExactStateKillShotProof,
+    ExactStateStructuralFrontierInputs, EXACT_STATE_STRUCTURAL_HASH_CHUNK_SIZE,
 };
 pub use exact_state_transition::{
     build_exact_state_transition_proof, build_exact_state_transition_proof_from_siblings,
-    derive_exact_slot_leaf_batch_inputs, derive_exact_state_merkle_batch_inputs,
-    derive_exact_state_structural_hash_batch_inputs, exact_state_structural_hash_chunk_plan,
-    exact_state_structural_hash_ghost_input, exact_state_structural_hash_params,
-    verify_exact_state_transition, ExactSlotLeafBatchInputs, ExactStateMerkleBatchInputs,
+    derive_exact_slot_leaf_batch_inputs, derive_exact_state_structural_hash_batch_inputs,
+    exact_state_structural_hash_chunk_plan, exact_state_structural_hash_ghost_input,
+    exact_state_structural_hash_params, verify_exact_state_transition, ExactSlotLeafBatchInputs,
     ExactStateStructuralHashBatchInputs, ExactStateStructuralHashChunkPlan,
     ExactStateTransitionError, ExactStateTransitionInputs, ExactStateTransitionProof,
     VerifiedStateTransition,

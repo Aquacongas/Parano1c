@@ -13,15 +13,13 @@ use noid_chain::exact_state_hash::{slot_leaf_hash, state_node_hash, zero_slot_ro
 use noid_chain::fri_state::SlotValue;
 use noid_chain::sparse_merkle::{
     build_multiproof, derive_structural_frontier_plan, evaluate_structural_frontier,
-    expand_multiproof_paths, frontier_sibling_positions, maximum_sibling_count_with_segment_cap,
-    ExpandedMerklePath, SparseMerkleCache, SparseMerkleError, StructuralFrontierEvaluation,
-    StructuralFrontierPlan, StructuralNodeRef, STRUCTURAL_FRONTIER_PAD,
+    frontier_sibling_positions, maximum_sibling_count_with_segment_cap, SparseMerkleCache,
+    SparseMerkleError, StructuralFrontierEvaluation, StructuralFrontierPlan, StructuralNodeRef,
+    STRUCTURAL_FRONTIER_PAD,
 };
 use noid_chain::state_delta::ExactActionSurface;
-use noid_core::{Block128, TowerField};
-use noid_gkr::{
-    FixedFieldHashInputs, FixedFieldHashParams, MerklePathInputs, SlotLeafInputs, MAX_MERKLE_DEPTH,
-};
+use noid_core::Block128;
+use noid_gkr::{FixedFieldHashInputs, FixedFieldHashParams, SlotLeafInputs, MAX_MERKLE_DEPTH};
 use noid_poseidon2b::native::domain::TAG_EXSTNOD;
 
 /// Maximum user transactions under the consensus semantic block budget.
@@ -83,15 +81,6 @@ pub struct VerifiedStateTransition {
     slot_updates: Vec<(u32, SlotValue)>,
     active_slot_count: u64,
     alloc_counter: u64,
-}
-
-/// Public Merkle-path inputs consumed by the EXSTNOD batch relation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExactStateMerkleBatchInputs {
-    pub old_root: StateHash,
-    pub new_root: StateHash,
-    pub old_paths: Vec<MerklePathInputs>,
-    pub new_paths: Vec<MerklePathInputs>,
 }
 
 /// Public EXSTSLT slot-leaf inputs for old and new exact leaves.
@@ -271,55 +260,6 @@ pub fn build_exact_state_transition_proof_from_siblings(
         });
     }
     Ok(ExactStateTransitionProof { slot_siblings })
-}
-
-/// Derive and fully bind the old/new EXSTNOD path statements.
-pub fn derive_exact_state_merkle_batch_inputs(
-    inputs: &ExactStateTransitionInputs,
-    surface: &ExactActionSurface,
-    proof: &ExactStateTransitionProof,
-) -> Result<ExactStateMerkleBatchInputs, ExactStateTransitionError> {
-    let roots = verify_exact_state_roots(inputs, surface, proof)?;
-
-    derive_exact_state_merkle_batch_inputs_from_verified_roots(inputs, surface, proof, &roots)
-}
-
-/// Project transitional directed-path inputs from roots already authenticated
-/// by [`verify_exact_state_roots`]. This is crate-private so untrusted callers
-/// cannot bypass the root audit.
-pub(crate) fn derive_exact_state_merkle_batch_inputs_from_verified_roots(
-    inputs: &ExactStateTransitionInputs,
-    surface: &ExactActionSurface,
-    proof: &ExactStateTransitionProof,
-    roots: &VerifiedExactStateRoots,
-) -> Result<ExactStateMerkleBatchInputs, ExactStateTransitionError> {
-    let old_expanded = expand_multiproof_paths(
-        &surface.touched_indices,
-        &roots.old_leaf_hashes,
-        &proof.slot_siblings,
-        inputs.child_log_slots,
-    )?;
-    let new_expanded = expand_multiproof_paths(
-        &surface.touched_indices,
-        &roots.new_leaf_hashes,
-        &proof.slot_siblings,
-        inputs.child_log_slots,
-    )?;
-    let old_paths = old_expanded
-        .iter()
-        .map(|path| expanded_to_gkr_path(path, roots.old_root, inputs.child_log_slots))
-        .collect::<Result<Vec<_>, _>>()?;
-    let new_paths = new_expanded
-        .iter()
-        .map(|path| expanded_to_gkr_path(path, roots.new_root, inputs.child_log_slots))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    Ok(ExactStateMerkleBatchInputs {
-        old_root: roots.old_root,
-        new_root: roots.new_root,
-        old_paths,
-        new_paths,
-    })
 }
 
 /// Parameters for the structural binary-node hash relation.
@@ -742,33 +682,6 @@ fn digest_to_fields(hash: StateHash) -> [Block128; 2] {
     ]
 }
 
-fn expanded_to_gkr_path(
-    path: &ExpandedMerklePath,
-    expected_root: StateHash,
-    depth: u32,
-) -> Result<MerklePathInputs, ExactStateTransitionError> {
-    let depth = depth as usize;
-    if depth > MAX_MERKLE_DEPTH {
-        return Err(ExactStateTransitionError::ProofDepthUnsupported {
-            depth: depth as u32,
-            max_depth: MAX_MERKLE_DEPTH,
-        });
-    }
-    let mut siblings = [[Block128::ZERO; 2]; MAX_MERKLE_DEPTH];
-    let mut directions = [false; MAX_MERKLE_DEPTH];
-    for level in 0..depth {
-        siblings[level] = digest_to_fields(path.siblings[level]);
-        directions[level] = path.directions[level];
-    }
-    Ok(MerklePathInputs {
-        leaf: digest_to_fields(path.leaf),
-        siblings,
-        directions,
-        expected_root: digest_to_fields(expected_root),
-        active_depth: depth,
-    })
-}
-
 fn hash_slots(slots: &[SlotValue]) -> Vec<StateHash> {
     slots.iter().copied().map(slot_leaf_hash).collect()
 }
@@ -862,35 +775,22 @@ mod tests {
         assert_eq!(verified.active_slot_count(), 1);
         assert_eq!(verified.alloc_counter(), 2);
 
-        let derived = derive_exact_state_merkle_batch_inputs(&inputs, &surface, &proof).unwrap();
-        assert_eq!(derived.old_root, inputs.parent_state_root);
-        assert_eq!(derived.new_root, inputs.child_state_root);
-        assert!(derived
-            .old_paths
-            .iter()
-            .chain(derived.new_paths.iter())
-            .all(|path| path.active_depth == inputs.child_log_slots as usize));
+        let roots = verify_exact_state_roots(&inputs, &surface, &proof).unwrap();
+        assert_eq!(roots.old_root, inputs.parent_state_root);
+        assert_eq!(roots.new_root, inputs.child_state_root);
     }
 
     #[test]
     fn grow_transition_uses_parent_plus_zero_frontier() {
         let (surface, inputs, proof) = fixture(true);
-        let derived = derive_exact_state_merkle_batch_inputs(&inputs, &surface, &proof).unwrap();
+        let roots = verify_exact_state_roots(&inputs, &surface, &proof).unwrap();
         let zeros = zero_slot_roots(inputs.parent_log_slots as usize);
         let expected_old = state_node_hash(
             inputs.parent_state_root,
             zeros[inputs.parent_log_slots as usize],
         );
-        assert_eq!(derived.old_root, expected_old);
-        assert_eq!(derived.new_root, inputs.child_state_root);
-        assert!(derived
-            .old_paths
-            .iter()
-            .all(|path| path.expected_root == digest_to_fields(expected_old)));
-        assert!(derived
-            .new_paths
-            .iter()
-            .all(|path| path.expected_root == digest_to_fields(inputs.child_state_root)));
+        assert_eq!(roots.old_root, expected_old);
+        assert_eq!(roots.new_root, inputs.child_state_root);
         verify_exact_state_transition(&inputs, &surface, &proof).unwrap();
     }
 
