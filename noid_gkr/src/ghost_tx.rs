@@ -74,7 +74,8 @@ pub fn ghost_tx_body() -> TxBody {
 /// The ghost body hash lanes — the constant ghost spine chains hash to and
 /// ghost authorization statements bind.
 pub fn ghost_tx_body_hash() -> [Block128; 2] {
-    ghost_authorization().1.tx_body_hash
+    let txid = ghost_tx_body().txid();
+    [txid.as_fields()[0], txid.as_fields()[1]]
 }
 
 /// Legacy recursive-trace ghost fixture: the old owner-auth KillShot plus its

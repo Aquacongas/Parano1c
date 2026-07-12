@@ -747,10 +747,13 @@ mod tests {
             Err(BlockAuthSidecarCodecError::TrailingBytes { remaining: 1 })
         ));
 
-        let legacy = bincode::serialize(&noid_gkr::ghost_tx::ghost_authorization().0)
-            .expect("encode legacy proof fixture");
+        // A legacy bincode payload has no fixed selected-sidecar marker.  The
+        // hard-cut decoder rejects it before attempting any proof decode; it
+        // never dispatches by a legacy shape or version.
+        let legacy_unframed_payload = bincode::serialize(&vec![0u64; 64])
+            .expect("encode representative unframed legacy payload");
         assert!(matches!(
-            BlockAuthSidecar::from_bytes(&legacy),
+            BlockAuthSidecar::from_bytes(&legacy_unframed_payload),
             Err(BlockAuthSidecarCodecError::InvalidMagic)
                 | Err(BlockAuthSidecarCodecError::Truncated)
         ));
