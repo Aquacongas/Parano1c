@@ -37,12 +37,16 @@ fn field_proof_byte_digest() {
         all.extend_from_slice(&digest);
     }
     let top = noid_poseidon2b::native::poseidon2b_hash_byte_slices(b"BYTE-IDENTITY-TOP", &[&all]);
-    // Pinned digest. Re-pinned 2026-07-09 for the grind-by-squeeze pow rule
-    // (the transcript-protocol change is deliberate; the pin still catches
-    // ACCIDENTAL transcript perturbations such as a non-identical fold).
+    // Pinned digest. Re-pinned 2026-07-12; a bisect attributed both shifts
+    // since the 2026-07-09 pin to deliberate protocol commits only: the
+    // cryptographic-boundary/final-ladder cut (bf6aa115) and finite-length
+    // UDR query derivation (4eaed4d0). Every other commit in the range —
+    // including all four prove-time cuts — reproduced the digest byte-exact,
+    // so the pin still catches ACCIDENTAL transcript perturbations such as a
+    // non-identical fold.
     assert_eq!(
         hex(&top),
-        "9655b9e0c2052777809d96c01af2cc4dba5a8d6dd9ab4d0e2a97b3b90a4d3021",
+        "5a6b326250bf36e3ee07f882e8f58877594b44915c1b74a7178d6297fc7a7545",
         "proof bytes changed — the transcript must be byte-stable"
     );
 }
