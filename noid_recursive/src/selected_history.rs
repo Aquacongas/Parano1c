@@ -128,6 +128,12 @@ impl SelectedHistoryTerminalPackage {
         &self.terminal_envelope
     }
 
+    /// Consume a locally decoded package and transfer its terminal proof into
+    /// the next durable Link job without cloning the proof envelope.
+    pub fn into_terminal_envelope(self) -> LinkProofEnvelope {
+        self.terminal_envelope
+    }
+
     /// Exact canonical wire encoding.
     pub fn encode(&self) -> Result<Vec<u8>, SelectedHistoryCodecError> {
         encode_selected_history_terminal_package(self)

@@ -3095,6 +3095,9 @@ impl MdbxStore {
             if let Some(coverage_height) = real_checkpoint_coverage {
                 let cutoff = retention_cutoff.min(coverage_height);
                 let cert_tbl = txn.open_table(Some(T_ACCEPTED_BLOCK_CERTIFICATES))?;
+                let jobs_tbl = txn.open_table(Some(T_RECURSIVE_PROOF_JOBS))?;
+                let results_tbl = txn.open_table(Some(T_RECURSIVE_PROOF_RESULTS))?;
+                let headers_tbl = txn.open_table(Some(T_HEADERS))?;
                 for table_name in [
                     T_RECENT_BLOCKS,
                     T_BLOCK_PROOFS,
@@ -3117,7 +3120,42 @@ impl MdbxStore {
                     };
                     for h in candidates {
                         let certificate: Option<Vec<u8>> = txn.get(&cert_tbl, &u64_key(h))?;
-                        if certificate.is_some() {
+                        let job_key = recursive_proof_height_key(h);
+                        let completed_job: Option<RecursiveProofJob> = txn
+                            .get::<[u8; RECURSIVE_PROOF_JOB_ENCODED_BYTES]>(&jobs_tbl, &job_key)?
+                            .and_then(|raw| decode_recursive_proof_job(h, &raw))
+                            .filter(|job| job.state == RecursiveProofJobState::Complete);
+                        let selected_result_is_canonical = if let Some(job) = completed_job {
+                            let canonical_hash = txn
+                                .get::<Vec<u8>>(&headers_tbl, &u64_key(h))?
+                                .as_deref()
+                                .and_then(canonical_hash_from_encoded_header);
+                            let result_length = txn
+                                .get::<ObjectLength>(&results_tbl, &job_key)?
+                                .map(|ObjectLength(length)| length);
+                            if canonical_hash == Some(job.block_hash)
+                                && result_length.is_some_and(|length| {
+                                    (RECURSIVE_PROOF_RESULT_HEADER_BYTES
+                                        ..=RECURSIVE_PROOF_RESULT_HEADER_BYTES
+                                            + MAX_RECURSIVE_PROOF_JOB_RESULT_BYTES)
+                                        .contains(&length)
+                                })
+                            {
+                                txn.get::<Vec<u8>>(&results_tbl, &job_key)?
+                                    .and_then(|raw| decode_recursive_proof_result(h, raw))
+                                    .is_some_and(|result| result.block_hash == job.block_hash)
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+                        // The certificate checkpoint is not selected recursive
+                        // authority. Retain every raw block/proof/sidecar until
+                        // its canonical selected Link result is durably complete;
+                        // otherwise a slow or restarted prover could lose the
+                        // only material from which its queued job is rebuilt.
+                        if certificate.is_some() && selected_result_is_canonical {
                             txn.del(&tbl, u64_key(h), None)?;
                         }
                     }
@@ -3230,6 +3268,67 @@ mod tests {
         txn.clear_table(&table).unwrap();
         txn.put(&table, key, value, WriteFlags::empty()).unwrap();
         txn.commit().unwrap();
+    }
+
+    #[test]
+    fn pruning_waits_for_canonical_selected_recursive_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(dir.path()).unwrap();
+        let (_header, hash) = put_recursive_job_header(&store, 1, 0xA11CE);
+
+        let txn = store.db.begin_rw_txn().unwrap();
+        for (table_name, bytes) in [
+            (T_RECENT_BLOCKS, b"retained-block".as_slice()),
+            (T_BLOCK_PROOFS, b"retained-proof".as_slice()),
+            (T_BLOCK_AUTH_SIDECARS, b"retained-sidecar".as_slice()),
+            (T_HISTORY_CLAIMS, b"retained-claim".as_slice()),
+            (T_ACCEPTED_BLOCK_CERTIFICATES, b"certificate".as_slice()),
+        ] {
+            let table = txn.open_table(Some(table_name)).unwrap();
+            txn.put(&table, u64_key(1), bytes, WriteFlags::empty())
+                .unwrap();
+        }
+        txn.commit().unwrap();
+        store
+            .put_checkpoint_coverage(&crate::checkpoint::CheckpointCoverage {
+                checkpoint_id: [1u8; 32],
+                height: 1,
+                block_hash: hash,
+                covered_from: 1,
+                covered_to: 1,
+                history_proof_covered_to: Some(1),
+            })
+            .unwrap();
+        store
+            .enqueue_recursive_proof_job(1, hash, RecursiveProofJobTier::B8)
+            .unwrap();
+
+        let pruning_height = RECENT_BLOCK_RETENTION_DEPTH + 1;
+        store.prune_after_commit(pruning_height).unwrap();
+        assert_eq!(
+            store.get_recent_block(1).unwrap().as_deref(),
+            Some(b"retained-block".as_slice())
+        );
+        assert_eq!(
+            store.get_block_proof(1).unwrap().as_deref(),
+            Some(b"retained-proof".as_slice())
+        );
+        assert_eq!(
+            store.get_block_auth_sidecar(1).unwrap().as_deref(),
+            Some(b"retained-sidecar".as_slice())
+        );
+
+        store.claim_next_recursive_proof_job().unwrap().unwrap();
+        store
+            .complete_recursive_proof_job(1, hash, b"selected-link-result")
+            .unwrap();
+        store.prune_after_commit(pruning_height).unwrap();
+        assert!(store.get_recent_block(1).unwrap().is_none());
+        assert!(store.get_block_proof(1).unwrap().is_none());
+        assert!(store.get_block_auth_sidecar(1).unwrap().is_none());
+        assert!(store.get_history_claim(1).unwrap().is_none());
+        assert!(store.get_accepted_block_certificate(1).unwrap().is_some());
+        assert!(store.get_recursive_proof_job_result(1).unwrap().is_some());
     }
 
     #[test]
