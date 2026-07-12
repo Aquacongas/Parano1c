@@ -222,6 +222,59 @@ struct RemoteSelectedHistoryVerificationCompletion {
     result: Result<VerifiedRemoteSelectedHistoryTerminal, String>,
 }
 
+/// One-time startup preflight over the selected-recursive artifact set: the
+/// pinned registry plus nine canonical matrices (T, four PreviousLink tiers,
+/// four CurrentBlock tiers). Missing pieces only disable the proof-native
+/// roles — snapshot admission and the proving worker; full-block sync stays
+/// available — but the node says so once at startup, loudly and with the
+/// exact missing list, instead of erroring deep inside the first sync.
+fn preflight_selected_recursive_artifacts(artifacts: &SelectedHistoryVerifierArtifacts) {
+    use noid_miner::{
+        selected_recursive_matrix_relative_path, SelectedRecursiveMatrixKind as Kind,
+        SelectedRecursiveTier as Tier,
+    };
+
+    let mut missing: Vec<String> = Vec::new();
+    let registry_path =
+        noid_miner::LocalSelectedRecursiveClassRegistryStore::new(artifacts.root.clone())
+            .artifact_path();
+    if !registry_path.is_file() {
+        missing.push("pinned class registry".into());
+    }
+    let kinds = [
+        Kind::GenesisLink,
+        Kind::PreviousLink(Tier::B8),
+        Kind::PreviousLink(Tier::B32),
+        Kind::PreviousLink(Tier::B64),
+        Kind::PreviousLink(Tier::B255),
+        Kind::CurrentBlock(Tier::B8),
+        Kind::CurrentBlock(Tier::B32),
+        Kind::CurrentBlock(Tier::B64),
+        Kind::CurrentBlock(Tier::B255),
+    ];
+    for kind in kinds {
+        let relative = selected_recursive_matrix_relative_path(kind);
+        if !artifacts.root.join(&relative).is_file() {
+            missing.push(relative.display().to_string());
+        }
+    }
+
+    if missing.is_empty() {
+        tracing::info!(
+            root = %artifacts.root.display(),
+            "selected-recursive artifacts complete: pinned registry and all nine canonical matrices"
+        );
+    } else {
+        tracing::warn!(
+            root = %artifacts.root.display(),
+            missing = %missing.join(", "),
+            "selected-recursive artifacts incomplete: proof-native snapshot admission and the \
+             proving worker stay disabled until the canonical artifacts are installed \
+             (one-time first-run generation; ordinary full-block sync remains available)"
+        );
+    }
+}
+
 fn selected_history_verifier_artifacts(
     data_dir: &Path,
 ) -> Result<Option<SelectedHistoryVerifierArtifacts>, String> {
@@ -736,10 +789,11 @@ async fn main() -> anyhow::Result<()> {
     })?;
     let selected_history_verifier =
         selected_history_verifier_artifacts(&data_dir).map_err(anyhow::Error::msg)?;
-    if selected_history_verifier.is_none() {
-        tracing::warn!(
+    match &selected_history_verifier {
+        None => tracing::warn!(
             "selected-history snapshot admission disabled: release registry authority is not embedded"
-        );
+        ),
+        Some(artifacts) => preflight_selected_recursive_artifacts(artifacts),
     }
 
     // --- Storage ---
