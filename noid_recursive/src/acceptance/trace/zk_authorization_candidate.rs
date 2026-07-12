@@ -1759,13 +1759,12 @@ mod tests {
     };
     use noid_gkr::layers::evaluate_permutation;
     use noid_gkr::zk_auth_capsule::{
-        build_explicit_mlecheck_carrier, build_post_claim_relation, AuthCapsuleBoundaryPublic,
-        AuthCapsuleTerminalOperandClaims, ZkAuthCapsuleBankView, ZkAuthCapsuleStateTable,
-        ZK_AUTH_CAPSULE_BANK_LEN, ZK_AUTH_CAPSULE_LIBRA_MASK_OFFSET,
+        build_explicit_mlecheck_carrier, build_post_claim_relation, state_cell_index,
+        AuthCapsuleBoundaryPublic, AuthCapsuleTerminalOperandClaims, ZkAuthCapsuleBankView,
+        ZkAuthCapsuleStateTable, ZK_AUTH_CAPSULE_BANK_LEN, ZK_AUTH_CAPSULE_LIBRA_MASK_OFFSET,
         ZK_AUTH_CAPSULE_PCS_COINS_OFFSET, ZK_AUTH_CAPSULE_REMAINING_PADDING_OFFSET,
-        ZK_AUTH_CAPSULE_STATE_LEN,
     };
-    use noid_gkr::zk_authorization::prove_zk_authorization_from_state;
+    use noid_gkr::zk_authorization::prove_zk_authorization_from_state_table;
     use noid_gkr::zk_mlecheck::ZkMleCheckRoundProof;
     use noid_ivc_core::deep_chain::schedule::LaneSource;
     use noid_ivc_core::field_r1cs::FieldR1cs;
@@ -1868,10 +1867,12 @@ mod tests {
             iv[1],
         ]);
         let expected_address = [permutation.final_state()[0], permutation.final_state()[1]];
-        let state = ZkAuthCapsuleStateTable::from_permutation_witness(&permutation)
-            .expect("real AuthGKR state table");
         let mut bank = vec![Block128::ZERO; ZK_AUTH_CAPSULE_BANK_LEN];
-        bank[..ZK_AUTH_CAPSULE_STATE_LEN].copy_from_slice(state.cells());
+        for (round, row) in permutation.state.iter().enumerate() {
+            for (lane, value) in row.iter().copied().enumerate() {
+                bank[state_cell_index(round, lane).unwrap()] = value;
+            }
+        }
         for (index, cell) in bank
             .iter_mut()
             .enumerate()
@@ -2994,12 +2995,13 @@ mod tests {
 
     fn selected_ghost_proof() -> ZkAuthorizationProof {
         let secret = noid_gkr::ghost_tx::ghost_spend_secret();
-        let [secret_hi, secret_lo] = secret.as_fields();
         let [iv_hi, iv_lo] = capacity_iv(TAG_ADDRFIX);
-        let permutation = evaluate_permutation([secret_hi, secret_lo, iv_hi, iv_lo]);
+        let permutation = secret.with_exposed_prover_fields(|fields| {
+            evaluate_permutation([fields[0], fields[1], iv_hi, iv_lo])
+        });
         let state = ZkAuthCapsuleStateTable::from_permutation_witness(&permutation)
             .expect("canonical ghost state table");
-        prove_zk_authorization_from_state(state.cells(), canonical_selected_zk_ghost_statement())
+        prove_zk_authorization_from_state_table(&state, canonical_selected_zk_ghost_statement())
             .expect("fresh selected ghost authorization")
     }
 

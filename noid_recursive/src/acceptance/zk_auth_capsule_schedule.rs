@@ -206,7 +206,7 @@ mod tests {
     use noid_gkr::evaluate_permutation;
     use noid_gkr::zk_auth_capsule::{ZkAuthCapsuleStateTable, ZK_AUTH_CAPSULE_STATE_LEN};
     use noid_gkr::zk_authorization::{
-        prove_zk_authorization_from_state, verify_zk_authorization,
+        prove_zk_authorization_from_state_table, verify_zk_authorization,
         zk_auth_capsule_owner_dynamic_data, zk_authorization_main_dynamic_data,
         ZkAuthCapsuleOwnerStatement,
     };
@@ -355,7 +355,7 @@ mod tests {
         let address = [permutation.final_state()[0], permutation.final_state()[1]];
         let state = ZkAuthCapsuleStateTable::from_permutation_witness(&permutation)
             .expect("valid Poseidon state table");
-        assert_eq!(state.cells().len(), ZK_AUTH_CAPSULE_STATE_LEN);
+        assert_eq!(state.len(), ZK_AUTH_CAPSULE_STATE_LEN);
         let statement = ZkAuthCapsuleOwnerStatement {
             tx_body_hash: [
                 owner_test_elem(3, 0x7A_B0D1, salt),
@@ -363,7 +363,7 @@ mod tests {
             ],
             address,
         };
-        let proof = prove_zk_authorization_from_state(state.cells(), statement)
+        let proof = prove_zk_authorization_from_state_table(&state, statement)
             .expect("complete authorization proof");
         let verified =
             verify_zk_authorization(statement, &proof).expect("complete authorization replay");

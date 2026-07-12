@@ -207,11 +207,10 @@ mod tests {
     };
     use noid_gkr::layers::evaluate_permutation;
     use noid_gkr::zk_auth_capsule::{
-        build_explicit_mlecheck_carrier, build_post_claim_relation, AuthCapsuleBoundaryPublic,
-        AuthCapsuleTerminalOperandClaims, ZkAuthCapsuleBankView, ZkAuthCapsuleStateTable,
+        build_explicit_mlecheck_carrier, build_post_claim_relation, state_cell_index,
+        AuthCapsuleBoundaryPublic, AuthCapsuleTerminalOperandClaims, ZkAuthCapsuleBankView,
         ZK_AUTH_CAPSULE_BANK_LEN, ZK_AUTH_CAPSULE_LIBRA_MASK_OFFSET,
         ZK_AUTH_CAPSULE_PCS_COINS_OFFSET, ZK_AUTH_CAPSULE_REMAINING_PADDING_OFFSET,
-        ZK_AUTH_CAPSULE_STATE_LEN,
     };
     use noid_gkr::zk_mlecheck::ZkMleCheckRoundProof;
     use noid_ivc_core::field_r1cs::FieldR1cs;
@@ -284,10 +283,12 @@ mod tests {
             iv[1],
         ]);
         let expected_address = [permutation.final_state()[0], permutation.final_state()[1]];
-        let state = ZkAuthCapsuleStateTable::from_permutation_witness(&permutation)
-            .expect("real AuthGKR state table");
         let mut bank = vec![Block128::ZERO; ZK_AUTH_CAPSULE_BANK_LEN];
-        bank[..ZK_AUTH_CAPSULE_STATE_LEN].copy_from_slice(state.cells());
+        for (round, row) in permutation.state.iter().enumerate() {
+            for (lane, value) in row.iter().copied().enumerate() {
+                bank[state_cell_index(round, lane).unwrap()] = value;
+            }
+        }
         for (index, cell) in bank
             .iter_mut()
             .enumerate()

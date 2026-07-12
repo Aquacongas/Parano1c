@@ -14,7 +14,7 @@ use bench_prover::{
 use noid_core::mem_profile::{current_mem_snapshot, MemSnapshot};
 use noid_gkr::zk_auth_capsule::ZkAuthCapsuleStateTable;
 use noid_gkr::zk_authorization::{
-    prove_zk_authorization_from_state, ZkAuthCapsuleOwnerStatement, ZkAuthorizationProof,
+    prove_zk_authorization_from_state_table, ZkAuthCapsuleOwnerStatement, ZkAuthorizationProof,
 };
 use noid_gkr::{evaluate_permutation, owner_auth_public_from_body};
 use noid_poseidon2b::{capacity_iv, derive_address, SpendSecret, TAG_ADDRFIX};
@@ -100,9 +100,10 @@ fn prove_selected_authorization(body: &TxBody, secret: &SpendSecret) -> ZkAuthor
         derive_address(secret).as_fields(),
         "selected proof authority does not own the canonical body"
     );
-    let [secret_hi, secret_lo] = secret.as_fields();
     let [iv_hi, iv_lo] = capacity_iv(TAG_ADDRFIX);
-    let permutation = evaluate_permutation([secret_hi, secret_lo, iv_hi, iv_lo]);
+    let permutation = secret.with_exposed_prover_fields(|fields| {
+        evaluate_permutation([fields[0], fields[1], iv_hi, iv_lo])
+    });
     assert_eq!(
         [permutation.final_state()[0], permutation.final_state()[1]],
         public.expected_address,
@@ -114,7 +115,7 @@ fn prove_selected_authorization(body: &TxBody, secret: &SpendSecret) -> ZkAuthor
         tx_body_hash: public.tx_body_hash,
         address: public.expected_address,
     };
-    prove_zk_authorization_from_state(state.cells(), statement)
+    prove_zk_authorization_from_state_table(&state, statement)
         .expect("selected authorization proof")
 }
 
@@ -129,7 +130,7 @@ fn prepare_selected_fixture(live: usize, seed: u128) -> PreparedSelectedFixture 
     let mut scenarios = scenarios(live, seed);
     let secrets = scenarios
         .iter()
-        .map(|scenario| scenario.spend_secret.clone())
+        .map(BenchScenario::spend_secret)
         .collect::<Vec<_>>();
     let fixture = accepted_proved_user_block_fixture(scenarios.clone());
 

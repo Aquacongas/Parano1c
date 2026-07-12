@@ -285,9 +285,9 @@ mod tests {
     use noid_core::TowerField;
     use noid_gkr::layers::evaluate_permutation;
     use noid_gkr::zk_auth_capsule::{
-        compute_terminal_operand_claims, evaluate_auth_main_terminal_from_claims,
+        compute_terminal_operand_claims, evaluate_auth_main_terminal_from_claims, state_cell_index,
         validate_auth_main_relation, AuthCapsuleTerminalOperandClaims, ZkAuthCapsuleBankView,
-        ZkAuthCapsuleStateTable, ZK_AUTH_CAPSULE_BANK_LEN, ZK_AUTH_CAPSULE_STATE_LEN,
+        ZK_AUTH_CAPSULE_BANK_LEN,
     };
     use noid_ivc_core::field_r1cs::FieldR1cs;
     use noid_poseidon2b::native::domain::{capacity_iv, TAG_ADDRFIX};
@@ -381,9 +381,12 @@ mod tests {
         let iv = capacity_iv(TAG_ADDRFIX);
         let input = [elem(0, 0x5EC2E7), elem(1, 0x5EC2E7), iv[0], iv[1]];
         let permutation = evaluate_permutation(input);
-        let state = ZkAuthCapsuleStateTable::from_permutation_witness(&permutation).unwrap();
         let mut bank = vec![Block128::ZERO; ZK_AUTH_CAPSULE_BANK_LEN];
-        bank[..ZK_AUTH_CAPSULE_STATE_LEN].copy_from_slice(state.cells());
+        for (round, row) in permutation.state.iter().enumerate() {
+            for (lane, value) in row.iter().copied().enumerate() {
+                bank[state_cell_index(round, lane).unwrap()] = value;
+            }
+        }
         let bank = ZkAuthCapsuleBankView::checked(&bank).unwrap();
         validate_auth_main_relation(bank).unwrap();
 

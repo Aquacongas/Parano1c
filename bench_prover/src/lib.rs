@@ -35,8 +35,17 @@ pub struct BenchScenario {
     pub label: &'static str,
     pub desc: String,
     pub body: TxBody,
-    /// Wallet-local proving authority. It is never serialized into `body`.
-    pub spend_secret: SpendSecret,
+    /// Public deterministic fixture seed used to recreate a fresh, consuming
+    /// wallet-local proving authority for each benchmark sample.  Keeping the
+    /// seed instead of a `SpendSecret` preserves the production type's
+    /// non-cloneable/non-exposing contract.
+    pub spend_secret_seed: u128,
+}
+
+impl BenchScenario {
+    pub fn spend_secret(&self) -> SpendSecret {
+        mk_secret(self.spend_secret_seed)
+    }
 }
 
 #[derive(Clone)]
@@ -179,7 +188,7 @@ pub fn mk_secret(seed: u128) -> SpendSecret {
     let mut bytes = [0u8; 32];
     bytes[..16].copy_from_slice(&lo.to_le_bytes());
     bytes[16..].copy_from_slice(&hi.to_le_bytes());
-    SpendSecret(bytes)
+    SpendSecret::from_bytes(bytes)
 }
 
 /// Build one canonical Tx8x2 scenario with `1..=8` live inputs and `1..=2`
@@ -245,7 +254,7 @@ pub fn tx8x2_scenario(
         label,
         desc: format!("Tx8x2: {n_inputs} inputs / {n_outputs} outputs"),
         body,
-        spend_secret,
+        spend_secret_seed: seed,
     }
 }
 
@@ -448,7 +457,7 @@ fn tx8x2_scenario_with_layout(
             TX_OUTPUTS
         ),
         body,
-        spend_secret,
+        spend_secret_seed: seed,
     }
 }
 
@@ -464,12 +473,10 @@ pub fn state_shrinking_scenario(
 }
 
 pub fn minimal_tx_fixture(scenario: BenchScenario) -> MinimalTxFixture {
-    let proof = prove_wallet_authorization(
-        &scenario.body,
-        OwnerAuthWitness::new(SpendSecret(scenario.spend_secret.0)),
-    )
-    .expect("selected witness-hiding authorization")
-    .proof;
+    let spend_secret = scenario.spend_secret();
+    let proof = prove_wallet_authorization(&scenario.body, OwnerAuthWitness::new(spend_secret))
+        .expect("selected witness-hiding authorization")
+        .proof;
     MinimalTxFixture {
         scenario,
         auth_proof: proof,
@@ -480,13 +487,13 @@ pub fn prove_wallet(fixture: &MinimalTxFixture, samples: usize) -> WalletBench {
     let prove_time = time_median(samples, || {
         prove_wallet_authorization(
             &fixture.scenario.body,
-            OwnerAuthWitness::new(SpendSecret(fixture.scenario.spend_secret.0)),
+            OwnerAuthWitness::new(fixture.scenario.spend_secret()),
         )
         .expect("prove selected wallet authorization");
     });
     let proof = prove_wallet_authorization(
         &fixture.scenario.body,
-        OwnerAuthWitness::new(SpendSecret(fixture.scenario.spend_secret.0)),
+        OwnerAuthWitness::new(fixture.scenario.spend_secret()),
     )
     .expect("prove selected wallet authorization")
     .proof;
@@ -1159,7 +1166,13 @@ pub fn accepted_two_coinbase_chain_fixture() -> [AcceptedSingleBlockFixture; 2] 
 #[derive(Clone)]
 struct TrackedSpendable {
     slot_index: u32,
-    spend_secret: SpendSecret,
+    spend_secret_seed: u128,
+}
+
+impl TrackedSpendable {
+    fn spend_secret(&self) -> SpendSecret {
+        mk_secret(self.spend_secret_seed)
+    }
 }
 
 fn four_tier_chain_start(
@@ -1177,7 +1190,8 @@ fn four_tier_chain_start(
     let mut spendables = Vec::with_capacity(INITIAL_UTXO_COUNT);
     let mut slots = Vec::with_capacity(INITIAL_UTXO_COUNT);
     for index in 0..INITIAL_UTXO_COUNT {
-        let spend_secret = mk_secret(seed.wrapping_add(0x1000_0000).wrapping_add(index as u128));
+        let spend_secret_seed = seed.wrapping_add(0x1000_0000).wrapping_add(index as u128);
+        let spend_secret = mk_secret(spend_secret_seed);
         let slot_index = 0x0001_0000 + (index as u32) * 0x0001_0000;
         let creation_id = index as u64 + 1;
         slots.push((
@@ -1190,7 +1204,7 @@ fn four_tier_chain_start(
         ));
         spendables.push(TrackedSpendable {
             slot_index,
-            spend_secret,
+            spend_secret_seed,
         });
     }
     let state =
@@ -1284,11 +1298,12 @@ fn sequential_chain_user_scenario(
     pre_state: &ChainState,
     epoch_anchor: [u8; 32],
     output_slots: [u32; TX_OUTPUTS],
-    output_secrets: [SpendSecret; TX_OUTPUTS],
+    output_secret_seeds: [u128; TX_OUTPUTS],
 ) -> BenchScenario {
     let input_slot = pre_state.state.slot(source.slot_index);
     assert!(!input_slot.is_empty(), "tracked fixture UTXO must be live");
-    let input_owner = derive_address(&source.spend_secret);
+    let source_secret = source.spend_secret();
+    let input_owner = derive_address(&source_secret);
     assert_eq!(
         input_slot,
         SlotValue::with_owner_fields(
@@ -1310,7 +1325,7 @@ fn sequential_chain_user_scenario(
         outputs[index] = TxOutput {
             slot_index: output_slots[index],
             amount: 1,
-            owner: derive_address(&output_secrets[index]),
+            owner: derive_address(&mk_secret(output_secret_seeds[index])),
         };
     }
     let mut body = TxBody {
@@ -1340,7 +1355,7 @@ fn sequential_chain_user_scenario(
         label: "accepted-four-tier-chain",
         desc: "continuous tier-ladder Tx8x2: 1 input / 2 outputs".to_owned(),
         body,
-        spend_secret: source.spend_secret.clone(),
+        spend_secret_seed: source.spend_secret_seed,
     }
 }
 
@@ -1386,24 +1401,22 @@ fn accepted_sequential_chain_fixture(
                     .checked_add(1)
                     .expect("four-tier fixture output slot space");
             }
-            let output_secrets = std::array::from_fn(|output_index| {
-                mk_secret(
-                    seed.wrapping_add(0x2000_0000)
-                        .wrapping_add((block_index as u128) << 20)
-                        .wrapping_add((tx_index as u128) << 4)
-                        .wrapping_add(output_index as u128),
-                )
+            let output_secret_seeds = std::array::from_fn(|output_index| {
+                seed.wrapping_add(0x2000_0000)
+                    .wrapping_add((block_index as u128) << 20)
+                    .wrapping_add((tx_index as u128) << 4)
+                    .wrapping_add(output_index as u128)
             });
             scenarios.push(sequential_chain_user_scenario(
                 source,
                 &state,
                 accumulator.epoch_anchor_id,
                 output_slots,
-                output_secrets.clone(),
+                output_secret_seeds,
             ));
             next_user_spendables.extend((0..TX_OUTPUTS).map(|output_index| TrackedSpendable {
                 slot_index: output_slots[output_index],
-                spend_secret: output_secrets[output_index].clone(),
+                spend_secret_seed: output_secret_seeds[output_index],
             }));
         }
 
@@ -1418,10 +1431,10 @@ fn accepted_sequential_chain_fixture(
             parent.height + 1,
             timestamp,
         );
-        let miner_secret = mk_secret(
-            seed.wrapping_add(0x3000_0000)
-                .wrapping_add(block_index as u128),
-        );
+        let miner_secret_seed = seed
+            .wrapping_add(0x3000_0000)
+            .wrapping_add(block_index as u128);
+        let miner_secret = mk_secret(miner_secret_seed);
         let template = noid_chain::consensus::build_block_template(
             &parent,
             &state,
@@ -1556,17 +1569,18 @@ fn accepted_sequential_chain_fixture(
         next_spendables.extend(spendables.iter().skip(user_count).cloned());
         next_spendables.push(TrackedSpendable {
             slot_index: coinbase_output.slot_index,
-            spend_secret: miner_secret,
+            spend_secret_seed: miner_secret_seed,
         });
         next_spendables.extend(next_user_spendables);
         for tracked in &next_spendables {
             let slot = next_state.state.slot(tracked.slot_index);
+            let tracked_secret = tracked.spend_secret();
             assert_eq!(
                 slot,
                 SlotValue::with_owner_fields(
                     slot.amount(),
                     slot.creation_id(),
-                    derive_address(&tracked.spend_secret).as_fields(),
+                    derive_address(&tracked_secret).as_fields(),
                 ),
                 "accepted end state must retain each tracked output authority"
             );

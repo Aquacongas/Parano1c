@@ -12,7 +12,7 @@ use noid_gkr::{
     OwnerAuthWitness, SpineCircuit, N_SPINE_SLOTS, N_SPINE_SLOTS_PADDED, N_SPINE_SLOT_VARS,
 };
 use noid_poseidon2b::channel::Poseidon2bChannel;
-use noid_poseidon2b::primitives::{SpendSecret, TxBodyHash};
+use noid_poseidon2b::primitives::TxBodyHash;
 
 fn requested_sizes() -> Vec<usize> {
     std::env::var("NOID_KILLSHOT_TX_COUNTS")
@@ -32,7 +32,7 @@ fn bench_owner_auth() {
     let (prove_time, proof) = time_once(|| {
         prove_wallet_authorization(
             &scenario.body,
-            OwnerAuthWitness::new(SpendSecret(scenario.spend_secret.0)),
+            OwnerAuthWitness::new(scenario.spend_secret()),
         )
         .expect("selected witness-hiding authorization")
         .proof
