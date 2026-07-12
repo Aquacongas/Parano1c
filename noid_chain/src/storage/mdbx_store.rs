@@ -42,6 +42,91 @@ use crate::storage::serial::{
 };
 use crate::storage::snapshot_staging::{FinalizedSnapshotStaging, SnapshotStagingError};
 
+// Deterministic mutation-boundary fault injection lives in this module rather
+// than in the MDBX wrapper so release builds cannot accidentally carry a
+// process-global switch on consensus writes.  Every call site below expands to
+// an empty block outside `cfg(test)`.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthoritativeMutationFault {
+    VerifiedHeaderBeforeCommit,
+    VerifiedHeaderAfterCommit,
+    AcceptedBlockBeforeCommit,
+    AcceptedBlockAfterCommit,
+    ReorgBeforeCommit,
+    ReorgAfterCommit,
+    SnapshotInstallBeforeCommit,
+    SnapshotInstallAfterCommit,
+    DeleteAboveBeforeCommit,
+    DeleteAboveAfterCommit,
+    SelectedPromotionBeforeCommit,
+    SelectedPromotionAfterCommit,
+    SelectedImportBeforeCommit,
+    SelectedImportAfterCommit,
+    RetainedPayloadPruneBeforeCommit,
+    RetainedPayloadPruneAfterCommit,
+    SelectedJournalPruneBeforeCommit,
+    SelectedJournalPruneAfterCommit,
+    EpochClearBeforeCommit,
+    EpochClearAfterCommit,
+}
+
+#[cfg(test)]
+thread_local! {
+    static AUTHORITATIVE_MUTATION_FAULT: std::cell::Cell<Option<AuthoritativeMutationFault>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// One-thread, one-shot guard used by restart tests.  TLS keeps parallel Rust
+/// tests independent, and consuming the point before returning the synthetic
+/// crash makes reopening the database exercise normal startup recovery.
+#[cfg(test)]
+pub(crate) struct AuthoritativeMutationFaultGuard;
+
+#[cfg(test)]
+impl Drop for AuthoritativeMutationFaultGuard {
+    fn drop(&mut self) {
+        AUTHORITATIVE_MUTATION_FAULT.with(|armed| armed.set(None));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn arm_authoritative_mutation_fault(
+    fault: AuthoritativeMutationFault,
+) -> AuthoritativeMutationFaultGuard {
+    AUTHORITATIVE_MUTATION_FAULT.with(|armed| {
+        assert!(
+            armed.replace(Some(fault)).is_none(),
+            "an authoritative MDBX mutation fault is already armed on this test thread"
+        );
+    });
+    AuthoritativeMutationFaultGuard
+}
+
+#[cfg(test)]
+fn hit_authoritative_mutation_fault(fault: AuthoritativeMutationFault) -> Result<(), StoreError> {
+    let hit = AUTHORITATIVE_MUTATION_FAULT.with(|armed| {
+        if armed.get() == Some(fault) {
+            armed.set(None);
+            true
+        } else {
+            false
+        }
+    });
+    if hit {
+        Err(StoreError::InjectedCrash(fault))
+    } else {
+        Ok(())
+    }
+}
+
+macro_rules! authoritative_mutation_boundary {
+    ($fault:ident) => {{
+        #[cfg(test)]
+        hit_authoritative_mutation_fault(AuthoritativeMutationFault::$fault)?;
+    }};
+}
+
 // ---------------------------------------------------------------------------
 // Table names
 // ---------------------------------------------------------------------------
@@ -121,6 +206,8 @@ pub enum StoreError {
     Decode(&'static str),
     HeaderAnchor(HeaderChainAnchorError),
     SnapshotStaging(SnapshotStagingError),
+    #[cfg(test)]
+    InjectedCrash(AuthoritativeMutationFault),
 }
 
 impl std::fmt::Display for StoreError {
@@ -130,6 +217,13 @@ impl std::fmt::Display for StoreError {
             Self::Decode(ctx) => write!(f, "decode error: {ctx}"),
             Self::HeaderAnchor(e) => write!(f, "header anchor: {e}"),
             Self::SnapshotStaging(e) => write!(f, "snapshot staging: {e}"),
+            #[cfg(test)]
+            Self::InjectedCrash(boundary) => {
+                write!(
+                    f,
+                    "injected crash at authoritative MDBX boundary {boundary:?}"
+                )
+            }
         }
     }
 }
@@ -141,6 +235,8 @@ impl std::error::Error for StoreError {
             Self::HeaderAnchor(error) => Some(error),
             Self::SnapshotStaging(error) => Some(error),
             Self::Decode(_) => None,
+            #[cfg(test)]
+            Self::InjectedCrash(_) => None,
         }
     }
 }
@@ -2046,7 +2142,19 @@ impl MdbxStore {
                 WriteFlags::empty(),
             )?;
         }
+        #[cfg(test)]
+        if promote_selected_history {
+            hit_authoritative_mutation_fault(
+                AuthoritativeMutationFault::SelectedPromotionBeforeCommit,
+            )?;
+        }
         txn.commit()?;
+        #[cfg(test)]
+        if promote_selected_history {
+            hit_authoritative_mutation_fault(
+                AuthoritativeMutationFault::SelectedPromotionAfterCommit,
+            )?;
+        }
         Ok(job)
     }
 
@@ -2222,7 +2330,9 @@ impl MdbxStore {
             encode_selected_history_coverage(coverage),
             WriteFlags::empty(),
         )?;
+        authoritative_mutation_boundary!(SelectedImportBeforeCommit);
         txn.commit()?;
+        authoritative_mutation_boundary!(SelectedImportAfterCommit);
         // Coverage is already durable. Cleanup is retryable maintenance and a
         // failure must not masquerade as a rejected verified import.
         let _ = self.compact_selected_history_journal_bounded();
@@ -2345,7 +2455,19 @@ impl MdbxStore {
             }
         }
 
+        #[cfg(test)]
+        if deleted != 0 {
+            hit_authoritative_mutation_fault(
+                AuthoritativeMutationFault::SelectedJournalPruneBeforeCommit,
+            )?;
+        }
         txn.commit()?;
+        #[cfg(test)]
+        if deleted != 0 {
+            hit_authoritative_mutation_fault(
+                AuthoritativeMutationFault::SelectedJournalPruneAfterCommit,
+            )?;
+        }
         Ok(deleted)
     }
 
@@ -2697,7 +2819,9 @@ impl MdbxStore {
         }
         rewind_selected_history_coverage(&txn, ancestor_height)?;
         rewind_retained_payload_prune_watermark(&txn, ancestor_height)?;
+        authoritative_mutation_boundary!(DeleteAboveBeforeCommit);
         txn.commit()?;
+        authoritative_mutation_boundary!(DeleteAboveAfterCommit);
         Ok(())
     }
 
@@ -2858,7 +2982,9 @@ impl MdbxStore {
             WriteFlags::empty(),
         )?;
 
+        authoritative_mutation_boundary!(VerifiedHeaderBeforeCommit);
         txn.commit()?;
+        authoritative_mutation_boundary!(VerifiedHeaderAfterCommit);
         Ok(())
     }
 
@@ -4008,7 +4134,9 @@ impl MdbxStore {
             WriteFlags::empty(),
         )?;
 
+        authoritative_mutation_boundary!(SnapshotInstallBeforeCommit);
         txn.commit()?;
+        authoritative_mutation_boundary!(SnapshotInstallAfterCommit);
         Ok(hot_state)
     }
 
@@ -4629,7 +4757,9 @@ impl MdbxStore {
         }
 
         // Commit atomically — all steps or none.
+        authoritative_mutation_boundary!(AcceptedBlockBeforeCommit);
         txn.commit()?;
+        authoritative_mutation_boundary!(AcceptedBlockAfterCommit);
 
         // Post-commit pruning is non-atomic and non-critical.
         // A prune failure leaves stale undo entries until
@@ -5068,7 +5198,9 @@ impl MdbxStore {
             item = cursor.next()?;
         }
 
+        authoritative_mutation_boundary!(ReorgBeforeCommit);
         txn.commit()?;
+        authoritative_mutation_boundary!(ReorgAfterCommit);
         if let Err(_error) = self.prune_after_commit(final_header.height) {
             // The accepted branch is already durable.  Pruning is retryable
             // maintenance and must not masquerade as a failed reorg.
@@ -5082,7 +5214,9 @@ impl MdbxStore {
         // delete count. The watermark and deletions commit atomically.
         let txn = self.db.begin_rw_txn()?;
         prune_retained_payloads_bounded(&txn, current_height)?;
+        authoritative_mutation_boundary!(RetainedPayloadPruneBeforeCommit);
         txn.commit()?;
+        authoritative_mutation_boundary!(RetainedPayloadPruneAfterCommit);
 
         // --- Prune undo_logs older than UNDO_RETENTION_DEPTH ---
         if current_height > UNDO_RETENTION_DEPTH {
@@ -5135,7 +5269,9 @@ impl MdbxStore {
             let tbl = txn.open_table(Some(name))?;
             txn.clear_table(&tbl)?;
         }
+        authoritative_mutation_boundary!(EpochClearBeforeCommit);
         txn.commit()?;
+        authoritative_mutation_boundary!(EpochClearAfterCommit);
         Ok(())
     }
 
@@ -8363,5 +8499,1078 @@ mod tests {
             anchor.block_id,
             crate::hash_block_header(&store.get_header(1).unwrap().unwrap())
         );
+    }
+
+    fn assert_injected_crash<T>(
+        result: Result<T, StoreError>,
+        expected: AuthoritativeMutationFault,
+    ) {
+        assert!(
+            matches!(result, Err(StoreError::InjectedCrash(actual)) if actual == expected),
+            "operation did not stop at the armed authoritative MDBX boundary"
+        );
+    }
+
+    fn crash_test_coinbase(tag: u8) -> noid_tx::Transaction {
+        use noid_poseidon2b::primitives::Address;
+        use noid_tx::{output_bitmap_bit, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS};
+
+        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        outputs[0] = TxOutput {
+            slot_index: u32::from(tag),
+            amount: 1,
+            owner: Address([tag; 32]),
+        };
+        noid_tx::Transaction::new(TxBody {
+            epoch_anchor: [tag; 32],
+            fee: 0,
+            input_owner: Address([0; 32]),
+            inputs: [TxInput::dummy(); TX_INPUTS],
+            outputs,
+            validity_bitmap: output_bitmap_bit(0),
+            is_coinbase: true,
+        })
+    }
+
+    #[test]
+    fn verified_header_crash_restart_is_exactly_old_or_new() {
+        for (fault, committed) in [
+            (
+                AuthoritativeMutationFault::VerifiedHeaderBeforeCommit,
+                false,
+            ),
+            (AuthoritativeMutationFault::VerifiedHeaderAfterCommit, true),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = MdbxStore::open(directory.path()).unwrap();
+            let genesis = crate::consensus::genesis::genesis_header();
+            let genesis_hash = crate::hash_block_header(&genesis);
+            store
+                .put_verified_header_only(&genesis, &genesis_hash, &[1; 32])
+                .unwrap();
+
+            let mut next = genesis;
+            next.height = 1;
+            next.prev_block_hash = genesis_hash;
+            next.timestamp = next.timestamp.saturating_add(1);
+            next.nonce = 11;
+            let next_hash = crate::hash_block_header(&next);
+            let next_work = [2; 32];
+
+            let guard = arm_authoritative_mutation_fault(fault);
+            assert_injected_crash(
+                store.put_verified_header_only(&next, &next_hash, &next_work),
+                fault,
+            );
+            drop(guard);
+            drop(store);
+
+            let reopened = MdbxStore::open(directory.path()).unwrap();
+            assert_eq!(reopened.get_header(0).unwrap(), Some(genesis));
+            assert_eq!(reopened.get_header(1).unwrap(), committed.then_some(next));
+            assert_eq!(
+                reopened.get_header_by_hash(&next_hash).unwrap(),
+                committed.then_some(next)
+            );
+            assert_eq!(
+                reopened.get_chain_work(1).unwrap(),
+                committed.then_some(next_work)
+            );
+            assert_eq!(
+                reopened
+                    .get_header_anchor(1)
+                    .unwrap()
+                    .map(|anchor| (anchor.block_id, anchor.cumulative_chainwork,)),
+                committed.then_some((next_hash, next_work))
+            );
+            assert_eq!(reopened.get_chain_tip().unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn accepted_block_crash_restart_keeps_one_complete_epoch() {
+        use noid_poseidon2b::primitives::{Address, TxBodyHash};
+
+        for (fault, committed) in [
+            (AuthoritativeMutationFault::AcceptedBlockBeforeCommit, false),
+            (AuthoritativeMutationFault::AcceptedBlockAfterCommit, true),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = MdbxStore::open(directory.path()).unwrap();
+            let owner = Address([0xC1; 32]);
+            let (parent, parent_meta) = commit_owner_fixture(&store, owner);
+            let parent_hash = crate::hash_block_header(&parent);
+            let parent_segment = store
+                .get_segment(0)
+                .unwrap()
+                .map(|(effective_log, columns)| encode_segment(&columns, effective_log));
+            let parent_utxos = store.get_verified_utxos_by_owner(&owner.0).unwrap();
+
+            let mut header = parent;
+            header.height = 1;
+            header.prev_block_hash = parent_hash;
+            header.timestamp = header.timestamp.saturating_add(1);
+            header.nonce = 0xA11CE;
+            let hash = crate::hash_block_header(&header);
+            let tx_hash = TxBodyHash([0xA1; 32]);
+            let undo = BlockUndoLog {
+                block_height: 1,
+                log_slots_before: parent.log_slots,
+                active_slot_count_before: parent.active_slot_count,
+                alloc_counter_before: parent.alloc_counter,
+                slot_changes: vec![],
+                tx_hashes: vec![tx_hash],
+            };
+            let meta = ConsensusMeta {
+                tip_height: 1,
+                tip_hash: hash,
+                cumulative_chainwork: [2; 32],
+                finalized: parent_meta.finalized,
+            };
+            let accepted = AcceptedBlockCommitData {
+                block_proof_bytes: b"accepted-proof",
+                block_auth_sidecar_bytes: b"accepted-sidecar",
+                history_claim_bytes: b"accepted-history",
+                accepted_block_certificate_bytes: b"accepted-certificate",
+            };
+
+            let guard = arm_authoritative_mutation_fault(fault);
+            assert_injected_crash(
+                store.commit_block(
+                    &header,
+                    &hash,
+                    &undo,
+                    &[],
+                    &[tx_hash],
+                    &[],
+                    Some(b"accepted-body"),
+                    Some(accepted),
+                    &meta,
+                    false,
+                ),
+                fault,
+            );
+            drop(guard);
+            drop(store);
+
+            let reopened = MdbxStore::open(directory.path()).unwrap();
+            assert_eq!(
+                reopened.get_chain_tip().unwrap(),
+                Some(if committed {
+                    (1, hash)
+                } else {
+                    (0, parent_hash)
+                })
+            );
+            assert_eq!(
+                reopened.get_consensus_meta().unwrap(),
+                Some(if committed {
+                    meta.clone()
+                } else {
+                    parent_meta.clone()
+                })
+            );
+            assert_eq!(reopened.get_header(1).unwrap(), committed.then_some(header));
+            assert_eq!(
+                reopened.get_chain_work(1).unwrap(),
+                committed.then_some([2; 32])
+            );
+            assert_eq!(
+                reopened
+                    .get_header_anchor(1)
+                    .unwrap()
+                    .map(|anchor| (anchor.block_id, anchor.cumulative_chainwork)),
+                committed.then_some((hash, [2; 32]))
+            );
+            assert_eq!(
+                reopened.get_state_meta().unwrap(),
+                Some((
+                    parent.log_slots,
+                    parent.active_slot_count,
+                    parent.alloc_counter
+                ))
+            );
+            assert_eq!(
+                reopened
+                    .get_segment(0)
+                    .unwrap()
+                    .map(|(effective_log, columns)| encode_segment(&columns, effective_log)),
+                parent_segment
+            );
+            let owner_snapshot = reopened.get_verified_utxos_by_owner(&owner.0).unwrap();
+            assert_eq!(owner_snapshot.utxos, parent_utxos.utxos);
+            assert_eq!(owner_snapshot.state_root, parent_utxos.state_root);
+            assert_eq!(owner_snapshot.log_slots, parent_utxos.log_slots);
+            assert_eq!(
+                owner_snapshot.active_slot_count,
+                parent_utxos.active_slot_count
+            );
+            assert_eq!(owner_snapshot.alloc_counter, parent_utxos.alloc_counter);
+            assert_eq!(owner_snapshot.height, if committed { 1 } else { 0 });
+            assert_eq!(
+                owner_snapshot.tip_hash,
+                if committed { hash } else { parent_hash }
+            );
+            assert_eq!(
+                reopened.get_tx_index(&tx_hash.0).unwrap(),
+                committed.then_some((1, 0))
+            );
+            assert_eq!(
+                reopened.get_undo_log(1).unwrap(),
+                committed.then_some(undo.clone())
+            );
+            assert_eq!(
+                reopened.get_recent_block(1).unwrap().as_deref(),
+                committed.then_some(b"accepted-body".as_slice())
+            );
+            assert_eq!(
+                reopened.get_block_proof(1).unwrap().as_deref(),
+                committed.then_some(b"accepted-proof".as_slice())
+            );
+            assert_eq!(
+                reopened.get_block_auth_sidecar(1).unwrap().as_deref(),
+                committed.then_some(b"accepted-sidecar".as_slice())
+            );
+            assert_eq!(
+                reopened.get_history_claim(1).unwrap().as_deref(),
+                committed.then_some(b"accepted-history".as_slice())
+            );
+            assert_eq!(
+                reopened
+                    .get_accepted_block_certificate(1)
+                    .unwrap()
+                    .as_deref(),
+                committed.then_some(b"accepted-certificate".as_slice())
+            );
+            assert_eq!(
+                reopened
+                    .get_recursive_proof_job(1)
+                    .unwrap()
+                    .map(|job| (job.block_hash, job.state,)),
+                committed.then_some((hash, RecursiveProofJobState::Pending))
+            );
+            assert_eq!(reopened.get_selected_history_coverage().unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn reorg_crash_restart_never_mixes_canonical_suffixes() {
+        use crate::block::Block;
+        use crate::storage::mdbx_context::ReorgBlockPayload;
+        use noid_poseidon2b::primitives::Address;
+
+        for (fault, committed) in [
+            (AuthoritativeMutationFault::ReorgBeforeCommit, false),
+            (AuthoritativeMutationFault::ReorgAfterCommit, true),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = MdbxStore::open(directory.path()).unwrap();
+            let owner = Address([0xC2; 32]);
+            let (parent, parent_meta) = commit_owner_fixture(&store, owner);
+            let parent_hash = crate::hash_block_header(&parent);
+            let parent_segment = store
+                .get_segment(0)
+                .unwrap()
+                .map(|(effective_log, columns)| encode_segment(&columns, effective_log));
+            let parent_utxos = store.get_verified_utxos_by_owner(&owner.0).unwrap();
+
+            let old_tx = crash_test_coinbase(1);
+            let old_tx_hash = old_tx.txid();
+            let mut old_header = parent;
+            old_header.height = 1;
+            old_header.prev_block_hash = parent_hash;
+            old_header.timestamp = old_header.timestamp.saturating_add(1);
+            old_header.nonce = 1;
+            let old_hash = crate::hash_block_header(&old_header);
+            let old_undo = BlockUndoLog {
+                block_height: 1,
+                log_slots_before: parent.log_slots,
+                active_slot_count_before: parent.active_slot_count,
+                alloc_counter_before: parent.alloc_counter,
+                slot_changes: vec![],
+                tx_hashes: vec![old_tx_hash],
+            };
+            let old_block = Block {
+                header: old_header,
+                transactions: vec![old_tx],
+            };
+            let old_bytes = old_block.to_bytes();
+            let old_meta = ConsensusMeta {
+                tip_height: 1,
+                tip_hash: old_hash,
+                cumulative_chainwork: [2; 32],
+                finalized: parent_meta.finalized,
+            };
+            store
+                .commit_block(
+                    &old_header,
+                    &old_hash,
+                    &old_undo,
+                    &[],
+                    &[old_tx_hash],
+                    &[],
+                    Some(&old_bytes),
+                    Some(AcceptedBlockCommitData {
+                        block_proof_bytes: b"old-proof",
+                        block_auth_sidecar_bytes: b"old-sidecar",
+                        history_claim_bytes: b"old-history",
+                        accepted_block_certificate_bytes: b"old-certificate",
+                    }),
+                    &old_meta,
+                    false,
+                )
+                .unwrap();
+
+            let new_tx = crash_test_coinbase(2);
+            let new_tx_hash = new_tx.txid();
+            let mut new_header = old_header;
+            new_header.nonce = 2;
+            let new_hash = crate::hash_block_header(&new_header);
+            let new_undo = BlockUndoLog {
+                block_height: 1,
+                log_slots_before: parent.log_slots,
+                active_slot_count_before: parent.active_slot_count,
+                alloc_counter_before: parent.alloc_counter,
+                slot_changes: vec![],
+                tx_hashes: vec![new_tx_hash],
+            };
+            let new_block = Block {
+                header: new_header,
+                transactions: vec![new_tx],
+            };
+            let new_bytes = new_block.to_bytes();
+            let staged = StagedAcceptedBlockCommit {
+                header: new_header,
+                hash: new_hash,
+                cumulative_chainwork: [3; 32],
+                undo_log: new_undo.clone(),
+                history_claim_bytes: b"new-history".to_vec(),
+                accepted_block_certificate_bytes: b"new-certificate".to_vec(),
+            };
+            let payload = ReorgBlockPayload::new(&new_block, b"new-proof", b"new-sidecar");
+            let new_meta = ConsensusMeta {
+                tip_height: 1,
+                tip_hash: new_hash,
+                cumulative_chainwork: [3; 32],
+                finalized: parent_meta.finalized,
+            };
+
+            let guard = arm_authoritative_mutation_fault(fault);
+            assert_injected_crash(
+                store.commit_reorg(
+                    0,
+                    &new_header,
+                    &new_hash,
+                    &[],
+                    &[old_tx_hash],
+                    &[payload],
+                    &[staged],
+                    &new_meta,
+                ),
+                fault,
+            );
+            drop(guard);
+            drop(store);
+
+            let reopened = MdbxStore::open(directory.path()).unwrap();
+            let (expected_header, expected_hash, expected_meta, expected_tx, expected_undo) =
+                if committed {
+                    (new_header, new_hash, new_meta, new_tx_hash, new_undo)
+                } else {
+                    (old_header, old_hash, old_meta, old_tx_hash, old_undo)
+                };
+            assert_eq!(reopened.get_chain_tip().unwrap(), Some((1, expected_hash)));
+            assert_eq!(reopened.get_consensus_meta().unwrap(), Some(expected_meta));
+            assert_eq!(reopened.get_header(1).unwrap(), Some(expected_header));
+            assert_eq!(
+                reopened.get_chain_work(1).unwrap(),
+                Some(if committed { [3; 32] } else { [2; 32] })
+            );
+            assert_eq!(
+                reopened
+                    .get_header_anchor(1)
+                    .unwrap()
+                    .map(|anchor| (anchor.block_id, anchor.cumulative_chainwork)),
+                Some((expected_hash, if committed { [3; 32] } else { [2; 32] },))
+            );
+            assert_eq!(
+                reopened.get_header_by_hash(&old_hash).unwrap().is_some(),
+                !committed
+            );
+            assert_eq!(
+                reopened.get_header_by_hash(&new_hash).unwrap().is_some(),
+                committed
+            );
+            assert_eq!(
+                reopened.get_tx_index(&old_tx_hash.0).unwrap().is_some(),
+                !committed
+            );
+            assert_eq!(
+                reopened.get_tx_index(&new_tx_hash.0).unwrap(),
+                committed.then_some((1, 0))
+            );
+            assert_eq!(reopened.get_undo_log(1).unwrap(), Some(expected_undo));
+            assert_eq!(
+                reopened.get_recent_block(1).unwrap(),
+                Some(if committed {
+                    new_bytes.clone()
+                } else {
+                    old_bytes.clone()
+                })
+            );
+            assert_eq!(
+                reopened.get_block_proof(1).unwrap().as_deref(),
+                Some(if committed {
+                    b"new-proof".as_slice()
+                } else {
+                    b"old-proof".as_slice()
+                })
+            );
+            assert_eq!(
+                reopened.get_history_claim(1).unwrap().as_deref(),
+                Some(if committed {
+                    b"new-history".as_slice()
+                } else {
+                    b"old-history".as_slice()
+                })
+            );
+            assert_eq!(
+                reopened
+                    .get_accepted_block_certificate(1)
+                    .unwrap()
+                    .as_deref(),
+                Some(if committed {
+                    b"new-certificate".as_slice()
+                } else {
+                    b"old-certificate".as_slice()
+                })
+            );
+            assert_eq!(
+                reopened
+                    .get_recursive_proof_job(1)
+                    .unwrap()
+                    .map(|job| (job.block_hash, job.state,)),
+                Some((expected_hash, RecursiveProofJobState::Pending))
+            );
+            assert_eq!(
+                reopened
+                    .get_segment(0)
+                    .unwrap()
+                    .map(|(effective_log, columns)| encode_segment(&columns, effective_log)),
+                parent_segment
+            );
+            let owner_snapshot = reopened.get_verified_utxos_by_owner(&owner.0).unwrap();
+            assert_eq!(owner_snapshot.utxos, parent_utxos.utxos);
+            assert_eq!(owner_snapshot.state_root, parent_utxos.state_root);
+            assert_eq!(owner_snapshot.log_slots, parent_utxos.log_slots);
+            assert_eq!(
+                owner_snapshot.active_slot_count,
+                parent_utxos.active_slot_count
+            );
+            assert_eq!(owner_snapshot.alloc_counter, parent_utxos.alloc_counter);
+            assert_eq!(owner_snapshot.height, 1);
+            assert_eq!(owner_snapshot.tip_hash, expected_hash);
+            assert_eq!(
+                reopened.get_state_meta().unwrap(),
+                Some((
+                    parent.log_slots,
+                    parent.active_slot_count,
+                    parent.alloc_counter
+                ))
+            );
+            assert_eq!(reopened.get_tx_index(&expected_tx.0).unwrap(), Some((1, 0)));
+        }
+    }
+
+    #[test]
+    fn staged_snapshot_crash_restart_keeps_one_state_and_authority_epoch() {
+        use noid_poseidon2b::primitives::TxBodyHash;
+
+        for (fault, committed) in [
+            (
+                AuthoritativeMutationFault::SnapshotInstallBeforeCommit,
+                false,
+            ),
+            (AuthoritativeMutationFault::SnapshotInstallAfterCommit, true),
+        ] {
+            let database = tempfile::tempdir().unwrap();
+            let staging_parent = tempfile::tempdir().unwrap();
+            let store = MdbxStore::open(database.path()).unwrap();
+            let (staging, old_header, new_header, old_owner, new_owner) =
+                staged_snapshot_install_fixture(&store, staging_parent.path());
+            let old_hash = crate::hash_block_header(&old_header);
+            let new_hash = crate::hash_block_header(&new_header);
+            let old_consensus = store.get_consensus_meta().unwrap().unwrap();
+            let stale_tx = TxBodyHash([0xD1; 32]);
+            store
+                .put_accepted_block_certificate(0, b"old-certificate")
+                .unwrap();
+            let txn = store.db.begin_rw_txn().unwrap();
+            let recent = txn.open_table(Some(T_RECENT_BLOCKS)).unwrap();
+            txn.put(&recent, u64_key(0), b"old-body", WriteFlags::empty())
+                .unwrap();
+            let undo = txn.open_table(Some(T_UNDO_LOGS)).unwrap();
+            txn.put(
+                &undo,
+                u64_key(0),
+                encode_undo_log(&BlockUndoLog::empty(0, old_header.log_slots)),
+                WriteFlags::empty(),
+            )
+            .unwrap();
+            let tx_index = txn.open_table(Some(T_TX_INDEX)).unwrap();
+            txn.put(
+                &tx_index,
+                stale_tx.0,
+                encode_tx_index_value(0, 0),
+                WriteFlags::empty(),
+            )
+            .unwrap();
+            txn.commit().unwrap();
+
+            let terminal = selected_terminal_bytes(1, new_hash);
+            let meta = ConsensusMeta {
+                tip_height: 1,
+                tip_hash: new_hash,
+                cumulative_chainwork: [2; 32],
+                finalized: crate::storage::meta::FinalizedCheckpoint {
+                    height: 1,
+                    hash: new_hash,
+                },
+            };
+            let guard = arm_authoritative_mutation_fault(fault);
+            assert_injected_crash(
+                store.install_finalized_snapshot_staging_with_selected_history(
+                    &staging,
+                    &meta,
+                    &[old_header, new_header],
+                    SelectedHistorySnapshotSeed {
+                        height: 1,
+                        block_hash: new_hash,
+                        tier: RecursiveProofJobTier::B8,
+                        terminal_package_bytes: &terminal,
+                    },
+                ),
+                fault,
+            );
+            drop(guard);
+            drop(store);
+
+            let reopened = MdbxStore::open(database.path()).unwrap();
+            assert_eq!(
+                reopened.get_chain_tip().unwrap(),
+                Some(if committed {
+                    (1, new_hash)
+                } else {
+                    (0, old_hash)
+                })
+            );
+            assert_eq!(
+                reopened.get_consensus_meta().unwrap(),
+                Some(if committed {
+                    meta.clone()
+                } else {
+                    old_consensus
+                })
+            );
+            assert_eq!(reopened.get_header(0).unwrap(), Some(old_header));
+            assert_eq!(reopened.get_header(1).unwrap(), Some(new_header));
+            assert_eq!(
+                reopened.get_state_meta().unwrap(),
+                Some(if committed { (3, 1, 2) } else { (3, 1, 1) })
+            );
+            assert_eq!(
+                reopened
+                    .get_verified_utxos_by_owner(&old_owner.0)
+                    .unwrap()
+                    .utxos,
+                if committed {
+                    vec![]
+                } else {
+                    vec![VerifiedOwnerUtxo {
+                        slot_index: 1,
+                        amount: 41,
+                        creation_id: 1,
+                    }]
+                }
+            );
+            assert_eq!(
+                reopened
+                    .get_verified_utxos_by_owner(&new_owner.0)
+                    .unwrap()
+                    .utxos,
+                if committed {
+                    vec![VerifiedOwnerUtxo {
+                        slot_index: 6,
+                        amount: 73,
+                        creation_id: 2,
+                    }]
+                } else {
+                    vec![]
+                }
+            );
+            assert_eq!(
+                reopened.get_recent_block(0).unwrap().as_deref(),
+                (!committed).then_some(b"old-body".as_slice())
+            );
+            assert_eq!(reopened.get_undo_log(0).unwrap().is_some(), !committed);
+            assert_eq!(
+                reopened.get_tx_index(&stale_tx.0).unwrap(),
+                (!committed).then_some((0, 0))
+            );
+            assert_eq!(
+                reopened
+                    .get_accepted_block_certificate(0)
+                    .unwrap()
+                    .as_deref(),
+                (!committed).then_some(b"old-certificate".as_slice())
+            );
+            assert_eq!(
+                reopened.get_selected_history_coverage().unwrap(),
+                committed.then_some(SelectedHistoryCoverage {
+                    height: 1,
+                    block_hash: new_hash,
+                })
+            );
+            assert_eq!(
+                reopened
+                    .get_recursive_proof_job(1)
+                    .unwrap()
+                    .map(|job| (job.block_hash, job.state,)),
+                committed.then_some((new_hash, RecursiveProofJobState::Complete))
+            );
+            assert_eq!(
+                reopened
+                    .get_selected_history_terminal_result()
+                    .unwrap()
+                    .map(|result| result.bytes),
+                committed.then_some(terminal)
+            );
+            assert_eq!(
+                retained_payload_prune_watermark(&reopened),
+                Some(if committed { 1 } else { 0 })
+            );
+        }
+    }
+
+    #[test]
+    fn selected_promotion_and_import_crash_restart_are_atomic() {
+        for (fault, committed) in [
+            (
+                AuthoritativeMutationFault::SelectedPromotionBeforeCommit,
+                false,
+            ),
+            (
+                AuthoritativeMutationFault::SelectedPromotionAfterCommit,
+                true,
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = MdbxStore::open(directory.path()).unwrap();
+            let chain = put_selected_history_header_chain(&store, 1);
+            let hash = chain[1].1;
+            store
+                .enqueue_recursive_proof_job(1, hash, RecursiveProofJobTier::B8)
+                .unwrap();
+            store.claim_next_recursive_proof_job().unwrap().unwrap();
+            let terminal = selected_terminal_bytes(1, hash);
+            let guard = arm_authoritative_mutation_fault(fault);
+            assert_injected_crash(
+                store.complete_recursive_proof_job_and_promote_selected_history(1, hash, &terminal),
+                fault,
+            );
+            drop(guard);
+            drop(store);
+
+            let reopened = MdbxStore::open(directory.path()).unwrap();
+            assert_eq!(
+                reopened.get_recursive_proof_job(1).unwrap().unwrap().state,
+                if committed {
+                    RecursiveProofJobState::Complete
+                } else {
+                    // Startup recovery turns the exact old Running epoch back
+                    // into its resumable Pending representation.
+                    RecursiveProofJobState::Pending
+                }
+            );
+            assert_eq!(
+                reopened
+                    .get_recursive_proof_job_result(1)
+                    .unwrap()
+                    .map(|result| result.bytes),
+                committed.then_some(terminal.clone())
+            );
+            assert_eq!(
+                reopened.get_selected_history_coverage().unwrap(),
+                committed.then_some(SelectedHistoryCoverage {
+                    height: 1,
+                    block_hash: hash,
+                })
+            );
+        }
+
+        for (fault, committed) in [
+            (
+                AuthoritativeMutationFault::SelectedImportBeforeCommit,
+                false,
+            ),
+            (AuthoritativeMutationFault::SelectedImportAfterCommit, true),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = MdbxStore::open(directory.path()).unwrap();
+            let chain = put_selected_history_header_chain(&store, 2);
+            let hash = chain[2].1;
+            store
+                .enqueue_recursive_proof_job(2, hash, RecursiveProofJobTier::B8)
+                .unwrap();
+            let terminal = selected_terminal_bytes(2, hash);
+            let guard = arm_authoritative_mutation_fault(fault);
+            assert_injected_crash(
+                store.import_verified_selected_history_terminal(
+                    VerifiedSelectedHistoryTerminalImport {
+                        height: 2,
+                        block_hash: hash,
+                        epoch_anchor_height: 0,
+                        epoch_anchor_hash: chain[0].1,
+                        tier: RecursiveProofJobTier::B8,
+                        terminal_package_bytes: &terminal,
+                    },
+                ),
+                fault,
+            );
+            drop(guard);
+            drop(store);
+
+            let reopened = MdbxStore::open(directory.path()).unwrap();
+            assert_eq!(
+                reopened.get_recursive_proof_job(2).unwrap().unwrap().state,
+                if committed {
+                    RecursiveProofJobState::Complete
+                } else {
+                    RecursiveProofJobState::Pending
+                }
+            );
+            assert_eq!(
+                reopened
+                    .get_recursive_proof_job_result(2)
+                    .unwrap()
+                    .map(|result| result.bytes),
+                committed.then_some(terminal.clone())
+            );
+            assert_eq!(
+                reopened.get_selected_history_coverage().unwrap(),
+                committed.then_some(SelectedHistoryCoverage {
+                    height: 2,
+                    block_hash: hash,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn delete_above_crash_restart_rewinds_jobs_results_coverage_and_watermark_together() {
+        for (fault, committed) in [
+            (AuthoritativeMutationFault::DeleteAboveBeforeCommit, false),
+            (AuthoritativeMutationFault::DeleteAboveAfterCommit, true),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = MdbxStore::open(directory.path()).unwrap();
+            let chain = put_selected_history_header_chain(&store, 2);
+            for height in 1..=2 {
+                let hash = chain[height as usize].1;
+                store
+                    .enqueue_recursive_proof_job(height, hash, RecursiveProofJobTier::B8)
+                    .unwrap();
+                store.claim_next_recursive_proof_job().unwrap().unwrap();
+                store
+                    .complete_recursive_proof_job_and_promote_selected_history(
+                        height,
+                        hash,
+                        &selected_terminal_bytes(height, hash),
+                    )
+                    .unwrap();
+            }
+            let txn = store.db.begin_rw_txn().unwrap();
+            set_retained_payload_prune_watermark(&txn, 2).unwrap();
+            txn.commit().unwrap();
+
+            let guard = arm_authoritative_mutation_fault(fault);
+            assert_injected_crash(store.delete_recursive_proof_jobs_above(1), fault);
+            drop(guard);
+            drop(store);
+
+            let reopened = MdbxStore::open(directory.path()).unwrap();
+            assert!(reopened.get_recursive_proof_job(1).unwrap().is_some());
+            assert!(reopened
+                .get_recursive_proof_job_result(1)
+                .unwrap()
+                .is_some());
+            assert_eq!(
+                reopened.get_recursive_proof_job(2).unwrap().is_some(),
+                !committed
+            );
+            assert_eq!(
+                reopened
+                    .get_recursive_proof_job_result(2)
+                    .unwrap()
+                    .is_some(),
+                !committed
+            );
+            let expected_height = if committed { 1 } else { 2 };
+            assert_eq!(
+                reopened.get_selected_history_coverage().unwrap(),
+                Some(SelectedHistoryCoverage {
+                    height: expected_height,
+                    block_hash: chain[expected_height as usize].1,
+                })
+            );
+            assert_eq!(
+                retained_payload_prune_watermark(&reopened),
+                Some(expected_height)
+            );
+            assert_eq!(reopened.get_header(2).unwrap(), Some(chain[2].0));
+        }
+    }
+
+    #[test]
+    fn maintenance_crash_restart_is_atomic_for_payloads_and_selected_journal() {
+        for (fault, committed) in [
+            (
+                AuthoritativeMutationFault::RetainedPayloadPruneBeforeCommit,
+                false,
+            ),
+            (
+                AuthoritativeMutationFault::RetainedPayloadPruneAfterCommit,
+                true,
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = MdbxStore::open(directory.path()).unwrap();
+            let (chain, current_height) = install_selected_prune_authority(&store, 2);
+            put_retained_payload_fixture(&store, 1);
+            put_retained_payload_fixture(&store, 2);
+
+            let guard = arm_authoritative_mutation_fault(fault);
+            assert_injected_crash(store.prune_after_commit(current_height), fault);
+            drop(guard);
+            drop(store);
+
+            let reopened = MdbxStore::open(directory.path()).unwrap();
+            for height in 1..=2 {
+                assert_eq!(
+                    reopened.get_recent_block(height).unwrap().is_some(),
+                    !committed
+                );
+                assert_eq!(
+                    reopened.get_block_proof(height).unwrap().is_some(),
+                    !committed
+                );
+                assert_eq!(
+                    reopened.get_block_auth_sidecar(height).unwrap().is_some(),
+                    !committed
+                );
+                assert_eq!(
+                    reopened.get_history_claim(height).unwrap().is_some(),
+                    !committed
+                );
+                assert_eq!(
+                    reopened
+                        .get_accepted_block_certificate(height)
+                        .unwrap()
+                        .is_some(),
+                    !committed
+                );
+            }
+            assert_eq!(
+                retained_payload_prune_watermark(&reopened),
+                committed.then_some(2)
+            );
+            assert_eq!(
+                reopened.get_selected_history_coverage().unwrap(),
+                Some(SelectedHistoryCoverage {
+                    height: 2,
+                    block_hash: chain[2].1,
+                })
+            );
+            assert!(reopened
+                .get_selected_history_terminal_result_at(2, chain[2].1)
+                .unwrap()
+                .is_some());
+        }
+
+        for (fault, committed) in [
+            (
+                AuthoritativeMutationFault::SelectedJournalPruneBeforeCommit,
+                false,
+            ),
+            (
+                AuthoritativeMutationFault::SelectedJournalPruneAfterCommit,
+                true,
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = MdbxStore::open(directory.path()).unwrap();
+            let chain = put_selected_history_header_chain(&store, 2);
+            for height in 1..=2 {
+                let hash = chain[height as usize].1;
+                store
+                    .enqueue_recursive_proof_job(height, hash, RecursiveProofJobTier::B8)
+                    .unwrap();
+                store.claim_next_recursive_proof_job().unwrap().unwrap();
+                store
+                    .complete_recursive_proof_job_and_promote_selected_history(
+                        height,
+                        hash,
+                        &selected_terminal_bytes(height, hash),
+                    )
+                    .unwrap();
+            }
+
+            let guard = arm_authoritative_mutation_fault(fault);
+            assert_injected_crash(store.compact_selected_history_journal_bounded(), fault);
+            drop(guard);
+            drop(store);
+
+            let reopened = MdbxStore::open(directory.path()).unwrap();
+            assert_eq!(
+                reopened.get_recursive_proof_job(1).unwrap().is_some(),
+                !committed
+            );
+            assert_eq!(
+                reopened
+                    .get_recursive_proof_job_result(1)
+                    .unwrap()
+                    .is_some(),
+                !committed
+            );
+            assert!(reopened.get_recursive_proof_job(2).unwrap().is_some());
+            assert!(reopened
+                .get_recursive_proof_job_result(2)
+                .unwrap()
+                .is_some());
+            assert_eq!(
+                reopened.get_selected_history_coverage().unwrap(),
+                Some(SelectedHistoryCoverage {
+                    height: 2,
+                    block_hash: chain[2].1,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn epoch_clear_crash_restart_is_all_tables_or_none() {
+        use noid_poseidon2b::primitives::{Address, TxBodyHash};
+
+        for (fault, committed) in [
+            (AuthoritativeMutationFault::EpochClearBeforeCommit, false),
+            (AuthoritativeMutationFault::EpochClearAfterCommit, true),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = MdbxStore::open(directory.path()).unwrap();
+            let owner = Address([0xC3; 32]);
+            let (header, _) = commit_owner_fixture(&store, owner);
+            let hash = crate::hash_block_header(&header);
+            store
+                .put_accepted_block_certificate(0, b"epoch-certificate")
+                .unwrap();
+            store
+                .enqueue_recursive_proof_job(0, hash, RecursiveProofJobTier::B8)
+                .unwrap();
+            let terminal = selected_terminal_bytes(0, hash);
+            store
+                .import_verified_selected_history_terminal(VerifiedSelectedHistoryTerminalImport {
+                    height: 0,
+                    block_hash: hash,
+                    epoch_anchor_height: 0,
+                    epoch_anchor_hash: hash,
+                    tier: RecursiveProofJobTier::B8,
+                    terminal_package_bytes: &terminal,
+                })
+                .unwrap();
+            let tx_hash = TxBodyHash([0xC3; 32]);
+            let txn = store.db.begin_rw_txn().unwrap();
+            let recent = txn.open_table(Some(T_RECENT_BLOCKS)).unwrap();
+            txn.put(&recent, u64_key(0), b"epoch-body", WriteFlags::empty())
+                .unwrap();
+            let tx_index = txn.open_table(Some(T_TX_INDEX)).unwrap();
+            txn.put(
+                &tx_index,
+                tx_hash.0,
+                encode_tx_index_value(0, 0),
+                WriteFlags::empty(),
+            )
+            .unwrap();
+            set_retained_payload_prune_watermark(&txn, 0).unwrap();
+            txn.commit().unwrap();
+
+            let guard = arm_authoritative_mutation_fault(fault);
+            assert_injected_crash(store.clear_all(), fault);
+            drop(guard);
+            drop(store);
+
+            let reopened = MdbxStore::open(directory.path()).unwrap();
+            assert_eq!(reopened.is_empty().unwrap(), committed);
+            assert_eq!(reopened.get_header(0).unwrap().is_some(), !committed);
+            assert_eq!(
+                reopened.get_header_by_hash(&hash).unwrap().is_some(),
+                !committed
+            );
+            assert_eq!(reopened.get_consensus_meta().unwrap().is_some(), !committed);
+            assert_eq!(reopened.get_state_meta().unwrap().is_some(), !committed);
+            assert_eq!(reopened.get_segment(0).unwrap().is_some(), !committed);
+            let owner_txn = reopened.db.begin_ro_txn().unwrap();
+            let owner_table = owner_txn.open_table(Some(T_OWNER_INDEX)).unwrap();
+            for slot_index in [1, 6] {
+                assert_eq!(
+                    owner_txn
+                        .get::<ObjectLength>(&owner_table, &owner_index_key(&owner.0, slot_index))
+                        .unwrap()
+                        .is_some(),
+                    !committed
+                );
+            }
+            drop(owner_txn);
+            if committed {
+                assert!(reopened.get_verified_utxos_by_owner(&owner.0).is_err());
+            } else {
+                assert!(!reopened
+                    .get_verified_utxos_by_owner(&owner.0)
+                    .unwrap()
+                    .utxos
+                    .is_empty());
+            }
+            assert_eq!(reopened.get_undo_log(0).unwrap().is_some(), !committed);
+            assert_eq!(reopened.get_recent_block(0).unwrap().is_some(), !committed);
+            assert_eq!(
+                reopened.get_tx_index(&tx_hash.0).unwrap().is_some(),
+                !committed
+            );
+            assert_eq!(
+                reopened
+                    .get_accepted_block_certificate(0)
+                    .unwrap()
+                    .is_some(),
+                !committed
+            );
+            assert_eq!(
+                reopened.get_recursive_proof_job(0).unwrap().is_some(),
+                !committed
+            );
+            assert_eq!(
+                reopened
+                    .get_recursive_proof_job_result(0)
+                    .unwrap()
+                    .is_some(),
+                !committed
+            );
+            assert_eq!(
+                reopened.get_selected_history_coverage().unwrap().is_some(),
+                !committed
+            );
+            assert_eq!(
+                retained_payload_prune_watermark(&reopened).is_some(),
+                !committed
+            );
+        }
     }
 }
