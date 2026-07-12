@@ -14,7 +14,7 @@ use std::{path::Path, sync::Arc};
 
 use libmdbx::{
     Database, DatabaseOptions, Mode, NoWriteMap, ObjectLength, Table, TableFlags, Transaction,
-    WriteFlags, RW,
+    WriteFlags, RO, RW,
 };
 use noid_poseidon2b::primitives::TxBodyHash;
 use noid_tx::unpack_amount_creation_id;
@@ -162,6 +162,56 @@ impl From<SnapshotStagingError> for StoreError {
 #[derive(Clone)]
 pub struct MdbxStore {
     db: Arc<Database<NoWriteMap>>,
+}
+
+/// One stable MVCC view used by bounded historical-state reconstruction.
+///
+/// The transaction owns no decoded payload collection. Each requested header,
+/// undo record, or segment is read on demand from the same database version,
+/// while a concurrent writer may advance the live canonical tip.
+pub(super) struct MdbxHistoricalReadSnapshot<'a> {
+    txn: Transaction<'a, RO, NoWriteMap>,
+}
+
+impl MdbxHistoricalReadSnapshot<'_> {
+    pub(super) fn get_chain_tip(&self) -> Result<Option<(u64, [u8; 32])>, StoreError> {
+        let table = self.txn.open_table(Some(T_CHAIN_TIP))?;
+        let raw: Option<[u8; 40]> = self.txn.get(&table, KEY_TIP)?;
+        Ok(raw.as_ref().and_then(|raw| decode_chain_tip(raw)))
+    }
+
+    pub(super) fn get_state_meta(&self) -> Result<Option<(u32, u64, u64)>, StoreError> {
+        let table = self.txn.open_table(Some(T_STATE_META))?;
+        let raw: Option<Vec<u8>> = self.txn.get(&table, KEY_META)?;
+        Ok(raw.and_then(|raw| decode_state_meta(&raw)))
+    }
+
+    pub(super) fn get_header(&self, height: u64) -> Result<Option<BlockHeader>, StoreError> {
+        let table = self.txn.open_table(Some(T_HEADERS))?;
+        let raw: Option<Vec<u8>> = self.txn.get(&table, &u64_key(height))?;
+        Ok(raw.and_then(|raw| decode_header(&raw)))
+    }
+
+    pub(super) fn get_undo_log(
+        &self,
+        height: u64,
+    ) -> Result<Option<BlockUndoLog>, StoreError> {
+        let table = self.txn.open_table(Some(T_UNDO_LOGS))?;
+        let raw: Option<Vec<u8>> = self.txn.get(&table, &u64_key(height))?;
+        Ok(raw.and_then(|raw| decode_undo_log(&raw)))
+    }
+
+    pub(super) fn get_segment(
+        &self,
+        segment_id: u16,
+    ) -> Result<Option<(u8, SegmentColumns)>, StoreError> {
+        let table = self.txn.open_table(Some(T_SEGMENTS))?;
+        let raw: Option<Vec<u8>> = self.txn.get(&table, &segment_id.to_le_bytes())?;
+        raw.map(|raw| {
+            decode_segment(&raw).ok_or(StoreError::Decode("invalid stored historical segment"))
+        })
+        .transpose()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -897,6 +947,14 @@ impl MdbxStore {
     // -----------------------------------------------------------------------
     // Reads
     // -----------------------------------------------------------------------
+
+    pub(super) fn historical_read_snapshot(
+        &self,
+    ) -> Result<MdbxHistoricalReadSnapshot<'_>, StoreError> {
+        Ok(MdbxHistoricalReadSnapshot {
+            txn: self.db.begin_ro_txn()?,
+        })
+    }
 
     pub fn get_chain_tip(&self) -> Result<Option<(u64, [u8; 32])>, StoreError> {
         let txn = self.db.begin_ro_txn()?;

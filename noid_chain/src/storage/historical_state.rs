@@ -6,10 +6,11 @@
 //! The durable segment table always belongs to the current canonical tip.  A
 //! proof worker may nevertheless need the parent state of a retained block.
 //! This module rolls the compact current-tip [`ChainState`] metadata backwards
-//! through the retained undo journal without scanning untouched state
-//! payloads.  Undo pre-images are grouped by segment, and every non-required
-//! segment is decoded, rolled back, exact-summarized, and evicted before the next
-//! payload is read.
+//! through the retained undo journal from one stable MDBX MVCC snapshot,
+//! without blocking a concurrent canonical writer or scanning untouched state
+//! payloads. Undo pre-images are grouped by segment, and every non-required
+//! segment is decoded, rolled back, exact-summarized, and evicted before the
+//! next payload is read.
 //!
 //! This is deliberately an **exact-state-only** carrier. The direct exact
 //! state-root hard cut made FRI roots non-consensus, and rebuilding them here
@@ -34,6 +35,7 @@ use crate::fri_state::{SlotValue, StateError, LOG_SEGMENT_SIZE};
 use crate::segmented_state::{ExactStateReadError, SegmentColumns, StateResizeError};
 use crate::state::ChainState;
 
+use super::mdbx_store::MdbxHistoricalReadSnapshot;
 use super::{MdbxStore, StoreError};
 
 const MAX_GROUPED_UNDO_CHANGES: usize = UNDO_RETENTION_DEPTH as usize * BLOCK_MAX_ACTIONS;
@@ -302,7 +304,8 @@ fn reconstruct_historical_exact_state_inner(
     required_segment_ids: &[u16],
     after_undo_collection: impl FnOnce(&MdbxStore),
 ) -> Result<HistoricalExactStateView, HistoricalStateError> {
-    let (durable_height, durable_hash) = store
+    let snapshot = store.historical_read_snapshot()?;
+    let (durable_height, durable_hash) = snapshot
         .get_chain_tip()?
         .ok_or(HistoricalStateError::MissingChainTip)?;
     if (durable_height, durable_hash) != (source_tip.height, source_tip.hash) {
@@ -321,7 +324,7 @@ fn reconstruct_historical_exact_state_inner(
         });
     }
 
-    let tip_header = canonical_header(store, source_tip.height)?;
+    let tip_header = canonical_header(&snapshot, source_tip.height)?;
     if tip_header.height != source_tip.height || block_id(&tip_header) != source_tip.hash {
         return Err(HistoricalStateError::SourceStateMismatch(
             "tip header identity",
@@ -329,7 +332,7 @@ fn reconstruct_historical_exact_state_inner(
     }
     validate_log_slots(tip_header.log_slots)?;
     validate_header_counters(&tip_header)?;
-    let source_meta = store
+    let source_meta = snapshot
         .get_state_meta()?
         .ok_or(HistoricalStateError::MissingStateMeta)?;
     if source_meta
@@ -362,7 +365,7 @@ fn reconstruct_historical_exact_state_inner(
         ));
     }
 
-    let target_header = canonical_header(store, target_height)?;
+    let target_header = canonical_header(&snapshot, target_height)?;
     if target_header.height != target_height {
         return Err(HistoricalStateError::Corrupt(
             "canonical header height does not match its key",
@@ -381,7 +384,12 @@ fn reconstruct_historical_exact_state_inner(
     }
 
     validate_required_segments(required_segment_ids, target_header.log_slots)?;
-    let grouped = collect_grouped_undo(store, target_height, source_tip, tip_effective_log)?;
+    let grouped = collect_grouped_undo(
+        &snapshot,
+        target_height,
+        source_tip,
+        tip_effective_log,
+    )?;
     after_undo_collection(store);
 
     // Non-required historical payloads are processed first and immediately
@@ -392,7 +400,7 @@ fn reconstruct_historical_exact_state_inner(
             required_segment_ids.binary_search(segment_id).is_ok() == required_phase
         }) {
             reconstruct_touched_segment(
-                store,
+                &snapshot,
                 &mut state,
                 source_tip,
                 segment_id,
@@ -435,7 +443,7 @@ fn reconstruct_historical_exact_state_inner(
             continue;
         }
         hydrate_untouched_required_segment(
-            store,
+            &snapshot,
             &mut state,
             source_tip,
             segment_id,
@@ -447,12 +455,13 @@ fn reconstruct_historical_exact_state_inner(
 
     ensure_resident_allowlist(&state, required_segment_ids)?;
 
-    // Last-source check: every payload read was individually tip-bound, and
-    // these metadata checks reject a header/state swap during the other reads.
-    if store.get_chain_tip()? != Some((source_tip.height, source_tip.hash))
-        || store.get_state_meta()? != Some(source_meta)
-        || canonical_header(store, source_tip.height)? != tip_header
-        || canonical_header(store, target_height)? != target_header
+    // Recheck the stable MVCC view. The live writer may have advanced since
+    // reconstruction began; that does not invalidate this internally
+    // consistent source boundary.
+    if snapshot.get_chain_tip()? != Some((source_tip.height, source_tip.hash))
+        || snapshot.get_state_meta()? != Some(source_meta)
+        || canonical_header(&snapshot, source_tip.height)? != tip_header
+        || canonical_header(&snapshot, target_height)? != target_header
     {
         return Err(HistoricalStateError::SourceChanged);
     }
@@ -466,8 +475,11 @@ fn reconstruct_historical_exact_state_inner(
     })
 }
 
-fn canonical_header(store: &MdbxStore, height: u64) -> Result<BlockHeader, HistoricalStateError> {
-    store
+fn canonical_header(
+    snapshot: &MdbxHistoricalReadSnapshot<'_>,
+    height: u64,
+) -> Result<BlockHeader, HistoricalStateError> {
+    snapshot
         .get_header(height)?
         .ok_or(HistoricalStateError::MissingHeader(height))
 }
@@ -546,7 +558,7 @@ fn slot_is_in_domain(slot_index: u32, log_slots: u32) -> bool {
 }
 
 fn collect_grouped_undo(
-    store: &MdbxStore,
+    snapshot: &MdbxHistoricalReadSnapshot<'_>,
     target_height: u64,
     source_tip: CanonicalTipBinding,
     segment_log: u8,
@@ -558,8 +570,8 @@ fn collect_grouped_undo(
         return Ok(grouped);
     }
     for height in (target_height + 1..=source_tip.height).rev() {
-        let child = canonical_header(store, height)?;
-        let parent = canonical_header(store, height - 1)?;
+        let child = canonical_header(snapshot, height)?;
+        let parent = canonical_header(snapshot, height - 1)?;
         if child.height != height || parent.height != height - 1 {
             return Err(HistoricalStateError::Corrupt(
                 "retained header height does not match its key",
@@ -604,7 +616,7 @@ fn collect_grouped_undo(
             });
         }
 
-        let undo = store
+        let undo = snapshot
             .get_undo_log(height)?
             .ok_or(HistoricalStateError::MissingUndo(height))?;
         if undo.block_height != height
@@ -660,7 +672,7 @@ fn collect_grouped_undo(
 
 #[allow(clippy::too_many_arguments)]
 fn reconstruct_touched_segment(
-    store: &MdbxStore,
+    snapshot: &MdbxHistoricalReadSnapshot<'_>,
     state: &mut ChainState,
     source_tip: CanonicalTipBinding,
     segment_id: u16,
@@ -670,7 +682,7 @@ fn reconstruct_touched_segment(
     retain: bool,
     required_segment_ids: &[u16],
 ) -> Result<(), HistoricalStateError> {
-    let columns = load_source_segment(store, state, source_tip, segment_id, effective_log)?;
+    let columns = load_source_segment(snapshot, state, source_tip, segment_id, effective_log)?;
     state.restore_evicted_segment(segment_id, columns)?;
     state.state.apply_delta_unrooted(changes)?;
     validate_resident_segment(state, segment_id, target_alloc_counter)?;
@@ -686,7 +698,7 @@ fn reconstruct_touched_segment(
 }
 
 fn hydrate_untouched_required_segment(
-    store: &MdbxStore,
+    snapshot: &MdbxHistoricalReadSnapshot<'_>,
     state: &mut ChainState,
     source_tip: CanonicalTipBinding,
     segment_id: u16,
@@ -694,7 +706,7 @@ fn hydrate_untouched_required_segment(
     target_alloc_counter: u64,
     required_segment_ids: &[u16],
 ) -> Result<(), HistoricalStateError> {
-    let columns = load_source_segment(store, state, source_tip, segment_id, effective_log)?;
+    let columns = load_source_segment(snapshot, state, source_tip, segment_id, effective_log)?;
     state.restore_evicted_segment(segment_id, columns)?;
     validate_resident_segment(state, segment_id, target_alloc_counter)?;
     state.state.clear_dirty();
@@ -702,14 +714,17 @@ fn hydrate_untouched_required_segment(
 }
 
 fn load_source_segment(
-    store: &MdbxStore,
+    snapshot: &MdbxHistoricalReadSnapshot<'_>,
     state: &ChainState,
     source_tip: CanonicalTipBinding,
     segment_id: u16,
     effective_log: u8,
 ) -> Result<SegmentColumns, HistoricalStateError> {
     let expected_len = 1usize << effective_log;
-    match store.get_segment_at_tip(source_tip.height, source_tip.hash, segment_id)? {
+    if snapshot.get_chain_tip()? != Some((source_tip.height, source_tip.hash)) {
+        return Err(HistoricalStateError::SourceChanged);
+    }
+    match snapshot.get_segment(segment_id)? {
         Some((stored_log, columns)) => {
             if stored_log != effective_log
                 || columns.values.len() != expected_len
@@ -1302,7 +1317,9 @@ mod tests {
             height: tip.height,
             hash: tip_hash,
         };
-        let grouped = collect_grouped_undo(&store, target.height, source_tip, 3).unwrap();
+        let snapshot = store.historical_read_snapshot().unwrap();
+        let grouped = collect_grouped_undo(&snapshot, target.height, source_tip, 3).unwrap();
+        drop(snapshot);
         assert_eq!(grouped.get(&0).unwrap(), &vec![(1, value1), (1, value0)]);
 
         drop(store);
@@ -1328,10 +1345,10 @@ mod tests {
         assert_eq!(replay_state.cached_state_root(), target.state_root);
         assert_eq!(replay_state.state.slot(1), value0);
 
-        // Advance the durable tip after undo collection and before the first
-        // payload read. Reconstruction must fail closed rather than assemble a
-        // state from two source tips.
-        let race_error = reconstruct_historical_exact_state_inner(
+        // Advance the live durable tip after undo collection and before the
+        // first payload read. The long-lived MVCC snapshot must continue from
+        // its old, internally consistent source without mixing either tip.
+        let snapshot_view = reconstruct_historical_exact_state_inner(
             &context.store,
             &context.state,
             source_tip,
@@ -1366,15 +1383,16 @@ mod tests {
                     .unwrap();
             },
         )
-        .unwrap_err();
-        assert!(matches!(
-            race_error,
-            HistoricalStateError::SourceChanged
-                | HistoricalStateError::InvalidSegment(
-                    _,
-                    "source metadata names a live segment missing from MDBX"
-                )
-        ));
+        .unwrap();
+        assert_eq!(snapshot_view.source_tip(), source_tip);
+        assert_eq!(snapshot_view.target_header(), &target);
+        assert_eq!(snapshot_view.exact_state().state.slot(1), value0);
+        assert_eq!(snapshot_view.exact_state().cached_state_root(), target.state_root);
+        assert_eq!(
+            context.store.get_chain_tip().unwrap().unwrap().0,
+            tip.height + 1,
+            "test writer advanced independently of the stable read snapshot",
+        );
     }
 
     #[test]
