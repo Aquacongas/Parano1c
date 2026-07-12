@@ -360,6 +360,74 @@ fn layer_terms(q: usize, u: &[F128; STATE_SIZE]) -> [F128; STATE_SIZE] {
     }
 }
 
+/// Monomial coefficients of `Σ_j E_j(t)·term_j(S(t))` for one Boolean pair,
+/// accumulated into `acc`. `E_j(t) = e_base_j + t·e_delta_j`,
+/// `S_j(t) = s_base_j + t·s_delta_j`, `term_j` as in [`layer_terms`].
+///
+/// In characteristic 2 squaring is linear, so with `x = a + t·b`
+/// `sbox7(x) = x⁴·x²·x = (a⁴ + t⁴b⁴)(a² + t²b²)(a + t·b)` expands into
+/// eight monomials costing 12 multiplications plus four squarings, and the
+/// affine `E` factor is a 2×8 convolution — 44 multiplications per partial
+/// round pair against 144 for evaluating the degree-8 product at all nine
+/// wire points. The round message previously interpolated from those nine
+/// evaluations is the same polynomial, so by coefficient uniqueness every
+/// wire byte is unchanged. An exhausted ragged instance arrives here as
+/// `e_delta = e_base`, `s_delta = 0` and degenerates to the constant-`S`
+/// alignment gate `E·(1 + t)·term(S)`.
+#[inline]
+fn accumulate_pair_round_coeffs(
+    q: usize,
+    e_base: &[F128; STATE_SIZE],
+    e_delta: &[F128; STATE_SIZE],
+    s_base: &[F128; STATE_SIZE],
+    s_delta: &[F128; STATE_SIZE],
+    acc: &mut [F128; WALK_DEGREE + 1],
+) {
+    let sch = schedule();
+    let full_round = is_full_round(q);
+    for j in 0..STATE_SIZE {
+        let eb = e_base[j];
+        let ed = e_delta[j];
+        if full_round || j == 0 {
+            // T(t) = sbox7((s_base + rc) + t·s_delta), degree 7.
+            let a = s_base[j] + sch.rc[j][q];
+            let b = s_delta[j];
+            let a2 = a * a;
+            let b2 = b * b;
+            let a4 = a2 * a2;
+            let b4 = b2 * b2;
+            let a4a2 = a4 * a2;
+            let a4b2 = a4 * b2;
+            let b4a2 = b4 * a2;
+            let b4b2 = b4 * b2;
+            let t_coeffs = [
+                a4a2 * a,
+                a4a2 * b,
+                a4b2 * a,
+                a4b2 * b,
+                b4a2 * a,
+                b4a2 * b,
+                b4b2 * a,
+                b4b2 * b,
+            ];
+            for (d, &tc) in t_coeffs.iter().enumerate() {
+                if tc == F128::ZERO {
+                    continue;
+                }
+                acc[d] += eb * tc;
+                acc[d + 1] += ed * tc;
+            }
+        } else {
+            // Passthrough lane: T(t) = s_base + t·s_delta, degree 1.
+            let sb = s_base[j];
+            let sd = s_delta[j];
+            acc[0] += eb * sb;
+            acc[1] += eb * sd + ed * sb;
+            acc[2] += ed * sd;
+        }
+    }
+}
+
 /// Per-group lane weights from one squeezed α: group g lane i gets
 /// `α^{4g+i+1}`.
 fn lane_weight_table(alpha: F128, groups: usize) -> Vec<[F128; STATE_SIZE]> {
@@ -496,7 +564,7 @@ pub fn prove_deep_chain_walk<Ch: Challenger>(
         let mut point = Vec::with_capacity(w_log);
         for _round in 0..w_log {
             let half = e_tables[0].len() / 2;
-            let evals = (0..half)
+            let full = (0..half)
                 .into_par_iter()
                 .fold(
                     || [F128::ZERO; WALK_DEGREE + 1],
@@ -511,19 +579,9 @@ pub fn prove_deep_chain_walk<Ch: Challenger>(
                             s_base[j] = s_tables[j][2 * p];
                             s_delta[j] = s_tables[j][2 * p] + s_tables[j][2 * p + 1];
                         }
-                        for (t, slot) in acc.iter_mut().enumerate() {
-                            let t_f = f128_of_u128(t as u128);
-                            let e_t: [F128; STATE_SIZE] =
-                                std::array::from_fn(|j| e_base[j] + t_f * e_delta[j]);
-                            let s_t: [F128; STATE_SIZE] =
-                                std::array::from_fn(|j| s_base[j] + t_f * s_delta[j]);
-                            let terms = layer_terms(q, &s_t);
-                            let mut contrib = F128::ZERO;
-                            for j in 0..STATE_SIZE {
-                                contrib += e_t[j] * terms[j];
-                            }
-                            *slot += contrib;
-                        }
+                        accumulate_pair_round_coeffs(
+                            q, &e_base, &e_delta, &s_base, &s_delta, &mut acc,
+                        );
                         acc
                     },
                 )
@@ -536,7 +594,6 @@ pub fn prove_deep_chain_walk<Ch: Challenger>(
                         a
                     },
                 );
-            let full = interpolate(&evals);
             debug_assert_eq!(full[0] + horner(&full, F128::ONE), claim);
             let wire = compress(&full);
             challenger.observe_f128_slice(&wire);
@@ -700,17 +757,9 @@ pub fn prove_multi_deep_chain_walk<Ch: Challenger>(
                             s_delta[lane] = s_tables[instance][lane][2 * p]
                                 + s_tables[instance][lane][2 * p + 1];
                         }
-                        for (t, slot) in acc.iter_mut().enumerate() {
-                            let t_f = f128_of_u128(t as u128);
-                            let e_t: [F128; STATE_SIZE] =
-                                std::array::from_fn(|lane| e_base[lane] + t_f * e_delta[lane]);
-                            let s_t: [F128; STATE_SIZE] =
-                                std::array::from_fn(|lane| s_base[lane] + t_f * s_delta[lane]);
-                            let terms = layer_terms(q, &s_t);
-                            for lane in 0..STATE_SIZE {
-                                *slot += e_t[lane] * terms[lane];
-                            }
-                        }
+                        accumulate_pair_round_coeffs(
+                            q, &e_base, &e_delta, &s_base, &s_delta, &mut acc,
+                        );
                         acc
                     },
                 )
@@ -723,7 +772,7 @@ pub fn prove_multi_deep_chain_walk<Ch: Challenger>(
                         left
                     },
                 );
-            let full = interpolate(&evals);
+            let full = evals;
             debug_assert_eq!(full[0] + horner(&full, F128::ONE), claim);
             let wire = compress(&full);
             challenger.observe_f128_slice(&wire);
@@ -957,17 +1006,9 @@ pub fn prove_ragged_multi_deep_chain_walk<Ch: Challenger>(
                                 s_base[lane] = s_tables[instance][lane][0];
                             }
                         }
-                        for (t, slot) in acc.iter_mut().enumerate() {
-                            let t_f = f128_of_u128(t as u128);
-                            let e_t: [F128; STATE_SIZE] =
-                                std::array::from_fn(|lane| e_base[lane] + t_f * e_delta[lane]);
-                            let s_t: [F128; STATE_SIZE] =
-                                std::array::from_fn(|lane| s_base[lane] + t_f * s_delta[lane]);
-                            let terms = layer_terms(q, &s_t);
-                            for lane in 0..STATE_SIZE {
-                                *slot += e_t[lane] * terms[lane];
-                            }
-                        }
+                        accumulate_pair_round_coeffs(
+                            q, &e_base, &e_delta, &s_base, &s_delta, &mut acc,
+                        );
                         acc
                     },
                 )
@@ -980,7 +1021,7 @@ pub fn prove_ragged_multi_deep_chain_walk<Ch: Challenger>(
                         left
                     },
                 );
-            let full = interpolate(&evals);
+            let full = evals;
             debug_assert_eq!(
                 full[0] + horner(&full, F128::ONE),
                 claim,
