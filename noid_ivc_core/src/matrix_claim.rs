@@ -46,7 +46,10 @@ use crate::field_r1cs::FieldR1csArtifactError;
 use crate::lincheck::build_eq_table;
 use crate::proof::FieldShape;
 use crate::zerocheck::multilinear::lagrange_weights_naive;
+use noid_poseidon2b::native::poseidon2b_hash_byte_slices;
 use rayon::prelude::*;
+
+const MATRIX_CLAIM_REQUEST_DOMAIN: &[u8] = b"NOID/IVC/MATRIX-CLAIM-REQUEST/V1";
 
 /// A plain accumulated claim `M̂~(point) = value` on the stacked matrix.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -88,6 +91,7 @@ pub struct FreshLincheckClaim {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AuthenticatedMatrixClaimEvaluations {
     structural_digest: [u8; 32],
+    request_binding: [u8; 32],
     fresh_value: Option<F128>,
     accumulated_value: Option<F128>,
 }
@@ -105,17 +109,77 @@ impl AuthenticatedMatrixClaimEvaluations {
         self.accumulated_value
     }
 
-    pub(crate) const fn new(
+    /// Prove that these values were evaluated for these exact claim objects,
+    /// not replayed by an external evaluator implementation from another
+    /// otherwise-valid call.
+    pub fn is_bound_to(
+        &self,
+        fresh: Option<&FreshLincheckClaim>,
+        accumulated: Option<&MatrixAccClaim>,
+    ) -> bool {
+        self.request_binding == matrix_claim_request_binding(fresh, accumulated)
+    }
+
+    pub(crate) fn new(
         structural_digest: [u8; 32],
+        fresh: Option<&FreshLincheckClaim>,
+        accumulated: Option<&MatrixAccClaim>,
         fresh_value: Option<F128>,
         accumulated_value: Option<F128>,
     ) -> Self {
         Self {
             structural_digest,
+            request_binding: matrix_claim_request_binding(fresh, accumulated),
             fresh_value,
             accumulated_value,
         }
     }
+}
+
+fn matrix_claim_request_binding(
+    fresh: Option<&FreshLincheckClaim>,
+    accumulated: Option<&MatrixAccClaim>,
+) -> [u8; 32] {
+    fn push_field(bytes: &mut Vec<u8>, value: F128) {
+        bytes.extend_from_slice(&value.lo.to_le_bytes());
+        bytes.extend_from_slice(&value.hi.to_le_bytes());
+    }
+
+    fn push_fields(bytes: &mut Vec<u8>, values: &[F128]) {
+        bytes.extend_from_slice(&(values.len() as u64).to_le_bytes());
+        for &value in values {
+            push_field(bytes, value);
+        }
+    }
+
+    let fresh_fields = fresh.map_or(0, |claim| {
+        4usize
+            .saturating_add(claim.x_inner_rest.len())
+            .saturating_add(claim.r_inner_rest.len())
+            .saturating_add(claim.z_partial.len())
+    });
+    let accumulated_fields = accumulated.map_or(0, |claim| 1 + claim.point.len());
+    let mut bytes = Vec::with_capacity(
+        2 + 4 * 8
+            + fresh_fields
+                .saturating_add(accumulated_fields)
+                .saturating_mul(16),
+    );
+    bytes.push(u8::from(fresh.is_some()));
+    if let Some(claim) = fresh {
+        push_field(&mut bytes, claim.alpha);
+        push_field(&mut bytes, claim.z_skip);
+        push_fields(&mut bytes, &claim.x_inner_rest);
+        push_fields(&mut bytes, &claim.r_inner_rest);
+        push_fields(&mut bytes, &claim.z_partial);
+        push_field(&mut bytes, claim.value);
+    }
+    bytes.push(u8::from(accumulated.is_some()));
+    if let Some(claim) = accumulated {
+        push_fields(&mut bytes, &claim.point);
+        push_field(&mut bytes, claim.value);
+    }
+    poseidon2b_hash_byte_slices(MATRIX_CLAIM_REQUEST_DOMAIN, &[&bytes])
 }
 
 /// Bounded matrix-evaluation boundary used by the terminal history decider.
@@ -168,6 +232,8 @@ impl MatrixClaimEvaluator for FieldR1cs {
         }
         Ok(AuthenticatedMatrixClaimEvaluations::new(
             self.structural_statement_digest(),
+            fresh,
+            accumulated,
             fresh.map(|claim| fresh_claim_value(self, claim)),
             accumulated.map(|claim| stacked_matrix_mle_eval(self, claim)),
         ))
@@ -838,6 +904,28 @@ mod tests {
                 "factored fresh claim at k_log={k_log}"
             );
         }
+    }
+
+    #[test]
+    fn authenticated_evaluation_cannot_be_replayed_for_another_claim() {
+        let mut rng = Rng(0xB1AD_1A6);
+        let mut r1cs = random_instance(&mut rng, 7, 2);
+        let first = random_true_acc(&mut rng, &r1cs);
+        let evaluated = r1cs
+            .evaluate_matrix_claims(None, Some(&first))
+            .expect("first claim evaluates");
+        assert!(evaluated.is_bound_to(None, Some(&first)));
+
+        let mut second = first.clone();
+        second.point[0] += F128::ONE;
+        second.value = stacked_matrix_mle_eval(&r1cs, &second);
+        assert!(!evaluated.is_bound_to(None, Some(&second)));
+
+        let second_evaluation = r1cs
+            .evaluate_matrix_claims(None, Some(&second))
+            .expect("second claim evaluates");
+        assert!(second_evaluation.is_bound_to(None, Some(&second)));
+        assert!(!second_evaluation.is_bound_to(None, Some(&first)));
     }
 
     /// Honest fold roundtrip: chained accumulators stay TRUE against the

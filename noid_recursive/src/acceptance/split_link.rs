@@ -3005,6 +3005,11 @@ impl PendingSplitTipDecision {
         let evaluated = matrix
             .evaluate_matrix_claims(None, Some(&claim))
             .map_err(|error| format!("{what}: matrix evaluation failed: {error}"))?;
+        if !evaluated.is_bound_to(None, Some(&claim)) {
+            return Err(format!(
+                "{what}: matrix evaluation was replayed for another claim"
+            ));
+        }
         Self::check_lane_with_evaluation(
             lanes,
             slot,
@@ -3247,6 +3252,9 @@ impl DeferredSplitTipDecision {
         let evaluated = tip_class_r1cs
             .evaluate_matrix_claims(Some(&self.fresh), tip_claim)
             .map_err(|_| LinkProofError::MatrixMismatch)?;
+        if !evaluated.is_bound_to(Some(&self.fresh), tip_claim) {
+            return Err(LinkProofError::MatrixMismatch);
+        }
         if evaluated.structural_digest() != self.expected_digest {
             return Err(LinkProofError::MatrixMismatch);
         }
@@ -4249,6 +4257,45 @@ mod tests {
             "link lane 2: slot out of range"
         );
         pending.finish().expect("only live lane was checked");
+    }
+
+    #[test]
+    fn streamed_tip_decision_rejects_safe_rust_evaluation_replay() {
+        struct ReplayingEvaluator {
+            shape: FieldShape,
+            replayed: noid_ivc_core::matrix_claim::AuthenticatedMatrixClaimEvaluations,
+        }
+
+        impl MatrixClaimEvaluator for ReplayingEvaluator {
+            fn field_shape(&self) -> FieldShape {
+                self.shape
+            }
+
+            fn evaluate_matrix_claims(
+                &mut self,
+                _fresh: Option<&FreshLincheckClaim>,
+                _accumulated: Option<&MatrixAccClaim>,
+            ) -> Result<
+                noid_ivc_core::matrix_claim::AuthenticatedMatrixClaimEvaluations,
+                noid_ivc_core::field_r1cs::FieldR1csArtifactError,
+            > {
+                Ok(self.replayed)
+            }
+        }
+
+        let mut matrix = decider_test_matrix(0);
+        let shape = FieldShape::of(&matrix);
+        let mut unrelated = MatrixAccClaim::zero(matrix.k_log);
+        unrelated.point[0] = F128::ONE;
+        let replayed = matrix
+            .evaluate_matrix_claims(None, Some(&unrelated))
+            .expect("canonical matrix evaluates unrelated claim");
+        let mut adapter = ReplayingEvaluator { shape, replayed };
+        let mut pending = pending_test_decision(&[Some(&matrix)], &[]);
+        assert_eq!(
+            pending.check_link_matrix(0, &mut adapter).unwrap_err(),
+            "link lane 0: matrix evaluation was replayed for another claim"
+        );
     }
 
     #[test]
