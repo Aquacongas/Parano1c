@@ -10,7 +10,7 @@
 //! The core operation is `commit_block`, which writes all block-related data in
 //! one atomic MDBX transaction.
 
-use std::{path::Path, sync::Arc};
+use std::{borrow::Cow, path::Path, sync::Arc};
 
 use libmdbx::{
     Database, DatabaseOptions, Mode, NoWriteMap, ObjectLength, Table, TableFlags, Transaction,
@@ -282,6 +282,10 @@ const SELECTED_HISTORY_COVERAGE_ENCODED_BYTES: usize = 44;
 // The opaque recursive envelope follows this fixed metadata.
 const SELECTED_HISTORY_TERMINAL_PREFIX_BYTES: usize = 2 + 8 + 32 + 1 + 2;
 const SELECTED_HISTORY_TERMINAL_VERSION: u16 = 1;
+/// Bound both page retirement and cursor work in one selected-history journal
+/// maintenance transaction. One result may occupy the full history-proof wire
+/// cap, so this count is deliberately small and maintenance is incremental.
+const SELECTED_HISTORY_JOURNAL_COMPACTION_ENTRY_LIMIT: usize = 16;
 
 /// Hard storage cap for one opaque selected recursive proof result.
 ///
@@ -390,6 +394,24 @@ pub struct SelectedHistoryCoverage {
 pub struct SelectedHistorySnapshotSeed<'a> {
     pub height: u64,
     pub block_hash: [u8; 32],
+    pub tier: RecursiveProofJobTier,
+    pub terminal_package_bytes: &'a [u8],
+}
+
+/// One selected-history terminal that was cryptographically verified by the
+/// ordinary-node recursive verifier before entering chain storage.
+///
+/// This type is an import contract, not recursive authority: `MdbxStore`
+/// deliberately has no dependency on `noid_recursive`.  The atomic import
+/// rechecks every storage-level binding (wire cap and prefix, canonical target,
+/// terminal tier, and the exact transaction-epoch anchor identity) before it
+/// changes durable coverage.
+#[derive(Debug, Clone, Copy)]
+pub struct VerifiedSelectedHistoryTerminalImport<'a> {
+    pub height: u64,
+    pub block_hash: [u8; 32],
+    pub epoch_anchor_height: u64,
+    pub epoch_anchor_hash: [u8; 32],
     pub tier: RecursiveProofJobTier,
     pub terminal_package_bytes: &'a [u8],
 }
@@ -604,6 +626,20 @@ fn decode_recursive_proof_result(
     height: u64,
     mut encoded: Vec<u8>,
 ) -> Option<RecursiveProofJobResult> {
+    let (block_hash, payload) = decode_recursive_proof_result_ref(&encoded)?;
+    let declared = payload.len();
+    encoded.copy_within(RECURSIVE_PROOF_RESULT_HEADER_BYTES.., 0);
+    encoded.truncate(declared);
+    Some(RecursiveProofJobResult {
+        height,
+        block_hash,
+        bytes: encoded,
+    })
+}
+
+/// Borrow a proof result directly from an MDBX page.  Coverage validation uses
+/// this view so a monotonic import never allocates the previous terminal proof.
+fn decode_recursive_proof_result_ref(encoded: &[u8]) -> Option<([u8; 32], &[u8])> {
     if encoded.len() < RECURSIVE_PROOF_RESULT_HEADER_BYTES
         || encoded.len()
             > RECURSIVE_PROOF_RESULT_HEADER_BYTES
@@ -619,13 +655,7 @@ fn decode_recursive_proof_result(
     {
         return None;
     }
-    encoded.copy_within(RECURSIVE_PROOF_RESULT_HEADER_BYTES.., 0);
-    encoded.truncate(declared);
-    Some(RecursiveProofJobResult {
-        height,
-        block_hash,
-        bytes: encoded,
-    })
+    Some((block_hash, &encoded[RECURSIVE_PROOF_RESULT_HEADER_BYTES..]))
 }
 
 fn encode_selected_history_coverage(
@@ -693,6 +723,108 @@ fn selected_history_terminal_metadata(
         _ => return None,
     };
     Some((height, block_hash, job_tier))
+}
+
+/// Validate the current compact coverage authority without copying its proof
+/// out of the MDBX page.  An import must not silently paper over a torn,
+/// forked, or malformed older pointer.
+fn validate_selected_history_coverage_in_rw_txn(
+    txn: &Transaction<'_, RW, NoWriteMap>,
+    coverage: SelectedHistoryCoverage,
+) -> Result<(), StoreError> {
+    let headers = txn.open_table(Some(T_HEADERS))?;
+    let header_raw: Option<Vec<u8>> = txn.get(&headers, &u64_key(coverage.height))?;
+    let header = header_raw
+        .as_deref()
+        .and_then(decode_header)
+        .ok_or(StoreError::Decode(
+            "selected history coverage canonical header is missing",
+        ))?;
+    if header.height != coverage.height
+        || crate::block_header::block_id(&header) != coverage.block_hash
+    {
+        return Err(StoreError::Decode(
+            "selected history coverage is no longer canonical",
+        ));
+    }
+
+    let key = recursive_proof_height_key(coverage.height);
+    let jobs = txn.open_table(Some(T_RECURSIVE_PROOF_JOBS))?;
+    let job_raw: Option<[u8; RECURSIVE_PROOF_JOB_ENCODED_BYTES]> = txn.get(&jobs, &key)?;
+    let job = job_raw
+        .as_ref()
+        .and_then(|raw| decode_recursive_proof_job(coverage.height, raw))
+        .ok_or(StoreError::Decode(
+            "selected history coverage job is missing or malformed",
+        ))?;
+    if job.state != RecursiveProofJobState::Complete || job.block_hash != coverage.block_hash {
+        return Err(StoreError::Decode(
+            "selected history coverage job is not complete and canonical",
+        ));
+    }
+
+    let results = txn.open_table(Some(T_RECURSIVE_PROOF_RESULTS))?;
+    let result_length: Option<ObjectLength> = txn.get(&results, &key)?;
+    let maximum = RECURSIVE_PROOF_RESULT_HEADER_BYTES
+        + crate::consensus::wire_limits::MAX_HISTORY_PROOF_BYTES;
+    let Some(ObjectLength(length)) = result_length else {
+        return Err(StoreError::Decode(
+            "selected history coverage result is missing",
+        ));
+    };
+    if !(RECURSIVE_PROOF_RESULT_HEADER_BYTES..=maximum).contains(&length) {
+        return Err(StoreError::Decode(
+            "selected history coverage result exceeds hard bounds",
+        ));
+    }
+    let encoded: Cow<'_, [u8]> = txn.get(&results, &key)?.ok_or(StoreError::Decode(
+        "selected history coverage result disappeared",
+    ))?;
+    if encoded.len() != length {
+        return Err(StoreError::Decode(
+            "selected history coverage result length changed during validation",
+        ));
+    }
+    let (result_hash, terminal) = decode_recursive_proof_result_ref(encoded.as_ref()).ok_or(
+        StoreError::Decode("selected history coverage result wrapper is malformed"),
+    )?;
+    if result_hash != coverage.block_hash
+        || !selected_history_terminal_matches_job(
+            terminal,
+            coverage.height,
+            coverage.block_hash,
+            job.tier,
+        )
+    {
+        return Err(StoreError::Decode(
+            "selected history coverage terminal binding is malformed",
+        ));
+    }
+    Ok(())
+}
+
+/// Read and validate the one selected-history serving authority from the same
+/// transaction that will use it. Covered journal records may remain while
+/// bounded maintenance catches up, so callers must use this pointer rather
+/// than infer coverage from the oldest retained job.
+fn validated_selected_history_coverage_in_rw_txn(
+    txn: &Transaction<'_, RW, NoWriteMap>,
+) -> Result<Option<SelectedHistoryCoverage>, StoreError> {
+    let coverage_table = txn.open_table(Some(T_CHECKPOINT_COVERAGE))?;
+    let raw: Option<[u8; SELECTED_HISTORY_COVERAGE_ENCODED_BYTES]> =
+        txn.get(&coverage_table, KEY_SELECTED_HISTORY_COVERAGE)?;
+    let coverage = raw
+        .as_ref()
+        .map(|raw| {
+            decode_selected_history_coverage(raw).ok_or(StoreError::Decode(
+                "invalid selected history coverage pointer",
+            ))
+        })
+        .transpose()?;
+    if let Some(coverage) = coverage {
+        validate_selected_history_coverage_in_rw_txn(txn, coverage)?;
+    }
+    Ok(coverage)
 }
 
 /// Rewind only the compact serving pointer inside an existing canonical reorg
@@ -1092,19 +1224,29 @@ impl MdbxStore {
         Ok(job)
     }
 
-    /// Claim the numerically-lowest canonical pending job.
+    /// Claim the numerically-lowest canonical pending job strictly above valid
+    /// selected-history coverage.
     ///
     /// Big-endian height keys make the cursor order numeric even across byte
     /// boundaries such as 255 -> 256. Only the selected fixed-width record is
     /// retained; no queue or result payload collection is allocated.
     pub fn claim_next_recursive_proof_job(&self) -> Result<Option<RecursiveProofJob>, StoreError> {
         let txn = self.db.begin_rw_txn()?;
+        let coverage = validated_selected_history_coverage_in_rw_txn(&txn)?;
         let jobs = txn.open_table(Some(T_RECURSIVE_PROOF_JOBS))?;
         let headers = txn.open_table(Some(T_HEADERS))?;
         let selected = {
             let mut cursor = txn.cursor(&jobs)?;
             let mut item: Option<([u8; 8], [u8; RECURSIVE_PROOF_JOB_ENCODED_BYTES])> =
-                cursor.first()?;
+                match coverage {
+                    Some(coverage) => match coverage.height.checked_add(1) {
+                        Some(first_uncovered) => {
+                            cursor.set_range(&recursive_proof_height_key(first_uncovered))?
+                        }
+                        None => None,
+                    },
+                    None => cursor.first()?,
+                };
             let mut selected = None;
             while let Some((key, raw)) = item {
                 let height = recursive_proof_height_from_key(&key)
@@ -1560,6 +1702,305 @@ impl MdbxStore {
         }
         txn.commit()?;
         Ok(job)
+    }
+
+    /// Atomically import a terminal already accepted by the recursive verifier
+    /// on an ordinary relay.
+    ///
+    /// Unlike the local prover completion path, this operation intentionally
+    /// permits a strict forward coverage jump: the recursive terminal already
+    /// proves the complete prefix through `height`.  It still requires the
+    /// canonical accepted-block journal entry at the target, rejects a Running
+    /// target job, and never accepts an equal or lower coverage height. The
+    /// exact target result and fixed-width serving pointer commit atomically;
+    /// covered predecessor cleanup is separate, bounded maintenance.
+    pub fn import_verified_selected_history_terminal(
+        &self,
+        imported: VerifiedSelectedHistoryTerminalImport<'_>,
+    ) -> Result<SelectedHistoryCoverage, StoreError> {
+        let VerifiedSelectedHistoryTerminalImport {
+            height,
+            block_hash,
+            epoch_anchor_height,
+            epoch_anchor_hash,
+            tier,
+            terminal_package_bytes,
+        } = imported;
+
+        if terminal_package_bytes.len() > crate::consensus::wire_limits::MAX_HISTORY_PROOF_BYTES {
+            return Err(StoreError::Decode(
+                "verified selected history terminal exceeds wire cap",
+            ));
+        }
+        if !selected_history_terminal_matches_job(terminal_package_bytes, height, block_hash, tier)
+        {
+            return Err(StoreError::Decode(
+                "verified selected history terminal prefix or tier is invalid",
+            ));
+        }
+        let encoded_result = encode_recursive_proof_result(block_hash, terminal_package_bytes)?;
+
+        let txn = self.db.begin_rw_txn()?;
+        // A remote coverage jump makes predecessor jobs/results redundant and
+        // bounded maintenance may remove them later. It is therefore admitted
+        // only inside the durable hard-finalized prefix: a shallow reorg still
+        // retains the exact finalized terminal needed to resume recursion.
+        let consensus_table = txn.open_table(Some(T_CONSENSUS_META))?;
+        let consensus_raw: Option<Vec<u8>> = txn.get(&consensus_table, KEY_CONSENSUS_META)?;
+        let consensus = consensus_raw
+            .as_deref()
+            .and_then(decode_consensus_meta)
+            .ok_or(StoreError::Decode(
+                "verified selected history import requires valid consensus metadata",
+            ))?;
+        if consensus.finalized.height > consensus.tip_height || height > consensus.finalized.height
+        {
+            return Err(StoreError::Decode(
+                "verified selected history import target is not hard-finalized",
+            ));
+        }
+
+        let headers = txn.open_table(Some(T_HEADERS))?;
+        let finalized_raw: Option<Vec<u8>> =
+            txn.get(&headers, &u64_key(consensus.finalized.height))?;
+        let finalized_header =
+            finalized_raw
+                .as_deref()
+                .and_then(decode_header)
+                .ok_or(StoreError::Decode(
+                    "verified selected history finalized header is missing",
+                ))?;
+        if finalized_header.height != consensus.finalized.height
+            || crate::block_header::block_id(&finalized_header) != consensus.finalized.hash
+        {
+            return Err(StoreError::Decode(
+                "verified selected history finalized checkpoint is not canonical",
+            ));
+        }
+        let target_raw: Option<Vec<u8>> = txn.get(&headers, &u64_key(height))?;
+        let target_header =
+            target_raw
+                .as_deref()
+                .and_then(decode_header)
+                .ok_or(StoreError::Decode(
+                    "verified selected history target header is missing",
+                ))?;
+        if target_header.height != height
+            || crate::block_header::block_id(&target_header) != block_hash
+        {
+            return Err(StoreError::Decode(
+                "verified selected history target is not canonical",
+            ));
+        }
+
+        let expected_epoch_anchor_height = (height / crate::consensus::params::TX_EPOCH_BLOCKS)
+            * crate::consensus::params::TX_EPOCH_BLOCKS;
+        if epoch_anchor_height != expected_epoch_anchor_height {
+            return Err(StoreError::Decode(
+                "verified selected history epoch anchor height is invalid",
+            ));
+        }
+        let epoch_raw: Option<Vec<u8>> =
+            txn.get(&headers, &u64_key(expected_epoch_anchor_height))?;
+        let epoch_header =
+            epoch_raw
+                .as_deref()
+                .and_then(decode_header)
+                .ok_or(StoreError::Decode(
+                    "verified selected history epoch anchor is missing",
+                ))?;
+        if epoch_header.height != expected_epoch_anchor_height
+            || crate::block_header::block_id(&epoch_header) != epoch_anchor_hash
+        {
+            return Err(StoreError::Decode(
+                "verified selected history epoch anchor is not canonical",
+            ));
+        }
+
+        let coverage_table = txn.open_table(Some(T_CHECKPOINT_COVERAGE))?;
+        let coverage_raw: Option<[u8; SELECTED_HISTORY_COVERAGE_ENCODED_BYTES]> =
+            txn.get(&coverage_table, KEY_SELECTED_HISTORY_COVERAGE)?;
+        let previous_coverage = coverage_raw
+            .as_ref()
+            .map(|raw| {
+                decode_selected_history_coverage(raw).ok_or(StoreError::Decode(
+                    "invalid selected history coverage pointer before verified import",
+                ))
+            })
+            .transpose()?;
+        if let Some(previous) = previous_coverage {
+            validate_selected_history_coverage_in_rw_txn(&txn, previous)?;
+            if height <= previous.height {
+                return Err(StoreError::Decode(
+                    "verified selected history import does not advance coverage",
+                ));
+            }
+        }
+
+        let key = recursive_proof_height_key(height);
+        let jobs = txn.open_table(Some(T_RECURSIVE_PROOF_JOBS))?;
+        let target_job_raw: Option<[u8; RECURSIVE_PROOF_JOB_ENCODED_BYTES]> =
+            txn.get(&jobs, &key)?;
+        let mut target_job = target_job_raw
+            .as_ref()
+            .and_then(|raw| decode_recursive_proof_job(height, raw))
+            .ok_or(StoreError::Decode(
+                "verified selected history target job is missing or malformed",
+            ))?;
+        if target_job.block_hash != block_hash || target_job.tier != tier {
+            return Err(StoreError::Decode(
+                "verified selected history target job identity or tier differs",
+            ));
+        }
+        if !matches!(
+            target_job.state,
+            RecursiveProofJobState::Pending | RecursiveProofJobState::Complete
+        ) {
+            return Err(StoreError::Decode(
+                "verified selected history target job is running",
+            ));
+        }
+        let results = txn.open_table(Some(T_RECURSIVE_PROOF_RESULTS))?;
+        txn.put(&results, key, encoded_result, WriteFlags::empty())?;
+        target_job.state = RecursiveProofJobState::Complete;
+        txn.put(
+            &jobs,
+            key,
+            encode_recursive_proof_job(&target_job),
+            WriteFlags::empty(),
+        )?;
+        let coverage = SelectedHistoryCoverage { height, block_hash };
+        txn.put(
+            &coverage_table,
+            KEY_SELECTED_HISTORY_COVERAGE,
+            encode_selected_history_coverage(coverage),
+            WriteFlags::empty(),
+        )?;
+        txn.commit()?;
+        // Coverage is already durable. Cleanup is retryable maintenance and a
+        // failure must not masquerade as a rejected verified import.
+        let _ = self.compact_selected_history_journal_bounded();
+        Ok(coverage)
+    }
+
+    /// Delete a small bounded batch of redundant selected-history journal
+    /// records in one short MDBX transaction.
+    ///
+    /// The strict cutoff is `min(verified coverage, durable finality)`. Keeping
+    /// the record exactly at that cutoff preserves the finalized terminal used
+    /// for snapshot serving and gives a shallow-reorg prover a restart anchor.
+    /// Cursor visits and successful deletes share one fixed budget, while any
+    /// in-process `Running` job is skipped rather than invalidated.
+    pub fn compact_selected_history_journal_bounded(&self) -> Result<usize, StoreError> {
+        let txn = self.db.begin_rw_txn()?;
+        let Some(coverage) = validated_selected_history_coverage_in_rw_txn(&txn)? else {
+            txn.commit()?;
+            return Ok(0);
+        };
+
+        let consensus_table = txn.open_table(Some(T_CONSENSUS_META))?;
+        let consensus_raw: Option<Vec<u8>> = txn.get(&consensus_table, KEY_CONSENSUS_META)?;
+        let consensus = consensus_raw
+            .as_deref()
+            .and_then(decode_consensus_meta)
+            .ok_or(StoreError::Decode(
+                "selected history compaction requires valid consensus metadata",
+            ))?;
+        if consensus.finalized.height > consensus.tip_height {
+            return Err(StoreError::Decode(
+                "selected history compaction finality exceeds the durable tip",
+            ));
+        }
+        let headers = txn.open_table(Some(T_HEADERS))?;
+        let finalized_raw: Option<Vec<u8>> =
+            txn.get(&headers, &u64_key(consensus.finalized.height))?;
+        let finalized_header =
+            finalized_raw
+                .as_deref()
+                .and_then(decode_header)
+                .ok_or(StoreError::Decode(
+                    "selected history compaction finalized header is missing",
+                ))?;
+        if finalized_header.height != consensus.finalized.height
+            || crate::block_header::block_id(&finalized_header) != consensus.finalized.hash
+        {
+            return Err(StoreError::Decode(
+                "selected history compaction finalized checkpoint is not canonical",
+            ));
+        }
+
+        let cutoff = coverage.height.min(consensus.finalized.height);
+        if cutoff == 0 {
+            txn.commit()?;
+            return Ok(0);
+        }
+
+        let mut visited = 0usize;
+        let mut deleted = 0usize;
+        let jobs = txn.open_table(Some(T_RECURSIVE_PROOF_JOBS))?;
+        let job_keys = {
+            let mut cursor = txn.cursor(&jobs)?;
+            let mut item: Option<([u8; 8], [u8; RECURSIVE_PROOF_JOB_ENCODED_BYTES])> =
+                cursor.first()?;
+            let mut keys = Vec::with_capacity(SELECTED_HISTORY_JOURNAL_COMPACTION_ENTRY_LIMIT);
+            while visited < SELECTED_HISTORY_JOURNAL_COMPACTION_ENTRY_LIMIT {
+                let Some((key, raw)) = item else {
+                    break;
+                };
+                let height = recursive_proof_height_from_key(&key).ok_or(StoreError::Decode(
+                    "invalid recursive proof job key during bounded compaction",
+                ))?;
+                if height >= cutoff {
+                    break;
+                }
+                let job = decode_recursive_proof_job(height, &raw).ok_or(StoreError::Decode(
+                    "invalid recursive proof job during bounded compaction",
+                ))?;
+                visited += 1;
+                if job.state != RecursiveProofJobState::Running {
+                    keys.push(key);
+                }
+                item = cursor.next()?;
+            }
+            keys
+        };
+        for key in job_keys {
+            txn.del(&jobs, &key, None)?;
+            deleted += 1;
+        }
+
+        if visited < SELECTED_HISTORY_JOURNAL_COMPACTION_ENTRY_LIMIT {
+            let results = txn.open_table(Some(T_RECURSIVE_PROOF_RESULTS))?;
+            let result_keys = {
+                let mut cursor = txn.cursor(&results)?;
+                let mut item: Option<([u8; 8], ())> = cursor.first()?;
+                let mut keys =
+                    Vec::with_capacity(SELECTED_HISTORY_JOURNAL_COMPACTION_ENTRY_LIMIT - visited);
+                while visited < SELECTED_HISTORY_JOURNAL_COMPACTION_ENTRY_LIMIT {
+                    let Some((key, ())) = item else {
+                        break;
+                    };
+                    let height =
+                        recursive_proof_height_from_key(&key).ok_or(StoreError::Decode(
+                            "invalid recursive proof result key during bounded compaction",
+                        ))?;
+                    if height >= cutoff {
+                        break;
+                    }
+                    visited += 1;
+                    keys.push(key);
+                    item = cursor.next()?;
+                }
+                keys
+            };
+            for key in result_keys {
+                txn.del(&results, &key, None)?;
+                deleted += 1;
+            }
+        }
+
+        txn.commit()?;
+        Ok(deleted)
     }
 
     /// Cancellation/backpressure handoff: release one canonical running job
@@ -4225,20 +4666,14 @@ impl MdbxStore {
                 .transpose()?
             };
             if let Some(coverage) = selected_history_coverage {
-                let headers_tbl = txn.open_table(Some(T_HEADERS))?;
-                let coverage_hash = txn
-                    .get::<Vec<u8>>(&headers_tbl, &u64_key(coverage.height))?
-                    .as_deref()
-                    .and_then(canonical_hash_from_encoded_header);
-                if coverage_hash != Some(coverage.block_hash) {
-                    return Err(StoreError::Decode(
-                        "selected history coverage is not canonical during pruning",
-                    ));
-                }
+                // A selected terminal recursively covers the entire prefix.
+                // Validate that one durable authority once, directly from its
+                // MDBX page, rather than loading one proof for every old height
+                // and every payload table. Remote coverage jumps intentionally
+                // compact those redundant intermediate job/result records.
+                validate_selected_history_coverage_in_rw_txn(&txn, coverage)?;
                 let cutoff = retention_cutoff.min(coverage.height);
                 let cert_tbl = txn.open_table(Some(T_ACCEPTED_BLOCK_CERTIFICATES))?;
-                let jobs_tbl = txn.open_table(Some(T_RECURSIVE_PROOF_JOBS))?;
-                let results_tbl = txn.open_table(Some(T_RECURSIVE_PROOF_RESULTS))?;
                 for table_name in [
                     T_RECENT_BLOCKS,
                     T_BLOCK_PROOFS,
@@ -4294,50 +4729,11 @@ impl MdbxStore {
                         for h in candidates {
                             let certificate: Option<ObjectLength> =
                                 txn.get(&cert_tbl, &u64_key(h))?;
-                            let job_key = recursive_proof_height_key(h);
-                            let completed_job: Option<RecursiveProofJob> = txn
-                                .get::<[u8; RECURSIVE_PROOF_JOB_ENCODED_BYTES]>(
-                                    &jobs_tbl, &job_key,
-                                )?
-                                .and_then(|raw| decode_recursive_proof_job(h, &raw))
-                                .filter(|job| job.state == RecursiveProofJobState::Complete);
-                            let selected_result_is_canonical = if let Some(job) = completed_job {
-                                let canonical_hash = txn
-                                    .get::<Vec<u8>>(&headers_tbl, &u64_key(h))?
-                                    .as_deref()
-                                    .and_then(canonical_hash_from_encoded_header);
-                                let result_length = txn
-                                    .get::<ObjectLength>(&results_tbl, &job_key)?
-                                    .map(|ObjectLength(length)| length);
-                                if canonical_hash == Some(job.block_hash)
-                                    && result_length.is_some_and(|length| {
-                                        (RECURSIVE_PROOF_RESULT_HEADER_BYTES
-                                            ..=RECURSIVE_PROOF_RESULT_HEADER_BYTES
-                                                + crate::consensus::wire_limits::MAX_HISTORY_PROOF_BYTES)
-                                            .contains(&length)
-                                    })
-                                {
-                                    txn.get::<Vec<u8>>(&results_tbl, &job_key)?
-                                        .and_then(|raw| decode_recursive_proof_result(h, raw))
-                                        .is_some_and(|result| {
-                                            result.block_hash == job.block_hash
-                                                && selected_history_terminal_matches_job(
-                                                    &result.bytes,
-                                                    h,
-                                                    job.block_hash,
-                                                    job.tier,
-                                                )
-                                        })
-                                } else {
-                                    false
-                                }
-                            } else {
-                                false
-                            };
                             // A certificate is not selected recursive authority.
-                            // Retain raw material until its canonical selected
-                            // Link result is durably complete and prefix-bound.
-                            if certificate.is_some() && selected_result_is_canonical {
+                            // The validated target terminal above is the one
+                            // prefix authority; the certificate only proves
+                            // this payload came from local block acceptance.
+                            if certificate.is_some() {
                                 txn.del(&tbl, u64_key(h), None)?;
                             }
                         }
@@ -4352,6 +4748,10 @@ impl MdbxStore {
         }
 
         txn.commit()?;
+        // Journal cleanup is deliberately a separate short transaction. The
+        // accepted block/pruning transaction is already durable and must not
+        // be reported as failed if retryable maintenance cannot run.
+        let _ = self.compact_selected_history_journal_bounded();
         Ok(())
     }
 
@@ -4547,7 +4947,7 @@ mod tests {
             .enqueue_recursive_proof_job(1, parent_hash, RecursiveProofJobTier::B8)
             .unwrap();
         let parent_claim = store.claim_next_recursive_proof_job().unwrap().unwrap();
-        let previous_result_bytes = b"selected-link-height-one".to_vec();
+        let previous_result_bytes = selected_terminal_bytes(1, parent_claim.block_hash);
         store
             .complete_recursive_proof_job(1, parent_claim.block_hash, &previous_result_bytes)
             .unwrap();
@@ -4607,13 +5007,55 @@ mod tests {
     }
 
     fn selected_terminal_bytes(height: u64, block_hash: [u8; 32]) -> Vec<u8> {
+        selected_terminal_bytes_for_tier(height, block_hash, RecursiveProofJobTier::B8)
+    }
+
+    fn selected_terminal_bytes_for_tier(
+        height: u64,
+        block_hash: [u8; 32],
+        tier: RecursiveProofJobTier,
+    ) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(SELECTED_HISTORY_TERMINAL_PREFIX_BYTES);
         bytes.extend_from_slice(&SELECTED_HISTORY_TERMINAL_VERSION.to_le_bytes());
         bytes.extend_from_slice(&height.to_le_bytes());
         bytes.extend_from_slice(&block_hash);
-        bytes.push(0);
-        bytes.extend_from_slice(&8u16.to_le_bytes());
+        bytes.push(tier as u8);
+        bytes.extend_from_slice(&(tier.capacity() as u16).to_le_bytes());
         bytes
+    }
+
+    fn put_selected_history_header_chain(
+        store: &MdbxStore,
+        last_height: u64,
+    ) -> Vec<(BlockHeader, [u8; 32])> {
+        let genesis = crate::consensus::genesis::genesis_header();
+        let genesis_hash = crate::hash_block_header(&genesis);
+        store.put_header_only(&genesis, &genesis_hash).unwrap();
+        let mut chain = vec![(genesis, genesis_hash)];
+        for height in 1..=last_height {
+            let (parent, parent_hash) = *chain.last().unwrap();
+            let mut header = parent;
+            header.height = height;
+            header.prev_block_hash = parent_hash;
+            header.timestamp = parent.timestamp.saturating_add(1);
+            header.nonce = u128::from(height).saturating_add(0x51EC7ED);
+            let hash = crate::hash_block_header(&header);
+            store.put_header_only(&header, &hash).unwrap();
+            chain.push((header, hash));
+        }
+        let (tip, tip_hash) = *chain.last().unwrap();
+        store
+            .put_consensus_meta(&ConsensusMeta {
+                tip_height: tip.height,
+                tip_hash,
+                cumulative_chainwork: [0u8; 32],
+                finalized: crate::storage::meta::FinalizedCheckpoint {
+                    height: tip.height,
+                    hash: tip_hash,
+                },
+            })
+            .unwrap();
+        chain
     }
 
     #[test]
@@ -5313,6 +5755,517 @@ mod tests {
             store.get_recursive_proof_job(2).unwrap().unwrap().state,
             RecursiveProofJobState::Running
         );
+    }
+
+    #[test]
+    fn verified_selected_history_import_jumps_and_compacts_in_constant_space() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let chain = put_selected_history_header_chain(&store, 5);
+        for height in 1..=5 {
+            store
+                .enqueue_recursive_proof_job(
+                    height,
+                    chain[height as usize].1,
+                    RecursiveProofJobTier::B8,
+                )
+                .unwrap();
+        }
+        let txn = store.db.begin_rw_txn().unwrap();
+        let recent = txn.open_table(Some(T_RECENT_BLOCKS)).unwrap();
+        let certificates = txn.open_table(Some(T_ACCEPTED_BLOCK_CERTIFICATES)).unwrap();
+        txn.put(
+            &recent,
+            u64_key(2),
+            b"covered-intermediate-block",
+            WriteFlags::empty(),
+        )
+        .unwrap();
+        txn.put(
+            &certificates,
+            u64_key(2),
+            b"accepted-certificate",
+            WriteFlags::empty(),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+
+        // Establish a valid older pointer. The relay import below skips two
+        // Pending intermediates and does not require exact predecessor proof
+        // coverage.
+        let first_hash = chain[1].1;
+        store.claim_next_recursive_proof_job().unwrap().unwrap();
+        store
+            .complete_recursive_proof_job_and_promote_selected_history(
+                1,
+                first_hash,
+                &selected_terminal_bytes(1, first_hash),
+            )
+            .unwrap();
+
+        let target_hash = chain[4].1;
+        let terminal = selected_terminal_bytes(4, target_hash);
+        let coverage = store
+            .import_verified_selected_history_terminal(VerifiedSelectedHistoryTerminalImport {
+                height: 4,
+                block_hash: target_hash,
+                epoch_anchor_height: 0,
+                epoch_anchor_hash: chain[0].1,
+                tier: RecursiveProofJobTier::B8,
+                terminal_package_bytes: &terminal,
+            })
+            .unwrap();
+        assert_eq!(
+            coverage,
+            SelectedHistoryCoverage {
+                height: 4,
+                block_hash: target_hash,
+            }
+        );
+        assert_eq!(
+            store.get_selected_history_coverage().unwrap(),
+            Some(coverage)
+        );
+        for covered in 1..4 {
+            assert!(store.get_recursive_proof_job(covered).unwrap().is_none());
+            assert!(store
+                .get_recursive_proof_job_result(covered)
+                .unwrap()
+                .is_none());
+        }
+        let target_job = store.get_recursive_proof_job(4).unwrap().unwrap();
+        assert_eq!(target_job.state, RecursiveProofJobState::Complete);
+        assert_eq!(target_job.tier, RecursiveProofJobTier::B8);
+        assert_eq!(
+            store
+                .get_selected_history_terminal_result()
+                .unwrap()
+                .unwrap()
+                .bytes,
+            terminal
+        );
+        assert_eq!(
+            store.get_recursive_proof_job(5).unwrap().unwrap().state,
+            RecursiveProofJobState::Pending,
+            "future work must not be compacted by the imported prefix"
+        );
+        store
+            .prune_after_commit(4 + RECENT_BLOCK_RETENTION_DEPTH)
+            .unwrap();
+        assert!(store.get_recent_block(2).unwrap().is_none());
+
+        // A reorg below the imported target cannot rewind to a compacted proof
+        // that no longer exists. Both target authority and coverage disappear
+        // atomically, forcing a new canonical verification/import.
+        store.delete_recursive_proof_jobs_above(2).unwrap();
+        assert!(store.get_selected_history_coverage().unwrap().is_none());
+        assert!(store.get_recursive_proof_job(4).unwrap().is_none());
+        assert!(store.get_recursive_proof_job_result(4).unwrap().is_none());
+    }
+
+    #[test]
+    fn verified_selected_history_import_rejects_stale_fork_tier_epoch_and_running() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let chain = put_selected_history_header_chain(&store, 5);
+        for height in 1..=5 {
+            store
+                .enqueue_recursive_proof_job(
+                    height,
+                    chain[height as usize].1,
+                    RecursiveProofJobTier::B8,
+                )
+                .unwrap();
+        }
+        let target_hash = chain[4].1;
+        let terminal = selected_terminal_bytes(4, target_hash);
+        let imported = VerifiedSelectedHistoryTerminalImport {
+            height: 4,
+            block_hash: target_hash,
+            epoch_anchor_height: 0,
+            epoch_anchor_hash: chain[0].1,
+            tier: RecursiveProofJobTier::B8,
+            terminal_package_bytes: &terminal,
+        };
+        let expected_coverage = store
+            .import_verified_selected_history_terminal(imported)
+            .unwrap();
+
+        assert!(
+            store
+                .import_verified_selected_history_terminal(imported)
+                .is_err(),
+            "equal-height stale import must fail"
+        );
+
+        let regression_terminal = selected_terminal_bytes(3, chain[3].1);
+        assert!(
+            store
+                .import_verified_selected_history_terminal(VerifiedSelectedHistoryTerminalImport {
+                    height: 3,
+                    block_hash: chain[3].1,
+                    epoch_anchor_height: 0,
+                    epoch_anchor_hash: chain[0].1,
+                    tier: RecursiveProofJobTier::B8,
+                    terminal_package_bytes: &regression_terminal,
+                },)
+                .is_err(),
+            "coverage regression must fail"
+        );
+
+        let fork_hash = [0xF0; 32];
+        let fork_terminal = selected_terminal_bytes(5, fork_hash);
+        assert!(
+            store
+                .import_verified_selected_history_terminal(VerifiedSelectedHistoryTerminalImport {
+                    height: 5,
+                    block_hash: fork_hash,
+                    epoch_anchor_height: 0,
+                    epoch_anchor_hash: chain[0].1,
+                    tier: RecursiveProofJobTier::B8,
+                    terminal_package_bytes: &fork_terminal,
+                },)
+                .is_err(),
+            "fork terminal must fail canonical target binding"
+        );
+
+        let wrong_tier_terminal =
+            selected_terminal_bytes_for_tier(5, chain[5].1, RecursiveProofJobTier::B32);
+        assert!(
+            store
+                .import_verified_selected_history_terminal(VerifiedSelectedHistoryTerminalImport {
+                    height: 5,
+                    block_hash: chain[5].1,
+                    epoch_anchor_height: 0,
+                    epoch_anchor_hash: chain[0].1,
+                    tier: RecursiveProofJobTier::B32,
+                    terminal_package_bytes: &wrong_tier_terminal,
+                },)
+                .is_err(),
+            "terminal tier must equal the accepted-block job tier"
+        );
+
+        let next_terminal = selected_terminal_bytes(5, chain[5].1);
+        for (epoch_anchor_height, epoch_anchor_hash) in [(1, chain[1].1), (0, [0xE0; 32])] {
+            assert!(
+                store
+                    .import_verified_selected_history_terminal(
+                        VerifiedSelectedHistoryTerminalImport {
+                            height: 5,
+                            block_hash: chain[5].1,
+                            epoch_anchor_height,
+                            epoch_anchor_hash,
+                            tier: RecursiveProofJobTier::B8,
+                            terminal_package_bytes: &next_terminal,
+                        },
+                    )
+                    .is_err(),
+                "epoch anchor height and identity are both canonical inputs"
+            );
+        }
+
+        let claimed = store.claim_next_recursive_proof_job().unwrap().unwrap();
+        assert_eq!(claimed.height, 5);
+        assert!(
+            store
+                .import_verified_selected_history_terminal(VerifiedSelectedHistoryTerminalImport {
+                    height: 5,
+                    block_hash: chain[5].1,
+                    epoch_anchor_height: 0,
+                    epoch_anchor_hash: chain[0].1,
+                    tier: RecursiveProofJobTier::B8,
+                    terminal_package_bytes: &next_terminal,
+                },)
+                .is_err(),
+            "a Running target owns the durable job until release"
+        );
+
+        assert_eq!(
+            store.get_selected_history_coverage().unwrap(),
+            Some(expected_coverage),
+            "every rejected import must leave coverage unchanged"
+        );
+        assert_eq!(
+            store.get_recursive_proof_job(5).unwrap().unwrap().state,
+            RecursiveProofJobState::Running
+        );
+    }
+
+    #[test]
+    fn verified_selected_history_import_survives_restart_with_only_target_terminal() {
+        let directory = tempfile::tempdir().unwrap();
+        let target_hash;
+        let terminal;
+        {
+            let store = MdbxStore::open(directory.path()).unwrap();
+            let chain = put_selected_history_header_chain(&store, 3);
+            for height in 1..=3 {
+                store
+                    .enqueue_recursive_proof_job(
+                        height,
+                        chain[height as usize].1,
+                        RecursiveProofJobTier::B8,
+                    )
+                    .unwrap();
+            }
+            target_hash = chain[3].1;
+            terminal = selected_terminal_bytes(3, target_hash);
+            store
+                .import_verified_selected_history_terminal(VerifiedSelectedHistoryTerminalImport {
+                    height: 3,
+                    block_hash: target_hash,
+                    epoch_anchor_height: 0,
+                    epoch_anchor_hash: chain[0].1,
+                    tier: RecursiveProofJobTier::B8,
+                    terminal_package_bytes: &terminal,
+                })
+                .unwrap();
+        }
+
+        let reopened = MdbxStore::open(directory.path()).unwrap();
+        assert_eq!(
+            reopened.get_selected_history_coverage().unwrap(),
+            Some(SelectedHistoryCoverage {
+                height: 3,
+                block_hash: target_hash,
+            })
+        );
+        for covered in 1..3 {
+            assert!(reopened.get_recursive_proof_job(covered).unwrap().is_none());
+            assert!(reopened
+                .get_recursive_proof_job_result(covered)
+                .unwrap()
+                .is_none());
+        }
+        assert_eq!(
+            reopened.get_recursive_proof_job(3).unwrap().unwrap().state,
+            RecursiveProofJobState::Complete
+        );
+        assert_eq!(
+            reopened
+                .get_selected_history_terminal_result()
+                .unwrap()
+                .unwrap()
+                .bytes,
+            terminal
+        );
+    }
+
+    #[test]
+    fn verified_selected_history_import_rejects_unfinalized_target_atomically() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let chain = put_selected_history_header_chain(&store, 5);
+        store
+            .put_consensus_meta(&ConsensusMeta {
+                tip_height: 5,
+                tip_hash: chain[5].1,
+                cumulative_chainwork: [0u8; 32],
+                finalized: crate::storage::meta::FinalizedCheckpoint {
+                    height: 3,
+                    hash: chain[3].1,
+                },
+            })
+            .unwrap();
+        store
+            .enqueue_recursive_proof_job(4, chain[4].1, RecursiveProofJobTier::B8)
+            .unwrap();
+        let terminal = selected_terminal_bytes(4, chain[4].1);
+
+        assert!(store
+            .import_verified_selected_history_terminal(VerifiedSelectedHistoryTerminalImport {
+                height: 4,
+                block_hash: chain[4].1,
+                epoch_anchor_height: 0,
+                epoch_anchor_hash: chain[0].1,
+                tier: RecursiveProofJobTier::B8,
+                terminal_package_bytes: &terminal,
+            })
+            .is_err());
+        assert!(store.get_selected_history_coverage().unwrap().is_none());
+        assert_eq!(
+            store.get_recursive_proof_job(4).unwrap().unwrap().state,
+            RecursiveProofJobState::Pending
+        );
+        assert!(store.get_recursive_proof_job_result(4).unwrap().is_none());
+    }
+
+    #[test]
+    fn verified_import_supersedes_but_never_deletes_running_covered_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let chain = put_selected_history_header_chain(&store, 6);
+        for height in 1..=6 {
+            store
+                .enqueue_recursive_proof_job(
+                    height,
+                    chain[height as usize].1,
+                    RecursiveProofJobTier::B8,
+                )
+                .unwrap();
+        }
+        let running = store.claim_next_recursive_proof_job().unwrap().unwrap();
+        assert_eq!(running.height, 1);
+
+        let terminal = selected_terminal_bytes(5, chain[5].1);
+        store
+            .import_verified_selected_history_terminal(VerifiedSelectedHistoryTerminalImport {
+                height: 5,
+                block_hash: chain[5].1,
+                epoch_anchor_height: 0,
+                epoch_anchor_hash: chain[0].1,
+                tier: RecursiveProofJobTier::B8,
+                terminal_package_bytes: &terminal,
+            })
+            .unwrap();
+        assert_eq!(
+            store.get_recursive_proof_job(1).unwrap().unwrap().state,
+            RecursiveProofJobState::Running,
+            "bounded cleanup must not invalidate memory owned by a prover"
+        );
+        assert!(store
+            .complete_recursive_proof_job_and_promote_selected_history(
+                1,
+                chain[1].1,
+                &selected_terminal_bytes(1, chain[1].1),
+            )
+            .is_err());
+        assert_eq!(
+            store
+                .get_selected_history_coverage()
+                .unwrap()
+                .unwrap()
+                .height,
+            5,
+            "stale covered work cannot regress imported authority"
+        );
+        store.release_recursive_proof_job(1, chain[1].1).unwrap();
+        assert!(store.compact_selected_history_journal_bounded().unwrap() >= 1);
+        assert!(store.get_recursive_proof_job(1).unwrap().is_none());
+        assert_eq!(
+            store
+                .claim_next_recursive_proof_job()
+                .unwrap()
+                .unwrap()
+                .height,
+            6
+        );
+    }
+
+    #[test]
+    fn bounded_selected_history_compaction_never_reclaims_or_claims_coverage() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let chain = put_selected_history_header_chain(&store, 41);
+        for height in 1..=41 {
+            store
+                .enqueue_recursive_proof_job(
+                    height,
+                    chain[height as usize].1,
+                    RecursiveProofJobTier::B8,
+                )
+                .unwrap();
+        }
+        let terminal = selected_terminal_bytes(40, chain[40].1);
+        store
+            .import_verified_selected_history_terminal(VerifiedSelectedHistoryTerminalImport {
+                height: 40,
+                block_hash: chain[40].1,
+                epoch_anchor_height: 0,
+                epoch_anchor_hash: chain[0].1,
+                tier: RecursiveProofJobTier::B8,
+                terminal_package_bytes: &terminal,
+            })
+            .unwrap();
+
+        let retained_covered_jobs = (1..40)
+            .filter(|height| store.get_recursive_proof_job(*height).unwrap().is_some())
+            .count();
+        assert_eq!(
+            retained_covered_jobs,
+            39 - SELECTED_HISTORY_JOURNAL_COMPACTION_ENTRY_LIMIT,
+            "the post-import transaction may retire only one fixed-size batch"
+        );
+        assert_eq!(
+            store.compact_selected_history_journal_bounded().unwrap(),
+            SELECTED_HISTORY_JOURNAL_COMPACTION_ENTRY_LIMIT
+        );
+        assert_eq!(
+            store
+                .claim_next_recursive_proof_job()
+                .unwrap()
+                .unwrap()
+                .height,
+            41,
+            "durable coverage, not delayed physical cleanup, sets the claim floor"
+        );
+        assert_eq!(
+            store
+                .get_selected_history_terminal_result_at(40, chain[40].1)
+                .unwrap()
+                .unwrap()
+                .bytes,
+            terminal,
+            "the strict compaction cutoff must retain its serving terminal"
+        );
+    }
+
+    #[test]
+    fn bounded_selected_history_compaction_keeps_exact_finalized_terminal() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let chain = put_selected_history_header_chain(&store, 3);
+        for height in 1..=3 {
+            store
+                .enqueue_recursive_proof_job(
+                    height,
+                    chain[height as usize].1,
+                    RecursiveProofJobTier::B8,
+                )
+                .unwrap();
+            assert_eq!(
+                store
+                    .claim_next_recursive_proof_job()
+                    .unwrap()
+                    .unwrap()
+                    .height,
+                height
+            );
+            store
+                .complete_recursive_proof_job_and_promote_selected_history(
+                    height,
+                    chain[height as usize].1,
+                    &selected_terminal_bytes(height, chain[height as usize].1),
+                )
+                .unwrap();
+        }
+        store
+            .put_consensus_meta(&ConsensusMeta {
+                tip_height: 3,
+                tip_hash: chain[3].1,
+                cumulative_chainwork: [0u8; 32],
+                finalized: crate::storage::meta::FinalizedCheckpoint {
+                    height: 2,
+                    hash: chain[2].1,
+                },
+            })
+            .unwrap();
+
+        assert_eq!(
+            store.compact_selected_history_journal_bounded().unwrap(),
+            2,
+            "height one contributes one job and one result"
+        );
+        assert!(store.get_recursive_proof_job(1).unwrap().is_none());
+        assert!(store.get_recursive_proof_job_result(1).unwrap().is_none());
+        assert!(store
+            .get_selected_history_terminal_result_at(2, chain[2].1)
+            .unwrap()
+            .is_some());
+        assert!(store
+            .get_selected_history_terminal_result_at(3, chain[3].1)
+            .unwrap()
+            .is_some());
     }
 
     #[test]
