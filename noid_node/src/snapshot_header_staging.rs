@@ -1057,7 +1057,7 @@ mod tests {
                     miner_address: parent.miner_address,
                     // Pre-mined for this exact deterministic fixture. Keeping
                     // it fixed avoids debug-mode PoW work in CI.
-                    nonce: 257_296,
+                    nonce: 241_876,
                     difficulty_target: next_target(
                         anchor_height,
                         anchor.timestamp,

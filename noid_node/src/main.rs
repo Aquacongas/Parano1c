@@ -976,7 +976,12 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("--mining-threads is only valid with --mode miner");
     }
     let selected_history_prover_enabled = matches!(&cli.mode, NodeMode::Miner | NodeMode::Extminer);
-    let remote_selected_history_import_enabled = cli.mode == NodeMode::Relay;
+    // Every role imports remote terminals: when any faster prover has
+    // advanced the ladder, local coverage jumps forward instead of grinding
+    // through heights someone already proved. Provers resume from the jump
+    // (the ladder cursor reseeds inside the tip window), so one fast prover
+    // lifts the whole network's snapshot boundary.
+    let remote_selected_history_import_enabled = true;
 
     // --- Network ---
     let net = NetworkConfig::mainnet();
