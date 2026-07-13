@@ -154,6 +154,11 @@ const REMOTE_SELECTED_HISTORY_REQUEST_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(12);
 const REMOTE_SELECTED_HISTORY_REQUEST_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(2);
+/// A state-manifest round with zero responses is re-requested after this
+/// deadline. A dropped response stream must not wedge sync: with few peers
+/// there may never be another PeerConnected event to retrigger the probe
+/// (live-test finding, 2026-07-12).
+const STATE_MANIFEST_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
 
 /// A fixed-capacity rotation of peers eligible for relay terminal imports.
 /// It is deliberately a compact control-plane collection: proof bytes are
@@ -3198,6 +3203,13 @@ async fn handle_p2p_events(
     // within 10 seconds of the first candidate arriving, proceed anyway —
     // some peers may be offline, behind NAT, or not yet synced.
     let mut manifest_first_candidate_at: Option<std::time::Instant> = None;
+    // Set when a manifest round begins and no response has arrived yet; any
+    // manifest response clears it. The heartbeat re-requests a silent round
+    // after STATE_MANIFEST_RESPONSE_TIMEOUT.
+    let mut manifest_round_started_at: Option<std::time::Instant> = None;
+    // Connected peers eligible for manifest (re-)requests.
+    let mut manifest_peers: std::collections::HashSet<libp2p::PeerId> =
+        std::collections::HashSet::new();
     // Payloads are authenticated one at a time and sealed to disk.  The
     // session retains only compact descriptors and a received bitset.
     let mut snapshot_staging: Option<SnapshotStagingSession> = None;
@@ -3230,6 +3242,7 @@ async fn handle_p2p_events(
             manifest_force_snapshot_peers.clear();
             manifest_response_count = 0;
             manifest_first_candidate_at = None;
+            manifest_round_started_at = None;
             if let Some(stale_staging) = snapshot_staging.take() {
                 cleanup_snapshot_staging_session_offthread(stale_staging);
             }
@@ -4226,6 +4239,7 @@ async fn handle_p2p_events(
             }
             Ok(NetworkEvent::PeerConnected(peer)) => {
                 tracing::info!(peer = %peer, "peer connected");
+                manifest_peers.insert(peer);
                 if remote_selected_history_import_enabled
                     && !relay_terminal_peers.insert(peer)
                 {
@@ -4261,6 +4275,7 @@ async fn handle_p2p_events(
                     if manifest_candidates.len() < 3 && !manifest_requested_peers.contains(&peer) {
                         tracing::info!(peer = %peer, "fresh node — requesting state manifest (Paranoid sync)");
                         manifest_requested_peers.insert(peer);
+                        manifest_round_started_at.get_or_insert_with(Instant::now);
                         p2p_cmd
                             .send(noid_p2p::NetworkCommand::RequestStateManifest {
                                 peer,
@@ -4275,6 +4290,7 @@ async fn handle_p2p_events(
                     // the peer can serve an O(1) snapshot at finalized F. Recent
                     // gaps still use block/header announcements and retained
                     // full-block replay.
+                    manifest_round_started_at.get_or_insert_with(Instant::now);
                     p2p_cmd
                         .send(noid_p2p::NetworkCommand::RequestStateManifest {
                             peer,
@@ -4561,6 +4577,7 @@ async fn handle_p2p_events(
                 // Eclipse mitigation: collect from multiple peers, pick best.
                 // Track all responses (including tip=0) to detect when all
                 // requested peers have replied, avoiding infinite wait.
+                manifest_round_started_at = None;
                 let force_snapshot = manifest_force_snapshot_peers.remove(&from);
                 manifest_response_count += 1;
                 if manifest.tip_height == 0 {
@@ -5326,6 +5343,7 @@ async fn handle_p2p_events(
             }
             Ok(NetworkEvent::PeerDisconnected(peer)) => {
                 tracing::debug!(peer = %peer, "peer disconnected");
+                manifest_peers.remove(&peer);
                 relay_terminal_peers.remove(&peer);
                 if pending_remote_selected_history_request
                     .as_ref()
@@ -5989,6 +6007,41 @@ async fn handle_p2p_events(
             recent_block_fetches.retain(|_, t| *t >= fetch_cutoff);
             pending_block_fetches
                 .retain(|_, pending| now.duration_since(pending.requested_at) < BLOCK_FETCH_INFLIGHT_TTL);
+
+            // A manifest round that produced zero responses is dead air — a
+            // dropped response stream, a peer that never served it. Reset and
+            // re-request from every connected peer; with a single seed there
+            // is no second PeerConnected event to save us.
+            if manifest_round_started_at.is_some_and(|started| {
+                now.duration_since(started) >= STATE_MANIFEST_RESPONSE_TIMEOUT
+            }) && manifest_response_count == 0
+                && pending_manifest.is_none()
+                && snapshot_staging.is_none()
+                && snapshot_install_inflight.is_none()
+            {
+                tracing::warn!(
+                    peers = manifest_peers.len(),
+                    "state manifest round timed out with no responses — re-requesting"
+                );
+                reset_sync_state!();
+                let our_height = {
+                    let ctx = chain.read().await;
+                    ctx.tip_height()
+                };
+                for peer in manifest_peers.iter().copied() {
+                    manifest_requested_peers.insert(peer);
+                    p2p_cmd
+                        .send(noid_p2p::NetworkCommand::RequestStateManifest {
+                            peer,
+                            requester_height: our_height,
+                        })
+                        .await
+                        .ok();
+                }
+                if !manifest_peers.is_empty() {
+                    manifest_round_started_at = Some(now);
+                }
+            }
 
             if remote_selected_history_import_enabled {
                 let snapshot_pipeline_idle = pending_manifest.is_none()
