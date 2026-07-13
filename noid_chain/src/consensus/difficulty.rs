@@ -568,12 +568,12 @@ mod tests {
 
     #[test]
     fn block_work_genesis_target() {
-        // GENESIS_TARGET = 2^237. With strict `< target`, expected trial count
-        // is exactly 2^(256-237) = 2^19.
+        // GENESIS_TARGET = 2^238. With strict `< target`, expected trial count
+        // is exactly 2^(256-238) = 2^18.
         use crate::consensus::params::GENESIS_TARGET;
         let w = block_work(&GENESIS_TARGET);
         let val = u256_to_u128_low(&w);
-        assert_eq!(val, 1u128 << 19, "GENESIS_TARGET work = 2^19");
+        assert_eq!(val, 1u128 << 18, "GENESIS_TARGET work = 2^18");
 
         // Cross-check: MIN_SNAPSHOT_CHAINWORK = CONSENSUS_FINALITY_DEPTH × block_work(GENESIS_TARGET)
         use crate::consensus::params::{CONSENSUS_FINALITY_DEPTH, MIN_SNAPSHOT_CHAINWORK};

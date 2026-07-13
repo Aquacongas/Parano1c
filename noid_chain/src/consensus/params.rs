@@ -187,13 +187,16 @@ pub const EXPAND_DENOM: u64 = 4;
 ///   avg_nonces = 2^(256-237) = 2^19 = 524,288
 ///   time = 524K / 186K ≈ 2.8s
 ///
-/// LE 256-bit layout: byte 29 = 0x20 (bit 237 = bit 5 of byte 29).
-/// Bytes 30-31 = 0x00 so the target value equals 2^237.
+/// LE 256-bit layout: byte 29 = 0x40 (bit 238 = bit 6 of byte 29).
+/// Bytes 30-31 = 0x00 so the target value equals 2^238.
 ///
 /// This is the minimum allowed difficulty floor. ASERT may only move harder.
+/// Halved difficulty (2^237 -> 2^238 target, owner decision 2026-07-13) so
+/// young-network block discovery is twice as fast; ASERT converges to
+/// BLOCK_TIME either way.
 pub const GENESIS_TARGET: [u8; 32] = {
     let mut t = [0u8; 32];
-    t[29] = 0x20; // bit 5 of byte 29 -> 2^(8*29+5) = 2^237
+    t[29] = 0x40; // bit 6 of byte 29 -> 2^(8*29+6) = 2^238
     t
 };
 

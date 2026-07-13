@@ -67,7 +67,7 @@ const GENESIS_STATE_ROOT: [u8; 32] = [
 
 /// Pre-mined genesis nonce.
 /// Satisfies: `H_POSEIDON_POW(genesis_header()) < GENESIS_TARGET`.
-const GENESIS_NONCE: u128 = 468_361;
+const GENESIS_NONCE: u128 = 149_245;
 
 /// Find and return a valid genesis nonce at runtime.
 /// Used for verification only — not for production (nonce is hardcoded as `GENESIS_NONCE`).
