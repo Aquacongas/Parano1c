@@ -16,7 +16,7 @@ use noid_chain::header_anchor::{
     extend_header_chain_anchor, HeaderChainAnchor, HeaderChainAnchorError,
 };
 use noid_chain::segmented_state::ExactStateReadError;
-use noid_chain::state::{ChainState, ExactFrontierError};
+use noid_chain::state::{ChainState, ExactFrontierError, SelectedHistoryLadderUpdate};
 use noid_core::{Block128, TowerField};
 use noid_gkr::{
     prove_accepted_claim_hash_killshot, prove_batched_merkle_killshot, prove_block_spine_killshot,
@@ -316,6 +316,7 @@ pub enum FullAcceptedBlockBatchError {
     CheckpointSummaryStartMismatch,
     CheckpointSummaryEndMismatch,
     CheckpointStep(HistoryCheckpointStepProofError),
+    LadderEndState(&'static str),
 }
 
 /// `AcceptBlock` authorization verifier that captures each selected-ZK public
@@ -863,7 +864,8 @@ pub fn prove_retained_full_accepted_block_batch_proof(
 }
 
 /// Reconstruct the exact selected-recursive miner carrier from one owned
-/// canonical block and its stored detached proof/auth material.
+/// canonical block and its stored detached proof/auth material, plus the
+/// replayed end state's forward ladder cursor advance.
 ///
 /// The historical `start_state` must still have every segment needed by the
 /// native acceptance replay. No component DTO or decoded authorization proof
@@ -876,7 +878,10 @@ pub fn reconstruct_selected_recursive_block_artifacts(
     start_parent: BlockHeader,
     start_state: ChainState,
     item: FullAcceptedBlockBatchItem,
-) -> Result<SelectedRecursiveBlockArtifacts, FullAcceptedBlockBatchError> {
+) -> Result<
+    (SelectedRecursiveBlockArtifacts, SelectedHistoryLadderUpdate),
+    FullAcceptedBlockBatchError,
+> {
     reconstruct_selected_recursive_block_artifacts_from_single_witness(
         start_consensus,
         start_accumulator,
@@ -895,7 +900,10 @@ pub fn reconstruct_selected_recursive_block_artifacts_from_single_witness(
     start_parent: BlockHeader,
     start_state: ChainState,
     witness: FullAcceptedBlockBatchWitness,
-) -> Result<SelectedRecursiveBlockArtifacts, FullAcceptedBlockBatchError> {
+) -> Result<
+    (SelectedRecursiveBlockArtifacts, SelectedHistoryLadderUpdate),
+    FullAcceptedBlockBatchError,
+> {
     validate_single_block_reconstruction_input(&start_parent, &witness)?;
     let transaction_count = witness.items[0].block.transactions.len();
     let user_transaction_count = witness.items[0]
@@ -923,9 +931,13 @@ pub fn reconstruct_selected_recursive_block_artifacts_from_single_witness(
         proof_components,
     } = output;
     // The recursive Block builder needs only the authenticated end
-    // accumulator. Release the cloned/mutated historical state before proving
-    // the retained components.
-    drop(end_state);
+    // accumulator, but the promotion transaction persists this block's
+    // end-state boundary as the forward ladder cursor. Extract the dirty
+    // columns (bounded by the block's touched-segment budget) and the compact
+    // summaries, releasing the rest of the replayed state before proving.
+    let ladder_update = end_state
+        .into_selected_history_ladder_update()
+        .map_err(FullAcceptedBlockBatchError::LadderEndState)?;
     validate_single_block_recursive_components(
         &proof_components,
         transaction_count,
@@ -969,13 +981,16 @@ pub fn reconstruct_selected_recursive_block_artifacts_from_single_witness(
         accepted_block_receipt_projection_handles,
     ));
 
-    Ok(SelectedRecursiveBlockArtifacts {
-        start_accumulator,
-        end_accumulator,
-        component_inputs,
-        component_proof,
-        selected_authorization_proofs,
-    })
+    Ok((
+        SelectedRecursiveBlockArtifacts {
+            start_accumulator,
+            end_accumulator,
+            component_inputs,
+            component_proof,
+            selected_authorization_proofs,
+        },
+        ladder_update,
+    ))
 }
 
 fn validate_single_block_reconstruction_input(
@@ -2168,7 +2183,7 @@ mod tests {
             canonical_coinbase_fixture();
         let child_header = item.block.header.clone();
         SELECTED_RECONSTRUCTION_COMPONENT_VERIFY_CALLS.with(|calls| calls.set(0));
-        let artifacts = reconstruct_selected_recursive_block_artifacts(
+        let (artifacts, ladder_update) = reconstruct_selected_recursive_block_artifacts(
             start_consensus.clone(),
             start_accumulator.clone(),
             parent,
@@ -2179,6 +2194,16 @@ mod tests {
         SELECTED_RECONSTRUCTION_COMPONENT_VERIFY_CALLS
             .with(|calls| assert_eq!(calls.get(), 1, "one retained-component verification"));
 
+        assert_eq!(ladder_update.state_root, child_header.state_root);
+        assert_eq!(ladder_update.log_slots, child_header.log_slots);
+        assert_eq!(
+            ladder_update.active_slot_count,
+            child_header.active_slot_count
+        );
+        assert!(
+            !ladder_update.dirty_segments.is_empty(),
+            "the coinbase mint must surface its touched end-state columns"
+        );
         assert_eq!(artifacts.live_authorization_count(), 0);
         let (
             sealed_start_accumulator,
@@ -2314,7 +2339,7 @@ mod tests {
         assert!(!reconstructor.contains("verify_full_accepted_block_batch_native("));
         assert!(reconstructor.contains("start_state: ChainState"));
         assert!(reconstructor.contains("drop(witness)"));
-        assert!(reconstructor.contains("drop(end_state)"));
+        assert!(reconstructor.contains("into_selected_history_ladder_update()"));
         assert!(reconstructor.contains("prove_full_accepted_block_batch_components"));
         assert_eq!(
             reconstructor

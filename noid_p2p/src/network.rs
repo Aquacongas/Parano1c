@@ -3022,7 +3022,12 @@ mod tests {
         terminal.push(0);
         terminal.extend_from_slice(&8u16.to_le_bytes());
         ctx.store
-            .complete_recursive_proof_job_and_promote_selected_history(1, hash, &terminal)
+            .complete_recursive_proof_job_and_promote_selected_history(
+                1,
+                hash,
+                &terminal,
+                &noid_chain::SelectedHistoryLadderUpdate::empty(header.log_slots),
+            )
             .unwrap();
         ctx.tip_height = 1;
         ctx.tip_hash = hash;

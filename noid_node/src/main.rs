@@ -605,7 +605,6 @@ impl SelectedHistoryWorkerRuntime {
 }
 
 fn start_selected_history_worker(
-    chain: Arc<RwLock<MdbxChainContext>>,
     store: noid_chain::storage::MdbxStore,
     artifacts: SelectedHistoryVerifierArtifacts,
 ) -> Result<SelectedHistoryWorkerRuntime, String> {
@@ -647,16 +646,7 @@ fn start_selected_history_worker(
             };
 
             while !worker_cancelled.load(std::sync::atomic::Ordering::Acquire) {
-                let outcome = worker.run_once(
-                    || {
-                        let context = chain.blocking_read();
-                        context
-                            .state
-                            .durable_metadata_clone()
-                            .ok_or("chain state is outside a durable metadata boundary")
-                    },
-                    &worker_cancelled,
-                );
+                let outcome = worker.run_once(&worker_cancelled);
                 let delay = match outcome {
                     SelectedHistoryWorkerOutcome::Completed(identity) => {
                         tracing::info!(
@@ -1444,10 +1434,7 @@ async fn main() -> anyhow::Result<()> {
             let context = chain.read().await;
             context.store.clone()
         };
-        Some(
-            start_selected_history_worker(Arc::clone(&chain), store, artifacts)
-                .map_err(anyhow::Error::msg)?,
-        )
+        Some(start_selected_history_worker(store, artifacts).map_err(anyhow::Error::msg)?)
     } else {
         None
     };

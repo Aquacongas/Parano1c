@@ -1076,6 +1076,44 @@ impl SegmentedFriState {
         Ok(())
     }
 
+    /// Install a live ladder-cursor segment summary without any FRI authority.
+    ///
+    /// The forward ladder cursor stores exact roots and live counts only; its
+    /// carrier state must never answer a FRI root/opening request. The segment
+    /// is marked evicted with `seg_roots = None` and left FRI-dirty, so a
+    /// later FRI flush fails closed on the eviction assertion instead of
+    /// silently hashing a zero payload.
+    pub(crate) fn install_evicted_segment_summary_without_fri(
+        &mut self,
+        seg_id: u16,
+        live_count: u32,
+    ) -> Result<(), &'static str> {
+        let id = seg_id as usize;
+        if id >= self.num_segments || live_count == 0 {
+            return Err("invalid ladder segment summary");
+        }
+        self.segments[id] = None;
+        self.live_counts[id] = live_count;
+        self.seg_roots[id] = None;
+        self.evicted.insert(seg_id);
+        self.dirty.insert(seg_id);
+        self.tree_dirty = true;
+        Ok(())
+    }
+
+    /// Move one segment's resident columns out for durable persistence.
+    ///
+    /// Returns `None` when the segment holds no resident payload. The segment
+    /// is left evicted, so the consuming state must not replay further.
+    pub(crate) fn take_segment_columns(&mut self, seg_id: u16) -> Option<Box<SegmentColumns>> {
+        let id = seg_id as usize;
+        let columns = self.segments[id].take();
+        if columns.is_some() {
+            self.evicted.insert(seg_id);
+        }
+        columns
+    }
+
     /// Finish a batch of summary installs and leave no false persistence dirt.
     pub(crate) fn finish_evicted_segment_summaries(&mut self) {
         self.flush_tree();

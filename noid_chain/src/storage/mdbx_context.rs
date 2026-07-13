@@ -241,7 +241,7 @@ impl MdbxChainContext {
     // Initialisation
     // -----------------------------------------------------------------------
 
-    fn load_streamed_chain_state(
+    pub(crate) fn load_streamed_chain_state(
         store: &MdbxStore,
         log_slots: u32,
         active_slot_count: u64,

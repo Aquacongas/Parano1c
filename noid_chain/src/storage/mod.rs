@@ -13,6 +13,7 @@
 //! bandwidth relevant.
 
 pub mod historical_state;
+pub mod ladder_state;
 pub mod mdbx_context;
 pub mod mdbx_store;
 pub mod memory;
@@ -25,16 +26,20 @@ pub use historical_state::{
     reconstruct_historical_exact_state, CanonicalTipBinding, HistoricalExactStateView,
     HistoricalStateError,
 };
+pub use ladder_state::{
+    derive_touched_segment_ids, load_selected_history_ladder_parent_state, LadderStateError,
+    TouchedSegmentError,
+};
 pub use mdbx_context::{
     AppliedBlockValidation, MdbxChainContext, MdbxContextError, ReorgBlockPayload,
 };
 pub use mdbx_store::{
     AcceptedBlockCommitData, ClaimedRecursiveProofJobInputs, MdbxStore, RecursiveProofJob,
     RecursiveProofJobResult, RecursiveProofJobState, RecursiveProofJobTier,
-    SelectedHistoryCoverage, SelectedHistorySnapshotSeed, StoreError, VerifiedHeaderBatchOutcome,
-    VerifiedHeaderBatchRecord, VerifiedOwnerSnapshot, VerifiedOwnerUtxo,
-    VerifiedSelectedHistoryTerminalImport, MAX_RECURSIVE_PROOF_JOB_RESULT_BYTES,
-    MAX_VERIFIED_HEADER_BATCH_RECORDS,
+    SelectedHistoryCoverage, SelectedHistoryLadderMeta, SelectedHistorySnapshotSeed, StoreError,
+    VerifiedHeaderBatchOutcome, VerifiedHeaderBatchRecord, VerifiedOwnerSnapshot,
+    VerifiedOwnerUtxo, VerifiedSelectedHistoryTerminalImport,
+    MAX_RECURSIVE_PROOF_JOB_RESULT_BYTES, MAX_VERIFIED_HEADER_BATCH_RECORDS,
 };
 pub use memory::RamBackend;
 pub use meta::{ConsensusMeta, FinalizedCheckpoint};

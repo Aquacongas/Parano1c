@@ -258,6 +258,57 @@ impl ExactSegmentRootCache {
     }
 }
 
+/// Recombine per-segment exact roots into the chain-level exact state root.
+///
+/// Absent segments contribute the canonical zero-segment root. Returns `None`
+/// when an entry lies outside the `log_slots` segment domain.
+pub(crate) fn exact_state_root_from_segment_summaries(
+    log_slots: usize,
+    exact_segment_roots: &[(u16, StateHash)],
+) -> Option<StateHash> {
+    if log_slots == 0 || log_slots > 64 {
+        return None;
+    }
+    let mut cache = ExactSegmentRootCache::empty(log_slots);
+    for &(segment_id, root) in exact_segment_roots {
+        if segment_id as usize >= cache.segment_roots.len() {
+            return None;
+        }
+        cache.set_segment_root(segment_id, root);
+    }
+    Some(cache.root())
+}
+
+/// One state boundary of the selected-history forward ladder cursor.
+///
+/// `segment_summaries` carries `(segment_id, live_count, exact_segment_root)`
+/// for every live segment, strictly ascending. `dirty_segments` carries the
+/// raw post-block columns of every block-touched segment in ascending order;
+/// `None` deletes the durable record of a segment that became empty.
+#[derive(Debug)]
+pub struct SelectedHistoryLadderUpdate {
+    pub log_slots: u32,
+    pub active_slot_count: u64,
+    pub alloc_counter: u64,
+    pub state_root: StateHash,
+    pub segment_summaries: Vec<(u16, u32, StateHash)>,
+    pub dirty_segments: Vec<(u16, Option<SegmentColumns>)>,
+}
+
+impl SelectedHistoryLadderUpdate {
+    /// Update describing the canonical empty state at `log_slots`.
+    pub fn empty(log_slots: u32) -> Self {
+        Self {
+            log_slots,
+            active_slot_count: 0,
+            alloc_counter: 0,
+            state_root: zero_slot_roots(log_slots as usize)[log_slots as usize],
+            segment_summaries: Vec::new(),
+            dirty_segments: Vec::new(),
+        }
+    }
+}
+
 fn exact_segment_root_with_updates(
     effective_log_seg: usize,
     columns: Option<&SegmentColumns>,
@@ -804,6 +855,91 @@ impl ChainState {
         self.active_slot_count = active_slot_count;
         self.alloc_counter = alloc_counter;
         Ok(applied_root)
+    }
+
+    /// Extract this block's ladder cursor advance: the raw columns of every
+    /// MDBX-dirty segment plus the complete compact per-segment summary.
+    pub fn into_selected_history_ladder_update(
+        self,
+    ) -> Result<SelectedHistoryLadderUpdate, &'static str> {
+        let mut dirty_segment_ids: Vec<u16> = self.state.dirty_segment_ids().collect();
+        dirty_segment_ids.sort_unstable();
+        self.into_selected_history_ladder_parts(dirty_segment_ids)
+    }
+
+    /// Extract a self-contained ladder cursor snapshot: raw columns for every
+    /// live segment. Bootstrap seeding uses this; every live segment must be
+    /// resident.
+    pub fn into_selected_history_ladder_snapshot(
+        self,
+    ) -> Result<SelectedHistoryLadderUpdate, &'static str> {
+        let live_segment_ids: Vec<u16> = (0..self.state.num_segments())
+            .map(|index| index as u16)
+            .filter(|&segment_id| self.state.segment_live_count(segment_id) != 0)
+            .collect();
+        self.into_selected_history_ladder_parts(live_segment_ids)
+    }
+
+    fn into_selected_history_ladder_parts(
+        mut self,
+        dirty_segment_ids: Vec<u16>,
+    ) -> Result<SelectedHistoryLadderUpdate, &'static str> {
+        if self.state.exact_dirty_segment_ids().next().is_some() {
+            return Err("ladder update requires a freshly refreshed exact root");
+        }
+        if self.exact_roots.log_slots != self.state.log_slots()
+            || self.exact_roots.root() != self.utxo_root
+        {
+            return Err("ladder update exact-root cache is stale");
+        }
+        let log_slots = u32::try_from(self.state.log_slots())
+            .map_err(|_| "ladder update slot depth exceeds u32")?;
+
+        let mut segment_summaries = Vec::new();
+        let mut counted_live = 0u64;
+        for index in 0..self.state.num_segments() {
+            let segment_id = index as u16;
+            let live_count = self.state.segment_live_count(segment_id);
+            if live_count == 0 {
+                continue;
+            }
+            counted_live = counted_live
+                .checked_add(u64::from(live_count))
+                .ok_or("ladder update live count overflows u64")?;
+            segment_summaries.push((
+                segment_id,
+                live_count,
+                self.exact_roots.segment_roots[index],
+            ));
+        }
+        if counted_live != self.active_slot_count {
+            return Err("ladder update live counts disagree with the active slot count");
+        }
+
+        let mut dirty_segments = Vec::with_capacity(dirty_segment_ids.len());
+        for segment_id in dirty_segment_ids {
+            if usize::from(segment_id) >= self.state.num_segments() {
+                return Err("ladder update dirty segment lies outside the slot domain");
+            }
+            if self.state.segment_live_count(segment_id) == 0 {
+                dirty_segments.push((segment_id, None));
+                continue;
+            }
+            let columns = self
+                .state
+                .take_segment_columns(segment_id)
+                .ok_or("ladder update dirty live segment has no resident columns")?;
+            dirty_segments.push((segment_id, Some(*columns)));
+        }
+
+        Ok(SelectedHistoryLadderUpdate {
+            log_slots,
+            active_slot_count: self.active_slot_count,
+            alloc_counter: self.alloc_counter,
+            state_root: self.utxo_root,
+            segment_summaries,
+            dirty_segments,
+        })
     }
 }
 

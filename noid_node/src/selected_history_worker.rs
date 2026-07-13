@@ -14,15 +14,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use noid_block::{FullAcceptedBlockBatchItem, reconstruct_selected_recursive_block_artifacts};
 use noid_chain::block::Block;
 use noid_chain::consensus::header::asert_anchor_height;
-use noid_chain::consensus::params::{
-    BLOCK_MAX_DISTINCT_SEGMENTS, EXPANSION_WINDOW, MEDIAN_TIME_BLOCKS, TX_EPOCH_BLOCKS,
-};
-use noid_chain::fri_state::LOG_SEGMENT_SIZE;
+use noid_chain::consensus::params::{EXPANSION_WINDOW, MEDIAN_TIME_BLOCKS, TX_EPOCH_BLOCKS};
 use noid_chain::storage::{
-    CanonicalTipBinding, MdbxStore, RecursiveProofJob, RecursiveProofJobState,
-    RecursiveProofJobTier,
+    MdbxStore, RecursiveProofJob, RecursiveProofJobState, RecursiveProofJobTier,
+    derive_touched_segment_ids, load_selected_history_ladder_parent_state,
 };
-use noid_chain::{BlockHeader, ChainState, block_id, reconstruct_historical_exact_state};
+use noid_chain::{BlockHeader, SelectedHistoryLadderUpdate, block_id};
 use noid_miner::{
     LoadedSelectedRecursiveClassRegistry, LocalSelectedRecursiveClassRegistryStore,
     LocalSelectedRecursiveMatrixSource, SelectedHistoryProofSession, SelectedRecursiveBlockJob,
@@ -112,25 +109,14 @@ impl SelectedHistoryProverWorker {
 
     /// Claim and process at most one selected recursive proof job.
     ///
-    /// `current_tip_metadata` is a one-shot supplier that must construct an
-    /// owned [`ChainState::durable_metadata_clone`] without retaining the
-    /// caller's chain lock.  It is invoked only after this poll has claimed a
-    /// durable job and acquired the full proving-memory admission, so Idle,
-    /// cancelled and memory-pressure polls never clone chain metadata.  The
-    /// historical reconstructor independently binds the supplied metadata to
-    /// the single MVCC source tip loaded with the claimed job. Cancellation is
-    /// cooperative at explicit phase boundaries; an in-flight cryptographic
-    /// backend call runs to its owning drop point instead of abandoning
-    /// allocations halfway through a proof.
-    pub fn run_once<F, E>(
-        &mut self,
-        current_tip_metadata: F,
-        cancelled: &AtomicBool,
-    ) -> SelectedHistoryWorkerOutcome
-    where
-        F: FnOnce() -> Result<ChainState, E>,
-        E: std::fmt::Debug,
-    {
+    /// The parent state comes from the worker's own durable forward ladder
+    /// cursor, never from the caller's chain state, so this poll takes no
+    /// chain lock and is independent of how far the canonical tip has
+    /// advanced past the proof pipeline. Cancellation is cooperative at
+    /// explicit phase boundaries; an in-flight cryptographic backend call
+    /// runs to its owning drop point instead of abandoning allocations
+    /// halfway through a proof.
+    pub fn run_once(&mut self, cancelled: &AtomicBool) -> SelectedHistoryWorkerOutcome {
         let Self {
             store,
             registry_store,
@@ -140,9 +126,8 @@ impl SelectedHistoryProverWorker {
         let PreparedSelectedHistoryClaim {
             mut running,
             identity,
-            current_tip_metadata,
             proof_session,
-        } = match prepare_claim(store, cancelled, current_tip_metadata) {
+        } = match prepare_claim(store, cancelled) {
             Ok(prepared) => prepared,
             Err(outcome) => return outcome,
         };
@@ -155,7 +140,6 @@ impl SelectedHistoryProverWorker {
                 *expected_registry_digest,
                 matrix_source,
                 claimed,
-                current_tip_metadata,
                 proof_session,
                 cancelled,
             )
@@ -191,7 +175,7 @@ impl SelectedHistoryProverWorker {
             );
         }
 
-        match running.promote(&candidate.encoded_package) {
+        match running.promote(&candidate.encoded_package, &candidate.ladder_update) {
             Ok(()) => SelectedHistoryWorkerOutcome::Completed(identity),
             Err(error) => release_backoff(
                 &mut running,
@@ -205,36 +189,27 @@ impl SelectedHistoryProverWorker {
 struct PreparedSelectedHistoryClaim<'a, S> {
     running: RunningJobGuard<'a>,
     identity: SelectedHistoryJobIdentity,
-    current_tip_metadata: ChainState,
     proof_session: S,
 }
 
-fn prepare_claim<'a, F, E>(
+fn prepare_claim<'a>(
     store: &'a MdbxStore,
     cancelled: &AtomicBool,
-    current_tip_metadata: F,
 ) -> Result<
     PreparedSelectedHistoryClaim<'a, SelectedHistoryProofSession>,
     SelectedHistoryWorkerOutcome,
->
-where
-    F: FnOnce() -> Result<ChainState, E>,
-    E: std::fmt::Debug,
-{
-    prepare_claim_with_admission(store, cancelled, current_tip_metadata, || {
+> {
+    prepare_claim_with_admission(store, cancelled, || {
         begin_selected_history_proof_session().map_err(map_prover_admission)
     })
 }
 
-fn prepare_claim_with_admission<'a, F, E, A, S>(
+fn prepare_claim_with_admission<'a, A, S>(
     store: &'a MdbxStore,
     cancelled: &AtomicBool,
-    current_tip_metadata: F,
     admission: A,
 ) -> Result<PreparedSelectedHistoryClaim<'a, S>, SelectedHistoryWorkerOutcome>
 where
-    F: FnOnce() -> Result<ChainState, E>,
-    E: std::fmt::Debug,
     A: FnOnce() -> Result<S, SelectedHistoryWorkerBackoff>,
 {
     if cancelled.load(Ordering::Acquire) {
@@ -242,8 +217,7 @@ where
     }
 
     // Exactly one durable claim per poll. MDBX chooses the numerically lowest
-    // canonical Pending job without materializing a queue. No chain metadata
-    // has been constructed at this point.
+    // canonical Pending job without materializing a queue.
     let claimed = match store.claim_next_recursive_proof_job() {
         Ok(Some(job)) => job,
         Ok(None) => {
@@ -264,9 +238,9 @@ where
         ));
     }
 
-    // Reserve the complete m24 envelope before the caller is allowed to clone
-    // even compact chain metadata. Admission failure therefore adds no chain
-    // state allocation to an already memory-pressured process.
+    // Reserve the complete m24 envelope before any job input is loaded.
+    // Admission failure therefore adds no state allocation to an already
+    // memory-pressured process.
     let proof_session = match catch_unwind(AssertUnwindSafe(admission)) {
         Ok(Ok(session)) => session,
         Ok(Err(reason)) => return Err(release_backoff(&mut running, identity, reason)),
@@ -286,36 +260,9 @@ where
         ));
     }
 
-    let supplied = catch_unwind(AssertUnwindSafe(current_tip_metadata));
-    if cancelled.load(Ordering::Acquire) {
-        return Err(release_backoff(
-            &mut running,
-            identity,
-            SelectedHistoryWorkerBackoff::Cancelled,
-        ));
-    }
-    let current_tip_metadata = match supplied {
-        Ok(Ok(metadata)) => metadata,
-        Ok(Err(error)) => {
-            return Err(release_backoff(
-                &mut running,
-                identity,
-                retryable("construct current tip metadata", error),
-            ));
-        }
-        Err(_) => {
-            return Err(release_backoff(
-                &mut running,
-                identity,
-                SelectedHistoryWorkerBackoff::Panicked,
-            ));
-        }
-    };
-
     Ok(PreparedSelectedHistoryClaim {
         running,
         identity,
-        current_tip_metadata,
         proof_session,
     })
 }
@@ -324,6 +271,9 @@ struct CompletionCandidate {
     height: u64,
     block_hash: [u8; 32],
     encoded_package: Vec<u8>,
+    /// The proven block's end-state boundary, persisted atomically with the
+    /// promotion so the forward ladder cursor can never lag coverage.
+    ladder_update: SelectedHistoryLadderUpdate,
 }
 
 /// Armed immediately after Pending -> Running and disarmed only by the same
@@ -355,12 +305,17 @@ impl<'a> RunningJobGuard<'a> {
         Ok(())
     }
 
-    fn promote(&mut self, encoded_package: &[u8]) -> Result<(), String> {
+    fn promote(
+        &mut self,
+        encoded_package: &[u8],
+        ladder_update: &SelectedHistoryLadderUpdate,
+    ) -> Result<(), String> {
         self.store
             .complete_recursive_proof_job_and_promote_selected_history(
                 self.job.height,
                 self.job.block_hash,
                 encoded_package,
+                ladder_update,
             )
             .map_err(|error| error.to_string())?;
         self.armed = false;
@@ -405,7 +360,6 @@ fn process_claimed_job(
     expected_registry_digest: [u8; 32],
     matrix_source: &mut LocalSelectedRecursiveMatrixSource,
     claimed: RecursiveProofJob,
-    current_tip_metadata: ChainState,
     mut proof_session: SelectedHistoryProofSession,
     cancelled: &AtomicBool,
 ) -> Result<CompletionCandidate, SelectedHistoryWorkerBackoff> {
@@ -432,7 +386,7 @@ fn process_claimed_job(
 
     let noid_chain::storage::ClaimedRecursiveProofJobInputs {
         job,
-        source_tip,
+        source_tip: _,
         parent_header,
         block_header,
         user_transaction_count,
@@ -488,33 +442,15 @@ fn process_claimed_job(
     validate_start_accumulator(store, &start_accumulator, &parent_header)?;
     check_cancelled(cancelled)?;
 
-    // This is the sole raw-state reconstruction. It opens one stable MDBX
-    // historical snapshot and retains columns only for the sorted touched set.
-    let historical = reconstruct_historical_exact_state(
-        store,
-        &current_tip_metadata,
-        CanonicalTipBinding {
-            height: source_tip.0,
-            hash: source_tip.1,
-        },
-        parent_header.height,
-        &required_segment_ids,
-    )
-    .map_err(|error| retryable("reconstruct bounded historical exact state", error))?;
-    drop(current_tip_metadata);
-    if historical.target_header() != &parent_header
-        || historical.target_hash() != block_id(&parent_header)
-        || historical.required_segment_ids() != required_segment_ids
-    {
-        return Err(retryable_message(
-            "validate historical exact state",
-            "historical view identity or touched-segment allowlist mismatch",
-        ));
-    }
-    let start_state = historical.into_exact_state_for_replay();
+    // This is the sole raw-state load. The worker's durable forward ladder
+    // cursor supplies the exact parent state with columns resident only for
+    // the sorted touched set, independent of the canonical tip's undo window.
+    let start_state =
+        load_selected_history_ladder_parent_state(store, &parent_header, &required_segment_ids)
+            .map_err(|error| retryable("load forward ladder parent state", error))?;
     check_cancelled(cancelled)?;
 
-    let artifacts = reconstruct_selected_recursive_block_artifacts(
+    let (artifacts, ladder_update) = reconstruct_selected_recursive_block_artifacts(
         start_consensus,
         start_accumulator,
         parent_header,
@@ -604,6 +540,7 @@ fn process_claimed_job(
         height: job.height,
         block_hash: job.block_hash,
         encoded_package,
+        ladder_update,
     })
 }
 
@@ -780,109 +717,6 @@ fn recursive_consensus_state_at_header(
     ))
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TouchedSegmentError {
-    UnsupportedLogSlots(u32),
-    InvalidLogSlotsTransition { parent: u32, child: u32 },
-    InputSlotOutOfParentDomain(u32),
-    SlotOutOfDomain(u32),
-    SegmentIdOverflow(u32),
-    TooManyDistinctSegments { actual: usize, maximum: usize },
-}
-
-impl std::fmt::Display for TouchedSegmentError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::UnsupportedLogSlots(log) => write!(f, "unsupported log_slots {log}"),
-            Self::InvalidLogSlotsTransition { parent, child } => {
-                write!(f, "invalid log_slots transition {parent} -> {child}")
-            }
-            Self::InputSlotOutOfParentDomain(slot) => {
-                write!(f, "live input slot {slot} is outside the parent domain")
-            }
-            Self::SlotOutOfDomain(slot) => write!(f, "live slot {slot} is outside block domain"),
-            Self::SegmentIdOverflow(segment) => {
-                write!(f, "derived segment {segment} exceeds u16 storage identity")
-            }
-            Self::TooManyDistinctSegments { actual, maximum } => write!(
-                f,
-                "block touches {actual} exact-state segments; maximum is {maximum}"
-            ),
-        }
-    }
-}
-
-/// Derive only the raw exact-state segments actually read by the one-block
-/// replay. Dead fixed-width actions are ignored; duplicate segment IDs are
-/// compacted in place and the consensus distinct-segment cap is enforced.
-fn derive_touched_segment_ids(
-    block: &Block,
-    parent_log_slots: u32,
-) -> Result<Vec<u16>, TouchedSegmentError> {
-    let child_log_slots = block.header.log_slots;
-    if parent_log_slots > u32::BITS || child_log_slots > u32::BITS {
-        return Err(TouchedSegmentError::UnsupportedLogSlots(
-            parent_log_slots.max(child_log_slots),
-        ));
-    }
-    if child_log_slots != parent_log_slots && child_log_slots != parent_log_slots.saturating_add(1)
-    {
-        return Err(TouchedSegmentError::InvalidLogSlotsTransition {
-            parent: parent_log_slots,
-            child: child_log_slots,
-        });
-    }
-    let effective_log = usize::try_from(parent_log_slots)
-        .unwrap_or(usize::MAX)
-        .min(LOG_SEGMENT_SIZE);
-    let parent_domain_slots = 1u64
-        .checked_shl(parent_log_slots)
-        .ok_or(TouchedSegmentError::UnsupportedLogSlots(parent_log_slots))?;
-    let child_domain_slots = 1u64
-        .checked_shl(child_log_slots)
-        .ok_or(TouchedSegmentError::UnsupportedLogSlots(child_log_slots))?;
-    let mut segments = Vec::with_capacity(BLOCK_MAX_DISTINCT_SEGMENTS);
-
-    let mut push_parent_slot = |slot: u32| -> Result<(), TouchedSegmentError> {
-        let segment = slot >> effective_log;
-        let segment_id =
-            u16::try_from(segment).map_err(|_| TouchedSegmentError::SegmentIdOverflow(segment))?;
-        segments.push(segment_id);
-        Ok(())
-    };
-    for transaction in &block.transactions {
-        for (_, input) in transaction.body.live_inputs() {
-            if u64::from(input.slot_index) >= parent_domain_slots {
-                return Err(TouchedSegmentError::InputSlotOutOfParentDomain(
-                    input.slot_index,
-                ));
-            }
-            push_parent_slot(input.slot_index)?;
-        }
-        for (_, output) in transaction.body.live_outputs() {
-            if u64::from(output.slot_index) >= child_domain_slots {
-                return Err(TouchedSegmentError::SlotOutOfDomain(output.slot_index));
-            }
-            // During the sole permitted +1 expansion, the upper half is
-            // deterministically virtual zero at the parent boundary.  Loading
-            // it from historical MDBX would be both unnecessary and invalid;
-            // `apply_block` materializes it only after expanding the state.
-            if u64::from(output.slot_index) < parent_domain_slots {
-                push_parent_slot(output.slot_index)?;
-            }
-        }
-    }
-    segments.sort_unstable();
-    segments.dedup();
-    if segments.len() > BLOCK_MAX_DISTINCT_SEGMENTS {
-        return Err(TouchedSegmentError::TooManyDistinctSegments {
-            actual: segments.len(),
-            maximum: BLOCK_MAX_DISTINCT_SEGMENTS,
-        });
-    }
-    Ok(segments)
-}
-
 fn storage_tier_matches(storage: RecursiveProofJobTier, selected: SelectedRecursiveTier) -> bool {
     matches!(
         (storage, selected),
@@ -1003,63 +837,6 @@ mod tests {
     }
 
     #[test]
-    fn touched_segment_derivation_keeps_only_live_unique_segments() {
-        let mut header = genesis_header();
-        header.log_slots = 24;
-        let block = Block {
-            header,
-            transactions: vec![
-                transaction((3 << 16) + 1, true, (7 << 16) + 2, true, false),
-                // Dead fixed-width cells must not hydrate segment 200.
-                transaction((200 << 16) + 1, false, (3 << 16) + 9, true, false),
-            ],
-        };
-        assert_eq!(derive_touched_segment_ids(&block, 24).unwrap(), vec![3, 7]);
-
-        let mut monolithic = block;
-        monolithic.header.log_slots = 16;
-        monolithic.transactions = vec![transaction(9, true, 65_000, true, false)];
-        assert_eq!(
-            derive_touched_segment_ids(&monolithic, 16).unwrap(),
-            vec![0]
-        );
-    }
-
-    #[test]
-    fn touched_segment_derivation_rejects_live_out_of_domain_slot() {
-        let mut header = genesis_header();
-        header.log_slots = 16;
-        let block = Block {
-            header,
-            transactions: vec![transaction(1 << 16, true, 0, false, false)],
-        };
-        assert_eq!(
-            derive_touched_segment_ids(&block, 16),
-            Err(TouchedSegmentError::InputSlotOutOfParentDomain(1 << 16))
-        );
-    }
-
-    #[test]
-    fn expansion_upper_outputs_remain_virtual_and_are_not_hydrated() {
-        let mut header = genesis_header();
-        header.log_slots = 25;
-        let upper_slot = (1 << 24) + 7;
-        let block = Block {
-            header,
-            transactions: vec![transaction((9 << 16) + 1, true, upper_slot, true, false)],
-        };
-        assert_eq!(
-            derive_touched_segment_ids(&block, 24).unwrap(),
-            vec![9],
-            "the deterministic empty upper half has no parent MDBX payload"
-        );
-        assert!(matches!(
-            derive_touched_segment_ids(&block, 23),
-            Err(TouchedSegmentError::InvalidLogSlotsTransition { .. })
-        ));
-    }
-
-    #[test]
     fn running_job_guard_releases_pending_during_unwind() {
         let directory = tempfile::tempdir().unwrap();
         let store = MdbxStore::open(directory.path()).unwrap();
@@ -1079,26 +856,17 @@ mod tests {
     }
 
     #[test]
-    fn idle_and_pre_cancelled_polls_never_invoke_metadata_supplier() {
+    fn idle_and_pre_cancelled_polls_never_acquire_admission() {
         for cancelled_at_entry in [false, true] {
             let directory = tempfile::tempdir().unwrap();
             let store = MdbxStore::open(directory.path()).unwrap();
             let cancelled = AtomicBool::new(cancelled_at_entry);
-            let supplier_calls = AtomicUsize::new(0);
             let admission_calls = AtomicUsize::new(0);
 
-            let outcome = prepare_claim_with_admission(
-                &store,
-                &cancelled,
-                || -> Result<ChainState, &'static str> {
-                    supplier_calls.fetch_add(1, Ordering::Relaxed);
-                    Err("must not be called")
-                },
-                || {
-                    admission_calls.fetch_add(1, Ordering::Relaxed);
-                    Ok(())
-                },
-            )
+            let outcome = prepare_claim_with_admission(&store, &cancelled, || {
+                admission_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            })
             .err()
             .expect("poll must back off before preparation");
 
@@ -1115,31 +883,21 @@ mod tests {
                     release_error: None,
                 } if reason == expected
             ));
-            assert_eq!(supplier_calls.load(Ordering::Relaxed), 0);
             assert_eq!(admission_calls.load(Ordering::Relaxed), 0);
         }
     }
 
     #[test]
-    fn cancellation_after_admission_skips_supplier_and_releases_claim() {
+    fn cancellation_after_admission_releases_claim() {
         let directory = tempfile::tempdir().unwrap();
         let store = MdbxStore::open(directory.path()).unwrap();
         let queued = enqueue_height_one_job(&store);
         let cancelled = AtomicBool::new(false);
-        let supplier_calls = AtomicUsize::new(0);
 
-        let outcome = prepare_claim_with_admission(
-            &store,
-            &cancelled,
-            || -> Result<ChainState, &'static str> {
-                supplier_calls.fetch_add(1, Ordering::Relaxed);
-                Err("must not be called")
-            },
-            || {
-                cancelled.store(true, Ordering::Release);
-                Ok(())
-            },
-        )
+        let outcome = prepare_claim_with_admission(&store, &cancelled, || {
+            cancelled.store(true, Ordering::Release);
+            Ok(())
+        })
         .err()
         .expect("cancelled preparation must back off");
 
@@ -1151,44 +909,6 @@ mod tests {
                 release_error: None,
             } if identity == SelectedHistoryJobIdentity::from(queued)
         ));
-        assert_eq!(supplier_calls.load(Ordering::Relaxed), 0);
-        let released = store.get_recursive_proof_job(1).unwrap().unwrap();
-        assert_eq!(released.state, RecursiveProofJobState::Pending);
-        assert_eq!(released.attempt_counter, 1);
-    }
-
-    #[test]
-    fn metadata_supplier_failure_releases_running_claim() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = MdbxStore::open(directory.path()).unwrap();
-        enqueue_height_one_job(&store);
-        let cancelled = AtomicBool::new(false);
-        let supplier_calls = AtomicUsize::new(0);
-
-        let outcome = prepare_claim_with_admission(
-            &store,
-            &cancelled,
-            || -> Result<ChainState, &'static str> {
-                supplier_calls.fetch_add(1, Ordering::Relaxed);
-                Err("metadata unavailable")
-            },
-            || Ok(()),
-        )
-        .err()
-        .expect("supplier failure must back off");
-
-        assert!(matches!(
-            outcome,
-            SelectedHistoryWorkerOutcome::Backoff {
-                job: Some(_),
-                reason: SelectedHistoryWorkerBackoff::RetryableFailure {
-                    phase: "construct current tip metadata",
-                    ..
-                },
-                release_error: None,
-            }
-        ));
-        assert_eq!(supplier_calls.load(Ordering::Relaxed), 1);
         let released = store.get_recursive_proof_job(1).unwrap().unwrap();
         assert_eq!(released.state, RecursiveProofJobState::Pending);
         assert_eq!(released.attempt_counter, 1);
@@ -1257,15 +977,19 @@ mod tests {
         let registry_load = production
             .find(".load_pinned(expected_registry_digest)")
             .expect("transient pinned registry load");
-        let reconstruct = production
-            .find("reconstruct_historical_exact_state(")
-            .expect("bounded historical view");
-        assert!(reserve < registry_load && registry_load < load && load < reconstruct);
+        let ladder_load = production
+            .find("load_selected_history_ladder_parent_state(")
+            .expect("forward ladder parent state load");
+        assert!(reserve < registry_load && registry_load < load && load < ladder_load);
         assert_eq!(
             production
-                .matches("reconstruct_historical_exact_state(")
+                .matches("load_selected_history_ladder_parent_state(")
                 .count(),
             1
+        );
+        assert!(
+            !production.contains("reconstruct_historical_exact_state"),
+            "the worker must never roll back from the canonical tip"
         );
     }
 

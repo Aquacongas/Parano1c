@@ -30,7 +30,10 @@ use crate::header_anchor::{
     HeaderChainAnchorError,
 };
 use crate::segmented_state::SegmentColumns;
-use crate::state::{exact_segment_root_from_columns, ChainState, StreamingSparseRoot};
+use crate::state::{
+    exact_segment_root_from_columns, exact_state_root_from_segment_summaries, ChainState,
+    SelectedHistoryLadderUpdate, StreamingSparseRoot,
+};
 use crate::storage::meta::ConsensusMeta;
 use crate::storage::serial::{
     decode_chain_tip, decode_chain_work, decode_checkpoint_coverage, decode_checkpoint_package,
@@ -186,11 +189,19 @@ const T_RECURSIVE_PROOF_JOBS: &str = "recursive_proof_jobs";
 /// Opaque bounded selected recursive proof result, keyed by the same numeric
 /// big-endian height and hash-bound independently from the job record.
 const T_RECURSIVE_PROOF_RESULTS: &str = "recursive_proof_results";
+/// Forward ladder cursor payloads: the selected-history prover's own exact
+/// raw segment columns at the cursor height, independent of the canonical
+/// tip's undo window. Key: segment_id (u16 BE); value: `encode_segment`.
+const T_LADDER_SEGMENTS: &str = "ladder_segments";
+/// Single fixed-key boundary record for the forward ladder cursor. Only live
+/// segments carry summary entries; `T_LADDER_SEGMENTS` must back exactly them.
+const T_LADDER_META: &str = "ladder_meta";
 const N_TABLES: u64 = 32;
 
 // Single-entry table keys
 const KEY_TIP: &[u8] = &[0u8];
 const KEY_META: &[u8] = &[0u8];
+const KEY_LADDER_META: &[u8] = &[0u8];
 const KEY_CONSENSUS_META: &[u8] = &[0u8];
 const KEY_CHECKPOINT_COVERAGE: &[u8] = &[0u8];
 const KEY_SELECTED_HISTORY_COVERAGE: &[u8] = &[1u8];
@@ -331,6 +342,30 @@ impl MdbxHistoricalReadSnapshot<'_> {
         let raw: Option<Vec<u8>> = self.txn.get(&table, &segment_id.to_le_bytes())?;
         raw.map(|raw| {
             decode_segment(&raw).ok_or(StoreError::Decode("invalid stored historical segment"))
+        })
+        .transpose()
+    }
+
+    pub(super) fn get_selected_history_ladder_meta(
+        &self,
+    ) -> Result<Option<SelectedHistoryLadderMeta>, StoreError> {
+        let table = self.txn.open_table(Some(T_LADDER_META))?;
+        let raw: Option<Vec<u8>> = self.txn.get(&table, KEY_LADDER_META)?;
+        raw.map(|raw| {
+            decode_selected_history_ladder_meta(&raw)
+                .ok_or(StoreError::Decode("invalid selected-history ladder meta"))
+        })
+        .transpose()
+    }
+
+    pub(super) fn get_selected_history_ladder_segment(
+        &self,
+        segment_id: u16,
+    ) -> Result<Option<(u8, SegmentColumns)>, StoreError> {
+        let table = self.txn.open_table(Some(T_LADDER_SEGMENTS))?;
+        let raw: Option<Vec<u8>> = self.txn.get(&table, &ladder_segment_key(segment_id))?;
+        raw.map(|raw| {
+            decode_segment(&raw).ok_or(StoreError::Decode("invalid stored ladder segment"))
         })
         .transpose()
     }
@@ -816,6 +851,550 @@ fn decode_selected_history_coverage(bytes: &[u8]) -> Option<SelectedHistoryCover
         height: u64::from_le_bytes(bytes[4..12].try_into().ok()?),
         block_hash: bytes[12..44].try_into().ok()?,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Selected-history forward ladder cursor
+// ---------------------------------------------------------------------------
+
+const SELECTED_HISTORY_LADDER_META_MAGIC: [u8; 4] = *b"SLM1";
+const SELECTED_HISTORY_LADDER_META_HEADER_BYTES: usize = 4 + 8 + 32 + 4 + 8 + 8 + 2;
+const SELECTED_HISTORY_LADDER_META_ENTRY_BYTES: usize = 2 + 4 + 32;
+
+/// Durable boundary of the selected-history forward ladder cursor.
+///
+/// `segment_summaries` holds `(segment_id, live_count, exact_segment_root)`
+/// for every live segment at the covered height, strictly ascending. The raw
+/// columns live in `T_LADDER_SEGMENTS` under the same segment identities.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedHistoryLadderMeta {
+    pub height: u64,
+    pub block_hash: [u8; 32],
+    pub log_slots: u32,
+    pub active_slot_count: u64,
+    pub alloc_counter: u64,
+    pub segment_summaries: Vec<(u16, u32, [u8; 32])>,
+}
+
+#[inline]
+fn ladder_segment_key(segment_id: u16) -> [u8; 2] {
+    segment_id.to_be_bytes()
+}
+
+#[inline]
+fn ladder_segment_domain(log_slots: u32) -> Option<usize> {
+    if log_slots == 0 || log_slots > crate::consensus::params::LOG_SLOTS_MAX {
+        return None;
+    }
+    if log_slots <= crate::consensus::params::LOG_SEGMENT_SIZE {
+        return Some(1);
+    }
+    1usize.checked_shl(log_slots - crate::consensus::params::LOG_SEGMENT_SIZE)
+}
+
+#[inline]
+fn ladder_effective_log(log_slots: u32) -> u8 {
+    log_slots.min(crate::consensus::params::LOG_SEGMENT_SIZE) as u8
+}
+
+fn encode_selected_history_ladder_meta(
+    meta: &SelectedHistoryLadderMeta,
+) -> Result<Vec<u8>, StoreError> {
+    let entry_count = u16::try_from(meta.segment_summaries.len())
+        .map_err(|_| StoreError::Decode("ladder meta summary count exceeds the record format"))?;
+    let mut encoded = Vec::with_capacity(
+        SELECTED_HISTORY_LADDER_META_HEADER_BYTES
+            + meta.segment_summaries.len() * SELECTED_HISTORY_LADDER_META_ENTRY_BYTES,
+    );
+    encoded.extend_from_slice(&SELECTED_HISTORY_LADDER_META_MAGIC);
+    encoded.extend_from_slice(&meta.height.to_le_bytes());
+    encoded.extend_from_slice(&meta.block_hash);
+    encoded.extend_from_slice(&meta.log_slots.to_le_bytes());
+    encoded.extend_from_slice(&meta.active_slot_count.to_le_bytes());
+    encoded.extend_from_slice(&meta.alloc_counter.to_le_bytes());
+    encoded.extend_from_slice(&entry_count.to_le_bytes());
+    for &(segment_id, live_count, exact_root) in &meta.segment_summaries {
+        encoded.extend_from_slice(&segment_id.to_le_bytes());
+        encoded.extend_from_slice(&live_count.to_le_bytes());
+        encoded.extend_from_slice(&exact_root);
+    }
+    Ok(encoded)
+}
+
+fn decode_selected_history_ladder_meta(bytes: &[u8]) -> Option<SelectedHistoryLadderMeta> {
+    if bytes.len() < SELECTED_HISTORY_LADDER_META_HEADER_BYTES
+        || bytes[..4] != SELECTED_HISTORY_LADDER_META_MAGIC
+    {
+        return None;
+    }
+    let height = u64::from_le_bytes(bytes[4..12].try_into().ok()?);
+    let block_hash: [u8; 32] = bytes[12..44].try_into().ok()?;
+    let log_slots = u32::from_le_bytes(bytes[44..48].try_into().ok()?);
+    let active_slot_count = u64::from_le_bytes(bytes[48..56].try_into().ok()?);
+    let alloc_counter = u64::from_le_bytes(bytes[56..64].try_into().ok()?);
+    let entry_count = usize::from(u16::from_le_bytes(bytes[64..66].try_into().ok()?));
+
+    let domain = ladder_segment_domain(log_slots)?;
+    let capacity = 1u64.checked_shl(log_slots)?;
+    if entry_count > domain
+        || active_slot_count > capacity
+        || active_slot_count > alloc_counter
+        || bytes.len()
+            != SELECTED_HISTORY_LADDER_META_HEADER_BYTES
+                .checked_add(entry_count.checked_mul(SELECTED_HISTORY_LADDER_META_ENTRY_BYTES)?)?
+    {
+        return None;
+    }
+
+    let mut segment_summaries = Vec::with_capacity(entry_count);
+    let mut counted_live = 0u64;
+    let mut previous_segment = None;
+    for index in 0..entry_count {
+        let offset = SELECTED_HISTORY_LADDER_META_HEADER_BYTES
+            + index * SELECTED_HISTORY_LADDER_META_ENTRY_BYTES;
+        let segment_id = u16::from_le_bytes(bytes[offset..offset + 2].try_into().ok()?);
+        let live_count = u32::from_le_bytes(bytes[offset + 2..offset + 6].try_into().ok()?);
+        let exact_root: [u8; 32] = bytes[offset + 6..offset + 38].try_into().ok()?;
+        if live_count == 0
+            || usize::from(segment_id) >= domain
+            || previous_segment.is_some_and(|previous| previous >= segment_id)
+        {
+            return None;
+        }
+        previous_segment = Some(segment_id);
+        counted_live = counted_live.checked_add(u64::from(live_count))?;
+        segment_summaries.push((segment_id, live_count, exact_root));
+    }
+    if counted_live != active_slot_count {
+        return None;
+    }
+
+    Some(SelectedHistoryLadderMeta {
+        height,
+        block_hash,
+        log_slots,
+        active_slot_count,
+        alloc_counter,
+        segment_summaries,
+    })
+}
+
+fn selected_history_ladder_meta_in_rw_txn(
+    txn: &Transaction<'_, RW, NoWriteMap>,
+) -> Result<Option<SelectedHistoryLadderMeta>, StoreError> {
+    let table = txn.open_table(Some(T_LADDER_META))?;
+    let raw: Option<Vec<u8>> = txn.get(&table, KEY_LADDER_META)?;
+    raw.map(|raw| {
+        decode_selected_history_ladder_meta(&raw)
+            .ok_or(StoreError::Decode("invalid selected-history ladder meta"))
+    })
+    .transpose()
+}
+
+fn clear_selected_history_ladder_cursor_in_rw_txn(
+    txn: &Transaction<'_, RW, NoWriteMap>,
+) -> Result<(), StoreError> {
+    for name in [T_LADDER_META, T_LADDER_SEGMENTS] {
+        let table = txn.open_table(Some(name))?;
+        txn.clear_table(&table)?;
+    }
+    Ok(())
+}
+
+/// Validate one ladder cursor advance against its canonical header and apply
+/// it. A self-contained update (dirty columns cover every live segment)
+/// atomically replaces the whole cursor; a layered update requires the exact
+/// predecessor boundary to already be durable.
+fn apply_selected_history_ladder_update_in_rw_txn(
+    txn: &Transaction<'_, RW, NoWriteMap>,
+    header: &BlockHeader,
+    block_hash: [u8; 32],
+    update: &SelectedHistoryLadderUpdate,
+) -> Result<(), StoreError> {
+    if update.log_slots != header.log_slots
+        || update.active_slot_count != header.active_slot_count
+        || update.alloc_counter != header.alloc_counter
+        || update.state_root != header.state_root
+    {
+        return Err(StoreError::Decode(
+            "ladder update does not match its canonical header",
+        ));
+    }
+    let domain = ladder_segment_domain(header.log_slots).ok_or(StoreError::Decode(
+        "ladder update header slot depth is outside the consensus domain",
+    ))?;
+    let effective_log = ladder_effective_log(header.log_slots);
+    let segment_len = 1usize << effective_log;
+
+    let mut counted_live = 0u64;
+    let mut previous_segment = None;
+    for &(segment_id, live_count, _) in &update.segment_summaries {
+        if live_count == 0
+            || usize::from(segment_id) >= domain
+            || previous_segment.is_some_and(|previous| previous >= segment_id)
+        {
+            return Err(StoreError::Decode(
+                "ladder update segment summaries are malformed",
+            ));
+        }
+        previous_segment = Some(segment_id);
+        counted_live = counted_live
+            .checked_add(u64::from(live_count))
+            .ok_or(StoreError::Decode("ladder update live count overflow"))?;
+    }
+    if counted_live != header.active_slot_count {
+        return Err(StoreError::Decode(
+            "ladder update live counts disagree with the canonical header",
+        ));
+    }
+    let exact_entries: Vec<(u16, [u8; 32])> = update
+        .segment_summaries
+        .iter()
+        .map(|&(segment_id, _, exact_root)| (segment_id, exact_root))
+        .collect();
+    if exact_state_root_from_segment_summaries(header.log_slots as usize, &exact_entries)
+        != Some(header.state_root)
+    {
+        return Err(StoreError::Decode(
+            "ladder update summaries do not commit to the header state root",
+        ));
+    }
+
+    let mut previous_dirty = None;
+    for (segment_id, columns) in &update.dirty_segments {
+        if usize::from(*segment_id) >= domain
+            || previous_dirty.is_some_and(|previous| previous >= *segment_id)
+        {
+            return Err(StoreError::Decode(
+                "ladder update dirty segments are malformed",
+            ));
+        }
+        previous_dirty = Some(*segment_id);
+        let live = update
+            .segment_summaries
+            .binary_search_by_key(segment_id, |&(id, _, _)| id)
+            .is_ok();
+        match (live, columns) {
+            (true, Some(columns)) => {
+                if columns.values.len() != segment_len
+                    || columns.owners_hi.len() != segment_len
+                    || columns.owners_lo.len() != segment_len
+                    || segment_columns_empty(columns)
+                {
+                    return Err(StoreError::Decode(
+                        "ladder update dirty columns do not match their summary",
+                    ));
+                }
+            }
+            (false, None) => {}
+            _ => {
+                return Err(StoreError::Decode(
+                    "ladder update dirty payload presence disagrees with its summary",
+                ));
+            }
+        }
+    }
+
+    let self_contained = update.segment_summaries.iter().all(|&(segment_id, _, _)| {
+        update
+            .dirty_segments
+            .binary_search_by_key(&segment_id, |(id, _)| *id)
+            .is_ok()
+    });
+    if self_contained {
+        clear_selected_history_ladder_cursor_in_rw_txn(txn)?;
+    } else {
+        let previous = selected_history_ladder_meta_in_rw_txn(txn)?.ok_or(StoreError::Decode(
+            "layered ladder update requires an existing cursor boundary",
+        ))?;
+        if previous.height.checked_add(1) != Some(header.height)
+            || previous.block_hash != header.prev_block_hash
+        {
+            return Err(StoreError::Decode(
+                "ladder update is not the exact successor of the durable cursor",
+            ));
+        }
+        if ladder_effective_log(previous.log_slots) != effective_log
+            || (header.log_slots != previous.log_slots
+                && header.log_slots != previous.log_slots.saturating_add(1))
+        {
+            return Err(StoreError::Decode(
+                "ladder update slot-domain transition is invalid",
+            ));
+        }
+    }
+
+    let segments = txn.open_table(Some(T_LADDER_SEGMENTS))?;
+    for (segment_id, columns) in &update.dirty_segments {
+        let key = ladder_segment_key(*segment_id);
+        match columns {
+            None => {
+                let _ = txn.del(&segments, key, None);
+            }
+            Some(columns) => {
+                txn.put(
+                    &segments,
+                    key,
+                    encode_segment(columns, effective_log),
+                    WriteFlags::empty(),
+                )?;
+            }
+        }
+    }
+    let meta_table = txn.open_table(Some(T_LADDER_META))?;
+    txn.put(
+        &meta_table,
+        KEY_LADDER_META,
+        encode_selected_history_ladder_meta(&SelectedHistoryLadderMeta {
+            height: header.height,
+            block_hash,
+            log_slots: header.log_slots,
+            active_slot_count: header.active_slot_count,
+            alloc_counter: header.alloc_counter,
+            segment_summaries: update.segment_summaries.clone(),
+        })?,
+        WriteFlags::empty(),
+    )?;
+    Ok(())
+}
+
+/// Roll the ladder cursor back to the reorg ancestor inside the caller's
+/// canonical write transaction, using the same undo logs the reorg consumes.
+///
+/// Any local inconsistency clears the cursor instead of failing the reorg;
+/// the fail-closed bootstrap rebuilds it afterwards. Only MDBX-level errors
+/// propagate. Must run before the transaction truncates old undo records.
+fn rewind_selected_history_ladder_cursor(
+    txn: &Transaction<'_, RW, NoWriteMap>,
+    ancestor_height: u64,
+) -> Result<(), StoreError> {
+    let meta_table = txn.open_table(Some(T_LADDER_META))?;
+    let raw: Option<Vec<u8>> = txn.get(&meta_table, KEY_LADDER_META)?;
+    let Some(raw) = raw else {
+        return Ok(());
+    };
+    let Some(meta) = decode_selected_history_ladder_meta(&raw) else {
+        return clear_selected_history_ladder_cursor_in_rw_txn(txn);
+    };
+    if meta.height <= ancestor_height {
+        return Ok(());
+    }
+    match rewind_selected_history_ladder_cursor_inner(txn, ancestor_height, meta) {
+        Ok(()) => Ok(()),
+        Err(StoreError::Decode(_)) => clear_selected_history_ladder_cursor_in_rw_txn(txn),
+        Err(error) => Err(error),
+    }
+}
+
+fn rewind_selected_history_ladder_cursor_inner(
+    txn: &Transaction<'_, RW, NoWriteMap>,
+    ancestor_height: u64,
+    meta: SelectedHistoryLadderMeta,
+) -> Result<(), StoreError> {
+    use crate::consensus::params::{BLOCK_MAX_ACTIONS, UNDO_RETENTION_DEPTH};
+    use crate::fri_state::SlotValue;
+
+    if meta.height - ancestor_height > UNDO_RETENTION_DEPTH {
+        return Err(StoreError::Decode(
+            "ladder rewind depth exceeds the retained undo window",
+        ));
+    }
+    let headers = txn.open_table(Some(T_HEADERS))?;
+    let ancestor_raw: Option<Vec<u8>> = txn.get(&headers, &u64_key(ancestor_height))?;
+    let ancestor = ancestor_raw
+        .as_deref()
+        .and_then(decode_header)
+        .filter(|header| header.height == ancestor_height)
+        .ok_or(StoreError::Decode(
+            "ladder rewind ancestor header is missing",
+        ))?;
+    let effective_log = ladder_effective_log(meta.log_slots);
+    if ladder_effective_log(ancestor.log_slots) != effective_log
+        || ancestor.log_slots > meta.log_slots
+    {
+        return Err(StoreError::Decode(
+            "ladder rewind slot-domain transition is unsupported",
+        ));
+    }
+    let meta_domain = ladder_segment_domain(meta.log_slots)
+        .ok_or(StoreError::Decode("ladder rewind cursor domain is invalid"))?;
+    let ancestor_domain = ladder_segment_domain(ancestor.log_slots).ok_or(StoreError::Decode(
+        "ladder rewind ancestor domain is invalid",
+    ))?;
+
+    // Group pre-images newest-first exactly like historical reconstruction.
+    let undo_table = txn.open_table(Some(T_UNDO_LOGS))?;
+    let mut grouped: std::collections::BTreeMap<u16, Vec<(u32, SlotValue)>> =
+        std::collections::BTreeMap::new();
+    for height in (ancestor_height + 1..=meta.height).rev() {
+        let undo_raw: Option<Vec<u8>> = txn.get(&undo_table, &u64_key(height))?;
+        let undo = undo_raw
+            .as_deref()
+            .and_then(decode_undo_log)
+            .filter(|undo| undo.block_height == height)
+            .ok_or(StoreError::Decode("ladder rewind undo log is missing"))?;
+        if undo.slot_changes.len() > BLOCK_MAX_ACTIONS {
+            return Err(StoreError::Decode("ladder rewind undo log is oversized"));
+        }
+        if height == ancestor_height + 1
+            && (undo.log_slots_before != ancestor.log_slots
+                || undo.active_slot_count_before != ancestor.active_slot_count
+                || undo.alloc_counter_before != ancestor.alloc_counter)
+        {
+            return Err(StoreError::Decode(
+                "ladder rewind undo boundary does not match the ancestor header",
+            ));
+        }
+        for &(slot_index, previous) in undo.slot_changes.iter().rev() {
+            let segment_id = (slot_index >> effective_log) as u16;
+            if usize::from(segment_id) >= meta_domain {
+                return Err(StoreError::Decode(
+                    "ladder rewind undo slot lies outside the cursor domain",
+                ));
+            }
+            grouped
+                .entry(segment_id)
+                .or_default()
+                .push((slot_index, previous));
+        }
+    }
+
+    let mut summaries: std::collections::BTreeMap<u16, (u32, [u8; 32])> = meta
+        .segment_summaries
+        .iter()
+        .map(|&(segment_id, live_count, exact_root)| (segment_id, (live_count, exact_root)))
+        .collect();
+    let segments = txn.open_table(Some(T_LADDER_SEGMENTS))?;
+    let segment_len = 1usize << effective_log;
+    let local_mask = (1u32 << effective_log) - 1;
+    for (segment_id, changes) in grouped {
+        let key = ladder_segment_key(segment_id);
+        let record: Option<Vec<u8>> = txn.get(&segments, &key)?;
+        let mut columns = match record {
+            Some(record) => {
+                let (stored_log, columns) = decode_segment(&record).ok_or(StoreError::Decode(
+                    "ladder rewind stored segment is invalid",
+                ))?;
+                if stored_log != effective_log || columns.values.len() != segment_len {
+                    return Err(StoreError::Decode(
+                        "ladder rewind stored segment shape mismatch",
+                    ));
+                }
+                if !summaries.contains_key(&segment_id) {
+                    return Err(StoreError::Decode(
+                        "ladder rewind found a payload for an empty segment",
+                    ));
+                }
+                columns
+            }
+            None => {
+                if summaries.contains_key(&segment_id) {
+                    return Err(StoreError::Decode(
+                        "ladder rewind live segment has no payload",
+                    ));
+                }
+                SegmentColumns::new_zero(segment_len)
+            }
+        };
+        let mut live_count = 0u32;
+        for &(slot_index, previous) in &changes {
+            let local = (slot_index & local_mask) as usize;
+            columns.values[local] = previous.value;
+            columns.owners_hi[local] = previous.owner_hi;
+            columns.owners_lo[local] = previous.owner_lo;
+        }
+        for local in 0..segment_len {
+            let slot = SlotValue {
+                value: columns.values[local],
+                owner_hi: columns.owners_hi[local],
+                owner_lo: columns.owners_lo[local],
+            };
+            if !slot.is_empty() {
+                live_count = live_count
+                    .checked_add(1)
+                    .ok_or(StoreError::Decode("ladder rewind live count overflow"))?;
+            }
+        }
+        if live_count == 0 {
+            let _ = txn.del(&segments, key, None);
+            summaries.remove(&segment_id);
+        } else {
+            txn.put(
+                &segments,
+                key,
+                encode_segment(&columns, effective_log),
+                WriteFlags::empty(),
+            )?;
+            summaries.insert(
+                segment_id,
+                (
+                    live_count,
+                    exact_segment_root_from_columns(usize::from(effective_log), &columns),
+                ),
+            );
+        }
+    }
+
+    // A rewind across an expansion shrinks the domain; the discarded upper
+    // half must already be canonical zero.
+    if summaries
+        .keys()
+        .any(|segment_id| usize::from(*segment_id) >= ancestor_domain)
+    {
+        return Err(StoreError::Decode(
+            "ladder rewind upper-half segment is still live below the expansion",
+        ));
+    }
+    if ancestor_domain < meta_domain {
+        let mut stale = Vec::new();
+        {
+            let mut cursor = txn.cursor(&segments)?;
+            let mut item: Option<(Vec<u8>, ())> =
+                cursor.set_range(&ladder_segment_key(ancestor_domain as u16))?;
+            while let Some((key, ())) = item {
+                stale.push(key);
+                item = cursor.next()?;
+            }
+        }
+        for key in stale {
+            txn.del(&segments, &key, None)?;
+        }
+    }
+
+    let mut counted_live = 0u64;
+    let mut segment_summaries = Vec::with_capacity(summaries.len());
+    let mut exact_entries = Vec::with_capacity(summaries.len());
+    for (segment_id, (live_count, exact_root)) in summaries {
+        counted_live = counted_live
+            .checked_add(u64::from(live_count))
+            .ok_or(StoreError::Decode("ladder rewind live count overflow"))?;
+        segment_summaries.push((segment_id, live_count, exact_root));
+        exact_entries.push((segment_id, exact_root));
+    }
+    if counted_live != ancestor.active_slot_count
+        || exact_state_root_from_segment_summaries(ancestor.log_slots as usize, &exact_entries)
+            != Some(ancestor.state_root)
+    {
+        return Err(StoreError::Decode(
+            "ladder rewind does not commit to the ancestor header",
+        ));
+    }
+
+    let meta_table = txn.open_table(Some(T_LADDER_META))?;
+    txn.put(
+        &meta_table,
+        KEY_LADDER_META,
+        encode_selected_history_ladder_meta(&SelectedHistoryLadderMeta {
+            height: ancestor_height,
+            block_hash: crate::block_header::block_id(&ancestor),
+            log_slots: ancestor.log_slots,
+            active_slot_count: ancestor.active_slot_count,
+            alloc_counter: ancestor.alloc_counter,
+            segment_summaries,
+        })?,
+        WriteFlags::empty(),
+    )?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1579,12 +2158,15 @@ impl MdbxStore {
             T_CHECKPOINT_COVERAGE,
             T_RECURSIVE_PROOF_JOBS,
             T_RECURSIVE_PROOF_RESULTS,
+            T_LADDER_SEGMENTS,
+            T_LADDER_META,
         ] {
             txn.create_table(Some(name), TableFlags::empty())?;
         }
         txn.commit()?;
         let store = Self { db: Arc::new(db) };
         store.reset_running_recursive_proof_jobs()?;
+        store.validate_selected_history_ladder_cursor_on_open()?;
         Ok(store)
     }
 
@@ -2016,20 +2598,24 @@ impl MdbxStore {
         block_hash: [u8; 32],
         result: &[u8],
     ) -> Result<RecursiveProofJob, StoreError> {
-        self.complete_recursive_proof_job_inner(height, block_hash, result, false)
+        self.complete_recursive_proof_job_inner(height, block_hash, result, None)
     }
 
     /// Atomically complete one locally verified selected terminal package and
     /// advance its fixed-width serving pointer. The pointer never owns proof
     /// bytes, and promotion checks the immediately preceding completed job
     /// without loading its envelope.
+    ///
+    /// `ladder` is the proven block's end-state cursor advance; it commits in
+    /// this same transaction so the forward ladder can never lag coverage.
     pub fn complete_recursive_proof_job_and_promote_selected_history(
         &self,
         height: u64,
         block_hash: [u8; 32],
         result: &[u8],
+        ladder: &SelectedHistoryLadderUpdate,
     ) -> Result<RecursiveProofJob, StoreError> {
-        self.complete_recursive_proof_job_inner(height, block_hash, result, true)
+        self.complete_recursive_proof_job_inner(height, block_hash, result, Some(ladder))
     }
 
     fn complete_recursive_proof_job_inner(
@@ -2037,8 +2623,9 @@ impl MdbxStore {
         height: u64,
         block_hash: [u8; 32],
         result: &[u8],
-        promote_selected_history: bool,
+        ladder: Option<&SelectedHistoryLadderUpdate>,
     ) -> Result<RecursiveProofJob, StoreError> {
+        let promote_selected_history = ladder.is_some();
         if promote_selected_history {
             if result.len() > crate::consensus::wire_limits::MAX_HISTORY_PROOF_BYTES {
                 return Err(StoreError::Decode(
@@ -2154,7 +2741,7 @@ impl MdbxStore {
             encode_recursive_proof_job(&job),
             WriteFlags::empty(),
         )?;
-        if promote_selected_history {
+        if let Some(ladder) = ladder {
             let coverage = txn.open_table(Some(T_CHECKPOINT_COVERAGE))?;
             txn.put(
                 &coverage,
@@ -2162,6 +2749,7 @@ impl MdbxStore {
                 encode_selected_history_coverage(SelectedHistoryCoverage { height, block_hash }),
                 WriteFlags::empty(),
             )?;
+            apply_selected_history_ladder_update_in_rw_txn(&txn, &header, block_hash, ladder)?;
         }
         #[cfg(test)]
         if promote_selected_history {
@@ -2809,6 +3397,132 @@ impl MdbxStore {
         Ok(reset)
     }
 
+    /// Read the durable forward ladder cursor boundary, if any.
+    pub fn get_selected_history_ladder_meta(
+        &self,
+    ) -> Result<Option<SelectedHistoryLadderMeta>, StoreError> {
+        self.historical_read_snapshot()?
+            .get_selected_history_ladder_meta()
+    }
+
+    /// Advance the forward ladder cursor by one canonical block without
+    /// completing any proof job. Bootstrap fast-forward uses this to rebuild
+    /// the cursor from retained canonical blocks; promotion advances it inside
+    /// the same transaction as the proof result instead.
+    pub(crate) fn advance_selected_history_ladder_cursor(
+        &self,
+        header: &BlockHeader,
+        update: &SelectedHistoryLadderUpdate,
+    ) -> Result<(), StoreError> {
+        let txn = self.db.begin_rw_txn()?;
+        let headers = txn.open_table(Some(T_HEADERS))?;
+        let stored_raw: Option<Vec<u8>> = txn.get(&headers, &u64_key(header.height))?;
+        if stored_raw.as_deref().and_then(decode_header).as_ref() != Some(header) {
+            return Err(StoreError::Decode(
+                "ladder cursor advance header is not canonical",
+            ));
+        }
+        apply_selected_history_ladder_update_in_rw_txn(
+            &txn,
+            header,
+            crate::block_header::block_id(header),
+            update,
+        )?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Whether a retained block body exists at `height`, without loading it.
+    pub(crate) fn has_recent_block(&self, height: u64) -> Result<bool, StoreError> {
+        let txn = self.db.begin_ro_txn()?;
+        let table = txn.open_table(Some(T_RECENT_BLOCKS))?;
+        let length: Option<ObjectLength> = txn.get(&table, &u64_key(height))?;
+        Ok(length.is_some())
+    }
+
+    /// Startup validation: the ladder cursor boundary must decode and match
+    /// the canonical header at its height; otherwise it is cleared so the
+    /// fail-closed bootstrap rebuilds it. Segment payloads stay lazily
+    /// root-checked at load time.
+    fn validate_selected_history_ladder_cursor_on_open(&self) -> Result<(), StoreError> {
+        let txn = self.db.begin_rw_txn()?;
+        let meta_table = txn.open_table(Some(T_LADDER_META))?;
+        let raw: Option<Vec<u8>> = txn.get(&meta_table, KEY_LADDER_META)?;
+        let Some(raw) = raw else {
+            txn.commit()?;
+            return Ok(());
+        };
+        let headers = txn.open_table(Some(T_HEADERS))?;
+        let valid = decode_selected_history_ladder_meta(&raw).is_some_and(|meta| {
+            let header = txn
+                .get::<Vec<u8>>(&headers, &u64_key(meta.height))
+                .ok()
+                .flatten()
+                .as_deref()
+                .and_then(decode_header);
+            let exact_entries: Vec<(u16, [u8; 32])> = meta
+                .segment_summaries
+                .iter()
+                .map(|&(segment_id, _, exact_root)| (segment_id, exact_root))
+                .collect();
+            header.is_some_and(|header| {
+                header.height == meta.height
+                    && crate::block_header::block_id(&header) == meta.block_hash
+                    && header.log_slots == meta.log_slots
+                    && header.active_slot_count == meta.active_slot_count
+                    && header.alloc_counter == meta.alloc_counter
+                    && exact_state_root_from_segment_summaries(
+                        meta.log_slots as usize,
+                        &exact_entries,
+                    ) == Some(header.state_root)
+            })
+        });
+        if !valid {
+            clear_selected_history_ladder_cursor_in_rw_txn(&txn)?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn put_raw_selected_history_ladder_meta_for_test(
+        &self,
+        bytes: &[u8],
+    ) -> Result<(), StoreError> {
+        let txn = self.db.begin_rw_txn()?;
+        let table = txn.open_table(Some(T_LADDER_META))?;
+        txn.put(&table, KEY_LADDER_META, bytes, WriteFlags::empty())?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn put_raw_selected_history_ladder_segment_for_test(
+        &self,
+        segment_id: u16,
+        bytes: &[u8],
+    ) -> Result<(), StoreError> {
+        let txn = self.db.begin_rw_txn()?;
+        let table = txn.open_table(Some(T_LADDER_SEGMENTS))?;
+        txn.put(
+            &table,
+            ladder_segment_key(segment_id),
+            bytes,
+            WriteFlags::empty(),
+        )?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn delete_undo_log_for_test(&self, height: u64) -> Result<(), StoreError> {
+        let txn = self.db.begin_rw_txn()?;
+        let table = txn.open_table(Some(T_UNDO_LOGS))?;
+        let _ = txn.del(&table, u64_key(height), None);
+        txn.commit()?;
+        Ok(())
+    }
+
     /// Delete every job and result strictly above a retained canonical
     /// ancestor. Used by reorg and explicit epoch-reset paths.
     pub fn delete_recursive_proof_jobs_above(
@@ -2838,6 +3552,7 @@ impl MdbxStore {
                 }
             }
         }
+        rewind_selected_history_ladder_cursor(&txn, ancestor_height)?;
         rewind_selected_history_coverage(&txn, ancestor_height)?;
         rewind_retained_payload_prune_watermark(&txn, ancestor_height)?;
         authoritative_mutation_boundary!(DeleteAboveBeforeCommit);
@@ -4154,6 +4869,8 @@ impl MdbxStore {
             T_CHECKPOINT_COVERAGE,
             T_RECURSIVE_PROOF_JOBS,
             T_RECURSIVE_PROOF_RESULTS,
+            T_LADDER_SEGMENTS,
+            T_LADDER_META,
         ] {
             let table = txn.open_table(Some(name))?;
             txn.clear_table(&table)?;
@@ -4164,6 +4881,7 @@ impl MdbxStore {
         // a later selected-coverage jump never rescans the absent prefix.
         set_retained_payload_prune_watermark(&txn, tip_header.height)?;
 
+        let seed_ladder_cursor = selected_history.is_some();
         if let Some((seed, encoded_result)) = selected_history {
             let job = RecursiveProofJob {
                 height: seed.height,
@@ -4196,6 +4914,8 @@ impl MdbxStore {
 
         let segment_tbl = txn.open_table(Some(T_SEGMENTS))?;
         let owner_tbl = txn.open_table(Some(T_OWNER_INDEX))?;
+        let ladder_segment_tbl = txn.open_table(Some(T_LADDER_SEGMENTS))?;
+        let mut ladder_summaries = Vec::with_capacity(staging.descriptors().len());
         for staged_file in staging.encoded_files() {
             let descriptor = *staged_file.descriptor();
             if previous_segment.is_some_and(|previous| previous >= descriptor.segment_id) {
@@ -4293,10 +5013,20 @@ impl MdbxStore {
             segmented
                 .install_evicted_segment_summary(descriptor.segment_id, segment_live, fri_root)
                 .map_err(StoreError::Decode)?;
-            exact_segment_roots.push((
-                descriptor.segment_id,
-                exact_segment_root_from_columns(effective_log as usize, &columns),
-            ));
+            let exact_root = exact_segment_root_from_columns(effective_log as usize, &columns);
+            exact_segment_roots.push((descriptor.segment_id, exact_root));
+            if seed_ladder_cursor {
+                // The recursive boundary seed makes this snapshot the prover's
+                // next Link predecessor; the same validated payloads seed the
+                // forward ladder cursor at the identical boundary.
+                txn.put(
+                    &ladder_segment_tbl,
+                    ladder_segment_key(descriptor.segment_id),
+                    &encoded,
+                    WriteFlags::empty(),
+                )?;
+                ladder_summaries.push((descriptor.segment_id, segment_live, exact_root));
+            }
             // `columns` and `encoded` drop here before the iterator opens the
             // next file. Only compact roots/counts survive the pass.
         }
@@ -4323,6 +5053,22 @@ impl MdbxStore {
             &exact_segment_roots,
         )
         .map_err(|_| StoreError::Decode("staged snapshot compact exact cache mismatch"))?;
+        if seed_ladder_cursor {
+            let ladder_meta_tbl = txn.open_table(Some(T_LADDER_META))?;
+            txn.put(
+                &ladder_meta_tbl,
+                KEY_LADDER_META,
+                encode_selected_history_ladder_meta(&SelectedHistoryLadderMeta {
+                    height: tip_header.height,
+                    block_hash: tip_hash,
+                    log_slots: tip_header.log_slots,
+                    active_slot_count: tip_header.active_slot_count,
+                    alloc_counter: tip_header.alloc_counter,
+                    segment_summaries: ladder_summaries,
+                })?,
+                WriteFlags::empty(),
+            )?;
+        }
 
         let tip_tbl = txn.open_table(Some(T_CHAIN_TIP))?;
         txn.put(
@@ -5109,6 +5855,12 @@ impl MdbxStore {
             txn.del(&seg_tbl, &key, None)?;
         }
 
+        // Roll the prover's forward ladder cursor back to the ancestor while
+        // this transaction still holds the reverted branch's undo logs; the
+        // truncation below deletes them. Reorgs deeper than the retained undo
+        // window are rejected upstream, so the rewind is always in range.
+        rewind_selected_history_ladder_cursor(&txn, ancestor_height)?;
+
         // Remove every old canonical height record above the ancestor before
         // installing the replacement.  Hash and tx indexes are cleaned in the
         // same transaction, so shorter replacement branches cannot expose a
@@ -5486,6 +6238,8 @@ impl MdbxStore {
             T_CHECKPOINT_COVERAGE,
             T_RECURSIVE_PROOF_JOBS,
             T_RECURSIVE_PROOF_RESULTS,
+            T_LADDER_SEGMENTS,
+            T_LADDER_META,
         ];
         for name in tables {
             let tbl = txn.open_table(Some(name))?;
@@ -5711,6 +6465,20 @@ mod tests {
 
     fn selected_terminal_bytes(height: u64, block_hash: [u8; 32]) -> Vec<u8> {
         selected_terminal_bytes_for_tier(height, block_hash, RecursiveProofJobTier::B8)
+    }
+
+    /// Ladder advance for synthetic fixture headers that carry the canonical
+    /// empty state. Its empty dirty set is trivially self-contained, so no
+    /// predecessor cursor boundary needs seeding.
+    fn empty_ladder_update(header: &BlockHeader) -> SelectedHistoryLadderUpdate {
+        SelectedHistoryLadderUpdate {
+            log_slots: header.log_slots,
+            active_slot_count: header.active_slot_count,
+            alloc_counter: header.alloc_counter,
+            state_root: header.state_root,
+            segment_summaries: Vec::new(),
+            dirty_segments: Vec::new(),
+        }
     }
 
     fn selected_terminal_bytes_for_tier(
@@ -6185,6 +6953,7 @@ mod tests {
                 1,
                 hash,
                 &selected_terminal_bytes(1, hash),
+                &empty_ladder_update(&chain[1].0),
             )
             .unwrap();
         store.prune_after_commit(pruning_height).unwrap();
@@ -6582,6 +7351,7 @@ mod tests {
                 1,
                 first_hash,
                 b"opaque-not-a-terminal-package",
+                &empty_ladder_update(&first_header),
             )
             .is_err());
         assert!(store.get_selected_history_coverage().unwrap().is_none());
@@ -6592,6 +7362,7 @@ mod tests {
                 1,
                 first_hash,
                 &first_terminal,
+                &empty_ladder_update(&first_header),
             )
             .unwrap();
         assert_eq!(
@@ -6627,6 +7398,7 @@ mod tests {
                 2,
                 second_hash,
                 &second_terminal,
+                &empty_ladder_update(&second_header),
             )
             .unwrap();
         assert_eq!(
@@ -6706,6 +7478,7 @@ mod tests {
                 2,
                 second_hash,
                 &selected_terminal_bytes(2, second_hash),
+                &empty_ladder_update(&second_header),
             )
             .is_err());
         assert!(store.get_selected_history_coverage().unwrap().is_none());
@@ -6754,6 +7527,7 @@ mod tests {
                 1,
                 first_hash,
                 &selected_terminal_bytes(1, first_hash),
+                &empty_ladder_update(&chain[1].0),
             )
             .unwrap();
 
@@ -7080,6 +7854,7 @@ mod tests {
                 1,
                 chain[1].1,
                 &selected_terminal_bytes(1, chain[1].1),
+                &empty_ladder_update(&chain[1].0),
             )
             .is_err());
         assert_eq!(
@@ -7188,6 +7963,7 @@ mod tests {
                     height,
                     chain[height as usize].1,
                     &selected_terminal_bytes(height, chain[height as usize].1),
+                    &empty_ladder_update(&chain[height as usize].0),
                 )
                 .unwrap();
         }
@@ -9058,7 +9834,12 @@ mod tests {
 
         let mut parent = crate::consensus::genesis::genesis_header();
         parent.log_slots = PARENT_LOG_SLOTS;
-        parent.state_root = [0x31; 32];
+        // Real exact roots: ladder promotion validates the cursor summary
+        // commitment against the canonical header state root.
+        parent.state_root =
+            crate::state::ChainState::from_sparse_utxos(24, &[(LOWER_SLOT_INDEX, lower_slot)], 1)
+                .unwrap()
+                .cached_state_root();
         parent.active_slot_count = 1;
         parent.alloc_counter = 1;
         let parent_hash = crate::hash_block_header(&parent);
@@ -9093,7 +9874,6 @@ mod tests {
                 false,
             )
             .unwrap();
-        drop(lower_columns);
 
         let mut upper_columns = SegmentColumns::new_zero(1usize << LOG_SEGMENT_SIZE);
         upper_columns.values[0] = upper_slot.value;
@@ -9106,7 +9886,16 @@ mod tests {
         child.timestamp = child.timestamp.saturating_add(1);
         child.nonce = 0xD25;
         child.log_slots = CHILD_LOG_SLOTS;
-        child.state_root = [0x32; 32];
+        child.state_root = crate::state::ChainState::from_sparse_utxos(
+            25,
+            &[
+                (LOWER_SLOT_INDEX, lower_slot),
+                (upper_slot_index, upper_slot),
+            ],
+            2,
+        )
+        .unwrap()
+        .cached_state_root();
         child.active_slot_count = 2;
         child.alloc_counter = 2;
         let child_hash = crate::hash_block_header(&child);
@@ -9153,17 +9942,45 @@ mod tests {
             child_commit.unwrap();
         }
         drop(fault_guard);
-        drop(upper_columns);
 
         if promote_child_coverage {
             assert!(child_fault.is_none());
             let claimed = store.claim_next_recursive_proof_job().unwrap().unwrap();
             assert_eq!((claimed.height, claimed.block_hash), (1, child_hash));
+            let ladder_update = SelectedHistoryLadderUpdate {
+                log_slots: CHILD_LOG_SLOTS,
+                active_slot_count: 2,
+                alloc_counter: 2,
+                state_root: child.state_root,
+                segment_summaries: vec![
+                    (
+                        0,
+                        1,
+                        exact_segment_root_from_columns(
+                            crate::fri_state::LOG_SEGMENT_SIZE,
+                            &lower_columns,
+                        ),
+                    ),
+                    (
+                        upper_segment_id,
+                        1,
+                        exact_segment_root_from_columns(
+                            crate::fri_state::LOG_SEGMENT_SIZE,
+                            &upper_columns,
+                        ),
+                    ),
+                ],
+                dirty_segments: vec![
+                    (0, Some(lower_columns)),
+                    (upper_segment_id, Some(upper_columns)),
+                ],
+            };
             store
                 .complete_recursive_proof_job_and_promote_selected_history(
                     1,
                     child_hash,
                     &selected_terminal_bytes(1, child_hash),
+                    &ladder_update,
                 )
                 .unwrap();
         }
@@ -10098,7 +10915,12 @@ mod tests {
             let terminal = selected_terminal_bytes(1, hash);
             let guard = arm_authoritative_mutation_fault(fault);
             assert_injected_crash(
-                store.complete_recursive_proof_job_and_promote_selected_history(1, hash, &terminal),
+                store.complete_recursive_proof_job_and_promote_selected_history(
+                    1,
+                    hash,
+                    &terminal,
+                    &empty_ladder_update(&chain[1].0),
+                ),
                 fault,
             );
             drop(guard);
@@ -10209,6 +11031,7 @@ mod tests {
                         height,
                         hash,
                         &selected_terminal_bytes(height, hash),
+                        &empty_ladder_update(&chain[height as usize].0),
                     )
                     .unwrap();
             }
@@ -10344,6 +11167,7 @@ mod tests {
                         height,
                         hash,
                         &selected_terminal_bytes(height, hash),
+                        &empty_ladder_update(&chain[height as usize].0),
                     )
                     .unwrap();
             }
