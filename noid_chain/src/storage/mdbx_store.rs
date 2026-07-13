@@ -5048,7 +5048,15 @@ impl MdbxStore {
                 if slot.is_empty() {
                     continue;
                 }
-                if slot.creation_id() > tip_header.alloc_counter {
+                let creation_in_target = if crate::consensus::params::is_coinbase_creation_id(
+                    slot.creation_id(),
+                ) {
+                    crate::consensus::params::coinbase_creation_height(slot.creation_id())
+                        <= tip_header.height
+                } else {
+                    slot.creation_id() <= tip_header.alloc_counter
+                };
+                if !creation_in_target {
                     return Err(StoreError::Decode(
                         "staged snapshot creation_id exceeds target allocator",
                     ));

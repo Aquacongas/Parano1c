@@ -172,6 +172,7 @@ impl SnapshotGeneration {
             effective_log,
             &columns,
             self.manifest.alloc_counter,
+            self.manifest.target_height,
         )?;
         if live == 0 {
             return Err(SnapshotGenerationError::InvalidSegment(
@@ -468,7 +469,17 @@ pub fn export_snapshot_generation(
             if slot.is_empty() {
                 continue;
             }
-            if slot.creation_id() > target_header.alloc_counter {
+            // Tagged coinbase ids live in the `TAG | mint_height` namespace
+            // and are bounded by the target height, not the allocator counter.
+            let creation_in_target = if crate::consensus::params::is_coinbase_creation_id(
+                slot.creation_id(),
+            ) {
+                crate::consensus::params::coinbase_creation_height(slot.creation_id())
+                    <= target_header.height
+            } else {
+                slot.creation_id() <= target_header.alloc_counter
+            };
+            if !creation_in_target {
                 return Err(SnapshotGenerationError::CreationIdExceedsTarget {
                     segment_id,
                     local_index: local_index as u32,
@@ -790,6 +801,7 @@ fn validate_segment_columns(
     effective_log: u8,
     columns: &SegmentColumns,
     alloc_counter: u64,
+    target_height: u64,
 ) -> Result<(u32, [u8; 32]), SnapshotGenerationError> {
     let expected_len =
         1usize
@@ -813,7 +825,15 @@ fn validate_segment_columns(
         if slot.is_empty() {
             continue;
         }
-        if slot.creation_id() > alloc_counter {
+        // Same tag-aware namespace rule as the historical carrier.
+        let creation_in_target =
+            if crate::consensus::params::is_coinbase_creation_id(slot.creation_id()) {
+                crate::consensus::params::coinbase_creation_height(slot.creation_id())
+                    <= target_height
+            } else {
+                slot.creation_id() <= alloc_counter
+            };
+        if !creation_in_target {
             return Err(SnapshotGenerationError::CreationIdExceedsTarget {
                 segment_id,
                 local_index: local as u32,
