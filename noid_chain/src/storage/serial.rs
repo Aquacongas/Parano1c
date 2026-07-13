@@ -506,6 +506,7 @@ mod tests {
             log_slots: 24,
             active_slot_count: 100,
             alloc_counter: 200,
+            attested_coverage: 0,
         };
         let bytes = encode_header(&h);
         assert_eq!(bytes.len(), BLOCK_HEADER_WIRE_SIZE);

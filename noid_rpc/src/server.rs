@@ -1059,12 +1059,41 @@ impl ParanoidApiServer for RpcHandler {
 
         // Single production path: verify the minimal block proof, apply the
         // proven transition, then commit atomically to MDBX.
-        let (hash, new_view) = {
+        let (hash, new_view, coverage_attestation_bytes) = {
             let mut ctx = self.chain.write().await;
+            // External miners mine templates built by THIS node, so a header
+            // that advances `attested_coverage` refers to a Link terminal this
+            // node already holds in its durable verified results store.
+            // Recover those bytes locally; the RPC wire stays unchanged. A
+            // missing terminal leaves the payload empty and the acceptance
+            // path rejects the block fail-closed.
+            let coverage_attestation_bytes: Vec<u8> = if block.header.attested_coverage
+                != ctx.tip_header().attested_coverage
+            {
+                let coverage_height = block.header.attested_coverage;
+                ctx.get_header_from_store(coverage_height)
+                    .ok()
+                    .flatten()
+                    .and_then(|header| {
+                        ctx.store
+                            .get_selected_history_terminal_result_at(
+                                coverage_height,
+                                noid_chain::hash_block_header(&header),
+                            )
+                            .ok()
+                            .flatten()
+                    })
+                    .map(|result| result.bytes)
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let attestation_store = ctx.store.clone();
             ctx.apply_next_block(
                 &block,
                 &block_proof_bytes,
                 &block_auth_sidecar_bytes,
+                &coverage_attestation_bytes,
                 local_time,
                 |block,
                  proof_bytes,
@@ -1103,6 +1132,25 @@ impl ParanoidApiServer for RpcHandler {
                         output.state_root,
                     )
                 },
+                |claim| {
+                    let expected = attestation_store
+                        .get_selected_history_terminal_result_at(
+                            claim.coverage_height,
+                            noid_chain::hash_block_header(&claim.header_at_coverage),
+                        )
+                        .map_err(|error| {
+                            format!("durable terminal read failed at attested coverage: {error}")
+                        })?
+                        .ok_or_else(|| {
+                            "no durable verified terminal at the attested coverage".to_string()
+                        })?;
+                    if expected.bytes != claim.attestation_bytes {
+                        return Err(
+                            "attestation differs from the durable verified terminal".to_string()
+                        );
+                    }
+                    Ok(())
+                },
             )
             .map_err(|e| rpc_err(format!("consensus: {e}")))?;
             // The block is already durably committed. Keep the chain write
@@ -1118,7 +1166,7 @@ impl ParanoidApiServer for RpcHandler {
             }
             let hash = block_id(&block.header);
             let view = noid_mempool::ChainView::from_mdbx(&ctx);
-            (hash, view)
+            (hash, view, coverage_attestation_bytes)
         };
 
         // Update mempool after confirmed block.
@@ -1145,6 +1193,7 @@ impl ParanoidApiServer for RpcHandler {
                 block_bytes: bytes,
                 block_proof_bytes,
                 block_auth_sidecar_bytes,
+                coverage_attestation_bytes,
             })
             .await
         {

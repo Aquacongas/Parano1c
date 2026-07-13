@@ -160,6 +160,9 @@ pub enum MinerEvent {
         /// Versioned selected-ZK authorization sidecar bytes carried as detached witness.
         /// Empty for coinbase-only blocks.
         block_auth_sidecar_bytes: Vec<u8>,
+        /// Serialized Link terminal envelope attesting the header's advanced
+        /// `attested_coverage`. Empty when the header keeps the parent's.
+        coverage_attestation_bytes: Vec<u8>,
     },
     /// Template refreshed.
     TemplateRefreshed {
@@ -635,7 +638,7 @@ impl BlockMiner {
                             // IMPORTANT: apply and store the block FIRST, THEN fire the event.
                             // The announcement triggers peers to request the block immediately;
                             // if we fire the event before storing, a fast peer gets None.
-                            if let Err(e) = self.apply_found_block(&block, &block_proof_bytes, &block_auth_sidecar_bytes).await {
+                            if let Err(e) = self.apply_found_block(&block, &block_proof_bytes, &block_auth_sidecar_bytes, &tmpl.coverage_attestation_bytes).await {
                                 tracing::warn!(height, "miner: block superseded (reorg in progress): {e}");
                                 continue;
                             }
@@ -649,6 +652,7 @@ impl BlockMiner {
                                 block_bytes: block_bytes.clone(),
                                 block_proof_bytes: block_proof_bytes.clone(),
                                 block_auth_sidecar_bytes: block_auth_sidecar_bytes.clone(),
+                                coverage_attestation_bytes: tmpl.coverage_attestation_bytes.clone(),
                             });
                         }
                         (Ok(Some(_sol)), Ok((Err(e), prove_elapsed))) => {
@@ -710,6 +714,7 @@ impl BlockMiner {
         block: &Block,
         block_proof_bytes: &[u8],
         block_auth_sidecar_bytes: &[u8],
+        coverage_attestation_bytes: &[u8],
     ) -> anyhow::Result<()> {
         use noid_mempool::ChainView;
 
@@ -740,13 +745,21 @@ impl BlockMiner {
             let block_owned = block.clone();
             let proof_bytes = block_proof_bytes.to_vec();
             let auth_sidecar_bytes = block_auth_sidecar_bytes.to_vec();
+            let attestation_bytes = coverage_attestation_bytes.to_vec();
             let hook = self.on_block_applied.clone();
             tokio::task::spawn_blocking(move || {
                 let mut ctx = chain_clone.blocking_write();
+                // The attached envelope was loaded from the local durable
+                // results store, whose entries are natively verified before
+                // promotion/import. Re-checking byte-exact identity against
+                // that store (bound to the canonical header at C) is the
+                // miner's fail-closed equivalent of full re-verification.
+                let attestation_store = ctx.store.clone();
                 ctx.apply_next_block(
                     &block_owned,
                     &proof_bytes,
                     &auth_sidecar_bytes,
+                    &attestation_bytes,
                     local_time,
                     |block,
                      proof_bytes,
@@ -784,6 +797,26 @@ impl BlockMiner {
                             &output.artifacts,
                             output.state_root,
                         )
+                    },
+                    |claim| {
+                        let expected = attestation_store
+                            .get_selected_history_terminal_result_at(
+                                claim.coverage_height,
+                                noid_chain::hash_block_header(&claim.header_at_coverage),
+                            )
+                            .map_err(|error| {
+                                format!("durable terminal read failed at attested coverage: {error}")
+                            })?
+                            .ok_or_else(|| {
+                                "no durable verified terminal at the attested coverage".to_string()
+                            })?;
+                        if expected.bytes != claim.attestation_bytes {
+                            return Err(
+                                "attached attestation differs from the durable verified terminal"
+                                    .to_string(),
+                            );
+                        }
+                        Ok(())
                     },
                 )?;
                 if let Some(h) = &hook {

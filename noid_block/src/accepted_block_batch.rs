@@ -1866,6 +1866,7 @@ mod tests {
             log_slots: 24,
             active_slot_count: 0,
             alloc_counter: 0,
+            attested_coverage: 0,
         }
     }
 
@@ -1926,6 +1927,7 @@ mod tests {
             log_slots,
             active_slot_count: state.active_slot_count,
             alloc_counter: state.alloc_counter,
+            attested_coverage: 0,
         };
         let parent_id = hash_block_header(&parent);
         let genesis_work = noid_chain::consensus::block_work(&parent.difficulty_target);
@@ -1946,6 +1948,7 @@ mod tests {
             active_slot_count: parent.active_slot_count,
             alloc_counter: parent.alloc_counter,
             epoch_anchor_id: parent_id,
+            attested_coverage: parent.attested_coverage,
         };
         let timestamp = parent
             .timestamp
@@ -2422,6 +2425,7 @@ mod tests {
             active_slot_count: header.active_slot_count,
             alloc_counter: header.alloc_counter,
             epoch_anchor_id: [0x77; 32],
+            attested_coverage: header.attested_coverage,
         };
         assert!(accumulator_matches_anchor(&accumulator, &anchor));
 

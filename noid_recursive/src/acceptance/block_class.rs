@@ -830,13 +830,13 @@ mod tests {
     use noid_ivc_core::pcs::ligerito::LigeritoProfile;
 
     #[test]
-    fn production_block_io_is_exactly_twenty_accumulator_lanes() {
+    fn production_block_io_is_exactly_two_eleven_lane_accumulators() {
         let layout = block_io_layout();
         let spec = block_io_spec();
         assert_eq!(layout.start_acc, 0);
         assert_eq!(layout.end_acc, ACC_LANES);
-        assert_eq!(layout.len, 20);
-        assert_eq!(spec.io_len, 20);
+        assert_eq!(layout.len, 22);
+        assert_eq!(spec.io_len, 22);
         assert_eq!(spec.io_slice.log2_len, 5);
         assert_eq!(spec.io_slice.index, 1);
         assert!(spec.claims.is_empty());

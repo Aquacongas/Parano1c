@@ -92,8 +92,8 @@ pub use checkpoint::{
 pub use chain_context::ChainContext;
 pub use mempool::{Mempool, MempoolEntry, MempoolError};
 pub use state::{
-    apply_tx, ApplyError, ChainState, SelectedHistoryLadderUpdate, SparseUtxoBuildError,
-    StateTransition,
+    apply_tx, apply_tx_at, ApplyError, ChainState, SelectedHistoryLadderUpdate,
+    SparseUtxoBuildError, StateTransition,
 };
 pub use state_delta::{
     build_exact_action_surface, build_exact_action_surface_at_log_slots,

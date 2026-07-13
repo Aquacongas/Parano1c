@@ -95,7 +95,7 @@ pub struct DuplexSlot {
 }
 
 /// Compiled slot layout of one duplex channel.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DuplexLayout {
     pub slots: Vec<DuplexSlot>,
     /// `(slot, lane)` whose output state carries the k-th challenge.

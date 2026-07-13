@@ -22,7 +22,7 @@ use noid_tx::wire::WireError;
 use noid_tx::Transaction;
 
 use crate::block_header::BlockHeader;
-use crate::state::{apply_tx, ApplyError, ChainState, StateTransition};
+use crate::state::{apply_tx_at, ApplyError, ChainState, StateTransition};
 
 /// Hard DoS cap on the number of transactions accepted by the decoder.
 ///
@@ -185,7 +185,7 @@ pub(crate) fn apply_block(
             .validate_canonical()
             .map_err(|_| BlockApplyError::InvalidTxBody)?;
 
-        apply_tx(&mut snap, &tx.body).map_err(BlockApplyError::Tx)?;
+        apply_tx_at(&mut snap, &tx.body, block.header.height).map_err(BlockApplyError::Tx)?;
     }
 
     if block.header.state_root
@@ -273,12 +273,22 @@ pub(crate) fn apply_state_delta(
         }
         for (_, out) in tx.body.live_outputs() {
             // The exact state certificate established that this output slot was empty.
-            let creation_id = snap
+            let next_alloc = snap
                 .alloc_counter
                 .checked_add(1)
                 .ok_or(BlockApplyError::Tx(
                     crate::state::ApplyError::AllocCounterOverflow,
                 ))?;
+            if crate::consensus::params::is_coinbase_creation_id(next_alloc) {
+                return Err(BlockApplyError::Tx(
+                    crate::state::ApplyError::AllocCounterOverflow,
+                ));
+            }
+            let creation_id = if tx.body.is_coinbase {
+                crate::consensus::params::coinbase_creation_id(block.header.height)
+            } else {
+                next_alloc
+            };
             let active_slot_count =
                 snap.active_slot_count
                     .checked_add(1)
@@ -288,7 +298,7 @@ pub(crate) fn apply_state_delta(
             let sv = SlotValue::with_owner_fields(out.amount, creation_id, out.owner.as_fields());
             deltas.push((out.slot_index, sv));
             snap.active_slot_count = active_slot_count;
-            snap.alloc_counter = creation_id;
+            snap.alloc_counter = next_alloc;
         }
     }
     snap.state
@@ -547,7 +557,7 @@ mod tests {
     fn block_for(state: &ChainState, txs: Vec<Transaction>) -> Block {
         let mut dry = state.clone();
         for tx in &txs {
-            apply_tx(&mut dry, &tx.body).unwrap();
+            apply_tx_at(&mut dry, &tx.body, 1).unwrap();
         }
         Block {
             header: BlockHeader {
@@ -562,6 +572,7 @@ mod tests {
                 log_slots: 8,
                 active_slot_count: dry.active_slot_count,
                 alloc_counter: dry.alloc_counter,
+                attested_coverage: 0,
             },
             transactions: txs,
         }
@@ -634,11 +645,12 @@ mod tests {
                 log_slots: 24,
                 active_slot_count: 0,
                 alloc_counter: 0,
+                attested_coverage: 0,
             },
             transactions: txs,
         };
-        assert_eq!(block.canonical_wire_len(), Ok(82_905));
-        assert_eq!(block.to_bytes().len(), 82_905);
+        assert_eq!(block.canonical_wire_len(), Ok(82_913));
+        assert_eq!(block.to_bytes().len(), 82_913);
         assert_eq!(Block::from_bytes(&block.to_bytes()).unwrap(), block);
         assert_eq!(
             canonical_block_wire_len(BLOCK_MAX_TXS + 1),
@@ -662,6 +674,7 @@ mod tests {
                 log_slots: 8,
                 active_slot_count: 0,
                 alloc_counter: 0,
+                attested_coverage: 0,
             },
             transactions: vec![],
         };

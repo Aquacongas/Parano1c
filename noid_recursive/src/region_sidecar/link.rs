@@ -3,9 +3,10 @@
 
 //! Mandatory terminal post-commit authority for one production link proof.
 //!
-//! Link-local PCS replay has exactly two independent verticals: heterogeneous
-//! leaf/transcript Walk L-A and feed-forward Merkle Walk L-B.  The L-B proof
-//! is a sibling field, never data recorded into L-A's committed columns.
+//! Link-local replay has exactly three independent verticals: heterogeneous
+//! leaf/transcript Walk L-A, feed-forward Merkle Walk L-B, and the recorded
+//! block-sidecar child-transcript region Walk L-C.  Each proof is a sibling
+//! field, never data recorded into another vertical's committed columns.
 
 use noid_ivc_core::challenger::Challenger;
 use noid_ivc_core::deep_chain::{
@@ -25,7 +26,8 @@ use crate::acceptance::trace::deep_chain::{
     verify_ragged_multi_deep_chain_walk_trace, MultiDeepChainWalkProofTrace,
 };
 use crate::acceptance::trace::r_pcs_region::{
-    link_r_pcs_leaf_sidecar_purpose, link_r_pcs_path_sidecar_purpose,
+    link_block_sidecar_recording_purpose, link_r_pcs_leaf_sidecar_purpose,
+    link_r_pcs_path_sidecar_purpose,
 };
 use crate::acceptance::trace::self_verify::FieldPostCommitTraceContext;
 use crate::acceptance::trace::FieldR1csBuilder;
@@ -40,33 +42,45 @@ use super::combined_duplex::{
     verify_combined_duplex_region_walk_deferred_prefix_trace,
     CombinedDuplexRegionWalkDeferredProof,
 };
+use super::recording_duplex::{
+    preflight_recording_duplex_region_walk_deferred, recording_duplex_bounded_shape,
+    validate_recording_endpoints, verify_recording_duplex_region_walk_deferred_prefix,
+    verify_recording_duplex_region_walk_deferred_prefix_trace, RecordingDuplexRegionProverPlan,
+    RecordingDuplexRegionVk,
+};
 use super::{
     preflight_merkle_region_walk_deferred_trace, verify_merkle_region_walk_deferred_prefix,
     verify_merkle_region_walk_deferred_prefix_trace, CombinedDuplexRegionProverPlan,
-    CombinedDuplexRegionVk, MerkleRegionProverPlan, MerkleRegionVk, MerkleRegionWalkDeferredProof,
-    RegionSidecarError, RegionWalkEndpoints,
+    CombinedDuplexRegionVk, DuplexRegionWalkDeferredProof, MerkleRegionProverPlan, MerkleRegionVk,
+    MerkleRegionWalkDeferredProof, RegionSidecarError, RegionWalkEndpoints,
 };
 
-pub const LINK_REGION_SIDECAR_VERSION: u8 = 2;
+pub const LINK_REGION_SIDECAR_VERSION: u8 = 3;
 
-const LINK_REGION_VK_DIGEST_DOMAIN: &[u8] = b"NOID/REGION-SIDECAR/LINK-VK/V2";
+const LINK_REGION_VK_DIGEST_DOMAIN: &[u8] = b"NOID/REGION-SIDECAR/LINK-VK/V3";
 const LINK_POST_COMMIT_CLASS_DIGEST_DOMAIN: &[u8] =
-    b"NOID/REGION-SIDECAR/LINK-POST-COMMIT-CLASS/V2";
-const LINK_REGION_TRANSCRIPT_LABEL: &[u8] = b"history-region-sidecar-link-v2";
+    b"NOID/REGION-SIDECAR/LINK-POST-COMMIT-CLASS/V3";
+const LINK_REGION_TRANSCRIPT_LABEL: &[u8] = b"history-region-sidecar-link-v3";
 
-/// Canonical key for the two mandatory link-region verticals.
+/// Canonical key for the three mandatory link-region verticals.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LinkRegionSidecarVk {
     leaf_a: CombinedDuplexRegionVk,
     path_b: MerkleRegionVk,
+    rec_c: RecordingDuplexRegionVk,
 }
 
 impl LinkRegionSidecarVk {
     pub fn new(
         leaf_a: CombinedDuplexRegionVk,
         path_b: MerkleRegionVk,
+        rec_c: RecordingDuplexRegionVk,
     ) -> Result<Self, RegionSidecarError> {
-        let vk = Self { leaf_a, path_b };
+        let vk = Self {
+            leaf_a,
+            path_b,
+            rec_c,
+        };
         vk.validate_roles()?;
         Ok(vk)
     }
@@ -79,6 +93,10 @@ impl LinkRegionSidecarVk {
         &self.path_b
     }
 
+    pub fn rec_c(&self) -> &RecordingDuplexRegionVk {
+        &self.rec_c
+    }
+
     pub fn transcript_digest(&self) -> [u8; 32] {
         let version = [LINK_REGION_SIDECAR_VERSION];
         poseidon2b_hash_byte_slices(
@@ -89,6 +107,8 @@ impl LinkRegionSidecarVk {
                 &self.leaf_a.transcript_digest(),
                 b"path-b",
                 &self.path_b.transcript_digest(),
+                b"rec-c",
+                &self.rec_c.transcript_digest(),
             ],
         )
     }
@@ -96,6 +116,7 @@ impl LinkRegionSidecarVk {
     fn validate_roles(&self) -> Result<(), RegionSidecarError> {
         if self.leaf_a.purpose() != &link_r_pcs_leaf_sidecar_purpose()
             || self.path_b.purpose() != &link_r_pcs_path_sidecar_purpose()
+            || self.rec_c.purpose() != &link_block_sidecar_recording_purpose()
         {
             return Err(RegionSidecarError::UnsupportedVkShape);
         }
@@ -150,6 +171,7 @@ pub fn link_post_commit_class_digest(
 pub struct LinkRegionProverInput {
     leaf_a: RegionWalkEndpoints,
     path_b: RegionWalkEndpoints,
+    rec_c: RegionWalkEndpoints,
 }
 
 impl LinkRegionProverInput {
@@ -157,9 +179,14 @@ impl LinkRegionProverInput {
         vk: &LinkRegionSidecarVk,
         leaf_a: RegionWalkEndpoints,
         path_b: RegionWalkEndpoints,
+        rec_c: RegionWalkEndpoints,
     ) -> Result<Self, RegionSidecarError> {
         vk.validate_roles()?;
-        let input = Self { leaf_a, path_b };
+        let input = Self {
+            leaf_a,
+            path_b,
+            rec_c,
+        };
         input.validate(vk)?;
         Ok(input)
     }
@@ -167,6 +194,7 @@ impl LinkRegionProverInput {
     fn validate(&self, vk: &LinkRegionSidecarVk) -> Result<(), RegionSidecarError> {
         CombinedDuplexRegionProverPlan::new(vk.leaf_a(), self.leaf_a.s0(), self.leaf_a.s_out())?;
         MerkleRegionProverPlan::new(vk.path_b(), self.path_b.s0(), self.path_b.s_out())?;
+        validate_recording_endpoints(vk.rec_c(), &self.rec_c)?;
         Ok(())
     }
 }
@@ -203,28 +231,37 @@ impl<'a> LinkRegionProverPlan<'a> {
             self.input.path_b.s0(),
             self.input.path_b.s_out(),
         )?;
+        let rec_plan = RecordingDuplexRegionProverPlan::new(
+            self.vk.rec_c(),
+            self.input.rec_c.s0(),
+            self.input.rec_c.s_out(),
+        )?;
         let leaf_a_prefix = leaf_plan.prove_walk_deferred_prefix(z, challenger)?;
         let path_b_prefix = path_plan.prove_walk_deferred_prefix(z, challenger)?;
+        let rec_c_prefix = rec_plan.prove_walk_deferred_prefix(z, challenger)?;
         let groups = vec![
             vec![leaf_a_prefix.group().clone()],
             vec![path_b_prefix.group().clone()],
+            vec![rec_c_prefix.group().clone()],
         ];
-        let s0 = [leaf_a_prefix.s0(), path_b_prefix.s0()];
-        let (leaf_a_path_b_walk, terminals) =
-            prove_ragged_multi_deep_chain_walk(&s0, &groups, challenger);
-        let [leaf_a_terminal, path_b_terminal]: [_; 2] = terminals
+        let s0 = [leaf_a_prefix.s0(), path_b_prefix.s0(), rec_c_prefix.s0()];
+        let (walk, terminals) = prove_ragged_multi_deep_chain_walk(&s0, &groups, challenger);
+        let [leaf_a_terminal, path_b_terminal, rec_c_terminal]: [_; 3] = terminals
             .try_into()
-            .expect("leaf-A/path-B multi-walk terminal count");
+            .expect("leaf-A/path-B/rec-C multi-walk terminal count");
         let (leaf_a, mut claims) = leaf_a_prefix.finish(&leaf_a_terminal, challenger)?;
         let (path_b, path_claims) = path_b_prefix.finish(&path_b_terminal, challenger)?;
         claims.extend(path_claims);
+        let (rec_c, rec_claims) = rec_c_prefix.finish(&rec_c_terminal, challenger)?;
+        claims.extend(rec_claims);
 
         Ok((
             LinkRegionSidecarProof {
                 version: LINK_REGION_SIDECAR_VERSION,
                 leaf_a,
                 path_b,
-                leaf_a_path_b_walk,
+                rec_c,
+                walk,
             },
             claims,
         ))
@@ -243,15 +280,16 @@ impl<'a> LinkRegionProverPlan<'a> {
     }
 }
 
-/// Fixed V2 link sidecar.  Both children retain their complete role-local
-/// prefix/suffix authority; only their deep-chain walks are reduced by one
-/// mandatory ragged-domain multi-instance proof.
+/// Fixed V3 link sidecar.  All three children retain their complete
+/// role-local prefix/suffix authority; only their deep-chain walks are
+/// reduced by one mandatory ragged-domain multi-instance proof.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LinkRegionSidecarProof {
     version: u8,
     leaf_a: CombinedDuplexRegionWalkDeferredProof,
     path_b: MerkleRegionWalkDeferredProof,
-    leaf_a_path_b_walk: MultiDeepChainWalkProof,
+    rec_c: DuplexRegionWalkDeferredProof,
+    walk: MultiDeepChainWalkProof,
 }
 
 impl LinkRegionSidecarProof {
@@ -265,6 +303,10 @@ impl LinkRegionSidecarProof {
 
     pub(crate) fn path_b(&self) -> &MerkleRegionWalkDeferredProof {
         &self.path_b
+    }
+
+    pub(crate) fn rec_c(&self) -> &DuplexRegionWalkDeferredProof {
+        &self.rec_c
     }
 
     #[cfg(test)]
@@ -332,9 +374,9 @@ impl LinkRegionSidecarProof {
     }
 }
 
-/// Decode the mandatory V2 link envelope only after both deferred children
-/// and their shared multi-walk have passed one allocation-free, class-aware
-/// bincode scan.
+/// Decode the mandatory V3 link envelope only after all three deferred
+/// children and their shared multi-walk have passed one allocation-free,
+/// class-aware bincode scan.
 pub fn decode_link_region_sidecar_bounded(
     vk: &LinkRegionSidecarVk,
     total_vars: usize,
@@ -350,15 +392,16 @@ pub fn decode_link_region_sidecar_bounded(
     }
     preflight_combined_duplex_region_walk_deferred_trace(vk.leaf_a(), total_vars, &proof.leaf_a)?;
     preflight_merkle_region_walk_deferred_trace(vk.path_b(), total_vars, &proof.path_b)?;
+    preflight_recording_duplex_region_walk_deferred(vk.rec_c(), total_vars, &proof.rec_c)?;
     let w_logs = link_w_logs(vk);
-    preflight_multi_walk(&proof.leaf_a_path_b_walk, max_w_log(&w_logs), w_logs.len())?;
+    preflight_multi_walk(&proof.walk, max_w_log(&w_logs), w_logs.len())?;
     Ok(proof)
 }
 
 fn link_bounded_shapes(
     vk: &LinkRegionSidecarVk,
     total_vars: usize,
-) -> Result<[SidecarProofShape; 3], RegionSidecarError> {
+) -> Result<[SidecarProofShape; 4], RegionSidecarError> {
     vk.validate_roles()?;
     let w_logs = link_w_logs(vk);
     Ok([
@@ -368,6 +411,9 @@ fn link_bounded_shapes(
         )?),
         SidecarProofShape::DeferredMerkle(
             merkle_shape_for_vk(vk.path_b(), total_vars)?.walk_deferred(),
+        ),
+        SidecarProofShape::DeferredFixed(
+            recording_duplex_bounded_shape(vk.rec_c(), total_vars)?.walk_deferred(),
         ),
         SidecarProofShape::MultiWalk(multi_walk_proof_shape(max_w_log(&w_logs), w_logs.len())?),
     ])
@@ -396,21 +442,25 @@ fn verify_link_region_sidecar<Ch: Challenger>(
         &proof.path_b,
         challenger,
     )?;
+    let rec_c_prefix = verify_recording_duplex_region_walk_deferred_prefix(
+        vk.rec_c(),
+        total_vars,
+        &proof.rec_c,
+        challenger,
+    )?;
     let groups = vec![
         vec![leaf_a_prefix.group().clone()],
         vec![path_b_prefix.group().clone()],
+        vec![rec_c_prefix.group().clone()],
     ];
-    let [leaf_a_terminal, path_b_terminal]: [_; 2] = verify_ragged_multi_deep_chain_walk(
-        &link_w_logs(vk),
-        &groups,
-        &proof.leaf_a_path_b_walk,
-        challenger,
-    )
-    .map_err(|_| RegionSidecarError::InvalidProof)?
-    .try_into()
-    .expect("verified leaf-A/path-B terminal count");
+    let [leaf_a_terminal, path_b_terminal, rec_c_terminal]: [_; 3] =
+        verify_ragged_multi_deep_chain_walk(&link_w_logs(vk), &groups, &proof.walk, challenger)
+            .map_err(|_| RegionSidecarError::InvalidProof)?
+            .try_into()
+            .expect("verified leaf-A/path-B/rec-C terminal count");
     let mut claims = leaf_a_prefix.finish(&leaf_a_terminal, challenger)?;
     claims.extend(path_b_prefix.finish(&path_b_terminal, challenger)?);
+    claims.extend(rec_c_prefix.finish(&rec_c_terminal, challenger)?);
     Ok(claims)
 }
 
@@ -425,10 +475,10 @@ pub fn verify_link_region_sidecar_post_commit<Ch: Challenger>(
     Ok(())
 }
 
-/// Recursive trace verifier for the mandatory V2 link sidecar. Both deferred
-/// children and the ragged multi-walk are shape-preflighted before the first
-/// proof witness is allocated. Prefix, walk, and suffix order exactly matches
-/// the native prover/verifier transcript.
+/// Recursive trace verifier for the mandatory V3 link sidecar. All three
+/// deferred children and the ragged multi-walk are shape-preflighted before
+/// the first proof witness is allocated. Prefix, walk, and suffix order
+/// exactly matches the native prover/verifier transcript.
 pub fn verify_link_region_sidecar_trace_post_commit<C: FsChannelOps>(
     b: &mut FieldR1csBuilder,
     context: &mut FieldPostCommitTraceContext<'_, C>,
@@ -443,7 +493,8 @@ pub fn verify_link_region_sidecar_trace_post_commit<C: FsChannelOps>(
     let w_logs = link_w_logs(vk);
     preflight_combined_duplex_region_walk_deferred_trace(vk.leaf_a(), total_vars, &proof.leaf_a)?;
     preflight_merkle_region_walk_deferred_trace(vk.path_b(), total_vars, &proof.path_b)?;
-    preflight_multi_walk(&proof.leaf_a_path_b_walk, max_w_log(&w_logs), w_logs.len())?;
+    preflight_recording_duplex_region_walk_deferred(vk.rec_c(), total_vars, &proof.rec_c)?;
+    preflight_multi_walk(&proof.walk, max_w_log(&w_logs), w_logs.len())?;
 
     context.observe_label(b, LINK_REGION_TRANSCRIPT_LABEL);
     context.observe_bytes_const(b, &vk.transcript_digest());
@@ -456,27 +507,37 @@ pub fn verify_link_region_sidecar_trace_post_commit<C: FsChannelOps>(
     )?;
     let path_b_prefix =
         verify_merkle_region_walk_deferred_prefix_trace(b, context, vk.path_b(), &proof.path_b)?;
-    crate::acceptance::row_ledger_mark(b, &mut ledger, "link-sidecar: leaf-A/path-B prefixes");
+    let rec_c_prefix = verify_recording_duplex_region_walk_deferred_prefix_trace(
+        b,
+        context,
+        vk.rec_c(),
+        &proof.rec_c,
+    )?;
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "link-sidecar: three-child prefixes");
 
     let groups = vec![
         vec![leaf_a_prefix.walk_group()],
         vec![path_b_prefix.walk_group()],
+        vec![rec_c_prefix.walk_group()],
     ];
-    let walk = MultiDeepChainWalkProofTrace::alloc_ragged(b, &proof.leaf_a_path_b_walk, &w_logs);
+    let walk = MultiDeepChainWalkProofTrace::alloc_ragged(b, &proof.walk, &w_logs);
     let terminals = verify_ragged_multi_deep_chain_walk_trace(b, context, &w_logs, &groups, &walk);
-    if terminals.len() != 2 {
+    if terminals.len() != 3 {
         return Err(RegionSidecarError::InvalidProof);
     }
     let mut terminals = terminals.into_iter();
     let leaf_a_terminal = terminals.next().expect("checked terminal count");
     let path_b_terminal = terminals.next().expect("checked terminal count");
-    crate::acceptance::row_ledger_mark(b, &mut ledger, "link-sidecar: leaf-A/path-B multi-walk");
+    let rec_c_terminal = terminals.next().expect("checked terminal count");
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "link-sidecar: three-child multi-walk");
 
     let claims = leaf_a_prefix.finish(b, context, &leaf_a_terminal)?;
     context.append_claims(claims);
     let claims = path_b_prefix.finish(b, context, &path_b_terminal)?;
     context.append_claims(claims);
-    crate::acceptance::row_ledger_mark(b, &mut ledger, "link-sidecar: leaf-A/path-B suffixes");
+    let claims = rec_c_prefix.finish(b, context, &rec_c_terminal)?;
+    context.append_claims(claims);
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "link-sidecar: three-child suffixes");
     Ok(())
 }
 
@@ -497,8 +558,12 @@ fn preflight_multi_walk(
     Ok(())
 }
 
-fn link_w_logs(vk: &LinkRegionSidecarVk) -> [usize; 2] {
-    [vk.leaf_a().w_log(), vk.path_b().w_log()]
+fn link_w_logs(vk: &LinkRegionSidecarVk) -> [usize; 3] {
+    [
+        vk.leaf_a().w_log(),
+        vk.path_b().w_log(),
+        vk.rec_c().w_log(),
+    ]
 }
 
 fn max_w_log(w_logs: &[usize]) -> usize {
@@ -517,12 +582,72 @@ fn push_u64(bytes: &mut Vec<u8>, value: usize) {
 
 #[cfg(test)]
 mod tests {
-    use noid_ivc_core::deep_chain::{DeepChainWalkProof, MultiWalkLayerProof};
+    use noid_ivc_core::deep_chain::relations::{
+        ColumnRelationProof, ShiftDischargeProof, RELATION_DEGREE,
+    };
+    use noid_ivc_core::deep_chain::schedule::{compile_duplex, TranscriptOp};
+    use noid_ivc_core::deep_chain::{DeepChainWalkProof, MultiWalkLayerProof, WALK_DEGREE};
+    use noid_ivc_core::public_io::WitnessSlice;
 
     use super::super::bounded_decode;
     use super::super::combined_duplex::tests::composite_decode_fixture as combined_fixture;
     use super::super::tests::merkle_decode_fixture_with_purpose;
     use super::*;
+
+    /// Minimal recording vertical fixture: two ghost blocks and a zero-valued
+    /// walk-deferred authority of the exact canonical shape.
+    fn recording_fixture() -> (
+        RecordingDuplexRegionVk,
+        usize,
+        super::super::DuplexRegionWalkDeferredProof,
+        DeepChainWalkProof,
+    ) {
+        let layout = || {
+            compile_duplex(&[
+                TranscriptOp::Absorb(vec![None, None]),
+                TranscriptOp::Squeeze(1),
+            ])
+        };
+        let block = layout().slots.len().max(1).next_power_of_two();
+        let w_log = (2 * block).next_power_of_two().trailing_zeros() as usize;
+        let slices = std::array::from_fn(|column| WitnessSlice {
+            log2_len: w_log,
+            index: 64 + column,
+        });
+        let vk = RecordingDuplexRegionVk::new(
+            link_block_sidecar_recording_purpose(),
+            w_log,
+            slices,
+            vec![(layout(), 0), (layout(), block)],
+        )
+        .expect("minimal recording vertical fixture");
+        let relation = |values: usize| ColumnRelationProof {
+            rounds: vec![[noid_ivc_core::field::F128::ZERO; RELATION_DEGREE]; w_log],
+            final_values: vec![noid_ivc_core::field::F128::ZERO; values],
+        };
+        let shifts = (0..4)
+            .map(|_| ShiftDischargeProof {
+                rounds: vec![[noid_ivc_core::field::F128::ZERO; 2]; w_log],
+                final_value: noid_ivc_core::field::F128::ZERO,
+            })
+            .collect();
+        let proof = super::super::DuplexRegionWalkDeferredProof::new(
+            crate::acceptance::trace::region_source_binding::DuplexUnionWalkDeferredProof {
+                selection: relation(8),
+                substitution: relation(6),
+                shifts,
+            },
+        );
+        let walk = DeepChainWalkProof {
+            layers: (0..N_ROUNDS)
+                .map(|_| noid_ivc_core::deep_chain::WalkLayerProof {
+                    round_coeffs: vec![[noid_ivc_core::field::F128::ZERO; WALK_DEGREE]; w_log],
+                    next_values: [noid_ivc_core::field::F128::ZERO; 4],
+                })
+                .collect(),
+        };
+        (vk, 10, proof, walk)
+    }
 
     fn shape_only_multi_walk(walks: &[DeepChainWalkProof]) -> MultiDeepChainWalkProof {
         assert!(!walks.is_empty());
@@ -545,23 +670,25 @@ mod tests {
     }
 
     #[test]
-    fn link_v2_bounded_decode_preflights_children_and_multi_walk_before_serde() {
+    fn link_v3_bounded_decode_preflights_children_and_multi_walk_before_serde() {
         let (leaf_vk, leaf_vars, leaf_a) = combined_fixture(link_r_pcs_leaf_sidecar_purpose());
         let (path_vk, path_vars, path_b, _) =
             merkle_decode_fixture_with_purpose(link_r_pcs_path_sidecar_purpose());
+        let (rec_vk, rec_vars, rec_c, rec_walk) = recording_fixture();
         let leaf_w_log = leaf_vk.w_log();
         let path_w_log = path_vk.w_log();
-        let total_vars = leaf_vars.max(path_vars);
-        let vk = LinkRegionSidecarVk::new(leaf_vk, path_vk).unwrap();
+        let total_vars = leaf_vars.max(path_vars).max(rec_vars);
+        let vk = LinkRegionSidecarVk::new(leaf_vk, path_vk, rec_vk).unwrap();
         let (leaf_a, leaf_a_walk) = leaf_a.into_walk_deferred_parts();
         let (path_b, path_b_walk) = path_b.into_walk_deferred_parts(path_w_log);
         assert_eq!(leaf_a_walk.layers[0].round_coeffs.len(), leaf_w_log);
-        let leaf_a_path_b_walk = shape_only_multi_walk(&[leaf_a_walk, path_b_walk]);
+        let walk = shape_only_multi_walk(&[leaf_a_walk, path_b_walk, rec_walk]);
         let proof = LinkRegionSidecarProof {
             version: LINK_REGION_SIDECAR_VERSION,
             leaf_a,
             path_b,
-            leaf_a_path_b_walk,
+            rec_c,
+            walk,
         };
         let encoded = bincode::serialize(&proof).unwrap();
 
@@ -604,7 +731,7 @@ mod tests {
                 (*field == bounded_decode::LayoutField::Version).then_some(*offset)
             })
             .collect::<Vec<_>>();
-        assert_eq!(versions.len(), 3, "envelope plus two child versions");
+        assert_eq!(versions.len(), 4, "envelope plus three child versions");
         for offset in &versions[1..] {
             let mut forged = encoded.clone();
             forged[*offset] ^= 1;
@@ -613,7 +740,7 @@ mod tests {
                 RegionSidecarError::UnsupportedVersion
             );
         }
-        for child in 0..2 {
+        for child in 0..3 {
             let start = versions[child + 1];
             let end = versions.get(child + 2).copied().unwrap_or(encoded.len());
             let offset = offsets

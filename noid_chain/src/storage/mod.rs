@@ -31,7 +31,8 @@ pub use ladder_state::{
     TouchedSegmentError,
 };
 pub use mdbx_context::{
-    AppliedBlockValidation, MdbxChainContext, MdbxContextError, ReorgBlockPayload,
+    AppliedBlockValidation, CoverageAttestationClaim, MdbxChainContext, MdbxContextError,
+    ReorgBlockPayload,
 };
 pub use mdbx_store::{
     AcceptedBlockCommitData, ClaimedRecursiveProofJobInputs, MdbxStore, RecursiveProofJob,

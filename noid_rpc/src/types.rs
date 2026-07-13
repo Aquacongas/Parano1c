@@ -124,6 +124,9 @@ pub struct WalletBalance {
     /// Confirmed UTXOs being spent by pending (mempool) txs.
     /// These are locked and cannot be spent again until confirmed or evicted.
     pub pending_outbound_micronoid: u64,
+    /// Confirmed coinbase value still locked by proof-gated maturity:
+    /// its mint heights exceed the tip's `attested_coverage`.
+    pub immature_micronoid: u64,
     /// Spendable = active balance - pending_outbound.
     pub spendable_micronoid: u64,
     pub spendable_noid: f64,

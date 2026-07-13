@@ -674,12 +674,33 @@ fn fixed_pattern_dot_gate(
     point: &[LinExpr],
 ) -> LinExpr {
     assert_eq!(tensor.len(), pattern.table.len(), "eq tensor arity");
-    let mut acc = LinExpr::zero();
-    for (v, t) in pattern.table.iter().zip(tensor.iter()) {
-        if *v != F128::ZERO {
-            acc = acc.add(&t.scale(*v));
-        }
+    // Balanced affine fold: `LinExpr::add` copies both sides, so a linear
+    // accumulation over a 2^14-entry table would cost O(n²) term copies.
+    // The pairwise tree produces the identical canonical expression (sorted
+    // merge is order-independent) in O(n log n).
+    let mut layer: Vec<LinExpr> = pattern
+        .table
+        .iter()
+        .zip(tensor.iter())
+        .filter(|(v, _)| **v != F128::ZERO)
+        .map(|(v, t)| t.scale(*v))
+        .collect();
+    if layer.is_empty() {
+        layer.push(LinExpr::zero());
     }
+    while layer.len() > 1 {
+        layer = layer
+            .chunks(2)
+            .map(|pair| {
+                if pair.len() == 2 {
+                    pair[0].add(&pair[1])
+                } else {
+                    pair[0].clone()
+                }
+            })
+            .collect();
+    }
+    let mut acc = layer.pop().expect("non-empty fold layer");
     if let Some((first, bits)) = &pattern.hi_gate {
         assert_eq!(point.len(), first + bits.len(), "gated pattern point arity");
         for (j, bit) in bits.iter().enumerate() {

@@ -160,6 +160,7 @@ mod tests {
 
     fn header(height: u64, prev: [u8; 32], state_seed: u8) -> noid_chain::BlockHeader {
         noid_chain::BlockHeader {
+            attested_coverage: 0,
             prev_block_hash: prev,
             state_root: [state_seed; 32],
             tx_root: [state_seed ^ 0x55; 32],

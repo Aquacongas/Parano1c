@@ -187,6 +187,7 @@ mod tests {
                 log_slots: 8,
                 active_slot_count: 1,
                 alloc_counter: 1,
+                attested_coverage: 0,
             },
             transactions: vec![tx],
         }

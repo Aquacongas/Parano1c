@@ -47,6 +47,8 @@ pub fn genesis_header() -> BlockHeader {
         log_slots: LOG_SLOTS_GENESIS,
         active_slot_count: 0,
         alloc_counter: 0,
+        // Genesis needs no Link proof: nothing precedes it.
+        attested_coverage: 0,
     }
 }
 
@@ -67,7 +69,8 @@ const GENESIS_STATE_ROOT: [u8; 32] = [
 
 /// Pre-mined genesis nonce.
 /// Satisfies: `H_POSEIDON_POW(genesis_header()) < GENESIS_TARGET`.
-const GENESIS_NONCE: u128 = 149_245;
+/// Re-mined for the `attested_coverage` header layout (18-field PoW schedule).
+const GENESIS_NONCE: u128 = 73_403;
 
 /// Find and return a valid genesis nonce at runtime.
 /// Used for verification only — not for production (nonce is hardcoded as `GENESIS_NONCE`).
@@ -144,6 +147,7 @@ mod tests {
             log_slots: LOG_SLOTS_GENESIS,
             active_slot_count: 0,
             alloc_counter: 0,
+            attested_coverage: 0,
         };
         search_pow(&h, 0, 2_000_000_000).expect("genesis target is trivially satisfiable")
     }

@@ -31,6 +31,8 @@ pub struct RecursiveConsensusState {
     pub log_slots: u32,
     pub active_slot_count: u64,
     pub alloc_counter: u64,
+    /// Proof-gated coinbase-maturity frontier carried by the tip header.
+    pub attested_coverage: u64,
     pub asert_anchor_height: u64,
     pub asert_anchor_timestamp: u64,
     pub asert_anchor_target: [u8; 32],
@@ -103,6 +105,13 @@ fn digest_to_fields(hash: [u8; 32]) -> [Block128; 2] {
     ]
 }
 
+// The killshot statement is the complete native 18-field schedule
+// (`attested_coverage` at index 16 plus the reserved zero pad at 17).
+const _: () = assert!(
+    noid_gkr::header_hash_killshot::HEADER_HASH_FIELDS
+        == noid_chain::consensus::pow::POW_HEADER_FIELD_COUNT
+);
+
 pub fn header_hash_proof_inputs(witnesses: &[HeaderWitness]) -> Vec<HeaderHashInputs> {
     witnesses
         .iter()
@@ -139,6 +148,9 @@ pub enum PowHeaderBatchError {
     BadLogSlots {
         index: usize,
     },
+    BadAttestedCoverage {
+        index: usize,
+    },
 }
 
 impl RecursiveConsensusState {
@@ -172,6 +184,7 @@ impl RecursiveConsensusState {
             log_slots: header.log_slots,
             active_slot_count: header.active_slot_count,
             alloc_counter: header.alloc_counter,
+            attested_coverage: header.attested_coverage,
             asert_anchor_height,
             asert_anchor_timestamp,
             asert_anchor_target,
@@ -290,6 +303,16 @@ fn verify_pow_header_batch_inner(
             return Err(PowHeaderBatchError::BadLogSlots { index });
         }
 
+        // Structural attested-coverage advancement rule — the exact twin of
+        // `consensus::header::validate_header_inner` step 7: repeat the
+        // parent's coverage or advance it to at most the parent height.
+        if header.attested_coverage < state.attested_coverage
+            || (header.attested_coverage > state.attested_coverage
+                && header.attested_coverage > state.height)
+        {
+            return Err(PowHeaderBatchError::BadAttestedCoverage { index });
+        }
+
         state.height = header.height;
         state.block_id = noid_chain::hash_block_header(header);
         state.state_root = header.state_root;
@@ -300,6 +323,7 @@ fn verify_pow_header_batch_inner(
         state.log_slots = header.log_slots;
         state.active_slot_count = header.active_slot_count;
         state.alloc_counter = header.alloc_counter;
+        state.attested_coverage = header.attested_coverage;
         state.push_timestamp(header.timestamp);
         state.push_active_count(header.active_slot_count);
 
@@ -341,6 +365,7 @@ mod tests {
             timestamp,
         );
         BlockHeader {
+            attested_coverage: 0,
             prev_block_hash: state.block_id,
             state_root: [height as u8; 32],
             tx_root: [0u8; 32],
@@ -357,6 +382,7 @@ mod tests {
 
     fn genesis() -> BlockHeader {
         BlockHeader {
+            attested_coverage: 0,
             prev_block_hash: [0u8; 32],
             state_root: [0u8; 32],
             tx_root: [0u8; 32],
@@ -739,6 +765,53 @@ mod tests {
                 reason: HeaderWitnessError::BadPow
             })
         );
+    }
+
+    #[test]
+    fn attested_coverage_must_stay_monotone_and_below_parent_height() {
+        let g = genesis();
+        let start = RecursiveConsensusState::from_header(
+            &g,
+            block_work(&g.difficulty_target),
+            0,
+            g.timestamp,
+            g.difficulty_target,
+            &[g.timestamp],
+            &[g.active_slot_count],
+        );
+        let mut rolling = start.clone();
+        // Reach parent height 5 with coverage 3 by valid successions.
+        for step in 1..=5u64 {
+            let mut h = header_from_state(&rolling, g.timestamp + step * BLOCK_TIME);
+            h.attested_coverage = (rolling.attested_coverage + 1).min(rolling.height).min(3);
+            rolling = verify_pow_header_batch_native_without_pow_for_tests(&rolling, &[h])
+                .expect("bounded coverage advancement is valid");
+        }
+        assert_eq!(rolling.height, 5);
+        assert_eq!(rolling.attested_coverage, 3);
+
+        let child_with = |coverage: u64| {
+            let mut h = header_from_state(&rolling, g.timestamp + 6 * BLOCK_TIME);
+            h.attested_coverage = coverage;
+            h
+        };
+        for valid in [3u64, 4, 5] {
+            let end = verify_pow_header_batch_native_without_pow_for_tests(
+                &rolling,
+                &[child_with(valid)],
+            )
+            .expect("repeat or bounded advancement accepts");
+            assert_eq!(end.attested_coverage, valid);
+        }
+        for invalid in [2u64, 6] {
+            assert_eq!(
+                verify_pow_header_batch_native_without_pow_for_tests(
+                    &rolling,
+                    &[child_with(invalid)]
+                ),
+                Err(PowHeaderBatchError::BadAttestedCoverage { index: 0 })
+            );
+        }
     }
 
     #[test]

@@ -1304,7 +1304,10 @@ mod tests {
 
     #[test]
     fn production_io_lane_constant_matches_frozen_layout() {
-        assert_eq!(SELECTED_HISTORY_LINK_IO_LANES, 427);
+        // 1 genesis flag + 16 whitelist lanes + 4 x (2*23 + 3) m23 Link
+        // claim lanes + (47 + 49 + 49 + 51) Block claim lanes + the
+        // eleven-lane direct chain accumulator.
+        assert_eq!(SELECTED_HISTORY_LINK_IO_LANES, 420);
     }
 
     #[test]

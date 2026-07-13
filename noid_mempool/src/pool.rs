@@ -773,6 +773,28 @@ fn run_admission_checks(tx: &Transaction, st: &MempoolState) -> Result<u64, Subm
         u64::MAX
     };
 
+    // Proof-gated coinbase maturity: a spend of a tagged coinbase UTXO is
+    // admissible only when the tip's attested selected-history coverage
+    // already reaches its mint height. Template selection re-checks this
+    // against the coverage of the block actually being built (a same-block
+    // attestation can mature it earlier than admission would).
+    if !tx.body.is_coinbase {
+        for (_, inp) in tx.body.live_inputs() {
+            if noid_chain::consensus::params::is_coinbase_creation_id(inp.creation_id) {
+                let mint_height =
+                    noid_chain::consensus::params::coinbase_creation_height(inp.creation_id);
+                if st.view.tip_attested_coverage < mint_height {
+                    return Err(SubmitError::Consensus(
+                        noid_chain::consensus::ConsensusError::ImmatureCoinbaseSpend {
+                            mint_height,
+                            attested_coverage: st.view.tip_attested_coverage,
+                        },
+                    ));
+                }
+            }
+        }
+    }
+
     // No slot conflict with currently admitted txs (O(inputs + outputs)).
     check_slot_conflicts_with_pool(tx, &st.admitted_input_slots, &st.admitted_output_slots)?;
 
@@ -931,7 +953,9 @@ mod tests {
         TX_INTENT_FIXED_OVERHEAD, TX_OUTPUTS,
     };
 
-    use super::{check_input_slots, AsyncMempool};
+    use super::{check_input_slots, run_admission_checks, AsyncMempool, MempoolState};
+    use crate::error::SubmitError;
+    use std::collections::HashSet;
     use crate::config::MempoolConfig;
     use crate::view::ChainView;
 
@@ -1044,6 +1068,98 @@ mod tests {
             .expect("preverified boundary");
         assert!(!preverified.contains("intent_bytes.clone"));
         assert!(!preverified.contains("Vec<Vec<u8>>"));
+    }
+
+    #[test]
+    fn admission_rejects_immature_coinbase_spends_against_tip_coverage() {
+        use noid_chain::consensus::params::coinbase_creation_id;
+
+        let owner = Address([0xA5; 32]);
+        let build_state = || {
+            let mut state = ChainState::with_log_slots(6);
+            // A coinbase UTXO minted at height 3.
+            state
+                .state
+                .set_slot(
+                    7,
+                    SlotValue::with_owner_fields(
+                        1_000_000,
+                        coinbase_creation_id(3),
+                        owner.as_fields(),
+                    ),
+                )
+                .unwrap();
+            state
+        };
+        let view_with_coverage = |attested_coverage: u64| {
+            let mut tip = genesis_header();
+            tip.attested_coverage = attested_coverage;
+            let mut headers = HashMap::new();
+            headers.insert(0, tip);
+            ChainView::new(0, headers, 1, build_state().state)
+        };
+        let mempool_state = |view: ChainView| MempoolState {
+            pool: noid_chain::Mempool::new(16),
+            view,
+            floor: crate::floor::FeeFloor::new(4),
+            admitted_input_slots: HashSet::new(),
+            admitted_output_slots: HashSet::new(),
+        };
+
+        let spend = |fee: u64| {
+            let mut inputs = [TxInput::dummy(); TX_INPUTS];
+            inputs[0] = TxInput {
+                slot_index: 7,
+                amount: 1_000_000,
+                creation_id: coinbase_creation_id(3),
+            };
+            let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+            outputs[0] = TxOutput {
+                slot_index: 8,
+                amount: 1_000_000 - fee,
+                owner: Address([0xB6; 32]),
+            };
+            Transaction::new(TxBody {
+                epoch_anchor: [1; 32],
+                fee,
+                input_owner: owner,
+                inputs,
+                outputs,
+                validity_bitmap: 1 | output_bitmap_bit(0),
+                is_coinbase: false,
+            })
+        };
+
+        // Learn the consensus fee, then anchor the candidate correctly.
+        let probe_state = mempool_state(view_with_coverage(3));
+        let required = noid_chain::consensus::required_fee_for_tx_body(
+            &spend(0).body,
+            probe_state.view.active_slot_count,
+            probe_state.view.log_slots(),
+        );
+        let candidate = spend(required);
+        let anchored = |attested_coverage: u64, tx: &Transaction| {
+            let st = mempool_state(view_with_coverage(attested_coverage));
+            let mut anchored_tx = tx.clone();
+            anchored_tx.body.epoch_anchor = st.view.user_epoch_anchor_id;
+            (st, Transaction::new(anchored_tx.body))
+        };
+
+        // Tip attests coverage 2 < mint height 3 — inadmissible.
+        let (immature_state, immature_tx) = anchored(2, &candidate);
+        assert!(matches!(
+            run_admission_checks(&immature_tx, &immature_state),
+            Err(SubmitError::Consensus(
+                noid_chain::consensus::ConsensusError::ImmatureCoinbaseSpend {
+                    mint_height: 3,
+                    attested_coverage: 2,
+                }
+            ))
+        ));
+
+        // Tip attests coverage 3 — admissible.
+        let (mature_state, mature_tx) = anchored(3, &candidate);
+        run_admission_checks(&mature_tx, &mature_state).expect("mature coinbase spend admits");
     }
 
     #[test]

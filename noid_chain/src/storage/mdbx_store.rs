@@ -151,6 +151,11 @@ const T_BLOCK_PROOFS: &str = "block_proofs";
 /// Public AuthGKR sidecars retained with block bodies until checkpoint coverage.
 /// Key: height (u64 LE).
 const T_BLOCK_AUTH_SIDECARS: &str = "block_auth_sidecars";
+/// Detached coverage attestations (selected-history Link terminal envelopes)
+/// carried by blocks that advanced `header.attested_coverage`. Retained and
+/// served with the block so peers can natively re-verify the advancement.
+/// Key: height (u64 LE). Value: serialized terminal package bytes.
+const T_COVERAGE_ATTESTATIONS: &str = "coverage_attestations";
 /// Accepted state-transition history claims retained until checkpoint package
 /// coverage consumes them. Key: height (u64 LE). Value: raw bincode bytes.
 const T_HISTORY_CLAIMS: &str = "history_claims";
@@ -397,6 +402,9 @@ pub struct VerifiedOwnerSnapshot {
     pub log_slots: u32,
     pub active_slot_count: u64,
     pub alloc_counter: u64,
+    /// Tip header `attested_coverage` bound to this same MDBX snapshot.
+    /// Gates coinbase maturity in wallet balance/selection views.
+    pub attested_coverage: u64,
     pub utxos: Vec<VerifiedOwnerUtxo>,
 }
 
@@ -411,6 +419,11 @@ pub struct VerifiedOwnerSnapshot {
 pub struct AcceptedBlockCommitData<'a> {
     pub block_proof_bytes: &'a [u8],
     pub block_auth_sidecar_bytes: &'a [u8],
+    /// Serialized selected-history Link terminal envelope attesting the
+    /// header's advanced coverage. Empty is canonical for a block that keeps
+    /// its parent's `attested_coverage` and deletes any stale same-height
+    /// payload left by a reverted branch.
+    pub coverage_attestation_bytes: &'a [u8],
     pub history_claim_bytes: &'a [u8],
     pub accepted_block_certificate_bytes: &'a [u8],
 }
@@ -1803,6 +1816,7 @@ fn prune_retained_payloads_bounded(
     let recent = txn.open_table(Some(T_RECENT_BLOCKS))?;
     let proofs = txn.open_table(Some(T_BLOCK_PROOFS))?;
     let sidecars = txn.open_table(Some(T_BLOCK_AUTH_SIDECARS))?;
+    let attestations = txn.open_table(Some(T_COVERAGE_ATTESTATIONS))?;
     let history = txn.open_table(Some(T_HISTORY_CLAIMS))?;
     let certificates = txn.open_table(Some(T_ACCEPTED_BLOCK_CERTIFICATES))?;
     let certificate_bindings = txn.open_table(Some(T_ACCEPTED_BLOCK_CERTIFICATE_BINDINGS))?;
@@ -1829,6 +1843,8 @@ fn prune_retained_payloads_bounded(
             txn.get::<ObjectLength>(&proofs, &key)?
                 .map(|ObjectLength(length)| length),
             txn.get::<ObjectLength>(&sidecars, &key)?
+                .map(|ObjectLength(length)| length),
+            txn.get::<ObjectLength>(&attestations, &key)?
                 .map(|ObjectLength(length)| length),
             txn.get::<ObjectLength>(&history, &key)?
                 .map(|ObjectLength(length)| length),
@@ -1912,7 +1928,8 @@ fn prune_retained_payloads_bounded(
             (&recent, payload_lengths[0].is_some()),
             (&proofs, payload_lengths[1].is_some()),
             (&sidecars, payload_lengths[2].is_some()),
-            (&history, payload_lengths[3].is_some()),
+            (&attestations, payload_lengths[3].is_some()),
+            (&history, payload_lengths[4].is_some()),
         ] {
             if present {
                 txn.del(table, &key, None)?;
@@ -2148,6 +2165,7 @@ impl MdbxStore {
             T_TX_INDEX,
             T_BLOCK_PROOFS,
             T_BLOCK_AUTH_SIDECARS,
+            T_COVERAGE_ATTESTATIONS,
             T_HISTORY_CLAIMS,
             T_ACCEPTED_BLOCK_CERTIFICATES,
             T_ACCEPTED_BLOCK_CERTIFICATE_BINDINGS,
@@ -3998,20 +4016,22 @@ impl MdbxStore {
         Ok(txn.get(&tbl, &u64_key(height))?)
     }
 
-    /// Load one retained block/proof/authorization bundle from a single MDBX
-    /// snapshot after checking every stored length with `ObjectLength`.
+    /// Load one retained block/proof/authorization/attestation bundle from a
+    /// single MDBX snapshot after checking every stored length with
+    /// `ObjectLength`.
     ///
     /// This is the P2P serving boundary: corrupt or substituted database values
     /// cannot make the node allocate beyond consensus wire caps before their
-    /// lengths are rejected. The three payloads are mutually snapshot-stable.
+    /// lengths are rejected. The four payloads are mutually snapshot-stable.
     #[allow(clippy::type_complexity)]
     pub fn get_recent_block_bundle_bounded(
         &self,
         height: u64,
-    ) -> Result<Option<(Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>)>, StoreError> {
+    ) -> Result<Option<(Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>)>, StoreError>
+    {
         use crate::consensus::wire_limits::{
             proof_sidecar_combined_len_ok, MAX_BLOCK_AUTH_SIDECAR_BYTES, MAX_BLOCK_BYTES,
-            MAX_BLOCK_PROOF_BYTES,
+            MAX_BLOCK_PROOF_BYTES, MAX_COVERAGE_ATTESTATION_BYTES,
         };
 
         let txn = self.db.begin_ro_txn()?;
@@ -4019,12 +4039,14 @@ impl MdbxStore {
         let blocks = txn.open_table(Some(T_RECENT_BLOCKS))?;
         let proofs = txn.open_table(Some(T_BLOCK_PROOFS))?;
         let sidecars = txn.open_table(Some(T_BLOCK_AUTH_SIDECARS))?;
+        let attestations = txn.open_table(Some(T_COVERAGE_ATTESTATIONS))?;
         let block_len: Option<ObjectLength> = txn.get(&blocks, &key)?;
         let proof_len: Option<ObjectLength> = txn.get(&proofs, &key)?;
         let sidecar_len: Option<ObjectLength> = txn.get(&sidecars, &key)?;
+        let attestation_len: Option<ObjectLength> = txn.get(&attestations, &key)?;
 
         let Some(ObjectLength(block_len)) = block_len else {
-            if proof_len.is_some() || sidecar_len.is_some() {
+            if proof_len.is_some() || sidecar_len.is_some() || attestation_len.is_some() {
                 return Err(StoreError::Decode(
                     "retained proof material exists without its block",
                 ));
@@ -4050,6 +4072,13 @@ impl MdbxStore {
             return Err(StoreError::Decode(
                 "retained block proof material exceeds hard bounds",
             ));
+        }
+        if let Some(ObjectLength(length)) = attestation_len {
+            if length == 0 || length > MAX_COVERAGE_ATTESTATION_BYTES {
+                return Err(StoreError::Decode(
+                    "retained coverage attestation exceeds hard bounds",
+                ));
+            }
         }
 
         let block: Vec<u8> = txn
@@ -4086,7 +4115,20 @@ impl MdbxStore {
         } else {
             None
         };
-        Ok(Some((block, proof, sidecar)))
+        let attestation = if let Some(ObjectLength(expected)) = attestation_len {
+            let bytes: Vec<u8> = txn.get(&attestations, &key)?.ok_or(StoreError::Decode(
+                "retained coverage attestation disappeared during read",
+            ))?;
+            if bytes.len() != expected {
+                return Err(StoreError::Decode(
+                    "retained coverage attestation length changed during read",
+                ));
+            }
+            Some(bytes)
+        } else {
+            None
+        };
+        Ok(Some((block, proof, sidecar, attestation)))
     }
 
     /// Store a serialised `BlockProof` for `height`.
@@ -4122,6 +4164,40 @@ impl MdbxStore {
         let txn = self.db.begin_ro_txn()?;
         let tbl = txn.open_table(Some(T_BLOCK_AUTH_SIDECARS))?;
         let raw: Option<Vec<u8>> = txn.get(&tbl, &u64_key(height))?;
+        Ok(raw)
+    }
+
+    /// Store the serialized coverage-attestation envelope carried by the
+    /// accepted block at `height`. Retained with the block body so peers can
+    /// re-verify the coverage advancement.
+    pub fn put_coverage_attestation(&self, height: u64, bytes: &[u8]) -> Result<(), StoreError> {
+        if bytes.len() > crate::consensus::wire_limits::MAX_COVERAGE_ATTESTATION_BYTES {
+            return Err(StoreError::Decode(
+                "coverage attestation exceeds wire cap",
+            ));
+        }
+        let txn = self.db.begin_rw_txn()?;
+        let tbl = txn.open_table(Some(T_COVERAGE_ATTESTATIONS))?;
+        txn.put(&tbl, u64_key(height), bytes, WriteFlags::empty())?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Retrieve the coverage-attestation envelope bytes carried by the block
+    /// at `height`, or `None` when that block kept its parent's coverage.
+    pub fn get_coverage_attestation(&self, height: u64) -> Result<Option<Vec<u8>>, StoreError> {
+        let txn = self.db.begin_ro_txn()?;
+        let tbl = txn.open_table(Some(T_COVERAGE_ATTESTATIONS))?;
+        let raw: Option<Vec<u8>> = txn.get(&tbl, &u64_key(height))?;
+        if let Some(raw) = raw.as_ref() {
+            if raw.is_empty()
+                || raw.len() > crate::consensus::wire_limits::MAX_COVERAGE_ATTESTATION_BYTES
+            {
+                return Err(StoreError::Decode(
+                    "stored coverage attestation violates wire cap",
+                ));
+            }
+        }
         Ok(raw)
     }
 
@@ -4582,6 +4658,7 @@ impl MdbxStore {
             log_slots,
             active_slot_count,
             alloc_counter,
+            attested_coverage: header.attested_coverage,
             utxos: verified,
         })
     }
@@ -4859,6 +4936,7 @@ impl MdbxStore {
             T_TX_INDEX,
             T_BLOCK_PROOFS,
             T_BLOCK_AUTH_SIDECARS,
+            T_COVERAGE_ATTESTATIONS,
             T_HISTORY_CLAIMS,
             T_ACCEPTED_BLOCK_CERTIFICATES,
             T_ACCEPTED_BLOCK_CERTIFICATE_BINDINGS,
@@ -5130,6 +5208,7 @@ impl MdbxStore {
             T_TX_INDEX,
             T_BLOCK_PROOFS,
             T_BLOCK_AUTH_SIDECARS,
+            T_COVERAGE_ATTESTATIONS,
             T_HISTORY_CLAIMS,
             T_ACCEPTED_BLOCK_CERTIFICATES,
             T_ACCEPTED_BLOCK_CERTIFICATE_BINDINGS,
@@ -5501,6 +5580,28 @@ impl MdbxStore {
                     &sidecar_tbl,
                     height_key,
                     accepted.block_auth_sidecar_bytes,
+                    WriteFlags::empty(),
+                )?;
+            }
+
+            // Coverage attestation follows the same delete-on-empty contract
+            // so a reorg replacing an attesting block cannot leave a stale
+            // envelope bound to a different header at this height.
+            let attestation_tbl = txn.open_table(Some(T_COVERAGE_ATTESTATIONS))?;
+            if accepted.coverage_attestation_bytes.is_empty() {
+                let _ = txn.del(&attestation_tbl, height_key, None);
+            } else {
+                if accepted.coverage_attestation_bytes.len()
+                    > crate::consensus::wire_limits::MAX_COVERAGE_ATTESTATION_BYTES
+                {
+                    return Err(StoreError::Decode(
+                        "accepted coverage attestation exceeds wire cap",
+                    ));
+                }
+                txn.put(
+                    &attestation_tbl,
+                    height_key,
+                    accepted.coverage_attestation_bytes,
                     WriteFlags::empty(),
                 )?;
             }
@@ -5917,6 +6018,7 @@ impl MdbxStore {
             T_RECENT_BLOCKS,
             T_BLOCK_PROOFS,
             T_BLOCK_AUTH_SIDECARS,
+            T_COVERAGE_ATTESTATIONS,
             T_HISTORY_CLAIMS,
             T_ACCEPTED_BLOCK_CERTIFICATES,
             T_ACCEPTED_BLOCK_CERTIFICATE_BINDINGS,
@@ -5968,6 +6070,7 @@ impl MdbxStore {
         let recent_tbl = txn.open_table(Some(T_RECENT_BLOCKS))?;
         let proof_tbl = txn.open_table(Some(T_BLOCK_PROOFS))?;
         let sidecar_tbl = txn.open_table(Some(T_BLOCK_AUTH_SIDECARS))?;
+        let attestation_tbl = txn.open_table(Some(T_COVERAGE_ATTESTATIONS))?;
         let history_tbl = txn.open_table(Some(T_HISTORY_CLAIMS))?;
         let certificate_tbl = txn.open_table(Some(T_ACCEPTED_BLOCK_CERTIFICATES))?;
         let certificate_binding_tbl =
@@ -6035,6 +6138,16 @@ impl MdbxStore {
                     &sidecar_tbl,
                     height_key,
                     payload.block_auth_sidecar_bytes,
+                    WriteFlags::empty(),
+                )?;
+            }
+            if payload.coverage_attestation_bytes.is_empty() {
+                let _ = txn.del(&attestation_tbl, height_key, None);
+            } else {
+                txn.put(
+                    &attestation_tbl,
+                    height_key,
+                    payload.coverage_attestation_bytes,
                     WriteFlags::empty(),
                 )?;
             }
@@ -6228,6 +6341,7 @@ impl MdbxStore {
             T_TX_INDEX,
             T_BLOCK_PROOFS,
             T_BLOCK_AUTH_SIDECARS,
+            T_COVERAGE_ATTESTATIONS,
             T_HISTORY_CLAIMS,
             T_ACCEPTED_BLOCK_CERTIFICATES,
             T_ACCEPTED_BLOCK_CERTIFICATE_BINDINGS,
@@ -6886,10 +7000,19 @@ mod tests {
             Some(b"bounded-proof"),
             Some(b"bounded-sidecar"),
         );
-        let (block, proof, sidecar) = store.get_recent_block_bundle_bounded(3).unwrap().unwrap();
+        let (block, proof, sidecar, attestation) =
+            store.get_recent_block_bundle_bounded(3).unwrap().unwrap();
         assert_eq!(block, b"bounded-block");
         assert_eq!(proof.as_deref(), Some(b"bounded-proof".as_slice()));
         assert_eq!(sidecar.as_deref(), Some(b"bounded-sidecar".as_slice()));
+        assert_eq!(attestation, None);
+
+        store.put_coverage_attestation(3, b"bounded-attestation").unwrap();
+        let (_, _, _, attestation) = store.get_recent_block_bundle_bounded(3).unwrap().unwrap();
+        assert_eq!(
+            attestation.as_deref(),
+            Some(b"bounded-attestation".as_slice())
+        );
 
         let txn = store.db.begin_rw_txn().unwrap();
         let sidecars = txn.open_table(Some(T_BLOCK_AUTH_SIDECARS)).unwrap();
@@ -8079,6 +8202,7 @@ mod tests {
         let accepted_artifacts = AcceptedBlockCommitData {
             block_proof_bytes: &[],
             block_auth_sidecar_bytes: &[],
+            coverage_attestation_bytes: &[],
             history_claim_bytes: b"history-one",
             accepted_block_certificate_bytes: b"certificate-one",
         };
@@ -8147,6 +8271,7 @@ mod tests {
                 Some(AcceptedBlockCommitData {
                     block_proof_bytes: &[],
                     block_auth_sidecar_bytes: &[],
+                    coverage_attestation_bytes: &[],
                     history_claim_bytes: b"history-two",
                     accepted_block_certificate_bytes: b"certificate-two",
                 }),
@@ -8257,6 +8382,7 @@ mod tests {
                 Some(AcceptedBlockCommitData {
                     block_proof_bytes: &[],
                     block_auth_sidecar_bytes: &[],
+                    coverage_attestation_bytes: &[],
                     history_claim_bytes: b"old-history",
                     accepted_block_certificate_bytes: b"old-certificate",
                 }),
@@ -8294,7 +8420,7 @@ mod tests {
             history_claim_bytes: b"replacement-history".to_vec(),
             accepted_block_certificate_bytes: b"replacement-certificate".to_vec(),
         };
-        let replacement_payload = ReorgBlockPayload::new(&replacement_block, &[], &[]);
+        let replacement_payload = ReorgBlockPayload::new(&replacement_block, &[], &[], &[]);
         let replacement_meta = ConsensusMeta {
             tip_height: 1,
             tip_hash: replacement_hash,
@@ -8359,7 +8485,7 @@ mod tests {
             history_claim_bytes: b"failed-history".to_vec(),
             accepted_block_certificate_bytes: b"failed-certificate".to_vec(),
         };
-        let failed_payload = ReorgBlockPayload::new(&failed_block, &[], &[]);
+        let failed_payload = ReorgBlockPayload::new(&failed_block, &[], &[], &[]);
         let failed_meta = ConsensusMeta {
             tip_height: 2,
             tip_hash: failed_hash,
@@ -9003,6 +9129,7 @@ mod tests {
                 Some(AcceptedBlockCommitData {
                     block_proof_bytes: b"first-proof",
                     block_auth_sidecar_bytes: b"first-sidecar",
+                    coverage_attestation_bytes: &[],
                     history_claim_bytes: b"first-history",
                     accepted_block_certificate_bytes: b"first-certificate",
                 }),
@@ -9022,6 +9149,7 @@ mod tests {
             Some(AcceptedBlockCommitData {
                 block_proof_bytes: b"uncommitted-proof",
                 block_auth_sidecar_bytes: b"uncommitted-sidecar",
+                coverage_attestation_bytes: &[],
                 history_claim_bytes: b"",
                 accepted_block_certificate_bytes: b"uncommitted-certificate",
             }),
@@ -9061,6 +9189,7 @@ mod tests {
                 Some(AcceptedBlockCommitData {
                     block_proof_bytes: b"",
                     block_auth_sidecar_bytes: b"",
+                    coverage_attestation_bytes: &[],
                     history_claim_bytes: b"replacement-history",
                     accepted_block_certificate_bytes: b"replacement-certificate",
                 }),
@@ -9734,6 +9863,7 @@ mod tests {
                 log_slots: h0.log_slots,
                 active_slot_count: 1,
                 alloc_counter: 1,
+                attested_coverage: 0,
             };
             let h1_hash = crate::hash_block_header(&h1);
             let h1_work = [2u8; 32];
@@ -9930,6 +10060,7 @@ mod tests {
             Some(AcceptedBlockCommitData {
                 block_proof_bytes: b"production-grow-proof",
                 block_auth_sidecar_bytes: b"production-grow-sidecar",
+                coverage_attestation_bytes: &[],
                 history_claim_bytes: b"production-grow-history",
                 accepted_block_certificate_bytes: b"production-grow-certificate",
             }),
@@ -10098,6 +10229,7 @@ mod tests {
             let accepted = AcceptedBlockCommitData {
                 block_proof_bytes: b"accepted-proof",
                 block_auth_sidecar_bytes: b"accepted-sidecar",
+                coverage_attestation_bytes: &[],
                 history_claim_bytes: b"accepted-history",
                 accepted_block_certificate_bytes: b"accepted-certificate",
             };
@@ -10553,6 +10685,7 @@ mod tests {
                     Some(AcceptedBlockCommitData {
                         block_proof_bytes: b"old-proof",
                         block_auth_sidecar_bytes: b"old-sidecar",
+                        coverage_attestation_bytes: &[],
                         history_claim_bytes: b"old-history",
                         accepted_block_certificate_bytes: b"old-certificate",
                     }),
@@ -10587,7 +10720,7 @@ mod tests {
                 history_claim_bytes: b"new-history".to_vec(),
                 accepted_block_certificate_bytes: b"new-certificate".to_vec(),
             };
-            let payload = ReorgBlockPayload::new(&new_block, b"new-proof", b"new-sidecar");
+            let payload = ReorgBlockPayload::new(&new_block, b"new-proof", b"new-sidecar", b"");
             let new_meta = ConsensusMeta {
                 tip_height: 1,
                 tip_hash: new_hash,

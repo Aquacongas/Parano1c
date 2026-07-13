@@ -64,6 +64,9 @@ struct ProvedBlockCandidate {
     block_bytes_len: usize,
     block_proof_bytes: Vec<u8>,
     block_auth_sidecar_bytes: Vec<u8>,
+    /// Serialized Link terminal envelope for coverage-advancing blocks.
+    /// Empty when the header keeps its parent's `attested_coverage`.
+    coverage_attestation_bytes: Vec<u8>,
 }
 
 struct AppliedP2pBlock {
@@ -84,6 +87,7 @@ struct OrphanBlock {
     block_bytes_len: usize,
     block_proof_bytes: Vec<u8>,
     block_auth_sidecar_bytes: Vec<u8>,
+    coverage_attestation_bytes: Vec<u8>,
     received_at: Instant,
 }
 
@@ -94,12 +98,14 @@ impl OrphanBlock {
             block_bytes_len,
             block_proof_bytes,
             block_auth_sidecar_bytes,
+            coverage_attestation_bytes,
         } = candidate;
         Self {
             block,
             block_bytes_len,
             block_proof_bytes,
             block_auth_sidecar_bytes,
+            coverage_attestation_bytes,
             received_at: Instant::now(),
         }
     }
@@ -110,6 +116,7 @@ impl OrphanBlock {
             block_bytes_len: self.block_bytes_len,
             block_proof_bytes: self.block_proof_bytes,
             block_auth_sidecar_bytes: self.block_auth_sidecar_bytes,
+            coverage_attestation_bytes: self.coverage_attestation_bytes,
         }
     }
 
@@ -117,6 +124,7 @@ impl OrphanBlock {
         self.block_bytes_len
             .saturating_add(self.block_proof_bytes.len())
             .saturating_add(self.block_auth_sidecar_bytes.len())
+            .saturating_add(self.coverage_attestation_bytes.len())
     }
 }
 
@@ -748,6 +756,11 @@ pub enum NodeMode {
     /// verifier will authorize.
     #[default]
     Relay,
+    /// Relay that also runs the selected-history proving worker: no mining,
+    /// no template serving, but the node advances the Link ladder and serves
+    /// O(1) snapshots. For operators who want to support the network without
+    /// mining.
+    Prover,
     /// Internal miner. Runs built-in PoW + block-certificate assembly in parallel.
     /// Blocks external miner (extminer) access to the block-template API.
     Miner,
@@ -772,10 +785,23 @@ struct Cli {
     /// Node operating mode.
     ///
     /// relay    — full node, no mining (default)
+    /// prover   — full node that also proves the Link ladder (network support)
     /// miner    — internal PoW + block-certificate assembly; blocks extminer access
     /// extminer — serves block templates to noid-extminer; requires --mining-key
     #[arg(long, value_enum, default_value_t = NodeMode::Relay)]
     mode: NodeMode,
+
+    /// Shorthand for `--mode miner`.
+    #[arg(long, conflicts_with_all = ["extminer", "prover"])]
+    miner: bool,
+
+    /// Shorthand for `--mode extminer`.
+    #[arg(long, conflicts_with_all = ["miner", "prover"])]
+    extminer: bool,
+
+    /// Shorthand for `--mode prover`.
+    #[arg(long, conflicts_with_all = ["miner", "extminer"])]
+    prover: bool,
 
     /// Bootstrap a new network: start mining immediately without waiting for peers.
     /// Use ONLY for the very first node on a fresh network.
@@ -932,7 +958,16 @@ fn ip_port_to_multiaddr(addr: &str) -> anyhow::Result<libp2p::Multiaddr> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    // Shorthand role flags override the default mode; clap already rejects
+    // combining them with each other.
+    if cli.miner {
+        cli.mode = NodeMode::Miner;
+    } else if cli.extminer {
+        cli.mode = NodeMode::Extminer;
+    } else if cli.prover {
+        cli.mode = NodeMode::Prover;
+    }
 
     // --- Tracing ---
     // Log format: HH:MM:SS LEVEL target: message
@@ -975,7 +1010,10 @@ async fn main() -> anyhow::Result<()> {
     if cli.mode != NodeMode::Miner && cli.mining_threads.is_some() {
         anyhow::bail!("--mining-threads is only valid with --mode miner");
     }
-    let selected_history_prover_enabled = matches!(&cli.mode, NodeMode::Miner | NodeMode::Extminer);
+    let selected_history_prover_enabled = matches!(
+        &cli.mode,
+        NodeMode::Miner | NodeMode::Extminer | NodeMode::Prover
+    );
     // Every role imports remote terminals: when any faster prover has
     // advanced the ladder, local coverage jumps forward instead of grinding
     // through heights someone already proved. Provers resume from the jump
@@ -1374,6 +1412,7 @@ async fn main() -> anyhow::Result<()> {
                         block_bytes,
                         block_proof_bytes,
                         block_auth_sidecar_bytes,
+                        coverage_attestation_bytes,
                         height,
                         hash,
                         n_txs,
@@ -1403,6 +1442,7 @@ async fn main() -> anyhow::Result<()> {
                                 block_bytes,
                                 block_proof_bytes,
                                 block_auth_sidecar_bytes,
+                                coverage_attestation_bytes,
                             })
                             .await;
                     }
@@ -1818,6 +1858,64 @@ fn validate_snapshot_staged_header_boundary(
     Ok(())
 }
 
+/// Natively verify one block's coverage-attestation claim (fail-closed).
+///
+/// Byte-exact fast path first: when the local durable results store already
+/// holds an identical verified terminal bound to the same canonical boundary
+/// (own prover promotion or a relay import), no cryptographic work is redone.
+/// Otherwise the envelope is verified through the pinned release registry and
+/// streamed matrices. A node without those artifacts cannot validate a
+/// coverage-attesting block and rejects it.
+fn verify_block_coverage_attestation(
+    claim: &noid_chain::storage::CoverageAttestationClaim<'_>,
+    artifacts: Option<&SelectedHistoryVerifierArtifacts>,
+    store: &noid_chain::storage::MdbxStore,
+) -> Result<(), String> {
+    let expected_hash = noid_chain::hash_block_header(&claim.header_at_coverage);
+    if let Ok(Some(result)) =
+        store.get_selected_history_terminal_result_at(claim.coverage_height, expected_hash)
+    {
+        if result.bytes == claim.attestation_bytes {
+            return Ok(());
+        }
+    }
+    let package =
+        noid_recursive::decode_selected_history_terminal_package(claim.attestation_bytes)
+            .map_err(|error| format!("coverage attestation decode failed: {error}"))?;
+    if package.terminal_height() != claim.coverage_height {
+        return Err("coverage attestation height does not match the header claim".to_string());
+    }
+    if package.terminal_hash() != expected_hash {
+        return Err(
+            "coverage attestation does not bind the canonical header at the attested height"
+                .to_string(),
+        );
+    }
+    let Some(artifacts) = artifacts else {
+        return Err(
+            "release verifier artifacts unavailable — cannot validate a coverage-attesting block"
+                .to_string(),
+        );
+    };
+    let registry_store =
+        noid_miner::LocalSelectedRecursiveClassRegistryStore::new(artifacts.root.clone());
+    let mut matrix_source =
+        noid_miner::LocalSelectedRecursiveMatrixSource::new(artifacts.root.clone());
+    if std::env::var_os("NOID_ALWAYS_REHASH_MATRICES").is_some() {
+        matrix_source.set_artifact_trust(false);
+    }
+    noid_miner::verify_selected_history_terminal_pinned_governed(
+        &package,
+        &registry_store,
+        artifacts.registry_digest,
+        &claim.header_at_coverage,
+        &claim.epoch_anchor_header,
+        &mut matrix_source,
+    )
+    .map_err(|error| format!("coverage attestation rejected: {error}"))?;
+    Ok(())
+}
+
 fn verify_snapshot_selected_history_terminal(
     expected_height: u64,
     expected_hash: [u8; 32],
@@ -2115,15 +2213,18 @@ async fn apply_p2p_block_offthread(
     candidate: ProvedBlockCandidate,
     local_time: u64,
     preverified_auth: std::collections::HashMap<[u8; 32], Vec<u8>>,
+    selected_history_verifier: Option<SelectedHistoryVerifierArtifacts>,
 ) -> Result<AppliedP2pBlock, (noid_chain::storage::MdbxContextError, ProvedBlockCandidate)> {
     let chain = chain.clone();
     let wallet = wallet.clone();
     tokio::task::spawn_blocking(move || {
         let mut ctx = chain.blocking_write();
+        let attestation_store = ctx.store.clone();
         let apply_result = ctx.apply_next_block(
             &candidate.block,
             &candidate.block_proof_bytes,
             &candidate.block_auth_sidecar_bytes,
+            &candidate.coverage_attestation_bytes,
             local_time,
             |block,
              proof_bytes,
@@ -2176,6 +2277,13 @@ async fn apply_p2p_block_offthread(
                     ),
                 )
             },
+            |claim| {
+                verify_block_coverage_attestation(
+                    claim,
+                    selected_history_verifier.as_ref(),
+                    &attestation_store,
+                )
+            },
         );
         let hash = match apply_result {
             Ok(hash) => hash,
@@ -2212,6 +2320,7 @@ async fn apply_p2p_block_offthread(
 /// The owned replacement payloads are retained only on failure.  On success
 /// they are dropped on the blocking worker and only compact mempool metadata
 /// crosses back to async code.
+#[allow(clippy::too_many_arguments)]
 async fn apply_reorg_offthread(
     chain: &Arc<RwLock<MdbxChainContext>>,
     wallet: &SharedWallet,
@@ -2220,6 +2329,7 @@ async fn apply_reorg_offthread(
     ancestor_height: u64,
     new_blocks: Vec<ProvedBlockCandidate>,
     local_time: u64,
+    selected_history_verifier: Option<SelectedHistoryVerifierArtifacts>,
 ) -> Result<
     AppliedReorg,
     (
@@ -2246,6 +2356,7 @@ async fn apply_reorg_offthread(
                     &candidate.block,
                     &candidate.block_proof_bytes,
                     &candidate.block_auth_sidecar_bytes,
+                    &candidate.coverage_attestation_bytes,
                 )
             })
             .collect();
@@ -2254,10 +2365,13 @@ async fn apply_reorg_offthread(
             &replacement_payloads,
             local_time,
             |ctx, candidate, block_local_time| {
+                let attestation_store = ctx.store.clone();
+                let selected_history_verifier = selected_history_verifier.clone();
                 ctx.apply_next_block(
                     candidate.block,
                     candidate.block_proof_bytes,
                     candidate.block_auth_sidecar_bytes,
+                    candidate.coverage_attestation_bytes,
                     block_local_time,
                     |block,
                      proof_bytes,
@@ -2306,6 +2420,13 @@ async fn apply_reorg_offthread(
                                 history_claim_bytes,
                                 certificate_record_bytes,
                             ),
+                        )
+                    },
+                    |claim| {
+                        verify_block_coverage_attestation(
+                            claim,
+                            selected_history_verifier.as_ref(),
+                            &attestation_store,
                         )
                     },
                 )?;
@@ -2586,17 +2707,21 @@ mod tests {
         let sidecar = vec![0x5A; 129];
         let proof_ptr = proof.as_ptr();
         let sidecar_ptr = sidecar.as_ptr();
+        let attestation = vec![0xC3; 65];
+        let attestation_ptr = attestation.as_ptr();
         let candidate = ProvedBlockCandidate {
             block,
             block_bytes_len: 33,
             block_proof_bytes: proof,
             block_auth_sidecar_bytes: sidecar,
+            coverage_attestation_bytes: attestation,
         };
 
         let orphan = OrphanBlock::from_candidate(candidate);
         assert_eq!(orphan.block_proof_bytes.as_ptr(), proof_ptr);
         assert_eq!(orphan.block_auth_sidecar_bytes.as_ptr(), sidecar_ptr);
-        assert_eq!(orphan.retained_bytes(), 33 + 257 + 129);
+        assert_eq!(orphan.coverage_attestation_bytes.as_ptr(), attestation_ptr);
+        assert_eq!(orphan.retained_bytes(), 33 + 257 + 129 + 65);
 
         let candidate = orphan.into_candidate();
         assert_eq!(candidate.block_proof_bytes.as_ptr(), proof_ptr);
@@ -3545,6 +3670,7 @@ async fn handle_p2p_events(
                 block_bytes,
                 block_proof_bytes,
                 block_auth_sidecar_bytes,
+                coverage_attestation_bytes,
                 mut inbound_memory_permit,
             }) => {
                 if snapshot_install_inflight.is_some() {
@@ -3554,6 +3680,7 @@ async fn handle_p2p_events(
                     drop(block_bytes);
                     drop(block_proof_bytes);
                     drop(block_auth_sidecar_bytes);
+                    drop(coverage_attestation_bytes);
                     drop(inbound_memory_permit.take());
                     tracing::debug!(
                         peer = %from,
@@ -3643,11 +3770,13 @@ async fn handle_p2p_events(
                             block_bytes_len,
                             block_proof_bytes,
                             block_auth_sidecar_bytes,
+                            coverage_attestation_bytes,
                         };
                         let suffix_block_bytes = candidate
                             .block_bytes_len
                             .saturating_add(candidate.block_proof_bytes.len())
                             .saturating_add(candidate.block_auth_sidecar_bytes.len())
+                            .saturating_add(candidate.coverage_attestation_bytes.len())
                             as u64;
                         let apply_result = apply_p2p_block_offthread(
                             &chain,
@@ -3655,6 +3784,7 @@ async fn handle_p2p_events(
                             candidate,
                             local_time,
                             preverified_auth,
+                            selected_history_verifier.clone(),
                         )
                         .await;
 
@@ -3716,6 +3846,7 @@ async fn handle_p2p_events(
                                         orphan_candidate,
                                         orphan_local_time,
                                         orphan_preverified,
+                                        selected_history_verifier.clone(),
                                     )
                                     .await;
                                     match orphan_result {
@@ -3858,6 +3989,7 @@ async fn handle_p2p_events(
                                                 ancestor_height,
                                                 new_chain,
                                                 local_time,
+                                                selected_history_verifier.clone(),
                                             )
                                             .await;
 

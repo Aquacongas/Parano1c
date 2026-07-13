@@ -77,6 +77,11 @@ pub struct ChainView {
     /// Canonical tip hash paired with `tip_height` for atomic durable reads.
     pub tip_hash: [u8; 32],
 
+    /// `attested_coverage` of the tip header: the proven selected-history
+    /// frontier already attested on-chain. Coinbase UTXOs minted above this
+    /// height are immature for admission (proof-gated coinbase maturity).
+    pub tip_attested_coverage: u64,
+
     /// UTXO state for slot liveness / emptiness checks.
     /// Lazy: only materialized segments are allocated.
     state: SegmentedFriState,
@@ -102,6 +107,10 @@ impl ChainView {
             .get(&tip_height)
             .map(block_id)
             .unwrap_or([0u8; 32]);
+        let tip_attested_coverage = recent_headers
+            .get(&tip_height)
+            .map(|header| header.attested_coverage)
+            .unwrap_or(0);
         Self {
             tip_height,
             recent_headers,
@@ -109,6 +118,7 @@ impl ChainView {
             active_slot_count,
             user_epoch_anchor_id,
             tip_hash,
+            tip_attested_coverage,
             state,
             store: None,
             segment_cache: Arc::new(Mutex::new(SegmentReadCache::default())),

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Direct ten-lane chain-accumulator transition in the acceptance trace.
+//! Direct eleven-lane chain-accumulator transition in the acceptance trace.
 //!
 //! There is no rolling chain hash and no accepted-claim digest fold. One
 //! block proof exposes the parent boundary and proves that the header is its
@@ -13,6 +13,7 @@ use noid_core::Block128;
 use noid_poseidon2b::native::domain::{capacity_iv, DomainTag, TAG_COMPRESS};
 use noid_poseidon2b::native::permutation::STATE_SIZE;
 
+use super::action_compaction::strict_less_bits;
 use super::tx_epoch::constrain_tx_epoch_boundary;
 use super::{
     alloc_block, const_block, flat_const, mul, pin_eq, pin_zero, poseidon2b_permute,
@@ -68,6 +69,7 @@ pub struct DirectChildWires {
     pub log_slots: LinExpr,
     pub active_slot_count: LinExpr,
     pub alloc_counter: LinExpr,
+    pub attested_coverage: LinExpr,
 }
 
 /// Accumulator boundary wires (start/end).
@@ -79,6 +81,7 @@ pub struct AccumulatorWires {
     pub active_slot_count: LinExpr,
     pub alloc_counter: LinExpr,
     pub epoch_anchor_id: [LinExpr; 2],
+    pub attested_coverage: LinExpr,
 }
 
 impl AccumulatorWires {
@@ -97,6 +100,7 @@ impl AccumulatorWires {
             active_slot_count: lanes[6].clone(),
             alloc_counter: lanes[7].clone(),
             epoch_anchor_id: [lanes[8].clone(), lanes[9].clone()],
+            attested_coverage: lanes[10].clone(),
         }
     }
 
@@ -113,21 +117,23 @@ impl AccumulatorWires {
             self.alloc_counter.clone(),
             self.epoch_anchor_id[0].clone(),
             self.epoch_anchor_id[1].clone(),
+            self.attested_coverage.clone(),
         ]
     }
 }
 
-/// Range-check every scalar accumulator lane and return the height bits for
-/// the exact successor relation.
+/// Range-check every scalar accumulator lane and return the height and
+/// attested-coverage bits for the exact successor/advancement relations.
 fn range_check_boundary_scalars(
     b: &mut FieldR1csBuilder,
     boundary: &AccumulatorWires,
-) -> Vec<Wire> {
+) -> (Vec<Wire>, Vec<Wire>) {
     let height_bits = range_check_bits(b, &boundary.height, 64);
     let _ = range_check_bits(b, &boundary.log_slots, 32);
     let _ = range_check_bits(b, &boundary.active_slot_count, 64);
     let _ = range_check_bits(b, &boundary.alloc_counter, 64);
-    height_bits
+    let coverage_bits = range_check_bits(b, &boundary.attested_coverage, 64);
+    (height_bits, coverage_bits)
 }
 
 /// Pin `child = parent + 1` as an exact u64 integer relation.
@@ -146,15 +152,15 @@ fn pin_u64_successor(b: &mut FieldR1csBuilder, parent_bits: &[Wire], child: &Lin
     pin_eq(b, child, &reconstructed);
 }
 
-/// Prove one direct child transition between ten-lane boundaries.
+/// Prove one direct child transition between eleven-lane boundaries.
 pub fn build_direct_accumulator_transition_slot(
     b: &mut FieldR1csBuilder,
     start: &AccumulatorWires,
     child: &DirectChildWires,
     end: &AccumulatorWires,
 ) {
-    let start_height_bits = range_check_boundary_scalars(b, start);
-    let _ = range_check_boundary_scalars(b, end);
+    let (start_height_bits, start_coverage_bits) = range_check_boundary_scalars(b, start);
+    let (_, end_coverage_bits) = range_check_boundary_scalars(b, end);
 
     for lane in 0..2 {
         pin_eq(b, &child.prev_block_hash[lane], &start.tip_block_id[lane]);
@@ -169,6 +175,19 @@ pub fn build_direct_accumulator_transition_slot(
     pin_eq(b, &child.log_slots, &end.log_slots);
     pin_eq(b, &child.active_slot_count, &end.active_slot_count);
     pin_eq(b, &child.alloc_counter, &end.alloc_counter);
+    pin_eq(b, &child.attested_coverage, &end.attested_coverage);
+
+    // Attested-coverage advancement rule — the monotone+bound envelope of the
+    // native `ChainAccumulator::advance` twin of consensus header rule 7:
+    // `start.attested_coverage <= child.attested_coverage <= start.height`.
+    // On every reachable boundary (inductively from genesis, where coverage
+    // and height are both zero) `start.attested_coverage <= start.height`
+    // holds, making this interval exactly the natively accepted set; outside
+    // that invariant it only rejects more, never less.
+    let (coverage_regressed, _) = strict_less_bits(b, &end_coverage_bits, &start_coverage_bits);
+    pin_zero(b, &coverage_regressed);
+    let (coverage_overreach, _) = strict_less_bits(b, &start_height_bits, &end_coverage_bits);
+    pin_zero(b, &coverage_overreach);
 
     // `boundary` is derived from the constrained child height, never supplied
     // independently by the prover.
@@ -195,6 +214,7 @@ mod tests {
         log_slots: u32,
         active_slot_count: u64,
         alloc_counter: u64,
+        attested_coverage: u64,
     }
 
     fn fixture(parent_height: u64) -> (ChainAccumulator, NativeChild, ChainAccumulator) {
@@ -206,6 +226,7 @@ mod tests {
             active_slot_count: 17,
             alloc_counter: 29,
             epoch_anchor_id: [0x33; 32],
+            attested_coverage: 2,
         };
         let child = NativeChild {
             block_id: [0x44; 32],
@@ -215,6 +236,7 @@ mod tests {
             log_slots: 25,
             active_slot_count: 19,
             alloc_counter: 31,
+            attested_coverage: 5,
         };
         let end = ChainAccumulator {
             height: child.height,
@@ -228,6 +250,7 @@ mod tests {
             } else {
                 start.epoch_anchor_id
             },
+            attested_coverage: child.attested_coverage,
         };
         (start, child, end)
     }
@@ -244,6 +267,7 @@ mod tests {
             log_slots: alloc_block(b, Block128::from(child.log_slots)),
             active_slot_count: alloc_block(b, Block128::from(child.active_slot_count)),
             alloc_counter: alloc_block(b, Block128::from(child.alloc_counter)),
+            attested_coverage: alloc_block(b, Block128::from(child.attested_coverage)),
         }
     }
 
@@ -333,7 +357,7 @@ mod tests {
     #[test]
     fn direct_transition_rejects_every_child_projection_mutation() {
         let (start, child, end) = fixture(143);
-        for target in 0..10 {
+        for target in 0..11 {
             let mut bad = child.clone();
             match target {
                 0 => bad.block_id[0] ^= 1,
@@ -346,9 +370,38 @@ mod tests {
                 7 => bad.log_slots ^= 1,
                 8 => bad.active_slot_count ^= 1,
                 9 => bad.alloc_counter ^= 1,
+                10 => bad.attested_coverage ^= 1,
                 _ => unreachable!(),
             }
             assert!(!satisfies(&start, &bad, &end), "child target {target}");
+        }
+    }
+
+    /// Twin of the native advance rule envelope: the child coverage must not
+    /// regress below the start boundary's coverage and must not exceed the
+    /// start (parent) height.
+    #[test]
+    fn direct_transition_pins_attested_coverage_envelope() {
+        let (start, child, end) = fixture(143);
+        assert_eq!(start.attested_coverage, 2);
+
+        let with_coverage = |coverage: u64| {
+            let mut child = child.clone();
+            let mut end = end.clone();
+            child.attested_coverage = coverage;
+            end.attested_coverage = coverage;
+            (child, end)
+        };
+        // Repeat, interior advancement and the exact parent-height bound.
+        for valid in [2u64, 5, 143] {
+            let (child, end) = with_coverage(valid);
+            assert!(satisfies(&start, &child, &end), "coverage {valid}");
+        }
+        // Regression below the start coverage and any advancement beyond the
+        // parent height are unsatisfiable.
+        for invalid in [0u64, 1, 144, u64::MAX] {
+            let (child, end) = with_coverage(invalid);
+            assert!(!satisfies(&start, &child, &end), "coverage {invalid}");
         }
     }
 
@@ -358,6 +411,7 @@ mod tests {
             (5usize, u32::MAX as u128 + 1),
             (6usize, u64::MAX as u128 + 1),
             (7usize, u64::MAX as u128 + 1),
+            (10usize, u64::MAX as u128 + 1),
         ] {
             let accepted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut b = FieldR1csBuilder::new();

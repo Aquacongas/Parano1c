@@ -90,11 +90,15 @@ use super::trace::{mul, pin_eq};
 use crate::accumulator::{genesis_accumulator, ChainAccumulator, ChainAccumulatorLaneError};
 use crate::region_sidecar::{
     decode_block_region_sidecar_bounded, decode_link_region_sidecar_bounded,
-    link_post_commit_class_digest, selected_zk_block_post_commit_class_digest_from_vk_digest,
-    verify_block_region_sidecar_post_commit, verify_block_region_sidecar_trace_post_commit,
-    verify_link_region_sidecar_post_commit, verify_link_region_sidecar_trace_post_commit,
+    derive_block_sidecar_recording_layout, link_post_commit_class_digest,
+    scratch_record_block_sidecar_child, selected_zk_block_post_commit_class_digest_from_vk_digest,
+    verify_block_region_sidecar_post_commit, verify_block_region_sidecar_post_commit_captured,
+    verify_block_region_sidecar_recorded_trace_post_commit, BlockSidecarChildTranscript,
     LinkRegionProverPlan, LinkRegionSidecarProof, LinkRegionSidecarVk, RegionSidecarError,
 };
+use crate::region_sidecar::verify_link_region_sidecar_post_commit;
+use crate::region_sidecar::verify_link_region_sidecar_trace_post_commit;
+use noid_ivc_core::deep_chain::schedule::DuplexLayout;
 use noid_core::Block128;
 use noid_ivc_prover::field_prover::prove_field_with_public_io_and_post_commit_context;
 
@@ -130,13 +134,18 @@ pub struct LadderSlotInfo {
     /// separately makes a mismatched but internally valid block authority
     /// detectable before its hosted link class is materialized.
     pub b_sidecar_vk_digest: [u8; 32],
+    /// Canonical recorded block-sidecar child-transcript layout of this
+    /// slot's class — the walk L-C recording block every link hosts for the
+    /// slot.  A protocol constant of the tier, derived (never persisted) by
+    /// replaying the recorded verifier schedule against a shape-only proof.
+    pub b_sidecar_rec_layout: DuplexLayout,
 }
 
 /// Frozen production Field dimensions for the four consensus Block classes.
 pub const CANONICAL_BLOCK_CLASS_MS: [usize;
     noid_chain::consensus::params::USER_TX_CLASS_TIERS.len()] = [22, 23, 23, 24];
 /// Frozen production Field dimension shared by every Link class.
-pub const CANONICAL_LINK_CLASS_M: usize = 24;
+pub const CANONICAL_LINK_CLASS_M: usize = 23;
 /// Frozen production BaseFold inverse-rate logarithm.
 pub const CANONICAL_PCS_LOG_INV_RATE: usize = 2;
 /// Frozen production BaseFold row-batch logarithm.
@@ -544,7 +553,11 @@ impl CanonicalSplitLinkLadder {
             .iter()
             .map(|slot| slot.b_pcs_params.clone())
             .collect::<Vec<_>>();
-        RPcsLinkUniversalGeometry::new(&link_pcs_params, &block_params, n_queries)
+        let rec_layouts = slots
+            .iter()
+            .map(|slot| slot.b_sidecar_rec_layout.clone())
+            .collect::<Vec<_>>();
+        RPcsLinkUniversalGeometry::new(&link_pcs_params, &block_params, n_queries, rec_layouts)
             .map_err(|_| CanonicalLadderError::UnsupportedUniversalPcs)?;
 
         Ok(Self {
@@ -567,6 +580,11 @@ impl CanonicalSplitLinkLadder {
             let b_digest = block_class
                 .validate_frozen_identity()
                 .map_err(|_| CanonicalLadderError::BlockClassIdentity { slot })?;
+            let b_sidecar_rec_layout = derive_block_sidecar_recording_layout(
+                block_class.sidecar_vk(),
+                block_class.shape.m,
+            )
+            .map_err(|_| CanonicalLadderError::BlockClassSidecarVk { slot })?;
             slots.push(LadderSlotInfo {
                 tier: block_class.tier(),
                 b_shape: block_class.shape,
@@ -574,6 +592,7 @@ impl CanonicalSplitLinkLadder {
                 b_pcs_params: block_class.pcs_params.clone(),
                 b_post_commit_class_digest: *block_class.post_commit_class_digest(),
                 b_sidecar_vk_digest: block_class.sidecar_vk().transcript_digest(),
+                b_sidecar_rec_layout,
             });
         }
         Self::try_new(link_shape, link_pcs_params, slots)
@@ -868,6 +887,7 @@ fn same_ladder(left: &[LadderSlotInfo], right: &[LadderSlotInfo]) -> bool {
                 && same_pcs_params(&left.b_pcs_params, &right.b_pcs_params)
                 && left.b_post_commit_class_digest == right.b_post_commit_class_digest
                 && left.b_sidecar_vk_digest == right.b_sidecar_vk_digest
+                && left.b_sidecar_rec_layout == right.b_sidecar_rec_layout
         })
 }
 
@@ -1418,10 +1438,15 @@ impl SplitLinkClass {
             .iter()
             .map(|slot| slot.b_pcs_params.clone())
             .collect::<Vec<_>>();
+        let rec_layouts = descriptor
+            .slots()
+            .iter()
+            .map(|slot| slot.b_sidecar_rec_layout.clone())
+            .collect::<Vec<_>>();
         let n_queries =
             noid_ivc_core::pcs::default_fri_queries(pcs_params.log_dim(), pcs_params.log_inv_rate);
         let universal_geometry =
-            RPcsLinkUniversalGeometry::new(&pcs_params, &block_params, n_queries)
+            RPcsLinkUniversalGeometry::new(&pcs_params, &block_params, n_queries, rec_layouts)
                 .map_err(|_| LinkProofError::ClassIdentityMismatch)?;
 
         let class_statement_digest = std::sync::OnceLock::new();
@@ -1576,10 +1601,23 @@ impl SplitLinkClass {
             .iter()
             .map(|slot| slot.b_pcs_params.clone())
             .collect::<Vec<_>>();
+        let rec_layouts = ladder
+            .iter()
+            .map(|slot| slot.b_sidecar_rec_layout.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ladder[slot].b_sidecar_rec_layout,
+            derive_block_sidecar_recording_layout(
+                block_class.sidecar_vk(),
+                block_class.shape.m,
+            )
+            .expect("hosted block class recording layout"),
+            "slot recording layout vs block class"
+        );
         let n_queries =
             noid_ivc_core::pcs::default_fri_queries(pcs_params.log_dim(), pcs_params.log_inv_rate);
         let universal_geometry =
-            RPcsLinkUniversalGeometry::new(&pcs_params, &block_params, n_queries)
+            RPcsLinkUniversalGeometry::new(&pcs_params, &block_params, n_queries, rec_layouts)
                 .expect("link/block ladder must share one frozen query count");
         let spec = split_io_spec(shape.k_log, &ladder);
         let class = Self {
@@ -2030,6 +2068,10 @@ pub struct PreparedSplitLink<'a> {
     fold_proof_link: MatrixFoldProof,
     fold_proof_block: MatrixFoldProof,
     io: Vec<F128>,
+    /// Captured block-sidecar child-transcript boundary (outer seed + child
+    /// terminal lanes) of the native block replay.  The trace pass reuses
+    /// the seed to prefill the walk L-C recording columns.
+    block_child: BlockSidecarChildTranscript,
     freeze: bool,
 }
 
@@ -2606,6 +2648,7 @@ impl<'a> SplitLinkBlockMatrixPhase<'a> {
         )?;
 
         let mut ch_native = FsLaneChallenger::new(b"history-block-v0");
+        let mut captured_child = None;
         let (_block_claim, fresh_block) = verify_field_deferred_matrix_with_post_commit_context(
             &b_shape,
             &core.expected_block_matrix_digest,
@@ -2617,11 +2660,15 @@ impl<'a> SplitLinkBlockMatrixPhase<'a> {
             core.input.block.region_sidecar(),
             &mut ch_native,
             |sidecar, context| {
-                verify_block_region_sidecar_post_commit(b_sidecar_vk, sidecar, context)
-                    .map_err(|_| VerifyError::Auxiliary)
+                let child =
+                    verify_block_region_sidecar_post_commit_captured(b_sidecar_vk, sidecar, context)
+                        .map_err(|_| VerifyError::Auxiliary)?;
+                captured_child = Some(child);
+                Ok(())
             },
         )
         .map_err(|_| SplitLinkPreparationError::BlockProof)?;
+        let block_child = captured_child.ok_or(SplitLinkPreparationError::BlockProof)?;
 
         let b_lane = &core.layout.b_lanes[slot];
         let incoming_block = MatrixAccClaim {
@@ -2656,6 +2703,7 @@ impl<'a> SplitLinkBlockMatrixPhase<'a> {
             fold_proof_link,
             fold_proof_block,
             io,
+            block_child,
             freeze: core.freeze,
         })
     }
@@ -2696,6 +2744,7 @@ fn assemble_prepared_split_link(prepared: PreparedSplitLink<'_>) -> BuiltSplitLi
         fold_proof_link,
         fold_proof_block,
         io,
+        block_child,
         freeze,
     } = prepared;
     let layout = class.layout();
@@ -2743,11 +2792,23 @@ fn assemble_prepared_split_link(prepared: PreparedSplitLink<'_>) -> BuiltSplitLi
     // columns' slices — hence the class's opening-claim spec — must be
     // identical across every link class of the ladder, so nothing
     // class-specific (envelope sizes differ per slot!) may precede them.
+    // The block-sidecar child transcript is deterministic in the (already
+    // natively verified) block proof and the captured seed; replay it once
+    // on a throwaway builder so its committed recording block can be
+    // allocated with the other universal walk columns.
+    let rec_scratch = scratch_record_block_sidecar_child(
+        b_sidecar_vk,
+        input.block.region_sidecar(),
+        b_shape.m,
+        block_child.seed,
+    )
+    .expect("recorded block-sidecar child transcript");
     let r_cols = prepare_r_pcs_link_columns_universal(
         &mut b,
         &r_pcs_proofs,
         &class.universal_geometry,
         &[0, slot + 1],
+        Some(&rec_scratch),
     )
     .expect("universal recording-free link columns");
     crate::acceptance::row_ledger_mark(&b, &mut ledger, "split: walk columns");
@@ -2883,6 +2944,7 @@ fn assemble_prepared_split_link(prepared: PreparedSplitLink<'_>) -> BuiltSplitLi
     let w_b: FlatDigestExpr = [LinExpr::constant(d_b[0]), LinExpr::constant(d_b[1])];
     let mut obs_block = PcsWalkObligations::default();
     let mut chb = FsChannelTrace::new(&mut b, b"history-block-v0");
+    let mut recorded_child = None;
     let (_bce, fresh_block_e) = verify_field_trace_deferred_region_with_post_commit_context(
         &mut b,
         &mut chb,
@@ -2896,15 +2958,17 @@ fn assemble_prepared_split_link(prepared: PreparedSplitLink<'_>) -> BuiltSplitLi
         &class.b_post_commit_class_digest,
         Some(&mut obs_block),
         |builder, context| {
-            verify_block_region_sidecar_trace_post_commit(
+            let recorded = verify_block_region_sidecar_recorded_trace_post_commit(
                 builder,
                 context,
                 b_sidecar_vk,
                 input.block.region_sidecar(),
             )
-            .expect("block sidecar trace shape")
+            .expect("block sidecar trace shape");
+            recorded_child = Some(recorded);
         },
     );
+    let recorded_child = recorded_child.expect("recorded block-sidecar child transcript");
     crate::acceptance::row_ledger_mark(&b, &mut ledger, "split: [R]_B replay");
 
     // ---- Genesis arm: the fresh [R]_prev claim equals T's baked
@@ -3039,8 +3103,13 @@ fn assemble_prepared_split_link(prepared: PreparedSplitLink<'_>) -> BuiltSplitLi
     }
     crate::acceptance::row_ledger_mark(&b, &mut ledger, "split: chain rules");
 
-    let region_preparation = finalize_r_pcs_link_region(&mut b, r_cols, &[&obs_prev, &obs_block])
-        .expect("recording-free link semantic binding");
+    let region_preparation = finalize_r_pcs_link_region(
+        &mut b,
+        r_cols,
+        &[&obs_prev, &obs_block],
+        &recorded_child,
+    )
+    .expect("recording-free link semantic binding");
     assert_eq!(
         region_preparation.vk(),
         class.sidecar_vk(),
@@ -3621,6 +3690,14 @@ mod tests {
         }
     }
 
+    fn ladder_test_rec_layout() -> DuplexLayout {
+        use noid_ivc_core::deep_chain::schedule::{compile_duplex, TranscriptOp};
+        compile_duplex(&[
+            TranscriptOp::Absorb(vec![None, None]),
+            TranscriptOp::Squeeze(1),
+        ])
+    }
+
     fn canonical_test_slots() -> Vec<LadderSlotInfo> {
         [
             (8usize, 22usize),
@@ -3636,6 +3713,7 @@ mod tests {
             b_pcs_params: ladder_test_pcs(m),
             b_post_commit_class_digest: [tier.wrapping_add(1) as u8; 32],
             b_sidecar_vk_digest: [tier.wrapping_add(2) as u8; 32],
+            b_sidecar_rec_layout: ladder_test_rec_layout(),
         })
         .collect()
     }
@@ -3643,8 +3721,8 @@ mod tests {
     #[test]
     fn canonical_split_link_ladder_accepts_only_the_consensus_table() {
         let descriptor = CanonicalSplitLinkLadder::try_new(
-            ladder_test_shape(24),
-            ladder_test_pcs(24),
+            ladder_test_shape(CANONICAL_LINK_CLASS_M),
+            ladder_test_pcs(CANONICAL_LINK_CLASS_M),
             canonical_test_slots(),
         )
         .expect("canonical four-slot descriptor");
@@ -3656,15 +3734,15 @@ mod tests {
                 .collect::<Vec<_>>(),
             noid_chain::consensus::params::USER_TX_CLASS_TIERS
         );
-        assert_eq!(descriptor.link_shape(), ladder_test_shape(24));
+        assert_eq!(descriptor.link_shape(), ladder_test_shape(CANONICAL_LINK_CLASS_M));
         assert!(same_pcs_params(
             descriptor.link_pcs_params(),
-            &ladder_test_pcs(24)
+            &ladder_test_pcs(CANONICAL_LINK_CLASS_M)
         ));
 
         let short = canonical_test_slots().into_iter().take(3).collect();
         assert_eq!(
-            CanonicalSplitLinkLadder::try_new(ladder_test_shape(24), ladder_test_pcs(24), short,)
+            CanonicalSplitLinkLadder::try_new(ladder_test_shape(CANONICAL_LINK_CLASS_M), ladder_test_pcs(CANONICAL_LINK_CLASS_M), short,)
                 .unwrap_err(),
             CanonicalLadderError::SlotCount {
                 expected: 4,
@@ -3678,7 +3756,7 @@ mod tests {
         let mut mutated = canonical_test_slots();
         mutated[2].tier = 63;
         assert_eq!(
-            CanonicalSplitLinkLadder::try_new(ladder_test_shape(24), ladder_test_pcs(24), mutated,)
+            CanonicalSplitLinkLadder::try_new(ladder_test_shape(CANONICAL_LINK_CLASS_M), ladder_test_pcs(CANONICAL_LINK_CLASS_M), mutated,)
                 .unwrap_err(),
             CanonicalLadderError::TierMismatch {
                 slot: 2,
@@ -3691,8 +3769,8 @@ mod tests {
         reordered.swap(0, 1);
         assert_eq!(
             CanonicalSplitLinkLadder::try_new(
-                ladder_test_shape(24),
-                ladder_test_pcs(24),
+                ladder_test_shape(CANONICAL_LINK_CLASS_M),
+                ladder_test_pcs(CANONICAL_LINK_CLASS_M),
                 reordered,
             )
             .unwrap_err(),
@@ -3710,8 +3788,8 @@ mod tests {
         non_block_shape[2].b_shape.k_log -= 1;
         assert_eq!(
             CanonicalSplitLinkLadder::try_new(
-                ladder_test_shape(24),
-                ladder_test_pcs(24),
+                ladder_test_shape(CANONICAL_LINK_CLASS_M),
+                ladder_test_pcs(CANONICAL_LINK_CLASS_M),
                 non_block_shape,
             )
             .unwrap_err(),
@@ -3722,8 +3800,8 @@ mod tests {
         bad_shape[1].b_pcs_params.m += 1;
         assert_eq!(
             CanonicalSplitLinkLadder::try_new(
-                ladder_test_shape(24),
-                ladder_test_pcs(24),
+                ladder_test_shape(CANONICAL_LINK_CLASS_M),
+                ladder_test_pcs(CANONICAL_LINK_CLASS_M),
                 bad_shape,
             )
             .unwrap_err(),
@@ -3734,8 +3812,8 @@ mod tests {
         bad_queries[3].b_pcs_params.log_inv_rate = 1;
         assert_eq!(
             CanonicalSplitLinkLadder::try_new(
-                ladder_test_shape(24),
-                ladder_test_pcs(24),
+                ladder_test_shape(CANONICAL_LINK_CLASS_M),
+                ladder_test_pcs(CANONICAL_LINK_CLASS_M),
                 bad_queries,
             )
             .unwrap_err(),

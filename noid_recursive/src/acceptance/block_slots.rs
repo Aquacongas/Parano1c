@@ -16,7 +16,7 @@
 //!   transcript embeds `AcceptedBlockHeaderClaim::from_header(header)`);
 //! - the claim's parent-section block id is the header's `prev_block_hash`,
 //!   its parent state root / height are the start accumulator's;
-//! - the direct ten-lane accumulator transition shares the header block-id,
+//! - the direct eleven-lane accumulator transition shares the header block-id,
 //!   parent-tip, state/depth/counter and height wires; transaction epoch is
 //!   selected by a constrained `height mod 144` relation;
 //! - every tx-root Merkle path pins its root to the underlying universal
@@ -87,7 +87,9 @@ use super::trace::exact_state::{
     select_upper_paired_roots, ExactStateSlotWires, PairedRootCellPair, StateDepthTrace,
 };
 use super::trace::fee_arithmetic::bind_block_fee_arithmetic;
-use super::trace::public_arithmetic::{bind_user_public_arithmetic, UserPublicArithmeticTrace};
+use super::trace::public_arithmetic::{
+    bind_coinbase_maturity, bind_user_public_arithmetic, UserPublicArithmeticTrace,
+};
 use super::trace::region_source_binding::{
     PairedExactStateCells, SpineInstanceRegion, SpineRegionData, TxRootPathRegion, TxRootRegionData,
 };
@@ -305,7 +307,7 @@ pub mod claim_layout {
     pub const FIELDS: usize = STATE_FRONTIER_NODE_COUNT + 2;
 }
 
-/// Offsets inside the 16-field PoW header schedule
+/// Offsets inside the 18-field PoW header schedule
 /// (`pow_header_fields_into` order — the header-hash killshot statement).
 pub mod header_fields {
     pub const PREV_BLOCK_HASH: usize = 0; // 2 lanes
@@ -319,7 +321,11 @@ pub mod header_fields {
     pub const LOG_SLOTS: usize = 13;
     pub const ACTIVE_SLOT_COUNT: usize = 14;
     pub const ALLOC_COUNTER: usize = 15;
-    pub const FIELDS: usize = 16;
+    pub const ATTESTED_COVERAGE: usize = 16;
+    /// Reserved constant-zero rate-alignment lane; pinned to zero so one
+    /// semantic header has exactly one admissible field schedule.
+    pub const RESERVED: usize = 17;
+    pub const FIELDS: usize = 18;
 }
 
 const _: () =
@@ -1285,6 +1291,10 @@ fn build_selected_zk_block_slots_core(
         &header.fields[hf::ACTIVE_SLOT_COUNT],
     );
     pin_eq(b, &end_acc.alloc_counter, &header.fields[hf::ALLOC_COUNTER]);
+    // The reserved rate-alignment lane is a consensus constant zero (twin of
+    // the native decoder's nonzero-pad rejection): without this pin one
+    // semantic header would admit two killshot field schedules.
+    pin_zero(b, &header.fields[hf::RESERVED]);
     crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: claim-hash killshot+[D]");
     // ---- Tx8x2 body-spine component. Region mode moves the whole final
     // 31-permutation-per-tx replay onto the shared walk A (compress tree +
@@ -1518,6 +1528,14 @@ fn build_selected_zk_block_slots_core(
         body_user_slots,
         "one public-arithmetic trace per physical user body slot"
     );
+    // Proof-gated coinbase maturity: every selected input whose bound
+    // creation id carries the coinbase tag must be covered by THIS header's
+    // attested coverage (twin of `validate_coinbase_maturity`).
+    bind_coinbase_maturity(
+        b,
+        &user_public_arithmetic,
+        &header.fields[hf::ATTESTED_COVERAGE],
+    );
     crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: per-tx auth+public arithmetic");
     let _fee_arithmetic = bind_block_fee_arithmetic(
         b,
@@ -1598,6 +1616,7 @@ fn build_selected_zk_block_slots_core(
         &mut action_candidates,
         &start_acc.alloc_counter,
         &header.fields[hf::ALLOC_COUNTER],
+        &header.fields[hf::HEIGHT],
     );
     let compacted_actions = compact_action_rows(b, &action_candidates, action_live_capacity);
     crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: action allocator+route+order");
@@ -1624,7 +1643,7 @@ fn build_selected_zk_block_slots_core(
         &claim.fields[claim_layout::STATE_FRONTIER_NODE_COUNT],
     );
     crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: structural frontier count");
-    // ---- Direct ten-lane accumulator transition. The child header is the
+    // ---- Direct eleven-lane accumulator transition. The child header is the
     // sole transition statement; there is no rolling claim/hash fold.
     let child = DirectChildWires {
         block_id: header.expected_block_id.clone(),
@@ -1640,6 +1659,7 @@ fn build_selected_zk_block_slots_core(
         log_slots: header.fields[hf::LOG_SLOTS].clone(),
         active_slot_count: header.fields[hf::ACTIVE_SLOT_COUNT].clone(),
         alloc_counter: header.fields[hf::ALLOC_COUNTER].clone(),
+        attested_coverage: header.fields[hf::ATTESTED_COVERAGE].clone(),
     };
     build_direct_accumulator_transition_slot(b, &start_acc, &child, &end_acc);
 
@@ -1717,6 +1737,7 @@ mod tx_epoch_anchor_tests {
             active_slot_count: 7,
             alloc_counter: 9,
             epoch_anchor_id: [0x33; 32],
+            attested_coverage: 0,
         }
     }
 

@@ -66,7 +66,9 @@ pub struct WalletUtxo {
     pub slot_index: u32,
     /// Value in μNOID.
     pub value: u64,
-    /// Monotone alloc-counter incarnation assigned when this UTXO was minted.
+    /// Incarnation assigned when this UTXO was minted: the monotone
+    /// alloc-counter value for user mints, or the height-tagged coinbase
+    /// creation id (`COINBASE_CREATION_TAG | mint_height`) for coinbase.
     /// This must be copied into every spending [`noid_tx::TxInput`].
     pub creation_id: u64,
     /// The 32-byte address that owns this slot.
@@ -75,6 +77,16 @@ pub struct WalletUtxo {
     pub key_index: u32,
     /// Block height at which this UTXO was confirmed.
     pub confirmed_height: u64,
+}
+
+impl WalletUtxo {
+    /// Proof-gated coinbase maturity: a coinbase UTXO is spendable only after
+    /// the chain's attested selected-history coverage reaches its mint height.
+    pub fn is_immature_coinbase(&self, attested_coverage: u64) -> bool {
+        noid_chain::consensus::params::is_coinbase_creation_id(self.creation_id)
+            && noid_chain::consensus::params::coinbase_creation_height(self.creation_id)
+                > attested_coverage
+    }
 }
 
 /// Durable chain identity to which the active-address cache is bound.
@@ -86,6 +98,9 @@ pub struct ActiveWalletSnapshot {
     pub log_slots: u32,
     pub active_slot_count: u64,
     pub alloc_counter: u64,
+    /// `attested_coverage` of the snapshot's tip header. Gates coinbase
+    /// maturity for balance display and coin selection.
+    pub attested_coverage: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -201,11 +216,31 @@ impl WalletState {
         !self.pending_input_slots.is_empty() || !self.pending_output_slots.is_empty()
     }
 
-    /// Confirmed balance of the ACTIVE address in μNOID (the spendable
-    /// balance under the one-owner-per-tx rule).
+    /// Confirmed balance of the ACTIVE address in μNOID, including immature
+    /// coinbase value (see [`Self::immature_balance`]).
     pub fn balance(&self) -> u64 {
         self.utxos
             .values()
+            .map(|u| u.value)
+            .fold(0u64, |a, v| a.saturating_add(v))
+    }
+
+    /// Attested selected-history coverage of the wallet's snapshot tip.
+    /// Zero (everything immature but height-0 mints) until the first reload.
+    pub fn attested_coverage(&self) -> u64 {
+        self.active_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.attested_coverage)
+            .unwrap_or(0)
+    }
+
+    /// Coinbase value locked until its mint heights are proof-covered
+    /// (`creation_id` tag bit set and mint height above the tip coverage).
+    pub fn immature_balance(&self) -> u64 {
+        let coverage = self.attested_coverage();
+        self.utxos
+            .values()
+            .filter(|u| u.is_immature_coinbase(coverage))
             .map(|u| u.value)
             .fold(0u64, |a, v| a.saturating_add(v))
     }
@@ -273,6 +308,7 @@ impl WalletState {
             log_slots: snapshot.log_slots,
             active_slot_count: snapshot.active_slot_count,
             alloc_counter: snapshot.alloc_counter,
+            attested_coverage: snapshot.attested_coverage,
         };
 
         // Persist first. If the filesystem operation fails, the live wallet
@@ -392,10 +428,15 @@ impl WalletState {
         let needed = target.checked_add(fee)?;
         // `utxos` contains the active owner only. Filter out outputs already
         // being spent by a pending transaction.
+        // Immature coinbase is displayed as locked and never selected: a
+        // spend would be rejected by mempool admission and block validation
+        // until the chain attests coverage of its mint height.
+        let attested_coverage = self.attested_coverage();
         let mut available: Vec<&WalletUtxo> = self
             .utxos
             .values()
             .filter(|u| !self.pending_input_slots.contains(&u.slot_index))
+            .filter(|u| !u.is_immature_coinbase(attested_coverage))
             .collect();
         // Value-first selection minimizes input count. Equal-value candidates
         // are ordered by state segment and slot so every caller produces the
@@ -621,6 +662,73 @@ pub type SharedWallet = Arc<Mutex<Option<WalletState>>>;
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn immature_coinbase_is_locked_out_of_spendable_balance_and_selection() {
+        use noid_chain::consensus::params::coinbase_creation_id;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = WalletState::create_or_load(dir.path().join("wallet.key")).unwrap();
+        let address = wallet.active_address();
+        let mature_user = WalletUtxo {
+            slot_index: 1,
+            value: 40,
+            creation_id: 11,
+            address,
+            key_index: 0,
+            confirmed_height: 4,
+        };
+        let mature_coinbase = WalletUtxo {
+            slot_index: 2,
+            value: 50,
+            creation_id: coinbase_creation_id(3),
+            address,
+            key_index: 0,
+            confirmed_height: 3,
+        };
+        let immature_coinbase = WalletUtxo {
+            slot_index: 3,
+            value: 60,
+            creation_id: coinbase_creation_id(7),
+            address,
+            key_index: 0,
+            confirmed_height: 7,
+        };
+        wallet.utxos.insert(1, mature_user);
+        wallet.utxos.insert(2, mature_coinbase);
+        wallet.utxos.insert(3, immature_coinbase);
+        wallet.active_snapshot = Some(ActiveWalletSnapshot {
+            height: 8,
+            tip_hash: [0x22; 32],
+            state_root: [0x33; 32],
+            log_slots: 8,
+            active_slot_count: 3,
+            alloc_counter: 11,
+            attested_coverage: 3,
+        });
+
+        // Total balance still reports every confirmed UTXO; the immature
+        // coinbase is carved out separately like pending value.
+        assert_eq!(wallet.balance(), 150);
+        assert_eq!(wallet.immature_balance(), 60);
+
+        // Selection can reach 90 (40 + 50) but never touches the immature 60.
+        let (selected, change) = wallet.select_utxos(90, 0).expect("mature funds suffice");
+        assert_eq!(change, 0);
+        let mut slots: Vec<u32> = selected.iter().map(|u| u.slot_index).collect();
+        slots.sort_unstable();
+        assert_eq!(slots, vec![1, 2]);
+        assert!(wallet.select_utxos(91, 0).is_none());
+
+        // Once coverage reaches the mint height the coinbase matures.
+        wallet
+            .active_snapshot
+            .as_mut()
+            .expect("snapshot installed")
+            .attested_coverage = 7;
+        assert_eq!(wallet.immature_balance(), 0);
+        assert!(wallet.select_utxos(150, 0).is_some());
+    }
     use super::*;
 
     fn snapshot(owner: [u8; 32], amount: Option<u64>) -> VerifiedOwnerSnapshot {
@@ -632,6 +740,7 @@ mod tests {
             log_slots: 24,
             active_slot_count: u64::from(amount.is_some()),
             alloc_counter: 9,
+            attested_coverage: 0,
             utxos: amount
                 .map(|amount| noid_chain::storage::VerifiedOwnerUtxo {
                     slot_index: 5,

@@ -162,6 +162,7 @@ pub fn build_state_delta_action_surface(
     bodies: &[TxBody],
     expected_commitments: &[Digest],
     parent_alloc_counter: u64,
+    block_height: u64,
 ) -> Result<StateDeltaActionSurface, StateDeltaError> {
     assert_eq!(
         bodies.len(),
@@ -175,6 +176,7 @@ pub fn build_state_delta_action_surface(
         |tx_index| &bodies[tx_index],
         |tx_index| Some(expected_commitments[tx_index]),
         parent_alloc_counter,
+        block_height,
     )
 }
 
@@ -185,6 +187,7 @@ fn build_state_delta_action_surface_in_domain<'a>(
     mut body_at: impl FnMut(usize) -> &'a TxBody,
     mut expected_commitment_at: impl FnMut(usize) -> Option<Digest>,
     parent_alloc_counter: u64,
+    block_height: u64,
 ) -> Result<StateDeltaActionSurface, StateDeltaError> {
     let parent_slot_domain = state.num_slots();
     if slot_domain < parent_slot_domain {
@@ -271,13 +274,28 @@ fn build_state_delta_action_surface_in_domain<'a>(
                     output_index: j,
                 });
             }
-            let creation_id =
+            // Every mint consumes one allocator increment; the coinbase's
+            // unique live output stores the tagged height id instead of the
+            // allocator id (proof-gated coinbase maturity).
+            let next_alloc =
                 alloc_counter
                     .checked_add(1)
                     .ok_or(StateDeltaError::AllocationCounterOverflow {
                         tx_index: tx_idx,
                         output_index: j,
                     })?;
+            // Normal mints must never enter the tagged coinbase namespace.
+            if crate::consensus::params::is_coinbase_creation_id(next_alloc) {
+                return Err(StateDeltaError::AllocationCounterOverflow {
+                    tx_index: tx_idx,
+                    output_index: j,
+                });
+            }
+            let creation_id = if body.is_coinbase {
+                crate::consensus::params::coinbase_creation_id(block_height)
+            } else {
+                next_alloc
+            };
             let post = slot_value_from_output(output, creation_id);
 
             actions.push(StateDeltaAction {
@@ -292,7 +310,7 @@ fn build_state_delta_action_surface_in_domain<'a>(
             mints = mints
                 .checked_add(1)
                 .ok_or(StateDeltaError::ActionCountOverflow)?;
-            alloc_counter = creation_id;
+            alloc_counter = next_alloc;
         }
     }
 
@@ -309,12 +327,14 @@ pub fn build_exact_action_surface(
     bodies: &[TxBody],
     expected_commitments: &[Digest],
     parent_alloc_counter: u64,
+    block_height: u64,
 ) -> Result<ExactActionSurface, StateDeltaError> {
     let surface = build_state_delta_action_surface(
         state,
         bodies,
         expected_commitments,
         parent_alloc_counter,
+        block_height,
     )?;
     Ok(exact_action_surface_from_surface(surface))
 }
@@ -332,6 +352,7 @@ pub fn build_exact_action_surface_at_log_slots(
     bodies: &[TxBody],
     expected_commitments: &[Digest],
     parent_alloc_counter: u64,
+    block_height: u64,
 ) -> Result<ExactActionSurface, StateDeltaError> {
     assert_eq!(
         bodies.len(),
@@ -345,6 +366,7 @@ pub fn build_exact_action_surface_at_log_slots(
         |tx_index| &bodies[tx_index],
         |tx_index| Some(expected_commitments[tx_index]),
         parent_alloc_counter,
+        block_height,
     )
 }
 
@@ -356,6 +378,7 @@ pub fn build_exact_action_surface_for_transactions_at_log_slots(
     target_log_slots: u32,
     transactions: &[Transaction],
     parent_alloc_counter: u64,
+    block_height: u64,
 ) -> Result<ExactActionSurface, StateDeltaError> {
     build_exact_action_surface_at_log_slots_from_source(
         state,
@@ -364,6 +387,7 @@ pub fn build_exact_action_surface_for_transactions_at_log_slots(
         |tx_index| &transactions[tx_index].body,
         |_| None,
         parent_alloc_counter,
+        block_height,
     )
 }
 
@@ -374,6 +398,7 @@ fn build_exact_action_surface_at_log_slots_from_source<'a>(
     body_at: impl FnMut(usize) -> &'a TxBody,
     expected_commitment_at: impl FnMut(usize) -> Option<Digest>,
     parent_alloc_counter: u64,
+    block_height: u64,
 ) -> Result<ExactActionSurface, StateDeltaError> {
     let current = state.log_slots();
     let target =
@@ -391,6 +416,7 @@ fn build_exact_action_surface_at_log_slots_from_source<'a>(
         body_at,
         expected_commitment_at,
         parent_alloc_counter,
+        block_height,
     )?;
     Ok(exact_action_surface_from_surface(surface))
 }
@@ -435,6 +461,7 @@ pub fn build_state_delta_witness(
     bodies: &[TxBody],
     expected_commitments: &[Digest],
     parent_alloc_counter: u64,
+    block_height: u64,
 ) -> Result<StateDeltaWitness, StateDeltaError> {
     let mut snap = state.clone();
     let prev_state_root = snap.root();
@@ -443,6 +470,7 @@ pub fn build_state_delta_witness(
         bodies,
         expected_commitments,
         parent_alloc_counter,
+        block_height,
     )?;
 
     let deltas: Vec<_> = surface
@@ -568,6 +596,7 @@ mod tests {
             std::slice::from_ref(&body),
             &[body.claims_commitment()],
             1,
+            7,
         )
         .unwrap();
         assert_eq!(surface.spends, 1);
@@ -593,6 +622,7 @@ mod tests {
                     &[first.clone(), second],
                     &commitments,
                     1,
+                    7,
                 ),
                 Err(StateDeltaError::BlockSlotConflict { .. })
             ));
@@ -608,11 +638,12 @@ mod tests {
                 std::slice::from_ref(&body),
                 &[body.claims_commitment()],
                 1,
+                7,
             ),
             Err(StateDeltaError::InputMismatch { .. })
         ));
         assert!(matches!(
-            build_state_delta_action_surface(&state(), &[body], &[[0u8; 32]], 1),
+            build_state_delta_action_surface(&state(), &[body], &[[0u8; 32]], 1, 7),
             Err(StateDeltaError::ClaimsCommitmentMismatch { .. })
         ));
     }
@@ -627,6 +658,7 @@ mod tests {
             std::slice::from_ref(&mint),
             &[mint.claims_commitment()],
             3,
+            7,
         )
         .unwrap();
         assert_eq!(surface.touched_indices, vec![300]);
@@ -641,6 +673,7 @@ mod tests {
                 std::slice::from_ref(&impossible_spend),
                 &[impossible_spend.claims_commitment()],
                 3,
+                7,
             ),
             Err(StateDeltaError::InputMismatch { .. })
         ));
@@ -651,6 +684,7 @@ mod tests {
                 std::slice::from_ref(&mint),
                 &[mint.claims_commitment()],
                 3,
+                7,
             ),
             Err(StateDeltaError::InvalidSlotDomain)
         ));

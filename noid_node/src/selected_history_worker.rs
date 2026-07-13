@@ -463,7 +463,7 @@ fn process_claimed_job(
     )
     .map_err(|error| retryable("reconstruct selected Block artifacts", error))?;
     check_cancelled(cancelled)?;
-    // Keep only the fixed ten-lane terminal identity. The consuming job moves
+    // Keep only the fixed eleven-lane terminal identity. The consuming job moves
     // every B255-sized component/proof vector into Block construction.
     let expected_end_accumulator = artifacts.end_accumulator().clone();
 

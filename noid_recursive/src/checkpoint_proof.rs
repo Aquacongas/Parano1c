@@ -2043,6 +2043,7 @@ mod tests {
         for index in 0..chunk_len {
             let height = accumulator.height + 1;
             let header = BlockHeader {
+                attested_coverage: 0,
                 prev_block_hash: previous_block_id,
                 state_root: [(index as u8).wrapping_add(2); 32],
                 tx_root: [(index as u8).wrapping_add(0x20); 32],

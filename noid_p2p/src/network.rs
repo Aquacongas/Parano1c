@@ -20,6 +20,7 @@ use libp2p::{
 use tokio::sync::{mpsc, RwLock, Semaphore};
 
 use noid_chain::consensus::wire_limits::{
+    MAX_COVERAGE_ATTESTATION_BYTES,
     proof_sidecar_combined_len_ok, INLINE_BLOCK_GOSSIP_THRESHOLD, MAX_BLOCK_AUTH_SIDECAR_BYTES,
     MAX_BLOCK_BYTES, MAX_BLOCK_PROOF_BYTES, MAX_BLOCK_PROOF_PLUS_SIDECAR_BYTES, MAX_HEADER_BYTES,
     MAX_HISTORY_PROOF_BYTES, MAX_MEMPOOL_SYNC_BYTES, MAX_MEMPOOL_SYNC_TXS, MAX_SEGMENT_BYTES,
@@ -93,7 +94,7 @@ type SnapshotExport = Arc<SnapshotGeneration>;
 
 const MAX_SNAPSHOT_EXPORTS: usize = 2;
 const MAX_OUTBOUND_BLOCK_RESPONSE_BYTES: usize =
-    MAX_BLOCK_BYTES + MAX_BLOCK_PROOF_PLUS_SIDECAR_BYTES;
+    MAX_BLOCK_BYTES + MAX_BLOCK_PROOF_PLUS_SIDECAR_BYTES + MAX_COVERAGE_ATTESTATION_BYTES;
 const MAX_OUTBOUND_HISTORY_RESPONSE_BYTES: usize = MAX_HISTORY_PROOF_BYTES + MAX_HEADER_BYTES;
 const MAX_PENDING_RETAINED_BLOCK_REQUESTS: usize = 256;
 const MAX_PENDING_STATE_SEGMENT_REQUESTS: usize = 64;
@@ -301,7 +302,13 @@ fn sanitize_stored_block_response(
     mut block_bytes: Option<Vec<u8>>,
     mut block_proof_bytes: Option<Vec<u8>>,
     mut block_auth_sidecar_bytes: Option<Vec<u8>>,
-) -> (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>) {
+    mut coverage_attestation_bytes: Option<Vec<u8>>,
+) -> (
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+) {
     if block_bytes
         .as_deref()
         .is_some_and(|bytes| !pulled_block_bytes_match_height(bytes, height))
@@ -310,17 +317,27 @@ fn sanitize_stored_block_response(
             height,
             "stored block header does not match requested height — not serving"
         );
-        return (None, None, None);
+        return (None, None, None, None);
     }
     if block_bytes
         .as_ref()
         .is_some_and(|bytes| bytes.len() > MAX_BLOCK_BYTES)
     {
         tracing::warn!(height, "stored block exceeds wire cap — not serving");
-        return (None, None, None);
+        return (None, None, None, None);
     }
     if block_bytes.is_none() {
-        return (None, None, None);
+        return (None, None, None, None);
+    }
+    if coverage_attestation_bytes
+        .as_ref()
+        .is_some_and(|bytes| bytes.is_empty() || bytes.len() > MAX_COVERAGE_ATTESTATION_BYTES)
+    {
+        tracing::warn!(
+            height,
+            "stored coverage attestation violates wire cap — not serving attestation"
+        );
+        coverage_attestation_bytes = None;
     }
     if block_proof_bytes
         .as_ref()
@@ -366,6 +383,7 @@ fn sanitize_stored_block_response(
         block_bytes.take(),
         block_proof_bytes,
         block_auth_sidecar_bytes,
+        coverage_attestation_bytes,
     )
 }
 
@@ -433,11 +451,13 @@ fn should_inline_block_gossip(
     block_bytes_len: usize,
     block_proof_bytes_len: usize,
     block_auth_sidecar_bytes_len: usize,
+    coverage_attestation_bytes_len: usize,
 ) -> bool {
     block_bytes_len > 0
         && block_bytes_len
             .saturating_add(block_proof_bytes_len)
             .saturating_add(block_auth_sidecar_bytes_len)
+            .saturating_add(coverage_attestation_bytes_len)
             <= INLINE_BLOCK_GOSSIP_THRESHOLD
 }
 
@@ -452,7 +472,7 @@ pub enum NetworkCommand {
     AnnounceBlock {
         height: u64,
         hash: [u8; 32],
-        /// Canonical wire-encoded BlockHeader (212 bytes).
+        /// Canonical wire-encoded BlockHeader (220 bytes).
         header_bytes: Vec<u8>,
         /// Full block bytes (for inline mode). Empty = compact-only.
         block_bytes: Vec<u8>,
@@ -460,6 +480,8 @@ pub enum NetworkCommand {
         block_proof_bytes: Vec<u8>,
         /// Public AuthGKR sidecar bytes (for inline mode). Empty = compact-only.
         block_auth_sidecar_bytes: Vec<u8>,
+        /// Coverage attestation envelope bytes (for inline mode).
+        coverage_attestation_bytes: Vec<u8>,
     },
     /// Broadcast a new TxIntent to all peers.
     BroadcastTx { intent_bytes: Arc<[u8]> },
@@ -537,6 +559,9 @@ pub enum NetworkEvent {
         block_proof_bytes: Vec<u8>,
         /// `BlockAuthSidecar` bincode bytes. Empty Vec for coinbase-only blocks.
         block_auth_sidecar_bytes: Vec<u8>,
+        /// Serialized Link terminal envelope for coverage-advancing blocks.
+        /// Empty Vec when the header keeps its parent's `attested_coverage`.
+        coverage_attestation_bytes: Vec<u8>,
         /// Holds the process-global inbound byte budget until node-side
         /// validation and persistence have consumed the pulled response.
         inbound_memory_permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
@@ -737,6 +762,7 @@ impl P2PNetwork {
     }
 
     /// Announce a new block to all peers.  Small blocks are inlined in gossip.
+    #[allow(clippy::too_many_arguments)]
     pub async fn announce_block(
         &self,
         height: u64,
@@ -745,6 +771,7 @@ impl P2PNetwork {
         block_bytes: Vec<u8>,
         block_proof_bytes: Vec<u8>,
         block_auth_sidecar_bytes: Vec<u8>,
+        coverage_attestation_bytes: Vec<u8>,
     ) {
         let _ = self
             .cmd_tx
@@ -755,6 +782,7 @@ impl P2PNetwork {
                 block_bytes,
                 block_proof_bytes,
                 block_auth_sidecar_bytes,
+                coverage_attestation_bytes,
             })
             .await;
     }
@@ -1331,13 +1359,16 @@ fn handle_network_command(
             block_bytes,
             block_proof_bytes,
             block_auth_sidecar_bytes,
+            coverage_attestation_bytes,
         } => {
-            // Inline threshold: if block + proof + sidecar fit in 1 MB, gossip
-            // the full block directly. Larger blocks use compact announcement.
+            // Inline threshold: if block + proof + sidecar + attestation fit
+            // within the inline gossip budget, gossip the full block directly.
+            // Larger payloads use compact announcement + pull.
             let msg = if should_inline_block_gossip(
                 block_bytes.len(),
                 block_proof_bytes.len(),
                 block_auth_sidecar_bytes.len(),
+                coverage_attestation_bytes.len(),
             ) {
                 BlockGossipMsg::Inline {
                     height,
@@ -1345,6 +1376,7 @@ fn handle_network_command(
                     block_bytes,
                     block_proof_bytes,
                     block_auth_sidecar_bytes,
+                    coverage_attestation_bytes,
                 }
             } else {
                 BlockGossipMsg::Compact {
@@ -1642,8 +1674,11 @@ async fn handle_swarm_event(
                         block_bytes,
                         block_proof_bytes,
                         block_auth_sidecar_bytes,
+                        coverage_attestation_bytes,
                     }) => {
-                        if block_bytes.len() > MAX_BLOCK_BYTES {
+                        if coverage_attestation_bytes.len() > MAX_COVERAGE_ATTESTATION_BYTES {
+                            tracing::warn!(peer = %propagation_source, len = coverage_attestation_bytes.len(), "inline coverage attestation too large — dropped");
+                        } else if block_bytes.len() > MAX_BLOCK_BYTES {
                             tracing::warn!(peer = %propagation_source, len = block_bytes.len(), "inline block too large — dropped");
                         } else if block_proof_bytes.len() > MAX_BLOCK_PROOF_BYTES {
                             tracing::warn!(peer = %propagation_source, len = block_proof_bytes.len(), "inline proof too large — dropped");
@@ -1672,6 +1707,7 @@ async fn handle_swarm_event(
                                 block_bytes,
                                 block_proof_bytes,
                                 block_auth_sidecar_bytes,
+                                coverage_attestation_bytes,
                                 inbound_memory_permit: None,
                             });
                         }
@@ -1964,7 +2000,12 @@ async fn handle_swarm_event(
                 } else {
                     let proof_bytes = response.block_proof_bytes.unwrap_or_default();
                     let auth_sidecar_bytes = response.block_auth_sidecar_bytes.unwrap_or_default();
-                    if proof_bytes.len() > MAX_BLOCK_PROOF_BYTES {
+                    let attestation_bytes =
+                        response.coverage_attestation_bytes.unwrap_or_default();
+                    if attestation_bytes.len() > MAX_COVERAGE_ATTESTATION_BYTES {
+                        tracing::warn!(peer = %peer, len = attestation_bytes.len(), "block coverage attestation too large — dropped");
+                        fail_peer!(pending.peer);
+                    } else if proof_bytes.len() > MAX_BLOCK_PROOF_BYTES {
                         tracing::warn!(peer = %peer, len = proof_bytes.len(), "block proof too large — dropped");
                         fail_peer!(pending.peer);
                     } else if auth_sidecar_bytes.len() > MAX_BLOCK_AUTH_SIDECAR_BYTES {
@@ -1996,6 +2037,7 @@ async fn handle_swarm_event(
                                 block_bytes,
                                 block_proof_bytes: proof_bytes,
                                 block_auth_sidecar_bytes: auth_sidecar_bytes,
+                                coverage_attestation_bytes: attestation_bytes,
                                 inbound_memory_permit,
                             })
                             .await;
@@ -2058,32 +2100,37 @@ async fn handle_swarm_event(
                 let loaded = tokio::task::spawn_blocking(move || {
                     let ctx = chain.blocking_read();
                     match ctx.store.get_recent_block_bundle_bounded(height) {
-                        Ok(Some((block, proof, sidecar))) => sanitize_stored_block_response(
-                            height,
-                            Some(block),
-                            proof,
-                            sidecar,
-                        ),
-                        Ok(None) => (None, None, None),
+                        Ok(Some((block, proof, sidecar, attestation))) => {
+                            sanitize_stored_block_response(
+                                height,
+                                Some(block),
+                                proof,
+                                sidecar,
+                                attestation,
+                            )
+                        }
+                        Ok(None) => (None, None, None, None),
                         Err(error) => {
                             tracing::warn!(height, err = %error, "bounded block response read failed");
-                            (None, None, None)
+                            (None, None, None, None)
                         }
                     }
                 })
                 .await;
-                let (block_bytes, block_proof_bytes, block_auth_sidecar_bytes) = match loaded {
-                    Ok(loaded) => loaded,
-                    Err(error) => {
-                        tracing::warn!(height, err = %error, "block response storage worker failed");
-                        (None, None, None)
-                    }
-                };
+                let (block_bytes, block_proof_bytes, block_auth_sidecar_bytes, coverage_attestation_bytes) =
+                    match loaded {
+                        Ok(loaded) => loaded,
+                        Err(error) => {
+                            tracing::warn!(height, err = %error, "block response storage worker failed");
+                            (None, None, None, None)
+                        }
+                    };
                 let response = GetRecentBlockResponse {
                     height,
                     block_bytes,
                     block_proof_bytes,
                     block_auth_sidecar_bytes,
+                    coverage_attestation_bytes,
                     inbound_memory_permit: None,
                     outbound_memory_permit: Some(outbound_memory_permit),
                 };
@@ -2811,17 +2858,26 @@ mod tests {
 
     #[test]
     fn inline_block_gossip_policy_uses_combined_block_proof_and_sidecar_size() {
-        assert!(should_inline_block_gossip(1, 0, 0));
+        assert!(should_inline_block_gossip(1, 0, 0, 0));
         assert!(should_inline_block_gossip(
             512 * 1024,
             256 * 1024,
             INLINE_BLOCK_GOSSIP_THRESHOLD - 768 * 1024,
+            0,
         ));
-        assert!(!should_inline_block_gossip(0, 0, 0));
+        assert!(!should_inline_block_gossip(0, 0, 0, 0));
         assert!(!should_inline_block_gossip(
             512 * 1024,
             256 * 1024,
             INLINE_BLOCK_GOSSIP_THRESHOLD - 768 * 1024 + 1,
+            0,
+        ));
+        // The attestation participates in the combined inline budget.
+        assert!(!should_inline_block_gossip(
+            512 * 1024,
+            256 * 1024,
+            INLINE_BLOCK_GOSSIP_THRESHOLD - 768 * 1024,
+            1,
         ));
     }
 
@@ -2854,9 +2910,14 @@ mod tests {
             77
         ));
 
-        let response =
-            sanitize_stored_block_response(78, Some(bytes), Some(vec![1]), Some(vec![2]));
-        assert_eq!(response, (None, None, None));
+        let response = sanitize_stored_block_response(
+            78,
+            Some(bytes),
+            Some(vec![1]),
+            Some(vec![2]),
+            Some(vec![3]),
+        );
+        assert_eq!(response, (None, None, None, None));
     }
 
     #[test]

@@ -378,6 +378,7 @@ fn seed_cursor_from_recent_state(
         log_slots,
         active_slot_count,
         alloc_counter,
+        tip_header.height,
         tip_header.state_root,
     )
     .map_err(LadderStateError::Context)?;
@@ -513,7 +514,12 @@ fn apply_retained_block_to_ladder_state(
             .body
             .validate_canonical()
             .map_err(|_| LadderStateError::Corrupt("retained block transaction is malformed"))?;
-        crate::state::apply_tx_checked_deferred_root(state, &transaction.body).map_err(|_| {
+        crate::state::apply_tx_checked_deferred_root(
+            state,
+            &transaction.body,
+            Some(block.header.height),
+        )
+        .map_err(|_| {
             LadderStateError::Corrupt("retained block does not replay onto the ladder state")
         })?;
     }
@@ -1326,7 +1332,7 @@ mod tests {
         let mut parent = genesis;
         for height in 1..=25u64 {
             let coinbase = ladder_coinbase(height, owner);
-            crate::state::apply_tx(&mut running, &coinbase.body).unwrap();
+            crate::state::apply_tx_at(&mut running, &coinbase.body, height).unwrap();
             let mut header = parent;
             header.height = height;
             header.prev_block_hash = block_id(&parent);

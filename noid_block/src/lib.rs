@@ -769,6 +769,7 @@ mod tests {
             log_slots: 24,
             active_slot_count: 1,
             alloc_counter: 1,
+            attested_coverage: 0,
         }
     }
 

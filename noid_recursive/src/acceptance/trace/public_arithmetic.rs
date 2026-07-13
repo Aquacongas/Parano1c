@@ -35,6 +35,7 @@
 
 use noid_core::{hardware::flat_to_tower_u128, Block128};
 
+use super::action_compaction::strict_less_bits;
 use super::action_surface::{
     ActionSurfaceTrace, INPUT_SELECTORS, LEAF_FEE, LEAF_INPUT_BASE, LEAF_OUTPUT0_DATA,
     OUTPUT_SELECTORS,
@@ -42,7 +43,7 @@ use super::action_surface::{
 use super::tx_body_spine::SpineInputsTrace;
 use super::{
     alloc_block, flat_const, mul, pin_eq, pin_zero, range_check_bits, FieldR1csBuilder, LinExpr,
-    Wire,
+    Wire, F128,
 };
 
 const U64_BITS: usize = 64;
@@ -318,6 +319,43 @@ pub fn bind_user_public_arithmetic(
         input_sum,
         output_sum,
         output_plus_fee,
+    }
+}
+
+/// Per-input proof-gated coinbase maturity.
+///
+/// Trace twin of `noid_chain::consensus::validation::validate_coinbase_maturity`:
+/// a bitmap-live input whose bound `creation_id` carries the coinbase tag
+/// (bit 63) is spendable only when the CONTAINING header's
+/// `attested_coverage` already covers the id's mint height (the id with the
+/// tag cleared). Untagged inputs, bitmap-dead positions and capacity-ghost
+/// transactions are exempt exactly as natively (their `selected` gate is
+/// zero). The constraint shape is occupancy-invariant: every physical input
+/// position instantiates the same comparator.
+///
+/// The mint height is 63 bits by construction, so with `c = coverage` and
+/// `h = mint_height`: `c < h  ⇔  c_63 = 0 AND low63(c) < h`. The violation
+/// `selected · tag · (1 + c_63) · less63` is pinned to zero.
+pub fn bind_coinbase_maturity(
+    b: &mut FieldR1csBuilder,
+    arithmetic: &[UserPublicArithmeticTrace],
+    attested_coverage: &LinExpr,
+) {
+    let coverage_bits = range_check_bits(b, attested_coverage, U64_BITS);
+    let coverage_tag = LinExpr::from_wire(coverage_bits[U64_BITS - 1]);
+    for tx in arithmetic {
+        for (selected, input) in tx.selected_input_live.iter().zip(&tx.inputs) {
+            let tag = LinExpr::from_wire(input.creation_id.bits[U64_BITS - 1]);
+            let (less63, _) = strict_less_bits(
+                b,
+                &coverage_bits[..U64_BITS - 1],
+                &input.creation_id.bits[..U64_BITS - 1],
+            );
+            let tagged_spend = mul(b, selected, &tag);
+            let immature = mul(b, &less63, &coverage_tag.add_const(F128::ONE));
+            let violation = mul(b, &tagged_spend, &immature);
+            pin_zero(b, &violation);
+        }
     }
 }
 
@@ -663,5 +701,44 @@ mod tests {
                 "public balance differential diverged at case {case}"
             );
         }
+    }
+
+    /// Twin of `validate_coinbase_maturity`: a tagged input is spendable only
+    /// under sufficient coverage; untagged inputs and capacity ghosts are
+    /// exempt.
+    #[test]
+    fn coinbase_maturity_gates_tagged_inputs_by_attested_coverage() {
+        let tag = 1u64 << 63;
+        let mint_height = 7u64;
+        let mut tagged = sparse_body();
+        tagged.inputs[0].creation_id = tag | mint_height;
+
+        let satisfies = |body: &TxBody, coverage: u128, tx_live: Block128| {
+            let native = spine_inputs_from_body(body);
+            let mut b = FieldR1csBuilder::new();
+            let spine = SpineInputsTrace::alloc(&mut b, &native);
+            let expected_owner = std::array::from_fn(|lane| {
+                alloc_block(&mut b, native.leaves[LEAF_INPUT_OWNER][lane])
+            });
+            let tx_live = alloc_block(&mut b, tx_live);
+            let surface = bind_user_action_surface(&mut b, &spine, &tx_live, &expected_owner);
+            let arithmetic = bind_user_public_arithmetic(&mut b, &spine, &surface);
+            let coverage = alloc_block(&mut b, Block128::from(coverage));
+            bind_coinbase_maturity(&mut b, &[arithmetic], &coverage);
+            let (r1cs, witness) = b.build();
+            r1cs.satisfies(&witness)
+        };
+
+        // Covered exactly at the mint height and above accepts.
+        assert!(satisfies(&tagged, mint_height as u128, Block128::ONE));
+        assert!(satisfies(&tagged, mint_height as u128 + 1, Block128::ONE));
+        assert!(satisfies(&tagged, 1u128 << 63, Block128::ONE));
+        // Immature coverage rejects.
+        assert!(!satisfies(&tagged, mint_height as u128 - 1, Block128::ONE));
+        assert!(!satisfies(&tagged, 0, Block128::ONE));
+        // Untagged inputs are exempt at any coverage.
+        assert!(satisfies(&sparse_body(), 0, Block128::ONE));
+        // A capacity ghost is exempt exactly like natively.
+        assert!(satisfies(&tagged, 0, Block128::ZERO));
     }
 }

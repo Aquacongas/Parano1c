@@ -267,6 +267,38 @@ pub const BASE_REWARD_MICRONOID: u64 = 50 * MICRONOID_PER_NOID;
 pub const FLOOR_REWARD_MICRONOID: u64 = MICRONOID_PER_NOID;
 
 // ---------------------------------------------------------------------------
+// Proof-gated coinbase maturity
+// ---------------------------------------------------------------------------
+
+/// High-bit tag marking a coinbase mint's `creation_id`.
+///
+/// Coinbase outputs store `creation_id = COINBASE_CREATION_TAG | mint_height`.
+/// Normal mints use the monotone `alloc_counter` namespace, which consensus
+/// keeps strictly below `2^63` (allocation fails closed at the namespace
+/// boundary), so the two id spaces can never collide. Exactly one live
+/// coinbase output exists per block (canonical coinbase bitmap), so tagged
+/// ids stay unique per chain history.
+pub const COINBASE_CREATION_TAG: u64 = 1 << 63;
+
+/// True when a `creation_id` names a coinbase mint.
+#[inline]
+pub const fn is_coinbase_creation_id(creation_id: u64) -> bool {
+    creation_id & COINBASE_CREATION_TAG != 0
+}
+
+/// The tagged `creation_id` of the unique coinbase output minted at `height`.
+#[inline]
+pub const fn coinbase_creation_id(height: u64) -> u64 {
+    COINBASE_CREATION_TAG | height
+}
+
+/// Mint height encoded in a tagged coinbase `creation_id`.
+#[inline]
+pub const fn coinbase_creation_height(creation_id: u64) -> u64 {
+    creation_id & !COINBASE_CREATION_TAG
+}
+
+// ---------------------------------------------------------------------------
 // Slot allocator PRNG
 // ---------------------------------------------------------------------------
 // splitmix64 constants are embedded in noid_chain::consensus::allocator.

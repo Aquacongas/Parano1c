@@ -13,7 +13,7 @@ use noid_core::Block128;
 use noid_poseidon2b::primitives::Digest;
 
 /// Canonical number of `Block128` lanes in [`ChainAccumulator`].
-pub const CHAIN_ACCUMULATOR_LANES: usize = 10;
+pub const CHAIN_ACCUMULATOR_LANES: usize = 11;
 
 /// Direct recursive continuity state.
 ///
@@ -28,6 +28,7 @@ pub const CHAIN_ACCUMULATOR_LANES: usize = 10;
 /// active_slot_count
 /// alloc_counter
 /// epoch_anchor_id[2]
+/// attested_coverage
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ChainAccumulator {
@@ -38,6 +39,8 @@ pub struct ChainAccumulator {
     pub active_slot_count: u64,
     pub alloc_counter: u64,
     pub epoch_anchor_id: Digest,
+    /// Proof-gated coinbase-maturity frontier carried by the tip header.
+    pub attested_coverage: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,13 +49,24 @@ pub enum ChainAccumulatorLaneError {
     LogSlotsOutOfRange,
     ActiveSlotCountOutOfRange,
     AllocCounterOutOfRange,
+    AttestedCoverageOutOfRange,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChainAccumulatorAdvanceError {
     HeightOverflow,
-    BadHeight { expected: u64, actual: u64 },
+    BadHeight {
+        expected: u64,
+        actual: u64,
+    },
     BadParentTip,
+    /// Twin of consensus header rule 7 (`consensus::header`): the child must
+    /// repeat the parent's coverage or advance it to at most `parent.height`.
+    BadAttestedCoverage {
+        parent_coverage: u64,
+        parent_height: u64,
+        attested_coverage: u64,
+    },
 }
 
 /// Mismatch between a recovered recursive boundary and the node's locally
@@ -65,6 +79,7 @@ pub enum ChainAccumulatorLocalBoundaryError {
     LogSlots,
     ActiveSlotCount,
     AllocCounter,
+    AttestedCoverage,
     EpochAnchorHeight { expected: u64, actual: u64 },
     EpochAnchorId,
 }
@@ -82,6 +97,9 @@ impl core::fmt::Display for ChainAccumulatorLocalBoundaryError {
             Self::AllocCounter => {
                 write!(f, "accumulator allocation counter does not match local tip")
             }
+            Self::AttestedCoverage => {
+                write!(f, "accumulator attested coverage does not match local tip")
+            }
             Self::EpochAnchorHeight { expected, actual } => write!(
                 f,
                 "local epoch-anchor header has height {actual}, expected {expected}"
@@ -97,7 +115,7 @@ impl core::fmt::Display for ChainAccumulatorLocalBoundaryError {
 impl std::error::Error for ChainAccumulatorLocalBoundaryError {}
 
 impl ChainAccumulator {
-    /// Encode the canonical ten-lane recursive boundary.
+    /// Encode the canonical eleven-lane recursive boundary.
     pub fn to_lanes(&self) -> [Block128; CHAIN_ACCUMULATOR_LANES] {
         let tip = digest_to_lanes(self.tip_block_id);
         let state = digest_to_lanes(self.state_root);
@@ -113,10 +131,11 @@ impl ChainAccumulator {
             Block128::from(self.alloc_counter),
             epoch[0],
             epoch[1],
+            Block128::from(self.attested_coverage),
         ]
     }
 
-    /// Decode the canonical ten-lane recursive boundary.
+    /// Decode the canonical eleven-lane recursive boundary.
     ///
     /// Scalar lanes are range-checked before conversion. In particular, this
     /// API never truncates a field lane with `as u64`/`as u32`.
@@ -135,6 +154,8 @@ impl ChainAccumulator {
             alloc_counter: u64::try_from(lanes[7].to_u128())
                 .map_err(|_| ChainAccumulatorLaneError::AllocCounterOutOfRange)?,
             epoch_anchor_id: digest_from_lanes([lanes[8], lanes[9]]),
+            attested_coverage: u64::try_from(lanes[10].to_u128())
+                .map_err(|_| ChainAccumulatorLaneError::AttestedCoverageOutOfRange)?,
         })
     }
 
@@ -160,6 +181,21 @@ impl ChainAccumulator {
                 actual: child_header.height,
             });
         }
+        // Structural attested-coverage advancement rule — the exact twin of
+        // `consensus::header::validate_header_inner` step 7: repeat the
+        // parent's coverage or advance it to at most the parent height. The
+        // "advanced iff a verified Link envelope accompanies the block" rule
+        // stays with native block acceptance (it needs the detached payload).
+        if child_header.attested_coverage < self.attested_coverage
+            || (child_header.attested_coverage > self.attested_coverage
+                && child_header.attested_coverage > self.height)
+        {
+            return Err(ChainAccumulatorAdvanceError::BadAttestedCoverage {
+                parent_coverage: self.attested_coverage,
+                parent_height: self.height,
+                attested_coverage: child_header.attested_coverage,
+            });
+        }
 
         let child_id = hash_block_header(child_header);
         Ok(Self {
@@ -177,6 +213,7 @@ impl ChainAccumulator {
             } else {
                 self.epoch_anchor_id
             },
+            attested_coverage: child_header.attested_coverage,
         })
     }
 
@@ -209,6 +246,9 @@ impl ChainAccumulator {
         if self.alloc_counter != tip_header.alloc_counter {
             return Err(ChainAccumulatorLocalBoundaryError::AllocCounter);
         }
+        if self.attested_coverage != tip_header.attested_coverage {
+            return Err(ChainAccumulatorLocalBoundaryError::AttestedCoverage);
+        }
 
         let expected_epoch_height = (tip_header.height / TX_EPOCH_BLOCKS) * TX_EPOCH_BLOCKS;
         if epoch_anchor_header.height != expected_epoch_height {
@@ -236,6 +276,7 @@ pub fn genesis_accumulator() -> ChainAccumulator {
         active_slot_count: header.active_slot_count,
         alloc_counter: header.alloc_counter,
         epoch_anchor_id: block_id,
+        attested_coverage: header.attested_coverage,
     }
 }
 
@@ -261,6 +302,7 @@ mod tests {
 
     fn child(parent: &ChainAccumulator, height: u64) -> BlockHeader {
         BlockHeader {
+            attested_coverage: 0,
             prev_block_hash: parent.tip_block_id,
             state_root: [height as u8; 32],
             tx_root: [0x33; 32],
@@ -289,6 +331,7 @@ mod tests {
                 active_slot_count: 0,
                 alloc_counter: 0,
                 epoch_anchor_id: id,
+                attested_coverage: 0,
             }
         );
     }
@@ -303,6 +346,7 @@ mod tests {
             active_slot_count: u64::MAX - 1,
             alloc_counter: u64::MAX - 2,
             epoch_anchor_id: [0x33; 32],
+            attested_coverage: u64::MAX - 3,
         };
         assert_eq!(
             ChainAccumulator::from_lanes(accumulator.to_lanes()),
@@ -318,6 +362,7 @@ mod tests {
             (5, ChainAccumulatorLaneError::LogSlotsOutOfRange),
             (6, ChainAccumulatorLaneError::ActiveSlotCountOutOfRange),
             (7, ChainAccumulatorLaneError::AllocCounterOutOfRange),
+            (10, ChainAccumulatorLaneError::AttestedCoverageOutOfRange),
         ] {
             let mut lanes = base;
             lanes[lane] = if lane == 5 {
@@ -369,6 +414,50 @@ mod tests {
         );
     }
 
+    /// Exact twin of `consensus::header` rule 7: the accumulator accepts a
+    /// repeated coverage or a bounded advancement and rejects regression and
+    /// beyond-parent-height jumps.
+    #[test]
+    fn advance_keeps_attested_coverage_monotone_and_below_parent_height() {
+        let mut parent = genesis_accumulator();
+        // Reach parent height 5 with coverage 3 by valid successions.
+        for height in 1..=5u64 {
+            let mut header = child(&parent, height);
+            header.attested_coverage = (parent.attested_coverage + 1).min(parent.height).min(3);
+            parent = parent.advance(&header).unwrap();
+        }
+        assert_eq!(parent.height, 5);
+        assert_eq!(parent.attested_coverage, 3);
+
+        let advance_with = |coverage: u64| {
+            let mut header = child(&parent, 6);
+            header.attested_coverage = coverage;
+            parent.advance(&header)
+        };
+        // Repeating and bounded advancement are valid.
+        assert_eq!(advance_with(3).unwrap().attested_coverage, 3);
+        assert_eq!(advance_with(4).unwrap().attested_coverage, 4);
+        assert_eq!(advance_with(5).unwrap().attested_coverage, 5);
+        // Regression is rejected.
+        assert_eq!(
+            advance_with(2),
+            Err(ChainAccumulatorAdvanceError::BadAttestedCoverage {
+                parent_coverage: 3,
+                parent_height: 5,
+                attested_coverage: 2,
+            })
+        );
+        // Advancing past the parent height is rejected.
+        assert_eq!(
+            advance_with(6),
+            Err(ChainAccumulatorAdvanceError::BadAttestedCoverage {
+                parent_coverage: 3,
+                parent_height: 5,
+                attested_coverage: 6,
+            })
+        );
+    }
+
     #[test]
     fn epoch_changes_only_at_exact_boundary() {
         let mut accumulator = genesis_accumulator();
@@ -391,7 +480,7 @@ mod tests {
     }
 
     #[test]
-    fn local_header_boundary_covers_epoch_edges_and_all_ten_lanes() {
+    fn local_header_boundary_covers_epoch_edges_and_every_lane() {
         let genesis = genesis_header();
         let mut headers = vec![genesis];
         let mut accumulator = genesis_accumulator();

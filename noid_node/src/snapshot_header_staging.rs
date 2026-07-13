@@ -1056,8 +1056,10 @@ mod tests {
                     height,
                     miner_address: parent.miner_address,
                     // Pre-mined for this exact deterministic fixture. Keeping
-                    // it fixed avoids debug-mode PoW work in CI.
-                    nonce: 241_876,
+                    // it fixed avoids debug-mode PoW work in CI. Re-mined for
+                    // the `attested_coverage` header layout via the ignored
+                    // `print_new_fixture_nonce` test below.
+                    nonce: 106_729,
                     difficulty_target: next_target(
                         anchor_height,
                         anchor.timestamp,
@@ -1068,11 +1070,25 @@ mod tests {
                     log_slots: parent.log_slots,
                     active_slot_count: parent.active_slot_count,
                     alloc_counter: parent.alloc_counter,
+                    attested_coverage: 0,
                 };
                 headers.push(header);
             }
             headers
         })
+    }
+
+    /// Print a fresh pre-mined nonce for `fixture_chain` after header-layout
+    /// changes. Run with:
+    /// `cargo test --release -p noid_node print_new_fixture_nonce -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn print_new_fixture_nonce() {
+        let mut header = fixture_chain()[1];
+        header.nonce = 0;
+        let nonce = noid_chain::consensus::pow::search_pow(&header, 0, 2_000_000_000)
+            .expect("fixture target is satisfiable");
+        println!("\nNew fixture nonce: {nonce}");
     }
 
     fn canonical_base(store: &MdbxStore) -> CanonicalHeaderBoundary {

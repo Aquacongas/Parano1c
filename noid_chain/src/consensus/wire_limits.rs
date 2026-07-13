@@ -24,7 +24,14 @@ pub const MAX_MEMPOOL_SYNC_TXS: usize = 128;
 pub const MAX_MEMPOOL_SYNC_BYTES: usize = 16 * 1024 * 1024;
 
 /// Exact largest canonical block: marker + header + count + 256 Tx8x2 bodies.
-pub const MAX_BLOCK_BYTES: usize = 1 + 212 + 4 + 256 * noid_tx::TX_BODY_WIRE_SIZE;
+pub const MAX_BLOCK_BYTES: usize =
+    1 + crate::wire::BLOCK_HEADER_WIRE_SIZE + 4 + 256 * noid_tx::TX_BODY_WIRE_SIZE;
+
+/// Maximum serialized coverage-attestation payload attached to a block.
+///
+/// The attestation is one selected-history Link terminal envelope, so it
+/// shares the terminal proof wire cap.
+pub const MAX_COVERAGE_ATTESTATION_BYTES: usize = MAX_HISTORY_PROOF_BYTES;
 
 /// Maximum serialized canonical BlockProof payload.
 pub const MAX_BLOCK_PROOF_BYTES: usize = 32 * 1024 * 1024;
@@ -153,8 +160,9 @@ mod tests {
     fn final_wire_caps_match_canonical_constructions() {
         assert_eq!(MAX_AUTHORIZATION_BYTES, noid_tx::MAX_TX_AUTHORIZATION_BYTES);
         assert_eq!(MAX_TX_INTENT_BYTES_GLOBAL, noid_tx::MAX_TX_INTENT_BYTES);
-        assert_eq!(MAX_BLOCK_BYTES, 82_905);
+        assert_eq!(MAX_BLOCK_BYTES, 82_913);
         assert!(MAX_HISTORY_PROOF_BYTES > 580_495);
+        assert_eq!(MAX_COVERAGE_ATTESTATION_BYTES, MAX_HISTORY_PROOF_BYTES);
     }
 
     #[test]
@@ -200,7 +208,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(BLOCK_MAX_TXS, 256);
-        assert_eq!(weight, 62_956_505);
+        assert_eq!(weight, 62_956_513);
         assert!(weight <= MAX_BLOCK_RESOURCE_WEIGHT);
     }
 }

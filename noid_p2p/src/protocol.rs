@@ -75,6 +75,9 @@ pub struct GetRecentBlockResponse {
     pub block_proof_bytes: Option<Vec<u8>>,
     /// `BlockAuthSidecar` bincode bytes.  `None` for coinbase-only blocks.
     pub block_auth_sidecar_bytes: Option<Vec<u8>>,
+    /// Serialized Link terminal envelope attesting the header's advanced
+    /// `attested_coverage`.  `None` when the block keeps its parent's coverage.
+    pub coverage_attestation_bytes: Option<Vec<u8>>,
     /// Process-global inbound block-byte budget retained until the node has
     /// consumed this response. It is local flow-control state, never wire data.
     #[serde(skip)]
@@ -263,6 +266,9 @@ pub enum BlockGossipMsg {
         block_bytes: Vec<u8>,
         block_proof_bytes: Vec<u8>,
         block_auth_sidecar_bytes: Vec<u8>,
+        /// Serialized Link terminal envelope for coverage-advancing blocks.
+        /// Empty when the header keeps its parent's `attested_coverage`.
+        coverage_attestation_bytes: Vec<u8>,
     },
 }
 

@@ -107,10 +107,17 @@ fn derive_output_creation_ids(
             if !tx.body.output_is_live(output_index) {
                 continue;
             }
+            // Every mint (including coinbase) consumes one allocator
+            // increment, but the coinbase's unique live output STORES the
+            // height-tagged coinbase creation id (proof-gated maturity).
             counter = counter
                 .checked_add(1)
                 .ok_or(CreationIdDerivationError::CounterOverflow)?;
-            ids[tx_index][output_index] = Some(counter);
+            ids[tx_index][output_index] = Some(if tx.body.is_coinbase {
+                noid_chain::consensus::params::coinbase_creation_id(block.header.height)
+            } else {
+                counter
+            });
         }
     }
 
@@ -424,6 +431,7 @@ mod tests {
                 log_slots: 24,
                 active_slot_count: transactions.len() as u64,
                 alloc_counter,
+                attested_coverage: 0,
             },
             transactions,
         }
@@ -452,8 +460,15 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(utxos[&10].creation_id, 101, "coinbase is first");
-        assert_eq!(utxos[&20].creation_id, 102, "user output follows");
+        assert_eq!(
+            utxos[&10].creation_id,
+            noid_chain::consensus::params::coinbase_creation_id(7),
+            "coinbase stores the height-tagged creation id"
+        );
+        assert_eq!(
+            utxos[&20].creation_id, 102,
+            "user output follows the allocator (coinbase still burned id 101)"
+        );
     }
 
     #[test]

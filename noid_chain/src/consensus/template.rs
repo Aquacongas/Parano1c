@@ -63,6 +63,10 @@ pub struct BlockTemplate {
     pub difficulty_target: Digest,
     /// Hash of parent block header.
     pub prev_block_hash: Digest,
+    /// Selected-history coverage the new header attests. Either the parent's
+    /// value (no attestation attached) or the advanced coverage C bound by the
+    /// Link envelope the miner attaches alongside this block.
+    pub attested_coverage: u64,
 }
 
 impl BlockTemplate {
@@ -80,6 +84,7 @@ impl BlockTemplate {
             log_slots: self.log_slots,
             active_slot_count: self.active_slot_count,
             alloc_counter: self.alloc_counter,
+            attested_coverage: self.attested_coverage,
         }
     }
 
@@ -98,6 +103,7 @@ impl BlockTemplate {
             log_slots: self.log_slots,
             active_slot_count: self.active_slot_count,
             alloc_counter: self.alloc_counter,
+            attested_coverage: self.attested_coverage,
         }
     }
 
@@ -197,6 +203,10 @@ impl TemplateResourceSelection {
 ///
 /// `candidate_txs` must be pre-validated (not yet conflict-resolved).
 /// Coinbase is constructed internally using `miner_address`.
+///
+/// This convenience wrapper keeps the parent's `attested_coverage` (no Link
+/// attestation attached). Miners that attach an attestation for an advanced
+/// coverage C use [`build_block_template_with_coverage`].
 pub fn build_block_template(
     parent: &BlockHeader,
     state: &ChainState,
@@ -205,6 +215,37 @@ pub fn build_block_template(
     miner_address: Address,
     timestamp: u64,
     difficulty_target: Digest,
+) -> Result<BlockTemplate, TemplateBuildError> {
+    build_block_template_with_coverage(
+        parent,
+        state,
+        prev_active_counts,
+        candidate_txs,
+        miner_address,
+        timestamp,
+        difficulty_target,
+        parent.attested_coverage,
+    )
+}
+
+/// [`build_block_template`] with an explicit header `attested_coverage`.
+///
+/// `attested_coverage` must be the parent's value, or an advanced coverage C
+/// in `(parent.attested_coverage, parent.height]` for which the caller will
+/// attach the matching Link envelope. Transactions spending coinbase UTXOs
+/// not yet matured under this coverage are skipped during selection (the
+/// same-block rule: an attestation raising coverage in this block counts for
+/// spends inside it).
+#[allow(clippy::too_many_arguments)]
+pub fn build_block_template_with_coverage(
+    parent: &BlockHeader,
+    state: &ChainState,
+    prev_active_counts: &[u64],
+    candidate_txs: Vec<Transaction>,
+    miner_address: Address,
+    timestamp: u64,
+    difficulty_target: Digest,
+    attested_coverage: u64,
 ) -> Result<BlockTemplate, TemplateBuildError> {
     use crate::consensus::allocator::generate_slot_hints;
     use crate::consensus::emission::block_reward;
@@ -268,7 +309,17 @@ pub fn build_block_template(
         if actual < required {
             continue;
         }
-        match apply_tx_checked_deferred_root(&mut selection_scratch, &tx.body) {
+        // Proof-gated coinbase maturity: skip spends of coinbase UTXOs whose
+        // mint height exceeds the coverage this template attests. Selecting
+        // them would make the sealed block fail `validate_coinbase_maturity`.
+        if tx.body.live_inputs().any(|(_, input)| {
+            crate::consensus::params::is_coinbase_creation_id(input.creation_id)
+                && crate::consensus::params::coinbase_creation_height(input.creation_id)
+                    > attested_coverage
+        }) {
+            continue;
+        }
+        match apply_tx_checked_deferred_root(&mut selection_scratch, &tx.body, None) {
             Ok(_) => {
                 resources = next_resources;
                 applied_winners.push(tx);
@@ -384,10 +435,10 @@ pub fn build_block_template(
     let coinbase = Transaction::new(cb_body);
 
     // Apply the complete block to scratch in its real semantic order.
-    apply_tx_checked_deferred_root(&mut scratch, &coinbase.body)
+    apply_tx_checked_deferred_root(&mut scratch, &coinbase.body, Some(parent.height + 1))
         .map_err(|e| TemplateBuildError::StateApplyError(format!("{:?}", e)))?;
     for tx in &ordered_winners {
-        apply_tx_checked_deferred_root(&mut scratch, &tx.body)
+        apply_tx_checked_deferred_root(&mut scratch, &tx.body, None)
             .map_err(|e| TemplateBuildError::StateApplyError(format!("{:?}", e)))?;
     }
 
@@ -413,6 +464,7 @@ pub fn build_block_template(
         miner_address,
         difficulty_target,
         prev_block_hash,
+        attested_coverage,
     })
 }
 
@@ -439,6 +491,7 @@ mod tests {
             log_slots: state.state.log_slots() as u32,
             active_slot_count: state.active_slot_count,
             alloc_counter: state.alloc_counter,
+            attested_coverage: 0,
         }
     }
 
@@ -495,6 +548,77 @@ mod tests {
         assert_eq!(
             template.tx_root,
             crate::block::compute_tx_root(&template.all_txs())
+        );
+    }
+
+    #[test]
+    fn selection_gates_immature_coinbase_spends_on_template_coverage() {
+        use crate::consensus::params::coinbase_creation_id;
+
+        let owner = Address([1u8; 32]);
+        let mut state = ChainState::with_log_slots(8);
+        // A coinbase UTXO minted at height 6, funded directly into state.
+        state
+            .state
+            .set_slot(
+                1,
+                crate::fri_state::SlotValue::with_owner_fields(
+                    1_000_000,
+                    coinbase_creation_id(6),
+                    owner.as_fields(),
+                ),
+            )
+            .unwrap();
+        state.active_slot_count = 1;
+        state.alloc_counter = 1;
+        let mut parent = parent(&mut state);
+        parent.height = 8;
+
+        let mut spend = user(1, 3, 1_000_000, owner, &parent);
+        let mut body = spend.body;
+        body.inputs[0].creation_id = coinbase_creation_id(6);
+        spend = Transaction::new(body);
+
+        // Template attesting only coverage 5 skips the immature spend.
+        let immature_template = build_block_template_with_coverage(
+            &parent,
+            &state,
+            &[1],
+            vec![spend.clone()],
+            Address([9u8; 32]),
+            1,
+            [0xff; 32],
+            5,
+        )
+        .unwrap();
+        assert!(immature_template.txs.is_empty());
+        assert_eq!(immature_template.attested_coverage, 5);
+
+        // Advancing the template's own attested coverage to the mint height
+        // matures the spend inside the same block (same-block rule).
+        let matured_template = build_block_template_with_coverage(
+            &parent,
+            &state,
+            &[1],
+            vec![spend],
+            Address([9u8; 32]),
+            1,
+            [0xff; 32],
+            6,
+        )
+        .unwrap();
+        assert_eq!(matured_template.txs.len(), 1);
+        assert_eq!(matured_template.attested_coverage, 6);
+        let header = matured_template.clone().into_header(0);
+        assert_eq!(header.attested_coverage, 6);
+        // The sealed block passes the consensus maturity predicate.
+        let block = crate::block::Block {
+            header,
+            transactions: matured_template.all_txs(),
+        };
+        assert_eq!(
+            crate::consensus::validation::validate_coinbase_maturity(&block),
+            Ok(())
         );
     }
 

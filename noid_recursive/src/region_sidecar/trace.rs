@@ -44,9 +44,20 @@ pub(crate) struct DuplexUnionTraceWalkPrefix<'a> {
     walk_group: LaneClaimGroupTrace,
 }
 
-impl DuplexUnionTraceWalkPrefix<'_> {
+impl<'a> DuplexUnionTraceWalkPrefix<'a> {
     pub(crate) fn walk_group(&self) -> &LaneClaimGroupTrace {
         &self.walk_group
+    }
+
+    /// Consume the prefix into its deferred authority and the claims
+    /// accumulated so far (for a suffix twin living outside this module).
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        DuplexUnionWalkDeferredProofRef<'a>,
+        Vec<DuplexColumnClaimTrace>,
+    ) {
+        (self.proof, self.terminal_claims)
     }
 }
 

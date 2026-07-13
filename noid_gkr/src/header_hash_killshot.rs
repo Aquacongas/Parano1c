@@ -4,11 +4,12 @@
 //! Batched semantic-header and PoW-header Poseidon2b KillShot.
 //!
 //! For each header this component proves both fixed schedules from the same
-//! public 16-field header schedule:
+//! public 18-field header schedule (`attested_coverage` at index 16 plus a
+//! reserved zero pad at index 17):
 //!
 //! ```text
-//! pow_digest = Poseidon2b(POWHDR__, fields[0..16]) no-pad squeeze
-//! block_id   = Poseidon2b(BLOCKHDR, fields[0..16]) padded squeeze
+//! pow_digest = Poseidon2b(POWHDR__, fields[0..18]) no-pad squeeze
+//! block_id   = Poseidon2b(BLOCKHDR, fields[0..18]) padded squeeze
 //! ```
 
 use noid_core::transcript::FiatShamir;
@@ -27,11 +28,11 @@ use crate::block_spine::{
     BlockSpineUnifiedReduction,
 };
 
-pub const HEADER_HASH_FIELDS: usize = 16;
+pub const HEADER_HASH_FIELDS: usize = 18;
 // Public: the in-circuit trace transliteration (`noid_recursive::acceptance::trace`)
 // replays the chain relation from these same definitions; change both together.
-pub const HEADER_HASH_BLOCK_PERMS: usize = 9;
-pub const HEADER_HASH_POW_PERMS: usize = 8;
+pub const HEADER_HASH_BLOCK_PERMS: usize = 10;
+pub const HEADER_HASH_POW_PERMS: usize = 9;
 pub const HEADER_HASH_PERMS_PER_ITEM: usize = HEADER_HASH_BLOCK_PERMS + HEADER_HASH_POW_PERMS;
 pub const HEADER_HASH_PIN_LANES: usize = 2;
 pub const HEADER_HASH_LINEAR_RELATION_TAG: u128 = 0x4844_5248_4153_4801; // "HDRHASH"+1

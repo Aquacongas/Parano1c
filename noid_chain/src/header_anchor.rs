@@ -166,6 +166,7 @@ mod tests {
             log_slots: 24,
             active_slot_count: height,
             alloc_counter: height * 2,
+            attested_coverage: 0,
         }
     }
 

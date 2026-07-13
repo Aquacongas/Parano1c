@@ -1268,6 +1268,9 @@ mod tests {
     use noid_ivc_core::field::F128 as Field;
     use noid_ivc_core::field_r1cs::FieldR1cs;
 
+    const TEST_BLOCK_HEIGHT: u128 = 6;
+    const COINBASE_TEST_ID: u64 = (1u64 << 63) | (TEST_BLOCK_HEIGHT as u64);
+
     fn exact_leaf_input(value: Block128, owner: [Block128; 2]) -> SlotLeafInputs {
         let slot = SlotValue {
             value,
@@ -1313,9 +1316,12 @@ mod tests {
         ];
         let parent = alloc_block(&mut b, Block128::from(7u128));
         let child = alloc_block(&mut b, Block128::from(8u128));
+        // Body index 0 is the mandatory coinbase mint: its packed id is the
+        // tagged height while the allocator still advances 7 -> 8.
+        let height = alloc_block(&mut b, Block128::from(TEST_BLOCK_HEIGHT));
         // Production proves this at the body source through public_arithmetic.
         let _ = range_check_bits(&mut b, &actions[0].value, 64);
-        bind_mint_packed_values_body_order(&mut b, &mut actions, &parent, &child);
+        bind_mint_packed_values_body_order(&mut b, &mut actions, &parent, &child, &height);
         let compacted = compact_action_rows(&mut b, &actions, actions.len());
 
         let empty = exact_leaf_input(Block128::from(0u128), [Block128::from(0u128); 2]);
@@ -1356,7 +1362,7 @@ mod tests {
         let (r1cs, witness) = action_leaf_case(
             noid_tx::pack_amount_creation_id(11, 7),
             Block128::from(0u128),
-            noid_tx::pack_amount_creation_id(13, 8),
+            noid_tx::pack_amount_creation_id(13, COINBASE_TEST_ID),
             Block128::from(13u128),
             mint_owner,
         );
@@ -1370,35 +1376,35 @@ mod tests {
             action_leaf_case(
                 noid_tx::pack_amount_creation_id(12, 7),
                 Block128::from(0u128),
-                noid_tx::pack_amount_creation_id(13, 8),
+                noid_tx::pack_amount_creation_id(13, COINBASE_TEST_ID),
                 Block128::from(13u128),
                 mint_owner,
             ),
             action_leaf_case(
                 noid_tx::pack_amount_creation_id(11, 7),
                 Block128::from(1u128),
-                noid_tx::pack_amount_creation_id(13, 8),
+                noid_tx::pack_amount_creation_id(13, COINBASE_TEST_ID),
                 Block128::from(13u128),
                 mint_owner,
             ),
             action_leaf_case(
                 noid_tx::pack_amount_creation_id(11, 7),
                 Block128::from(0u128),
-                noid_tx::pack_amount_creation_id(13, 9),
+                noid_tx::pack_amount_creation_id(13, COINBASE_TEST_ID + 1),
                 Block128::from(13u128),
                 mint_owner,
             ),
             action_leaf_case(
                 noid_tx::pack_amount_creation_id(11, 7),
                 Block128::from(0u128),
-                noid_tx::pack_amount_creation_id(13, 8),
+                noid_tx::pack_amount_creation_id(13, COINBASE_TEST_ID),
                 Block128::from(1u128 << 64),
                 mint_owner,
             ),
             action_leaf_case(
                 noid_tx::pack_amount_creation_id(11, 7),
                 Block128::from(0u128),
-                noid_tx::pack_amount_creation_id(13, 8),
+                noid_tx::pack_amount_creation_id(13, COINBASE_TEST_ID),
                 Block128::from(13u128),
                 [Block128::from(99u128), mint_owner[1]],
             ),

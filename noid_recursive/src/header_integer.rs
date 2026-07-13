@@ -46,6 +46,7 @@ pub enum HeaderIntegerTraceError {
     BadMedianTimePast { index: usize },
     BadPowTarget { index: usize },
     BadLogSlots { index: usize },
+    BadAttestedCoverage { index: usize },
     BadBlockWork { index: usize },
     BadChainwork { index: usize },
     BadAsertAnchor { index: usize },
@@ -166,6 +167,16 @@ pub fn verify_header_integer_trace(
             return Err(HeaderIntegerTraceError::BadLogSlots { index });
         }
 
+        // Structural attested-coverage advancement rule — the exact twin of
+        // `consensus::header::validate_header_inner` step 7: repeat the
+        // parent's coverage or advance it to at most the parent height.
+        if header.attested_coverage < state.attested_coverage
+            || (header.attested_coverage > state.attested_coverage
+                && header.attested_coverage > state.height)
+        {
+            return Err(HeaderIntegerTraceError::BadAttestedCoverage { index });
+        }
+
         let work = block_work(&header.difficulty_target);
         if step.block_work != work {
             return Err(HeaderIntegerTraceError::BadBlockWork { index });
@@ -209,6 +220,7 @@ fn advance_state_from_step(
     state.log_slots = header.log_slots;
     state.active_slot_count = header.active_slot_count;
     state.alloc_counter = header.alloc_counter;
+    state.attested_coverage = header.attested_coverage;
     state.push_timestamp(header.timestamp);
     state.push_active_count(header.active_slot_count);
     state.asert_anchor_height = step.asert_anchor_height_after;
@@ -243,6 +255,7 @@ mod tests {
 
     fn genesis() -> BlockHeader {
         BlockHeader {
+            attested_coverage: 0,
             prev_block_hash: [0u8; 32],
             state_root: [0u8; 32],
             tx_root: [0u8; 32],
@@ -272,6 +285,7 @@ mod tests {
     fn child(state: &RecursiveConsensusState, timestamp: u64) -> BlockHeader {
         let height = state.height + 1;
         BlockHeader {
+            attested_coverage: 0,
             prev_block_hash: state.block_id,
             state_root: [height as u8; 32],
             tx_root: [0u8; 32],
@@ -338,6 +352,34 @@ mod tests {
             verify_header_integer_trace(&start, &[witness], &trace),
             Err(HeaderIntegerTraceError::BadPowTarget { index: 0 })
         );
+    }
+
+    #[test]
+    fn header_integer_trace_rejects_attested_coverage_violations() {
+        let g = genesis();
+        let mut start = start_state(&g);
+        start.height = 5;
+        start.attested_coverage = 3;
+        let child_with = |coverage: u64| {
+            let mut h = child(&start, g.timestamp + BLOCK_TIME);
+            h.attested_coverage = coverage;
+            integer_witness(&h)
+        };
+        for valid in [3u64, 4, 5] {
+            let witness = child_with(valid);
+            let trace = build_header_integer_trace(&start, &[witness.clone()]).unwrap();
+            let end = verify_header_integer_trace(&start, &[witness], &trace)
+                .expect("repeat or bounded advancement accepts");
+            assert_eq!(end.attested_coverage, valid);
+        }
+        for invalid in [2u64, 6] {
+            let witness = child_with(invalid);
+            let trace = build_header_integer_trace(&start, &[witness.clone()]).unwrap();
+            assert_eq!(
+                verify_header_integer_trace(&start, &[witness], &trace),
+                Err(HeaderIntegerTraceError::BadAttestedCoverage { index: 0 })
+            );
+        }
     }
 
     #[test]

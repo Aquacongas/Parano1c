@@ -181,7 +181,7 @@ fn action_from_lanes(mut lanes: Vec<LinExpr>) -> ActionRowTrace {
     }
 }
 
-/// Pack every live mint's monotone creation id in canonical body order.
+/// Pack every live mint's creation id in canonical body order.
 ///
 /// This MUST run before slot sorting: consensus increments the allocator as
 /// coinbase/user outputs appear in the block, not in destination-slot order.
@@ -191,11 +191,19 @@ fn action_from_lanes(mut lanes: Vec<LinExpr>) -> ActionRowTrace {
 /// action. Conditional ripple increments reject u64 overflow and the final
 /// counter is pinned to the child accumulator/header value. Callers must have
 /// proved every mint amount is u64 before this pass.
+///
+/// Exact twin of the `state_delta` mint branch (proof-gated coinbase
+/// maturity): EVERY mint consumes one allocator increment and the incremented
+/// counter must never enter the tagged coinbase namespace (bit 63), but the
+/// SINGLE mandatory coinbase output — canonical body order fixes it as
+/// `actions[0]` — stores `COINBASE_CREATION_TAG | block_height` instead of
+/// the allocator id.
 pub fn bind_mint_packed_values_body_order(
     b: &mut FieldR1csBuilder,
     actions: &mut [ActionRowTrace],
     parent_alloc_counter: &LinExpr,
     child_alloc_counter: &LinExpr,
+    block_height: &LinExpr,
 ) {
     const BITS: usize = 64;
     let mut counter_bits: Vec<LinExpr> = super::range_check_bits(b, parent_alloc_counter, BITS)
@@ -203,7 +211,19 @@ pub fn bind_mint_packed_values_body_order(
         .map(LinExpr::from_wire)
         .collect();
 
-    for action in actions {
+    // `coinbase_creation_id(height) = (1 << 63) | height`: the OR forces id
+    // bit 63 to one and passes the height's low 63 bits through, matching the
+    // native constant for every u64 height. The bits come from the header
+    // height lane's constrained u64 decomposition.
+    let height_bits = super::range_check_bits(b, block_height, BITS);
+    let coinbase_creation_high = height_bits[..BITS - 1].iter().enumerate().fold(
+        LinExpr::constant(flat_const(1u128 << 127)),
+        |sum, (bit, &value)| {
+            sum.add(&LinExpr::from_wire(value).scale(flat_const(1u128 << (64 + bit))))
+        },
+    );
+
+    for (index, action) in actions.iter_mut().enumerate() {
         let mut carry = action.is_mint.clone();
         let mut next_bits = Vec::with_capacity(BITS);
         for bit in &counter_bits {
@@ -211,12 +231,21 @@ pub fn bind_mint_packed_values_body_order(
             carry = mul(b, bit, &carry);
         }
         pin_zero(b, &carry);
-        let creation_high = next_bits
-            .iter()
-            .enumerate()
-            .fold(LinExpr::zero(), |sum, (bit, value)| {
-                sum.add(&value.scale(flat_const(1u128 << (64 + bit))))
-            });
+        // Twin of the native tagged-namespace guard: a mint whose incremented
+        // allocator id sets bit 63 fails closed (`is_coinbase_creation_id`
+        // rejection in the mint branch), keeping the two id spaces disjoint.
+        let tagged_allocation = mul(b, &action.is_mint, &next_bits[BITS - 1]);
+        pin_zero(b, &tagged_allocation);
+        let creation_high = if index == 0 {
+            coinbase_creation_high.clone()
+        } else {
+            next_bits
+                .iter()
+                .enumerate()
+                .fold(LinExpr::zero(), |sum, (bit, value)| {
+                    sum.add(&value.scale(flat_const(1u128 << (64 + bit))))
+                })
+        };
         let selected_creation_high = mul(b, &action.is_mint, &creation_high);
         action.value = action.value.add(&selected_creation_high);
         counter_bits = next_bits;
@@ -380,6 +409,9 @@ mod tests {
         })
     }
 
+    const TEST_BLOCK_HEIGHT: u128 = 6;
+    const COINBASE_TEST_ID: u128 = (1u128 << 63) | TEST_BLOCK_HEIGHT;
+
     fn allocator_case(
         slots: &[(u128, bool, bool)],
         parent: u128,
@@ -393,7 +425,8 @@ mod tests {
         let mut rows = slot_rows(&mut b, slots);
         let parent_w = super::super::alloc_block(&mut b, Block128::from(parent));
         let child_w = super::super::alloc_block(&mut b, Block128::from(child));
-        bind_mint_packed_values_body_order(&mut b, &mut rows, &parent_w, &child_w);
+        let height_w = super::super::alloc_block(&mut b, Block128::from(TEST_BLOCK_HEIGHT));
+        bind_mint_packed_values_body_order(&mut b, &mut rows, &parent_w, &child_w, &height_w);
         let compact = compact_action_rows(&mut b, &rows, rows.len());
         let routed = compact
             .rows
@@ -429,6 +462,9 @@ mod tests {
 
     #[test]
     fn body_order_creation_ids_survive_slot_sorting() {
+        // Index 0 is the mandatory coinbase mint: it stores the tagged height
+        // id while still consuming allocator increment 8; the user mints then
+        // take 9 and 10 in body order.
         let (r1cs, witness, routed) = allocator_case(
             &[
                 (90, true, true),
@@ -441,7 +477,28 @@ mod tests {
             10,
         );
         assert!(r1cs.satisfies(&witness));
-        assert_eq!(routed, [(1, 10), (5, 0), (20, 9), (90, 8), (0, 0)]);
+        assert_eq!(
+            routed,
+            [(1, 10), (5, 0), (20, 9), (90, COINBASE_TEST_ID), (0, 0)]
+        );
+    }
+
+    #[test]
+    fn allocator_rejects_user_mint_entering_coinbase_namespace() {
+        // The coinbase increment reaches (1<<63)-1 (untagged, valid); the
+        // user mint's increment would set bit 63 and must fail closed — the
+        // twin of the native `is_coinbase_creation_id(next_alloc)` rejection.
+        let parent = (1u128 << 63) - 2;
+        let (r1cs, witness, _) = allocator_case(
+            &[(9, true, true), (12, true, true)],
+            parent,
+            parent + 2,
+        );
+        assert!(!r1cs.satisfies(&witness));
+
+        // One increment below the namespace boundary stays satisfiable.
+        let (ok, ok_witness, _) = allocator_case(&[(9, true, true)], parent, parent + 1);
+        assert!(ok.satisfies(&ok_witness));
     }
 
     #[test]

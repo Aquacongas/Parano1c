@@ -59,6 +59,8 @@ mod merkle_trace;
 pub use merkle_trace::*;
 mod combined_duplex;
 pub use combined_duplex::*;
+mod recording_duplex;
+pub use recording_duplex::*;
 mod trace;
 pub use trace::*;
 mod walk_a;

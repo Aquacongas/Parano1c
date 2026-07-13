@@ -658,6 +658,7 @@ fn bench_block_from_parts(
             log_slots: BENCH_LOG_SLOTS,
             active_slot_count,
             alloc_counter,
+            attested_coverage: 0,
         },
         transactions,
     }
@@ -682,11 +683,13 @@ fn prove_full_block_from_fixtures(
         .chain(user_bodies.iter().cloned())
         .collect();
     let commitments: Vec<_> = all_bodies.iter().map(TxBody::claims_commitment).collect();
+    // `bench_block_from_parts` mints this fixture at height 1.
     let exact_surface = noid_chain::build_exact_action_surface(
         &pre_state.state,
         &all_bodies,
         &commitments,
         pre_state.alloc_counter,
+        1,
     )
     .expect("build Tx8x2 exact action surface");
     let exact_cache = pre_state
@@ -725,6 +728,7 @@ fn prove_full_block_from_fixtures(
         epoch_anchor_id: user_bodies
             .first()
             .map_or(block.header.prev_block_hash, |body| body.epoch_anchor),
+        attested_coverage: 0,
     };
     assert_eq!(
         block.transactions[0].body.epoch_anchor, start_accumulator.tip_block_id,
@@ -735,7 +739,7 @@ fn prove_full_block_from_fixtures(
         .all(|body| body.epoch_anchor == start_accumulator.epoch_anchor_id));
     let end_accumulator = start_accumulator
         .advance(&block.header)
-        .expect("benchmark block advances the direct ten-lane accumulator");
+        .expect("benchmark block advances the direct eleven-lane accumulator");
     (
         proof,
         block,
@@ -803,6 +807,7 @@ fn accepted_user_block_seed(mut scenarios: Vec<BenchScenario>) -> AcceptedBlockS
         log_slots: BENCH_LOG_SLOTS,
         active_slot_count: pre_state.active_slot_count,
         alloc_counter: pre_state.alloc_counter,
+        attested_coverage: 0,
     };
     parent.nonce = mine_benchmark_header(&parent);
     let parent_id = noid_chain::hash_block_header(&parent);
@@ -878,6 +883,7 @@ fn accepted_user_block_seed(mut scenarios: Vec<BenchScenario>) -> AcceptedBlockS
         active_slot_count: parent.active_slot_count,
         alloc_counter: parent.alloc_counter,
         epoch_anchor_id: genesis_id,
+        attested_coverage: parent.attested_coverage,
     };
     let child_timestamp = parent.timestamp + noid_chain::consensus::params::BLOCK_TIME;
     let child_target = noid_chain::consensus::difficulty::next_target(
@@ -919,6 +925,7 @@ fn accepted_user_block_seed(mut scenarios: Vec<BenchScenario>) -> AcceptedBlockS
         &all_bodies,
         &commitments,
         pre_state.alloc_counter,
+        parent.height + 1,
     )
     .expect("accepted fixture exact action surface");
     let state_transition = build_exact_state_transition_proof(&exact_cache, &surface)
@@ -957,6 +964,7 @@ fn accepted_user_block_seed(mut scenarios: Vec<BenchScenario>) -> AcceptedBlockS
         log_slots: BENCH_LOG_SLOTS,
         active_slot_count: child_active_slot_count,
         alloc_counter: child_alloc_counter,
+        attested_coverage: parent.attested_coverage,
     };
     child_header.nonce = mine_benchmark_header(&child_header);
     let block = Block {
@@ -1236,6 +1244,7 @@ fn four_tier_chain_start(
         log_slots: BENCH_LOG_SLOTS,
         active_slot_count: state.active_slot_count,
         alloc_counter: state.alloc_counter,
+        attested_coverage: 0,
     };
     parent.nonce = mine_benchmark_header_parallel(&parent);
     let parent_id = noid_chain::hash_block_header(&parent);
@@ -1261,6 +1270,7 @@ fn four_tier_chain_start(
         active_slot_count: parent.active_slot_count,
         alloc_counter: parent.alloc_counter,
         epoch_anchor_id: genesis_id,
+        attested_coverage: parent.attested_coverage,
     };
     (consensus, accumulator, parent, state, spendables)
 }
@@ -1480,6 +1490,7 @@ fn accepted_sequential_chain_fixture(
                 &all_bodies,
                 &commitments,
                 state.alloc_counter,
+                template.height,
             )
             .expect("sequential fixture exact action surface");
             let exact_cache = state
@@ -2071,6 +2082,7 @@ mod tests {
                 log_slots: BENCH_LOG_SLOTS,
                 active_slot_count: 0,
                 alloc_counter: 0,
+                attested_coverage: 0,
             },
             transactions,
         };
@@ -2360,6 +2372,7 @@ pub fn bench_full_block_proof_minimal(fixtures: &[MinimalTxFixture]) -> FullBloc
             &exact_bodies,
             &commitments,
             pre_state.alloc_counter,
+            block.header.height,
         )
         .expect("rebuild exact state surface");
         let inputs = ExactStateTransitionInputs {

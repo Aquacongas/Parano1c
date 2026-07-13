@@ -137,6 +137,23 @@ fn validate_header_inner(
         return Err(ConsensusError::BadLogSlotsExpansion);
     }
 
+    // 7. Structural attested-coverage advancement rule.
+    //
+    // A header either repeats its parent's coverage or advances it to at most
+    // `parent.height`. The exact rule (advanced iff a natively verified Link
+    // envelope for exactly this height accompanies the block) is enforced by
+    // the block acceptance path, which has the detached attestation payload.
+    if header.attested_coverage < parent.attested_coverage
+        || (header.attested_coverage > parent.attested_coverage
+            && header.attested_coverage > parent.height)
+    {
+        return Err(ConsensusError::BadAttestedCoverage {
+            parent_coverage: parent.attested_coverage,
+            parent_height: parent.height,
+            attested_coverage: header.attested_coverage,
+        });
+    }
+
     Ok(())
 }
 
@@ -175,6 +192,7 @@ mod tests {
             log_slots: 24,
             active_slot_count: 0,
             alloc_counter: 0,
+            attested_coverage: 0,
         }
     }
 
@@ -292,6 +310,58 @@ mod tests {
             &genesis.difficulty_target,
         );
         assert_eq!(result, Err(ConsensusError::BadLogSlotsExpansion));
+    }
+
+    #[test]
+    fn attested_coverage_must_stay_monotone_and_below_parent_height() {
+        let mut genesis = make_header(0, 1_000_000, None);
+        genesis.attested_coverage = 0;
+        let mut parent = make_header(5, 1_000_000, None);
+        parent.attested_coverage = 3;
+
+        let child = |coverage: u64| {
+            // Perfect BLOCK_TIME spacing keeps ASERT at the anchor target.
+            let mut h = make_header(6, 1_000_000 + 6 * BLOCK_TIME, Some(&parent));
+            h.attested_coverage = coverage;
+            mine(&mut h);
+            h
+        };
+        let validate = |h: &BlockHeader| {
+            validate_header(
+                h,
+                &parent,
+                &[parent.timestamp],
+                &[parent.active_slot_count],
+                h.timestamp + 1,
+                0,
+                genesis.timestamp,
+                &genesis.difficulty_target,
+            )
+        };
+
+        // Keeping the parent's coverage is always structurally valid.
+        assert!(validate(&child(3)).is_ok());
+        // Advancing within (parent_coverage, parent.height] is structurally valid.
+        assert!(validate(&child(4)).is_ok());
+        assert!(validate(&child(5)).is_ok());
+        // Regression is rejected.
+        assert_eq!(
+            validate(&child(2)),
+            Err(ConsensusError::BadAttestedCoverage {
+                parent_coverage: 3,
+                parent_height: 5,
+                attested_coverage: 2,
+            })
+        );
+        // Advancing past the parent height is rejected.
+        assert_eq!(
+            validate(&child(6)),
+            Err(ConsensusError::BadAttestedCoverage {
+                parent_coverage: 3,
+                parent_height: 5,
+                attested_coverage: 6,
+            })
+        );
     }
 
     #[test]

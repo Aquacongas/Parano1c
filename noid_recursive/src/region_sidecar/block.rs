@@ -3,13 +3,16 @@
 
 //! Mandatory terminal post-commit authority for one production block proof.
 //!
-//! The six fields are the complete block-region authority.  None is optional:
-//! wallet/meta Walk-A, wallet/meta Walk-B, owner-auth C' and the main FRICHANL
-//! C walk all replay on the enclosing Field proof's already post-commit
-//! challenger.  Terminal PCS claims are verifier output and therefore never
-//! appear in the serialized proof.
+//! The six children are the complete block-region authority.  None is
+//! optional: wallet/meta Walk-A, wallet/meta Walk-B, owner-auth C' and the
+//! main FRICHANL C walk all replay on the enclosing Field proof's already
+//! post-commit challenger.  Every child carries its own prefix/suffix
+//! relation authority with the deep-chain walk deliberately absent; ONE
+//! mandatory six-instance ragged multi-walk reduces all six children at the
+//! cost of `66 × max(w_log)` aggregate rounds.  Terminal PCS claims are
+//! verifier output and therefore never appear in the serialized proof.
 
-use noid_ivc_core::challenger::Challenger;
+use noid_ivc_core::challenger::{Challenger, FsLaneChallenger};
 use noid_ivc_core::deep_chain::capsule_leaf::raw_flat_lane;
 use noid_ivc_core::deep_chain::schedule::{
     duplex_family_refs, duplex_fixed_patterns, flat_of_tower_u128,
@@ -20,7 +23,7 @@ use noid_ivc_core::deep_chain::{
     MultiDeepChainWalkProof,
 };
 use noid_ivc_core::field::F128;
-use noid_ivc_core::field_circuit::FsChannelOps;
+use noid_ivc_core::field_circuit::{FsChannelOps, FsChannelUnionRecorder, RecordedChannel};
 use noid_ivc_core::pcs::{PcsParams, QuirkyDirectClaim};
 use noid_ivc_core::public_io::{PublicIoSpec, WitnessSlice};
 use noid_ivc_core::verifier::FieldPostCommitVerifierContext;
@@ -53,17 +56,16 @@ use super::bounded_decode::{
 use super::walk_a::walk_a_bounded_shape;
 use super::{
     preflight_duplex_region_walk_deferred_trace, preflight_merkle_region_walk_deferred_trace,
-    preflight_merkle_sidecar_trace, preflight_walk_a_region_walk_deferred_trace,
-    verify_duplex_region_walk_deferred_prefix, verify_duplex_region_walk_deferred_prefix_trace,
-    verify_merkle_region_sidecar, verify_merkle_region_sidecar_trace_post_commit,
-    verify_merkle_region_walk_deferred_prefix, verify_merkle_region_walk_deferred_prefix_trace,
-    verify_walk_a_region_walk_deferred_prefix, verify_walk_a_region_walk_deferred_prefix_trace,
-    DuplexRegionProverPlan, DuplexRegionVk, DuplexRegionWalkDeferredProof, MerkleRegionProverPlan,
-    MerkleRegionSidecarProof, MerkleRegionVk, MerkleRegionWalkDeferredProof, RegionSidecarError,
-    WalkARegionProverPlan, WalkARegionVk, WalkARegionWalkDeferredProof,
+    preflight_walk_a_region_walk_deferred_trace, verify_duplex_region_walk_deferred_prefix,
+    verify_duplex_region_walk_deferred_prefix_trace, verify_merkle_region_walk_deferred_prefix,
+    verify_merkle_region_walk_deferred_prefix_trace, verify_walk_a_region_walk_deferred_prefix,
+    verify_walk_a_region_walk_deferred_prefix_trace, DuplexRegionProverPlan, DuplexRegionVk,
+    DuplexRegionWalkDeferredProof, MerkleRegionProverPlan, MerkleRegionVk,
+    MerkleRegionWalkDeferredProof, RegionSidecarError, WalkARegionProverPlan, WalkARegionVk,
+    WalkARegionWalkDeferredProof,
 };
 
-pub const BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION: u8 = 4;
+pub const BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION: u8 = 5;
 
 /// Compact retained portion of a selected Block sidecar VK.
 ///
@@ -213,10 +215,21 @@ const SELECTED_ZK_AUTH_OWNER_W_LOG: usize = 15;
 #[cfg(test)]
 const SELECTED_ZK_AUTH_WALLET_A_W_LOG: usize = 19;
 
-const BLOCK_REGION_SELECTED_ZK_VK_DIGEST_DOMAIN: &[u8] = b"NOID/REGION-SIDECAR/BLOCK-ZK-AUTH-VK/V4";
+const BLOCK_REGION_SELECTED_ZK_VK_DIGEST_DOMAIN: &[u8] = b"NOID/REGION-SIDECAR/BLOCK-ZK-AUTH-VK/V5";
 const BLOCK_SELECTED_ZK_POST_COMMIT_CLASS_DIGEST_DOMAIN: &[u8] =
-    b"NOID/REGION-SIDECAR/BLOCK-ZK-AUTH-POST-COMMIT-CLASS/V4";
-const BLOCK_REGION_SELECTED_ZK_TRANSCRIPT_LABEL: &[u8] = b"history-region-sidecar-block-zk-auth-v4";
+    b"NOID/REGION-SIDECAR/BLOCK-ZK-AUTH-POST-COMMIT-CLASS/V5";
+const BLOCK_REGION_SELECTED_ZK_TRANSCRIPT_LABEL: &[u8] = b"history-region-sidecar-block-zk-auth-v5";
+
+/// Outer-channel label preceding the child-transcript seed draw.
+pub(crate) const BLOCK_SIDECAR_RECORDED_LABEL: &[u8] = b"history-block-sidecar-recorded-v1";
+/// Fresh Fiat-Shamir domain of the block-sidecar CHILD transcript.  The
+/// child chain starts from this domain, absorbs one outer-sampled seed (so
+/// its challenges are causally post-commit), replays the complete V5 block
+/// sidecar verification, and squeezes a two-lane terminal digest that the
+/// outer channel re-absorbs before its first zerocheck challenge.
+pub(crate) const BLOCK_SIDECAR_CHILD_DOMAIN: &[u8] = b"history-block-sidecar-child-v1";
+/// Terminal child-state binding lanes re-absorbed by the outer channel.
+pub(crate) const BLOCK_SIDECAR_CHILD_TAIL_LANES: usize = 2;
 
 /// Canonical verification key for all six production block-region verticals.
 ///
@@ -884,47 +897,31 @@ impl<'a> BlockRegionProverPlan<'a> {
         bind_block_vk(challenger, self.vk);
         let mut claims = Vec::new();
 
-        // Batch only the deep-chain walk shared by these ordered children.
+        // Batch the ONE deep-chain walk shared by all six ordered children.
         // The ragged embedding retains every child's native domain width; no
         // committed column or outer witness is padded to the group max.
         // Every prefix/suffix relation and every terminal opening remains a
         // separate role-bound proof.  The exact order below is the canonical
-        // V4 block sidecar transcript and is mirrored by both verifier twins.
+        // V5 block sidecar transcript and is mirrored by both verifier twins.
         let wallet_a_plan = WalkARegionProverPlan::new(
             self.vk.wallet_a(),
             self.input.wallet_a.s0(),
             self.input.wallet_a.s_out(),
         )?;
-        let meta_b_plan = MerkleRegionProverPlan::new(
-            self.vk.meta_b(),
-            self.input.meta_b.s0(),
-            self.input.meta_b.s_out(),
-        )?;
-        let wallet_a_prefix = wallet_a_plan.prove_walk_deferred_prefix(z, challenger)?;
-        lap("wallet-A prefix", &mut t);
-        let meta_b_prefix = meta_b_plan.prove_walk_deferred_prefix(z, challenger)?;
-        lap("meta-B prefix", &mut t);
-        let groups = vec![
-            vec![wallet_a_prefix.group().clone()],
-            vec![meta_b_prefix.group().clone()],
-        ];
-        let s0 = [wallet_a_prefix.s0(), meta_b_prefix.s0()];
-        let (wallet_a_meta_b_walk, terminals) =
-            prove_ragged_multi_deep_chain_walk(&s0, &groups, challenger);
-        lap("wallet-A/meta-B multi-walk", &mut t);
-        let [wallet_a_terminal, meta_b_terminal]: [_; 2] = terminals
-            .try_into()
-            .expect("wallet-A/meta-B multi-walk terminal count");
-        let (wallet_a, child_claims) = wallet_a_prefix.finish(&wallet_a_terminal, challenger)?;
-        claims.extend(child_claims);
-        let (meta_b, child_claims) = meta_b_prefix.finish(&meta_b_terminal, challenger)?;
-        claims.extend(child_claims);
-        lap("wallet-A/meta-B finish", &mut t);
-
         let meta_a_plan = WalkARegionProverPlan::new(
             self.vk.meta_a(),
             self.input.meta_a.s0(),
             self.input.meta_a.s_out(),
+        )?;
+        let wallet_b_plan = MerkleRegionProverPlan::new(
+            self.vk.wallet_b(),
+            self.input.wallet_b.s0(),
+            self.input.wallet_b.s_out(),
+        )?;
+        let meta_b_plan = MerkleRegionProverPlan::new(
+            self.vk.meta_b(),
+            self.input.meta_b.s0(),
+            self.input.meta_b.s_out(),
         )?;
         let owner_c_plan = DuplexRegionProverPlan::new(
             self.vk.owner_c(),
@@ -936,54 +933,63 @@ impl<'a> BlockRegionProverPlan<'a> {
             self.input.main_c.s0(),
             self.input.main_c.s_out(),
         )?;
+        let wallet_a_prefix = wallet_a_plan.prove_walk_deferred_prefix(z, challenger)?;
+        lap("wallet-A prefix", &mut t);
         let meta_a_prefix = meta_a_plan.prove_walk_deferred_prefix(z, challenger)?;
         lap("meta-A prefix", &mut t);
+        let wallet_b_prefix = wallet_b_plan.prove_walk_deferred_prefix(z, challenger)?;
+        lap("wallet-B prefix", &mut t);
+        let meta_b_prefix = meta_b_plan.prove_walk_deferred_prefix(z, challenger)?;
+        lap("meta-B prefix", &mut t);
         let owner_c_prefix = owner_c_plan.prove_walk_deferred_prefix(z, challenger)?;
         lap("owner-C prefix", &mut t);
         let main_c_prefix = main_c_plan.prove_walk_deferred_prefix(z, challenger)?;
         lap("main-C prefix", &mut t);
         let groups = vec![
+            vec![wallet_a_prefix.group().clone()],
             vec![meta_a_prefix.group().clone()],
+            vec![wallet_b_prefix.group().clone()],
+            vec![meta_b_prefix.group().clone()],
             vec![owner_c_prefix.group().clone()],
             vec![main_c_prefix.group().clone()],
         ];
-        let s0 = [meta_a_prefix.s0(), owner_c_prefix.s0(), main_c_prefix.s0()];
-        let (meta_a_owner_main_walk, terminals) =
-            prove_ragged_multi_deep_chain_walk(&s0, &groups, challenger);
-        lap("meta-A/owner-C/main-C multi-walk", &mut t);
-        let [meta_a_terminal, owner_c_terminal, main_c_terminal]: [_; 3] = terminals
+        let s0 = [
+            wallet_a_prefix.s0(),
+            meta_a_prefix.s0(),
+            wallet_b_prefix.s0(),
+            meta_b_prefix.s0(),
+            owner_c_prefix.s0(),
+            main_c_prefix.s0(),
+        ];
+        let (walk, terminals) = prove_ragged_multi_deep_chain_walk(&s0, &groups, challenger);
+        lap("six-child multi-walk", &mut t);
+        let [wallet_a_terminal, meta_a_terminal, wallet_b_terminal, meta_b_terminal, owner_c_terminal, main_c_terminal]: [_; 6] = terminals
             .try_into()
-            .expect("meta-A/owner-C/main-C multi-walk terminal count");
+            .expect("six-child multi-walk terminal count");
+        let (wallet_a, child_claims) = wallet_a_prefix.finish(&wallet_a_terminal, challenger)?;
+        claims.extend(child_claims);
         let (meta_a, child_claims) = meta_a_prefix.finish(&meta_a_terminal, challenger)?;
+        claims.extend(child_claims);
+        let (wallet_b, child_claims) = wallet_b_prefix.finish(&wallet_b_terminal, challenger)?;
+        claims.extend(child_claims);
+        let (meta_b, child_claims) = meta_b_prefix.finish(&meta_b_terminal, challenger)?;
         claims.extend(child_claims);
         let (owner_c, child_claims) = owner_c_prefix.finish(&owner_c_terminal, challenger)?;
         claims.extend(child_claims);
         let (main_c, child_claims) = main_c_prefix.finish(&main_c_terminal, challenger)?;
         claims.extend(child_claims);
-        lap("meta/owner/main finish", &mut t);
-
-        // wallet-B has the only unmatched production domain and therefore
-        // retains its ordinary single-instance authority.
-        let wallet_b = prove_merkle(
-            self.vk.wallet_b(),
-            &self.input.wallet_b,
-            z,
-            challenger,
-            &mut claims,
-        )?;
-        lap("wallet-B full", &mut t);
+        lap("six-child finish", &mut t);
 
         Ok((
             BlockRegionSidecarProof {
                 version: BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION,
                 wallet_a,
-                meta_b,
-                wallet_a_meta_b_walk,
                 meta_a,
+                wallet_b,
+                meta_b,
                 owner_c,
                 main_c,
-                meta_a_owner_main_walk,
-                wallet_b,
+                walk,
             },
             claims,
         ))
@@ -993,34 +999,46 @@ impl<'a> BlockRegionProverPlan<'a> {
     /// created by the enclosing Field prover after committing to `z`; this
     /// method also deposits every derived claim into its private sink before
     /// returning the sidecar proof.
+    ///
+    /// The complete sidecar transcript rides a CHILD Fiat-Shamir chain: the
+    /// outer channel seeds it (one post-commit sample) and re-absorbs its
+    /// two-lane terminal digest, so the outer zerocheck challenges still
+    /// cover every sidecar message while a recursive replay may discharge
+    /// the child chain through a committed recording region instead of
+    /// inline sponge permutations.
     pub fn prove_post_commit<Ch: Challenger>(
         &self,
         context: &mut FieldPostCommitProverContext<'_, Ch>,
     ) -> Result<BlockRegionSidecarProof, RegionSidecarError> {
         let witness = context.witness();
-        let (proof, claims) = self.prove(witness, context)?;
+        context.observe_label(BLOCK_SIDECAR_RECORDED_LABEL);
+        let seed = context.sample_f128();
+        let mut child = FsLaneChallenger::new(BLOCK_SIDECAR_CHILD_DOMAIN);
+        child.observe_f128(seed);
+        let (proof, claims) = self.prove(witness, &mut child)?;
+        let tail = child.sample_f128_vec(BLOCK_SIDECAR_CHILD_TAIL_LANES);
+        context.observe_f128_slice(&tail);
         context.append_claims(claims);
         Ok(proof)
     }
 }
 
-/// The fixed-shape selected-ZK V4 block sidecar envelope.
+/// The fixed-shape selected-ZK V5 block sidecar envelope.
 ///
-/// Five children carry independent prefix/suffix authority with their walk
-/// deliberately absent; two mandatory multi-walks reduce those exact child
-/// groups. Wallet-B remains the one unmatched full child. No relation proof,
-/// shift discharge, or terminal opening is shared or omitted.
+/// All six children carry independent prefix/suffix authority with their
+/// walk deliberately absent; ONE mandatory six-instance ragged multi-walk
+/// reduces the exact child group.  No relation proof, shift discharge, or
+/// terminal opening is shared or omitted.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BlockRegionSidecarProof {
     version: u8,
     wallet_a: WalkARegionWalkDeferredProof,
-    meta_b: MerkleRegionWalkDeferredProof,
-    wallet_a_meta_b_walk: MultiDeepChainWalkProof,
     meta_a: WalkARegionWalkDeferredProof,
+    wallet_b: MerkleRegionWalkDeferredProof,
+    meta_b: MerkleRegionWalkDeferredProof,
     owner_c: DuplexRegionWalkDeferredProof,
     main_c: DuplexRegionWalkDeferredProof,
-    meta_a_owner_main_walk: MultiDeepChainWalkProof,
-    wallet_b: MerkleRegionSidecarProof,
+    walk: MultiDeepChainWalkProof,
 }
 
 impl BlockRegionSidecarProof {
@@ -1036,7 +1054,7 @@ impl BlockRegionSidecarProof {
         &self.meta_a
     }
 
-    pub(crate) fn wallet_b(&self) -> &MerkleRegionSidecarProof {
+    pub(crate) fn wallet_b(&self) -> &MerkleRegionWalkDeferredProof {
         &self.wallet_b
     }
 
@@ -1053,9 +1071,9 @@ impl BlockRegionSidecarProof {
     }
 }
 
-/// Decode the mandatory V4 block envelope only after every deferred child,
-/// both multi-walks, and the unmatched full child have passed one
-/// allocation-free class-aware scan.
+/// Decode the mandatory V5 block envelope only after every deferred child
+/// and the shared six-instance multi-walk have passed one allocation-free
+/// class-aware scan.
 pub fn decode_block_region_sidecar_bounded(
     vk: &BlockRegionSidecarVk,
     total_vars: usize,
@@ -1075,23 +1093,21 @@ pub fn decode_block_region_sidecar_bounded(
 fn block_bounded_shapes(
     vk: &BlockRegionSidecarVk,
     total_vars: usize,
-) -> Result<[SidecarProofShape; 8], RegionSidecarError> {
+) -> Result<[SidecarProofShape; 7], RegionSidecarError> {
     vk.validate_selected_zk_roles()?;
-    let wallet_meta_w_logs = wallet_meta_w_logs(vk);
-    let meta_duplex_w_logs = meta_duplex_w_logs(vk);
+    let w_logs = block_walk_w_logs(vk);
     Ok([
         SidecarProofShape::DeferredFixed(
             walk_a_bounded_shape(vk.wallet_a(), total_vars)?.walk_deferred(),
         ),
-        SidecarProofShape::DeferredMerkle(
-            merkle_shape_for_vk(vk.meta_b(), total_vars)?.walk_deferred(),
-        ),
-        SidecarProofShape::MultiWalk(multi_walk_proof_shape(
-            max_w_log(&wallet_meta_w_logs),
-            wallet_meta_w_logs.len(),
-        )?),
         SidecarProofShape::DeferredFixed(
             walk_a_bounded_shape(vk.meta_a(), total_vars)?.walk_deferred(),
+        ),
+        SidecarProofShape::DeferredMerkle(
+            merkle_shape_for_vk(vk.wallet_b(), total_vars)?.walk_deferred(),
+        ),
+        SidecarProofShape::DeferredMerkle(
+            merkle_shape_for_vk(vk.meta_b(), total_vars)?.walk_deferred(),
         ),
         SidecarProofShape::DeferredFixed(
             duplex_shape_for_vk(vk.owner_c(), total_vars)?.walk_deferred(),
@@ -1100,10 +1116,9 @@ fn block_bounded_shapes(
             duplex_shape_for_vk(vk.main_c(), total_vars)?.walk_deferred(),
         ),
         SidecarProofShape::MultiWalk(multi_walk_proof_shape(
-            max_w_log(&meta_duplex_w_logs),
-            meta_duplex_w_logs.len(),
+            max_w_log(&w_logs),
+            w_logs.len(),
         )?),
-        SidecarProofShape::Merkle(merkle_shape_for_vk(vk.wallet_b(), total_vars)?),
     ])
 }
 
@@ -1129,32 +1144,22 @@ fn verify_block_region_sidecar<Ch: Challenger>(
         &proof.wallet_a,
         challenger,
     )?;
-    let meta_b_prefix = verify_merkle_region_walk_deferred_prefix(
-        vk.meta_b(),
-        total_vars,
-        &proof.meta_b,
-        challenger,
-    )?;
-    let groups = vec![
-        vec![wallet_a_prefix.group().clone()],
-        vec![meta_b_prefix.group().clone()],
-    ];
-    let [wallet_a_terminal, meta_b_terminal]: [_; 2] = verify_ragged_multi_deep_chain_walk(
-        &wallet_meta_w_logs(vk),
-        &groups,
-        &proof.wallet_a_meta_b_walk,
-        challenger,
-    )
-    .map_err(|_| RegionSidecarError::InvalidProof)?
-    .try_into()
-    .expect("verified wallet-A/meta-B terminal count");
-    claims.extend(wallet_a_prefix.finish(&wallet_a_terminal, challenger)?);
-    claims.extend(meta_b_prefix.finish(&meta_b_terminal, challenger)?);
-
     let meta_a_prefix = verify_walk_a_region_walk_deferred_prefix(
         vk.meta_a(),
         total_vars,
         &proof.meta_a,
+        challenger,
+    )?;
+    let wallet_b_prefix = verify_merkle_region_walk_deferred_prefix(
+        vk.wallet_b(),
+        total_vars,
+        &proof.wallet_b,
+        challenger,
+    )?;
+    let meta_b_prefix = verify_merkle_region_walk_deferred_prefix(
+        vk.meta_b(),
+        total_vars,
+        &proof.meta_b,
         challenger,
     )?;
     let owner_c_prefix = verify_duplex_region_walk_deferred_prefix(
@@ -1170,51 +1175,87 @@ fn verify_block_region_sidecar<Ch: Challenger>(
         challenger,
     )?;
     let groups = vec![
+        vec![wallet_a_prefix.group().clone()],
         vec![meta_a_prefix.group().clone()],
+        vec![wallet_b_prefix.group().clone()],
+        vec![meta_b_prefix.group().clone()],
         vec![owner_c_prefix.group().clone()],
         vec![main_c_prefix.group().clone()],
     ];
-    let [meta_a_terminal, owner_c_terminal, main_c_terminal]: [_; 3] =
-        verify_ragged_multi_deep_chain_walk(
-            &meta_duplex_w_logs(vk),
-            &groups,
-            &proof.meta_a_owner_main_walk,
-            challenger,
-        )
-        .map_err(|_| RegionSidecarError::InvalidProof)?
-        .try_into()
-        .expect("verified meta-A/owner-C/main-C terminal count");
+    let [wallet_a_terminal, meta_a_terminal, wallet_b_terminal, meta_b_terminal, owner_c_terminal, main_c_terminal]:
+        [_; 6] = verify_ragged_multi_deep_chain_walk(
+        &block_walk_w_logs(vk),
+        &groups,
+        &proof.walk,
+        challenger,
+    )
+    .map_err(|_| RegionSidecarError::InvalidProof)?
+    .try_into()
+    .expect("verified six-child terminal count");
+    claims.extend(wallet_a_prefix.finish(&wallet_a_terminal, challenger)?);
     claims.extend(meta_a_prefix.finish(&meta_a_terminal, challenger)?);
+    claims.extend(wallet_b_prefix.finish(&wallet_b_terminal, challenger)?);
+    claims.extend(meta_b_prefix.finish(&meta_b_terminal, challenger)?);
     claims.extend(owner_c_prefix.finish(&owner_c_terminal, challenger)?);
     claims.extend(main_c_prefix.finish(&main_c_terminal, challenger)?);
-
-    claims.extend(verify_merkle_region_sidecar(
-        vk.wallet_b(),
-        total_vars,
-        &proof.wallet_b,
-        challenger,
-    )?);
     Ok(claims)
+}
+
+/// Captured native child transcript: the outer-sampled seed plus the child
+/// chain's terminal binding lanes.  Recursive trace assembly consumes the
+/// seed to reproduce the exact child recording before any trace channel
+/// exists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockSidecarChildTranscript {
+    pub seed: F128,
+    pub tail: [F128; BLOCK_SIDECAR_CHILD_TAIL_LANES],
 }
 
 /// Sound production verifier entry point.  Claims reconstructed from the six
 /// authorities are placed directly in the enclosing verifier's private PCS
 /// sink; callers cannot accidentally verify a sidecar and then discard its
 /// openings.
+///
+/// Transcript mirror of [`BlockRegionProverPlan::prove_post_commit`]: the
+/// sidecar replay runs on a seeded CHILD chain whose terminal digest the
+/// outer channel re-absorbs pre-zerocheck.
 pub fn verify_block_region_sidecar_post_commit<Ch: Challenger>(
     vk: &BlockRegionSidecarVk,
     proof: &BlockRegionSidecarProof,
     context: &mut FieldPostCommitVerifierContext<'_, Ch>,
 ) -> Result<(), RegionSidecarError> {
-    let claims = verify_block_region_sidecar(vk, context.total_vars(), proof, context)?;
-    context.append_claims(claims);
-    Ok(())
+    verify_block_region_sidecar_post_commit_captured(vk, proof, context).map(|_| ())
 }
 
-/// Recursive trace verifier for the fixed V4 block authority. Every deferred
-/// child, multi-walk, and the unmatched wallet-B proof is shape-preflighted
-/// before the first proof witness allocation. Prefixes and suffixes remain
-/// role-local; only the ragged-domain deep walks are random-linearly batched.
+/// [`verify_block_region_sidecar_post_commit`] that additionally returns the
+/// captured child transcript boundary (seed + terminal lanes).  The split
+/// link's native preparation uses the capture to fill the committed child
+/// recording columns before the recursive trace pass begins.
+pub fn verify_block_region_sidecar_post_commit_captured<Ch: Challenger>(
+    vk: &BlockRegionSidecarVk,
+    proof: &BlockRegionSidecarProof,
+    context: &mut FieldPostCommitVerifierContext<'_, Ch>,
+) -> Result<BlockSidecarChildTranscript, RegionSidecarError> {
+    context.observe_label(BLOCK_SIDECAR_RECORDED_LABEL);
+    let seed = context.sample_f128();
+    let mut child = FsLaneChallenger::new(BLOCK_SIDECAR_CHILD_DOMAIN);
+    child.observe_f128(seed);
+    let claims = verify_block_region_sidecar(vk, context.total_vars(), proof, &mut child)?;
+    let tail = child.sample_f128_vec(BLOCK_SIDECAR_CHILD_TAIL_LANES);
+    context.observe_f128_slice(&tail);
+    context.append_claims(claims);
+    Ok(BlockSidecarChildTranscript {
+        seed,
+        tail: tail
+            .try_into()
+            .expect("child transcript terminal lane count"),
+    })
+}
+
+/// Recursive trace verifier for the fixed V5 block authority. Every deferred
+/// child and the shared six-instance multi-walk is shape-preflighted before
+/// the first proof witness allocation. Prefixes and suffixes remain
+/// role-local; only the ragged-domain deep walk is random-linearly batched.
 pub fn verify_block_region_sidecar_trace_post_commit<C: FsChannelOps>(
     b: &mut FieldR1csBuilder,
     context: &mut FieldPostCommitTraceContext<'_, C>,
@@ -1226,24 +1267,14 @@ pub fn verify_block_region_sidecar_trace_post_commit<C: FsChannelOps>(
         return Err(RegionSidecarError::UnsupportedVersion);
     }
     let total_vars = context.total_vars();
-    let wallet_meta_w_logs = wallet_meta_w_logs(vk);
-    let meta_duplex_w_logs = meta_duplex_w_logs(vk);
+    let w_logs = block_walk_w_logs(vk);
     preflight_walk_a_region_walk_deferred_trace(vk.wallet_a(), total_vars, &proof.wallet_a)?;
-    preflight_merkle_region_walk_deferred_trace(vk.meta_b(), total_vars, &proof.meta_b)?;
-    preflight_multi_walk(
-        &proof.wallet_a_meta_b_walk,
-        max_w_log(&wallet_meta_w_logs),
-        wallet_meta_w_logs.len(),
-    )?;
     preflight_walk_a_region_walk_deferred_trace(vk.meta_a(), total_vars, &proof.meta_a)?;
+    preflight_merkle_region_walk_deferred_trace(vk.wallet_b(), total_vars, &proof.wallet_b)?;
+    preflight_merkle_region_walk_deferred_trace(vk.meta_b(), total_vars, &proof.meta_b)?;
     preflight_duplex_region_walk_deferred_trace(vk.owner_c(), total_vars, &proof.owner_c)?;
     preflight_duplex_region_walk_deferred_trace(vk.main_c(), total_vars, &proof.main_c)?;
-    preflight_multi_walk(
-        &proof.meta_a_owner_main_walk,
-        max_w_log(&meta_duplex_w_logs),
-        meta_duplex_w_logs.len(),
-    )?;
-    preflight_merkle_sidecar_trace(vk.wallet_b(), total_vars, &proof.wallet_b)?;
+    preflight_multi_walk(&proof.walk, max_w_log(&w_logs), w_logs.len())?;
 
     context.observe_label(b, vk.transcript_label());
     context.observe_bytes_const(b, &vk.transcript_digest());
@@ -1255,83 +1286,230 @@ pub fn verify_block_region_sidecar_trace_post_commit<C: FsChannelOps>(
         vk.wallet_a(),
         &proof.wallet_a,
     )?;
-    let meta_b_prefix =
-        verify_merkle_region_walk_deferred_prefix_trace(b, context, vk.meta_b(), &proof.meta_b)?;
-    crate::acceptance::row_ledger_mark(b, &mut ledger, "block-sidecar: wallet-A/meta-B prefixes");
-    let groups = vec![
-        vec![wallet_a_prefix.walk_group()],
-        vec![meta_b_prefix.walk_group()],
-    ];
-    let walk = MultiDeepChainWalkProofTrace::alloc_ragged(
-        b,
-        &proof.wallet_a_meta_b_walk,
-        &wallet_meta_w_logs,
-    );
-    let terminals =
-        verify_ragged_multi_deep_chain_walk_trace(b, context, &wallet_meta_w_logs, &groups, &walk);
-    if terminals.len() != 2 {
-        return Err(RegionSidecarError::InvalidProof);
-    }
-    let mut terminals = terminals.into_iter();
-    let wallet_a_terminal = terminals.next().expect("checked terminal count");
-    let meta_b_terminal = terminals.next().expect("checked terminal count");
-    crate::acceptance::row_ledger_mark(b, &mut ledger, "block-sidecar: wallet-A/meta-B multi-walk");
-    let claims = wallet_a_prefix.finish(b, context, &wallet_a_terminal)?;
-    context.append_claims(claims);
-    let claims = meta_b_prefix.finish(b, context, &meta_b_terminal)?;
-    context.append_claims(claims);
-    crate::acceptance::row_ledger_mark(b, &mut ledger, "block-sidecar: wallet-A/meta-B suffixes");
-
     let meta_a_prefix =
         verify_walk_a_region_walk_deferred_prefix_trace(b, context, vk.meta_a(), &proof.meta_a)?;
+    let wallet_b_prefix = verify_merkle_region_walk_deferred_prefix_trace(
+        b,
+        context,
+        vk.wallet_b(),
+        &proof.wallet_b,
+    )?;
+    let meta_b_prefix =
+        verify_merkle_region_walk_deferred_prefix_trace(b, context, vk.meta_b(), &proof.meta_b)?;
     let owner_c_prefix =
         verify_duplex_region_walk_deferred_prefix_trace(b, context, vk.owner_c(), &proof.owner_c)?;
     let main_c_prefix =
         verify_duplex_region_walk_deferred_prefix_trace(b, context, vk.main_c(), &proof.main_c)?;
-    crate::acceptance::row_ledger_mark(
-        b,
-        &mut ledger,
-        "block-sidecar: meta-A/owner-C/main-C prefixes",
-    );
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "block-sidecar: six-child prefixes");
+
     let groups = vec![
+        vec![wallet_a_prefix.walk_group()],
         vec![meta_a_prefix.walk_group()],
+        vec![wallet_b_prefix.walk_group()],
+        vec![meta_b_prefix.walk_group()],
         vec![owner_c_prefix.walk_group()],
         vec![main_c_prefix.walk_group()],
     ];
-    let walk = MultiDeepChainWalkProofTrace::alloc_ragged(
-        b,
-        &proof.meta_a_owner_main_walk,
-        &meta_duplex_w_logs,
-    );
-    let terminals =
-        verify_ragged_multi_deep_chain_walk_trace(b, context, &meta_duplex_w_logs, &groups, &walk);
-    if terminals.len() != 3 {
+    let walk = MultiDeepChainWalkProofTrace::alloc_ragged(b, &proof.walk, &w_logs);
+    let terminals = verify_ragged_multi_deep_chain_walk_trace(b, context, &w_logs, &groups, &walk);
+    if terminals.len() != 6 {
         return Err(RegionSidecarError::InvalidProof);
     }
     let mut terminals = terminals.into_iter();
+    let wallet_a_terminal = terminals.next().expect("checked terminal count");
     let meta_a_terminal = terminals.next().expect("checked terminal count");
+    let wallet_b_terminal = terminals.next().expect("checked terminal count");
+    let meta_b_terminal = terminals.next().expect("checked terminal count");
     let owner_c_terminal = terminals.next().expect("checked terminal count");
     let main_c_terminal = terminals.next().expect("checked terminal count");
-    crate::acceptance::row_ledger_mark(
-        b,
-        &mut ledger,
-        "block-sidecar: meta-A/owner-C/main-C multi-walk",
-    );
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "block-sidecar: six-child multi-walk");
+
+    let claims = wallet_a_prefix.finish(b, context, &wallet_a_terminal)?;
+    context.append_claims(claims);
     let claims = meta_a_prefix.finish(b, context, &meta_a_terminal)?;
+    context.append_claims(claims);
+    let claims = wallet_b_prefix.finish(b, context, &wallet_b_terminal)?;
+    context.append_claims(claims);
+    let claims = meta_b_prefix.finish(b, context, &meta_b_terminal)?;
     context.append_claims(claims);
     let claims = owner_c_prefix.finish(b, context, &owner_c_terminal)?;
     context.append_claims(claims);
     let claims = main_c_prefix.finish(b, context, &main_c_terminal)?;
     context.append_claims(claims);
-    crate::acceptance::row_ledger_mark(
-        b,
-        &mut ledger,
-        "block-sidecar: meta-A/owner-C/main-C suffixes",
-    );
-
-    verify_merkle_region_sidecar_trace_post_commit(b, context, vk.wallet_b(), &proof.wallet_b)?;
-    crate::acceptance::row_ledger_mark(b, &mut ledger, "block-sidecar: wallet-B");
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "block-sidecar: six-child suffixes");
     Ok(())
+}
+
+/// Recursive trace verifier for the V5 block authority in RECORDED mode: the
+/// complete sidecar replay runs on a union-recorder child channel, so its
+/// Fiat-Shamir traffic costs recorded schedule lanes instead of inline sponge
+/// permutations.  The outer context pays exactly one label, one seed sample
+/// and one two-lane tail observe; the returned recording carries the child's
+/// schedule, absorbed-data wires and challenge wires for the caller's
+/// committed-region cell pins.  Transcript mirror of the native
+/// [`verify_block_region_sidecar_post_commit`].
+pub(crate) fn verify_block_region_sidecar_recorded_trace_post_commit<C: FsChannelOps>(
+    b: &mut FieldR1csBuilder,
+    context: &mut FieldPostCommitTraceContext<'_, C>,
+    vk: &BlockRegionSidecarVk,
+    proof: &BlockRegionSidecarProof,
+) -> Result<RecordedChannel, RegionSidecarError> {
+    context.observe_label(b, BLOCK_SIDECAR_RECORDED_LABEL);
+    let seed = context.sample_f128(b);
+    let mut recorder = FsChannelUnionRecorder::new(BLOCK_SIDECAR_CHILD_DOMAIN);
+    recorder.observe_f128(b, &seed);
+    let mut child = context.child(&mut recorder);
+    verify_block_region_sidecar_trace_post_commit(b, &mut child, vk, proof)?;
+    context.adopt_child_claims(child);
+    let tail = recorder.sample_f128_vec(b, BLOCK_SIDECAR_CHILD_TAIL_LANES);
+    context.observe_f128_slice(b, &tail);
+    Ok(recorder.finish())
+}
+
+/// Replay the recorded child transcript on a THROWAWAY builder to obtain the
+/// exact recording (schedule, absorbed data, challenges, post-state) before
+/// the real trace pass allocates its committed recording columns.  The real
+/// recorded replay must later reproduce this recording op-for-op — any drift
+/// is a bug caught loudly by the caller's lockstep asserts.
+pub(crate) fn scratch_record_block_sidecar_child(
+    vk: &BlockRegionSidecarVk,
+    proof: &BlockRegionSidecarProof,
+    total_vars: usize,
+    seed: F128,
+) -> Result<RecordedChannel, RegionSidecarError> {
+    let mut scratch = FieldR1csBuilder::new();
+    let mut recorder = FsChannelUnionRecorder::new(BLOCK_SIDECAR_CHILD_DOMAIN);
+    let seed_wire =
+        crate::acceptance::trace::LinExpr::from_wire(scratch.alloc_f128(seed));
+    recorder.observe_f128(&mut scratch, &seed_wire);
+    let root: crate::acceptance::trace::self_verify::FlatDigestExpr = [
+        crate::acceptance::trace::LinExpr::zero(),
+        crate::acceptance::trace::LinExpr::zero(),
+    ];
+    let mut context = FieldPostCommitTraceContext::detached(&root, total_vars, &mut recorder);
+    verify_block_region_sidecar_trace_post_commit(&mut scratch, &mut context, vk, proof)?;
+    drop(context);
+    let _tail = recorder.sample_f128_vec(&mut scratch, BLOCK_SIDECAR_CHILD_TAIL_LANES);
+    Ok(recorder.finish())
+}
+
+/// Derive the canonical child-transcript recording LAYOUT of one block
+/// class: the compiled duplex schedule of
+/// [`verify_block_region_sidecar_recorded_trace_post_commit`] against a
+/// shape-only proof.  The op stream is value-independent (its control flow
+/// derives from the verification key alone), so the layout is a protocol
+/// constant of the tier.
+pub(crate) fn derive_block_sidecar_recording_layout(
+    vk: &BlockRegionSidecarVk,
+    total_vars: usize,
+) -> Result<noid_ivc_core::deep_chain::schedule::DuplexLayout, RegionSidecarError> {
+    let proof = shape_only_block_region_sidecar_proof(vk, total_vars)?;
+    let recording = scratch_record_block_sidecar_child(vk, &proof, total_vars, F128::ZERO)?;
+    Ok(noid_ivc_core::deep_chain::schedule::compile_duplex(
+        &recording.ops,
+    ))
+}
+
+/// Zero-valued proof of the exact class shape.  It cannot verify; its only
+/// role is deriving the value-independent child-transcript SCHEDULE (the
+/// recorded op stream of [`verify_block_region_sidecar_recorded_trace_post_commit`])
+/// when the canonical recording layout is frozen before any real proof
+/// exists.
+pub(crate) fn shape_only_block_region_sidecar_proof(
+    vk: &BlockRegionSidecarVk,
+    total_vars: usize,
+) -> Result<BlockRegionSidecarProof, RegionSidecarError> {
+    use noid_ivc_core::deep_chain::relations::{ColumnRelationProof, ShiftDischargeProof};
+    use noid_ivc_core::deep_chain::MultiWalkLayerProof;
+
+    use crate::acceptance::trace::region_source_binding::{
+        DuplexUnionWalkDeferredProof, MerkleUnionWalkDeferredProof, WalkAUnionWalkDeferredProof,
+    };
+
+    let relation = |rounds: usize, values: usize| ColumnRelationProof {
+        rounds: vec![[F128::ZERO; noid_ivc_core::deep_chain::relations::RELATION_DEGREE]; rounds],
+        final_values: vec![F128::ZERO; values],
+    };
+    let shifts = |count: usize, w_log: usize| -> Vec<ShiftDischargeProof> {
+        (0..count)
+            .map(|_| ShiftDischargeProof {
+                rounds: vec![[F128::ZERO; 2]; w_log],
+                final_value: F128::ZERO,
+            })
+            .collect()
+    };
+    let fixed_child = |shape: &super::bounded_decode::DeferredFixedProofShape| {
+        (
+            relation(shape.w_log, shape.selection_values),
+            relation(shape.w_log, shape.substitution_values),
+            shifts(shape.shifts, shape.w_log),
+            match shape.tail {
+                super::bounded_decode::ProofTailShape::None
+                | super::bounded_decode::ProofTailShape::RelationOption(None) => None,
+                super::bounded_decode::ProofTailShape::RelationOption(Some(spine)) => {
+                    Some(relation(spine.rounds, spine.values))
+                }
+            },
+        )
+    };
+    let merkle_child = |shape: &super::bounded_decode::DeferredMerkleProofShape| {
+        MerkleRegionWalkDeferredProof::new(MerkleUnionWalkDeferredProof {
+            zero: relation(shape.w_log, shape.zero_values),
+            zero_shifts: shifts(shape.zero_shifts, shape.w_log),
+            selection: relation(shape.w_log, shape.selection_values),
+            substitution: relation(shape.w_log, shape.substitution_values),
+            shifts: shifts(shape.shifts, shape.w_log),
+        })
+    };
+
+    let shapes = block_bounded_shapes(vk, total_vars)?;
+    let [SidecarProofShape::DeferredFixed(wallet_a_shape), SidecarProofShape::DeferredFixed(meta_a_shape), SidecarProofShape::DeferredMerkle(wallet_b_shape), SidecarProofShape::DeferredMerkle(meta_b_shape), SidecarProofShape::DeferredFixed(owner_c_shape), SidecarProofShape::DeferredFixed(main_c_shape), SidecarProofShape::MultiWalk(walk_shape)] =
+        shapes
+    else {
+        return Err(RegionSidecarError::UnsupportedVkShape);
+    };
+
+    let (selection, substitution, shift_proofs, spine_exposure) = fixed_child(&wallet_a_shape);
+    let wallet_a = WalkARegionWalkDeferredProof::new(WalkAUnionWalkDeferredProof {
+        selection,
+        substitution,
+        shifts: shift_proofs,
+        spine_exposure,
+    });
+    let (selection, substitution, shift_proofs, spine_exposure) = fixed_child(&meta_a_shape);
+    let meta_a = WalkARegionWalkDeferredProof::new(WalkAUnionWalkDeferredProof {
+        selection,
+        substitution,
+        shifts: shift_proofs,
+        spine_exposure,
+    });
+    let duplex_child = |shape: &super::bounded_decode::DeferredFixedProofShape| {
+        DuplexRegionWalkDeferredProof::new(DuplexUnionWalkDeferredProof {
+            selection: relation(shape.w_log, shape.selection_values),
+            substitution: relation(shape.w_log, shape.substitution_values),
+            shifts: shifts(shape.shifts, shape.w_log),
+        })
+    };
+    Ok(BlockRegionSidecarProof {
+        version: BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION,
+        wallet_a,
+        meta_a,
+        wallet_b: merkle_child(&wallet_b_shape),
+        meta_b: merkle_child(&meta_b_shape),
+        owner_c: duplex_child(&owner_c_shape),
+        main_c: duplex_child(&main_c_shape),
+        walk: MultiDeepChainWalkProof {
+            layers: (0..N_ROUNDS)
+                .map(|_| MultiWalkLayerProof {
+                    round_coeffs: vec![
+                        [F128::ZERO; noid_ivc_core::deep_chain::WALK_DEGREE];
+                        walk_shape.w_log
+                    ],
+                    next_values: vec![[F128::ZERO; 4]; walk_shape.instances],
+                })
+                .collect(),
+        },
+    })
 }
 
 fn preflight_multi_walk(
@@ -1351,13 +1529,14 @@ fn preflight_multi_walk(
     Ok(())
 }
 
-fn wallet_meta_w_logs(vk: &BlockRegionSidecarVk) -> [usize; 2] {
-    [vk.wallet_a().w_log(), vk.meta_b().w_log()]
-}
-
-fn meta_duplex_w_logs(vk: &BlockRegionSidecarVk) -> [usize; 3] {
+/// Native walk domain widths of the six ordered children — the canonical V5
+/// multi-walk instance order.
+fn block_walk_w_logs(vk: &BlockRegionSidecarVk) -> [usize; 6] {
     [
+        vk.wallet_a().w_log(),
         vk.meta_a().w_log(),
+        vk.wallet_b().w_log(),
+        vk.meta_b().w_log(),
         vk.owner_c().w_log(),
         vk.main_c().w_log(),
     ]
@@ -1370,19 +1549,6 @@ fn max_w_log(w_logs: &[usize]) -> usize {
 fn bind_block_vk<Ch: Challenger>(challenger: &mut Ch, vk: &BlockRegionSidecarVk) {
     challenger.observe_label(vk.transcript_label());
     challenger.observe_bytes(&vk.transcript_digest());
-}
-
-fn prove_merkle<Ch: Challenger>(
-    vk: &MerkleRegionVk,
-    endpoints: &RegionWalkEndpoints,
-    z: &[F128],
-    challenger: &mut Ch,
-    claims: &mut Vec<QuirkyDirectClaim>,
-) -> Result<MerkleRegionSidecarProof, RegionSidecarError> {
-    let plan = MerkleRegionProverPlan::new(vk, endpoints.s0(), endpoints.s_out())?;
-    let (proof, child_claims) = plan.prove(z, challenger)?;
-    claims.extend(child_claims);
-    Ok(proof)
 }
 
 fn push_u64(bytes: &mut Vec<u8>, value: usize) {
@@ -1517,7 +1683,37 @@ mod tests {
     }
 
     #[test]
-    fn selected_v4_registry_accepts_exactly_four_canonical_geometries() {
+    fn recorded_child_layout_derivation_is_deterministic_per_tier() {
+        // The recorded child-transcript schedule is a protocol constant of
+        // the tier: two derivations agree, and the four canonical tiers fit
+        // one recordings-only union without inflating the link-sidecar
+        // multi-walk domain past the B255 recording block itself.
+        let mut sizes = Vec::new();
+        for (tier, total_vars) in [(8usize, 22usize), (32, 23), (64, 23), (255, 24)] {
+            let vk = selected_vk_fixture(tier);
+            let first = derive_block_sidecar_recording_layout(&vk, total_vars).unwrap();
+            let second = derive_block_sidecar_recording_layout(&vk, total_vars).unwrap();
+            assert_eq!(first, second, "B{tier} recording schedule drift");
+            assert!(!first.slots.is_empty());
+            let padded = first.slots.len().next_power_of_two();
+            eprintln!(
+                "[rec-layout] B{tier}: {} slots ({} data lanes, {} challenges) -> 2^{}",
+                first.slots.len(),
+                first.n_data,
+                first.challenges.len(),
+                padded.trailing_zeros()
+            );
+            sizes.push(padded);
+        }
+        let total: usize = sizes.iter().sum();
+        eprintln!(
+            "[rec-layout] union domain: 2^{}",
+            total.next_power_of_two().trailing_zeros()
+        );
+    }
+
+    #[test]
+    fn selected_v5_registry_accepts_exactly_four_canonical_geometries() {
         let mut digests = std::collections::BTreeSet::new();
         for tier in [8usize, 32, 64, 255] {
             let geometry = selected_zk_block_geometry(tier).unwrap();
@@ -1582,7 +1778,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_b255_certificate_is_exact_v4() {
+    fn selected_b255_certificate_is_exact_v5() {
         let vk = selected_b255_vk_fixture();
         assert_eq!(vk.version(), BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION);
         vk.validate_selected_zk_roles().unwrap();

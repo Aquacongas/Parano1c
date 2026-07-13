@@ -5,10 +5,11 @@
 //!
 //! The generic libp2p CBOR codec first buffers the complete encoded response,
 //! is capped at 10 MiB, and then allocates the decoded byte vectors.  A valid
-//! Paranoid block may carry up to 48 MiB of proof and authorization data, so
-//! block sync uses a small fixed header followed by the three payloads.  Every
-//! declared length is checked before any payload allocation and payload bytes
-//! are read directly into the vectors delivered to the node.
+//! Paranoid block may carry up to 48 MiB of proof and authorization data plus
+//! a ~580 KiB coverage attestation, so block sync uses a small fixed header
+//! followed by the four payloads.  Every declared length is checked before any
+//! payload allocation and payload bytes are read directly into the vectors
+//! delivered to the node.
 
 use std::{io, sync::Arc};
 
@@ -17,17 +18,17 @@ use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::{request_response, swarm::StreamProtocol};
 use noid_chain::consensus::wire_limits::{
     proof_sidecar_combined_len_ok, MAX_BLOCK_AUTH_SIDECAR_BYTES, MAX_BLOCK_BYTES,
-    MAX_BLOCK_PROOF_BYTES,
+    MAX_BLOCK_PROOF_BYTES, MAX_COVERAGE_ATTESTATION_BYTES,
 };
 
 use crate::inbound_budget::process_global_inbound_budget;
 use crate::outbound_budget::OutboundResponseBudget;
 use crate::protocol::{GetRecentBlockRequest, GetRecentBlockResponse};
 
-const REQUEST_MAGIC: [u8; 4] = *b"NBR2";
-const RESPONSE_MAGIC: [u8; 4] = *b"NBS2";
+const REQUEST_MAGIC: [u8; 4] = *b"NBR3";
+const RESPONSE_MAGIC: [u8; 4] = *b"NBS3";
 const REQUEST_HEADER_BYTES: usize = 12;
-const RESPONSE_HEADER_BYTES: usize = 24;
+const RESPONSE_HEADER_BYTES: usize = 28;
 const NONE_LEN: u32 = u32::MAX;
 /// Block-sync codec with a canonical, allocation-bounded wire format.
 #[derive(Debug, Clone)]
@@ -101,6 +102,8 @@ impl request_response::Codec for BlockSyncCodec {
         let block_bytes = read_optional_payload(io, lengths.block_len).await?;
         let block_proof_bytes = read_optional_payload(io, lengths.proof_len).await?;
         let block_auth_sidecar_bytes = read_optional_payload(io, lengths.sidecar_len).await?;
+        let coverage_attestation_bytes =
+            read_optional_payload(io, lengths.attestation_len).await?;
         ensure_eof(io).await?;
 
         Ok(GetRecentBlockResponse {
@@ -108,6 +111,7 @@ impl request_response::Codec for BlockSyncCodec {
             block_bytes,
             block_proof_bytes,
             block_auth_sidecar_bytes,
+            coverage_attestation_bytes,
             inbound_memory_permit,
             outbound_memory_permit: None,
         })
@@ -142,17 +146,20 @@ impl request_response::Codec for BlockSyncCodec {
             block_bytes,
             block_proof_bytes,
             block_auth_sidecar_bytes,
+            coverage_attestation_bytes,
             inbound_memory_permit,
             outbound_memory_permit,
         } = response;
         let block_len = optional_len(&block_bytes, "block")?;
         let proof_len = optional_len(&block_proof_bytes, "block proof")?;
         let sidecar_len = optional_len(&block_auth_sidecar_bytes, "block authorization sidecar")?;
-        validate_response_lengths(block_len, proof_len, sidecar_len)?;
+        let attestation_len = optional_len(&coverage_attestation_bytes, "coverage attestation")?;
+        validate_response_lengths(block_len, proof_len, sidecar_len, attestation_len)?;
 
         let payload_len = decoded_optional_len(block_len)
             .checked_add(decoded_optional_len(proof_len))
             .and_then(|sum| sum.checked_add(decoded_optional_len(sidecar_len)))
+            .and_then(|sum| sum.checked_add(decoded_optional_len(attestation_len)))
             .ok_or_else(|| invalid_data("block-sync response length overflow"))?;
         // Production response workers acquire this before touching storage.
         // The codec fallback preserves the process-wide write bound for any
@@ -169,6 +176,7 @@ impl request_response::Codec for BlockSyncCodec {
         header[12..16].copy_from_slice(&block_len.to_le_bytes());
         header[16..20].copy_from_slice(&proof_len.to_le_bytes());
         header[20..24].copy_from_slice(&sidecar_len.to_le_bytes());
+        header[24..28].copy_from_slice(&attestation_len.to_le_bytes());
         io.write_all(&header).await?;
 
         // Write directly from the owned response fields.  Unlike CBOR, this
@@ -180,6 +188,9 @@ impl request_response::Codec for BlockSyncCodec {
             io.write_all(&bytes).await?;
         }
         if let Some(bytes) = block_auth_sidecar_bytes {
+            io.write_all(&bytes).await?;
+        }
+        if let Some(bytes) = coverage_attestation_bytes {
             io.write_all(&bytes).await?;
         }
         Ok(())
@@ -197,6 +208,7 @@ impl BlockSyncCodec {
             (lengths.block_len as usize)
                 .checked_add(decoded_optional_len(lengths.proof_len))
                 .and_then(|sum| sum.checked_add(decoded_optional_len(lengths.sidecar_len)))
+                .and_then(|sum| sum.checked_add(decoded_optional_len(lengths.attestation_len)))
                 .ok_or_else(|| invalid_data("block-sync response length overflow"))?
         };
         if bytes == 0 {
@@ -220,6 +232,7 @@ struct ResponseLengths {
     block_len: u32,
     proof_len: u32,
     sidecar_len: u32,
+    attestation_len: u32,
 }
 
 fn parse_response_header(header: &[u8; RESPONSE_HEADER_BYTES]) -> io::Result<ResponseLengths> {
@@ -235,14 +248,29 @@ fn parse_response_header(header: &[u8; RESPONSE_HEADER_BYTES]) -> io::Result<Res
                 .try_into()
                 .expect("fixed sidecar length field"),
         ),
+        attestation_len: u32::from_le_bytes(
+            header[24..28]
+                .try_into()
+                .expect("fixed attestation length field"),
+        ),
     };
-    validate_response_lengths(lengths.block_len, lengths.proof_len, lengths.sidecar_len)?;
+    validate_response_lengths(
+        lengths.block_len,
+        lengths.proof_len,
+        lengths.sidecar_len,
+        lengths.attestation_len,
+    )?;
     Ok(lengths)
 }
 
-fn validate_response_lengths(block_len: u32, proof_len: u32, sidecar_len: u32) -> io::Result<()> {
+fn validate_response_lengths(
+    block_len: u32,
+    proof_len: u32,
+    sidecar_len: u32,
+    attestation_len: u32,
+) -> io::Result<()> {
     if block_len == NONE_LEN {
-        if proof_len != NONE_LEN || sidecar_len != NONE_LEN {
+        if proof_len != NONE_LEN || sidecar_len != NONE_LEN || attestation_len != NONE_LEN {
             return Err(invalid_data(
                 "unavailable block response carries proof or sidecar bytes",
             ));
@@ -253,6 +281,14 @@ fn validate_response_lengths(block_len: u32, proof_len: u32, sidecar_len: u32) -
     let block_len = block_len as usize;
     let proof_len = decoded_optional_len(proof_len);
     let sidecar_len = decoded_optional_len(sidecar_len);
+    let attestation_len_decoded = decoded_optional_len(attestation_len);
+    if attestation_len != NONE_LEN
+        && (attestation_len_decoded == 0 || attestation_len_decoded > MAX_COVERAGE_ATTESTATION_BYTES)
+    {
+        return Err(invalid_data(
+            "declared coverage attestation length exceeds consensus cap",
+        ));
+    }
     if block_len > MAX_BLOCK_BYTES {
         return Err(invalid_data("declared block length exceeds consensus cap"));
     }
@@ -342,12 +378,22 @@ mod tests {
     }
 
     fn response_header(block_len: u32, proof_len: u32, sidecar_len: u32) -> Vec<u8> {
+        response_header_with_attestation(block_len, proof_len, sidecar_len, NONE_LEN)
+    }
+
+    fn response_header_with_attestation(
+        block_len: u32,
+        proof_len: u32,
+        sidecar_len: u32,
+        attestation_len: u32,
+    ) -> Vec<u8> {
         let mut header = vec![0u8; RESPONSE_HEADER_BYTES];
         header[..4].copy_from_slice(&RESPONSE_MAGIC);
         header[4..12].copy_from_slice(&7u64.to_le_bytes());
         header[12..16].copy_from_slice(&block_len.to_le_bytes());
         header[16..20].copy_from_slice(&proof_len.to_le_bytes());
         header[20..24].copy_from_slice(&sidecar_len.to_le_bytes());
+        header[24..28].copy_from_slice(&attestation_len.to_le_bytes());
         header
     }
 
@@ -367,6 +413,7 @@ mod tests {
             block_bytes: Some(vec![0x11; 128]),
             block_proof_bytes: Some(vec![0x22; 11 * 1024 * 1024]),
             block_auth_sidecar_bytes: Some(vec![0x33; 1024]),
+            coverage_attestation_bytes: Some(vec![0x44; 4096]),
             inbound_memory_permit: None,
             outbound_memory_permit: None,
         };
@@ -386,6 +433,7 @@ mod tests {
         assert_eq!(decoded.block_bytes.unwrap().len(), 128);
         assert_eq!(decoded.block_proof_bytes.unwrap().len(), 11 * 1024 * 1024);
         assert_eq!(decoded.block_auth_sidecar_bytes.unwrap().len(), 1024);
+        assert_eq!(decoded.coverage_attestation_bytes.unwrap().len(), 4096);
     }
 
     #[tokio::test]
@@ -425,6 +473,19 @@ mod tests {
 
     #[tokio::test]
     async fn unavailable_response_cannot_smuggle_payload_or_trailing_bytes() {
+        let oversized_attestation = response_header_with_attestation(
+            1,
+            NONE_LEN,
+            NONE_LEN,
+            u32::try_from(MAX_COVERAGE_ATTESTATION_BYTES + 1).unwrap(),
+        );
+        let error = BlockSyncCodec::default()
+            .read_response(&protocol(), &mut Cursor::new(oversized_attestation))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("attestation"));
+
         let mut inconsistent = response_header(NONE_LEN, 0, NONE_LEN);
         inconsistent.push(0xaa);
         let error = BlockSyncCodec::default()

@@ -13,7 +13,7 @@
 //! Scope note (no header consensus belongs in the O(1) history proof): the
 //! Native `verify_checkpoint_poseidon` prepends `validate_shape` (the
 //! `pow_fields == pow_header_fields(header)` recomputation from the header
-//! struct). Header consensus and direct ten-lane accumulator continuity are
+//! struct). Header consensus and direct eleven-lane accumulator continuity are
 //! separate relations. This slot replays only the header killshot and its
 //! discharge over `HeaderHashInputs`; the block slot pins those same wires to
 //! the accepted claim and direct accumulator transition.
@@ -407,6 +407,7 @@ mod tests {
 
     fn header(height: u64, prev: [u8; 32], state_seed: u8) -> noid_chain::BlockHeader {
         noid_chain::BlockHeader {
+            attested_coverage: 0,
             prev_block_hash: prev,
             state_root: [state_seed; 32],
             tx_root: [state_seed ^ 0x55; 32],

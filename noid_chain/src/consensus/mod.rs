@@ -91,15 +91,17 @@ pub use receipt::{
 };
 pub use reorg::{apply_reorg, find_common_ancestor, ReorgError, ReorgResult};
 pub use slot_expansion::expected_child_log_slots;
-pub use template::{build_block_template, BlockTemplate, TemplateBuildError};
+pub use template::{
+    build_block_template, build_block_template_with_coverage, BlockTemplate, TemplateBuildError,
+};
 pub use timestamps::{
     median_time_past, median_u64, validate_future_drift, validate_median_time_past,
     validate_timestamp,
 };
 pub use validation::{
     validate_block_checks, validate_block_checks_timeless, validate_block_consensus,
-    validate_block_resource_preflight, validate_mandatory_coinbase, AnchorInfo,
-    BlockResourcePreflight,
+    validate_block_resource_preflight, validate_coinbase_maturity, validate_mandatory_coinbase,
+    AnchorInfo, BlockResourcePreflight,
 };
 
 /// Consensus validation errors — one variant per block invariant.
@@ -145,6 +147,23 @@ pub enum ConsensusError {
     InflatedCoinbase,
     /// Coinbase `epoch_anchor` must equal the parent block hash.
     BadCoinbaseAnchor,
+    /// `attested_coverage` violates the monotone advancement rule against the
+    /// parent header (decreased, or advanced past `parent.height`).
+    BadAttestedCoverage {
+        parent_coverage: u64,
+        parent_height: u64,
+        attested_coverage: u64,
+    },
+    /// The block's coverage attestation payload is missing, unexpected, does
+    /// not natively verify, or does not bind the declared coverage height.
+    /// Nodes without the pinned verifier artifacts fail closed here.
+    BadCoverageAttestation(String),
+    /// An input spends a coinbase UTXO whose mint height is not yet covered
+    /// by the containing block's `attested_coverage` (proof-gated maturity).
+    ImmatureCoinbaseSpend {
+        mint_height: u64,
+        attested_coverage: u64,
+    },
     /// P.16 — transaction fee is below the deterministic minimum fee.
     BelowMinFee { required: u64, actual: u64 },
     /// §15.3.6 — `log_slots` must expand exactly when occupancy ≥ 75 %,

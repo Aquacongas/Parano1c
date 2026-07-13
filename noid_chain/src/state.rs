@@ -540,7 +540,11 @@ impl ChainState {
             if slot.is_empty() {
                 return Err(SparseUtxoBuildError::EmptySlot(index));
             }
-            if slot.creation_id() > alloc_counter {
+            // Tagged coinbase ids live in the `COINBASE_CREATION_TAG | height`
+            // namespace and are bounded by chain height, not the allocator.
+            if !crate::consensus::params::is_coinbase_creation_id(slot.creation_id())
+                && slot.creation_id() > alloc_counter
+            {
                 return Err(SparseUtxoBuildError::CreationIdExceedsAllocCounter {
                     slot_index: index,
                     creation_id: slot.creation_id(),
@@ -981,7 +985,12 @@ pub enum ApplyError {
     /// Minting a live output would overflow the occupancy counter.
     ActiveSlotCountOverflow,
     /// No fresh non-zero creation ID can be assigned to the next live output.
+    /// The allocator namespace ends at `COINBASE_CREATION_TAG` (`2^63`): ids
+    /// with the high bit set are reserved for tagged coinbase mints.
     AllocCounterOverflow,
+    /// A coinbase body was applied without the mint height needed to derive
+    /// its tagged `creation_id = COINBASE_CREATION_TAG | height`.
+    CoinbaseMintHeightMissing,
     /// The exact post-state root cannot be recomputed because part of the raw
     /// state is evicted. Acceptance must fail closed or preload the state.
     ExactStateUnavailable,
@@ -995,17 +1004,44 @@ pub enum ApplyExactTransitionError {
     CachedRootMismatch,
 }
 
-/// Apply a `TxBody` to `state` in place, returning the post-transition
-/// root on success. Bitmap-dead slots are skipped entirely.
+/// Apply a non-coinbase `TxBody` to `state` in place, returning the
+/// post-transition root on success. Bitmap-dead slots are skipped entirely.
 ///
 /// State root validation happens at block level via the exact authenticated
 /// transition proof — this function purely executes the UTXO state transition
 /// without checking anchors.
 ///
+/// Coinbase bodies must go through [`apply_tx_at`]: their tagged
+/// `creation_id` derives from the mint height, which only the block context
+/// knows. Applying a coinbase here fails closed.
+///
 /// On `Err`, `state` is left untouched.
 pub fn apply_tx(state: &mut ChainState, body: &TxBody) -> Result<StateTransition, ApplyError> {
+    if body.is_coinbase {
+        return Err(ApplyError::CoinbaseMintHeightMissing);
+    }
+    apply_tx_inner(state, body, None)
+}
+
+/// Apply a `TxBody` (coinbase or user) minted inside the block at
+/// `block_height`. The unique live coinbase output receives the tagged
+/// `creation_id = COINBASE_CREATION_TAG | block_height`; user outputs receive
+/// fresh monotone allocator ids exactly as [`apply_tx`].
+pub fn apply_tx_at(
+    state: &mut ChainState,
+    body: &TxBody,
+    block_height: u64,
+) -> Result<StateTransition, ApplyError> {
+    apply_tx_inner(state, body, Some(block_height))
+}
+
+fn apply_tx_inner(
+    state: &mut ChainState,
+    body: &TxBody,
+    block_height: Option<u64>,
+) -> Result<StateTransition, ApplyError> {
     let mut snapshot = state.clone();
-    apply_tx_checked_deferred_root(&mut snapshot, body)?;
+    apply_tx_checked_deferred_root(&mut snapshot, body, block_height)?;
     let new_state_root = snapshot
         .try_state_root()
         .map_err(|_| ApplyError::ExactStateUnavailable)?;
@@ -1020,10 +1056,17 @@ pub fn apply_tx(state: &mut ChainState, body: &TxBody) -> Result<StateTransition
 /// call. This is a consensus-internal construction helper, not a block
 /// acceptance API; callers must compute/bind the final root before publishing or
 /// accepting a header.
+///
+/// `coinbase_mint_height` supplies the block height for the coinbase's tagged
+/// `creation_id`; it MUST be `Some` when `body.is_coinbase`.
 pub(crate) fn apply_tx_checked_deferred_root(
     state: &mut ChainState,
     body: &TxBody,
+    coinbase_mint_height: Option<u64>,
 ) -> Result<(), ApplyError> {
+    if body.is_coinbase && coinbase_mint_height.is_none() {
+        return Err(ApplyError::CoinbaseMintHeightMissing);
+    }
     let mut input_slots = HashSet::new();
     for (_, input) in body.live_inputs() {
         if !input_slots.insert(input.slot_index) {
@@ -1077,8 +1120,13 @@ pub(crate) fn apply_tx_checked_deferred_root(
         .alloc_counter
         .checked_add(output_count)
         .ok_or(ApplyError::AllocCounterOverflow)?;
+    // Normal mints live strictly below the coinbase tag namespace. Fail
+    // closed instead of ever colliding with a tagged coinbase creation id.
+    if crate::consensus::params::is_coinbase_creation_id(final_alloc_counter) {
+        return Err(ApplyError::AllocCounterOverflow);
+    }
 
-    let mut creation_id = state.alloc_counter;
+    let mut alloc_cursor = state.alloc_counter;
     for (_, output) in body.live_outputs() {
         if (output.slot_index as u64) >= state.state.num_slots() {
             return Err(ApplyError::SlotOutOfRange);
@@ -1090,9 +1138,21 @@ pub(crate) fn apply_tx_checked_deferred_root(
         if state.state.slot(output.slot_index) != SlotValue::EMPTY {
             return Err(ApplyError::OutputSlotNotEmpty);
         }
-        creation_id = creation_id
+        // Every mint (including coinbase) consumes one allocator increment,
+        // keeping `alloc_counter` = "number of mints ever" and the wallet
+        // slot-hint seed unchanged. The STORED id diverges only for coinbase:
+        // its unique live output is tagged with the mint height so spends can
+        // be gated on proven selected-history coverage.
+        alloc_cursor = alloc_cursor
             .checked_add(1)
             .ok_or(ApplyError::AllocCounterOverflow)?;
+        let creation_id = if body.is_coinbase {
+            crate::consensus::params::coinbase_creation_id(
+                coinbase_mint_height.ok_or(ApplyError::CoinbaseMintHeightMissing)?,
+            )
+        } else {
+            alloc_cursor
+        };
         deltas.push((
             output.slot_index,
             SlotValue::with_owner_fields(output.amount, creation_id, output.owner.as_fields()),
@@ -1177,6 +1237,112 @@ mod tests {
         assert_eq!(
             apply_tx(&mut state, &overlap),
             Err(ApplyError::InputOutputSlotOverlap)
+        );
+    }
+
+    #[test]
+    fn coinbase_mint_is_height_tagged_and_aba_binds_exact_creation_id() {
+        use crate::consensus::params::{
+            coinbase_creation_id, is_coinbase_creation_id, COINBASE_CREATION_TAG,
+        };
+
+        let miner = Address([5u8; 32]);
+        let mut coinbase_outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        coinbase_outputs[0] = TxOutput {
+            slot_index: 4,
+            amount: 50,
+            owner: miner,
+        };
+        let coinbase = TxBody {
+            epoch_anchor: [9u8; 32],
+            fee: 0,
+            input_owner: Address([0u8; 32]),
+            inputs: [TxInput::dummy(); TX_INPUTS],
+            outputs: coinbase_outputs,
+            validity_bitmap: output_bitmap_bit(0),
+            is_coinbase: true,
+        };
+
+        // A coinbase cannot be applied without its mint height.
+        let mut state = ChainState::with_log_slots(8);
+        assert_eq!(
+            apply_tx(&mut state, &coinbase),
+            Err(ApplyError::CoinbaseMintHeightMissing)
+        );
+
+        // Applied at height 42 the unique live output stores TAG | 42 while
+        // the allocator still burns exactly one increment.
+        apply_tx_at(&mut state, &coinbase, 42).unwrap();
+        let minted = state.state.slot(4);
+        assert_eq!(minted.creation_id(), coinbase_creation_id(42));
+        assert_eq!(minted.creation_id(), COINBASE_CREATION_TAG | 42);
+        assert!(is_coinbase_creation_id(minted.creation_id()));
+        assert_eq!(state.alloc_counter, 1);
+        assert_eq!(state.active_slot_count, 1);
+
+        // ABA: a spend binds the EXACT tagged creation id. The untagged
+        // allocator id the coinbase burned does not match the stored slot.
+        let spend = |creation_id: u64| {
+            let mut inputs = [TxInput::dummy(); TX_INPUTS];
+            inputs[0] = TxInput {
+                slot_index: 4,
+                amount: 50,
+                creation_id,
+            };
+            let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+            outputs[0] = TxOutput {
+                slot_index: 6,
+                amount: 49,
+                owner: Address([6u8; 32]),
+            };
+            TxBody {
+                epoch_anchor: [9u8; 32],
+                fee: 1,
+                input_owner: miner,
+                inputs,
+                outputs,
+                validity_bitmap: 1 | output_bitmap_bit(0),
+                is_coinbase: false,
+            }
+        };
+        assert_eq!(
+            apply_tx(&mut state.clone(), &spend(1)),
+            Err(ApplyError::UnknownOrSpentInput)
+        );
+        assert_eq!(
+            apply_tx(&mut state.clone(), &spend(coinbase_creation_id(41))),
+            Err(ApplyError::UnknownOrSpentInput)
+        );
+        apply_tx(&mut state, &spend(coinbase_creation_id(42))).unwrap();
+        // The user mint after the coinbase continues the untagged namespace.
+        assert_eq!(state.state.slot(6).creation_id(), 2);
+    }
+
+    #[test]
+    fn allocator_fails_closed_at_the_coinbase_tag_namespace() {
+        use crate::consensus::params::COINBASE_CREATION_TAG;
+
+        let mut state = ChainState::with_log_slots(8);
+        state.alloc_counter = COINBASE_CREATION_TAG - 1;
+        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        outputs[0] = TxOutput {
+            slot_index: 2,
+            amount: 1,
+            owner: Address([7u8; 32]),
+        };
+        let mint_only = TxBody {
+            epoch_anchor: [3u8; 32],
+            fee: 0,
+            input_owner: Address([0u8; 32]),
+            inputs: [TxInput::dummy(); TX_INPUTS],
+            outputs,
+            validity_bitmap: output_bitmap_bit(0),
+            is_coinbase: true,
+        };
+        // Even the coinbase's own allocator increment must not cross 2^63.
+        assert_eq!(
+            apply_tx_at(&mut state, &mint_only, 1),
+            Err(ApplyError::AllocCounterOverflow)
         );
     }
 

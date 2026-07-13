@@ -238,6 +238,7 @@ mod tests {
 
     fn local_header() -> BlockHeader {
         BlockHeader {
+            attested_coverage: 0,
             prev_block_hash: [2u8; 32],
             state_root: [4u8; 32],
             tx_root: [5u8; 32],

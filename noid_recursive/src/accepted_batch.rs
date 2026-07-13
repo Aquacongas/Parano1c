@@ -35,7 +35,7 @@ use noid_chain::consensus::pow::POW_HEADER_FIELD_COUNT;
 pub const ACCEPTED_CLAIM_BATCH_DIGEST_HEADER_WITNESS_FIELDS: usize = POW_HEADER_FIELD_COUNT + 6;
 pub const ACCEPTED_CLAIM_BATCH_DIGEST_CLAIM_FIELDS: usize = 2;
 pub const ACCEPTED_CLAIM_BATCH_DIGEST_CONSENSUS_FIELDS: usize =
-    16 + MEDIAN_TIME_BLOCKS + EXPANSION_WINDOW_LEN;
+    17 + MEDIAN_TIME_BLOCKS + EXPANSION_WINDOW_LEN;
 pub const ACCEPTED_CLAIM_BATCH_DIGEST_ACCUMULATOR_FIELDS: usize = CHAIN_ACCUMULATOR_LANES;
 pub const ACCEPTED_CLAIM_BATCH_DIGEST_SLOT_FIELDS: usize =
     ACCEPTED_CLAIM_BATCH_DIGEST_HEADER_WITNESS_FIELDS + ACCEPTED_CLAIM_BATCH_DIGEST_CLAIM_FIELDS;
@@ -191,8 +191,9 @@ pub fn accepted_claim_batch_digest_hash_fields(
         }
     }
     // The fixed no-pad hash consumes field pairs. These three canonical zero
-    // lanes make the complete schedule even after the direct accumulator grew
-    // from seven to ten lanes.
+    // lanes keep the complete schedule even: the eleven-lane accumulator plus
+    // the seventeen-scalar consensus section grew in lockstep (+2), so the
+    // historical pad width still closes the pairing.
     for _ in 0..3 {
         fields[index] = Block128::ZERO;
         index += 1;
@@ -359,6 +360,8 @@ fn push_consensus_fields<const N: usize>(
     *index += 1;
     fields[*index] = Block128::from(consensus.alloc_counter as u128);
     *index += 1;
+    fields[*index] = Block128::from(consensus.attested_coverage as u128);
+    *index += 1;
     fields[*index] = Block128::from(consensus.asert_anchor_height as u128);
     *index += 1;
     fields[*index] = Block128::from(consensus.asert_anchor_timestamp as u128);
@@ -524,6 +527,7 @@ fn accumulator_matches_consensus(
         && accumulator.log_slots == consensus.log_slots
         && accumulator.active_slot_count == consensus.active_slot_count
         && accumulator.alloc_counter == consensus.alloc_counter
+        && accumulator.attested_coverage == consensus.attested_coverage
 }
 
 #[cfg(test)]
@@ -590,6 +594,7 @@ mod tests {
         let height = state.height + 1;
         let timestamp = state.mtp_timestamps[(state.mtp_len - 1) as usize] + BLOCK_TIME;
         noid_chain::BlockHeader {
+            attested_coverage: 0,
             prev_block_hash: state.block_id,
             state_root: [state_seed; 32],
             tx_root: [state_seed ^ 0x55; 32],

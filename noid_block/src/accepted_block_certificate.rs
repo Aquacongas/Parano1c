@@ -404,6 +404,7 @@ mod tests {
             log_slots: 6,
             active_slot_count: if with_user { 1 } else { 0 },
             alloc_counter: 0,
+            attested_coverage: 0,
         };
         let mut coinbase_outputs = [TxOutput::dummy(); TX_OUTPUTS];
         coinbase_outputs[0] = TxOutput {
@@ -432,9 +433,14 @@ mod tests {
             .iter()
             .map(TxBody::claims_commitment)
             .collect::<Vec<_>>();
-        let surface =
-            build_exact_action_surface(&state.state, &bodies, &commitments, state.alloc_counter)
-                .expect("exact action surface");
+        let surface = build_exact_action_surface(
+            &state.state,
+            &bodies,
+            &commitments,
+            state.alloc_counter,
+            parent.height + 1,
+        )
+        .expect("exact action surface");
         let slot_updates = surface
             .touched_indices
             .iter()
@@ -461,6 +467,7 @@ mod tests {
                     .unwrap()
                     + u64::from(surface.mints),
                 alloc_counter: parent.alloc_counter + u64::from(surface.mints),
+                attested_coverage: 0,
             },
             transactions,
         };

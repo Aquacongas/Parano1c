@@ -566,7 +566,8 @@ fn build_exact_surface_for_block(
     state: &ChainState,
 ) -> Result<ExactActionSurface, VerifyBlockError> {
     // Preserve the consensus block order exactly.  In particular the coinbase
-    // is first, so its live outputs consume the first creation IDs.  Reordering
+    // is first, so its live output consumes the first allocator increment
+    // (its stored id is the height-tagged coinbase creation id).  Reordering
     // it behind user transactions would reconstruct a different packed state
     // surface even when every amount/owner/slot matched.
     build_exact_action_surface_for_transactions_at_log_slots(
@@ -574,6 +575,7 @@ fn build_exact_surface_for_block(
         block.header.log_slots,
         &block.transactions,
         state.alloc_counter,
+        block.header.height,
     )
     .map_err(map_state_delta_error)
 }
@@ -1130,6 +1132,7 @@ mod tests {
             log_slots: 6,
             active_slot_count: 0,
             alloc_counter: 0,
+            attested_coverage: 0,
         }
     }
 

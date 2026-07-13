@@ -133,6 +133,7 @@ pub fn update_for_accepted_block(
         log_slots: block.header.log_slots,
         active_slot_count: block.header.active_slot_count,
         alloc_counter: block.header.alloc_counter,
+        attested_coverage: block.header.attested_coverage,
     });
 
     for tx in &block.transactions {
@@ -317,6 +318,7 @@ impl WalletOps for WalletHandle {
                 balance_noid: 0.0,
                 utxo_count: 0,
                 pending_outbound_micronoid: 0,
+                immature_micronoid: 0,
                 spendable_micronoid: 0,
                 spendable_noid: 0.0,
             },
@@ -329,12 +331,16 @@ impl WalletOps for WalletHandle {
                     .filter(|u| u.key_index == w.active_index)
                     .map(|u| u.value)
                     .sum();
-                let spendable = total.saturating_sub(pending_out);
+                // Immature coinbase is confirmed but locked until its mint
+                // height is proof-covered — shown separately, like pending.
+                let immature = w.immature_balance();
+                let spendable = total.saturating_sub(pending_out).saturating_sub(immature);
                 WalletBalance {
                     balance_micronoid: total,
                     balance_noid: micronoid_to_noid(total),
                     utxo_count: w.utxos.len(),
                     pending_outbound_micronoid: pending_out,
+                    immature_micronoid: immature,
                     spendable_micronoid: spendable,
                     spendable_noid: micronoid_to_noid(spendable),
                 }
@@ -505,11 +511,13 @@ impl WalletOps for WalletHandle {
         let wallet = guard
             .as_ref()
             .ok_or_else(|| WalletSendPlanError::Other("wallet not initialized".to_string()))?;
+        let attested_coverage = wallet.attested_coverage();
         let mut available: Vec<&state::WalletUtxo> = wallet
             .utxos
             .values()
             .filter(|utxo| utxo.key_index == wallet.active_index)
             .filter(|utxo| !wallet.pending_input_slots.contains(&utxo.slot_index))
+            .filter(|utxo| !utxo.is_immature_coinbase(attested_coverage))
             .collect();
         available.sort_by_key(|utxo| {
             (
@@ -862,6 +870,7 @@ mod tests {
             log_slots: 24,
             active_slot_count: 0,
             alloc_counter: 0,
+            attested_coverage: 0,
             utxos: vec![],
         }
     }
@@ -1096,6 +1105,7 @@ mod tests {
             log_slots: 24,
             active_slot_count: 1,
             alloc_counter: 8,
+            attested_coverage: 0,
             utxos: vec![noid_chain::storage::VerifiedOwnerUtxo {
                 slot_index: 99,
                 amount: 777,
@@ -1195,6 +1205,7 @@ mod tests {
             log_slots: 24,
             active_slot_count: 1,
             alloc_counter: 1,
+            attested_coverage: 0,
         };
         handle
             .inner
@@ -1233,6 +1244,7 @@ mod tests {
                 active_slot_count: 2,
                 // One live mint with a zero post-counter is impossible.
                 alloc_counter: 0,
+                attested_coverage: 0,
             },
             transactions: vec![noid_tx::Transaction::new(body)],
         };

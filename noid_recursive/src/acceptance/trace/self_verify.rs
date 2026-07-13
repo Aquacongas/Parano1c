@@ -1671,6 +1671,37 @@ impl<'a, C> FieldPostCommitTraceContext<'a, C> {
     pub fn claim_count(&self) -> usize {
         self.claims.len()
     }
+
+    /// Open a CHILD post-commit context over a different channel (the
+    /// union-recorder discipline): same verified proof, same claim authority,
+    /// but every transcript op lands on `channel` instead of the enclosing
+    /// inline sponge.  The caller must drain the child's claims back into
+    /// this context with [`Self::adopt_child_claims`] — the child cannot
+    /// discharge openings on its own.
+    pub(crate) fn child<'c, C2>(&self, channel: &'c mut C2) -> FieldPostCommitTraceContext<'c, C2>
+    where
+        'a: 'c,
+    {
+        FieldPostCommitTraceContext::new(self.commitment_root, self.total_vars, channel)
+    }
+
+    /// Detached context for SCRATCH replays (schedule derivation, recording
+    /// prefill).  Nothing built through it enters a real proof: the claims
+    /// are dropped by the caller and the commitment root is never read by
+    /// the recorded child protocols.
+    pub(crate) fn detached(
+        commitment_root: &'a FlatDigestExpr,
+        total_vars: usize,
+        channel: &'a mut C,
+    ) -> Self {
+        Self::new(commitment_root, total_vars, channel)
+    }
+
+    /// Adopt a finished child context's claims into this context's sink (the
+    /// enclosing proof's shared PCS batch), preserving order.
+    pub(crate) fn adopt_child_claims<C2>(&mut self, child: FieldPostCommitTraceContext<'_, C2>) {
+        self.claims.extend(child.finish());
+    }
 }
 
 impl<C: FsChannelOps> FsChannelOps for FieldPostCommitTraceContext<'_, C> {

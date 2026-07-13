@@ -69,6 +69,10 @@ pub struct BlockTemplate {
     pub authorization_bytes: Vec<Option<Vec<u8>>>,
     /// Exact authenticated state transition proof for user-transaction blocks.
     pub exact_state_transition: Option<noid_block::ExactStateTransitionProof>,
+    /// Serialized Link terminal envelope attached when this template advances
+    /// `header.attested_coverage` beyond the parent's. Empty when the header
+    /// keeps the parent's coverage.
+    pub coverage_attestation_bytes: Vec<u8>,
     /// Process-wide proof-memory reservation acquired before cached proof bytes
     /// or exact-state artifacts are cloned into this template. Shared clones
     /// keep the reservation alive until the blocking prover actually exits.
@@ -116,6 +120,10 @@ pub struct TemplateChainSnapshot {
     pub prev_timestamps: Vec<u64>,
     pub anchor: AnchorInfo,
     pub state: ChainState,
+    /// Local durable coverage advancement to attest in the new block:
+    /// `(coverage_height, serialized Link terminal envelope)`. `None` when the
+    /// local proven frontier does not exceed the parent's attested coverage.
+    pub coverage_attachment: Option<(u64, Vec<u8>)>,
     user_epoch_anchor: [u8; 32],
     store: MdbxStore,
 }
@@ -131,6 +139,7 @@ impl TemplateChainSnapshot {
             .ok_or(MdbxContextError::Corrupt(
                 "transaction epoch anchor header missing",
             ))?;
+        let coverage_attachment = local_coverage_attachment(ctx, &parent);
 
         Ok(Self {
             parent,
@@ -143,9 +152,19 @@ impl TemplateChainSnapshot {
                 .ok_or(MdbxContextError::Corrupt(
                     "template snapshot requested outside durable state boundary",
                 ))?,
+            coverage_attachment,
             user_epoch_anchor,
             store: ctx.store.clone(),
         })
+    }
+
+    /// Coverage the new header will attest: the attachment's height when the
+    /// local proven frontier advanced, otherwise the parent's value.
+    pub fn template_attested_coverage(&self) -> u64 {
+        self.coverage_attachment
+            .as_ref()
+            .map(|(height, _)| *height)
+            .unwrap_or(self.parent.attested_coverage)
     }
 
     pub fn prev_state_root(&self) -> [u8; 32] {
@@ -221,6 +240,61 @@ impl TemplateChainSnapshot {
     }
 }
 
+/// Read the local durable selected-history coverage pointer and, when it
+/// advances past the parent's attested coverage, load the matching Link
+/// terminal envelope for attachment.
+///
+/// Mining must never be throttled by the proof pipeline: every failure or
+/// inconsistency here degrades to `None` (build a non-attesting template)
+/// instead of erroring.
+fn local_coverage_attachment(
+    ctx: &MdbxChainContext,
+    parent: &BlockHeader,
+) -> Option<(u64, Vec<u8>)> {
+    let coverage = match ctx.store.get_selected_history_coverage() {
+        Ok(Some(coverage)) => coverage,
+        Ok(None) => return None,
+        Err(error) => {
+            tracing::warn!(err = %error, "template coverage pointer read failed");
+            return None;
+        }
+    };
+    // Consensus bounds: strictly advancing and provable within the parent
+    // chain (C <= parent.height). Coverage can never exceed the tip, but a
+    // racing rewind makes this a cheap fail-open guard.
+    if coverage.height <= parent.attested_coverage || coverage.height > parent.height {
+        return None;
+    }
+    // The envelope must bind the CANONICAL header at C; a stale pointer left
+    // by a reorg rewind would fail block validation, so skip attaching it.
+    match ctx.get_header_from_store(coverage.height) {
+        Ok(Some(header))
+            if noid_chain::hash_block_header(&header) == coverage.block_hash => {}
+        Ok(_) => return None,
+        Err(error) => {
+            tracing::warn!(err = %error, "template coverage header read failed");
+            return None;
+        }
+    }
+    match ctx
+        .store
+        .get_selected_history_terminal_result_at(coverage.height, coverage.block_hash)
+    {
+        Ok(Some(result))
+            if !result.bytes.is_empty()
+                && result.bytes.len()
+                    <= noid_chain::consensus::wire_limits::MAX_COVERAGE_ATTESTATION_BYTES =>
+        {
+            Some((coverage.height, result.bytes))
+        }
+        Ok(_) => None,
+        Err(error) => {
+            tracing::warn!(err = %error, "template coverage terminal read failed");
+            None
+        }
+    }
+}
+
 /// Builds `BlockTemplate` from a chain snapshot and top-fee mempool txs.
 pub struct TemplateBuilder {
     pub mempool: AsyncMempool,
@@ -260,7 +334,6 @@ impl TemplateBuilder {
         max_user_txs: usize,
     ) -> Option<BlockTemplate> {
         use noid_chain::consensus::median_time_past;
-        use noid_chain::consensus::template::build_block_template;
 
         let parent = &snapshot.parent;
         let prev_active_counts = &snapshot.prev_active_counts;
@@ -320,10 +393,22 @@ impl TemplateBuilder {
 
         // Recheck exact start-of-block anchor after selection. A boundary may
         // have advanced while the transaction waited in the mempool.
+        // Re-check proof-gated coinbase maturity the same way: admission used
+        // the tip coverage at submit time, but the block being built attests
+        // `template_attested_coverage()` (same-block attestation counts).
+        let template_coverage = snapshot.template_attested_coverage();
         let (authorization_bytes, txs): (Vec<_>, Vec<_>) = authorization_bytes
             .into_iter()
             .zip(txs)
             .filter(|(_, tx)| tx.body.epoch_anchor == snapshot.user_epoch_anchor)
+            .filter(|(_, tx)| {
+                !tx.body.live_inputs().any(|(_, input)| {
+                    noid_chain::consensus::params::is_coinbase_creation_id(input.creation_id)
+                        && noid_chain::consensus::params::coinbase_creation_height(
+                            input.creation_id,
+                        ) > template_coverage
+                })
+            })
             .take(max_user_txs)
             .unzip();
         let mut proof_by_hash: HashMap<noid_poseidon2b::primitives::TxBodyHash, Option<Vec<u8>>> =
@@ -345,7 +430,7 @@ impl TemplateBuilder {
             tracing::warn!(err = %error, "template allocator-segment hydration failed");
             return None;
         }
-        match build_block_template(
+        match noid_chain::consensus::template::build_block_template_with_coverage(
             parent,
             &state,
             prev_active_counts,
@@ -353,6 +438,7 @@ impl TemplateBuilder {
             miner_address,
             timestamp,
             difficulty_target,
+            template_coverage,
         ) {
             Ok(inner) => {
                 let proof_memory_reservation = if inner.txs.is_empty() {
@@ -389,6 +475,7 @@ impl TemplateBuilder {
                         &bodies,
                         &commitments,
                         state.alloc_counter,
+                        inner.height,
                     ) {
                         Ok(surface) => surface,
                         Err(e) => {
@@ -423,6 +510,11 @@ impl TemplateBuilder {
                     .iter()
                     .map(|tx| proof_by_hash.remove(&tx.txid()).unwrap_or(None))
                     .collect();
+                let coverage_attestation_bytes = snapshot
+                    .coverage_attachment
+                    .as_ref()
+                    .map(|(_, bytes)| bytes.clone())
+                    .unwrap_or_default();
                 Some(BlockTemplate {
                     inner,
                     difficulty_target,
@@ -431,6 +523,7 @@ impl TemplateBuilder {
                     parent: *parent,
                     authorization_bytes,
                     exact_state_transition,
+                    coverage_attestation_bytes,
                     proof_memory_reservation,
                 })
             }

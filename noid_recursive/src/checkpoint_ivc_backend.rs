@@ -713,6 +713,11 @@ fn validate_public_direct_accumulator_transition(
 fn block_header_from_pow_fields(
     fields: &[Block128; noid_chain::consensus::pow::POW_HEADER_FIELD_COUNT],
 ) -> Option<BlockHeader> {
+    // The reserved pad lane must be zero: a nonzero pad would admit two field
+    // schedules for one semantic header.
+    if fields[17].to_u128() != 0 {
+        return None;
+    }
     Some(BlockHeader {
         prev_block_hash: digest_from_field_pair(&fields[0..2]),
         state_root: digest_from_field_pair(&fields[2..4]),
@@ -725,6 +730,7 @@ fn block_header_from_pow_fields(
         log_slots: u32::try_from(fields[13].to_u128()).ok()?,
         active_slot_count: u64::try_from(fields[14].to_u128()).ok()?,
         alloc_counter: u64::try_from(fields[15].to_u128()).ok()?,
+        attested_coverage: u64::try_from(fields[16].to_u128()).ok()?,
     })
 }
 
@@ -1683,6 +1689,7 @@ mod tests {
         height: u64,
     ) -> noid_chain::BlockHeader {
         noid_chain::BlockHeader {
+            attested_coverage: 0,
             prev_block_hash,
             state_root,
             tx_root: digest_with_seed(0x10 | (height as u8)),

@@ -402,6 +402,7 @@ fn reconstruct_historical_exact_state_inner(
                 tip_effective_log,
                 changes,
                 target_header.alloc_counter,
+                target_header.height,
                 required_phase,
                 required_segment_ids,
             )?;
@@ -444,6 +445,7 @@ fn reconstruct_historical_exact_state_inner(
             segment_id,
             tip_effective_log,
             target_header.alloc_counter,
+            target_header.height,
             required_segment_ids,
         )?;
     }
@@ -674,13 +676,14 @@ fn reconstruct_touched_segment(
     effective_log: u8,
     changes: &[SegmentRollback],
     target_alloc_counter: u64,
+    target_height: u64,
     retain: bool,
     required_segment_ids: &[u16],
 ) -> Result<(), HistoricalStateError> {
     let columns = load_source_segment(snapshot, state, source_tip, segment_id, effective_log)?;
     state.restore_evicted_segment(segment_id, columns)?;
     state.state.apply_delta_unrooted(changes)?;
-    validate_resident_segment(state, segment_id, target_alloc_counter)?;
+    validate_resident_segment(state, segment_id, target_alloc_counter, target_height)?;
 
     // Refresh only the consensus exact summary. FRI summaries deliberately
     // remain unavailable in `HistoricalExactStateView`.
@@ -699,11 +702,12 @@ fn hydrate_untouched_required_segment(
     segment_id: u16,
     effective_log: u8,
     target_alloc_counter: u64,
+    target_height: u64,
     required_segment_ids: &[u16],
 ) -> Result<(), HistoricalStateError> {
     let columns = load_source_segment(snapshot, state, source_tip, segment_id, effective_log)?;
     state.restore_evicted_segment(segment_id, columns)?;
-    validate_resident_segment(state, segment_id, target_alloc_counter)?;
+    validate_resident_segment(state, segment_id, target_alloc_counter, target_height)?;
     state.state.clear_dirty();
     ensure_resident_allowlist(state, required_segment_ids)
 }
@@ -747,6 +751,7 @@ fn validate_resident_segment(
     state: &ChainState,
     segment_id: u16,
     alloc_counter: u64,
+    target_height: u64,
 ) -> Result<(), HistoricalStateError> {
     let Some(columns) = state.state.try_get_segment_columns(segment_id) else {
         if state.state.segment_live_count(segment_id) != 0 {
@@ -777,7 +782,20 @@ fn validate_resident_segment(
         if slot.is_empty() {
             continue;
         }
-        if slot.creation_id() > alloc_counter {
+        // Tagged coinbase ids live in the `TAG | mint_height` namespace and
+        // are bounded by the target height, not the allocator counter.
+        if crate::consensus::params::is_coinbase_creation_id(slot.creation_id()) {
+            if crate::consensus::params::coinbase_creation_height(slot.creation_id())
+                > target_height
+            {
+                return Err(HistoricalStateError::CreationIdExceedsTarget {
+                    segment_id,
+                    local_index: local_index as u32,
+                    creation_id: slot.creation_id(),
+                    alloc_counter,
+                });
+            }
+        } else if slot.creation_id() > alloc_counter {
             return Err(HistoricalStateError::CreationIdExceedsTarget {
                 segment_id,
                 local_index: local_index as u32,

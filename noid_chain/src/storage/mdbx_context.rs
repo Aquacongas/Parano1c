@@ -148,6 +148,26 @@ pub struct ReorgBlockPayload<'a> {
     pub block: &'a Block,
     pub block_proof_bytes: &'a [u8],
     pub block_auth_sidecar_bytes: &'a [u8],
+    /// Serialized Link terminal envelope when the block advances
+    /// `attested_coverage`; empty otherwise.
+    pub coverage_attestation_bytes: &'a [u8],
+}
+
+/// One block's claim that a Link envelope attests selected-history coverage.
+///
+/// `noid_chain` resolves the canonical headers the native verifier must bind
+/// against; the injected verifier (owned by the node, which holds the pinned
+/// registry/matrix artifacts) performs the actual cryptographic check.
+#[derive(Debug, Clone, Copy)]
+pub struct CoverageAttestationClaim<'a> {
+    /// Serialized selected-history terminal package bytes.
+    pub attestation_bytes: &'a [u8],
+    /// The coverage height C declared by the child header.
+    pub coverage_height: u64,
+    /// Canonical header at height C the envelope must bind.
+    pub header_at_coverage: BlockHeader,
+    /// Canonical transaction-epoch anchor header for height C.
+    pub epoch_anchor_header: BlockHeader,
 }
 
 /// A shallow in-RAM reorg may retain the union of old-branch and replacement
@@ -181,11 +201,13 @@ impl<'a> ReorgBlockPayload<'a> {
         block: &'a Block,
         block_proof_bytes: &'a [u8],
         block_auth_sidecar_bytes: &'a [u8],
+        coverage_attestation_bytes: &'a [u8],
     ) -> Self {
         Self {
             block,
             block_proof_bytes,
             block_auth_sidecar_bytes,
+            coverage_attestation_bytes,
         }
     }
 }
@@ -246,6 +268,7 @@ impl MdbxChainContext {
         log_slots: u32,
         active_slot_count: u64,
         alloc_counter: u64,
+        tip_height: u64,
         expected_root: [u8; 32],
     ) -> Result<ChainState, MdbxContextError> {
         let mut segmented = SegmentedFriState::new_empty(log_slots as usize);
@@ -274,7 +297,18 @@ impl MdbxChainContext {
                 if slot.is_empty() {
                     continue;
                 }
-                if slot.creation_id() > alloc_counter {
+                // Tagged coinbase mints live in the `TAG | mint_height`
+                // namespace: bound them by the tip height instead of the
+                // allocator counter.
+                if crate::consensus::params::is_coinbase_creation_id(slot.creation_id()) {
+                    if crate::consensus::params::coinbase_creation_height(slot.creation_id())
+                        > tip_height
+                    {
+                        return Err(StoreError::Decode(
+                            "persisted coinbase creation_id exceeds tip height",
+                        ));
+                    }
+                } else if slot.creation_id() > alloc_counter {
                     return Err(StoreError::Decode(
                         "persisted slot creation_id exceeds alloc_counter",
                     ));
@@ -568,6 +602,7 @@ impl MdbxChainContext {
             log_slots,
             active_slot_count,
             alloc_counter,
+            tip_height,
             tip_hdr.state_root,
         )?;
 
@@ -633,6 +668,7 @@ impl MdbxChainContext {
             log_slots,
             active_slot_count,
             alloc_counter,
+            tip_header.height,
             tip_header.state_root,
         )?;
 
@@ -807,6 +843,7 @@ impl MdbxChainContext {
         block: &Block,
         block_proof_bytes: &[u8],
         block_auth_sidecar_bytes: &[u8],
+        coverage_attestation_bytes: &[u8],
         validation: &AppliedBlockValidation,
         undo: &crate::consensus::da_prune::BlockUndoLog,
         parent: &BlockHeader,
@@ -868,6 +905,7 @@ impl MdbxChainContext {
                     Some(AcceptedBlockCommitData {
                         block_proof_bytes,
                         block_auth_sidecar_bytes,
+                        coverage_attestation_bytes,
                         history_claim_bytes: &validation.history_claim_bytes,
                         accepted_block_certificate_bytes: &validation
                             .accepted_block_certificate_bytes,
@@ -918,13 +956,21 @@ impl MdbxChainContext {
     /// Coinbase-only blocks are the sole no-proof exception, but they still go
     /// through the supplied proof-native validator so mint-slot emptiness and
     /// the exact transition are established before the atomic commit.
-    pub fn apply_next_block<F, E>(
+    ///
+    /// `coverage_attestation_bytes` carries the detached Link terminal
+    /// envelope for a header that advances `attested_coverage` (empty
+    /// otherwise). `verify_coverage_attestation` is the node-injected native
+    /// verifier over the pinned registry/matrix artifacts; a node without
+    /// artifacts must fail closed from that closure, rejecting the block.
+    pub fn apply_next_block<F, E, A>(
         &mut self,
         block: &Block,
         block_proof_bytes: &[u8],
         block_auth_sidecar_bytes: &[u8],
+        coverage_attestation_bytes: &[u8],
         local_time: u64,
         validate_and_apply: F,
+        verify_coverage_attestation: A,
     ) -> Result<[u8; 32], MdbxContextError>
     where
         F: FnOnce(
@@ -940,6 +986,7 @@ impl MdbxChainContext {
             &mut ChainState,
         ) -> Result<AppliedBlockValidation, E>,
         E: std::fmt::Display,
+        A: FnOnce(&CoverageAttestationClaim<'_>) -> Result<(), String>,
     {
         let parent = *self.tip_header();
         let prev_timestamps = self.prev_timestamps();
@@ -964,6 +1011,75 @@ impl MdbxChainContext {
             local_time,
             &anchor,
         )?;
+
+        // --- Attestation-on-advancement (proof-gated coinbase maturity) ---
+        //
+        // `validate_block_checks` established the structural envelope of the
+        // header rule (monotone, and any advancement lands in
+        // `(parent.attested_coverage, parent.height]`). Here the detached
+        // payload is bound to the header: present iff the header advances
+        // coverage, and natively verified against the canonical header at C
+        // through the injected artifact-backed verifier. Fail-closed.
+        if block.header.attested_coverage == parent.attested_coverage {
+            if !coverage_attestation_bytes.is_empty() {
+                return Err(MdbxContextError::Consensus(
+                    ConsensusError::BadCoverageAttestation(
+                        "attestation attached but header does not advance coverage".to_string(),
+                    ),
+                ));
+            }
+        } else {
+            if coverage_attestation_bytes.is_empty() {
+                return Err(MdbxContextError::Consensus(
+                    ConsensusError::BadCoverageAttestation(
+                        "header advances coverage without an attestation payload".to_string(),
+                    ),
+                ));
+            }
+            if coverage_attestation_bytes.len()
+                > crate::consensus::wire_limits::MAX_COVERAGE_ATTESTATION_BYTES
+            {
+                return Err(MdbxContextError::Consensus(
+                    ConsensusError::BadCoverageAttestation(
+                        "attestation payload exceeds the wire cap".to_string(),
+                    ),
+                ));
+            }
+            let coverage_height = block.header.attested_coverage;
+            let header_at_coverage = match self.recent_headers.get(&coverage_height) {
+                Some(header) => *header,
+                None => self.get_header_from_store(coverage_height)?.ok_or(
+                    MdbxContextError::Consensus(ConsensusError::BadCoverageAttestation(
+                        "canonical header at the attested coverage height is missing".to_string(),
+                    )),
+                )?,
+            };
+            if header_at_coverage.height != coverage_height {
+                return Err(MdbxContextError::Corrupt(
+                    "stored header disagrees with the attested coverage height",
+                ));
+            }
+            let epoch_anchor_height = (coverage_height
+                / crate::consensus::params::TX_EPOCH_BLOCKS)
+                * crate::consensus::params::TX_EPOCH_BLOCKS;
+            let epoch_anchor_header = match self.recent_headers.get(&epoch_anchor_height) {
+                Some(header) => *header,
+                None => self.get_header_from_store(epoch_anchor_height)?.ok_or(
+                    MdbxContextError::Consensus(ConsensusError::BadCoverageAttestation(
+                        "canonical epoch anchor for the attested coverage is missing".to_string(),
+                    )),
+                )?,
+            };
+            let claim = CoverageAttestationClaim {
+                attestation_bytes: coverage_attestation_bytes,
+                coverage_height,
+                header_at_coverage,
+                epoch_anchor_header,
+            };
+            verify_coverage_attestation(&claim).map_err(|error| {
+                MdbxContextError::Consensus(ConsensusError::BadCoverageAttestation(error))
+            })?;
+        }
 
         let has_user_txs = block.transactions.iter().any(|tx| !tx.body.is_coinbase);
         if has_user_txs {
@@ -1058,6 +1174,7 @@ impl MdbxChainContext {
             block,
             block_proof_bytes,
             block_auth_sidecar_bytes,
+            coverage_attestation_bytes,
             &validation,
             &undo,
             &parent,
@@ -1839,7 +1956,15 @@ impl MdbxChainContext {
                 if slot.is_empty() {
                     continue;
                 }
-                if slot.creation_id() > alloc_counter {
+                if crate::consensus::params::is_coinbase_creation_id(slot.creation_id()) {
+                    if crate::consensus::params::coinbase_creation_height(slot.creation_id())
+                        > tip_height
+                    {
+                        return Err(MdbxContextError::Corrupt(
+                            "snapshot coinbase creation_id exceeds tip height",
+                        ));
+                    }
+                } else if slot.creation_id() > alloc_counter {
                     return Err(MdbxContextError::Corrupt(
                         "snapshot slot creation_id exceeds alloc_counter",
                     ));
@@ -2063,7 +2188,7 @@ mod tests {
             let (_, columns) = ctx.store.get_segment(segment_id).unwrap().unwrap();
             child.restore_evicted_segment(segment_id, columns).unwrap();
         }
-        crate::state::apply_tx(&mut child, &tx.body).unwrap();
+        crate::state::apply_tx_at(&mut child, &tx.body, parent.height + 1).unwrap();
         Block {
             header: BlockHeader {
                 prev_block_hash: block_id(&parent),
@@ -2077,6 +2202,7 @@ mod tests {
                 log_slots: parent.log_slots,
                 active_slot_count: child.active_slot_count,
                 alloc_counter: child.alloc_counter,
+                attested_coverage: 0,
             },
             transactions: vec![tx],
         }
@@ -2119,9 +2245,175 @@ mod tests {
                 log_slots: parent.log_slots,
                 active_slot_count: parent.active_slot_count,
                 alloc_counter: parent.alloc_counter,
+                attested_coverage: 0,
             },
             transactions: vec![tx],
         }
+    }
+
+    /// Test attestation verifier: these fixtures never attach an attestation,
+    /// so reaching the verifier means the binding rule itself regressed.
+    fn reject_unexpected_attestation(
+        _claim: &CoverageAttestationClaim<'_>,
+    ) -> Result<(), String> {
+        Err("test fixtures do not carry coverage attestations".to_string())
+    }
+
+    /// [`coinbase_block`] with an explicit header `attested_coverage`.
+    fn coinbase_block_with_coverage(
+        ctx: &MdbxChainContext,
+        slot: u32,
+        owner: Address,
+        attested_coverage: u64,
+    ) -> Block {
+        let mut block = coinbase_block(ctx, slot, owner);
+        block.header.attested_coverage = attested_coverage;
+        block
+    }
+
+    /// Apply a coinbase block carrying `attestation` bytes through an
+    /// injected attestation verifier.
+    fn apply_coinbase_with_attestation<A>(
+        ctx: &mut MdbxChainContext,
+        block: &Block,
+        attestation: &[u8],
+        verify: A,
+    ) -> Result<[u8; 32], MdbxContextError>
+    where
+        A: FnOnce(&CoverageAttestationClaim<'_>) -> Result<(), String>,
+    {
+        ctx.apply_next_block(
+            block,
+            &[],
+            &[],
+            attestation,
+            block.header.timestamp + 1,
+            |block,
+             _proof,
+             _sidecar,
+             _parent,
+             _timestamps,
+             _active,
+             _local,
+             _tx_epoch,
+             _anchor,
+             state|
+             -> Result<AppliedBlockValidation, String> {
+                crate::block::apply_block(state, block)
+                    .map(|transition| {
+                        AppliedBlockValidation::new(
+                            transition.new_state_root,
+                            b"test-history-claim".to_vec(),
+                            b"test-accepted-certificate".to_vec(),
+                        )
+                    })
+                    .map_err(|error| format!("{error:?}"))
+            },
+            verify,
+        )
+    }
+
+    #[test]
+    fn coverage_attestation_binding_gates_advancing_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
+        let owner = Address([0x21; 32]);
+
+        // Height 1 keeps genesis coverage 0 without any attestation.
+        let block_one = coinbase_block(&ctx, 7, owner);
+        apply_coinbase(&mut ctx, &block_one).unwrap();
+        let header_at_one = *ctx.tip_header();
+
+        // An advancing header without an attestation payload fails closed.
+        let advancing = coinbase_block_with_coverage(&ctx, 8, owner, 1);
+        let missing = apply_coinbase_with_attestation(
+            &mut ctx,
+            &advancing,
+            &[],
+            reject_unexpected_attestation,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            missing,
+            MdbxContextError::Consensus(ConsensusError::BadCoverageAttestation(_))
+        ));
+        assert_eq!(ctx.tip_height(), 1);
+
+        // A rejected (garbage) envelope fails closed without state change.
+        let garbage = apply_coinbase_with_attestation(
+            &mut ctx,
+            &advancing,
+            b"garbage-envelope",
+            |_claim| Err("envelope does not verify".to_string()),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            garbage,
+            MdbxContextError::Consensus(ConsensusError::BadCoverageAttestation(_))
+        ));
+        assert_eq!(ctx.tip_height(), 1);
+
+        // A non-advancing header must not carry attestation bytes.
+        let non_advancing = coinbase_block(&ctx, 8, owner);
+        let unexpected = apply_coinbase_with_attestation(
+            &mut ctx,
+            &non_advancing,
+            b"unsolicited-envelope",
+            |_claim| Ok(()),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            unexpected,
+            MdbxContextError::Consensus(ConsensusError::BadCoverageAttestation(_))
+        ));
+        assert_eq!(ctx.tip_height(), 1);
+
+        // A verified envelope advances coverage; the claim binds the exact
+        // canonical header at C and its transaction-epoch anchor.
+        let envelope = b"verified-envelope".to_vec();
+        apply_coinbase_with_attestation(&mut ctx, &advancing, &envelope, |claim| {
+            assert_eq!(claim.coverage_height, 1);
+            assert_eq!(claim.header_at_coverage, header_at_one);
+            assert_eq!(claim.epoch_anchor_header.height, 0);
+            assert_eq!(claim.attestation_bytes, envelope.as_slice());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(ctx.tip_height(), 2);
+        assert_eq!(ctx.tip_header().attested_coverage, 1);
+        // The attestation is retained with the block for P2P serving.
+        assert_eq!(
+            ctx.store.get_coverage_attestation(2).unwrap().as_deref(),
+            Some(envelope.as_slice())
+        );
+
+        // Regressing coverage is rejected by header validation.
+        let regressing = coinbase_block_with_coverage(&ctx, 9, owner, 0);
+        let regression = apply_coinbase(&mut ctx, &regressing).unwrap_err();
+        assert!(matches!(
+            regression,
+            MdbxContextError::Consensus(ConsensusError::BadAttestedCoverage { .. })
+        ));
+
+        // A false C above the parent height is rejected by header validation.
+        let overreaching = coinbase_block_with_coverage(&ctx, 9, owner, 3);
+        let overreach = apply_coinbase_with_attestation(
+            &mut ctx,
+            &overreaching,
+            b"claims-too-much",
+            |_claim| Ok(()),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            overreach,
+            MdbxContextError::Consensus(ConsensusError::BadAttestedCoverage { .. })
+        ));
+
+        // Keeping the advanced coverage without a new attestation is normal.
+        let steady = coinbase_block_with_coverage(&ctx, 9, owner, 1);
+        apply_coinbase(&mut ctx, &steady).unwrap();
+        assert_eq!(ctx.tip_header().attested_coverage, 1);
+        assert_eq!(ctx.store.get_coverage_attestation(3).unwrap(), None);
     }
 
     fn apply_coinbase(
@@ -2130,6 +2422,7 @@ mod tests {
     ) -> Result<[u8; 32], MdbxContextError> {
         ctx.apply_next_block(
             block,
+            &[],
             &[],
             &[],
             block.header.timestamp + 1,
@@ -2154,6 +2447,7 @@ mod tests {
                     })
                     .map_err(|error| format!("{error:?}"))
             },
+            reject_unexpected_attestation,
         )
     }
 
@@ -2549,6 +2843,7 @@ mod tests {
                 &candidate,
                 &[],
                 &[],
+                &[],
                 candidate.header.timestamp + 1,
                 |_block,
                  _proof,
@@ -2563,6 +2858,7 @@ mod tests {
                  -> Result<AppliedBlockValidation, &'static str> {
                     Err("deliberately invalid proof")
                 },
+                reject_unexpected_attestation,
             );
             assert!(
                 matches!(
@@ -2611,6 +2907,7 @@ mod tests {
             &candidate,
             &[],
             &[],
+            &[],
             candidate.header.timestamp + 1,
             |_block,
              _proof,
@@ -2627,6 +2924,7 @@ mod tests {
                 assert!(state.state.try_get_segment_columns(0).is_some());
                 Err("reject before applying expansion")
             },
+            reject_unexpected_attestation,
         );
         assert!(matches!(
             result,
@@ -2660,6 +2958,7 @@ mod tests {
             &candidate,
             &[],
             &[],
+            &[],
             candidate.header.timestamp + 1,
             |_block,
              _proof,
@@ -2687,6 +2986,7 @@ mod tests {
                     .unwrap();
                 Err("corrupt validator transition")
             },
+            reject_unexpected_attestation,
         );
         assert!(matches!(
             result,
@@ -2811,8 +3111,8 @@ mod tests {
         replacement_two.header.prev_block_hash = [0xA5; 32];
         let replacement_txid = replacement_one.transactions[0].txid();
         let payloads = [
-            ReorgBlockPayload::new(&replacement_one, &[], &[]),
-            ReorgBlockPayload::new(&replacement_two, &[], &[]),
+            ReorgBlockPayload::new(&replacement_one, &[], &[], &[]),
+            ReorgBlockPayload::new(&replacement_two, &[], &[], &[]),
         ];
 
         let result = canonical.apply_reorg_mdbx_with_applier(
@@ -2915,15 +3215,25 @@ mod tests {
             MdbxChainContext::open_or_create_for_test(replacement_dir.path()).unwrap();
         let replacement_one = coinbase_block(&replacement, 9, Address([2u8; 32]));
         apply_coinbase(&mut replacement, &replacement_one).unwrap();
-        let replacement_two = coinbase_block(&replacement, 10, Address([2u8; 32]));
-        apply_coinbase(&mut replacement, &replacement_two).unwrap();
+        // The replacement branch attests coverage of its own height 1, so the
+        // reorg exercises the attestation payload travelling with headers.
+        let replacement_attestation = b"replacement-branch-envelope".to_vec();
+        let replacement_two =
+            coinbase_block_with_coverage(&replacement, 10, Address([2u8; 32]), 1);
+        apply_coinbase_with_attestation(
+            &mut replacement,
+            &replacement_two,
+            &replacement_attestation,
+            |_claim| Ok(()),
+        )
+        .unwrap();
         let replacement_one_txid = replacement_one.transactions[0].txid();
         let replacement_two_txid = replacement_two.transactions[0].txid();
         let expected_tip = block_id(&replacement_two.header);
         let expected_root = replacement_two.header.state_root;
         let payloads = [
-            ReorgBlockPayload::new(&replacement_one, &[], &[]),
-            ReorgBlockPayload::new(&replacement_two, &[], &[]),
+            ReorgBlockPayload::new(&replacement_one, &[], &[], &[]),
+            ReorgBlockPayload::new(&replacement_two, &[], &[], &replacement_attestation),
         ];
 
         let result = canonical
@@ -2931,7 +3241,15 @@ mod tests {
                 0,
                 &payloads,
                 replacement_two.header.timestamp + 1,
-                |ctx, candidate, _local_time| apply_coinbase(ctx, candidate.block).map(|_| ()),
+                |ctx, candidate, _local_time| {
+                    apply_coinbase_with_attestation(
+                        ctx,
+                        candidate.block,
+                        candidate.coverage_attestation_bytes,
+                        |_claim| Ok(()),
+                    )
+                    .map(|_| ())
+                },
             )
             .unwrap();
         assert_eq!(result.reverted_heights, vec![2, 1]);
@@ -2977,6 +3295,17 @@ mod tests {
         assert_eq!(reopened.tip_height(), 2);
         assert_eq!(reopened.tip_hash(), expected_tip);
         assert_eq!(reopened.state.cached_state_root(), expected_root);
+        // The coverage field reorgs with the headers, and the replacement
+        // branch's retained attestation replaces the old branch's (none).
+        assert_eq!(reopened.tip_header().attested_coverage, 1);
+        assert_eq!(
+            reopened
+                .store
+                .get_coverage_attestation(2)
+                .unwrap()
+                .as_deref(),
+            Some(replacement_attestation.as_slice())
+        );
         assert_eq!(
             reopened
                 .store

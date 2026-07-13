@@ -965,6 +965,7 @@ mod tests {
             log_slots,
             active_slot_count: active,
             alloc_counter: alloc,
+            attested_coverage: 0,
         }
     }
 
