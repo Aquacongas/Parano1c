@@ -8,10 +8,12 @@
 //!
 //! Every block of the union is one recorded child transcript (a compiled
 //! [`DuplexLayout`] over the union-recorder capacity IV), gated to its own
-//! dyadic offset.  A built instance carries exactly one LIVE block (the
-//! recording its enclosing relation actually pinned) and canonical
-//! zero-data ghosts on the remaining blocks, so ONE verification key covers
-//! every ladder slot.  The serialized child authority reuses the duplex
+//! dyadic offset.  A built instance carries exactly one LIVE block per
+//! recording ROLE (the recordings its enclosing relation actually pinned:
+//! the hosted slot's block-sidecar child and `[R]_B` channel plus the
+//! universal `[R]_prev` channel) and canonical zero-data ghosts on the
+//! remaining blocks, so ONE verification key covers every ladder slot.
+//! The serialized child authority reuses the duplex
 //! walk-deferred wire shape byte-for-byte: recordings change relation TERMS
 //! (per-set gated wiring), never the claimed-column set, so selection /
 //! substitution / shift dimensions equal the recording-free duplex child.
@@ -545,7 +547,21 @@ pub(crate) fn verify_recording_duplex_region_walk_deferred_prefix_trace<'a, C: F
     let total_vars = context.total_vars();
     preflight_recording_duplex_region_walk_deferred(vk, total_vars, proof)?;
     context.observe_label(b, RECORDING_DUPLEX_SIDECAR_TRANSCRIPT_LABEL);
-    context.observe_bytes_const(b, &vk.transcript_digest());
+    // WITNESS lanes pinned to the digest constants (same FS_OP_BYTES header
+    // and packed lanes as the native `observe_bytes`).  The recordings-only
+    // vertical hosts the very [R]-replay recording whose schedule this
+    // replay produces; a constant absorb would bake the vertical's digest
+    // into its own layout (a hash fixed point), so the digest must ride the
+    // matrix pins instead of the recording schedule.
+    let digest_lanes = crate::acceptance::trace::self_verify::flat_digest_lanes(
+        &vk.transcript_digest(),
+    )
+    .map(|lane| {
+        let wire = LinExpr::from_wire(b.alloc_f128(lane));
+        crate::acceptance::trace::pin_eq(b, &wire, &LinExpr::constant(lane));
+        wire
+    });
+    context.observe_lanes(b, 32, &digest_lanes);
     let prefix = verify_duplex_union_walk_prefix_trace(
         b,
         context,

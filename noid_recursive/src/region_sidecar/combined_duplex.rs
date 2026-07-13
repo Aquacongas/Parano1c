@@ -607,6 +607,15 @@ impl CombinedDuplexRegionWalkDeferredProof {
     }
 }
 
+/// The canonical padded union domain log of one combined-duplex descriptor,
+/// without constructing a full VK (the slices-first recording-layout
+/// derivation needs the width before any witness slice exists).
+pub(crate) fn combined_duplex_protocol_w_log(
+    descriptor: &CombinedDuplexRegionDescriptor,
+) -> Result<usize, RegionSidecarError> {
+    Ok(canonical_protocol(descriptor)?.w_log)
+}
+
 /// Decode one heterogeneous combined-Duplex sidecar only after its canonical
 /// class has fixed every nested bincode sequence length without allocating.
 pub fn decode_combined_duplex_region_sidecar_bounded(

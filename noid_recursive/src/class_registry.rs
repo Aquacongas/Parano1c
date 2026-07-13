@@ -23,9 +23,13 @@ use noid_poseidon2b::native::poseidon2b_hash_byte_slices;
 
 use crate::acceptance::block_class::{BlockClass, BlockProofError};
 use crate::acceptance::split_link::{
-    CanonicalLadderError, CanonicalSplitLinkLadder, LadderSlotInfo, LinkProofError, SplitLinkClass,
+    split_io_spec, CanonicalLadderError, CanonicalSplitLinkLadder, LadderSlotInfo, LinkProofError,
+    SplitLinkClass,
 };
-use crate::acceptance::trace::r_pcs_region::canonical_selected_link_region_sidecar_vk;
+use crate::acceptance::trace::r_pcs_region::{
+    canonical_selected_link_region_sidecar_vk, derive_link_r_b_recording_layout,
+    derive_link_r_prev_recording_layout,
+};
 use crate::acceptance::trace::region_source_binding::pack_recording_only_blocks;
 use crate::region_sidecar::{
     derive_block_sidecar_recording_layout, RecordingDuplexRegionVk,
@@ -327,7 +331,11 @@ fn ladder_slot_wire(info: &LadderSlotInfo) -> LadderSlotWire {
     }
 }
 
-fn ladder_slot_with_layout(wire: &LadderSlotWire, layout: DuplexLayout) -> LadderSlotInfo {
+fn ladder_slot_with_layout(
+    wire: &LadderSlotWire,
+    child_layout: DuplexLayout,
+    r_b_layout: DuplexLayout,
+) -> LadderSlotInfo {
     LadderSlotInfo {
         tier: wire.tier,
         b_shape: wire.b_shape,
@@ -335,7 +343,8 @@ fn ladder_slot_with_layout(wire: &LadderSlotWire, layout: DuplexLayout) -> Ladde
         b_pcs_params: wire.b_pcs_params.clone(),
         b_post_commit_class_digest: wire.b_post_commit_class_digest,
         b_sidecar_vk_digest: wire.b_sidecar_vk_digest,
-        b_sidecar_rec_layout: layout,
+        b_sidecar_rec_layout: child_layout,
+        b_r_replay_rec_layout: r_b_layout,
     }
 }
 
@@ -626,18 +635,70 @@ fn link_vk_wire(
     })
 }
 
-/// Derive the four canonical recorded child layouts from the materialized
-/// Block sidecar VKs (ladder slot order).
+/// Derive the canonical recorded (child, `[R]_B`) layout pair of every slot
+/// from the materialized Block classes (ladder slot order).
 fn derived_recording_layouts(
     blocks: &[BlockClass; CLASS_COUNT],
-) -> Result<Vec<DuplexLayout>, SelectedRecursiveClassRegistryError> {
+) -> Result<Vec<(DuplexLayout, DuplexLayout)>, SelectedRecursiveClassRegistryError> {
     blocks
         .iter()
-        .map(|block| {
-            derive_block_sidecar_recording_layout(block.sidecar_vk(), block.shape.m)
-                .map_err(SelectedRecursiveClassRegistryError::Region)
+        .enumerate()
+        .map(|(slot, block)| {
+            let child = derive_block_sidecar_recording_layout(block.sidecar_vk(), block.shape.m)
+                .map_err(SelectedRecursiveClassRegistryError::Region)?;
+            let b_digest = block
+                .registry_matrix_digest()
+                .map_err(|source| SelectedRecursiveClassRegistryError::Block { slot, source })?;
+            let r_b = derive_link_r_b_recording_layout(
+                &block.shape,
+                &block.spec,
+                &block.pcs_params,
+                &b_digest,
+                block.post_commit_class_digest(),
+                block.sidecar_vk(),
+            )
+            .map_err(SelectedRecursiveClassRegistryError::Region)?;
+            Ok((child, r_b))
         })
         .collect()
+}
+
+/// The complete walk L-C block list of one validated descriptor, in the
+/// canonical geometry order: per-slot child blocks, per-slot `[R]_B` blocks,
+/// then the one universal `[R]_prev` block.
+fn full_recording_layouts(
+    descriptor: &CanonicalSplitLinkLadder,
+) -> Result<Vec<DuplexLayout>, SelectedRecursiveClassRegistryError> {
+    let children: Vec<DuplexLayout> = descriptor
+        .slots()
+        .iter()
+        .map(|slot| slot.b_sidecar_rec_layout.clone())
+        .collect();
+    let r_b: Vec<DuplexLayout> = descriptor
+        .slots()
+        .iter()
+        .map(|slot| slot.b_r_replay_rec_layout.clone())
+        .collect();
+    let block_params: Vec<PcsParams> = descriptor
+        .slots()
+        .iter()
+        .map(|slot| slot.b_pcs_params.clone())
+        .collect();
+    let spec = split_io_spec(descriptor.link_shape().k_log, descriptor.slots());
+    let r_prev = derive_link_r_prev_recording_layout(
+        &descriptor.link_shape(),
+        descriptor.link_pcs_params(),
+        &spec,
+        &block_params,
+        &children,
+        &r_b,
+    )
+    .map_err(SelectedRecursiveClassRegistryError::Region)?;
+    Ok(children
+        .into_iter()
+        .chain(r_b)
+        .chain(std::iter::once(r_prev))
+        .collect())
 }
 
 fn materialize_registry(
@@ -660,7 +721,9 @@ fn materialize_registry(
         wire.descriptor_slots
             .iter()
             .zip(&rec_layouts)
-            .map(|(slot, layout)| ladder_slot_with_layout(slot, layout.clone()))
+            .map(|(slot, (child, r_b))| {
+                ladder_slot_with_layout(slot, child.clone(), r_b.clone())
+            })
             .collect(),
     )?;
     for (slot, (info, block)) in descriptor.slots().iter().zip(&blocks).enumerate() {
@@ -680,7 +743,10 @@ fn materialize_registry(
         }
     }
 
-    let sidecar_vk = Arc::new(materialize_link_vk(wire.link_vk, &rec_layouts)?);
+    let sidecar_vk = Arc::new(materialize_link_vk(
+        wire.link_vk,
+        &full_recording_layouts(&descriptor)?,
+    )?);
     let package = decode_selected_history_terminal_package(&wire.genesis_package)?;
     if package.terminal_height() != 0
         || package.terminal_hash() != [0u8; 32]
@@ -751,10 +817,10 @@ fn materialize_terminal_registry(
         validate_terminal_block_wire(slot, block)?;
     }
 
-    // The recorded child-transcript layouts are derived, not persisted: the
+    // The recorded transcript layouts are derived, not persisted: the
     // terminal path transiently rebuilds each tier's Block sidecar VK from
     // its compact carrier (digest-checked against the pinned aggregate) and
-    // replays the recorded verifier schedule once per slot.
+    // replays the recorded verifier schedules once per slot.
     let terminal_rec_layouts = wire
         .blocks
         .iter()
@@ -768,8 +834,18 @@ fn materialize_terminal_registry(
                     "terminal Block sidecar VK identity",
                 ));
             }
-            derive_block_sidecar_recording_layout(&vk, block.shape.m)
-                .map_err(SelectedRecursiveClassRegistryError::Region)
+            let child = derive_block_sidecar_recording_layout(&vk, block.shape.m)
+                .map_err(SelectedRecursiveClassRegistryError::Region)?;
+            let r_b = derive_link_r_b_recording_layout(
+                &block.shape,
+                &block.spec,
+                &block.pcs,
+                &block.matrix_digest,
+                &block.post_commit_digest,
+                &vk,
+            )
+            .map_err(SelectedRecursiveClassRegistryError::Region)?;
+            Ok((child, r_b))
         })
         .collect::<Result<Vec<_>, SelectedRecursiveClassRegistryError>>()?;
     let descriptor = CanonicalSplitLinkLadder::try_new(
@@ -778,7 +854,9 @@ fn materialize_terminal_registry(
         wire.descriptor_slots
             .iter()
             .zip(&terminal_rec_layouts)
-            .map(|(slot, layout)| ladder_slot_with_layout(slot, layout.clone()))
+            .map(|(slot, (child, r_b))| {
+                ladder_slot_with_layout(slot, child.clone(), r_b.clone())
+            })
             .collect(),
     )?;
     for (slot, (info, block)) in descriptor.slots().iter().zip(&wire.blocks).enumerate() {
@@ -810,10 +888,27 @@ fn materialize_terminal_registry(
         .iter()
         .map(|slot| slot.b_sidecar_rec_layout.clone())
         .collect::<Vec<_>>();
+    let r_b_layouts = descriptor
+        .slots()
+        .iter()
+        .map(|slot| slot.b_r_replay_rec_layout.clone())
+        .collect::<Vec<_>>();
+    let terminal_spec = split_io_spec(descriptor.link_shape().k_log, descriptor.slots());
+    let r_prev_layout = derive_link_r_prev_recording_layout(
+        &descriptor.link_shape(),
+        descriptor.link_pcs_params(),
+        &terminal_spec,
+        &block_params,
+        &rec_layouts,
+        &r_b_layouts,
+    )
+    .map_err(SelectedRecursiveClassRegistryError::Region)?;
     let canonical_link_vk = canonical_selected_link_region_sidecar_vk(
         descriptor.link_pcs_params(),
         &block_params,
         rec_layouts,
+        r_b_layouts,
+        r_prev_layout,
         wire.link_vk.leaf_slices,
         wire.link_vk.path_slices,
         wire.link_vk.rec_slices,
@@ -2398,9 +2493,11 @@ mod tests {
             &link_params,
             &block_params,
             fixture_rec_layouts(block_params.len()),
+            fixture_rec_layouts(block_params.len()),
+            crate::acceptance::trace::r_pcs_region::descriptor_preflight_r_prev_layout(),
             fixture_slices(14, 70),
             fixture_slices(15, 80),
-            fixture_slices(3, 90),
+            fixture_slices(5, 90),
         )
         .expect("canonical terminal Link VK");
         link_vk_wire(&vk).expect("compact canonical Link VK wire")

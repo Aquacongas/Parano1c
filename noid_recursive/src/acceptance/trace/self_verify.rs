@@ -24,7 +24,7 @@
 //! images — do not mix the two conventions.)
 
 use noid_ivc_core::field::PHI_8_TABLE;
-use noid_ivc_core::field_circuit::{f128_from_u128, FsChannelOps};
+use noid_ivc_core::field_circuit::{f128_from_u128, f128_to_u128, FsChannelOps};
 use noid_ivc_core::field_r1cs::FieldR1cs;
 use noid_ivc_core::merkle::{self, Hash};
 use noid_ivc_core::ntt::AdditiveNttF128;
@@ -2342,6 +2342,132 @@ fn verify_field_trace_inner(
     crate::acceptance::row_ledger_mark(b, &mut ledger, "R: PCS opening batch");
 
     R1csClaimTrace { ab, c }
+}
+
+// ---------------------------------------------------------------------------
+// Shape-only proof synthesis (recording-layout derivation)
+// ---------------------------------------------------------------------------
+
+/// Zero-valued `FieldR1csProof` of the exact class shape, PATH-FREE (the
+/// region-mode allocation).  It cannot verify; its only role is deriving the
+/// value-independent [R]-replay transcript SCHEDULE (the recorded op stream)
+/// when a recording layout is frozen before any real proof of the class
+/// exists.  Query positions start at zero — the layout-derivation driver
+/// patches them to the transcript-derived values between its two passes.
+pub(crate) fn shape_only_field_r1cs_proof(
+    shape: &noid_ivc_core::proof::FieldShape,
+    pcs_params: &PcsParams,
+) -> noid_ivc_core::proof::FieldR1csProof {
+    let log_msg_len = pcs_params.m - LOG_PACKING;
+    let log_batch_size = pcs_params.log_batch_size;
+    let log_dim = log_msg_len - log_batch_size;
+    let k_code = log_dim + pcs_params.log_inv_rate;
+    let arities = compute_fri_arities(log_dim);
+    let (num_fri_commits, tail_layout) = pcs::fri_commit_layout(k_code, &arities);
+    let arity_0 = arities.first().copied().unwrap_or(0);
+    let n_queries = default_fri_queries(pcs_params.log_dim(), pcs_params.log_inv_rate);
+
+    // The proof carries full-length zero Merkle paths: the path-free trace
+    // allocation still shape-checks the native path lengths (it only skips
+    // allocating wires for them).
+    let mut cum = arity_0;
+    let epoch_shapes: Vec<(usize, usize)> = (0..num_fri_commits)
+        .map(|i| {
+            let shape = (1usize << arities[i + 1], k_code - cum - arities[i + 1]);
+            cum += arities[i + 1];
+            shape
+        })
+        .collect();
+    let query = pcs::basefold::QueryOpening {
+        position: 0,
+        initial_leaf: vec![F128::ZERO; 1usize << log_batch_size],
+        initial_path: vec![[0u8; 32]; k_code],
+        post_row_batch_leaf: if arities.is_empty() {
+            Vec::new()
+        } else {
+            vec![F128::ZERO; 1usize << arity_0]
+        },
+        post_row_batch_path: if arities.is_empty() {
+            Vec::new()
+        } else {
+            vec![[0u8; 32]; k_code - arity_0]
+        },
+        epoch_leaves: epoch_shapes
+            .iter()
+            .map(|&(lanes, _)| vec![F128::ZERO; lanes])
+            .collect(),
+        epoch_paths: epoch_shapes
+            .iter()
+            .map(|&(_, depth)| vec![[0u8; 32]; depth])
+            .collect(),
+    };
+    noid_ivc_core::proof::FieldR1csProof {
+        zerocheck: zerocheck::ZerocheckProof {
+            round1_ab: vec![F128::ZERO; 1usize << K_SKIP],
+            round1_c: vec![F128::ZERO; 1usize << K_SKIP],
+            multilinear_rounds: vec![(F128::ZERO, F128::ZERO); shape.m - K_SKIP],
+            final_a_eval: F128::ZERO,
+            final_b_eval: F128::ZERO,
+            final_c_eval: F128::ZERO,
+        },
+        lincheck: noid_ivc_core::lincheck::LincheckProof {
+            rounds: vec![(F128::ZERO, F128::ZERO); shape.k_log - shape.k_skip],
+            z_partial: vec![F128::ZERO; 1usize << shape.k_skip],
+        },
+        pcs_open: pcs::BaseFoldProof {
+            round_messages: vec![
+                pcs::basefold::RoundMessage {
+                    u_0: F128::ZERO,
+                    u_2: F128::ZERO,
+                };
+                log_msg_len
+            ],
+            post_row_batch_commit: pcs::RoundCommitment { root: [0u8; 32] },
+            round_commitments: vec![pcs::RoundCommitment { root: [0u8; 32] }; num_fri_commits],
+            final_a: F128::ZERO,
+            final_b: F128::ZERO,
+            final_codeword: vec![F128::ZERO; 1usize << pcs_params.log_inv_rate],
+            plaintext_tail: match tail_layout {
+                Some((tail_len, _)) => vec![F128::ZERO; tail_len],
+                None => Vec::new(),
+            },
+            pow_nonce: 0,
+            queries: vec![query; n_queries],
+        },
+    }
+}
+
+/// Overwrite a shape-only proof's query positions with the transcript-derived
+/// values harvested from a first recording pass (see the layout-derivation
+/// drivers in `r_pcs_region`).  The final `div_ceil(n_queries, 128/k_code)`
+/// squeezed challenges of an [R]-replay recording are exactly the
+/// query-position lanes: the batched PCS opening is the replay's last channel
+/// consumer and nothing squeezes after the query draw.
+pub(crate) fn patch_shape_only_query_positions(
+    proof: &mut noid_ivc_core::proof::FieldR1csProof,
+    pcs_params: &PcsParams,
+    query_lane_values: &[F128],
+) {
+    let log_msg_len = pcs_params.m - LOG_PACKING;
+    let log_dim = log_msg_len - pcs_params.log_batch_size;
+    let k_code = log_dim + pcs_params.log_inv_rate;
+    let per_lane = 128 / k_code;
+    let n_queries = proof.pcs_open.queries.len();
+    assert_eq!(
+        query_lane_values.len(),
+        n_queries.div_ceil(per_lane),
+        "query-lane harvest count"
+    );
+    let mask = (1u128 << k_code) - 1;
+    let mut query = 0usize;
+    for lane in query_lane_values {
+        let raw = f128_to_u128(*lane);
+        for w in 0..per_lane.min(n_queries - query) {
+            proof.pcs_open.queries[query].position = ((raw >> (w * k_code)) & mask) as usize;
+            query += 1;
+        }
+    }
+    assert_eq!(query, n_queries, "query position patch count");
 }
 
 // ---------------------------------------------------------------------------

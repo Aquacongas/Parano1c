@@ -1445,7 +1445,11 @@ fn accepted_sequential_chain_fixture(
             .wrapping_add(0x3000_0000)
             .wrapping_add(block_index as u128);
         let miner_secret = mk_secret(miner_secret_seed);
-        let template = noid_chain::consensus::build_block_template(
+        // The canonical-chain fixture simulates a FULLY PROVEN history: every
+        // block attests coverage up to its parent (the value a live prover
+        // ladder supplies), so coinbase spends mature exactly as they would
+        // on a healthy production chain instead of being template-gated.
+        let template = noid_chain::consensus::build_block_template_with_coverage(
             &parent,
             &state,
             consensus.active_counts(),
@@ -1456,6 +1460,7 @@ fn accepted_sequential_chain_fixture(
             derive_address(&miner_secret),
             timestamp,
             target,
+            parent.height.max(parent.attested_coverage),
         )
         .expect("four-tier canonical block template");
         assert_eq!(

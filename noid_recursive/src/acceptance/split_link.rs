@@ -53,7 +53,9 @@ use std::sync::Arc;
 use noid_chain::BlockHeader;
 use noid_ivc_core::challenger::{Challenger, FsLaneChallenger};
 use noid_ivc_core::field::F128;
-use noid_ivc_core::field_circuit::{FieldR1csBuilder, FsChannelTrace, LinExpr};
+use noid_ivc_core::field_circuit::{
+    FieldR1csBuilder, FsChannelTrace, FsChannelUnionRecorder, LinExpr,
+};
 use noid_ivc_core::field_r1cs::{FieldR1cs, SparseFieldMatrix};
 use noid_ivc_core::matrix_claim::{
     prove_matrix_claim_fold, stacked_matrix_mle_eval, FreshLincheckClaim, MatrixAccClaim,
@@ -76,9 +78,12 @@ use super::trace::matrix_fold::{
     verify_matrix_claim_fold_trace, MatrixAccClaimTrace, MatrixFoldProofTrace,
 };
 use super::trace::r_pcs_region::{
-    finalize_r_pcs_link_region, prepare_r_pcs_link_columns_universal,
-    prepare_r_pcs_link_genesis_ghost, RPcsLinkRegionPreparation, RPcsLinkUniversalGeometry,
-    RPcsProof,
+    derive_link_r_b_recording_layout, derive_link_r_prev_recording_layout,
+    descriptor_preflight_r_prev_layout, finalize_r_pcs_link_region,
+    prepare_r_pcs_link_columns_universal, prepare_r_pcs_link_genesis_ghost,
+    scratch_record_split_r_b, scratch_record_split_r_prev, LinkLiveRecordings,
+    RPcsLinkRegionPreparation, RPcsLinkUniversalGeometry, RPcsProof, SplitRBChannelInputs,
+    SplitRPrevChannelInputs, R_B_CHANNEL_DOMAIN, R_PREV_CHANNEL_DOMAIN,
 };
 use super::trace::self_verify::{
     alloc_flat_digest, flat_digest_lanes, lagrange_weights_window_trace,
@@ -91,7 +96,7 @@ use crate::accumulator::{genesis_accumulator, ChainAccumulator, ChainAccumulator
 use crate::region_sidecar::{
     decode_block_region_sidecar_bounded, decode_link_region_sidecar_bounded,
     derive_block_sidecar_recording_layout, link_post_commit_class_digest,
-    scratch_record_block_sidecar_child, selected_zk_block_post_commit_class_digest_from_vk_digest,
+    selected_zk_block_post_commit_class_digest_from_vk_digest,
     verify_block_region_sidecar_post_commit, verify_block_region_sidecar_post_commit_captured,
     verify_block_region_sidecar_recorded_trace_post_commit, BlockSidecarChildTranscript,
     LinkRegionProverPlan, LinkRegionSidecarProof, LinkRegionSidecarVk, RegionSidecarError,
@@ -139,13 +144,17 @@ pub struct LadderSlotInfo {
     /// slot.  A protocol constant of the tier, derived (never persisted) by
     /// replaying the recorded verifier schedule against a shape-only proof.
     pub b_sidecar_rec_layout: DuplexLayout,
+    /// Canonical recorded `[R]_B` outer-channel layout of this slot's class
+    /// — the walk L-C block carrying the block replay's complete Fiat-Shamir
+    /// transcript.  Derived (never persisted) exactly like the child layout.
+    pub b_r_replay_rec_layout: DuplexLayout,
 }
 
 /// Frozen production Field dimensions for the four consensus Block classes.
 pub const CANONICAL_BLOCK_CLASS_MS: [usize;
     noid_chain::consensus::params::USER_TX_CLASS_TIERS.len()] = [22, 23, 23, 24];
 /// Frozen production Field dimension shared by every Link class.
-pub const CANONICAL_LINK_CLASS_M: usize = 23;
+pub const CANONICAL_LINK_CLASS_M: usize = 22;
 /// Frozen production BaseFold inverse-rate logarithm.
 pub const CANONICAL_PCS_LOG_INV_RATE: usize = 2;
 /// Frozen production BaseFold row-batch logarithm.
@@ -557,8 +566,23 @@ impl CanonicalSplitLinkLadder {
             .iter()
             .map(|slot| slot.b_sidecar_rec_layout.clone())
             .collect::<Vec<_>>();
-        RPcsLinkUniversalGeometry::new(&link_pcs_params, &block_params, n_queries, rec_layouts)
-            .map_err(|_| CanonicalLadderError::UnsupportedUniversalPcs)?;
+        let r_b_layouts = slots
+            .iter()
+            .map(|slot| slot.b_r_replay_rec_layout.clone())
+            .collect::<Vec<_>>();
+        // Descriptor-level preflight only: the carrier topology is validated
+        // around a stand-in `[R]_prev` block (the real layout is a heavier
+        // derived constant that every class-materialization boundary derives
+        // and validates itself — the group checks here do not depend on it).
+        RPcsLinkUniversalGeometry::new(
+            &link_pcs_params,
+            &block_params,
+            n_queries,
+            rec_layouts,
+            r_b_layouts,
+            descriptor_preflight_r_prev_layout(),
+        )
+        .map_err(|_| CanonicalLadderError::UnsupportedUniversalPcs)?;
 
         Ok(Self {
             link_shape,
@@ -585,6 +609,15 @@ impl CanonicalSplitLinkLadder {
                 block_class.shape.m,
             )
             .map_err(|_| CanonicalLadderError::BlockClassSidecarVk { slot })?;
+            let b_r_replay_rec_layout = derive_link_r_b_recording_layout(
+                &block_class.shape,
+                &block_class.spec,
+                &block_class.pcs_params,
+                &b_digest,
+                block_class.post_commit_class_digest(),
+                block_class.sidecar_vk(),
+            )
+            .map_err(|_| CanonicalLadderError::BlockClassSidecarVk { slot })?;
             slots.push(LadderSlotInfo {
                 tier: block_class.tier(),
                 b_shape: block_class.shape,
@@ -593,6 +626,7 @@ impl CanonicalSplitLinkLadder {
                 b_post_commit_class_digest: *block_class.post_commit_class_digest(),
                 b_sidecar_vk_digest: block_class.sidecar_vk().transcript_digest(),
                 b_sidecar_rec_layout,
+                b_r_replay_rec_layout,
             });
         }
         Self::try_new(link_shape, link_pcs_params, slots)
@@ -888,6 +922,7 @@ fn same_ladder(left: &[LadderSlotInfo], right: &[LadderSlotInfo]) -> bool {
                 && left.b_post_commit_class_digest == right.b_post_commit_class_digest
                 && left.b_sidecar_vk_digest == right.b_sidecar_vk_digest
                 && left.b_sidecar_rec_layout == right.b_sidecar_rec_layout
+                && left.b_r_replay_rec_layout == right.b_r_replay_rec_layout
         })
 }
 
@@ -1443,11 +1478,31 @@ impl SplitLinkClass {
             .iter()
             .map(|slot| slot.b_sidecar_rec_layout.clone())
             .collect::<Vec<_>>();
+        let r_b_layouts = descriptor
+            .slots()
+            .iter()
+            .map(|slot| slot.b_r_replay_rec_layout.clone())
+            .collect::<Vec<_>>();
         let n_queries =
             noid_ivc_core::pcs::default_fri_queries(pcs_params.log_dim(), pcs_params.log_inv_rate);
-        let universal_geometry =
-            RPcsLinkUniversalGeometry::new(&pcs_params, &block_params, n_queries, rec_layouts)
-                .map_err(|_| LinkProofError::ClassIdentityMismatch)?;
+        let r_prev_layout = derive_link_r_prev_recording_layout(
+            &shape,
+            &pcs_params,
+            &spec,
+            &block_params,
+            &rec_layouts,
+            &r_b_layouts,
+        )
+        .map_err(|_| LinkProofError::ClassIdentityMismatch)?;
+        let universal_geometry = RPcsLinkUniversalGeometry::new(
+            &pcs_params,
+            &block_params,
+            n_queries,
+            rec_layouts,
+            r_b_layouts,
+            r_prev_layout,
+        )
+        .map_err(|_| LinkProofError::ClassIdentityMismatch)?;
 
         let class_statement_digest = std::sync::OnceLock::new();
         class_statement_digest
@@ -1605,6 +1660,10 @@ impl SplitLinkClass {
             .iter()
             .map(|slot| slot.b_sidecar_rec_layout.clone())
             .collect::<Vec<_>>();
+        let r_b_layouts = ladder
+            .iter()
+            .map(|slot| slot.b_r_replay_rec_layout.clone())
+            .collect::<Vec<_>>();
         assert_eq!(
             ladder[slot].b_sidecar_rec_layout,
             derive_block_sidecar_recording_layout(
@@ -1614,12 +1673,40 @@ impl SplitLinkClass {
             .expect("hosted block class recording layout"),
             "slot recording layout vs block class"
         );
+        assert_eq!(
+            ladder[slot].b_r_replay_rec_layout,
+            derive_link_r_b_recording_layout(
+                &block_class.shape,
+                &block_class.spec,
+                &block_class.pcs_params,
+                &b_digest,
+                block_class.post_commit_class_digest(),
+                block_class.sidecar_vk(),
+            )
+            .expect("hosted block class [R]_B recording layout"),
+            "slot [R]_B recording layout vs block class"
+        );
         let n_queries =
             noid_ivc_core::pcs::default_fri_queries(pcs_params.log_dim(), pcs_params.log_inv_rate);
-        let universal_geometry =
-            RPcsLinkUniversalGeometry::new(&pcs_params, &block_params, n_queries, rec_layouts)
-                .expect("link/block ladder must share one frozen query count");
         let spec = split_io_spec(shape.k_log, &ladder);
+        let r_prev_layout = derive_link_r_prev_recording_layout(
+            &shape,
+            &pcs_params,
+            &spec,
+            &block_params,
+            &rec_layouts,
+            &r_b_layouts,
+        )
+        .expect("universal [R]_prev recording layout");
+        let universal_geometry = RPcsLinkUniversalGeometry::new(
+            &pcs_params,
+            &block_params,
+            n_queries,
+            rec_layouts,
+            r_b_layouts,
+            r_prev_layout,
+        )
+        .expect("link/block ladder must share one frozen query count");
         let class = Self {
             shape,
             pcs_params: pcs_params.clone(),
@@ -2792,25 +2879,71 @@ fn assemble_prepared_split_link(prepared: PreparedSplitLink<'_>) -> BuiltSplitLi
     // columns' slices — hence the class's opening-claim spec — must be
     // identical across every link class of the ladder, so nothing
     // class-specific (envelope sizes differ per slot!) may precede them.
-    // The block-sidecar child transcript is deterministic in the (already
-    // natively verified) block proof and the captured seed; replay it once
-    // on a throwaway builder so its committed recording block can be
-    // allocated with the other universal walk columns.
-    let rec_scratch = scratch_record_block_sidecar_child(
+    // All three recorded transcripts are deterministic in the (already
+    // natively verified) input proofs; replay each once on a throwaway
+    // builder so its committed recording block can be allocated with the
+    // other universal walk columns.
+    let (w_d_value, w_post_commit_value) = if input.genesis {
+        (
+            flat_digest_lanes(&class.genesis_digest),
+            flat_digest_lanes(
+                class
+                    .genesis_post_commit_class_digest
+                    .get()
+                    .expect("frozen genesis post-commit identity"),
+            ),
+        )
+    } else {
+        (
+            flat_digest_lanes(&input.link_class_digests[input.prev_slot]),
+            flat_digest_lanes(&input.link_post_commit_class_digests[input.prev_slot]),
+        )
+    };
+    let r_prev_scratch = scratch_record_split_r_prev(&SplitRPrevChannelInputs {
+        shape: &class.shape,
+        pcs_params: &class.pcs_params,
+        spec: &class.spec,
+        w_d: w_d_value,
+        w_post_commit: w_post_commit_value,
+        commitment_root: flat_digest_lanes(&input.prev.commitment().root),
+        io: input.prev.io(),
+        proof: input.prev.field_proof(),
+        sidecar_vk: class.sidecar_vk(),
+        sidecar: input.prev.region_sidecar(),
+    })
+    .expect("recorded [R]_prev channel transcript");
+    let (r_b_scratch, rec_scratch) = scratch_record_split_r_b(&SplitRBChannelInputs {
+        b_shape: &b_shape,
+        b_pcs_params: &class.b_pcs_params,
+        b_spec: &class.b_spec,
+        b_digest: &class.ladder[slot].b_digest,
+        b_post_commit: &class.b_post_commit_class_digest,
+        commitment_root: flat_digest_lanes(&input.block.commitment().root),
+        io: input.block.io(),
+        proof: input.block.field_proof(),
         b_sidecar_vk,
-        input.block.region_sidecar(),
-        b_shape.m,
-        block_child.seed,
-    )
-    .expect("recorded block-sidecar child transcript");
+        sidecar: input.block.region_sidecar(),
+    })
+    .expect("recorded [R]_B channel transcript");
+    // Native/trace seed lockstep: the child chain's seed is the first data
+    // lane of the child recording and must equal the natively captured one.
+    assert_eq!(
+        rec_scratch.data_flat.first().copied(),
+        Some(block_child.seed),
+        "block-sidecar child seed diverged from the native capture"
+    );
     let r_cols = prepare_r_pcs_link_columns_universal(
         &mut b,
         &r_pcs_proofs,
         &class.universal_geometry,
         &[0, slot + 1],
-        Some(&rec_scratch),
+        LinkLiveRecordings {
+            child: Some(&rec_scratch),
+            r_b: Some(&r_b_scratch),
+            r_prev: Some(&r_prev_scratch),
+        },
     )
-    .expect("universal recording-free link columns");
+    .expect("universal recording link columns");
     crate::acceptance::row_ledger_mark(&b, &mut ledger, "split: walk columns");
 
     // Envelope wires: the previous link, then the block proof.
@@ -2910,10 +3043,14 @@ fn assemble_prepared_split_link(prepared: PreparedSplitLink<'_>) -> BuiltSplitLi
         acc
     });
 
-    // ---- [R]_prev: the deferred replay of the previous link's proof,
-    // in REGION mode — its PCS hashing lands on the link walks below.
+    // ---- [R]_prev: the deferred replay of the previous link's proof, in
+    // REGION mode — its PCS hashing lands on the link walks below and its
+    // COMPLETE Fiat-Shamir transcript (statement/IO binds, the previous
+    // link's full sidecar verify, zerocheck/lincheck, the batched PCS
+    // opening) is RECORDED into walk L-C instead of replayed as inline
+    // sponge permutations.  Only the verifier algebra stays in-trace.
     let mut obs_prev = PcsWalkObligations::default();
-    let mut ch = FsChannelTrace::new(&mut b, b"history-link-v0");
+    let mut ch = FsChannelUnionRecorder::new(R_PREV_CHANNEL_DOMAIN);
     let (_pce, fresh_link_e) = verify_field_trace_deferred_region_with_post_commit_context_expr(
         &mut b,
         &mut ch,
@@ -2936,14 +3073,15 @@ fn assemble_prepared_split_link(prepared: PreparedSplitLink<'_>) -> BuiltSplitLi
             .expect("previous link sidecar trace shape")
         },
     );
+    let recorded_r_prev = ch.finish();
     crate::acceptance::row_ledger_mark(&b, &mut ledger, "split: [R]_prev replay");
 
     // ---- [R]_B: the deferred replay of the block proof, against the
-    // BAKED block-class digest.
+    // BAKED block-class digest — same recording discipline.
     let d_b = flat_digest_lanes(&class.ladder[slot].b_digest);
     let w_b: FlatDigestExpr = [LinExpr::constant(d_b[0]), LinExpr::constant(d_b[1])];
     let mut obs_block = PcsWalkObligations::default();
-    let mut chb = FsChannelTrace::new(&mut b, b"history-block-v0");
+    let mut chb = FsChannelUnionRecorder::new(R_B_CHANNEL_DOMAIN);
     let mut recorded_child = None;
     let (_bce, fresh_block_e) = verify_field_trace_deferred_region_with_post_commit_context(
         &mut b,
@@ -2969,6 +3107,7 @@ fn assemble_prepared_split_link(prepared: PreparedSplitLink<'_>) -> BuiltSplitLi
         },
     );
     let recorded_child = recorded_child.expect("recorded block-sidecar child transcript");
+    let recorded_r_b = chb.finish();
     crate::acceptance::row_ledger_mark(&b, &mut ledger, "split: [R]_B replay");
 
     // ---- Genesis arm: the fresh [R]_prev claim equals T's baked
@@ -3108,8 +3247,10 @@ fn assemble_prepared_split_link(prepared: PreparedSplitLink<'_>) -> BuiltSplitLi
         r_cols,
         &[&obs_prev, &obs_block],
         &recorded_child,
+        &recorded_r_b,
+        &recorded_r_prev,
     )
-    .expect("recording-free link semantic binding");
+    .expect("recording link semantic binding");
     assert_eq!(
         region_preparation.vk(),
         class.sidecar_vk(),
@@ -3714,6 +3855,7 @@ mod tests {
             b_post_commit_class_digest: [tier.wrapping_add(1) as u8; 32],
             b_sidecar_vk_digest: [tier.wrapping_add(2) as u8; 32],
             b_sidecar_rec_layout: ladder_test_rec_layout(),
+            b_r_replay_rec_layout: ladder_test_rec_layout(),
         })
         .collect()
     }
