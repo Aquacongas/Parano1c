@@ -89,7 +89,9 @@ fn main() {
     // Streamed decider path (default policy): one preflight scan at open plus
     // one authenticated evaluation scan.
     let t = Instant::now();
-    let mut streamed = source.open_artifact_evaluator(identity).expect("streamed open");
+    let mut streamed = source
+        .open_artifact_evaluator(identity)
+        .expect("streamed open");
     let open_s = t.elapsed().as_secs_f64();
     let t = Instant::now();
     let evaluated = streamed
@@ -109,7 +111,9 @@ fn main() {
     source.set_resident_evaluation(true);
     source.set_artifact_trust(false);
     let t = Instant::now();
-    let mut resident = source.open_artifact_evaluator(identity).expect("resident open");
+    let mut resident = source
+        .open_artifact_evaluator(identity)
+        .expect("resident open");
     let open_s = t.elapsed().as_secs_f64();
     let t = Instant::now();
     let evaluated = resident

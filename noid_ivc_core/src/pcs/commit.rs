@@ -320,38 +320,21 @@ fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, 
     )
 }
 
-/// Tag the current thread as background QoS. On macOS the scheduler then
-/// strongly prefers efficiency (E) cores — ideal for the fault/bandwidth-bound
-/// codeword pre-fault, which we want OFF the performance cores running witness
-/// generation. No-op on other platforms.
-#[cfg(target_os = "macos")]
-fn set_background_qos() {
-    // QOS_CLASS_BACKGROUND = 0x09. Declared inline to avoid a libc dependency.
-    unsafe extern "C" {
-        fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
-    }
-    unsafe {
-        let _ = pthread_set_qos_class_self_np(0x09, 0);
-    }
-}
-#[cfg(not(target_os = "macos"))]
-fn set_background_qos() {}
-
 /// Allocate + zero-fill (pre-fault) the codeword buffer that [`commit_into`]
-/// will consume, on a background-QoS (E-core) thread, **while** `gen` runs on
-/// the caller's performance threads. Returns `(Some(buf), gen_result)`.
+/// will consume while `gen` runs on another worker from the caller's current
+/// Rayon pool. Returns `(Some(buf), gen_result)`.
 ///
 /// The codeword alloc is page-fault-bound (first-touch of a fresh 64–512 MB
 /// buffer) and scales ~1.0×, so overlapping it with witness generation hides it
 /// almost entirely (measured ~99% at m=29 — see `benches/ecore_offload_probe`).
 ///
-/// **Gated for honest single-threaded behavior:** when the rayon pool has ≤ 1
-/// thread (i.e. `RAYON_NUM_THREADS=1`), this spawns **zero** OS threads — it
-/// runs `gen` and returns `None`, leaving [`commit`] to allocate inline. The
-/// whole offload is therefore invisible to truly-serial runs.
-pub fn prefault_codeword_during<R>(
+/// Using `rayon::join` is part of the process CPU admission contract: every
+/// cold concurrent proof shares the same fixed worker budget instead of each
+/// spawning an unaccounted OS thread. With a one-worker pool the buffer is
+/// allocated inline by [`commit`], preserving genuinely serial execution.
+pub fn prefault_codeword_during<R: Send>(
     params: &PcsParams,
-    generate: impl FnOnce() -> R,
+    generate: impl FnOnce() -> R + Send,
 ) -> (Option<Vec<F128>>, R) {
     if rayon::current_num_threads() <= 1 || std::env::var_os("NOIDH_NO_PREFAULT").is_some() {
         // Truly single-threaded (or explicitly disabled): no extra OS thread;
@@ -365,21 +348,20 @@ pub fn prefault_codeword_during<R>(
     if let Some(buf) = crate::scratch::try_take_f128(codeword_len) {
         return (Some(buf), generate());
     }
-    // Cold path: allocate + first-touch on a background-QoS thread, hidden
-    // under witness generation. (commit_into rewrites all slots, so the
-    // zero values themselves don't matter — the page faults do.)
-    std::thread::scope(|s| {
-        let h = s.spawn(move || {
-            set_background_qos();
+    // Cold path: allocate + first-touch on one admitted Rayon worker while
+    // another runs witness generation. `commit_into` rewrites every slot, so
+    // only the page residency matters here.
+    let (buf, result) = rayon::join(
+        || {
             let mut buf: Vec<F128> = crate::alloc_uninit_f128_vec(codeword_len);
             unsafe {
                 std::ptr::write_bytes(buf.as_mut_ptr(), 0u8, codeword_len);
             }
             buf
-        });
-        let r = generate();
-        (Some(h.join().unwrap()), r)
-    })
+        },
+        generate,
+    );
+    (Some(buf), result)
 }
 
 #[cfg(test)]

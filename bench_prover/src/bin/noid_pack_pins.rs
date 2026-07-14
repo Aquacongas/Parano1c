@@ -35,8 +35,8 @@ fn main() {
         let leaf = std::path::Path::new(&root)
             .join(selected_recursive_matrix_relative_path(kind))
             .with_extension("field-r1cs.zst");
-        let bytes = std::fs::read(&leaf)
-            .unwrap_or_else(|error| panic!("read {}: {error}", leaf.display()));
+        let bytes =
+            std::fs::read(&leaf).unwrap_or_else(|error| panic!("read {}: {error}", leaf.display()));
         let digest =
             noid_poseidon2b::native::poseidon2b_hash_byte_slices(PACK_LEAF_HASH_DOMAIN, &[&bytes]);
         let encoded = hex::encode(digest);

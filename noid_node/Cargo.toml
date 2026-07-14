@@ -24,6 +24,7 @@ noid_gkr        = { path = "../noid_gkr" }
 noid_core       = { path = "../noid_core" }
 noid_mempool    = { path = "../noid_mempool" }
 noid_miner      = { path = "../noid_miner" }
+noid-ivc-core   = { path = "../noid_ivc_core" }
 noid_p2p        = { path = "../noid_p2p" }
 noid_rpc        = { path = "../noid_rpc" }
 
@@ -65,3 +66,9 @@ tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
 [dev-dependencies]
 tempfile = "3"
 static_assertions = "1.1"
+
+[build-dependencies]
+noid_poseidon2b = { path = "../noid_poseidon2b" }
+noid_recursive  = { path = "../noid_recursive" }
+noid-ivc-core   = { path = "../noid_ivc_core" }
+zstd            = "0.13"

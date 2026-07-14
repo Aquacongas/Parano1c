@@ -47,7 +47,7 @@ pub mod source_tree;
 pub mod spine;
 
 use crate::challenger::Challenger;
-use crate::field::F128;
+use crate::field::{F128, F256Unreduced};
 use crate::lincheck::build_eq_table;
 use noid_core::hardware::tower_to_flat_u128;
 use noid_poseidon2b::native::permutation::{
@@ -77,6 +77,19 @@ pub fn sbox7(x: F128) -> F128 {
     x * x2 * x4
 }
 
+#[inline]
+fn sbox7_lanes(x: [F128; STATE_SIZE]) -> [F128; STATE_SIZE] {
+    let [x20, x21] = mul_pair(x[0], x[0], x[1], x[1]);
+    let [x22, x23] = mul_pair(x[2], x[2], x[3], x[3]);
+    let [x40, x41] = mul_pair(x20, x20, x21, x21);
+    let [x42, x43] = mul_pair(x22, x22, x23, x23);
+    let [x30, x31] = mul_pair(x[0], x20, x[1], x21);
+    let [x32, x33] = mul_pair(x[2], x22, x[3], x23);
+    let [y0, y1] = mul_pair(x30, x40, x31, x41);
+    let [y2, y3] = mul_pair(x32, x42, x33, x43);
+    [y0, y1, y2, y3]
+}
+
 /// Round schedule in the flat basis (converted once from the tower-basis
 /// protocol constants, exactly as the native permutation does internally).
 struct FlatSchedule {
@@ -98,6 +111,28 @@ fn schedule() -> &'static FlatSchedule {
             for j in 0..STATE_SIZE {
                 mds_full[i][j] = f128_of_u128(tower_to_flat_u128(MDS_FULL[i][j]));
                 mds_partial[i][j] = f128_of_u128(tower_to_flat_u128(MDS_PARTIAL[i][j]));
+            }
+        }
+        // The hot MDS kernels below elide exactly these protocol-fixed
+        // identity products.  Validate the sparse layout once in every build
+        // (not merely under debug assertions), so any future constant drift
+        // fails before a proof can be authored with the wrong linear layer.
+        for (row, column) in [(0, 2), (1, 2), (1, 3), (2, 0), (3, 0), (3, 1)] {
+            assert_eq!(
+                mds_full[row][column],
+                F128::ONE,
+                "full MDS identity layout drift at ({row}, {column})"
+            );
+        }
+        for (row, coefficients) in mds_partial.iter().enumerate() {
+            for (column, &coefficient) in coefficients.iter().enumerate() {
+                if row != column {
+                    assert_eq!(
+                        coefficient,
+                        F128::ONE,
+                        "partial MDS identity layout drift at ({row}, {column})"
+                    );
+                }
             }
         }
         FlatSchedule {
@@ -133,33 +168,61 @@ pub fn flat_mds(full: bool) -> &'static [[F128; STATE_SIZE]; STATE_SIZE] {
 /// fold it into the layer-0 columns (it is linear, so chain-wiring
 /// relations compose with it for free).
 pub fn initial_mds(raw: [F128; STATE_SIZE]) -> [F128; STATE_SIZE] {
-    mds_apply(&schedule().mds_full, raw)
+    mds_apply_full(&schedule().mds_full, raw)
 }
 
+/// Apply the frozen full-round MDS while eliding its six identity
+/// coefficients.  Products stay unreduced until the four row sums, exactly
+/// like the dense kernel; reduction is linear, so replacing `1 * x` by `x`
+/// cannot change a field value (and therefore cannot change a proof byte).
 #[inline]
-fn mds_apply(
+fn mds_apply_full(
     mds: &[[F128; STATE_SIZE]; STATE_SIZE],
     input: [F128; STATE_SIZE],
 ) -> [F128; STATE_SIZE] {
-    std::array::from_fn(|i| {
-        let mut acc = F128::ZERO;
-        for j in 0..STATE_SIZE {
-            acc += mds[i][j] * input[j];
-        }
-        acc
-    })
+    let [p00, p10] = mul_unreduced_pair(mds[0][0], input[0], mds[1][0], input[0]);
+    let [p01, p11] = mul_unreduced_pair(mds[0][1], input[1], mds[1][1], input[1]);
+    let [p03, p21] = mul_unreduced_pair(mds[0][3], input[3], mds[2][1], input[1]);
+    let [p22, p32] = mul_unreduced_pair(mds[2][2], input[2], mds[3][2], input[2]);
+    let [p23, p33] = mul_unreduced_pair(mds[2][3], input[3], mds[3][3], input[3]);
+    [
+        (p00 ^ p01 ^ p03).reduce() + input[2],
+        (p10 ^ p11).reduce() + input[2] + input[3],
+        (p21 ^ p22 ^ p23).reduce() + input[0],
+        (p32 ^ p33).reduce() + input[0] + input[1],
+    ]
+}
+
+/// The partial-round matrix has four non-trivial diagonal coefficients and
+/// twelve identity coefficients.  With `sum = x0 + x1 + x2 + x3`, row `i`
+/// is `diag_i * x_i + sum + x_i`; this is the exact dense 4x4 product in
+/// characteristic two, using four multiplications instead of sixteen.
+#[inline]
+fn mds_apply_partial(
+    mds: &[[F128; STATE_SIZE]; STATE_SIZE],
+    input: [F128; STATE_SIZE],
+) -> [F128; STATE_SIZE] {
+    let sum = input[0] + input[1] + input[2] + input[3];
+    let [p0, p1] = mul_pair(mds[0][0], input[0], mds[1][1], input[1]);
+    let [p2, p3] = mul_pair(mds[2][2], input[2], mds[3][3], input[3]);
+    [
+        p0 + sum + input[0],
+        p1 + sum + input[1],
+        p2 + sum + input[2],
+        p3 + sum + input[3],
+    ]
 }
 
 /// Apply round `q` to one slot's state (mirrors the native round order).
 pub fn apply_round(q: usize, state: [F128; STATE_SIZE]) -> [F128; STATE_SIZE] {
     let sch = schedule();
     if is_full_round(q) {
-        let boxed = std::array::from_fn(|i| sbox7(state[i] + sch.rc[i][q]));
-        mds_apply(&sch.mds_full, boxed)
+        let boxed = sbox7_lanes(std::array::from_fn(|i| state[i] + sch.rc[i][q]));
+        mds_apply_full(&sch.mds_full, boxed)
     } else {
         let mut boxed = state;
         boxed[0] = sbox7(state[0] + sch.rc[0][q]);
-        mds_apply(&sch.mds_partial, boxed)
+        mds_apply_partial(&sch.mds_partial, boxed)
     }
 }
 
@@ -340,11 +403,9 @@ fn column_weights(q: usize, lane_weights: &[F128; STATE_SIZE]) -> [F128; STATE_S
         &sch.mds_partial
     };
     std::array::from_fn(|j| {
-        let mut acc = F128::ZERO;
-        for i in 0..STATE_SIZE {
-            acc += lane_weights[i] * mds[i][j];
-        }
-        acc
+        let [p0, p1] = mul_unreduced_pair(lane_weights[0], mds[0][j], lane_weights[1], mds[1][j]);
+        let [p2, p3] = mul_unreduced_pair(lane_weights[2], mds[2][j], lane_weights[3], mds[3][j]);
+        (p0 ^ p1 ^ p2 ^ p3).reduce()
     })
 }
 
@@ -384,15 +445,128 @@ fn accumulate_lane_tables(
         });
 }
 
+/// Row-major twin of [`accumulate_lane_tables`] for the ragged Link walk.
+/// Keeping all four lanes adjacent lets both field products and subsequent
+/// folds use the two-lane VPCLMUL path without transposing every round.
+fn accumulate_lane_rows(
+    rows: &mut [[F128; STATE_SIZE]],
+    eq: &[F128],
+    columns: &[F128; STATE_SIZE],
+) {
+    const CHUNK: usize = 4096;
+    rows.par_chunks_mut(CHUNK)
+        .zip(eq.par_chunks(CHUNK))
+        .for_each(|(row_chunk, eq_chunk)| {
+            for (row, &e) in row_chunk.iter_mut().zip(eq_chunk) {
+                let [p0, p1] = mul_pair(columns[0], e, columns[1], e);
+                let [p2, p3] = mul_pair(columns[2], e, columns[3], e);
+                row[0] += p0;
+                row[1] += p1;
+                row[2] += p2;
+                row[3] += p3;
+            }
+        });
+}
+
 /// `term_j` of the layer relation applied to next-layer lane values.
 fn layer_terms(q: usize, u: &[F128; STATE_SIZE]) -> [F128; STATE_SIZE] {
     let sch = schedule();
     if is_full_round(q) {
-        std::array::from_fn(|j| sbox7(u[j] + sch.rc[j][q]))
+        sbox7_lanes(std::array::from_fn(|j| u[j] + sch.rc[j][q]))
     } else {
         let mut t = *u;
         t[0] = sbox7(u[0] + sch.rc[0][q]);
         t
+    }
+}
+
+/// Two independent unreduced GF(2^128) products. On the production x86
+/// target VPCLMULQDQ executes both 128-bit lanes per instruction; the scalar
+/// fallback preserves portability and the exact unreduced bit layout.
+#[inline]
+fn mul_unreduced_pair(a0: F128, b0: F128, a1: F128, b1: F128) -> [F256Unreduced; 2] {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx2",
+        target_feature = "vpclmulqdq"
+    ))]
+    {
+        // SAFETY: both required target features are enabled statically.
+        unsafe { mul_unreduced_pair_vpclmul(a0, b0, a1, b1) }
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx2",
+        target_feature = "vpclmulqdq"
+    )))]
+    {
+        [a0.mul_unreduced(b0), a1.mul_unreduced(b1)]
+    }
+}
+
+#[inline]
+fn mul_pair(a0: F128, b0: F128, a1: F128, b1: F128) -> [F128; 2] {
+    mul_unreduced_pair(a0, b0, a1, b1).map(F256Unreduced::reduce)
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "vpclmulqdq"
+))]
+#[target_feature(enable = "avx2", enable = "vpclmulqdq")]
+unsafe fn mul_unreduced_pair_vpclmul(a0: F128, b0: F128, a1: F128, b1: F128) -> [F256Unreduced; 2] {
+    use core::arch::x86_64::*;
+
+    #[inline]
+    unsafe fn lane(v: __m256i, high: bool) -> __m128i {
+        if high {
+            // SAFETY: inherited AVX2 target feature.
+            unsafe { _mm256_extracti128_si256::<1>(v) }
+        } else {
+            // SAFETY: inherited AVX2 target feature.
+            unsafe { _mm256_castsi256_si128(v) }
+        }
+    }
+
+    #[inline]
+    unsafe fn unpack(ll: __m128i, cross: __m128i, hh: __m128i) -> F256Unreduced {
+        // SAFETY: inherited SSE4.1 support from AVX2.
+        unsafe {
+            F256Unreduced {
+                r0: _mm_extract_epi64::<0>(ll) as u64,
+                r1: (_mm_extract_epi64::<1>(ll) as u64) ^ (_mm_extract_epi64::<0>(cross) as u64),
+                r2: (_mm_extract_epi64::<0>(hh) as u64) ^ (_mm_extract_epi64::<1>(cross) as u64),
+                r3: _mm_extract_epi64::<1>(hh) as u64,
+            }
+        }
+    }
+
+    // SAFETY: function carries AVX2 + VPCLMULQDQ and all values are plain
+    // integer vectors. Lane 0 is product 0; lane 1 is product 1.
+    unsafe {
+        let va0 = _mm_set_epi64x(a0.hi as i64, a0.lo as i64);
+        let va1 = _mm_set_epi64x(a1.hi as i64, a1.lo as i64);
+        let vb0 = _mm_set_epi64x(b0.hi as i64, b0.lo as i64);
+        let vb1 = _mm_set_epi64x(b1.hi as i64, b1.lo as i64);
+        let va = _mm256_set_m128i(va1, va0);
+        let vb = _mm256_set_m128i(vb1, vb0);
+        let va_cross = _mm256_set_m128i(
+            _mm_set_epi64x(0, (a1.lo ^ a1.hi) as i64),
+            _mm_set_epi64x(0, (a0.lo ^ a0.hi) as i64),
+        );
+        let vb_cross = _mm256_set_m128i(
+            _mm_set_epi64x(0, (b1.lo ^ b1.hi) as i64),
+            _mm_set_epi64x(0, (b0.lo ^ b0.hi) as i64),
+        );
+        let ll = _mm256_clmulepi64_epi128::<0x00>(va, vb);
+        let hh = _mm256_clmulepi64_epi128::<0x11>(va, vb);
+        let middle = _mm256_clmulepi64_epi128::<0x00>(va_cross, vb_cross);
+        let cross = _mm256_xor_si256(_mm256_xor_si256(middle, ll), hh);
+        [
+            unpack(lane(ll, false), lane(cross, false), lane(hh, false)),
+            unpack(lane(ll, true), lane(cross, true), lane(hh, true)),
+        ]
     }
 }
 
@@ -417,7 +591,7 @@ fn accumulate_pair_round_coeffs(
     e_delta: &[F128; STATE_SIZE],
     s_base: &[F128; STATE_SIZE],
     s_delta: &[F128; STATE_SIZE],
-    acc: &mut [F128; WALK_DEGREE + 1],
+    acc: &mut [F256Unreduced; WALK_DEGREE + 1],
 ) {
     let sch = schedule();
     let full_round = is_full_round(q);
@@ -450,18 +624,27 @@ fn accumulate_pair_round_coeffs(
                 if tc == F128::ZERO {
                     continue;
                 }
-                acc[d] += eb * tc;
-                acc[d + 1] += ed * tc;
+                let [base_product, delta_product] = mul_unreduced_pair(eb, tc, ed, tc);
+                acc[d] ^= base_product;
+                acc[d + 1] ^= delta_product;
             }
         } else {
             // Passthrough lane: T(t) = s_base + t·s_delta, degree 1.
             let sb = s_base[j];
             let sd = s_delta[j];
-            acc[0] += eb * sb;
-            acc[1] += eb * sd + ed * sb;
-            acc[2] += ed * sd;
+            let [constant, quadratic] = mul_unreduced_pair(eb, sb, ed, sd);
+            let [linear_a, linear_b] = mul_unreduced_pair(eb, sd, ed, sb);
+            acc[0] ^= constant;
+            acc[1] ^= linear_a;
+            acc[1] ^= linear_b;
+            acc[2] ^= quadratic;
         }
     }
+}
+
+#[inline]
+fn reduce_round_coeffs(deferred: [F256Unreduced; WALK_DEGREE + 1]) -> [F128; WALK_DEGREE + 1] {
+    deferred.map(F256Unreduced::reduce)
 }
 
 /// Per-group lane weights from one squeezed α: group g lane i gets
@@ -595,7 +778,7 @@ pub fn prove_deep_chain_walk<Ch: Challenger>(
             let full = (0..half)
                 .into_par_iter()
                 .fold(
-                    || [F128::ZERO; WALK_DEGREE + 1],
+                    || [F256Unreduced::ZERO; WALK_DEGREE + 1],
                     |mut acc, p| {
                         let mut e_base = [F128::ZERO; STATE_SIZE];
                         let mut e_delta = [F128::ZERO; STATE_SIZE];
@@ -614,14 +797,15 @@ pub fn prove_deep_chain_walk<Ch: Challenger>(
                     },
                 )
                 .reduce(
-                    || [F128::ZERO; WALK_DEGREE + 1],
+                    || [F256Unreduced::ZERO; WALK_DEGREE + 1],
                     |mut a, b| {
                         for (x, y) in a.iter_mut().zip(b.iter()) {
-                            *x += *y;
+                            *x ^= *y;
                         }
                         a
                     },
                 );
+            let full = reduce_round_coeffs(full);
             debug_assert_eq!(full[0] + horner(&full, F128::ONE), claim);
             let wire = compress(&full);
             challenger.observe_f128_slice(&wire);
@@ -752,7 +936,6 @@ pub fn prove_multi_deep_chain_walk<Ch: Challenger>(
             .iter_mut()
             .map(|instance_states| instance_states.state(q))
             .collect();
-
         let mut round_coeffs = Vec::with_capacity(w_log);
         let mut point = Vec::with_capacity(w_log);
         for _round in 0..w_log {
@@ -761,7 +944,7 @@ pub fn prove_multi_deep_chain_walk<Ch: Challenger>(
             let evals = (0..work)
                 .into_par_iter()
                 .fold(
-                    || [F128::ZERO; WALK_DEGREE + 1],
+                    || [F256Unreduced::ZERO; WALK_DEGREE + 1],
                     |mut acc, work_index| {
                         let instance = work_index / half;
                         let p = work_index % half;
@@ -784,15 +967,15 @@ pub fn prove_multi_deep_chain_walk<Ch: Challenger>(
                     },
                 )
                 .reduce(
-                    || [F128::ZERO; WALK_DEGREE + 1],
+                    || [F256Unreduced::ZERO; WALK_DEGREE + 1],
                     |mut left, right| {
                         for (left, right) in left.iter_mut().zip(right) {
-                            *left += right;
+                            *left ^= right;
                         }
                         left
                     },
                 );
-            let full = evals;
+            let full = reduce_round_coeffs(evals);
             debug_assert_eq!(full[0] + horner(&full, F128::ONE), claim);
             let wire = compress(&full);
             challenger.observe_f128_slice(&wire);
@@ -885,6 +1068,8 @@ pub fn prove_ragged_multi_deep_chain_walk<Ch: Challenger>(
     out_groups: &[Vec<LaneClaimGroup>],
     challenger: &mut Ch,
 ) -> (MultiDeepChainWalkProof, Vec<LaneClaimGroup>) {
+    let total_started = std::time::Instant::now();
+    let timing_enabled = std::env::var_os("NOIDH_DEEP_CHAIN_TIMING").is_some();
     assert!(!s0_instances.is_empty(), "at least one walk instance");
     assert_eq!(
         s0_instances.len(),
@@ -912,16 +1097,23 @@ pub fn prove_ragged_multi_deep_chain_walk<Ch: Challenger>(
 
     // Layer states retain each native width.  In particular, a smaller state
     // is not cloned into a 2^W outer witness merely to share sumcheck rounds.
-    let mut layer_states: Vec<DescendingLayerStates> = s0_instances
+    let state_init_started = std::time::Instant::now();
+    let mut layer_states: Vec<RaggedDescendingLayerStates> = s0_instances
         .iter()
-        .map(|&s0| DescendingLayerStates::new(s0))
+        .map(|&s0| RaggedDescendingLayerStates::new(s0))
         .collect();
+    let state_init_elapsed = state_init_started.elapsed();
 
     absorb_ragged_multi_groups(challenger, &w_logs, out_groups);
 
     let mut groups = out_groups.to_vec();
     let mut layers = Vec::with_capacity(N_ROUNDS);
+    let mut setup_elapsed = std::time::Duration::ZERO;
+    let mut state_fetch_elapsed = std::time::Duration::ZERO;
+    let mut sumcheck_elapsed = std::time::Duration::ZERO;
+    let mut finish_elapsed = std::time::Duration::ZERO;
     for layer in (1..=N_ROUNDS).rev() {
+        let setup_started = std::time::Instant::now();
         let q = layer - 1;
         let alpha = challenger.sample_f128();
         let total_groups = groups.iter().map(Vec::len).sum();
@@ -939,11 +1131,11 @@ pub fn prove_ragged_multi_deep_chain_walk<Ch: Challenger>(
         debug_assert_eq!(weight_cursor, flat_weights.len());
 
         let mut claim = F128::ZERO;
-        let mut e_tables: Vec<[Vec<F128>; STATE_SIZE]> = w_logs
+        let mut e_tables: Vec<Vec<[F128; STATE_SIZE]>> = w_logs
             .iter()
             .map(|&w_log| {
                 let w = 1usize << w_log;
-                std::array::from_fn(|_| vec![F128::ZERO; w])
+                vec![[F128::ZERO; STATE_SIZE]; w]
             })
             .collect();
         for ((instance_groups, instance_weights), instance_e) in
@@ -955,17 +1147,26 @@ pub fn prove_ragged_multi_deep_chain_walk<Ch: Challenger>(
                 }
                 let columns = column_weights(q, lane_weights);
                 let eq = build_eq_table(&group.point);
-                accumulate_lane_tables(instance_e, &eq, &columns);
+                accumulate_lane_rows(instance_e, &eq, &columns);
             }
         }
+        setup_elapsed += setup_started.elapsed();
 
-        let mut s_tables: Vec<[Vec<F128>; STATE_SIZE]> = layer_states
+        let state_fetch_started = std::time::Instant::now();
+        let mut s_tables: Vec<Vec<[F128; STATE_SIZE]>> = layer_states
             .iter_mut()
             .map(|instance_states| instance_states.state(q))
             .collect();
+        state_fetch_elapsed += state_fetch_started.elapsed();
+
+        let mut e_fold_scratch: Vec<Vec<[F128; STATE_SIZE]>> =
+            (0..w_logs.len()).map(|_| Vec::new()).collect();
+        let mut s_fold_scratch: Vec<Vec<[F128; STATE_SIZE]>> =
+            (0..w_logs.len()).map(|_| Vec::new()).collect();
 
         let mut round_coeffs = Vec::with_capacity(max_w_log);
         let mut point = Vec::with_capacity(max_w_log);
+        let sumcheck_started = std::time::Instant::now();
         for round in 0..max_w_log {
             // A native coordinate contributes one work item per Boolean
             // pair; an exhausted instance contributes one analytical item
@@ -979,23 +1180,19 @@ pub fn prove_ragged_multi_deep_chain_walk<Ch: Challenger>(
                 let instance_e = &e_tables[instance];
                 let instance_s = &s_tables[instance];
                 let contribution = if round < w_log {
-                    (0..instance_e[0].len() / 2)
+                    (0..instance_e.len() / 2)
                         .into_par_iter()
                         .fold(
-                            || [F128::ZERO; WALK_DEGREE + 1],
+                            || [F256Unreduced::ZERO; WALK_DEGREE + 1],
                             |mut acc, p| {
-                                let mut e_base = [F128::ZERO; STATE_SIZE];
-                                let mut e_delta = [F128::ZERO; STATE_SIZE];
-                                let mut s_base = [F128::ZERO; STATE_SIZE];
-                                let mut s_delta = [F128::ZERO; STATE_SIZE];
-                                for lane in 0..STATE_SIZE {
-                                    e_base[lane] = instance_e[lane][2 * p];
-                                    e_delta[lane] =
-                                        instance_e[lane][2 * p] + instance_e[lane][2 * p + 1];
-                                    s_base[lane] = instance_s[lane][2 * p];
-                                    s_delta[lane] =
-                                        instance_s[lane][2 * p] + instance_s[lane][2 * p + 1];
-                                }
+                                let e_base = instance_e[2 * p];
+                                let e_next = instance_e[2 * p + 1];
+                                let e_delta =
+                                    std::array::from_fn(|lane| e_base[lane] + e_next[lane]);
+                                let s_base = instance_s[2 * p];
+                                let s_next = instance_s[2 * p + 1];
+                                let s_delta =
+                                    std::array::from_fn(|lane| s_base[lane] + s_next[lane]);
                                 accumulate_pair_round_coeffs(
                                     q, &e_base, &e_delta, &s_base, &s_delta, &mut acc,
                                 );
@@ -1003,30 +1200,27 @@ pub fn prove_ragged_multi_deep_chain_walk<Ch: Challenger>(
                             },
                         )
                         .reduce(
-                            || [F128::ZERO; WALK_DEGREE + 1],
+                            || [F256Unreduced::ZERO; WALK_DEGREE + 1],
                             |mut left, right| {
                                 for (left, right) in left.iter_mut().zip(right) {
-                                    *left += right;
+                                    *left ^= right;
                                 }
                                 left
                             },
                         )
                 } else {
-                    let mut acc = [F128::ZERO; WALK_DEGREE + 1];
-                    let mut e_base = [F128::ZERO; STATE_SIZE];
-                    let mut s_base = [F128::ZERO; STATE_SIZE];
+                    let mut acc = [F256Unreduced::ZERO; WALK_DEGREE + 1];
+                    debug_assert_eq!(instance_e.len(), 1);
+                    debug_assert_eq!(instance_s.len(), 1);
+                    let e_base = instance_e[0];
+                    let s_base = instance_s[0];
                     let s_delta = [F128::ZERO; STATE_SIZE];
-                    for lane in 0..STATE_SIZE {
-                        debug_assert_eq!(instance_e[lane].len(), 1);
-                        debug_assert_eq!(instance_s[lane].len(), 1);
-                        e_base[lane] = instance_e[lane][0];
-                        s_base[lane] = instance_s[lane][0];
-                    }
                     // e * (1 + t) = e + t*e in characteristic 2.
                     let e_delta = e_base;
                     accumulate_pair_round_coeffs(q, &e_base, &e_delta, &s_base, &s_delta, &mut acc);
                     acc
                 };
+                let contribution = reduce_round_coeffs(contribution);
                 for (slot, value) in full.iter_mut().zip(&contribution) {
                     *slot += *value;
                 }
@@ -1043,21 +1237,31 @@ pub fn prove_ragged_multi_deep_chain_walk<Ch: Challenger>(
             point.push(challenge);
             round_coeffs.push(wire);
             for (instance, &w_log) in w_logs.iter().enumerate() {
-                for lane in 0..STATE_SIZE {
-                    if round < w_log {
-                        fold_in_place(&mut e_tables[instance][lane], challenge);
-                        fold_in_place(&mut s_tables[instance][lane], challenge);
-                    } else {
-                        e_tables[instance][lane][0] *= F128::ONE + challenge;
-                    }
+                if round < w_log {
+                    fold_rows_reusing(
+                        &mut e_tables[instance],
+                        &mut e_fold_scratch[instance],
+                        challenge,
+                    );
+                    fold_rows_reusing(
+                        &mut s_tables[instance],
+                        &mut s_fold_scratch[instance],
+                        challenge,
+                    );
+                } else {
+                    let gate = F128::ONE + challenge;
+                    let row = &mut e_tables[instance][0];
+                    let [v0, v1] = mul_pair(row[0], gate, row[1], gate);
+                    let [v2, v3] = mul_pair(row[2], gate, row[3], gate);
+                    *row = [v0, v1, v2, v3];
                 }
             }
         }
+        sumcheck_elapsed += sumcheck_started.elapsed();
 
-        let next_values: Vec<[F128; STATE_SIZE]> = s_tables
-            .iter()
-            .map(|instance| std::array::from_fn(|lane| instance[lane][0]))
-            .collect();
+        let finish_started = std::time::Instant::now();
+        let next_values: Vec<[F128; STATE_SIZE]> =
+            s_tables.iter().map(|instance| instance[0]).collect();
         let flat_next = next_values
             .iter()
             .flat_map(|values| values.iter().copied())
@@ -1083,7 +1287,7 @@ pub fn prove_ragged_multi_deep_chain_walk<Ch: Challenger>(
                 }
                 expected += aligned_eq * dot;
             }
-            debug_assert!(e_tables[instance].iter().all(|table| table.len() == 1));
+            debug_assert_eq!(e_tables[instance].len(), 1);
         }
         debug_assert_eq!(
             expected, claim,
@@ -1104,12 +1308,24 @@ pub fn prove_ragged_multi_deep_chain_walk<Ch: Challenger>(
                 }]
             })
             .collect();
+        finish_elapsed += finish_started.elapsed();
     }
 
     let terminals = groups
         .into_iter()
         .map(|mut instance| instance.pop().expect("one terminal group per instance"))
         .collect();
+    if timing_enabled {
+        eprintln!(
+            "NOIDH deep-chain-ragged widths={w_logs:?} state_init_ms={} setup_ms={} state_fetch_ms={} sumcheck_ms={} finish_ms={} total_ms={}",
+            state_init_elapsed.as_millis(),
+            setup_elapsed.as_millis(),
+            state_fetch_elapsed.as_millis(),
+            sumcheck_elapsed.as_millis(),
+            finish_elapsed.as_millis(),
+            total_started.elapsed().as_millis(),
+        );
+    }
     (MultiDeepChainWalkProof { layers }, terminals)
 }
 
@@ -1123,14 +1339,16 @@ fn apply_round_columns(q: usize, cols: &mut [Vec<F128>; STATE_SIZE]) {
     // so paying the scatter is the cheaper side. Values and their in-lane
     // order are bit-identical.
     let mut rows: Vec<[F128; STATE_SIZE]> = vec![[F128::ZERO; STATE_SIZE]; w];
-    rows.par_chunks_mut(chunk).enumerate().for_each(|(c, slots)| {
-        let base = c * chunk;
-        for (dw, slot) in slots.iter_mut().enumerate() {
-            let widx = base + dw;
-            let state: [F128; STATE_SIZE] = std::array::from_fn(|j| cols[j][widx]);
-            *slot = apply_round(q, state);
-        }
-    });
+    rows.par_chunks_mut(chunk)
+        .enumerate()
+        .for_each(|(c, slots)| {
+            let base = c * chunk;
+            for (dw, slot) in slots.iter_mut().enumerate() {
+                let widx = base + dw;
+                let state: [F128; STATE_SIZE] = std::array::from_fn(|j| cols[j][widx]);
+                *slot = apply_round(q, state);
+            }
+        });
     for (lane, col) in cols.iter_mut().enumerate() {
         col.par_chunks_mut(chunk)
             .enumerate()
@@ -1140,6 +1358,76 @@ fn apply_round_columns(q: usize, cols: &mut [Vec<F128>; STATE_SIZE]) {
                     *slot = rows[base + dw][lane];
                 }
             });
+    }
+}
+
+fn columns_to_rows(columns: &[Vec<F128>; STATE_SIZE]) -> Vec<[F128; STATE_SIZE]> {
+    let w = columns[0].len();
+    (0..w)
+        .into_par_iter()
+        .map(|slot| std::array::from_fn(|lane| columns[lane][slot]))
+        .collect()
+}
+
+fn apply_round_rows(q: usize, rows: &mut [[F128; STATE_SIZE]]) {
+    let chunk = 1usize.max(rows.len() / (rayon::current_num_threads().max(1) * 4));
+    rows.par_chunks_mut(chunk).for_each(|slots| {
+        for slot in slots {
+            *slot = apply_round(q, *slot);
+        }
+    });
+}
+
+/// Row-major checkpoint server used by the ragged Link walk. The round
+/// function naturally consumes one four-lane state, so retaining this layout
+/// removes the position-major scratch allocation and four lane scatters from
+/// every forward/replayed Poseidon round.
+struct RaggedDescendingLayerStates {
+    checkpoints: Vec<Vec<[F128; STATE_SIZE]>>,
+    window: Vec<Vec<[F128; STATE_SIZE]>>,
+    window_base: usize,
+}
+
+impl RaggedDescendingLayerStates {
+    fn new(s0: &[Vec<F128>; STATE_SIZE]) -> Self {
+        let mut current = columns_to_rows(s0);
+        let mut checkpoints = vec![current.clone()];
+        let last_checkpoint = ((N_ROUNDS - 1) / CHECKPOINT_SPACING) * CHECKPOINT_SPACING;
+        let mut q = 0usize;
+        while q < last_checkpoint {
+            let step = CHECKPOINT_SPACING.min(last_checkpoint - q);
+            for dq in 0..step {
+                apply_round_rows(q + dq, &mut current);
+            }
+            q += step;
+            checkpoints.push(current.clone());
+        }
+        Self {
+            checkpoints,
+            window: Vec::new(),
+            window_base: usize::MAX,
+        }
+    }
+
+    fn state(&mut self, q: usize) -> Vec<[F128; STATE_SIZE]> {
+        let base = (q / CHECKPOINT_SPACING) * CHECKPOINT_SPACING;
+        if self.window_base != base {
+            let len = CHECKPOINT_SPACING.min(N_ROUNDS - base);
+            let checkpoint = std::mem::take(&mut self.checkpoints[base / CHECKPOINT_SPACING]);
+            assert!(!checkpoint.is_empty(), "checkpoint requested twice");
+            let mut window = Vec::with_capacity(len);
+            window.push(checkpoint);
+            for i in 1..len {
+                let mut next = window[i - 1].clone();
+                apply_round_rows(base + i - 1, &mut next);
+                window.push(next);
+            }
+            self.window = window;
+            self.window_base = base;
+        }
+        let slot = &mut self.window[q - self.window_base];
+        assert!(!slot.is_empty(), "layer state S_{q} requested twice");
+        std::mem::take(slot)
     }
 }
 
@@ -1166,8 +1454,12 @@ impl DescendingLayerStates {
         let mut checkpoints = vec![s0.clone()];
         let mut current = s0.clone();
         let mut q = 0usize;
-        while q < N_ROUNDS {
-            let step = CHECKPOINT_SPACING.min(N_ROUNDS - q);
+        // The highest state consumed by the backward walk is S_{N_ROUNDS-1}.
+        // Stop at its checkpoint base: the former final S_66 checkpoint cost
+        // two full column rounds and was never requested.
+        let last_checkpoint = ((N_ROUNDS - 1) / CHECKPOINT_SPACING) * CHECKPOINT_SPACING;
+        while q < last_checkpoint {
+            let step = CHECKPOINT_SPACING.min(last_checkpoint - q);
             for dq in 0..step {
                 apply_round_columns(q + dq, &mut current);
             }
@@ -1189,7 +1481,14 @@ impl DescendingLayerStates {
         if self.window_base != base {
             let len = CHECKPOINT_SPACING.min(N_ROUNDS - base);
             let mut window = Vec::with_capacity(len);
-            window.push(self.checkpoints[base / CHECKPOINT_SPACING].clone());
+            // Windows are visited in strictly descending order. Move their
+            // checkpoint into the window instead of cloning it; neither this
+            // checkpoint nor any higher one can be requested again. Besides
+            // removing a full-column copy, retained checkpoint memory now
+            // falls as the proof descends.
+            let checkpoint = std::mem::take(&mut self.checkpoints[base / CHECKPOINT_SPACING]);
+            assert!(!checkpoint[0].is_empty(), "checkpoint requested twice");
+            window.push(checkpoint);
             for i in 1..len {
                 let mut next = window[i - 1].clone();
                 apply_round_columns(base + i - 1, &mut next);
@@ -1216,6 +1515,26 @@ fn fold_in_place(table: &mut Vec<F128>, r: F128) {
         })
         .collect();
     *table = folded;
+}
+
+#[inline]
+fn fold_rows_reusing(
+    table: &mut Vec<[F128; STATE_SIZE]>,
+    scratch: &mut Vec<[F128; STATE_SIZE]>,
+    r: F128,
+) {
+    let half = table.len() / 2;
+    (0..half)
+        .into_par_iter()
+        .map(|p| {
+            let a = table[2 * p];
+            let b = table[2 * p + 1];
+            let [d0, d1] = mul_pair(r, a[0] + b[0], r, a[1] + b[1]);
+            let [d2, d3] = mul_pair(r, a[2] + b[2], r, a[3] + b[3]);
+            [a[0] + d0, a[1] + d1, a[2] + d2, a[3] + d3]
+        })
+        .collect_into_vec(scratch);
+    std::mem::swap(table, scratch);
 }
 
 // ---------------------------------------------------------------------------
@@ -1660,6 +1979,41 @@ mod tests {
         }
     }
 
+    /// The sparse MDS kernels are an implementation-only optimization.  Keep
+    /// an independent dense 4x4 oracle so every output lane remains exactly
+    /// equal for both frozen matrices, including the identity-elision path.
+    #[test]
+    fn sparse_mds_kernels_match_dense_field_product_oracle() {
+        fn dense(
+            matrix: &[[F128; STATE_SIZE]; STATE_SIZE],
+            input: [F128; STATE_SIZE],
+        ) -> [F128; STATE_SIZE] {
+            std::array::from_fn(|row| {
+                let mut value = F128::ZERO;
+                for (coefficient, input) in matrix[row].iter().zip(input) {
+                    value += *coefficient * input;
+                }
+                value
+            })
+        }
+
+        let schedule = schedule();
+        let mut rng = Rng(0x5A25_E1D5);
+        for _ in 0..256 {
+            let input = std::array::from_fn(|_| rng.f128());
+            assert_eq!(
+                mds_apply_full(&schedule.mds_full, input),
+                dense(&schedule.mds_full, input),
+                "full MDS"
+            );
+            assert_eq!(
+                mds_apply_partial(&schedule.mds_partial, input),
+                dense(&schedule.mds_partial, input),
+                "partial MDS"
+            );
+        }
+    }
+
     #[test]
     fn interpolation_roundtrips() {
         let mut rng = Rng(0x1E77);
@@ -1667,6 +2021,159 @@ mod tests {
         let evals: [F128; WALK_DEGREE + 1] =
             std::array::from_fn(|t| horner(&coeffs, f128_of_u128(t as u128)));
         assert_eq!(interpolate(&evals), coeffs);
+    }
+
+    /// Deferred reduction must be a wire-preserving arithmetic change: XORing
+    /// the 256-bit products and reducing once has to match reducing every
+    /// product before it enters the coefficient accumulator.
+    #[test]
+    fn deferred_round_coeff_accumulation_matches_reduced_reference() {
+        fn reduced_reference(
+            q: usize,
+            e_base: &[F128; STATE_SIZE],
+            e_delta: &[F128; STATE_SIZE],
+            s_base: &[F128; STATE_SIZE],
+            s_delta: &[F128; STATE_SIZE],
+        ) -> [F128; WALK_DEGREE + 1] {
+            let sch = schedule();
+            let full_round = is_full_round(q);
+            let mut acc = [F128::ZERO; WALK_DEGREE + 1];
+            for j in 0..STATE_SIZE {
+                let eb = e_base[j];
+                let ed = e_delta[j];
+                if full_round || j == 0 {
+                    let a = s_base[j] + sch.rc[j][q];
+                    let b = s_delta[j];
+                    let a2 = a * a;
+                    let b2 = b * b;
+                    let a4 = a2 * a2;
+                    let b4 = b2 * b2;
+                    let a4a2 = a4 * a2;
+                    let a4b2 = a4 * b2;
+                    let b4a2 = b4 * a2;
+                    let b4b2 = b4 * b2;
+                    let terms = [
+                        a4a2 * a,
+                        a4a2 * b,
+                        a4b2 * a,
+                        a4b2 * b,
+                        b4a2 * a,
+                        b4a2 * b,
+                        b4b2 * a,
+                        b4b2 * b,
+                    ];
+                    for (d, &term) in terms.iter().enumerate() {
+                        acc[d] += eb * term;
+                        acc[d + 1] += ed * term;
+                    }
+                } else {
+                    let sb = s_base[j];
+                    let sd = s_delta[j];
+                    acc[0] += eb * sb;
+                    acc[1] += eb * sd + ed * sb;
+                    acc[2] += ed * sd;
+                }
+            }
+            acc
+        }
+
+        let mut rng = Rng(0xDEF3_22ED);
+        for q in 0..N_ROUNDS {
+            for _ in 0..4 {
+                let e_base = std::array::from_fn(|_| rng.f128());
+                let e_delta = std::array::from_fn(|_| rng.f128());
+                let s_base = std::array::from_fn(|_| rng.f128());
+                let s_delta = std::array::from_fn(|_| rng.f128());
+                let mut deferred = [F256Unreduced::ZERO; WALK_DEGREE + 1];
+                accumulate_pair_round_coeffs(
+                    q,
+                    &e_base,
+                    &e_delta,
+                    &s_base,
+                    &s_delta,
+                    &mut deferred,
+                );
+                assert_eq!(
+                    reduce_round_coeffs(deferred),
+                    reduced_reference(q, &e_base, &e_delta, &s_base, &s_delta),
+                    "round {q}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn paired_unreduced_products_match_scalar_layout() {
+        let mut rng = Rng(0x2A1E_DF00);
+        for _ in 0..256 {
+            let a0 = rng.f128();
+            let b0 = rng.f128();
+            let a1 = rng.f128();
+            let b1 = rng.f128();
+            assert_eq!(
+                mul_unreduced_pair(a0, b0, a1, b1),
+                [a0.mul_unreduced(b0), a1.mul_unreduced(b1)]
+            );
+        }
+    }
+
+    #[test]
+    fn ragged_row_major_state_server_matches_column_reference() {
+        let s0 = random_columns(5, 0x57A7_E5);
+        let mut column_server = DescendingLayerStates::new(&s0);
+        let mut row_server = RaggedDescendingLayerStates::new(&s0);
+        for q in (0..N_ROUNDS).rev() {
+            let columns = column_server.state(q);
+            let rows = row_server.state(q);
+            assert_eq!(rows.len(), columns[0].len());
+            for (slot, row) in rows.iter().enumerate() {
+                for lane in 0..STATE_SIZE {
+                    assert_eq!(row[lane], columns[lane][slot], "S_{q}[{slot}][{lane}]");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ragged_row_kernels_match_column_references() {
+        let mut rng = Rng(0xB17E_A11E);
+        for q in [0, F_ROUNDS / 2, N_ROUNDS - 1] {
+            let weights = std::array::from_fn(|_| rng.f128());
+            let mds = flat_mds(is_full_round(q));
+            let reference = std::array::from_fn(|column| {
+                let mut value = F128::ZERO;
+                for lane in 0..STATE_SIZE {
+                    value += weights[lane] * mds[lane][column];
+                }
+                value
+            });
+            assert_eq!(column_weights(q, &weights), reference);
+        }
+
+        let eq = (0..32).map(|_| rng.f128()).collect::<Vec<_>>();
+        let columns = std::array::from_fn(|_| rng.f128());
+        let mut lane_tables = std::array::from_fn(|_| vec![F128::ZERO; eq.len()]);
+        let mut rows = vec![[F128::ZERO; STATE_SIZE]; eq.len()];
+        accumulate_lane_tables(&mut lane_tables, &eq, &columns);
+        accumulate_lane_rows(&mut rows, &eq, &columns);
+        for (slot, row) in rows.iter().enumerate() {
+            for lane in 0..STATE_SIZE {
+                assert_eq!(row[lane], lane_tables[lane][slot]);
+            }
+        }
+
+        let challenge = rng.f128();
+        let mut row_scratch = Vec::new();
+        let mut folded_rows = rows.clone();
+        fold_rows_reusing(&mut folded_rows, &mut row_scratch, challenge);
+        for lane in 0..STATE_SIZE {
+            fold_in_place(&mut lane_tables[lane], challenge);
+        }
+        for (slot, row) in folded_rows.iter().enumerate() {
+            for lane in 0..STATE_SIZE {
+                assert_eq!(row[lane], lane_tables[lane][slot]);
+            }
+        }
     }
 
     #[test]
@@ -1855,6 +2362,43 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Production-shape micro profile for the Link three-child multi-walk.
+    /// Claims need not be honest for measuring the prover kernel in a release
+    /// build; the regular round-trip tests above cover the authenticated path.
+    #[test]
+    #[ignore = "production-width performance probe"]
+    fn ragged_m22_three_child_micro_profile() {
+        let w_logs = [14usize, 15, 17];
+        let instances = w_logs
+            .iter()
+            .enumerate()
+            .map(|(instance, &w_log)| random_columns(w_log, 0xC011_0000 + instance as u64))
+            .collect::<Vec<_>>();
+        let mut rng = Rng(0xC011_F5);
+        let groups = w_logs
+            .iter()
+            .map(|&w_log| {
+                vec![LaneClaimGroup {
+                    point: (0..w_log).map(|_| rng.f128()).collect(),
+                    values: std::array::from_fn(|_| rng.f128()),
+                }]
+            })
+            .collect::<Vec<_>>();
+        let instance_refs = instances.iter().collect::<Vec<_>>();
+        let started = std::time::Instant::now();
+        let mut challenger = FsLaneChallenger::new(b"deep-chain-ragged-m22-micro");
+        let (proof, terminals) =
+            prove_ragged_multi_deep_chain_walk(&instance_refs, &groups, &mut challenger);
+        eprintln!(
+            "NOIDH deep-chain-ragged-m22-micro elapsed_ms={} layers={} terminals={}",
+            started.elapsed().as_millis(),
+            proof.layers.len(),
+            terminals.len(),
+        );
+        assert_eq!(proof.layers.len(), N_ROUNDS);
+        assert_eq!(terminals.len(), w_logs.len());
     }
 
     #[test]

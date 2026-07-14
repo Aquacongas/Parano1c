@@ -22,7 +22,7 @@
 //! reference escapes. No copy is serialized or stored on disk after this
 //! function completes.
 
-use noid_gkr::{OwnerAuthWitness, WalletAuthorizationBundle, prove_wallet_authorization};
+use noid_gkr::{prove_wallet_authorization, OwnerAuthWitness, WalletAuthorizationBundle};
 use noid_tx::TxBody;
 
 /// Error from transaction proving.
@@ -47,8 +47,8 @@ pub fn prove_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use noid_poseidon2b::primitives::{Address, SpendSecret, derive_address};
-    use noid_tx::{TX_INPUTS, TX_OUTPUTS, TxInput, TxOutput, output_bitmap_bit};
+    use noid_poseidon2b::primitives::{derive_address, Address, SpendSecret};
+    use noid_tx::{output_bitmap_bit, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS};
 
     fn secret_bytes(seed: u8) -> [u8; 32] {
         let mut bytes = [0u8; 32];

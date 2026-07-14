@@ -40,9 +40,10 @@
 //! to the fresh claim's reduction.
 
 use crate::challenger::Challenger;
-use crate::field::F128;
-use crate::field_r1cs::FieldR1cs;
-use crate::field_r1cs::FieldR1csArtifactError;
+use crate::field::{F128, F256Unreduced};
+use crate::field_r1cs::{
+    CompactFieldR1cs, FieldR1cs, FieldR1csArtifactError, FieldR1csArtifactMatrix,
+};
 use crate::lincheck::build_eq_table;
 use crate::proof::FieldShape;
 use crate::zerocheck::multilinear::lagrange_weights_naive;
@@ -187,11 +188,13 @@ fn matrix_claim_request_binding(
 /// At most one fresh and one accumulated claim are needed for a class at a
 /// time.  Keeping that bound in the API lets an on-disk implementation scan
 /// both canonical matrices once with fixed-size buffers.  Implementations
-/// must recompute `structural_digest` from the same decoded rows used for the
-/// evaluations; cached or externally supplied digest metadata is not valid
-/// authority here. The success object has no public constructor: external
-/// adapters may delegate to a core evaluator, but cannot manufacture a digest
-/// or claim value in safe Rust.
+/// must either recompute `structural_digest` from the same rows used for the
+/// evaluations, or retain a core-authenticated immutable byte backing whose
+/// exact rows were structurally authenticated at construction. Cached or
+/// externally supplied digest metadata alone is not valid authority here. The
+/// success object has no public constructor: external adapters may delegate to
+/// a core evaluator, but cannot manufacture a digest or claim value in safe
+/// Rust.
 pub trait MatrixClaimEvaluator {
     fn field_shape(&self) -> FieldShape;
 
@@ -248,23 +251,6 @@ impl MatrixClaimEvaluator for FieldR1cs {
         let digest = self.structural_statement_digest();
         evaluate_field_r1cs_claims(self, fresh, accumulated, digest)
     }
-}
-
-/// Same evaluations as the [`MatrixClaimEvaluator`] impl for [`FieldR1cs`],
-/// but the digest authority is the instance's already-established statement
-/// digest — installed by
-/// [`FieldR1cs::read_artifact_with_established_digest`] from an install-time
-/// trust record — instead of a fresh span recompute. The record's binding to
-/// the artifact bytes lives in the node's local disk/database trust domain,
-/// the same domain that already holds the chain state; per-run paranoid
-/// re-authentication remains available through the ordinary evaluator.
-pub fn evaluate_matrix_claims_established(
-    matrix: &FieldR1cs,
-    fresh: Option<&FreshLincheckClaim>,
-    accumulated: Option<&MatrixAccClaim>,
-) -> Result<AuthenticatedMatrixClaimEvaluations, FieldR1csArtifactError> {
-    let digest = matrix.statement_digest();
-    evaluate_field_r1cs_claims(matrix, fresh, accumulated, digest)
 }
 
 /// Proof wires of one accumulator fold: phase-1 rounds (`k_log + 1`),
@@ -359,18 +345,52 @@ fn absorb_fold_header<Ch: Challenger>(
     ch.observe_f128(gate);
 }
 
-fn fold_table_pairs(table: &mut Vec<F128>, r: F128) {
+/// Fold one dense MLE table while rotating a caller-owned spare allocation.
+///
+/// The previous parallel path collected a fresh `Vec` for every table in
+/// every large round. At m22 that is 52 allocator round trips in phase 1 and
+/// 24 more in phase 2, repeatedly releasing/reacquiring buffers on the
+/// memory-bandwidth critical path. The first large fold below allocates one
+/// half-sized spare; subsequent folds rotate the just-consumed input
+/// allocation into `spare`, so every later round writes into an already
+/// allocated buffer.
+///
+/// Returning both vectors also keeps this entirely safe: while Rayon writes
+/// the spare, the input is immutably borrowed and the two allocations cannot
+/// alias.  Small tails stay in place, where allocator avoidance matters more
+/// than parallelism.
+fn fold_table_pairs_reusing(
+    mut table: Vec<F128>,
+    mut spare: Vec<F128>,
+    r: F128,
+) -> (Vec<F128>, Vec<F128>) {
+    debug_assert!(table.len().is_power_of_two());
     let half = table.len() / 2;
     if half >= 1024 {
-        let folded: Vec<F128> = (0..half)
-            .into_par_iter()
-            .map(|p| {
-                let a = table[2 * p];
-                let b = table[2 * p + 1];
-                a + r * (a + b)
-            })
-            .collect();
-        *table = folded;
+        if spare.len() < half {
+            // This occurs only for the first large fold of the phase. Every
+            // consumed input thereafter remains initialized and becomes the
+            // next spare. Let Rayon's collector initialize this first output
+            // directly, without a redundant zero-fill pass.
+            let folded = (0..half)
+                .into_par_iter()
+                .map(|p| {
+                    let a = table[2 * p];
+                    let b = table[2 * p + 1];
+                    a + r * (a + b)
+                })
+                .collect();
+            return (folded, table);
+        }
+        spare.truncate(half);
+        spare.par_iter_mut().enumerate().for_each(|(p, folded)| {
+            let a = table[2 * p];
+            let b = table[2 * p + 1];
+            *folded = a + r * (a + b);
+        });
+        // Keep the consumed input initialized: the next fold can truncate and
+        // overwrite it without a redundant zero-fill pass.
+        (spare, table)
     } else {
         for p in 0..half {
             let a = table[2 * p];
@@ -378,12 +398,158 @@ fn fold_table_pairs(table: &mut Vec<F128>, r: F128) {
             table[p] = a + r * (a + b);
         }
         table.truncate(half);
+        (table, spare)
     }
 }
 
-/// One degree-2 product-sumcheck round over paired tables: evaluations of
-/// `Σ_p Π_i tbl_i` at t ∈ {0, 1, 2} for two product terms.
-fn round_evals_two_products(w1: &[F128], g1: &[F128], w2: &[F128], g2: &[F128]) -> [F128; 3] {
+#[cfg(test)]
+fn fold_table_pairs_reference(table: &mut Vec<F128>, r: F128) {
+    let half = table.len() / 2;
+    let folded = (0..half)
+        .map(|p| {
+            let a = table[2 * p];
+            let b = table[2 * p + 1];
+            a + r * (a + b)
+        })
+        .collect();
+    *table = folded;
+}
+
+/// One degree-2 product-sumcheck round over two products, already in the
+/// compressed wire basis `[c_0, c_2]`.
+///
+/// For one pair, the affine extensions are
+/// `w(t) = w_0 + t·(w_0 + w_1)` and `g(t) = g_0 + t·(g_0 + g_1)`.  Their
+/// product therefore contributes `w_0·g_0` to `c_0` and
+/// `(w_0+w_1)·(g_0+g_1)` to `c_2`.  Computing those coefficients directly
+/// avoids evaluating at 1 and 2 and then interpolating the values back into
+/// the exact same wire.
+fn round_coefficients_two_products(
+    w1: &[F128],
+    g1: &[F128],
+    w2: &[F128],
+    g2: &[F128],
+) -> [F128; 2] {
+    debug_assert_eq!(w1.len(), g1.len());
+    debug_assert_eq!(w1.len(), w2.len());
+    debug_assert_eq!(w1.len(), g2.len());
+    let half = w1.len() / 2;
+    let deferred = (0..half)
+        .into_par_iter()
+        .fold(
+            || [F256Unreduced::ZERO; 2],
+            |mut acc, p| {
+                let pairs = [
+                    (w1[2 * p], w1[2 * p + 1], g1[2 * p], g1[2 * p + 1]),
+                    (w2[2 * p], w2[2 * p + 1], g2[2 * p], g2[2 * p + 1]),
+                ];
+                for (w0, w1v, g0, g1v) in pairs {
+                    let wd = w0 + w1v;
+                    let gd = g0 + g1v;
+                    // Reduction is F2-linear. Accumulate the carry-less
+                    // 256-bit products with XOR and reduce only the two final
+                    // coefficients after Rayon has combined every shard.
+                    acc[0] ^= w0.mul_unreduced(g0);
+                    acc[1] ^= wd.mul_unreduced(gd);
+                }
+                acc
+            },
+        )
+        .reduce(
+            || [F256Unreduced::ZERO; 2],
+            |mut a, b| {
+                for (x, y) in a.iter_mut().zip(b.iter()) {
+                    *x ^= *y;
+                }
+                a
+            },
+        );
+    deferred.map(F256Unreduced::reduce)
+}
+
+/// One-product twin used by phase 2.  Keeping this separate means the hot
+/// path neither allocates nor scans two width-`k` all-zero tables merely to
+/// feed the generic two-product kernel.
+fn round_coefficients_one_product(w: &[F128], g: &[F128]) -> [F128; 2] {
+    debug_assert_eq!(w.len(), g.len());
+    let half = w.len() / 2;
+    let deferred = (0..half)
+        .into_par_iter()
+        .fold(
+            || [F256Unreduced::ZERO; 2],
+            |mut acc, p| {
+                let w0 = w[2 * p];
+                let w1 = w[2 * p + 1];
+                let g0 = g[2 * p];
+                let g1 = g[2 * p + 1];
+                acc[0] ^= w0.mul_unreduced(g0);
+                acc[1] ^= (w0 + w1).mul_unreduced(g0 + g1);
+                acc
+            },
+        )
+        .reduce(
+            || [F256Unreduced::ZERO; 2],
+            |mut a, b| {
+                a[0] ^= b[0];
+                a[1] ^= b[1];
+                a
+            },
+        );
+    deferred.map(F256Unreduced::reduce)
+}
+
+/// Materialize `w += scale·e` and compute phase 2's first round coefficients
+/// in the same dense pass.
+///
+/// `scale` is transcript-derived after phase 1, so the mix cannot happen any
+/// earlier. Once it is known, however, scanning the newly mixed table again
+/// just to form round zero is redundant. Unreduced XOR accumulation makes the
+/// fused reduction byte-identical for every Rayon partitioning.
+fn mix_and_round_coefficients_one_product(
+    w: &mut [F128],
+    e: &[F128],
+    g: &[F128],
+    scale: F128,
+) -> [F128; 2] {
+    debug_assert_eq!(w.len(), e.len());
+    debug_assert_eq!(w.len(), g.len());
+    debug_assert_eq!(w.len() % 2, 0);
+    let deferred = w
+        .par_chunks_exact_mut(2)
+        .zip(e.par_chunks_exact(2))
+        .zip(g.par_chunks_exact(2))
+        .fold(
+            || [F256Unreduced::ZERO; 2],
+            |mut acc, ((w_pair, e_pair), g_pair)| {
+                let w0 = w_pair[0] + scale * e_pair[0];
+                let w1 = w_pair[1] + scale * e_pair[1];
+                w_pair[0] = w0;
+                w_pair[1] = w1;
+                acc[0] ^= w0.mul_unreduced(g_pair[0]);
+                acc[1] ^= (w0 + w1).mul_unreduced(g_pair[0] + g_pair[1]);
+                acc
+            },
+        )
+        .reduce(
+            || [F256Unreduced::ZERO; 2],
+            |mut a, b| {
+                a[0] ^= b[0];
+                a[1] ^= b[1];
+                a
+            },
+        );
+    deferred.map(F256Unreduced::reduce)
+}
+
+/// Previous three-evaluation implementation retained solely as an independent
+/// test oracle for the direct coefficient kernels above.
+#[cfg(test)]
+fn round_evals_two_products_reference(
+    w1: &[F128],
+    g1: &[F128],
+    w2: &[F128],
+    g2: &[F128],
+) -> [F128; 3] {
     let half = w1.len() / 2;
     let two = F128 { lo: 2, hi: 0 };
     (0..half)
@@ -418,6 +584,23 @@ fn round_evals_two_products(w1: &[F128], g1: &[F128], w2: &[F128], g2: &[F128]) 
         )
 }
 
+#[cfg(test)]
+fn round_coefficients_two_products_reference(
+    w1: &[F128],
+    g1: &[F128],
+    w2: &[F128],
+    g2: &[F128],
+) -> [F128; 2] {
+    let evals = round_evals_two_products_reference(w1, g1, w2, g2);
+    let two = F128 { lo: 2, hi: 0 };
+    let c0 = evals[0];
+    let s1 = evals[1] + c0;
+    let s2 = evals[2] + c0;
+    let det_inv = crate::deep_chain::f128_inv_pub(two * two + two);
+    let c2 = (s2 + two * s1) * det_inv;
+    [c0, c2]
+}
+
 /// Run one phase of the fold: a degree-2 sumcheck over two product terms
 /// with compressed `[c_0, c_2]` round wires. Returns (rounds, point).
 fn run_phase<Ch: Challenger>(
@@ -431,43 +614,325 @@ fn run_phase<Ch: Challenger>(
     let n_rounds = w1.len().trailing_zeros() as usize;
     let mut rounds = Vec::with_capacity(n_rounds);
     let mut point = Vec::with_capacity(n_rounds);
-    let two = F128 { lo: 2, hi: 0 };
+    // One rotating allocation serves all four tables and all rounds. Its
+    // first allocation is only half a table, matching the old path's peak
+    // scratch rather than reserving four ping-pong buffers up front.
+    let mut spare = Vec::new();
     for _ in 0..n_rounds {
-        let evals = round_evals_two_products(&w1, &g1, &w2, &g2);
-        // Degree-2 interpolation at nodes 0,1,2 (char-2 exact, flat basis).
-        let c0 = evals[0];
-        let s1 = evals[1] + c0;
-        let s2 = evals[2] + c0;
-        let det_inv = crate::deep_chain::f128_inv_pub(two * two + two);
-        let c2 = (s2 + two * s1) * det_inv;
-        let c1 = s1 + c2;
-        debug_assert_eq!(evals[0] + evals[1], claim, "phase round sum mismatch");
+        let [c0, c2] = round_coefficients_two_products(&w1, &g1, &w2, &g2);
+        // In characteristic two, P(0) + P(1) = c1 + c2.
+        let c1 = claim + c2;
         let wire = [c0, c2];
         ch.observe_f128_slice(&wire);
         let r = ch.sample_f128();
         claim = (c2 * r + c1) * r + c0;
         rounds.push(wire);
         point.push(r);
-        fold_table_pairs(&mut w1, r);
-        fold_table_pairs(&mut g1, r);
-        fold_table_pairs(&mut w2, r);
-        fold_table_pairs(&mut g2, r);
+        (w1, spare) = fold_table_pairs_reusing(w1, spare, r);
+        (g1, spare) = fold_table_pairs_reusing(g1, spare, r);
+        (w2, spare) = fold_table_pairs_reusing(w2, spare, r);
+        (g2, spare) = fold_table_pairs_reusing(g2, spare, r);
     }
     (rounds, point, claim, [w1[0], g1[0], w2[0], g2[0]])
 }
 
-/// Prove one accumulator fold. `gate` is 1 to include the incoming claim
-/// (regular links) or 0 to ignore it (the genesis link, whose incoming
-/// lanes are unconstrained). Returns the proof and the outgoing claim.
-pub fn prove_matrix_claim_fold<Ch: Challenger>(
-    r1cs: &FieldR1cs,
+/// One-product phase with the same compressed wire and transcript schedule.
+fn run_phase_one_product<Ch: Challenger>(
+    mut claim: F128,
+    mut w: Vec<F128>,
+    mut g: Vec<F128>,
+    mut first_round_coefficients: Option<[F128; 2]>,
+    ch: &mut Ch,
+) -> (Vec<[F128; 2]>, Vec<F128>, F128, [F128; 2]) {
+    let n_rounds = w.len().trailing_zeros() as usize;
+    let mut rounds = Vec::with_capacity(n_rounds);
+    let mut point = Vec::with_capacity(n_rounds);
+    let mut spare = Vec::new();
+    for _ in 0..n_rounds {
+        let [c0, c2] = first_round_coefficients
+            .take()
+            .unwrap_or_else(|| round_coefficients_one_product(&w, &g));
+        let c1 = claim + c2;
+        let wire = [c0, c2];
+        ch.observe_f128_slice(&wire);
+        let r = ch.sample_f128();
+        claim = (c2 * r + c1) * r + c0;
+        rounds.push(wire);
+        point.push(r);
+        (w, spare) = fold_table_pairs_reusing(w, spare, r);
+        (g, spare) = fold_table_pairs_reusing(g, spare, r);
+    }
+    (rounds, point, claim, [w[0], g[0]])
+}
+
+/// Frozen pre-optimization phase implementation used to prove that the
+/// direct-coefficient kernel and rotating buffers leave every transcript wire
+/// and challenge byte-identical. Keep this independent (three evaluations,
+/// interpolation, allocating folds) so the test cannot merely repeat the
+/// production implementation's mistake.
+#[cfg(test)]
+fn run_phase_reference<Ch: Challenger>(
+    mut claim: F128,
+    mut w1: Vec<F128>,
+    mut g1: Vec<F128>,
+    mut w2: Vec<F128>,
+    mut g2: Vec<F128>,
+    ch: &mut Ch,
+) -> (Vec<[F128; 2]>, Vec<F128>, F128, [F128; 4]) {
+    let n_rounds = w1.len().trailing_zeros() as usize;
+    let mut rounds = Vec::with_capacity(n_rounds);
+    let mut point = Vec::with_capacity(n_rounds);
+    let two = F128 { lo: 2, hi: 0 };
+    let det_inv = crate::deep_chain::f128_inv_pub(two * two + two);
+    for _ in 0..n_rounds {
+        let evals = round_evals_two_products_reference(&w1, &g1, &w2, &g2);
+        let c0 = evals[0];
+        let s1 = evals[1] + c0;
+        let s2 = evals[2] + c0;
+        let c2 = (s2 + two * s1) * det_inv;
+        let c1 = s1 + c2;
+        debug_assert_eq!(evals[0] + evals[1], claim);
+        let wire = [c0, c2];
+        ch.observe_f128_slice(&wire);
+        let r = ch.sample_f128();
+        claim = (c2 * r + c1) * r + c0;
+        rounds.push(wire);
+        point.push(r);
+        fold_table_pairs_reference(&mut w1, r);
+        fold_table_pairs_reference(&mut g1, r);
+        fold_table_pairs_reference(&mut w2, r);
+        fold_table_pairs_reference(&mut g2, r);
+    }
+    (rounds, point, claim, [w1[0], g1[0], w2[0], g2[0]])
+}
+
+/// Equality tensor with an initial scalar already folded into every entry.
+/// Starting from `scale` instead of one removes a separate width-sized pass.
+fn build_eq_table_scaled(point: &[F128], scale: F128) -> Vec<F128> {
+    let length = 1usize << point.len();
+    if scale == F128::ZERO {
+        return vec![F128::ZERO; length];
+    }
+    let mut out = Vec::with_capacity(length);
+    out.push(scale);
+    for (j, &r) in point.iter().enumerate() {
+        let one_plus_r = F128::ONE + r;
+        let len = 1usize << j;
+        out.resize(2 * len, F128::ZERO);
+        for i in 0..len {
+            let value = out[i];
+            out[i + len] = value * r;
+            out[i] = value * one_plus_r;
+        }
+    }
+    out
+}
+
+/// Stacked fresh-row weight `[α·(λ⊗eq), λ⊗eq]`.  The shared base
+/// half is formed once, then copied verbatim to B while A receives its one
+/// required `α` multiplication.
+fn build_stacked_u_weights(
+    k_log: usize,
+    k_skip: usize,
+    alpha: F128,
+    lambda: &[F128],
+    e_tensor: &[F128],
+) -> Vec<F128> {
+    let k = 1usize << k_log;
+    let ell = 1usize << k_skip;
+    assert_eq!(lambda.len(), ell);
+    assert_eq!(e_tensor.len(), k >> k_skip);
+    let mut weights = vec![F128::ZERO; 2 * k];
+    let (weights_a, weights_b) = weights.split_at_mut(k);
+    weights_a
+        .par_chunks_mut(ell)
+        .zip(weights_b.par_chunks_mut(ell))
+        .zip(e_tensor.par_iter())
+        .for_each(|((a_chunk, b_chunk), &e)| {
+            for ((a_slot, b_slot), &lam) in a_chunk
+                .iter_mut()
+                .zip(b_chunk.iter_mut())
+                .zip(lambda.iter())
+            {
+                let base = lam * e;
+                *a_slot = base * alpha;
+                *b_slot = base;
+            }
+        });
+    weights
+}
+
+/// Native row source for the matrix-fold prover.
+///
+/// The compact variant walks the canonical planar streams authenticated by
+/// [`CompactFieldR1cs::open`] directly.  Keeping the two representations
+/// behind this private enum makes the transcript-producing implementation a
+/// single source of truth: compact and resident CSR proofs cannot drift.
+enum MatrixFoldRows<'a> {
+    Resident(&'a FieldR1cs),
+    Compact(&'a CompactFieldR1cs),
+}
+
+impl MatrixFoldRows<'_> {
+    #[inline]
+    fn storage_name(&self) -> &'static str {
+        match self {
+            Self::Resident(_) => "resident",
+            Self::Compact(r1cs) => r1cs.storage_name(),
+        }
+    }
+
+    #[inline]
+    fn k_log(&self) -> usize {
+        match self {
+            Self::Resident(r1cs) => r1cs.k_log,
+            Self::Compact(r1cs) => r1cs.shape().k_log,
+        }
+    }
+
+    #[inline]
+    fn k_skip(&self) -> usize {
+        match self {
+            Self::Resident(r1cs) => r1cs.k_skip,
+            Self::Compact(r1cs) => r1cs.shape().k_skip,
+        }
+    }
+
+    /// Fill the two stacked row images used by phase 1. Each compact group
+    /// owns a disjoint 2048-row output window, so Rayon can decode straight
+    /// into the final dense tables without a CSR or reduction buffers.
+    fn fill_row_images(&self, v_table: &[F128], e_c: &[F128], g_v: &mut [F128], g_e: &mut [F128]) {
+        let k = 1usize << self.k_log();
+        debug_assert_eq!(g_v.len(), 2 * k);
+        debug_assert_eq!(g_e.len(), 2 * k);
+        match self {
+            Self::Resident(r1cs) => {
+                let halves = [(&r1cs.a_0, 0usize), (&r1cs.b_0, k)];
+                for (matrix, offset) in halves {
+                    g_v.par_iter_mut()
+                        .zip(g_e.par_iter_mut())
+                        .skip(offset)
+                        .take(k)
+                        .enumerate()
+                        .for_each(|(row, (gv, ge))| {
+                            if row < matrix.num_rows {
+                                let mut gv_deferred = F256Unreduced::ZERO;
+                                let mut ge_deferred = F256Unreduced::ZERO;
+                                for (column, coefficient) in matrix.row(row) {
+                                    gv_deferred ^=
+                                        coefficient.mul_unreduced(v_table[column as usize]);
+                                    ge_deferred ^= coefficient.mul_unreduced(e_c[column as usize]);
+                                }
+                                // Characteristic-two reduction is linear:
+                                // one reduction per row is bit-identical to
+                                // reducing and XORing every product.
+                                *gv = gv_deferred.reduce();
+                                *ge = ge_deferred.reduce();
+                            }
+                        });
+                }
+            }
+            Self::Compact(r1cs) => {
+                const GROUP_ROWS: usize = 2048;
+                for (side, offset) in [
+                    (FieldR1csArtifactMatrix::A, 0usize),
+                    (FieldR1csArtifactMatrix::B, k),
+                ] {
+                    g_v[offset..offset + k]
+                        .par_chunks_mut(GROUP_ROWS)
+                        .zip(g_e[offset..offset + k].par_chunks_mut(GROUP_ROWS))
+                        .enumerate()
+                        .for_each(|(group, (gv_group, ge_group))| {
+                            let mut current_row = None;
+                            let mut gv_deferred = F256Unreduced::ZERO;
+                            let mut ge_deferred = F256Unreduced::ZERO;
+                            let visited = r1cs.for_each_matrix_group_entry(
+                                side,
+                                group,
+                                |row, column, coefficient| {
+                                    if current_row != Some(row) {
+                                        if let Some(previous_row) = current_row {
+                                            let local_row = previous_row - group * GROUP_ROWS;
+                                            gv_group[local_row] = gv_deferred.reduce();
+                                            ge_group[local_row] = ge_deferred.reduce();
+                                        }
+                                        current_row = Some(row);
+                                        gv_deferred = F256Unreduced::ZERO;
+                                        ge_deferred = F256Unreduced::ZERO;
+                                    }
+                                    let local_row = row - group * GROUP_ROWS;
+                                    debug_assert!(local_row < gv_group.len());
+                                    gv_deferred ^=
+                                        coefficient.mul_unreduced(v_table[column as usize]);
+                                    ge_deferred ^= coefficient.mul_unreduced(e_c[column as usize]);
+                                },
+                            );
+                            assert!(visited, "enumerated compact matrix group exists");
+                            if let Some(row) = current_row {
+                                let local_row = row - group * GROUP_ROWS;
+                                gv_group[local_row] = gv_deferred.reduce();
+                                ge_group[local_row] = ge_deferred.reduce();
+                            }
+                        });
+                }
+            }
+        }
+    }
+
+    /// Compute `H(c) = sum_y eq(rho,y) M[y,c]` for phase 2. Resident CSR keeps
+    /// one private accumulator per A/B side. The compact production path
+    /// parallelizes authenticated row groups into one char-2 accumulator, so
+    /// m22 scratch is 64 MiB rather than two 64-MiB side tables.
+    fn weighted_column_image(&self, eq_rho: &FactoredEqTable) -> Vec<F128> {
+        let k = 1usize << self.k_log();
+        match self {
+            Self::Resident(r1cs) => {
+                let parts: Vec<Vec<F128>> = [(&r1cs.a_0, 0usize), (&r1cs.b_0, k)]
+                    .par_iter()
+                    .map(|(matrix, offset)| {
+                        let mut acc = vec![F128::ZERO; k];
+                        for row in 0..matrix.num_rows {
+                            let weight = eq_rho.value(*offset + row);
+                            if weight == F128::ZERO {
+                                continue;
+                            }
+                            for (column, coefficient) in matrix.row(row) {
+                                acc[column as usize] += coefficient * weight;
+                            }
+                        }
+                        acc
+                    })
+                    .collect();
+                // Reuse one side accumulator as the final H table. Allocating
+                // a third k-wide output here costs another 64 MiB at m22.
+                let mut parts = parts.into_iter();
+                let mut h = parts.next().expect("A-side matrix-fold accumulator");
+                for part in parts {
+                    h.par_iter_mut()
+                        .zip(part.par_iter())
+                        .for_each(|(slot, value)| *slot += *value);
+                }
+                h
+            }
+            Self::Compact(r1cs) => r1cs.stacked_weighted_column_image(&|row| eq_rho.value(row)),
+        }
+    }
+}
+
+/// Shared transcript-producing implementation for resident CSR and compact
+/// authenticated artifacts.
+fn prove_matrix_claim_fold_from_rows<Ch: Challenger>(
+    rows: MatrixFoldRows<'_>,
     fresh: &FreshLincheckClaim,
     incoming: &MatrixAccClaim,
     gate: bool,
     ch: &mut Ch,
 ) -> (MatrixFoldProof, MatrixAccClaim) {
-    let k_log = r1cs.k_log;
-    let k_skip = r1cs.k_skip;
+    let timing = std::env::var_os("NOIDH_MATRIX_FOLD_TIMING").is_some();
+    let total_started = std::time::Instant::now();
+    let storage = rows.storage_name();
+    let k_log = rows.k_log();
+    let k_skip = rows.k_skip();
     let k = 1usize << k_log;
     assert_eq!(fresh.x_inner_rest.len(), k_log - k_skip);
     assert_eq!(fresh.r_inner_rest.len(), k_log - k_skip);
@@ -482,6 +947,7 @@ pub fn prove_matrix_claim_fold<Ch: Challenger>(
 
     // Dense weight/value tables.
     // v(c) = z_partial[c mod 64]·eq(r_inner_rest)[c div 64].
+    let tables_started = std::time::Instant::now();
     let q_tensor = build_eq_table(&fresh.r_inner_rest);
     let mut v_table = vec![F128::ZERO; k];
     v_table
@@ -492,55 +958,33 @@ pub fn prove_matrix_claim_fold<Ch: Challenger>(
                 *slot = *zp * q;
             }
         });
+    drop(q_tensor);
     // e_c(c) = eq(p_in^c, c).
     let e_c = build_eq_table(p_in_col);
+    let tables_ms = tables_started.elapsed().as_millis();
 
     // G_v, G_e: row images of M̂ against v and e_c. Row index y = r + b·k.
+    let row_images_started = std::time::Instant::now();
     let mut g_v = vec![F128::ZERO; 2 * k];
     let mut g_e = vec![F128::ZERO; 2 * k];
-    let halves = [(&r1cs.a_0, 0usize), (&r1cs.b_0, k)];
-    for (m, off) in halves {
-        g_v[..]
-            .par_iter_mut()
-            .zip(g_e.par_iter_mut())
-            .skip(off)
-            .take(k)
-            .enumerate()
-            .for_each(|(r, (gv, ge))| {
-                if r < m.num_rows {
-                    let mut av = F128::ZERO;
-                    let mut ae = F128::ZERO;
-                    for (c, kappa) in m.row(r) {
-                        av += kappa * v_table[c as usize];
-                        ae += kappa * e_c[c as usize];
-                    }
-                    *gv = av;
-                    *ge = ae;
-                }
-            });
-    }
+    rows.fill_row_images(&v_table, &e_c, &mut g_v, &mut g_e);
+    let row_images_ms = row_images_started.elapsed().as_millis();
 
     // Phase-1 weights over y = (r, b): ŵu and γ·gate·eq(p_in^{rb}).
+    let phase1_weights_started = std::time::Instant::now();
     let lambda = lagrange_weights_naive(k_skip, fresh.z_skip);
     let e_tensor = build_eq_table(&fresh.x_inner_rest);
-    let mut w_u = vec![F128::ZERO; 2 * k];
-    let (alpha_a, alpha_b) = (fresh.alpha, F128::ONE);
-    w_u.par_chunks_mut(1 << k_skip)
-        .enumerate()
-        .for_each(|(hi, chunk)| {
-            let b = hi >> (k_log - k_skip);
-            let e = e_tensor[hi & ((1 << (k_log - k_skip)) - 1)];
-            let wa = if b == 0 { alpha_a } else { alpha_b };
-            for (slot, lam) in chunk.iter_mut().zip(lambda.iter()) {
-                *slot = *lam * e * wa;
-            }
-        });
-    let mut w_in_row = build_eq_table(p_in_row);
+    let w_u = build_stacked_u_weights(k_log, k_skip, fresh.alpha, &lambda, &e_tensor);
     let gg = gamma * gate_f;
-    w_in_row.par_iter_mut().for_each(|x| *x = *x * gg);
+    let w_in_row = build_eq_table_scaled(p_in_row, gg);
+    drop(lambda);
+    drop(e_tensor);
+    let phase1_weights_ms = phase1_weights_started.elapsed().as_millis();
 
     let target1 = fresh.value + gg * incoming.value;
+    let phase1_started = std::time::Instant::now();
     let (phase1_rounds, rho, claim1, finals1) = run_phase(target1, w_u, g_v, w_in_row, g_e, ch);
+    let phase1_ms = phase1_started.elapsed().as_millis();
     // finals1 = [ŵu~(ρ), G_v~(ρ), γ·gate·eq~(ρ), G_e~(ρ)].
     let g_v_val = finals1[1];
     let g_e_val = finals1[3];
@@ -554,43 +998,28 @@ pub fn prove_matrix_claim_fold<Ch: Challenger>(
     let delta = ch.sample_f128();
 
     // H(c) = Σ_y eq(ρ, y)·M̂[y, c].
-    let eq_rho = build_eq_table(&rho);
-    let mut h = vec![F128::ZERO; k];
-    {
-        // Scatter per row: H[c] += eq_rho[y]·κ. Parallel over column
-        // stripes would race; accumulate per thread then reduce.
-        let parts: Vec<Vec<F128>> = halves
-            .par_iter()
-            .map(|(m, off)| {
-                let mut acc = vec![F128::ZERO; k];
-                for r in 0..m.num_rows {
-                    let w = eq_rho[off + r];
-                    if w == F128::ZERO {
-                        continue;
-                    }
-                    for (c, kappa) in m.row(r) {
-                        acc[c as usize] += kappa * w;
-                    }
-                }
-                acc
-            })
-            .collect();
-        for part in parts {
-            h.par_iter_mut().zip(part.par_iter()).for_each(|(a, b)| {
-                *a += *b;
-            });
-        }
-    }
+    // `rho` has k_log+1 coordinates, so its dense equality table would hold
+    // 2k field elements (128 MiB at m22). Matrix rows are canonical and
+    // row-major; retain two sqrt-sized factors and evaluate one weight per
+    // nonempty row instead.
+    let column_image_started = std::time::Instant::now();
+    let eq_rho = FactoredEqTable::new(&rho);
+    let h = rows.weighted_column_image(&eq_rho);
+    drop(eq_rho);
+    let column_image_ms = column_image_started.elapsed().as_millis();
 
     // Phase 2 over c: target = G_v~ + δ·gate·G_e~, weight = v + δ·gate·e_c.
+    let phase2_mix_started = std::time::Instant::now();
     let dg = delta * gate_f;
     let mut w2 = v_table;
-    w2.par_iter_mut().zip(e_c.par_iter()).for_each(|(w, e)| {
-        *w += dg * *e;
-    });
+    let first_phase2_coefficients = mix_and_round_coefficients_one_product(&mut w2, &e_c, &h, dg);
+    drop(e_c);
+    let phase2_mix_ms = phase2_mix_started.elapsed().as_millis();
     let target2 = g_v_val + dg * g_e_val;
-    let zero = vec![F128::ZERO; k];
-    let (phase2_rounds, sigma, claim2, finals2) = run_phase(target2, w2, h, zero.clone(), zero, ch);
+    let phase2_started = std::time::Instant::now();
+    let (phase2_rounds, sigma, claim2, finals2) =
+        run_phase_one_product(target2, w2, h, Some(first_phase2_coefficients), ch);
+    let phase2_ms = phase2_started.elapsed().as_millis();
     let final_matrix_eval = finals2[1];
     debug_assert_eq!(
         finals2[0] * final_matrix_eval,
@@ -598,6 +1027,13 @@ pub fn prove_matrix_claim_fold<Ch: Challenger>(
         "phase-2 terminal mismatch"
     );
     ch.observe_f128(final_matrix_eval);
+
+    if timing {
+        eprintln!(
+            "[matrix-fold] storage={storage} k_log={k_log} gate={gate} tables={tables_ms}ms row-images={row_images_ms}ms phase1-weights={phase1_weights_ms}ms phase1={phase1_ms}ms column-image={column_image_ms}ms phase2-mix={phase2_mix_ms}ms phase2-round0=fused phase2={phase2_ms}ms total={}ms",
+            total_started.elapsed().as_millis()
+        );
+    }
 
     let mut point = rho;
     point.extend(sigma);
@@ -614,6 +1050,30 @@ pub fn prove_matrix_claim_fold<Ch: Challenger>(
             value: final_matrix_eval,
         },
     )
+}
+
+/// Prove one accumulator fold from a resident CSR relation. `gate` is 1 to
+/// include the incoming claim (regular links) or 0 to ignore it (genesis).
+pub fn prove_matrix_claim_fold<Ch: Challenger>(
+    r1cs: &FieldR1cs,
+    fresh: &FreshLincheckClaim,
+    incoming: &MatrixAccClaim,
+    gate: bool,
+    ch: &mut Ch,
+) -> (MatrixFoldProof, MatrixAccClaim) {
+    prove_matrix_claim_fold_from_rows(MatrixFoldRows::Resident(r1cs), fresh, incoming, gate, ch)
+}
+
+/// Transcript-identical matrix fold directly over an authenticated compact
+/// artifact. No CSR arrays are decoded or retained.
+pub fn prove_matrix_claim_fold_compact<Ch: Challenger>(
+    r1cs: &CompactFieldR1cs,
+    fresh: &FreshLincheckClaim,
+    incoming: &MatrixAccClaim,
+    gate: bool,
+    ch: &mut Ch,
+) -> (MatrixFoldProof, MatrixAccClaim) {
+    prove_matrix_claim_fold_from_rows(MatrixFoldRows::Compact(r1cs), fresh, incoming, gate, ch)
 }
 
 /// Verify one accumulator fold (matrix-free: only claim data and the
@@ -784,11 +1244,247 @@ pub fn fresh_claim_value(r1cs: &FieldR1cs, fresh: &FreshLincheckClaim) -> F128 {
         .reduce(|| F128::ZERO, |a, b| a + b)
 }
 
+struct CompactFreshClaimWeights<'a> {
+    claim: &'a FreshLincheckClaim,
+    lambda: Vec<F128>,
+    row_tensor: FactoredEqTable,
+    column_tensor: FactoredEqTable,
+    k_skip: usize,
+    mask: usize,
+}
+
+impl<'a> CompactFreshClaimWeights<'a> {
+    fn new(claim: &'a FreshLincheckClaim, k_skip: usize) -> Self {
+        Self {
+            claim,
+            lambda: lagrange_weights_naive(k_skip, claim.z_skip),
+            row_tensor: FactoredEqTable::new(&claim.x_inner_rest),
+            column_tensor: FactoredEqTable::new(&claim.r_inner_rest),
+            k_skip,
+            mask: (1usize << k_skip) - 1,
+        }
+    }
+
+    #[inline(always)]
+    fn row_weight(&self, row: usize) -> F128 {
+        self.lambda[row & self.mask] * self.row_tensor.value(row >> self.k_skip)
+    }
+
+    #[inline(always)]
+    fn column_weight(&self, column: usize) -> F128 {
+        self.claim.z_partial[column & self.mask] * self.column_tensor.value(column >> self.k_skip)
+    }
+}
+
+struct CompactAccumulatedClaimWeights {
+    x_b: F128,
+    row_tensor: FactoredEqTable,
+    column_tensor: FactoredEqTable,
+}
+
+impl CompactAccumulatedClaimWeights {
+    fn new(claim: &MatrixAccClaim, k_log: usize) -> Self {
+        assert_eq!(claim.point.len(), 2 * k_log + 1);
+        let (p_row, p_col) = claim.point.split_at(k_log + 1);
+        Self {
+            x_b: p_row[k_log],
+            row_tensor: FactoredEqTable::new(&p_row[..k_log]),
+            column_tensor: FactoredEqTable::new(p_col),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CompactMatrixClaimTotals {
+    fresh: F128,
+    accumulated: F128,
+    #[cfg(test)]
+    group_scans: usize,
+}
+
+impl CompactMatrixClaimTotals {
+    const fn zero() -> Self {
+        Self {
+            fresh: F128::ZERO,
+            accumulated: F128::ZERO,
+            #[cfg(test)]
+            group_scans: 0,
+        }
+    }
+
+    #[inline]
+    fn combine(self, other: Self) -> Self {
+        Self {
+            fresh: self.fresh + other.fresh,
+            accumulated: self.accumulated + other.accumulated,
+            #[cfg(test)]
+            group_scans: self.group_scans + other.group_scans,
+        }
+    }
+}
+
+struct CompactMatrixClaimValues {
+    fresh: Option<F128>,
+    accumulated: Option<F128>,
+    #[cfg(test)]
+    group_scans: usize,
+}
+
+/// Evaluate the bounded fresh/accumulated pair over authenticated compact
+/// planar rows.  When both claims are present, every A/B group is decoded
+/// exactly once and each visited coefficient contributes to both independent
+/// sums.  Canonical row-major order also lets the two factored row weights be
+/// cached until the row changes; column tensors remain factored and bounded.
+fn compact_matrix_claim_values(
+    r1cs: &CompactFieldR1cs,
+    fresh: Option<&FreshLincheckClaim>,
+    accumulated: Option<&MatrixAccClaim>,
+) -> CompactMatrixClaimValues {
+    let shape = r1cs.shape();
+    let fresh_weights = fresh.map(|claim| CompactFreshClaimWeights::new(claim, shape.k_skip));
+    let accumulated_weights =
+        accumulated.map(|claim| CompactAccumulatedClaimWeights::new(claim, shape.k_log));
+
+    if fresh_weights.is_none() && accumulated_weights.is_none() {
+        return CompactMatrixClaimValues {
+            fresh: None,
+            accumulated: None,
+            #[cfg(test)]
+            group_scans: 0,
+        };
+    }
+
+    let totals = [FieldR1csArtifactMatrix::A, FieldR1csArtifactMatrix::B]
+        .par_iter()
+        .map(|&side| {
+            let mut side_totals = (0..r1cs.matrix_group_count(side))
+                .into_par_iter()
+                .map(|group| {
+                    let mut totals = CompactMatrixClaimTotals::zero();
+                    #[cfg(test)]
+                    {
+                        totals.group_scans = 1;
+                    }
+                    let mut cached_row = usize::MAX;
+                    let mut fresh_row_weight = F128::ZERO;
+                    let mut accumulated_row_weight = F128::ZERO;
+                    let visited = r1cs.for_each_matrix_group_entry(
+                        side,
+                        group,
+                        |row, column, coefficient| {
+                            if row != cached_row {
+                                cached_row = row;
+                                if let Some(weights) = &fresh_weights {
+                                    fresh_row_weight = weights.row_weight(row);
+                                }
+                                if let Some(weights) = &accumulated_weights {
+                                    accumulated_row_weight = weights.row_tensor.value(row);
+                                }
+                            }
+
+                            let column = column as usize;
+                            if let Some(weights) = &fresh_weights {
+                                totals.fresh +=
+                                    coefficient * weights.column_weight(column) * fresh_row_weight;
+                            }
+                            if let Some(weights) = &accumulated_weights {
+                                totals.accumulated += coefficient
+                                    * weights.column_tensor.value(column)
+                                    * accumulated_row_weight;
+                            }
+                        },
+                    );
+                    assert!(visited, "enumerated compact matrix group exists");
+                    totals
+                })
+                .reduce(CompactMatrixClaimTotals::zero, |a, b| a.combine(b));
+
+            if let Some(weights) = &fresh_weights {
+                side_totals.fresh *= match side {
+                    FieldR1csArtifactMatrix::A => weights.claim.alpha,
+                    FieldR1csArtifactMatrix::B => F128::ONE,
+                };
+            }
+            if let Some(weights) = &accumulated_weights {
+                side_totals.accumulated *= match side {
+                    FieldR1csArtifactMatrix::A => F128::ONE + weights.x_b,
+                    FieldR1csArtifactMatrix::B => weights.x_b,
+                };
+            }
+            side_totals
+        })
+        .reduce(CompactMatrixClaimTotals::zero, |a, b| a.combine(b));
+
+    CompactMatrixClaimValues {
+        fresh: fresh.map(|_| totals.fresh),
+        accumulated: accumulated.map(|_| totals.accumulated),
+        #[cfg(test)]
+        group_scans: totals.group_scans,
+    }
+}
+
+impl CompactFieldR1cs {
+    /// Evaluate the terminal's bounded fresh/accumulated claim set against the
+    /// exact immutable rows authenticated by [`CompactFieldR1cs::open`].
+    ///
+    /// Unlike the compatibility [`MatrixClaimEvaluator`] trait this operation
+    /// needs only `&self`, so an `Arc<CompactFieldR1cs>` can serve concurrent
+    /// terminal and proving lanes without cloning the artifact or introducing
+    /// a mutex solely for trait mutability.
+    pub fn evaluate_matrix_claims_authenticated(
+        &self,
+        fresh: Option<&FreshLincheckClaim>,
+        accumulated: Option<&MatrixAccClaim>,
+    ) -> Result<AuthenticatedMatrixClaimEvaluations, FieldR1csArtifactError> {
+        let shape = self.shape();
+        if let Some(claim) = fresh {
+            let rest = shape.k_log - shape.k_skip;
+            if claim.x_inner_rest.len() != rest || claim.r_inner_rest.len() != rest {
+                return Err(FieldR1csArtifactError::MatrixClaimShape(
+                    "fresh inner-rest width",
+                ));
+            }
+            if claim.z_partial.len() != 1usize << shape.k_skip {
+                return Err(FieldR1csArtifactError::MatrixClaimShape(
+                    "fresh partial window",
+                ));
+            }
+        }
+        if accumulated.is_some_and(|claim| claim.point.len() != 2 * shape.k_log + 1) {
+            return Err(FieldR1csArtifactError::MatrixClaimShape(
+                "accumulated point width",
+            ));
+        }
+        let values = compact_matrix_claim_values(self, fresh, accumulated);
+        Ok(AuthenticatedMatrixClaimEvaluations::new(
+            self.statement_digest(),
+            fresh,
+            accumulated,
+            values.fresh,
+            values.accumulated,
+        ))
+    }
+}
+
+impl MatrixClaimEvaluator for CompactFieldR1cs {
+    fn field_shape(&self) -> FieldShape {
+        self.shape()
+    }
+
+    fn evaluate_matrix_claims(
+        &mut self,
+        fresh: Option<&FreshLincheckClaim>,
+        accumulated: Option<&MatrixAccClaim>,
+    ) -> Result<AuthenticatedMatrixClaimEvaluations, FieldR1csArtifactError> {
+        self.evaluate_matrix_claims_authenticated(fresh, accumulated)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::challenger::FsLaneChallenger;
-    use crate::field_r1cs::SparseFieldMatrix;
+    use crate::field_r1cs::{CompactFieldR1cs, SparseFieldMatrix};
 
     struct Rng(u64);
     impl Rng {
@@ -804,6 +1500,236 @@ mod tests {
                 lo: self.next_u64(),
                 hi: self.next_u64(),
             }
+        }
+    }
+
+    #[test]
+    fn direct_round_coefficients_match_three_evaluation_reference_in_serial_and_parallel() {
+        let mut rng = Rng(0xC02F_F1C1_E17);
+        let cases = [2usize, 32, 4096]
+            .into_iter()
+            .map(|length| {
+                let random_table =
+                    |rng: &mut Rng| (0..length).map(|_| rng.f128()).collect::<Vec<_>>();
+                (
+                    random_table(&mut rng),
+                    random_table(&mut rng),
+                    random_table(&mut rng),
+                    random_table(&mut rng),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        for threads in [1, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("round-coefficient test pool");
+            pool.install(|| {
+                for (w1, g1, w2, g2) in &cases {
+                    assert_eq!(
+                        round_coefficients_two_products(w1, g1, w2, g2),
+                        round_coefficients_two_products_reference(w1, g1, w2, g2),
+                        "two-product coefficients with {threads} Rayon threads",
+                    );
+
+                    let zero = vec![F128::ZERO; w1.len()];
+                    assert_eq!(
+                        round_coefficients_one_product(w1, g1),
+                        round_coefficients_two_products_reference(w1, g1, &zero, &zero),
+                        "one-product coefficients with {threads} Rayon threads",
+                    );
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn rotating_fold_buffers_preserve_full_phase_transcript() {
+        let mut rng = Rng(0xB0FF_EA11_0CA7_E);
+        let cases = [128usize, 4096]
+            .into_iter()
+            .map(|length| {
+                let random_table =
+                    |rng: &mut Rng| (0..length).map(|_| rng.f128()).collect::<Vec<_>>();
+                (
+                    random_table(&mut rng),
+                    random_table(&mut rng),
+                    random_table(&mut rng),
+                    random_table(&mut rng),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        for threads in [1, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("phase transcript test pool");
+            pool.install(|| {
+                for (w1, g1, w2, g2) in &cases {
+                    let initial = round_evals_two_products_reference(w1, g1, w2, g2);
+                    let claim = initial[0] + initial[1];
+
+                    let mut reference_ch = FsLaneChallenger::new(b"fold-buffer-parity");
+                    let reference = run_phase_reference(
+                        claim,
+                        w1.clone(),
+                        g1.clone(),
+                        w2.clone(),
+                        g2.clone(),
+                        &mut reference_ch,
+                    );
+                    let mut optimized_ch = FsLaneChallenger::new(b"fold-buffer-parity");
+                    let optimized = run_phase(
+                        claim,
+                        w1.clone(),
+                        g1.clone(),
+                        w2.clone(),
+                        g2.clone(),
+                        &mut optimized_ch,
+                    );
+                    assert_eq!(
+                        optimized, reference,
+                        "two-product phase with {threads} Rayon threads"
+                    );
+                    assert_eq!(
+                        optimized_ch.sample_f128(),
+                        reference_ch.sample_f128(),
+                        "two-product challenger tail with {threads} Rayon threads"
+                    );
+
+                    // Phase 2 is the same frozen two-product protocol with an
+                    // all-zero second term. Compare the specialized one-term
+                    // kernel against that exact legacy schedule as well.
+                    let zero = vec![F128::ZERO; w1.len()];
+                    let initial_one = round_evals_two_products_reference(w1, g1, &zero, &zero);
+                    let claim_one = initial_one[0] + initial_one[1];
+                    let mut reference_ch = FsLaneChallenger::new(b"fold-buffer-one-parity");
+                    let reference = run_phase_reference(
+                        claim_one,
+                        w1.clone(),
+                        g1.clone(),
+                        zero.clone(),
+                        zero,
+                        &mut reference_ch,
+                    );
+                    let mut optimized_ch = FsLaneChallenger::new(b"fold-buffer-one-parity");
+                    let optimized = run_phase_one_product(
+                        claim_one,
+                        w1.clone(),
+                        g1.clone(),
+                        None,
+                        &mut optimized_ch,
+                    );
+                    assert_eq!(optimized.0, reference.0, "one-product round wires");
+                    assert_eq!(optimized.1, reference.1, "one-product challenges");
+                    assert_eq!(optimized.2, reference.2, "one-product final claim");
+                    assert_eq!(
+                        optimized.3,
+                        [reference.3[0], reference.3[1]],
+                        "one-product terminal values"
+                    );
+                    assert_eq!(
+                        optimized_ch.sample_f128(),
+                        reference_ch.sample_f128(),
+                        "one-product challenger tail with {threads} Rayon threads"
+                    );
+
+                    let scale = F128 {
+                        lo: 0xD31A_5E00_1234_5678,
+                        hi: 0xA11C_EF01_89AB_CDEF,
+                    };
+                    let mut expected_mixed = w1.clone();
+                    expected_mixed
+                        .iter_mut()
+                        .zip(w2.iter())
+                        .for_each(|(w, e)| *w += scale * *e);
+                    let zero = vec![F128::ZERO; w1.len()];
+                    let initial =
+                        round_evals_two_products_reference(&expected_mixed, g1, &zero, &zero);
+                    let claim = initial[0] + initial[1];
+                    let mut reference_ch = FsLaneChallenger::new(b"fold-mix-parity");
+                    let reference = run_phase_reference(
+                        claim,
+                        expected_mixed.clone(),
+                        g1.clone(),
+                        zero.clone(),
+                        zero,
+                        &mut reference_ch,
+                    );
+
+                    let mut fused_mixed = w1.clone();
+                    let first_coefficients =
+                        mix_and_round_coefficients_one_product(&mut fused_mixed, w2, g1, scale);
+                    assert_eq!(fused_mixed, expected_mixed, "fused phase-2 mix");
+                    assert_eq!(
+                        first_coefficients,
+                        round_coefficients_one_product(&expected_mixed, g1),
+                        "fused phase-2 round-zero coefficients"
+                    );
+                    let mut optimized_ch = FsLaneChallenger::new(b"fold-mix-parity");
+                    let optimized = run_phase_one_product(
+                        claim,
+                        fused_mixed,
+                        g1.clone(),
+                        Some(first_coefficients),
+                        &mut optimized_ch,
+                    );
+                    assert_eq!(optimized.0, reference.0, "fused phase-2 round wires");
+                    assert_eq!(optimized.1, reference.1, "fused phase-2 challenges");
+                    assert_eq!(optimized.2, reference.2, "fused phase-2 final claim");
+                    assert_eq!(optimized.3, [reference.3[0], reference.3[1]]);
+                    assert_eq!(
+                        optimized_ch.sample_f128(),
+                        reference_ch.sample_f128(),
+                        "fused phase-2 challenger tail with {threads} Rayon threads"
+                    );
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn scaled_eq_table_is_byte_identical_to_the_previous_scale_pass() {
+        let mut rng = Rng(0x5CA1_ED_E9);
+        for dimensions in 0..=10 {
+            let point = (0..dimensions).map(|_| rng.f128()).collect::<Vec<_>>();
+            for scale in [F128::ZERO, F128::ONE, rng.f128()] {
+                let mut expected = build_eq_table(&point);
+                expected
+                    .iter_mut()
+                    .for_each(|value| *value = *value * scale);
+                assert_eq!(build_eq_table_scaled(&point, scale), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn shared_stacked_u_base_matches_the_previous_per_half_formula() {
+        let mut rng = Rng(0x57AC_CED0);
+        let (k_log, k_skip) = (10usize, 3usize);
+        let k = 1usize << k_log;
+        let ell = 1usize << k_skip;
+        let alpha = rng.f128();
+        let lambda = (0..ell).map(|_| rng.f128()).collect::<Vec<_>>();
+        let e_tensor = (0..k >> k_skip).map(|_| rng.f128()).collect::<Vec<_>>();
+        let expected = (0..2 * k)
+            .map(|index| {
+                let row = index & (k - 1);
+                let side_weight = if index < k { alpha } else { F128::ONE };
+                lambda[row & (ell - 1)] * e_tensor[row >> k_skip] * side_weight
+            })
+            .collect::<Vec<_>>();
+
+        for threads in [1, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("stacked-weight test pool");
+            let actual =
+                pool.install(|| build_stacked_u_weights(k_log, k_skip, alpha, &lambda, &e_tensor));
+            assert_eq!(actual, expected, "{threads} Rayon threads");
         }
     }
 
@@ -953,6 +1879,112 @@ mod tests {
             .expect("second claim evaluates");
         assert!(second_evaluation.is_bound_to(None, Some(&second)));
         assert!(!second_evaluation.is_bound_to(None, Some(&first)));
+    }
+
+    #[test]
+    fn compact_artifact_all_optional_evaluations_match_csr_in_one_scan() {
+        let mut rng = Rng(0xC04A_C7E0);
+        let mut resident = random_instance(&mut rng, 9, 4);
+        let shape = FieldShape::of(&resident);
+        let digest = resident.structural_statement_digest();
+        let mut artifact = Vec::new();
+        resident
+            .write_artifact(&mut artifact)
+            .expect("resident fixture has a canonical artifact");
+        let compact = CompactFieldR1cs::open(artifact.clone().into_boxed_slice(), shape, digest)
+            .expect("canonical artifact authenticates as compact");
+        let packed = CompactFieldR1cs::open_packed(artifact.into_boxed_slice(), shape, digest)
+            .expect("canonical artifact authenticates as startup-packed");
+
+        let fresh = random_fresh(&mut rng, &resident);
+        let accumulated = random_true_acc(&mut rng, &resident);
+        let expected_group_scans = compact.matrix_group_count(FieldR1csArtifactMatrix::A)
+            + compact.matrix_group_count(FieldR1csArtifactMatrix::B);
+
+        for request_fresh in [false, true] {
+            for request_accumulated in [false, true] {
+                let fresh = request_fresh.then_some(&fresh);
+                let accumulated = request_accumulated.then_some(&accumulated);
+                let expected = resident
+                    .evaluate_matrix_claims(fresh, accumulated)
+                    .expect("resident claims evaluate");
+                let actual = compact
+                    .evaluate_matrix_claims_authenticated(fresh, accumulated)
+                    .expect("compact claims evaluate");
+                assert_eq!(actual, expected);
+                assert!(actual.is_bound_to(fresh, accumulated));
+                let packed_actual = packed
+                    .evaluate_matrix_claims_authenticated(fresh, accumulated)
+                    .expect("packed claims evaluate");
+                assert_eq!(packed_actual, expected);
+                assert!(packed_actual.is_bound_to(fresh, accumulated));
+
+                let values = compact_matrix_claim_values(&compact, fresh, accumulated);
+                assert_eq!(values.fresh, expected.fresh_value());
+                assert_eq!(values.accumulated, expected.accumulated_value());
+                assert_eq!(
+                    values.group_scans,
+                    if request_fresh || request_accumulated {
+                        expected_group_scans
+                    } else {
+                        0
+                    },
+                    "fresh={request_fresh}, accumulated={request_accumulated}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compact_matrix_fold_is_transcript_identical_to_csr() {
+        let mut rng = Rng(0xC04A_F01D);
+        let resident = random_instance(&mut rng, 9, 4);
+        let shape = FieldShape::of(&resident);
+        let digest = resident.structural_statement_digest();
+        let mut artifact = Vec::new();
+        resident
+            .write_artifact(&mut artifact)
+            .expect("resident fixture has a canonical artifact");
+        let compact = CompactFieldR1cs::open(artifact.clone().into_boxed_slice(), shape, digest)
+            .expect("canonical artifact authenticates as compact");
+        let packed = CompactFieldR1cs::open_packed(artifact.into_boxed_slice(), shape, digest)
+            .expect("canonical artifact authenticates as startup-packed");
+        let fresh = random_fresh(&mut rng, &resident);
+        let incoming = random_true_acc(&mut rng, &resident);
+
+        for gate in [false, true] {
+            let mut resident_challenger = FsLaneChallenger::new(b"compact-fold-parity");
+            let resident_fold = prove_matrix_claim_fold(
+                &resident,
+                &fresh,
+                &incoming,
+                gate,
+                &mut resident_challenger,
+            );
+            let mut compact_challenger = FsLaneChallenger::new(b"compact-fold-parity");
+            let compact_fold = prove_matrix_claim_fold_compact(
+                &compact,
+                &fresh,
+                &incoming,
+                gate,
+                &mut compact_challenger,
+            );
+            assert_eq!(compact_fold, resident_fold, "gate={gate}");
+            let mut packed_challenger = FsLaneChallenger::new(b"compact-fold-parity");
+            let packed_fold = prove_matrix_claim_fold_compact(
+                &packed,
+                &fresh,
+                &incoming,
+                gate,
+                &mut packed_challenger,
+            );
+            assert_eq!(packed_fold, resident_fold, "packed gate={gate}");
+            assert_eq!(
+                packed_challenger.sample_f128(),
+                compact_challenger.sample_f128(),
+                "packed challenger tail gate={gate}",
+            );
+        }
     }
 
     /// Honest fold roundtrip: chained accumulators stay TRUE against the

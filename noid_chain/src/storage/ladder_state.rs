@@ -23,7 +23,7 @@ use crate::block_header::{block_id, BlockHeader};
 use crate::consensus::params::{BLOCK_MAX_DISTINCT_SEGMENTS, UNDO_RETENTION_DEPTH};
 use crate::fri_state::LOG_SEGMENT_SIZE;
 use crate::segmented_state::SegmentedFriState;
-use crate::state::ChainState;
+use crate::state::{ChainState, SelectedHistoryLadderUpdate};
 
 use super::historical_state::{
     reconstruct_historical_exact_state, CanonicalTipBinding, HistoricalStateError,
@@ -139,6 +139,156 @@ pub fn load_selected_history_ladder_parent_state(
     Err(LadderStateError::Corrupt(
         "ladder cursor did not converge on the parent boundary",
     ))
+}
+
+/// Load the exact chain state at `parent_header` from the pipelined worker's
+/// in-memory forward boundaries layered over the durable ladder segment table.
+///
+/// `in_flight` carries every not-yet-promoted boundary of the current
+/// pipeline window in ascending height order; the **last** entry must be the
+/// parent block's own end-state update (the header identity binding between
+/// that update and `parent_header` is the caller's bookkeeping — geometry,
+/// counters, and the state-root commitment are all re-verified here).  A
+/// touched segment hydrates from the newest in-flight update that dirtied it,
+/// falling back to the durable ladder table, which is exact for any segment
+/// untouched since the durable cursor.  Every hydrated segment fails closed
+/// against the parent boundary's compact per-segment exact root, so a stale
+/// or torn source can never produce a wrong replay state.
+pub fn load_selected_history_pipelined_parent_state(
+    store: &MdbxStore,
+    parent_header: &BlockHeader,
+    in_flight: &[&SelectedHistoryLadderUpdate],
+    required_segment_ids: &[u16],
+) -> Result<ChainState, LadderStateError> {
+    validate_required_segment_ids(required_segment_ids, parent_header.log_slots)?;
+    let boundary = in_flight.last().ok_or(LadderStateError::Corrupt(
+        "pipelined parent state requires at least the parent boundary",
+    ))?;
+    if boundary.log_slots != parent_header.log_slots
+        || boundary.active_slot_count != parent_header.active_slot_count
+        || boundary.alloc_counter != parent_header.alloc_counter
+        || boundary.state_root != parent_header.state_root
+    {
+        return Err(LadderStateError::Corrupt(
+            "in-memory boundary is not the requested parent boundary",
+        ));
+    }
+
+    let domain = segment_domain(boundary.log_slots)?;
+    let mut segmented = SegmentedFriState::new_empty(boundary.log_slots as usize);
+    for &(segment_id, live_count, _) in &boundary.segment_summaries {
+        if usize::from(segment_id) >= domain {
+            return Err(LadderStateError::Corrupt(
+                "in-memory boundary summary lies outside its domain",
+            ));
+        }
+        segmented
+            .install_evicted_segment_summary_without_fri(segment_id, live_count)
+            .map_err(LadderStateError::Corrupt)?;
+    }
+    let exact_entries: Vec<(u16, [u8; 32])> = boundary
+        .segment_summaries
+        .iter()
+        .map(|&(segment_id, _, exact_root)| (segment_id, exact_root))
+        .collect();
+    let mut state = ChainState::from_evicted_parts(
+        segmented,
+        boundary.active_slot_count,
+        boundary.alloc_counter,
+        parent_header.state_root,
+        &exact_entries,
+    )
+    .map_err(|_| {
+        LadderStateError::Corrupt(
+            "in-memory boundary summaries do not commit to the parent state root",
+        )
+    })?;
+
+    let effective_log = (boundary.log_slots as usize).min(LOG_SEGMENT_SIZE);
+    let segment_len = 1usize << effective_log;
+    // One MVCC snapshot for every durable fallback read: promotions landing
+    // concurrently only ever persist segments that are also present in an
+    // in-flight update, so the union stays exact either way.
+    let snapshot = store.historical_read_snapshot()?;
+    for &segment_id in required_segment_ids {
+        let live_count = boundary
+            .segment_summaries
+            .iter()
+            .find(|&&(id, _, _)| id == segment_id)
+            .map(|&(_, live_count, _)| live_count)
+            .unwrap_or(0);
+        let newest_dirty = in_flight.iter().rev().find_map(|update| {
+            update
+                .dirty_segments
+                .iter()
+                .find(|(id, _)| *id == segment_id)
+                .map(|(_, columns)| columns)
+        });
+        match newest_dirty {
+            Some(Some(columns)) => {
+                if live_count == 0 {
+                    return Err(LadderStateError::Corrupt(
+                        "in-flight columns back an empty segment",
+                    ));
+                }
+                if columns.values.len() != segment_len
+                    || columns.owners_hi.len() != segment_len
+                    || columns.owners_lo.len() != segment_len
+                {
+                    return Err(LadderStateError::Corrupt(
+                        "in-flight segment shape does not match the parent geometry",
+                    ));
+                }
+                state
+                    .restore_shared_evicted_segment(segment_id, columns.clone())
+                    .map_err(|_| {
+                        LadderStateError::Corrupt(
+                            "in-flight segment does not match its compact exact summary",
+                        )
+                    })?;
+            }
+            // The segment became empty at some in-flight boundary.
+            Some(None) => {
+                if live_count != 0 {
+                    return Err(LadderStateError::Corrupt(
+                        "in-flight deletion contradicts a live parent summary",
+                    ));
+                }
+            }
+            None => match snapshot.get_selected_history_ladder_segment(segment_id)? {
+                Some((stored_log, columns)) => {
+                    if live_count == 0 {
+                        return Err(LadderStateError::Corrupt(
+                            "stale ladder payload backs an empty segment",
+                        ));
+                    }
+                    if usize::from(stored_log) != effective_log
+                        || columns.values.len() != segment_len
+                        || columns.owners_hi.len() != segment_len
+                        || columns.owners_lo.len() != segment_len
+                    {
+                        return Err(LadderStateError::Corrupt(
+                            "ladder segment shape does not match the parent geometry",
+                        ));
+                    }
+                    state
+                        .restore_evicted_segment(segment_id, columns)
+                        .map_err(|_| {
+                            LadderStateError::Corrupt(
+                                "ladder segment does not match the parent's compact exact summary",
+                            )
+                        })?;
+                }
+                None if live_count != 0 => {
+                    return Err(LadderStateError::Corrupt(
+                        "parent boundary names a live segment with no payload",
+                    ));
+                }
+                None => {}
+            },
+        }
+    }
+    Ok(state)
 }
 
 fn validate_required_segment_ids(
@@ -860,7 +1010,10 @@ mod tests {
                     exact_segment_root_from_columns(LOG_SEGMENT_SIZE, &columns1),
                 ),
             ],
-            dirty_segments: vec![(0, Some(columns0)), (1, Some(columns1))],
+            dirty_segments: vec![
+                (0, Some(std::sync::Arc::new(columns0))),
+                (1, Some(std::sync::Arc::new(columns1))),
+            ],
         }
     }
 
@@ -1400,6 +1553,182 @@ mod tests {
                 .height,
             7
         );
+    }
+
+    #[test]
+    fn pipelined_parent_state_layers_in_flight_boundaries_over_durable_cursor() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let fixture = commit_ladder_chain(&store);
+        // Durable cursor at height one; height two is only an in-memory
+        // boundary, exactly as in a two-deep pipeline window.
+        promote(&store, 1, fixture.h1_hash, &ladder_update_one(&fixture));
+        let update_two = ladder_update_two(&fixture);
+
+        let state = load_selected_history_pipelined_parent_state(
+            &store,
+            &fixture.h2,
+            &[&update_two],
+            &[0, 1],
+        )
+        .unwrap();
+        assert_eq!(state.cached_state_root(), fixture.h2.state_root);
+        assert_eq!(state.active_slot_count, 1);
+        // Segment 0 was emptied in flight; segment 1 is untouched since the
+        // durable cursor and hydrates from the promoted ladder table.
+        assert_eq!(state.state.slot(fixture.slot_a.0), SlotValue::EMPTY);
+        assert_eq!(state.state.slot(fixture.slot_b.0), fixture.slot_b.1);
+
+        // The pipelined state must equal the durable cursor state after the
+        // same boundary is promoted.
+        promote(&store, 2, fixture.h2_hash, &ladder_update_two(&fixture));
+        let durable =
+            load_selected_history_ladder_parent_state(&store, &fixture.h2, &[0, 1]).unwrap();
+        assert_eq!(durable.cached_state_root(), state.cached_state_root());
+        assert_eq!(durable.active_slot_count, state.active_slot_count);
+        assert_eq!(durable.alloc_counter, state.alloc_counter);
+        assert_eq!(
+            durable.state.slot(fixture.slot_b.0),
+            state.state.slot(fixture.slot_b.0)
+        );
+    }
+
+    #[test]
+    fn pipelined_parent_state_prefers_newest_in_flight_dirty_columns() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let fixture = commit_ladder_chain(&store);
+        // Durable cursor still at genesis boundary: both one and two are
+        // in-memory boundaries. Segment 0 is dirty at one (live) and at two
+        // (deleted); segment 1 is dirty only at one.
+        let update_one = ladder_update_one(&fixture);
+        let update_two = ladder_update_two(&fixture);
+
+        let state = load_selected_history_pipelined_parent_state(
+            &store,
+            &fixture.h2,
+            &[&update_one, &update_two],
+            &[0, 1],
+        )
+        .unwrap();
+        assert_eq!(state.cached_state_root(), fixture.h2.state_root);
+        assert_eq!(state.state.slot(fixture.slot_a.0), SlotValue::EMPTY);
+        assert_eq!(state.state.slot(fixture.slot_b.0), fixture.slot_b.1);
+
+        // Parent boundary mid-window: loading at height one uses only the
+        // prefix of the in-flight window.
+        let state_one = load_selected_history_pipelined_parent_state(
+            &store,
+            &fixture.h1,
+            &[&ladder_update_one(&fixture)],
+            &[0, 1],
+        )
+        .unwrap();
+        assert_eq!(state_one.cached_state_root(), fixture.h1.state_root);
+        assert_eq!(state_one.state.slot(fixture.slot_a.0), fixture.slot_a.1);
+    }
+
+    #[test]
+    fn pipelined_parent_state_shares_then_cow_clones_dirty_columns() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let fixture = commit_ladder_chain(&store);
+        let update_one = ladder_update_one(&fixture);
+        assert_eq!(
+            update_one.retained_dirty_columns_bytes(),
+            2 * 3 * SEGMENT_LEN * core::mem::size_of::<u128>()
+        );
+        let shared_columns = update_one
+            .dirty_segments
+            .iter()
+            .find(|(segment_id, _)| *segment_id == 1)
+            .and_then(|(_, columns)| columns.as_ref())
+            .unwrap();
+
+        let mut state =
+            load_selected_history_pipelined_parent_state(&store, &fixture.h1, &[&update_one], &[1])
+                .unwrap();
+        let loaded_columns = state.state.try_get_segment_columns(1).unwrap();
+        assert!(
+            std::ptr::eq(shared_columns.as_ref(), loaded_columns),
+            "pipeline hydration must share immutable columns"
+        );
+
+        // The pipelined loader intentionally hydrates only the exact-replay
+        // working set.  Mutate it through the same unrooted primitive used by
+        // production exact transitions; requesting a global FRI root here
+        // would correctly fail on the still-evicted segments outside that set.
+        state
+            .state
+            .apply_delta_unrooted(&[(fixture.slot_b.0, live_slot(23, 3, 0x23))])
+            .unwrap();
+        let mutated_columns = state.state.try_get_segment_columns(1).unwrap();
+        assert!(
+            !std::ptr::eq(shared_columns.as_ref(), mutated_columns),
+            "the first write must detach from the retained boundary"
+        );
+        assert_eq!(
+            shared_columns.values[(fixture.slot_b.0 as usize) & (SEGMENT_LEN - 1)],
+            fixture.slot_b.1.value,
+            "copy-on-write must leave the queued promotion immutable"
+        );
+    }
+
+    #[test]
+    fn pipelined_parent_state_fails_closed_on_identity_and_tamper() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let fixture = commit_ladder_chain(&store);
+        promote(&store, 1, fixture.h1_hash, &ladder_update_one(&fixture));
+
+        // No boundary at all.
+        assert!(matches!(
+            load_selected_history_pipelined_parent_state(&store, &fixture.h2, &[], &[0]),
+            Err(LadderStateError::Corrupt(
+                "pipelined parent state requires at least the parent boundary"
+            ))
+        ));
+
+        // Boundary belonging to a different parent header.
+        assert!(matches!(
+            load_selected_history_pipelined_parent_state(
+                &store,
+                &fixture.h2,
+                &[&ladder_update_one(&fixture)],
+                &[0],
+            ),
+            Err(LadderStateError::Corrupt(
+                "in-memory boundary is not the requested parent boundary"
+            ))
+        ));
+
+        // Tampered in-flight columns fail the compact per-segment root check.
+        let mut tampered = ladder_update_two(&fixture);
+        let mut tampered_columns = columns_for_segment(1, &[fixture.slot_b]);
+        tampered_columns.values[2] = Block128(4242);
+        tampered
+            .dirty_segments
+            .push((1, Some(std::sync::Arc::new(tampered_columns))));
+        assert!(matches!(
+            load_selected_history_pipelined_parent_state(&store, &fixture.h2, &[&tampered], &[1]),
+            Err(LadderStateError::Corrupt(
+                "in-flight segment does not match its compact exact summary"
+            ))
+        ));
+
+        // A live parent summary whose segment has neither an in-flight nor a
+        // durable payload fails closed.
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let fixture = commit_ladder_chain(&store);
+        let mut update_two = ladder_update_two(&fixture);
+        update_two.dirty_segments.clear();
+        assert!(matches!(
+            load_selected_history_pipelined_parent_state(&store, &fixture.h2, &[&update_two], &[1]),
+            Err(LadderStateError::Corrupt(
+                "parent boundary names a live segment with no payload"
+            ))
+        ));
     }
 
     #[test]

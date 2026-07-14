@@ -69,7 +69,9 @@ fn encode_planar(matrix: &SparseFieldMatrix) -> PlanarStreams {
 
 fn compress(bytes: &[u8], level: i32) -> usize {
     let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), level).expect("encoder");
-    encoder.multithread(rayon::current_num_threads() as u32).expect("multithread");
+    encoder
+        .multithread(rayon::current_num_threads() as u32)
+        .expect("multithread");
     std::io::Write::write_all(&mut encoder, bytes).expect("compress write");
     encoder.finish().expect("compress finish").len()
 }
@@ -107,13 +109,8 @@ fn main() {
         };
 
         let t = Instant::now();
-        let r1cs = FieldR1cs::read_artifact_with_established_digest(
-            &mut &raw[..],
-            shape,
-            [0u8; 32],
-            usize::MAX,
-        )
-        .expect("parse artifact");
+        let r1cs = FieldR1cs::read_artifact_unbound(&mut &raw[..], shape, usize::MAX)
+            .expect("parse artifact");
         let parse_s = t.elapsed().as_secs_f64();
 
         let name = std::path::Path::new(&path)
@@ -143,8 +140,10 @@ fn main() {
                 compress(&streams.deltas, 19),
                 compress(&streams.values, 19),
             ];
-            let stream_raw =
-                streams.counts.len() + streams.firsts.len() + streams.deltas.len() + streams.values.len();
+            let stream_raw = streams.counts.len()
+                + streams.firsts.len()
+                + streams.deltas.len()
+                + streams.values.len();
             planar_raw += stream_raw;
             planar_zst += sizes.iter().sum::<usize>();
             println!(

@@ -139,7 +139,7 @@ AMOUNT FORMAT:
   1 NOID = 1,000,000 μNOID — the CLI converts automatically.
 
 DAEMON:
-  The daemon must be running: paranoid --mine --data-dir ~/.paranoid",
+  The daemon must be running: paranoid --mode miner --data-dir ~/.paranoid",
 )]
 struct Cli {
     /// JSON-RPC endpoint of the running paranoid daemon.
@@ -504,7 +504,7 @@ fn print_error(msg: &str) {
         || msg.contains("Node is not responding")
     {
         "Node is not responding.\n\
-             Is the paranoid daemon running?  Try: paranoid --mine\n\
+             Is the paranoid daemon running?  Try: paranoid --mode miner\n\
              Default RPC: http://127.0.0.1:9401  (override with --rpc)"
             .to_string()
     } else if msg.contains("Insufficient") || msg.contains("insufficient") {
@@ -2116,7 +2116,7 @@ async fn rpc(ctx: &Ctx<'_>, method: &str, params: &[Value]) -> anyhow::Result<Va
             if e.is_connect() || e.is_timeout() {
                 anyhow::anyhow!(
                     "Node is not responding.\n\
-                     \tIs the paranoid daemon running?  Try: paranoid --mine\n\
+                     \tIs the paranoid daemon running?  Try: paranoid --mode miner\n\
                      \tRPC endpoint: {}\n\
                      \tOverride with --rpc <URL> or NOID_RPC env var",
                     ctx.rpc

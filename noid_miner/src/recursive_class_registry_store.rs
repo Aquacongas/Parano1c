@@ -7,6 +7,7 @@ use std::fs::{self, File, Metadata};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -17,7 +18,9 @@ use std::fs::OpenOptions;
 use noid_recursive::acceptance::block_class::BlockClass;
 use noid_recursive::acceptance::split_link::{CanonicalSplitLinkLadder, SplitLinkClass};
 use noid_recursive::class_registry::{
+    decode_selected_recursive_class_registry_build_authenticated,
     decode_selected_recursive_class_registry_pinned,
+    decode_selected_recursive_terminal_registry_build_authenticated,
     decode_selected_recursive_terminal_registry_pinned, encode_selected_recursive_class_registry,
     OwnedSelectedRecursiveClassRegistry, OwnedSelectedRecursiveTerminalRegistry,
     SelectedRecursiveClassRegistryError, MAX_SELECTED_RECURSIVE_CLASS_REGISTRY_BYTES,
@@ -63,29 +66,43 @@ pub enum LocalSelectedRecursiveClassRegistryError {
 
 /// Loaded ownership plus checked borrowed views for the prover and terminal
 /// verifier.  No view clones a class or retained genesis proof.
+#[derive(Clone)]
 pub struct LoadedSelectedRecursiveClassRegistry {
-    registry: OwnedSelectedRecursiveClassRegistry,
+    registry: Arc<OwnedSelectedRecursiveClassRegistry>,
 }
 
 impl LoadedSelectedRecursiveClassRegistry {
+    /// # Safety
+    ///
+    /// `bytes` must be the exact executable-embedded payload fully accepted by
+    /// the release build's pinned full-registry decoder.
+    pub(crate) unsafe fn decode_build_authenticated_bytes(
+        bytes: &[u8],
+    ) -> Result<Self, SelectedRecursiveClassRegistryError> {
+        let registry =
+            unsafe { decode_selected_recursive_class_registry_build_authenticated(bytes)? };
+        Ok(Self {
+            registry: Arc::new(registry),
+        })
+    }
+
     pub fn owned(&self) -> &OwnedSelectedRecursiveClassRegistry {
-        &self.registry
+        self.registry.as_ref()
     }
 
     pub fn block_classes(
         &self,
     ) -> Result<SelectedRecursiveBlockClasses<'_>, SelectedRecursiveProverError> {
         let [b8, b32, b64, b255] = self.registry.block_classes();
-        SelectedRecursiveBlockClasses::try_new(b8, b32, b64, b255)
+        Ok(SelectedRecursiveBlockClasses::from_pinned_materialization(
+            b8, b32, b64, b255,
+        ))
     }
 
     pub fn link_classes(
         &self,
     ) -> Result<SelectedRecursiveLinkClasses<'_>, SelectedRecursiveProverError> {
-        SelectedRecursiveLinkClasses::try_new(
-            self.registry.descriptor(),
-            self.registry.link_classes(),
-        )
+        SelectedRecursiveLinkClasses::from_pinned_materialization(self.registry.link_classes())
     }
 
     pub fn terminal_registry(&self) -> CanonicalSelectedHistoryRegistry<'_> {
@@ -96,14 +113,109 @@ impl LoadedSelectedRecursiveClassRegistry {
 /// Relay-only pinned registry.  Its Link classes retain the mandatory Link
 /// sidecar VK but only compact selected-ZK Block identities, so no Block VK
 /// fixed-table bank can become a node-RAM baseline.
+#[derive(Clone)]
+enum LoadedSelectedRecursiveTerminalRegistryAuthority {
+    Terminal(Arc<OwnedSelectedRecursiveTerminalRegistry>),
+    Full(Arc<OwnedSelectedRecursiveClassRegistry>),
+}
+
+#[derive(Clone)]
 pub struct LoadedSelectedRecursiveTerminalRegistry {
-    registry: OwnedSelectedRecursiveTerminalRegistry,
+    registry: LoadedSelectedRecursiveTerminalRegistryAuthority,
 }
 
 impl LoadedSelectedRecursiveTerminalRegistry {
-    pub fn terminal_registry(&self) -> CanonicalSelectedHistoryRegistry<'_> {
-        self.registry.selected_history_registry()
+    /// # Safety
+    ///
+    /// `bytes` must be the exact executable-embedded payload fully accepted by
+    /// the release build's pinned terminal-registry decoder.
+    pub(crate) unsafe fn decode_build_authenticated_bytes(
+        bytes: &[u8],
+    ) -> Result<Self, SelectedRecursiveClassRegistryError> {
+        let registry =
+            unsafe { decode_selected_recursive_terminal_registry_build_authenticated(bytes)? };
+        Ok(Self {
+            registry: LoadedSelectedRecursiveTerminalRegistryAuthority::Terminal(Arc::new(
+                registry,
+            )),
+        })
     }
+
+    pub(crate) fn from_full(full: &LoadedSelectedRecursiveClassRegistry) -> Self {
+        Self {
+            registry: LoadedSelectedRecursiveTerminalRegistryAuthority::Full(Arc::clone(
+                &full.registry,
+            )),
+        }
+    }
+
+    pub fn terminal_registry(&self) -> CanonicalSelectedHistoryRegistry<'_> {
+        match &self.registry {
+            LoadedSelectedRecursiveTerminalRegistryAuthority::Terminal(registry) => {
+                registry.selected_history_registry()
+            }
+            LoadedSelectedRecursiveTerminalRegistryAuthority::Full(registry) => {
+                registry.selected_history_registry()
+            }
+        }
+    }
+
+    /// Canonical embedded-pack identities derivable from the relay-only
+    /// registry: genesis T, four Link matrices, then four Block matrices.
+    /// No Block VK materialization is needed for startup compact prewarming.
+    pub fn canonical_artifact_identities(
+        &self,
+    ) -> [crate::SelectedRecursiveMatrixArtifactIdentity; 9] {
+        use crate::recursive_prover::{SelectedRecursiveMatrixKind as Kind, SelectedRecursiveTier};
+        use crate::SelectedRecursiveMatrixArtifactIdentity as Identity;
+
+        let (descriptor, genesis_digest, registry) = match &self.registry {
+            LoadedSelectedRecursiveTerminalRegistryAuthority::Terminal(terminal) => (
+                terminal.descriptor(),
+                terminal.genesis_link_matrix_digest(),
+                terminal.selected_history_registry(),
+            ),
+            LoadedSelectedRecursiveTerminalRegistryAuthority::Full(full) => (
+                full.descriptor(),
+                full.link_classes()[0].genesis_digest,
+                full.selected_history_registry(),
+            ),
+        };
+        let tiers = [
+            SelectedRecursiveTier::B8,
+            SelectedRecursiveTier::B32,
+            SelectedRecursiveTier::B64,
+            SelectedRecursiveTier::B255,
+        ];
+        let mut identities =
+            [Identity::new(Kind::GenesisLink, descriptor.link_shape(), genesis_digest); 9];
+        for (slot, tier) in tiers.into_iter().enumerate() {
+            identities[1 + slot] = Identity::new(
+                Kind::PreviousLink(tier),
+                descriptor.link_shape(),
+                registry
+                    .link_class_digest(slot)
+                    .expect("validated terminal registry covers four Link slots"),
+            );
+            let block = &descriptor.slots()[slot];
+            identities[5 + slot] =
+                Identity::new(Kind::CurrentBlock(tier), block.b_shape, block.b_digest);
+        }
+        identities
+    }
+}
+
+/// Source of the externally pinned full prover registry.  Keeping this tiny
+/// interface independent of storage lets the production daemon use immutable
+/// bytes embedded in its executable, while the local store remains available
+/// to offline materializers and focused storage tests.
+pub trait PinnedSelectedRecursiveClassRegistrySource {
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    fn load_pinned_registry(
+        &self,
+        expected_registry_digest: [u8; 32],
+    ) -> Result<LoadedSelectedRecursiveClassRegistry, Self::Error>;
 }
 
 /// Fixed-path, fail-closed registry source.  The root is trusted local
@@ -146,7 +258,9 @@ impl LocalSelectedRecursiveClassRegistryStore {
         let bytes = self.read_artifact_bytes()?;
         let registry =
             decode_selected_recursive_class_registry_pinned(&bytes, expected_registry_digest)?;
-        Ok(LoadedSelectedRecursiveClassRegistry { registry })
+        Ok(LoadedSelectedRecursiveClassRegistry {
+            registry: Arc::new(registry),
+        })
     }
 
     /// Load the same fd-anchored artifact through the terminal-only pinned
@@ -159,7 +273,11 @@ impl LocalSelectedRecursiveClassRegistryStore {
         let bytes = self.read_artifact_bytes()?;
         let registry =
             decode_selected_recursive_terminal_registry_pinned(&bytes, expected_registry_digest)?;
-        Ok(LoadedSelectedRecursiveTerminalRegistry { registry })
+        Ok(LoadedSelectedRecursiveTerminalRegistry {
+            registry: LoadedSelectedRecursiveTerminalRegistryAuthority::Terminal(Arc::new(
+                registry,
+            )),
+        })
     }
 
     fn read_artifact_bytes(&self) -> Result<Vec<u8>, LocalSelectedRecursiveClassRegistryError> {
@@ -304,6 +422,17 @@ impl LocalSelectedRecursiveClassRegistryStore {
         let version_path = self.root.join(REGISTRY_VERSION_DIRECTORY);
         root.open_child_directory(REGISTRY_VERSION_DIRECTORY, create)
             .map_err(|source| directory_open_error(&version_path, source))
+    }
+}
+
+impl PinnedSelectedRecursiveClassRegistrySource for LocalSelectedRecursiveClassRegistryStore {
+    type Error = LocalSelectedRecursiveClassRegistryError;
+
+    fn load_pinned_registry(
+        &self,
+        expected_registry_digest: [u8; 32],
+    ) -> Result<LoadedSelectedRecursiveClassRegistry, Self::Error> {
+        self.load_pinned(expected_registry_digest)
     }
 }
 

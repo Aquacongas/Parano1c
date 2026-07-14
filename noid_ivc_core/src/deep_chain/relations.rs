@@ -444,11 +444,19 @@ pub fn prove_column_relation<Ch: Challenger>(
     absorb_relation_header(challenger, target, eq_point, terms);
 
     // Materialize one working table per distinct ref plus the eq table.
-    let mut tables: Vec<Vec<F128>> = refs.iter().map(|&r| columns.resolve(r, w)).collect();
+    let mut tables: Vec<Vec<F128>> = refs
+        .par_iter()
+        .map(|&reference| columns.resolve(reference, w))
+        .collect();
     for t in &tables {
         assert_eq!(t.len(), w, "column length mismatch");
     }
     let mut eq = build_eq_table(eq_point);
+    // Folding used to allocate a fresh output Vec for every table in every
+    // round.  Keep one alternate buffer per table instead: after the first
+    // fold the two allocations simply swap roles for the remaining rounds.
+    let mut table_scratch: Vec<Vec<F128>> = (0..tables.len()).map(|_| Vec::new()).collect();
+    let mut eq_scratch = Vec::new();
 
     // Term factor indices into `refs`.
     let term_refs: Vec<(F128, Vec<usize>)> = terms
@@ -469,17 +477,26 @@ pub fn prove_column_relation<Ch: Challenger>(
     let mut point = Vec::with_capacity(w_log);
     for _round in 0..w_log {
         let half = eq.len() / 2;
-        let evals = (0..half)
+        // `bases` is only pair-local scratch.  Allocating it in the item
+        // closure caused one heap allocation per Boolean pair (131071 of
+        // them for a 2^17 relation), amplified by recording relations with
+        // dozens of fixed refs.  Rayon fold state gives each worker one Vec
+        // to clear and reuse while preserving the exact coefficient sums.
+        let table_count = tables.len();
+        let (evals, _) = (0..half)
             .into_par_iter()
             .fold(
-                || [F128::ZERO; RELATION_NODES],
-                |mut acc, p| {
+                || {
+                    (
+                        [F128::ZERO; RELATION_NODES],
+                        Vec::with_capacity(table_count),
+                    )
+                },
+                |(mut acc, mut bases), p| {
                     let eq_base = eq[2 * p];
                     let eq_delta = eq[2 * p] + eq[2 * p + 1];
-                    let bases: Vec<(F128, F128)> = tables
-                        .iter()
-                        .map(|t| (t[2 * p], t[2 * p] + t[2 * p + 1]))
-                        .collect();
+                    bases.clear();
+                    bases.extend(tables.iter().map(|t| (t[2 * p], t[2 * p] + t[2 * p + 1])));
                     for (t, slot) in acc.iter_mut().enumerate() {
                         let t_f = f128_of_usize(t);
                         let eq_t = eq_base + t_f * eq_delta;
@@ -494,16 +511,19 @@ pub fn prove_column_relation<Ch: Challenger>(
                         }
                         *slot += eq_t * sum;
                     }
-                    acc
+                    (acc, bases)
                 },
             )
             .reduce(
-                || [F128::ZERO; RELATION_NODES],
-                |mut a, b| {
+                || ([F128::ZERO; RELATION_NODES], Vec::new()),
+                |(mut a, mut a_scratch), (b, b_scratch)| {
                     for (x, y) in a.iter_mut().zip(b.iter()) {
                         *x += *y;
                     }
-                    a
+                    if b_scratch.capacity() > a_scratch.capacity() {
+                        a_scratch = b_scratch;
+                    }
+                    (a, a_scratch)
                 },
             );
         let full = interpolate_round(&evals);
@@ -516,9 +536,9 @@ pub fn prove_column_relation<Ch: Challenger>(
         claim = horner_round(&full, r);
         point.push(r);
         rounds.push(wire);
-        fold_table(&mut eq, r);
-        for t in tables.iter_mut() {
-            fold_table(t, r);
+        fold_table_reuse(&mut eq, &mut eq_scratch, r);
+        for (table, scratch) in tables.iter_mut().zip(&mut table_scratch) {
+            fold_table_reuse(table, scratch, r);
         }
     }
 
@@ -612,17 +632,15 @@ pub fn verify_column_relation<Ch: Challenger>(
     Ok(point)
 }
 
-fn fold_table(table: &mut Vec<F128>, r: F128) {
+fn fold_table_reuse(table: &mut Vec<F128>, scratch: &mut Vec<F128>, r: F128) {
     let half = table.len() / 2;
-    let folded: Vec<F128> = (0..half)
-        .into_par_iter()
-        .map(|p| {
-            let a = table[2 * p];
-            let b = table[2 * p + 1];
-            a + r * (a + b)
-        })
-        .collect();
-    *table = folded;
+    scratch.clear();
+    scratch.par_extend((0..half).into_par_iter().map(|p| {
+        let a = table[2 * p];
+        let b = table[2 * p + 1];
+        a + r * (a + b)
+    }));
+    std::mem::swap(table, scratch);
 }
 
 // ---------------------------------------------------------------------------
@@ -711,6 +729,8 @@ pub fn prove_shift_discharge_pow2<Ch: Challenger>(
     let mut n_table = vec![F128::ZERO; w];
     n_table[..w - shift].copy_from_slice(&eq_sigma[shift..]);
     let mut col_table = col.to_vec();
+    let mut n_scratch = Vec::new();
+    let mut col_scratch = Vec::new();
 
     let mut claim = target;
     let mut rounds = Vec::with_capacity(w_log);
@@ -751,8 +771,8 @@ pub fn prove_shift_discharge_pow2<Ch: Challenger>(
         claim = (full[2] * r + full[1]) * r + full[0];
         point.push(r);
         rounds.push(wire);
-        fold_table(&mut n_table, r);
-        fold_table(&mut col_table, r);
+        fold_table_reuse(&mut n_table, &mut n_scratch, r);
+        fold_table_reuse(&mut col_table, &mut col_scratch, r);
     }
 
     let final_value = col_table[0];
@@ -861,6 +881,8 @@ pub fn prove_weighted_sum<Ch: Challenger>(
 
     let mut wt = weights.to_vec();
     let mut col_t = col.to_vec();
+    let mut wt_scratch = Vec::new();
+    let mut col_scratch = Vec::new();
     let mut claim = target;
     let mut rounds = Vec::with_capacity(w_log);
     let mut point = Vec::with_capacity(w_log);
@@ -899,8 +921,8 @@ pub fn prove_weighted_sum<Ch: Challenger>(
         claim = (full[2] * r + full[1]) * r + full[0];
         point.push(r);
         rounds.push(wire);
-        fold_table(&mut wt, r);
-        fold_table(&mut col_t, r);
+        fold_table_reuse(&mut wt, &mut wt_scratch, r);
+        fold_table_reuse(&mut col_t, &mut col_scratch, r);
     }
     let final_value = col_t[0];
     challenger.observe_f128(final_value);
@@ -983,6 +1005,126 @@ mod tests {
     use super::*;
     use crate::challenger::{Challenger, FsLaneChallenger};
 
+    /// Allocation-heavy implementation retained only as a byte-parity oracle
+    /// for the optimized prover loop above.
+    fn prove_column_relation_allocating_reference<Ch: Challenger>(
+        target: F128,
+        eq_point: &[F128],
+        terms: &[RelationTerm],
+        columns: &RelationColumns<'_>,
+        challenger: &mut Ch,
+    ) -> (ColumnRelationProof, Vec<F128>, Vec<F128>) {
+        let w_log = eq_point.len();
+        let w = 1usize << w_log;
+        let refs = distinct_refs(terms);
+        let claimed = claimed_refs(terms);
+
+        absorb_relation_header(challenger, target, eq_point, terms);
+        let mut tables: Vec<Vec<F128>> = refs
+            .iter()
+            .map(|&reference| columns.resolve(reference, w))
+            .collect();
+        let mut eq = build_eq_table(eq_point);
+        let term_refs: Vec<(F128, Vec<usize>)> = terms
+            .iter()
+            .map(|term| {
+                (
+                    term.coeff,
+                    term.factors
+                        .iter()
+                        .map(|factor| refs.iter().position(|r| r == factor).unwrap())
+                        .collect(),
+                )
+            })
+            .collect();
+
+        let mut claim = target;
+        let mut rounds = Vec::with_capacity(w_log);
+        let mut point = Vec::with_capacity(w_log);
+        for _round in 0..w_log {
+            let half = eq.len() / 2;
+            let evals = (0..half)
+                .into_par_iter()
+                .fold(
+                    || [F128::ZERO; RELATION_NODES],
+                    |mut acc, p| {
+                        let eq_base = eq[2 * p];
+                        let eq_delta = eq[2 * p] + eq[2 * p + 1];
+                        let bases: Vec<(F128, F128)> = tables
+                            .iter()
+                            .map(|table| (table[2 * p], table[2 * p] + table[2 * p + 1]))
+                            .collect();
+                        for (t, slot) in acc.iter_mut().enumerate() {
+                            let t_f = f128_of_usize(t);
+                            let eq_t = eq_base + t_f * eq_delta;
+                            let mut sum = F128::ZERO;
+                            for (coeff, factors) in &term_refs {
+                                let mut product = *coeff;
+                                for &factor in factors {
+                                    let (base, delta) = bases[factor];
+                                    product *= base + t_f * delta;
+                                }
+                                sum += product;
+                            }
+                            *slot += eq_t * sum;
+                        }
+                        acc
+                    },
+                )
+                .reduce(
+                    || [F128::ZERO; RELATION_NODES],
+                    |mut left, right| {
+                        for (left, right) in left.iter_mut().zip(right) {
+                            *left += right;
+                        }
+                        left
+                    },
+                );
+            let full = interpolate_round(&evals);
+            debug_assert_eq!(full[0] + horner_round(&full, F128::ONE), claim);
+            let mut wire = [F128::ZERO; RELATION_DEGREE];
+            wire[0] = full[0];
+            wire[1..].copy_from_slice(&full[2..]);
+            challenger.observe_f128_slice(&wire);
+            let r = challenger.sample_f128();
+            claim = horner_round(&full, r);
+            point.push(r);
+            rounds.push(wire);
+            let fold_allocating = |table: &mut Vec<F128>| {
+                let half = table.len() / 2;
+                *table = (0..half)
+                    .into_par_iter()
+                    .map(|p| {
+                        let a = table[2 * p];
+                        let b = table[2 * p + 1];
+                        a + r * (a + b)
+                    })
+                    .collect();
+            };
+            fold_allocating(&mut eq);
+            for table in &mut tables {
+                fold_allocating(table);
+            }
+        }
+
+        let final_values: Vec<F128> = refs
+            .iter()
+            .zip(&tables)
+            .filter(|(reference, _)| !matches!(reference, ColRef::Fixed(_)))
+            .map(|(_, table)| table[0])
+            .collect();
+        debug_assert_eq!(final_values.len(), claimed.len());
+        challenger.observe_f128_slice(&final_values);
+        (
+            ColumnRelationProof {
+                rounds,
+                final_values: final_values.clone(),
+            },
+            point,
+            final_values,
+        )
+    }
+
     struct Rng(u64);
     impl Rng {
         fn next_u64(&mut self) -> u64 {
@@ -1018,6 +1160,138 @@ mod tests {
 
     fn random_col(rng: &mut Rng, w: usize) -> Vec<F128> {
         (0..w).map(|_| rng.f128()).collect()
+    }
+
+    #[test]
+    fn column_relation_reused_scratch_is_byte_identical() {
+        // Mirror the recordings-C substitution shape: six committed columns,
+        // nine disjoint seven-pattern sets, 94 terms and 69 distinct refs.
+        let mut rng = Rng(0x5C4A_7C4);
+        // The override turns this parity test into a narrow release microbench
+        // without burdening the default test suite (for example, set it to
+        // 14 to make allocator overhead visible).
+        let w_log = std::env::var("NOID_RELATION_PARITY_W_LOG")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(8usize);
+        assert!(w_log >= 8);
+        let w = 1usize << w_log;
+        let committed_owned: Vec<Vec<F128>> = (0..6).map(|_| random_col(&mut rng, w)).collect();
+        let committed: Vec<&[F128]> = committed_owned.iter().map(Vec::as_slice).collect();
+
+        let mut fixed = Vec::new();
+        for set in 0..9usize {
+            let gate_bits: Vec<bool> = (0..w_log - 4).map(|bit| (set >> bit) & 1 == 1).collect();
+            for _pattern in 0..7 {
+                fixed.push(
+                    FixedPattern::new(4, random_col(&mut rng, 1 << 4)).gated(4, gate_bits.clone()),
+                );
+            }
+        }
+        let columns = RelationColumns {
+            committed: &committed,
+            internal: &[],
+            fixed: &fixed,
+        };
+
+        let mut terms = Vec::new();
+        for lane in 0..4 {
+            terms.push(RelationTerm {
+                coeff: rng.f128(),
+                factors: vec![ColRef::CommittedShift(2 + lane)],
+            });
+        }
+        for set in 0..9usize {
+            let base = 7 * set;
+            for lane in 0..4 {
+                terms.push(RelationTerm {
+                    coeff: rng.f128(),
+                    factors: vec![ColRef::Fixed(base), ColRef::CommittedShift(2 + lane)],
+                });
+                if lane < 2 {
+                    terms.push(RelationTerm {
+                        coeff: rng.f128(),
+                        factors: vec![ColRef::Fixed(base + 1 + lane), ColRef::Committed(lane)],
+                    });
+                }
+                terms.push(RelationTerm {
+                    coeff: rng.f128(),
+                    factors: vec![ColRef::Fixed(base + 3 + lane)],
+                });
+            }
+        }
+        assert_eq!(terms.len(), 94);
+        assert_eq!(distinct_refs(&terms).len(), 69);
+
+        let eq_point: Vec<F128> = (0..w_log).map(|_| rng.f128()).collect();
+        let eq = build_eq_table(&eq_point);
+        let refs = distinct_refs(&terms);
+        let resolved: Vec<Vec<F128>> = refs
+            .iter()
+            .map(|&reference| columns.resolve(reference, w))
+            .collect();
+        let mut target = F128::ZERO;
+        for row in 0..w {
+            let mut relation = F128::ZERO;
+            for term in &terms {
+                let mut product = term.coeff;
+                for factor in &term.factors {
+                    let index = refs
+                        .iter()
+                        .position(|reference| reference == factor)
+                        .unwrap();
+                    product *= resolved[index][row];
+                }
+                relation += product;
+            }
+            target += eq[row] * relation;
+        }
+
+        let mut reference_challenger = FsLaneChallenger::new(b"relation-scratch-parity");
+        let reference_started = std::time::Instant::now();
+        let reference = prove_column_relation_allocating_reference(
+            target,
+            &eq_point,
+            &terms,
+            &columns,
+            &mut reference_challenger,
+        );
+        let reference_elapsed = reference_started.elapsed();
+        let mut optimized_challenger = FsLaneChallenger::new(b"relation-scratch-parity");
+        let optimized_started = std::time::Instant::now();
+        let optimized = prove_column_relation(
+            target,
+            &eq_point,
+            &terms,
+            &columns,
+            &mut optimized_challenger,
+        );
+        let optimized_elapsed = optimized_started.elapsed();
+        if std::env::var_os("NOID_RELATION_PARITY_W_LOG").is_some() {
+            eprintln!(
+                "recording relation w_log={w_log}: allocating={reference_elapsed:?} reused={optimized_elapsed:?} speedup={:.2}x",
+                reference_elapsed.as_secs_f64() / optimized_elapsed.as_secs_f64(),
+            );
+        }
+        assert_eq!(optimized, reference);
+        assert_eq!(
+            optimized_challenger.sample_f128(),
+            reference_challenger.sample_f128(),
+            "post-proof Fiat-Shamir state",
+        );
+
+        let mut verifier = FsLaneChallenger::new(b"relation-scratch-parity");
+        let verified_point = verify_column_relation(
+            w_log,
+            target,
+            &eq_point,
+            &terms,
+            &fixed,
+            &optimized.0,
+            &mut verifier,
+        )
+        .expect("optimized proof verifies");
+        assert_eq!(verified_point, optimized.1);
     }
 
     #[test]

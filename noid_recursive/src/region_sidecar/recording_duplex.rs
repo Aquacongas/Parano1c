@@ -37,9 +37,9 @@ use crate::acceptance::trace::deep_chain::{
     LaneClaimGroupTrace, ShiftDischargeProofTrace,
 };
 use crate::acceptance::trace::region_source_binding::{
-    duplex_sub_terms_trace_multi, duplex_substitution_terms_sets, rec_hi_bits,
+    duplex_sub_terms_trace_multi, duplex_substitution_terms_sets,
     prove_duplex_union_walk_prefix_with_challenger, prove_duplex_union_walk_suffix_with_challenger,
-    verify_duplex_union_walk_prefix_with_challenger,
+    rec_hi_bits, verify_duplex_union_walk_prefix_with_challenger,
     verify_duplex_union_walk_suffix_with_challenger, DuplexColumnClaim, DuplexUnion,
     DuplexUnionProverWalkPrefix, DuplexUnionVerifierWalkPrefix,
 };
@@ -116,10 +116,7 @@ impl RecordingDuplexRegionVk {
             return Err(RegionSidecarError::UnsupportedVkShape);
         }
         let vk = Self::new(purpose, union.w_log, slices, union.rec_blocks.clone())?;
-        if vk.fixed != union.fixed
-            || vk.refs != union.refs
-            || vk.rec_refs != union.rec_refs
-        {
+        if vk.fixed != union.fixed || vk.refs != union.refs || vk.rec_refs != union.rec_refs {
             return Err(RegionSidecarError::BadVk);
         }
         Ok(vk)
@@ -501,13 +498,8 @@ impl RecordingDuplexTraceWalkContinuation<'_> {
         if context.total_vars() != self.total_vars {
             return Err(RegionSidecarError::InvalidProof);
         }
-        let terminal = verify_recording_duplex_suffix_trace(
-            b,
-            context,
-            self.vk,
-            self.prefix,
-            walk_terminal,
-        )?;
+        let terminal =
+            verify_recording_duplex_suffix_trace(b, context, self.vk, self.prefix, walk_terminal)?;
         terminal
             .into_iter()
             .map(|claim| {
@@ -598,9 +590,7 @@ fn verify_recording_duplex_suffix_trace<C: FsChannelOps>(
     // multi-block union uses the multi-set form (the relation header absorbs
     // the term structure, so the order is transcript-significant).
     let (substitution_terms, alpha_powers) = if vk.rec_refs.is_empty() {
-        crate::acceptance::trace::region_source_binding::duplex_sub_terms_trace(
-            b, &vk.refs, &alpha,
-        )
+        crate::acceptance::trace::region_source_binding::duplex_sub_terms_trace(b, &vk.refs, &alpha)
     } else {
         let sets = recording_ref_sets(vk);
         duplex_sub_terms_trace_multi(b, &sets, &alpha)

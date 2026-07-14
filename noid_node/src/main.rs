@@ -33,31 +33,32 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
+use std::{fs::OpenOptions, io::Write};
 
 use anyhow::Context;
 use clap::Parser;
 use tokio::sync::RwLock;
 use tracing_subscriber::EnvFilter;
 
-use noid_chain::consensus::NetworkConfig;
 use noid_chain::consensus::wire_limits::{
     MAX_INFLIGHT_SEGMENTS, MAX_ORPHAN_POOL, MAX_ORPHAN_POOL_BYTES, MAX_SEGMENT_BYTES,
     MAX_SNAPSHOT_MANIFEST_SEGMENTS, MAX_TX_INTENT_BYTES_GLOBAL,
 };
+use noid_chain::consensus::NetworkConfig;
 use noid_chain::storage::snapshot_staging::{
     AuthenticatedSnapshotMetadata, FinalizedSnapshotStaging, SnapshotStagingSession,
 };
 use noid_chain::storage::{
-    MdbxChainContext, SnapshotSegmentDescriptor, encoded_segment_len_for_eff_log,
+    encoded_segment_len_for_eff_log, MdbxChainContext, SnapshotSegmentDescriptor,
 };
 use noid_mempool::{AsyncMempool, ChainView, MempoolConfig};
 use noid_miner::{BlockMiner, MinerConfig};
 use noid_node::snapshot_header_staging::{
-    CanonicalHeaderBoundary, MAX_STAGED_HEADER_BATCH, SelectedTerminalHeaderBoundary,
-    SnapshotHeaderStaging, VerifiedSnapshotHeaderStaging,
+    CanonicalHeaderBoundary, SelectedTerminalHeaderBoundary, SnapshotHeaderStaging,
+    VerifiedSnapshotHeaderStaging, MAX_STAGED_HEADER_BATCH,
 };
 use noid_p2p::{NetworkEvent, P2PNetwork};
-use noid_rpc::{WalletOperationGate, start_rpc_server};
+use noid_rpc::{start_rpc_server, WalletOperationGate};
 
 struct ProvedBlockCandidate {
     block: noid_chain::block::Block,
@@ -133,27 +134,10 @@ fn gap_requires_snapshot_sync(local_height: u64, peer_height: u64) -> bool {
         > local_height.saturating_add(noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH)
 }
 
-/// A release build embeds this authority independently of the local artifact.
-/// Until a digest is provisioned, deep snapshot admission fails closed while
-/// recent full-block synchronization remains available.
-const SELECTED_RECURSIVE_REGISTRY_RELEASE_DIGEST_HEX: Option<&str> =
-    option_env!("NOID_SELECTED_RECURSIVE_REGISTRY_RELEASE_DIGEST");
-const SELECTED_RECURSIVE_ARTIFACT_DIRECTORY: &str = "selected-recursive";
-/// Release-pack leaf pins: nine concatenated 32-byte Poseidon2b hashes of the
-/// compressed artifact files, hex-encoded, in canonical identity order
-/// (genesis T, Link B8/B32/B64/B255, Block B8/B32/B64/B255). A build without
-/// pins still seeds files from the distribution folder, but the one-time full
-/// authentication then runs on first sync instead of at install.
-const SELECTED_RECURSIVE_PACK_LEAF_DIGESTS_HEX: Option<&str> =
-    option_env!("NOID_SELECTED_RECURSIVE_PACK_LEAF_DIGESTS");
-const SELECTED_RECURSIVE_PACK_LEAF_HASH_DOMAIN: &[u8] = b"NOID/SELECTED-RECURSIVE/PACK-LEAF";
-/// Hard per-file bound when reading distribution-pack candidates; the real
-/// compressed leaves are two orders of magnitude below this.
-const SELECTED_RECURSIVE_PACK_LEAF_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
-
 #[derive(Clone)]
 struct SelectedHistoryVerifierArtifacts {
-    root: PathBuf,
+    registry_source: noid_miner::EmbeddedSelectedRecursiveClassRegistrySource,
+    matrix_source: noid_miner::EmbeddedSelectedRecursiveMatrixSource,
     registry_digest: [u8; 32],
 }
 
@@ -246,349 +230,73 @@ struct RemoteSelectedHistoryVerificationCompletion {
     result: Result<VerifiedRemoteSelectedHistoryTerminal, String>,
 }
 
-/// One-time startup preflight over the selected-recursive artifact set: the
-/// pinned registry plus nine canonical matrices (T, four PreviousLink tiers,
-/// four CurrentBlock tiers). Missing pieces only disable the proof-native
-/// roles — snapshot admission and the proving worker; full-block sync stays
-/// available — but the node says so once at startup, loudly and with the
-/// exact missing list, instead of erroring deep inside the first sync.
-fn preflight_selected_recursive_artifacts(artifacts: &SelectedHistoryVerifierArtifacts) {
-    use noid_miner::{
-        selected_recursive_matrix_relative_path, SelectedRecursiveMatrixKind as Kind,
-        SelectedRecursiveTier as Tier,
-    };
-
-    let mut missing: Vec<String> = Vec::new();
-    let registry_path =
-        noid_miner::LocalSelectedRecursiveClassRegistryStore::new(artifacts.root.clone())
-            .artifact_path();
-    if !registry_path.is_file() {
-        missing.push("pinned class registry".into());
-    }
-    let kinds = [
-        Kind::GenesisLink,
-        Kind::PreviousLink(Tier::B8),
-        Kind::PreviousLink(Tier::B32),
-        Kind::PreviousLink(Tier::B64),
-        Kind::PreviousLink(Tier::B255),
-        Kind::CurrentBlock(Tier::B8),
-        Kind::CurrentBlock(Tier::B32),
-        Kind::CurrentBlock(Tier::B64),
-        Kind::CurrentBlock(Tier::B255),
-    ];
-    for kind in kinds {
-        let relative = selected_recursive_matrix_relative_path(kind);
-        let raw = artifacts.root.join(&relative);
-        let compressed = raw.with_extension("field-r1cs.zst");
-        if !raw.is_file() && !compressed.is_file() {
-            missing.push(relative.display().to_string());
-        }
-    }
-
-    if missing.is_empty() {
-        tracing::info!(
-            root = %artifacts.root.display(),
-            "selected-recursive artifacts complete: pinned registry and all nine canonical matrices"
-        );
-    } else {
-        tracing::warn!(
-            root = %artifacts.root.display(),
-            missing = %missing.join(", "),
-            "selected-recursive artifacts incomplete: proof-native snapshot admission and the \
-             proving worker stay disabled until the canonical artifacts are installed. Install \
-             by placing the release matrix pack next to this binary and restarting (the node \
-             adopts it automatically), by copying the files into the directory above, or by \
-             rebuilding them with the standalone `noid_matrix_gen` tool. Ordinary full-block \
-             sync remains available meanwhile"
-        );
-    }
-}
-
-/// First-run installation: seed missing canonical artifacts from the
-/// directory the running executable was launched from (the unpacked release
-/// folder). Fail-closed at every step: the registry candidate must decode
-/// under the embedded release pin before it is installed, and each matrix
-/// leaf must match its embedded pack pin before it is installed and
-/// trust-adopted. A verified install is removed from the distribution folder
-/// (best effort) so the user is never left with a second stale copy; an
-/// unverifiable candidate is left in place and reported.
-fn seed_selected_recursive_artifacts_from_distribution(
-    artifacts: &SelectedHistoryVerifierArtifacts,
-) {
-    use noid_miner::{selected_recursive_matrix_relative_path, SelectedRecursiveMatrixKind as Kind};
-
-    let registry_store =
-        noid_miner::LocalSelectedRecursiveClassRegistryStore::new(artifacts.root.clone());
-    let registry_path = registry_store.artifact_path();
-    let version_directory = artifacts.root.join("v1");
-
-    let leaf_of = |kind: Kind| {
-        let compressed = artifacts
-            .root
-            .join(selected_recursive_matrix_relative_path(kind))
-            .with_extension("field-r1cs.zst");
-        let name = compressed
-            .file_name()
-            .expect("compressed artifact leaf has a file name")
-            .to_owned();
-        (compressed, name)
-    };
-    let kinds = [
-        Kind::GenesisLink,
-        Kind::PreviousLink(noid_miner::SelectedRecursiveTier::B8),
-        Kind::PreviousLink(noid_miner::SelectedRecursiveTier::B32),
-        Kind::PreviousLink(noid_miner::SelectedRecursiveTier::B64),
-        Kind::PreviousLink(noid_miner::SelectedRecursiveTier::B255),
-        Kind::CurrentBlock(noid_miner::SelectedRecursiveTier::B8),
-        Kind::CurrentBlock(noid_miner::SelectedRecursiveTier::B32),
-        Kind::CurrentBlock(noid_miner::SelectedRecursiveTier::B64),
-        Kind::CurrentBlock(noid_miner::SelectedRecursiveTier::B255),
-    ];
-
-    let registry_missing = !registry_path.is_file();
-    let missing_kinds: Vec<Kind> = kinds
-        .iter()
-        .copied()
-        .filter(|kind| {
-            let (compressed, _) = leaf_of(*kind);
-            !compressed.is_file() && !compressed.with_extension("").is_file()
-        })
-        .collect();
-    if !registry_missing && missing_kinds.is_empty() {
-        return;
-    }
-
-    let Some(distribution) = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(Path::to_path_buf))
-    else {
-        return;
-    };
-    // A development binary running out of the artifact root must not seed
-    // from itself.
-    let same_tree = |left: &Path, right: &Path| match (left.canonicalize(), right.canonicalize()) {
-        (Ok(left), Ok(right)) => left == right,
-        _ => false,
-    };
-    if same_tree(&distribution, &artifacts.root) || same_tree(&distribution, &version_directory) {
-        return;
-    }
-
-    if registry_missing {
-        let candidate = distribution.join("selected-recursive.classes");
-        match std::fs::read(&candidate) {
-            Err(_) => {}
-            Ok(bytes) if bytes.len() > noid_recursive::MAX_SELECTED_RECURSIVE_CLASS_REGISTRY_BYTES => {
-                tracing::warn!(
-                    candidate = %candidate.display(),
-                    "distribution registry candidate exceeds the registry size cap; ignored"
-                );
-            }
-            Ok(bytes) => {
-                match noid_recursive::decode_selected_recursive_terminal_registry_pinned(
-                    &bytes,
-                    artifacts.registry_digest,
-                ) {
-                    Ok(_) => {
-                        if let Err(error) = install_distribution_file(
-                            &version_directory,
-                            &registry_path,
-                            &bytes,
-                            &candidate,
-                        ) {
-                            tracing::warn!(
-                                candidate = %candidate.display(),
-                                %error,
-                                "failed to install the verified distribution registry"
-                            );
-                        } else {
-                            tracing::info!(
-                                registry = %registry_path.display(),
-                                "installed the pinned class registry from the distribution folder"
-                            );
-                        }
-                    }
-                    Err(error) => tracing::warn!(
-                        candidate = %candidate.display(),
-                        %error,
-                        "distribution registry candidate does not match the embedded release pin; ignored"
-                    ),
-                }
-            }
-        }
-    }
-
-    if missing_kinds.is_empty() {
-        return;
-    }
-    let loaded = match registry_store.load_pinned(artifacts.registry_digest) {
-        Ok(loaded) => loaded,
-        // No verified registry: nothing can pin the matrices. The preflight
-        // warning that follows lists everything that is still missing.
-        Err(_) => return,
-    };
-    let link_classes = match loaded.link_classes() {
-        Ok(classes) => classes,
-        Err(error) => {
-            tracing::warn!(%error, "pinned registry rejected while enumerating identities");
-            return;
-        }
-    };
-    let identities = link_classes.canonical_artifact_identities();
-
-    let leaf_pins: Option<Vec<[u8; 32]>> = SELECTED_RECURSIVE_PACK_LEAF_DIGESTS_HEX
-        .filter(|encoded| encoded.len() == 9 * 64)
-        .and_then(|encoded| {
-            let mut pins = Vec::with_capacity(9);
-            for index in 0..9 {
-                let mut pin = [0u8; 32];
-                hex::decode_to_slice(&encoded[index * 64..(index + 1) * 64], &mut pin).ok()?;
-                pins.push(pin);
-            }
-            Some(pins)
-        });
-    if leaf_pins.is_none() {
-        tracing::warn!(
-            "release pack leaf pins are not embedded in this build: distribution matrices are \
-             installed unverified and the first sync performs the one-time full authentication"
-        );
-    }
-
-    let matrix_source = noid_miner::LocalSelectedRecursiveMatrixSource::new(artifacts.root.clone());
-    let mut installed = 0usize;
-    for kind in missing_kinds {
-        let (final_path, leaf_name) = leaf_of(kind);
-        let candidate = distribution.join(&leaf_name);
-        let Ok(metadata) = std::fs::metadata(&candidate) else {
-            continue;
-        };
-        if !metadata.is_file() || metadata.len() > SELECTED_RECURSIVE_PACK_LEAF_MAX_BYTES {
-            continue;
-        }
-        let index = identities
-            .iter()
-            .position(|identity| identity.kind() == kind)
-            .expect("canonical identities cover every preflight kind");
-        let bytes = match std::fs::read(&candidate) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                tracing::warn!(candidate = %candidate.display(), %error, "cannot read pack candidate");
-                continue;
-            }
-        };
-        if let Some(pins) = &leaf_pins {
-            let digest = noid_poseidon2b::native::poseidon2b_hash_byte_slices(
-                SELECTED_RECURSIVE_PACK_LEAF_HASH_DOMAIN,
-                &[&bytes],
-            );
-            if digest != pins[index] {
-                tracing::warn!(
-                    candidate = %candidate.display(),
-                    "pack candidate does not match its embedded release pin; left in place, not installed"
-                );
-                continue;
-            }
-        }
-        if let Err(error) =
-            install_distribution_file(&version_directory, &final_path, &bytes, &candidate)
-        {
-            tracing::warn!(
-                candidate = %candidate.display(),
-                %error,
-                "failed to install verified pack candidate"
-            );
-            continue;
-        }
-        if leaf_pins.is_some() {
-            let identity = identities[index];
-            if let Err(error) =
-                matrix_source.adopt_artifact_trust(kind, identity.statement_digest())
-            {
-                tracing::warn!(
-                    leaf = %final_path.display(),
-                    %error,
-                    "trust adoption failed; the first authenticated load will rehash once"
-                );
-            }
-        }
-        installed += 1;
-        tracing::info!(
-            leaf = %final_path.display(),
-            verified = leaf_pins.is_some(),
-            "installed canonical matrix from the distribution folder"
-        );
-    }
-    if installed > 0 {
-        tracing::info!(
-            installed,
-            root = %artifacts.root.display(),
-            "distribution pack adopted into the data directory"
-        );
-    }
-}
-
-/// Write `bytes` into `final_path` atomically (temp + rename inside the
-/// version directory), then best-effort remove the verified source file.
-fn install_distribution_file(
-    version_directory: &Path,
-    final_path: &Path,
-    bytes: &[u8],
-    source: &Path,
-) -> std::io::Result<()> {
-    std::fs::create_dir_all(version_directory)?;
-    let temporary = final_path.with_extension("install-tmp");
-    {
-        let mut file = std::fs::File::create(&temporary)?;
-        use std::io::Write as _;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-    }
-    if let Err(error) = std::fs::rename(&temporary, final_path) {
-        let _ = std::fs::remove_file(&temporary);
-        return Err(error);
-    }
-    if let Err(error) = std::fs::remove_file(source) {
-        tracing::debug!(
-            source = %source.display(),
-            %error,
-            "verified distribution source could not be removed; leaving it in place"
-        );
-    }
-    Ok(())
-}
-
 fn selected_history_verifier_artifacts(
-    data_dir: &Path,
+    retention: noid_miner::EmbeddedSelectedRecursiveRetention,
 ) -> Result<Option<SelectedHistoryVerifierArtifacts>, String> {
-    let Some(encoded) = SELECTED_RECURSIVE_REGISTRY_RELEASE_DIGEST_HEX else {
+    let Some(pack) = embedded_selected_recursive_pack::embedded_selected_recursive_pack() else {
         return Ok(None);
     };
-    if encoded.len() != 64 {
-        return Err("embedded selected-recursive registry digest must be exactly 32 bytes".into());
+    let leaves = std::array::from_fn(|index| {
+        let leaf = &pack.leaves()[index];
+        (
+            leaf.kind(),
+            leaf.compressed_runtime_image(),
+            leaf.build_seal(),
+        )
+    });
+    // SAFETY: the pack and seals are one generated static emitted only after
+    // build.rs authenticated every exact staged leaf against the pinned
+    // registry. No runtime or filesystem bytes can reach this constructor.
+    let embedded = unsafe {
+        noid_miner::EmbeddedSelectedRecursiveArtifacts::from_build_authenticated(
+            pack.registry_bytes(),
+            pack.registry_digest(),
+            leaves,
+            retention,
+        )
     }
-    let mut registry_digest = [0u8; 32];
-    hex::decode_to_slice(encoded, &mut registry_digest).map_err(|error| {
-        format!("embedded selected-recursive registry digest is invalid: {error}")
-    })?;
-    Ok(Some(SelectedHistoryVerifierArtifacts {
-        root: data_dir.join(SELECTED_RECURSIVE_ARTIFACT_DIRECTORY),
-        registry_digest,
-    }))
+    .map_err(|error| format!("embedded selected-recursive pack rejected: {error}"))?;
+    tracing::info!(
+        embedded_matrix_mib = pack.embedded_bytes_total() / (1024 * 1024),
+        ?retention,
+        "build-authenticated selected-recursive runtime images loaded from the executable"
+    );
+    let artifacts = SelectedHistoryVerifierArtifacts {
+        registry_source: embedded.registry_source(),
+        matrix_source: embedded.matrix_source(),
+        registry_digest: pack.registry_digest(),
+    };
+
+    Ok(Some(artifacts))
+}
+
+#[derive(Clone)]
+struct SelectedHistoryWorkerWake {
+    thread: std::thread::Thread,
+}
+
+impl SelectedHistoryWorkerWake {
+    fn wake(&self) {
+        self.thread.unpark();
+    }
 }
 
 struct SelectedHistoryWorkerRuntime {
     cancelled: Arc<std::sync::atomic::AtomicBool>,
+    wake: SelectedHistoryWorkerWake,
     thread: Option<std::thread::JoinHandle<()>>,
     stopped: tokio::sync::oneshot::Receiver<()>,
 }
 
 impl SelectedHistoryWorkerRuntime {
+    fn wake_handle(&self) -> SelectedHistoryWorkerWake {
+        self.wake.clone()
+    }
+
     fn signal_stop(&self) {
         self.cancelled
             .store(true, std::sync::atomic::Ordering::Release);
-        if let Some(thread) = &self.thread {
-            thread.thread().unpark();
-        }
+        self.wake.wake();
     }
 
     async fn shutdown(mut self) {
@@ -612,57 +320,97 @@ impl SelectedHistoryWorkerRuntime {
     }
 }
 
-fn start_selected_history_worker(
+/// Fully authenticated/prewarmed worker state. Construction is synchronous
+/// and must finish before either network listener is exposed; spawning the
+/// polling thread is deliberately a separate, allocation-light step.
+type SelectedHistoryWorkerSpawn =
+    Box<dyn FnOnce() -> Result<SelectedHistoryWorkerRuntime, String> + Send + 'static>;
+
+struct PreparedSelectedHistoryWorker {
+    spawn: Option<SelectedHistoryWorkerSpawn>,
+}
+
+fn prepare_selected_history_worker(
     store: noid_chain::storage::MdbxStore,
     artifacts: SelectedHistoryVerifierArtifacts,
-) -> Result<SelectedHistoryWorkerRuntime, String> {
-    // Fail at startup, under the 64 MiB terminal-verifier envelope, if the
-    // externally pinned release registry is absent or malformed. The compact
-    // validation copy is dropped before the durable worker starts polling.
-    let registry_store =
-        noid_miner::LocalSelectedRecursiveClassRegistryStore::new(artifacts.root.clone());
-    let mut registry_admission = noid_miner::begin_selected_history_terminal_verification_session()
-        .map_err(|error| format!("selected-history registry admission failed: {error}"))?;
-    registry_admission
-        .load_pinned_registry(&registry_store, artifacts.registry_digest)
-        .map_err(|error| format!("selected-history release registry rejected: {error}"))?;
-    drop(registry_admission);
-
-    let mut matrix_source =
-        noid_miner::LocalSelectedRecursiveMatrixSource::new(artifacts.root.clone());
-    // The worker verifies its own terminal package inside the retained
-    // 8 GiB proving session, after all transient proof matrices are gone;
-    // resident one-at-a-time claim evaluation always fits that admission.
-    matrix_source.set_resident_evaluation(true);
-    if std::env::var_os("NOID_ALWAYS_REHASH_MATRICES").is_some() {
-        matrix_source.set_artifact_trust(false);
-    }
+) -> Result<PreparedSelectedHistoryWorker, String> {
+    // Genesis T is prewarmed only while the durable ladder starts at height
+    // zero. Once materialized it remains in the proving role's 1-GiB
+    // retain-all bank, so a deep reorg never pays the cold authentication cost
+    // again; ordinary restarts do not decode it speculatively.
+    let prewarm_genesis = store
+        .get_selected_history_coverage()
+        .map_err(|error| format!("read selected-history coverage for prewarm: {error}"))?
+        .is_none_or(|coverage| coverage.height == 0);
+    // Three lightweight handles share one authenticated in-memory bank. The
+    // steady B8 pair is startup-packed; stages A/B/C scan the same immutable
+    // rows, so no lane decodes CSR or waits on a global matrix lease.
+    let prewarm_matrix_source = artifacts.matrix_source.clone();
+    let block_matrix_source = artifacts.matrix_source.clone();
+    let link_matrix_source = artifacts.matrix_source.clone();
+    let verify_matrix_source = artifacts.matrix_source;
     let mut worker = selected_history_worker::SelectedHistoryProverWorker::new(
         store,
-        registry_store,
+        artifacts.registry_source,
         artifacts.registry_digest,
-        matrix_source,
+        block_matrix_source,
+        link_matrix_source,
+        verify_matrix_source,
     );
-    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let worker_cancelled = Arc::clone(&cancelled);
-    let (stopped_tx, stopped) = tokio::sync::oneshot::channel();
-    let thread = std::thread::Builder::new()
-        .name("selected-history-prover".into())
-        .spawn(move || {
+    // The full pinned registry is immutable and retains only about 69 MiB.
+    // Materialize it once before the miner task exists; otherwise a
+    // one-height steady-state drain would rebuild its VK tables for 6-8 s.
+    let registry_preload_admission = noid_miner::begin_selected_history_prewarm_session()
+        .map_err(|error| format!("selected-history registry preload admission failed: {error}"))?;
+    let registry_preload_started = Instant::now();
+    worker
+        .preload_registry()
+        .map_err(|error| format!("selected-history prover registry preload failed: {error}"))?;
+    let registry_preload_ms = registry_preload_started.elapsed().as_millis() as u64;
+    let identities = worker
+        .preloaded_registry_artifact_identities()
+        .map_err(|error| format!("selected-history matrix identities unavailable: {error}"))?;
+    let matrix_prewarm_started = Instant::now();
+    let prewarm_indices: &[usize] = if prewarm_genesis { &[0, 1, 5] } else { &[1, 5] };
+    for &index in prewarm_indices {
+        prewarm_matrix_source
+            .prewarm_compact(identities[index])
+            .map_err(|error| format!("selected-history compact prewarm failed: {error}"))?;
+    }
+    let memory = noid_core::mem_profile::current_mem_snapshot();
+    tracing::info!(
+        registry_preload_ms,
+        matrix_prewarm_ms = matrix_prewarm_started.elapsed().as_millis() as u64,
+        prewarm_genesis,
+        rss_mib = ?memory.map(|snapshot| snapshot.rss_kib / 1024),
+        hwm_mib = ?memory.map(|snapshot| snapshot.hwm_kib / 1024),
+        "selected-history prover registry retained for all pipeline drains"
+    );
+    drop(registry_preload_admission);
+
+    let spawn: SelectedHistoryWorkerSpawn = Box::new(move || {
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let (stopped_tx, stopped) = tokio::sync::oneshot::channel();
+        let thread = std::thread::Builder::new()
+            .name("selected-history-prover".into())
+            .spawn(move || {
             use selected_history_worker::{
                 SelectedHistoryWorkerBackoff, SelectedHistoryWorkerOutcome,
             };
 
             while !worker_cancelled.load(std::sync::atomic::Ordering::Acquire) {
-                let outcome = worker.run_once(&worker_cancelled);
+                let outcome = worker.run_pipelined(&worker_cancelled);
+                let mut stop_after_cycle = false;
                 let delay = match outcome {
-                    SelectedHistoryWorkerOutcome::Completed(identity) => {
-                        tracing::info!(
-                            height = identity.height,
-                            hash = %hex::encode(identity.block_hash),
-                            "selected-history terminal promoted"
-                        );
-                        None
+                    // Stage C logs every individual promotion together with
+                    // its stage timings; the drain outcome only controls
+                    // polling/backoff here.
+                    SelectedHistoryWorkerOutcome::Completed(_) => {
+                        // Each session drains at most one three-height window.
+                        // Give the native template builder an admission chance
+                        // before this background worker claims the next head.
+                        Some(std::time::Duration::from_millis(25))
                     }
                     SelectedHistoryWorkerOutcome::Backoff {
                         job,
@@ -672,7 +420,8 @@ fn start_selected_history_worker(
                         if let Some(error) = release_error {
                             tracing::warn!(job = ?job, err = %error, "selected-history cancellation release failed");
                         }
-                        break;
+                        stop_after_cycle = true;
+                        None
                     }
                     SelectedHistoryWorkerOutcome::Backoff {
                         job,
@@ -684,13 +433,8 @@ fn start_selected_history_worker(
                         }
                         match &reason {
                             SelectedHistoryWorkerBackoff::Idle => {}
-                            SelectedHistoryWorkerBackoff::MemoryPressure {
-                                required_mib,
-                                available_mib,
-                            } => tracing::debug!(
-                                required_mib,
-                                available_mib,
-                                "selected-history worker waiting for proof memory"
+                            SelectedHistoryWorkerBackoff::ProofStageBusy => tracing::debug!(
+                                "selected-history worker waiting for an incompatible proof stage"
                             ),
                             SelectedHistoryWorkerBackoff::RetryableFailure { phase, detail } => {
                                 tracing::warn!(job = ?job, phase, detail, "selected-history job deferred")
@@ -704,8 +448,8 @@ fn start_selected_history_worker(
                             SelectedHistoryWorkerBackoff::Idle => {
                                 std::time::Duration::from_secs(2)
                             }
-                            SelectedHistoryWorkerBackoff::MemoryPressure { .. } => {
-                                std::time::Duration::from_secs(5)
+                            SelectedHistoryWorkerBackoff::ProofStageBusy => {
+                                std::time::Duration::from_millis(25)
                             }
                             SelectedHistoryWorkerBackoff::RetryableFailure { .. } => {
                                 std::time::Duration::from_secs(10)
@@ -717,6 +461,9 @@ fn start_selected_history_worker(
                         })
                     }
                 };
+                if stop_after_cycle {
+                    break;
+                }
                 if let Some(delay) = delay {
                     std::thread::park_timeout(delay);
                 }
@@ -724,15 +471,33 @@ fn start_selected_history_worker(
             let _ = stopped_tx.send(());
         })
         .map_err(|error| format!("spawn selected-history prover thread: {error}"))?;
+        let wake = SelectedHistoryWorkerWake {
+            thread: thread.thread().clone(),
+        };
 
-    Ok(SelectedHistoryWorkerRuntime {
-        cancelled,
-        thread: Some(thread),
-        stopped,
-    })
+        Ok(SelectedHistoryWorkerRuntime {
+            cancelled,
+            wake,
+            thread: Some(thread),
+            stopped,
+        })
+    });
+
+    Ok(PreparedSelectedHistoryWorker { spawn: Some(spawn) })
+}
+
+fn spawn_selected_history_worker(
+    mut prepared: PreparedSelectedHistoryWorker,
+) -> Result<SelectedHistoryWorkerRuntime, String> {
+    let spawn = prepared
+        .spawn
+        .take()
+        .ok_or_else(|| "selected-history worker preparation already consumed".to_string())?;
+    spawn()
 }
 
 mod config;
+mod embedded_selected_recursive_pack;
 #[allow(dead_code)]
 mod selected_history_worker;
 mod sync_phase_telemetry;
@@ -770,6 +535,15 @@ pub enum NodeMode {
     Extminer,
 }
 
+fn embedded_matrix_retention(mode: &NodeMode) -> noid_miner::EmbeddedSelectedRecursiveRetention {
+    match mode {
+        NodeMode::Relay => noid_miner::EmbeddedSelectedRecursiveRetention::Ephemeral,
+        NodeMode::Prover | NodeMode::Miner | NodeMode::Extminer => {
+            noid_miner::EmbeddedSelectedRecursiveRetention::RetainAll
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "paranoid",
@@ -778,7 +552,8 @@ pub enum NodeMode {
     long_about = "Run a Paranoid full node.\n\nExample:\n  paranoid --mode miner --data-dir ~/.paranoid\n  paranoid --mode relay --p2p-listen 0.0.0.0:9301 --seed 1.2.3.4:9301",
 )]
 struct Cli {
-    /// Path to TOML config file (optional).
+    /// Path to TOML config file. A missing file is created with safe defaults.
+    /// Default: ~/.paranoid/paranoid.toml
     #[arg(short = 'c', long, value_name = "FILE")]
     config: Option<PathBuf>,
 
@@ -834,7 +609,7 @@ struct Cli {
     #[arg(long, default_value = "info", value_name = "LEVEL")]
     log: String,
 
-    /// Internal PoW mining threads for --mode miner. If omitted, uses a balanced split.
+    /// Internal PoW threads for --mode miner. Default: 1; proofs use the rest.
     #[arg(long = "mining-threads", value_name = "N")]
     mining_threads: Option<usize>,
 
@@ -952,6 +727,18 @@ fn ip_port_to_multiaddr(addr: &str) -> anyhow::Result<libp2p::Multiaddr> {
         .with_context(|| format!("build multiaddr from {:?}", addr))
 }
 
+/// Parse a P2P listen address from either the friendly `HOST:PORT` form used
+/// by the CLI or the libp2p multiaddr form accepted by existing config files.
+fn p2p_listen_to_multiaddr(addr: &str) -> anyhow::Result<libp2p::Multiaddr> {
+    let addr = addr.trim();
+    if addr.starts_with('/') {
+        return addr
+            .parse()
+            .with_context(|| format!("parse P2P listen multiaddr {addr:?}"));
+    }
+    ip_port_to_multiaddr(addr)
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -1025,14 +812,17 @@ async fn main() -> anyhow::Result<()> {
     let net = NetworkConfig::mainnet();
     tracing::debug!(network = %net.kind, "daemon starting");
 
-    // --- Config file (optional) ---
+    // --- Config file ---
     let config_path = cli
         .config
         .unwrap_or_else(|| expand_tilde(&PathBuf::from("~/.paranoid/paranoid.toml")));
-    let mut cfg = load_config(&config_path).unwrap_or_else(|| {
-        tracing::debug!("no config file, using defaults");
-        NodeConfig::default()
-    });
+    let mut config_defaults = NodeConfig::default();
+    config_defaults.network.listen = Some(format!("0.0.0.0:{}", net.default_p2p_port));
+    config_defaults.rpc.listen = Some(net.default_rpc_listen());
+    let (mut cfg, config_created) = load_or_create_config(&config_path, &config_defaults)?;
+    if config_created {
+        tracing::info!(path = %config_path.display(), "created default node config");
+    }
 
     // CLI flags override config.
     if let Some(dir) = cli.data_dir {
@@ -1047,6 +837,26 @@ async fn main() -> anyhow::Result<()> {
     if let Some(mining_threads) = cli.mining_threads {
         cfg.mining.mining_threads = mining_threads;
     }
+
+    // Validate both listeners before artifact prewarm, database opening, or
+    // wallet creation. A typo in user configuration must fail immediately.
+    let p2p_listen_str = cli.p2p_listen.unwrap_or_else(|| {
+        cfg.network
+            .listen
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| net.default_p2p_listen())
+    });
+    let listen_addr = p2p_listen_to_multiaddr(&p2p_listen_str).context("--p2p-listen")?;
+    let rpc_addr_str = cli.rpc_listen.unwrap_or_else(|| {
+        cfg.rpc
+            .listen
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| net.default_rpc_listen())
+    });
+    let rpc_listen: std::net::SocketAddr = rpc_addr_str.parse().context("parse RPC listen")?;
+
     if cli.mode == NodeMode::Miner {
         let available = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -1058,6 +868,20 @@ async fn main() -> anyhow::Result<()> {
             );
         }
     }
+    // Establish the process-wide work-conserving proof pool before the
+    // embedded registry/matrix prewarm or any verifier can enter Rayon.  An
+    // internal miner receives a disjoint PoW pool; every other role gives the
+    // complete host-visible budget to proof work.  Reusing the same plan in
+    // `BlockMiner::new` is idempotent and cannot create a second pool.
+    let cpu_budget_mode = if cli.mode == NodeMode::Miner {
+        noid_miner::ProcessCpuBudgetMode::InternalMiner {
+            mining_threads: cfg.mining.mining_threads,
+        }
+    } else {
+        noid_miner::ProcessCpuBudgetMode::ProofOnly
+    };
+    noid_miner::configure_process_cpu_budget(cpu_budget_mode)
+        .context("configure process CPU budget")?;
     // --seed accepts HOST:PORT; convert to multiaddr strings for internal use
     for raw_seed in cli.seed {
         let ma = ip_port_to_multiaddr(&raw_seed).with_context(|| format!("--seed {raw_seed}"))?;
@@ -1095,15 +919,15 @@ async fn main() -> anyhow::Result<()> {
         )
     })?;
     let selected_history_verifier =
-        selected_history_verifier_artifacts(&data_dir).map_err(anyhow::Error::msg)?;
+        selected_history_verifier_artifacts(embedded_matrix_retention(&cli.mode))
+            .map_err(anyhow::Error::msg)?;
     match &selected_history_verifier {
         None => tracing::warn!(
-            "selected-history snapshot admission disabled: release registry authority is not embedded"
+            "selected-history snapshot admission disabled in this pack-free development build"
         ),
-        Some(artifacts) => {
-            seed_selected_recursive_artifacts_from_distribution(artifacts);
-            preflight_selected_recursive_artifacts(artifacts);
-        }
+        Some(_) => tracing::info!(
+            "selected-history verifier uses only executable-embedded registry and matrices"
+        ),
     }
 
     // --- Storage ---
@@ -1120,6 +944,24 @@ async fn main() -> anyhow::Result<()> {
     let state_root = hex::encode(ctx.tip_header().state_root);
     tracing::debug!(height = tip_height, state_root = %state_root, "chain loaded");
     let chain = Arc::new(RwLock::new(ctx));
+
+    // Mandatory registry materialization and compact B8 prewarm happen while
+    // the process is still private: no P2P handler, RPC listener, miner, or
+    // terminal verifier can race the startup topology slot.
+    let prepared_selected_history_worker = if selected_history_prover_enabled {
+        let artifacts = selected_history_verifier.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "prover mode requires a build-authenticated embedded selected-recursive pack"
+            )
+        })?;
+        let store = {
+            let context = chain.read().await;
+            context.store.clone()
+        };
+        Some(prepare_selected_history_worker(store, artifacts).map_err(anyhow::Error::msg)?)
+    } else {
+        None
+    };
 
     // Sync-ready notifier: fires when the chain has caught up to peers.
     let sync_ready = Arc::new(tokio::sync::Notify::new());
@@ -1139,7 +981,14 @@ async fn main() -> anyhow::Result<()> {
 
     // --- Mempool ---
     let view = ChainView::from_mdbx(&*chain.read().await);
-    let mempool = AsyncMempool::new(view, MempoolConfig::default());
+    let authorization_verification_executor: noid_mempool::AuthorizationVerificationExecutor =
+        Arc::new(|task: noid_mempool::AuthorizationVerificationTask| {
+            noid_miner::install_process_proof_cpu(task).map_err(|error| {
+                format!("authorization verification CPU admission failed: {error}")
+            })?
+        });
+    let mempool = AsyncMempool::new(view, MempoolConfig::default())
+        .with_authorization_verification_executor(authorization_verification_executor);
     tracing::debug!("mempool ready");
 
     // --- Wallet ---
@@ -1205,18 +1054,6 @@ async fn main() -> anyhow::Result<()> {
     let wallet_operation_gate = Arc::new(tokio::sync::Mutex::new(()));
 
     // --- P2P Network ---
-    let p2p_listen_str = cli.p2p_listen.unwrap_or_else(|| {
-        cfg.network
-            .listen
-            .clone()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| net.default_p2p_listen())
-    });
-    // Convert HOST:PORT to libp2p Multiaddr transparently.
-    // Users specify --p2p-listen 0.0.0.0:9301; libp2p gets /ip4/0.0.0.0/tcp/9301.
-    let listen_addr: libp2p::Multiaddr =
-        ip_port_to_multiaddr(&p2p_listen_str).context("--p2p-listen")?;
-
     let topics = noid_p2p::protocol::NetworkTopics::for_network_cfg(&net);
     let (p2p, _p2p_task) = P2PNetwork::start(
         listen_addr.clone(),
@@ -1303,14 +1140,6 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // --- RPC Server ---
-    let rpc_addr_str = cli.rpc_listen.unwrap_or_else(|| {
-        cfg.rpc
-            .listen
-            .clone()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| net.default_rpc_listen())
-    });
-    let rpc_listen: std::net::SocketAddr = rpc_addr_str.parse().context("parse RPC listen")?;
     // Payout address for the mining template API: explicit override or active wallet address.
     let mining_payout_address = if cfg.mining.miner_address.is_empty() {
         None
@@ -1349,6 +1178,15 @@ async fn main() -> anyhow::Result<()> {
     .await
     .context("start RPC server")?;
     tracing::debug!(listen = %rpc_listen, "RPC ready");
+
+    // Startup prewarm already completed before either listener was exposed;
+    // only the lightweight dedicated polling thread is launched here.
+    let selected_history_worker_runtime = match prepared_selected_history_worker {
+        Some(prepared) => {
+            Some(spawn_selected_history_worker(prepared).map_err(anyhow::Error::msg)?)
+        }
+        None => None,
+    };
 
     // --- Miner (optional) ---
     let miner_handle = if cfg.mining.enabled {
@@ -1396,8 +1234,14 @@ async fn main() -> anyhow::Result<()> {
         // Remote wallets use P2P block subscription independently.
         {
             let hook_wallet = shared_wallet.clone();
+            let hook_selected_history_wake = selected_history_worker_runtime
+                .as_ref()
+                .map(SelectedHistoryWorkerRuntime::wake_handle);
             miner.set_block_applied_hook(std::sync::Arc::new(move |block| {
                 update_wallet_for_block(&hook_wallet, block);
+                if let Some(wake) = &hook_selected_history_wake {
+                    wake.wake();
+                }
             }));
         }
 
@@ -1463,23 +1307,6 @@ async fn main() -> anyhow::Result<()> {
         let task = tokio::spawn(async move { miner.run().await });
         tracing::debug!("miner started");
         Some((task, miner_stop, miner_stopped))
-    } else {
-        None
-    };
-
-    // Only explicit prover roles run the 8 GiB Block+Link worker. Relay nodes
-    // verify/import compact terminals but never build recursive proofs.
-    let selected_history_worker_runtime = if selected_history_prover_enabled {
-        let artifacts = selected_history_verifier.clone().ok_or_else(|| {
-            anyhow::anyhow!(
-                "prover mode requires an embedded NOID_SELECTED_RECURSIVE_REGISTRY_RELEASE_DIGEST"
-            )
-        })?;
-        let store = {
-            let context = chain.read().await;
-            context.store.clone()
-        };
-        Some(start_selected_history_worker(store, artifacts).map_err(anyhow::Error::msg)?)
     } else {
         None
     };
@@ -1863,9 +1690,9 @@ fn validate_snapshot_staged_header_boundary(
 /// Byte-exact fast path first: when the local durable results store already
 /// holds an identical verified terminal bound to the same canonical boundary
 /// (own prover promotion or a relay import), no cryptographic work is redone.
-/// Otherwise the envelope is verified through the pinned release registry and
-/// streamed matrices. A node without those artifacts cannot validate a
-/// coverage-attesting block and rejects it.
+/// Otherwise the envelope is verified through the executable-embedded pinned
+/// registry and compact matrix bank. A pack-free development build cannot
+/// validate a coverage-attesting block and rejects it.
 fn verify_block_coverage_attestation(
     claim: &noid_chain::storage::CoverageAttestationClaim<'_>,
     artifacts: Option<&SelectedHistoryVerifierArtifacts>,
@@ -1879,9 +1706,8 @@ fn verify_block_coverage_attestation(
             return Ok(());
         }
     }
-    let package =
-        noid_recursive::decode_selected_history_terminal_package(claim.attestation_bytes)
-            .map_err(|error| format!("coverage attestation decode failed: {error}"))?;
+    let package = noid_recursive::decode_selected_history_terminal_package(claim.attestation_bytes)
+        .map_err(|error| format!("coverage attestation decode failed: {error}"))?;
     if package.terminal_height() != claim.coverage_height {
         return Err("coverage attestation height does not match the header claim".to_string());
     }
@@ -1893,25 +1719,22 @@ fn verify_block_coverage_attestation(
     }
     let Some(artifacts) = artifacts else {
         return Err(
-            "release verifier artifacts unavailable — cannot validate a coverage-attesting block"
+            "embedded release verifier unavailable — cannot validate a coverage-attesting block"
                 .to_string(),
         );
     };
-    let registry_store =
-        noid_miner::LocalSelectedRecursiveClassRegistryStore::new(artifacts.root.clone());
-    let mut matrix_source =
-        noid_miner::LocalSelectedRecursiveMatrixSource::new(artifacts.root.clone());
-    if std::env::var_os("NOID_ALWAYS_REHASH_MATRICES").is_some() {
-        matrix_source.set_artifact_trust(false);
-    }
-    noid_miner::verify_selected_history_terminal_pinned_governed(
-        &package,
-        &registry_store,
-        artifacts.registry_digest,
-        &claim.header_at_coverage,
-        &claim.epoch_anchor_header,
-        &mut matrix_source,
-    )
+    let mut matrix_source = artifacts.matrix_source.clone();
+    noid_miner::install_selected_history_cpu(noid_miner::SelectedHistoryCpuStage::Verify, || {
+        noid_miner::verify_selected_history_terminal_embedded_governed(
+            &package,
+            &artifacts.registry_source,
+            artifacts.registry_digest,
+            &claim.header_at_coverage,
+            &claim.epoch_anchor_header,
+            &mut matrix_source,
+        )
+    })
+    .map_err(|error| format!("coverage attestation CPU admission failed: {error}"))?
     .map_err(|error| format!("coverage attestation rejected: {error}"))?;
     Ok(())
 }
@@ -1946,23 +1769,20 @@ fn verify_snapshot_selected_history_terminal(
         }
     };
 
-    // Admission is acquired before the release-pinned registry is opened and
-    // retained through one-at-a-time seekable matrix verification.
-    let registry_store =
-        noid_miner::LocalSelectedRecursiveClassRegistryStore::new(artifacts.root.clone());
-    let mut matrix_source =
-        noid_miner::LocalSelectedRecursiveMatrixSource::new(artifacts.root.clone());
-    if std::env::var_os("NOID_ALWAYS_REHASH_MATRICES").is_some() {
-        matrix_source.set_artifact_trust(false);
-    }
-    noid_miner::verify_selected_history_terminal_pinned_governed(
-        &package,
-        &registry_store,
-        artifacts.registry_digest,
-        &boundary.tip_header,
-        &boundary.epoch_anchor_header,
-        &mut matrix_source,
-    )
+    // Admission is acquired before the embedded registry is materialized and
+    // retained while compact matrix claims scan the shared authenticated bank.
+    let mut matrix_source = artifacts.matrix_source.clone();
+    noid_miner::install_selected_history_cpu(noid_miner::SelectedHistoryCpuStage::Verify, || {
+        noid_miner::verify_selected_history_terminal_embedded_governed(
+            &package,
+            &artifacts.registry_source,
+            artifacts.registry_digest,
+            &boundary.tip_header,
+            &boundary.epoch_anchor_header,
+            &mut matrix_source,
+        )
+    })
+    .map_err(|error| format!("snapshot selected-history CPU admission failed: {error}"))?
     .map_err(|error| format!("snapshot selected-history terminal rejected: {error}"))?;
 
     Ok(tier)
@@ -2236,46 +2056,57 @@ async fn apply_p2p_block_offthread(
              tx_epoch_anchor_id,
              anchor,
              state| {
-                let auth_verifier = noid_block::PreverifiedAuthorizationVerifier {
-                    verified_proof_bytes: &preverified_auth,
-                };
-                let tx_epoch = noid_block::BlockTxEpochContext {
-                    expected_user_epoch_anchor_id: *tx_epoch_anchor_id,
-                };
-                let output = noid_block::accept_block_with_artifacts_with_auth_verifier(
-                    block,
-                    proof_bytes,
-                    auth_sidecar_bytes,
-                    parent,
-                    prev_timestamps,
-                    prev_active_counts,
-                    local_time,
-                    &tx_epoch,
-                    anchor,
-                    state,
-                    &auth_verifier,
-                )?;
-                let post_validation = noid_block::accepted_block_post_validation_bundle(
-                    block,
-                    parent,
-                    prev_timestamps,
-                    prev_active_counts,
-                    anchor,
-                    proof_bytes,
-                    auth_sidecar_bytes,
-                    &output.artifacts,
-                )?;
-                let history_claim_bytes = bincode::serialize(&post_validation.history_claim_fields)
-                    .expect("history claim fields serialize");
-                let accepted_block_certificate_bytes =
-                    accepted_block_certificate_record_bytes(post_validation.acceptance_receipt)?;
-                Ok::<noid_chain::AppliedBlockValidation, noid_block::FullValidationError>(
-                    noid_chain::AppliedBlockValidation::new(
-                        output.state_root,
-                        history_claim_bytes,
-                        accepted_block_certificate_bytes,
-                    ),
-                )
+                noid_miner::install_process_proof_cpu(|| {
+                    let auth_verifier = noid_block::PreverifiedAuthorizationVerifier {
+                        verified_proof_bytes: &preverified_auth,
+                    };
+                    let tx_epoch = noid_block::BlockTxEpochContext {
+                        expected_user_epoch_anchor_id: *tx_epoch_anchor_id,
+                    };
+                    let output = noid_block::accept_block_with_artifacts_with_auth_verifier(
+                        block,
+                        proof_bytes,
+                        auth_sidecar_bytes,
+                        parent,
+                        prev_timestamps,
+                        prev_active_counts,
+                        local_time,
+                        &tx_epoch,
+                        anchor,
+                        state,
+                        &auth_verifier,
+                    )?;
+                    let post_validation = noid_block::accepted_block_post_validation_bundle(
+                        block,
+                        parent,
+                        prev_timestamps,
+                        prev_active_counts,
+                        anchor,
+                        proof_bytes,
+                        auth_sidecar_bytes,
+                        &output.artifacts,
+                    )?;
+                    let history_claim_bytes =
+                        bincode::serialize(&post_validation.history_claim_fields)
+                            .expect("history claim fields serialize");
+                    let accepted_block_certificate_bytes = accepted_block_certificate_record_bytes(
+                        post_validation.acceptance_receipt,
+                    )?;
+                    Ok::<noid_chain::AppliedBlockValidation, noid_block::FullValidationError>(
+                        noid_chain::AppliedBlockValidation::new(
+                            output.state_root,
+                            history_claim_bytes,
+                            accepted_block_certificate_bytes,
+                        ),
+                    )
+                })
+                .map_err(|error| {
+                    noid_block::FullValidationError::Consensus(
+                        noid_chain::consensus::ConsensusError::ShapeMismatch(format!(
+                            "process proof CPU admission failed: {error}"
+                        )),
+                    )
+                })?
             },
             |claim| {
                 verify_block_coverage_attestation(
@@ -2383,44 +2214,56 @@ async fn apply_reorg_offthread(
                      tx_epoch_anchor_id,
                      anchor,
                      state| {
-                        let tx_epoch = noid_block::BlockTxEpochContext {
-                            expected_user_epoch_anchor_id: *tx_epoch_anchor_id,
-                        };
-                        let output = noid_block::accept_block_with_artifacts(
-                            block,
-                            proof_bytes,
-                            auth_sidecar_bytes,
-                            parent,
-                            prev_timestamps,
-                            prev_active_counts,
-                            local_time,
-                            &tx_epoch,
-                            anchor,
-                            state,
-                        )?;
-                        let post_validation = noid_block::accepted_block_post_validation_bundle(
-                            block,
-                            parent,
-                            prev_timestamps,
-                            prev_active_counts,
-                            anchor,
-                            proof_bytes,
-                            auth_sidecar_bytes,
-                            &output.artifacts,
-                        )?;
-                        let history_claim_bytes =
-                            bincode::serialize(&post_validation.history_claim_fields)
-                                .expect("history claim fields serialize");
-                        let certificate_record_bytes = accepted_block_certificate_record_bytes(
-                            post_validation.acceptance_receipt,
-                        )?;
-                        Ok::<noid_chain::AppliedBlockValidation, noid_block::FullValidationError>(
-                            noid_chain::AppliedBlockValidation::new(
+                        noid_miner::install_process_proof_cpu(|| {
+                            let tx_epoch = noid_block::BlockTxEpochContext {
+                                expected_user_epoch_anchor_id: *tx_epoch_anchor_id,
+                            };
+                            let output = noid_block::accept_block_with_artifacts(
+                                block,
+                                proof_bytes,
+                                auth_sidecar_bytes,
+                                parent,
+                                prev_timestamps,
+                                prev_active_counts,
+                                local_time,
+                                &tx_epoch,
+                                anchor,
+                                state,
+                            )?;
+                            let post_validation =
+                                noid_block::accepted_block_post_validation_bundle(
+                                    block,
+                                    parent,
+                                    prev_timestamps,
+                                    prev_active_counts,
+                                    anchor,
+                                    proof_bytes,
+                                    auth_sidecar_bytes,
+                                    &output.artifacts,
+                                )?;
+                            let history_claim_bytes =
+                                bincode::serialize(&post_validation.history_claim_fields)
+                                    .expect("history claim fields serialize");
+                            let certificate_record_bytes =
+                                accepted_block_certificate_record_bytes(
+                                    post_validation.acceptance_receipt,
+                                )?;
+                            Ok::<
+                                noid_chain::AppliedBlockValidation,
+                                noid_block::FullValidationError,
+                            >(noid_chain::AppliedBlockValidation::new(
                                 output.state_root,
                                 history_claim_bytes,
                                 certificate_record_bytes,
-                            ),
-                        )
+                            ))
+                        })
+                        .map_err(|error| {
+                            noid_block::FullValidationError::Consensus(
+                                noid_chain::consensus::ConsensusError::ShapeMismatch(format!(
+                                    "process proof CPU admission failed: {error}"
+                                )),
+                            )
+                        })?
                     },
                     |claim| {
                         verify_block_coverage_attestation(
@@ -2553,13 +2396,164 @@ fn state_segment_response_matches_snapshot_boundary(
 #[cfg(test)]
 mod tests {
     use super::{
-        BoundedRelayTerminalPeers, MAX_TRACKED_RELAY_TERMINAL_PEERS, OrphanBlock,
-        ProvedBlockCandidate, RemoteSelectedHistoryRequestKey, SelectedTerminalHeaderBoundary,
-        SnapshotHeaderNextAction, compare_manifest_fork_choice, gap_requires_snapshot_sync,
-        snapshot_header_next_action, state_segment_response_matches_snapshot_boundary,
+        compare_manifest_fork_choice, embedded_matrix_retention, gap_requires_snapshot_sync,
+        load_or_create_config, p2p_listen_to_multiaddr, snapshot_header_next_action,
+        state_segment_response_matches_snapshot_boundary,
         validate_selected_terminal_tip_future_drift, validate_snapshot_header_batch_admission,
-        validate_snapshot_staged_header_boundary,
+        validate_snapshot_staged_header_boundary, BoundedRelayTerminalPeers, NodeConfig, NodeMode,
+        OrphanBlock, ProvedBlockCandidate, RemoteSelectedHistoryRequestKey,
+        SelectedTerminalHeaderBoundary, SnapshotHeaderNextAction, MAX_TRACKED_RELAY_TERMINAL_PEERS,
     };
+
+    #[test]
+    fn p2p_listener_accepts_cli_and_legacy_config_forms() {
+        assert_eq!(
+            p2p_listen_to_multiaddr("0.0.0.0:9400").unwrap().to_string(),
+            "/ip4/0.0.0.0/tcp/9400"
+        );
+        assert_eq!(
+            p2p_listen_to_multiaddr("/ip4/0.0.0.0/tcp/9400")
+                .unwrap()
+                .to_string(),
+            "/ip4/0.0.0.0/tcp/9400"
+        );
+    }
+
+    #[test]
+    fn first_start_creates_and_reuses_default_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("nested/paranoid.toml");
+        let mut defaults = NodeConfig::default();
+        defaults.network.listen = Some("0.0.0.0:9400".into());
+        defaults.rpc.listen = Some("127.0.0.1:9401".into());
+
+        let (created_config, created) = load_or_create_config(&path, &defaults).unwrap();
+        assert!(created);
+        assert_eq!(created_config.network.listen, defaults.network.listen);
+        assert!(path.is_file());
+
+        let original = std::fs::read(&path).unwrap();
+        let (loaded_config, created_again) = load_or_create_config(&path, &defaults).unwrap();
+        assert!(!created_again);
+        assert_eq!(loaded_config.network.listen, defaults.network.listen);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn malformed_config_is_reported_instead_of_silently_ignored() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("paranoid.toml");
+        std::fs::write(&path, "[network\n").unwrap();
+
+        let error = load_or_create_config(&path, &NodeConfig::default()).unwrap_err();
+        assert!(error.to_string().contains("parse node config"));
+    }
+
+    #[test]
+    fn embedded_matrix_cache_is_light_only_for_the_non_proving_relay_role() {
+        use noid_miner::EmbeddedSelectedRecursiveRetention::{Ephemeral, RetainAll};
+
+        assert_eq!(embedded_matrix_retention(&NodeMode::Relay), Ephemeral);
+        for mode in [NodeMode::Prover, NodeMode::Miner, NodeMode::Extminer] {
+            assert_eq!(embedded_matrix_retention(&mode), RetainAll);
+        }
+    }
+
+    #[test]
+    fn selected_prover_prewarm_precedes_every_external_proof_entrypoint() {
+        let source = include_str!("main.rs");
+        let startup = source
+            .split_once("async fn main() -> anyhow::Result<()> {")
+            .expect("node main entrypoint")
+            .1
+            .split_once("// --- Startup Banner ---")
+            .expect("bounded startup section")
+            .0;
+        let cpu_budget = startup
+            .find("configure_process_cpu_budget(")
+            .expect("global CPU topology configuration");
+        let embedded_artifacts = startup
+            .find("selected_history_verifier_artifacts(")
+            .expect("embedded artifact construction");
+        let prepare = startup
+            .find("prepare_selected_history_worker(store, artifacts)")
+            .expect("synchronous selected-history prewarm");
+        let p2p = startup.find("P2PNetwork::start(").expect("P2P exposure");
+        let rpc = startup.find("start_rpc_server(").expect("RPC exposure");
+        let spawn = startup
+            .find("spawn_selected_history_worker(prepared)")
+            .expect("dedicated worker spawn");
+        assert!(cpu_budget < embedded_artifacts);
+        assert!(embedded_artifacts < prepare);
+        assert!(prepare < p2p && prepare < rpc);
+        assert!(
+            rpc < spawn,
+            "prewarm and listener startup are split explicitly"
+        );
+    }
+
+    #[test]
+    fn production_admission_routes_mempool_p2p_and_reorg_cpu_to_proof_pool() {
+        let source = include_str!("main.rs");
+        let mempool = source
+            .split_once("// --- Mempool ---")
+            .expect("mempool startup section exists")
+            .1
+            .split_once("// --- Wallet ---")
+            .expect("wallet follows mempool startup")
+            .0;
+        let mempool_pool = mempool
+            .find("noid_miner::install_process_proof_cpu(task)")
+            .expect("authorization verification uses the process proof pool");
+        let mempool_install = mempool
+            .find(".with_authorization_verification_executor(")
+            .expect("production mempool installs its CPU executor");
+        assert!(mempool_pool < mempool_install);
+        assert!(mempool.contains("authorization verification CPU admission failed: {error}"));
+
+        let p2p = source
+            .split_once("async fn apply_p2p_block_offthread(")
+            .expect("P2P apply path exists")
+            .1
+            .split_once("async fn apply_reorg_offthread(")
+            .expect("reorg path follows P2P apply")
+            .0;
+        assert_validation_callback_uses_process_proof_pool(
+            p2p,
+            "noid_block::accept_block_with_artifacts_with_auth_verifier(",
+        );
+
+        let reorg = source
+            .split_once("async fn apply_reorg_offthread(")
+            .expect("reorg apply path exists")
+            .1
+            .split_once("fn validate_p2p_block_proof_binding(")
+            .expect("proof-binding helper follows reorg")
+            .0;
+        assert_validation_callback_uses_process_proof_pool(
+            reorg,
+            "noid_block::accept_block_with_artifacts(",
+        );
+    }
+
+    fn assert_validation_callback_uses_process_proof_pool(source: &str, acceptance: &str) {
+        let pool = source
+            .find("noid_miner::install_process_proof_cpu(||")
+            .expect("validation callback installs the process proof pool");
+        let acceptance = source
+            .find(acceptance)
+            .expect("validation callback performs block acceptance");
+        let post_validation = source
+            .find("noid_block::accepted_block_post_validation_bundle(")
+            .expect("validation callback performs post-validation");
+        let coverage = source
+            .find("|claim|")
+            .expect("coverage callback remains a separate apply callback");
+        assert!(pool < acceptance);
+        assert!(acceptance < post_validation);
+        assert!(post_validation < coverage);
+        assert!(source.contains("process proof CPU admission failed: {error}"));
+    }
 
     #[test]
     fn accepted_wallet_callback_stays_post_commit_pre_mempool_and_non_rejecting() {
@@ -2597,6 +2591,24 @@ mod tests {
         assert!(
             !wallet_wrapper.contains("-> Result"),
             "an already-committed block must not become a rejection through its wallet callback"
+        );
+
+        let miner_hook = node_source
+            .split_once("miner.set_block_applied_hook(")
+            .expect("internal miner installs the accepted-block hook")
+            .1
+            .split_once("let miner_stop")
+            .expect("accepted-block hook has a bounded source section")
+            .0;
+        let wallet_update = miner_hook
+            .find("update_wallet_for_block")
+            .expect("accepted-block hook updates the wallet");
+        let prover_wake = miner_hook
+            .find("wake.wake()")
+            .expect("accepted-block hook wakes the selected-history worker");
+        assert!(
+            wallet_update < prover_wake,
+            "the worker wake must follow the committed-block wallet update"
         );
     }
 
@@ -2940,10 +2952,12 @@ mod tests {
         assert!(validate_snapshot_header_batch_admission(21, 20, 1).is_err());
         assert!(validate_snapshot_header_batch_admission(20, 20, 0).is_err());
         assert!(validate_snapshot_header_batch_admission(20, 20, 2).is_err());
-        assert!(
-            validate_snapshot_header_batch_admission(1, 1_000, super::MAX_STAGED_HEADER_BATCH + 1,)
-                .is_err()
-        );
+        assert!(validate_snapshot_header_batch_admission(
+            1,
+            1_000,
+            super::MAX_STAGED_HEADER_BATCH + 1,
+        )
+        .is_err());
     }
 
     fn test_coinbase_child(
@@ -3074,15 +3088,13 @@ mod tests {
             cumulative_chainwork: low_work,
             ..boundary
         };
-        assert!(
-            validate_snapshot_staged_header_boundary(
-                &low_work_manifest,
-                &low_work_boundary,
-                &high_start_work,
-            )
-            .expect_err("below minimum snapshot work must reject")
-            .contains("minimum snapshot work")
-        );
+        assert!(validate_snapshot_staged_header_boundary(
+            &low_work_manifest,
+            &low_work_boundary,
+            &high_start_work,
+        )
+        .expect_err("below minimum snapshot work must reject")
+        .contains("minimum snapshot work"));
     }
 
     #[test]
@@ -6935,10 +6947,69 @@ fn print_startup_banner(
     }
 }
 
-fn load_config(path: &Path) -> Option<NodeConfig> {
+fn load_or_create_config(path: &Path, defaults: &NodeConfig) -> anyhow::Result<(NodeConfig, bool)> {
     let expanded = expand_tilde(path);
-    let text = std::fs::read_to_string(&expanded).ok()?;
-    toml::from_str(&text).ok()
+    match std::fs::read_to_string(&expanded) {
+        Ok(text) => {
+            let config = toml::from_str(&text)
+                .with_context(|| format!("parse node config: {}", expanded.display()))?;
+            Ok((config, false))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = expanded
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                std::fs::create_dir_all(parent).with_context(|| {
+                    format!("create node config directory: {}", parent.display())
+                })?;
+            }
+
+            let encoded =
+                toml::to_string_pretty(defaults).context("serialize default node config")?;
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+
+            match options.open(&expanded) {
+                Ok(mut file) => {
+                    let write_result = file
+                        .write_all(encoded.as_bytes())
+                        .and_then(|()| file.sync_all());
+                    if let Err(error) = write_result {
+                        drop(file);
+                        let _ = std::fs::remove_file(&expanded);
+                        return Err(error).with_context(|| {
+                            format!("write default node config: {}", expanded.display())
+                        });
+                    }
+                    Ok((defaults.clone(), true))
+                }
+                // Another node may have created the file after our initial
+                // read. Never overwrite it; load and validate that file.
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let text = std::fs::read_to_string(&expanded).with_context(|| {
+                        format!(
+                            "read concurrently created node config: {}",
+                            expanded.display()
+                        )
+                    })?;
+                    let config = toml::from_str(&text)
+                        .with_context(|| format!("parse node config: {}", expanded.display()))?;
+                    Ok((config, false))
+                }
+                Err(error) => Err(error)
+                    .with_context(|| format!("create node config: {}", expanded.display())),
+            }
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("read node config: {}", expanded.display()))
+        }
+    }
 }
 
 fn expand_tilde(p: &Path) -> PathBuf {

@@ -23,9 +23,10 @@
 //! }
 //! ```
 //!
-//! Internal miner uses separate Rayon pools for PoW and proving.  With default
-//! settings it splits available cores roughly in half and adapts the transaction
-//! cap to recent proof throughput instead of always trying to fill 256 txs.
+//! Internal miner uses separate Rayon pools for PoW and proving. By default it
+//! reserves one worker for adaptive-difficulty PoW and gives the remaining
+//! workers to the shared Block/Link/Verify proof pool; the transaction cap
+//! adapts to recent proof throughput instead of always trying to fill 256 txs.
 //! External miner mode disables internal PoW, so the node can spend its CPUs on
 //! template building, certificate assembly, validation, RPC, and P2P while miners run elsewhere.
 //!
@@ -49,8 +50,12 @@ use noid_chain::storage::MdbxChainContext;
 use noid_mempool::AsyncMempool;
 use noid_poseidon2b::primitives::Address;
 
-use crate::memory_governor::ProofMemoryGovernor;
+use crate::cpu_budget::{
+    configure_process_cpu_budget, install_process_proof_cpu, process_pow_pool, process_proof_pool,
+    ProcessCpuBudgetMode,
+};
 use crate::template::{TemplateBuilder, TemplateChainSnapshot, TemplateRefreshTrigger};
+use crate::topology_gate::ProofTopologyGate;
 
 #[allow(clippy::too_many_arguments)]
 fn accepted_block_validation(
@@ -100,7 +105,7 @@ pub struct MinerConfig {
     /// Address that receives the coinbase reward.
     pub miner_address: Address,
     /// Number of Rayon threads for internal PoW search.
-    /// 0 = balanced default (roughly half of available cores).
+    /// 0 = proof-latency default (one dedicated PoW worker).
     pub mining_threads: usize,
     /// Safety-net heartbeat interval (seconds).
     ///
@@ -112,12 +117,6 @@ pub struct MinerConfig {
     /// Must be > BLOCK_TIME to avoid firing during active proving and
     /// inserting unnecessary coinbase blocks.  Default: 5 × BLOCK_TIME = 75s.
     pub refresh_interval_secs: u64,
-    /// Maximum resident-memory envelope admitted for block proof workers, MiB.
-    ///
-    /// `0` selects a host-aware ceiling from currently available memory while
-    /// reserving capacity for validation, networking, and the OS. This is a
-    /// local scheduler policy and never changes consensus block limits.
-    pub proof_memory_budget_mib: usize,
 }
 
 impl Default for MinerConfig {
@@ -126,7 +125,6 @@ impl Default for MinerConfig {
             miner_address: Address([0u8; 32]),
             mining_threads: 0,
             refresh_interval_secs: 75, // 5 × BLOCK_TIME; real triggers are sync_ready + TxAdmitted
-            proof_memory_budget_mib: 0,
         }
     }
 }
@@ -179,33 +177,6 @@ pub enum MinerEvent {
 // ---------------------------------------------------------------------------
 // CPU split + adaptive block sizing
 // ---------------------------------------------------------------------------
-
-fn available_threads() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .max(1)
-}
-
-/// Internal mining default: do not give PoW every core.  A balanced split keeps
-/// the block prover responsive while still giving PoW more than a token thread.
-fn effective_mining_threads(configured: usize) -> usize {
-    if configured > 0 {
-        return configured.max(1);
-    }
-    let total = available_threads();
-    if total <= 2 {
-        1
-    } else {
-        (total / 2).max(1)
-    }
-}
-
-fn effective_prover_threads(mining_configured: usize) -> usize {
-    let total = available_threads();
-    let mining = effective_mining_threads(mining_configured).min(total.saturating_sub(1).max(1));
-    total.saturating_sub(mining).max(1)
-}
 
 fn adaptive_user_tx_limit(ms_per_tx_ewma: Option<f64>) -> usize {
     let consensus_max = noid_chain::consensus::params::BLOCK_MAX_TXS.saturating_sub(1);
@@ -262,9 +233,9 @@ pub struct BlockMiner {
     /// Each heartbeat/mempool refresh drops the JoinHandle but NOT the blocking task;
     /// without this guard repeated refreshes can pile up blocking proof work.
     prove_semaphore: Arc<tokio::sync::Semaphore>,
-    /// Shared resident-memory admission gate held for the complete lifetime of
-    /// each blocking proof job. It rejects work before Tokio can queue it.
-    proof_memory_governor: ProofMemoryGovernor,
+    /// Shared proof-topology admission held for the complete lifetime of each
+    /// blocking proof job. It rejects conflicting work before Tokio queues it.
+    proof_topology_gate: ProofTopologyGate,
     /// Optional hook called synchronously after block is applied to chain, before
     /// the mempool is updated. Used by the built-in wallet to generate receipts
     /// race-free (receipt ready before getMempoolSize → 0 is observable).
@@ -287,39 +258,33 @@ impl BlockMiner {
         sync_ready: Arc<tokio::sync::Notify>,
     ) -> (Self, broadcast::Receiver<MinerEvent>) {
         let (events, rx) = broadcast::channel(32);
-        let mining_threads = effective_mining_threads(config.mining_threads);
-        let prover_threads = effective_prover_threads(config.mining_threads);
-        let proof_memory_governor = ProofMemoryGovernor::global(config.proof_memory_budget_mib);
+        let cpu_plan = configure_process_cpu_budget(ProcessCpuBudgetMode::InternalMiner {
+            mining_threads: config.mining_threads,
+        })
+        .unwrap_or_else(|error| panic!("invalid process CPU budget for internal miner: {error}"));
+        let mining_threads = cpu_plan.pow_threads;
+        let prover_threads = cpu_plan.proof_threads;
+        let proof_topology_gate = ProofTopologyGate::global();
         tracing::info!(
             mining_threads,
             prover_threads,
-            proof_memory_budget_mib = proof_memory_governor.configured_budget_mib(),
-            "internal miner CPU and memory budgets"
+            "internal miner CPU budget and proof-stage topology configured"
         );
         let miner = Self {
             config,
             mempool,
             chain,
             events,
-            pow_pool: Arc::new(
-                rayon::ThreadPoolBuilder::new()
-                    .num_threads(mining_threads)
-                    .thread_name(|i| format!("noid-pow-{i}"))
-                    .build()
-                    .expect("create PoW Rayon pool"),
-            ),
-            prove_pool: Arc::new(
-                rayon::ThreadPoolBuilder::new()
-                    .num_threads(prover_threads)
-                    .thread_name(|i| format!("noid-prove-{i}"))
-                    .build()
-                    .expect("create prove Rayon pool"),
-            ),
+            pow_pool: process_pow_pool()
+                .expect("process CPU budget was configured immediately above")
+                .expect("internal miner CPU plan has a PoW pool"),
+            prove_pool: process_proof_pool()
+                .expect("process CPU budget was configured immediately above"),
             cancel_pow: Arc::new(AtomicBool::new(false)),
             stopped: Arc::new(AtomicBool::new(false)),
             sync_ready,
             prove_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
-            proof_memory_governor,
+            proof_topology_gate,
             on_block_applied: None,
             payout_resolver: None,
             chain_operation_gate: None,
@@ -474,9 +439,9 @@ impl BlockMiner {
                 }
             };
             let prev_state_root = snapshot.prev_state_root();
-            let memory_user_tx_limit = self.proof_memory_governor.max_user_txs_now();
+            let topology_user_tx_limit = self.proof_topology_gate.max_user_txs_now();
             let max_user_txs =
-                adaptive_user_tx_limit(prove_ms_per_tx_ewma).min(memory_user_tx_limit);
+                adaptive_user_tx_limit(prove_ms_per_tx_ewma).min(topology_user_tx_limit);
             let tmpl = match builder
                 .build_from_snapshot_with_limit(&snapshot, addr, now, max_user_txs)
                 .await
@@ -501,7 +466,7 @@ impl BlockMiner {
                 height,
                 n_txs,
                 max_user_txs,
-                memory_user_tx_limit,
+                topology_user_tx_limit,
                 prove_ms_per_tx_ewma,
                 "mining template ready"
             );
@@ -771,32 +736,41 @@ impl BlockMiner {
                      tx_epoch_anchor_id,
                      anchor,
                      state| {
-                        let tx_epoch = noid_block::BlockTxEpochContext {
-                            expected_user_epoch_anchor_id: *tx_epoch_anchor_id,
-                        };
-                        let output = noid_block::accept_block_with_artifacts(
-                            block,
-                            proof_bytes,
-                            auth_sidecar_bytes,
-                            parent,
-                            prev_timestamps,
-                            prev_active_counts,
-                            local_time,
-                            &tx_epoch,
-                            anchor,
-                            state,
-                        )?;
-                        accepted_block_validation(
-                            block,
-                            parent,
-                            prev_timestamps,
-                            prev_active_counts,
-                            anchor,
-                            proof_bytes,
-                            auth_sidecar_bytes,
-                            &output.artifacts,
-                            output.state_root,
-                        )
+                        install_process_proof_cpu(|| {
+                            let tx_epoch = noid_block::BlockTxEpochContext {
+                                expected_user_epoch_anchor_id: *tx_epoch_anchor_id,
+                            };
+                            let output = noid_block::accept_block_with_artifacts(
+                                block,
+                                proof_bytes,
+                                auth_sidecar_bytes,
+                                parent,
+                                prev_timestamps,
+                                prev_active_counts,
+                                local_time,
+                                &tx_epoch,
+                                anchor,
+                                state,
+                            )?;
+                            accepted_block_validation(
+                                block,
+                                parent,
+                                prev_timestamps,
+                                prev_active_counts,
+                                anchor,
+                                proof_bytes,
+                                auth_sidecar_bytes,
+                                &output.artifacts,
+                                output.state_root,
+                            )
+                        })
+                        .map_err(|error| {
+                            noid_block::FullValidationError::Consensus(
+                                noid_chain::consensus::ConsensusError::ShapeMismatch(format!(
+                                    "process proof CPU admission failed: {error}"
+                                )),
+                            )
+                        })?
                     },
                     |claim| {
                         let expected = attestation_store
@@ -805,7 +779,9 @@ impl BlockMiner {
                                 noid_chain::hash_block_header(&claim.header_at_coverage),
                             )
                             .map_err(|error| {
-                                format!("durable terminal read failed at attested coverage: {error}")
+                                format!(
+                                    "durable terminal read failed at attested coverage: {error}"
+                                )
                             })?
                             .ok_or_else(|| {
                                 "no durable verified terminal at the attested coverage".to_string()
@@ -876,9 +852,12 @@ pub(crate) fn run_prove_block(
         );
         return Ok((vec![], vec![]));
     }
-    let _proof_memory_reservation = tmpl
-        .take_proof_memory_reservation()
-        .ok_or_else(|| "unbudgeted or already-consumed proof template rejected".to_string())?;
+    // This owning reservation deliberately remains in scope through every
+    // decode/verify/assembly return and through unwind. Template clones share
+    // one Option, so no second native proof can cross this edge.
+    let _proof_topology_reservation = tmpl
+        .take_proof_topology_reservation()
+        .ok_or_else(|| "unadmitted or already-consumed proof template rejected".to_string())?;
 
     let mut bundles: Vec<WalletAuthorizationBundle> = Vec::with_capacity(non_cb_count);
     for (idx, opt) in tmpl.authorization_bytes.iter().enumerate() {
@@ -954,5 +933,64 @@ mod tests {
             resolve_mining_payout(configured, Some(&resolver)),
             noid_poseidon2b::primitives::Address([0x33; 32])
         );
+    }
+
+    #[test]
+    fn local_acceptance_and_template_exact_state_share_process_proof_pool() {
+        let miner = include_str!("miner.rs")
+            .split_once("async fn apply_found_block(")
+            .expect("local accepted-block path exists")
+            .1
+            .split_once("// Block certificate assembly")
+            .expect("certificate assembly follows local apply")
+            .0;
+        let local_pool = miner
+            .find("install_process_proof_cpu(||")
+            .expect("local acceptance installs the process proof pool");
+        let local_accept = miner
+            .find("noid_block::accept_block_with_artifacts(")
+            .expect("local acceptance verifies the mined block");
+        let local_post = miner
+            .find("accepted_block_validation(")
+            .expect("local acceptance builds post-validation artifacts");
+        let local_coverage = miner
+            .find("|claim|")
+            .expect("coverage remains a separate apply callback");
+        assert!(local_pool < local_accept);
+        assert!(local_accept < local_post);
+        assert!(local_post < local_coverage);
+        assert!(miner.contains("process proof CPU admission failed: {error}"));
+
+        let template = include_str!("template.rs")
+            .split_once("pub async fn build_from_snapshot_with_limit(")
+            .expect("template build path exists")
+            .1
+            .split_once("#[cfg(test)]")
+            .expect("template build path has a bounded source section")
+            .0;
+        let hydration = template
+            .find("snapshot.hydrate_coinbase_allocator_segments(&mut state)")
+            .expect("template hydrates allocator segments");
+        let template_pool = template
+            .find("let template_cpu_result = install_process_proof_cpu(||")
+            .expect("template CPU phase installs the process proof pool");
+        let build = template
+            .find("build_block_template_with_coverage(")
+            .expect("template CPU phase builds the chain template");
+        let surface = template
+            .find("noid_chain::build_exact_action_surface(")
+            .expect("template CPU phase builds the exact action surface");
+        let frontier = template
+            .find(".exact_frontier_siblings(")
+            .expect("template CPU phase builds the exact frontier");
+        let proof = template
+            .find("noid_block::build_exact_state_transition_proof_from_siblings(")
+            .expect("template CPU phase builds the exact-state proof");
+        assert!(hydration < template_pool);
+        assert!(template_pool < build);
+        assert!(build < surface);
+        assert!(surface < frontier);
+        assert!(frontier < proof);
+        assert!(template.contains("template exact-state CPU admission failed closed"));
     }
 }

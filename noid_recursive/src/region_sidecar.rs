@@ -444,46 +444,6 @@ impl DuplexRegionSidecarProof {
     pub fn byte_len(&self) -> usize {
         bincode::serialized_size(self).expect("duplex sidecar serialized length") as usize
     }
-
-    #[cfg(test)]
-    pub(in crate::region_sidecar) fn into_walk_deferred_parts(
-        self,
-        w_log: usize,
-    ) -> (
-        DuplexRegionWalkDeferredProof,
-        noid_ivc_core::deep_chain::DeepChainWalkProof,
-    ) {
-        let DuplexUnionProof {
-            mut selection,
-            mut walk,
-            mut substitution,
-            mut shifts,
-        } = self.authority;
-        selection.rounds.resize(
-            w_log,
-            [F128::ZERO; noid_ivc_core::deep_chain::relations::RELATION_DEGREE],
-        );
-        substitution.rounds.resize(
-            w_log,
-            [F128::ZERO; noid_ivc_core::deep_chain::relations::RELATION_DEGREE],
-        );
-        for shift in &mut shifts {
-            shift.rounds.resize(w_log, [F128::ZERO; 2]);
-        }
-        for layer in &mut walk.layers {
-            layer
-                .round_coeffs
-                .resize(w_log, [F128::ZERO; noid_ivc_core::deep_chain::WALK_DEGREE]);
-        }
-        (
-            DuplexRegionWalkDeferredProof::new(DuplexUnionWalkDeferredProof {
-                selection,
-                substitution,
-                shifts,
-            }),
-            walk,
-        )
-    }
 }
 
 /// Serializable duplex-region authority whose walk is provided and verified

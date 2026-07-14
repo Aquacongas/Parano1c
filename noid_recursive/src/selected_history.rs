@@ -921,6 +921,26 @@ pub(crate) struct ValidatedSelectedHistoryRegistryIdentities {
     link_post_commit_class_digests: [[u8; 32]; USER_TX_CLASS_TIERS.len()],
 }
 
+impl ValidatedSelectedHistoryRegistryIdentities {
+    /// Copy identity tables whose exact source registry was fully validated by
+    /// the release build. Runtime does not re-walk classes or re-verify the
+    /// shared Genesis proof merely to recover these already-stored digests.
+    ///
+    /// # Safety
+    ///
+    /// Both tables must come from the exact build-authenticated registry body
+    /// used to construct the corresponding Link classes.
+    pub(crate) const unsafe fn from_build_authenticated_tables(
+        link_class_digests: [[u8; 32]; USER_TX_CLASS_TIERS.len()],
+        link_post_commit_class_digests: [[u8; 32]; USER_TX_CLASS_TIERS.len()],
+    ) -> Self {
+        Self {
+            link_class_digests,
+            link_post_commit_class_digests,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelectedHistoryRegistryError {
     NonCanonical(CanonicalLadderError),

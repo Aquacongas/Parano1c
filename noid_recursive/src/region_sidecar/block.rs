@@ -23,7 +23,10 @@ use noid_ivc_core::deep_chain::{
     MultiDeepChainWalkProof,
 };
 use noid_ivc_core::field::F128;
-use noid_ivc_core::field_circuit::{FsChannelOps, FsChannelUnionRecorder, RecordedChannel};
+use noid_ivc_core::field_circuit::{
+    FsChannelOps, FsChannelUnionRecorder, LayoutRecordedChannel, LayoutRecordingChallenger,
+    RecordedChannel,
+};
 use noid_ivc_core::pcs::{PcsParams, QuirkyDirectClaim};
 use noid_ivc_core::public_io::{PublicIoSpec, WitnessSlice};
 use noid_ivc_core::verifier::FieldPostCommitVerifierContext;
@@ -244,6 +247,7 @@ pub struct BlockRegionSidecarVk {
     meta_b: MerkleRegionVk,
     owner_c: DuplexRegionVk,
     main_c: DuplexRegionVk,
+    transcript_digest: [u8; 32],
 }
 
 impl BlockRegionSidecarVk {
@@ -376,6 +380,9 @@ impl BlockRegionSidecarVk {
         owner_c: DuplexRegionVk,
         main_c: DuplexRegionVk,
     ) -> Result<Self, RegionSidecarError> {
+        let transcript_digest = block_region_sidecar_vk_digest(
+            &wallet_a, &meta_a, &wallet_b, &meta_b, &owner_c, &main_c,
+        );
         let vk = Self {
             wallet_a,
             meta_a,
@@ -383,6 +390,7 @@ impl BlockRegionSidecarVk {
             meta_b,
             owner_c,
             main_c,
+            transcript_digest,
         };
         vk.validate_selected_zk_roles()?;
         Ok(vk)
@@ -420,33 +428,7 @@ impl BlockRegionSidecarVk {
     /// component of the enclosing block class digest; the exact child keys
     /// are also absorbed here before any child proof message is sampled.
     pub fn transcript_digest(&self) -> [u8; 32] {
-        let child = [
-            self.wallet_a.transcript_digest(),
-            self.meta_a.transcript_digest(),
-            self.wallet_b.transcript_digest(),
-            self.meta_b.transcript_digest(),
-            self.owner_c.transcript_digest(),
-            self.main_c.transcript_digest(),
-        ];
-        let version = [BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION];
-        poseidon2b_hash_byte_slices(
-            BLOCK_REGION_SELECTED_ZK_VK_DIGEST_DOMAIN,
-            &[
-                &version,
-                b"wallet-a",
-                &child[0],
-                b"meta-a",
-                &child[1],
-                b"wallet-b",
-                &child[2],
-                b"meta-b",
-                &child[3],
-                b"owner-c",
-                &child[4],
-                b"main-c",
-                &child[5],
-            ],
-        )
+        self.transcript_digest
     }
 
     fn transcript_label(&self) -> &'static [u8] {
@@ -587,6 +569,43 @@ impl BlockRegionSidecarVk {
         }
         Ok(())
     }
+}
+
+fn block_region_sidecar_vk_digest(
+    wallet_a: &WalkARegionVk,
+    meta_a: &WalkARegionVk,
+    wallet_b: &MerkleRegionVk,
+    meta_b: &MerkleRegionVk,
+    owner_c: &DuplexRegionVk,
+    main_c: &DuplexRegionVk,
+) -> [u8; 32] {
+    let child = [
+        wallet_a.transcript_digest(),
+        meta_a.transcript_digest(),
+        wallet_b.transcript_digest(),
+        meta_b.transcript_digest(),
+        owner_c.transcript_digest(),
+        main_c.transcript_digest(),
+    ];
+    let version = [BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION];
+    poseidon2b_hash_byte_slices(
+        BLOCK_REGION_SELECTED_ZK_VK_DIGEST_DOMAIN,
+        &[
+            &version,
+            b"wallet-a",
+            &child[0],
+            b"meta-a",
+            &child[1],
+            b"wallet-b",
+            &child[2],
+            b"meta-b",
+            &child[3],
+            b"owner-c",
+            &child[4],
+            b"main-c",
+            &child[5],
+        ],
+    )
 }
 
 fn selected_duplex_vk_matches(
@@ -1021,6 +1040,48 @@ impl<'a> BlockRegionProverPlan<'a> {
         context.append_claims(claims);
         Ok(proof)
     }
+
+    /// Local-authoring twin of [`Self::prove_post_commit`] that harvests the
+    /// exact child transcript while the sidecar proof is already being
+    /// authored.  `LayoutRecordingChallenger` delegates every Fiat--Shamir
+    /// operation to the same native challenger as the legacy path, so the
+    /// returned proof and enclosing transcript are unchanged.  The extra
+    /// values are process-local replay material and never enter a wire type.
+    pub(crate) fn prove_post_commit_layout_captured<Ch: Challenger>(
+        &self,
+        context: &mut FieldPostCommitProverContext<'_, Ch>,
+        layout: noid_ivc_core::deep_chain::schedule::DuplexLayout,
+    ) -> Result<
+        (
+            BlockRegionSidecarProof,
+            BlockSidecarChildTranscript,
+            LayoutRecordedChannel,
+        ),
+        RegionSidecarError,
+    > {
+        let witness = context.witness();
+        context.observe_label(BLOCK_SIDECAR_RECORDED_LABEL);
+        let seed = context.sample_f128();
+        let mut child = LayoutRecordingChallenger::new(BLOCK_SIDECAR_CHILD_DOMAIN, layout);
+        child.observe_f128(seed);
+        let (proof, claims) = self.prove(witness, &mut child)?;
+        let tail = child.sample_f128_vec(BLOCK_SIDECAR_CHILD_TAIL_LANES);
+        let recording = child
+            .finish()
+            .map_err(|_| RegionSidecarError::InvalidProof)?;
+        context.observe_f128_slice(&tail);
+        context.append_claims(claims);
+        Ok((
+            proof,
+            BlockSidecarChildTranscript {
+                seed,
+                tail: tail
+                    .try_into()
+                    .expect("child transcript terminal lane count"),
+            },
+            recording,
+        ))
+    }
 }
 
 /// The fixed-shape selected-ZK V5 block sidecar envelope.
@@ -1044,30 +1105,6 @@ pub struct BlockRegionSidecarProof {
 impl BlockRegionSidecarProof {
     pub fn byte_len(&self) -> usize {
         bincode::serialized_size(self).expect("block region sidecar serialized length") as usize
-    }
-
-    pub(crate) fn wallet_a(&self) -> &WalkARegionWalkDeferredProof {
-        &self.wallet_a
-    }
-
-    pub(crate) fn meta_a(&self) -> &WalkARegionWalkDeferredProof {
-        &self.meta_a
-    }
-
-    pub(crate) fn wallet_b(&self) -> &MerkleRegionWalkDeferredProof {
-        &self.wallet_b
-    }
-
-    pub(crate) fn meta_b(&self) -> &MerkleRegionWalkDeferredProof {
-        &self.meta_b
-    }
-
-    pub(crate) fn owner_c(&self) -> &DuplexRegionWalkDeferredProof {
-        &self.owner_c
-    }
-
-    pub(crate) fn main_c(&self) -> &DuplexRegionWalkDeferredProof {
-        &self.main_c
     }
 }
 
@@ -1115,10 +1152,7 @@ fn block_bounded_shapes(
         SidecarProofShape::DeferredFixed(
             duplex_shape_for_vk(vk.main_c(), total_vars)?.walk_deferred(),
         ),
-        SidecarProofShape::MultiWalk(multi_walk_proof_shape(
-            max_w_log(&w_logs),
-            w_logs.len(),
-        )?),
+        SidecarProofShape::MultiWalk(multi_walk_proof_shape(max_w_log(&w_logs), w_logs.len())?),
     ])
 }
 
@@ -1252,6 +1286,40 @@ pub fn verify_block_region_sidecar_post_commit_captured<Ch: Challenger>(
     })
 }
 
+/// Native block-sidecar verification that also harvests the complete child
+/// recording through its frozen class layout. The verifier and all appended
+/// PCS claims are identical to
+/// [`verify_block_region_sidecar_post_commit_captured`]; only the concrete
+/// child challenger additionally classifies absorbed lanes for the Link
+/// recording union.
+pub(crate) fn verify_block_region_sidecar_post_commit_layout_captured<Ch: Challenger>(
+    vk: &BlockRegionSidecarVk,
+    proof: &BlockRegionSidecarProof,
+    context: &mut FieldPostCommitVerifierContext<'_, Ch>,
+    layout: noid_ivc_core::deep_chain::schedule::DuplexLayout,
+) -> Result<(BlockSidecarChildTranscript, LayoutRecordedChannel), RegionSidecarError> {
+    context.observe_label(BLOCK_SIDECAR_RECORDED_LABEL);
+    let seed = context.sample_f128();
+    let mut child = LayoutRecordingChallenger::new(BLOCK_SIDECAR_CHILD_DOMAIN, layout);
+    child.observe_f128(seed);
+    let claims = verify_block_region_sidecar(vk, context.total_vars(), proof, &mut child)?;
+    let tail = child.sample_f128_vec(BLOCK_SIDECAR_CHILD_TAIL_LANES);
+    let recording = child
+        .finish()
+        .map_err(|_| RegionSidecarError::InvalidProof)?;
+    context.observe_f128_slice(&tail);
+    context.append_claims(claims);
+    Ok((
+        BlockSidecarChildTranscript {
+            seed,
+            tail: tail
+                .try_into()
+                .expect("child transcript terminal lane count"),
+        },
+        recording,
+    ))
+}
+
 /// Recursive trace verifier for the fixed V5 block authority. Every deferred
 /// child and the shared six-instance multi-walk is shape-preflighted before
 /// the first proof witness allocation. Prefixes and suffixes remain
@@ -1379,8 +1447,7 @@ pub(crate) fn scratch_record_block_sidecar_child(
 ) -> Result<RecordedChannel, RegionSidecarError> {
     let mut scratch = FieldR1csBuilder::new();
     let mut recorder = FsChannelUnionRecorder::new(BLOCK_SIDECAR_CHILD_DOMAIN);
-    let seed_wire =
-        crate::acceptance::trace::LinExpr::from_wire(scratch.alloc_f128(seed));
+    let seed_wire = crate::acceptance::trace::LinExpr::from_wire(scratch.alloc_f128(seed));
     recorder.observe_f128(&mut scratch, &seed_wire);
     let root: crate::acceptance::trace::self_verify::FlatDigestExpr = [
         crate::acceptance::trace::LinExpr::zero(),

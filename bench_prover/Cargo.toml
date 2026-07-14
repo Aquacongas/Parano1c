@@ -25,6 +25,7 @@ rayon = "1.10"
 bincode = "1"
 hex = "0.4"
 zstd = { version = "0.13", features = ["zstdmt"] }
+serde = { workspace = true }
 
 [[bench]]
 name = "alice_sends_bob"

@@ -57,6 +57,18 @@ use crate::event::{EvictReason, MempoolEvent};
 use crate::floor::FeeFloor;
 use crate::view::ChainView;
 
+/// One CPU-heavy authorization verification ready to run on a node-owned
+/// executor. The mempool owns protocol validation; the embedding node owns
+/// process-wide CPU admission.
+pub type AuthorizationVerificationTask = Box<dyn FnOnce() -> Result<(), String> + Send + 'static>;
+
+/// Executor hook for authorization verification. The default runs the task on
+/// the surrounding `spawn_blocking` thread. Production nodes replace it with
+/// their common proof Rayon pool so mempool traffic cannot activate an
+/// independent global pool beside Block/Link/Verify.
+pub type AuthorizationVerificationExecutor =
+    Arc<dyn Fn(AuthorizationVerificationTask) -> Result<(), String> + Send + Sync + 'static>;
+
 // ---------------------------------------------------------------------------
 // Internal state (held under Mutex)
 // ---------------------------------------------------------------------------
@@ -140,6 +152,7 @@ pub struct AsyncMempool {
     /// Bounds CPU usage: at most `config.auth_verify_workers` proofs in flight.
     /// Set to 0 in config → semaphore with MAX permits (no limit).
     auth_verify_semaphore: Arc<Semaphore>,
+    auth_verify_executor: AuthorizationVerificationExecutor,
 }
 
 impl AsyncMempool {
@@ -170,7 +183,18 @@ impl AsyncMempool {
             events,
             config: Arc::new(config),
             auth_verify_semaphore,
+            auth_verify_executor: Arc::new(|task| task()),
         }
+    }
+
+    /// Route authorization proof work through a process-owned CPU executor.
+    /// Configure this before cloning the mempool into RPC/P2P tasks.
+    pub fn with_authorization_verification_executor(
+        mut self,
+        executor: AuthorizationVerificationExecutor,
+    ) -> Self {
+        self.auth_verify_executor = executor;
+        self
     }
 
     /// Subscribe to mempool events (P2P, RPC WebSocket subscriptions, miner wakeup).
@@ -259,6 +283,7 @@ impl AsyncMempool {
         if needs_zk {
             let proof_bytes = intent.authorization_bytes.clone();
             let tx_body_clone = intent.tx_body.clone();
+            let executor = Arc::clone(&self.auth_verify_executor);
 
             let _permit =
                 self.auth_verify_semaphore.acquire().await.map_err(|_| {
@@ -266,7 +291,9 @@ impl AsyncMempool {
                 })?;
 
             tokio::task::spawn_blocking(move || {
-                verify_intent_authorization(&tx_body_clone, &proof_bytes)
+                executor(Box::new(move || {
+                    verify_intent_authorization(&tx_body_clone, &proof_bytes)
+                }))
             })
             .await
             .map_err(|e| SubmitError::Internal(format!("spawn_blocking: {e}")))?
@@ -954,10 +981,10 @@ mod tests {
     };
 
     use super::{check_input_slots, run_admission_checks, AsyncMempool, MempoolState};
-    use crate::error::SubmitError;
-    use std::collections::HashSet;
     use crate::config::MempoolConfig;
+    use crate::error::SubmitError;
     use crate::view::ChainView;
+    use std::collections::HashSet;
 
     fn empty_user_tx(epoch_anchor: [u8; 32], fee: u64) -> Transaction {
         Transaction::new(TxBody {

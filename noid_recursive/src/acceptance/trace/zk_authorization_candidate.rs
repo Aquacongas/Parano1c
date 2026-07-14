@@ -357,6 +357,66 @@ enum SelectedZkAuthorizationProofPolicyError {
     },
 }
 
+impl std::fmt::Display for SelectedZkAuthorizationProofPolicyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SlotCount { expected, actual } => write!(
+                f,
+                "selected ZK authorization slot count mismatch: expected {expected}, got {actual}"
+            ),
+            Self::LiveCount { expected, actual } => write!(
+                f,
+                "selected ZK authorization live-proof count mismatch: expected {expected}, got {actual}"
+            ),
+            Self::NonGhostStatement { index } => write!(
+                f,
+                "selected ZK authorization slot {index} has a non-canonical ghost statement"
+            ),
+            Self::NativeVerification { index, source } => write!(
+                f,
+                "selected ZK authorization proof {index} failed native verification: {source:?}"
+            ),
+            Self::GhostVerification(source) => write!(
+                f,
+                "selected ZK authorization ghost proof failed native verification: {source:?}"
+            ),
+            Self::WireEncoding { index, source } => write!(
+                f,
+                "selected ZK authorization proof {index} failed canonical wire encoding: {source}"
+            ),
+            Self::GhostWireEncoding(source) => write!(
+                f,
+                "selected ZK authorization ghost proof failed canonical wire encoding: {source}"
+            ),
+            Self::DuplicateLiveProof { first, second } => write!(
+                f,
+                "selected ZK authorization proofs {first} and {second} reuse identical proof bytes"
+            ),
+            Self::DuplicateLiveSourceCommitment { first, second } => write!(
+                f,
+                "selected ZK authorization proofs {first} and {second} reuse an identical source commitment"
+            ),
+            Self::LiveGhostProofReuse { live } => write!(
+                f,
+                "selected ZK authorization proof {live} reuses the canonical ghost proof bytes"
+            ),
+            Self::LiveGhostSourceCommitmentReuse { live } => write!(
+                f,
+                "selected ZK authorization proof {live} reuses the canonical ghost source commitment"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SelectedZkAuthorizationProofPolicyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::WireEncoding { source, .. } | Self::GhostWireEncoding(source) => Some(source),
+            _ => None,
+        }
+    }
+}
+
 fn validate_selected_zk_authorization_artifact_reuse(
     live: &[SelectedZkAuthorizationArtifactIdentity],
     ghost: &SelectedZkAuthorizationArtifactIdentity,
@@ -1351,14 +1411,6 @@ pub(crate) fn verify_zk_authorization_candidate_trace(
     })
 }
 
-/// Outputs of the private raw-slice tile candidate helper.
-#[derive(Clone, Debug)]
-struct ZkAuthorizationRawSliceTileTraceOutput {
-    /// The exact four Owner closing-state/Main absorb aliases pinned here.
-    pub bridge: ZkAuthSplitBridgeCells,
-    pub candidate: ZkAuthorizationCandidateTraceOutput,
-}
-
 fn slice_range(slice: &WitnessSlice) -> std::ops::Range<usize> {
     let start = slice.start();
     let end = start
@@ -1641,7 +1693,10 @@ fn verify_zk_authorization_raw_slice_tile_candidate_trace(
     wallet_b: &[WitnessSlice; ZK_AUTH_WALLET_B_COLUMNS],
     tile_index: usize,
     public: &SelectedZkAuthorizationStatementTrace,
-) -> Result<ZkAuthorizationRawSliceTileTraceOutput, ZkAuthorizationCandidateTraceError> {
+) -> Result<
+    (ZkAuthSplitBridgeCells, ZkAuthorizationCandidateTraceOutput),
+    ZkAuthorizationCandidateTraceError,
+> {
     let (cells, mut external) = preflight_zk_authorization_raw_slice_tile_candidate_trace(
         b,
         owner_layout,
@@ -1737,7 +1792,7 @@ fn verify_zk_authorization_raw_slice_tile_candidate_trace(
         b.num_wires() - wrapper_start,
         ZK_AUTH_RAW_SLICE_TILE_TRACE_ROWS
     );
-    Ok(ZkAuthorizationRawSliceTileTraceOutput { bridge, candidate })
+    Ok((bridge, candidate))
 }
 
 #[cfg(test)]
@@ -2589,7 +2644,7 @@ mod tests {
         let slices =
             alloc_raw_slice_tile_fixture_slices(&mut b, &native, &owner_layout, &main_layout);
         let before = b.num_wires();
-        let output = verify_zk_authorization_raw_slice_tile_candidate_trace(
+        let (bridge, candidate) = verify_zk_authorization_raw_slice_tile_candidate_trace(
             &mut b,
             &owner_layout,
             &slices.owner_a,
@@ -2613,10 +2668,9 @@ mod tests {
             &slices.main_c,
             0,
         );
-        assert_eq!(output.bridge.main_absorb, mapped.main.bridge);
+        assert_eq!(bridge.main_absorb, mapped.main.bridge);
         assert_eq!(
-            output
-                .candidate
+            candidate
                 .authorization
                 .phase_a
                 .terminal_oracle_value

@@ -336,6 +336,7 @@ fn test_header(
     height: u64,
 ) -> noid_chain::BlockHeader {
     noid_chain::BlockHeader {
+        attested_coverage: 0,
         prev_block_hash,
         state_root,
         tx_root: digest_with_seed(0x10 | (height as u8)),

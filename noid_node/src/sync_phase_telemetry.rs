@@ -231,22 +231,18 @@ mod tests {
     fn suffix_counts_only_until_the_fixed_target() {
         let mut telemetry = SnapshotSyncTelemetry::default();
         assert!(telemetry.begin_suffix(100, 102).is_none());
-        assert!(
-            telemetry
-                .record_suffix_block(101, 10, Duration::from_millis(2))
-                .is_none()
-        );
+        assert!(telemetry
+            .record_suffix_block(101, 10, Duration::from_millis(2))
+            .is_none());
         let completed = telemetry
             .record_suffix_block(102, 20, Duration::from_millis(3))
             .expect("target block completes the suffix");
         assert_eq!(completed.phase, SyncPhase::RetainedSuffix);
         assert_eq!((completed.count, completed.bytes), (2, 30));
         assert_eq!(completed.elapsed, Duration::from_millis(5));
-        assert!(
-            telemetry
-                .record_suffix_block(103, 99, Duration::from_secs(1))
-                .is_none()
-        );
+        assert!(telemetry
+            .record_suffix_block(103, 99, Duration::from_secs(1))
+            .is_none());
     }
 
     #[test]

@@ -134,6 +134,9 @@ mod tests {
     /// from this single equivalence.
     #[test]
     fn packed_mul_matches_scalar_clmul_gcm() {
+        if !kernel_supported() {
+            return;
+        }
         let mut s = 0xB00B5EED_u64;
         for _ in 0..20_000 {
             let a = [rng(&mut s), rng(&mut s)];
@@ -163,6 +166,9 @@ mod tests {
 
     #[test]
     fn packed_scalar_mul_matches_scalar_clmul_gcm() {
+        if !kernel_supported() {
+            return;
+        }
         let mut s = 0x5CA1AB1E_u64;
         for _ in 0..10_000 {
             let a = [rng(&mut s), rng(&mut s)];

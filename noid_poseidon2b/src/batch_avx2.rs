@@ -134,7 +134,10 @@ unsafe fn store_group(v: &[__m256i; STATE_SIZE], s: &mut [PackedBlock128; STATE_
 /// The CPU must support AVX2 and VPCLMULQDQ — callers gate on
 /// `is_x86_feature_detected!` (or a statically-enabled build).
 #[target_feature(enable = "avx2,vpclmulqdq")]
-pub(crate) unsafe fn permute_flat_groups(states: &mut [[PackedBlock128; STATE_SIZE]], t: &VecTables) {
+pub(crate) unsafe fn permute_flat_groups(
+    states: &mut [[PackedBlock128; STATE_SIZE]],
+    t: &VecTables,
+) {
     /// Groups per register-domain chunk. 4 groups × 4 state words = 16 ymm
     /// values plus multiply temporaries: the working set spills a little,
     /// but the interleaving keeps the CLMUL port saturated, which measures

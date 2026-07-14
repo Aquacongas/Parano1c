@@ -557,6 +557,15 @@ impl FsLaneChallenger {
         self.perms
     }
 
+    /// Current flat-basis sponge state, excluding the at-most-one buffered
+    /// absorb lane.  Recorded recursive channels finish at a transcript
+    /// boundary; exposing the state lets a layout-checked recording wrapper
+    /// prove that its native verifier pass and the later trace pass ended in
+    /// exact lockstep without replaying the verifier on a scratch builder.
+    pub fn post_state(&self) -> [F128; 4] {
+        self.state
+    }
+
     fn permute(&mut self) {
         permute_flat(&mut self.state);
         self.perms += 1;

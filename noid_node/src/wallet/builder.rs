@@ -11,12 +11,12 @@
 //! is held for as short a time as possible.
 //!
 use noid_gkr::OwnerAuthWitness;
-use noid_poseidon2b::primitives::{Address, derive_address};
+use noid_poseidon2b::primitives::{derive_address, Address};
 use noid_tx::{
-    TX_INPUTS, TX_OUTPUTS,
     intent::TxIntent,
     output_bitmap_bit,
     types::{TxBody, TxInput, TxOutput},
+    TX_INPUTS, TX_OUTPUTS,
 };
 
 use crate::wallet::prover::prove_tx;

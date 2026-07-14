@@ -32,7 +32,69 @@ use noid_chain::storage::{MdbxChainContext, MdbxContextError, MdbxStore};
 use noid_mempool::AsyncMempool;
 use noid_poseidon2b::primitives::Address;
 
-use crate::memory_governor::{ProofMemoryGovernor, ProofMemoryReservation};
+use crate::cpu_budget::install_process_proof_cpu;
+use crate::topology_gate::{ProofTopologyGate, ProofTopologyReservation};
+
+/// Shared one-shot capability. All immutable template clones race on the same
+/// owning reservation, so at most one caller may assemble the detached proof
+/// payload and the topology slot cannot disappear between build and proof.
+#[derive(Clone)]
+struct ProofTemplateAuthorization {
+    reservation: Arc<Mutex<Option<ProofTopologyReservation>>>,
+}
+
+impl ProofTemplateAuthorization {
+    fn new(reservation: ProofTopologyReservation) -> Self {
+        Self {
+            reservation: Arc::new(Mutex::new(Some(reservation))),
+        }
+    }
+
+    fn consume(&self) -> Option<ProofTopologyReservation> {
+        self.reservation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+}
+
+/// Owns the global heavy-proof admission for exactly the template build.
+/// Dropping this guard on any early return releases the reservation.
+struct TopologyAdmittedTemplateBuild {
+    reservation: Option<ProofTopologyReservation>,
+}
+
+impl TopologyAdmittedTemplateBuild {
+    fn new(reservation: Option<ProofTopologyReservation>) -> Self {
+        Self { reservation }
+    }
+
+    /// Finish the budgeted build and transfer its owning reservation into the
+    /// shared one-shot template capability. The reservation is atomically
+    /// narrowed from the selection cap to the exact finalized native tier;
+    /// it then lives until proof return/unwind or the last template clone drop.
+    fn finish<T>(
+        mut self,
+        user_txs: usize,
+        complete: impl FnOnce(Option<ProofTemplateAuthorization>) -> T,
+    ) -> Result<T, &'static str> {
+        let authorization = match (user_txs, self.reservation.take()) {
+            (0, reservation) => {
+                drop(reservation);
+                None
+            }
+            (_, None) => {
+                return Err("tx-bearing template completed without proof-stage admission");
+            }
+            (_, Some(reservation)) => Some(ProofTemplateAuthorization::new(
+                reservation
+                    .narrow_for_native_user_txs(user_txs)?
+                    .ok_or("tx-bearing template lost its proof-stage admission")?,
+            )),
+        };
+        Ok(complete(authorization))
+    }
+}
 
 /// Why the template was refreshed (carried in `MinerEvent::TemplateRefreshed`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,10 +135,10 @@ pub struct BlockTemplate {
     /// `header.attested_coverage` beyond the parent's. Empty when the header
     /// keeps the parent's coverage.
     pub coverage_attestation_bytes: Vec<u8>,
-    /// Process-wide proof-memory reservation acquired before cached proof bytes
-    /// or exact-state artifacts are cloned into this template. Shared clones
-    /// keep the reservation alive until the blocking prover actually exits.
-    proof_memory_reservation: Option<Arc<Mutex<Option<ProofMemoryReservation>>>>,
+    /// One-shot owning admission minted only after tx-bearing template
+    /// construction completes under the process-wide proof topology gate.
+    /// Shared clones transfer the same private reservation exactly once.
+    proof_template_authorization: Option<ProofTemplateAuthorization>,
 }
 
 impl BlockTemplate {
@@ -101,10 +163,12 @@ impl BlockTemplate {
         self.inner.txs.len()
     }
 
-    /// Consume the one proof-job reservation shared by every clone of this
-    /// immutable template. Exactly one blocking worker can cross this edge.
-    pub(crate) fn take_proof_memory_reservation(&self) -> Option<ProofMemoryReservation> {
-        self.proof_memory_reservation.as_ref()?.lock().ok()?.take()
+    /// Transfer the one owning proof reservation shared by every clone of this
+    /// immutable template. Exactly one caller can cross this edge.
+    pub(crate) fn take_proof_topology_reservation(&self) -> Option<ProofTopologyReservation> {
+        self.proof_template_authorization
+            .as_ref()
+            .and_then(ProofTemplateAuthorization::consume)
     }
 }
 
@@ -113,7 +177,7 @@ impl BlockTemplate {
 /// Capture this under the chain lock, then drop the lock before awaiting mempool
 /// selection or doing proof/template work. Raw segment columns are deliberately
 /// excluded; selected transaction segments are faulted in from the cloned MDBX
-/// handle only after the memory governor admits the job.
+/// handle only after the topology gate admits the job.
 pub struct TemplateChainSnapshot {
     pub parent: BlockHeader,
     pub prev_active_counts: Vec<u64>,
@@ -204,14 +268,11 @@ impl TemplateChainSnapshot {
     ) -> Result<(), MdbxContextError> {
         let effective_log = state.state.effective_log_segment_size();
         let log_slots = state.state.log_slots() as u32;
-        let needed: HashSet<u16> = noid_chain::consensus::generate_slot_hints(
-            state.alloc_counter,
-            log_slots,
-            65_536,
-        )
-        .into_iter()
-        .map(|slot| (slot >> effective_log) as u16)
-        .collect();
+        let needed: HashSet<u16> =
+            noid_chain::consensus::generate_slot_hints(state.alloc_counter, log_slots, 65_536)
+                .into_iter()
+                .map(|slot| (slot >> effective_log) as u16)
+                .collect();
         self.hydrate_segments(state, needed)
     }
 
@@ -268,8 +329,7 @@ fn local_coverage_attachment(
     // The envelope must bind the CANONICAL header at C; a stale pointer left
     // by a reorg rewind would fail block validation, so skip attaching it.
     match ctx.get_header_from_store(coverage.height) {
-        Ok(Some(header))
-            if noid_chain::hash_block_header(&header) == coverage.block_hash => {}
+        Ok(Some(header)) if noid_chain::hash_block_header(&header) == coverage.block_hash => {}
         Ok(_) => return None,
         Err(error) => {
             tracing::warn!(err = %error, "template coverage header read failed");
@@ -361,26 +421,25 @@ impl TemplateBuilder {
 
         // Select top txs from mempool (coinbase is added separately by the chain template).
         let consensus_max = noid_chain::consensus::params::BLOCK_MAX_USER_TXS;
-        let memory_governor = ProofMemoryGovernor::global(0);
+        let topology_gate = ProofTopologyGate::global();
         let max_user_txs = max_user_txs
             .min(consensus_max)
-            .min(memory_governor.max_user_txs_now());
-        let proof_memory_reservation = match memory_governor.try_reserve_for_user_txs(max_user_txs)
-        {
+            .min(topology_gate.max_user_txs_now());
+        let proof_build_admission = match topology_gate.try_admit_native_user_txs(max_user_txs) {
             Ok(reservation) => reservation,
-            Err(pressure) => {
+            Err(error) => {
                 tracing::warn!(
                     max_user_txs,
-                    required_mib = pressure.required_mib,
-                    available_mib = pressure.available_mib,
-                    "proof template rejected by process memory governor"
+                    error = %error,
+                    "proof template deferred by process proof topology"
                 );
                 return None;
             }
         };
+        let proof_build_admission = TopologyAdmittedTemplateBuild::new(proof_build_admission);
         // Filter against the captured anchor while entries are still borrowed
         // under the mempool lock. This preserves the same fee-ordered prefix
-        // but clones only the proof bundles admitted by the runtime budget.
+        // but clones only the proof bundles admitted by the active topology.
         let entries = self
             .mempool
             .select_for_block_at_anchor(max_user_txs, snapshot.user_epoch_anchor)
@@ -430,107 +489,272 @@ impl TemplateBuilder {
             tracing::warn!(err = %error, "template allocator-segment hydration failed");
             return None;
         }
-        match noid_chain::consensus::template::build_block_template_with_coverage(
-            parent,
-            &state,
-            prev_active_counts,
-            txs,
-            miner_address,
-            timestamp,
-            difficulty_target,
-            template_coverage,
-        ) {
-            Ok(inner) => {
-                let proof_memory_reservation = if inner.txs.is_empty() {
-                    None
-                } else {
-                    proof_memory_reservation
-                        .map(|reservation| Arc::new(Mutex::new(Some(reservation))))
-                };
-                let exact_state_transition = if inner.txs.is_empty() {
-                    None
-                } else {
-                    // Expansion blocks are coinbase-only (template building
-                    // clears user txs when log_slots grows), so a tx-bearing
-                    // template always shares the snapshot state's log_slots
-                    // and the action surface builds against the snapshot
-                    // directly — no expanded whole-state copy.
-                    if inner.log_slots as usize != state.state.log_slots() {
-                        tracing::warn!(
-                            template_log_slots = inner.log_slots,
-                            state_log_slots = state.state.log_slots(),
-                            "tx-bearing template log_slots diverges from snapshot state"
-                        );
+        let template_cpu_result = install_process_proof_cpu(|| {
+            let inner = match noid_chain::consensus::template::build_block_template_with_coverage(
+                parent,
+                &state,
+                prev_active_counts,
+                txs,
+                miner_address,
+                timestamp,
+                difficulty_target,
+                template_coverage,
+            ) {
+                Ok(inner) => inner,
+                Err(error) => {
+                    tracing::warn!(err = ?error, "template build failed");
+                    return None;
+                }
+            };
+            let exact_state_transition = if inner.txs.is_empty() {
+                None
+            } else {
+                // Expansion blocks are coinbase-only (template building
+                // clears user txs when log_slots grows), so a tx-bearing
+                // template always shares the snapshot state's log_slots
+                // and the action surface builds against the snapshot
+                // directly — no expanded whole-state copy.
+                if inner.log_slots as usize != state.state.log_slots() {
+                    tracing::warn!(
+                        template_log_slots = inner.log_slots,
+                        state_log_slots = state.state.log_slots(),
+                        "tx-bearing template log_slots diverges from snapshot state"
+                    );
+                    return None;
+                }
+                let bodies: Vec<_> = std::iter::once(inner.coinbase.body.clone())
+                    .chain(inner.txs.iter().map(|tx| tx.body.clone()))
+                    .collect();
+                let commitments: Vec<[u8; 32]> = bodies
+                    .iter()
+                    .map(noid_tx::compute_claims_commitment)
+                    .collect();
+                let surface = match noid_chain::build_exact_action_surface(
+                    &state.state,
+                    &bodies,
+                    &commitments,
+                    state.alloc_counter,
+                    inner.height,
+                ) {
+                    Ok(surface) => surface,
+                    Err(error) => {
+                        tracing::warn!(err = ?error, "exact state surface build failed");
                         return None;
                     }
-                    let bodies: Vec<_> = std::iter::once(inner.coinbase.body.clone())
-                        .chain(inner.txs.iter().map(|tx| tx.body.clone()))
-                        .collect();
-                    let commitments: Vec<[u8; 32]> = bodies
-                        .iter()
-                        .map(noid_tx::compute_claims_commitment)
-                        .collect();
-                    let surface = match noid_chain::build_exact_action_surface(
-                        &state.state,
-                        &bodies,
-                        &commitments,
-                        state.alloc_counter,
-                        inner.height,
-                    ) {
-                        Ok(surface) => surface,
-                        Err(e) => {
-                            tracing::warn!(err = ?e, "exact state surface build failed");
-                            return None;
-                        }
-                    };
-                    let siblings = match state
-                        .exact_frontier_siblings(&surface.touched_indices, inner.log_slots)
-                    {
-                        Ok(siblings) => siblings,
-                        Err(e) => {
-                            tracing::warn!(err = %e, "compact exact frontier build failed");
-                            return None;
-                        }
-                    };
-                    match noid_block::build_exact_state_transition_proof_from_siblings(
-                        &surface,
-                        siblings,
-                        inner.log_slots,
-                    ) {
-                        Ok(proof) => Some(proof),
-                        Err(error) => {
-                            tracing::warn!(err = ?error, "bounded exact state proof build failed");
-                            return None;
-                        }
+                };
+                let siblings = match state
+                    .exact_frontier_siblings(&surface.touched_indices, inner.log_slots)
+                {
+                    Ok(siblings) => siblings,
+                    Err(error) => {
+                        tracing::warn!(err = %error, "compact exact frontier build failed");
+                        return None;
                     }
                 };
-
-                let authorization_bytes = inner
-                    .txs
-                    .iter()
-                    .map(|tx| proof_by_hash.remove(&tx.txid()).unwrap_or(None))
-                    .collect();
-                let coverage_attestation_bytes = snapshot
-                    .coverage_attachment
-                    .as_ref()
-                    .map(|(_, bytes)| bytes.clone())
-                    .unwrap_or_default();
-                Some(BlockTemplate {
-                    inner,
-                    difficulty_target,
-                    miner_address,
-                    timestamp,
-                    parent: *parent,
-                    authorization_bytes,
-                    exact_state_transition,
-                    coverage_attestation_bytes,
-                    proof_memory_reservation,
-                })
+                match noid_block::build_exact_state_transition_proof_from_siblings(
+                    &surface,
+                    siblings,
+                    inner.log_slots,
+                ) {
+                    Ok(proof) => Some(proof),
+                    Err(error) => {
+                        tracing::warn!(err = ?error, "bounded exact state proof build failed");
+                        return None;
+                    }
+                }
+            };
+            Some((inner, exact_state_transition))
+        });
+        let (inner, exact_state_transition) = match template_cpu_result {
+            Ok(Some(result)) => result,
+            Ok(None) => return None,
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    "template exact-state CPU admission failed closed"
+                );
+                return None;
             }
-            Err(e) => {
-                tracing::warn!("template build failed: {:?}", e);
+        };
+
+        let authorization_bytes = inner
+            .txs
+            .iter()
+            .map(|tx| proof_by_hash.remove(&tx.txid()).unwrap_or(None))
+            .collect();
+        let coverage_attestation_bytes = snapshot
+            .coverage_attachment
+            .as_ref()
+            .map(|(_, bytes)| bytes.clone())
+            .unwrap_or_default();
+        let actual_user_txs = inner.txs.len();
+        match proof_build_admission.finish(actual_user_txs, |proof_template_authorization| {
+            BlockTemplate {
+                inner,
+                difficulty_target,
+                miner_address,
+                timestamp,
+                parent: *parent,
+                authorization_bytes,
+                exact_state_transition,
+                coverage_attestation_bytes,
+                proof_template_authorization,
+            }
+        }) {
+            Ok(template) => Some(template),
+            Err(error) => {
+                tracing::error!(%error, "proof template authorization failed closed");
                 None
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn synthetic_transaction(is_coinbase: bool) -> noid_tx::Transaction {
+        noid_tx::Transaction::new(noid_tx::TxBody {
+            epoch_anchor: [0u8; 32],
+            fee: 0,
+            input_owner: Address([0u8; 32]),
+            inputs: [noid_tx::TxInput::dummy(); noid_tx::TX_INPUTS],
+            outputs: [noid_tx::TxOutput::dummy(); noid_tx::TX_OUTPUTS],
+            validity_bitmap: 0,
+            is_coinbase,
+        })
+    }
+
+    fn synthetic_template(
+        user_txs: usize,
+        proof_template_authorization: Option<ProofTemplateAuthorization>,
+    ) -> BlockTemplate {
+        let miner_address = Address([7u8; 32]);
+        let inner = ChainTemplate {
+            coinbase: synthetic_transaction(true),
+            txs: (0..user_txs)
+                .map(|_| synthetic_transaction(false))
+                .collect(),
+            state_root: [2u8; 32],
+            tx_root: [3u8; 32],
+            active_slot_count: 0,
+            alloc_counter: 0,
+            log_slots: 8,
+            height: 1,
+            timestamp: 1,
+            miner_address,
+            difficulty_target: [0xff; 32],
+            prev_block_hash: [0u8; 32],
+            attested_coverage: 0,
+        };
+        BlockTemplate {
+            inner,
+            difficulty_target: [0xff; 32],
+            miner_address,
+            timestamp: 1,
+            parent: BlockHeader {
+                prev_block_hash: [0u8; 32],
+                state_root: [1u8; 32],
+                tx_root: [0u8; 32],
+                timestamp: 0,
+                height: 0,
+                miner_address: Address([0u8; 32]),
+                nonce: 0,
+                difficulty_target: [0xff; 32],
+                log_slots: 8,
+                active_slot_count: 0,
+                alloc_counter: 0,
+                attested_coverage: 0,
+            },
+            authorization_bytes: vec![None; user_txs],
+            exact_state_transition: None,
+            coverage_attestation_bytes: Vec::new(),
+            proof_template_authorization,
+        }
+    }
+
+    fn native_test_reservation(
+        gate: &ProofTopologyGate,
+        user_txs: usize,
+    ) -> ProofTopologyReservation {
+        gate.try_admit_native_user_txs(user_txs)
+            .expect("native proof admission")
+            .expect("tx-bearing native reservation")
+    }
+
+    #[test]
+    fn max_b255_selection_cap_downgrades_to_owned_native_b8() {
+        let governor = ProofTopologyGate::for_tests();
+        let admission =
+            TopologyAdmittedTemplateBuild::new(Some(native_test_reservation(&governor, 255)));
+        assert!(governor.try_admit_selected_history_session(64).is_err());
+
+        let authorization = admission
+            .finish(1, |authorization| {
+                assert!(governor.try_admit_selected_history_session(64).is_ok());
+                authorization
+            })
+            .expect("budgeted tx template")
+            .expect("tx proof authorization");
+        assert!(governor.try_admit_native_user_txs(9).is_err());
+        let reservation = authorization.consume().expect("owning native B8 admission");
+        assert!(authorization.consume().is_none());
+        drop(reservation);
+        drop(native_test_reservation(&governor, 9));
+    }
+
+    #[test]
+    fn failed_or_empty_template_build_releases_native_admission() {
+        let governor = ProofTopologyGate::for_tests();
+        let abandoned_build =
+            TopologyAdmittedTemplateBuild::new(Some(native_test_reservation(&governor, 255)));
+
+        drop(abandoned_build);
+        drop(native_test_reservation(&governor, 255));
+
+        let empty =
+            TopologyAdmittedTemplateBuild::new(Some(native_test_reservation(&governor, 255)))
+                .finish(0, |authorization| authorization)
+                .expect("empty template completion");
+        assert!(empty.is_none());
+        drop(native_test_reservation(&governor, 255));
+
+        assert!(TopologyAdmittedTemplateBuild::new(None)
+            .finish(1, |_| ())
+            .is_err());
+    }
+
+    #[test]
+    fn template_clones_transfer_one_reservation_held_through_error() {
+        let governor = ProofTopologyGate::for_tests();
+        let authorization =
+            TopologyAdmittedTemplateBuild::new(Some(native_test_reservation(&governor, 8)))
+                .finish(1, |authorization| authorization)
+                .expect("budgeted tx template")
+                .expect("tx proof authorization");
+        let template = synthetic_template(1, Some(authorization));
+        let cloned_template = template.clone();
+
+        let first = crate::miner::run_prove_block(&template, [1u8; 32])
+            .expect_err("synthetic template has no authorization bundle");
+        assert!(first.contains("missing WalletAuthorizationBundle"));
+        assert_eq!(
+            crate::miner::run_prove_block(&cloned_template, [1u8; 32]),
+            Err("unadmitted or already-consumed proof template rejected".to_string())
+        );
+        drop(native_test_reservation(&governor, 9));
+    }
+
+    #[test]
+    fn unadmitted_tx_is_rejected_but_coinbase_only_needs_no_marker() {
+        assert_eq!(
+            crate::miner::run_prove_block(&synthetic_template(1, None), [1u8; 32]),
+            Err("unadmitted or already-consumed proof template rejected".to_string())
+        );
+        assert_eq!(
+            crate::miner::run_prove_block(&synthetic_template(0, None), [1u8; 32]),
+            Ok((Vec::new(), Vec::new()))
+        );
     }
 }

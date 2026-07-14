@@ -157,6 +157,21 @@ pub trait LincheckCircuit: Sync {
     /// `c ∈ [0, n_cols())`. `eq_inner.len() == n_cols()`.
     fn fold_alpha_batched(&self, alpha: F128, eq_inner: &[F128]) -> Vec<F128>;
 
+    /// Compute the same column marginal directly from the factorized quirky
+    /// equality point. The default keeps the established dense-table path;
+    /// compact immutable relations override this seam so a width-k
+    /// `eq_inner` allocation is not needed beside the width-k result.
+    fn fold_alpha_batched_quirky(
+        &self,
+        alpha: F128,
+        z_skip: F128,
+        x_inner_rest: &[F128],
+        k_skip: usize,
+    ) -> Vec<F128> {
+        let eq_inner = build_quirky_eq_table(z_skip, x_inner_rest, k_skip);
+        self.fold_alpha_batched(alpha, &eq_inner)
+    }
+
     /// Column index of a constant-one wire to pin, or `None` if the circuit has
     /// no such wire. When `Some(col)`, lincheck folds one extra `β`-term into the
     /// comb so the sumcheck also proves that the committed constant column is the
@@ -1502,24 +1517,12 @@ fn prove_padded_inner<Ch: Challenger>(
     } else {
         None
     };
-    let eq_inner = build_quirky_eq_table(x_ab.z_skip, &x_ab.x_inner_rest, k_skip);
+    let mut comb_vec =
+        circuit.fold_alpha_batched_quirky(alpha, x_ab.z_skip, &x_ab.x_inner_rest, k_skip);
     if let Some(t) = t {
         eprintln!(
             "[lc] {:<26} {:>7.2} ms",
-            "build_quirky_eq",
-            t.elapsed().as_secs_f64() * 1e3
-        );
-    }
-    let t = if trace {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
-    let mut comb_vec = circuit.fold_alpha_batched(alpha, &eq_inner);
-    if let Some(t) = t {
-        eprintln!(
-            "[lc] {:<26} {:>7.2} ms",
-            "fold_alpha_batched",
+            "fold_alpha_batched_quirky",
             t.elapsed().as_secs_f64() * 1e3
         );
     }
@@ -1632,6 +1635,33 @@ fn prove_padded_inner<Ch: Challenger>(
     (proof, claim, captured_z_vec)
 }
 
+/// One prover-derived deferred matrix claim captured from the exact lincheck
+/// transcript while it is being produced.
+///
+/// The constructor is intentionally private and the capability is neither
+/// `Clone` nor serializable: only [`prove_field_capturing_fresh`] can mint it,
+/// and a downstream locally-authored replay consumes it exactly once.  This is
+/// not a substitute for statement/class/envelope binding; the enclosing field
+/// prover owns those bindings and wraps this narrow capture before it crosses
+/// a proving-stage boundary.
+#[must_use = "a locally-authored lincheck capture must be consumed or deliberately dropped"]
+pub struct LocallyAuthoredFreshLincheckCapture {
+    fresh: crate::matrix_claim::FreshLincheckClaim,
+}
+
+impl LocallyAuthoredFreshLincheckCapture {
+    /// Test-only inspection for parity against the ordinary verifier replay.
+    #[cfg(test)]
+    pub(crate) fn fresh_claim(&self) -> &crate::matrix_claim::FreshLincheckClaim {
+        &self.fresh
+    }
+
+    /// Consume the locally-authored capability and release its deferred claim.
+    pub fn into_fresh_claim(self) -> crate::matrix_claim::FreshLincheckClaim {
+        self.fresh
+    }
+}
+
 /// Field-witness lincheck prover (P1, `FieldR1cs`): the witness is `2^m`
 /// F128 **elements** in element-major layout (`z[i_inner + k·i_outer]`)
 /// instead of stripe-packed bits, and the circuit carries F128 coefficients
@@ -1655,6 +1685,80 @@ pub fn prove_field<Ch: Challenger>(
     x_ab: &QuirkyPoint,
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim) {
+    let (proof, claim, capture) = prove_field_inner(
+        z,
+        m,
+        k_log,
+        k_skip,
+        useful_rows,
+        circuit,
+        x_ab,
+        None,
+        challenger,
+    );
+    debug_assert!(capture.is_none());
+    (proof, claim)
+}
+
+/// Opt-in twin of [`prove_field`] which captures the exact deferred matrix
+/// claim that [`verify_deferred`] would derive from this proof and transcript.
+///
+/// `v_a` and `v_b` must be the zerocheck evaluations already bound into the
+/// same enclosing challenger immediately before lincheck.  They are used only
+/// to thread the verifier's running sumcheck target; no additional transcript
+/// messages or samples are introduced, so the returned proof bytes and final
+/// challenger state are identical to [`prove_field`].
+#[allow(clippy::too_many_arguments)]
+pub fn prove_field_capturing_fresh<Ch: Challenger>(
+    z: &[F128],
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_rows: usize,
+    circuit: &dyn LincheckCircuit,
+    x_ab: &QuirkyPoint,
+    v_a: F128,
+    v_b: F128,
+    challenger: &mut Ch,
+) -> (
+    LincheckProof,
+    LincheckClaim,
+    LocallyAuthoredFreshLincheckCapture,
+) {
+    let (proof, claim, capture) = prove_field_inner(
+        z,
+        m,
+        k_log,
+        k_skip,
+        useful_rows,
+        circuit,
+        x_ab,
+        Some((v_a, v_b)),
+        challenger,
+    );
+    (
+        proof,
+        claim,
+        capture.expect("captured lincheck path returns its one-shot claim"),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_field_inner<Ch: Challenger>(
+    z: &[F128],
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_rows: usize,
+    circuit: &dyn LincheckCircuit,
+    x_ab: &QuirkyPoint,
+    capture_values: Option<(F128, F128)>,
+    challenger: &mut Ch,
+) -> (
+    LincheckProof,
+    LincheckClaim,
+    Option<LocallyAuthoredFreshLincheckCapture>,
+) {
     use rayon::prelude::*;
 
     let k = 1usize << k_log;
@@ -1674,16 +1778,31 @@ pub fn prove_field<Ch: Challenger>(
     let alpha = challenger.sample_f128();
 
     // 2. α-batched comb_vec via the coefficient-carrying circuit fold.
-    let eq_inner = build_quirky_eq_table(x_ab.z_skip, &x_ab.x_inner_rest, k_skip);
-    let mut comb_vec = circuit.fold_alpha_batched(alpha, &eq_inner);
+    let mut comb_vec =
+        circuit.fold_alpha_batched_quirky(alpha, x_ab.z_skip, &x_ab.x_inner_rest, k_skip);
 
     // 2b. Constant-wire pin (see docs/const-wire-pin.md; identical to the
     //     boolean path — the committed constant column must be all-ones in
     //     every block, padding included).
-    if let Some(col) = circuit.const_pin_col() {
+    let const_pin = circuit.const_pin_col();
+    let beta = if let Some(col) = const_pin {
         let beta = challenger.sample_f128();
         comb_vec[col] += beta;
-    }
+        Some(beta)
+    } else {
+        None
+    };
+
+    // Opt-in only: mirror verify_deferred's running target without observing
+    // or sampling anything new.  The ordinary prover path keeps this `None`
+    // and pays neither the per-round arithmetic nor the final claim clones.
+    let mut captured_running = capture_values.map(|(v_a, v_b)| {
+        let mut target = alpha * v_a + v_b;
+        if let Some(beta) = beta {
+            target += beta;
+        }
+        target
+    });
 
     // 3. Partial fold of the field witness at the shared outer half:
     //    z_vec[i_inner] = Σ_{i_outer} eq(x_outer, i_outer) · z[i_inner + k·i_outer].
@@ -1713,6 +1832,13 @@ pub fn prove_field<Ch: Challenger>(
             let r = challenger.sample_f128();
             rounds.push((e1, einf));
             r_rounds.push(r);
+            if let Some(running) = captured_running.as_mut() {
+                // Exact twin of verify_deferred: q(0) = running + q(1) in
+                // characteristic two, with q(X) encoded by (q(1), q(inf)).
+                let e0 = *running + e1;
+                let c1 = e0 + e1 + einf;
+                *running = einf * r * r + c1 * r + e0;
+            }
             if t + 1 < inner_rest_len {
                 let (ne1, neinf) = sumcheck_bind_both_and_eval_next(&mut comb_vec, &mut z_vec, r);
                 e1 = ne1;
@@ -1735,13 +1861,41 @@ pub fn prove_field<Ch: Challenger>(
     let mut r_inner_rest = r_rounds;
     r_inner_rest.reverse();
 
+    let fresh_capture = captured_running.map(|mut fresh_value| {
+        debug_assert_eq!(
+            fresh_value,
+            inner_product(&comb_vec, &z_partial),
+            "captured lincheck running target must reach the prover terminal",
+        );
+
+        // The constant-pin term is matrix-independent.  Peel it exactly as
+        // verify_deferred does so `fresh.value` contains only the bilinear
+        // (alpha*A + B) matrix evaluation folded by the chain.
+        if let (Some(beta), Some(col)) = (beta, const_pin) {
+            let q_tensor = build_eq_table(&r_inner_rest);
+            let mask = (1usize << k_skip) - 1;
+            fresh_value += beta * z_partial[col & mask] * q_tensor[col >> k_skip];
+        }
+
+        LocallyAuthoredFreshLincheckCapture {
+            fresh: crate::matrix_claim::FreshLincheckClaim {
+                alpha,
+                z_skip: x_ab.z_skip,
+                x_inner_rest: x_ab.x_inner_rest.clone(),
+                r_inner_rest: r_inner_rest.clone(),
+                z_partial: z_partial.clone(),
+                value: fresh_value,
+            },
+        }
+    });
+
     let proof = LincheckProof { rounds, z_partial };
     let claim = LincheckClaim {
         r_inner_skip,
         r_inner_rest,
         w,
     };
-    (proof, claim)
+    (proof, claim, fresh_capture)
 }
 
 /// Verify a lincheck proof. Walks the challenger in lockstep with `prove`,
@@ -1823,18 +1977,11 @@ pub fn verify<Ch: Challenger>(
     //    the prover made — sparse default delegates to the fused row-fold;
     //    per-hash impls walk the constraint graph directly).
     let t = std::time::Instant::now();
-    let eq_inner = build_quirky_eq_table(x_ab.z_skip, &x_ab.x_inner_rest, k_skip);
+    let mut comb_vec =
+        circuit.fold_alpha_batched_quirky(alpha, x_ab.z_skip, &x_ab.x_inner_rest, k_skip);
     if trace {
         eprintln!(
-            "        [lcv] build_quirky_eq_table (2^{k_log}): {}",
-            fmt(t.elapsed().as_secs_f64())
-        );
-    }
-    let t = std::time::Instant::now();
-    let mut comb_vec = circuit.fold_alpha_batched(alpha, &eq_inner);
-    if trace {
-        eprintln!(
-            "        [lcv] circuit.fold_alpha_batched: {}",
+            "        [lcv] fold_alpha_batched_quirky (2^{k_log}): {}",
             fmt(t.elapsed().as_secs_f64())
         );
     }
@@ -2768,6 +2915,110 @@ mod tests {
                 "tampered z_partial accepted m={m}"
             );
         }
+    }
+
+    #[test]
+    fn locally_authored_capture_matches_deferred_replay_and_legacy_bytes() {
+        use crate::field_r1cs::{
+            FieldCscCircuit, FieldR1cs, SparseFieldMatrix, apply_block_diag_field,
+        };
+        use crate::matrix_claim::fresh_claim_value;
+
+        let (m, k_log, k_skip) = (10usize, 7usize, 6usize);
+        let k = 1usize << k_log;
+        let const_pin = 5usize;
+        let mut rng = Rng::new(0x10CA_11A7_C4A7);
+        let gen_matrix = |rng: &mut Rng| {
+            SparseFieldMatrix::from_rows(
+                k,
+                (0..k)
+                    .map(|_| {
+                        (0..3)
+                            .map(|_| ((rng.next_u64() as usize % k) as u32, rng.f128()))
+                            .collect()
+                    })
+                    .collect(),
+            )
+        };
+        let a_0 = gen_matrix(&mut rng);
+        let b_0 = gen_matrix(&mut rng);
+        let relation = FieldR1cs {
+            m,
+            k_log,
+            k_skip,
+            useful_rows: k,
+            a_0,
+            b_0,
+            const_pin: Some(const_pin),
+            digest_cache: std::sync::OnceLock::new(),
+            csc_cache: std::sync::OnceLock::new(),
+        };
+        let mut z = rng.f128_vec(1usize << m);
+        for outer in 0..(1usize << (m - k_log)) {
+            z[(outer << k_log) + const_pin] = F128::ONE;
+        }
+        let a = apply_block_diag_field(&relation.a_0, &z, k_log);
+        let b = apply_block_diag_field(&relation.b_0, &z, k_log);
+        let x_ab = random_quirky_point(m, k_log, k_skip, &mut rng);
+        let v_a = mle_eval_field_quirky(&a, m, k_log, k_skip, &x_ab);
+        let v_b = mle_eval_field_quirky(&b, m, k_log, k_skip, &x_ab);
+        let circuit = FieldCscCircuit::from_matrices(&relation.a_0, &relation.b_0)
+            .with_const_pin(Some(const_pin));
+
+        let mut legacy_ch = FsChallenger::new(b"field-lc-local-capture-v0");
+        let (legacy_proof, legacy_claim) =
+            prove_field(&z, m, k_log, k_skip, k, &circuit, &x_ab, &mut legacy_ch);
+
+        let mut captured_ch = FsChallenger::new(b"field-lc-local-capture-v0");
+        let (captured_proof, captured_claim, capture) = prove_field_capturing_fresh(
+            &z,
+            m,
+            k_log,
+            k_skip,
+            k,
+            &circuit,
+            &x_ab,
+            v_a,
+            v_b,
+            &mut captured_ch,
+        );
+        assert_eq!(captured_proof, legacy_proof);
+        assert_eq!(captured_claim, legacy_claim);
+        let next_after_prove = captured_ch.sample_f128();
+        assert_eq!(next_after_prove, legacy_ch.sample_f128());
+
+        let mut deferred_ch = FsChallenger::new(b"field-lc-local-capture-v0");
+        let (deferred_claim, deferred_fresh) = verify_deferred(
+            m,
+            k_log,
+            k_skip,
+            Some(const_pin),
+            &x_ab,
+            v_a,
+            v_b,
+            &captured_proof,
+            &mut deferred_ch,
+        )
+        .expect("captured honest lincheck has a deferred replay");
+        assert_eq!(deferred_claim, captured_claim);
+        assert_eq!(deferred_ch.sample_f128(), next_after_prove);
+        assert_eq!(capture.fresh_claim().value, deferred_fresh.value);
+
+        let captured_fresh = capture.into_fresh_claim();
+        assert_eq!(captured_fresh.alpha, deferred_fresh.alpha);
+        assert_eq!(captured_fresh.z_skip, deferred_fresh.z_skip);
+        assert_eq!(captured_fresh.x_inner_rest, deferred_fresh.x_inner_rest);
+        assert_eq!(captured_fresh.r_inner_rest, deferred_fresh.r_inner_rest);
+        assert_eq!(captured_fresh.z_partial, deferred_fresh.z_partial);
+        assert_eq!(
+            captured_fresh.value, deferred_fresh.value,
+            "the locally-authored capture must peel the beta const-pin term exactly",
+        );
+        assert_eq!(
+            fresh_claim_value(&relation, &captured_fresh),
+            captured_fresh.value,
+            "the peeled capture must be the true matrix-only bilinear claim",
+        );
     }
 
     /// prove_field honors useful_rows padding: a witness whose padding rows

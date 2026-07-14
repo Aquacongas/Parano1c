@@ -20,13 +20,22 @@ use std::sync::{Arc, OnceLock};
 
 use noid_ivc_core::challenger::Challenger;
 use noid_ivc_core::field::F128;
-use noid_ivc_core::field_circuit::{FieldR1csBuilder, LinExpr};
-use noid_ivc_core::field_r1cs::FieldR1cs;
+use noid_ivc_core::field_circuit::{
+    FieldR1csBuilder, LayoutRecordedChannel, LayoutRecordingChallenger, LinExpr,
+};
+use noid_ivc_core::field_r1cs::{CompactFieldR1cs, FieldR1cs};
+use noid_ivc_core::lincheck::LocallyAuthoredFreshLincheckCapture;
 use noid_ivc_core::pcs::{Commitment, PcsParams, LOG_PACKING};
 use noid_ivc_core::proof::{pcs_params_statement_bytes, FieldR1csProof, FieldShape, R1csClaim};
 use noid_ivc_core::public_io::{PublicIoSpec, WitnessSlice};
 use noid_ivc_core::verifier::{verify_field_with_public_io_and_post_commit_context, VerifyError};
-use noid_ivc_prover::field_prover::prove_field_with_public_io_and_post_commit_context;
+use noid_ivc_prover::field_prover::{
+    prove_field_compact_with_public_io_and_post_commit_context,
+    prove_field_compact_with_public_io_and_post_commit_context_capturing_fresh_lincheck,
+    prove_field_with_public_io_and_post_commit_context,
+    prove_field_with_public_io_and_post_commit_context_capturing_fresh_lincheck,
+};
+use noid_poseidon2b::native::poseidon2b_hash_byte_slices;
 
 use super::block_slots::{build_block_slots_selected_zk, BlockSlots, SelectedZkBlockSlotsAssembly};
 use super::link::{block_acc_lanes, LinkBlock, ACC_LANES};
@@ -34,11 +43,12 @@ use super::link::{
     SelectedZkB255BlockInput, SelectedZkB32BlockInput, SelectedZkB64BlockInput,
     SelectedZkB8BlockInput, SelectedZkBlockInput,
 };
+use super::split_link::SplitLinkClass;
 use super::trace::pin_eq;
 use crate::region_sidecar::{
     block_post_commit_class_digest, verify_block_region_sidecar_post_commit,
-    BlockRegionPreparation, BlockRegionSidecarProof, BlockRegionSidecarVk, RegionSidecarError,
-    BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION,
+    BlockRegionPreparation, BlockRegionSidecarProof, BlockRegionSidecarVk,
+    BlockSidecarChildTranscript, RegionSidecarError, BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION,
 };
 
 /// Fixed public-IO offsets of every production block class.
@@ -55,6 +65,7 @@ pub const BLOCK_IO_LEN: usize = 2 * ACC_LANES;
 /// Canonical Fiat--Shamir domain for every standalone production Block class.
 /// Production coordinators must not accept a caller-selected domain.
 pub const BLOCK_PROOF_TRANSCRIPT_DOMAIN: &[u8] = b"history-block-v0";
+const LOCAL_BLOCK_REPLAY_ENVELOPE_DOMAIN: &[u8] = b"NOID/LOCAL-SELECTED-BLOCK-REPLAY-ENVELOPE/V1";
 
 pub const fn block_io_layout() -> BlockIoLayout {
     BlockIoLayout {
@@ -91,6 +102,35 @@ pub struct BlockClass {
 }
 
 impl BlockClass {
+    /// Assemble the runtime object from registry fields already proven by the
+    /// release build. No class identity is recomputed here.
+    ///
+    /// # Safety
+    ///
+    /// The exact registry bytes supplying these fields must already have
+    /// passed `decode_selected_recursive_class_registry_pinned` during the
+    /// build which embedded them.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn from_build_authenticated_registry_parts(
+        tier: usize,
+        shape: FieldShape,
+        pcs_params: PcsParams,
+        spec: PublicIoSpec,
+        matrix_digest: [u8; 32],
+        sidecar_vk: BlockRegionSidecarVk,
+        post_commit_class_digest: [u8; 32],
+    ) -> Self {
+        Self {
+            tier,
+            shape,
+            class_statement_digest: OnceLock::from(matrix_digest),
+            pcs_params,
+            spec,
+            sidecar_vk: Arc::new(sidecar_vk),
+            post_commit_class_digest,
+        }
+    }
+
     /// Rehydrate one selected production class from a compact, locally
     /// provisioned registry artifact.  The artifact supplies identities, not
     /// a matrix or witness: every deterministic class component is rebuilt
@@ -220,13 +260,21 @@ impl BlockClass {
         &self,
         expected_tier: usize,
     ) -> Result<(), BlockProofError> {
+        self.validated_matrix_digest_for_tier(expected_tier)
+            .map(|_| ())
+    }
+
+    fn validated_matrix_digest_for_tier(
+        &self,
+        expected_tier: usize,
+    ) -> Result<[u8; 32], BlockProofError> {
         if self.tier != expected_tier {
             return Err(BlockProofError::TierMismatch {
                 expected: expected_tier,
                 actual: self.tier,
             });
         }
-        self.validate_frozen_identity().map(|_| ())
+        self.validate_frozen_identity()
     }
 
     pub fn post_commit_class_digest(&self) -> &[u8; 32] {
@@ -274,6 +322,16 @@ pub struct BuiltBlock {
     pub witness: Vec<F128>,
     pub io: Vec<F128>,
     pub region_preparation: BlockRegionPreparation,
+}
+
+/// Matrix-free selected Block assembly. It is accepted by the prover only
+/// together with the authenticated compact relation whose frozen identity and
+/// useful-row ledger this build reproduced.
+pub struct BuiltBlockWitness {
+    useful_rows: usize,
+    witness: Vec<F128>,
+    io: Vec<F128>,
+    region_preparation: BlockRegionPreparation,
 }
 
 /// Unforgeable selected-region finalization authority.  The type is visible
@@ -510,6 +568,71 @@ pub fn build_selected_zk_block_proof_trace<const TIER: usize>(
     built
 }
 
+/// Assemble the deterministic selected witness under an already established
+/// frozen class identity.
+///
+/// This is the steady-state local-authoring path: registry decode has pinned
+/// the class and terminal promotion verifies the resulting proof against the
+/// authenticated matrix artifact.  Shape and sidecar-key fixity are still
+/// checked here, while the expensive CSR digest is not recomputed for every
+/// height.  Use [`build_selected_zk_block_proof_trace`] at untrusted matrix
+/// boundaries and for paranoid regeneration checks.
+pub fn build_selected_zk_block_proof_trace_established<const TIER: usize>(
+    class: &BlockClass,
+    input: SelectedZkBlockInput<'_, TIER>,
+) -> BuiltBlock {
+    assert_eq!(class.tier, TIER, "selected input/class tier mismatch");
+    let matrix_digest = class
+        .validate_frozen_identity()
+        .expect("selected BlockClass must remain freeze-locked");
+    let built = build_selected_zk_trace_parts(input, Some(class.sidecar_vk()));
+    assert_eq!(
+        FieldShape::of(&built.r1cs),
+        class.shape,
+        "selected matrix shape drifted from the frozen class"
+    );
+    built.r1cs.seed_statement_digest(matrix_digest);
+    built
+}
+
+/// Assemble only the deterministic selected witness and bind it to an
+/// immutable compact relation authenticated by the executable registry.
+/// Matrix digest, shape, useful-row count and sidecar VK are all checked at
+/// this boundary; no CSR relation is constructed for the current height.
+pub fn build_selected_zk_block_proof_witness_established<const TIER: usize>(
+    class: &BlockClass,
+    input: SelectedZkBlockInput<'_, TIER>,
+    relation: &CompactFieldR1cs,
+) -> Result<BuiltBlockWitness, BlockProofError> {
+    let matrix_digest = class.validated_matrix_digest_for_tier(TIER)?;
+    if relation.shape() != class.shape || relation.statement_digest() != matrix_digest {
+        return Err(BlockProofError::MatrixMismatch);
+    }
+
+    let (builder, io, assembly) = assemble_selected_zk(FieldR1csBuilder::new_witness_only(), input);
+    let useful_rows = builder.num_wires();
+    let binding = assembly.into_region_binding();
+    let (built_rows, mut witness) = builder.build_witness_only();
+    if built_rows != useful_rows
+        || relation.useful_rows() != useful_rows
+        || witness.len() > 1usize << class.shape.m
+    {
+        return Err(BlockProofError::MatrixMismatch);
+    }
+    witness.resize(1usize << class.shape.m, F128::ZERO);
+    let seal = SelectedBlockAssemblyFinalizationSeal(());
+    let region_preparation = binding.finalize_after_block_build(seal, class.shape.m)?;
+    if region_preparation.vk() != class.sidecar_vk() {
+        return Err(BlockProofError::SidecarVkMismatch);
+    }
+    Ok(BuiltBlockWitness {
+        useful_rows,
+        witness,
+        io,
+        region_preparation,
+    })
+}
+
 pub fn build_selected_zk_b8_block_proof_trace(
     class: &BlockClass,
     input: SelectedZkB8BlockInput<'_>,
@@ -570,6 +693,86 @@ impl BlockProofEnvelope {
     }
 }
 
+/// One-shot, process-local replay material emitted only while this exact
+/// Block envelope is authored.  It deliberately implements neither `Clone`
+/// nor serde: persistence and network transport must always cross the normal
+/// proof verifier, while the selected-history pipeline may move this value
+/// directly to the immediately following Link stage.
+#[must_use = "a locally authored Block replay must be consumed or deliberately dropped"]
+pub struct LocallyAuthoredBlockReplay {
+    envelope_digest: [u8; 32],
+    commitment_root: [u8; 32],
+    block_tier: usize,
+    block_shape: FieldShape,
+    block_matrix_digest: [u8; 32],
+    block_post_commit_digest: [u8; 32],
+    block_sidecar_vk_digest: [u8; 32],
+    link_slot: usize,
+    link_shape: FieldShape,
+    link_matrix_digest: [u8; 32],
+    link_post_commit_digest: [u8; 32],
+    link_sidecar_vk_digest: [u8; 32],
+    fresh: LocallyAuthoredFreshLincheckCapture,
+    block_child: BlockSidecarChildTranscript,
+    child_recording: LayoutRecordedChannel,
+    r_b_recording: LayoutRecordedChannel,
+}
+
+/// Internal consuming projection of a locally-authored Block capability.
+/// Callers may inspect and validate these parts, but cannot reconstruct the
+/// opaque capability because all of its fields remain private to this module.
+pub(crate) struct LocallyAuthoredBlockReplayParts {
+    pub(crate) envelope_digest: [u8; 32],
+    pub(crate) commitment_root: [u8; 32],
+    pub(crate) block_tier: usize,
+    pub(crate) block_shape: FieldShape,
+    pub(crate) block_matrix_digest: [u8; 32],
+    pub(crate) block_post_commit_digest: [u8; 32],
+    pub(crate) block_sidecar_vk_digest: [u8; 32],
+    pub(crate) link_slot: usize,
+    pub(crate) link_shape: FieldShape,
+    pub(crate) link_matrix_digest: [u8; 32],
+    pub(crate) link_post_commit_digest: [u8; 32],
+    pub(crate) link_sidecar_vk_digest: [u8; 32],
+    pub(crate) fresh: LocallyAuthoredFreshLincheckCapture,
+    pub(crate) block_child: BlockSidecarChildTranscript,
+    pub(crate) child_recording: LayoutRecordedChannel,
+    pub(crate) r_b_recording: LayoutRecordedChannel,
+}
+
+impl LocallyAuthoredBlockReplay {
+    pub(crate) fn into_parts(self) -> LocallyAuthoredBlockReplayParts {
+        LocallyAuthoredBlockReplayParts {
+            envelope_digest: self.envelope_digest,
+            commitment_root: self.commitment_root,
+            block_tier: self.block_tier,
+            block_shape: self.block_shape,
+            block_matrix_digest: self.block_matrix_digest,
+            block_post_commit_digest: self.block_post_commit_digest,
+            block_sidecar_vk_digest: self.block_sidecar_vk_digest,
+            link_slot: self.link_slot,
+            link_shape: self.link_shape,
+            link_matrix_digest: self.link_matrix_digest,
+            link_post_commit_digest: self.link_post_commit_digest,
+            link_sidecar_vk_digest: self.link_sidecar_vk_digest,
+            fresh: self.fresh,
+            block_child: self.block_child,
+            child_recording: self.child_recording,
+            r_b_recording: self.r_b_recording,
+        }
+    }
+}
+
+pub(crate) fn locally_authored_block_envelope_digest(
+    envelope: &BlockProofEnvelope,
+) -> Result<[u8; 32], BlockProofError> {
+    let encoded = bincode::serialize(envelope).map_err(|_| BlockProofError::LocalReplayMismatch)?;
+    Ok(poseidon2b_hash_byte_slices(
+        LOCAL_BLOCK_REPLAY_ENVELOPE_DOMAIN,
+        &[&encoded],
+    ))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BlockProofError {
     UnfrozenClass,
@@ -579,6 +782,7 @@ pub enum BlockProofError {
     SidecarVkMismatch,
     PcsParamsMismatch,
     InvalidIo,
+    LocalReplayMismatch,
     Sidecar(RegionSidecarError),
     Field(VerifyError),
 }
@@ -599,7 +803,13 @@ impl std::fmt::Display for BlockProofError {
             Self::PcsParamsMismatch => {
                 write!(f, "block commitment PCS parameters do not match its class")
             }
-            Self::InvalidIo => write!(f, "block envelope must contain exactly 20 IO lanes"),
+            Self::InvalidIo => write!(
+                f,
+                "block envelope must contain exactly {BLOCK_IO_LEN} IO lanes"
+            ),
+            Self::LocalReplayMismatch => {
+                write!(f, "locally authored Block replay binding mismatch")
+            }
             Self::Sidecar(err) => write!(f, "block sidecar error: {err:?}"),
             Self::Field(err) => write!(f, "block Field proof error: {err:?}"),
         }
@@ -656,6 +866,199 @@ pub fn prove_built_block<Ch: Challenger>(
         io: built.io.clone(),
         region_sidecar: region_sidecar?,
     })
+}
+
+/// Compact authenticated-relation twin of [`prove_built_block`]. The exact
+/// witness, IO, post-commit sidecar plan and transcript are unchanged; only
+/// the frozen relation storage is compact instead of a newly assembled CSR.
+pub fn prove_built_block_compact<Ch: Challenger>(
+    class: &BlockClass,
+    relation: &CompactFieldR1cs,
+    built: &BuiltBlockWitness,
+    challenger: &mut Ch,
+) -> Result<BlockProofEnvelope, BlockProofError> {
+    let matrix_digest = class.validate_frozen_identity()?;
+    if relation.statement_digest() != matrix_digest
+        || relation.shape() != class.shape
+        || relation.useful_rows() != built.useful_rows
+    {
+        return Err(BlockProofError::MatrixMismatch);
+    }
+    if built.region_preparation.vk() != class.sidecar_vk() {
+        return Err(BlockProofError::SidecarVkMismatch);
+    }
+    if built.io.len() != BLOCK_IO_LEN {
+        return Err(BlockProofError::InvalidIo);
+    }
+    let plan = built.region_preparation.prover_plan()?;
+    let (field_proof, region_sidecar, commitment, _) =
+        prove_field_compact_with_public_io_and_post_commit_context(
+            relation,
+            &built.witness,
+            &class.pcs_params,
+            &class.spec,
+            &built.io,
+            &class.post_commit_class_digest,
+            challenger,
+            |context| plan.prove_post_commit(context),
+        );
+    Ok(BlockProofEnvelope {
+        field_proof,
+        commitment,
+        io: built.io.clone(),
+        region_sidecar: region_sidecar?,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_locally_authored_block_replay(
+    class: &BlockClass,
+    link_class: &SplitLinkClass,
+    matrix_digest: [u8; 32],
+    io: &[F128],
+    field_proof: FieldR1csProof,
+    commitment: Commitment,
+    sidecar_capture: Result<
+        (
+            BlockRegionSidecarProof,
+            BlockSidecarChildTranscript,
+            LayoutRecordedChannel,
+        ),
+        RegionSidecarError,
+    >,
+    fresh: LocallyAuthoredFreshLincheckCapture,
+    outer: LayoutRecordingChallenger,
+) -> Result<(BlockProofEnvelope, LocallyAuthoredBlockReplay), BlockProofError> {
+    let (region_sidecar, block_child, child_recording) = sidecar_capture?;
+    let r_b_recording = outer
+        .finish()
+        .map_err(|_| BlockProofError::LocalReplayMismatch)?;
+    let envelope = BlockProofEnvelope {
+        field_proof,
+        commitment,
+        io: io.to_vec(),
+        region_sidecar,
+    };
+    let envelope_digest = locally_authored_block_envelope_digest(&envelope)?;
+    let link_matrix_digest = link_class
+        .class_statement_digest
+        .get()
+        .copied()
+        .ok_or(BlockProofError::ClassIdentityMismatch)?;
+    let replay = LocallyAuthoredBlockReplay {
+        envelope_digest,
+        commitment_root: envelope.commitment.root,
+        block_tier: class.tier(),
+        block_shape: class.shape,
+        block_matrix_digest: matrix_digest,
+        block_post_commit_digest: *class.post_commit_class_digest(),
+        block_sidecar_vk_digest: class.sidecar_vk().transcript_digest(),
+        link_slot: link_class.slot(),
+        link_shape: link_class.shape,
+        link_matrix_digest,
+        link_post_commit_digest: *link_class.post_commit_class_digest(),
+        link_sidecar_vk_digest: link_class.sidecar_vk().transcript_digest(),
+        fresh,
+        block_child,
+        child_recording,
+        r_b_recording,
+    };
+    Ok((envelope, replay))
+}
+
+/// Opt-in local-authoring twin of [`prove_built_block`].  It emits the same
+/// serialized envelope while retaining a one-shot replay capsule for the
+/// immediately following Link stage.  The canonical Link class supplies both
+/// recording layouts; caller-selected layouts are intentionally impossible.
+pub fn prove_built_block_locally_authored(
+    class: &BlockClass,
+    link_class: &SplitLinkClass,
+    built: &BuiltBlock,
+) -> Result<(BlockProofEnvelope, LocallyAuthoredBlockReplay), BlockProofError> {
+    let matrix_digest = class.validate_frozen_identity()?;
+    if built.r1cs.statement_digest() != matrix_digest || FieldShape::of(&built.r1cs) != class.shape
+    {
+        return Err(BlockProofError::MatrixMismatch);
+    }
+    if built.region_preparation.vk() != class.sidecar_vk() {
+        return Err(BlockProofError::SidecarVkMismatch);
+    }
+    if built.io.len() != BLOCK_IO_LEN {
+        return Err(BlockProofError::InvalidIo);
+    }
+    let (child_layout, r_b_layout) = link_class.locally_authored_block_replay_layouts(class)?;
+    let plan = built.region_preparation.prover_plan()?;
+    let mut challenger = LayoutRecordingChallenger::new(BLOCK_PROOF_TRANSCRIPT_DOMAIN, r_b_layout);
+    let (field_proof, sidecar_capture, commitment, _, fresh) =
+        prove_field_with_public_io_and_post_commit_context_capturing_fresh_lincheck(
+            &built.r1cs,
+            &built.witness,
+            &class.pcs_params,
+            &class.spec,
+            &built.io,
+            &class.post_commit_class_digest,
+            &mut challenger,
+            |context| plan.prove_post_commit_layout_captured(context, child_layout),
+        );
+    finish_locally_authored_block_replay(
+        class,
+        link_class,
+        matrix_digest,
+        &built.io,
+        field_proof,
+        commitment,
+        sidecar_capture,
+        fresh,
+        challenger,
+    )
+}
+
+/// Compact authenticated-relation twin of
+/// [`prove_built_block_locally_authored`].
+pub fn prove_built_block_compact_locally_authored(
+    class: &BlockClass,
+    link_class: &SplitLinkClass,
+    relation: &CompactFieldR1cs,
+    built: &BuiltBlockWitness,
+) -> Result<(BlockProofEnvelope, LocallyAuthoredBlockReplay), BlockProofError> {
+    let matrix_digest = class.validate_frozen_identity()?;
+    if relation.statement_digest() != matrix_digest
+        || relation.shape() != class.shape
+        || relation.useful_rows() != built.useful_rows
+    {
+        return Err(BlockProofError::MatrixMismatch);
+    }
+    if built.region_preparation.vk() != class.sidecar_vk() {
+        return Err(BlockProofError::SidecarVkMismatch);
+    }
+    if built.io.len() != BLOCK_IO_LEN {
+        return Err(BlockProofError::InvalidIo);
+    }
+    let (child_layout, r_b_layout) = link_class.locally_authored_block_replay_layouts(class)?;
+    let plan = built.region_preparation.prover_plan()?;
+    let mut challenger = LayoutRecordingChallenger::new(BLOCK_PROOF_TRANSCRIPT_DOMAIN, r_b_layout);
+    let (field_proof, sidecar_capture, commitment, _, fresh) =
+        prove_field_compact_with_public_io_and_post_commit_context_capturing_fresh_lincheck(
+            relation,
+            &built.witness,
+            &class.pcs_params,
+            &class.spec,
+            &built.io,
+            &class.post_commit_class_digest,
+            &mut challenger,
+            |context| plan.prove_post_commit_layout_captured(context, child_layout),
+        );
+    finish_locally_authored_block_replay(
+        class,
+        link_class,
+        matrix_digest,
+        &built.io,
+        field_proof,
+        commitment,
+        sidecar_capture,
+        fresh,
+        challenger,
+    )
 }
 
 /// Verify a complete production block proof.  The sidecar callback is inside
@@ -828,6 +1231,138 @@ fn same_pcs_params(left: &PcsParams, right: &PcsParams) -> bool {
 mod tests {
     use super::*;
     use noid_ivc_core::pcs::ligerito::LigeritoProfile;
+    use noid_ivc_prover::challenger::FsLaneChallenger;
+
+    /// Native inputs for the opt-in exact B8 release parity gate below.
+    ///
+    /// Authorization proofs retain their bounded canonical wire encoding:
+    /// `ZkAuthorizationProof` intentionally has no raw serde decoder.  A
+    /// fixture producer should serialize this DTO with bincode after calling
+    /// `ZkAuthorizationProof::to_bytes` for each proof. The canonical
+    /// producer is the `bench_prover` binary
+    /// `noid_b8_block_parity_fixture`.
+    #[derive(serde::Deserialize)]
+    struct ReleaseB8BlockParityFixture {
+        start_accumulator: crate::accumulator::ChainAccumulator,
+        end_accumulator: crate::accumulator::ChainAccumulator,
+        inputs: crate::block_certificate_backend::AcceptedBlockBatchComponentInputs,
+        component_proof: crate::block_certificate_backend::AcceptedBlockBatchComponentProof,
+        live_authorization_proof_bytes: Vec<Vec<u8>>,
+        ghost_authorization_proof_bytes: Vec<u8>,
+    }
+
+    impl ReleaseB8BlockParityFixture {
+        fn selected_input(&self) -> SelectedZkB8BlockInput<'_> {
+            let live = self
+                .live_authorization_proof_bytes
+                .iter()
+                .map(|encoded| {
+                    noid_gkr::zk_authorization::ZkAuthorizationProof::from_bytes(encoded)
+                        .expect("decode bounded live authorization proof")
+                })
+                .collect();
+            let ghost = noid_gkr::zk_authorization::ZkAuthorizationProof::from_bytes(
+                &self.ghost_authorization_proof_bytes,
+            )
+            .expect("decode bounded ghost authorization proof");
+            SelectedZkB8BlockInput::try_new(
+                &self.start_accumulator,
+                &self.end_accumulator,
+                &self.inputs,
+                &self.component_proof,
+                live,
+                ghost,
+            )
+            .expect("canonical B8 release fixture")
+        }
+    }
+
+    fn envelope_and_sidecar_bytes(envelope: &BlockProofEnvelope) -> (Vec<u8>, Vec<u8>) {
+        (
+            bincode::serialize(envelope).expect("serialize Block envelope"),
+            bincode::serialize(envelope.region_sidecar()).expect("serialize Block sidecar"),
+        )
+    }
+
+    /// Exact production-envelope compatibility gate for both resident and
+    /// compact local-authoring entry points.  It is fixture-driven because an
+    /// honest selected B8 input is produced by `noid_block`, which depends on
+    /// this crate; making it a unit-test dev-dependency would form a Cargo
+    /// cycle.  Release tooling supplies the already-proved native input and
+    /// the canonical registry rather than rebuilding that roofline fixture in
+    /// the low-RAM unit harness.
+    #[test]
+    #[ignore = "set NOID_SELECTED_RECURSIVE_REGISTRY_FIXTURE and NOID_B8_BLOCK_PARITY_FIXTURE"]
+    fn release_b8_locally_authored_block_envelope_and_sidecar_are_legacy_identical() {
+        let registry_path = std::env::var_os("NOID_SELECTED_RECURSIVE_REGISTRY_FIXTURE")
+            .expect("NOID_SELECTED_RECURSIVE_REGISTRY_FIXTURE");
+        let fixture_path =
+            std::env::var_os("NOID_B8_BLOCK_PARITY_FIXTURE").expect("NOID_B8_BLOCK_PARITY_FIXTURE");
+        let registry_bytes = std::fs::read(registry_path).expect("read canonical registry");
+        let registry = crate::class_registry::decode_selected_recursive_class_registry_unpinned_for_offline_inspection(
+            &registry_bytes,
+        )
+        .expect("decode canonical full registry");
+        let fixture_bytes = std::fs::read(fixture_path).expect("read B8 Block parity fixture");
+        let fixture: ReleaseB8BlockParityFixture =
+            bincode::deserialize(&fixture_bytes).expect("decode B8 Block parity fixture");
+        let class = &registry.block_classes()[0];
+        let link_class = &registry.link_classes()[0];
+        assert_eq!(class.tier(), 8, "registry slot zero must remain B8");
+
+        let built =
+            build_selected_zk_block_proof_trace_established(class, fixture.selected_input());
+        let mut legacy_challenger = FsLaneChallenger::new(BLOCK_PROOF_TRANSCRIPT_DOMAIN);
+        let legacy = prove_built_block(class, &built, &mut legacy_challenger)
+            .expect("legacy resident B8 Block proof");
+        let (local, local_replay) = prove_built_block_locally_authored(class, link_class, &built)
+            .expect("locally-authored resident B8 Block proof");
+        drop(local_replay);
+        let expected = envelope_and_sidecar_bytes(&legacy);
+        assert_eq!(
+            envelope_and_sidecar_bytes(&local),
+            expected,
+            "resident local capture changed the Block envelope or child transcript",
+        );
+
+        let shape = FieldShape::of(&built.r1cs);
+        let matrix_digest = built.r1cs.statement_digest();
+        let mut artifact = Vec::new();
+        built
+            .r1cs
+            .write_artifact(&mut artifact)
+            .expect("encode authenticated B8 relation");
+        let compact = CompactFieldR1cs::open(artifact.into_boxed_slice(), shape, matrix_digest)
+            .expect("open authenticated B8 relation");
+        let compact_built = build_selected_zk_block_proof_witness_established(
+            class,
+            fixture.selected_input(),
+            &compact,
+        )
+        .expect("assemble compact B8 witness");
+        let mut compact_legacy_challenger = FsLaneChallenger::new(BLOCK_PROOF_TRANSCRIPT_DOMAIN);
+        let compact_legacy = prove_built_block_compact(
+            class,
+            &compact,
+            &compact_built,
+            &mut compact_legacy_challenger,
+        )
+        .expect("legacy compact B8 Block proof");
+        let (compact_local, compact_local_replay) =
+            prove_built_block_compact_locally_authored(class, link_class, &compact, &compact_built)
+                .expect("locally-authored compact B8 Block proof");
+        drop(compact_local_replay);
+        assert_eq!(
+            envelope_and_sidecar_bytes(&compact_legacy),
+            expected,
+            "compact legacy path changed the resident Block transcript",
+        );
+        assert_eq!(
+            envelope_and_sidecar_bytes(&compact_local),
+            expected,
+            "compact local capture changed the Block envelope or child transcript",
+        );
+    }
 
     #[test]
     fn production_block_io_is_exactly_two_eleven_lane_accumulators() {

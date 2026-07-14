@@ -102,8 +102,7 @@ impl request_response::Codec for BlockSyncCodec {
         let block_bytes = read_optional_payload(io, lengths.block_len).await?;
         let block_proof_bytes = read_optional_payload(io, lengths.proof_len).await?;
         let block_auth_sidecar_bytes = read_optional_payload(io, lengths.sidecar_len).await?;
-        let coverage_attestation_bytes =
-            read_optional_payload(io, lengths.attestation_len).await?;
+        let coverage_attestation_bytes = read_optional_payload(io, lengths.attestation_len).await?;
         ensure_eof(io).await?;
 
         Ok(GetRecentBlockResponse {
@@ -283,7 +282,8 @@ fn validate_response_lengths(
     let sidecar_len = decoded_optional_len(sidecar_len);
     let attestation_len_decoded = decoded_optional_len(attestation_len);
     if attestation_len != NONE_LEN
-        && (attestation_len_decoded == 0 || attestation_len_decoded > MAX_COVERAGE_ATTESTATION_BYTES)
+        && (attestation_len_decoded == 0
+            || attestation_len_decoded > MAX_COVERAGE_ATTESTATION_BYTES)
     {
         return Err(invalid_data(
             "declared coverage attestation length exceeds consensus cap",

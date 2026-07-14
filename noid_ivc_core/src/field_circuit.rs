@@ -38,9 +38,11 @@
 //!   wires + 1 pin.
 
 use crate::challenger::{
-    FS_KIND_SCALAR, FS_KIND_SLICE, FS_OP_BYTES, FS_OP_DOMAIN, FS_OP_LABEL, FS_OP_OBSERVE,
-    FS_OP_POW, FS_OP_SQUEEZE, fs_lane_iv_flat, fs_op_lane, fs_pack_bytes_lanes, fs_pad_lane_flat,
+    Challenger, FS_KIND_SCALAR, FS_KIND_SLICE, FS_OP_BYTES, FS_OP_DOMAIN, FS_OP_LABEL,
+    FS_OP_OBSERVE, FS_OP_POW, FS_OP_SQUEEZE, FsLaneChallenger, fs_lane_iv_flat, fs_op_lane,
+    fs_pack_bytes_lanes, fs_pad_lane_flat,
 };
+use crate::deep_chain::schedule::{DuplexLayout, LaneSource, flat_of_tower_u128};
 use crate::field::F128;
 use crate::field_r1cs::{FieldR1cs, SparseFieldMatrix};
 use noid_core::hardware::tower_to_flat_u128;
@@ -360,6 +362,9 @@ impl FieldR1csBuilder {
     /// One multiplication constraint: new wire `w = x · y`.
     pub fn mul(&mut self, x: &LinExpr, y: &LinExpr) -> Wire {
         let value = x.eval(&self.values) * y.eval(&self.values);
+        if !self.record_rows {
+            return self.commit_wire(value, &[], &[]);
+        }
         let a_row = Self::expr_to_row(x);
         let b_row = Self::expr_to_row(y);
         self.commit_wire(value, &a_row, &b_row)
@@ -373,6 +378,10 @@ impl FieldR1csBuilder {
     /// Assert `expr == expected` (one wire, self-cancelling row:
     /// `z_w = (z_w + expr + expected) · 1` ⇒ `expr + expected = 0`).
     pub fn pin_f128(&mut self, expr: &LinExpr, expected: F128) {
+        if !self.record_rows {
+            self.commit_wire(F128::ZERO, &[], &[]);
+            return;
+        }
         let w = self.next_wire();
         let full = expr.add(&LinExpr::from_wire(Wire(w))).add_const(expected);
         let a_row = Self::expr_to_row(&full);
@@ -873,6 +882,256 @@ pub struct RecordedChannel {
     pub perms: usize,
 }
 
+/// Value-only recording captured while the sound native verifier is already
+/// replaying a proof.
+///
+/// The immutable [`DuplexLayout`] is the class-authenticated schedule.  A
+/// [`LayoutRecordingChallenger`] accepts a native transcript lane only when
+/// the corresponding layout cell has the same constant or is the next data
+/// cell.  It therefore harvests exactly the data stream needed to prefill a
+/// recording union without the former throwaway witness-only trace replay.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LayoutRecordedChannel {
+    pub layout: DuplexLayout,
+    pub data_flat: Vec<F128>,
+    /// Native challenge values when the ordinary Challenger API exposes
+    /// them. PoW verification intentionally returns only a boolean, so those
+    /// entries are `None`; the later trace-to-column pins remain authoritative
+    /// for every challenge cell.
+    pub challenges: Vec<Option<F128>>,
+    pub post_state: [F128; STATE_SIZE],
+    pub perms: usize,
+}
+
+/// Production Fiat-Shamir challenger plus a fail-closed, class-layout-checked
+/// value recorder.
+///
+/// Challenges come from an ordinary [`FsLaneChallenger`], so native proof
+/// verification is unchanged.  The recorder merely classifies each absorbed
+/// lane through the frozen layout: constants must match exactly and only
+/// `LaneSource::Data` cells are retained.  Any schedule mismatch is remembered
+/// and reported by [`Self::finish`].
+pub struct LayoutRecordingChallenger {
+    inner: FsLaneChallenger,
+    layout: DuplexLayout,
+    data_flat: Vec<F128>,
+    challenges: Vec<Option<F128>>,
+    slot: usize,
+    filled: usize,
+    pending_challenge: Option<(usize, usize)>,
+    valid: bool,
+}
+
+impl LayoutRecordingChallenger {
+    pub fn new(domain: &[u8], layout: DuplexLayout) -> Self {
+        let inner = FsLaneChallenger::new(domain);
+        let mut recorder = Self {
+            inner,
+            data_flat: Vec::with_capacity(layout.n_data),
+            challenges: Vec::with_capacity(layout.challenges.len()),
+            layout,
+            slot: 0,
+            filled: 0,
+            pending_challenge: None,
+            valid: true,
+        };
+        recorder.record_absorb(fs_op_lane(FS_OP_DOMAIN, 0, domain.len() as u64));
+        for lane in fs_pack_bytes_lanes(domain) {
+            recorder.record_absorb(lane);
+        }
+        recorder
+    }
+
+    #[inline]
+    fn invalidate(&mut self) {
+        self.valid = false;
+    }
+
+    fn record_absorb(&mut self, value: F128) {
+        // Native lane semantics discard a buffered second squeeze as soon as
+        // a new absorb begins. The eager empty permutation was already
+        // consumed by record_squeeze, exactly as in compile_duplex.
+        self.pending_challenge = None;
+        let source = self
+            .layout
+            .slots
+            .get(self.slot)
+            .and_then(|slot| slot.lanes.get(self.filled))
+            .copied()
+            .flatten();
+        match source {
+            Some(LaneSource::Data(index)) => {
+                if index != self.data_flat.len() {
+                    self.invalidate();
+                } else {
+                    self.data_flat.push(value);
+                }
+            }
+            Some(LaneSource::Const(expected)) => {
+                if value != flat_of_tower_u128(expected) {
+                    self.invalidate();
+                }
+            }
+            None => self.invalidate(),
+        }
+        self.filled += 1;
+        if self.filled == 2 {
+            self.filled = 0;
+            self.slot += 1;
+        }
+    }
+
+    fn record_squeeze(&mut self, value: Option<F128>) {
+        if self.filled == 1 {
+            let expected_pad = self
+                .layout
+                .slots
+                .get(self.slot)
+                .and_then(|slot| slot.lanes[1]);
+            let pad_tower =
+                noid_core::hardware::flat_to_tower_u128(f128_to_u128(fs_pad_lane_flat()));
+            if expected_pad != Some(LaneSource::Const(pad_tower)) {
+                self.invalidate();
+            }
+            self.filled = 0;
+            self.slot += 1;
+        }
+
+        let location = if let Some(pending) = self.pending_challenge.take() {
+            pending
+        } else if self.slot == 0 {
+            self.invalidate();
+            (0, 0)
+        } else {
+            let read_slot = self.slot - 1;
+            let empty = self
+                .layout
+                .slots
+                .get(self.slot)
+                .is_some_and(|slot| slot.lanes == [None, None]);
+            if !empty {
+                self.invalidate();
+            }
+            self.slot += 1;
+            self.pending_challenge = Some((read_slot, 1));
+            (read_slot, 0)
+        };
+        if self.layout.challenges.get(self.challenges.len()) != Some(&location) {
+            self.invalidate();
+        }
+        self.challenges.push(value);
+    }
+
+    fn record_scalar_sample_header(&mut self) {
+        self.record_absorb(fs_op_lane(FS_OP_SQUEEZE, FS_KIND_SCALAR, 0));
+    }
+
+    /// Finish only if the native call stream consumed the complete frozen
+    /// schedule and every data cell exactly once.
+    pub fn finish(mut self) -> Result<LayoutRecordedChannel, &'static str> {
+        // compile_duplex gives a trailing unpermuted odd absorb its own
+        // partial slot so the data cell exists in the committed union.
+        if self.filled == 1 {
+            let trailing_none = self
+                .layout
+                .slots
+                .get(self.slot)
+                .is_some_and(|slot| slot.lanes[1].is_none());
+            if !trailing_none {
+                self.invalidate();
+            }
+            self.filled = 0;
+            self.slot += 1;
+        }
+        if !self.valid
+            || self.slot != self.layout.slots.len()
+            || self.data_flat.len() != self.layout.n_data
+            || self.challenges.len() != self.layout.challenges.len()
+        {
+            return Err(
+                "native Fiat-Shamir call stream does not match the frozen recording layout",
+            );
+        }
+        Ok(LayoutRecordedChannel {
+            layout: self.layout,
+            data_flat: self.data_flat,
+            challenges: self.challenges,
+            post_state: self.inner.post_state(),
+            perms: self.inner.perms(),
+        })
+    }
+}
+
+impl Challenger for LayoutRecordingChallenger {
+    fn observe_label(&mut self, label: &[u8]) {
+        self.record_absorb(fs_op_lane(FS_OP_LABEL, 0, label.len() as u64));
+        for lane in fs_pack_bytes_lanes(label) {
+            self.record_absorb(lane);
+        }
+        self.inner.observe_label(label);
+    }
+
+    fn observe_f128(&mut self, value: F128) {
+        self.record_absorb(fs_op_lane(FS_OP_OBSERVE, FS_KIND_SCALAR, 0));
+        self.record_absorb(value);
+        self.inner.observe_f128(value);
+    }
+
+    fn observe_f128_slice(&mut self, values: &[F128]) {
+        self.record_absorb(fs_op_lane(
+            FS_OP_OBSERVE,
+            FS_KIND_SLICE,
+            values.len() as u64,
+        ));
+        for &value in values {
+            self.record_absorb(value);
+        }
+        self.inner.observe_f128_slice(values);
+    }
+
+    fn observe_bytes(&mut self, bytes: &[u8]) {
+        self.record_absorb(fs_op_lane(FS_OP_BYTES, 0, bytes.len() as u64));
+        for lane in fs_pack_bytes_lanes(bytes) {
+            self.record_absorb(lane);
+        }
+        self.inner.observe_bytes(bytes);
+    }
+
+    fn sample_f128(&mut self) -> F128 {
+        self.record_scalar_sample_header();
+        let value = self.inner.sample_f128();
+        self.record_squeeze(Some(value));
+        value
+    }
+
+    fn sample_f128_vec(&mut self, n: usize) -> Vec<F128> {
+        self.record_absorb(fs_op_lane(FS_OP_SQUEEZE, FS_KIND_SLICE, n as u64));
+        let values = self.inner.sample_f128_vec(n);
+        for &value in &values {
+            self.record_squeeze(Some(value));
+        }
+        values
+    }
+
+    fn grind_pow(&mut self, bits: u32) -> u64 {
+        let nonce = self.inner.grind_pow(bits);
+        self.record_absorb(fs_op_lane(FS_OP_POW, 0, bits as u64));
+        self.record_absorb(F128 { lo: nonce, hi: 0 });
+        self.record_scalar_sample_header();
+        self.record_squeeze(None);
+        nonce
+    }
+
+    fn verify_pow(&mut self, nonce: u64, bits: u32) -> bool {
+        self.record_absorb(fs_op_lane(FS_OP_POW, 0, bits as u64));
+        self.record_absorb(F128 { lo: nonce, hi: 0 });
+        self.record_scalar_sample_header();
+        let accepted = self.inner.verify_pow(nonce, bits);
+        self.record_squeeze(None);
+        accepted
+    }
+}
+
 /// Union-mode twin channel: RECORDS the transcript instead of replaying its
 /// permutations in-trace.
 ///
@@ -1346,6 +1605,101 @@ mod tests {
                 "duplex column challenge {k} diverges from the recording"
             );
         }
+    }
+
+    /// A sound native verifier can harvest the recording values through the
+    /// frozen layout while producing the exact same challenges as the normal
+    /// lane challenger. This is the differential lock for removing a second,
+    /// throwaway trace replay from production Link assembly.
+    #[test]
+    fn layout_recording_challenger_matches_union_recorder() {
+        use crate::challenger::Challenger;
+        use crate::deep_chain::schedule::compile_duplex;
+
+        let mut b = FieldR1csBuilder::new_witness_only();
+        let values = (0..7)
+            .map(|i| F128 {
+                lo: 0xA500 + i,
+                hi: 0x5A00 + 3 * i,
+            })
+            .collect::<Vec<_>>();
+        let wires = values
+            .iter()
+            .map(|&value| LinExpr::from_wire(b.alloc_f128(value)))
+            .collect::<Vec<_>>();
+        let constant = F128 { lo: 42, hi: 7 };
+
+        let mut trace = FsChannelUnionRecorder::new(b"layout-native-lockstep");
+        trace.observe_label(&mut b, b"stage-1");
+        trace.observe_f128(&mut b, &LinExpr::constant(constant));
+        trace.observe_f128(&mut b, &wires[0]);
+        let mut trace_challenges = vec![trace.sample_f128(&mut b)];
+        trace.observe_f128_slice(&mut b, &wires[1..4]);
+        trace_challenges.extend(trace.sample_f128_vec(&mut b, 3));
+        trace.observe_f128_slice(&mut b, &wires[4..7]);
+        trace.observe_label(&mut b, b"stage-2");
+        trace_challenges.push(trace.sample_f128(&mut b));
+        // Exercise the special Challenger::verify_pow call stream too. Its
+        // challenge is deliberately opaque in the native API.
+        trace.verify_pow(&mut b, &LinExpr::constant(F128::ZERO), 0);
+        trace.observe_f128_slice(&mut b, &wires[..2]);
+        let recorded = trace.finish();
+        let layout = compile_duplex(&recorded.ops);
+
+        let mut native = LayoutRecordingChallenger::new(b"layout-native-lockstep", layout.clone());
+        native.observe_label(b"stage-1");
+        native.observe_f128(constant);
+        native.observe_f128(values[0]);
+        let mut native_challenges = vec![native.sample_f128()];
+        native.observe_f128_slice(&values[1..4]);
+        native_challenges.extend(native.sample_f128_vec(3));
+        native.observe_f128_slice(&values[4..7]);
+        native.observe_label(b"stage-2");
+        native_challenges.push(native.sample_f128());
+        assert!(native.verify_pow(0, 0));
+        native.observe_f128_slice(&values[..2]);
+        let captured = native
+            .finish()
+            .expect("frozen layout matches native replay");
+
+        assert_eq!(captured.layout, layout);
+        assert_eq!(captured.data_flat, recorded.data_flat);
+        assert_eq!(captured.post_state, recorded.post_state);
+        assert_eq!(captured.perms, recorded.perms);
+        assert_eq!(native_challenges.len(), trace_challenges.len());
+        for (native, trace) in native_challenges.iter().zip(&trace_challenges) {
+            assert_eq!(*native, trace.eval(b.values()));
+        }
+        let exposed = captured
+            .challenges
+            .iter()
+            .filter_map(|value| *value)
+            .collect::<Vec<_>>();
+        // All ordinary samples are exposed; only the PoW sample is opaque.
+        assert_eq!(exposed, native_challenges);
+    }
+
+    #[test]
+    fn layout_recording_challenger_rejects_layout_drift() {
+        use crate::challenger::Challenger;
+        use crate::deep_chain::schedule::compile_duplex;
+
+        let value = F128 { lo: 9, hi: 11 };
+        let mut b = FieldR1csBuilder::new_witness_only();
+        let wire = LinExpr::from_wire(b.alloc_f128(value));
+        let mut trace = FsChannelUnionRecorder::new(b"layout-drift");
+        trace.observe_f128(&mut b, &wire);
+        let _ = trace.sample_f128(&mut b);
+        let mut layout = compile_duplex(&trace.finish().ops);
+        layout.n_data += 1;
+
+        let mut native = LayoutRecordingChallenger::new(b"layout-drift", layout);
+        native.observe_f128(value);
+        let _ = native.sample_f128();
+        assert!(
+            native.finish().is_err(),
+            "drifted class layout must fail closed"
+        );
     }
 
     struct Rng(u64);

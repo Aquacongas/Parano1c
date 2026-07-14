@@ -857,21 +857,19 @@ mod tests {
         );
 
         let wrong_owner = [0xFF; 32];
-        assert!(
-            wallet
-                .commit_verified_activation(
-                    0,
-                    1,
-                    0,
-                    false,
-                    wrong_owner,
-                    snapshot(wrong_owner, None),
-                    &HashSet::new(),
-                    &HashSet::new(),
-                )
-                .unwrap_err()
-                .contains("does not match")
-        );
+        assert!(wallet
+            .commit_verified_activation(
+                0,
+                1,
+                0,
+                false,
+                wrong_owner,
+                snapshot(wrong_owner, None),
+                &HashSet::new(),
+                &HashSet::new(),
+            )
+            .unwrap_err()
+            .contains("does not match"));
         assert_eq!(wallet.balance(), 123, "failed reload must not erase cache");
     }
 
@@ -986,12 +984,10 @@ mod tests {
         wallet.next_index = 2;
         wallet.pending_input_slots.insert(5);
 
-        assert!(
-            wallet
-                .preview_generated_index(1)
-                .unwrap_err()
-                .contains("pending")
-        );
+        assert!(wallet
+            .preview_generated_index(1)
+            .unwrap_err()
+            .contains("pending"));
         assert!(wallet.preview_next_index().unwrap_err().contains("pending"));
         assert!(wallet.preview_generated_index(0).is_ok());
 

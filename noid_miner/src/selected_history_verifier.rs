@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Memory-governed selected-history terminal verification.
+//! Topology-admitted selected-history terminal verification.
 //!
 //! The recursive verifier owns cryptographic policy and the dependency-clean
 //! matrix lease contract.  This node/miner layer connects that contract to the
-//! disk-backed production matrix source and the same process-global exclusion
-//! ledger used by native and recursive proving. Its byte reservation covers
-//! the hard-cap-derived compact-registry materialization envelope plus bounded
-//! streaming scratch; it does not pretend to allocate an m24 CSR.
+//! matrix source and the same process-local ownership ledger used by native and
+//! recursive proving. Admission describes incompatible proof kernels only;
+//! host-memory readings and byte estimates do not participate.
 
 use std::fmt;
 
@@ -20,7 +19,10 @@ use noid_recursive::{
     SelectedHistoryVerificationError,
 };
 
-use crate::memory_governor::{ProofMemoryGovernor, ProofMemoryPressure, ProofMemoryReservation};
+use crate::embedded_recursive_artifacts::{
+    EmbeddedSelectedRecursiveArtifactError, EmbeddedSelectedRecursiveClassRegistrySource,
+    EmbeddedSelectedRecursiveMatrixSource,
+};
 use crate::recursive_class_registry_store::{
     LoadedSelectedRecursiveTerminalRegistry, LocalSelectedRecursiveClassRegistryError,
     LocalSelectedRecursiveClassRegistryStore,
@@ -31,6 +33,9 @@ use crate::recursive_matrix_store::{
     SelectedRecursiveMatrixArtifactIdentity,
 };
 use crate::recursive_prover::{SelectedRecursiveMatrixKind, SelectedRecursiveTier};
+use crate::topology_gate::{
+    ProofTopologyAdmissionError, ProofTopologyGate, ProofTopologyReservation,
+};
 
 impl SelectedHistoryMatrixLease for LoadedSelectedRecursiveMatrixView {
     fn evaluator(&mut self) -> &mut dyn noid_ivc_core::matrix_claim::MatrixClaimEvaluator {
@@ -84,15 +89,13 @@ impl SelectedHistoryMatrixSource for LocalSelectedRecursiveMatrixSource {
     }
 }
 
-/// Production terminal-verification failure.  The pinned production entrypoint
-/// reports memory pressure before the registry or any matrix artifact opens.
+/// Production terminal-verification failure.
 #[derive(Debug)]
 pub enum SelectedHistoryTerminalVerifierError {
-    MemoryPressure {
-        required_mib: usize,
-        available_mib: usize,
-    },
+    ProofStageBusy,
+    ProofTopologyInvariant(&'static str),
     RegistryLoad(LocalSelectedRecursiveClassRegistryError),
+    EmbeddedRegistryLoad(EmbeddedSelectedRecursiveArtifactError),
     RegistryPolicy(SelectedHistoryRegistryError),
     RegistryNotLoaded,
     RegistryAlreadyLoaded,
@@ -102,15 +105,17 @@ pub enum SelectedHistoryTerminalVerifierError {
 impl fmt::Display for SelectedHistoryTerminalVerifierError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MemoryPressure {
-                required_mib,
-                available_mib,
-            } => write!(
-                f,
-                "selected-history verification needs {required_mib} MiB; {available_mib} MiB is available"
-            ),
+            Self::ProofStageBusy => {
+                f.write_str("selected-history verification deferred by an active proof stage")
+            }
+            Self::ProofTopologyInvariant(message) => {
+                write!(f, "selected-history proof topology invariant: {message}")
+            }
             Self::RegistryLoad(error) => {
                 write!(f, "selected-history pinned registry load: {error}")
+            }
+            Self::EmbeddedRegistryLoad(error) => {
+                write!(f, "selected-history embedded registry load: {error}")
             }
             Self::RegistryPolicy(error) => {
                 write!(f, "selected-history terminal registry policy: {error}")
@@ -129,8 +134,9 @@ impl fmt::Display for SelectedHistoryTerminalVerifierError {
 impl std::error::Error for SelectedHistoryTerminalVerifierError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::MemoryPressure { .. } => None,
+            Self::ProofStageBusy | Self::ProofTopologyInvariant(_) => None,
             Self::RegistryLoad(error) => Some(error),
+            Self::EmbeddedRegistryLoad(error) => Some(error),
             Self::RegistryPolicy(error) => Some(error),
             Self::RegistryNotLoaded => None,
             Self::RegistryAlreadyLoaded => None,
@@ -139,11 +145,18 @@ impl std::error::Error for SelectedHistoryTerminalVerifierError {
     }
 }
 
-impl From<ProofMemoryPressure> for SelectedHistoryTerminalVerifierError {
-    fn from(value: ProofMemoryPressure) -> Self {
-        Self::MemoryPressure {
-            required_mib: value.required_mib,
-            available_mib: value.available_mib,
+impl From<ProofTopologyAdmissionError> for SelectedHistoryTerminalVerifierError {
+    fn from(value: ProofTopologyAdmissionError) -> Self {
+        match value {
+            ProofTopologyAdmissionError::Busy => Self::ProofStageBusy,
+            ProofTopologyAdmissionError::NonCanonicalNativeUserTxCount { .. } => {
+                Self::ProofTopologyInvariant(
+                    "terminal verifier requested a native transaction class",
+                )
+            }
+            ProofTopologyAdmissionError::NonCanonicalRecursiveTier { .. } => {
+                Self::ProofTopologyInvariant("terminal verifier requested a recursive tier")
+            }
         }
     }
 }
@@ -160,6 +173,12 @@ impl From<LocalSelectedRecursiveClassRegistryError> for SelectedHistoryTerminalV
     }
 }
 
+impl From<EmbeddedSelectedRecursiveArtifactError> for SelectedHistoryTerminalVerifierError {
+    fn from(value: EmbeddedSelectedRecursiveArtifactError) -> Self {
+        Self::EmbeddedRegistryLoad(value)
+    }
+}
+
 impl From<SelectedHistoryRegistryError> for SelectedHistoryTerminalVerifierError {
     fn from(value: SelectedHistoryRegistryError) -> Self {
         Self::RegistryPolicy(value)
@@ -171,22 +190,21 @@ impl From<SelectedHistoryRegistryError> for SelectedHistoryTerminalVerifierError
 /// live-lane checks, and the final local accumulator boundary decision.
 #[must_use = "dropping the session releases selected-history verification admission"]
 pub struct SelectedHistoryTerminalVerificationSession {
-    _reservation: ProofMemoryReservation,
+    _reservation: ProofTopologyReservation,
     // Keeping the registry inside the session makes it impossible for the
     // pinned materialization performed through this API to outlive admission.
     loaded_registry: Option<LoadedSelectedRecursiveTerminalRegistry>,
-    // True when this admission covers one resident CSR matrix at a time, so
-    // matrix claims evaluate in RAM with parallel span hashing instead of the
-    // single-pass streaming scanner.
-    resident_matrices: bool,
 }
 
 impl SelectedHistoryTerminalVerificationSession {
-    /// Whether this admission covers resident one-at-a-time matrix
-    /// evaluation. Callers propagate this to
-    /// [`LocalSelectedRecursiveMatrixSource::set_resident_evaluation`].
-    pub fn matrix_residency(&self) -> bool {
-        self.resident_matrices
+    pub fn canonical_artifact_identities(
+        &self,
+    ) -> Result<[SelectedRecursiveMatrixArtifactIdentity; 9], SelectedHistoryTerminalVerifierError>
+    {
+        self.loaded_registry
+            .as_ref()
+            .map(LoadedSelectedRecursiveTerminalRegistry::canonical_artifact_identities)
+            .ok_or(SelectedHistoryTerminalVerifierError::RegistryNotLoaded)
     }
 
     /// Read, authenticate, preflight, and materialize the compact registry
@@ -207,6 +225,21 @@ impl SelectedHistoryTerminalVerificationSession {
         // terminal registry. Reborrowing its view below is allocation-free
         // and cannot repeat the shared-genesis proof replay.
         self.loaded_registry = Some(loaded);
+        Ok(())
+    }
+
+    /// Materialize the relay-only registry directly from immutable bytes in
+    /// the daemon image. No filesystem path or install-time trust record is
+    /// consulted.
+    pub fn load_embedded_pinned_registry(
+        &mut self,
+        source: &EmbeddedSelectedRecursiveClassRegistrySource,
+        expected_registry_digest: [u8; 32],
+    ) -> Result<(), SelectedHistoryTerminalVerifierError> {
+        if self.loaded_registry.is_some() {
+            return Err(SelectedHistoryTerminalVerifierError::RegistryAlreadyLoaded);
+        }
+        self.loaded_registry = Some(source.load_terminal_pinned(expected_registry_digest)?);
         Ok(())
     }
 
@@ -257,27 +290,24 @@ impl SelectedHistoryTerminalVerificationSession {
 /// pinned-registry materialization or any matrix load.
 pub fn begin_selected_history_terminal_verification_session(
 ) -> Result<SelectedHistoryTerminalVerificationSession, SelectedHistoryTerminalVerifierError> {
-    begin_terminal_verification_with_governor(&ProofMemoryGovernor::global(0))
+    begin_terminal_verification_with_gate(&ProofTopologyGate::global())
 }
 
-fn begin_terminal_verification_with_governor(
-    governor: &ProofMemoryGovernor,
+/// Compatibility name for callers using the executable-embedded compact bank.
+/// It acquires the same topology slot as every terminal verifier; there is no
+/// memory-profile branch or fallback mode.
+pub fn begin_selected_history_terminal_compact_verification_session(
 ) -> Result<SelectedHistoryTerminalVerificationSession, SelectedHistoryTerminalVerifierError> {
-    // Prefer the resident-matrix envelope: one decoded CSR at a time with
-    // parallel span hashing. Memory pressure falls back to the bounded
-    // streaming envelope so a low-RAM node can still verify from disk.
-    match governor.try_reserve_for_selected_history_terminal_verification_resident() {
-        Ok(reservation) => Ok(SelectedHistoryTerminalVerificationSession {
-            _reservation: reservation,
-            loaded_registry: None,
-            resident_matrices: true,
-        }),
-        Err(_pressure) => Ok(SelectedHistoryTerminalVerificationSession {
-            _reservation: governor.try_reserve_for_selected_history_terminal_verification()?,
-            loaded_registry: None,
-            resident_matrices: false,
-        }),
-    }
+    begin_selected_history_terminal_verification_session()
+}
+
+fn begin_terminal_verification_with_gate(
+    gate: &ProofTopologyGate,
+) -> Result<SelectedHistoryTerminalVerificationSession, SelectedHistoryTerminalVerifierError> {
+    Ok(SelectedHistoryTerminalVerificationSession {
+        _reservation: gate.try_admit_selected_history_terminal_verification()?,
+        loaded_registry: None,
+    })
 }
 
 /// One-shot verifier for a registry that the caller already materialized under
@@ -305,8 +335,8 @@ pub fn verify_selected_history_terminal_governed<S: SelectedHistoryMatrixSource>
 /// Production pinned-registry entrypoint. Admission is acquired before the
 /// registry artifact is opened, and the same owning session retains both the
 /// registry and the process-global exclusion through terminal verification.
-/// Matrix residency follows the granted admission: resident evaluation when
-/// the host has the memory, bounded streaming otherwise.
+/// The local compatibility source always uses its resident evaluator; there
+/// is no host-memory-dependent fallback mode.
 pub fn verify_selected_history_terminal_pinned_governed(
     package: &SelectedHistoryTerminalPackage,
     registry_store: &LocalSelectedRecursiveClassRegistryStore,
@@ -317,7 +347,28 @@ pub fn verify_selected_history_terminal_pinned_governed(
 ) -> Result<ChainAccumulator, SelectedHistoryTerminalVerifierError> {
     let mut session = begin_selected_history_terminal_verification_session()?;
     session.load_pinned_registry(registry_store, expected_registry_digest)?;
-    matrix_source.set_resident_evaluation(session.matrix_residency());
+    matrix_source.set_resident_evaluation(true);
+    session.verify_with_loaded_registry(
+        package,
+        local_tip_header,
+        local_epoch_anchor_header,
+        matrix_source,
+    )
+}
+
+/// Self-contained production entrypoint: both authorities come from one
+/// executable-embedded pack and the matrix source shares its authenticated
+/// resident bank with the prover lane.
+pub fn verify_selected_history_terminal_embedded_governed(
+    package: &SelectedHistoryTerminalPackage,
+    registry_source: &EmbeddedSelectedRecursiveClassRegistrySource,
+    expected_registry_digest: [u8; 32],
+    local_tip_header: &BlockHeader,
+    local_epoch_anchor_header: &BlockHeader,
+    matrix_source: &mut EmbeddedSelectedRecursiveMatrixSource,
+) -> Result<ChainAccumulator, SelectedHistoryTerminalVerifierError> {
+    let mut session = begin_selected_history_terminal_compact_verification_session()?;
+    session.load_embedded_pinned_registry(registry_source, expected_registry_digest)?;
     session.verify_with_loaded_registry(
         package,
         local_tip_header,
@@ -355,23 +406,21 @@ mod tests {
 
     #[test]
     fn terminal_verification_session_serializes_with_all_proof_work() {
-        let governor = ProofMemoryGovernor::new(8 * 1024);
+        let gate = ProofTopologyGate::for_tests();
         let session = SelectedHistoryTerminalVerificationSession {
-            _reservation: governor
-                .try_reserve_selected_history_terminal_with_available(Some(2 * 1024))
+            _reservation: gate
+                .try_admit_selected_history_terminal_verification()
                 .expect("first terminal verification admission"),
             loaded_registry: None,
-            resident_matrices: false,
         };
 
-        assert!(governor
-            .try_reserve_selected_history_terminal_with_available(Some(2 * 1024))
+        assert!(gate
+            .try_admit_selected_history_terminal_verification()
             .is_err());
-        assert!(governor.try_reserve_for_recursive_tier(8).is_err());
+        assert!(gate.try_admit_recursive_tier(8).is_err());
 
         drop(session);
-        governor
-            .try_reserve_selected_history_terminal_with_available(Some(2 * 1024))
+        gate.try_admit_selected_history_terminal_verification()
             .expect("dropping terminal session releases shared admission");
     }
 
@@ -379,20 +428,19 @@ mod tests {
     fn pinned_registry_load_stays_inside_terminal_admission() {
         let directory = tempfile::tempdir().unwrap();
         let store = LocalSelectedRecursiveClassRegistryStore::new(directory.path());
-        let governor = ProofMemoryGovernor::new(8 * 1024);
-        let mut session = begin_terminal_verification_with_governor(&governor)
+        let gate = ProofTopologyGate::for_tests();
+        let mut session = begin_terminal_verification_with_gate(&gate)
             .expect("terminal admission before registry I/O");
 
         assert!(session.load_pinned_registry(&store, [0u8; 32]).is_err());
         assert!(
-            governor.try_reserve_for_recursive_tier(8).is_err(),
+            gate.try_admit_recursive_tier(8).is_err(),
             "a failed registry load must not release the owning session"
         );
 
         drop(session);
         drop(
-            governor
-                .try_reserve_for_recursive_tier(8)
+            gate.try_admit_recursive_tier(8)
                 .expect("session drop releases process-global proof exclusion"),
         );
     }

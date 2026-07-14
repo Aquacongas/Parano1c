@@ -180,6 +180,7 @@ pub struct LocalSelectedRecursiveMatrixSource {
     resident: Arc<AtomicBool>,
     resident_evaluation: bool,
     artifact_trust: bool,
+    lease_patience: Option<std::time::Duration>,
 }
 
 impl LocalSelectedRecursiveMatrixSource {
@@ -194,14 +195,13 @@ impl LocalSelectedRecursiveMatrixSource {
             resident: process_matrix_residency(),
             resident_evaluation: false,
             artifact_trust: true,
+            lease_patience: None,
         }
     }
 
-    /// Choose the terminal claim-evaluation strategy for
-    /// [`Self::open_artifact_evaluator`]. Callers enable residency only under
-    /// an admission that covers one decoded CSR matrix
-    /// (`SELECTED_HISTORY_TERMINAL_RESIDENT_MATRIX_PEAK_MIB`); the default is
-    /// the bounded-memory streaming scanner.
+    /// Choose the terminal claim-evaluation strategy for the offline/local
+    /// filesystem source. Official nodes use the executable-embedded matrix
+    /// bank and never enter this compatibility branch.
     pub fn set_resident_evaluation(&mut self, resident_evaluation: bool) {
         self.resident_evaluation = resident_evaluation;
     }
@@ -218,6 +218,25 @@ impl LocalSelectedRecursiveMatrixSource {
         self.artifact_trust = artifact_trust;
     }
 
+    /// Bound how long this handle waits for the process-wide one-matrix
+    /// residency before failing closed with `MatrixAlreadyResident`.
+    ///
+    /// The default (`None`) preserves the historical immediate-failure
+    /// behavior. The pipelined history worker sets a finite patience on its
+    /// own lane handles only: its link and verify lanes intentionally contend
+    /// on the single residency, each holds at most one matrix, and each
+    /// releases it before requesting another, so a bounded wait serializes
+    /// the lanes instead of aborting a multi-second proof stage.
+    pub fn set_lease_patience(&mut self, lease_patience: Option<std::time::Duration>) {
+        self.lease_patience = lease_patience;
+    }
+
+    fn acquire_resident_lease(
+        &self,
+    ) -> Result<ResidentMatrixLease, LocalSelectedRecursiveMatrixError> {
+        ResidentMatrixLease::acquire_with_patience(Arc::clone(&self.resident), self.lease_patience)
+    }
+
     #[cfg(test)]
     fn with_isolated_residency(root: impl Into<PathBuf>, max_artifact_bytes: u64) -> Self {
         Self {
@@ -226,6 +245,7 @@ impl LocalSelectedRecursiveMatrixSource {
             resident: Arc::new(AtomicBool::new(false)),
             resident_evaluation: false,
             artifact_trust: true,
+            lease_patience: None,
         }
     }
 
@@ -297,9 +317,20 @@ impl LocalSelectedRecursiveMatrixSource {
             }
             #[cfg(unix)]
             {
-                let lease = ResidentMatrixLease::acquire(Arc::clone(&self.resident))?;
+                let lease_started = std::time::Instant::now();
+                let lease = self.acquire_resident_lease()?;
+                let lease_wait_ms = lease_started.elapsed().as_millis() as u64;
                 let parent = self.open_version_directory(false)?;
-                self.load_requested_evaluator_anchored(&parent, identity, lease)
+                let materialize_started = std::time::Instant::now();
+                let loaded = self.load_requested_evaluator_anchored(&parent, identity, lease);
+                tracing::info!(
+                    matrix_kind = ?identity.kind(),
+                    lease_wait_ms,
+                    materialize_ms = materialize_started.elapsed().as_millis() as u64,
+                    ok = loaded.is_ok(),
+                    "selected-history Verify matrix load phases"
+                );
+                loaded
             }
         } else {
             Ok(LoadedSelectedRecursiveMatrixEvaluator::Streamed(
@@ -365,9 +396,21 @@ impl LocalSelectedRecursiveMatrixSource {
         }
         #[cfg(unix)]
         {
-            let lease = ResidentMatrixLease::acquire(Arc::clone(&self.resident))?;
+            let lease_started = std::time::Instant::now();
+            let lease = self.acquire_resident_lease()?;
+            let lease_wait_ms = lease_started.elapsed().as_millis() as u64;
             let parent = self.open_version_directory(false)?;
-            self.load_requested_anchored(&parent, kind, shape, statement_digest, lease)
+            let materialize_started = std::time::Instant::now();
+            let loaded =
+                self.load_requested_anchored(&parent, kind, shape, statement_digest, lease);
+            tracing::info!(
+                matrix_kind = ?kind,
+                lease_wait_ms,
+                materialize_ms = materialize_started.elapsed().as_millis() as u64,
+                ok = loaded.is_ok(),
+                "selected-history Link matrix load phases"
+            );
+            loaded
         }
     }
 
@@ -384,7 +427,7 @@ impl LocalSelectedRecursiveMatrixSource {
         }
         #[cfg(unix)]
         {
-            let lease = ResidentMatrixLease::acquire(Arc::clone(&self.resident))?;
+            let lease = self.acquire_resident_lease()?;
             let parent = self.open_version_directory(false)?;
             self.open_requested_view_anchored(&parent, kind, shape, statement_digest, lease)
         }
@@ -400,14 +443,20 @@ impl LocalSelectedRecursiveMatrixSource {
         lease: ResidentMatrixLease,
     ) -> Result<LoadedSelectedRecursiveMatrix, LocalSelectedRecursiveMatrixError> {
         let (file, opened, path, compressed) = self.open_anchored_artifact(parent, kind)?;
+        let trusted = self.artifact_trust
+            && self
+                .read_artifact_trust_record(parent, kind, compressed)
+                .is_some_and(|record| record.digest == statement_digest && record.matches(&opened));
         let decoder_cap = usize::try_from(self.effective_max_bytes()).unwrap_or(usize::MAX);
         let buffered = BufReader::with_capacity(ARTIFACT_READ_BUFFER_BYTES, file);
+        let read_matrix = |reader: &mut dyn io::Read| {
+            FieldR1cs::read_artifact(reader, shape, statement_digest, decoder_cap)
+                .map_err(LocalSelectedRecursiveMatrixError::Codec)
+        };
         let (matrix, after) = if compressed {
             let mut decoder = zstd::stream::read::Decoder::with_buffer(buffered)
                 .map_err(|source| io_error("open zstd decoder", &path, source))?;
-            let matrix =
-                FieldR1cs::read_artifact(&mut decoder, shape, statement_digest, decoder_cap)
-                    .map_err(LocalSelectedRecursiveMatrixError::Codec)?;
+            let matrix = read_matrix(&mut decoder)?;
             let after = decoder
                 .get_ref()
                 .get_ref()
@@ -416,9 +465,7 @@ impl LocalSelectedRecursiveMatrixSource {
             (matrix, after)
         } else {
             let mut reader = buffered;
-            let matrix =
-                FieldR1cs::read_artifact(&mut reader, shape, statement_digest, decoder_cap)
-                    .map_err(LocalSelectedRecursiveMatrixError::Codec)?;
+            let matrix = read_matrix(&mut reader)?;
             let after = reader
                 .get_ref()
                 .metadata()
@@ -427,6 +474,19 @@ impl LocalSelectedRecursiveMatrixSource {
         };
         if !same_file_and_length(&opened, &after) {
             return Err(LocalSelectedRecursiveMatrixError::ArtifactChanged { path });
+        }
+        // `read_artifact` just authenticated the complete CSR. Seeding its
+        // cache is now only a derived optimization; every acceptance boundary
+        // below still uses the structural rows rather than this cache value.
+        matrix.seed_statement_digest(statement_digest);
+        if !trusted && self.artifact_trust {
+            let _ = self.write_artifact_trust_record(
+                parent,
+                kind,
+                compressed,
+                &after,
+                statement_digest,
+            );
         }
 
         let resident = lease.transfer();
@@ -469,11 +529,10 @@ impl LocalSelectedRecursiveMatrixSource {
         })
     }
 
-    /// Resident terminal-evaluator load with the optional install-time trust
-    /// fast path. A record is honored only when its digest equals the
-    /// requested identity's digest and the backing file is byte-identical to
-    /// the one that was fully authenticated; anything else re-authenticates
-    /// and rewrites the record.
+    /// Resident terminal-evaluator load. An install-time record remains a
+    /// cache/status hint, but never replaces structural authentication: the
+    /// complete relation is rehashed on load and again with evaluated rows at
+    /// the terminal boundary.
     #[cfg(unix)]
     fn load_requested_evaluator_anchored(
         &self,
@@ -491,17 +550,8 @@ impl LocalSelectedRecursiveMatrixSource {
         let decoder_cap = usize::try_from(self.effective_max_bytes()).unwrap_or(usize::MAX);
         let buffered = BufReader::with_capacity(ARTIFACT_READ_BUFFER_BYTES, file);
         let read_matrix = |reader: &mut dyn io::Read| {
-            if trusted {
-                FieldR1cs::read_artifact_with_established_digest(
-                    reader,
-                    identity.shape(),
-                    expected_digest,
-                    decoder_cap,
-                )
-            } else {
-                FieldR1cs::read_artifact(reader, identity.shape(), expected_digest, decoder_cap)
-            }
-            .map_err(LocalSelectedRecursiveMatrixError::Codec)
+            FieldR1cs::read_artifact(reader, identity.shape(), expected_digest, decoder_cap)
+                .map_err(LocalSelectedRecursiveMatrixError::Codec)
         };
         let (matrix, after) = if compressed {
             let mut decoder = zstd::stream::read::Decoder::with_buffer(buffered)
@@ -935,11 +985,10 @@ impl Drop for LoadedSelectedRecursiveMatrixView {
 /// One terminal claim-evaluation lease under the source's residency policy.
 /// Every variant holds the process-wide one-matrix admission until drop.
 ///
-/// `Resident` and `Streamed` recompute the structural statement digest from
-/// the exact rows they evaluate. `TrustedResident` is admitted only by a
-/// valid install-time trust record for the byte-identical artifact; its
-/// digest authority is the recorded prior full authentication, and the
-/// caller still compares that digest against the registry pin.
+/// Every variant recomputes the structural statement digest from the exact
+/// rows it evaluates. `TrustedResident` records only that an install-time
+/// record matched the byte identity; it grants no digest authority or
+/// authentication bypass.
 pub enum LoadedSelectedRecursiveMatrixEvaluator {
     Resident(crate::recursive_prover::LoadedSelectedRecursiveMatrix),
     TrustedResident(crate::recursive_prover::LoadedSelectedRecursiveMatrix),
@@ -962,9 +1011,12 @@ impl MatrixClaimEvaluator for LoadedSelectedRecursiveMatrixEvaluator {
         accumulated: Option<&MatrixAccClaim>,
     ) -> Result<AuthenticatedMatrixClaimEvaluations, FieldR1csArtifactError> {
         match self {
-            Self::Resident(loaded) => loaded.matrix_mut().evaluate_matrix_claims(fresh, accumulated),
-            Self::TrustedResident(loaded) => noid_ivc_core::matrix_claim::
-                evaluate_matrix_claims_established(loaded.matrix(), fresh, accumulated),
+            Self::Resident(loaded) => loaded
+                .matrix_mut()
+                .evaluate_matrix_claims(fresh, accumulated),
+            Self::TrustedResident(loaded) => loaded
+                .matrix_mut()
+                .evaluate_matrix_claims(fresh, accumulated),
             Self::Streamed(view) => view.evaluate_matrix_claims(fresh, accumulated),
         }
     }
@@ -1243,14 +1295,41 @@ struct ResidentMatrixLease {
 }
 
 impl ResidentMatrixLease {
+    /// Immediate-failure acquire retained for tests; production sites go
+    /// through the source's configured patience.
+    #[cfg(test)]
     fn acquire(resident: Arc<AtomicBool>) -> Result<Self, LocalSelectedRecursiveMatrixError> {
-        resident
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| LocalSelectedRecursiveMatrixError::MatrixAlreadyResident)?;
-        Ok(Self {
-            resident,
-            armed: true,
-        })
+        Self::acquire_with_patience(resident, None)
+    }
+
+    /// Acquire the process-wide one-matrix residency, optionally waiting up
+    /// to `patience` for another lane's matrix to be destroyed. The wait
+    /// polls at a coarse period because residency epochs are seconds-scale
+    /// (decode, evaluate, drop of multi-GiB vectors); on expiry the acquire
+    /// fails closed exactly like the immediate form.
+    fn acquire_with_patience(
+        resident: Arc<AtomicBool>,
+        patience: Option<std::time::Duration>,
+    ) -> Result<Self, LocalSelectedRecursiveMatrixError> {
+        const LEASE_POLL_PERIOD: std::time::Duration = std::time::Duration::from_millis(50);
+        let deadline = patience.map(|patience| std::time::Instant::now() + patience);
+        loop {
+            if resident
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Ok(Self {
+                    resident,
+                    armed: true,
+                });
+            }
+            match deadline {
+                Some(deadline) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(LEASE_POLL_PERIOD);
+                }
+                _ => return Err(LocalSelectedRecursiveMatrixError::MatrixAlreadyResident),
+            }
+        }
     }
 
     fn transfer(mut self) -> Arc<AtomicBool> {
@@ -1326,10 +1405,6 @@ impl<W> CappedWriter<W> {
 
     fn exceeded_at(&self) -> Option<u64> {
         self.exceeded_at
-    }
-
-    fn inner(&self) -> &W {
-        &self.inner
     }
 
     fn into_inner(self) -> W {
@@ -1414,6 +1489,43 @@ mod tests {
 
     fn isolated_source_with_cap(root: &Path, cap: u64) -> LocalSelectedRecursiveMatrixSource {
         LocalSelectedRecursiveMatrixSource::with_isolated_residency(root, cap)
+    }
+
+    #[test]
+    fn resident_lease_patience_waits_for_the_current_owner() {
+        let resident = Arc::new(AtomicBool::new(false));
+        let first = ResidentMatrixLease::acquire(Arc::clone(&resident)).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let contender_resident = Arc::clone(&resident);
+        let contender = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            ResidentMatrixLease::acquire_with_patience(
+                contender_resident,
+                Some(std::time::Duration::from_secs(1)),
+            )
+        });
+
+        started_rx.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        drop(first);
+        let second = contender.join().unwrap().unwrap();
+        drop(second);
+        assert!(!resident.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn resident_lease_patience_expires_fail_closed() {
+        let resident = Arc::new(AtomicBool::new(false));
+        let first = ResidentMatrixLease::acquire(Arc::clone(&resident)).unwrap();
+        assert!(matches!(
+            ResidentMatrixLease::acquire_with_patience(
+                Arc::clone(&resident),
+                Some(std::time::Duration::from_millis(5)),
+            ),
+            Err(LocalSelectedRecursiveMatrixError::MatrixAlreadyResident)
+        ));
+        drop(first);
+        assert!(!resident.load(Ordering::Acquire));
     }
 
     #[test]
@@ -1604,10 +1716,7 @@ mod tests {
             LoadedSelectedRecursiveMatrixEvaluator::TrustedResident(_)
         ));
         let eval = second.evaluate_matrix_claims(None, Some(&claim)).unwrap();
-        assert_eq!(
-            eval.structural_digest(),
-            matrix_identity.statement_digest()
-        );
+        assert_eq!(eval.structural_digest(), matrix_identity.statement_digest());
         assert_eq!(eval.accumulated_value(), Some(claim.value));
         drop(second);
 
@@ -2101,10 +2210,8 @@ mod tests {
         assert!(!outside.join(&leaf).exists());
         assert_eq!(fs::read_dir(&held_parent).unwrap().count(), 1);
 
-        let mut reader = zstd::stream::read::Decoder::new(
-            File::open(held_parent.join(leaf)).unwrap(),
-        )
-        .unwrap();
+        let mut reader =
+            zstd::stream::read::Decoder::new(File::open(held_parent.join(leaf)).unwrap()).unwrap();
         let decoded = FieldR1cs::read_artifact(
             &mut reader,
             matrix_identity.shape(),

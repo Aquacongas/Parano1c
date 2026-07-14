@@ -27,8 +27,8 @@ pub use historical_state::{
     HistoricalStateError,
 };
 pub use ladder_state::{
-    derive_touched_segment_ids, load_selected_history_ladder_parent_state, LadderStateError,
-    TouchedSegmentError,
+    derive_touched_segment_ids, load_selected_history_ladder_parent_state,
+    load_selected_history_pipelined_parent_state, LadderStateError, TouchedSegmentError,
 };
 pub use mdbx_context::{
     AppliedBlockValidation, CoverageAttestationClaim, MdbxChainContext, MdbxContextError,
@@ -39,8 +39,8 @@ pub use mdbx_store::{
     RecursiveProofJobResult, RecursiveProofJobState, RecursiveProofJobTier,
     SelectedHistoryCoverage, SelectedHistoryLadderMeta, SelectedHistorySnapshotSeed, StoreError,
     VerifiedHeaderBatchOutcome, VerifiedHeaderBatchRecord, VerifiedOwnerSnapshot,
-    VerifiedOwnerUtxo, VerifiedSelectedHistoryTerminalImport,
-    MAX_RECURSIVE_PROOF_JOB_RESULT_BYTES, MAX_VERIFIED_HEADER_BATCH_RECORDS,
+    VerifiedOwnerUtxo, VerifiedSelectedHistoryTerminalImport, MAX_RECURSIVE_PROOF_JOB_RESULT_BYTES,
+    MAX_VERIFIED_HEADER_BATCH_RECORDS,
 };
 pub use memory::RamBackend;
 pub use meta::{ConsensusMeta, FinalizedCheckpoint};

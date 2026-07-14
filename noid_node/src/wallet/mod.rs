@@ -77,12 +77,12 @@ mod secret_surface_source_tests {
 use std::sync::Arc;
 
 use noid_chain::storage::VerifiedOwnerSnapshot;
-use noid_rpc::WalletOps;
 use noid_rpc::types::{
-    FeeBreakdownInfo, WalletAddressInfo, WalletBalance, WalletHistoryEntry, WalletScanResult,
-    WalletSendPlan, WalletStatus, WalletUtxoInfo, micronoid_to_noid,
+    micronoid_to_noid, FeeBreakdownInfo, WalletAddressInfo, WalletBalance, WalletHistoryEntry,
+    WalletScanResult, WalletSendPlan, WalletStatus, WalletUtxoInfo,
 };
 use noid_rpc::wallet_ops::{WalletActivationPreview, WalletSendPlanError};
+use noid_rpc::WalletOps;
 use noid_tx::TX_INPUTS;
 
 /// Thread-safe handle to the in-process wallet.
@@ -1173,12 +1173,10 @@ mod tests {
         let guard = handle.inner.lock().unwrap();
         let wallet = guard.as_ref().unwrap();
         assert!(!wallet.receipts.contains_key(&orphan_hash));
-        assert!(
-            wallet
-                .history
-                .iter()
-                .all(|entry| entry.tx_hash != orphan_hash)
-        );
+        assert!(wallet
+            .history
+            .iter()
+            .all(|entry| entry.tx_hash != orphan_hash));
         drop(guard);
 
         let reloaded = state::WalletState::create_or_load(dir.path().join("wallet.key")).unwrap();

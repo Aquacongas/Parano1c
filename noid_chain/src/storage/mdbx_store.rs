@@ -635,6 +635,7 @@ struct ClaimedRecursiveProofInputLengths {
 fn validate_claimed_recursive_proof_input_lengths(
     height: u64,
     lengths: ClaimedRecursiveProofInputLengths,
+    require_previous_result: bool,
 ) -> Result<(), StoreError> {
     use crate::consensus::wire_limits::{
         proof_sidecar_combined_len_ok, MAX_BLOCK_AUTH_SIDECAR_BYTES, MAX_BLOCK_BYTES,
@@ -666,10 +667,10 @@ fn validate_claimed_recursive_proof_input_lengths(
         }
     }
 
-    if height == 1 {
+    if height == 1 || !require_previous_result {
         if lengths.previous_result.is_some() {
             return Err(StoreError::Decode(
-                "height-one recursive proof input unexpectedly selected a predecessor result",
+                "recursive proof input unexpectedly selected a predecessor result",
             ));
         }
     } else {
@@ -2366,6 +2367,50 @@ impl MdbxStore {
         &self,
         claimed: RecursiveProofJob,
     ) -> Result<ClaimedRecursiveProofJobInputs, StoreError> {
+        self.load_claimed_recursive_proof_job_inputs_inner(claimed, false, None)
+            .map(|(inputs, _)| inputs)
+    }
+
+    /// Strictly load one claimed job and, from the same read snapshot, report
+    /// whether its durable predecessor is the exact in-memory lane tail the
+    /// caller expects. The comparison reuses the single decoded predecessor
+    /// result already owned by the returned inputs; it does not fetch or copy
+    /// the result payload a second time.
+    pub fn load_claimed_recursive_proof_job_inputs_with_expected_predecessor(
+        &self,
+        claimed: RecursiveProofJob,
+        expected_height: u64,
+        expected_block_hash: [u8; 32],
+        expected_bytes: &[u8],
+    ) -> Result<(ClaimedRecursiveProofJobInputs, bool), StoreError> {
+        self.load_claimed_recursive_proof_job_inputs_inner(
+            claimed,
+            false,
+            Some((expected_height, expected_block_hash, expected_bytes)),
+        )
+    }
+
+    /// Pipelined variant of [`Self::load_claimed_recursive_proof_job_inputs`]
+    /// for the in-memory chained history worker: the immediate predecessor
+    /// job may still be `Running` when it is bound to the exact canonical
+    /// parent hash — its terminal result then arrives through the worker's
+    /// in-memory lane handoff and `previous_result` is `None`.  A `Complete`
+    /// predecessor (for example after a raced verified import) behaves
+    /// exactly like the strict loader.  Every other validation is identical.
+    pub fn load_claimed_recursive_proof_job_inputs_with_running_predecessor(
+        &self,
+        claimed: RecursiveProofJob,
+    ) -> Result<ClaimedRecursiveProofJobInputs, StoreError> {
+        self.load_claimed_recursive_proof_job_inputs_inner(claimed, true, None)
+            .map(|(inputs, _)| inputs)
+    }
+
+    fn load_claimed_recursive_proof_job_inputs_inner(
+        &self,
+        claimed: RecursiveProofJob,
+        allow_running_predecessor: bool,
+        expected_predecessor: Option<(u64, [u8; 32], &[u8])>,
+    ) -> Result<(ClaimedRecursiveProofJobInputs, bool), StoreError> {
         use crate::wire::BLOCK_HEADER_WIRE_SIZE;
 
         if claimed.height == 0 {
@@ -2443,6 +2488,31 @@ impl MdbxStore {
             ));
         }
 
+        let expected_predecessor_identity_matches =
+            expected_predecessor.is_some_and(|(height, block_hash, _)| {
+                height == parent_height && block_hash == parent_hash
+            });
+        let expected_predecessor_coverage_matches = if expected_predecessor.is_some() {
+            let coverage_table = txn.open_table(Some(T_CHECKPOINT_COVERAGE))?;
+            let coverage_raw: Option<[u8; SELECTED_HISTORY_COVERAGE_ENCODED_BYTES]> =
+                txn.get(&coverage_table, KEY_SELECTED_HISTORY_COVERAGE)?;
+            let coverage = coverage_raw
+                .as_ref()
+                .map(|raw| {
+                    decode_selected_history_coverage(raw).ok_or(StoreError::Decode(
+                        "invalid selected history coverage pointer",
+                    ))
+                })
+                .transpose()?;
+            coverage
+                == Some(SelectedHistoryCoverage {
+                    height: parent_height,
+                    block_hash: parent_hash,
+                })
+        } else {
+            false
+        };
+
         if source_tip.0 == claimed.height {
             if source_tip.1 != claimed.block_hash {
                 return Err(StoreError::Decode(
@@ -2493,15 +2563,26 @@ impl MdbxStore {
                 .ok_or(StoreError::Decode(
                     "previous recursive proof job is missing or malformed",
                 ))?;
-            if decoded.state != RecursiveProofJobState::Complete
-                || decoded.block_hash != parent_hash
-            {
+            if decoded.block_hash != parent_hash {
                 return Err(StoreError::Decode(
-                    "previous recursive proof job is not complete and canonical",
+                    "previous recursive proof job is not canonical",
                 ));
             }
-            previous_job = Some(decoded);
-            txn.get::<ObjectLength>(&results, &previous_key)?
+            match decoded.state {
+                RecursiveProofJobState::Complete => {
+                    previous_job = Some(decoded);
+                    txn.get::<ObjectLength>(&results, &previous_key)?
+                }
+                // The pipelined worker proves consecutive heights before the
+                // lower one is promoted; the predecessor terminal then comes
+                // from the in-memory lane handoff, never from this snapshot.
+                RecursiveProofJobState::Running if allow_running_predecessor => None,
+                _ => {
+                    return Err(StoreError::Decode(
+                        "previous recursive proof job is not complete and canonical",
+                    ));
+                }
+            }
         };
 
         let lengths = ClaimedRecursiveProofInputLengths {
@@ -2510,7 +2591,11 @@ impl MdbxStore {
             sidecar: sidecar_length.map(|ObjectLength(length)| length),
             previous_result: previous_result_length.map(|ObjectLength(length)| length),
         };
-        validate_claimed_recursive_proof_input_lengths(claimed.height, lengths)?;
+        validate_claimed_recursive_proof_input_lengths(
+            claimed.height,
+            lengths,
+            previous_job.is_some(),
+        )?;
 
         let block_bytes: Vec<u8> =
             txn.get(&recent_blocks, &u64_key(claimed.height))?
@@ -2595,17 +2680,31 @@ impl MdbxStore {
             None
         };
 
-        Ok(ClaimedRecursiveProofJobInputs {
-            job: claimed,
-            source_tip,
-            parent_header,
-            block_header,
-            user_transaction_count,
-            block_bytes,
-            block_proof_bytes,
-            block_auth_sidecar_bytes,
-            previous_result,
-        })
+        let expected_predecessor_matches = match (expected_predecessor, previous_result.as_ref()) {
+            (Some((height, block_hash, bytes)), Some(result)) => {
+                expected_predecessor_identity_matches
+                    && expected_predecessor_coverage_matches
+                    && result.height == height
+                    && result.block_hash == block_hash
+                    && result.bytes.as_slice() == bytes
+            }
+            _ => false,
+        };
+
+        Ok((
+            ClaimedRecursiveProofJobInputs {
+                job: claimed,
+                source_tip,
+                parent_header,
+                block_header,
+                user_transaction_count,
+                block_bytes,
+                block_proof_bytes,
+                block_auth_sidecar_bytes,
+                previous_result,
+            },
+            expected_predecessor_matches,
+        ))
     }
 
     /// Store one bounded opaque proof and mark its running job complete in the
@@ -4172,9 +4271,7 @@ impl MdbxStore {
     /// re-verify the coverage advancement.
     pub fn put_coverage_attestation(&self, height: u64, bytes: &[u8]) -> Result<(), StoreError> {
         if bytes.len() > crate::consensus::wire_limits::MAX_COVERAGE_ATTESTATION_BYTES {
-            return Err(StoreError::Decode(
-                "coverage attestation exceeds wire cap",
-            ));
+            return Err(StoreError::Decode("coverage attestation exceeds wire cap"));
         }
         let txn = self.db.begin_rw_txn()?;
         let tbl = txn.open_table(Some(T_COVERAGE_ATTESTATIONS))?;
@@ -5048,14 +5145,13 @@ impl MdbxStore {
                 if slot.is_empty() {
                     continue;
                 }
-                let creation_in_target = if crate::consensus::params::is_coinbase_creation_id(
-                    slot.creation_id(),
-                ) {
-                    crate::consensus::params::coinbase_creation_height(slot.creation_id())
-                        <= tip_header.height
-                } else {
-                    slot.creation_id() <= tip_header.alloc_counter
-                };
+                let creation_in_target =
+                    if crate::consensus::params::is_coinbase_creation_id(slot.creation_id()) {
+                        crate::consensus::params::coinbase_creation_height(slot.creation_id())
+                            <= tip_header.height
+                    } else {
+                        slot.creation_id() <= tip_header.alloc_counter
+                    };
                 if !creation_in_target {
                     return Err(StoreError::Decode(
                         "staged snapshot creation_id exceeds target allocator",
@@ -6506,6 +6602,19 @@ mod tests {
         txn.commit().unwrap();
     }
 
+    fn overwrite_selected_history_coverage_for_test(store: &MdbxStore, encoded: &[u8]) {
+        let txn = store.db.begin_rw_txn().unwrap();
+        let table = txn.open_table(Some(T_CHECKPOINT_COVERAGE)).unwrap();
+        txn.put(
+            &table,
+            KEY_SELECTED_HISTORY_COVERAGE,
+            encoded,
+            WriteFlags::empty(),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+    }
+
     fn recursive_loader_fixture(store: &MdbxStore) -> RecursiveLoaderFixture {
         use crate::block::Block;
 
@@ -6772,6 +6881,116 @@ mod tests {
     }
 
     #[test]
+    fn claimed_recursive_proof_expected_predecessor_matches_in_one_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let fixture = recursive_loader_fixture(&store);
+        let parent_hash = crate::hash_block_header(&fixture.parent_header);
+        overwrite_selected_history_coverage_for_test(
+            &store,
+            &encode_selected_history_coverage(SelectedHistoryCoverage {
+                height: fixture.parent_header.height,
+                block_hash: parent_hash,
+            }),
+        );
+
+        let (loaded, matches) = store
+            .load_claimed_recursive_proof_job_inputs_with_expected_predecessor(
+                fixture.claimed,
+                fixture.parent_header.height,
+                parent_hash,
+                &fixture.previous_result_bytes,
+            )
+            .unwrap();
+
+        assert!(matches);
+        let predecessor = loaded.previous_result.unwrap();
+        assert_eq!(predecessor.height, fixture.parent_header.height);
+        assert_eq!(predecessor.block_hash, parent_hash);
+        assert_eq!(predecessor.bytes, fixture.previous_result_bytes);
+    }
+
+    #[test]
+    fn claimed_recursive_proof_expected_predecessor_mismatches_fail_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let fixture = recursive_loader_fixture(&store);
+        let parent_height = fixture.parent_header.height;
+        let parent_hash = crate::hash_block_header(&fixture.parent_header);
+        overwrite_selected_history_coverage_for_test(
+            &store,
+            &encode_selected_history_coverage(SelectedHistoryCoverage {
+                height: parent_height,
+                block_hash: parent_hash,
+            }),
+        );
+
+        let (_, height_matches) = store
+            .load_claimed_recursive_proof_job_inputs_with_expected_predecessor(
+                fixture.claimed,
+                parent_height + 1,
+                parent_hash,
+                &fixture.previous_result_bytes,
+            )
+            .unwrap();
+        assert!(!height_matches);
+
+        let mut wrong_hash = parent_hash;
+        wrong_hash[0] ^= 1;
+        let (_, hash_matches) = store
+            .load_claimed_recursive_proof_job_inputs_with_expected_predecessor(
+                fixture.claimed,
+                parent_height,
+                wrong_hash,
+                &fixture.previous_result_bytes,
+            )
+            .unwrap();
+        assert!(!hash_matches);
+
+        let mut wrong_bytes = fixture.previous_result_bytes.clone();
+        wrong_bytes.push(0);
+        let (_, bytes_match) = store
+            .load_claimed_recursive_proof_job_inputs_with_expected_predecessor(
+                fixture.claimed,
+                parent_height,
+                parent_hash,
+                &wrong_bytes,
+            )
+            .unwrap();
+        assert!(!bytes_match);
+
+        overwrite_selected_history_coverage_for_test(
+            &store,
+            &encode_selected_history_coverage(SelectedHistoryCoverage {
+                height: 0,
+                block_hash: [0xA5; 32],
+            }),
+        );
+        let (_, coverage_matches) = store
+            .load_claimed_recursive_proof_job_inputs_with_expected_predecessor(
+                fixture.claimed,
+                parent_height,
+                parent_hash,
+                &fixture.previous_result_bytes,
+            )
+            .unwrap();
+        assert!(!coverage_matches);
+
+        overwrite_selected_history_coverage_for_test(
+            &store,
+            &[0xFF; SELECTED_HISTORY_COVERAGE_ENCODED_BYTES],
+        );
+        assert!(store
+            .load_claimed_recursive_proof_job_inputs_with_expected_predecessor(
+                fixture.claimed,
+                parent_height,
+                parent_hash,
+                &fixture.previous_result_bytes,
+            )
+            .is_err());
+    }
+
+    #[test]
     fn height_one_recursive_proof_inputs_have_no_predecessor_allocation() {
         use crate::block::Block;
 
@@ -6912,6 +7131,79 @@ mod tests {
     }
 
     #[test]
+    fn pipelined_input_loader_admits_running_predecessor_bound_to_parent_hash() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let fixture = recursive_loader_fixture(&store);
+
+        // With a complete predecessor both loaders return identical inputs.
+        let strict = store
+            .load_claimed_recursive_proof_job_inputs(fixture.claimed)
+            .unwrap();
+        let pipelined = store
+            .load_claimed_recursive_proof_job_inputs_with_running_predecessor(fixture.claimed)
+            .unwrap();
+        assert_eq!(
+            strict.previous_result.as_ref().map(|result| &result.bytes),
+            Some(&fixture.previous_result_bytes)
+        );
+        assert_eq!(strict.previous_result, pipelined.previous_result);
+        assert_eq!(strict.block_bytes, pipelined.block_bytes);
+
+        // Rewind the predecessor to the pipelined in-flight shape: Running
+        // under the exact canonical parent hash, no durable result yet.
+        let set_previous_state = |state: RecursiveProofJobState, hash_flip: bool| {
+            let txn = store.db.begin_rw_txn().unwrap();
+            let jobs = txn.open_table(Some(T_RECURSIVE_PROOF_JOBS)).unwrap();
+            let previous_key = recursive_proof_height_key(1);
+            let raw: [u8; RECURSIVE_PROOF_JOB_ENCODED_BYTES] =
+                txn.get(&jobs, &previous_key).unwrap().unwrap();
+            let mut previous = decode_recursive_proof_job(1, &raw).unwrap();
+            previous.state = state;
+            if hash_flip {
+                previous.block_hash[0] ^= 1;
+            }
+            txn.put(
+                &jobs,
+                previous_key,
+                encode_recursive_proof_job(&previous),
+                WriteFlags::empty(),
+            )
+            .unwrap();
+            let results = txn.open_table(Some(T_RECURSIVE_PROOF_RESULTS)).unwrap();
+            let _ = txn.del(&results, &previous_key, None);
+            txn.commit().unwrap();
+        };
+        set_previous_state(RecursiveProofJobState::Running, false);
+
+        assert!(
+            store
+                .load_claimed_recursive_proof_job_inputs(fixture.claimed)
+                .is_err(),
+            "the strict loader must stay strict"
+        );
+        let inflight = store
+            .load_claimed_recursive_proof_job_inputs_with_running_predecessor(fixture.claimed)
+            .unwrap();
+        assert!(inflight.previous_result.is_none());
+        assert_eq!(inflight.block_bytes, fixture.block_bytes);
+        assert_eq!(inflight.block_header, fixture.block_header);
+        assert_eq!(inflight.parent_header, fixture.parent_header);
+
+        // A running predecessor bound to a fork hash is rejected.
+        set_previous_state(RecursiveProofJobState::Running, true);
+        assert!(store
+            .load_claimed_recursive_proof_job_inputs_with_running_predecessor(fixture.claimed)
+            .is_err());
+
+        // A pending predecessor is rejected even by the pipelined loader.
+        set_previous_state(RecursiveProofJobState::Pending, true);
+        assert!(store
+            .load_claimed_recursive_proof_job_inputs_with_running_predecessor(fixture.claimed)
+            .is_err());
+    }
+
+    #[test]
     fn claimed_recursive_proof_input_length_preflight_covers_all_large_records() {
         use crate::consensus::wire_limits::{
             MAX_BLOCK_AUTH_SIDECAR_BYTES, MAX_BLOCK_BYTES, MAX_BLOCK_PROOF_BYTES,
@@ -6924,7 +7216,30 @@ mod tests {
             sidecar: Some(MAX_BLOCK_PROOF_PLUS_SIDECAR_BYTES - MAX_BLOCK_PROOF_BYTES),
             previous_result: Some(RECURSIVE_PROOF_RESULT_HEADER_BYTES),
         };
-        assert!(validate_claimed_recursive_proof_input_lengths(2, valid).is_ok());
+        assert!(validate_claimed_recursive_proof_input_lengths(2, valid, true).is_ok());
+        // The pipelined in-memory predecessor form carries no durable result.
+        assert!(validate_claimed_recursive_proof_input_lengths(
+            2,
+            ClaimedRecursiveProofInputLengths {
+                previous_result: None,
+                ..valid
+            },
+            false,
+        )
+        .is_ok());
+        assert!(validate_claimed_recursive_proof_input_lengths(2, valid, false).is_err());
+        assert!(
+            validate_claimed_recursive_proof_input_lengths(
+                2,
+                ClaimedRecursiveProofInputLengths {
+                    previous_result: None,
+                    ..valid
+                },
+                true,
+            )
+            .is_err(),
+            "a complete predecessor must still present its durable result"
+        );
         for invalid in [
             ClaimedRecursiveProofInputLengths {
                 block: Some(MAX_BLOCK_BYTES + 1),
@@ -6953,7 +7268,7 @@ mod tests {
                 ..valid
             },
         ] {
-            assert!(validate_claimed_recursive_proof_input_lengths(2, invalid).is_err());
+            assert!(validate_claimed_recursive_proof_input_lengths(2, invalid, true).is_err());
         }
         assert!(validate_claimed_recursive_proof_input_lengths(
             2,
@@ -6961,6 +7276,7 @@ mod tests {
                 sidecar: None,
                 ..valid
             },
+            true,
         )
         .is_err());
     }
@@ -7015,7 +7331,9 @@ mod tests {
         assert_eq!(sidecar.as_deref(), Some(b"bounded-sidecar".as_slice()));
         assert_eq!(attestation, None);
 
-        store.put_coverage_attestation(3, b"bounded-attestation").unwrap();
+        store
+            .put_coverage_attestation(3, b"bounded-attestation")
+            .unwrap();
         let (_, _, _, attestation) = store.get_recent_block_bundle_bounded(3).unwrap().unwrap();
         assert_eq!(
             attestation.as_deref(),
@@ -10110,8 +10428,8 @@ mod tests {
                     ),
                 ],
                 dirty_segments: vec![
-                    (0, Some(lower_columns)),
-                    (upper_segment_id, Some(upper_columns)),
+                    (0, Some(std::sync::Arc::new(lower_columns))),
+                    (upper_segment_id, Some(std::sync::Arc::new(upper_columns))),
                 ],
             };
             store

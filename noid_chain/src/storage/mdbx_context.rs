@@ -1059,8 +1059,7 @@ impl MdbxChainContext {
                     "stored header disagrees with the attested coverage height",
                 ));
             }
-            let epoch_anchor_height = (coverage_height
-                / crate::consensus::params::TX_EPOCH_BLOCKS)
+            let epoch_anchor_height = (coverage_height / crate::consensus::params::TX_EPOCH_BLOCKS)
                 * crate::consensus::params::TX_EPOCH_BLOCKS;
             let epoch_anchor_header = match self.recent_headers.get(&epoch_anchor_height) {
                 Some(header) => *header,
@@ -2253,9 +2252,7 @@ mod tests {
 
     /// Test attestation verifier: these fixtures never attach an attestation,
     /// so reaching the verifier means the binding rule itself regressed.
-    fn reject_unexpected_attestation(
-        _claim: &CoverageAttestationClaim<'_>,
-    ) -> Result<(), String> {
+    fn reject_unexpected_attestation(_claim: &CoverageAttestationClaim<'_>) -> Result<(), String> {
         Err("test fixtures do not carry coverage attestations".to_string())
     }
 
@@ -2340,13 +2337,11 @@ mod tests {
         assert_eq!(ctx.tip_height(), 1);
 
         // A rejected (garbage) envelope fails closed without state change.
-        let garbage = apply_coinbase_with_attestation(
-            &mut ctx,
-            &advancing,
-            b"garbage-envelope",
-            |_claim| Err("envelope does not verify".to_string()),
-        )
-        .unwrap_err();
+        let garbage =
+            apply_coinbase_with_attestation(&mut ctx, &advancing, b"garbage-envelope", |_claim| {
+                Err("envelope does not verify".to_string())
+            })
+            .unwrap_err();
         assert!(matches!(
             garbage,
             MdbxContextError::Consensus(ConsensusError::BadCoverageAttestation(_))
@@ -3218,8 +3213,7 @@ mod tests {
         // The replacement branch attests coverage of its own height 1, so the
         // reorg exercises the attestation payload travelling with headers.
         let replacement_attestation = b"replacement-branch-envelope".to_vec();
-        let replacement_two =
-            coinbase_block_with_coverage(&replacement, 10, Address([2u8; 32]), 1);
+        let replacement_two = coinbase_block_with_coverage(&replacement, 10, Address([2u8; 32]), 1);
         apply_coinbase_with_attestation(
             &mut replacement,
             &replacement_two,

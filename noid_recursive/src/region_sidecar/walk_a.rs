@@ -500,48 +500,6 @@ impl WalkARegionSidecarProof {
     pub fn byte_len(&self) -> usize {
         bincode::serialized_size(self).expect("Walk-A sidecar serialized length") as usize
     }
-
-    #[cfg(test)]
-    pub(in crate::region_sidecar) fn into_walk_deferred_parts(
-        self,
-        w_log: usize,
-    ) -> (
-        WalkARegionWalkDeferredProof,
-        noid_ivc_core::deep_chain::DeepChainWalkProof,
-    ) {
-        let WalkAUnionProof {
-            mut selection,
-            mut walk,
-            mut substitution,
-            mut shifts,
-            spine_exposure,
-        } = self.authority;
-        selection.rounds.resize(
-            w_log,
-            [F128::ZERO; noid_ivc_core::deep_chain::relations::RELATION_DEGREE],
-        );
-        substitution.rounds.resize(
-            w_log,
-            [F128::ZERO; noid_ivc_core::deep_chain::relations::RELATION_DEGREE],
-        );
-        for shift in &mut shifts {
-            shift.rounds.resize(w_log, [F128::ZERO; 2]);
-        }
-        for layer in &mut walk.layers {
-            layer
-                .round_coeffs
-                .resize(w_log, [F128::ZERO; noid_ivc_core::deep_chain::WALK_DEGREE]);
-        }
-        (
-            WalkARegionWalkDeferredProof::new(WalkAUnionWalkDeferredProof {
-                selection,
-                substitution,
-                shifts,
-                spine_exposure,
-            }),
-            walk,
-        )
-    }
 }
 
 /// Serializable Walk-A region authority whose deep-chain walk is owned by an
@@ -1416,19 +1374,6 @@ pub(in crate::region_sidecar) mod tests {
 
     fn direct_roundtrip(fixture: &Fixture) -> (WalkARegionVk, Vec<F128>, WalkARegionSidecarProof) {
         direct_roundtrip_with_purpose(fixture, [fixture.w_log() as u8; 32])
-    }
-
-    pub(in crate::region_sidecar) fn composite_decode_fixture(
-        meta: bool,
-        purpose: [u8; 32],
-    ) -> (WalkARegionVk, usize, WalkARegionSidecarProof) {
-        let fixture = if meta {
-            meta_fixture(true, true)
-        } else {
-            wallet_fixture()
-        };
-        let (vk, z, proof) = direct_roundtrip_with_purpose(&fixture, purpose);
-        (vk, z.len().trailing_zeros() as usize, proof)
     }
 
     struct AuthorityCase {

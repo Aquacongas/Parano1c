@@ -3,6 +3,9 @@
 //! ZClaims, and verifies the PCS openings at those points against the
 //! witness commitment.
 
+use std::cell::Cell;
+use std::sync::{Condvar, Mutex, OnceLock, PoisonError};
+
 use crate::challenger::Challenger;
 use crate::field::F128;
 use crate::lincheck::{self, QuirkyPoint};
@@ -107,33 +110,168 @@ impl<Ch: Challenger> Challenger for FieldPostCommitVerifierContext<'_, Ch> {
     }
 }
 
-/// Dedicated single-thread rayon pool that the verifier runs inside.
-///
-/// The verifier is intentionally single-threaded — matching the convention of
-/// comparable provers (binius64, plonky3, hashcaster all ship serial
-/// verifiers) and keeping reported verify times honest single-core numbers.
-/// The verify path shares several `par_*` helpers with the (multi-threaded)
-/// prover — e.g. `lincheck::fold_alpha_batched`, `sumcheck_bind_top_in_place_par`,
-/// and the Ligerito residual eval — so rather than fork every shared helper, the
-/// reusable verify cores (`verify_core`, `verify_claims`, `verify_claims_ligerito`)
-/// run their body via `verifier_pool().install(..)`. Any `par_iter` reached from
-/// there uses this 1-thread pool and collapses onto a single worker, without
-/// touching the prover's use of the global pool.
-fn verifier_pool() -> &'static rayon::ThreadPool {
-    use std::sync::OnceLock;
-    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
-    POOL.get_or_init(|| {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(1)
-            // The whole verify body runs on this worker — including the deep
-            // recursive Ligerito verifier — so give it an ample stack. A rayon
-            // worker otherwise defaults to ~2 MiB (vs the 8 MiB main thread),
-            // which the recursion overflows.
-            .stack_size(64 * 1024 * 1024)
-            .thread_name(|_| "history-verify".to_string())
-            .build()
-            .expect("build single-thread verifier pool")
-    })
+/// Two bounded verifier lanes. Each proof remains strictly single-threaded,
+/// while the history pipeline may verify B(N+1) and terminal Link(N) without
+/// queueing both independent calls on one process-global worker.
+const VERIFIER_LANES: usize = 2;
+
+#[derive(Clone, Copy)]
+struct ActiveVerifierLane {
+    pool: usize,
+    lane: usize,
+}
+
+thread_local! {
+    // This is only a reentrancy marker on the two persistent pool workers;
+    // pools themselves remain process-global and are never scope-thread local.
+    static ACTIVE_VERIFIER_LANE: Cell<Option<ActiveVerifierLane>> = const { Cell::new(None) };
+    // Production proof workers have a 64-MiB stack and belong to the node's
+    // fixed CPU budget. They execute recursive verification in place instead
+    // of activating one of the compatibility lanes below and exceeding that
+    // process-wide budget. Library callers without such an executor retain
+    // the two bounded large-stack lanes.
+    static BUDGETED_LARGE_STACK_WORKER: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Mark the current worker as belonging to an externally budgeted large-stack
+/// proof pool. This is a low-level executor hook used by `noid_miner` worker
+/// start/exit handlers; ordinary verifier callers must not enable it on a
+/// default-size thread stack.
+#[doc(hidden)]
+pub fn set_budgeted_large_stack_worker(active: bool) {
+    BUDGETED_LARGE_STACK_WORKER.with(|marker| marker.set(active));
+}
+
+struct ActiveVerifierLaneGuard(Option<ActiveVerifierLane>);
+
+impl ActiveVerifierLaneGuard {
+    fn enter(pool: usize, lane: usize) -> Self {
+        Self(
+            ACTIVE_VERIFIER_LANE
+                .with(|active| active.replace(Some(ActiveVerifierLane { pool, lane }))),
+        )
+    }
+}
+
+impl Drop for ActiveVerifierLaneGuard {
+    fn drop(&mut self) {
+        ACTIVE_VERIFIER_LANE.with(|active| active.set(self.0));
+    }
+}
+
+struct VerifierPools {
+    lanes: [rayon::ThreadPool; VERIFIER_LANES],
+    busy: Mutex<[bool; VERIFIER_LANES]>,
+    available: Condvar,
+    #[cfg(test)]
+    wait_observer: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+}
+
+struct VerifierLaneLease<'a> {
+    pools: &'a VerifierPools,
+    lane: usize,
+}
+
+impl Drop for VerifierLaneLease<'_> {
+    fn drop(&mut self) {
+        let mut busy = self
+            .pools
+            .busy
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        busy[self.lane] = false;
+        self.pools.available.notify_one();
+    }
+}
+
+impl VerifierPools {
+    fn new() -> Self {
+        let lanes = std::array::from_fn(|lane| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                // The deep recursive Ligerito verifier needs more than the
+                // default ~2 MiB worker stack. Stack pages remain demand-paged.
+                .stack_size(64 * 1024 * 1024)
+                .thread_name(move |_| format!("history-verify-{lane}"))
+                .build()
+                .expect("build single-thread verifier lane")
+        });
+        Self {
+            lanes,
+            busy: Mutex::new([false; VERIFIER_LANES]),
+            available: Condvar::new(),
+            #[cfg(test)]
+            wait_observer: Mutex::new(None),
+        }
+    }
+
+    fn acquire(&self) -> VerifierLaneLease<'_> {
+        let mut busy = self.busy.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            if let Some(lane) = busy.iter().position(|occupied| !*occupied) {
+                busy[lane] = true;
+                return VerifierLaneLease { pools: self, lane };
+            }
+            #[cfg(test)]
+            if let Some(observer) = self
+                .wait_observer
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_ref()
+            {
+                // An unbounded test channel cannot block while `busy` is held.
+                let _ = observer.send(());
+            }
+            busy = self
+                .available
+                .wait(busy)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    fn install<OP, R>(&self, op: OP) -> R
+    where
+        OP: FnOnce() -> R + Send,
+        R: Send,
+    {
+        let pool_id = self as *const Self as usize;
+        let active = ACTIVE_VERIFIER_LANE.with(std::cell::Cell::get);
+        if let Some(active) = active.filter(|active| active.pool == pool_id) {
+            // A post-commit callback may recursively invoke a verifier. Reuse
+            // its current one-thread lane exactly as the former single pool did.
+            return self.lanes[active.lane].install(op);
+        }
+
+        let lease = self.acquire();
+        let lane = lease.lane;
+        self.lanes[lane].install(move || {
+            // The lane worker, rather than a possibly-helping caller from a
+            // different Rayon pool, must own the lease.  A cross-pool
+            // `ThreadPool::install` lets its caller execute other local jobs
+            // while it waits; retaining leases on that caller's nested stack
+            // can otherwise consume both lanes before a third job blocks it,
+            // preventing either completed lane from being released.
+            let _lease = lease;
+            let _active = ActiveVerifierLaneGuard::enter(pool_id, lane);
+            op()
+        })
+    }
+}
+
+fn verifier_pools() -> &'static VerifierPools {
+    static POOLS: OnceLock<VerifierPools> = OnceLock::new();
+    POOLS.get_or_init(VerifierPools::new)
+}
+
+fn install_verifier<OP, R>(op: OP) -> R
+where
+    OP: FnOnce() -> R + Send,
+    R: Send,
+{
+    if BUDGETED_LARGE_STACK_WORKER.with(Cell::get) {
+        return op();
+    }
+    verifier_pools().install(op)
 }
 
 pub fn verify<Ch: Challenger>(
@@ -202,8 +340,8 @@ pub fn verify_claims_ligerito<Ch: Challenger>(
     pcs_params: &crate::pcs::PcsParams,
     challenger: &mut Ch,
 ) -> Result<(), pcs::VerifyError> {
-    // Verification is single-threaded; run the body on the dedicated 1-thread pool.
-    verifier_pool().install(move || {
+    // Verification is single-threaded; run the body on one bounded verifier lane.
+    install_verifier(move || {
         verify_claims_ligerito_inner(commitment, claims, pcs_open, pcs_params, challenger)
     })
 }
@@ -257,8 +395,8 @@ pub fn verify_core<Ch: Challenger>(
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     challenger: &mut Ch,
 ) -> Result<(ZClaim, ZClaim), VerifyError> {
-    // Verification is single-threaded; run the body on the dedicated 1-thread pool.
-    verifier_pool().install(move || {
+    // Verification is single-threaded; run the body on one bounded verifier lane.
+    install_verifier(move || {
         verify_core_inner(
             r1cs,
             zerocheck_proof,
@@ -378,8 +516,8 @@ pub fn verify_claims<Ch: Challenger>(
     pcs_open: &pcs::BatchOpeningProof,
     challenger: &mut Ch,
 ) -> Result<(), pcs::VerifyError> {
-    // Verification is single-threaded; run the body on the dedicated 1-thread pool.
-    verifier_pool().install(move || verify_claims_inner(commitment, claims, pcs_open, challenger))
+    // Verification is single-threaded; run the body on one bounded verifier lane.
+    install_verifier(move || verify_claims_inner(commitment, claims, pcs_open, challenger))
 }
 
 fn verify_claims_inner<Ch: Challenger>(
@@ -404,14 +542,14 @@ fn verify_claims_inner<Ch: Challenger>(
 
 /// Verify a **FieldR1cs** proof: field zerocheck → shared lincheck
 /// (coefficient-carrying circuit) → batched quirky-direct PCS opening.
-/// Structural mirror of [`verify`]; same single-threaded pool policy.
+/// Structural mirror of [`verify`]; same single-thread-per-call lane policy.
 pub fn verify_field<Ch: Challenger>(
     r1cs: &crate::field_r1cs::FieldR1cs,
     commitment: &Commitment,
     proof: &crate::proof::FieldR1csProof,
     challenger: &mut Ch,
 ) -> Result<R1csClaim, VerifyError> {
-    verifier_pool().install(move || {
+    install_verifier(move || {
         verify_field_inner(r1cs, commitment, proof, None, challenger, |_, _| {
             Ok(Vec::new())
         })
@@ -432,7 +570,7 @@ pub fn verify_field_with_public_io<Ch: Challenger>(
     io: &[crate::field::F128],
     challenger: &mut Ch,
 ) -> Result<R1csClaim, VerifyError> {
-    verifier_pool().install(move || {
+    install_verifier(move || {
         verify_field_inner(
             r1cs,
             commitment,
@@ -466,7 +604,7 @@ where
     Aux: Sync,
     PostCommit: FnOnce(&Aux, &mut Ch) -> Result<Vec<pcs::QuirkyDirectClaim>, VerifyError> + Send,
 {
-    verifier_pool().install(move || {
+    install_verifier(move || {
         verify_field_inner(
             r1cs,
             commitment,
@@ -501,7 +639,7 @@ where
     PostCommit:
         FnOnce(&Aux, &mut FieldPostCommitVerifierContext<'_, Ch>) -> Result<(), VerifyError> + Send,
 {
-    verifier_pool().install(move || {
+    install_verifier(move || {
         verify_field_inner(
             r1cs,
             commitment,
@@ -538,7 +676,7 @@ pub fn verify_field_deferred_matrix<Ch: Challenger>(
     io: &[crate::field::F128],
     challenger: &mut Ch,
 ) -> Result<(R1csClaim, crate::matrix_claim::FreshLincheckClaim), VerifyError> {
-    verifier_pool().install(move || {
+    install_verifier(move || {
         verify_field_deferred_matrix_inner(
             shape,
             statement_digest,
@@ -572,7 +710,7 @@ where
     Aux: Sync,
     PostCommit: FnOnce(&Aux, &mut Ch) -> Result<Vec<pcs::QuirkyDirectClaim>, VerifyError> + Send,
 {
-    verifier_pool().install(move || {
+    install_verifier(move || {
         verify_field_deferred_matrix_inner(
             shape,
             statement_digest,
@@ -609,7 +747,7 @@ where
     PostCommit:
         FnOnce(&Aux, &mut FieldPostCommitVerifierContext<'_, Ch>) -> Result<(), VerifyError> + Send,
 {
-    verifier_pool().install(move || {
+    install_verifier(move || {
         verify_field_deferred_matrix_inner(
             shape,
             statement_digest,
@@ -848,18 +986,171 @@ fn verify_field_inner<Ch: Challenger>(
 mod tests {
     use crate::field_r1cs::{FieldRowCircuit, synthetic_satisfiable};
 
-    /// The verifier is intentionally single-threaded: every `par_*` reached
-    /// from a verify core must collapse onto the one-thread `verifier_pool`.
-    /// Guard the invariant so a future `ThreadPoolBuilder` tweak can't silently
-    /// re-parallelize verification.
+    /// Every individual verifier remains single-threaded even though two
+    /// independent calls may occupy the bounded lane set concurrently.
     ///
     /// (The end-to-end prove → verify roundtrip and tamper-rejection tests live
     /// in `noid-ivc-prover`'s `tests/verifier_roundtrip.rs`, since they need the
     /// prove path.)
     #[test]
-    fn verifier_pool_is_single_threaded() {
-        let n = super::verifier_pool().install(rayon::current_num_threads);
-        assert_eq!(n, 1, "verifier_pool must have exactly one worker thread");
+    fn each_verifier_lane_is_single_threaded() {
+        let pools = super::VerifierPools::new();
+        let n = pools.install(rayon::current_num_threads);
+        assert_eq!(n, 1, "each verifier lane must have exactly one worker");
+    }
+
+    #[test]
+    fn verifier_lanes_admit_two_calls_and_bound_the_third() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        let pools = std::sync::Arc::new(super::VerifierPools::new());
+        let entered = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let first_two_entered = Arc::new(Barrier::new(3));
+        let release_first_two = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+        for _ in 0..3 {
+            let pools = Arc::clone(&pools);
+            let entered = Arc::clone(&entered);
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            let first_two_entered = Arc::clone(&first_two_entered);
+            let release_first_two = Arc::clone(&release_first_two);
+            workers.push(std::thread::spawn(move || {
+                pools.install(|| {
+                    assert_eq!(rayon::current_num_threads(), 1);
+                    let ticket = entered.fetch_add(1, Ordering::AcqRel);
+                    let now = active.fetch_add(1, Ordering::AcqRel) + 1;
+                    peak.fetch_max(now, Ordering::AcqRel);
+                    if ticket < 2 {
+                        first_two_entered.wait();
+                        release_first_two.wait();
+                    }
+                    active.fetch_sub(1, Ordering::AcqRel);
+                });
+            }));
+        }
+
+        first_two_entered.wait();
+        assert_eq!(entered.load(Ordering::Acquire), 2);
+        assert_eq!(active.load(Ordering::Acquire), 2);
+        release_first_two.wait();
+        for worker in workers {
+            worker.join().expect("bounded verifier worker");
+        }
+        assert_eq!(entered.load(Ordering::Acquire), 3);
+        assert_eq!(active.load(Ordering::Acquire), 0);
+        assert_eq!(peak.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn cross_rayon_pool_caller_cannot_retain_completed_lane_leases() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Condvar, Mutex, mpsc};
+        use std::time::Duration;
+
+        let pools = Arc::new(super::VerifierPools::new());
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let entered = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (waiting_tx, waiting_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        *pools.wait_observer.lock().unwrap() = Some(waiting_tx);
+
+        let runner_pools = Arc::clone(&pools);
+        let runner_release = Arc::clone(&release);
+        let runner_entered = Arc::clone(&entered);
+        let runner = std::thread::spawn(move || {
+            let caller_pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("build cross-pool verifier caller");
+            caller_pool.install(move || {
+                rayon::scope(|scope| {
+                    for _ in 0..3 {
+                        let pools = Arc::clone(&runner_pools);
+                        let release = Arc::clone(&runner_release);
+                        let entered = Arc::clone(&runner_entered);
+                        let entered_tx = entered_tx.clone();
+                        scope.spawn(move |_| {
+                            pools.install(move || {
+                                let ticket = entered.fetch_add(1, Ordering::AcqRel);
+                                if ticket < 2 {
+                                    let _ = entered_tx.send(ticket);
+                                    let (released, available) = &*release;
+                                    let mut released = released.lock().unwrap();
+                                    while !*released {
+                                        released = available.wait(released).unwrap();
+                                    }
+                                }
+                            });
+                        });
+                    }
+                });
+            });
+            let _ = done_tx.send(());
+        });
+
+        let timeout = Duration::from_secs(5);
+        let first_two_entered =
+            entered_rx.recv_timeout(timeout).is_ok() && entered_rx.recv_timeout(timeout).is_ok();
+        // `acquire` emits this only while all lanes are busy and immediately
+        // before the third install atomically releases `busy` in Condvar::wait.
+        // Waiting for it makes the old caller-owned-lease deadlock deterministic.
+        let third_is_waiting = waiting_rx.recv_timeout(timeout).is_ok();
+        // Always release any lane closures that did enter, even if the setup
+        // assertion failed, so this regression cannot strand its own workers.
+        {
+            let (released, available) = &*release;
+            *released.lock().unwrap() = true;
+            available.notify_all();
+        }
+
+        let completed = done_rx.recv_timeout(timeout).is_ok();
+        if !completed {
+            // Cleanup for the exact old failure mode: its completed lane jobs
+            // left both permits on the blocked caller's nested stack.  Waking
+            // the third install lets the detached Rayon stack unwind, so a
+            // regression fails by assertion rather than hanging the test run.
+            let mut busy = pools.busy.lock().unwrap();
+            busy.fill(false);
+            pools.available.notify_all();
+        }
+        let joined = runner.join();
+
+        assert!(first_two_entered, "two verifier lanes did not overlap");
+        assert!(third_is_waiting, "third verifier install did not wait");
+        assert!(
+            completed,
+            "completed lane jobs retained their leases on a cross-pool caller"
+        );
+        joined.expect("cross-pool verifier caller");
+        assert_eq!(entered.load(Ordering::Acquire), 3);
+    }
+
+    #[test]
+    fn verifier_lane_is_reentrant_and_panic_releases_lease() {
+        let pools = super::VerifierPools::new();
+        let (outer, inner) = pools.install(|| {
+            let outer = super::ACTIVE_VERIFIER_LANE
+                .with(std::cell::Cell::get)
+                .expect("outer verifier lane");
+            let inner = pools.install(|| {
+                super::ACTIVE_VERIFIER_LANE
+                    .with(std::cell::Cell::get)
+                    .expect("nested verifier lane")
+            });
+            (outer.lane, inner.lane)
+        });
+        assert_eq!(outer, inner, "nested verifier must reuse its lane");
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pools.install(|| panic!("synthetic verifier panic"));
+        }));
+        assert!(panic.is_err());
+        assert_eq!(pools.install(|| 7), 7, "panic leaked a verifier lease");
     }
 
     /// Production field verification must borrow the canonical CSR matrices;

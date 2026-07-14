@@ -139,8 +139,8 @@ pub(super) fn multi_walk_proof_shape(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum SidecarProofShape {
+    #[cfg(test)]
     Fixed(FixedProofShape),
-    Merkle(MerkleProofShape),
     DeferredFixed(DeferredFixedProofShape),
     DeferredMerkle(DeferredMerkleProofShape),
     MultiWalk(MultiWalkProofShape),
@@ -409,6 +409,7 @@ pub(super) fn preflight_merkle_proof(
     cursor.finish()
 }
 
+#[cfg(test)]
 pub(super) fn preflight_deferred_merkle_proof(
     bytes: &[u8],
     shape: &DeferredMerkleProofShape,
@@ -422,6 +423,7 @@ pub(super) fn preflight_deferred_merkle_proof(
     cursor.finish()
 }
 
+#[cfg(test)]
 pub(super) fn preflight_multi_walk_proof(
     bytes: &[u8],
     shape: &MultiWalkProofShape,
@@ -727,10 +729,8 @@ fn scan_composite_proof(
     }
     for child in children {
         match child {
+            #[cfg(test)]
             SidecarProofShape::Fixed(shape) => scan_fixed_proof_body(&mut cursor, shape, observe)?,
-            SidecarProofShape::Merkle(shape) => {
-                scan_merkle_proof_body(&mut cursor, shape, observe)?
-            }
             SidecarProofShape::DeferredFixed(shape) => {
                 scan_deferred_fixed_proof_body(&mut cursor, shape, observe)?
             }
@@ -793,8 +793,8 @@ pub(super) fn sidecar_proof_encoded_len(
     shape: &SidecarProofShape,
 ) -> Result<usize, RegionSidecarError> {
     match shape {
+        #[cfg(test)]
         SidecarProofShape::Fixed(shape) => fixed_proof_encoded_len(shape),
-        SidecarProofShape::Merkle(shape) => merkle_proof_encoded_len(shape),
         SidecarProofShape::DeferredFixed(shape) => deferred_fixed_proof_encoded_len(shape),
         SidecarProofShape::DeferredMerkle(shape) => deferred_merkle_proof_encoded_len(shape),
         SidecarProofShape::MultiWalk(shape) => multi_walk_proof_encoded_len(shape),

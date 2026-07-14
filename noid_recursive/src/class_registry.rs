@@ -31,10 +31,7 @@ use crate::acceptance::trace::r_pcs_region::{
     derive_link_r_prev_recording_layout,
 };
 use crate::acceptance::trace::region_source_binding::pack_recording_only_blocks;
-use crate::region_sidecar::{
-    derive_block_sidecar_recording_layout, RecordingDuplexRegionVk,
-};
-use noid_ivc_core::deep_chain::schedule::DuplexLayout;
+use crate::region_sidecar::{derive_block_sidecar_recording_layout, RecordingDuplexRegionVk};
 use crate::region_sidecar::{
     selected_zk_block_post_commit_class_digest_from_vk_digest,
     selected_zk_block_vk_digest_from_child_digests, BlockRegionSidecarVk,
@@ -51,6 +48,7 @@ use crate::selected_history::{
     SelectedHistoryCodecError, SelectedHistoryRegistryError, SelectedHistoryTerminalPackage,
     ValidatedSelectedHistoryRegistryIdentities, MAX_SELECTED_HISTORY_TERMINAL_PACKAGE_BYTES,
 };
+use noid_ivc_core::deep_chain::schedule::DuplexLayout;
 
 pub const SELECTED_RECURSIVE_CLASS_REGISTRY_VERSION: u16 = 2;
 pub const MAX_SELECTED_RECURSIVE_CLASS_REGISTRY_BYTES: usize = 4 * 1024 * 1024;
@@ -126,6 +124,15 @@ pub struct OwnedSelectedRecursiveTerminalRegistry {
 impl OwnedSelectedRecursiveTerminalRegistry {
     pub fn descriptor(&self) -> &CanonicalSplitLinkLadder {
         &self.descriptor
+    }
+
+    /// Statement identity of the one canonical bootstrap Link matrix.
+    ///
+    /// Keep the relay-only classes private: their prover-only capabilities are
+    /// deliberately absent after terminal materialization, while embedded-pack
+    /// prewarming needs only this narrow immutable identity.
+    pub fn genesis_link_matrix_digest(&self) -> [u8; 32] {
+        self.link_classes[0].genesis_digest
     }
 
     /// Cheap borrowed verifier view over the one-pass pinned materialization.
@@ -443,6 +450,74 @@ pub fn decode_selected_recursive_terminal_registry_pinned(
     materialize_terminal_registry(wire)
 }
 
+/// Materialize the exact registry payload already authenticated by the
+/// release build which embedded it in the executable.
+///
+/// Unlike the filesystem decoder this does not hash the body, run the
+/// allocation preflight, or compare the release pin again. It only decodes
+/// the trusted wire representation into the runtime objects used by proving.
+///
+/// # Safety
+///
+/// `bytes` must be the exact immutable registry payload for which the same
+/// build successfully ran [`decode_selected_recursive_class_registry_pinned`]
+/// with the release pin before embedding it.
+#[doc(hidden)]
+pub unsafe fn decode_selected_recursive_class_registry_build_authenticated(
+    bytes: &[u8],
+) -> Result<OwnedSelectedRecursiveClassRegistry, SelectedRecursiveClassRegistryError> {
+    let body = build_authenticated_registry_body(bytes)?;
+    // SAFETY: inherited from this function's contract.
+    unsafe { materialize_registry_build_authenticated(decode_registry_body(body)?) }
+}
+
+/// Terminal-only twin of
+/// [`decode_selected_recursive_class_registry_build_authenticated`].
+///
+/// # Safety
+///
+/// `bytes` must be the exact immutable registry payload for which the same
+/// build successfully ran
+/// [`decode_selected_recursive_terminal_registry_pinned`] before embedding it.
+#[doc(hidden)]
+pub unsafe fn decode_selected_recursive_terminal_registry_build_authenticated(
+    bytes: &[u8],
+) -> Result<OwnedSelectedRecursiveTerminalRegistry, SelectedRecursiveClassRegistryError> {
+    let body = build_authenticated_registry_body(bytes)?;
+    // SAFETY: inherited from this function's contract.
+    unsafe { materialize_terminal_registry_build_authenticated(decode_registry_body(body)?) }
+}
+
+/// Extract the already-authenticated body without hashing or semantic
+/// preflight. Cheap length arithmetic remains so an unsafe contract violation
+/// is reported instead of turning into an indexing panic.
+fn build_authenticated_registry_body(
+    bytes: &[u8],
+) -> Result<&[u8], SelectedRecursiveClassRegistryError> {
+    if bytes.len() < REGISTRY_HEADER_BYTES + REGISTRY_TRAILER_BYTES {
+        return Err(SelectedRecursiveClassRegistryError::Truncated);
+    }
+    let body_len_offset = REGISTRY_MAGIC.len() + 2;
+    let body_len = u64::from_le_bytes(
+        bytes[body_len_offset..body_len_offset + 8]
+            .try_into()
+            .expect("fixed registry body length field"),
+    );
+    let body_len = usize::try_from(body_len)
+        .map_err(|_| SelectedRecursiveClassRegistryError::LengthOverflow)?;
+    let expected = REGISTRY_HEADER_BYTES
+        .checked_add(body_len)
+        .and_then(|value| value.checked_add(REGISTRY_TRAILER_BYTES))
+        .ok_or(SelectedRecursiveClassRegistryError::LengthOverflow)?;
+    if expected != bytes.len() {
+        return Err(SelectedRecursiveClassRegistryError::LengthMismatch {
+            expected,
+            actual: bytes.len(),
+        });
+    }
+    Ok(&bytes[REGISTRY_HEADER_BYTES..REGISTRY_HEADER_BYTES + body_len])
+}
+
 /// Explicitly unpinned decoder for offline release generation and inspection.
 ///
 /// Runtime verification must use
@@ -720,10 +795,8 @@ fn materialize_registry(
         wire.descriptor_pcs,
         wire.descriptor_slots
             .iter()
-            .zip(&rec_layouts)
-            .map(|(slot, (child, r_b))| {
-                ladder_slot_with_layout(slot, child.clone(), r_b.clone())
-            })
+            .zip(rec_layouts)
+            .map(|(slot, (child, r_b))| ladder_slot_with_layout(slot, child, r_b))
             .collect(),
     )?;
     for (slot, (info, block)) in descriptor.slots().iter().zip(&blocks).enumerate() {
@@ -758,6 +831,7 @@ fn materialize_registry(
         ));
     }
     let genesis_envelope = Arc::new(package.into_terminal_envelope());
+    let universal_geometry = descriptor.materialize_universal_geometry()?;
 
     let links_vec = wire
         .links
@@ -776,6 +850,7 @@ fn materialize_registry(
             }
             SplitLinkClass::from_selected_registry_parts(
                 &descriptor,
+                Arc::clone(&universal_geometry),
                 slot,
                 &blocks[slot],
                 link.shape,
@@ -853,10 +928,8 @@ fn materialize_terminal_registry(
         wire.descriptor_pcs,
         wire.descriptor_slots
             .iter()
-            .zip(&terminal_rec_layouts)
-            .map(|(slot, (child, r_b))| {
-                ladder_slot_with_layout(slot, child.clone(), r_b.clone())
-            })
+            .zip(terminal_rec_layouts)
+            .map(|(slot, (child, r_b))| ladder_slot_with_layout(slot, child, r_b))
             .collect(),
     )?;
     for (slot, (info, block)) in descriptor.slots().iter().zip(&wire.blocks).enumerate() {
@@ -931,6 +1004,7 @@ fn materialize_terminal_registry(
         ));
     }
     let genesis_envelope = Arc::new(package.into_terminal_envelope());
+    let universal_geometry = descriptor.materialize_universal_geometry()?;
 
     let links_vec = wire
         .links
@@ -951,6 +1025,7 @@ fn materialize_terminal_registry(
             }
             SplitLinkClass::from_selected_terminal_registry_parts(
                 &descriptor,
+                Arc::clone(&universal_geometry),
                 slot,
                 link.shape,
                 link.pcs,
@@ -989,6 +1064,221 @@ fn materialize_terminal_registry(
                 source,
             })?;
     }
+    Ok(OwnedSelectedRecursiveTerminalRegistry {
+        descriptor,
+        link_classes: links,
+        selected_history_identities,
+    })
+}
+
+/// Runtime assembly for the exact registry body already accepted by both
+/// strict release-build decoders. This creates the objects proving needs but
+/// deliberately performs no second class/ladder/Genesis verification.
+///
+/// # Safety
+///
+/// `wire` must be decoded from the exact immutable registry bytes validated
+/// and embedded by the current release build.
+unsafe fn materialize_registry_build_authenticated(
+    wire: RegistryWire,
+) -> Result<OwnedSelectedRecursiveClassRegistry, SelectedRecursiveClassRegistryError> {
+    let RegistryWire {
+        blocks: block_wires,
+        descriptor_shape,
+        descriptor_pcs,
+        descriptor_slots,
+        link_vk,
+        links: link_wires,
+        genesis_package,
+    } = wire;
+    let link_class_digests = std::array::from_fn(|slot| link_wires[slot].matrix_digest);
+    let link_post_commit_class_digests =
+        std::array::from_fn(|slot| link_wires[slot].post_commit_digest);
+
+    let blocks_vec = block_wires
+        .into_iter()
+        .enumerate()
+        .map(|(slot, block)| {
+            // SAFETY: inherited from this materializer's contract.
+            unsafe { materialize_block_build_authenticated(slot, block) }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let blocks: [BlockClass; CLASS_COUNT] = blocks_vec
+        .try_into()
+        .map_err(|_| SelectedRecursiveClassRegistryError::InvalidValue("Block count"))?;
+
+    let rec_layouts = derived_recording_layouts(&blocks)?;
+    // SAFETY: descriptor fields are from the build-validated wire.
+    let descriptor = unsafe {
+        CanonicalSplitLinkLadder::from_build_authenticated_parts(
+            descriptor_shape,
+            descriptor_pcs,
+            descriptor_slots
+                .iter()
+                .zip(rec_layouts)
+                .map(|(slot, (child, r_b))| ladder_slot_with_layout(slot, child, r_b))
+                .collect(),
+        )?
+    };
+    // SAFETY: the Link VK wire and derived recording layouts were accepted
+    // together by the strict release-build decoder.
+    let sidecar_vk = Arc::new(unsafe {
+        materialize_link_vk_build_authenticated(link_vk, &full_recording_layouts(&descriptor)?)?
+    });
+    // Proving height zero needs the envelope object, but its proof was already
+    // verified by the release build. Runtime performs bounded decoding only.
+    let genesis_envelope = Arc::new(
+        decode_selected_history_terminal_package(&genesis_package)?.into_terminal_envelope(),
+    );
+    let universal_geometry = descriptor.materialize_universal_geometry()?;
+
+    let links_vec = link_wires
+        .into_iter()
+        .enumerate()
+        .map(|(slot, link)| {
+            // SAFETY: all class fields share the exact build-validated body.
+            Ok::<_, SelectedRecursiveClassRegistryError>(unsafe {
+                SplitLinkClass::from_build_authenticated_registry_parts(
+                    &descriptor,
+                    Arc::clone(&universal_geometry),
+                    slot,
+                    link.shape,
+                    link.pcs,
+                    link.spec,
+                    link.matrix_digest,
+                    link.post_commit_digest,
+                    link.genesis_digest,
+                    link.genesis_post_commit_digest,
+                    Arc::clone(&sidecar_vk),
+                    Some(Arc::clone(&genesis_envelope)),
+                    link.b_spec,
+                    link.b_pcs,
+                    Some(blocks[slot].sidecar_vk_arc()),
+                    link.b_sidecar_vk_digest,
+                    link.b_post_commit_digest,
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let links: [SplitLinkClass; CLASS_COUNT] = links_vec
+        .try_into()
+        .map_err(|_| SelectedRecursiveClassRegistryError::InvalidValue("Link count"))?;
+    // SAFETY: these tables are copied from the same strict build-validated
+    // Link wires used above.
+    let selected_history_identities = unsafe {
+        ValidatedSelectedHistoryRegistryIdentities::from_build_authenticated_tables(
+            link_class_digests,
+            link_post_commit_class_digests,
+        )
+    };
+    Ok(OwnedSelectedRecursiveClassRegistry {
+        block_classes: blocks,
+        descriptor,
+        link_classes: links,
+        selected_history_identities,
+    })
+}
+
+/// Terminal-only runtime assembly for build-authenticated registry bytes. It
+/// never decodes, verifies, retains, or subsequently discards the Genesis
+/// proof; relay verification needs only its already-validated identities.
+///
+/// # Safety
+///
+/// `wire` must be decoded from the exact immutable registry bytes validated
+/// and embedded by the current release build.
+unsafe fn materialize_terminal_registry_build_authenticated(
+    wire: RegistryWire,
+) -> Result<OwnedSelectedRecursiveTerminalRegistry, SelectedRecursiveClassRegistryError> {
+    let RegistryWire {
+        blocks,
+        descriptor_shape,
+        descriptor_pcs,
+        descriptor_slots,
+        link_vk,
+        links: link_wires,
+        genesis_package: _,
+    } = wire;
+    let link_class_digests = std::array::from_fn(|slot| link_wires[slot].matrix_digest);
+    let link_post_commit_class_digests =
+        std::array::from_fn(|slot| link_wires[slot].post_commit_digest);
+
+    let terminal_rec_layouts = blocks
+        .iter()
+        .map(|block| {
+            let vk =
+                BlockRegionSidecarVk::from_selected_registry_slices(block.tier, block.vk_slices)?;
+            let child = derive_block_sidecar_recording_layout(&vk, block.shape.m)
+                .map_err(SelectedRecursiveClassRegistryError::Region)?;
+            let r_b = derive_link_r_b_recording_layout(
+                &block.shape,
+                &block.spec,
+                &block.pcs,
+                &block.matrix_digest,
+                &block.post_commit_digest,
+                &vk,
+            )
+            .map_err(SelectedRecursiveClassRegistryError::Region)?;
+            Ok((child, r_b))
+        })
+        .collect::<Result<Vec<_>, SelectedRecursiveClassRegistryError>>()?;
+    // SAFETY: descriptor fields are from the build-validated wire.
+    let descriptor = unsafe {
+        CanonicalSplitLinkLadder::from_build_authenticated_parts(
+            descriptor_shape,
+            descriptor_pcs,
+            descriptor_slots
+                .iter()
+                .zip(terminal_rec_layouts)
+                .map(|(slot, (child, r_b))| ladder_slot_with_layout(slot, child, r_b))
+                .collect(),
+        )?
+    };
+    // SAFETY: the Link VK wire and derived layouts were accepted together by
+    // the strict build decoder.
+    let sidecar_vk = Arc::new(unsafe {
+        materialize_link_vk_build_authenticated(link_vk, &full_recording_layouts(&descriptor)?)?
+    });
+    let universal_geometry = descriptor.materialize_universal_geometry()?;
+    let links_vec = link_wires
+        .into_iter()
+        .enumerate()
+        .map(|(slot, link)| {
+            // SAFETY: all class fields share the exact build-validated body.
+            Ok::<_, SelectedRecursiveClassRegistryError>(unsafe {
+                SplitLinkClass::from_build_authenticated_registry_parts(
+                    &descriptor,
+                    Arc::clone(&universal_geometry),
+                    slot,
+                    link.shape,
+                    link.pcs,
+                    link.spec,
+                    link.matrix_digest,
+                    link.post_commit_digest,
+                    link.genesis_digest,
+                    link.genesis_post_commit_digest,
+                    Arc::clone(&sidecar_vk),
+                    None,
+                    link.b_spec,
+                    link.b_pcs,
+                    None,
+                    link.b_sidecar_vk_digest,
+                    link.b_post_commit_digest,
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let links: [SplitLinkClass; CLASS_COUNT] = links_vec
+        .try_into()
+        .map_err(|_| SelectedRecursiveClassRegistryError::InvalidValue("Link count"))?;
+    // SAFETY: these tables are copied from the same strict build-validated
+    // Link wires used above.
+    let selected_history_identities = unsafe {
+        ValidatedSelectedHistoryRegistryIdentities::from_build_authenticated_tables(
+            link_class_digests,
+            link_post_commit_class_digests,
+        )
+    };
     Ok(OwnedSelectedRecursiveTerminalRegistry {
         descriptor,
         link_classes: links,
@@ -1115,6 +1405,31 @@ fn materialize_block(
     .map_err(|source| SelectedRecursiveClassRegistryError::Block { slot, source })
 }
 
+/// Build the runtime Block VK/tables without recomputing the enclosing class
+/// identity already checked by the release build.
+///
+/// # Safety
+///
+/// `wire` must come from the exact build-authenticated registry body.
+unsafe fn materialize_block_build_authenticated(
+    _slot: usize,
+    wire: BlockWire,
+) -> Result<BlockClass, SelectedRecursiveClassRegistryError> {
+    let vk = BlockRegionSidecarVk::from_selected_registry_slices(wire.tier, wire.vk_slices)?;
+    // SAFETY: inherited from this helper's contract.
+    Ok(unsafe {
+        BlockClass::from_build_authenticated_registry_parts(
+            wire.tier,
+            wire.shape,
+            wire.pcs,
+            wire.spec,
+            wire.matrix_digest,
+            vk,
+            wire.post_commit_digest,
+        )
+    })
+}
+
 fn materialize_link_vk(
     wire: LinkVkWire,
     rec_layouts: &[DuplexLayout],
@@ -1156,11 +1471,7 @@ fn materialize_link_vk(
         wire.rec_purpose,
         rec_w_log,
         wire.rec_slices,
-        rec_layouts
-            .iter()
-            .cloned()
-            .zip(rec_offsets)
-            .collect(),
+        rec_layouts.iter().cloned().zip(rec_offsets).collect(),
     )?;
     if rec.transcript_digest() != wire.rec_digest {
         return Err(SelectedRecursiveClassRegistryError::InvalidValue(
@@ -1174,6 +1485,47 @@ fn materialize_link_vk(
         ));
     }
     Ok(vk)
+}
+
+/// Build the runtime Link VK tables while trusting the transcript identities
+/// already verified by the release build.
+///
+/// # Safety
+///
+/// `wire` and `rec_layouts` must be the exact pair accepted by the strict
+/// build-time registry materialization.
+unsafe fn materialize_link_vk_build_authenticated(
+    wire: LinkVkWire,
+    rec_layouts: &[DuplexLayout],
+) -> Result<LinkRegionSidecarVk, SelectedRecursiveClassRegistryError> {
+    let mut channels = Vec::with_capacity(wire.leaf_subchannels.len());
+    for channel in wire.leaf_subchannels {
+        channels.push(CombinedDuplexSubChannelDescriptor::new(
+            channel.schedule,
+            channel.iv,
+        )?);
+    }
+    let descriptor = CombinedDuplexRegionDescriptor::new(wire.leaf_tx_tile_log, channels)?;
+    let leaf = CombinedDuplexRegionVk::new(wire.leaf_purpose, descriptor, wire.leaf_slices)?;
+    let path = MerkleRegionVk::new(
+        wire.path_purpose,
+        wire.path_w_log,
+        wire.path_slices,
+        wire.path_block_log,
+        wire.path_families,
+    )?;
+    let layout_refs: Vec<&DuplexLayout> = rec_layouts.iter().collect();
+    let (rec_offsets, rec_w_log) = pack_recording_only_blocks(&layout_refs);
+    let rec = RecordingDuplexRegionVk::new(
+        wire.rec_purpose,
+        rec_w_log,
+        wire.rec_slices,
+        rec_layouts.iter().cloned().zip(rec_offsets).collect(),
+    )?;
+    // SAFETY: inherited from this helper's contract.
+    Ok(unsafe {
+        LinkRegionSidecarVk::from_build_authenticated_parts(leaf, path, rec, wire.vk_digest)
+    })
 }
 
 fn same_pcs(left: &PcsParams, right: &PcsParams) -> bool {
@@ -2701,12 +3053,16 @@ mod tests {
     }
 
     /// Exact release-artifact gate.  It is fixture-driven because generating
-    /// the production m24 genesis proof inside a unit test would defeat the
+    /// the production genesis proof inside a unit test would defeat the
     /// low-RAM test contract.  CI/release runs point the variable at the
     /// already-generated canonical registry artifact.
     #[test]
     #[ignore = "set NOID_SELECTED_RECURSIVE_REGISTRY_FIXTURE to a canonical release artifact"]
     fn release_registry_full_encode_to_terminal_pinned_decode_is_equivalent() {
+        assert!(
+            !cfg!(debug_assertions),
+            "a release registry records the 64-query production profile; run this gate with cargo test --release"
+        );
         let path = std::env::var_os("NOID_SELECTED_RECURSIVE_REGISTRY_FIXTURE")
             .expect("NOID_SELECTED_RECURSIVE_REGISTRY_FIXTURE");
         let source = std::fs::read(path).expect("read canonical registry fixture");
@@ -2726,9 +3082,24 @@ mod tests {
             genesis_validations_before + 1,
             "one pinned terminal load must replay the shared genesis proof once"
         );
+        let validations_after_strict =
+            crate::acceptance::split_link::materialized_genesis_proof_validation_count();
+        let fast_full =
+            unsafe { decode_selected_recursive_class_registry_build_authenticated(&encoded) }
+                .expect("build-authenticated full decode");
+        let fast_terminal =
+            unsafe { decode_selected_recursive_terminal_registry_build_authenticated(&encoded) }
+                .expect("build-authenticated terminal decode");
+        assert_eq!(
+            crate::acceptance::split_link::materialized_genesis_proof_validation_count(),
+            validations_after_strict,
+            "build-authenticated runtime materialization must not verify Genesis again"
+        );
 
         let full_view = full.selected_history_registry();
         let terminal_view = terminal.selected_history_registry();
+        let fast_full_view = fast_full.selected_history_registry();
+        let fast_terminal_view = fast_terminal.selected_history_registry();
         assert_eq!(
             full.descriptor().link_shape(),
             terminal.descriptor().link_shape()
@@ -2737,6 +3108,38 @@ mod tests {
             full.descriptor().link_pcs_params(),
             terminal.descriptor().link_pcs_params(),
         ));
+        for class in full.link_classes() {
+            assert!(
+                class.shares_ladder_storage_with_descriptor(full.descriptor()),
+                "full registry descriptor and Link classes must share one ladder allocation"
+            );
+        }
+        for class in &full.link_classes()[1..] {
+            assert!(
+                full.link_classes()[0].shares_ladder_storage_with(class),
+                "full registry Link classes must share one ladder allocation"
+            );
+            assert!(
+                full.link_classes()[0].shares_universal_geometry_with(class),
+                "full registry Link classes must share one universal geometry allocation"
+            );
+        }
+        for class in &terminal.link_classes {
+            assert!(
+                class.shares_ladder_storage_with_descriptor(terminal.descriptor()),
+                "terminal registry descriptor and Link classes must share one ladder allocation"
+            );
+        }
+        for class in &terminal.link_classes[1..] {
+            assert!(
+                terminal.link_classes[0].shares_ladder_storage_with(class),
+                "terminal registry Link classes must share one ladder allocation"
+            );
+            assert!(
+                terminal.link_classes[0].shares_universal_geometry_with(class),
+                "terminal registry Link classes must share one universal geometry allocation"
+            );
+        }
         for slot in 0..CLASS_COUNT {
             assert_eq!(
                 full_view.link_class_digest(slot),
@@ -2747,6 +3150,16 @@ mod tests {
                 full_view.link_post_commit_class_digest(slot),
                 terminal_view.link_post_commit_class_digest(slot),
                 "Link post-commit authority at slot {slot}"
+            );
+            assert_eq!(
+                fast_full_view.link_class_digest(slot),
+                full_view.link_class_digest(slot),
+                "fast full Link matrix authority at slot {slot}"
+            );
+            assert_eq!(
+                fast_terminal_view.link_post_commit_class_digest(slot),
+                terminal_view.link_post_commit_class_digest(slot),
+                "fast terminal Link post-commit authority at slot {slot}"
             );
             let full_link = &full.link_classes()[slot];
             let terminal_link = &terminal.link_classes[slot];
@@ -2773,6 +3186,8 @@ mod tests {
             );
             assert!(full_link.retains_genesis_envelope());
             assert!(!terminal_link.retains_genesis_envelope());
+            assert!(fast_full.link_classes()[slot].retains_genesis_envelope());
+            assert!(!fast_terminal.link_classes[slot].retains_genesis_envelope());
         }
     }
 

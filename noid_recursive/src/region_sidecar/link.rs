@@ -62,8 +62,7 @@ use crate::acceptance::trace::deep_chain::{
     verify_ragged_multi_deep_chain_walk_trace, MultiDeepChainWalkProofTrace,
 };
 use crate::acceptance::trace::r_pcs_region::{
-    link_recordings_purpose, link_r_pcs_leaf_sidecar_purpose,
-    link_r_pcs_path_sidecar_purpose,
+    link_r_pcs_leaf_sidecar_purpose, link_r_pcs_path_sidecar_purpose, link_recordings_purpose,
 };
 use crate::acceptance::trace::self_verify::FieldPostCommitTraceContext;
 use crate::acceptance::trace::FieldR1csBuilder;
@@ -104,6 +103,7 @@ pub struct LinkRegionSidecarVk {
     leaf_a: CombinedDuplexRegionVk,
     path_b: MerkleRegionVk,
     rec_c: RecordingDuplexRegionVk,
+    transcript_digest: [u8; 32],
 }
 
 impl LinkRegionSidecarVk {
@@ -112,13 +112,37 @@ impl LinkRegionSidecarVk {
         path_b: MerkleRegionVk,
         rec_c: RecordingDuplexRegionVk,
     ) -> Result<Self, RegionSidecarError> {
+        let transcript_digest = link_region_sidecar_vk_digest(&leaf_a, &path_b, &rec_c);
         let vk = Self {
             leaf_a,
             path_b,
             rec_c,
+            transcript_digest,
         };
         vk.validate_roles()?;
         Ok(vk)
+    }
+
+    /// Assemble the runtime VK with the digest already verified by the
+    /// release build. Child runtime tables are still materialized, but their
+    /// complete transcript is not rehashed.
+    ///
+    /// # Safety
+    ///
+    /// `transcript_digest` and all children must be the exact values accepted
+    /// together by the strict registry decoder in the embedding build.
+    pub(crate) unsafe fn from_build_authenticated_parts(
+        leaf_a: CombinedDuplexRegionVk,
+        path_b: MerkleRegionVk,
+        rec_c: RecordingDuplexRegionVk,
+        transcript_digest: [u8; 32],
+    ) -> Self {
+        Self {
+            leaf_a,
+            path_b,
+            rec_c,
+            transcript_digest,
+        }
     }
 
     pub fn leaf_a(&self) -> &CombinedDuplexRegionVk {
@@ -134,19 +158,7 @@ impl LinkRegionSidecarVk {
     }
 
     pub fn transcript_digest(&self) -> [u8; 32] {
-        let version = [LINK_REGION_SIDECAR_VERSION];
-        poseidon2b_hash_byte_slices(
-            LINK_REGION_VK_DIGEST_DOMAIN,
-            &[
-                &version,
-                b"leaf-a",
-                &self.leaf_a.transcript_digest(),
-                b"path-b",
-                &self.path_b.transcript_digest(),
-                b"rec-c",
-                &self.rec_c.transcript_digest(),
-            ],
-        )
+        self.transcript_digest
     }
 
     fn validate_roles(&self) -> Result<(), RegionSidecarError> {
@@ -158,6 +170,26 @@ impl LinkRegionSidecarVk {
         }
         Ok(())
     }
+}
+
+fn link_region_sidecar_vk_digest(
+    leaf_a: &CombinedDuplexRegionVk,
+    path_b: &MerkleRegionVk,
+    rec_c: &RecordingDuplexRegionVk,
+) -> [u8; 32] {
+    let version = [LINK_REGION_SIDECAR_VERSION];
+    poseidon2b_hash_byte_slices(
+        LINK_REGION_VK_DIGEST_DOMAIN,
+        &[
+            &version,
+            b"leaf-a",
+            &leaf_a.transcript_digest(),
+            b"path-b",
+            &path_b.transcript_digest(),
+            b"rec-c",
+            &rec_c.transcript_digest(),
+        ],
+    )
 }
 
 /// Stable identity bound at the link Field proof's post-commit boundary.
@@ -255,6 +287,20 @@ impl<'a> LinkRegionProverPlan<'a> {
         z: &[F128],
         challenger: &mut Ch,
     ) -> Result<(LinkRegionSidecarProof, Vec<QuirkyDirectClaim>), RegionSidecarError> {
+        // Env-gated stage timing, mirroring the Block sidecar.  Keeping this
+        // local to the prover plan makes the production transcript and proof
+        // bytes completely independent of whether diagnostics are enabled.
+        let timing = std::env::var_os("NOIDH_SIDECAR_TIMING").is_some();
+        let mut t = std::time::Instant::now();
+        let lap = move |label: &str, t: &mut std::time::Instant| {
+            if timing {
+                eprintln!(
+                    "[link-sidecar] {label}: {:.1} ms",
+                    t.elapsed().as_secs_f64() * 1e3
+                );
+            }
+            *t = std::time::Instant::now();
+        };
         bind_link_vk(challenger, self.vk);
 
         let leaf_plan = CombinedDuplexRegionProverPlan::new(
@@ -272,9 +318,13 @@ impl<'a> LinkRegionProverPlan<'a> {
             self.input.rec_c.s0(),
             self.input.rec_c.s_out(),
         )?;
+        lap("bind + plans", &mut t);
         let leaf_a_prefix = leaf_plan.prove_walk_deferred_prefix(z, challenger)?;
+        lap("leaf-A prefix", &mut t);
         let path_b_prefix = path_plan.prove_walk_deferred_prefix(z, challenger)?;
+        lap("path-B prefix", &mut t);
         let rec_c_prefix = rec_plan.prove_walk_deferred_prefix(z, challenger)?;
+        lap("rec-C prefix", &mut t);
         let groups = vec![
             vec![leaf_a_prefix.group().clone()],
             vec![path_b_prefix.group().clone()],
@@ -282,14 +332,18 @@ impl<'a> LinkRegionProverPlan<'a> {
         ];
         let s0 = [leaf_a_prefix.s0(), path_b_prefix.s0(), rec_c_prefix.s0()];
         let (walk, terminals) = prove_ragged_multi_deep_chain_walk(&s0, &groups, challenger);
+        lap("three-child multi-walk", &mut t);
         let [leaf_a_terminal, path_b_terminal, rec_c_terminal]: [_; 3] = terminals
             .try_into()
             .expect("leaf-A/path-B/rec-C multi-walk terminal count");
         let (leaf_a, mut claims) = leaf_a_prefix.finish(&leaf_a_terminal, challenger)?;
+        lap("leaf-A finish", &mut t);
         let (path_b, path_claims) = path_b_prefix.finish(&path_b_terminal, challenger)?;
         claims.extend(path_claims);
+        lap("path-B finish", &mut t);
         let (rec_c, rec_claims) = rec_c_prefix.finish(&rec_c_terminal, challenger)?;
         claims.extend(rec_claims);
+        lap("rec-C finish", &mut t);
 
         Ok((
             LinkRegionSidecarProof {
@@ -331,18 +385,6 @@ pub struct LinkRegionSidecarProof {
 impl LinkRegionSidecarProof {
     pub fn byte_len(&self) -> usize {
         bincode::serialized_size(self).expect("link region sidecar serialized length") as usize
-    }
-
-    pub(crate) fn leaf_a(&self) -> &CombinedDuplexRegionWalkDeferredProof {
-        &self.leaf_a
-    }
-
-    pub(crate) fn path_b(&self) -> &MerkleRegionWalkDeferredProof {
-        &self.path_b
-    }
-
-    pub(crate) fn rec_c(&self) -> &DuplexRegionWalkDeferredProof {
-        &self.rec_c
     }
 
     #[cfg(test)]
@@ -697,11 +739,7 @@ fn preflight_multi_walk(
 }
 
 fn link_w_logs(vk: &LinkRegionSidecarVk) -> [usize; 3] {
-    [
-        vk.leaf_a().w_log(),
-        vk.path_b().w_log(),
-        vk.rec_c().w_log(),
-    ]
+    [vk.leaf_a().w_log(), vk.path_b().w_log(), vk.rec_c().w_log()]
 }
 
 fn max_w_log(w_logs: &[usize]) -> usize {

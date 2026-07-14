@@ -20,10 +20,10 @@ use libp2p::{
 use tokio::sync::{mpsc, RwLock, Semaphore};
 
 use noid_chain::consensus::wire_limits::{
-    MAX_COVERAGE_ATTESTATION_BYTES,
     proof_sidecar_combined_len_ok, INLINE_BLOCK_GOSSIP_THRESHOLD, MAX_BLOCK_AUTH_SIDECAR_BYTES,
-    MAX_BLOCK_BYTES, MAX_BLOCK_PROOF_BYTES, MAX_BLOCK_PROOF_PLUS_SIDECAR_BYTES, MAX_HEADER_BYTES,
-    MAX_HISTORY_PROOF_BYTES, MAX_MEMPOOL_SYNC_BYTES, MAX_MEMPOOL_SYNC_TXS, MAX_SEGMENT_BYTES,
+    MAX_BLOCK_BYTES, MAX_BLOCK_PROOF_BYTES, MAX_BLOCK_PROOF_PLUS_SIDECAR_BYTES,
+    MAX_COVERAGE_ATTESTATION_BYTES, MAX_HEADER_BYTES, MAX_HISTORY_PROOF_BYTES,
+    MAX_MEMPOOL_SYNC_BYTES, MAX_MEMPOOL_SYNC_TXS, MAX_SEGMENT_BYTES,
     MAX_SNAPSHOT_MANIFEST_SEGMENTS, MAX_TX_INTENT_BYTES_GLOBAL,
 };
 use noid_chain::storage::{encoded_segment_len_for_eff_log, MdbxChainContext};
@@ -2000,8 +2000,7 @@ async fn handle_swarm_event(
                 } else {
                     let proof_bytes = response.block_proof_bytes.unwrap_or_default();
                     let auth_sidecar_bytes = response.block_auth_sidecar_bytes.unwrap_or_default();
-                    let attestation_bytes =
-                        response.coverage_attestation_bytes.unwrap_or_default();
+                    let attestation_bytes = response.coverage_attestation_bytes.unwrap_or_default();
                     if attestation_bytes.len() > MAX_COVERAGE_ATTESTATION_BYTES {
                         tracing::warn!(peer = %peer, len = attestation_bytes.len(), "block coverage attestation too large — dropped");
                         fail_peer!(pending.peer);
@@ -2117,14 +2116,18 @@ async fn handle_swarm_event(
                     }
                 })
                 .await;
-                let (block_bytes, block_proof_bytes, block_auth_sidecar_bytes, coverage_attestation_bytes) =
-                    match loaded {
-                        Ok(loaded) => loaded,
-                        Err(error) => {
-                            tracing::warn!(height, err = %error, "block response storage worker failed");
-                            (None, None, None, None)
-                        }
-                    };
+                let (
+                    block_bytes,
+                    block_proof_bytes,
+                    block_auth_sidecar_bytes,
+                    coverage_attestation_bytes,
+                ) = match loaded {
+                    Ok(loaded) => loaded,
+                    Err(error) => {
+                        tracing::warn!(height, err = %error, "block response storage worker failed");
+                        (None, None, None, None)
+                    }
+                };
                 let response = GetRecentBlockResponse {
                     height,
                     block_bytes,

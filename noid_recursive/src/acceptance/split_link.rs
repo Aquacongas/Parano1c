@@ -54,12 +54,14 @@ use noid_chain::BlockHeader;
 use noid_ivc_core::challenger::{Challenger, FsLaneChallenger};
 use noid_ivc_core::field::F128;
 use noid_ivc_core::field_circuit::{
-    FieldR1csBuilder, FsChannelTrace, FsChannelUnionRecorder, LinExpr,
+    FieldR1csBuilder, FsChannelTrace, FsChannelUnionRecorder, LayoutRecordedChannel,
+    LayoutRecordingChallenger, LinExpr,
 };
-use noid_ivc_core::field_r1cs::{FieldR1cs, SparseFieldMatrix};
+use noid_ivc_core::field_r1cs::{CompactFieldR1cs, FieldR1cs, SparseFieldMatrix};
+use noid_ivc_core::lincheck::LocallyAuthoredFreshLincheckCapture;
 use noid_ivc_core::matrix_claim::{
-    prove_matrix_claim_fold, stacked_matrix_mle_eval, FreshLincheckClaim, MatrixAccClaim,
-    MatrixClaimEvaluator, MatrixFoldProof,
+    prove_matrix_claim_fold, prove_matrix_claim_fold_compact, stacked_matrix_mle_eval,
+    FreshLincheckClaim, MatrixAccClaim, MatrixClaimEvaluator, MatrixFoldProof,
 };
 use noid_ivc_core::pcs::{Commitment, PcsParams};
 use noid_ivc_core::proof::{pcs_params_statement_bytes, FieldR1csProof, FieldShape, R1csClaim};
@@ -70,8 +72,9 @@ use noid_ivc_core::verifier::{
 };
 
 use super::block_class::{
-    is_production_block_io_spec, BlockClass, BlockProofEnvelope, BLOCK_IO_END_ACC,
-    BLOCK_IO_START_ACC,
+    is_production_block_io_spec, locally_authored_block_envelope_digest, BlockClass,
+    BlockProofEnvelope, BlockProofError, LocallyAuthoredBlockReplay,
+    LocallyAuthoredBlockReplayParts, BLOCK_IO_END_ACC, BLOCK_IO_START_ACC,
 };
 use super::link::block_acc_lanes;
 use super::trace::matrix_fold::{
@@ -80,10 +83,9 @@ use super::trace::matrix_fold::{
 use super::trace::r_pcs_region::{
     derive_link_r_b_recording_layout, derive_link_r_prev_recording_layout,
     descriptor_preflight_r_prev_layout, finalize_r_pcs_link_region,
-    prepare_r_pcs_link_columns_universal, prepare_r_pcs_link_genesis_ghost,
-    scratch_record_split_r_b, scratch_record_split_r_prev, LinkLiveRecordings,
-    RPcsLinkRegionPreparation, RPcsLinkUniversalGeometry, RPcsProof, SplitRBChannelInputs,
-    SplitRPrevChannelInputs, R_B_CHANNEL_DOMAIN, R_PREV_CHANNEL_DOMAIN,
+    prepare_r_pcs_link_columns_universal, prepare_r_pcs_link_genesis_ghost, LinkLiveRecordings,
+    RPcsLinkRecordingGhostCache, RPcsLinkRegionPreparation, RPcsLinkUniversalGeometry, RPcsProof,
+    R_B_CHANNEL_DOMAIN, R_PREV_CHANNEL_DOMAIN,
 };
 use super::trace::self_verify::{
     alloc_flat_digest, flat_digest_lanes, lagrange_weights_window_trace,
@@ -93,19 +95,29 @@ use super::trace::self_verify::{
 };
 use super::trace::{mul, pin_eq};
 use crate::accumulator::{genesis_accumulator, ChainAccumulator, ChainAccumulatorLaneError};
+use crate::region_sidecar::verify_link_region_sidecar_post_commit;
+use crate::region_sidecar::verify_link_region_sidecar_trace_post_commit;
 use crate::region_sidecar::{
     decode_block_region_sidecar_bounded, decode_link_region_sidecar_bounded,
     derive_block_sidecar_recording_layout, link_post_commit_class_digest,
     selected_zk_block_post_commit_class_digest_from_vk_digest,
-    verify_block_region_sidecar_post_commit, verify_block_region_sidecar_post_commit_captured,
+    verify_block_region_sidecar_post_commit,
+    verify_block_region_sidecar_post_commit_layout_captured,
     verify_block_region_sidecar_recorded_trace_post_commit, BlockSidecarChildTranscript,
     LinkRegionProverPlan, LinkRegionSidecarProof, LinkRegionSidecarVk, RegionSidecarError,
 };
-use crate::region_sidecar::verify_link_region_sidecar_post_commit;
-use crate::region_sidecar::verify_link_region_sidecar_trace_post_commit;
-use noid_ivc_core::deep_chain::schedule::DuplexLayout;
 use noid_core::Block128;
-use noid_ivc_prover::field_prover::prove_field_with_public_io_and_post_commit_context;
+use noid_ivc_core::deep_chain::schedule::DuplexLayout;
+use noid_ivc_prover::field_prover::{
+    prove_field_compact_with_public_io_and_post_commit_context,
+    prove_field_compact_with_public_io_and_post_commit_context_capturing_fresh_lincheck,
+    prove_field_with_public_io_and_post_commit_context,
+    prove_field_with_public_io_and_post_commit_context_capturing_fresh_lincheck,
+};
+use noid_poseidon2b::native::poseidon2b_hash_byte_slices;
+
+const LINK_PROOF_TRANSCRIPT_DOMAIN: &[u8] = b"history-link-v0";
+const LOCAL_LINK_REPLAY_ENVELOPE_DOMAIN: &[u8] = b"NOID/LOCAL-SELECTED-LINK-REPLAY-ENVELOPE/V1";
 
 #[cfg(test)]
 thread_local! {
@@ -148,6 +160,46 @@ pub struct LadderSlotInfo {
     /// — the walk L-C block carrying the block replay's complete Fiat-Shamir
     /// transcript.  Derived (never persisted) exactly like the child layout.
     pub b_r_replay_rec_layout: DuplexLayout,
+}
+
+/// One authenticated ladder allocation shared by its descriptor and every
+/// materialized Link class.  The two compiled duplex layouts in each slot are
+/// immutable protocol constants and are intentionally not copied per class.
+type SharedLadderSlots =
+    Arc<[LadderSlotInfo; noid_chain::consensus::params::USER_TX_CLASS_TIERS.len()]>;
+
+/// A universal geometry together with the exact immutable ladder allocation
+/// from which it was derived.  Fields and construction stay private to this
+/// module, so pointer identity is a sound runtime capability: a class cannot
+/// pair an authenticated ladder with geometry built for another descriptor.
+pub(crate) struct BoundRPcsLinkUniversalGeometry {
+    geometry: RPcsLinkUniversalGeometry,
+    link_shape: FieldShape,
+    link_pcs_params: PcsParams,
+    ladder: SharedLadderSlots,
+}
+
+impl BoundRPcsLinkUniversalGeometry {
+    fn is_bound_to(
+        &self,
+        link_shape: FieldShape,
+        link_pcs_params: &PcsParams,
+        ladder: &SharedLadderSlots,
+    ) -> bool {
+        self.link_shape == link_shape
+            && same_pcs_params(&self.link_pcs_params, link_pcs_params)
+            && Arc::ptr_eq(&self.ladder, ladder)
+            && self.geometry.rec_layouts().len() == ladder.len()
+            && self.geometry.r_b_layouts().len() == ladder.len()
+    }
+}
+
+impl std::ops::Deref for BoundRPcsLinkUniversalGeometry {
+    type Target = RPcsLinkUniversalGeometry;
+
+    fn deref(&self) -> &Self::Target {
+        &self.geometry
+    }
 }
 
 /// Frozen production Field dimensions for the four consensus Block classes.
@@ -430,7 +482,10 @@ pub struct SplitLinkSlotMaterial<'a> {
 pub struct CanonicalSplitLinkLadder {
     link_shape: FieldShape,
     link_pcs_params: PcsParams,
-    slots: [LadderSlotInfo; noid_chain::consensus::params::USER_TX_CLASS_TIERS.len()],
+    slots: SharedLadderSlots,
+    /// Non-semantic, bounded cache capability shared only by link classes
+    /// materialized from this authenticated universal descriptor.
+    recording_ghost_cache: RPcsLinkRecordingGhostCache,
 }
 
 fn is_canonical_pcs_profile(params: &PcsParams) -> bool {
@@ -485,9 +540,57 @@ impl CanonicalSplitLinkLadder {
                     actual,
                 })?;
 
+        let slots = Arc::new(slots);
+        Self::validate_metadata(link_shape, &link_pcs_params, slots.as_ref())?;
+        Self::preflight_universal_geometry(&link_pcs_params, slots.as_ref())?;
+        Ok(Self {
+            link_shape,
+            link_pcs_params,
+            slots,
+            recording_ghost_cache: RPcsLinkRecordingGhostCache::default(),
+        })
+    }
+
+    /// Assemble a descriptor whose exact fields already passed `try_new` in
+    /// the release build. Runtime does not repeat metadata or stand-in
+    /// geometry validation.
+    ///
+    /// # Safety
+    ///
+    /// `link_shape`, `link_pcs_params`, and every slot must come from the exact
+    /// registry bytes strictly decoded by the build which embedded them.
+    pub(crate) unsafe fn from_build_authenticated_parts(
+        link_shape: FieldShape,
+        link_pcs_params: PcsParams,
+        slots: Vec<LadderSlotInfo>,
+    ) -> Result<Self, CanonicalLadderError> {
+        let actual = slots.len();
+        let slots: [LadderSlotInfo; Self::SLOT_COUNT] =
+            slots
+                .try_into()
+                .map_err(|_| CanonicalLadderError::SlotCount {
+                    expected: Self::SLOT_COUNT,
+                    actual,
+                })?;
+        Ok(Self {
+            link_shape,
+            link_pcs_params,
+            slots: Arc::new(slots),
+            recording_ghost_cache: RPcsLinkRecordingGhostCache::default(),
+        })
+    }
+
+    /// Cheap validation for an immutable ladder that already crossed
+    /// [`try_new`](Self::try_new).  This checks every consensus metadata field
+    /// but deliberately does not clone layouts or rebuild universal geometry.
+    fn validate_metadata(
+        link_shape: FieldShape,
+        link_pcs_params: &PcsParams,
+        slots: &[LadderSlotInfo; Self::SLOT_COUNT],
+    ) -> Result<(), CanonicalLadderError> {
         for (slot, (&expected, info)) in noid_chain::consensus::params::USER_TX_CLASS_TIERS
             .iter()
-            .zip(&slots)
+            .zip(slots.iter())
             .enumerate()
         {
             if info.tier != expected {
@@ -515,7 +618,7 @@ impl CanonicalSplitLinkLadder {
         if link_shape.m.checked_add(noid_ivc_core::pcs::LOG_PACKING) != Some(link_pcs_params.m) {
             return Err(CanonicalLadderError::LinkPcsShape);
         }
-        if !is_canonical_pcs_profile(&link_pcs_params) {
+        if !is_canonical_pcs_profile(link_pcs_params) {
             return Err(CanonicalLadderError::LinkPcsParameters);
         }
         for (slot, (info, &expected_m)) in slots.iter().zip(&CANONICAL_BLOCK_CLASS_MS).enumerate() {
@@ -543,7 +646,7 @@ impl CanonicalSplitLinkLadder {
                 return Err(CanonicalLadderError::BlockPcsParameters { slot });
             }
         }
-        let spec = split_io_spec(link_shape.k_log, &slots);
+        let spec = split_io_spec(link_shape.k_log, slots);
         if !spec.io_slice.fits(link_shape.m) || spec.io_len > spec.io_slice.len() {
             return Err(CanonicalLadderError::LinkIoDoesNotFit);
         }
@@ -556,8 +659,20 @@ impl CanonicalSplitLinkLadder {
         if !(1..=5).contains(&link_rate) {
             return Err(CanonicalLadderError::UnsupportedUniversalPcs);
         }
-        let n_queries =
-            noid_ivc_core::pcs::default_fri_queries(link_pcs_params.log_dim(), link_rate);
+        Ok(())
+    }
+
+    /// Allocation-bearing geometry preflight performed exactly at the
+    /// external descriptor boundary. Runtime class validation must use the
+    /// metadata check plus the private bound-geometry capability instead.
+    fn preflight_universal_geometry(
+        link_pcs_params: &PcsParams,
+        slots: &[LadderSlotInfo; Self::SLOT_COUNT],
+    ) -> Result<(), CanonicalLadderError> {
+        let n_queries = noid_ivc_core::pcs::default_fri_queries(
+            link_pcs_params.log_dim(),
+            link_pcs_params.log_inv_rate,
+        );
         let block_params = slots
             .iter()
             .map(|slot| slot.b_pcs_params.clone())
@@ -575,7 +690,7 @@ impl CanonicalSplitLinkLadder {
         // derived constant that every class-materialization boundary derives
         // and validates itself — the group checks here do not depend on it).
         RPcsLinkUniversalGeometry::new(
-            &link_pcs_params,
+            link_pcs_params,
             &block_params,
             n_queries,
             rec_layouts,
@@ -583,12 +698,7 @@ impl CanonicalSplitLinkLadder {
             descriptor_preflight_r_prev_layout(),
         )
         .map_err(|_| CanonicalLadderError::UnsupportedUniversalPcs)?;
-
-        Ok(Self {
-            link_shape,
-            link_pcs_params,
-            slots,
-        })
+        Ok(())
     }
 
     /// Materialize the descriptor directly from the four frozen block
@@ -641,7 +751,59 @@ impl CanonicalSplitLinkLadder {
     }
 
     pub fn slots(&self) -> &[LadderSlotInfo; Self::SLOT_COUNT] {
-        &self.slots
+        self.slots.as_ref()
+    }
+
+    /// Materialize the one immutable recording geometry shared by every Link
+    /// class of this descriptor. The external constructor already performed
+    /// the full geometry preflight; production materializers call this once
+    /// and distribute `Arc` clones together with the exact ladder binding.
+    pub(crate) fn materialize_universal_geometry(
+        &self,
+    ) -> Result<Arc<BoundRPcsLinkUniversalGeometry>, RegionSidecarError> {
+        let block_params = self
+            .slots
+            .iter()
+            .map(|slot| slot.b_pcs_params.clone())
+            .collect::<Vec<_>>();
+        let rec_layouts = self
+            .slots
+            .iter()
+            .map(|slot| slot.b_sidecar_rec_layout.clone())
+            .collect::<Vec<_>>();
+        let r_b_layouts = self
+            .slots
+            .iter()
+            .map(|slot| slot.b_r_replay_rec_layout.clone())
+            .collect::<Vec<_>>();
+        let spec = split_io_spec(self.link_shape.k_log, self.slots.as_ref());
+        let r_prev_layout = derive_link_r_prev_recording_layout(
+            &self.link_shape,
+            &self.link_pcs_params,
+            &spec,
+            &block_params,
+            &rec_layouts,
+            &r_b_layouts,
+        )?;
+        let n_queries = noid_ivc_core::pcs::default_fri_queries(
+            self.link_pcs_params.log_dim(),
+            self.link_pcs_params.log_inv_rate,
+        );
+        let geometry = RPcsLinkUniversalGeometry::new_with_recording_ghost_cache(
+            &self.link_pcs_params,
+            &block_params,
+            n_queries,
+            rec_layouts,
+            r_b_layouts,
+            r_prev_layout,
+            self.recording_ghost_cache.clone(),
+        )?;
+        Ok(Arc::new(BoundRPcsLinkUniversalGeometry {
+            geometry,
+            link_shape: self.link_shape,
+            link_pcs_params: self.link_pcs_params.clone(),
+            ladder: Arc::clone(&self.slots),
+        }))
     }
 
     /// Recoverable metadata/shape preflight for one hosted slot.  This is
@@ -747,19 +909,24 @@ impl CanonicalSplitLinkLadder {
         slot: usize,
         material: SplitLinkSlotMaterial<'_>,
     ) -> SplitLinkClass {
-        self.freeze_slot_preflighted_with_genesis(slot, material, None)
+        let universal_geometry = self
+            .materialize_universal_geometry()
+            .expect("canonical split-link universal geometry");
+        self.freeze_slot_preflighted_with_genesis(slot, material, universal_geometry, None)
     }
 
     fn freeze_slot_preflighted_with_genesis(
         &self,
         slot: usize,
         material: SplitLinkSlotMaterial<'_>,
+        universal_geometry: Arc<BoundRPcsLinkUniversalGeometry>,
         shared_genesis: Option<&SharedSplitLinkGenesis>,
     ) -> SplitLinkClass {
         SplitLinkClass::freeze(
             self.link_shape,
             self.link_pcs_params.clone(),
-            self.slots.to_vec(),
+            Arc::clone(&self.slots),
+            universal_geometry,
             slot,
             material.block_class,
             material.sample_block,
@@ -773,12 +940,14 @@ impl CanonicalSplitLinkLadder {
         slot: usize,
         material: SplitLinkSlotMaterial<'_>,
         genesis: &mut FieldR1cs,
+        universal_geometry: Arc<BoundRPcsLinkUniversalGeometry>,
         shared_genesis: Option<&SharedSplitLinkGenesis>,
     ) -> SplitLinkClass {
         SplitLinkClass::freeze_with_transient_genesis(
             self.link_shape,
             self.link_pcs_params.clone(),
-            self.slots.to_vec(),
+            Arc::clone(&self.slots),
+            universal_geometry,
             slot,
             material.block_class,
             material.sample_block,
@@ -801,6 +970,9 @@ impl CanonicalSplitLinkLadder {
         // same transient allocation sequentially, then the complete registry
         // drops it instead of retaining it behind an Arc.
         let mut genesis = split_genesis_instance(&self.link_shape);
+        let universal_geometry = self
+            .materialize_universal_geometry()
+            .expect("canonical split-link universal geometry");
         let mut materials = materials.into_iter().enumerate();
         let (first_slot, first_material) = materials
             .next()
@@ -809,6 +981,7 @@ impl CanonicalSplitLinkLadder {
             first_slot,
             first_material,
             &mut genesis,
+            Arc::clone(&universal_geometry),
             None,
         );
         let shared_genesis = first.shared_genesis();
@@ -819,6 +992,7 @@ impl CanonicalSplitLinkLadder {
                 slot,
                 material,
                 &mut genesis,
+                Arc::clone(&universal_geometry),
                 Some(&shared_genesis),
             ));
         }
@@ -828,10 +1002,20 @@ impl CanonicalSplitLinkLadder {
         drop(genesis);
         self.validate_materialized(&classes)
             .expect("fresh canonical split-link ladder identity drift");
+        for class in &classes {
+            assert!(
+                Arc::ptr_eq(&self.slots, &class.ladder),
+                "freeze_all must retain the descriptor's shared ladder allocation"
+            );
+        }
         for class in &classes[1..] {
             assert!(
                 classes[0].shares_genesis_artifacts_with(class),
                 "freeze_all must retain one shared canonical genesis bootstrap"
+            );
+            assert!(
+                classes[0].shares_universal_geometry_with(class),
+                "freeze_all must retain one shared universal geometry"
             );
         }
         classes
@@ -881,7 +1065,7 @@ impl CanonicalSplitLinkLadder {
             if !same_pcs_params(&class.pcs_params, &self.link_pcs_params) {
                 return Err(CanonicalLadderError::MaterializedClassPcs { slot });
             }
-            if !same_ladder(&class.ladder, &self.slots) {
+            if !same_ladder(class.ladder.as_ref(), self.slots.as_ref()) {
                 return Err(CanonicalLadderError::MaterializedClassLadder { slot });
             }
             if class.slot != slot {
@@ -1282,7 +1466,7 @@ pub struct SplitLinkClass {
     pub genesis_digest: [u8; 32],
     /// The block accumulator a genesis link's block must start from.
     genesis_block_accumulator: ChainAccumulator,
-    ladder: Vec<LadderSlotInfo>,
+    ladder: SharedLadderSlots,
     /// This class's ladder slot (selects the hosted block class).
     slot: usize,
     /// The slot's block-class spec ([R]_B replays it; a baked structural
@@ -1290,7 +1474,7 @@ pub struct SplitLinkClass {
     b_spec: PublicIoSpec,
     /// The slot's block-class PCS parameters.
     b_pcs_params: PcsParams,
-    universal_geometry: RPcsLinkUniversalGeometry,
+    universal_geometry: Arc<BoundRPcsLinkUniversalGeometry>,
     sidecar_vk: std::sync::OnceLock<Arc<LinkRegionSidecarVk>>,
     post_commit_class_digest: std::sync::OnceLock<[u8; 32]>,
     genesis_post_commit_class_digest: std::sync::OnceLock<[u8; 32]>,
@@ -1311,14 +1495,79 @@ pub struct SplitLinkClass {
 }
 
 impl SplitLinkClass {
+    /// Assemble a Link class from fields already validated by the release
+    /// build. This creates only the runtime ownership graph; it does not
+    /// recompute class identities or verify the embedded Genesis proof.
+    ///
+    /// A terminal-only class passes no Genesis envelope and no Block VK. Its
+    /// discarded flag is initialized directly instead of materializing and
+    /// then dropping a proof that the build already verified.
+    ///
+    /// # Safety
+    ///
+    /// Every argument must come from the exact registry bytes which passed
+    /// both strict registry decoders during the build that embedded them.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn from_build_authenticated_registry_parts(
+        descriptor: &CanonicalSplitLinkLadder,
+        universal_geometry: Arc<BoundRPcsLinkUniversalGeometry>,
+        slot: usize,
+        shape: FieldShape,
+        pcs_params: PcsParams,
+        spec: PublicIoSpec,
+        matrix_digest: [u8; 32],
+        post_commit_class_digest: [u8; 32],
+        genesis_digest: [u8; 32],
+        genesis_post_commit_class_digest: [u8; 32],
+        sidecar_vk: Arc<LinkRegionSidecarVk>,
+        genesis_envelope: Option<Arc<LinkProofEnvelope>>,
+        b_spec: PublicIoSpec,
+        b_pcs_params: PcsParams,
+        b_sidecar_vk: Option<Arc<crate::region_sidecar::BlockRegionSidecarVk>>,
+        b_sidecar_vk_digest: [u8; 32],
+        b_post_commit_class_digest: [u8; 32],
+    ) -> Self {
+        let terminal_genesis_envelope_discarded = genesis_envelope.is_none();
+        let genesis_envelope_lock = std::sync::OnceLock::new();
+        if let Some(envelope) = genesis_envelope {
+            genesis_envelope_lock
+                .set(envelope)
+                .expect("fresh build-authenticated Genesis envelope lock");
+        }
+        Self {
+            shape,
+            pcs_params,
+            spec,
+            class_statement_digest: std::sync::OnceLock::from(matrix_digest),
+            genesis_digest,
+            genesis_block_accumulator: genesis_accumulator(),
+            ladder: Arc::clone(&descriptor.slots),
+            slot,
+            b_spec,
+            b_pcs_params,
+            universal_geometry,
+            sidecar_vk: std::sync::OnceLock::from(sidecar_vk),
+            post_commit_class_digest: std::sync::OnceLock::from(post_commit_class_digest),
+            genesis_post_commit_class_digest: std::sync::OnceLock::from(
+                genesis_post_commit_class_digest,
+            ),
+            genesis_envelope: genesis_envelope_lock,
+            terminal_genesis_envelope_discarded,
+            b_sidecar_vk,
+            b_sidecar_vk_digest,
+            b_post_commit_class_digest,
+        }
+    }
+
     /// Rehydrate one selected production Link class from compact registry
-    /// metadata.  Matrices and sample Block proofs are deliberately absent:
-    /// the constructor rebuilds all derived geometry, installs only published
-    /// identities, and validates the complete post-commit binding before the
-    /// class can escape.
+    /// metadata.  Matrices and sample Block proofs are deliberately absent;
+    /// the caller supplies the descriptor-derived shared geometry, while this
+    /// constructor installs only published identities and validates the
+    /// complete post-commit binding before the class can escape.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_selected_registry_parts(
         descriptor: &CanonicalSplitLinkLadder,
+        universal_geometry: Arc<BoundRPcsLinkUniversalGeometry>,
         slot: usize,
         block_class: &BlockClass,
         shape: FieldShape,
@@ -1363,6 +1612,7 @@ impl SplitLinkClass {
         }
         Self::from_selected_registry_parts_inner(
             descriptor,
+            universal_geometry,
             slot,
             shape,
             pcs_params,
@@ -1388,6 +1638,7 @@ impl SplitLinkClass {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_selected_terminal_registry_parts(
         descriptor: &CanonicalSplitLinkLadder,
+        universal_geometry: Arc<BoundRPcsLinkUniversalGeometry>,
         slot: usize,
         shape: FieldShape,
         pcs_params: PcsParams,
@@ -1424,6 +1675,7 @@ impl SplitLinkClass {
         }
         Self::from_selected_registry_parts_inner(
             descriptor,
+            universal_geometry,
             slot,
             shape,
             pcs_params,
@@ -1445,6 +1697,7 @@ impl SplitLinkClass {
     #[allow(clippy::too_many_arguments)]
     fn from_selected_registry_parts_inner(
         descriptor: &CanonicalSplitLinkLadder,
+        universal_geometry: Arc<BoundRPcsLinkUniversalGeometry>,
         slot: usize,
         shape: FieldShape,
         pcs_params: PcsParams,
@@ -1468,41 +1721,6 @@ impl SplitLinkClass {
         {
             return Err(LinkProofError::ClassIdentityMismatch);
         }
-        let block_params = descriptor
-            .slots()
-            .iter()
-            .map(|slot| slot.b_pcs_params.clone())
-            .collect::<Vec<_>>();
-        let rec_layouts = descriptor
-            .slots()
-            .iter()
-            .map(|slot| slot.b_sidecar_rec_layout.clone())
-            .collect::<Vec<_>>();
-        let r_b_layouts = descriptor
-            .slots()
-            .iter()
-            .map(|slot| slot.b_r_replay_rec_layout.clone())
-            .collect::<Vec<_>>();
-        let n_queries =
-            noid_ivc_core::pcs::default_fri_queries(pcs_params.log_dim(), pcs_params.log_inv_rate);
-        let r_prev_layout = derive_link_r_prev_recording_layout(
-            &shape,
-            &pcs_params,
-            &spec,
-            &block_params,
-            &rec_layouts,
-            &r_b_layouts,
-        )
-        .map_err(|_| LinkProofError::ClassIdentityMismatch)?;
-        let universal_geometry = RPcsLinkUniversalGeometry::new(
-            &pcs_params,
-            &block_params,
-            n_queries,
-            rec_layouts,
-            r_b_layouts,
-            r_prev_layout,
-        )
-        .map_err(|_| LinkProofError::ClassIdentityMismatch)?;
 
         let class_statement_digest = std::sync::OnceLock::new();
         class_statement_digest
@@ -1531,7 +1749,7 @@ impl SplitLinkClass {
             class_statement_digest,
             genesis_digest,
             genesis_block_accumulator: genesis_accumulator(),
-            ladder: descriptor.slots().to_vec(),
+            ladder: Arc::clone(&descriptor.slots),
             slot,
             b_spec,
             b_pcs_params,
@@ -1562,7 +1780,8 @@ impl SplitLinkClass {
     fn freeze(
         shape: FieldShape,
         pcs_params: PcsParams,
-        ladder: Vec<LadderSlotInfo>,
+        ladder: SharedLadderSlots,
+        universal_geometry: Arc<BoundRPcsLinkUniversalGeometry>,
         slot: usize,
         block_class: &BlockClass,
         sample_block: &BlockProofEnvelope,
@@ -1574,6 +1793,7 @@ impl SplitLinkClass {
             shape,
             pcs_params,
             ladder,
+            universal_geometry,
             slot,
             block_class,
             sample_block,
@@ -1590,7 +1810,8 @@ impl SplitLinkClass {
     fn freeze_with_transient_genesis(
         shape: FieldShape,
         pcs_params: PcsParams,
-        ladder: Vec<LadderSlotInfo>,
+        ladder: SharedLadderSlots,
+        universal_geometry: Arc<BoundRPcsLinkUniversalGeometry>,
         slot: usize,
         block_class: &BlockClass,
         sample_block: &BlockProofEnvelope,
@@ -1598,8 +1819,12 @@ impl SplitLinkClass {
         genesis: &mut FieldR1cs,
         shared_genesis: Option<&SharedSplitLinkGenesis>,
     ) -> Self {
-        CanonicalSplitLinkLadder::try_new(shape, pcs_params.clone(), ladder.clone())
-            .expect("internal split-link freeze requires the canonical ladder");
+        CanonicalSplitLinkLadder::validate_metadata(shape, &pcs_params, ladder.as_ref())
+            .expect("internal split-link freeze requires canonical ladder metadata");
+        assert!(
+            universal_geometry.is_bound_to(shape, &pcs_params, &ladder),
+            "internal split-link freeze requires geometry bound to the exact ladder allocation"
+        );
         let genesis_block_accumulator = genesis_accumulator();
         assert!(slot < ladder.len(), "slot out of ladder");
         assert_eq!(
@@ -1652,25 +1877,10 @@ impl SplitLinkClass {
                 "rebuilt split-genesis statement identity"
             );
         }
-        let block_params = ladder
-            .iter()
-            .map(|slot| slot.b_pcs_params.clone())
-            .collect::<Vec<_>>();
-        let rec_layouts = ladder
-            .iter()
-            .map(|slot| slot.b_sidecar_rec_layout.clone())
-            .collect::<Vec<_>>();
-        let r_b_layouts = ladder
-            .iter()
-            .map(|slot| slot.b_r_replay_rec_layout.clone())
-            .collect::<Vec<_>>();
         assert_eq!(
             ladder[slot].b_sidecar_rec_layout,
-            derive_block_sidecar_recording_layout(
-                block_class.sidecar_vk(),
-                block_class.shape.m,
-            )
-            .expect("hosted block class recording layout"),
+            derive_block_sidecar_recording_layout(block_class.sidecar_vk(), block_class.shape.m,)
+                .expect("hosted block class recording layout"),
             "slot recording layout vs block class"
         );
         assert_eq!(
@@ -1686,27 +1896,7 @@ impl SplitLinkClass {
             .expect("hosted block class [R]_B recording layout"),
             "slot [R]_B recording layout vs block class"
         );
-        let n_queries =
-            noid_ivc_core::pcs::default_fri_queries(pcs_params.log_dim(), pcs_params.log_inv_rate);
-        let spec = split_io_spec(shape.k_log, &ladder);
-        let r_prev_layout = derive_link_r_prev_recording_layout(
-            &shape,
-            &pcs_params,
-            &spec,
-            &block_params,
-            &rec_layouts,
-            &r_b_layouts,
-        )
-        .expect("universal [R]_prev recording layout");
-        let universal_geometry = RPcsLinkUniversalGeometry::new(
-            &pcs_params,
-            &block_params,
-            n_queries,
-            rec_layouts,
-            r_b_layouts,
-            r_prev_layout,
-        )
-        .expect("link/block ladder must share one frozen query count");
+        let spec = split_io_spec(shape.k_log, ladder.as_ref());
         let class = Self {
             shape,
             pcs_params: pcs_params.clone(),
@@ -1850,11 +2040,11 @@ impl SplitLinkClass {
     }
 
     pub fn layout(&self) -> SplitIoLayout {
-        split_io_layout(self.shape.k_log, &self.ladder)
+        split_io_layout(self.shape.k_log, self.ladder.as_ref())
     }
 
     pub fn ladder(&self) -> &[LadderSlotInfo] {
-        &self.ladder
+        self.ladder.as_ref()
     }
 
     pub fn slot(&self) -> usize {
@@ -1872,6 +2062,42 @@ impl SplitLinkClass {
         self.post_commit_class_digest
             .get()
             .expect("frozen link post-commit class")
+    }
+
+    /// Return the two authenticated recording layouts needed while a local
+    /// Block proof is authored for this exact hosted slot.  This boundary
+    /// prevents the Block prover from accepting caller-selected transcript
+    /// geometry: the supplied class must be byte-for-byte bound to the
+    /// ladder entry and materialized Block VK retained by this Link class.
+    pub(crate) fn locally_authored_block_replay_layouts(
+        &self,
+        block_class: &BlockClass,
+    ) -> Result<(DuplexLayout, DuplexLayout), BlockProofError> {
+        self.validate_frozen_identity()
+            .map_err(|_| BlockProofError::ClassIdentityMismatch)?;
+        let block_digest = block_class.validate_frozen_identity()?;
+        let slot = self
+            .ladder
+            .get(self.slot)
+            .ok_or(BlockProofError::ClassIdentityMismatch)?;
+        let retained_vk = self
+            .b_sidecar_vk
+            .as_deref()
+            .ok_or(BlockProofError::ClassIdentityMismatch)?;
+        if block_class.tier() != slot.tier
+            || block_class.shape != slot.b_shape
+            || block_digest != slot.b_digest
+            || !same_pcs_params(&block_class.pcs_params, &slot.b_pcs_params)
+            || block_class.sidecar_vk().transcript_digest() != slot.b_sidecar_vk_digest
+            || block_class.post_commit_class_digest() != &slot.b_post_commit_class_digest
+            || retained_vk.transcript_digest() != slot.b_sidecar_vk_digest
+        {
+            return Err(BlockProofError::ClassIdentityMismatch);
+        }
+        Ok((
+            self.universal_geometry.rec_layouts()[self.slot].clone(),
+            self.universal_geometry.r_b_layouts()[self.slot].clone(),
+        ))
     }
 
     pub fn genesis_envelope(&self) -> &LinkProofEnvelope {
@@ -1949,6 +2175,23 @@ impl SplitLinkClass {
                 (self.genesis_envelope.get(), other.genesis_envelope.get()),
                 (Some(left), Some(right)) if Arc::ptr_eq(left, right)
             )
+    }
+
+    pub(crate) fn shares_universal_geometry_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.universal_geometry, &other.universal_geometry)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_ladder_storage_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.ladder, &other.ladder)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_ladder_storage_with_descriptor(
+        &self,
+        descriptor: &CanonicalSplitLinkLadder,
+    ) -> bool {
+        Arc::ptr_eq(&self.ladder, &descriptor.slots)
     }
 
     fn build_genesis_ghost_witness(&self) -> (Vec<F128>, RPcsLinkRegionPreparation) {
@@ -2053,6 +2296,8 @@ pub enum SplitLinkPreparationError {
     BlockMatrixDigest,
     PreviousProof,
     BlockProof,
+    PreviousLocalReplayMismatch,
+    BlockLocalReplayMismatch,
     IoRouting,
 }
 
@@ -2074,6 +2319,12 @@ impl core::fmt::Display for SplitLinkPreparationError {
             Self::BlockMatrixDigest => "current Block matrix structural digest mismatch",
             Self::PreviousProof => "previous Link envelope verification failed",
             Self::BlockProof => "current Block envelope verification failed",
+            Self::PreviousLocalReplayMismatch => {
+                "previous locally authored Link replay binding mismatch"
+            }
+            Self::BlockLocalReplayMismatch => {
+                "current locally authored Block replay binding mismatch"
+            }
             Self::IoRouting => "split-link accumulated-claim IO routing failed",
         };
         f.write_str(message)
@@ -2100,6 +2351,7 @@ pub struct SplitLinkBlockMatrixPhase<'a> {
     core: SplitLinkNativePreparationCore<'a>,
     fold_proof_link: MatrixFoldProof,
     acc_link: MatrixAccClaim,
+    r_prev_recording: LayoutRecordedChannel,
 }
 
 struct SplitLinkNativePreparationCore<'a> {
@@ -2112,6 +2364,111 @@ struct SplitLinkNativePreparationCore<'a> {
     freeze: bool,
 }
 
+fn consume_locally_authored_link_replay(
+    core: &SplitLinkNativePreparationCore<'_>,
+    replay: LocallyAuthoredLinkReplay,
+) -> Result<(FreshLincheckClaim, LayoutRecordedChannel), SplitLinkPreparationError> {
+    let LocallyAuthoredLinkReplay {
+        envelope_digest,
+        commitment_root,
+        slot,
+        shape,
+        matrix_digest,
+        post_commit_digest,
+        sidecar_vk_digest,
+        fresh,
+        r_prev_recording,
+    } = replay;
+    let actual_envelope_digest = locally_authored_link_envelope_digest(core.input.prev)
+        .map_err(|_| SplitLinkPreparationError::PreviousLocalReplayMismatch)?;
+    if core.input.genesis
+        || envelope_digest != actual_envelope_digest
+        || commitment_root != core.input.prev.commitment().root
+        || slot != core.input.prev_slot
+        || shape != core.class.shape
+        || matrix_digest != core.expected_link_matrix_digest
+        || post_commit_digest != core.expected_link_post_commit
+        || sidecar_vk_digest != core.class.sidecar_vk().transcript_digest()
+        || &r_prev_recording.layout != core.class.universal_geometry.r_prev_layout()
+    {
+        return Err(SplitLinkPreparationError::PreviousLocalReplayMismatch);
+    }
+    Ok((fresh.into_fresh_claim(), r_prev_recording))
+}
+
+fn consume_locally_authored_block_replay(
+    core: &SplitLinkNativePreparationCore<'_>,
+    replay: LocallyAuthoredBlockReplay,
+) -> Result<
+    (
+        FreshLincheckClaim,
+        BlockSidecarChildTranscript,
+        LayoutRecordedChannel,
+        LayoutRecordedChannel,
+    ),
+    SplitLinkPreparationError,
+> {
+    let LocallyAuthoredBlockReplayParts {
+        envelope_digest,
+        commitment_root,
+        block_tier,
+        block_shape,
+        block_matrix_digest,
+        block_post_commit_digest,
+        block_sidecar_vk_digest,
+        link_slot,
+        link_shape,
+        link_matrix_digest,
+        link_post_commit_digest,
+        link_sidecar_vk_digest,
+        fresh,
+        block_child,
+        child_recording,
+        r_b_recording,
+    } = replay.into_parts();
+    let class = core.class;
+    let slot = class.slot;
+    let hosted = class
+        .ladder
+        .get(slot)
+        .ok_or(SplitLinkPreparationError::BlockLocalReplayMismatch)?;
+    let retained_block_vk = class
+        .b_sidecar_vk
+        .as_deref()
+        .ok_or(SplitLinkPreparationError::BlockLocalReplayMismatch)?;
+    let current_link_matrix_digest = class
+        .class_statement_digest
+        .get()
+        .copied()
+        .ok_or(SplitLinkPreparationError::BlockLocalReplayMismatch)?;
+    let actual_envelope_digest = locally_authored_block_envelope_digest(core.input.block)
+        .map_err(|_| SplitLinkPreparationError::BlockLocalReplayMismatch)?;
+    if envelope_digest != actual_envelope_digest
+        || commitment_root != core.input.block.commitment().root
+        || block_tier != hosted.tier
+        || block_shape != hosted.b_shape
+        || block_matrix_digest != core.expected_block_matrix_digest
+        || block_post_commit_digest != hosted.b_post_commit_class_digest
+        || block_sidecar_vk_digest != hosted.b_sidecar_vk_digest
+        || retained_block_vk.transcript_digest() != block_sidecar_vk_digest
+        || link_slot != slot
+        || link_shape != class.shape
+        || link_matrix_digest != current_link_matrix_digest
+        || link_post_commit_digest != *class.post_commit_class_digest()
+        || link_sidecar_vk_digest != class.sidecar_vk().transcript_digest()
+        || &child_recording.layout != &class.universal_geometry.rec_layouts()[slot]
+        || &r_b_recording.layout != &class.universal_geometry.r_b_layouts()[slot]
+    {
+        return Err(SplitLinkPreparationError::BlockLocalReplayMismatch);
+    }
+    Ok((
+        fresh.into_fresh_claim(),
+        block_child,
+        child_recording,
+        r_b_recording,
+    ))
+}
+
 fn validate_split_fold_matrix_identity(
     matrix: &FieldR1cs,
     expected_shape: FieldShape,
@@ -2122,10 +2479,27 @@ fn validate_split_fold_matrix_identity(
     if FieldShape::of(matrix) != expected_shape {
         return Err(shape_error);
     }
-    // `statement_digest()` has a seedable cache for trusted rebuilt class
-    // artifacts.  A matrix crossing this public phased boundary is untrusted,
-    // so authenticate its CSR contents directly before proof replay.
-    if matrix.structural_statement_digest() != expected_digest {
+    // A seedable digest cache is never authority at this public boundary.
+    let actual_digest = matrix.structural_statement_digest();
+    if actual_digest != expected_digest {
+        return Err(digest_error);
+    }
+    Ok(())
+}
+
+fn validate_compact_split_fold_matrix_identity(
+    matrix: &CompactFieldR1cs,
+    expected_shape: FieldShape,
+    expected_digest: [u8; 32],
+    shape_error: SplitLinkPreparationError,
+    digest_error: SplitLinkPreparationError,
+) -> Result<(), SplitLinkPreparationError> {
+    // CompactFieldR1cs has no seedable digest and can only be constructed by
+    // a complete canonical scan against this structural identity.
+    if matrix.shape() != expected_shape {
+        return Err(shape_error);
+    }
+    if matrix.statement_digest() != expected_digest {
         return Err(digest_error);
     }
     Ok(())
@@ -2140,6 +2514,17 @@ fn prove_split_matrix_fold(
 ) -> (MatrixFoldProof, MatrixAccClaim) {
     let mut challenger = FsLaneChallenger::new(transcript_domain);
     prove_matrix_claim_fold(matrix, fresh, incoming, gate, &mut challenger)
+}
+
+fn prove_compact_split_matrix_fold(
+    transcript_domain: &'static [u8],
+    matrix: &CompactFieldR1cs,
+    fresh: &FreshLincheckClaim,
+    incoming: &MatrixAccClaim,
+    gate: bool,
+) -> (MatrixFoldProof, MatrixAccClaim) {
+    let mut challenger = FsLaneChallenger::new(transcript_domain);
+    prove_matrix_claim_fold_compact(matrix, fresh, incoming, gate, &mut challenger)
 }
 
 /// One-shot native split-link preparation.
@@ -2159,6 +2544,9 @@ pub struct PreparedSplitLink<'a> {
     /// terminal lanes) of the native block replay.  The trace pass reuses
     /// the seed to prefill the walk L-C recording columns.
     block_child: BlockSidecarChildTranscript,
+    child_recording: LayoutRecordedChannel,
+    r_b_recording: LayoutRecordedChannel,
+    r_prev_recording: LayoutRecordedChannel,
     freeze: bool,
 }
 
@@ -2167,7 +2555,34 @@ impl<'a> PreparedSplitLink<'a> {
     /// matrix. Consumes the preparation so it cannot be mixed or replayed with
     /// another class/input pair.
     pub fn assemble(self) -> BuiltSplitLink {
-        assemble_prepared_split_link(self)
+        assemble_prepared_split_link(self, false)
+    }
+
+    /// Assemble against the registry-established frozen Link relation without
+    /// re-hashing the deterministic output CSR at every height. Shape, wire
+    /// count and sidecar-key fixity remain checked; terminal promotion still
+    /// verifies the authored proof against the authenticated matrix artifact.
+    pub fn assemble_established(self) -> BuiltSplitLink {
+        assemble_prepared_split_link(self, true)
+    }
+
+    /// Re-run the exact recursive trace while retaining only its witness.
+    /// The output relation is an authenticated compact artifact from the
+    /// frozen registry; its digest, shape and useful-row ledger are checked
+    /// before this value can be proven.
+    pub fn assemble_witness_only_established(
+        self,
+        relation: &CompactFieldR1cs,
+    ) -> Result<BuiltSplitLinkWitness, LinkProofError> {
+        let class_digest = self.class.validate_frozen_identity()?;
+        if relation.shape() != self.class.shape || relation.statement_digest() != class_digest {
+            return Err(LinkProofError::MatrixMismatch);
+        }
+        let built = assemble_prepared_split_link_witness_only(self);
+        if relation.useful_rows() != built.useful_rows {
+            return Err(LinkProofError::MatrixMismatch);
+        }
+        Ok(built)
     }
 }
 
@@ -2176,6 +2591,15 @@ pub struct BuiltSplitLink {
     pub r1cs: FieldR1cs,
     pub witness: Vec<F128>,
     pub io: Vec<F128>,
+    region_preparation: RPcsLinkRegionPreparation,
+}
+
+/// Matrix-free production Link assembly paired with an authenticated compact
+/// relation at the proving boundary.
+pub struct BuiltSplitLinkWitness {
+    useful_rows: usize,
+    witness: Vec<F128>,
+    io: Vec<F128>,
     region_preparation: RPcsLinkRegionPreparation,
 }
 
@@ -2207,6 +2631,33 @@ impl LinkProofEnvelope {
     }
 }
 
+/// One-shot replay material for a Link envelope authored inside this process.
+/// The capsule is intentionally non-`Clone` and non-serializable: a durable or
+/// network envelope must take the complete verifier path, while only the next
+/// in-memory pipeline height may consume this captured native twin.
+#[must_use = "a locally authored Link replay must be consumed or deliberately dropped"]
+pub struct LocallyAuthoredLinkReplay {
+    envelope_digest: [u8; 32],
+    commitment_root: [u8; 32],
+    slot: usize,
+    shape: FieldShape,
+    matrix_digest: [u8; 32],
+    post_commit_digest: [u8; 32],
+    sidecar_vk_digest: [u8; 32],
+    fresh: LocallyAuthoredFreshLincheckCapture,
+    r_prev_recording: LayoutRecordedChannel,
+}
+
+fn locally_authored_link_envelope_digest(
+    envelope: &LinkProofEnvelope,
+) -> Result<[u8; 32], LinkProofError> {
+    let encoded = bincode::serialize(envelope).map_err(|_| LinkProofError::LocalReplayMismatch)?;
+    Ok(poseidon2b_hash_byte_slices(
+        LOCAL_LINK_REPLAY_ENVELOPE_DOMAIN,
+        &[&encoded],
+    ))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LinkProofError {
     UnfrozenClass,
@@ -2217,6 +2668,7 @@ pub enum LinkProofError {
     MatrixClaimMismatch,
     AccumulatorClaimMismatch,
     SidecarVkMismatch,
+    LocalReplayMismatch,
     Sidecar(RegionSidecarError),
     Field(VerifyError),
 }
@@ -2239,6 +2691,9 @@ impl std::fmt::Display for LinkProofError {
                 write!(f, "link accumulated matrix claim is false")
             }
             Self::SidecarVkMismatch => write!(f, "link sidecar VK does not match its class"),
+            Self::LocalReplayMismatch => {
+                write!(f, "locally authored Link replay binding mismatch")
+            }
             Self::Sidecar(error) => write!(f, "link sidecar error: {error:?}"),
             Self::Field(error) => write!(f, "link Field proof error: {error:?}"),
         }
@@ -2266,8 +2721,18 @@ impl SplitLinkClass {
             .get()
             .copied()
             .ok_or(LinkProofError::UnfrozenClass)?;
-        CanonicalSplitLinkLadder::try_new(self.shape, self.pcs_params.clone(), self.ladder.clone())
-            .map_err(|_| LinkProofError::ClassIdentityMismatch)?;
+        CanonicalSplitLinkLadder::validate_metadata(
+            self.shape,
+            &self.pcs_params,
+            self.ladder.as_ref(),
+        )
+        .map_err(|_| LinkProofError::ClassIdentityMismatch)?;
+        if !self
+            .universal_geometry
+            .is_bound_to(self.shape, &self.pcs_params, &self.ladder)
+        {
+            return Err(LinkProofError::ClassIdentityMismatch);
+        }
         if self.shape.m.checked_add(noid_ivc_core::pcs::LOG_PACKING) != Some(self.pcs_params.m) {
             return Err(LinkProofError::PcsParamsMismatch);
         }
@@ -2414,6 +2879,186 @@ pub fn prove_built_split_link<Ch: Challenger>(
         io: built.io.clone(),
         region_sidecar: sidecar?,
     })
+}
+
+/// Prove a witness-only Link assembly against the exact immutable relation
+/// authenticated by [`CompactFieldR1cs::open`].  All class identity,
+/// useful-row, sidecar-VK and public-IO checks mirror
+/// [`prove_built_split_link`]; the emitted proof is byte-identical.
+pub fn prove_built_split_link_compact<Ch: Challenger>(
+    class: &SplitLinkClass,
+    relation: &CompactFieldR1cs,
+    built: &BuiltSplitLinkWitness,
+    challenger: &mut Ch,
+) -> Result<LinkProofEnvelope, LinkProofError> {
+    let matrix_digest = class.validate_frozen_identity()?;
+    if built.io.len() != class.spec.io_len {
+        return Err(LinkProofError::InvalidIo);
+    }
+    if relation.statement_digest() != matrix_digest
+        || relation.shape() != class.shape
+        || relation.useful_rows() != built.useful_rows
+    {
+        return Err(LinkProofError::MatrixMismatch);
+    }
+    if built.region_preparation.vk() != class.sidecar_vk() {
+        return Err(LinkProofError::SidecarVkMismatch);
+    }
+    let plan = LinkRegionProverPlan::new(
+        built.region_preparation.vk(),
+        built.region_preparation.prover_input(),
+    )?;
+    let (field_proof, sidecar, commitment, _) =
+        prove_field_compact_with_public_io_and_post_commit_context(
+            relation,
+            &built.witness,
+            &class.pcs_params,
+            &class.spec,
+            &built.io,
+            class.post_commit_class_digest(),
+            challenger,
+            |context| plan.prove_post_commit(context),
+        );
+    Ok(LinkProofEnvelope {
+        field_proof,
+        commitment,
+        io: built.io.clone(),
+        region_sidecar: sidecar?,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_locally_authored_link_replay(
+    class: &SplitLinkClass,
+    matrix_digest: [u8; 32],
+    io: &[F128],
+    field_proof: FieldR1csProof,
+    commitment: Commitment,
+    sidecar: Result<LinkRegionSidecarProof, RegionSidecarError>,
+    fresh: LocallyAuthoredFreshLincheckCapture,
+    outer: LayoutRecordingChallenger,
+) -> Result<(LinkProofEnvelope, LocallyAuthoredLinkReplay), LinkProofError> {
+    let r_prev_recording = outer
+        .finish()
+        .map_err(|_| LinkProofError::LocalReplayMismatch)?;
+    let envelope = LinkProofEnvelope {
+        field_proof,
+        commitment,
+        io: io.to_vec(),
+        region_sidecar: sidecar?,
+    };
+    let replay = LocallyAuthoredLinkReplay {
+        envelope_digest: locally_authored_link_envelope_digest(&envelope)?,
+        commitment_root: envelope.commitment.root,
+        slot: class.slot,
+        shape: class.shape,
+        matrix_digest,
+        post_commit_digest: *class.post_commit_class_digest(),
+        sidecar_vk_digest: class.sidecar_vk().transcript_digest(),
+        fresh,
+        r_prev_recording,
+    };
+    Ok((envelope, replay))
+}
+
+/// Opt-in local-authoring twin of [`prove_built_split_link`].  The proof
+/// transcript and envelope bytes are unchanged; only an opaque in-memory
+/// replay capsule is returned beside them.
+pub fn prove_built_split_link_locally_authored(
+    class: &SplitLinkClass,
+    built: &BuiltSplitLink,
+) -> Result<(LinkProofEnvelope, LocallyAuthoredLinkReplay), LinkProofError> {
+    let matrix_digest = class.validate_frozen_identity()?;
+    if built.io.len() != class.spec.io_len {
+        return Err(LinkProofError::InvalidIo);
+    }
+    if built.r1cs.statement_digest() != matrix_digest || FieldShape::of(&built.r1cs) != class.shape
+    {
+        return Err(LinkProofError::MatrixMismatch);
+    }
+    if built.region_preparation.vk() != class.sidecar_vk() {
+        return Err(LinkProofError::SidecarVkMismatch);
+    }
+    let plan = LinkRegionProverPlan::new(
+        built.region_preparation.vk(),
+        built.region_preparation.prover_input(),
+    )?;
+    let mut challenger = LayoutRecordingChallenger::new(
+        LINK_PROOF_TRANSCRIPT_DOMAIN,
+        class.universal_geometry.r_prev_layout().clone(),
+    );
+    let (field_proof, sidecar, commitment, _, fresh) =
+        prove_field_with_public_io_and_post_commit_context_capturing_fresh_lincheck(
+            &built.r1cs,
+            &built.witness,
+            &class.pcs_params,
+            &class.spec,
+            &built.io,
+            class.post_commit_class_digest(),
+            &mut challenger,
+            |context| plan.prove_post_commit(context),
+        );
+    finish_locally_authored_link_replay(
+        class,
+        matrix_digest,
+        &built.io,
+        field_proof,
+        commitment,
+        sidecar,
+        fresh,
+        challenger,
+    )
+}
+
+/// Compact authenticated-relation twin of
+/// [`prove_built_split_link_locally_authored`].
+pub fn prove_built_split_link_compact_locally_authored(
+    class: &SplitLinkClass,
+    relation: &CompactFieldR1cs,
+    built: &BuiltSplitLinkWitness,
+) -> Result<(LinkProofEnvelope, LocallyAuthoredLinkReplay), LinkProofError> {
+    let matrix_digest = class.validate_frozen_identity()?;
+    if built.io.len() != class.spec.io_len {
+        return Err(LinkProofError::InvalidIo);
+    }
+    if relation.statement_digest() != matrix_digest
+        || relation.shape() != class.shape
+        || relation.useful_rows() != built.useful_rows
+    {
+        return Err(LinkProofError::MatrixMismatch);
+    }
+    if built.region_preparation.vk() != class.sidecar_vk() {
+        return Err(LinkProofError::SidecarVkMismatch);
+    }
+    let plan = LinkRegionProverPlan::new(
+        built.region_preparation.vk(),
+        built.region_preparation.prover_input(),
+    )?;
+    let mut challenger = LayoutRecordingChallenger::new(
+        LINK_PROOF_TRANSCRIPT_DOMAIN,
+        class.universal_geometry.r_prev_layout().clone(),
+    );
+    let (field_proof, sidecar, commitment, _, fresh) =
+        prove_field_compact_with_public_io_and_post_commit_context_capturing_fresh_lincheck(
+            relation,
+            &built.witness,
+            &class.pcs_params,
+            &class.spec,
+            &built.io,
+            class.post_commit_class_digest(),
+            &mut challenger,
+            |context| plan.prove_post_commit(context),
+        );
+    finish_locally_authored_link_replay(
+        class,
+        matrix_digest,
+        &built.io,
+        field_proof,
+        commitment,
+        sidecar,
+        fresh,
+        challenger,
+    )
 }
 
 /// Full native verification of a production link envelope. A plain Field
@@ -2650,16 +3295,182 @@ impl<'a> SplitLinkPreviousMatrixPhase<'a> {
         self,
         fold_matrix_link: &FieldR1cs,
     ) -> Result<SplitLinkBlockMatrixPhase<'a>, SplitLinkPreparationError> {
-        let core = self.core;
-        validate_split_fold_matrix_identity(
+        self.prepare_previous_link_with_identity(fold_matrix_link)
+    }
+
+    /// Fold directly over canonical artifact bytes authenticated by
+    /// [`CompactFieldR1cs::open`]. The returned phase retains no matrix
+    /// reference, so the shared compact lease may be released immediately.
+    pub fn prepare_previous_link_compact(
+        self,
+        fold_matrix_link: &CompactFieldR1cs,
+    ) -> Result<SplitLinkBlockMatrixPhase<'a>, SplitLinkPreparationError> {
+        let identity_started = std::time::Instant::now();
+        validate_compact_split_fold_matrix_identity(
             fold_matrix_link,
-            core.class.shape,
-            core.expected_link_matrix_digest,
+            self.core.class.shape,
+            self.core.expected_link_matrix_digest,
             SplitLinkPreparationError::PreviousMatrixShape,
             SplitLinkPreparationError::PreviousMatrixDigest,
         )?;
+        let identity_ms = identity_started.elapsed().as_millis();
+        self.prepare_previous_link_after_identity(identity_ms, |fresh, incoming, gate| {
+            prove_compact_split_matrix_fold(
+                b"history-link-fold-v0",
+                fold_matrix_link,
+                fresh,
+                incoming,
+                gate,
+            )
+        })
+    }
 
-        let mut ch_native = FsLaneChallenger::new(b"history-link-v0");
+    /// Consume a one-shot replay captured while this exact previous Link
+    /// envelope was authored.  Matrix identity and fold proving are unchanged;
+    /// only the redundant host proof replay is replaced.  Any capsule mismatch
+    /// is terminal for this call and never falls back to the full verifier.
+    pub fn prepare_previous_link_locally_authored(
+        self,
+        fold_matrix_link: &FieldR1cs,
+        replay: LocallyAuthoredLinkReplay,
+    ) -> Result<SplitLinkBlockMatrixPhase<'a>, SplitLinkPreparationError> {
+        let identity_started = std::time::Instant::now();
+        validate_split_fold_matrix_identity(
+            fold_matrix_link,
+            self.core.class.shape,
+            self.core.expected_link_matrix_digest,
+            SplitLinkPreparationError::PreviousMatrixShape,
+            SplitLinkPreparationError::PreviousMatrixDigest,
+        )?;
+        let identity_ms = identity_started.elapsed().as_millis();
+        self.prepare_previous_link_after_locally_authored_identity(
+            identity_ms,
+            replay,
+            |fresh, incoming, gate| {
+                prove_split_matrix_fold(
+                    b"history-link-fold-v0",
+                    fold_matrix_link,
+                    fresh,
+                    incoming,
+                    gate,
+                )
+            },
+        )
+    }
+
+    /// Compact-relation twin of
+    /// [`Self::prepare_previous_link_locally_authored`].
+    pub fn prepare_previous_link_compact_locally_authored(
+        self,
+        fold_matrix_link: &CompactFieldR1cs,
+        replay: LocallyAuthoredLinkReplay,
+    ) -> Result<SplitLinkBlockMatrixPhase<'a>, SplitLinkPreparationError> {
+        let identity_started = std::time::Instant::now();
+        validate_compact_split_fold_matrix_identity(
+            fold_matrix_link,
+            self.core.class.shape,
+            self.core.expected_link_matrix_digest,
+            SplitLinkPreparationError::PreviousMatrixShape,
+            SplitLinkPreparationError::PreviousMatrixDigest,
+        )?;
+        let identity_ms = identity_started.elapsed().as_millis();
+        self.prepare_previous_link_after_locally_authored_identity(
+            identity_ms,
+            replay,
+            |fresh, incoming, gate| {
+                prove_compact_split_matrix_fold(
+                    b"history-link-fold-v0",
+                    fold_matrix_link,
+                    fresh,
+                    incoming,
+                    gate,
+                )
+            },
+        )
+    }
+
+    fn prepare_previous_link_after_locally_authored_identity(
+        self,
+        identity_ms: u128,
+        replay: LocallyAuthoredLinkReplay,
+        fold: impl FnOnce(
+            &FreshLincheckClaim,
+            &MatrixAccClaim,
+            bool,
+        ) -> (MatrixFoldProof, MatrixAccClaim),
+    ) -> Result<SplitLinkBlockMatrixPhase<'a>, SplitLinkPreparationError> {
+        let replay_started = std::time::Instant::now();
+        let (fresh_link, r_prev_recording) =
+            consume_locally_authored_link_replay(&self.core, replay)?;
+        let replay_ms = replay_started.elapsed().as_millis();
+        let core = self.core;
+        let k_l = core.class.shape.k_log;
+        let (incoming_link, in_live_link) = if core.input.genesis {
+            (MatrixAccClaim::zero(k_l), F128::ZERO)
+        } else {
+            let lane = &core.layout.link_lanes[core.input.prev_slot];
+            (
+                MatrixAccClaim {
+                    point: core.input.prev.io()[lane.point..lane.value].to_vec(),
+                    value: core.input.prev.io()[lane.value],
+                },
+                core.input.prev.io()[lane.live],
+            )
+        };
+        let gate_link = !core.input.genesis && in_live_link == F128::ONE;
+        let fold_started = std::time::Instant::now();
+        let (fold_proof_link, acc_link) = fold(&fresh_link, &incoming_link, gate_link);
+        let fold_ms = fold_started.elapsed().as_millis();
+        eprintln!(
+            "[split-link-native] previous identity={identity_ms}ms local_replay={replay_ms}ms fold={fold_ms}ms"
+        );
+        Ok(SplitLinkBlockMatrixPhase {
+            core,
+            fold_proof_link,
+            acc_link,
+            r_prev_recording,
+        })
+    }
+
+    fn prepare_previous_link_with_identity(
+        self,
+        fold_matrix_link: &FieldR1cs,
+    ) -> Result<SplitLinkBlockMatrixPhase<'a>, SplitLinkPreparationError> {
+        let identity_started = std::time::Instant::now();
+        validate_split_fold_matrix_identity(
+            fold_matrix_link,
+            self.core.class.shape,
+            self.core.expected_link_matrix_digest,
+            SplitLinkPreparationError::PreviousMatrixShape,
+            SplitLinkPreparationError::PreviousMatrixDigest,
+        )?;
+        let identity_ms = identity_started.elapsed().as_millis();
+        self.prepare_previous_link_after_identity(identity_ms, |fresh, incoming, gate| {
+            prove_split_matrix_fold(
+                b"history-link-fold-v0",
+                fold_matrix_link,
+                fresh,
+                incoming,
+                gate,
+            )
+        })
+    }
+
+    fn prepare_previous_link_after_identity(
+        self,
+        identity_ms: u128,
+        fold: impl FnOnce(
+            &FreshLincheckClaim,
+            &MatrixAccClaim,
+            bool,
+        ) -> (MatrixFoldProof, MatrixAccClaim),
+    ) -> Result<SplitLinkBlockMatrixPhase<'a>, SplitLinkPreparationError> {
+        let core = self.core;
+        let verify_started = std::time::Instant::now();
+        let mut ch_native = LayoutRecordingChallenger::new(
+            b"history-link-v0",
+            core.class.universal_geometry.r_prev_layout().clone(),
+        );
         let (_previous_claim, fresh_link) = verify_field_deferred_matrix_with_post_commit_context(
             &core.class.shape,
             &core.expected_link_matrix_digest,
@@ -2676,6 +3487,10 @@ impl<'a> SplitLinkPreviousMatrixPhase<'a> {
             },
         )
         .map_err(|_| SplitLinkPreparationError::PreviousProof)?;
+        let r_prev_recording = ch_native
+            .finish()
+            .map_err(|_| SplitLinkPreparationError::PreviousProof)?;
+        let verify_ms = verify_started.elapsed().as_millis();
 
         let k_l = core.class.shape.k_log;
         let (incoming_link, in_live_link) = if core.input.genesis {
@@ -2691,17 +3506,17 @@ impl<'a> SplitLinkPreviousMatrixPhase<'a> {
             )
         };
         let gate_link = !core.input.genesis && in_live_link == F128::ONE;
-        let (fold_proof_link, acc_link) = prove_split_matrix_fold(
-            b"history-link-fold-v0",
-            fold_matrix_link,
-            &fresh_link,
-            &incoming_link,
-            gate_link,
+        let fold_started = std::time::Instant::now();
+        let (fold_proof_link, acc_link) = fold(&fresh_link, &incoming_link, gate_link);
+        let fold_ms = fold_started.elapsed().as_millis();
+        eprintln!(
+            "[split-link-native] previous identity={identity_ms}ms verify={verify_ms}ms fold={fold_ms}ms"
         );
         Ok(SplitLinkBlockMatrixPhase {
             core,
             fold_proof_link,
             acc_link,
+            r_prev_recording,
         })
     }
 }
@@ -2714,10 +3529,211 @@ impl<'a> SplitLinkBlockMatrixPhase<'a> {
         self,
         fold_matrix_block: &FieldR1cs,
     ) -> Result<PreparedSplitLink<'a>, SplitLinkPreparationError> {
+        self.prepare_current_block_with_identity(fold_matrix_block)
+    }
+
+    /// Compact-artifact twin of [`Self::prepare_current_block`]. Identity was
+    /// structurally authenticated when the immutable compact view was opened;
+    /// native fold proving walks those exact bytes without decoding CSR.
+    pub fn prepare_current_block_compact(
+        self,
+        fold_matrix_block: &CompactFieldR1cs,
+    ) -> Result<PreparedSplitLink<'a>, SplitLinkPreparationError> {
+        let class = self.core.class;
+        let slot = class.slot;
+        let b_shape = class.ladder[slot].b_shape;
+        let identity_started = std::time::Instant::now();
+        validate_compact_split_fold_matrix_identity(
+            fold_matrix_block,
+            b_shape,
+            self.core.expected_block_matrix_digest,
+            SplitLinkPreparationError::BlockMatrixShape,
+            SplitLinkPreparationError::BlockMatrixDigest,
+        )?;
+        let identity_ms = identity_started.elapsed().as_millis();
+        self.prepare_current_block_after_identity(identity_ms, |fresh, incoming, gate| {
+            prove_compact_split_matrix_fold(
+                b"history-block-fold-v0",
+                fold_matrix_block,
+                fresh,
+                incoming,
+                gate,
+            )
+        })
+    }
+
+    /// Consume the replay captured while this exact current Block was
+    /// authored.  The authenticated matrix fold, transition routing and later
+    /// in-circuit Block replay are unchanged; only the duplicate host verifier
+    /// pass is omitted.  Mismatch is fail-closed with no verifier fallback.
+    pub fn prepare_current_block_locally_authored(
+        self,
+        fold_matrix_block: &FieldR1cs,
+        replay: LocallyAuthoredBlockReplay,
+    ) -> Result<PreparedSplitLink<'a>, SplitLinkPreparationError> {
+        let class = self.core.class;
+        let slot = class.slot;
+        let b_shape = class.ladder[slot].b_shape;
+        let identity_started = std::time::Instant::now();
+        validate_split_fold_matrix_identity(
+            fold_matrix_block,
+            b_shape,
+            self.core.expected_block_matrix_digest,
+            SplitLinkPreparationError::BlockMatrixShape,
+            SplitLinkPreparationError::BlockMatrixDigest,
+        )?;
+        let identity_ms = identity_started.elapsed().as_millis();
+        self.prepare_current_block_after_locally_authored_identity(
+            identity_ms,
+            replay,
+            |fresh, incoming, gate| {
+                prove_split_matrix_fold(
+                    b"history-block-fold-v0",
+                    fold_matrix_block,
+                    fresh,
+                    incoming,
+                    gate,
+                )
+            },
+        )
+    }
+
+    /// Compact-relation twin of
+    /// [`Self::prepare_current_block_locally_authored`].
+    pub fn prepare_current_block_compact_locally_authored(
+        self,
+        fold_matrix_block: &CompactFieldR1cs,
+        replay: LocallyAuthoredBlockReplay,
+    ) -> Result<PreparedSplitLink<'a>, SplitLinkPreparationError> {
+        let class = self.core.class;
+        let slot = class.slot;
+        let b_shape = class.ladder[slot].b_shape;
+        let identity_started = std::time::Instant::now();
+        validate_compact_split_fold_matrix_identity(
+            fold_matrix_block,
+            b_shape,
+            self.core.expected_block_matrix_digest,
+            SplitLinkPreparationError::BlockMatrixShape,
+            SplitLinkPreparationError::BlockMatrixDigest,
+        )?;
+        let identity_ms = identity_started.elapsed().as_millis();
+        self.prepare_current_block_after_locally_authored_identity(
+            identity_ms,
+            replay,
+            |fresh, incoming, gate| {
+                prove_compact_split_matrix_fold(
+                    b"history-block-fold-v0",
+                    fold_matrix_block,
+                    fresh,
+                    incoming,
+                    gate,
+                )
+            },
+        )
+    }
+
+    fn prepare_current_block_after_locally_authored_identity(
+        self,
+        identity_ms: u128,
+        replay: LocallyAuthoredBlockReplay,
+        fold: impl FnOnce(
+            &FreshLincheckClaim,
+            &MatrixAccClaim,
+            bool,
+        ) -> (MatrixFoldProof, MatrixAccClaim),
+    ) -> Result<PreparedSplitLink<'a>, SplitLinkPreparationError> {
+        let replay_started = std::time::Instant::now();
+        let (fresh_block, block_child, child_recording, r_b_recording) =
+            consume_locally_authored_block_replay(&self.core, replay)?;
+        let replay_ms = replay_started.elapsed().as_millis();
         let Self {
             core,
             fold_proof_link,
             acc_link,
+            r_prev_recording,
+        } = self;
+        let class = core.class;
+        let slot = class.slot;
+        let b_lane = &core.layout.b_lanes[slot];
+        let incoming_block = MatrixAccClaim {
+            point: core.input.prev.io()[b_lane.point..b_lane.value].to_vec(),
+            value: core.input.prev.io()[b_lane.value],
+        };
+        let gate_block = core.input.prev.io()[b_lane.live] == F128::ONE;
+        let fold_started = std::time::Instant::now();
+        let (fold_proof_block, acc_block) = fold(&fresh_block, &incoming_block, gate_block);
+        let fold_ms = fold_started.elapsed().as_millis();
+        eprintln!(
+            "[split-link-native] block identity={identity_ms}ms local_replay={replay_ms}ms fold={fold_ms}ms"
+        );
+        let io = route_split_transition_io(
+            &core.layout,
+            core.input.genesis,
+            core.input.prev_slot,
+            slot,
+            &core.input.link_class_digests,
+            &core.input.link_post_commit_class_digests,
+            core.input.prev.io(),
+            &acc_link,
+            &acc_block,
+            &core.input.block.io()[BLOCK_IO_END_ACC..BLOCK_IO_END_ACC + super::link::ACC_LANES],
+        )
+        .map_err(|_| SplitLinkPreparationError::IoRouting)?;
+        Ok(PreparedSplitLink {
+            class,
+            input: core.input,
+            fold_proof_link,
+            fold_proof_block,
+            io,
+            block_child,
+            child_recording,
+            r_b_recording,
+            r_prev_recording,
+            freeze: core.freeze,
+        })
+    }
+
+    fn prepare_current_block_with_identity(
+        self,
+        fold_matrix_block: &FieldR1cs,
+    ) -> Result<PreparedSplitLink<'a>, SplitLinkPreparationError> {
+        let class = self.core.class;
+        let slot = class.slot;
+        let b_shape = class.ladder[slot].b_shape;
+        let identity_started = std::time::Instant::now();
+        validate_split_fold_matrix_identity(
+            fold_matrix_block,
+            b_shape,
+            self.core.expected_block_matrix_digest,
+            SplitLinkPreparationError::BlockMatrixShape,
+            SplitLinkPreparationError::BlockMatrixDigest,
+        )?;
+        let identity_ms = identity_started.elapsed().as_millis();
+        self.prepare_current_block_after_identity(identity_ms, |fresh, incoming, gate| {
+            prove_split_matrix_fold(
+                b"history-block-fold-v0",
+                fold_matrix_block,
+                fresh,
+                incoming,
+                gate,
+            )
+        })
+    }
+
+    fn prepare_current_block_after_identity(
+        self,
+        identity_ms: u128,
+        fold: impl FnOnce(
+            &FreshLincheckClaim,
+            &MatrixAccClaim,
+            bool,
+        ) -> (MatrixFoldProof, MatrixAccClaim),
+    ) -> Result<PreparedSplitLink<'a>, SplitLinkPreparationError> {
+        let Self {
+            core,
+            fold_proof_link,
+            acc_link,
+            r_prev_recording,
         } = self;
         let class = core.class;
         let slot = class.slot;
@@ -2726,15 +3742,11 @@ impl<'a> SplitLinkBlockMatrixPhase<'a> {
             .b_sidecar_vk
             .as_deref()
             .ok_or(SplitLinkPreparationError::ClassIdentity)?;
-        validate_split_fold_matrix_identity(
-            fold_matrix_block,
-            b_shape,
-            core.expected_block_matrix_digest,
-            SplitLinkPreparationError::BlockMatrixShape,
-            SplitLinkPreparationError::BlockMatrixDigest,
-        )?;
-
-        let mut ch_native = FsLaneChallenger::new(b"history-block-v0");
+        let verify_started = std::time::Instant::now();
+        let mut ch_native = LayoutRecordingChallenger::new(
+            b"history-block-v0",
+            class.universal_geometry.r_b_layouts()[slot].clone(),
+        );
         let mut captured_child = None;
         let (_block_claim, fresh_block) = verify_field_deferred_matrix_with_post_commit_context(
             &b_shape,
@@ -2747,15 +3759,24 @@ impl<'a> SplitLinkBlockMatrixPhase<'a> {
             core.input.block.region_sidecar(),
             &mut ch_native,
             |sidecar, context| {
-                let child =
-                    verify_block_region_sidecar_post_commit_captured(b_sidecar_vk, sidecar, context)
-                        .map_err(|_| VerifyError::Auxiliary)?;
+                let child = verify_block_region_sidecar_post_commit_layout_captured(
+                    b_sidecar_vk,
+                    sidecar,
+                    context,
+                    class.universal_geometry.rec_layouts()[slot].clone(),
+                )
+                .map_err(|_| VerifyError::Auxiliary)?;
                 captured_child = Some(child);
                 Ok(())
             },
         )
         .map_err(|_| SplitLinkPreparationError::BlockProof)?;
-        let block_child = captured_child.ok_or(SplitLinkPreparationError::BlockProof)?;
+        let r_b_recording = ch_native
+            .finish()
+            .map_err(|_| SplitLinkPreparationError::BlockProof)?;
+        let verify_ms = verify_started.elapsed().as_millis();
+        let (block_child, child_recording) =
+            captured_child.ok_or(SplitLinkPreparationError::BlockProof)?;
 
         let b_lane = &core.layout.b_lanes[slot];
         let incoming_block = MatrixAccClaim {
@@ -2763,12 +3784,11 @@ impl<'a> SplitLinkBlockMatrixPhase<'a> {
             value: core.input.prev.io()[b_lane.value],
         };
         let gate_block = core.input.prev.io()[b_lane.live] == F128::ONE;
-        let (fold_proof_block, acc_block) = prove_split_matrix_fold(
-            b"history-block-fold-v0",
-            fold_matrix_block,
-            &fresh_block,
-            &incoming_block,
-            gate_block,
+        let fold_started = std::time::Instant::now();
+        let (fold_proof_block, acc_block) = fold(&fresh_block, &incoming_block, gate_block);
+        let fold_ms = fold_started.elapsed().as_millis();
+        eprintln!(
+            "[split-link-native] block identity={identity_ms}ms verify={verify_ms}ms fold={fold_ms}ms"
         );
         let io = route_split_transition_io(
             &core.layout,
@@ -2791,6 +3811,9 @@ impl<'a> SplitLinkBlockMatrixPhase<'a> {
             fold_proof_block,
             io,
             block_child,
+            child_recording,
+            r_b_recording,
+            r_prev_recording,
             freeze: core.freeze,
         })
     }
@@ -2824,7 +3847,36 @@ fn prepare_split_link_native_inner<'a>(
         .expect("current Block native phase")
 }
 
-fn assemble_prepared_split_link(prepared: PreparedSplitLink<'_>) -> BuiltSplitLink {
+enum AssembledPreparedSplitLink {
+    Full(BuiltSplitLink),
+    WitnessOnly(BuiltSplitLinkWitness),
+}
+
+fn assemble_prepared_split_link(
+    prepared: PreparedSplitLink<'_>,
+    established_class: bool,
+) -> BuiltSplitLink {
+    match assemble_prepared_split_link_inner(prepared, established_class, false) {
+        AssembledPreparedSplitLink::Full(built) => built,
+        AssembledPreparedSplitLink::WitnessOnly(_) => unreachable!("full Link assembly mode"),
+    }
+}
+
+fn assemble_prepared_split_link_witness_only(
+    prepared: PreparedSplitLink<'_>,
+) -> BuiltSplitLinkWitness {
+    match assemble_prepared_split_link_inner(prepared, true, true) {
+        AssembledPreparedSplitLink::WitnessOnly(built) => built,
+        AssembledPreparedSplitLink::Full(_) => unreachable!("witness-only Link assembly mode"),
+    }
+}
+
+fn assemble_prepared_split_link_inner(
+    prepared: PreparedSplitLink<'_>,
+    established_class: bool,
+    witness_only: bool,
+) -> AssembledPreparedSplitLink {
+    let assembly_started = std::time::Instant::now();
     let PreparedSplitLink {
         class,
         input,
@@ -2832,6 +3884,9 @@ fn assemble_prepared_split_link(prepared: PreparedSplitLink<'_>) -> BuiltSplitLi
         fold_proof_block,
         io,
         block_child,
+        child_recording,
+        r_b_recording,
+        r_prev_recording,
         freeze,
     } = prepared;
     let layout = class.layout();
@@ -2861,7 +3916,11 @@ fn assemble_prepared_split_link(prepared: PreparedSplitLink<'_>) -> BuiltSplitLi
     ];
 
     // ---- Trace pass.
-    let mut b = FieldR1csBuilder::new();
+    let mut b = if witness_only {
+        FieldR1csBuilder::new_witness_only()
+    } else {
+        FieldR1csBuilder::new()
+    };
     let mut ledger = 0usize;
     let io_start = class.spec.io_slice.start();
     while b.num_wires() < io_start {
@@ -2879,71 +3938,31 @@ fn assemble_prepared_split_link(prepared: PreparedSplitLink<'_>) -> BuiltSplitLi
     // columns' slices — hence the class's opening-claim spec — must be
     // identical across every link class of the ladder, so nothing
     // class-specific (envelope sizes differ per slot!) may precede them.
-    // All three recorded transcripts are deterministic in the (already
-    // natively verified) input proofs; replay each once on a throwaway
-    // builder so its committed recording block can be allocated with the
-    // other universal walk columns.
-    let (w_d_value, w_post_commit_value) = if input.genesis {
-        (
-            flat_digest_lanes(&class.genesis_digest),
-            flat_digest_lanes(
-                class
-                    .genesis_post_commit_class_digest
-                    .get()
-                    .expect("frozen genesis post-commit identity"),
-            ),
-        )
-    } else {
-        (
-            flat_digest_lanes(&input.link_class_digests[input.prev_slot]),
-            flat_digest_lanes(&input.link_post_commit_class_digests[input.prev_slot]),
-        )
-    };
-    let r_prev_scratch = scratch_record_split_r_prev(&SplitRPrevChannelInputs {
-        shape: &class.shape,
-        pcs_params: &class.pcs_params,
-        spec: &class.spec,
-        w_d: w_d_value,
-        w_post_commit: w_post_commit_value,
-        commitment_root: flat_digest_lanes(&input.prev.commitment().root),
-        io: input.prev.io(),
-        proof: input.prev.field_proof(),
-        sidecar_vk: class.sidecar_vk(),
-        sidecar: input.prev.region_sidecar(),
-    })
-    .expect("recorded [R]_prev channel transcript");
-    let (r_b_scratch, rec_scratch) = scratch_record_split_r_b(&SplitRBChannelInputs {
-        b_shape: &b_shape,
-        b_pcs_params: &class.b_pcs_params,
-        b_spec: &class.b_spec,
-        b_digest: &class.ladder[slot].b_digest,
-        b_post_commit: &class.b_post_commit_class_digest,
-        commitment_root: flat_digest_lanes(&input.block.commitment().root),
-        io: input.block.io(),
-        proof: input.block.field_proof(),
-        b_sidecar_vk,
-        sidecar: input.block.region_sidecar(),
-    })
-    .expect("recorded [R]_B channel transcript");
+    // All three data streams were harvested by the already mandatory sound
+    // native verifier passes. The real recursive replays below still run and
+    // pin every data/challenge cell; only the redundant throwaway replay has
+    // disappeared.
     // Native/trace seed lockstep: the child chain's seed is the first data
     // lane of the child recording and must equal the natively captured one.
     assert_eq!(
-        rec_scratch.data_flat.first().copied(),
+        child_recording.data_flat.first().copied(),
         Some(block_child.seed),
         "block-sidecar child seed diverged from the native capture"
     );
+    let columns_started = std::time::Instant::now();
     let r_cols = prepare_r_pcs_link_columns_universal(
         &mut b,
         &r_pcs_proofs,
         &class.universal_geometry,
         &[0, slot + 1],
         LinkLiveRecordings {
-            child: Some(&rec_scratch),
-            r_b: Some(&r_b_scratch),
-            r_prev: Some(&r_prev_scratch),
+            child: Some(child_recording),
+            r_b: Some(r_b_recording),
+            r_prev: Some(r_prev_recording),
         },
     )
     .expect("universal recording link columns");
+    let columns_ms = columns_started.elapsed().as_millis();
     crate::acceptance::row_ledger_mark(&b, &mut ledger, "split: walk columns");
 
     // Envelope wires: the previous link, then the block proof.
@@ -3049,6 +4068,7 @@ fn assemble_prepared_split_link(prepared: PreparedSplitLink<'_>) -> BuiltSplitLi
     // link's full sidecar verify, zerocheck/lincheck, the batched PCS
     // opening) is RECORDED into walk L-C instead of replayed as inline
     // sponge permutations.  Only the verifier algebra stays in-trace.
+    let trace_prev_started = std::time::Instant::now();
     let mut obs_prev = PcsWalkObligations::default();
     let mut ch = FsChannelUnionRecorder::new(R_PREV_CHANNEL_DOMAIN);
     let (_pce, fresh_link_e) = verify_field_trace_deferred_region_with_post_commit_context_expr(
@@ -3074,10 +4094,12 @@ fn assemble_prepared_split_link(prepared: PreparedSplitLink<'_>) -> BuiltSplitLi
         },
     );
     let recorded_r_prev = ch.finish();
+    let trace_prev_ms = trace_prev_started.elapsed().as_millis();
     crate::acceptance::row_ledger_mark(&b, &mut ledger, "split: [R]_prev replay");
 
     // ---- [R]_B: the deferred replay of the block proof, against the
     // BAKED block-class digest — same recording discipline.
+    let trace_block_started = std::time::Instant::now();
     let d_b = flat_digest_lanes(&class.ladder[slot].b_digest);
     let w_b: FlatDigestExpr = [LinExpr::constant(d_b[0]), LinExpr::constant(d_b[1])];
     let mut obs_block = PcsWalkObligations::default();
@@ -3108,6 +4130,7 @@ fn assemble_prepared_split_link(prepared: PreparedSplitLink<'_>) -> BuiltSplitLi
     );
     let recorded_child = recorded_child.expect("recorded block-sidecar child transcript");
     let recorded_r_b = chb.finish();
+    let trace_block_ms = trace_block_started.elapsed().as_millis();
     crate::acceptance::row_ledger_mark(&b, &mut ledger, "split: [R]_B replay");
 
     // ---- Genesis arm: the fresh [R]_prev claim equals T's baked
@@ -3242,6 +4265,7 @@ fn assemble_prepared_split_link(prepared: PreparedSplitLink<'_>) -> BuiltSplitLi
     }
     crate::acceptance::row_ledger_mark(&b, &mut ledger, "split: chain rules");
 
+    let finalize_started = std::time::Instant::now();
     let region_preparation = finalize_r_pcs_link_region(
         &mut b,
         r_cols,
@@ -3251,6 +4275,7 @@ fn assemble_prepared_split_link(prepared: PreparedSplitLink<'_>) -> BuiltSplitLi
         &recorded_r_prev,
     )
     .expect("recording link semantic binding");
+    let finalize_ms = finalize_started.elapsed().as_millis();
     assert_eq!(
         region_preparation.vk(),
         class.sidecar_vk(),
@@ -3269,28 +4294,61 @@ fn assemble_prepared_split_link(prepared: PreparedSplitLink<'_>) -> BuiltSplitLi
         used <= target,
         "split link outgrew the class shape: {used} > {target}"
     );
+    let build_started = std::time::Instant::now();
+    if witness_only {
+        let (witness_rows, mut witness) = b.build_witness_only();
+        assert_eq!(
+            witness_rows, used,
+            "link witness-only useful-row accounting"
+        );
+        assert!(
+            witness.len() <= target,
+            "link witness-only natural dyadic shape exceeds its class"
+        );
+        witness.resize(target, F128::ZERO);
+        let build_ms = build_started.elapsed().as_millis();
+        eprintln!(
+            "[split-link-assemble] native-recordings=reused columns={columns_ms}ms trace-prev={trace_prev_ms}ms trace-block={trace_block_ms}ms finalize={finalize_ms}ms witness-build={build_ms}ms total={}ms",
+            assembly_started.elapsed().as_millis()
+        );
+        return AssembledPreparedSplitLink::WitnessOnly(BuiltSplitLinkWitness {
+            useful_rows: used,
+            witness,
+            io,
+            region_preparation,
+        });
+    }
     let (r1cs, witness) = b.build();
     let (r1cs, witness) = super::expand_empty_field_tail(r1cs, witness, class.shape);
+    let build_ms = build_started.elapsed().as_millis();
     assert_eq!(r1cs.m, class.shape.m, "class shape mismatch after padding");
     assert_eq!(r1cs.useful_rows, used, "link useful-row accounting");
+    let digest_started = std::time::Instant::now();
     if !freeze {
         let class_digest = class
             .class_statement_digest
             .get()
             .expect("frozen link matrix digest");
-        assert_eq!(
-            r1cs.statement_digest(),
-            *class_digest,
-            "same-slot link matrix drifted from its frozen class"
-        );
+        if !established_class {
+            assert_eq!(
+                r1cs.statement_digest(),
+                *class_digest,
+                "same-slot link matrix drifted from its frozen class"
+            );
+        }
         r1cs.seed_statement_digest(*class_digest);
     }
-    BuiltSplitLink {
+    let digest_ms = digest_started.elapsed().as_millis();
+    eprintln!(
+        "[split-link-assemble] native-recordings=reused columns={columns_ms}ms trace-prev={trace_prev_ms}ms trace-block={trace_block_ms}ms finalize={finalize_ms}ms build={build_ms}ms digest={digest_ms}ms total={}ms",
+        assembly_started.elapsed().as_millis()
+    );
+    AssembledPreparedSplitLink::Full(BuiltSplitLink {
         r1cs,
         witness,
         io,
         region_preparation,
-    }
+    })
 }
 
 enum PendingMatrixLane {
@@ -3876,16 +4934,28 @@ mod tests {
                 .collect::<Vec<_>>(),
             noid_chain::consensus::params::USER_TX_CLASS_TIERS
         );
-        assert_eq!(descriptor.link_shape(), ladder_test_shape(CANONICAL_LINK_CLASS_M));
+        assert_eq!(
+            descriptor.link_shape(),
+            ladder_test_shape(CANONICAL_LINK_CLASS_M)
+        );
         assert!(same_pcs_params(
             descriptor.link_pcs_params(),
             &ladder_test_pcs(CANONICAL_LINK_CLASS_M)
         ));
+        let descriptor_clone = descriptor.clone();
+        assert!(
+            Arc::ptr_eq(&descriptor.slots, &descriptor_clone.slots),
+            "descriptor clone must not copy compiled ladder layouts"
+        );
 
         let short = canonical_test_slots().into_iter().take(3).collect();
         assert_eq!(
-            CanonicalSplitLinkLadder::try_new(ladder_test_shape(CANONICAL_LINK_CLASS_M), ladder_test_pcs(CANONICAL_LINK_CLASS_M), short,)
-                .unwrap_err(),
+            CanonicalSplitLinkLadder::try_new(
+                ladder_test_shape(CANONICAL_LINK_CLASS_M),
+                ladder_test_pcs(CANONICAL_LINK_CLASS_M),
+                short,
+            )
+            .unwrap_err(),
             CanonicalLadderError::SlotCount {
                 expected: 4,
                 actual: 3,
@@ -3898,8 +4968,12 @@ mod tests {
         let mut mutated = canonical_test_slots();
         mutated[2].tier = 63;
         assert_eq!(
-            CanonicalSplitLinkLadder::try_new(ladder_test_shape(CANONICAL_LINK_CLASS_M), ladder_test_pcs(CANONICAL_LINK_CLASS_M), mutated,)
-                .unwrap_err(),
+            CanonicalSplitLinkLadder::try_new(
+                ladder_test_shape(CANONICAL_LINK_CLASS_M),
+                ladder_test_pcs(CANONICAL_LINK_CLASS_M),
+                mutated,
+            )
+            .unwrap_err(),
             CanonicalLadderError::TierMismatch {
                 slot: 2,
                 expected: 64,
@@ -4459,6 +5533,9 @@ mod tests {
         assert!(!shared_fields.contains("genesis: Arc"));
         assert!(!fields.contains("FieldR1cs"));
         assert!(!fields.contains("genesis: Arc"));
+        assert!(fields.contains("ladder: SharedLadderSlots"));
+        assert!(!fields.contains("ladder: Vec<LadderSlotInfo>"));
+        assert!(fields.contains("universal_geometry: Arc<BoundRPcsLinkUniversalGeometry>"));
         assert!(fields
             .contains("b_sidecar_vk: Option<Arc<crate::region_sidecar::BlockRegionSidecarVk>>"));
         assert!(fields.contains("b_sidecar_vk_digest: [u8; 32]"));
@@ -4469,7 +5546,7 @@ mod tests {
                 >= 1
         );
         let block_phase = source
-            .split("pub fn prepare_current_block(")
+            .split("fn prepare_current_block_after_identity(")
             .nth(1)
             .expect("Block matrix phase")
             .split("Ok(PreparedSplitLink")
@@ -4482,6 +5559,23 @@ mod tests {
             .find("verify_block_region_sidecar_post_commit")
             .expect("mandatory native nested Block post-commit replay");
         assert!(require_vk < replay);
+        let block_identity = source
+            .split("fn prepare_current_block_with_identity(")
+            .nth(1)
+            .expect("Block identity phase")
+            .split("fn prepare_current_block_after_identity(")
+            .next()
+            .expect("Block identity phase boundary");
+        assert!(block_identity.contains("self.prepare_current_block_after_identity"));
+        let local_block_replay = source
+            .split("fn consume_locally_authored_block_replay(")
+            .nth(1)
+            .expect("local Block replay consumer")
+            .split("fn validate_split_fold_matrix_identity(")
+            .next()
+            .expect("local Block replay boundary");
+        assert!(local_block_replay.contains(".b_sidecar_vk"));
+        assert!(local_block_replay.contains("BlockLocalReplayMismatch"));
         let native_preflight = source
             .split("fn begin_split_link_native_preparation_inner")
             .nth(1)
@@ -4492,6 +5586,74 @@ mod tests {
         assert!(native_preflight.contains("class.b_sidecar_vk.is_none()"));
         assert!(block_source.contains("Arc::clone(&self.sidecar_vk)"));
         assert!(source.contains("pub fn rebuild_genesis_matrix"));
+    }
+
+    #[test]
+    fn runtime_class_validation_uses_bound_geometry_without_rebuilding_it() {
+        let source = include_str!("split_link.rs");
+        let binding_fields = source
+            .split("pub(crate) struct BoundRPcsLinkUniversalGeometry {")
+            .nth(1)
+            .expect("bound universal geometry capability")
+            .split('}')
+            .next()
+            .expect("bound universal geometry fields");
+        assert!(!binding_fields.lines().any(|line| {
+            let line = line.trim_start();
+            line.starts_with("pub ") || line.starts_with("pub(")
+        }));
+        let binding_mint = ["Ok(Arc::new(BoundRPcsLink", "UniversalGeometry {"].concat();
+        assert_eq!(
+            source.matches(&binding_mint).count(),
+            1,
+            "only the fully validated descriptor may mint a geometry binding"
+        );
+
+        let external_constructor = source
+            .split("pub fn try_new(")
+            .nth(1)
+            .expect("external ladder constructor")
+            .split("pub fn from_block_classes(")
+            .next()
+            .expect("external ladder constructor boundary");
+        assert!(external_constructor.contains("Self::preflight_universal_geometry("));
+
+        let full_preflight = source
+            .split("fn preflight_universal_geometry(")
+            .nth(1)
+            .expect("full geometry preflight")
+            .split("pub fn from_block_classes(")
+            .next()
+            .expect("full geometry preflight boundary");
+        assert!(full_preflight.contains("RPcsLinkUniversalGeometry::new("));
+        assert!(full_preflight.contains("b_sidecar_rec_layout.clone()"));
+        assert!(full_preflight.contains("b_r_replay_rec_layout.clone()"));
+
+        let metadata_only = source
+            .split("fn validate_metadata(")
+            .nth(1)
+            .expect("metadata-only ladder validation")
+            .split("fn preflight_universal_geometry(")
+            .next()
+            .expect("metadata-only validation boundary");
+        assert!(!metadata_only.contains("RPcsLinkUniversalGeometry::new"));
+        assert!(!metadata_only.contains("DuplexLayout::clone"));
+        assert!(!metadata_only.contains("b_sidecar_rec_layout.clone()"));
+        assert!(!metadata_only.contains("b_r_replay_rec_layout.clone()"));
+
+        let runtime_validation = source
+            .split("fn validate_frozen_identity(&self)")
+            .nth(1)
+            .expect("runtime class identity validation")
+            .split("if self.shape.m.checked_add")
+            .next()
+            .expect("runtime class identity validation preamble");
+        assert!(runtime_validation.contains("CanonicalSplitLinkLadder::validate_metadata("));
+        assert!(runtime_validation.contains(".universal_geometry"));
+        assert!(runtime_validation.contains(".is_bound_to("));
+        assert!(!runtime_validation.contains("preflight_universal_geometry"));
+        assert!(!runtime_validation.contains("RPcsLinkUniversalGeometry::new"));
+        assert!(!runtime_validation.contains(".clone()"));
     }
 
     #[test]
@@ -4898,6 +6060,61 @@ mod tests {
             phased.region_preparation.vk(),
             "phased sidecar preparation parity"
         );
+
+        let shape = FieldShape::of(&combined.r1cs);
+        let digest = combined.r1cs.structural_statement_digest();
+        let mut artifact = Vec::new();
+        combined.r1cs.write_artifact(&mut artifact).unwrap();
+        let compact = CompactFieldR1cs::open(artifact.into_boxed_slice(), shape, digest).unwrap();
+        let witness_phase =
+            begin_split_link_native_preparation(class, SplitLinkTraceInput::from_combined(input))
+                .expect("witness-only split-link preflight")
+                .prepare_previous_link(input.fold_matrix_link)
+                .expect("witness-only previous Link phase")
+                .prepare_current_block(input.fold_matrix_block)
+                .expect("witness-only current Block phase")
+                .assemble_witness_only_established(&compact)
+                .expect("authenticated witness-only Link assembly");
+        assert_eq!(
+            witness_phase.useful_rows, combined.r1cs.useful_rows,
+            "witness-only useful-row parity"
+        );
+        assert_eq!(
+            witness_phase.witness, combined.witness,
+            "witness-only Link trace parity"
+        );
+        assert_eq!(witness_phase.io, combined.io, "witness-only Link IO parity");
+        assert_eq!(
+            witness_phase.region_preparation.vk(),
+            combined.region_preparation.vk(),
+            "witness-only Link sidecar VK parity"
+        );
+
+        let mut full_challenger = FsLaneChallenger::new(b"history-link-v0");
+        let full_envelope = prove_built_split_link(class, &combined, &mut full_challenger)
+            .expect("full Link parity proof");
+        let mut compact_challenger = FsLaneChallenger::new(b"history-link-v0");
+        let compact_envelope = prove_built_split_link_compact(
+            class,
+            &compact,
+            &witness_phase,
+            &mut compact_challenger,
+        )
+        .expect("compact Link parity proof");
+        assert_eq!(
+            bincode::serialize(&compact_envelope).unwrap(),
+            bincode::serialize(&full_envelope).unwrap(),
+            "full and compact Link proof bytes"
+        );
+        let (local_envelope, local_replay) =
+            prove_built_split_link_locally_authored(class, &combined)
+                .expect("locally-authored Link parity proof");
+        assert_eq!(
+            bincode::serialize(&local_envelope).unwrap(),
+            bincode::serialize(&full_envelope).unwrap(),
+            "locally-authored capture changed Link envelope bytes"
+        );
+        drop(local_replay);
     }
 
     #[test]
@@ -4910,6 +6127,225 @@ mod tests {
         ) -> BuiltSplitLink = phased_matrix_release_compile_contract;
         let _parity: for<'a> fn(&'a SplitLinkClass, &SplitLinkInput<'a>) =
             combined_and_phased_build_parity_contract;
+    }
+
+    #[test]
+    fn locally_authored_replay_api_is_one_shot_bound_and_has_no_fallback() {
+        let link_source = include_str!("split_link.rs");
+        let block_source = include_str!("block_class.rs");
+        let sidecar_source = include_str!("../region_sidecar/block.rs");
+        let lincheck_source = include_str!("../../../noid_ivc_core/src/lincheck.rs");
+
+        for (source, name) in [
+            (block_source, "LocallyAuthoredBlockReplay"),
+            (link_source, "LocallyAuthoredLinkReplay"),
+        ] {
+            let declaration = format!("pub struct {name} {{");
+            let declaration_at = source
+                .find(&declaration)
+                .expect("replay capsule declaration");
+            let attribute_block = source[..declaration_at]
+                .rsplit("\n\n")
+                .next()
+                .expect("replay capsule attribute block");
+            assert!(!attribute_block.contains("#[derive("));
+            assert!(!source.contains(&format!("impl Clone for {name}")));
+            assert!(!source.contains(&format!("Serialize for {name}")));
+            assert!(!source.contains(&format!("Deserialize for {name}")));
+            let fields = source[declaration_at + declaration.len()..]
+                .split('}')
+                .next()
+                .expect("replay capsule field list");
+            assert!(
+                !fields.lines().any(|line| {
+                    let line = line.trim_start();
+                    line.starts_with("pub ") || line.starts_with("pub(")
+                }),
+                "{name} exposed a construction or inspection field",
+            );
+            assert!(source.contains(&format!(
+                "a locally authored {} replay must be consumed",
+                if name.contains("Block") {
+                    "Block"
+                } else {
+                    "Link"
+                }
+            )));
+        }
+
+        let fresh_capture = lincheck_source
+            .split("pub struct LocallyAuthoredFreshLincheckCapture {")
+            .nth(1)
+            .expect("fresh lincheck capture declaration")
+            .split('}')
+            .next()
+            .expect("fresh lincheck capture fields");
+        assert!(!fresh_capture.contains("pub fresh:"));
+        assert!(!fresh_capture.contains("pub(crate) fresh:"));
+        let fresh_inspection = lincheck_source
+            .split("impl LocallyAuthoredFreshLincheckCapture {")
+            .nth(1)
+            .expect("fresh lincheck capture implementation")
+            .split("pub fn into_fresh_claim")
+            .next()
+            .expect("fresh lincheck inspection boundary");
+        assert!(fresh_inspection.contains("#[cfg(test)]"));
+        assert!(fresh_inspection.contains("pub(crate) fn fresh_claim"));
+        assert!(!fresh_inspection.contains("pub fn fresh_claim"));
+
+        assert!(block_source.contains("link_class: &SplitLinkClass"));
+        assert!(block_source.contains("locally_authored_block_envelope_digest(&envelope)"));
+        assert!(link_source.contains("locally_authored_link_envelope_digest(&envelope)"));
+        assert!(block_source.contains("commitment_root: envelope.commitment.root"));
+        assert!(link_source.contains("commitment_root: envelope.commitment.root"));
+
+        let local_previous = link_source
+            .split("fn prepare_previous_link_after_locally_authored_identity(")
+            .nth(1)
+            .expect("local previous-Link replay path")
+            .split("fn prepare_previous_link_with_identity(")
+            .next()
+            .expect("local previous-Link path boundary");
+        assert!(local_previous.contains("consume_locally_authored_link_replay"));
+        assert!(!local_previous.contains("verify_field_deferred_matrix"));
+
+        let local_block = link_source
+            .split("fn prepare_current_block_after_locally_authored_identity(")
+            .nth(1)
+            .expect("local current-Block replay path")
+            .split("fn prepare_current_block_with_identity(")
+            .next()
+            .expect("local current-Block path boundary");
+        assert!(local_block.contains("consume_locally_authored_block_replay"));
+        assert!(!local_block.contains("verify_field_deferred_matrix"));
+
+        for method in [
+            "prepare_previous_link_locally_authored",
+            "prepare_previous_link_compact_locally_authored",
+            "prepare_current_block_locally_authored",
+            "prepare_current_block_compact_locally_authored",
+        ] {
+            assert!(link_source.contains(&format!("pub fn {method}(")));
+        }
+        assert!(link_source.contains("PreviousLocalReplayMismatch"));
+        assert!(link_source.contains("BlockLocalReplayMismatch"));
+
+        let previous_consumer = link_source
+            .split("fn consume_locally_authored_link_replay(")
+            .nth(1)
+            .expect("previous Link capsule consumer")
+            .split("fn consume_locally_authored_block_replay(")
+            .next()
+            .expect("previous Link consumer boundary");
+        for binding in [
+            "locally_authored_link_envelope_digest(core.input.prev)",
+            "commitment_root",
+            "core.input.prev_slot",
+            "core.class.shape",
+            "core.expected_link_matrix_digest",
+            "core.expected_link_post_commit",
+            "sidecar_vk().transcript_digest()",
+            "r_prev_recording.layout",
+            "PreviousLocalReplayMismatch",
+        ] {
+            assert!(previous_consumer.contains(binding), "missing {binding}");
+        }
+        assert!(!previous_consumer.contains("verify_field_deferred_matrix"));
+
+        let block_consumer = link_source
+            .split("fn consume_locally_authored_block_replay(")
+            .nth(1)
+            .expect("current Block capsule consumer")
+            .split("fn validate_split_fold_matrix_identity(")
+            .next()
+            .expect("current Block consumer boundary");
+        for binding in [
+            "locally_authored_block_envelope_digest(core.input.block)",
+            "commitment_root",
+            "block_tier",
+            "block_shape",
+            "core.expected_block_matrix_digest",
+            "block_post_commit_digest",
+            "block_sidecar_vk_digest",
+            "link_slot",
+            "link_shape",
+            "link_matrix_digest",
+            "link_post_commit_digest",
+            "link_sidecar_vk_digest",
+            "child_recording.layout",
+            "r_b_recording.layout",
+            "BlockLocalReplayMismatch",
+        ] {
+            assert!(block_consumer.contains(binding), "missing {binding}");
+        }
+        assert!(!block_consumer.contains("verify_field_deferred_matrix"));
+
+        let captured_sidecar = sidecar_source
+            .split("pub(crate) fn prove_post_commit_layout_captured")
+            .nth(1)
+            .expect("captured Block sidecar prover")
+            .split("/// The fixed-shape selected-ZK")
+            .next()
+            .expect("captured sidecar boundary");
+        let captured_sidecar_compact = captured_sidecar.split_whitespace().collect::<String>();
+        assert!(captured_sidecar.contains("LayoutRecordingChallenger::new"));
+        assert!(captured_sidecar_compact.contains("letrecording=child.finish()"));
+        assert!(captured_sidecar.contains("context.append_claims(claims)"));
+    }
+
+    #[test]
+    fn locally_authored_field_envelope_bytes_are_legacy_identical() {
+        let (relation, witness) =
+            noid_ivc_core::field_r1cs::synthetic_satisfiable(10, 7, 0x10CA_1A7E);
+        let params = PcsParams {
+            m: relation.m + noid_ivc_core::pcs::LOG_PACKING,
+            log_inv_rate: 2,
+            log_batch_size: 2,
+            profile: Default::default(),
+        };
+        let spec = PublicIoSpec {
+            io_slice: WitnessSlice {
+                log2_len: 0,
+                index: 1,
+            },
+            io_len: 1,
+            claims: Vec::new(),
+        };
+        let io = vec![witness[spec.io_slice.start()]];
+        let post_commit = [0xA7; 32];
+
+        let mut legacy_ch = FsLaneChallenger::new(b"local-envelope-byte-parity-v0");
+        let (legacy_proof, (), legacy_commitment, legacy_claim) =
+            prove_field_with_public_io_and_post_commit_context(
+                &relation,
+                &witness,
+                &params,
+                &spec,
+                &io,
+                &post_commit,
+                &mut legacy_ch,
+                |_| (),
+            );
+        let mut local_ch = FsLaneChallenger::new(b"local-envelope-byte-parity-v0");
+        let (local_proof, (), local_commitment, local_claim, local_fresh) =
+            prove_field_with_public_io_and_post_commit_context_capturing_fresh_lincheck(
+                &relation,
+                &witness,
+                &params,
+                &spec,
+                &io,
+                &post_commit,
+                &mut local_ch,
+                |_| (),
+            );
+        assert_eq!(legacy_claim, local_claim);
+        assert_eq!(
+            bincode::serialize(&(legacy_proof, legacy_commitment, &io)).unwrap(),
+            bincode::serialize(&(local_proof, local_commitment, &io)).unwrap(),
+            "locally authored capture changed the serialized Field envelope",
+        );
+        let fresh = local_fresh.into_fresh_claim();
+        assert_eq!(fresh.z_partial.len(), 1usize << relation.k_skip);
     }
 
     fn fold_test_fresh(matrix: &FieldR1cs, mut seed: u128) -> FreshLincheckClaim {
@@ -5042,17 +6478,23 @@ mod tests {
     #[test]
     fn production_phased_api_is_public_consuming_and_compatibility_is_thin() {
         let source = include_str!("split_link.rs");
-        assert!(source.contains("pub fn begin_split_link_native_preparation<'a>("));
-        assert!(source.contains("pub struct SplitLinkPreviousMatrixPhase<'a>"));
-        assert!(source.contains("pub struct SplitLinkBlockMatrixPhase<'a>"));
-        assert!(source.contains(
+        let production = source
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("production source boundary");
+        assert!(production.contains("pub fn begin_split_link_native_preparation<'a>("));
+        assert!(production.contains("pub struct SplitLinkPreviousMatrixPhase<'a>"));
+        assert!(production.contains("pub struct SplitLinkBlockMatrixPhase<'a>"));
+        assert!(production.contains(
             "pub fn prepare_previous_link(\n        self,\n        fold_matrix_link: &FieldR1cs,"
         ));
-        assert!(source.contains(
+        assert!(production.contains(
             "pub fn prepare_current_block(\n        self,\n        fold_matrix_block: &FieldR1cs,"
         ));
+        assert!(!production.contains("pub fn prepare_previous_link_established"));
+        assert!(!production.contains("pub fn prepare_current_block_established"));
 
-        let compatibility = source
+        let compatibility = production
             .split("fn prepare_split_link_native_inner<'a>(")
             .nth(1)
             .expect("compatibility wrapper")

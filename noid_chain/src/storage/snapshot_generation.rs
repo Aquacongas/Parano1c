@@ -471,14 +471,13 @@ pub fn export_snapshot_generation(
             }
             // Tagged coinbase ids live in the `TAG | mint_height` namespace
             // and are bounded by the target height, not the allocator counter.
-            let creation_in_target = if crate::consensus::params::is_coinbase_creation_id(
-                slot.creation_id(),
-            ) {
-                crate::consensus::params::coinbase_creation_height(slot.creation_id())
-                    <= target_header.height
-            } else {
-                slot.creation_id() <= target_header.alloc_counter
-            };
+            let creation_in_target =
+                if crate::consensus::params::is_coinbase_creation_id(slot.creation_id()) {
+                    crate::consensus::params::coinbase_creation_height(slot.creation_id())
+                        <= target_header.height
+                } else {
+                    slot.creation_id() <= target_header.alloc_counter
+                };
             if !creation_in_target {
                 return Err(SnapshotGenerationError::CreationIdExceedsTarget {
                     segment_id,

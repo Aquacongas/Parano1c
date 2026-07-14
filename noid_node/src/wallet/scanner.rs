@@ -383,7 +383,7 @@ mod tests {
     use noid_chain::block_header::BlockHeader;
     use noid_poseidon2b::primitives::Address;
     use noid_tx::{
-        TX_INPUTS, TX_OUTPUTS, Transaction, TxBody, TxInput, TxOutput, output_bitmap_bit,
+        output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS,
     };
 
     fn transaction(is_coinbase: bool, slot_index: u32, owner: Address) -> Transaction {
@@ -505,18 +505,16 @@ mod tests {
         let mut receipts = HashMap::new();
         let mut pending_inputs = std::collections::HashSet::new();
 
-        assert!(
-            update_active_wallet_from_block(
-                &mut utxos,
-                &mut history,
-                &mut receipts,
-                owner,
-                0,
-                &mut pending_inputs,
-                &block,
-            )
-            .is_err()
-        );
+        assert!(update_active_wallet_from_block(
+            &mut utxos,
+            &mut history,
+            &mut receipts,
+            owner,
+            0,
+            &mut pending_inputs,
+            &block,
+        )
+        .is_err());
 
         assert!(utxos.is_empty());
         assert!(history.is_empty());

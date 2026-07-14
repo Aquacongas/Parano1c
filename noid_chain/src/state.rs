@@ -16,6 +16,7 @@
 //! proof, then commits the sealed verifier result atomically.
 
 use std::collections::{BTreeMap, HashSet};
+use std::sync::Arc;
 
 use noid_poseidon2b::primitives::Digest;
 use noid_tx::TxBody;
@@ -292,7 +293,7 @@ pub struct SelectedHistoryLadderUpdate {
     pub alloc_counter: u64,
     pub state_root: StateHash,
     pub segment_summaries: Vec<(u16, u32, StateHash)>,
-    pub dirty_segments: Vec<(u16, Option<SegmentColumns>)>,
+    pub dirty_segments: Vec<(u16, Option<Arc<SegmentColumns>>)>,
 }
 
 impl SelectedHistoryLadderUpdate {
@@ -306,6 +307,25 @@ impl SelectedHistoryLadderUpdate {
             segment_summaries: Vec::new(),
             dirty_segments: Vec::new(),
         }
+    }
+
+    /// Exact retained bytes in the shared immutable dirty column buffers.
+    /// This excludes tiny vector/Arc metadata and counts each update's owned
+    /// segment versions once; the pipeline scheduler uses it to keep its
+    /// depth decision proportional to the actual state overlay.
+    pub fn retained_dirty_columns_bytes(&self) -> usize {
+        self.dirty_segments
+            .iter()
+            .filter_map(|(_, columns)| columns.as_deref())
+            .map(|columns| {
+                columns
+                    .values
+                    .capacity()
+                    .saturating_add(columns.owners_hi.capacity())
+                    .saturating_add(columns.owners_lo.capacity())
+                    .saturating_mul(core::mem::size_of::<u128>())
+            })
+            .fold(0usize, usize::saturating_add)
     }
 }
 
@@ -682,6 +702,33 @@ impl ChainState {
         Ok(())
     }
 
+    /// Reinstall one already-authenticated immutable pipeline segment without
+    /// eagerly cloning its column buffers. Exact-root authentication is still
+    /// repeated at this boundary; sharing changes ownership only, never trust.
+    pub(crate) fn restore_shared_evicted_segment(
+        &mut self,
+        segment_id: u16,
+        columns: Arc<SegmentColumns>,
+    ) -> Result<(), ExactStateReadError> {
+        let actual = exact_segment_root_with_updates(
+            self.state.effective_log_segment_size(),
+            Some(&columns),
+            &BTreeMap::new(),
+        );
+        if self
+            .exact_roots
+            .segment_roots
+            .get(segment_id as usize)
+            .copied()
+            != Some(actual)
+        {
+            return Err(ExactStateReadError::SegmentRootMismatch { seg_id: segment_id });
+        }
+        self.state
+            .restore_shared_evicted_segment(segment_id, columns);
+        Ok(())
+    }
+
     /// Read the canonical exact-state sibling frontier without building a
     /// global sparse-node map.  Local sibling subtrees are streamed from the
     /// already-hydrated touched segments; upper siblings come from the compact
@@ -933,7 +980,7 @@ impl ChainState {
                 .state
                 .take_segment_columns(segment_id)
                 .ok_or("ladder update dirty live segment has no resident columns")?;
-            dirty_segments.push((segment_id, Some(*columns)));
+            dirty_segments.push((segment_id, Some(columns)));
         }
 
         Ok(SelectedHistoryLadderUpdate {

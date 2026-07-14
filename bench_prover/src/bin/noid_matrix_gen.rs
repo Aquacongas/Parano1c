@@ -17,7 +17,9 @@
 use std::io::Write as _;
 use std::time::Instant;
 
-use bench_prover::{accepted_proved_user_block_fixture, tx8x2_scenario, AcceptedSingleBlockFixture};
+use bench_prover::{
+    accepted_proved_user_block_fixture, tx8x2_scenario, AcceptedSingleBlockFixture,
+};
 use noid_ivc_prover::challenger::FsLaneChallenger;
 use noid_ivc_prover::field_r1cs::FieldR1cs;
 use noid_ivc_prover::pcs::{self, PcsParams};
@@ -166,8 +168,7 @@ fn export_matrix(
 ) {
     let digest = matrix.statement_digest();
     assert_eq!(
-        digest,
-        expected_digest,
+        digest, expected_digest,
         "canonical {kind:?} matrix digest drifted from its frozen class identity",
     );
     let identity =
@@ -194,7 +195,8 @@ fn main() {
 
     // [1] Deterministic floor members, one per Block class.
     let t = stage(1, total, "building four canonical floor members");
-    let fixtures: Vec<AcceptedSingleBlockFixture> = TIERS.iter().map(|&t| floor_fixture(t)).collect();
+    let fixtures: Vec<AcceptedSingleBlockFixture> =
+        TIERS.iter().map(|&t| floor_fixture(t)).collect();
     done(t);
 
     // [2] Freeze the four Block classes.
@@ -206,7 +208,9 @@ fn main() {
             freeze_block_class(
                 fixture,
                 tier,
-                pcs_params(CANONICAL_BLOCK_CLASS_MS[TIERS.iter().position(|c| *c == tier).unwrap()]),
+                pcs_params(
+                    CANONICAL_BLOCK_CLASS_MS[TIERS.iter().position(|c| *c == tier).unwrap()],
+                ),
             )
         })
         .collect();
@@ -287,8 +291,7 @@ fn main() {
             .try_into()
             .expect("rebuilt registry trailer digest");
         assert_eq!(
-            existing_digest,
-            fresh_digest,
+            existing_digest, fresh_digest,
             "installed registry does not match the independently rebuilt one",
         );
         println!("        installed registry digest reproduced independently");
@@ -303,7 +306,11 @@ fn main() {
     done(t);
 
     // [6] The five Link-family matrices: T plus one derivation build per slot.
-    let t = stage(6, total, "building and exporting T and the four Link matrices");
+    let t = stage(
+        6,
+        total,
+        "building and exporting T and the four Link matrices",
+    );
     let genesis_matrix = link_classes[0]
         .rebuild_genesis_matrix()
         .expect("rebuild canonical T matrix");

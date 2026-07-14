@@ -37,7 +37,7 @@
 #![allow(clippy::needless_range_loop)]
 
 use std::collections::HashSet;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use noid_core::{Block128, TowerField};
 use noid_poseidon2b::native::compress;
@@ -324,7 +324,12 @@ pub struct SegmentedFriState {
     ///   (a) a virtual zero segment — no UTXO data, or
     ///   (b) an evicted segment — has UTXO data in MDBX but is not in RAM.
     /// Use `is_evicted(i)` to distinguish the two cases.
-    segments: Vec<Option<Box<SegmentColumns>>>,
+    // Immutable segment versions are reference-counted so the selected-history
+    // proof pipeline can hand an authenticated parent version to the next
+    // replay without eagerly copying three 1 MiB columns. Every mutation goes
+    // through `Arc::make_mut`, preserving ordinary owned-state semantics while
+    // an older boundary remains queued for durable promotion.
+    segments: Vec<Option<Arc<SegmentColumns>>>,
     /// `seg_roots[i] = None` means the root must be recomputed.
     /// Kept valid even after segment columns are evicted.
     seg_roots: Vec<Option<StateRoot>>,
@@ -624,14 +629,14 @@ impl SegmentedFriState {
                 }
                 // Materialise the segment.
                 let seg_size = self.segment_slot_count();
-                self.segments[seg_idx] = Some(Box::new(SegmentColumns::new_zero(seg_size)));
+                self.segments[seg_idx] = Some(Arc::new(SegmentColumns::new_zero(seg_size)));
                 self.evicted.remove(&seg);
             }
 
             let old_empty = old.is_empty();
             let new_empty = v.is_empty();
             {
-                let cols = self.segments[seg_idx].as_mut().unwrap();
+                let cols = Arc::make_mut(self.segments[seg_idx].as_mut().unwrap());
                 cols.values[loc] = v.value;
                 cols.owners_hi[loc] = v.owner_hi;
                 cols.owners_lo[loc] = v.owner_lo;
@@ -727,7 +732,7 @@ impl SegmentedFriState {
                 return zero_cols_16();
             }
             let seg_size = 1 << self.effective_log_seg;
-            self.segments[id] = Some(Box::new(SegmentColumns::new_zero(seg_size)));
+            self.segments[id] = Some(Arc::new(SegmentColumns::new_zero(seg_size)));
         }
         self.segments[id].as_ref().unwrap().as_ref()
     }
@@ -811,7 +816,7 @@ impl SegmentedFriState {
         self.segments[id] = if live == 0 {
             None
         } else {
-            Some(Box::new(cols))
+            Some(Arc::new(cols))
         };
         self.evicted.remove(&seg_id);
         // Invalidate the FRI root so it is recomputed on next root() call.
@@ -984,14 +989,22 @@ impl SegmentedFriState {
     /// Restore a previously evicted segment from MDBX-loaded column data.
     /// The FRI root will be recomputed lazily when next needed.
     pub fn restore_evicted_segment(&mut self, seg_id: u16, cols: SegmentColumns) {
+        self.restore_shared_evicted_segment(seg_id, Arc::new(cols));
+    }
+
+    /// Install an immutable authenticated segment version without copying its
+    /// three column buffers. The first later write is copy-on-write, so an
+    /// older selected-history boundary can retain the exact same allocation
+    /// safely until its ordered durable promotion completes.
+    pub(crate) fn restore_shared_evicted_segment(
+        &mut self,
+        seg_id: u16,
+        cols: Arc<SegmentColumns>,
+    ) {
         let id = seg_id as usize;
         let live = Self::count_live(&cols);
         self.live_counts[id] = live;
-        self.segments[id] = if live == 0 {
-            None
-        } else {
-            Some(Box::new(cols))
-        };
+        self.segments[id] = if live == 0 { None } else { Some(cols) };
         self.evicted.remove(&seg_id);
         // Invalidate the cached FRI root so it will be recomputed.
         // (The loaded data might differ from what we last computed for, if
@@ -1105,7 +1118,7 @@ impl SegmentedFriState {
     ///
     /// Returns `None` when the segment holds no resident payload. The segment
     /// is left evicted, so the consuming state must not replay further.
-    pub(crate) fn take_segment_columns(&mut self, seg_id: u16) -> Option<Box<SegmentColumns>> {
+    pub(crate) fn take_segment_columns(&mut self, seg_id: u16) -> Option<Arc<SegmentColumns>> {
         let id = seg_id as usize;
         let columns = self.segments[id].take();
         if columns.is_some() {
@@ -1295,7 +1308,8 @@ impl SegmentedFriState {
             // Still in single-segment territory — just grow the single segment.
             self.effective_log_seg = self.log_slots;
             let extra = 1 << (self.log_slots - 1); // half the new size
-            if let Some(ref mut cols) = self.segments[0] {
+            if let Some(ref mut columns) = self.segments[0] {
+                let cols = Arc::make_mut(columns);
                 cols.values.extend(vec![Block128::ZERO; extra]);
                 cols.owners_hi.extend(vec![Block128::ZERO; extra]);
                 cols.owners_lo.extend(vec![Block128::ZERO; extra]);
@@ -1367,7 +1381,8 @@ impl SegmentedFriState {
                     return Err(StateResizeError::EvictedUpperSegment { seg_id: 0 });
                 }
                 let keep = 1usize << (self.log_slots - 1);
-                if let Some(cols) = self.segments[0].as_mut() {
+                if let Some(columns) = self.segments[0].as_mut() {
+                    let cols = Arc::make_mut(columns);
                     let upper_is_empty = cols.values[keep..].iter().all(|v| v.0 == 0)
                         && cols.owners_hi[keep..].iter().all(|v| v.0 == 0)
                         && cols.owners_lo[keep..].iter().all(|v| v.0 == 0);

@@ -102,6 +102,18 @@ pub struct FullAcceptedBlockBatchOutput {
     pub proof_components: FullAcceptedBlockBatchProofComponents,
 }
 
+/// Controls only which checkpoint-serving certificate extras the native
+/// replay retains and proves after the accepted-block statements have been
+/// derived.  Both policies run the exact same timeless `AcceptBlock` replay
+/// and produce the same recursive component inputs.  The selected recursive
+/// worker never consumes the receipt-projection proof, so constructing it
+/// there would be pure throwaway work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeReplayOutputPolicy {
+    RetainedCheckpoint,
+    SelectedRecursive,
+}
+
 /// Consuming single-block carrier handed directly to the selected recursive
 /// miner.  It deliberately has no `Clone` or serde implementation: large
 /// component inputs and decoded authorization proofs move once from native
@@ -370,6 +382,7 @@ pub fn verify_full_accepted_block_batch_native(
         start_parent,
         start_state.clone(),
         witness,
+        NativeReplayOutputPolicy::RetainedCheckpoint,
     )
 }
 
@@ -382,6 +395,7 @@ fn verify_full_accepted_block_batch_native_with_owned_state(
     start_parent: &BlockHeader,
     mut state: ChainState,
     witness: &FullAcceptedBlockBatchWitness,
+    output_policy: NativeReplayOutputPolicy,
 ) -> Result<FullAcceptedBlockBatchOutput, FullAcceptedBlockBatchError> {
     if witness.items.is_empty() {
         return Err(FullAcceptedBlockBatchError::EmptyBatch);
@@ -411,7 +425,10 @@ fn verify_full_accepted_block_batch_native_with_owned_state(
     let mut rolling_consensus = start_consensus.clone();
     let mut header_witnesses = Vec::with_capacity(witness.items.len());
     let mut accepted_block_claims = Vec::with_capacity(witness.items.len());
-    let mut accepted_block_acceptance_receipts = Vec::with_capacity(witness.items.len());
+    let mut accepted_block_acceptance_receipts = match output_policy {
+        NativeReplayOutputPolicy::RetainedCheckpoint => Vec::with_capacity(witness.items.len()),
+        NativeReplayOutputPolicy::SelectedRecursive => Vec::new(),
+    };
     let mut accepted_block_certificate_statements = Vec::with_capacity(witness.items.len());
     let mut accepted_claim_hash_inputs = Vec::with_capacity(witness.items.len());
     let mut tx_body_inputs = Vec::new();
@@ -612,7 +629,9 @@ fn verify_full_accepted_block_batch_native_with_owned_state(
                 .map_err(|source| FullAcceptedBlockBatchError::HeaderWork { index, source })?;
         header_witnesses.push(header_witness);
         accepted_block_claims.push(claim);
-        accepted_block_acceptance_receipts.push(acceptance_receipt);
+        if output_policy == NativeReplayOutputPolicy::RetainedCheckpoint {
+            accepted_block_acceptance_receipts.push(acceptance_receipt);
+        }
         accepted_block_certificate_statements.push(certificate_statement);
         rolling_accumulator = rolling_accumulator
             .advance(&item.block.header)
@@ -620,28 +639,16 @@ fn verify_full_accepted_block_batch_native_with_owned_state(
         parent = item.block.header.clone();
     }
 
-    let accepted_block_certificate_receipts = accepted_block_certificate_statements
-        .iter()
-        .map(accepted_block_certificate_receipt)
-        .collect::<Vec<_>>();
-    let certificate_proof_pairs = accepted_block_certificate_statements
-        .par_iter()
-        .enumerate()
-        .map(|(index, statement)| {
-            let proof = prove_accepted_block_certificate_receipt_projection_proof(statement)
-                .map_err(|source| {
-                    FullAcceptedBlockBatchError::CertificateReceiptProjectionProof { index, source }
-                })?;
-            let handle = accepted_block_receipt_projection_handle(&proof).map_err(|source| {
-                FullAcceptedBlockBatchError::CertificateReceiptProjectionHandle { index, source }
-            })?;
-            Ok((proof, handle))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let (accepted_block_certificate_proofs, accepted_block_receipt_projection_handles): (
-        Vec<_>,
-        Vec<_>,
-    ) = certificate_proof_pairs.into_iter().unzip();
+    let (
+        accepted_block_certificate_proofs,
+        accepted_block_certificate_receipts,
+        accepted_block_receipt_projection_handles,
+    ) = match output_policy {
+        NativeReplayOutputPolicy::RetainedCheckpoint => {
+            build_retained_certificate_projection_extras(&accepted_block_certificate_statements)?
+        }
+        NativeReplayOutputPolicy::SelectedRecursive => (Vec::new(), Vec::new(), Vec::new()),
+    };
 
     let accepted_claim_witness = AcceptedClaimBatchWitness {
         headers: header_witnesses,
@@ -684,6 +691,41 @@ fn verify_full_accepted_block_batch_native_with_owned_state(
             accepted_block_receipt_projection_handles,
         },
     })
+}
+
+/// Build the checkpoint-serving projection carriers only for the generic
+/// retained replay.  Keeping the prover in this policy-specific helper makes
+/// the selected-recursive no-projection path explicit and regression-testable.
+fn build_retained_certificate_projection_extras(
+    statements: &[noid_recursive::AcceptedBlockCertificateStatement],
+) -> Result<
+    (
+        Vec<AcceptedBlockCertificateProof>,
+        Vec<AcceptedBlockCertificateReceipt>,
+        Vec<AcceptedBlockReceiptProjectionHandle>,
+    ),
+    FullAcceptedBlockBatchError,
+> {
+    let receipts = statements
+        .iter()
+        .map(accepted_block_certificate_receipt)
+        .collect::<Vec<_>>();
+    let proof_pairs = statements
+        .par_iter()
+        .enumerate()
+        .map(|(index, statement)| {
+            let proof = prove_accepted_block_certificate_receipt_projection_proof(statement)
+                .map_err(|source| {
+                    FullAcceptedBlockBatchError::CertificateReceiptProjectionProof { index, source }
+                })?;
+            let handle = accepted_block_receipt_projection_handle(&proof).map_err(|source| {
+                FullAcceptedBlockBatchError::CertificateReceiptProjectionHandle { index, source }
+            })?;
+            Ok((proof, handle))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let (proofs, handles) = proof_pairs.into_iter().unzip();
+    Ok((proofs, receipts, handles))
 }
 
 pub(crate) fn prove_full_accepted_block_batch_components(
@@ -869,9 +911,8 @@ pub fn prove_retained_full_accepted_block_batch_proof(
 ///
 /// The historical `start_state` must still have every segment needed by the
 /// native acceptance replay. No component DTO or decoded authorization proof
-/// is serialized, cloned, or accepted as caller authority. The caller must
-/// hold the process-global proof-memory reservation before entering; governor
-/// wiring remains outside this dependency-clean crate.
+/// is serialized, cloned, or accepted as caller authority. Process-local
+/// proof-stage scheduling remains outside this dependency-clean crate.
 pub fn reconstruct_selected_recursive_block_artifacts(
     start_consensus: RecursiveConsensusState,
     start_accumulator: ChainAccumulator,
@@ -922,6 +963,7 @@ pub fn reconstruct_selected_recursive_block_artifacts_from_single_witness(
         &start_parent,
         start_state,
         &witness,
+        NativeReplayOutputPolicy::SelectedRecursive,
     )?;
     drop(witness);
 
@@ -971,9 +1013,9 @@ pub fn reconstruct_selected_recursive_block_artifacts_from_single_witness(
         accepted_block_certificate_receipts,
         accepted_block_receipt_projection_handles,
     } = proof_components;
-    // Certificate/checkpoint extras were needed to establish the full native
-    // output but are not miner inputs. Do not retain them alongside the large
-    // selected component carrier.
+    // The selected replay policy guarantees these checkpoint-serving extras
+    // are empty. Consume their carriers here so none can escape alongside the
+    // selected recursive inputs if that policy is ever changed accidentally.
     drop((
         accepted_block_acceptance_receipts,
         accepted_block_certificate_proofs,
@@ -1028,10 +1070,12 @@ fn validate_single_block_recursive_components(
         || inputs.authorization_inputs.len() != user_transaction_count
         || inputs.authorization_totals.user_tx_count != user_transaction_count
         || components.selected_authorization_proofs.len() != user_transaction_count
-        || components.accepted_block_acceptance_receipts.len() != 1
-        || components.accepted_block_certificate_proofs.len() != 1
-        || components.accepted_block_certificate_receipts.len() != 1
-        || components.accepted_block_receipt_projection_handles.len() != 1
+        || !components.accepted_block_acceptance_receipts.is_empty()
+        || !components.accepted_block_certificate_proofs.is_empty()
+        || !components.accepted_block_certificate_receipts.is_empty()
+        || !components
+            .accepted_block_receipt_projection_handles
+            .is_empty()
     {
         return Err(FullAcceptedBlockBatchError::ComponentShapeMismatch);
     }
@@ -2117,6 +2161,34 @@ mod tests {
         );
         assert_eq!(proof.exact_state.len(), 1);
         assert!(!proof.exact_state[0].structural_hashes.is_empty());
+        assert_eq!(
+            output
+                .proof_components
+                .accepted_block_acceptance_receipts
+                .len(),
+            1
+        );
+        assert_eq!(
+            output
+                .proof_components
+                .accepted_block_certificate_proofs
+                .len(),
+            1
+        );
+        assert_eq!(
+            output
+                .proof_components
+                .accepted_block_certificate_receipts
+                .len(),
+            1
+        );
+        assert_eq!(
+            output
+                .proof_components
+                .accepted_block_receipt_projection_handles
+                .len(),
+            1
+        );
 
         let verified = verify_retained_full_accepted_block_batch_proof(
             &start_consensus,
@@ -2239,6 +2311,39 @@ mod tests {
     }
 
     #[test]
+    fn selected_native_replay_keeps_statements_but_omits_checkpoint_projection_extras() {
+        let (start_consensus, start_accumulator, parent, state, item) =
+            canonical_coinbase_fixture();
+        let output = verify_full_accepted_block_batch_native_with_owned_state(
+            &start_consensus,
+            &start_accumulator,
+            &parent,
+            state,
+            &FullAcceptedBlockBatchWitness { items: vec![item] },
+            NativeReplayOutputPolicy::SelectedRecursive,
+        )
+        .expect("selected replay keeps the accepted component statement");
+        let components = output.proof_components;
+        assert_eq!(
+            components
+                .component_inputs
+                .accepted_block_certificate_statements
+                .len(),
+            1
+        );
+        assert_eq!(
+            components.component_inputs.accepted_claim_hash_inputs.len(),
+            1
+        );
+        assert!(components.accepted_block_acceptance_receipts.is_empty());
+        assert!(components.accepted_block_certificate_proofs.is_empty());
+        assert!(components.accepted_block_certificate_receipts.is_empty());
+        assert!(components
+            .accepted_block_receipt_projection_handles
+            .is_empty());
+    }
+
+    #[test]
     fn selected_recursive_reconstructor_rejects_batch_shape_and_parent_tamper() {
         let parent = noid_chain::consensus::genesis_header();
         let genesis_work = noid_chain::consensus::block_work(&parent.difficulty_target);
@@ -2339,6 +2444,7 @@ mod tests {
             1,
             "raw accepted material is replayed exactly once"
         );
+        assert!(reconstructor.contains("NativeReplayOutputPolicy::SelectedRecursive"));
         assert!(!reconstructor.contains("verify_full_accepted_block_batch_native("));
         assert!(reconstructor.contains("start_state: ChainState"));
         assert!(reconstructor.contains("drop(witness)"));
@@ -2378,6 +2484,31 @@ mod tests {
         assert!(native_accept < proof_decode);
         assert!(proof_decode < proof_consumed);
         assert!(proof_consumed < sidecar_decode);
+
+        let output_policy_dispatch = owned_native
+            .split(") = match output_policy {")
+            .nth(1)
+            .expect("native replay output-policy dispatch")
+            .split("let accepted_claim_witness")
+            .next()
+            .expect("output-policy dispatch boundary");
+        let selected_policy = output_policy_dispatch
+            .split("NativeReplayOutputPolicy::SelectedRecursive =>")
+            .nth(1)
+            .expect("selected recursive output policy");
+        assert!(selected_policy.contains("(Vec::new(), Vec::new(), Vec::new())"));
+        assert!(
+            !selected_policy.contains("prove_accepted_block_certificate_receipt_projection_proof")
+        );
+
+        let generic_replay = source
+            .split("pub fn verify_full_accepted_block_batch_native(")
+            .nth(1)
+            .expect("generic native replay")
+            .split("fn verify_full_accepted_block_batch_native_with_owned_state(")
+            .next()
+            .expect("generic replay boundary");
+        assert!(generic_replay.contains("NativeReplayOutputPolicy::RetainedCheckpoint"));
     }
 
     #[test]

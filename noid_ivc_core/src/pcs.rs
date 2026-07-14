@@ -272,10 +272,17 @@ pub fn open_batch_quirky_direct<Ch: Challenger>(
         ));
     }
     let mut b_combined: Vec<F128> = crate::scratch::take_f128(l);
-    b_combined
+    // BaseFold's first sumcheck message is a reduction over the same
+    // `packed_witness`/`b_combined` pairs that this pass has hot in cache.
+    // Prime it here instead of making BaseFold stream both 2^m vectors once
+    // more.  `lo_len` is a power of two; every non-trivial domain therefore
+    // keeps pairs inside one output block.  The degenerate length-one domain
+    // falls back to BaseFold's own prime path below.
+    let fuse_round0_prime = lo_len >= 2;
+    let round0_prime = b_combined
         .par_chunks_mut(lo_len)
         .enumerate()
-        .for_each(|(hi, out_block)| {
+        .map(|(hi, out_block)| {
             out_block.fill(F128::ZERO);
             for (lo_table, hi_table) in lo_tables.iter().zip(&hi_tables) {
                 let scale = hi_table[hi];
@@ -286,12 +293,31 @@ pub fn open_batch_quirky_direct<Ch: Challenger>(
                     *slot += scale * *lo_value;
                 }
             }
-        });
+            if !fuse_round0_prime {
+                return (F128::ZERO, F128::ZERO);
+            }
+            let base = hi * lo_len;
+            let mut u0 = F128::ZERO;
+            let mut u2 = F128::ZERO;
+            for (pair, values) in out_block.chunks_exact(2).enumerate() {
+                let a0 = packed_witness[base + 2 * pair];
+                let a1 = packed_witness[base + 2 * pair + 1];
+                let b0 = values[0];
+                let b1 = values[1];
+                u0 += a0 * b0;
+                u2 += (a0 + a1) * (b0 + b1);
+            }
+            (u0, u2)
+        })
+        .reduce(
+            || (F128::ZERO, F128::ZERO),
+            |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
+        );
     lap("b_combined build", &mut t);
 
     let ntt = crate::ntt::AdditiveNttF128::standard(commitment.params.k_code());
     lap("ntt tables", &mut t);
-    basefold::prove(
+    let proof = basefold::prove_with_precomputed_round0_prime(
         packed_witness,
         b_combined,
         target_combined,
@@ -301,8 +327,11 @@ pub fn open_batch_quirky_direct<Ch: Challenger>(
         commitment.params.log_inv_rate,
         commitment.params.log_batch_size,
         default_fri_queries(commitment.params.log_dim(), commitment.params.log_inv_rate),
+        fuse_round0_prime.then_some(round0_prime),
         challenger,
-    )
+    );
+    lap("basefold", &mut t);
+    proof
 }
 
 /// Verify a [`open_batch_quirky_direct`] proof. Mirror transcript; the

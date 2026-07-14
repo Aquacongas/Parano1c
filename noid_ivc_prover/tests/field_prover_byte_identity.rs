@@ -6,9 +6,10 @@
 //!      representation is resident through the lincheck+open peak.
 
 use noid_ivc_core::challenger::FsLaneChallenger;
-use noid_ivc_core::field_r1cs::synthetic_satisfiable;
+use noid_ivc_core::field_r1cs::{CompactFieldR1cs, synthetic_satisfiable};
 use noid_ivc_core::pcs::{self, PcsParams};
-use noid_ivc_prover::field_prover::prove_field;
+use noid_ivc_core::proof::FieldShape;
+use noid_ivc_prover::field_prover::{prove_field, prove_field_compact};
 
 fn params_for(m_elems: usize) -> PcsParams {
     PcsParams {
@@ -64,6 +65,34 @@ fn prover_does_not_materialize_csc() {
     assert!(
         r1cs.csc_cache.get().is_none(),
         "prover materialized the CSC transpose — double-storage not eliminated"
+    );
+}
+
+#[test]
+fn authenticated_compact_prover_is_byte_identical_to_resident_csr() {
+    let (r1cs, z) = synthetic_satisfiable(12, 12, 0xC04A_C7A1);
+    let shape = FieldShape::of(&r1cs);
+    let digest = r1cs.structural_statement_digest();
+    let mut artifact = Vec::new();
+    r1cs.write_artifact(&mut artifact).unwrap();
+    let compact = CompactFieldR1cs::open(artifact.into_boxed_slice(), shape, digest).unwrap();
+    let params = params_for(shape.m);
+
+    let mut resident_ch = FsLaneChallenger::new(b"compact-field-byte-identity-v0");
+    let (resident_proof, resident_commitment, resident_claim) =
+        prove_field(&r1cs, &z, &params, &mut resident_ch);
+    let mut compact_ch = FsLaneChallenger::new(b"compact-field-byte-identity-v0");
+    let (compact_proof, compact_commitment, compact_claim) =
+        prove_field_compact(&compact, &z, &params, &mut compact_ch);
+
+    assert_eq!(
+        bincode::serialize(&(compact_proof, compact_commitment)).unwrap(),
+        bincode::serialize(&(resident_proof, resident_commitment)).unwrap(),
+        "authenticated compact relation changed proof or commitment",
+    );
+    assert_eq!(
+        compact_claim, resident_claim,
+        "compact output claims drifted"
     );
 }
 

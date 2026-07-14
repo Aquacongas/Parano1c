@@ -41,16 +41,19 @@
 //! behind a commitment) — asserted at assembly, so one sub-channel
 //! schedule serves every tile.
 
+#[cfg(test)]
+use noid_ivc_core::deep_chain::ff_merkle::FfMerkleFamilyRefs;
 use noid_ivc_core::deep_chain::ff_merkle::{
-    build_ff_merkle_path_columns, ff_merkle_fixed_patterns, FfMerkleFamilyRefs, FfMerklePathFamily,
-    FfMerklePathWitness,
+    build_ff_merkle_path_columns, ff_merkle_fixed_patterns, FfMerklePathFamily, FfMerklePathWitness,
 };
 use noid_ivc_core::deep_chain::relations::FixedPattern;
 use noid_ivc_core::deep_chain::schedule::{compile_duplex, TranscriptOp};
 use noid_ivc_core::field::F128;
 use noid_ivc_core::field_circuit::{
-    FieldR1csBuilder, FsChannelTrace, FsChannelUnionRecorder, LinExpr, RecordedChannel,
+    FieldR1csBuilder, FsChannelUnionRecorder, LayoutRecordedChannel, LinExpr,
 };
+#[cfg(test)]
+use noid_ivc_core::field_circuit::{FsChannelTrace, RecordedChannel};
 use noid_ivc_core::pcs::{self, PcsParams};
 use noid_ivc_core::proof::pcs_params_statement_bytes;
 use noid_ivc_core::public_io::WitnessSlice;
@@ -67,18 +70,27 @@ use crate::region_sidecar::{
 use noid_ivc_core::deep_chain::schedule::DuplexLayout;
 use noid_ivc_core::field_circuit::RecordedChannel as FsRecordedChannel;
 
+#[cfg(test)]
+use super::mul;
+use super::pin_eq;
+#[cfg(test)]
+use super::region_source_binding::DuplexUnionRetentionMetric;
 use super::region_source_binding::{
-    alloc_boolean_column_slice, alloc_column_slice, build_combined_duplex_union,
-    build_combined_duplex_union_with_recordings, build_recording_only_duplex_union,
-    common_period_ones, common_period_pattern, discharge_duplex_union, discharge_merkle_union,
-    duplex_data_positions, pack_recording_only_blocks, place_ff, run_duplex_union_native,
-    run_merkle_union_native, slot_cell, DuplexUnion, FfLegSpec, MerkleLeg, MerkleUnionNative,
-    RecordingSpec, RegionPcsClaim, SubChannel,
+    alloc_boolean_column_slice_values_only, alloc_column_slice_values_only,
+    build_combined_duplex_union, build_recording_only_duplex_union, common_period_ones,
+    common_period_pattern, duplex_data_positions, pack_recording_only_blocks,
+    patch_recording_only_duplex_union_live, place_ff, slot_cell, DuplexUnion, RecordingSpec,
+    SubChannel,
+};
+#[cfg(test)]
+use super::region_source_binding::{
+    build_combined_duplex_union_with_recordings, discharge_duplex_union, discharge_merkle_union,
+    run_duplex_union_native, run_merkle_union_native, FfLegSpec, MerkleLeg, MerkleUnionNative,
+    RegionPcsClaim,
 };
 use super::self_verify::{
     flat_digest_lanes, pcs_leaf_iv_flat, pcs_node_iv_flat, PcsWalkObligations,
 };
-use super::{mul, pin_eq};
 
 const DOMAIN_LA: &[u8] = b"r-pcs-leaf-union-v0";
 const DOMAIN_LB: &[u8] = b"r-pcs-merkle-union-v0";
@@ -95,8 +107,7 @@ pub fn link_r_pcs_path_sidecar_purpose() -> [u8; 32] {
     poseidon2b_hash_byte_slices(LINK_R_PCS_PATH_SIDECAR_PURPOSE_DOMAIN, &[DOMAIN_LB])
 }
 
-const LINK_RECORDINGS_REC_PURPOSE_DOMAIN: &[u8] =
-    b"NOID/REGION-SIDECAR/LINK-RECORDINGS-REC-C/V2";
+const LINK_RECORDINGS_REC_PURPOSE_DOMAIN: &[u8] = b"NOID/REGION-SIDECAR/LINK-RECORDINGS-REC-C/V2";
 /// The `[R]_prev` replay's outer Fiat-Shamir domain (the native
 /// `FsLaneChallenger::new(b"history-link-v0")` the recorded transcript
 /// mirrors bit-for-bit).
@@ -139,6 +150,36 @@ struct TreeInfo {
     depth: usize,
 }
 
+/// Bounded canonical zero-recording template shared only by geometries
+/// derived from one authenticated ladder descriptor.  The cache is neither
+/// process-global nor keyed by prover data: one immutable geometry family
+/// owns exactly one template, and cloning the family shares this allocation.
+#[derive(Clone, Default)]
+pub(crate) struct RPcsLinkRecordingGhostCache(std::sync::Arc<std::sync::OnceLock<DuplexUnion>>);
+
+impl std::fmt::Debug for RPcsLinkRecordingGhostCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RPcsLinkRecordingGhostCache")
+            .field("initialized", &self.0.get().is_some())
+            .finish()
+    }
+}
+
+/// Exact test-only accounting for the immutable L-C geometry and its lazy
+/// cached zero union. `old_zero_buffer_bytes` is what nine independent
+/// per-height zero Vecs retained; `shared_zero_buffer_bytes` is the new single
+/// max-sized buffer.
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RPcsLinkRecordingCacheMetric {
+    pub(crate) n_data_by_block: Vec<usize>,
+    pub(crate) total_n_data: usize,
+    pub(crate) max_n_data: usize,
+    pub(crate) old_zero_buffer_bytes: usize,
+    pub(crate) shared_zero_buffer_bytes: usize,
+    pub(crate) cached_union: Option<DuplexUnionRetentionMetric>,
+}
+
 /// Canonical link-side PCS geometry shared by every link class in a ladder.
 ///
 /// Group zero is the (fixed-shape) previous-link proof.  The remaining
@@ -162,6 +203,9 @@ pub(crate) struct RPcsLinkUniversalGeometry {
     /// Canonical recorded `[R]_prev` outer-channel layout — one universal
     /// walk L-C block shared by every link class of the ladder.
     r_prev_layout: DuplexLayout,
+    /// One canonical zero-data walk L-C template for this exact immutable
+    /// geometry. Per-height assembly clones it and patches only live blocks.
+    recording_ghost_cache: RPcsLinkRecordingGhostCache,
 }
 
 impl RPcsLinkUniversalGeometry {
@@ -176,6 +220,30 @@ impl RPcsLinkUniversalGeometry {
         rec_layouts: Vec<DuplexLayout>,
         r_b_layouts: Vec<DuplexLayout>,
         r_prev_layout: DuplexLayout,
+    ) -> Result<Self, RegionSidecarError> {
+        Self::new_with_recording_ghost_cache(
+            link_params,
+            block_params,
+            n_queries,
+            rec_layouts,
+            r_b_layouts,
+            r_prev_layout,
+            RPcsLinkRecordingGhostCache::default(),
+        )
+    }
+
+    /// Construct against a cache capability owned by the already validated
+    /// universal ladder. All semantic geometry is still re-derived and
+    /// checked here; the capability shares only the resulting zero columns.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_recording_ghost_cache(
+        link_params: &PcsParams,
+        block_params: &[PcsParams],
+        n_queries: usize,
+        rec_layouts: Vec<DuplexLayout>,
+        r_b_layouts: Vec<DuplexLayout>,
+        r_prev_layout: DuplexLayout,
+        recording_ghost_cache: RPcsLinkRecordingGhostCache,
     ) -> Result<Self, RegionSidecarError> {
         if block_params.is_empty() || n_queries == 0 {
             return Err(RegionSidecarError::BadVk);
@@ -227,6 +295,7 @@ impl RPcsLinkUniversalGeometry {
             rec_layouts,
             r_b_layouts,
             r_prev_layout,
+            recording_ghost_cache,
         };
         // Freeze the role/tile carrier topology here, before any witness is
         // allocated.  Present trees at one position must share the exact leaf
@@ -257,14 +326,85 @@ impl RPcsLinkUniversalGeometry {
             .chain(std::iter::once(&self.r_prev_layout))
             .collect();
         let (offsets, w_log) = pack_recording_only_blocks(&ordered);
-        Ok((
-            ordered
-                .into_iter()
-                .cloned()
-                .zip(offsets)
-                .collect(),
-            w_log,
-        ))
+        Ok((ordered.into_iter().cloned().zip(offsets).collect(), w_log))
+    }
+
+    /// Materialize walk L-C from the geometry-owned canonical zero template,
+    /// recomputing only the explicitly live blocks. Any mismatch between the
+    /// per-height recordings and the frozen geometry fails closed.
+    fn recording_union_cached(
+        &self,
+        recordings: &[RecordingSpec<'_>],
+        live_blocks: &[usize],
+    ) -> Result<DuplexUnion, RegionSidecarError> {
+        let expected_layouts = self
+            .rec_layouts
+            .iter()
+            .chain(self.r_b_layouts.iter())
+            .chain(std::iter::once(&self.r_prev_layout))
+            .collect::<Vec<_>>();
+        let canonical_iv = FsChannelUnionRecorder::capacity_iv_flat();
+        if recordings.len() != expected_layouts.len()
+            || recordings.iter().zip(expected_layouts.iter().copied()).any(
+                |(recording, expected)| {
+                    &recording.layout != expected
+                        || recording.iv_flat != canonical_iv
+                        || recording.data.len() != expected.n_data
+                },
+            )
+        {
+            return Err(RegionSidecarError::UnsupportedVkShape);
+        }
+
+        let canonical_zero = self.recording_ghost_cache.0.get_or_init(|| {
+            let zero_data = expected_layouts
+                .iter()
+                .map(|layout| vec![F128::ZERO; layout.n_data])
+                .collect::<Vec<_>>();
+            let zero_specs = expected_layouts
+                .iter()
+                .copied()
+                .zip(&zero_data)
+                .map(|(layout, data)| RecordingSpec {
+                    layout: layout.clone(),
+                    iv_flat: canonical_iv,
+                    data,
+                })
+                .collect::<Vec<_>>();
+            build_recording_only_duplex_union(&zero_specs)
+        });
+        patch_recording_only_duplex_union_live(
+            canonical_zero,
+            recordings,
+            live_blocks,
+            canonical_iv,
+        )
+        .ok_or(RegionSidecarError::UnsupportedVkShape)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recording_cache_metric(&self) -> RPcsLinkRecordingCacheMetric {
+        let n_data_by_block = self
+            .rec_layouts
+            .iter()
+            .chain(self.r_b_layouts.iter())
+            .chain(std::iter::once(&self.r_prev_layout))
+            .map(|layout| layout.n_data)
+            .collect::<Vec<_>>();
+        let total_n_data = n_data_by_block.iter().sum();
+        let max_n_data = n_data_by_block.iter().copied().max().unwrap_or(0);
+        RPcsLinkRecordingCacheMetric {
+            n_data_by_block,
+            total_n_data,
+            max_n_data,
+            old_zero_buffer_bytes: total_n_data * std::mem::size_of::<F128>(),
+            shared_zero_buffer_bytes: max_n_data * std::mem::size_of::<F128>(),
+            cached_union: self
+                .recording_ghost_cache
+                .0
+                .get()
+                .map(DuplexUnion::retention_metric),
+        }
     }
 
     pub(crate) fn rec_layouts(&self) -> &[DuplexLayout] {
@@ -339,6 +479,7 @@ impl RPcsLinkUniversalGeometry {
             rec_layouts,
             r_b_layouts,
             r_prev_layout,
+            recording_ghost_cache: RPcsLinkRecordingGhostCache::default(),
         };
         geometry.leaf_lanes()?;
         geometry.path_carrier_depths()?;
@@ -346,11 +487,13 @@ impl RPcsLinkUniversalGeometry {
         Ok(geometry)
     }
 
-    pub(crate) fn group_count(&self) -> usize {
+    #[cfg(test)]
+    fn group_count(&self) -> usize {
         self.groups.len()
     }
 
-    pub(crate) fn n_queries(&self) -> usize {
+    #[cfg(test)]
+    fn n_queries(&self) -> usize {
         self.n_queries
     }
 
@@ -505,6 +648,7 @@ fn checked_tree_structure(params: &PcsParams) -> Result<Vec<TreeInfo>, RegionSid
 
 /// Transitional callers still use assertion-style shape handling; all
 /// production universal-geometry entry points call the checked twin above.
+#[cfg(test)]
 fn tree_structure(params: &PcsParams) -> Vec<TreeInfo> {
     checked_tree_structure(params).expect("supported BaseFold tree geometry")
 }
@@ -635,7 +779,10 @@ fn ghost_basefold_geometry(
 }
 
 /// Everything both the native mirror and the trace discharge derive from
-/// the native proofs — built ONCE, deterministically.
+/// the native proofs — built ONCE, deterministically. This recording-bearing
+/// assembly is retained only as a regression oracle for the production
+/// recording-free three-walk implementation.
+#[cfg(test)]
 struct Assembly {
     u_a: DuplexUnion,
     /// Per (proof, query, tree): the native leaf digest.
@@ -647,8 +794,6 @@ struct Assembly {
     n_queries: usize,
     // ---- walk L-B ----
     cb: Vec<Vec<F128>>,
-    s0b: [Vec<F128>; STATE_SIZE],
-    soutb: [Vec<F128>; STATE_SIZE],
     fixed_b: Vec<FixedPattern>,
     ff_specs: Vec<FfLegSpec>,
     /// Per (proof, tree): the leg's slot offset within a query block.
@@ -663,6 +808,7 @@ struct Assembly {
     rec_b_scratch: RecordedChannel,
 }
 
+#[cfg(test)]
 fn build_assembly(proofs: &[RPcsProof<'_>]) -> Assembly {
     assert!(!proofs.is_empty(), "at least one [R] proof");
     let trees: Vec<Vec<TreeInfo>> = proofs.iter().map(|p| tree_structure(p.params)).collect();
@@ -893,8 +1039,6 @@ fn build_assembly(proofs: &[RPcsProof<'_>]) -> Assembly {
         s_log,
         n_queries,
         cb,
-        s0b,
-        soutb,
         fixed_b,
         ff_specs,
         leg_offsets,
@@ -1063,12 +1207,8 @@ fn link_sidecar_vk_from_geometry(
         families,
     )?;
     let (rec_blocks, rec_w_log) = geometry.recording_blocks()?;
-    let rec = RecordingDuplexRegionVk::new(
-        link_recordings_purpose(),
-        rec_w_log,
-        rec_slices,
-        rec_blocks,
-    )?;
+    let rec =
+        RecordingDuplexRegionVk::new(link_recordings_purpose(), rec_w_log, rec_slices, rec_blocks)?;
     LinkRegionSidecarVk::new(leaf, path, rec)
 }
 
@@ -1224,30 +1364,6 @@ fn drive_split_r_b_channel(
     );
     sidecar_result?;
     recorded_child.ok_or(RegionSidecarError::InvalidProof)
-}
-
-/// Scratch-record the `[R]_prev` outer channel on a throwaway witness-only
-/// builder: the exact recording (schedule, absorbed data, challenges,
-/// post-state) the real trace pass must reproduce, available BEFORE the
-/// committed recording columns are allocated.
-pub(crate) fn scratch_record_split_r_prev(
-    inputs: &SplitRPrevChannelInputs<'_>,
-) -> Result<FsRecordedChannel, RegionSidecarError> {
-    let mut scratch = FieldR1csBuilder::new_witness_only();
-    let mut recorder = FsChannelUnionRecorder::new(R_PREV_CHANNEL_DOMAIN);
-    drive_split_r_prev_channel(&mut scratch, &mut recorder, inputs)?;
-    Ok(recorder.finish())
-}
-
-/// Scratch-record the `[R]_B` outer channel (and its nested block-sidecar
-/// child recording) on a throwaway witness-only builder.
-pub(crate) fn scratch_record_split_r_b(
-    inputs: &SplitRBChannelInputs<'_>,
-) -> Result<(FsRecordedChannel, FsRecordedChannel), RegionSidecarError> {
-    let mut scratch = FieldR1csBuilder::new_witness_only();
-    let mut recorder = FsChannelUnionRecorder::new(R_B_CHANNEL_DOMAIN);
-    let child = drive_split_r_b_channel(&mut scratch, &mut recorder, inputs)?;
-    Ok((recorder.finish(), child))
 }
 
 /// Process-global memo of derived recording layouts.  The derivation is a
@@ -1505,8 +1621,7 @@ pub(crate) fn derive_link_r_prev_recording_layout(
 
         let sidecar =
             crate::region_sidecar::shape_only_link_region_sidecar_proof(&vk, link_shape.m)?;
-        let mut proof =
-            super::self_verify::shape_only_field_r1cs_proof(link_shape, link_params);
+        let mut proof = super::self_verify::shape_only_field_r1cs_proof(link_shape, link_params);
         let io = vec![F128::ZERO; spec.io_len];
         macro_rules! r_prev_inputs {
             ($proof:expr) => {
@@ -1874,9 +1989,11 @@ fn build_recording_free_link_assembly(
 }
 
 /// The native (point, value) stream of every walk opening claim, in the
-/// exact discharge order — the split link's IO fill (mirror of
-/// `region_wallet_pcs_native`). Deterministic in the proofs alone.
-pub fn r_pcs_region_native(proofs: &[RPcsProof<'_>]) -> Vec<(Vec<F128>, F128)> {
+/// exact legacy discharge order. Kept as a test oracle for the retired
+/// recording-bearing walk; production derives its inputs from the frozen
+/// recording-free sidecar geometry.
+#[cfg(test)]
+fn r_pcs_region_native(proofs: &[RPcsProof<'_>]) -> Vec<(Vec<F128>, F128)> {
     let asm = build_assembly(proofs);
     let native_a = run_duplex_union_native(&asm.u_a, DOMAIN_LA);
     let mut out: Vec<(Vec<F128>, F128)> = Vec::new();
@@ -1902,14 +2019,14 @@ pub(crate) struct RPcsLinkColumns {
     /// blocks, per-slot `[R]_B` replay blocks, one `[R]_prev` replay block).
     slices_rec: [WitnessSlice; 6],
     /// The recordings-only union backing walk L-C (its endpoints feed the
-    /// prover input; its committed data was filled from the scratches).
+    /// prover input; its committed data was filled from native captures).
     u_rec: DuplexUnion,
-    /// The scratch recordings that prefilled the ACTIVE blocks; the real
-    /// recorded replays must reproduce them exactly.  All `None` only for
-    /// the bootstrap ghost, which records nothing.
-    child_scratch: Option<FsRecordedChannel>,
-    r_b_scratch: Option<FsRecordedChannel>,
-    r_prev_scratch: Option<FsRecordedChannel>,
+    /// Value-only recordings captured by the already mandatory sound native
+    /// verifiers. The real recursive replays must reproduce them exactly.
+    /// All `None` only for the bootstrap ghost, which records nothing.
+    child_scratch: Option<LayoutRecordedChannel>,
+    r_b_scratch: Option<LayoutRecordedChannel>,
+    r_prev_scratch: Option<LayoutRecordedChannel>,
     /// Ladder slot whose child/`[R]_B` recording blocks are live.
     rec_active_slot: usize,
     /// Walk L-C block indices of the live child, `[R]_B` and `[R]_prev`
@@ -1920,18 +2037,20 @@ pub(crate) struct RPcsLinkColumns {
     vk: LinkRegionSidecarVk,
 }
 
-/// The live recordings one link instance commits into walk L-C, one per
-/// recording role.  `None` per role only for the bootstrap ghost.
-#[derive(Default, Clone, Copy)]
-pub(crate) struct LinkLiveRecordings<'a> {
-    pub(crate) child: Option<&'a FsRecordedChannel>,
-    pub(crate) r_b: Option<&'a FsRecordedChannel>,
-    pub(crate) r_prev: Option<&'a FsRecordedChannel>,
+/// Owned live recordings one link instance commits into walk L-C, one per
+/// recording role. They move into [`RPcsLinkColumns`] after union assembly,
+/// avoiding a second deep copy of their layouts, data and challenges. `None`
+/// per role is reserved for the bootstrap ghost.
+#[derive(Default)]
+pub(crate) struct LinkLiveRecordings {
+    pub(crate) child: Option<LayoutRecordedChannel>,
+    pub(crate) r_b: Option<LayoutRecordedChannel>,
+    pub(crate) r_prev: Option<LayoutRecordedChannel>,
 }
 
 /// Allocate the two independent recording-free link walk verticals. This is
-/// the production phase-1 API; [`alloc_r_pcs_columns`] remains the transitional
-/// recording-bearing twin.
+/// the production phase-1 API; the recording-bearing twin remains test-only
+/// as a transcript/claim regression oracle.
 #[allow(dead_code)]
 pub(crate) fn prepare_r_pcs_link_columns(
     b: &mut FieldR1csBuilder,
@@ -1939,7 +2058,7 @@ pub(crate) fn prepare_r_pcs_link_columns(
     rec_layouts: Vec<DuplexLayout>,
     r_b_layouts: Vec<DuplexLayout>,
     r_prev_layout: DuplexLayout,
-    recordings: LinkLiveRecordings<'_>,
+    recordings: LinkLiveRecordings,
 ) -> Result<RPcsLinkColumns, RegionSidecarError> {
     let geometry =
         RPcsLinkUniversalGeometry::exact_for(proofs, rec_layouts, r_b_layouts, r_prev_layout)?;
@@ -1957,17 +2076,17 @@ pub(crate) fn prepare_r_pcs_link_columns_universal(
     proofs: &[RPcsProof<'_>],
     geometry: &RPcsLinkUniversalGeometry,
     active_groups: &[usize],
-    recordings: LinkLiveRecordings<'_>,
+    recordings: LinkLiveRecordings,
 ) -> Result<RPcsLinkColumns, RegionSidecarError> {
     let asm = build_recording_free_link_assembly(proofs, geometry, active_groups)?;
     let slices_a = std::array::from_fn(|column| {
-        alloc_column_slice(b, &asm.u_a.committed[column], asm.u_a.w_log).0
+        alloc_column_slice_values_only(b, &asm.u_a.committed[column], asm.u_a.w_log)
     });
     let slices_b = std::array::from_fn(|column| {
         if column == 8 {
-            alloc_boolean_column_slice(b, &asm.cb[column], asm.w_log_b).0
+            alloc_boolean_column_slice_values_only(b, &asm.cb[column], asm.w_log_b)
         } else {
-            alloc_column_slice(b, &asm.cb[column], asm.w_log_b).0
+            alloc_column_slice_values_only(b, &asm.cb[column], asm.w_log_b)
         }
     });
 
@@ -1994,25 +2113,36 @@ pub(crate) fn prepare_r_pcs_link_columns_universal(
     {
         return Err(RegionSidecarError::UnsupportedVkShape);
     }
-    let live: Vec<(usize, Option<&FsRecordedChannel>)> = vec![
-        (child_block, recordings.child),
-        (r_b_block, recordings.r_b),
-        (r_prev_block, recordings.r_prev),
+    let live = [
+        (child_block, recordings.child.as_ref()),
+        (r_b_block, recordings.r_b.as_ref()),
+        (r_prev_block, recordings.r_prev.as_ref()),
     ];
     for (block, recording) in &live {
         if let Some(recording) = recording {
             let layout = &blocks[*block].0;
-            let active_layout =
-                noid_ivc_core::deep_chain::schedule::compile_duplex(&recording.ops);
-            if active_layout != *layout || recording.data_flat.len() != layout.n_data {
+            if recording.layout != *layout || recording.data_flat.len() != layout.n_data {
                 return Err(RegionSidecarError::UnsupportedVkShape);
             }
         }
     }
-    let ghost_data: Vec<Vec<F128>> = blocks
+    let max_recording_data_lanes = blocks
         .iter()
-        .map(|(layout, _)| vec![F128::ZERO; layout.n_data])
-        .collect();
+        .map(|(layout, _)| layout.n_data)
+        .max()
+        .ok_or(RegionSidecarError::BadVk)?;
+    // Every inactive recording consumes an all-zero slice and the builder
+    // reads it immutably. One max-sized buffer therefore serves every
+    // inactive canonical ghost role without changing a single lane, while avoiding
+    // nine independently allocated/zeroed Vecs at every height.
+    let ghost_data = vec![F128::ZERO; max_recording_data_lanes];
+    debug_assert!(
+        max_recording_data_lanes
+            <= blocks
+                .iter()
+                .map(|(layout, _)| layout.n_data)
+                .sum::<usize>()
+    );
     let rec_specs: Vec<RecordingSpec<'_>> = blocks
         .iter()
         .enumerate()
@@ -2024,13 +2154,18 @@ pub(crate) fn prepare_r_pcs_link_columns_universal(
                 .find(|(live_block, recording)| *live_block == block && recording.is_some())
             {
                 Some((_, Some(recording))) => &recording.data_flat,
-                _ => &ghost_data[block],
+                _ => &ghost_data[..layout.n_data],
             },
         })
         .collect();
-    let u_rec = build_recording_only_duplex_union(&rec_specs);
+    let live_blocks = if recordings.child.is_some() {
+        vec![child_block, r_b_block, r_prev_block]
+    } else {
+        Vec::new()
+    };
+    let u_rec = geometry.recording_union_cached(&rec_specs, &live_blocks)?;
     let slices_rec = std::array::from_fn(|column| {
-        alloc_column_slice(b, &u_rec.committed[column], u_rec.w_log).0
+        alloc_column_slice_values_only(b, &u_rec.committed[column], u_rec.w_log)
     });
 
     let leaf_vk = CombinedDuplexRegionVk::from_union(
@@ -2047,31 +2182,18 @@ pub(crate) fn prepare_r_pcs_link_columns_universal(
         asm.path_families.clone(),
         &asm.fixed_b,
     )?;
-    let rec_vk = RecordingDuplexRegionVk::from_union(
-        link_recordings_purpose(),
-        slices_rec,
-        &u_rec,
-    )?;
+    let rec_vk =
+        RecordingDuplexRegionVk::from_union(link_recordings_purpose(), slices_rec, &u_rec)?;
     let vk = LinkRegionSidecarVk::new(leaf_vk, path_vk, rec_vk)?;
-    let scratch_of = |recording: Option<&FsRecordedChannel>| {
-        recording.map(|recording| FsRecordedChannel {
-            ops: recording.ops.clone(),
-            data_wires: Vec::new(),
-            data_flat: recording.data_flat.clone(),
-            challenge_wires: Vec::new(),
-            post_state: recording.post_state,
-            perms: recording.perms,
-        })
-    };
     Ok(RPcsLinkColumns {
         asm,
         slices_a,
         slices_b,
         slices_rec,
         u_rec,
-        child_scratch: scratch_of(recordings.child),
-        r_b_scratch: scratch_of(recordings.r_b),
-        r_prev_scratch: scratch_of(recordings.r_prev),
+        child_scratch: recordings.child,
+        r_b_scratch: recordings.r_b,
+        r_prev_scratch: recordings.r_prev,
         rec_active_slot,
         child_block,
         r_b_block,
@@ -2158,14 +2280,18 @@ pub(crate) fn prepare_r_pcs_link_genesis_ghost(
 fn pin_recording_block(
     b: &mut FieldR1csBuilder,
     what: &str,
-    scratch: &FsRecordedChannel,
+    scratch: &LayoutRecordedChannel,
     recorded: &FsRecordedChannel,
     vk: &LinkRegionSidecarVk,
     u_rec: &DuplexUnion,
     slices_rec: &[WitnessSlice; 6],
     block: usize,
 ) {
-    assert_eq!(recorded.ops, scratch.ops, "{what} recording schedule drift");
+    assert_eq!(
+        compile_duplex(&recorded.ops),
+        scratch.layout,
+        "{what} recording schedule drift"
+    );
     assert_eq!(
         recorded.data_flat, scratch.data_flat,
         "{what} recording data drift"
@@ -2173,6 +2299,10 @@ fn pin_recording_block(
     assert_eq!(
         recorded.post_state, scratch.post_state,
         "{what} recording post-state drift"
+    );
+    assert_eq!(
+        recorded.perms, scratch.perms,
+        "{what} permutation-count drift"
     );
     let (rec_layout, rec_offset) = &vk.rec_c().blocks()[block];
     assert_eq!(
@@ -2186,6 +2316,13 @@ fn pin_recording_block(
         "{what} recording data count"
     );
     for (k, &(slot, lane)) in rec_layout.challenges.iter().enumerate() {
+        if let Some(native) = scratch.challenges[k] {
+            assert_eq!(
+                recorded.challenge_wires[k].eval(b.values()),
+                native,
+                "{what} native/trace challenge {k} drift"
+            );
+        }
         assert_eq!(
             recorded.challenge_wires[k].eval(b.values()),
             u_rec.rec_challenges[block][k],
@@ -2367,33 +2504,29 @@ pub(crate) fn finalize_r_pcs_link_region(
     Ok(RPcsLinkRegionPreparation { vk, input })
 }
 
-/// Phase 1 of the walk discharge: build the assembly from the native
-/// proofs and ALLOCATE the committed walk columns. The caller runs this
-/// right after its public-IO cells, BEFORE anything class-specific (the
-/// verified envelopes, the replays), so the columns' [`WitnessSlice`]s —
-/// hence the class's opening-claim spec — depend on the two PCS parameter
-/// sets alone and stay IDENTICAL across every link class of a ladder.
-pub(crate) struct RPcsColumns {
+/// Test-only carrier for the retired recording-bearing two-walk discharge.
+/// Production uses [`RPcsLinkColumns`] and its independent L-A/L-B/L-C
+/// verticals; this reference remains useful for transcript/claim parity tests.
+#[cfg(test)]
+struct RPcsColumns {
     asm: Assembly,
     slices_a: Vec<WitnessSlice>,
     slices_b: Vec<WitnessSlice>,
 }
 
-pub(crate) fn alloc_r_pcs_columns(
-    b: &mut FieldR1csBuilder,
-    proofs: &[RPcsProof<'_>],
-) -> RPcsColumns {
+#[cfg(test)]
+fn alloc_r_pcs_columns(b: &mut FieldR1csBuilder, proofs: &[RPcsProof<'_>]) -> RPcsColumns {
     let asm = build_assembly(proofs);
     let slices_a: Vec<WitnessSlice> = asm
         .u_a
         .committed
         .iter()
-        .map(|c| alloc_column_slice(b, c, asm.u_a.w_log).0)
+        .map(|c| alloc_column_slice_values_only(b, c, asm.u_a.w_log))
         .collect();
     let slices_b: Vec<WitnessSlice> = asm
         .cb
         .iter()
-        .map(|c| alloc_column_slice(b, c, asm.w_log_b).0)
+        .map(|c| alloc_column_slice_values_only(b, c, asm.w_log_b))
         .collect();
     RPcsColumns {
         asm,
@@ -2402,13 +2535,15 @@ pub(crate) fn alloc_r_pcs_columns(
     }
 }
 
-/// Phase 2: discharge BOTH [R]s' PCS obligations on the two link walks —
+/// Test-only phase 2: discharge both `[R]` PCS obligations on the retired
+/// recording-bearing two-walk construction —
 /// replay each walk's discharge in-trace and bind every obligation (leaf
 /// lanes → A cells, leaf digests → L-A digest cells AND L-B entry cells,
 /// direction bits → D cells, recomputed roots → the FS-observed root
 /// wires). Returns the committed-column opening claims for the caller's
 /// public-IO tail — claim order matches [`r_pcs_region_native`].
-pub(crate) fn discharge_r_pcs_via_region(
+#[cfg(test)]
+fn discharge_r_pcs_via_region(
     b: &mut FieldR1csBuilder,
     cols: RPcsColumns,
     obligations: &[&PcsWalkObligations],
@@ -2612,6 +2747,45 @@ mod tests {
     use noid_ivc_prover::field_prover::{
         prove_field_with_public_io, prove_field_with_public_io_and_post_commit_context,
     };
+
+    #[test]
+    fn production_link_recordings_are_owned_and_moved_without_deep_clone() {
+        let source = include_str!("r_pcs_region.rs");
+        let carrier = source
+            .split("pub(crate) struct LinkLiveRecordings {")
+            .nth(1)
+            .expect("owned LinkLiveRecordings declaration")
+            .split("/// Allocate the two independent recording-free link walk verticals.")
+            .next()
+            .expect("LinkLiveRecordings fields");
+        assert_eq!(carrier.matches("Option<LayoutRecordedChannel>").count(), 3);
+        assert!(!carrier.contains("Option<&"));
+
+        let prepare = source
+            .split("pub(crate) fn prepare_r_pcs_link_columns_universal(")
+            .nth(1)
+            .expect("universal link column preparation")
+            .split("/// Owning production output of phase 2.")
+            .next()
+            .expect("universal link column preparation body");
+        assert!(!prepare.contains("recording.cloned()"));
+        assert!(!prepare.contains("scratch_of"));
+        assert!(prepare.contains("child_scratch: recordings.child"));
+        assert!(prepare.contains("r_b_scratch: recordings.r_b"));
+        assert!(prepare.contains("r_prev_scratch: recordings.r_prev"));
+
+        let split_source = include_str!("../split_link.rs");
+        let production_call = split_source
+            .split("let r_cols = prepare_r_pcs_link_columns_universal(")
+            .nth(1)
+            .expect("production split-link walk-column call")
+            .split(".expect(\"universal recording link columns\")")
+            .next()
+            .expect("production split-link walk-column arguments");
+        assert!(production_call.contains("child: Some(child_recording)"));
+        assert!(production_call.contains("r_b: Some(r_b_recording)"));
+        assert!(production_call.contains("r_prev: Some(r_prev_recording)"));
+    }
 
     fn hash_of_flat_lanes(lanes: [F128; 2]) -> [u8; 32] {
         let mut hash = [0u8; 32];
@@ -3103,15 +3277,26 @@ mod tests {
         ];
 
         let mut builder = FieldR1csBuilder::new();
-        let columns =
-            prepare_r_pcs_link_columns_universal(
-                &mut builder,
-                &proofs,
-                &geometry,
-                &[0, 1],
-                LinkLiveRecordings::default(),
-            )
-            .unwrap();
+        let columns = prepare_r_pcs_link_columns_universal(
+            &mut builder,
+            &proofs,
+            &geometry,
+            &[0, 1],
+            LinkLiveRecordings::default(),
+        )
+        .unwrap();
+        let cache_metric = geometry.recording_cache_metric();
+        let cached_union = cache_metric
+            .cached_union
+            .expect("column preparation initializes the bounded zero cache");
+        assert_eq!(cache_metric.n_data_by_block.len(), 9);
+        assert_eq!(cached_union.columns, 14);
+        assert_eq!(cached_union.column_elements, 14 << columns.u_rec.w_log);
+        assert_eq!(
+            cached_union.column_retained_bytes,
+            (14 << columns.u_rec.w_log) * std::mem::size_of::<F128>()
+        );
+        eprintln!("link L-C recording cache: {cache_metric:?}");
         assert_eq!(columns.asm.u_a.block_log, 6);
         assert_eq!(columns.asm.u_a.w_log, 14);
         assert_eq!(columns.asm.block_log_b, 7);
@@ -3240,6 +3425,7 @@ mod tests {
             rec_layouts: test_rec_layouts(block_params.len()),
             r_b_layouts: test_rec_layouts(block_params.len()),
             r_prev_layout: test_r_prev_layout(),
+            recording_ghost_cache: RPcsLinkRecordingGhostCache::default(),
         };
         let (link_proof, link_root) = mock_basefold_geometry(&link_params, 1);
         let (b8_proof, b8_root) = mock_basefold_geometry(&block_params[0], 1);
@@ -3367,6 +3553,7 @@ mod tests {
             rec_layouts: test_rec_layouts(block_params.len()),
             r_b_layouts: test_rec_layouts(block_params.len()),
             r_prev_layout: test_r_prev_layout(),
+            recording_ghost_cache: RPcsLinkRecordingGhostCache::default(),
         };
         let (link_proof, link_root) = mock_basefold_geometry(&link_params, 1);
         let (b8_proof, b8_root) = mock_basefold_geometry(&block_params[0], 1);
@@ -3460,16 +3647,15 @@ mod tests {
         ];
 
         let mut builder = FieldR1csBuilder::new();
-        let columns =
-            prepare_r_pcs_link_columns(
-                &mut builder,
-                &proofs,
-                test_rec_layouts(1),
-                test_rec_layouts(1),
-                test_r_prev_layout(),
-                LinkLiveRecordings::default(),
-            )
-            .unwrap();
+        let columns = prepare_r_pcs_link_columns(
+            &mut builder,
+            &proofs,
+            test_rec_layouts(1),
+            test_rec_layouts(1),
+            test_r_prev_layout(),
+            LinkLiveRecordings::default(),
+        )
+        .unwrap();
         assert!(columns.asm.u_a.rec_blocks.is_empty());
         assert!(columns.asm.u_a.rec_refs.is_empty());
         assert!(columns.asm.u_a.rec_challenges.is_empty());
@@ -3488,9 +3674,9 @@ mod tests {
             test_rec_layouts(1),
             test_r_prev_layout(),
         )
-            .unwrap()
-            .path_carrier_depths()
-            .unwrap();
+        .unwrap()
+        .path_carrier_depths()
+        .unwrap();
         assert_eq!(
             columns.vk.path_b().families().len(),
             columns.asm.trees.iter().map(Vec::len).max().unwrap()

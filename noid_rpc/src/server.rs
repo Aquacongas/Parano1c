@@ -1067,27 +1067,26 @@ impl ParanoidApiServer for RpcHandler {
             // Recover those bytes locally; the RPC wire stays unchanged. A
             // missing terminal leaves the payload empty and the acceptance
             // path rejects the block fail-closed.
-            let coverage_attestation_bytes: Vec<u8> = if block.header.attested_coverage
-                != ctx.tip_header().attested_coverage
-            {
-                let coverage_height = block.header.attested_coverage;
-                ctx.get_header_from_store(coverage_height)
-                    .ok()
-                    .flatten()
-                    .and_then(|header| {
-                        ctx.store
-                            .get_selected_history_terminal_result_at(
-                                coverage_height,
-                                noid_chain::hash_block_header(&header),
-                            )
-                            .ok()
-                            .flatten()
-                    })
-                    .map(|result| result.bytes)
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
+            let coverage_attestation_bytes: Vec<u8> =
+                if block.header.attested_coverage != ctx.tip_header().attested_coverage {
+                    let coverage_height = block.header.attested_coverage;
+                    ctx.get_header_from_store(coverage_height)
+                        .ok()
+                        .flatten()
+                        .and_then(|header| {
+                            ctx.store
+                                .get_selected_history_terminal_result_at(
+                                    coverage_height,
+                                    noid_chain::hash_block_header(&header),
+                                )
+                                .ok()
+                                .flatten()
+                        })
+                        .map(|result| result.bytes)
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
             let attestation_store = ctx.store.clone();
             ctx.apply_next_block(
                 &block,
@@ -1105,32 +1104,41 @@ impl ParanoidApiServer for RpcHandler {
                  tx_epoch_anchor_id,
                  anchor,
                  state| {
-                    let tx_epoch = noid_block::BlockTxEpochContext {
-                        expected_user_epoch_anchor_id: *tx_epoch_anchor_id,
-                    };
-                    let output = noid_block::accept_block_with_artifacts(
-                        block,
-                        proof_bytes,
-                        auth_sidecar_bytes,
-                        parent,
-                        prev_timestamps,
-                        prev_active_counts,
-                        local_time,
-                        &tx_epoch,
-                        anchor,
-                        state,
-                    )?;
-                    accepted_block_validation(
-                        block,
-                        parent,
-                        prev_timestamps,
-                        prev_active_counts,
-                        anchor,
-                        proof_bytes,
-                        auth_sidecar_bytes,
-                        &output.artifacts,
-                        output.state_root,
-                    )
+                    noid_miner::install_process_proof_cpu(|| {
+                        let tx_epoch = noid_block::BlockTxEpochContext {
+                            expected_user_epoch_anchor_id: *tx_epoch_anchor_id,
+                        };
+                        let output = noid_block::accept_block_with_artifacts(
+                            block,
+                            proof_bytes,
+                            auth_sidecar_bytes,
+                            parent,
+                            prev_timestamps,
+                            prev_active_counts,
+                            local_time,
+                            &tx_epoch,
+                            anchor,
+                            state,
+                        )?;
+                        accepted_block_validation(
+                            block,
+                            parent,
+                            prev_timestamps,
+                            prev_active_counts,
+                            anchor,
+                            proof_bytes,
+                            auth_sidecar_bytes,
+                            &output.artifacts,
+                            output.state_root,
+                        )
+                    })
+                    .map_err(|error| {
+                        noid_block::FullValidationError::Consensus(
+                            noid_chain::consensus::ConsensusError::ShapeMismatch(format!(
+                                "process proof CPU admission failed: {error}"
+                            )),
+                        )
+                    })?
                 },
                 |claim| {
                     let expected = attestation_store
@@ -1604,6 +1612,31 @@ mod tests {
         assert!(snapshot_suffix_is_retained(100, 100 - retention));
         assert!(!snapshot_suffix_is_retained(100, 100 - retention - 1));
         assert!(!snapshot_suffix_is_retained(100, 101));
+    }
+
+    #[test]
+    fn extminer_acceptance_runs_inside_process_proof_pool() {
+        let source = include_str!("server.rs");
+        let submit_block = source
+            .split_once("async fn submit_block(")
+            .expect("submit_block method exists")
+            .1
+            .split_once("async fn wallet_status(")
+            .expect("wallet_status follows submit_block")
+            .0;
+        let pool_boundary = submit_block
+            .find("noid_miner::install_process_proof_cpu(||")
+            .expect("submit validation installs the process proof pool");
+        let acceptance = submit_block
+            .find("noid_block::accept_block_with_artifacts(")
+            .expect("submit validation performs full block acceptance");
+        let post_validation = submit_block
+            .find("accepted_block_validation(")
+            .expect("submit validation builds post-validation artifacts");
+
+        assert!(pool_boundary < acceptance);
+        assert!(acceptance < post_validation);
+        assert!(submit_block.contains("process proof CPU admission failed: {error}"));
     }
 }
 

@@ -489,11 +489,8 @@ mod tests {
         // user mint's increment would set bit 63 and must fail closed — the
         // twin of the native `is_coinbase_creation_id(next_alloc)` rejection.
         let parent = (1u128 << 63) - 2;
-        let (r1cs, witness, _) = allocator_case(
-            &[(9, true, true), (12, true, true)],
-            parent,
-            parent + 2,
-        );
+        let (r1cs, witness, _) =
+            allocator_case(&[(9, true, true), (12, true, true)], parent, parent + 2);
         assert!(!r1cs.satisfies(&witness));
 
         // One increment below the namespace boundary stays satisfiable.
