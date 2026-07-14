@@ -226,6 +226,13 @@ cargo build --locked --release -p noid_node --bins
 if [[ ${NOID_RELEASE_SKIP_TESTS:-0} == 1 ]]; then
   printf '\n==> Skipping release tests because NOID_RELEASE_SKIP_TESTS=1\n'
 else
+  CURRENT_STAGE="authenticated selected-history vertical"
+  printf '\n==> Proving and verifying one real selected-history terminal\n'
+  cargo test --locked --release \
+    -p noid_node --bin paranoid \
+    tests::authenticated_release_pack_proves_and_verifies_real_b8_terminal \
+    -- --exact --ignored --test-threads=1
+
   CURRENT_STAGE="release test suite"
   printf '\n==> Running release tests\n'
   cargo test --locked --release \

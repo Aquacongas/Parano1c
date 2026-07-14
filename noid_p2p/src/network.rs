@@ -3079,12 +3079,11 @@ mod tests {
             .enqueue_recursive_proof_job(1, hash, RecursiveProofJobTier::B8)
             .unwrap();
         ctx.store.claim_next_recursive_proof_job().unwrap().unwrap();
-        let mut terminal = Vec::new();
-        terminal.extend_from_slice(&1u16.to_le_bytes());
-        terminal.extend_from_slice(&1u64.to_le_bytes());
-        terminal.extend_from_slice(&hash);
-        terminal.push(0);
-        terminal.extend_from_slice(&8u16.to_le_bytes());
+        let terminal =
+            noid_chain::selected_history::SelectedHistoryTerminalMetadata::new(1, hash, 0)
+                .expect("B8 is the first canonical selected-history slot")
+                .encode_prefix()
+                .to_vec();
         ctx.store
             .complete_recursive_proof_job_and_promote_selected_history(
                 1,

@@ -864,13 +864,10 @@ mod tests {
     }
 
     fn selected_terminal_bytes(height: u64, block_hash: [u8; 32]) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&1u16.to_le_bytes());
-        bytes.extend_from_slice(&height.to_le_bytes());
-        bytes.extend_from_slice(&block_hash);
-        bytes.push(0);
-        bytes.extend_from_slice(&8u16.to_le_bytes());
-        bytes
+        crate::selected_history::SelectedHistoryTerminalMetadata::new(height, block_hash, 0)
+            .expect("B8 is the first canonical selected-history slot")
+            .encode_prefix()
+            .to_vec()
     }
 
     struct LadderFixture {

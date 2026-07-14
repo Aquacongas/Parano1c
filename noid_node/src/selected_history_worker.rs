@@ -2288,16 +2288,25 @@ mod tests {
         store.get_recursive_proof_job(1).unwrap().unwrap()
     }
 
-    /// Prefix-valid selected terminal bytes for a B8 job; the store validates
-    /// exactly this fixed prefix before promotion.
-    fn fake_terminal_package_bytes(height: u64, block_hash: [u8; 32]) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(45);
-        bytes.extend_from_slice(&1u16.to_le_bytes());
-        bytes.extend_from_slice(&height.to_le_bytes());
-        bytes.extend_from_slice(&block_hash);
-        bytes.push(0);
-        bytes.extend_from_slice(&8u16.to_le_bytes());
-        bytes
+    /// Canonical production metadata at the injected Stage-C boundary.
+    ///
+    /// These scheduler tests deliberately replace cryptographic Stage C; they
+    /// exercise only the exact terminal/job binding MDBX owns.  The bytes are
+    /// therefore authored by the shared production codec rather than by a
+    /// test-local imitation of the consensus wire layout.
+    fn scheduler_terminal_metadata_bytes(
+        height: u64,
+        block_hash: [u8; 32],
+        tier: RecursiveProofJobTier,
+    ) -> Vec<u8> {
+        noid_chain::selected_history::SelectedHistoryTerminalMetadata::new(
+            height,
+            block_hash,
+            tier.canonical_slot(),
+        )
+        .expect("canonical recursive proof tier")
+        .encode_prefix()
+        .to_vec()
     }
 
     fn stub_block_stage(
@@ -2319,9 +2328,33 @@ mod tests {
     ) -> Result<LinkStageResult<u64, ()>, SelectedHistoryWorkerBackoff> {
         Ok(LinkStageResult {
             payload: job.height,
-            encoded_package: Arc::new(fake_terminal_package_bytes(job.height, job.block_hash)),
+            encoded_package: Arc::new(scheduler_terminal_metadata_bytes(
+                job.height,
+                job.block_hash,
+                job.tier,
+            )),
             local_replay: (),
         })
+    }
+
+    #[test]
+    fn scheduler_terminal_metadata_uses_the_canonical_codec_for_every_tier() {
+        for tier in [
+            RecursiveProofJobTier::B8,
+            RecursiveProofJobTier::B32,
+            RecursiveProofJobTier::B64,
+            RecursiveProofJobTier::B255,
+        ] {
+            let metadata =
+                noid_chain::selected_history::SelectedHistoryTerminalMetadata::decode_prefix(
+                    &scheduler_terminal_metadata_bytes(7, [tier as u8; 32], tier),
+                )
+                .expect("scheduler boundary uses canonical selected-history metadata");
+            assert_eq!(metadata.terminal_height(), 7);
+            assert_eq!(metadata.terminal_hash(), [tier as u8; 32]);
+            assert_eq!(metadata.canonical_tip_slot(), tier.canonical_slot());
+            assert_eq!(metadata.canonical_tip_tier(), tier.capacity());
+        }
     }
 
     #[test]
@@ -2576,7 +2609,7 @@ mod tests {
             .complete_recursive_proof_job_and_promote_selected_history(
                 1,
                 hash,
-                &fake_terminal_package_bytes(1, hash),
+                &scheduler_terminal_metadata_bytes(1, hash, RecursiveProofJobTier::B8),
                 &update,
             )
             .unwrap();
@@ -2722,7 +2755,11 @@ mod tests {
                         .complete_recursive_proof_job_and_promote_selected_history(
                             1,
                             hash_one,
-                            &fake_terminal_package_bytes(1, hash_one),
+                            &scheduler_terminal_metadata_bytes(
+                                1,
+                                hash_one,
+                                RecursiveProofJobTier::B8,
+                            ),
                             &SelectedHistoryLadderUpdate::empty(genesis_header().log_slots),
                         )
                         .unwrap();
@@ -3018,9 +3055,10 @@ mod tests {
                 }
                 Ok(LinkStageResult {
                     payload: job.height,
-                    encoded_package: Arc::new(fake_terminal_package_bytes(
+                    encoded_package: Arc::new(scheduler_terminal_metadata_bytes(
                         job.height,
                         job.block_hash,
+                        job.tier,
                     )),
                     local_replay: SessionReplay(job.height),
                 })
@@ -3056,9 +3094,10 @@ mod tests {
                 cross_session_uses.fetch_add(1, Ordering::Relaxed);
                 Ok(LinkStageResult {
                     payload: job.height,
-                    encoded_package: Arc::new(fake_terminal_package_bytes(
+                    encoded_package: Arc::new(scheduler_terminal_metadata_bytes(
                         job.height,
                         job.block_hash,
+                        job.tier,
                     )),
                     local_replay: SessionReplay(job.height),
                 })
@@ -3130,9 +3169,10 @@ mod tests {
                 }
                 Ok(LinkStageResult {
                     payload: job.height,
-                    encoded_package: Arc::new(fake_terminal_package_bytes(
+                    encoded_package: Arc::new(scheduler_terminal_metadata_bytes(
                         job.height,
                         job.block_hash,
+                        job.tier,
                     )),
                     local_replay: LinearReplay {
                         height: job.height,

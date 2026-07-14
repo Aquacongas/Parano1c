@@ -21,6 +21,10 @@ use std::io::Cursor;
 use bincode::Options;
 use noid_chain::consensus::params::USER_TX_CLASS_TIERS;
 use noid_chain::consensus::wire_limits::MAX_HISTORY_PROOF_BYTES;
+use noid_chain::selected_history::{
+    SelectedHistoryTerminalMetadata, SelectedHistoryTerminalMetadataError,
+    SELECTED_HISTORY_TERMINAL_METADATA_BYTES,
+};
 use noid_chain::{block_id, BlockHeader};
 use noid_ivc_core::field::F128;
 use noid_ivc_core::field_r1cs::FieldR1cs;
@@ -38,15 +42,14 @@ use crate::acceptance::split_link::{
 };
 use crate::accumulator::{ChainAccumulator, CHAIN_ACCUMULATOR_LANES};
 
-/// First and only pre-launch selected-history terminal wire version.
-pub const SELECTED_HISTORY_TERMINAL_VERSION: u16 = 1;
+pub use noid_chain::selected_history::SELECTED_HISTORY_TERMINAL_VERSION;
 
 /// The terminal package uses the existing consensus history-proof admission
 /// budget.  The limit is checked before any bincode call.
 pub const MAX_SELECTED_HISTORY_TERMINAL_PACKAGE_BYTES: usize = MAX_HISTORY_PROOF_BYTES;
 
 /// Fixed prefix: version, height, hash, slot, tier, envelope Vec length.
-const SELECTED_HISTORY_WIRE_PREFIX_BYTES: usize = 2 + 8 + 32 + 1 + 2 + 8;
+const SELECTED_HISTORY_WIRE_PREFIX_BYTES: usize = SELECTED_HISTORY_TERMINAL_METADATA_BYTES + 8;
 
 /// Maximum bincode payload admitted for the terminal [`LinkProofEnvelope`].
 pub const MAX_SELECTED_HISTORY_TERMINAL_ENVELOPE_BYTES: usize =
@@ -246,14 +249,35 @@ struct WirePreflight<'a> {
 }
 
 fn canonical_selector(slot: usize) -> Result<(u8, u16), SelectedHistoryCodecError> {
-    let tier = USER_TX_CLASS_TIERS
-        .get(slot)
-        .copied()
-        .ok_or(SelectedHistoryCodecError::InvalidTipSlot { actual: slot })?;
-    let slot = u8::try_from(slot)
-        .map_err(|_| SelectedHistoryCodecError::InvalidTipSlot { actual: slot })?;
-    let tier = u16::try_from(tier).expect("canonical transaction tier fits u16");
-    Ok((slot, tier))
+    let metadata =
+        SelectedHistoryTerminalMetadata::new(0, [0u8; 32], slot).map_err(map_metadata_error)?;
+    Ok((
+        u8::try_from(metadata.canonical_tip_slot()).expect("canonical slot fits u8"),
+        u16::try_from(metadata.canonical_tip_tier()).expect("canonical tier fits u16"),
+    ))
+}
+
+fn map_metadata_error(error: SelectedHistoryTerminalMetadataError) -> SelectedHistoryCodecError {
+    match error {
+        SelectedHistoryTerminalMetadataError::Truncated => {
+            SelectedHistoryCodecError::TruncatedPrefix
+        }
+        SelectedHistoryTerminalMetadataError::UnsupportedVersion { actual } => {
+            SelectedHistoryCodecError::UnsupportedVersion { actual }
+        }
+        SelectedHistoryTerminalMetadataError::InvalidTipSlot { actual } => {
+            SelectedHistoryCodecError::InvalidTipSlot { actual }
+        }
+        SelectedHistoryTerminalMetadataError::TipTierMismatch {
+            slot,
+            expected,
+            actual,
+        } => SelectedHistoryCodecError::TipTierMismatch {
+            slot,
+            expected,
+            actual,
+        },
+    }
 }
 
 /// Allocation-free preflight of the complete outer fixed-int wire.
@@ -272,24 +296,20 @@ fn preflight_wire(bytes: &[u8]) -> Result<WirePreflight<'_>, SelectedHistoryCode
         return Err(SelectedHistoryCodecError::TruncatedPrefix);
     }
 
-    let version = u16::from_le_bytes(bytes[0..2].try_into().unwrap());
-    if version != SELECTED_HISTORY_TERMINAL_VERSION {
-        return Err(SelectedHistoryCodecError::UnsupportedVersion { actual: version });
-    }
-    let terminal_height = u64::from_le_bytes(bytes[2..10].try_into().unwrap());
-    let terminal_hash = bytes[10..42].try_into().unwrap();
-    let canonical_tip_slot = bytes[42];
-    let canonical_tip_tier = u16::from_le_bytes(bytes[43..45].try_into().unwrap());
-    let (_, expected_tier) = canonical_selector(usize::from(canonical_tip_slot))?;
-    if canonical_tip_tier != expected_tier {
-        return Err(SelectedHistoryCodecError::TipTierMismatch {
-            slot: usize::from(canonical_tip_slot),
-            expected: usize::from(expected_tier),
-            actual: usize::from(canonical_tip_tier),
-        });
-    }
+    let metadata =
+        SelectedHistoryTerminalMetadata::decode_prefix(bytes).map_err(map_metadata_error)?;
+    let terminal_height = metadata.terminal_height();
+    let terminal_hash = metadata.terminal_hash();
+    let canonical_tip_slot =
+        u8::try_from(metadata.canonical_tip_slot()).expect("canonical slot fits u8");
+    let canonical_tip_tier =
+        u16::try_from(metadata.canonical_tip_tier()).expect("canonical tier fits u16");
 
-    let encoded_len = u64::from_le_bytes(bytes[45..53].try_into().unwrap());
+    let encoded_len = u64::from_le_bytes(
+        bytes[SELECTED_HISTORY_TERMINAL_METADATA_BYTES..SELECTED_HISTORY_WIRE_PREFIX_BYTES]
+            .try_into()
+            .unwrap(),
+    );
     if encoded_len == 0 {
         return Err(SelectedHistoryCodecError::EmptyEnvelope);
     }
@@ -367,12 +387,18 @@ pub fn encode_selected_history_terminal_package(
         });
     }
 
+    let metadata = SelectedHistoryTerminalMetadata::new(
+        package.terminal_height,
+        package.terminal_hash,
+        usize::from(package.canonical_tip_slot),
+    )
+    .map_err(map_metadata_error)?;
+    debug_assert_eq!(
+        metadata.canonical_tip_tier(),
+        usize::from(package.canonical_tip_tier)
+    );
     let mut encoded = Vec::with_capacity(SELECTED_HISTORY_WIRE_PREFIX_BYTES + envelope_bytes.len());
-    encoded.extend_from_slice(&package.version.to_le_bytes());
-    encoded.extend_from_slice(&package.terminal_height.to_le_bytes());
-    encoded.extend_from_slice(&package.terminal_hash);
-    encoded.push(package.canonical_tip_slot);
-    encoded.extend_from_slice(&package.canonical_tip_tier.to_le_bytes());
+    encoded.extend_from_slice(&metadata.encode_prefix());
     encoded.extend_from_slice(&(envelope_bytes.len() as u64).to_le_bytes());
     encoded.extend_from_slice(&envelope_bytes);
     debug_assert!(preflight_wire(&encoded).is_ok());

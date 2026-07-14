@@ -24,6 +24,7 @@ pub mod fri_state;
 pub mod header_anchor;
 pub mod mempool;
 pub mod segmented_state;
+pub mod selected_history;
 pub mod sparse_merkle;
 pub mod state;
 pub mod state_delta;

@@ -451,10 +451,6 @@ const RECURSIVE_PROOF_RESULT_MAGIC: [u8; 4] = *b"RPR1";
 const RECURSIVE_PROOF_RESULT_HEADER_BYTES: usize = 40;
 const SELECTED_HISTORY_COVERAGE_MAGIC: [u8; 4] = *b"SHC1";
 const SELECTED_HISTORY_COVERAGE_ENCODED_BYTES: usize = 44;
-// version + height + hash + canonical class slot + canonical tier.
-// The opaque recursive envelope follows this fixed metadata.
-const SELECTED_HISTORY_TERMINAL_PREFIX_BYTES: usize = 2 + 8 + 32 + 1 + 2;
-const SELECTED_HISTORY_TERMINAL_VERSION: u16 = 1;
 const ACCEPTED_BLOCK_CERTIFICATE_BINDING_MAGIC: [u8; 4] = *b"ACB1";
 const ACCEPTED_BLOCK_CERTIFICATE_BINDING_BYTES: usize = 4 + 8 + 32 + 8;
 const RETAINED_PAYLOAD_PRUNE_WATERMARK_MAGIC: [u8; 4] = *b"RPW1";
@@ -509,6 +505,21 @@ impl RecursiveProofJobTier {
             Self::B32 => 32,
             Self::B64 => 64,
             Self::B255 => 255,
+        }
+    }
+
+    /// Consensus class slot used by the selected-history terminal metadata.
+    pub const fn canonical_slot(self) -> usize {
+        self as usize
+    }
+
+    pub const fn from_canonical_slot(slot: usize) -> Option<Self> {
+        match slot {
+            0 => Some(Self::B8),
+            1 => Some(Self::B32),
+            2 => Some(Self::B64),
+            3 => Some(Self::B255),
+            _ => None,
         }
     }
 
@@ -1540,23 +1551,14 @@ fn selected_history_terminal_matches_job(
 fn selected_history_terminal_metadata(
     bytes: &[u8],
 ) -> Option<(u64, [u8; 32], RecursiveProofJobTier)> {
-    if bytes.len() < SELECTED_HISTORY_TERMINAL_PREFIX_BYTES
-        || u16::from_le_bytes(bytes[..2].try_into().ok()?) != SELECTED_HISTORY_TERMINAL_VERSION
-    {
-        return None;
-    }
-    let height = u64::from_le_bytes(bytes[2..10].try_into().ok()?);
-    let block_hash = bytes[10..42].try_into().ok()?;
-    let slot = bytes[42];
-    let tier = u16::from_le_bytes(bytes[43..45].try_into().ok()?);
-    let job_tier = match (slot, tier) {
-        (0, 8) => RecursiveProofJobTier::B8,
-        (1, 32) => RecursiveProofJobTier::B32,
-        (2, 64) => RecursiveProofJobTier::B64,
-        (3, 255) => RecursiveProofJobTier::B255,
-        _ => return None,
-    };
-    Some((height, block_hash, job_tier))
+    let metadata =
+        crate::selected_history::SelectedHistoryTerminalMetadata::decode_prefix(bytes).ok()?;
+    let job_tier = RecursiveProofJobTier::from_canonical_slot(metadata.canonical_tip_slot())?;
+    Some((
+        metadata.terminal_height(),
+        metadata.terminal_hash(),
+        job_tier,
+    ))
 }
 
 /// Validate the current compact coverage authority without copying its proof
@@ -6717,13 +6719,14 @@ mod tests {
         block_hash: [u8; 32],
         tier: RecursiveProofJobTier,
     ) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(SELECTED_HISTORY_TERMINAL_PREFIX_BYTES);
-        bytes.extend_from_slice(&SELECTED_HISTORY_TERMINAL_VERSION.to_le_bytes());
-        bytes.extend_from_slice(&height.to_le_bytes());
-        bytes.extend_from_slice(&block_hash);
-        bytes.push(tier as u8);
-        bytes.extend_from_slice(&(tier.capacity() as u16).to_le_bytes());
-        bytes
+        crate::selected_history::SelectedHistoryTerminalMetadata::new(
+            height,
+            block_hash,
+            tier.canonical_slot(),
+        )
+        .expect("canonical recursive proof tier")
+        .encode_prefix()
+        .to_vec()
     }
 
     fn put_selected_history_header_chain(

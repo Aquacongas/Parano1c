@@ -2384,8 +2384,8 @@ fn state_segment_response_matches_snapshot_boundary(
 mod tests {
     use super::{
         compare_manifest_fork_choice, embedded_matrix_retention, gap_requires_snapshot_sync,
-        load_or_create_config, p2p_listen_to_multiaddr, snapshot_header_next_action,
-        state_segment_response_matches_snapshot_boundary,
+        load_or_create_config, p2p_listen_to_multiaddr, selected_history_verifier_artifacts,
+        snapshot_header_next_action, state_segment_response_matches_snapshot_boundary,
         validate_selected_terminal_tip_future_drift, validate_snapshot_header_batch_admission,
         validate_snapshot_staged_header_boundary, BoundedRelayTerminalPeers, NodeConfig, NodeMode,
         OrphanBlock, ProvedBlockCandidate, RemoteSelectedHistoryRequestKey,
@@ -2444,6 +2444,118 @@ mod tests {
         for mode in [NodeMode::Miner, NodeMode::Extminer] {
             assert_eq!(embedded_matrix_retention(&mode), RetainAll);
         }
+    }
+
+    /// Mandatory release-script gate over the executable's exact embedded
+    /// authority.  Unlike the scheduler tests, every object crossing this
+    /// vertical is real: an accepted block is replayed into the sealed native
+    /// carrier, its B8 Block and non-genesis Link proofs are authored with the
+    /// authenticated matrix bank, the terminal package is round-tripped, and
+    /// the production streaming verifier discharges the result again.
+    #[test]
+    #[ignore = "requires the authenticated release pack and the m22 Block/Link prover"]
+    fn authenticated_release_pack_proves_and_verifies_real_b8_terminal() {
+        use noid_miner::{
+            EmbeddedSelectedRecursiveRetention, PinnedSelectedRecursiveClassRegistrySource,
+            SelectedRecursiveBlockJob, SelectedRecursiveLinkJob, SelectedRecursiveLinkPredecessor,
+            SelectedRecursiveTier,
+        };
+
+        let embedded =
+            selected_history_verifier_artifacts(EmbeddedSelectedRecursiveRetention::RetainAll)
+                .expect("embedded selected-history authority")
+                .expect("release gate requires an authenticated embedded pack");
+        let registry = embedded
+            .registry_source
+            .load_pinned_registry(embedded.registry_digest)
+            .expect("load build-authenticated full registry");
+        let block_classes = registry.block_classes().expect("canonical Block classes");
+        let link_classes = registry.link_classes().expect("canonical Link classes");
+
+        // The first child is the smallest honest non-genesis vertical: its
+        // predecessor is the registry's cryptographically validated Genesis T
+        // and its accepted body is a real canonical coinbase-only block.
+        let [first, second] = bench_prover::accepted_two_coinbase_chain_fixture();
+        drop(second);
+        let bench_prover::AcceptedSingleBlockFixture {
+            start_consensus,
+            start_accumulator,
+            parent,
+            pre_state,
+            witness,
+            output,
+            component_proof,
+        } = first;
+        drop(component_proof);
+        let tip_header = witness.items[0].block.header.clone();
+        let expected_end_accumulator = output.accepted_claim_batch.accumulator.clone();
+        drop(output);
+
+        // Admission starts before the native carrier is reconstructed, just
+        // as it does in the production selected-history worker.
+        let mut proof_session =
+            noid_miner::begin_selected_history_proof_session(SelectedRecursiveTier::B8)
+                .expect("admit B8 selected-history proof session");
+        let (native_artifacts, _ladder_update) =
+            noid_block::reconstruct_selected_recursive_block_artifacts_from_single_witness(
+                start_consensus,
+                start_accumulator,
+                parent,
+                pre_state,
+                witness,
+            )
+            .expect("reconstruct native-verified selected Block carrier");
+        assert_eq!(
+            native_artifacts.end_accumulator(),
+            &expected_end_accumulator
+        );
+
+        let mut proof_matrices = embedded.matrix_source.clone();
+        let current_block = proof_session
+            .prove_block_with_matrices(
+                &block_classes,
+                SelectedRecursiveBlockJob::from_native_verified(native_artifacts),
+                &mut proof_matrices,
+            )
+            .expect("prove real selected B8 Block");
+        let linked = proof_session
+            .prove_link(
+                &link_classes,
+                SelectedRecursiveLinkJob {
+                    predecessor: SelectedRecursiveLinkPredecessor::Genesis,
+                    current_block,
+                },
+                &mut proof_matrices,
+            )
+            .expect("prove real non-genesis selected Link");
+        assert_eq!(linked.tier, SelectedRecursiveTier::B8);
+
+        let package = noid_recursive::SelectedHistoryTerminalPackage::new(
+            tip_header.height,
+            noid_chain::block_id(&tip_header),
+            0,
+            linked.envelope,
+        )
+        .expect("construct real selected-history terminal");
+        let encoded = package.encode().expect("encode real terminal package");
+        let decoded = noid_recursive::decode_selected_history_terminal_package(&encoded)
+            .expect("decode real terminal package");
+
+        // Verification owns the mutually exclusive topology admission, so
+        // the authoring session must end before entering production Stage C.
+        drop(proof_session);
+        drop(proof_matrices);
+        let mut verify_matrices = embedded.matrix_source.clone();
+        let verified = noid_miner::verify_selected_history_terminal_embedded_governed(
+            &decoded,
+            &embedded.registry_source,
+            embedded.registry_digest,
+            &tip_header,
+            &noid_chain::consensus::genesis_header(),
+            &mut verify_matrices,
+        )
+        .expect("stream-verify real selected-history terminal");
+        assert_eq!(verified, expected_end_accumulator);
     }
 
     #[test]
