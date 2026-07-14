@@ -1,2 +1,5 @@
+# Stable Cargo profiles cannot carry rustflags. Keep the workspace default
+# here; noid_core independently rejects release targets that lose the required
+# proof ISA through an environment override or an out-of-tree Cargo invocation.
 [build]
 rustflags = ["-C", "target-cpu=native"]

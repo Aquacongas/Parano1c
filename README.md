@@ -1,8 +1,10 @@
 # Paranoid
 
 Paranoid is a proof-native UTXO blockchain written in Rust. Every node checks
-proof of work and block certificates. Proving nodes additionally maintain a
-recursive selected-history proof whose size does not grow with chain height.
+proof of work and block certificates. Mining nodes also create block
+certificates and maintain a recursive selected-history proof whose size does
+not grow with chain height. Proof generation is an automatic part of mining,
+whether PoW runs inside the node or in an external worker.
 
 The current release uses the m22 Link relation and four Block classes: B8,
 B32, B64, and B255. The release binary contains the registry and all nine
@@ -18,14 +20,18 @@ for release builders, matrix regeneration, and pipeline diagnostics.
 
 | Role | Requirement |
 |---|---|
-| `relay` | Normal full-node and wallet mode. It does not mine or run the local proving pipeline and does not require the 16 GiB proving profile. |
-| `miner`, `prover`, `extminer` | At least 16 GiB RAM and a multi-core CPU. These roles run the selected-history prover. The internal miner requires at least two logical CPUs and uses one PoW worker by default. |
+| Node and wallet | The default `./paranoid` process. It validates and relays the chain, serves P2P/RPC, and owns the wallet. It does not mine or create local selected-history proofs. |
+| Mining node | At least 16 GiB RAM and a multi-core CPU. The node creates block certificates and selected-history proofs with either built-in or external PoW. Built-in PoW requires at least two logical CPUs and uses one worker by default. |
 | Release builder | At least 16 GiB RAM, Linux, Rust with `rustfmt`, a C/C++ toolchain, `pkg-config`, libclang, OpenSSL development headers, Bash, GNU userland, and enough disk for a fresh matrix pack. |
 
-Release builds use `-C target-cpu=native` from `.cargo/config.toml`. Build on
-the oldest CPU that the resulting binary must support. An environment
-`RUSTFLAGS` value replaces the workspace setting; if you set it manually, keep
-`-C target-cpu=native` or proving performance will be dramatically worse.
+The tracked `.cargo/config.toml` applies `-C target-cpu=native` to every Cargo
+build and test started from the repository. `Cargo.lock` fixes dependency
+versions; compiler flags do not belong in it. Release compilation stops if the
+effective target loses the proof CPU contract: SSE4.1, PCLMULQDQ, AVX2, and
+VPCLMULQDQ on x86-64, or AES/PMULL on aarch64. This catches `RUSTFLAGS`
+overrides that remove those features and Cargo invoked from outside the
+repository. Build an official binary on the least capable supported CPU that
+still satisfies this contract.
 Python 3 and `rg` are optional conveniences used by later diagnostic examples.
 
 ### Release contents
@@ -54,7 +60,7 @@ If only the archive is distributed, compare its digest with the published
 sha256sum paranoid-release.tar.gz
 ```
 
-Then unpack the archive and start the default relay:
+Then unpack the archive and start the node and wallet:
 
 ```bash
 tar -xzf paranoid-release.tar.gz
@@ -79,27 +85,29 @@ The node tries its built-in DNS seeds automatically. To add a known peer
 explicitly:
 
 ```bash
-./paranoid --mode relay --seed SEED_IP:9400
+./paranoid --seed SEED_IP:9400
 ```
 
 The `--seed` option expects `IP:PORT`, not a DNS name or libp2p multiaddress.
 For example, use `127.0.0.1:9400`, not `/ip4/127.0.0.1/tcp/9400`.
 
-### Node modes
+### Ways to run the node
 
-| Mode | What it does |
+| Invocation | What it does |
 |---|---|
-| `relay` | Default. Validates the chain, serves P2P/RPC, and runs the wallet. No PoW and no local selected-history proving. |
-| `prover` | Relay plus the selected-history proving worker. Does not mine. |
-| `miner` | Internal PoW mining plus block-certificate assembly and selected-history proving. |
-| `extminer` | Serves block templates to an external miner and runs selected-history proving. Internal PoW is disabled. Requires `--mining-key`. |
+| `./paranoid` | Ordinary node and wallet. Validates and relays the chain, serves P2P/RPC, and verifies remote proofs. It does not mine. |
+| `./paranoid --miner` | Mining node with built-in PoW. The node assembles block certificates and runs the selected-history proof pipeline automatically. |
+| `./paranoid --extminer` | Mining node with an external PoW worker. The node still assembles and proves the block and runs the selected-history pipeline; the external worker only searches for the nonce. Requires `--mining-key`. |
+
+There is no separate proving-node role. Producing the Block and Link proofs is
+part of both mining configurations.
 
 The release archive does not include the separate external-miner client.
 
 Bootstrap the first node of a new network:
 
 ```bash
-./paranoid --mode miner --genesis --mining-threads 1
+./paranoid --miner --genesis --mining-threads 1
 ```
 
 `--genesis` is only for the first node of a fresh network. A miner joining an
@@ -107,15 +115,9 @@ existing network uses seeds instead:
 
 ```bash
 ./paranoid \
-  --mode miner \
+  --miner \
   --seed SEED_IP:9400 \
   --mining-threads 1
-```
-
-Run a non-mining prover:
-
-```bash
-./paranoid --mode prover --seed SEED_IP:9400
 ```
 
 See every option with:
@@ -160,7 +162,6 @@ RUN="$PWD/target/my-node"
 mkdir -p "$RUN"
 
 ./paranoid \
-  --mode relay \
   --config "$RUN/paranoid.toml" \
   --data-dir "$RUN/data" \
   --p2p-listen 127.0.0.1:9500 \
@@ -168,7 +169,8 @@ mkdir -p "$RUN"
 ```
 
 Command-line overrides apply to that process only; they are not written back
-to the generated TOML. Pass `--mode` on every start that should mine or prove.
+to the generated TOML. Pass `--miner` or `--extminer` on every start that
+should mine.
 
 ## Build an official release
 
@@ -189,7 +191,7 @@ may be supplied, but it must not already exist:
 The script performs these steps in order:
 
 1. Checks formatting and checks all workspace targets in Cargo's normal
-   non-release profile with warnings denied.
+   non-release profile.
 2. Builds the matrix generator and pin tool with `--locked --release`.
 3. Generates the registry and nine canonical matrices exactly once, directly
    at zstd level 19.
@@ -198,7 +200,8 @@ The script performs these steps in order:
    compressed matrix bytes.
 6. Lets `noid_node/build.rs` strictly validate the registry and all nine
    matrix relations, then embeds build-produced runtime images.
-7. Builds `paranoid` and `noid-cli` in release mode.
+7. Builds `paranoid` and `noid-cli` in release mode; the shared core rejects a
+   target that does not satisfy the proof CPU contract.
 8. Runs release tests for `noid_recursive`, `noid_node`, `noid_chain`, and
    `noid_miner`.
 9. Creates the binary archive and SHA-256 checksums.
@@ -280,8 +283,8 @@ NOID_SELECTED_RECURSIVE_PACK_LEAF_DIGESTS
 ```
 
 `pins.env` supplies the two digest variables. The command supplies the pack
-directory. A debug build may omit the pack, but `miner`, `prover`, and
-`extminer` then refuse to start because they cannot prove selected history.
+directory. A debug build may omit the pack, but its mining modes then refuse
+to start because they cannot create selected-history proofs.
 
 ## Generate matrices manually
 
@@ -406,9 +409,9 @@ derivation, or repack. The embedded registry is bounded-decoded once to build
 runtime tables without repeating its semantic proof validation. There is no
 filesystem fallback.
 
-`miner`, `prover`, and `extminer` prewarm the B8 Block/Link matrices. Genesis
-Link is also prewarmed while selected-history coverage is zero. A proving role
-retains every matrix after its first use. A relay releases a matrix when its
+Both mining configurations prewarm the B8 Block/Link matrices. Genesis Link is
+also prewarmed while selected-history coverage is zero. A mining node retains
+every matrix after its first use. An ordinary node releases a matrix when its
 active verification leases disappear. There is no matrix LRU, host
 `MemAvailable` polling, hard byte budget, or memory-dependent eviction policy.
 
@@ -418,8 +421,8 @@ are verified at runtime.
 
 ## Selected-history pipeline
 
-Every accepted block creates a durable proof job in MDBX. A proving node moves
-consecutive jobs through three ordered stages:
+Every accepted block creates a durable proof job in MDBX. A mining node's
+proof pipeline moves consecutive jobs through three ordered stages:
 
 1. **Block:** load the claimed block and parent state, replay the transition,
    produce its ladder update and accumulator, and build the selected Block
@@ -458,7 +461,7 @@ RUN="$(mktemp -d "$RUN_PARENT/m22-one-node.XXXXXX")"
 printf '%s\n' "$RUN" > "$RUN_PARENT/LAST_M22_RUN"
 
 "$BIN_DIR/paranoid" \
-  --mode miner \
+  --miner \
   --genesis \
   --mining-threads 1 \
   --config "$RUN/paranoid.toml" \

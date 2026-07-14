@@ -3,7 +3,7 @@
 
 //! Crash-resumable production worker for selected Block+Link history proofs.
 //!
-//! This module is deliberately synchronous: the prover-role node calls
+//! This module is deliberately synchronous: a mining node calls
 //! [`SelectedHistoryProverWorker::run_pipelined`] from its bounded blocking
 //! worker.  Ordinary validating nodes never construct this worker.  One
 //! invocation acquires one proof-topology session and then pipelines a bounded
@@ -82,7 +82,7 @@ impl From<RecursiveProofJob> for SelectedHistoryJobIdentity {
 pub enum SelectedHistoryWorkerBackoff {
     /// The durable queue currently has no canonical pending entry.
     Idle,
-    /// The prover role is shutting down or has been administratively paused.
+    /// The mining node is shutting down or its proof pipeline was paused.
     Cancelled,
     /// Another incompatible process-local proof stage currently owns the
     /// topology slot needed to start this drain.
@@ -158,7 +158,7 @@ fn planned_pipeline_depth(
 // Worker
 // ---------------------------------------------------------------------------
 
-/// Prover-role owner of one immutable decoded registry and three lightweight
+/// Mining-pipeline owner of one immutable decoded registry and three lightweight
 /// handles over the shared authenticated compact matrix bank (one per
 /// overlapped matrix-using lane). It owns no proof queue, relation matrix, or
 /// chain state; only one bounded process-local replay tail may survive a

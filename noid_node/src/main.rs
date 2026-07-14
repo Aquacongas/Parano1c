@@ -335,9 +335,9 @@ fn prepare_selected_history_worker(
     artifacts: SelectedHistoryVerifierArtifacts,
 ) -> Result<PreparedSelectedHistoryWorker, String> {
     // Genesis T is prewarmed only while the durable ladder starts at height
-    // zero. Once materialized it remains in the proving role's 1-GiB
-    // retain-all bank, so a deep reorg never pays the cold authentication cost
-    // again; ordinary restarts do not decode it speculatively.
+    // zero. Once materialized it remains in the mining node's retain-all bank,
+    // so a deep reorg never pays the cold authentication cost again; ordinary
+    // restarts do not decode it speculatively.
     let prewarm_genesis = store
         .get_selected_history_coverage()
         .map_err(|error| format!("read selected-history coverage for prewarm: {error}"))?
@@ -512,33 +512,29 @@ use wallet::{SharedWallet, WalletHandle, WalletState};
 
 /// Operating mode for the full node.
 ///
-/// Exactly one mode must be active. The default is `relay`.
+/// Exactly one mode must be active. The default is `node`.
 #[derive(Debug, Clone, PartialEq, Eq, clap::ValueEnum, Default)]
 pub enum NodeMode {
-    /// Relay node (default). No mining, no block-template serving.
+    /// Ordinary node and wallet (default). No mining or template serving.
     /// Verifies all blocks (proofs + PoW) and serves recent block/header sync.
     /// Snapshot sync uses the same manifest/proof pipeline that the O(1)
     /// verifier will authorize.
     #[default]
-    Relay,
-    /// Relay that also runs the selected-history proving worker: no mining,
-    /// no template serving, but the node advances the Link ladder and serves
-    /// O(1) snapshots. For operators who want to support the network without
-    /// mining.
-    Prover,
-    /// Internal miner. Runs built-in PoW + block-certificate assembly in parallel.
-    /// Blocks external miner (extminer) access to the block-template API.
+    #[value(alias = "relay")]
+    Node,
+    /// Mining node with built-in PoW. It also assembles block certificates and
+    /// runs the selected-history proof pipeline.
     Miner,
-    /// External miner mode. Serves `getBlockTemplate` / `submitBlock`
-    /// to `noid-extminer` clients. Requires `--mining-key`. Internal
-    /// PoW miner is disabled.
+    /// Mining node with an external PoW worker. The node assembles and proves
+    /// the template; `noid-extminer` only searches for a nonce. Requires
+    /// `--mining-key`. Internal PoW is disabled.
     Extminer,
 }
 
 fn embedded_matrix_retention(mode: &NodeMode) -> noid_miner::EmbeddedSelectedRecursiveRetention {
     match mode {
-        NodeMode::Relay => noid_miner::EmbeddedSelectedRecursiveRetention::Ephemeral,
-        NodeMode::Prover | NodeMode::Miner | NodeMode::Extminer => {
+        NodeMode::Node => noid_miner::EmbeddedSelectedRecursiveRetention::Ephemeral,
+        NodeMode::Miner | NodeMode::Extminer => {
             noid_miner::EmbeddedSelectedRecursiveRetention::RetainAll
         }
     }
@@ -549,7 +545,7 @@ fn embedded_matrix_retention(mode: &NodeMode) -> noid_miner::EmbeddedSelectedRec
     name = "paranoid",
     about = "Paranoid full node daemon — proof-native UTXO blockchain",
     version = env!("CARGO_PKG_VERSION"),
-    long_about = "Run a Paranoid full node.\n\nExample:\n  paranoid --mode miner --data-dir ~/.paranoid\n  paranoid --mode relay --p2p-listen 0.0.0.0:9301 --seed 1.2.3.4:9301",
+    long_about = "Run a Paranoid node and wallet.\n\nExample:\n  paranoid --miner --data-dir ~/.paranoid\n  paranoid --p2p-listen 0.0.0.0:9301 --seed 1.2.3.4:9301",
 )]
 struct Cli {
     /// Path to TOML config file. A missing file is created with safe defaults.
@@ -559,24 +555,19 @@ struct Cli {
 
     /// Node operating mode.
     ///
-    /// relay    — full node, no mining (default)
-    /// prover   — full node that also proves the Link ladder (network support)
-    /// miner    — internal PoW + block-certificate assembly; blocks extminer access
-    /// extminer — serves block templates to noid-extminer; requires --mining-key
-    #[arg(long, value_enum, default_value_t = NodeMode::Relay)]
+    /// node     — ordinary node and wallet, no mining (default)
+    /// miner    — mining node with built-in PoW and automatic proof pipeline
+    /// extminer — mining node with external PoW nonce search; requires --mining-key
+    #[arg(long, value_enum, default_value_t = NodeMode::Node)]
     mode: NodeMode,
 
     /// Shorthand for `--mode miner`.
-    #[arg(long, conflicts_with_all = ["extminer", "prover"])]
+    #[arg(long, conflicts_with = "extminer")]
     miner: bool,
 
     /// Shorthand for `--mode extminer`.
-    #[arg(long, conflicts_with_all = ["miner", "prover"])]
+    #[arg(long, conflicts_with = "miner")]
     extminer: bool,
-
-    /// Shorthand for `--mode prover`.
-    #[arg(long, conflicts_with_all = ["miner", "extminer"])]
-    prover: bool,
 
     /// Bootstrap a new network: start mining immediately without waiting for peers.
     /// Use ONLY for the very first node on a fresh network.
@@ -752,8 +743,6 @@ async fn main() -> anyhow::Result<()> {
         cli.mode = NodeMode::Miner;
     } else if cli.extminer {
         cli.mode = NodeMode::Extminer;
-    } else if cli.prover {
-        cli.mode = NodeMode::Prover;
     }
 
     // --- Tracing ---
@@ -797,15 +786,13 @@ async fn main() -> anyhow::Result<()> {
     if cli.mode != NodeMode::Miner && cli.mining_threads.is_some() {
         anyhow::bail!("--mining-threads is only valid with --mode miner");
     }
-    let selected_history_prover_enabled = matches!(
-        &cli.mode,
-        NodeMode::Miner | NodeMode::Extminer | NodeMode::Prover
-    );
-    // Every role imports remote terminals: when any faster prover has
+    let selected_history_pipeline_enabled =
+        matches!(&cli.mode, NodeMode::Miner | NodeMode::Extminer);
+    // Every node imports remote terminals: when any faster mining node has
     // advanced the ladder, local coverage jumps forward instead of grinding
-    // through heights someone already proved. Provers resume from the jump
-    // (the ladder cursor reseeds inside the tip window), so one fast prover
-    // lifts the whole network's snapshot boundary.
+    // through heights a mining node already proved. Mining nodes resume from
+    // the jump (the ladder cursor reseeds inside the tip window), so one fast
+    // mining node lifts the whole network's snapshot boundary.
     let remote_selected_history_import_enabled = true;
 
     // --- Network ---
@@ -828,7 +815,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(dir) = cli.data_dir {
         cfg.storage.path = dir;
     }
-    // The CLI mode is authoritative: relay/extminer never start the internal
+    // The CLI mode is authoritative: node/extminer never start the internal
     // miner even if a stale config file has mining.enabled=true.
     cfg.mining.enabled = cli.mode == NodeMode::Miner;
     if let Some(addr) = cli.miner_address {
@@ -948,10 +935,10 @@ async fn main() -> anyhow::Result<()> {
     // Mandatory registry materialization and compact B8 prewarm happen while
     // the process is still private: no P2P handler, RPC listener, miner, or
     // terminal verifier can race the startup topology slot.
-    let prepared_selected_history_worker = if selected_history_prover_enabled {
+    let prepared_selected_history_worker = if selected_history_pipeline_enabled {
         let artifacts = selected_history_verifier.clone().ok_or_else(|| {
             anyhow::anyhow!(
-                "prover mode requires a build-authenticated embedded selected-recursive pack"
+                "mining modes require a build-authenticated embedded selected-recursive pack"
             )
         })?;
         let store = {
@@ -2450,11 +2437,11 @@ mod tests {
     }
 
     #[test]
-    fn embedded_matrix_cache_is_light_only_for_the_non_proving_relay_role() {
+    fn embedded_matrix_cache_is_light_only_for_the_ordinary_node() {
         use noid_miner::EmbeddedSelectedRecursiveRetention::{Ephemeral, RetainAll};
 
-        assert_eq!(embedded_matrix_retention(&NodeMode::Relay), Ephemeral);
-        for mode in [NodeMode::Prover, NodeMode::Miner, NodeMode::Extminer] {
+        assert_eq!(embedded_matrix_retention(&NodeMode::Node), Ephemeral);
+        for mode in [NodeMode::Miner, NodeMode::Extminer] {
             assert_eq!(embedded_matrix_retention(&mode), RetainAll);
         }
     }

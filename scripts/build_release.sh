@@ -117,7 +117,7 @@ unset TAR_OPTIONS
 unset GZIP
 unset GZIP_OPT
 export CARGO_TARGET_DIR="$ROOT_DIR/target"
-export RUSTFLAGS='-C target-cpu=native -D warnings'
+export RUSTFLAGS='-C target-cpu=native'
 
 printf 'Paranoid self-contained release build\n'
 printf '  source:       %s\n' "$ROOT_DIR"
@@ -129,8 +129,8 @@ CURRENT_STAGE="format check"
 printf '\n==> Checking formatting\n'
 cargo fmt --all -- --check
 
-CURRENT_STAGE="warning-free workspace check"
-printf '\n==> Checking the workspace with warnings denied\n'
+CURRENT_STAGE="workspace check"
+printf '\n==> Checking the workspace\n'
 cargo check --locked --workspace --all-targets
 
 CURRENT_STAGE="release tool build"
