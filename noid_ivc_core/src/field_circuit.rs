@@ -49,6 +49,7 @@ use noid_core::hardware::tower_to_flat_u128;
 use noid_poseidon2b::native::permutation::{
     F_ROUNDS, MDS_FULL, MDS_PARTIAL, N_ROUNDS, P_ROUNDS, ROUND_CONSTANTS, STATE_SIZE,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[inline]
 pub fn f128_from_u128(v: u128) -> F128 {
@@ -76,6 +77,32 @@ pub fn flat_const(tower: u128) -> F128 {
 /// Index of a materialized witness element.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Wire(pub u32);
+
+/// Linear authority to replace one explicitly deferred free witness value.
+///
+/// The slot is deliberately neither `Clone` nor serializable.  It is branded
+/// to the builder that allocated it, can be consumed only once, and cannot be
+/// constructed for an already-existing wire.  This keeps staged witness
+/// assembly from growing an arbitrary witness-mutation API.
+#[must_use = "a deferred witness slot must be sealed before the builder can finish"]
+pub struct DeferredWitnessSlot {
+    builder_brand: u64,
+    wire: Wire,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeferredWitnessSlotError {
+    WrongBuilder,
+    AlreadySealed,
+}
+
+static NEXT_BUILDER_BRAND: AtomicU64 = AtomicU64::new(1);
+
+fn next_builder_brand() -> u64 {
+    let brand = NEXT_BUILDER_BRAND.fetch_add(1, Ordering::Relaxed);
+    assert_ne!(brand, 0, "FieldR1csBuilder brand space exhausted");
+    brand
+}
 
 /// Symbolic affine combination `Σ coeff·wire + constant`. Terms are kept
 /// sorted by wire index and consolidated on every combination, so expression
@@ -211,6 +238,13 @@ pub struct FieldR1csBuilder {
     /// builds by I1, enforced by the fixity gates) without materializing a
     /// second matrix copy. Finish with [`Self::build_witness_only`].
     record_rows: bool,
+    /// Identity and exact per-wire pending flags for the small set of free
+    /// inputs deliberately left open by a staged relation. One byte per wire
+    /// makes release-mode dependency checks a direct indexed load and also
+    /// catches manually reconstructed [`LinExpr`] values.
+    builder_brand: u64,
+    deferred_witness_slots: Vec<u8>,
+    pending_deferred_witness_slots: usize,
 }
 
 impl Default for FieldR1csBuilder {
@@ -233,6 +267,9 @@ impl FieldR1csBuilder {
             value_map: std::collections::HashMap::new(),
             publics: Vec::new(),
             record_rows: true,
+            builder_brand: next_builder_brand(),
+            deferred_witness_slots: Vec::new(),
+            pending_deferred_witness_slots: 0,
         };
         // Wire 0: the constant-one wire, z_0 = z_0 · z_0.
         let w = b.commit_wire(F128::ONE, &[(0, F128::ONE)], &[(0, F128::ONE)]);
@@ -267,6 +304,15 @@ impl FieldR1csBuilder {
         self.values.len()
     }
 
+    /// Exact allocated byte capacity of the retained witness-value buffer.
+    /// Staged proving owners use this for admission accounting.
+    pub fn retained_witness_bytes(&self) -> usize {
+        self.values
+            .capacity()
+            .saturating_mul(core::mem::size_of::<F128>())
+            .saturating_add(self.deferred_witness_slots.capacity())
+    }
+
     /// Index the next allocation will assign.
     #[inline]
     fn next_wire(&self) -> u32 {
@@ -293,6 +339,7 @@ impl FieldR1csBuilder {
         let idx = self.values.len();
         assert!(idx < u32::MAX as usize);
         self.values.push(value);
+        self.deferred_witness_slots.push(0);
         if self.record_rows {
             for &(c, v) in a_row {
                 self.a_cols.push(c);
@@ -335,6 +382,53 @@ impl FieldR1csBuilder {
         self.commit_wire(value, &[(w, F128::ONE)], &[(0, F128::ONE)])
     }
 
+    /// Allocate one free input whose value may be replaced exactly once by
+    /// consuming the returned builder-branded capability.
+    ///
+    /// Its constraint row is byte-for-byte the ordinary [`Self::alloc_f128`]
+    /// row, so sealing changes witness data only and never relation shape.
+    #[doc(hidden)]
+    pub fn alloc_deferred_f128(&mut self, initial: F128) -> (Wire, DeferredWitnessSlot) {
+        let wire = self.alloc_f128(initial);
+        let pending = &mut self.deferred_witness_slots[wire.0 as usize];
+        assert_eq!(
+            *pending, 0,
+            "fresh deferred witness wire was already pending"
+        );
+        *pending = 1;
+        self.pending_deferred_witness_slots += 1;
+        (
+            wire,
+            DeferredWitnessSlot {
+                builder_brand: self.builder_brand,
+                wire,
+            },
+        )
+    }
+
+    /// Seal one explicitly deferred free input.  There is intentionally no
+    /// API for mutating an ordinary or already-sealed witness wire.
+    #[doc(hidden)]
+    pub fn seal_deferred_f128(
+        &mut self,
+        slot: DeferredWitnessSlot,
+        value: F128,
+    ) -> Result<(), DeferredWitnessSlotError> {
+        if slot.builder_brand != self.builder_brand {
+            return Err(DeferredWitnessSlotError::WrongBuilder);
+        }
+        let Some(pending) = self.deferred_witness_slots.get_mut(slot.wire.0 as usize) else {
+            return Err(DeferredWitnessSlotError::AlreadySealed);
+        };
+        if *pending == 0 {
+            return Err(DeferredWitnessSlotError::AlreadySealed);
+        }
+        *pending = 0;
+        self.pending_deferred_witness_slots -= 1;
+        self.values[slot.wire.0 as usize] = value;
+        Ok(())
+    }
+
     /// Public-input wire: row forces `z_i = value` (`A_i = value·col_0`,
     /// `B_i = col_0`), and the pair is recorded in the public-input list.
     /// The pinned value is part of the statement (it lives in the matrix,
@@ -361,6 +455,11 @@ impl FieldR1csBuilder {
 
     /// One multiplication constraint: new wire `w = x · y`.
     pub fn mul(&mut self, x: &LinExpr, y: &LinExpr) -> Wire {
+        assert!(
+            !self.expression_contains_pending_deferred(x)
+                && !self.expression_contains_pending_deferred(y),
+            "cannot evaluate a multiplication from an unsealed deferred witness slot"
+        );
         let value = x.eval(&self.values) * y.eval(&self.values);
         if !self.record_rows {
             return self.commit_wire(value, &[], &[]);
@@ -368,6 +467,15 @@ impl FieldR1csBuilder {
         let a_row = Self::expr_to_row(x);
         let b_row = Self::expr_to_row(y);
         self.commit_wire(value, &a_row, &b_row)
+    }
+
+    #[inline]
+    fn expression_contains_pending_deferred(&self, expression: &LinExpr) -> bool {
+        self.pending_deferred_witness_slots != 0
+            && expression
+                .terms
+                .iter()
+                .any(|(wire, _)| self.deferred_witness_slots[*wire as usize] != 0)
     }
 
     /// Materialize an expression into a single wire (`w = expr · 1`).
@@ -396,6 +504,10 @@ impl FieldR1csBuilder {
     /// pairs it with an existing instance of the same class-fixed matrix.
     pub fn build_witness_only(self) -> (usize, Vec<F128>) {
         assert!(!self.record_rows, "use build() on a row-recording builder");
+        assert!(
+            self.pending_deferred_witness_slots == 0,
+            "cannot build with unsealed deferred witness slots"
+        );
         let n_wires = self.values.len();
         let k_log = n_wires.next_power_of_two().trailing_zeros().max(7) as usize;
         let mut values = self.values;
@@ -408,6 +520,10 @@ impl FieldR1csBuilder {
             self.record_rows,
             "build() on a witness-only builder would emit an empty matrix; \
              use build_witness_only()"
+        );
+        assert!(
+            self.pending_deferred_witness_slots == 0,
+            "cannot build with unsealed deferred witness slots"
         );
         let n_wires = self.values.len();
         let k_log = n_wires.next_power_of_two().trailing_zeros().max(7) as usize;
@@ -502,6 +618,10 @@ impl FieldR1csBuilder {
     /// all zero. Returns the bit wires. Cost: `n_bits` boolean rows + 1 pin.
     pub fn decompose_bits_le(&mut self, expr: &LinExpr, n_bits: usize) -> Vec<Wire> {
         assert!(n_bits <= 128);
+        assert!(
+            !self.expression_contains_pending_deferred(expr),
+            "cannot decompose an unsealed deferred witness slot"
+        );
         let value = f128_to_u128(expr.eval(&self.values));
         let bits: Vec<Wire> = (0..n_bits)
             .map(|i| self.alloc_bool((value >> i) & 1 == 1))
@@ -1482,6 +1602,92 @@ mod tests {
     use noid_core::hardware::clmul_gcm;
     use noid_core::{Block128, TowerField};
     use noid_poseidon2b::native::permutation::Poseidon2bPermutation;
+
+    #[test]
+    fn deferred_witness_slot_is_builder_branded_and_single_use() {
+        let initial = F128 { lo: 7, hi: 11 };
+        let sealed = F128 { lo: 13, hi: 17 };
+        let mut owner = FieldR1csBuilder::new_witness_only();
+        let (wire, slot) = owner.alloc_deferred_f128(initial);
+        let mut other = FieldR1csBuilder::new_witness_only();
+        assert_eq!(
+            other.seal_deferred_f128(slot, sealed),
+            Err(DeferredWitnessSlotError::WrongBuilder)
+        );
+
+        // A wrong-builder attempt consumes the linear token; the owner can no
+        // longer finish, rather than gaining a retryable arbitrary patch.
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                owner.build_witness_only()
+            }))
+            .is_err()
+        );
+        assert_eq!(wire.0, 1);
+    }
+
+    #[test]
+    fn deferred_witness_seal_preserves_the_ordinary_free_row_shape() {
+        let initial = F128 { lo: 19, hi: 23 };
+        let sealed = F128 { lo: 29, hi: 31 };
+
+        let mut deferred = FieldR1csBuilder::new();
+        let (wire, slot) = deferred.alloc_deferred_f128(initial);
+        deferred
+            .seal_deferred_f128(slot, sealed)
+            .expect("owner seals its exact slot");
+        let (deferred_matrix, deferred_witness) = deferred.build();
+
+        let mut ordinary = FieldR1csBuilder::new();
+        let ordinary_wire = ordinary.alloc_f128(sealed);
+        let (ordinary_matrix, ordinary_witness) = ordinary.build();
+
+        assert_eq!(wire, ordinary_wire);
+        assert_eq!(
+            deferred_matrix.statement_digest(),
+            ordinary_matrix.statement_digest()
+        );
+        assert_eq!(deferred_witness, ordinary_witness);
+        assert!(deferred_matrix.satisfies(&deferred_witness));
+    }
+
+    #[test]
+    fn deferred_witness_cannot_feed_computed_rows_before_seal() {
+        let mut builder = FieldR1csBuilder::new_witness_only();
+        let (wire, slot) = builder.alloc_deferred_f128(F128::ZERO);
+        let expression = LinExpr::from_wire(wire);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                builder.mul(&expression, &LinExpr::constant(F128::ONE));
+            }))
+            .is_err()
+        );
+        builder
+            .seal_deferred_f128(slot, F128::ONE)
+            .expect("deferred owner remains sealable after dependency rejection");
+        builder.mul(&expression, &LinExpr::constant(F128::ONE));
+        let (_, witness) = builder.build_witness_only();
+        assert_eq!(witness[wire.0 as usize], F128::ONE);
+    }
+
+    #[test]
+    fn deferred_witness_cannot_feed_bit_decomposition_before_seal() {
+        let mut builder = FieldR1csBuilder::new_witness_only();
+        let (wire, slot) = builder.alloc_deferred_f128(F128::ZERO);
+        let expression = LinExpr::from_wire(wire);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                builder.decompose_bits_le(&expression, 1);
+            }))
+            .is_err()
+        );
+        builder
+            .seal_deferred_f128(slot, F128::ONE)
+            .expect("deferred owner remains sealable after dependency rejection");
+        builder.decompose_bits_le(&expression, 1);
+        let (_, witness) = builder.build_witness_only();
+        assert_eq!(witness[wire.0 as usize], F128::ONE);
+    }
 
     fn drive_mixed_gadgets(b: &mut FieldR1csBuilder) {
         let mut rng = Rng::new(0xF00D);

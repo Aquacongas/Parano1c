@@ -18,7 +18,6 @@
 //! - [`receipt`]        — ParanoidReceipt generation and verification.
 //! - [`header`]         — Per-block header validation rules.
 //! - [`checks`]         — Slot-conflict and tx-consensus validation.
-//! - [`mempool_checks`] — Full tx validation for mempool admission.
 //! - [`allocator`]      — Slot hint generation (splitmix64, zone-based).
 //! - [`fork_choice`]    — Cumulative-chainwork fork choice rule.
 //! - [`reorg`]          — Chain reorganisation within finality window.
@@ -34,7 +33,6 @@
 pub mod checks;
 pub mod conflict;
 pub mod da_prune;
-pub mod mempool_checks;
 pub mod network;
 pub mod ordering;
 pub mod reorg;
@@ -78,7 +76,6 @@ pub use fees::{
 pub use fork_choice::{choose_chain_by_work, reorg_allowed, ChainChoice};
 pub use genesis::{find_genesis_nonce, genesis_header, genesis_state_root, GENESIS_TIMESTAMP};
 pub use header::{asert_anchor_height, is_final, validate_header};
-pub use mempool_checks::validate_tx_for_mempool;
 pub use network::{NetworkConfig, NetworkKind};
 pub use ordering::order_block_txs;
 pub use params::*;
@@ -89,19 +86,17 @@ pub use receipt::{
     generate_receipt, tx_root, verify_against_header, verify_merkle_inclusion, ParanoidReceipt,
     ReceiptVerifyResult, TxSummary,
 };
-pub use reorg::{apply_reorg, find_common_ancestor, ReorgError, ReorgResult};
+pub use reorg::ReorgResult;
 pub use slot_expansion::expected_child_log_slots;
-pub use template::{
-    build_block_template, build_block_template_with_coverage, BlockTemplate, TemplateBuildError,
-};
+pub use template::{build_block_template, BlockTemplate, TemplateBuildError};
 pub use timestamps::{
     median_time_past, median_u64, validate_future_drift, validate_median_time_past,
     validate_timestamp,
 };
 pub use validation::{
     validate_block_checks, validate_block_checks_timeless, validate_block_consensus,
-    validate_block_resource_preflight, validate_coinbase_maturity, validate_mandatory_coinbase,
-    AnchorInfo, BlockResourcePreflight,
+    validate_block_resource_preflight, validate_mandatory_coinbase, AnchorInfo,
+    BlockResourcePreflight,
 };
 
 /// Consensus validation errors — one variant per block invariant.
@@ -117,8 +112,6 @@ pub enum ConsensusError {
     BadDifficultyTarget,
     /// §16.5 — Timestamp violates MTP or future-drift rules.
     BadTimestamp,
-    /// §16.6 — required detached proof/witness data is absent.
-    MissingProof,
     /// §16.8 — Block contains more than `BLOCK_MAX_TXS` decoded transactions.
     TooManyTxs,
     /// §16.8b — Block exceeds a canonical shape or availability resource bound.
@@ -147,23 +140,10 @@ pub enum ConsensusError {
     InflatedCoinbase,
     /// Coinbase `epoch_anchor` must equal the parent block hash.
     BadCoinbaseAnchor,
-    /// `attested_coverage` violates the monotone advancement rule against the
-    /// parent header (decreased, or advanced past `parent.height`).
-    BadAttestedCoverage {
-        parent_coverage: u64,
-        parent_height: u64,
-        attested_coverage: u64,
-    },
-    /// The block's coverage attestation payload is missing, unexpected, does
-    /// not natively verify, or does not bind the declared coverage height.
+    /// The block's mandatory current-height history terminal is missing, does
+    /// not natively verify, or does not bind the exact candidate header.
     /// Nodes without the pinned verifier artifacts fail closed here.
-    BadCoverageAttestation(String),
-    /// An input spends a coinbase UTXO whose mint height is not yet covered
-    /// by the containing block's `attested_coverage` (proof-gated maturity).
-    ImmatureCoinbaseSpend {
-        mint_height: u64,
-        attested_coverage: u64,
-    },
+    BadHistoryStepTerminal(String),
     /// P.16 — transaction fee is below the deterministic minimum fee.
     BelowMinFee { required: u64, actual: u64 },
     /// §15.3.6 — `log_slots` must expand exactly when occupancy ≥ 75 %,

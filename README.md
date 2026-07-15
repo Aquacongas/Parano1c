@@ -1,15 +1,18 @@
 # Paranoid
 
-Paranoid is a proof-native UTXO blockchain written in Rust. Every node checks
-proof of work and block certificates. Mining nodes also create block
-certificates and maintain a recursive selected-history proof whose size does
-not grow with chain height. Proof generation is an automatic part of mining,
-whether PoW runs inside the node or in an external worker.
+Paranoid is a proof-native UTXO blockchain written in Rust. Every accepted
+non-genesis block is one atomic unit: native proof of work plus a recursive
+HistoryStep binding that exact header, nonce, transaction set and state
+transition. The HistoryStep terminal stays constant-size as the chain grows.
+Proof generation is part of mining whether nonce search runs inside the node
+or in an external worker.
 
-The current release uses the m22 Link relation and four Block classes: B8,
-B32, B64, and B255. The release binary contains the registry and all nine
-runtime matrix images. End users run the binary directly; they do not install
-or distribute matrix files.
+HistoryStep has four current-block tiers (B8, B32, B64 and B255) and four
+possible parent tiers, forming one release-pinned 4×4 class bank. Block 1 is
+the exact genesis-anchored base case of the same relation; there is no separate
+genesis proof or bootstrap class. The release binary contains the authenticated
+runtime metadata and matrix images; end users do not install or distribute
+matrix files.
 
 ## Quick start
 
@@ -20,8 +23,8 @@ for release builders, matrix regeneration, and pipeline diagnostics.
 
 | Role | Requirement |
 |---|---|
-| Node and wallet | The default `./paranoid` process. It validates and relays the chain, serves P2P/RPC, and owns the wallet. It does not mine or create local selected-history proofs. |
-| Mining node | At least 16 GiB RAM and a multi-core CPU. The node creates block certificates and selected-history proofs with either built-in or external PoW. Built-in PoW requires at least two logical CPUs and uses one worker by default. |
+| Node and wallet | The default `./paranoid` process. It validates and relays complete block bundles, serves P2P/RPC, and owns the wallet. It does not mine. |
+| Mining node | At least 16 GiB RAM and a multi-core CPU. The node creates a complete PoW + HistoryStep block with either built-in or external nonce search. Built-in mining reuses all host-visible CPUs for each ordered phase. |
 | Release builder | At least 16 GiB RAM, Linux, Rust with `rustfmt`, a C/C++ toolchain, `pkg-config`, libclang, OpenSSL development headers, Bash, GNU userland, and enough disk for a fresh matrix pack. |
 
 The tracked `.cargo/config.toml` applies `-C target-cpu=native` to every Cargo
@@ -44,7 +47,7 @@ noid-cli
 ```
 
 `paranoid` is the node and owns the wallet key. `noid-cli` is its wallet-control
-and JSON-RPC client. No registry or matrix files are required beside them.
+and JSON-RPC client. No metadata or matrix files are required beside them.
 
 In a complete release directory, verify the distributable binaries and archive
 with:
@@ -96,18 +99,18 @@ For example, use `127.0.0.1:9400`, not `/ip4/127.0.0.1/tcp/9400`.
 | Invocation | What it does |
 |---|---|
 | `./paranoid` | Ordinary node and wallet. Validates and relays the chain, serves P2P/RPC, and verifies remote proofs. It does not mine. |
-| `./paranoid --miner` | Mining node with built-in PoW. The node assembles block certificates and runs the selected-history proof pipeline automatically. |
-| `./paranoid --extminer` | Mining node with an external PoW worker. The node still assembles and proves the block and runs the selected-history pipeline; the external worker only searches for the nonce. Requires `--mining-key`. |
+| `./paranoid --miner` | Mining node with built-in PoW. It uses all visible CPUs for PoW, then all CPUs for the block's required HistoryStep before accepting and announcing it. |
+| `./paranoid --extminer` | Mining node with an external PoW worker. The external worker only returns a nonce; the node builds, proves and atomically accepts the complete block. Requires `--mining-key`. |
 
-There is no separate proving-node role. Producing the Block and Link proofs is
-part of both mining configurations.
+There is no separate proving-node role and no background proof backlog. A block
+is not accepted and creates no reward until its exact HistoryStep is complete.
 
 The release archive does not include the separate external-miner client.
 
 Bootstrap the first node of a new network:
 
 ```bash
-./paranoid --miner --genesis --mining-threads 1
+./paranoid --miner --genesis
 ```
 
 `--genesis` is only for the first node of a fresh network. A miner joining an
@@ -116,8 +119,7 @@ existing network uses seeds instead:
 ```bash
 ./paranoid \
   --miner \
-  --seed SEED_IP:9400 \
-  --mining-threads 1
+  --seed SEED_IP:9400
 ```
 
 See every option with:
@@ -188,23 +190,11 @@ may be supplied, but it must not already exist:
 ./scripts/build_release.sh target/release-builds/my-release
 ```
 
-The script performs these steps in order:
-
-1. Checks formatting and checks all workspace targets in Cargo's normal
-   non-release profile.
-2. Builds the matrix generator and pin tool with `--locked --release`.
-3. Generates the registry and nine canonical matrices exactly once, directly
-   at zstd level 19.
-4. Requires the exact ten-file pack layout and rejects symlinks or empty files.
-5. Checks the approved m22 registry digest and computes pins over the final
-   compressed matrix bytes.
-6. Lets `noid_node/build.rs` strictly validate the registry and all nine
-   matrix relations, then embeds build-produced runtime images.
-7. Builds `paranoid` and `noid-cli` in release mode; the shared core rejects a
-   target that does not satisfy the proof CPU contract.
-8. Runs release tests for `noid_recursive`, `noid_node`, `noid_chain`, and
-   `noid_miner`.
-9. Creates the binary archive and SHA-256 checksums.
+The script checks the workspace, generates and authenticates the sixteen
+HistoryStep class matrices, embeds their runtime images, builds both binaries,
+runs the release test suite, and creates the archive and checksums. Matrix
+generation happens once at the final compression level; the release build
+does not regenerate or recompress an approved pack.
 
 The result is:
 
@@ -213,8 +203,8 @@ The result is:
 ├── pack/                         build evidence; not needed by deployed nodes
 │   ├── pins.env
 │   └── v1/
-│       ├── selected-recursive.classes
-│       └── nine *.field-r1cs.zst files
+│       ├── history-step.runtime
+│       └── sixteen history-step-*.field-r1cs.zst files
 ├── bin/
 │   ├── paranoid
 │   └── noid-cli
@@ -237,23 +227,16 @@ dependency resolution cannot drift during the build.
 
 ## Build from an existing matrix pack
 
-The normal release script generates a fresh pack. For development, an existing
-pack has this layout:
+The normal release script generates a fresh pack. A development build may use
+an existing pack containing `pins.env`, `v1/history-step.runtime`, and the
+sixteen class matrices.
 
 ```text
 target/release-pack/
 ├── pins.env
 └── v1/
-    ├── selected-recursive.classes
-    ├── genesis-link.field-r1cs.zst
-    ├── link-b8.field-r1cs.zst
-    ├── link-b32.field-r1cs.zst
-    ├── link-b64.field-r1cs.zst
-    ├── link-b255.field-r1cs.zst
-    ├── block-b8.field-r1cs.zst
-    ├── block-b32.field-r1cs.zst
-    ├── block-b64.field-r1cs.zst
-    └── block-b255.field-r1cs.zst
+    ├── history-step.runtime
+    └── history-step-*.field-r1cs.zst
 ```
 
 Build the self-contained node from it:
@@ -262,7 +245,7 @@ Build the self-contained node from it:
 set -euo pipefail
 PACK_ROOT="$PWD/target/release-pack"
 source "$PACK_ROOT/pins.env"
-export NOID_SELECTED_RECURSIVE_PACK_DIR="$PACK_ROOT"
+export NOID_HISTORY_STEP_PACK_DIR="$PACK_ROOT"
 
 cargo build --locked --release -p noid_node --bins
 ```
@@ -274,17 +257,18 @@ target/release/paranoid
 target/release/noid-cli
 ```
 
-A release build requires all three values below:
+A release build requires the authenticated pack directory plus the runtime
+metadata and leaf pins emitted by `noid_pack_pins`:
 
 ```text
-NOID_SELECTED_RECURSIVE_PACK_DIR
-NOID_SELECTED_RECURSIVE_REGISTRY_RELEASE_DIGEST
-NOID_SELECTED_RECURSIVE_PACK_LEAF_DIGESTS
+NOID_HISTORY_STEP_PACK_DIR
+NOID_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST
+NOID_HISTORY_STEP_PACK_LEAF_DIGESTS
 ```
 
 `pins.env` supplies the two digest variables. The command supplies the pack
-directory. A debug build may omit the pack, but its mining modes then refuse
-to start because they cannot create selected-history proofs.
+directory. A pack-free debug node can exercise non-proof code, but it cannot
+mine or verify HistoryStep terminals.
 
 ## Generate matrices manually
 
@@ -306,145 +290,111 @@ pack:
 
 ```bash
 set -euo pipefail
-PACK_ROOT="$PWD/target/selected-recursive-release"
+PACK_ROOT="$PWD/target/history-step-release"
 test ! -e "$PACK_ROOT"
 
 NOID_ARTIFACT_ZSTD_LEVEL=19 \
   ./target/release/noid_matrix_gen "$PACK_ROOT"
 ```
 
-This single invocation:
+The invocation freezes the four current tiers against the four possible parent
+tiers from mined, native-valid fixtures, exports the sixteen matrices, and
+writes `history-step.runtime`. `noid_pack_pins` below emits the exact pins for
+those final compressed bytes. Do not generate at one level and recompress
+later.
 
-1. Builds and freezes B8, B32, B64, and B255 Block classes.
-2. Proves, verifies, and exports their four matrices.
-3. Freezes the four-slot m22 Link ladder and Genesis Link relation.
-4. Creates the selected-recursive class registry.
-5. Exports Genesis Link and the four Link matrices.
-
-The generator also writes nine local `*.trust` receipts. They are generation
-evidence, not release-pack inputs. Remove them before using the directory as
-the exact ten-file pack:
+Inspect or recompute the leaf pins with:
 
 ```bash
-find "$PACK_ROOT/v1" -mindepth 1 -maxdepth 1 -name '*.trust' -delete
-```
-
-The pack now contains one registry plus nine `*.field-r1cs.zst` files under
-`v1/`. Do not rerun the generator at level 3 and then recompress the output.
-The one level-19 invocation above already creates the final release bytes.
-
-The current approved registry digest is:
-
-```text
-fdebbe54ad2f473458e7dcdf4cc5905e224fd6f816c0c62acd8b18e398de756a
-```
-
-Compute leaf pins from the final compressed files:
-
-```bash
-PACK_ROOT="${PACK_ROOT:-$PWD/target/selected-recursive-release}"
+PACK_ROOT="${PACK_ROOT:-$PWD/target/history-step-release}"
 ./target/release/noid_pack_pins "$PACK_ROOT"
 ```
 
-The tool prints `NOID_SELECTED_RECURSIVE_PACK_LEAF_DIGESTS=...`. To complete a
-manual development pack, compare the registry trailer with the independently
-approved value and write `pins.env`:
-
-```bash
-set -euo pipefail
-PACK_ROOT="${PACK_ROOT:-$PWD/target/selected-recursive-release}"
-APPROVED_REGISTRY_DIGEST="fdebbe54ad2f473458e7dcdf4cc5905e224fd6f816c0c62acd8b18e398de756a"
-
-REGISTRY_DIGEST="$(
-  tail -c 32 "$PACK_ROOT/v1/selected-recursive.classes" |
-    od -An -tx1 |
-    tr -d ' \n'
-)"
-LEAF_DIGESTS="$(
-  ./target/release/noid_pack_pins "$PACK_ROOT" |
-    sed -n 's/^NOID_SELECTED_RECURSIVE_PACK_LEAF_DIGESTS=//p'
-)"
-
-test "$REGISTRY_DIGEST" = "$APPROVED_REGISTRY_DIGEST"
-[[ $LEAF_DIGESTS =~ ^[0-9a-f]{576}$ ]]
-printf 'export NOID_SELECTED_RECURSIVE_REGISTRY_RELEASE_DIGEST=%s\nexport NOID_SELECTED_RECURSIVE_PACK_LEAF_DIGESTS=%s\n' \
-  "$REGISTRY_DIGEST" "$LEAF_DIGESTS" > "$PACK_ROOT/pins.env"
-```
-
-The pack can now be used by the earlier **Build from an existing matrix pack**
-procedure. `build_release.sh` performs all pin checks and writes `pins.env`
-automatically; this manual block is not an additional release step.
+For a reusable development pack, save the two emitted assignments as exported
+variables in `$PACK_ROOT/pins.env`; the release script does this automatically.
 
 `noid_matrix_stats` is an optional, expensive sizing tool. It is not part of a
 normal node build:
 
 ```bash
-PACK_ROOT="${PACK_ROOT:-$PWD/target/selected-recursive-release}"
+PACK_ROOT="${PACK_ROOT:-$PWD/target/history-step-release}"
 ./target/release/noid_matrix_stats "$PACK_ROOT"/v1/*.field-r1cs.zst
 ```
 
+## Benchmark production HistoryStep proofs
+
+Run the isolated prover benchmark against a completed, pinned pack:
+
+```bash
+set -euo pipefail
+PACK_ROOT="$PWD/target/release-pack"
+source "$PACK_ROOT/pins.env"
+export NOID_HISTORY_STEP_PACK_DIR="$PACK_ROOT"
+
+cargo bench --locked -p bench_prover --bench history_step_proof
+```
+
+The benchmark authenticates all sixteen matrices, builds and verifies an
+honest B8 parent, then reports one uniform line for B8, B32, B64 and B255.
+Fixture construction and matrix assembly are outside `prove_ms`; `verify_ms`
+includes bounded terminal decoding and complete production verification.
+
 ## How embedded artifacts work
 
-Canonical registry and matrix files are release-build inputs, not deployed
-node dependencies.
+Canonical runtime metadata and matrix files are release-build inputs, not
+deployed node dependencies.
 
 At build time:
 
-1. The official release script compares the registry with the approved m22
-   digest and derives pins from the final compressed leaves.
-2. `noid_node/build.rs` checks the supplied registry and compressed-leaf pins.
-3. Full and terminal registry forms are strictly decoded.
-4. Every matrix is decompressed and checked against its registry shape and
+1. The generator derives the fixed runtime metadata and final compressed leaves.
+2. `noid_node/build.rs` checks the supplied metadata and every leaf pin.
+3. The sixteen identities are decoded into the canonical HistoryStep bank.
+4. Every matrix is decompressed and checked against its pinned shape and
    structural statement digest.
 5. Every checked matrix is converted to a fixed-width packed runtime image.
 6. The runtime images are compressed at zstd level 9 and embedded into the
-   executable with the registry. The canonical build-input pack remains at
+   executable with the metadata. The canonical build-input pack remains at
    zstd level 19.
 
 At runtime, the official binary trusts those immutable build-produced bytes.
 It decompresses them and checks cheap image framing, lengths, ordering, and
 the requested identity against the build seal. It does not repeat the
-canonical row parse, compressed-leaf hash, structural Poseidon hash, layout
-derivation, or repack. The embedded registry is bounded-decoded once to build
-runtime tables without repeating its semantic proof validation. There is no
-filesystem fallback.
+canonical row parse, compressed-leaf hash, structural Poseidon hash, or
+repack. The fixed-size metadata rebuilds the canonical runtime once.
 
-Both mining configurations prewarm the B8 Block/Link matrices. Genesis Link is
-also prewarmed while selected-history coverage is zero. A mining node retains
-every matrix after its first use. An ordinary node releases a matrix when its
-active verification leases disappear. There is no matrix LRU, host
-`MemAvailable` polling, hard byte budget, or memory-dependent eviction policy.
+Both mining configurations use the release-pinned 4×4 HistoryStep class bank.
+Before PoW, the node loads the authenticated current matrix and assembles the
+complete HistoryStep witness except for the fixed 4,402-row direct-accumulator
+and `BLOCKHDR` suffix. Matrix loading is strictly one-at-a-time: the miner uses
+the current class and the terminal decider walks live bank lanes sequentially.
 
 This trust applies only to immutable artifacts built into the executable.
 Blocks, transactions, peer messages, and remote proofs remain untrusted and
 are verified at runtime.
 
-## Selected-history pipeline
+## Atomic HistoryStep production
 
-Every accepted block creates a durable proof job in MDBX. A mining node's
-proof pipeline moves consecutive jobs through three ordered stages:
+PoW and accepted history are one consensus unit. A non-genesis block cannot
+mutate state, create a reward or be announced as complete until a HistoryStep
+for that exact height, header and nonce is ready. There is no independent
+history-height cursor that can lag behind the chain tip.
 
-1. **Block:** load the claimed block and parent state, replay the transition,
-   produce its ladder update and accumulator, and build the selected Block
-   proof.
-2. **Link:** consume the previous terminal package and current Block proof,
-   then build the m22 Link proof. Locally produced predecessor packages are
-   passed as typed in-process replay capabilities instead of being loaded and
-   reverified from disk.
-3. **Verify and promote:** verify the terminal package and atomically promote
-   it. MDBX independently enforces exact predecessor coverage and FIFO height
-   order.
+The mining loop is phase ordered:
 
-For B8, B32, and B64, up to three heights may occupy Block, Link, and Verify
-simultaneously. The worker continues draining consecutive jobs; there is no
-three-claims-per-session limit. B255 currently uses depth one. Capacity-one
-stage channels are handoff/backpressure slots, not memory quotas.
+1. build the template, current-block relation and parent-recursion witness;
+2. search PoW with the complete shared CPU pool;
+3. seal the builder-branded nonce/block-id boundary cells and append the fixed
+   direct suffix;
+4. move that one complete witness directly into the all-core HistoryStep
+   prover;
+5. atomically commit block, terminal, state and receipt indexes;
+6. announce the complete bundle, then start the next height.
 
-The successor parent view is reconstructed from the durable forward cursor
-plus ordered updates from still-in-flight predecessors. On failure, the valid
-lower prefix may still finish and promote; the failing height and dependent
-in-flight claims are released for retry. Shutdown releases unpromoted claims,
-while canonical queue maintenance handles stale jobs after a reorganization.
+There is no durable proof job, no asynchronous history worker and no partially
+accepted non-genesis block. A competing complete block drops the local
+in-memory carrier. Restarts either recover a fully committed bundle or no block
+at that height. The detailed consensus and sync design is in
+[`noid_chain/HISTORY_STEP.md`](noid_chain/HISTORY_STEP.md).
 
 ## Live one-node test
 
@@ -457,13 +407,12 @@ set -euo pipefail
 BIN_DIR="$PWD/target/release"
 RUN_PARENT="$PWD/target/live-tests"
 mkdir -p "$RUN_PARENT"
-RUN="$(mktemp -d "$RUN_PARENT/m22-one-node.XXXXXX")"
-printf '%s\n' "$RUN" > "$RUN_PARENT/LAST_M22_RUN"
+RUN="$(mktemp -d "$RUN_PARENT/history-step-one-node.XXXXXX")"
+printf '%s\n' "$RUN" > "$RUN_PARENT/LAST_HISTORY_STEP_RUN"
 
 "$BIN_DIR/paranoid" \
   --miner \
   --genesis \
-  --mining-threads 1 \
   --config "$RUN/paranoid.toml" \
   --data-dir "$RUN/data" \
   --p2p-listen 127.0.0.1:19750 \
@@ -481,39 +430,29 @@ export NOID_RPC=http://127.0.0.1:19751
 ./target/release/noid-cli stop
 ```
 
-Inspect successful promotions:
+At the default `info` level, the lifecycle is intentionally concise:
 
 ```bash
-RUN="$(<"$PWD/target/live-tests/LAST_M22_RUN")"
-rg 'selected-history terminal promoted' "$RUN/node.log"
+RUN="$(<"$PWD/target/live-tests/LAST_HISTORY_STEP_RUN")"
+rg 'mining complete block|block accepted' "$RUN/node.log"
 ```
 
-Each promotion reports:
+`block accepted` includes `nonce_to_commit_ms`, the critical latency
+from the winning nonce through HistoryStep and the atomic MDBX commit. Detailed
+matrix, transcript, prefetch and proving timings stay at `debug`. The release
+gate requires p95 nonce-to-commit at or below 15 seconds and rejects any run
+that exposes a proof backlog or a lagging canonical history height.
 
-- `block_ms`, `link_ms`, and `verify_ms`: wall time inside each stage;
-- `block_queue_ms`: time after the durable claim and before Block starts; it
-  can include topology admission and prover-registry preparation;
-- `link_queue_ms` and `verify_queue_ms`: waits at the stage handoffs;
-- `promote_ms`: the atomic MDBX promotion;
-- `e2e_ms`: latency from return of the durable claim to promotion;
-- `cadence_ms`: time between consecutive promotions.
-
-`cadence_ms` is the interval between successful promotions and includes idle
-time. Treat it as throughput only after startup while the job queue remains
-continuous. `e2e_ms` is per-height latency and can be larger when several
-heights occupy the pipeline. The current performance target is a steady
-`cadence_ms <= 15000`; it is not a consensus rule and the latest local run did
-not pass that threshold on every height.
-
-The expected embedded-artifact startup markers are:
+The embedded-artifact startup details are also available at `debug`:
 
 ```text
-build-authenticated selected-recursive runtime images loaded from the executable
-selected-history verifier uses only executable-embedded registry and matrices
-selected-history prover registry retained for all pipeline drains
+build-authenticated HistoryStep runtime images loaded from the executable
+HistoryStep verifier uses only executable-embedded metadata and matrices
+HistoryStep class bank ready
 ```
 
-`No known peers` is expected in an isolated genesis test.
+The expected libp2p `No known peers` bootstrap warning is suppressed for an
+isolated `--genesis` node.
 
 ## Verification commands
 
@@ -532,7 +471,7 @@ Release-profile tests need an authenticated pack environment:
 set -euo pipefail
 PACK_ROOT="$PWD/target/release-pack"
 source "$PACK_ROOT/pins.env"
-export NOID_SELECTED_RECURSIVE_PACK_DIR="$PACK_ROOT"
+export NOID_HISTORY_STEP_PACK_DIR="$PACK_ROOT"
 
 cargo test --locked --release \
   -p noid_recursive \

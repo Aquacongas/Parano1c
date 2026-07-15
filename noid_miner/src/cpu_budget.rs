@@ -1,19 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Process-wide CPU admission for proof pipelines and internal PoW.
+//! Process-wide CPU admission for internal PoW and HistoryStep work.
 //!
-//! A selected-history drain has three concurrent callers (Block, Link, and
-//! terminal verification). Giving each caller the global Rayon pool lets all
-//! three independently activate every logical CPU. An exclusive proof mutex
-//! avoids that oversubscription, but turns useful overlap into queue time on
-//! the critical Link path.
-//!
-//! This module instead gives every proof caller the same work-conserving Rayon
-//! pool. Concurrent `install` calls share one fixed worker set, so idle proof
-//! capacity is immediately stealable by another stage without multiplying the
-//! number of active workers. Internal PoW uses a disjoint fixed pool and the
-//! planner enforces `pow_threads + proof_threads == available_threads`.
+//! Block production is a sequence of CPU-heavy phases, not a permanent CPU
+//! split: all workers search PoW, then the same workers prove HistoryStep. The
+//! process therefore owns exactly one fixed Rayon pool sized to the complete
+//! host-visible CPU budget. Inbound verification also enters that pool, so no
+//! caller can activate a second full worker set.
 
 use std::sync::{
     atomic::{AtomicU8, Ordering},
@@ -21,14 +15,14 @@ use std::sync::{
 };
 use std::time::Instant;
 
-const PROCESS_PROOF_WORKER_STACK_BYTES: usize = 64 * 1024 * 1024;
+const PROCESS_PHASE_WORKER_STACK_BYTES: usize = 64 * 1024 * 1024;
 
 thread_local! {
     /// Rayon exposes a thread index for every pool, so an index alone cannot
-    /// distinguish our proof pool from the global or PoW pool. Mark the actual
-    /// worker lifetime instead; nested stage boundaries can then execute
+    /// distinguish our process pool from the global pool. Mark the actual
+    /// worker lifetime instead; nested phase boundaries can then execute
     /// directly without re-injecting a job into the same scheduler.
-    static PROCESS_PROOF_POOL_WORKER: std::cell::Cell<bool> = const {
+    static PROCESS_PHASE_POOL_WORKER: std::cell::Cell<bool> = const {
         std::cell::Cell::new(false)
     };
 }
@@ -36,28 +30,32 @@ thread_local! {
 /// Whether this process performs PoW internally.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProcessCpuBudgetMode {
-    /// Prover and external-miner nodes have no in-process PoW workers. The
-    /// complete host-visible CPU set remains available to an isolated Link.
+    /// Prover and external-miner nodes do not enter the internal PoW phase.
+    /// The one process pool still contains every host-visible CPU.
     ProofOnly,
-    /// Internal mining reserves exactly the effective PoW thread count; zero
-    /// selects the proof-latency default of one dedicated PoW worker.
-    InternalMiner { mining_threads: usize },
+    /// Internal mining enables the all-core PoW phase.
+    InternalMiner,
 }
 
-/// Immutable worker-count plan for one process.
+/// Immutable worker-count plan for one process and its sequential phases.
+///
+/// Phase capacities are intentionally not additive. For an internal miner on
+/// 12 visible CPUs this reports one 12-worker pool, a 12-worker PoW phase, and
+/// a 12-worker HistoryStep phase. Those phases reuse the same workers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProcessCpuBudgetPlan {
     pub available_threads: usize,
-    pub pow_threads: usize,
-    pub proof_threads: usize,
+    pub shared_pool_threads: usize,
+    pub pow_phase_threads: usize,
+    pub history_step_phase_threads: usize,
+    pub inbound_verifier_threads: usize,
 }
 
 impl ProcessCpuBudgetPlan {
-    /// Total active Rayon workers admitted by this plan. This excludes idle
-    /// global-pool threads owned by unrelated callers and ordinary Tokio/P2P
-    /// control threads.
+    /// Total Rayon workers admitted by this plan. Phase capacities above are
+    /// views of this same worker set and must never be summed.
     pub const fn admitted_rayon_threads(self) -> usize {
-        self.pow_threads + self.proof_threads
+        self.shared_pool_threads
     }
 }
 
@@ -67,12 +65,8 @@ pub enum ProcessCpuBudgetError {
     NotConfigured,
     #[error("process CPU budget requires at least one available logical CPU")]
     NoAvailableThreads,
-    #[error("internal mining requires at least two available logical CPUs")]
-    InternalMiningNeedsTwoThreads,
-    #[error(
-        "configured internal mining threads ({configured}) must be less than available logical CPUs ({available})"
-    )]
-    InvalidMiningThreads { configured: usize, available: usize },
+    #[error("internal PoW phase is disabled for a proof-only process")]
+    PowPhaseDisabled,
     #[error("failed to build {role} Rayon pool: {detail}")]
     PoolBuild { role: &'static str, detail: String },
     #[error(
@@ -84,15 +78,8 @@ pub enum ProcessCpuBudgetError {
     },
 }
 
-/// Calculate the exact fixed-worker split without constructing any threads.
+/// Calculate the fixed all-core phase plan without constructing any threads.
 ///
-/// `mining_threads == 0` reserves one dedicated PoW worker and gives every
-/// remaining worker to the common Block/Link/Verify pool. PoW difficulty
-/// adapts to sustained hashrate, while splitting the machine in half would
-/// immediately lengthen every proof stage on the critical block-cadence path.
-/// An explicit value is fail-closed rather than clamped, so library callers
-/// cannot accidentally construct an oversubscribed miner outside the node's
-/// CLI validation.
 pub fn plan_process_cpu_budget(
     available_threads: usize,
     mode: ProcessCpuBudgetMode,
@@ -101,192 +88,144 @@ pub fn plan_process_cpu_budget(
         return Err(ProcessCpuBudgetError::NoAvailableThreads);
     }
 
-    let pow_threads = match mode {
+    let pow_phase_threads = match mode {
         ProcessCpuBudgetMode::ProofOnly => 0,
-        ProcessCpuBudgetMode::InternalMiner { .. } if available_threads < 2 => {
-            return Err(ProcessCpuBudgetError::InternalMiningNeedsTwoThreads);
-        }
-        ProcessCpuBudgetMode::InternalMiner { mining_threads: 0 } => 1,
-        ProcessCpuBudgetMode::InternalMiner { mining_threads }
-            if mining_threads >= available_threads =>
-        {
-            return Err(ProcessCpuBudgetError::InvalidMiningThreads {
-                configured: mining_threads,
-                available: available_threads,
-            });
-        }
-        ProcessCpuBudgetMode::InternalMiner { mining_threads } => mining_threads,
+        ProcessCpuBudgetMode::InternalMiner => available_threads,
     };
-    let proof_threads = available_threads - pow_threads;
-    debug_assert!(proof_threads > 0);
     let plan = ProcessCpuBudgetPlan {
         available_threads,
-        pow_threads,
-        proof_threads,
+        shared_pool_threads: available_threads,
+        pow_phase_threads,
+        history_step_phase_threads: available_threads,
+        inbound_verifier_threads: available_threads,
     };
     debug_assert_eq!(plan.admitted_rayon_threads(), available_threads);
     Ok(plan)
 }
 
-/// CPU-heavy selected-history boundary entering the shared proof pool.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SelectedHistoryCpuStage {
-    Block,
-    Link,
-    Verify,
+struct ProcessCpuBudget {
+    plan: ProcessCpuBudgetPlan,
+    phase_pool: Arc<rayon::ThreadPool>,
+    observed_phases: AtomicU8,
 }
 
-impl SelectedHistoryCpuStage {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProcessCpuPhase {
+    Pow,
+    HistoryStep,
+    InboundVerify,
+}
+
+impl ProcessCpuPhase {
     const fn label(self) -> &'static str {
         match self {
-            Self::Block => "Block",
-            Self::Link => "Link",
-            Self::Verify => "Verify",
+            Self::Pow => "PoW",
+            Self::HistoryStep => "HistoryStep",
+            Self::InboundVerify => "InboundVerify",
         }
     }
 
     const fn bit(self) -> u8 {
         match self {
-            Self::Block => 1 << 0,
-            Self::Link => 1 << 1,
-            Self::Verify => 1 << 2,
+            Self::Pow => 1 << 0,
+            Self::HistoryStep => 1 << 1,
+            Self::InboundVerify => 1 << 2,
         }
     }
 }
 
-struct ProcessCpuBudget {
-    plan: ProcessCpuBudgetPlan,
-    proof_pool: Arc<rayon::ThreadPool>,
-    pow_pool: Option<Arc<rayon::ThreadPool>>,
-    observed_history_stages: AtomicU8,
-}
-
 impl ProcessCpuBudget {
     fn build(plan: ProcessCpuBudgetPlan) -> Result<Self, ProcessCpuBudgetError> {
-        let proof_pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(plan.proof_threads)
-            .stack_size(PROCESS_PROOF_WORKER_STACK_BYTES)
-            .thread_name(|index| format!("noid-proof-{index}"))
+        let phase_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(plan.shared_pool_threads)
+            .stack_size(PROCESS_PHASE_WORKER_STACK_BYTES)
+            .thread_name(|index| format!("noid-cpu-{index}"))
             .start_handler(|_| {
-                PROCESS_PROOF_POOL_WORKER.with(|marker| {
+                PROCESS_PHASE_POOL_WORKER.with(|marker| {
                     debug_assert!(!marker.get());
                     marker.set(true);
                 });
                 // These workers own the 64-MiB stack required by the deep
                 // recursive verifier. Keep verification on this admitted
-                // worker instead of activating an extra compatibility pool.
+                // worker instead of activating an extra worker pool.
                 noid_ivc_core::verifier::set_budgeted_large_stack_worker(true);
             })
             .exit_handler(|_| {
                 noid_ivc_core::verifier::set_budgeted_large_stack_worker(false);
-                PROCESS_PROOF_POOL_WORKER.with(|marker| marker.set(false));
+                PROCESS_PHASE_POOL_WORKER.with(|marker| marker.set(false));
             })
             .build()
             .map(Arc::new)
             .map_err(|error| ProcessCpuBudgetError::PoolBuild {
-                role: "proof",
+                role: "shared phase",
                 detail: error.to_string(),
             })?;
-        let pow_pool = (plan.pow_threads > 0)
-            .then(|| {
-                rayon::ThreadPoolBuilder::new()
-                    .num_threads(plan.pow_threads)
-                    .thread_name(|index| format!("noid-pow-{index}"))
-                    .build()
-                    .map(Arc::new)
-                    .map_err(|error| ProcessCpuBudgetError::PoolBuild {
-                        role: "PoW",
-                        detail: error.to_string(),
-                    })
-            })
-            .transpose()?;
         Ok(Self {
             plan,
-            proof_pool,
-            pow_pool,
-            observed_history_stages: AtomicU8::new(0),
+            phase_pool,
+            observed_phases: AtomicU8::new(0),
         })
     }
 
-    fn install_history<R: Send>(
+    fn install_phase<R: Send>(
         &self,
-        stage: SelectedHistoryCpuStage,
+        phase: ProcessCpuPhase,
         operation: impl FnOnce() -> R + Send,
     ) -> R {
-        if PROCESS_PROOF_POOL_WORKER.with(|marker| marker.get()) {
-            return self.run_history_operation(stage, 0, true, operation);
+        if PROCESS_PHASE_POOL_WORKER.with(|marker| marker.get()) {
+            return self.run_phase_operation(phase, 0, true, operation);
         }
         let queued_at = Instant::now();
-        self.proof_pool.install(|| {
+        self.phase_pool.install(|| {
             let pool_queue_ms = queued_at.elapsed().as_millis() as u64;
-            self.run_history_operation(stage, pool_queue_ms, false, operation)
+            self.run_phase_operation(phase, pool_queue_ms, false, operation)
         })
     }
 
-    fn install_proof<R: Send>(&self, operation: impl FnOnce() -> R + Send) -> R {
-        if PROCESS_PROOF_POOL_WORKER.with(|marker| marker.get()) {
-            operation()
-        } else {
-            self.proof_pool.install(operation)
-        }
-    }
-
-    fn run_history_operation<R>(
+    fn run_phase_operation<R>(
         &self,
-        stage: SelectedHistoryCpuStage,
+        phase: ProcessCpuPhase,
         pool_queue_ms: u64,
         nested_same_pool: bool,
         operation: impl FnOnce() -> R,
     ) -> R {
-        debug_assert!(PROCESS_PROOF_POOL_WORKER.with(|marker| marker.get()));
+        debug_assert!(PROCESS_PHASE_POOL_WORKER.with(|marker| marker.get()));
         let observed_threads = rayon::current_num_threads();
-        debug_assert_eq!(observed_threads, self.plan.proof_threads);
-        let first_stage_entry = self
-            .observed_history_stages
-            .fetch_or(stage.bit(), Ordering::AcqRel)
-            & stage.bit()
-            == 0;
-        tracing::info!(
-            stage = stage.label(),
-            proof_threads = self.plan.proof_threads,
-            observed_threads,
+        debug_assert_eq!(observed_threads, self.plan.shared_pool_threads);
+        let first_phase_entry =
+            self.observed_phases.fetch_or(phase.bit(), Ordering::AcqRel) & phase.bit() == 0;
+        tracing::debug!(
+            phase = phase.label(),
+            phase_threads = observed_threads,
+            shared_pool_threads = self.plan.shared_pool_threads,
             pool_queue_ms,
             nested_same_pool,
-            first_stage_entry,
-            "selected-history stage entered shared proof Rayon pool"
+            first_phase_entry,
+            "CPU phase entered shared all-core Rayon pool"
         );
         operation()
     }
 
-    fn proof_pool(&self) -> Arc<rayon::ThreadPool> {
-        Arc::clone(&self.proof_pool)
-    }
-
-    fn pow_pool(&self) -> Option<Arc<rayon::ThreadPool>> {
-        self.pow_pool.as_ref().map(Arc::clone)
+    #[cfg(test)]
+    fn phase_pool(&self) -> Arc<rayon::ThreadPool> {
+        Arc::clone(&self.phase_pool)
     }
 }
 
 static PROCESS_CPU_BUDGET: OnceLock<Arc<ProcessCpuBudget>> = OnceLock::new();
 
 fn host_available_threads() -> usize {
-    let host = std::thread::available_parallelism()
+    std::thread::available_parallelism()
         .map(|parallelism| parallelism.get())
         .unwrap_or(1)
-        .max(1);
-    let explicit_rayon_ceiling = std::env::var("RAYON_NUM_THREADS")
-        .ok()
-        .and_then(|raw| raw.parse::<usize>().ok())
-        .filter(|threads| *threads > 0);
-    explicit_rayon_ceiling
-        .map(|ceiling| ceiling.min(host))
-        .unwrap_or(host)
+        .max(1)
 }
 
-/// Configure the fixed process pools exactly once. Repeating the same plan is
+/// Configure the fixed process pool exactly once. Repeating the same plan is
 /// idempotent; attempting to change it after any worker can have started is a
-/// startup error. `RAYON_NUM_THREADS`, when it is a positive integer, is an
-/// upper bound on the host-visible budget rather than an independent pool.
+/// startup error. The pool uses every CPU visible through the process affinity
+/// and cgroup limits; the global `RAYON_NUM_THREADS` setting cannot silently
+/// restore a one-core PoW path or construct an independent scheduler.
 pub fn configure_process_cpu_budget(
     mode: ProcessCpuBudgetMode,
 ) -> Result<ProcessCpuBudgetPlan, ProcessCpuBudgetError> {
@@ -314,17 +253,19 @@ pub fn configure_process_cpu_budget(
             });
         }
     }
-    tracing::info!(
+    tracing::debug!(
         available_threads = requested.available_threads,
-        pow_threads = requested.pow_threads,
-        proof_threads = requested.proof_threads,
+        shared_pool_threads = requested.shared_pool_threads,
+        pow_phase_threads = requested.pow_phase_threads,
+        history_step_phase_threads = requested.history_step_phase_threads,
+        inbound_verifier_threads = requested.inbound_verifier_threads,
         admitted_rayon_threads = requested.admitted_rayon_threads(),
-        "process CPU budget configured"
+        "single all-core process CPU pool configured for sequential phases"
     );
     Ok(requested)
 }
 
-/// The active plan, if startup has already configured the process pools.
+/// The active plan, if startup has already configured the process pool.
 pub fn configured_process_cpu_budget() -> Option<ProcessCpuBudgetPlan> {
     PROCESS_CPU_BUDGET.get().map(|budget| budget.plan)
 }
@@ -342,33 +283,35 @@ fn process_cpu_budget() -> Result<Arc<ProcessCpuBudget>, ProcessCpuBudgetError> 
     process_cpu_budget_from(&PROCESS_CPU_BUDGET)
 }
 
-/// Run one complete selected-history CPU boundary inside the common proof
-/// pool. Concurrent Block/Link/Verify calls are work-conserving jobs in the
-/// same fixed worker set; this is deliberately not an exclusive proof gate.
-pub fn install_selected_history_cpu<R: Send>(
-    stage: SelectedHistoryCpuStage,
+/// Run the PoW search phase on the complete shared process pool.
+///
+/// The production miner calls this phase before HistoryStep. The pool itself
+/// remains work-conserving for inbound verification; phase ordering belongs to
+/// the miner state machine, not to a second scheduler or worker set.
+pub fn install_pow_phase_cpu<R: Send>(
     operation: impl FnOnce() -> R + Send,
 ) -> Result<R, ProcessCpuBudgetError> {
-    Ok(process_cpu_budget()?.install_history(stage, operation))
+    let budget = process_cpu_budget()?;
+    if budget.plan.pow_phase_threads == 0 {
+        return Err(ProcessCpuBudgetError::PowPhaseDisabled);
+    }
+    Ok(budget.install_phase(ProcessCpuPhase::Pow, operation))
 }
 
-/// Run arbitrary proof work inside the same fixed process pool as the
-/// selected-history lanes. This boundary intentionally has no stage label: it
-/// is for native block assembly, template exact-state construction, and local
-/// acceptance/verifier work. An unconfigured process fails closed, and a
-/// nested call already on one of our workers executes directly.
-pub fn install_process_proof_cpu<R: Send>(
+/// Run the fused HistoryStep build/prove phase on the complete shared process
+/// pool after PoW has fixed the block nonce.
+pub fn install_history_step_phase_cpu<R: Send>(
     operation: impl FnOnce() -> R + Send,
 ) -> Result<R, ProcessCpuBudgetError> {
-    Ok(process_cpu_budget()?.install_proof(operation))
+    Ok(process_cpu_budget()?.install_phase(ProcessCpuPhase::HistoryStep, operation))
 }
 
-pub(crate) fn process_proof_pool() -> Result<Arc<rayon::ThreadPool>, ProcessCpuBudgetError> {
-    Ok(process_cpu_budget()?.proof_pool())
-}
-
-pub(crate) fn process_pow_pool() -> Result<Option<Arc<rayon::ThreadPool>>, ProcessCpuBudgetError> {
-    Ok(process_cpu_budget()?.pow_pool())
+/// Run inbound terminal verification on the same fixed process pool as PoW
+/// and HistoryStep. This admits no independent verifier worker set.
+pub fn install_inbound_verifier_cpu<R: Send>(
+    operation: impl FnOnce() -> R + Send,
+) -> Result<R, ProcessCpuBudgetError> {
+    Ok(process_cpu_budget()?.install_phase(ProcessCpuPhase::InboundVerify, operation))
 }
 
 #[cfg(test)]
@@ -385,56 +328,63 @@ mod tests {
     }
 
     #[test]
-    fn twelve_thread_plans_are_exact_and_never_oversubscribed() {
+    fn twelve_threads_are_reused_whole_by_each_phase_and_never_summed() {
         assert_eq!(
             plan_process_cpu_budget(12, ProcessCpuBudgetMode::ProofOnly).unwrap(),
             ProcessCpuBudgetPlan {
                 available_threads: 12,
-                pow_threads: 0,
-                proof_threads: 12,
+                shared_pool_threads: 12,
+                pow_phase_threads: 0,
+                history_step_phase_threads: 12,
+                inbound_verifier_threads: 12,
             }
         );
+        let default_plan =
+            plan_process_cpu_budget(12, ProcessCpuBudgetMode::InternalMiner).unwrap();
         assert_eq!(
-            plan_process_cpu_budget(
-                12,
-                ProcessCpuBudgetMode::InternalMiner { mining_threads: 1 },
-            )
-            .unwrap(),
+            default_plan,
             ProcessCpuBudgetPlan {
                 available_threads: 12,
-                pow_threads: 1,
-                proof_threads: 11,
+                shared_pool_threads: 12,
+                pow_phase_threads: 12,
+                history_step_phase_threads: 12,
+                inbound_verifier_threads: 12,
             }
         );
+        assert_eq!(default_plan.admitted_rayon_threads(), 12);
+        assert_ne!(default_plan.pow_phase_threads, 1);
+    }
+
+    #[test]
+    fn pow_history_and_inbound_verifier_use_one_twelve_worker_pool() {
+        let plan = plan_process_cpu_budget(12, ProcessCpuBudgetMode::InternalMiner).unwrap();
+        let budget = ProcessCpuBudget::build(plan).unwrap();
+
+        let pow_handle = budget.phase_pool();
+        let history_handle = budget.phase_pool();
+        let inbound_handle = budget.phase_pool();
+        assert!(Arc::ptr_eq(&pow_handle, &history_handle));
+        assert!(Arc::ptr_eq(&pow_handle, &inbound_handle));
+
         assert_eq!(
-            plan_process_cpu_budget(
-                12,
-                ProcessCpuBudgetMode::InternalMiner { mining_threads: 0 },
-            )
-            .unwrap(),
-            ProcessCpuBudgetPlan {
-                available_threads: 12,
-                pow_threads: 1,
-                proof_threads: 11,
-            }
+            budget.install_phase(ProcessCpuPhase::Pow, rayon::current_num_threads),
+            12
+        );
+        assert_eq!(
+            budget.install_phase(ProcessCpuPhase::HistoryStep, rayon::current_num_threads),
+            12
+        );
+        assert_eq!(
+            budget.install_phase(ProcessCpuPhase::InboundVerify, rayon::current_num_threads),
+            12
         );
     }
 
     #[test]
-    fn invalid_library_miner_configuration_fails_instead_of_clamping() {
-        assert!(matches!(
-            plan_process_cpu_budget(
-                12,
-                ProcessCpuBudgetMode::InternalMiner { mining_threads: 12 },
-            ),
-            Err(ProcessCpuBudgetError::InvalidMiningThreads {
-                configured: 12,
-                available: 12,
-            })
-        ));
-        assert!(matches!(
-            plan_process_cpu_budget(1, ProcessCpuBudgetMode::InternalMiner { mining_threads: 0 },),
-            Err(ProcessCpuBudgetError::InternalMiningNeedsTwoThreads)
-        ));
+    fn one_cpu_internal_miner_still_has_an_all_core_pow_phase() {
+        let plan = plan_process_cpu_budget(1, ProcessCpuBudgetMode::InternalMiner).unwrap();
+        assert_eq!(plan.shared_pool_threads, 1);
+        assert_eq!(plan.pow_phase_threads, 1);
+        assert_eq!(plan.history_step_phase_threads, 1);
     }
 }

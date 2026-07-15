@@ -1,29 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Shared benchmark fixtures for the final Tx8x2 transaction path.
+//! Shared benchmark fixtures for the canonical Tx8x2 and Field-R1CS paths.
 //!
-//! There is one transaction form, one owner per transaction, and one wallet
-//! authorization geometry. Benchmark secrets stay outside canonical bodies;
-//! transaction ids are always derived through [`TxBody::txid`].
+//! The `HistoryStep` pack generator builds its own one-shot freezing inputs.
 
 use std::time::{Duration, Instant};
 
-use noid_block::{
-    build_exact_state_transition_proof, verify_exact_state_transition, BlockAuthSidecar,
-    BlockProof, ExactStateTransitionInputs,
-};
-use noid_chain::exact_state_hash::slot_leaf_hash;
-use noid_chain::sparse_merkle::reconstruct_root;
-use noid_chain::state::ChainState;
-use noid_chain::{Block, BlockHeader, SlotValue};
 use noid_core::Block128;
 use noid_gkr::zk_authorization::ZkAuthorizationProof;
 use noid_gkr::{
     prove_wallet_authorization, verify_wallet_authorization_proof, OwnerAuthWitness,
     WalletAuthorizationBundle,
 };
-use noid_poseidon2b::primitives::{derive_address, Address, SpendSecret, TxBodyHash};
+use noid_poseidon2b::primitives::{derive_address, SpendSecret, TxBodyHash};
 use noid_tx::{output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS};
 
 pub const BENCH_LOG_SLOTS: u32 = 24;
@@ -35,10 +25,8 @@ pub struct BenchScenario {
     pub label: &'static str,
     pub desc: String,
     pub body: TxBody,
-    /// Public deterministic fixture seed used to recreate a fresh, consuming
-    /// wallet-local proving authority for each benchmark sample.  Keeping the
-    /// seed instead of a `SpendSecret` preserves the production type's
-    /// non-cloneable/non-exposing contract.
+    /// Public deterministic seed used to recreate a fresh, consuming wallet
+    /// proving authority for each sample.
     pub spend_secret_seed: u128,
 }
 
@@ -60,57 +48,12 @@ pub struct WalletBench {
     pub proof: ZkAuthorizationProof,
 }
 
-pub struct FullBlockProofBench {
-    pub state_seed_time: Duration,
-    pub prove_time: Duration,
-    pub verify_time: Duration,
-    pub proof_bytes: usize,
-    pub auth_sidecar_bytes: usize,
-    pub state_transition_bytes: usize,
-    pub proof: BlockProof,
-    pub auth_sidecar: BlockAuthSidecar,
-    pub start_accumulator: noid_recursive::ChainAccumulator,
-    pub end_accumulator: noid_recursive::ChainAccumulator,
-}
-
-/// One consensus-accepted user-bearing block and every object needed to feed
-/// the production recursive block-slot assembly.
-pub struct AcceptedSingleBlockFixture {
-    pub start_consensus: noid_recursive::RecursiveConsensusState,
-    pub start_accumulator: noid_recursive::ChainAccumulator,
-    pub parent: BlockHeader,
-    pub pre_state: ChainState,
-    pub witness: noid_block::FullAcceptedBlockBatchWitness,
-    pub output: noid_block::FullAcceptedBlockBatchOutput,
-    pub component_proof: noid_block::RetainedFullAcceptedBlockBatchProof,
-}
-
-/// A fully replayed accepted block with all production component statements,
-/// but without the expensive retained component proof. This split keeps the
-/// B255 truth fixture independent from the m22+ prover roofline measurement.
-pub struct AcceptedNativeBlockFixture {
-    pub start_consensus: noid_recursive::RecursiveConsensusState,
-    pub start_accumulator: noid_recursive::ChainAccumulator,
-    pub parent: BlockHeader,
-    pub pre_state: ChainState,
-    pub witness: noid_block::FullAcceptedBlockBatchWitness,
-    pub output: noid_block::FullAcceptedBlockBatchOutput,
-}
-
-struct AcceptedBlockSeed {
-    start_consensus: noid_recursive::RecursiveConsensusState,
-    start_accumulator: noid_recursive::ChainAccumulator,
-    parent: BlockHeader,
-    pre_state: ChainState,
-    witness: noid_block::FullAcceptedBlockBatchWitness,
-}
-
-pub fn fmt_ms(d: Duration) -> String {
-    let ms = d.as_secs_f64() * 1_000.0;
-    if ms >= 1_000.0 {
-        format!("{:>8.2} s ", ms / 1_000.0)
+pub fn fmt_ms(duration: Duration) -> String {
+    let milliseconds = duration.as_secs_f64() * 1_000.0;
+    if milliseconds >= 1_000.0 {
+        format!("{:>8.2} s ", milliseconds / 1_000.0)
     } else {
-        format!("{:>8.2} ms", ms)
+        format!("{:>8.2} ms", milliseconds)
     }
 }
 
@@ -124,21 +67,21 @@ pub fn fmt_bytes(bytes: usize) -> String {
     }
 }
 
-pub fn median(mut xs: Vec<Duration>) -> Duration {
-    xs.sort();
-    xs[xs.len() / 2]
+pub fn median(mut samples: Vec<Duration>) -> Duration {
+    samples.sort();
+    samples[samples.len() / 2]
 }
 
-pub fn time_once<F, R>(f: F) -> (Duration, R)
+pub fn time_once<F, R>(operation: F) -> (Duration, R)
 where
     F: FnOnce() -> R,
 {
     let started = Instant::now();
-    let value = f();
+    let value = operation();
     (started.elapsed(), value)
 }
 
-pub fn time_median<F>(samples: usize, mut f: F) -> Duration
+pub fn time_median<F>(samples: usize, mut operation: F) -> Duration
 where
     F: FnMut(),
 {
@@ -146,13 +89,13 @@ where
     let mut timings = Vec::with_capacity(samples);
     for _ in 0..samples {
         let started = Instant::now();
-        f();
+        operation();
         timings.push(started.elapsed());
     }
     median(timings)
 }
 
-/// Representative FieldR1cs shape used by field-prover microbenchmarks.
+/// Representative Field-R1CS shape used by prover microbenchmarks.
 pub fn poseidon_chain_field_instance(
     chain: usize,
 ) -> (
@@ -164,14 +107,15 @@ pub fn poseidon_chain_field_instance(
     use noid_recursive::acceptance::trace::FieldR1csBuilder;
 
     let seed: [Block128; STATE_SIZE] =
-        std::array::from_fn(|i| Block128(0x1234_5678_9abc_def0 + i as u128));
+        std::array::from_fn(|index| Block128(0x1234_5678_9abc_def0 + index as u128));
     let mut expected = seed;
     for _ in 0..chain {
         Poseidon2bPermutation.permute_mut(&mut expected);
     }
     let mut builder = FieldR1csBuilder::new();
-    let mut state: [LinExpr; STATE_SIZE] =
-        std::array::from_fn(|i| LinExpr::from_wire(builder.alloc_f128(flat_const(seed[i].0))));
+    let mut state: [LinExpr; STATE_SIZE] = std::array::from_fn(|index| {
+        LinExpr::from_wire(builder.alloc_f128(flat_const(seed[index].0)))
+    });
     for _ in 0..chain {
         state = poseidon2b_permute(&mut builder, state);
     }
@@ -183,11 +127,11 @@ pub fn poseidon_chain_field_instance(
 }
 
 pub fn mk_secret(seed: u128) -> SpendSecret {
-    let lo = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xA5A5_A5A5_A5A5_A5A5;
-    let hi = seed.wrapping_mul(0xBF58_476D_1CE4_E5B9) ^ 0x5A5A_5A5A_5A5A_5A5A;
+    let low = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xA5A5_A5A5_A5A5_A5A5;
+    let high = seed.wrapping_mul(0xBF58_476D_1CE4_E5B9) ^ 0x5A5A_5A5A_5A5A_5A5A;
     let mut bytes = [0u8; 32];
-    bytes[..16].copy_from_slice(&lo.to_le_bytes());
-    bytes[16..].copy_from_slice(&hi.to_le_bytes());
+    bytes[..16].copy_from_slice(&low.to_le_bytes());
+    bytes[16..].copy_from_slice(&high.to_le_bytes());
     SpendSecret::from_bytes(bytes)
 }
 
@@ -195,22 +139,22 @@ pub fn mk_secret(seed: u128) -> SpendSecret {
 /// live outputs. All inputs share the address derived from one secret.
 pub fn tx8x2_scenario(
     label: &'static str,
-    n_inputs: usize,
-    n_outputs: usize,
+    input_count: usize,
+    output_count: usize,
     slot_base: u32,
     seed: u128,
 ) -> BenchScenario {
-    assert!((1..=TX_INPUTS).contains(&n_inputs));
-    assert!((1..=TX_OUTPUTS).contains(&n_outputs));
+    assert!((1..=TX_INPUTS).contains(&input_count));
+    assert!((1..=TX_OUTPUTS).contains(&output_count));
 
     let spend_secret = mk_secret(seed);
     let input_owner = derive_address(&spend_secret);
     let mut inputs = [TxInput::dummy(); TX_INPUTS];
     let mut input_sum = 0u64;
     let mut validity_bitmap = 0u16;
-    for (index, input) in inputs.iter_mut().enumerate().take(n_inputs) {
-        let amount = 100_000 + (n_inputs - index) as u64 * 10_000;
-        input_sum = input_sum.checked_add(amount).expect("bench input sum");
+    for (index, input) in inputs.iter_mut().enumerate().take(input_count) {
+        let amount = 100_000 + (input_count - index) as u64 * 10_000;
+        input_sum = input_sum.checked_add(amount).expect("benchmark input sum");
         *input = TxInput {
             slot_index: slot_base + index as u32,
             amount,
@@ -219,15 +163,17 @@ pub fn tx8x2_scenario(
         validity_bitmap |= 1 << index;
     }
 
-    let fee = 5_000 + (n_inputs + n_outputs) as u64 * 500;
-    let spendable = input_sum.checked_sub(fee).expect("bench fee fits inputs");
+    let fee = 5_000 + (input_count + output_count) as u64 * 500;
+    let spendable = input_sum
+        .checked_sub(fee)
+        .expect("benchmark fee fits inputs");
     let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
     let mut remaining = spendable;
-    for (index, output) in outputs.iter_mut().enumerate().take(n_outputs) {
-        let amount = if index + 1 == n_outputs {
+    for (index, output) in outputs.iter_mut().enumerate().take(output_count) {
+        let amount = if index + 1 == output_count {
             remaining
         } else {
-            spendable / n_outputs as u64
+            spendable / output_count as u64
         };
         remaining -= amount;
         *output = TxOutput {
@@ -247,31 +193,22 @@ pub fn tx8x2_scenario(
         validity_bitmap,
         is_coinbase: false,
     };
-    body.validate_canonical()
-        .expect("canonical Tx8x2 benchmark body");
-
+    body.validate_canonical().expect("canonical Tx8x2 fixture");
     BenchScenario {
         label,
-        desc: format!("Tx8x2: {n_inputs} inputs / {n_outputs} outputs"),
+        desc: format!("Tx8x2: {input_count} inputs / {output_count} outputs"),
         body,
         spend_secret_seed: seed,
     }
 }
 
-/// Build the legal saturation body set for one proof-class tier.
-///
-/// B8/B32/B64 use eight inputs per body.  B255 uses the canonical consensus
-/// saturation distribution `85 * 8 + 170 * 2 = 1020` and a depth-24
-/// maximally dispersed touched set spanning all 256 state segments.
+/// Build the legal saturation body set for one HistoryStep current tier.
 pub fn legal_block_scenarios(
     label: &'static str,
     user_txs: usize,
     seed_base: u128,
 ) -> Vec<BenchScenario> {
-    assert!(
-        noid_chain::consensus::params::USER_TX_CLASS_TIERS.contains(&user_txs),
-        "fixture count must be a canonical proof tier"
-    );
+    assert!(noid_chain::consensus::params::USER_TX_CLASS_TIERS.contains(&user_txs));
     if user_txs == noid_chain::consensus::params::BLOCK_MAX_USER_TXS {
         return b255_saturation_scenarios(label, seed_base);
     }
@@ -288,12 +225,8 @@ pub fn legal_block_scenarios(
         .collect()
 }
 
-/// Legal 255-real saturation foundation for the feasibility fixture.
-///
-/// The returned bodies have 1020 distinct, non-zero creation-id inputs, 510
-/// outputs, varied owners, sparse high input bitmap positions, and 1530 unique
-/// user-action slots. Together with the benchmark coinbase output they attain
-/// the depth-24, 256-segment canonical frontier maximum.
+/// Legal 255-user saturation foundation with the consensus maximum 1020
+/// inputs and 510 outputs spread across all depth-24 state segments.
 pub fn b255_saturation_scenarios(label: &'static str, seed_base: u128) -> Vec<BenchScenario> {
     const INPUT_PAIRS: [[usize; 2]; 8] = [
         [0, 7],
@@ -307,70 +240,56 @@ pub fn b255_saturation_scenarios(label: &'static str, seed_base: u128) -> Vec<Be
     ];
 
     let coinbase_slot = (1u32 << BENCH_LOG_SLOTS) - 1;
-    let mut all_touched = maximally_dispersed_b255_touched_slots();
-    let coinbase_pos = all_touched
+    let mut touched = maximally_dispersed_b255_touched_slots();
+    let coinbase_position = touched
         .iter()
         .position(|slot| *slot == coinbase_slot)
-        .expect("dispersed set reserves the canonical benchmark coinbase slot");
-    all_touched.swap_remove(coinbase_pos);
-    assert_eq!(
-        all_touched.len(),
-        noid_chain::consensus::params::BLOCK_MAX_USER_ACTIONS
-    );
+        .expect("fixture reserves the coinbase slot");
+    touched.swap_remove(coinbase_position);
 
-    let mut slot_cursor = 0usize;
+    let mut cursor = 0usize;
     let mut next_creation_id = 1u64;
-    let mut scenarios = Vec::with_capacity(noid_chain::consensus::params::BLOCK_MAX_USER_TXS);
-    for tx_index in 0..noid_chain::consensus::params::BLOCK_MAX_USER_TXS {
-        let n_inputs = if tx_index < B255_EIGHT_INPUT_TXS {
+    let mut scenarios = Vec::with_capacity(255);
+    for tx_index in 0..255 {
+        let input_count = if tx_index < B255_EIGHT_INPUT_TXS {
             TX_INPUTS
         } else {
             2
         };
-        let input_positions: Vec<_> = if n_inputs == TX_INPUTS {
+        let positions: Vec<_> = if input_count == TX_INPUTS {
             (0..TX_INPUTS).collect()
         } else {
             INPUT_PAIRS[(tx_index - B255_EIGHT_INPUT_TXS) % INPUT_PAIRS.len()].to_vec()
         };
-        let input_slots = &all_touched[slot_cursor..slot_cursor + n_inputs];
-        slot_cursor += n_inputs;
-        let output_slots: [u32; TX_OUTPUTS] = all_touched[slot_cursor..slot_cursor + TX_OUTPUTS]
+        let input_slots = &touched[cursor..cursor + input_count];
+        cursor += input_count;
+        let output_slots: [u32; TX_OUTPUTS] = touched[cursor..cursor + TX_OUTPUTS]
             .try_into()
             .expect("two output slots");
-        slot_cursor += TX_OUTPUTS;
-
+        cursor += TX_OUTPUTS;
         scenarios.push(tx8x2_scenario_with_layout(
             label,
-            &input_positions,
+            &positions,
             input_slots,
             output_slots,
             next_creation_id,
             seed_base + tx_index as u128,
         ));
-        next_creation_id += n_inputs as u64;
+        next_creation_id += input_count as u64;
     }
-
-    assert_eq!(slot_cursor, all_touched.len());
+    assert_eq!(cursor, touched.len());
     assert_eq!(next_creation_id - 1, 1_020);
-    assert_eq!(scenarios.len(), 255);
     scenarios
 }
 
 fn maximally_dispersed_b255_touched_slots() -> Vec<u32> {
     let mut slots = Vec::with_capacity(noid_chain::consensus::params::BLOCK_MAX_ACTIONS);
     for segment_rank in 0..noid_chain::consensus::params::BLOCK_MAX_DISTINCT_SEGMENTS {
-        // All 256 production segments are present. Bit reversal keeps the
-        // fixture prefix dispersed too, which is useful while inspecting it.
         let segment = (segment_rank as u32).reverse_bits() >> 24;
         let local_count = if segment_rank < 251 { 6 } else { 5 };
         for local_rank in 0..local_count {
             let mut local = (local_rank as u32).reverse_bits() >> 16;
             if segment == 0 || segment == u8::MAX as u32 {
-                // Preserve maximum dispersion while making the canonical
-                // benchmark coinbase slot one member of the set. Mirroring
-                // segment zero also places 65_535 next to segment one's
-                // 65_536, so the truth fixture exercises adjacent (but still
-                // distinct) spend/mint slots across a segment boundary.
                 local ^= u16::MAX as u32;
             }
             slots.push((segment << noid_chain::consensus::params::LOG_SEGMENT_SIZE) | local);
@@ -392,20 +311,16 @@ fn tx8x2_scenario_with_layout(
     seed: u128,
 ) -> BenchScenario {
     assert_eq!(input_positions.len(), input_slots.len());
-    assert!((1..=TX_INPUTS).contains(&input_slots.len()));
-
     let spend_secret = mk_secret(seed);
     let input_owner = derive_address(&spend_secret);
     let mut inputs = [TxInput::dummy(); TX_INPUTS];
     let mut validity_bitmap = 0u16;
     let mut input_sum = 0u64;
     for (logical_index, (&position, &slot_index)) in
-        input_positions.iter().zip(input_slots.iter()).enumerate()
+        input_positions.iter().zip(input_slots).enumerate()
     {
-        assert!(position < TX_INPUTS);
-        assert_eq!(inputs[position], TxInput::dummy());
         let amount = 1_000_000 + (logical_index as u64 + 1) * 10_000 + seed as u64 % 997;
-        input_sum = input_sum.checked_add(amount).expect("saturation input sum");
+        input_sum = input_sum.checked_add(amount).expect("fixture input sum");
         inputs[position] = TxInput {
             slot_index,
             amount,
@@ -413,7 +328,6 @@ fn tx8x2_scenario_with_layout(
         };
         validity_bitmap |= 1 << position;
     }
-
     let fee = noid_chain::consensus::fees::fee_breakdown(
         input_slots.len() as u64,
         TX_OUTPUTS as u64,
@@ -421,9 +335,7 @@ fn tx8x2_scenario_with_layout(
         BENCH_LOG_SLOTS,
     )
     .required_total;
-    let spendable = input_sum
-        .checked_sub(fee)
-        .expect("saturation fee fits inputs");
+    let spendable = input_sum.checked_sub(fee).expect("fixture fee fits inputs");
     let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
     let first_output = spendable / 2;
     outputs[0] = TxOutput {
@@ -437,7 +349,6 @@ fn tx8x2_scenario_with_layout(
         owner: derive_address(&mk_secret(seed + 0x20_000)),
     };
     validity_bitmap |= output_bitmap_bit(0) | output_bitmap_bit(1);
-
     let body = TxBody {
         epoch_anchor: [0xAA; 32],
         fee,
@@ -447,8 +358,7 @@ fn tx8x2_scenario_with_layout(
         validity_bitmap,
         is_coinbase: false,
     };
-    body.validate_canonical()
-        .expect("canonical B255 saturation body");
+    body.validate_canonical().expect("canonical B255 fixture");
     BenchScenario {
         label,
         desc: format!(
@@ -463,20 +373,22 @@ fn tx8x2_scenario_with_layout(
 
 pub fn state_shrinking_scenario(
     label: &'static str,
-    n_inputs: usize,
+    input_count: usize,
     slot_base: u32,
     seed: u128,
 ) -> BenchScenario {
-    let mut scenario = tx8x2_scenario(label, n_inputs, 1, slot_base, seed);
-    scenario.desc = format!("Tx8x2 state shrink: {n_inputs} inputs / 1 output");
+    let mut scenario = tx8x2_scenario(label, input_count, 1, slot_base, seed);
+    scenario.desc = format!("Tx8x2 state shrink: {input_count} inputs / 1 output");
     scenario
 }
 
 pub fn minimal_tx_fixture(scenario: BenchScenario) -> MinimalTxFixture {
-    let spend_secret = scenario.spend_secret();
-    let proof = prove_wallet_authorization(&scenario.body, OwnerAuthWitness::new(spend_secret))
-        .expect("selected witness-hiding authorization")
-        .proof;
+    let proof = prove_wallet_authorization(
+        &scenario.body,
+        OwnerAuthWitness::new(scenario.spend_secret()),
+    )
+    .expect("wallet authorization fixture")
+    .proof;
     MinimalTxFixture {
         scenario,
         auth_proof: proof,
@@ -489,17 +401,17 @@ pub fn prove_wallet(fixture: &MinimalTxFixture, samples: usize) -> WalletBench {
             &fixture.scenario.body,
             OwnerAuthWitness::new(fixture.scenario.spend_secret()),
         )
-        .expect("prove selected wallet authorization");
+        .expect("prove wallet authorization");
     });
     let proof = prove_wallet_authorization(
         &fixture.scenario.body,
         OwnerAuthWitness::new(fixture.scenario.spend_secret()),
     )
-    .expect("prove selected wallet authorization")
+    .expect("prove wallet authorization")
     .proof;
     let verify_time = time_median(samples, || {
         verify_wallet_authorization_proof(&fixture.scenario.body, &proof)
-            .expect("verify selected wallet authorization");
+            .expect("verify wallet authorization");
     });
     WalletBench {
         prove_time,
@@ -509,10 +421,7 @@ pub fn prove_wallet(fixture: &MinimalTxFixture, samples: usize) -> WalletBench {
 }
 
 pub fn authorization_size(proof: &ZkAuthorizationProof) -> usize {
-    proof
-        .to_bytes()
-        .expect("encode selected authorization")
-        .len()
+    proof.to_bytes().expect("encode authorization proof").len()
 }
 
 pub fn wallet_bundle_size(proof: &ZkAuthorizationProof) -> usize {
@@ -520,7 +429,7 @@ pub fn wallet_bundle_size(proof: &ZkAuthorizationProof) -> usize {
         proof: proof.clone(),
     }
     .to_bytes()
-    .expect("encode selected wallet bundle")
+    .expect("encode wallet bundle")
     .len()
 }
 
@@ -532,644 +441,17 @@ pub fn block_tx_hash_body(body: &TxBody) -> TxBodyHash {
     body.txid()
 }
 
-fn seed_state_for_bodies(bodies: &[TxBody]) -> ChainState {
-    let slots: Vec<_> = bodies
-        .iter()
-        .flat_map(|body| {
-            body.live_inputs().map(|(_, input)| {
-                (
-                    input.slot_index,
-                    SlotValue::with_owner_fields(
-                        input.amount,
-                        input.creation_id,
-                        body.input_owner.as_fields(),
-                    ),
-                )
-            })
-        })
-        .collect();
-    let alloc_counter = bodies
-        .iter()
-        .flat_map(TxBody::live_inputs)
-        .map(|(_, input)| input.creation_id)
-        .max()
-        .unwrap_or(0);
-    ChainState::from_sparse_utxos(BENCH_LOG_SLOTS as usize, &slots, alloc_counter)
-        .expect("bench input slots form a valid sparse UTXO state")
-}
-
-fn bench_coinbase_body() -> TxBody {
-    let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
-    outputs[0] = TxOutput {
-        slot_index: (1u32 << BENCH_LOG_SLOTS) - 1,
-        amount: 0,
-        owner: Address([0xCB; 32]),
-    };
-    TxBody {
-        epoch_anchor: [0u8; 32],
-        fee: 0,
-        input_owner: Address([0u8; 32]),
-        inputs: [TxInput::dummy(); TX_INPUTS],
-        outputs,
-        validity_bitmap: output_bitmap_bit(0),
-        is_coinbase: true,
-    }
-}
-
-fn mine_benchmark_header(header: &BlockHeader) -> u128 {
-    const CHUNK: u128 = 2_000_000;
-    let mut start_nonce = 0u128;
-    loop {
-        if let Some(nonce) = noid_chain::consensus::pow::search_pow(header, start_nonce, CHUNK) {
-            return nonce;
-        }
-        start_nonce = start_nonce
-            .checked_add(CHUNK)
-            .expect("benchmark PoW nonce space exhausted");
-    }
-}
-
-/// Deterministic batched PoW search for multi-block heavy fixtures. Each batch
-/// exhausts adjacent nonce ranges in parallel and returns the minimum hit, so
-/// the result does not depend on Rayon scheduling.
-fn mine_benchmark_header_parallel(header: &BlockHeader) -> u128 {
-    use rayon::prelude::*;
-
-    const CHUNK: u128 = 65_536;
-    let lanes = rayon::current_num_threads().max(1);
-    let batch_width = CHUNK
-        .checked_mul(lanes as u128)
-        .expect("benchmark PoW batch width");
-    let mut batch_start = 0u128;
-    loop {
-        let hit = (0..lanes)
-            .into_par_iter()
-            .filter_map(|lane| {
-                let start = batch_start.checked_add(CHUNK * lane as u128)?;
-                noid_chain::consensus::pow::search_pow(header, start, CHUNK)
-            })
-            .min();
-        if let Some(nonce) = hit {
-            return nonce;
-        }
-        batch_start = batch_start
-            .checked_add(batch_width)
-            .expect("benchmark PoW nonce space exhausted");
-    }
-}
-
-fn bench_block_from_parts(
-    coinbase_body: TxBody,
-    user_bodies: &[TxBody],
-    proof: &BlockProof,
-    pre_state: &ChainState,
-) -> Block {
-    let mut transactions = Vec::with_capacity(user_bodies.len() + 1);
-    transactions.push(Transaction::new(coinbase_body));
-    transactions.extend(user_bodies.iter().cloned().map(Transaction::new));
-    let active_inputs: u64 = user_bodies
-        .iter()
-        .map(|body| body.live_input_count() as u64)
-        .sum();
-    let active_outputs: u64 = transactions
-        .iter()
-        .map(|tx| tx.body.live_output_count() as u64)
-        .sum();
-    let active_slot_count = pre_state
-        .active_slot_count
-        .checked_sub(active_inputs)
-        .and_then(|count| count.checked_add(active_outputs))
-        .expect("benchmark active counter transition");
-    let alloc_counter = pre_state
-        .alloc_counter
-        .checked_add(active_outputs)
-        .expect("benchmark allocation counter transition");
-    let tx_root = noid_chain::compute_tx_root(&transactions);
-    Block {
-        header: BlockHeader {
-            prev_block_hash: [0u8; 32],
-            state_root: proof.meta.new_state_root,
-            tx_root,
-            timestamp: 2,
-            height: 1,
-            miner_address: Address([0xCB; 32]),
-            nonce: 0,
-            difficulty_target: [0xFF; 32],
-            log_slots: BENCH_LOG_SLOTS,
-            active_slot_count,
-            alloc_counter,
-            attested_coverage: 0,
-        },
-        transactions,
-    }
-}
-
-fn prove_full_block_from_fixtures(
-    pre_state: ChainState,
-    user_bodies: Vec<TxBody>,
-    tx_auth: Vec<ZkAuthorizationProof>,
-) -> (
-    BlockProof,
-    Block,
-    BlockAuthSidecar,
-    ChainState,
-    noid_recursive::ChainAccumulator,
-    noid_recursive::ChainAccumulator,
-) {
-    assert_eq!(user_bodies.len(), tx_auth.len());
-    let prev_state_root = pre_state.cached_state_root();
-    let coinbase_body = bench_coinbase_body();
-    let all_bodies: Vec<_> = std::iter::once(coinbase_body.clone())
-        .chain(user_bodies.iter().cloned())
-        .collect();
-    let commitments: Vec<_> = all_bodies.iter().map(TxBody::claims_commitment).collect();
-    // `bench_block_from_parts` mints this fixture at height 1.
-    let exact_surface = noid_chain::build_exact_action_surface(
-        &pre_state.state,
-        &all_bodies,
-        &commitments,
-        pre_state.alloc_counter,
-        1,
-    )
-    .expect("build Tx8x2 exact action surface");
-    let exact_cache = pre_state
-        .state
-        .exact_sparse_cache()
-        .expect("build benchmark sparse cache");
-    let exact_state_transition = build_exact_state_transition_proof(&exact_cache, &exact_surface)
-        .expect("build exact state proof");
-    let new_leaf_hashes: Vec<_> = exact_surface
-        .new_slots
-        .iter()
-        .map(|&slot| slot_leaf_hash(slot))
-        .collect();
-    let new_state_root = reconstruct_root(
-        &exact_surface.touched_indices,
-        &new_leaf_hashes,
-        &exact_state_transition.slot_siblings,
-        BENCH_LOG_SLOTS,
-    )
-    .expect("child state root from multiproof frontier");
-    let auth_sidecar = BlockAuthSidecar { tx_auth };
-    let proof = BlockProof::minimal(
-        prev_state_root,
-        new_state_root,
-        user_bodies.len() as u32,
-        exact_state_transition,
-    );
-    let block = bench_block_from_parts(coinbase_body, &user_bodies, &proof, &pre_state);
-    let start_accumulator = noid_recursive::ChainAccumulator {
-        height: block.header.height - 1,
-        tip_block_id: block.header.prev_block_hash,
-        state_root: prev_state_root,
-        log_slots: pre_state.state.log_slots() as u32,
-        active_slot_count: pre_state.active_slot_count,
-        alloc_counter: pre_state.alloc_counter,
-        epoch_anchor_id: user_bodies
-            .first()
-            .map_or(block.header.prev_block_hash, |body| body.epoch_anchor),
-        attested_coverage: 0,
-    };
-    assert_eq!(
-        block.transactions[0].body.epoch_anchor, start_accumulator.tip_block_id,
-        "coinbase epoch anchor is the parent tip"
-    );
-    assert!(user_bodies
-        .iter()
-        .all(|body| body.epoch_anchor == start_accumulator.epoch_anchor_id));
-    let end_accumulator = start_accumulator
-        .advance(&block.header)
-        .expect("benchmark block advances the direct eleven-lane accumulator");
-    (
-        proof,
-        block,
-        auth_sidecar,
-        pre_state,
-        start_accumulator,
-        end_accumulator,
-    )
-}
-
-/// Build a complete accepted user-bearing block from a locally valid synthetic
-/// parent header. The parent itself is a valid PoW/header child of genesis; its
-/// exact state is seeded with the users' real input UTXOs.
+/// Native user counts used by the release freezer's honest backbone.
 ///
-/// Coinbase deliberately occupies the final depth-24 slot. The B255 saturation
-/// scenarios reserve that slot, so their accepted block retains the attainable
-/// 20,420-sibling maximum rather than allowing template slot heuristics to
-/// change the truth fixture's frontier geometry.
-fn accepted_user_block_seed(mut scenarios: Vec<BenchScenario>) -> AcceptedBlockSeed {
-    assert!(
-        (1..=noid_chain::consensus::params::BLOCK_MAX_USER_TXS).contains(&scenarios.len()),
-        "accepted fixture needs 1..=255 real user transactions"
-    );
-    let pre_bodies: Vec<_> = scenarios
-        .iter()
-        .map(|scenario| scenario.body.clone())
-        .collect();
-    let pre_state = seed_state_for_bodies(&pre_bodies);
-    let pre_leaves: Vec<_> = pre_bodies
-        .iter()
-        .flat_map(|body| {
-            body.live_inputs().map(|(_, input)| {
-                let slot = SlotValue::with_owner_fields(
-                    input.amount,
-                    input.creation_id,
-                    body.input_owner.as_fields(),
-                );
-                (input.slot_index, slot_leaf_hash(slot))
-            })
-        })
-        .collect();
-    let exact_cache =
-        noid_chain::sparse_merkle::SparseMerkleCache::from_leaves(BENCH_LOG_SLOTS, &pre_leaves)
-            .expect("accepted fixture sparse cache from real UTXOs");
-    assert_eq!(exact_cache.root(), pre_state.cached_state_root());
-    let genesis = noid_chain::consensus::genesis_header();
-    let genesis_id = noid_chain::hash_block_header(&genesis);
-    let parent_timestamp = genesis.timestamp + noid_chain::consensus::params::BLOCK_TIME;
-    let parent_target = noid_chain::consensus::difficulty::next_target(
-        0,
-        genesis.timestamp,
-        &genesis.difficulty_target,
-        1,
-        parent_timestamp,
-    );
-    let mut parent = BlockHeader {
-        prev_block_hash: genesis_id,
-        state_root: pre_state.cached_state_root(),
-        tx_root: [0u8; 32],
-        timestamp: parent_timestamp,
-        height: 1,
-        miner_address: Address([0xA1; 32]),
-        nonce: 0,
-        difficulty_target: parent_target,
-        log_slots: BENCH_LOG_SLOTS,
-        active_slot_count: pre_state.active_slot_count,
-        alloc_counter: pre_state.alloc_counter,
-        attested_coverage: 0,
-    };
-    parent.nonce = mine_benchmark_header(&parent);
-    let parent_id = noid_chain::hash_block_header(&parent);
+/// The first ten blocks remain in B8 while growing a pool large enough for
+/// every fork. The final three blocks establish exact B32, B64 and B255
+/// parent boundaries. Every block starts at canonical genesis ancestry and is
+/// mined, checked and materialized through the production state transition.
+pub const HISTORY_STEP_FREEZER_BACKBONE_USER_COUNTS: [usize; 13] =
+    [0, 1, 3, 7, 8, 8, 8, 8, 8, 8, 17, 33, 65];
 
-    // Height one is still in genesis' transaction epoch. Recompute the exact
-    // consensus fee against this parent and preserve each scenario's output
-    // slots/owners while rebalancing its live amount lanes.
-    for scenario in &mut scenarios {
-        scenario.body.epoch_anchor = genesis_id;
-        let required_fee = noid_chain::consensus::fees::required_fee_for_tx_body(
-            &scenario.body,
-            parent.active_slot_count,
-            parent.log_slots,
-        );
-        let input_sum: u64 = scenario
-            .body
-            .live_inputs()
-            .map(|(_, input)| input.amount)
-            .sum();
-        let spendable = input_sum
-            .checked_sub(required_fee)
-            .expect("fixture fee fits inputs");
-        scenario.body.fee = required_fee;
-        let live_outputs: Vec<_> = (0..TX_OUTPUTS)
-            .filter(|&index| scenario.body.output_is_live(index))
-            .collect();
-        assert!(!live_outputs.is_empty(), "accepted user needs an output");
-        let mut remaining = spendable;
-        for (rank, &index) in live_outputs.iter().enumerate() {
-            let amount = if rank + 1 == live_outputs.len() {
-                remaining
-            } else {
-                spendable / live_outputs.len() as u64
-            };
-            remaining -= amount;
-            scenario.body.outputs[index].amount = amount;
-        }
-        scenario
-            .body
-            .validate_canonical()
-            .expect("accepted fixture canonical body");
-    }
-    let tx_auth: Vec<_> = scenarios
-        .iter()
-        .cloned()
-        .map(minimal_tx_fixture)
-        .map(|fixture| fixture.auth_proof)
-        .collect();
-    let user_bodies: Vec<_> = scenarios
-        .into_iter()
-        .map(|scenario| scenario.body)
-        .collect();
-
-    let genesis_work = noid_chain::consensus::block_work(&genesis.difficulty_target);
-    let parent_work = noid_chain::consensus::add_work(
-        &genesis_work,
-        &noid_chain::consensus::block_work(&parent.difficulty_target),
-    );
-    let start_consensus = noid_recursive::RecursiveConsensusState::from_header(
-        &parent,
-        parent_work,
-        0,
-        genesis.timestamp,
-        genesis.difficulty_target,
-        &[genesis.timestamp, parent.timestamp],
-        &[genesis.active_slot_count, parent.active_slot_count],
-    );
-    let start_accumulator = noid_recursive::ChainAccumulator {
-        height: parent.height,
-        tip_block_id: parent_id,
-        state_root: parent.state_root,
-        log_slots: parent.log_slots,
-        active_slot_count: parent.active_slot_count,
-        alloc_counter: parent.alloc_counter,
-        epoch_anchor_id: genesis_id,
-        attested_coverage: parent.attested_coverage,
-    };
-    let child_timestamp = parent.timestamp + noid_chain::consensus::params::BLOCK_TIME;
-    let child_target = noid_chain::consensus::difficulty::next_target(
-        start_consensus.asert_anchor_height,
-        start_consensus.asert_anchor_timestamp,
-        &start_consensus.asert_anchor_target,
-        parent.height + 1,
-        child_timestamp,
-    );
-    let miner_address = Address([0xB2; 32]);
-    let mut coinbase = bench_coinbase_body();
-    coinbase.epoch_anchor = parent_id;
-    coinbase.outputs[0].owner = miner_address;
-    let claimable_fee_sum: u128 = user_bodies
-        .iter()
-        .map(|body| {
-            u128::from(noid_chain::consensus::fees::claimable_fee_for_tx_body(
-                body,
-                parent.active_slot_count,
-                parent.log_slots,
-            ))
-        })
-        .sum();
-    coinbase.outputs[0].amount = (u128::from(noid_chain::consensus::emission::block_reward(
-        BENCH_LOG_SLOTS,
-    )) + claimable_fee_sum)
-        .min(u128::from(u64::MAX)) as u64;
-    let mut transactions = Vec::with_capacity(user_bodies.len() + 1);
-    transactions.push(Transaction::new(coinbase));
-    transactions.extend(user_bodies.iter().cloned().map(Transaction::new));
-
-    let all_bodies: Vec<_> = transactions
-        .iter()
-        .map(|transaction| transaction.body.clone())
-        .collect();
-    let commitments: Vec<_> = all_bodies.iter().map(TxBody::claims_commitment).collect();
-    let surface = noid_chain::build_exact_action_surface(
-        &pre_state.state,
-        &all_bodies,
-        &commitments,
-        pre_state.alloc_counter,
-        parent.height + 1,
-    )
-    .expect("accepted fixture exact action surface");
-    let state_transition = build_exact_state_transition_proof(&exact_cache, &surface)
-        .expect("accepted fixture structural frontier");
-    let child_leaves: Vec<_> = surface
-        .new_slots
-        .iter()
-        .copied()
-        .map(slot_leaf_hash)
-        .collect();
-    let child_root = reconstruct_root(
-        &surface.touched_indices,
-        &child_leaves,
-        &state_transition.slot_siblings,
-        BENCH_LOG_SLOTS,
-    )
-    .expect("accepted fixture child root");
-    let child_active_slot_count = parent
-        .active_slot_count
-        .checked_sub(u64::from(surface.spends))
-        .and_then(|count| count.checked_add(u64::from(surface.mints)))
-        .expect("accepted fixture active counter");
-    let child_alloc_counter = parent
-        .alloc_counter
-        .checked_add(u64::from(surface.mints))
-        .expect("accepted fixture allocator counter");
-    let mut child_header = BlockHeader {
-        prev_block_hash: parent_id,
-        state_root: child_root,
-        tx_root: noid_chain::compute_tx_root(&transactions),
-        timestamp: child_timestamp,
-        height: parent.height + 1,
-        miner_address,
-        nonce: 0,
-        difficulty_target: child_target,
-        log_slots: BENCH_LOG_SLOTS,
-        active_slot_count: child_active_slot_count,
-        alloc_counter: child_alloc_counter,
-        attested_coverage: parent.attested_coverage,
-    };
-    child_header.nonce = mine_benchmark_header(&child_header);
-    let block = Block {
-        header: child_header,
-        transactions,
-    };
-    noid_chain::consensus::validate_block_checks_timeless(
-        &block,
-        &parent,
-        &[genesis.timestamp, parent.timestamp],
-        &[genesis.active_slot_count, parent.active_slot_count],
-        &noid_chain::consensus::AnchorInfo {
-            anchor_height: 0,
-            anchor_timestamp: genesis.timestamp,
-            anchor_target: genesis.difficulty_target,
-        },
-    )
-    .expect("accepted fixture native consensus checks");
-    let block_proof = BlockProof::minimal(
-        pre_state.cached_state_root(),
-        child_root,
-        user_bodies.len() as u32,
-        state_transition,
-    );
-    let sidecar = BlockAuthSidecar { tx_auth };
-    let witness = noid_block::FullAcceptedBlockBatchWitness {
-        items: vec![noid_block::FullAcceptedBlockBatchItem {
-            block,
-            block_proof_bytes: bincode::serialize(&block_proof)
-                .expect("accepted fixture block proof bytes"),
-            block_auth_sidecar_bytes: sidecar
-                .to_bytes()
-                .expect("accepted fixture auth sidecar bytes"),
-        }],
-    };
-    AcceptedBlockSeed {
-        start_consensus,
-        start_accumulator,
-        parent,
-        pre_state,
-        witness,
-    }
-}
-
-/// Replay an accepted user-bearing block and derive every production component
-/// statement without crossing into the retained component prover.
-pub fn accepted_user_block_fixture(scenarios: Vec<BenchScenario>) -> AcceptedNativeBlockFixture {
-    let seed = accepted_user_block_seed(scenarios);
-    let output = noid_block::verify_full_accepted_block_batch_native(
-        &seed.start_consensus,
-        &seed.start_accumulator,
-        &seed.parent,
-        &seed.pre_state,
-        &seed.witness,
-    )
-    .expect("accepted fixture native replay");
-    AcceptedNativeBlockFixture {
-        start_consensus: seed.start_consensus,
-        start_accumulator: seed.start_accumulator,
-        parent: seed.parent,
-        pre_state: seed.pre_state,
-        witness: seed.witness,
-        output,
-    }
-}
-
-/// Build the retained production component proof for an accepted user block.
-/// Keep B255 calls opt-in: this crosses the m22+ proof roofline by design.
-pub fn accepted_proved_user_block_fixture(
-    scenarios: Vec<BenchScenario>,
-) -> AcceptedSingleBlockFixture {
-    let seed = accepted_user_block_seed(scenarios);
-    let (output, component_proof) = noid_block::prove_retained_full_accepted_block_batch_proof(
-        &seed.start_consensus,
-        &seed.start_accumulator,
-        &seed.parent,
-        &seed.pre_state,
-        &seed.witness,
-    )
-    .expect("accepted fixture component proof");
-    AcceptedSingleBlockFixture {
-        start_consensus: seed.start_consensus,
-        start_accumulator: seed.start_accumulator,
-        parent: seed.parent,
-        pre_state: seed.pre_state,
-        witness: seed.witness,
-        output,
-        component_proof,
-    }
-}
-
-/// Small production-path smoke fixture.
-pub fn accepted_single_user_fixture(seed: u128) -> AcceptedSingleBlockFixture {
-    accepted_proved_user_block_fixture(vec![tx8x2_scenario(
-        "accepted-single-user",
-        2,
-        2,
-        4_096,
-        seed,
-    )])
-}
-
-/// Two consecutive canonical coinbase-only children of the real genesis
-/// boundary, each replayed and proved as its own retained single-block batch.
-///
-/// This is the smallest honest fixture for the recursive block -> link -> tip
-/// vertical: the first link can use the canonical blockless bootstrap
-/// accumulator, while the second link exercises an ordinary predecessor replay.
-/// Both blocks belong to B8 (`user_tx_class_tier(0) == Some(8)`) and therefore
-/// share one production block matrix after capacity padding.
-pub fn accepted_two_coinbase_chain_fixture() -> [AcceptedSingleBlockFixture; 2] {
-    let genesis = noid_chain::consensus::genesis_header();
-    let mut state = ChainState::with_log_slots(genesis.log_slots as usize);
-    assert_eq!(
-        state.cached_state_root(),
-        genesis.state_root,
-        "canonical empty state must match the genesis header"
-    );
-
-    let genesis_work = noid_chain::consensus::block_work(&genesis.difficulty_target);
-    let mut consensus = noid_recursive::RecursiveConsensusState::from_header(
-        &genesis,
-        genesis_work,
-        0,
-        genesis.timestamp,
-        genesis.difficulty_target,
-        &[genesis.timestamp],
-        &[genesis.active_slot_count],
-    );
-    let mut accumulator = noid_recursive::genesis_accumulator();
-    let mut parent = genesis;
-    let mut fixtures = Vec::with_capacity(2);
-
-    for index in 0..2usize {
-        let timestamp = parent
-            .timestamp
-            .checked_add(noid_chain::consensus::params::BLOCK_TIME)
-            .expect("coinbase-chain timestamp");
-        let target = noid_chain::consensus::next_target(
-            consensus.asert_anchor_height,
-            consensus.asert_anchor_timestamp,
-            &consensus.asert_anchor_target,
-            parent.height + 1,
-            timestamp,
-        );
-        let template = noid_chain::consensus::build_block_template(
-            &parent,
-            &state,
-            consensus.active_counts(),
-            Vec::new(),
-            Address([0xC0 + index as u8; 32]),
-            timestamp,
-            target,
-        )
-        .expect("canonical coinbase-only template");
-        let transactions = template.all_txs();
-        let mut header = template.into_header(0);
-        header.nonce = mine_benchmark_header(&header);
-        let block = Block {
-            header: header.clone(),
-            transactions,
-        };
-        let witness = noid_block::FullAcceptedBlockBatchWitness {
-            items: vec![noid_block::FullAcceptedBlockBatchItem {
-                block,
-                // Coinbase-only acceptance has no detached block proof or
-                // authorization sidecar. The retained replay derives its exact
-                // structural component statements directly.
-                block_proof_bytes: Vec::new(),
-                block_auth_sidecar_bytes: Vec::new(),
-            }],
-        };
-        let (output, component_proof) = noid_block::prove_retained_full_accepted_block_batch_proof(
-            &consensus,
-            &accumulator,
-            &parent,
-            &state,
-            &witness,
-        )
-        .expect("canonical coinbase-only retained component proof");
-        assert_eq!(component_proof.exact_state.len(), 1);
-
-        let next_consensus = output.accepted_claim_batch.consensus_state.clone();
-        let next_accumulator = output.accepted_claim_batch.accumulator.clone();
-        let next_state = output.end_state.clone();
-        fixtures.push(AcceptedSingleBlockFixture {
-            start_consensus: consensus,
-            start_accumulator: accumulator,
-            parent,
-            pre_state: state,
-            witness,
-            output,
-            component_proof,
-        });
-
-        consensus = next_consensus;
-        accumulator = next_accumulator;
-        state = next_state;
-        parent = header;
-    }
-
-    fixtures
-        .try_into()
-        .unwrap_or_else(|_| unreachable!("exactly two fixtures were built"))
-}
+/// One honest current-block member for each fixed HistoryStep tier.
+pub const HISTORY_STEP_FREEZER_FORK_USER_COUNTS: [usize; 4] = [8, 17, 33, 65];
 
 #[derive(Clone)]
 struct TrackedSpendable {
@@ -1183,1224 +465,1321 @@ impl TrackedSpendable {
     }
 }
 
-fn four_tier_chain_start(
-    seed: u128,
-) -> (
-    noid_recursive::RecursiveConsensusState,
-    noid_recursive::ChainAccumulator,
-    BlockHeader,
-    ChainState,
-    Vec<TrackedSpendable>,
-) {
-    const INITIAL_UTXO_COUNT: usize = 8;
-    const INITIAL_AMOUNT: u64 = 1_000_000_000;
-
-    let mut spendables = Vec::with_capacity(INITIAL_UTXO_COUNT);
-    let mut slots = Vec::with_capacity(INITIAL_UTXO_COUNT);
-    for index in 0..INITIAL_UTXO_COUNT {
-        let spend_secret_seed = seed.wrapping_add(0x1000_0000).wrapping_add(index as u128);
-        let spend_secret = mk_secret(spend_secret_seed);
-        let slot_index = 0x0001_0000 + (index as u32) * 0x0001_0000;
-        let creation_id = index as u64 + 1;
-        slots.push((
-            slot_index,
-            SlotValue::with_owner_fields(
-                INITIAL_AMOUNT,
-                creation_id,
-                derive_address(&spend_secret).as_fields(),
-            ),
-        ));
-        spendables.push(TrackedSpendable {
-            slot_index,
-            spend_secret_seed,
-        });
-    }
-    let state =
-        ChainState::from_sparse_utxos(BENCH_LOG_SLOTS as usize, &slots, INITIAL_UTXO_COUNT as u64)
-            .expect("four-tier fixture synthetic parent state");
-
-    let genesis = noid_chain::consensus::genesis_header();
-    let genesis_id = noid_chain::hash_block_header(&genesis);
-    let parent_timestamp = genesis
-        .timestamp
-        .checked_add(noid_chain::consensus::params::BLOCK_TIME)
-        .expect("four-tier parent timestamp");
-    let parent_target = noid_chain::consensus::next_target(
-        0,
-        genesis.timestamp,
-        &genesis.difficulty_target,
-        1,
-        parent_timestamp,
-    );
-    let mut parent = BlockHeader {
-        prev_block_hash: genesis_id,
-        state_root: state.cached_state_root(),
-        tx_root: [0u8; 32],
-        timestamp: parent_timestamp,
-        height: 1,
-        miner_address: Address([0xD0; 32]),
-        nonce: 0,
-        difficulty_target: parent_target,
-        log_slots: BENCH_LOG_SLOTS,
-        active_slot_count: state.active_slot_count,
-        alloc_counter: state.alloc_counter,
-        attested_coverage: 0,
-    };
-    parent.nonce = mine_benchmark_header_parallel(&parent);
-    let parent_id = noid_chain::hash_block_header(&parent);
-    let genesis_work = noid_chain::consensus::block_work(&genesis.difficulty_target);
-    let parent_work = noid_chain::consensus::add_work(
-        &genesis_work,
-        &noid_chain::consensus::block_work(&parent.difficulty_target),
-    );
-    let consensus = noid_recursive::RecursiveConsensusState::from_header(
-        &parent,
-        parent_work,
-        0,
-        genesis.timestamp,
-        genesis.difficulty_target,
-        &[genesis.timestamp, parent.timestamp],
-        &[genesis.active_slot_count, parent.active_slot_count],
-    );
-    let accumulator = noid_recursive::ChainAccumulator {
-        height: parent.height,
-        tip_block_id: parent_id,
-        state_root: parent.state_root,
-        log_slots: parent.log_slots,
-        active_slot_count: parent.active_slot_count,
-        alloc_counter: parent.alloc_counter,
-        epoch_anchor_id: genesis_id,
-        attested_coverage: parent.attested_coverage,
-    };
-    (consensus, accumulator, parent, state, spendables)
+#[derive(Clone)]
+struct HistoryStepFixtureCheckpoint {
+    parent_header: noid_chain::BlockHeader,
+    tx_epoch_anchor_header: noid_chain::BlockHeader,
+    parent_state: noid_chain::state::ChainState,
+    start_accumulator: noid_recursive::ChainAccumulator,
+    previous_timestamps: Vec<u64>,
+    previous_active_counts: Vec<u64>,
+    asert_anchor: noid_chain::consensus::AnchorInfo,
+    spendables: Vec<TrackedSpendable>,
+    output_slot_cursor: u32,
 }
 
-fn canonical_ladder_chain_start() -> (
-    noid_recursive::RecursiveConsensusState,
-    noid_recursive::ChainAccumulator,
-    BlockHeader,
-    ChainState,
-    Vec<TrackedSpendable>,
-) {
-    let genesis = noid_chain::consensus::genesis_header();
-    let state = ChainState::with_log_slots(genesis.log_slots as usize);
-    assert_eq!(state.cached_state_root(), genesis.state_root);
-    let consensus = noid_recursive::RecursiveConsensusState::from_header(
-        &genesis,
-        noid_chain::consensus::block_work(&genesis.difficulty_target),
-        0,
-        genesis.timestamp,
-        genesis.difficulty_target,
-        &[genesis.timestamp],
-        &[genesis.active_slot_count],
-    );
-    let accumulator = noid_recursive::genesis_accumulator();
-    assert_eq!(
-        accumulator.tip_block_id,
-        noid_chain::hash_block_header(&genesis)
-    );
-    assert_eq!(accumulator.state_root, state.cached_state_root());
-    (consensus, accumulator, genesis, state, Vec::new())
+/// A mined, fully prepared release-freezer witness for one HistoryStep input.
+///
+/// The start/end accumulators are owned beside the one-shot witness so the
+/// freezer can consume the input immediately without retaining borrowed
+/// chain state or reconstructing any boundary.
+pub struct PreparedHistoryStepTierFixture<const TIER: usize> {
+    witness: noid_block::PreparedHistoryStepInputWitness<TIER>,
+    nonce: u128,
+    start_accumulator: noid_recursive::ChainAccumulator,
+    end_accumulator: noid_recursive::ChainAccumulator,
 }
 
-fn sequential_chain_user_scenario(
-    source: &TrackedSpendable,
-    pre_state: &ChainState,
-    epoch_anchor: [u8; 32],
-    output_slots: [u32; TX_OUTPUTS],
-    output_secret_seeds: [u128; TX_OUTPUTS],
-) -> BenchScenario {
-    let input_slot = pre_state.state.slot(source.slot_index);
-    assert!(!input_slot.is_empty(), "tracked fixture UTXO must be live");
-    let source_secret = source.spend_secret();
-    let input_owner = derive_address(&source_secret);
-    assert_eq!(
-        input_slot,
-        SlotValue::with_owner_fields(
-            input_slot.amount(),
-            input_slot.creation_id(),
-            input_owner.as_fields(),
-        ),
-        "tracked fixture secret must own the selected UTXO"
-    );
-
-    let mut inputs = [TxInput::dummy(); TX_INPUTS];
-    inputs[0] = TxInput {
-        slot_index: source.slot_index,
-        amount: input_slot.amount(),
-        creation_id: input_slot.creation_id(),
-    };
-    let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
-    for index in 0..TX_OUTPUTS {
-        outputs[index] = TxOutput {
-            slot_index: output_slots[index],
-            amount: 1,
-            owner: derive_address(&mk_secret(output_secret_seeds[index])),
-        };
+impl<const TIER: usize> PreparedHistoryStepTierFixture<TIER> {
+    pub fn nonce(&self) -> u128 {
+        self.nonce
     }
-    let mut body = TxBody {
-        epoch_anchor,
-        fee: 0,
-        input_owner,
-        inputs,
-        outputs,
-        validity_bitmap: 1 | output_bitmap_bit(0) | output_bitmap_bit(1),
-        is_coinbase: false,
-    };
-    let required_fee = noid_chain::consensus::fees::required_fee_for_tx_body(
-        &body,
-        pre_state.active_slot_count,
-        pre_state.state.log_slots() as u32,
-    );
-    let spendable = input_slot
-        .amount()
-        .checked_sub(required_fee)
-        .expect("four-tier fixture input covers the exact consensus fee");
-    body.fee = required_fee;
-    body.outputs[0].amount = spendable / 2;
-    body.outputs[1].amount = spendable - body.outputs[0].amount;
-    body.validate_canonical()
-        .expect("four-tier fixture canonical one-input/two-output body");
-    BenchScenario {
-        label: "accepted-four-tier-chain",
-        desc: "continuous tier-ladder Tx8x2: 1 input / 2 outputs".to_owned(),
-        body,
-        spend_secret_seed: source.spend_secret_seed,
-    }
-}
 
-fn accepted_sequential_chain_fixture(
-    seed: u128,
-    user_counts: &[usize],
-    expected_tiers: &[usize],
-    start: (
-        noid_recursive::RecursiveConsensusState,
+    pub fn start_accumulator(&self) -> &noid_recursive::ChainAccumulator {
+        &self.start_accumulator
+    }
+
+    pub fn end_accumulator(&self) -> &noid_recursive::ChainAccumulator {
+        &self.end_accumulator
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        noid_block::PreparedHistoryStepInputWitness<TIER>,
+        u128,
         noid_recursive::ChainAccumulator,
-        BlockHeader,
-        ChainState,
-        Vec<TrackedSpendable>,
-    ),
-) -> Vec<AcceptedSingleBlockFixture> {
-    assert_eq!(user_counts.len(), expected_tiers.len());
-    let (mut consensus, mut accumulator, mut parent, mut state, mut spendables) = start;
-    let mut fixtures = Vec::with_capacity(user_counts.len());
-    let mut output_slot_cursor = 0x0080_0000u32;
+        noid_recursive::ChainAccumulator,
+    ) {
+        (
+            self.witness,
+            self.nonce,
+            self.start_accumulator,
+            self.end_accumulator,
+        )
+    }
 
-    for (block_index, &user_count) in user_counts.iter().enumerate() {
-        assert!(
-            spendables.len() >= user_count,
-            "preceding accepted outputs must fund the next proof tier"
-        );
-        assert_eq!(
-            noid_chain::consensus::params::user_tx_class_tier(user_count),
-            Some(expected_tiers[block_index])
-        );
+    fn into_history_step_input(
+        self,
+    ) -> Result<noid_recursive::HistoryStepBlockInput<TIER>, String> {
+        let (witness, nonce, start, end) = self.into_parts();
+        witness
+            .finish(nonce, &start, &end)
+            .map(|(_, input)| input)
+            .map_err(|error| format!("finish honest B{TIER} HistoryStep witness: {error}"))
+    }
+}
 
-        let mut scenarios = Vec::with_capacity(user_count);
-        let mut next_user_spendables = Vec::with_capacity(user_count * TX_OUTPUTS);
-        for (tx_index, source) in spendables.iter().take(user_count).enumerate() {
-            let mut output_slots = [0u32; TX_OUTPUTS];
-            for output_slot in &mut output_slots {
-                while state.state.slot(output_slot_cursor) != SlotValue::EMPTY {
-                    output_slot_cursor = output_slot_cursor
-                        .checked_add(1)
-                        .expect("four-tier fixture output slot space");
-                }
-                *output_slot = output_slot_cursor;
-                output_slot_cursor = output_slot_cursor
-                    .checked_add(1)
-                    .expect("four-tier fixture output slot space");
-            }
-            let output_secret_seeds = std::array::from_fn(|output_index| {
-                seed.wrapping_add(0x2000_0000)
-                    .wrapping_add((block_index as u128) << 20)
-                    .wrapping_add((tx_index as u128) << 4)
-                    .wrapping_add(output_index as u128)
-            });
-            scenarios.push(sequential_chain_user_scenario(
-                source,
-                &state,
-                accumulator.epoch_anchor_id,
-                output_slots,
-                output_secret_seeds,
-            ));
-            next_user_spendables.extend((0..TX_OUTPUTS).map(|output_index| TrackedSpendable {
-                slot_index: output_slots[output_index],
-                spend_secret_seed: output_secret_seeds[output_index],
-            }));
+/// Heterogeneous streaming item used while the freezer proves the backbone.
+pub enum PreparedHistoryStepBackboneInput {
+    B8(PreparedHistoryStepTierFixture<8>),
+    B32(PreparedHistoryStepTierFixture<32>),
+    B64(PreparedHistoryStepTierFixture<64>),
+    B255(PreparedHistoryStepTierFixture<255>),
+}
+
+/// One backbone item and the parent-tier checkpoint established after it.
+pub struct HonestHistoryStepBackboneStep {
+    pub input: PreparedHistoryStepBackboneInput,
+    pub capture_parent_slot: Option<usize>,
+}
+
+struct BuiltFixtureChild<const TIER: usize> {
+    prepared: PreparedHistoryStepTierFixture<TIER>,
+    sealed_block: noid_chain::Block,
+    next_spendables: Vec<TrackedSpendable>,
+    next_output_slot_cursor: u32,
+}
+
+/// Deterministic, resettable source of real release-freezer witnesses.
+///
+/// A pass first streams the canonical-genesis backbone. Once all four parent
+/// checkpoints exist, each class method forks a real child from the exact
+/// checkpoint selected by `class_id.parent_slot()`. Only the currently
+/// requested witness is materialized.
+pub struct HonestHistoryStepFixtureProvider {
+    seed: u128,
+    ghost: noid_recursive::PreparedHistoryStepGhostAuthorization,
+    authorization_proofs:
+        std::cell::RefCell<std::collections::HashMap<TxBodyHash, ZkAuthorizationProof>>,
+    mined_nonces: std::cell::RefCell<std::collections::HashMap<[u8; 32], u128>>,
+    backbone_index: usize,
+    live: HistoryStepFixtureCheckpoint,
+    checkpoints: [Option<HistoryStepFixtureCheckpoint>; 4],
+}
+
+impl HonestHistoryStepFixtureProvider {
+    pub fn new(seed: u128) -> Result<Self, String> {
+        let ghost = noid_gkr::ghost_tx::prove_selected_ghost_authorization()
+            .map_err(|error| format!("prove canonical ghost authorization: {error}"))?;
+        let ghost = noid_recursive::prepare_history_step_ghost_authorization(ghost)
+            .map_err(|error| format!("prepare canonical ghost authorization: {error}"))?;
+        let live = genesis_fixture_checkpoint();
+        Ok(Self {
+            seed,
+            ghost,
+            authorization_proofs: std::cell::RefCell::new(std::collections::HashMap::new()),
+            mined_nonces: std::cell::RefCell::new(std::collections::HashMap::new()),
+            backbone_index: 0,
+            live,
+            checkpoints: std::array::from_fn(|_| None),
+        })
+    }
+
+    /// Start a fresh deterministic freezer pass at the canonical genesis
+    /// boundary. This drops all previous state checkpoints and witnesses.
+    pub fn reset_backbone(&mut self) {
+        self.backbone_index = 0;
+        self.live = genesis_fixture_checkpoint();
+        self.checkpoints = std::array::from_fn(|_| None);
+    }
+
+    pub fn next_backbone(
+        &mut self,
+        expected_start: &noid_recursive::ChainAccumulator,
+    ) -> Result<Option<HonestHistoryStepBackboneStep>, String> {
+        if self.backbone_index == HISTORY_STEP_FREEZER_BACKBONE_USER_COUNTS.len() {
+            return Ok(None);
+        }
+        if &self.live.start_accumulator != expected_start {
+            return Err("freezer backbone start does not match the honest native boundary".into());
         }
 
-        let timestamp = parent
+        let step = self.backbone_index;
+        let user_count = HISTORY_STEP_FREEZER_BACKBONE_USER_COUNTS[step];
+        let capture_parent_slot = match step {
+            9 => Some(0),
+            10 => Some(1),
+            11 => Some(2),
+            12 => Some(3),
+            _ => None,
+        };
+        let input = match noid_chain::consensus::params::user_tx_class_tier(user_count) {
+            Some(8) => self
+                .build_child::<8>(user_count, step as u128)?
+                .map_into(&mut self.live)?,
+            Some(32) => self
+                .build_child::<32>(user_count, step as u128)?
+                .map_into(&mut self.live)?,
+            Some(64) => self
+                .build_child::<64>(user_count, step as u128)?
+                .map_into(&mut self.live)?,
+            Some(255) => self
+                .build_child::<255>(user_count, step as u128)?
+                .map_into(&mut self.live)?,
+            _ => return Err("backbone user count does not select a canonical tier".into()),
+        };
+
+        self.backbone_index += 1;
+        if let Some(parent_slot) = capture_parent_slot {
+            self.checkpoints[parent_slot] = Some(self.live.clone());
+        }
+        Ok(Some(HonestHistoryStepBackboneStep {
+            input,
+            capture_parent_slot,
+        }))
+    }
+
+    pub fn b8(
+        &self,
+        class_id: noid_recursive::CanonicalHistoryStepClassId,
+        expected_start: &noid_recursive::ChainAccumulator,
+    ) -> Result<PreparedHistoryStepTierFixture<8>, String> {
+        self.fork::<8>(
+            class_id,
+            expected_start,
+            HISTORY_STEP_FREEZER_FORK_USER_COUNTS[0],
+        )
+    }
+
+    pub fn b32(
+        &self,
+        class_id: noid_recursive::CanonicalHistoryStepClassId,
+        expected_start: &noid_recursive::ChainAccumulator,
+    ) -> Result<PreparedHistoryStepTierFixture<32>, String> {
+        self.fork::<32>(
+            class_id,
+            expected_start,
+            HISTORY_STEP_FREEZER_FORK_USER_COUNTS[1],
+        )
+    }
+
+    pub fn b64(
+        &self,
+        class_id: noid_recursive::CanonicalHistoryStepClassId,
+        expected_start: &noid_recursive::ChainAccumulator,
+    ) -> Result<PreparedHistoryStepTierFixture<64>, String> {
+        self.fork::<64>(
+            class_id,
+            expected_start,
+            HISTORY_STEP_FREEZER_FORK_USER_COUNTS[2],
+        )
+    }
+
+    pub fn b255(
+        &self,
+        class_id: noid_recursive::CanonicalHistoryStepClassId,
+        expected_start: &noid_recursive::ChainAccumulator,
+    ) -> Result<PreparedHistoryStepTierFixture<255>, String> {
+        self.fork::<255>(
+            class_id,
+            expected_start,
+            HISTORY_STEP_FREEZER_FORK_USER_COUNTS[3],
+        )
+    }
+
+    pub fn parent_accumulator(
+        &self,
+        parent_slot: usize,
+    ) -> Option<&noid_recursive::ChainAccumulator> {
+        self.checkpoints
+            .get(parent_slot)?
+            .as_ref()
+            .map(|checkpoint| &checkpoint.start_accumulator)
+    }
+
+    fn fork<const TIER: usize>(
+        &self,
+        class_id: noid_recursive::CanonicalHistoryStepClassId,
+        expected_start: &noid_recursive::ChainAccumulator,
+        user_count: usize,
+    ) -> Result<PreparedHistoryStepTierFixture<TIER>, String> {
+        if class_id.current_tier() != TIER {
+            return Err(format!(
+                "class {} selects B{}, not requested B{TIER}",
+                class_id.index(),
+                class_id.current_tier(),
+            ));
+        }
+        let checkpoint = self.checkpoints[class_id.parent_slot()]
+            .as_ref()
+            .ok_or_else(|| format!("parent checkpoint {} is not built", class_id.parent_slot()))?;
+        if &checkpoint.start_accumulator != expected_start {
+            return Err(format!(
+                "class {} start does not match parent checkpoint {}",
+                class_id.index(),
+                class_id.parent_slot(),
+            ));
+        }
+        self.build_child_from::<TIER>(checkpoint, user_count, 0x1000 + class_id.index() as u128)
+            .map(|child| child.prepared)
+    }
+
+    fn build_child<const TIER: usize>(
+        &self,
+        user_count: usize,
+        nonce_domain: u128,
+    ) -> Result<BuiltFixtureChild<TIER>, String> {
+        self.build_child_from::<TIER>(&self.live, user_count, nonce_domain)
+    }
+
+    fn build_child_from<const TIER: usize>(
+        &self,
+        checkpoint: &HistoryStepFixtureCheckpoint,
+        user_count: usize,
+        nonce_domain: u128,
+    ) -> Result<BuiltFixtureChild<TIER>, String> {
+        if noid_chain::consensus::params::user_tx_class_tier(user_count) != Some(TIER) {
+            return Err(format!("{user_count} users do not select B{TIER}"));
+        }
+        let (candidates, authorities, next_user_spendables, next_output_slot_cursor) =
+            child_user_transactions(checkpoint, user_count, self.seed, nonce_domain)?;
+        let timestamp = checkpoint
+            .parent_header
             .timestamp
             .checked_add(noid_chain::consensus::params::BLOCK_TIME)
-            .expect("four-tier child timestamp");
+            .ok_or_else(|| "fixture timestamp overflow".to_owned())?;
         let target = noid_chain::consensus::next_target(
-            consensus.asert_anchor_height,
-            consensus.asert_anchor_timestamp,
-            &consensus.asert_anchor_target,
-            parent.height + 1,
+            checkpoint.asert_anchor.anchor_height,
+            checkpoint.asert_anchor.anchor_timestamp,
+            &checkpoint.asert_anchor.anchor_target,
+            checkpoint.parent_header.height + 1,
             timestamp,
         );
-        let miner_secret_seed = seed
+        let miner_seed = self
+            .seed
             .wrapping_add(0x3000_0000)
-            .wrapping_add(block_index as u128);
-        let miner_secret = mk_secret(miner_secret_seed);
-        // The canonical-chain fixture simulates a FULLY PROVEN history: every
-        // block attests coverage up to its parent (the value a live prover
-        // ladder supplies), so coinbase spends mature exactly as they would
-        // on a healthy production chain instead of being template-gated.
-        let template = noid_chain::consensus::build_block_template_with_coverage(
-            &parent,
-            &state,
-            consensus.active_counts(),
-            scenarios
-                .iter()
-                .map(|scenario| Transaction::new(scenario.body.clone()))
-                .collect(),
-            derive_address(&miner_secret),
+            .wrapping_add(nonce_domain << 12)
+            .wrapping_add(checkpoint.parent_header.height as u128);
+        let template = noid_chain::consensus::build_block_template(
+            &checkpoint.parent_header,
+            &checkpoint.parent_state,
+            &checkpoint.previous_active_counts,
+            candidates,
+            derive_address(&mk_secret(miner_seed)),
             timestamp,
             target,
-            parent.height.max(parent.attested_coverage),
         )
-        .expect("four-tier canonical block template");
-        assert_eq!(
-            template.txs.len(),
-            user_count,
-            "canonical template must retain every tier transaction"
-        );
+        .map_err(|error| format!("build honest B{TIER} template: {error:?}"))?;
+        if template.txs.len() != user_count {
+            return Err(format!(
+                "honest B{TIER} template retained {} of {user_count} users",
+                template.txs.len(),
+            ));
+        }
+        let authorization_proofs = template
+            .txs
+            .iter()
+            .map(|transaction| -> Result<ZkAuthorizationProof, String> {
+                let seed = authorities
+                    .iter()
+                    .find_map(|(txid, seed)| (txid == &transaction.txid()).then_some(*seed))
+                    .ok_or_else(|| "ordered template lost its wallet authority".to_owned())?;
+                let cached_proof = {
+                    self.authorization_proofs
+                        .borrow()
+                        .get(&transaction.txid())
+                        .cloned()
+                };
+                if let Some(proof) = cached_proof {
+                    return Ok(proof);
+                }
+                let proof = prove_wallet_authorization(
+                    &transaction.body,
+                    OwnerAuthWitness::new(mk_secret(seed)),
+                )
+                .map(|bundle| bundle.proof)
+                .map_err(|error| format!("prove honest wallet authorization: {error}"))?;
+                self.authorization_proofs
+                    .borrow_mut()
+                    .insert(transaction.txid(), proof.clone());
+                Ok(proof)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
-        let transactions = template.all_txs();
-        let (block_proof_bytes, block_auth_sidecar_bytes) = if user_count == 0 {
-            (Vec::new(), Vec::new())
+        let block = template.into_block(0);
+        let nonce_key = noid_chain::hash_block_header(&block.header);
+        let cached_nonce = { self.mined_nonces.borrow().get(&nonce_key).copied() };
+        let nonce = if let Some(nonce) = cached_nonce {
+            nonce
         } else {
-            let tx_auth = template
-                .txs
-                .iter()
-                .map(|transaction| {
-                    let scenario = scenarios
-                        .iter()
-                        .find(|scenario| scenario.body.txid() == transaction.txid())
-                        .expect("template transaction maps to its tracked authority")
-                        .clone();
-                    minimal_tx_fixture(scenario).auth_proof
-                })
-                .collect();
-            let all_bodies: Vec<_> = transactions
-                .iter()
-                .map(|transaction| transaction.body.clone())
-                .collect();
-            let commitments: Vec<_> = all_bodies.iter().map(TxBody::claims_commitment).collect();
-            let exact_surface = noid_chain::build_exact_action_surface(
-                &state.state,
-                &all_bodies,
-                &commitments,
-                state.alloc_counter,
-                template.height,
-            )
-            .expect("sequential fixture exact action surface");
-            let exact_cache = state
-                .state
-                .exact_sparse_cache()
-                .expect("sequential fixture sparse pre-state cache");
-            let exact_state_transition =
-                build_exact_state_transition_proof(&exact_cache, &exact_surface)
-                    .expect("sequential fixture exact state transition proof");
-            let new_leaf_hashes: Vec<_> = exact_surface
-                .new_slots
-                .iter()
-                .copied()
-                .map(slot_leaf_hash)
-                .collect();
-            let child_root = reconstruct_root(
-                &exact_surface.touched_indices,
-                &new_leaf_hashes,
-                &exact_state_transition.slot_siblings,
-                template.log_slots,
-            )
-            .expect("sequential fixture reconstructed child root");
-            assert_eq!(child_root, template.state_root);
-            let block_proof = BlockProof::minimal(
-                state.cached_state_root(),
-                child_root,
-                user_count as u32,
-                exact_state_transition,
-            );
-            let sidecar = BlockAuthSidecar { tx_auth };
-            (
-                bincode::serialize(&block_proof)
-                    .expect("sequential fixture detached block proof bytes"),
-                sidecar
-                    .to_bytes()
-                    .expect("sequential fixture authorization sidecar bytes"),
-            )
+            let nonce = mine_history_step_fixture_header(&block.header);
+            self.mined_nonces.borrow_mut().insert(nonce_key, nonce);
+            nonce
         };
-        let mut header = template.to_pow_header(0);
-        header.nonce = mine_benchmark_header_parallel(&header);
-        let block = Block {
-            header: header.clone(),
-            transactions,
+        let mut sealed_block = block.clone();
+        sealed_block.header.nonce = nonce;
+        let end_accumulator = checkpoint
+            .start_accumulator
+            .advance(&sealed_block.header)
+            .map_err(|error| format!("advance honest B{TIER} accumulator: {error:?}"))?;
+        let context = noid_block::HistoryStepPreparationContext {
+            parent_header: &checkpoint.parent_header,
+            tx_epoch_anchor_header: &checkpoint.tx_epoch_anchor_header,
+            parent_state: &checkpoint.parent_state,
+            start_accumulator: &checkpoint.start_accumulator,
+            previous_timestamps: &checkpoint.previous_timestamps,
+            previous_active_counts: &checkpoint.previous_active_counts,
+            asert_anchor: &checkpoint.asert_anchor,
+            local_time: timestamp,
         };
-        let witness = noid_block::FullAcceptedBlockBatchWitness {
-            items: vec![noid_block::FullAcceptedBlockBatchItem {
-                block,
-                block_proof_bytes,
-                block_auth_sidecar_bytes,
-            }],
-        };
-        let (output, component_proof) = noid_block::prove_retained_full_accepted_block_batch_proof(
-            &consensus,
-            &accumulator,
-            &parent,
-            &state,
-            &witness,
+        let witness = noid_block::prepare_history_step_input_witness::<TIER>(
+            block,
+            context,
+            authorization_proofs,
+            &self.ghost,
         )
-        .expect("four-tier retained component proof");
-        assert_eq!(component_proof.exact_state.len(), 1);
-        noid_recursive::block_certificate_backend::verify_accepted_block_batch_components(
-            &consensus,
-            &accumulator,
-            &output.accepted_claim_batch.accumulator,
-            &output.proof_components.component_inputs,
-            &component_proof,
-        )
-        .expect("four-tier structural retained component verification");
+        .map_err(|error| format!("prepare honest B{TIER} HistoryStep: {error}"))?;
 
-        let next_consensus = output.accepted_claim_batch.consensus_state.clone();
-        let next_accumulator = output.accepted_claim_batch.accumulator.clone();
-        let next_state = output.end_state.clone();
-        assert_eq!(
-            next_accumulator.tip_block_id,
-            noid_chain::hash_block_header(&header)
+        let mut next_spendables = Vec::with_capacity(
+            checkpoint.spendables.len() - user_count + 1 + next_user_spendables.len(),
         );
-        assert_eq!(next_accumulator.state_root, next_state.cached_state_root());
-
-        let coinbase_output = &witness.items[0].block.transactions[0].body.outputs[0];
-        // Tracking is fixture-only bookkeeping.  Sources not selected by this
-        // block remain live in the consensus state and must remain available
-        // to a later downward/skip class transition.  Keep them first so the
-        // next block deterministically spends the oldest tracked UTXOs, then
-        // append this block's coinbase and new user outputs.
-        let mut next_spendables =
-            Vec::with_capacity(spendables.len() - user_count + 1 + next_user_spendables.len());
-        next_spendables.extend(spendables.iter().skip(user_count).cloned());
+        next_spendables.extend(checkpoint.spendables.iter().skip(user_count).cloned());
+        let coinbase_slot = sealed_block.transactions[0]
+            .body
+            .live_outputs()
+            .next()
+            .ok_or_else(|| "honest coinbase has no live output".to_owned())?
+            .1
+            .slot_index;
         next_spendables.push(TrackedSpendable {
-            slot_index: coinbase_output.slot_index,
-            spend_secret_seed: miner_secret_seed,
+            slot_index: coinbase_slot,
+            spend_secret_seed: miner_seed,
         });
         next_spendables.extend(next_user_spendables);
-        for tracked in &next_spendables {
-            let slot = next_state.state.slot(tracked.slot_index);
-            let tracked_secret = tracked.spend_secret();
-            assert_eq!(
-                slot,
-                SlotValue::with_owner_fields(
-                    slot.amount(),
-                    slot.creation_id(),
-                    derive_address(&tracked_secret).as_fields(),
-                ),
-                "accepted end state must retain each tracked output authority"
-            );
-        }
 
-        fixtures.push(AcceptedSingleBlockFixture {
-            start_consensus: consensus,
-            start_accumulator: accumulator,
-            parent,
-            pre_state: state,
-            witness,
-            output,
-            component_proof,
-        });
-        consensus = next_consensus;
-        accumulator = next_accumulator;
-        parent = header;
-        state = next_state;
-        spendables = next_spendables;
+        Ok(BuiltFixtureChild {
+            prepared: PreparedHistoryStepTierFixture {
+                witness,
+                nonce,
+                start_accumulator: checkpoint.start_accumulator.clone(),
+                end_accumulator,
+            },
+            sealed_block,
+            next_spendables,
+            next_output_slot_cursor,
+        })
+    }
+}
+
+impl noid_recursive::HistoryStepFreezeInputProvider for HonestHistoryStepFixtureProvider {
+    type Error = String;
+
+    fn reset_backbone(&mut self) -> Result<(), Self::Error> {
+        HonestHistoryStepFixtureProvider::reset_backbone(self);
+        Ok(())
     }
 
-    fixtures
+    fn next_backbone(
+        &mut self,
+        expected_start: &noid_recursive::ChainAccumulator,
+    ) -> Result<Option<noid_recursive::HistoryStepFreezeInput>, Self::Error> {
+        HonestHistoryStepFixtureProvider::next_backbone(self, expected_start)?
+            .map(|step| match step.input {
+                PreparedHistoryStepBackboneInput::B8(input) => input
+                    .into_history_step_input()
+                    .map(noid_recursive::HistoryStepFreezeInput::B8),
+                PreparedHistoryStepBackboneInput::B32(input) => input
+                    .into_history_step_input()
+                    .map(noid_recursive::HistoryStepFreezeInput::B32),
+                PreparedHistoryStepBackboneInput::B64(input) => input
+                    .into_history_step_input()
+                    .map(noid_recursive::HistoryStepFreezeInput::B64),
+                PreparedHistoryStepBackboneInput::B255(input) => input
+                    .into_history_step_input()
+                    .map(noid_recursive::HistoryStepFreezeInput::B255),
+            })
+            .transpose()
+    }
+
+    fn b8(
+        &mut self,
+        class: noid_recursive::CanonicalHistoryStepClassId,
+        expected_start: &noid_recursive::ChainAccumulator,
+    ) -> Result<noid_recursive::HistoryStepBlockInput<8>, Self::Error> {
+        HonestHistoryStepFixtureProvider::b8(self, class, expected_start)?.into_history_step_input()
+    }
+
+    fn b32(
+        &mut self,
+        class: noid_recursive::CanonicalHistoryStepClassId,
+        expected_start: &noid_recursive::ChainAccumulator,
+    ) -> Result<noid_recursive::HistoryStepBlockInput<32>, Self::Error> {
+        HonestHistoryStepFixtureProvider::b32(self, class, expected_start)?
+            .into_history_step_input()
+    }
+
+    fn b64(
+        &mut self,
+        class: noid_recursive::CanonicalHistoryStepClassId,
+        expected_start: &noid_recursive::ChainAccumulator,
+    ) -> Result<noid_recursive::HistoryStepBlockInput<64>, Self::Error> {
+        HonestHistoryStepFixtureProvider::b64(self, class, expected_start)?
+            .into_history_step_input()
+    }
+
+    fn b255(
+        &mut self,
+        class: noid_recursive::CanonicalHistoryStepClassId,
+        expected_start: &noid_recursive::ChainAccumulator,
+    ) -> Result<noid_recursive::HistoryStepBlockInput<255>, Self::Error> {
+        HonestHistoryStepFixtureProvider::b255(self, class, expected_start)?
+            .into_history_step_input()
+    }
 }
 
-/// Four consecutive accepted and retained-proof-backed user blocks selecting
-/// the complete production proof ladder B8 -> B32 -> B64 -> B255.
-///
-/// The live user counts are `[8, 17, 33, 65]`. Every user spends one output of
-/// the preceding state and creates two outputs; the preceding coinbase is also
-/// tracked, which supplies the seventeenth input at the first tier boundary.
-/// Amounts and creation IDs are always read back from the actual preceding
-/// `end_state`, never predicted by the fixture.
-pub fn accepted_four_tier_chain_fixture(seed: u128) -> [AcceptedSingleBlockFixture; 4] {
-    const USER_COUNTS: [usize; 4] = [8, 17, 33, 65];
-    const EXPECTED_TIERS: [usize; 4] = [8, 32, 64, 255];
-
-    accepted_sequential_chain_fixture(
-        seed,
-        &USER_COUNTS,
-        &EXPECTED_TIERS,
-        four_tier_chain_start(seed),
-    )
-    .try_into()
-    .unwrap_or_else(|_| unreachable!("exactly four tier fixtures were built"))
+trait AdvanceHonestBackbone {
+    fn map_into(
+        self,
+        live: &mut HistoryStepFixtureCheckpoint,
+    ) -> Result<PreparedHistoryStepBackboneInput, String>;
 }
 
-/// Honest canonical-genesis ladder fixture. The first item is a coinbase-only
-/// child of the real genesis boundary. Tracking that miner output and every
-/// later user output gives the tracked-pool recurrence
-/// `1 -> 3 -> 7 -> 15 -> 24 -> 42 -> 76 -> 142`, leaving unspent accepted
-/// outputs available for later downward and skipped class transitions.
-pub fn accepted_canonical_ladder_chain_fixture(seed: u128) -> [AcceptedSingleBlockFixture; 8] {
-    const USER_COUNTS: [usize; 8] = [0, 1, 3, 7, 8, 17, 33, 65];
-    const EXPECTED_TIERS: [usize; 8] = [8, 8, 8, 8, 8, 32, 64, 255];
-
-    accepted_sequential_chain_fixture(
-        seed,
-        &USER_COUNTS,
-        &EXPECTED_TIERS,
-        canonical_ladder_chain_start(),
-    )
-    .try_into()
-    .unwrap_or_else(|_| unreachable!("exactly eight canonical ladder fixtures were built"))
+macro_rules! impl_advance_honest_backbone {
+    ($tier:literal, $variant:ident) => {
+        impl AdvanceHonestBackbone for BuiltFixtureChild<$tier> {
+            fn map_into(
+                self,
+                live: &mut HistoryStepFixtureCheckpoint,
+            ) -> Result<PreparedHistoryStepBackboneInput, String> {
+                let Self {
+                    prepared,
+                    sealed_block,
+                    next_spendables,
+                    next_output_slot_cursor,
+                } = self;
+                noid_chain::consensus::validate_block_checks(
+                    &sealed_block,
+                    &live.parent_header,
+                    &live.previous_timestamps,
+                    &live.previous_active_counts,
+                    sealed_block.header.timestamp,
+                    &live.asert_anchor,
+                )
+                .map_err(|error| format!("validate honest B{} backbone: {error}", $tier))?;
+                noid_chain::materialize_accepted_block_state(&mut live.parent_state, &sealed_block)
+                    .map_err(|error| {
+                        format!("materialize honest B{} backbone: {error:?}", $tier)
+                    })?;
+                if live.parent_state.cached_state_root() != sealed_block.header.state_root {
+                    return Err(format!("honest B{} state root did not materialize", $tier));
+                }
+                live.previous_timestamps.push(sealed_block.header.timestamp);
+                live.previous_active_counts
+                    .push(sealed_block.header.active_slot_count);
+                live.start_accumulator = prepared.end_accumulator.clone();
+                live.parent_header = sealed_block.header;
+                live.spendables = next_spendables;
+                live.output_slot_cursor = next_output_slot_cursor;
+                Ok(PreparedHistoryStepBackboneInput::$variant(prepared))
+            }
+        }
+    };
 }
 
-/// Honest canonical-genesis ladder extended through the saturated Stage-5
-/// maximum.  After first entering B255 at 65 user transactions, the chain
-/// remains continuous through 131 and finally all 255 production user slots.
-/// Retaining unspent accepted sources gives pool sizes `142 -> 274 -> 530`,
-/// so both saturated steps are funded entirely by live UTXOs in the direct
-/// predecessor state.
-pub fn accepted_canonical_saturated_ladder_chain_fixture(
+impl_advance_honest_backbone!(8, B8);
+impl_advance_honest_backbone!(32, B32);
+impl_advance_honest_backbone!(64, B64);
+impl_advance_honest_backbone!(255, B255);
+
+fn genesis_fixture_checkpoint() -> HistoryStepFixtureCheckpoint {
+    let genesis = noid_chain::consensus::genesis_header();
+    let state = noid_chain::state::ChainState::with_log_slots(genesis.log_slots as usize);
+    assert_eq!(state.cached_state_root(), genesis.state_root);
+    HistoryStepFixtureCheckpoint {
+        parent_header: genesis,
+        tx_epoch_anchor_header: genesis,
+        parent_state: state,
+        start_accumulator: noid_recursive::genesis_accumulator(),
+        previous_timestamps: vec![genesis.timestamp],
+        previous_active_counts: vec![genesis.active_slot_count],
+        asert_anchor: noid_chain::consensus::AnchorInfo {
+            anchor_height: genesis.height,
+            anchor_timestamp: genesis.timestamp,
+            anchor_target: genesis.difficulty_target,
+        },
+        spendables: Vec::new(),
+        output_slot_cursor: 1 << (BENCH_LOG_SLOTS - 1),
+    }
+}
+
+fn child_user_transactions(
+    checkpoint: &HistoryStepFixtureCheckpoint,
+    user_count: usize,
     seed: u128,
-) -> [AcceptedSingleBlockFixture; 10] {
-    const USER_COUNTS: [usize; 10] = [0, 1, 3, 7, 8, 17, 33, 65, 131, 255];
-    const EXPECTED_TIERS: [usize; 10] = [8, 8, 8, 8, 8, 32, 64, 255, 255, 255];
+    nonce_domain: u128,
+) -> Result<
+    (
+        Vec<Transaction>,
+        Vec<(TxBodyHash, u128)>,
+        Vec<TrackedSpendable>,
+        u32,
+    ),
+    String,
+> {
+    if checkpoint.spendables.len() < user_count {
+        return Err(format!(
+            "honest parent has {} spendables, needs {user_count}",
+            checkpoint.spendables.len(),
+        ));
+    }
+    let mut output_slot_cursor = checkpoint.output_slot_cursor;
+    let mut reserved = std::collections::BTreeSet::new();
+    let mut transactions = Vec::with_capacity(user_count);
+    let mut authorities = Vec::with_capacity(user_count);
+    let mut next_spendables = Vec::with_capacity(user_count * TX_OUTPUTS);
 
-    accepted_sequential_chain_fixture(
-        seed,
-        &USER_COUNTS,
-        &EXPECTED_TIERS,
-        canonical_ladder_chain_start(),
-    )
-    .try_into()
-    .unwrap_or_else(|_| unreachable!("exactly ten saturated ladder fixtures were built"))
-}
-
-/// Honest arbitrary-class-transition fixture after the complete 255-user
-/// Stage-5 saturation point.
-///
-/// The final suffix selects `B8, B255, B32, B64`, exercising the representative
-/// transitions `B255 -> B8` (full downward), `B8 -> B255` (full skipped
-/// upward), `B255 -> B32` (skipped downward), and `B32 -> B64` (ordinary
-/// upward) without resetting consensus, state, accumulator, or tracked UTXOs.
-pub fn accepted_canonical_ladder_transition_chain_fixture(
-    seed: u128,
-) -> [AcceptedSingleBlockFixture; 14] {
-    const USER_COUNTS: [usize; 14] = [0, 1, 3, 7, 8, 17, 33, 65, 131, 255, 8, 65, 17, 33];
-    const EXPECTED_TIERS: [usize; 14] = [8, 8, 8, 8, 8, 32, 64, 255, 255, 255, 8, 255, 32, 64];
-
-    accepted_sequential_chain_fixture(
-        seed,
-        &USER_COUNTS,
-        &EXPECTED_TIERS,
-        canonical_ladder_chain_start(),
-    )
-    .try_into()
-    .unwrap_or_else(|_| unreachable!("exactly fourteen transition fixtures were built"))
-}
-
-/// Complete 255-real Stage-3 truth fixture.
-pub fn accepted_b255_truth_fixture(seed: u128) -> AcceptedNativeBlockFixture {
-    accepted_user_block_fixture(b255_saturation_scenarios("accepted-b255-truth", seed))
-}
-
-/// Opt-in retained component proof over the complete B255 truth fixture.
-pub fn accepted_b255_proved_truth_fixture(seed: u128) -> AcceptedSingleBlockFixture {
-    accepted_proved_user_block_fixture(b255_saturation_scenarios(
-        "accepted-b255-proved-truth",
-        seed,
+    for (tx_index, source) in checkpoint.spendables.iter().take(user_count).enumerate() {
+        let slot = checkpoint.parent_state.state.slot(source.slot_index);
+        if slot.is_empty() {
+            return Err("tracked honest input is not live".into());
+        }
+        let spend_secret = source.spend_secret();
+        let owner = derive_address(&spend_secret);
+        if [slot.owner_hi, slot.owner_lo] != owner.as_fields() {
+            return Err("tracked honest input owner does not match its wallet secret".into());
+        }
+        let mut output_slots = [0u32; TX_OUTPUTS];
+        for output_slot in &mut output_slots {
+            while checkpoint.parent_state.state.slot(output_slot_cursor)
+                != noid_chain::SlotValue::EMPTY
+                || reserved.contains(&output_slot_cursor)
+            {
+                output_slot_cursor = output_slot_cursor
+                    .checked_add(1)
+                    .ok_or_else(|| "honest fixture output slot overflow".to_owned())?;
+            }
+            *output_slot = output_slot_cursor;
+            reserved.insert(output_slot_cursor);
+            output_slot_cursor = output_slot_cursor
+                .checked_add(1)
+                .ok_or_else(|| "honest fixture output slot overflow".to_owned())?;
+        }
+        let output_seeds: [u128; TX_OUTPUTS] = std::array::from_fn(|output_index| {
+            seed.wrapping_add(0x2000_0000)
+                .wrapping_add(nonce_domain << 20)
+                .wrapping_add((tx_index as u128) << 4)
+                .wrapping_add(output_index as u128)
+        });
+        let mut inputs = [TxInput::dummy(); TX_INPUTS];
+        inputs[0] = TxInput {
+            slot_index: source.slot_index,
+            amount: slot.amount(),
+            creation_id: slot.creation_id(),
+        };
+        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        for index in 0..TX_OUTPUTS {
+            outputs[index] = TxOutput {
+                slot_index: output_slots[index],
+                amount: 1,
+                owner: derive_address(&mk_secret(output_seeds[index])),
+            };
+        }
+        let mut body = TxBody {
+            epoch_anchor: checkpoint.start_accumulator.epoch_anchor_id,
+            fee: 0,
+            input_owner: owner,
+            inputs,
+            outputs,
+            validity_bitmap: 1 | output_bitmap_bit(0) | output_bitmap_bit(1),
+            is_coinbase: false,
+        };
+        body.fee = noid_chain::consensus::fees::required_fee_for_tx_body(
+            &body,
+            checkpoint.parent_state.active_slot_count,
+            checkpoint.parent_header.log_slots,
+        );
+        let spendable = slot
+            .amount()
+            .checked_sub(body.fee)
+            .ok_or_else(|| "honest input does not cover the consensus fee".to_owned())?;
+        body.outputs[0].amount = spendable / 2;
+        body.outputs[1].amount = spendable - body.outputs[0].amount;
+        body.validate_canonical()
+            .map_err(|error| format!("honest Tx8x2 body: {error}"))?;
+        let txid = body.txid();
+        authorities.push((txid, source.spend_secret_seed));
+        transactions.push(Transaction::new(body));
+        next_spendables.extend((0..TX_OUTPUTS).map(|index| TrackedSpendable {
+            slot_index: output_slots[index],
+            spend_secret_seed: output_seeds[index],
+        }));
+    }
+    Ok((
+        transactions,
+        authorities,
+        next_spendables,
+        output_slot_cursor,
     ))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::{BTreeSet, HashSet};
+fn mine_history_step_fixture_header(header: &noid_chain::BlockHeader) -> u128 {
+    use rayon::prelude::*;
 
-    /// This fixture produces four retained component proofs (including B255
-    /// class selection) and is intentionally opt-in for ordinary unit runs.
-    #[test]
-    #[ignore = "heavy continuous B8/B32/B64/B255 retained-proof fixture"]
-    fn accepted_four_tier_chain_is_continuous_and_structural() {
-        const EXPECTED_COUNTS: [usize; 4] = [8, 17, 33, 65];
-        const EXPECTED_TIERS: [usize; 4] = [8, 32, 64, 255];
-
-        let fixtures = accepted_four_tier_chain_fixture(0x4C41_4444_4552);
-        for (index, fixture) in fixtures.iter().enumerate() {
-            let block = &fixture.witness.items[0].block;
-            let user_count = block.transactions.len() - 1;
-            assert_eq!(user_count, EXPECTED_COUNTS[index]);
-            assert_eq!(
-                noid_chain::consensus::params::user_tx_class_tier(user_count),
-                Some(EXPECTED_TIERS[index])
-            );
-            assert_eq!(
-                block.header.prev_block_hash,
-                noid_chain::hash_block_header(&fixture.parent)
-            );
-            assert_eq!(block.header.height, fixture.parent.height + 1);
-            assert_eq!(fixture.start_accumulator.height, fixture.parent.height);
-            assert_eq!(
-                fixture.start_accumulator.tip_block_id,
-                noid_chain::hash_block_header(&fixture.parent)
-            );
-            assert_eq!(
-                fixture.start_accumulator.state_root,
-                fixture.pre_state.cached_state_root()
-            );
-            assert_eq!(
-                fixture
-                    .output
-                    .proof_components
-                    .component_inputs
-                    .exact_state_structural_inputs
-                    .len(),
-                1
-            );
-
-            if index == 0 {
-                continue;
-            }
-            let previous = &fixtures[index - 1];
-            let previous_block = &previous.witness.items[0].block;
-            assert_eq!(fixture.parent, previous_block.header);
-            assert_eq!(
-                fixture.start_consensus,
-                previous.output.accepted_claim_batch.consensus_state
-            );
-            assert_eq!(
-                fixture.start_accumulator,
-                previous.output.accepted_claim_batch.accumulator
-            );
-            assert_eq!(
-                fixture.pre_state.cached_state_root(),
-                previous.output.end_state.cached_state_root()
-            );
-            assert_eq!(
-                fixture.pre_state.active_slot_count,
-                previous.output.end_state.active_slot_count
-            );
-            assert_eq!(
-                fixture.pre_state.alloc_counter,
-                previous.output.end_state.alloc_counter
-            );
-            for transaction in &previous_block.transactions {
-                for (_, input) in transaction.body.live_inputs() {
-                    assert_eq!(
-                        fixture.pre_state.state.slot(input.slot_index),
-                        previous.output.end_state.state.slot(input.slot_index)
-                    );
-                }
-                for (_, output) in transaction.body.live_outputs() {
-                    assert_eq!(
-                        fixture.pre_state.state.slot(output.slot_index),
-                        previous.output.end_state.state.slot(output.slot_index)
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    #[ignore = "heavy canonical-genesis eight-block retained-proof ladder"]
-    fn accepted_canonical_ladder_chain_has_direct_boundaries_and_structural_state() {
-        const EXPECTED_COUNTS: [usize; 8] = [0, 1, 3, 7, 8, 17, 33, 65];
-        const EXPECTED_TIERS: [usize; 8] = [8, 8, 8, 8, 8, 32, 64, 255];
-
-        let fixtures = accepted_canonical_ladder_chain_fixture(0xC4A0_1CA1_1ADD_E2);
-        let genesis = noid_chain::consensus::genesis_header();
-        assert_eq!(fixtures[0].parent, genesis);
-        assert_eq!(
-            fixtures[0].start_accumulator,
-            noid_recursive::genesis_accumulator()
-        );
-        assert_eq!(
-            fixtures[0].start_consensus.block_id,
-            noid_chain::hash_block_header(&genesis)
-        );
-        assert_eq!(
-            fixtures[0].pre_state.cached_state_root(),
-            genesis.state_root
-        );
-
-        for (index, fixture) in fixtures.iter().enumerate() {
-            let block = &fixture.witness.items[0].block;
-            let user_count = block.transactions.len() - 1;
-            assert_eq!(user_count, EXPECTED_COUNTS[index]);
-            assert_eq!(
-                noid_chain::consensus::params::user_tx_class_tier(user_count),
-                Some(EXPECTED_TIERS[index])
-            );
-            assert_eq!(
-                block.header.prev_block_hash,
-                noid_chain::hash_block_header(&fixture.parent)
-            );
-            assert_eq!(block.header.height, fixture.parent.height + 1);
-            assert_eq!(
-                fixture
-                    .output
-                    .proof_components
-                    .component_inputs
-                    .exact_state_structural_inputs
-                    .len(),
-                1
-            );
-
-            if index == 0 {
-                assert!(fixture.witness.items[0].block_proof_bytes.is_empty());
-                assert!(fixture.witness.items[0].block_auth_sidecar_bytes.is_empty());
-                continue;
-            }
-            let previous = &fixtures[index - 1];
-            assert_eq!(fixture.parent, previous.witness.items[0].block.header);
-            assert_eq!(
-                fixture.start_consensus,
-                previous.output.accepted_claim_batch.consensus_state
-            );
-            assert_eq!(
-                fixture.start_accumulator,
-                previous.output.accepted_claim_batch.accumulator
-            );
-            assert_eq!(
-                fixture.pre_state.cached_state_root(),
-                previous.output.end_state.cached_state_root()
-            );
-            assert_eq!(
-                fixture.pre_state.active_slot_count,
-                previous.output.end_state.active_slot_count
-            );
-            assert_eq!(
-                fixture.pre_state.alloc_counter,
-                previous.output.end_state.alloc_counter
-            );
-        }
-    }
-
-    #[test]
-    #[ignore = "heavy canonical-genesis ten-block saturated retained-proof ladder"]
-    fn accepted_canonical_saturated_ladder_reaches_b255_with_direct_boundaries() {
-        const EXPECTED_COUNTS: [usize; 10] = [0, 1, 3, 7, 8, 17, 33, 65, 131, 255];
-        const EXPECTED_TIERS: [usize; 10] = [8, 8, 8, 8, 8, 32, 64, 255, 255, 255];
-
-        let fixtures = accepted_canonical_saturated_ladder_chain_fixture(0xC4A0_5A7A_2A7E_D255);
-        let genesis = noid_chain::consensus::genesis_header();
-        assert_eq!(fixtures[0].parent, genesis);
-        assert_eq!(
-            fixtures[0].start_accumulator,
-            noid_recursive::genesis_accumulator()
-        );
-        assert_eq!(
-            fixtures[0].start_consensus.block_id,
-            noid_chain::hash_block_header(&genesis)
-        );
-        assert_eq!(
-            fixtures[0].pre_state.cached_state_root(),
-            genesis.state_root
-        );
-
-        for (index, fixture) in fixtures.iter().enumerate() {
-            let block = &fixture.witness.items[0].block;
-            let user_count = block.transactions.len() - 1;
-            assert_eq!(user_count, EXPECTED_COUNTS[index]);
-            assert_eq!(
-                noid_chain::consensus::params::user_tx_class_tier(user_count),
-                Some(EXPECTED_TIERS[index])
-            );
-            assert_eq!(
-                block.header.prev_block_hash,
-                noid_chain::hash_block_header(&fixture.parent)
-            );
-            assert_eq!(block.header.height, fixture.parent.height + 1);
-            assert_eq!(fixture.start_accumulator.height, fixture.parent.height);
-            assert_eq!(
-                fixture.start_accumulator.tip_block_id,
-                noid_chain::hash_block_header(&fixture.parent)
-            );
-            assert_eq!(
-                fixture.start_accumulator.state_root,
-                fixture.pre_state.cached_state_root()
-            );
-            assert_eq!(
-                fixture.output.accepted_claim_batch.accumulator.tip_block_id,
-                noid_chain::hash_block_header(&block.header)
-            );
-            assert_eq!(
-                fixture.output.accepted_claim_batch.accumulator.state_root,
-                fixture.output.end_state.cached_state_root()
-            );
-            assert_eq!(
-                fixture.output.accepted_claim_batch.accumulator.state_root,
-                block.header.state_root
-            );
-            assert_eq!(fixture.component_proof.exact_state.len(), 1);
-            assert_eq!(
-                fixture
-                    .output
-                    .proof_components
-                    .component_inputs
-                    .exact_state_structural_inputs
-                    .len(),
-                1
-            );
-
-            if user_count == 0 {
-                assert!(fixture.witness.items[0].block_proof_bytes.is_empty());
-                assert!(fixture.witness.items[0].block_auth_sidecar_bytes.is_empty());
-            } else {
-                let proof: BlockProof =
-                    bincode::deserialize(&fixture.witness.items[0].block_proof_bytes)
-                        .expect("decode saturated-ladder detached BlockProof");
-                assert_eq!(proof.meta.n_tx, user_count as u32);
-                assert_eq!(
-                    proof.meta.prev_block_state_root,
-                    fixture.pre_state.cached_state_root()
-                );
-                assert_eq!(proof.meta.new_state_root, block.header.state_root);
-            }
-
-            if index == 0 {
-                continue;
-            }
-            let previous = &fixtures[index - 1];
-            assert_eq!(fixture.parent, previous.witness.items[0].block.header);
-            assert_eq!(
-                fixture.start_consensus,
-                previous.output.accepted_claim_batch.consensus_state
-            );
-            assert_eq!(
-                fixture.start_accumulator,
-                previous.output.accepted_claim_batch.accumulator
-            );
-            assert_eq!(
-                fixture.pre_state.cached_state_root(),
-                previous.output.end_state.cached_state_root()
-            );
-            assert_eq!(
-                fixture.pre_state.active_slot_count,
-                previous.output.end_state.active_slot_count
-            );
-            assert_eq!(
-                fixture.pre_state.alloc_counter,
-                previous.output.end_state.alloc_counter
-            );
-        }
-
-        let final_fixture = fixtures.last().expect("saturated ladder tip");
-        let final_proof: BlockProof =
-            bincode::deserialize(&final_fixture.witness.items[0].block_proof_bytes)
-                .expect("decode final saturated detached BlockProof");
-        assert_eq!(final_proof.meta.n_tx, 255);
-        assert_eq!(
-            final_proof.meta.prev_block_state_root,
-            final_fixture.pre_state.cached_state_root()
-        );
-        assert_eq!(
-            final_proof.meta.new_state_root,
-            final_fixture.witness.items[0].block.header.state_root
-        );
-    }
-
-    #[test]
-    #[ignore = "heavy canonical saturated ladder plus real class-transition suffix"]
-    fn accepted_canonical_transition_suffix_is_continuous_and_structural() {
-        const EXPECTED_COUNTS: [usize; 14] = [0, 1, 3, 7, 8, 17, 33, 65, 131, 255, 8, 65, 17, 33];
-        const EXPECTED_TIERS: [usize; 14] = [8, 8, 8, 8, 8, 32, 64, 255, 255, 255, 8, 255, 32, 64];
-
-        let fixtures = accepted_canonical_ladder_transition_chain_fixture(0xC4A0_7A4A_5171_0A55);
-        assert_eq!(fixtures[0].parent, noid_chain::consensus::genesis_header());
-        assert_eq!(
-            fixtures[0].start_accumulator,
-            noid_recursive::genesis_accumulator()
-        );
-        for (index, fixture) in fixtures.iter().enumerate() {
-            let block = &fixture.witness.items[0].block;
-            let user_count = block.transactions.len() - 1;
-            assert_eq!(user_count, EXPECTED_COUNTS[index]);
-            assert_eq!(
-                noid_chain::consensus::params::user_tx_class_tier(user_count),
-                Some(EXPECTED_TIERS[index])
-            );
-            assert_eq!(
-                block.header.prev_block_hash,
-                noid_chain::hash_block_header(&fixture.parent)
-            );
-            assert_eq!(fixture.component_proof.exact_state.len(), 1);
-            assert_eq!(
-                fixture
-                    .output
-                    .proof_components
-                    .component_inputs
-                    .exact_state_structural_inputs
-                    .len(),
-                1
-            );
-            if index > 0 {
-                let previous = &fixtures[index - 1];
-                assert_eq!(fixture.parent, previous.witness.items[0].block.header);
-                assert_eq!(
-                    fixture.start_accumulator,
-                    previous.output.accepted_claim_batch.accumulator
-                );
-                assert_eq!(
-                    fixture.pre_state.cached_state_root(),
-                    previous.output.end_state.cached_state_root()
-                );
-            }
-        }
-        assert_eq!(
-            &EXPECTED_TIERS[9..],
-            &[255, 8, 255, 32, 64],
-            "real suffix covers downward, skipped-up, skipped-down, and upward transitions",
-        );
-    }
-
-    #[test]
-    fn b255_saturation_fixture_hits_caps_and_depth24_frontier_maximum() {
-        let scenarios = b255_saturation_scenarios("b255-saturation", 0xB255_0000);
-        let coinbase = bench_coinbase_body();
-        let mut transactions = Vec::with_capacity(256);
-        transactions.push(Transaction::new(coinbase));
-        transactions.extend(
-            scenarios
-                .iter()
-                .map(|scenario| Transaction::new(scenario.body.clone())),
-        );
-        let tx_root = noid_chain::compute_tx_root(&transactions);
-        let block = Block {
-            header: BlockHeader {
-                prev_block_hash: [0u8; 32],
-                state_root: [0u8; 32],
-                tx_root,
-                timestamp: 2,
-                height: 1,
-                miner_address: Address([0xCB; 32]),
-                nonce: 0,
-                difficulty_target: [0xFF; 32],
-                log_slots: BENCH_LOG_SLOTS,
-                active_slot_count: 0,
-                alloc_counter: 0,
-                attested_coverage: 0,
-            },
-            transactions,
-        };
-        let resources = noid_chain::consensus::validate_block_resource_preflight(&block)
-            .expect("saturation fixture passes raw consensus caps");
-        assert_eq!(resources.user_tx_count, 255);
-        assert_eq!(resources.live_input_count, 1_020);
-        assert_eq!(resources.output_count, 511);
-        assert_eq!(resources.action_count, 1_531);
-        assert_eq!(resources.touched_slot_count, 1_531);
-        assert_eq!(resources.distinct_segment_count, 256);
-        assert_eq!(resources.state_frontier_node_count, 20_420);
-
-        let input_counts: Vec<_> = scenarios
-            .iter()
-            .map(|scenario| scenario.body.live_input_count())
-            .collect();
-        assert_eq!(
-            input_counts.iter().filter(|&&count| count == 8).count(),
-            B255_EIGHT_INPUT_TXS
-        );
-        assert_eq!(
-            input_counts.iter().filter(|&&count| count == 2).count(),
-            B255_TWO_INPUT_TXS
-        );
-        assert!(scenarios[B255_EIGHT_INPUT_TXS..]
-            .iter()
-            .any(|scenario| scenario.body.input_is_live(7)));
-        assert_eq!(
-            scenarios
-                .iter()
-                .map(|scenario| scenario.body.input_owner)
-                .collect::<HashSet<_>>()
-                .len(),
-            255
-        );
-
-        let creation_ids: BTreeSet<_> = scenarios
-            .iter()
-            .flat_map(|scenario| scenario.body.live_inputs())
-            .map(|(_, input)| input.creation_id)
-            .collect();
-        assert_eq!(creation_ids.len(), 1_020);
-        assert_eq!(creation_ids.first(), Some(&1));
-        assert_eq!(creation_ids.last(), Some(&1_020));
-
-        let input_slots: HashSet<_> = scenarios
-            .iter()
-            .flat_map(|scenario| scenario.body.live_inputs())
-            .map(|(_, input)| input.slot_index)
-            .collect();
-        let output_slots: HashSet<_> = scenarios
-            .iter()
-            .flat_map(|scenario| scenario.body.live_outputs())
-            .map(|(_, output)| output.slot_index)
-            .collect();
-        assert!(input_slots.contains(&65_535));
-        assert!(output_slots.contains(&65_536));
-
-        assert!(scenarios.iter().all(|scenario| {
-            noid_gkr::owner_auth_public_from_body(&scenario.body)
-                .is_ok_and(|public| public.layout == noid_gkr::OwnerAuthLayout::FIXED)
-        }));
-
-        let mut touched: Vec<_> = block
-            .transactions
-            .iter()
-            .flat_map(|tx| {
-                tx.body
-                    .live_inputs()
-                    .map(|(_, input)| input.slot_index)
-                    .chain(tx.body.live_outputs().map(|(_, output)| output.slot_index))
+    const NONCES_PER_LANE: u128 = 65_536;
+    let lanes = rayon::current_num_threads().max(1);
+    let batch_width = NONCES_PER_LANE * lanes as u128;
+    let mut batch_start = 0u128;
+    loop {
+        if let Some(nonce) = (0..lanes)
+            .into_par_iter()
+            .filter_map(|lane| {
+                noid_chain::consensus::pow::search_pow(
+                    header,
+                    batch_start + NONCES_PER_LANE * lane as u128,
+                    NONCES_PER_LANE,
+                )
             })
-            .collect();
-        touched.sort_unstable();
-        let maximum = noid_chain::sparse_merkle::maximum_sibling_count_with_segment_cap(
-            touched.len(),
-            BENCH_LOG_SLOTS,
-            noid_chain::consensus::params::LOG_SEGMENT_SIZE,
-            noid_chain::consensus::params::BLOCK_MAX_DISTINCT_SEGMENTS,
-        );
-        assert_eq!(maximum, 20_420);
-        assert_eq!(
-            noid_chain::sparse_merkle::expected_sibling_count(&touched, BENCH_LOG_SLOTS).unwrap(),
-            maximum
-        );
-    }
-
-    /// The truth replay materializes all 256 exact-state segments and is kept
-    /// out of the default unit suite. It intentionally stops before the m22+
-    /// retained component prover; that roofline has its own benchmark gate.
-    #[test]
-    #[ignore = "large B255 native accepted-block truth fixture"]
-    fn accepted_b255_truth_fixture_binds_every_production_statement() {
-        let fixture = accepted_b255_truth_fixture(0xB255_ACCE_57ED);
-        let block = &fixture.witness.items[0].block;
-        let resources = noid_chain::consensus::validate_block_resource_preflight(block)
-            .expect("accepted B255 resource preflight");
-        assert_eq!(
-            (
-                resources.user_tx_count,
-                resources.live_input_count,
-                resources.output_count,
-                resources.action_count,
-                resources.touched_slot_count,
-                resources.distinct_segment_count,
-                resources.state_frontier_node_count,
-            ),
-            (255, 1_020, 511, 1_531, 1_531, 256, 20_420)
-        );
-
-        let proof: BlockProof = bincode::deserialize(&fixture.witness.items[0].block_proof_bytes)
-            .expect("decode B255 exact proof");
-        assert_eq!(proof.meta.n_tx, 255);
-        assert_eq!(proof.meta.prev_block_state_root, fixture.parent.state_root);
-        assert_eq!(proof.meta.new_state_root, block.header.state_root);
-        assert_eq!(proof.state_transition.slot_siblings.len(), 20_420);
-        assert_eq!(
-            block.header.tx_root,
-            noid_chain::compute_tx_root(&block.transactions)
-        );
-
-        let users = &block.transactions[1..];
-        assert_eq!(users.len(), 255);
-        assert_eq!(
-            users
-                .iter()
-                .map(|tx| tx.body.input_owner)
-                .collect::<HashSet<_>>()
-                .len(),
-            255
-        );
-        assert!(users.iter().any(|tx| tx.body.input_is_live(7)));
-
-        let mut input_creation_ids = BTreeSet::new();
-        let mut input_slots = HashSet::new();
-        let mut output_slots = HashSet::new();
-        let mut output_owners = HashSet::new();
-        for tx in users {
-            for (_, input) in tx.body.live_inputs() {
-                assert!(input_creation_ids.insert(input.creation_id));
-                assert!(input_slots.insert(input.slot_index));
-                assert_eq!(
-                    fixture.pre_state.state.slot(input.slot_index),
-                    SlotValue::with_owner_fields(
-                        input.amount,
-                        input.creation_id,
-                        tx.body.input_owner.as_fields(),
-                    )
-                );
-                assert!(fixture
-                    .output
-                    .end_state
-                    .state
-                    .slot(input.slot_index)
-                    .is_empty());
-            }
-            for (_, output) in tx.body.live_outputs() {
-                assert!(output_slots.insert(output.slot_index));
-                assert!(output_owners.insert(output.owner));
-            }
-        }
-        assert_eq!(input_creation_ids.len(), 1_020);
-        assert_eq!(input_creation_ids.first(), Some(&1));
-        assert_eq!(input_creation_ids.last(), Some(&1_020));
-        assert!(input_slots.contains(&65_535));
-        assert!(output_slots.contains(&65_536));
-        assert_eq!(output_owners.len(), 510);
-
-        let mut next_creation_id = fixture.start_accumulator.alloc_counter;
-        for tx in &block.transactions {
-            for (_, output) in tx.body.live_outputs() {
-                next_creation_id += 1;
-                let minted = fixture.output.end_state.state.slot(output.slot_index);
-                assert_eq!(minted.amount(), output.amount);
-                assert_eq!(minted.creation_id(), next_creation_id);
-                assert_eq!([minted.owner_hi, minted.owner_lo], output.owner.as_fields());
-            }
-        }
-        assert_eq!(next_creation_id, 1_531);
-        assert_eq!(fixture.output.end_state.active_slot_count, 511);
-        assert_eq!(fixture.output.end_state.alloc_counter, 1_531);
-        assert_eq!(
-            fixture.output.end_state.cached_state_root(),
-            block.header.state_root
-        );
-
-        let component = &fixture.output.proof_components.component_inputs;
-        assert_eq!(component.tx_body_inputs.len(), 256);
-        assert_eq!(component.tx_body_hashes.len(), 256);
-        assert_eq!(component.tx_root_inputs.len(), 256);
-        assert!(component
-            .tx_root_inputs
-            .iter()
-            .all(|input| input.active_depth == noid_chain::tx_tree::TX_TREE_DEPTH));
-        assert!(
-            component.tx_root_inputs[255].directions[..noid_chain::tx_tree::TX_TREE_DEPTH]
-                .iter()
-                .all(|direction| *direction)
-        );
-        for (body, hash) in block
-            .transactions
-            .iter()
-            .map(|tx| &tx.body)
-            .zip(component.tx_body_hashes.iter())
+            .min()
         {
-            assert_eq!(*hash, body.txid().as_fields());
+            return nonce;
         }
-        assert_eq!(component.authorization_inputs.len(), 255);
-        assert_eq!(component.authorization_totals.user_tx_count, 255);
-        assert_eq!(component.authorization_totals.live_input_count_total, 1_020);
-        for (index, authorization) in component.authorization_inputs.iter().enumerate() {
-            let body = &block.transactions[index + 1].body;
-            assert_eq!(authorization.block_index, 0);
-            assert_eq!(authorization.tx_index, index + 1);
-            assert_eq!(
-                authorization.public.layout,
-                noid_gkr::OwnerAuthLayout::FIXED
-            );
-            assert_eq!(authorization.tx_body_hash, body.txid().as_fields());
-            assert_eq!(
-                authorization.public.tx_body_hash,
-                authorization.tx_body_hash
-            );
-            assert_eq!(
-                authorization.public.expected_address,
-                body.input_owner.as_fields()
-            );
-            assert_eq!(
-                usize::from(authorization.live_input_count),
-                body.live_input_count()
-            );
-        }
-        assert_eq!(component.exact_state_structural_inputs.len(), 1);
-        assert_eq!(
-            component.exact_state_structural_inputs[0]
-                .old_slot_leaves
-                .len(),
-            1_531
-        );
-        assert_eq!(
-            component.exact_state_structural_inputs[0]
-                .new_slot_leaves
-                .len(),
-            1_531
-        );
-
-        let expected_end = fixture
-            .start_accumulator
-            .advance(&block.header)
-            .expect("B255 direct accumulator transition");
-        assert_eq!(
-            expected_end,
-            fixture.output.accepted_claim_batch.accumulator
-        );
+        batch_start = batch_start
+            .checked_add(batch_width)
+            .expect("fixture PoW nonce space exhausted");
     }
 }
 
-pub fn bench_full_block_proof_minimal(fixtures: &[MinimalTxFixture]) -> FullBlockProofBench {
-    let user_bodies: Vec<_> = fixtures
-        .iter()
-        .map(|fixture| fixture.scenario.body.clone())
-        .collect();
-    let tx_auth: Vec<_> = fixtures
-        .iter()
-        .map(|fixture| fixture.auth_proof.clone())
-        .collect();
-    let (state_seed_time, pre_state) = time_once(|| seed_state_for_bodies(&user_bodies));
-    let (prove_time, (proof, block, auth_sidecar, pre_state, start_accumulator, end_accumulator)) =
-        time_once(move || prove_full_block_from_fixtures(pre_state, user_bodies, tx_auth));
-    let (verify_time, ()) = time_once(|| {
-        noid_block::validate_block_authorizations(
-            &block,
-            &auth_sidecar,
-            &noid_block::OwnerAuthAuthorizationVerifier,
-        )
-        .expect("verify block authorizations");
+#[cfg(test)]
+mod honest_history_step_fixture_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
-        let exact_bodies: Vec<_> = block
-            .transactions
-            .iter()
-            .map(|tx| tx.body.clone())
-            .collect();
-        let commitments: Vec<_> = exact_bodies.iter().map(TxBody::claims_commitment).collect();
-        let exact_surface = noid_chain::build_exact_action_surface(
-            &pre_state.state,
-            &exact_bodies,
-            &commitments,
-            pre_state.alloc_counter,
-            block.header.height,
+    const KNOWN_C00_PREFIX_PASSED: &str = "focused known-c00 prefix passed";
+
+    struct KnownC00CutoffProvider {
+        inner: HonestHistoryStepFixtureProvider,
+        resets: usize,
+        backbone_calls_per_reset: Vec<usize>,
+    }
+
+    impl noid_recursive::HistoryStepFreezeInputProvider for KnownC00CutoffProvider {
+        type Error = String;
+
+        fn reset_backbone(&mut self) -> Result<(), Self::Error> {
+            self.resets += 1;
+            // Resets 1-2 derive the provisional direct VKs, 3 assembles the
+            // provisional c00, 4 assembles c00 with its integrated direct VK,
+            // and 5 must consume the now-known c00 before discovering c04.
+            // Stop only when that complete pass has succeeded.
+            if self.resets == 6 {
+                return Err(KNOWN_C00_PREFIX_PASSED.to_owned());
+            }
+            self.inner.reset_backbone();
+            self.backbone_calls_per_reset.push(0);
+            Ok(())
+        }
+
+        fn next_backbone(
+            &mut self,
+            expected_start: &noid_recursive::ChainAccumulator,
+        ) -> Result<Option<noid_recursive::HistoryStepFreezeInput>, Self::Error> {
+            *self
+                .backbone_calls_per_reset
+                .last_mut()
+                .expect("next_backbone follows reset_backbone") += 1;
+            noid_recursive::HistoryStepFreezeInputProvider::next_backbone(
+                &mut self.inner,
+                expected_start,
+            )
+        }
+
+        fn b8(
+            &mut self,
+            class: noid_recursive::CanonicalHistoryStepClassId,
+            expected_start: &noid_recursive::ChainAccumulator,
+        ) -> Result<noid_recursive::HistoryStepBlockInput<8>, Self::Error> {
+            noid_recursive::HistoryStepFreezeInputProvider::b8(
+                &mut self.inner,
+                class,
+                expected_start,
+            )
+        }
+
+        fn b32(
+            &mut self,
+            class: noid_recursive::CanonicalHistoryStepClassId,
+            expected_start: &noid_recursive::ChainAccumulator,
+        ) -> Result<noid_recursive::HistoryStepBlockInput<32>, Self::Error> {
+            noid_recursive::HistoryStepFreezeInputProvider::b32(
+                &mut self.inner,
+                class,
+                expected_start,
+            )
+        }
+
+        fn b64(
+            &mut self,
+            class: noid_recursive::CanonicalHistoryStepClassId,
+            expected_start: &noid_recursive::ChainAccumulator,
+        ) -> Result<noid_recursive::HistoryStepBlockInput<64>, Self::Error> {
+            noid_recursive::HistoryStepFreezeInputProvider::b64(
+                &mut self.inner,
+                class,
+                expected_start,
+            )
+        }
+
+        fn b255(
+            &mut self,
+            class: noid_recursive::CanonicalHistoryStepClassId,
+            expected_start: &noid_recursive::ChainAccumulator,
+        ) -> Result<noid_recursive::HistoryStepBlockInput<255>, Self::Error> {
+            noid_recursive::HistoryStepFreezeInputProvider::b255(
+                &mut self.inner,
+                class,
+                expected_start,
+            )
+        }
+    }
+
+    #[derive(Default)]
+    struct RetainedBootstrapMatrices {
+        matrices: Mutex<Vec<Option<std::sync::Arc<noid_ivc_core::field_r1cs::FieldR1cs>>>>,
+        installs: AtomicUsize,
+        loads: AtomicUsize,
+    }
+
+    impl noid_recursive::HistoryStepMatrixSource for RetainedBootstrapMatrices {
+        fn load(
+            &self,
+            class: noid_recursive::CanonicalHistoryStepClassId,
+        ) -> Result<
+            noid_recursive::HistoryStepMatrixLease,
+            noid_recursive::HistoryStepMatrixSourceError,
+        > {
+            self.loads.fetch_add(1, Ordering::Relaxed);
+            self.matrices
+                .lock()
+                .map_err(|_| noid_recursive::HistoryStepMatrixSourceError)?
+                .get(class.index())
+                .and_then(Clone::clone)
+                .map(noid_recursive::HistoryStepMatrixLease::Resident)
+                .ok_or(noid_recursive::HistoryStepMatrixSourceError)
+        }
+    }
+
+    impl noid_recursive::HistoryStepFreezeMatrixStore for RetainedBootstrapMatrices {
+        type Error = String;
+
+        fn install(
+            &self,
+            class: noid_recursive::CanonicalHistoryStepClassId,
+            matrix: noid_ivc_core::field_r1cs::FieldR1cs,
+        ) -> Result<(), Self::Error> {
+            let mut matrices = self
+                .matrices
+                .lock()
+                .map_err(|_| "bootstrap matrix lock is poisoned".to_owned())?;
+            if matrices.is_empty() {
+                matrices.resize_with(noid_recursive::HISTORY_STEP_CLASS_COUNT, || None);
+            }
+            matrices[class.index()] = Some(std::sync::Arc::new(matrix));
+            self.installs.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct SharedRetainedBootstrapMatrices(std::sync::Arc<RetainedBootstrapMatrices>);
+
+    impl noid_recursive::HistoryStepMatrixSource for SharedRetainedBootstrapMatrices {
+        fn load(
+            &self,
+            class: noid_recursive::CanonicalHistoryStepClassId,
+        ) -> Result<
+            noid_recursive::HistoryStepMatrixLease,
+            noid_recursive::HistoryStepMatrixSourceError,
+        > {
+            noid_recursive::HistoryStepMatrixSource::load(self.0.as_ref(), class)
+        }
+    }
+
+    fn derive_focused_provisional_parts(
+        provider: &mut HonestHistoryStepFixtureProvider,
+    ) -> Result<noid_recursive::HistoryStepRuntimeParts, String> {
+        provider.reset_backbone();
+        let mut expected = noid_recursive::genesis_accumulator();
+        let mut vks: [Option<noid_recursive::region_sidecar::BlockRegionSidecarVk>; 4] =
+            std::array::from_fn(|_| None);
+
+        while vks.iter().any(Option::is_none) {
+            let step = provider
+                .next_backbone(&expected)?
+                .ok_or_else(|| "focused VK derivation exhausted the backbone".to_owned())?;
+            macro_rules! derive_vk {
+                ($fixture:expr, $slot:expr) => {{
+                    let input = $fixture.into_history_step_input()?;
+                    expected = input.end_accumulator().clone();
+                    if vks[$slot].is_none() {
+                        vks[$slot] = Some(
+                            noid_recursive::derive_history_step_direct_block_vk(input).map_err(
+                                |error| {
+                                    format!(
+                                        "derive focused B{} VK: {error}",
+                                        [8, 32, 64, 255][$slot]
+                                    )
+                                },
+                            )?,
+                        );
+                    }
+                }};
+            }
+            match step.input {
+                PreparedHistoryStepBackboneInput::B8(fixture) => derive_vk!(fixture, 0),
+                PreparedHistoryStepBackboneInput::B32(fixture) => derive_vk!(fixture, 1),
+                PreparedHistoryStepBackboneInput::B64(fixture) => derive_vk!(fixture, 2),
+                PreparedHistoryStepBackboneInput::B255(fixture) => derive_vk!(fixture, 3),
+            }
+        }
+
+        noid_recursive::derive_history_step_runtime_parts(
+            vks.map(|vk| vk.expect("all focused direct VKs were derived")),
         )
-        .expect("rebuild exact state surface");
-        let inputs = ExactStateTransitionInputs {
-            parent_state_root: proof.meta.prev_block_state_root,
-            parent_log_slots: pre_state.state.log_slots() as u32,
-            child_state_root: block.header.state_root,
-            child_log_slots: block.header.log_slots,
-            parent_active_slot_count: pre_state.active_slot_count,
-            parent_alloc_counter: pre_state.alloc_counter,
+        .map_err(|error| format!("derive focused runtime parts: {error}"))
+    }
+
+    fn focused_runtime(
+        digests: [[u8; 32]; noid_recursive::HISTORY_STEP_CLASS_COUNT],
+        parts: &noid_recursive::HistoryStepRuntimeParts,
+        store: &std::sync::Arc<RetainedBootstrapMatrices>,
+    ) -> Result<noid_recursive::HistoryStepRuntime, String> {
+        let bank = noid_recursive::pin_history_step_class_bank(digests, parts)
+            .map_err(|error| format!("pin focused bank: {error}"))?;
+        noid_recursive::HistoryStepRuntime::new(
+            bank,
+            Box::new(SharedRetainedBootstrapMatrices(std::sync::Arc::clone(
+                store,
+            ))),
+            parts.clone(),
+        )
+        .map_err(|error| format!("construct focused runtime: {error}"))
+    }
+
+    fn next_focused_b8(
+        provider: &mut HonestHistoryStepFixtureProvider,
+        expected: &noid_recursive::ChainAccumulator,
+    ) -> Result<(noid_chain::Block, noid_recursive::HistoryStepBlockInput<8>), String> {
+        let step = provider
+            .next_backbone(expected)?
+            .ok_or_else(|| "focused B8 backbone step is missing".to_owned())?;
+        let PreparedHistoryStepBackboneInput::B8(fixture) = step.input else {
+            return Err("focused backbone step does not select B8".to_owned());
         };
-        verify_exact_state_transition(&inputs, &exact_surface, &proof.state_transition)
-            .expect("verify exact state transition");
-    });
-    FullBlockProofBench {
-        state_seed_time,
-        prove_time,
-        verify_time,
-        proof_bytes: proof.byte_len(),
-        auth_sidecar_bytes: auth_sidecar.byte_len(),
-        state_transition_bytes: proof.state_transition.byte_len(),
-        proof,
-        auth_sidecar,
-        start_accumulator,
-        end_accumulator,
+        let (witness, nonce, start, end) = fixture.into_parts();
+        witness
+            .finish(nonce, &start, &end)
+            .map_err(|error| format!("finish focused B8 input: {error}"))
+    }
+
+    fn next_focused_b32(
+        provider: &mut HonestHistoryStepFixtureProvider,
+        expected: &noid_recursive::ChainAccumulator,
+    ) -> Result<(noid_chain::Block, noid_recursive::HistoryStepBlockInput<32>), String> {
+        let step = provider
+            .next_backbone(expected)?
+            .ok_or_else(|| "focused B32 backbone step is missing".to_owned())?;
+        let PreparedHistoryStepBackboneInput::B32(fixture) = step.input else {
+            return Err("focused backbone step does not select B32".to_owned());
+        };
+        let (witness, nonce, start, end) = fixture.into_parts();
+        witness
+            .finish(nonce, &start, &end)
+            .map_err(|error| format!("finish focused B32 input: {error}"))
+    }
+
+    fn replace_focused_direct_vk(
+        parts: &noid_recursive::HistoryStepRuntimeParts,
+        slot: usize,
+        vk: noid_recursive::region_sidecar::BlockRegionSidecarVk,
+    ) -> noid_recursive::HistoryStepRuntimeParts {
+        let mut direct_vks = parts.direct_block_vks().clone();
+        direct_vks[slot] = vk;
+        noid_recursive::HistoryStepRuntimeParts::new(
+            parts.parent_recursion_vk().clone(),
+            direct_vks,
+            parts.parent_transcripts().clone(),
+        )
+        .expect("focused direct VK replacement remains canonical")
+    }
+
+    fn prove_focused_b8_checkpoint(
+        runtime: &noid_recursive::HistoryStepRuntime,
+        provider: &mut HonestHistoryStepFixtureProvider,
+    ) -> noid_recursive::HistoryStepTerminal {
+        provider.reset_backbone();
+        let mut expected = noid_recursive::genesis_accumulator();
+        let mut parent = None;
+        for _ in 0..10 {
+            let (_, input) = next_focused_b8(provider, &expected).unwrap();
+            let terminal = noid_recursive::prove_history_step(runtime, parent.as_ref(), input)
+                .expect("prove focused B8 backbone step");
+            expected = terminal.accumulator().clone();
+            parent = Some(terminal);
+        }
+        parent.expect("focused B8 checkpoint exists")
+    }
+
+    fn prove_focused_b32_checkpoint(
+        runtime: &noid_recursive::HistoryStepRuntime,
+        provider: &mut HonestHistoryStepFixtureProvider,
+    ) -> noid_recursive::HistoryStepTerminal {
+        let b8 = prove_focused_b8_checkpoint(runtime, provider);
+        let (_, input) = next_focused_b32(provider, b8.accumulator()).unwrap();
+        noid_recursive::prove_history_step(runtime, Some(&b8), input)
+            .expect("prove focused B32 checkpoint")
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct FocusedBlockVkRoleGeometry {
+        role: &'static str,
+        row_count: usize,
+        slice_starts: Vec<usize>,
+        slice_lengths: Vec<usize>,
+    }
+
+    fn focused_block_vk_geometry(
+        vk: &noid_recursive::region_sidecar::BlockRegionSidecarVk,
+    ) -> Vec<FocusedBlockVkRoleGeometry> {
+        macro_rules! role {
+            ($name:literal, $child:expr) => {{
+                let child = $child;
+                FocusedBlockVkRoleGeometry {
+                    role: $name,
+                    row_count: 1usize << child.w_log(),
+                    slice_starts: child.slices().iter().map(|slice| slice.start()).collect(),
+                    slice_lengths: child.slices().iter().map(|slice| slice.len()).collect(),
+                }
+            }};
+        }
+        vec![
+            role!("wallet_a", vk.wallet_a()),
+            role!("meta_a", vk.meta_a()),
+            role!("wallet_b", vk.wallet_b()),
+            role!("meta_b", vk.meta_b()),
+            role!("owner_c", vk.owner_c()),
+            role!("main_c", vk.main_c()),
+        ]
+    }
+
+    #[test]
+    fn freezer_transaction_counts_select_the_declared_tiers() {
+        let backbone_tiers = HISTORY_STEP_FREEZER_BACKBONE_USER_COUNTS
+            .map(|count| noid_chain::consensus::params::user_tx_class_tier(count).unwrap());
+        assert_eq!(backbone_tiers, [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 32, 64, 255]);
+        let fork_tiers = HISTORY_STEP_FREEZER_FORK_USER_COUNTS
+            .map(|count| noid_chain::consensus::params::user_tx_class_tier(count).unwrap());
+        assert_eq!(fork_tiers, [8, 32, 64, 255]);
+    }
+
+    #[test]
+    #[ignore = "runs real wallet proving and production PoW"]
+    fn first_backbone_step_is_exact_genesis_child() {
+        let mut provider = HonestHistoryStepFixtureProvider::new(0x4849_5354_4550).unwrap();
+        let genesis = noid_recursive::genesis_accumulator();
+        let step = provider.next_backbone(&genesis).unwrap().unwrap();
+        assert!(step.capture_parent_slot.is_none());
+        let PreparedHistoryStepBackboneInput::B8(prepared) = step.input else {
+            panic!("height one must select B8");
+        };
+        let (witness, nonce, start, end) = prepared.into_parts();
+        let (block, _) = witness.finish(nonce, &start, &end).unwrap();
+        assert_eq!(block.header.height, 1);
+        assert_eq!(block.transactions.len(), 1);
+        assert_eq!(block.header.prev_block_hash, genesis.tip_block_id);
+    }
+
+    #[test]
+    #[ignore = "runs the honest provisional -> integrated -> known-c00 freezer prefix"]
+    fn known_c00_proves_after_exact_direct_vk_replacement() {
+        noid_ivc_prover::init_perf_thread_pool();
+        let mut provider = KnownC00CutoffProvider {
+            inner: HonestHistoryStepFixtureProvider::new(0x4849_5354_4550_5f56_31).unwrap(),
+            resets: 0,
+            backbone_calls_per_reset: Vec::new(),
+        };
+        let store = std::sync::Arc::new(RetainedBootstrapMatrices::default());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            noid_recursive::freeze_history_step_bank(&mut provider, std::sync::Arc::clone(&store))
+        }));
+        let result = result.unwrap_or_else(|payload| {
+            let message = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("non-string panic");
+            panic!(
+                "known-c00 freezer panicked after resets={} backbone_calls={:?} installs={} loads={}: {message}",
+                provider.resets,
+                provider.backbone_calls_per_reset,
+                store.installs.load(Ordering::Relaxed),
+                store.loads.load(Ordering::Relaxed),
+            )
+        });
+        match result {
+            Err(noid_recursive::HistoryStepFreezeError::Provider(message)) => {
+                assert_eq!(message, KNOWN_C00_PREFIX_PASSED);
+                assert_eq!(provider.resets, 6);
+                assert_eq!(provider.backbone_calls_per_reset, [13, 0, 1, 1, 11]);
+                assert_eq!(store.installs.load(Ordering::Relaxed), 3);
+                assert!(store.loads.load(Ordering::Relaxed) > 0);
+            }
+            Err(error) => panic!(
+                "known-c00 prefix failed after resets={} backbone_calls={:?} installs={} loads={}: {error}",
+                provider.resets,
+                provider.backbone_calls_per_reset,
+                store.installs.load(Ordering::Relaxed),
+                store.loads.load(Ordering::Relaxed),
+            ),
+            Ok(_) => panic!("focused known-c00 freezer did not stop at its exact cutoff"),
+        }
+    }
+
+    #[test]
+    #[ignore = "runs honest VK derivation and a production c00 proof"]
+    fn fresh_known_c00_terminal_verifies_before_recursive_consumption() {
+        noid_ivc_prover::init_perf_thread_pool();
+        let mut provider = HonestHistoryStepFixtureProvider::new(0x4849_5354_4550_5f56_31).unwrap();
+        let provisional_parts = derive_focused_provisional_parts(&mut provider).unwrap();
+        let store = std::sync::Arc::new(RetainedBootstrapMatrices::default());
+        let zero_digests = [[0u8; 32]; noid_recursive::HISTORY_STEP_CLASS_COUNT];
+        let provisional_runtime =
+            focused_runtime(zero_digests, &provisional_parts, &store).unwrap();
+
+        provider.reset_backbone();
+        let genesis = noid_recursive::genesis_accumulator();
+        let (_, provisional_input) = next_focused_b8(&mut provider, &genesis).unwrap();
+        let provisional =
+            noid_recursive::acceptance::history_step::assemble_frozen_history_step_base(
+                &provisional_runtime,
+                provisional_input,
+            )
+            .unwrap();
+        let integrated_b8_vk = provisional.direct_block_vk().clone();
+        drop(provisional);
+
+        let mut integrated_vks = provisional_parts.direct_block_vks().clone();
+        integrated_vks[0] = integrated_b8_vk;
+        let integrated_parts = noid_recursive::HistoryStepRuntimeParts::new(
+            provisional_parts.parent_recursion_vk().clone(),
+            integrated_vks,
+            provisional_parts.parent_transcripts().clone(),
+        )
+        .unwrap();
+        let integrated_runtime = focused_runtime(zero_digests, &integrated_parts, &store).unwrap();
+
+        provider.reset_backbone();
+        let (_, integrated_input) = next_focused_b8(&mut provider, &genesis).unwrap();
+        let integrated =
+            noid_recursive::acceptance::history_step::assemble_frozen_history_step_base(
+                &integrated_runtime,
+                integrated_input,
+            )
+            .unwrap();
+        assert_eq!(
+            integrated.direct_block_vk(),
+            &integrated_parts.direct_block_vks()[0]
+        );
+        let c00 = noid_recursive::CanonicalHistoryStepClassId::from_index(0).unwrap();
+        let integrated_digest = integrated.matrix().structural_statement_digest();
+        noid_recursive::HistoryStepFreezeMatrixStore::install(
+            store.as_ref(),
+            c00,
+            integrated.into_matrix(),
+        )
+        .unwrap();
+
+        let mut known_digests = zero_digests;
+        known_digests[c00.index()] = integrated_digest;
+        let known_runtime = focused_runtime(known_digests, &integrated_parts, &store).unwrap();
+        provider.reset_backbone();
+        let (base_block, base_input) = next_focused_b8(&mut provider, &genesis).unwrap();
+        let terminal =
+            noid_recursive::prove_history_step(&known_runtime, None, base_input).unwrap();
+        let accepted = noid_recursive::verify_history_step_terminal(
+            &known_runtime,
+            &terminal,
+            &base_block.header,
+            &noid_chain::consensus::genesis_header(),
+        )
+        .unwrap();
+        assert_eq!(accepted.height(), 1);
+        assert_eq!(accepted.block_id(), terminal.block_id());
+        assert_eq!(accepted.class_id(), c00);
+
+        let (_, recursive_input) = next_focused_b8(&mut provider, terminal.accumulator()).unwrap();
+        let recursive = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            noid_recursive::prove_history_step(&known_runtime, Some(&terminal), recursive_input)
+        }));
+        match recursive {
+            Ok(Ok(next)) => assert_eq!(next.height(), 2),
+            Ok(Err(error)) => panic!(
+                "fresh c00 passed full native verification before recursive consumption failed: {error}"
+            ),
+            Err(payload) => {
+                let message = payload
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| payload.downcast_ref::<&str>().copied())
+                    .unwrap_or("non-string panic");
+                panic!(
+                    "fresh c00 passed full native verification before recursive consumption panicked: {message}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "runs the honest frozen B8/B32 prefix and first fork class c01"]
+    fn first_b8_from_b32_fork_reuses_the_frozen_b8_direct_vk() {
+        noid_ivc_prover::init_perf_thread_pool();
+        let mut provider = HonestHistoryStepFixtureProvider::new(0x4849_5354_4550_5f56_31).unwrap();
+        let provisional_parts = derive_focused_provisional_parts(&mut provider).unwrap();
+        let store = std::sync::Arc::new(RetainedBootstrapMatrices::default());
+        let mut digests = [[0u8; 32]; noid_recursive::HISTORY_STEP_CLASS_COUNT];
+
+        // Freeze c00 and its exact B8 direct VK.
+        let provisional_runtime = focused_runtime(digests, &provisional_parts, &store).unwrap();
+        provider.reset_backbone();
+        let genesis = noid_recursive::genesis_accumulator();
+        let (_, provisional_b8_input) = next_focused_b8(&mut provider, &genesis).unwrap();
+        let provisional_c00 =
+            noid_recursive::acceptance::history_step::assemble_frozen_history_step_base(
+                &provisional_runtime,
+                provisional_b8_input,
+            )
+            .unwrap();
+        let b8_parts = replace_focused_direct_vk(
+            &provisional_parts,
+            0,
+            provisional_c00.direct_block_vk().clone(),
+        );
+        drop(provisional_c00);
+
+        let b8_runtime = focused_runtime(digests, &b8_parts, &store).unwrap();
+        provider.reset_backbone();
+        let (_, frozen_b8_input) = next_focused_b8(&mut provider, &genesis).unwrap();
+        let frozen_c00 =
+            noid_recursive::acceptance::history_step::assemble_frozen_history_step_base(
+                &b8_runtime,
+                frozen_b8_input,
+            )
+            .unwrap();
+        assert_eq!(
+            frozen_c00.direct_block_vk(),
+            &b8_parts.direct_block_vks()[0]
+        );
+        let c00 = noid_recursive::CanonicalHistoryStepClassId::from_index(0).unwrap();
+        digests[c00.index()] = frozen_c00.matrix().structural_statement_digest();
+        noid_recursive::HistoryStepFreezeMatrixStore::install(
+            store.as_ref(),
+            c00,
+            frozen_c00.into_matrix(),
+        )
+        .unwrap();
+
+        // Freeze c04 and its exact B32 direct VK using the real ten-block B8
+        // checkpoint. Reprove that checkpoint after replacing B32 because the
+        // terminal authenticates the complete bank.
+        let c00_runtime = focused_runtime(digests, &b8_parts, &store).unwrap();
+        let first_b8_checkpoint = prove_focused_b8_checkpoint(&c00_runtime, &mut provider);
+        let (_, provisional_b32_input) =
+            next_focused_b32(&mut provider, first_b8_checkpoint.accumulator()).unwrap();
+        let provisional_c04 =
+            noid_recursive::acceptance::history_step::assemble_frozen_history_step_recursive(
+                &c00_runtime,
+                noid_recursive::acceptance::history_step::HistoryStepParent::new(
+                    &c00_runtime,
+                    &first_b8_checkpoint,
+                )
+                .unwrap(),
+                provisional_b32_input,
+            )
+            .unwrap();
+        let b8_b32_parts =
+            replace_focused_direct_vk(&b8_parts, 1, provisional_c04.direct_block_vk().clone());
+        drop(provisional_c04);
+
+        let integrated_c00_runtime = focused_runtime(digests, &b8_b32_parts, &store).unwrap();
+        let frozen_b8_checkpoint =
+            prove_focused_b8_checkpoint(&integrated_c00_runtime, &mut provider);
+        let (_, frozen_b32_input) =
+            next_focused_b32(&mut provider, frozen_b8_checkpoint.accumulator()).unwrap();
+        let frozen_c04 =
+            noid_recursive::acceptance::history_step::assemble_frozen_history_step_recursive(
+                &integrated_c00_runtime,
+                noid_recursive::acceptance::history_step::HistoryStepParent::new(
+                    &integrated_c00_runtime,
+                    &frozen_b8_checkpoint,
+                )
+                .unwrap(),
+                frozen_b32_input,
+            )
+            .unwrap();
+        assert_eq!(
+            frozen_c04.direct_block_vk(),
+            &b8_b32_parts.direct_block_vks()[1]
+        );
+        let c04 = noid_recursive::CanonicalHistoryStepClassId::from_index(4).unwrap();
+        digests[c04.index()] = frozen_c04.matrix().structural_statement_digest();
+        noid_recursive::HistoryStepFreezeMatrixStore::install(
+            store.as_ref(),
+            c04,
+            frozen_c04.into_matrix(),
+        )
+        .unwrap();
+
+        // Candidate class 1 is the first non-backbone fork: current B8 over
+        // the honest B32 checkpoint. Its direct relation must reuse the sole
+        // frozen B8 VK byte-for-byte, independent of parent geometry.
+        let frozen_runtime = focused_runtime(digests, &b8_b32_parts, &store).unwrap();
+        let b32_checkpoint = prove_focused_b32_checkpoint(&frozen_runtime, &mut provider);
+        let c01 = noid_recursive::CanonicalHistoryStepClassId::from_index(1).unwrap();
+        assert_eq!((c01.current_tier(), c01.parent_tier()), (8, 32));
+        let fork_input = provider
+            .b8(c01, b32_checkpoint.accumulator())
+            .unwrap()
+            .into_history_step_input()
+            .unwrap();
+        let candidate_c01 =
+            noid_recursive::acceptance::history_step::assemble_frozen_history_step_recursive(
+                &frozen_runtime,
+                noid_recursive::acceptance::history_step::HistoryStepParent::new(
+                    &frozen_runtime,
+                    &b32_checkpoint,
+                )
+                .unwrap(),
+                fork_input,
+            )
+            .unwrap();
+        assert_eq!(candidate_c01.class_id(), c01);
+
+        let expected = focused_block_vk_geometry(&b8_b32_parts.direct_block_vks()[0]);
+        let actual = focused_block_vk_geometry(candidate_c01.direct_block_vk());
+        for (expected_role, actual_role) in expected.iter().zip(&actual) {
+            eprintln!(
+                "[focused-c01-vk] class=c01 current=B8 parent=B32 role={} expected_rows={} actual_rows={} expected_starts={:?} actual_starts={:?}",
+                expected_role.role,
+                expected_role.row_count,
+                actual_role.row_count,
+                expected_role.slice_starts,
+                actual_role.slice_starts,
+            );
+        }
+        assert_eq!(
+            actual, expected,
+            "c01 current B8 / parent B32 relocated the frozen B8 direct VK"
+        );
     }
 }

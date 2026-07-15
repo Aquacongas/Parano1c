@@ -3,7 +3,7 @@
 
 //! Process-wide admission for decoded inbound P2P payloads.
 //!
-//! Block, history-proof, state-segment, and mempool codecs share this one
+//! Accepted-block, HistoryStep, state-segment, and mempool codecs share this one
 //! byte domain.  A permit is acquired before payload allocation and travels
 //! with the decoded response until node-side consumption finishes.  Traffic
 //! on different protocols therefore cannot add their individual maxima or
@@ -14,8 +14,8 @@ use std::sync::{Arc, OnceLock};
 use tokio::sync::Semaphore;
 
 /// Aggregate decoded payload bytes admitted across every large inbound P2P
-/// response.  This admits one maximum proof-native block.  Smaller protocols
-/// share any remaining capacity and wait while a maximum block is resident.
+/// response. Smaller protocols share remaining capacity and wait when the
+/// process-wide domain is full.
 pub const INBOUND_RESPONSE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
 pub(crate) fn process_global_inbound_budget() -> Arc<Semaphore> {

@@ -115,6 +115,8 @@ pub fn update_for_accepted_block(
         return Ok(());
     };
 
+    let history_count_before = wallet.history.len();
+    let receipt_count_before = wallet.receipts.len();
     let active_address = wallet.active_address();
     let active_index = wallet.active_index;
     scanner::update_active_wallet_from_block(
@@ -133,11 +135,11 @@ pub fn update_for_accepted_block(
         log_slots: block.header.log_slots,
         active_slot_count: block.header.active_slot_count,
         alloc_counter: block.header.alloc_counter,
-        attested_coverage: block.header.attested_coverage,
     });
 
+    let mut history_changed = wallet.history.len() != history_count_before;
     for tx in &block.transactions {
-        wallet.confirm_pending_tx(&tx.txid().0, block.header.height);
+        history_changed |= wallet.confirm_pending_tx(&tx.txid().0, block.header.height);
         let output_slots: Vec<u32> = tx
             .body
             .live_outputs()
@@ -146,11 +148,150 @@ pub fn update_for_accepted_block(
             .collect();
         wallet.remove_pending_outputs(&output_slots);
     }
-    wallet.save_history();
-    if !wallet.receipts.is_empty() {
-        wallet.save_receipts();
+    wallet.history_dirty |= history_changed;
+    wallet.receipts_dirty |= wallet.receipts.len() != receipt_count_before;
+    if wallet.history_dirty {
+        wallet.save_history()?;
+    }
+    if wallet.receipts_dirty {
+        wallet.save_receipts()?;
     }
     Ok(())
+}
+
+fn recover_outgoing_receipts_from_block(
+    wallet: &mut WalletState,
+    owned_addresses: &std::collections::HashSet<[u8; 32]>,
+    sent_history: &std::collections::HashSet<[u8; 32]>,
+    block: &noid_chain::block::Block,
+) -> (usize, bool) {
+    let tx_hashes = block
+        .transactions
+        .iter()
+        .map(|transaction| transaction.txid().0)
+        .collect::<Vec<_>>();
+    let mut recovered = 0usize;
+    let mut history_changed = false;
+    for (tx_index, transaction) in block.transactions.iter().enumerate() {
+        if transaction.body.is_coinbase {
+            continue;
+        }
+        let tx_hash = tx_hashes[tx_index];
+        let outgoing = sent_history.contains(&tx_hash)
+            || (transaction.body.live_inputs().next().is_some()
+                && owned_addresses.contains(&transaction.body.input_owner.0));
+        if !outgoing {
+            continue;
+        }
+        if let std::collections::hash_map::Entry::Vacant(entry) = wallet.receipts.entry(tx_hash) {
+            entry.insert(
+                noid_chain::consensus::receipt::generate_receipt(
+                    &block.header,
+                    &transaction.body,
+                    tx_index,
+                    &tx_hashes,
+                )
+                .to_bytes(),
+            );
+            recovered += 1;
+        }
+        for history in wallet.history.iter_mut().filter(|entry| {
+            entry.tx_hash == tx_hash
+                && entry.direction == state::TxDirection::Sent
+                && entry.height == 0
+        }) {
+            history.height = block.header.height;
+            history_changed = true;
+        }
+    }
+    (recovered, history_changed)
+}
+
+/// Reconcile the durable receipt cache with permanent canonical headers and
+/// recover any receipt lost in the crash window between chain commit and the
+/// wallet-side fsync. Recovery reads only the consensus-retained body window.
+pub fn reconcile_receipts_at_startup(
+    wallet: &mut WalletState,
+    chain: &noid_chain::storage::MdbxChainContext,
+) -> Result<(usize, usize), String> {
+    use noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH;
+    use noid_chain::consensus::receipt::{
+        verify_against_header, verify_merkle_inclusion, ParanoidReceipt,
+    };
+
+    let mut removed = 0usize;
+    let receipt_keys = wallet.receipts.keys().copied().collect::<Vec<_>>();
+    for tx_hash in receipt_keys {
+        let receipt = wallet
+            .receipts
+            .get(&tx_hash)
+            .and_then(|bytes| ParanoidReceipt::from_bytes(bytes).ok());
+        let valid = match receipt {
+            Some(receipt)
+                if receipt.summary.tx_body_hash == tx_hash && verify_merkle_inclusion(&receipt) =>
+            {
+                chain
+                    .store
+                    .get_header(receipt.claimed_height)
+                    .map_err(|error| format!("load canonical receipt header: {error}"))?
+                    .is_some_and(|header| verify_against_header(&receipt, &header))
+            }
+            _ => false,
+        };
+        if !valid {
+            wallet.receipts.remove(&tx_hash);
+            removed += 1;
+        }
+    }
+
+    let owned_addresses = (0..wallet.next_index)
+        .map(|index| wallet.address_at(index).0)
+        .collect::<std::collections::HashSet<_>>();
+    let sent_history = wallet
+        .history
+        .iter()
+        .filter(|entry| entry.direction == state::TxDirection::Sent)
+        .map(|entry| entry.tx_hash)
+        .collect::<std::collections::HashSet<_>>();
+    let tip = chain.tip_height();
+    let first = tip
+        .saturating_sub(RECENT_BLOCK_RETENTION_DEPTH.saturating_sub(1))
+        .max(1);
+    let mut recovered = 0usize;
+    let mut history_changed = false;
+    if first <= tip {
+        for height in first..=tip {
+            let Some(bundle_bytes) = chain
+                .store
+                .get_recent_accepted_block_bundle_bounded(height)
+                .map_err(|error| format!("load retained accepted block {height}: {error}"))?
+            else {
+                continue;
+            };
+            let bundle = noid_chain::AcceptedBlockBundle::decode(&bundle_bytes)
+                .map_err(|error| format!("decode retained accepted block {height}: {error}"))?;
+            let block = noid_chain::block::Block::from_bytes(bundle.block_bytes())
+                .map_err(|error| format!("decode retained block body {height}: {error:?}"))?;
+            let (block_recovered, block_history_changed) = recover_outgoing_receipts_from_block(
+                wallet,
+                &owned_addresses,
+                &sent_history,
+                &block,
+            );
+            recovered += block_recovered;
+            history_changed |= block_history_changed;
+        }
+    }
+
+    if history_changed {
+        wallet.history_dirty = true;
+        wallet.save_history()?;
+    }
+    if removed != 0 || recovered != 0 {
+        wallet.receipts_dirty = true;
+        wallet.save_receipts()?;
+    }
+    Ok((removed, recovered))
 }
 
 /// Install the one exact post-reorg active-owner snapshot, then derive only
@@ -223,7 +364,7 @@ pub fn install_reorg_snapshot_and_artifacts(
             block,
         );
         for transaction in &block.transactions {
-            wallet.confirm_pending_tx(&transaction.txid().0, block.header.height);
+            let _ = wallet.confirm_pending_tx(&transaction.txid().0, block.header.height);
             let output_slots: Vec<u32> = transaction
                 .body
                 .live_outputs()
@@ -233,10 +374,12 @@ pub fn install_reorg_snapshot_and_artifacts(
             wallet.remove_pending_outputs(&output_slots);
         }
     }
-    wallet.save_history();
+    wallet.history_dirty = true;
+    wallet.receipts_dirty = true;
+    wallet.save_history()?;
     // Persist even the empty map: otherwise removing the last orphan-bound
     // receipt in RAM would leave its old file to resurrect after restart.
-    wallet.save_receipts();
+    wallet.save_receipts()?;
     Ok(())
 }
 
@@ -318,7 +461,6 @@ impl WalletOps for WalletHandle {
                 balance_noid: 0.0,
                 utxo_count: 0,
                 pending_outbound_micronoid: 0,
-                immature_micronoid: 0,
                 spendable_micronoid: 0,
                 spendable_noid: 0.0,
             },
@@ -331,16 +473,12 @@ impl WalletOps for WalletHandle {
                     .filter(|u| u.key_index == w.active_index)
                     .map(|u| u.value)
                     .sum();
-                // Immature coinbase is confirmed but locked until its mint
-                // height is proof-covered — shown separately, like pending.
-                let immature = w.immature_balance();
-                let spendable = total.saturating_sub(pending_out).saturating_sub(immature);
+                let spendable = total.saturating_sub(pending_out);
                 WalletBalance {
                     balance_micronoid: total,
                     balance_noid: micronoid_to_noid(total),
                     utxo_count: w.utxos.len(),
                     pending_outbound_micronoid: pending_out,
-                    immature_micronoid: immature,
                     spendable_micronoid: spendable,
                     spendable_noid: micronoid_to_noid(spendable),
                 }
@@ -511,13 +649,11 @@ impl WalletOps for WalletHandle {
         let wallet = guard
             .as_ref()
             .ok_or_else(|| WalletSendPlanError::Other("wallet not initialized".to_string()))?;
-        let attested_coverage = wallet.attested_coverage();
         let mut available: Vec<&state::WalletUtxo> = wallet
             .utxos
             .values()
             .filter(|utxo| utxo.key_index == wallet.active_index)
             .filter(|utxo| !wallet.pending_input_slots.contains(&utxo.slot_index))
-            .filter(|utxo| !utxo.is_immature_coinbase(attested_coverage))
             .collect();
         available.sort_by_key(|utxo| {
             (
@@ -751,7 +887,7 @@ impl WalletOps for WalletHandle {
             .ok_or_else(|| "wallet not initialized".to_string())?;
         wallet.add_pending_inputs(input_slots);
         wallet.add_pending_outputs(output_slots);
-        wallet.record_pending_send(txid, amount_micronoid, peer_address);
+        wallet.record_pending_send(txid, amount_micronoid, peer_address)?;
         Ok(())
     }
 
@@ -765,7 +901,9 @@ impl WalletOps for WalletHandle {
         if let Some(wallet) = guard.as_mut() {
             wallet.remove_pending_inputs(input_slots);
             wallet.remove_pending_outputs(output_slots);
-            wallet.remove_pending_send(&txid);
+            if let Err(error) = wallet.remove_pending_send(&txid) {
+                tracing::error!(%error, "failed to durably roll back pending wallet send");
+            }
         }
     }
 
@@ -870,9 +1008,87 @@ mod tests {
             log_slots: 24,
             active_slot_count: 0,
             alloc_counter: 0,
-            attested_coverage: 0,
             utxos: vec![],
         }
+    }
+
+    #[test]
+    fn retained_body_rebuilds_missing_outgoing_receipt_without_history_marker() {
+        use noid_chain::block_header::BlockHeader;
+        use noid_chain::consensus::receipt::{
+            verify_against_header, verify_merkle_inclusion, ParanoidReceipt,
+        };
+        use noid_poseidon2b::primitives::Address;
+        use noid_tx::{
+            output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS,
+        };
+
+        let (dir, handle) = handle_with_utxos(&[]);
+        let mut guard = handle.inner.lock().unwrap();
+        let wallet = guard.as_mut().unwrap();
+        let owner = wallet.active_address();
+        let mut inputs = [TxInput::dummy(); TX_INPUTS];
+        inputs[0] = TxInput {
+            slot_index: 7,
+            amount: 50,
+            creation_id: 3,
+        };
+        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        outputs[0] = TxOutput {
+            slot_index: 9,
+            amount: 40,
+            owner: Address([0xA5; 32]),
+        };
+        let transaction = Transaction::new(TxBody {
+            epoch_anchor: [0x11; 32],
+            fee: 10,
+            input_owner: owner,
+            inputs,
+            outputs,
+            validity_bitmap: 1 | output_bitmap_bit(0),
+            is_coinbase: false,
+        });
+        let transactions = vec![transaction];
+        let header = BlockHeader {
+            prev_block_hash: [0; 32],
+            state_root: [0; 32],
+            tx_root: noid_chain::block::compute_tx_root(&transactions),
+            timestamp: 123,
+            height: 7,
+            miner_address: Address([0x77; 32]),
+            nonce: 0,
+            difficulty_target: [0xFF; 32],
+            log_slots: 24,
+            active_slot_count: 1,
+            alloc_counter: 1,
+        };
+        let block = noid_chain::block::Block {
+            header,
+            transactions,
+        };
+        let owned = std::collections::HashSet::from([owner.0]);
+        let (recovered, history_changed) = recover_outgoing_receipts_from_block(
+            wallet,
+            &owned,
+            &std::collections::HashSet::new(),
+            &block,
+        );
+        assert_eq!(recovered, 1);
+        assert!(!history_changed);
+        let tx_hash = block.transactions[0].txid().0;
+        let receipt = ParanoidReceipt::from_bytes(&wallet.receipts[&tx_hash]).unwrap();
+        assert!(verify_merkle_inclusion(&receipt));
+        assert!(verify_against_header(&receipt, &block.header));
+
+        let (recovered_again, _) = recover_outgoing_receipts_from_block(
+            wallet,
+            &owned,
+            &std::collections::HashSet::new(),
+            &block,
+        );
+        assert_eq!(recovered_again, 0);
+        drop(guard);
+        drop(dir);
     }
 
     #[test]
@@ -1021,7 +1237,7 @@ mod tests {
         {
             let mut guard = handle.inner.lock().unwrap();
             let wallet = guard.as_mut().unwrap();
-            wallet.record_pending_send([1; 32], 10, [2; 32]);
+            wallet.record_pending_send([1; 32], 10, [2; 32]).unwrap();
             wallet.history.push(state::TxHistoryEntry {
                 tx_hash: [3; 32],
                 height: 7,
@@ -1105,7 +1321,6 @@ mod tests {
             log_slots: 24,
             active_slot_count: 1,
             alloc_counter: 8,
-            attested_coverage: 0,
             utxos: vec![noid_chain::storage::VerifiedOwnerUtxo {
                 slot_index: 99,
                 amount: 777,
@@ -1143,7 +1358,7 @@ mod tests {
             let mut guard = handle.inner.lock().unwrap();
             let wallet = guard.as_mut().unwrap();
             wallet.receipts.insert(orphan_hash, vec![1, 2, 3]);
-            wallet.save_receipts();
+            wallet.save_receipts().unwrap();
             wallet.history.push(state::TxHistoryEntry {
                 tx_hash: orphan_hash,
                 height: 9,
@@ -1203,7 +1418,6 @@ mod tests {
             log_slots: 24,
             active_slot_count: 1,
             alloc_counter: 1,
-            attested_coverage: 0,
         };
         handle
             .inner
@@ -1242,7 +1456,6 @@ mod tests {
                 active_slot_count: 2,
                 // One live mint with a zero post-counter is impossible.
                 alloc_counter: 0,
-                attested_coverage: 0,
             },
             transactions: vec![noid_tx::Transaction::new(body)],
         };

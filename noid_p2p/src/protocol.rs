@@ -5,14 +5,15 @@
 //!
 //! ## Block propagation
 //!
-//! Blocks use dual-mode gossip:
+//! Blocks use one all-or-none bundle in two propagation modes:
 //!
 //! 1. **Inline** (common case): small blocks (coinbase-only or few txs, total
-//!    < 1 MB) are sent in full via gossipsub.  Receivers apply immediately —
+//!    < 1 MB) carry one complete accepted-block bundle via gossipsub. Receivers
+//!    can validate immediately —
 //!    no round-trip, no race condition.
 //!
 //! 2. **Compact** (large blocks): header-only gossip (~310 bytes).  Receivers
-//!    pull the full block + proof via `GetRecentBlockRequest`.  This mirrors
+//!    pull the complete bundle via `GetRecentBlockRequest`. This mirrors
 //!    Bitcoin's compact block protocol and Ethereum's `NewBlockHashes`.
 //!
 //! The 1 MB inline threshold is well below the 2 MB gossipsub transmit limit
@@ -32,6 +33,10 @@
 //! This enables progress reporting, resumable sync, and correct memory usage
 //! regardless of total state size.
 
+use noid_chain::{
+    block::BLOCK_WIRE_HEADER_OFFSET, AcceptedBlockBundle, BlockHeader, BLOCK_HEADER_WIRE_SIZE,
+    MAX_ACCEPTED_BLOCK_BUNDLE_BYTES,
+};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -52,7 +57,7 @@ pub struct GetHeadersResponse {
 }
 
 // ---------------------------------------------------------------------------
-// Block pull: full block + proof
+// Block pull: complete accepted-block bundle
 // ---------------------------------------------------------------------------
 
 /// Request a retained full block from the bounded suffix window.
@@ -61,66 +66,43 @@ pub struct GetRecentBlockRequest {
     pub height: u64,
 }
 
-/// Response: full block bytes + BlockProof bytes + public AuthGKR sidecar bytes.
-///
-/// All optional fields are `None` when the peer does not have the block.
-/// `block_proof_bytes` and `block_auth_sidecar_bytes` are `None` (not empty)
-/// for coinbase-only blocks that carry no user transactions.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Response: one structurally complete block + current-height HistoryStep
+/// terminal, or `None` when the retained block is unavailable.
+#[derive(Debug, Clone)]
 pub struct GetRecentBlockResponse {
     pub height: u64,
-    /// `Block::to_bytes()` — header + transactions.
-    pub block_bytes: Option<Vec<u8>>,
-    /// `BlockProof` bincode bytes.  `None` for coinbase-only blocks.
-    pub block_proof_bytes: Option<Vec<u8>>,
-    /// `BlockAuthSidecar` bincode bytes.  `None` for coinbase-only blocks.
-    pub block_auth_sidecar_bytes: Option<Vec<u8>>,
-    /// Serialized Link terminal envelope attesting the header's advanced
-    /// `attested_coverage`.  `None` when the block keeps its parent's coverage.
-    pub coverage_attestation_bytes: Option<Vec<u8>>,
+    pub bundle: Option<AcceptedBlockBundle>,
     /// Process-global inbound block-byte budget retained until the node has
     /// consumed this response. It is local flow-control state, never wire data.
-    #[serde(skip)]
     pub(crate) inbound_memory_permit: Option<std::sync::Arc<tokio::sync::OwnedSemaphorePermit>>,
     /// Process-wide outbound byte admission retained through the codec write.
     /// Local flow-control state; never serialized.
-    #[serde(skip)]
     pub(crate) outbound_memory_permit: Option<crate::outbound_budget::OutboundMemoryPermit>,
 }
 
 // ---------------------------------------------------------------------------
-// Public history proof
+// HistoryStep terminal for O(1) snapshot sync
 // ---------------------------------------------------------------------------
 
-/// Request the constant-size selected-history proof at one exact manifest
-/// boundary. Height alone is insufficient across a reorg; the server must
-/// return no proof unless both fields still name its canonical retained chain.
-///
-/// A peer returns `None` until verified selected-history coverage reaches this
-/// finalized retained boundary. Snapshot acceptance depends on the local
-/// recursive decider and the node-selected header chain.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GetHistoryProofRequest {
+/// Request the fused HistoryStep terminal at one exact snapshot boundary.
+#[derive(Debug, Clone)]
+pub struct GetHistoryStepTerminalRequest {
     pub height: u64,
     pub block_hash: [u8; 32],
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GetHistoryProofResponse {
+#[derive(Debug, Clone)]
+pub struct GetHistoryStepTerminalResponse {
     /// Exact request boundary echoed by the server so delayed responses cannot
     /// consume a newer manifest session for the same peer.
     pub height: u64,
     pub block_hash: [u8; 32],
-    /// Serialized selected-history terminal package bytes.
-    pub proof_bytes: Option<Vec<u8>>,
-    /// Canonical serialized tip BlockHeader bytes (212 bytes).
-    pub tip_header_bytes: Option<Vec<u8>>,
-    /// Process-wide inbound byte admission retained until node-side proof
+    /// Serialized fused HistoryStep terminal bound to `height, block_hash`.
+    pub terminal_bytes: Option<Vec<u8>>,
+    /// Process-wide inbound byte admission retained until node-side terminal
     /// verification has consumed the response.
-    #[serde(skip)]
     pub(crate) inbound_memory_permit: Option<std::sync::Arc<tokio::sync::OwnedSemaphorePermit>>,
     /// Process-wide outbound byte admission retained through the codec write.
-    #[serde(skip)]
     pub(crate) outbound_memory_permit: Option<crate::outbound_budget::OutboundMemoryPermit>,
 }
 
@@ -131,7 +113,7 @@ pub struct GetHistoryProofResponse {
 /// Request the state manifest: metadata + list of active segment IDs.
 ///
 /// The manifest describes the state snapshot authorized by the corresponding
-/// O(1) selected-history terminal package.
+/// fused HistoryStep terminal.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetStateManifestRequest {
     /// Requester's current tip height (0 for fresh nodes).
@@ -161,8 +143,6 @@ pub struct GetStateManifestResponse {
     /// downloaded payloads; after decoding, the receiver independently rebuilds
     /// the exact sparse UTXO root and compares it with the tip header.
     pub segment_roots: Vec<[u8; 32]>,
-    /// Wire-encoded recent headers (last ~155 blocks) for PoW validation.
-    pub recent_headers: Vec<Vec<u8>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -239,37 +219,97 @@ pub struct GetMempoolResponse {
 }
 
 // ---------------------------------------------------------------------------
-// Compact block announcement (gossip)
+// Block announcement (gossip)
 // ---------------------------------------------------------------------------
 
-/// Gossipsub block message — compact announcement OR inline full block.
-///
-/// For small blocks (coinbase-only or few txs) that fit within the gossipsub
-/// message size limit (2 MB), the full block + proof are inlined.  This
-/// eliminates the request-response round-trip, removing the race condition
-/// where the pull target hasn't fetched the block yet.
-///
-/// For large blocks (many txs, proof > 1 MB), only the header is sent and
-/// receivers pull the full block via `GetRecentBlockRequest`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Canonical block-gossip tagged union. A partial block has no representable
+/// shape: gossip carries either one header or one complete accepted bundle.
+#[derive(Debug, Clone)]
 pub enum BlockGossipMsg {
-    /// Compact: header only.  Receivers must pull full block.
-    Compact {
-        height: u64,
-        hash: [u8; 32],
-        header_bytes: Vec<u8>,
-    },
-    /// Inline: full block + proof in gossip message.  No pull needed.
-    Inline {
-        height: u64,
-        hash: [u8; 32],
-        block_bytes: Vec<u8>,
-        block_proof_bytes: Vec<u8>,
-        block_auth_sidecar_bytes: Vec<u8>,
-        /// Serialized Link terminal envelope for coverage-advancing blocks.
-        /// Empty when the header keeps its parent's `attested_coverage`.
-        coverage_attestation_bytes: Vec<u8>,
-    },
+    Header(BlockHeader),
+    Complete(AcceptedBlockBundle),
+}
+
+const BLOCK_GOSSIP_MAGIC: [u8; 4] = *b"NBG1";
+const BLOCK_GOSSIP_HEADER: u8 = 0;
+const BLOCK_GOSSIP_COMPLETE: u8 = 1;
+pub const BLOCK_GOSSIP_FIXED_BYTES: usize = 4 + 1 + 4;
+
+impl BlockGossipMsg {
+    pub fn from_bundle(bundle: AcceptedBlockBundle, inline: bool) -> Self {
+        if inline {
+            return Self::Complete(bundle);
+        }
+        let block_bytes = bundle.block_bytes();
+        let header_end = BLOCK_WIRE_HEADER_OFFSET
+            .checked_add(BLOCK_HEADER_WIRE_SIZE)
+            .expect("canonical block header range fits usize");
+        let header_bytes = block_bytes
+            .get(BLOCK_WIRE_HEADER_OFFSET..header_end)
+            .expect("AcceptedBlockBundle contains a canonical block header");
+        Self::Header(
+            BlockHeader::from_bytes(header_bytes)
+                .expect("AcceptedBlockBundle contains a canonical BlockHeader"),
+        )
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let (tag, payload) = match self {
+            Self::Header(header) => {
+                let mut bytes = Vec::with_capacity(BLOCK_HEADER_WIRE_SIZE);
+                header.encode(&mut bytes);
+                (BLOCK_GOSSIP_HEADER, bytes)
+            }
+            Self::Complete(bundle) => (BLOCK_GOSSIP_COMPLETE, bundle.encode()),
+        };
+        let mut encoded = Vec::with_capacity(BLOCK_GOSSIP_FIXED_BYTES + payload.len());
+        encoded.extend_from_slice(&BLOCK_GOSSIP_MAGIC);
+        encoded.push(tag);
+        encoded.extend_from_slice(
+            &u32::try_from(payload.len())
+                .expect("bounded block gossip payload length fits u32")
+                .to_le_bytes(),
+        );
+        encoded.extend_from_slice(&payload);
+        encoded
+    }
+
+    pub fn decode(encoded: &[u8]) -> Result<Self, String> {
+        if encoded.len() < BLOCK_GOSSIP_FIXED_BYTES {
+            return Err("block gossip message is truncated".to_string());
+        }
+        if encoded[..4] != BLOCK_GOSSIP_MAGIC {
+            return Err("invalid block gossip magic/version".to_string());
+        }
+        let tag = encoded[4];
+        let payload_len = u32::from_le_bytes(encoded[5..9].try_into().unwrap()) as usize;
+        match tag {
+            BLOCK_GOSSIP_HEADER if payload_len != BLOCK_HEADER_WIRE_SIZE => {
+                return Err("block gossip header length is noncanonical".to_string());
+            }
+            BLOCK_GOSSIP_COMPLETE if payload_len > MAX_ACCEPTED_BLOCK_BUNDLE_BYTES => {
+                return Err("inline accepted-block bundle exceeds its wire cap".to_string());
+            }
+            BLOCK_GOSSIP_HEADER | BLOCK_GOSSIP_COMPLETE => {}
+            _ => return Err("block gossip tag is unknown".to_string()),
+        }
+        let expected = BLOCK_GOSSIP_FIXED_BYTES
+            .checked_add(payload_len)
+            .ok_or_else(|| "block gossip length overflow".to_string())?;
+        if encoded.len() != expected {
+            return Err("block gossip message length is noncanonical".to_string());
+        }
+        let payload = &encoded[BLOCK_GOSSIP_FIXED_BYTES..];
+        match tag {
+            BLOCK_GOSSIP_HEADER => BlockHeader::from_bytes(payload)
+                .map(Self::Header)
+                .map_err(|error| format!("block gossip header decode failed: {error:?}")),
+            BLOCK_GOSSIP_COMPLETE => AcceptedBlockBundle::decode(payload)
+                .map(Self::Complete)
+                .map_err(|error| format!("inline accepted-block bundle: {error}")),
+            _ => unreachable!("tag was validated"),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -297,5 +337,62 @@ impl NetworkTopics {
             txs: cfg.topic_txs.to_string(),
             protocol_id: cfg.p2p_protocol_id.to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bundle(height: u64) -> AcceptedBlockBundle {
+        let mut header = noid_chain::consensus::genesis_header();
+        header.height = height;
+        let block = noid_chain::Block {
+            header,
+            transactions: Vec::new(),
+        };
+        let mut terminal = Vec::new();
+        terminal.extend_from_slice(&noid_chain::HISTORY_STEP_TERMINAL_VERSION.to_le_bytes());
+        terminal.extend_from_slice(&height.to_le_bytes());
+        terminal.extend_from_slice(&noid_chain::block_id(&block.header));
+        terminal.push(1);
+        terminal.push(0xA5);
+        AcceptedBlockBundle::try_from_parts(block.to_bytes(), terminal).unwrap()
+    }
+
+    #[test]
+    fn gossip_round_trips_each_union_variant() {
+        let bundle = bundle(9);
+        let inline = BlockGossipMsg::from_bundle(bundle.clone(), true);
+        let decoded = BlockGossipMsg::decode(&inline.encode()).unwrap();
+        assert!(matches!(decoded, BlockGossipMsg::Complete(decoded) if decoded == bundle));
+
+        let announcement = BlockGossipMsg::from_bundle(bundle.clone(), false);
+        let decoded = BlockGossipMsg::decode(&announcement.encode()).unwrap();
+        assert!(matches!(decoded, BlockGossipMsg::Header(header)
+            if header.height == bundle.height()
+                && noid_chain::hash_block_header(&header) == bundle.block_hash()));
+    }
+
+    #[test]
+    fn gossip_has_no_partial_shape_or_unknown_tag() {
+        let mut header = BlockGossipMsg::from_bundle(bundle(9), false).encode();
+        header[4] = 2;
+        assert!(BlockGossipMsg::decode(&header).is_err());
+
+        let mut complete = BlockGossipMsg::from_bundle(bundle(9), true).encode();
+        complete.truncate(complete.len() - 1);
+        assert!(BlockGossipMsg::decode(&complete).is_err());
+    }
+
+    #[test]
+    fn gossip_rejects_bundle_length_bomb_before_decode() {
+        let mut encoded = BlockGossipMsg::from_bundle(bundle(9), true).encode();
+        encoded[5..9].copy_from_slice(
+            &u32::try_from(MAX_ACCEPTED_BLOCK_BUNDLE_BYTES + 1)
+                .unwrap()
+                .to_le_bytes(),
+        );
+        assert!(BlockGossipMsg::decode(&encoded).is_err());
     }
 }

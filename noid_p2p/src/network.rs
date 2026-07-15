@@ -5,7 +5,7 @@
 //!
 //! Handles:
 //! - GossipSub: receiving blocks and txs from peers, broadcasting our blocks/txs
-//! - Request-Response: serving header/block/proof requests from syncing nodes
+//! - Request-Response: serving headers, accepted-block bundles, and HistoryStep terminals
 //! - Identify: maintaining peer address books
 //! - Ping: pruning stale connections
 
@@ -20,24 +20,23 @@ use libp2p::{
 use tokio::sync::{mpsc, RwLock, Semaphore};
 
 use noid_chain::consensus::wire_limits::{
-    proof_sidecar_combined_len_ok, INLINE_BLOCK_GOSSIP_THRESHOLD, MAX_BLOCK_AUTH_SIDECAR_BYTES,
-    MAX_BLOCK_BYTES, MAX_BLOCK_PROOF_BYTES, MAX_BLOCK_PROOF_PLUS_SIDECAR_BYTES,
-    MAX_COVERAGE_ATTESTATION_BYTES, MAX_HEADER_BYTES, MAX_HISTORY_PROOF_BYTES,
-    MAX_MEMPOOL_SYNC_BYTES, MAX_MEMPOOL_SYNC_TXS, MAX_SEGMENT_BYTES,
-    MAX_SNAPSHOT_MANIFEST_SEGMENTS, MAX_TX_INTENT_BYTES_GLOBAL,
+    INLINE_BLOCK_GOSSIP_THRESHOLD, MAX_HISTORY_STEP_TERMINAL_BYTES, MAX_MEMPOOL_SYNC_BYTES,
+    MAX_MEMPOOL_SYNC_TXS, MAX_SEGMENT_BYTES, MAX_SNAPSHOT_MANIFEST_SEGMENTS,
+    MAX_TX_INTENT_BYTES_GLOBAL,
 };
 use noid_chain::storage::{encoded_segment_len_for_eff_log, MdbxChainContext};
 use noid_chain::storage::{
     export_snapshot_generation, open_snapshot_generation, SnapshotGeneration,
 };
+use noid_chain::{AcceptedBlockBundle, MAX_ACCEPTED_BLOCK_BUNDLE_BYTES};
 use noid_mempool::AsyncMempool;
 
 use crate::behaviour::{NodeBehaviour, NodeBehaviourEvent};
 use crate::outbound_budget::OutboundResponseBudget;
 use crate::protocol::{
-    BlockGossipMsg, GetHeadersResponse, GetHistoryProofResponse, GetMempoolResponse,
+    BlockGossipMsg, GetHeadersResponse, GetHistoryStepTerminalResponse, GetMempoolResponse,
     GetRecentBlockResponse, GetStateManifestResponse, GetStateSegmentRequest,
-    GetStateSegmentResponse, NetworkTopics,
+    GetStateSegmentResponse, NetworkTopics, BLOCK_GOSSIP_FIXED_BYTES,
 };
 
 struct PendingStateSegmentResponse {
@@ -50,9 +49,9 @@ struct PendingBlockResponse {
     response: GetRecentBlockResponse,
 }
 
-struct PendingHistoryProofResponse {
-    channel: request_response::ResponseChannel<GetHistoryProofResponse>,
-    response: GetHistoryProofResponse,
+struct PendingHistoryStepTerminalResponse {
+    channel: request_response::ResponseChannel<GetHistoryStepTerminalResponse>,
+    response: GetHistoryStepTerminalResponse,
 }
 
 struct PendingMempoolResponse {
@@ -93,9 +92,8 @@ type SnapshotExportKey = (u64, [u8; 32]);
 type SnapshotExport = Arc<SnapshotGeneration>;
 
 const MAX_SNAPSHOT_EXPORTS: usize = 2;
-const MAX_OUTBOUND_BLOCK_RESPONSE_BYTES: usize =
-    MAX_BLOCK_BYTES + MAX_BLOCK_PROOF_PLUS_SIDECAR_BYTES + MAX_COVERAGE_ATTESTATION_BYTES;
-const MAX_OUTBOUND_HISTORY_RESPONSE_BYTES: usize = MAX_HISTORY_PROOF_BYTES + MAX_HEADER_BYTES;
+const MAX_OUTBOUND_BLOCK_RESPONSE_BYTES: usize = MAX_ACCEPTED_BLOCK_BUNDLE_BYTES;
+const MAX_OUTBOUND_HISTORY_STEP_RESPONSE_BYTES: usize = MAX_HISTORY_STEP_TERMINAL_BYTES;
 const MAX_PENDING_RETAINED_BLOCK_REQUESTS: usize = 256;
 const MAX_PENDING_STATE_SEGMENT_REQUESTS: usize = 64;
 const _: () = assert!(
@@ -236,20 +234,17 @@ fn fail_peer_requests(
 
 // Hard caps on incoming response sizes are shared via noid_chain::consensus::wire_limits.
 
-fn snapshot_suffix_is_retained(tip_height: u64, proof_height: u64) -> bool {
-    proof_height <= tip_height
-        && tip_height.saturating_sub(proof_height)
+fn snapshot_suffix_is_retained(tip_height: u64, terminal_height: u64) -> bool {
+    terminal_height <= tip_height
+        && tip_height.saturating_sub(terminal_height)
             <= noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH
 }
 
-/// Choose one finalized selected-history boundary without loading its proof.
-/// Local proving may be ahead of finality; snapshot generation therefore uses
-/// the exact result at `min(coverage, finalized)` rather than retaining a
-/// 580-KiB envelope on every timer tick.
-fn local_selected_history_boundary(ctx: &MdbxChainContext) -> Option<(u64, [u8; 32])> {
-    let coverage = ctx.store.get_selected_history_coverage().ok().flatten()?;
+/// Choose the finalized snapshot boundary only when its exact HistoryStep
+/// terminal is durably available.
+fn local_history_step_boundary(ctx: &MdbxChainContext) -> Option<(u64, [u8; 32])> {
     let finalized = ctx.finalized_checkpoint();
-    let height = coverage.height.min(finalized.height);
+    let height = finalized.height;
     if height == 0
         || height > ctx.tip_height()
         || !snapshot_suffix_is_retained(ctx.tip_height(), height)
@@ -258,155 +253,54 @@ fn local_selected_history_boundary(ctx: &MdbxChainContext) -> Option<(u64, [u8; 
     }
     let header = ctx.store.get_header(height).ok().flatten()?;
     let block_hash = noid_chain::hash_block_header(&header);
-    if height == coverage.height && block_hash != coverage.block_hash {
+    if block_hash != finalized.hash {
         return None;
     }
-    if height == finalized.height && block_hash != finalized.hash {
-        return None;
-    }
-    let job = ctx.store.get_recursive_proof_job(height).ok().flatten()?;
-    if job.state != noid_chain::storage::RecursiveProofJobState::Complete
-        || job.block_hash != block_hash
+    if !ctx
+        .store
+        .has_history_step_terminal_at(height, block_hash)
+        .ok()?
     {
         return None;
     }
     Some((height, block_hash))
 }
 
-/// Load only the exact selected terminal requested by the peer's previously
-/// advertised manifest. Advancement of local finality/coverage cannot switch
-/// this response to a different boundary.
-fn local_public_history_proof(
+/// Load only the exact HistoryStep terminal requested for a finalized manifest.
+fn local_history_step_terminal(
     ctx: &MdbxChainContext,
     height: u64,
     block_hash: [u8; 32],
 ) -> Option<Vec<u8>> {
-    let coverage = ctx.store.get_selected_history_coverage().ok().flatten()?;
     let finalized = ctx.finalized_checkpoint();
     if height == 0
-        || height > coverage.height
         || height > finalized.height
         || !snapshot_suffix_is_retained(ctx.tip_height(), height)
     {
         return None;
     }
     ctx.store
-        .get_selected_history_terminal_result_at(height, block_hash)
+        .get_history_step_terminal_at(height, block_hash)
         .ok()
         .flatten()
-        .map(|result| result.bytes)
 }
 
-fn sanitize_stored_block_response(
+fn decode_stored_accepted_block_bundle(
     height: u64,
-    mut block_bytes: Option<Vec<u8>>,
-    mut block_proof_bytes: Option<Vec<u8>>,
-    mut block_auth_sidecar_bytes: Option<Vec<u8>>,
-    mut coverage_attestation_bytes: Option<Vec<u8>>,
-) -> (
-    Option<Vec<u8>>,
-    Option<Vec<u8>>,
-    Option<Vec<u8>>,
-    Option<Vec<u8>>,
-) {
-    if block_bytes
-        .as_deref()
-        .is_some_and(|bytes| !pulled_block_bytes_match_height(bytes, height))
-    {
-        tracing::warn!(
-            height,
-            "stored block header does not match requested height — not serving"
-        );
-        return (None, None, None, None);
+    encoded: Option<Vec<u8>>,
+) -> Option<AcceptedBlockBundle> {
+    let encoded = encoded?;
+    match AcceptedBlockBundle::decode(&encoded) {
+        Ok(bundle) if bundle.height() == height => Some(bundle),
+        Ok(_) => {
+            tracing::warn!(height, "stored accepted-block bundle has the wrong height");
+            None
+        }
+        Err(error) => {
+            tracing::warn!(height, %error, "stored accepted-block bundle is invalid");
+            None
+        }
     }
-    if block_bytes
-        .as_ref()
-        .is_some_and(|bytes| bytes.len() > MAX_BLOCK_BYTES)
-    {
-        tracing::warn!(height, "stored block exceeds wire cap — not serving");
-        return (None, None, None, None);
-    }
-    if block_bytes.is_none() {
-        return (None, None, None, None);
-    }
-    if coverage_attestation_bytes
-        .as_ref()
-        .is_some_and(|bytes| bytes.is_empty() || bytes.len() > MAX_COVERAGE_ATTESTATION_BYTES)
-    {
-        tracing::warn!(
-            height,
-            "stored coverage attestation violates wire cap — not serving attestation"
-        );
-        coverage_attestation_bytes = None;
-    }
-    if block_proof_bytes
-        .as_ref()
-        .is_some_and(|bytes| bytes.len() > MAX_BLOCK_PROOF_BYTES)
-    {
-        tracing::warn!(
-            height,
-            "stored block proof exceeds wire cap — not serving proof"
-        );
-        block_proof_bytes = None;
-    }
-    if block_auth_sidecar_bytes
-        .as_ref()
-        .is_some_and(|bytes| bytes.len() > MAX_BLOCK_AUTH_SIDECAR_BYTES)
-    {
-        tracing::warn!(
-            height,
-            "stored auth sidecar exceeds wire cap — not serving sidecar"
-        );
-        block_auth_sidecar_bytes = None;
-    }
-    let proof_len = block_proof_bytes.as_ref().map_or(0, Vec::len);
-    let sidecar_len = block_auth_sidecar_bytes.as_ref().map_or(0, Vec::len);
-    if !proof_sidecar_combined_len_ok(proof_len, sidecar_len) {
-        tracing::warn!(
-            height,
-            proof_len,
-            sidecar_len,
-            "stored proof+sidecar exceed combined wire cap — not serving proof data"
-        );
-        block_proof_bytes = None;
-        block_auth_sidecar_bytes = None;
-    }
-    if block_proof_bytes.is_some() != block_auth_sidecar_bytes.is_some() {
-        tracing::warn!(
-            height,
-            "stored proof/authorization sidecar presence mismatch — not serving proof data"
-        );
-        block_proof_bytes = None;
-        block_auth_sidecar_bytes = None;
-    }
-    (
-        block_bytes.take(),
-        block_proof_bytes,
-        block_auth_sidecar_bytes,
-        coverage_attestation_bytes,
-    )
-}
-
-/// Allocation-free transport identity check for a pulled block response.
-/// Consensus still performs the complete canonical block decode; this early
-/// check only prevents a peer (or corrupt local suffix record) from answering
-/// request `h` with bytes whose canonical header declares another height.
-fn pulled_block_bytes_match_height(bytes: &[u8], expected_height: u64) -> bool {
-    use noid_chain::block::{BLOCK_WIRE_HEADER_OFFSET, BLOCK_WIRE_MARKER};
-
-    if bytes.first() != Some(&BLOCK_WIRE_MARKER) {
-        return false;
-    }
-    let Some(header_end) = BLOCK_WIRE_HEADER_OFFSET.checked_add(noid_chain::BLOCK_HEADER_WIRE_SIZE)
-    else {
-        return false;
-    };
-    let Some(header_bytes) = bytes.get(BLOCK_WIRE_HEADER_OFFSET..header_end) else {
-        return false;
-    };
-    let mut source = header_bytes;
-    noid_chain::block_header::BlockHeader::decode(&mut source)
-        .is_ok_and(|header| source.is_empty() && header.height == expected_height)
 }
 
 /// Decode one fixed-framed batch as a single contiguous chain fragment.
@@ -446,43 +340,23 @@ fn decode_linked_header_batch(
     Ok(decoded)
 }
 
-#[inline]
-fn should_inline_block_gossip(
-    block_bytes_len: usize,
-    block_proof_bytes_len: usize,
-    block_auth_sidecar_bytes_len: usize,
-    coverage_attestation_bytes_len: usize,
-) -> bool {
-    block_bytes_len > 0
-        && block_bytes_len
-            .saturating_add(block_proof_bytes_len)
-            .saturating_add(block_auth_sidecar_bytes_len)
-            .saturating_add(coverage_attestation_bytes_len)
-            <= INLINE_BLOCK_GOSSIP_THRESHOLD
+fn accepted_block_bundle_wire_len(bundle: &AcceptedBlockBundle) -> usize {
+    noid_chain::ACCEPTED_BLOCK_BUNDLE_HEADER_BYTES
+        + bundle.block_bytes().len()
+        + bundle.history_step_terminal_bytes().len()
+}
+
+fn should_inline_accepted_block_bundle(bundle: &AcceptedBlockBundle) -> bool {
+    accepted_block_bundle_wire_len(bundle).saturating_add(BLOCK_GOSSIP_FIXED_BYTES)
+        <= INLINE_BLOCK_GOSSIP_THRESHOLD
 }
 
 /// Commands sent to the P2P network event loop.
 #[derive(Debug)]
 pub enum NetworkCommand {
-    /// Announce a new block to all peers.
-    ///
-    /// If `block_bytes` + `block_proof_bytes` + `block_auth_sidecar_bytes` fit
-    /// within the inline threshold (1 MB), the full block is gossiped directly.
-    /// Otherwise only the header is sent and peers pull via request-response.
-    AnnounceBlock {
-        height: u64,
-        hash: [u8; 32],
-        /// Canonical wire-encoded BlockHeader (220 bytes).
-        header_bytes: Vec<u8>,
-        /// Full block bytes (for inline mode). Empty = compact-only.
-        block_bytes: Vec<u8>,
-        /// Block proof bytes (for inline mode). Empty = compact-only.
-        block_proof_bytes: Vec<u8>,
-        /// Public AuthGKR sidecar bytes (for inline mode). Empty = compact-only.
-        block_auth_sidecar_bytes: Vec<u8>,
-        /// Coverage attestation envelope bytes (for inline mode).
-        coverage_attestation_bytes: Vec<u8>,
-    },
+    /// Announce one complete accepted-block bundle. The event loop chooses
+    /// inline gossip or header-only gossip from its canonical encoded size.
+    AnnounceBlock { bundle: AcceptedBlockBundle },
     /// Broadcast a new TxIntent to all peers.
     BroadcastTx { intent_bytes: Arc<[u8]> },
     /// Connect to a seed peer.
@@ -493,14 +367,14 @@ pub enum NetworkCommand {
     },
     /// Request recent blocks from a specific peer for initial sync.
     /// Fetches blocks from `from_height` to `from_height + count - 1`.
-    /// Emits `NetworkEvent::NewBlock` for each successfully fetched block.
+    /// Emits `NetworkEvent::RecentBlock` for each successfully fetched bundle.
     SyncBlocksFrom {
         peer: PeerId,
         from_height: u64,
         count: u16,
     },
     /// Request a specific block by height from a peer (orphan resolution).
-    /// Emits `NetworkEvent::NewBlock` if the peer has the block.
+    /// Emits `NetworkEvent::RecentBlock` if the peer has the bundle.
     RequestBlock { peer: PeerId, height: u64 },
     /// Fetch a range of headers from a peer for reorg ancestor search.
     /// Emits `NetworkEvent::HeadersBatch` with the decoded headers.
@@ -523,10 +397,8 @@ pub enum NetworkCommand {
         expected_tip_height: u64,
         expected_tip_hash: [u8; 32],
     },
-    /// Request the public checkpoint/history proof from a peer.
-    /// Peers return no proof until promoted checkpoint package coverage is ready.
-    /// Emits `NetworkEvent::HistoryProof` when the response arrives.
-    RequestHistoryProof {
+    /// Request the fused HistoryStep terminal for an exact snapshot boundary.
+    RequestHistoryStepTerminal {
         peer: PeerId,
         height: u64,
         block_hash: [u8; 32],
@@ -544,24 +416,21 @@ pub enum NetworkEvent {
     ///
     /// Contains only the header; the full block must be pulled via
     /// `NetworkCommand::SyncBlocksFrom` or `RequestBlock`.
-    NewBlockAnnouncement {
+    BlockAnnouncement {
         from: PeerId,
-        height: u64,
-        hash: [u8; 32],
-        /// Canonical wire-encoded BlockHeader (212 bytes).
-        header_bytes: Vec<u8>,
+        header: noid_chain::BlockHeader,
     },
-    /// A full block + proof + public AuthGKR sidecar arrived.
-    NewBlock {
+    /// A complete accepted-block bundle arrived inline via gossip.
+    IncomingBlock {
         from: PeerId,
-        block_bytes: Vec<u8>,
-        /// `BlockProof` bincode bytes. Empty Vec for coinbase-only blocks.
-        block_proof_bytes: Vec<u8>,
-        /// `BlockAuthSidecar` bincode bytes. Empty Vec for coinbase-only blocks.
-        block_auth_sidecar_bytes: Vec<u8>,
-        /// Serialized Link terminal envelope for coverage-advancing blocks.
-        /// Empty Vec when the header keeps its parent's `attested_coverage`.
-        coverage_attestation_bytes: Vec<u8>,
+        bundle: AcceptedBlockBundle,
+        /// Inline gossip is bounded by its codec, so this is always `None`.
+        inbound_memory_permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    },
+    /// A complete retained bundle arrived through block pull.
+    RecentBlock {
+        from: PeerId,
+        bundle: AcceptedBlockBundle,
         /// Holds the process-global inbound byte budget until node-side
         /// validation and persistence have consumed the pulled response.
         inbound_memory_permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
@@ -586,18 +455,14 @@ pub enum NetworkEvent {
         from: PeerId,
         response: crate::protocol::GetStateSegmentResponse,
     },
-    /// Public checkpoint/history proof envelope response received from a peer.
-    ///
-    /// Empty `proof_bytes` means the peer has no servable selected-history terminal.
-    HistoryProof {
+    /// Fused HistoryStep terminal response for O(1) snapshot sync.
+    HistoryStepTerminal {
         from: PeerId,
         height: u64,
         block_hash: [u8; 32],
-        /// Serialized selected-history terminal package bytes, or empty.
-        proof_bytes: Vec<u8>,
-        /// Canonical serialized tip `BlockHeader` bytes (212 bytes), or empty.
-        tip_header_bytes: Vec<u8>,
-        /// Holds the process-global inbound history byte budget until the node
+        /// Exact-bound HistoryStep terminal bytes, or empty when unavailable.
+        terminal_bytes: Vec<u8>,
+        /// Holds the process-global inbound terminal byte budget until the node
         /// finishes verifying this response.
         inbound_memory_permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     },
@@ -621,8 +486,8 @@ pub enum NetworkEvent {
 ///
 /// Required request/response results use a bounded, backpressured MPSC queue;
 /// recoverable gossip and peer-lifecycle notifications use broadcast and may
-/// report lag.  This prevents a slow proof verifier from either retaining 256
-/// maximum-sized blocks or silently losing a requested suffix response.
+/// report lag. This prevents a slow consumer from retaining an unbounded
+/// number of bundles or silently losing a requested suffix response.
 pub struct NetworkEventReceiver {
     required_rx: mpsc::Receiver<NetworkEvent>,
     gossip_rx: tokio::sync::broadcast::Receiver<NetworkEvent>,
@@ -761,29 +626,11 @@ impl P2PNetwork {
         }
     }
 
-    /// Announce a new block to all peers.  Small blocks are inlined in gossip.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn announce_block(
-        &self,
-        height: u64,
-        hash: [u8; 32],
-        header_bytes: Vec<u8>,
-        block_bytes: Vec<u8>,
-        block_proof_bytes: Vec<u8>,
-        block_auth_sidecar_bytes: Vec<u8>,
-        coverage_attestation_bytes: Vec<u8>,
-    ) {
+    /// Announce one complete accepted block to all peers.
+    pub async fn announce_block(&self, bundle: AcceptedBlockBundle) {
         let _ = self
             .cmd_tx
-            .send(NetworkCommand::AnnounceBlock {
-                height,
-                hash,
-                header_bytes,
-                block_bytes,
-                block_proof_bytes,
-                block_auth_sidecar_bytes,
-                coverage_attestation_bytes,
-            })
+            .send(NetworkCommand::AnnounceBlock { bundle })
             .await;
     }
 
@@ -849,12 +696,16 @@ impl P2PNetwork {
             .await;
     }
 
-    /// Request the public history proof from a peer.
-    /// The response arrives as `NetworkEvent::HistoryProof`.
-    pub async fn request_history_proof(&self, peer: PeerId, height: u64, block_hash: [u8; 32]) {
+    /// Request the HistoryStep terminal for an exact snapshot boundary.
+    pub async fn request_history_step_terminal(
+        &self,
+        peer: PeerId,
+        height: u64,
+        block_hash: [u8; 32],
+    ) {
         let _ = self
             .cmd_tx
-            .send(NetworkCommand::RequestHistoryProof {
+            .send(NetworkCommand::RequestHistoryStepTerminal {
                 peer,
                 height,
                 block_hash,
@@ -984,13 +835,13 @@ async fn run_swarm(
     // behaviour owns the next response while its codec writes it. Byte permits
     // retained by both stages are the process-wide RAM bound.
     let (block_response_tx, mut block_response_rx) = mpsc::channel::<PendingBlockResponse>(1);
-    let (history_response_tx, mut history_response_rx) =
-        mpsc::channel::<PendingHistoryProofResponse>(1);
+    let (history_step_response_tx, mut history_step_response_rx) =
+        mpsc::channel::<PendingHistoryStepTerminalResponse>(1);
     let (segment_response_tx, mut segment_response_rx) =
         mpsc::channel::<PendingStateSegmentResponse>(1);
     let (mempool_response_tx, mut mempool_response_rx) = mpsc::channel::<PendingMempoolResponse>(1);
     let block_response_prepare_semaphore = Arc::new(Semaphore::new(2));
-    let history_response_prepare_semaphore = Arc::new(Semaphore::new(4));
+    let history_step_response_prepare_semaphore = Arc::new(Semaphore::new(4));
     let segment_encode_semaphore = Arc::new(Semaphore::new(2));
     let mempool_response_prepare_semaphore = Arc::new(Semaphore::new(1));
     let outbound_response_budget = OutboundResponseBudget::process_global();
@@ -1053,8 +904,8 @@ async fn run_swarm(
                     &topics,
                     &block_response_tx,
                     &block_response_prepare_semaphore,
-                    &history_response_tx,
-                    &history_response_prepare_semaphore,
+                    &history_step_response_tx,
+                    &history_step_response_prepare_semaphore,
                     &segment_response_tx,
                     &segment_encode_semaphore,
                     &mempool_response_tx,
@@ -1082,11 +933,11 @@ async fn run_swarm(
                 }
             }
 
-            prepared = history_response_rx.recv() => {
+            prepared = history_step_response_rx.recv() => {
                 if let Some(prepared) = prepared {
                     let _ = swarm
                         .behaviour_mut()
-                        .proof_sync
+                        .history_step_sync
                         .send_response(prepared.channel, prepared.response);
                 }
             }
@@ -1130,7 +981,7 @@ async fn run_swarm(
                 if snapshot_export_inflight.is_none() {
                     let candidate = {
                         let ctx = chain.read().await;
-                        local_selected_history_boundary(&ctx).and_then(|key| {
+                        local_history_step_boundary(&ctx).and_then(|key| {
                             if snapshot_exports.contains_key(&key) {
                                 None
                             } else {
@@ -1352,47 +1203,17 @@ fn handle_network_command(
     >,
 ) {
     match cmd {
-        NetworkCommand::AnnounceBlock {
-            height,
-            hash,
-            header_bytes,
-            block_bytes,
-            block_proof_bytes,
-            block_auth_sidecar_bytes,
-            coverage_attestation_bytes,
-        } => {
-            // Inline threshold: if block + proof + sidecar + attestation fit
-            // within the inline gossip budget, gossip the full block directly.
-            // Larger payloads use compact announcement + pull.
-            let msg = if should_inline_block_gossip(
-                block_bytes.len(),
-                block_proof_bytes.len(),
-                block_auth_sidecar_bytes.len(),
-                coverage_attestation_bytes.len(),
-            ) {
-                BlockGossipMsg::Inline {
-                    height,
-                    hash,
-                    block_bytes,
-                    block_proof_bytes,
-                    block_auth_sidecar_bytes,
-                    coverage_attestation_bytes,
-                }
-            } else {
-                BlockGossipMsg::Compact {
-                    height,
-                    hash,
-                    header_bytes,
-                }
-            };
-            match bincode::serialize(&msg) {
-                Ok(encoded) => {
-                    let topic = gossipsub::IdentTopic::new(topics.blocks.clone());
-                    if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, encoded) {
-                        tracing::debug!(height, err = %e, "gossipsub: block announcement");
-                    }
-                }
-                Err(e) => tracing::error!("BlockGossipMsg serialize: {e}"),
+        NetworkCommand::AnnounceBlock { bundle } => {
+            let height = bundle.height();
+            let inline = should_inline_accepted_block_bundle(&bundle);
+            let message = BlockGossipMsg::from_bundle(bundle, inline);
+            let topic = gossipsub::IdentTopic::new(topics.blocks.clone());
+            if let Err(error) = swarm
+                .behaviour_mut()
+                .gossipsub
+                .publish(topic, message.encode())
+            {
+                tracing::debug!(height, err = %error, "gossipsub: block announcement");
             }
         }
         NetworkCommand::BroadcastTx { intent_bytes } => {
@@ -1534,16 +1355,16 @@ fn handle_network_command(
             debug_assert!(inserted, "fresh segment-sync request ID must be unique");
             tracing::debug!(peer = %peer, segment_id, "requesting state segment");
         }
-        NetworkCommand::RequestHistoryProof {
+        NetworkCommand::RequestHistoryStepTerminal {
             peer,
             height,
             block_hash,
         } => {
-            let _ = swarm.behaviour_mut().proof_sync.send_request(
+            let _ = swarm.behaviour_mut().history_step_sync.send_request(
                 &peer,
-                crate::protocol::GetHistoryProofRequest { height, block_hash },
+                crate::protocol::GetHistoryStepTerminalRequest { height, block_hash },
             );
-            tracing::debug!(peer = %peer, height, "requesting exact history proof for snapshot verification");
+            tracing::debug!(peer = %peer, height, "requesting HistoryStep terminal for snapshot verification");
         }
         NetworkCommand::FetchHeaders {
             peer,
@@ -1589,8 +1410,8 @@ async fn handle_swarm_event(
     topics: &NetworkTopics,
     block_response_tx: &mpsc::Sender<PendingBlockResponse>,
     block_response_prepare_semaphore: &Arc<Semaphore>,
-    history_response_tx: &mpsc::Sender<PendingHistoryProofResponse>,
-    history_response_prepare_semaphore: &Arc<Semaphore>,
+    history_step_response_tx: &mpsc::Sender<PendingHistoryStepTerminalResponse>,
+    history_step_response_prepare_semaphore: &Arc<Semaphore>,
     segment_response_tx: &mpsc::Sender<PendingStateSegmentResponse>,
     segment_encode_semaphore: &Arc<Semaphore>,
     mempool_response_tx: &mpsc::Sender<PendingMempoolResponse>,
@@ -1644,12 +1465,8 @@ async fn handle_swarm_event(
 
             let topic = message.topic.as_str();
             if topic == topics.blocks.as_str() {
-                match bincode::deserialize::<BlockGossipMsg>(&message.data) {
-                    Ok(BlockGossipMsg::Compact {
-                        height,
-                        hash,
-                        header_bytes,
-                    }) => {
+                match BlockGossipMsg::decode(&message.data) {
+                    Ok(message) => {
                         const BLOCK_RATE_WINDOW: Duration = Duration::from_secs(10);
                         const BLOCK_RATE_MAX: u32 = 40;
                         if !allow_peer_rate(
@@ -1661,62 +1478,28 @@ async fn handle_swarm_event(
                             tracing::debug!(peer = %origin, "block announcement rate limit exceeded — dropped before event channel");
                             return;
                         }
-                        let _ = gossip_event_tx.send(NetworkEvent::NewBlockAnnouncement {
-                            from: origin,
-                            height,
-                            hash,
-                            header_bytes,
-                        });
-                    }
-                    Ok(BlockGossipMsg::Inline {
-                        height,
-                        hash: _,
-                        block_bytes,
-                        block_proof_bytes,
-                        block_auth_sidecar_bytes,
-                        coverage_attestation_bytes,
-                    }) => {
-                        if coverage_attestation_bytes.len() > MAX_COVERAGE_ATTESTATION_BYTES {
-                            tracing::warn!(peer = %propagation_source, len = coverage_attestation_bytes.len(), "inline coverage attestation too large — dropped");
-                        } else if block_bytes.len() > MAX_BLOCK_BYTES {
-                            tracing::warn!(peer = %propagation_source, len = block_bytes.len(), "inline block too large — dropped");
-                        } else if block_proof_bytes.len() > MAX_BLOCK_PROOF_BYTES {
-                            tracing::warn!(peer = %propagation_source, len = block_proof_bytes.len(), "inline proof too large — dropped");
-                        } else if block_auth_sidecar_bytes.len() > MAX_BLOCK_AUTH_SIDECAR_BYTES {
-                            tracing::warn!(peer = %propagation_source, len = block_auth_sidecar_bytes.len(), "inline auth sidecar too large — dropped");
-                        } else if !proof_sidecar_combined_len_ok(
-                            block_proof_bytes.len(),
-                            block_auth_sidecar_bytes.len(),
-                        ) {
-                            tracing::warn!(peer = %propagation_source, proof_len = block_proof_bytes.len(), sidecar_len = block_auth_sidecar_bytes.len(), "inline proof+sidecar combined cap exceeded — dropped");
-                        } else {
-                            const BLOCK_RATE_WINDOW: Duration = Duration::from_secs(10);
-                            const BLOCK_RATE_MAX: u32 = 40;
-                            if !allow_peer_rate(
-                                block_event_rate,
-                                origin,
-                                BLOCK_RATE_MAX,
-                                BLOCK_RATE_WINDOW,
-                            ) {
-                                tracing::debug!(peer = %origin, "inline block rate limit exceeded — dropped before event channel");
-                                return;
+                        match message {
+                            BlockGossipMsg::Complete(bundle) => {
+                                tracing::debug!(height = bundle.height(), peer = %propagation_source, "received complete block bundle via gossip");
+                                let _ = gossip_event_tx.send(NetworkEvent::IncomingBlock {
+                                    from: origin,
+                                    bundle,
+                                    inbound_memory_permit: None,
+                                });
                             }
-                            tracing::debug!(height, peer = %propagation_source, "received inline block via gossip");
-                            let _ = gossip_event_tx.send(NetworkEvent::NewBlock {
-                                from: origin,
-                                block_bytes,
-                                block_proof_bytes,
-                                block_auth_sidecar_bytes,
-                                coverage_attestation_bytes,
-                                inbound_memory_permit: None,
-                            });
+                            BlockGossipMsg::Header(header) => {
+                                let _ = gossip_event_tx.send(NetworkEvent::BlockAnnouncement {
+                                    from: origin,
+                                    header,
+                                });
+                            }
                         }
                     }
-                    Err(e) => {
+                    Err(error) => {
                         tracing::debug!(
                             peer = %propagation_source,
-                            err = %e,
-                            "block gossip message deserialize failed"
+                            %error,
+                            "block gossip message decode failed"
                         );
                     }
                 }
@@ -1990,58 +1773,22 @@ async fn handle_swarm_event(
                 return;
             }
             let inbound_memory_permit = response.inbound_memory_permit.clone();
-            if let Some(block_bytes) = response.block_bytes {
-                if block_bytes.len() > MAX_BLOCK_BYTES {
-                    tracing::warn!(peer = %peer, len = block_bytes.len(), "block pull response too large — dropped");
+            if let Some(bundle) = response.bundle {
+                const BLOCK_RATE_WINDOW: Duration = Duration::from_secs(10);
+                const BLOCK_RATE_MAX: u32 = 40;
+                if !allow_peer_rate(block_event_rate, peer, BLOCK_RATE_MAX, BLOCK_RATE_WINDOW) {
+                    tracing::debug!(peer = %peer, "pulled block response rate limit exceeded — dropped before event channel");
                     fail_peer!(pending.peer);
-                } else if !pulled_block_bytes_match_height(&block_bytes, response.height) {
-                    tracing::warn!(peer = %peer, response_height = response.height, "block pull response header/height mismatch — dropped");
-                    fail_peer!(pending.peer);
-                } else {
-                    let proof_bytes = response.block_proof_bytes.unwrap_or_default();
-                    let auth_sidecar_bytes = response.block_auth_sidecar_bytes.unwrap_or_default();
-                    let attestation_bytes = response.coverage_attestation_bytes.unwrap_or_default();
-                    if attestation_bytes.len() > MAX_COVERAGE_ATTESTATION_BYTES {
-                        tracing::warn!(peer = %peer, len = attestation_bytes.len(), "block coverage attestation too large — dropped");
-                        fail_peer!(pending.peer);
-                    } else if proof_bytes.len() > MAX_BLOCK_PROOF_BYTES {
-                        tracing::warn!(peer = %peer, len = proof_bytes.len(), "block proof too large — dropped");
-                        fail_peer!(pending.peer);
-                    } else if auth_sidecar_bytes.len() > MAX_BLOCK_AUTH_SIDECAR_BYTES {
-                        tracing::warn!(peer = %peer, len = auth_sidecar_bytes.len(), "block auth sidecar too large — dropped");
-                        fail_peer!(pending.peer);
-                    } else if !proof_sidecar_combined_len_ok(
-                        proof_bytes.len(),
-                        auth_sidecar_bytes.len(),
-                    ) {
-                        tracing::warn!(peer = %peer, proof_len = proof_bytes.len(), sidecar_len = auth_sidecar_bytes.len(), "block proof+sidecar combined cap exceeded — dropped");
-                        fail_peer!(pending.peer);
-                    } else {
-                        const BLOCK_RATE_WINDOW: Duration = Duration::from_secs(10);
-                        const BLOCK_RATE_MAX: u32 = 40;
-                        if !allow_peer_rate(
-                            block_event_rate,
-                            peer,
-                            BLOCK_RATE_MAX,
-                            BLOCK_RATE_WINDOW,
-                        ) {
-                            tracing::debug!(peer = %peer, "pulled block response rate limit exceeded — dropped before event channel");
-                            fail_peer!(pending.peer);
-                            return;
-                        }
-                        tracing::debug!(peer = %peer, "received block via pull");
-                        let _ = required_event_tx
-                            .send(NetworkEvent::NewBlock {
-                                from: peer,
-                                block_bytes,
-                                block_proof_bytes: proof_bytes,
-                                block_auth_sidecar_bytes: auth_sidecar_bytes,
-                                coverage_attestation_bytes: attestation_bytes,
-                                inbound_memory_permit,
-                            })
-                            .await;
-                    }
+                    return;
                 }
+                tracing::debug!(peer = %peer, height = bundle.height(), "received accepted-block bundle via pull");
+                let _ = required_event_tx
+                    .send(NetworkEvent::RecentBlock {
+                        from: peer,
+                        bundle,
+                        inbound_memory_permit,
+                    })
+                    .await;
             } else {
                 tracing::debug!(
                     peer = %peer,
@@ -2057,7 +1804,7 @@ async fn handle_swarm_event(
             }
         }
 
-        // --- Block pull: server side — serve block + proof to requesting peer ---
+        // --- Block pull: server side — serve one complete retained bundle ---
         //
         // Only last FINALITY_DEPTH blocks are available; pruned blocks return None.
         // Peers that request pruned blocks must do a full state sync instead.
@@ -2098,42 +1845,25 @@ async fn handle_swarm_event(
                 };
                 let loaded = tokio::task::spawn_blocking(move || {
                     let ctx = chain.blocking_read();
-                    match ctx.store.get_recent_block_bundle_bounded(height) {
-                        Ok(Some((block, proof, sidecar, attestation))) => {
-                            sanitize_stored_block_response(
-                                height,
-                                Some(block),
-                                proof,
-                                sidecar,
-                                attestation,
-                            )
-                        }
-                        Ok(None) => (None, None, None, None),
+                    match ctx.store.get_recent_accepted_block_bundle_bounded(height) {
+                        Ok(encoded) => decode_stored_accepted_block_bundle(height, encoded),
                         Err(error) => {
                             tracing::warn!(height, err = %error, "bounded block response read failed");
-                            (None, None, None, None)
+                            None
                         }
                     }
                 })
                 .await;
-                let (
-                    block_bytes,
-                    block_proof_bytes,
-                    block_auth_sidecar_bytes,
-                    coverage_attestation_bytes,
-                ) = match loaded {
+                let bundle = match loaded {
                     Ok(loaded) => loaded,
                     Err(error) => {
                         tracing::warn!(height, err = %error, "block response storage worker failed");
-                        (None, None, None, None)
+                        None
                     }
                 };
                 let response = GetRecentBlockResponse {
                     height,
-                    block_bytes,
-                    block_proof_bytes,
-                    block_auth_sidecar_bytes,
-                    coverage_attestation_bytes,
+                    bundle,
                     inbound_memory_permit: None,
                     outbound_memory_permit: Some(outbound_memory_permit),
                 };
@@ -2143,8 +1873,8 @@ async fn handle_swarm_event(
             });
         }
 
-        // --- Request-Response: public history proof ---
-        SwarmEvent::Behaviour(NodeBehaviourEvent::ProofSync(
+        // --- Request-Response: HistoryStep terminal server ---
+        SwarmEvent::Behaviour(NodeBehaviourEvent::HistoryStepSync(
             request_response::Event::Message {
                 message:
                     request_response::Message::Request {
@@ -2153,57 +1883,53 @@ async fn handle_swarm_event(
                 ..
             },
         )) => {
-            let Ok(preparation_permit) = history_response_prepare_semaphore
+            let Ok(preparation_permit) = history_step_response_prepare_semaphore
                 .clone()
                 .try_acquire_owned()
             else {
-                tracing::debug!("history response preparation saturated");
+                tracing::debug!("HistoryStep response preparation saturated");
                 return;
             };
             let chain = chain.clone();
             let budget = outbound_response_budget.clone();
-            let completion = history_response_tx.clone();
+            let completion = history_step_response_tx.clone();
             let request_height = request.height;
             let request_hash = request.block_hash;
             tokio::spawn(async move {
                 let _preparation_permit = preparation_permit;
-                let Ok(Some(outbound_memory_permit)) =
-                    budget.acquire(MAX_OUTBOUND_HISTORY_RESPONSE_BYTES).await
+                let Ok(Some(outbound_memory_permit)) = budget
+                    .acquire(MAX_OUTBOUND_HISTORY_STEP_RESPONSE_BYTES)
+                    .await
                 else {
                     return;
                 };
                 let loaded = tokio::task::spawn_blocking(move || {
                     let ctx = chain.blocking_read();
-                    let proof_bytes =
-                        local_public_history_proof(&ctx, request_height, request_hash);
-                    let mut tip_header_bytes = Vec::new();
-                    ctx.tip_header().encode(&mut tip_header_bytes);
-                    (proof_bytes, Some(tip_header_bytes))
+                    local_history_step_terminal(&ctx, request_height, request_hash)
                 })
                 .await;
-                let (proof_bytes, tip_header_bytes) = match loaded {
-                    Ok(loaded) => loaded,
+                let terminal_bytes = match loaded {
+                    Ok(terminal_bytes) => terminal_bytes,
                     Err(error) => {
-                        tracing::warn!(err = %error, "history response storage worker failed");
-                        (None, None)
+                        tracing::warn!(err = %error, "HistoryStep response storage worker failed");
+                        None
                     }
                 };
-                let response = GetHistoryProofResponse {
+                let response = GetHistoryStepTerminalResponse {
                     height: request_height,
                     block_hash: request_hash,
-                    proof_bytes,
-                    tip_header_bytes,
+                    terminal_bytes,
                     inbound_memory_permit: None,
                     outbound_memory_permit: Some(outbound_memory_permit),
                 };
                 let _ = completion
-                    .send(PendingHistoryProofResponse { channel, response })
+                    .send(PendingHistoryStepTerminalResponse { channel, response })
                     .await;
             });
         }
 
-        // --- Request-Response: public history proof client side ---
-        SwarmEvent::Behaviour(NodeBehaviourEvent::ProofSync(
+        // --- Request-Response: HistoryStep terminal client ---
+        SwarmEvent::Behaviour(NodeBehaviourEvent::HistoryStepSync(
             request_response::Event::Message {
                 message: request_response::Message::Response { response, .. },
                 peer,
@@ -2212,28 +1938,18 @@ async fn handle_swarm_event(
             let inbound_memory_permit = response.inbound_memory_permit.clone();
             let height = response.height;
             let block_hash = response.block_hash;
-            let proof_bytes = response.proof_bytes.unwrap_or_default();
-            let tip_header_bytes = response.tip_header_bytes.unwrap_or_default();
-            if proof_bytes.len() > MAX_HISTORY_PROOF_BYTES {
-                tracing::warn!(peer = %peer, len = proof_bytes.len(), "history proof response too large — dropped");
-                return;
-            }
-            if tip_header_bytes.len() > MAX_HEADER_BYTES {
-                tracing::warn!(peer = %peer, len = tip_header_bytes.len(), "tip header in proof response too large — dropped");
-                return;
-            }
+            let terminal_bytes = response.terminal_bytes.unwrap_or_default();
             tracing::debug!(
                 from = %peer,
-                proof_len = proof_bytes.len(),
-                "received history proof from peer"
+                terminal_len = terminal_bytes.len(),
+                "received HistoryStep terminal from peer"
             );
             let _ = required_event_tx
-                .send(NetworkEvent::HistoryProof {
+                .send(NetworkEvent::HistoryStepTerminal {
                     from: peer,
                     height,
                     block_hash,
-                    proof_bytes,
-                    tip_header_bytes,
+                    terminal_bytes,
                     inbound_memory_permit,
                 })
                 .await;
@@ -2270,7 +1986,7 @@ async fn handle_swarm_event(
             prune_snapshot_exports(snapshot_exports);
             let response = 'ready_manifest: {
                 let ctx = chain.read().await;
-                let Some((snapshot_height, snapshot_hash)) = local_selected_history_boundary(&ctx)
+                let Some((snapshot_height, snapshot_hash)) = local_history_step_boundary(&ctx)
                 else {
                     break 'ready_manifest GetStateManifestResponse::default();
                 };
@@ -2304,19 +2020,6 @@ async fn handle_swarm_event(
                     break 'ready_manifest GetStateManifestResponse::default();
                 }
 
-                let header_window = noid_chain::consensus::params::MEDIAN_TIME_BLOCKS as u64
-                    + noid_chain::consensus::params::TX_EPOCH_BLOCKS;
-                let start_height = snapshot_height.saturating_sub(header_window);
-                let mut recent_headers =
-                    Vec::with_capacity(snapshot_height.saturating_sub(start_height) as usize + 1);
-                for height in start_height..=snapshot_height {
-                    let Some(header) = ctx.get_header_from_store(height).ok().flatten() else {
-                        break 'ready_manifest GetStateManifestResponse::default();
-                    };
-                    let mut encoded = Vec::new();
-                    header.encode(&mut encoded);
-                    recent_headers.push(encoded);
-                }
                 let segment_ids = manifest
                     .segments
                     .iter()
@@ -2343,7 +2046,6 @@ async fn handle_swarm_event(
                     eff_log: manifest.effective_log_segment_size,
                     segment_ids,
                     segment_roots,
-                    recent_headers,
                 }
             };
             let _ = swarm
@@ -2360,19 +2062,6 @@ async fn handle_swarm_event(
             },
         )) => {
             if response.tip_height > 0 {
-                const MAX_RECENT_HEADERS: usize = 512;
-                if response.recent_headers.len() > MAX_RECENT_HEADERS {
-                    tracing::warn!(from = %peer, "manifest: too many headers, dropping");
-                    return;
-                }
-                if response
-                    .recent_headers
-                    .iter()
-                    .any(|h| h.len() > MAX_HEADER_BYTES)
-                {
-                    tracing::warn!(from = %peer, "manifest: oversized header entry, dropping");
-                    return;
-                }
                 if response.segment_ids.len() != response.segment_roots.len() {
                     tracing::warn!(from = %peer, "manifest: segment_ids/segment_roots length mismatch, dropping");
                     return;
@@ -2839,10 +2528,10 @@ async fn handle_swarm_event(
             fail_peer!(peer);
         }
 
-        SwarmEvent::Behaviour(NodeBehaviourEvent::ProofSync(
+        SwarmEvent::Behaviour(NodeBehaviourEvent::HistoryStepSync(
             request_response::Event::OutboundFailure { peer, error, .. },
         )) => {
-            tracing::debug!(peer = %peer, err = %error, "proof sync request failed");
+            tracing::debug!(peer = %peer, err = %error, "HistoryStep terminal request failed");
         }
 
         SwarmEvent::NewListenAddr { address, .. } => {
@@ -2859,33 +2548,34 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn inline_block_gossip_policy_uses_combined_block_proof_and_sidecar_size() {
-        assert!(should_inline_block_gossip(1, 0, 0, 0));
-        assert!(should_inline_block_gossip(
-            512 * 1024,
-            256 * 1024,
-            INLINE_BLOCK_GOSSIP_THRESHOLD - 768 * 1024,
-            0,
-        ));
-        assert!(!should_inline_block_gossip(0, 0, 0, 0));
-        assert!(!should_inline_block_gossip(
-            512 * 1024,
-            256 * 1024,
-            INLINE_BLOCK_GOSSIP_THRESHOLD - 768 * 1024 + 1,
-            0,
-        ));
-        // The attestation participates in the combined inline budget.
-        assert!(!should_inline_block_gossip(
-            512 * 1024,
-            256 * 1024,
-            INLINE_BLOCK_GOSSIP_THRESHOLD - 768 * 1024,
-            1,
-        ));
+    fn accepted_bundle(height: u64, recursive_payload_bytes: usize) -> AcceptedBlockBundle {
+        let mut header = noid_chain::consensus::genesis::genesis_header();
+        header.height = height;
+        let block = noid_chain::Block {
+            header,
+            transactions: Vec::new(),
+        };
+        let terminal_len =
+            noid_chain::HISTORY_STEP_TERMINAL_BINDING_BYTES + recursive_payload_bytes;
+        let mut terminal = Vec::with_capacity(terminal_len);
+        terminal.extend_from_slice(&noid_chain::HISTORY_STEP_TERMINAL_VERSION.to_le_bytes());
+        terminal.extend_from_slice(&height.to_le_bytes());
+        terminal.extend_from_slice(&noid_chain::block_id(&block.header));
+        terminal.resize(terminal_len, 1);
+        AcceptedBlockBundle::try_from_parts(block.to_bytes(), terminal).unwrap()
     }
 
     #[test]
-    fn snapshot_proof_serving_requires_retained_suffix() {
+    fn inline_policy_counts_the_complete_bundle_and_announcement() {
+        assert!(should_inline_accepted_block_bundle(&accepted_bundle(1, 1)));
+        assert!(!should_inline_accepted_block_bundle(&accepted_bundle(
+            1,
+            MAX_HISTORY_STEP_TERMINAL_BYTES - noid_chain::HISTORY_STEP_TERMINAL_BINDING_BYTES,
+        )));
+    }
+
+    #[test]
+    fn snapshot_terminal_serving_requires_retained_suffix() {
         let retention = noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH;
         assert!(snapshot_suffix_is_retained(100, 100));
         assert!(snapshot_suffix_is_retained(100, 100 - retention));
@@ -2894,33 +2584,14 @@ mod tests {
     }
 
     #[test]
-    fn retained_block_response_is_bound_to_requested_height_without_allocating_decode() {
-        let mut header = noid_chain::consensus::genesis::genesis_header();
-        header.height = 77;
-        let block = noid_chain::block::Block {
-            header,
-            transactions: Vec::new(),
-        };
-        let bytes = block.to_bytes();
-        assert!(pulled_block_bytes_match_height(&bytes, 77));
-        assert!(!pulled_block_bytes_match_height(&bytes, 78));
-
-        let mut bad_marker = bytes.clone();
-        bad_marker[0] ^= 1;
-        assert!(!pulled_block_bytes_match_height(&bad_marker, 77));
-        assert!(!pulled_block_bytes_match_height(
-            &bytes[..noid_chain::BLOCK_HEADER_WIRE_SIZE],
-            77
-        ));
-
-        let response = sanitize_stored_block_response(
-            78,
-            Some(bytes),
-            Some(vec![1]),
-            Some(vec![2]),
-            Some(vec![3]),
+    fn stored_bundle_decode_is_all_or_none_and_height_bound() {
+        let bundle = accepted_bundle(77, 1);
+        assert_eq!(
+            decode_stored_accepted_block_bundle(77, Some(bundle.encode())),
+            Some(bundle.clone())
         );
-        assert_eq!(response, (None, None, None, None));
+        assert!(decode_stored_accepted_block_bundle(78, Some(bundle.encode())).is_none());
+        assert!(decode_stored_accepted_block_bundle(77, Some(vec![1, 2, 3])).is_none());
     }
 
     #[test]
@@ -3062,55 +2733,12 @@ mod tests {
     }
 
     #[test]
-    fn selected_history_serving_is_exact_and_finalized() {
-        use noid_chain::storage::{FinalizedCheckpoint, MdbxChainContext, RecursiveProofJobTier};
-
-        let directory = tempfile::tempdir().unwrap();
-        let mut ctx = MdbxChainContext::open_or_create(directory.path()).unwrap();
-        let genesis = noid_chain::consensus::genesis::genesis_header();
-        let mut header = genesis;
-        header.height = 1;
-        header.prev_block_hash = noid_chain::hash_block_header(&genesis);
-        header.timestamp = header.timestamp.saturating_add(1);
-        header.nonce = 0x5151;
-        let hash = noid_chain::hash_block_header(&header);
-        ctx.store.put_header_only(&header, &hash).unwrap();
-        ctx.store
-            .enqueue_recursive_proof_job(1, hash, RecursiveProofJobTier::B8)
-            .unwrap();
-        ctx.store.claim_next_recursive_proof_job().unwrap().unwrap();
-        let terminal =
-            noid_chain::selected_history::SelectedHistoryTerminalMetadata::new(1, hash, 0)
-                .expect("B8 is the first canonical selected-history slot")
-                .encode_prefix()
-                .to_vec();
-        ctx.store
-            .complete_recursive_proof_job_and_promote_selected_history(
-                1,
-                hash,
-                &terminal,
-                &noid_chain::SelectedHistoryLadderUpdate::empty(header.log_slots),
-            )
-            .unwrap();
-        ctx.tip_height = 1;
-        ctx.tip_hash = hash;
-
-        // Coverage above the finalized boundary is not snapshot authority.
-        assert!(local_selected_history_boundary(&ctx).is_none());
-        ctx.finalized = FinalizedCheckpoint { height: 1, hash };
-        assert_eq!(local_selected_history_boundary(&ctx), Some((1, hash)));
-        assert_eq!(local_public_history_proof(&ctx, 1, hash), Some(terminal));
-        assert!(local_public_history_proof(&ctx, 1, [0xA5; 32]).is_none());
-    }
-
-    #[test]
     #[allow(clippy::assertions_on_constants)]
     fn canonical_wire_caps_are_ordered() {
-        assert!(MAX_BLOCK_PROOF_BYTES > INLINE_BLOCK_GOSSIP_THRESHOLD);
-        assert!(MAX_BLOCK_AUTH_SIDECAR_BYTES > INLINE_BLOCK_GOSSIP_THRESHOLD);
         assert!(MAX_TX_INTENT_BYTES_GLOBAL < INLINE_BLOCK_GOSSIP_THRESHOLD);
         assert!(MAX_MEMPOOL_SYNC_BYTES >= MAX_TX_INTENT_BYTES_GLOBAL);
-        assert!(MAX_HISTORY_PROOF_BYTES < MAX_BLOCK_PROOF_BYTES);
+        assert!(MAX_ACCEPTED_BLOCK_BUNDLE_BYTES > INLINE_BLOCK_GOSSIP_THRESHOLD);
+        assert!(MAX_HISTORY_STEP_TERMINAL_BYTES < MAX_ACCEPTED_BLOCK_BUNDLE_BYTES);
     }
 
     #[tokio::test]
@@ -3157,13 +2785,10 @@ mod tests {
         };
 
         for height in 0..3 {
+            let mut header = noid_chain::consensus::genesis_header();
+            header.height = height;
             gossip_tx
-                .send(NetworkEvent::NewBlockAnnouncement {
-                    from: peer,
-                    height,
-                    hash: [height as u8; 32],
-                    header_bytes: Vec::new(),
-                })
+                .send(NetworkEvent::BlockAnnouncement { from: peer, header })
                 .unwrap();
         }
         required_tx

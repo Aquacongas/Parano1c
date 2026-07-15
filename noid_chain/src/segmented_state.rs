@@ -324,11 +324,9 @@ pub struct SegmentedFriState {
     ///   (a) a virtual zero segment — no UTXO data, or
     ///   (b) an evicted segment — has UTXO data in MDBX but is not in RAM.
     /// Use `is_evicted(i)` to distinguish the two cases.
-    // Immutable segment versions are reference-counted so the selected-history
-    // proof pipeline can hand an authenticated parent version to the next
-    // replay without eagerly copying three 1 MiB columns. Every mutation goes
-    // through `Arc::make_mut`, preserving ordinary owned-state semantics while
-    // an older boundary remains queued for durable promotion.
+    // Immutable segment versions are reference-counted so hot block assembly
+    // can share a parent snapshot without eagerly copying three 1 MiB columns.
+    // Every mutation goes through `Arc::make_mut`.
     segments: Vec<Option<Arc<SegmentColumns>>>,
     /// `seg_roots[i] = None` means the root must be recomputed.
     /// Kept valid even after segment columns are evicted.
@@ -397,44 +395,6 @@ impl SegmentedFriState {
             tree[k] = compress(&tree[2 * k], &tree[2 * k + 1]);
         }
 
-        Self {
-            log_slots,
-            effective_log_seg,
-            num_segments,
-            segments: vec![None; num_segments],
-            seg_roots: vec![Some(zero_leaf); num_segments],
-            live_counts: vec![0; num_segments],
-            tree,
-            tree_dirty: false,
-            dirty: HashSet::new(),
-            mdbx_dirty: HashSet::new(),
-            exact_dirty: HashSet::new(),
-            evicted: HashSet::new(),
-            dirty_tree_leaves: HashSet::new(),
-        }
-    }
-
-    /// Test-only segmented geometry with small raw columns. Production always
-    /// uses [`LOG_SEGMENT_SIZE`], but storage/rollback tests need multiple
-    /// independently evictable segments without allocating and hashing 3 MiB
-    /// per fixture segment.
-    #[cfg(test)]
-    pub(crate) fn new_empty_with_segment_log_for_test(
-        log_slots: usize,
-        effective_log_seg: usize,
-    ) -> Self {
-        assert!(effective_log_seg >= 1);
-        assert!(effective_log_seg <= LOG_SEGMENT_SIZE);
-        assert!(effective_log_seg <= log_slots);
-        let num_segments = 1usize << (log_slots - effective_log_seg);
-        let zero_leaf = zero_seg_root_for(effective_log_seg);
-        let mut tree = vec![[0u8; 32]; 2 * num_segments + 1];
-        for index in 0..num_segments {
-            tree[num_segments + index] = zero_leaf;
-        }
-        for index in (1..num_segments).rev() {
-            tree[index] = compress(&tree[2 * index], &tree[2 * index + 1]);
-        }
         Self {
             log_slots,
             effective_log_seg,
@@ -994,7 +954,7 @@ impl SegmentedFriState {
 
     /// Install an immutable authenticated segment version without copying its
     /// three column buffers. The first later write is copy-on-write, so an
-    /// older selected-history boundary can retain the exact same allocation
+    /// older HistoryStep boundary can retain the exact same allocation
     /// safely until its ordered durable promotion completes.
     pub(crate) fn restore_shared_evicted_segment(
         &mut self,
@@ -1087,44 +1047,6 @@ impl SegmentedFriState {
             self.tree_dirty = true;
         }
         Ok(())
-    }
-
-    /// Install a live ladder-cursor segment summary without any FRI authority.
-    ///
-    /// The forward ladder cursor stores exact roots and live counts only; its
-    /// carrier state must never answer a FRI root/opening request. The segment
-    /// is marked evicted with `seg_roots = None` and left FRI-dirty, so a
-    /// later FRI flush fails closed on the eviction assertion instead of
-    /// silently hashing a zero payload.
-    pub(crate) fn install_evicted_segment_summary_without_fri(
-        &mut self,
-        seg_id: u16,
-        live_count: u32,
-    ) -> Result<(), &'static str> {
-        let id = seg_id as usize;
-        if id >= self.num_segments || live_count == 0 {
-            return Err("invalid ladder segment summary");
-        }
-        self.segments[id] = None;
-        self.live_counts[id] = live_count;
-        self.seg_roots[id] = None;
-        self.evicted.insert(seg_id);
-        self.dirty.insert(seg_id);
-        self.tree_dirty = true;
-        Ok(())
-    }
-
-    /// Move one segment's resident columns out for durable persistence.
-    ///
-    /// Returns `None` when the segment holds no resident payload. The segment
-    /// is left evicted, so the consuming state must not replay further.
-    pub(crate) fn take_segment_columns(&mut self, seg_id: u16) -> Option<Arc<SegmentColumns>> {
-        let id = seg_id as usize;
-        let columns = self.segments[id].take();
-        if columns.is_some() {
-            self.evicted.insert(seg_id);
-        }
-        columns
     }
 
     /// Finish a batch of summary installs and leave no false persistence dirt.

@@ -11,10 +11,11 @@
 //!
 //! **Merkle inclusion** (offline): Poseidon2b COMPRESS binary tree.
 //!   Must match `noid_chain::block::compute_tx_root` exactly.
-//!   Poseidon2b is used because the tx_root feeds into the BlockProof spine and
+//!   Poseidon2b is used because `tx_root` feeds the HistoryStep transition and
 //!   must stay in the arithmetic consensus hash domain.
 //! **Header lookup** (online): `getHeaderByHeight(claimed_height)` → check `tx_root`.
-//! **Chain cert verify** (offline): `verify_tip(chain_cert, ...)` with embedded proof.
+//! **Canonical-chain check** (online): compare the claimed root and timestamp
+//! against the permanently retained header at `claimed_height`.
 
 use crate::block_header::BlockHeader;
 use crate::tx_tree;
@@ -50,7 +51,6 @@ pub struct ParanoidReceipt {
     pub claimed_root: [u8; 32],
     pub claimed_height: u64,
     pub summary: TxSummary,
-    pub chain_cert: Option<Vec<u8>>,
 }
 
 impl ParanoidReceipt {
@@ -84,7 +84,6 @@ pub fn generate_receipt(
     tx_body: &TxBody,
     tx_index: usize,
     block_tx_hashes: &[[u8; 32]],
-    chain_cert: Option<Vec<u8>>,
 ) -> ParanoidReceipt {
     let tx_body_hash = tx_body.txid().0;
     assert_eq!(block_tx_hashes.get(tx_index), Some(&tx_body_hash));
@@ -99,7 +98,6 @@ pub fn generate_receipt(
         claimed_root: header.tx_root,
         claimed_height: header.height,
         summary,
-        chain_cert,
     }
 }
 
@@ -212,7 +210,6 @@ mod tests {
             log_slots: 24,
             active_slot_count: 0,
             alloc_counter: 0,
-            attested_coverage: 0,
         }
     }
 
@@ -222,7 +219,7 @@ mod tests {
         let hashes: Vec<_> = bodies.iter().map(|body| body.txid().0).collect();
         let header = header(10, tx_root(&hashes));
         for (index, body) in bodies.iter().enumerate() {
-            let receipt = generate_receipt(&header, body, index, &hashes, None);
+            let receipt = generate_receipt(&header, body, index, &hashes);
             assert_eq!(receipt.merkle_path.len(), 8);
             assert!(verify_merkle_inclusion(&receipt), "index {index}");
             assert!(verify_against_header(&receipt, &header));
@@ -240,7 +237,7 @@ mod tests {
         let bodies = [body(1), body(2), body(3)];
         let hashes: Vec<_> = bodies.iter().map(|body| body.txid().0).collect();
         let header = header(5, tx_root(&hashes));
-        let receipt = generate_receipt(&header, &bodies[1], 1, &hashes, None);
+        let receipt = generate_receipt(&header, &bodies[1], 1, &hashes);
 
         let mut bad = receipt.clone();
         bad.tx_body[80] ^= 1;

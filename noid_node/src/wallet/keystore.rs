@@ -40,6 +40,8 @@ pub enum KeystoreError {
     WrongOwner { actual: u32, expected: u32 },
     #[error("I/O: {0}")]
     Io(#[from] std::io::Error),
+    #[error("wallet artifact: {0}")]
+    Artifact(String),
 }
 
 // ---------------------------------------------------------------------------

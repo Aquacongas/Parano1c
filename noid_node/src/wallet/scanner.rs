@@ -109,7 +109,7 @@ fn derive_output_creation_ids(
             }
             // Every mint (including coinbase) consumes one allocator
             // increment, but the coinbase's unique live output STORES the
-            // height-tagged coinbase creation id (proof-gated maturity).
+            // height-tagged coinbase creation id.
             counter = counter
                 .checked_add(1)
                 .ok_or(CreationIdDerivationError::CounterOverflow)?;
@@ -162,8 +162,7 @@ pub fn update_wallet_artifacts_from_block(
         let pending_send = pending_hashes.contains(&tx_hash);
 
         if pending_send {
-            let receipt =
-                generate_receipt(&block.header, &tx.body, tx_index, &block_tx_hashes, None);
+            let receipt = generate_receipt(&block.header, &tx.body, tx_index, &block_tx_hashes);
             receipts.insert(tx_hash, receipt.to_bytes());
             continue;
         }
@@ -369,8 +368,7 @@ pub fn update_active_wallet_from_block(
         // pending history tag is the ownership signal for receipt generation.
         // Incoming-only transactions still need no receipt.
         if sent_from_wallet > 0 || already_pending {
-            let receipt =
-                generate_receipt(&block.header, &tx.body, tx_index, &block_tx_hashes, None);
+            let receipt = generate_receipt(&block.header, &tx.body, tx_index, &block_tx_hashes);
             receipts.insert(tx_hash, receipt.to_bytes());
         }
     }
@@ -431,7 +429,6 @@ mod tests {
                 log_slots: 24,
                 active_slot_count: transactions.len() as u64,
                 alloc_counter,
-                attested_coverage: 0,
             },
             transactions,
         }

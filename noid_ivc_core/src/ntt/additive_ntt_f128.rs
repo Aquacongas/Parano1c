@@ -194,16 +194,12 @@ impl AdditiveNttF128 {
         assert!(log_d <= self.log_domain_size());
         assert!(start_layer <= log_d);
 
-        // Scalar; SIMD/parallel variants below dispatch from `forward_transform_interleaved`
-        // on supported targets.
-        #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-        {
-            self.forward_transform_interleaved_parallel_from_layer(data, num_ntts, start_layer);
-        }
-        #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
-        {
-            self.forward_transform_interleaved_scalar_from_layer(data, num_ntts, start_layer);
-        }
+        // This cache-blocked path is architecture-neutral: its butterflies
+        // use F128's native multiplication backend (PCLMUL on x86_64, PMULL
+        // on aarch64) and Rayon. Historically it was hidden behind the
+        // aarch64 NEON cfg even though it calls no NEON-only helper, leaving
+        // the 1 GiB production codeword on scalar full-buffer sweeps on x86.
+        self.forward_transform_interleaved_parallel_from_layer(data, num_ntts, start_layer);
     }
 
     /// Scalar reference for the interleaved forward NTT.
@@ -246,22 +242,19 @@ impl AdditiveNttF128 {
         }
     }
 
-    /// Parallel + NEON interleaved forward NTT. Cache-blocks the same way as
+    /// Parallel interleaved forward NTT. Cache-blocks the same way as
     /// `forward_transform_batched`: top layers process the full SoA buffer with
     /// per-block parallelism; deep layers process each sub-NTT-group in cache.
     ///
-    /// Internally calls [`forward_transform_interleaved_scalar`] for very small
-    /// inputs to avoid rayon overhead; for large inputs it uses an in-place
-    /// scalar butterfly per lane (per-lane vectorization is future work — the
-    /// big win at large `m` is cache locality + thread parallelism).
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    /// Internally calls the scalar path for very small inputs to avoid Rayon
+    /// overhead. At large `m`, cache locality and admitted-pool parallelism
+    /// provide the speedup while preserving the exact scalar butterfly.
     pub fn forward_transform_interleaved_parallel(&self, data: &mut [F128], num_ntts: usize) {
         self.forward_transform_interleaved_parallel_from_layer(data, num_ntts, 0);
     }
 
     /// Parallel interleaved forward NTT from `start_layer` (see
     /// [`Self::forward_transform_interleaved_from_layer`]).
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     pub fn forward_transform_interleaved_parallel_from_layer(
         &self,
         data: &mut [F128],
@@ -1067,11 +1060,13 @@ mod tests {
         }
     }
 
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     #[test]
     fn interleaved_parallel_matches_scalar() {
         let mut rng = Rng::new(0xCC2);
-        for log_d in [4usize, 10, 14, 17, 19] {
+        // log_d=14 exercises both the top-layer Rayon path and the
+        // cache-resident deep sub-NTTs without making an identity test a
+        // production-size memory benchmark.
+        for log_d in [4usize, 10, 14] {
             for &num_ntts in &[2usize, 8, 32] {
                 let ntt = AdditiveNttF128::standard(log_d);
                 let n_total = (1 << log_d) * num_ntts;
@@ -1083,6 +1078,33 @@ mod tests {
                 assert_eq!(
                     v_par, v_scalar,
                     "interleaved parallel mismatch at log_d={log_d}, num_ntts={num_ntts}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn interleaved_parallel_from_layer_matches_scalar() {
+        let mut rng = Rng::new(0xCC3);
+        for &(log_d, num_ntts) in &[(6usize, 2usize), (12, 8), (14, 32)] {
+            let ntt = AdditiveNttF128::standard(log_d);
+            let original = rand_vec(&mut rng, (1 << log_d) * num_ntts);
+            for start_layer in [0usize, 1, 2, log_d / 2, log_d] {
+                let mut scalar = original.clone();
+                ntt.forward_transform_interleaved_scalar_from_layer(
+                    &mut scalar,
+                    num_ntts,
+                    start_layer,
+                );
+                let mut parallel = original.clone();
+                ntt.forward_transform_interleaved_parallel_from_layer(
+                    &mut parallel,
+                    num_ntts,
+                    start_layer,
+                );
+                assert_eq!(
+                    parallel, scalar,
+                    "parallel from-layer drift at log_d={log_d}, num_ntts={num_ntts}, start={start_layer}"
                 );
             }
         }

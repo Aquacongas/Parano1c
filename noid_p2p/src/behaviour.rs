@@ -37,7 +37,7 @@ const GOSSIPSUB_MESSAGE_ID_DOMAIN: &[u8] = b"NOID_P2P_GOSSIPSUB_MESSAGE_ID";
 
 use crate::block_sync_codec::BlockSyncCodec;
 use crate::header_sync_codec::HeaderSyncCodec;
-use crate::history_proof_codec::HistoryProofCodec;
+use crate::history_step_codec::HistoryStepTerminalCodec;
 use crate::mempool_sync_codec::MempoolSyncCodec;
 use crate::state_manifest_codec::StateManifestCodec;
 use crate::state_segment_codec::StateSegmentCodec;
@@ -51,14 +51,14 @@ pub struct NodeBehaviour {
     /// Block and TxIntent gossip broadcast.
     pub gossipsub: gossipsub::Behaviour,
 
-    /// Typed request-response for chain sync (headers, blocks, history proof).
+    /// Typed request-response for chain headers.
     pub chain_sync: request_response::Behaviour<HeaderSyncCodec>,
 
     /// Block sync (recent blocks).
     pub block_sync: request_response::Behaviour<BlockSyncCodec>,
 
-    /// History proof sync (O(1) chain-history verification).
-    pub proof_sync: request_response::Behaviour<HistoryProofCodec>,
+    /// Fused HistoryStep terminal for O(1) snapshot sync.
+    pub history_step_sync: request_response::Behaviour<HistoryStepTerminalCodec>,
 
     /// Kademlia DHT — primary peer discovery mechanism.
     ///
@@ -178,14 +178,8 @@ impl NodeBehaviour {
         // Block bodies are fixed-form and capped at 82,905 bytes for all 256
         // canonical transaction slots, including coinbase.
         //
-        // Block proof sizes (block_proof_bytes):
-        //   coinbase:  0 B (empty)
-        //   user-tx blocks carry BlockProof bytes. The proof caps remain
-        //   conservative until final production row-ledger measurements.
-        //
-        // Strategy: inline blocks up to 1 MB via gossip for low-tx blocks.
-        // Larger blocks use compact announcement + pull sync via block_sync
-        // request-response so peers pull block/proof bytes on demand.
+        // Complete accepted-block bundles up to 1 MB are inlined. Larger
+        // bundles use header announcement + bounded block-sync pull.
 
         let gossipsub_cfg = gossipsub::ConfigBuilder::default()
             .heartbeat_interval(Duration::from_millis(700))
@@ -244,24 +238,19 @@ impl NodeBehaviour {
 
         let block_sync = request_response::Behaviour::new(
             [(
-                // v2 is an allocation-bounded fixed-header stream codec.  It
-                // intentionally cannot negotiate with the old 10 MiB CBOR wire.
-                StreamProtocol::try_from_owned(format!("{}/sync/block/2", protocol_id))?,
+                StreamProtocol::try_from_owned(format!("{}/sync/block/1", protocol_id))?,
                 ProtocolSupport::Full,
             )],
             request_response::Config::default()
                 .with_request_timeout(Duration::from_secs(30))
-                // A response can contain 48 MiB of proof material. One stream
-                // per connection reduces scheduling pressure; the codec's
-                // process-global 64 MiB permit is the peer-count-independent
-                // RAM bound. Suffix advancement requests the next block only
-                // after the current block has been consumed.
+                // Suffix advancement requests the next complete bundle only
+                // after the current bundle has been consumed.
                 .with_max_concurrent_streams(1),
         );
 
-        let proof_sync = request_response::Behaviour::new(
+        let history_step_sync = request_response::Behaviour::new(
             [(
-                StreamProtocol::try_from_owned(format!("{}/sync/proof/2", protocol_id))?,
+                StreamProtocol::try_from_owned(format!("{}/sync/history-step/1", protocol_id))?,
                 ProtocolSupport::Full,
             )],
             request_response::Config::default()
@@ -274,7 +263,7 @@ impl NodeBehaviour {
             [(
                 // v2 checks segment/header counts and snapshot geometry before
                 // allocating either manifest vector.
-                StreamProtocol::try_from_owned(format!("{}/sync/manifest/2", protocol_id))?,
+                StreamProtocol::try_from_owned(format!("{}/sync/manifest/1", protocol_id))?,
                 ProtocolSupport::Full,
             )],
             request_response::Config::default()
@@ -398,8 +387,8 @@ impl NodeBehaviour {
         //
         // Enforced at the swarm level before any behaviour receives events.
         // Substrate defaults: 100 in / 25 out.  We use slightly higher
-        // values because Paranoid nodes actively push block proofs and
-        // have higher per-connection bandwidth.
+        // values because Paranoid nodes actively push complete block bundles
+        // and have higher per-connection bandwidth.
         let connection_limits = connection_limits::Behaviour::new(
             connection_limits::ConnectionLimits::default()
                 .with_max_established_incoming(Some(128))
@@ -412,7 +401,7 @@ impl NodeBehaviour {
             gossipsub,
             chain_sync,
             block_sync,
-            proof_sync,
+            history_step_sync,
             kad,
             mdns,
             identify,

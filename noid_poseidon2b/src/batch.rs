@@ -558,6 +558,11 @@ pub(crate) fn avx2_vpclmul_runtime() -> bool {
 pub(crate) fn vec_tables() -> &'static crate::batch_avx2::VecTables {
     static TABLES: OnceLock<crate::batch_avx2::VecTables> = OnceLock::new();
     TABLES.get_or_init(|| {
+        assert_eq!(
+            MDS_FULL,
+            [[5, 7, 1, 3], [4, 6, 1, 1], [1, 3, 5, 7], [1, 1, 4, 6]],
+            "register-domain full MDS specialization drifted from protocol constants"
+        );
         let t = flat_tables();
         let mut mds_partial_diag = [0u128; STATE_SIZE];
         for i in 0..STATE_SIZE {
@@ -573,8 +578,8 @@ pub(crate) fn vec_tables() -> &'static crate::batch_avx2::VecTables {
         }
         crate::batch_avx2::VecTables {
             rc: t.rc,
-            mds_full: t.mds_full,
-            mds_full_is_one: t.mds_full_is_one,
+            mds_full_two: tower_to_flat_u128(2),
+            mds_full_four: tower_to_flat_u128(4),
             mds_partial_diag,
         }
     })
@@ -837,9 +842,12 @@ pub fn leaf_sponge_flat_batch_with_iv_into(
         pad || leaf_size % 32 == 0,
         "no-pad mode requires whole rate blocks"
     );
+    let expected_data_len = leaf_size
+        .checked_mul(out.len())
+        .expect("leaf_size × leaf count must fit usize");
     assert_eq!(
         data.len(),
-        leaf_size * out.len(),
+        expected_data_len,
         "data length must be leaf_size × leaf count"
     );
 
@@ -857,6 +865,25 @@ pub fn leaf_sponge_flat_batch_with_iv_into(
     if PACKED_LANES == 1 || n < PACKED_LANES {
         for i in 0..n {
             scalar(i, out);
+        }
+        return;
+    }
+
+    // Production PCS leaves are fixed-length and block-aligned. Keep the
+    // complete multi-block sponge chains resident in AVX2 registers instead
+    // of crossing the packed-permutation load/store boundary after every
+    // block. Eight leaves are exactly four two-lane state groups, the same
+    // interleave width as the register-domain permutation kernel.
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+    if !pad
+        && leaf_size.is_multiple_of(32)
+        && n.is_multiple_of(PERM_INTERLEAVE * PACKED_LANES)
+        && avx2_vpclmul_runtime()
+    {
+        // SAFETY: the runtime ISA gate and public preconditions above prove
+        // the specialized kernel's alignment-independent slice contract.
+        unsafe {
+            crate::batch_avx2::leaf_sponge_flat_no_pad_into(iv, data, leaf_size, out, vec_tables());
         }
         return;
     }
@@ -1242,5 +1269,18 @@ mod tests {
                 .collect();
             assert_eq!(got, expected, "n={n} leaf_size={leaf_size}");
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "leaf_size × leaf count must fit usize")]
+    fn leaf_sponge_batch_rejects_length_product_overflow_before_unsafe_dispatch() {
+        let mut out = [[0u8; 32]; 2];
+        leaf_sponge_flat_batch_with_iv_into(
+            [0u128; 2],
+            false,
+            &[],
+            1usize << (usize::BITS - 1),
+            &mut out,
+        );
     }
 }

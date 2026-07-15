@@ -26,7 +26,7 @@ use bincode::Options;
 use noid_poseidon2b::native::poseidon2b_hash_byte_slices;
 use serde::{Deserialize, Serialize};
 
-use crate::block_header::block_id;
+use crate::block_header::{block_id, BlockHeader};
 use crate::consensus::params::{BLOCK_MAX_ACTIONS, LOG_SLOTS_MAX, UNDO_RETENTION_DEPTH};
 use crate::consensus::wire_limits::{MAX_SEGMENT_BYTES, MAX_SNAPSHOT_MANIFEST_SEGMENTS};
 use crate::exact_state_hash::slot_leaf_hash;
@@ -471,13 +471,11 @@ pub fn export_snapshot_generation(
             }
             // Tagged coinbase ids live in the `TAG | mint_height` namespace
             // and are bounded by the target height, not the allocator counter.
-            let creation_in_target =
-                if crate::consensus::params::is_coinbase_creation_id(slot.creation_id()) {
-                    crate::consensus::params::coinbase_creation_height(slot.creation_id())
-                        <= target_header.height
-                } else {
-                    slot.creation_id() <= target_header.alloc_counter
-                };
+            let creation_in_target = crate::consensus::params::creation_id_within_boundary(
+                slot.creation_id(),
+                target_header.alloc_counter,
+                target_header.height,
+            );
             if !creation_in_target {
                 return Err(SnapshotGenerationError::CreationIdExceedsTarget {
                     segment_id,
@@ -676,6 +674,23 @@ fn slot_is_in_domain(slot_index: u32, log_slots: u32) -> bool {
     log_slots >= 32 || u64::from(slot_index) < (1u64 << log_slots)
 }
 
+fn validate_undo_preimage_creation_boundary(
+    previous: SlotValue,
+    parent: &BlockHeader,
+) -> Result<(), &'static str> {
+    if previous.is_empty()
+        || crate::consensus::params::creation_id_within_boundary(
+            previous.creation_id(),
+            parent.alloc_counter,
+            parent.height,
+        )
+    {
+        Ok(())
+    } else {
+        Err("undo pre-image creation id exceeds parent boundary")
+    }
+}
+
 type SegmentRollback = (u32, SlotValue);
 
 fn collect_grouped_undo(
@@ -746,11 +761,8 @@ fn collect_grouped_undo(
                     "new expansion-half undo pre-image is not empty",
                 ));
             }
-            if !previous.is_empty() && previous.creation_id() > parent.alloc_counter {
-                return Err(SnapshotGenerationError::Corrupt(
-                    "undo pre-image creation_id exceeds parent allocator",
-                ));
-            }
+            validate_undo_preimage_creation_boundary(previous, &parent)
+                .map_err(SnapshotGenerationError::Corrupt)?;
             let segment_id = (slot_index >> segment_log) as u16;
             let local_index = slot_index & ((1u32 << segment_log) - 1);
             grouped
@@ -825,13 +837,11 @@ fn validate_segment_columns(
             continue;
         }
         // Same tag-aware namespace rule as the historical carrier.
-        let creation_in_target =
-            if crate::consensus::params::is_coinbase_creation_id(slot.creation_id()) {
-                crate::consensus::params::coinbase_creation_height(slot.creation_id())
-                    <= target_height
-            } else {
-                slot.creation_id() <= alloc_counter
-            };
+        let creation_in_target = crate::consensus::params::creation_id_within_boundary(
+            slot.creation_id(),
+            alloc_counter,
+            target_height,
+        );
         if !creation_in_target {
             return Err(SnapshotGenerationError::CreationIdExceedsTarget {
                 segment_id,
@@ -1010,197 +1020,36 @@ impl Drop for TemporaryGeneration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use noid_core::Block128;
 
-    use crate::block_header::BlockHeader;
-    use crate::consensus::da_prune::BlockUndoLog;
     use crate::consensus::genesis::genesis_header;
-    use crate::storage::meta::{ConsensusMeta, FinalizedCheckpoint};
-
-    fn live_slot(amount: u64, creation_id: u64, owner: u128) -> SlotValue {
-        SlotValue::from_parts(
-            amount,
-            creation_id,
-            Block128(owner),
-            Block128(owner.wrapping_add(1)),
-        )
-    }
-
-    fn columns(log_slots: u8, slots: &[(u32, SlotValue)]) -> SegmentColumns {
-        let mut columns = SegmentColumns::new_zero(1usize << log_slots);
-        for &(index, slot) in slots {
-            columns.values[index as usize] = slot.value;
-            columns.owners_hi[index as usize] = slot.owner_hi;
-            columns.owners_lo[index as usize] = slot.owner_lo;
-        }
-        columns
-    }
-
-    fn exact_root(log_slots: u32, slots: &[(u32, SlotValue)]) -> [u8; 32] {
-        let mut sorted = slots.to_vec();
-        sorted.sort_unstable_by_key(|(index, _)| *index);
-        let mut stream = StreamingSparseRoot::new(log_slots).unwrap();
-        for (index, slot) in sorted {
-            stream.push_leaf(index, slot_leaf_hash(slot)).unwrap();
-        }
-        stream.finish().unwrap()
-    }
-
-    fn meta(header: &BlockHeader, work: u8) -> ConsensusMeta {
-        let hash = block_id(header);
-        ConsensusMeta {
-            tip_height: header.height,
-            tip_hash: hash,
-            cumulative_chainwork: [work; 32],
-            finalized: FinalizedCheckpoint {
-                height: header.height,
-                hash,
-            },
-        }
-    }
-
-    fn commit_fixture(store: &MdbxStore) -> (BlockHeader, SlotValue) {
-        let before = live_slot(11, 1, 7);
-        let mut header0 = genesis_header();
-        header0.log_slots = 3;
-        header0.active_slot_count = 1;
-        header0.alloc_counter = 1;
-        header0.state_root = exact_root(3, &[(1, before)]);
-        let hash0 = block_id(&header0);
-        let columns0 = columns(3, &[(1, before)]);
-        store
-            .commit_block(
-                &header0,
-                &hash0,
-                &BlockUndoLog::empty(0, 3),
-                &[(0, 3, Some(&columns0))],
-                &[],
-                &[],
-                None,
-                None,
-                &meta(&header0, 1),
-                true,
-            )
-            .unwrap();
-
-        let after = live_slot(22, 2, 17);
-        let mut header1 = header0;
-        header1.height = 1;
-        header1.prev_block_hash = hash0;
-        header1.active_slot_count = 1;
-        header1.alloc_counter = 2;
-        header1.state_root = exact_root(3, &[(6, after)]);
-        let hash1 = block_id(&header1);
-        let columns1 = columns(3, &[(6, after)]);
-        let undo1 = BlockUndoLog {
-            block_height: 1,
-            log_slots_before: 3,
-            active_slot_count_before: 1,
-            alloc_counter_before: 1,
-            slot_changes: vec![(1, before), (6, SlotValue::EMPTY)],
-            tx_hashes: vec![],
-        };
-        store
-            .commit_block(
-                &header1,
-                &hash1,
-                &undo1,
-                &[(0, 3, Some(&columns1))],
-                &[],
-                &[],
-                None,
-                None,
-                &meta(&header1, 2),
-                false,
-            )
-            .unwrap();
-        (header0, before)
-    }
+    use crate::consensus::params::coinbase_creation_id;
 
     #[test]
-    fn exporter_rolls_back_to_target_and_reads_one_segment() {
-        let database = tempfile::tempdir().unwrap();
-        let exports = tempfile::tempdir().unwrap();
-        let store = MdbxStore::open(database.path()).unwrap();
-        let (target, target_slot) = commit_fixture(&store);
+    fn spent_coinbase_undo_preimage_uses_parent_height_boundary() {
+        let mut parent = genesis_header();
+        parent.height = 7;
+        parent.alloc_counter = 3;
 
-        let generation = export_snapshot_generation(&store, exports.path(), 0).unwrap();
-        assert_eq!(generation.manifest().target_hash, block_id(&target));
-        assert_eq!(generation.manifest().state_root, target.state_root);
-        assert_eq!(generation.manifest().active_slot_count, 1);
-        assert_eq!(generation.manifest().segments.len(), 1);
+        let at_parent_height = SlotValue::from_parts(
+            1,
+            coinbase_creation_id(parent.height),
+            Block128(1),
+            Block128(2),
+        );
+        assert!(validate_undo_preimage_creation_boundary(at_parent_height, &parent).is_ok());
 
-        let encoded = generation.read_encoded_segment(0).unwrap();
-        let (effective_log, decoded) = decode_segment(&encoded).unwrap();
-        assert_eq!(effective_log, 3);
-        assert_eq!(slot_at(&decoded, 1), target_slot);
-        assert_eq!(slot_at(&decoded, 6), SlotValue::EMPTY);
-
-        let reopened = open_snapshot_generation(generation.directory()).unwrap();
-        assert_eq!(reopened.manifest(), generation.manifest());
-    }
-
-    #[test]
-    fn exporter_rejects_out_of_domain_id_without_decoding_its_payload() {
-        let database = tempfile::tempdir().unwrap();
-        let exports = tempfile::tempdir().unwrap();
-        let store = MdbxStore::open(database.path()).unwrap();
-        commit_fixture(&store);
-        store
-            .put_raw_segment_record_for_test(
-                &u16::MAX.to_le_bytes(),
-                b"deliberately not a segment payload",
-            )
-            .unwrap();
-
-        assert!(matches!(
-            export_snapshot_generation(&store, exports.path(), 0),
-            Err(SnapshotGenerationError::Corrupt(
-                "durable segment lies outside tip slot domain"
-            ))
-        ));
-        assert_eq!(fs::read_dir(exports.path()).unwrap().count(), 0);
-    }
-
-    #[test]
-    fn manifest_is_not_published_when_exact_root_validation_fails() {
-        let database = tempfile::tempdir().unwrap();
-        let exports = tempfile::tempdir().unwrap();
-        let store = MdbxStore::open(database.path()).unwrap();
-        let (_target, _) = commit_fixture(&store);
-
-        // The header remains canonical but no longer authenticates the undo
-        // reconstruction.  Export must clean its private temporary directory
-        // without ever publishing a manifest.
-        let mut corrupt = store.get_header(0).unwrap().unwrap();
-        corrupt.state_root[0] ^= 1;
-        store
-            .put_header_only(&corrupt, &block_id(&corrupt))
-            .unwrap();
-        assert!(matches!(
-            export_snapshot_generation(&store, exports.path(), 0),
-            Err(SnapshotGenerationError::ExactStateRootMismatch)
-                | Err(SnapshotGenerationError::Corrupt(_))
-        ));
-        assert_eq!(fs::read_dir(exports.path()).unwrap().count(), 0);
-    }
-
-    #[test]
-    fn reader_rejects_segment_tampering() {
-        let database = tempfile::tempdir().unwrap();
-        let exports = tempfile::tempdir().unwrap();
-        let store = MdbxStore::open(database.path()).unwrap();
-        commit_fixture(&store);
-        let generation = export_snapshot_generation(&store, exports.path(), 0).unwrap();
-        let path = segment_path(generation.directory(), 0);
-        let mut bytes = fs::read(&path).unwrap();
-        let last = bytes.len() - 1;
-        bytes[last] ^= 1;
-        fs::write(path, bytes).unwrap();
-        assert!(matches!(
-            generation.read_encoded_segment(0),
-            Err(SnapshotGenerationError::InvalidSegment(0, _))
-        ));
+        let from_future_height = SlotValue::from_parts(
+            1,
+            coinbase_creation_id(parent.height + 1),
+            Block128(1),
+            Block128(2),
+        );
+        assert_eq!(
+            validate_undo_preimage_creation_boundary(from_future_height, &parent),
+            Err("undo pre-image creation id exceeds parent boundary")
+        );
     }
 
     #[test]

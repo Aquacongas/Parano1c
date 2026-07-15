@@ -44,9 +44,9 @@ pub trait ParanoidApi {
     #[method(name = "getHeaderByHash")]
     async fn get_header_by_hash(&self, hash: String) -> RpcResult<Option<String>>;
 
-    /// Current finalized selected-history terminal, when locally available.
-    #[method(name = "getHistoryProof")]
-    async fn get_history_proof(&self) -> RpcResult<Option<String>>;
+    /// Current finalized HistoryStep terminal, when locally available.
+    #[method(name = "getHistoryStepTerminal")]
+    async fn get_history_step_terminal(&self) -> RpcResult<Option<String>>;
 
     /// UTXO slot contents by index.
     #[method(name = "getSlot")]
@@ -79,7 +79,7 @@ pub trait ParanoidApi {
     // Network / mining
     // =========================================================================
 
-    /// Mining and network state: difficulty, block reward, history-proof height.
+    /// Mining and network state: difficulty, block reward, HistoryStep height.
     #[method(name = "getMiningInfo")]
     async fn get_mining_info(&self) -> RpcResult<MiningInfo>;
 
@@ -163,15 +163,10 @@ pub trait ParanoidApi {
     #[method(name = "getBlockTemplate")]
     async fn get_block_template(&self, miner_address: String) -> RpcResult<BlockTemplateResponse>;
 
-    /// Submit a solved block plus serialized BlockProof/AuthSidecar bytes.
-    /// `block_proof_hex` and `block_auth_sidecar_hex` are empty for coinbase-only blocks.
+    /// Submit only a nonce for a single-use, node-owned prepared template.
+    /// `nonce_hex` is exactly 16 little-endian bytes encoded as 32 lowercase hex chars.
     #[method(name = "submitBlock")]
-    async fn submit_block(
-        &self,
-        block_hex: String,
-        block_proof_hex: String,
-        block_auth_sidecar_hex: String,
-    ) -> RpcResult<String>;
+    async fn submit_block(&self, template_id: String, nonce_hex: String) -> RpcResult<String>;
 
     // =========================================================================
     // Node control

@@ -122,23 +122,56 @@ fn main() {
     // padded mode.
     let leaf_size = 512usize;
     let n_leaves = 1usize << 13;
-    let mut data = vec![0u8; n_leaves * leaf_size];
+    // One extra leaf deliberately makes the count non-divisible by the
+    // eight-leaf streaming width and therefore measures the generic packed
+    // implementation in the same binary as the production fast path.
+    let generic_leaves = n_leaves + 1;
+    let mut data = vec![0u8; generic_leaves * leaf_size];
     for chunk in data.chunks_exact_mut(8) {
         chunk.copy_from_slice(&splitmix(&mut seed).to_le_bytes());
     }
     let iv = capacity_iv_flat(tag);
-    let mut lout = vec![[0u8; 32]; n_leaves];
-    leaf_sponge_flat_batch_with_iv_into(iv, true, &data, leaf_size, &mut lout); // warm
+    let mut generic_out = vec![[0u8; 32]; generic_leaves];
+    leaf_sponge_flat_batch_with_iv_into(iv, false, &data, leaf_size, &mut generic_out); // warm
     let t = Instant::now();
     for _ in 0..reps {
-        leaf_sponge_flat_batch_with_iv_into(iv, true, black_box(&data), leaf_size, &mut lout);
+        leaf_sponge_flat_batch_with_iv_into(
+            iv,
+            false,
+            black_box(&data),
+            leaf_size,
+            &mut generic_out,
+        );
+    }
+    let dt = t.elapsed();
+    black_box(&generic_out);
+    let generic_per_leaf = dt.as_nanos() as f64 / (reps as f64 * generic_leaves as f64);
+    let perms_per_leaf = (leaf_size / 32) as f64;
+    println!(
+        "generic leaf_sponge 512B fixed:        {:7.1} ns/leaf  ({:.1} ns/perm, {:.2} M perms/s)",
+        generic_per_leaf,
+        generic_per_leaf / perms_per_leaf,
+        perms_per_leaf * 1e3 / generic_per_leaf
+    );
+
+    let production_data = &data[..n_leaves * leaf_size];
+    let mut lout = vec![[0u8; 32]; n_leaves];
+    leaf_sponge_flat_batch_with_iv_into(iv, false, production_data, leaf_size, &mut lout); // warm
+    let t = Instant::now();
+    for _ in 0..reps {
+        leaf_sponge_flat_batch_with_iv_into(
+            iv,
+            false,
+            black_box(production_data),
+            leaf_size,
+            &mut lout,
+        );
     }
     let dt = t.elapsed();
     black_box(&lout);
     let per_leaf = dt.as_nanos() as f64 / (reps as f64 * n_leaves as f64);
-    let perms_per_leaf = (leaf_size / 32 + 1) as f64;
     println!(
-        "batch   leaf_sponge 512B (2^13 leaves): {:7.1} ns/leaf  ({:.1} ns/perm, {:.2} M perms/s)",
+        "stream  leaf_sponge 512B fixed (2^13): {:7.1} ns/leaf  ({:.1} ns/perm, {:.2} M perms/s)",
         per_leaf,
         per_leaf / perms_per_leaf,
         perms_per_leaf * 1e3 / per_leaf

@@ -4,8 +4,9 @@
 //! Parallel Poseidon2b PoW nonce search.
 //!
 //! PoW is computed over the fixed semantic header field schedule. Detached
-//! proof and authorization sidecar bytes are not header fields, so certificate
-//! assembly and PoW search can run concurrently.
+//! nonce-independent witness data is prepared before this phase. The search
+//! then owns the miner's shared all-core pool until it finds a nonce or is
+//! cancelled; HistoryStep proving starts only after the search has drained.
 //!
 
 use noid_chain::block_header::BlockHeader;
@@ -20,7 +21,7 @@ pub struct PowSolution {
 }
 
 /// Search for a valid PoW nonce using the current Rayon pool.
-/// Internal miner calls this inside its dedicated PoW pool.
+/// Internal miner calls this inside the process-wide all-core PoW phase.
 ///
 /// Detached witness fields are not part of the PoW hash; only semantic header
 /// fields are absorbed under the `POWHDR__` domain.

@@ -82,9 +82,8 @@ fn take_u128(src: &mut &[u8]) -> Result<u128, WireError> {
 ///   log_slots              4B
 ///   active_slot_count      8B
 ///   alloc_counter          8B
-///   attested_coverage      8B
 ///   ─────────────────────────
-///   Total                220B
+///   Total                212B
 /// ```
 pub const BLOCK_HEADER_WIRE_SIZE: usize =
     32   // prev_block_hash
@@ -98,8 +97,7 @@ pub const BLOCK_HEADER_WIRE_SIZE: usize =
     + 4  // log_slots
     + 8  // active_slot_count
     + 8  // alloc_counter
-    + 8  // attested_coverage
-    ; // = 220
+    ; // = 212
 
 /// Byte offset of `BlockHeader::nonce` inside the canonical block-header wire.
 pub const BLOCK_HEADER_NONCE_OFFSET: usize = 32 + 32 + 32 + 8 + 8 + 32;
@@ -117,7 +115,6 @@ impl BlockHeader {
         put_u32(buf, self.log_slots);
         put_u64(buf, self.active_slot_count);
         put_u64(buf, self.alloc_counter);
-        put_u64(buf, self.attested_coverage);
     }
 
     pub fn to_bytes(&self) -> [u8; BLOCK_HEADER_WIRE_SIZE] {
@@ -141,7 +138,6 @@ impl BlockHeader {
         let log_slots = take_u32(src)?;
         let active_slot_count = take_u64(src)?;
         let alloc_counter = take_u64(src)?;
-        let attested_coverage = take_u64(src)?;
         Ok(Self {
             prev_block_hash,
             state_root,
@@ -154,7 +150,6 @@ impl BlockHeader {
             log_slots,
             active_slot_count,
             alloc_counter,
-            attested_coverage,
         })
     }
 
@@ -185,13 +180,12 @@ mod tests {
             log_slots: 24,
             active_slot_count: 7_777,
             alloc_counter: 8_888,
-            attested_coverage: 33,
         }
     }
 
     #[test]
     fn wire_size_constant_is_correct() {
-        assert_eq!(BLOCK_HEADER_WIRE_SIZE, 220);
+        assert_eq!(BLOCK_HEADER_WIRE_SIZE, 212);
         let h = hdr();
         assert_eq!(h.to_bytes().len(), BLOCK_HEADER_WIRE_SIZE);
     }
@@ -226,16 +220,14 @@ mod tests {
     }
 
     #[test]
-    fn new_fields_survive_roundtrip() {
+    fn state_boundary_fields_survive_roundtrip() {
         let mut h = hdr();
         h.log_slots = 27;
         h.active_slot_count = u64::MAX;
         h.alloc_counter = 123_456_789;
-        h.attested_coverage = 987_654;
         let back = BlockHeader::from_bytes(&h.to_bytes()).unwrap();
         assert_eq!(back.log_slots, 27);
         assert_eq!(back.active_slot_count, u64::MAX);
         assert_eq!(back.alloc_counter, 123_456_789);
-        assert_eq!(back.attested_coverage, 987_654);
     }
 }

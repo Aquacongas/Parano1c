@@ -508,6 +508,7 @@ where
 
     // ---- Bind the FS transcript to the statement.
     bind_statement_field_parts(challenger, &r1cs.field_statement_digest(), &commitment);
+    lap("statement bind", &mut t);
 
     // ---- Public-IO envelope binding (before any sub-protocol challenge).
     let io_claims: Vec<QuirkyDirectClaim> = match public_io {
@@ -517,6 +518,7 @@ where
         }
         None => Vec::new(),
     };
+    lap("public IO bind", &mut t);
 
     // The commitment root is already transcript-bound here. Auxiliary proof
     // messages and every challenge they induce are therefore post-commit.

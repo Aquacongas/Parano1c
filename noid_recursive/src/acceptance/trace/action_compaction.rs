@@ -192,8 +192,8 @@ fn action_from_lanes(mut lanes: Vec<LinExpr>) -> ActionRowTrace {
 /// counter is pinned to the child accumulator/header value. Callers must have
 /// proved every mint amount is u64 before this pass.
 ///
-/// Exact twin of the `state_delta` mint branch (proof-gated coinbase
-/// maturity): EVERY mint consumes one allocator increment and the incremented
+/// Exact twin of the `state_delta` mint branch (height-tagged coinbase
+/// identity): EVERY mint consumes one allocator increment and the incremented
 /// counter must never enter the tagged coinbase namespace (bit 63), but the
 /// SINGLE mandatory coinbase output — canonical body order fixes it as
 /// `actions[0]` — stores `COINBASE_CREATION_TAG | block_height` instead of

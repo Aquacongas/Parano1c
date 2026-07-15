@@ -277,7 +277,7 @@ dependencies = [
  "noid_recursive",
  "noid_tx",
  "rayon",
- "serde",
+ "tracing-subscriber",
  "zstd",
 ]
 
@@ -2582,18 +2582,12 @@ dependencies = [
 name = "noid_block"
 version = "0.1.0"
 dependencies = [
- "bincode",
- "noid-ivc-core",
- "noid-ivc-prover",
  "noid_chain",
  "noid_core",
  "noid_gkr",
  "noid_poseidon2b",
  "noid_recursive",
  "noid_tx",
- "rayon",
- "serde",
- "tracing",
 ]
 
 [[package]]
@@ -2687,7 +2681,6 @@ name = "noid_miner"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bench_prover",
  "bincode",
  "hex",
  "libc",
@@ -2755,15 +2748,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "bincode",
  "futures",
  "libp2p",
  "libp2p-connection-limits",
- "noid_block",
  "noid_chain",
  "noid_mempool",
  "noid_poseidon2b",
- "noid_recursive",
  "noid_tx",
  "serde",
  "serde_json",
@@ -2803,6 +2793,7 @@ dependencies = [
  "noid_tx",
  "rayon",
  "serde",
+ "tracing",
 ]
 
 [[package]]
@@ -2810,11 +2801,9 @@ name = "noid_rpc"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bincode",
  "hex",
  "http 1.4.1",
  "jsonrpsee",
- "noid_block",
  "noid_chain",
  "noid_mempool",
  "noid_miner",

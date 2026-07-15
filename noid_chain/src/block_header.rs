@@ -33,10 +33,9 @@ use noid_poseidon2b::primitives::{Address, Digest};
 ///   log_slots             [4B]   current slot-space depth (LE u32)
 ///   active_slot_count     [8B]   live UTXO count after this block (LE u64)
 ///   alloc_counter         [8B]   monotonic PRNG seed after this block (LE u64)
-///   attested_coverage     [8B]   proven selected-history frontier (LE u64)
 /// ```
 ///
-/// Total: 220 bytes (see `BLOCK_HEADER_WIRE_SIZE`).
+/// Total: 212 bytes (see `BLOCK_HEADER_WIRE_SIZE`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BlockHeader {
     pub prev_block_hash: Digest,
@@ -63,12 +62,6 @@ pub struct BlockHeader {
     /// Monotonic PRNG seed: incremented on every successful mint.
     /// MUST equal `ChainState::alloc_counter` after `apply_block`.
     pub alloc_counter: u64,
-    /// Highest height C whose recursive Link proof (ladder back to genesis)
-    /// has been attested on-chain. Monotone by construction: a block either
-    /// repeats its parent's value or raises it by carrying a natively
-    /// verified Link envelope for exactly this height (`C <= parent.height`).
-    /// Genesis: 0. Gates coinbase maturity (proof-gated coinbase spends).
-    pub attested_coverage: u64,
 }
 
 /// Compute the semantic `block_id` — the Poseidon2b hash of the canonical
@@ -90,12 +83,6 @@ pub fn hash_block_header(hdr: &BlockHeader) -> Digest {
     s.absorb(Block128::from(hdr.log_slots as u128));
     s.absorb(Block128::from(hdr.active_slot_count as u128));
     s.absorb(Block128::from(hdr.alloc_counter as u128));
-    s.absorb(Block128::from(hdr.attested_coverage as u128));
-    // Reserved constant-zero element: keeps the semantic absorb schedule
-    // identical to the fixed 18-field PoW schedule (`pow_header_fields`), so
-    // both header hashes are sponges over one shared field vector. Safe: the
-    // schedule length is a consensus constant.
-    s.absorb(Block128::from(0u128));
 
     s.finalize()
 }
@@ -130,7 +117,6 @@ mod tests {
             log_slots: 24,
             active_slot_count: 12_345,
             alloc_counter: 99_999,
-            attested_coverage: 77,
         }
     }
 
@@ -169,7 +155,6 @@ mod tests {
         check!(log_slots, base.log_slots + 1);
         check!(active_slot_count, base.active_slot_count + 1);
         check!(alloc_counter, base.alloc_counter + 1);
-        check!(attested_coverage, base.attested_coverage + 1);
     }
 
     #[test]
@@ -192,8 +177,6 @@ mod tests {
         s.absorb(Block128::from(h.log_slots as u128));
         s.absorb(Block128::from(h.active_slot_count as u128));
         s.absorb(Block128::from(h.alloc_counter as u128));
-        s.absorb(Block128::from(h.attested_coverage as u128));
-        s.absorb(Block128::from(0u128));
         let tx8x2_flavor = s.finalize();
 
         assert_ne!(block_digest, tx8x2_flavor);

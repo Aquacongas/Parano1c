@@ -8,7 +8,7 @@
 //! - Zero state (all slots empty)
 //! - Fixed Poseidon2b PoW target
 //! - Coinbase to burn address (initial coins bootstrapping)
-//! - zero detached witness metadata; genesis has no block proof
+//! - no transported HistoryStep terminal; genesis is the built-in recursion boundary
 //!
 //! The genesis state_root is the direct exact sparse-Merkle root of an empty UTXO tree.
 
@@ -43,12 +43,10 @@ pub fn genesis_header() -> BlockHeader {
         miner_address: GENESIS_BURN_ADDRESS,
         nonce: GENESIS_NONCE,
         difficulty_target: GENESIS_TARGET,
-        // No BlockProof for genesis.
+        // Genesis is built in and has no attached HistoryStep terminal.
         log_slots: LOG_SLOTS_GENESIS,
         active_slot_count: 0,
         alloc_counter: 0,
-        // Genesis needs no Link proof: nothing precedes it.
-        attested_coverage: 0,
     }
 }
 
@@ -69,8 +67,8 @@ const GENESIS_STATE_ROOT: [u8; 32] = [
 
 /// Pre-mined genesis nonce.
 /// Satisfies: `H_POSEIDON_POW(genesis_header()) < GENESIS_TARGET`.
-/// Re-mined for the `attested_coverage` header layout (18-field PoW schedule).
-const GENESIS_NONCE: u128 = 73_403;
+/// Mined for the canonical 16-field PoW schedule.
+const GENESIS_NONCE: u128 = 149_245;
 
 /// Find and return a valid genesis nonce at runtime.
 /// Used for verification only — not for production (nonce is hardcoded as `GENESIS_NONCE`).
@@ -147,7 +145,6 @@ mod tests {
             log_slots: LOG_SLOTS_GENESIS,
             active_slot_count: 0,
             alloc_counter: 0,
-            attested_coverage: 0,
         };
         search_pow(&h, 0, 2_000_000_000).expect("genesis target is trivially satisfiable")
     }

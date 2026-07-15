@@ -4,7 +4,7 @@
 //! Production wire, memory and decode limits shared by node, P2P, RPC and mempool.
 //!
 //! These are not cryptographic security parameters. They are DoS guardrails around
-//! the proof-native protocol: every large object must be bounded before expensive
+//! the accepted-bundle protocol: every large object must be bounded before expensive
 //! decode, allocation, verification or storage.
 
 /// Maximum serialized authorization and intent sizes for the sole fixed body.
@@ -27,21 +27,6 @@ pub const MAX_MEMPOOL_SYNC_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_BLOCK_BYTES: usize =
     1 + crate::wire::BLOCK_HEADER_WIRE_SIZE + 4 + 256 * noid_tx::TX_BODY_WIRE_SIZE;
 
-/// Maximum serialized coverage-attestation payload attached to a block.
-///
-/// The attestation is one selected-history Link terminal envelope, so it
-/// shares the terminal proof wire cap.
-pub const MAX_COVERAGE_ATTESTATION_BYTES: usize = MAX_HISTORY_PROOF_BYTES;
-
-/// Maximum serialized canonical BlockProof payload.
-pub const MAX_BLOCK_PROOF_BYTES: usize = 32 * 1024 * 1024;
-
-/// Maximum serialized public BlockAuthSidecar payload.
-pub const MAX_BLOCK_AUTH_SIDECAR_BYTES: usize = 32 * 1024 * 1024;
-
-/// Maximum combined BlockProof + BlockAuthSidecar payload.
-pub const MAX_BLOCK_PROOF_PLUS_SIDECAR_BYTES: usize = 48 * 1024 * 1024;
-
 /// Maximum block resource weight accepted before expensive proof verification.
 ///
 /// This is an admission/DoS guard, not the consensus semantic throughput
@@ -60,15 +45,15 @@ pub const BLOCK_WEIGHT_PER_STATE_FRONTIER_NODE: usize = 256;
 /// Gossipsub message size. Large blocks must use compact announce + pull.
 pub const GOSSIP_MAX_TRANSMIT_BYTES: usize = 2 * 1024 * 1024;
 
-/// Inline block gossip threshold for block + proof + sidecar.
+/// Inline gossip threshold for one complete accepted block bundle.
 pub const INLINE_BLOCK_GOSSIP_THRESHOLD: usize = 1024 * 1024;
 
-/// Maximum selected-history terminal proof bytes accepted over RPC/P2P.
+/// Maximum serialized fused `HistoryStep` terminal carried by one
+/// [`AcceptedBlockBundle`](crate::accepted_block_bundle::AcceptedBlockBundle).
 ///
-/// The production four-slot Link envelope currently measures 580,495 bytes.
 /// One MiB leaves bounded codec framing margin without coupling the wire cap to
 /// an exact serialization snapshot. This remains constant in chain height.
-pub const MAX_HISTORY_PROOF_BYTES: usize = 1024 * 1024;
+pub const MAX_HISTORY_STEP_TERMINAL_BYTES: usize = 1024 * 1024;
 
 /// Maximum encoded block header bytes accepted over P2P/RPC paths.
 pub const MAX_HEADER_BYTES: usize = 512;
@@ -88,7 +73,7 @@ pub const MAX_INFLIGHT_SEGMENTS: usize = 8;
 /// Maximum orphan blocks retained by count.
 pub const MAX_ORPHAN_POOL: usize = 36;
 
-/// Maximum orphan block/proof/sidecar bytes retained in RAM.
+/// Maximum orphan accepted-bundle bytes retained in RAM.
 pub const MAX_ORPHAN_POOL_BYTES: usize = 128 * 1024 * 1024;
 
 /// Maximum receipt bytes accepted via RPC before decode.
@@ -103,24 +88,15 @@ pub const fn hex_chars_for_bytes(bytes: usize) -> usize {
 }
 
 #[inline]
-pub fn proof_sidecar_combined_len_ok(proof_len: usize, sidecar_len: usize) -> bool {
-    proof_len.saturating_add(sidecar_len) <= MAX_BLOCK_PROOF_PLUS_SIDECAR_BYTES
-}
-
-#[inline]
-#[allow(clippy::too_many_arguments)]
 pub fn block_resource_weight(
     block_body_len: usize,
-    proof_len: usize,
-    sidecar_len: usize,
+    history_step_terminal_len: usize,
     user_txs: usize,
     live_inputs: usize,
     outputs: usize,
     state_frontier_nodes: usize,
 ) -> Option<usize> {
-    let mut weight = block_body_len
-        .checked_add(proof_len)?
-        .checked_add(sidecar_len)?;
+    let mut weight = block_body_len.checked_add(history_step_terminal_len)?;
     weight = weight.checked_add(user_txs.checked_mul(BLOCK_WEIGHT_PER_USER_TX)?)?;
     weight = weight.checked_add(live_inputs.checked_mul(BLOCK_WEIGHT_PER_LIVE_INPUT)?)?;
     weight = weight.checked_add(outputs.checked_mul(BLOCK_WEIGHT_PER_OUTPUT)?)?;
@@ -130,11 +106,9 @@ pub fn block_resource_weight(
 }
 
 #[inline]
-#[allow(clippy::too_many_arguments)]
 pub fn block_resource_weight_ok(
     block_body_len: usize,
-    proof_len: usize,
-    sidecar_len: usize,
+    history_step_terminal_len: usize,
     user_txs: usize,
     live_inputs: usize,
     outputs: usize,
@@ -142,8 +116,7 @@ pub fn block_resource_weight_ok(
 ) -> bool {
     block_resource_weight(
         block_body_len,
-        proof_len,
-        sidecar_len,
+        history_step_terminal_len,
         user_txs,
         live_inputs,
         outputs,
@@ -160,27 +133,14 @@ mod tests {
     fn final_wire_caps_match_canonical_constructions() {
         assert_eq!(MAX_AUTHORIZATION_BYTES, noid_tx::MAX_TX_AUTHORIZATION_BYTES);
         assert_eq!(MAX_TX_INTENT_BYTES_GLOBAL, noid_tx::MAX_TX_INTENT_BYTES);
-        assert_eq!(MAX_BLOCK_BYTES, 82_913);
-        assert!(MAX_HISTORY_PROOF_BYTES > 580_495);
-        assert_eq!(MAX_COVERAGE_ATTESTATION_BYTES, MAX_HISTORY_PROOF_BYTES);
-    }
-
-    #[test]
-    fn combined_proof_cap_is_checked_without_overflow() {
-        assert!(proof_sidecar_combined_len_ok(
-            MAX_BLOCK_PROOF_BYTES,
-            MAX_BLOCK_PROOF_PLUS_SIDECAR_BYTES - MAX_BLOCK_PROOF_BYTES,
-        ));
-        assert!(!proof_sidecar_combined_len_ok(
-            MAX_BLOCK_PROOF_BYTES,
-            MAX_BLOCK_AUTH_SIDECAR_BYTES,
-        ));
+        assert_eq!(MAX_BLOCK_BYTES, 82_905);
+        assert!(MAX_HISTORY_STEP_TERMINAL_BYTES > 580_495);
     }
 
     #[test]
     fn resource_weight_uses_checked_arithmetic() {
-        assert!(block_resource_weight(1, 2, 3, 4, 5, 6, 7).is_some());
-        assert!(block_resource_weight(usize::MAX, 1, 0, 0, 0, 0, 0).is_none());
+        assert!(block_resource_weight(1, 2, 3, 4, 5, 6).is_some());
+        assert!(block_resource_weight(usize::MAX, 1, 0, 0, 0, 0).is_none());
     }
 
     #[test]
@@ -199,8 +159,7 @@ mod tests {
         assert_eq!(frontier, 22_468);
         let weight = block_resource_weight(
             MAX_BLOCK_BYTES,
-            MAX_BLOCK_PROOF_BYTES,
-            MAX_BLOCK_PROOF_PLUS_SIDECAR_BYTES - MAX_BLOCK_PROOF_BYTES,
+            MAX_HISTORY_STEP_TERMINAL_BYTES,
             BLOCK_MAX_USER_TXS,
             BLOCK_MAX_LIVE_INPUTS,
             BLOCK_MAX_USER_OUTPUTS + 1,
@@ -208,7 +167,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(BLOCK_MAX_TXS, 256);
-        assert_eq!(weight, 62_956_513);
+        assert_eq!(weight, 13_673_433);
         assert!(weight <= MAX_BLOCK_RESOURCE_WEIGHT);
     }
 }

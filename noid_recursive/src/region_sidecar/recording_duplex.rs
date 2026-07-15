@@ -539,21 +539,11 @@ pub(crate) fn verify_recording_duplex_region_walk_deferred_prefix_trace<'a, C: F
     let total_vars = context.total_vars();
     preflight_recording_duplex_region_walk_deferred(vk, total_vars, proof)?;
     context.observe_label(b, RECORDING_DUPLEX_SIDECAR_TRANSCRIPT_LABEL);
-    // WITNESS lanes pinned to the digest constants (same FS_OP_BYTES header
-    // and packed lanes as the native `observe_bytes`).  The recordings-only
-    // vertical hosts the very [R]-replay recording whose schedule this
-    // replay produces; a constant absorb would bake the vertical's digest
-    // into its own layout (a hash fixed point), so the digest must ride the
-    // matrix pins instead of the recording schedule.
-    let digest_lanes = crate::acceptance::trace::self_verify::flat_digest_lanes(
+    crate::acceptance::trace::self_verify::observe_pinned_digest(
+        b,
+        context,
         &vk.transcript_digest(),
-    )
-    .map(|lane| {
-        let wire = LinExpr::from_wire(b.alloc_f128(lane));
-        crate::acceptance::trace::pin_eq(b, &wire, &LinExpr::constant(lane));
-        wire
-    });
-    context.observe_lanes(b, 32, &digest_lanes);
+    );
     let prefix = verify_duplex_union_walk_prefix_trace(
         b,
         context,

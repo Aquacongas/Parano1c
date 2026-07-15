@@ -4,12 +4,12 @@
 //! Bounded-memory candidate-header staging for deep snapshot synchronization.
 //!
 //! Peer headers are consensus-validated against one fixed canonical base and
-//! appended to a private, crash-disposable file.  They are deliberately not
-//! inserted into the canonical MDBX tables until the selected-history
-//! terminal has authenticated the exact staged tip.  The file uses fixed-size
-//! records, so validation and restart recovery retain only the consensus
-//! windows (currently at most 18 headers) in memory regardless of candidate
-//! chain length.
+//! appended to a private, crash-disposable file. Once the complete suffix is
+//! natively validated, it travels with the verified HistoryStep terminal and
+//! is streamed into the same MDBX transaction as snapshot state and rewarded
+//! tip. The file uses fixed-size records, so validation and restart
+//! recovery retain only the consensus windows (currently at most 18 headers)
+//! in memory regardless of candidate chain length.
 
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
@@ -22,9 +22,7 @@ use noid_chain::consensus::params::{
     EPOCH_LENGTH, EXPANSION_WINDOW, MEDIAN_TIME_BLOCKS, TX_EPOCH_BLOCKS,
 };
 use noid_chain::consensus::{add_work, asert_anchor_height, block_work};
-use noid_chain::storage::{
-    MdbxStore, StoreError, VerifiedHeaderBatchRecord, MAX_VERIFIED_HEADER_BATCH_RECORDS,
-};
+use noid_chain::storage::{MdbxStore, SnapshotHeaderInstallSource, VerifiedHeaderBatchRecord};
 use noid_chain::wire::BLOCK_HEADER_WIRE_SIZE;
 use noid_chain::{hash_block_header, HeaderChainAnchor};
 
@@ -36,7 +34,7 @@ const RECORD_SIZE: usize = BLOCK_HEADER_WIRE_SIZE + 32 + 32;
 /// Matches the P2P header response cap.  Keeping this explicit prevents an
 /// accidentally unbounded caller-provided slice from becoming the temporary
 /// working set even though the on-disk chain itself is not RAM-bounded.
-pub const MAX_STAGED_HEADER_BATCH: usize = MAX_VERIFIED_HEADER_BATCH_RECORDS;
+pub const MAX_STAGED_HEADER_BATCH: usize = 512;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SnapshotHeaderStagingError {
@@ -50,9 +48,7 @@ pub enum SnapshotHeaderStagingError {
     InvalidCandidate { height: u64, reason: String },
     #[error("snapshot header canonical conflict at h={height}: {reason}")]
     CanonicalConflict { height: u64, reason: String },
-    #[error("selected-history terminal rejected staged headers: {0}")]
-    TerminalRejected(String),
-    #[error("authenticated snapshot header staging changed after terminal verification: {0}")]
+    #[error("validated snapshot header staging changed before atomic install: {0}")]
     VerifiedFileChanged(&'static str),
     #[error("snapshot header staging is poisoned by a failed durable write; reopen it")]
     Poisoned,
@@ -213,9 +209,9 @@ impl StagingFileIdentity {
     }
 }
 
-/// Exact header inputs supplied to selected-terminal verification.
+/// Exact header inputs supplied to HistoryStep verification.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SelectedTerminalHeaderBoundary {
+pub struct SnapshotHeaderBoundary {
     pub tip_header: BlockHeader,
     pub tip_hash: [u8; 32],
     pub cumulative_chainwork: [u8; 32],
@@ -438,15 +434,14 @@ impl SnapshotHeaderStaging {
         Ok(Some(self.read_record(index)?.header))
     }
 
-    /// Bind the staged tip, exact work and transaction-epoch header before the
-    /// expensive selected-terminal verifier is invoked.
-    pub fn terminal_boundary(
+    /// Bind the staged tip, exact work and transaction-epoch header.
+    pub fn exact_boundary(
         &mut self,
         store: &MdbxStore,
         expected_height: u64,
         expected_hash: [u8; 32],
         expected_chainwork: [u8; 32],
-    ) -> Result<SelectedTerminalHeaderBoundary> {
+    ) -> Result<SnapshotHeaderBoundary> {
         let tip = self.tip_record()?;
         if tip.header.height != expected_height {
             return Err(SnapshotHeaderStagingError::InvalidCandidate {
@@ -473,7 +468,7 @@ impl SnapshotHeaderStaging {
                 reason: "transaction-epoch anchor header is missing".into(),
             },
         )?;
-        Ok(SelectedTerminalHeaderBoundary {
+        Ok(SnapshotHeaderBoundary {
             tip_header: tip.header,
             tip_hash: tip.block_hash,
             cumulative_chainwork: tip.cumulative_chainwork,
@@ -481,37 +476,29 @@ impl SnapshotHeaderStaging {
         })
     }
 
-    /// The only transition to a promotable stage.  The closure is expected to
-    /// run selected-terminal verification using exactly the supplied boundary;
-    /// an error preserves the isolated file and exposes no canonical writer.
-    pub fn verify_terminal<F>(
+    /// Validate and read-only seal a complete native header chain before it
+    /// may enter the atomic snapshot installation transaction.
+    pub fn validate_complete(
         mut self,
         store: &MdbxStore,
         expected_height: u64,
         expected_hash: [u8; 32],
         expected_chainwork: [u8; 32],
-        verifier: F,
-    ) -> Result<VerifiedSnapshotHeaderStaging>
-    where
-        F: FnOnce(&SelectedTerminalHeaderBoundary) -> std::result::Result<(), String>,
-    {
+    ) -> Result<ValidatedSnapshotHeaderStaging> {
         let boundary =
-            self.terminal_boundary(store, expected_height, expected_hash, expected_chainwork)?;
-        verifier(&boundary).map_err(SnapshotHeaderStagingError::TerminalRejected)?;
+            self.exact_boundary(store, expected_height, expected_hash, expected_chainwork)?;
 
-        // Terminal verification can be expensive.  Treat the file as
-        // untrusted again afterwards: validate every record, re-derive both
-        // terminal header inputs, and require exact equality with what the
-        // verifier saw.  Only then replace our writable descriptor with a
-        // read-only O_NOFOLLOW descriptor for the same inode.
+        // Validate every record, re-derive the exact boundary, then replace
+        // the writable descriptor with a read-only O_NOFOLLOW descriptor for
+        // the same inode.
         self.revalidate_complete_file(store)?;
-        let revalidated = self.terminal_boundary(
+        let revalidated = self.exact_boundary(
             store,
             boundary.tip_header.height,
             boundary.tip_hash,
             boundary.cumulative_chainwork,
         )?;
-        ensure_exact_terminal_boundary(&boundary, &revalidated)?;
+        ensure_exact_header_boundary(&boundary, &revalidated)?;
 
         let writable_identity = StagingFileIdentity::capture(&self.file)?;
         let expected_len = staged_file_len(self.count)?;
@@ -531,27 +518,52 @@ impl SnapshotHeaderStaging {
         }
         self.file = read_only;
 
-        // Revalidate through the descriptor that promotion will actually use.
+        // Revalidate through the descriptor that atomic installation will use.
         // This closes the path-reopen interval and drops the last writable
-        // descriptor owned by the node before promotable typestate exists.
+        // descriptor owned by the node before installable typestate exists.
         self.revalidate_complete_file(store)?;
-        let sealed_boundary = self.terminal_boundary(
+        let sealed_boundary = self.exact_boundary(
             store,
             boundary.tip_header.height,
             boundary.tip_hash,
             boundary.cumulative_chainwork,
         )?;
-        ensure_exact_terminal_boundary(&boundary, &sealed_boundary)?;
+        ensure_exact_header_boundary(&boundary, &sealed_boundary)?;
         let sealed_identity = StagingFileIdentity::capture(&self.file)?;
         if sealed_identity != read_only_identity {
             return Err(SnapshotHeaderStagingError::VerifiedFileChanged(
                 "staging metadata changed while sealing",
             ));
         }
-        Ok(VerifiedSnapshotHeaderStaging {
+        let history_window = MEDIAN_TIME_BLOCKS as u64 + TX_EPOCH_BLOCKS;
+        let first_recent = boundary.tip_header.height.saturating_sub(history_window);
+        let mut recent_headers = Vec::with_capacity(
+            boundary
+                .tip_header
+                .height
+                .saturating_sub(first_recent)
+                .saturating_add(1) as usize,
+        );
+        for height in first_recent..=boundary.tip_header.height {
+            recent_headers.push(self.header_at(store, height)?.ok_or(
+                SnapshotHeaderStagingError::CanonicalConflict {
+                    height,
+                    reason:
+                        "header required by the post-snapshot consensus window is missing".into(),
+                },
+            )?);
+        }
+        if StagingFileIdentity::capture(&self.file)? != sealed_identity {
+            return Err(SnapshotHeaderStagingError::VerifiedFileChanged(
+                "staging metadata changed while reading the recent header window",
+            ));
+        }
+        Ok(ValidatedSnapshotHeaderStaging {
             staging: self,
             boundary,
             file_identity: sealed_identity,
+            recent_headers,
+            next_install_index: 0,
         })
     }
 
@@ -681,86 +693,19 @@ impl SnapshotHeaderStaging {
     }
 }
 
-/// A stage for which selected-terminal verification has succeeded.  No public
-/// constructor exists, so canonical promotion cannot be reached through the
-/// ordinary unverified staging path.
-pub struct VerifiedSnapshotHeaderStaging {
+/// A fully native-validated, read-only header suffix. No public constructor
+/// exists, so unvalidated bytes cannot reach the permanent header archive.
+pub struct ValidatedSnapshotHeaderStaging {
     staging: SnapshotHeaderStaging,
-    boundary: SelectedTerminalHeaderBoundary,
+    boundary: SnapshotHeaderBoundary,
     file_identity: StagingFileIdentity,
+    recent_headers: Vec<BlockHeader>,
+    next_install_index: u64,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct HeaderPromotionReport {
-    pub already_canonical: u64,
-    pub promoted: u64,
-}
-
-impl VerifiedSnapshotHeaderStaging {
-    pub fn boundary(&self) -> SelectedTerminalHeaderBoundary {
+impl ValidatedSnapshotHeaderStaging {
+    pub fn boundary(&self) -> SnapshotHeaderBoundary {
         self.boundary
-    }
-
-    /// Promote the authenticated suffix through fixed-size atomic MDBX
-    /// batches.  The staging file is streamed and never materialized as one
-    /// chain-sized vector.  Every batch independently checks its exact
-    /// existing prefix, parent link, cumulative work, hash index and anchor;
-    /// a crash or later conflict therefore leaves only an authenticated
-    /// prefix and retry is idempotent.
-    ///
-    /// The caller must serialize this operation with normal canonical-chain
-    /// mutation (the daemon does so with its chain write guard).
-    pub fn promote(&mut self, store: &MdbxStore) -> Result<HeaderPromotionReport> {
-        self.assert_file_unchanged_before_read()?;
-        self.staging.revalidate_complete_file(store)?;
-        let current_boundary = self.staging.terminal_boundary(
-            store,
-            self.boundary.tip_header.height,
-            self.boundary.tip_hash,
-            self.boundary.cumulative_chainwork,
-        )?;
-        ensure_exact_terminal_boundary(&self.boundary, &current_boundary)?;
-        self.assert_file_unchanged_before_read()?;
-        let mut report = HeaderPromotionReport::default();
-        let mut next_index = 0u64;
-        while next_index < self.staging.count {
-            self.assert_file_unchanged_before_read()?;
-            let remaining = self.staging.count - next_index;
-            let batch_len = remaining.min(MAX_VERIFIED_HEADER_BATCH_RECORDS as u64) as usize;
-            let mut batch = Vec::with_capacity(batch_len);
-            for offset in 0..batch_len {
-                let record = self.staging.read_record(next_index + offset as u64)?;
-                batch.push(VerifiedHeaderBatchRecord {
-                    header: record.header,
-                    hash: record.block_hash,
-                    cumulative_chainwork: record.cumulative_chainwork,
-                });
-            }
-            self.assert_file_unchanged_before_read()?;
-            let outcome =
-                store
-                    .put_verified_headers_batch(&batch)
-                    .map_err(|error| match error {
-                        StoreError::Decode(reason) => {
-                            SnapshotHeaderStagingError::CanonicalConflict {
-                                height: batch[0].header.height,
-                                reason: reason.to_owned(),
-                            }
-                        }
-                        other => store_error(other),
-                    })?;
-            report.already_canonical = report
-                .already_canonical
-                .checked_add(outcome.existing as u64)
-                .ok_or(SnapshotHeaderStagingError::Format(
-                    "header promotion report overflow",
-                ))?;
-            report.promoted = report.promoted.checked_add(outcome.promoted as u64).ok_or(
-                SnapshotHeaderStagingError::Format("header promotion report overflow"),
-            )?;
-            next_index += batch_len as u64;
-        }
-        Ok(report)
     }
 
     pub fn discard(self) -> Result<()> {
@@ -778,11 +723,56 @@ impl VerifiedSnapshotHeaderStaging {
     }
 }
 
-fn ensure_exact_terminal_boundary(
-    authenticated: &SelectedTerminalHeaderBoundary,
-    current: &SelectedTerminalHeaderBoundary,
+impl SnapshotHeaderInstallSource for ValidatedSnapshotHeaderStaging {
+    fn base_record(&self) -> VerifiedHeaderBatchRecord {
+        VerifiedHeaderBatchRecord {
+            header: self.staging.base.header,
+            hash: self.staging.base.block_hash,
+            cumulative_chainwork: self.staging.base.cumulative_chainwork,
+        }
+    }
+
+    fn target_record(&self) -> VerifiedHeaderBatchRecord {
+        VerifiedHeaderBatchRecord {
+            header: self.boundary.tip_header,
+            hash: self.boundary.tip_hash,
+            cumulative_chainwork: self.boundary.cumulative_chainwork,
+        }
+    }
+
+    fn recent_headers(&self) -> &[BlockHeader] {
+        &self.recent_headers
+    }
+
+    fn next_record(&mut self) -> std::result::Result<Option<VerifiedHeaderBatchRecord>, String> {
+        self.assert_file_unchanged_before_read()
+            .map_err(|error| error.to_string())?;
+        if self.next_install_index == self.staging.count {
+            return Ok(None);
+        }
+        if self.next_install_index > self.staging.count {
+            return Err("snapshot header staging stream advanced beyond its sealed suffix".into());
+        }
+        let record = self
+            .staging
+            .read_record(self.next_install_index)
+            .map_err(|error| error.to_string())?;
+        self.next_install_index += 1;
+        self.assert_file_unchanged_before_read()
+            .map_err(|error| error.to_string())?;
+        Ok(Some(VerifiedHeaderBatchRecord {
+            header: record.header,
+            hash: record.block_hash,
+            cumulative_chainwork: record.cumulative_chainwork,
+        }))
+    }
+}
+
+fn ensure_exact_header_boundary(
+    validated: &SnapshotHeaderBoundary,
+    current: &SnapshotHeaderBoundary,
 ) -> Result<()> {
-    if authenticated != current {
+    if validated != current {
         return Err(SnapshotHeaderStagingError::VerifiedFileChanged(
             "tip header/hash/work or transaction-epoch header changed",
         ));
@@ -1014,23 +1004,6 @@ fn sync_parent(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn promotion_is_streamed_through_the_storage_batch_cap() {
-        assert_eq!(MAX_STAGED_HEADER_BATCH, MAX_VERIFIED_HEADER_BATCH_RECORDS);
-        let source = include_str!("snapshot_header_staging.rs");
-        let promote = source
-            .split("pub fn promote(&mut self, store: &MdbxStore)")
-            .nth(1)
-            .expect("verified promotion entry point")
-            .split("pub fn discard(self)")
-            .next()
-            .expect("promotion boundary");
-        assert!(promote.contains("remaining.min(MAX_VERIFIED_HEADER_BATCH_RECORDS as u64)"));
-        assert!(promote.contains("Vec::with_capacity(batch_len)"));
-        assert!(promote.contains("put_verified_headers_batch(&batch)"));
-        assert!(!promote.contains("put_verified_header_only"));
-    }
     use noid_chain::consensus::genesis::genesis_header;
     use noid_chain::consensus::next_target;
     use noid_chain::consensus::params::BLOCK_TIME;
@@ -1056,10 +1029,8 @@ mod tests {
                     height,
                     miner_address: parent.miner_address,
                     // Pre-mined for this exact deterministic fixture. Keeping
-                    // it fixed avoids debug-mode PoW work in CI. Re-mined for
-                    // the `attested_coverage` header layout via the ignored
-                    // `print_new_fixture_nonce` test below.
-                    nonce: 106_729,
+                    // it fixed avoids debug-mode PoW work in CI.
+                    nonce: 241_876,
                     difficulty_target: next_target(
                         anchor_height,
                         anchor.timestamp,
@@ -1070,7 +1041,6 @@ mod tests {
                     log_slots: parent.log_slots,
                     active_slot_count: parent.active_slot_count,
                     alloc_counter: parent.alloc_counter,
-                    attested_coverage: 0,
                 };
                 headers.push(header);
             }
@@ -1092,30 +1062,72 @@ mod tests {
     }
 
     fn canonical_base(store: &MdbxStore) -> CanonicalHeaderBoundary {
-        let genesis = genesis_header();
-        let hash = hash_block_header(&genesis);
-        let work = block_work(&genesis.difficulty_target);
-        store
-            .put_verified_header_only(&genesis, &hash, &work)
-            .expect("persist fixture genesis");
         CanonicalHeaderBoundary::load(store, 0).expect("load base")
+    }
+
+    fn native_coinbase_child(chain: &noid_chain::storage::MdbxChainContext) -> noid_chain::Block {
+        let parent = *chain.tip_header();
+        let timestamp = parent.timestamp + BLOCK_TIME;
+        let anchor = chain.anchor_info();
+        let difficulty_target = next_target(
+            anchor.anchor_height,
+            anchor.anchor_timestamp,
+            &anchor.anchor_target,
+            parent.height + 1,
+            timestamp,
+        );
+        noid_chain::consensus::build_block_template(
+            &parent,
+            &chain.state,
+            &chain.prev_active_counts(),
+            Vec::new(),
+            parent.miner_address,
+            timestamp,
+            difficulty_target,
+        )
+        .expect("build native-valid coinbase child")
+        // Pre-mined for this exact deterministic coinbase-only template.
+        .into_block(136_504)
+    }
+
+    /// Print a fresh pre-mined nonce for `native_coinbase_child` after a
+    /// consensus or block-layout change.
+    #[test]
+    #[ignore]
+    fn print_new_native_coinbase_child_nonce() {
+        let db = tempfile::tempdir().unwrap();
+        let chain = noid_chain::storage::MdbxChainContext::open_or_create(db.path()).unwrap();
+        let child = native_coinbase_child(&chain);
+        let nonce = noid_chain::consensus::pow::search_pow(&child.header, 0, 2_000_000_000)
+            .expect("fixture target is satisfiable");
+        println!("\nNew native coinbase child nonce: {nonce}");
+    }
+
+    fn fixture_terminal(height: u64, hash: [u8; 32]) -> Vec<u8> {
+        let mut bytes = noid_chain::HistoryStepTerminalMetadata::new(height, hash, 0)
+            .unwrap()
+            .encode_prefix()
+            .to_vec();
+        bytes.push(1);
+        bytes
     }
 
     #[test]
     fn invalid_late_header_does_not_partially_append_batch() {
         let db = tempfile::tempdir().unwrap();
         let stage_dir = tempfile::tempdir().unwrap();
-        let store = MdbxStore::open(db.path()).unwrap();
-        let base = canonical_base(&store);
+        let chain = noid_chain::storage::MdbxChainContext::open_or_create(db.path()).unwrap();
+        let store = &chain.store;
+        let base = canonical_base(store);
         let mut staging =
-            SnapshotHeaderStaging::create(&stage_dir.path().join("candidate"), &store, base)
+            SnapshotHeaderStaging::create(&stage_dir.path().join("candidate"), store, base)
                 .unwrap();
         let mut bad_second = fixture_chain()[1];
         bad_second.height = 2;
         bad_second.timestamp += BLOCK_TIME;
         bad_second.prev_block_hash = [0xAA; 32];
         assert!(staging
-            .append_batch(&store, &[fixture_chain()[1], bad_second])
+            .append_batch(store, &[fixture_chain()[1], bad_second])
             .is_err());
         assert_eq!(staging.staged_len(), 0);
         assert!(store.get_header(1).unwrap().is_none());
@@ -1126,12 +1138,13 @@ mod tests {
         let db = tempfile::tempdir().unwrap();
         let stage_dir = tempfile::tempdir().unwrap();
         let path = stage_dir.path().join("candidate");
-        let store = MdbxStore::open(db.path()).unwrap();
-        let base = canonical_base(&store);
+        let chain = noid_chain::storage::MdbxChainContext::open_or_create(db.path()).unwrap();
+        let store = &chain.store;
+        let base = canonical_base(store);
         {
-            let mut staging = SnapshotHeaderStaging::create(&path, &store, base).unwrap();
+            let mut staging = SnapshotHeaderStaging::create(&path, store, base).unwrap();
             staging
-                .append_batch(&store, &fixture_chain()[1..=1])
+                .append_batch(store, &fixture_chain()[1..=1])
                 .unwrap();
         }
         {
@@ -1139,106 +1152,36 @@ mod tests {
             file.write_all(&[0xCC; 17]).unwrap();
             file.sync_all().unwrap();
         }
-        let reopened = SnapshotHeaderStaging::open(&path, &store).unwrap();
+        let reopened = SnapshotHeaderStaging::open(&path, store).unwrap();
         assert_eq!(reopened.staged_len(), 1);
         assert_eq!(reopened.next_height().unwrap(), 2);
     }
 
     #[test]
-    fn adversarial_fork_cannot_replace_canonical_header_on_promotion() {
-        let db = tempfile::tempdir().unwrap();
-        let stage_dir = tempfile::tempdir().unwrap();
-        let store = MdbxStore::open(db.path()).unwrap();
-        let base = canonical_base(&store);
-        let mut staging =
-            SnapshotHeaderStaging::create(&stage_dir.path().join("candidate"), &store, base)
-                .unwrap();
-        staging
-            .append_batch(&store, &fixture_chain()[1..=1])
-            .unwrap();
-        let tip = staging.tip_record().unwrap();
-        let mut verified = staging
-            .verify_terminal(
-                &store,
-                tip.header.height,
-                tip.block_hash,
-                tip.cumulative_chainwork,
-                |_| Ok(()),
-            )
-            .unwrap();
-
-        let mut conflicting = fixture_chain()[1];
-        conflicting.state_root = [0xFE; 32];
-        let conflicting_hash = hash_block_header(&conflicting);
-        let conflicting_work = add_work(
-            &base.cumulative_chainwork,
-            &block_work(&conflicting.difficulty_target),
-        );
-        store
-            .put_verified_header_only(&conflicting, &conflicting_hash, &conflicting_work)
-            .unwrap();
-
-        assert!(matches!(
-            verified.promote(&store),
-            Err(SnapshotHeaderStagingError::CanonicalConflict { height: 1, .. })
-        ));
-        assert_eq!(store.get_header(1).unwrap(), Some(conflicting));
-        assert!(store.get_header(2).unwrap().is_none());
-    }
-
-    #[test]
-    fn rejected_terminal_has_no_canonical_write_path() {
-        let db = tempfile::tempdir().unwrap();
-        let stage_dir = tempfile::tempdir().unwrap();
-        let store = MdbxStore::open(db.path()).unwrap();
-        let base = canonical_base(&store);
-        let mut staging =
-            SnapshotHeaderStaging::create(&stage_dir.path().join("candidate"), &store, base)
-                .unwrap();
-        staging
-            .append_batch(&store, &fixture_chain()[1..=1])
-            .unwrap();
-        let tip = staging.tip_record().unwrap();
-
-        assert!(matches!(
-            staging.verify_terminal(
-                &store,
-                tip.header.height,
-                tip.block_hash,
-                tip.cumulative_chainwork,
-                |_| Err("synthetic selected-terminal failure".into()),
-            ),
-            Err(SnapshotHeaderStagingError::TerminalRejected(_))
-        ));
-        assert!(store.get_header(1).unwrap().is_none());
-        assert!(store.get_chain_work(1).unwrap().is_none());
-    }
-
-    #[test]
-    fn tampered_valid_looking_tip_after_terminal_cannot_promote() {
+    fn tampered_valid_looking_tip_cannot_match_the_sealed_install_boundary() {
         let db = tempfile::tempdir().unwrap();
         let stage_dir = tempfile::tempdir().unwrap();
         let path = stage_dir.path().join("candidate");
-        let store = MdbxStore::open(db.path()).unwrap();
-        let base = canonical_base(&store);
-        let mut staging = SnapshotHeaderStaging::create(&path, &store, base).unwrap();
+        let chain = noid_chain::storage::MdbxChainContext::open_or_create(db.path()).unwrap();
+        let store = &chain.store;
+        let base = canonical_base(store);
+        let mut staging = SnapshotHeaderStaging::create(&path, store, base).unwrap();
         staging
-            .append_batch(&store, &fixture_chain()[1..=1])
+            .append_batch(store, &fixture_chain()[1..=1])
             .unwrap();
         let tip = staging.tip_record().unwrap();
-        let mut verified = staging
-            .verify_terminal(
-                &store,
+        let mut validated = staging
+            .validate_complete(
+                store,
                 tip.header.height,
                 tip.block_hash,
                 tip.cumulative_chainwork,
-                |_| Ok(()),
             )
             .unwrap();
 
         // The replacement is a complete, parseable fixed-size record with a
         // self-consistent header hash.  It is nevertheless not the exact
-        // terminal-authenticated tip and must never reach canonical storage.
+        // validated candidate tip and must never reach the header archive.
         let mut changed_header = fixture_chain()[1];
         changed_header.state_root = [0xA5; 32];
         let changed = StagedHeaderRecord {
@@ -1254,63 +1197,31 @@ mod tests {
         writer.sync_all().unwrap();
         drop(writer);
 
-        assert!(verified.promote(&store).is_err());
+        let streamed = validated.next_record().unwrap().unwrap();
+        assert_eq!(streamed.header, changed_header);
+        assert_ne!(streamed, validated.target_record());
         assert!(store.get_header(1).unwrap().is_none());
         assert!(store.get_chain_work(1).unwrap().is_none());
     }
-
     #[test]
-    fn terminal_transition_revalidates_file_after_verifier_returns() {
+    fn appended_partial_record_after_validation_cannot_be_streamed() {
         let db = tempfile::tempdir().unwrap();
         let stage_dir = tempfile::tempdir().unwrap();
         let path = stage_dir.path().join("candidate");
-        let store = MdbxStore::open(db.path()).unwrap();
-        let base = canonical_base(&store);
-        let mut staging = SnapshotHeaderStaging::create(&path, &store, base).unwrap();
+        let chain = noid_chain::storage::MdbxChainContext::open_or_create(db.path()).unwrap();
+        let store = &chain.store;
+        let base = canonical_base(store);
+        let mut staging = SnapshotHeaderStaging::create(&path, store, base).unwrap();
         staging
-            .append_batch(&store, &fixture_chain()[1..=1])
+            .append_batch(store, &fixture_chain()[1..=1])
             .unwrap();
         let tip = staging.tip_record().unwrap();
-
-        let result = staging.verify_terminal(
-            &store,
-            tip.header.height,
-            tip.block_hash,
-            tip.cumulative_chainwork,
-            |_| {
-                let mut writer = OpenOptions::new().append(true).open(&path).unwrap();
-                writer.write_all(&[0xDD; 9]).unwrap();
-                writer.sync_all().unwrap();
-                Ok(())
-            },
-        );
-        assert!(matches!(
-            result,
-            Err(SnapshotHeaderStagingError::VerifiedFileChanged(_))
-        ));
-        assert!(store.get_header(1).unwrap().is_none());
-        assert!(store.get_chain_work(1).unwrap().is_none());
-    }
-
-    #[test]
-    fn appended_partial_record_after_terminal_cannot_promote() {
-        let db = tempfile::tempdir().unwrap();
-        let stage_dir = tempfile::tempdir().unwrap();
-        let path = stage_dir.path().join("candidate");
-        let store = MdbxStore::open(db.path()).unwrap();
-        let base = canonical_base(&store);
-        let mut staging = SnapshotHeaderStaging::create(&path, &store, base).unwrap();
-        staging
-            .append_batch(&store, &fixture_chain()[1..=1])
-            .unwrap();
-        let tip = staging.tip_record().unwrap();
-        let mut verified = staging
-            .verify_terminal(
-                &store,
+        let mut validated = staging
+            .validate_complete(
+                store,
                 tip.header.height,
                 tip.block_hash,
                 tip.cumulative_chainwork,
-                |_| Ok(()),
             )
             .unwrap();
 
@@ -1319,32 +1230,29 @@ mod tests {
         writer.sync_all().unwrap();
         drop(writer);
 
-        assert!(matches!(
-            verified.promote(&store),
-            Err(SnapshotHeaderStagingError::VerifiedFileChanged(_))
-        ));
+        assert!(validated.next_record().is_err());
         assert!(store.get_header(1).unwrap().is_none());
     }
 
     #[test]
-    fn appended_complete_record_after_terminal_cannot_promote() {
+    fn appended_complete_record_after_validation_cannot_be_streamed() {
         let db = tempfile::tempdir().unwrap();
         let stage_dir = tempfile::tempdir().unwrap();
         let path = stage_dir.path().join("candidate");
-        let store = MdbxStore::open(db.path()).unwrap();
-        let base = canonical_base(&store);
-        let mut staging = SnapshotHeaderStaging::create(&path, &store, base).unwrap();
+        let chain = noid_chain::storage::MdbxChainContext::open_or_create(db.path()).unwrap();
+        let store = &chain.store;
+        let base = canonical_base(store);
+        let mut staging = SnapshotHeaderStaging::create(&path, store, base).unwrap();
         staging
-            .append_batch(&store, &fixture_chain()[1..=1])
+            .append_batch(store, &fixture_chain()[1..=1])
             .unwrap();
         let tip = staging.tip_record().unwrap();
-        let mut verified = staging
-            .verify_terminal(
-                &store,
+        let mut validated = staging
+            .validate_complete(
+                store,
                 tip.header.height,
                 tip.block_hash,
                 tip.cumulative_chainwork,
-                |_| Ok(()),
             )
             .unwrap();
 
@@ -1353,43 +1261,7 @@ mod tests {
         writer.sync_all().unwrap();
         drop(writer);
 
-        assert!(matches!(
-            verified.promote(&store),
-            Err(SnapshotHeaderStagingError::VerifiedFileChanged(_))
-        ));
-        assert!(store.get_header(1).unwrap().is_none());
-    }
-
-    #[test]
-    fn changed_epoch_boundary_after_terminal_cannot_promote() {
-        let db = tempfile::tempdir().unwrap();
-        let stage_dir = tempfile::tempdir().unwrap();
-        let path = stage_dir.path().join("candidate");
-        let store = MdbxStore::open(db.path()).unwrap();
-        let base = canonical_base(&store);
-        let mut staging = SnapshotHeaderStaging::create(&path, &store, base).unwrap();
-        staging
-            .append_batch(&store, &fixture_chain()[1..=1])
-            .unwrap();
-        let tip = staging.tip_record().unwrap();
-        let mut verified = staging
-            .verify_terminal(
-                &store,
-                tip.header.height,
-                tip.block_hash,
-                tip.cumulative_chainwork,
-                |_| Ok(()),
-            )
-            .unwrap();
-
-        // Exercise the exact four-field reseal check independently of record
-        // validation: even an epoch header with the right height is distinct
-        // authority and cannot be silently substituted.
-        verified.boundary.epoch_anchor_header.state_root = [0xE0; 32];
-        assert!(matches!(
-            verified.promote(&store),
-            Err(SnapshotHeaderStagingError::VerifiedFileChanged(_))
-        ));
+        assert!(validated.next_record().is_err());
         assert!(store.get_header(1).unwrap().is_none());
     }
 
@@ -1397,26 +1269,38 @@ mod tests {
     fn empty_exact_target_uses_typestate_even_with_canonical_child() {
         let db = tempfile::tempdir().unwrap();
         let stage_dir = tempfile::tempdir().unwrap();
-        let store = MdbxStore::open(db.path()).unwrap();
-        let genesis_base = canonical_base(&store);
-        let child = fixture_chain()[1];
-        let child_work = add_work(
-            &genesis_base.cumulative_chainwork,
-            &block_work(&child.difficulty_target),
-        );
-        store
-            .put_verified_header_only(&child, &hash_block_header(&child), &child_work)
+        let mut chain = noid_chain::storage::MdbxChainContext::open_or_create(db.path()).unwrap();
+        let genesis_base = canonical_base(&chain.store);
+        let block = native_coinbase_child(&chain);
+        let child = block.header;
+        let child_hash = hash_block_header(&child);
+        let bundle = noid_chain::AcceptedBlockBundle::try_from_parts(
+            block.to_bytes(),
+            fixture_terminal(child.height, child_hash),
+        )
+        .unwrap();
+        chain
+            .apply_next_block(
+                &bundle,
+                child.timestamp,
+                |block, state| {
+                    noid_chain::materialize_accepted_block_state(state, block)
+                        .map_err(|error| format!("{error:?}"))
+                },
+                |_| Ok(()),
+            )
             .unwrap();
+        let store = &chain.store;
 
         let ordinary =
-            SnapshotHeaderStaging::create(&stage_dir.path().join("ordinary"), &store, genesis_base);
+            SnapshotHeaderStaging::create(&stage_dir.path().join("ordinary"), store, genesis_base);
         assert!(matches!(
             ordinary,
             Err(SnapshotHeaderStagingError::CanonicalConflict { height: 1, .. })
         ));
         let exact = SnapshotHeaderStaging::create_at_canonical_boundary(
             &stage_dir.path().join("exact"),
-            &store,
+            store,
             genesis_base,
         )
         .unwrap();
@@ -1425,50 +1309,31 @@ mod tests {
     }
 
     #[test]
-    fn verified_promotion_is_idempotent_and_never_buffers_suffix() {
+    fn validated_suffix_streams_once_without_mutating_canonical_store() {
         let db = tempfile::tempdir().unwrap();
         let stage_dir = tempfile::tempdir().unwrap();
         let path = stage_dir.path().join("candidate");
-        let store = MdbxStore::open(db.path()).unwrap();
-        let base = canonical_base(&store);
-        let mut staging = SnapshotHeaderStaging::create(&path, &store, base).unwrap();
+        let chain = noid_chain::storage::MdbxChainContext::open_or_create(db.path()).unwrap();
+        let store = &chain.store;
+        let base = canonical_base(store);
+        let mut staging = SnapshotHeaderStaging::create(&path, store, base).unwrap();
         staging
-            .append_batch(&store, &fixture_chain()[1..=1])
+            .append_batch(store, &fixture_chain()[1..=1])
             .unwrap();
         let tip = staging.tip_record().unwrap();
-        let mut verified = staging
-            .verify_terminal(
-                &store,
+        let mut validated = staging
+            .validate_complete(
+                store,
                 tip.header.height,
                 tip.block_hash,
                 tip.cumulative_chainwork,
-                |boundary| {
-                    assert_eq!(boundary.tip_header, fixture_chain()[1]);
-                    assert_eq!(boundary.epoch_anchor_header, genesis_header());
-                    Ok(())
-                },
             )
             .unwrap();
-        assert_eq!(
-            verified.promote(&store).unwrap(),
-            HeaderPromotionReport {
-                already_canonical: 0,
-                promoted: 1,
-            }
-        );
-
-        let reopened = SnapshotHeaderStaging::open(&path, &store).unwrap();
-        let tip = fixture_chain()[1];
-        let tip_work = store.get_chain_work(1).unwrap().unwrap();
-        let mut verified = reopened
-            .verify_terminal(&store, 1, hash_block_header(&tip), tip_work, |_| Ok(()))
-            .unwrap();
-        assert_eq!(
-            verified.promote(&store).unwrap(),
-            HeaderPromotionReport {
-                already_canonical: 1,
-                promoted: 0,
-            }
-        );
+        assert_eq!(validated.boundary().tip_header, fixture_chain()[1]);
+        assert_eq!(validated.boundary().epoch_anchor_header, genesis_header());
+        let record = validated.next_record().unwrap().unwrap();
+        assert_eq!(record, validated.target_record());
+        assert!(validated.next_record().unwrap().is_none());
+        assert!(store.get_header(1).unwrap().is_none());
     }
 }

@@ -8,9 +8,10 @@
 //! values alone do not establish canonical sidecar provenance, and a
 //! per-tile call cannot establish complete block coverage.  The private
 //! production BlockSlots backend owns the
-//! canonical statement aliases and consumes unverified proofs through one
-//! policy -> raw Owner/Main/Wallet -> common Meta allocator -> all-class-tiles
-//! bridge.  It returns only an opaque bound region and paired handoff.  The
+//! canonical statement aliases and consumes verifier-minted prepared
+//! authorization through one canonical-statement binding -> raw
+//! Owner/Main/Wallet -> common Meta allocator -> all-class-tiles bridge.  It
+//! returns only an opaque bound region and paired handoff.  The
 //! owning Block facade retains the sole builder through all Block and
 //! public-IO rows, calls `build`/`build_witness_only`, and only then consumes
 //! that binding through the sealed preparation finalizer.
@@ -30,7 +31,7 @@
 //! Main nonce is range-bound here to the canonical `u64` wire language before
 //! its post-nonce grind squeeze is checked.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use noid_fri_binius::interleaved_commit::SourceHash;
 use noid_fri_binius::zk_capsule_algebra::{
@@ -85,7 +86,7 @@ use super::zk_split_bridge::{
     pin_zk_auth_split_bridge_at, ZkAuthSplitBridgeCells, ZK_AUTH_SPLIT_BRIDGE_PIN_ROWS,
 };
 use super::{const_block, flat_of, mul, pin_eq, FieldR1csBuilder, LinExpr, F128};
-use crate::acceptance::block_class::SelectedBlockAssemblyFinalizationSeal;
+use crate::acceptance::block_slots::SelectedBlockAssemblyFinalizationSeal;
 use crate::acceptance::block_slots::{
     CanonicalSelectedZkAuthorizationCapability, CanonicalSelectedZkAuthorizationSlotKind,
 };
@@ -319,17 +320,10 @@ fn selected_zk_authorization_artifact_identity(
 }
 
 #[derive(Debug)]
-enum SelectedZkAuthorizationProofPolicyError {
-    SlotCount {
-        expected: usize,
-        actual: usize,
-    },
+pub(in crate::acceptance) enum HistoryStepAuthorizationPreparationError {
     LiveCount {
         expected: usize,
         actual: usize,
-    },
-    NonGhostStatement {
-        index: usize,
     },
     NativeVerification {
         index: usize,
@@ -357,20 +351,12 @@ enum SelectedZkAuthorizationProofPolicyError {
     },
 }
 
-impl std::fmt::Display for SelectedZkAuthorizationProofPolicyError {
+impl std::fmt::Display for HistoryStepAuthorizationPreparationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::SlotCount { expected, actual } => write!(
-                f,
-                "selected ZK authorization slot count mismatch: expected {expected}, got {actual}"
-            ),
             Self::LiveCount { expected, actual } => write!(
                 f,
                 "selected ZK authorization live-proof count mismatch: expected {expected}, got {actual}"
-            ),
-            Self::NonGhostStatement { index } => write!(
-                f,
-                "selected ZK authorization slot {index} has a non-canonical ghost statement"
             ),
             Self::NativeVerification { index, source } => write!(
                 f,
@@ -408,7 +394,7 @@ impl std::fmt::Display for SelectedZkAuthorizationProofPolicyError {
     }
 }
 
-impl std::error::Error for SelectedZkAuthorizationProofPolicyError {
+impl std::error::Error for HistoryStepAuthorizationPreparationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::WireEncoding { source, .. } | Self::GhostWireEncoding(source) => Some(source),
@@ -420,25 +406,25 @@ impl std::error::Error for SelectedZkAuthorizationProofPolicyError {
 fn validate_selected_zk_authorization_artifact_reuse(
     live: &[SelectedZkAuthorizationArtifactIdentity],
     ghost: &SelectedZkAuthorizationArtifactIdentity,
-) -> Result<(), SelectedZkAuthorizationProofPolicyError> {
+) -> Result<(), HistoryStepAuthorizationPreparationError> {
     let mut proof_bytes = BTreeMap::<&[u8], usize>::new();
     let mut source_caps = BTreeMap::<&[SourceHash], usize>::new();
     for (index, identity) in live.iter().enumerate() {
         if identity.proof_bytes == ghost.proof_bytes {
             return Err(
-                SelectedZkAuthorizationProofPolicyError::LiveGhostProofReuse { live: index },
+                HistoryStepAuthorizationPreparationError::LiveGhostProofReuse { live: index },
             );
         }
         if identity.source_cap == ghost.source_cap {
             return Err(
-                SelectedZkAuthorizationProofPolicyError::LiveGhostSourceCommitmentReuse {
+                HistoryStepAuthorizationPreparationError::LiveGhostSourceCommitmentReuse {
                     live: index,
                 },
             );
         }
         if let Some(first) = proof_bytes.insert(identity.proof_bytes.as_slice(), index) {
             return Err(
-                SelectedZkAuthorizationProofPolicyError::DuplicateLiveProof {
+                HistoryStepAuthorizationPreparationError::DuplicateLiveProof {
                     first,
                     second: index,
                 },
@@ -446,7 +432,7 @@ fn validate_selected_zk_authorization_artifact_reuse(
         }
         if let Some(first) = source_caps.insert(identity.source_cap.as_slice(), index) {
             return Err(
-                SelectedZkAuthorizationProofPolicyError::DuplicateLiveSourceCommitment {
+                HistoryStepAuthorizationPreparationError::DuplicateLiveSourceCommitment {
                     first,
                     second: index,
                 },
@@ -460,6 +446,89 @@ pub(super) struct SelectedZkAuthorizationVerifiedEntry {
     statement: noid_gkr::zk_authorization::ZkAuthCapsuleOwnerStatement,
     proof: ZkAuthorizationProof,
     verified: ZkAuthorizationVerified,
+}
+
+/// Runtime-prepared canonical ghost authorization. The expensive native
+/// verification and transcript expansion happen once; block templates share
+/// this immutable authority by `Arc`.
+pub(in crate::acceptance) struct PreparedSelectedZkGhostAuthorization {
+    entry: Arc<SelectedZkAuthorizationVerifiedEntry>,
+    identity: SelectedZkAuthorizationArtifactIdentity,
+}
+
+impl Clone for PreparedSelectedZkGhostAuthorization {
+    fn clone(&self) -> Self {
+        Self {
+            entry: Arc::clone(&self.entry),
+            identity: self.identity.clone(),
+        }
+    }
+}
+
+/// Non-serializable, non-cloneable authorization authority prepared before
+/// nonce search. It can only be minted by full native verification below.
+pub(in crate::acceptance) struct PreparedSelectedZkAuthorizations {
+    live_entries: Vec<SelectedZkAuthorizationVerifiedEntry>,
+    ghost_entry: Arc<SelectedZkAuthorizationVerifiedEntry>,
+}
+
+impl PreparedSelectedZkAuthorizations {
+    pub(in crate::acceptance) fn live_count(&self) -> usize {
+        self.live_entries.len()
+    }
+}
+
+pub(in crate::acceptance) fn prepare_selected_zk_ghost_authorization(
+    proof: ZkAuthorizationProof,
+) -> Result<PreparedSelectedZkGhostAuthorization, HistoryStepAuthorizationPreparationError> {
+    let statement = canonical_selected_zk_ghost_statement();
+    let verified = verify_zk_authorization(statement, &proof)
+        .map_err(HistoryStepAuthorizationPreparationError::GhostVerification)?;
+    let identity = selected_zk_authorization_artifact_identity(&proof)
+        .map_err(HistoryStepAuthorizationPreparationError::GhostWireEncoding)?;
+    Ok(PreparedSelectedZkGhostAuthorization {
+        entry: Arc::new(SelectedZkAuthorizationVerifiedEntry {
+            statement,
+            proof,
+            verified,
+        }),
+        identity,
+    })
+}
+
+pub(in crate::acceptance) fn prepare_selected_zk_authorizations(
+    statements: &[noid_gkr::zk_authorization::ZkAuthCapsuleOwnerStatement],
+    proofs: Vec<ZkAuthorizationProof>,
+    ghost: &PreparedSelectedZkGhostAuthorization,
+) -> Result<PreparedSelectedZkAuthorizations, HistoryStepAuthorizationPreparationError> {
+    if proofs.len() != statements.len() {
+        return Err(HistoryStepAuthorizationPreparationError::LiveCount {
+            expected: statements.len(),
+            actual: proofs.len(),
+        });
+    }
+    let mut live_entries = Vec::with_capacity(proofs.len());
+    let mut identities = Vec::with_capacity(proofs.len());
+    for (index, (statement, proof)) in statements.iter().copied().zip(proofs).enumerate() {
+        let verified = verify_zk_authorization(statement, &proof).map_err(|source| {
+            HistoryStepAuthorizationPreparationError::NativeVerification { index, source }
+        })?;
+        identities.push(
+            selected_zk_authorization_artifact_identity(&proof).map_err(|source| {
+                HistoryStepAuthorizationPreparationError::WireEncoding { index, source }
+            })?,
+        );
+        live_entries.push(SelectedZkAuthorizationVerifiedEntry {
+            statement,
+            proof,
+            verified,
+        });
+    }
+    validate_selected_zk_authorization_artifact_reuse(&identities, &ghost.identity)?;
+    Ok(PreparedSelectedZkAuthorizations {
+        live_entries,
+        ghost_entry: Arc::clone(&ghost.entry),
+    })
 }
 
 impl SelectedZkAuthorizationVerifiedEntry {
@@ -476,7 +545,7 @@ impl SelectedZkAuthorizationVerifiedEntry {
     }
 }
 
-/// Policy-checked native batch. One selected proof is supplied per live
+/// Verifier-minted native batch. One selected proof is supplied per live
 /// canonical prefix slot and one proof for the canonical ghost statement.
 /// The ghost artifact is verified and stored once; `entry_for_slot` maps every
 /// Ghost/PAD slot to that immutable entry. Byte-identical repetition under the
@@ -485,7 +554,7 @@ impl SelectedZkAuthorizationVerifiedEntry {
 pub(super) struct SelectedZkAuthorizationProofBatch {
     canonical: CanonicalSelectedZkAuthorizationCapability,
     live_entries: Vec<SelectedZkAuthorizationVerifiedEntry>,
-    ghost_entry: SelectedZkAuthorizationVerifiedEntry,
+    ghost_entry: Arc<SelectedZkAuthorizationVerifiedEntry>,
 }
 
 impl SelectedZkAuthorizationProofBatch {
@@ -506,7 +575,7 @@ impl SelectedZkAuthorizationProofBatch {
         &self.ghost_entry
     }
 
-    /// Consume the only policy-verified proof owner and derive the raw selected
+    /// Consume the only verifier-minted proof owner and derive the raw selected
     /// authorization columns before releasing the canonical statement
     /// capability. There is no API accepting a second statement/proof source,
     /// and the raw draft cannot be supplied independently to this handoff.
@@ -525,125 +594,7 @@ impl SelectedZkAuthorizationProofBatch {
     }
 }
 
-struct SelectedZkAuthorizationProofPolicy;
-
-impl SelectedZkAuthorizationProofPolicy {
-    /// Honest-assembler preflight only. The relation does not prove
-    /// commitment uniqueness. Its repeated-ZK premise is fresh independent OS
-    /// commitment entropy for every real attempt; this check catches local
-    /// builder reuse but cannot prevent leakage from two already-broadcast
-    /// transcripts or whole-system/VM RNG rollback.
-    fn verify_and_expand(
-        canonical: CanonicalSelectedZkAuthorizationCapability,
-        real_proofs: Vec<ZkAuthorizationProof>,
-        ghost_proof: ZkAuthorizationProof,
-    ) -> Result<SelectedZkAuthorizationProofBatch, SelectedZkAuthorizationProofPolicyError> {
-        let geometry =
-            crate::region_sidecar::selected_zk_block_geometry_for_auth_tiles(canonical.len())
-                .ok_or(SelectedZkAuthorizationProofPolicyError::SlotCount {
-                    expected: canonical.len().next_power_of_two(),
-                    actual: canonical.len(),
-                })?;
-        if canonical.len() != geometry.auth_tiles {
-            return Err(SelectedZkAuthorizationProofPolicyError::SlotCount {
-                expected: geometry.auth_tiles,
-                actual: canonical.len(),
-            });
-        }
-        let live_count = canonical.live_count();
-        if real_proofs.len() != live_count {
-            return Err(SelectedZkAuthorizationProofPolicyError::LiveCount {
-                expected: live_count,
-                actual: real_proofs.len(),
-            });
-        }
-
-        let ghost_statement = canonical_selected_zk_ghost_statement();
-        if geometry.tier == noid_chain::consensus::params::BLOCK_MAX_USER_TXS {
-            assert_eq!(
-                canonical.slot(canonical.len() - 1).native_statement(),
-                ghost_statement,
-                "PAD255 statement is not the canonical ghost constant"
-            );
-        }
-        for index in 0..canonical.len() {
-            let slot = canonical.slot(index);
-            assert_eq!(
-                slot.kind() == CanonicalSelectedZkAuthorizationSlotKind::Live,
-                index < live_count,
-                "canonical Block liveness is not a monotone prefix"
-            );
-            if slot.kind() != CanonicalSelectedZkAuthorizationSlotKind::Live
-                && slot.native_statement() != ghost_statement
-            {
-                return Err(SelectedZkAuthorizationProofPolicyError::NonGhostStatement { index });
-            }
-        }
-
-        // Full native verification precedes every artifact-reuse decision.
-        let mut live_entries = Vec::with_capacity(live_count);
-        let mut live_identities = Vec::with_capacity(live_count);
-        let mut proof_iter = real_proofs.into_iter();
-        for index in 0..canonical.len() {
-            let slot = canonical.slot(index);
-            if slot.kind() != CanonicalSelectedZkAuthorizationSlotKind::Live {
-                continue;
-            }
-            let proof = proof_iter.next().expect("live proof count preflighted");
-            let statement = slot.native_statement();
-            let verified = verify_zk_authorization(statement, &proof).map_err(|source| {
-                SelectedZkAuthorizationProofPolicyError::NativeVerification { index, source }
-            })?;
-            let identity =
-                selected_zk_authorization_artifact_identity(&proof).map_err(|source| {
-                    SelectedZkAuthorizationProofPolicyError::WireEncoding { index, source }
-                })?;
-            live_identities.push(identity);
-            live_entries.push(SelectedZkAuthorizationVerifiedEntry {
-                statement,
-                proof,
-                verified,
-            });
-        }
-        debug_assert!(proof_iter.next().is_none());
-        let ghost_verified = verify_zk_authorization(ghost_statement, &ghost_proof)
-            .map_err(SelectedZkAuthorizationProofPolicyError::GhostVerification)?;
-        let ghost_identity = selected_zk_authorization_artifact_identity(&ghost_proof)
-            .map_err(SelectedZkAuthorizationProofPolicyError::GhostWireEncoding)?;
-        validate_selected_zk_authorization_artifact_reuse(&live_identities, &ghost_identity)?;
-
-        let ghost_entry = SelectedZkAuthorizationVerifiedEntry {
-            statement: ghost_statement,
-            proof: ghost_proof,
-            verified: ghost_verified,
-        };
-        Ok(SelectedZkAuthorizationProofBatch {
-            canonical,
-            live_entries,
-            ghost_entry,
-        })
-    }
-}
-
-/// Owned, still-unverified inputs for the private selected-B255 production
-/// backend.  Keeping the fields private prevents callers from pairing a
-/// pre-verified batch (and therefore a capability minted by some other
-/// builder) with the current Block assembly.
-pub(in crate::acceptance) struct SelectedZkAuthorizationProofBundle {
-    live: Vec<ZkAuthorizationProof>,
-    ghost: ZkAuthorizationProof,
-}
-
-impl SelectedZkAuthorizationProofBundle {
-    pub(in crate::acceptance) fn new(
-        live: Vec<ZkAuthorizationProof>,
-        ghost: ZkAuthorizationProof,
-    ) -> Self {
-        Self { live, ghost }
-    }
-}
-
-/// Opaque result of the one private proof-policy -> raw authorization ->
+/// Opaque result of the one private verified authorization ->
 /// common authorization/Meta allocator -> all-tiles binding boundary.  The
 /// draft never escapes this module; BlockSlots may only borrow the paired
 /// exact-state cells needed by its common continuation.  The owning Block
@@ -659,7 +610,6 @@ impl SelectedZkBlockRegionBinding {
         &self.paired
     }
 
-    #[cfg(feature = "selected-zk-measurement")]
     pub(in crate::acceptance) fn vk(&self) -> &crate::region_sidecar::BlockRegionSidecarVk {
         self.draft.vk()
     }
@@ -685,14 +635,36 @@ impl SelectedZkBlockRegionBinding {
 pub(in crate::acceptance) fn bind_selected_zk_block_region(
     b: &mut FieldR1csBuilder,
     canonical: CanonicalSelectedZkAuthorizationCapability,
-    proofs: SelectedZkAuthorizationProofBundle,
+    prepared: PreparedSelectedZkAuthorizations,
     exact_state: &ExactStateRegionData,
     tx_root: &TxRootRegionData,
     spine: &SpineRegionData,
 ) -> SelectedZkBlockRegionBinding {
-    let SelectedZkAuthorizationProofBundle { live, ghost } = proofs;
-    let batch = SelectedZkAuthorizationProofPolicy::verify_and_expand(canonical, live, ghost)
-        .expect("selected proof-policy preflight");
+    assert_eq!(
+        prepared.live_entries.len(),
+        canonical.live_count(),
+        "prepared HistoryStep authorization count drift"
+    );
+    for index in 0..canonical.len() {
+        let slot = canonical.slot(index);
+        let statement = match slot.kind() {
+            CanonicalSelectedZkAuthorizationSlotKind::Live => {
+                prepared.live_entries[index].statement()
+            }
+            CanonicalSelectedZkAuthorizationSlotKind::Ghost
+            | CanonicalSelectedZkAuthorizationSlotKind::Pad255 => prepared.ghost_entry.statement(),
+        };
+        assert_eq!(
+            statement,
+            slot.native_statement(),
+            "prepared HistoryStep authorization statement drift"
+        );
+    }
+    let batch = SelectedZkAuthorizationProofBatch {
+        canonical,
+        live_entries: prepared.live_entries,
+        ghost_entry: prepared.ghost_entry,
+    };
     let (canonical, authorization) = batch
         .into_canonical_and_raw_draft()
         .expect("selected raw authorization draft");
@@ -1816,10 +1788,9 @@ mod tests {
     use noid_gkr::zk_auth_capsule::{
         build_explicit_mlecheck_carrier, build_post_claim_relation, state_cell_index,
         AuthCapsuleBoundaryPublic, AuthCapsuleTerminalOperandClaims, ZkAuthCapsuleBankView,
-        ZkAuthCapsuleStateTable, ZK_AUTH_CAPSULE_BANK_LEN, ZK_AUTH_CAPSULE_LIBRA_MASK_OFFSET,
+        ZK_AUTH_CAPSULE_BANK_LEN, ZK_AUTH_CAPSULE_LIBRA_MASK_OFFSET,
         ZK_AUTH_CAPSULE_PCS_COINS_OFFSET, ZK_AUTH_CAPSULE_REMAINING_PADDING_OFFSET,
     };
-    use noid_gkr::zk_authorization::prove_zk_authorization_from_state_table;
     use noid_gkr::zk_mlecheck::ZkMleCheckRoundProof;
     use noid_ivc_core::deep_chain::schedule::LaneSource;
     use noid_ivc_core::field_r1cs::FieldR1cs;
@@ -1834,10 +1805,7 @@ mod tests {
         ZK_PHASE_B_MID_CAP_NODES, ZK_PHASE_B_SOURCE_CAP_NODES,
     };
     use super::*;
-    use crate::acceptance::block_slots::{
-        canonical_selected_zk_authorization_fixture,
-        canonical_selected_zk_authorization_fixture_for_tier,
-    };
+    use crate::acceptance::block_slots::canonical_selected_zk_authorization_fixture;
     use crate::acceptance::zk_auth_capsule_schedule::ZkAuthCapsuleDuplexSchedules;
 
     #[derive(Clone)]
@@ -3013,7 +2981,7 @@ mod tests {
         assert!(matches!(
             validate_selected_zk_authorization_artifact_reuse(&duplicate_proof, &ghost),
             Err(
-                SelectedZkAuthorizationProofPolicyError::DuplicateLiveProof {
+                HistoryStepAuthorizationPreparationError::DuplicateLiveProof {
                     first: 0,
                     second: 1
                 }
@@ -3023,7 +2991,7 @@ mod tests {
         assert!(matches!(
             validate_selected_zk_authorization_artifact_reuse(&duplicate_cap, &ghost),
             Err(
-                SelectedZkAuthorizationProofPolicyError::DuplicateLiveSourceCommitment {
+                HistoryStepAuthorizationPreparationError::DuplicateLiveSourceCommitment {
                     first: 0,
                     second: 1
                 }
@@ -3034,7 +3002,7 @@ mod tests {
                 &[fake_artifact(usize::MAX, 1)],
                 &ghost
             ),
-            Err(SelectedZkAuthorizationProofPolicyError::LiveGhostProofReuse { live: 0 })
+            Err(HistoryStepAuthorizationPreparationError::LiveGhostProofReuse { live: 0 })
         ));
         assert!(matches!(
             validate_selected_zk_authorization_artifact_reuse(
@@ -3042,173 +3010,11 @@ mod tests {
                 &ghost
             ),
             Err(
-                SelectedZkAuthorizationProofPolicyError::LiveGhostSourceCommitmentReuse { live: 0 }
+                HistoryStepAuthorizationPreparationError::LiveGhostSourceCommitmentReuse {
+                    live: 0
+                }
             )
         ));
-    }
-
-    fn selected_ghost_proof() -> ZkAuthorizationProof {
-        let secret = noid_gkr::ghost_tx::ghost_spend_secret();
-        let [iv_hi, iv_lo] = capacity_iv(TAG_ADDRFIX);
-        let permutation = secret.with_exposed_prover_fields(|fields| {
-            evaluate_permutation([fields[0], fields[1], iv_hi, iv_lo])
-        });
-        let state = ZkAuthCapsuleStateTable::from_permutation_witness(&permutation)
-            .expect("canonical ghost state table");
-        prove_zk_authorization_from_state_table(&state, canonical_selected_zk_ghost_statement())
-            .expect("fresh selected ghost authorization")
-    }
-
-    #[test]
-    fn native_policy_live0_builds_exact_raw_b255_from_one_shared_ghost_entry() {
-        let ghost = selected_ghost_proof();
-        let (_builder, capability) = canonical_selected_zk_authorization_fixture(0);
-        let batch =
-            SelectedZkAuthorizationProofPolicy::verify_and_expand(capability, vec![], ghost)
-                .expect("one canonical ghost artifact verifies");
-        assert!(batch.live_entries.is_empty());
-        let ghost_entry = batch.entry_for_slot(0);
-        let expected_owner = ghost_entry
-            .verified()
-            .owner
-            .transcript_challenges()
-            .map(flat_of);
-        let expected_main = ghost_entry
-            .verified()
-            .main_transcript_challenges()
-            .map(flat_of);
-        for index in 0..256 {
-            assert!(
-                std::ptr::eq(ghost_entry, batch.entry_for_slot(index)),
-                "dead slot {index} cloned or remapped the ghost proof"
-            );
-        }
-        assert_eq!(
-            ghost_entry.statement,
-            canonical_selected_zk_ghost_statement()
-        );
-        let (canonical, raw) = batch
-            .into_canonical_and_raw_draft()
-            .expect("policy batch reconstructs exact raw selected region");
-
-        assert_eq!(canonical.len(), SELECTED_ZK_AUTH_TILE_COUNT);
-        assert_eq!(
-            canonical.slot(255).kind(),
-            CanonicalSelectedZkAuthorizationSlotKind::Pad255
-        );
-        assert_eq!(raw.changed_committed_columns(), 27);
-        assert_eq!(raw.committed_cells(), 6_094_848);
-        assert_eq!(raw.owner().w_log, ZK_AUTH_OWNER_TILE_LOG + 8);
-        assert_eq!(raw.owner().block_log, ZK_AUTH_OWNER_TILE_LOG);
-        assert_eq!(raw.main().w_log, ZK_AUTH_MAIN_TILE_LOG + 8);
-        assert_eq!(raw.main().block_log, ZK_AUTH_MAIN_TILE_LOG);
-        assert!(raw
-            .owner()
-            .committed
-            .iter()
-            .chain(raw.owner().s0.iter())
-            .chain(raw.owner().s_out.iter())
-            .all(|column| column.len() == 1 << 15));
-        assert!(raw
-            .main()
-            .committed
-            .iter()
-            .chain(raw.main().s0.iter())
-            .chain(raw.main().s_out.iter())
-            .all(|column| column.len() == 1 << 16));
-        assert_eq!(raw.wallet_a().committed().len(), ZK_AUTH_WALLET_A_COLUMNS);
-        assert_eq!(raw.wallet_b().committed().len(), ZK_AUTH_WALLET_B_COLUMNS);
-        assert!(raw
-            .wallet_a()
-            .committed()
-            .iter()
-            .all(|column| column.len() == 1 << 19));
-        assert!(raw
-            .wallet_b()
-            .committed()
-            .iter()
-            .all(|column| column.len() == 1 << 18));
-        assert!(raw
-            .wallet_a()
-            .s0()
-            .iter()
-            .chain(raw.wallet_a().s_out())
-            .all(|column| column.len() == 1 << 19));
-        assert!(raw
-            .wallet_b()
-            .s0()
-            .iter()
-            .chain(raw.wallet_b().s_out())
-            .all(|column| column.len() == 1 << 18));
-        assert_eq!(raw.owner().challenges.len(), 256);
-        assert_eq!(raw.main().challenges.len(), 256);
-        for index in 0..256 {
-            assert_eq!(raw.owner().challenges[index], expected_owner);
-            assert_eq!(raw.main().challenges[index], expected_main);
-        }
-
-        let assert_first_last_tile = |columns: &[Vec<F128>], tile_slots: usize| {
-            let last = 255 * tile_slots;
-            for column in columns {
-                assert_eq!(
-                    &column[..tile_slots],
-                    &column[last..last + tile_slots],
-                    "canonical ghost tile 255 differs from tile zero"
-                );
-            }
-        };
-        assert_first_last_tile(&raw.owner().committed, 1 << ZK_AUTH_OWNER_TILE_LOG);
-        assert_first_last_tile(&raw.owner().s0, 1 << ZK_AUTH_OWNER_TILE_LOG);
-        assert_first_last_tile(&raw.owner().s_out, 1 << ZK_AUTH_OWNER_TILE_LOG);
-        assert_first_last_tile(&raw.main().committed, 1 << ZK_AUTH_MAIN_TILE_LOG);
-        assert_first_last_tile(&raw.main().s0, 1 << ZK_AUTH_MAIN_TILE_LOG);
-        assert_first_last_tile(&raw.main().s_out, 1 << ZK_AUTH_MAIN_TILE_LOG);
-        assert_first_last_tile(raw.wallet_a().committed(), 1 << 11);
-        assert_first_last_tile(raw.wallet_a().s0(), 1 << 11);
-        assert_first_last_tile(raw.wallet_a().s_out(), 1 << 11);
-        assert_first_last_tile(raw.wallet_b().committed(), 1 << 10);
-        assert_first_last_tile(raw.wallet_b().s0(), 1 << 10);
-        assert_first_last_tile(raw.wallet_b().s_out(), 1 << 10);
-    }
-
-    #[test]
-    fn native_policy_live0_reconstructs_each_lower_class_without_b255_padding() {
-        let ghost = selected_ghost_proof();
-        for (tier, expected_cells) in [(8usize, 190_464usize), (32, 761_856), (64, 1_523_712)] {
-            let geometry = crate::region_sidecar::selected_zk_block_geometry(tier).unwrap();
-            let (_builder, capability) =
-                canonical_selected_zk_authorization_fixture_for_tier(tier, 0);
-            let batch = SelectedZkAuthorizationProofPolicy::verify_and_expand(
-                capability,
-                vec![],
-                ghost.clone(),
-            )
-            .expect("one canonical ghost artifact verifies lower class");
-            let ghost_entry = batch.entry_for_slot(0);
-            for index in 0..geometry.auth_tiles {
-                assert!(std::ptr::eq(ghost_entry, batch.entry_for_slot(index)));
-            }
-            let (canonical, raw) = batch
-                .into_canonical_and_raw_draft()
-                .expect("lower class raw selected region");
-            assert_eq!(canonical.len(), geometry.auth_tiles);
-            assert!((0..canonical.len()).all(|index| {
-                canonical.slot(index).kind() != CanonicalSelectedZkAuthorizationSlotKind::Pad255
-            }));
-            assert_eq!(raw.committed_cells(), expected_cells);
-            assert_eq!(raw.owner().w_log, geometry.owner_w_log);
-            assert_eq!(raw.main().w_log, geometry.main_w_log);
-            assert!(raw
-                .wallet_a()
-                .committed()
-                .iter()
-                .all(|column| column.len() == 1 << geometry.wallet_a_w_log));
-            assert!(raw
-                .wallet_b()
-                .committed()
-                .iter()
-                .all(|column| column.len() == 1 << geometry.wallet_b_w_log));
-        }
     }
 
     #[test]
@@ -3273,105 +3079,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_owner_has_no_free_builder_token_or_prebuild_preparation_surface() {
-        let source = include_str!("zk_authorization_candidate.rs");
-        let production = source
-            .split("#[cfg(test)]\nmod tests")
-            .next()
-            .expect("production candidate source");
-        assert!(!production.contains("struct ZkAuthorizationAllTilesBound"));
-        assert!(
-            !production.contains("pub(crate) fn bind_selected_zk_authorization_all_tiles_trace")
-        );
-        assert!(!production.contains("pub tx_body_hash: [LinExpr; 2]"));
-        assert!(!production.contains("pub expected_address: [LinExpr; 2]"));
-        assert!(!production.contains("fn into_preparation"));
-        for stale in [
-            "SelectedBlockAssemblyPending",
-            "SelectedBlockAssemblyVerifiedRawAuth",
-            "SelectedBlockAssemblyReady",
-            "struct SelectedBlockAssembly<",
-        ] {
-            assert!(
-                !production.contains(stale),
-                "obsolete disconnected owner scaffold survived: {stale}"
-            );
-        }
-
-        let binding_impl = production
-            .split("impl SelectedZkBlockRegionBinding")
-            .nth(1)
-            .expect("opaque binding implementation");
-        let binding_finalizer = binding_impl
-            .split("fn finalize_after_block_build")
-            .nth(1)
-            .expect("post-build binding finalizer")
-            .split("/// Consume every selected authorization input")
-            .next()
-            .expect("bounded binding finalizer body");
-        assert!(binding_finalizer.contains("self,"));
-        assert!(binding_finalizer.contains("seal: SelectedBlockAssemblyFinalizationSeal"));
-        assert!(binding_finalizer
-            .contains("from_selected_zk_owned_assembly(self.draft, seal, total_vars)"));
-        assert!(binding_finalizer.contains("from_selected_zk_owned_assembly"));
-        assert!(
-            !production.contains("SelectedBlockAssemblyFinalizationSeal(())"),
-            "candidate module manufactured the owning Block seal"
-        );
-
-        let outer = include_str!("../block_class.rs");
-        let full = outer
-            .split("fn build_selected_zk_trace_parts")
-            .nth(1)
-            .expect("selected production trace builder")
-            .split("pub fn build_selected_zk_b255_measurement_witness_only")
-            .next()
-            .expect("selected production trace-builder body");
-        let full_build = full.find("builder.build()").expect("full matrix build");
-        let full_seal = full
-            .find("SelectedBlockAssemblyFinalizationSeal(())")
-            .expect("full post-build seal");
-        let full_finalize = full
-            .find("finalize_after_block_build")
-            .expect("full post-build finalization");
-        assert!(full_build < full_seal && full_seal < full_finalize);
-
-        let witness_only = outer
-            .split("pub fn build_selected_zk_b255_measurement_witness_only")
-            .nth(1)
-            .expect("witness-only selected measurement facade")
-            .split("pub fn build_block_proof_trace")
-            .next()
-            .expect("witness-only selected facade body");
-        let witness_build = witness_only
-            .find("builder.build_witness_only()")
-            .expect("witness-only build");
-        let witness_seal = witness_only
-            .find("SelectedBlockAssemblyFinalizationSeal(())")
-            .expect("witness-only post-build seal");
-        let witness_finalize = witness_only
-            .find("finalize_after_block_build")
-            .expect("witness-only post-build finalization");
-        assert!(witness_build < witness_seal && witness_seal < witness_finalize);
-
-        let block_source = include_str!("../../region_sidecar/block.rs");
-        assert!(!block_source.contains("from_selected_zk_all_tiles_bound"));
-        assert!(!block_source.contains("ZkAuthorizationAllTilesBound"));
-        let finalizer = block_source
-            .split("fn from_selected_zk_owned_assembly")
-            .nth(1)
-            .expect("sealed selected finalizer")
-            .split("pub fn vk")
-            .next()
-            .expect("selected finalizer body");
-        assert!(
-            finalizer.contains("block_bounded_shapes(&vk, total_vars)"),
-            "selected finish omitted whole-VK witness-bound preflight"
-        );
-    }
-
-    #[test]
-    fn selected_block_bridge_consumes_policy_raw_allocator_and_all_tiles_in_order() {
+    fn selected_block_bridge_consumes_prepared_authority_raw_allocator_and_all_tiles_in_order() {
         let source = include_str!("zk_authorization_candidate.rs");
         let production = source
             .split("#[cfg(test)]\nmod tests")
@@ -3381,9 +3089,15 @@ mod tests {
             .split("fn bind_selected_zk_block_region")
             .nth(1)
             .expect("private selected Block bridge");
-        let policy = bridge
-            .find("SelectedZkAuthorizationProofPolicy::verify_and_expand")
-            .expect("proof policy");
+        let cardinality = bridge
+            .find("prepared.live_entries.len()")
+            .expect("prepared authorization cardinality binding");
+        let statement_binding = bridge
+            .find("slot.native_statement()")
+            .expect("prepared authorization canonical statement binding");
+        let batch = bridge
+            .find("let batch = SelectedZkAuthorizationProofBatch")
+            .expect("prepared authorization batch ownership");
         let raw = bridge
             .find("into_canonical_and_raw_draft")
             .expect("raw authorization derivation");
@@ -3396,7 +3110,8 @@ mod tests {
         let opaque_return = bridge
             .find("SelectedZkBlockRegionBinding { draft, paired }")
             .expect("opaque bound return");
-        assert!(policy < raw && raw < allocation && allocation < all_tiles);
+        assert!(cardinality < statement_binding && statement_binding < batch && batch < raw);
+        assert!(raw < allocation && allocation < all_tiles);
         assert!(all_tiles < opaque_return);
 
         let binding = production

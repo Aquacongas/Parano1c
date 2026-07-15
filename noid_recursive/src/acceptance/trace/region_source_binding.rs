@@ -44,7 +44,7 @@ use noid_ivc_core::deep_chain::schedule::{
 #[cfg(test)]
 use noid_ivc_core::deep_chain::schedule::{compile_duplex, merkle_fixed_patterns};
 use noid_ivc_core::deep_chain::source_tree::{
-    compress_iv_flat, mds_weights_pub, run_perm, source_tree_substitution_terms, SourceTreeRefs,
+    compress_iv_flat, mds_weights_pub, source_tree_substitution_terms, SourceTreeRefs,
 };
 use noid_ivc_core::deep_chain::spine::{
     build_spine_instance_columns, spine_tree_exposure_terms, spine_tree_internal_child_pattern,
@@ -5544,21 +5544,6 @@ fn run_merkle_union_native_with_paired(
 
 #[allow(clippy::too_many_arguments)]
 #[cfg(test)]
-pub(crate) fn discharge_merkle_union(
-    b: &mut FieldR1csBuilder,
-    ch: &mut impl FsChannelOps,
-    fixed: &[FixedPattern],
-    cb_c: &[usize; STATE_SIZE],
-    ff_specs: &[FfLegSpec],
-    legs: &[MerkleLeg],
-    w_log: usize,
-    native: &MerkleUnionNative,
-) -> (Vec<Claim>, Vec<(usize, usize, LinExpr)>) {
-    discharge_merkle_union_with_paired(b, ch, fixed, cb_c, ff_specs, legs, &[], w_log, native)
-}
-
-#[allow(clippy::too_many_arguments)]
-#[cfg(test)]
 fn discharge_merkle_union_with_paired(
     b: &mut FieldR1csBuilder,
     mut ch: &mut impl FsChannelOps,
@@ -5801,84 +5786,6 @@ pub(crate) struct DuplexUnion {
     pub(crate) rec_refs: Vec<DuplexFamilyRefs>,
     /// Per-recording squeezed challenges (native, schedule order).
     pub(crate) rec_challenges: Vec<Vec<F128>>,
-}
-
-/// Exact retained payload of a cached [`DuplexUnion`]. This test-only metric
-/// uses every Vec's actual capacity, includes nested fixed/layout/challenge
-/// buffers, and deliberately reports the 14 full-domain columns separately
-/// from auxiliary metadata. Allocator bookkeeping and the Arc header are not
-/// observable through stable Rust and are therefore excluded.
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct DuplexUnionRetentionMetric {
-    pub(crate) columns: usize,
-    pub(crate) column_elements: usize,
-    pub(crate) column_retained_bytes: usize,
-    pub(crate) auxiliary_retained_bytes: usize,
-    pub(crate) total_payload_retained_bytes: usize,
-}
-
-#[cfg(test)]
-impl DuplexUnion {
-    pub(crate) fn retention_metric(&self) -> DuplexUnionRetentionMetric {
-        let column_vectors = self
-            .committed
-            .iter()
-            .chain(self.s0.iter())
-            .chain(self.s_out.iter())
-            .collect::<Vec<_>>();
-        let columns = column_vectors.len();
-        let column_elements = column_vectors.iter().map(|column| column.len()).sum();
-        let column_retained_bytes = column_vectors
-            .iter()
-            .map(|column| column.capacity() * std::mem::size_of::<F128>())
-            .sum::<usize>();
-
-        let layout_buffers = |layout: &DuplexLayout| {
-            layout.slots.capacity() * std::mem::size_of::<DuplexSlot>()
-                + layout.challenges.capacity() * std::mem::size_of::<(usize, usize)>()
-        };
-        let nested_f128_buffers = |columns: &[Vec<F128>], outer_capacity: usize| {
-            outer_capacity * std::mem::size_of::<Vec<F128>>()
-                + columns
-                    .iter()
-                    .map(|column| column.capacity() * std::mem::size_of::<F128>())
-                    .sum::<usize>()
-        };
-        let fixed_retained = self.fixed.capacity() * std::mem::size_of::<FixedPattern>()
-            + self
-                .fixed
-                .iter()
-                .map(|pattern| {
-                    pattern.table.capacity() * std::mem::size_of::<F128>()
-                        + pattern
-                            .hi_gate
-                            .as_ref()
-                            .map_or(0, |(_, bits)| bits.capacity().div_ceil(8))
-                })
-                .sum::<usize>();
-        let rec_blocks_retained = self.rec_blocks.capacity()
-            * std::mem::size_of::<(DuplexLayout, usize)>()
-            + self
-                .rec_blocks
-                .iter()
-                .map(|(layout, _)| layout_buffers(layout))
-                .sum::<usize>();
-        let auxiliary_retained_bytes = std::mem::size_of::<DuplexUnion>()
-            + layout_buffers(&self.layout)
-            + fixed_retained
-            + nested_f128_buffers(&self.challenges, self.challenges.capacity())
-            + rec_blocks_retained
-            + self.rec_refs.capacity() * std::mem::size_of::<DuplexFamilyRefs>()
-            + nested_f128_buffers(&self.rec_challenges, self.rec_challenges.capacity());
-        DuplexUnionRetentionMetric {
-            columns,
-            column_elements,
-            column_retained_bytes,
-            auxiliary_retained_bytes,
-            total_payload_retained_bytes: column_retained_bytes + auxiliary_retained_bytes,
-        }
-    }
 }
 
 /// Tile `data.len()` transactions' duplex channels into ONE walk-C domain at a
@@ -6190,128 +6097,6 @@ pub(crate) fn build_recording_only_duplex_union(recordings: &[RecordingSpec<'_>]
         rec_refs,
         rec_challenges,
     }
-}
-
-/// Clone a class-authenticated canonical zero-data recordings union and
-/// replace only the selected live recording blocks.
-///
-/// Recording blocks are independent IV-reseeded dyadic chains: the START
-/// pattern at every block boundary cancels the preceding carry and installs
-/// that block's capacity IV.  Therefore changing one block changes exactly
-/// its own `A/C/S0/Sout` range.  Only the pure-carry domain tail depends on
-/// the final packed block and is recomputed when that block is live.
-///
-/// `canonical_zero` is deliberately supplied by the owning immutable link
-/// geometry rather than looked up through a process-global cache.  This
-/// helper validates the complete packing/layout/IV boundary before cloning,
-/// and returns `None` on any drift.
-pub(crate) fn patch_recording_only_duplex_union_live(
-    canonical_zero: &DuplexUnion,
-    recordings: &[RecordingSpec<'_>],
-    live_blocks: &[usize],
-    canonical_iv: [F128; 2],
-) -> Option<DuplexUnion> {
-    if recordings.is_empty()
-        || recordings.iter().any(|recording| {
-            recording.iv_flat != canonical_iv || recording.data.len() != recording.layout.n_data
-        })
-        || canonical_zero.rec_blocks.len() != recordings.len()
-        || canonical_zero.rec_challenges.len() != recordings.len()
-        || canonical_zero.challenges.len() != 1
-    {
-        return None;
-    }
-
-    let layouts: Vec<&DuplexLayout> = recordings
-        .iter()
-        .map(|recording| &recording.layout)
-        .collect();
-    let (offsets, w_log) = pack_recording_only_blocks(&layouts);
-    let sizes: Vec<usize> = recordings
-        .iter()
-        .map(|recording| recording.layout.slots.len().max(1).next_power_of_two())
-        .collect();
-    if canonical_zero.w_log != w_log
-        || canonical_zero.block_log != sizes[0].trailing_zeros() as usize
-        || canonical_zero.layout != recordings[0].layout
-        || canonical_zero
-            .rec_blocks
-            .iter()
-            .zip(recordings.iter().zip(&offsets))
-            .any(|((cached_layout, cached_offset), (recording, offset))| {
-                cached_layout != &recording.layout || cached_offset != offset
-            })
-    {
-        return None;
-    }
-
-    let mut selected = vec![false; recordings.len()];
-    for &block in live_blocks {
-        let selected_block = selected.get_mut(block)?;
-        if *selected_block {
-            return None;
-        }
-        *selected_block = true;
-    }
-
-    let mut union = canonical_zero.clone();
-    for (block, recording) in recordings.iter().enumerate() {
-        if !selected[block] {
-            // A non-live block must remain the exact canonical zero-data
-            // block whose columns were cloned from the authenticated cache.
-            if recording.data.iter().any(|value| *value != F128::ZERO) {
-                return None;
-            }
-            continue;
-        }
-        let size = sizes[block];
-        let offset = offsets[block];
-        let block_log = size.trailing_zeros() as usize;
-        let columns = build_duplex_columns(
-            &recording.layout,
-            recording.iv_flat,
-            recording.data,
-            block_log,
-        );
-        for lane in 0..2 {
-            union.committed[lane][offset..offset + size].copy_from_slice(&columns.a[lane]);
-        }
-        for lane in 0..STATE_SIZE {
-            union.committed[2 + lane][offset..offset + size].copy_from_slice(&columns.c[lane]);
-            union.s0[lane][offset..offset + size].copy_from_slice(&columns.s0[lane]);
-            union.s_out[lane][offset..offset + size].copy_from_slice(&columns.s_out[lane]);
-        }
-        union.rec_challenges[block] = columns.challenges;
-    }
-    union.challenges[0] = union.rec_challenges[0].clone();
-
-    // Descending power-of-two packing is contiguous.  If its last block is
-    // live, the remaining ungated carry chain must start from the patched
-    // terminal state instead of the cached zero block's terminal state.
-    let (last_block, packed_end) = offsets
-        .iter()
-        .zip(&sizes)
-        .enumerate()
-        .map(|(block, (offset, size))| (block, offset + size))
-        .max_by_key(|(_, end)| *end)?;
-    if selected[last_block] {
-        let p = 1usize.checked_shl(w_log as u32)?;
-        if packed_end == 0 || packed_end > p {
-            return None;
-        }
-        let mut carry = std::array::from_fn(|lane| union.committed[2 + lane][packed_end - 1]);
-        for slot in packed_end..p {
-            let (s0, s_out) = run_perm(carry);
-            for lane in 0..STATE_SIZE {
-                union.s0[lane][slot] = s0[lane];
-                union.s_out[lane][slot] = s_out[lane];
-                union.committed[2 + lane][slot] = s_out[lane];
-            }
-            carry = s_out;
-        }
-    }
-
-    Some(union)
 }
 
 /// Descending-size dyadic packing of recording blocks after a region-1
@@ -7299,7 +7084,6 @@ pub(crate) fn duplex_data_positions(layout: &DuplexLayout) -> Vec<(usize, usize)
 /// schedule and its capacity IV. Different sub-channels may have DIFFERENT
 /// schedules AND DIFFERENT IVs (e.g. FRICHANL vs KSCHANNL), yet still share ONE
 /// data-parallel walk.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone)]
 pub(crate) struct SubChannel {
     pub(crate) layout: DuplexLayout,
@@ -7313,7 +7097,6 @@ pub(crate) struct SubChannel {
 /// selectors / rate constants at `i·S + sl`. Ghost sub-block slots (past a sub's
 /// real length) carry START=0 and no constants — they just continue the chain, and
 /// `build_duplex_columns` fills the matching continuing-chain tail per sub-block.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn combined_duplex_fixed_patterns(
     subs: &[SubChannel],
     s_log: usize,
@@ -7359,9 +7142,8 @@ pub(crate) fn combined_duplex_fixed_patterns(
 /// slots placed at offset `i·S` with Data lane indices RENUMBERED to the flattened
 /// `[sub0 data ++ sub1 data ++ ...]` global stream, and challenges concatenated in
 /// sub order with slots shifted by `i·S` (matching the per-tx challenge stream). By
-/// construction `duplex_data_positions(&combined_duplex_layout(subs, s_log))` ==
-/// [`combined_duplex_data_positions`]`(subs, s_log)`.
-#[cfg_attr(not(test), allow(dead_code))]
+/// construction, reading data positions from this layout yields the flattened
+/// sub-channel streams in order.
 pub(crate) fn combined_duplex_layout(subs: &[SubChannel], s_log: usize) -> DuplexLayout {
     let s = 1usize << s_log;
     let per_tx = subs.len() * s;
@@ -7394,26 +7176,6 @@ pub(crate) fn combined_duplex_layout(subs: &[SubChannel], s_log: usize) -> Duple
     }
 }
 
-/// Each data lane's `(slot, lane)` in the combined per-tx block, in the flattened
-/// `[sub0 data ++ sub1 data ++ ...]` order — sub `i`'s `duplex_data_positions` with
-/// slot shifted by `i·S`. The per-tx algebra reads each channel's absorbed data at
-/// these positions; agrees with `duplex_data_positions(&combined_duplex_layout(..))`.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn combined_duplex_data_positions(
-    subs: &[SubChannel],
-    s_log: usize,
-) -> Vec<(usize, usize)> {
-    let s = 1usize << s_log;
-    let mut out = Vec::new();
-    for (i, sub) in subs.iter().enumerate() {
-        let off = i * s;
-        for (slot, lane) in duplex_data_positions(&sub.layout) {
-            out.push((off + slot, lane));
-        }
-    }
-    out
-}
-
 /// Tile `data.len()` transactions, each carrying `subs.len()` DIFFERENT duplex
 /// sub-channels, into ONE walk-C domain. `data[t][i]` is sub-channel `i`'s
 /// absorbed-data stream for tx `t` (flat, length `subs[i].layout.n_data`).
@@ -7431,7 +7193,6 @@ pub(crate) fn combined_duplex_data_positions(
 /// pads are valid chains re-seeded by the START pattern — never `perm([0;4])` ghost
 /// slots (the duplex substitution's leading carry term is ungated, so every block
 /// must be a genuine IV-seeded chain).
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn build_combined_duplex_union(
     subs: &[SubChannel],
     data: &[Vec<Vec<F128>>],
@@ -7719,150 +7480,6 @@ mod stage1_duplex_union_tests {
                 }
             })
             .collect()
-    }
-
-    /// The optimized production path must be a pure implementation change:
-    /// cloning the canonical zero template and patching live dyadic blocks
-    /// yields exactly the old full rebuild for every committed/walk column,
-    /// challenge stream, fixed table and packing descriptor.  The cases cover
-    /// different live positions and explicitly include the final packed block
-    /// whose data controls the pure-carry domain tail.
-    #[test]
-    fn recording_only_zero_template_live_patch_is_byte_identical() {
-        let layouts = vec![
-            compile_duplex(&channel_ops()),
-            compile_duplex(&[
-                TranscriptOp::Absorb(vec![None, None]),
-                TranscriptOp::Squeeze(1),
-            ]),
-            compile_duplex(&[
-                TranscriptOp::Absorb(vec![None; 5]),
-                TranscriptOp::Squeeze(2),
-            ]),
-            compile_duplex(&[
-                TranscriptOp::Absorb(vec![None]),
-                TranscriptOp::Squeeze(3),
-                TranscriptOp::Absorb(vec![None, None, None]),
-            ]),
-            compile_duplex(&[
-                TranscriptOp::Absorb(vec![None; 9]),
-                TranscriptOp::Squeeze(1),
-            ]),
-            compile_duplex(&[
-                TranscriptOp::Absorb(vec![None; 3]),
-                TranscriptOp::Squeeze(4),
-            ]),
-        ];
-        let iv = iv_flat();
-        let zero_data = layouts
-            .iter()
-            .map(|layout| vec![F128::ZERO; layout.n_data])
-            .collect::<Vec<_>>();
-        let zero_specs = layouts
-            .iter()
-            .zip(&zero_data)
-            .map(|(layout, data)| RecordingSpec {
-                layout: layout.clone(),
-                iv_flat: iv,
-                data,
-            })
-            .collect::<Vec<_>>();
-        let canonical_zero = build_recording_only_duplex_union(&zero_specs);
-        let retention = canonical_zero.retention_metric();
-        let domain = 1usize << canonical_zero.w_log;
-        assert_eq!(retention.columns, 14, "six committed + eight endpoints");
-        assert_eq!(retention.column_elements, 14 * domain);
-        assert_eq!(
-            retention.column_retained_bytes,
-            14 * domain * std::mem::size_of::<F128>(),
-            "cached full-domain column capacity"
-        );
-        eprintln!("recording-only cached union retention: {retention:?}");
-
-        let layout_refs = layouts.iter().collect::<Vec<_>>();
-        let (offsets, _) = pack_recording_only_blocks(&layout_refs);
-        let final_block = offsets
-            .iter()
-            .zip(&layouts)
-            .enumerate()
-            .map(|(block, (offset, layout))| {
-                (
-                    block,
-                    *offset + layout.slots.len().max(1).next_power_of_two(),
-                )
-            })
-            .max_by_key(|(_, end)| *end)
-            .map(|(block, _)| block)
-            .unwrap();
-        let cases = [
-            vec![0, 2, 4],
-            vec![1, 3, 5],
-            vec![final_block, (final_block + 1) % 6, (final_block + 3) % 6],
-        ];
-
-        for (case, mut live_blocks) in cases.into_iter().enumerate() {
-            live_blocks.sort_unstable();
-            live_blocks.dedup();
-            assert_eq!(live_blocks.len(), 3, "three distinct live blocks");
-            let data = layouts
-                .iter()
-                .enumerate()
-                .map(|(block, layout)| {
-                    if live_blocks.contains(&block) {
-                        tx_data(layout, 0xCA_CE_0000 + (case * 16 + block) as u64)
-                    } else {
-                        vec![F128::ZERO; layout.n_data]
-                    }
-                })
-                .collect::<Vec<_>>();
-            let specs = layouts
-                .iter()
-                .zip(&data)
-                .map(|(layout, data)| RecordingSpec {
-                    layout: layout.clone(),
-                    iv_flat: iv,
-                    data,
-                })
-                .collect::<Vec<_>>();
-            let full = build_recording_only_duplex_union(&specs);
-            let patched =
-                patch_recording_only_duplex_union_live(&canonical_zero, &specs, &live_blocks, iv)
-                    .expect("frozen zero template accepts matching live recordings");
-
-            assert_eq!(patched.committed, full.committed, "case {case}: A/C bytes");
-            assert_eq!(patched.s0, full.s0, "case {case}: S0 bytes");
-            assert_eq!(patched.s_out, full.s_out, "case {case}: Sout bytes");
-            assert_eq!(patched.fixed, full.fixed, "case {case}: fixed bytes");
-            assert_eq!(patched.refs, full.refs, "case {case}: primary refs");
-            assert_eq!(patched.layout, full.layout, "case {case}: primary layout");
-            assert_eq!(patched.w_log, full.w_log, "case {case}: domain log");
-            assert_eq!(patched.block_log, full.block_log, "case {case}: block log");
-            assert_eq!(
-                patched.challenges, full.challenges,
-                "case {case}: primary challenge bytes"
-            );
-            assert_eq!(
-                patched.rec_blocks, full.rec_blocks,
-                "case {case}: recording packing"
-            );
-            assert_eq!(
-                patched.rec_refs, full.rec_refs,
-                "case {case}: recording refs"
-            );
-            assert_eq!(
-                patched.rec_challenges, full.rec_challenges,
-                "case {case}: recording challenge bytes"
-            );
-        }
-
-        let rebuilt_zero = build_recording_only_duplex_union(&zero_specs);
-        assert_eq!(
-            canonical_zero.committed, rebuilt_zero.committed,
-            "live patching must never mutate the shared template"
-        );
-        assert_eq!(canonical_zero.s0, rebuilt_zero.s0);
-        assert_eq!(canonical_zero.s_out, rebuilt_zero.s_out);
-        assert_eq!(canonical_zero.rec_challenges, rebuilt_zero.rec_challenges);
     }
 
     /// The channel union discharges K txs' duplex chains in ONE walk: native
@@ -8644,17 +8261,9 @@ mod combined_duplex_union_tests {
             "distinct tx data ⇒ distinct challenges"
         );
 
-        // Data-position self-consistency: the separate helper agrees with reading
-        // the combined layout directly (Data indices renumbered to the global
-        // flattened stream).
-        let s_log = s_log_of(&subs);
+        // Data indices are renumbered into one flattened stream.
         assert_eq!(
-            combined_duplex_data_positions(&subs, s_log),
-            duplex_data_positions(&u.layout),
-            "data positions agree with the combined layout"
-        );
-        assert_eq!(
-            combined_duplex_data_positions(&subs, s_log).len(),
+            duplex_data_positions(&u.layout).len(),
             ch0.n_data + ch1.n_data,
             "one position per real data lane"
         );

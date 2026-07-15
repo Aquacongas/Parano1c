@@ -37,7 +37,7 @@ use noid_poseidon2b::native::domain::{
 use noid_poseidon2b::native::permutation::N_ROUNDS;
 use noid_poseidon2b::native::poseidon2b_hash_byte_slices;
 
-use crate::acceptance::block_class::SelectedBlockAssemblyFinalizationSeal;
+use crate::acceptance::block_slots::SelectedBlockAssemblyFinalizationSeal;
 use crate::acceptance::trace::deep_chain::{
     verify_ragged_multi_deep_chain_walk_trace, MultiDeepChainWalkProofTrace,
 };
@@ -650,6 +650,7 @@ pub fn block_post_commit_class_digest(
 /// used by terminal-only registry materialization, which never verifies a
 /// standalone Block sidecar and therefore does not need the large child VK
 /// tables resident.  Prover materialization continues to rebuild the full VK.
+#[cfg(test)]
 pub(crate) fn selected_zk_block_post_commit_class_digest_from_vk_digest(
     matrix_digest: &[u8; 32],
     spec: &PublicIoSpec,
@@ -668,6 +669,7 @@ pub(crate) fn selected_zk_block_post_commit_class_digest_from_vk_digest(
 /// child key.  The ordered child identities are already authenticated by the
 /// external registry pin; this check prevents an inconsistent aggregate
 /// carrier from entering the terminal class binding.
+#[cfg(test)]
 pub(crate) fn selected_zk_block_vk_digest_from_child_digests(child: &[[u8; 32]; 6]) -> [u8; 32] {
     let version = [BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION];
     poseidon2b_hash_byte_slices(
@@ -1040,48 +1042,6 @@ impl<'a> BlockRegionProverPlan<'a> {
         context.append_claims(claims);
         Ok(proof)
     }
-
-    /// Local-authoring twin of [`Self::prove_post_commit`] that harvests the
-    /// exact child transcript while the sidecar proof is already being
-    /// authored.  `LayoutRecordingChallenger` delegates every Fiat--Shamir
-    /// operation to the same native challenger as the legacy path, so the
-    /// returned proof and enclosing transcript are unchanged.  The extra
-    /// values are process-local replay material and never enter a wire type.
-    pub(crate) fn prove_post_commit_layout_captured<Ch: Challenger>(
-        &self,
-        context: &mut FieldPostCommitProverContext<'_, Ch>,
-        layout: noid_ivc_core::deep_chain::schedule::DuplexLayout,
-    ) -> Result<
-        (
-            BlockRegionSidecarProof,
-            BlockSidecarChildTranscript,
-            LayoutRecordedChannel,
-        ),
-        RegionSidecarError,
-    > {
-        let witness = context.witness();
-        context.observe_label(BLOCK_SIDECAR_RECORDED_LABEL);
-        let seed = context.sample_f128();
-        let mut child = LayoutRecordingChallenger::new(BLOCK_SIDECAR_CHILD_DOMAIN, layout);
-        child.observe_f128(seed);
-        let (proof, claims) = self.prove(witness, &mut child)?;
-        let tail = child.sample_f128_vec(BLOCK_SIDECAR_CHILD_TAIL_LANES);
-        let recording = child
-            .finish()
-            .map_err(|_| RegionSidecarError::InvalidProof)?;
-        context.observe_f128_slice(&tail);
-        context.append_claims(claims);
-        Ok((
-            proof,
-            BlockSidecarChildTranscript {
-                seed,
-                tail: tail
-                    .try_into()
-                    .expect("child transcript terminal lane count"),
-            },
-            recording,
-        ))
-    }
 }
 
 /// The fixed-shape selected-ZK V5 block sidecar envelope.
@@ -1106,6 +1066,148 @@ impl BlockRegionSidecarProof {
     pub fn byte_len(&self) -> usize {
         bincode::serialized_size(self).expect("block region sidecar serialized length") as usize
     }
+}
+
+pub(crate) fn encode_block_region_sidecar_canonical(
+    vk: &BlockRegionSidecarVk,
+    total_vars: usize,
+    proof: &BlockRegionSidecarProof,
+) -> Result<Vec<u8>, RegionSidecarError> {
+    use super::canonical_codec as canonical;
+
+    let [SidecarProofShape::DeferredFixed(wallet_a_shape), SidecarProofShape::DeferredFixed(meta_a_shape), SidecarProofShape::DeferredMerkle(wallet_b_shape), SidecarProofShape::DeferredMerkle(meta_b_shape), SidecarProofShape::DeferredFixed(owner_c_shape), SidecarProofShape::DeferredFixed(main_c_shape), SidecarProofShape::MultiWalk(walk_shape)] =
+        block_bounded_shapes(vk, total_vars)?
+    else {
+        return Err(RegionSidecarError::UnsupportedVkShape);
+    };
+    let expected = canonical_block_region_sidecar_len(vk, total_vars)?;
+    if proof.version != BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION {
+        return Err(RegionSidecarError::UnsupportedVersion);
+    }
+    let mut out = Vec::with_capacity(expected);
+    out.push(proof.version);
+    canonical::encode_walk_a_deferred(
+        &mut out,
+        proof.wallet_a.version(),
+        proof.wallet_a.authority(),
+        &wallet_a_shape,
+    )?;
+    canonical::encode_walk_a_deferred(
+        &mut out,
+        proof.meta_a.version(),
+        proof.meta_a.authority(),
+        &meta_a_shape,
+    )?;
+    canonical::encode_merkle_deferred(
+        &mut out,
+        proof.wallet_b.version(),
+        proof.wallet_b.authority(),
+        &wallet_b_shape,
+    )?;
+    canonical::encode_merkle_deferred(
+        &mut out,
+        proof.meta_b.version(),
+        proof.meta_b.authority(),
+        &meta_b_shape,
+    )?;
+    canonical::encode_duplex_deferred(
+        &mut out,
+        proof.owner_c.version(),
+        proof.owner_c.authority(),
+        &owner_c_shape,
+    )?;
+    canonical::encode_duplex_deferred(
+        &mut out,
+        proof.main_c.version(),
+        proof.main_c.authority(),
+        &main_c_shape,
+    )?;
+    canonical::encode_multi_walk(&mut out, &proof.walk, &walk_shape)?;
+    if out.len() != expected {
+        return Err(RegionSidecarError::InvalidProof);
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_block_region_sidecar_canonical(
+    vk: &BlockRegionSidecarVk,
+    total_vars: usize,
+    bytes: &[u8],
+) -> Result<BlockRegionSidecarProof, RegionSidecarError> {
+    use super::canonical_codec as canonical;
+
+    let [SidecarProofShape::DeferredFixed(wallet_a_shape), SidecarProofShape::DeferredFixed(meta_a_shape), SidecarProofShape::DeferredMerkle(wallet_b_shape), SidecarProofShape::DeferredMerkle(meta_b_shape), SidecarProofShape::DeferredFixed(owner_c_shape), SidecarProofShape::DeferredFixed(main_c_shape), SidecarProofShape::MultiWalk(walk_shape)] =
+        block_bounded_shapes(vk, total_vars)?
+    else {
+        return Err(RegionSidecarError::UnsupportedVkShape);
+    };
+    let expected = canonical_block_region_sidecar_len(vk, total_vars)?;
+    let mut reader = canonical::CanonicalProofReader::exact(bytes, expected)?;
+    if reader.u8()? != BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION {
+        return Err(RegionSidecarError::UnsupportedVersion);
+    }
+    let wallet_a = WalkARegionWalkDeferredProof::new(canonical::decode_walk_a_deferred(
+        &mut reader,
+        &wallet_a_shape,
+    )?);
+    let meta_a = WalkARegionWalkDeferredProof::new(canonical::decode_walk_a_deferred(
+        &mut reader,
+        &meta_a_shape,
+    )?);
+    let wallet_b = MerkleRegionWalkDeferredProof::new(canonical::decode_merkle_deferred(
+        &mut reader,
+        &wallet_b_shape,
+    )?);
+    let meta_b = MerkleRegionWalkDeferredProof::new(canonical::decode_merkle_deferred(
+        &mut reader,
+        &meta_b_shape,
+    )?);
+    let owner_c = DuplexRegionWalkDeferredProof::new(canonical::decode_duplex_deferred(
+        &mut reader,
+        &owner_c_shape,
+    )?);
+    let main_c = DuplexRegionWalkDeferredProof::new(canonical::decode_duplex_deferred(
+        &mut reader,
+        &main_c_shape,
+    )?);
+    let walk = canonical::decode_multi_walk(&mut reader, &walk_shape)?;
+    reader.finish()?;
+    Ok(BlockRegionSidecarProof {
+        version: BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION,
+        wallet_a,
+        meta_a,
+        wallet_b,
+        meta_b,
+        owner_c,
+        main_c,
+        walk,
+    })
+}
+
+pub(crate) fn canonical_block_region_sidecar_len(
+    vk: &BlockRegionSidecarVk,
+    total_vars: usize,
+) -> Result<usize, RegionSidecarError> {
+    use super::canonical_codec as canonical;
+
+    let [SidecarProofShape::DeferredFixed(wallet_a_shape), SidecarProofShape::DeferredFixed(meta_a_shape), SidecarProofShape::DeferredMerkle(wallet_b_shape), SidecarProofShape::DeferredMerkle(meta_b_shape), SidecarProofShape::DeferredFixed(owner_c_shape), SidecarProofShape::DeferredFixed(main_c_shape), SidecarProofShape::MultiWalk(walk_shape)] =
+        block_bounded_shapes(vk, total_vars)?
+    else {
+        return Err(RegionSidecarError::UnsupportedVkShape);
+    };
+    [
+        canonical::deferred_fixed_len(&wallet_a_shape)?,
+        canonical::deferred_fixed_len(&meta_a_shape)?,
+        canonical::deferred_merkle_len(&wallet_b_shape)?,
+        canonical::deferred_merkle_len(&meta_b_shape)?,
+        canonical::deferred_fixed_len(&owner_c_shape)?,
+        canonical::deferred_fixed_len(&main_c_shape)?,
+        canonical::multi_walk_len(&walk_shape)?,
+    ]
+    .into_iter()
+    .try_fold(1usize, |sum, len| {
+        sum.checked_add(len).ok_or(RegionSidecarError::InvalidProof)
+    })
 }
 
 /// Decode the mandatory V5 block envelope only after every deferred child
@@ -1345,7 +1447,11 @@ pub fn verify_block_region_sidecar_trace_post_commit<C: FsChannelOps>(
     preflight_multi_walk(&proof.walk, max_w_log(&w_logs), w_logs.len())?;
 
     context.observe_label(b, vk.transcript_label());
-    context.observe_bytes_const(b, &vk.transcript_digest());
+    crate::acceptance::trace::self_verify::observe_pinned_digest(
+        b,
+        context,
+        &vk.transcript_digest(),
+    );
     let mut ledger = b.num_wires();
 
     let wallet_a_prefix = verify_walk_a_region_walk_deferred_prefix_trace(
@@ -1660,9 +1766,9 @@ mod tests {
         .expect("selected duplex VK fixture")
     }
 
-    fn selected_vk_fixture(tier: usize) -> BlockRegionSidecarVk {
+    fn selected_vk_fixture_at(tier: usize, initial_cursor: usize) -> BlockRegionSidecarVk {
         let geometry = selected_zk_block_geometry(tier).unwrap();
-        let mut cursor = 0usize;
+        let mut cursor = initial_cursor;
         let wallet_a = WalkARegionVk::new_wallet(
             selected_zk_auth_wallet_a_sidecar_purpose(),
             geometry.tx_log,
@@ -1745,22 +1851,35 @@ mod tests {
             .unwrap()
     }
 
+    fn selected_vk_fixture(tier: usize) -> BlockRegionSidecarVk {
+        selected_vk_fixture_at(tier, 0)
+    }
+
     fn selected_b255_vk_fixture() -> BlockRegionSidecarVk {
         selected_vk_fixture(255)
     }
 
     #[test]
-    fn recorded_child_layout_derivation_is_deterministic_per_tier() {
+    fn recorded_child_layout_is_stable_across_absolute_slice_addresses() {
         // The recorded child-transcript schedule is a protocol constant of
-        // the tier: two derivations agree, and the four canonical tiers fit
-        // one recordings-only union without inflating the link-sidecar
-        // multi-walk domain past the B255 recording block itself.
+        // the tier, not of the matrix address where its committed columns
+        // happen to land. This is the freezer's provisional -> integrated VK
+        // transition for all four canonical tiers.
         let mut sizes = Vec::new();
         for (tier, total_vars) in [(8usize, 22usize), (32, 23), (64, 23), (255, 24)] {
             let vk = selected_vk_fixture(tier);
+            let relocated = selected_vk_fixture_at(tier, 1usize << 20);
+            assert_ne!(
+                vk.transcript_digest(),
+                relocated.transcript_digest(),
+                "B{tier} fixture relocation must change the exact VK identity"
+            );
             let first = derive_block_sidecar_recording_layout(&vk, total_vars).unwrap();
-            let second = derive_block_sidecar_recording_layout(&vk, total_vars).unwrap();
-            assert_eq!(first, second, "B{tier} recording schedule drift");
+            let second = derive_block_sidecar_recording_layout(&relocated, total_vars).unwrap();
+            assert_eq!(
+                first, second,
+                "B{tier} recording schedule depends on absolute slice addresses"
+            );
             assert!(!first.slots.is_empty());
             let padded = first.slots.len().next_power_of_two();
             eprintln!(
@@ -1824,7 +1943,7 @@ mod tests {
                 "compact aggregate digest must be transcript-identical"
             );
             let matrix_digest = [tier as u8; 32];
-            let spec = crate::acceptance::block_class::block_io_spec();
+            let spec = crate::acceptance::history_step_bank::history_step_bank_io_spec();
             let pcs = PcsParams {
                 m: selected_zk_block_geometry(tier).unwrap().main_w_log + 12,
                 log_inv_rate: 2,

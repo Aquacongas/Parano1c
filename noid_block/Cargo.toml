@@ -11,11 +11,3 @@ noid_tx         = { path = "../noid_tx" }
 noid_gkr        = { path = "../noid_gkr" }
 noid_chain      = { path = "../noid_chain" }
 noid_recursive  = { path = "../noid_recursive" }
-rayon           = "1.10"
-tracing         = "0.1"
-serde = { version = "1", features = ["derive"] }
-bincode = "1"
-
-[dev-dependencies]
-noid-ivc-core = { path = "../noid_ivc_core" }
-noid-ivc-prover = { path = "../noid_ivc_prover" }

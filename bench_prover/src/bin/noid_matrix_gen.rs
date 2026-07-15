@@ -1,352 +1,327 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! One-time canonical selected-recursive artifact generator.
+//! Build the canonical `HistoryStep` v1 release pack from honest chain data.
 //!
-//! Builds the pinned class registry plus all nine canonical matrix
-//! artifacts (T, four PreviousLink tiers, four CurrentBlock tiers) into an
-//! artifact root, with per-stage terminal progress. Class relations are
-//! content-invariant, so one deterministic floor member per Block class
-//! reproduces the exact canonical matrices; every export is digest-checked,
-//! and when a registry artifact already exists in the root its digest must
-//! match the freshly rebuilt registry (the independent-rebuild gate) —
-//! wrong or drifted generation cannot be installed.
+//! Usage: `noid_matrix_gen <pack-root>`
 //!
-//! Usage: `noid-matrix-gen <artifact-root>` (default `./selected-recursive`).
+//! The fixture provider starts at the real genesis state, mines every header,
+//! verifies every wallet authorization and materializes every backbone state.
+//! It saves one exact parent boundary for B8/B32/B64/B255, then forks each of
+//! those four boundaries into every current tier.  Thus all sixteen matrices
+//! are assembled from native-valid block witnesses rather than shape-only or
+//! synthetic inputs.
 
-use std::io::Write as _;
+use std::fs::{File, OpenOptions};
+use std::io::{BufReader, Read as _, Write as _};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Instant;
 
-use bench_prover::{
-    accepted_proved_user_block_fixture, tx8x2_scenario, AcceptedSingleBlockFixture,
+use bench_prover::HonestHistoryStepFixtureProvider;
+use noid_ivc_core::field_r1cs::FieldR1cs;
+use noid_ivc_core::proof::FieldShape;
+use noid_miner::history_step_artifacts::{
+    decode_history_step_runtime_metadata_pinned, encode_history_step_runtime_metadata,
+    history_step_matrix_file_name, HISTORY_STEP_PACK_LEAF_COUNT,
+    HISTORY_STEP_PACK_VERSION_DIRECTORY, HISTORY_STEP_RUNTIME_METADATA_FILE,
 };
-use noid_ivc_prover::challenger::FsLaneChallenger;
-use noid_ivc_prover::field_r1cs::FieldR1cs;
-use noid_ivc_prover::pcs::{self, PcsParams};
-use noid_ivc_prover::proof::FieldShape;
-use noid_miner::{
-    LocalSelectedRecursiveClassRegistryStore, LocalSelectedRecursiveMatrixSource,
-    SelectedRecursiveMatrixArtifactIdentity, SelectedRecursiveMatrixKind, SelectedRecursiveTier,
-};
-use noid_recursive::acceptance::block_class::{
-    build_selected_zk_block_proof_trace, prove_built_block, verify_block_proof, BlockClass,
-    BlockProofEnvelope, BuiltBlock,
-};
-use noid_recursive::acceptance::link::SelectedZkBlockInput;
-use noid_recursive::acceptance::split_link::{
-    build_split_link, CanonicalSplitLinkLadder, SplitLinkClass, SplitLinkInput,
-    SplitLinkSlotMaterial, CANONICAL_BLOCK_CLASS_MS, CANONICAL_LINK_CLASS_M,
-    CANONICAL_PCS_LOG_BATCH_SIZE, CANONICAL_PCS_LOG_INV_RATE,
+use noid_recursive::{
+    canonical_history_step_shape, freeze_history_step_bank, CanonicalHistoryStepClassId,
+    HistoryStepFreezeMatrixStore, HistoryStepMatrixLease, HistoryStepMatrixSource,
+    HistoryStepMatrixSourceError,
 };
 
-const BLOCK_DOMAIN: &[u8] = b"history-block-v0";
-const K_SKIP: usize = 6;
-const TIERS: [usize; 4] = noid_chain::consensus::params::USER_TX_CLASS_TIERS;
-const SELECTED_TIERS: [SelectedRecursiveTier; 4] = [
-    SelectedRecursiveTier::B8,
-    SelectedRecursiveTier::B32,
-    SelectedRecursiveTier::B64,
-    SelectedRecursiveTier::B255,
-];
-/// Deterministic generation seed: the canonical floor members below are
-/// protocol tooling constants, not secrets. Content does not affect the
-/// exported matrices (content-invariance), only reproducibility of the run.
-const FIXTURE_SEED_BASE: u128 = 0xB10C_C1A5_0000;
+const FIXTURE_SEED: u128 = 0x4849_5354_4550_5f56_31;
+const DEFAULT_ZSTD_LEVEL: i32 = 19;
+const MAX_COMPRESSED_MATRIX_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_CANONICAL_MATRIX_BYTES: usize = 1024 * 1024 * 1024;
+const ZSTD_WINDOW_LOG_MAX: u32 = 27;
 
-fn stage(step: usize, total: usize, label: &str) -> Instant {
-    println!("[{step}/{total}] {label}...");
-    std::io::stdout().flush().expect("flush progress");
-    Instant::now()
+fn class_label(class: CanonicalHistoryStepClassId) -> String {
+    format!("H(B{}<-B{})", class.current_tier(), class.parent_tier())
 }
 
-fn done(started: Instant) {
-    println!("        done in {:.1} s", started.elapsed().as_secs_f64());
+struct CanonicalMatrixStore {
+    directory: PathBuf,
+    zstd_level: i32,
+    installed_digests: Mutex<[Option<[u8; 32]>; HISTORY_STEP_PACK_LEAF_COUNT]>,
 }
 
-fn field_shape(m: usize) -> FieldShape {
-    FieldShape {
-        m,
-        k_log: m,
-        k_skip: K_SKIP,
-        const_pin: Some(0),
+impl CanonicalMatrixStore {
+    fn new(directory: PathBuf, zstd_level: i32) -> Self {
+        Self {
+            directory,
+            zstd_level,
+            installed_digests: Mutex::new(std::array::from_fn(|_| None)),
+        }
+    }
+
+    fn path(&self, class: CanonicalHistoryStepClassId) -> PathBuf {
+        self.directory.join(history_step_matrix_file_name(class))
+    }
+
+    fn temporary_path(&self, class: CanonicalHistoryStepClassId) -> PathBuf {
+        self.directory.join(format!(
+            ".{}.{}.tmp",
+            history_step_matrix_file_name(class),
+            std::process::id()
+        ))
+    }
+
+    fn installed_digest(&self, class: CanonicalHistoryStepClassId) -> Result<[u8; 32], String> {
+        self.installed_digests
+            .lock()
+            .map_err(|_| "HistoryStep matrix digest lock is poisoned".to_owned())?[class.index()]
+        .ok_or_else(|| format!("{} matrix is not installed", class_label(class)))
+    }
+
+    fn load_checked(&self, class: CanonicalHistoryStepClassId) -> Result<FieldR1cs, String> {
+        let path = self.path(class);
+        let metadata = std::fs::metadata(&path)
+            .map_err(|error| format!("inspect {}: {error}", path.display()))?;
+        if !metadata.is_file() || metadata.len() > MAX_COMPRESSED_MATRIX_BYTES {
+            return Err(format!(
+                "{} is not a bounded regular matrix artifact",
+                path.display()
+            ));
+        }
+        let file =
+            File::open(&path).map_err(|error| format!("open {}: {error}", path.display()))?;
+        let mut decoder = zstd::stream::read::Decoder::new(BufReader::new(file))
+            .map_err(|error| format!("open zstd {}: {error}", path.display()))?;
+        decoder
+            .window_log_max(ZSTD_WINDOW_LOG_MAX)
+            .map_err(|error| format!("bound zstd window {}: {error}", path.display()))?;
+        let matrix = FieldR1cs::read_artifact(
+            &mut decoder,
+            canonical_history_step_shape(class),
+            self.installed_digest(class)?,
+            MAX_CANONICAL_MATRIX_BYTES,
+        )
+        .map_err(|error| format!("decode {}: {error}", path.display()))?;
+        let mut trailing = [0u8; 1];
+        if decoder
+            .read(&mut trailing)
+            .map_err(|error| format!("finish zstd {}: {error}", path.display()))?
+            != 0
+        {
+            return Err(format!(
+                "{} has trailing decompressed bytes",
+                path.display()
+            ));
+        }
+        Ok(matrix)
+    }
+
+    fn install_checked(
+        &self,
+        class: CanonicalHistoryStepClassId,
+        matrix: FieldR1cs,
+    ) -> Result<(), String> {
+        let actual_shape = FieldShape::of(&matrix);
+        let expected_shape = canonical_history_step_shape(class);
+        if actual_shape != expected_shape {
+            return Err(format!(
+                "{} has shape {actual_shape:?}, expected {expected_shape:?}",
+                class_label(class)
+            ));
+        }
+        let digest = matrix.structural_statement_digest();
+        let temporary = self.temporary_path(class);
+        let final_path = self.path(class);
+        let result = (|| -> Result<(), String> {
+            let file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temporary)
+                .map_err(|error| format!("create {}: {error}", temporary.display()))?;
+            let mut encoder = zstd::stream::write::Encoder::new(file, self.zstd_level)
+                .map_err(|error| format!("open zstd {}: {error}", temporary.display()))?;
+            encoder
+                .multithread(rayon::current_num_threads().max(1) as u32)
+                .map_err(|error| format!("enable zstd workers {}: {error}", temporary.display()))?;
+            encoder.include_checksum(true).map_err(|error| {
+                format!("enable zstd checksum {}: {error}", temporary.display())
+            })?;
+            matrix
+                .write_artifact(&mut encoder)
+                .map_err(|error| format!("encode {}: {error}", class_label(class)))?;
+            let file = encoder
+                .finish()
+                .map_err(|error| format!("finish zstd {}: {error}", temporary.display()))?;
+            file.sync_all()
+                .map_err(|error| format!("sync {}: {error}", temporary.display()))?;
+            std::fs::rename(&temporary, &final_path).map_err(|error| {
+                format!(
+                    "publish {} as {}: {error}",
+                    temporary.display(),
+                    final_path.display()
+                )
+            })?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+            return result;
+        }
+        self.installed_digests
+            .lock()
+            .map_err(|_| "HistoryStep matrix digest lock is poisoned".to_owned())?[class.index()] =
+            Some(digest);
+        Ok(())
     }
 }
 
-fn pcs_params(m: usize) -> PcsParams {
-    PcsParams {
-        m: m + pcs::LOG_PACKING,
-        log_inv_rate: CANONICAL_PCS_LOG_INV_RATE,
-        log_batch_size: CANONICAL_PCS_LOG_BATCH_SIZE,
-        profile: Default::default(),
+impl HistoryStepMatrixSource for CanonicalMatrixStore {
+    fn load(
+        &self,
+        class: CanonicalHistoryStepClassId,
+    ) -> Result<HistoryStepMatrixLease, HistoryStepMatrixSourceError> {
+        self.load_checked(class)
+            .map(HistoryStepMatrixLease::resident)
+            .map_err(|_| HistoryStepMatrixSourceError)
     }
 }
 
-fn tier_floor_user_txs(tier: usize) -> usize {
-    match tier {
-        8 => 1,
-        32 => 9,
-        64 => 33,
-        255 => 65,
-        _ => unreachable!("canonical tier"),
+impl HistoryStepFreezeMatrixStore for CanonicalMatrixStore {
+    type Error = String;
+
+    fn install(
+        &self,
+        class: CanonicalHistoryStepClassId,
+        matrix: FieldR1cs,
+    ) -> Result<(), Self::Error> {
+        self.install_checked(class, matrix)
+    }
+
+    fn final_class_built(
+        &self,
+        class: CanonicalHistoryStepClassId,
+        wires: usize,
+        elapsed: std::time::Duration,
+    ) {
+        let path = self.path(class);
+        let bytes = std::fs::metadata(&path)
+            .unwrap_or_else(|error| panic!("inspect exported {}: {error}", path.display()))
+            .len();
+        println!(
+            "  c{:02} current=B{} parent=B{} wires={wires} bytes={bytes} build_export_ms={}",
+            class.index(),
+            class.current_tier(),
+            class.parent_tier(),
+            elapsed.as_millis(),
+        );
+        std::io::stdout()
+            .flush()
+            .expect("flush HistoryStep freezer progress");
     }
 }
 
-fn floor_fixture(tier: usize) -> AcceptedSingleBlockFixture {
-    let count = tier_floor_user_txs(tier);
-    let scenarios = (0..count)
-        .map(|index| {
-            tx8x2_scenario(
-                "matrix-gen-floor",
-                noid_tx::TX_INPUTS,
-                noid_tx::TX_OUTPUTS,
-                u32::try_from(index * 2_048).expect("fixture slot base"),
-                FIXTURE_SEED_BASE + ((tier as u128) << 32) + index as u128,
-            )
-        })
-        .collect();
-    let fixture = accepted_proved_user_block_fixture(scenarios);
-    assert_eq!(
-        noid_chain::consensus::params::user_tx_class_tier(count),
-        Some(tier),
-        "floor member must select its own class",
-    );
-    fixture
-}
-
-fn selected_block_input<const TIER: usize>(
-    fixture: &AcceptedSingleBlockFixture,
-) -> SelectedZkBlockInput<'_, TIER> {
-    SelectedZkBlockInput::try_new(
-        &fixture.start_accumulator,
-        &fixture.output.accepted_claim_batch.accumulator,
-        &fixture.output.proof_components.component_inputs,
-        &fixture.component_proof,
-        fixture
-            .output
-            .proof_components
-            .selected_authorization_proofs
-            .clone(),
-        noid_gkr::ghost_tx::prove_selected_ghost_authorization()
-            .expect("fresh canonical selected ghost proof"),
-    )
-    .expect("canonical selected Block input")
-}
-
-fn freeze_block_class(
-    fixture: &AcceptedSingleBlockFixture,
-    tier: usize,
-    params: PcsParams,
-) -> BlockClass {
-    match tier {
-        8 => BlockClass::freeze_selected_zk(params, selected_block_input::<8>(fixture)),
-        32 => BlockClass::freeze_selected_zk(params, selected_block_input::<32>(fixture)),
-        64 => BlockClass::freeze_selected_zk(params, selected_block_input::<64>(fixture)),
-        255 => BlockClass::freeze_selected_zk(params, selected_block_input::<255>(fixture)),
-        _ => unreachable!("canonical tier"),
+fn parse_zstd_level() -> i32 {
+    match std::env::var("NOID_ARTIFACT_ZSTD_LEVEL") {
+        Ok(value) => value
+            .parse::<i32>()
+            .unwrap_or_else(|error| panic!("NOID_ARTIFACT_ZSTD_LEVEL must be an integer: {error}")),
+        Err(std::env::VarError::NotPresent) => DEFAULT_ZSTD_LEVEL,
+        Err(error) => panic!("read NOID_ARTIFACT_ZSTD_LEVEL: {error}"),
     }
 }
 
-fn build_block_trace(
-    class: &BlockClass,
-    fixture: &AcceptedSingleBlockFixture,
-    tier: usize,
-) -> BuiltBlock {
-    match tier {
-        8 => build_selected_zk_block_proof_trace(class, selected_block_input::<8>(fixture)),
-        32 => build_selected_zk_block_proof_trace(class, selected_block_input::<32>(fixture)),
-        64 => build_selected_zk_block_proof_trace(class, selected_block_input::<64>(fixture)),
-        255 => build_selected_zk_block_proof_trace(class, selected_block_input::<255>(fixture)),
-        _ => unreachable!("canonical tier"),
+fn write_metadata(path: &Path, bytes: &[u8]) {
+    let temporary = path.with_extension(format!("runtime.{}.tmp", std::process::id()));
+    let result = (|| -> Result<(), std::io::Error> {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, path)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&temporary);
+        panic!("publish {}: {error}", path.display());
     }
-}
-
-fn export_matrix(
-    store: &LocalSelectedRecursiveMatrixSource,
-    kind: SelectedRecursiveMatrixKind,
-    matrix: &FieldR1cs,
-    expected_digest: [u8; 32],
-) {
-    let digest = matrix.statement_digest();
-    assert_eq!(
-        digest, expected_digest,
-        "canonical {kind:?} matrix digest drifted from its frozen class identity",
-    );
-    let identity =
-        SelectedRecursiveMatrixArtifactIdentity::new(kind, FieldShape::of(matrix), digest);
-    store
-        .export_matrix(identity, matrix)
-        .expect("export canonical matrix artifact");
-    println!("        {kind:?}: {}", hex::encode(digest));
 }
 
 fn main() {
-    let _ = noid_ivc_prover::init_perf_thread_pool();
+    noid_ivc_prover::init_perf_thread_pool();
     let root = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "selected-recursive".into());
-    let total = 6usize;
-    println!("PARANOID canonical matrix generator");
-    println!("  artifact root:  {root}");
-    println!("  rayon threads:  {}", rayon::current_num_threads());
-    println!("  one-time cost:  minutes; every later node start is instant");
-
-    let registry_store = LocalSelectedRecursiveClassRegistryStore::new(&root);
-    let matrix_store = LocalSelectedRecursiveMatrixSource::new(&root);
-
-    // [1] Deterministic floor members, one per Block class.
-    let t = stage(1, total, "building four canonical floor members");
-    let fixtures: Vec<AcceptedSingleBlockFixture> =
-        TIERS.iter().map(|&t| floor_fixture(t)).collect();
-    done(t);
-
-    // [2] Freeze the four Block classes.
-    let t = stage(2, total, "freezing B8/B32/B64/B255 classes");
-    let block_classes: Vec<BlockClass> = TIERS
-        .iter()
-        .zip(&fixtures)
-        .map(|(&tier, fixture)| {
-            freeze_block_class(
-                fixture,
-                tier,
-                pcs_params(
-                    CANONICAL_BLOCK_CLASS_MS[TIERS.iter().position(|c| *c == tier).unwrap()],
-                ),
-            )
-        })
-        .collect();
-    done(t);
-
-    // [3] Build, export, and prove one member per class.
-    let t = stage(3, total, "building and exporting the four Block matrices");
-    let mut block_matrices: Vec<FieldR1cs> = Vec::with_capacity(4);
-    let mut block_envelopes: Vec<BlockProofEnvelope> = Vec::with_capacity(4);
-    for (slot, (&tier, fixture)) in TIERS.iter().zip(&fixtures).enumerate() {
-        let built = build_block_trace(&block_classes[slot], fixture, tier);
-        assert!(built.r1cs.satisfies(&built.witness), "B{tier} floor member");
-        // Proving validates the built matrix against the frozen class
-        // identity before anything is exported.
-        let mut challenger = FsLaneChallenger::new(BLOCK_DOMAIN);
-        let envelope = prove_built_block(&block_classes[slot], &built, &mut challenger)
-            .expect("prove canonical floor member");
-        let mut verifier = FsLaneChallenger::new(BLOCK_DOMAIN);
-        verify_block_proof(&block_classes[slot], &built.r1cs, &envelope, &mut verifier)
-            .expect("verify canonical floor member");
-        let digest = built.r1cs.statement_digest();
-        export_matrix(
-            &matrix_store,
-            SelectedRecursiveMatrixKind::CurrentBlock(SELECTED_TIERS[slot]),
-            &built.r1cs,
-            digest,
-        );
-        block_envelopes.push(envelope);
-        let mut matrix = built.r1cs;
-        matrix.release_csc_cache();
-        block_matrices.push(matrix);
-    }
-    drop(fixtures);
-    done(t);
-
-    // [4] Freeze the Link ladder (builds and proves the canonical T once).
-    let t = stage(4, total, "freezing the four-slot Link ladder and T");
-    let ladder = CanonicalSplitLinkLadder::from_block_classes(
-        field_shape(CANONICAL_LINK_CLASS_M),
-        pcs_params(CANONICAL_LINK_CLASS_M),
-        [
-            &block_classes[0],
-            &block_classes[1],
-            &block_classes[2],
-            &block_classes[3],
-        ],
-    )
-    .expect("canonical four-slot ladder descriptor");
-    let materials: [SplitLinkSlotMaterial<'_>; CanonicalSplitLinkLadder::SLOT_COUNT] =
-        std::array::from_fn(|slot| SplitLinkSlotMaterial {
-            block_class: &block_classes[slot],
-            sample_block: &block_envelopes[slot],
-            block_matrix: &block_matrices[slot],
-        });
-    let link_classes: [SplitLinkClass; 4] = ladder.freeze_all(materials);
-    done(t);
-
-    // [5] Registry: export fresh, or verify byte-digest identity when one
-    // is already installed (the independent-rebuild gate).
-    let t = stage(5, total, "pinning the class registry");
-    let registry_path = registry_store.artifact_path();
-    let block_class_array: &[BlockClass; 4] = block_classes
-        .as_slice()
-        .try_into()
-        .expect("four canonical Block classes");
-    if registry_path.is_file() {
-        let existing = std::fs::read(&registry_path).expect("read installed registry");
-        let existing_digest: [u8; 32] = existing[existing.len() - 32..]
-            .try_into()
-            .expect("registry trailer digest");
-        let fresh = noid_recursive::encode_selected_recursive_class_registry(
-            block_class_array,
-            &ladder,
-            &link_classes,
+        .expect("usage: noid_matrix_gen <pack-root>");
+    assert!(
+        std::env::args().nth(2).is_none(),
+        "usage: noid_matrix_gen <pack-root>"
+    );
+    let root = PathBuf::from(root);
+    let version = root.join(HISTORY_STEP_PACK_VERSION_DIRECTORY);
+    std::fs::create_dir(&root).unwrap_or_else(|error| {
+        panic!(
+            "create fresh HistoryStep pack root {}: {error}",
+            root.display()
         )
-        .expect("encode rebuilt registry");
-        let fresh_digest: [u8; 32] = fresh[fresh.len() - 32..]
-            .try_into()
-            .expect("rebuilt registry trailer digest");
-        assert_eq!(
-            existing_digest, fresh_digest,
-            "installed registry does not match the independently rebuilt one",
-        );
-        println!("        installed registry digest reproduced independently");
-    } else {
-        registry_store
-            .export(block_class_array, &ladder, &link_classes)
-            .expect("export pinned class registry");
-    }
-    let installed = std::fs::read(&registry_path).expect("read pinned registry");
-    let registry_digest = hex::encode(&installed[installed.len() - 32..]);
-    println!("        registry digest: {registry_digest}");
-    done(t);
+    });
+    std::fs::create_dir(&version).unwrap_or_else(|error| {
+        panic!(
+            "create fresh HistoryStep pack directory {}: {error}",
+            version.display()
+        )
+    });
 
-    // [6] The five Link-family matrices: T plus one derivation build per slot.
-    let t = stage(
-        6,
-        total,
-        "building and exporting T and the four Link matrices",
-    );
-    let genesis_matrix = link_classes[0]
-        .rebuild_genesis_matrix()
-        .expect("rebuild canonical T matrix");
-    export_matrix(
-        &matrix_store,
-        SelectedRecursiveMatrixKind::GenesisLink,
-        &genesis_matrix,
-        link_classes[0].genesis_digest,
-    );
-    for (slot, link_class) in link_classes.iter().enumerate() {
-        let input = SplitLinkInput {
-            prev: link_class.genesis_envelope(),
-            prev_slot: 0,
-            genesis: true,
-            // Matrix-derivation build: whitelist digests are witness data
-            // and do not shape the relation.
-            link_class_digests: vec![[0u8; 32]; CanonicalSplitLinkLadder::SLOT_COUNT],
-            link_post_commit_class_digests: vec![[0u8; 32]; CanonicalSplitLinkLadder::SLOT_COUNT],
-            block: &block_envelopes[slot],
-            fold_matrix_link: &genesis_matrix,
-            fold_matrix_block: &block_matrices[slot],
-        };
-        let built = build_split_link(link_class, &input);
-        let expected = *link_class
-            .class_statement_digest
-            .get()
-            .expect("frozen Link class digest");
-        export_matrix(
-            &matrix_store,
-            SelectedRecursiveMatrixKind::PreviousLink(SELECTED_TIERS[slot]),
-            &built.r1cs,
-            expected,
-        );
-    }
-    done(t);
+    let zstd_level = parse_zstd_level();
+    let debug = std::env::var_os("NOID_HISTORY_STEP_GENERATOR_DEBUG").is_some();
+    println!("PARANOID canonical HistoryStep v1 freezer");
+    println!("  pack:          {}", version.display());
+    println!("  rayon threads: {}", rayon::current_num_threads());
+    println!("  witnesses:     real genesis chain + four exact parent forks");
+    println!("  classes:       16 (four current tiers x four parent tiers)");
+    println!("\nBuilding and exporting canonical matrices:");
 
-    println!("complete: pinned registry + 9 canonical matrices in {root}");
-    println!("registry digest (release pin): {registry_digest}");
+    let started = Instant::now();
+    let mut provider = HonestHistoryStepFixtureProvider::new(FIXTURE_SEED)
+        .unwrap_or_else(|error| panic!("initialize honest HistoryStep fixtures: {error}"));
+    let store = std::sync::Arc::new(CanonicalMatrixStore::new(version.clone(), zstd_level));
+    let frozen = freeze_history_step_bank(&mut provider, std::sync::Arc::clone(&store))
+        .unwrap_or_else(|error| panic!("freeze honest HistoryStep bank: {error}"));
+
+    let metadata = encode_history_step_runtime_metadata(frozen.bank(), frozen.parts())
+        .unwrap_or_else(|error| panic!("encode HistoryStep runtime metadata: {error}"));
+    let metadata_digest: [u8; 32] = metadata[metadata.len() - 32..]
+        .try_into()
+        .expect("fixed metadata digest trailer");
+    let decoded = decode_history_step_runtime_metadata_pinned(&metadata, metadata_digest)
+        .unwrap_or_else(|error| panic!("self-check HistoryStep runtime metadata: {error}"));
+    assert_eq!(
+        decoded.bank().digest(),
+        frozen.bank().digest(),
+        "runtime metadata rebuilt a different canonical bank"
+    );
+    write_metadata(&version.join(HISTORY_STEP_RUNTIME_METADATA_FILE), &metadata);
+
+    println!("\nAuthenticating exported pack...");
+    for index in 0..HISTORY_STEP_PACK_LEAF_COUNT {
+        let class_started = Instant::now();
+        let class = CanonicalHistoryStepClassId::from_index(index).expect("canonical class");
+        let matrix = store
+            .load_checked(class)
+            .unwrap_or_else(|error| panic!("reload final {}: {error}", class_label(class)));
+        frozen
+            .bank()
+            .authenticate_resident_matrix(class, &matrix)
+            .unwrap_or_else(|error| panic!("authenticate final {}: {error}", class_label(class)));
+        drop(matrix);
+        if debug {
+            println!(
+                "  c{index:02} load_verify_ms={} matrix_digest={}",
+                class_started.elapsed().as_millis(),
+                hex::encode(frozen.bank().entry(class).matrix_digest())
+            );
+        }
+    }
+    println!("  matrices:      {HISTORY_STEP_PACK_LEAF_COUNT}/{HISTORY_STEP_PACK_LEAF_COUNT}");
+    println!("\nRuntime metadata: {}", hex::encode(metadata_digest));
+    println!("Bank digest:       {}", hex::encode(frozen.bank().digest()));
+    println!("Completed in {:.1} s", started.elapsed().as_secs_f64());
 }

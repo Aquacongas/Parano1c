@@ -122,7 +122,7 @@ fn post_commit_auxiliary_claim_roundtrip_and_causality() {
         "post-commit proof accepted without its mandatory auxiliary replay"
     );
 
-    // Split-link recursion uses the matrix-free verifier. Its post-commit
+    // HistoryStep recursion uses the matrix-free verifier. Its post-commit
     // prefix and appended terminal claim must be transcript-identical.
     let mut ch_deferred = FsLaneChallenger::new(b"field-post-commit-v0");
     let deferred = verify_field_deferred_matrix_with_post_commit(

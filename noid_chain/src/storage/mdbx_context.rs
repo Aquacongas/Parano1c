@@ -3,9 +3,9 @@
 
 //! `MdbxChainContext` — crash-consistent chain context backed by MDBX.
 //!
-//! Replaces the in-memory `ChainContext` with a version that survives process
-//! restarts. The consensus logic is reused unchanged; only the
-//! persistence layer differs.
+//! This is the sole chain context that can advance the accepted canonical tip.
+//! It survives process restarts and commits one complete accepted bundle at a
+//! time.
 //!
 //! # Crash-consistency guarantee (P.18)
 //!
@@ -34,7 +34,7 @@
 //! | Headers | MDBX (forever) | Random access by height/hash |
 //! | Segment columns | MDBX (forever) | Persist across restarts |
 //! | Undo logs | MDBX retained window | Reorg recovery |
-//! | Block bodies/proofs/sidecars | MDBX retained suffix after coverage | Bounded peer sync and prover input |
+//! | Accepted block bundles | MDBX retained suffix | Bounded peer sync and reorg input |
 //! | ChainState (active/alloc) | MDBX (state_meta) | Fast restart |
 //! | Recent headers | RAM (MTP/expansion window) | Header validation |
 
@@ -43,30 +43,37 @@ use std::path::Path;
 
 use crate::block::Block;
 use crate::block_header::BlockHeader;
-use crate::chain_context::ChainContext;
 use crate::consensus::{
     da_prune::{build_undo_log, revert_block, BlockUndoLog},
     difficulty::{add_work, block_work},
     epoch_anchor::{tx_epoch_anchor_height_for_child, validate_block_epoch_anchors},
+    genesis::genesis_header,
     header::asert_anchor_height,
     params::{
         BLOCK_MAX_DISTINCT_SEGMENTS, CONSENSUS_FINALITY_DEPTH, EXPANSION_WINDOW, GENESIS_TARGET,
         LOG_SEGMENT_SIZE, MEDIAN_TIME_BLOCKS, TX_EPOCH_BLOCKS,
     },
-    pow::block_id,
+    pow::{block_id, validate_pow},
+    template::LocallyProvedBlockCommit,
     validation::{validate_block_checks, AnchorInfo},
     ConsensusError,
 };
 use crate::segmented_state::SegmentedFriState;
 use crate::state::{ChainState, StreamingSparseRoot};
 use crate::storage::mdbx_store::StagedAcceptedBlockCommit;
-#[cfg(test)]
-use crate::storage::serial::encode_segment;
 use crate::storage::{
-    AcceptedBlockCommitData, ConsensusMeta, FinalizedCheckpoint, FinalizedSnapshotStaging,
-    MdbxStore, StoreError,
+    ConsensusMeta, FinalizedCheckpoint, FinalizedSnapshotStaging, MdbxStore,
+    SnapshotHeaderInstallSource, StoreError, VerifiedSnapshotBoundary,
 };
 use noid_poseidon2b::primitives::TxBodyHash;
+
+fn canonical_genesis_parts() -> (ChainState, HashMap<u64, BlockHeader>, [u8; 32]) {
+    let header = genesis_header();
+    let hash = block_id(&header);
+    let mut headers = HashMap::new();
+    headers.insert(0, header);
+    (ChainState::new(), headers, hash)
+}
 
 // ---------------------------------------------------------------------------
 // Error
@@ -111,61 +118,19 @@ impl From<ConsensusError> for MdbxContextError {
     }
 }
 
-/// Output of the single proof-native acceptance call that is persisted with
-/// the resulting state transition.
-///
-/// `history_claim_bytes` and `accepted_block_certificate_bytes` are opaque to
-/// `noid_chain`, but mandatory at this boundary so a successful block commit
-/// cannot leave the O(1)-history worker without its accepted inputs.
-#[derive(Debug)]
-pub struct AppliedBlockValidation {
-    pub state_root: [u8; 32],
-    pub history_claim_bytes: Vec<u8>,
-    pub accepted_block_certificate_bytes: Vec<u8>,
-}
-
-impl AppliedBlockValidation {
-    pub fn new(
-        state_root: [u8; 32],
-        history_claim_bytes: Vec<u8>,
-        accepted_block_certificate_bytes: Vec<u8>,
-    ) -> Self {
-        Self {
-            state_root,
-            history_claim_bytes,
-            accepted_block_certificate_bytes,
-        }
-    }
-}
-
-/// Borrowed large payloads for one candidate reorg block.
-///
-/// The reorg validator and final MDBX transaction both read these slices from
-/// the caller's existing candidate buffer.  Staging never clones a block,
-/// proof, or authorization sidecar into node RAM.
-#[derive(Debug, Clone, Copy)]
-pub struct ReorgBlockPayload<'a> {
-    pub block: &'a Block,
-    pub block_proof_bytes: &'a [u8],
-    pub block_auth_sidecar_bytes: &'a [u8],
-    /// Serialized Link terminal envelope when the block advances
-    /// `attested_coverage`; empty otherwise.
-    pub coverage_attestation_bytes: &'a [u8],
-}
-
-/// One block's claim that a Link envelope attests selected-history coverage.
+/// One block's claim that a terminal attests its own HistoryStep.
 ///
 /// `noid_chain` resolves the canonical headers the native verifier must bind
 /// against; the injected verifier (owned by the node, which holds the pinned
 /// registry/matrix artifacts) performs the actual cryptographic check.
 #[derive(Debug, Clone, Copy)]
-pub struct CoverageAttestationClaim<'a> {
-    /// Serialized selected-history terminal package bytes.
-    pub attestation_bytes: &'a [u8],
-    /// The coverage height C declared by the child header.
-    pub coverage_height: u64,
-    /// Canonical header at height C the envelope must bind.
-    pub header_at_coverage: BlockHeader,
+pub struct HistoryStepTerminalClaim<'a> {
+    /// Serialized HistoryStep terminal package bytes.
+    pub terminal_bytes: &'a [u8],
+    /// The exact candidate header the terminal must bind. It is deliberately
+    /// not loaded from the older canonical store because the candidate is not
+    /// committed until this verification succeeds.
+    pub header: BlockHeader,
     /// Canonical transaction-epoch anchor header for height C.
     pub epoch_anchor_header: BlockHeader,
 }
@@ -194,22 +159,6 @@ fn track_reorg_segment(
         });
     }
     Ok(())
-}
-
-impl<'a> ReorgBlockPayload<'a> {
-    pub fn new(
-        block: &'a Block,
-        block_proof_bytes: &'a [u8],
-        block_auth_sidecar_bytes: &'a [u8],
-        coverage_attestation_bytes: &'a [u8],
-    ) -> Self {
-        Self {
-            block,
-            block_proof_bytes,
-            block_auth_sidecar_bytes,
-            coverage_attestation_bytes,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -297,20 +246,13 @@ impl MdbxChainContext {
                 if slot.is_empty() {
                     continue;
                 }
-                // Tagged coinbase mints live in the `TAG | mint_height`
-                // namespace: bound them by the tip height instead of the
-                // allocator counter.
-                if crate::consensus::params::is_coinbase_creation_id(slot.creation_id()) {
-                    if crate::consensus::params::coinbase_creation_height(slot.creation_id())
-                        > tip_height
-                    {
-                        return Err(StoreError::Decode(
-                            "persisted coinbase creation_id exceeds tip height",
-                        ));
-                    }
-                } else if slot.creation_id() > alloc_counter {
+                if !crate::consensus::params::creation_id_within_boundary(
+                    slot.creation_id(),
+                    alloc_counter,
+                    tip_height,
+                ) {
                     return Err(StoreError::Decode(
-                        "persisted slot creation_id exceeds alloc_counter",
+                        "persisted slot creation_id exceeds tip boundary",
                     ));
                 }
                 segment_live = segment_live
@@ -387,18 +329,18 @@ impl MdbxChainContext {
 
         if store.is_empty()? {
             // First run: initialise from genesis.
-            let consensus = ChainContext::init_from_genesis();
+            let (state, recent_headers, tip_hash) = canonical_genesis_parts();
             let tip_chain_work = block_work(&GENESIS_TARGET);
             let finalized = FinalizedCheckpoint {
                 height: 0,
-                hash: consensus.tip_hash,
+                hash: tip_hash,
             };
             let ctx = Self {
                 store,
-                state: consensus.state,
-                recent_headers: consensus.headers,
-                tip_height: consensus.tip_height,
-                tip_hash: consensus.tip_hash,
+                state,
+                recent_headers,
+                tip_height: 0,
+                tip_hash,
                 tip_chain_work,
                 finalized,
                 defer_finality_updates: false,
@@ -421,18 +363,18 @@ impl MdbxChainContext {
                     // Re-open store (the previous one was consumed by restore_from_mdbx).
                     let store = MdbxStore::open(path)?;
                     store.clear_all()?;
-                    let consensus = ChainContext::init_from_genesis();
+                    let (state, recent_headers, tip_hash) = canonical_genesis_parts();
                     let tip_chain_work = block_work(&GENESIS_TARGET);
                     let finalized = FinalizedCheckpoint {
                         height: 0,
-                        hash: consensus.tip_hash,
+                        hash: tip_hash,
                     };
                     let ctx = Self {
                         store,
-                        state: consensus.state,
-                        recent_headers: consensus.headers,
-                        tip_height: consensus.tip_height,
-                        tip_hash: consensus.tip_hash,
+                        state,
+                        recent_headers,
+                        tip_height: 0,
+                        tip_hash,
                         tip_chain_work,
                         finalized,
                         defer_finality_updates: false,
@@ -443,64 +385,6 @@ impl MdbxChainContext {
                 }
                 Err(e) => Err(e),
             }
-        }
-    }
-
-    /// Test-only: open a fresh MDBX with a trivially-satisfiable genesis
-    /// (difficulty_target = `[0xFF;32]`).  All subsequent blocks can use nonce=0,
-    /// so no PoW search is needed in tests that are testing storage logic.
-    #[cfg(test)]
-    fn open_or_create_for_test(path: &std::path::Path) -> Result<Self, MdbxContextError> {
-        use crate::chain_context::TEST_TARGET;
-        let store = MdbxStore::open(path)?;
-        if store.is_empty()? {
-            let consensus = ChainContext::init_from_easy_genesis();
-            let tip_chain_work = crate::block_work(&TEST_TARGET);
-            let finalized = FinalizedCheckpoint {
-                height: 0,
-                hash: consensus.tip_hash,
-            };
-            let ctx = Self {
-                store,
-                state: consensus.state,
-                recent_headers: consensus.headers,
-                tip_height: consensus.tip_height,
-                tip_hash: consensus.tip_hash,
-                tip_chain_work,
-                finalized,
-                defer_finality_updates: false,
-                reorg_staging: None,
-            };
-            // Persist easy genesis.
-            {
-                use crate::consensus::da_prune::BlockUndoLog;
-                let genesis = *ctx
-                    .recent_headers
-                    .get(&0)
-                    .expect("easy genesis header must exist");
-                let genesis_hash = block_id(&genesis);
-                let meta = ConsensusMeta {
-                    tip_height: 0,
-                    tip_hash: genesis_hash,
-                    cumulative_chainwork: tip_chain_work,
-                    finalized,
-                };
-                ctx.store.commit_block(
-                    &genesis,
-                    &genesis_hash,
-                    &BlockUndoLog::empty(0, genesis.log_slots),
-                    &[],
-                    &[],
-                    &[],
-                    None,
-                    None,
-                    &meta,
-                    false,
-                )?;
-            }
-            Ok(ctx)
-        } else {
-            Self::restore_from_mdbx(store)
         }
     }
 
@@ -526,8 +410,7 @@ impl MdbxChainContext {
             &[], // no dirty segments (all virtual zero)
             &[],
             &[],
-            None, // no block bytes for genesis
-            None,
+            None, // genesis is built in and has no accepted bundle
             &meta,
             false,
         )?;
@@ -575,6 +458,7 @@ impl MdbxChainContext {
                 "tip hash mismatch with persisted tip header",
             ));
         }
+        Self::validate_durable_tip_history_terminal(&store, &tip_hdr, tip_hash)?;
         if log_slots != tip_hdr.log_slots
             || active_slot_count != tip_hdr.active_slot_count
             || alloc_counter != tip_hdr.alloc_counter
@@ -632,6 +516,31 @@ impl MdbxChainContext {
         })
     }
 
+    fn validate_durable_tip_history_terminal(
+        store: &MdbxStore,
+        tip_header: &BlockHeader,
+        tip_hash: [u8; 32],
+    ) -> Result<(), MdbxContextError> {
+        if tip_header.height == 0 {
+            return Ok(());
+        }
+        let terminal = store
+            .get_history_step_terminal_at(tip_header.height, tip_hash)?
+            .ok_or(MdbxContextError::Corrupt(
+                "durable non-genesis tip history terminal is missing",
+            ))?;
+        let metadata = crate::history_step::HistoryStepTerminalMetadata::decode_prefix(&terminal)
+            .map_err(|_| {
+            MdbxContextError::Corrupt("durable non-genesis tip history terminal is malformed")
+        })?;
+        if metadata.terminal_height() != tip_header.height || metadata.terminal_hash() != tip_hash {
+            return Err(MdbxContextError::Corrupt(
+                "durable non-genesis tip history terminal binding mismatch",
+            ));
+        }
+        Ok(())
+    }
+
     /// Reload the durable canonical tip without retaining a second full state
     /// image in RAM.  Used only to abort a staged reorg; MDBX is still on the
     /// old branch until the final atomic replacement transaction commits.
@@ -657,6 +566,7 @@ impl MdbxChainContext {
                 "durable reorg recovery metadata mismatch",
             ));
         }
+        Self::validate_durable_tip_history_terminal(&self.store, &tip_header, meta.tip_hash)?;
 
         // Release the failed candidate before decoding durable segments.  The
         // replacement is a sparse virtual-zero state and does not allocate the
@@ -840,11 +750,8 @@ impl MdbxChainContext {
 
     fn commit_applied_next_block(
         &mut self,
+        accepted_bundle: &crate::AcceptedBlockBundle,
         block: &Block,
-        block_proof_bytes: &[u8],
-        block_auth_sidecar_bytes: &[u8],
-        coverage_attestation_bytes: &[u8],
-        validation: &AppliedBlockValidation,
         undo: &crate::consensus::da_prune::BlockUndoLog,
         parent: &BlockHeader,
         parent_segment_summaries: &[ParentSegmentSummary],
@@ -867,10 +774,6 @@ impl MdbxChainContext {
                 hash: block_hash,
                 cumulative_chainwork: new_tip_chain_work,
                 undo_log: undo.clone(),
-                history_claim_bytes: validation.history_claim_bytes.clone(),
-                accepted_block_certificate_bytes: validation
-                    .accepted_block_certificate_bytes
-                    .clone(),
             });
         } else {
             let consensus_meta = ConsensusMeta {
@@ -901,15 +804,7 @@ impl MdbxChainContext {
                     &dirty_refs,
                     &tx_hashes,
                     &[],
-                    Some(&block.to_bytes()),
-                    Some(AcceptedBlockCommitData {
-                        block_proof_bytes,
-                        block_auth_sidecar_bytes,
-                        coverage_attestation_bytes,
-                        history_claim_bytes: &validation.history_claim_bytes,
-                        accepted_block_certificate_bytes: &validation
-                            .accepted_block_certificate_bytes,
-                    }),
+                    Some(accepted_bundle),
                     &consensus_meta,
                     false,
                 )
@@ -947,47 +842,155 @@ impl MdbxChainContext {
         Ok(())
     }
 
-    /// Production block application: proof-native only.
+    fn current_terminal_epoch_anchor_header(
+        &self,
+        current_header: &BlockHeader,
+    ) -> Result<BlockHeader, MdbxContextError> {
+        let epoch_anchor_height = (current_header.height / TX_EPOCH_BLOCKS) * TX_EPOCH_BLOCKS;
+        if epoch_anchor_height == current_header.height {
+            // A boundary block advances the accepted-history accumulator to
+            // itself. It is not in MDBX until terminal verification succeeds.
+            return Ok(*current_header);
+        }
+        match self.recent_headers.get(&epoch_anchor_height) {
+            Some(header) => Ok(*header),
+            None => {
+                self.get_header_from_store(epoch_anchor_height)?
+                    .ok_or(MdbxContextError::Consensus(
+                        ConsensusError::BadHistoryStepTerminal(
+                            "canonical epoch anchor for the current terminal is missing"
+                                .to_string(),
+                        ),
+                    ))
+            }
+        }
+    }
+
+    /// Commit one node-owned block whose exact HistoryStep and public
+    /// transition were completed before this call.
     ///
-    /// For user-transaction blocks, `validate_and_apply` must verify the full
-    /// network `BlockProof` against the pre-block state and mutate `state` to the
-    /// post-block state (the node passes `noid_block::accept_block`).
-    /// The sequential interpreter is not a second production validity source.
-    /// Coinbase-only blocks are the sole no-proof exception, but they still go
-    /// through the supplied proof-native validator so mint-slot emptiness and
-    /// the exact transition are established before the atomic commit.
+    /// This is deliberately separate from [`Self::apply_next_block`].  It
+    /// consumes a non-cloneable typed capability minted with the canonical
+    /// template and sealed only after local HistoryStep proving, so it does
+    /// not decode the just-built block, re-run terminal verification, or
+    /// replay its public state transition.  The capability carries the exact
+    /// immutable header/body/bundle binding; exact current-parent and
+    /// post-state boundaries are rechecked under the chain write lock before
+    /// the same single-transaction MDBX commit used by inbound acceptance.
+    pub fn commit_locally_proved_next_block(
+        &mut self,
+        proved: LocallyProvedBlockCommit,
+    ) -> Result<(Block, crate::AcceptedBlockBundle), MdbxContextError> {
+        if self.reorg_staging.is_some() {
+            return Err(MdbxContextError::Corrupt(
+                "local proved block cannot commit during reorg staging",
+            ));
+        }
+
+        let parent = *self.tip_header();
+        if proved.parent_header() != &parent
+            || proved.block().header.prev_block_hash != self.tip_hash
+        {
+            return Err(MdbxContextError::Consensus(ConsensusError::BadParentHash));
+        }
+        if parent
+            .height
+            .checked_add(1)
+            .is_none_or(|height| proved.block().header.height != height)
+        {
+            return Err(MdbxContextError::Consensus(ConsensusError::BadHeight));
+        }
+        // The proof itself is deliberately not self-verified on the trusted
+        // local producer path. PoW is cheap and closes the only native field
+        // a miner can change after template preparation, so fail closed here
+        // before installing the prepared state image.
+        validate_pow(&proved.block().header)?;
+        if self.state.cached_state_root() != parent.state_root
+            || self.state.state.log_slots() as u32 != parent.log_slots
+            || self.state.active_slot_count != parent.active_slot_count
+            || self.state.alloc_counter != parent.alloc_counter
+        {
+            return Err(MdbxContextError::Corrupt(
+                "hot state does not match the exact local parent boundary",
+            ));
+        }
+
+        let (block, accepted_bundle, post_state, undo) = proved.into_commit_parts();
+        if post_state.state.exact_dirty_segment_ids().next().is_some() {
+            return Err(MdbxContextError::Consensus(ConsensusError::ShapeMismatch(
+                "locally prepared post-state has an unsealed exact root".to_string(),
+            )));
+        }
+        if post_state.cached_state_root() != block.header.state_root {
+            return Err(MdbxContextError::Consensus(ConsensusError::BadStateRoot));
+        }
+        if post_state.state.log_slots() as u32 != block.header.log_slots
+            || post_state.active_slot_count != block.header.active_slot_count
+            || post_state.alloc_counter != block.header.alloc_counter
+        {
+            return Err(MdbxContextError::Consensus(ConsensusError::ShapeMismatch(
+                "locally prepared post-state counters do not match the sealed header".to_string(),
+            )));
+        }
+        let block_hash = block_id(&block.header);
+        if accepted_bundle.height() != block.header.height
+            || accepted_bundle.block_hash() != block_hash
+        {
+            return Err(MdbxContextError::Consensus(
+                ConsensusError::BadHistoryStepTerminal(
+                    "local proved bundle does not bind the sealed block".to_string(),
+                ),
+            ));
+        }
+
+        let touched_segment_ids = self.segment_ids_for_block(&block);
+        let parent_segment_summaries: Vec<ParentSegmentSummary> = touched_segment_ids
+            .iter()
+            .copied()
+            .filter(|segment_id| (*segment_id as usize) < self.state.state.num_segments())
+            .map(|segment_id| (segment_id, self.state.state.cached_segment_root(segment_id)))
+            .collect();
+
+        // The capability owns the exact state image used to derive the header.
+        // Install it only after every immutable binding above has succeeded;
+        // commit failure then uses its prepared undo to restore `parent`.
+        self.state = post_state;
+        let state_root = self.state.cached_state_root();
+        self.commit_applied_next_block(
+            &accepted_bundle,
+            &block,
+            &undo,
+            &parent,
+            &parent_segment_summaries,
+        )?;
+        debug_assert_eq!(state_root, block.header.state_root);
+        Ok((block, accepted_bundle))
+    }
+
+    /// Accept one indivisible block + HistoryStep unit.
     ///
-    /// `coverage_attestation_bytes` carries the detached Link terminal
-    /// envelope for a header that advances `attested_coverage` (empty
-    /// otherwise). `verify_coverage_attestation` is the node-injected native
-    /// verifier over the pinned registry/matrix artifacts; a node without
-    /// artifacts must fail closed from that closure, rejecting the block.
+    /// The terminal verifier runs before any state mutation. Once it has
+    /// established the full recursive statement, `materialize_state` applies
+    /// the public block body to the hot exact state. The final state root must
+    /// still equal the header before the bundle and state are committed in one
+    /// MDBX transaction.
     pub fn apply_next_block<F, E, A>(
         &mut self,
-        block: &Block,
-        block_proof_bytes: &[u8],
-        block_auth_sidecar_bytes: &[u8],
-        coverage_attestation_bytes: &[u8],
+        accepted_bundle: &crate::AcceptedBlockBundle,
         local_time: u64,
-        validate_and_apply: F,
-        verify_coverage_attestation: A,
+        materialize_state: F,
+        verify_history_step_terminal: A,
     ) -> Result<[u8; 32], MdbxContextError>
     where
-        F: FnOnce(
-            &Block,
-            &[u8],
-            &[u8],
-            &BlockHeader,
-            &[u64],
-            &[u64],
-            u64,
-            &[u8; 32],
-            &AnchorInfo,
-            &mut ChainState,
-        ) -> Result<AppliedBlockValidation, E>,
+        F: FnOnce(&Block, &mut ChainState) -> Result<[u8; 32], E>,
         E: std::fmt::Display,
-        A: FnOnce(&CoverageAttestationClaim<'_>) -> Result<(), String>,
+        A: FnOnce(&HistoryStepTerminalClaim<'_>) -> Result<(), String>,
     {
+        let block = Block::from_bytes(accepted_bundle.block_bytes()).map_err(|_| {
+            MdbxContextError::Corrupt("accepted bundle contains a malformed canonical block")
+        })?;
+        let block = &block;
+        let history_step_terminal_bytes = accepted_bundle.history_step_terminal_bytes();
         let parent = *self.tip_header();
         let prev_timestamps = self.prev_timestamps();
         let prev_active_counts = self.prev_active_counts();
@@ -1012,105 +1015,45 @@ impl MdbxChainContext {
             &anchor,
         )?;
 
-        // --- Attestation-on-advancement (proof-gated coinbase maturity) ---
-        //
-        // `validate_block_checks` established the structural envelope of the
-        // header rule (monotone, and any advancement lands in
-        // `(parent.attested_coverage, parent.height]`). Here the detached
-        // payload is bound to the header: present iff the header advances
-        // coverage, and natively verified against the canonical header at C
-        // through the injected artifact-backed verifier. Fail-closed.
-        if block.header.attested_coverage == parent.attested_coverage {
-            if !coverage_attestation_bytes.is_empty() {
-                return Err(MdbxContextError::Consensus(
-                    ConsensusError::BadCoverageAttestation(
-                        "attestation attached but header does not advance coverage".to_string(),
-                    ),
-                ));
-            }
-        } else {
-            if coverage_attestation_bytes.is_empty() {
-                return Err(MdbxContextError::Consensus(
-                    ConsensusError::BadCoverageAttestation(
-                        "header advances coverage without an attestation payload".to_string(),
-                    ),
-                ));
-            }
-            if coverage_attestation_bytes.len()
-                > crate::consensus::wire_limits::MAX_COVERAGE_ATTESTATION_BYTES
-            {
-                return Err(MdbxContextError::Consensus(
-                    ConsensusError::BadCoverageAttestation(
-                        "attestation payload exceeds the wire cap".to_string(),
-                    ),
-                ));
-            }
-            let coverage_height = block.header.attested_coverage;
-            let header_at_coverage = match self.recent_headers.get(&coverage_height) {
-                Some(header) => *header,
-                None => self.get_header_from_store(coverage_height)?.ok_or(
-                    MdbxContextError::Consensus(ConsensusError::BadCoverageAttestation(
-                        "canonical header at the attested coverage height is missing".to_string(),
-                    )),
-                )?,
-            };
-            if header_at_coverage.height != coverage_height {
-                return Err(MdbxContextError::Corrupt(
-                    "stored header disagrees with the attested coverage height",
-                ));
-            }
-            let epoch_anchor_height = (coverage_height / crate::consensus::params::TX_EPOCH_BLOCKS)
-                * crate::consensus::params::TX_EPOCH_BLOCKS;
-            let epoch_anchor_header = match self.recent_headers.get(&epoch_anchor_height) {
-                Some(header) => *header,
-                None => self.get_header_from_store(epoch_anchor_height)?.ok_or(
-                    MdbxContextError::Consensus(ConsensusError::BadCoverageAttestation(
-                        "canonical epoch anchor for the attested coverage is missing".to_string(),
-                    )),
-                )?,
-            };
-            let claim = CoverageAttestationClaim {
-                attestation_bytes: coverage_attestation_bytes,
-                coverage_height,
-                header_at_coverage,
-                epoch_anchor_header,
-            };
-            verify_coverage_attestation(&claim).map_err(|error| {
-                MdbxContextError::Consensus(ConsensusError::BadCoverageAttestation(error))
-            })?;
+        // The terminal is bound directly to this uncommitted candidate, never
+        // to an older header fetched from storage. There is no canonical
+        // PoW-only intermediate state.
+        if block.header.height == 0 {
+            return Err(MdbxContextError::Consensus(
+                ConsensusError::BadHistoryStepTerminal(
+                    "genesis is not transported as an accepted block bundle".to_string(),
+                ),
+            ));
+        }
+        let height = block.header.height;
+        let current_hash = block_id(&block.header);
+        let terminal_metadata = crate::history_step::HistoryStepTerminalMetadata::decode_prefix(
+            history_step_terminal_bytes,
+        )
+        .map_err(|error| {
+            MdbxContextError::Consensus(ConsensusError::BadHistoryStepTerminal(format!(
+                "terminal metadata is invalid: {error}"
+            )))
+        })?;
+        if terminal_metadata.terminal_height() != height
+            || terminal_metadata.terminal_hash() != current_hash
+        {
+            return Err(MdbxContextError::Consensus(
+                ConsensusError::BadHistoryStepTerminal(
+                    "terminal metadata does not bind the current block".to_string(),
+                ),
+            ));
         }
 
-        let has_user_txs = block.transactions.iter().any(|tx| !tx.body.is_coinbase);
-        if has_user_txs {
-            use crate::consensus::wire_limits::{
-                proof_sidecar_combined_len_ok, MAX_BLOCK_AUTH_SIDECAR_BYTES, MAX_BLOCK_PROOF_BYTES,
-            };
-            if block_proof_bytes.is_empty() || block_auth_sidecar_bytes.is_empty() {
-                return Err(MdbxContextError::Consensus(ConsensusError::MissingProof));
-            }
-            if block_proof_bytes.len() > MAX_BLOCK_PROOF_BYTES
-                || block_auth_sidecar_bytes.len() > MAX_BLOCK_AUTH_SIDECAR_BYTES
-                || !proof_sidecar_combined_len_ok(
-                    block_proof_bytes.len(),
-                    block_auth_sidecar_bytes.len(),
-                )
-            {
-                return Err(MdbxContextError::Consensus(ConsensusError::ShapeMismatch(
-                    "block proof/auth sidecar exceeds wire limits".to_string(),
-                )));
-            }
-        } else {
-            crate::block::validate_block_proof_binding(block, block_proof_bytes).map_err(|e| {
-                MdbxContextError::Consensus(ConsensusError::ShapeMismatch(format!(
-                    "coinbase-only proof binding invalid: {e}"
-                )))
-            })?;
-            if !block_auth_sidecar_bytes.is_empty() {
-                return Err(MdbxContextError::Consensus(ConsensusError::ShapeMismatch(
-                    "coinbase-only block unexpectedly carried auth sidecar bytes".to_string(),
-                )));
-            }
-        }
+        let epoch_anchor_header = self.current_terminal_epoch_anchor_header(&block.header)?;
+        let claim = HistoryStepTerminalClaim {
+            terminal_bytes: history_step_terminal_bytes,
+            header: block.header,
+            epoch_anchor_header,
+        };
+        verify_history_step_terminal(&claim).map_err(|error| {
+            MdbxContextError::Consensus(ConsensusError::BadHistoryStepTerminal(error))
+        })?;
 
         let touched_segment_ids = self.segment_ids_for_block(block);
         let parent_segment_summaries: Vec<ParentSegmentSummary> = touched_segment_ids
@@ -1122,22 +1065,11 @@ impl MdbxChainContext {
         self.preload_segment_ids(&touched_segment_ids)?;
         let undo = build_undo_log(&self.state, block);
 
-        let validation = match validate_and_apply(
-            block,
-            block_proof_bytes,
-            block_auth_sidecar_bytes,
-            &parent,
-            &prev_timestamps,
-            &prev_active_counts,
-            local_time,
-            &tx_epoch_anchor_id,
-            &anchor,
-            &mut self.state,
-        ) {
-            Ok(validation) => validation,
+        let state_root = match materialize_state(block, &mut self.state) {
+            Ok(state_root) => state_root,
             Err(e) => {
                 let original = MdbxContextError::Consensus(ConsensusError::ShapeMismatch(format!(
-                    "proof-native validation failed: {e}"
+                    "public block state materialization failed: {e}"
                 )));
                 return Err(self.reject_uncommitted_block(
                     &undo,
@@ -1148,7 +1080,7 @@ impl MdbxChainContext {
             }
         };
 
-        if validation.state_root != block.header.state_root {
+        if state_root != block.header.state_root {
             return Err(self.reject_uncommitted_block(
                 &undo,
                 &parent,
@@ -1156,30 +1088,14 @@ impl MdbxChainContext {
                 MdbxContextError::Consensus(ConsensusError::BadStateRoot),
             ));
         }
-        if validation.history_claim_bytes.is_empty()
-            || validation.accepted_block_certificate_bytes.is_empty()
-        {
-            return Err(self.reject_uncommitted_block(
-                &undo,
-                &parent,
-                &parent_segment_summaries,
-                MdbxContextError::Consensus(ConsensusError::ShapeMismatch(
-                    "proof-native acceptance returned incomplete durable artifacts".to_string(),
-                )),
-            ));
-        }
-
         self.commit_applied_next_block(
+            accepted_bundle,
             block,
-            block_proof_bytes,
-            block_auth_sidecar_bytes,
-            coverage_attestation_bytes,
-            &validation,
             &undo,
             &parent,
             &parent_segment_summaries,
         )?;
-        Ok(validation.state_root)
+        Ok(state_root)
     }
 
     // -----------------------------------------------------------------------
@@ -1211,26 +1127,24 @@ impl MdbxChainContext {
     ///
     /// 1. Reverts our chain from tip back to `ancestor_height` using MDBX undo logs.
     /// 2. Persists the reverted state to MDBX atomically (crash-safe checkpoint).
-    /// 3. Applies `new_blocks` on top of `ancestor_height` through the caller's
-    ///    proof-native applier. The node passes a closure that calls this type's
-    ///    single production `apply_next_block` method with the matching `BlockProof`
-    ///    bytes and `noid_block::accept_block`.
+    /// 3. Applies complete accepted-block bundles on top of `ancestor_height`
+    ///    through the same terminal-first `apply_next_block` path.
     ///
     /// Returns the hashes of reclaimed transactions for mempool re-admission.
     ///
     /// Fails if the reorg would change the finalized prefix, if an undo log is
-    /// missing, or if any fork block fails full proof-native validation/application.
+    /// missing, or if any fork bundle fails full validation/materialization.
     pub fn apply_reorg_mdbx_with_applier<F>(
         &mut self,
         ancestor_height: u64,
-        replacement: &[ReorgBlockPayload<'_>],
+        replacement: &[crate::AcceptedBlockBundle],
         local_time: u64,
         mut apply_block: F,
     ) -> Result<crate::consensus::reorg::ReorgResult, MdbxContextError>
     where
-        F: FnMut(&mut Self, &ReorgBlockPayload<'_>, u64) -> Result<(), MdbxContextError>,
+        F: FnMut(&mut Self, &crate::AcceptedBlockBundle, u64) -> Result<(), MdbxContextError>,
     {
-        use crate::consensus::reorg::{revert_state_counters, ReorgResult};
+        use crate::consensus::reorg::{restore_state_counters, ReorgResult};
 
         // Re-validate inside write lock: ancestor_height must be <= our CURRENT tip.
         // The caller computed ancestor_height outside the lock — if another task applied
@@ -1316,8 +1230,11 @@ impl MdbxChainContext {
         // any in-memory state.
         // -----------------------------------------------------------------------
         let mut reorg_segment_ids = std::collections::HashSet::new();
-        for payload in replacement {
-            for tx in &payload.block.transactions {
+        for bundle in replacement {
+            let block = Block::from_bytes(bundle.block_bytes()).map_err(|_| {
+                MdbxContextError::Corrupt("reorg bundle contains a malformed canonical block")
+            })?;
+            for tx in &block.transactions {
                 for (_, input) in tx.body.live_inputs() {
                     track_reorg_segment(&mut reorg_segment_ids, input.slot_index)?;
                 }
@@ -1380,7 +1297,7 @@ impl MdbxChainContext {
                         .map_err(|_| {
                             MdbxContextError::Corrupt("state shrink after reorg failed")
                         })?;
-                    revert_state_counters(&mut self.state, &undo);
+                    restore_state_counters(&mut self.state, &undo);
                     self.state.rebuild_exact_utxo_root_loaded().map_err(|_| {
                         MdbxContextError::Corrupt("exact root rebuild after reorg failed")
                     })?;
@@ -1417,8 +1334,8 @@ impl MdbxChainContext {
         self.tip_chain_work = ancestor_chain_work;
 
         // -----------------------------------------------------------------------
-        // Validate the entire fork through the normal proof-native applier,
-        // but stage every resulting commit in RAM.  The old canonical MDBX
+        // Validate the entire fork through the normal terminal-first applier,
+        // but stage every resulting commit in RAM. The old canonical MDBX
         // branch remains untouched until every replacement block succeeds.
         // -----------------------------------------------------------------------
         let mut applied_heights: Vec<u64> = Vec::new();
@@ -1428,14 +1345,11 @@ impl MdbxChainContext {
         for candidate in replacement {
             match apply_block(self, candidate, local_time) {
                 Ok(()) => {
-                    applied_heights.push(candidate.block.header.height);
-                    tracing::info!(
-                        height = candidate.block.header.height,
-                        "reorg: applied new block"
-                    );
+                    applied_heights.push(candidate.height());
+                    tracing::info!(height = candidate.height(), "reorg: applied new block");
                 }
                 Err(e) => {
-                    tracing::error!(height = candidate.block.header.height, err = ?e, "reorg: failed to apply block");
+                    tracing::error!(height = candidate.height(), err = ?e, "reorg: failed to apply block");
                     return Err(self.abort_staged_reorg(e));
                 }
             }
@@ -1661,41 +1575,80 @@ impl MdbxChainContext {
     // State snapshot sync
     // -----------------------------------------------------------------------
 
-    /// Atomically install a finalized disk-staged snapshot and switch the hot
-    /// context to a metadata-only exact state.
-    ///
-    /// `staging` must come from the authenticated receiver staging state
-    /// machine. This boundary deliberately accepts no caller-supplied height,
-    /// root, counters, or segment vectors: all state identity comes from the
-    /// authenticated metadata and locally persisted canonical headers.
-    pub fn apply_staged_state_snapshot(
-        &mut self,
-        staging: &FinalizedSnapshotStaging,
-        recent_headers_bytes: &[Vec<u8>],
-    ) -> Result<(), MdbxContextError> {
-        self.apply_staged_state_snapshot_inner(staging, recent_headers_bytes, None)
-    }
-
-    /// Install a peer snapshot and its already-decided selected-history
-    /// terminal boundary in one durable state epoch.
-    pub fn apply_staged_state_snapshot_with_selected_history(
-        &mut self,
-        staging: &FinalizedSnapshotStaging,
-        recent_headers_bytes: &[Vec<u8>],
-        selected_history: crate::storage::SelectedHistorySnapshotSeed<'_>,
-    ) -> Result<(), MdbxContextError> {
-        self.apply_staged_state_snapshot_inner(
-            staging,
-            recent_headers_bytes,
-            Some(selected_history),
+    /// Verify the snapshot tip's full HistoryStep terminal before any state
+    /// epoch can be installed. The boundary block body may already be pruned;
+    /// the sealed candidate header, terminal and finalized staging state are the
+    /// complete O(1)-sync boundary.
+    pub fn verify_snapshot_boundary<A>(
+        &self,
+        header: BlockHeader,
+        epoch_anchor_header: BlockHeader,
+        history_step_terminal_bytes: Vec<u8>,
+        verify_history_step_terminal: A,
+    ) -> Result<VerifiedSnapshotBoundary, MdbxContextError>
+    where
+        A: FnOnce(&HistoryStepTerminalClaim<'_>) -> Result<(), String>,
+    {
+        let hash = block_id(&header);
+        if header.height == 0 {
+            return Err(MdbxContextError::Corrupt(
+                "snapshot boundary header metadata is invalid",
+            ));
+        }
+        let expected_epoch_height = (header.height / TX_EPOCH_BLOCKS) * TX_EPOCH_BLOCKS;
+        if epoch_anchor_header.height != expected_epoch_height
+            || (expected_epoch_height == header.height && epoch_anchor_header != header)
+        {
+            return Err(MdbxContextError::Corrupt(
+                "snapshot boundary epoch anchor is invalid",
+            ));
+        }
+        if history_step_terminal_bytes.len()
+            > crate::consensus::wire_limits::MAX_HISTORY_STEP_TERMINAL_BYTES
+        {
+            return Err(MdbxContextError::Consensus(
+                ConsensusError::BadHistoryStepTerminal(
+                    "snapshot HistoryStep terminal exceeds the wire cap".to_string(),
+                ),
+            ));
+        }
+        let terminal_metadata = crate::history_step::HistoryStepTerminalMetadata::decode_prefix(
+            &history_step_terminal_bytes,
         )
+        .map_err(|error| {
+            MdbxContextError::Consensus(ConsensusError::BadHistoryStepTerminal(format!(
+                "snapshot terminal metadata is invalid: {error}"
+            )))
+        })?;
+        if terminal_metadata.terminal_height() != header.height
+            || terminal_metadata.terminal_hash() != hash
+        {
+            return Err(MdbxContextError::Consensus(
+                ConsensusError::BadHistoryStepTerminal(
+                    "snapshot terminal does not bind its staged boundary".to_string(),
+                ),
+            ));
+        }
+        verify_history_step_terminal(&HistoryStepTerminalClaim {
+            terminal_bytes: &history_step_terminal_bytes,
+            header,
+            epoch_anchor_header,
+        })
+        .map_err(|error| {
+            MdbxContextError::Consensus(ConsensusError::BadHistoryStepTerminal(error))
+        })?;
+        Ok(VerifiedSnapshotBoundary::new_verified(
+            header,
+            history_step_terminal_bytes,
+        ))
     }
 
-    fn apply_staged_state_snapshot_inner(
+    /// Install a fully verified snapshot boundary in one durable state epoch.
+    pub fn apply_staged_state_snapshot<S: SnapshotHeaderInstallSource>(
         &mut self,
         staging: &FinalizedSnapshotStaging,
-        recent_headers_bytes: &[Vec<u8>],
-        selected_history: Option<crate::storage::SelectedHistorySnapshotSeed<'_>>,
+        boundary: &VerifiedSnapshotBoundary,
+        header_source: &mut S,
     ) -> Result<(), MdbxContextError> {
         if self.reorg_staging.is_some() {
             return Err(MdbxContextError::Corrupt(
@@ -1717,15 +1670,15 @@ impl MdbxChainContext {
                 "staged snapshot tip hash does not match authenticated header",
             ));
         }
-        let stored_tip_header =
-            self.store
-                .get_header(tip_height)?
-                .ok_or(MdbxContextError::Corrupt(
-                    "staged snapshot tip header is missing from canonical store",
-                ))?;
-        if stored_tip_header != tip_header {
+        if boundary.header() != &tip_header || boundary.block_hash() != tip_hash {
             return Err(MdbxContextError::Corrupt(
-                "staged snapshot tip header conflicts with canonical store",
+                "verified snapshot boundary does not match staged state",
+            ));
+        }
+        let target_record = header_source.target_record();
+        if target_record.header != tip_header || target_record.hash != tip_hash {
+            return Err(MdbxContextError::Corrupt(
+                "staged snapshot tip conflicts with sealed header source",
             ));
         }
 
@@ -1736,17 +1689,11 @@ impl MdbxChainContext {
         let expected_first = tip_height.saturating_sub(history_window);
         let expected_header_count =
             tip_height.saturating_sub(expected_first).saturating_add(1) as usize;
-        if recent_headers_bytes.len() != expected_header_count {
+        let decoded_recent = header_source.recent_headers().to_vec();
+        if decoded_recent.len() != expected_header_count {
             return Err(MdbxContextError::Corrupt(
-                "staged snapshot recent header window has wrong length",
+                "staged snapshot recent header window has the wrong length",
             ));
-        }
-
-        let mut decoded_recent = Vec::with_capacity(expected_header_count);
-        for bytes in recent_headers_bytes {
-            decoded_recent.push(BlockHeader::from_bytes(bytes).map_err(|_| {
-                MdbxContextError::Corrupt("staged snapshot recent header decode failed")
-            })?);
         }
         if decoded_recent.first().map(|header| header.height) != Some(expected_first)
             || decoded_recent.last().copied() != Some(tip_header)
@@ -1764,20 +1711,7 @@ impl MdbxChainContext {
                 ));
             }
         }
-        for header in &decoded_recent {
-            if self.store.get_header(header.height)? != Some(*header) {
-                return Err(MdbxContextError::Corrupt(
-                    "staged snapshot recent header conflicts with canonical store",
-                ));
-            }
-        }
-
-        let cumulative_chainwork =
-            self.store
-                .get_chain_work(tip_height)?
-                .ok_or(MdbxContextError::Corrupt(
-                    "staged snapshot tip chainwork is missing",
-                ))?;
+        let cumulative_chainwork = target_record.cumulative_chainwork;
         let finalized = FinalizedCheckpoint {
             height: tip_height,
             hash: tip_hash,
@@ -1797,21 +1731,13 @@ impl MdbxChainContext {
         // transaction has committed. Every operation below is an infallible
         // in-memory swap, so no post-commit error can leave hot and durable
         // state at different boundaries.
-        let snapshot_state = match selected_history {
-            Some(seed) => self
-                .store
-                .install_finalized_snapshot_staging_with_selected_history(
-                    staging,
-                    &consensus_meta,
-                    &decoded_recent,
-                    seed,
-                )?,
-            None => self.store.install_finalized_snapshot_staging(
-                staging,
-                &consensus_meta,
-                &decoded_recent,
-            )?,
-        };
+        let snapshot_state = self.store.install_finalized_snapshot_staging(
+            staging,
+            &consensus_meta,
+            &decoded_recent,
+            boundary,
+            header_source,
+        )?;
         debug_assert_eq!(snapshot_state.state.materialized_segment_ids().count(), 0);
 
         self.state = snapshot_state;
@@ -1824,227 +1750,8 @@ impl MdbxChainContext {
         Ok(())
     }
 
-    /// Apply a full state snapshot received from a peer during initial sync.
-    ///
-    /// The caller must already have validated and persisted the canonical header
-    /// chain through `tip_height` and accepted the snapshot proof policy.
-    #[cfg(test)]
-    #[allow(clippy::too_many_arguments)]
-    pub fn apply_state_snapshot<I>(
-        &mut self,
-        tip_height: u64,
-        tip_hash: [u8; 32],
-        log_slots: u32,
-        active_slot_count: u64,
-        alloc_counter: u64,
-        segments: I,
-        recent_headers_bytes: &[Vec<u8>],
-    ) -> Result<(), MdbxContextError>
-    where
-        I: IntoIterator<Item = (u16, u8, crate::segmented_state::SegmentColumns, [u8; 32])>,
-    {
-        if tip_height <= self.tip_height {
-            return Err(MdbxContextError::Corrupt(
-                "snapshot tip is not ahead of local state",
-            ));
-        }
-
-        let tip_header = self
-            .store
-            .get_header(tip_height)?
-            .ok_or(MdbxContextError::Corrupt("snapshot tip header missing"))?;
-        if block_id(&tip_header) != tip_hash {
-            return Err(MdbxContextError::Corrupt(
-                "snapshot tip hash does not match canonical header",
-            ));
-        }
-        if tip_header.log_slots != log_slots
-            || tip_header.active_slot_count != active_slot_count
-            || tip_header.alloc_counter != alloc_counter
-        {
-            return Err(MdbxContextError::Corrupt(
-                "snapshot manifest counters do not match canonical header",
-            ));
-        }
-
-        let mut decoded_recent = Vec::with_capacity(recent_headers_bytes.len());
-        for bytes in recent_headers_bytes {
-            decoded_recent.push(
-                BlockHeader::from_bytes(bytes).map_err(|_| {
-                    MdbxContextError::Corrupt("snapshot recent header decode failed")
-                })?,
-            );
-        }
-        if decoded_recent.is_empty() {
-            return Err(MdbxContextError::Corrupt(
-                "snapshot recent header window is empty",
-            ));
-        }
-        if decoded_recent.last().map(|h| h.height) != Some(tip_height) {
-            return Err(MdbxContextError::Corrupt(
-                "snapshot recent header window does not end at tip",
-            ));
-        }
-        for pair in decoded_recent.windows(2) {
-            if pair[1].height != pair[0].height + 1 {
-                return Err(MdbxContextError::Corrupt(
-                    "snapshot recent headers are not contiguous",
-                ));
-            }
-            if pair[1].prev_block_hash != block_id(&pair[0]) {
-                return Err(MdbxContextError::Corrupt(
-                    "snapshot recent headers are not linked",
-                ));
-            }
-        }
-        for header in &decoded_recent {
-            let stored = self
-                .store
-                .get_header(header.height)?
-                .ok_or(MdbxContextError::Corrupt(
-                    "snapshot recent header missing from canonical store",
-                ))?;
-            if block_id(&stored) != block_id(header) {
-                return Err(MdbxContextError::Corrupt(
-                    "snapshot recent header conflicts with canonical store",
-                ));
-            }
-        }
-
-        let owned_segments: Vec<_> = segments.into_iter().collect();
-        let mut seg_state = SegmentedFriState::new_empty(log_slots as usize);
-        let expected_eff_log = seg_state.effective_log_segment_size() as u8;
-        let mut live_count = 0u64;
-        let mut seen_segments = std::collections::HashSet::new();
-        for (seg_id, eff_log, cols, expected_root) in &owned_segments {
-            if !seen_segments.insert(*seg_id) {
-                return Err(MdbxContextError::Corrupt(
-                    "snapshot contains duplicate segment id",
-                ));
-            }
-            if *eff_log != expected_eff_log {
-                return Err(MdbxContextError::Corrupt(
-                    "snapshot segment effective log mismatch",
-                ));
-            }
-            if (*seg_id as usize) >= seg_state.num_segments() {
-                return Err(MdbxContextError::Corrupt(
-                    "snapshot segment id out of range",
-                ));
-            }
-            let computed_root = crate::fri_state::compute_segment_root(
-                *eff_log as usize,
-                &cols.values,
-                &cols.owners_hi,
-                &cols.owners_lo,
-            );
-            if computed_root != *expected_root {
-                return Err(MdbxContextError::Corrupt("snapshot segment root mismatch"));
-            }
-            for ((&value, &owner_hi), &owner_lo) in cols
-                .values
-                .iter()
-                .zip(cols.owners_hi.iter())
-                .zip(cols.owners_lo.iter())
-            {
-                let slot = crate::fri_state::SlotValue {
-                    value,
-                    owner_hi,
-                    owner_lo,
-                };
-                if slot.is_empty() {
-                    continue;
-                }
-                if crate::consensus::params::is_coinbase_creation_id(slot.creation_id()) {
-                    if crate::consensus::params::coinbase_creation_height(slot.creation_id())
-                        > tip_height
-                    {
-                        return Err(MdbxContextError::Corrupt(
-                            "snapshot coinbase creation_id exceeds tip height",
-                        ));
-                    }
-                } else if slot.creation_id() > alloc_counter {
-                    return Err(MdbxContextError::Corrupt(
-                        "snapshot slot creation_id exceeds alloc_counter",
-                    ));
-                }
-                live_count = live_count.checked_add(1).ok_or(MdbxContextError::Corrupt(
-                    "snapshot active slot count overflow",
-                ))?;
-            }
-            seg_state.set_segment_columns(*seg_id, cols.clone());
-        }
-        if live_count != active_slot_count {
-            return Err(MdbxContextError::Corrupt(
-                "snapshot active slot count mismatch",
-            ));
-        }
-
-        let mut snapshot_state =
-            ChainState::from_loaded_parts(seg_state, active_slot_count, alloc_counter)
-                .map_err(|_| MdbxContextError::Corrupt("snapshot exact state rebuild failed"))?;
-        if snapshot_state
-            .try_state_root()
-            .map_err(|_| MdbxContextError::Corrupt("snapshot exact state rebuild failed"))?
-            != tip_header.state_root
-        {
-            return Err(MdbxContextError::Corrupt(
-                "snapshot reconstructed state_root mismatch",
-            ));
-        }
-        snapshot_state.state.clear_dirty();
-
-        let cumulative_chainwork = self
-            .store
-            .get_chain_work(tip_height)?
-            .ok_or(MdbxContextError::Corrupt("snapshot tip chainwork missing"))?;
-        // Snapshot manifests are served at a proof-covered finalized boundary.
-        // The retained suffix is replayed after snapshot application, so the
-        // snapshot height itself is the local finalized checkpoint.
-        let finalized_height = tip_height;
-        let finalized_header =
-            self.store
-                .get_header(finalized_height)?
-                .ok_or(MdbxContextError::Corrupt(
-                    "snapshot finalized header missing",
-                ))?;
-        let finalized = FinalizedCheckpoint {
-            height: finalized_height,
-            hash: block_id(&finalized_header),
-        };
-        let consensus_meta = ConsensusMeta {
-            tip_height,
-            tip_hash,
-            cumulative_chainwork,
-            finalized,
-        };
-        let segment_refs: Vec<_> = owned_segments
-            .iter()
-            .map(|(seg_id, eff_log, cols, _)| (*seg_id, *eff_log, cols))
-            .collect();
-        self.store.install_state_snapshot(
-            &tip_header,
-            &tip_hash,
-            &consensus_meta,
-            &segment_refs,
-        )?;
-
-        self.state = snapshot_state;
-        self.recent_headers.clear();
-        for header in decoded_recent {
-            self.recent_headers.insert(header.height, header);
-        }
-        self.tip_height = tip_height;
-        self.tip_hash = tip_hash;
-        self.tip_chain_work = cumulative_chainwork;
-        self.finalized = finalized;
-        self.defer_finality_updates = false;
-
-        Ok(())
-    }
-
     // -----------------------------------------------------------------------
-    // ChainContext-compatible accessors
+    // Chain accessors
     // -----------------------------------------------------------------------
 
     pub fn tip_header(&self) -> &BlockHeader {
@@ -2121,1205 +1828,157 @@ impl MdbxChainContext {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block::{compute_tx_root, Block};
-    use crate::chain_context::TEST_TARGET;
-    use crate::consensus::{emission::block_reward, params::BLOCK_TIME};
-    use noid_poseidon2b::primitives::Address;
-    use noid_tx::{
-        output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS,
-    };
 
-    #[test]
-    fn reorg_resident_segment_budget_is_bounded_before_mutation() {
-        let mut segment_ids = std::collections::HashSet::new();
-
-        for segment_id in 0..MAX_REORG_RESIDENT_SEGMENTS {
-            track_reorg_segment(&mut segment_ids, (segment_id as u32) << LOG_SEGMENT_SIZE).unwrap();
-        }
-
-        // Repeated slots in an already resident segment consume no extra RAM
-        // budget.
-        track_reorg_segment(&mut segment_ids, 1).unwrap();
-
-        let error = track_reorg_segment(
-            &mut segment_ids,
-            (MAX_REORG_RESIDENT_SEGMENTS as u32) << LOG_SEGMENT_SIZE,
-        )
-        .unwrap_err();
-        assert!(matches!(
-            error,
-            MdbxContextError::ResourceLimit {
-                resource: "reorg resident segments",
-                actual,
-                maximum,
-            } if actual == MAX_REORG_RESIDENT_SEGMENTS + 1
-                && maximum == MAX_REORG_RESIDENT_SEGMENTS
-        ));
-    }
-
-    fn coinbase_block(ctx: &MdbxChainContext, slot: u32, owner: Address) -> Block {
-        let parent = *ctx.tip_header();
-        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
-        outputs[0] = TxOutput {
-            slot_index: slot,
-            amount: block_reward(parent.log_slots),
-            owner,
-        };
-        let tx = Transaction::new(TxBody {
-            epoch_anchor: block_id(&parent),
-            fee: 0,
-            input_owner: Address([0u8; 32]),
-            inputs: [TxInput::dummy(); TX_INPUTS],
-            outputs,
-            validity_bitmap: output_bitmap_bit(0),
-            is_coinbase: true,
-        });
-        let mut child = ctx.state.clone();
-        let segment_id = (slot >> child.state.effective_log_segment_size()) as u16;
-        if child.state.is_evicted(segment_id) {
-            let (_, columns) = ctx.store.get_segment(segment_id).unwrap().unwrap();
-            child.restore_evicted_segment(segment_id, columns).unwrap();
-        }
-        crate::state::apply_tx_at(&mut child, &tx.body, parent.height + 1).unwrap();
-        Block {
-            header: BlockHeader {
-                prev_block_hash: block_id(&parent),
-                state_root: child.state_root(),
-                tx_root: compute_tx_root(std::slice::from_ref(&tx)),
-                timestamp: parent.timestamp + BLOCK_TIME,
-                height: parent.height + 1,
-                miner_address: owner,
-                nonce: 0,
-                difficulty_target: TEST_TARGET,
-                log_slots: parent.log_slots,
-                active_slot_count: child.active_slot_count,
-                alloc_counter: child.alloc_counter,
-                attested_coverage: 0,
-            },
-            transactions: vec![tx],
-        }
-    }
-
-    /// Build a header-valid coinbase candidate without executing its state
-    /// transition. Tests whose validator intentionally rejects the candidate
-    /// do not need to allocate a second 3 MiB segment merely to derive an
-    /// unreachable post-state root.
-    fn rejected_coinbase_candidate(ctx: &MdbxChainContext, slot: u32, owner: Address) -> Block {
-        let parent = *ctx.tip_header();
-        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
-        outputs[0] = TxOutput {
-            slot_index: slot,
-            amount: block_reward(parent.log_slots),
-            owner,
-        };
-        let tx = Transaction::new(TxBody {
-            epoch_anchor: block_id(&parent),
-            fee: 0,
-            input_owner: Address([0u8; 32]),
-            inputs: [TxInput::dummy(); TX_INPUTS],
-            outputs,
-            validity_bitmap: output_bitmap_bit(0),
-            is_coinbase: true,
-        });
-        Block {
-            header: BlockHeader {
-                prev_block_hash: block_id(&parent),
-                // The rejecting verifier never authenticates a child state;
-                // rollback must restore this parent independently of the
-                // candidate's untrusted commitment fields.
-                state_root: parent.state_root,
-                tx_root: compute_tx_root(std::slice::from_ref(&tx)),
-                timestamp: parent.timestamp + BLOCK_TIME,
-                height: parent.height + 1,
-                miner_address: owner,
-                nonce: 0,
-                difficulty_target: TEST_TARGET,
-                log_slots: parent.log_slots,
-                active_slot_count: parent.active_slot_count,
-                alloc_counter: parent.alloc_counter,
-                attested_coverage: 0,
-            },
-            transactions: vec![tx],
-        }
-    }
-
-    /// Test attestation verifier: these fixtures never attach an attestation,
-    /// so reaching the verifier means the binding rule itself regressed.
-    fn reject_unexpected_attestation(_claim: &CoverageAttestationClaim<'_>) -> Result<(), String> {
-        Err("test fixtures do not carry coverage attestations".to_string())
-    }
-
-    /// [`coinbase_block`] with an explicit header `attested_coverage`.
-    fn coinbase_block_with_coverage(
-        ctx: &MdbxChainContext,
-        slot: u32,
-        owner: Address,
-        attested_coverage: u64,
-    ) -> Block {
-        let mut block = coinbase_block(ctx, slot, owner);
-        block.header.attested_coverage = attested_coverage;
-        block
-    }
-
-    /// Apply a coinbase block carrying `attestation` bytes through an
-    /// injected attestation verifier.
-    fn apply_coinbase_with_attestation<A>(
-        ctx: &mut MdbxChainContext,
-        block: &Block,
-        attestation: &[u8],
-        verify: A,
-    ) -> Result<[u8; 32], MdbxContextError>
-    where
-        A: FnOnce(&CoverageAttestationClaim<'_>) -> Result<(), String>,
-    {
-        ctx.apply_next_block(
-            block,
-            &[],
-            &[],
-            attestation,
-            block.header.timestamp + 1,
-            |block,
-             _proof,
-             _sidecar,
-             _parent,
-             _timestamps,
-             _active,
-             _local,
-             _tx_epoch,
-             _anchor,
-             state|
-             -> Result<AppliedBlockValidation, String> {
-                crate::block::apply_block(state, block)
-                    .map(|transition| {
-                        AppliedBlockValidation::new(
-                            transition.new_state_root,
-                            b"test-history-claim".to_vec(),
-                            b"test-accepted-certificate".to_vec(),
-                        )
-                    })
-                    .map_err(|error| format!("{error:?}"))
-            },
-            verify,
-        )
-    }
-
-    #[test]
-    fn coverage_attestation_binding_gates_advancing_headers() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
-        let owner = Address([0x21; 32]);
-
-        // Height 1 keeps genesis coverage 0 without any attestation.
-        let block_one = coinbase_block(&ctx, 7, owner);
-        apply_coinbase(&mut ctx, &block_one).unwrap();
-        let header_at_one = *ctx.tip_header();
-
-        // An advancing header without an attestation payload fails closed.
-        let advancing = coinbase_block_with_coverage(&ctx, 8, owner, 1);
-        let missing = apply_coinbase_with_attestation(
-            &mut ctx,
-            &advancing,
-            &[],
-            reject_unexpected_attestation,
-        )
-        .unwrap_err();
-        assert!(matches!(
-            missing,
-            MdbxContextError::Consensus(ConsensusError::BadCoverageAttestation(_))
-        ));
-        assert_eq!(ctx.tip_height(), 1);
-
-        // A rejected (garbage) envelope fails closed without state change.
-        let garbage =
-            apply_coinbase_with_attestation(&mut ctx, &advancing, b"garbage-envelope", |_claim| {
-                Err("envelope does not verify".to_string())
-            })
-            .unwrap_err();
-        assert!(matches!(
-            garbage,
-            MdbxContextError::Consensus(ConsensusError::BadCoverageAttestation(_))
-        ));
-        assert_eq!(ctx.tip_height(), 1);
-
-        // A non-advancing header must not carry attestation bytes.
-        let non_advancing = coinbase_block(&ctx, 8, owner);
-        let unexpected = apply_coinbase_with_attestation(
-            &mut ctx,
-            &non_advancing,
-            b"unsolicited-envelope",
-            |_claim| Ok(()),
-        )
-        .unwrap_err();
-        assert!(matches!(
-            unexpected,
-            MdbxContextError::Consensus(ConsensusError::BadCoverageAttestation(_))
-        ));
-        assert_eq!(ctx.tip_height(), 1);
-
-        // A verified envelope advances coverage; the claim binds the exact
-        // canonical header at C and its transaction-epoch anchor.
-        let envelope = b"verified-envelope".to_vec();
-        apply_coinbase_with_attestation(&mut ctx, &advancing, &envelope, |claim| {
-            assert_eq!(claim.coverage_height, 1);
-            assert_eq!(claim.header_at_coverage, header_at_one);
-            assert_eq!(claim.epoch_anchor_header.height, 0);
-            assert_eq!(claim.attestation_bytes, envelope.as_slice());
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(ctx.tip_height(), 2);
-        assert_eq!(ctx.tip_header().attested_coverage, 1);
-        // The attestation is retained with the block for P2P serving.
-        assert_eq!(
-            ctx.store.get_coverage_attestation(2).unwrap().as_deref(),
-            Some(envelope.as_slice())
-        );
-
-        // Regressing coverage is rejected by header validation.
-        let regressing = coinbase_block_with_coverage(&ctx, 9, owner, 0);
-        let regression = apply_coinbase(&mut ctx, &regressing).unwrap_err();
-        assert!(matches!(
-            regression,
-            MdbxContextError::Consensus(ConsensusError::BadAttestedCoverage { .. })
-        ));
-
-        // A false C above the parent height is rejected by header validation.
-        let overreaching = coinbase_block_with_coverage(&ctx, 9, owner, 3);
-        let overreach = apply_coinbase_with_attestation(
-            &mut ctx,
-            &overreaching,
-            b"claims-too-much",
-            |_claim| Ok(()),
-        )
-        .unwrap_err();
-        assert!(matches!(
-            overreach,
-            MdbxContextError::Consensus(ConsensusError::BadAttestedCoverage { .. })
-        ));
-
-        // Keeping the advanced coverage without a new attestation is normal.
-        let steady = coinbase_block_with_coverage(&ctx, 9, owner, 1);
-        apply_coinbase(&mut ctx, &steady).unwrap();
-        assert_eq!(ctx.tip_header().attested_coverage, 1);
-        assert_eq!(ctx.store.get_coverage_attestation(3).unwrap(), None);
-    }
-
-    fn apply_coinbase(
-        ctx: &mut MdbxChainContext,
-        block: &Block,
-    ) -> Result<[u8; 32], MdbxContextError> {
-        ctx.apply_next_block(
-            block,
-            &[],
-            &[],
-            &[],
-            block.header.timestamp + 1,
-            |block,
-             _proof,
-             _sidecar,
-             _parent,
-             _timestamps,
-             _active,
-             _local,
-             _tx_epoch,
-             _anchor,
-             state|
-             -> Result<AppliedBlockValidation, String> {
-                crate::block::apply_block(state, block)
-                    .map(|transition| {
-                        AppliedBlockValidation::new(
-                            transition.new_state_root,
-                            b"test-history-claim".to_vec(),
-                            b"test-accepted-certificate".to_vec(),
-                        )
-                    })
-                    .map_err(|error| format!("{error:?}"))
-            },
-            reject_unexpected_attestation,
-        )
-    }
-
-    fn install_populated_segment_genesis_for_test(
-        path: &std::path::Path,
-        segment_count: u16,
-    ) -> MdbxChainContext {
-        use crate::consensus::da_prune::BlockUndoLog;
-        use crate::fri_state::SlotValue;
-
-        const TEST_LOG_SLOTS: usize = 8;
-        const TEST_LOG_SEGMENT_SIZE: usize = 3;
+    fn small_context(path: &Path) -> MdbxChainContext {
         let store = MdbxStore::open(path).unwrap();
-        assert!(store.is_empty().unwrap());
-        let slots: Vec<(u32, SlotValue)> = (0..segment_count)
-            .map(|segment_id| {
-                (
-                    (u32::from(segment_id) << TEST_LOG_SEGMENT_SIZE) | 1,
-                    SlotValue::with_owner_fields(
-                        10,
-                        u64::from(segment_id) + 1,
-                        Address([segment_id.saturating_add(1) as u8; 32]).as_fields(),
-                    ),
-                )
-            })
-            .collect();
-        let mut state =
-            ChainState::with_segment_log_for_test(TEST_LOG_SLOTS, TEST_LOG_SEGMENT_SIZE);
-        state.state.apply_delta_unrooted(&slots).unwrap();
-        state.active_slot_count = u64::from(segment_count);
-        state.alloc_counter = u64::from(segment_count);
-        state.try_state_root().unwrap();
-        state.state.root();
-        let mut genesis = crate::consensus::genesis::genesis_header();
-        genesis.difficulty_target = TEST_TARGET;
-        genesis.nonce = 0;
-        genesis.log_slots = TEST_LOG_SLOTS as u32;
-        genesis.state_root = state.cached_state_root();
-        genesis.active_slot_count = state.active_slot_count;
-        genesis.alloc_counter = state.alloc_counter;
-        let genesis_hash = block_id(&genesis);
-        let tip_chain_work = block_work(&TEST_TARGET);
-        let finalized = FinalizedCheckpoint {
+        let state = ChainState::with_log_slots(8);
+        let header = BlockHeader {
+            prev_block_hash: [0u8; 32],
+            state_root: state.cached_state_root(),
+            tx_root: [0u8; 32],
+            timestamp: 1_000,
             height: 0,
-            hash: genesis_hash,
+            miner_address: noid_poseidon2b::primitives::Address([0u8; 32]),
+            nonce: 0,
+            difficulty_target: [0xff; 32],
+            log_slots: 8,
+            active_slot_count: 0,
+            alloc_counter: 0,
         };
-        let meta = ConsensusMeta {
-            tip_height: 0,
-            tip_hash: genesis_hash,
-            cumulative_chainwork: tip_chain_work,
-            finalized,
-        };
-        let dirty_ids: Vec<u16> = state.state.dirty_segment_ids().collect();
-        let effective_log = state.state.effective_log_segment_size() as u8;
-        {
-            let dirty_refs: Vec<_> = dirty_ids
-                .iter()
-                .map(|&segment_id| {
-                    (
-                        segment_id,
-                        effective_log,
-                        state.state.try_get_segment_columns(segment_id),
-                    )
-                })
-                .collect();
-            store
-                .commit_block(
-                    &genesis,
-                    &genesis_hash,
-                    &BlockUndoLog::empty(0, genesis.log_slots),
-                    &dirty_refs,
-                    &[],
-                    &[],
-                    None,
-                    None,
-                    &meta,
-                    false,
-                )
-                .unwrap();
-        }
-        // `commit_block` correctly enforces production's fixed 2^16 segment
-        // geometry and therefore purges test-only IDs above zero at depth 8.
-        // Reinstall the tiny-column fixtures explicitly after the canonical
-        // metadata transaction; this helper never participates in restart.
-        for &segment_id in &dirty_ids {
-            store
-                .overwrite_segment_for_test(
-                    segment_id,
-                    effective_log,
-                    state
-                        .state
-                        .try_get_segment_columns(segment_id)
-                        .expect("test fixture segment is resident"),
-                )
-                .unwrap();
-        }
-        state.state.clear_dirty();
-        state.state.evict_all_persisted_segments();
-        let mut recent_headers = HashMap::new();
-        recent_headers.insert(0, genesis);
+        let hash = block_id(&header);
+        let chain_work = block_work(&header.difficulty_target);
+        let finalized = FinalizedCheckpoint { height: 0, hash };
+        store
+            .commit_block(
+                &header,
+                &hash,
+                &BlockUndoLog::empty(0, header.log_slots),
+                &[],
+                &[],
+                &[],
+                None,
+                &ConsensusMeta {
+                    tip_height: 0,
+                    tip_hash: hash,
+                    cumulative_chainwork: chain_work,
+                    finalized,
+                },
+                false,
+            )
+            .unwrap();
         MdbxChainContext {
             store,
             state,
-            recent_headers,
+            recent_headers: std::collections::HashMap::from([(0, header)]),
             tip_height: 0,
-            tip_hash: genesis_hash,
-            tip_chain_work,
+            tip_hash: hash,
+            tip_chain_work: chain_work,
             finalized,
             defer_finality_updates: false,
             reorg_staging: None,
         }
     }
 
-    fn install_evicted_subsegment_expansion_parent_for_test(ctx: &mut MdbxChainContext) {
-        use crate::consensus::da_prune::BlockUndoLog;
-        use crate::fri_state::SlotValue;
-
-        const EXPANSION_ACTIVE: u64 = 192;
-        let slots: Vec<(u32, SlotValue)> = (0..EXPANSION_ACTIVE as u32)
-            .map(|slot_index| {
-                (
-                    slot_index,
-                    SlotValue::with_owner_fields(
-                        1,
-                        u64::from(slot_index) + 1,
-                        Address([0x31; 32]).as_fields(),
-                    ),
-                )
-            })
-            .collect();
-        ctx.state.state.apply_delta_unrooted(&slots).unwrap();
-        ctx.state.active_slot_count = EXPANSION_ACTIVE;
-        ctx.state.alloc_counter = EXPANSION_ACTIVE;
-        ctx.state.try_state_root().unwrap();
-        ctx.state.state.root();
-
-        let mut parent = *ctx.tip_header();
-        parent.state_root = ctx.state.cached_state_root();
-        parent.active_slot_count = EXPANSION_ACTIVE;
-        parent.alloc_counter = EXPANSION_ACTIVE;
-        let parent_hash = block_id(&parent);
-        let finalized = FinalizedCheckpoint {
-            height: 0,
-            hash: parent_hash,
-        };
-        let meta = ConsensusMeta {
-            tip_height: 0,
-            tip_hash: parent_hash,
-            cumulative_chainwork: ctx.tip_chain_work,
-            finalized,
-        };
-        let columns = ctx
-            .state
-            .state
-            .try_get_segment_columns(0)
-            .expect("expansion parent segment is resident");
-        ctx.store
-            .commit_block(
-                &parent,
-                &parent_hash,
-                &BlockUndoLog::empty(0, parent.log_slots),
-                &[(
-                    0,
-                    ctx.state.state.effective_log_segment_size() as u8,
-                    Some(columns),
-                )],
-                &[],
-                &[],
-                None,
-                None,
-                &meta,
-                false,
-            )
-            .unwrap();
-        ctx.state.state.clear_dirty();
-        ctx.state.state.evict_all_persisted_segments();
-        ctx.recent_headers.insert(0, parent);
-        ctx.tip_hash = parent_hash;
-        ctx.finalized = finalized;
-    }
-
-    #[test]
-    fn staged_snapshot_context_switches_to_compact_state_and_restarts_consistently() {
-        use crate::consensus::da_prune::BlockUndoLog;
-        use crate::fri_state::{compute_segment_root, SlotValue};
-        use crate::segmented_state::SegmentColumns;
-        use crate::storage::{
-            AuthenticatedSnapshotMetadata, SnapshotSegmentDescriptor, SnapshotStagingSession,
-        };
-
-        let database = tempfile::tempdir().unwrap();
-        let staging_parent = tempfile::tempdir().unwrap();
-        let store = MdbxStore::open(database.path()).unwrap();
-        let empty_state = ChainState::with_log_slots(3);
-        let mut genesis = crate::consensus::genesis::genesis_header();
-        genesis.log_slots = 3;
-        genesis.active_slot_count = 0;
-        genesis.alloc_counter = 0;
-        genesis.state_root = empty_state.utxo_root;
-        let genesis_hash = block_id(&genesis);
-        let genesis_finalized = FinalizedCheckpoint {
-            height: 0,
-            hash: genesis_hash,
-        };
-        let genesis_meta = ConsensusMeta {
-            tip_height: 0,
-            tip_hash: genesis_hash,
-            cumulative_chainwork: [1; 32],
-            finalized: genesis_finalized,
-        };
-        store
-            .commit_block(
-                &genesis,
-                &genesis_hash,
-                &BlockUndoLog::empty(0, 3),
-                &[],
-                &[],
-                &[],
-                None,
-                None,
-                &genesis_meta,
-                false,
-            )
-            .unwrap();
-        let mut initial_headers = HashMap::new();
-        initial_headers.insert(0, genesis);
-        let mut ctx = MdbxChainContext {
-            store,
-            state: empty_state,
-            recent_headers: initial_headers,
-            tip_height: 0,
-            tip_hash: genesis_hash,
-            tip_chain_work: [1; 32],
-            finalized: genesis_finalized,
-            defer_finality_updates: false,
-            reorg_staging: None,
-        };
-
-        let owner = Address([0x81; 32]);
-        let live = SlotValue::with_owner_fields(99, 1, owner.as_fields());
-        let target_state = ChainState::from_sparse_utxos(3, &[(5, live)], 1).unwrap();
-        let mut target = genesis;
-        target.height = 1;
-        target.prev_block_hash = genesis_hash;
-        target.timestamp = target.timestamp.saturating_add(1);
-        target.state_root = target_state.utxo_root;
-        target.active_slot_count = 1;
-        target.alloc_counter = 1;
-        let target_hash = block_id(&target);
-        ctx.store
-            .put_verified_header_only(&target, &target_hash, &[2; 32])
-            .unwrap();
-
-        let mut columns = SegmentColumns::new_zero(8);
-        columns.values[5] = live.value;
-        columns.owners_hi[5] = live.owner_hi;
-        columns.owners_lo[5] = live.owner_lo;
-        let encoded = encode_segment(&columns, 3);
-        let descriptor = SnapshotSegmentDescriptor {
-            segment_id: 0,
-            segment_root: compute_segment_root(
-                3,
-                &columns.values,
-                &columns.owners_hi,
-                &columns.owners_lo,
-            ),
-            encoded_len: encoded.len() as u32,
-        };
-        let authenticated =
-            AuthenticatedSnapshotMetadata::from_authenticated_header(target, target_hash, 3)
-                .unwrap();
-        let mut session =
-            SnapshotStagingSession::new(staging_parent.path(), authenticated, vec![descriptor])
-                .unwrap();
-        session.accept_segment(0, 3, &encoded).unwrap();
-        let staging = session.finalize().unwrap();
-        let recent_headers = vec![genesis.to_bytes().to_vec(), target.to_bytes().to_vec()];
-
-        ctx.apply_staged_state_snapshot(&staging, &recent_headers)
-            .unwrap();
-        assert_eq!(ctx.tip_height(), 1);
-        assert_eq!(ctx.tip_hash(), target_hash);
-        assert_eq!(ctx.state.cached_state_root(), target.state_root);
-        assert_eq!(ctx.state.state.materialized_segment_ids().count(), 0);
-        assert!(ctx.state.state.is_evicted(0));
-        assert_eq!(ctx.store.get_undo_log(0).unwrap(), None);
-        assert_eq!(
-            ctx.store
-                .get_verified_utxos_by_owner(&owner.0)
-                .unwrap()
-                .utxos,
-            vec![crate::storage::VerifiedOwnerUtxo {
-                slot_index: 5,
-                amount: 99,
-                creation_id: 1,
-            }]
-        );
-
-        drop(staging);
-        drop(ctx);
-        let reopened_store = MdbxStore::open(database.path()).unwrap();
-        let reopened = MdbxChainContext::restore_from_mdbx(reopened_store).unwrap();
-        assert_eq!(reopened.tip_height(), 1);
-        assert_eq!(reopened.tip_hash(), target_hash);
-        assert_eq!(reopened.state.cached_state_root(), target.state_root);
-        assert_eq!(reopened.state.state.materialized_segment_ids().count(), 0);
-        assert!(reopened.state.state.is_evicted(0));
-    }
-
-    #[test]
-    fn fresh_database_has_canonical_genesis_anchor() {
-        let dir = tempfile::tempdir().unwrap();
-        let ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
-        assert_eq!(ctx.tip_height(), 0);
-        let header = *ctx.tip_header();
-        let expected =
-            crate::compute_header_chain_anchor(std::iter::once(&header), *ctx.tip_chain_work())
-                .unwrap();
-        assert_eq!(ctx.store.get_header_anchor(0).unwrap(), Some(expected));
-    }
-
-    #[test]
-    fn coinbase_commit_tx_index_and_restart_are_atomic() {
-        let dir = tempfile::tempdir().unwrap();
-        let txid;
-        let root;
-        {
-            let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
-            let block = coinbase_block(&ctx, 7, Address([1u8; 32]));
-            txid = block.transactions[0].txid();
-            root = apply_coinbase(&mut ctx, &block).unwrap();
-            assert_eq!(ctx.state.state.materialized_segment_ids().count(), 0);
-            assert_eq!(ctx.store.get_tx_index(&txid.0).unwrap(), Some((1, 0)));
-            assert_eq!(
-                ctx.store.get_history_claim(1).unwrap().as_deref(),
-                Some(b"test-history-claim".as_slice())
-            );
-            assert_eq!(
-                ctx.store
-                    .get_accepted_block_certificate(1)
-                    .unwrap()
-                    .as_deref(),
-                Some(b"test-accepted-certificate".as_slice())
-            );
-            assert_eq!(ctx.store.get_block_proof(1).unwrap(), None);
-            assert_eq!(ctx.store.get_block_auth_sidecar(1).unwrap(), None);
-        }
-        let reopened = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
-        assert_eq!(reopened.tip_height(), 1);
-        assert_eq!(reopened.state.cached_state_root(), root);
-        assert_eq!(reopened.state.state.materialized_segment_ids().count(), 0);
-        assert_eq!(reopened.store.get_tx_index(&txid.0).unwrap(), Some((1, 0)));
-        assert_eq!(
-            reopened.store.get_history_claim(1).unwrap().as_deref(),
-            Some(b"test-history-claim".as_slice())
-        );
-        assert_eq!(
-            reopened
-                .store
-                .get_accepted_block_certificate(1)
-                .unwrap()
-                .as_deref(),
-            Some(b"test-accepted-certificate".as_slice())
-        );
-    }
-
-    #[test]
-    fn repeated_rejected_candidates_do_not_accumulate_hydrated_segments() {
-        const SEGMENT_COUNT: u32 = 8;
-
-        let dir = tempfile::tempdir().unwrap();
-        let mut ctx = install_populated_segment_genesis_for_test(dir.path(), SEGMENT_COUNT as u16);
-        assert_eq!(ctx.state.state.materialized_segment_ids().count(), 0);
-        let parent_tip = ctx.tip_hash();
-        let parent_root = ctx.state.cached_state_root();
-        let parent_active = ctx.state.active_slot_count;
-        let parent_alloc = ctx.state.alloc_counter;
-        let resident_before = ctx.state.state.materialized_segment_ids().count();
-        assert_eq!(resident_before, 0);
-
-        for segment_id in 0..SEGMENT_COUNT {
-            let cached_fri_before = ctx
-                .state
-                .state
-                .cached_segment_root(segment_id as u16)
-                .expect("restart authenticated every persisted FRI summary");
-            let candidate = rejected_coinbase_candidate(
-                &ctx,
-                (segment_id << 3) | 2,
-                Address([0x80 | segment_id as u8; 32]),
-            );
-            let result = ctx.apply_next_block(
-                &candidate,
-                &[],
-                &[],
-                &[],
-                candidate.header.timestamp + 1,
-                |_block,
-                 _proof,
-                 _sidecar,
-                 _parent,
-                 _timestamps,
-                 _active,
-                 _local,
-                 _tx_epoch,
-                 _anchor,
-                 _state|
-                 -> Result<AppliedBlockValidation, &'static str> {
-                    Err("deliberately invalid proof")
-                },
-                reject_unexpected_attestation,
-            );
-            assert!(
-                matches!(
-                    &result,
-                    Err(MdbxContextError::Consensus(ConsensusError::ShapeMismatch(
-                        _
-                    )))
-                ),
-                "unexpected rejection: {result:?}"
-            );
-            assert_eq!(ctx.tip_hash(), parent_tip);
-            assert_eq!(ctx.state.cached_state_root(), parent_root);
-            assert_eq!(ctx.state.active_slot_count, parent_active);
-            assert_eq!(ctx.state.alloc_counter, parent_alloc);
-            assert_eq!(
-                ctx.state.state.materialized_segment_ids().count(),
-                resident_before,
-                "rejection {segment_id} retained a hydrated segment"
-            );
-            assert!(ctx.state.state.is_evicted(segment_id as u16));
-            assert_eq!(
-                ctx.state.state.cached_segment_root(segment_id as u16),
-                Some(cached_fri_before),
-                "rejection {segment_id} degraded its parent FRI summary"
-            );
-            assert!(ctx.state.durable_metadata_clone().is_some());
-        }
-    }
-
-    #[test]
-    fn rejected_subsegment_expansion_hydrates_and_re_evicts_parent_segment_zero() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
-        install_evicted_subsegment_expansion_parent_for_test(&mut ctx);
-        assert_eq!(ctx.tip_header().log_slots, 8);
-        assert!(ctx.state.state.is_evicted(0));
-        assert_eq!(ctx.state.state.materialized_segment_ids().count(), 0);
-        let parent_root = ctx.state.cached_state_root();
-        let parent_fri = ctx.state.state.cached_segment_root(0);
-
-        let mut candidate = rejected_coinbase_candidate(&ctx, 1 << 8, Address([0x42; 32]));
-        candidate.header.log_slots = 9;
-        candidate.transactions[0].body.outputs[0].amount = block_reward(9);
-        candidate.header.tx_root = compute_tx_root(&candidate.transactions);
-        let result = ctx.apply_next_block(
-            &candidate,
-            &[],
-            &[],
-            &[],
-            candidate.header.timestamp + 1,
-            |_block,
-             _proof,
-             _sidecar,
-             _parent,
-             _timestamps,
-             _active,
-             _local,
-             _tx_epoch,
-             _anchor,
-             state|
-             -> Result<AppliedBlockValidation, &'static str> {
-                assert!(!state.state.is_evicted(0));
-                assert!(state.state.try_get_segment_columns(0).is_some());
-                Err("reject before applying expansion")
-            },
-            reject_unexpected_attestation,
-        );
-        assert!(matches!(
-            result,
-            Err(MdbxContextError::Consensus(ConsensusError::ShapeMismatch(
-                _
-            )))
-        ));
-        assert_eq!(ctx.tip_header().log_slots, 8);
-        assert_eq!(ctx.state.cached_state_root(), parent_root);
-        assert_eq!(ctx.state.state.cached_segment_root(0), parent_fri);
-        assert!(ctx.state.state.is_evicted(0));
-        assert_eq!(ctx.state.state.materialized_segment_ids().count(), 0);
-    }
-
-    #[test]
-    fn rollback_exact_root_corruption_recovers_from_mdbx_and_fails_closed() {
-        let dir = tempfile::tempdir().unwrap();
-        {
-            let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
-            let block = coinbase_block(&ctx, 7, Address([1u8; 32]));
-            apply_coinbase(&mut ctx, &block).unwrap();
-        }
-
-        let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
-        let parent_tip = ctx.tip_hash();
-        let parent_root = ctx.state.cached_state_root();
-        let parent_active = ctx.state.active_slot_count;
-        let parent_alloc = ctx.state.alloc_counter;
-        let candidate = rejected_coinbase_candidate(&ctx, 8, Address([2u8; 32]));
-        let result = ctx.apply_next_block(
-            &candidate,
-            &[],
-            &[],
-            &[],
-            candidate.header.timestamp + 1,
-            |_block,
-             _proof,
-             _sidecar,
-             _parent,
-             _timestamps,
-             _active,
-             _local,
-             _tx_epoch,
-             _anchor,
-             state|
-             -> Result<AppliedBlockValidation, &'static str> {
-                // This write deliberately escapes the block action surface, so
-                // its bounded undo cannot restore the parent exact root.
-                state
-                    .state
-                    .apply_delta_unrooted(&[(
-                        9,
-                        crate::fri_state::SlotValue::with_owner_fields(
-                            5,
-                            state.alloc_counter,
-                            Address([0xA5; 32]).as_fields(),
-                        ),
-                    )])
-                    .unwrap();
-                Err("corrupt validator transition")
-            },
-            reject_unexpected_attestation,
-        );
-        assert!(matches!(
-            result,
-            Err(MdbxContextError::Corrupt(
-                "uncommitted block undo does not restore parent exact root"
-            ))
-        ));
-
-        // A rollback-integrity failure is never returned with poisoned hot
-        // state: the durable canonical boundary is reloaded first.
-        assert_eq!(ctx.tip_hash(), parent_tip);
-        assert_eq!(ctx.state.cached_state_root(), parent_root);
-        assert_eq!(ctx.state.active_slot_count, parent_active);
-        assert_eq!(ctx.state.alloc_counter, parent_alloc);
-        assert_eq!(ctx.state.state.materialized_segment_ids().count(), 0);
-        assert!(ctx.state.state.is_evicted(0));
-        assert!(ctx.state.durable_metadata_clone().is_some());
-    }
-
-    #[test]
-    fn occupied_coinbase_slot_rejects_without_poisoning_tip() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
-        let first = coinbase_block(&ctx, 7, Address([1u8; 32]));
-        apply_coinbase(&mut ctx, &first).unwrap();
-        let tip = ctx.tip_hash();
-        let root = ctx.state.cached_state_root();
-
-        let parent = *ctx.tip_header();
-        let mut bad = coinbase_block(&ctx, 8, Address([2u8; 32]));
-        bad.transactions[0].body.outputs[0].slot_index = 7;
-        bad.header.tx_root = compute_tx_root(&bad.transactions);
-        let mut blind = ctx.state.clone();
-        blind.alloc_counter += 1;
-        blind.active_slot_count += 1;
-        blind
-            .state
-            .set_slot(
-                7,
-                crate::fri_state::SlotValue::with_owner_fields(
-                    bad.transactions[0].body.outputs[0].amount,
-                    blind.alloc_counter,
-                    Address([2u8; 32]).as_fields(),
-                ),
-            )
-            .unwrap();
-        bad.header.state_root = blind.state_root();
-        bad.header.active_slot_count = blind.active_slot_count;
-        bad.header.alloc_counter = blind.alloc_counter;
-        bad.header.prev_block_hash = block_id(&parent);
-
-        assert!(apply_coinbase(&mut ctx, &bad).is_err());
-        assert_eq!(ctx.tip_hash(), tip);
-        assert_eq!(ctx.state.cached_state_root(), root);
-    }
-
-    #[test]
-    fn direct_block_with_wrong_user_epoch_anchor_fails_before_apply() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut ctx = MdbxChainContext::open_or_create_for_test(dir.path()).unwrap();
-        let mut block = coinbase_block(&ctx, 7, Address([1u8; 32]));
-        let mut user_inputs = [TxInput::dummy(); TX_INPUTS];
-        user_inputs[0] = TxInput {
-            slot_index: 9,
-            amount: 2,
-            creation_id: 1,
-        };
-        let mut user_outputs = [TxOutput::dummy(); TX_OUTPUTS];
-        user_outputs[0] = TxOutput {
-            slot_index: 10,
-            amount: 1,
-            owner: Address([3u8; 32]),
-        };
-        block.transactions.push(Transaction::new(TxBody {
-            epoch_anchor: [0xAA; 32],
-            fee: 1,
-            input_owner: Address([3u8; 32]),
-            inputs: user_inputs,
-            outputs: user_outputs,
-            validity_bitmap: 1 | output_bitmap_bit(0),
-            is_coinbase: false,
-        }));
-        block.header.tx_root = compute_tx_root(&block.transactions);
-        assert!(matches!(
-            apply_coinbase(&mut ctx, &block),
-            Err(MdbxContextError::Consensus(ConsensusError::BadEpochAnchor))
-        ));
-        assert_eq!(ctx.tip_height(), 0);
-    }
-
-    #[test]
-    fn failed_multi_block_reorg_leaves_ram_and_mdbx_on_old_branch() {
-        let canonical_dir = tempfile::tempdir().unwrap();
-        let replacement_dir = tempfile::tempdir().unwrap();
-        let mut canonical =
-            MdbxChainContext::open_or_create_for_test(canonical_dir.path()).unwrap();
-        let old_one = coinbase_block(&canonical, 7, Address([1u8; 32]));
-        apply_coinbase(&mut canonical, &old_one).unwrap();
-        let old_two = coinbase_block(&canonical, 8, Address([1u8; 32]));
-        apply_coinbase(&mut canonical, &old_two).unwrap();
-        let old_one_hash = block_id(&old_one.header);
-        let old_two_hash = block_id(&old_two.header);
-        let claimed = canonical
-            .store
-            .claim_next_recursive_proof_job()
-            .unwrap()
-            .unwrap();
-        assert_eq!((claimed.height, claimed.block_hash), (1, old_one_hash));
-        canonical
-            .store
-            .complete_recursive_proof_job(1, old_one_hash, b"old-selected-proof")
-            .unwrap();
-        let old_tip = canonical.tip_hash();
-        let old_root = canonical.state.cached_state_root();
-        let old_txid = old_two.transactions[0].txid();
-
-        let mut replacement =
-            MdbxChainContext::open_or_create_for_test(replacement_dir.path()).unwrap();
-        let replacement_one = coinbase_block(&replacement, 9, Address([2u8; 32]));
-        apply_coinbase(&mut replacement, &replacement_one).unwrap();
-        let mut replacement_two = coinbase_block(&replacement, 10, Address([2u8; 32]));
-        replacement_two.header.prev_block_hash = [0xA5; 32];
-        let replacement_txid = replacement_one.transactions[0].txid();
-        let payloads = [
-            ReorgBlockPayload::new(&replacement_one, &[], &[], &[]),
-            ReorgBlockPayload::new(&replacement_two, &[], &[], &[]),
-        ];
-
-        let result = canonical.apply_reorg_mdbx_with_applier(
-            0,
-            &payloads,
-            replacement_two.header.timestamp + 1,
-            |ctx, candidate, _local_time| apply_coinbase(ctx, candidate.block).map(|_| ()),
-        );
-        assert!(result.is_err());
-        assert_eq!(canonical.tip_height(), 2);
-        assert_eq!(canonical.tip_hash(), old_tip);
-        assert_eq!(canonical.state.cached_state_root(), old_root);
-        assert_eq!(
-            canonical.store.get_tx_index(&old_txid.0).unwrap(),
-            Some((2, 0))
-        );
-        assert_eq!(
-            canonical.store.get_tx_index(&replacement_txid.0).unwrap(),
-            None
-        );
-        let preserved_job_one = canonical.store.get_recursive_proof_job(1).unwrap().unwrap();
-        assert_eq!(preserved_job_one.block_hash, old_one_hash);
-        assert_eq!(
-            preserved_job_one.state,
-            crate::storage::RecursiveProofJobState::Complete
-        );
-        assert_eq!(
-            canonical
-                .store
-                .get_recursive_proof_job_result(1)
-                .unwrap()
-                .unwrap()
-                .bytes,
-            b"old-selected-proof"
-        );
-        let preserved_job_two = canonical.store.get_recursive_proof_job(2).unwrap().unwrap();
-        assert_eq!(preserved_job_two.block_hash, old_two_hash);
-        assert_eq!(
-            preserved_job_two.state,
-            crate::storage::RecursiveProofJobState::Pending
-        );
-        drop(canonical);
-
-        let reopened = MdbxChainContext::open_or_create_for_test(canonical_dir.path()).unwrap();
-        assert_eq!(reopened.tip_height(), 2);
-        assert_eq!(reopened.tip_hash(), old_tip);
-        assert_eq!(reopened.state.cached_state_root(), old_root);
-        assert_eq!(
-            reopened.store.get_tx_index(&old_txid.0).unwrap(),
-            Some((2, 0))
-        );
-        assert_eq!(
-            reopened.store.get_tx_index(&replacement_txid.0).unwrap(),
-            None
-        );
-        assert_eq!(
-            reopened
-                .store
-                .get_recursive_proof_job_result(1)
-                .unwrap()
-                .unwrap()
-                .bytes,
-            b"old-selected-proof"
-        );
-        assert_eq!(
-            reopened
-                .store
-                .get_recursive_proof_job(2)
-                .unwrap()
-                .unwrap()
-                .block_hash,
-            old_two_hash
-        );
-    }
-
-    #[test]
-    fn successful_multi_block_reorg_commits_one_restart_consistent_suffix() {
-        let canonical_dir = tempfile::tempdir().unwrap();
-        let replacement_dir = tempfile::tempdir().unwrap();
-        let mut canonical =
-            MdbxChainContext::open_or_create_for_test(canonical_dir.path()).unwrap();
-        let old_one = coinbase_block(&canonical, 7, Address([1u8; 32]));
-        apply_coinbase(&mut canonical, &old_one).unwrap();
-        let old_two = coinbase_block(&canonical, 8, Address([1u8; 32]));
-        apply_coinbase(&mut canonical, &old_two).unwrap();
-        let old_one_hash = block_id(&old_one.header);
-        let claimed = canonical
-            .store
-            .claim_next_recursive_proof_job()
-            .unwrap()
-            .unwrap();
-        assert_eq!((claimed.height, claimed.block_hash), (1, old_one_hash));
-        canonical
-            .store
-            .complete_recursive_proof_job(1, old_one_hash, b"stale-selected-proof")
-            .unwrap();
-        let old_txid = old_two.transactions[0].txid();
-
-        let mut replacement =
-            MdbxChainContext::open_or_create_for_test(replacement_dir.path()).unwrap();
-        let replacement_one = coinbase_block(&replacement, 9, Address([2u8; 32]));
-        apply_coinbase(&mut replacement, &replacement_one).unwrap();
-        // The replacement branch attests coverage of its own height 1, so the
-        // reorg exercises the attestation payload travelling with headers.
-        let replacement_attestation = b"replacement-branch-envelope".to_vec();
-        let replacement_two = coinbase_block_with_coverage(&replacement, 10, Address([2u8; 32]), 1);
-        apply_coinbase_with_attestation(
-            &mut replacement,
-            &replacement_two,
-            &replacement_attestation,
-            |_claim| Ok(()),
+    fn unsafe_claimed_coinbase_with_impossible_pow(
+        context: &MdbxChainContext,
+    ) -> crate::consensus::template::LocallyProvedBlockCommit {
+        let parent = *context.tip_header();
+        let (template, prepared) = crate::consensus::template::build_node_owned_block_template(
+            &parent,
+            &context.state,
+            &[parent.active_slot_count],
+            vec![],
+            noid_poseidon2b::primitives::Address([0x44; 32]),
+            parent.timestamp + crate::consensus::params::BLOCK_TIME,
+            [0; 32],
         )
         .unwrap();
-        let replacement_one_txid = replacement_one.transactions[0].txid();
-        let replacement_two_txid = replacement_two.transactions[0].txid();
-        let expected_tip = block_id(&replacement_two.header);
-        let expected_root = replacement_two.header.state_root;
-        let payloads = [
-            ReorgBlockPayload::new(&replacement_one, &[], &[], &[]),
-            ReorgBlockPayload::new(&replacement_two, &[], &[], &replacement_attestation),
-        ];
-
-        let result = canonical
-            .apply_reorg_mdbx_with_applier(
-                0,
-                &payloads,
-                replacement_two.header.timestamp + 1,
-                |ctx, candidate, _local_time| {
-                    apply_coinbase_with_attestation(
-                        ctx,
-                        candidate.block,
-                        candidate.coverage_attestation_bytes,
-                        |_claim| Ok(()),
-                    )
-                    .map(|_| ())
-                },
-            )
-            .unwrap();
-        assert_eq!(result.reverted_heights, vec![2, 1]);
-        assert_eq!(result.applied_heights, vec![1, 2]);
-        assert_eq!(canonical.tip_hash(), expected_tip);
-        assert_eq!(canonical.state.cached_state_root(), expected_root);
-        assert_eq!(canonical.store.get_tx_index(&old_txid.0).unwrap(), None);
-        assert_eq!(
-            canonical
-                .store
-                .get_tx_index(&replacement_one_txid.0)
-                .unwrap(),
-            Some((1, 0))
-        );
-        assert_eq!(
-            canonical
-                .store
-                .get_tx_index(&replacement_two_txid.0)
-                .unwrap(),
-            Some((2, 0))
-        );
-        assert!(canonical
-            .store
-            .get_recursive_proof_job_result(1)
-            .unwrap()
-            .is_none());
-        for (height, expected_hash) in [
-            (1, block_id(&replacement_one.header)),
-            (2, block_id(&replacement_two.header)),
-        ] {
-            let job = canonical
-                .store
-                .get_recursive_proof_job(height)
+        let block = template.into_block(0);
+        let mut terminal = crate::history_step::HistoryStepTerminalMetadata::new(
+            block.header.height,
+            block_id(&block.header),
+            0,
+        )
+        .unwrap()
+        .encode_prefix()
+        .to_vec();
+        terminal.push(0xA5);
+        // SAFETY: this is deliberately not a real proof. The negative test
+        // below exercises the commit boundary's independent PoW guard and
+        // asserts that no canonical state is mutated.
+        unsafe {
+            prepared
+                .seal_after_trusted_history_step_proof_unchecked(block, terminal)
                 .unwrap()
-                .unwrap();
-            assert_eq!(job.block_hash, expected_hash);
-            assert_eq!(job.tier, crate::storage::RecursiveProofJobTier::B8);
-            assert_eq!(job.state, crate::storage::RecursiveProofJobState::Pending);
         }
-        drop(canonical);
+    }
 
-        let reopened = MdbxChainContext::open_or_create_for_test(canonical_dir.path()).unwrap();
-        assert_eq!(reopened.tip_height(), 2);
-        assert_eq!(reopened.tip_hash(), expected_tip);
-        assert_eq!(reopened.state.cached_state_root(), expected_root);
-        // The coverage field reorgs with the headers, and the replacement
-        // branch's retained attestation replaces the old branch's (none).
-        assert_eq!(reopened.tip_header().attested_coverage, 1);
+    #[test]
+    fn rejected_snapshot_terminal_leaves_canonical_headers_untouched() {
+        let directory = tempfile::tempdir().unwrap();
+        let context = MdbxChainContext::open_or_create(directory.path()).unwrap();
+        let genesis = genesis_header();
+        let genesis_hash = block_id(&genesis);
+        let mut candidate = genesis;
+        candidate.height = 1;
+        candidate.prev_block_hash = genesis_hash;
+        candidate.timestamp = candidate.timestamp.saturating_add(1);
+        candidate.nonce = candidate.nonce.saturating_add(1);
+        let candidate_hash = block_id(&candidate);
+        let mut terminal = crate::history_step::HistoryStepTerminalMetadata::new(
+            candidate.height,
+            candidate_hash,
+            0,
+        )
+        .unwrap()
+        .encode_prefix()
+        .to_vec();
+        terminal.push(1);
+
+        assert!(context
+            .verify_snapshot_boundary(candidate, genesis, terminal, |_| {
+                Err("deliberate verifier rejection".to_owned())
+            })
+            .is_err());
         assert_eq!(
-            reopened
-                .store
-                .get_coverage_attestation(2)
-                .unwrap()
-                .as_deref(),
-            Some(replacement_attestation.as_slice())
+            context.store.get_chain_tip().unwrap(),
+            Some((0, genesis_hash))
+        );
+        assert_eq!(context.store.get_header(1).unwrap(), None);
+        assert_eq!(context.store.get_chain_work(1).unwrap(), None);
+        assert_eq!(context.store.get_header_anchor(1).unwrap(), None);
+    }
+
+    #[test]
+    fn local_fast_commit_rejects_impossible_pow_before_state_or_tip_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut context = small_context(directory.path());
+        let parent_tip = context.tip_hash();
+        let parent_root = context.state.cached_state_root();
+        let claimed = unsafe_claimed_coinbase_with_impossible_pow(&context);
+        let error = context
+            .commit_locally_proved_next_block(claimed)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            MdbxContextError::Consensus(ConsensusError::InvalidPoW)
+        ));
+        assert_eq!(context.tip_height(), 0);
+        assert_eq!(context.tip_hash(), parent_tip);
+        assert_eq!(context.state.cached_state_root(), parent_root);
+        assert_eq!(
+            context.store.get_chain_tip().unwrap(),
+            Some((0, parent_tip))
         );
         assert_eq!(
-            reopened
+            context
                 .store
-                .get_tx_index(&replacement_two_txid.0)
+                .get_recent_accepted_block_bundle_bounded(1)
                 .unwrap(),
-            Some((2, 0))
-        );
-        assert!(reopened
-            .store
-            .get_recursive_proof_job_result(1)
-            .unwrap()
-            .is_none());
-        assert_eq!(
-            reopened
-                .store
-                .get_recursive_proof_job(2)
-                .unwrap()
-                .unwrap()
-                .block_hash,
-            block_id(&replacement_two.header)
+            None
         );
     }
 }

@@ -9,9 +9,8 @@
 //!
 //! # Design
 //!
-//! Admission pipeline (cheapest first):
-//!   1. `validate_tx_for_mempool()` — native checks (~0ms)
-//!   2. [async] `verify_wallet_authorization()` — AuthGKR authorization verification (semaphore-bounded)
+//! Admission and authorization run in `noid_mempool`; this module only owns
+//! deterministic storage, ordering and eviction of already admitted entries.
 //!
 //! When a block is confirmed: `on_block_confirmed()` removes confirmed txs
 //! and returns reverted txs (from reorged blocks) to the pool.
@@ -206,8 +205,8 @@ impl Mempool {
 
     /// Attempt to add a transaction to the pool.
     ///
-    /// Does NOT call `validate_tx_for_mempool()` — the caller is responsible
-    /// for pre-validation. This function only checks pool-internal constraints
+    /// The caller is responsible for native admission checks. This function
+    /// only checks pool-internal constraints
     /// (capacity, duplicates, slot conflicts with already-admitted txs).
     ///
     pub fn admit(&mut self, tx: Transaction, current_height: u64) -> Result<(), MempoolError> {

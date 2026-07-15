@@ -25,10 +25,9 @@ class Node:
         name,
         p2p_port,
         rpc_port,
-        mode="relay",
+        mode="node",
         genesis=False,
         seed=None,
-        mining_threads=None,
         log="info",
     ):
         self.name = name
@@ -37,7 +36,6 @@ class Node:
         self.mode = mode
         self.genesis = genesis
         self.seed = seed or []
-        self.mining_threads = mining_threads
         self.log = log
         self.data_dir = BASE / name
         self.log_path = LOGS / f"{name}.log"
@@ -68,8 +66,6 @@ class Node:
             "--log",
             self.log,
         ]
-        if self.mining_threads is not None:
-            args.extend(["--mining-threads", str(self.mining_threads)])
         if self.genesis:
             args.append("--genesis")
         for seed in self.seed:
@@ -239,11 +235,9 @@ def main():
         shutil.rmtree(BASE)
     LOGS.mkdir(parents=True, exist_ok=True)
 
-    n1 = Node(
-        "node1-cli-miner", 19500, 19501, mode="miner", genesis=True, mining_threads=None
-    )
-    n2 = Node("node2-cli-relay", 19510, 19511, mode="relay", seed=[n1.seed_addr])
-    n3 = Node("node3-cli-wallet", 19520, 19521, mode="relay", seed=[n2.seed_addr])
+    n1 = Node("node1-cli-miner", 19500, 19501, mode="miner", genesis=True)
+    n2 = Node("node2-cli-relay", 19510, 19511, mode="node", seed=[n1.seed_addr])
+    n3 = Node("node3-cli-wallet", 19520, 19521, mode="node", seed=[n2.seed_addr])
     nodes = [n1, n2, n3]
     started = []
     tx_hashes = []
@@ -281,9 +275,9 @@ def main():
         assert_contains(out, "Connected peers", "peers output")
         assert_contains(out, "Count", "peers output")
 
-        out, _, _ = cli(n1, ["proof"])
-        assert_contains(out, "Recursive chain proof", "proof output")
-        assert_contains(out, "Size", "proof output")
+        out, _, _ = cli(n1, ["history-step-terminal"])
+        assert_contains(out, "HistoryStep terminal", "HistoryStep terminal output")
+        assert_contains(out, "Size", "HistoryStep terminal output")
 
         out, _, _ = cli(n1, ["state"])
         assert_contains(out, "UTXO state", "state output")

@@ -9,8 +9,10 @@
 
 use noid_chain::exact_state_hash::{slot_leaf_hash, state_node_hash, zero_slot_roots, StateHash};
 use noid_chain::sparse_merkle::{
-    SequentialMerkleUpdatePath, StructuralFrontierEvaluation, StructuralFrontierPlan,
-    StructuralNodeRef, STRUCTURAL_FRONTIER_PAD,
+    derive_structural_frontier_plan, evaluate_structural_frontier,
+    expand_multiproof_segmented_updates, SegmentedSequentialMerkleUpdates,
+    SequentialMerkleUpdatePath, SparseMerkleError, StructuralFrontierEvaluation,
+    StructuralFrontierPlan, StructuralNodeRef, STRUCTURAL_FRONTIER_PAD,
 };
 use noid_chain::SlotValue;
 use noid_core::Block128;
@@ -19,10 +21,7 @@ use noid_ivc_core::deep_chain::leaf_hash::flat_sponge_leaf_hash;
 use noid_ivc_core::field_circuit::Wire;
 use noid_poseidon2b::native::domain::{capacity_iv, TAG_EXSTNOD};
 
-use crate::block_certificate_backend::{
-    derive_exact_state_segmented_updates, verify_exact_state_structural_frontier,
-    ExactStateStructuralFrontierError, ExactStateStructuralFrontierInputs,
-};
+use crate::acceptance::history_step::ExactStateStructuralFrontierInputs;
 
 use super::action_surface::ActionRowTrace;
 use super::paired_merkle_update::{
@@ -32,6 +31,170 @@ use super::{
     alloc_block, const_block, flat_const, flat_of, mul, pin_eq, pin_zero, poseidon2b_permute,
     range_check_bits, FieldR1csBuilder, LinExpr, F128,
 };
+
+/// Verifier-owned topology and hashes materialized from the sibling-only
+/// structural frontier carried by one HistoryStep block input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedExactStateStructuralFrontier {
+    pub plan: StructuralFrontierPlan,
+    pub old_evaluation: StructuralFrontierEvaluation,
+    pub new_evaluation: StructuralFrontierEvaluation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExactStateStructuralFrontierError {
+    SlotLeafCountMismatch {
+        touched: usize,
+        old: usize,
+        new: usize,
+    },
+    OldSlotLeafMismatch {
+        index: usize,
+    },
+    NewSlotLeafMismatch {
+        index: usize,
+    },
+    CombineDigestCountMismatch {
+        expected: usize,
+        old: usize,
+        new: usize,
+    },
+    OldCombineDigestMismatch {
+        index: usize,
+    },
+    NewCombineDigestMismatch {
+        index: usize,
+    },
+    OldRootMismatch,
+    NewRootMismatch,
+    SparseMerkle(SparseMerkleError),
+}
+
+impl From<SparseMerkleError> for ExactStateStructuralFrontierError {
+    fn from(source: SparseMerkleError) -> Self {
+        Self::SparseMerkle(source)
+    }
+}
+
+fn fields_to_digest(fields: [Block128; 2]) -> StateHash {
+    let mut digest = [0u8; 32];
+    digest[..16].copy_from_slice(&fields[0].0.to_le_bytes());
+    digest[16..].copy_from_slice(&fields[1].0.to_le_bytes());
+    digest
+}
+
+fn validated_slot_leaf_hashes(
+    inputs: &[SlotLeafInputs],
+    mismatch: impl Fn(usize) -> ExactStateStructuralFrontierError,
+) -> Result<Vec<StateHash>, ExactStateStructuralFrontierError> {
+    inputs
+        .iter()
+        .enumerate()
+        .map(|(index, input)| {
+            let digest = slot_leaf_hash(SlotValue {
+                value: input.packed_value,
+                owner_hi: input.owner_hi,
+                owner_lo: input.owner_lo,
+            });
+            if fields_to_digest(input.expected_leaf) != digest {
+                return Err(mismatch(index));
+            }
+            Ok(digest)
+        })
+        .collect()
+}
+
+fn first_digest_mismatch(left: &[StateHash], right: &[StateHash]) -> Option<usize> {
+    left.iter()
+        .zip(right.iter())
+        .position(|(left, right)| left != right)
+}
+
+/// Validate the exact sibling-only carrier and derive all Merkle topology on
+/// the verifier side. No path direction or node coordinate is accepted from
+/// the prover.
+pub fn verify_exact_state_structural_frontier(
+    inputs: &ExactStateStructuralFrontierInputs,
+) -> Result<VerifiedExactStateStructuralFrontier, ExactStateStructuralFrontierError> {
+    let touched = inputs.touched_indices.len();
+    if inputs.old_slot_leaves.len() != touched || inputs.new_slot_leaves.len() != touched {
+        return Err(ExactStateStructuralFrontierError::SlotLeafCountMismatch {
+            touched,
+            old: inputs.old_slot_leaves.len(),
+            new: inputs.new_slot_leaves.len(),
+        });
+    }
+    let plan = derive_structural_frontier_plan(&inputs.touched_indices, inputs.active_depth)?;
+    let combines = plan.combines().len();
+    if inputs.old_combine_digests.len() != combines || inputs.new_combine_digests.len() != combines
+    {
+        return Err(
+            ExactStateStructuralFrontierError::CombineDigestCountMismatch {
+                expected: combines,
+                old: inputs.old_combine_digests.len(),
+                new: inputs.new_combine_digests.len(),
+            },
+        );
+    }
+    let old_leaves = validated_slot_leaf_hashes(&inputs.old_slot_leaves, |index| {
+        ExactStateStructuralFrontierError::OldSlotLeafMismatch { index }
+    })?;
+    let new_leaves = validated_slot_leaf_hashes(&inputs.new_slot_leaves, |index| {
+        ExactStateStructuralFrontierError::NewSlotLeafMismatch { index }
+    })?;
+    let old_evaluation =
+        evaluate_structural_frontier(&plan, &old_leaves, &inputs.live_sibling_digests)?;
+    if let Some(index) =
+        first_digest_mismatch(&inputs.old_combine_digests, &old_evaluation.combines)
+    {
+        return Err(ExactStateStructuralFrontierError::OldCombineDigestMismatch { index });
+    }
+    if old_evaluation.root != inputs.old_root {
+        return Err(ExactStateStructuralFrontierError::OldRootMismatch);
+    }
+    let new_evaluation =
+        evaluate_structural_frontier(&plan, &new_leaves, &inputs.live_sibling_digests)?;
+    if let Some(index) =
+        first_digest_mismatch(&inputs.new_combine_digests, &new_evaluation.combines)
+    {
+        return Err(ExactStateStructuralFrontierError::NewCombineDigestMismatch { index });
+    }
+    if new_evaluation.root != inputs.new_root {
+        return Err(ExactStateStructuralFrontierError::NewRootMismatch);
+    }
+    Ok(VerifiedExactStateStructuralFrontier {
+        plan,
+        old_evaluation,
+        new_evaluation,
+    })
+}
+
+/// Deterministically project the same authenticated frontier into the local
+/// and segment update paths consumed by the fixed-shape trace.
+pub fn derive_exact_state_segmented_updates(
+    inputs: &ExactStateStructuralFrontierInputs,
+    log_segment_size: u32,
+) -> Result<SegmentedSequentialMerkleUpdates, ExactStateStructuralFrontierError> {
+    verify_exact_state_structural_frontier(inputs)?;
+    let old_leaves = inputs
+        .old_slot_leaves
+        .iter()
+        .map(|leaf| fields_to_digest(leaf.expected_leaf))
+        .collect::<Vec<_>>();
+    let new_leaves = inputs
+        .new_slot_leaves
+        .iter()
+        .map(|leaf| fields_to_digest(leaf.expected_leaf))
+        .collect::<Vec<_>>();
+    Ok(expand_multiproof_segmented_updates(
+        &inputs.touched_indices,
+        &old_leaves,
+        &new_leaves,
+        &inputs.live_sibling_digests,
+        inputs.active_depth,
+        log_segment_size,
+    )?)
+}
 
 pub struct SlotLeafInputsTrace {
     pub packed_value: LinExpr,

@@ -25,7 +25,10 @@ use std::collections::{BTreeSet, HashSet};
 use noid_poseidon2b::primitives::{Address, Digest};
 use noid_tx::Transaction;
 
+use crate::accepted_block_bundle::AcceptedBlockBundle;
+use crate::block::Block;
 use crate::block_header::BlockHeader;
+use crate::consensus::da_prune::{build_undo_log, BlockUndoLog};
 use crate::consensus::pow::block_id;
 use crate::state::{apply_tx_checked_deferred_root, ChainState};
 
@@ -63,13 +66,46 @@ pub struct BlockTemplate {
     pub difficulty_target: Digest,
     /// Hash of parent block header.
     pub prev_block_hash: Digest,
-    /// Selected-history coverage the new header attests. Either the parent's
-    /// value (no attestation attached) or the advanced coverage C bound by the
-    /// Link envelope the miner attaches alongside this block.
-    pub attested_coverage: u64,
 }
 
 impl BlockTemplate {
+    /// Consume the template into its exact block without cloning transactions.
+    pub fn into_block(self, nonce: u128) -> crate::block::Block {
+        let Self {
+            coinbase,
+            txs,
+            state_root,
+            tx_root,
+            active_slot_count,
+            alloc_counter,
+            log_slots,
+            height,
+            timestamp,
+            miner_address,
+            difficulty_target,
+            prev_block_hash,
+        } = self;
+        let mut transactions = Vec::with_capacity(1 + txs.len());
+        transactions.push(coinbase);
+        transactions.extend(txs);
+        crate::block::Block {
+            header: BlockHeader {
+                prev_block_hash,
+                state_root,
+                tx_root,
+                timestamp,
+                height,
+                miner_address,
+                nonce,
+                difficulty_target,
+                log_slots,
+                active_slot_count,
+                alloc_counter,
+            },
+            transactions,
+        }
+    }
+
     /// Build a semantic `BlockHeader` from this template with the given nonce.
     pub fn into_header(self, nonce: u128) -> BlockHeader {
         BlockHeader {
@@ -84,7 +120,6 @@ impl BlockTemplate {
             log_slots: self.log_slots,
             active_slot_count: self.active_slot_count,
             alloc_counter: self.alloc_counter,
-            attested_coverage: self.attested_coverage,
         }
     }
 
@@ -103,7 +138,6 @@ impl BlockTemplate {
             log_slots: self.log_slots,
             active_slot_count: self.active_slot_count,
             alloc_counter: self.alloc_counter,
-            attested_coverage: self.attested_coverage,
         }
     }
 
@@ -117,6 +151,108 @@ impl BlockTemplate {
     /// Total tx count (coinbase + non-coinbase).
     pub fn n_txs(&self) -> usize {
         1 + self.txs.len()
+    }
+}
+
+/// Non-serializable state handoff minted together with one canonical
+/// node-owned block template.
+///
+/// It owns the already-computed post-state and exact parent undo rather than
+/// asking the commit path to replay the public transition.  Private fields and
+/// the absence of `Clone` make this a one-shot phase capability.
+#[must_use = "dropping the prepared state capability cancels its local fast commit"]
+pub struct PreparedBlockStateCommit {
+    parent_header: BlockHeader,
+    nonce_free_header: BlockHeader,
+    post_state: ChainState,
+    undo_log: BlockUndoLog,
+}
+
+/// One-shot commit authority after the node-owned HistoryStep prover has
+/// produced the bundle for the exact prepared block.
+///
+/// Network and reorg acceptance never construct this type; they continue
+/// through full terminal verification and state materialization.
+#[must_use = "a locally proved block is not accepted until this capability is committed"]
+pub struct LocallyProvedBlockCommit {
+    parent_header: BlockHeader,
+    block: Block,
+    bundle: AcceptedBlockBundle,
+    post_state: ChainState,
+    undo_log: BlockUndoLog,
+}
+
+impl PreparedBlockStateCommit {
+    /// Consume the prepared phase after trusted local HistoryStep proving and
+    /// bind it to the exact sealed block and complete bundle without
+    /// re-verifying that just-authored proof.
+    ///
+    /// # Safety
+    ///
+    /// `history_step_terminal_bytes` must be the canonical encoding returned
+    /// by the pinned HistoryStep prover after full native consensus validation
+    /// for this exact `block`. Violating this precondition can authorize the
+    /// local fast-commit path to persist an unverified terminal. Inbound and
+    /// reorg acceptance do not use this bridge and always verify the proof.
+    pub unsafe fn seal_after_trusted_history_step_proof_unchecked(
+        self,
+        block: Block,
+        history_step_terminal_bytes: Vec<u8>,
+    ) -> Result<LocallyProvedBlockCommit, String> {
+        let mut nonce_free_header = block.header;
+        nonce_free_header.nonce = 0;
+        if nonce_free_header != self.nonce_free_header {
+            return Err("sealed block header differs from its prepared template".to_string());
+        }
+        let tx_hashes = block
+            .transactions
+            .iter()
+            .map(Transaction::txid)
+            .collect::<Vec<_>>();
+        if tx_hashes != self.undo_log.tx_hashes {
+            return Err("sealed block body differs from its prepared template".to_string());
+        }
+        if self.post_state.cached_state_root() != block.header.state_root
+            || self.post_state.state.log_slots() as u32 != block.header.log_slots
+            || self.post_state.active_slot_count != block.header.active_slot_count
+            || self.post_state.alloc_counter != block.header.alloc_counter
+        {
+            return Err("prepared post-state differs from the sealed block header".to_string());
+        }
+        if self.undo_log.block_height != block.header.height {
+            return Err("prepared undo does not bind the sealed block height".to_string());
+        }
+        let bundle =
+            AcceptedBlockBundle::try_from_locally_built_block(&block, history_step_terminal_bytes)
+                .map_err(|error| error.to_string())?;
+
+        Ok(LocallyProvedBlockCommit {
+            parent_header: self.parent_header,
+            block,
+            bundle,
+            post_state: self.post_state,
+            undo_log: self.undo_log,
+        })
+    }
+}
+
+impl LocallyProvedBlockCommit {
+    pub const fn block(&self) -> &Block {
+        &self.block
+    }
+
+    pub const fn bundle(&self) -> &AcceptedBlockBundle {
+        &self.bundle
+    }
+
+    pub(crate) const fn parent_header(&self) -> &BlockHeader {
+        &self.parent_header
+    }
+
+    pub(crate) fn into_commit_parts(
+        self,
+    ) -> (Block, AcceptedBlockBundle, ChainState, BlockUndoLog) {
+        (self.block, self.bundle, self.post_state, self.undo_log)
     }
 }
 
@@ -204,9 +340,8 @@ impl TemplateResourceSelection {
 /// `candidate_txs` must be pre-validated (not yet conflict-resolved).
 /// Coinbase is constructed internally using `miner_address`.
 ///
-/// This convenience wrapper keeps the parent's `attested_coverage` (no Link
-/// attestation attached). Miners that attach an attestation for an advanced
-/// coverage C use [`build_block_template_with_coverage`].
+/// A miner may search PoW over this template, but the resulting block is not
+/// admissible until its exact current-height terminal has also been produced.
 pub fn build_block_template(
     parent: &BlockHeader,
     state: &ChainState,
@@ -216,7 +351,7 @@ pub fn build_block_template(
     timestamp: u64,
     difficulty_target: Digest,
 ) -> Result<BlockTemplate, TemplateBuildError> {
-    build_block_template_with_coverage(
+    build_block_template_with_post_state(
         parent,
         state,
         prev_active_counts,
@@ -224,20 +359,17 @@ pub fn build_block_template(
         miner_address,
         timestamp,
         difficulty_target,
-        parent.attested_coverage,
     )
+    .map(|(template, _)| template)
 }
 
-/// [`build_block_template`] with an explicit header `attested_coverage`.
+/// Build the canonical node-owned template together with its one-shot local
+/// state-commit capability.
 ///
-/// `attested_coverage` must be the parent's value, or an advanced coverage C
-/// in `(parent.attested_coverage, parent.height]` for which the caller will
-/// attach the matching Link envelope. Transactions spending coinbase UTXOs
-/// not yet matured under this coverage are skipped during selection (the
-/// same-block rule: an attestation raising coverage in this block counts for
-/// spends inside it).
-#[allow(clippy::too_many_arguments)]
-pub fn build_block_template_with_coverage(
+/// The returned post-state is the same scratch state used to derive the
+/// header, not a second replay.  Only the local miner/RPC template pipeline
+/// carries this value; inbound blocks cannot select this commit path.
+pub fn build_node_owned_block_template(
     parent: &BlockHeader,
     state: &ChainState,
     prev_active_counts: &[u64],
@@ -245,14 +377,47 @@ pub fn build_block_template_with_coverage(
     miner_address: Address,
     timestamp: u64,
     difficulty_target: Digest,
-    attested_coverage: u64,
-) -> Result<BlockTemplate, TemplateBuildError> {
+) -> Result<(BlockTemplate, PreparedBlockStateCommit), TemplateBuildError> {
+    let (template, post_state) = build_block_template_with_post_state(
+        parent,
+        state,
+        prev_active_counts,
+        candidate_txs,
+        miner_address,
+        timestamp,
+        difficulty_target,
+    )?;
+    let nonce_free_block = template.clone().into_block(0);
+    let undo_log = build_undo_log(state, &nonce_free_block);
+    let prepared = PreparedBlockStateCommit {
+        parent_header: *parent,
+        nonce_free_header: nonce_free_block.header,
+        post_state,
+        undo_log,
+    };
+    Ok((template, prepared))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_block_template_with_post_state(
+    parent: &BlockHeader,
+    state: &ChainState,
+    prev_active_counts: &[u64],
+    candidate_txs: Vec<Transaction>,
+    miner_address: Address,
+    timestamp: u64,
+    difficulty_target: Digest,
+) -> Result<(BlockTemplate, ChainState), TemplateBuildError> {
     use crate::consensus::allocator::generate_slot_hints;
     use crate::consensus::emission::block_reward;
     use crate::consensus::expected_child_log_slots;
     use crate::consensus::fees::{claimable_fee_for_tx_body, required_fee_for_tx_body};
     use crate::consensus::{conflict::resolve_slot_conflicts, ordering::order_block_txs};
     use noid_tx::{TxBody, TxInput, TxOutput, TX_INPUTS};
+
+    let child_height = parent.height.checked_add(1).ok_or_else(|| {
+        TemplateBuildError::StateApplyError("parent height exhausted".to_string())
+    })?;
 
     // 1. Resolve slot conflicts among candidate txs.
     let (mut winners, _losers) = resolve_slot_conflicts(candidate_txs);
@@ -307,16 +472,6 @@ pub fn build_block_template_with_coverage(
             required_fee_for_tx_body(&tx.body, parent.active_slot_count, parent.log_slots);
         let actual = tx.body.fee;
         if actual < required {
-            continue;
-        }
-        // Proof-gated coinbase maturity: skip spends of coinbase UTXOs whose
-        // mint height exceeds the coverage this template attests. Selecting
-        // them would make the sealed block fail `validate_coinbase_maturity`.
-        if tx.body.live_inputs().any(|(_, input)| {
-            crate::consensus::params::is_coinbase_creation_id(input.creation_id)
-                && crate::consensus::params::coinbase_creation_height(input.creation_id)
-                    > attested_coverage
-        }) {
             continue;
         }
         match apply_tx_checked_deferred_root(&mut selection_scratch, &tx.body, None) {
@@ -435,7 +590,7 @@ pub fn build_block_template_with_coverage(
     let coinbase = Transaction::new(cb_body);
 
     // Apply the complete block to scratch in its real semantic order.
-    apply_tx_checked_deferred_root(&mut scratch, &coinbase.body, Some(parent.height + 1))
+    apply_tx_checked_deferred_root(&mut scratch, &coinbase.body, Some(child_height))
         .map_err(|e| TemplateBuildError::StateApplyError(format!("{:?}", e)))?;
     for tx in &ordered_winners {
         apply_tx_checked_deferred_root(&mut scratch, &tx.body, None)
@@ -451,7 +606,7 @@ pub fn build_block_template_with_coverage(
         .collect();
     let tx_root = crate::tx_tree::root_from_hashes(&tx_hashes_for_root);
 
-    Ok(BlockTemplate {
+    let template = BlockTemplate {
         coinbase,
         txs: ordered_winners,
         state_root,
@@ -459,13 +614,13 @@ pub fn build_block_template_with_coverage(
         active_slot_count: scratch.active_slot_count,
         alloc_counter: scratch.alloc_counter,
         log_slots: new_log_slots,
-        height: parent.height + 1,
+        height: child_height,
         timestamp,
         miner_address,
         difficulty_target,
         prev_block_hash,
-        attested_coverage,
-    })
+    };
+    Ok((template, scratch))
 }
 
 // ---------------------------------------------------------------------------
@@ -476,6 +631,7 @@ pub fn build_block_template_with_coverage(
 mod tests {
     use super::*;
     use crate::consensus::fees::required_fee_for_tx_body;
+    use crate::history_step::HistoryStepTerminalMetadata;
     use noid_tx::{output_bitmap_bit, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS};
 
     fn parent(state: &mut ChainState) -> BlockHeader {
@@ -491,7 +647,6 @@ mod tests {
             log_slots: state.state.log_slots() as u32,
             active_slot_count: state.active_slot_count,
             alloc_counter: state.alloc_counter,
-            attested_coverage: 0,
         }
     }
 
@@ -543,6 +698,7 @@ mod tests {
         )
         .unwrap();
         assert!(template.coinbase.body.is_coinbase);
+        assert_eq!(template.height, 1);
         assert_eq!(template.coinbase.body.validity_bitmap, output_bitmap_bit(0));
         assert_eq!(template.coinbase.body.input_owner, Address([0u8; 32]));
         assert_eq!(
@@ -552,19 +708,20 @@ mod tests {
     }
 
     #[test]
-    fn selection_gates_immature_coinbase_spends_on_template_coverage() {
+    fn reward_minted_at_parent_height_is_selected_for_child() {
         use crate::consensus::params::coinbase_creation_id;
 
         let owner = Address([1u8; 32]);
         let mut state = ChainState::with_log_slots(8);
-        // A coinbase UTXO minted at height 6, funded directly into state.
+        let mint_height = 6;
+        // The accepted parent state already contains its height-6 reward.
         state
             .state
             .set_slot(
                 1,
                 crate::fri_state::SlotValue::with_owner_fields(
                     1_000_000,
-                    coinbase_creation_id(6),
+                    coinbase_creation_id(mint_height),
                     owner.as_fields(),
                 ),
             )
@@ -572,31 +729,14 @@ mod tests {
         state.active_slot_count = 1;
         state.alloc_counter = 1;
         let mut parent = parent(&mut state);
-        parent.height = 8;
+        parent.height = mint_height;
 
         let mut spend = user(1, 3, 1_000_000, owner, &parent);
         let mut body = spend.body;
-        body.inputs[0].creation_id = coinbase_creation_id(6);
+        body.inputs[0].creation_id = coinbase_creation_id(mint_height);
         spend = Transaction::new(body);
 
-        // Template attesting only coverage 5 skips the immature spend.
-        let immature_template = build_block_template_with_coverage(
-            &parent,
-            &state,
-            &[1],
-            vec![spend.clone()],
-            Address([9u8; 32]),
-            1,
-            [0xff; 32],
-            5,
-        )
-        .unwrap();
-        assert!(immature_template.txs.is_empty());
-        assert_eq!(immature_template.attested_coverage, 5);
-
-        // Advancing the template's own attested coverage to the mint height
-        // matures the spend inside the same block (same-block rule).
-        let matured_template = build_block_template_with_coverage(
+        let child = build_block_template(
             &parent,
             &state,
             &[1],
@@ -604,22 +744,10 @@ mod tests {
             Address([9u8; 32]),
             1,
             [0xff; 32],
-            6,
         )
         .unwrap();
-        assert_eq!(matured_template.txs.len(), 1);
-        assert_eq!(matured_template.attested_coverage, 6);
-        let header = matured_template.clone().into_header(0);
-        assert_eq!(header.attested_coverage, 6);
-        // The sealed block passes the consensus maturity predicate.
-        let block = crate::block::Block {
-            header,
-            transactions: matured_template.all_txs(),
-        };
-        assert_eq!(
-            crate::consensus::validation::validate_coinbase_maturity(&block),
-            Ok(())
-        );
+        assert_eq!(child.height, mint_height + 1);
+        assert_eq!(child.txs.len(), 1);
     }
 
     #[test]
@@ -651,5 +779,67 @@ mod tests {
         )
         .unwrap();
         assert!(template.txs.len() <= 1);
+    }
+
+    fn node_owned_coinbase_template(
+        parent: &BlockHeader,
+        state: &ChainState,
+    ) -> (BlockTemplate, PreparedBlockStateCommit) {
+        build_node_owned_block_template(
+            parent,
+            state,
+            &[parent.active_slot_count],
+            vec![],
+            Address([9u8; 32]),
+            parent.timestamp + 1,
+            [0xff; 32],
+        )
+        .unwrap()
+    }
+
+    fn structural_terminal_for_unsafe_binding_test(block: &Block) -> Vec<u8> {
+        let mut terminal =
+            HistoryStepTerminalMetadata::new(block.header.height, block_id(&block.header), 0)
+                .unwrap()
+                .encode_prefix()
+                .to_vec();
+        terminal.push(0xA5);
+        terminal
+    }
+
+    #[test]
+    fn unsafe_local_seal_still_binds_header_body_and_post_state() {
+        let mut state = ChainState::with_log_slots(8);
+        let parent = parent(&mut state);
+
+        let (template, prepared) = node_owned_coinbase_template(&parent, &state);
+        let mut changed_header = template.into_block(17);
+        changed_header.header.miner_address = Address([0xA5; 32]);
+        let terminal = structural_terminal_for_unsafe_binding_test(&changed_header);
+        assert_eq!(
+            // SAFETY: this deliberately malformed test input exercises only
+            // the unsafe bridge's immutable template binding and is never
+            // committed.
+            unsafe {
+                prepared.seal_after_trusted_history_step_proof_unchecked(changed_header, terminal)
+            }
+            .err(),
+            Some("sealed block header differs from its prepared template".to_string())
+        );
+
+        let (template, prepared) = node_owned_coinbase_template(&parent, &state);
+        let mut changed_body = template.into_block(17);
+        let mut body = changed_body.transactions[0].body.clone();
+        body.outputs[0].amount = body.outputs[0].amount.saturating_sub(1);
+        changed_body.transactions[0] = Transaction::new(body);
+        let terminal = structural_terminal_for_unsafe_binding_test(&changed_body);
+        assert_eq!(
+            // SAFETY: as above, no capability produced here reaches commit.
+            unsafe {
+                prepared.seal_after_trusted_history_step_proof_unchecked(changed_body, terminal)
+            }
+            .err(),
+            Some("sealed block body differs from its prepared template".to_string())
+        );
     }
 }

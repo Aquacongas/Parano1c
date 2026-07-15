@@ -28,8 +28,11 @@ use noid_core::packed::PackedBlock128;
 /// module's `FlatTables` (already tower→flat converted).
 pub(crate) struct VecTables {
     pub rc: [[u128; N_ROUNDS]; STATE_SIZE],
-    pub mds_full: [[u128; STATE_SIZE]; STATE_SIZE],
-    pub mds_full_is_one: [[bool; STATE_SIZE]; STATE_SIZE],
+    /// Flat-basis images of the tower constants 2 and 4. The production
+    /// full MDS contains only coefficients 1..=7, so linearity lets the
+    /// kernel synthesize 3/5/6/7 from these two products and XORs.
+    pub mds_full_two: u128,
+    pub mds_full_four: u128,
     /// Diagonal of the partial-round matrix (its off-diagonal entries are
     /// all 1, checked at table build time).
     pub mds_partial_diag: [u128; STATE_SIZE],
@@ -54,18 +57,39 @@ unsafe fn sbox_x7(x: __m256i) -> __m256i {
 #[inline]
 #[target_feature(enable = "avx2,vpclmulqdq")]
 unsafe fn mds_full(s: &mut [__m256i; STATE_SIZE], t: &VecTables) {
-    let input = *s;
-    for i in 0..STATE_SIZE {
-        let mut acc = _mm256_setzero_si256();
-        for j in 0..STATE_SIZE {
-            if t.mds_full_is_one[i][j] {
-                acc = _mm256_xor_si256(acc, input[j]);
-            } else {
-                acc = _mm256_xor_si256(acc, mul_gcm_x2(input[j], bcast(t.mds_full[i][j])));
-            }
-        }
-        s[i] = acc;
-    }
+    // M = [5 7 1 3; 4 6 1 1; 1 3 5 7; 1 1 4 6]. In characteristic two,
+    // 3x=2x+x, 5x=4x+x, 6x=4x+2x, 7x=4x+2x+x. Six products by 2/4 therefore
+    // replace the generic ten non-identity products without changing the
+    // linear map. This MDS runs once initially and after every full round.
+    let [a, b, c, d] = *s;
+    let two = bcast(t.mds_full_two);
+    let four = bcast(t.mds_full_four);
+    let a4 = mul_gcm_x2(a, four);
+    let b2 = mul_gcm_x2(b, two);
+    let b4 = mul_gcm_x2(b, four);
+    let c4 = mul_gcm_x2(c, four);
+    let d2 = mul_gcm_x2(d, two);
+    let d4 = mul_gcm_x2(d, four);
+
+    s[0] = _mm256_xor_si256(
+        _mm256_xor_si256(_mm256_xor_si256(a4, a), _mm256_xor_si256(b4, b2)),
+        _mm256_xor_si256(_mm256_xor_si256(b, c), _mm256_xor_si256(d2, d)),
+    );
+    s[1] = _mm256_xor_si256(
+        _mm256_xor_si256(a4, _mm256_xor_si256(b4, b2)),
+        _mm256_xor_si256(c, d),
+    );
+    s[2] = _mm256_xor_si256(
+        _mm256_xor_si256(a, _mm256_xor_si256(b2, b)),
+        _mm256_xor_si256(
+            _mm256_xor_si256(c4, c),
+            _mm256_xor_si256(d4, _mm256_xor_si256(d2, d)),
+        ),
+    );
+    s[3] = _mm256_xor_si256(
+        _mm256_xor_si256(a, b),
+        _mm256_xor_si256(c4, _mm256_xor_si256(d4, d2)),
+    );
 }
 
 /// Partial-round MDS: diagonal entries `c_i`, all off-diagonals 1, so
@@ -172,6 +196,78 @@ pub(crate) unsafe fn permute_flat_one(states: &mut [PackedBlock128; STATE_SIZE],
         let mut regs = [load_group(states)];
         permute_groups(&mut regs, t);
         store_group(&regs[0], states);
+    }
+}
+
+/// Fixed-length, no-pad leaf sponges over leaf-major bytes.
+///
+/// The generic batch path has to materialize every packed state around each
+/// rate block because the permutation entry point owns only one invocation.
+/// A PCS leaf is a long dependent sponge chain (512 bytes / 16 invocations in
+/// the production tree), so those boundaries repeatedly spill and reload all
+/// 16 live YMM state registers.  Keep four packed groups (eight leaves) in
+/// the register-domain kernel for the complete absorb schedule instead.
+///
+/// This is only an execution shortcut: the initial state, byte-to-lane
+/// mapping, per-block XOR, permutation schedule and final flat-basis bytes are
+/// identical to `Poseidon2bFlatSponge::finalize_no_pad`.
+///
+/// # Safety
+/// The CPU must support AVX2 and VPCLMULQDQ. `data.len()` must equal
+/// `leaf_size * out.len()`, `leaf_size` must be a positive multiple of 32,
+/// and the leaf count must be a multiple of eight. Callers check all four.
+#[target_feature(enable = "avx2,vpclmulqdq")]
+pub(crate) unsafe fn leaf_sponge_flat_no_pad_into(
+    iv: [u128; 2],
+    data: &[u8],
+    leaf_size: usize,
+    out: &mut [[u8; 32]],
+    t: &VecTables,
+) {
+    const G: usize = 4;
+    const LEAVES_PER_CHUNK: usize = G * 2;
+
+    debug_assert!(leaf_size > 0 && leaf_size.is_multiple_of(32));
+    debug_assert_eq!(data.len(), leaf_size * out.len());
+    debug_assert!(out.len().is_multiple_of(LEAVES_PER_CHUNK));
+
+    unsafe {
+        let zero = _mm256_setzero_si256();
+        let iv_hi = bcast(iv[0]);
+        let iv_lo = bcast(iv[1]);
+
+        for leaf_base in (0..out.len()).step_by(LEAVES_PER_CHUNK) {
+            let mut states: [[__m256i; STATE_SIZE]; G] = [[zero, zero, iv_hi, iv_lo]; G];
+
+            for block_offset in (0..leaf_size).step_by(32) {
+                for g in 0..G {
+                    let leaf0 = leaf_base + 2 * g;
+                    let leaf1 = leaf0 + 1;
+                    let p0 = data.as_ptr().add(leaf0 * leaf_size + block_offset);
+                    let p1 = data.as_ptr().add(leaf1 * leaf_size + block_offset);
+
+                    let w0_lo = _mm_loadu_si128(p0.cast::<__m128i>());
+                    let w0_hi = _mm_loadu_si128(p1.cast::<__m128i>());
+                    let w1_lo = _mm_loadu_si128(p0.add(16).cast::<__m128i>());
+                    let w1_hi = _mm_loadu_si128(p1.add(16).cast::<__m128i>());
+                    let w0 = _mm256_inserti128_si256(_mm256_castsi128_si256(w0_lo), w0_hi, 1);
+                    let w1 = _mm256_inserti128_si256(_mm256_castsi128_si256(w1_lo), w1_hi, 1);
+                    states[g][0] = _mm256_xor_si256(states[g][0], w0);
+                    states[g][1] = _mm256_xor_si256(states[g][1], w1);
+                }
+                permute_groups(&mut states, t);
+            }
+
+            // Transpose `[leaf0.word, leaf1.word]` vectors into the normal
+            // contiguous `[leaf0.word0, leaf0.word1]` digest layout.
+            for g in 0..G {
+                let digest0 = _mm256_permute2x128_si256(states[g][0], states[g][1], 0x20);
+                let digest1 = _mm256_permute2x128_si256(states[g][0], states[g][1], 0x31);
+                let dst = out.as_mut_ptr().add(leaf_base + 2 * g).cast::<__m256i>();
+                _mm256_storeu_si256(dst, digest0);
+                _mm256_storeu_si256(dst.add(1), digest1);
+            }
+        }
     }
 }
 

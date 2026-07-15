@@ -32,11 +32,11 @@ use super::snapshot_generation::SnapshotSegmentDescriptor;
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(0);
 
-/// Canonical snapshot boundary already authenticated by the history proof and
+/// Canonical snapshot boundary already authenticated by HistoryStep and
 /// the locally verified header chain.
 ///
 /// Construction rechecks internal metadata consistency; it does not replace
-/// the caller's history-proof/header authentication step.
+/// the caller's HistoryStep/header authentication step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AuthenticatedSnapshotMetadata {
     header: BlockHeader,
@@ -97,6 +97,40 @@ impl AuthenticatedSnapshotMetadata {
 
     pub fn effective_log_segment(&self) -> u8 {
         self.effective_log_segment
+    }
+}
+
+/// Snapshot boundary whose full HistoryStep terminal has been verified
+/// against a sealed, native-validated candidate header chain.
+///
+/// Only `MdbxChainContext::verify_snapshot_boundary` can construct this type.
+/// The finalized staging handle separately proves that the streamed state
+/// equals `header.state_root`; together they form the complete snapshot
+/// boundary without requiring an already-pruned block body.
+#[derive(Debug)]
+pub struct VerifiedSnapshotBoundary {
+    header: BlockHeader,
+    history_step_terminal_bytes: Vec<u8>,
+}
+
+impl VerifiedSnapshotBoundary {
+    pub(crate) fn new_verified(header: BlockHeader, history_step_terminal_bytes: Vec<u8>) -> Self {
+        Self {
+            header,
+            history_step_terminal_bytes,
+        }
+    }
+
+    pub fn header(&self) -> &BlockHeader {
+        &self.header
+    }
+
+    pub fn block_hash(&self) -> [u8; 32] {
+        block_id(&self.header)
+    }
+
+    pub fn history_step_terminal_bytes(&self) -> &[u8] {
+        &self.history_step_terminal_bytes
     }
 }
 
@@ -163,6 +197,12 @@ pub enum SnapshotStagingError {
         creation_id: u64,
         alloc_counter: u64,
     },
+    CoinbaseCreationHeightExceedsBoundary {
+        segment_id: u16,
+        local_index: u32,
+        mint_height: u64,
+        snapshot_height: u64,
+    },
     EmptyAdvertisedSegment {
         segment_id: u16,
     },
@@ -214,10 +254,10 @@ impl fmt::Display for SnapshotStagingError {
                 f,
                 "snapshot descriptors are not strictly sorted: {previous} then {current}"
             ),
-            Self::SegmentIdOutOfRange { segment_id, maximum } => write!(
-                f,
-                "snapshot segment {segment_id} is outside 0..{maximum}"
-            ),
+            Self::SegmentIdOutOfRange {
+                segment_id,
+                maximum,
+            } => write!(f, "snapshot segment {segment_id} is outside 0..{maximum}"),
             Self::DescriptorLength {
                 segment_id,
                 expected,
@@ -276,10 +316,18 @@ impl fmt::Display for SnapshotStagingError {
                 f,
                 "snapshot segment {segment_id} slot {local_index} creation id {creation_id} exceeds {alloc_counter}"
             ),
-            Self::EmptyAdvertisedSegment { segment_id } => write!(
+            Self::CoinbaseCreationHeightExceedsBoundary {
+                segment_id,
+                local_index,
+                mint_height,
+                snapshot_height,
+            } => write!(
                 f,
-                "snapshot manifest advertises empty segment {segment_id}"
+                "snapshot segment {segment_id} slot {local_index} coinbase mint height {mint_height} exceeds snapshot height {snapshot_height}"
             ),
+            Self::EmptyAdvertisedSegment { segment_id } => {
+                write!(f, "snapshot manifest advertises empty segment {segment_id}")
+            }
             Self::Incomplete { received, expected } => write!(
                 f,
                 "snapshot staging incomplete: received {received} of {expected} segments"
@@ -570,13 +618,6 @@ impl FinalizedSnapshotStaging {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn staging_directory(&self) -> &Path {
-        self.directory
-            .as_deref()
-            .expect("finalized snapshot handle always owns its directory")
-    }
-
     fn cleanup_best_effort(&mut self) {
         let Some(directory) = self.directory.as_ref() else {
             return;
@@ -753,7 +794,23 @@ fn decode_and_verify_segment(
         }
         live += 1;
         let creation_id = slot.creation_id();
-        if creation_id > metadata.header.alloc_counter {
+        if !crate::consensus::params::creation_id_within_boundary(
+            creation_id,
+            metadata.header.alloc_counter,
+            metadata.header.height,
+        ) {
+            if crate::consensus::params::is_coinbase_creation_id(creation_id) {
+                return Err(
+                    SnapshotStagingError::CoinbaseCreationHeightExceedsBoundary {
+                        segment_id: descriptor.segment_id,
+                        local_index: local as u32,
+                        mint_height: crate::consensus::params::coinbase_creation_height(
+                            creation_id,
+                        ),
+                        snapshot_height: metadata.header.height,
+                    },
+                );
+            }
             return Err(SnapshotStagingError::CreationIdExceedsBound {
                 segment_id: descriptor.segment_id,
                 local_index: local as u32,
@@ -965,7 +1022,6 @@ mod tests {
             log_slots,
             active_slot_count: active,
             alloc_counter: alloc,
-            attested_coverage: 0,
         }
     }
 
@@ -1123,6 +1179,67 @@ mod tests {
             })
         ));
         assert!(!directory.exists());
+    }
+
+    #[test]
+    fn coinbase_creation_ids_use_snapshot_height_not_allocator_bound() {
+        use crate::consensus::params::coinbase_creation_id;
+
+        let parent = tempfile::tempdir().unwrap();
+        let coinbase = slot(1, coinbase_creation_id(7), 0xCB);
+        let coinbase_columns = columns(3, &[(4, coinbase)]);
+        let encoded = encode_segment(&coinbase_columns, 3);
+        let fri_root = compute_segment_root(
+            3,
+            &coinbase_columns.values,
+            &coinbase_columns.owners_hi,
+            &coinbase_columns.owners_lo,
+        );
+        let exact = ChainState::from_sparse_utxos(3, &[(4, coinbase)], 5)
+            .expect("tagged coinbase snapshot state");
+        let hdr = header(3, exact.utxo_root, 1, 5);
+        let metadata =
+            AuthenticatedSnapshotMetadata::from_authenticated_header(hdr, block_id(&hdr), 3)
+                .unwrap();
+        let descriptor = SnapshotSegmentDescriptor {
+            segment_id: 0,
+            segment_root: fri_root,
+            encoded_len: encoded.len() as u32,
+        };
+        let mut session =
+            SnapshotStagingSession::new(parent.path(), metadata, vec![descriptor]).unwrap();
+        session
+            .accept_segment(0, 3, &encoded)
+            .expect("coinbase tag is bounded by mint height");
+        session.finalize().expect("coinbase snapshot finalizes");
+
+        let future = slot(1, coinbase_creation_id(8), 0xCC);
+        let future_columns = columns(3, &[(4, future)]);
+        let future_encoded = encode_segment(&future_columns, 3);
+        let future_root = compute_segment_root(
+            3,
+            &future_columns.values,
+            &future_columns.owners_hi,
+            &future_columns.owners_lo,
+        );
+        let future_descriptor = SnapshotSegmentDescriptor {
+            segment_id: 0,
+            segment_root: future_root,
+            encoded_len: future_encoded.len() as u32,
+        };
+        let mut future_session =
+            SnapshotStagingSession::new(parent.path(), metadata, vec![future_descriptor]).unwrap();
+        assert!(matches!(
+            future_session.accept_segment(0, 3, &future_encoded),
+            Err(
+                SnapshotStagingError::CoinbaseCreationHeightExceedsBoundary {
+                    segment_id: 0,
+                    local_index: 4,
+                    mint_height: 8,
+                    snapshot_height: 7,
+                }
+            )
+        ));
     }
 
     #[test]

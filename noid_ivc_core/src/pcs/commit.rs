@@ -191,30 +191,23 @@ pub fn commit(z_packed: &[F128], params: &PcsParams) -> (Commitment, ProverData)
     let codeword_len = n_positions * num_ntts;
 
     // ---- Codeword buffer (SoA): codeword[pos * num_ntts + lane].
-    // Copy first 2^log_msg_len positions from packed witness; zero-pad the rest.
-    //
-    // At large m the codeword buffer is huge (128 MB at m=29, 512 MB at m=31).
-    // `vec![F128::ZERO; n]` would eagerly zero all 128 MB upfront, then
-    // immediately overwrite the lower half with `z_packed` — half the zero-fill
-    // is wasted. Instead allocate uninit, write each half exactly once: copy
-    // `z_packed` into the lower half, and zero-fill JUST the upper half (the
-    // RS-encoding zero coefficients that the NTT's first-layer butterfly will
-    // read). Saves ~64 MB of memory writes at m=29 (~9 ms).
+    // The scratch contents are irrelevant: commit_into materializes the
+    // zero-padded NTT prefix plus its first active layers directly from
+    // `z_packed`, writing every codeword slot before it is read.
     let codeword = crate::scratch::take_f128(codeword_len);
     commit_into(z_packed, params, codeword)
 }
 
 /// Like [`commit`], but reuses a caller-provided codeword buffer instead of
 /// allocating its own. The buffer must have length `codeword_len`; its
-/// CONTENTS may be arbitrary (uninit/stale) — every slot is written here:
-/// `z_packed` is replicated into all `2^log_inv_rate` sub-blocks (the exact
-/// state after the first `log_inv_rate` NTT layers on `[z, 0, …, 0]`), in
-/// parallel. Buffers from [`prefault_codeword_during`] or the scratch pool
-/// are already resident, so no write faults.
+/// CONTENTS may be arbitrary (uninit/stale) — every slot is written here.
+/// The zero-copy NTT prefix and first active layers are materialized directly
+/// from `z_packed` in parallel. Buffers from [`prefault_codeword_during`] or
+/// the scratch pool are already resident, so no write faults.
 pub fn commit_into(
     z_packed: &[F128],
     params: &PcsParams,
-    mut codeword: Vec<F128>,
+    codeword: Vec<F128>,
 ) -> (Commitment, ProverData) {
     params.validate();
     assert_eq!(z_packed.len(), 1usize << params.log_msg_len());
@@ -225,15 +218,7 @@ pub fn commit_into(
         "commit_into: prebuilt codeword buffer has wrong length"
     );
 
-    // RS encoding of [z, 0, …, 0] starts with `log_inv_rate` butterfly layers
-    // whose bottom inputs are all zero — each is a pure copy, so after those
-    // layers the buffer holds 2^log_inv_rate replicas of z. Write that state
-    // directly (replicating z costs the same writes as the zero-fill it
-    // replaces) and start the NTT at layer `log_inv_rate`, skipping those
-    // layers' full-buffer reads and multiplies.
-    replicate_message_fill(&mut codeword, z_packed);
-
-    finalize_commit(codeword, params)
+    finalize_commit(z_packed, codeword, params)
 }
 
 /// Fill `codeword` with `2^r` replicas of `msg` (`r = log2(codeword.len() /
@@ -262,21 +247,190 @@ pub(crate) fn replicate_message_fill(codeword: &mut [F128], msg: &[F128]) {
     }
 }
 
+/// Materialize the exact state after the zero-copy prefix and the first two
+/// active interleaved NTT layers.
+///
+/// A conventional commit first writes `2^start_layer` full replicas of
+/// `msg`, then the NTT reads and writes that entire codeword again for layers
+/// `start_layer` and `start_layer + 1`. The two layers form independent
+/// four-row butterflies inside each replica. Evaluate those butterflies
+/// directly from the shared message and write their final rows once. This is
+/// algebraically identical to `replicate_message_fill` followed by the normal
+/// fused two-layer transform, but removes one full codeword read and write.
+///
+/// Falls back to replica fill when fewer than two active layers remain. The
+/// returned layer is the first layer the caller must still execute.
+fn replicate_message_fill_fused_two_layers(
+    codeword: &mut [F128],
+    msg: &[F128],
+    ntt: &AdditiveNttF128,
+    num_ntts: usize,
+    start_layer: usize,
+) -> usize {
+    use rayon::prelude::*;
+
+    assert!(num_ntts.is_power_of_two() && num_ntts > 0);
+    assert_eq!(msg.len() % num_ntts, 0);
+    assert_eq!(codeword.len() % msg.len(), 0);
+    let replicas = codeword.len() / msg.len();
+    assert_eq!(replicas, 1usize << start_layer);
+    debug_assert_eq!(codeword.len() / num_ntts, 1usize << ntt.log_domain_size());
+
+    let msg_positions = msg.len() / num_ntts;
+    if start_layer + 2 > ntt.log_domain_size() || msg_positions < 4 {
+        replicate_message_fill(codeword, msg);
+        return start_layer;
+    }
+
+    let quarter_positions = msg_positions / 4;
+    let quarter_len = quarter_positions * num_ntts;
+    debug_assert_eq!(4 * quarter_len, msg.len());
+    let twiddles: Vec<(F128, F128, F128)> = (0..replicas)
+        .map(|replica| {
+            // At `start_layer`, replica `r` is global block r. Splitting it
+            // for the next layer produces global blocks 2r and 2r+1.
+            (
+                ntt.twiddle(start_layer, replica),
+                ntt.twiddle(start_layer + 1, 2 * replica),
+                ntt.twiddle(start_layer + 1, 2 * replica + 1),
+            )
+        })
+        .collect();
+
+    // Tiny recursive commits do not amortize Rayon dispatch. Production's
+    // B255 message is 256 MiB, far above this threshold.
+    const PARALLEL_MSG_MIN: usize = 1 << 16;
+    if msg.len() >= PARALLEL_MSG_MIN {
+        codeword
+            .par_chunks_mut(msg.len())
+            .zip(twiddles.into_par_iter())
+            .for_each(|(out, (t_outer, t_inner_top, t_inner_bottom))| {
+                fill_fused_two_layer_replica(
+                    out,
+                    msg,
+                    quarter_len,
+                    num_ntts,
+                    t_outer,
+                    t_inner_top,
+                    t_inner_bottom,
+                    true,
+                );
+            });
+    } else {
+        for (out, (t_outer, t_inner_top, t_inner_bottom)) in
+            codeword.chunks_mut(msg.len()).zip(twiddles)
+        {
+            fill_fused_two_layer_replica(
+                out,
+                msg,
+                quarter_len,
+                num_ntts,
+                t_outer,
+                t_inner_top,
+                t_inner_bottom,
+                false,
+            );
+        }
+    }
+
+    start_layer + 2
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fill_fused_two_layer_replica(
+    out: &mut [F128],
+    msg: &[F128],
+    quarter_len: usize,
+    num_ntts: usize,
+    t_outer: F128,
+    t_inner_top: F128,
+    t_inner_bottom: F128,
+    parallel: bool,
+) {
+    use rayon::prelude::*;
+
+    debug_assert_eq!(out.len(), msg.len());
+    debug_assert_eq!(out.len(), 4 * quarter_len);
+    let (msg_top, msg_bottom) = msg.split_at(2 * quarter_len);
+    let (msg_a, msg_b) = msg_top.split_at(quarter_len);
+    let (msg_c, msg_d) = msg_bottom.split_at(quarter_len);
+    let (out_top, out_bottom) = out.split_at_mut(2 * quarter_len);
+    let (out_a, out_b) = out_top.split_at_mut(quarter_len);
+    let (out_c, out_d) = out_bottom.split_at_mut(quarter_len);
+
+    let apply_row = |row: usize,
+                     dst_a: &mut [F128],
+                     dst_b: &mut [F128],
+                     dst_c: &mut [F128],
+                     dst_d: &mut [F128]| {
+        let offset = row * num_ntts;
+        let src_a = &msg_a[offset..offset + num_ntts];
+        let src_b = &msg_b[offset..offset + num_ntts];
+        let src_c = &msg_c[offset..offset + num_ntts];
+        let src_d = &msg_d[offset..offset + num_ntts];
+        for lane in 0..num_ntts {
+            // Layer start_layer: (a,c), (b,d).
+            let a1 = src_a[lane] + src_c[lane] * t_outer;
+            let c1 = src_c[lane] + a1;
+            let b1 = src_b[lane] + src_d[lane] * t_outer;
+            let d1 = src_d[lane] + b1;
+            // Layer start_layer+1: (a,b), (c,d).
+            let a2 = a1 + b1 * t_inner_top;
+            let b2 = b1 + a2;
+            let c2 = c1 + d1 * t_inner_bottom;
+            let d2 = d1 + c2;
+            dst_a[lane] = a2;
+            dst_b[lane] = b2;
+            dst_c[lane] = c2;
+            dst_d[lane] = d2;
+        }
+    };
+
+    if parallel {
+        out_a
+            .par_chunks_mut(num_ntts)
+            .zip(out_b.par_chunks_mut(num_ntts))
+            .zip(out_c.par_chunks_mut(num_ntts))
+            .zip(out_d.par_chunks_mut(num_ntts))
+            .enumerate()
+            .for_each(|(row, (((dst_a, dst_b), dst_c), dst_d))| {
+                apply_row(row, dst_a, dst_b, dst_c, dst_d);
+            });
+    } else {
+        for (row, (((dst_a, dst_b), dst_c), dst_d)) in out_a
+            .chunks_mut(num_ntts)
+            .zip(out_b.chunks_mut(num_ntts))
+            .zip(out_c.chunks_mut(num_ntts))
+            .zip(out_d.chunks_mut(num_ntts))
+            .enumerate()
+        {
+            apply_row(row, dst_a, dst_b, dst_c, dst_d);
+        }
+    }
+}
+
 /// Shared tail of [`commit`] / [`commit_into`]: interleaved forward additive
 /// NTT (RS-encode every lane) then the initial Merkle tree over codeword rows.
-fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, ProverData) {
+fn finalize_commit(
+    z_packed: &[F128],
+    mut codeword: Vec<F128>,
+    params: &PcsParams,
+) -> (Commitment, ProverData) {
     let timing = std::env::var_os("NOIDH_COMMIT_TIMING").is_some();
     let t_ntt = std::time::Instant::now();
     // ---- Interleaved forward additive NTT: 2^log_batch_size independent
     // sub-NTTs with shared twiddles. Each sub-NTT operates on its lane of the
-    // SoA buffer. The first `log_inv_rate` layers were pre-applied by the
-    // caller's replicate-fill (commit_into), so start past them.
+    // SoA buffer. Materialize the zero-copy prefix and the first two active
+    // layers in one output pass, then run the remaining cache-blocked NTT.
     let ntt = AdditiveNttF128::standard(params.k_code());
-    ntt.forward_transform_interleaved_from_layer(
+    let start_layer = replicate_message_fill_fused_two_layers(
         &mut codeword,
+        z_packed,
+        &ntt,
         params.num_ntts(),
         params.log_inv_rate,
     );
+    ntt.forward_transform_interleaved_from_layer(&mut codeword, params.num_ntts(), start_layer);
     if timing {
         eprintln!(
             "[commit-timing] ntt: {:.2} ms",
@@ -394,15 +548,23 @@ mod tests {
         }
     }
 
-    /// The replicate-fill + start-at-layer-`log_inv_rate` fast path must be
+    /// The fused replica-prefix + parallel from-layer fast path must be
     /// byte-identical to the definitional encoding: zero-padded coefficients
-    /// through the FULL forward NTT. Covers rate 1/2 and 1/4 and both
-    /// interleaving widths.
+    /// through the FULL scalar forward NTT. Covers rate 1/2 and 1/4 and both
+    /// interleaving widths; root equality pins commitment identity too.
     #[test]
     fn commit_matches_full_ntt_oracle() {
         use crate::ntt::AdditiveNttF128;
         let mut rng = Rng::new(0xFEED);
-        for (m, log_inv_rate, log_batch_size) in [(10, 1, 1), (12, 1, 2), (12, 2, 1), (14, 2, 3)] {
+        for (m, log_inv_rate, log_batch_size) in [
+            (10, 1, 1),
+            (12, 1, 2),
+            (12, 2, 1),
+            (14, 2, 3),
+            // Crosses PARALLEL_MSG_MIN and log_d's cache-blocked threshold,
+            // pinning the production iterator branches to the scalar oracle.
+            (23, 1, 3),
+        ] {
             let params = PcsParams {
                 m,
                 log_inv_rate,
@@ -418,7 +580,7 @@ mod tests {
             let mut oracle = vec![F128::ZERO; params.codeword_len_f128()];
             oracle[..z_packed.len()].copy_from_slice(&z_packed);
             let ntt = AdditiveNttF128::standard(params.k_code());
-            ntt.forward_transform_interleaved(&mut oracle, params.num_ntts());
+            ntt.forward_transform_interleaved_scalar(&mut oracle, params.num_ntts());
 
             assert_eq!(
                 pd.codeword, oracle,

@@ -16,8 +16,7 @@ use std::{
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Aggregate encoded bytes of large responses that may be resident while
-/// being prepared, queued, or written.  This admits one maximum proof-native
-/// block plus bounded state/history traffic without scaling with peer count.
+/// being prepared, queued, or written, without scaling with peer count.
 pub const OUTBOUND_RESPONSE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
 pub(crate) type OutboundMemoryPermit = Arc<OwnedSemaphorePermit>;

@@ -11,7 +11,6 @@ use noid_core::field::{CanonicalDeserialize, CanonicalSerialize, TowerField};
 use noid_core::Block128;
 
 use crate::block_header::BlockHeader;
-use crate::checkpoint::{CheckpointCoverage, ImmutableCheckpointPackage};
 use crate::consensus::da_prune::BlockUndoLog;
 use crate::consensus::params::{BLOCK_MAX_ACTIONS, BLOCK_MAX_TXS};
 use crate::fri_state::SlotValue;
@@ -457,22 +456,6 @@ pub fn decode_chain_work(bytes: &[u8]) -> Option<[u8; 32]> {
     bytes.try_into().ok()
 }
 
-pub fn encode_checkpoint_package(package: &ImmutableCheckpointPackage) -> Vec<u8> {
-    bincode::serialize(package).expect("ImmutableCheckpointPackage serialization must succeed")
-}
-
-pub fn decode_checkpoint_package(bytes: &[u8]) -> Option<ImmutableCheckpointPackage> {
-    bincode::deserialize(bytes).ok()
-}
-
-pub fn encode_checkpoint_coverage(coverage: &CheckpointCoverage) -> Vec<u8> {
-    bincode::serialize(coverage).expect("CheckpointCoverage serialization must succeed")
-}
-
-pub fn decode_checkpoint_coverage(bytes: &[u8]) -> Option<CheckpointCoverage> {
-    bincode::deserialize(bytes).ok()
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -506,7 +489,6 @@ mod tests {
             log_slots: 24,
             active_slot_count: 100,
             alloc_counter: 200,
-            attested_coverage: 0,
         };
         let bytes = encode_header(&h);
         assert_eq!(bytes.len(), BLOCK_HEADER_WIRE_SIZE);

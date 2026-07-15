@@ -536,10 +536,18 @@ pub fn prove_column_relation<Ch: Challenger>(
         claim = horner_round(&full, r);
         point.push(r);
         rounds.push(wire);
-        fold_table_reuse(&mut eq, &mut eq_scratch, r);
-        for (table, scratch) in tables.iter_mut().zip(&mut table_scratch) {
-            fold_table_reuse(table, scratch, r);
-        }
+        // Every relation table folds at the same challenge and is otherwise
+        // independent. One outer parallel pass avoids a Rayon barrier per
+        // reference while retaining each indexed fold's exact order.
+        rayon::join(
+            || fold_table_reuse(&mut eq, &mut eq_scratch, r),
+            || {
+                tables
+                    .par_iter_mut()
+                    .zip(&mut table_scratch)
+                    .for_each(|(table, scratch)| fold_table_reuse(table, scratch, r));
+            },
+        );
     }
 
     // Only claimed refs travel; Fixed values are verifier-computed.
@@ -771,8 +779,10 @@ pub fn prove_shift_discharge_pow2<Ch: Challenger>(
         claim = (full[2] * r + full[1]) * r + full[0];
         point.push(r);
         rounds.push(wire);
-        fold_table_reuse(&mut n_table, &mut n_scratch, r);
-        fold_table_reuse(&mut col_table, &mut col_scratch, r);
+        rayon::join(
+            || fold_table_reuse(&mut n_table, &mut n_scratch, r),
+            || fold_table_reuse(&mut col_table, &mut col_scratch, r),
+        );
     }
 
     let final_value = col_table[0];
@@ -921,8 +931,10 @@ pub fn prove_weighted_sum<Ch: Challenger>(
         claim = (full[2] * r + full[1]) * r + full[0];
         point.push(r);
         rounds.push(wire);
-        fold_table_reuse(&mut wt, &mut wt_scratch, r);
-        fold_table_reuse(&mut col_t, &mut col_scratch, r);
+        rayon::join(
+            || fold_table_reuse(&mut wt, &mut wt_scratch, r),
+            || fold_table_reuse(&mut col_t, &mut col_scratch, r),
+        );
     }
     let final_value = col_t[0];
     challenger.observe_f128(final_value);

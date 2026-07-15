@@ -276,7 +276,11 @@ pub(crate) fn verify_duplex_region_walk_deferred_prefix_trace<'a, C: FsChannelOp
     let deferred = proof.authority().as_ref();
 
     context.observe_label(b, DUPLEX_SIDECAR_TRANSCRIPT_LABEL);
-    context.observe_bytes_const(b, &vk.transcript_digest());
+    crate::acceptance::trace::self_verify::observe_pinned_digest(
+        b,
+        context,
+        &vk.transcript_digest(),
+    );
     let prefix =
         verify_duplex_union_walk_prefix_trace(b, context, vk.w_log, &vk.fixed, &vk.refs, deferred)?;
     Ok(DuplexRegionTraceWalkContinuation {
@@ -344,7 +348,11 @@ pub fn verify_duplex_region_sidecar_trace_post_commit<C: FsChannelOps>(
     preflight_duplex_sidecar(vk, total_vars, proof)?;
 
     context.observe_label(b, DUPLEX_SIDECAR_TRANSCRIPT_LABEL);
-    context.observe_bytes_const(b, &vk.transcript_digest());
+    crate::acceptance::trace::self_verify::observe_pinned_digest(
+        b,
+        context,
+        &vk.transcript_digest(),
+    );
     let terminal = verify_duplex_union_proof_trace(
         b,
         context,

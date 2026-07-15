@@ -11,7 +11,7 @@ use std::time::Duration;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SyncPhase {
     HeaderDiskValidation,
-    SelectedTerminalProof,
+    HistoryStepTerminal,
     SnapshotState,
     RetainedSuffix,
 }
@@ -20,7 +20,7 @@ impl SyncPhase {
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::HeaderDiskValidation => "header_disk_validation",
-            Self::SelectedTerminalProof => "selected_terminal_proof",
+            Self::HistoryStepTerminal => "history_step_terminal",
             Self::SnapshotState => "snapshot_segment_stage_install",
             Self::RetainedSuffix => "retained_suffix_apply",
         }
@@ -29,7 +29,7 @@ impl SyncPhase {
     pub(crate) const fn scaling(self) -> &'static str {
         match self {
             Self::HeaderDiskValidation => "O(H)",
-            Self::SelectedTerminalProof => "O(1)",
+            Self::HistoryStepTerminal => "O(1)",
             Self::SnapshotState => "O(state)",
             Self::RetainedSuffix => "O(tail)",
         }
@@ -216,7 +216,7 @@ mod tests {
     #[test]
     fn terminal_measurement_is_an_independent_constant_phase() {
         let terminal = SyncPhaseMeasurement::new(
-            SyncPhase::SelectedTerminalProof,
+            SyncPhase::HistoryStepTerminal,
             1,
             61 * 1_024,
             Duration::from_millis(42),

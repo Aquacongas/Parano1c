@@ -276,7 +276,7 @@ fn build_state_delta_action_surface_in_domain<'a>(
             }
             // Every mint consumes one allocator increment; the coinbase's
             // unique live output stores the tagged height id instead of the
-            // allocator id (proof-gated coinbase maturity).
+            // allocator id (height-tagged coinbase identity).
             let next_alloc =
                 alloc_counter
                     .checked_add(1)

@@ -1,38 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! `BlockMiner` — the parallel PoW + block-certificate generation orchestrator.
+//! `BlockMiner` — phase-ordered block-production orchestrator.
 //!
-//! ## Parallel block production design
+//! ## Block production design
 //!
 //! ```text
 //! loop {
-//!   template = build_template(mempool, ctx)
-//!
-//!   ┌─────────────────────────┐   ┌─────────────────────────────────┐
-//!   │  PoW Search             │   │  Block certificate assembly    │
-//!   │  Poseidon2b POW nonce   │   │  build proof + sidecar          │
-//!   │  < difficulty_target    │   │  exact state + auth sidecar     │
-//!   └──────────┬──────────────┘   └──────────────┬──────────────────┘
-//!              │                                 │
-//!              └────────────┬────────────────────┘
-//!                           │ both complete
-//!                           ▼
-//!   seal(nonce, detached proof/object ids) → Block
-//!   apply_to_chain + broadcast via P2P
+//!   template + nonce-independent witness preparation
+//!   all-core PoW search
+//!   seal exact nonce/header
+//!   prove HistoryStep for the exact sealed block
+//!   atomic commit + broadcast
 //! }
 //! ```
 //!
-//! Internal miner uses separate Rayon pools for PoW and proving. By default it
-//! reserves one worker for adaptive-difficulty PoW and gives the remaining
-//! workers to the shared Block/Link/Verify proof pool; the transaction cap
-//! adapts to recent proof throughput instead of always trying to fill 256 txs.
+//! Internal mining has one Rayon pool containing every host-visible CPU. CPU
+//! heavy phases reuse that same pool in order; there is no permanent one-core
+//! PoW reservation and no independent prover pool. The transaction cap adapts
+//! to recent proof throughput instead of always trying to fill 256 txs.
 //! External miner mode disables internal PoW, so the node can spend its CPUs on
-//! template building, certificate assembly, validation, RPC, and P2P while miners run elsewhere.
+//! template and HistoryStep preparation, validation, RPC, and P2P while miners run elsewhere.
 //!
 //! Template refresh triggers (see run loop):
 //!   1. Heartbeat every `refresh_interval_secs` seconds (safety net)
-//!   2. First `TxAdmitted` while a coinbase-only no-proof block is being mined
+//!   2. First `TxAdmitted` while a coinbase-only template is being mined
 //!   3. New chain tip from P2P (block received or snapshot applied)
 
 use std::sync::{
@@ -44,56 +36,17 @@ use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, RwLock};
 use tokio::time::interval;
 
-use noid_chain::block::Block;
 use noid_chain::consensus::pow::block_id;
 use noid_chain::storage::MdbxChainContext;
-use noid_mempool::AsyncMempool;
+use noid_mempool::{AsyncMempool, MempoolEvent};
 use noid_poseidon2b::primitives::Address;
 
+use crate::block_production::{PreparedBlockAttempt, ProvedBlock};
 use crate::cpu_budget::{
-    configure_process_cpu_budget, install_process_proof_cpu, process_pow_pool, process_proof_pool,
+    configure_process_cpu_budget, install_history_step_phase_cpu, install_pow_phase_cpu,
     ProcessCpuBudgetMode,
 };
 use crate::template::{TemplateBuilder, TemplateChainSnapshot, TemplateRefreshTrigger};
-use crate::topology_gate::ProofTopologyGate;
-
-#[allow(clippy::too_many_arguments)]
-fn accepted_block_validation(
-    block: &Block,
-    parent: &noid_chain::BlockHeader,
-    prev_timestamps: &[u64],
-    prev_active_counts: &[u64],
-    anchor: &noid_chain::consensus::validation::AnchorInfo,
-    block_proof_bytes: &[u8],
-    block_auth_sidecar_bytes: &[u8],
-    artifacts: &noid_block::AcceptedBlockValidationArtifacts,
-    state_root: [u8; 32],
-) -> Result<noid_chain::AppliedBlockValidation, noid_block::FullValidationError> {
-    let post_validation = noid_block::accepted_block_post_validation_bundle(
-        block,
-        parent,
-        prev_timestamps,
-        prev_active_counts,
-        anchor,
-        block_proof_bytes,
-        block_auth_sidecar_bytes,
-        artifacts,
-    )?;
-    let record = noid_block::accepted_block_certificate_record(post_validation.acceptance_receipt)
-        .map_err(|error| {
-            noid_block::FullValidationError::Consensus(
-                noid_chain::consensus::ConsensusError::ShapeMismatch(format!(
-                    "accepted-block certificate record build failed: {error}"
-                )),
-            )
-        })?;
-    Ok(noid_chain::AppliedBlockValidation::new(
-        state_root,
-        bincode::serialize(&post_validation.history_claim_fields)
-            .expect("history claim fields serialize"),
-        bincode::serialize(&record).expect("accepted-block certificate record serializes"),
-    ))
-}
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -104,9 +57,6 @@ fn accepted_block_validation(
 pub struct MinerConfig {
     /// Address that receives the coinbase reward.
     pub miner_address: Address,
-    /// Number of Rayon threads for internal PoW search.
-    /// 0 = proof-latency default (one dedicated PoW worker).
-    pub mining_threads: usize,
     /// Safety-net heartbeat interval (seconds).
     ///
     /// Fires only if the miner has been stuck without a block for this long.
@@ -123,7 +73,6 @@ impl Default for MinerConfig {
     fn default() -> Self {
         Self {
             miner_address: Address([0u8; 32]),
-            mining_threads: 0,
             refresh_interval_secs: 75, // 5 × BLOCK_TIME; real triggers are sync_ready + TxAdmitted
         }
     }
@@ -140,27 +89,17 @@ impl MinerConfig {
 // Events
 // ---------------------------------------------------------------------------
 
-/// Events emitted by the miner for P2P broadcast, logging, RPC, and local
-/// finalized-history coverage.
+/// Events emitted by the miner for P2P broadcast and local status.
 #[derive(Debug, Clone)]
 pub enum MinerEvent {
-    /// New block found and sealed. Contains the sealed block bytes for P2P.
+    /// A complete block was proved and committed atomically.
     BlockFound {
         height: u64,
         hash: [u8; 32],
         n_txs: usize,
         pow_nonce: u128,
-        /// Serialized Block bytes for P2P broadcast.
-        block_bytes: Vec<u8>,
-        /// Serialized BlockProof bytes for P2P broadcast.
-        /// Empty for coinbase-only blocks.
-        block_proof_bytes: Vec<u8>,
-        /// Versioned selected-ZK authorization sidecar bytes carried as detached witness.
-        /// Empty for coinbase-only blocks.
-        block_auth_sidecar_bytes: Vec<u8>,
-        /// Serialized Link terminal envelope attesting the header's advanced
-        /// `attested_coverage`. Empty when the header keeps the parent's.
-        coverage_attestation_bytes: Vec<u8>,
+        /// The only network/storage representation of a non-genesis block.
+        bundle: noid_chain::AcceptedBlockBundle,
     },
     /// Template refreshed.
     TemplateRefreshed {
@@ -170,7 +109,7 @@ pub enum MinerEvent {
     },
     /// Mining cancelled (new P2P block or heartbeat).
     MiningCancelled { reason: String },
-    /// Block certificate assembly failed (non-fatal: block is abandoned, new template built).
+    /// Witness preparation or HistoryStep proving failed; the block is abandoned.
     ProveFailed { height: u64, error: String },
 }
 
@@ -184,14 +123,45 @@ fn adaptive_user_tx_limit(ms_per_tx_ewma: Option<f64>) -> usize {
         return 0;
     }
 
-    // Keep certificate work comfortably under the 15s consensus target. PoW
-    // runs in parallel, but a user-tx block still needs proof bytes before it
-    // can be sealed and propagated.
+    // Keep post-nonce HistoryStep work comfortably under the 15s target.
     let block_time_ms = noid_chain::consensus::params::BLOCK_TIME as f64 * 1_000.0;
     let budget_ms = (block_time_ms * 0.70).max(1_000.0);
     let ms_per_tx = ms_per_tx_ewma.unwrap_or(100.0).max(10.0);
     let cap = (budget_ms / ms_per_tx).floor() as usize;
     cap.clamp(1, consensus_max)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MiningMempoolRefresh {
+    TransactionAdmitted,
+    ReceiverLagged(u64),
+}
+
+/// Wait for a mempool event that can actually change a coinbase-only
+/// template. Confirmations and evictions emitted while applying our own block
+/// belong to the previous height and must not cancel fresh PoW on the next
+/// height.
+async fn next_mining_mempool_refresh(
+    receiver: &mut broadcast::Receiver<MempoolEvent>,
+) -> MiningMempoolRefresh {
+    loop {
+        match receiver.recv().await {
+            Ok(MempoolEvent::TxAdmitted { .. }) => {
+                return MiningMempoolRefresh::TransactionAdmitted;
+            }
+            Ok(
+                MempoolEvent::TxConfirmed { .. }
+                | MempoolEvent::TxEvicted { .. }
+                | MempoolEvent::TxAuthorizationVerified { .. },
+            ) => {}
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                return MiningMempoolRefresh::ReceiverLagged(skipped);
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                return std::future::pending().await;
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -220,8 +190,6 @@ pub struct BlockMiner {
     mempool: AsyncMempool,
     chain: Arc<RwLock<MdbxChainContext>>,
     events: broadcast::Sender<MinerEvent>,
-    pow_pool: Arc<rayon::ThreadPool>,
-    prove_pool: Arc<rayon::ThreadPool>,
     /// Cancel flag: set to abort current PoW search and restart.
     cancel_pow: Arc<AtomicBool>,
     /// Permanent stop flag: set only by stop(), never reset. The main loop
@@ -229,13 +197,9 @@ pub struct BlockMiner {
     stopped: Arc<AtomicBool>,
     /// Notified when the chain is sufficiently synced to begin mining.
     sync_ready: Arc<tokio::sync::Notify>,
-    /// Semaphore (1 permit) preventing concurrent certificate tasks from accumulating.
-    /// Each heartbeat/mempool refresh drops the JoinHandle but NOT the blocking task;
-    /// without this guard repeated refreshes can pile up blocking proof work.
-    prove_semaphore: Arc<tokio::sync::Semaphore>,
-    /// Shared proof-topology admission held for the complete lifetime of each
-    /// blocking proof job. It rejects conflicting work before Tokio queues it.
-    proof_topology_gate: ProofTopologyGate,
+    history_step_runtime: Arc<noid_recursive::acceptance::history_step::HistoryStepRuntime>,
+    ghost_authorization:
+        Arc<noid_recursive::acceptance::history_step::PreparedHistoryStepGhostAuthorization>,
     /// Optional hook called synchronously after block is applied to chain, before
     /// the mempool is updated. Used by the built-in wallet to generate receipts
     /// race-free (receipt ready before getMempoolSize → 0 is observable).
@@ -256,35 +220,33 @@ impl BlockMiner {
         mempool: AsyncMempool,
         chain: Arc<RwLock<MdbxChainContext>>,
         sync_ready: Arc<tokio::sync::Notify>,
+        history_step_runtime: Arc<noid_recursive::acceptance::history_step::HistoryStepRuntime>,
+        ghost_authorization: Arc<
+            noid_recursive::acceptance::history_step::PreparedHistoryStepGhostAuthorization,
+        >,
     ) -> (Self, broadcast::Receiver<MinerEvent>) {
         let (events, rx) = broadcast::channel(32);
-        let cpu_plan = configure_process_cpu_budget(ProcessCpuBudgetMode::InternalMiner {
-            mining_threads: config.mining_threads,
-        })
-        .unwrap_or_else(|error| panic!("invalid process CPU budget for internal miner: {error}"));
-        let mining_threads = cpu_plan.pow_threads;
-        let prover_threads = cpu_plan.proof_threads;
-        let proof_topology_gate = ProofTopologyGate::global();
-        tracing::info!(
-            mining_threads,
-            prover_threads,
-            "internal miner CPU budget and proof-stage topology configured"
+        let cpu_plan = configure_process_cpu_budget(ProcessCpuBudgetMode::InternalMiner)
+            .unwrap_or_else(|error| {
+                panic!("invalid process CPU budget for internal miner: {error}")
+            });
+        let pow_threads = cpu_plan.pow_phase_threads;
+        let history_step_threads = cpu_plan.history_step_phase_threads;
+        tracing::debug!(
+            pow_threads,
+            history_step_threads,
+            "internal miner all-core PoW and HistoryStep pool configured"
         );
         let miner = Self {
             config,
             mempool,
             chain,
             events,
-            pow_pool: process_pow_pool()
-                .expect("process CPU budget was configured immediately above")
-                .expect("internal miner CPU plan has a PoW pool"),
-            prove_pool: process_proof_pool()
-                .expect("process CPU budget was configured immediately above"),
             cancel_pow: Arc::new(AtomicBool::new(false)),
             stopped: Arc::new(AtomicBool::new(false)),
             sync_ready,
-            prove_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
-            proof_topology_gate,
+            history_step_runtime,
+            ghost_authorization,
             on_block_applied: None,
             payout_resolver: None,
             chain_operation_gate: None,
@@ -306,7 +268,7 @@ impl BlockMiner {
 
     /// Serialize template capture and canonical apply with node-wide snapshot
     /// and reorg replacement. The gate is held only while shared boundaries
-    /// are captured/updated, never while certificate proving or PoW runs.
+    /// are captured/updated, never while HistoryStep proving or PoW runs.
     pub fn set_chain_operation_gate(&mut self, gate: ChainOperationGate) {
         self.chain_operation_gate = Some(gate);
     }
@@ -397,7 +359,7 @@ impl BlockMiner {
         let cancel = self.cancel_pow.clone();
         let mut heartbeat = interval(Duration::from_secs(self.config.refresh_interval_secs));
         let mut mempool_events = self.mempool.subscribe();
-        let mut prove_ms_per_tx_ewma: Option<f64> = None;
+        let mut history_step_ms_per_tx_ewma: Option<f64> = None;
 
         tracing::debug!("BlockMiner started");
 
@@ -438,12 +400,9 @@ impl BlockMiner {
                     continue;
                 }
             };
-            let prev_state_root = snapshot.prev_state_root();
-            let topology_user_tx_limit = self.proof_topology_gate.max_user_txs_now();
-            let max_user_txs =
-                adaptive_user_tx_limit(prove_ms_per_tx_ewma).min(topology_user_tx_limit);
+            let max_user_txs = adaptive_user_tx_limit(history_step_ms_per_tx_ewma);
             let tmpl = match builder
-                .build_from_snapshot_with_limit(&snapshot, addr, now, max_user_txs)
+                .build_from_snapshot_with_limit(snapshot, addr, now, max_user_txs)
                 .await
             {
                 Some(t) => t,
@@ -466,104 +425,82 @@ impl BlockMiner {
                 height,
                 n_txs,
                 max_user_txs,
-                topology_user_tx_limit,
-                prove_ms_per_tx_ewma,
+                history_step_ms_per_tx_ewma,
                 "mining template ready"
             );
 
-            // Track when PoW search started so we can report solve time.
-            let pow_start = std::time::Instant::now();
-            // The heartbeat is a per-template safety net. Reset it here so an old
-            // interval tick from a long previous search cannot cancel a fresh
-            // user-transaction template and force the same block proof to be rebuilt.
-            heartbeat.reset();
-
-            cancel.store(false, Ordering::Relaxed);
-
-            // Track when prove completes. Coinbase-only blocks have no proof; on the
-            // first admitted tx we cancel their PoW search and rebuild immediately. For
-            // user-tx templates we intentionally do not listen to later mempool events:
-            // dropping the JoinHandle would not cancel spawn_blocking proof work and would
-            // wastefully rebuild the same block proof in the next loop.
-            let prove_done = Arc::new(AtomicBool::new(false));
-            let prove_done_clone = prove_done.clone();
-
-            // --- Parallel: PoW + certificate assembly ---
-            // Extract only the PoW header so PoW never depends on detached
-            // proof/sidecar witness bytes.
-            let pow_header = tmpl.header_for_pow(0);
-            let tmpl = Arc::new(tmpl);
-            let tmpl_prove = tmpl.clone();
-            let cancel_pow = cancel.clone();
-            let pow_pool = self.pow_pool.clone();
-            let prove_pool = self.prove_pool.clone();
-
-            // Try to acquire the single-permit prove semaphore.
-            // spawn_blocking tasks are NOT cancelled when JoinHandles are dropped;
-            // without this guard repeated refreshes can accumulate blocking
-            // proof work and saturate CPU cores.
-            let prove_permit = self.prove_semaphore.clone().try_acquire_owned();
-
-            // If the semaphore is already held and the template has user txs we
-            // cannot legally seal without a block proof — skip this iteration and wait for
-            // the running prove to release the permit.
-            if prove_permit.is_err() && tmpl.n_user_txs() > 0 {
-                tracing::debug!(
-                    height,
-                    "prove task busy and block has user txs — skipping this template iteration"
-                );
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                continue;
-            }
-
-            // PoW: Poseidon2b over semantic header fields, CPU-bound via the dedicated PoW Rayon pool.
-            let pow_handle = tokio::task::spawn_blocking(move || {
-                pow_pool.install(|| crate::pow::search_pow_parallel(&pow_header, &cancel_pow))
+            let expected_parent_height = tmpl.parent.height;
+            let expected_parent_hash = block_id(&tmpl.parent);
+            let prepare_runtime = Arc::clone(&self.history_step_runtime);
+            let prepare_ghost = Arc::clone(&self.ghost_authorization);
+            let prepare_handle = tokio::task::spawn_blocking(move || {
+                let started = Instant::now();
+                let result = install_history_step_phase_cpu(|| {
+                    PreparedBlockAttempt::prepare(tmpl, &prepare_runtime, &prepare_ghost, now)
+                })
+                .map_err(|error| format!("HistoryStep preparation CPU phase: {error}"))
+                .and_then(|result| result);
+                (result, started.elapsed())
             });
-
-            // Certificate assembly: run for real (permit held until done) or return
-            // empty detached witness bytes for coinbase-only blocks when the prove slot is occupied.
-            let prove_handle = match prove_permit {
-                Ok(permit) => tokio::task::spawn_blocking(move || {
-                    // Run prove inside a scope so the semaphore permit is released
-                    // BEFORE we set prove_done. This guarantees: when the miner loop
-                    // sees prove_done=true, the semaphore is already free for the next
-                    // template rebuild.
-                    let started = Instant::now();
-                    let result = {
-                        let _permit = permit;
-                        prove_pool.install(|| run_prove_block(&tmpl_prove, prev_state_root))
-                    };
-                    let elapsed = started.elapsed();
-                    prove_done_clone.store(true, Ordering::Release);
-                    (result, elapsed)
-                }),
-                Err(_) => {
-                    // Semaphore busy, but coinbase-only block — no proof is required.
-                    tracing::debug!(
+            let (attempt, prepare_elapsed) = match prepare_handle.await {
+                Ok((Ok(attempt), elapsed)) => (attempt, elapsed),
+                Ok((Err(error), elapsed)) => {
+                    tracing::error!(
                         height,
-                        "prove task busy, coinbase-only block will carry no proof"
+                        prepare_ms = elapsed.as_millis(),
+                        %error,
+                        "HistoryStep witness preparation failed"
                     );
-                    tokio::task::spawn_blocking(move || {
-                        // Empty detached witness is instant; mark prove_done so TxAdmitted can trigger rebuild.
-                        prove_done_clone.store(true, Ordering::Release);
-                        (Ok((vec![], vec![])), Duration::ZERO)
-                    })
+                    let _ = self.events.send(MinerEvent::ProveFailed { height, error });
+                    continue;
+                }
+                Err(error) => {
+                    tracing::error!(height, ?error, "HistoryStep preparation task panicked");
+                    continue;
                 }
             };
 
-            // Wait for both (or cancel from heartbeat/mempool).
+            let user_txs = attempt.user_transaction_count();
+
+            // Preparation may be expensive. Refuse to spend PoW on a parent
+            // that was replaced while it ran; the final commit repeats this
+            // exact-parent check under the canonical write lock.
+            let parent_is_still_tip = {
+                let context = self.chain.read().await;
+                context.tip_height() == expected_parent_height
+                    && block_id(context.tip_header()) == expected_parent_hash
+            };
+            if !parent_is_still_tip {
+                tracing::debug!(height, "prepared template parent changed before PoW");
+                continue;
+            }
+
+            tracing::info!(
+                height,
+                txs = n_txs,
+                user_txs,
+                prepare_ms = prepare_elapsed.as_millis(),
+                "mining complete block"
+            );
+
+            // Phase 2: all workers search the fixed semantic header.
+            // HistoryStep proving begins only after a winning nonce exists.
+            let pow_header = attempt.pow_header(0);
+            let cancel_pow = Arc::clone(&cancel);
+            cancel.store(false, Ordering::Relaxed);
+            heartbeat.reset();
+            let pow_start = Instant::now();
+            let mut pow_handle = tokio::task::spawn_blocking(move || {
+                install_pow_phase_cpu(|| crate::pow::search_pow_parallel(&pow_header, &cancel_pow))
+            });
+
             tokio::select! {
-                (pow_res, prove_res) = async {
-                    let p = pow_handle.await;
-                    let r = prove_handle.await;
-                    (p, r)
-                } => {
-                    match (pow_res, prove_res) {
-                        (Ok(Some(sol)), Ok((Ok((block_proof_bytes, block_auth_sidecar_bytes)), prove_elapsed))) => {
-                            let block = tmpl.seal(sol.nonce);
-                            let block_bytes = block.to_bytes();
-                            let hash = block_id(&block.header);
+                pow_res = &mut pow_handle => {
+                    match pow_res {
+                        Ok(Ok(Some(sol))) => {
+                            let nonce_found_at = Instant::now();
+                            let sealed_header = attempt.pow_header(sol.nonce);
+                            let hash = block_id(&sealed_header);
                             let elapsed = pow_start.elapsed();
                             let elapsed_s = elapsed.as_secs_f64();
 
@@ -572,7 +509,7 @@ impl BlockMiner {
                             // Genesis = 27lz. ASERT raises this when blocks arrive faster
                             // than BLOCK_TIME (15s) and lowers it when they're slower.
                             let diff_lz: u32 = {
-                                let t = &block.header.difficulty_target;
+                                let t = &sealed_header.difficulty_target;
                                 let mut lz = 0u32;
                                 for i in (0..32).rev() {
                                     if t[i] == 0 { lz += 8; }
@@ -581,79 +518,119 @@ impl BlockMiner {
                                 lz
                             };
 
-                            let user_txs = tmpl.n_user_txs();
-                            if user_txs > 0 && prove_elapsed > Duration::ZERO {
-                                let sample = prove_elapsed.as_secs_f64() * 1_000.0 / user_txs as f64;
-                                prove_ms_per_tx_ewma = Some(match prove_ms_per_tx_ewma {
-                                    Some(prev) => prev * 0.75 + sample * 0.25,
-                                    None => sample,
-                                });
-                            }
-                            tracing::info!(
+                            tracing::debug!(
                                 height,
                                 hash = %hex::encode(hash),
                                 n_txs,
-                                prove_ms = prove_elapsed.as_millis(),
-                                prove_ms_per_tx_ewma,
-                                time = %format!("{elapsed_s:.2}s"),
+                                prepare_ms = prepare_elapsed.as_millis(),
+                                history_step_ms_per_tx_ewma,
+                                pow_time = %format!("{elapsed_s:.2}s"),
                                 diff = %format!("lz{diff_lz}"),
-                                "block found"
+                                "PoW nonce found; proving HistoryStep"
                             );
+
+                            let prove_runtime = Arc::clone(&self.history_step_runtime);
+                            let prove_handle = tokio::task::spawn_blocking(move || {
+                                let started = Instant::now();
+                                let result = install_history_step_phase_cpu(|| {
+                                    attempt.prove(&prove_runtime, sol.nonce)
+                                })
+                                .map_err(|error| format!("HistoryStep prove CPU phase: {error}"))
+                                .and_then(|result| result);
+                                (result, started.elapsed())
+                            });
+                            let (proved, history_step_elapsed) = match prove_handle.await {
+                                Ok((Ok(proved), elapsed)) => (proved, elapsed),
+                                Ok((Err(error), elapsed)) => {
+                                    tracing::error!(
+                                        height,
+                                        history_step_ms = elapsed.as_millis(),
+                                        %error,
+                                        "HistoryStep proving failed"
+                                    );
+                                    let _ = self.events.send(MinerEvent::ProveFailed { height, error });
+                                    continue;
+                                }
+                                Err(error) => {
+                                    tracing::error!(height, ?error, "HistoryStep proving task panicked");
+                                    continue;
+                                }
+                            };
+
+                            if user_txs > 0 && history_step_elapsed > Duration::ZERO {
+                                let sample = history_step_elapsed.as_secs_f64() * 1_000.0
+                                    / user_txs as f64;
+                                history_step_ms_per_tx_ewma = Some(match history_step_ms_per_tx_ewma {
+                                    Some(previous) => previous * 0.75 + sample * 0.25,
+                                    None => sample,
+                                });
+                            }
 
                             // IMPORTANT: apply and store the block FIRST, THEN fire the event.
                             // The announcement triggers peers to request the block immediately;
                             // if we fire the event before storing, a fast peer gets None.
-                            if let Err(e) = self.apply_found_block(&block, &block_proof_bytes, &block_auth_sidecar_bytes, &tmpl.coverage_attestation_bytes).await {
-                                tracing::warn!(height, "miner: block superseded (reorg in progress): {e}");
-                                continue;
-                            }
+                            let proved = match self.apply_found_block(proved).await {
+                                Ok(proved) => proved,
+                                Err(error) => {
+                                    tracing::warn!(height, "miner: block superseded: {error}");
+                                    continue;
+                                }
+                            };
+                            tracing::info!(
+                                height,
+                                hash = %hex::encode(hash),
+                                txs = n_txs,
+                                pow_ms = elapsed.as_millis(),
+                                history_step_ms = history_step_elapsed.as_millis(),
+                                nonce_to_commit_ms = nonce_found_at.elapsed().as_millis(),
+                                "block accepted"
+                            );
 
-                            // Now safe to announce — block and proof are in MDBX.
+                            // Now safe to announce: the complete bundle is durable.
                             let _ = self.events.send(MinerEvent::BlockFound {
                                 height,
                                 hash,
                                 n_txs,
                                 pow_nonce: sol.nonce,
-                                block_bytes: block_bytes.clone(),
-                                block_proof_bytes: block_proof_bytes.clone(),
-                                block_auth_sidecar_bytes: block_auth_sidecar_bytes.clone(),
-                                coverage_attestation_bytes: tmpl.coverage_attestation_bytes.clone(),
+                                bundle: proved.into_parts().1,
                             });
                         }
-                        (Ok(Some(_sol)), Ok((Err(e), prove_elapsed))) => {
-                            // PoW succeeded but proof failed — abandon block.
-                            tracing::error!(prove_ms = prove_elapsed.as_millis(), "prove_block failed at height {height}: {e}");
-                            let _ = self.events.send(MinerEvent::ProveFailed {
-                                height,
-                                error: e,
-                            });
-                        }
-                        (Ok(None), _) => {
+                        Ok(Ok(None)) => {
                             // PoW cancelled.
                             let _ = self.events.send(MinerEvent::MiningCancelled {
                                 reason: "cancelled".into(),
                             });
                         }
-                        (Err(e), _) | (_, Err(e)) => {
-                            tracing::error!("task panicked: {:?}", e);
+                        Ok(Err(error)) => {
+                            tracing::error!(height, %error, "PoW CPU admission failed");
+                        }
+                        Err(error) => {
+                            tracing::error!(height, ?error, "PoW task panicked");
                         }
                     }
                 }
 
-                _ = heartbeat.tick(), if tmpl.n_user_txs() == 0 => {
+                _ = heartbeat.tick(), if user_txs == 0 => {
                     cancel.store(true, Ordering::Relaxed);
+                    let _ = pow_handle.await;
                     tracing::debug!("heartbeat: refreshing coinbase-only template (safety net)");
                 }
 
-                event = mempool_events.recv(), if tmpl.n_user_txs() == 0 => {
-                    if let Ok(noid_mempool::MempoolEvent::TxAdmitted { .. }) = event {
-                        // Coinbase-only templates have no validation witness. Cancel PoW
-                        // immediately so the first admitted user transaction is not
-                        // delayed by an empty block. If the empty proof task has not set
-                        // prove_done yet, dropping its JoinHandle is still harmless.
-                        let empty_proof_done = prove_done.load(Ordering::Acquire);
-                        cancel.store(true, Ordering::Relaxed);
-                        tracing::debug!(empty_proof_done, "coinbase-only template: new tx admitted, cancelling PoW for immediate inclusion");
+                refresh = next_mining_mempool_refresh(&mut mempool_events), if user_txs == 0 => {
+                    // No blocking PoW task may escape this select branch. A
+                    // new transaction must be included immediately. Lag is
+                    // conservative because the missed range may contain an
+                    // admission; previous-height confirmations are filtered
+                    // inside `next_mining_mempool_refresh`.
+                    cancel.store(true, Ordering::Relaxed);
+                    let _ = pow_handle.await;
+                    match refresh {
+                        MiningMempoolRefresh::TransactionAdmitted => {
+                            tracing::debug!("coinbase-only template: new tx admitted, cancelling PoW for immediate inclusion");
+                        }
+                        MiningMempoolRefresh::ReceiverLagged(skipped) => {
+                            tracing::debug!(skipped, "coinbase-only template: mempool receiver lagged, rebuilding after PoW drain");
+                        }
                     }
                 }
 
@@ -661,6 +638,7 @@ impl BlockMiner {
                     // A new chain tip is available (P2P block applied or snapshot synced).
                     // Cancel current PoW so the next iteration mines on the correct tip.
                     cancel.store(true, Ordering::Relaxed);
+                    let _ = pow_handle.await;
                     tracing::debug!("sync_ready: new chain tip, cancelling PoW to rebuild");
                 }
             }
@@ -676,11 +654,8 @@ impl BlockMiner {
     /// is already exclusive) and eliminates a separate ~50ms read lock.
     async fn apply_found_block(
         &self,
-        block: &Block,
-        block_proof_bytes: &[u8],
-        block_auth_sidecar_bytes: &[u8],
-        coverage_attestation_bytes: &[u8],
-    ) -> anyhow::Result<()> {
+        proved: ProvedBlock,
+    ) -> anyhow::Result<crate::block_production::CommittedBlock> {
         use noid_mempool::ChainView;
 
         // Snapshot installation retains this gate from before its atomic MDBX
@@ -692,11 +667,6 @@ impl BlockMiner {
             None => None,
         };
 
-        let local_time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
         // --- MDBX commit + ChainView build off the async executor ---
         //
         // SyncMode::Durable means commit_block issues fsync before returning —
@@ -705,101 +675,17 @@ impl BlockMiner {
         // still held, preserving the original "hook before mempool" ordering.
         // ChainView is built inside the write lock (no added contention since
         // the lock is already exclusive).
-        let new_view = {
+        let (new_view, committed) = {
             let chain_clone = self.chain.clone();
-            let block_owned = block.clone();
-            let proof_bytes = block_proof_bytes.to_vec();
-            let auth_sidecar_bytes = block_auth_sidecar_bytes.to_vec();
-            let attestation_bytes = coverage_attestation_bytes.to_vec();
             let hook = self.on_block_applied.clone();
             tokio::task::spawn_blocking(move || {
                 let mut ctx = chain_clone.blocking_write();
-                // The attached envelope was loaded from the local durable
-                // results store, whose entries are natively verified before
-                // promotion/import. Re-checking byte-exact identity against
-                // that store (bound to the canonical header at C) is the
-                // miner's fail-closed equivalent of full re-verification.
-                let attestation_store = ctx.store.clone();
-                ctx.apply_next_block(
-                    &block_owned,
-                    &proof_bytes,
-                    &auth_sidecar_bytes,
-                    &attestation_bytes,
-                    local_time,
-                    |block,
-                     proof_bytes,
-                     auth_sidecar_bytes,
-                     parent,
-                     prev_timestamps,
-                     prev_active_counts,
-                     local_time,
-                     tx_epoch_anchor_id,
-                     anchor,
-                     state| {
-                        install_process_proof_cpu(|| {
-                            let tx_epoch = noid_block::BlockTxEpochContext {
-                                expected_user_epoch_anchor_id: *tx_epoch_anchor_id,
-                            };
-                            let output = noid_block::accept_block_with_artifacts(
-                                block,
-                                proof_bytes,
-                                auth_sidecar_bytes,
-                                parent,
-                                prev_timestamps,
-                                prev_active_counts,
-                                local_time,
-                                &tx_epoch,
-                                anchor,
-                                state,
-                            )?;
-                            accepted_block_validation(
-                                block,
-                                parent,
-                                prev_timestamps,
-                                prev_active_counts,
-                                anchor,
-                                proof_bytes,
-                                auth_sidecar_bytes,
-                                &output.artifacts,
-                                output.state_root,
-                            )
-                        })
-                        .map_err(|error| {
-                            noid_block::FullValidationError::Consensus(
-                                noid_chain::consensus::ConsensusError::ShapeMismatch(format!(
-                                    "process proof CPU admission failed: {error}"
-                                )),
-                            )
-                        })?
-                    },
-                    |claim| {
-                        let expected = attestation_store
-                            .get_selected_history_terminal_result_at(
-                                claim.coverage_height,
-                                noid_chain::hash_block_header(&claim.header_at_coverage),
-                            )
-                            .map_err(|error| {
-                                format!(
-                                    "durable terminal read failed at attested coverage: {error}"
-                                )
-                            })?
-                            .ok_or_else(|| {
-                                "no durable verified terminal at the attested coverage".to_string()
-                            })?;
-                        if expected.bytes != claim.attestation_bytes {
-                            return Err(
-                                "attached attestation differs from the durable verified terminal"
-                                    .to_string(),
-                            );
-                        }
-                        Ok(())
-                    },
-                )?;
+                let committed = proved.commit(&mut ctx)?;
                 if let Some(h) = &hook {
-                    h(&block_owned);
+                    h(committed.block());
                 }
                 let view = ChainView::from_mdbx(&ctx);
-                Ok::<ChainView, noid_chain::storage::MdbxContextError>(view)
+                Ok::<_, noid_chain::storage::MdbxContextError>((view, committed))
             })
             .await
             .expect("apply_next_block panicked in spawn_blocking")
@@ -807,106 +693,15 @@ impl BlockMiner {
         };
 
         // --- Update mempool (no chain lock held) ---
+        let block = committed.block();
         let confirmed: Vec<_> = block.transactions.iter().map(|tx| tx.txid()).collect();
         self.mempool
             .on_new_block(&confirmed, block.header.height, new_view)
             .await;
         drop(chain_operation);
 
-        Ok(())
+        Ok(committed)
     }
-}
-
-// ---------------------------------------------------------------------------
-// Block certificate assembly (CPU-bound, called inside spawn_blocking)
-// ---------------------------------------------------------------------------
-
-/// Run `prove_block` with the witnesses from the template's transactions.
-///
-/// Returns `(proof_bytes, auth_sidecar_bytes)` on success.
-///
-/// # Correctness
-///
-/// This uses the `WalletAuthorizationBundle` borrowed from each retained
-/// immutable mempool intent and copied only for the bounded selected template.
-///
-/// # State correctness
-///
-/// Production block validity is proof-native: every user-transaction block must
-/// include an exact authenticated state transition proof for the header
-/// state-root transition. The live node/miner verify the minimal block proof
-/// and then commit the proven transition via the single `apply_next_block` path.
-pub(crate) fn run_prove_block(
-    tmpl: &crate::template::BlockTemplate,
-    prev_state_root: [u8; 32],
-) -> Result<crate::ProvedBlockParts, String> {
-    use noid_block::{BlockAuthSidecar, BlockProof};
-    use noid_gkr::{verify_wallet_authorization, WalletAuthorizationBundle};
-
-    // Coinbase-only: no block certificate needed.
-    let non_cb_count = tmpl.n_user_txs();
-    if non_cb_count == 0 {
-        tracing::debug!(
-            height = tmpl.inner.height,
-            "coinbase-only block — no block proof required"
-        );
-        return Ok((vec![], vec![]));
-    }
-    // This owning reservation deliberately remains in scope through every
-    // decode/verify/assembly return and through unwind. Template clones share
-    // one Option, so no second native proof can cross this edge.
-    let _proof_topology_reservation = tmpl
-        .take_proof_topology_reservation()
-        .ok_or_else(|| "unadmitted or already-consumed proof template rejected".to_string())?;
-
-    let mut bundles: Vec<WalletAuthorizationBundle> = Vec::with_capacity(non_cb_count);
-    for (idx, opt) in tmpl.authorization_bytes.iter().enumerate() {
-        let bytes = opt.as_ref().ok_or_else(|| {
-            format!(
-                "missing WalletAuthorizationBundle for non-coinbase tx index {idx} — will retry coinbase-only"
-            )
-        })?;
-        let bundle = WalletAuthorizationBundle::from_bytes(bytes).map_err(|e| {
-            format!("WalletAuthorizationBundle decode failed at tx index {idx}: {e}")
-        })?;
-        verify_wallet_authorization(&tmpl.inner.txs[idx].body, &bundle).map_err(|e| {
-            format!("WalletAuthorizationBundle verify failed at tx index {idx}: {e}")
-        })?;
-        bundles.push(bundle);
-    }
-    if bundles.len() != non_cb_count {
-        return Err(format!(
-            "authorization bundle count mismatch: have {}, need {}",
-            bundles.len(),
-            non_cb_count,
-        ));
-    }
-
-    let auth_sidecar = BlockAuthSidecar {
-        tx_auth: bundles.into_iter().map(|bundle| bundle.proof).collect(),
-    };
-    let auth_sidecar_bytes = auth_sidecar
-        .to_bytes()
-        .map_err(|e| format!("BlockAuthSidecar serialize failed: {e}"))?;
-
-    let n_tx = tmpl.n_user_txs() as u32;
-    let new_state_root = tmpl.inner.state_root;
-    let exact_state_transition = tmpl.exact_state_transition.clone().ok_or_else(|| {
-        "user-transaction template is missing ExactStateTransitionProof".to_string()
-    })?;
-    let block_proof = BlockProof::minimal(
-        prev_state_root,
-        new_state_root,
-        n_tx,
-        exact_state_transition,
-    );
-    let proof_bytes = bincode::serialize(&block_proof).unwrap_or_default();
-    tracing::info!(
-        proof_bytes = proof_bytes.len(),
-        auth_sidecar_bytes = auth_sidecar_bytes.len(),
-        "prove_block succeeded"
-    );
-    Ok((proof_bytes, auth_sidecar_bytes))
 }
 
 #[cfg(test)]
@@ -935,62 +730,41 @@ mod tests {
         );
     }
 
-    #[test]
-    fn local_acceptance_and_template_exact_state_share_process_proof_pool() {
-        let miner = include_str!("miner.rs")
-            .split_once("async fn apply_found_block(")
-            .expect("local accepted-block path exists")
-            .1
-            .split_once("// Block certificate assembly")
-            .expect("certificate assembly follows local apply")
-            .0;
-        let local_pool = miner
-            .find("install_process_proof_cpu(||")
-            .expect("local acceptance installs the process proof pool");
-        let local_accept = miner
-            .find("noid_block::accept_block_with_artifacts(")
-            .expect("local acceptance verifies the mined block");
-        let local_post = miner
-            .find("accepted_block_validation(")
-            .expect("local acceptance builds post-validation artifacts");
-        let local_coverage = miner
-            .find("|claim|")
-            .expect("coverage remains a separate apply callback");
-        assert!(local_pool < local_accept);
-        assert!(local_accept < local_post);
-        assert!(local_post < local_coverage);
-        assert!(miner.contains("process proof CPU admission failed: {error}"));
+    #[tokio::test]
+    async fn previous_height_confirmation_does_not_cancel_fresh_pow() {
+        let (sender, mut receiver) = broadcast::channel(8);
+        sender
+            .send(MempoolEvent::TxConfirmed {
+                hash: noid_poseidon2b::primitives::TxBodyHash([0x11; 32]),
+                block_height: 1,
+            })
+            .unwrap();
 
-        let template = include_str!("template.rs")
-            .split_once("pub async fn build_from_snapshot_with_limit(")
-            .expect("template build path exists")
-            .1
-            .split_once("#[cfg(test)]")
-            .expect("template build path has a bounded source section")
-            .0;
-        let hydration = template
-            .find("snapshot.hydrate_coinbase_allocator_segments(&mut state)")
-            .expect("template hydrates allocator segments");
-        let template_pool = template
-            .find("let template_cpu_result = install_process_proof_cpu(||")
-            .expect("template CPU phase installs the process proof pool");
-        let build = template
-            .find("build_block_template_with_coverage(")
-            .expect("template CPU phase builds the chain template");
-        let surface = template
-            .find("noid_chain::build_exact_action_surface(")
-            .expect("template CPU phase builds the exact action surface");
-        let frontier = template
-            .find(".exact_frontier_siblings(")
-            .expect("template CPU phase builds the exact frontier");
-        let proof = template
-            .find("noid_block::build_exact_state_transition_proof_from_siblings(")
-            .expect("template CPU phase builds the exact-state proof");
-        assert!(hydration < template_pool);
-        assert!(template_pool < build);
-        assert!(build < surface);
-        assert!(surface < frontier);
-        assert!(frontier < proof);
-        assert!(template.contains("template exact-state CPU admission failed closed"));
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                next_mining_mempool_refresh(&mut receiver),
+            )
+            .await
+            .is_err(),
+            "a confirmation from our own previous block must be ignored",
+        );
+
+        sender
+            .send(MempoolEvent::TxAdmitted {
+                hash: noid_poseidon2b::primitives::TxBodyHash([0x22; 32]),
+                fee: 1,
+                intent_bytes: Arc::from(Vec::<u8>::new().into_boxed_slice()),
+            })
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                next_mining_mempool_refresh(&mut receiver),
+            )
+            .await
+            .unwrap(),
+            MiningMempoolRefresh::TransactionAdmitted,
+        );
     }
 }

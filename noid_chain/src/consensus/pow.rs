@@ -6,7 +6,7 @@
 //! The mining digest is a fixed-field Poseidon2b sponge over the semantic
 //! header fields, under the dedicated `POWHDR__` capacity IV.
 //!
-//! The absorbed field schedule is fixed at 18 `Block128` elements:
+//! The absorbed field schedule is fixed at 16 `Block128` elements:
 //!
 //! ```text
 //! prev_block_hash       2 fields
@@ -20,16 +20,11 @@
 //! log_slots             1 field   zero-extended LE u32
 //! active_slot_count     1 field   zero-extended LE u64
 //! alloc_counter         1 field   zero-extended LE u64
-//! attested_coverage     1 field   zero-extended LE u64
-//! reserved              1 field   constant zero (rate alignment)
 //! ```
 //!
-//! With Poseidon2b `rate = 2`, this is exactly nine rate blocks and uses
-//! `finalize_no_pad()`. The trailing reserved zero field keeps the fixed
-//! schedule rate-aligned; it is safe because the schedule length is a
-//! consensus constant (no variable-length ambiguity). Domain separation
-//! comes from `POWHDR__`; the semantic chain-link id uses the distinct
-//! `BLOCKHDR` domain.
+//! With Poseidon2b `rate = 2`, this is exactly eight rate blocks and uses
+//! `finalize_no_pad()`. Domain separation comes from `POWHDR__`; the semantic
+//! chain-link id uses the distinct `BLOCKHDR` domain.
 
 use crate::block_header::BlockHeader;
 use crate::consensus::{difficulty::le256_lt, ConsensusError};
@@ -43,7 +38,7 @@ use noid_poseidon2b::native::domain::{capacity_iv, TAG_POWHDR};
 pub type BlockHash = [u8; 32];
 
 /// Number of `Block128` field elements absorbed by `poseidon_pow_digest`.
-pub const POW_HEADER_FIELD_COUNT: usize = 18;
+pub const POW_HEADER_FIELD_COUNT: usize = 16;
 
 /// Index of the nonce field in the fixed PoW field schedule.
 pub const POW_NONCE_FIELD_INDEX: usize = 10;
@@ -76,12 +71,6 @@ pub fn pow_header_fields_into(h: &BlockHeader, out: &mut PowHeaderFields) {
     out[i] = Block128::from(h.active_slot_count as u128);
     i += 1;
     out[i] = Block128::from(h.alloc_counter as u128);
-    i += 1;
-    out[i] = Block128::from(h.attested_coverage as u128);
-    i += 1;
-    // Reserved constant-zero field: keeps the fixed schedule aligned to the
-    // sponge rate (two fields per permutation) under `finalize_no_pad()`.
-    out[i] = Block128::ZERO;
     i += 1;
     debug_assert_eq!(i, POW_HEADER_FIELD_COUNT);
 }
@@ -227,7 +216,6 @@ mod tests {
             log_slots: 24,
             active_slot_count: 0,
             alloc_counter: 0,
-            attested_coverage: 0,
         }
     }
 
@@ -245,7 +233,6 @@ mod tests {
         h.log_slots = 0x6162_6364;
         h.active_slot_count = 0x7172_7374_7576_7778;
         h.alloc_counter = 0x8182_8384_8586_8788;
-        h.attested_coverage = 0x9192_9394_9596_9798;
 
         let fields = pow_header_fields(&h);
         assert_eq!(fields.len(), POW_HEADER_FIELD_COUNT);
@@ -266,17 +253,6 @@ mod tests {
         assert_eq!(fields[13], Block128::from(h.log_slots as u128));
         assert_eq!(fields[14], Block128::from(h.active_slot_count as u128));
         assert_eq!(fields[15], Block128::from(h.alloc_counter as u128));
-        assert_eq!(fields[16], Block128::from(h.attested_coverage as u128));
-        assert_eq!(fields[17], Block128::ZERO);
-    }
-
-    #[test]
-    fn attested_coverage_changes_pow_digest() {
-        let mut h = dummy_header();
-        let digest1 = poseidon_pow_digest(&h);
-        h.attested_coverage = 42;
-        let digest2 = poseidon_pow_digest(&h);
-        assert_ne!(digest1, digest2);
     }
 
     #[test]

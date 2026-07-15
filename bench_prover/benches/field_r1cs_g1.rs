@@ -146,7 +146,7 @@ fn main() {
         }
     }
 
-    // Legacy synthetic multi-block shape (~2.5 nnz/row, no builder locality):
+    // Synthetic multi-block shape (~2.5 nnz/row, no builder locality):
     // kept as a comparison point only — it overstates sustained throughput
     // and is NOT the gate.
     {

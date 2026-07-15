@@ -1,14 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Block container, block-level state transition, and helpers that bind
-//! proofs into block headers.
+//! Block container and deterministic public-body state materialization.
 //!
 //! A `Block` is a header plus an ordered list of transactions. Live full-node
-//! validation is proof-native: the block proof establishes the state transition,
-//! then the node commits the sealed exact slot updates through
-//! `ChainState::apply_verified_exact_transition`. The native sequential
-//! interpreter remains only for in-memory tests and local utilities.
+//! acceptance first verifies the bundled recursive HistoryStep terminal, then
+//! materializes these public actions into the exact hot state.
 //! Block-level state validation ensures `header.state_root` matches the final
 //! computed post-root after all transactions are applied, and
 //! `tx_root` equals the count-bound universal Merkle root over the derived
@@ -33,54 +30,12 @@ pub const BLOCK_MAX_TXS: usize = crate::consensus::params::BLOCK_MAX_TXS;
 
 /// A semantic block: header plus ordered transactions.
 ///
-/// Validation proofs live outside this struct as detachable witnesses. Their
-/// serialized bytes are mandatory for accepting user-transaction blocks, but
-/// they are not part of semantic block identity.
+/// Network acceptance transports this body together with its full HistoryStep
+/// terminal in `AcceptedBlockBundle`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Block {
     pub header: BlockHeader,
     pub transactions: Vec<Transaction>,
-}
-
-/// Errors returned when checking detached witness presence for a semantic block.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProofBindingError {
-    /// A block with user transactions did not include detached `BlockProof` bytes.
-    MissingProof,
-    /// A structurally no-user block carried proof bytes. Consensus separately
-    /// requires its mandatory coinbase.
-    UnexpectedProofForCoinbaseOnly,
-}
-
-impl std::fmt::Display for ProofBindingError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::MissingProof => write!(f, "user-transaction block is missing BlockProof bytes"),
-            Self::UnexpectedProofForCoinbaseOnly => {
-                write!(f, "coinbase-only block unexpectedly carried proof bytes")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ProofBindingError {}
-
-/// Validate detached witness presence required before proof-native consensus checks.
-pub fn validate_block_proof_binding(
-    block: &Block,
-    block_proof_bytes: &[u8],
-) -> Result<(), ProofBindingError> {
-    let has_user_txs = block.transactions.iter().any(|tx| !tx.body.is_coinbase);
-    if has_user_txs {
-        if block_proof_bytes.is_empty() {
-            return Err(ProofBindingError::MissingProof);
-        }
-    } else {
-        if !block_proof_bytes.is_empty() {
-            return Err(ProofBindingError::UnexpectedProofForCoinbaseOnly);
-        }
-    }
-    Ok(())
 }
 
 /// Errors surfaced by [`apply_block`].
@@ -120,14 +75,21 @@ impl From<ApplyError> for BlockApplyError {
     }
 }
 
-/// Sequential state-transition interpreter.
+/// Deterministically materialize an already-verified accepted block body.
 ///
-/// This is not the live MDBX/node production validity path for
-/// user-transaction blocks. Full nodes verify `BlockProof` and then commit the
-/// sealed exact transition. This interpreter is kept for in-memory tests and
-/// utility contexts that need to recompute a transition directly. On error,
-/// `state` is left untouched (work happens on a snapshot and is swapped only on
-/// success).
+/// The caller must verify the block's full HistoryStep terminal before calling
+/// this function. It applies only public block actions and independently
+/// requires the resulting exact root/counters/tx root to match the header. On
+/// error `state` is left untouched.
+pub fn materialize_accepted_block_state(
+    state: &mut ChainState,
+    block: &Block,
+) -> Result<[u8; 32], BlockApplyError> {
+    apply_block(state, block).map(|transition| transition.new_state_root)
+}
+
+/// Shared state-transition implementation for consensus and the public
+/// accepted-block materializer.
 pub(crate) fn apply_block(
     state: &mut ChainState,
     block: &Block,
@@ -243,7 +205,7 @@ pub(crate) fn apply_state_delta(
     crate::consensus::checks::validate_block_slot_conflicts(&block.transactions)
         .map_err(|_| BlockApplyError::SlotConflict)?;
 
-    // Sanity-guard: must be called after BlockProof verification.
+    // Sanity-guard: must be called only after full HistoryStep verification.
     // tx_root is still checked natively (cheap, doesn't require state reads).
     if block.header.tx_root != compute_tx_root(&block.transactions) {
         return Err(BlockApplyError::HeaderTxRootMismatch);
@@ -332,10 +294,10 @@ pub(crate) fn apply_state_delta(
     })
 }
 
-/// Apply the genesis block to `state` without requiring a BlockProof or witness root.
+/// Apply the built-in genesis block to `state`.
 ///
-/// Genesis (height = 0) is a special case: it has no transactions to prove
-/// and uses zero detached witness metadata.
+/// Genesis (height = 0) is a special case and is never transported as an
+/// accepted block bundle.
 /// All other validation (state_root, tx_root, counters) still applies.
 ///
 /// MUST only be called with `block.header.height == 0`. Use `apply_block`
@@ -572,7 +534,6 @@ mod tests {
                 log_slots: 8,
                 active_slot_count: dry.active_slot_count,
                 alloc_counter: dry.alloc_counter,
-                attested_coverage: 0,
             },
             transactions: txs,
         }
@@ -645,12 +606,11 @@ mod tests {
                 log_slots: 24,
                 active_slot_count: 0,
                 alloc_counter: 0,
-                attested_coverage: 0,
             },
             transactions: txs,
         };
-        assert_eq!(block.canonical_wire_len(), Ok(82_913));
-        assert_eq!(block.to_bytes().len(), 82_913);
+        assert_eq!(block.canonical_wire_len(), Ok(82_905));
+        assert_eq!(block.to_bytes().len(), 82_905);
         assert_eq!(Block::from_bytes(&block.to_bytes()).unwrap(), block);
         assert_eq!(
             canonical_block_wire_len(BLOCK_MAX_TXS + 1),
@@ -674,7 +634,6 @@ mod tests {
                 log_slots: 8,
                 active_slot_count: 0,
                 alloc_counter: 0,
-                attested_coverage: 0,
             },
             transactions: vec![],
         };

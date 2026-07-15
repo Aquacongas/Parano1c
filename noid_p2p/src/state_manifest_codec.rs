@@ -16,17 +16,16 @@ use libp2p::{request_response, swarm::StreamProtocol};
 use noid_chain::{
     consensus::wire_limits::{MAX_SEGMENT_BYTES, MAX_SNAPSHOT_MANIFEST_SEGMENTS},
     storage::encoded_segment_len_for_eff_log,
-    BLOCK_HEADER_WIRE_SIZE, LOG_SEGMENT_SIZE,
+    LOG_SEGMENT_SIZE,
 };
 
 use crate::protocol::{GetStateManifestRequest, GetStateManifestResponse};
 
-const REQUEST_MAGIC: [u8; 4] = *b"NMQ2";
-const RESPONSE_MAGIC: [u8; 4] = *b"NMF2";
+const REQUEST_MAGIC: [u8; 4] = *b"NMQ1";
+const RESPONSE_MAGIC: [u8; 4] = *b"NMF1";
 const REQUEST_BYTES: usize = 4 + 8;
-const RESPONSE_HEADER_BYTES: usize = 108;
+const RESPONSE_HEADER_BYTES: usize = 4 + 8 + 32 + 32 + 4 + 8 + 8 + 1 + 4;
 const SEGMENT_DESCRIPTOR_BYTES: usize = 2 + 32;
-const MAX_RECENT_HEADERS: usize = 512;
 
 /// Fixed-framing state-manifest request/response codec.
 #[derive(Debug, Clone, Copy, Default)]
@@ -74,7 +73,6 @@ impl request_response::Codec for StateManifestCodec {
         // Counts and geometry are now bounded. No attacker-controlled Vec is
         // reserved before this point.
         let segment_count = fields.segment_count as usize;
-        let recent_header_count = usize::from(fields.recent_header_count);
         let mut segment_ids = Vec::new();
         segment_ids.try_reserve_exact(segment_count).map_err(|_| {
             io::Error::new(
@@ -113,20 +111,6 @@ impl request_response::Codec for StateManifestCodec {
             segment_roots.push(descriptor[2..34].try_into().expect("fixed segment root"));
         }
 
-        let mut recent_headers = Vec::new();
-        recent_headers
-            .try_reserve_exact(recent_header_count)
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::OutOfMemory,
-                    "manifest recent-header allocation failed",
-                )
-            })?;
-        for _ in 0..recent_header_count {
-            let mut encoded = vec![0u8; BLOCK_HEADER_WIRE_SIZE];
-            io.read_exact(&mut encoded).await?;
-            recent_headers.push(encoded);
-        }
         ensure_eof(io).await?;
 
         Ok(GetStateManifestResponse {
@@ -139,7 +123,6 @@ impl request_response::Codec for StateManifestCodec {
             eff_log: fields.eff_log,
             segment_ids,
             segment_roots,
-            recent_headers,
         })
     }
 
@@ -188,16 +171,6 @@ impl request_response::Codec for StateManifestCodec {
             }
             previous = Some(segment_id);
         }
-        if response
-            .recent_headers
-            .iter()
-            .any(|encoded| encoded.len() != BLOCK_HEADER_WIRE_SIZE)
-        {
-            return Err(invalid_data(
-                "manifest contains a noncanonical recent-header length",
-            ));
-        }
-
         // Validate every variable field before emitting the fixed header so an
         // invalid local response cannot create an ambiguous partial frame.
         let header = encode_response_header(&fields);
@@ -207,9 +180,6 @@ impl request_response::Codec for StateManifestCodec {
         {
             io.write_all(&segment_id.to_le_bytes()).await?;
             io.write_all(&segment_root).await?;
-        }
-        for encoded in response.recent_headers {
-            io.write_all(&encoded).await?;
         }
         Ok(())
     }
@@ -225,7 +195,6 @@ struct ResponseFields {
     alloc_counter: u64,
     eff_log: u8,
     segment_count: u32,
-    recent_header_count: u16,
     maximum_segments: u32,
 }
 
@@ -241,8 +210,6 @@ impl ResponseFields {
             eff_log: response.eff_log,
             segment_count: u32::try_from(response.segment_ids.len())
                 .map_err(|_| invalid_data("manifest segment count does not fit u32"))?,
-            recent_header_count: u16::try_from(response.recent_headers.len())
-                .map_err(|_| invalid_data("manifest recent-header count does not fit u16"))?,
             maximum_segments: 0,
         })
     }
@@ -252,11 +219,6 @@ fn parse_response_header(header: &[u8; RESPONSE_HEADER_BYTES]) -> io::Result<Res
     if header[..4] != RESPONSE_MAGIC {
         return Err(invalid_data(
             "invalid state-manifest response magic/version",
-        ));
-    }
-    if header[97..100] != [0, 0, 0] || header[106..108] != [0, 0] {
-        return Err(invalid_data(
-            "non-zero state-manifest response reserved bytes",
         ));
     }
     let mut fields = ResponseFields {
@@ -271,14 +233,7 @@ fn parse_response_header(header: &[u8; RESPONSE_HEADER_BYTES]) -> io::Result<Res
             header[88..96].try_into().expect("fixed allocation counter"),
         ),
         eff_log: header[96],
-        segment_count: u32::from_le_bytes(
-            header[100..104].try_into().expect("fixed segment count"),
-        ),
-        recent_header_count: u16::from_le_bytes(
-            header[104..106]
-                .try_into()
-                .expect("fixed recent-header count"),
-        ),
+        segment_count: u32::from_le_bytes(header[97..101].try_into().expect("fixed segment count")),
         maximum_segments: 0,
     };
     validate_response_fields(&mut fields)?;
@@ -294,7 +249,6 @@ fn validate_response_fields(fields: &mut ResponseFields) -> io::Result<()> {
             || fields.alloc_counter != 0
             || fields.eff_log != 0
             || fields.segment_count != 0
-            || fields.recent_header_count != 0
         {
             return Err(invalid_data(
                 "empty state manifest carries non-zero metadata",
@@ -351,18 +305,8 @@ fn validate_response_fields(fields: &mut ResponseFields) -> io::Result<()> {
             "declared non-empty segment count exceeds active slot count",
         ));
     }
-    if usize::from(fields.recent_header_count) > MAX_RECENT_HEADERS {
-        return Err(invalid_data(
-            "declared manifest recent-header count exceeds 512",
-        ));
-    }
     segment_count
         .checked_mul(SEGMENT_DESCRIPTOR_BYTES)
-        .and_then(|bytes| {
-            usize::from(fields.recent_header_count)
-                .checked_mul(BLOCK_HEADER_WIRE_SIZE)
-                .and_then(|header_bytes| bytes.checked_add(header_bytes))
-        })
         .ok_or_else(|| invalid_data("manifest payload length overflows"))?;
     Ok(())
 }
@@ -377,8 +321,7 @@ fn encode_response_header(fields: &ResponseFields) -> [u8; RESPONSE_HEADER_BYTES
     header[80..88].copy_from_slice(&fields.active_slot_count.to_le_bytes());
     header[88..96].copy_from_slice(&fields.alloc_counter.to_le_bytes());
     header[96] = fields.eff_log;
-    header[100..104].copy_from_slice(&fields.segment_count.to_le_bytes());
-    header[104..106].copy_from_slice(&fields.recent_header_count.to_le_bytes());
+    header[97..101].copy_from_slice(&fields.segment_count.to_le_bytes());
     header
 }
 
@@ -402,7 +345,7 @@ mod tests {
     use super::*;
 
     fn protocol() -> StreamProtocol {
-        StreamProtocol::new("/noid/test/sync/manifest/2")
+        StreamProtocol::new("/noid/test/sync/manifest/1")
     }
 
     fn populated_response() -> GetStateManifestResponse {
@@ -416,7 +359,6 @@ mod tests {
             eff_log: 16,
             segment_ids: vec![0, 1],
             segment_roots: vec![[0x33; 32], [0x44; 32]],
-            recent_headers: vec![vec![0x55; BLOCK_HEADER_WIRE_SIZE]],
         }
     }
 
@@ -435,7 +377,6 @@ mod tests {
             alloc_counter: 12,
             eff_log: 16,
             segment_count: 2,
-            recent_header_count: 1,
             maximum_segments: 0,
         }
     }
@@ -482,7 +423,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             wire.get_ref().len(),
-            RESPONSE_HEADER_BYTES + 2 * SEGMENT_DESCRIPTOR_BYTES + BLOCK_HEADER_WIRE_SIZE
+            RESPONSE_HEADER_BYTES + 2 * SEGMENT_DESCRIPTOR_BYTES
         );
         wire.set_position(0);
         let decoded = StateManifestCodec
@@ -494,7 +435,6 @@ mod tests {
         assert_eq!(decoded.cumulative_chainwork, [0x22; 32]);
         assert_eq!(decoded.segment_ids, vec![0, 1]);
         assert_eq!(decoded.segment_roots, vec![[0x33; 32], [0x44; 32]]);
-        assert_eq!(decoded.recent_headers[0].len(), BLOCK_HEADER_WIRE_SIZE);
     }
 
     #[tokio::test]
@@ -507,15 +447,6 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("segment count"));
-
-        let mut header_bomb = valid_fields();
-        header_bomb.recent_header_count = u16::MAX;
-        let error = StateManifestCodec
-            .read_response(&protocol(), &mut Cursor::new(response_header(header_bomb)))
-            .await
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(error.to_string().contains("recent-header count"));
     }
 
     #[tokio::test]
@@ -564,7 +495,6 @@ mod tests {
             wire.extend_from_slice(&id.to_le_bytes());
             wire.extend_from_slice(&root);
         }
-        wire.extend_from_slice(&[0u8; BLOCK_HEADER_WIRE_SIZE]);
         let error = StateManifestCodec
             .read_response(&protocol(), &mut Cursor::new(wire))
             .await
@@ -586,7 +516,6 @@ mod tests {
         let mut noncanonical = valid_fields();
         noncanonical.tip_height = 0;
         noncanonical.segment_count = 0;
-        noncanonical.recent_header_count = 0;
         let error = StateManifestCodec
             .read_response(&protocol(), &mut Cursor::new(response_header(noncanonical)))
             .await

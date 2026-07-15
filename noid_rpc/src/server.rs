@@ -7,7 +7,8 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use jsonrpsee::core::async_trait;
 use jsonrpsee::core::RpcResult;
@@ -15,16 +16,16 @@ use jsonrpsee::server::Server;
 use jsonrpsee::types::ErrorObject;
 use tokio::sync::RwLock;
 
-use noid_chain::block::{Block, BLOCK_WIRE_NONCE_OFFSET};
-use noid_chain::consensus::pow::{block_id, pow_header_fields};
+use noid_chain::consensus::pow::{
+    block_id, pow_header_fields, validate_pow, POW_NONCE_FIELD_INDEX,
+};
 use noid_chain::consensus::wire_limits::{
-    hex_chars_for_bytes, proof_sidecar_combined_len_ok, MAX_BLOCK_AUTH_SIDECAR_BYTES,
-    MAX_BLOCK_BYTES, MAX_BLOCK_PROOF_BYTES, MAX_HISTORY_PROOF_BYTES, MAX_RPC_RECEIPT_BYTES,
-    MAX_RPC_SALT_BYTES, MAX_TX_INTENT_BYTES_GLOBAL,
+    hex_chars_for_bytes, MAX_RPC_RECEIPT_BYTES, MAX_RPC_SALT_BYTES, MAX_TX_INTENT_BYTES_GLOBAL,
 };
 use noid_chain::storage::MdbxChainContext;
 use noid_mempool::AsyncMempool;
 use noid_miner::template::{TemplateBuilder, TemplateChainSnapshot};
+use noid_miner::PreparedBlockAttempt;
 
 use crate::api::ParanoidApiServer;
 use crate::types::{
@@ -38,6 +39,13 @@ use crate::wallet_ops::{WalletActivationPreview, WalletOps, WalletSendPlanError}
 use crate::wallet_submit::{
     collect_empty_slot_hints, next_user_epoch_anchor, PendingAdmissionGuard, WalletOperationGate,
 };
+
+/// External workers receive only a short-lived capability for immutable
+/// node-owned material.  The server retains exactly one attempt across its
+/// preparation, PoW, proof and commit lifecycle.
+const EXTERNAL_MINING_TEMPLATE_TTL: Duration = Duration::from_secs(30);
+
+type ExternalMiningTemplateId = [u8; 16];
 
 fn rpc_err(msg: impl Into<String>) -> ErrorObject<'static> {
     ErrorObject::owned(-32000, msg.into(), None::<()>)
@@ -112,96 +120,19 @@ fn read_canonical_slot(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn accepted_block_validation(
-    block: &Block,
-    parent: &noid_chain::BlockHeader,
-    prev_timestamps: &[u64],
-    prev_active_counts: &[u64],
-    anchor: &noid_chain::consensus::validation::AnchorInfo,
-    block_proof_bytes: &[u8],
-    block_auth_sidecar_bytes: &[u8],
-    artifacts: &noid_block::AcceptedBlockValidationArtifacts,
-    state_root: [u8; 32],
-) -> Result<noid_chain::AppliedBlockValidation, noid_block::FullValidationError> {
-    let post_validation = noid_block::accepted_block_post_validation_bundle(
-        block,
-        parent,
-        prev_timestamps,
-        prev_active_counts,
-        anchor,
-        block_proof_bytes,
-        block_auth_sidecar_bytes,
-        artifacts,
-    )?;
-    let record = noid_block::accepted_block_certificate_record(post_validation.acceptance_receipt)
-        .map_err(|error| {
-            noid_block::FullValidationError::Consensus(
-                noid_chain::consensus::ConsensusError::ShapeMismatch(format!(
-                    "accepted-block certificate record build failed: {error}"
-                )),
-            )
-        })?;
-    Ok(noid_chain::AppliedBlockValidation::new(
-        state_root,
-        bincode::serialize(&post_validation.history_claim_fields)
-            .expect("history claim fields serialize"),
-        bincode::serialize(&record).expect("accepted-block certificate record serializes"),
-    ))
-}
-
-#[inline]
-fn snapshot_suffix_is_retained(tip_height: u64, proof_height: u64) -> bool {
-    proof_height <= tip_height
-        && tip_height.saturating_sub(proof_height)
-            <= noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH
-}
-
-fn selected_history_proof_bytes(ctx: &MdbxChainContext) -> Result<Option<Vec<u8>>, String> {
-    let Some(coverage) = ctx
-        .store
-        .get_selected_history_coverage()
-        .map_err(|e| format!("selected-history coverage read failed: {e}"))?
-    else {
-        return Ok(None);
-    };
+fn history_step_terminal_bytes(ctx: &MdbxChainContext) -> Result<Option<Vec<u8>>, String> {
     let finalized = ctx.finalized_checkpoint();
-    let height = coverage.height.min(finalized.height);
-    if height == 0
-        || height > ctx.tip_height()
-        || !snapshot_suffix_is_retained(ctx.tip_height(), height)
-    {
+    if finalized.height == 0 {
         return Ok(None);
     }
-    let header = ctx
-        .store
-        .get_header(height)
-        .map_err(|e| format!("selected-history header read h={height} failed: {e}"))?;
-    let Some(header) = header else {
-        return Ok(None);
-    };
-    let block_hash = noid_chain::hash_block_header(&header);
-    if (height == coverage.height && block_hash != coverage.block_hash)
-        || (height == finalized.height && block_hash != finalized.hash)
-    {
-        return Ok(None);
-    }
-    let Some(result) = ctx
-        .store
-        .get_selected_history_terminal_result_at(height, block_hash)
-        .map_err(|e| format!("selected-history result read h={height} failed: {e}"))?
-    else {
-        return Ok(None);
-    };
-    let bytes = result.bytes;
-    if bytes.len() > MAX_HISTORY_PROOF_BYTES {
-        return Err(format!(
-            "selected-history proof too large: {} > {}",
-            bytes.len(),
-            MAX_HISTORY_PROOF_BYTES
-        ));
-    }
-    Ok(Some(bytes))
+    ctx.store
+        .get_history_step_terminal_at(finalized.height, finalized.hash)
+        .map_err(|error| {
+            format!(
+                "HistoryStep terminal read h={} failed: {error}",
+                finalized.height
+            )
+        })
 }
 
 #[inline]
@@ -254,6 +185,39 @@ fn decode_32_byte_hex(name: &str, hex_str: &str) -> Result<[u8; 32], ErrorObject
         .ok()
         .and_then(|b| b.try_into().ok())
         .ok_or_else(|| rpc_err(format!("invalid {name}: expected 32-byte hex")))
+}
+
+fn decode_canonical_fixed_hex<const N: usize>(
+    name: &str,
+    encoded: &str,
+) -> Result<[u8; N], ErrorObject<'static>> {
+    if encoded.len() != N.saturating_mul(2) {
+        return Err(rpc_err(format!(
+            "invalid {name}: expected exactly {} lowercase hex chars",
+            N.saturating_mul(2)
+        )));
+    }
+    let decoded = hex::decode(encoded)
+        .map_err(|error| rpc_err(format!("invalid {name}: canonical hex decode: {error}")))?;
+    if hex::encode(&decoded) != encoded {
+        return Err(rpc_err(format!(
+            "invalid {name}: expected canonical lowercase hex without a prefix"
+        )));
+    }
+    decoded
+        .try_into()
+        .map_err(|_| rpc_err(format!("invalid {name}: expected exactly {} bytes", N)))
+}
+
+fn decode_external_template_id(
+    encoded: &str,
+) -> Result<ExternalMiningTemplateId, ErrorObject<'static>> {
+    decode_canonical_fixed_hex("template_id", encoded)
+}
+
+fn decode_external_nonce_hex(encoded: &str) -> Result<u128, ErrorObject<'static>> {
+    let bytes = decode_canonical_fixed_hex::<16>("nonce_hex", encoded)?;
+    Ok(u128::from_le_bytes(bytes))
 }
 
 #[inline]
@@ -318,6 +282,337 @@ fn seed_from_salt_hex(salt_hex: &str) -> Result<u64, ErrorObject<'static>> {
     Ok(acc)
 }
 
+struct CachedExternalMiningTemplate<T> {
+    prepared: T,
+    template_id: ExternalMiningTemplateId,
+    parent_height: u64,
+    parent_id: [u8; 32],
+    expires_at: Instant,
+}
+
+enum ExternalMiningAttemptState<T> {
+    Idle,
+    Preparing {
+        template_id: ExternalMiningTemplateId,
+        invalidated: bool,
+    },
+    Ready(CachedExternalMiningTemplate<T>),
+    Proving {
+        template_id: ExternalMiningTemplateId,
+    },
+}
+
+/// The external miner owns one attempt, not a cache of independent proofs.
+/// The generic payload keeps the lifecycle testable without constructing a
+/// cryptographic witness in unit tests.
+struct ExternalMiningAttemptSlot<T> {
+    state: ExternalMiningAttemptState<T>,
+    namespace: u64,
+    next_sequence: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExternalMiningConsumeError {
+    Unavailable,
+    Stale,
+}
+
+impl<T> ExternalMiningAttemptSlot<T> {
+    fn new(namespace: u64) -> Self {
+        Self {
+            state: ExternalMiningAttemptState::Idle,
+            namespace,
+            next_sequence: 0,
+        }
+    }
+
+    fn purge_expired(&mut self, now: Instant) {
+        let expired = matches!(
+            &self.state,
+            ExternalMiningAttemptState::Ready(cached) if cached.expires_at <= now
+        );
+        if expired {
+            self.state = ExternalMiningAttemptState::Idle;
+        }
+    }
+
+    fn reserve_preparation(&mut self, now: Instant) -> Result<ExternalMiningTemplateId, String> {
+        self.purge_expired(now);
+        if !matches!(self.state, ExternalMiningAttemptState::Idle) {
+            return Err("external mining attempt is already active".to_string());
+        }
+        self.next_sequence = self.next_sequence.wrapping_add(1);
+        let mut template_id = [0u8; 16];
+        template_id[..8].copy_from_slice(&self.namespace.to_le_bytes());
+        template_id[8..].copy_from_slice(&self.next_sequence.to_le_bytes());
+        self.state = ExternalMiningAttemptState::Preparing {
+            template_id,
+            invalidated: false,
+        };
+        Ok(template_id)
+    }
+
+    fn cancel_preparation(&mut self, template_id: ExternalMiningTemplateId) {
+        if matches!(
+            &self.state,
+            ExternalMiningAttemptState::Preparing {
+                template_id: active,
+                ..
+            } if *active == template_id
+        ) {
+            self.state = ExternalMiningAttemptState::Idle;
+        }
+    }
+
+    fn install_ready(
+        &mut self,
+        template_id: ExternalMiningTemplateId,
+        prepared: T,
+        parent_height: u64,
+        parent_id: [u8; 32],
+        expires_at: Instant,
+    ) -> Result<(), String> {
+        let installable = matches!(
+            &self.state,
+            ExternalMiningAttemptState::Preparing {
+                template_id: active,
+                invalidated: false,
+            } if *active == template_id
+        );
+        if !installable {
+            self.cancel_preparation(template_id);
+            return Err("external mining preparation was invalidated".to_string());
+        }
+        self.state = ExternalMiningAttemptState::Ready(CachedExternalMiningTemplate {
+            prepared,
+            template_id,
+            parent_height,
+            parent_id,
+            expires_at,
+        });
+        Ok(())
+    }
+
+    fn expire_ready(&mut self, template_id: ExternalMiningTemplateId, now: Instant) {
+        if matches!(
+            &self.state,
+            ExternalMiningAttemptState::Ready(cached)
+                if cached.template_id == template_id && cached.expires_at <= now
+        ) {
+            self.state = ExternalMiningAttemptState::Idle;
+        }
+    }
+
+    fn begin_proving(
+        &mut self,
+        template_id: ExternalMiningTemplateId,
+        now: Instant,
+        tip_height: u64,
+        tip_id: [u8; 32],
+    ) -> Result<T, ExternalMiningConsumeError> {
+        self.purge_expired(now);
+        let previous = std::mem::replace(&mut self.state, ExternalMiningAttemptState::Idle);
+        match previous {
+            ExternalMiningAttemptState::Ready(cached)
+                if cached.template_id == template_id
+                    && cached.parent_height == tip_height
+                    && cached.parent_id == tip_id =>
+            {
+                self.state = ExternalMiningAttemptState::Proving { template_id };
+                Ok(cached.prepared)
+            }
+            ExternalMiningAttemptState::Ready(cached) if cached.template_id == template_id => {
+                Err(ExternalMiningConsumeError::Stale)
+            }
+            other => {
+                self.state = other;
+                Err(ExternalMiningConsumeError::Unavailable)
+            }
+        }
+    }
+
+    fn finish_proving(&mut self, template_id: ExternalMiningTemplateId) {
+        if matches!(
+            &self.state,
+            ExternalMiningAttemptState::Proving {
+                template_id: active,
+                ..
+            } if *active == template_id
+        ) {
+            self.state = ExternalMiningAttemptState::Idle;
+        }
+    }
+
+    fn invalidate_except(&mut self, tip_height: u64, tip_id: [u8; 32]) {
+        match &mut self.state {
+            ExternalMiningAttemptState::Idle => {}
+            ExternalMiningAttemptState::Preparing { invalidated, .. } => {
+                // The parent may have been captured immediately before this
+                // canonical advance. Keep the owner occupied until its running
+                // preparation returns, but never publish that result.
+                *invalidated = true;
+            }
+            ExternalMiningAttemptState::Ready(cached) => {
+                if cached.parent_height != tip_height || cached.parent_id != tip_id {
+                    self.state = ExternalMiningAttemptState::Idle;
+                }
+            }
+            // Proving cannot be synchronously cancelled. Keep the slot occupied
+            // until its owner exits; atomic commit rejects a replaced parent.
+            ExternalMiningAttemptState::Proving { .. } => {}
+        }
+    }
+}
+
+/// A small node-facing handle which immediately drops a ready attempt when a
+/// P2P block, reorg or snapshot replaces its parent. Running preparation/proof
+/// owners remain occupied until their cancellation-safe lease is dropped.
+#[derive(Clone)]
+pub struct ExternalMiningAttemptInvalidator {
+    inner: Arc<Mutex<ExternalMiningAttemptSlot<PreparedBlockAttempt>>>,
+}
+
+impl Default for ExternalMiningAttemptInvalidator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ExternalMiningAttemptInvalidator {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(ExternalMiningAttemptSlot::new(
+                node_entropy_nonce(),
+            ))),
+        }
+    }
+
+    pub fn invalidate_for_tip(&self, tip_height: u64, tip_id: [u8; 32]) {
+        match self.inner.lock() {
+            Ok(mut slot) => slot.invalidate_except(tip_height, tip_id),
+            Err(_) => tracing::error!("external mining attempt slot lock poisoned"),
+        }
+    }
+
+    fn reserve_preparation(&self, now: Instant) -> Result<ExternalMiningPreparationLease, String> {
+        let template_id = self
+            .inner
+            .lock()
+            .map_err(|_| "external mining attempt slot lock poisoned".to_string())?
+            .reserve_preparation(now)?;
+        Ok(ExternalMiningPreparationLease {
+            attempts: self.clone(),
+            template_id,
+            armed: true,
+        })
+    }
+
+    fn begin_proving(
+        &self,
+        template_id: ExternalMiningTemplateId,
+        now: Instant,
+        tip_height: u64,
+        tip_id: [u8; 32],
+    ) -> Result<ExternalMiningProvingAttempt, ExternalMiningConsumeError> {
+        let prepared = self
+            .inner
+            .lock()
+            .map_err(|_| ExternalMiningConsumeError::Unavailable)?
+            .begin_proving(template_id, now, tip_height, tip_id)?;
+        Ok(ExternalMiningProvingAttempt {
+            prepared,
+            lease: ExternalMiningProvingLease {
+                attempts: self.clone(),
+                template_id,
+            },
+        })
+    }
+}
+
+struct ExternalMiningPreparationLease {
+    attempts: ExternalMiningAttemptInvalidator,
+    template_id: ExternalMiningTemplateId,
+    armed: bool,
+}
+
+impl ExternalMiningPreparationLease {
+    const fn template_id(&self) -> ExternalMiningTemplateId {
+        self.template_id
+    }
+
+    fn install_ready(
+        mut self,
+        prepared: PreparedBlockAttempt,
+        parent_height: u64,
+        parent_id: [u8; 32],
+        now: Instant,
+    ) -> Result<(), String> {
+        let expires_at = now
+            .checked_add(EXTERNAL_MINING_TEMPLATE_TTL)
+            .ok_or_else(|| "external template expiry overflow".to_string())?;
+        let retained_bytes = prepared.retained_bytes();
+        self.attempts
+            .inner
+            .lock()
+            .map_err(|_| "external mining attempt slot lock poisoned".to_string())?
+            .install_ready(
+                self.template_id,
+                prepared,
+                parent_height,
+                parent_id,
+                expires_at,
+            )?;
+        self.armed = false;
+        tracing::debug!(
+            template_id = %hex::encode(self.template_id),
+            retained_bytes,
+            "external mining attempt staged"
+        );
+
+        let attempts = self.attempts.clone();
+        let template_id = self.template_id;
+        tokio::spawn(async move {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(expires_at)).await;
+            match attempts.inner.lock() {
+                Ok(mut slot) => slot.expire_ready(template_id, Instant::now()),
+                Err(_) => tracing::error!("external mining attempt slot lock poisoned"),
+            }
+        });
+        Ok(())
+    }
+}
+
+impl Drop for ExternalMiningPreparationLease {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        match self.attempts.inner.lock() {
+            Ok(mut slot) => slot.cancel_preparation(self.template_id),
+            Err(_) => tracing::error!("external mining attempt slot lock poisoned"),
+        }
+    }
+}
+
+struct ExternalMiningProvingAttempt {
+    prepared: PreparedBlockAttempt,
+    lease: ExternalMiningProvingLease,
+}
+
+struct ExternalMiningProvingLease {
+    attempts: ExternalMiningAttemptInvalidator,
+    template_id: ExternalMiningTemplateId,
+}
+
+impl Drop for ExternalMiningProvingLease {
+    fn drop(&mut self) {
+        match self.attempts.inner.lock() {
+            Ok(mut slot) => slot.finish_proving(self.template_id),
+            Err(_) => tracing::error!("external mining attempt slot lock poisoned"),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // RpcHandler
 // ---------------------------------------------------------------------------
@@ -326,6 +621,7 @@ fn seed_from_salt_hex(salt_hex: &str) -> Result<u64, ErrorObject<'static>> {
 ///
 /// Holds shared references to the chain context, mempool, and wallet.
 /// All state access goes through `Arc<RwLock<MdbxChainContext>>`.
+#[derive(Clone)]
 pub struct RpcHandler {
     pub chain: Arc<RwLock<MdbxChainContext>>,
     pub mempool: AsyncMempool,
@@ -355,6 +651,16 @@ pub struct RpcHandler {
     /// any valid address as `miner_address` in getBlockTemplate and receive
     /// block rewards directly. The node operator earns via off-chain service fees.
     pub allow_custom_coinbase: bool,
+    /// Pinned self-recursive HistoryStep runtime shared with local mining and
+    /// inbound bundle verification.
+    pub history_step_runtime:
+        Option<Arc<noid_recursive::acceptance::history_step::HistoryStepRuntime>>,
+    /// Process-wide prepared ghost authorization reused by every block attempt.
+    pub history_step_ghost: Option<
+        Arc<noid_recursive::acceptance::history_step::PreparedHistoryStepGhostAuthorization>,
+    >,
+    /// Every handler clone shares the same one-attempt lifecycle owner.
+    external_mining_attempts: ExternalMiningAttemptInvalidator,
 }
 
 impl RpcHandler {
@@ -410,6 +716,238 @@ impl RpcHandler {
         collect_empty_slot_hints(&chain, &reserved, seed, count, (count * 64).max(512))
             .map_err(rpc_err)
     }
+
+    /// Owned preparation coordinator. `getBlockTemplate` runs this in its own
+    /// Tokio task, so disconnecting the RPC client cannot drop the one-attempt
+    /// lease while a detached blocking/Rayon job still owns the template.
+    async fn prepare_external_mining_attempt(
+        self,
+        requested: Option<noid_poseidon2b::primitives::Address>,
+        preparation: ExternalMiningPreparationLease,
+    ) -> RpcResult<BlockTemplateResponse> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let builder = TemplateBuilder::new(self.mempool.clone());
+        // Snapshot/reorg installation holds the same gate while it replaces
+        // chain, mempool and wallet views. Capture the exact parent+payout
+        // boundary under that gate, then release it before witness preparation.
+        let wallet_operation = self.wallet_operation_gate.lock().await;
+        let (snapshot, addr) = {
+            let mut ctx = self.chain.write().await;
+            let operator_payout = self.resolved_mining_payout()?;
+            let addr = match requested {
+                None => operator_payout,
+                Some(requested) if self.allow_custom_coinbase => requested,
+                Some(requested) if requested.0 == operator_payout.0 => requested,
+                Some(_) => {
+                    return Err(rpc_err(
+                        "miner_address must match the node's configured payout address. \
+                         Use empty string \"\" to use the node's address, or start the \
+                         node with --allow-custom-coinbase (requires --mining-key) to \
+                         allow miners to specify their own payout address.",
+                    ));
+                }
+            };
+            let snapshot = TemplateChainSnapshot::from_context(&mut ctx)
+                .map_err(|e| rpc_err(format!("template snapshot: {e:?}")))?;
+            (snapshot, addr)
+        };
+        drop(wallet_operation);
+        let tmpl = builder
+            .build_from_snapshot(snapshot, addr, now)
+            .await
+            .ok_or_else(|| rpc_err("template build failed"))?;
+
+        let height = tmpl.inner.height;
+        let n_txs = tmpl.inner.n_txs();
+        let tx_input_counts: Vec<usize> = tmpl
+            .inner
+            .txs
+            .iter()
+            .map(|tx| tx.body.live_input_count())
+            .collect();
+        let tx_output_counts: Vec<usize> = tmpl
+            .inner
+            .txs
+            .iter()
+            .map(|tx| tx.body.live_output_count())
+            .collect();
+        let coinbase_value_micronoid: u64 = tmpl
+            .inner
+            .coinbase
+            .body
+            .live_outputs()
+            .map(|(_, output)| output.amount)
+            .fold(0u64, |acc, value| acc.saturating_add(value));
+        let claimable_fees_micronoid = tmpl
+            .inner
+            .txs
+            .iter()
+            .map(|tx| {
+                noid_chain::consensus::claimable_fee_for_tx_body(
+                    &tx.body,
+                    tmpl.parent.active_slot_count,
+                    tmpl.parent.log_slots,
+                )
+            })
+            .fold(0u64, |acc, fee| acc.saturating_add(fee));
+        let pow_header = tmpl.header_for_pow(0);
+        let pow_fields_hex = encode_pow_fields_hex(&pow_header);
+        let diff_target = pow_header.difficulty_target;
+
+        // Build every nonce-independent HistoryStep witness before exposing the
+        // capability. The worker's only remaining job is PoW nonce search.
+        let runtime = self
+            .history_step_runtime
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| rpc_err("HistoryStep runtime is unavailable"))?;
+        let ghost = self
+            .history_step_ghost
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| rpc_err("HistoryStep producer authorization is unavailable"))?;
+        let prepared = tokio::task::spawn_blocking(move || {
+            noid_miner::install_history_step_phase_cpu(|| {
+                PreparedBlockAttempt::prepare(tmpl, &runtime, &ghost, now)
+            })
+            .map_err(|error| format!("HistoryStep CPU admission failed: {error}"))?
+        })
+        .await
+        .map_err(|error| rpc_err(format!("HistoryStep preparation task failed: {error}")))?
+        .map_err(|error| rpc_err(format!("HistoryStep preparation failed: {error}")))?;
+
+        let parent_height = prepared.expected_parent_height();
+        let parent_id = prepared.expected_parent_id();
+        {
+            let chain = self.chain.read().await;
+            let tip = chain.tip_header();
+            if tip.height != parent_height || block_id(tip) != parent_id {
+                return Err(rpc_err(
+                    "chain tip changed while preparing external mining template",
+                ));
+            }
+        }
+
+        let template_id = preparation.template_id();
+        preparation
+            .install_ready(prepared, parent_height, parent_id, Instant::now())
+            .map_err(|error| rpc_err(format!("install external mining attempt: {error}")))?;
+        Ok(BlockTemplateResponse {
+            template_id: hex::encode(template_id),
+            pow_fields_hex,
+            nonce_field_index: POW_NONCE_FIELD_INDEX,
+            difficulty_target_hex: hex::encode(diff_target),
+            height,
+            expires_in_seconds: EXTERNAL_MINING_TEMPLATE_TTL.as_secs(),
+            n_txs,
+            tx_input_counts,
+            tx_output_counts,
+            coinbase_value_micronoid,
+            claimable_fees_micronoid,
+        })
+    }
+
+    /// Seal the sole miner-controlled value into an immutable node-owned
+    /// template, check the exact parent and PoW, then finalize it through the
+    /// node-owned consensus path.
+    async fn finalize_node_owned_template_after_nonce(
+        &self,
+        prepared: PreparedBlockAttempt,
+        nonce: u128,
+        nonce_submitted_at: Instant,
+    ) -> RpcResult<String> {
+        // Consume happened before this check, so a stale or losing template
+        // cannot be retried. Atomic apply repeats the parent checks under the
+        // chain write lock and closes the race with a peer block.
+        {
+            let chain = self.chain.read().await;
+            let tip = chain.tip_header();
+            if tip.height != prepared.expected_parent_height()
+                || block_id(tip) != prepared.expected_parent_id()
+            {
+                return Err(rpc_err("stale external mining template parent"));
+            }
+        }
+
+        validate_pow(&prepared.pow_header(nonce))
+            .map_err(|error| rpc_err(format!("proof of work: {error}")))?;
+
+        let prove_started = Instant::now();
+        let runtime = self
+            .history_step_runtime
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| rpc_err("HistoryStep runtime is unavailable"))?;
+        let proved = tokio::task::spawn_blocking(move || {
+            noid_miner::install_history_step_phase_cpu(|| prepared.prove(&runtime, nonce))
+                .map_err(|error| format!("HistoryStep CPU admission failed: {error}"))?
+        })
+        .await
+        .map_err(|error| rpc_err(format!("HistoryStep task failed: {error}")))?
+        .map_err(|error| rpc_err(format!("HistoryStep prove failed: {error}")))?;
+        let history_step_ms = prove_started.elapsed().as_millis();
+        // Serialize canonical commit + wallet delta + mempool view replacement.
+        let wallet_operation = self.wallet_operation_gate.lock().await;
+        let chain = Arc::clone(&self.chain);
+        let wallet = Arc::clone(&self.wallet);
+        let (committed, new_view) = tokio::task::spawn_blocking(move || {
+            let mut ctx = chain.blocking_write();
+            let committed = proved
+                .commit(&mut ctx)
+                .map_err(|error| format!("consensus: {error}"))?;
+            if let Err(error) = wallet.on_accepted_block(committed.block()) {
+                tracing::error!(
+                    height = committed.block().header.height,
+                    %error,
+                    "committed RPC block but wallet update failed"
+                );
+            }
+            let view = noid_mempool::ChainView::from_mdbx(&ctx);
+            Ok::<_, String>((committed, view))
+        })
+        .await
+        .map_err(|error| rpc_err(format!("block commit task failed: {error}")))?
+        .map_err(rpc_err)?;
+
+        let block = committed.block();
+        let height = block.header.height;
+        let hash = block_id(&block.header);
+        let n_txs = block.transactions.len();
+        let confirmed: Vec<_> = block.transactions.iter().map(|tx| tx.txid()).collect();
+        self.mempool
+            .on_new_block(&confirmed, height, new_view)
+            .await;
+        drop(wallet_operation);
+
+        tracing::info!(
+            height,
+            hash = %hex::encode(hash),
+            txs = n_txs,
+            mining = "external",
+            history_step_ms,
+            nonce_to_commit_ms = nonce_submitted_at.elapsed().as_millis(),
+            "block accepted"
+        );
+
+        let (_block, bundle) = committed.into_parts();
+        if let Err(error) = self
+            .p2p_cmd
+            .send(noid_p2p::NetworkCommand::AnnounceBlock { bundle })
+            .await
+        {
+            tracing::warn!(
+                height,
+                err = %error,
+                "failed to broadcast RPC-submitted block"
+            );
+        }
+
+        Ok(hex::encode(hash))
+    }
 }
 
 #[async_trait]
@@ -462,9 +1000,9 @@ impl ParanoidApiServer for RpcHandler {
         }
     }
 
-    async fn get_history_proof(&self) -> RpcResult<Option<String>> {
+    async fn get_history_step_terminal(&self) -> RpcResult<Option<String>> {
         let chain = self.chain.read().await;
-        selected_history_proof_bytes(&chain)
+        history_step_terminal_bytes(&chain)
             .map(|bytes| bytes.map(hex::encode))
             .map_err(rpc_err)
     }
@@ -693,12 +1231,6 @@ impl ParanoidApiServer for RpcHandler {
             }
         });
         let reward = block_reward(tip.log_slots);
-        let history_proof_height = chain
-            .store
-            .get_selected_history_coverage()
-            .ok()
-            .flatten()
-            .map(|coverage| coverage.height);
         Ok(MiningInfo {
             height,
             difficulty_bits: diff_bits,
@@ -706,7 +1238,6 @@ impl ParanoidApiServer for RpcHandler {
             block_reward_micronoid: reward,
             block_reward_noid: reward as f64 / 1_000_000.0,
             active_slot_count: tip.active_slot_count,
-            history_proof_height,
         })
     }
 
@@ -869,9 +1400,8 @@ impl ParanoidApiServer for RpcHandler {
     /// The external miner brute-forces `nonce` such that:
     ///   `Poseidon2b(POWHDR__, patched_fields) < difficulty_target`
     ///
-    /// CANNOT change the coinbase address: it is committed via the
-    /// block certificate which the full node generates. Changing the
-    /// coinbase would require regenerating the certificate.
+    /// Every semantic field, including the coinbase address, is fixed inside
+    /// the node-owned prepared attempt. The worker can return only a nonce.
     async fn get_block_template(&self, miner_address: String) -> RpcResult<BlockTemplateResponse> {
         if !self.mining_api_enabled {
             return Err(rpc_err(
@@ -884,331 +1414,63 @@ impl ParanoidApiServer for RpcHandler {
         } else {
             Some(parse_address_param(&miner_address)?)
         };
-
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        let builder = TemplateBuilder::new(self.mempool.clone());
-        // Snapshot/reorg installation holds the same gate while it replaces
-        // chain, mempool and wallet views.  Capture only the parent+payout
-        // boundary under that gate, then release it before the expensive
-        // detached proof is assembled.  A later snapshot makes the template
-        // stale and submitBlock rejects it by parent hash.
-        let wallet_operation = self.wallet_operation_gate.lock().await;
-        // Resolve the default payout under the same chain guard that captures
-        // the template parent. Account activation also takes `chain -> wallet`,
-        // so a new template cannot pair a new account with an old snapshot (or
-        // vice versa). Custom authenticated payouts remain caller-selected.
-        let (snapshot, addr) = {
-            let mut ctx = self.chain.write().await;
-            let operator_payout = self.resolved_mining_payout()?;
-            let addr = match requested {
-                None => operator_payout,
-                Some(requested) if self.allow_custom_coinbase => requested,
-                Some(requested) if requested.0 == operator_payout.0 => requested,
-                Some(_) => {
-                    return Err(rpc_err(
-                        "miner_address must match the node's configured payout address. \
-                         Use empty string \"\" to use the node's address, or start the \
-                         node with --allow-custom-coinbase (requires --mining-key) to \
-                         allow miners to specify their own payout address.",
-                    ));
-                }
-            };
-            let snapshot = TemplateChainSnapshot::from_context(&mut ctx)
-                .map_err(|e| rpc_err(format!("template snapshot: {e:?}")))?;
-            (snapshot, addr)
-        };
-        drop(wallet_operation);
-        let prev_state_root = snapshot.prev_state_root();
-        let tmpl = builder
-            .build_from_snapshot(&snapshot, addr, now)
-            .await
-            .ok_or_else(|| rpc_err("template build failed"))?;
-
-        let height = tmpl.inner.height;
-        let n_txs = tmpl.inner.n_txs();
-        let tx_input_counts: Vec<usize> = tmpl
-            .inner
-            .txs
-            .iter()
-            .map(|tx| tx.body.live_input_count())
-            .collect();
-        let tx_output_counts: Vec<usize> = tmpl
-            .inner
-            .txs
-            .iter()
-            .map(|tx| tx.body.live_output_count())
-            .collect();
-        let coinbase_value_micronoid: u64 = tmpl
-            .inner
-            .coinbase
-            .body
-            .live_outputs()
-            .map(|(_, output)| output.amount)
-            .fold(0u64, |acc, value| acc.saturating_add(value));
-        let claimable_fees_micronoid = tmpl
-            .inner
-            .txs
-            .iter()
-            .map(|tx| {
-                noid_chain::consensus::claimable_fee_for_tx_body(
-                    &tx.body,
-                    tmpl.parent.active_slot_count,
-                    tmpl.parent.log_slots,
-                )
-            })
-            .fold(0u64, |acc, fee| acc.saturating_add(fee));
-        let pow_header = tmpl.header_for_pow(0);
-        let pow_fields_hex = encode_pow_fields_hex(&pow_header);
-        let diff_target = pow_header.difficulty_target;
-
-        // Run certificate assembly so detached proof data is ready.
-        // External miner only needs to patch the nonce — no other computation required.
-        // Coinbase-only blocks carry no proof; user-tx blocks carry proof + auth sidecar.
-        let tmpl_for_prove = tmpl.clone();
-        let (proof_bytes, auth_sidecar_bytes) = tokio::task::spawn_blocking(move || {
-            noid_miner::run_prove_block_for_rpc(&tmpl_for_prove, prev_state_root)
+        let preparation = self
+            .external_mining_attempts
+            .reserve_preparation(Instant::now())
+            .map_err(rpc_err)?;
+        let handler = self.clone();
+        // The task, not the request future, owns the lease. Dropping a client
+        // connection detaches this coordinator but cannot admit a second
+        // attempt while its blocking preparation is still running.
+        tokio::spawn(async move {
+            handler
+                .prepare_external_mining_attempt(requested, preparation)
+                .await
         })
         .await
-        .map_err(|e| rpc_err(format!("prove task: {e}")))?
-        .map_err(|e| rpc_err(format!("prove_block: {e}")))?;
-
-        // Seal block with nonce = 0. External miner patches the advertised
-        // version-aware `nonce_offset` below.
-        let sealed = tmpl.seal(0);
-        let block_bytes = sealed.to_bytes();
-
-        // Serialized blocks carry a version prefix before the semantic header.
-        let nonce_offset = BLOCK_WIRE_NONCE_OFFSET;
-
-        let block_proof_hex = hex::encode(&proof_bytes);
-        let block_auth_sidecar_hex = hex::encode(&auth_sidecar_bytes);
-        Ok(BlockTemplateResponse {
-            pow_fields_hex,
-            block_hex: hex::encode(block_bytes),
-            block_proof_hex: block_proof_hex.clone(),
-            block_auth_sidecar_hex,
-            nonce_offset,
-            difficulty_target_hex: hex::encode(diff_target),
-            height,
-            n_txs,
-            tx_input_counts,
-            tx_output_counts,
-            coinbase_value_micronoid,
-            claimable_fees_micronoid,
-            has_block_proof: !block_proof_hex.is_empty(),
-            block_proof_size_bytes: proof_bytes.len(),
-        })
+        .map_err(|error| rpc_err(format!("external mining coordinator failed: {error}")))?
     }
 
-    /// Submit a mined block (from external miner or internal PoW).
-    ///
-    /// `block_hex`: hex-encoded serialized `Block` bytes.
-    /// `block_proof_hex`: serialized `BlockProof` bytes, empty for coinbase-only blocks.
-    /// `block_auth_sidecar_hex`: serialized `BlockAuthSidecar` bytes, empty for coinbase-only blocks.
-    async fn submit_block(
-        &self,
-        block_hex: String,
-        block_proof_hex: String,
-        block_auth_sidecar_hex: String,
-    ) -> RpcResult<String> {
+    /// Consume one node-owned template and submit its canonical LE nonce.
+    async fn submit_block(&self, template_id: String, nonce_hex: String) -> RpcResult<String> {
+        let nonce_submitted_at = Instant::now();
         if !self.mining_api_enabled {
             return Err(rpc_err(
                 "external mining API is disabled; start this node with --mode extminer",
             ));
         }
 
-        let bytes = decode_bounded_hex("block", &block_hex, MAX_BLOCK_BYTES)?;
-        let block =
-            Block::from_bytes(&bytes).map_err(|e| rpc_err(format!("decode block: {e:?}")))?;
-        let block_proof_bytes = if block_proof_hex.is_empty() {
-            Vec::new()
-        } else {
-            decode_bounded_hex("block proof", &block_proof_hex, MAX_BLOCK_PROOF_BYTES)?
+        let template_id = decode_external_template_id(&template_id)?;
+        let nonce = decode_external_nonce_hex(&nonce_hex)?;
+        let (tip_height, tip_id) = {
+            let chain = self.chain.read().await;
+            let tip = chain.tip_header();
+            (tip.height, block_id(tip))
         };
-        let block_auth_sidecar_bytes = if block_auth_sidecar_hex.is_empty() {
-            Vec::new()
-        } else {
-            decode_bounded_hex(
-                "block auth sidecar",
-                &block_auth_sidecar_hex,
-                MAX_BLOCK_AUTH_SIDECAR_BYTES,
-            )?
-        };
-        if !proof_sidecar_combined_len_ok(block_proof_bytes.len(), block_auth_sidecar_bytes.len()) {
-            return Err(rpc_err(format!(
-                "block proof+auth sidecar too large: proof={} bytes, sidecar={} bytes",
-                block_proof_bytes.len(),
-                block_auth_sidecar_bytes.len()
-            )));
-        }
-
-        let local_time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        // Serialize the complete canonical apply + wallet delta + mempool
-        // view update against snapshot/reorg replacement.  Decoding and wire
-        // caps above need no shared state, so malformed submissions never
-        // occupy this gate.
-        let wallet_operation = self.wallet_operation_gate.lock().await;
-
-        // Single production path: verify the minimal block proof, apply the
-        // proven transition, then commit atomically to MDBX.
-        let (hash, new_view, coverage_attestation_bytes) = {
-            let mut ctx = self.chain.write().await;
-            // External miners mine templates built by THIS node, so a header
-            // that advances `attested_coverage` refers to a Link terminal this
-            // node already holds in its durable verified results store.
-            // Recover those bytes locally; the RPC wire stays unchanged. A
-            // missing terminal leaves the payload empty and the acceptance
-            // path rejects the block fail-closed.
-            let coverage_attestation_bytes: Vec<u8> =
-                if block.header.attested_coverage != ctx.tip_header().attested_coverage {
-                    let coverage_height = block.header.attested_coverage;
-                    ctx.get_header_from_store(coverage_height)
-                        .ok()
-                        .flatten()
-                        .and_then(|header| {
-                            ctx.store
-                                .get_selected_history_terminal_result_at(
-                                    coverage_height,
-                                    noid_chain::hash_block_header(&header),
-                                )
-                                .ok()
-                                .flatten()
-                        })
-                        .map(|result| result.bytes)
-                        .unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
-            let attestation_store = ctx.store.clone();
-            ctx.apply_next_block(
-                &block,
-                &block_proof_bytes,
-                &block_auth_sidecar_bytes,
-                &coverage_attestation_bytes,
-                local_time,
-                |block,
-                 proof_bytes,
-                 auth_sidecar_bytes,
-                 parent,
-                 prev_timestamps,
-                 prev_active_counts,
-                 local_time,
-                 tx_epoch_anchor_id,
-                 anchor,
-                 state| {
-                    noid_miner::install_process_proof_cpu(|| {
-                        let tx_epoch = noid_block::BlockTxEpochContext {
-                            expected_user_epoch_anchor_id: *tx_epoch_anchor_id,
-                        };
-                        let output = noid_block::accept_block_with_artifacts(
-                            block,
-                            proof_bytes,
-                            auth_sidecar_bytes,
-                            parent,
-                            prev_timestamps,
-                            prev_active_counts,
-                            local_time,
-                            &tx_epoch,
-                            anchor,
-                            state,
-                        )?;
-                        accepted_block_validation(
-                            block,
-                            parent,
-                            prev_timestamps,
-                            prev_active_counts,
-                            anchor,
-                            proof_bytes,
-                            auth_sidecar_bytes,
-                            &output.artifacts,
-                            output.state_root,
-                        )
-                    })
-                    .map_err(|error| {
-                        noid_block::FullValidationError::Consensus(
-                            noid_chain::consensus::ConsensusError::ShapeMismatch(format!(
-                                "process proof CPU admission failed: {error}"
-                            )),
-                        )
-                    })?
-                },
-                |claim| {
-                    let expected = attestation_store
-                        .get_selected_history_terminal_result_at(
-                            claim.coverage_height,
-                            noid_chain::hash_block_header(&claim.header_at_coverage),
-                        )
-                        .map_err(|error| {
-                            format!("durable terminal read failed at attested coverage: {error}")
-                        })?
-                        .ok_or_else(|| {
-                            "no durable verified terminal at the attested coverage".to_string()
-                        })?;
-                    if expected.bytes != claim.attestation_bytes {
-                        return Err(
-                            "attestation differs from the durable verified terminal".to_string()
-                        );
-                    }
-                    Ok(())
-                },
-            )
-            .map_err(|e| rpc_err(format!("consensus: {e}")))?;
-            // The block is already durably committed. Keep the chain write
-            // guard while applying its wallet delta (`chain -> wallet`), but a
-            // wallet artifact failure must never report or attempt a consensus
-            // rollback of that committed block.
-            if let Err(error) = self.wallet.on_accepted_block(&block) {
-                tracing::error!(
-                    height = block.header.height,
-                    %error,
-                    "committed RPC block but wallet update failed"
-                );
-            }
-            let hash = block_id(&block.header);
-            let view = noid_mempool::ChainView::from_mdbx(&ctx);
-            (hash, view, coverage_attestation_bytes)
-        };
-
-        // Update mempool after confirmed block.
-        let confirmed: Vec<_> = block.transactions.iter().map(|tx| tx.txid()).collect();
-        self.mempool
-            .on_new_block(&confirmed, block.header.height, new_view)
-            .await;
-        drop(wallet_operation);
-
-        tracing::info!(
-            height = block.header.height,
-            hash = %hex::encode(hash),
-            "block submitted via RPC"
-        );
-
-        let mut header_bytes = Vec::new();
-        block.header.encode(&mut header_bytes);
-        if let Err(e) = self
-            .p2p_cmd
-            .send(noid_p2p::NetworkCommand::AnnounceBlock {
-                height: block.header.height,
-                hash,
-                header_bytes,
-                block_bytes: bytes,
-                block_proof_bytes,
-                block_auth_sidecar_bytes,
-                coverage_attestation_bytes,
-            })
-            .await
-        {
-            tracing::warn!(height = block.header.height, err = %e, "failed to broadcast RPC-submitted block");
-        }
-
-        Ok(hex::encode(hash))
+        let proving = self
+            .external_mining_attempts
+            .begin_proving(template_id, Instant::now(), tip_height, tip_id)
+            .map_err(|error| match error {
+                ExternalMiningConsumeError::Unavailable => {
+                    rpc_err("external mining template is unknown, expired, consumed, or busy")
+                }
+                ExternalMiningConsumeError::Stale => {
+                    rpc_err("stale external mining template parent")
+                }
+            })?;
+        let handler = self.clone();
+        // Keep the Proving marker in an owned task. If the RPC client
+        // disconnects, proof/commit continues to own the sole slot and its
+        // lease releases it on every return or panic path.
+        tokio::spawn(async move {
+            let ExternalMiningProvingAttempt { prepared, lease } = proving;
+            let _lease = lease;
+            handler
+                .finalize_node_owned_template_after_nonce(prepared, nonce, nonce_submitted_at)
+                .await
+        })
+        .await
+        .map_err(|error| rpc_err(format!("external proving coordinator failed: {error}")))?
     }
 
     // -----------------------------------------------------------------------
@@ -1555,6 +1817,111 @@ mod tests {
     use super::*;
 
     #[test]
+    fn external_mining_slot_owns_exactly_one_attempt() {
+        let now = Instant::now();
+        let mut slot = ExternalMiningAttemptSlot::new(7);
+        let template_id = slot.reserve_preparation(now).unwrap();
+        assert!(slot.reserve_preparation(now).is_err());
+        slot.install_ready(
+            template_id,
+            "prepared",
+            11,
+            [3u8; 32],
+            now + Duration::from_secs(30),
+        )
+        .unwrap();
+
+        let mut unknown = template_id;
+        unknown[15] ^= 1;
+        assert_eq!(
+            slot.begin_proving(unknown, now, 11, [3u8; 32]),
+            Err(ExternalMiningConsumeError::Unavailable)
+        );
+        assert_eq!(
+            slot.begin_proving(template_id, now, 11, [3u8; 32]),
+            Ok("prepared")
+        );
+        assert!(slot.reserve_preparation(now).is_err());
+        slot.finish_proving(template_id);
+        assert!(slot.reserve_preparation(now).is_ok());
+    }
+
+    #[test]
+    fn external_mining_slot_drops_expired_and_stale_ready_attempts() {
+        let now = Instant::now();
+        let mut slot = ExternalMiningAttemptSlot::new(9);
+        let expired = slot.reserve_preparation(now).unwrap();
+        slot.install_ready(expired, (), 4, [1u8; 32], now).unwrap();
+        assert!(slot.reserve_preparation(now).is_ok());
+
+        let active = match &slot.state {
+            ExternalMiningAttemptState::Preparing { template_id, .. } => *template_id,
+            _ => panic!("fresh reservation must be preparing"),
+        };
+        slot.install_ready(active, (), 5, [2u8; 32], now + Duration::from_secs(30))
+            .unwrap();
+        slot.invalidate_except(6, [4u8; 32]);
+        assert_eq!(
+            slot.begin_proving(active, now, 6, [4u8; 32]),
+            Err(ExternalMiningConsumeError::Unavailable)
+        );
+        assert!(slot.reserve_preparation(now).is_ok());
+    }
+
+    #[test]
+    fn canonical_advance_invalidates_preparing_but_keeps_proving_occupied() {
+        let now = Instant::now();
+        let mut slot = ExternalMiningAttemptSlot::new(11);
+        let preparing = slot.reserve_preparation(now).unwrap();
+        slot.invalidate_except(8, [8u8; 32]);
+        assert!(slot
+            .install_ready(preparing, (), 7, [7u8; 32], now + Duration::from_secs(30),)
+            .is_err());
+        let proving = slot.reserve_preparation(now).unwrap();
+        slot.install_ready(proving, (), 8, [8u8; 32], now + Duration::from_secs(30))
+            .unwrap();
+        slot.begin_proving(proving, now, 8, [8u8; 32]).unwrap();
+        slot.invalidate_except(9, [9u8; 32]);
+        assert!(slot.reserve_preparation(now).is_err());
+        slot.finish_proving(proving);
+        assert!(slot.reserve_preparation(now).is_ok());
+    }
+
+    #[test]
+    fn preparation_lease_drop_releases_only_its_own_token() {
+        let attempts = ExternalMiningAttemptInvalidator::new();
+        let first = attempts.reserve_preparation(Instant::now()).unwrap();
+        assert!(attempts.reserve_preparation(Instant::now()).is_err());
+        drop(first);
+        let second = attempts.reserve_preparation(Instant::now()).unwrap();
+        let second_id = second.template_id();
+        let mut stale_id = second_id;
+        stale_id[15] ^= 1;
+        attempts.inner.lock().unwrap().cancel_preparation(stale_id);
+        assert!(attempts.reserve_preparation(Instant::now()).is_err());
+        drop(second);
+        assert!(attempts.reserve_preparation(Instant::now()).is_ok());
+    }
+
+    #[test]
+    fn proving_lease_drop_releases_the_occupied_slot() {
+        let attempts = ExternalMiningAttemptInvalidator::new();
+        let mut preparation = attempts.reserve_preparation(Instant::now()).unwrap();
+        let template_id = preparation.template_id();
+        attempts.inner.lock().unwrap().state = ExternalMiningAttemptState::Proving { template_id };
+        preparation.armed = false;
+        drop(preparation);
+
+        let proving = ExternalMiningProvingLease {
+            attempts: attempts.clone(),
+            template_id,
+        };
+        assert!(attempts.reserve_preparation(Instant::now()).is_err());
+        drop(proving);
+        assert!(attempts.reserve_preparation(Instant::now()).is_ok());
+    }
+
+    #[test]
     fn transaction_count_validation_matches_tx8x2() {
         assert!(validate_tx_counts(1, 1).is_ok());
         assert!(validate_tx_counts(8, 2).is_ok());
@@ -1584,59 +1951,41 @@ mod tests {
     #[test]
     fn block_template_response_serializes_canonical_counts() {
         let response = BlockTemplateResponse {
+            template_id: "00112233445566778899aabbccddeeff".into(),
             pow_fields_hex: "00".into(),
-            block_hex: "11".into(),
-            block_proof_hex: "22".into(),
-            block_auth_sidecar_hex: "33".into(),
-            nonce_offset: BLOCK_WIRE_NONCE_OFFSET,
+            nonce_field_index: POW_NONCE_FIELD_INDEX,
             difficulty_target_hex: "ff".into(),
             height: 7,
+            expires_in_seconds: 30,
             n_txs: 3,
             tx_input_counts: vec![2, 5],
             tx_output_counts: vec![2, 1],
             coinbase_value_micronoid: 50,
             claimable_fees_micronoid: 9,
-            has_block_proof: true,
-            block_proof_size_bytes: 1234,
         };
 
         let json = serde_json::to_value(response).expect("serialize template response");
         assert_eq!(json["tx_input_counts"][1], 5);
-        assert_eq!(json["has_block_proof"], true);
+        assert_eq!(json["template_id"], "00112233445566778899aabbccddeeff");
+        assert_eq!(json["nonce_field_index"], POW_NONCE_FIELD_INDEX);
+        assert_eq!(json["expires_in_seconds"], 30);
+        assert_eq!(json.as_object().unwrap().len(), 11);
     }
 
     #[test]
-    fn selected_history_serving_requires_retained_suffix() {
-        let retention = noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH;
-        assert!(snapshot_suffix_is_retained(100, 100));
-        assert!(snapshot_suffix_is_retained(100, 100 - retention));
-        assert!(!snapshot_suffix_is_retained(100, 100 - retention - 1));
-        assert!(!snapshot_suffix_is_retained(100, 101));
-    }
-
-    #[test]
-    fn extminer_acceptance_runs_inside_process_proof_pool() {
-        let source = include_str!("server.rs");
-        let submit_block = source
-            .split_once("async fn submit_block(")
-            .expect("submit_block method exists")
-            .1
-            .split_once("async fn wallet_status(")
-            .expect("wallet_status follows submit_block")
-            .0;
-        let pool_boundary = submit_block
-            .find("noid_miner::install_process_proof_cpu(||")
-            .expect("submit validation installs the process proof pool");
-        let acceptance = submit_block
-            .find("noid_block::accept_block_with_artifacts(")
-            .expect("submit validation performs full block acceptance");
-        let post_validation = submit_block
-            .find("accepted_block_validation(")
-            .expect("submit validation builds post-validation artifacts");
-
-        assert!(pool_boundary < acceptance);
-        assert!(acceptance < post_validation);
-        assert!(submit_block.contains("process proof CPU admission failed: {error}"));
+    fn external_nonce_is_exact_canonical_little_endian_u128() {
+        let bytes = [
+            0xef, 0xcd, 0xab, 0x89, 0x67, 0x45, 0x23, 0x01, 0xef, 0xcd, 0xab, 0x89, 0x67, 0x45,
+            0x23, 0x01,
+        ];
+        let encoded = hex::encode(bytes);
+        assert_eq!(
+            decode_external_nonce_hex(&encoded).unwrap(),
+            0x0123_4567_89ab_cdef_0123_4567_89ab_cdef
+        );
+        assert!(decode_external_nonce_hex(&encoded.to_uppercase()).is_err());
+        assert!(decode_external_nonce_hex(&format!("0x{encoded}")).is_err());
+        assert!(decode_external_nonce_hex(&encoded[..30]).is_err());
     }
 }
 
@@ -1657,6 +2006,11 @@ pub async fn start_rpc_server(
     wallet: Arc<dyn WalletOps + Send + Sync>,
     wallet_operation_gate: WalletOperationGate,
     p2p_cmd: tokio::sync::mpsc::Sender<noid_p2p::NetworkCommand>,
+    history_step_runtime: Option<Arc<noid_recursive::acceptance::history_step::HistoryStepRuntime>>,
+    history_step_ghost: Option<
+        Arc<noid_recursive::acceptance::history_step::PreparedHistoryStepGhostAuthorization>,
+    >,
+    external_mining_attempts: ExternalMiningAttemptInvalidator,
     mining_api_enabled: bool,
     mining_payout_address: Option<noid_poseidon2b::primitives::Address>,
     mining_key: Option<String>,
@@ -1678,6 +2032,9 @@ pub async fn start_rpc_server(
         mining_payout_address,
         mining_key: mining_key.clone(),
         allow_custom_coinbase,
+        history_step_runtime,
+        history_step_ghost,
+        external_mining_attempts,
     };
 
     // Always add the Bearer-auth middleware layer.

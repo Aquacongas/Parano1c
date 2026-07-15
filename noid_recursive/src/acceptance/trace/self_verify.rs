@@ -55,6 +55,45 @@ pub fn flat_digest_lanes(d: &Hash) -> [F128; 2] {
     ]
 }
 
+/// Absorb a verifier-key digest with the native byte transcript encoding.
+/// The digest travels as two data lanes pinned to exact constants in the
+/// enclosing matrix, so the compiled schedule is independent of absolute
+/// witness-slice addresses while the transcript value remains authenticated.
+pub(crate) fn observe_pinned_digest<C: FsChannelOps>(
+    b: &mut FieldR1csBuilder,
+    channel: &mut C,
+    digest: &Hash,
+) {
+    let lanes = flat_digest_lanes(digest).map(|lane| {
+        let wire = LinExpr::from_wire(b.alloc_f128(lane));
+        pin_eq(b, &wire, &LinExpr::constant(lane));
+        wire
+    });
+    channel.observe_lanes(b, 32, &lanes);
+}
+
+/// Keep verifier-derived claim coordinates out of a recorded transcript's
+/// constant schedule. Constant coordinates are still fixed by matrix rows;
+/// only their transcript representation becomes a data lane. Non-constant
+/// coordinates already have a witness source and are reused unchanged.
+fn pin_transcript_constant_coordinates(
+    b: &mut FieldR1csBuilder,
+    coordinates: &[LinExpr],
+) -> Vec<LinExpr> {
+    coordinates
+        .iter()
+        .map(|coordinate| {
+            if !coordinate.is_const() {
+                return coordinate.clone();
+            }
+            let value = coordinate.eval(b.values());
+            let wire = LinExpr::from_wire(b.alloc_f128(value));
+            pin_eq(b, &wire, coordinate);
+            wire
+        })
+        .collect()
+}
+
 /// Allocate a witness digest (two flat lanes).
 pub fn alloc_flat_digest(b: &mut FieldR1csBuilder, d: &Hash) -> FlatDigestExpr {
     let [lo, hi] = flat_digest_lanes(d);
@@ -1785,7 +1824,8 @@ pub fn verify_opening_batch_quirky_direct_trace_region(
         ch.observe_label(b, b"history-pcs-quirky-direct-v1");
         ch.observe_f128(b, &c.z_skip);
         ch.observe_f128(b, &LinExpr::constant(F128::new(c.k_skip as u64, 0)));
-        ch.observe_f128_slice(b, &c.x_rest);
+        let transcript_x_rest = pin_transcript_constant_coordinates(b, &c.x_rest);
+        ch.observe_f128_slice(b, &transcript_x_rest);
         ch.observe_f128(b, &c.value);
     }
     let gammas: Vec<LinExpr> = (0..claims.len()).map(|_| ch.sample_f128(b)).collect();
@@ -2348,16 +2388,29 @@ fn verify_field_trace_inner(
 // Shape-only proof synthesis (recording-layout derivation)
 // ---------------------------------------------------------------------------
 
-/// Zero-valued `FieldR1csProof` of the exact class shape, PATH-FREE (the
-/// region-mode allocation).  It cannot verify; its only role is deriving the
-/// value-independent [R]-replay transcript SCHEDULE (the recorded op stream)
-/// when a recording layout is frozen before any real proof of the class
-/// exists.  Query positions start at zero — the layout-derivation driver
-/// patches them to the transcript-derived values between its two passes.
+fn canonical_zero_merkle_path(lanes: usize, depth: usize) -> (Vec<Hash>, Hash) {
+    let leaf = merkle::hash_leaf(&vec![0u8; lanes * 16]);
+    let mut carried = leaf;
+    let mut path = Vec::with_capacity(depth);
+    for _ in 0..depth {
+        path.push(carried);
+        carried = merkle::hash_pair(&carried, &carried);
+    }
+    (path, carried)
+}
+
+/// Zero-valued `FieldR1csProof` and its exact commitment root for recording
+/// layout derivation. It cannot verify algebraically, but every Merkle path is
+/// an honest path in the uniform zero-leaf tree. This matters even under the
+/// disabled base arm: the post-commit region columns still enforce their
+/// native hash relation and may never be populated with fake zero roots.
+/// Query positions start at zero; the layout driver patches them between its
+/// two passes. Uniform-tree siblings make the authenticated root independent
+/// of those positions.
 pub(crate) fn shape_only_field_r1cs_proof(
     shape: &noid_ivc_core::proof::FieldShape,
     pcs_params: &PcsParams,
-) -> noid_ivc_core::proof::FieldR1csProof {
+) -> (noid_ivc_core::proof::FieldR1csProof, Hash) {
     let log_msg_len = pcs_params.m - LOG_PACKING;
     let log_batch_size = pcs_params.log_batch_size;
     let log_dim = log_msg_len - log_batch_size;
@@ -2378,10 +2431,20 @@ pub(crate) fn shape_only_field_r1cs_proof(
             shape
         })
         .collect();
+    let (initial_path, initial_root) = canonical_zero_merkle_path(1usize << log_batch_size, k_code);
+    let (post_row_batch_path, post_row_batch_root) = if arities.is_empty() {
+        (Vec::new(), [0u8; 32])
+    } else {
+        canonical_zero_merkle_path(1usize << arity_0, k_code - arity_0)
+    };
+    let epoch_paths_and_roots = epoch_shapes
+        .iter()
+        .map(|&(lanes, depth)| canonical_zero_merkle_path(lanes, depth))
+        .collect::<Vec<_>>();
     let query = pcs::basefold::QueryOpening {
         position: 0,
         initial_leaf: vec![F128::ZERO; 1usize << log_batch_size],
-        initial_path: vec![[0u8; 32]; k_code],
+        initial_path,
         post_row_batch_leaf: if arities.is_empty() {
             Vec::new()
         } else {
@@ -2390,18 +2453,18 @@ pub(crate) fn shape_only_field_r1cs_proof(
         post_row_batch_path: if arities.is_empty() {
             Vec::new()
         } else {
-            vec![[0u8; 32]; k_code - arity_0]
+            post_row_batch_path
         },
         epoch_leaves: epoch_shapes
             .iter()
             .map(|&(lanes, _)| vec![F128::ZERO; lanes])
             .collect(),
-        epoch_paths: epoch_shapes
+        epoch_paths: epoch_paths_and_roots
             .iter()
-            .map(|&(_, depth)| vec![[0u8; 32]; depth])
+            .map(|(path, _)| path.clone())
             .collect(),
     };
-    noid_ivc_core::proof::FieldR1csProof {
+    let proof = noid_ivc_core::proof::FieldR1csProof {
         zerocheck: zerocheck::ZerocheckProof {
             round1_ab: vec![F128::ZERO; 1usize << K_SKIP],
             round1_c: vec![F128::ZERO; 1usize << K_SKIP],
@@ -2422,8 +2485,13 @@ pub(crate) fn shape_only_field_r1cs_proof(
                 };
                 log_msg_len
             ],
-            post_row_batch_commit: pcs::RoundCommitment { root: [0u8; 32] },
-            round_commitments: vec![pcs::RoundCommitment { root: [0u8; 32] }; num_fri_commits],
+            post_row_batch_commit: pcs::RoundCommitment {
+                root: post_row_batch_root,
+            },
+            round_commitments: epoch_paths_and_roots
+                .iter()
+                .map(|(_, root)| pcs::RoundCommitment { root: *root })
+                .collect(),
             final_a: F128::ZERO,
             final_b: F128::ZERO,
             final_codeword: vec![F128::ZERO; 1usize << pcs_params.log_inv_rate],
@@ -2434,7 +2502,8 @@ pub(crate) fn shape_only_field_r1cs_proof(
             pow_nonce: 0,
             queries: vec![query; n_queries],
         },
-    }
+    };
+    (proof, initial_root)
 }
 
 /// Overwrite a shape-only proof's query positions with the transcript-derived
@@ -2478,6 +2547,68 @@ pub(crate) fn patch_shape_only_query_positions(
 mod tests {
     use super::*;
     use noid_ivc_core::challenger::{fs_pack_bytes_lanes, Challenger, FsLaneChallenger};
+    use noid_ivc_core::deep_chain::schedule::{compile_duplex, DuplexLayout};
+    use noid_ivc_core::field_circuit::FsChannelUnionRecorder;
+
+    fn lanes_bytes(lanes: &[F128]) -> Vec<u8> {
+        lanes
+            .iter()
+            .flat_map(|lane| f128_to_u128(*lane).to_le_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn shape_only_envelope_uses_honest_uniform_merkle_trees() {
+        use crate::acceptance::history_step_bank::{
+            canonical_history_step_pcs_params, canonical_history_step_shape,
+            CanonicalHistoryStepClassId, HISTORY_STEP_TIER_SLOT_COUNT,
+        };
+
+        for slot in 0..HISTORY_STEP_TIER_SLOT_COUNT {
+            let class = CanonicalHistoryStepClassId::new(slot, 0).unwrap();
+            let params = canonical_history_step_pcs_params(class);
+            let shape = canonical_history_step_shape(class);
+            let (mut proof, commitment_root) = shape_only_field_r1cs_proof(&shape, &params);
+            let log_dim = params.log_dim();
+            let k_code = log_dim + params.log_inv_rate;
+            let arities = compute_fri_arities(log_dim);
+            let arity_0 = arities[0];
+            let position = (1usize << k_code) - 1;
+            proof.pcs_open.queries[0].position = position;
+            let query = &proof.pcs_open.queries[0];
+
+            let initial_leaf = merkle::hash_leaf(&lanes_bytes(&query.initial_leaf));
+            assert!(merkle::verify_merkle_proof(
+                &commitment_root,
+                &initial_leaf,
+                position,
+                &query.initial_path,
+            ));
+            let post_leaf = merkle::hash_leaf(&lanes_bytes(&query.post_row_batch_leaf));
+            assert!(merkle::verify_merkle_proof(
+                &proof.pcs_open.post_row_batch_commit.root,
+                &post_leaf,
+                position >> arity_0,
+                &query.post_row_batch_path,
+            ));
+            let mut consumed = arity_0;
+            for (index, (leaf, path)) in query
+                .epoch_leaves
+                .iter()
+                .zip(&query.epoch_paths)
+                .enumerate()
+            {
+                consumed += arities[index + 1];
+                let leaf_hash = merkle::hash_leaf(&lanes_bytes(leaf));
+                assert!(merkle::verify_merkle_proof(
+                    &proof.pcs_open.round_commitments[index].root,
+                    &leaf_hash,
+                    position >> consumed,
+                    path,
+                ));
+            }
+        }
+    }
     use noid_ivc_core::field_circuit::FsChannelTrace;
 
     struct Rng(u128);
@@ -3889,5 +4020,64 @@ mod tests {
             let (r1cs, z) = b.build();
             assert!(r1cs.satisfies(&z));
         }
+    }
+
+    #[test]
+    fn observe_pinned_digest_matches_native_bytes() {
+        let digest = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff, 0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa, 0x99, 0x88, 0x77, 0x66, 0x55, 0x44,
+            0x33, 0x22, 0x11, 0x00,
+        ];
+        let domain = b"pinned-vk-digest-test";
+        let mut native = FsLaneChallenger::new(domain);
+        native.observe_bytes(&digest);
+        let expected = native.sample_f128();
+
+        let mut b = FieldR1csBuilder::new();
+        let mut trace = FsChannelTrace::new(&mut b, domain);
+        observe_pinned_digest(&mut b, &mut trace, &digest);
+        let actual = trace.sample_f128(&mut b);
+        assert_eq!(actual.eval(b.values()), expected);
+
+        let (r1cs, witness) = b.build();
+        assert!(r1cs.satisfies(&witness));
+    }
+
+    fn pinned_coordinate_recording(values: &[F128]) -> (DuplexLayout, F128) {
+        let domain = b"pinned-claim-coordinates-test";
+        let mut native = FsLaneChallenger::new(domain);
+        native.observe_f128_slice(values);
+        let expected = native.sample_f128();
+
+        let mut b = FieldR1csBuilder::new();
+        let coordinates = values
+            .iter()
+            .copied()
+            .map(LinExpr::constant)
+            .collect::<Vec<_>>();
+        let coordinates = pin_transcript_constant_coordinates(&mut b, &coordinates);
+        let mut recorder = FsChannelUnionRecorder::new(domain);
+        recorder.observe_f128_slice(&mut b, &coordinates);
+        let actual = recorder.sample_f128(&mut b);
+        let recording = recorder.finish();
+
+        assert_eq!(actual.eval(b.values()), expected);
+        assert_eq!(recording.data_flat, values);
+        let layout = compile_duplex(&recording.ops);
+        let (r1cs, witness) = b.build();
+        assert!(r1cs.satisfies(&witness));
+        (layout, expected)
+    }
+
+    #[test]
+    fn pinned_claim_coordinates_are_value_independent_transcript_data() {
+        let (first, first_challenge) =
+            pinned_coordinate_recording(&[F128::ZERO, F128::ONE, F128::ZERO, F128::ONE]);
+        let (second, second_challenge) =
+            pinned_coordinate_recording(&[F128::ONE, F128::ZERO, F128::ONE, F128::ZERO]);
+        assert_eq!(first, second);
+        assert_eq!(first.n_data, 4);
+        assert_ne!(first_challenge, second_challenge);
     }
 }

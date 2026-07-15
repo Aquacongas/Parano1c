@@ -194,9 +194,8 @@ enum Command {
         height: u64,
     },
 
-    /// Recursive chain proof: height covered, proof size.
-    #[command(alias = "rec")]
-    Proof,
+    /// Current finalized HistoryStep terminal.
+    HistoryStepTerminal,
 
     /// UTXO slot by index: value and owner.
     Slot {
@@ -222,7 +221,7 @@ enum Command {
     /// UTXO state dimensions: capacity, fill %, size on disk, expansion headroom.
     State,
 
-    /// Mining info: difficulty, block reward, history proof height.
+    /// Mining info: difficulty, block reward, HistoryStep height.
     Mining,
 
     /// Number of connected peers.
@@ -357,18 +356,15 @@ enum Command {
         miner_addr: String,
     },
 
-    /// Submit a solved block plus BlockProof/AuthSidecar bytes from an external miner.
+    /// Submit a nonce for a node-owned, single-use mining template.
     #[command(name = "submit-block", alias = "submit")]
     SubmitBlock {
-        /// Solved block as hex (full block bytes with valid nonce).
-        #[arg(value_name = "BLOCK_HEX")]
-        block_hex: String,
-        /// Serialized BlockProof hex. Use empty string "" for coinbase-only blocks.
-        #[arg(value_name = "BLOCK_PROOF_HEX")]
-        block_proof_hex: String,
-        /// Serialized public BlockAuthSidecar hex. Omit or use "" when absent.
-        #[arg(value_name = "BLOCK_AUTH_SIDECAR_HEX")]
-        block_auth_sidecar_hex: Option<String>,
+        /// Opaque template identifier returned by `block-template`.
+        #[arg(value_name = "TEMPLATE_ID")]
+        template_id: String,
+        /// Exactly 16 little-endian nonce bytes as 32 lowercase hex characters.
+        #[arg(value_name = "NONCE_HEX")]
+        nonce_hex: String,
     },
 }
 
@@ -426,7 +422,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::BlockHeader { height } => cmd_block_header(&ctx, *height).await,
         Command::Block { height } => cmd_block(&ctx, *height).await,
         Command::Header { height } => cmd_header(&ctx, *height).await,
-        Command::Proof => cmd_proof(&ctx).await,
+        Command::HistoryStepTerminal => cmd_history_step_terminal(&ctx).await,
         Command::Slot { index } => cmd_slot(&ctx, *index).await,
         Command::UtxosOf { address } => cmd_utxos_of(&ctx, address).await,
         Command::Tx { txhash } => cmd_tx(&ctx, txhash).await,
@@ -461,18 +457,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Stop => cmd_stop(&ctx).await,
         Command::BlockTemplate { miner_addr } => cmd_block_template(&ctx, miner_addr).await,
         Command::SubmitBlock {
-            block_hex,
-            block_proof_hex,
-            block_auth_sidecar_hex,
-        } => {
-            cmd_submit_block(
-                &ctx,
-                block_hex,
-                block_proof_hex,
-                block_auth_sidecar_hex.as_deref(),
-            )
-            .await
-        }
+            template_id,
+            nonce_hex,
+        } => cmd_submit_block(&ctx, template_id, nonce_hex).await,
     }
 }
 
@@ -677,17 +664,17 @@ async fn cmd_header(ctx: &Ctx<'_>, height: u64) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn cmd_proof(ctx: &Ctx<'_>) -> anyhow::Result<()> {
-    let result = rpc(ctx, "getHistoryProof", &[])
+async fn cmd_history_step_terminal(ctx: &Ctx<'_>) -> anyhow::Result<()> {
+    let result = rpc(ctx, "getHistoryStepTerminal", &[])
         .await
-        .context("getHistoryProof")?;
+        .context("getHistoryStepTerminal")?;
 
     if ctx.json {
         return print_json(&result);
     }
 
     if result.is_null() {
-        warn_msg("No selected-history terminal is available at the finalized boundary.");
+        warn_msg("No HistoryStep terminal is available at the finalized boundary.");
         return Ok(());
     }
 
@@ -696,19 +683,19 @@ async fn cmd_proof(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     let kb = bytes as f64 / 1024.0;
 
     // Simple fingerprint: first 16 + last 16 chars of the hex
-    let proof_hash = if hex.len() >= 32 {
+    let terminal_fingerprint = if hex.len() >= 32 {
         format!("{}…{}", &hex[..8], &hex[hex.len() - 8..])
     } else {
         hex[..hex.len().min(16)].to_string()
     };
 
-    section("Selected history proof");
+    section("HistoryStep terminal");
     kv2(
         "Size",
         &format!("{bytes} bytes ({kb:.1} KB)"),
         "(constant-size history envelope)",
     );
-    kv("Fingerprint", &proof_hash);
+    kv("Fingerprint", &terminal_fingerprint);
     println!();
     println!(
         "  {} The terminal binds the selected chain boundary for O(1)-history verification.",
@@ -976,7 +963,6 @@ async fn cmd_mining(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     let diff_target = result["difficulty_target"].as_str().unwrap_or("?");
     let reward_micro = result["block_reward_micronoid"].as_u64().unwrap_or(0);
     let active = result["active_slot_count"].as_u64().unwrap_or(0);
-    let history_proof_height = result["history_proof_height"].as_u64();
     section("Mining info");
     kv("Height", &height.to_string());
     kv2(
@@ -990,10 +976,6 @@ async fn cmd_mining(ctx: &Ctx<'_>) -> anyhow::Result<()> {
         &format!("({reward_micro} \u{03bc}NOID)"),
     );
     kv("Active UTXOs", &active.to_string());
-    kv(
-        "History proof",
-        &history_proof_height.map_or("not available".into(), |h| format!("height {h}")),
-    );
     Ok(())
 }
 
@@ -2004,15 +1986,21 @@ async fn cmd_block_template(ctx: &Ctx<'_>, miner_addr: &str) -> anyhow::Result<(
 
     let height = result["height"].as_u64().unwrap_or(0);
     let n_txs = result["n_txs"].as_u64().unwrap_or(0);
-    let proof_size = result["block_proof_size_bytes"].as_u64().unwrap_or(0);
     let claimable_fees = result["claimable_fees_micronoid"].as_u64().unwrap_or(0);
     let coinbase_value = result["coinbase_value_micronoid"].as_u64().unwrap_or(0);
+    let template_id = result["template_id"].as_str().unwrap_or("");
+    let expires_in_seconds = result["expires_in_seconds"].as_u64().unwrap_or(0);
+    let nonce_field_index = result["nonce_field_index"].as_u64().unwrap_or(0);
+    let difficulty_target = result["difficulty_target_hex"].as_str().unwrap_or("");
     let pow_fields = result["pow_fields_hex"].as_str().unwrap_or("");
 
     section("Block template");
+    kv("Template ID", template_id);
     kv("Height", &height.to_string());
     kv("Txs in block", &n_txs.to_string());
-    kv("Block proof", &format!("{proof_size} bytes"));
+    kv("Expires in", &format!("{expires_in_seconds} s"));
+    kv("Nonce field", &nonce_field_index.to_string());
+    kv("Difficulty", difficulty_target);
     kv("Claimable fees", &format!("{claimable_fees} μNOID"));
     kv("Coinbase value", &format!("{coinbase_value} μNOID"));
     if !pow_fields.is_empty() {
@@ -2024,7 +2012,7 @@ async fn cmd_block_template(ctx: &Ctx<'_>, miner_addr: &str) -> anyhow::Result<(
     }
     println!();
     println!(
-        "  {} Search nonce with Poseidon2b(POWHDR__, semantic_header_fields) < difficulty_target, then submit.",
+        "  {} Search the nonce, then run `noid-cli submit-block {template_id} <32-char-lowercase-nonce-hex>`.",
         c!(DIM, "PoW:")
     );
     if !pow_fields.is_empty() {
@@ -2034,23 +2022,10 @@ async fn cmd_block_template(ctx: &Ctx<'_>, miner_addr: &str) -> anyhow::Result<(
     Ok(())
 }
 
-async fn cmd_submit_block(
-    ctx: &Ctx<'_>,
-    block_hex: &str,
-    block_proof_hex: &str,
-    block_auth_sidecar_hex: Option<&str>,
-) -> anyhow::Result<()> {
-    let result = rpc(
-        ctx,
-        "submitBlock",
-        &[
-            block_hex.into(),
-            block_proof_hex.into(),
-            block_auth_sidecar_hex.unwrap_or("").into(),
-        ],
-    )
-    .await
-    .context("submitBlock")?;
+async fn cmd_submit_block(ctx: &Ctx<'_>, template_id: &str, nonce_hex: &str) -> anyhow::Result<()> {
+    let result = rpc(ctx, "submitBlock", &[template_id.into(), nonce_hex.into()])
+        .await
+        .context("submitBlock")?;
 
     if ctx.json {
         return print_json(&result);

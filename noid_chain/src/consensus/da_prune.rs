@@ -10,9 +10,8 @@
 //! restore the prior UTXO state.
 //!
 //! After `UNDO_RETENTION_DEPTH` confirmations, the undo log for a block is
-//! pruned (`prune_undo_logs`). MDBX also prunes retained block bytes,
-//! BlockProof bytes, and Auth sidecars once finalized history/checkpoint
-//! coverage has consumed the same heights.
+//! pruned (`prune_undo_logs`). MDBX retains the matching recent accepted-block
+//! bundle suffix and one additional HistoryStep boundary terminal.
 
 use std::collections::{HashMap, HashSet};
 
@@ -187,7 +186,6 @@ mod tests {
                 log_slots: 8,
                 active_slot_count: 1,
                 alloc_counter: 1,
-                attested_coverage: 0,
             },
             transactions: vec![tx],
         }

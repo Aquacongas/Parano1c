@@ -4,10 +4,6 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 
-[features]
-default = []
-selected-zk-measurement = ["noid_recursive/selected-zk-measurement"]
-
 [dependencies]
 noid_core = { path = "../noid_core" }
 noid_fri = { path = "../noid_fri" }
@@ -15,8 +11,8 @@ noid_fri_binius = { path = "../noid_fri_binius" }
 noid_poseidon2b = { path = "../noid_poseidon2b" }
 noid_gkr = { path = "../noid_gkr" }
 noid_tx = { path = "../noid_tx" }
-noid_block = { path = "../noid_block" }
 noid_chain = { path = "../noid_chain" }
+noid_block = { path = "../noid_block" }
 noid_recursive = { path = "../noid_recursive" }
 noid_miner = { path = "../noid_miner" }
 noid-ivc-core = { path = "../noid_ivc_core" }
@@ -25,14 +21,10 @@ rayon = "1.10"
 bincode = "1"
 hex = "0.4"
 zstd = { version = "0.13", features = ["zstdmt"] }
-serde = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [[bench]]
 name = "alice_sends_bob"
-harness = false
-
-[[bench]]
-name = "block_scaling"
 harness = false
 
 [[bench]]
@@ -41,10 +33,6 @@ harness = false
 
 [[bench]]
 name = "poseidon_pow_mining"
-harness = false
-
-[[bench]]
-name = "tier1_shape_stats"
 harness = false
 
 [[bench]]
@@ -68,26 +56,5 @@ name = "pcs_roofline"
 harness = false
 
 [[bench]]
-name = "selected_zk_b255_measurement"
-harness = false
-required-features = ["selected-zk-measurement"]
-
-[[bench]]
-name = "accepted_b255_truth"
-harness = false
-
-[[bench]]
-name = "exact_state_structural_b255"
-harness = false
-
-[[bench]]
-name = "block_class_b8_proof"
-harness = false
-
-[[bench]]
-name = "block_class_ladder_proof"
-harness = false
-
-[[bench]]
-name = "canonical_ladder_capstone"
+name = "history_step_proof"
 harness = false

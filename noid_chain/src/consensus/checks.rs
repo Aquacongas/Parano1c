@@ -139,6 +139,37 @@ mod tests {
     }
 
     #[test]
+    fn reward_cannot_be_spent_inside_its_own_block() {
+        use crate::consensus::params::coinbase_creation_id;
+
+        let height = 7;
+        let reward_slot = 9;
+        let mut reward_outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        reward_outputs[0] = TxOutput {
+            slot_index: reward_slot,
+            amount: 10,
+            owner: Address([1u8; 32]),
+        };
+        let reward = Transaction::new(TxBody {
+            epoch_anchor: [2u8; 32],
+            fee: 0,
+            input_owner: Address([0u8; 32]),
+            inputs: [TxInput::dummy(); TX_INPUTS],
+            outputs: reward_outputs,
+            validity_bitmap: output_bitmap_bit(0),
+            is_coinbase: true,
+        });
+        let mut spend = user_tx(reward_slot, 10, [3u8; 32]);
+        spend.body.inputs[0].creation_id = coinbase_creation_id(height);
+        let spend = Transaction::new(spend.body);
+
+        assert_eq!(
+            validate_block_slot_conflicts(&[reward, spend]),
+            Err(ConsensusError::SlotConflict)
+        );
+    }
+
+    #[test]
     fn disjoint_actions_pass() {
         assert_eq!(
             validate_block_slot_conflicts(&[user_tx(1, 2, [3u8; 32]), user_tx(3, 4, [3u8; 32]),]),

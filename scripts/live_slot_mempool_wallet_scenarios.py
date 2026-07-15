@@ -44,7 +44,7 @@ class Node:
         name,
         p2p_port,
         rpc_port,
-        mode="relay",
+        mode="node",
         genesis=False,
         seed=None,
         log="info",
@@ -295,14 +295,14 @@ def main():
         "node2-relay-B",
         BASE_PORT + 10,
         BASE_PORT + 11,
-        mode="relay",
+        mode="node",
         seed=[n1.seed_addr],
     )
     n3 = Node(
         "node3-relay-C",
         BASE_PORT + 20,
         BASE_PORT + 21,
-        mode="relay",
+        mode="node",
         seed=[n1.seed_addr, n2.seed_addr],
     )
     nodes = [n1, n2, n3]

@@ -26,9 +26,4 @@ bincode       = "1"
 zstd          = { version = "0.13", features = ["zstdmt"] }
 
 [dev-dependencies]
-bench_prover = { path = "../bench_prover" }
 tempfile = "3"
-
-[[bench]]
-name = "decider_matrix_roofline"
-harness = false

@@ -335,7 +335,11 @@ pub(crate) fn verify_walk_a_region_walk_deferred_prefix_trace<'a, C: FsChannelOp
     let deferred = proof.authority().as_ref();
 
     context.observe_label(b, WALK_A_SIDECAR_TRANSCRIPT_LABEL);
-    context.observe_bytes_const(b, &vk.transcript_digest());
+    crate::acceptance::trace::self_verify::observe_pinned_digest(
+        b,
+        context,
+        &vk.transcript_digest(),
+    );
     let prefix = verify_walk_a_union_walk_prefix_trace(b, context, &protocol, deferred)?;
     Ok(WalkARegionTraceWalkContinuation {
         vk,
@@ -404,7 +408,11 @@ pub fn verify_walk_a_region_sidecar_trace_post_commit<C: FsChannelOps>(
     let protocol = vk.validate_in_witness(total_vars)?;
 
     context.observe_label(b, WALK_A_SIDECAR_TRANSCRIPT_LABEL);
-    context.observe_bytes_const(b, &vk.transcript_digest());
+    crate::acceptance::trace::self_verify::observe_pinned_digest(
+        b,
+        context,
+        &vk.transcript_digest(),
+    );
     let terminal = verify_walk_a_union_proof_trace(b, context, &protocol, &proof.authority)?;
     let claims = resolve_walk_a_terminal_claims_trace(vk, total_vars, terminal)?;
     context.append_claims(claims);

@@ -3,10 +3,10 @@
 
 //! Consensus checks shared by proof-native validation and in-memory utilities.
 //!
-//! Live full nodes use `validate_block_checks` as the cheap first stage, then
-//! verify the minimal block proof, then commit via the exact authenticated state
-//! transition. `validate_block_consensus` is the sequential interpreter
-//! path for RAM tests/utilities and is not the live production acceptance path.
+//! Live full nodes use `validate_block_checks` as the cheap native first stage,
+//! verify the block's fused recursive `HistoryStep`, then materialize and commit
+//! the exact public state transition atomically. `validate_block_consensus` is
+//! the sequential interpreter path for RAM tests and utilities.
 //!
 //! # Invariants checked here (SPEC §16)
 //!
@@ -23,8 +23,7 @@
 //!  ✅  Wallet authorization proof verifies for every user transaction
 //!  ✅  Exact public transaction predicate verifies for every user transaction
 //!  ✅  Exact authenticated state transition verifies state updates
-//!  ✅  Detached block proof metadata matches the semantic block statement
-//!  ✅  Detached authorization sidecar verifies for every user transaction
+//!  ✅  The sealed semantic header and recursive parent bind the complete step
 //! Exact user epoch-anchor equality is checked by the owning chain context
 //! before this state-free validation boundary.
 
@@ -194,34 +193,6 @@ fn validate_fee_policy_and_claimable_fee_sum(
     Ok(claimable_fee_sum)
 }
 
-/// Validate proof-gated coinbase maturity for every input in the block.
-///
-/// State-free: an input's `creation_id` is bound into the tx body and must
-/// equal the spent slot's stored id (enforced by state/exact-transition
-/// checks), so the tag bit and mint height can be read directly from the
-/// body. A tagged input is spendable only when the CONTAINING block's header
-/// already attests coverage of its mint height. Same-block attestation
-/// counts: `header.attested_coverage` is the post-attestation value.
-pub fn validate_coinbase_maturity(block: &Block) -> Result<(), ConsensusError> {
-    use crate::consensus::params::{coinbase_creation_height, is_coinbase_creation_id};
-
-    for tx in &block.transactions {
-        for (_, input) in tx.body.live_inputs() {
-            if !is_coinbase_creation_id(input.creation_id) {
-                continue;
-            }
-            let mint_height = coinbase_creation_height(input.creation_id);
-            if block.header.attested_coverage < mint_height {
-                return Err(ConsensusError::ImmatureCoinbaseSpend {
-                    mint_height,
-                    attested_coverage: block.header.attested_coverage,
-                });
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Validate the complete mandatory coinbase contract for a non-genesis block.
 ///
 /// This is the single cheap, state-free predicate shared by every accepted
@@ -350,7 +321,6 @@ fn validate_block_checks_inner(
         )?,
     }
     validate_mandatory_coinbase(block, parent)?;
-    validate_coinbase_maturity(block)?;
     validate_block_slot_conflicts(&block.transactions)?;
     for tx in &block.transactions {
         validate_tx_consensus(tx)?;
@@ -410,9 +380,6 @@ pub fn validate_block_consensus(
     validate_block_resource_preflight(block)?;
 
     validate_mandatory_coinbase(block, parent)?;
-
-    // --- Proof-gated coinbase maturity (state-free, per input) ---
-    validate_coinbase_maturity(block)?;
 
     // --- Cross-tx slot conflict check (P.8, §16 invariants 4-5) ---
     validate_block_slot_conflicts(&block.transactions)?;
@@ -487,7 +454,6 @@ mod tests {
             log_slots: 24,
             active_slot_count: 0,
             alloc_counter: 0,
-            attested_coverage: 0,
         }
     }
 
@@ -589,63 +555,6 @@ mod tests {
                 ..
             })
         ));
-    }
-
-    #[test]
-    fn proof_gated_coinbase_maturity_is_gated_by_the_containing_header() {
-        use crate::consensus::params::coinbase_creation_id;
-
-        let parent = header(9);
-        let spend_of_coinbase_5 = {
-            let mut inputs = [TxInput::dummy(); TX_INPUTS];
-            inputs[0] = TxInput {
-                slot_index: 1,
-                amount: 50,
-                creation_id: coinbase_creation_id(5),
-            };
-            let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
-            outputs[0] = TxOutput {
-                slot_index: 2,
-                amount: 50,
-                owner: Address([2u8; 32]),
-            };
-            Transaction::new(TxBody {
-                epoch_anchor: [7u8; 32],
-                fee: 0,
-                input_owner: Address([1u8; 32]),
-                inputs,
-                outputs,
-                validity_bitmap: 1 | output_bitmap_bit(0),
-                is_coinbase: false,
-            })
-        };
-        let block_with_coverage = |attested_coverage: u64| {
-            let mut child = header(10);
-            child.attested_coverage = attested_coverage;
-            Block {
-                header: child,
-                transactions: vec![coinbase(&parent), spend_of_coinbase_5.clone()],
-            }
-        };
-
-        // Immature while the containing header attests coverage below the
-        // mint height.
-        assert_eq!(
-            validate_coinbase_maturity(&block_with_coverage(4)),
-            Err(ConsensusError::ImmatureCoinbaseSpend {
-                mint_height: 5,
-                attested_coverage: 4,
-            })
-        );
-        // Mature at exactly the mint height — including when THIS block's
-        // attestation raised the coverage (same-block rule: the header field
-        // is the post-attestation value).
-        assert_eq!(validate_coinbase_maturity(&block_with_coverage(5)), Ok(()));
-        assert_eq!(validate_coinbase_maturity(&block_with_coverage(9)), Ok(()));
-        // Untagged inputs are never gated.
-        let mut untagged = block_with_coverage(0);
-        untagged.transactions[1].body.inputs[0].creation_id = 5;
-        assert_eq!(validate_coinbase_maturity(&untagged), Ok(()));
     }
 
     #[test]

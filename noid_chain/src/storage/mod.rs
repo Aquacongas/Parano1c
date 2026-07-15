@@ -13,7 +13,6 @@
 //! bandwidth relevant.
 
 pub mod historical_state;
-pub mod ladder_state;
 pub mod mdbx_context;
 pub mod mdbx_store;
 pub mod memory;
@@ -26,21 +25,10 @@ pub use historical_state::{
     reconstruct_historical_exact_state, CanonicalTipBinding, HistoricalExactStateView,
     HistoricalStateError,
 };
-pub use ladder_state::{
-    derive_touched_segment_ids, load_selected_history_ladder_parent_state,
-    load_selected_history_pipelined_parent_state, LadderStateError, TouchedSegmentError,
-};
-pub use mdbx_context::{
-    AppliedBlockValidation, CoverageAttestationClaim, MdbxChainContext, MdbxContextError,
-    ReorgBlockPayload,
-};
+pub use mdbx_context::{HistoryStepTerminalClaim, MdbxChainContext, MdbxContextError};
 pub use mdbx_store::{
-    AcceptedBlockCommitData, ClaimedRecursiveProofJobInputs, MdbxStore, RecursiveProofJob,
-    RecursiveProofJobResult, RecursiveProofJobState, RecursiveProofJobTier,
-    SelectedHistoryCoverage, SelectedHistoryLadderMeta, SelectedHistorySnapshotSeed, StoreError,
-    VerifiedHeaderBatchOutcome, VerifiedHeaderBatchRecord, VerifiedOwnerSnapshot,
-    VerifiedOwnerUtxo, VerifiedSelectedHistoryTerminalImport, MAX_RECURSIVE_PROOF_JOB_RESULT_BYTES,
-    MAX_VERIFIED_HEADER_BATCH_RECORDS,
+    MdbxStore, SnapshotHeaderInstallSource, StoreError, VerifiedHeaderBatchRecord,
+    VerifiedOwnerSnapshot, VerifiedOwnerUtxo,
 };
 pub use memory::RamBackend;
 pub use meta::{ConsensusMeta, FinalizedCheckpoint};
@@ -58,7 +46,7 @@ pub use snapshot_generation::{
 };
 pub use snapshot_staging::{
     AuthenticatedSnapshotMetadata, FinalizedSnapshotStaging, SnapshotStagingError,
-    SnapshotStagingSession,
+    SnapshotStagingSession, VerifiedSnapshotBoundary,
 };
 
 use crate::block_header::BlockHeader;
@@ -104,8 +92,8 @@ pub trait HeaderProvider {
 
 /// Combined durable chain store.
 ///
-/// Implementors provide unified access to headers, checkpoint coverage, the
-/// transaction index, and retained full blocks. `MdbxStore` implements this
+/// Implementors provide unified access to headers, the transaction index, and
+/// retained full blocks. `MdbxStore` implements this
 /// trait for the disk-backed node.
 pub trait BlockStore: Send + Sync {
     /// Current best tip: `(height, H_BLOCK hash)`.
@@ -119,7 +107,7 @@ pub trait BlockStore: Send + Sync {
     fn get_header_by_hash(&self, hash: &[u8; 32]) -> Result<Option<BlockHeader>, StoreError>;
 
     /// Retrieve a retained block's raw bytes. Data is retained only for the
-    /// bounded recent suffix once history/checkpoint coverage consumes it.
+    /// bounded recent suffix. Its HistoryStep terminal is stored atomically.
     fn get_recent_block(&self, height: u64) -> Result<Option<Vec<u8>>, StoreError>;
 
     /// Look up a transaction by body hash. Returns `(block_height, tx_pos)`

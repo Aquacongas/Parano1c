@@ -52,6 +52,7 @@ use crate::acceptance::trace::region_source_binding::{
 mod block;
 pub use block::*;
 mod bounded_decode;
+mod canonical_codec;
 pub use bounded_decode::*;
 mod link;
 pub use link::*;

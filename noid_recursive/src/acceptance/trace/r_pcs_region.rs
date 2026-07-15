@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! The [R] PCS hashing discharged through LINK-LOCAL region walks — the
-//! split link's diet ([`super::self_verify::PcsWalkObligations`] consumer).
+//! HistoryStep parent PCS hashing discharged through the mandatory LinkRegion
+//! sidecar ([`super::self_verify::PcsWalkObligations`] consumer).
 //!
-//! A deferred [R] replay in region mode records every PCS leaf sponge and
+//! The predecessor replay records every PCS leaf sponge and
 //! Merkle path as an obligation instead of replaying it inline (~90% of
-//! the replay). This module hosts the obligations of BOTH of the split
-//! link's [R]s on TWO shared walks:
+//! the replay). This module hosts those obligations on two shared walks:
 //!
 //! - **walk L-A (leaves)** — one combined duplex union: each (proof,
 //!   query) is a tile whose sub-channels are that query's leaf hashes,
@@ -28,12 +27,11 @@
 //!   before the query draw, the capsule's authentication-root rule). The
 //!   remaining suffix is relation-valid padding and has no semantic role.
 //!
-//! Production links allocate both walks before the deferred `[R]` replays,
+//! HistoryStep allocates both walks before the predecessor `[R]` replay,
 //! add only the semantic cell pins in phase 2, and prove both relation
 //! authorities after the enclosing Field commitment through
 //! [`crate::region_sidecar::LinkRegionProverPlan`]. No opening-claim IO tail
-//! and no B-to-A transcript recording is part of that path. The older native
-//! point/value and inline-discharge APIs remain below for transitional tests.
+//! and no B-to-A transcript recording is part of that path.
 //!
 //! Tree-structure invariant: every ladder shape yields the same leaf
 //! signature — `[2^log_batch_size, 2^a0, 2^a0, 2^a0]` lanes (the
@@ -41,8 +39,6 @@
 //! behind a commitment) — asserted at assembly, so one sub-channel
 //! schedule serves every tile.
 
-#[cfg(test)]
-use noid_ivc_core::deep_chain::ff_merkle::FfMerkleFamilyRefs;
 use noid_ivc_core::deep_chain::ff_merkle::{
     build_ff_merkle_path_columns, ff_merkle_fixed_patterns, FfMerklePathFamily, FfMerklePathWitness,
 };
@@ -52,8 +48,6 @@ use noid_ivc_core::field::F128;
 use noid_ivc_core::field_circuit::{
     FieldR1csBuilder, FsChannelUnionRecorder, LayoutRecordedChannel, LinExpr,
 };
-#[cfg(test)]
-use noid_ivc_core::field_circuit::{FsChannelTrace, RecordedChannel};
 use noid_ivc_core::pcs::{self, PcsParams};
 use noid_ivc_core::proof::pcs_params_statement_bytes;
 use noid_ivc_core::public_io::WitnessSlice;
@@ -70,23 +64,12 @@ use crate::region_sidecar::{
 use noid_ivc_core::deep_chain::schedule::DuplexLayout;
 use noid_ivc_core::field_circuit::RecordedChannel as FsRecordedChannel;
 
-#[cfg(test)]
-use super::mul;
 use super::pin_eq;
-#[cfg(test)]
-use super::region_source_binding::DuplexUnionRetentionMetric;
 use super::region_source_binding::{
     alloc_boolean_column_slice_values_only, alloc_column_slice_values_only,
     build_combined_duplex_union, build_recording_only_duplex_union, common_period_ones,
-    common_period_pattern, duplex_data_positions, pack_recording_only_blocks,
-    patch_recording_only_duplex_union_live, place_ff, slot_cell, DuplexUnion, RecordingSpec,
-    SubChannel,
-};
-#[cfg(test)]
-use super::region_source_binding::{
-    build_combined_duplex_union_with_recordings, discharge_duplex_union, discharge_merkle_union,
-    run_duplex_union_native, run_merkle_union_native, FfLegSpec, MerkleLeg, MerkleUnionNative,
-    RegionPcsClaim,
+    common_period_pattern, duplex_data_positions, pack_recording_only_blocks, place_ff, slot_cell,
+    DuplexUnion, RecordingSpec, SubChannel,
 };
 use super::self_verify::{
     flat_digest_lanes, pcs_leaf_iv_flat, pcs_node_iv_flat, PcsWalkObligations,
@@ -107,25 +90,16 @@ pub fn link_r_pcs_path_sidecar_purpose() -> [u8; 32] {
     poseidon2b_hash_byte_slices(LINK_R_PCS_PATH_SIDECAR_PURPOSE_DOMAIN, &[DOMAIN_LB])
 }
 
-const LINK_RECORDINGS_REC_PURPOSE_DOMAIN: &[u8] = b"NOID/REGION-SIDECAR/LINK-RECORDINGS-REC-C/V2";
-/// The `[R]_prev` replay's outer Fiat-Shamir domain (the native
-/// `FsLaneChallenger::new(b"history-link-v0")` the recorded transcript
-/// mirrors bit-for-bit).
-pub(crate) const R_PREV_CHANNEL_DOMAIN: &[u8] = b"history-link-v0";
-/// The `[R]_B` replay's outer Fiat-Shamir domain.
-pub(crate) const R_B_CHANNEL_DOMAIN: &[u8] = b"history-block-v0";
-
-/// Canonical role identifier for the link-local recordings vertical (walk
-/// L-C): the recorded block-sidecar child transcript, the recorded `[R]_B`
-/// outer channel and the recorded `[R]_prev` outer channel, one gated block
-/// each.
+const LINK_RECORDINGS_REC_PURPOSE_DOMAIN: &[u8] = b"NOID/REGION-SIDECAR/HISTORY-STEP-RECORDINGS/V1";
+/// Canonical role identifier for HistoryStep's recordings vertical (walk
+/// L-C): four possible predecessor Block-child transcripts followed by four
+/// possible `[R]_prev` transcripts. Exactly one block in each bank is live.
 pub fn link_recordings_purpose() -> [u8; 32] {
     poseidon2b_hash_byte_slices(
         LINK_RECORDINGS_REC_PURPOSE_DOMAIN,
         &[
             crate::region_sidecar::BLOCK_SIDECAR_CHILD_DOMAIN,
-            R_B_CHANNEL_DOMAIN,
-            R_PREV_CHANNEL_DOMAIN,
+            crate::acceptance::history_step::HISTORY_STEP_PROOF_DOMAIN,
         ],
     )
 }
@@ -150,353 +124,18 @@ struct TreeInfo {
     depth: usize,
 }
 
-/// Bounded canonical zero-recording template shared only by geometries
-/// derived from one authenticated ladder descriptor.  The cache is neither
-/// process-global nor keyed by prover data: one immutable geometry family
-/// owns exactly one template, and cloning the family shares this allocation.
-#[derive(Clone, Default)]
-pub(crate) struct RPcsLinkRecordingGhostCache(std::sync::Arc<std::sync::OnceLock<DuplexUnion>>);
-
-impl std::fmt::Debug for RPcsLinkRecordingGhostCache {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RPcsLinkRecordingGhostCache")
-            .field("initialized", &self.0.get().is_some())
-            .finish()
-    }
-}
-
-/// Exact test-only accounting for the immutable L-C geometry and its lazy
-/// cached zero union. `old_zero_buffer_bytes` is what nine independent
-/// per-height zero Vecs retained; `shared_zero_buffer_bytes` is the new single
-/// max-sized buffer.
-#[cfg(test)]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct RPcsLinkRecordingCacheMetric {
-    pub(crate) n_data_by_block: Vec<usize>,
-    pub(crate) total_n_data: usize,
-    pub(crate) max_n_data: usize,
-    pub(crate) old_zero_buffer_bytes: usize,
-    pub(crate) shared_zero_buffer_bytes: usize,
-    pub(crate) cached_union: Option<DuplexUnionRetentionMetric>,
-}
-
-/// Canonical link-side PCS geometry shared by every link class in a ladder.
-///
-/// Group zero is the (fixed-shape) previous-link proof.  The remaining
-/// groups are the block-class ladder in canonical slot order.  Groups select
-/// proof *data*, never verifier topology: L-A has one subchannel per tree
-/// position and L-B has one max-depth carrier per tree position.  The two
-/// mandatory proof roles (previous link and hosted block) live on the tile /
-/// path-block axis.  Consequently every slot freezes the same two sidecar
-/// authorities without paying a disjoint verifier bank for every block tier.
+/// Canonical PCS carrier shared by the four possible HistoryStep parent tiers.
+/// One predecessor proof occupies the tile/path axis; group selection changes
+/// only witness data and never verifier topology.
 #[derive(Clone, Debug)]
-pub(crate) struct RPcsLinkUniversalGeometry {
+pub(crate) struct HistoryStepPcsCarrierGeometry {
     group_params: Vec<PcsParams>,
     groups: Vec<Vec<TreeInfo>>,
     n_queries: usize,
-    /// Canonical recorded block-sidecar child-transcript layout per BLOCK
-    /// group (ladder slot order) — walk L-C's per-slot child blocks.
-    rec_layouts: Vec<DuplexLayout>,
-    /// Canonical recorded `[R]_B` outer-channel layout per BLOCK group
-    /// (ladder slot order) — walk L-C's per-slot replay blocks.
-    r_b_layouts: Vec<DuplexLayout>,
-    /// Canonical recorded `[R]_prev` outer-channel layout — one universal
-    /// walk L-C block shared by every link class of the ladder.
-    r_prev_layout: DuplexLayout,
-    /// One canonical zero-data walk L-C template for this exact immutable
-    /// geometry. Per-height assembly clones it and patches only live blocks.
-    recording_ghost_cache: RPcsLinkRecordingGhostCache,
+    proof_roles: usize,
 }
 
-impl RPcsLinkUniversalGeometry {
-    /// Build the universal carrier topology from one fixed link PCS and every
-    /// block-class PCS. Groups may have different tree counts and path depths,
-    /// while every present tree at one position must share its leaf schedule.
-    /// The query count is derived from each group's PCS rate and must agree.
-    pub(crate) fn new(
-        link_params: &PcsParams,
-        block_params: &[PcsParams],
-        n_queries: usize,
-        rec_layouts: Vec<DuplexLayout>,
-        r_b_layouts: Vec<DuplexLayout>,
-        r_prev_layout: DuplexLayout,
-    ) -> Result<Self, RegionSidecarError> {
-        Self::new_with_recording_ghost_cache(
-            link_params,
-            block_params,
-            n_queries,
-            rec_layouts,
-            r_b_layouts,
-            r_prev_layout,
-            RPcsLinkRecordingGhostCache::default(),
-        )
-    }
-
-    /// Construct against a cache capability owned by the already validated
-    /// universal ladder. All semantic geometry is still re-derived and
-    /// checked here; the capability shares only the resulting zero columns.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new_with_recording_ghost_cache(
-        link_params: &PcsParams,
-        block_params: &[PcsParams],
-        n_queries: usize,
-        rec_layouts: Vec<DuplexLayout>,
-        r_b_layouts: Vec<DuplexLayout>,
-        r_prev_layout: DuplexLayout,
-        recording_ghost_cache: RPcsLinkRecordingGhostCache,
-    ) -> Result<Self, RegionSidecarError> {
-        if block_params.is_empty() || n_queries == 0 {
-            return Err(RegionSidecarError::BadVk);
-        }
-        if rec_layouts.len() != block_params.len()
-            || rec_layouts.iter().any(|layout| layout.slots.is_empty())
-        {
-            return Err(RegionSidecarError::BadVk);
-        }
-        if r_b_layouts.len() != block_params.len()
-            || r_b_layouts.iter().any(|layout| layout.slots.is_empty())
-            || r_prev_layout.slots.is_empty()
-        {
-            return Err(RegionSidecarError::BadVk);
-        }
-        let query_count_matches = |params: &PcsParams| {
-            let Some(log_msg_len) = params.m.checked_sub(pcs::LOG_PACKING) else {
-                return false;
-            };
-            let Some(log_dim) = log_msg_len.checked_sub(params.log_batch_size) else {
-                return false;
-            };
-            pcs::checked_fri_configuration(log_dim, params.log_inv_rate)
-                .is_ok_and(|config| config.query_count == n_queries)
-        };
-        if !query_count_matches(link_params)
-            || block_params
-                .iter()
-                .any(|params| !query_count_matches(params))
-        {
-            return Err(RegionSidecarError::UnsupportedVkShape);
-        }
-        let group_params = std::iter::once(link_params.clone())
-            .chain(block_params.iter().cloned())
-            .collect::<Vec<_>>();
-        let groups = group_params
-            .iter()
-            .map(checked_tree_structure)
-            .collect::<Result<Vec<_>, _>>()?;
-        // The universal key must also admit the mandatory genesis carrier,
-        // whose canonical BaseFold geometry has an initial and post-row tree.
-        if groups.iter().any(|group| group.len() < 2) {
-            return Err(RegionSidecarError::UnsupportedVkShape);
-        }
-        let geometry = Self {
-            group_params,
-            groups,
-            n_queries,
-            rec_layouts,
-            r_b_layouts,
-            r_prev_layout,
-            recording_ghost_cache,
-        };
-        // Freeze the role/tile carrier topology here, before any witness is
-        // allocated.  Present trees at one position must share the exact leaf
-        // hash schedule; path depths may differ and are covered by the
-        // position's causal max-depth carrier.
-        geometry.leaf_lanes()?;
-        geometry.path_carrier_depths()?;
-        geometry.recording_blocks()?;
-        Ok(geometry)
-    }
-
-    /// The canonical recordings-only walk L-C geometry plus the covering
-    /// domain log.  Block order is a protocol constant: the per-slot child
-    /// blocks in ladder order, the per-slot `[R]_B` replay blocks in ladder
-    /// order, then the one universal `[R]_prev` replay block.
-    pub(crate) fn recording_blocks(
-        &self,
-    ) -> Result<(Vec<(DuplexLayout, usize)>, usize), RegionSidecarError> {
-        if self.rec_layouts.len() + 1 != self.groups.len()
-            || self.r_b_layouts.len() != self.rec_layouts.len()
-        {
-            return Err(RegionSidecarError::BadVk);
-        }
-        let ordered: Vec<&DuplexLayout> = self
-            .rec_layouts
-            .iter()
-            .chain(self.r_b_layouts.iter())
-            .chain(std::iter::once(&self.r_prev_layout))
-            .collect();
-        let (offsets, w_log) = pack_recording_only_blocks(&ordered);
-        Ok((ordered.into_iter().cloned().zip(offsets).collect(), w_log))
-    }
-
-    /// Materialize walk L-C from the geometry-owned canonical zero template,
-    /// recomputing only the explicitly live blocks. Any mismatch between the
-    /// per-height recordings and the frozen geometry fails closed.
-    fn recording_union_cached(
-        &self,
-        recordings: &[RecordingSpec<'_>],
-        live_blocks: &[usize],
-    ) -> Result<DuplexUnion, RegionSidecarError> {
-        let expected_layouts = self
-            .rec_layouts
-            .iter()
-            .chain(self.r_b_layouts.iter())
-            .chain(std::iter::once(&self.r_prev_layout))
-            .collect::<Vec<_>>();
-        let canonical_iv = FsChannelUnionRecorder::capacity_iv_flat();
-        if recordings.len() != expected_layouts.len()
-            || recordings.iter().zip(expected_layouts.iter().copied()).any(
-                |(recording, expected)| {
-                    &recording.layout != expected
-                        || recording.iv_flat != canonical_iv
-                        || recording.data.len() != expected.n_data
-                },
-            )
-        {
-            return Err(RegionSidecarError::UnsupportedVkShape);
-        }
-
-        let canonical_zero = self.recording_ghost_cache.0.get_or_init(|| {
-            let zero_data = expected_layouts
-                .iter()
-                .map(|layout| vec![F128::ZERO; layout.n_data])
-                .collect::<Vec<_>>();
-            let zero_specs = expected_layouts
-                .iter()
-                .copied()
-                .zip(&zero_data)
-                .map(|(layout, data)| RecordingSpec {
-                    layout: layout.clone(),
-                    iv_flat: canonical_iv,
-                    data,
-                })
-                .collect::<Vec<_>>();
-            build_recording_only_duplex_union(&zero_specs)
-        });
-        patch_recording_only_duplex_union_live(
-            canonical_zero,
-            recordings,
-            live_blocks,
-            canonical_iv,
-        )
-        .ok_or(RegionSidecarError::UnsupportedVkShape)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn recording_cache_metric(&self) -> RPcsLinkRecordingCacheMetric {
-        let n_data_by_block = self
-            .rec_layouts
-            .iter()
-            .chain(self.r_b_layouts.iter())
-            .chain(std::iter::once(&self.r_prev_layout))
-            .map(|layout| layout.n_data)
-            .collect::<Vec<_>>();
-        let total_n_data = n_data_by_block.iter().sum();
-        let max_n_data = n_data_by_block.iter().copied().max().unwrap_or(0);
-        RPcsLinkRecordingCacheMetric {
-            n_data_by_block,
-            total_n_data,
-            max_n_data,
-            old_zero_buffer_bytes: total_n_data * std::mem::size_of::<F128>(),
-            shared_zero_buffer_bytes: max_n_data * std::mem::size_of::<F128>(),
-            cached_union: self
-                .recording_ghost_cache
-                .0
-                .get()
-                .map(DuplexUnion::retention_metric),
-        }
-    }
-
-    pub(crate) fn rec_layouts(&self) -> &[DuplexLayout] {
-        &self.rec_layouts
-    }
-
-    pub(crate) fn r_b_layouts(&self) -> &[DuplexLayout] {
-        &self.r_b_layouts
-    }
-
-    pub(crate) fn r_prev_layout(&self) -> &DuplexLayout {
-        &self.r_prev_layout
-    }
-
-    /// Walk L-C block index of one slot's recorded block-sidecar child.
-    pub(crate) fn child_block_index(&self, slot: usize) -> usize {
-        debug_assert!(slot < self.rec_layouts.len());
-        slot
-    }
-
-    /// Walk L-C block index of one slot's recorded `[R]_B` outer channel.
-    pub(crate) fn r_b_block_index(&self, slot: usize) -> usize {
-        debug_assert!(slot < self.r_b_layouts.len());
-        self.rec_layouts.len() + slot
-    }
-
-    /// Walk L-C block index of the universal recorded `[R]_prev` channel.
-    pub(crate) fn r_prev_block_index(&self) -> usize {
-        self.rec_layouts.len() + self.r_b_layouts.len()
-    }
-
-    fn exact_for(
-        proofs: &[RPcsProof<'_>],
-        rec_layouts: Vec<DuplexLayout>,
-        r_b_layouts: Vec<DuplexLayout>,
-        r_prev_layout: DuplexLayout,
-    ) -> Result<Self, RegionSidecarError> {
-        if proofs.is_empty() {
-            return Err(RegionSidecarError::BadVk);
-        }
-        let n_queries = proofs[0].native.queries.len();
-        if n_queries == 0
-            || proofs
-                .iter()
-                .any(|proof| proof.native.queries.len() != n_queries)
-        {
-            return Err(RegionSidecarError::UnsupportedVkShape);
-        }
-        let group_params = proofs
-            .iter()
-            .map(|proof| proof.params.clone())
-            .collect::<Vec<_>>();
-        let groups = group_params
-            .iter()
-            .map(checked_tree_structure)
-            .collect::<Result<Vec<_>, _>>()?;
-        if groups.iter().any(|group| group.len() < 2) {
-            return Err(RegionSidecarError::UnsupportedVkShape);
-        }
-        if rec_layouts.len() + 1 != group_params.len()
-            || rec_layouts.iter().any(|layout| layout.slots.is_empty())
-            || r_b_layouts.len() != rec_layouts.len()
-            || r_b_layouts.iter().any(|layout| layout.slots.is_empty())
-            || r_prev_layout.slots.is_empty()
-        {
-            return Err(RegionSidecarError::BadVk);
-        }
-        let geometry = Self {
-            group_params,
-            groups,
-            n_queries,
-            rec_layouts,
-            r_b_layouts,
-            r_prev_layout,
-            recording_ghost_cache: RPcsLinkRecordingGhostCache::default(),
-        };
-        geometry.leaf_lanes()?;
-        geometry.path_carrier_depths()?;
-        geometry.recording_blocks()?;
-        Ok(geometry)
-    }
-
-    #[cfg(test)]
-    fn group_count(&self) -> usize {
-        self.groups.len()
-    }
-
-    #[cfg(test)]
-    fn n_queries(&self) -> usize {
-        self.n_queries
-    }
-
+impl HistoryStepPcsCarrierGeometry {
     fn subchannel_count(&self) -> usize {
         self.groups.iter().map(Vec::len).max().unwrap_or(0)
     }
@@ -581,6 +220,229 @@ impl RPcsLinkUniversalGeometry {
     }
 }
 
+/// One-role universal carrier for HistoryStep recursion.
+///
+/// The four groups are the possible predecessor output tiers.  L-A/L-B carry
+/// exactly one active predecessor PCS proof, while L-C contains two banks in
+/// canonical tier order: the predecessor Block-sidecar child transcript and
+/// the enclosing HistoryStep `[R]_prev` transcript.  Exactly one block in
+/// each bank is live.  Padding is relation-valid universal geometry, not an
+/// omitted proof role.
+#[derive(Clone, Debug)]
+pub(crate) struct HistoryStepParentGeometry {
+    carrier: HistoryStepPcsCarrierGeometry,
+    child_layouts: Vec<DuplexLayout>,
+    r_prev_layouts: Vec<DuplexLayout>,
+    recording_blocks: Vec<(DuplexLayout, usize)>,
+    rec_w_log: usize,
+}
+
+impl HistoryStepParentGeometry {
+    fn from_parts(
+        parent_params: &[PcsParams],
+        child_layouts: Vec<DuplexLayout>,
+        r_prev_layouts: Vec<DuplexLayout>,
+    ) -> Result<Self, RegionSidecarError> {
+        if parent_params.is_empty()
+            || child_layouts.len() != parent_params.len()
+            || r_prev_layouts.len() != parent_params.len()
+            || child_layouts.iter().any(|layout| layout.slots.is_empty())
+            || r_prev_layouts.iter().any(|layout| layout.slots.is_empty())
+        {
+            return Err(RegionSidecarError::BadVk);
+        }
+        let first = parent_params.first().ok_or(RegionSidecarError::BadVk)?;
+        let n_queries = pcs::checked_fri_configuration(first.log_dim(), first.log_inv_rate)
+            .map_err(|_| RegionSidecarError::UnsupportedVkShape)?
+            .query_count;
+        for params in parent_params {
+            let config = pcs::checked_fri_configuration(params.log_dim(), params.log_inv_rate)
+                .map_err(|_| RegionSidecarError::UnsupportedVkShape)?;
+            if config.query_count != n_queries {
+                return Err(RegionSidecarError::UnsupportedVkShape);
+            }
+        }
+        let groups = parent_params
+            .iter()
+            .map(checked_tree_structure)
+            .collect::<Result<Vec<_>, _>>()?;
+        if groups.iter().any(|group| group.len() < 2) {
+            return Err(RegionSidecarError::UnsupportedVkShape);
+        }
+        let carrier = HistoryStepPcsCarrierGeometry {
+            group_params: parent_params.to_vec(),
+            groups,
+            n_queries,
+            proof_roles: 1,
+        };
+        carrier.leaf_lanes()?;
+        carrier.path_carrier_depths()?;
+        let ordered = child_layouts
+            .iter()
+            .chain(r_prev_layouts.iter())
+            .collect::<Vec<_>>();
+        let (offsets, rec_w_log) = pack_recording_only_blocks(&ordered);
+        let recording_blocks = ordered
+            .into_iter()
+            .cloned()
+            .zip(offsets)
+            .collect::<Vec<_>>();
+        Ok(Self {
+            carrier,
+            child_layouts,
+            r_prev_layouts,
+            recording_blocks,
+            rec_w_log,
+        })
+    }
+
+    pub(crate) fn new(
+        parent_params: &[PcsParams],
+        child_layouts: Vec<DuplexLayout>,
+        r_prev_layouts: Vec<DuplexLayout>,
+    ) -> Result<Self, RegionSidecarError> {
+        let tier_count = noid_chain::consensus::params::USER_TX_CLASS_TIERS.len();
+        if parent_params.len() != tier_count
+            || child_layouts.len() != tier_count
+            || r_prev_layouts.len() != tier_count
+        {
+            return Err(RegionSidecarError::BadVk);
+        }
+        Self::from_parts(parent_params, child_layouts, r_prev_layouts)
+    }
+
+    pub(crate) fn tier_count(&self) -> usize {
+        self.child_layouts.len()
+    }
+
+    pub(crate) fn child_layout(&self, slot: usize) -> Option<&DuplexLayout> {
+        self.child_layouts.get(slot)
+    }
+
+    pub(crate) fn r_prev_layout(&self, slot: usize) -> Option<&DuplexLayout> {
+        self.r_prev_layouts.get(slot)
+    }
+
+    pub(crate) fn child_block_index(&self, slot: usize) -> usize {
+        debug_assert!(slot < self.tier_count());
+        slot
+    }
+
+    pub(crate) fn r_prev_block_index(&self, slot: usize) -> usize {
+        debug_assert!(slot < self.tier_count());
+        self.tier_count() + slot
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recording_blocks(&self) -> &[(DuplexLayout, usize)] {
+        &self.recording_blocks
+    }
+
+    pub(crate) fn canonical_vk(
+        &self,
+        spec: &noid_ivc_core::public_io::PublicIoSpec,
+    ) -> Result<LinkRegionSidecarVk, RegionSidecarError> {
+        let leaf_w_log = crate::region_sidecar::combined_duplex_protocol_w_log(
+            &combined_leaf_descriptor(&self.carrier)?,
+        )?;
+        let (_, path_w_log) = link_path_geometry(&self.carrier)?;
+        let (leaf, path, rec) =
+            canonical_link_walk_slices(spec, leaf_w_log, path_w_log, self.rec_w_log);
+        self.vk_from_slices(leaf, path, rec)
+    }
+
+    fn recording_union(
+        &self,
+        active_slot: usize,
+        child: &LayoutRecordedChannel,
+        r_prev: &LayoutRecordedChannel,
+    ) -> Result<DuplexUnion, RegionSidecarError> {
+        let expected_child = self
+            .child_layout(active_slot)
+            .ok_or(RegionSidecarError::BadVk)?;
+        let expected_r_prev = self
+            .r_prev_layout(active_slot)
+            .ok_or(RegionSidecarError::BadVk)?;
+        if &child.layout != expected_child
+            || &r_prev.layout != expected_r_prev
+            || child.data_flat.len() != expected_child.n_data
+            || r_prev.data_flat.len() != expected_r_prev.n_data
+        {
+            return Err(RegionSidecarError::UnsupportedVkShape);
+        }
+
+        let zero_data = self
+            .child_layouts
+            .iter()
+            .chain(self.r_prev_layouts.iter())
+            .map(|layout| vec![F128::ZERO; layout.n_data])
+            .collect::<Vec<_>>();
+        let mut specs = self
+            .child_layouts
+            .iter()
+            .chain(self.r_prev_layouts.iter())
+            .enumerate()
+            .map(|(index, layout)| RecordingSpec {
+                layout: layout.clone(),
+                iv_flat: FsChannelUnionRecorder::capacity_iv_flat(),
+                data: zero_data[index].as_slice(),
+            })
+            .collect::<Vec<_>>();
+        specs[self.child_block_index(active_slot)].data = &child.data_flat;
+        specs[self.r_prev_block_index(active_slot)].data = &r_prev.data_flat;
+        Ok(build_recording_only_duplex_union(&specs))
+    }
+
+    fn vk_from_slices(
+        &self,
+        leaf_slices: [WitnessSlice; 6],
+        path_slices: [WitnessSlice; N_COMMITTED_B],
+        rec_slices: [WitnessSlice; 6],
+    ) -> Result<LinkRegionSidecarVk, RegionSidecarError> {
+        let leaf = CombinedDuplexRegionVk::new(
+            link_r_pcs_leaf_sidecar_purpose(),
+            combined_leaf_descriptor(&self.carrier)?,
+            leaf_slices,
+        )?;
+        let carrier_depths = self.carrier.path_carrier_depths()?;
+        let (block_log, w_log) = link_path_geometry(&self.carrier)?;
+        let mut offset = 0usize;
+        let mut families = Vec::with_capacity(carrier_depths.len());
+        for depth in carrier_depths {
+            families.push(MerkleRegionFamily::FeedForward {
+                offset,
+                depth,
+                n_paths: 1,
+                iv: pcs_node_iv_flat(),
+            });
+            offset = offset
+                .checked_add(
+                    depth
+                        .checked_next_power_of_two()
+                        .ok_or(RegionSidecarError::BadVk)?,
+                )
+                .ok_or(RegionSidecarError::BadVk)?;
+        }
+        if offset.next_power_of_two().trailing_zeros() as usize != block_log {
+            return Err(RegionSidecarError::BadVk);
+        }
+        let path = MerkleRegionVk::new(
+            link_r_pcs_path_sidecar_purpose(),
+            w_log,
+            path_slices,
+            block_log,
+            families,
+        )?;
+        let rec = RecordingDuplexRegionVk::new(
+            link_recordings_purpose(),
+            self.rec_w_log,
+            rec_slices,
+            self.recording_blocks.clone(),
+        )?;
+        LinkRegionSidecarVk::new(leaf, path, rec)
+    }
+}
+
 /// The per-proof tree ladder, mirroring `basefold_verify_trace`'s shape
 /// math: the initial codeword tree, the post-row-batch tree, then one
 /// tree per FRI epoch commitment.
@@ -646,13 +508,6 @@ fn checked_tree_structure(params: &PcsParams) -> Result<Vec<TreeInfo>, RegionSid
     Ok(trees)
 }
 
-/// Transitional callers still use assertion-style shape handling; all
-/// production universal-geometry entry points call the checked twin above.
-#[cfg(test)]
-fn tree_structure(params: &PcsParams) -> Vec<TreeInfo> {
-    checked_tree_structure(params).expect("supported BaseFold tree geometry")
-}
-
 /// The native leaf lanes of tree `t` for query `q`.
 fn native_leaf_lanes<'a>(q: &'a pcs::basefold::QueryOpening, t: usize) -> &'a [F128] {
     match t {
@@ -699,361 +554,9 @@ fn native_leaf_digest(lanes: &[F128]) -> [F128; 2] {
     flat_digest_lanes(&noid_ivc_core::merkle::hash_leaf(&bytes))
 }
 
-fn hash_of_flat_lanes(lanes: [F128; 2]) -> [u8; 32] {
-    let mut hash = [0u8; 32];
-    for (lane, chunk) in lanes.into_iter().zip(hash.chunks_exact_mut(16)) {
-        let value = (lane.lo as u128) | ((lane.hi as u128) << 64);
-        chunk.copy_from_slice(&value.to_le_bytes());
-    }
-    hash
-}
-
-/// Canonical zero-data carrier used only to materialize the genesis ghost
-/// sidecar columns before there is a previous recursive proof.  It is not
-/// accepted as a Field proof: only the shape-derived leaves, paths and roots
-/// are consumed by the recording-free column builder.
-fn ghost_basefold_geometry(
-    trees: &[TreeInfo],
-    n_queries: usize,
-) -> Result<(pcs::BaseFoldProof, [F128; 2]), RegionSidecarError> {
-    if trees.len() < 2 || n_queries == 0 {
-        return Err(RegionSidecarError::UnsupportedVkShape);
-    }
-    let zero_hash = [0u8; 32];
-    let mut roots = Vec::with_capacity(trees.len());
-    for tree in trees {
-        let leaf = vec![F128::ZERO; tree.lanes];
-        let family = FfMerklePathFamily {
-            depth: tree.depth,
-            n_paths: 1,
-        };
-        let columns = build_ff_merkle_path_columns(
-            &family,
-            pcs_node_iv_flat(),
-            &[FfMerklePathWitness {
-                entry: native_leaf_digest(&leaf),
-                siblings: vec![[F128::ZERO; 2]; tree.depth],
-                directions: vec![false; tree.depth],
-            }],
-            family.stride_log(),
-        );
-        roots.push(columns.roots[0]);
-    }
-    let query = pcs::basefold::QueryOpening {
-        position: 0,
-        initial_leaf: vec![F128::ZERO; trees[0].lanes],
-        initial_path: vec![zero_hash; trees[0].depth],
-        post_row_batch_leaf: vec![F128::ZERO; trees[1].lanes],
-        post_row_batch_path: vec![zero_hash; trees[1].depth],
-        epoch_leaves: trees[2..]
-            .iter()
-            .map(|tree| vec![F128::ZERO; tree.lanes])
-            .collect(),
-        epoch_paths: trees[2..]
-            .iter()
-            .map(|tree| vec![zero_hash; tree.depth])
-            .collect(),
-    };
-    Ok((
-        pcs::BaseFoldProof {
-            round_messages: Vec::new(),
-            post_row_batch_commit: pcs::RoundCommitment {
-                root: hash_of_flat_lanes(roots[1]),
-            },
-            round_commitments: roots[2..]
-                .iter()
-                .copied()
-                .map(|root| pcs::RoundCommitment {
-                    root: hash_of_flat_lanes(root),
-                })
-                .collect(),
-            final_a: F128::ZERO,
-            final_b: F128::ZERO,
-            final_codeword: Vec::new(),
-            plaintext_tail: Vec::new(),
-            pow_nonce: 0,
-            queries: vec![query; n_queries],
-        },
-        roots[0],
-    ))
-}
-
-/// Everything both the native mirror and the trace discharge derive from
-/// the native proofs — built ONCE, deterministically. This recording-bearing
-/// assembly is retained only as a regression oracle for the production
-/// recording-free three-walk implementation.
-#[cfg(test)]
-struct Assembly {
-    u_a: DuplexUnion,
-    /// Per (proof, query, tree): the native leaf digest.
-    digests: Vec<Vec<Vec<[F128; 2]>>>,
-    /// Per proof: the tree ladder.
-    trees: Vec<Vec<TreeInfo>>,
-    /// Sub-channel stride log of walk L-A (`S = 2^s_log` slots per sub).
-    s_log: usize,
-    n_queries: usize,
-    // ---- walk L-B ----
-    cb: Vec<Vec<F128>>,
-    fixed_b: Vec<FixedPattern>,
-    ff_specs: Vec<FfLegSpec>,
-    /// Per (proof, tree): the leg's slot offset within a query block.
-    leg_offsets: Vec<Vec<usize>>,
-    block_log_b: usize,
-    w_log_b: usize,
-    /// The walk L-B native run (proves + verifies once; phase 2 reuses it).
-    native_b: MerkleUnionNative,
-    /// The scratch recording of the walk L-B discharge transcript — the
-    /// values walk L-A's region-2 block carries; phase 2's real discharge
-    /// must reproduce it op-for-op.
-    rec_b_scratch: RecordedChannel,
-}
-
-#[cfg(test)]
-fn build_assembly(proofs: &[RPcsProof<'_>]) -> Assembly {
-    assert!(!proofs.is_empty(), "at least one [R] proof");
-    let trees: Vec<Vec<TreeInfo>> = proofs.iter().map(|p| tree_structure(p.params)).collect();
-    let n_queries = proofs[0].native.queries.len();
-    for p in proofs {
-        assert_eq!(p.native.queries.len(), n_queries, "query counts must agree");
-    }
-    // One shared leaf-schedule signature (lane counts per tree).
-    let lanes_sig: Vec<usize> = trees[0].iter().map(|t| t.lanes).collect();
-    for tr in &trees {
-        let sig: Vec<usize> = tr.iter().map(|t| t.lanes).collect();
-        assert_eq!(
-            sig, lanes_sig,
-            "the [R] proofs must share the leaf-schedule signature (lanes per tree)"
-        );
-    }
-    let n_trees = lanes_sig.len();
-
-    // ---- Walk L-A: sub-channels + tiles.
-    let subs: Vec<SubChannel> = lanes_sig
-        .iter()
-        .map(|&lanes| {
-            assert!(lanes >= 2 && lanes % 2 == 0, "even-lane leaves only");
-            SubChannel {
-                layout: compile_duplex(&[TranscriptOp::Absorb(vec![None; lanes])]),
-                iv_flat: pcs_leaf_iv_flat(lanes),
-            }
-        })
-        .collect();
-    let s = subs
-        .iter()
-        .map(|c| c.layout.slots.len())
-        .max()
-        .unwrap()
-        .max(1)
-        .next_power_of_two();
-    let s_log = s.trailing_zeros() as usize;
-    let mut tiles: Vec<Vec<Vec<F128>>> = Vec::with_capacity(proofs.len() * n_queries);
-    let mut digests: Vec<Vec<Vec<[F128; 2]>>> = Vec::with_capacity(proofs.len());
-    for p in proofs {
-        let mut per_proof = Vec::with_capacity(n_queries);
-        for q in &p.native.queries {
-            let mut tile = Vec::with_capacity(n_trees);
-            let mut ds = Vec::with_capacity(n_trees);
-            for t in 0..n_trees {
-                let lanes = native_leaf_lanes(q, t);
-                assert_eq!(lanes.len(), lanes_sig[t], "native leaf off signature");
-                tile.push(lanes.to_vec());
-                ds.push(native_leaf_digest(lanes));
-            }
-            tiles.push(tile);
-            per_proof.push(ds);
-        }
-        digests.push(per_proof);
-    }
-    // ---- Walk L-B: ff legs per (proof, tree), one path per query block.
-    let iv_node = pcs_node_iv_flat();
-    let mut leg_offsets: Vec<Vec<usize>> = Vec::with_capacity(proofs.len());
-    let mut off = 0usize;
-    for tr in &trees {
-        let mut per_proof = Vec::with_capacity(tr.len());
-        for t in tr {
-            per_proof.push(off);
-            off += t.depth.next_power_of_two();
-        }
-        leg_offsets.push(per_proof);
-    }
-    let block_b = off.next_power_of_two();
-    let block_log_b = block_b.trailing_zeros() as usize;
-    let n_blocks_b = n_queries.next_power_of_two();
-    let pb = n_blocks_b * block_b;
-    let w_log_b = pb.trailing_zeros() as usize;
-
-    let mut cb: Vec<Vec<F128>> = (0..N_COMMITTED_B).map(|_| vec![F128::ZERO; pb]).collect();
-    let mut s0b: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; pb]);
-    let mut soutb: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; pb]);
-    let (gh0, gho) = noid_ivc_core::deep_chain::source_tree::run_perm([F128::ZERO; STATE_SIZE]);
-    for slot in 0..pb {
-        for j in 0..STATE_SIZE {
-            s0b[j][slot] = gh0[j];
-            soutb[j][slot] = gho[j];
-            cb[j][slot] = gho[j];
-        }
-    }
-    let mut fixed_b: Vec<FixedPattern> = Vec::new();
-    let mut ff_specs: Vec<FfLegSpec> = Vec::new();
-    for (pi, p) in proofs.iter().enumerate() {
-        for (t, tree) in trees[pi].iter().enumerate() {
-            let family = FfMerklePathFamily {
-                depth: tree.depth,
-                n_paths: 1,
-            };
-            let stride = family.stride();
-            let base = fixed_b.len();
-            for pat in ff_merkle_fixed_patterns(&family, iv_node) {
-                fixed_b.push(common_period_pattern(
-                    &pat.table,
-                    leg_offsets[pi][t],
-                    1,
-                    block_log_b,
-                ));
-            }
-            fixed_b.push(common_period_ones(leg_offsets[pi][t], stride, block_log_b));
-            ff_specs.push(FfLegSpec {
-                refs: FfMerkleFamilyRefs {
-                    cr: [4, 5],
-                    sib: [6, 7],
-                    d: 8,
-                    c: std::array::from_fn(|i| i),
-                    node: base,
-                    nodens: base + 1,
-                    start: base + 2,
-                    iv: [base + 3, base + 4],
-                },
-                region: base + 5,
-            });
-            // Place every query's path chain for this leg. The query axis
-            // is padded to a power of two and the family patterns are
-            // PERIODIC over the query blocks, so the pad blocks must
-            // carry VALID (zero-witness) chains — never bare ghost
-            // permutations.
-            let fam_wlog = stride.trailing_zeros() as usize;
-            let root = native_root(p, t);
-            let bit_off = dir_bit_offset(&trees[pi], t, trees[pi][0].depth);
-            for qi in 0..n_blocks_b {
-                let wit = if let Some(q) = p.native.queries.get(qi) {
-                    FfMerklePathWitness {
-                        entry: digests[pi][qi][t],
-                        siblings: native_path(q, t),
-                        directions: (0..tree.depth)
-                            .map(|kk| (q.position >> (bit_off + kk)) & 1 == 1)
-                            .collect(),
-                    }
-                } else {
-                    FfMerklePathWitness {
-                        entry: [F128::ZERO; 2],
-                        siblings: vec![[F128::ZERO; 2]; tree.depth],
-                        directions: vec![false; tree.depth],
-                    }
-                };
-                let fcols = build_ff_merkle_path_columns(&family, iv_node, &[wit], fam_wlog);
-                if qi < n_queries {
-                    assert_eq!(
-                        fcols.roots[0], root,
-                        "ff leg root != committed root (proof {pi}, tree {t}, query {qi})"
-                    );
-                }
-                place_ff(
-                    &mut cb,
-                    &mut s0b,
-                    &mut soutb,
-                    &fcols,
-                    qi * block_b + leg_offsets[pi][t],
-                    stride,
-                );
-            }
-        }
-    }
-
-    // ---- Walk L-B native + the SCRATCH-RECORDED trace discharge. The
-    // walk L-B discharge transcript rides walk L-A as a REGION-2 recording
-    // block instead of an inline permutation replay (the 4f.1c diet applied
-    // to the link walks; L-A's own transcript stays inline — a walk cannot
-    // host its own transcript). The recording's VALUES must exist before
-    // the L-A columns are built (the split link allocates walk columns
-    // right after its IO cells), so a throwaway builder runs the discharge
-    // twin once here; phase 2 re-runs it for real and asserts op/data/
-    // challenge identity against this scratch recording.
-    let committed_b: Vec<&[F128]> = cb.iter().map(|c| c.as_slice()).collect();
-    let c_refs: [usize; STATE_SIZE] = std::array::from_fn(|i| i);
-    let legs: Vec<MerkleLeg> = Vec::new();
-    let native_b = run_merkle_union_native(
-        &committed_b,
-        &s0b,
-        &soutb,
-        &fixed_b,
-        &c_refs,
-        &ff_specs,
-        &legs,
-        w_log_b,
-        DOMAIN_LB,
-    );
-    let mut scratch = FieldR1csBuilder::new();
-    let mut rec_ch = FsChannelUnionRecorder::new(DOMAIN_LB);
-    let (_, scratch_pins) = discharge_merkle_union(
-        &mut scratch,
-        &mut rec_ch,
-        &fixed_b,
-        &c_refs,
-        &ff_specs,
-        &legs,
-        w_log_b,
-        &native_b,
-    );
-    assert!(scratch_pins.is_empty(), "no 2-perm legs in the link walks");
-    let rec_b_scratch = rec_ch.finish();
-
-    // ---- Walk L-A: the combined union hosting the leaf tiles (region 1)
-    // and the walk L-B discharge recording (region 2).
-    let rec_spec = RecordingSpec {
-        layout: compile_duplex(&rec_b_scratch.ops),
-        iv_flat: FsChannelUnionRecorder::capacity_iv_flat(),
-        data: &rec_b_scratch.data_flat,
-    };
-    let u_a = build_combined_duplex_union_with_recordings(&subs, &tiles, &[rec_spec]);
-    // Sanity: the C0/C1 cells at each sub-channel's last real slot carry
-    // the native leaf digest (the fixed no-pad sponge reads its state
-    // directly after the last absorb permutation).
-    let per_tile = 1usize << u_a.block_log;
-    for (pi, per_proof) in digests.iter().enumerate() {
-        for (qi, ds) in per_proof.iter().enumerate() {
-            let tile_off = (pi * n_queries + qi) * per_tile;
-            for (t, d) in ds.iter().enumerate() {
-                let dslot = tile_off + t * s + lanes_sig[t] / 2 - 1;
-                assert_eq!(
-                    [u_a.committed[2][dslot], u_a.committed[3][dslot]],
-                    *d,
-                    "leaf digest cell mismatch (proof {pi}, query {qi}, tree {t})"
-                );
-            }
-        }
-    }
-
-    Assembly {
-        u_a,
-        digests,
-        trees,
-        s_log,
-        n_queries,
-        cb,
-        fixed_b,
-        ff_specs,
-        leg_offsets,
-        block_log_b,
-        w_log_b,
-        native_b,
-        rec_b_scratch,
-    }
-}
-
-/// Production-only link walk assembly.  Unlike [`Assembly`], this type has no
-/// native relation proof and no recorded channel: its L-A union is the exact
+/// HistoryStep parent walk assembly. Its L-A union is the exact
 /// recording-free output of [`build_combined_duplex_union`], while L-B remains
 /// an independent sibling vertical.
-#[allow(dead_code)] // consumed by split_link after the recursive trace twin lands
 struct RecordingFreeLinkAssembly {
     u_a: DuplexUnion,
     leaf_descriptor: CombinedDuplexRegionDescriptor,
@@ -1076,9 +579,8 @@ struct RecordingFreeLinkAssembly {
     w_log_b: usize,
 }
 
-#[allow(dead_code)]
 fn combined_leaf_descriptor(
-    geometry: &RPcsLinkUniversalGeometry,
+    geometry: &HistoryStepPcsCarrierGeometry,
 ) -> Result<CombinedDuplexRegionDescriptor, RegionSidecarError> {
     let subchannels = geometry
         .leaf_lanes()?
@@ -1090,9 +592,9 @@ fn combined_leaf_descriptor(
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
-    // Exactly two proof/query roles are live in every production link.  The
-    // tier selector changes tile data only; it never changes topology.
-    let live_tiles = 2usize
+    // HistoryStep has exactly one predecessor proof/query role.
+    let live_tiles = geometry
+        .proof_roles
         .checked_mul(geometry.n_queries)
         .ok_or(RegionSidecarError::BadVk)?;
     let padded_tiles = live_tiles
@@ -1103,44 +605,13 @@ fn combined_leaf_descriptor(
     CombinedDuplexRegionDescriptor::new(tx_tile_log, subchannels)
 }
 
-/// Rebuild the unique production Link sidecar VK from the canonical PCS
-/// ladder and the compact outer-witness slices retained by the registry.
-///
-/// Unlike the general manual VK codec this constructor admits no caller-
-/// selected schedule or Merkle family topology.  Terminal-only registry
-/// loading uses it to keep the materialization bound tied to the four frozen
-/// BaseFold tree positions instead of the much larger generic codec caps.
-pub(crate) fn canonical_selected_link_region_sidecar_vk(
-    link_params: &PcsParams,
-    block_params: &[PcsParams],
-    rec_layouts: Vec<DuplexLayout>,
-    r_b_layouts: Vec<DuplexLayout>,
-    r_prev_layout: DuplexLayout,
-    leaf_slices: [WitnessSlice; 6],
-    path_slices: [WitnessSlice; N_COMMITTED_B],
-    rec_slices: [WitnessSlice; 6],
-) -> Result<LinkRegionSidecarVk, RegionSidecarError> {
-    if !(1..=5).contains(&link_params.log_inv_rate) {
-        return Err(RegionSidecarError::UnsupportedVkShape);
-    }
-    let n_queries = pcs::default_fri_queries(link_params.log_dim(), link_params.log_inv_rate);
-    let geometry = RPcsLinkUniversalGeometry::new(
-        link_params,
-        block_params,
-        n_queries,
-        rec_layouts,
-        r_b_layouts,
-        r_prev_layout,
-    )?;
-    link_sidecar_vk_from_geometry(&geometry, leaf_slices, path_slices, rec_slices)
-}
-
 /// Path carrier packing of the universal link walk L-B: `(block_log, w_log)`.
 fn link_path_geometry(
-    geometry: &RPcsLinkUniversalGeometry,
+    geometry: &HistoryStepPcsCarrierGeometry,
 ) -> Result<(usize, usize), RegionSidecarError> {
     let block_log = geometry.path_block_log()?;
-    let live_blocks = 2usize
+    let live_blocks = geometry
+        .proof_roles
         .checked_mul(geometry.n_queries)
         .ok_or(RegionSidecarError::BadVk)?;
     let blocks = live_blocks
@@ -1157,544 +628,7 @@ fn link_path_geometry(
     Ok((block_log, cells.trailing_zeros() as usize))
 }
 
-/// Geometry-based core of [`canonical_selected_link_region_sidecar_vk`],
-/// shared with the recording-layout derivation (which constructs the same
-/// VK around a provisional `[R]_prev` block while iterating its size).
-fn link_sidecar_vk_from_geometry(
-    geometry: &RPcsLinkUniversalGeometry,
-    leaf_slices: [WitnessSlice; 6],
-    path_slices: [WitnessSlice; N_COMMITTED_B],
-    rec_slices: [WitnessSlice; 6],
-) -> Result<LinkRegionSidecarVk, RegionSidecarError> {
-    let leaf = CombinedDuplexRegionVk::new(
-        link_r_pcs_leaf_sidecar_purpose(),
-        combined_leaf_descriptor(geometry)?,
-        leaf_slices,
-    )?;
-
-    let carrier_depths = geometry.path_carrier_depths()?;
-    let (block_log, w_log) = link_path_geometry(geometry)?;
-    let mut offset = 0usize;
-    let mut families = Vec::with_capacity(carrier_depths.len());
-    for depth in carrier_depths {
-        families.push(MerkleRegionFamily::FeedForward {
-            offset,
-            depth,
-            n_paths: 1,
-            iv: pcs_node_iv_flat(),
-        });
-        offset = offset
-            .checked_add(
-                depth
-                    .checked_next_power_of_two()
-                    .ok_or(RegionSidecarError::BadVk)?,
-            )
-            .ok_or(RegionSidecarError::BadVk)?;
-    }
-    if offset
-        .checked_next_power_of_two()
-        .ok_or(RegionSidecarError::BadVk)?
-        .trailing_zeros() as usize
-        != block_log
-    {
-        return Err(RegionSidecarError::BadVk);
-    }
-    let path = MerkleRegionVk::new(
-        link_r_pcs_path_sidecar_purpose(),
-        w_log,
-        path_slices,
-        block_log,
-        families,
-    )?;
-    let (rec_blocks, rec_w_log) = geometry.recording_blocks()?;
-    let rec =
-        RecordingDuplexRegionVk::new(link_recordings_purpose(), rec_w_log, rec_slices, rec_blocks)?;
-    LinkRegionSidecarVk::new(leaf, path, rec)
-}
-
-// ---------------------------------------------------------------------------
-// Recorded [R]-replay channels: drive, scratch and layout derivation
-// ---------------------------------------------------------------------------
-
-/// Everything the `[R]_prev` outer-channel recording depends on.  Values are
-/// NATIVE (the drive allocates its own witness wires); the recorded schedule
-/// is value-independent, the recorded data/challenges are not.
-pub(crate) struct SplitRPrevChannelInputs<'a> {
-    pub(crate) shape: &'a noid_ivc_core::proof::FieldShape,
-    pub(crate) pcs_params: &'a PcsParams,
-    pub(crate) spec: &'a noid_ivc_core::public_io::PublicIoSpec,
-    /// The β-muxed statement digest value (witness lanes in the schedule).
-    pub(crate) w_d: [F128; 2],
-    /// The β-muxed post-commit class digest value (witness lanes).
-    pub(crate) w_post_commit: [F128; 2],
-    pub(crate) commitment_root: [F128; 2],
-    pub(crate) io: &'a [F128],
-    pub(crate) proof: &'a noid_ivc_core::proof::FieldR1csProof,
-    pub(crate) sidecar_vk: &'a LinkRegionSidecarVk,
-    pub(crate) sidecar: &'a crate::region_sidecar::LinkRegionSidecarProof,
-}
-
-/// Everything the `[R]_B` outer-channel recording depends on.
-pub(crate) struct SplitRBChannelInputs<'a> {
-    pub(crate) b_shape: &'a noid_ivc_core::proof::FieldShape,
-    pub(crate) b_pcs_params: &'a PcsParams,
-    pub(crate) b_spec: &'a noid_ivc_core::public_io::PublicIoSpec,
-    /// The BAKED block-class statement digest (constant lanes).
-    pub(crate) b_digest: &'a [u8; 32],
-    /// The baked block post-commit class digest (constant lanes).
-    pub(crate) b_post_commit: &'a [u8; 32],
-    pub(crate) commitment_root: [F128; 2],
-    pub(crate) io: &'a [F128],
-    pub(crate) proof: &'a noid_ivc_core::proof::FieldR1csProof,
-    pub(crate) b_sidecar_vk: &'a crate::region_sidecar::BlockRegionSidecarVk,
-    pub(crate) sidecar: &'a crate::region_sidecar::BlockRegionSidecarProof,
-}
-
-/// Run the complete `[R]_prev` replay twin against a union recorder on a
-/// caller-supplied (throwaway) builder.  The channel op stream this leaves in
-/// `ch` is the exact recording the production trace pass must reproduce.
-fn drive_split_r_prev_channel(
-    b: &mut FieldR1csBuilder,
-    ch: &mut FsChannelUnionRecorder,
-    inputs: &SplitRPrevChannelInputs<'_>,
-) -> Result<(), RegionSidecarError> {
-    use super::self_verify::{
-        verify_field_trace_deferred_region_with_post_commit_context_expr, FieldR1csProofTrace,
-    };
-    let alloc = |b: &mut FieldR1csBuilder, v: F128| LinExpr::from_wire(b.alloc_f128(v));
-    let w_d = [alloc(b, inputs.w_d[0]), alloc(b, inputs.w_d[1])];
-    let w_post_commit = [
-        alloc(b, inputs.w_post_commit[0]),
-        alloc(b, inputs.w_post_commit[1]),
-    ];
-    let root = [
-        alloc(b, inputs.commitment_root[0]),
-        alloc(b, inputs.commitment_root[1]),
-    ];
-    let io: Vec<LinExpr> = inputs.io.iter().map(|&v| alloc(b, v)).collect();
-    let proof_e = FieldR1csProofTrace::alloc_shape_mode(
-        b,
-        inputs.proof,
-        inputs.shape,
-        inputs.pcs_params,
-        false,
-    );
-    let mut obs = PcsWalkObligations::default();
-    let mut sidecar_result = Ok(());
-    verify_field_trace_deferred_region_with_post_commit_context_expr(
-        b,
-        ch,
-        inputs.shape,
-        inputs.pcs_params,
-        &w_d,
-        &root,
-        &proof_e,
-        inputs.spec,
-        &io,
-        &w_post_commit,
-        Some(&mut obs),
-        |b, context| {
-            sidecar_result = crate::region_sidecar::verify_link_region_sidecar_trace_post_commit(
-                b,
-                context,
-                inputs.sidecar_vk,
-                inputs.sidecar,
-            );
-        },
-    );
-    sidecar_result
-}
-
-/// Run the complete `[R]_B` replay twin against a union recorder on a
-/// caller-supplied (throwaway) builder.  Returns the nested block-sidecar
-/// child recording (the walk L-C child block's data), whose seed was drawn
-/// from `ch` exactly as in the production trace pass.
-fn drive_split_r_b_channel(
-    b: &mut FieldR1csBuilder,
-    ch: &mut FsChannelUnionRecorder,
-    inputs: &SplitRBChannelInputs<'_>,
-) -> Result<FsRecordedChannel, RegionSidecarError> {
-    use super::self_verify::{
-        verify_field_trace_deferred_region_with_post_commit_context, FieldR1csProofTrace,
-    };
-    let alloc = |b: &mut FieldR1csBuilder, v: F128| LinExpr::from_wire(b.alloc_f128(v));
-    let w_b_lanes = flat_digest_lanes(inputs.b_digest);
-    let w_b = [
-        LinExpr::constant(w_b_lanes[0]),
-        LinExpr::constant(w_b_lanes[1]),
-    ];
-    let root = [
-        alloc(b, inputs.commitment_root[0]),
-        alloc(b, inputs.commitment_root[1]),
-    ];
-    let io: Vec<LinExpr> = inputs.io.iter().map(|&v| alloc(b, v)).collect();
-    let proof_e = FieldR1csProofTrace::alloc_shape_mode(
-        b,
-        inputs.proof,
-        inputs.b_shape,
-        inputs.b_pcs_params,
-        false,
-    );
-    let mut obs = PcsWalkObligations::default();
-    let mut recorded_child = None;
-    let mut sidecar_result = Ok(());
-    verify_field_trace_deferred_region_with_post_commit_context(
-        b,
-        ch,
-        inputs.b_shape,
-        inputs.b_pcs_params,
-        &w_b,
-        &root,
-        &proof_e,
-        inputs.b_spec,
-        &io,
-        inputs.b_post_commit,
-        Some(&mut obs),
-        |b, context| {
-            match crate::region_sidecar::verify_block_region_sidecar_recorded_trace_post_commit(
-                b,
-                context,
-                inputs.b_sidecar_vk,
-                inputs.sidecar,
-            ) {
-                Ok(recorded) => recorded_child = Some(recorded),
-                Err(error) => sidecar_result = Err(error),
-            }
-        },
-    );
-    sidecar_result?;
-    recorded_child.ok_or(RegionSidecarError::InvalidProof)
-}
-
-/// Process-global memo of derived recording layouts.  The derivation is a
-/// deterministic pure function of protocol constants, so caching by input
-/// digest is sound and keeps repeated class materializations cheap.
-fn derived_recording_layout_memo(
-) -> &'static std::sync::Mutex<std::collections::HashMap<[u8; 32], DuplexLayout>> {
-    static MEMO: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<[u8; 32], DuplexLayout>>,
-    > = std::sync::OnceLock::new();
-    MEMO.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-}
-
-fn spec_digest_bytes(spec: &noid_ivc_core::public_io::PublicIoSpec) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    for value in [spec.io_slice.log2_len, spec.io_slice.index, spec.io_len] {
-        bytes.extend_from_slice(&(value as u64).to_le_bytes());
-    }
-    bytes.extend_from_slice(&(spec.claims.len() as u64).to_le_bytes());
-    for claim in &spec.claims {
-        for value in [
-            claim.slice.log2_len,
-            claim.slice.index,
-            claim.point.start,
-            claim.point.end,
-            claim.value,
-        ] {
-            bytes.extend_from_slice(&(value as u64).to_le_bytes());
-        }
-    }
-    bytes
-}
-
-/// One pass of a layout-derivation replay: run `drive` on a fresh throwaway
-/// builder + recorder, tolerating the query-position desync panic of the
-/// FIRST pass (the transcript-derived positions of a zero proof cannot be
-/// known before the transcript runs; every squeeze of the replay is already
-/// recorded when the assert fires because the batched PCS opening draws the
-/// query lanes with its LAST squeeze).  Returns the recording plus the
-/// squeezed challenge VALUES.
-fn derivation_pass(
-    domain: &'static [u8],
-    drive: impl FnOnce(
-        &mut FieldR1csBuilder,
-        &mut FsChannelUnionRecorder,
-    ) -> Result<(), RegionSidecarError>,
-    allow_position_desync: bool,
-) -> Result<(FsRecordedChannel, Vec<F128>), RegionSidecarError> {
-    let mut scratch = FieldR1csBuilder::new_witness_only();
-    let mut recorder = FsChannelUnionRecorder::new(domain);
-    // The first pass EXPECTS the query-position desync panic (the positions
-    // of a zero proof are unknowable before its transcript runs), so the
-    // global hook is silenced around it; any other payload is re-raised.
-    let quiet_hook = allow_position_desync.then(|| {
-        let hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        hook
-    });
-    // The throwaway builder/recorder pair is discarded or read whole after
-    // the pass; a poisoned intermediate state cannot escape, so unwinding
-    // through the borrow is safe to assert.
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        drive(&mut scratch, &mut recorder)
-    }));
-    if let Some(hook) = quiet_hook {
-        std::panic::set_hook(hook);
-    }
-    match outcome {
-        Ok(result) => result?,
-        Err(payload) => {
-            let desync = payload
-                .downcast_ref::<String>()
-                .is_some_and(|message| message.contains("query position desynced"))
-                || payload
-                    .downcast_ref::<&str>()
-                    .is_some_and(|message| message.contains("query position desynced"));
-            if !(allow_position_desync && desync) {
-                std::panic::resume_unwind(payload);
-            }
-        }
-    }
-    let recorded = recorder.finish();
-    let challenge_values: Vec<F128> = recorded
-        .challenge_wires
-        .iter()
-        .map(|wire| wire.eval(scratch.values()))
-        .collect();
-    Ok((recorded, challenge_values))
-}
-
-/// Number of query-position lanes the batched PCS opening draws with its
-/// final squeeze.
-fn query_lane_count(pcs_params: &PcsParams) -> usize {
-    let log_dim = pcs_params.m - pcs::LOG_PACKING - pcs_params.log_batch_size;
-    let k_code = log_dim + pcs_params.log_inv_rate;
-    let per_lane = 128 / k_code;
-    pcs::default_fri_queries(pcs_params.log_dim(), pcs_params.log_inv_rate).div_ceil(per_lane)
-}
-
-/// Derive the canonical `[R]_B` outer-channel recording LAYOUT of one ladder
-/// slot: the compiled duplex schedule of the block replay against shape-only
-/// proofs.  The op stream is value-independent (control flow derives from
-/// class shapes and the block sidecar VK alone), so the layout is a protocol
-/// constant of the tier.
-pub(crate) fn derive_link_r_b_recording_layout(
-    b_shape: &noid_ivc_core::proof::FieldShape,
-    b_spec: &noid_ivc_core::public_io::PublicIoSpec,
-    b_pcs_params: &PcsParams,
-    b_digest: &[u8; 32],
-    b_post_commit: &[u8; 32],
-    b_sidecar_vk: &crate::region_sidecar::BlockRegionSidecarVk,
-) -> Result<DuplexLayout, RegionSidecarError> {
-    let mut key = Vec::new();
-    key.extend_from_slice(b"r-b-layout-v1");
-    key.extend_from_slice(&(b_shape.m as u64).to_le_bytes());
-    key.extend_from_slice(&(b_shape.k_log as u64).to_le_bytes());
-    key.extend_from_slice(&(b_shape.k_skip as u64).to_le_bytes());
-    key.extend_from_slice(&pcs_params_statement_bytes(b_pcs_params));
-    key.extend_from_slice(&spec_digest_bytes(b_spec));
-    key.extend_from_slice(b_digest);
-    key.extend_from_slice(b_post_commit);
-    key.extend_from_slice(&b_sidecar_vk.transcript_digest());
-    let key = poseidon2b_hash_byte_slices(b"NOID/R-B-RECORDING-LAYOUT-MEMO/V1", &[&key]);
-    if let Some(layout) = derived_recording_layout_memo()
-        .lock()
-        .expect("layout memo lock")
-        .get(&key)
-    {
-        return Ok(layout.clone());
-    }
-
-    let sidecar =
-        crate::region_sidecar::shape_only_block_region_sidecar_proof(b_sidecar_vk, b_shape.m)?;
-    let mut proof = super::self_verify::shape_only_field_r1cs_proof(b_shape, b_pcs_params);
-    let io = vec![F128::ZERO; b_spec.io_len];
-    let layout = {
-        macro_rules! r_b_inputs {
-            ($proof:expr) => {
-                SplitRBChannelInputs {
-                    b_shape,
-                    b_pcs_params,
-                    b_spec,
-                    b_digest,
-                    b_post_commit,
-                    commitment_root: [F128::ZERO; 2],
-                    io: &io,
-                    proof: $proof,
-                    b_sidecar_vk,
-                    sidecar: &sidecar,
-                }
-            };
-        }
-        // Pass 1: harvest the transcript-derived query positions.
-        let (_, challenges) = {
-            let inputs = r_b_inputs!(&proof);
-            derivation_pass(
-                R_B_CHANNEL_DOMAIN,
-                |b, ch| drive_split_r_b_channel(b, ch, &inputs).map(|_| ()),
-                true,
-            )?
-        };
-        let lanes = query_lane_count(b_pcs_params);
-        if challenges.len() < lanes {
-            return Err(RegionSidecarError::InvalidProof);
-        }
-        super::self_verify::patch_shape_only_query_positions(
-            &mut proof,
-            b_pcs_params,
-            &challenges[challenges.len() - lanes..],
-        );
-        // Pass 2: the clean, complete schedule.
-        let (recorded, _) = {
-            let inputs = r_b_inputs!(&proof);
-            derivation_pass(
-                R_B_CHANNEL_DOMAIN,
-                |b, ch| drive_split_r_b_channel(b, ch, &inputs).map(|_| ()),
-                false,
-            )?
-        };
-        compile_duplex(&recorded.ops)
-    };
-    derived_recording_layout_memo()
-        .lock()
-        .expect("layout memo lock")
-        .insert(key, layout.clone());
-    Ok(layout)
-}
-
-/// Derive the canonical `[R]_prev` outer-channel recording LAYOUT of the
-/// universal ladder.
-///
-/// The `[R]_prev` replay verifies the previous link's sidecar against the
-/// SAME universal VK whose walk L-C hosts this very recording, so the layout
-/// is a fixed point: the schedule depends on the VK only through its
-/// numeric geometry (child/`[R]_B`/`[R]_prev` block packing → `rec_c` width
-/// and slices; the VK digest itself rides witness lanes).  Iterate the
-/// `[R]_prev` block size until the derived schedule reproduces it — one
-/// extra round after the size stabilizes proves stability.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn derive_link_r_prev_recording_layout(
-    link_shape: &noid_ivc_core::proof::FieldShape,
-    link_params: &PcsParams,
-    spec: &noid_ivc_core::public_io::PublicIoSpec,
-    block_params: &[PcsParams],
-    child_layouts: &[DuplexLayout],
-    r_b_layouts: &[DuplexLayout],
-) -> Result<DuplexLayout, RegionSidecarError> {
-    let mut key = Vec::new();
-    key.extend_from_slice(b"r-prev-layout-v1");
-    key.extend_from_slice(&(link_shape.m as u64).to_le_bytes());
-    key.extend_from_slice(&(link_shape.k_log as u64).to_le_bytes());
-    key.extend_from_slice(&(link_shape.k_skip as u64).to_le_bytes());
-    key.extend_from_slice(&pcs_params_statement_bytes(link_params));
-    key.extend_from_slice(&spec_digest_bytes(spec));
-    for params in block_params {
-        key.extend_from_slice(&pcs_params_statement_bytes(params));
-    }
-    for layout in child_layouts.iter().chain(r_b_layouts) {
-        key.extend_from_slice(&crate::region_sidecar::duplex_layout_digest(layout));
-    }
-    let key = poseidon2b_hash_byte_slices(b"NOID/R-PREV-RECORDING-LAYOUT-MEMO/V1", &[&key]);
-    if let Some(layout) = derived_recording_layout_memo()
-        .lock()
-        .expect("layout memo lock")
-        .get(&key)
-    {
-        return Ok(layout.clone());
-    }
-
-    if !(1..=5).contains(&link_params.log_inv_rate) {
-        return Err(RegionSidecarError::UnsupportedVkShape);
-    }
-    let n_queries = pcs::default_fri_queries(link_params.log_dim(), link_params.log_inv_rate);
-    // Initial size guess: one 2^14-slot block (the measured production
-    // schedule's size class).  The loop converges for any starting size.
-    let mut candidate = placeholder_recording_layout(1usize << 14);
-    let mut derived = None;
-    for _ in 0..8 {
-        let geometry = RPcsLinkUniversalGeometry::new(
-            link_params,
-            block_params,
-            n_queries,
-            child_layouts.to_vec(),
-            r_b_layouts.to_vec(),
-            candidate.clone(),
-        )?;
-        let leaf_w_log = crate::region_sidecar::combined_duplex_protocol_w_log(
-            &combined_leaf_descriptor(&geometry)?,
-        )?;
-        let (_, path_w_log) = link_path_geometry(&geometry)?;
-        let (_, rec_w_log) = geometry.recording_blocks()?;
-        let (leaf_slices, path_slices, rec_slices) =
-            canonical_link_walk_slices(spec, leaf_w_log, path_w_log, rec_w_log);
-        let vk = link_sidecar_vk_from_geometry(&geometry, leaf_slices, path_slices, rec_slices)?;
-
-        let sidecar =
-            crate::region_sidecar::shape_only_link_region_sidecar_proof(&vk, link_shape.m)?;
-        let mut proof = super::self_verify::shape_only_field_r1cs_proof(link_shape, link_params);
-        let io = vec![F128::ZERO; spec.io_len];
-        macro_rules! r_prev_inputs {
-            ($proof:expr) => {
-                SplitRPrevChannelInputs {
-                    shape: link_shape,
-                    pcs_params: link_params,
-                    spec,
-                    w_d: [F128::ZERO; 2],
-                    w_post_commit: [F128::ZERO; 2],
-                    commitment_root: [F128::ZERO; 2],
-                    io: &io,
-                    proof: $proof,
-                    sidecar_vk: &vk,
-                    sidecar: &sidecar,
-                }
-            };
-        }
-        // Pass 1: harvest query positions; pass 2: the clean schedule.
-        let (_, challenges) = {
-            let inputs = r_prev_inputs!(&proof);
-            derivation_pass(
-                R_PREV_CHANNEL_DOMAIN,
-                |b, ch| drive_split_r_prev_channel(b, ch, &inputs),
-                true,
-            )?
-        };
-        let lanes = query_lane_count(link_params);
-        if challenges.len() < lanes {
-            return Err(RegionSidecarError::InvalidProof);
-        }
-        super::self_verify::patch_shape_only_query_positions(
-            &mut proof,
-            link_params,
-            &challenges[challenges.len() - lanes..],
-        );
-        let (recorded, _) = {
-            let inputs = r_prev_inputs!(&proof);
-            derivation_pass(
-                R_PREV_CHANNEL_DOMAIN,
-                |b, ch| drive_split_r_prev_channel(b, ch, &inputs),
-                false,
-            )?
-        };
-        let layout = compile_duplex(&recorded.ops);
-        if layout == candidate {
-            derived = Some(layout);
-            break;
-        }
-        candidate = layout;
-    }
-    let layout = derived.ok_or(RegionSidecarError::UnsupportedVkShape)?;
-    derived_recording_layout_memo()
-        .lock()
-        .expect("layout memo lock")
-        .insert(key, layout.clone());
-    Ok(layout)
-}
-
-/// A value-free stand-in recording block of exactly `slot_count` slots, used
-/// only to seed the `[R]_prev` layout fixed point (the schedule depends on
-/// the provisional block through its SIZE CLASS alone).
-fn placeholder_recording_layout(slot_count: usize) -> DuplexLayout {
-    compile_duplex(&[TranscriptOp::Absorb(vec![Some(0); 2 * slot_count])])
-}
-
-/// Cheap descriptor-preflight stand-in for the `[R]_prev` block: the ladder
-/// descriptor's group validation is independent of the recording packing, so
-/// `CanonicalSplitLinkLadder::try_new` avoids the full layout derivation.
-pub(crate) fn descriptor_preflight_r_prev_layout() -> DuplexLayout {
-    placeholder_recording_layout(1)
-}
-
-/// The canonical walk-column [`WitnessSlice`] table of every link class:
+/// The canonical walk-column [`WitnessSlice`] table of every HistoryStep class:
 /// columns are allocated right after the public-IO block, leaf family first,
 /// then paths, then recordings, each family aligned to its own width.
 /// Mirrors `alloc_column_slice` exactly.
@@ -1725,20 +659,25 @@ pub(crate) fn canonical_link_walk_slices(
     (leaf, path, rec)
 }
 
-#[allow(dead_code)]
 fn build_recording_free_link_assembly(
     proofs: &[RPcsProof<'_>],
-    geometry: &RPcsLinkUniversalGeometry,
+    geometry: &HistoryStepPcsCarrierGeometry,
     active_groups: &[usize],
 ) -> Result<RecordingFreeLinkAssembly, RegionSidecarError> {
-    if proofs.len() != 2 || active_groups.len() != 2 {
+    if proofs.is_empty()
+        || proofs.len() != active_groups.len()
+        || proofs.len() != geometry.proof_roles
+        || proofs.len() > 2
+    {
         return Err(RegionSidecarError::UnsupportedVkShape);
     }
-    // Production roles are positional protocol constants, not a topology
-    // choice: proof 0 is always the previous link (group 0), while proof 1
-    // is one explicit block-ladder group.  Shape equality alone cannot infer
-    // this mapping because B32/B64 and link/B255 legitimately share shapes.
-    if active_groups[0] != 0 || active_groups[1] == 0 || active_groups[1] >= geometry.groups.len() {
+    // The active group is the predecessor's output tier; universal carrier
+    // topology stays unchanged by that selection.
+    if active_groups
+        .iter()
+        .any(|group| *group >= geometry.groups.len())
+        || (proofs.len() == 2 && (active_groups[0] != 0 || active_groups[1] == 0))
+    {
         return Err(RegionSidecarError::UnsupportedVkShape);
     }
     let trees = proofs
@@ -1790,7 +729,8 @@ fn build_recording_free_link_assembly(
         })
         .collect::<Vec<_>>();
 
-    let tile_capacity = 2usize
+    let tile_capacity = proofs
+        .len()
         .checked_mul(n_queries)
         .ok_or(RegionSidecarError::BadVk)?;
     let mut tiles = Vec::with_capacity(tile_capacity);
@@ -1988,97 +928,40 @@ fn build_recording_free_link_assembly(
     })
 }
 
-/// The native (point, value) stream of every walk opening claim, in the
-/// exact legacy discharge order. Kept as a test oracle for the retired
-/// recording-bearing walk; production derives its inputs from the frozen
-/// recording-free sidecar geometry.
-#[cfg(test)]
-fn r_pcs_region_native(proofs: &[RPcsProof<'_>]) -> Vec<(Vec<F128>, F128)> {
-    let asm = build_assembly(proofs);
-    let native_a = run_duplex_union_native(&asm.u_a, DOMAIN_LA);
-    let mut out: Vec<(Vec<F128>, F128)> = Vec::new();
-    for (_, pt, v) in &native_a.pending {
-        out.push((pt.clone(), *v));
-    }
-    for (_, pt, v) in &asm.native_b.pending {
-        out.push((pt.clone(), *v));
-    }
-    out
-}
-
-/// Phase-1 production handoff. Both committed walk matrices and their exact
-/// sidecar VK are frozen before the deferred `[R]` obligations allocate any
-/// class-specific wires. No native relation proof or point/value stream is
-/// stored here.
-#[allow(dead_code)]
-pub(crate) struct RPcsLinkColumns {
+/// Self-recursive HistoryStep columns over the universal four-tier parent
+/// geometry.  The only live proof role is the exact predecessor; walk L-C
+/// additionally carries that predecessor's nested Block-sidecar child chain
+/// and its complete enclosing `[R]_prev` chain.
+pub(crate) struct HistoryStepParentColumns {
     asm: RecordingFreeLinkAssembly,
     slices_a: [WitnessSlice; 6],
     slices_b: [WitnessSlice; N_COMMITTED_B],
-    /// Walk L-C committed columns (the recordings vertical: per-slot child
-    /// blocks, per-slot `[R]_B` replay blocks, one `[R]_prev` replay block).
     slices_rec: [WitnessSlice; 6],
-    /// The recordings-only union backing walk L-C (its endpoints feed the
-    /// prover input; its committed data was filled from native captures).
     u_rec: DuplexUnion,
-    /// Value-only recordings captured by the already mandatory sound native
-    /// verifiers. The real recursive replays must reproduce them exactly.
-    /// All `None` only for the bootstrap ghost, which records nothing.
-    child_scratch: Option<LayoutRecordedChannel>,
-    r_b_scratch: Option<LayoutRecordedChannel>,
-    r_prev_scratch: Option<LayoutRecordedChannel>,
-    /// Ladder slot whose child/`[R]_B` recording blocks are live.
-    rec_active_slot: usize,
-    /// Walk L-C block indices of the live child, `[R]_B` and `[R]_prev`
-    /// recordings (protocol constants of the geometry).
+    child_scratch: LayoutRecordedChannel,
+    r_prev_scratch: LayoutRecordedChannel,
     child_block: usize,
-    r_b_block: usize,
     r_prev_block: usize,
     vk: LinkRegionSidecarVk,
 }
 
-/// Owned live recordings one link instance commits into walk L-C, one per
-/// recording role. They move into [`RPcsLinkColumns`] after union assembly,
-/// avoiding a second deep copy of their layouts, data and challenges. `None`
-/// per role is reserved for the bootstrap ghost.
-#[derive(Default)]
-pub(crate) struct LinkLiveRecordings {
-    pub(crate) child: Option<LayoutRecordedChannel>,
-    pub(crate) r_b: Option<LayoutRecordedChannel>,
-    pub(crate) r_prev: Option<LayoutRecordedChannel>,
-}
-
-/// Allocate the two independent recording-free link walk verticals. This is
-/// the production phase-1 API; the recording-bearing twin remains test-only
-/// as a transcript/claim regression oracle.
-#[allow(dead_code)]
-pub(crate) fn prepare_r_pcs_link_columns(
+pub(crate) fn prepare_history_step_parent_columns(
     b: &mut FieldR1csBuilder,
-    proofs: &[RPcsProof<'_>],
-    rec_layouts: Vec<DuplexLayout>,
-    r_b_layouts: Vec<DuplexLayout>,
-    r_prev_layout: DuplexLayout,
-    recordings: LinkLiveRecordings,
-) -> Result<RPcsLinkColumns, RegionSidecarError> {
-    let geometry =
-        RPcsLinkUniversalGeometry::exact_for(proofs, rec_layouts, r_b_layouts, r_prev_layout)?;
-    let active_groups = (0..proofs.len()).collect::<Vec<_>>();
-    prepare_r_pcs_link_columns_universal(b, proofs, &geometry, &active_groups, recordings)
-}
-
-/// Universal-ladder phase 1. `active_groups` maps the two verified proofs to
-/// group zero (previous link) and `1 + current_block_slot`. The selection is
-/// validated against the registry, then only chooses data for the shared
-/// role/tile carriers; all link classes freeze the same sidecar VK and exact
-/// witness-slice geometry.
-pub(crate) fn prepare_r_pcs_link_columns_universal(
-    b: &mut FieldR1csBuilder,
-    proofs: &[RPcsProof<'_>],
-    geometry: &RPcsLinkUniversalGeometry,
-    active_groups: &[usize],
-    recordings: LinkLiveRecordings,
-) -> Result<RPcsLinkColumns, RegionSidecarError> {
-    let asm = build_recording_free_link_assembly(proofs, geometry, active_groups)?;
+    proof: &RPcsProof<'_>,
+    geometry: &HistoryStepParentGeometry,
+    active_slot: usize,
+    child_recording: LayoutRecordedChannel,
+    r_prev_recording: LayoutRecordedChannel,
+) -> Result<HistoryStepParentColumns, RegionSidecarError> {
+    if active_slot >= geometry.tier_count() {
+        return Err(RegionSidecarError::BadVk);
+    }
+    let proofs = [RPcsProof {
+        native: proof.native,
+        params: proof.params,
+        commitment_root: proof.commitment_root,
+    }];
+    let asm = build_recording_free_link_assembly(&proofs, &geometry.carrier, &[active_slot])?;
     let slices_a = std::array::from_fn(|column| {
         alloc_column_slice_values_only(b, &asm.u_a.committed[column], asm.u_a.w_log)
     });
@@ -2089,81 +972,7 @@ pub(crate) fn prepare_r_pcs_link_columns_universal(
             alloc_column_slice_values_only(b, &asm.cb[column], asm.w_log_b)
         }
     });
-
-    // ---- Walk L-C: the recordings vertical.  Per ladder slot one recorded
-    // block-sidecar child block and one recorded `[R]_B` outer-channel
-    // block (this class's hosted slot is live, every other slot carries its
-    // canonical zero-data ghost recording), plus the ONE universal recorded
-    // `[R]_prev` outer-channel block — so the committed slice geometry and
-    // the sidecar VK stay universal.
-    let rec_active_slot = active_groups[1]
-        .checked_sub(1)
-        .ok_or(RegionSidecarError::UnsupportedVkShape)?;
-    if rec_active_slot >= geometry.rec_layouts().len() {
-        return Err(RegionSidecarError::UnsupportedVkShape);
-    }
-    let child_block = geometry.child_block_index(rec_active_slot);
-    let r_b_block = geometry.r_b_block_index(rec_active_slot);
-    let r_prev_block = geometry.r_prev_block_index();
-    let (blocks, _) = geometry.recording_blocks()?;
-    // All three roles record together (a real link) or not at all (the
-    // bootstrap ghost) — a partially recorded walk L-C has no meaning.
-    if recordings.child.is_some() != recordings.r_b.is_some()
-        || recordings.child.is_some() != recordings.r_prev.is_some()
-    {
-        return Err(RegionSidecarError::UnsupportedVkShape);
-    }
-    let live = [
-        (child_block, recordings.child.as_ref()),
-        (r_b_block, recordings.r_b.as_ref()),
-        (r_prev_block, recordings.r_prev.as_ref()),
-    ];
-    for (block, recording) in &live {
-        if let Some(recording) = recording {
-            let layout = &blocks[*block].0;
-            if recording.layout != *layout || recording.data_flat.len() != layout.n_data {
-                return Err(RegionSidecarError::UnsupportedVkShape);
-            }
-        }
-    }
-    let max_recording_data_lanes = blocks
-        .iter()
-        .map(|(layout, _)| layout.n_data)
-        .max()
-        .ok_or(RegionSidecarError::BadVk)?;
-    // Every inactive recording consumes an all-zero slice and the builder
-    // reads it immutably. One max-sized buffer therefore serves every
-    // inactive canonical ghost role without changing a single lane, while avoiding
-    // nine independently allocated/zeroed Vecs at every height.
-    let ghost_data = vec![F128::ZERO; max_recording_data_lanes];
-    debug_assert!(
-        max_recording_data_lanes
-            <= blocks
-                .iter()
-                .map(|(layout, _)| layout.n_data)
-                .sum::<usize>()
-    );
-    let rec_specs: Vec<RecordingSpec<'_>> = blocks
-        .iter()
-        .enumerate()
-        .map(|(block, (layout, _))| RecordingSpec {
-            layout: layout.clone(),
-            iv_flat: noid_ivc_core::field_circuit::FsChannelUnionRecorder::capacity_iv_flat(),
-            data: match live
-                .iter()
-                .find(|(live_block, recording)| *live_block == block && recording.is_some())
-            {
-                Some((_, Some(recording))) => &recording.data_flat,
-                _ => &ghost_data[..layout.n_data],
-            },
-        })
-        .collect();
-    let live_blocks = if recordings.child.is_some() {
-        vec![child_block, r_b_block, r_prev_block]
-    } else {
-        Vec::new()
-    };
-    let u_rec = geometry.recording_union_cached(&rec_specs, &live_blocks)?;
+    let u_rec = geometry.recording_union(active_slot, &child_recording, &r_prev_recording)?;
     let slices_rec = std::array::from_fn(|column| {
         alloc_column_slice_values_only(b, &u_rec.committed[column], u_rec.w_log)
     });
@@ -2185,34 +994,31 @@ pub(crate) fn prepare_r_pcs_link_columns_universal(
     let rec_vk =
         RecordingDuplexRegionVk::from_union(link_recordings_purpose(), slices_rec, &u_rec)?;
     let vk = LinkRegionSidecarVk::new(leaf_vk, path_vk, rec_vk)?;
-    Ok(RPcsLinkColumns {
+    if vk != geometry.vk_from_slices(slices_a, slices_b, slices_rec)? {
+        return Err(RegionSidecarError::UnsupportedVkShape);
+    }
+    Ok(HistoryStepParentColumns {
         asm,
         slices_a,
         slices_b,
         slices_rec,
         u_rec,
-        child_scratch: recordings.child,
-        r_b_scratch: recordings.r_b,
-        r_prev_scratch: recordings.r_prev,
-        rec_active_slot,
-        child_block,
-        r_b_block,
-        r_prev_block,
+        child_scratch: child_recording,
+        r_prev_scratch: r_prev_recording,
+        child_block: geometry.child_block_index(active_slot),
+        r_prev_block: geometry.r_prev_block_index(active_slot),
         vk,
     })
 }
 
-/// Owning production output of phase 2. The outer link prover borrows these
-/// two values to construct [`crate::region_sidecar::LinkRegionProverPlan`]
-/// only inside its typestate post-commit callback.
-#[allow(dead_code)]
-pub(crate) struct RPcsLinkRegionPreparation {
+/// Production predecessor-recursion preparation for the three HistoryStep
+/// parent sidecar verticals.
+pub(crate) struct HistoryStepParentRegionPreparation {
     vk: LinkRegionSidecarVk,
     input: LinkRegionProverInput,
 }
 
-#[allow(dead_code)]
-impl RPcsLinkRegionPreparation {
+impl HistoryStepParentRegionPreparation {
     pub(crate) fn vk(&self) -> &LinkRegionSidecarVk {
         &self.vk
     }
@@ -2220,55 +1026,6 @@ impl RPcsLinkRegionPreparation {
     pub(crate) fn prover_input(&self) -> &LinkRegionProverInput {
         &self.input
     }
-}
-
-/// Allocate the explicit genesis ghost using the same universal L-A/L-B key
-/// as every ordinary link.  There are deliberately no deferred `[R]`
-/// obligations to bind: the bootstrap relation verifies no predecessor.
-/// Nevertheless both recording-free relations are real post-commit
-/// authorities. The honest constructor uses canonical zero-data/zero-path
-/// columns; verification requires a relation-valid ghost, not uniqueness of
-/// that zero witness. Thus genesis T and an ordinary link share one transcript
-/// shape without inventing deferred obligations at bootstrap.
-pub(crate) fn prepare_r_pcs_link_genesis_ghost(
-    b: &mut FieldR1csBuilder,
-    geometry: &RPcsLinkUniversalGeometry,
-) -> Result<RPcsLinkRegionPreparation, RegionSidecarError> {
-    if geometry.groups.len() < 2 || geometry.group_params.len() != geometry.groups.len() {
-        return Err(RegionSidecarError::BadVk);
-    }
-    let (link_proof, link_root) = ghost_basefold_geometry(&geometry.groups[0], geometry.n_queries)?;
-    let (block_proof, block_root) =
-        ghost_basefold_geometry(&geometry.groups[1], geometry.n_queries)?;
-    let proofs = [
-        RPcsProof {
-            native: &link_proof,
-            params: &geometry.group_params[0],
-            commitment_root: link_root,
-        },
-        RPcsProof {
-            native: &block_proof,
-            params: &geometry.group_params[1],
-            commitment_root: block_root,
-        },
-    ];
-    // The bootstrap verifies no predecessor and no block sidecar: its walk
-    // L-C carries the canonical zero-data recording on EVERY block.
-    let columns = prepare_r_pcs_link_columns_universal(
-        b,
-        &proofs,
-        geometry,
-        &[0, 1],
-        LinkLiveRecordings::default(),
-    )?;
-    let RPcsLinkColumns { asm, u_rec, vk, .. } = columns;
-    let input = LinkRegionProverInput::new(
-        &vk,
-        RegionWalkEndpoints::new(asm.u_a.s0, asm.u_a.s_out),
-        RegionWalkEndpoints::new(asm.s0b, asm.soutb),
-        RegionWalkEndpoints::new(u_rec.s0, u_rec.s_out),
-    )?;
-    Ok(RPcsLinkRegionPreparation { vk, input })
 }
 
 /// Pin one live recording block: the real recorded replay must reproduce the
@@ -2337,1594 +1094,164 @@ fn pin_recording_block(
     }
 }
 
-/// Phase-2 production binding. It adds the same leaf/data/digest/cross-walk/
-/// direction/root semantic pins as the transitional discharge, but creates no
-/// relation proof, no FS channel, no recording block and no `RegionPcsClaim`.
-#[allow(dead_code)]
-pub(crate) fn finalize_r_pcs_link_region(
+/// Self-recursive twin of [`finalize_r_pcs_history_step_region`].  Besides the
+/// predecessor PCS obligations it pins both live recording blocks; omitting
+/// the previous envelope's direct-Block child transcript is therefore
+/// structurally impossible.
+pub(crate) fn finalize_history_step_parent_region(
     b: &mut FieldR1csBuilder,
-    columns: RPcsLinkColumns,
-    obligations: &[&PcsWalkObligations],
+    columns: HistoryStepParentColumns,
+    obligations: &PcsWalkObligations,
     recorded_child: &FsRecordedChannel,
-    recorded_r_b: &FsRecordedChannel,
     recorded_r_prev: &FsRecordedChannel,
-) -> Result<RPcsLinkRegionPreparation, RegionSidecarError> {
-    let RPcsLinkColumns {
+) -> Result<HistoryStepParentRegionPreparation, RegionSidecarError> {
+    let HistoryStepParentColumns {
         asm,
         slices_a,
         slices_b,
         slices_rec,
         u_rec,
         child_scratch,
-        r_b_scratch,
         r_prev_scratch,
-        rec_active_slot: _,
         child_block,
-        r_b_block,
         r_prev_block,
         vk,
     } = columns;
-    assert_eq!(
-        obligations.len(),
-        asm.trees.len(),
-        "one obligation set per proof"
-    );
-    for (proof_index, proof_obligations) in obligations.iter().enumerate() {
-        let n_trees = asm.trees[proof_index].len();
-        assert_eq!(
-            proof_obligations.leaves.len(),
-            asm.n_queries * n_trees,
-            "proof {proof_index}: leaf obligation count off the tree ladder"
-        );
-        assert_eq!(
-            proof_obligations.paths.len(),
-            proof_obligations.leaves.len(),
-            "proof {proof_index}: path/leaf pairing"
-        );
+    if asm.trees.len() != 1 {
+        return Err(RegionSidecarError::UnsupportedVkShape);
     }
+    let n_trees = asm.trees[0].len();
+    assert_eq!(
+        obligations.leaves.len(),
+        asm.n_queries * n_trees,
+        "HistoryStep parent leaf obligation count"
+    );
+    assert_eq!(
+        obligations.paths.len(),
+        obligations.leaves.len(),
+        "HistoryStep parent path/leaf pairing"
+    );
 
-    let mut ledger = b.num_wires();
     let per_tile = 1usize << asm.u_a.block_log;
     let subchannel_slots = 1usize << asm.s_log;
     let path_block = 1usize << asm.block_log_b;
-    for (proof_index, proof_obligations) in obligations.iter().enumerate() {
-        let n_trees = asm.trees[proof_index].len();
-        for query_index in 0..asm.n_queries {
-            let tile_offset = (proof_index * asm.n_queries + query_index) * per_tile;
-            for tree_index in 0..n_trees {
-                let subchannel = tree_index;
-                let leaf = &proof_obligations.leaves[query_index * n_trees + tree_index];
-                let positions = &asm.leaf_data_positions[subchannel];
-                assert_eq!(
-                    leaf.lanes.len(),
-                    positions.len(),
-                    "proof {proof_index}, tree {tree_index}: leaf lane count vs universal subchannel"
-                );
-                for (wire, &(slot, lane)) in leaf.lanes.iter().zip(positions) {
-                    pin_eq(b, wire, &slot_cell(&slices_a[lane], tile_offset + slot));
-                }
+    for query_index in 0..asm.n_queries {
+        let tile_offset = query_index * per_tile;
+        for tree_index in 0..n_trees {
+            let leaf = &obligations.leaves[query_index * n_trees + tree_index];
+            let positions = &asm.leaf_data_positions[tree_index];
+            assert_eq!(
+                leaf.lanes.len(),
+                positions.len(),
+                "HistoryStep parent leaf lanes"
+            );
+            for (wire, &(slot, lane)) in leaf.lanes.iter().zip(positions) {
+                pin_eq(b, wire, &slot_cell(&slices_a[lane], tile_offset + slot));
+            }
 
-                let obligation = &proof_obligations.paths[query_index * n_trees + tree_index];
-                assert_eq!(
-                    obligation.leaf,
-                    query_index * n_trees + tree_index,
-                    "leaf/path pairing"
-                );
-                let depth = asm.trees[proof_index][tree_index].depth;
-                assert_eq!(obligation.dir_bits.len(), depth, "direction bit count");
-                let digest_slot = tile_offset
-                    + subchannel * subchannel_slots
-                    + asm.trees[proof_index][tree_index].lanes / 2
+            let obligation = &obligations.paths[query_index * n_trees + tree_index];
+            assert_eq!(
+                obligation.leaf,
+                query_index * n_trees + tree_index,
+                "HistoryStep parent leaf/path pairing"
+            );
+            let depth = asm.trees[0][tree_index].depth;
+            assert_eq!(obligation.dir_bits.len(), depth);
+            let digest_slot =
+                tile_offset + tree_index * subchannel_slots + asm.trees[0][tree_index].lanes / 2
                     - 1;
-                let path_block_index = proof_index * asm.n_queries + query_index;
-                let leg_slot = path_block_index * path_block + asm.leg_offsets[tree_index];
-                for lane in 0..2 {
-                    let digest_wire = LinExpr::from_wire(
-                        b.alloc_f128(asm.digests[proof_index][query_index][tree_index][lane]),
-                    );
-                    pin_eq(
-                        b,
-                        &digest_wire,
-                        &slot_cell(&slices_a[2 + lane], digest_slot),
-                    );
-                    pin_eq(b, &digest_wire, &slot_cell(&slices_b[4 + lane], leg_slot));
-                }
-                for (level, bit) in obligation.dir_bits.iter().enumerate() {
-                    pin_eq(b, bit, &slot_cell(&slices_b[8], leg_slot + level));
-                }
-                // `NODENS(root_slot)` proves that this committed CR cell is
-                // exactly the feed-forward output of the final real prefix
-                // node.  Carrier suffix nodes are relation-valid padding and
-                // cannot change the already committed prefix root.
-                let root_slot = leg_slot + depth;
-                for lane in 0..2 {
-                    pin_eq(
-                        b,
-                        &slot_cell(&slices_b[4 + lane], root_slot),
-                        &obligation.root[lane],
-                    );
-                }
-            }
-        }
-    }
-    crate::acceptance::row_ledger_mark(b, &mut ledger, "r-pcs: recording-free link semantic pins");
-
-    // ---- Walk L-C: the recorded transcript pins, one live block per role.
-    match (&child_scratch, &r_b_scratch, &r_prev_scratch) {
-        (Some(child), Some(r_b), Some(r_prev)) => {
-            pin_recording_block(
-                b,
-                "walk L-C child",
-                child,
-                recorded_child,
-                &vk,
-                &u_rec,
-                &slices_rec,
-                child_block,
-            );
-            pin_recording_block(
-                b,
-                "walk L-C [R]_B",
-                r_b,
-                recorded_r_b,
-                &vk,
-                &u_rec,
-                &slices_rec,
-                r_b_block,
-            );
-            pin_recording_block(
-                b,
-                "walk L-C [R]_prev",
-                r_prev,
-                recorded_r_prev,
-                &vk,
-                &u_rec,
-                &slices_rec,
-                r_prev_block,
-            );
-        }
-        (None, None, None) => {
-            for recorded in [recorded_child, recorded_r_b, recorded_r_prev] {
-                assert!(
-                    recorded.ops.is_empty()
-                        && recorded.data_wires.is_empty()
-                        && recorded.challenge_wires.is_empty(),
-                    "ghost walk L-C cannot bind a recorded transcript"
-                );
-            }
-        }
-        _ => return Err(RegionSidecarError::UnsupportedVkShape),
-    }
-    crate::acceptance::row_ledger_mark(b, &mut ledger, "r-pcs: walk L-C recording pins");
-
-    let leaf_endpoints = RegionWalkEndpoints::new(asm.u_a.s0, asm.u_a.s_out);
-    let path_endpoints = RegionWalkEndpoints::new(asm.s0b, asm.soutb);
-    let rec_endpoints = RegionWalkEndpoints::new(u_rec.s0, u_rec.s_out);
-    let input = LinkRegionProverInput::new(&vk, leaf_endpoints, path_endpoints, rec_endpoints)?;
-    Ok(RPcsLinkRegionPreparation { vk, input })
-}
-
-/// Test-only carrier for the retired recording-bearing two-walk discharge.
-/// Production uses [`RPcsLinkColumns`] and its independent L-A/L-B/L-C
-/// verticals; this reference remains useful for transcript/claim parity tests.
-#[cfg(test)]
-struct RPcsColumns {
-    asm: Assembly,
-    slices_a: Vec<WitnessSlice>,
-    slices_b: Vec<WitnessSlice>,
-}
-
-#[cfg(test)]
-fn alloc_r_pcs_columns(b: &mut FieldR1csBuilder, proofs: &[RPcsProof<'_>]) -> RPcsColumns {
-    let asm = build_assembly(proofs);
-    let slices_a: Vec<WitnessSlice> = asm
-        .u_a
-        .committed
-        .iter()
-        .map(|c| alloc_column_slice_values_only(b, c, asm.u_a.w_log))
-        .collect();
-    let slices_b: Vec<WitnessSlice> = asm
-        .cb
-        .iter()
-        .map(|c| alloc_column_slice_values_only(b, c, asm.w_log_b))
-        .collect();
-    RPcsColumns {
-        asm,
-        slices_a,
-        slices_b,
-    }
-}
-
-/// Test-only phase 2: discharge both `[R]` PCS obligations on the retired
-/// recording-bearing two-walk construction —
-/// replay each walk's discharge in-trace and bind every obligation (leaf
-/// lanes → A cells, leaf digests → L-A digest cells AND L-B entry cells,
-/// direction bits → D cells, recomputed roots → the FS-observed root
-/// wires). Returns the committed-column opening claims for the caller's
-/// public-IO tail — claim order matches [`r_pcs_region_native`].
-#[cfg(test)]
-fn discharge_r_pcs_via_region(
-    b: &mut FieldR1csBuilder,
-    cols: RPcsColumns,
-    obligations: &[&PcsWalkObligations],
-) -> Vec<RegionPcsClaim> {
-    let RPcsColumns {
-        asm,
-        slices_a,
-        slices_b,
-    } = cols;
-    let n_trees = asm.trees[0].len();
-    assert_eq!(
-        obligations.len(),
-        asm.trees.len(),
-        "one obligation set per proof"
-    );
-    for (pi, obs) in obligations.iter().enumerate() {
-        assert_eq!(
-            obs.leaves.len(),
-            asm.n_queries * n_trees,
-            "proof {pi}: leaf obligation count off the tree ladder"
-        );
-        assert_eq!(
-            obs.paths.len(),
-            obs.leaves.len(),
-            "proof {pi}: path/leaf pairing"
-        );
-    }
-
-    // ---- Walk L-A native (over the recording-bearing domain; walk L-B's
-    // native run rides the assembly).
-    let native_a = run_duplex_union_native(&asm.u_a, DOMAIN_LA);
-    let c_refs: [usize; STATE_SIZE] = std::array::from_fn(|i| i);
-    let legs: Vec<MerkleLeg> = Vec::new();
-
-    // ---- Walk L-B discharge FIRST, on a RECORDER: its transcript rides
-    // walk L-A's region-2 block; the real recording must reproduce the
-    // assembly's scratch recording exactly (same native inputs — any drift
-    // is a bug, caught loudly here before the cell pins).
-    let mut ledger = b.num_wires();
-    let mut ch_b = FsChannelUnionRecorder::new(DOMAIN_LB);
-    let (mut claims_b, leg_pins) = discharge_merkle_union(
-        b,
-        &mut ch_b,
-        &asm.fixed_b,
-        &c_refs,
-        &asm.ff_specs,
-        &legs,
-        asm.w_log_b,
-        &asm.native_b,
-    );
-    assert!(leg_pins.is_empty(), "no 2-perm legs in the link walks");
-    let rec_b = ch_b.finish();
-    assert_eq!(
-        rec_b.ops, asm.rec_b_scratch.ops,
-        "walk L-B recording schedule drift"
-    );
-    assert_eq!(
-        rec_b.data_flat, asm.rec_b_scratch.data_flat,
-        "walk L-B recording data drift"
-    );
-    assert_eq!(
-        rec_b.post_state, asm.rec_b_scratch.post_state,
-        "walk L-B recording post-state drift"
-    );
-    crate::acceptance::row_ledger_mark(b, &mut ledger, "r-pcs: walk L-B twin (recorded)");
-
-    // ---- Walk L-A discharge (inline transcript — a walk cannot host its
-    // own transcript; L-A is the one inline replay the link pays for).
-    let mut ch_a = FsChannelTrace::new(b, DOMAIN_LA);
-    let mut claims = discharge_duplex_union(b, &mut ch_a, &asm.u_a, &native_a, 0);
-    crate::acceptance::row_ledger_mark(b, &mut ledger, "r-pcs: walk L-A twin (inline)");
-
-    // ---- Region-2 recording cell pins: the walk L-B discharge's absorbed
-    // proof data pins to the recording block's A-lane cells and its
-    // squeezed challenges to the carry cells — walk L-A then proves the
-    // whole transcript chain, replacing the deleted inline replay.
-    {
-        let (rec_layout, off) = &asm.u_a.rec_blocks[0];
-        assert_eq!(
-            rec_b.challenge_wires.len(),
-            rec_layout.challenges.len(),
-            "walk L-B recording challenge count"
-        );
-        assert_eq!(
-            rec_b.data_wires.len(),
-            rec_layout.n_data,
-            "walk L-B recording data count"
-        );
-        for (kk, &(slot, lane)) in rec_layout.challenges.iter().enumerate() {
-            assert_eq!(
-                rec_b.challenge_wires[kk].eval(b.values()),
-                asm.u_a.rec_challenges[0][kk],
-                "walk L-B recording challenge {kk} lockstep"
-            );
-            let cell = slot_cell(&slices_a[asm.u_a.refs.c[lane]], off + slot);
-            pin_eq(b, &rec_b.challenge_wires[kk], &cell);
-        }
-        for (kk, &(slot, lane)) in duplex_data_positions(rec_layout).iter().enumerate() {
-            let cell = slot_cell(&slices_a[asm.u_a.refs.a[lane]], off + slot);
-            pin_eq(b, &rec_b.data_wires[kk], &cell);
-        }
-    }
-
-    for c in claims_b.iter_mut() {
-        c.slice += slices_a.len();
-    }
-    claims.extend(claims_b);
-
-    // ---- Stage-2 cell pins.
-    let per_tile = 1usize << asm.u_a.block_log;
-    let s = 1usize << asm.s_log;
-    let block_b = 1usize << asm.block_log_b;
-    let data_positions = duplex_data_positions(&asm.u_a.layout);
-    for (pi, obs) in obligations.iter().enumerate() {
-        for qi in 0..asm.n_queries {
-            let tile_off = (pi * asm.n_queries + qi) * per_tile;
-            // Leaf lanes → A-lane cells (tile-flattened sub order == the
-            // obligation push order: initial, post, epochs).
-            let flat: Vec<&LinExpr> = (0..n_trees)
-                .flat_map(|t| obs.leaves[qi * n_trees + t].lanes.iter())
-                .collect();
-            assert_eq!(
-                flat.len(),
-                data_positions.len(),
-                "leaf lane count vs layout"
-            );
-            for (wire, &(slot, lane)) in flat.iter().zip(data_positions.iter()) {
+            let leg_slot = query_index * path_block + asm.leg_offsets[tree_index];
+            for lane in 0..2 {
+                let digest_wire =
+                    LinExpr::from_wire(b.alloc_f128(asm.digests[0][query_index][tree_index][lane]));
                 pin_eq(
                     b,
-                    wire,
-                    &slot_cell(&slices_a[asm.u_a.refs.a[lane]], tile_off + slot),
+                    &digest_wire,
+                    &slot_cell(&slices_a[2 + lane], digest_slot),
                 );
+                pin_eq(b, &digest_wire, &slot_cell(&slices_b[4 + lane], leg_slot));
             }
-            for t in 0..n_trees {
-                let ob = &obs.paths[qi * n_trees + t];
-                assert_eq!(ob.leaf, qi * n_trees + t, "leaf/path pairing");
-                let depth = asm.trees[pi][t].depth;
-                assert_eq!(ob.dir_bits.len(), depth, "direction bit count");
-                // Digest wires: pinned to BOTH the L-A digest cells and
-                // the leg's CR(start) cells (the cross-walk entry join).
-                let dslot = tile_off + t * s + asm.trees[pi][t].lanes / 2 - 1;
-                let leg_slot = qi * block_b + asm.leg_offsets[pi][t];
-                for lane in 0..2 {
-                    let w = LinExpr::from_wire(b.alloc_f128(asm.digests[pi][qi][t][lane]));
-                    pin_eq(b, &w, &slot_cell(&slices_a[asm.u_a.refs.c[lane]], dslot));
-                    pin_eq(b, &w, &slot_cell(&slices_b[4 + lane], leg_slot));
-                }
-                // Direction cells → the transcript-bound position bits.
-                for (kk, bit) in ob.dir_bits.iter().enumerate() {
-                    pin_eq(b, bit, &slot_cell(&slices_b[8], leg_slot + kk));
-                }
-                // Recomputed root == the FS-observed root wire.
-                let last = leg_slot + depth - 1;
-                let d_cell = slot_cell(&slices_b[8], last);
-                for lane in 0..2 {
-                    let c_cell = slot_cell(&slices_b[lane], last);
-                    let cr_cell = slot_cell(&slices_b[4 + lane], last);
-                    let sib_cell = slot_cell(&slices_b[6 + lane], last);
-                    let mix = mul(b, &d_cell, &cr_cell.add(&sib_cell));
-                    pin_eq(b, &c_cell.add(&cr_cell).add(&mix), &ob.root[lane]);
-                }
+            for (level, bit) in obligation.dir_bits.iter().enumerate() {
+                pin_eq(b, bit, &slot_cell(&slices_b[8], leg_slot + level));
+            }
+            let root_slot = leg_slot + depth;
+            for lane in 0..2 {
+                pin_eq(
+                    b,
+                    &slot_cell(&slices_b[4 + lane], root_slot),
+                    &obligation.root[lane],
+                );
             }
         }
     }
+    pin_recording_block(
+        b,
+        "walk L-C HistoryStep parent Block child",
+        &child_scratch,
+        recorded_child,
+        &vk,
+        &u_rec,
+        &slices_rec,
+        child_block,
+    );
+    pin_recording_block(
+        b,
+        "walk L-C HistoryStep [R]_prev",
+        &r_prev_scratch,
+        recorded_r_prev,
+        &vk,
+        &u_rec,
+        &slices_rec,
+        r_prev_block,
+    );
 
-    // ---- Resolve column indices to committed slices.
-    let all_slices: Vec<WitnessSlice> = slices_a.into_iter().chain(slices_b).collect();
-    claims
-        .into_iter()
-        .map(|c| RegionPcsClaim {
-            slice: all_slices[c.slice],
-            point: c.point,
-            value: c.value,
-            native_point: c.native_point,
-            native_value: c.native_value,
-        })
-        .collect()
+    let input = LinkRegionProverInput::new(
+        &vk,
+        RegionWalkEndpoints::new(asm.u_a.s0, asm.u_a.s_out),
+        RegionWalkEndpoints::new(asm.s0b, asm.soutb),
+        RegionWalkEndpoints::new(u_rec.s0, u_rec.s_out),
+    )?;
+    Ok(HistoryStepParentRegionPreparation { vk, input })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acceptance::trace::self_verify::{
-        alloc_flat_digest, verify_field_trace_deferred_region,
-        verify_field_trace_deferred_region_with_post_commit_context, FieldR1csProofTrace,
-        PcsLeafObligation, PcsPathObligation,
-    };
-    use crate::region_sidecar::{
-        link_post_commit_class_digest, verify_link_region_sidecar_post_commit,
-        verify_link_region_sidecar_trace_post_commit, LinkRegionProverPlan,
-    };
-    use noid_ivc_core::challenger::{Challenger, FsLaneChallenger};
-    use noid_ivc_core::field_r1cs::synthetic_satisfiable;
     use noid_ivc_core::pcs::LOG_PACKING;
-    use noid_ivc_core::proof::FieldShape;
     use noid_ivc_core::public_io::PublicIoSpec;
-    use noid_ivc_core::verifier::{
-        verify_field_deferred_matrix_with_post_commit_context, verify_field_with_public_io,
-        verify_field_with_public_io_and_post_commit_context, VerifyError,
-    };
-    use noid_ivc_prover::field_prover::{
-        prove_field_with_public_io, prove_field_with_public_io_and_post_commit_context,
-    };
 
     #[test]
-    fn production_link_recordings_are_owned_and_moved_without_deep_clone() {
-        let source = include_str!("r_pcs_region.rs");
-        let carrier = source
-            .split("pub(crate) struct LinkLiveRecordings {")
-            .nth(1)
-            .expect("owned LinkLiveRecordings declaration")
-            .split("/// Allocate the two independent recording-free link walk verticals.")
-            .next()
-            .expect("LinkLiveRecordings fields");
-        assert_eq!(carrier.matches("Option<LayoutRecordedChannel>").count(), 3);
-        assert!(!carrier.contains("Option<&"));
-
-        let prepare = source
-            .split("pub(crate) fn prepare_r_pcs_link_columns_universal(")
-            .nth(1)
-            .expect("universal link column preparation")
-            .split("/// Owning production output of phase 2.")
-            .next()
-            .expect("universal link column preparation body");
-        assert!(!prepare.contains("recording.cloned()"));
-        assert!(!prepare.contains("scratch_of"));
-        assert!(prepare.contains("child_scratch: recordings.child"));
-        assert!(prepare.contains("r_b_scratch: recordings.r_b"));
-        assert!(prepare.contains("r_prev_scratch: recordings.r_prev"));
-
-        let split_source = include_str!("../split_link.rs");
-        let production_call = split_source
-            .split("let r_cols = prepare_r_pcs_link_columns_universal(")
-            .nth(1)
-            .expect("production split-link walk-column call")
-            .split(".expect(\"universal recording link columns\")")
-            .next()
-            .expect("production split-link walk-column arguments");
-        assert!(production_call.contains("child: Some(child_recording)"));
-        assert!(production_call.contains("r_b: Some(r_b_recording)"));
-        assert!(production_call.contains("r_prev: Some(r_prev_recording)"));
-    }
-
-    fn hash_of_flat_lanes(lanes: [F128; 2]) -> [u8; 32] {
-        let mut hash = [0u8; 32];
-        for (lane, chunk) in lanes.into_iter().zip(hash.chunks_exact_mut(16)) {
-            let value = (lane.lo as u128) | ((lane.hi as u128) << 64);
-            chunk.copy_from_slice(&value.to_le_bytes());
-        }
-        hash
-    }
-
-    fn test_rec_layouts(count: usize) -> Vec<DuplexLayout> {
-        (0..count)
-            .map(|_| {
-                compile_duplex(&[
-                    TranscriptOp::Absorb(vec![None, None]),
-                    TranscriptOp::Squeeze(1),
-                ])
-            })
-            .collect()
-    }
-
-    fn test_r_prev_layout() -> DuplexLayout {
-        compile_duplex(&[
-            TranscriptOp::Absorb(vec![None, Some(1), None]),
-            TranscriptOp::Squeeze(1),
-        ])
-    }
-
-    /// Shape-correct zero-data BaseFold carrier for sidecar-geometry tests.
-    /// It is not a cryptographic proof; the recording-free assembly consumes
-    /// only its canonical leaves, paths, roots and query positions.
-    fn mock_basefold_geometry(
-        params: &PcsParams,
-        n_queries: usize,
-    ) -> (pcs::BaseFoldProof, [F128; 2]) {
-        let trees = tree_structure(params);
-        let zero_hash = [0u8; 32];
-        let mut roots = Vec::with_capacity(trees.len());
-        for tree in &trees {
-            let leaf = vec![F128::ZERO; tree.lanes];
-            let family = FfMerklePathFamily {
-                depth: tree.depth,
-                n_paths: 1,
-            };
-            let columns = build_ff_merkle_path_columns(
-                &family,
-                pcs_node_iv_flat(),
-                &[FfMerklePathWitness {
-                    entry: native_leaf_digest(&leaf),
-                    siblings: vec![[F128::ZERO; 2]; tree.depth],
-                    directions: vec![false; tree.depth],
-                }],
-                family.stride_log(),
-            );
-            roots.push(columns.roots[0]);
-        }
-        let query = pcs::basefold::QueryOpening {
-            position: 0,
-            initial_leaf: vec![F128::ZERO; trees[0].lanes],
-            initial_path: vec![zero_hash; trees[0].depth],
-            post_row_batch_leaf: vec![F128::ZERO; trees[1].lanes],
-            post_row_batch_path: vec![zero_hash; trees[1].depth],
-            epoch_leaves: trees[2..]
-                .iter()
-                .map(|tree| vec![F128::ZERO; tree.lanes])
-                .collect(),
-            epoch_paths: trees[2..]
-                .iter()
-                .map(|tree| vec![zero_hash; tree.depth])
-                .collect(),
-        };
-        let proof = pcs::BaseFoldProof {
-            round_messages: Vec::new(),
-            post_row_batch_commit: pcs::RoundCommitment {
-                root: hash_of_flat_lanes(roots[1]),
-            },
-            round_commitments: roots[2..]
-                .iter()
-                .copied()
-                .map(|root| pcs::RoundCommitment {
-                    root: hash_of_flat_lanes(root),
-                })
-                .collect(),
-            final_a: F128::ZERO,
-            final_b: F128::ZERO,
-            final_codeword: Vec::new(),
-            plaintext_tail: Vec::new(),
-            pow_nonce: 0,
-            queries: vec![query; n_queries],
-        };
-        (proof, roots[0])
-    }
-
-    fn alloc_native_walk_obligations(
-        b: &mut FieldR1csBuilder,
-        proof: &RPcsProof<'_>,
-    ) -> PcsWalkObligations {
-        let trees = tree_structure(proof.params);
-        let mut obligations = PcsWalkObligations::default();
-        for query in &proof.native.queries {
-            for (tree_index, tree) in trees.iter().enumerate() {
-                let leaf = obligations.leaves.len();
-                let lanes = native_leaf_lanes(query, tree_index)
-                    .iter()
-                    .map(|&value| LinExpr::from_wire(b.alloc_f128(value)))
-                    .collect();
-                obligations.leaves.push(PcsLeafObligation { lanes });
-
-                let bit_offset = dir_bit_offset(&trees, tree_index, trees[0].depth);
-                let dir_bits = (0..tree.depth)
-                    .map(|level| {
-                        let bit = ((query.position >> (bit_offset + level)) & 1) as u64;
-                        LinExpr::from_wire(b.alloc_f128(F128::new(bit, 0)))
-                    })
-                    .collect();
-                let root = native_root(proof, tree_index)
-                    .map(|value| LinExpr::from_wire(b.alloc_f128(value)));
-                obligations.paths.push(PcsPathObligation {
-                    leaf,
-                    dir_bits,
-                    root,
-                });
-            }
-        }
-        obligations
-    }
-
-    /// The full [R] PCS walk discharge on TWO proofs of DIFFERENT shapes:
-    /// path-free region replays collect the obligations, the two link
-    /// walks discharge them, the trace satisfies, the native mirror
-    /// agrees claim-for-claim, and one-flip negatives break each binding
-    /// class (leaf lane, direction bit, observed root).
-    #[test]
-    fn r_pcs_region_discharge_two_proofs_and_negatives() {
-        let mk = |m: usize, seed: u64| {
-            let (inner, z) = synthetic_satisfiable(m, m, seed);
-            let spec = PublicIoSpec {
-                io_slice: noid_ivc_core::public_io::WitnessSlice {
-                    log2_len: 2,
-                    index: 4,
-                },
-                io_len: 4,
-                claims: vec![],
-            };
-            let io: Vec<F128> = (16..20).map(|t| z[t]).collect();
-            let params = PcsParams {
-                m: m + LOG_PACKING,
-                log_inv_rate: 2,
-                log_batch_size: 2,
-                profile: Default::default(),
-            };
-            let mut ch = FsLaneChallenger::new(b"r-pcs-region-test");
-            let (proof, commitment, _) =
-                prove_field_with_public_io(&inner, &z, &params, &spec, &io, &mut ch);
-            let digest = inner.statement_digest();
-            (
-                FieldShape::of(&inner),
-                params,
-                spec,
-                io,
-                proof,
-                commitment,
-                digest,
-            )
-        };
-        // m=11/m=12 are different shapes that share the domain-derived
-        // 125-query count; the shared-walk assembly requires equal counts,
-        // exactly like the production m22..m24 ladder.
-        let (shape0, params0, spec0, io0, proof0, com0, dig0) = mk(11, 0xA11CE);
-        let (shape1, params1, spec1, io1, proof1, com1, dig1) = mk(12, 0xB0B);
-
-        let mut b = FieldR1csBuilder::new();
-        let run = |b: &mut FieldR1csBuilder,
-                   shape: &FieldShape,
-                   params: &PcsParams,
-                   spec: &PublicIoSpec,
-                   io: &[F128],
-                   proof: &noid_ivc_core::proof::FieldR1csProof,
-                   com: &noid_ivc_core::pcs::Commitment,
-                   dig: &[u8; 32]|
-         -> PcsWalkObligations {
-            let digest_e = alloc_flat_digest(b, dig);
-            let root = alloc_flat_digest(b, &com.root);
-            let io_wires: Vec<LinExpr> = io
-                .iter()
-                .map(|&v| LinExpr::from_wire(b.alloc_f128(v)))
-                .collect();
-            let proof_e = FieldR1csProofTrace::alloc_shape_mode(b, proof, shape, params, false);
-            let mut ch = FsChannelTrace::new(b, b"r-pcs-region-test");
-            let mut obs = PcsWalkObligations::default();
-            let _ = verify_field_trace_deferred_region(
-                b,
-                &mut ch,
-                shape,
-                params,
-                &digest_e,
-                &root,
-                &proof_e,
-                spec,
-                &io_wires,
-                Some(&mut obs),
-            );
-            obs
-        };
-        let obs0 = run(
-            &mut b, &shape0, &params0, &spec0, &io0, &proof0, &com0, &dig0,
-        );
-        let obs1 = run(
-            &mut b, &shape1, &params1, &spec1, &io1, &proof1, &com1, &dig1,
-        );
-
-        let proofs = [
-            RPcsProof {
-                native: &proof0.pcs_open,
-                params: &params0,
-                commitment_root: flat_digest_lanes(&com0.root),
-            },
-            RPcsProof {
-                native: &proof1.pcs_open,
-                params: &params1,
-                commitment_root: flat_digest_lanes(&com1.root),
-            },
-        ];
-        let cols = alloc_r_pcs_columns(&mut b, &proofs);
-        // Recording-region cell coordinates (captured before `cols` moves):
-        // the hosted walk L-B discharge transcript's first data cell and a
-        // carry-chain cell inside the recording block.
-        let (rec_layout, rec_off) = {
-            let (l, o) = &cols.asm.u_a.rec_blocks[0];
-            (l.clone(), *o)
-        };
-        let rec_data0 = duplex_data_positions(&rec_layout)[0];
-        let rec_data_cell = slot_cell(
-            &cols.slices_a[cols.asm.u_a.refs.a[rec_data0.1]],
-            rec_off + rec_data0.0,
-        );
-        let rec_chal0 = rec_layout.challenges[0];
-        let rec_chal_cell = slot_cell(
-            &cols.slices_a[cols.asm.u_a.refs.c[rec_chal0.1]],
-            rec_off + rec_chal0.0,
-        );
-        let claims = discharge_r_pcs_via_region(&mut b, cols, &[&obs0, &obs1]);
-        assert!(!claims.is_empty(), "walk opening claims present");
-        let rows = b.num_wires();
-        eprintln!(
-            "[r-pcs-region] two-proof discharge: {rows} wires, {} claims, {} obligations",
-            claims.len(),
-            obs0.leaves.len() + obs1.leaves.len()
-        );
-
-        // Native mirror parity: same claim stream, same (point, value)s.
-        let natives = r_pcs_region_native(&proofs);
-        assert_eq!(natives.len(), claims.len(), "native mirror claim count");
-        for (i, ((npt, nv), c)) in natives.iter().zip(claims.iter()).enumerate() {
-            assert_eq!(&c.native_point, npt, "claim {i} native point");
-            assert_eq!(c.native_value, *nv, "claim {i} native value");
-            for (e, n) in c.point.iter().zip(npt.iter()) {
-                assert_eq!(e.eval(b.values()), *n, "claim {i} point wire vs native");
-            }
-            assert_eq!(
-                c.value.eval(b.values()),
-                *nv,
-                "claim {i} value wire vs native"
-            );
-        }
-
-        let (r1cs, z) = b.build();
-        assert!(
-            r1cs.satisfies(&z),
-            "honest r-pcs walk discharge unsatisfiable"
-        );
-
-        // One-flip negatives on each binding class.
-        let wire_of = |e: &LinExpr| -> usize {
-            assert_eq!(e.terms.len(), 1, "single-wire expression expected");
-            e.terms[0].0 as usize
-        };
-        let mut flips: Vec<(usize, &str)> = Vec::new();
-        flips.push((wire_of(&obs0.leaves[0].lanes[0]), "leaf lane (proof 0)"));
-        flips.push((wire_of(&obs1.leaves[3].lanes[1]), "leaf lane (proof 1)"));
-        flips.push((wire_of(&obs0.paths[0].dir_bits[0]), "direction bit"));
-        flips.push((wire_of(&obs1.paths[1].root[0]), "observed root lane"));
-        // Hosted-recording negatives: a data cell and a squeezed-challenge
-        // carry cell of the walk L-B discharge recording — each pinned
-        // (pin_eq) to the discharge twin's wire, so a flip breaks the
-        // binding row. (Unpinned interior carry cells are bound by the
-        // column OPENING claim, which only a consumer of the claim tail
-        // enforces — the standalone gate cannot flip those.)
-        flips.push((wire_of(&rec_data_cell), "recording data cell"));
-        flips.push((wire_of(&rec_chal_cell), "recording challenge cell"));
-        for (w, what) in flips {
-            let mut bad = z.clone();
-            bad[w] += F128::ONE;
-            assert!(!r1cs.satisfies(&bad), "{what} flip slipped through");
-        }
-    }
-
-    #[test]
-    fn recording_free_link_descriptor_covers_two_rate_half_proofs() {
-        let params = PcsParams {
-            m: 24 + LOG_PACKING,
-            log_inv_rate: 1,
-            log_batch_size: 6,
-            profile: Default::default(),
-        };
-        let n_queries = noid_ivc_core::pcs::basefold::default_fri_queries(params.log_dim(), 1);
-        assert_eq!(n_queries, 204);
-        let geometry = RPcsLinkUniversalGeometry::new(
-            &params,
-            std::slice::from_ref(&params),
-            n_queries,
-            test_rec_layouts(1),
-            test_rec_layouts(1),
-            test_r_prev_layout(),
-        )
-        .expect("rate-1/2 proof groups share a leaf signature");
-        let descriptor =
-            combined_leaf_descriptor(&geometry).expect("two production rate-1/2 proofs fit V1");
-        assert_eq!(2 * n_queries, 408);
-        assert_eq!((2 * n_queries).next_power_of_two(), 512);
-        assert_eq!(descriptor.tx_tile_log(), 9);
-        assert_ne!(
-            link_r_pcs_leaf_sidecar_purpose(),
-            link_r_pcs_path_sidecar_purpose(),
-            "L-A and L-B roles must be domain-separated"
-        );
-    }
-
-    #[test]
-    fn universal_link_geometry_covers_m22_m23_m24_without_vk_branching() {
-        let params = |field_m| PcsParams {
-            m: field_m + LOG_PACKING,
+    fn history_step_parent_geometry_has_four_tiers_and_eight_recordings() {
+        let params = [22usize, 23, 23, 24].map(|m| PcsParams {
+            m: m + LOG_PACKING,
             log_inv_rate: 2,
             log_batch_size: 5,
             profile: Default::default(),
-        };
-        let link = params(24);
-        // Canonical capacity slots may share a Field shape; they select only
-        // role/tile data under one four-position carrier topology.
-        let blocks = [params(22), params(23), params(23), params(24)];
-        let n_queries = pcs::default_fri_queries(link.log_dim(), link.log_inv_rate);
-        let geometry = RPcsLinkUniversalGeometry::new(
-            &link,
-            &blocks,
-            n_queries,
-            test_rec_layouts(4),
-            test_rec_layouts(4),
-            test_r_prev_layout(),
-        )
-        .expect("canonical ladder has one leaf signature");
-        assert_eq!(geometry.group_count(), 5);
-        assert_eq!(geometry.n_queries(), n_queries);
-        assert_eq!(geometry.subchannel_count(), 4);
-        assert_eq!(geometry.path_carrier_depths().unwrap(), [21, 17, 13, 9]);
-        assert_eq!(geometry.path_block_log().unwrap(), 7);
-
-        let descriptor = combined_leaf_descriptor(&geometry).unwrap();
-        assert_eq!(descriptor.subchannels().len(), 4);
-        assert_eq!(
-            descriptor.tx_tile_log(),
-            (2 * n_queries).next_power_of_two().trailing_zeros() as usize
-        );
-        let common_s = descriptor
-            .subchannels()
-            .iter()
-            .map(|subchannel| compile_duplex(subchannel.schedule()).slots.len())
-            .max()
-            .unwrap()
-            .next_power_of_two();
-        let common_block = descriptor.subchannels().len().next_power_of_two() * common_s;
-        assert_eq!(common_block, 64);
-        assert_eq!(
-            descriptor.tx_tile_log() + common_block.trailing_zeros() as usize,
-            14,
-            "production role/tile L-A geometry"
-        );
-
-        let wrong_rate = params(22);
-        let mut wrong_rate = wrong_rate;
-        wrong_rate.log_inv_rate = 1;
-        assert!(
-            matches!(
-                RPcsLinkUniversalGeometry::new(
-                    &link,
-                    &[wrong_rate],
-                    n_queries,
-                    test_rec_layouts(1),
-                    test_rec_layouts(1),
-                    test_r_prev_layout(),
-                ),
-                Err(RegionSidecarError::UnsupportedVkShape)
-            ),
-            "query-count drift must fail before column allocation"
-        );
-    }
-
-    #[test]
-    fn terminal_link_vk_reconstruction_has_exact_small_fixed_table_footprint() {
-        let params = |field_m| PcsParams {
-            m: field_m + LOG_PACKING,
-            log_inv_rate: 2,
-            log_batch_size: 5,
-            profile: Default::default(),
-        };
-        let link = params(24);
-        let blocks = [params(22), params(23), params(23), params(24)];
-        let leaf_slices = std::array::from_fn(|column| WitnessSlice {
-            log2_len: 14,
-            index: 10 + column,
         });
-        let path_slices = std::array::from_fn(|column| WitnessSlice {
-            log2_len: 15,
-            index: 20 + column,
-        });
-        let rec_slices = std::array::from_fn(|column| WitnessSlice {
-            log2_len: 5,
-            index: (30usize << 10) + column,
-        });
-        let vk = canonical_selected_link_region_sidecar_vk(
-            &link,
-            &blocks,
-            test_rec_layouts(4),
-            test_rec_layouts(4),
-            test_r_prev_layout(),
-            leaf_slices,
-            path_slices,
-            rec_slices,
-        )
-        .expect("canonical terminal Link VK");
-
-        assert_eq!(vk.leaf_a().descriptor().subchannels().len(), 4);
-        assert_eq!(vk.leaf_a().descriptor().tx_tile_log(), 8);
-        assert_eq!(vk.leaf_a().block_log(), 6);
-        assert_eq!(vk.leaf_a().w_log(), 14);
-        assert_eq!(
-            vk.leaf_a()
-                .fixed()
-                .iter()
-                .map(|pattern| pattern.table.len())
-                .sum::<usize>(),
-            448
-        );
-        assert_eq!(vk.path_b().families().len(), 4);
-        assert_eq!(vk.path_b().block_log(), 7);
-        assert_eq!(vk.path_b().w_log(), 15);
-        assert_eq!(
-            vk.path_b()
-                .fixed()
-                .iter()
-                .map(|pattern| pattern.table.len())
-                .sum::<usize>(),
-            3_072
-        );
-    }
-
-    #[test]
-    fn production_role_tile_walk_column_ledger_is_425984() {
-        let params = |field_m| PcsParams {
-            m: field_m + LOG_PACKING,
-            log_inv_rate: 2,
-            log_batch_size: 5,
-            profile: Default::default(),
-        };
-        let link_params = params(24);
-        let block_params = [params(22), params(23), params(23), params(24)];
-        let n_queries = pcs::default_fri_queries(link_params.log_dim(), link_params.log_inv_rate);
-        let geometry = RPcsLinkUniversalGeometry::new(
-            &link_params,
-            &block_params,
-            n_queries,
-            test_rec_layouts(4),
-            test_rec_layouts(4),
-            test_r_prev_layout(),
-        )
-        .unwrap();
-        let (link_proof, link_root) = mock_basefold_geometry(&link_params, n_queries);
-        let (block_proof, block_root) = mock_basefold_geometry(&block_params[0], n_queries);
-        let proofs = [
-            RPcsProof {
-                native: &link_proof,
-                params: &link_params,
-                commitment_root: link_root,
-            },
-            RPcsProof {
-                native: &block_proof,
-                params: &block_params[0],
-                commitment_root: block_root,
-            },
-        ];
-
-        let mut builder = FieldR1csBuilder::new();
-        let columns = prepare_r_pcs_link_columns_universal(
-            &mut builder,
-            &proofs,
-            &geometry,
-            &[0, 1],
-            LinkLiveRecordings::default(),
-        )
-        .unwrap();
-        let cache_metric = geometry.recording_cache_metric();
-        let cached_union = cache_metric
-            .cached_union
-            .expect("column preparation initializes the bounded zero cache");
-        assert_eq!(cache_metric.n_data_by_block.len(), 9);
-        assert_eq!(cached_union.columns, 14);
-        assert_eq!(cached_union.column_elements, 14 << columns.u_rec.w_log);
-        assert_eq!(
-            cached_union.column_retained_bytes,
-            (14 << columns.u_rec.w_log) * std::mem::size_of::<F128>()
-        );
-        eprintln!("link L-C recording cache: {cache_metric:?}");
-        assert_eq!(columns.asm.u_a.block_log, 6);
-        assert_eq!(columns.asm.u_a.w_log, 14);
-        assert_eq!(columns.asm.block_log_b, 7);
-        assert_eq!(columns.asm.w_log_b, 15);
-        assert_eq!(columns.asm.leg_offsets, [0, 32, 64, 80]);
-        assert_eq!(
-            columns.asm.path_families,
-            [(0, 21), (32, 17), (64, 13), (80, 9),].map(|(offset, depth)| {
-                MerkleRegionFamily::FeedForward {
-                    offset,
-                    depth,
-                    n_paths: 1,
-                    iv: pcs_node_iv_flat(),
-                }
-            })
-        );
-        // Includes wire zero and the canonical dyadic slice-alignment rows:
-        // align→2^14, 6·2^14 L-A, align→2^15, 9·2^15 L-B, plus the test
-        // walk L-C recording columns (4 child + 4 [R]_B ghost blocks of 2
-        // slots and one 2-slot [R]_prev ghost → 18 slots → 6·2^5 cells,
-        // already aligned).
-        assert_eq!(columns.u_rec.w_log, 5);
-        assert_eq!(builder.num_wires(), 425_984 + 6 * 32);
-    }
-
-    #[test]
-    fn universal_link_geometry_rejects_malformed_params_without_panicking() {
-        let valid = PcsParams {
-            m: 24 + LOG_PACKING,
-            log_inv_rate: 1,
-            log_batch_size: 5,
-            profile: Default::default(),
-        };
-        let n_queries = pcs::default_fri_queries(valid.log_dim(), 1);
-        let malformed = [
-            PcsParams {
-                m: LOG_PACKING - 1,
-                log_inv_rate: 1,
-                log_batch_size: 0,
-                profile: Default::default(),
-            },
-            PcsParams {
-                m: LOG_PACKING + 2,
-                log_inv_rate: 1,
-                log_batch_size: 3,
-                profile: Default::default(),
-            },
-            PcsParams {
-                m: LOG_PACKING + usize::BITS as usize,
-                log_inv_rate: 1,
-                log_batch_size: 0,
-                profile: Default::default(),
-            },
-            PcsParams {
-                m: LOG_PACKING + 5,
-                log_inv_rate: 1,
-                log_batch_size: 5,
-                profile: Default::default(),
-            },
-            PcsParams {
-                m: LOG_PACKING + 21,
-                log_inv_rate: 1,
-                log_batch_size: 20,
-                profile: Default::default(),
-            },
-        ];
-
-        for params in &malformed {
-            let outcome = std::panic::catch_unwind(|| {
-                RPcsLinkUniversalGeometry::new(
-                    params,
-                    std::slice::from_ref(&valid),
-                    n_queries,
-                    test_rec_layouts(1),
-                    test_rec_layouts(1),
-                    test_r_prev_layout(),
-                )
-            });
-            assert!(
-                outcome.is_ok(),
-                "malformed PCS params reached a shape panic"
-            );
-            assert!(
-                outcome.unwrap().is_err(),
-                "malformed PCS params produced a universal geometry"
-            );
-        }
-
-        let outcome = std::panic::catch_unwind(|| {
-            RPcsLinkUniversalGeometry::new(
-                &valid,
-                std::slice::from_ref(&malformed[0]),
-                n_queries,
-                test_rec_layouts(1),
-                test_rec_layouts(1),
-                test_r_prev_layout(),
-            )
-        });
-        assert!(
-            outcome.is_ok(),
-            "malformed block group reached a shape panic"
-        );
-        assert!(outcome.unwrap().is_err());
-    }
-
-    #[test]
-    fn universal_link_vk_is_identical_for_b8_and_b255_active_groups() {
-        let params = |field_m| PcsParams {
-            m: field_m + LOG_PACKING,
-            log_inv_rate: 2,
-            log_batch_size: 5,
-            profile: Default::default(),
-        };
-        let link_params = params(24);
-        let block_params = [params(22), params(23), params(23), params(24)];
-        // One query keeps this all-tier semantic gate lightweight.  The
-        // production row snapshot below locks the derived query axis.
-        let geometry = RPcsLinkUniversalGeometry {
-            group_params: std::iter::once(link_params.clone())
-                .chain(block_params.iter().cloned())
-                .collect(),
-            groups: std::iter::once(tree_structure(&link_params))
-                .chain(block_params.iter().map(tree_structure))
-                .collect(),
-            n_queries: 1,
-            rec_layouts: test_rec_layouts(block_params.len()),
-            r_b_layouts: test_rec_layouts(block_params.len()),
-            r_prev_layout: test_r_prev_layout(),
-            recording_ghost_cache: RPcsLinkRecordingGhostCache::default(),
-        };
-        let (link_proof, link_root) = mock_basefold_geometry(&link_params, 1);
-        let (b8_proof, b8_root) = mock_basefold_geometry(&block_params[0], 1);
-        let (b32_proof, b32_root) = mock_basefold_geometry(&block_params[1], 1);
-        let (b64_proof, b64_root) = mock_basefold_geometry(&block_params[2], 1);
-        let (b255_proof, b255_root) = mock_basefold_geometry(&block_params[3], 1);
-
-        let build_vk = |block_proof: &pcs::BaseFoldProof,
-                        block_params: &PcsParams,
-                        block_root,
-                        active_block_group| {
-            let proofs = [
-                RPcsProof {
-                    native: &link_proof,
-                    params: &link_params,
-                    commitment_root: link_root,
-                },
-                RPcsProof {
-                    native: block_proof,
-                    params: block_params,
-                    commitment_root: block_root,
-                },
-            ];
-            let mut builder = FieldR1csBuilder::new();
-            let columns = prepare_r_pcs_link_columns_universal(
-                &mut builder,
-                &proofs,
-                &geometry,
-                &[0, active_block_group],
-                LinkLiveRecordings::default(),
-            )
-            .expect("universal recording-free columns");
-            assert_eq!(columns.asm.path_families.len(), 4);
-            assert_eq!(columns.asm.block_log_b, 7);
-            assert_eq!(columns.asm.u_a.block_log, 6);
-            assert!(matches!(
-                columns.asm.path_families[0],
-                MerkleRegionFamily::FeedForward { depth, .. }
-                    if depth == 21
-            ));
-            let block_leg =
-                (columns.asm.n_queries << columns.asm.block_log_b) + columns.asm.leg_offsets[0];
-            let block_root_cell = block_leg + columns.asm.trees[1][0].depth;
-            let entry_cr_wire = columns.slices_b[4].start() + block_leg;
-            let root_cr_wire = columns.slices_b[4].start() + block_root_cell;
-            let vk = columns.vk.clone();
-            let obs_link = alloc_native_walk_obligations(&mut builder, &proofs[0]);
-            let obs_block = alloc_native_walk_obligations(&mut builder, &proofs[1]);
-            let root_wire = {
-                let root = &obs_block.paths[0].root[0];
-                assert_eq!(root.terms.len(), 1, "root is one allocated wire");
-                root.terms[0].0 as usize
-            };
-            let ghost_recording = noid_ivc_core::field_circuit::RecordedChannel {
-                ops: Vec::new(),
-                data_wires: Vec::new(),
-                data_flat: Vec::new(),
-                challenge_wires: Vec::new(),
-                post_state: [F128::ZERO; STATE_SIZE],
-                perms: 0,
-            };
-            let preparation = finalize_r_pcs_link_region(
-                &mut builder,
-                columns,
-                &[&obs_link, &obs_block],
-                &ghost_recording,
-                &ghost_recording,
-                &ghost_recording,
-            )
-            .expect("universal semantic pins");
-            assert_eq!(preparation.vk(), &vk);
-            let (r1cs, witness) = builder.build();
-            assert!(r1cs.satisfies(&witness), "active real-depth root pin");
-            let mut bad = witness;
-            bad[root_wire] += F128::ONE;
-            assert!(
-                !r1cs.satisfies(&bad),
-                "active root mutation escaped its real-depth L-B cell pin"
-            );
-            for (wire, role) in [
-                (entry_cr_wire, "L-A digest to L-B CR(start)"),
-                (root_cr_wire, "proven CR(actual_depth) root"),
-            ] {
-                let mut bad = bad.clone();
-                // Undo the preceding root-wire mutation, then flip precisely
-                // one committed carrier cell.
-                bad[root_wire] += F128::ONE;
-                bad[wire] += F128::ONE;
-                assert!(!r1cs.satisfies(&bad), "{role} pin missing");
-            }
-            vk
-        };
-
-        let b8_vk = build_vk(&b8_proof, &block_params[0], b8_root, 1);
-        let b32_vk = build_vk(&b32_proof, &block_params[1], b32_root, 2);
-        let b64_vk = build_vk(&b64_proof, &block_params[2], b64_root, 3);
-        let b255_vk = build_vk(&b255_proof, &block_params[3], b255_root, 4);
-        assert_eq!(b8_vk, b32_vk, "B32 selected a different VK topology");
-        assert_eq!(b8_vk, b64_vk, "B64 selected a different VK topology");
-        assert_eq!(b8_vk, b255_vk, "B255 selected a different VK topology");
-        assert_eq!(b8_vk.leaf_a().descriptor().subchannels().len(), 4);
-        assert_eq!(b8_vk.path_b().families().len(), 4);
-        assert_eq!(b8_vk.leaf_a().w_log(), 7);
-        assert_eq!(b8_vk.path_b().w_log(), 8);
-    }
-
-    #[test]
-    fn universal_link_active_groups_reject_swapped_or_nonzero_link_role() {
-        let params = |field_m| PcsParams {
-            m: field_m + LOG_PACKING,
-            log_inv_rate: 2,
-            log_batch_size: 5,
-            profile: Default::default(),
-        };
-        let link_params = params(24);
-        let block_params = [params(22), params(23), params(23), params(24)];
-        let geometry = RPcsLinkUniversalGeometry {
-            group_params: std::iter::once(link_params.clone())
-                .chain(block_params.iter().cloned())
-                .collect(),
-            groups: std::iter::once(tree_structure(&link_params))
-                .chain(block_params.iter().map(tree_structure))
-                .collect(),
-            n_queries: 1,
-            rec_layouts: test_rec_layouts(block_params.len()),
-            r_b_layouts: test_rec_layouts(block_params.len()),
-            r_prev_layout: test_r_prev_layout(),
-            recording_ghost_cache: RPcsLinkRecordingGhostCache::default(),
-        };
-        let (link_proof, link_root) = mock_basefold_geometry(&link_params, 1);
-        let (b8_proof, b8_root) = mock_basefold_geometry(&block_params[0], 1);
-        let (b255_proof, b255_root) = mock_basefold_geometry(&block_params[3], 1);
-
-        let rejected = |block_proof: &pcs::BaseFoldProof,
-                        block_params: &PcsParams,
-                        block_root,
-                        active_groups: [usize; 2]| {
-            let proofs = [
-                RPcsProof {
-                    native: &link_proof,
-                    params: &link_params,
-                    commitment_root: link_root,
-                },
-                RPcsProof {
-                    native: block_proof,
-                    params: block_params,
-                    commitment_root: block_root,
-                },
-            ];
-            let mut builder = FieldR1csBuilder::new();
-            assert!(matches!(
-                prepare_r_pcs_link_columns_universal(
-                    &mut builder,
-                    &proofs,
-                    &geometry,
-                    &active_groups,
-                    LinkLiveRecordings::default(),
-                ),
-                Err(RegionSidecarError::UnsupportedVkShape)
-            ));
-        };
-
-        // Link and B255 share an exact tree shape, so shape equality used to
-        // permit a full role swap.  The positional protocol rule must reject it.
-        rejected(&b255_proof, &block_params[3], b255_root, [4, 0]);
-        // This mapping is also shape-correct at both positions, but group 4 is
-        // never a valid previous-link role; B32/B64 remain selectable as the
-        // SECOND role through their explicit groups 2 and 3 in the VK test.
-        rejected(&b8_proof, &block_params[0], b8_root, [4, 1]);
-
-        // The BaseFold tree topology does not depend on the Ligerito profile,
-        // while the full PCS statement encoding does.  Registry selection
-        // must therefore reject this shape-identical parameter substitution.
-        let mut statement_substitution = block_params[0].clone();
-        statement_substitution.profile = noid_ivc_core::pcs::ligerito::LigeritoProfile::Secure;
-        rejected(&b8_proof, &statement_substitution, b8_root, [0, 1]);
-    }
-
-    #[test]
-    fn recording_free_link_sidecar_field_typestate_e2e_and_negatives() {
-        let make_inner = |m: usize, seed: u64| {
-            let (inner, z) = synthetic_satisfiable(m, m, seed);
-            let spec = PublicIoSpec {
-                io_slice: WitnessSlice {
-                    log2_len: 2,
-                    index: 4,
-                },
-                io_len: 4,
-                claims: Vec::new(),
-            };
-            let io = z[16..20].to_vec();
-            let params = PcsParams {
-                m: m + LOG_PACKING,
-                log_inv_rate: 2,
-                log_batch_size: 2,
-                profile: Default::default(),
-            };
-            let mut challenger = FsLaneChallenger::new(b"r-pcs-link-sidecar-inner-v1");
-            let (mut proof, commitment, _) =
-                prove_field_with_public_io(&inner, &z, &params, &spec, &io, &mut challenger);
-            // The production geometry is locked separately above. Two real
-            // authenticated openings keep this outer sidecar E2E lightweight.
-            proof.pcs_open.queries.truncate(2);
-            (params, proof, commitment)
-        };
-        let (params0, proof0, commitment0) = make_inner(10, 0xA11CE5);
-        let (params1, proof1, commitment1) = make_inner(11, 0xB0B5EED);
-        let proofs = [
-            RPcsProof {
-                native: &proof0.pcs_open,
-                params: &params0,
-                commitment_root: flat_digest_lanes(&commitment0.root),
-            },
-            RPcsProof {
-                native: &proof1.pcs_open,
-                params: &params1,
-                commitment_root: flat_digest_lanes(&commitment1.root),
-            },
-        ];
-
-        let mut builder = FieldR1csBuilder::new();
-        let columns = prepare_r_pcs_link_columns(
-            &mut builder,
-            &proofs,
-            test_rec_layouts(1),
-            test_rec_layouts(1),
-            test_r_prev_layout(),
-            LinkLiveRecordings::default(),
-        )
-        .unwrap();
-        assert!(columns.asm.u_a.rec_blocks.is_empty());
-        assert!(columns.asm.u_a.rec_refs.is_empty());
-        assert!(columns.asm.u_a.rec_challenges.is_empty());
-        assert_eq!(columns.asm.u_a.fixed.len(), 7);
-        assert_eq!(
-            columns.vk.leaf_a().purpose(),
-            &link_r_pcs_leaf_sidecar_purpose()
-        );
-        assert_eq!(
-            columns.vk.path_b().purpose(),
-            &link_r_pcs_path_sidecar_purpose()
-        );
-        let carrier_depths = RPcsLinkUniversalGeometry::exact_for(
-            &proofs,
-            test_rec_layouts(1),
-            test_rec_layouts(1),
-            test_r_prev_layout(),
-        )
-        .unwrap()
-        .path_carrier_depths()
-        .unwrap();
-        assert_eq!(
-            columns.vk.path_b().families().len(),
-            columns.asm.trees.iter().map(Vec::len).max().unwrap()
-        );
-        let d_column_wire = columns.slices_b[8].start();
-        let mut expected_offset = 0usize;
-        for (actual, &depth) in columns.vk.path_b().families().iter().zip(&carrier_depths) {
-            assert_eq!(
-                *actual,
-                MerkleRegionFamily::FeedForward {
-                    offset: expected_offset,
-                    depth,
-                    n_paths: 1,
-                    iv: pcs_node_iv_flat(),
-                }
-            );
-            expected_offset += depth.next_power_of_two();
-        }
-
-        let obligations0 = alloc_native_walk_obligations(&mut builder, &proofs[0]);
-        let obligations1 = alloc_native_walk_obligations(&mut builder, &proofs[1]);
-        let lane_wire = obligations0.leaves[0].lanes[0].terms[0].0 as usize;
-        let direction_wire = obligations0.paths[0].dir_bits[0].terms[0].0 as usize;
-        let root_wire = obligations1.paths[1].root[0].terms[0].0 as usize;
-        let ghost_recording = noid_ivc_core::field_circuit::RecordedChannel {
-            ops: Vec::new(),
-            data_wires: Vec::new(),
-            data_flat: Vec::new(),
-            challenge_wires: Vec::new(),
-            post_state: [F128::ZERO; STATE_SIZE],
-            perms: 0,
-        };
-        let preparation = finalize_r_pcs_link_region(
-            &mut builder,
-            columns,
-            &[&obligations0, &obligations1],
-            &ghost_recording,
-            &ghost_recording,
-            &ghost_recording,
-        )
-        .unwrap();
-        let (r1cs, witness) = builder.build();
-        assert!(r1cs.satisfies(&witness));
-        for (wire, role) in [
-            (lane_wire, "leaf lane"),
-            (direction_wire, "direction"),
-            (root_wire, "observed root"),
-        ] {
-            let mut bad = witness.clone();
-            bad[wire] += F128::ONE;
-            assert!(!r1cs.satisfies(&bad), "{role} semantic pin missing");
-        }
-        let mut non_boolean_d = witness.clone();
-        non_boolean_d[d_column_wire] = F128::new(2, 0);
-        assert!(
-            !r1cs.satisfies(&non_boolean_d),
-            "Walk L-B D slice lost its unconditional boolean rows"
-        );
+        let layout = compile_duplex(&[
+            TranscriptOp::Absorb(vec![None, Some(7), None]),
+            TranscriptOp::Squeeze(2),
+        ]);
+        let geometry =
+            HistoryStepParentGeometry::new(&params, vec![layout.clone(); 4], vec![layout; 4])
+                .expect("four-tier HistoryStep geometry");
+        assert_eq!(geometry.carrier.proof_roles, 1);
+        assert_eq!(geometry.carrier.groups.len(), 4);
+        assert_eq!(geometry.carrier.n_queries, 125);
+        assert_eq!(geometry.recording_blocks().len(), 8);
+        assert_eq!(geometry.child_block_index(3), 3);
+        assert_eq!(geometry.r_prev_block_index(3), 7);
 
         let spec = PublicIoSpec {
             io_slice: WitnessSlice {
-                log2_len: 0,
-                index: 0,
+                log2_len: 10,
+                index: 1,
             },
-            io_len: 1,
+            io_len: 900,
             claims: Vec::new(),
         };
-        let io = [witness[0]];
-        let outer_params = PcsParams {
-            m: r1cs.m + LOG_PACKING,
-            log_inv_rate: 2,
-            log_batch_size: 2,
-            profile: Default::default(),
-        };
-        let class_digest = link_post_commit_class_digest(
-            &r1cs.statement_digest(),
-            &spec,
-            &outer_params,
-            preparation.vk(),
-        );
-        let plan = LinkRegionProverPlan::new(preparation.vk(), preparation.prover_input()).unwrap();
-        let mut prover = FsLaneChallenger::new(b"r-pcs-link-sidecar-outer-v1");
-        let (field_proof, sidecar, commitment, _) =
-            prove_field_with_public_io_and_post_commit_context(
-                &r1cs,
-                &witness,
-                &outer_params,
-                &spec,
-                &io,
-                &class_digest,
-                &mut prover,
-                |context| plan.prove_post_commit(context).unwrap(),
-            );
-        let encoded = bincode::serialize(&sidecar).unwrap();
-        assert_eq!(encoded.len(), sidecar.byte_len());
-        let decoded = bincode::deserialize(&encoded).unwrap();
-        assert_eq!(decoded, sidecar);
-
-        let verify =
-            |candidate_vk: &LinkRegionSidecarVk,
-             candidate_class: &[u8; 32],
-             candidate_proof: &crate::region_sidecar::LinkRegionSidecarProof| {
-                let mut verifier = FsLaneChallenger::new(b"r-pcs-link-sidecar-outer-v1");
-                verify_field_with_public_io_and_post_commit_context(
-                    &r1cs,
-                    &commitment,
-                    &field_proof,
-                    &spec,
-                    &io,
-                    candidate_class,
-                    candidate_proof,
-                    &mut verifier,
-                    |proof, context| {
-                        verify_link_region_sidecar_post_commit(candidate_vk, proof, context)
-                            .map_err(|_| VerifyError::Auxiliary)
-                    },
-                )
-            };
-        assert!(verify(preparation.vk(), &class_digest, &decoded).is_ok());
-        for (candidate, message) in [
-            (
-                decoded.with_multi_walk_message_mutated(preparation.vk(), r1cs.m),
-                "shared ragged walk",
-            ),
-            (
-                decoded.with_leaf_prefix_message_mutated(preparation.vk(), r1cs.m),
-                "deferred L-A prefix",
-            ),
-            (
-                decoded.with_path_prefix_message_mutated(preparation.vk(), r1cs.m),
-                "deferred L-B prefix",
-            ),
-        ] {
-            assert!(
-                verify(preparation.vk(), &class_digest, &candidate).is_err(),
-                "Link V2 accepted a mutated {message} message"
-            );
-        }
-
-        // Full recursive verifier lockstep: the outer Field transcript binds
-        // the Link class, then replays mandatory L-A and L-B sidecars on the
-        // same trace context before zerocheck/lincheck/PCS.
-        let shape = FieldShape::of(&r1cs);
-        let statement_digest = r1cs.statement_digest();
-        let mut native_recursive = FsLaneChallenger::new(b"r-pcs-link-sidecar-outer-v1");
-        let (_, native_fresh) = verify_field_deferred_matrix_with_post_commit_context(
-            &shape,
-            &statement_digest,
-            &commitment,
-            &field_proof,
-            &spec,
-            &io,
-            &class_digest,
-            &decoded,
-            &mut native_recursive,
-            |proof, context| {
-                verify_link_region_sidecar_post_commit(preparation.vk(), proof, context)
-                    .map_err(|_| VerifyError::Auxiliary)
-            },
-        )
-        .unwrap();
-        let native_post = native_recursive.sample_f128();
-
-        let mut recursive_builder = FieldR1csBuilder::new();
-        let mut recursive_channel =
-            FsChannelTrace::new(&mut recursive_builder, b"r-pcs-link-sidecar-outer-v1");
-        let digest_expr = alloc_flat_digest(&mut recursive_builder, &statement_digest);
-        let root_expr = alloc_flat_digest(&mut recursive_builder, &commitment.root);
-        let io_expr = io
-            .iter()
-            .map(|&value| LinExpr::from_wire(recursive_builder.alloc_f128(value)))
-            .collect::<Vec<_>>();
-        let proof_expr = FieldR1csProofTrace::alloc_shape(
-            &mut recursive_builder,
-            &field_proof,
-            &shape,
-            &outer_params,
-        );
-        let (_, trace_fresh) = verify_field_trace_deferred_region_with_post_commit_context(
-            &mut recursive_builder,
-            &mut recursive_channel,
-            &shape,
-            &outer_params,
-            &digest_expr,
-            &root_expr,
-            &proof_expr,
-            &spec,
-            &io_expr,
-            &class_digest,
-            None,
-            |builder, context| {
-                verify_link_region_sidecar_trace_post_commit(
-                    builder,
-                    context,
-                    preparation.vk(),
-                    &decoded,
-                )
-                .unwrap();
-            },
-        );
-        let trace_post = recursive_channel
-            .sample_f128(&mut recursive_builder)
-            .eval(recursive_builder.values());
-        assert_eq!(
-            trace_fresh.value.eval(recursive_builder.values()),
-            native_fresh.value
-        );
-        assert_eq!(trace_post, native_post);
-        let (recursive_r1cs, recursive_witness) = recursive_builder.build();
-        assert!(
-            recursive_r1cs.satisfies(&recursive_witness),
-            "recursive Link sidecar context is unsatisfied"
-        );
-
-        let mut core_only = FsLaneChallenger::new(b"r-pcs-link-sidecar-outer-v1");
-        assert!(verify_field_with_public_io(
-            &r1cs,
-            &commitment,
-            &field_proof,
-            &spec,
-            &io,
-            &mut core_only,
-        )
-        .is_err());
-
-        let mut wrong_class = class_digest;
-        wrong_class[0] ^= 1;
-        assert!(verify(preparation.vk(), &wrong_class, &decoded).is_err());
-
-        let mut version_bytes = encoded.clone();
-        version_bytes[0] = 0;
-        let bad_version = bincode::deserialize(&version_bytes).unwrap();
-        assert!(verify(preparation.vk(), &class_digest, &bad_version).is_err());
-
-        let honest_leaf = preparation.vk().leaf_a();
-        let wrong_leaf = CombinedDuplexRegionVk::new(
-            [0xD5; 32],
-            honest_leaf.descriptor().clone(),
-            *honest_leaf.slices(),
-        )
-        .unwrap();
-        assert_eq!(
-            LinkRegionSidecarVk::new(
-                wrong_leaf,
-                preparation.vk().path_b().clone(),
-                preparation.vk().rec_c().clone(),
-            ),
-            Err(RegionSidecarError::UnsupportedVkShape)
-        );
+        geometry
+            .canonical_vk(&spec)
+            .expect("canonical HistoryStep parent sidecar VK");
     }
 }

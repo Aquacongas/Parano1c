@@ -123,28 +123,6 @@ impl LinkRegionSidecarVk {
         Ok(vk)
     }
 
-    /// Assemble the runtime VK with the digest already verified by the
-    /// release build. Child runtime tables are still materialized, but their
-    /// complete transcript is not rehashed.
-    ///
-    /// # Safety
-    ///
-    /// `transcript_digest` and all children must be the exact values accepted
-    /// together by the strict registry decoder in the embedding build.
-    pub(crate) unsafe fn from_build_authenticated_parts(
-        leaf_a: CombinedDuplexRegionVk,
-        path_b: MerkleRegionVk,
-        rec_c: RecordingDuplexRegionVk,
-        transcript_digest: [u8; 32],
-    ) -> Self {
-        Self {
-            leaf_a,
-            path_b,
-            rec_c,
-            transcript_digest,
-        }
-    }
-
     pub fn leaf_a(&self) -> &CombinedDuplexRegionVk {
         &self.leaf_a
     }
@@ -386,70 +364,112 @@ impl LinkRegionSidecarProof {
     pub fn byte_len(&self) -> usize {
         bincode::serialized_size(self).expect("link region sidecar serialized length") as usize
     }
+}
 
-    #[cfg(test)]
-    pub(crate) fn with_multi_walk_message_mutated(
-        &self,
-        vk: &LinkRegionSidecarVk,
-        total_vars: usize,
-    ) -> Self {
-        self.with_first_vec_payload_mutated(
-            vk,
-            total_vars,
-            super::bounded_decode::VecClass::MultiWalkLayerRounds,
-        )
-    }
+pub(crate) fn encode_link_region_sidecar_canonical(
+    vk: &LinkRegionSidecarVk,
+    total_vars: usize,
+    proof: &LinkRegionSidecarProof,
+) -> Result<Vec<u8>, RegionSidecarError> {
+    use super::canonical_codec as canonical;
 
-    #[cfg(test)]
-    pub(crate) fn with_leaf_prefix_message_mutated(
-        &self,
-        vk: &LinkRegionSidecarVk,
-        total_vars: usize,
-    ) -> Self {
-        self.with_first_vec_payload_mutated(
-            vk,
-            total_vars,
-            super::bounded_decode::VecClass::SelectionRounds,
-        )
+    let [SidecarProofShape::DeferredFixed(leaf_shape), SidecarProofShape::DeferredMerkle(path_shape), SidecarProofShape::DeferredFixed(rec_shape), SidecarProofShape::MultiWalk(walk_shape)] =
+        link_bounded_shapes(vk, total_vars)?
+    else {
+        return Err(RegionSidecarError::UnsupportedVkShape);
+    };
+    let expected = canonical_link_region_sidecar_len(vk, total_vars)?;
+    if proof.version != LINK_REGION_SIDECAR_VERSION {
+        return Err(RegionSidecarError::UnsupportedVersion);
     }
+    let mut out = Vec::with_capacity(expected);
+    out.push(proof.version);
+    canonical::encode_duplex_deferred(
+        &mut out,
+        proof.leaf_a.version(),
+        proof.leaf_a.authority(),
+        &leaf_shape,
+    )?;
+    canonical::encode_merkle_deferred(
+        &mut out,
+        proof.path_b.version(),
+        proof.path_b.authority(),
+        &path_shape,
+    )?;
+    canonical::encode_duplex_deferred(
+        &mut out,
+        proof.rec_c.version(),
+        proof.rec_c.authority(),
+        &rec_shape,
+    )?;
+    canonical::encode_multi_walk(&mut out, &proof.walk, &walk_shape)?;
+    if out.len() != expected {
+        return Err(RegionSidecarError::InvalidProof);
+    }
+    Ok(out)
+}
 
-    #[cfg(test)]
-    pub(crate) fn with_path_prefix_message_mutated(
-        &self,
-        vk: &LinkRegionSidecarVk,
-        total_vars: usize,
-    ) -> Self {
-        self.with_first_vec_payload_mutated(
-            vk,
-            total_vars,
-            super::bounded_decode::VecClass::ZeroRounds,
-        )
-    }
+pub(crate) fn decode_link_region_sidecar_canonical(
+    vk: &LinkRegionSidecarVk,
+    total_vars: usize,
+    bytes: &[u8],
+) -> Result<LinkRegionSidecarProof, RegionSidecarError> {
+    use super::canonical_codec as canonical;
 
-    #[cfg(test)]
-    fn with_first_vec_payload_mutated(
-        &self,
-        vk: &LinkRegionSidecarVk,
-        total_vars: usize,
-        target: super::bounded_decode::VecClass,
-    ) -> Self {
-        let mut bytes = bincode::serialize(self).expect("serialize Link mutation fixture");
-        let shapes = link_bounded_shapes(vk, total_vars).expect("valid Link mutation VK");
-        let offsets = super::bounded_decode::composite_layout_offsets(
-            &bytes,
-            LINK_REGION_SIDECAR_VERSION,
-            &shapes,
-        )
-        .expect("valid Link mutation proof shape");
-        let length_offset = offsets
-            .into_iter()
-            .find_map(|(field, offset)| {
-                (field == super::bounded_decode::LayoutField::VecLength(target)).then_some(offset)
-            })
-            .expect("target Link proof message exists");
-        bytes[length_offset + 8] ^= 1;
-        bincode::deserialize(&bytes).expect("shape-preserving Link proof mutation")
+    let [SidecarProofShape::DeferredFixed(leaf_shape), SidecarProofShape::DeferredMerkle(path_shape), SidecarProofShape::DeferredFixed(rec_shape), SidecarProofShape::MultiWalk(walk_shape)] =
+        link_bounded_shapes(vk, total_vars)?
+    else {
+        return Err(RegionSidecarError::UnsupportedVkShape);
+    };
+    let expected = canonical_link_region_sidecar_len(vk, total_vars)?;
+    let mut reader = canonical::CanonicalProofReader::exact(bytes, expected)?;
+    if reader.u8()? != LINK_REGION_SIDECAR_VERSION {
+        return Err(RegionSidecarError::UnsupportedVersion);
     }
+    let leaf_a = CombinedDuplexRegionWalkDeferredProof::new(canonical::decode_duplex_deferred(
+        &mut reader,
+        &leaf_shape,
+    )?);
+    let path_b = MerkleRegionWalkDeferredProof::new(canonical::decode_merkle_deferred(
+        &mut reader,
+        &path_shape,
+    )?);
+    let rec_c = DuplexRegionWalkDeferredProof::new(canonical::decode_duplex_deferred(
+        &mut reader,
+        &rec_shape,
+    )?);
+    let walk = canonical::decode_multi_walk(&mut reader, &walk_shape)?;
+    reader.finish()?;
+    Ok(LinkRegionSidecarProof {
+        version: LINK_REGION_SIDECAR_VERSION,
+        leaf_a,
+        path_b,
+        rec_c,
+        walk,
+    })
+}
+
+pub(crate) fn canonical_link_region_sidecar_len(
+    vk: &LinkRegionSidecarVk,
+    total_vars: usize,
+) -> Result<usize, RegionSidecarError> {
+    use super::canonical_codec as canonical;
+
+    let [SidecarProofShape::DeferredFixed(leaf_shape), SidecarProofShape::DeferredMerkle(path_shape), SidecarProofShape::DeferredFixed(rec_shape), SidecarProofShape::MultiWalk(walk_shape)] =
+        link_bounded_shapes(vk, total_vars)?
+    else {
+        return Err(RegionSidecarError::UnsupportedVkShape);
+    };
+    [
+        canonical::deferred_fixed_len(&leaf_shape)?,
+        canonical::deferred_merkle_len(&path_shape)?,
+        canonical::deferred_fixed_len(&rec_shape)?,
+        canonical::multi_walk_len(&walk_shape)?,
+    ]
+    .into_iter()
+    .try_fold(1usize, |sum, len| {
+        sum.checked_add(len).ok_or(RegionSidecarError::InvalidProof)
+    })
 }
 
 /// Decode the mandatory V4 link envelope only after all three deferred
@@ -499,8 +519,8 @@ fn link_bounded_shapes(
 
 /// Zero-valued link-sidecar proof of the exact universal shape.  It cannot
 /// verify; its only role is deriving the value-independent [R]_prev-replay
-/// transcript SCHEDULE (the recorded op stream of the split link's previous-
-/// proof replay) when the recording layout is frozen before any real link
+/// transcript SCHEDULE (the recorded op stream of the HistoryStep parent-
+/// proof replay) when the recording layout is frozen before any real parent
 /// proof exists.  Mirror of `shape_only_block_region_sidecar_proof`.
 pub(crate) fn shape_only_link_region_sidecar_proof(
     vk: &LinkRegionSidecarVk,
@@ -659,25 +679,11 @@ pub fn verify_link_region_sidecar_trace_post_commit<C: FsChannelOps>(
     preflight_multi_walk(&proof.walk, max_w_log(&w_logs), w_logs.len())?;
 
     context.observe_label(b, LINK_REGION_TRANSCRIPT_LABEL);
-    // The VK digest enters as WITNESS lanes pinned to the digest constants
-    // (transcript-identical to the native `observe_bytes`: same FS_OP_BYTES
-    // header, same packed lanes).  The pins live in the class MATRIX, never
-    // in a recording schedule — a link that records this replay would
-    // otherwise bake the digest into the very recording layout the digest
-    // commits to (a hash fixed point).
-    let digest_lanes = crate::acceptance::trace::self_verify::flat_digest_lanes(
+    crate::acceptance::trace::self_verify::observe_pinned_digest(
+        b,
+        context,
         &vk.transcript_digest(),
-    )
-    .map(|lane| {
-        let wire = crate::acceptance::trace::LinExpr::from_wire(b.alloc_f128(lane));
-        crate::acceptance::trace::pin_eq(
-            b,
-            &wire,
-            &crate::acceptance::trace::LinExpr::constant(lane),
-        );
-        wire
-    });
-    context.observe_lanes(b, 32, &digest_lanes);
+    );
     let mut ledger = b.num_wires();
     let leaf_a_prefix = verify_combined_duplex_region_walk_deferred_prefix_trace(
         b,

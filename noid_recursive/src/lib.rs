@@ -1,135 +1,41 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Recursive proof components for the O(1) history path.
+//! Recursive proof authority for one atomic accepted block.
 //!
-//! The target path folds fixed accepted-block certificate chunks and binds them
-//! to locally verified header anchors.
+//! The only protocol carried by this crate is `HistoryStep`: the current
+//! block relation and the persisted parent terminal are proved as one unit.
 
 pub mod acceptance;
-pub mod accepted_batch;
 pub mod accumulator;
-pub mod block_certificate;
-pub mod block_certificate_backend;
-pub mod block_certificate_ivc;
-pub mod checkpoint;
-pub mod checkpoint_ivc_backend;
-pub mod checkpoint_proof;
-pub mod class_registry;
-pub mod header_integer;
-pub mod pow_header;
 pub mod region_sidecar;
-pub mod selected_history;
 
-pub use acceptance::{verify_acceptance_against_header, AcceptanceProof, AcceptanceRelationError};
-pub use accepted_batch::{
-    accepted_claim_batch_digest, accepted_claim_batch_digest_hash_fields,
-    accepted_claim_batch_digest_hash_params, prove_accepted_claim_batch_digest,
-    verify_accepted_claim_batch_digest, verify_accepted_claim_batch_native,
-    verify_accepted_claim_batch_with_header_trace, AcceptedClaimBatchDigestError,
-    AcceptedClaimBatchDigestProof, AcceptedClaimBatchError, AcceptedClaimBatchOutput,
-    AcceptedClaimBatchWitness, ACCEPTED_CLAIM_BATCH_DIGEST_HASH_FIELDS,
+pub use acceptance::history_step::{
+    decode_history_step_terminal, decode_verify_history_step_terminal,
+    derive_history_step_direct_block_vk, derive_history_step_runtime_parts,
+    encode_history_step_terminal, freeze_history_step_bank, history_step_terminal_max_wire_bytes,
+    pin_history_step_class_bank, prepare_history_step_authorizations, prepare_history_step_for_pow,
+    prepare_history_step_ghost_authorization, prove_built_history_step_terminal,
+    prove_history_step, verify_history_step_terminal, AcceptedHistoryStepTerminal,
+    AuthorizationComponentInput, BuiltHistoryStep, ExactStateStructuralFrontierInputs,
+    FrozenHistoryStepBank, HistoryStepAuthorizationError, HistoryStepBlockComponents,
+    HistoryStepBlockInput, HistoryStepError, HistoryStepFreezeError, HistoryStepFreezeInput,
+    HistoryStepFreezeInputProvider, HistoryStepFreezeMatrixStore, HistoryStepFreezeStage,
+    HistoryStepInputError, HistoryStepMatrixLease, HistoryStepMatrixSource,
+    HistoryStepMatrixSourceError, HistoryStepParentTranscriptLayout, HistoryStepRuntime,
+    HistoryStepRuntimeParts, HistoryStepSidecarOperation, HistoryStepTerminal,
+    PreparedHistoryStepAuthorizations, PreparedHistoryStepForPow,
+    PreparedHistoryStepGhostAuthorization, HISTORY_STEP_RUNTIME_PARTS_COMPACT_MAX_BYTES,
+    HISTORY_STEP_RUNTIME_PARTS_COMPACT_VERSION, HISTORY_STEP_WIRE_VERSION,
+};
+pub use acceptance::history_step_bank::{
+    canonical_history_step_class_id, canonical_history_step_pcs_params,
+    canonical_history_step_shape, history_step_bank_io_layout, history_step_bank_io_spec,
+    CanonicalHistoryStepClassId, HistoryStepBankEntryPins, HistoryStepBankError,
+    HistoryStepBankIoLayout, PinnedHistoryStepBankEntry, PinnedHistoryStepClassBank,
+    HISTORY_STEP_CLASS_COUNT, HISTORY_STEP_CURRENT_CLASS_MS, HISTORY_STEP_TIER_SLOT_COUNT,
 };
 pub use accumulator::{
     genesis_accumulator, ChainAccumulator, ChainAccumulatorAdvanceError, ChainAccumulatorLaneError,
     ChainAccumulatorLocalBoundaryError, CHAIN_ACCUMULATOR_LANES,
-};
-pub use block_certificate::{
-    accepted_block_certificate_auth_sidecar_digest, accepted_block_certificate_batch_statement,
-    accepted_block_certificate_batch_statement_digest,
-    accepted_block_certificate_batch_statement_hash_fields,
-    accepted_block_certificate_batch_statement_hash_params,
-    accepted_block_certificate_block_body_digest, accepted_block_certificate_block_proof_digest,
-    accepted_block_certificate_block_proof_meta_digest, accepted_block_certificate_chain_claim,
-    accepted_block_certificate_proof_digest, accepted_block_certificate_receipt,
-    accepted_block_certificate_receipt_chain_claim, accepted_block_certificate_statement_digest,
-    accepted_block_certificate_statement_fields,
-    accepted_block_certificate_statement_from_acceptance_receipt,
-    accepted_block_certificate_statement_hash_fields,
-    accepted_block_certificate_statement_hash_params, accepted_block_receipt_projection_handle,
-    block_proof_acceptance_receipt_digest, prove_accepted_block_certificate_batch_digest_proof,
-    verify_accepted_block_certificate_batch_digest_proof,
-    verify_accepted_block_certificate_proof_checkpoint,
-    verify_accepted_block_certificate_receipt_projection,
-    verify_accepted_block_receipt_projection_handle, AcceptedBlockCertificateBatchDigestProof,
-    AcceptedBlockCertificateBatchError, AcceptedBlockCertificateBatchStatement,
-    AcceptedBlockCertificateProof, AcceptedBlockCertificateProofError,
-    AcceptedBlockCertificateReceipt, AcceptedBlockCertificateReceiptError,
-    AcceptedBlockCertificateStatement, AcceptedBlockReceiptProjectionHandle,
-    AcceptedBlockReceiptProjectionHandleError, BlockProofAcceptanceReceipt,
-    ACCEPTED_BLOCK_CERTIFICATE_BATCH_STATEMENT_HASH_FIELDS,
-    ACCEPTED_BLOCK_CERTIFICATE_STATEMENT_FIELDS, ACCEPTED_BLOCK_CERTIFICATE_STATEMENT_HASH_FIELDS,
-};
-
-pub use block_certificate_ivc::{
-    accepted_block_receipt_projection_relation_digest,
-    decode_and_verify_accepted_block_receipt_projection,
-    prove_accepted_block_certificate_receipt_projection_proof,
-    prove_accepted_block_receipt_projection, prove_accepted_block_receipt_projection_with_receipt,
-    verify_accepted_block_receipt_projection, AcceptedBlockReceiptProjectionError,
-    AcceptedBlockReceiptProjectionProof, ACCEPTED_BLOCK_RECEIPT_PROJECTION_K_LOG,
-    ACCEPTED_BLOCK_RECEIPT_PROJECTION_LOG_BATCH_SIZE,
-    ACCEPTED_BLOCK_RECEIPT_PROJECTION_LOG_INV_RATE, ACCEPTED_BLOCK_RECEIPT_PROJECTION_M,
-    ACCEPTED_BLOCK_RECEIPT_PROJECTION_RELATION,
-};
-pub use checkpoint::{
-    prove_checkpoint_poseidon, verify_checkpoint_poseidon, CheckpointPoseidonError,
-    CheckpointPoseidonProof,
-};
-pub use checkpoint_ivc_backend::{
-    prove_history_checkpoint_ivc_chunk_core,
-    prove_history_checkpoint_ivc_chunk_receipt_handle_core,
-    verify_history_checkpoint_ivc_chunk_core, HistoryCheckpointIvcChunkCoreError,
-    HistoryCheckpointIvcChunkCoreProof, HISTORY_CHECKPOINT_IVC_CHUNK_CORE_RELATION,
-    HISTORY_CHECKPOINT_IVC_CHUNK_CORE_WIRE_BYTES, HISTORY_CHECKPOINT_IVC_PCS_LOG_BATCH_SIZE,
-    HISTORY_CHECKPOINT_IVC_PCS_LOG_INV_RATE,
-};
-pub use checkpoint_proof::{
-    advance_history_checkpoint_head_native, history_checkpoint_accumulator_digest,
-    history_checkpoint_anchor_digest, history_checkpoint_batch_summary_digest,
-    history_checkpoint_consensus_digest, history_checkpoint_head_digest,
-    history_checkpoint_head_from_boundary, history_checkpoint_public_proof_bytes_digest,
-    history_checkpoint_step_relation_digest, history_checkpoint_step_statement_digest,
-    history_checkpoint_step_statement_hash_fields, history_checkpoint_step_statement_hash_params,
-    prove_history_checkpoint_recursive_head_record, prove_history_checkpoint_step_digest_proof,
-    prove_history_checkpoint_step_proof_from_certificate_statements,
-    prove_history_checkpoint_step_proof_with_ivc_chunk_certificate_proof_components,
-    prove_history_checkpoint_step_proof_with_ivc_chunk_core_components,
-    public_history_checkpoint_proof_from_head_record, verify_history_checkpoint_head_record,
-    verify_history_checkpoint_head_record_transition, verify_history_checkpoint_proof_checkpoint,
-    verify_history_checkpoint_step_digest_proof, verify_history_checkpoint_step_proof_checkpoint,
-    verify_history_checkpoint_step_proof_private_components_native,
-    verify_history_checkpoint_step_statement_native, HistoryCheckpointBatchSummary,
-    HistoryCheckpointHead, HistoryCheckpointProof, HistoryCheckpointProofError,
-    HistoryCheckpointStepBackendProof, HistoryCheckpointStepDigestProof,
-    HistoryCheckpointStepProof, HistoryCheckpointStepProofError, HistoryCheckpointStepStatement,
-    StoredHistoryCheckpointHeadRecord, HISTORY_CHECKPOINT_BATCH_TARGET_BLOCKS,
-    HISTORY_CHECKPOINT_ENGINE_STREAMING_TOWER_IVC, HISTORY_CHECKPOINT_RETAINED_WINDOW_BLOCKS,
-    HISTORY_CHECKPOINT_STEP_STATEMENT_HASH_FIELDS,
-};
-pub use class_registry::{
-    decode_selected_recursive_class_registry_pinned,
-    decode_selected_recursive_class_registry_unpinned_for_offline_inspection,
-    decode_selected_recursive_terminal_registry_pinned, encode_selected_recursive_class_registry,
-    OwnedSelectedRecursiveClassRegistry, OwnedSelectedRecursiveTerminalRegistry,
-    SelectedRecursiveClassRegistryError, MAX_SELECTED_RECURSIVE_CLASS_REGISTRY_BYTES,
-    SELECTED_RECURSIVE_CLASS_REGISTRY_VERSION,
-};
-pub use header_integer::{
-    build_header_integer_trace, verify_header_integer_trace, HeaderIntegerBatchTrace,
-    HeaderIntegerStepTrace, HeaderIntegerTraceError,
-};
-pub use pow_header::{
-    header_hash_proof_inputs, verify_pow_header_batch_native,
-    verify_pow_header_witness_batch_native, HeaderWitness, PowHeaderBatchError,
-    RecursiveConsensusState,
-};
-pub use selected_history::{
-    decode_selected_history_terminal_package, encode_selected_history_terminal_package,
-    verify_selected_history_terminal, CanonicalSelectedHistoryRegistry, SelectedHistoryCodecError,
-    SelectedHistoryMatrixFamily, SelectedHistoryMatrixLease, SelectedHistoryMatrixRequest,
-    SelectedHistoryMatrixSource, SelectedHistoryRegistryError, SelectedHistoryTerminalPackage,
-    SelectedHistoryVerificationError, MAX_SELECTED_HISTORY_TERMINAL_ENVELOPE_BYTES,
-    MAX_SELECTED_HISTORY_TERMINAL_PACKAGE_BYTES, SELECTED_HISTORY_LINK_IO_LANES,
-    SELECTED_HISTORY_TERMINAL_VERSION,
 };

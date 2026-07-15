@@ -38,7 +38,6 @@ pub mod action_compaction;
 pub mod action_surface;
 pub mod batch_eval;
 pub mod block_spine;
-pub mod checkpoint_poseidon;
 pub mod deep_chain;
 pub mod exact_state;
 pub mod fee_arithmetic;
@@ -73,6 +72,7 @@ pub mod zk_post_claim_relation;
 pub mod zk_query_carriers;
 pub mod zk_split_bridge;
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use noid_core::Block128;
@@ -110,7 +110,44 @@ pub fn const_block(v: Block128) -> LinExpr {
 /// (subtraction == addition in char 2).
 #[inline]
 pub fn pin_zero(b: &mut FieldR1csBuilder, expr: &LinExpr) {
-    b.pin_f128(expr, F128::ZERO);
+    PIN_GATES.with(|gates| {
+        let gates = gates.borrow();
+        let mut gated = expr.clone();
+        for gate in gates.iter() {
+            gated = mul(b, gate, &gated);
+        }
+        b.pin_f128(&gated, F128::ZERO);
+    });
+}
+
+thread_local! {
+    /// Composition-only conditional relation scope.  The primitive verifier
+    /// twins remain unchanged: every native rejection still reaches
+    /// [`pin_zero`], while a recursive relation may select its exact base arm
+    /// by multiplying those rejection equations by one authenticated boolean.
+    /// The scope is thread-local because matrix builders run in parallel.
+    static PIN_GATES: RefCell<Vec<LinExpr>> = const { RefCell::new(Vec::new()) };
+}
+
+struct PinGateGuard;
+
+impl Drop for PinGateGuard {
+    fn drop(&mut self) {
+        PIN_GATES.with(|gates| {
+            let removed = gates.borrow_mut().pop();
+            debug_assert!(removed.is_some(), "pin-gate stack underflow");
+        });
+    }
+}
+
+/// Run one verifier-composition arm under `gate`.  This does not alter any
+/// transcript or primitive parameter: it only turns each native rejection
+/// equation `e = 0` into `gate * e = 0`.  Callers must separately constrain
+/// `gate` to a boolean and bind the complementary base relation.
+pub(crate) fn with_pin_gate<R>(gate: &LinExpr, f: impl FnOnce() -> R) -> R {
+    PIN_GATES.with(|gates| gates.borrow_mut().push(gate.clone()));
+    let _guard = PinGateGuard;
+    f()
 }
 
 /// Assert two expressions are equal.
@@ -467,5 +504,26 @@ mod tests {
         test_support::assert_expr_is(&b, &got, native, "evaluate_slice");
         let (r1cs, z) = b.build();
         assert!(r1cs.satisfies(&z));
+    }
+
+    fn gated_equality_matrix(active: bool) -> (noid_ivc_core::field_r1cs::FieldR1cs, Vec<F128>) {
+        let mut b = FieldR1csBuilder::new();
+        let gate = LinExpr::from_wire(b.alloc_bool(active));
+        let wrong = LinExpr::from_wire(b.alloc_f128(F128::ONE));
+        with_pin_gate(&gate, || pin_eq(&mut b, &wrong, &LinExpr::zero()));
+        b.build()
+    }
+
+    #[test]
+    fn composition_pin_gate_is_matrix_fixed_and_fail_closed_when_live() {
+        let (inactive_matrix, inactive_witness) = gated_equality_matrix(false);
+        let (active_matrix, active_witness) = gated_equality_matrix(true);
+        assert_eq!(
+            inactive_matrix.structural_statement_digest(),
+            active_matrix.structural_statement_digest(),
+            "selector value must not change the relation matrix",
+        );
+        assert!(inactive_matrix.satisfies(&inactive_witness));
+        assert!(!active_matrix.satisfies(&active_witness));
     }
 }

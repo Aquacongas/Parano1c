@@ -59,19 +59,16 @@ pub const BLOCK_MAX_ACTIONS: usize = BLOCK_MAX_USER_ACTIONS + 1;
 pub const BLOCK_MAX_DISTINCT_SEGMENTS: usize = 256;
 
 // ---------------------------------------------------------------------------
-// Block proof classes
+// HistoryStep classes
 // ---------------------------------------------------------------------------
 
-/// Fixed-body user-transaction count tiers. Every proof-facing per-block
+/// Fixed-body user-transaction count tiers. Every HistoryStep-facing per-block
 /// structure is padded up to the smallest tier holding the block's user
-/// tx count, so the proof system sees a small fixed family of shapes
-/// instead of per-count structures. The tiers ARE the recursive-proof
-/// ladder: one standalone block class and one link class exist per tier,
-/// and every node can derive/rebuild each class matrix locally, so the
-/// tier set is kept small. Blocks below the lowest tier (including
-/// coinbase-only blocks) pad up to it with protocol ghost transactions;
-/// the worst-case padding ratio is bounded by the largest adjacent-tier
-/// step (4x).
+/// tx count, so the recursive relation sees a small fixed family of shapes
+/// instead of per-count structures. Every node can derive each class matrix
+/// locally. Blocks below the lowest tier (including coinbase-only blocks) pad
+/// up to it with protocol ghost transactions; the worst-case padding ratio is
+/// bounded by the largest adjacent-tier step (4x).
 pub const USER_TX_CLASS_TIERS: [usize; 4] = [8, 32, 64, 255];
 
 /// Smallest tier in `tiers` holding `count`, or None past the top tier.
@@ -142,9 +139,8 @@ pub const UNDO_RETENTION_DEPTH: u64 = 18;
 
 /// Recent full-block retention depth for peer serving and normal catch-up.
 ///
-/// Nodes keep full block bodies, block proofs, auth sidecars, and undo material
-/// only for this recent window. Older full payloads are prunable once consumed
-/// by accepted-block certificate/checkpoint coverage; headers remain permanent.
+/// Nodes keep accepted block bodies and undo material only for this recent
+/// window, plus the preceding HistoryStep terminal. Headers remain permanent.
 pub const RECENT_BLOCK_RETENTION_DEPTH: u64 = UNDO_RETENTION_DEPTH;
 
 /// Number of finalised block headers used for the expansion trigger median.
@@ -220,12 +216,11 @@ pub const GENESIS_TARGET: [u8; 32] = {
 ///
 /// # Why CONSENSUS_FINALITY_DEPTH?
 ///
-/// Local history/checkpoint coverage only advances for blocks that are
-/// CONSENSUS_FINALITY_DEPTH behind tip. Public snapshot sync uses that finalized
-/// O(1) boundary, and this chainwork floor remains a resource/sanity guard:
+/// Public snapshot sync uses the finalized O(1) boundary, and this chainwork
+/// floor remains a resource/sanity guard:
 ///
 ///   tip < 18  -> no finalized history boundary and chainwork < threshold
-///   tip >= 18 -> finalized history/checkpoint coverage may serve snapshots
+///   tip >= 18 -> the finalized HistoryStep boundary may serve snapshots
 ///
 /// # Security vs fake snapshots
 ///
@@ -267,7 +262,7 @@ pub const BASE_REWARD_MICRONOID: u64 = 50 * MICRONOID_PER_NOID;
 pub const FLOOR_REWARD_MICRONOID: u64 = MICRONOID_PER_NOID;
 
 // ---------------------------------------------------------------------------
-// Proof-gated coinbase maturity
+// Height-tagged coinbase creation ids
 // ---------------------------------------------------------------------------
 
 /// High-bit tag marking a coinbase mint's `creation_id`.
@@ -296,6 +291,22 @@ pub const fn coinbase_creation_id(height: u64) -> u64 {
 #[inline]
 pub const fn coinbase_creation_height(creation_id: u64) -> u64 {
     creation_id & !COINBASE_CREATION_TAG
+}
+
+/// Whether a live slot's creation id can exist at one authenticated chain
+/// boundary. User outputs are bounded by the monotone allocator; coinbase
+/// outputs occupy the disjoint tagged namespace and are bounded by mint
+/// height instead.
+pub const fn creation_id_within_boundary(
+    creation_id: u64,
+    alloc_counter: u64,
+    height: u64,
+) -> bool {
+    if is_coinbase_creation_id(creation_id) {
+        coinbase_creation_height(creation_id) <= height
+    } else {
+        creation_id <= alloc_counter
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -346,7 +357,7 @@ mod tests {
     }
 
     #[test]
-    fn one_user_class_ladder() {
+    fn history_step_user_classes_are_exact() {
         assert_eq!(USER_TX_CLASS_TIERS, [8, 32, 64, 255]);
         assert_eq!(user_tx_class_tier(0), Some(8));
         assert_eq!(user_tx_class_tier(9), Some(32));
@@ -355,6 +366,18 @@ mod tests {
         assert_eq!(block_class_spend_capacity(255), BLOCK_MAX_LIVE_INPUTS);
         assert_eq!(block_class_output_capacity(255), BLOCK_MAX_USER_OUTPUTS);
         assert_eq!(block_class_touched_capacity(255), 1_531);
+    }
+
+    #[test]
+    fn creation_id_boundary_uses_disjoint_user_and_coinbase_bounds() {
+        assert!(creation_id_within_boundary(9, 9, 7));
+        assert!(!creation_id_within_boundary(10, 9, 7));
+        assert!(creation_id_within_boundary(coinbase_creation_id(7), 0, 7));
+        assert!(!creation_id_within_boundary(
+            coinbase_creation_id(8),
+            u64::MAX,
+            7,
+        ));
     }
 
     #[test]

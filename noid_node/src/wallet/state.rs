@@ -10,7 +10,8 @@
 //! - Only the active address's UTXOs are cached in memory
 //! - The cache is replaced from an exact, verified owner-index snapshot
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -79,16 +80,6 @@ pub struct WalletUtxo {
     pub confirmed_height: u64,
 }
 
-impl WalletUtxo {
-    /// Proof-gated coinbase maturity: a coinbase UTXO is spendable only after
-    /// the chain's attested selected-history coverage reaches its mint height.
-    pub fn is_immature_coinbase(&self, attested_coverage: u64) -> bool {
-        noid_chain::consensus::params::is_coinbase_creation_id(self.creation_id)
-            && noid_chain::consensus::params::coinbase_creation_height(self.creation_id)
-                > attested_coverage
-    }
-}
-
 /// Durable chain identity to which the active-address cache is bound.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveWalletSnapshot {
@@ -98,9 +89,6 @@ pub struct ActiveWalletSnapshot {
     pub log_slots: u32,
     pub active_slot_count: u64,
     pub alloc_counter: u64,
-    /// `attested_coverage` of the snapshot's tip header. Gates coinbase
-    /// maturity for balance display and coin selection.
-    pub attested_coverage: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -126,6 +114,10 @@ pub struct WalletState {
     /// Cached receipts: txid → bincode-serialized ParanoidReceipt bytes.
     /// Generated automatically when a block is applied, before pruning.
     pub receipts: HashMap<[u8; 32], Vec<u8>>,
+    /// A failed durable write is retried by the next accepted block.
+    pub(super) receipts_dirty: bool,
+    /// Pending-send ownership and confirmation metadata awaiting durable write.
+    pub(super) history_dirty: bool,
     /// Output slots claimed by pending (submitted but not yet confirmed) txs.
     /// Used to avoid SlotConflict when retrying or sending multiple txs.
     pub pending_output_slots: std::collections::HashSet<u32>,
@@ -162,13 +154,15 @@ impl WalletState {
             active_snapshot: None,
             history: Vec::new(),
             receipts: HashMap::new(),
+            receipts_dirty: false,
+            history_dirty: false,
             pending_output_slots: std::collections::HashSet::new(),
             pending_input_slots: std::collections::HashSet::new(),
             active_index: 0,
         };
         wallet.load_metadata();
-        wallet.load_receipts();
-        wallet.load_history();
+        wallet.load_receipts().map_err(KeystoreError::Artifact)?;
+        wallet.load_history().map_err(KeystoreError::Artifact)?;
         Ok(wallet)
     }
 
@@ -216,31 +210,10 @@ impl WalletState {
         !self.pending_input_slots.is_empty() || !self.pending_output_slots.is_empty()
     }
 
-    /// Confirmed balance of the ACTIVE address in μNOID, including immature
-    /// coinbase value (see [`Self::immature_balance`]).
+    /// Confirmed balance of the ACTIVE address in μNOID.
     pub fn balance(&self) -> u64 {
         self.utxos
             .values()
-            .map(|u| u.value)
-            .fold(0u64, |a, v| a.saturating_add(v))
-    }
-
-    /// Attested selected-history coverage of the wallet's snapshot tip.
-    /// Zero (everything immature but height-0 mints) until the first reload.
-    pub fn attested_coverage(&self) -> u64 {
-        self.active_snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.attested_coverage)
-            .unwrap_or(0)
-    }
-
-    /// Coinbase value locked until its mint heights are proof-covered
-    /// (`creation_id` tag bit set and mint height above the tip coverage).
-    pub fn immature_balance(&self) -> u64 {
-        let coverage = self.attested_coverage();
-        self.utxos
-            .values()
-            .filter(|u| u.is_immature_coinbase(coverage))
             .map(|u| u.value)
             .fold(0u64, |a, v| a.saturating_add(v))
     }
@@ -308,7 +281,6 @@ impl WalletState {
             log_slots: snapshot.log_slots,
             active_slot_count: snapshot.active_slot_count,
             alloc_counter: snapshot.alloc_counter,
-            attested_coverage: snapshot.attested_coverage,
         };
 
         // Persist first. If the filesystem operation fails, the live wallet
@@ -342,7 +314,7 @@ impl WalletState {
         tx_hash: [u8; 32],
         amount_micronoid: u64,
         to_address: [u8; 32],
-    ) {
+    ) -> Result<(), String> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -357,32 +329,34 @@ impl WalletState {
             own_address: Some(self.active_address().to_bech32()),
             own_key_index: Some(self.active_index),
         });
-        self.save_history();
+        self.history_dirty = true;
+        self.save_history()
     }
 
     /// Remove a pending send that never entered the mempool.
-    pub fn remove_pending_send(&mut self, tx_hash: &[u8; 32]) {
+    pub fn remove_pending_send(&mut self, tx_hash: &[u8; 32]) -> Result<(), String> {
         let before = self.history.len();
         self.history
             .retain(|entry| !(&entry.tx_hash == tx_hash && entry.height == 0));
         if self.history.len() != before {
-            self.save_history();
+            self.history_dirty = true;
+            self.save_history()?;
         }
+        Ok(())
     }
 
-    /// Update the height of a pending (height=0) tx once it's confirmed in a block.
-    pub fn confirm_pending_tx(&mut self, tx_hash: &[u8; 32], confirmed_height: u64) {
-        let mut changed = false;
+    /// Update the height of a pending (height=0) tx once it is confirmed.
+    /// The block-level caller persists the complete history once after all
+    /// transactions have been applied, avoiding one fsync per transaction.
+    pub fn confirm_pending_tx(&mut self, tx_hash: &[u8; 32], confirmed_height: u64) -> bool {
         for entry in self.history.iter_mut() {
             if &entry.tx_hash == tx_hash && entry.height == 0 {
                 entry.height = confirmed_height;
-                changed = true;
-                break;
+                self.history_dirty = true;
+                return true;
             }
         }
-        if changed {
-            self.save_history();
-        }
+        false
     }
 
     /// Register output slots as pending (tx submitted to mempool).
@@ -428,15 +402,10 @@ impl WalletState {
         let needed = target.checked_add(fee)?;
         // `utxos` contains the active owner only. Filter out outputs already
         // being spent by a pending transaction.
-        // Immature coinbase is displayed as locked and never selected: a
-        // spend would be rejected by mempool admission and block validation
-        // until the chain attests coverage of its mint height.
-        let attested_coverage = self.attested_coverage();
         let mut available: Vec<&WalletUtxo> = self
             .utxos
             .values()
             .filter(|u| !self.pending_input_slots.contains(&u.slot_index))
-            .filter(|u| !u.is_immature_coinbase(attested_coverage))
             .collect();
         // Value-first selection minimizes input count. Equal-value candidates
         // are ordered by state segment and slot so every caller produces the
@@ -581,76 +550,97 @@ impl WalletState {
         }
     }
 
-    /// Save receipts to disk. Called after each new receipt is generated.
-    pub fn save_receipts(&self) {
+    /// Save receipts durably. Called after each new receipt is generated.
+    pub fn save_receipts(&mut self) -> Result<(), String> {
         let path = receipts_path(&self.keystore_path);
-        // Serialize as a map of hex_hash → hex_bytes
-        let data: std::collections::HashMap<String, String> = self
+        // A sorted map keeps the durable representation deterministic.
+        let data: BTreeMap<String, String> = self
             .receipts
             .iter()
             .map(|(k, v)| (hex::encode(k), hex::encode(v)))
             .collect();
-        if let Ok(json) = serde_json::to_string(&data) {
-            let tmp = path.with_extension("receipts.tmp");
-            if std::fs::write(&tmp, json).is_ok() {
-                let _ = std::fs::rename(&tmp, &path);
-            }
-        }
+        let json = serde_json::to_vec(&data)
+            .map_err(|error| format!("serialize wallet receipts: {error}"))?;
+        persist_atomically(&path, "receipts.tmp", &json, "wallet receipts")?;
+        self.receipts_dirty = false;
+        Ok(())
     }
 
     /// Load receipts from disk. Called at startup after create_or_load.
-    pub fn load_receipts(&mut self) {
+    pub fn load_receipts(&mut self) -> Result<(), String> {
         let path = receipts_path(&self.keystore_path);
         if !path.exists() {
-            return;
+            return Ok(());
         }
-        let text = match std::fs::read_to_string(&path) {
-            Ok(t) => t,
-            Err(_) => return,
-        };
-        if let Ok(data) = serde_json::from_str::<std::collections::HashMap<String, String>>(&text) {
-            for (k_hex, v_hex) in data {
-                if let (Ok(k), Ok(v)) = (hex::decode(&k_hex), hex::decode(&v_hex)) {
-                    if k.len() == 32 {
-                        let mut key = [0u8; 32];
-                        key.copy_from_slice(&k);
-                        self.receipts.insert(key, v);
-                    }
-                }
+        let text = std::fs::read_to_string(&path)
+            .map_err(|error| format!("read wallet receipts: {error}"))?;
+        let data = serde_json::from_str::<BTreeMap<String, String>>(&text)
+            .map_err(|error| format!("decode wallet receipts: {error}"))?;
+        for (k_hex, v_hex) in data {
+            let key_bytes = hex::decode(&k_hex)
+                .map_err(|error| format!("decode wallet receipt key: {error}"))?;
+            let value = hex::decode(&v_hex)
+                .map_err(|error| format!("decode wallet receipt value: {error}"))?;
+            let key: [u8; 32] = key_bytes
+                .try_into()
+                .map_err(|_| "wallet receipt key is not 32 bytes".to_string())?;
+            if self.receipts.insert(key, value).is_some() {
+                return Err("duplicate wallet receipt key".to_string());
             }
-            tracing::info!(count = self.receipts.len(), "loaded receipts from disk");
         }
+        tracing::info!(count = self.receipts.len(), "loaded receipts from disk");
+        Ok(())
     }
 
-    /// Save wallet transaction history to disk.
-    pub fn save_history(&self) {
+    /// Save wallet transaction history durably.
+    pub fn save_history(&mut self) -> Result<(), String> {
         let path = history_path(&self.keystore_path);
-        if let Ok(json) = serde_json::to_string(&self.history) {
-            let tmp = path.with_extension("history.tmp");
-            if std::fs::write(&tmp, json).is_ok() {
-                let _ = std::fs::rename(&tmp, &path);
-            }
-        }
+        let json = serde_json::to_vec(&self.history)
+            .map_err(|error| format!("serialize wallet history: {error}"))?;
+        persist_atomically(&path, "history.tmp", &json, "wallet history")?;
+        self.history_dirty = false;
+        Ok(())
     }
 
     /// Load wallet transaction history from disk.
-    pub fn load_history(&mut self) {
+    pub fn load_history(&mut self) -> Result<(), String> {
         let path = history_path(&self.keystore_path);
         if !path.exists() {
-            return;
+            return Ok(());
         }
-        let text = match std::fs::read_to_string(&path) {
-            Ok(t) => t,
-            Err(_) => return,
-        };
-        if let Ok(history) = serde_json::from_str::<Vec<TxHistoryEntry>>(&text) {
-            self.history = history;
-            tracing::info!(
-                count = self.history.len(),
-                "loaded wallet history from disk"
-            );
-        }
+        let text = std::fs::read_to_string(&path)
+            .map_err(|error| format!("read wallet history: {error}"))?;
+        self.history = serde_json::from_str::<Vec<TxHistoryEntry>>(&text)
+            .map_err(|error| format!("decode wallet history: {error}"))?;
+        tracing::info!(
+            count = self.history.len(),
+            "loaded wallet history from disk"
+        );
+        Ok(())
     }
+}
+
+fn persist_atomically(
+    path: &Path,
+    temporary_extension: &str,
+    bytes: &[u8],
+    label: &str,
+) -> Result<(), String> {
+    let temporary = path.with_extension(temporary_extension);
+    let mut file = std::fs::File::create(&temporary)
+        .map_err(|error| format!("create temporary {label}: {error}"))?;
+    file.write_all(bytes)
+        .map_err(|error| format!("write {label}: {error}"))?;
+    file.sync_all()
+        .map_err(|error| format!("sync {label}: {error}"))?;
+    drop(file);
+    std::fs::rename(&temporary, path).map_err(|error| format!("replace {label}: {error}"))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{label} path has no parent directory"))?;
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("sync {label} directory: {error}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -664,13 +654,27 @@ pub type SharedWallet = Arc<Mutex<Option<WalletState>>>;
 mod tests {
 
     #[test]
-    fn immature_coinbase_is_locked_out_of_spendable_balance_and_selection() {
+    fn corrupt_durable_wallet_artifacts_fail_startup() {
+        for extension in ["receipts", "history"] {
+            let dir = tempfile::tempdir().unwrap();
+            let key_path = dir.path().join("wallet.key");
+            WalletState::create_or_load(key_path.clone()).unwrap();
+            std::fs::write(key_path.with_extension(extension), b"not-json").unwrap();
+            let error = WalletState::create_or_load(key_path.clone())
+                .err()
+                .expect("corrupt wallet artifact must fail startup");
+            assert!(matches!(error, KeystoreError::Artifact(_)));
+        }
+    }
+
+    #[test]
+    fn accepted_tip_reward_is_immediately_selectable_for_its_child() {
         use noid_chain::consensus::params::coinbase_creation_id;
 
         let dir = tempfile::tempdir().unwrap();
         let mut wallet = WalletState::create_or_load(dir.path().join("wallet.key")).unwrap();
         let address = wallet.active_address();
-        let mature_user = WalletUtxo {
+        let user = WalletUtxo {
             slot_index: 1,
             value: 40,
             creation_id: 11,
@@ -678,7 +682,7 @@ mod tests {
             key_index: 0,
             confirmed_height: 4,
         };
-        let mature_coinbase = WalletUtxo {
+        let older_reward = WalletUtxo {
             slot_index: 2,
             value: 50,
             creation_id: coinbase_creation_id(3),
@@ -686,7 +690,7 @@ mod tests {
             key_index: 0,
             confirmed_height: 3,
         };
-        let immature_coinbase = WalletUtxo {
+        let tip_reward = WalletUtxo {
             slot_index: 3,
             value: 60,
             creation_id: coinbase_creation_id(7),
@@ -694,40 +698,28 @@ mod tests {
             key_index: 0,
             confirmed_height: 7,
         };
-        wallet.utxos.insert(1, mature_user);
-        wallet.utxos.insert(2, mature_coinbase);
-        wallet.utxos.insert(3, immature_coinbase);
+        wallet.utxos.insert(1, user);
+        wallet.utxos.insert(2, older_reward);
+        wallet.utxos.insert(3, tip_reward);
         wallet.active_snapshot = Some(ActiveWalletSnapshot {
-            height: 8,
+            height: 7,
             tip_hash: [0x22; 32],
             state_root: [0x33; 32],
             log_slots: 8,
             active_slot_count: 3,
             alloc_counter: 11,
-            attested_coverage: 3,
         });
 
-        // Total balance still reports every confirmed UTXO; the immature
-        // coinbase is carved out separately like pending value.
+        // The height-7 reward exists only after height 7 was accepted, and is
+        // therefore selectable while building height 8.
         assert_eq!(wallet.balance(), 150);
-        assert_eq!(wallet.immature_balance(), 60);
-
-        // Selection can reach 90 (40 + 50) but never touches the immature 60.
-        let (selected, change) = wallet.select_utxos(90, 0).expect("mature funds suffice");
+        let (selected, change) = wallet
+            .select_utxos(150, 0)
+            .expect("all accepted rewards are spendable");
         assert_eq!(change, 0);
         let mut slots: Vec<u32> = selected.iter().map(|u| u.slot_index).collect();
         slots.sort_unstable();
-        assert_eq!(slots, vec![1, 2]);
-        assert!(wallet.select_utxos(91, 0).is_none());
-
-        // Once coverage reaches the mint height the coinbase matures.
-        wallet
-            .active_snapshot
-            .as_mut()
-            .expect("snapshot installed")
-            .attested_coverage = 7;
-        assert_eq!(wallet.immature_balance(), 0);
-        assert!(wallet.select_utxos(150, 0).is_some());
+        assert_eq!(slots, vec![1, 2, 3]);
     }
     use super::*;
 
@@ -740,7 +732,6 @@ mod tests {
             log_slots: 24,
             active_slot_count: u64::from(amount.is_some()),
             alloc_counter: 9,
-            attested_coverage: 0,
             utxos: amount
                 .map(|amount| noid_chain::storage::VerifiedOwnerUtxo {
                     slot_index: 5,
@@ -1011,7 +1002,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut wallet = WalletState::create_or_load(dir.path().join("wallet.key")).unwrap();
         let expected_address = wallet.active_address().to_bech32();
-        wallet.record_pending_send([3; 32], 77, [4; 32]);
+        wallet.record_pending_send([3; 32], 77, [4; 32]).unwrap();
 
         let entry = wallet.history.last().unwrap();
         assert_eq!(entry.own_key_index, Some(0));
@@ -1053,8 +1044,8 @@ mod tests {
         });
         wallet.receipts.insert([0x33; 32], vec![0x44; 96]);
         wallet.save_metadata();
-        wallet.save_history();
-        wallet.save_receipts();
+        wallet.save_history().unwrap();
+        wallet.save_receipts().unwrap();
 
         let mut key_file = std::fs::read(&key_path).unwrap();
         assert_eq!(key_file.len(), 48);

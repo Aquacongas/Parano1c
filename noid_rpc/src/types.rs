@@ -37,27 +37,21 @@ pub struct ReceiptVerifyResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockTemplateResponse {
-    /// Fixed 16-field Poseidon2b PoW input as hex.
+    /// Opaque, single-use identifier for the node-owned prepared template.
+    /// The external miner cannot use it to mutate the block body or witnesses.
+    pub template_id: String,
+    /// Fixed 16-field Poseidon2b PoW input as hex, with the nonce field zeroed.
     /// Each field is serialized as 16 little-endian bytes. Patch field 10
     /// with the LE u128 nonce. A valid nonce satisfies:
     /// `Poseidon2b(POWHDR__, patched_fields) < difficulty_target`.
     pub pow_fields_hex: String,
-    /// Full sealed block bytes (hex) with nonce = 0.
-    /// External miner: patch the 16 bytes beginning at `nonce_offset` with the found nonce.
-    pub block_hex: String,
-    /// Serialized BlockProof bytes as hex. Empty for coinbase-only blocks.
-    /// Submit this alongside `block_hex` to `submitBlock`.
-    pub block_proof_hex: String,
-    /// Serialized BlockAuthSidecar bytes as hex. Empty for coinbase-only blocks.
-    /// Submit this alongside `block_hex` and `block_proof_hex` to `submitBlock`.
-    #[serde(default)]
-    pub block_auth_sidecar_hex: String,
-    /// Byte offset of the nonce field inside `block_hex`.
-    /// Includes any block-wire prefix before the semantic header.
-    pub nonce_offset: usize,
+    /// Field index to replace with the canonical 16-byte little-endian nonce.
+    pub nonce_field_index: usize,
     /// Difficulty target as 64-char little-endian hex.
     pub difficulty_target_hex: String,
     pub height: u64,
+    /// Strict server-side lifetime of this template after this response is built.
+    pub expires_in_seconds: u64,
     /// Total transaction count including coinbase.
     pub n_txs: usize,
     /// Live input counts per user transaction in canonical block order.
@@ -70,10 +64,6 @@ pub struct BlockTemplateResponse {
     pub coinbase_value_micronoid: u64,
     /// Sum of user fees claimable by the miner after burned state-growth fees.
     pub claimable_fees_micronoid: u64,
-    /// Whether the template carries a serialized proof to submit with the block.
-    pub has_block_proof: bool,
-    /// Serialized BlockProof size in bytes (`0` for coinbase-only templates).
-    pub block_proof_size_bytes: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -124,9 +114,6 @@ pub struct WalletBalance {
     /// Confirmed UTXOs being spent by pending (mempool) txs.
     /// These are locked and cannot be spent again until confirmed or evicted.
     pub pending_outbound_micronoid: u64,
-    /// Confirmed coinbase value still locked by proof-gated maturity:
-    /// its mint heights exceed the tip's `attested_coverage`.
-    pub immature_micronoid: u64,
     /// Spendable = active balance - pending_outbound.
     pub spendable_micronoid: u64,
     pub spendable_noid: f64,
@@ -302,8 +289,6 @@ pub struct MiningInfo {
     pub block_reward_noid: f64,
     /// Number of live UTXOs (determines reward via occupancy formula).
     pub active_slot_count: u64,
-    /// Height covered by the latest verified selected-history terminal.
-    pub history_proof_height: Option<u64>,
 }
 
 /// Current UTXO state dimensions and fill metrics.

@@ -14,17 +14,16 @@
 //!   acceptance additionally verifies and commits an exact authenticated
 //!   state transition.
 
+pub mod accepted_block_bundle;
 pub mod block;
 pub mod block_header;
-pub mod chain_context;
-pub mod checkpoint;
 pub mod consensus;
 pub mod exact_state_hash;
 pub mod fri_state;
 pub mod header_anchor;
+pub mod history_step;
 pub mod mempool;
 pub mod segmented_state;
-pub mod selected_history;
 pub mod sparse_merkle;
 pub mod state;
 pub mod state_delta;
@@ -56,45 +55,42 @@ pub use segmented_state::{
 // ---------------------------------------------------------------------------
 
 pub use storage::{
-    reconstruct_historical_exact_state, AcceptedBlockCommitData, AppliedBlockValidation,
-    CanonicalTipBinding, ClaimedRecursiveProofJobInputs, ConsensusMeta, FinalizedCheckpoint,
+    reconstruct_historical_exact_state, CanonicalTipBinding, ConsensusMeta, FinalizedCheckpoint,
     HistoricalExactStateView, HistoricalStateError, MdbxChainContext, MdbxContextError, MdbxStore,
-    RamBackend, ReorgBlockPayload, StateBackend, StoreError,
+    RamBackend, StateBackend, StoreError, VerifiedSnapshotBoundary,
 };
 
 // ---------------------------------------------------------------------------
 // Block layer
 // ---------------------------------------------------------------------------
 
+pub use accepted_block_bundle::{
+    AcceptedBlockBundle, AcceptedBlockBundleError, ACCEPTED_BLOCK_BUNDLE_HEADER_BYTES,
+    ACCEPTED_BLOCK_BUNDLE_MAGIC, MAX_ACCEPTED_BLOCK_BUNDLE_BYTES,
+};
 pub use block::{
-    apply_genesis_block, canonical_block_wire_len, compute_tx_root, validate_block_proof_binding,
-    Block, BlockApplyError, ProofBindingError, BLOCK_MAX_TXS, BLOCK_WIRE_FIXED_OVERHEAD,
-    BLOCK_WIRE_HEADER_OFFSET, BLOCK_WIRE_MARKER, BLOCK_WIRE_NONCE_OFFSET,
+    apply_genesis_block, canonical_block_wire_len, compute_tx_root,
+    materialize_accepted_block_state, Block, BlockApplyError, BLOCK_MAX_TXS,
+    BLOCK_WIRE_FIXED_OVERHEAD, BLOCK_WIRE_HEADER_OFFSET, BLOCK_WIRE_MARKER,
+    BLOCK_WIRE_NONCE_OFFSET,
 };
 pub use block_header::{block_id, hash_block_header, BlockHeader};
 pub use header_anchor::{
     compute_header_chain_anchor, extend_header_chain_anchor, HeaderChainAnchor,
     HeaderChainAnchorError,
 };
-
-// ---------------------------------------------------------------------------
-// Checkpoint packages
-// ---------------------------------------------------------------------------
-
-pub use checkpoint::{
-    CheckpointCoverage, CheckpointSegmentPayload, ImmutableCheckpointManifest,
-    ImmutableCheckpointPackage,
+pub use history_step::{
+    HistoryStepTerminalMetadata, HistoryStepTerminalMetadataError, HISTORY_STEP_CLASS_COUNT,
+    HISTORY_STEP_TERMINAL_BINDING_BYTES, HISTORY_STEP_TERMINAL_VERSION,
 };
 
 // ---------------------------------------------------------------------------
 // Chain state
 // ---------------------------------------------------------------------------
 
-pub use chain_context::ChainContext;
 pub use mempool::{Mempool, MempoolEntry, MempoolError};
 pub use state::{
-    apply_tx, apply_tx_at, ApplyError, ChainState, SelectedHistoryLadderUpdate,
-    SparseUtxoBuildError, StateTransition,
+    apply_tx, apply_tx_at, ApplyError, ChainState, SparseUtxoBuildError, StateTransition,
 };
 pub use state_delta::{
     build_exact_action_surface, build_exact_action_surface_at_log_slots,

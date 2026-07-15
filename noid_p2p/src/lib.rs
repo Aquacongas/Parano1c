@@ -5,13 +5,13 @@
 //!
 //! Implements:
 //! - GossipSub broadcast: blocks (/paranoid/blocks/1), txs (/paranoid/txs/1)
-//! - Request-Response: headers, recent blocks, and the selected-history terminal endpoint
+//! - Request-Response: headers, complete recent-block bundles, and HistoryStep terminals
 //! - Identify + Ping for peer management
 
 pub mod behaviour;
 pub mod block_sync_codec;
 pub mod header_sync_codec;
-pub mod history_proof_codec;
+pub mod history_step_codec;
 mod inbound_budget;
 pub mod mempool_sync_codec;
 pub mod network;

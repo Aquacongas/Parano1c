@@ -5,7 +5,7 @@
 //!
 //! Connects to any `paranoid` full node via JSON-RPC, fetches a block template,
 //! searches for a valid PoW nonce using all available CPU cores (rayon), and
-//! submits the solved block.
+//! returns only that nonce to the node-owned template.
 //!
 //! ## Usage
 //!
@@ -23,17 +23,15 @@
 //! ## Template protocol
 //!
 //! `getBlockTemplate("")` returns:
+//!   - `template_id`              — opaque, single-use node capability
 //!   - `pow_fields_hex`           — 16-field Poseidon2b PoW input
-//!   - `block_hex`                — full sealed block with nonce = 0
-//!   - `block_proof_hex`          — serialized BlockProof, empty for coinbase-only
-//!   - `block_auth_sidecar_hex`   — serialized public Auth sidecar, empty when absent
-//!   - `nonce_offset`             — byte offset of nonce inside canonical block_hex
+//!   - `nonce_field_index`        — nonce lane (canonical value: 10)
 //!   - `difficulty_target_hex`    — 256-bit LE target
-//!   - proof metadata             — operator display only; PoW uses pow_fields
+//!   - block metadata             — operator display only
 //!
-//! The miner patches `block_hex[nonce_offset..nonce_offset+16]` with the found
-//! 16-byte LE nonce and calls `submitBlock(patched_block_hex, block_proof_hex,
-//! block_auth_sidecar_hex)`.
+//! The miner calls `submitBlock(template_id, nonce_hex)`, where `nonce_hex` is
+//! exactly the 16-byte little-endian nonce in lowercase hex. The worker never
+//! receives or submits a block body, HistoryStep witness or proof.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -100,17 +98,13 @@ struct Cli {
 
 #[derive(Debug, Deserialize)]
 struct BlockTemplateResponse {
+    template_id: String,
     pow_fields_hex: String,
-    block_hex: String,
-    block_proof_hex: String,
-    #[serde(default)]
-    block_auth_sidecar_hex: String,
-    nonce_offset: usize,
+    nonce_field_index: usize,
     difficulty_target_hex: String,
     height: u64,
+    expires_in_seconds: u64,
     n_txs: usize,
-    #[serde(default)]
-    block_proof_size_bytes: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -188,16 +182,9 @@ impl RpcClient {
         self.call("paranoid_getBlockTemplate", [coinbase])
     }
 
-    fn submit_block(
-        &self,
-        block_hex: &str,
-        block_proof_hex: &str,
-        block_auth_sidecar_hex: &str,
-    ) -> Result<String> {
-        self.call(
-            "paranoid_submitBlock",
-            (block_hex, block_proof_hex, block_auth_sidecar_hex),
-        )
+    fn submit_nonce(&self, template_id: &str, nonce: u128) -> Result<String> {
+        let nonce_hex = hex::encode(nonce.to_le_bytes());
+        self.call("paranoid_submitBlock", (template_id, nonce_hex))
     }
 }
 
@@ -210,11 +197,6 @@ const DIGEST_BATCH: usize = 256;
 const POW_HEADER_FIELD_COUNT: usize = 16;
 const POW_NONCE_FIELD_INDEX: usize = 10;
 const POW_FIELDS_HEX_BYTES: usize = POW_HEADER_FIELD_COUNT * 16;
-/// Header-relative nonce offset. The serialized block-envelope offset is
-/// advertised by the node and may include a version prefix.
-const BLOCK_HEADER_NONCE_OFFSET: usize = 144;
-/// Serialized semantic block header size, excluding its block-envelope prefix.
-const BLOCK_HEADER_WIRE_SIZE: usize = 212;
 /// Search for a valid nonce using all rayon threads.
 /// Returns `Some(nonce)` or `None` if cancelled.
 fn search_nonce(
@@ -287,55 +269,6 @@ fn decode_pow_fields_hex(hex_str: &str) -> Result<[Block128; POW_HEADER_FIELD_CO
     Ok(fields)
 }
 
-fn pow_fields_from_block_header(
-    block_bytes: &[u8],
-    header_offset: usize,
-) -> Result<[Block128; POW_HEADER_FIELD_COUNT]> {
-    let header_end = header_offset
-        .checked_add(BLOCK_HEADER_WIRE_SIZE)
-        .ok_or_else(|| anyhow!("block header offset overflow"))?;
-    if block_bytes.len() < header_end {
-        return Err(anyhow!(
-            "block_hex too short: {} bytes, need at least {header_end}",
-            block_bytes.len(),
-        ));
-    }
-    let header = &block_bytes[header_offset..header_end];
-
-    let mut fields = [Block128::ZERO; POW_HEADER_FIELD_COUNT];
-    let mut field = 0usize;
-    put_digest_fields(&mut fields, &mut field, &header[0..32]);
-    put_digest_fields(&mut fields, &mut field, &header[32..64]);
-    put_digest_fields(&mut fields, &mut field, &header[64..96]);
-    fields[field] = Block128::from(read_u64(&header[96..104]) as u128);
-    field += 1;
-    fields[field] = Block128::from(read_u64(&header[104..112]) as u128);
-    field += 1;
-    put_digest_fields(&mut fields, &mut field, &header[112..144]);
-    fields[field] = Block128::from(read_u128(&header[144..160]));
-    field += 1;
-    put_digest_fields(&mut fields, &mut field, &header[160..192]);
-    fields[field] = Block128::from(read_u32(&header[192..196]) as u128);
-    field += 1;
-    fields[field] = Block128::from(read_u64(&header[196..204]) as u128);
-    field += 1;
-    fields[field] = Block128::from(read_u64(&header[204..212]) as u128);
-    field += 1;
-    debug_assert_eq!(field, POW_HEADER_FIELD_COUNT);
-    Ok(fields)
-}
-
-fn put_digest_fields(
-    fields: &mut [Block128; POW_HEADER_FIELD_COUNT],
-    index: &mut usize,
-    bytes: &[u8],
-) {
-    fields[*index] = Block128::from(u128::from_le_bytes(bytes[..16].try_into().unwrap()));
-    *index += 1;
-    fields[*index] = Block128::from(u128::from_le_bytes(bytes[16..32].try_into().unwrap()));
-    *index += 1;
-}
-
 fn poseidon_pow_digest_nonce_batch(
     fields: &[Block128; POW_HEADER_FIELD_COUNT],
     start_nonce: u128,
@@ -386,21 +319,6 @@ fn poseidon_pow_digest_nonce_batch(
     }
 }
 
-#[inline]
-fn read_u32(bytes: &[u8]) -> u32 {
-    u32::from_le_bytes(bytes.try_into().unwrap())
-}
-
-#[inline]
-fn read_u64(bytes: &[u8]) -> u64 {
-    u64::from_le_bytes(bytes.try_into().unwrap())
-}
-
-#[inline]
-fn read_u128(bytes: &[u8]) -> u128 {
-    u128::from_le_bytes(bytes.try_into().unwrap())
-}
-
 /// Compare two 32-byte values as 256-bit LE integers: `a < b`.
 #[inline]
 fn le256_lt(a: &[u8; 32], b: &[u8; 32]) -> bool {
@@ -413,62 +331,6 @@ fn le256_lt(a: &[u8; 32], b: &[u8; 32]) -> bool {
         }
     }
     false
-}
-
-fn validate_template_layout(
-    pow_fields: &[Block128; POW_HEADER_FIELD_COUNT],
-    block_bytes: &[u8],
-    nonce_offset: usize,
-) -> Result<()> {
-    // The node is the single source of truth for the serialized offset. Derive
-    // the semantic header start from the stable header-relative nonce offset,
-    // leaving any version/envelope prefix opaque and untouched.
-    let header_offset = nonce_offset.checked_sub(BLOCK_HEADER_NONCE_OFFSET).ok_or_else(|| {
-        anyhow!(
-            "nonce_offset={nonce_offset} precedes header-relative nonce offset {BLOCK_HEADER_NONCE_OFFSET}"
-        )
-    })?;
-    let minimum_len = header_offset
-        .checked_add(BLOCK_HEADER_WIRE_SIZE)
-        .ok_or_else(|| anyhow!("block header length overflow"))?;
-    if block_bytes.len() < minimum_len {
-        return Err(anyhow!(
-            "block_hex too short: {} bytes, need at least {minimum_len}",
-            block_bytes.len(),
-        ));
-    }
-
-    let block_fields = pow_fields_from_block_header(block_bytes, header_offset)?;
-    if &block_fields != pow_fields {
-        return Err(anyhow!(
-            "template mismatch: pow_fields_hex does not match the semantic header embedded in block_hex"
-        ));
-    }
-
-    Ok(())
-}
-
-fn patch_block_nonce(block_bytes: &mut [u8], nonce_offset: usize, nonce: u128) -> Result<()> {
-    let nonce_end = nonce_offset
-        .checked_add(16)
-        .ok_or_else(|| anyhow!("nonce offset overflow"))?;
-    let block_len = block_bytes.len();
-    let dst = block_bytes
-        .get_mut(nonce_offset..nonce_end)
-        .ok_or_else(|| {
-            anyhow!("nonce_offset={nonce_offset} out of range (block_len={block_len})")
-        })?;
-    dst.copy_from_slice(&nonce.to_le_bytes());
-    Ok(())
-}
-
-fn proof_summary(tmpl: &BlockTemplateResponse) -> String {
-    let proof_size = if tmpl.block_proof_size_bytes > 0 {
-        tmpl.block_proof_size_bytes
-    } else {
-        tmpl.block_proof_hex.len() / 2
-    };
-    format!("proof={proof_size}B")
 }
 
 // ---------------------------------------------------------------------------
@@ -529,15 +391,17 @@ fn mine(cli: &Cli) -> Result<()> {
 
         let pow_fields =
             decode_pow_fields_hex(&tmpl.pow_fields_hex).context("decode pow_fields_hex")?;
+        if tmpl.nonce_field_index != POW_NONCE_FIELD_INDEX {
+            return Err(anyhow!(
+                "template nonce_field_index must be {POW_NONCE_FIELD_INDEX}, got {}",
+                tmpl.nonce_field_index
+            ));
+        }
 
         let target: [u8; 32] = hex::decode(&tmpl.difficulty_target_hex)
             .context("decode difficulty_target_hex")?
             .try_into()
             .map_err(|_| anyhow!("difficulty_target must be 32 bytes"))?;
-
-        let mut block_bytes = hex::decode(&tmpl.block_hex).context("decode block_hex")?;
-        let nonce_offset = tmpl.nonce_offset;
-        validate_template_layout(&pow_fields, &block_bytes, nonce_offset)?;
 
         // Count leading zero bits for display.
         let diff_bits = {
@@ -556,9 +420,9 @@ fn mine(cli: &Cli) -> Result<()> {
         };
 
         eprintln!(
-            "┌─ h={height} txs={n_txs} {} diff={diff_bits} leading-zero-bits  \
+            "┌─ h={height} txs={n_txs} expires={}s diff={diff_bits} leading-zero-bits  \
              target={}…",
-            proof_summary(&tmpl),
+            tmpl.expires_in_seconds,
             &tmpl.difficulty_target_hex[tmpl.difficulty_target_hex.len().saturating_sub(8)..]
         );
 
@@ -575,15 +439,8 @@ fn mine(cli: &Cli) -> Result<()> {
 
         let elapsed = t0.elapsed();
 
-        // Patch nonce into block bytes.
-        patch_block_nonce(&mut block_bytes, nonce_offset, nonce)?;
-
-        // Submit.
-        match rpc.submit_block(
-            &hex::encode(&block_bytes),
-            &tmpl.block_proof_hex,
-            &tmpl.block_auth_sidecar_hex,
-        ) {
+        // Submit only the nonce for this single-use node-owned template.
+        match rpc.submit_nonce(&tmpl.template_id, nonce) {
             Ok(hash) => {
                 blocks_found += 1;
                 last_height = height;
@@ -596,12 +453,11 @@ fn mine(cli: &Cli) -> Result<()> {
             }
             Err(e) => {
                 let err = e.to_string();
-                if err.contains("BadParentHash") {
+                if err.to_ascii_lowercase().contains("stale") {
                     eprintln!("└─ STALE  template parent lost race; fetching fresh template");
                 } else {
                     eprintln!("└─ submit failed: {err}");
                 }
-                last_height = height; // skip this height, get a fresh template
             }
         }
 
@@ -623,63 +479,14 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    const TEST_BLOCK_WIRE_HEADER_OFFSET: usize = 1;
-    const TEST_BLOCK_WIRE_NONCE_OFFSET: usize =
-        TEST_BLOCK_WIRE_HEADER_OFFSET + BLOCK_HEADER_NONCE_OFFSET;
-    const TEST_BLOCK_WIRE_VERSION: u8 = 0xB2;
-
-    fn matching_pow_fields_and_block_bytes() -> ([Block128; POW_HEADER_FIELD_COUNT], Vec<u8>) {
-        let mut block = vec![0u8; TEST_BLOCK_WIRE_HEADER_OFFSET + BLOCK_HEADER_WIRE_SIZE + 4];
-        block[0] = TEST_BLOCK_WIRE_VERSION;
-        for (i, b) in block
-            [TEST_BLOCK_WIRE_HEADER_OFFSET..TEST_BLOCK_WIRE_HEADER_OFFSET + BLOCK_HEADER_WIRE_SIZE]
-            .iter_mut()
-            .enumerate()
-        {
-            *b = i as u8;
-        }
-        let fields = pow_fields_from_block_header(&block, TEST_BLOCK_WIRE_HEADER_OFFSET)
-            .expect("valid header bytes");
-        (fields, block)
-    }
-
     #[test]
-    fn template_layout_accepts_matching_pow_fields_and_full_header() {
-        let (fields, block) = matching_pow_fields_and_block_bytes();
-        validate_template_layout(&fields, &block, TEST_BLOCK_WIRE_NONCE_OFFSET).unwrap();
-    }
-
-    #[test]
-    fn template_layout_rejects_mismatched_pow_fields() {
-        let (mut fields, block) = matching_pow_fields_and_block_bytes();
-        fields[0] += Block128::from(1u128);
-        assert!(validate_template_layout(&fields, &block, TEST_BLOCK_WIRE_NONCE_OFFSET).is_err());
-    }
-
-    #[test]
-    fn template_layout_rejects_unexpected_nonce_offset() {
-        let (fields, block) = matching_pow_fields_and_block_bytes();
-        assert!(
-            validate_template_layout(&fields, &block, TEST_BLOCK_WIRE_NONCE_OFFSET + 1).is_err()
-        );
-    }
-
-    #[test]
-    fn nonce_patch_preserves_opaque_wire_prefix_and_header_alignment() {
-        let (mut fields, mut block) = matching_pow_fields_and_block_bytes();
-        let prefix = block[..TEST_BLOCK_WIRE_HEADER_OFFSET].to_vec();
-        let nonce = 0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210u128;
-        fields[POW_NONCE_FIELD_INDEX] = Block128::from(nonce);
-
-        patch_block_nonce(&mut block, TEST_BLOCK_WIRE_NONCE_OFFSET, nonce).unwrap();
-
-        assert_eq!(&block[..TEST_BLOCK_WIRE_HEADER_OFFSET], prefix.as_slice());
+    fn nonce_submission_is_canonical_little_endian_hex() {
+        let nonce = 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210u128;
+        let encoded = hex::encode(nonce.to_le_bytes());
+        assert_eq!(encoded.len(), 32);
         assert_eq!(
-            pow_fields_from_block_header(&block, TEST_BLOCK_WIRE_HEADER_OFFSET).unwrap(),
-            fields
+            u128::from_le_bytes(hex::decode(encoded).unwrap().try_into().unwrap()),
+            nonce
         );
-        validate_template_layout(&fields, &block, TEST_BLOCK_WIRE_NONCE_OFFSET).unwrap();
     }
 }

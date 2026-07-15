@@ -7289,7 +7289,7 @@ mod tests {
             .split("pub struct SeekableFieldR1csArtifact")
             .nth(1)
             .expect("streaming artifact view")
-            .split("/// Rows per statement-digest span")
+            .split("struct CompactSparseFieldMatrix")
             .next()
             .expect("streaming implementation boundary");
         assert!(!implementation.contains("read_artifact(&mut"));
