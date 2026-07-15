@@ -536,6 +536,13 @@ pub fn derive_history_step_runtime_parts(
             .try_into()
             .map_err(|_| HistoryStepError::RuntimeLayout)?;
         if derived == r_prev_layouts {
+            // The banked parent envelope makes the outer transcript
+            // tier-independent; the live `[R]_prev` recording is therefore
+            // always pinned at the slot-zero union block, which is only
+            // sound while all four banked layouts stay identical.
+            if derived.iter().any(|layout| layout != &derived[0]) {
+                return Err(HistoryStepError::RuntimeLayout);
+            }
             return Ok(parts);
         }
         r_prev_layouts = derived;

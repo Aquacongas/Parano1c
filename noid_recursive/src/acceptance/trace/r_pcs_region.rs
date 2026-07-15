@@ -362,9 +362,12 @@ impl HistoryStepParentGeometry {
                 return Err(RegionSidecarError::UnsupportedVkShape);
             }
         }
-        let expected_r_prev = self
-            .r_prev_layout(active_slot)
-            .ok_or(RegionSidecarError::BadVk)?;
+        // The banked parent envelope makes the outer transcript — and with it
+        // all four banked `[R]_prev` layouts — independent of the live parent
+        // tier, so the live recording always occupies (and is always pinned
+        // at) the slot-zero block: the matrix must not encode the tier.
+        let _ = active_slot;
+        let expected_r_prev = self.r_prev_layout(0).ok_or(RegionSidecarError::BadVk)?;
         if &r_prev.layout != expected_r_prev || r_prev.data_flat.len() != expected_r_prev.n_data {
             return Err(RegionSidecarError::UnsupportedVkShape);
         }
@@ -389,7 +392,7 @@ impl HistoryStepParentGeometry {
                 data,
             })
             .collect::<Vec<_>>();
-        specs[self.r_prev_block_index(active_slot)].data = &r_prev.data_flat;
+        specs[self.r_prev_block_index(0)].data = &r_prev.data_flat;
         Ok(build_recording_only_duplex_union(&specs))
     }
 
@@ -1004,7 +1007,7 @@ pub(crate) fn prepare_history_step_parent_columns(
         u_rec,
         child_scratches: child_recordings,
         r_prev_scratch: r_prev_recording,
-        r_prev_block: geometry.r_prev_block_index(active_slot),
+        r_prev_block: geometry.r_prev_block_index(0),
         vk,
     })
 }
