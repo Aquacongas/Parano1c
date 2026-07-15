@@ -62,6 +62,11 @@ pub const TAG_BLOCKHDR: DomainTag = DomainTag::new(b"BLOCKHDR");
 /// Proof-of-work header digest. Distinct from `BLOCKHDR`: the same semantic
 /// header has separate chain-link and mining-difficulty hash domains.
 pub const TAG_POWHDR: DomainTag = DomainTag::new(b"POWHDR__");
+/// Nonce-free semantic header projection. Distinct from `BLOCKHDR` (chain
+/// link, nonce included) and `POWHDR__` (mining digest): one template has
+/// exactly one projection across every nonce, so a HistoryStep terminal
+/// minted before PoW binds any winning encoding of the same template.
+pub const TAG_SEMHDR: DomainTag = DomainTag::new(b"SEMHDR__");
 /// Byte-oriented Fiat-Shamir challenger (`FsChallenger`: op headers +
 /// length-prefixed byte absorbs).
 pub const TAG_FSCHALNG: DomainTag = DomainTag::new(b"FSCHALNG");
@@ -119,6 +124,7 @@ mod tests {
             TAG_TXROOT,
             TAG_BLOCKHDR,
             TAG_POWHDR,
+            TAG_SEMHDR,
             TAG_FSCHALNG,
             TAG_LANECHAL,
             TAG_KSCHANNL,

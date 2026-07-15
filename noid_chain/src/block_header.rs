@@ -14,7 +14,7 @@
 
 use noid_core::Block128;
 use noid_poseidon2b::native::compression::Poseidon2bSponge;
-use noid_poseidon2b::native::domain::{capacity_iv, TAG_BLOCKHDR};
+use noid_poseidon2b::native::domain::{capacity_iv, TAG_BLOCKHDR, TAG_SEMHDR};
 use noid_poseidon2b::primitives::{Address, Digest};
 
 /// Canonical block header.
@@ -91,6 +91,30 @@ pub fn hash_block_header(hdr: &BlockHeader) -> Digest {
 #[inline]
 pub fn block_id(hdr: &BlockHeader) -> Digest {
     hash_block_header(hdr)
+}
+
+/// Compute the nonce-free semantic header projection `C` under `SEMHDR__`.
+///
+/// Absorbs every consensus-significant field in exactly the
+/// `hash_block_header` order with the nonce skipped, so one template has one
+/// projection across every nonce. A HistoryStep terminal binds this value;
+/// the chain-link identity stays `block_id` (`BLOCKHDR`, nonce included) and
+/// every accepting node natively requires the two to agree on one header.
+pub fn semantic_header_id(hdr: &BlockHeader) -> Digest {
+    let mut s = Poseidon2bSponge::with_iv(capacity_iv(TAG_SEMHDR));
+
+    absorb_digest(&mut s, &hdr.prev_block_hash);
+    absorb_digest(&mut s, &hdr.state_root);
+    absorb_digest(&mut s, &hdr.tx_root);
+    s.absorb(Block128::from(hdr.timestamp as u128));
+    s.absorb(Block128::from(hdr.height as u128));
+    absorb_digest(&mut s, hdr.miner_address.as_bytes());
+    absorb_digest(&mut s, &hdr.difficulty_target);
+    s.absorb(Block128::from(hdr.log_slots as u128));
+    s.absorb(Block128::from(hdr.active_slot_count as u128));
+    s.absorb(Block128::from(hdr.alloc_counter as u128));
+
+    s.finalize()
 }
 
 #[inline]
@@ -180,5 +204,63 @@ mod tests {
         let tx8x2_flavor = s.finalize();
 
         assert_ne!(block_digest, tx8x2_flavor);
+    }
+
+    #[test]
+    fn semantic_projection_ignores_only_the_nonce() {
+        let base = header_fixture();
+        let baseline = semantic_header_id(&base);
+
+        let mut renonced = base;
+        renonced.nonce = base.nonce ^ 0xFFFF;
+        assert_eq!(semantic_header_id(&renonced), baseline);
+        assert_ne!(hash_block_header(&renonced), hash_block_header(&base));
+
+        macro_rules! check {
+            ($field:ident, $val:expr) => {{
+                let mut h = base;
+                h.$field = $val;
+                assert_ne!(
+                    semantic_header_id(&h),
+                    baseline,
+                    "semantic field {} did not affect the projection",
+                    stringify!($field)
+                );
+            }};
+        }
+
+        check!(prev_block_hash, [0xAAu8; 32]);
+        check!(state_root, [0xAAu8; 32]);
+        check!(tx_root, [0xAAu8; 32]);
+        check!(timestamp, base.timestamp + 1);
+        check!(height, base.height + 1);
+        check!(miner_address, Address([0xAAu8; 32]));
+        check!(difficulty_target, [0xAAu8; 32]);
+        check!(log_slots, base.log_slots + 1);
+        check!(active_slot_count, base.active_slot_count + 1);
+        check!(alloc_counter, base.alloc_counter + 1);
+    }
+
+    #[test]
+    fn semantic_domain_disjoint_from_chain_link() {
+        let h = header_fixture();
+
+        // The same nonce-free absorb schedule under the chain-link IV must
+        // not collide with the semantic projection domain.
+        let mut s = Poseidon2bSponge::with_iv(capacity_iv(TAG_BLOCKHDR));
+        absorb_digest(&mut s, &h.prev_block_hash);
+        absorb_digest(&mut s, &h.state_root);
+        absorb_digest(&mut s, &h.tx_root);
+        s.absorb(Block128::from(h.timestamp as u128));
+        s.absorb(Block128::from(h.height as u128));
+        absorb_digest(&mut s, h.miner_address.as_bytes());
+        absorb_digest(&mut s, &h.difficulty_target);
+        s.absorb(Block128::from(h.log_slots as u128));
+        s.absorb(Block128::from(h.active_slot_count as u128));
+        s.absorb(Block128::from(h.alloc_counter as u128));
+        let chain_link_flavor = s.finalize();
+
+        assert_ne!(semantic_header_id(&h), chain_link_flavor);
+        assert_ne!(semantic_header_id(&h), hash_block_header(&h));
     }
 }
