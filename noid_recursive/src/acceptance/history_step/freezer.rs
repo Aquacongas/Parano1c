@@ -191,10 +191,9 @@ impl<P: core::fmt::Display, S: core::fmt::Display> core::fmt::Display
                 if let Some(class) = class {
                     write!(
                         formatter,
-                        " for c{:02} (current B{}, parent B{})",
+                        " for c{:02} (current B{})",
                         class.index(),
                         class.current_tier(),
-                        class.parent_tier(),
                     )?;
                 }
                 write!(formatter, ": {source}")
@@ -335,7 +334,7 @@ where
         expected = input.end_accumulator().clone();
         if vks[slot].is_none() {
             let class =
-                CanonicalHistoryStepClassId::new(slot, 0).expect("backbone tier slot is canonical");
+                CanonicalHistoryStepClassId::new(slot).expect("backbone tier slot is canonical");
             let vk = match input {
                 HistoryStepFreezeInput::B8(input) => derive_history_step_direct_block_vk(input),
                 HistoryStepFreezeInput::B32(input) => derive_history_step_direct_block_vk(input),
@@ -389,10 +388,7 @@ where
             return Err(HistoryStepFreezeError::Backbone);
         }
         let advertised_slot = input.current_slot();
-        let parent_slot = tip
-            .as_ref()
-            .map_or(0, |terminal| terminal.class_id().current_slot());
-        let class = CanonicalHistoryStepClassId::new(advertised_slot, parent_slot)
+        let class = CanonicalHistoryStepClassId::new(advertised_slot)
             .ok_or(HistoryStepFreezeError::Backbone)?;
         let next = prove_input(runtime, tip.as_ref(), input)
             .map_err(|source| HistoryStepFreezeError::relation(stage, Some(class), source))?;
@@ -462,7 +458,10 @@ where
         let started = Instant::now();
         let class =
             CanonicalHistoryStepClassId::from_index(index).expect("fixed HistoryStep class index");
-        let parent = &checkpoints[class.parent_slot()];
+        // Every class shares one outer shape, so the parent tier must not
+        // affect the frozen matrix; freeze against the B8-tier checkpoint
+        // and let the independence gate verify the other tiers.
+        let parent = &checkpoints[0];
         let input = class_input::<P, S::Error>(provider, class, parent.accumulator())?;
         let built = assemble_input(runtime, Some(parent), input)
             .map_err(|source| HistoryStepFreezeError::relation(stage, Some(class), source))?;
@@ -531,10 +530,7 @@ where
                 return Err(HistoryStepFreezeError::Backbone);
             }
             let current_slot = input.current_slot();
-            let parent_slot = tip
-                .as_ref()
-                .map_or(0, |terminal| terminal.class_id().current_slot());
-            let class = CanonicalHistoryStepClassId::new(current_slot, parent_slot)
+            let class = CanonicalHistoryStepClassId::new(current_slot)
                 .ok_or(HistoryStepFreezeError::Backbone)?;
             if known[class.index()] {
                 let next = prove_input(&partial, tip.as_ref(), input).map_err(|source| {

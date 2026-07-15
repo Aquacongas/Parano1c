@@ -39,7 +39,7 @@ const MAX_CANONICAL_MATRIX_BYTES: usize = 1024 * 1024 * 1024;
 const ZSTD_WINDOW_LOG_MAX: u32 = 27;
 
 fn class_label(class: CanonicalHistoryStepClassId) -> String {
-    format!("H(B{}<-B{})", class.current_tier(), class.parent_tier())
+    format!("H(B{})", class.current_tier())
 }
 
 struct CanonicalMatrixStore {
@@ -206,10 +206,9 @@ impl HistoryStepFreezeMatrixStore for CanonicalMatrixStore {
             .unwrap_or_else(|error| panic!("inspect exported {}: {error}", path.display()))
             .len();
         println!(
-            "  c{:02} current=B{} parent=B{} wires={wires} bytes={bytes} build_export_ms={}",
+            "  c{:02} current=B{} wires={wires} bytes={bytes} build_export_ms={}",
             class.index(),
             class.current_tier(),
-            class.parent_tier(),
             elapsed.as_millis(),
         );
         std::io::stdout()

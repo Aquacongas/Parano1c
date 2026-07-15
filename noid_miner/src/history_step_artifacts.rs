@@ -56,7 +56,7 @@ const HISTORY_STEP_RUNTIME_METADATA_MIN_BYTES: usize = HISTORY_STEP_RUNTIME_META
     + HISTORY_STEP_RUNTIME_METADATA_TRAILER_BYTES;
 
 /// Keep the hot parent and one concurrent/terminal class without retaining
-/// the complete sixteen-class bank in memory.
+/// the complete four-class bank in memory.
 const HISTORY_STEP_COMPACT_MATRIX_CACHE_CAPACITY: usize = 2;
 
 const HISTORY_STEP_MATRIX_FILE_NAMES: [&str; HISTORY_STEP_PACK_LEAF_COUNT] = [
@@ -64,18 +64,6 @@ const HISTORY_STEP_MATRIX_FILE_NAMES: [&str; HISTORY_STEP_PACK_LEAF_COUNT] = [
     "history-step-c01.field-r1cs.zst",
     "history-step-c02.field-r1cs.zst",
     "history-step-c03.field-r1cs.zst",
-    "history-step-c04.field-r1cs.zst",
-    "history-step-c05.field-r1cs.zst",
-    "history-step-c06.field-r1cs.zst",
-    "history-step-c07.field-r1cs.zst",
-    "history-step-c08.field-r1cs.zst",
-    "history-step-c09.field-r1cs.zst",
-    "history-step-c10.field-r1cs.zst",
-    "history-step-c11.field-r1cs.zst",
-    "history-step-c12.field-r1cs.zst",
-    "history-step-c13.field-r1cs.zst",
-    "history-step-c14.field-r1cs.zst",
-    "history-step-c15.field-r1cs.zst",
 ];
 
 const HISTORY_STEP_RUNTIME_IMAGE_FILE_NAMES: [&str; HISTORY_STEP_PACK_LEAF_COUNT] = [
@@ -83,18 +71,6 @@ const HISTORY_STEP_RUNTIME_IMAGE_FILE_NAMES: [&str; HISTORY_STEP_PACK_LEAF_COUNT
     "history-step-c01.packed-r1cs.zst",
     "history-step-c02.packed-r1cs.zst",
     "history-step-c03.packed-r1cs.zst",
-    "history-step-c04.packed-r1cs.zst",
-    "history-step-c05.packed-r1cs.zst",
-    "history-step-c06.packed-r1cs.zst",
-    "history-step-c07.packed-r1cs.zst",
-    "history-step-c08.packed-r1cs.zst",
-    "history-step-c09.packed-r1cs.zst",
-    "history-step-c10.packed-r1cs.zst",
-    "history-step-c11.packed-r1cs.zst",
-    "history-step-c12.packed-r1cs.zst",
-    "history-step-c13.packed-r1cs.zst",
-    "history-step-c14.packed-r1cs.zst",
-    "history-step-c15.packed-r1cs.zst",
 ];
 
 pub fn history_step_matrix_file_name(class: CanonicalHistoryStepClassId) -> &'static str {

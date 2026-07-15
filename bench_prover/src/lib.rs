@@ -711,16 +711,19 @@ impl HonestHistoryStepFixtureProvider {
                 class_id.current_tier(),
             ));
         }
-        let checkpoint = self.checkpoints[class_id.parent_slot()]
-            .as_ref()
-            .ok_or_else(|| format!("parent checkpoint {} is not built", class_id.parent_slot()))?;
-        if &checkpoint.start_accumulator != expected_start {
-            return Err(format!(
-                "class {} start does not match parent checkpoint {}",
-                class_id.index(),
-                class_id.parent_slot(),
-            ));
-        }
+        // The requested start boundary identifies the parent checkpoint;
+        // the class no longer encodes a parent tier.
+        let checkpoint = self
+            .checkpoints
+            .iter()
+            .flatten()
+            .find(|checkpoint| &checkpoint.start_accumulator == expected_start)
+            .ok_or_else(|| {
+                format!(
+                    "class {} start does not match any built parent checkpoint",
+                    class_id.index(),
+                )
+            })?;
         self.build_child_from::<TIER>(checkpoint, user_count, 0x1000 + class_id.index() as u128)
             .map(|child| child.prepared)
     }
@@ -1748,10 +1751,10 @@ mod honest_history_step_fixture_tests {
         // frozen B8 VK byte-for-byte, independent of parent geometry.
         let frozen_runtime = focused_runtime(digests, &b8_b32_parts, &store).unwrap();
         let b32_checkpoint = prove_focused_b32_checkpoint(&frozen_runtime, &mut provider);
-        let c01 = noid_recursive::CanonicalHistoryStepClassId::from_index(1).unwrap();
-        assert_eq!((c01.current_tier(), c01.parent_tier()), (8, 32));
+        let c00 = noid_recursive::CanonicalHistoryStepClassId::from_index(0).unwrap();
+        assert_eq!(c00.current_tier(), 8);
         let fork_input = provider
-            .b8(c01, b32_checkpoint.accumulator())
+            .b8(c00, b32_checkpoint.accumulator())
             .unwrap()
             .into_history_step_input()
             .unwrap();
@@ -1766,7 +1769,7 @@ mod honest_history_step_fixture_tests {
                 fork_input,
             )
             .unwrap();
-        assert_eq!(candidate_c01.class_id(), c01);
+        assert_eq!(candidate_c01.class_id(), c00);
 
         let expected = focused_block_vk_geometry(&b8_b32_parts.direct_block_vks()[0]);
         let actual = focused_block_vk_geometry(candidate_c01.direct_block_vk());

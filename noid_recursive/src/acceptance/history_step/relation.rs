@@ -249,7 +249,7 @@ impl HistoryStepRuntimeParts {
     ) -> Result<Self, HistoryStepError> {
         let parent_params = (0..HISTORY_STEP_TIER_SLOT_COUNT)
             .map(|slot| {
-                let class = CanonicalHistoryStepClassId::new(slot, 0)
+                let class = CanonicalHistoryStepClassId::new(slot)
                     .expect("runtime parent tier is canonical");
                 canonical_history_step_pcs_params(class)
             })
@@ -427,7 +427,7 @@ pub fn derive_history_step_runtime_parts(
         ..HISTORY_STEP_TIER_SLOT_COUNT)
         .map(|slot| {
             let class =
-                CanonicalHistoryStepClassId::new(slot, 0).expect("canonical HistoryStep tier slot");
+                CanonicalHistoryStepClassId::new(slot).expect("canonical HistoryStep tier slot");
             crate::region_sidecar::derive_block_sidecar_recording_layout(
                 &direct_block_vks[slot],
                 canonical_history_step_shape(class).m,
@@ -438,7 +438,7 @@ pub fn derive_history_step_runtime_parts(
         .map_err(|_| HistoryStepError::RuntimeLayout)?;
     let parent_params: [PcsParams; HISTORY_STEP_TIER_SLOT_COUNT] = std::array::from_fn(|slot| {
         canonical_history_step_pcs_params(
-            CanonicalHistoryStepClassId::new(slot, 0).expect("canonical HistoryStep tier slot"),
+            CanonicalHistoryStepClassId::new(slot).expect("canonical HistoryStep tier slot"),
         )
     });
     let mut r_prev_layouts: [DuplexLayout; HISTORY_STEP_TIER_SLOT_COUNT] =
@@ -472,7 +472,7 @@ pub fn derive_history_step_runtime_parts(
         let mut derived = Vec::with_capacity(HISTORY_STEP_TIER_SLOT_COUNT);
         for slot in 0..HISTORY_STEP_TIER_SLOT_COUNT {
             let class_id =
-                CanonicalHistoryStepClassId::new(slot, 0).expect("canonical HistoryStep tier slot");
+                CanonicalHistoryStepClassId::new(slot).expect("canonical HistoryStep tier slot");
             let entry = runtime.bank().entry(class_id);
             let (field_proof, commitment_root) =
                 shape_only_field_r1cs_proof(&entry.shape(), entry.pcs_params());
@@ -581,15 +581,15 @@ impl HistoryStepRuntime {
             return Err(HistoryStepError::RuntimeParentVk);
         }
         for (slot, vk) in direct_block_vks.iter().enumerate() {
-            let class = CanonicalHistoryStepClassId::new(slot, 0)
-                .expect("runtime block VK slot is canonical");
+            let class =
+                CanonicalHistoryStepClassId::new(slot).expect("runtime block VK slot is canonical");
             if vk.transcript_digest() != bank.entry(class).direct_block_vk_digest() {
                 return Err(HistoryStepError::RuntimeBlockVk(slot));
             }
         }
         let parent_params = (0..HISTORY_STEP_TIER_SLOT_COUNT)
             .map(|slot| {
-                let class = CanonicalHistoryStepClassId::new(slot, 0)
+                let class = CanonicalHistoryStepClassId::new(slot)
                     .expect("runtime parent tier is canonical");
                 bank.entry(class).pcs_params().clone()
             })
@@ -1012,20 +1012,16 @@ impl ParentClassSelectorTrace {
     fn bind(
         builder: &mut FieldR1csBuilder,
         authenticated_class: &LinExpr,
-        parent_current_slot: usize,
         native_class: CanonicalHistoryStepClassId,
     ) -> Result<Self, HistoryStepError> {
-        if parent_current_slot >= HISTORY_STEP_TIER_SLOT_COUNT
-            || native_class.current_slot() != parent_current_slot
-        {
+        if !native_class.is_canonical() {
             return Err(HistoryStepError::InvalidClass);
         }
-        let candidates = std::array::from_fn(|grandparent_slot| {
-            CanonicalHistoryStepClassId::new(parent_current_slot, grandparent_slot)
-                .expect("canonical parent class")
+        let candidates = std::array::from_fn(|parent_slot| {
+            CanonicalHistoryStepClassId::new(parent_slot).expect("canonical parent class")
         });
-        let one_hot = std::array::from_fn(|grandparent_slot| {
-            LinExpr::from_wire(builder.alloc_bool(native_class.parent_slot() == grandparent_slot))
+        let one_hot = std::array::from_fn(|parent_slot| {
+            LinExpr::from_wire(builder.alloc_bool(native_class.index() == parent_slot))
         });
         let mut seen = LinExpr::zero();
         for selector in &one_hot {
@@ -1321,8 +1317,8 @@ fn prepare_history_step_base<'a, const TIER: usize>(
     }
     let selected_class = CanonicalHistoryStepClassId::from_index(0)
         .expect("class zero is the canonical internal base shape");
-    let current_class = canonical_history_step_class_id(TIER, selected_class.current_tier())
-        .ok_or(HistoryStepError::InvalidClass)?;
+    let current_class =
+        canonical_history_step_class_id(TIER).ok_or(HistoryStepError::InvalidClass)?;
     let entry = runtime.bank().entry(selected_class);
     let (field_proof, commitment_root) =
         shape_only_field_r1cs_proof(&entry.shape(), entry.pcs_params());
@@ -1417,8 +1413,8 @@ fn prepare_history_step_recursive<'a, const TIER: usize>(
     if selected_class != parent.terminal.class_id {
         return Err(HistoryStepError::InvalidClass);
     }
-    let current_class = canonical_history_step_class_id(TIER, selected_class.current_tier())
-        .ok_or(HistoryStepError::InvalidClass)?;
+    let current_class =
+        canonical_history_step_class_id(TIER).ok_or(HistoryStepError::InvalidClass)?;
     if block_acc_lanes(&current.start_accumulator)
         != envelope.io[bank.layout().block_accumulator..bank.layout().block_accumulator + ACC_LANES]
     {
@@ -1824,7 +1820,6 @@ fn prepare_history_step_assembly<const TIER: usize>(
     let parent_selector = ParentClassSelectorTrace::bind(
         &mut builder,
         &prev_io[layout.tip_class],
-        current_class.parent_slot(),
         selected_parent_class,
     )?;
 
@@ -1952,13 +1947,10 @@ fn prepare_history_step_assembly<const TIER: usize>(
     for (index, lane) in layout.matrix_lanes.iter().enumerate() {
         let class = CanonicalHistoryStepClassId::from_index(index)
             .expect("bank layout contains only canonical classes");
-        if class.current_slot() != current_class.parent_slot() {
-            for cell in lane.point..=lane.live {
-                pin_eq(&mut builder, &io_cells[cell], &prev_io[cell]);
-            }
-            continue;
-        }
-        let selector = &parent_selector.one_hot[class.parent_slot()];
+        // Every lane is gated by its own parent-tier selector bit: the
+        // selected lane folds, the other three pass through because their
+        // one-hot bit (and therefore the whole delta) is zero.
+        let selector = &parent_selector.one_hot[class.index()];
         for coordinate in 0..lane.point_len() {
             let previous = &prev_io[lane.point + coordinate];
             let selected_delta = mul(
@@ -2337,57 +2329,46 @@ pub fn prove_history_step<const TIER: usize>(
 mod tests {
     use super::*;
 
-    fn selector_matrix(
-        parent_current_slot: usize,
-        parent_grandparent_slot: usize,
-    ) -> (FieldR1cs, Vec<F128>) {
-        let native =
-            CanonicalHistoryStepClassId::new(parent_current_slot, parent_grandparent_slot).unwrap();
+    fn selector_matrix(parent_slot: usize) -> (FieldR1cs, Vec<F128>) {
+        let native = CanonicalHistoryStepClassId::new(parent_slot).unwrap();
         let mut builder = FieldR1csBuilder::new();
         let authenticated =
             LinExpr::from_wire(builder.alloc_f128(f128_from_u128(native.wire_id() as u128)));
-        let selector = ParentClassSelectorTrace::bind(
-            &mut builder,
-            &authenticated,
-            parent_current_slot,
-            native,
-        )
-        .unwrap();
+        let selector =
+            ParentClassSelectorTrace::bind(&mut builder, &authenticated, native).unwrap();
         let values = std::array::from_fn(|index| {
             LinExpr::from_wire(builder.alloc_f128(f128_from_u128((index + 17) as u128)))
         });
         let selected = selector.select(&mut builder, values);
-        let expected = LinExpr::from_wire(
-            builder.alloc_f128(f128_from_u128((parent_grandparent_slot + 17) as u128)),
-        );
+        let expected =
+            LinExpr::from_wire(builder.alloc_f128(f128_from_u128((parent_slot + 17) as u128)));
         pin_eq(&mut builder, &selected, &expected);
         builder.build()
     }
 
     #[test]
-    fn grandparent_selection_changes_only_witness_not_outer_matrix() {
-        for parent_current_slot in 0..HISTORY_STEP_TIER_SLOT_COUNT {
-            let built = (0..HISTORY_STEP_TIER_SLOT_COUNT)
-                .map(|grandparent| selector_matrix(parent_current_slot, grandparent))
-                .collect::<Vec<_>>();
-            let digest = built[0].0.structural_statement_digest();
-            for (matrix, witness) in &built {
-                assert_eq!(matrix.structural_statement_digest(), digest);
-                assert!(matrix.satisfies(witness));
-            }
+    fn parent_selection_changes_only_witness_not_outer_matrix() {
+        let built = (0..HISTORY_STEP_TIER_SLOT_COUNT)
+            .map(selector_matrix)
+            .collect::<Vec<_>>();
+        let digest = built[0].0.structural_statement_digest();
+        for (matrix, witness) in &built {
+            assert_eq!(matrix.structural_statement_digest(), digest);
+            assert!(matrix.satisfies(witness));
         }
     }
 
     #[test]
-    fn selector_rejects_parent_from_another_current_tier() {
+    fn selector_rejects_a_forged_authenticated_class() {
+        // The one-hot must reproduce the authenticated class wire exactly; a
+        // witness claiming a different parent tier is unsatisfiable.
+        let native = CanonicalHistoryStepClassId::new(2).unwrap();
         let mut builder = FieldR1csBuilder::new();
-        let wrong = CanonicalHistoryStepClassId::new(2, 1).unwrap();
-        let authenticated =
-            LinExpr::from_wire(builder.alloc_f128(f128_from_u128(wrong.wire_id() as u128)));
-        assert!(matches!(
-            ParentClassSelectorTrace::bind(&mut builder, &authenticated, 1, wrong),
-            Err(HistoryStepError::InvalidClass),
-        ));
+        let forged = LinExpr::from_wire(builder.alloc_f128(f128_from_u128(1)));
+        let selector = ParentClassSelectorTrace::bind(&mut builder, &forged, native).unwrap();
+        let _ = selector;
+        let (r1cs, witness) = builder.build();
+        assert!(!r1cs.satisfies(&witness));
     }
 
     #[test]

@@ -237,10 +237,7 @@ fn invalid_data(message: &str) -> io::Error {
 mod tests {
     use futures::io::Cursor;
     use libp2p::request_response::Codec;
-    use noid_chain::{
-        consensus::pow::block_id, AcceptedBlockBundle, Block, BlockHeader,
-        HISTORY_STEP_TERMINAL_VERSION,
-    };
+    use noid_chain::{AcceptedBlockBundle, Block, BlockHeader, HISTORY_STEP_TERMINAL_VERSION};
     use noid_poseidon2b::primitives::Address;
 
     use super::*;

@@ -198,7 +198,11 @@ fn parse_leaf_digests() -> Result<[[u8; 32]; HISTORY_STEP_CLASS_COUNT], String> 
     Ok(digests)
 }
 
-fn benchmark_filter() -> Result<Option<CanonicalHistoryStepClassId>, String> {
+/// Selected case: the current-tier class plus the parent tier the honest
+/// fixture chain should build. The legacy 4x4 aliases keep working: their
+/// parent component now only picks the fixture parent tier — the class and
+/// matrix are parent-independent.
+fn benchmark_filter() -> Result<Option<(CanonicalHistoryStepClassId, usize)>, String> {
     let value = match std::env::var(BENCH_FILTER_ENV) {
         Ok(value) => value,
         Err(std::env::VarError::NotPresent) => return Ok(None),
@@ -206,26 +210,27 @@ fn benchmark_filter() -> Result<Option<CanonicalHistoryStepClassId>, String> {
             return Err(format!("{BENCH_FILTER_ENV} must be valid UTF-8"));
         }
     };
-    let class = match value.trim().to_ascii_lowercase().as_str() {
-        "b8" | "8" | "c00" => CanonicalHistoryStepClassId::new(0, 0).expect("B8/B8 class"),
-        "b32" | "32" | "c04" => CanonicalHistoryStepClassId::new(1, 0).expect("B32/B8 class"),
-        "b64" | "64" | "c08" => CanonicalHistoryStepClassId::new(2, 0).expect("B64/B8 class"),
-        "b255" | "255" | "c12" => CanonicalHistoryStepClassId::new(3, 0).expect("B255/B8 class"),
-        "c15" | "b255-b255" => CanonicalHistoryStepClassId::new(3, 3).expect("B255/B255 class"),
+    let class = |slot: usize| CanonicalHistoryStepClassId::new(slot).expect("canonical tier slot");
+    let case = match value.trim().to_ascii_lowercase().as_str() {
+        "b8" | "8" | "c00" => (class(0), 0),
+        "b32" | "32" | "c04" | "c01" => (class(1), 0),
+        "b64" | "64" | "c08" | "c02" => (class(2), 0),
+        "b255" | "255" | "c12" | "c03" => (class(3), 0),
+        "c15" | "b255-b255" => (class(3), 3),
         _ => {
             return Err(format!(
-                "{BENCH_FILTER_ENV} must be one of B8/c00, B32/c04, B64/c08, B255/c12, or B255-B255/c15",
+                "{BENCH_FILTER_ENV} must be one of B8/c00, B32/c01, B64/c02, B255/c03, or B255-B255",
             ));
         }
     };
-    Ok(Some(class))
+    Ok(Some(case))
 }
 
 fn class_is_selected(
-    filter: Option<CanonicalHistoryStepClassId>,
+    filter: Option<(CanonicalHistoryStepClassId, usize)>,
     class: CanonicalHistoryStepClassId,
 ) -> bool {
-    filter.map_or(true, |selected| selected == class)
+    filter.map_or(true, |(selected, _)| selected == class)
 }
 
 fn load_runtime() -> Result<(HistoryStepRuntime, Arc<PinnedDiskMatrixSource>), String> {
@@ -361,8 +366,8 @@ fn run() -> Result<(), String> {
     let filter = benchmark_filter()?;
     let (runtime, source) = load_runtime()?;
     let mut provider = HonestHistoryStepFixtureProvider::new(FIXTURE_SEED)?;
-    let c00 = CanonicalHistoryStepClassId::new(0, 0).expect("B8/B8 class");
-    let target_parent_slot = filter.map_or(0, CanonicalHistoryStepClassId::parent_slot);
+    let c00 = CanonicalHistoryStepClassId::new(0).expect("B8 class");
+    let target_parent_slot = filter.map_or(0, |(_, parent_slot)| parent_slot);
     // Authenticate and convert outside every reported assembly interval. The
     // production node receives the same packed layout from its release build;
     // this file-backed benchmark deliberately performs the full canonical
@@ -401,29 +406,23 @@ fn run() -> Result<(), String> {
         source.load_checked(parent_class)?;
         benchmark_tier(&runtime, &parent, provider.b8(c00, parent_accumulator)?)?;
     }
-    let c04 = CanonicalHistoryStepClassId::new(1, 0).expect("B32/B8 class");
-    if class_is_selected(filter, c04) {
-        source.load_checked(c04)?;
+    let c01 = CanonicalHistoryStepClassId::new(1).expect("B32 class");
+    if class_is_selected(filter, c01) {
+        source.load_checked(c01)?;
         source.load_checked(parent_class)?;
-        benchmark_tier(&runtime, &parent, provider.b32(c04, parent_accumulator)?)?;
+        benchmark_tier(&runtime, &parent, provider.b32(c01, parent_accumulator)?)?;
     }
-    let c08 = CanonicalHistoryStepClassId::new(2, 0).expect("B64/B8 class");
-    if class_is_selected(filter, c08) {
-        source.load_checked(c08)?;
+    let c02 = CanonicalHistoryStepClassId::new(2).expect("B64 class");
+    if class_is_selected(filter, c02) {
+        source.load_checked(c02)?;
         source.load_checked(parent_class)?;
-        benchmark_tier(&runtime, &parent, provider.b64(c08, parent_accumulator)?)?;
+        benchmark_tier(&runtime, &parent, provider.b64(c02, parent_accumulator)?)?;
     }
-    let c12 = CanonicalHistoryStepClassId::new(3, 0).expect("B255/B8 class");
-    if class_is_selected(filter, c12) {
-        source.load_checked(c12)?;
+    let c03 = CanonicalHistoryStepClassId::new(3).expect("B255 class");
+    if class_is_selected(filter, c03) {
+        source.load_checked(c03)?;
         source.load_checked(parent_class)?;
-        benchmark_tier(&runtime, &parent, provider.b255(c12, parent_accumulator)?)?;
-    }
-    let c15 = CanonicalHistoryStepClassId::new(3, 3).expect("B255/B255 class");
-    if filter == Some(c15) {
-        source.load_checked(c15)?;
-        source.load_checked(parent_class)?;
-        benchmark_tier(&runtime, &parent, provider.b255(c15, parent_accumulator)?)?;
+        benchmark_tier(&runtime, &parent, provider.b255(c03, parent_accumulator)?)?;
     }
     Ok(())
 }

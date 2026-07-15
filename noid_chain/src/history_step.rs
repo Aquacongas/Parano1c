@@ -11,8 +11,9 @@ use core::fmt;
 pub const HISTORY_STEP_TERMINAL_VERSION: u8 = 2;
 pub const HISTORY_STEP_TERMINAL_BINDING_BYTES: usize = 1 + 8 + 32 + 1;
 pub const HISTORY_STEP_TIER_SLOT_COUNT: u8 = 4;
-pub const HISTORY_STEP_CLASS_COUNT: u8 =
-    HISTORY_STEP_TIER_SLOT_COUNT * HISTORY_STEP_TIER_SLOT_COUNT;
+/// One class per current tier: every class shares one frozen outer shape,
+/// so the parent tier never reaches the class id.
+pub const HISTORY_STEP_CLASS_COUNT: u8 = HISTORY_STEP_TIER_SLOT_COUNT;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HistoryStepTerminalMetadata {
@@ -72,7 +73,7 @@ impl HistoryStepTerminalMetadata {
     }
 
     pub const fn current_class_slot(self) -> usize {
-        (self.class_id / HISTORY_STEP_TIER_SLOT_COUNT) as usize
+        self.class_id as usize
     }
 }
 
@@ -117,7 +118,7 @@ mod tests {
 
     #[test]
     fn noncanonical_class_is_rejected() {
-        let mut encoded = HistoryStepTerminalMetadata::new(9, [0xA5; 32], 15)
+        let mut encoded = HistoryStepTerminalMetadata::new(9, [0xA5; 32], 3)
             .unwrap()
             .encode_prefix();
         encoded[41] = HISTORY_STEP_CLASS_COUNT;

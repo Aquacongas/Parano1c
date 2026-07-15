@@ -1273,7 +1273,6 @@ mod tests {
         let genesis_base = canonical_base(&chain.store);
         let block = native_coinbase_child(&chain);
         let child = block.header;
-        let child_hash = hash_block_header(&child);
         let bundle = noid_chain::AcceptedBlockBundle::try_from_parts(
             block.to_bytes(),
             fixture_terminal(

@@ -2565,7 +2565,7 @@ mod tests {
         };
 
         for slot in 0..HISTORY_STEP_TIER_SLOT_COUNT {
-            let class = CanonicalHistoryStepClassId::new(slot, 0).unwrap();
+            let class = CanonicalHistoryStepClassId::new(slot).unwrap();
             let params = canonical_history_step_pcs_params(class);
             let shape = canonical_history_step_shape(class);
             let (mut proof, commitment_root) = shape_only_field_r1cs_proof(&shape, &params);

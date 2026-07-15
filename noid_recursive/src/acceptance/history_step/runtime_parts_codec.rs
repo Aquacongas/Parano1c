@@ -377,7 +377,7 @@ impl HistoryStepRuntimeParts {
         let parent_params: [PcsParams; HISTORY_STEP_TIER_SLOT_COUNT] =
             std::array::from_fn(|slot| {
                 crate::acceptance::history_step_bank::canonical_history_step_pcs_params(
-                    CanonicalHistoryStepClassId::new(slot, 0)
+                    CanonicalHistoryStepClassId::new(slot)
                         .expect("canonical HistoryStep tier slot"),
                 )
             });
