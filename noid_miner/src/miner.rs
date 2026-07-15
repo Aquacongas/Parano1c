@@ -123,7 +123,9 @@ fn adaptive_user_tx_limit(ms_per_tx_ewma: Option<f64>) -> usize {
         return 0;
     }
 
-    // Keep post-nonce HistoryStep work comfortably under the 15s target.
+    // Proving now runs entirely before PoW: keep the pre-PoW preparation
+    // (witness + complete HistoryStep proof) comfortably under the 15s
+    // block-time target so the template does not eat the whole interval.
     let block_time_ms = noid_chain::consensus::params::BLOCK_TIME as f64 * 1_000.0;
     let budget_ms = (block_time_ms * 0.70).max(1_000.0);
     let ms_per_tx = ms_per_tx_ewma.unwrap_or(100.0).max(10.0);
@@ -462,6 +464,17 @@ impl BlockMiner {
 
             let user_txs = attempt.user_transaction_count();
 
+            // Preparation now contains the complete proof; it is the number
+            // that must stay under the block interval, so it feeds the
+            // adaptive per-transaction budget.
+            if user_txs > 0 && prepare_elapsed > Duration::ZERO {
+                let sample = prepare_elapsed.as_secs_f64() * 1_000.0 / user_txs as f64;
+                history_step_ms_per_tx_ewma = Some(match history_step_ms_per_tx_ewma {
+                    Some(previous) => previous * 0.75 + sample * 0.25,
+                    None => sample,
+                });
+            }
+
             // Preparation may be expensive. Refuse to spend PoW on a parent
             // that was replaced while it ran; the final commit repeats this
             // exact-parent check under the canonical write lock.
@@ -557,14 +570,6 @@ impl BlockMiner {
                                 }
                             };
 
-                            if user_txs > 0 && history_step_elapsed > Duration::ZERO {
-                                let sample = history_step_elapsed.as_secs_f64() * 1_000.0
-                                    / user_txs as f64;
-                                history_step_ms_per_tx_ewma = Some(match history_step_ms_per_tx_ewma {
-                                    Some(previous) => previous * 0.75 + sample * 0.25,
-                                    None => sample,
-                                });
-                            }
 
                             // IMPORTANT: apply and store the block FIRST, THEN fire the event.
                             // The announcement triggers peers to request the block immediately;
