@@ -509,87 +509,109 @@ where
     let mut digests = [[0u8; 32]; HISTORY_STEP_CLASS_COUNT];
     let mut known = [false; HISTORY_STEP_CLASS_COUNT];
 
-    // Discover the four matrices traversed by the monotone backbone. Each
-    // newly integrated direct VK is installed before that class is ever
-    // proved; H(B8) receives one extra build because it verifies its own VK,
-    // so the pass budget is one larger than the class count.
-    for _ in 0..=HISTORY_STEP_CLASS_COUNT {
-        let partial = runtime(digests, &parts, &store).map_err(|source| {
-            HistoryStepFreezeError::relation(HistoryStepFreezeStage::BootstrapRuntime, None, source)
-        })?;
-        provider
-            .reset_backbone()
-            .map_err(HistoryStepFreezeError::Provider)?;
-        let mut expected = crate::accumulator::genesis_accumulator();
-        let mut tip: Option<HistoryStepTerminal> = None;
-        let mut discovered = false;
-        while let Some(input) = provider
-            .next_backbone(&expected)
-            .map_err(HistoryStepFreezeError::Provider)?
-        {
-            if input.start_accumulator() != &expected {
-                return Err(HistoryStepFreezeError::Backbone);
-            }
-            let current_slot = input.current_slot();
-            let class = CanonicalHistoryStepClassId::new(current_slot)
-                .ok_or(HistoryStepFreezeError::Backbone)?;
-            if known[class.index()] {
-                let next = prove_input(&partial, tip.as_ref(), input).map_err(|source| {
-                    HistoryStepFreezeError::relation(
-                        HistoryStepFreezeStage::BootstrapProve,
-                        Some(class),
-                        source,
-                    )
-                })?;
-                expected = next.accumulator().clone();
-                tip = Some(next);
-                continue;
-            }
-            let built = assemble_input(&partial, tip.as_ref(), input).map_err(|source| {
+    // The banked parent envelope pins all four direct-Block VK digests into
+    // every class matrix, so replacing one provisional VK staleness-wipes
+    // every matrix frozen before it. Discovery therefore runs twice: phase A
+    // walks the backbone only until every provisional VK has been replaced
+    // by its integrated twin (wiping and restarting on each replacement),
+    // phase B reruns discovery under the stable parts and freezes the four
+    // matrices — any further VK drift there is a hard error.
+    let mut actualized = [false; HISTORY_STEP_TIER_SLOT_COUNT];
+    'phases: for stable_parts in [false, true] {
+        digests = [[0u8; 32]; HISTORY_STEP_CLASS_COUNT];
+        known = [false; HISTORY_STEP_CLASS_COUNT];
+        let pass_budget = if stable_parts {
+            HISTORY_STEP_CLASS_COUNT + 1
+        } else {
+            4 * HISTORY_STEP_CLASS_COUNT
+        };
+        for _ in 0..pass_budget {
+            let partial = runtime(digests, &parts, &store).map_err(|source| {
                 HistoryStepFreezeError::relation(
-                    HistoryStepFreezeStage::BootstrapAssemble,
-                    Some(class),
+                    HistoryStepFreezeStage::BootstrapRuntime,
+                    None,
                     source,
                 )
             })?;
-            if built.class_id() != class
-                || built.parent_recursion_vk() != parts.parent_recursion_vk()
+            provider
+                .reset_backbone()
+                .map_err(HistoryStepFreezeError::Provider)?;
+            let mut expected = crate::accumulator::genesis_accumulator();
+            let mut tip: Option<HistoryStepTerminal> = None;
+            let mut discovered = false;
+            while let Some(input) = provider
+                .next_backbone(&expected)
+                .map_err(HistoryStepFreezeError::Provider)?
             {
-                return Err(HistoryStepFreezeError::ParentVk);
-            }
-            let actual_vk = built.direct_block_vk().clone();
-            let vk_changed = &actual_vk != &parts.direct_block_vks()[current_slot];
-            let digest = built.matrix().structural_statement_digest();
-            store
-                .install(class, built.into_matrix())
-                .map_err(HistoryStepFreezeError::Store)?;
-            if vk_changed {
-                parts = parts
-                    .with_direct_block_vk(current_slot, actual_vk)
-                    .map_err(|source| {
+                if input.start_accumulator() != &expected {
+                    return Err(HistoryStepFreezeError::Backbone);
+                }
+                let current_slot = input.current_slot();
+                let class = CanonicalHistoryStepClassId::new(current_slot)
+                    .ok_or(HistoryStepFreezeError::Backbone)?;
+                if known[class.index()] {
+                    let next = prove_input(&partial, tip.as_ref(), input).map_err(|source| {
                         HistoryStepFreezeError::relation(
-                            HistoryStepFreezeStage::BootstrapReplaceDirectBlockVk,
+                            HistoryStepFreezeStage::BootstrapProve,
                             Some(class),
                             source,
                         )
                     })?;
+                    expected = next.accumulator().clone();
+                    tip = Some(next);
+                    continue;
+                }
+                let built = assemble_input(&partial, tip.as_ref(), input).map_err(|source| {
+                    HistoryStepFreezeError::relation(
+                        HistoryStepFreezeStage::BootstrapAssemble,
+                        Some(class),
+                        source,
+                    )
+                })?;
+                if built.class_id() != class
+                    || built.parent_recursion_vk() != parts.parent_recursion_vk()
+                {
+                    return Err(HistoryStepFreezeError::ParentVk);
+                }
+                let actual_vk = built.direct_block_vk().clone();
+                let vk_changed = &actual_vk != &parts.direct_block_vks()[current_slot];
+                let digest = built.matrix().structural_statement_digest();
+                store
+                    .install(class, built.into_matrix())
+                    .map_err(HistoryStepFreezeError::Store)?;
+                if vk_changed {
+                    if stable_parts {
+                        return Err(HistoryStepFreezeError::DirectBlockVk(class));
+                    }
+                    parts = parts
+                        .with_direct_block_vk(current_slot, actual_vk)
+                        .map_err(|source| {
+                            HistoryStepFreezeError::relation(
+                                HistoryStepFreezeStage::BootstrapReplaceDirectBlockVk,
+                                Some(class),
+                                source,
+                            )
+                        })?;
+                    digests = [[0u8; 32]; HISTORY_STEP_CLASS_COUNT];
+                    known = [false; HISTORY_STEP_CLASS_COUNT];
+                } else {
+                    digests[class.index()] = digest;
+                    known[class.index()] = true;
+                }
+                actualized[current_slot] = true;
+                discovered = true;
+                break;
             }
-            // H(8,8) contains the B8 VK as both current output and parent
-            // verifier authority, so rebuild it once after replacing the
-            // provisional carrier. Other backbone classes verify an already
-            // frozen lower-tier parent VK.
-            if class.index() == 0 && vk_changed {
-                digests[class.index()] = [0u8; 32];
-            } else {
-                digests[class.index()] = digest;
-                known[class.index()] = true;
+            if !stable_parts && actualized.iter().all(|&slot| slot) {
+                continue 'phases;
             }
-            discovered = true;
-            break;
+            if !discovered {
+                break;
+            }
         }
-        if !discovered {
-            break;
-        }
+    }
+    if !known.iter().all(|&class| class) {
+        return Err(HistoryStepFreezeError::Backbone);
     }
 
     let partial = runtime(digests, &parts, &store).map_err(|source| {
