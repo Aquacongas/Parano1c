@@ -63,7 +63,7 @@
 use noid_core::hardware::flat_to_tower_u128;
 use noid_core::Block128;
 use noid_poseidon2b::native::compression::compress;
-use noid_poseidon2b::native::domain::{capacity_iv, TAG_BLOCKHDR, TAG_TXROOT};
+use noid_poseidon2b::native::domain::{capacity_iv, TAG_BLOCKHDR, TAG_SEMHDR, TAG_TXROOT};
 
 use super::trace::accepted_claim_batch::{
     build_direct_accumulator_transition_slot, compress_with_tag_trace, digest_lanes,
@@ -101,7 +101,7 @@ use crate::region_sidecar::{BlockRegionPreparation, BlockRegionSidecarVk, Region
 use noid_chain::block_header::BlockHeader;
 use noid_gkr::SpineInputs;
 use noid_ivc_core::deep_chain::spine::SpineInstanceFlat;
-use noid_ivc_core::field_circuit::{f128_to_u128, DeferredWitnessSlot, DeferredWitnessSlotError};
+use noid_ivc_core::field_circuit::f128_to_u128;
 
 #[cfg(test)]
 mod selected_zk_capability_tests {
@@ -249,8 +249,10 @@ mod selected_zk_capability_tests {
     }
 }
 
-/// Offsets inside the 16-field PoW header schedule
-/// (`pow_header_fields_into` order — the header-hash killshot statement).
+/// Offsets inside the 15-field semantic header schedule — the PoW schedule
+/// (`pow_header_fields_into` order) with the nonce removed. The relation is
+/// nonce-free: the chain link over the exact nonce stays native, and the
+/// child step's parent-seal replay derives the parent block id in-circuit.
 pub mod header_fields {
     pub const PREV_BLOCK_HASH: usize = 0; // 2 lanes
     pub const STATE_ROOT: usize = 2; // 2
@@ -258,19 +260,19 @@ pub mod header_fields {
     pub const TIMESTAMP: usize = 6;
     pub const HEIGHT: usize = 7;
     pub const MINER: usize = 8; // 2
-    pub const NONCE: usize = 10;
-    pub const TARGET: usize = 11; // 2
-    pub const LOG_SLOTS: usize = 13;
-    pub const ACTIVE_SLOT_COUNT: usize = 14;
-    pub const ALLOC_COUNTER: usize = 15;
-    pub const FIELDS: usize = 16;
+    pub const TARGET: usize = 10; // 2
+    pub const LOG_SLOTS: usize = 12;
+    pub const ACTIVE_SLOT_COUNT: usize = 13;
+    pub const ALLOC_COUNTER: usize = 14;
+    pub const FIELDS: usize = 15;
 }
 
-const _: () = assert!(header_fields::FIELDS == noid_chain::consensus::pow::POW_HEADER_FIELD_COUNT);
+const _: () =
+    assert!(header_fields::FIELDS + 1 == noid_chain::consensus::pow::POW_HEADER_FIELD_COUNT);
 
-/// Class-independent post-nonce suffix: direct accumulator transition plus
-/// the exact semantic `BLOCKHDR` replay.
-const DIRECT_BLOCK_NONCE_TAIL_ROWS: usize = 4_402;
+/// Class-independent nonce-free suffix: direct accumulator transition plus
+/// the exact semantic `SEMHDR` replay. Every row is known at template time.
+const DIRECT_BLOCK_TAIL_ROWS: usize = 4_042;
 
 fn pin_eq2(b: &mut FieldR1csBuilder, a: &[LinExpr; 2], c: &[LinExpr; 2]) {
     pin_eq(b, &a[0], &c[0]);
@@ -759,7 +761,8 @@ fn spine_region_data_from_wires(
 /// body to the complete canonical ghost statement.
 fn bind_tx_epoch_anchors(
     b: &mut FieldR1csBuilder,
-    start: &AccumulatorWires,
+    parent_block_id: &[LinExpr; 2],
+    user_anchor: &[LinExpr; 2],
     spine_inputs: &[SpineInputsTrace],
     n_real_txs: usize,
     tx_delta: usize,
@@ -772,11 +775,7 @@ fn bind_tx_epoch_anchors(
 
     if tx_delta == 1 {
         for lane in 0..2 {
-            pin_eq(
-                b,
-                &spine_inputs[0].leaves[L0][lane],
-                &start.tip_block_id[lane],
-            );
+            pin_eq(b, &spine_inputs[0].leaves[L0][lane], &parent_block_id[lane]);
         }
     }
     match capacity_live_bits {
@@ -784,7 +783,7 @@ fn bind_tx_epoch_anchors(
             assert_eq!(n_real_txs, spine_inputs.len());
             for spine in &spine_inputs[tx_delta..] {
                 for lane in 0..2 {
-                    pin_eq(b, &spine.leaves[L0][lane], &start.epoch_anchor_id[lane]);
+                    pin_eq(b, &spine.leaves[L0][lane], &user_anchor[lane]);
                 }
             }
         }
@@ -798,7 +797,7 @@ fn bind_tx_epoch_anchors(
             // ghost body. No branch depends on the block's real tx count.
             for (spine, live) in spine_inputs[tx_delta..].iter().zip(live_bits) {
                 for lane in 0..2 {
-                    let epoch_diff = spine.leaves[L0][lane].add(&start.epoch_anchor_id[lane]);
+                    let epoch_diff = spine.leaves[L0][lane].add(&user_anchor[lane]);
                     let gated = mul(b, live, &epoch_diff);
                     pin_zero(b, &gated);
                 }
@@ -1017,122 +1016,112 @@ pub(in crate::acceptance) fn canonical_selected_zk_authorization_fixture_for_tie
 /// Exact semantic header schedule used by the direct block relation.
 ///
 /// The native PoW/ASERT/MTP path remains consensus authority. `HistoryStep`
-/// only recomputes `BLOCKHDR` so the recursive terminal binds the complete
-/// sealed header and block id without carrying a second PoW-hash proof.
+/// recomputes the nonce-free `SEMHDR` projection so the recursive terminal
+/// binds the complete semantic template; the chain-link id over the exact
+/// nonce is checked natively at the tip and sealed in-circuit by the child
+/// step's parent-seal replay.
 pub struct DirectHeaderTrace {
     pub fields: Vec<LinExpr>,
-    pub expected_block_id: [LinExpr; 2],
+    pub expected_semantic_id: [LinExpr; 2],
 }
 
 impl DirectHeaderTrace {
-    fn alloc_deferred(
-        b: &mut FieldR1csBuilder,
-        header: &BlockHeader,
-    ) -> (Self, DeferredDirectHeader) {
-        let mut nonce = None;
+    fn alloc(b: &mut FieldR1csBuilder, header: &BlockHeader) -> Self {
         let fields = noid_chain::consensus::pow::pow_header_fields(header)
             .into_iter()
             .enumerate()
-            .map(|(index, field)| {
-                if index == header_fields::NONCE {
-                    let (wire, slot) = b.alloc_deferred_f128(flat_of(field));
-                    nonce = Some(slot);
-                    LinExpr::from_wire(wire)
-                } else {
-                    alloc_block(b, field)
-                }
-            })
+            .filter(|(index, _)| *index != noid_chain::consensus::pow::POW_NONCE_FIELD_INDEX)
+            .map(|(_, field)| alloc_block(b, field))
             .collect();
-        let block_id = digest_lanes(&noid_chain::hash_block_header(header));
-        let (block_id_0, block_id_slot_0) = b.alloc_deferred_f128(flat_of(block_id[0]));
-        let (block_id_1, block_id_slot_1) = b.alloc_deferred_f128(flat_of(block_id[1]));
-        (
-            Self {
-                fields,
-                expected_block_id: [
-                    LinExpr::from_wire(block_id_0),
-                    LinExpr::from_wire(block_id_1),
-                ],
-            },
-            DeferredDirectHeader {
-                nonce: nonce.expect("the canonical direct header has one nonce field"),
-                block_id: [block_id_slot_0, block_id_slot_1],
-            },
-        )
+        let semantic_id = digest_lanes(&noid_chain::block_header::semantic_header_id(header));
+        Self {
+            fields,
+            expected_semantic_id: semantic_id.map(|lane| alloc_block(b, lane)),
+        }
     }
 }
 
-struct DeferredDirectHeader {
-    nonce: DeferredWitnessSlot,
-    block_id: [DeferredWitnessSlot; 2],
-}
-
-struct DeferredEndAccumulator {
-    tip_block_id: [DeferredWitnessSlot; 2],
-    epoch_anchor_id: [DeferredWitnessSlot; 2],
-}
-
-fn alloc_deferred_end_accumulator(
+/// Trace twin of the byte sponge over whole field lanes under `tag`. Mirrors
+/// `Poseidon2bSponge`: pairs are rate blocks; an odd trailing lane shares its
+/// final permutation with the `fill_padding` bytes (0x80 first, 0x01 last of
+/// the remaining half-buffer); an even schedule pads one whole rate block.
+fn sponge_lanes_trace(
     b: &mut FieldR1csBuilder,
-    native: &ChainAccumulator,
-) -> (AccumulatorWires, DeferredEndAccumulator) {
-    let lanes = native.to_lanes();
-    let height = alloc_block(b, lanes[0]);
-    let (tip_0, tip_slot_0) = b.alloc_deferred_f128(flat_of(lanes[1]));
-    let (tip_1, tip_slot_1) = b.alloc_deferred_f128(flat_of(lanes[2]));
-    let state_0 = alloc_block(b, lanes[3]);
-    let state_1 = alloc_block(b, lanes[4]);
-    let log_slots = alloc_block(b, lanes[5]);
-    let active_slot_count = alloc_block(b, lanes[6]);
-    let alloc_counter = alloc_block(b, lanes[7]);
-    let (epoch_0, epoch_slot_0) = b.alloc_deferred_f128(flat_of(lanes[8]));
-    let (epoch_1, epoch_slot_1) = b.alloc_deferred_f128(flat_of(lanes[9]));
-    (
-        AccumulatorWires::from_ordered_lanes([
-            height,
-            LinExpr::from_wire(tip_0),
-            LinExpr::from_wire(tip_1),
-            state_0,
-            state_1,
-            log_slots,
-            active_slot_count,
-            alloc_counter,
-            LinExpr::from_wire(epoch_0),
-            LinExpr::from_wire(epoch_1),
-        ]),
-        DeferredEndAccumulator {
-            tip_block_id: [tip_slot_0, tip_slot_1],
-            epoch_anchor_id: [epoch_slot_0, epoch_slot_1],
-        },
-    )
-}
-
-fn bind_direct_block_id(b: &mut FieldR1csBuilder, header: &DirectHeaderTrace) {
-    debug_assert_eq!(header.fields.len(), header_fields::FIELDS);
-    let [iv0, iv1] = capacity_iv(TAG_BLOCKHDR);
+    tag: noid_poseidon2b::native::domain::DomainTag,
+    fields: &[LinExpr],
+) -> [LinExpr; 2] {
+    let [iv0, iv1] = capacity_iv(tag);
     let mut state = [
         LinExpr::zero(),
         LinExpr::zero(),
         LinExpr::constant(flat_of(iv0)),
         LinExpr::constant(flat_of(iv1)),
     ];
-    for pair in header.fields.chunks_exact(2) {
+    for pair in fields.chunks_exact(2) {
         state[0] = state[0].add(&pair[0]);
         state[1] = state[1].add(&pair[1]);
         state = poseidon2b_permute(b, state);
     }
-    let mut pad = [0u8; 32];
-    pad[0] = 0x80;
-    pad[31] = 0x01;
-    state[0] = state[0].add_const(flat_of(Block128::from(u128::from_le_bytes(
-        pad[..16].try_into().expect("fixed pad lane"),
-    ))));
-    state[1] = state[1].add_const(flat_of(Block128::from(u128::from_le_bytes(
-        pad[16..].try_into().expect("fixed pad lane"),
-    ))));
+    if fields.len() % 2 == 1 {
+        let mut pad = [0u8; 16];
+        pad[0] = 0x80;
+        pad[15] |= 0x01;
+        state[0] = state[0].add(&fields[fields.len() - 1]);
+        state[1] = state[1].add_const(flat_of(Block128::from(u128::from_le_bytes(pad))));
+    } else {
+        let mut pad = [0u8; 32];
+        pad[0] = 0x80;
+        pad[31] |= 0x01;
+        state[0] = state[0].add_const(flat_of(Block128::from(u128::from_le_bytes(
+            pad[..16].try_into().expect("fixed pad lane"),
+        ))));
+        state[1] = state[1].add_const(flat_of(Block128::from(u128::from_le_bytes(
+            pad[16..].try_into().expect("fixed pad lane"),
+        ))));
+    }
     state = poseidon2b_permute(b, state);
-    pin_eq(b, &state[0], &header.expected_block_id[0]);
-    pin_eq(b, &state[1], &header.expected_block_id[1]);
+    [state[0].clone(), state[1].clone()]
+}
+
+fn bind_direct_semantic_id(b: &mut FieldR1csBuilder, header: &DirectHeaderTrace) {
+    debug_assert_eq!(header.fields.len(), header_fields::FIELDS);
+    let lanes = sponge_lanes_trace(b, TAG_SEMHDR, &header.fields);
+    pin_eq(b, &lanes[0], &header.expected_semantic_id[0]);
+    pin_eq(b, &lanes[1], &header.expected_semantic_id[1]);
+}
+
+/// Parent-seal witness: the exact parent header replayed under both header
+/// domains. The chain-link id (`BLOCKHDR`, nonce included) glues the child's
+/// `prev_block_hash` and the shifted epoch-anchor write; the nonce-free
+/// projection (`SEMHDR`) glues the verified parent terminal tip. Fixed
+/// geometry — independent of every tier.
+pub(in crate::acceptance) struct ParentSealTrace {
+    pub block_id: [LinExpr; 2],
+    pub semantic_id: [LinExpr; 2],
+    pub height: LinExpr,
+}
+
+impl ParentSealTrace {
+    pub(in crate::acceptance) fn alloc(b: &mut FieldR1csBuilder, parent: &BlockHeader) -> Self {
+        let fields: Vec<LinExpr> = noid_chain::consensus::pow::pow_header_fields(parent)
+            .into_iter()
+            .map(|field| alloc_block(b, field))
+            .collect();
+        let block_id = sponge_lanes_trace(b, TAG_BLOCKHDR, &fields);
+        let semantic: Vec<LinExpr> = fields
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != noid_chain::consensus::pow::POW_NONCE_FIELD_INDEX)
+            .map(|(_, wire)| wire.clone())
+            .collect();
+        let semantic_id = sponge_lanes_trace(b, TAG_SEMHDR, &semantic);
+        let height = fields[header_fields::HEIGHT].clone();
+        Self {
+            block_id,
+            semantic_id,
+            height,
+        }
+    }
 }
 
 /// The primary statement wires of one assembled block, returned for the
@@ -1170,19 +1159,21 @@ pub(in crate::acceptance) struct SelectedZkBlockSlotsAssembly {
     slots: BlockSlots,
     region: SelectedZkBlockRegionBinding,
     nonce_seal: Option<DirectBlockNonceSeal>,
+    parent_block_id: [LinExpr; 2],
 }
 
 struct DirectBlockNonceSeal {
     template_header: BlockHeader,
     start_accumulator: ChainAccumulator,
-    header: DeferredDirectHeader,
-    end: DeferredEndAccumulator,
+    parent_header: BlockHeader,
 }
 
 impl DirectBlockNonceSeal {
+    /// The relation is nonce-free: sealing only validates that the winning
+    /// header is the exact template (any nonce) and that the end boundary is
+    /// its exact parent-glued advance. No witness cell changes.
     fn seal(
         self,
-        b: &mut FieldR1csBuilder,
         sealed_header: &BlockHeader,
         end_accumulator: &ChainAccumulator,
     ) -> Result<(), DirectBlockSealError> {
@@ -1193,37 +1184,10 @@ impl DirectBlockNonceSeal {
         }
         let expected_end = self
             .start_accumulator
-            .advance(sealed_header)
+            .advance(&self.parent_header, sealed_header)
             .map_err(|_| DirectBlockSealError::EndAccumulator)?;
         if expected_end != *end_accumulator {
             return Err(DirectBlockSealError::EndAccumulator);
-        }
-
-        let DeferredDirectHeader { nonce, block_id } = self.header;
-        b.seal_deferred_f128(nonce, flat_of(Block128::from(sealed_header.nonce)))
-            .map_err(DirectBlockSealError::DeferredWitness)?;
-        let block_id_lanes = digest_lanes(&noid_chain::hash_block_header(sealed_header));
-        for (slot, value) in block_id.into_iter().zip(block_id_lanes) {
-            b.seal_deferred_f128(slot, flat_of(value))
-                .map_err(DirectBlockSealError::DeferredWitness)?;
-        }
-
-        let DeferredEndAccumulator {
-            tip_block_id,
-            epoch_anchor_id,
-        } = self.end;
-        let end_lanes = end_accumulator.to_lanes();
-        for (slot, value) in tip_block_id
-            .into_iter()
-            .zip([end_lanes[1], end_lanes[2]])
-            .chain(
-                epoch_anchor_id
-                    .into_iter()
-                    .zip([end_lanes[8], end_lanes[9]]),
-            )
-        {
-            b.seal_deferred_f128(slot, flat_of(value))
-                .map_err(DirectBlockSealError::DeferredWitness)?;
         }
         Ok(())
     }
@@ -1234,7 +1198,6 @@ pub(in crate::acceptance) enum DirectBlockSealError {
     AlreadySealed,
     HeaderChanged,
     EndAccumulator,
-    DeferredWitness(DeferredWitnessSlotError),
 }
 
 /// Unforgeable authority proving the owning HistoryStep builder has finished
@@ -1263,12 +1226,13 @@ impl SelectedZkBlockSlotsAssembly {
             .nonce_seal
             .take()
             .ok_or(DirectBlockSealError::AlreadySealed)?;
-        seal.seal(b, sealed_header, end_accumulator)?;
+        seal.seal(sealed_header, end_accumulator)?;
         append_direct_block_tail(
             b,
             &self.slots.header,
             &self.slots.start_acc,
             &self.slots.end_acc,
+            &self.parent_block_id,
         );
         Ok(())
     }
@@ -1301,6 +1265,8 @@ pub(in crate::acceptance) fn build_block_slots_selected_zk(
     sealed_header: &BlockHeader,
     tier: usize,
     proofs: PreparedSelectedZkAuthorizations,
+    parent_header: &BlockHeader,
+    parent_block_id: &[LinExpr; 2],
 ) -> SelectedZkBlockSlotsAssembly {
     let mut assembly = build_block_slots_selected_zk_prefix(
         b,
@@ -1310,6 +1276,8 @@ pub(in crate::acceptance) fn build_block_slots_selected_zk(
         sealed_header,
         tier,
         proofs,
+        parent_header,
+        parent_block_id,
     );
     assembly
         .seal_direct_tail(b, sealed_header, end_accumulator)
@@ -1317,9 +1285,10 @@ pub(in crate::acceptance) fn build_block_slots_selected_zk(
     assembly
 }
 
-/// Build every direct-Block row except the nonce-dependent accumulator and
-/// `BLOCKHDR` tail. Only the owning HistoryStep may retain this private
-/// capability across PoW.
+/// Build every direct-Block row except the class-fixed direct tail. Only
+/// the owning HistoryStep may retain this private capability across PoW.
+/// The tail itself is nonce-free; the split exists so the owner appends it
+/// after its public-IO pins in one canonical row order.
 pub(in crate::acceptance) fn build_block_slots_selected_zk_prefix(
     b: &mut FieldR1csBuilder,
     start_accumulator: &ChainAccumulator,
@@ -1328,6 +1297,8 @@ pub(in crate::acceptance) fn build_block_slots_selected_zk_prefix(
     sealed_header: &BlockHeader,
     tier: usize,
     proofs: PreparedSelectedZkAuthorizations,
+    parent_header: &BlockHeader,
+    parent_block_id: &[LinExpr; 2],
 ) -> SelectedZkBlockSlotsAssembly {
     assert!(
         crate::region_sidecar::selected_zk_block_geometry(tier).is_some(),
@@ -1341,6 +1312,8 @@ pub(in crate::acceptance) fn build_block_slots_selected_zk_prefix(
         sealed_header,
         tier,
         proofs,
+        parent_header,
+        parent_block_id,
     );
     let region = assembly
         .selected_region
@@ -1350,6 +1323,7 @@ pub(in crate::acceptance) fn build_block_slots_selected_zk_prefix(
         slots: assembly.slots,
         region,
         nonce_seal: Some(assembly.nonce_seal),
+        parent_block_id: [parent_block_id[0].clone(), parent_block_id[1].clone()],
     }
 }
 
@@ -1361,6 +1335,8 @@ fn build_selected_zk_block_slots_core(
     sealed_header: &BlockHeader,
     tier: usize,
     authorization_proofs: PreparedSelectedZkAuthorizations,
+    parent_header: &BlockHeader,
+    parent_block_id: &[LinExpr; 2],
 ) -> BlockSlotsCoreAssembly {
     assert_eq!(
         components.tx_body_inputs.len(),
@@ -1375,18 +1351,20 @@ fn build_selected_zk_block_slots_core(
     let mut ledger = b.num_wires();
 
     // ---- Primary statement wires: exact header and accumulator boundary.
-    let (header, deferred_header) = DirectHeaderTrace::alloc_deferred(b, sealed_header);
+    let header = DirectHeaderTrace::alloc(b, sealed_header);
     let start_acc = AccumulatorWires::alloc(b, start_accumulator);
-    let (end_acc, deferred_end) = alloc_deferred_end_accumulator(b, end_accumulator);
+    let end_acc = AccumulatorWires::alloc(b, end_accumulator);
 
     crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: statement wires");
     use header_fields as hf;
     // Parent continuity and child accumulator fields bind directly to the
-    // sealed header. There is no digest-of-a-detached-claim wrapper.
+    // sealed header. The chain link runs through the derived parent block
+    // id: the semantic start tip is glued to the same parent header by the
+    // owning HistoryStep's parent seal.
     for lane in 0..2 {
         pin_eq(
             b,
-            &start_acc.tip_block_id[lane],
+            &parent_block_id[lane],
             &header.fields[hf::PREV_BLOCK_HASH + lane],
         );
     }
@@ -1491,7 +1469,8 @@ fn build_selected_zk_block_slots_core(
     // directly.
     bind_tx_epoch_anchors(
         b,
-        &start_acc,
+        parent_block_id,
+        &end_acc.epoch_anchor_id,
         &spine_inputs,
         n_real_txs,
         tx_delta,
@@ -1725,26 +1704,26 @@ fn build_selected_zk_block_slots_core(
         nonce_seal: DirectBlockNonceSeal {
             template_header: *sealed_header,
             start_accumulator: start_accumulator.clone(),
-            header: deferred_header,
-            end: deferred_end,
+            parent_header: *parent_header,
         },
     }
 }
 
-/// The sole nonce-dependent relation suffix. Its gadgets and transcript
-/// semantics are unchanged; only its class-fixed row position moves after
-/// the nonce-independent HistoryStep prefix.
+/// The class-fixed relation suffix. Nonce-free: every gadget is fully
+/// determined by the semantic template, the start boundary and the derived
+/// parent block id supplied by the owning HistoryStep's parent seal.
 fn append_direct_block_tail(
     b: &mut FieldR1csBuilder,
     header: &DirectHeaderTrace,
     start_accumulator: &AccumulatorWires,
     end_accumulator: &AccumulatorWires,
+    parent_block_id: &[LinExpr; 2],
 ) {
     use header_fields as hf;
 
     let mut ledger = b.num_wires();
     let child = DirectChildWires {
-        block_id: header.expected_block_id.clone(),
+        semantic_id: header.expected_semantic_id.clone(),
         prev_block_hash: [
             header.fields[hf::PREV_BLOCK_HASH].clone(),
             header.fields[hf::PREV_BLOCK_HASH + 1].clone(),
@@ -1758,16 +1737,23 @@ fn append_direct_block_tail(
         active_slot_count: header.fields[hf::ACTIVE_SLOT_COUNT].clone(),
         alloc_counter: header.fields[hf::ALLOC_COUNTER].clone(),
     };
-    build_direct_accumulator_transition_slot(b, start_accumulator, &child, end_accumulator);
+    build_direct_accumulator_transition_slot(
+        b,
+        start_accumulator,
+        &child,
+        end_accumulator,
+        parent_block_id,
+    );
 
-    // Exact `BLOCKHDR` binding over the same semantic header wires. PoW and
-    // difficulty checks remain exclusively in the permanent native header
-    // path and are not recursively duplicated here.
-    bind_direct_block_id(b, header);
+    // Exact `SEMHDR` binding over the same semantic header wires. PoW,
+    // difficulty and the nonce-bearing chain-link id remain exclusively in
+    // the permanent native header path; the child step's parent seal derives
+    // and pins the link id in-circuit one height later.
+    bind_direct_semantic_id(b, header);
     debug_assert_eq!(
         b.num_wires() - ledger,
-        DIRECT_BLOCK_NONCE_TAIL_ROWS,
-        "canonical direct nonce tail row drift"
+        DIRECT_BLOCK_TAIL_ROWS,
+        "canonical direct tail row drift"
     );
     crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: direct accumulator + header hash");
 }
@@ -1777,21 +1763,65 @@ mod tx_epoch_anchor_tests {
     use super::*;
     use noid_core::TowerField;
 
+    fn tail_parent_header(height: u64) -> BlockHeader {
+        BlockHeader {
+            prev_block_hash: [0x10; 32],
+            state_root: [0x22; 32],
+            tx_root: [0x2A; 32],
+            timestamp: height * 10,
+            height,
+            miner_address: noid_poseidon2b::primitives::Address([0x66; 32]),
+            nonce: height as u128,
+            difficulty_target: [0xFF; 32],
+            log_slots: 8,
+            active_slot_count: 7,
+            alloc_counter: 9,
+        }
+    }
+
+    fn tail_start(parent: &BlockHeader) -> ChainAccumulator {
+        ChainAccumulator {
+            height: parent.height,
+            tip_semantic_id: noid_chain::block_header::semantic_header_id(parent),
+            state_root: parent.state_root,
+            log_slots: parent.log_slots,
+            active_slot_count: parent.active_slot_count,
+            alloc_counter: parent.alloc_counter,
+            epoch_anchor_id: [0x33; 32],
+        }
+    }
+
+    fn tail_child(parent: &BlockHeader, nonce: u128) -> BlockHeader {
+        BlockHeader {
+            prev_block_hash: noid_chain::hash_block_header(parent),
+            state_root: [0x44; 32],
+            tx_root: [0x55; 32],
+            timestamp: parent.timestamp + 10,
+            height: parent.height + 1,
+            miner_address: noid_poseidon2b::primitives::Address([0x66; 32]),
+            nonce,
+            difficulty_target: [0xFF; 32],
+            log_slots: parent.log_slots,
+            active_slot_count: 8,
+            alloc_counter: 10,
+        }
+    }
+
     fn direct_tail_fixture(
-        template_header: BlockHeader,
-        template_end: ChainAccumulator,
-        sealed_header: BlockHeader,
-        sealed_end: &ChainAccumulator,
+        parent: &BlockHeader,
+        sealed_header: &BlockHeader,
         start: &ChainAccumulator,
+        end: &ChainAccumulator,
     ) -> (noid_ivc_core::field_r1cs::FieldR1cs, Vec<F128>, usize) {
         let mut builder = FieldR1csBuilder::new();
-        let (header, deferred_header) =
-            DirectHeaderTrace::alloc_deferred(&mut builder, &template_header);
+        let header = DirectHeaderTrace::alloc(&mut builder, sealed_header);
         let start_wires = AccumulatorWires::alloc(&mut builder, start);
-        let (end_wires, deferred_end) = alloc_deferred_end_accumulator(&mut builder, &template_end);
+        let end_wires = AccumulatorWires::alloc(&mut builder, end);
+        let parent_block_id = digest_lanes(&noid_chain::hash_block_header(parent))
+            .map(|lane| alloc_block(&mut builder, lane));
 
-        // Represents arbitrary nonce-independent HistoryStep rows placed
-        // between the primary statement and the final direct suffix.
+        // Represents arbitrary HistoryStep rows placed between the primary
+        // statement and the class-fixed direct suffix.
         for index in 0..17u64 {
             builder.alloc_f128(F128 {
                 lo: index + 1,
@@ -1799,73 +1829,62 @@ mod tx_epoch_anchor_tests {
             });
         }
         let seal = DirectBlockNonceSeal {
-            template_header,
+            template_header: *sealed_header,
             start_accumulator: start.clone(),
-            header: deferred_header,
-            end: deferred_end,
+            parent_header: *parent,
         };
-        seal.seal(&mut builder, &sealed_header, sealed_end)
-            .expect("exact staged nonce boundary");
+        seal.seal(sealed_header, end)
+            .expect("exact sealed template boundary");
         let before_tail = builder.num_wires();
-        append_direct_block_tail(&mut builder, &header, &start_wires, &end_wires);
+        append_direct_block_tail(
+            &mut builder,
+            &header,
+            &start_wires,
+            &end_wires,
+            &parent_block_id,
+        );
         let tail_rows = builder.num_wires() - before_tail;
         let (matrix, witness) = builder.build();
         (matrix, witness, tail_rows)
     }
 
     #[test]
-    fn deferred_nonce_tail_matches_immediate_rows_and_epoch_boundary_witness() {
-        let start = ChainAccumulator {
-            height: 143,
-            tip_block_id: [0x11; 32],
-            state_root: [0x22; 32],
-            log_slots: 8,
-            active_slot_count: 7,
-            alloc_counter: 9,
-            epoch_anchor_id: [0x33; 32],
-        };
-        let template_header = BlockHeader {
-            prev_block_hash: start.tip_block_id,
-            state_root: [0x44; 32],
-            tx_root: [0x55; 32],
-            timestamp: 1_440,
-            height: 144,
-            miner_address: noid_poseidon2b::primitives::Address([0x66; 32]),
-            nonce: 0,
-            difficulty_target: [0xFF; 32],
-            log_slots: 8,
-            active_slot_count: 8,
-            alloc_counter: 10,
-        };
-        let placeholder_end = start.advance(&template_header).unwrap();
-        let mut sealed_header = template_header;
-        sealed_header.nonce = 0xDEAD_BEEF_CAFE_BABEu128;
-        let sealed_end = start.advance(&sealed_header).unwrap();
-        assert_eq!(sealed_end.tip_block_id, sealed_end.epoch_anchor_id);
+    fn direct_tail_is_nonce_free_across_the_epoch_edge() {
+        // Parent heights 143 (child 144: boundary block keeps the previous
+        // anchor) and 144 (child 145: anchor becomes the derived parent id).
+        for parent_height in [143u64, 144] {
+            let parent = tail_parent_header(parent_height);
+            let start = tail_start(&parent);
+            let template = tail_child(&parent, 0);
+            let mut renonced = template;
+            renonced.nonce = 0xDEAD_BEEF_CAFE_BABEu128;
 
-        let (staged_matrix, staged_witness, staged_tail_rows) = direct_tail_fixture(
-            template_header,
-            placeholder_end,
-            sealed_header,
-            &sealed_end,
-            &start,
-        );
-        let (immediate_matrix, immediate_witness, immediate_tail_rows) = direct_tail_fixture(
-            sealed_header,
-            sealed_end.clone(),
-            sealed_header,
-            &sealed_end,
-            &start,
-        );
+            let end = start.advance(&parent, &template).unwrap();
+            let renonced_end = start.advance(&parent, &renonced).unwrap();
+            // The complete boundary is nonce-invariant.
+            assert_eq!(end, renonced_end);
+            if parent_height == 144 {
+                assert_eq!(end.epoch_anchor_id, noid_chain::hash_block_header(&parent));
+            } else {
+                assert_eq!(end.epoch_anchor_id, start.epoch_anchor_id);
+            }
 
-        assert_eq!(staged_tail_rows, DIRECT_BLOCK_NONCE_TAIL_ROWS);
-        assert_eq!(immediate_tail_rows, staged_tail_rows);
-        assert_eq!(
-            staged_matrix.structural_statement_digest(),
-            immediate_matrix.structural_statement_digest()
-        );
-        assert_eq!(staged_witness, immediate_witness);
-        assert!(staged_matrix.satisfies(&staged_witness));
+            let (matrix, witness, tail_rows) =
+                direct_tail_fixture(&parent, &template, &start, &end);
+            let (renonced_matrix, renonced_witness, renonced_tail_rows) =
+                direct_tail_fixture(&parent, &renonced, &start, &renonced_end);
+
+            assert_eq!(tail_rows, DIRECT_BLOCK_TAIL_ROWS);
+            assert_eq!(renonced_tail_rows, tail_rows);
+            assert_eq!(
+                matrix.structural_statement_digest(),
+                renonced_matrix.structural_statement_digest()
+            );
+            // The witness itself is identical for every nonce of one
+            // template: the relation is nonce-free.
+            assert_eq!(witness, renonced_witness);
+            assert!(matrix.satisfies(&witness));
+        }
     }
 
     fn active_counter_case(
@@ -1902,7 +1921,7 @@ mod tx_epoch_anchor_tests {
     fn start_accumulator() -> ChainAccumulator {
         ChainAccumulator {
             height: 143,
-            tip_block_id: [0x11; 32],
+            tip_semantic_id: [0x11; 32],
             state_root: [0x22; 32],
             log_slots: 24,
             active_slot_count: 7,
@@ -1911,12 +1930,14 @@ mod tx_epoch_anchor_tests {
         }
     }
 
+    const TEST_PARENT_BLOCK_ID: [u8; 32] = [0x66; 32];
+
     fn bodies(start: &ChainAccumulator) -> Vec<SpineInputs> {
         let mut coinbase = SpineInputs {
             leaves: [[Block128::ZERO; 2]; noid_tx::body_hash::BODY_HASH_LEAVES],
         };
         coinbase.leaves[noid_tx::body_hash::TX8X2_LEAF_EPOCH_ANCHOR] =
-            digest_lanes(&start.tip_block_id);
+            digest_lanes(&TEST_PARENT_BLOCK_ID);
         let mut user = SpineInputs {
             leaves: [[Block128::ZERO; 2]; noid_tx::body_hash::BODY_HASH_LEAVES],
         };
@@ -1947,7 +1968,16 @@ mod tx_epoch_anchor_tests {
             let square = mul(&mut b, live, live);
             pin_eq(&mut b, &square, live);
         }
-        bind_tx_epoch_anchors(&mut b, &start, &traces, 1 + real_users, 1, Some(&live_bits));
+        let parent_id = digest_lanes(&TEST_PARENT_BLOCK_ID).map(|lane| alloc_block(&mut b, lane));
+        bind_tx_epoch_anchors(
+            &mut b,
+            &parent_id,
+            &start.epoch_anchor_id,
+            &traces,
+            1 + real_users,
+            1,
+            Some(&live_bits),
+        );
         b.build()
     }
 
@@ -2024,7 +2054,16 @@ mod tx_epoch_anchor_tests {
             pin_eq(&mut b, &square, live);
         }
         pin_zero(&mut b, &live_bits[255]);
-        bind_tx_epoch_anchors(&mut b, &start_w, &traces, 2, 1, Some(&live_bits[..255]));
+        let parent_id = digest_lanes(&TEST_PARENT_BLOCK_ID).map(|lane| alloc_block(&mut b, lane));
+        bind_tx_epoch_anchors(
+            &mut b,
+            &parent_id,
+            &start_w.epoch_anchor_id,
+            &traces,
+            2,
+            1,
+            Some(&live_bits[..255]),
+        );
         let (r1cs, witness) = b.build();
         assert!(r1cs.satisfies(&witness));
     }

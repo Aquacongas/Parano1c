@@ -821,7 +821,7 @@ impl HonestHistoryStepFixtureProvider {
         sealed_block.header.nonce = nonce;
         let end_accumulator = checkpoint
             .start_accumulator
-            .advance(&sealed_block.header)
+            .advance(&checkpoint.parent_header, &sealed_block.header)
             .map_err(|error| format!("advance honest B{TIER} accumulator: {error:?}"))?;
         let context = noid_block::HistoryStepPreparationContext {
             parent_header: &checkpoint.parent_header,
@@ -1497,7 +1497,10 @@ mod honest_history_step_fixture_tests {
         let (block, _) = witness.finish(nonce, &start, &end).unwrap();
         assert_eq!(block.header.height, 1);
         assert_eq!(block.transactions.len(), 1);
-        assert_eq!(block.header.prev_block_hash, genesis.tip_block_id);
+        assert_eq!(
+            block.header.prev_block_hash,
+            noid_chain::hash_block_header(&noid_chain::consensus::genesis_header())
+        );
     }
 
     #[test]
@@ -1615,7 +1618,7 @@ mod honest_history_step_fixture_tests {
         )
         .unwrap();
         assert_eq!(accepted.height(), 1);
-        assert_eq!(accepted.block_id(), terminal.block_id());
+        assert_eq!(accepted.semantic_id(), terminal.semantic_id());
         assert_eq!(accepted.class_id(), c00);
 
         let (_, recursive_input) = next_focused_b8(&mut provider, terminal.accumulator()).unwrap();

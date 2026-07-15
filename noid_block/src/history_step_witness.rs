@@ -120,7 +120,7 @@ impl<const TIER: usize> PreparedHistoryStepInputWitness<TIER> {
             &asert_anchor,
         )?;
         let expected_end = start_accumulator
-            .advance(&template.header)
+            .advance(&parent_header, &template.header)
             .map_err(HistoryStepWitnessError::AccumulatorAdvance)?;
         if end_accumulator != &expected_end {
             return Err(HistoryStepWitnessError::EndAccumulatorMismatch);
@@ -131,6 +131,7 @@ impl<const TIER: usize> PreparedHistoryStepInputWitness<TIER> {
             components,
             authorizations,
             &template.header,
+            &parent_header,
         )?;
         Ok((template, input))
     }
@@ -192,14 +193,14 @@ impl<const TIER: usize> PreparedHistoryStepWitness<TIER> {
         )?;
 
         let expected_end = start_accumulator
-            .advance(&template.header)
+            .advance(&parent_header, &template.header)
             .map_err(HistoryStepWitnessError::AccumulatorAdvance)?;
         if end_accumulator != &expected_end {
             return Err(HistoryStepWitnessError::EndAccumulatorMismatch);
         }
 
         let built = prepared_history_step.seal_nonce(runtime, nonce)?;
-        if built.block_id() != expected_end.tip_block_id || built.nonce() != nonce {
+        if built.semantic_id() != expected_end.tip_semantic_id || built.nonce() != nonce {
             return Err(HistoryStepWitnessError::EndAccumulatorMismatch);
         }
         Ok((template, built))
@@ -235,15 +236,18 @@ pub fn prepare_history_step_witness<const TIER: usize>(
         components,
         authorizations,
     } = native;
-    let placeholder_end = expected_start
-        .advance(&template.header)
+    // The relation is nonce-free: the template advance is already the exact
+    // final boundary for every nonce of this template.
+    let template_end = expected_start
+        .advance(&parent_header, &template.header)
         .map_err(HistoryStepWitnessError::AccumulatorAdvance)?;
     let current = HistoryStepBlockInput::try_new(
         &expected_start,
-        &placeholder_end,
+        &template_end,
         components,
         authorizations,
         &template.header,
+        &parent_header,
     )?;
     let prepared_history_step = prepare_history_step_for_pow(runtime, parent_terminal, current)?;
     Ok(PreparedHistoryStepWitness {
@@ -349,7 +353,7 @@ fn validate_nonce_independent_block(
     block: &Block,
     context: &HistoryStepPreparationContext<'_>,
 ) -> Result<(), HistoryStepWitnessError> {
-    if block.header.prev_block_hash != context.start_accumulator.tip_block_id
+    if block.header.prev_block_hash != noid_chain::hash_block_header(context.parent_header)
         || context
             .start_accumulator
             .height
@@ -369,11 +373,17 @@ fn validate_nonce_independent_block(
             })?;
         }
     }
-    validate_block_epoch_anchors(
-        block,
-        context.start_accumulator.epoch_anchor_id,
-        context.start_accumulator.tip_block_id,
-    )?;
+    let parent_block_id = noid_chain::hash_block_header(context.parent_header);
+    let user_epoch_anchor = if context
+        .start_accumulator
+        .height
+        .is_multiple_of(noid_chain::consensus::params::TX_EPOCH_BLOCKS)
+    {
+        parent_block_id
+    } else {
+        context.start_accumulator.epoch_anchor_id
+    };
+    validate_block_epoch_anchors(block, user_epoch_anchor, parent_block_id)?;
     if block.header.tx_root != compute_tx_root(&block.transactions) {
         return Err(HistoryStepWitnessError::TransactionRootMismatch);
     }

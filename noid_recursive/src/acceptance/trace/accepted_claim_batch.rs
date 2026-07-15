@@ -5,9 +5,12 @@
 //!
 //! There is no rolling chain hash and no accepted-claim digest fold. One
 //! block proof exposes the parent boundary and proves that the header is its
-//! exact child. The child header supplies the new tip, state, depth and
-//! counters directly; the transaction-epoch anchor changes to the child id
-//! exactly when the constrained child height is divisible by 144.
+//! exact child. The child header supplies the new semantic tip, state, depth
+//! and counters directly. The chain link is glued through the parent block
+//! id derived by the caller's parent-seal replay: `child.prev_block_hash`
+//! must equal it, and the transaction-epoch anchor changes to it exactly
+//! when the constrained START (parent) height is divisible by 144 — the
+//! boundary block's own id becomes the anchor only for its children.
 
 use noid_core::Block128;
 use noid_poseidon2b::native::domain::{capacity_iv, DomainTag, TAG_COMPRESS};
@@ -61,7 +64,7 @@ pub fn compress_with_tag_trace(
 
 /// The child-header values consumed by the direct transition.
 pub struct DirectChildWires {
-    pub block_id: [LinExpr; 2],
+    pub semantic_id: [LinExpr; 2],
     pub prev_block_hash: [LinExpr; 2],
     pub state_root: [LinExpr; 2],
     pub height: LinExpr,
@@ -73,7 +76,7 @@ pub struct DirectChildWires {
 /// Accumulator boundary wires (start/end).
 pub struct AccumulatorWires {
     pub height: LinExpr,
-    pub tip_block_id: [LinExpr; 2],
+    pub tip_semantic_id: [LinExpr; 2],
     pub state_root: [LinExpr; 2],
     pub log_slots: LinExpr,
     pub active_slot_count: LinExpr,
@@ -91,7 +94,7 @@ impl AccumulatorWires {
     pub fn from_ordered_lanes(lanes: [LinExpr; CHAIN_ACCUMULATOR_LANES]) -> Self {
         Self {
             height: lanes[0].clone(),
-            tip_block_id: [lanes[1].clone(), lanes[2].clone()],
+            tip_semantic_id: [lanes[1].clone(), lanes[2].clone()],
             state_root: [lanes[3].clone(), lanes[4].clone()],
             log_slots: lanes[5].clone(),
             active_slot_count: lanes[6].clone(),
@@ -104,8 +107,8 @@ impl AccumulatorWires {
     pub fn ordered_lanes(&self) -> [LinExpr; CHAIN_ACCUMULATOR_LANES] {
         [
             self.height.clone(),
-            self.tip_block_id[0].clone(),
-            self.tip_block_id[1].clone(),
+            self.tip_semantic_id[0].clone(),
+            self.tip_semantic_id[1].clone(),
             self.state_root[0].clone(),
             self.state_root[1].clone(),
             self.log_slots.clone(),
@@ -147,34 +150,42 @@ fn pin_u64_successor(b: &mut FieldR1csBuilder, parent_bits: &[Wire], child: &Lin
 }
 
 /// Prove one direct child transition between ten-lane boundaries.
+///
+/// `parent_block_id` is the chain-link id derived by the caller — the
+/// parent-seal `BLOCKHDR` replay in a recursive step, or the pinned genesis
+/// id at the base case. The start semantic tip itself is deliberately not
+/// read here: it is glued to the same parent header by the caller's
+/// parent-seal `SEMHDR` replay (or genesis constants).
 pub fn build_direct_accumulator_transition_slot(
     b: &mut FieldR1csBuilder,
     start: &AccumulatorWires,
     child: &DirectChildWires,
     end: &AccumulatorWires,
+    parent_block_id: &[LinExpr; 2],
 ) {
     let start_height_bits = range_check_boundary_scalars(b, start);
     let _ = range_check_boundary_scalars(b, end);
 
     for lane in 0..2 {
-        pin_eq(b, &child.prev_block_hash[lane], &start.tip_block_id[lane]);
+        pin_eq(b, &child.prev_block_hash[lane], &parent_block_id[lane]);
     }
     pin_u64_successor(b, &start_height_bits, &child.height);
 
     pin_eq(b, &child.height, &end.height);
     for lane in 0..2 {
-        pin_eq(b, &child.block_id[lane], &end.tip_block_id[lane]);
+        pin_eq(b, &child.semantic_id[lane], &end.tip_semantic_id[lane]);
         pin_eq(b, &child.state_root[lane], &end.state_root[lane]);
     }
     pin_eq(b, &child.log_slots, &end.log_slots);
     pin_eq(b, &child.active_slot_count, &end.active_slot_count);
     pin_eq(b, &child.alloc_counter, &end.alloc_counter);
 
-    // `boundary` is derived from the constrained child height, never supplied
-    // independently by the prover.
-    let epoch = constrain_tx_epoch_boundary(b, &child.height);
+    // `boundary` is derived from the constrained START height, never supplied
+    // independently by the prover: the anchor switches to the derived parent
+    // id exactly when the parent is a 144-boundary block.
+    let epoch = constrain_tx_epoch_boundary(b, &start.height);
     for lane in 0..2 {
-        let delta = start.epoch_anchor_id[lane].add(&child.block_id[lane]);
+        let delta = start.epoch_anchor_id[lane].add(&parent_block_id[lane]);
         let selected = start.epoch_anchor_id[lane].add(&mul(b, &epoch.boundary, &delta));
         pin_eq(b, &selected, &end.epoch_anchor_id[lane]);
     }
@@ -188,7 +199,8 @@ mod tests {
 
     #[derive(Clone)]
     struct NativeChild {
-        block_id: [u8; 32],
+        semantic_id: [u8; 32],
+        parent_block_id: [u8; 32],
         prev_block_hash: [u8; 32],
         state_root: [u8; 32],
         height: u64,
@@ -200,16 +212,18 @@ mod tests {
     fn fixture(parent_height: u64) -> (ChainAccumulator, NativeChild, ChainAccumulator) {
         let start = ChainAccumulator {
             height: parent_height,
-            tip_block_id: [0x11; 32],
+            tip_semantic_id: [0x11; 32],
             state_root: [0x22; 32],
             log_slots: 24,
             active_slot_count: 17,
             alloc_counter: 29,
             epoch_anchor_id: [0x33; 32],
         };
+        let parent_block_id = [0x66; 32];
         let child = NativeChild {
-            block_id: [0x44; 32],
-            prev_block_hash: start.tip_block_id,
+            semantic_id: [0x44; 32],
+            parent_block_id,
+            prev_block_hash: parent_block_id,
             state_root: [0x55; 32],
             height: parent_height + 1,
             log_slots: 25,
@@ -218,13 +232,13 @@ mod tests {
         };
         let end = ChainAccumulator {
             height: child.height,
-            tip_block_id: child.block_id,
+            tip_semantic_id: child.semantic_id,
             state_root: child.state_root,
             log_slots: child.log_slots,
             active_slot_count: child.active_slot_count,
             alloc_counter: child.alloc_counter,
-            epoch_anchor_id: if child.height % 144 == 0 {
-                child.block_id
+            epoch_anchor_id: if parent_height % 144 == 0 {
+                parent_block_id
             } else {
                 start.epoch_anchor_id
             },
@@ -232,28 +246,41 @@ mod tests {
         (start, child, end)
     }
 
-    fn alloc_child(b: &mut FieldR1csBuilder, child: &NativeChild) -> DirectChildWires {
-        let block_id = digest_lanes(&child.block_id);
+    fn alloc_child(
+        b: &mut FieldR1csBuilder,
+        child: &NativeChild,
+    ) -> (DirectChildWires, [LinExpr; 2]) {
+        let semantic_id = digest_lanes(&child.semantic_id);
+        let parent_id = digest_lanes(&child.parent_block_id);
         let prev = digest_lanes(&child.prev_block_hash);
         let state = digest_lanes(&child.state_root);
-        DirectChildWires {
-            block_id: block_id.map(|lane| alloc_block(b, lane)),
-            prev_block_hash: prev.map(|lane| alloc_block(b, lane)),
-            state_root: state.map(|lane| alloc_block(b, lane)),
-            height: alloc_block(b, Block128::from(child.height)),
-            log_slots: alloc_block(b, Block128::from(child.log_slots)),
-            active_slot_count: alloc_block(b, Block128::from(child.active_slot_count)),
-            alloc_counter: alloc_block(b, Block128::from(child.alloc_counter)),
-        }
+        (
+            DirectChildWires {
+                semantic_id: semantic_id.map(|lane| alloc_block(b, lane)),
+                prev_block_hash: prev.map(|lane| alloc_block(b, lane)),
+                state_root: state.map(|lane| alloc_block(b, lane)),
+                height: alloc_block(b, Block128::from(child.height)),
+                log_slots: alloc_block(b, Block128::from(child.log_slots)),
+                active_slot_count: alloc_block(b, Block128::from(child.active_slot_count)),
+                alloc_counter: alloc_block(b, Block128::from(child.alloc_counter)),
+            },
+            parent_id.map(|lane| alloc_block(b, lane)),
+        )
     }
 
     fn satisfies(start: &ChainAccumulator, child: &NativeChild, end: &ChainAccumulator) -> bool {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut b = FieldR1csBuilder::new();
             let start = AccumulatorWires::alloc(&mut b, start);
-            let child = alloc_child(&mut b, child);
+            let (child, parent_block_id) = alloc_child(&mut b, child);
             let end = AccumulatorWires::alloc(&mut b, end);
-            build_direct_accumulator_transition_slot(&mut b, &start, &child, &end);
+            build_direct_accumulator_transition_slot(
+                &mut b,
+                &start,
+                &child,
+                &end,
+                &parent_block_id,
+            );
             let (r1cs, witness) = b.build();
             r1cs.satisfies(&witness)
         }))
@@ -289,8 +316,10 @@ mod tests {
         for parent_height in [143, 144] {
             let (start, child, end) = fixture(parent_height);
             assert!(satisfies(&start, &child, &end));
-            let expected = if child.height == 144 {
-                child.block_id
+            // The boundary block 144 itself keeps the previous anchor; the
+            // derived id of parent 144 becomes the anchor for child 145.
+            let expected = if parent_height % 144 == 0 {
+                child.parent_block_id
             } else {
                 start.epoch_anchor_id
             };
@@ -313,21 +342,36 @@ mod tests {
     }
 
     #[test]
-    fn direct_transition_rejects_parent_link_height_and_epoch_mutations() {
+    fn direct_transition_rejects_parent_height_link_and_epoch_mutations() {
+        // Start height drives the successor relation and the epoch boundary.
         let (start, child, end) = fixture(143);
-        for lane in [0usize, 1, 2] {
-            let bad_start = mutate_accumulator_lane(&start, lane);
-            assert!(!satisfies(&bad_start, &child, &end), "start lane {lane}");
-        }
-
-        // At 143→144 the old epoch is intentionally overwritten, so its
-        // lanes are dead for that one transition. They are continuity-critical
-        // again on the following non-boundary step.
-        let (start, child, end) = fixture(144);
+        let bad_start = mutate_accumulator_lane(&start, 0);
+        assert!(!satisfies(&bad_start, &child, &end), "start height lane");
+        // Start semantic-tip lanes are deliberately not read by the
+        // transition: they are glued to the parent header by the caller's
+        // parent-seal replay (or genesis constants at the base case).
         for lane in [8usize, 9] {
             let bad_start = mutate_accumulator_lane(&start, lane);
             assert!(!satisfies(&bad_start, &child, &end), "start lane {lane}");
         }
+
+        // A mismatched chain link against the derived parent id is rejected.
+        let mut unlinked = child.clone();
+        unlinked.prev_block_hash[0] ^= 1;
+        assert!(!satisfies(&start, &unlinked, &end), "prev link");
+
+        // At the 144→145 transition the old epoch is intentionally
+        // overwritten by the derived parent id, so the incoming epoch lanes
+        // are dead for that one step; a consistently re-linked wrong parent
+        // id must still fail the epoch write against the honest end.
+        let (start, child, end) = fixture(144);
+        let mut wrong_parent = child.clone();
+        wrong_parent.parent_block_id[0] ^= 1;
+        wrong_parent.prev_block_hash[0] ^= 1;
+        assert!(
+            !satisfies(&start, &wrong_parent, &end),
+            "epoch from wrong parent id"
+        );
     }
 
     #[test]
@@ -336,8 +380,8 @@ mod tests {
         for target in 0..10 {
             let mut bad = child.clone();
             match target {
-                0 => bad.block_id[0] ^= 1,
-                1 => bad.block_id[17] ^= 1,
+                0 => bad.semantic_id[0] ^= 1,
+                1 => bad.semantic_id[17] ^= 1,
                 2 => bad.prev_block_hash[0] ^= 1,
                 3 => bad.prev_block_hash[17] ^= 1,
                 4 => bad.state_root[0] ^= 1,

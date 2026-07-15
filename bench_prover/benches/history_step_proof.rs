@@ -342,7 +342,7 @@ fn benchmark_tier<const TIER: usize>(
         decode_verify_history_step_terminal(runtime, &encoded, &block.header, &epoch_anchor)
             .map_err(|error| format!("verify honest B{TIER} terminal: {error}"))?;
     let verify_ms = verify_started.elapsed().as_millis();
-    if accepted.class_id() != class || accepted.block_id() != terminal.block_id() {
+    if accepted.class_id() != class || accepted.semantic_id() != terminal.semantic_id() {
         return Err(format!("B{TIER} accepted terminal boundary drift"));
     }
 
@@ -377,7 +377,7 @@ fn run() -> Result<(), String> {
     )
     .map_err(|error| format!("verify B8 benchmark parent: {error}"))?;
     if accepted_parent.class_id() != parent.class_id()
-        || accepted_parent.block_id() != parent.block_id()
+        || accepted_parent.semantic_id() != parent.semantic_id()
     {
         return Err("verified benchmark parent boundary drift".to_owned());
     }

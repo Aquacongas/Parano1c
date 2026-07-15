@@ -20,6 +20,7 @@ use core::fmt;
 use noid_tx::wire::WireError;
 
 use crate::block::Block;
+use crate::block_header::semantic_header_id;
 use crate::consensus::pow::block_id;
 use crate::consensus::wire_limits::{MAX_BLOCK_BYTES, MAX_HISTORY_STEP_TERMINAL_BYTES};
 use crate::history_step::{
@@ -72,7 +73,11 @@ impl AcceptedBlockBundle {
         )?;
         let height = block.header.height;
         let block_hash = block_id(&block.header);
-        validate_terminal_binding(&history_step_terminal_bytes, height, block_hash)?;
+        validate_terminal_binding(
+            &history_step_terminal_bytes,
+            height,
+            semantic_header_id(&block.header),
+        )?;
 
         Ok(Self {
             block_bytes,
@@ -103,7 +108,11 @@ impl AcceptedBlockBundle {
         }
         let height = block.header.height;
         let block_hash = block_id(&block.header);
-        validate_terminal_binding(&history_step_terminal_bytes, height, block_hash)?;
+        validate_terminal_binding(
+            &history_step_terminal_bytes,
+            height,
+            semantic_header_id(&block.header),
+        )?;
 
         Ok(Self {
             block_bytes,
@@ -367,9 +376,13 @@ mod tests {
     fn terminal_for(block: &Block) -> Vec<u8> {
         let mut terminal = Vec::with_capacity(HISTORY_STEP_TERMINAL_BINDING_BYTES + 1);
         terminal.extend_from_slice(
-            &HistoryStepTerminalMetadata::new(block.header.height, block_id(&block.header), 1)
-                .expect("canonical HistoryStep class")
-                .encode_prefix(),
+            &HistoryStepTerminalMetadata::new(
+                block.header.height,
+                semantic_header_id(&block.header),
+                1,
+            )
+            .expect("canonical HistoryStep class")
+            .encode_prefix(),
         );
         terminal.push(0xA5); // opaque recursive proof payload
         terminal
@@ -458,11 +471,11 @@ mod tests {
     fn wrong_terminal_version_is_rejected() {
         let block = block(9);
         let mut wrong_version = terminal_for(&block);
-        wrong_version[0] = 2;
+        wrong_version[0] = 1;
         assert_eq!(
             AcceptedBlockBundle::try_from_parts(block.to_bytes(), wrong_version),
             Err(AcceptedBlockBundleError::HistoryStepMetadata(
-                HistoryStepTerminalMetadataError::UnsupportedVersion { actual: 2 }
+                HistoryStepTerminalMetadataError::UnsupportedVersion { actual: 1 }
             ))
         );
     }
@@ -543,33 +556,57 @@ mod tests {
     /// A terminal whose `semantic_id` does not equal the semantic projection
     /// of the decoded header must be rejected before any state mutation.
     #[test]
-    #[ignore = "v2 phase 1: semantic terminal prefix not implemented"]
     fn terminal_with_mismatched_semantic_id_is_rejected() {
-        unimplemented!("v2 phase 1");
+        let block = block(9);
+        let mut mismatched = terminal_for(&block);
+        mismatched[9] ^= 1;
+        assert_eq!(
+            AcceptedBlockBundle::try_from_parts(block.to_bytes(), mismatched),
+            Err(AcceptedBlockBundleError::TerminalHashMismatch)
+        );
     }
 
     /// A valid terminal replayed under a bundle at a different height must
     /// fail the `(height, semantic_id)` binding.
     #[test]
-    #[ignore = "v2 phase 1: semantic terminal prefix not implemented"]
     fn terminal_reused_under_different_height_is_rejected() {
-        unimplemented!("v2 phase 1");
+        let nine = block(9);
+        let eight = block(8);
+        assert_eq!(
+            AcceptedBlockBundle::try_from_parts(eight.to_bytes(), terminal_for(&nine)),
+            Err(AcceptedBlockBundleError::TerminalHeightMismatch {
+                expected: 8,
+                actual: 9,
+            })
+        );
     }
 
-    /// Altering any semantic header field (state root, tx root, timestamp,
-    /// miner address, counters) changes the recomputed projection and must
-    /// invalidate a terminal minted for the original template.
+    /// Altering any semantic header field changes the recomputed projection
+    /// and must invalidate a terminal minted for the original template.
     #[test]
-    #[ignore = "v2 phase 1: semantic terminal prefix not implemented"]
     fn terminal_reused_under_altered_semantic_field_is_rejected() {
-        unimplemented!("v2 phase 1");
+        let original = block(9);
+        let terminal = terminal_for(&original);
+        let mut altered = original.clone();
+        altered.header.state_root = [0x77; 32];
+        assert_eq!(
+            AcceptedBlockBundle::try_from_parts(altered.to_bytes(), terminal),
+            Err(AcceptedBlockBundleError::TerminalHashMismatch)
+        );
     }
 
     /// Positive: two headers differing only in nonce share one semantic
-    /// projection; one terminal must bind both encodings identically.
+    /// projection; one terminal binds both encodings.
     #[test]
-    #[ignore = "v2 phase 1: semantic terminal prefix not implemented"]
     fn two_nonces_over_one_semantic_id_share_semantics() {
-        unimplemented!("v2 phase 1");
+        let original = block(9);
+        let terminal = terminal_for(&original);
+        let mut renonced = original.clone();
+        renonced.header.nonce = original.header.nonce.wrapping_add(1);
+        let first =
+            AcceptedBlockBundle::try_from_parts(original.to_bytes(), terminal.clone()).unwrap();
+        let second = AcceptedBlockBundle::try_from_parts(renonced.to_bytes(), terminal).unwrap();
+        assert_eq!(first.height(), second.height());
+        assert_ne!(first.block_hash(), second.block_hash());
     }
 }

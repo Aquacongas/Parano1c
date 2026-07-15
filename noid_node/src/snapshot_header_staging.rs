@@ -461,7 +461,7 @@ impl SnapshotHeaderStaging {
                 reason: "staged exact chainwork does not match candidate manifest".into(),
             });
         }
-        let epoch_height = (expected_height / TX_EPOCH_BLOCKS) * TX_EPOCH_BLOCKS;
+        let epoch_height = noid_chain::consensus::tx_epoch_anchor_height_for_child(expected_height);
         let epoch_anchor_header = self.header_at(store, epoch_height)?.ok_or(
             SnapshotHeaderStagingError::InvalidCandidate {
                 height: epoch_height,
@@ -1276,7 +1276,10 @@ mod tests {
         let child_hash = hash_block_header(&child);
         let bundle = noid_chain::AcceptedBlockBundle::try_from_parts(
             block.to_bytes(),
-            fixture_terminal(child.height, child_hash),
+            fixture_terminal(
+                child.height,
+                noid_chain::block_header::semantic_header_id(&child),
+            ),
         )
         .unwrap();
         chain

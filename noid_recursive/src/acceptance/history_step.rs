@@ -7,7 +7,7 @@
 //! recursively verifies the persisted parent terminal. The network stores and
 //! transports only the resulting terminal.
 
-use noid_chain::block_header::{hash_block_header, BlockHeader};
+use noid_chain::block_header::BlockHeader;
 use noid_ivc_core::challenger::FsLaneChallenger;
 use noid_ivc_core::deep_chain::schedule::{compile_duplex, DuplexLayout};
 use noid_ivc_core::field::F128;
@@ -28,8 +28,10 @@ use noid_ivc_prover::field_prover::{
 
 use super::block_slots::{
     build_block_slots_selected_zk, build_block_slots_selected_zk_prefix,
-    finalize_selected_zk_block_region, SelectedZkBlockSlotsAssembly,
+    finalize_selected_zk_block_region, ParentSealTrace, SelectedZkBlockSlotsAssembly,
 };
+use super::trace::accepted_claim_batch::digest_lanes;
+use super::trace::flat_of;
 use super::trace::matrix_fold::{
     verify_matrix_claim_fold_trace, MatrixAccClaimTrace, MatrixFoldProofTrace,
 };
@@ -221,7 +223,8 @@ pub struct HistoryStepBlockInput<const TIER: usize> {
     components: HistoryStepBlockComponents,
     authorization: PreparedSelectedZkAuthorizations,
     sealed_header: BlockHeader,
-    block_id: [u8; 32],
+    parent_header: BlockHeader,
+    semantic_id: [u8; 32],
 }
 
 impl<const TIER: usize> HistoryStepBlockInput<TIER> {
@@ -231,6 +234,7 @@ impl<const TIER: usize> HistoryStepBlockInput<TIER> {
         components: HistoryStepBlockComponents,
         authorizations: PreparedHistoryStepAuthorizations,
         sealed_header: &BlockHeader,
+        parent_header: &BlockHeader,
     ) -> Result<Self, HistoryStepInputError> {
         if crate::region_sidecar::selected_zk_block_geometry(TIER).is_none() {
             return Err(HistoryStepInputError::NonCanonicalTier { tier: TIER });
@@ -256,15 +260,20 @@ impl<const TIER: usize> HistoryStepBlockInput<TIER> {
         {
             return Err(HistoryStepInputError::ComponentShape);
         }
-        let block_id = hash_block_header(sealed_header);
-        if end_accumulator.height != sealed_header.height
-            || end_accumulator.tip_block_id != block_id
-            || end_accumulator.state_root != sealed_header.state_root
-            || end_accumulator.log_slots != sealed_header.log_slots
-            || end_accumulator.active_slot_count != sealed_header.active_slot_count
-            || end_accumulator.alloc_counter != sealed_header.alloc_counter
-            || start_accumulator.tip_block_id != sealed_header.prev_block_hash
+        let semantic_id = noid_chain::block_header::semantic_header_id(sealed_header);
+        // The complete parent glue: the end boundary must be the exact
+        // parent-headed advance of the start boundary — this covers the
+        // semantic tip, the chain link, the height successor and the shifted
+        // epoch-anchor rule in one place.
+        if start_accumulator
+            .advance(parent_header, sealed_header)
+            .ok()
+            .as_ref()
+            != Some(end_accumulator)
         {
+            return Err(HistoryStepInputError::SealedHeaderMismatch);
+        }
+        if end_accumulator.tip_semantic_id != semantic_id {
             return Err(HistoryStepInputError::SealedHeaderMismatch);
         }
         Ok(Self {
@@ -273,7 +282,8 @@ impl<const TIER: usize> HistoryStepBlockInput<TIER> {
             components,
             authorization: authorizations.inner,
             sealed_header: *sealed_header,
-            block_id,
+            parent_header: *parent_header,
+            semantic_id,
         })
     }
 
@@ -289,8 +299,12 @@ impl<const TIER: usize> HistoryStepBlockInput<TIER> {
         &self.end_accumulator
     }
 
-    pub fn block_id(&self) -> [u8; 32] {
-        self.block_id
+    pub fn parent_header(&self) -> &BlockHeader {
+        &self.parent_header
+    }
+
+    pub fn semantic_id(&self) -> [u8; 32] {
+        self.semantic_id
     }
 }
 

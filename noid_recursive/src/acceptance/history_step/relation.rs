@@ -380,9 +380,11 @@ pub fn derive_history_step_direct_block_vk<const TIER: usize>(
         components,
         authorization,
         sealed_header,
+        parent_header,
         ..
     } = current;
     let mut builder = FieldR1csBuilder::new();
+    let parent_seal = ParentSealTrace::alloc(&mut builder, &parent_header);
     let assembly = build_block_slots_selected_zk(
         &mut builder,
         &start_accumulator,
@@ -391,6 +393,8 @@ pub fn derive_history_step_direct_block_vk<const TIER: usize>(
         &sealed_header,
         TIER,
         authorization,
+        &parent_header,
+        &parent_seal.block_id,
     );
     Ok(assembly.region_vk().clone())
 }
@@ -662,7 +666,7 @@ pub struct BuiltHistoryStep {
     pcs_params: PcsParams,
     useful_rows: usize,
     class_id: CanonicalHistoryStepClassId,
-    block_id: [u8; 32],
+    semantic_id: [u8; 32],
     nonce: u128,
     preparations: HistoryStepPreparations,
 }
@@ -676,8 +680,8 @@ impl BuiltHistoryStep {
         self.class_id
     }
 
-    pub const fn block_id(&self) -> [u8; 32] {
-        self.block_id
+    pub const fn semantic_id(&self) -> [u8; 32] {
+        self.semantic_id
     }
 
     pub const fn nonce(&self) -> u128 {
@@ -753,7 +757,7 @@ impl HistoryStepProof {
 /// Persisted atomic history authority for exactly one accepted block.
 pub struct HistoryStepTerminal {
     pub(super) height: u64,
-    pub(super) block_id: [u8; 32],
+    pub(super) semantic_id: [u8; 32],
     pub(super) class_id: CanonicalHistoryStepClassId,
     pub(super) accumulator: ChainAccumulator,
     pub(super) proof: HistoryStepProof,
@@ -769,7 +773,7 @@ impl HistoryStepTerminal {
         let accumulator = history_step_bank_block_accumulator(runtime.bank(), &proof.io)?;
         Ok(Self {
             height: accumulator.height,
-            block_id: accumulator.tip_block_id,
+            semantic_id: accumulator.tip_semantic_id,
             class_id,
             accumulator,
             proof,
@@ -784,8 +788,8 @@ impl HistoryStepTerminal {
         self.height
     }
 
-    pub const fn block_id(&self) -> [u8; 32] {
-        self.block_id
+    pub const fn semantic_id(&self) -> [u8; 32] {
+        self.semantic_id
     }
 
     pub const fn class_id(&self) -> CanonicalHistoryStepClassId {
@@ -810,7 +814,7 @@ pub(super) fn validate_terminal_metadata(
     let accumulator = history_step_bank_block_accumulator(runtime.bank(), &terminal.proof.io)?;
     let base = terminal.proof.io[runtime.bank().layout().base] == F128::ONE;
     if terminal.height != accumulator.height
-        || terminal.block_id != accumulator.tip_block_id
+        || terminal.semantic_id != accumulator.tip_semantic_id
         || terminal.accumulator != accumulator
         || terminal.height == 0
         || base != (terminal.height == 1)
@@ -830,7 +834,7 @@ pub(super) fn validate_terminal_metadata(
 #[must_use = "accepted HistoryStep authority must be consumed by block application"]
 pub struct AcceptedHistoryStepTerminal {
     height: u64,
-    block_id: [u8; 32],
+    semantic_id: [u8; 32],
     class_id: CanonicalHistoryStepClassId,
     accumulator: ChainAccumulator,
 }
@@ -840,8 +844,8 @@ impl AcceptedHistoryStepTerminal {
         self.height
     }
 
-    pub const fn block_id(&self) -> [u8; 32] {
-        self.block_id
+    pub const fn semantic_id(&self) -> [u8; 32] {
+        self.semantic_id
     }
 
     pub const fn class_id(&self) -> CanonicalHistoryStepClassId {
@@ -1572,7 +1576,7 @@ pub fn verify_history_step_terminal(
     }
     Ok(AcceptedHistoryStepTerminal {
         height: terminal.height,
-        block_id: terminal.block_id,
+        semantic_id: terminal.semantic_id,
         class_id: terminal.class_id,
         accumulator,
     })
@@ -1688,6 +1692,7 @@ pub struct PreparedHistoryStepForPow<const TIER: usize> {
     assembly: PreparedHistoryStepAssembly,
     template_header: BlockHeader,
     start_accumulator: ChainAccumulator,
+    parent_header: BlockHeader,
 }
 
 fn prepare_history_step_assembly<const TIER: usize>(
@@ -1777,8 +1782,13 @@ fn prepare_history_step_assembly<const TIER: usize>(
         components,
         authorization,
         sealed_header,
-        block_id: _,
+        parent_header,
+        semantic_id: _,
     } = current;
+    // Parent seal: replay the exact parent header under both header domains.
+    // Fixed geometry, so it lives inside the class-independent prefix. Its
+    // glue pins land after the parent public IO is allocated below.
+    let parent_seal = ParentSealTrace::alloc(&mut builder, &parent_header);
     let block_assembly: SelectedZkBlockSlotsAssembly = build_block_slots_selected_zk_prefix(
         &mut builder,
         &start_accumulator,
@@ -1787,8 +1797,17 @@ fn prepare_history_step_assembly<const TIER: usize>(
         &sealed_header,
         TIER,
         authorization,
+        &parent_header,
+        &parent_seal.block_id,
     );
     let block_slots = block_assembly.slots();
+    // The parent header witness sits at the accumulator start height in both
+    // the base and the recursive case.
+    pin_eq(
+        &mut builder,
+        &parent_seal.height,
+        &block_slots.start_acc.height,
+    );
 
     let prev_root = alloc_flat_digest(&mut builder, &envelope.commitment.root);
     let prev_io = envelope
@@ -1978,6 +1997,38 @@ fn prepare_history_step_assembly<const TIER: usize>(
         HistoryStepError::sidecar(HistoryStepSidecarOperation::FinalizeParentRegion, source)
     })?;
 
+    // Parent-seal glue. Recursive case: the replayed header must project to
+    // the verified parent terminal tip (semantic lanes of the parent public
+    // IO). Base case: the header witness must be the exact canonical genesis
+    // header, pinned through both derived ids.
+    {
+        let genesis = noid_chain::consensus::genesis_header();
+        let genesis_id = digest_lanes(&noid_chain::hash_block_header(&genesis));
+        let genesis_semantic =
+            digest_lanes(&noid_chain::block_header::semantic_header_id(&genesis));
+        for lane in 0..2 {
+            with_pin_gate(&parent_gate, || {
+                pin_eq(
+                    &mut builder,
+                    &parent_seal.semantic_id[lane],
+                    &prev_io[layout.block_accumulator + 1 + lane],
+                );
+            });
+            with_pin_gate(&io_cells[layout.base], || {
+                pin_eq(
+                    &mut builder,
+                    &parent_seal.block_id[lane],
+                    &LinExpr::constant(flat_of(genesis_id[lane])),
+                );
+                pin_eq(
+                    &mut builder,
+                    &parent_seal.semantic_id[lane],
+                    &LinExpr::constant(flat_of(genesis_semantic[lane])),
+                );
+            });
+        }
+    }
+
     let genesis_lanes = block_acc_lanes(&genesis_accumulator());
     for (index, start) in block_slots.start_acc.ordered_lanes().iter().enumerate() {
         with_pin_gate(&parent_gate, || {
@@ -2099,7 +2150,7 @@ fn finish_history_step_assembly<const TIER: usize>(
                 pcs_params,
                 useful_rows: used,
                 class_id: current_class,
-                block_id: noid_chain::hash_block_header(sealed_header),
+                semantic_id: noid_chain::block_header::semantic_header_id(sealed_header),
                 nonce: sealed_header.nonce,
                 preparations,
             };
@@ -2201,6 +2252,7 @@ pub fn prepare_history_step_for_pow<const TIER: usize>(
     }
     let template_header = *current.sealed_header();
     let start_accumulator = current.start_accumulator().clone();
+    let parent_header = *current.parent_header();
     let prepared_parent = match parent {
         Some(parent) => prepare_history_step_recursive(
             runtime,
@@ -2219,6 +2271,7 @@ pub fn prepare_history_step_for_pow<const TIER: usize>(
         assembly,
         template_header,
         start_accumulator,
+        parent_header,
     })
 }
 
@@ -2239,10 +2292,11 @@ impl<const TIER: usize> PreparedHistoryStepForPow<TIER> {
             assembly,
             mut template_header,
             start_accumulator,
+            parent_header,
         } = self;
         template_header.nonce = nonce;
         let end_accumulator = start_accumulator
-            .advance(&template_header)
+            .advance(&parent_header, &template_header)
             .map_err(|_| HistoryStepError::StagedSeal)?;
         match finish_history_step_assembly::<TIER>(
             runtime,
@@ -2373,7 +2427,7 @@ mod tests {
     /// equal the child header's `prev_block_hash`; a mismatched witness
     /// header must be unsatisfiable.
     #[test]
-    #[ignore = "v2 phase 1: parent-seal sub-relation not implemented"]
+    #[ignore = "v2 phase 1 gate: needs regenerated pack fixtures (gadget-level twin is green)"]
     fn parent_seal_replay_rejects_wrong_prev_block_hash() {
         unimplemented!("v2 phase 1");
     }
@@ -2382,7 +2436,7 @@ mod tests {
     /// updated from the block id derived inside the parent-seal replay, and
     /// passed through unchanged at every other height (143 -> 144 edge).
     #[test]
-    #[ignore = "v2 phase 1: parent-seal sub-relation not implemented"]
+    #[ignore = "v2 phase 1 gate: needs regenerated pack fixtures (gadget-level twin is green)"]
     fn epoch_lane_updates_from_derived_parent_id_at_boundary() {
         unimplemented!("v2 phase 1");
     }
@@ -2391,7 +2445,7 @@ mod tests {
     /// genesis header/id; any other parent must be unsatisfiable under the
     /// gated parent obligations.
     #[test]
-    #[ignore = "v2 phase 1: semantic base-case selector not implemented"]
+    #[ignore = "v2 phase 1 gate: needs regenerated pack fixtures (gadget-level twin is green)"]
     fn base_case_selector_rejects_non_genesis_parent() {
         unimplemented!("v2 phase 1");
     }

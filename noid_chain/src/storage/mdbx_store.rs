@@ -373,21 +373,21 @@ fn rewind_retained_payload_prune_watermark(
     Ok(())
 }
 
-fn history_step_terminal_prefix_matches(bytes: &[u8], height: u64, block_hash: [u8; 32]) -> bool {
+fn history_step_terminal_prefix_matches(bytes: &[u8], height: u64, semantic_id: [u8; 32]) -> bool {
     history_step_terminal_metadata(bytes).is_some_and(|(actual_height, actual_hash, _)| {
-        actual_height == height && actual_hash == block_hash
+        actual_height == height && actual_hash == semantic_id
     })
 }
 
 fn history_step_terminal_matches_class(
     bytes: &[u8],
     height: u64,
-    block_hash: [u8; 32],
+    semantic_id: [u8; 32],
     class_slot: usize,
 ) -> bool {
     history_step_terminal_metadata(bytes).is_some_and(
         |(actual_height, actual_hash, actual_slot)| {
-            actual_height == height && actual_hash == block_hash && actual_slot == class_slot
+            actual_height == height && actual_hash == semantic_id && actual_slot == class_slot
         },
     )
 }
@@ -419,13 +419,13 @@ fn read_history_step_terminal(
 ) -> Result<Option<Vec<u8>>, StoreError> {
     let headers = txn.open_table(Some(T_HEADERS))?;
     let header_raw: Option<Vec<u8>> = txn.get(&headers, &u64_key(height))?;
-    if header_raw
-        .as_deref()
-        .and_then(canonical_hash_from_encoded_header)
-        != Some(block_hash)
-    {
+    let Some(header) = header_raw.as_deref().and_then(decode_header) else {
+        return Ok(None);
+    };
+    if crate::block_header::block_id(&header) != block_hash {
         return Ok(None);
     }
+    let semantic_id = crate::block_header::semantic_header_id(&header);
 
     let terminals = txn.open_table(Some(T_HISTORY_STEP_TERMINALS))?;
     let Some(ObjectLength(length)) = txn.get(&terminals, &u64_key(height))? else {
@@ -439,7 +439,7 @@ fn read_history_step_terminal(
     let bytes: Vec<u8> = txn
         .get(&terminals, &u64_key(height))?
         .ok_or(StoreError::Decode("HistoryStep terminal disappeared"))?;
-    if bytes.len() != length || !history_step_terminal_prefix_matches(&bytes, height, block_hash) {
+    if bytes.len() != length || !history_step_terminal_prefix_matches(&bytes, height, semantic_id) {
         return Err(StoreError::Decode(
             "HistoryStep terminal does not match its canonical boundary",
         ));
@@ -1856,7 +1856,7 @@ impl MdbxStore {
             if !history_step_terminal_matches_class(
                 bundle.history_step_terminal_bytes(),
                 header.height,
-                *hash,
+                crate::block_header::semantic_header_id(header),
                 expected_class,
             ) {
                 return Err(StoreError::Decode(
@@ -2498,7 +2498,7 @@ impl MdbxStore {
                 if !history_step_terminal_matches_class(
                     bundle.history_step_terminal_bytes(),
                     staged.header.height,
-                    staged.hash,
+                    crate::block_header::semantic_header_id(&staged.header),
                     expected_class,
                 ) {
                     return Err(StoreError::Decode(
@@ -2886,7 +2886,11 @@ mod tests {
         let hash = crate::hash_block_header(&block.header);
         let bundle = crate::AcceptedBlockBundle::try_from_parts(
             block.to_bytes(),
-            terminal(block.header.height, hash, 0),
+            terminal(
+                block.header.height,
+                crate::block_header::semantic_header_id(&block.header),
+                0,
+            ),
         )
         .unwrap();
         let tx_hashes = block
@@ -2926,9 +2930,11 @@ mod tests {
         let (genesis, genesis_meta) = commit_genesis(&store);
         let block = block(&genesis, 1, 7);
         let hash = crate::hash_block_header(&block.header);
-        let bundle =
-            crate::AcceptedBlockBundle::try_from_parts(block.to_bytes(), terminal(1, hash, 0))
-                .unwrap();
+        let bundle = crate::AcceptedBlockBundle::try_from_parts(
+            block.to_bytes(),
+            terminal(1, crate::block_header::semantic_header_id(&block.header), 0),
+        )
+        .unwrap();
         let tx_hashes = [block.transactions[0].txid()];
         let meta = ConsensusMeta {
             tip_height: 1,
@@ -3008,7 +3014,11 @@ mod tests {
         for height in 1..=tip {
             let candidate = block(&parent, height, height as u8);
             let hash = crate::hash_block_header(&candidate.header);
-            let terminal = terminal(height, hash, 0);
+            let terminal = terminal(
+                height,
+                crate::block_header::semantic_header_id(&candidate.header),
+                0,
+            );
             crate::AcceptedBlockBundle::try_from_parts(candidate.to_bytes(), terminal.clone())
                 .unwrap();
             put_test_header_row(&store, &candidate.header);
@@ -3083,7 +3093,11 @@ mod tests {
         let meta = target_meta(&source);
         let target = source.target_record();
         let staging = finalized_empty_snapshot(staging_root.path(), target.header);
-        let terminal_bytes = terminal(target.header.height, target.hash, 0);
+        let terminal_bytes = terminal(
+            target.header.height,
+            crate::block_header::semantic_header_id(&target.header),
+            0,
+        );
         let boundary = crate::storage::VerifiedSnapshotBoundary::new_verified(
             target.header,
             terminal_bytes.clone(),
@@ -3122,7 +3136,11 @@ mod tests {
         let staging = finalized_empty_snapshot(staging_root.path(), target.header);
         let boundary = crate::storage::VerifiedSnapshotBoundary::new_verified(
             target.header,
-            terminal(target.header.height, target.hash, 0),
+            terminal(
+                target.header.height,
+                crate::block_header::semantic_header_id(&target.header),
+                0,
+            ),
         );
         let recent = source.recent.clone();
 
@@ -3151,7 +3169,11 @@ mod tests {
         let staging = finalized_empty_snapshot(staging_root.path(), target.header);
         let boundary = crate::storage::VerifiedSnapshotBoundary::new_verified(
             target.header,
-            terminal(target.header.height, target.hash, 0),
+            terminal(
+                target.header.height,
+                crate::block_header::semantic_header_id(&target.header),
+                0,
+            ),
         );
         let recent = source.recent.clone();
 
@@ -3181,7 +3203,11 @@ mod tests {
         let staging = finalized_empty_snapshot(staging_root.path(), target.header);
         let boundary = crate::storage::VerifiedSnapshotBoundary::new_verified(
             target.header,
-            terminal(target.header.height, target.hash, 0),
+            terminal(
+                target.header.height,
+                crate::block_header::semantic_header_id(&target.header),
+                0,
+            ),
         );
         let recent = source.recent.clone();
 

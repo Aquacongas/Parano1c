@@ -533,7 +533,9 @@ impl MdbxChainContext {
             .map_err(|_| {
             MdbxContextError::Corrupt("durable non-genesis tip history terminal is malformed")
         })?;
-        if metadata.terminal_height() != tip_header.height || metadata.terminal_hash() != tip_hash {
+        if metadata.terminal_height() != tip_header.height
+            || metadata.terminal_hash() != crate::block_header::semantic_header_id(tip_header)
+        {
             return Err(MdbxContextError::Corrupt(
                 "durable non-genesis tip history terminal binding mismatch",
             ));
@@ -846,12 +848,7 @@ impl MdbxChainContext {
         &self,
         current_header: &BlockHeader,
     ) -> Result<BlockHeader, MdbxContextError> {
-        let epoch_anchor_height = (current_header.height / TX_EPOCH_BLOCKS) * TX_EPOCH_BLOCKS;
-        if epoch_anchor_height == current_header.height {
-            // A boundary block advances the accepted-history accumulator to
-            // itself. It is not in MDBX until terminal verification succeeds.
-            return Ok(*current_header);
-        }
+        let epoch_anchor_height = tx_epoch_anchor_height_for_child(current_header.height);
         match self.recent_headers.get(&epoch_anchor_height) {
             Some(header) => Ok(*header),
             None => {
@@ -1026,7 +1023,7 @@ impl MdbxChainContext {
             ));
         }
         let height = block.header.height;
-        let current_hash = block_id(&block.header);
+        let current_semantic = crate::block_header::semantic_header_id(&block.header);
         let terminal_metadata = crate::history_step::HistoryStepTerminalMetadata::decode_prefix(
             history_step_terminal_bytes,
         )
@@ -1036,7 +1033,7 @@ impl MdbxChainContext {
             )))
         })?;
         if terminal_metadata.terminal_height() != height
-            || terminal_metadata.terminal_hash() != current_hash
+            || terminal_metadata.terminal_hash() != current_semantic
         {
             return Err(MdbxContextError::Consensus(
                 ConsensusError::BadHistoryStepTerminal(
@@ -1595,10 +1592,8 @@ impl MdbxChainContext {
                 "snapshot boundary header metadata is invalid",
             ));
         }
-        let expected_epoch_height = (header.height / TX_EPOCH_BLOCKS) * TX_EPOCH_BLOCKS;
-        if epoch_anchor_header.height != expected_epoch_height
-            || (expected_epoch_height == header.height && epoch_anchor_header != header)
-        {
+        let expected_epoch_height = tx_epoch_anchor_height_for_child(header.height);
+        if epoch_anchor_header.height != expected_epoch_height {
             return Err(MdbxContextError::Corrupt(
                 "snapshot boundary epoch anchor is invalid",
             ));
@@ -1621,7 +1616,7 @@ impl MdbxChainContext {
             )))
         })?;
         if terminal_metadata.terminal_height() != header.height
-            || terminal_metadata.terminal_hash() != hash
+            || terminal_metadata.terminal_hash() != crate::block_header::semantic_header_id(&header)
         {
             return Err(MdbxContextError::Consensus(
                 ConsensusError::BadHistoryStepTerminal(
@@ -1899,7 +1894,7 @@ mod tests {
         let block = template.into_block(0);
         let mut terminal = crate::history_step::HistoryStepTerminalMetadata::new(
             block.header.height,
-            block_id(&block.header),
+            crate::block_header::semantic_header_id(&block.header),
             0,
         )
         .unwrap()

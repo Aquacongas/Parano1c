@@ -1641,7 +1641,7 @@ mod tests {
         let bank = PinnedHistoryStepClassBank::validate(test_pins()).unwrap();
         let first_accumulator = crate::accumulator::genesis_accumulator();
         let mut second_accumulator = first_accumulator.clone();
-        second_accumulator.tip_block_id = [0xA5; 32];
+        second_accumulator.tip_semantic_id = [0xA5; 32];
         second_accumulator.epoch_anchor_id = [0x5A; 32];
         let class = CanonicalHistoryStepClassId::new(0, 0).unwrap();
         let canonical = history_step_bank_base_output_io(&bank, class, &first_accumulator).unwrap();
@@ -1712,7 +1712,7 @@ mod tests {
         let matrix = HistoryStepMatrixLease::resident(matrix);
         let first_accumulator = crate::accumulator::genesis_accumulator();
         let mut second_accumulator = first_accumulator.clone();
-        second_accumulator.tip_block_id = [0xA5; 32];
+        second_accumulator.tip_semantic_id = [0xA5; 32];
         second_accumulator.epoch_anchor_id = [0x5A; 32];
 
         let first = route_carry_and_fold_history_step_lane_canonical(

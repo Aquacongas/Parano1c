@@ -3,7 +3,7 @@
 
 //! Canonical v1 terminal wire codec.
 //!
-//! Prefix (42 bytes): `version:u8 || height:u64-le || block_id:[u8;32] ||
+//! Prefix (42 bytes): `version:u8 || height:u64-le || semantic_id:[u8;32] ||
 //! class_id:u8`. The remaining proof shape is derived entirely from the
 //! authenticated class/runtime. No vector lengths or serde representation
 //! occur on this wire.
@@ -516,7 +516,7 @@ pub fn encode_history_step_terminal(
     let mut out = Vec::with_capacity(expected);
     out.push(HISTORY_STEP_WIRE_VERSION);
     out.extend_from_slice(&terminal.height.to_le_bytes());
-    out.extend_from_slice(&terminal.block_id);
+    out.extend_from_slice(&terminal.semantic_id);
     out.push(terminal.class_id.wire_id());
     put_hash(&mut out, &terminal.proof.commitment.root);
     encode_f128_vec(&mut out, &terminal.proof.io, runtime.bank().spec().io_len)?;
@@ -552,7 +552,7 @@ pub fn decode_history_step_terminal(
         return Err(HistoryStepError::WireVersion);
     }
     let height = prefix.u64()?;
-    let block_id = prefix.hash()?;
+    let semantic_id = prefix.hash()?;
     let class_id = CanonicalHistoryStepClassId::from_index(prefix.u8()? as usize)
         .ok_or(HistoryStepError::InvalidClass)?;
     prefix.finish()?;
@@ -600,7 +600,7 @@ pub fn decode_history_step_terminal(
     let accumulator = history_step_bank_block_accumulator(runtime.bank(), &proof.io)?;
     let terminal = HistoryStepTerminal {
         height,
-        block_id,
+        semantic_id,
         class_id,
         accumulator,
         proof,

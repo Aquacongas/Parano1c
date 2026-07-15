@@ -31,6 +31,7 @@ enum PreparedWitness {
 pub struct PreparedBlockAttempt {
     witness: PreparedWitness,
     start_accumulator: noid_recursive::ChainAccumulator,
+    parent_header: noid_chain::BlockHeader,
     expected_parent_id: [u8; 32],
     expected_parent_height: u64,
     payload_weight: usize,
@@ -74,7 +75,7 @@ fn accumulator_from_header_boundary(
 ) -> noid_recursive::ChainAccumulator {
     noid_recursive::ChainAccumulator {
         height: header.height,
-        tip_block_id: block_id(header),
+        tip_semantic_id: noid_chain::block_header::semantic_header_id(header),
         state_root: header.state_root,
         log_slots: header.log_slots,
         active_slot_count: header.active_slot_count,
@@ -203,6 +204,7 @@ impl PreparedBlockAttempt {
         Ok(Self {
             witness,
             start_accumulator,
+            parent_header: parent,
             expected_parent_id,
             expected_parent_height,
             payload_weight,
@@ -256,7 +258,7 @@ impl PreparedBlockAttempt {
         validate_pow(&sealed_header).map_err(|error| format!("proof of work: {error}"))?;
         let end = self
             .start_accumulator
-            .advance(&sealed_header)
+            .advance(&self.parent_header, &sealed_header)
             .map_err(|error| format!("sealed accumulator transition failed: {error:?}"))?;
         let start = &self.start_accumulator;
 

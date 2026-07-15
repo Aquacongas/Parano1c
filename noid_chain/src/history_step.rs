@@ -8,7 +8,7 @@
 
 use core::fmt;
 
-pub const HISTORY_STEP_TERMINAL_VERSION: u8 = 1;
+pub const HISTORY_STEP_TERMINAL_VERSION: u8 = 2;
 pub const HISTORY_STEP_TERMINAL_BINDING_BYTES: usize = 1 + 8 + 32 + 1;
 pub const HISTORY_STEP_TIER_SLOT_COUNT: u8 = 4;
 pub const HISTORY_STEP_CLASS_COUNT: u8 =

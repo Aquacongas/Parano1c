@@ -354,7 +354,7 @@ mod tests {
         let mut terminal = Vec::new();
         terminal.extend_from_slice(&noid_chain::HISTORY_STEP_TERMINAL_VERSION.to_le_bytes());
         terminal.extend_from_slice(&height.to_le_bytes());
-        terminal.extend_from_slice(&noid_chain::block_id(&block.header));
+        terminal.extend_from_slice(&noid_chain::block_header::semantic_header_id(&block.header));
         terminal.push(1);
         terminal.push(0xA5);
         AcceptedBlockBundle::try_from_parts(block.to_bytes(), terminal).unwrap()
