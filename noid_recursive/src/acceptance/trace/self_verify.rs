@@ -1660,11 +1660,32 @@ pub fn basefold_verify_trace(
 
 /// A `pcs::QuirkyDirectClaim` as expressions (the claim point comes from
 /// replayed sub-protocol challenges; only the value is fresh proof data).
+#[derive(Clone)]
 pub struct QuirkyDirectClaimTrace {
     pub z_skip: LinExpr,
     pub k_skip: usize,
     pub x_rest: Vec<LinExpr>,
     pub value: LinExpr,
+}
+
+/// The canonical dead-variant anchor claim: the committed IO slice evaluated
+/// at the all-zero window point, which is exactly `io[0]` (the slice start
+/// has zero low index bits).  True for every honestly bound envelope, so
+/// banked verifier compositions can pad their claim stream with claims whose
+/// native lane values never depend on the disabled variant.
+pub fn io_anchor_claim(
+    spec: &noid_ivc_core::public_io::PublicIoSpec,
+    io0: F128,
+    total_vars: usize,
+) -> pcs::QuirkyDirectClaim {
+    let mut x_rest = vec![F128::ZERO; spec.io_slice.log2_len];
+    x_rest.extend(spec.io_slice.prefix_coords(total_vars));
+    pcs::QuirkyDirectClaim {
+        z_skip: F128::ZERO,
+        k_skip: 0,
+        x_rest,
+        value: io0,
+    }
 }
 
 /// Opaque recursive-trace capability for a causally post-commit auxiliary
@@ -1736,10 +1757,49 @@ impl<'a, C> FieldPostCommitTraceContext<'a, C> {
         Self::new(commitment_root, total_vars, channel)
     }
 
-    /// Adopt a finished child context's claims into this context's sink (the
-    /// enclosing proof's shared PCS batch), preserving order.
-    pub(crate) fn adopt_child_claims<C2>(&mut self, child: FieldPostCommitTraceContext<'_, C2>) {
-        self.claims.extend(child.finish());
+    /// Drain a banked variant's child claims into this sink while keeping the
+    /// batch shape independent of which variant is live.  Every child claim
+    /// gets a freshly allocated wire mirror of its own constant/wire
+    /// coordinate pattern (so both arms cost identical wires and rows): the
+    /// live arm adopts the real claims and discards the mirrors, the dead arm
+    /// adopts the mirrors — witnessed to the caller's anchor claim, whose
+    /// truth the shared batched opening then enforces — and discards the
+    /// unprovable walk claims.
+    pub(crate) fn adopt_child_claims_banked<C2>(
+        &mut self,
+        b: &mut FieldR1csBuilder,
+        child: FieldPostCommitTraceContext<'_, C2>,
+        anchor: &pcs::QuirkyDirectClaim,
+        live: bool,
+    ) {
+        let claims = child.finish();
+        for claim in claims {
+            debug_assert_eq!(claim.k_skip, anchor.k_skip, "banked claim skip window");
+            debug_assert_eq!(
+                claim.x_rest.len(),
+                anchor.x_rest.len(),
+                "banked claim point arity"
+            );
+            let x_rest = claim
+                .x_rest
+                .iter()
+                .zip(anchor.x_rest.iter())
+                .map(|(coordinate, &value)| {
+                    if coordinate.is_const() {
+                        LinExpr::constant(value)
+                    } else {
+                        LinExpr::from_wire(b.alloc_f128(value))
+                    }
+                })
+                .collect();
+            let mirror = QuirkyDirectClaimTrace {
+                z_skip: LinExpr::constant(anchor.z_skip),
+                k_skip: anchor.k_skip,
+                x_rest,
+                value: LinExpr::from_wire(b.alloc_f128(anchor.value)),
+            };
+            self.claims.push(if live { claim } else { mirror });
+        }
     }
 }
 

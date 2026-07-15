@@ -315,14 +315,11 @@ impl HistoryStepParentGeometry {
         self.child_layouts.len()
     }
 
-    pub(crate) fn child_layout(&self, slot: usize) -> Option<&DuplexLayout> {
-        self.child_layouts.get(slot)
-    }
-
     pub(crate) fn r_prev_layout(&self, slot: usize) -> Option<&DuplexLayout> {
         self.r_prev_layouts.get(slot)
     }
 
+    #[cfg(test)]
     pub(crate) fn child_block_index(&self, slot: usize) -> usize {
         debug_assert!(slot < self.tier_count());
         slot
@@ -354,41 +351,44 @@ impl HistoryStepParentGeometry {
     fn recording_union(
         &self,
         active_slot: usize,
-        child: &LayoutRecordedChannel,
+        children: &[LayoutRecordedChannel],
         r_prev: &LayoutRecordedChannel,
     ) -> Result<DuplexUnion, RegionSidecarError> {
-        let expected_child = self
-            .child_layout(active_slot)
-            .ok_or(RegionSidecarError::BadVk)?;
+        if children.len() != self.tier_count() {
+            return Err(RegionSidecarError::UnsupportedVkShape);
+        }
+        for (child, expected) in children.iter().zip(self.child_layouts.iter()) {
+            if &child.layout != expected || child.data_flat.len() != expected.n_data {
+                return Err(RegionSidecarError::UnsupportedVkShape);
+            }
+        }
         let expected_r_prev = self
             .r_prev_layout(active_slot)
             .ok_or(RegionSidecarError::BadVk)?;
-        if &child.layout != expected_child
-            || &r_prev.layout != expected_r_prev
-            || child.data_flat.len() != expected_child.n_data
-            || r_prev.data_flat.len() != expected_r_prev.n_data
-        {
+        if &r_prev.layout != expected_r_prev || r_prev.data_flat.len() != expected_r_prev.n_data {
             return Err(RegionSidecarError::UnsupportedVkShape);
         }
 
         let zero_data = self
-            .child_layouts
+            .r_prev_layouts
             .iter()
-            .chain(self.r_prev_layouts.iter())
             .map(|layout| vec![F128::ZERO; layout.n_data])
             .collect::<Vec<_>>();
-        let mut specs = self
-            .child_layouts
+        let mut specs = children
             .iter()
-            .chain(self.r_prev_layouts.iter())
-            .enumerate()
-            .map(|(index, layout)| RecordingSpec {
-                layout: layout.clone(),
+            .map(|child| (child.layout.clone(), child.data_flat.as_slice()))
+            .chain(
+                self.r_prev_layouts
+                    .iter()
+                    .zip(zero_data.iter())
+                    .map(|(layout, zero)| (layout.clone(), zero.as_slice())),
+            )
+            .map(|(layout, data)| RecordingSpec {
+                layout,
                 iv_flat: FsChannelUnionRecorder::capacity_iv_flat(),
-                data: zero_data[index].as_slice(),
+                data,
             })
             .collect::<Vec<_>>();
-        specs[self.child_block_index(active_slot)].data = &child.data_flat;
         specs[self.r_prev_block_index(active_slot)].data = &r_prev.data_flat;
         Ok(build_recording_only_duplex_union(&specs))
     }
@@ -938,9 +938,8 @@ pub(crate) struct HistoryStepParentColumns {
     slices_b: [WitnessSlice; N_COMMITTED_B],
     slices_rec: [WitnessSlice; 6],
     u_rec: DuplexUnion,
-    child_scratch: LayoutRecordedChannel,
+    child_scratches: Vec<LayoutRecordedChannel>,
     r_prev_scratch: LayoutRecordedChannel,
-    child_block: usize,
     r_prev_block: usize,
     vk: LinkRegionSidecarVk,
 }
@@ -950,7 +949,7 @@ pub(crate) fn prepare_history_step_parent_columns(
     proof: &RPcsProof<'_>,
     geometry: &HistoryStepParentGeometry,
     active_slot: usize,
-    child_recording: LayoutRecordedChannel,
+    child_recordings: Vec<LayoutRecordedChannel>,
     r_prev_recording: LayoutRecordedChannel,
 ) -> Result<HistoryStepParentColumns, RegionSidecarError> {
     if active_slot >= geometry.tier_count() {
@@ -972,7 +971,7 @@ pub(crate) fn prepare_history_step_parent_columns(
             alloc_column_slice_values_only(b, &asm.cb[column], asm.w_log_b)
         }
     });
-    let u_rec = geometry.recording_union(active_slot, &child_recording, &r_prev_recording)?;
+    let u_rec = geometry.recording_union(active_slot, &child_recordings, &r_prev_recording)?;
     let slices_rec = std::array::from_fn(|column| {
         alloc_column_slice_values_only(b, &u_rec.committed[column], u_rec.w_log)
     });
@@ -1003,9 +1002,8 @@ pub(crate) fn prepare_history_step_parent_columns(
         slices_b,
         slices_rec,
         u_rec,
-        child_scratch: child_recording,
+        child_scratches: child_recordings,
         r_prev_scratch: r_prev_recording,
-        child_block: geometry.child_block_index(active_slot),
         r_prev_block: geometry.r_prev_block_index(active_slot),
         vk,
     })
@@ -1095,14 +1093,14 @@ fn pin_recording_block(
 }
 
 /// Self-recursive twin of [`finalize_r_pcs_history_step_region`].  Besides the
-/// predecessor PCS obligations it pins both live recording blocks; omitting
-/// the previous envelope's direct-Block child transcript is therefore
-/// structurally impossible.
+/// predecessor PCS obligations it pins every banked child recording block and
+/// the live `[R]_prev` block; omitting the previous envelope's direct-Block
+/// child transcript is therefore structurally impossible.
 pub(crate) fn finalize_history_step_parent_region(
     b: &mut FieldR1csBuilder,
     columns: HistoryStepParentColumns,
     obligations: &PcsWalkObligations,
-    recorded_child: &FsRecordedChannel,
+    recorded_children: &[FsRecordedChannel],
     recorded_r_prev: &FsRecordedChannel,
 ) -> Result<HistoryStepParentRegionPreparation, RegionSidecarError> {
     let HistoryStepParentColumns {
@@ -1111,12 +1109,14 @@ pub(crate) fn finalize_history_step_parent_region(
         slices_b,
         slices_rec,
         u_rec,
-        child_scratch,
+        child_scratches,
         r_prev_scratch,
-        child_block,
         r_prev_block,
         vk,
     } = columns;
+    if recorded_children.len() != child_scratches.len() {
+        return Err(RegionSidecarError::UnsupportedVkShape);
+    }
     if asm.trees.len() != 1 {
         return Err(RegionSidecarError::UnsupportedVkShape);
     }
@@ -1184,16 +1184,23 @@ pub(crate) fn finalize_history_step_parent_region(
             }
         }
     }
-    pin_recording_block(
-        b,
-        "walk L-C HistoryStep parent Block child",
-        &child_scratch,
-        recorded_child,
-        &vk,
-        &u_rec,
-        &slices_rec,
-        child_block,
-    );
+    for (block, (scratch, recorded)) in child_scratches
+        .iter()
+        .zip(recorded_children.iter())
+        .enumerate()
+    {
+        // Child block index == tier slot by the geometry's packing order.
+        pin_recording_block(
+            b,
+            "walk L-C HistoryStep parent Block child",
+            scratch,
+            recorded,
+            &vk,
+            &u_rec,
+            &slices_rec,
+            block,
+        );
+    }
     pin_recording_block(
         b,
         "walk L-C HistoryStep [R]_prev",

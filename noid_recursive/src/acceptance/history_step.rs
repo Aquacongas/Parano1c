@@ -52,9 +52,9 @@ use super::trace::{mul, pin_eq, with_pin_gate};
 use crate::accumulator::{genesis_accumulator, ChainAccumulator};
 use crate::region_sidecar::{
     shape_only_block_region_sidecar_proof, shape_only_link_region_sidecar_proof,
-    verify_block_region_sidecar_post_commit,
-    verify_block_region_sidecar_post_commit_layout_captured,
-    verify_block_region_sidecar_recorded_trace_post_commit, verify_link_region_sidecar_post_commit,
+    verify_block_region_sidecar_banked_post_commit,
+    verify_block_region_sidecar_banked_post_commit_layout_captured,
+    verify_block_region_sidecar_banked_trace_post_commit, verify_link_region_sidecar_post_commit,
     verify_link_region_sidecar_trace_post_commit, BlockRegionPreparation, BlockRegionSidecarProof,
     BlockRegionSidecarVk, LinkRegionProverPlan, LinkRegionSidecarProof, LinkRegionSidecarVk,
     RegionSidecarError,

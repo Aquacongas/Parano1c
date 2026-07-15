@@ -521,11 +521,13 @@ pub fn derive_history_step_runtime_parts(
                 &entry.post_commit_digest(),
                 false,
             )?;
-            if complete
-                .child
-                .as_ref()
-                .is_none_or(|recording| recording.layout != child_layouts[slot])
-            {
+            if complete.children.as_ref().is_none_or(|recordings| {
+                recordings.len() != HISTORY_STEP_TIER_SLOT_COUNT
+                    || recordings
+                        .iter()
+                        .zip(child_layouts.iter())
+                        .any(|(recording, layout)| &recording.layout != layout)
+            }) {
                 return Err(HistoryStepError::ParentRecording);
             }
             derived.push(complete.r_prev.layout);
@@ -559,6 +561,7 @@ pub struct HistoryStepRuntime {
     matrix_source: Box<dyn HistoryStepMatrixSource>,
     parent_recursion_vk: LinkRegionSidecarVk,
     direct_block_vks: [BlockRegionSidecarVk; HISTORY_STEP_TIER_SLOT_COUNT],
+    ghost_claim_counts: std::sync::OnceLock<[usize; HISTORY_STEP_TIER_SLOT_COUNT]>,
     parent_geometry: HistoryStepParentGeometry,
 }
 
@@ -616,6 +619,7 @@ impl HistoryStepRuntime {
             matrix_source,
             parent_recursion_vk,
             direct_block_vks,
+            ghost_claim_counts: std::sync::OnceLock::new(),
             parent_geometry,
         })
     }
@@ -644,6 +648,32 @@ impl HistoryStepRuntime {
 
     pub fn direct_block_vk(&self, current_slot: usize) -> Option<&BlockRegionSidecarVk> {
         self.direct_block_vks.get(current_slot)
+    }
+
+    pub fn direct_block_vks(&self) -> &[BlockRegionSidecarVk; HISTORY_STEP_TIER_SLOT_COUNT] {
+        &self.direct_block_vks
+    }
+
+    /// Per-tier post-commit claim counts of the banked block-sidecar replay
+    /// (the anchor block size each dead variant deposits).  Derived lazily
+    /// from shape-only replays and cached: only prove/verify paths pay it.
+    pub(crate) fn ghost_claim_counts(
+        &self,
+    ) -> Result<&[usize; HISTORY_STEP_TIER_SLOT_COUNT], HistoryStepError> {
+        if let Some(counts) = self.ghost_claim_counts.get() {
+            return Ok(counts);
+        }
+        let mut counts = [0usize; HISTORY_STEP_TIER_SLOT_COUNT];
+        for (slot, vk) in self.direct_block_vks.iter().enumerate() {
+            let class =
+                CanonicalHistoryStepClassId::new(slot).expect("runtime block VK slot is canonical");
+            counts[slot] = crate::region_sidecar::block_sidecar_post_commit_claim_count(
+                vk,
+                self.bank.entry(class).shape().m,
+            )
+            .map_err(|_| HistoryStepError::RuntimeBlockVk(slot))?;
+        }
+        Ok(self.ghost_claim_counts.get_or_init(|| counts))
     }
 
     fn parent_geometry(&self) -> &HistoryStepParentGeometry {
@@ -972,12 +1002,12 @@ pub(super) fn validate_envelope_against_runtime(
 
 struct PreparedParentReplay {
     fresh: FreshLincheckClaim,
-    child_recording: LayoutRecordedChannel,
+    child_recordings: Vec<LayoutRecordedChannel>,
     r_prev_recording: LayoutRecordedChannel,
 }
 
 struct ScratchParentRecordings {
-    child: LayoutRecordedChannel,
+    children: Vec<LayoutRecordedChannel>,
     r_prev: LayoutRecordedChannel,
 }
 
@@ -1056,9 +1086,22 @@ impl ParentClassSelectorTrace {
 }
 
 struct ScratchParentRecordingPass {
-    child: Option<LayoutRecordedChannel>,
+    children: Option<Vec<LayoutRecordedChannel>>,
     r_prev: LayoutRecordedChannel,
     challenge_values: Vec<F128>,
+}
+
+/// Build-time one-hot gate constants for a known live parent tier: the
+/// witness-only scratch passes fold them into the same muxed-tail values the
+/// gated relation produces from its authenticated selector wires.
+fn scratch_parent_tier_gates(live_slot: usize) -> [LinExpr; HISTORY_STEP_TIER_SLOT_COUNT] {
+    std::array::from_fn(|slot| {
+        LinExpr::constant(if slot == live_slot {
+            F128::ONE
+        } else {
+            F128::ZERO
+        })
+    })
 }
 
 fn run_scratch_parent_recording_pass(
@@ -1070,9 +1113,7 @@ fn run_scratch_parent_recording_pass(
     allow_query_position_desync: bool,
 ) -> Result<ScratchParentRecordingPass, HistoryStepError> {
     let entry = runtime.bank().entry(class_id);
-    let direct_block_vk = runtime
-        .direct_block_vk(class_id.current_slot())
-        .ok_or(HistoryStepError::RuntimeBlockVk(class_id.current_slot()))?;
+    let gates = scratch_parent_tier_gates(class_id.current_slot());
     let mut builder = FieldR1csBuilder::new_witness_only();
     let statement_digest = alloc_pinned_flat_digest(&mut builder, matrix_digest);
     let post_commit_digest = alloc_pinned_flat_digest(&mut builder, post_commit_digest);
@@ -1090,9 +1131,14 @@ fn run_scratch_parent_recording_pass(
         entry.pcs_params(),
         false,
     );
+    let anchor = crate::acceptance::trace::self_verify::io_anchor_claim(
+        runtime.bank().spec(),
+        *envelope.io.first().ok_or(HistoryStepError::InvalidIo)?,
+        entry.shape().m,
+    );
     let mut obligations = PcsWalkObligations::default();
     let mut channel = FsChannelUnionRecorder::new(HISTORY_STEP_PROOF_DOMAIN);
-    let mut child = None;
+    let mut children = None;
     let mut sidecar_result = Ok(());
     let mut drive = || {
         verify_field_trace_deferred_region_with_post_commit_context_expr(
@@ -1120,13 +1166,16 @@ fn run_scratch_parent_recording_pass(
                     ));
                     return;
                 }
-                match verify_block_region_sidecar_recorded_trace_post_commit(
+                match verify_block_region_sidecar_banked_trace_post_commit(
                     builder,
                     context,
-                    direct_block_vk,
+                    runtime.direct_block_vks(),
+                    &gates,
+                    class_id.current_slot(),
                     &envelope.sidecar.direct_block,
+                    &anchor,
                 ) {
-                    Ok(recording) => child = Some(recording),
+                    Ok(recordings) => children = Some(recordings),
                     Err(error) => {
                         sidecar_result = Err(HistoryStepError::sidecar(
                             HistoryStepSidecarOperation::ScratchDirectBlockReplay,
@@ -1164,9 +1213,12 @@ fn run_scratch_parent_recording_pass(
         .map(|wire| wire.eval(builder.values()))
         .collect();
     Ok(ScratchParentRecordingPass {
-        child: child
-            .as_ref()
-            .map(|recording| capture_scratch_recording(recording, &builder)),
+        children: children.as_ref().map(|recordings| {
+            recordings
+                .iter()
+                .map(|recording| capture_scratch_recording(recording, &builder))
+                .collect()
+        }),
         r_prev: capture_scratch_recording(&r_prev, &builder),
         challenge_values,
     })
@@ -1187,9 +1239,9 @@ fn scratch_parent_recordings(
         post_commit_digest,
         false,
     )?;
-    let child = pass.child.ok_or(HistoryStepError::ParentRecording)?;
+    let children = pass.children.ok_or(HistoryStepError::ParentRecording)?;
     Ok(ScratchParentRecordings {
-        child,
+        children,
         r_prev: pass.r_prev,
     })
 }
@@ -1212,8 +1264,20 @@ fn prepare_parent_replay(
         &matrix_digest,
         &post_commit_digest,
     )?;
-    let child_layout = scratch.child.layout.clone();
+    let live_slot = class_id.current_slot();
+    let child_layout = scratch
+        .children
+        .get(live_slot)
+        .ok_or(HistoryStepError::ParentRecording)?
+        .layout
+        .clone();
     let r_prev_layout = scratch.r_prev.layout.clone();
+    let anchor = crate::acceptance::trace::self_verify::io_anchor_claim(
+        bank.spec(),
+        *envelope.io.first().ok_or(HistoryStepError::InvalidIo)?,
+        entry.shape().m,
+    );
+    let ghost_claim_counts = runtime.ghost_claim_counts()?;
 
     let mut challenger =
         LayoutRecordingChallenger::new(HISTORY_STEP_PROOF_DOMAIN, r_prev_layout.clone());
@@ -1235,11 +1299,12 @@ fn prepare_parent_replay(
                 context,
             )
             .map_err(|_| VerifyError::Auxiliary)?;
-            let (_, recording) = verify_block_region_sidecar_post_commit_layout_captured(
-                runtime
-                    .direct_block_vk(class_id.current_slot())
-                    .ok_or(VerifyError::Auxiliary)?,
+            let (_, recording) = verify_block_region_sidecar_banked_post_commit_layout_captured(
+                runtime.direct_block_vks(),
+                ghost_claim_counts,
+                live_slot,
                 &sidecar.direct_block,
+                &anchor,
                 context,
                 child_layout.clone(),
             )
@@ -1255,9 +1320,15 @@ fn prepare_parent_replay(
     if child_recording.layout != child_layout || r_prev_recording.layout != r_prev_layout {
         return Err(HistoryStepError::ParentRecording);
     }
+    // Dead-tier recordings stay scratch-derived: they replay deterministic
+    // shape-only proofs, so the witness pass and the gated relation replay
+    // produce bit-identical recordings. Only the live tier swaps in the
+    // recording captured by the native envelope verification above.
+    let mut child_recordings = scratch.children;
+    child_recordings[live_slot] = child_recording;
     Ok(PreparedParentReplay {
         fresh,
-        child_recording,
+        child_recordings,
         r_prev_recording,
     })
 }
@@ -1380,7 +1451,7 @@ fn prepare_history_step_base<'a, const TIER: usize>(
         false,
     )?;
     let scratch = ScratchParentRecordings {
-        child: complete.child.ok_or(HistoryStepError::ParentRecording)?,
+        children: complete.children.ok_or(HistoryStepError::ParentRecording)?,
         r_prev: complete.r_prev,
     };
     Ok(PreparedHistoryStepParent {
@@ -1389,7 +1460,7 @@ fn prepare_history_step_base<'a, const TIER: usize>(
         current_class,
         replay: PreparedParentReplay {
             fresh: zero_fresh_claim(entry.shape()),
-            child_recording: scratch.child,
+            child_recordings: scratch.children,
             r_prev_recording: scratch.r_prev,
         },
         fold_proof: zero_fold_proof(entry.shape().k_log),
@@ -1455,6 +1526,12 @@ pub fn prove_built_history_step(
     validate_built_against_bank(runtime, built, &built.matrix)?;
     let bank = runtime.bank();
     let entry = bank.entry(built.class_id);
+    let anchor = crate::acceptance::trace::self_verify::io_anchor_claim(
+        bank.spec(),
+        *built.io.first().ok_or(HistoryStepError::InvalidIo)?,
+        entry.shape().m,
+    );
+    let ghost_claim_counts = runtime.ghost_claim_counts()?;
     macro_rules! prove_with_matrix {
         ($prove:path, $matrix:expr) => {{
             let parent_plan = LinkRegionProverPlan::new(
@@ -1473,7 +1550,12 @@ pub fn prove_built_history_step(
                 &mut challenger,
                 |context| -> Result<HistoryStepCompositeSidecarProof, RegionSidecarError> {
                     let parent_recursion = parent_plan.prove_post_commit(context)?;
-                    let direct_block = direct_block_plan.prove_post_commit(context)?;
+                    let direct_block = direct_block_plan.prove_post_commit_banked(
+                        context,
+                        ghost_claim_counts,
+                        built.class_id.current_slot(),
+                        &anchor,
+                    )?;
                     Ok(HistoryStepCompositeSidecarProof {
                         parent_recursion,
                         direct_block,
@@ -1518,6 +1600,12 @@ pub fn verify_history_step_pending(
     validate_envelope_against_runtime(runtime, class_id, envelope)?;
     let bank = runtime.bank();
     let entry = bank.entry(class_id);
+    let anchor = crate::acceptance::trace::self_verify::io_anchor_claim(
+        bank.spec(),
+        *envelope.io.first().ok_or(HistoryStepError::InvalidIo)?,
+        entry.shape().m,
+    );
+    let ghost_claim_counts = runtime.ghost_claim_counts()?;
     let mut challenger = FsLaneChallenger::new(HISTORY_STEP_PROOF_DOMAIN);
     let (_claim, fresh) = verify_field_deferred_matrix_with_post_commit_context(
         &entry.shape(),
@@ -1536,11 +1624,12 @@ pub fn verify_history_step_pending(
                 context,
             )
             .map_err(|_| VerifyError::Auxiliary)?;
-            verify_block_region_sidecar_post_commit(
-                runtime
-                    .direct_block_vk(class_id.current_slot())
-                    .ok_or(VerifyError::Auxiliary)?,
+            verify_block_region_sidecar_banked_post_commit(
+                runtime.direct_block_vks(),
+                ghost_claim_counts,
+                class_id.current_slot(),
                 &sidecar.direct_block,
+                &anchor,
                 context,
             )
             .map_err(|_| VerifyError::Auxiliary)?;
@@ -1714,11 +1803,6 @@ fn prepare_history_step_assembly<const TIER: usize>(
     } = prepared;
     let envelope = envelope.proof();
     let parent_entry = bank.entry(selected_parent_class);
-    let parent_direct_block_vk = runtime
-        .direct_block_vk(selected_parent_class.current_slot())
-        .ok_or(HistoryStepError::RuntimeBlockVk(
-            selected_parent_class.current_slot(),
-        ))?;
     if noid_chain::consensus::params::user_tx_class_tier(
         current.components.authorization_inputs.len(),
     ) != Some(TIER)
@@ -1764,7 +1848,7 @@ fn prepare_history_step_assembly<const TIER: usize>(
         &r_pcs,
         runtime.parent_geometry(),
         selected_parent_class.current_slot(),
-        prepared_parent.child_recording,
+        prepared_parent.child_recordings,
         prepared_parent.r_prev_recording,
     )
     .map_err(|source| {
@@ -1848,9 +1932,14 @@ fn prepare_history_step_assembly<const TIER: usize>(
             .map(|class| prev_io[layout.post_commit_whitelist + 2 * class.index() + lane].clone());
         parent_selector.select(&mut builder, candidates)
     });
+    let parent_anchor = crate::acceptance::trace::self_verify::io_anchor_claim(
+        bank.spec(),
+        *envelope.io.first().ok_or(HistoryStepError::InvalidIo)?,
+        parent_entry.shape().m,
+    );
     let mut obligations = PcsWalkObligations::default();
     let mut replay_channel = BaseSelectableParentRecorder::new(HISTORY_STEP_PROOF_DOMAIN);
-    let mut recorded_child = None;
+    let mut recorded_children = None;
     let mut sidecar_result = Ok(());
     let (_parent_claim, fresh_parent) = with_pin_gate(&parent_gate, || {
         verify_field_trace_deferred_region_with_post_commit_context_expr(
@@ -1878,13 +1967,16 @@ fn prepare_history_step_assembly<const TIER: usize>(
                     ));
                     return;
                 }
-                match verify_block_region_sidecar_recorded_trace_post_commit(
+                match verify_block_region_sidecar_banked_trace_post_commit(
                     builder,
                     context,
-                    parent_direct_block_vk,
+                    runtime.direct_block_vks(),
+                    &parent_selector.one_hot,
+                    selected_parent_class.current_slot(),
                     &envelope.sidecar.direct_block,
+                    &parent_anchor,
                 ) {
-                    Ok(recording) => recorded_child = Some(recording),
+                    Ok(recordings) => recorded_children = Some(recordings),
                     Err(error) => {
                         sidecar_result = Err(HistoryStepError::sidecar(
                             HistoryStepSidecarOperation::ParentDirectBlockTraceReplay,
@@ -1897,7 +1989,7 @@ fn prepare_history_step_assembly<const TIER: usize>(
     });
     sidecar_result?;
     let recorded_r_prev = replay_channel.finish();
-    let recorded_child = recorded_child.ok_or(HistoryStepError::ParentRecording)?;
+    let recorded_children = recorded_children.ok_or(HistoryStepError::ParentRecording)?;
 
     let selected_lane = layout.matrix_lanes[selected_parent_class.index()];
     let incoming = MatrixAccClaimTrace {
@@ -1986,7 +2078,7 @@ fn prepare_history_step_assembly<const TIER: usize>(
             &mut builder,
             r_columns,
             &obligations,
-            &recorded_child,
+            &recorded_children,
             &recorded_r_prev,
         )
     })

@@ -1042,6 +1042,44 @@ impl<'a> BlockRegionProverPlan<'a> {
         context.append_claims(claims);
         Ok(proof)
     }
+
+    /// Banked four-tier twin of [`Self::prove_post_commit`]: the transcript
+    /// and claim-stream mirror of
+    /// [`verify_block_region_sidecar_banked_post_commit`].  Only the live
+    /// tier's sidecar is actually proved; every dead tier deposits its fixed
+    /// anchor-claim block in variant order.
+    pub fn prove_post_commit_banked<Ch: Challenger>(
+        &self,
+        context: &mut FieldPostCommitProverContext<'_, Ch>,
+        ghost_claim_counts: &[usize],
+        live_slot: usize,
+        anchor: &QuirkyDirectClaim,
+    ) -> Result<BlockRegionSidecarProof, RegionSidecarError> {
+        if live_slot >= ghost_claim_counts.len() {
+            return Err(RegionSidecarError::BadVk);
+        }
+        let witness = context.witness();
+        context.observe_label(BLOCK_SIDECAR_RECORDED_LABEL);
+        let seed = context.sample_f128();
+        let mut result = None;
+        for slot in 0..ghost_claim_counts.len() {
+            if slot == live_slot {
+                let mut child = FsLaneChallenger::new(BLOCK_SIDECAR_CHILD_DOMAIN);
+                child.observe_f128(seed);
+                let (proof, claims) = self.prove(witness, &mut child)?;
+                context.append_claims(claims);
+                let tail = child.sample_f128_vec(BLOCK_SIDECAR_CHILD_TAIL_LANES);
+                result = Some((proof, tail));
+            } else {
+                context.append_claims(
+                    std::iter::repeat_with(|| anchor.clone()).take(ghost_claim_counts[slot]),
+                );
+            }
+        }
+        let (proof, tail) = result.expect("live slot bounds checked");
+        context.observe_f128_slice(&tail);
+        Ok(proof)
+    }
 }
 
 /// The fixed-shape selected-ZK V5 block sidecar envelope.
@@ -1388,40 +1426,6 @@ pub fn verify_block_region_sidecar_post_commit_captured<Ch: Challenger>(
     })
 }
 
-/// Native block-sidecar verification that also harvests the complete child
-/// recording through its frozen class layout. The verifier and all appended
-/// PCS claims are identical to
-/// [`verify_block_region_sidecar_post_commit_captured`]; only the concrete
-/// child challenger additionally classifies absorbed lanes for the Link
-/// recording union.
-pub(crate) fn verify_block_region_sidecar_post_commit_layout_captured<Ch: Challenger>(
-    vk: &BlockRegionSidecarVk,
-    proof: &BlockRegionSidecarProof,
-    context: &mut FieldPostCommitVerifierContext<'_, Ch>,
-    layout: noid_ivc_core::deep_chain::schedule::DuplexLayout,
-) -> Result<(BlockSidecarChildTranscript, LayoutRecordedChannel), RegionSidecarError> {
-    context.observe_label(BLOCK_SIDECAR_RECORDED_LABEL);
-    let seed = context.sample_f128();
-    let mut child = LayoutRecordingChallenger::new(BLOCK_SIDECAR_CHILD_DOMAIN, layout);
-    child.observe_f128(seed);
-    let claims = verify_block_region_sidecar(vk, context.total_vars(), proof, &mut child)?;
-    let tail = child.sample_f128_vec(BLOCK_SIDECAR_CHILD_TAIL_LANES);
-    let recording = child
-        .finish()
-        .map_err(|_| RegionSidecarError::InvalidProof)?;
-    context.observe_f128_slice(&tail);
-    context.append_claims(claims);
-    Ok((
-        BlockSidecarChildTranscript {
-            seed,
-            tail: tail
-                .try_into()
-                .expect("child transcript terminal lane count"),
-        },
-        recording,
-    ))
-}
-
 /// Recursive trace verifier for the fixed V5 block authority. Every deferred
 /// child and the shared six-instance multi-walk is shape-preflighted before
 /// the first proof witness allocation. Prefixes and suffixes remain
@@ -1514,30 +1518,188 @@ pub fn verify_block_region_sidecar_trace_post_commit<C: FsChannelOps>(
     Ok(())
 }
 
-/// Recursive trace verifier for the V5 block authority in RECORDED mode: the
-/// complete sidecar replay runs on a union-recorder child channel, so its
-/// Fiat-Shamir traffic costs recorded schedule lanes instead of inline sponge
-/// permutations.  The outer context pays exactly one label, one seed sample
-/// and one two-lane tail observe; the returned recording carries the child's
-/// schedule, absorbed-data wires and challenge wires for the caller's
-/// committed-region cell pins.  Transcript mirror of the native
-/// [`verify_block_region_sidecar_post_commit`].
-pub(crate) fn verify_block_region_sidecar_recorded_trace_post_commit<C: FsChannelOps>(
+/// Banked four-tier RECORDED-mode trace verifier: one recorded replay per
+/// candidate predecessor tier, so the caller's row structure is
+/// independent of the live tier.  Each replay runs on a union-recorder child
+/// channel, so its Fiat-Shamir traffic costs recorded schedule lanes instead
+/// of inline sponge permutations.  The outer transcript cost stays exactly one
+/// label, one seed sample and one two-lane tail observe: every child recorder
+/// absorbs the same seed, dead tiers replay their deterministic shape-only
+/// proofs with all rejection pins disabled by a zero gate, and only the
+/// gate-selected tail returns to the outer channel.  A dead tier's walk
+/// claims never open real cells: each one is swapped for a wire-pattern
+/// mirror witnessed to the caller's anchor claim, keeping the enclosing
+/// batch shape a protocol constant.
+pub(crate) fn verify_block_region_sidecar_banked_trace_post_commit<C: FsChannelOps>(
     b: &mut FieldR1csBuilder,
     context: &mut FieldPostCommitTraceContext<'_, C>,
-    vk: &BlockRegionSidecarVk,
-    proof: &BlockRegionSidecarProof,
-) -> Result<RecordedChannel, RegionSidecarError> {
+    vks: &[BlockRegionSidecarVk],
+    gates: &[crate::acceptance::trace::LinExpr],
+    live_slot: usize,
+    live_proof: &BlockRegionSidecarProof,
+    anchor: &QuirkyDirectClaim,
+) -> Result<Vec<RecordedChannel>, RegionSidecarError> {
+    if vks.is_empty() || vks.len() != gates.len() || live_slot >= vks.len() {
+        return Err(RegionSidecarError::BadVk);
+    }
+    let total_vars = context.total_vars();
     context.observe_label(b, BLOCK_SIDECAR_RECORDED_LABEL);
     let seed = context.sample_f128(b);
+    let mut recordings = Vec::with_capacity(vks.len());
+    let mut tails = Vec::with_capacity(vks.len());
+    for (slot, (vk, gate)) in vks.iter().zip(gates).enumerate() {
+        let ghost;
+        let proof = if slot == live_slot {
+            live_proof
+        } else {
+            ghost = shape_only_block_region_sidecar_proof(vk, total_vars)?;
+            &ghost
+        };
+        let mut recorder = FsChannelUnionRecorder::new(BLOCK_SIDECAR_CHILD_DOMAIN);
+        recorder.observe_f128(b, &seed);
+        let mut child = context.child(&mut recorder);
+        crate::acceptance::trace::with_pin_gate(gate, || {
+            verify_block_region_sidecar_trace_post_commit(b, &mut child, vk, proof)
+        })?;
+        context.adopt_child_claims_banked(b, child, anchor, slot == live_slot);
+        tails.push(recorder.sample_f128_vec(b, BLOCK_SIDECAR_CHILD_TAIL_LANES));
+        recordings.push(recorder.finish());
+    }
+    let selected_tail = (0..BLOCK_SIDECAR_CHILD_TAIL_LANES)
+        .map(|lane| {
+            tails
+                .iter()
+                .zip(gates)
+                .fold(crate::acceptance::trace::LinExpr::zero(), |sum, (tail, gate)| {
+                    sum.add(&crate::acceptance::trace::mul(b, gate, &tail[lane]))
+                })
+        })
+        .collect::<Vec<_>>();
+    context.observe_f128_slice(b, &selected_tail);
+    Ok(recordings)
+}
+
+/// The value-independent post-commit claim count of one block-sidecar class:
+/// how many PCS claims a replay of `vk` deposits into the enclosing batch.
+/// Derived from a shape-only replay, exactly like the recording layout.
+pub(crate) fn block_sidecar_post_commit_claim_count(
+    vk: &BlockRegionSidecarVk,
+    total_vars: usize,
+) -> Result<usize, RegionSidecarError> {
+    let proof = shape_only_block_region_sidecar_proof(vk, total_vars)?;
+    let mut scratch = FieldR1csBuilder::new();
     let mut recorder = FsChannelUnionRecorder::new(BLOCK_SIDECAR_CHILD_DOMAIN);
-    recorder.observe_f128(b, &seed);
-    let mut child = context.child(&mut recorder);
-    verify_block_region_sidecar_trace_post_commit(b, &mut child, vk, proof)?;
-    context.adopt_child_claims(child);
-    let tail = recorder.sample_f128_vec(b, BLOCK_SIDECAR_CHILD_TAIL_LANES);
-    context.observe_f128_slice(b, &tail);
-    Ok(recorder.finish())
+    let seed = crate::acceptance::trace::LinExpr::from_wire(scratch.alloc_f128(F128::ZERO));
+    recorder.observe_f128(&mut scratch, &seed);
+    let root: crate::acceptance::trace::self_verify::FlatDigestExpr = [
+        crate::acceptance::trace::LinExpr::zero(),
+        crate::acceptance::trace::LinExpr::zero(),
+    ];
+    let mut context = FieldPostCommitTraceContext::detached(&root, total_vars, &mut recorder);
+    verify_block_region_sidecar_trace_post_commit(&mut scratch, &mut context, vk, &proof)?;
+    Ok(context.claim_count())
+}
+
+/// Banked four-tier native twin of
+/// [`verify_block_region_sidecar_banked_trace_post_commit`].  The live tier
+/// verifies through the ordinary seeded child chain; every dead tier
+/// contributes its fixed anchor-claim block (one anchor per claim its replay
+/// would deposit), so the native claim stream matches the banked relation
+/// exactly without running any dead walk.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_block_region_sidecar_banked_post_commit<Ch: Challenger>(
+    vks: &[BlockRegionSidecarVk],
+    ghost_claim_counts: &[usize],
+    live_slot: usize,
+    live_proof: &BlockRegionSidecarProof,
+    anchor: &QuirkyDirectClaim,
+    context: &mut FieldPostCommitVerifierContext<'_, Ch>,
+) -> Result<BlockSidecarChildTranscript, RegionSidecarError> {
+    if vks.is_empty() || vks.len() != ghost_claim_counts.len() || live_slot >= vks.len() {
+        return Err(RegionSidecarError::BadVk);
+    }
+    context.observe_label(BLOCK_SIDECAR_RECORDED_LABEL);
+    let seed = context.sample_f128();
+    let mut tail = None;
+    for slot in 0..vks.len() {
+        if slot == live_slot {
+            let mut child = FsLaneChallenger::new(BLOCK_SIDECAR_CHILD_DOMAIN);
+            child.observe_f128(seed);
+            let claims = verify_block_region_sidecar(
+                &vks[slot],
+                context.total_vars(),
+                live_proof,
+                &mut child,
+            )?;
+            context.append_claims(claims);
+            tail = Some(child.sample_f128_vec(BLOCK_SIDECAR_CHILD_TAIL_LANES));
+        } else {
+            context.append_claims(
+                std::iter::repeat_with(|| anchor.clone()).take(ghost_claim_counts[slot]),
+            );
+        }
+    }
+    let tail = tail.expect("live slot bounds checked");
+    context.observe_f128_slice(&tail);
+    Ok(BlockSidecarChildTranscript {
+        seed,
+        tail: tail
+            .try_into()
+            .expect("child transcript terminal lane count"),
+    })
+}
+
+/// [`verify_block_region_sidecar_banked_post_commit`] that additionally
+/// harvests the live child recording through its frozen class layout.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn verify_block_region_sidecar_banked_post_commit_layout_captured<Ch: Challenger>(
+    vks: &[BlockRegionSidecarVk],
+    ghost_claim_counts: &[usize],
+    live_slot: usize,
+    live_proof: &BlockRegionSidecarProof,
+    anchor: &QuirkyDirectClaim,
+    context: &mut FieldPostCommitVerifierContext<'_, Ch>,
+    layout: noid_ivc_core::deep_chain::schedule::DuplexLayout,
+) -> Result<(BlockSidecarChildTranscript, LayoutRecordedChannel), RegionSidecarError> {
+    if vks.is_empty() || vks.len() != ghost_claim_counts.len() || live_slot >= vks.len() {
+        return Err(RegionSidecarError::BadVk);
+    }
+    context.observe_label(BLOCK_SIDECAR_RECORDED_LABEL);
+    let seed = context.sample_f128();
+    let mut captured = None;
+    for slot in 0..vks.len() {
+        if slot == live_slot {
+            let mut child = LayoutRecordingChallenger::new(BLOCK_SIDECAR_CHILD_DOMAIN, layout.clone());
+            child.observe_f128(seed);
+            let claims = verify_block_region_sidecar(
+                &vks[slot],
+                context.total_vars(),
+                live_proof,
+                &mut child,
+            )?;
+            let tail = child.sample_f128_vec(BLOCK_SIDECAR_CHILD_TAIL_LANES);
+            let recording = child
+                .finish()
+                .map_err(|_| RegionSidecarError::InvalidProof)?;
+            context.append_claims(claims);
+            captured = Some((tail, recording));
+        } else {
+            context.append_claims(
+                std::iter::repeat_with(|| anchor.clone()).take(ghost_claim_counts[slot]),
+            );
+        }
+    }
+    let (tail, recording) = captured.expect("live slot bounds checked");
+    context.observe_f128_slice(&tail);
+    Ok((
+        BlockSidecarChildTranscript {
+            seed,
+            tail: tail
+                .try_into()
+                .expect("child transcript terminal lane count"),
+        },
+        recording,
+    ))
 }
 
 /// Replay the recorded child transcript on a THROWAWAY builder to obtain the
