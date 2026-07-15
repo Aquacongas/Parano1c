@@ -275,7 +275,7 @@ fn main() {
     println!("  pack:          {}", version.display());
     println!("  rayon threads: {}", rayon::current_num_threads());
     println!("  witnesses:     real genesis chain + four exact parent forks");
-    println!("  classes:       16 (four current tiers x four parent tiers)");
+    println!("  classes:       4 (one per current tier; uniform outer shape)");
     println!("\nBuilding and exporting canonical matrices:");
 
     let started = Instant::now();

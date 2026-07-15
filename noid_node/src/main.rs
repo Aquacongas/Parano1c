@@ -130,6 +130,7 @@ const STATE_MANIFEST_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration
 const MINER_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn embedded_history_step_runtime(
+    data_dir: &Path,
 ) -> Result<Option<Arc<noid_recursive::acceptance::history_step::HistoryStepRuntime>>, String> {
     let Some(pack) = embedded_history_step_pack::embedded_history_step_pack() else {
         return Ok(None);
@@ -139,8 +140,17 @@ fn embedded_history_step_runtime(
         pack.runtime_metadata_digest(),
     )
     .map_err(|error| format!("embedded HistoryStep metadata rejected: {error}"))?;
+    // The packed runtime layout is derived from the embedded canonical
+    // leaves once per release build (keyed by the pinned metadata digest)
+    // and reused on later starts.
+    let mut digest_hex = String::with_capacity(64);
+    for byte in pack.runtime_metadata_digest() {
+        use std::fmt::Write as _;
+        write!(&mut digest_hex, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    let cache_directory = data_dir.join("history-step-cache").join(digest_hex);
     let matrix_source = pack
-        .matrix_source()
+        .matrix_source(Some(cache_directory))
         .map_err(|error| format!("embedded HistoryStep matrices rejected: {error}"))?;
     let (bank, runtime_parts) = metadata.into_parts();
     let runtime = noid_recursive::acceptance::history_step::HistoryStepRuntime::new(
@@ -539,7 +549,8 @@ async fn main() -> anyhow::Result<()> {
             snapshot_staging_root.display()
         )
     })?;
-    let history_step_runtime = embedded_history_step_runtime().map_err(anyhow::Error::msg)?;
+    let history_step_runtime =
+        embedded_history_step_runtime(&data_dir).map_err(anyhow::Error::msg)?;
     match &history_step_runtime {
         None => tracing::warn!(
             "HistoryStep verification unavailable in this pack-free development build"

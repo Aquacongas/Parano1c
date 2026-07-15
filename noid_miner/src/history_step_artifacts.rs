@@ -3,14 +3,16 @@
 
 //! Executable-embedded artifacts for the canonical `HistoryStep` class bank.
 //!
-//! An official node contains one pinned runtime-metadata artifact and sixteen
-//! build-authenticated matrix images.  This module owns only the matrix-image
-//! boundary. Every [`HistoryStepMatrixSource`] call returns an authenticated
-//! compact lease. A fixed-size cache retains only the most recently used
-//! packed relations; no runtime path decodes resident CSR arrays.
+//! An official node contains one pinned runtime-metadata artifact and four
+//! build-authenticated canonical matrix leaves.  This module owns only the
+//! matrix boundary. Every [`HistoryStepMatrixSource`] call returns an
+//! authenticated compact lease. Packed runtime images are derived once per
+//! release into a local cache directory; a fixed-size in-memory cache
+//! retains only the most recently used relations.
 
 use std::collections::VecDeque;
 use std::io::Read as _;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use noid_ivc_core::field_r1cs::{
@@ -33,6 +35,12 @@ use thiserror::Error;
 pub const HISTORY_STEP_PACK_VERSION_DIRECTORY: &str = "v1";
 pub const HISTORY_STEP_RUNTIME_METADATA_FILE: &str = "history-step.runtime";
 pub const HISTORY_STEP_PACK_LEAF_COUNT: usize = HISTORY_STEP_CLASS_COUNT;
+
+/// Hard bounds for runtime-cache files: derived packed images compress worse
+/// than canonical leaves and the largest observed class stays far below
+/// these caps.
+const MAX_COMPRESSED_RUNTIME_IMAGE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_RUNTIME_IMAGE_BYTES: u64 = 1024 * 1024 * 1024;
 pub const HISTORY_STEP_PACK_LEAF_HASH_DOMAIN: &[u8] = b"NOID/HISTORY-STEP/PACK-LEAF/V1";
 pub const HISTORY_STEP_RUNTIME_METADATA_DIGEST_DOMAIN: &[u8] =
     b"NOID/HISTORY-STEP/RUNTIME-METADATA/V1";
@@ -241,32 +249,31 @@ pub fn history_step_runtime_image_file_name(class: CanonicalHistoryStepClassId) 
     HISTORY_STEP_RUNTIME_IMAGE_FILE_NAMES[class.index()]
 }
 
-/// One immutable matrix image paired with the authority minted by the release
-/// build after it authenticated the corresponding canonical leaf.
+/// One immutable canonical matrix leaf paired with the authority minted by
+/// the release build after it authenticated exactly these compressed bytes.
+/// The binary carries only the compact canonical artifact; the hot packed
+/// runtime layout is derived once per release into a local cache directory.
 #[derive(Clone, Copy)]
 pub struct EmbeddedHistoryStepMatrixLeaf {
     class: CanonicalHistoryStepClassId,
-    compressed_runtime_image: &'static [u8],
-    runtime_image_bytes: usize,
+    compressed_canonical: &'static [u8],
     build_seal: BuildAuthenticatedFieldR1csSeal,
 }
 
 impl EmbeddedHistoryStepMatrixLeaf {
     /// # Safety
     ///
-    /// The image, exact decoded length, and seal must be emitted together by
+    /// The compressed canonical bytes and seal must be emitted together by
     /// the release build after authenticating the pinned canonical matrix.
     #[doc(hidden)]
     pub const unsafe fn from_release_build(
         class: CanonicalHistoryStepClassId,
-        compressed_runtime_image: &'static [u8],
-        runtime_image_bytes: usize,
+        compressed_canonical: &'static [u8],
         build_seal: BuildAuthenticatedFieldR1csSeal,
     ) -> Self {
         Self {
             class,
-            compressed_runtime_image,
-            runtime_image_bytes,
+            compressed_canonical,
             build_seal,
         }
     }
@@ -275,12 +282,8 @@ impl EmbeddedHistoryStepMatrixLeaf {
         self.class
     }
 
-    pub const fn compressed_runtime_image(&self) -> &'static [u8] {
-        self.compressed_runtime_image
-    }
-
-    pub const fn runtime_image_bytes(&self) -> usize {
-        self.runtime_image_bytes
+    pub const fn compressed_canonical(&self) -> &'static [u8] {
+        self.compressed_canonical
     }
 
     pub const fn build_seal(&self) -> BuildAuthenticatedFieldR1csSeal {
@@ -327,19 +330,29 @@ struct CachedHistoryStepMatrix {
     matrix: Arc<CompactFieldR1cs>,
 }
 
-/// Embedded source for the complete sixteen-class matrix bank. Only two
-/// authenticated compact relations are retained by the source at a time.
+/// Embedded source for the complete four-class matrix bank. Only two
+/// authenticated compact relations are retained in memory at a time.
+///
+/// The binary embeds canonical leaves only. The packed runtime layout is
+/// derived from them once per release into `runtime_cache_directory` and
+/// reused on later starts. A cache file that fails any bound or decode is
+/// rebuilt from the embedded canonical bytes, so cache corruption can only
+/// cost this node availability — never accept a foreign relation: proving
+/// or verifying against tampered rows fails against the release-pinned
+/// digests. The cache lives beside the wallet and MDBX state and shares
+/// exactly their local trust boundary.
 pub struct EmbeddedHistoryStepMatrixSource {
     leaves: [EmbeddedHistoryStepMatrixLeaf; HISTORY_STEP_PACK_LEAF_COUNT],
+    runtime_cache_directory: Option<PathBuf>,
     cache: Mutex<VecDeque<CachedHistoryStepMatrix>>,
 }
 
 impl EmbeddedHistoryStepMatrixSource {
     /// # Safety
     ///
-    /// Every leaf must be the exact immutable image/seal tuple emitted by the
-    /// successful release build.  Runtime or filesystem bytes must not enter
-    /// this constructor.
+    /// Every leaf must be the exact immutable canonical/seal tuple emitted by
+    /// the successful release build.  Runtime or filesystem bytes must not
+    /// enter this constructor.
     pub unsafe fn from_release_build(
         leaves: [EmbeddedHistoryStepMatrixLeaf; HISTORY_STEP_PACK_LEAF_COUNT],
     ) -> Result<Self, EmbeddedHistoryStepMatrixError> {
@@ -349,7 +362,7 @@ impl EmbeddedHistoryStepMatrixSource {
             if leaf.class != expected {
                 return Err(EmbeddedHistoryStepMatrixError::ClassOrder { index });
             }
-            if leaf.compressed_runtime_image.is_empty() || leaf.runtime_image_bytes == 0 {
+            if leaf.compressed_canonical.is_empty() || leaf.build_seal.canonical_bytes() == 0 {
                 return Err(EmbeddedHistoryStepMatrixError::EmptyLeaf { index });
             }
             if leaf.build_seal.shape() != canonical_history_step_shape(expected) {
@@ -358,10 +371,135 @@ impl EmbeddedHistoryStepMatrixSource {
         }
         Ok(Self {
             leaves,
+            runtime_cache_directory: None,
             cache: Mutex::new(VecDeque::with_capacity(
                 HISTORY_STEP_COMPACT_MATRIX_CACHE_CAPACITY,
             )),
         })
+    }
+
+    /// Derive packed runtime images into `directory` on first use and load
+    /// them from there afterwards. Without a directory every load rebuilds
+    /// from the embedded canonical bytes.
+    pub fn with_runtime_cache(mut self, directory: PathBuf) -> Self {
+        self.runtime_cache_directory = Some(directory);
+        self
+    }
+
+    fn cached_image_path(&self, class: CanonicalHistoryStepClassId) -> Option<PathBuf> {
+        self.runtime_cache_directory
+            .as_ref()
+            .map(|directory| directory.join(history_step_runtime_image_file_name(class)))
+    }
+
+    /// Load the packed image from the runtime cache. Any failure is treated
+    /// as an absent cache entry and triggers a rebuild from canonical bytes.
+    fn load_cached_image(
+        &self,
+        class: CanonicalHistoryStepClassId,
+    ) -> Option<Arc<CompactFieldR1cs>> {
+        let leaf = &self.leaves[class.index()];
+        let path = self.cached_image_path(class)?;
+        let metadata = std::fs::metadata(&path).ok()?;
+        if !metadata.is_file() || metadata.len() > MAX_COMPRESSED_RUNTIME_IMAGE_BYTES {
+            return None;
+        }
+        let compressed = std::fs::read(&path).ok()?;
+        let decoder = zstd::stream::read::Decoder::new(compressed.as_slice()).ok()?;
+        let mut image = Vec::new();
+        decoder
+            .take(MAX_RUNTIME_IMAGE_BYTES + 1)
+            .read_to_end(&mut image)
+            .ok()?;
+        if image.len() as u64 > MAX_RUNTIME_IMAGE_BYTES {
+            return None;
+        }
+        // SAFETY: the seal was minted by the release build for the embedded
+        // canonical relation; the packed decode validates the image framing
+        // against exactly that seal, and a value-tampered image can only
+        // make this node reject or produce proofs the network rejects.
+        let compact = unsafe {
+            CompactFieldR1cs::open_build_authenticated_packed_image(&image, leaf.build_seal)
+        }
+        .ok()?;
+        Some(Arc::new(compact))
+    }
+
+    /// Rebuild one packed image from the embedded canonical bytes with the
+    /// complete `CompactFieldR1cs::open` authentication, then persist it
+    /// best-effort into the runtime cache.
+    fn rebuild_from_canonical(
+        &self,
+        class: CanonicalHistoryStepClassId,
+    ) -> Result<Arc<CompactFieldR1cs>, EmbeddedHistoryStepMatrixError> {
+        let leaf = &self.leaves[class.index()];
+        let expected = leaf.build_seal.canonical_bytes();
+        let decoder =
+            zstd::stream::read::Decoder::new(leaf.compressed_canonical).map_err(|source| {
+                EmbeddedHistoryStepMatrixError::Compression {
+                    class: class.index(),
+                    source,
+                }
+            })?;
+        let mut canonical = Vec::new();
+        decoder
+            .take(expected as u64 + 1)
+            .read_to_end(&mut canonical)
+            .map_err(|source| EmbeddedHistoryStepMatrixError::Compression {
+                class: class.index(),
+                source,
+            })?;
+        if canonical.len() != expected {
+            return Err(EmbeddedHistoryStepMatrixError::DecodedLength {
+                class: class.index(),
+                expected,
+                actual: canonical.len(),
+            });
+        }
+        let relation = CompactFieldR1cs::open(
+            canonical.into_boxed_slice(),
+            leaf.build_seal.shape(),
+            leaf.build_seal.statement_digest(),
+        )
+        .map_err(|source| EmbeddedHistoryStepMatrixError::Matrix {
+            class: class.index(),
+            source,
+        })?;
+        let packed = relation.into_startup_packed().map_err(|source| {
+            EmbeddedHistoryStepMatrixError::Matrix {
+                class: class.index(),
+                source,
+            }
+        })?;
+        let image = packed.encode_startup_packed_image().map_err(|source| {
+            EmbeddedHistoryStepMatrixError::Matrix {
+                class: class.index(),
+                source,
+            }
+        })?;
+        if let Some(path) = self.cached_image_path(class) {
+            if let Ok(compressed) = zstd::stream::encode_all(image.as_ref(), 9) {
+                let _ = path
+                    .parent()
+                    .map(std::fs::create_dir_all)
+                    .transpose()
+                    .and_then(|_| {
+                        let staged = path.with_extension("tmp");
+                        std::fs::write(&staged, &compressed)?;
+                        std::fs::rename(&staged, &path)
+                    });
+            }
+        }
+        // SAFETY: this image was produced right here from the canonical
+        // relation that `CompactFieldR1cs::open` just fully authenticated.
+        let compact = unsafe {
+            CompactFieldR1cs::open_build_authenticated_packed_image(&image, leaf.build_seal)
+        }
+        .map_err(|source| EmbeddedHistoryStepMatrixError::Matrix {
+            class: class.index(),
+            source,
+        })?;
+        Ok(Arc::new(compact))
     }
 
     fn materialize(
@@ -381,46 +519,10 @@ impl EmbeddedHistoryStepMatrixSource {
             return Ok(matrix);
         }
 
-        let leaf = &self.leaves[class.index()];
-        let read_limit = leaf.runtime_image_bytes.checked_add(1).ok_or(
-            EmbeddedHistoryStepMatrixError::ImageLength {
-                class: class.index(),
-            },
-        )?;
-        let decoder =
-            zstd::stream::read::Decoder::new(leaf.compressed_runtime_image).map_err(|source| {
-                EmbeddedHistoryStepMatrixError::Compression {
-                    class: class.index(),
-                    source,
-                }
-            })?;
-        let mut image = Vec::new();
-        decoder
-            .take(read_limit as u64)
-            .read_to_end(&mut image)
-            .map_err(|source| EmbeddedHistoryStepMatrixError::Compression {
-                class: class.index(),
-                source,
-            })?;
-        if image.len() != leaf.runtime_image_bytes {
-            return Err(EmbeddedHistoryStepMatrixError::DecodedLength {
-                class: class.index(),
-                expected: leaf.runtime_image_bytes,
-                actual: image.len(),
-            });
-        }
-        // SAFETY: the private source can be constructed only from tuples
-        // emitted by the release build, which produced this packed image from
-        // the exact canonical relation authenticated under `build_seal`.
-        let compact = Arc::new(
-            unsafe {
-                CompactFieldR1cs::open_build_authenticated_packed_image(&image, leaf.build_seal)
-            }
-            .map_err(|source| EmbeddedHistoryStepMatrixError::Matrix {
-                class: class.index(),
-                source,
-            })?,
-        );
+        let compact = match self.load_cached_image(class) {
+            Some(compact) => compact,
+            None => self.rebuild_from_canonical(class)?,
+        };
         cache.push_back(CachedHistoryStepMatrix {
             class,
             matrix: Arc::clone(&compact),

@@ -13,9 +13,9 @@ use noid_ivc_core::field_r1cs::CompactFieldR1cs;
 use noid_ivc_core::proof::FieldShape;
 use noid_miner::history_step_artifacts::{
     decode_history_step_runtime_metadata_pinned, history_step_matrix_file_name,
-    history_step_runtime_image_file_name, HISTORY_STEP_PACK_LEAF_COUNT,
-    HISTORY_STEP_PACK_LEAF_HASH_DOMAIN, HISTORY_STEP_PACK_VERSION_DIRECTORY,
-    HISTORY_STEP_RUNTIME_METADATA_FILE, HISTORY_STEP_RUNTIME_METADATA_MAX_BYTES,
+    HISTORY_STEP_PACK_LEAF_COUNT, HISTORY_STEP_PACK_LEAF_HASH_DOMAIN,
+    HISTORY_STEP_PACK_VERSION_DIRECTORY, HISTORY_STEP_RUNTIME_METADATA_FILE,
+    HISTORY_STEP_RUNTIME_METADATA_MAX_BYTES,
 };
 use noid_poseidon2b::native::poseidon2b_hash_byte_slices;
 use noid_recursive::acceptance::history_step_bank::CanonicalHistoryStepClassId;
@@ -39,7 +39,6 @@ struct BuildAuthenticatedLeafSeal {
 
 struct BuildAuthenticatedLeaf {
     seal: BuildAuthenticatedLeafSeal,
-    runtime_image_bytes: usize,
 }
 
 fn main() {
@@ -139,11 +138,10 @@ fn embed_release_pack(
             &format!("HistoryStep matrix leaf {}", leaf_path.display()),
         );
         let entry = runtime_metadata.bank().entry(class);
-        let (built, compressed_runtime_image) =
-            authenticate_leaf(class, &compressed, entry.shape(), entry.matrix_digest());
+        let built = authenticate_leaf(class, &compressed, entry.shape(), entry.matrix_digest());
         write_if_changed(
-            &staged_directory.join(history_step_runtime_image_file_name(class)),
-            &compressed_runtime_image,
+            &staged_directory.join(history_step_matrix_file_name(class)),
+            &compressed,
         );
         build_leaves.push(built);
         println!("cargo:rerun-if-changed={}", leaf_path.display());
@@ -160,7 +158,7 @@ fn authenticate_leaf(
     compressed: &[u8],
     shape: FieldShape,
     statement_digest: [u8; 32],
-) -> (BuildAuthenticatedLeaf, Vec<u8>) {
+) -> BuildAuthenticatedLeaf {
     let label = history_step_matrix_file_name(class);
     let mut decoder = zstd::stream::read::Decoder::new(compressed)
         .unwrap_or_else(|error| panic!("open compressed HistoryStep matrix {label}: {error}"));
@@ -177,28 +175,18 @@ fn authenticate_leaf(
         "HistoryStep matrix {label} exceeds the canonical size bound"
     );
     let canonical_bytes = canonical.len();
-    let relation = CompactFieldR1cs::open(canonical.into_boxed_slice(), shape, statement_digest)
+    // Full authentication of the exact embedded bytes. The packed runtime
+    // layout is deliberately not built here: the node derives it once per
+    // release into its local runtime cache.
+    let _relation = CompactFieldR1cs::open(canonical.into_boxed_slice(), shape, statement_digest)
         .unwrap_or_else(|error| panic!("authenticate HistoryStep matrix {label}: {error}"));
-    let packed = relation
-        .into_startup_packed()
-        .unwrap_or_else(|error| panic!("pack HistoryStep matrix {label}: {error}"));
-    let runtime_image = packed
-        .encode_startup_packed_image()
-        .unwrap_or_else(|error| panic!("encode runtime HistoryStep matrix {label}: {error}"));
-    let runtime_image_bytes = runtime_image.len();
-    let compressed_runtime_image = zstd::stream::encode_all(runtime_image.as_ref(), 9)
-        .unwrap_or_else(|error| panic!("compress runtime HistoryStep matrix {label}: {error}"));
-    (
-        BuildAuthenticatedLeaf {
-            seal: BuildAuthenticatedLeafSeal {
-                shape,
-                statement_digest,
-                canonical_bytes,
-            },
-            runtime_image_bytes,
+    BuildAuthenticatedLeaf {
+        seal: BuildAuthenticatedLeafSeal {
+            shape,
+            statement_digest,
+            canonical_bytes,
         },
-        compressed_runtime_image,
-    )
+    }
 }
 
 fn read_bounded(path: &Path, max_bytes: u64) -> Vec<u8> {
@@ -292,9 +280,8 @@ fn render_generated_pack(
         let seal = leaf.seal;
         writeln!(
             &mut generated,
-            "        unsafe {{ noid_miner::EmbeddedHistoryStepMatrixLeaf::from_release_build(\n            noid_recursive::acceptance::history_step_bank::CanonicalHistoryStepClassId::from_index({index}).unwrap(),\n            include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{STAGED_DIRECTORY}/{}\")),\n            {},\n            noid_ivc_core::field_r1cs::BuildAuthenticatedFieldR1csSeal::from_release_build(\n                noid_ivc_core::proof::FieldShape {{ m: {}, k_log: {}, k_skip: {}, const_pin: {} }},\n                {},\n                {},\n            ),\n        ) }},",
-            history_step_runtime_image_file_name(class),
-            leaf.runtime_image_bytes,
+            "        unsafe {{ noid_miner::EmbeddedHistoryStepMatrixLeaf::from_release_build(\n            noid_recursive::acceptance::history_step_bank::CanonicalHistoryStepClassId::from_index({index}).unwrap(),\n            include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{STAGED_DIRECTORY}/{}\")),\n            noid_ivc_core::field_r1cs::BuildAuthenticatedFieldR1csSeal::from_release_build(\n                noid_ivc_core::proof::FieldShape {{ m: {}, k_log: {}, k_skip: {}, const_pin: {} }},\n                {},\n                {},\n            ),\n        ) }},",
+            history_step_matrix_file_name(class),
             seal.shape.m,
             seal.shape.k_log,
             seal.shape.k_skip,

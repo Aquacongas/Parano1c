@@ -4,8 +4,10 @@
 //! Build-authenticated embedded `HistoryStep` release pack.
 //!
 //! Development builds may contain no pack.  Official release builds contain
-//! one pinned runtime-metadata artifact and the sixteen canonical class
-//! matrices, all authenticated by `build.rs` before rustc embeds them.
+//! one pinned runtime-metadata artifact and the four canonical class
+//! matrices, all authenticated by `build.rs` before rustc embeds them. The
+//! packed runtime layout is derived once per release into the node's local
+//! runtime cache directory.
 
 use noid_miner::{
     EmbeddedHistoryStepMatrixError, EmbeddedHistoryStepMatrixLeaf, EmbeddedHistoryStepMatrixSource,
@@ -29,10 +31,15 @@ impl EmbeddedHistoryStepPack {
 
     pub fn matrix_source(
         &self,
+        runtime_cache_directory: Option<std::path::PathBuf>,
     ) -> Result<EmbeddedHistoryStepMatrixSource, EmbeddedHistoryStepMatrixError> {
         // SAFETY: this private pack is emitted only by `noid_node/build.rs`,
-        // which authenticates and transforms every pinned canonical leaf.
-        unsafe { EmbeddedHistoryStepMatrixSource::from_release_build(self.leaves) }
+        // which authenticates every pinned canonical leaf.
+        let source = unsafe { EmbeddedHistoryStepMatrixSource::from_release_build(self.leaves) }?;
+        Ok(match runtime_cache_directory {
+            Some(directory) => source.with_runtime_cache(directory),
+            None => source,
+        })
     }
 
     pub fn embedded_bytes_total(&self) -> usize {
@@ -40,7 +47,7 @@ impl EmbeddedHistoryStepPack {
             + self
                 .leaves
                 .iter()
-                .map(|leaf| leaf.compressed_runtime_image().len())
+                .map(|leaf| leaf.compressed_canonical().len())
                 .sum::<usize>()
     }
 }
@@ -69,8 +76,8 @@ mod tests {
                 leaf.class(),
                 CanonicalHistoryStepClassId::from_index(index).unwrap()
             );
-            assert!(!leaf.compressed_runtime_image().is_empty());
-            assert!(leaf.runtime_image_bytes() > 0);
+            assert!(!leaf.compressed_canonical().is_empty());
+            assert!(leaf.build_seal().canonical_bytes() > 0);
             assert!(leaf.build_seal().canonical_bytes() > 0);
         }
     }
