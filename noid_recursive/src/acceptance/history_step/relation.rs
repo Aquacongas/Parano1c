@@ -24,7 +24,12 @@ use crate::acceptance::history_step_bank::{
 };
 use noid_ivc_core::deep_chain::schedule::TranscriptOp;
 use noid_ivc_core::field_circuit::f128_from_u128;
-pub const HISTORY_STEP_WIRE_VERSION: u8 = 1;
+pub const HISTORY_STEP_WIRE_VERSION: u8 = 2;
+
+const _: () = assert!(
+    HISTORY_STEP_WIRE_VERSION == noid_chain::history_step::HISTORY_STEP_TERMINAL_VERSION,
+    "recursive terminal wire version must equal the chain metadata version"
+);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HistoryStepSidecarOperation {

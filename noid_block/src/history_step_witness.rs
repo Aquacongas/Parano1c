@@ -165,14 +165,8 @@ impl<const TIER: usize> PreparedHistoryStepWitness<TIER> {
     pub fn finish_template(
         self,
         runtime: &HistoryStepRuntime,
-    ) -> Result<
-        (
-            Block,
-            noid_recursive::BuiltHistoryStep,
-            ChainAccumulator,
-        ),
-        HistoryStepWitnessError,
-    > {
+    ) -> Result<(Block, noid_recursive::BuiltHistoryStep, ChainAccumulator), HistoryStepWitnessError>
+    {
         let Self {
             template,
             parent_header,
