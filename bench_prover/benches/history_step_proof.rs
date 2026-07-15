@@ -16,8 +16,11 @@
 //! B255-after-B255 class. With no filter, all four B8-parent tiers run.
 //!
 //! Honest native-valid fixtures and matrix assembly are setup.  Each reported
-//! `prove_ms` covers only production HistoryStep proof + terminal creation;
-//! `verify_ms` covers bounded wire decode and complete terminal verification.
+//! `prove_ms` covers only production HistoryStep proof + terminal creation —
+//! in the nonce-free pipeline this entire cost sits before PoW; the post-nonce
+//! path is one native PoW check plus the atomic commit and is measured live
+//! as `nonce_to_commit_ms`.  `verify_ms` covers bounded wire decode and
+//! complete terminal verification.
 
 use std::collections::VecDeque;
 use std::fs::File;
