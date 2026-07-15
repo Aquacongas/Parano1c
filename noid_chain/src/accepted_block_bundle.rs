@@ -533,4 +533,43 @@ mod tests {
             Err(AcceptedBlockBundleError::TrailingBytes { .. })
         ));
     }
+
+    // ----------------------------------------------------------------------
+    // v2 phase-1 semantic-binding catalog. Staged red; un-ignored when the
+    // terminal prefix binds `(height, semantic_id)` instead of
+    // `(height, block_id)`. Each name states the exact obligation.
+    // ----------------------------------------------------------------------
+
+    /// A terminal whose `semantic_id` does not equal the semantic projection
+    /// of the decoded header must be rejected before any state mutation.
+    #[test]
+    #[ignore = "v2 phase 1: semantic terminal prefix not implemented"]
+    fn terminal_with_mismatched_semantic_id_is_rejected() {
+        unimplemented!("v2 phase 1");
+    }
+
+    /// A valid terminal replayed under a bundle at a different height must
+    /// fail the `(height, semantic_id)` binding.
+    #[test]
+    #[ignore = "v2 phase 1: semantic terminal prefix not implemented"]
+    fn terminal_reused_under_different_height_is_rejected() {
+        unimplemented!("v2 phase 1");
+    }
+
+    /// Altering any semantic header field (state root, tx root, timestamp,
+    /// miner address, counters) changes the recomputed projection and must
+    /// invalidate a terminal minted for the original template.
+    #[test]
+    #[ignore = "v2 phase 1: semantic terminal prefix not implemented"]
+    fn terminal_reused_under_altered_semantic_field_is_rejected() {
+        unimplemented!("v2 phase 1");
+    }
+
+    /// Positive: two headers differing only in nonce share one semantic
+    /// projection; one terminal must bind both encodings identically.
+    #[test]
+    #[ignore = "v2 phase 1: semantic terminal prefix not implemented"]
+    fn two_nonces_over_one_semantic_id_share_semantics() {
+        unimplemented!("v2 phase 1");
+    }
 }

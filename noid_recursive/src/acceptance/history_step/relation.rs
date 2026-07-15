@@ -2363,4 +2363,36 @@ mod tests {
             }) if actual == class,
         ));
     }
+
+    // ----------------------------------------------------------------------
+    // v2 phase-1 semantic-binding catalog. Staged red; un-ignored when the
+    // parent-seal sub-relation lands. Each name states the exact obligation.
+    // ----------------------------------------------------------------------
+
+    /// The parent-seal replay must constrain `H_BLOCKHDR(parent header)` to
+    /// equal the child header's `prev_block_hash`; a mismatched witness
+    /// header must be unsatisfiable.
+    #[test]
+    #[ignore = "v2 phase 1: parent-seal sub-relation not implemented"]
+    fn parent_seal_replay_rejects_wrong_prev_block_hash() {
+        unimplemented!("v2 phase 1");
+    }
+
+    /// At a 144-boundary parent height the accumulator epoch lanes must be
+    /// updated from the block id derived inside the parent-seal replay, and
+    /// passed through unchanged at every other height (143 -> 144 edge).
+    #[test]
+    #[ignore = "v2 phase 1: parent-seal sub-relation not implemented"]
+    fn epoch_lane_updates_from_derived_parent_id_at_boundary() {
+        unimplemented!("v2 phase 1");
+    }
+
+    /// The height-1 base selector must accept only the pinned canonical
+    /// genesis header/id; any other parent must be unsatisfiable under the
+    /// gated parent obligations.
+    #[test]
+    #[ignore = "v2 phase 1: semantic base-case selector not implemented"]
+    fn base_case_selector_rejects_non_genesis_parent() {
+        unimplemented!("v2 phase 1");
+    }
 }
