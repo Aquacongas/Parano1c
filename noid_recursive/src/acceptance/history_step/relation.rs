@@ -2424,34 +2424,227 @@ mod tests {
     }
 
     // ----------------------------------------------------------------------
-    // v2 phase-1 semantic-binding catalog. Staged red; un-ignored when the
-    // parent-seal sub-relation lands. Each name states the exact obligation.
+    // v2 phase-1 semantic-binding catalog: the exact parent-seal glue the
+    // recursive assembly adds, exercised in isolation over real headers.
     // ----------------------------------------------------------------------
 
+    fn seal_fixture_parent(height: u64) -> noid_chain::BlockHeader {
+        noid_chain::BlockHeader {
+            prev_block_hash: [0x10; 32],
+            state_root: [0x22; 32],
+            tx_root: [0x2A; 32],
+            timestamp: height * 10,
+            height,
+            miner_address: noid_poseidon2b::primitives::Address([0x66; 32]),
+            nonce: 0xC0FFEE ^ height as u128,
+            difficulty_target: [0xFF; 32],
+            log_slots: 8,
+            active_slot_count: 7,
+            alloc_counter: 9,
+        }
+    }
+
+    /// Build the parent seal plus the exact glue pins the recursive assembly
+    /// adds: derived block id against the child's `prev_block_hash` wires and
+    /// derived semantic id against the verified parent-tip lanes.
+    fn seal_glue_satisfies(
+        parent: &noid_chain::BlockHeader,
+        child_prev: [u8; 32],
+        claimed_parent_tip: [u8; 32],
+    ) -> bool {
+        use crate::acceptance::trace::accepted_claim_batch::digest_lanes;
+
+        let mut builder = FieldR1csBuilder::new();
+        let seal = ParentSealTrace::alloc(&mut builder, parent);
+        let prev_wires = digest_lanes(&child_prev).map(|lane| {
+            LinExpr::from_wire(builder.alloc_f128(crate::acceptance::trace::flat_of(lane)))
+        });
+        let tip_wires = digest_lanes(&claimed_parent_tip).map(|lane| {
+            LinExpr::from_wire(builder.alloc_f128(crate::acceptance::trace::flat_of(lane)))
+        });
+        for lane in 0..2 {
+            pin_eq(&mut builder, &seal.block_id[lane], &prev_wires[lane]);
+            pin_eq(&mut builder, &seal.semantic_id[lane], &tip_wires[lane]);
+        }
+        let (r1cs, witness) = builder.build();
+        r1cs.satisfies(&witness)
+    }
+
     /// The parent-seal replay must constrain `H_BLOCKHDR(parent header)` to
-    /// equal the child header's `prev_block_hash`; a mismatched witness
-    /// header must be unsatisfiable.
+    /// equal the child header's `prev_block_hash`; a mismatched link or a
+    /// tampered parent witness must be unsatisfiable.
     #[test]
-    #[ignore = "v2 phase 1 gate: needs regenerated pack fixtures (gadget-level twin is green)"]
     fn parent_seal_replay_rejects_wrong_prev_block_hash() {
-        unimplemented!("v2 phase 1");
+        let parent = seal_fixture_parent(9);
+        let link = noid_chain::hash_block_header(&parent);
+        let tip = noid_chain::block_header::semantic_header_id(&parent);
+        assert!(seal_glue_satisfies(&parent, link, tip));
+
+        let mut wrong_link = link;
+        wrong_link[0] ^= 1;
+        assert!(!seal_glue_satisfies(&parent, wrong_link, tip));
+
+        // A different nonce keeps the semantic projection but changes the
+        // derived chain link: the replay must expose exactly that.
+        let mut renonced = parent;
+        renonced.nonce ^= 1;
+        assert!(!seal_glue_satisfies(&renonced, link, tip));
+        assert!(seal_glue_satisfies(
+            &renonced,
+            noid_chain::hash_block_header(&renonced),
+            tip,
+        ));
+
+        // A tampered semantic field breaks the verified-tip glue.
+        let mut tampered = parent;
+        tampered.state_root = [0x77; 32];
+        assert!(!seal_glue_satisfies(
+            &tampered,
+            noid_chain::hash_block_header(&tampered),
+            tip,
+        ));
     }
 
     /// At a 144-boundary parent height the accumulator epoch lanes must be
-    /// updated from the block id derived inside the parent-seal replay, and
+    /// written from the block id derived inside the parent-seal replay, and
     /// passed through unchanged at every other height (143 -> 144 edge).
     #[test]
-    #[ignore = "v2 phase 1 gate: needs regenerated pack fixtures (gadget-level twin is green)"]
     fn epoch_lane_updates_from_derived_parent_id_at_boundary() {
-        unimplemented!("v2 phase 1");
+        use crate::acceptance::trace::accepted_claim_batch::{
+            build_direct_accumulator_transition_slot, digest_lanes, AccumulatorWires,
+            DirectChildWires,
+        };
+
+        for parent_height in [143u64, 144] {
+            let parent = seal_fixture_parent(parent_height);
+            let parent_id = noid_chain::hash_block_header(&parent);
+            let start = ChainAccumulator {
+                height: parent.height,
+                tip_semantic_id: noid_chain::block_header::semantic_header_id(&parent),
+                state_root: parent.state_root,
+                log_slots: parent.log_slots,
+                active_slot_count: parent.active_slot_count,
+                alloc_counter: parent.alloc_counter,
+                epoch_anchor_id: [0x33; 32],
+            };
+            let child = noid_chain::BlockHeader {
+                prev_block_hash: parent_id,
+                state_root: [0x44; 32],
+                tx_root: [0x55; 32],
+                timestamp: parent.timestamp + 10,
+                height: parent.height + 1,
+                miner_address: noid_poseidon2b::primitives::Address([0x66; 32]),
+                nonce: 7,
+                difficulty_target: [0xFF; 32],
+                log_slots: parent.log_slots,
+                active_slot_count: 8,
+                alloc_counter: 10,
+            };
+            let end = start.advance(&parent, &child).unwrap();
+            if parent_height % 144 == 0 {
+                assert_eq!(end.epoch_anchor_id, parent_id);
+            } else {
+                assert_eq!(end.epoch_anchor_id, start.epoch_anchor_id);
+            }
+
+            // The transition consumes the REPLAY-derived parent id, exactly
+            // as the recursive assembly wires it.
+            let satisfies = |end: &ChainAccumulator| {
+                let mut builder = FieldR1csBuilder::new();
+                let seal = ParentSealTrace::alloc(&mut builder, &parent);
+                let start_wires = AccumulatorWires::alloc(&mut builder, &start);
+                let end_wires = AccumulatorWires::alloc(&mut builder, end);
+                let child_wires = DirectChildWires {
+                    semantic_id: digest_lanes(&noid_chain::block_header::semantic_header_id(
+                        &child,
+                    ))
+                    .map(|lane| {
+                        LinExpr::from_wire(
+                            builder.alloc_f128(crate::acceptance::trace::flat_of(lane)),
+                        )
+                    }),
+                    prev_block_hash: digest_lanes(&child.prev_block_hash).map(|lane| {
+                        LinExpr::from_wire(
+                            builder.alloc_f128(crate::acceptance::trace::flat_of(lane)),
+                        )
+                    }),
+                    state_root: digest_lanes(&child.state_root).map(|lane| {
+                        LinExpr::from_wire(
+                            builder.alloc_f128(crate::acceptance::trace::flat_of(lane)),
+                        )
+                    }),
+                    height: LinExpr::from_wire(builder.alloc_f128(
+                        crate::acceptance::trace::flat_of(noid_core::Block128::from(
+                            child.height as u128,
+                        )),
+                    )),
+                    log_slots: LinExpr::from_wire(builder.alloc_f128(
+                        crate::acceptance::trace::flat_of(noid_core::Block128::from(
+                            child.log_slots as u128,
+                        )),
+                    )),
+                    active_slot_count: LinExpr::from_wire(builder.alloc_f128(
+                        crate::acceptance::trace::flat_of(noid_core::Block128::from(
+                            child.active_slot_count as u128,
+                        )),
+                    )),
+                    alloc_counter: LinExpr::from_wire(builder.alloc_f128(
+                        crate::acceptance::trace::flat_of(noid_core::Block128::from(
+                            child.alloc_counter as u128,
+                        )),
+                    )),
+                };
+                build_direct_accumulator_transition_slot(
+                    &mut builder,
+                    &start_wires,
+                    &child_wires,
+                    &end_wires,
+                    &seal.block_id,
+                );
+                let (r1cs, witness) = builder.build();
+                r1cs.satisfies(&witness)
+            };
+            assert!(satisfies(&end), "parent height {parent_height}");
+            let mut wrong_epoch = end.clone();
+            wrong_epoch.epoch_anchor_id[0] ^= 1;
+            assert!(!satisfies(&wrong_epoch), "parent height {parent_height}");
+        }
     }
 
     /// The height-1 base selector must accept only the pinned canonical
-    /// genesis header/id; any other parent must be unsatisfiable under the
-    /// gated parent obligations.
+    /// genesis header; any other parent is unsatisfiable under the gated
+    /// genesis-constant pins the base assembly adds.
     #[test]
-    #[ignore = "v2 phase 1 gate: needs regenerated pack fixtures (gadget-level twin is green)"]
     fn base_case_selector_rejects_non_genesis_parent() {
-        unimplemented!("v2 phase 1");
+        use crate::acceptance::trace::accepted_claim_batch::digest_lanes;
+
+        let base_pins_satisfy = |parent: &noid_chain::BlockHeader| {
+            let genesis = noid_chain::consensus::genesis_header();
+            let genesis_id = digest_lanes(&noid_chain::hash_block_header(&genesis));
+            let genesis_semantic =
+                digest_lanes(&noid_chain::block_header::semantic_header_id(&genesis));
+            let mut builder = FieldR1csBuilder::new();
+            let seal = ParentSealTrace::alloc(&mut builder, parent);
+            for lane in 0..2 {
+                pin_eq(
+                    &mut builder,
+                    &seal.block_id[lane],
+                    &LinExpr::constant(crate::acceptance::trace::flat_of(genesis_id[lane])),
+                );
+                pin_eq(
+                    &mut builder,
+                    &seal.semantic_id[lane],
+                    &LinExpr::constant(crate::acceptance::trace::flat_of(genesis_semantic[lane])),
+                );
+            }
+            let (r1cs, witness) = builder.build();
+            r1cs.satisfies(&witness)
+        };
+
+        assert!(base_pins_satisfy(&noid_chain::consensus::genesis_header()));
+        assert!(!base_pins_satisfy(&seal_fixture_parent(0)));
+        let mut renonced_genesis = noid_chain::consensus::genesis_header();
+        renonced_genesis.nonce ^= 1;
+        assert!(!base_pins_satisfy(&renonced_genesis));
     }
 }
