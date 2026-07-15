@@ -154,21 +154,27 @@ impl<const TIER: usize> PreparedHistoryStepWitness<TIER> {
         self.prepared_history_step.retained_witness_bytes()
     }
 
-    /// Seal the sole nonce field, run native header/consensus validation, and
-    /// consume the prepared authority into the complete recursive witness.
+    /// Run every native consensus check of the exact template except proof
+    /// of work, and consume the prepared authority into the complete
+    /// nonce-free recursive witness.
     ///
-    /// The returned block is the exact body whose components were prepared.
-    /// It is still not accepted: the caller must prove HistoryStep and commit
-    /// the resulting `(block, terminal)` bundle atomically.
-    pub fn finish(
+    /// The relation and terminal bind the semantic projection, so the block
+    /// can be proven before PoW; the caller seals the winning nonce with one
+    /// native `validate_pow` and commits the `(block, terminal)` bundle
+    /// atomically. The returned end boundary is final for every nonce.
+    pub fn finish_template(
         self,
         runtime: &HistoryStepRuntime,
-        nonce: u128,
-        start_accumulator: &ChainAccumulator,
-        end_accumulator: &ChainAccumulator,
-    ) -> Result<(Block, noid_recursive::BuiltHistoryStep), HistoryStepWitnessError> {
+    ) -> Result<
+        (
+            Block,
+            noid_recursive::BuiltHistoryStep,
+            ChainAccumulator,
+        ),
+        HistoryStepWitnessError,
+    > {
         let Self {
-            mut template,
+            template,
             parent_header,
             expected_start,
             previous_timestamps,
@@ -178,12 +184,7 @@ impl<const TIER: usize> PreparedHistoryStepWitness<TIER> {
             prepared_history_step,
         } = self;
 
-        if start_accumulator != &expected_start {
-            return Err(HistoryStepWitnessError::StartAccumulatorChanged);
-        }
-
-        template.header.nonce = nonce;
-        validate_block_checks(
+        noid_chain::consensus::validation::validate_block_checks_template(
             &template,
             &parent_header,
             &previous_timestamps,
@@ -192,18 +193,15 @@ impl<const TIER: usize> PreparedHistoryStepWitness<TIER> {
             &asert_anchor,
         )?;
 
-        let expected_end = start_accumulator
+        let end_accumulator = expected_start
             .advance(&parent_header, &template.header)
             .map_err(HistoryStepWitnessError::AccumulatorAdvance)?;
-        if end_accumulator != &expected_end {
-            return Err(HistoryStepWitnessError::EndAccumulatorMismatch);
-        }
 
-        let built = prepared_history_step.seal_nonce(runtime, nonce)?;
-        if built.semantic_id() != expected_end.tip_semantic_id || built.nonce() != nonce {
+        let built = prepared_history_step.seal_nonce(runtime, template.header.nonce)?;
+        if built.semantic_id() != end_accumulator.tip_semantic_id {
             return Err(HistoryStepWitnessError::EndAccumulatorMismatch);
         }
-        Ok((template, built))
+        Ok((template, built, end_accumulator))
     }
 }
 

@@ -29,7 +29,9 @@ enum PreparedWitness {
 /// A single-use, nonce-independent block witness prepared entirely by the
 /// node. The external PoW worker never receives it and can change only nonce.
 pub struct PreparedBlockAttempt {
-    witness: PreparedWitness,
+    block: Block,
+    terminal_bytes: Vec<u8>,
+    end_accumulator: noid_recursive::ChainAccumulator,
     start_accumulator: noid_recursive::ChainAccumulator,
     parent_header: noid_chain::BlockHeader,
     expected_parent_id: [u8; 32],
@@ -191,18 +193,43 @@ impl PreparedBlockAttempt {
         }
         .map_err(|error| error.to_string())?;
 
-        let retained_witness_bytes = match &witness {
-            PreparedWitness::B8(witness) => witness.retained_witness_bytes(),
-            PreparedWitness::B32(witness) => witness.retained_witness_bytes(),
-            PreparedWitness::B64(witness) => witness.retained_witness_bytes(),
-            PreparedWitness::B255(witness) => witness.retained_witness_bytes(),
+        // The relation is nonce-free: finish the exact template (every native
+        // check except PoW) and prove the complete HistoryStep before any
+        // nonce search. Post-nonce work is one native PoW check + atomic
+        // commit.
+        macro_rules! finish_and_prove {
+            ($witness:expr) => {{
+                let (block, built, end) = $witness
+                    .finish_template(runtime)
+                    .map_err(|error| error.to_string())?;
+                let terminal =
+                    noid_recursive::acceptance::history_step::prove_built_history_step_terminal(
+                        runtime, &built,
+                    )
+                    .map_err(|error| error.to_string())?;
+                let terminal_bytes =
+                    noid_recursive::acceptance::history_step::encode_history_step_terminal(
+                        runtime, &terminal,
+                    )
+                    .map_err(|error| error.to_string())?;
+                (block, terminal_bytes, end)
+            }};
+        }
+        let (block, terminal_bytes, end_accumulator) = match witness {
+            PreparedWitness::B8(witness) => finish_and_prove!(witness),
+            PreparedWitness::B32(witness) => finish_and_prove!(witness),
+            PreparedWitness::B64(witness) => finish_and_prove!(witness),
+            PreparedWitness::B255(witness) => finish_and_prove!(witness),
         };
+
         let retained_bytes = payload_weight
-            .checked_add(retained_witness_bytes)
+            .checked_add(terminal_bytes.len())
             .ok_or_else(|| "prepared HistoryStep retained-byte weight overflow".to_string())?;
 
         Ok(Self {
-            witness,
+            block,
+            terminal_bytes,
+            end_accumulator,
             start_accumulator,
             parent_header: parent,
             expected_parent_id,
@@ -214,21 +241,13 @@ impl PreparedBlockAttempt {
     }
 
     pub fn pow_header(&self, nonce: u128) -> noid_chain::BlockHeader {
-        match &self.witness {
-            PreparedWitness::B8(witness) => witness.header_for_nonce(nonce),
-            PreparedWitness::B32(witness) => witness.header_for_nonce(nonce),
-            PreparedWitness::B64(witness) => witness.header_for_nonce(nonce),
-            PreparedWitness::B255(witness) => witness.header_for_nonce(nonce),
-        }
+        let mut header = self.block.header;
+        header.nonce = nonce;
+        header
     }
 
     pub fn user_transaction_count(&self) -> usize {
-        match &self.witness {
-            PreparedWitness::B8(witness) => witness.user_transaction_count(),
-            PreparedWitness::B32(witness) => witness.user_transaction_count(),
-            PreparedWitness::B64(witness) => witness.user_transaction_count(),
-            PreparedWitness::B255(witness) => witness.user_transaction_count(),
-        }
+        self.block.transactions.len().saturating_sub(1)
     }
 
     pub const fn expected_parent_id(&self) -> [u8; 32] {
@@ -251,76 +270,34 @@ impl PreparedBlockAttempt {
         self.retained_bytes
     }
 
-    /// Seal the nonce, require valid PoW, prove the exact HistoryStep, and
-    /// create the only complete network/storage block object.
-    pub fn prove(self, runtime: &HistoryStepRuntime, nonce: u128) -> Result<ProvedBlock, String> {
+    /// Seal the winning nonce with one native PoW check and create the only
+    /// complete network/storage block object.
+    ///
+    /// The complete HistoryStep terminal was already proven at preparation:
+    /// the relation is nonce-free and binds the semantic projection, so it
+    /// covers every nonce of this exact template. `runtime` stays in the
+    /// signature as the proving-authority witness of the caller's phase.
+    pub fn prove(self, _runtime: &HistoryStepRuntime, nonce: u128) -> Result<ProvedBlock, String> {
         let sealed_header = self.pow_header(nonce);
         validate_pow(&sealed_header).map_err(|error| format!("proof of work: {error}"))?;
         let end = self
             .start_accumulator
             .advance(&self.parent_header, &sealed_header)
             .map_err(|error| format!("sealed accumulator transition failed: {error:?}"))?;
-        let start = &self.start_accumulator;
-
-        let (block, terminal) = match self.witness {
-            PreparedWitness::B8(witness) => {
-                let (block, built) = witness
-                    .finish(runtime, nonce, start, &end)
-                    .map_err(|error| error.to_string())?;
-                let terminal =
-                    noid_recursive::acceptance::history_step::prove_built_history_step_terminal(
-                        runtime, &built,
-                    )
-                    .map_err(|error| error.to_string())?;
-                (block, terminal)
-            }
-            PreparedWitness::B32(witness) => {
-                let (block, built) = witness
-                    .finish(runtime, nonce, start, &end)
-                    .map_err(|error| error.to_string())?;
-                let terminal =
-                    noid_recursive::acceptance::history_step::prove_built_history_step_terminal(
-                        runtime, &built,
-                    )
-                    .map_err(|error| error.to_string())?;
-                (block, terminal)
-            }
-            PreparedWitness::B64(witness) => {
-                let (block, built) = witness
-                    .finish(runtime, nonce, start, &end)
-                    .map_err(|error| error.to_string())?;
-                let terminal =
-                    noid_recursive::acceptance::history_step::prove_built_history_step_terminal(
-                        runtime, &built,
-                    )
-                    .map_err(|error| error.to_string())?;
-                (block, terminal)
-            }
-            PreparedWitness::B255(witness) => {
-                let (block, built) = witness
-                    .finish(runtime, nonce, start, &end)
-                    .map_err(|error| error.to_string())?;
-                let terminal =
-                    noid_recursive::acceptance::history_step::prove_built_history_step_terminal(
-                        runtime, &built,
-                    )
-                    .map_err(|error| error.to_string())?;
-                (block, terminal)
-            }
-        };
-        let terminal_bytes =
-            noid_recursive::acceptance::history_step::encode_history_step_terminal(
-                runtime, &terminal,
-            )
-            .map_err(|error| error.to_string())?;
-        // SAFETY: `finish` performed the complete native consensus checks for
-        // this exact block, and `terminal_bytes` is the canonical encoding of
-        // the terminal returned directly by the pinned prover above. The
-        // local commit intentionally does not verify its own freshly-authored
-        // proof a second time.
+        if end != self.end_accumulator {
+            return Err("sealed boundary drifted from the proven template".to_string());
+        }
+        let mut block = self.block;
+        block.header.nonce = nonce;
+        // SAFETY: `finish_template` performed the complete native consensus
+        // checks for this exact template, `validate_pow` above checked the
+        // only nonce-dependent rule, and `terminal_bytes` is the canonical
+        // encoding of the terminal returned directly by the pinned prover at
+        // preparation. The local commit intentionally does not verify its own
+        // freshly-authored proof a second time.
         let local_commit = unsafe {
             self.state_commit
-                .seal_after_trusted_history_step_proof_unchecked(block, terminal_bytes)
+                .seal_after_trusted_history_step_proof_unchecked(block, self.terminal_bytes)
         }?;
         Ok(ProvedBlock { local_commit })
     }

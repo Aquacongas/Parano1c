@@ -1586,7 +1586,6 @@ impl MdbxChainContext {
     where
         A: FnOnce(&HistoryStepTerminalClaim<'_>) -> Result<(), String>,
     {
-        let hash = block_id(&header);
         if header.height == 0 {
             return Err(MdbxContextError::Corrupt(
                 "snapshot boundary header metadata is invalid",

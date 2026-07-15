@@ -36,7 +36,7 @@ use crate::consensus::{
     checks::{validate_block_slot_conflicts, validate_tx_consensus},
     emission::max_coinbase_value_from_claimable_fee_sum,
     fees::{claimable_fee_for_tx_body, required_fee_for_tx_body},
-    header::{validate_header, validate_header_timeless},
+    header::{validate_header, validate_header_template, validate_header_timeless},
     params::{
         BLOCK_MAX_ACTIONS, BLOCK_MAX_DISTINCT_SEGMENTS, BLOCK_MAX_LIVE_INPUTS, BLOCK_MAX_TXS,
         BLOCK_MAX_USER_OUTPUTS, BLOCK_MAX_USER_TXS, LOG_SEGMENT_SIZE,
@@ -262,6 +262,7 @@ pub fn validate_block_checks(
         prev_active_counts,
         anchor,
         Some(local_time),
+        true,
     )
 }
 
@@ -270,6 +271,27 @@ pub fn validate_block_checks(
 /// This is the deterministic boundary for historical history proofs. Live node
 /// admission must continue to use [`validate_block_checks`] so far-future
 /// timestamps are filtered before relay/acceptance.
+/// Run every block consensus check of a node-owned template except proof of
+/// work (see `validate_header_template`).
+pub fn validate_block_checks_template(
+    block: &Block,
+    parent: &BlockHeader,
+    prev_timestamps: &[u64],
+    prev_active_counts: &[u64],
+    local_time: u64,
+    anchor: &AnchorInfo,
+) -> Result<(), ConsensusError> {
+    validate_block_checks_inner(
+        block,
+        parent,
+        prev_timestamps,
+        prev_active_counts,
+        anchor,
+        Some(local_time),
+        false,
+    )
+}
+
 pub fn validate_block_checks_timeless(
     block: &Block,
     parent: &BlockHeader,
@@ -284,6 +306,7 @@ pub fn validate_block_checks_timeless(
         prev_active_counts,
         anchor,
         None,
+        true,
     )
 }
 
@@ -294,13 +317,14 @@ fn validate_block_checks_inner(
     prev_active_counts: &[u64],
     anchor: &AnchorInfo,
     local_time: Option<u64>,
+    check_pow: bool,
 ) -> Result<(), ConsensusError> {
     // Bound the raw semantic surface before any O(n) consensus scan.  This is
     // also the first line of defence for direct in-memory callers that did not
     // arrive through the bounded wire decoder.
     validate_block_resource_preflight(block)?;
-    match local_time {
-        Some(local_time) => validate_header(
+    match (local_time, check_pow) {
+        (Some(local_time), true) => validate_header(
             &block.header,
             parent,
             prev_timestamps,
@@ -310,7 +334,17 @@ fn validate_block_checks_inner(
             anchor.anchor_timestamp,
             &anchor.anchor_target,
         )?,
-        None => validate_header_timeless(
+        (Some(local_time), false) => validate_header_template(
+            &block.header,
+            parent,
+            prev_timestamps,
+            prev_active_counts,
+            local_time,
+            anchor.anchor_height,
+            anchor.anchor_timestamp,
+            &anchor.anchor_target,
+        )?,
+        (None, _) => validate_header_timeless(
             &block.header,
             parent,
             prev_timestamps,

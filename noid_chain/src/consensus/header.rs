@@ -55,6 +55,37 @@ pub fn validate_header(
         anchor_height,
         anchor_timestamp,
         anchor_target,
+        true,
+    )
+}
+
+/// Validate every header rule of a node-owned template except proof of work.
+///
+/// The relation and terminal are nonce-free, so a miner finishes and proves
+/// the complete HistoryStep before PoW; the winning nonce is then checked by
+/// exactly one native `validate_pow` at seal time. This variant exists only
+/// for that pre-PoW template path — every acceptance path keeps the full
+/// PoW-checking validators.
+pub fn validate_header_template(
+    header: &BlockHeader,
+    parent: &BlockHeader,
+    prev_timestamps: &[u64],
+    prev_active_counts: &[u64],
+    local_time: u64,
+    anchor_height: u64,
+    anchor_timestamp: u64,
+    anchor_target: &[u8; 32],
+) -> Result<(), ConsensusError> {
+    validate_header_inner(
+        header,
+        parent,
+        prev_timestamps,
+        prev_active_counts,
+        Some(local_time),
+        anchor_height,
+        anchor_timestamp,
+        anchor_target,
+        false,
     )
 }
 
@@ -80,9 +111,11 @@ pub fn validate_header_timeless(
         anchor_height,
         anchor_timestamp,
         anchor_target,
+        true,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_header_inner(
     header: &BlockHeader,
     parent: &BlockHeader,
@@ -92,6 +125,7 @@ fn validate_header_inner(
     anchor_height: u64,
     anchor_timestamp: u64,
     anchor_target: &[u8; 32],
+    check_pow: bool,
 ) -> Result<(), ConsensusError> {
     // 1. Parent hash linkage.
     let expected_parent_hash = block_id(parent);
@@ -124,8 +158,12 @@ fn validate_header_inner(
             .map_err(|_| ConsensusError::BadTimestamp)?;
     }
 
-    // 5. Poseidon2b PoW over semantic header fields.
-    validate_pow(header)?;
+    // 5. Poseidon2b PoW over semantic header fields. Skipped only on the
+    //    miner's nonce-free template path; the winning nonce is validated at
+    //    seal time.
+    if check_pow {
+        validate_pow(header)?;
+    }
 
     // 6. Exact slot-space expansion.
     let expected_log_slots = expected_child_log_slots(
