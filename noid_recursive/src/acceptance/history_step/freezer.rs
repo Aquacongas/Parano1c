@@ -511,8 +511,9 @@ where
 
     // Discover the four matrices traversed by the monotone backbone. Each
     // newly integrated direct VK is installed before that class is ever
-    // proved; H(8,8) receives one extra build because it verifies its own VK.
-    for _ in 0..HISTORY_STEP_CLASS_COUNT {
+    // proved; H(B8) receives one extra build because it verifies its own VK,
+    // so the pass budget is one larger than the class count.
+    for _ in 0..=HISTORY_STEP_CLASS_COUNT {
         let partial = runtime(digests, &parts, &store).map_err(|source| {
             HistoryStepFreezeError::relation(HistoryStepFreezeStage::BootstrapRuntime, None, source)
         })?;
