@@ -136,7 +136,7 @@ cargo build --locked --release -p bench_prover \
   --bin noid_pack_pins
 
 CURRENT_STAGE="canonical matrix generation"
-printf '\n==> Generating HistoryStep runtime metadata and sixteen canonical matrices (zstd level 19)\n'
+printf '\n==> Generating HistoryStep runtime metadata and four canonical matrices (zstd level 19)\n'
 NOID_ARTIFACT_ZSTD_LEVEL=19 \
   "$ROOT_DIR/target/release/noid_matrix_gen" "$PACK_STAGING"
 
@@ -148,18 +148,6 @@ expected_files=(
   history-step-c01.field-r1cs.zst
   history-step-c02.field-r1cs.zst
   history-step-c03.field-r1cs.zst
-  history-step-c04.field-r1cs.zst
-  history-step-c05.field-r1cs.zst
-  history-step-c06.field-r1cs.zst
-  history-step-c07.field-r1cs.zst
-  history-step-c08.field-r1cs.zst
-  history-step-c09.field-r1cs.zst
-  history-step-c10.field-r1cs.zst
-  history-step-c11.field-r1cs.zst
-  history-step-c12.field-r1cs.zst
-  history-step-c13.field-r1cs.zst
-  history-step-c14.field-r1cs.zst
-  history-step-c15.field-r1cs.zst
 )
 for file_name in "${expected_files[@]}"; do
   artifact="$PACK_V1/$file_name"
@@ -170,8 +158,8 @@ done
 shopt -s nullglob
 matrix_leaves=("$PACK_V1"/*.field-r1cs.zst)
 shopt -u nullglob
-(( ${#matrix_leaves[@]} == 16 )) || \
-  die "expected exactly 16 matrix leaves, found ${#matrix_leaves[@]}"
+(( ${#matrix_leaves[@]} == 4 )) || \
+  die "expected exactly 4 matrix leaves, found ${#matrix_leaves[@]}"
 
 shopt -s nullglob dotglob
 pack_entries=("$PACK_V1"/*)
