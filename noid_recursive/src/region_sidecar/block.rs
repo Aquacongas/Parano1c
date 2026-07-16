@@ -1561,7 +1561,7 @@ pub(crate) fn verify_block_region_sidecar_banked_trace_post_commit<C: FsChannelO
         crate::acceptance::trace::with_pin_gate(gate, || {
             verify_block_region_sidecar_trace_post_commit(b, &mut child, vk, proof)
         })?;
-        context.adopt_child_claims_banked(b, child, anchor, slot == live_slot);
+        context.adopt_child_claims_banked(b, child, anchor, gate);
         tails.push(recorder.sample_f128_vec(b, BLOCK_SIDECAR_CHILD_TAIL_LANES));
         recordings.push(recorder.finish());
     }

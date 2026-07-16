@@ -1758,19 +1758,20 @@ impl<'a, C> FieldPostCommitTraceContext<'a, C> {
     }
 
     /// Drain a banked variant's child claims into this sink while keeping the
-    /// batch shape independent of which variant is live.  Every child claim
-    /// gets a freshly allocated wire mirror of its own constant/wire
-    /// coordinate pattern (so both arms cost identical wires and rows): the
-    /// live arm adopts the real claims and discards the mirrors, the dead arm
-    /// adopts the mirrors — witnessed to the caller's anchor claim, whose
-    /// truth the shared batched opening then enforces — and discards the
-    /// unprovable walk claims.
+    /// batch shape independent of which variant is live.  Every adopted
+    /// coordinate and value becomes the gate-selected expression
+    /// `anchor + gate·(walk − anchor)`: with the variant's one-hot gate at
+    /// one it IS the walk claim, at zero it collapses to the caller's anchor
+    /// claim (whose truth the shared batched opening enforces).  The
+    /// expression's structure is fixed by the stream position — the walk
+    /// term always references the (always built) variant walk — so the
+    /// enclosing batch rows never encode which variant is live.
     pub(crate) fn adopt_child_claims_banked<C2>(
         &mut self,
         b: &mut FieldR1csBuilder,
         child: FieldPostCommitTraceContext<'_, C2>,
         anchor: &pcs::QuirkyDirectClaim,
-        live: bool,
+        gate: &LinExpr,
     ) {
         let claims = child.finish();
         for claim in claims {
@@ -1780,25 +1781,24 @@ impl<'a, C> FieldPostCommitTraceContext<'a, C> {
                 anchor.x_rest.len(),
                 "banked claim point arity"
             );
+            let select = |b: &mut FieldR1csBuilder, walk: &LinExpr, anchor: F128| {
+                let anchor = LinExpr::constant(anchor);
+                let delta = mul(b, gate, &walk.add(&anchor));
+                anchor.add(&delta)
+            };
             let x_rest = claim
                 .x_rest
                 .iter()
                 .zip(anchor.x_rest.iter())
-                .map(|(coordinate, &value)| {
-                    if coordinate.is_const() {
-                        LinExpr::constant(value)
-                    } else {
-                        LinExpr::from_wire(b.alloc_f128(value))
-                    }
-                })
+                .map(|(coordinate, &value)| select(b, coordinate, value))
                 .collect();
-            let mirror = QuirkyDirectClaimTrace {
-                z_skip: LinExpr::constant(anchor.z_skip),
+            let selected = QuirkyDirectClaimTrace {
+                z_skip: select(b, &claim.z_skip, anchor.z_skip),
                 k_skip: anchor.k_skip,
                 x_rest,
-                value: LinExpr::from_wire(b.alloc_f128(anchor.value)),
+                value: select(b, &claim.value, anchor.value),
             };
-            self.claims.push(if live { claim } else { mirror });
+            self.claims.push(selected);
         }
     }
 }
