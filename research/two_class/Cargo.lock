@@ -431,7 +431,6 @@ dependencies = [
  "noid_poseidon2b",
  "noid_recursive",
  "noid_tx",
- "zeroize",
 ]
 
 [[package]]

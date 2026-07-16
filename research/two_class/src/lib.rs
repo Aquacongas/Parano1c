@@ -7,7 +7,6 @@
 //! the production Cargo workspace. Only tested PagedSpend semantics and the
 //! m23/m24 parent-union certificate may move into production.
 
-pub mod authorization;
 #[cfg(test)]
 mod circuit_support;
 pub mod geometry;

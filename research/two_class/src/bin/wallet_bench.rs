@@ -9,18 +9,15 @@
 
 use std::time::{Duration, Instant};
 
-use noid_gkr::WalletAuthorizationBundle;
+use noid_gkr::{
+    prove_paged_spend_authorization, verify_paged_spend_authorization, OwnerAuthWitness,
+    WalletAuthorizationBundle,
+};
 use noid_poseidon2b::primitives::{derive_address, SpendSecret};
 use noid_tx::{output_bitmap_bit, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS};
-use paranoid_two_class_research::{
-    authorization::{
-        prove_paged_spend_authorization, verify_paged_spend_authorization,
-        PagedSpendAuthorizationWitness,
-    },
-    paged_spend::{
-        hash_paged_spend, PagedSpendIntent, TxPage, MAX_PAGED_SPEND_INPUTS, PAGED_SPEND_END_BIT,
-        PAGED_SPEND_START_BIT,
-    },
+use paranoid_two_class_research::paged_spend::{
+    hash_paged_spend, PagedSpendIntent, TxPage, MAX_PAGED_SPEND_INPUTS, PAGED_SPEND_END_BIT,
+    PAGED_SPEND_START_BIT,
 };
 
 const DEFAULT_SAMPLES: usize = 20;
@@ -150,11 +147,10 @@ fn run_sample(case: Case) -> Sample {
     let build_hash = build_started.elapsed();
 
     let prove_started = Instant::now();
-    let proof = prove_paged_spend_authorization(
-        &pages,
-        PagedSpendAuthorizationWitness::new(mk_secret(case.seed)),
-    )
-    .expect("one PagedSpend capsule");
+    let proof =
+        prove_paged_spend_authorization(&pages, OwnerAuthWitness::new(mk_secret(case.seed)))
+            .expect("one PagedSpend capsule")
+            .proof;
     let prove = prove_started.elapsed();
 
     let admission_started = Instant::now();
@@ -165,7 +161,7 @@ fn run_sample(case: Case) -> Sample {
     assert_eq!(intent.logical_txid(), logical_txid);
     let intent_bytes = intent.to_bytes().expect("encode PagedSpend intent");
     let decoded = PagedSpendIntent::from_bytes(&intent_bytes).expect("decode PagedSpend intent");
-    verify_paged_spend_authorization(&decoded.pages, &bundle.proof)
+    verify_paged_spend_authorization(&decoded.pages, &bundle)
         .expect("local PagedSpend admission verification");
     let admission = admission_started.elapsed();
 

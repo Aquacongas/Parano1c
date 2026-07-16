@@ -6,7 +6,10 @@
 use noid_core::Block128;
 use noid_poseidon2b::native::domain::{capacity_iv, TAG_ADDRFIX};
 use noid_poseidon2b::primitives::SpendSecret;
-use noid_tx::{canonical_owner_auth, validate_public_tx_logic, PublicLogicError, TxBody};
+use noid_tx::{
+    canonical_owner_auth, canonical_paged_spend_auth, validate_public_tx_logic, PagedSpendError,
+    PublicLogicError, TxBody, TxPage,
+};
 use zeroize::Zeroize;
 
 use crate::{
@@ -193,6 +196,7 @@ impl std::error::Error for AuthorizationDecodeError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProveAuthorizationError {
     PublicLogic(PublicLogicError),
+    PagedSpend(PagedSpendError),
     OwnerAuthStatement(String),
     /// The witness-hiding prover failed. Internal field values are
     /// deliberately not retained in the wallet/RPC-facing error.
@@ -209,6 +213,12 @@ impl From<PublicLogicError> for ProveAuthorizationError {
     }
 }
 
+impl From<PagedSpendError> for ProveAuthorizationError {
+    fn from(value: PagedSpendError) -> Self {
+        Self::PagedSpend(value)
+    }
+}
+
 impl std::fmt::Display for ProveAuthorizationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{self:?}")
@@ -220,6 +230,7 @@ impl std::error::Error for ProveAuthorizationError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerifyAuthorizationError {
     PublicLogic(PublicLogicError),
+    PagedSpend(PagedSpendError),
     OwnerAuthStatement(String),
     AuthProof,
 }
@@ -255,6 +266,12 @@ impl From<PublicLogicError> for VerifyAuthorizationError {
     }
 }
 
+impl From<PagedSpendError> for VerifyAuthorizationError {
+    fn from(value: PagedSpendError) -> Self {
+        Self::PagedSpend(value)
+    }
+}
+
 impl std::fmt::Display for VerifyAuthorizationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{self:?}")
@@ -275,7 +292,40 @@ pub fn prove_wallet_authorization(
         .next()
         .map(|(index, _)| index)
         .expect("canonical user transaction has a live input");
+    let public =
+        owner_auth_public_from_statement(&canonical).map_err(map_owner_auth_prove_error)?;
+    prove_selected_authorization(public, input_position, witness)
+}
 
+/// Prove one unchanged witness-hiding capsule for a complete PagedSpend group.
+pub fn prove_paged_spend_authorization(
+    pages: &[TxPage],
+    witness: OwnerAuthWitness,
+) -> Result<WalletAuthorizationBundle, ProveAuthorizationError> {
+    let canonical = canonical_paged_spend_auth(pages)?;
+    let input_position = pages
+        .iter()
+        .enumerate()
+        .find_map(|(page, page_body)| {
+            page_body
+                .body
+                .live_inputs()
+                .next()
+                .map(|(slot, _)| page * noid_tx::TX_INPUTS + slot)
+        })
+        .expect("canonical PagedSpend has a live input");
+    let public = OwnerAuthPublicInputs::new(
+        canonical.logical_txid.as_fields(),
+        canonical.input_owner.as_fields(),
+    );
+    prove_selected_authorization(public, input_position, witness)
+}
+
+fn prove_selected_authorization(
+    public: OwnerAuthPublicInputs,
+    input_position: usize,
+    witness: OwnerAuthWitness,
+) -> Result<WalletAuthorizationBundle, ProveAuthorizationError> {
     // The selected capsule commits exactly the address-permutation state
     // table. Keep every secret-bearing temporary zeroizing and never expose a
     // reusable state/bank constructor at the wallet boundary.
@@ -286,7 +336,7 @@ pub fn prove_wallet_authorization(
         permutation_input.zeroize();
         permutation
     });
-    if permutation.final_state()[..2] != canonical.input_owner.as_fields() {
+    if permutation.final_state()[..2] != public.expected_address {
         return Err(ProveAuthorizationError::BoundaryMismatch {
             input_index: input_position,
             field: "owner_auth",
@@ -294,8 +344,6 @@ pub fn prove_wallet_authorization(
     }
     let state = ZkAuthCapsuleStateTable::from_permutation_witness(&permutation)
         .map_err(|_| ProveAuthorizationError::Proof)?;
-    let public =
-        owner_auth_public_from_statement(&canonical).map_err(map_owner_auth_prove_error)?;
     let statement = selected_statement(&public);
     let proof = prove_zk_authorization_from_state_table(&state, statement)
         .map_err(|_| ProveAuthorizationError::Proof)?;
@@ -326,6 +374,29 @@ pub fn verify_wallet_authorization_proof(
         public,
     };
     verify_authorization_statement_proof(&statement, proof).map(|_| ())
+}
+
+/// Verify one unchanged capsule against the logical hash and owner of a
+/// complete PagedSpend group.
+pub fn verify_paged_spend_authorization(
+    pages: &[TxPage],
+    bundle: &WalletAuthorizationBundle,
+) -> Result<(), VerifyAuthorizationError> {
+    verify_paged_spend_authorization_proof(pages, &bundle.proof)
+}
+
+pub fn verify_paged_spend_authorization_proof(
+    pages: &[TxPage],
+    proof: &ZkAuthorizationProof,
+) -> Result<(), VerifyAuthorizationError> {
+    let canonical = canonical_paged_spend_auth(pages)?;
+    let public = OwnerAuthPublicInputs::new(
+        canonical.logical_txid.as_fields(),
+        canonical.input_owner.as_fields(),
+    );
+    verify_zk_authorization(selected_statement(&public), proof)
+        .map(|_| ())
+        .map_err(|_| VerifyAuthorizationError::AuthProof)
 }
 
 pub fn canonical_authorization_statement_from_body(
@@ -394,7 +465,10 @@ mod tests {
     use crate::owner_auth_public_from_body;
     use noid_core::{Block128, TowerField};
     use noid_poseidon2b::primitives::{derive_address, Address};
-    use noid_tx::{output_bitmap_bit, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS};
+    use noid_tx::{
+        output_bitmap_bit, TxInput, TxOutput, TxPage, PAGED_SPEND_END_BIT, PAGED_SPEND_START_BIT,
+        TX_INPUTS, TX_OUTPUTS,
+    };
 
     fn mk_secret_bytes(seed: u8) -> [u8; 32] {
         let mut bytes = [0u8; 32];
@@ -474,6 +548,44 @@ mod tests {
             prove_wallet_authorization(&body, witness).expect("prove standard authorization");
         verify_wallet_authorization(&body, &bundle).expect("verify standard authorization");
         (body, secret_bytes, bundle)
+    }
+
+    fn paged_fixture(statement_salt: u8) -> (Vec<TxPage>, [u8; 32]) {
+        let (mut body, secret_bytes) = standard_body_and_secret();
+        body.epoch_anchor[0] ^= statement_salt;
+        body.inputs[0].slot_index += u32::from(statement_salt);
+        body.inputs[0].creation_id += u64::from(statement_salt);
+        body.outputs[0].slot_index += u32::from(statement_salt);
+        body.validity_bitmap |= PAGED_SPEND_START_BIT | PAGED_SPEND_END_BIT;
+        (vec![TxPage::new(body).unwrap()], secret_bytes)
+    }
+
+    #[test]
+    fn paged_spend_reuses_the_capsule_but_not_the_statement_or_randomness() {
+        let (first_pages, secret_bytes) = paged_fixture(3);
+        let (second_pages, _) = paged_fixture(4);
+        let first = prove_paged_spend_authorization(
+            &first_pages,
+            OwnerAuthWitness::new(SpendSecret::from_bytes(secret_bytes)),
+        )
+        .expect("first PagedSpend capsule");
+        let second = prove_paged_spend_authorization(
+            &second_pages,
+            OwnerAuthWitness::new(SpendSecret::from_bytes(secret_bytes)),
+        )
+        .expect("second PagedSpend capsule");
+
+        verify_paged_spend_authorization(&first_pages, &first).unwrap();
+        verify_paged_spend_authorization(&second_pages, &second).unwrap();
+        assert_ne!(first.to_bytes().unwrap(), second.to_bytes().unwrap());
+        assert!(matches!(
+            verify_paged_spend_authorization(&first_pages, &second),
+            Err(VerifyAuthorizationError::AuthProof)
+        ));
+        assert!(matches!(
+            verify_paged_spend_authorization(&second_pages, &first),
+            Err(VerifyAuthorizationError::AuthProof)
+        ));
     }
 
     #[test]
