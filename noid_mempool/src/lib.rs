@@ -8,7 +8,7 @@
 //!
 //! ```text
 //!  wallet
-//!    │  TxIntent (body + selected-ZK authorization bytes)
+//!    │  PagedSpendIntent (pages + selected-ZK authorization bytes)
 //!    ▼
 //!  AsyncMempool::submit()
 //!    ├─ stateless body-hash and size checks

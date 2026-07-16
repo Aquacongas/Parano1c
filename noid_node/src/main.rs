@@ -2821,7 +2821,7 @@ async fn handle_p2p_events(
                             );
                             continue;
                         }
-                        if let Ok(intent) = noid_tx::TxIntent::from_bytes(&intent_bytes) {
+                        if let Ok(intent) = noid_tx::PagedSpendIntent::from_bytes(&intent_bytes) {
                             match mempool_task.submit(intent, intent_bytes).await {
                                 Ok(hash) => {
                                     tracing::debug!(hash = ?hash, "mempool sync: tx admitted");
@@ -2888,7 +2888,7 @@ async fn handle_p2p_events(
                 // relay task spawned in main() — no extra work needed here.
                 let mempool_task = mempool.clone();
                 tokio::spawn(async move {
-                    if let Ok(intent) = noid_tx::TxIntent::from_bytes(&intent_bytes) {
+                    if let Ok(intent) = noid_tx::PagedSpendIntent::from_bytes(&intent_bytes) {
                         match mempool_task.submit(intent, intent_bytes).await {
                             Ok(hash) => {
                                 tracing::debug!(hash = ?hash, "P2P tx admitted");

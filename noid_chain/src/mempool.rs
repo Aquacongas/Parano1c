@@ -22,7 +22,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use noid_poseidon2b::primitives::{Digest, TxBodyHash};
-use noid_tx::{Transaction, TX_INTENT_FIXED_OVERHEAD};
+use noid_tx::{
+    paged_spend_authorization_wire_offset, validate_paged_spend, PagedSpendFacts, TxPage,
+};
 
 use crate::consensus::params::BLOCK_MAX_TXS;
 
@@ -56,11 +58,14 @@ impl FeeKey {
 // MempoolEntry
 // ---------------------------------------------------------------------------
 
-/// A transaction admitted to the mempool.
+/// One indivisible logical PagedSpend admitted to the mempool.
 #[derive(Debug, Clone)]
 pub struct MempoolEntry {
-    /// The admitted transaction.
-    pub tx: Transaction,
+    /// Ordered physical pages. The detached authorization remains borrowed
+    /// from `intent_bytes` and is not duplicated here.
+    pub pages: Vec<TxPage>,
+    /// Canonical aggregate facts, including the logical txid.
+    pub spend: PagedSpendFacts,
     /// Chain height at the time of admission.
     pub admitted_height: u64,
     /// Fee per weighted resource unit.
@@ -75,7 +80,7 @@ pub struct MempoolEntry {
     /// range metadata avoids retaining the same proof in a second allocation.
     cached_authorization_len: u32,
 
-    /// Raw `TxIntent` bytes as submitted by the wallet.
+    /// Raw `PagedSpendIntent` bytes as submitted by the wallet.
     /// Stored so the P2P mempool-sync protocol can re-serve existing TXs to
     /// newly connected peers (gossipsub deduplication prevents re-gossiping;
     /// a dedicated request-response exchange is the only reliable mechanism).
@@ -83,30 +88,32 @@ pub struct MempoolEntry {
 }
 
 impl MempoolEntry {
-    /// Compute the fee_rate from the transaction body.
-    pub fn compute_fee_rate(tx: &Transaction) -> u64 {
-        let n_inputs = tx.body.live_input_count() as u64;
-        let n_outputs = tx.body.live_output_count() as u64;
+    /// Compute fee rate from group-wide live resources.
+    pub fn compute_fee_rate(spend: &PagedSpendFacts) -> u64 {
+        let n_inputs = u64::from(spend.live_inputs);
+        let n_outputs = u64::from(spend.live_outputs);
         let net_new_slots = n_outputs.saturating_sub(n_inputs);
         let weight = n_inputs
             .saturating_add(n_outputs)
             .saturating_add(net_new_slots.saturating_mul(4))
             .max(1);
-        tx.body.fee / weight
+        spend.fee / weight
     }
 
     /// Create a new entry.
     ///
     /// `current_height` — chain tip at admission time.
-    pub fn new(tx: Transaction, current_height: u64) -> Self {
-        let fee_rate = Self::compute_fee_rate(&tx);
-        Self {
-            tx,
+    pub fn new(pages: Vec<TxPage>, current_height: u64) -> Result<Self, noid_tx::PagedSpendError> {
+        let spend = validate_paged_spend(&pages)?;
+        let fee_rate = Self::compute_fee_rate(&spend);
+        Ok(Self {
+            pages,
+            spend,
             admitted_height: current_height,
             fee_rate,
             cached_authorization_len: 0,
             intent_bytes: Arc::from([]), // populated by AsyncMempool::submit
-        }
+        })
     }
 
     /// Borrow the retained authorization directly from the immutable intent.
@@ -115,8 +122,9 @@ impl MempoolEntry {
         if len == 0 {
             return None;
         }
-        let end = TX_INTENT_FIXED_OVERHEAD.checked_add(len)?;
-        self.intent_bytes.get(TX_INTENT_FIXED_OVERHEAD..end)
+        let start = paged_spend_authorization_wire_offset(self.pages.len()).ok()?;
+        let end = start.checked_add(len)?;
+        self.intent_bytes.get(start..end)
     }
 }
 
@@ -203,54 +211,61 @@ impl Mempool {
         self.entries.get(hash)
     }
 
-    /// Attempt to add a transaction to the pool.
+    /// Attempt to add one complete PagedSpend group to the pool.
     ///
     /// The caller is responsible for native admission checks. This function
     /// only checks pool-internal constraints
     /// (capacity, duplicates, slot conflicts with already-admitted txs).
     ///
-    pub fn admit(&mut self, tx: Transaction, current_height: u64) -> Result<(), MempoolError> {
+    pub fn admit(&mut self, pages: Vec<TxPage>, current_height: u64) -> Result<(), MempoolError> {
         if self.entries.len() >= self.capacity {
             return Err(MempoolError::Full);
         }
-        let hash = tx.txid();
+        let entry = MempoolEntry::new(pages, current_height)
+            .expect("AsyncMempool admits only natively validated PagedSpend groups");
+        let hash = entry.spend.logical_txid;
         if self.entries.contains_key(&hash) {
             return Err(MempoolError::AlreadyAdmitted);
         }
 
         // Check input slot conflicts.
-        for (_, inp) in tx.body.live_inputs() {
-            if let Some(&existing) = self
-                .spent_inputs
-                .get(&inp.slot_index)
-                .or_else(|| self.minted_outputs.get(&inp.slot_index))
-            {
-                return Err(MempoolError::InputConflict {
-                    conflicting_hash: existing,
-                });
+        for page in &entry.pages {
+            for (_, inp) in page.body.live_inputs() {
+                if let Some(&existing) = self
+                    .spent_inputs
+                    .get(&inp.slot_index)
+                    .or_else(|| self.minted_outputs.get(&inp.slot_index))
+                {
+                    return Err(MempoolError::InputConflict {
+                        conflicting_hash: existing,
+                    });
+                }
             }
         }
         // Check output slot conflicts.
-        for (_, out) in tx.body.live_outputs() {
-            if let Some(&existing) = self
-                .minted_outputs
-                .get(&out.slot_index)
-                .or_else(|| self.spent_inputs.get(&out.slot_index))
-            {
-                return Err(MempoolError::OutputConflict {
-                    conflicting_hash: existing,
-                });
+        for page in &entry.pages {
+            for (_, out) in page.body.live_outputs() {
+                if let Some(&existing) = self
+                    .minted_outputs
+                    .get(&out.slot_index)
+                    .or_else(|| self.spent_inputs.get(&out.slot_index))
+                {
+                    return Err(MempoolError::OutputConflict {
+                        conflicting_hash: existing,
+                    });
+                }
             }
         }
 
         // All checks passed — insert.
-        let entry = MempoolEntry::new(tx, current_height);
         let fee_key = FeeKey::new(entry.fee_rate, hash);
-        for (_, inp) in entry.tx.body.live_inputs() {
-            self.spent_inputs.insert(inp.slot_index, hash);
-        }
-        for (_, out) in entry.tx.body.live_outputs() {
-            self.minted_outputs.insert(out.slot_index, hash);
+        for page in &entry.pages {
+            for (_, inp) in page.body.live_inputs() {
+                self.spent_inputs.insert(inp.slot_index, hash);
+            }
+            for (_, out) in page.body.live_outputs() {
+                self.minted_outputs.insert(out.slot_index, hash);
+            }
         }
         self.fee_index.insert(fee_key, hash);
         self.entries.insert(hash, entry);
@@ -262,11 +277,13 @@ impl Mempool {
         let entry = self.entries.remove(hash)?;
         // Remove from fee_index using the same key that was inserted.
         self.fee_index.remove(&FeeKey::new(entry.fee_rate, *hash));
-        for (_, inp) in entry.tx.body.live_inputs() {
-            self.spent_inputs.remove(&inp.slot_index);
-        }
-        for (_, out) in entry.tx.body.live_outputs() {
-            self.minted_outputs.remove(&out.slot_index);
+        for page in &entry.pages {
+            for (_, inp) in page.body.live_inputs() {
+                self.spent_inputs.remove(&inp.slot_index);
+            }
+            for (_, out) in page.body.live_outputs() {
+                self.minted_outputs.remove(&out.slot_index);
+            }
         }
         Some(entry)
     }
@@ -276,9 +293,7 @@ impl Mempool {
         let expired: Vec<TxBodyHash> = self
             .entries
             .iter()
-            .filter(|(_, entry)| {
-                !entry.tx.body.is_coinbase && &entry.tx.body.epoch_anchor != current_anchor
-            })
+            .filter(|(_, entry)| &entry.spend.epoch_anchor != current_anchor)
             .map(|(&h, _)| h)
             .collect();
         for hash in &expired {
@@ -287,7 +302,7 @@ impl Mempool {
         expired
     }
 
-    /// Select up to `max_txs` transactions for block assembly.
+    /// Fee-pack complete groups into at most `max_pages` physical pages.
     ///
     /// Returns entries in descending fee_rate order (highest fees first),
     /// with ascending tx_body_hash as a deterministic tie-break.
@@ -301,12 +316,44 @@ impl Mempool {
     /// O(max_txs × log N) using the `fee_index` BTreeMap instead of
     /// the previous O(N log N) sort-all. At N=8192 and max_txs=1023:
     /// ~1023 BTreeMap lookups (~10K operations) vs ~107K comparisons.
-    pub fn select_for_block(&self, max_txs: usize) -> Vec<&MempoolEntry> {
-        self.fee_index
-            .values()
-            .take(max_txs)
-            .filter_map(|hash| self.entries.get(hash))
-            .collect()
+    pub fn select_for_block(&self, max_pages: usize) -> Vec<&MempoolEntry> {
+        self.select_for_block_matching(max_pages, |_| true)
+    }
+
+    /// Anchor-filter before page packing so stale high-fee groups cannot
+    /// consume the local B64/B255 page budget and starve valid groups.
+    pub fn select_for_block_at_anchor(
+        &self,
+        max_pages: usize,
+        epoch_anchor: &Digest,
+    ) -> Vec<&MempoolEntry> {
+        self.select_for_block_matching(max_pages, |entry| &entry.spend.epoch_anchor == epoch_anchor)
+    }
+
+    fn select_for_block_matching(
+        &self,
+        max_pages: usize,
+        keep: impl Fn(&MempoolEntry) -> bool,
+    ) -> Vec<&MempoolEntry> {
+        let mut remaining_pages = max_pages.min(crate::consensus::params::BLOCK_MAX_USER_TXS);
+        let mut selected = Vec::new();
+        for hash in self.fee_index.values() {
+            let Some(entry) = self.entries.get(hash) else {
+                continue;
+            };
+            if !keep(entry) {
+                continue;
+            }
+            if entry.pages.len() > remaining_pages {
+                continue;
+            }
+            remaining_pages -= entry.pages.len();
+            selected.push(entry);
+            if remaining_pages == 0 {
+                break;
+            }
+        }
+        selected
     }
 
     /// Update the pool after a block is confirmed or after a reorg.
@@ -335,15 +382,15 @@ impl Mempool {
         self.entries.iter()
     }
 
-    /// Store canonical raw TxIntent bytes for mempool-sync serving and retain
+    /// Store canonical raw PagedSpendIntent bytes for mempool-sync serving and retain
     /// only the authorization suffix length. The proof itself is borrowed from
     /// this one immutable allocation by miners and the block fast path.
     pub fn set_intent_bytes(&mut self, hash: &TxBodyHash, bytes: impl Into<Arc<[u8]>>) {
         if let Some(entry) = self.entries.get_mut(hash) {
             let bytes = bytes.into();
-            entry.cached_authorization_len = bytes
-                .len()
-                .checked_sub(TX_INTENT_FIXED_OVERHEAD)
+            let offset = paged_spend_authorization_wire_offset(entry.pages.len()).ok();
+            entry.cached_authorization_len = offset
+                .and_then(|offset| bytes.len().checked_sub(offset))
                 .and_then(|len| u32::try_from(len).ok())
                 .unwrap_or(0);
             entry.intent_bytes = bytes;
@@ -384,7 +431,7 @@ impl Mempool {
         out
     }
 
-    /// Total serialized TxIntent bytes retained by this mempool.
+    /// Total serialized PagedSpendIntent bytes retained by this mempool.
     pub fn total_intent_bytes(&self) -> usize {
         self.entries.values().map(|e| e.intent_bytes.len()).sum()
     }
@@ -393,8 +440,7 @@ impl Mempool {
     pub fn total_fees(&self) -> u64 {
         self.entries
             .values()
-            .filter(|e| !e.tx.body.is_coinbase)
-            .map(|e| e.tx.body.fee)
+            .map(|entry| entry.spend.fee)
             .fold(0u64, |a, f| a.saturating_add(f))
     }
 }
@@ -408,10 +454,11 @@ mod tests {
     use super::*;
     use noid_poseidon2b::primitives::Address;
     use noid_tx::{
-        output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS,
+        output_bitmap_bit, TxBody, TxInput, TxOutput, PAGED_SPEND_END_BIT, PAGED_SPEND_START_BIT,
+        TX_INPUTS, TX_OUTPUTS,
     };
 
-    fn tx(input_slot: u32, output_slot: u32, fee: u64, seed: u8, anchor: Digest) -> Transaction {
+    fn tx(input_slot: u32, output_slot: u32, fee: u64, seed: u8, anchor: Digest) -> Vec<TxPage> {
         let mut inputs = [TxInput::dummy(); TX_INPUTS];
         inputs[0] = TxInput {
             slot_index: input_slot,
@@ -424,26 +471,31 @@ mod tests {
             amount: 100,
             owner: Address([seed; 32]),
         };
-        Transaction::new(TxBody {
+        vec![TxPage::new(TxBody {
             epoch_anchor: anchor,
             fee,
             input_owner: Address([seed; 32]),
             inputs,
             outputs,
-            validity_bitmap: 1 | output_bitmap_bit(0),
+            validity_bitmap: 1 | output_bitmap_bit(0) | PAGED_SPEND_START_BIT | PAGED_SPEND_END_BIT,
             is_coinbase: false,
         })
+        .unwrap()]
+    }
+
+    fn id(pages: &[TxPage]) -> TxBodyHash {
+        validate_paged_spend(pages).unwrap().logical_txid
     }
 
     #[test]
     fn derived_txid_keys_and_duplicate_admission() {
         let mut pool = Mempool::new(4);
         let tx = tx(1, 2, 10, 1, [9u8; 32]);
-        let hash = tx.txid();
+        let hash = id(&tx);
         pool.admit(tx.clone(), 3).unwrap();
         assert!(pool.contains(&hash));
         assert_eq!(pool.admit(tx, 3), Err(MempoolError::AlreadyAdmitted));
-        assert_eq!(pool.remove(&hash).unwrap().tx.txid(), hash);
+        assert_eq!(pool.remove(&hash).unwrap().spend.logical_txid, hash);
     }
 
     #[test]
@@ -473,7 +525,7 @@ mod tests {
     fn epoch_switch_evicts_by_exact_anchor() {
         let mut pool = Mempool::new(8);
         let old = tx(1, 2, 10, 1, [7u8; 32]);
-        let old_hash = old.txid();
+        let old_hash = id(&old);
         pool.admit(old, 3).unwrap();
         pool.admit(tx(3, 4, 10, 2, [8u8; 32]), 3).unwrap();
 
@@ -487,9 +539,10 @@ mod tests {
         let mut pool = Mempool::new(2);
         let low = tx(1, 2, 1, 1, [9u8; 32]);
         let high = tx(3, 4, 100, 2, [9u8; 32]);
+        let high_id = id(&high);
         pool.admit(low, 0).unwrap();
         pool.admit(high.clone(), 0).unwrap();
-        assert_eq!(pool.select_for_block(1)[0].tx.txid(), high.txid());
+        assert_eq!(pool.select_for_block(1)[0].spend.logical_txid, high_id);
         assert_eq!(
             pool.admit(tx(5, 6, 10, 3, [9u8; 32]), 0),
             Err(MempoolError::Full)
@@ -502,7 +555,7 @@ mod tests {
         let a = tx(1, 2, 10, 1, [9u8; 32]);
         let b = tx(3, 4, 10, 2, [9u8; 32]);
         let c = tx(5, 6, 10, 3, [9u8; 32]);
-        let ids = [a.txid(), b.txid(), c.txid()];
+        let ids = [id(&a), id(&b), id(&c)];
         pool.admit(a, 0).unwrap();
         pool.admit(b, 0).unwrap();
         pool.admit(c, 0).unwrap();
@@ -526,9 +579,10 @@ mod tests {
     fn cached_authorization_is_a_borrowed_intent_suffix() {
         let mut pool = Mempool::new(1);
         let transaction = tx(1, 2, 10, 1, [9u8; 32]);
-        let id = transaction.txid();
+        let id = id(&transaction);
         pool.admit(transaction, 0).unwrap();
-        let mut intent = vec![0u8; TX_INTENT_FIXED_OVERHEAD];
+        let offset = paged_spend_authorization_wire_offset(1).unwrap();
+        let mut intent = vec![0u8; offset];
         intent.extend_from_slice(&[0xA5; 64]);
         pool.set_intent_bytes(&id, intent);
 
@@ -537,7 +591,7 @@ mod tests {
         assert_eq!(authorization, &[0xA5; 64]);
         assert_eq!(
             authorization.as_ptr(),
-            entry.intent_bytes[TX_INTENT_FIXED_OVERHEAD..].as_ptr()
+            entry.intent_bytes[offset..].as_ptr()
         );
     }
 }

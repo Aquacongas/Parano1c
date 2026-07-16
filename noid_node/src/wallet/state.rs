@@ -428,7 +428,7 @@ impl WalletState {
 
         let mut selected = Vec::new();
         let mut total = 0u64;
-        for utxo in available.into_iter().take(noid_tx::TX_INPUTS) {
+        for utxo in available.into_iter().take(noid_tx::MAX_PAGED_SPEND_INPUTS) {
             selected.push(utxo);
             total = total.checked_add(utxo.value)?;
             if total >= needed {

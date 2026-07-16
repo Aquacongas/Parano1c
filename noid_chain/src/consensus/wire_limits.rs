@@ -7,14 +7,14 @@
 //! the accepted-bundle protocol: every large object must be bounded before expensive
 //! decode, allocation, verification or storage.
 
-/// Maximum serialized authorization and intent sizes for the sole fixed body.
+/// Maximum serialized authorization and canonical PagedSpend intent sizes.
 pub const MAX_AUTHORIZATION_BYTES: usize = noid_tx::MAX_TX_AUTHORIZATION_BYTES;
-pub const MAX_TX_INTENT_BYTES_GLOBAL: usize = noid_tx::MAX_TX_INTENT_BYTES;
+pub const MAX_TX_INTENT_BYTES_GLOBAL: usize = noid_tx::MAX_PAGED_SPEND_INTENT_BYTES;
 
 /// Maximum admitted mempool transactions kept in RAM.
 pub const MAX_MEMPOOL_TXS: usize = 1024;
 
-/// Maximum serialized TxIntent bytes kept in mempool RAM.
+/// Maximum serialized PagedSpendIntent bytes kept in mempool RAM.
 pub const MAX_MEMPOOL_BYTES: usize = 384 * 1024 * 1024;
 
 /// Maximum transactions returned in one mempool-sync response.
@@ -132,7 +132,10 @@ mod tests {
     #[test]
     fn final_wire_caps_match_canonical_constructions() {
         assert_eq!(MAX_AUTHORIZATION_BYTES, noid_tx::MAX_TX_AUTHORIZATION_BYTES);
-        assert_eq!(MAX_TX_INTENT_BYTES_GLOBAL, noid_tx::MAX_TX_INTENT_BYTES);
+        assert_eq!(
+            MAX_TX_INTENT_BYTES_GLOBAL,
+            noid_tx::MAX_PAGED_SPEND_INTENT_BYTES
+        );
         assert_eq!(MAX_BLOCK_BYTES, 82_905);
         assert!(MAX_HISTORY_STEP_TERMINAL_BYTES > 580_495);
     }

@@ -11,7 +11,7 @@
 //! 3. Moved into one zeroizing `OwnerAuthWitness` per transaction
 //! 4. Zeroized when its owner object is dropped
 //! 5. **NEVER transmitted over the network** — not in RPC responses,
-//!    not in P2P messages, not in `TxIntent`
+//!    not in P2P messages, not in `PagedSpendIntent`
 //!
 //! Transaction flow (all inside the daemon):
 //! ```text
@@ -21,7 +21,7 @@
 //!   3. builder::build_and_prove_tx(...)
 //!      a. derive txid from the canonical body
 //!      b. prove_tx(body, one_owner_witness) → WalletAuthorizationBundle
-//!      c. assemble TxIntent bytes
+//!      c. assemble PagedSpendIntent bytes
 //!   4. submit to own mempool
 //! ```
 
@@ -83,7 +83,7 @@ use noid_rpc::types::{
 };
 use noid_rpc::wallet_ops::{WalletActivationPreview, WalletSendPlanError};
 use noid_rpc::WalletOps;
-use noid_tx::TX_INPUTS;
+use noid_tx::MAX_PAGED_SPEND_INPUTS;
 
 /// Thread-safe handle to the in-process wallet.
 ///
@@ -701,7 +701,7 @@ impl WalletOps for WalletHandle {
                 .find(|utxo| utxo.value == minimum_total)
                 .map(|_| (1, fee, 1, 0, one_input_one_output))
         });
-        for input_count in 1..=TX_INPUTS {
+        for input_count in 1..=MAX_PAGED_SPEND_INPUTS {
             if planned.is_some() {
                 break;
             }
@@ -778,9 +778,9 @@ impl WalletOps for WalletHandle {
         }
 
         let Some((_, fee_micronoid, _, _, _)) = planned else {
-            if available.len() > TX_INPUTS {
+            if available.len() > MAX_PAGED_SPEND_INPUTS {
                 return Err(WalletSendPlanError::InputLimitExceeded {
-                    max_inputs: TX_INPUTS,
+                    max_inputs: MAX_PAGED_SPEND_INPUTS,
                 });
             }
             return Err(WalletSendPlanError::InsufficientFunds {
@@ -794,9 +794,9 @@ impl WalletOps for WalletHandle {
         let Some((selected, change_micronoid)) =
             wallet.select_utxos(amount_micronoid, fee_micronoid)
         else {
-            if available.len() > TX_INPUTS {
+            if available.len() > MAX_PAGED_SPEND_INPUTS {
                 return Err(WalletSendPlanError::InputLimitExceeded {
-                    max_inputs: TX_INPUTS,
+                    max_inputs: MAX_PAGED_SPEND_INPUTS,
                 });
             }
             return Err(WalletSendPlanError::InsufficientFunds {
@@ -1161,11 +1161,13 @@ mod tests {
                 24,
             )
             .expect("build ordinary send");
-        let intent = noid_tx::TxIntent::from_bytes(&intent_bytes).expect("decode built intent");
-        let txid = intent.txid().0;
+        let intent =
+            noid_tx::PagedSpendIntent::from_bytes(&intent_bytes).expect("decode built intent");
+        let txid = intent.logical_txid().0;
         let output_slots: Vec<u32> = intent
-            .tx_body
-            .live_outputs()
+            .pages
+            .iter()
+            .flat_map(|page| page.body.live_outputs())
             .map(|(_, output)| output.slot_index)
             .collect();
 

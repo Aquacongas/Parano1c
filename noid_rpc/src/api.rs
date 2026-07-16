@@ -124,7 +124,7 @@ pub trait ParanoidApi {
     #[method(name = "getEpochAnchor")]
     async fn get_epoch_anchor(&self) -> RpcResult<String>;
 
-    /// Submit a raw `TxIntent` (transaction + WalletAuthorizationBundle) to the mempool.
+    /// Submit a raw `PagedSpendIntent` (pages + WalletAuthorizationBundle) to the mempool.
     #[method(name = "submitTxIntent")]
     async fn submit_tx_intent(&self, hex: String) -> RpcResult<String>;
 

@@ -257,15 +257,15 @@ fn fee_breakdown_info(
 }
 
 fn validate_tx_counts(n_inputs: usize, n_outputs: usize) -> Result<(), ErrorObject<'static>> {
-    if (1..=noid_tx::TX_INPUTS).contains(&n_inputs)
-        && (1..=noid_tx::TX_OUTPUTS).contains(&n_outputs)
+    if (1..=noid_tx::MAX_PAGED_SPEND_INPUTS).contains(&n_inputs)
+        && (1..=noid_tx::MAX_PAGED_SPEND_OUTPUTS).contains(&n_outputs)
     {
         Ok(())
     } else {
         Err(rpc_err(format!(
-            "canonical transaction supports 1..={} inputs and 1..={} outputs, got {n_inputs} and {n_outputs}",
-            noid_tx::TX_INPUTS,
-            noid_tx::TX_OUTPUTS,
+            "canonical PagedSpend supports 1..={} inputs and 1..={} outputs, got {n_inputs} and {n_outputs}",
+            noid_tx::MAX_PAGED_SPEND_INPUTS,
+            noid_tx::MAX_PAGED_SPEND_OUTPUTS,
         )))
     }
 }
@@ -1321,8 +1321,8 @@ impl ParanoidApiServer for RpcHandler {
 
     async fn submit_tx_intent(&self, hex_str: String) -> RpcResult<String> {
         let bytes = decode_bounded_hex("tx intent", &hex_str, MAX_TX_INTENT_BYTES_GLOBAL)?;
-        let intent =
-            noid_tx::TxIntent::from_bytes(&bytes).map_err(|e| rpc_err(format!("decode: {e:?}")))?;
+        let intent = noid_tx::PagedSpendIntent::from_bytes(&bytes)
+            .map_err(|e| rpc_err(format!("decode: {e:?}")))?;
         let hash = self
             .mempool
             .submit(intent, bytes)
@@ -1629,20 +1629,23 @@ impl ParanoidApiServer for RpcHandler {
                 }
             };
 
-            let intent = match noid_tx::TxIntent::from_bytes(&intent_bytes) {
+            let intent = match noid_tx::PagedSpendIntent::from_bytes(&intent_bytes) {
                 Ok(intent) => intent,
                 Err(error) => {
                     last_error = format!("intent decode: {error:?}");
                     break;
                 }
             };
-            let input_count = intent.tx_body.live_input_count();
-            let output_count = intent.tx_body.live_output_count();
-            let actual_fee = intent.tx_body.fee;
-            let failed_txid = intent.txid().0;
+            let facts = noid_tx::validate_paged_spend(&intent.pages)
+                .map_err(|error| rpc_err(format!("wallet PagedSpend: {error}")))?;
+            let input_count = usize::from(facts.live_inputs);
+            let output_count = usize::from(facts.live_outputs);
+            let actual_fee = facts.fee;
+            let failed_txid = facts.logical_txid.0;
             let output_slots: Vec<u32> = intent
-                .tx_body
-                .live_outputs()
+                .pages
+                .iter()
+                .flat_map(|page| page.body.live_outputs())
                 .map(|(_, output)| output.slot_index)
                 .collect();
             if actual_fee != plan.fee_micronoid

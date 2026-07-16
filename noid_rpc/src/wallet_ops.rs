@@ -101,7 +101,7 @@ pub trait WalletOps: Send + Sync {
 
     /// Build, prove, and serialize a send transaction.
     ///
-    /// Returns raw `TxIntent` bytes plus selected input slot indices. Building
+    /// Returns raw `PagedSpendIntent` bytes plus selected input slot indices. Building
     /// is side-effect free: the async coordinator installs the complete pending
     /// reservation only after `spawn_blocking` returns.
     ///

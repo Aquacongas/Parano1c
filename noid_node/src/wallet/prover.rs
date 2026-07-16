@@ -22,8 +22,8 @@
 //! reference escapes. No copy is serialized or stored on disk after this
 //! function completes.
 
-use noid_gkr::{prove_wallet_authorization, OwnerAuthWitness, WalletAuthorizationBundle};
-use noid_tx::TxBody;
+use noid_gkr::{prove_paged_spend_authorization, OwnerAuthWitness, WalletAuthorizationBundle};
+use noid_tx::TxPage;
 
 /// Error from transaction proving.
 #[derive(Debug, thiserror::Error)]
@@ -38,17 +38,21 @@ pub enum ProveError {
 /// transaction arithmetic is checked exactly before proving, and the canonical
 /// block prover rebuilds the public AIR from `TxBody` at inclusion time.
 pub fn prove_tx(
-    body: &TxBody,
+    pages: &[TxPage],
     witness: OwnerAuthWitness,
 ) -> Result<WalletAuthorizationBundle, ProveError> {
-    prove_wallet_authorization(body, witness).map_err(|e| ProveError::Authorization(e.to_string()))
+    prove_paged_spend_authorization(pages, witness)
+        .map_err(|e| ProveError::Authorization(e.to_string()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use noid_poseidon2b::primitives::{derive_address, Address, SpendSecret};
-    use noid_tx::{output_bitmap_bit, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS};
+    use noid_tx::{
+        output_bitmap_bit, TxBody, TxInput, TxOutput, PAGED_SPEND_END_BIT, PAGED_SPEND_START_BIT,
+        TX_INPUTS, TX_OUTPUTS,
+    };
 
     fn secret_bytes(seed: u8) -> [u8; 32] {
         let mut bytes = [0u8; 32];
@@ -62,7 +66,7 @@ mod tests {
         haystack.windows(needle.len()).any(|w| w == needle)
     }
 
-    fn body(spend_secret: &SpendSecret, input_count: usize) -> TxBody {
+    fn pages(spend_secret: &SpendSecret, input_count: usize) -> Vec<TxPage> {
         let owner = derive_address(spend_secret);
         let mut inputs = [TxInput::dummy(); TX_INPUTS];
         let mut total = 0u64;
@@ -81,25 +85,29 @@ mod tests {
             amount: total - fee,
             owner: Address([0xB1; 32]),
         };
-        TxBody {
+        vec![TxPage::new(TxBody {
             epoch_anchor: [0x52; 32],
             fee,
             input_owner: owner,
             inputs,
             outputs,
-            validity_bitmap: ((1u16 << input_count) - 1) | output_bitmap_bit(0),
+            validity_bitmap: ((1u16 << input_count) - 1)
+                | output_bitmap_bit(0)
+                | PAGED_SPEND_START_BIT
+                | PAGED_SPEND_END_BIT,
             is_coinbase: false,
-        }
+        })
+        .unwrap()]
     }
 
     #[test]
     fn wallet_bundle_does_not_serialize_spend_secret_bytes() {
         let raw_secret = secret_bytes(11);
         let spend_secret = SpendSecret::from_bytes(raw_secret);
-        let body = body(&spend_secret, 1);
+        let pages = pages(&spend_secret, 1);
 
         let bundle =
-            prove_tx(&body, OwnerAuthWitness::new(spend_secret)).expect("prove transaction");
+            prove_tx(&pages, OwnerAuthWitness::new(spend_secret)).expect("prove transaction");
         let bytes = bundle.to_bytes().expect("serialize wallet authorization");
 
         assert!(
@@ -113,9 +121,9 @@ mod tests {
     fn eight_input_wallet_bundle_does_not_serialize_spend_secret_bytes() {
         let raw_secret = secret_bytes(21);
         let spend_secret = SpendSecret::from_bytes(raw_secret);
-        let body = body(&spend_secret, TX_INPUTS);
+        let pages = pages(&spend_secret, TX_INPUTS);
 
-        let bundle = prove_tx(&body, OwnerAuthWitness::new(spend_secret))
+        let bundle = prove_tx(&pages, OwnerAuthWitness::new(spend_secret))
             .expect("prove eight-input transaction");
         let bytes = bundle.to_bytes().expect("serialize wallet authorization");
 

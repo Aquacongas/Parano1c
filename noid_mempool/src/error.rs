@@ -22,15 +22,15 @@ pub enum SubmitError {
     #[error("mempool full (capacity {capacity})")]
     Full { capacity: usize },
 
-    /// Pool serialized TxIntent byte cap would be exceeded.
+    /// Pool serialized PagedSpendIntent byte cap would be exceeded.
     #[error("mempool byte cap exceeded: {actual} bytes (max {max})")]
     BytesFull { actual: usize, max: usize },
 
-    /// Malformed TxIntent wire format.
+    /// Malformed PagedSpendIntent wire format.
     #[error("malformed intent: {0}")]
     MalformedIntent(String),
 
-    /// Serialized TxIntent bytes exceed the wire/admission cap.
+    /// Serialized PagedSpendIntent bytes exceed the wire/admission cap.
     #[error("tx intent too large: {actual} bytes (max {max})")]
     IntentTooLarge { actual: usize, max: usize },
 

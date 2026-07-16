@@ -15,13 +15,14 @@ use noid_poseidon2b::native::{capacity_iv, DomainTag, Poseidon2bSponge};
 use noid_poseidon2b::primitives::{Address, Digest, TxBodyHash};
 
 use crate::{
-    TxBody, TxInput, TxOutput, WireError, MAX_TX_AUTHORIZATION_BYTES, TX_BODY_WIRE_SIZE, TX_INPUTS,
-    TX_OUTPUTS, TX_VALIDITY_MASK,
+    TxBody, TxInput, TxOutput, WireError, TX_BODY_WIRE_SIZE, TX_INPUTS, TX_OUTPUTS,
+    TX_VALIDITY_MASK,
 };
 
 const TAG_PAGED_SPEND: DomainTag = DomainTag::new(b"PAGEDTX_");
 
 pub const PAGED_SPEND_VERSION: u16 = 1;
+pub const MAX_TX_AUTHORIZATION_BYTES: usize = 256 * 1024;
 pub const PAGED_SPEND_START_BIT: u16 = 1 << 10;
 pub const PAGED_SPEND_END_BIT: u16 = 1 << 11;
 pub const PAGED_SPEND_MARKER_MASK: u16 = PAGED_SPEND_START_BIT | PAGED_SPEND_END_BIT;
@@ -148,6 +149,13 @@ impl PagedSpendIntent {
         hash_paged_spend_unchecked(&self.pages)
     }
 
+    /// Byte offset of the detached authorization payload in the canonical
+    /// encoded intent. Mempool storage uses this to borrow the proof from the
+    /// one retained wire allocation instead of keeping a second copy.
+    pub fn authorization_wire_offset(&self) -> Result<usize, PagedSpendError> {
+        paged_spend_authorization_wire_offset(self.pages.len())
+    }
+
     pub fn encode(&self, bytes: &mut Vec<u8>) -> Result<(), PagedSpendError> {
         validate_paged_spend(&self.pages)?;
         if self.authorization_bytes.len() > MAX_TX_AUTHORIZATION_BYTES {
@@ -217,6 +225,17 @@ impl PagedSpendIntent {
         }
         Ok(intent)
     }
+}
+
+/// Canonical byte offset of the authorization payload for `page_count`
+/// physical pages: marker + count + pages + authorization length.
+pub fn paged_spend_authorization_wire_offset(page_count: usize) -> Result<usize, PagedSpendError> {
+    validate_page_count(page_count)?;
+    page_count
+        .checked_mul(TX_BODY_WIRE_SIZE)
+        .and_then(|page_bytes| (1usize + 2).checked_add(page_bytes))
+        .and_then(|prefix| prefix.checked_add(4))
+        .ok_or(PagedSpendError::Wire(WireError::LengthOverflow))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

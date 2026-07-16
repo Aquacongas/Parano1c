@@ -23,7 +23,7 @@
 use std::collections::{BTreeSet, HashSet};
 
 use noid_poseidon2b::primitives::{Address, Digest};
-use noid_tx::Transaction;
+use noid_tx::{PagedSpendFacts, Transaction};
 
 use crate::accepted_block_bundle::AcceptedBlockBundle;
 use crate::block::Block;
@@ -271,7 +271,8 @@ pub enum TemplateBuildError {
 
 #[derive(Clone, Default)]
 struct TemplateResourceSelection {
-    user_tx_count: usize,
+    user_page_count: usize,
+    logical_count: usize,
     live_input_count: usize,
     live_output_count: usize,
     touched_slots: HashSet<u32>,
@@ -281,14 +282,17 @@ struct TemplateResourceSelection {
 impl TemplateResourceSelection {
     /// Return the next bounded selection, reserving one possible new segment
     /// for the mandatory coinbase output.
-    fn with_user_tx(&self, tx: &Transaction) -> Option<Self> {
-        if tx.body.is_coinbase {
-            return None;
-        }
-        let user_tx_count = self.user_tx_count + 1;
-        let live_input_count = self.live_input_count + tx.body.live_input_count();
-        let live_output_count = self.live_output_count + tx.body.live_output_count();
-        if user_tx_count > crate::consensus::params::BLOCK_MAX_USER_TXS
+    fn with_group(&self, pages: &[Transaction], spend: &PagedSpendFacts) -> Option<Self> {
+        let user_page_count = self.user_page_count.checked_add(pages.len())?;
+        let logical_count = self.logical_count.checked_add(1)?;
+        let live_input_count = self
+            .live_input_count
+            .checked_add(usize::from(spend.live_inputs))?;
+        let live_output_count = self
+            .live_output_count
+            .checked_add(usize::from(spend.live_outputs))?;
+        if user_page_count > crate::consensus::params::BLOCK_MAX_USER_TXS
+            || logical_count > crate::consensus::params::BLOCK_MAX_USER_TXS
             || live_input_count > crate::consensus::params::BLOCK_MAX_LIVE_INPUTS
             || live_output_count > crate::consensus::params::BLOCK_MAX_USER_OUTPUTS
             || live_input_count + live_output_count
@@ -299,29 +303,42 @@ impl TemplateResourceSelection {
 
         let mut touched_slots = self.touched_slots.clone();
         let mut touched_segments = self.touched_segments.clone();
-        for slot in tx
-            .body
-            .live_inputs()
-            .map(|(_, input)| input.slot_index)
-            .chain(tx.body.live_outputs().map(|(_, output)| output.slot_index))
-        {
-            if !touched_slots.insert(slot) {
-                return None;
+        for page in pages {
+            for slot in page
+                .body
+                .live_inputs()
+                .map(|(_, input)| input.slot_index)
+                .chain(
+                    page.body
+                        .live_outputs()
+                        .map(|(_, output)| output.slot_index),
+                )
+            {
+                if !touched_slots.insert(slot) {
+                    return None;
+                }
+                touched_segments.insert(slot >> crate::consensus::params::LOG_SEGMENT_SIZE);
             }
-            touched_segments.insert(slot >> crate::consensus::params::LOG_SEGMENT_SIZE);
         }
         if touched_segments.len() >= crate::consensus::params::BLOCK_MAX_DISTINCT_SEGMENTS {
             return None;
         }
 
         Some(Self {
-            user_tx_count,
+            user_page_count,
+            logical_count,
             live_input_count,
             live_output_count,
             touched_slots,
             touched_segments,
         })
     }
+}
+
+#[derive(Debug)]
+struct CandidatePagedSpend {
+    pages: Vec<Transaction>,
+    spend: PagedSpendFacts,
 }
 
 /// Build a `BlockTemplate` from a set of candidate transactions.
@@ -411,16 +428,39 @@ fn build_block_template_with_post_state(
     use crate::consensus::allocator::generate_slot_hints;
     use crate::consensus::emission::block_reward;
     use crate::consensus::expected_child_log_slots;
-    use crate::consensus::fees::{claimable_fee_for_tx_body, required_fee_for_tx_body};
-    use crate::consensus::{conflict::resolve_slot_conflicts, ordering::order_block_txs};
+    use crate::consensus::fees::fee_breakdown;
     use noid_tx::{TxBody, TxInput, TxOutput, TX_INPUTS};
 
     let child_height = parent.height.checked_add(1).ok_or_else(|| {
         TemplateBuildError::StateApplyError("parent height exhausted".to_string())
     })?;
 
-    // 1. Resolve slot conflicts among candidate txs.
-    let (mut winners, _losers) = resolve_slot_conflicts(candidate_txs);
+    // 1. Parse complete groups once, then sort the indivisible candidates by
+    // fee and logical txid. Physical pages are never independently reordered.
+    let stream =
+        crate::consensus::paged_spend::validate_paged_spend_transaction_stream(&candidate_txs)
+            .map_err(|error| TemplateBuildError::StateApplyError(error.to_string()))?;
+    let mut source = candidate_txs.into_iter();
+    let mut candidates = Vec::with_capacity(stream.groups.len());
+    for group in stream.groups {
+        let pages: Vec<_> = source
+            .by_ref()
+            .take(usize::from(group.page_count))
+            .collect();
+        debug_assert_eq!(pages.len(), usize::from(group.page_count));
+        candidates.push(CandidatePagedSpend {
+            pages,
+            spend: group.spend,
+        });
+    }
+    debug_assert!(source.next().is_none());
+    candidates.sort_by(|left, right| {
+        right
+            .spend
+            .fee
+            .cmp(&left.spend.fee)
+            .then_with(|| left.spend.logical_txid.0.cmp(&right.spend.logical_txid.0))
+    });
 
     // 2. Determine expansion trigger using median over prev_active_counts window.
     //    Must match validate_block_consensus exactly so the block we produce passes
@@ -437,7 +477,7 @@ fn build_block_template_with_post_state(
     // under the expanded header. Produce a coinbase-only expansion block; wallets
     // will re-prove after observing the new tip.
     if should_expand {
-        winners.clear();
+        candidates.clear();
     }
 
     // 3. Apply non-coinbase txs to scratch state.
@@ -458,29 +498,32 @@ fn build_block_template_with_post_state(
                 )
             })?;
 
-    let mut applied_winners: Vec<Transaction> = Vec::new();
+    let mut applied_winners: Vec<CandidatePagedSpend> = Vec::new();
     // Reserve one segment for coinbase. Typical templates place coinbase in
     // an already-populated segment, but this conservative reservation makes
     // the final 256-segment consensus bound unconditional.
     let mut resources = TemplateResourceSelection::default();
-    let ordered_winners = order_block_txs(winners);
-    for tx in ordered_winners {
-        let Some(next_resources) = resources.with_user_tx(&tx) else {
+    for group in candidates {
+        let Some(next_resources) = resources.with_group(&group.pages, &group.spend) else {
             continue;
         };
-        let required =
-            required_fee_for_tx_body(&tx.body, parent.active_slot_count, parent.log_slots);
-        let actual = tx.body.fee;
+        let required = fee_breakdown(
+            u64::from(group.spend.live_inputs),
+            u64::from(group.spend.live_outputs),
+            parent.active_slot_count,
+            parent.log_slots,
+        )
+        .required_total;
+        let actual = group.spend.fee;
         if actual < required {
             continue;
         }
-        match apply_tx_checked_deferred_root(&mut selection_scratch, &tx.body, None) {
-            Ok(_) => {
-                resources = next_resources;
-                applied_winners.push(tx);
-            }
-            Err(_e) => {}
+        for page in &group.pages {
+            apply_tx_checked_deferred_root(&mut selection_scratch, &page.body, None)
+                .map_err(|error| TemplateBuildError::StateApplyError(format!("{error:?}")))?;
         }
+        resources = next_resources;
+        applied_winners.push(group);
     }
     let ordered_winners = applied_winners;
 
@@ -505,11 +548,17 @@ fn build_block_template_with_post_state(
         let state_log_slots = scratch.state.log_slots() as u32;
         let reserved: HashSet<u32> = ordered_winners
             .iter()
-            .flat_map(|tx| {
-                tx.body
-                    .live_inputs()
-                    .map(|(_, input)| input.slot_index)
-                    .chain(tx.body.live_outputs().map(|(_, output)| output.slot_index))
+            .flat_map(|group| {
+                group.pages.iter().flat_map(|page| {
+                    page.body
+                        .live_inputs()
+                        .map(|(_, input)| input.slot_index)
+                        .chain(
+                            page.body
+                                .live_outputs()
+                                .map(|(_, output)| output.slot_index),
+                        )
+                })
             })
             .collect();
         let seed =
@@ -556,13 +605,15 @@ fn build_block_template_with_post_state(
     // Sum only claimable fees. The deterministic state-growth component is burned.
     let claimable_fee_sum: u128 = ordered_winners
         .iter()
-        .filter(|tx| !tx.body.is_coinbase)
-        .map(|tx| {
-            u128::from(claimable_fee_for_tx_body(
-                &tx.body,
+        .map(|group| {
+            let burned = fee_breakdown(
+                u64::from(group.spend.live_inputs),
+                u64::from(group.spend.live_outputs),
                 parent.active_slot_count,
                 parent.log_slots,
-            ))
+            )
+            .burned;
+            u128::from(group.spend.fee.saturating_sub(burned))
         })
         .sum();
     // The mathematical ceiling may exceed the body amount lane. Claiming less
@@ -592,9 +643,11 @@ fn build_block_template_with_post_state(
     // Apply the complete block to scratch in its real semantic order.
     apply_tx_checked_deferred_root(&mut scratch, &coinbase.body, Some(child_height))
         .map_err(|e| TemplateBuildError::StateApplyError(format!("{:?}", e)))?;
-    for tx in &ordered_winners {
-        apply_tx_checked_deferred_root(&mut scratch, &tx.body, None)
-            .map_err(|e| TemplateBuildError::StateApplyError(format!("{:?}", e)))?;
+    for group in &ordered_winners {
+        for page in &group.pages {
+            apply_tx_checked_deferred_root(&mut scratch, &page.body, None)
+                .map_err(|e| TemplateBuildError::StateApplyError(format!("{:?}", e)))?;
+        }
     }
 
     // 5. Compute final header fields.
@@ -602,13 +655,22 @@ fn build_block_template_with_post_state(
         .try_state_root()
         .map_err(|e| TemplateBuildError::StateApplyError(format!("{e:?}")))?;
     let tx_hashes_for_root: Vec<[u8; 32]> = std::iter::once(coinbase.txid().0)
-        .chain(ordered_winners.iter().map(|tx| tx.txid().0))
+        .chain(
+            ordered_winners
+                .iter()
+                .map(|group| group.spend.logical_txid.0),
+        )
         .collect();
     let tx_root = crate::tx_tree::root_from_hashes(&tx_hashes_for_root);
 
+    let ordered_pages = ordered_winners
+        .into_iter()
+        .flat_map(|group| group.pages)
+        .collect();
+
     let template = BlockTemplate {
         coinbase,
-        txs: ordered_winners,
+        txs: ordered_pages,
         state_root,
         tx_root,
         active_slot_count: scratch.active_slot_count,
@@ -632,7 +694,10 @@ mod tests {
     use super::*;
     use crate::consensus::fees::required_fee_for_tx_body;
     use crate::history_step::HistoryStepTerminalMetadata;
-    use noid_tx::{output_bitmap_bit, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS};
+    use noid_tx::{
+        output_bitmap_bit, TxBody, TxInput, TxOutput, PAGED_SPEND_END_BIT, PAGED_SPEND_START_BIT,
+        TX_INPUTS, TX_OUTPUTS,
+    };
 
     fn parent(state: &mut ChainState) -> BlockHeader {
         BlockHeader {
@@ -675,7 +740,7 @@ mod tests {
             input_owner: owner,
             inputs,
             outputs,
-            validity_bitmap: 1 | output_bitmap_bit(0),
+            validity_bitmap: 1 | output_bitmap_bit(0) | PAGED_SPEND_START_BIT | PAGED_SPEND_END_BIT,
             is_coinbase: false,
         };
         body.fee = required_fee_for_tx_body(&body, parent.active_slot_count, parent.log_slots);
@@ -751,7 +816,7 @@ mod tests {
     }
 
     #[test]
-    fn selection_never_builds_same_block_slot_chains() {
+    fn candidate_stream_rejects_same_block_slot_chains() {
         let owner = Address([1u8; 32]);
         let mut state = ChainState::with_log_slots(8);
         for slot in [1u32, 2] {
@@ -768,7 +833,7 @@ mod tests {
         let parent = parent(&mut state);
         let a = user(1, 3, 1_000_000, owner, &parent);
         let b = user(2, 1, 1_000_000, owner, &parent);
-        let template = build_block_template(
+        let error = build_block_template(
             &parent,
             &state,
             &[2],
@@ -777,8 +842,8 @@ mod tests {
             1,
             [0xff; 32],
         )
-        .unwrap();
-        assert!(template.txs.len() <= 1);
+        .unwrap_err();
+        assert!(matches!(error, TemplateBuildError::StateApplyError(_)));
     }
 
     fn node_owned_coinbase_template(

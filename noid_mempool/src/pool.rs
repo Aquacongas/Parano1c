@@ -6,7 +6,7 @@
 //! ## Architecture
 //!
 //! ```text
-//!  submit(TxIntent)
+//!  submit(PagedSpendIntent)
 //!    │
 //!    ├─ Stateless check (no lock): canonical body logic + derived txid
 //!    │
@@ -27,7 +27,7 @@
 //!
 //! ## Pre-proving cache
 //!
-//! When a wallet submits a `TxIntent`, it includes a `WalletAuthorizationBundle`
+//! When a wallet submits a `PagedSpendIntent`, it includes a `WalletAuthorizationBundle`
 //! (one versioned witness-hiding proof). The pool retains one immutable intent
 //! allocation and borrows the bundle suffix from it during block assembly.
 //! The block assembler uses cached bundles so that `prove_block` only
@@ -41,14 +41,12 @@ use tokio::sync::{broadcast, Mutex, Semaphore};
 
 use noid_chain::consensus::params::BLOCK_MAX_USER_TXS;
 use noid_chain::consensus::wire_limits::{MAX_AUTHORIZATION_BYTES, MAX_TX_INTENT_BYTES_GLOBAL};
-use noid_chain::consensus::{
-    checks::validate_tx_consensus, required_fee_for_tx_body, tx_epoch_anchor_height_for_child,
-};
+use noid_chain::consensus::{fee_breakdown, tx_epoch_anchor_height_for_child};
 use noid_chain::fri_state::SlotValue;
 use noid_chain::Mempool;
 use noid_poseidon2b::primitives::TxBodyHash;
 use noid_tx::{
-    validate_public_tx_logic, Transaction, TxIntent, TX_INTENT_FIXED_OVERHEAD, TX_INTENT_MARKER,
+    validate_paged_spend, PagedSpendFacts, PagedSpendIntent, TxPage, PAGED_SPEND_INTENT_MARKER,
 };
 
 use crate::config::MempoolConfig;
@@ -95,8 +93,9 @@ pub struct MempoolEntryMetadata {
     pub tx_hash: TxBodyHash,
     pub fee_micronoid: u64,
     pub fee_rate: u64,
-    pub n_inputs: u8,
-    pub n_outputs: u8,
+    pub n_inputs: u16,
+    pub n_outputs: u16,
+    pub page_count: u16,
     pub admitted_height: u64,
     pub has_authorization: bool,
 }
@@ -110,12 +109,13 @@ pub struct MempoolMetadataSnapshot {
 
 /// Minimal owned block-template selection.
 ///
-/// Raw `TxIntent` bytes are a networking cache and are never cloned into the
+/// Raw `PagedSpendIntent` bytes are a networking cache and are never cloned into the
 /// miner. Only the semantic body and the cached authorization bundle cross the
 /// mempool lock.
 #[derive(Debug)]
 pub struct SelectedMempoolEntry {
-    pub tx: Transaction,
+    pub pages: Vec<TxPage>,
+    pub logical_txid: TxBodyHash,
     pub cached_authorization: Option<Vec<u8>>,
 }
 
@@ -125,12 +125,11 @@ fn entry_metadata(
 ) -> MempoolEntryMetadata {
     MempoolEntryMetadata {
         tx_hash: hash,
-        fee_micronoid: entry.tx.body.fee,
+        fee_micronoid: entry.spend.fee,
         fee_rate: entry.fee_rate,
-        n_inputs: u8::try_from(entry.tx.body.live_input_count())
-            .expect("fixed transaction input count fits u8"),
-        n_outputs: u8::try_from(entry.tx.body.live_output_count())
-            .expect("fixed transaction output count fits u8"),
+        n_inputs: entry.spend.live_inputs,
+        n_outputs: entry.spend.live_outputs,
+        page_count: entry.pages.len() as u16,
         admitted_height: entry.admitted_height,
         has_authorization: entry.cached_authorization().is_some(),
     }
@@ -206,7 +205,7 @@ impl AsyncMempool {
     // Tx submission
     // -----------------------------------------------------------------------
 
-    /// Submit a `TxIntent` for admission.
+    /// Submit one complete `PagedSpendIntent` for admission.
     ///
     /// Runs the full native admission pipeline:
     /// 1. Fee ≥ dynamic floor
@@ -222,7 +221,7 @@ impl AsyncMempool {
     /// Returns the `TxBodyHash` on success.
     pub async fn submit(
         &self,
-        intent: TxIntent,
+        intent: PagedSpendIntent,
         intent_bytes: Vec<u8>,
     ) -> Result<TxBodyHash, SubmitError> {
         if intent_bytes.len() > MAX_TX_INTENT_BYTES_GLOBAL {
@@ -237,15 +236,13 @@ impl AsyncMempool {
             ));
         }
         // ── Stateless sanity check (no lock, no IO) ────────────────────
-        // Canonical public logic rejects malformed intents before touching any
-        // shared state or invoking the authorization verifier.
-        if !intent.tx_body.is_coinbase {
-            validate_public_tx_logic(&intent.tx_body)
-                .map_err(|e| SubmitError::MalformedIntent(format!("public tx logic: {e}")))?;
-        }
-        let txid = intent.txid();
+        // Revalidate group semantics at this trust boundary even when the
+        // caller already used the bounded decoder.
+        let spend = validate_paged_spend(&intent.pages)
+            .map_err(|e| SubmitError::MalformedIntent(format!("PagedSpend: {e}")))?;
+        let txid = spend.logical_txid;
 
-        if !intent.tx_body.is_coinbase && intent.authorization_bytes.is_empty() {
+        if intent.authorization_bytes.is_empty() {
             return Err(SubmitError::MissingProof);
         }
         if intent.authorization_bytes.len() > MAX_AUTHORIZATION_BYTES {
@@ -254,8 +251,6 @@ impl AsyncMempool {
                 max: MAX_AUTHORIZATION_BYTES,
             });
         }
-        let needs_zk = !intent.tx_body.is_coinbase;
-
         // ── Cheap pre-filter (lock held briefly) ─────────────────
         // Runs all cheap state checks before expensive Auth verification.
         {
@@ -273,16 +268,15 @@ impl AsyncMempool {
                     max: self.config.max_total_intent_bytes,
                 });
             }
-            let tx = intent_to_transaction(&intent)?;
-            let _ = run_admission_checks(&tx, &st)?;
+            let _ = run_admission_checks(&intent.pages, &spend, &st)?;
         }
 
         // ── Authorization verification (CPU-heavy, outside lock, semaphore-bounded) ─
         // Runs only when the pre-filter passed — invalid fee/anchor/slot txs are
         // already gone.  Semaphore caps concurrent CPU threads.
-        if needs_zk {
+        {
             let proof_bytes = intent.authorization_bytes.clone();
-            let tx_body_clone = intent.tx_body.clone();
+            let pages = intent.pages.clone();
             let executor = Arc::clone(&self.auth_verify_executor);
 
             let _permit =
@@ -292,7 +286,7 @@ impl AsyncMempool {
 
             tokio::task::spawn_blocking(move || {
                 executor(Box::new(move || {
-                    verify_intent_authorization(&tx_body_clone, &proof_bytes)
+                    verify_intent_authorization(&pages, &proof_bytes)
                 }))
             })
             .await
@@ -307,8 +301,7 @@ impl AsyncMempool {
         // authoritative check; the pre-filter was the DoS guard.
         let mut st = self.state.lock().await;
 
-        let tx = intent_to_transaction(&intent)?;
-        let hash = tx.txid();
+        let hash = spend.logical_txid;
 
         if st.pool.contains(&hash) {
             return Err(SubmitError::AlreadyAdmitted(hash));
@@ -325,21 +318,35 @@ impl AsyncMempool {
         }
 
         // Re-derive anchor_height from current state (needed by pool.admit).
-        let _anchor_height = run_admission_checks(&tx, &st)?;
+        let _anchor_height = run_admission_checks(&intent.pages, &spend, &st)?;
 
         // --- Admit ---
-        let fee = tx.body.fee;
-        let is_coinbase = tx.body.is_coinbase;
-        let has_authorization = needs_zk;
+        let fee = spend.fee;
         let tip_height = st.view.tip_height;
-        match st.pool.admit(tx.clone(), tip_height) {
+        match st.pool.admit(intent.pages, tip_height) {
             Ok(()) => {
                 // Maintain persistent slot sets so future checks are O(1).
-                for (_, inp) in tx.body.live_inputs() {
-                    st.admitted_input_slots.insert(inp.slot_index);
+                let entry = st
+                    .pool
+                    .get(&hash)
+                    .expect("newly admitted PagedSpend is indexed by logical txid");
+                let input_slots: Vec<_> = entry
+                    .pages
+                    .iter()
+                    .flat_map(|page| page.body.live_inputs())
+                    .map(|(_, input)| input.slot_index)
+                    .collect();
+                let output_slots: Vec<_> = entry
+                    .pages
+                    .iter()
+                    .flat_map(|page| page.body.live_outputs())
+                    .map(|(_, output)| output.slot_index)
+                    .collect();
+                for slot in input_slots {
+                    st.admitted_input_slots.insert(slot);
                 }
-                for (_, out) in tx.body.live_outputs() {
-                    st.admitted_output_slots.insert(out.slot_index);
+                for slot in output_slots {
+                    st.admitted_output_slots.insert(slot);
                 }
             }
             Err(noid_chain::mempool::MempoolError::Full) => {
@@ -360,19 +367,15 @@ impl AsyncMempool {
         // suffix of this allocation rather than a second retained proof copy.
         let intent_bytes: Arc<[u8]> = intent_bytes.into();
         st.pool.set_intent_bytes(&hash, Arc::clone(&intent_bytes));
-        if !is_coinbase {
-            st.floor.record(fee);
-        }
+        st.floor.record(fee);
         let _ = self.events.send(MempoolEvent::TxAdmitted {
             hash,
             fee,
             intent_bytes: Arc::clone(&intent_bytes),
         });
-        if has_authorization {
-            let _ = self
-                .events
-                .send(MempoolEvent::TxAuthorizationVerified { hash });
-        }
+        let _ = self
+            .events
+            .send(MempoolEvent::TxAuthorizationVerified { hash });
 
         tracing::debug!(
             hash = ?hash,
@@ -389,20 +392,21 @@ impl AsyncMempool {
     // Block assembly
     // -----------------------------------------------------------------------
 
-    /// Select up to `max_txs` transactions for block assembly.
+    /// Select fee-ordered indivisible groups fitting `max_pages` pages.
     ///
     /// Returns a fee-sorted list of `(Transaction, Option<cached_proof>)`.
     /// The caller (block builder) applies conflict resolution and coinbase on top.
     ///
     /// Returned txs are in descending fee-rate order with txid tie-break.
-    pub async fn select_for_block(&self, max_txs: usize) -> Vec<SelectedMempoolEntry> {
+    pub async fn select_for_block(&self, max_pages: usize) -> Vec<SelectedMempoolEntry> {
         let st = self.state.lock().await;
-        let limit = max_txs.min(BLOCK_MAX_USER_TXS);
+        let limit = max_pages.min(BLOCK_MAX_USER_TXS);
         st.pool
             .select_for_block(limit)
             .into_iter()
             .map(|entry| SelectedMempoolEntry {
-                tx: entry.tx.clone(),
+                pages: entry.pages.clone(),
+                logical_txid: entry.spend.logical_txid,
                 cached_authorization: entry.cached_authorization().map(<[u8]>::to_vec),
             })
             .collect()
@@ -417,18 +421,17 @@ impl AsyncMempool {
     /// bundles and discard 247 of them.
     pub async fn select_for_block_at_anchor(
         &self,
-        max_txs: usize,
+        max_pages: usize,
         epoch_anchor: [u8; 32],
     ) -> Vec<SelectedMempoolEntry> {
         let st = self.state.lock().await;
-        let limit = max_txs.min(BLOCK_MAX_USER_TXS);
+        let limit = max_pages.min(BLOCK_MAX_USER_TXS);
         st.pool
-            .select_for_block(BLOCK_MAX_USER_TXS)
+            .select_for_block_at_anchor(limit, &epoch_anchor)
             .into_iter()
-            .filter(|entry| entry.tx.body.epoch_anchor == epoch_anchor)
-            .take(limit)
             .map(|entry| SelectedMempoolEntry {
-                tx: entry.tx.clone(),
+                pages: entry.pages.clone(),
+                logical_txid: entry.spend.logical_txid,
                 cached_authorization: entry.cached_authorization().map(<[u8]>::to_vec),
             })
             .collect()
@@ -467,10 +470,7 @@ impl AsyncMempool {
         let stale_anchor: Vec<TxBodyHash> = st
             .pool
             .iter()
-            .filter(|(_, entry)| {
-                !entry.tx.body.is_coinbase
-                    && entry.tx.body.epoch_anchor != st.view.user_epoch_anchor_id
-            })
+            .filter(|(_, entry)| entry.spend.epoch_anchor != st.view.user_epoch_anchor_id)
             .map(|(hash, _)| *hash)
             .collect();
         for hash in stale_anchor {
@@ -490,10 +490,12 @@ impl AsyncMempool {
             .pool
             .iter()
             .filter_map(|(hash, entry)| {
-                let occupied = entry.tx.body.live_outputs().any(|(_, out)| {
-                    st.view
-                        .try_slot(out.slot_index)
-                        .map_or(true, |slot| slot != SlotValue::EMPTY)
+                let occupied = entry.pages.iter().any(|page| {
+                    page.body.live_outputs().any(|(_, out)| {
+                        st.view
+                            .try_slot(out.slot_index)
+                            .map_or(true, |slot| slot != SlotValue::EMPTY)
+                    })
                 });
                 if occupied {
                     Some(*hash)
@@ -523,22 +525,19 @@ impl AsyncMempool {
             .pool
             .iter()
             .filter_map(|(hash, entry)| {
-                if entry.tx.body.is_coinbase {
-                    return None;
-                }
-                let stale = entry.tx.body.live_inputs().any(|(_, inp)| {
-                    // Input must still hold exactly (value, creation_id, owner)
-                    // for this tx to
-                    // be includable. If the slot is EMPTY or has different content,
-                    // the tx cannot be included in any future block.
-                    let expected = SlotValue::with_owner_fields(
-                        inp.amount,
-                        inp.creation_id,
-                        entry.tx.body.input_owner.as_fields(),
-                    );
-                    st.view
-                        .try_slot(inp.slot_index)
-                        .map_or(true, |slot| slot != expected)
+                let stale = entry.pages.iter().any(|page| {
+                    page.body.live_inputs().any(|(_, inp)| {
+                        // Input must still hold exactly (value, creation_id,
+                        // group owner) for this intent to remain includable.
+                        let expected = SlotValue::with_owner_fields(
+                            inp.amount,
+                            inp.creation_id,
+                            entry.spend.input_owner.as_fields(),
+                        );
+                        st.view
+                            .try_slot(inp.slot_index)
+                            .map_or(true, |slot| slot != expected)
+                    })
                 });
                 if stale {
                     Some(*hash)
@@ -739,24 +738,32 @@ impl AsyncMempool {
 
 /// Bind the semantic object to its retained wire allocation without encoding
 /// or cloning the potentially large authorization proof a second time.
-fn canonical_intent_bytes_match(intent: &TxIntent, bytes: &[u8]) -> bool {
+fn canonical_intent_bytes_match(intent: &PagedSpendIntent, bytes: &[u8]) -> bool {
     let Ok(auth_len) = u32::try_from(intent.authorization_bytes.len()) else {
         return false;
     };
-    let Some(expected_len) = TX_INTENT_FIXED_OVERHEAD.checked_add(auth_len as usize) else {
+    let Ok(auth_offset) = intent.authorization_wire_offset() else {
+        return false;
+    };
+    let Some(expected_len) = auth_offset.checked_add(auth_len as usize) else {
         return false;
     };
     if bytes.len() != expected_len {
         return false;
     }
 
-    let mut prefix = Vec::with_capacity(TX_INTENT_FIXED_OVERHEAD);
-    prefix.push(TX_INTENT_MARKER);
-    intent.tx_body.encode(&mut prefix);
+    let mut prefix = Vec::with_capacity(auth_offset);
+    prefix.push(PAGED_SPEND_INTENT_MARKER);
+    prefix.extend_from_slice(&(intent.pages.len() as u16).to_le_bytes());
+    for page in &intent.pages {
+        if page.encode(&mut prefix).is_err() {
+            return false;
+        }
+    }
     prefix.extend_from_slice(&auth_len.to_le_bytes());
-    prefix.len() == TX_INTENT_FIXED_OVERHEAD
+    prefix.len() == auth_offset
         && bytes.starts_with(&prefix)
-        && bytes[TX_INTENT_FIXED_OVERHEAD..] == intent.authorization_bytes
+        && bytes[auth_offset..] == intent.authorization_bytes
 }
 
 /// Run every cheap admission check against `st`.
@@ -767,57 +774,56 @@ fn canonical_intent_bytes_match(intent: &TxIntent, bytes: &[u8]) -> bool {
 ///
 /// Returns `anchor_height` (needed by `pool.admit` for expiry tracking).
 /// The pre-filter discards it; the final admission step uses it.
-fn run_admission_checks(tx: &Transaction, st: &MempoolState) -> Result<u64, SubmitError> {
+fn run_admission_checks(
+    pages: &[TxPage],
+    spend: &PagedSpendFacts,
+    st: &MempoolState,
+) -> Result<u64, SubmitError> {
     // Dynamic fee floor layered over the deterministic consensus minimum.
-    if !tx.body.is_coinbase {
-        let consensus_required =
-            required_fee_for_tx_body(&tx.body, st.view.active_slot_count, st.view.log_slots());
-        let required = st.floor.current().max(consensus_required);
-        let actual = tx.body.fee;
-        if actual < required {
-            return Err(SubmitError::Consensus(
-                noid_chain::consensus::ConsensusError::BelowMinFee { required, actual },
-            ));
-        }
+    let consensus_required = fee_breakdown(
+        u64::from(spend.live_inputs),
+        u64::from(spend.live_outputs),
+        st.view.active_slot_count,
+        st.view.log_slots(),
+    )
+    .required_total;
+    let required = st.floor.current().max(consensus_required);
+    let actual = spend.fee;
+    if actual < required {
+        return Err(SubmitError::Consensus(
+            noid_chain::consensus::ConsensusError::BelowMinFee { required, actual },
+        ));
     }
 
-    // Basic consensus (fee overflow, body hash non-zero, anchor non-zero).
-    validate_tx_consensus(tx)?;
+    validate_paged_spend(pages)
+        .map_err(|error| SubmitError::MalformedIntent(format!("PagedSpend: {error}")))?;
+    if spend.epoch_anchor == [0u8; 32] {
+        return Err(SubmitError::Consensus(
+            noid_chain::consensus::ConsensusError::BadEpochAnchor,
+        ));
+    }
 
     // Epoch anchor is the one start-of-next-block transaction-epoch anchor.
     // Returns its height for deterministic mempool bookkeeping.
-    let anchor_height: u64 = if !tx.body.is_coinbase {
-        let height = tx_epoch_anchor_height_for_child(st.view.tip_height + 1);
-        if st.view.user_epoch_anchor_id == [0u8; 32]
-            || tx.body.epoch_anchor != st.view.user_epoch_anchor_id
-        {
-            return Err(SubmitError::Consensus(
-                noid_chain::consensus::ConsensusError::BadEpochAnchor,
-            ));
-        }
-        height
-    } else {
-        u64::MAX
-    };
+    let anchor_height = tx_epoch_anchor_height_for_child(st.view.tip_height + 1);
+    if st.view.user_epoch_anchor_id == [0u8; 32]
+        || spend.epoch_anchor != st.view.user_epoch_anchor_id
+    {
+        return Err(SubmitError::Consensus(
+            noid_chain::consensus::ConsensusError::BadEpochAnchor,
+        ));
+    }
 
     // No slot conflict with currently admitted txs (O(inputs + outputs)).
-    check_slot_conflicts_with_pool(tx, &st.admitted_input_slots, &st.admitted_output_slots)?;
+    check_slot_conflicts_with_pool(pages, &st.admitted_input_slots, &st.admitted_output_slots)?;
 
     // Input slots must be live in state.
-    check_input_slots(tx, &st.view)?;
+    check_input_slots(pages, spend, &st.view)?;
 
     // Output slots must be empty in state.
-    check_output_slots(tx, &st.view)?;
+    check_output_slots(pages, &st.view)?;
 
     Ok(anchor_height)
-}
-
-// ---------------------------------------------------------------------------
-// Helper: TxIntent → Transaction
-// ---------------------------------------------------------------------------
-
-fn intent_to_transaction(intent: &TxIntent) -> Result<Transaction, SubmitError> {
-    Ok(Transaction::new(intent.tx_body.clone()))
 }
 
 // ---------------------------------------------------------------------------
@@ -828,11 +834,13 @@ fn rebuild_slot_sets(st: &mut MempoolState) {
     st.admitted_input_slots.clear();
     st.admitted_output_slots.clear();
     for (_, entry) in st.pool.iter() {
-        for (_, inp) in entry.tx.body.live_inputs() {
-            st.admitted_input_slots.insert(inp.slot_index);
-        }
-        for (_, out) in entry.tx.body.live_outputs() {
-            st.admitted_output_slots.insert(out.slot_index);
+        for page in &entry.pages {
+            for (_, inp) in page.body.live_inputs() {
+                st.admitted_input_slots.insert(inp.slot_index);
+            }
+            for (_, out) in page.body.live_outputs() {
+                st.admitted_output_slots.insert(out.slot_index);
+            }
         }
     }
 }
@@ -842,22 +850,24 @@ fn rebuild_slot_sets(st: &mut MempoolState) {
 // ---------------------------------------------------------------------------
 
 fn check_slot_conflicts_with_pool(
-    tx: &Transaction,
+    pages: &[TxPage],
     pool_inputs: &HashSet<u32>,
     pool_outputs: &HashSet<u32>,
 ) -> Result<(), SubmitError> {
-    for (_, inp) in tx.body.live_inputs() {
-        if pool_inputs.contains(&inp.slot_index) {
-            return Err(SubmitError::Consensus(
-                noid_chain::consensus::ConsensusError::SlotConflict,
-            ));
+    for page in pages {
+        for (_, inp) in page.body.live_inputs() {
+            if pool_inputs.contains(&inp.slot_index) {
+                return Err(SubmitError::Consensus(
+                    noid_chain::consensus::ConsensusError::SlotConflict,
+                ));
+            }
         }
-    }
-    for (_, out) in tx.body.live_outputs() {
-        if pool_outputs.contains(&out.slot_index) {
-            return Err(SubmitError::Consensus(
-                noid_chain::consensus::ConsensusError::SlotConflict,
-            ));
+        for (_, out) in page.body.live_outputs() {
+            if pool_outputs.contains(&out.slot_index) {
+                return Err(SubmitError::Consensus(
+                    noid_chain::consensus::ConsensusError::SlotConflict,
+                ));
+            }
         }
     }
     Ok(())
@@ -867,35 +877,41 @@ fn check_slot_conflicts_with_pool(
 // Helper: input slots must be live in state
 // ---------------------------------------------------------------------------
 
-fn check_input_slots(tx: &Transaction, view: &ChainView) -> Result<(), SubmitError> {
-    for (_, inp) in tx.body.live_inputs() {
-        let idx = inp.slot_index;
-        if (idx as u64) >= view.num_slots {
-            return Err(SubmitError::Consensus(
-                noid_chain::consensus::ConsensusError::ShapeMismatch(format!(
-                    "input slot {idx} out of range"
-                )),
-            ));
-        }
-        let expected = SlotValue::with_owner_fields(
-            inp.amount,
-            inp.creation_id,
-            tx.body.input_owner.as_fields(),
-        );
-        let actual = view
-            .try_slot(idx)
-            .map_err(|error| SubmitError::Internal(format!("chain state read failed: {error}")))?;
-        if actual != expected {
-            tracing::warn!(
-                slot_index = idx,
-                expected_value = inp.amount,
-                expected_creation_id = inp.creation_id,
-                actual_empty = actual.is_empty(),
-                "check_input_slots: canonical slot mismatch"
+fn check_input_slots(
+    pages: &[TxPage],
+    spend: &PagedSpendFacts,
+    view: &ChainView,
+) -> Result<(), SubmitError> {
+    for page in pages {
+        for (_, inp) in page.body.live_inputs() {
+            let idx = inp.slot_index;
+            if (idx as u64) >= view.num_slots {
+                return Err(SubmitError::Consensus(
+                    noid_chain::consensus::ConsensusError::ShapeMismatch(format!(
+                        "input slot {idx} out of range"
+                    )),
+                ));
+            }
+            let expected = SlotValue::with_owner_fields(
+                inp.amount,
+                inp.creation_id,
+                spend.input_owner.as_fields(),
             );
-            return Err(SubmitError::Consensus(
-                noid_chain::consensus::ConsensusError::BadStateRoot,
-            ));
+            let actual = view.try_slot(idx).map_err(|error| {
+                SubmitError::Internal(format!("chain state read failed: {error}"))
+            })?;
+            if actual != expected {
+                tracing::warn!(
+                    slot_index = idx,
+                    expected_value = inp.amount,
+                    expected_creation_id = inp.creation_id,
+                    actual_empty = actual.is_empty(),
+                    "check_input_slots: canonical slot mismatch"
+                );
+                return Err(SubmitError::Consensus(
+                    noid_chain::consensus::ConsensusError::BadStateRoot,
+                ));
+            }
         }
     }
     Ok(())
@@ -905,24 +921,25 @@ fn check_input_slots(tx: &Transaction, view: &ChainView) -> Result<(), SubmitErr
 // Helper: output slots must be empty in state
 // ---------------------------------------------------------------------------
 
-fn check_output_slots(tx: &Transaction, view: &ChainView) -> Result<(), SubmitError> {
-    for (_, out) in tx.body.live_outputs() {
-        let idx = out.slot_index;
-        if (idx as u64) >= view.num_slots {
-            return Err(SubmitError::Consensus(
-                noid_chain::consensus::ConsensusError::ShapeMismatch(format!(
-                    "output slot {idx} out of range"
-                )),
-            ));
-        }
-        if view
-            .try_slot(idx)
-            .map_err(|error| SubmitError::Internal(format!("chain state read failed: {error}")))?
-            != SlotValue::EMPTY
-        {
-            return Err(SubmitError::Consensus(
-                noid_chain::consensus::ConsensusError::SlotConflict,
-            ));
+fn check_output_slots(pages: &[TxPage], view: &ChainView) -> Result<(), SubmitError> {
+    for page in pages {
+        for (_, out) in page.body.live_outputs() {
+            let idx = out.slot_index;
+            if (idx as u64) >= view.num_slots {
+                return Err(SubmitError::Consensus(
+                    noid_chain::consensus::ConsensusError::ShapeMismatch(format!(
+                        "output slot {idx} out of range"
+                    )),
+                ));
+            }
+            if view.try_slot(idx).map_err(|error| {
+                SubmitError::Internal(format!("chain state read failed: {error}"))
+            })? != SlotValue::EMPTY
+            {
+                return Err(SubmitError::Consensus(
+                    noid_chain::consensus::ConsensusError::SlotConflict,
+                ));
+            }
         }
     }
     Ok(())
@@ -934,15 +951,13 @@ fn check_output_slots(tx: &Transaction, view: &ChainView) -> Result<(), SubmitEr
 
 /// Verify the wallet authorization for a non-coinbase tx.
 /// Returns Ok(()) if valid, Err(String) with reason if invalid.
-fn verify_intent_authorization(
-    tx_body: &noid_tx::TxBody,
-    authorization_bytes: &[u8],
-) -> Result<(), String> {
-    use noid_gkr::{verify_wallet_authorization, WalletAuthorizationBundle};
+fn verify_intent_authorization(pages: &[TxPage], authorization_bytes: &[u8]) -> Result<(), String> {
+    use noid_gkr::{verify_paged_spend_authorization, WalletAuthorizationBundle};
 
     let bundle = WalletAuthorizationBundle::from_bytes(authorization_bytes)
         .map_err(|e| format!("authorization decode: {e}"))?;
-    verify_wallet_authorization(tx_body, &bundle).map_err(|e| format!("authorization verify: {e}"))
+    verify_paged_spend_authorization(pages, &bundle)
+        .map_err(|e| format!("authorization verify: {e}"))
 }
 
 #[cfg(test)]
@@ -954,8 +969,8 @@ mod tests {
     use noid_chain::state::ChainState;
     use noid_poseidon2b::primitives::Address;
     use noid_tx::{
-        output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, TX_INPUTS,
-        TX_INTENT_FIXED_OVERHEAD, TX_OUTPUTS,
+        output_bitmap_bit, validate_paged_spend, TxBody, TxInput, TxOutput, TxPage,
+        PAGED_SPEND_END_BIT, PAGED_SPEND_START_BIT, TX_INPUTS, TX_OUTPUTS,
     };
 
     use super::{check_input_slots, run_admission_checks, AsyncMempool, MempoolState};
@@ -963,20 +978,33 @@ mod tests {
     use crate::view::ChainView;
     use std::collections::HashSet;
 
-    fn empty_user_tx(epoch_anchor: [u8; 32], fee: u64) -> Transaction {
-        Transaction::new(TxBody {
+    fn user_pages(epoch_anchor: [u8; 32], fee: u64, seed: u8) -> Vec<TxPage> {
+        let mut inputs = [TxInput::dummy(); TX_INPUTS];
+        inputs[0] = TxInput {
+            slot_index: u32::from(seed) * 2 + 1,
+            amount: 100 + fee,
+            creation_id: u64::from(seed) + 1,
+        };
+        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        outputs[0] = TxOutput {
+            slot_index: u32::from(seed) * 2 + 2,
+            amount: 100,
+            owner: Address([seed; 32]),
+        };
+        vec![TxPage::new(TxBody {
             epoch_anchor,
             fee,
             input_owner: Address([0xA5; 32]),
-            inputs: [TxInput::dummy(); TX_INPUTS],
-            outputs: [TxOutput::dummy(); TX_OUTPUTS],
-            validity_bitmap: 0,
+            inputs,
+            outputs,
+            validity_bitmap: 1 | output_bitmap_bit(0) | PAGED_SPEND_START_BIT | PAGED_SPEND_END_BIT,
             is_coinbase: false,
         })
+        .unwrap()]
     }
 
     fn retained_intent(auth_byte: u8, auth_len: usize) -> Vec<u8> {
-        let mut bytes = vec![0; TX_INTENT_FIXED_OVERHEAD];
+        let mut bytes = vec![0; noid_tx::paged_spend_authorization_wire_offset(1).unwrap()];
         bytes.extend(std::iter::repeat_n(auth_byte, auth_len));
         bytes
     }
@@ -990,11 +1018,11 @@ mod tests {
         );
         let anchor = [0x11; 32];
         let wrong_anchor = [0x22; 32];
-        let high = empty_user_tx(anchor, 300);
-        let wrong = empty_user_tx(wrong_anchor, 200);
-        let low = empty_user_tx(anchor, 100);
-        let high_id = high.txid();
-        let low_id = low.txid();
+        let high = user_pages(anchor, 300, 1);
+        let wrong = user_pages(wrong_anchor, 200, 2);
+        let low = user_pages(anchor, 100, 3);
+        let high_id = validate_paged_spend(&high).unwrap().logical_txid;
+        let low_id = validate_paged_spend(&low).unwrap().logical_txid;
         {
             let mut locked = pool.state.lock().await;
             locked.pool.admit(high, 0).expect("admit high fee");
@@ -1010,13 +1038,13 @@ mod tests {
 
         let one = pool.select_for_block_at_anchor(1, anchor).await;
         assert_eq!(one.len(), 1);
-        assert_eq!(one[0].tx.txid(), high_id);
+        assert_eq!(one[0].logical_txid, high_id);
         assert_eq!(one[0].cached_authorization.as_ref().unwrap().len(), 1024);
 
         let two = pool.select_for_block_at_anchor(2, anchor).await;
         assert_eq!(two.len(), 2);
-        assert_eq!(two[0].tx.txid(), high_id);
-        assert_eq!(two[1].tx.txid(), low_id);
+        assert_eq!(two[0].logical_txid, high_id);
+        assert_eq!(two[1].logical_txid, low_id);
     }
 
     #[tokio::test]
@@ -1026,8 +1054,8 @@ mod tests {
             ChainView::new(0, HashMap::new(), 0, state.state),
             MempoolConfig::default().with_capacity(8),
         );
-        let tx = empty_user_tx([0x31; 32], 400);
-        let txid = tx.txid();
+        let tx = user_pages([0x31; 32], 400, 1);
+        let txid = validate_paged_spend(&tx).unwrap().logical_txid;
         {
             let mut locked = pool.state.lock().await;
             locked.pool.admit(tx, 7).expect("admit metadata fixture");
@@ -1120,29 +1148,35 @@ mod tests {
                 amount: 1_000_000 - fee,
                 owner: Address([0xB6; 32]),
             };
-            Transaction::new(TxBody {
+            vec![TxPage::new(TxBody {
                 epoch_anchor: [1; 32],
                 fee,
                 input_owner: owner,
                 inputs,
                 outputs,
-                validity_bitmap: 1 | output_bitmap_bit(0),
+                validity_bitmap: 1
+                    | output_bitmap_bit(0)
+                    | PAGED_SPEND_START_BIT
+                    | PAGED_SPEND_END_BIT,
                 is_coinbase: false,
             })
+            .unwrap()]
         };
 
         // Learn the consensus fee, then anchor the child-height-4 candidate
         // to the epoch id captured by the accepted height-3 view.
         let probe_state = mempool_state(view);
-        let required = noid_chain::consensus::required_fee_for_tx_body(
-            &spend(0).body,
+        let required = noid_chain::consensus::fee_breakdown(
+            1,
+            1,
             probe_state.view.active_slot_count,
             probe_state.view.log_slots(),
-        );
+        )
+        .required_total;
         let mut candidate = spend(required);
-        candidate.body.epoch_anchor = probe_state.view.user_epoch_anchor_id;
-        let candidate = Transaction::new(candidate.body);
-        run_admission_checks(&candidate, &probe_state)
+        candidate[0].body.epoch_anchor = probe_state.view.user_epoch_anchor_id;
+        let facts = validate_paged_spend(&candidate).unwrap();
+        run_admission_checks(&candidate, &facts, &probe_state)
             .expect("accepted tip reward is spendable in its child block");
     }
 
@@ -1172,18 +1206,21 @@ mod tests {
             amount: 999,
             owner: Address([0xB6; 32]),
         };
-        let mut tx = Transaction::new(TxBody {
+        let mut pages = vec![TxPage::new(TxBody {
             epoch_anchor: [1; 32],
             fee: 1,
             input_owner: owner,
             inputs,
             outputs,
-            validity_bitmap: 1 | output_bitmap_bit(0),
+            validity_bitmap: 1 | output_bitmap_bit(0) | PAGED_SPEND_START_BIT | PAGED_SPEND_END_BIT,
             is_coinbase: false,
-        });
+        })
+        .unwrap()];
+        let mut facts = validate_paged_spend(&pages).unwrap();
 
-        assert!(check_input_slots(&tx, &view).is_err());
-        tx.body.inputs[0].creation_id = 42;
-        assert!(check_input_slots(&tx, &view).is_ok());
+        assert!(check_input_slots(&pages, &facts, &view).is_err());
+        pages[0].body.inputs[0].creation_id = 42;
+        facts = validate_paged_spend(&pages).unwrap();
+        assert!(check_input_slots(&pages, &facts, &view).is_ok());
     }
 }

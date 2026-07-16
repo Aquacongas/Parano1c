@@ -300,26 +300,35 @@ impl TemplateBuilder {
             .mempool
             .select_for_block_at_anchor(max_user_txs, user_epoch_anchor)
             .await;
-        // Single-pass: move authorization bytes and transactions together (no clone).
-        let (authorization_bytes, txs): (Vec<Option<Vec<u8>>>, Vec<_>) = entries
+        // Keep each authorization paired with its indivisible logical group;
+        // flatten only the public pages passed into the chain template.
+        let (authorization_bytes, groups): (Vec<Option<Vec<u8>>>, Vec<_>) = entries
             .into_iter()
-            .map(|e| (e.cached_authorization, e.tx))
+            .map(|e| (e.cached_authorization, (e.logical_txid, e.pages)))
             .unzip();
 
         // Recheck the exact start-of-block anchor after selection. A boundary
         // may have advanced while the transaction waited in the mempool.
-        let (authorization_bytes, txs): (Vec<_>, Vec<_>) = authorization_bytes
+        let (authorization_bytes, groups): (Vec<_>, Vec<_>) = authorization_bytes
             .into_iter()
-            .zip(txs)
-            .filter(|(_, tx)| tx.body.epoch_anchor == user_epoch_anchor)
-            .take(max_user_txs)
+            .zip(groups)
+            .filter(|(_, (_, pages))| {
+                pages
+                    .first()
+                    .is_some_and(|page| page.body.epoch_anchor == user_epoch_anchor)
+            })
             .unzip();
         let mut proof_by_hash: HashMap<noid_poseidon2b::primitives::TxBodyHash, Option<Vec<u8>>> =
             authorization_bytes
                 .into_iter()
-                .zip(txs.iter().map(|tx| tx.txid()))
-                .map(|(proof, hash)| (hash, proof))
+                .zip(groups.iter().map(|(logical_txid, _)| *logical_txid))
+                .map(|(proof, logical_txid)| (logical_txid, proof))
                 .collect();
+        let txs: Vec<_> = groups
+            .into_iter()
+            .flat_map(|(_, pages)| pages)
+            .map(|page| noid_tx::Transaction::new(page.body))
+            .collect();
 
         // Fault in only segments referenced by the admitted transaction set.
         // The canonical snapshot itself remains metadata-only, so template
@@ -359,10 +368,17 @@ impl TemplateBuilder {
             }
         };
 
-        let authorization_bytes = inner
-            .txs
+        let selected_stream =
+            noid_chain::consensus::validate_paged_spend_transaction_stream(&inner.txs)
+                .expect("chain template emits one canonical PagedSpend stream");
+        let authorization_bytes = selected_stream
+            .groups
             .iter()
-            .map(|tx| proof_by_hash.remove(&tx.txid()).unwrap_or(None))
+            .map(|group| {
+                proof_by_hash
+                    .remove(&group.spend.logical_txid)
+                    .unwrap_or(None)
+            })
             .collect();
         Some(BlockTemplate {
             inner,

@@ -10,7 +10,6 @@
 
 pub mod body_hash;
 pub mod claims;
-pub mod intent;
 pub mod owner_auth;
 pub mod paged_spend;
 pub mod public_logic;
@@ -19,15 +18,12 @@ pub mod wire;
 
 pub use body_hash::hash_tx_body;
 pub use claims::compute_claims_commitment;
-pub use intent::{
-    TxIntent, MAX_TX_AUTHORIZATION_BYTES, MAX_TX_INTENT_BYTES, TX_INTENT_FIXED_OVERHEAD,
-    TX_INTENT_MARKER,
-};
 pub use owner_auth::{canonical_owner_auth, CanonicalOwnerAuth, OwnerAuthError};
 pub use paged_spend::{
-    canonical_paged_spend_auth, hash_paged_spend, validate_paged_spend, CanonicalPagedSpendAuth,
-    PagedSpendError, PagedSpendFacts, PagedSpendIntent, TxPage, MAX_PAGED_SPEND_INPUTS,
-    MAX_PAGED_SPEND_INTENT_BYTES, MAX_PAGED_SPEND_OUTPUTS, MAX_PAGED_SPEND_PAGES,
+    canonical_paged_spend_auth, hash_paged_spend, paged_spend_authorization_wire_offset,
+    validate_paged_spend, CanonicalPagedSpendAuth, PagedSpendError, PagedSpendFacts,
+    PagedSpendIntent, TxPage, MAX_PAGED_SPEND_INPUTS, MAX_PAGED_SPEND_INTENT_BYTES,
+    MAX_PAGED_SPEND_OUTPUTS, MAX_PAGED_SPEND_PAGES, MAX_TX_AUTHORIZATION_BYTES,
     PAGED_SPEND_END_BIT, PAGED_SPEND_INTENT_FIXED_OVERHEAD, PAGED_SPEND_INTENT_MARKER,
     PAGED_SPEND_MARKER_MASK, PAGED_SPEND_START_BIT, PAGED_SPEND_VALIDITY_MASK, PAGED_SPEND_VERSION,
 };

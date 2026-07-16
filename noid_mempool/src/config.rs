@@ -11,7 +11,7 @@ pub struct MempoolConfig {
     /// Maximum number of admitted transactions.
     pub capacity: usize,
 
-    /// Maximum serialized TxIntent bytes retained in RAM.
+    /// Maximum serialized PagedSpendIntent bytes retained in RAM.
     pub max_total_intent_bytes: usize,
 
     /// Number of recent admitted-tx fees used to compute the dynamic fee floor.

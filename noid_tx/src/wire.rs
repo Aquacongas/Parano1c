@@ -22,8 +22,6 @@ pub enum WireError {
     InvalidBool,
     BadMarker,
     NonCanonicalBody,
-    AuthorizationTooLarge,
-    CoinbaseIntent,
     LengthOverflow,
 }
 

@@ -16,11 +16,11 @@ use noid_poseidon2b::primitives::TxBodyHash;
 #[derive(Debug, Clone)]
 pub enum MempoolEvent {
     /// A new transaction was admitted (passed all native checks).
-    /// Payload: raw wire bytes of the `TxIntent` (for P2P gossip).
+    /// Payload: raw wire bytes of the `PagedSpendIntent` (for P2P gossip).
     TxAdmitted {
         hash: TxBodyHash,
         fee: u64,
-        /// Raw `TxIntent` bytes for P2P rebroadcast.
+        /// Raw `PagedSpendIntent` bytes for P2P rebroadcast.
         intent_bytes: Arc<[u8]>,
     },
 
