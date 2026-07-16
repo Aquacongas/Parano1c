@@ -19,4 +19,5 @@ pub mod group_fee;
 pub mod page_binding;
 pub mod paged_spend;
 pub mod paged_spend_relation;
+pub mod parent_union;
 pub mod partial_candidate;

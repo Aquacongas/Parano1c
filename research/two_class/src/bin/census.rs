@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Paranoid Zero.
 
 use paranoid_two_class_research::{
-    action_relation, budget, geometry, page_binding, paged_spend_relation,
+    action_relation, budget, geometry, page_binding, paged_spend_relation, parent_union,
 };
 
 fn main() {
@@ -33,6 +33,15 @@ fn main() {
     println!(
         "action relation    {}",
         action_relation::ACTION_RELATION_ROWS
+    );
+    let parent = parent_union::ParentUnionLayout::canonical();
+    println!(
+        "parent m23/m24 q  {}/{}",
+        parent.b128.fri_queries, parent.b256.fri_queries
+    );
+    println!(
+        "parent union tail  {} fields",
+        parent.inactive_m23_suffix_fields
     );
     println!(
         "non-auth ceiling  {}",
