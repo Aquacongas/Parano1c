@@ -35,6 +35,7 @@ pub mod conflict;
 pub mod da_prune;
 pub mod network;
 pub mod ordering;
+pub mod paged_spend;
 pub mod reorg;
 pub mod template;
 pub mod validation;
@@ -78,6 +79,12 @@ pub use genesis::{find_genesis_nonce, genesis_header, genesis_state_root, GENESI
 pub use header::{asert_anchor_height, is_final, validate_header};
 pub use network::{NetworkConfig, NetworkKind};
 pub use ordering::order_block_txs;
+pub use paged_spend::{
+    validate_paged_spend_transaction_stream, validate_paged_spend_transaction_stream_for_class,
+    validate_paged_spend_tx_page_stream, validate_paged_spend_tx_page_stream_for_class,
+    BlockProofClass, PagedSpendGroupFacts, PagedSpendStreamError, PagedSpendStreamFacts,
+    BLOCK_PROOF_CLASS_TIERS,
+};
 pub use params::*;
 pub use pow::{
     block_id, poseidon_pow_digest, pow_header_fields, search_pow, validate_pow, BlockHash,
