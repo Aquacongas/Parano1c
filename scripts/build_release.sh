@@ -164,8 +164,8 @@ shopt -u nullglob
 shopt -s nullglob dotglob
 pack_entries=("$PACK_V1"/*)
 shopt -u nullglob dotglob
-(( ${#pack_entries[@]} == 17 )) || \
-  die "expected exactly 17 entries in v1, found ${#pack_entries[@]}"
+(( ${#pack_entries[@]} == 5 )) || \
+  die "expected exactly 5 entries in v1, found ${#pack_entries[@]}"
 for artifact in "${pack_entries[@]}"; do
   [[ -f "$artifact" && ! -L "$artifact" ]] || \
     die "unexpected non-regular pack entry: $artifact"
