@@ -185,8 +185,8 @@ LEAF_DIGESTS="$(
 )"
 [[ $METADATA_DIGEST =~ ^[0-9a-f]{64}$ ]] || \
   die "runtime metadata digest is not 64 lowercase hex characters"
-[[ $LEAF_DIGESTS =~ ^[0-9a-f]{1024}$ ]] || \
-  die "matrix leaf pin string is not 1024 lowercase hex characters"
+[[ $LEAF_DIGESTS =~ ^[0-9a-f]{256}$ ]] || \
+  die "matrix leaf pin string is not 256 lowercase hex characters"
 
 PINS_TMP="$PACK_STAGING/.pins.env.tmp.$$"
 printf 'export NOID_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST=%s\nexport NOID_HISTORY_STEP_PACK_LEAF_DIGESTS=%s\n' \
