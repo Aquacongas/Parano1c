@@ -44,6 +44,23 @@ fn main() {
         parent.inactive_m23_suffix_fields
     );
     println!(
+        "production B64     direct={} history={} shared={}",
+        budget::PRODUCTION_B64_DIRECT_BLOCK_ROWS,
+        budget::PRODUCTION_B64_HISTORY_STEP_ROWS,
+        budget::PRODUCTION_B64_SHARED_HISTORY_ROWS,
+    );
+    println!(
+        "standard A128 floor {} (+shared baseline={})",
+        budget::STANDARD_A128_AUTH_META_FLOOR,
+        budget::STANDARD_A128_WITH_B64_SHARED_BASELINE,
+    );
+    println!(
+        "optimized known    {} (unresolved={}, baseline margin={})",
+        budget::KNOWN_OPTIMIZED_CORE_ROWS_A128,
+        budget::OPTIMIZED_UNRESOLVED_BUDGET_A128,
+        budget::OPTIMIZED_MARGIN_AFTER_B64_SHARED_BASELINE,
+    );
+    println!(
         "non-auth ceiling  {}",
         budget::M23_ROWS - budget::DIRECT_SIMD_AUTH_ROWS_A128
     );

@@ -30,6 +30,9 @@ pub const P128_PAIRED_DOMAIN_ROWS: usize = P128_PAIRED_ACTIVE_ROWS.next_power_of
 pub const P128_PAIRED_COMMITTED_COLUMNS: usize = 9;
 pub const P128_PAIRED_COMMITTED_CELLS: usize =
     P128_PAIRED_DOMAIN_ROWS * P128_PAIRED_COMMITTED_COLUMNS;
+pub const P128_EXACT_STATE_STRUCTURAL_ROWS: usize = 13_575;
+pub const P128_EXACT_STATE_CONNECTION_ROWS: usize = 205_115;
+pub const P128_EXACT_STATE_INTERFACE_ALIAS_ROWS: usize = 52_152;
 
 const _: () = assert!(P128_TOUCHED_CAPACITY == 1_277);
 const _: () = assert!(P128_SEGMENT_CAPACITY == 256);
@@ -434,8 +437,12 @@ mod tests {
             case.interface_alias_rows,
             P128_PAIRED_COMMITTED_CELLS,
         );
-        assert!(case.structural_rows > 0);
-        assert!(case.connection_rows > 0);
+        assert_eq!(case.structural_rows, P128_EXACT_STATE_STRUCTURAL_ROWS);
+        assert_eq!(case.connection_rows, P128_EXACT_STATE_CONNECTION_ROWS);
+        assert_eq!(
+            case.interface_alias_rows,
+            P128_EXACT_STATE_INTERFACE_ALIAS_ROWS
+        );
         assert_eq!(P128_PAIRED_COMMITTED_CELLS, 1_179_648);
     }
 }
