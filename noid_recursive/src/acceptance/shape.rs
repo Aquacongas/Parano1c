@@ -8,7 +8,7 @@
 
 use noid_poseidon2b::native::poseidon2b_hash_byte_slices;
 
-/// One block shape class: a canonical user-transaction-count tier.
+/// One block shape class: a canonical physical-page tier.
 ///
 /// Every proof-facing per-block structure is padded to this tier. The fixed
 /// one-owner authorization statement has one geometry in every class; the
@@ -19,10 +19,10 @@ pub struct ShapeClass {
 }
 
 impl ShapeClass {
-    /// The class holding `user_txs`, or `None` above the consensus maximum.
-    pub fn for_count(user_txs: usize) -> Option<Self> {
+    /// The class holding `page_count`, or `None` above the consensus maximum.
+    pub fn for_page_count(page_count: usize) -> Option<Self> {
         Some(Self {
-            tier: noid_chain::consensus::params::user_tx_class_tier(user_txs)?,
+            tier: noid_chain::consensus::params::block_page_class_tier(page_count)?,
         })
     }
 
@@ -107,9 +107,9 @@ impl ShapeClass {
     }
 }
 
-/// Every current class in canonical ladder order: B8, B32, B64, B255.
+/// Every current class in canonical ladder order: B64, B255.
 pub fn enumerate_shape_classes() -> impl Iterator<Item = ShapeClass> {
-    noid_chain::consensus::params::USER_TX_CLASS_TIERS
+    noid_chain::consensus::params::BLOCK_PAGE_CLASS_TIERS
         .into_iter()
         .map(|tier| ShapeClass { tier })
 }
@@ -125,7 +125,7 @@ mod tests {
         let classes: Vec<_> = enumerate_shape_classes().collect();
         assert_eq!(
             classes.iter().map(|class| class.tier).collect::<Vec<_>>(),
-            [8, 32, 64, 255]
+            [64, 255]
         );
         let digests: std::collections::HashSet<_> = classes
             .iter()
@@ -134,28 +134,33 @@ mod tests {
             .collect();
         assert_eq!(digests.len(), classes.len());
 
-        assert_eq!(ShapeClass::for_count(9).unwrap().tier, 32);
-        assert!(ShapeClass::for_count(256).is_none());
+        assert_eq!(ShapeClass::for_page_count(0).unwrap().tier, 64);
+        assert_eq!(ShapeClass::for_page_count(65).unwrap().tier, 255);
+        assert!(ShapeClass::for_page_count(256).is_none());
         assert_eq!(
-            ShapeClass::for_count(255).unwrap().spend_capacity(),
+            ShapeClass::for_page_count(255).unwrap().spend_capacity(),
             noid_chain::consensus::params::BLOCK_MAX_LIVE_INPUTS
         );
         assert_eq!(
-            ShapeClass::for_count(255).unwrap().authorization_capacity(),
+            ShapeClass::for_page_count(255)
+                .unwrap()
+                .authorization_capacity(),
             256
         );
         assert_eq!(
-            ShapeClass::for_count(255).unwrap().touched_capacity(),
+            ShapeClass::for_page_count(255).unwrap().touched_capacity(),
             1_531
         );
         assert_eq!(
-            ShapeClass::for_count(255)
+            ShapeClass::for_page_count(255)
                 .unwrap()
                 .action_candidate_capacity(),
             2_551
         );
         assert_eq!(
-            ShapeClass::for_count(255).unwrap().action_sort_capacity(),
+            ShapeClass::for_page_count(255)
+                .unwrap()
+                .action_sort_capacity(),
             4_096
         );
         assert_eq!(noid_tx::body_hash::BODY_HASH_LEAVES, 16);
@@ -176,12 +181,7 @@ mod tests {
             .collect();
         assert_eq!(
             table,
-            [
-                (8, 81, 2_072, 2_152),
-                (32, 321, 7_054, 7_374),
-                (64, 641, 11_405, 12_045),
-                (255, 1_531, 22_468, 23_998),
-            ]
+            [(64, 641, 11_405, 12_045), (255, 1_531, 22_468, 23_998)]
         );
     }
 
@@ -197,15 +197,7 @@ mod tests {
                 )
             })
             .collect();
-        assert_eq!(
-            table,
-            [
-                (8, 81, 128, 81),
-                (32, 321, 512, 321),
-                (64, 641, 1_024, 641),
-                (255, 2_551, 4_096, 1_531),
-            ]
-        );
+        assert_eq!(table, [(64, 641, 1_024, 641), (255, 2_551, 4_096, 1_531)]);
     }
 
     #[test]
@@ -219,14 +211,6 @@ mod tests {
                 )
             })
             .collect();
-        assert_eq!(
-            table,
-            [
-                (8, 81, 81),
-                (32, 321, 256),
-                (64, 641, 256),
-                (255, 1_531, 256)
-            ]
-        );
+        assert_eq!(table, [(64, 641, 256), (255, 1_531, 256)]);
     }
 }

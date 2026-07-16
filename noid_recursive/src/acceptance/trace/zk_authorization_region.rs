@@ -751,7 +751,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_four_class_authorization_geometry_is_exact() {
+    fn selected_two_class_authorization_geometry_is_exact() {
         let schedules = ZkAuthCapsuleDuplexSchedules::selected();
         assert_eq!(
             schedules.owner_layout().slots.len().next_power_of_two(),
@@ -761,7 +761,7 @@ mod tests {
             schedules.main_layout().slots.len().next_power_of_two(),
             1 << 8
         );
-        for tier in [8usize, 32, 64, 255] {
+        for tier in [64usize, 255] {
             let geometry = crate::region_sidecar::selected_zk_block_geometry(tier).unwrap();
             assert_eq!(geometry.auth_tiles << 7, 1 << geometry.owner_w_log);
             assert_eq!(geometry.auth_tiles << 8, 1 << geometry.main_w_log);

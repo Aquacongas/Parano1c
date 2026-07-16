@@ -4,8 +4,8 @@
 //! Canonical class bank for the atomic `HistoryStep` relation.
 //!
 //! A `HistoryStep` class is selected by the current block
-//! tier and the immediate parent's block tier.  The resulting 4 x 4 bank has
-//! sixteen matrices.  Every class exposes the same public-IO layout:
+//! physical-page tier. The launch bank has exactly B64 and B255. Every class
+//! exposes the same public-IO layout:
 //!
 //! * the exact ordered matrix and post-commit class whitelists;
 //! * an aggregate digest of those pins;
@@ -18,7 +18,7 @@
 //! claim from the tip verifier and every live accumulated lane have been
 //! evaluated against locally authenticated matrix rows.
 
-use noid_chain::consensus::params::USER_TX_CLASS_TIERS;
+use noid_chain::consensus::params::BLOCK_PAGE_CLASS_TIERS;
 use noid_core::Block128;
 use noid_ivc_core::challenger::{Challenger, FsLaneChallenger};
 use noid_ivc_core::field::F128;
@@ -48,7 +48,7 @@ pub(crate) fn block_acc_lanes(accumulator: &ChainAccumulator) -> [F128; ACC_LANE
     accumulator.to_lanes().map(flat_of)
 }
 
-pub const HISTORY_STEP_TIER_SLOT_COUNT: usize = USER_TX_CLASS_TIERS.len();
+pub const HISTORY_STEP_TIER_SLOT_COUNT: usize = BLOCK_PAGE_CLASS_TIERS.len();
 /// One class per current tier. Every class shares one frozen outer shape,
 /// so the predecessor replay is uniform by construction and the parent tier
 /// never enters the outer matrix — it is an authenticated witness selection.
@@ -146,7 +146,7 @@ impl CanonicalHistoryStepClassId {
     }
 
     pub fn current_tier(self) -> usize {
-        USER_TX_CLASS_TIERS[self.current_slot()]
+        BLOCK_PAGE_CLASS_TIERS[self.current_slot()]
     }
 
     pub const fn wire_id(self) -> u8 {
@@ -160,7 +160,7 @@ impl CanonicalHistoryStepClassId {
 
 /// Resolve a class by the consensus tier value rather than registry position.
 pub fn canonical_history_step_class_id(current_tier: usize) -> Option<CanonicalHistoryStepClassId> {
-    let current_slot = USER_TX_CLASS_TIERS
+    let current_slot = BLOCK_PAGE_CLASS_TIERS
         .iter()
         .position(|tier| *tier == current_tier)?;
     CanonicalHistoryStepClassId::new(current_slot)
@@ -212,15 +212,15 @@ impl HistoryStepBankLaneLayout {
     }
 }
 
-/// Shared public-IO layout of all sixteen classes.
+/// Shared public-IO layout of both launch classes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HistoryStepBankIoLayout {
-    /// One only when the parent slot is B8 and the current block starts at
-    /// the canonical genesis boundary. Every recursive step carries zero.
+    /// One only when the current block starts at the canonical genesis
+    /// boundary. Every recursive step carries zero.
     pub base: usize,
-    /// Full `(current tier, parent tier)` class id of this authenticated tip.
+    /// Current physical-page class id of this authenticated tip.
     pub tip_class: usize,
-    /// First of `2 * 16` flat-F128 matrix-digest lanes.
+    /// First of `2 * HISTORY_STEP_CLASS_COUNT` flat-F128 matrix-digest lanes.
     pub matrix_whitelist: usize,
     /// First of `2 * 16` flat-F128 post-commit-digest lanes.
     pub post_commit_whitelist: usize,
@@ -564,8 +564,8 @@ fn write_bank_pins(bank: &PinnedHistoryStepClassBank, io: &mut [F128]) {
 
 /// Canonical base terminal before any predecessor matrix has been folded.
 /// The caller supplies the block accumulator reached from the exact genesis
-/// parent boundary; all matrix lanes start dead.  The parent slot is the
-/// canonical B8 genesis slot while the current block may use any tier.
+/// parent boundary; all matrix lanes start dead. The current block selects
+/// either the B64 or B255 launch class.
 pub fn history_step_bank_base_output_io(
     bank: &PinnedHistoryStepClassBank,
     class_id: CanonicalHistoryStepClassId,
@@ -1393,13 +1393,12 @@ mod tests {
     #[test]
     fn canonical_class_id_is_the_current_tier_slot() {
         let first = CanonicalHistoryStepClassId::new(0).unwrap();
-        let mixed = CanonicalHistoryStepClassId::new(2).unwrap();
-        let last = CanonicalHistoryStepClassId::new(3).unwrap();
+        let last = CanonicalHistoryStepClassId::new(1).unwrap();
         assert_eq!(first.index(), 0);
-        assert_eq!(mixed.index(), 2);
-        assert_eq!(mixed.current_tier(), 64);
-        assert_eq!(last.index(), 3);
-        assert!(CanonicalHistoryStepClassId::new(4).is_none());
+        assert_eq!(first.current_tier(), 64);
+        assert_eq!(last.index(), 1);
+        assert_eq!(last.current_tier(), 255);
+        assert!(CanonicalHistoryStepClassId::new(2).is_none());
     }
 
     #[test]
@@ -1419,21 +1418,21 @@ mod tests {
     #[test]
     fn validated_bank_pins_are_exact_and_ordered() {
         let bank = PinnedHistoryStepClassBank::validate(test_pins()).unwrap();
-        let class = CanonicalHistoryStepClassId::new(3).unwrap();
+        let class = CanonicalHistoryStepClassId::new(1).unwrap();
         assert_eq!(bank.entry(class).shape().m, 24);
 
         let mut wrong = test_pins();
-        wrong[3].post_commit_digest[0] ^= 1;
+        wrong[1].post_commit_digest[0] ^= 1;
         assert!(matches!(
             PinnedHistoryStepClassBank::validate(wrong),
-            Err(HistoryStepBankError::EntryPostCommit(class)) if class.index() == 3
+            Err(HistoryStepBankError::EntryPostCommit(class)) if class.index() == 1
         ));
 
         let mut split_parent_vk = test_pins();
-        split_parent_vk[2].parent_recursion_vk_digest[0] ^= 1;
+        split_parent_vk[1].parent_recursion_vk_digest[0] ^= 1;
         assert!(matches!(
             PinnedHistoryStepClassBank::validate(split_parent_vk),
-            Err(HistoryStepBankError::ParentRecursionVk(class)) if class.index() == 2,
+            Err(HistoryStepBankError::ParentRecursionVk(class)) if class.index() == 1,
         ));
 
         // A tampered direct-Block VK digest changes the recomputed
@@ -1457,7 +1456,7 @@ mod tests {
         )
         .unwrap();
         let before = io.clone();
-        let selected = CanonicalHistoryStepClassId::new(3).unwrap();
+        let selected = CanonicalHistoryStepClassId::new(1).unwrap();
         let lane = bank.layout.matrix_lanes[selected.index()];
         let claim = MatrixAccClaim {
             point: vec![F128::ONE; lane.point_len()],
@@ -1498,7 +1497,7 @@ mod tests {
     #[test]
     fn base_and_dead_lane_tampering_fail_closed() {
         let bank = PinnedHistoryStepClassBank::validate(test_pins()).unwrap();
-        let class = CanonicalHistoryStepClassId::new(2).unwrap();
+        let class = CanonicalHistoryStepClassId::new(0).unwrap();
         let mut io = history_step_bank_base_output_io(
             &bank,
             class,
@@ -1513,18 +1512,18 @@ mod tests {
         ));
         io[bank.layout.base] = F128::ONE;
 
-        let dead = bank.layout.matrix_lanes[3];
+        let dead = bank.layout.matrix_lanes[1];
         io[dead.point] = F128::ONE;
         assert!(matches!(
             parse_history_step_bank_io(&bank, &io),
-            Err(HistoryStepBankError::NonCanonicalDeadLane(id)) if id.index() == 3,
+            Err(HistoryStepBankError::NonCanonicalDeadLane(id)) if id.index() == 1,
         ));
     }
 
     #[test]
     fn whitelist_and_aggregate_pins_fail_closed() {
         let bank = PinnedHistoryStepClassBank::validate(test_pins()).unwrap();
-        let class = CanonicalHistoryStepClassId::new(3).unwrap();
+        let class = CanonicalHistoryStepClassId::new(1).unwrap();
         let canonical = history_step_bank_base_output_io(
             &bank,
             class,
@@ -1533,10 +1532,10 @@ mod tests {
         .unwrap();
 
         let mut matrix_tamper = canonical.clone();
-        matrix_tamper[bank.layout.matrix_whitelist + 2 * 2] += F128::ONE;
+        matrix_tamper[bank.layout.matrix_whitelist] += F128::ONE;
         assert!(matches!(
             parse_history_step_bank_io(&bank, &matrix_tamper),
-            Err(HistoryStepBankError::MatrixWhitelist(id)) if id.index() == 2,
+            Err(HistoryStepBankError::MatrixWhitelist(id)) if id.index() == 0,
         ));
 
         let mut aggregate_tamper = canonical;
@@ -1551,7 +1550,7 @@ mod tests {
     fn route_selection_requires_the_authenticated_parent_class() {
         let bank = PinnedHistoryStepClassBank::validate(test_pins()).unwrap();
         let authenticated_parent = CanonicalHistoryStepClassId::new(1).unwrap();
-        let wrong_selected = CanonicalHistoryStepClassId::new(2).unwrap();
+        let wrong_selected = CanonicalHistoryStepClassId::new(0).unwrap();
         let current = CanonicalHistoryStepClassId::new(0).unwrap();
         let mut io = history_step_bank_base_output_io(
             &bank,

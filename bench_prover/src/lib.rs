@@ -10,11 +10,14 @@ use std::time::{Duration, Instant};
 use noid_core::Block128;
 use noid_gkr::zk_authorization::ZkAuthorizationProof;
 use noid_gkr::{
-    prove_wallet_authorization, verify_wallet_authorization_proof, OwnerAuthWitness,
-    WalletAuthorizationBundle,
+    prove_paged_spend_authorization, prove_wallet_authorization, verify_wallet_authorization_proof,
+    OwnerAuthWitness, WalletAuthorizationBundle,
 };
 use noid_poseidon2b::primitives::{derive_address, SpendSecret, TxBodyHash};
-use noid_tx::{output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS};
+use noid_tx::{
+    hash_paged_spend, output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, TxPage,
+    PAGED_SPEND_END_BIT, PAGED_SPEND_START_BIT, TX_INPUTS, TX_OUTPUTS,
+};
 
 pub const BENCH_LOG_SLOTS: u32 = 24;
 pub const B255_EIGHT_INPUT_TXS: usize = 85;
@@ -208,7 +211,7 @@ pub fn legal_block_scenarios(
     user_txs: usize,
     seed_base: u128,
 ) -> Vec<BenchScenario> {
-    assert!(noid_chain::consensus::params::USER_TX_CLASS_TIERS.contains(&user_txs));
+    assert!(noid_chain::consensus::params::BLOCK_PAGE_CLASS_TIERS.contains(&user_txs));
     if user_txs == noid_chain::consensus::params::BLOCK_MAX_USER_TXS {
         return b255_saturation_scenarios(label, seed_base);
     }
@@ -443,15 +446,14 @@ pub fn block_tx_hash_body(body: &TxBody) -> TxBodyHash {
 
 /// Native user counts used by the release freezer's honest backbone.
 ///
-/// The first ten blocks remain in B8 while growing a pool large enough for
-/// every fork. The final three blocks establish exact B32, B64 and B255
-/// parent boundaries. Every block starts at canonical genesis ancestry and is
-/// mined, checked and materialized through the production state transition.
-pub const HISTORY_STEP_FREEZER_BACKBONE_USER_COUNTS: [usize; 13] =
-    [0, 1, 3, 7, 8, 8, 8, 8, 8, 8, 17, 33, 65];
+/// B64 blocks grow a spendable pool geometrically; the final 65-page block
+/// establishes the B255 parent boundary. Every block starts at canonical
+/// genesis ancestry and is mined, checked and materialized through the
+/// production state transition.
+pub const HISTORY_STEP_FREEZER_BACKBONE_USER_COUNTS: [usize; 8] = [0, 1, 3, 7, 15, 31, 63, 65];
 
 /// One honest current-block member for each fixed HistoryStep tier.
-pub const HISTORY_STEP_FREEZER_FORK_USER_COUNTS: [usize; 4] = [8, 17, 33, 65];
+pub const HISTORY_STEP_FREEZER_FORK_USER_COUNTS: [usize; 2] = [64, 65];
 
 #[derive(Clone)]
 struct TrackedSpendable {
@@ -532,8 +534,6 @@ impl<const TIER: usize> PreparedHistoryStepTierFixture<TIER> {
 
 /// Heterogeneous streaming item used while the freezer proves the backbone.
 pub enum PreparedHistoryStepBackboneInput {
-    B8(PreparedHistoryStepTierFixture<8>),
-    B32(PreparedHistoryStepTierFixture<32>),
     B64(PreparedHistoryStepTierFixture<64>),
     B255(PreparedHistoryStepTierFixture<255>),
 }
@@ -553,7 +553,7 @@ struct BuiltFixtureChild<const TIER: usize> {
 
 /// Deterministic, resettable source of real release-freezer witnesses.
 ///
-/// A pass first streams the canonical-genesis backbone. Once all four parent
+/// A pass first streams the canonical-genesis backbone. Once both parent
 /// checkpoints exist, each class method forks a real child from the exact
 /// checkpoint selected by `class_id.parent_slot()`. Only the currently
 /// requested witness is materialized.
@@ -565,7 +565,8 @@ pub struct HonestHistoryStepFixtureProvider {
     mined_nonces: std::cell::RefCell<std::collections::HashMap<[u8; 32], u128>>,
     backbone_index: usize,
     live: HistoryStepFixtureCheckpoint,
-    checkpoints: [Option<HistoryStepFixtureCheckpoint>; 4],
+    checkpoints:
+        [Option<HistoryStepFixtureCheckpoint>; noid_recursive::HISTORY_STEP_TIER_SLOT_COUNT],
 }
 
 impl HonestHistoryStepFixtureProvider {
@@ -608,19 +609,11 @@ impl HonestHistoryStepFixtureProvider {
         let step = self.backbone_index;
         let user_count = HISTORY_STEP_FREEZER_BACKBONE_USER_COUNTS[step];
         let capture_parent_slot = match step {
-            9 => Some(0),
-            10 => Some(1),
-            11 => Some(2),
-            12 => Some(3),
+            6 => Some(0),
+            7 => Some(1),
             _ => None,
         };
-        let input = match noid_chain::consensus::params::user_tx_class_tier(user_count) {
-            Some(8) => self
-                .build_child::<8>(user_count, step as u128)?
-                .map_into(&mut self.live)?,
-            Some(32) => self
-                .build_child::<32>(user_count, step as u128)?
-                .map_into(&mut self.live)?,
+        let input = match noid_chain::consensus::params::block_page_class_tier(user_count) {
             Some(64) => self
                 .build_child::<64>(user_count, step as u128)?
                 .map_into(&mut self.live)?,
@@ -640,30 +633,6 @@ impl HonestHistoryStepFixtureProvider {
         }))
     }
 
-    pub fn b8(
-        &self,
-        class_id: noid_recursive::CanonicalHistoryStepClassId,
-        expected_start: &noid_recursive::ChainAccumulator,
-    ) -> Result<PreparedHistoryStepTierFixture<8>, String> {
-        self.fork::<8>(
-            class_id,
-            expected_start,
-            HISTORY_STEP_FREEZER_FORK_USER_COUNTS[0],
-        )
-    }
-
-    pub fn b32(
-        &self,
-        class_id: noid_recursive::CanonicalHistoryStepClassId,
-        expected_start: &noid_recursive::ChainAccumulator,
-    ) -> Result<PreparedHistoryStepTierFixture<32>, String> {
-        self.fork::<32>(
-            class_id,
-            expected_start,
-            HISTORY_STEP_FREEZER_FORK_USER_COUNTS[1],
-        )
-    }
-
     pub fn b64(
         &self,
         class_id: noid_recursive::CanonicalHistoryStepClassId,
@@ -672,7 +641,7 @@ impl HonestHistoryStepFixtureProvider {
         self.fork::<64>(
             class_id,
             expected_start,
-            HISTORY_STEP_FREEZER_FORK_USER_COUNTS[2],
+            HISTORY_STEP_FREEZER_FORK_USER_COUNTS[0],
         )
     }
 
@@ -684,7 +653,7 @@ impl HonestHistoryStepFixtureProvider {
         self.fork::<255>(
             class_id,
             expected_start,
-            HISTORY_STEP_FREEZER_FORK_USER_COUNTS[3],
+            HISTORY_STEP_FREEZER_FORK_USER_COUNTS[1],
         )
     }
 
@@ -742,7 +711,7 @@ impl HonestHistoryStepFixtureProvider {
         user_count: usize,
         nonce_domain: u128,
     ) -> Result<BuiltFixtureChild<TIER>, String> {
-        if noid_chain::consensus::params::user_tx_class_tier(user_count) != Some(TIER) {
+        if noid_chain::consensus::params::block_page_class_tier(user_count) != Some(TIER) {
             return Err(format!("{user_count} users do not select B{TIER}"));
         }
         let (candidates, authorities, next_user_spendables, next_output_slot_cursor) =
@@ -784,28 +753,33 @@ impl HonestHistoryStepFixtureProvider {
             .txs
             .iter()
             .map(|transaction| -> Result<ZkAuthorizationProof, String> {
+                let page = TxPage {
+                    body: transaction.body.clone(),
+                };
+                let logical_txid = hash_paged_spend(std::slice::from_ref(&page))
+                    .map_err(|error| format!("hash honest PagedSpend: {error}"))?;
                 let seed = authorities
                     .iter()
-                    .find_map(|(txid, seed)| (txid == &transaction.txid()).then_some(*seed))
+                    .find_map(|(txid, seed)| (txid == &logical_txid).then_some(*seed))
                     .ok_or_else(|| "ordered template lost its wallet authority".to_owned())?;
                 let cached_proof = {
                     self.authorization_proofs
                         .borrow()
-                        .get(&transaction.txid())
+                        .get(&logical_txid)
                         .cloned()
                 };
                 if let Some(proof) = cached_proof {
                     return Ok(proof);
                 }
-                let proof = prove_wallet_authorization(
-                    &transaction.body,
+                let proof = prove_paged_spend_authorization(
+                    std::slice::from_ref(&page),
                     OwnerAuthWitness::new(mk_secret(seed)),
                 )
                 .map(|bundle| bundle.proof)
                 .map_err(|error| format!("prove honest wallet authorization: {error}"))?;
                 self.authorization_proofs
                     .borrow_mut()
-                    .insert(transaction.txid(), proof.clone());
+                    .insert(logical_txid, proof.clone());
                 Ok(proof)
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -889,12 +863,6 @@ impl noid_recursive::HistoryStepFreezeInputProvider for HonestHistoryStepFixture
     ) -> Result<Option<noid_recursive::HistoryStepFreezeInput>, Self::Error> {
         HonestHistoryStepFixtureProvider::next_backbone(self, expected_start)?
             .map(|step| match step.input {
-                PreparedHistoryStepBackboneInput::B8(input) => input
-                    .into_history_step_input()
-                    .map(noid_recursive::HistoryStepFreezeInput::B8),
-                PreparedHistoryStepBackboneInput::B32(input) => input
-                    .into_history_step_input()
-                    .map(noid_recursive::HistoryStepFreezeInput::B32),
                 PreparedHistoryStepBackboneInput::B64(input) => input
                     .into_history_step_input()
                     .map(noid_recursive::HistoryStepFreezeInput::B64),
@@ -903,23 +871,6 @@ impl noid_recursive::HistoryStepFreezeInputProvider for HonestHistoryStepFixture
                     .map(noid_recursive::HistoryStepFreezeInput::B255),
             })
             .transpose()
-    }
-
-    fn b8(
-        &mut self,
-        class: noid_recursive::CanonicalHistoryStepClassId,
-        expected_start: &noid_recursive::ChainAccumulator,
-    ) -> Result<noid_recursive::HistoryStepBlockInput<8>, Self::Error> {
-        HonestHistoryStepFixtureProvider::b8(self, class, expected_start)?.into_history_step_input()
-    }
-
-    fn b32(
-        &mut self,
-        class: noid_recursive::CanonicalHistoryStepClassId,
-        expected_start: &noid_recursive::ChainAccumulator,
-    ) -> Result<noid_recursive::HistoryStepBlockInput<32>, Self::Error> {
-        HonestHistoryStepFixtureProvider::b32(self, class, expected_start)?
-            .into_history_step_input()
     }
 
     fn b64(
@@ -990,8 +941,6 @@ macro_rules! impl_advance_honest_backbone {
     };
 }
 
-impl_advance_honest_backbone!(8, B8);
-impl_advance_honest_backbone!(32, B32);
 impl_advance_honest_backbone!(64, B64);
 impl_advance_honest_backbone!(255, B255);
 
@@ -1094,7 +1043,11 @@ fn child_user_transactions(
             input_owner: owner,
             inputs,
             outputs,
-            validity_bitmap: 1 | output_bitmap_bit(0) | output_bitmap_bit(1),
+            validity_bitmap: 1
+                | output_bitmap_bit(0)
+                | output_bitmap_bit(1)
+                | PAGED_SPEND_START_BIT
+                | PAGED_SPEND_END_BIT,
             is_coinbase: false,
         };
         body.fee = noid_chain::consensus::fees::required_fee_for_tx_body(
@@ -1108,9 +1061,10 @@ fn child_user_transactions(
             .ok_or_else(|| "honest input does not cover the consensus fee".to_owned())?;
         body.outputs[0].amount = spendable / 2;
         body.outputs[1].amount = spendable - body.outputs[0].amount;
-        body.validate_canonical()
-            .map_err(|error| format!("honest Tx8x2 body: {error}"))?;
-        let txid = body.txid();
+        let page = TxPage::new(body.clone())
+            .map_err(|error| format!("honest PagedSpend page: {error}"))?;
+        let txid = hash_paged_spend(std::slice::from_ref(&page))
+            .map_err(|error| format!("honest PagedSpend group: {error}"))?;
         authorities.push((txid, source.spend_secret_seed));
         transactions.push(Transaction::new(body));
         next_spendables.extend((0..TX_OUTPUTS).map(|index| TrackedSpendable {
@@ -1154,638 +1108,32 @@ fn mine_history_step_fixture_header(header: &noid_chain::BlockHeader) -> u128 {
 }
 
 #[cfg(test)]
-mod honest_history_step_fixture_tests {
+mod two_class_history_step_fixture_tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Mutex;
-
-    const KNOWN_C00_PREFIX_PASSED: &str = "focused known-c00 prefix passed";
-
-    struct KnownC00CutoffProvider {
-        inner: HonestHistoryStepFixtureProvider,
-        resets: usize,
-        backbone_calls_per_reset: Vec<usize>,
-    }
-
-    impl noid_recursive::HistoryStepFreezeInputProvider for KnownC00CutoffProvider {
-        type Error = String;
-
-        fn reset_backbone(&mut self) -> Result<(), Self::Error> {
-            self.resets += 1;
-            // Resets 1-2 derive the provisional direct VKs, 3 assembles the
-            // provisional c00, 4 assembles c00 with its integrated direct VK,
-            // and 5 must consume the now-known c00 before discovering c04.
-            // Stop only when that complete pass has succeeded.
-            if self.resets == 6 {
-                return Err(KNOWN_C00_PREFIX_PASSED.to_owned());
-            }
-            self.inner.reset_backbone();
-            self.backbone_calls_per_reset.push(0);
-            Ok(())
-        }
-
-        fn next_backbone(
-            &mut self,
-            expected_start: &noid_recursive::ChainAccumulator,
-        ) -> Result<Option<noid_recursive::HistoryStepFreezeInput>, Self::Error> {
-            *self
-                .backbone_calls_per_reset
-                .last_mut()
-                .expect("next_backbone follows reset_backbone") += 1;
-            noid_recursive::HistoryStepFreezeInputProvider::next_backbone(
-                &mut self.inner,
-                expected_start,
-            )
-        }
-
-        fn b8(
-            &mut self,
-            class: noid_recursive::CanonicalHistoryStepClassId,
-            expected_start: &noid_recursive::ChainAccumulator,
-        ) -> Result<noid_recursive::HistoryStepBlockInput<8>, Self::Error> {
-            noid_recursive::HistoryStepFreezeInputProvider::b8(
-                &mut self.inner,
-                class,
-                expected_start,
-            )
-        }
-
-        fn b32(
-            &mut self,
-            class: noid_recursive::CanonicalHistoryStepClassId,
-            expected_start: &noid_recursive::ChainAccumulator,
-        ) -> Result<noid_recursive::HistoryStepBlockInput<32>, Self::Error> {
-            noid_recursive::HistoryStepFreezeInputProvider::b32(
-                &mut self.inner,
-                class,
-                expected_start,
-            )
-        }
-
-        fn b64(
-            &mut self,
-            class: noid_recursive::CanonicalHistoryStepClassId,
-            expected_start: &noid_recursive::ChainAccumulator,
-        ) -> Result<noid_recursive::HistoryStepBlockInput<64>, Self::Error> {
-            noid_recursive::HistoryStepFreezeInputProvider::b64(
-                &mut self.inner,
-                class,
-                expected_start,
-            )
-        }
-
-        fn b255(
-            &mut self,
-            class: noid_recursive::CanonicalHistoryStepClassId,
-            expected_start: &noid_recursive::ChainAccumulator,
-        ) -> Result<noid_recursive::HistoryStepBlockInput<255>, Self::Error> {
-            noid_recursive::HistoryStepFreezeInputProvider::b255(
-                &mut self.inner,
-                class,
-                expected_start,
-            )
-        }
-    }
-
-    #[derive(Default)]
-    struct RetainedBootstrapMatrices {
-        matrices: Mutex<Vec<Option<std::sync::Arc<noid_ivc_core::field_r1cs::FieldR1cs>>>>,
-        installs: AtomicUsize,
-        loads: AtomicUsize,
-    }
-
-    impl noid_recursive::HistoryStepMatrixSource for RetainedBootstrapMatrices {
-        fn load(
-            &self,
-            class: noid_recursive::CanonicalHistoryStepClassId,
-        ) -> Result<
-            noid_recursive::HistoryStepMatrixLease,
-            noid_recursive::HistoryStepMatrixSourceError,
-        > {
-            self.loads.fetch_add(1, Ordering::Relaxed);
-            self.matrices
-                .lock()
-                .map_err(|_| noid_recursive::HistoryStepMatrixSourceError)?
-                .get(class.index())
-                .and_then(Clone::clone)
-                .map(noid_recursive::HistoryStepMatrixLease::Resident)
-                .ok_or(noid_recursive::HistoryStepMatrixSourceError)
-        }
-    }
-
-    impl noid_recursive::HistoryStepFreezeMatrixStore for RetainedBootstrapMatrices {
-        type Error = String;
-
-        fn install(
-            &self,
-            class: noid_recursive::CanonicalHistoryStepClassId,
-            matrix: noid_ivc_core::field_r1cs::FieldR1cs,
-        ) -> Result<(), Self::Error> {
-            let mut matrices = self
-                .matrices
-                .lock()
-                .map_err(|_| "bootstrap matrix lock is poisoned".to_owned())?;
-            if matrices.is_empty() {
-                matrices.resize_with(noid_recursive::HISTORY_STEP_CLASS_COUNT, || None);
-            }
-            matrices[class.index()] = Some(std::sync::Arc::new(matrix));
-            self.installs.fetch_add(1, Ordering::Relaxed);
-            Ok(())
-        }
-    }
-
-    #[derive(Clone)]
-    struct SharedRetainedBootstrapMatrices(std::sync::Arc<RetainedBootstrapMatrices>);
-
-    impl noid_recursive::HistoryStepMatrixSource for SharedRetainedBootstrapMatrices {
-        fn load(
-            &self,
-            class: noid_recursive::CanonicalHistoryStepClassId,
-        ) -> Result<
-            noid_recursive::HistoryStepMatrixLease,
-            noid_recursive::HistoryStepMatrixSourceError,
-        > {
-            noid_recursive::HistoryStepMatrixSource::load(self.0.as_ref(), class)
-        }
-    }
-
-    fn derive_focused_provisional_parts(
-        provider: &mut HonestHistoryStepFixtureProvider,
-    ) -> Result<noid_recursive::HistoryStepRuntimeParts, String> {
-        provider.reset_backbone();
-        let mut expected = noid_recursive::genesis_accumulator();
-        let mut vks: [Option<noid_recursive::region_sidecar::BlockRegionSidecarVk>; 4] =
-            std::array::from_fn(|_| None);
-
-        while vks.iter().any(Option::is_none) {
-            let step = provider
-                .next_backbone(&expected)?
-                .ok_or_else(|| "focused VK derivation exhausted the backbone".to_owned())?;
-            macro_rules! derive_vk {
-                ($fixture:expr, $slot:expr) => {{
-                    let input = $fixture.into_history_step_input()?;
-                    expected = input.end_accumulator().clone();
-                    if vks[$slot].is_none() {
-                        vks[$slot] = Some(
-                            noid_recursive::derive_history_step_direct_block_vk(input).map_err(
-                                |error| {
-                                    format!(
-                                        "derive focused B{} VK: {error}",
-                                        [8, 32, 64, 255][$slot]
-                                    )
-                                },
-                            )?,
-                        );
-                    }
-                }};
-            }
-            match step.input {
-                PreparedHistoryStepBackboneInput::B8(fixture) => derive_vk!(fixture, 0),
-                PreparedHistoryStepBackboneInput::B32(fixture) => derive_vk!(fixture, 1),
-                PreparedHistoryStepBackboneInput::B64(fixture) => derive_vk!(fixture, 2),
-                PreparedHistoryStepBackboneInput::B255(fixture) => derive_vk!(fixture, 3),
-            }
-        }
-
-        noid_recursive::derive_history_step_runtime_parts(
-            vks.map(|vk| vk.expect("all focused direct VKs were derived")),
-        )
-        .map_err(|error| format!("derive focused runtime parts: {error}"))
-    }
-
-    fn focused_runtime(
-        digests: [[u8; 32]; noid_recursive::HISTORY_STEP_CLASS_COUNT],
-        parts: &noid_recursive::HistoryStepRuntimeParts,
-        store: &std::sync::Arc<RetainedBootstrapMatrices>,
-    ) -> Result<noid_recursive::HistoryStepRuntime, String> {
-        let bank = noid_recursive::pin_history_step_class_bank(digests, parts)
-            .map_err(|error| format!("pin focused bank: {error}"))?;
-        noid_recursive::HistoryStepRuntime::new(
-            bank,
-            Box::new(SharedRetainedBootstrapMatrices(std::sync::Arc::clone(
-                store,
-            ))),
-            parts.clone(),
-        )
-        .map_err(|error| format!("construct focused runtime: {error}"))
-    }
-
-    fn next_focused_b8(
-        provider: &mut HonestHistoryStepFixtureProvider,
-        expected: &noid_recursive::ChainAccumulator,
-    ) -> Result<(noid_chain::Block, noid_recursive::HistoryStepBlockInput<8>), String> {
-        let step = provider
-            .next_backbone(expected)?
-            .ok_or_else(|| "focused B8 backbone step is missing".to_owned())?;
-        let PreparedHistoryStepBackboneInput::B8(fixture) = step.input else {
-            return Err("focused backbone step does not select B8".to_owned());
-        };
-        let (witness, nonce, start, end) = fixture.into_parts();
-        witness
-            .finish(nonce, &start, &end)
-            .map_err(|error| format!("finish focused B8 input: {error}"))
-    }
-
-    fn next_focused_b32(
-        provider: &mut HonestHistoryStepFixtureProvider,
-        expected: &noid_recursive::ChainAccumulator,
-    ) -> Result<(noid_chain::Block, noid_recursive::HistoryStepBlockInput<32>), String> {
-        let step = provider
-            .next_backbone(expected)?
-            .ok_or_else(|| "focused B32 backbone step is missing".to_owned())?;
-        let PreparedHistoryStepBackboneInput::B32(fixture) = step.input else {
-            return Err("focused backbone step does not select B32".to_owned());
-        };
-        let (witness, nonce, start, end) = fixture.into_parts();
-        witness
-            .finish(nonce, &start, &end)
-            .map_err(|error| format!("finish focused B32 input: {error}"))
-    }
-
-    fn replace_focused_direct_vk(
-        parts: &noid_recursive::HistoryStepRuntimeParts,
-        slot: usize,
-        vk: noid_recursive::region_sidecar::BlockRegionSidecarVk,
-    ) -> noid_recursive::HistoryStepRuntimeParts {
-        let mut direct_vks = parts.direct_block_vks().clone();
-        direct_vks[slot] = vk;
-        noid_recursive::HistoryStepRuntimeParts::new(
-            parts.parent_recursion_vk().clone(),
-            direct_vks,
-            parts.parent_transcripts().clone(),
-        )
-        .expect("focused direct VK replacement remains canonical")
-    }
-
-    fn prove_focused_b8_checkpoint(
-        runtime: &noid_recursive::HistoryStepRuntime,
-        provider: &mut HonestHistoryStepFixtureProvider,
-    ) -> noid_recursive::HistoryStepTerminal {
-        provider.reset_backbone();
-        let mut expected = noid_recursive::genesis_accumulator();
-        let mut parent = None;
-        for _ in 0..10 {
-            let (_, input) = next_focused_b8(provider, &expected).unwrap();
-            let terminal = noid_recursive::prove_history_step(runtime, parent.as_ref(), input)
-                .expect("prove focused B8 backbone step");
-            expected = terminal.accumulator().clone();
-            parent = Some(terminal);
-        }
-        parent.expect("focused B8 checkpoint exists")
-    }
-
-    fn prove_focused_b32_checkpoint(
-        runtime: &noid_recursive::HistoryStepRuntime,
-        provider: &mut HonestHistoryStepFixtureProvider,
-    ) -> noid_recursive::HistoryStepTerminal {
-        let b8 = prove_focused_b8_checkpoint(runtime, provider);
-        let (_, input) = next_focused_b32(provider, b8.accumulator()).unwrap();
-        noid_recursive::prove_history_step(runtime, Some(&b8), input)
-            .expect("prove focused B32 checkpoint")
-    }
-
-    #[derive(Debug, PartialEq, Eq)]
-    struct FocusedBlockVkRoleGeometry {
-        role: &'static str,
-        row_count: usize,
-        slice_starts: Vec<usize>,
-        slice_lengths: Vec<usize>,
-    }
-
-    fn focused_block_vk_geometry(
-        vk: &noid_recursive::region_sidecar::BlockRegionSidecarVk,
-    ) -> Vec<FocusedBlockVkRoleGeometry> {
-        macro_rules! role {
-            ($name:literal, $child:expr) => {{
-                let child = $child;
-                FocusedBlockVkRoleGeometry {
-                    role: $name,
-                    row_count: 1usize << child.w_log(),
-                    slice_starts: child.slices().iter().map(|slice| slice.start()).collect(),
-                    slice_lengths: child.slices().iter().map(|slice| slice.len()).collect(),
-                }
-            }};
-        }
-        vec![
-            role!("wallet_a", vk.wallet_a()),
-            role!("meta_a", vk.meta_a()),
-            role!("wallet_b", vk.wallet_b()),
-            role!("meta_b", vk.meta_b()),
-            role!("owner_c", vk.owner_c()),
-            role!("main_c", vk.main_c()),
-        ]
-    }
 
     #[test]
-    fn freezer_transaction_counts_select_the_declared_tiers() {
-        let backbone_tiers = HISTORY_STEP_FREEZER_BACKBONE_USER_COUNTS
-            .map(|count| noid_chain::consensus::params::user_tx_class_tier(count).unwrap());
-        assert_eq!(backbone_tiers, [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 32, 64, 255]);
-        let fork_tiers = HISTORY_STEP_FREEZER_FORK_USER_COUNTS
-            .map(|count| noid_chain::consensus::params::user_tx_class_tier(count).unwrap());
-        assert_eq!(fork_tiers, [8, 32, 64, 255]);
+    fn freezer_page_counts_select_only_b64_and_b255() {
+        let backbone = HISTORY_STEP_FREEZER_BACKBONE_USER_COUNTS
+            .map(|count| noid_chain::consensus::params::block_page_class_tier(count).unwrap());
+        assert_eq!(backbone, [64, 64, 64, 64, 64, 64, 64, 255]);
+        let forks = HISTORY_STEP_FREEZER_FORK_USER_COUNTS
+            .map(|count| noid_chain::consensus::params::block_page_class_tier(count).unwrap());
+        assert_eq!(forks, [64, 255]);
     }
 
     #[test]
     #[ignore = "runs real wallet proving and production PoW"]
-    fn first_backbone_step_is_exact_genesis_child() {
+    fn first_backbone_step_is_a_coinbase_only_b64_block() {
         let mut provider = HonestHistoryStepFixtureProvider::new(0x4849_5354_4550).unwrap();
         let genesis = noid_recursive::genesis_accumulator();
         let step = provider.next_backbone(&genesis).unwrap().unwrap();
         assert!(step.capture_parent_slot.is_none());
-        let PreparedHistoryStepBackboneInput::B8(prepared) = step.input else {
-            panic!("height one must select B8");
+        let PreparedHistoryStepBackboneInput::B64(prepared) = step.input else {
+            panic!("height one must select B64");
         };
         let (witness, nonce, start, end) = prepared.into_parts();
         let (block, _) = witness.finish(nonce, &start, &end).unwrap();
         assert_eq!(block.header.height, 1);
         assert_eq!(block.transactions.len(), 1);
-        assert_eq!(
-            block.header.prev_block_hash,
-            noid_chain::hash_block_header(&noid_chain::consensus::genesis_header())
-        );
-    }
-
-    #[test]
-    #[ignore = "runs the honest provisional -> integrated -> known-c00 freezer prefix"]
-    fn known_c00_proves_after_exact_direct_vk_replacement() {
-        noid_ivc_prover::init_perf_thread_pool();
-        let mut provider = KnownC00CutoffProvider {
-            inner: HonestHistoryStepFixtureProvider::new(0x4849_5354_4550_5f56_31).unwrap(),
-            resets: 0,
-            backbone_calls_per_reset: Vec::new(),
-        };
-        let store = std::sync::Arc::new(RetainedBootstrapMatrices::default());
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            noid_recursive::freeze_history_step_bank(&mut provider, std::sync::Arc::clone(&store))
-        }));
-        let result = result.unwrap_or_else(|payload| {
-            let message = payload
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .or_else(|| payload.downcast_ref::<&str>().copied())
-                .unwrap_or("non-string panic");
-            panic!(
-                "known-c00 freezer panicked after resets={} backbone_calls={:?} installs={} loads={}: {message}",
-                provider.resets,
-                provider.backbone_calls_per_reset,
-                store.installs.load(Ordering::Relaxed),
-                store.loads.load(Ordering::Relaxed),
-            )
-        });
-        match result {
-            Err(noid_recursive::HistoryStepFreezeError::Provider(message)) => {
-                assert_eq!(message, KNOWN_C00_PREFIX_PASSED);
-                assert_eq!(provider.resets, 6);
-                assert_eq!(provider.backbone_calls_per_reset, [13, 0, 1, 1, 11]);
-                assert_eq!(store.installs.load(Ordering::Relaxed), 3);
-                assert!(store.loads.load(Ordering::Relaxed) > 0);
-            }
-            Err(error) => panic!(
-                "known-c00 prefix failed after resets={} backbone_calls={:?} installs={} loads={}: {error}",
-                provider.resets,
-                provider.backbone_calls_per_reset,
-                store.installs.load(Ordering::Relaxed),
-                store.loads.load(Ordering::Relaxed),
-            ),
-            Ok(_) => panic!("focused known-c00 freezer did not stop at its exact cutoff"),
-        }
-    }
-
-    #[test]
-    #[ignore = "runs honest VK derivation and a production c00 proof"]
-    fn fresh_known_c00_terminal_verifies_before_recursive_consumption() {
-        noid_ivc_prover::init_perf_thread_pool();
-        let mut provider = HonestHistoryStepFixtureProvider::new(0x4849_5354_4550_5f56_31).unwrap();
-        let provisional_parts = derive_focused_provisional_parts(&mut provider).unwrap();
-        let store = std::sync::Arc::new(RetainedBootstrapMatrices::default());
-        let zero_digests = [[0u8; 32]; noid_recursive::HISTORY_STEP_CLASS_COUNT];
-        let provisional_runtime =
-            focused_runtime(zero_digests, &provisional_parts, &store).unwrap();
-
-        provider.reset_backbone();
-        let genesis = noid_recursive::genesis_accumulator();
-        let (_, provisional_input) = next_focused_b8(&mut provider, &genesis).unwrap();
-        let provisional =
-            noid_recursive::acceptance::history_step::assemble_frozen_history_step_base(
-                &provisional_runtime,
-                provisional_input,
-            )
-            .unwrap();
-        let integrated_b8_vk = provisional.direct_block_vk().clone();
-        drop(provisional);
-
-        let mut integrated_vks = provisional_parts.direct_block_vks().clone();
-        integrated_vks[0] = integrated_b8_vk;
-        let integrated_parts = noid_recursive::HistoryStepRuntimeParts::new(
-            provisional_parts.parent_recursion_vk().clone(),
-            integrated_vks,
-            provisional_parts.parent_transcripts().clone(),
-        )
-        .unwrap();
-        let integrated_runtime = focused_runtime(zero_digests, &integrated_parts, &store).unwrap();
-
-        provider.reset_backbone();
-        let (_, integrated_input) = next_focused_b8(&mut provider, &genesis).unwrap();
-        let integrated =
-            noid_recursive::acceptance::history_step::assemble_frozen_history_step_base(
-                &integrated_runtime,
-                integrated_input,
-            )
-            .unwrap();
-        assert_eq!(
-            integrated.direct_block_vk(),
-            &integrated_parts.direct_block_vks()[0]
-        );
-        let c00 = noid_recursive::CanonicalHistoryStepClassId::from_index(0).unwrap();
-        let integrated_digest = integrated.matrix().structural_statement_digest();
-        noid_recursive::HistoryStepFreezeMatrixStore::install(
-            store.as_ref(),
-            c00,
-            integrated.into_matrix(),
-        )
-        .unwrap();
-
-        let mut known_digests = zero_digests;
-        known_digests[c00.index()] = integrated_digest;
-        let known_runtime = focused_runtime(known_digests, &integrated_parts, &store).unwrap();
-        provider.reset_backbone();
-        let (base_block, base_input) = next_focused_b8(&mut provider, &genesis).unwrap();
-        let terminal =
-            noid_recursive::prove_history_step(&known_runtime, None, base_input).unwrap();
-        let accepted = noid_recursive::verify_history_step_terminal(
-            &known_runtime,
-            &terminal,
-            &base_block.header,
-            &noid_chain::consensus::genesis_header(),
-        )
-        .unwrap();
-        assert_eq!(accepted.height(), 1);
-        assert_eq!(accepted.semantic_id(), terminal.semantic_id());
-        assert_eq!(accepted.class_id(), c00);
-
-        let (_, recursive_input) = next_focused_b8(&mut provider, terminal.accumulator()).unwrap();
-        let recursive = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            noid_recursive::prove_history_step(&known_runtime, Some(&terminal), recursive_input)
-        }));
-        match recursive {
-            Ok(Ok(next)) => assert_eq!(next.height(), 2),
-            Ok(Err(error)) => panic!(
-                "fresh c00 passed full native verification before recursive consumption failed: {error}"
-            ),
-            Err(payload) => {
-                let message = payload
-                    .downcast_ref::<String>()
-                    .map(String::as_str)
-                    .or_else(|| payload.downcast_ref::<&str>().copied())
-                    .unwrap_or("non-string panic");
-                panic!(
-                    "fresh c00 passed full native verification before recursive consumption panicked: {message}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    #[ignore = "runs the honest frozen B8/B32 prefix and first fork class c01"]
-    fn first_b8_from_b32_fork_reuses_the_frozen_b8_direct_vk() {
-        noid_ivc_prover::init_perf_thread_pool();
-        let mut provider = HonestHistoryStepFixtureProvider::new(0x4849_5354_4550_5f56_31).unwrap();
-        let provisional_parts = derive_focused_provisional_parts(&mut provider).unwrap();
-        let store = std::sync::Arc::new(RetainedBootstrapMatrices::default());
-        let mut digests = [[0u8; 32]; noid_recursive::HISTORY_STEP_CLASS_COUNT];
-
-        // Freeze c00 and its exact B8 direct VK.
-        let provisional_runtime = focused_runtime(digests, &provisional_parts, &store).unwrap();
-        provider.reset_backbone();
-        let genesis = noid_recursive::genesis_accumulator();
-        let (_, provisional_b8_input) = next_focused_b8(&mut provider, &genesis).unwrap();
-        let provisional_c00 =
-            noid_recursive::acceptance::history_step::assemble_frozen_history_step_base(
-                &provisional_runtime,
-                provisional_b8_input,
-            )
-            .unwrap();
-        let b8_parts = replace_focused_direct_vk(
-            &provisional_parts,
-            0,
-            provisional_c00.direct_block_vk().clone(),
-        );
-        drop(provisional_c00);
-
-        let b8_runtime = focused_runtime(digests, &b8_parts, &store).unwrap();
-        provider.reset_backbone();
-        let (_, frozen_b8_input) = next_focused_b8(&mut provider, &genesis).unwrap();
-        let frozen_c00 =
-            noid_recursive::acceptance::history_step::assemble_frozen_history_step_base(
-                &b8_runtime,
-                frozen_b8_input,
-            )
-            .unwrap();
-        assert_eq!(
-            frozen_c00.direct_block_vk(),
-            &b8_parts.direct_block_vks()[0]
-        );
-        let c00 = noid_recursive::CanonicalHistoryStepClassId::from_index(0).unwrap();
-        digests[c00.index()] = frozen_c00.matrix().structural_statement_digest();
-        noid_recursive::HistoryStepFreezeMatrixStore::install(
-            store.as_ref(),
-            c00,
-            frozen_c00.into_matrix(),
-        )
-        .unwrap();
-
-        // Freeze c04 and its exact B32 direct VK using the real ten-block B8
-        // checkpoint. Reprove that checkpoint after replacing B32 because the
-        // terminal authenticates the complete bank.
-        let c00_runtime = focused_runtime(digests, &b8_parts, &store).unwrap();
-        let first_b8_checkpoint = prove_focused_b8_checkpoint(&c00_runtime, &mut provider);
-        let (_, provisional_b32_input) =
-            next_focused_b32(&mut provider, first_b8_checkpoint.accumulator()).unwrap();
-        let provisional_c04 =
-            noid_recursive::acceptance::history_step::assemble_frozen_history_step_recursive(
-                &c00_runtime,
-                noid_recursive::acceptance::history_step::HistoryStepParent::new(
-                    &c00_runtime,
-                    &first_b8_checkpoint,
-                )
-                .unwrap(),
-                provisional_b32_input,
-            )
-            .unwrap();
-        let b8_b32_parts =
-            replace_focused_direct_vk(&b8_parts, 1, provisional_c04.direct_block_vk().clone());
-        drop(provisional_c04);
-
-        let integrated_c00_runtime = focused_runtime(digests, &b8_b32_parts, &store).unwrap();
-        let frozen_b8_checkpoint =
-            prove_focused_b8_checkpoint(&integrated_c00_runtime, &mut provider);
-        let (_, frozen_b32_input) =
-            next_focused_b32(&mut provider, frozen_b8_checkpoint.accumulator()).unwrap();
-        let frozen_c04 =
-            noid_recursive::acceptance::history_step::assemble_frozen_history_step_recursive(
-                &integrated_c00_runtime,
-                noid_recursive::acceptance::history_step::HistoryStepParent::new(
-                    &integrated_c00_runtime,
-                    &frozen_b8_checkpoint,
-                )
-                .unwrap(),
-                frozen_b32_input,
-            )
-            .unwrap();
-        assert_eq!(
-            frozen_c04.direct_block_vk(),
-            &b8_b32_parts.direct_block_vks()[1]
-        );
-        let c04 = noid_recursive::CanonicalHistoryStepClassId::from_index(4).unwrap();
-        digests[c04.index()] = frozen_c04.matrix().structural_statement_digest();
-        noid_recursive::HistoryStepFreezeMatrixStore::install(
-            store.as_ref(),
-            c04,
-            frozen_c04.into_matrix(),
-        )
-        .unwrap();
-
-        // Candidate class 1 is the first non-backbone fork: current B8 over
-        // the honest B32 checkpoint. Its direct relation must reuse the sole
-        // frozen B8 VK byte-for-byte, independent of parent geometry.
-        let frozen_runtime = focused_runtime(digests, &b8_b32_parts, &store).unwrap();
-        let b32_checkpoint = prove_focused_b32_checkpoint(&frozen_runtime, &mut provider);
-        let c00 = noid_recursive::CanonicalHistoryStepClassId::from_index(0).unwrap();
-        assert_eq!(c00.current_tier(), 8);
-        let fork_input = provider
-            .b8(c00, b32_checkpoint.accumulator())
-            .unwrap()
-            .into_history_step_input()
-            .unwrap();
-        let candidate_c01 =
-            noid_recursive::acceptance::history_step::assemble_frozen_history_step_recursive(
-                &frozen_runtime,
-                noid_recursive::acceptance::history_step::HistoryStepParent::new(
-                    &frozen_runtime,
-                    &b32_checkpoint,
-                )
-                .unwrap(),
-                fork_input,
-            )
-            .unwrap();
-        assert_eq!(candidate_c01.class_id(), c00);
-
-        let expected = focused_block_vk_geometry(&b8_b32_parts.direct_block_vks()[0]);
-        let actual = focused_block_vk_geometry(candidate_c01.direct_block_vk());
-        for (expected_role, actual_role) in expected.iter().zip(&actual) {
-            eprintln!(
-                "[focused-c01-vk] class=c01 current=B8 parent=B32 role={} expected_rows={} actual_rows={} expected_starts={:?} actual_starts={:?}",
-                expected_role.role,
-                expected_role.row_count,
-                actual_role.row_count,
-                expected_role.slice_starts,
-                actual_role.slice_starts,
-            );
-        }
-        assert_eq!(
-            actual, expected,
-            "c01 current B8 / parent B32 relocated the frozen B8 direct VK"
-        );
     }
 }

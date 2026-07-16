@@ -12,11 +12,12 @@ use std::collections::HashSet;
 use noid_tx::{validate_paged_spend, PagedSpendError, PagedSpendFacts, Transaction, TxPage};
 
 use super::params::{
-    BLOCK_MAX_LIVE_INPUTS, BLOCK_MAX_USER_OUTPUTS, BLOCK_MAX_USER_TXS, MAX_INPUTS, MAX_OUTPUTS,
+    BLOCK_MAX_LIVE_INPUTS, BLOCK_MAX_USER_OUTPUTS, BLOCK_MAX_USER_TXS, BLOCK_PAGE_CLASS_TIERS,
+    MAX_INPUTS, MAX_OUTPUTS,
 };
 
 /// The complete launch proof-class ladder, indexed by physical user pages.
-pub const BLOCK_PROOF_CLASS_TIERS: [usize; 2] = [64, BLOCK_MAX_USER_TXS];
+pub const BLOCK_PROOF_CLASS_TIERS: [usize; 2] = BLOCK_PAGE_CLASS_TIERS;
 
 /// The only two block proof classes accepted by the launch protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -562,7 +562,7 @@ async fn main() -> anyhow::Result<()> {
     let block_production_enabled = cli.mode != NodeMode::Node;
     if block_production_enabled && history_step_runtime.is_none() {
         anyhow::bail!(
-            "block production requires the release-pinned HistoryStep runtime and 16 matrices"
+            "block production requires the release-pinned HistoryStep runtime and 2 matrices"
         );
     }
     let history_step_ghost = if block_production_enabled {

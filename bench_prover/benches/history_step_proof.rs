@@ -11,9 +11,9 @@
 //! cargo bench -p bench_prover --bench history_step_proof
 //! ```
 //!
-//! Set `NOID_HISTORY_STEP_BENCH_FILTER=B255` (or its fixed class alias `c12`)
-//! to run B255 after a B8 parent. Use `c15` (or `B255-B255`) for the worst
-//! B255-after-B255 class. With no filter, all four B8-parent tiers run.
+//! Set `NOID_HISTORY_STEP_BENCH_FILTER=B255` (or `c01`) to run B255 after a
+//! B64 parent. Use `B255-B255` for the B255-parent case. With no filter, both
+//! launch classes run.
 //!
 //! Honest native-valid fixtures and matrix assembly are setup.  Each reported
 //! `prove_ms` covers only production HistoryStep proof + terminal creation —
@@ -198,10 +198,8 @@ fn parse_leaf_digests() -> Result<[[u8; 32]; HISTORY_STEP_CLASS_COUNT], String> 
     Ok(digests)
 }
 
-/// Selected case: the current-tier class plus the parent tier the honest
-/// fixture chain should build. The legacy 4x4 aliases keep working: their
-/// parent component now only picks the fixture parent tier — the class and
-/// matrix are parent-independent.
+/// Selected case: the current physical-page class plus the parent class the
+/// honest fixture chain should build.
 fn benchmark_filter() -> Result<Option<(CanonicalHistoryStepClassId, usize)>, String> {
     let value = match std::env::var(BENCH_FILTER_ENV) {
         Ok(value) => value,
@@ -212,14 +210,13 @@ fn benchmark_filter() -> Result<Option<(CanonicalHistoryStepClassId, usize)>, St
     };
     let class = |slot: usize| CanonicalHistoryStepClassId::new(slot).expect("canonical tier slot");
     let case = match value.trim().to_ascii_lowercase().as_str() {
-        "b8" | "8" | "c00" => (class(0), 0),
-        "b32" | "32" | "c04" | "c01" => (class(1), 0),
-        "b64" | "64" | "c08" | "c02" => (class(2), 0),
-        "b255" | "255" | "c12" | "c03" => (class(3), 0),
-        "c15" | "b255-b255" => (class(3), 3),
+        "b64" | "64" | "c00" => (class(0), 0),
+        "b255" | "255" | "c01" => (class(1), 0),
+        "b64-b255" => (class(0), 1),
+        "b255-b255" => (class(1), 1),
         _ => {
             return Err(format!(
-                "{BENCH_FILTER_ENV} must be one of B8/c00, B32/c01, B64/c02, B255/c03, or B255-B255",
+                "{BENCH_FILTER_ENV} must be one of B64/c00, B255/c01, B64-B255, or B255-B255",
             ));
         }
     };
@@ -300,12 +297,6 @@ fn build_parent(
         })?;
         let capture = step.capture_parent_slot;
         let (block, terminal) = match step.input {
-            PreparedHistoryStepBackboneInput::B8(fixture) => {
-                prove_parent_step(runtime, parent.as_ref(), fixture)?
-            }
-            PreparedHistoryStepBackboneInput::B32(fixture) => {
-                prove_parent_step(runtime, parent.as_ref(), fixture)?
-            }
             PreparedHistoryStepBackboneInput::B64(fixture) => {
                 prove_parent_step(runtime, parent.as_ref(), fixture)?
             }
@@ -366,7 +357,7 @@ fn run() -> Result<(), String> {
     let filter = benchmark_filter()?;
     let (runtime, source) = load_runtime()?;
     let mut provider = HonestHistoryStepFixtureProvider::new(FIXTURE_SEED)?;
-    let c00 = CanonicalHistoryStepClassId::new(0).expect("B8 class");
+    let c00 = CanonicalHistoryStepClassId::new(0).expect("B64 class");
     let target_parent_slot = filter.map_or(0, |(_, parent_slot)| parent_slot);
     // Authenticate and convert outside every reported assembly interval. The
     // production node receives the same packed layout from its release build;
@@ -376,14 +367,14 @@ fn run() -> Result<(), String> {
     let (parent_block, parent) = build_parent(&runtime, &mut provider, target_parent_slot)?;
 
     let parent_wire = encode_history_step_terminal(&runtime, &parent)
-        .map_err(|error| format!("encode B8 benchmark parent: {error}"))?;
+        .map_err(|error| format!("encode benchmark parent: {error}"))?;
     let accepted_parent = decode_verify_history_step_terminal(
         &runtime,
         &parent_wire,
         &parent_block.header,
         &noid_chain::consensus::genesis_header(),
     )
-    .map_err(|error| format!("verify B8 benchmark parent: {error}"))?;
+    .map_err(|error| format!("verify benchmark parent: {error}"))?;
     if accepted_parent.class_id() != parent.class_id()
         || accepted_parent.semantic_id() != parent.semantic_id()
     {
@@ -404,25 +395,13 @@ fn run() -> Result<(), String> {
     if class_is_selected(filter, c00) {
         source.load_checked(c00)?;
         source.load_checked(parent_class)?;
-        benchmark_tier(&runtime, &parent, provider.b8(c00, parent_accumulator)?)?;
+        benchmark_tier(&runtime, &parent, provider.b64(c00, parent_accumulator)?)?;
     }
-    let c01 = CanonicalHistoryStepClassId::new(1).expect("B32 class");
+    let c01 = CanonicalHistoryStepClassId::new(1).expect("B255 class");
     if class_is_selected(filter, c01) {
         source.load_checked(c01)?;
         source.load_checked(parent_class)?;
-        benchmark_tier(&runtime, &parent, provider.b32(c01, parent_accumulator)?)?;
-    }
-    let c02 = CanonicalHistoryStepClassId::new(2).expect("B64 class");
-    if class_is_selected(filter, c02) {
-        source.load_checked(c02)?;
-        source.load_checked(parent_class)?;
-        benchmark_tier(&runtime, &parent, provider.b64(c02, parent_accumulator)?)?;
-    }
-    let c03 = CanonicalHistoryStepClassId::new(3).expect("B255 class");
-    if class_is_selected(filter, c03) {
-        source.load_checked(c03)?;
-        source.load_checked(parent_class)?;
-        benchmark_tier(&runtime, &parent, provider.b255(c03, parent_accumulator)?)?;
+        benchmark_tier(&runtime, &parent, provider.b255(c01, parent_accumulator)?)?;
     }
     Ok(())
 }

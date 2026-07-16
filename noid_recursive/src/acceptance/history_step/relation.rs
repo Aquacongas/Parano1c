@@ -5,8 +5,8 @@
 //!
 //! A recursive transition verifies the complete previous
 //! composite envelope (parent recursion plus its direct Block sidecar),
-//! carries the complete pinned 4×4 matrix bank, folds the fresh parent claim
-//! into the exact authenticated `(parent, grandparent)` lane, and returns a
+//! carries the complete pinned two-class matrix bank, folds the fresh parent
+//! claim into the exact authenticated class lane, and returns a
 //! consuming terminal decision rather than a boolean acceptance shortcut.
 
 use super::gated_recorder::BaseSelectableParentRecorder;
@@ -231,7 +231,7 @@ impl HistoryStepParentTranscriptLayout {
     }
 }
 
-/// Complete value-independent verifier material for the sixteen-class bank.
+/// Complete value-independent verifier material for the two-class bank.
 /// Matrix digests are deliberately absent: they are frozen only after these
 /// canonical VKs and transcript layouts have shaped the relation.
 #[derive(Clone, Debug)]
@@ -274,7 +274,7 @@ impl HistoryStepRuntimeParts {
         }
         for (slot, vk) in direct_block_vks.iter().enumerate() {
             if crate::region_sidecar::selected_zk_block_geometry(
-                noid_chain::consensus::params::USER_TX_CLASS_TIERS[slot],
+                noid_chain::consensus::params::BLOCK_PAGE_CLASS_TIERS[slot],
             )
             .is_none()
                 || vk.version() != crate::region_sidecar::BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION
@@ -321,7 +321,7 @@ impl HistoryStepRuntimeParts {
     }
 }
 
-/// Bind the sixteen frozen matrix identities to the exact runtime verifier
+/// Bind the two frozen matrix identities to the exact runtime verifier
 /// material. Shapes, PCS parameters and post-commit identities are derived;
 /// callers cannot supply a second, potentially divergent copy of them.
 pub fn pin_history_step_class_bank(
@@ -1035,10 +1035,10 @@ fn capture_scratch_recording(
     }
 }
 
-/// Four-way authenticated predecessor selector.  A frozen H(current,parent)
+/// Authenticated predecessor-class selector. A frozen H(current,parent)
 /// matrix fixes only the predecessor's current tier; its grandparent tier is
-/// carried by the predecessor terminal and selected in-circuit.  Therefore
-/// all four `(parent, grandparent)` histories share one outer matrix.
+/// carried by the predecessor terminal and selected in-circuit. Therefore
+/// both launch parent histories share one outer matrix.
 struct ParentClassSelectorTrace {
     class: LinExpr,
     one_hot: [LinExpr; HISTORY_STEP_TIER_SLOT_COUNT],
@@ -1082,7 +1082,11 @@ impl ParentClassSelectorTrace {
         })
     }
 
-    fn select(&self, builder: &mut FieldR1csBuilder, values: [LinExpr; 4]) -> LinExpr {
+    fn select(
+        &self,
+        builder: &mut FieldR1csBuilder,
+        values: [LinExpr; HISTORY_STEP_TIER_SLOT_COUNT],
+    ) -> LinExpr {
         self.one_hot
             .iter()
             .zip(values)
@@ -1864,7 +1868,7 @@ fn prepare_history_step_assembly<const TIER: usize>(
     })?;
 
     // The universal parent columns above have one fixed geometry across the
-    // complete 4x4 bank and establish the shared Link VK slices. Allocate the
+    // complete two-class bank and establish the shared Link VK slices. Allocate the
     // current Block immediately after that fixed boundary, before the
     // predecessor proof replay/fold whose row count depends on the selected
     // parent tier. This keeps one exact direct-Block VK per current tier

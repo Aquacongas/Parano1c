@@ -2911,13 +2911,8 @@ mod tests {
     }
 
     #[test]
-    fn selected_four_class_all_tiles_row_ledger_is_exact() {
-        for (tier, expected_rows) in [
-            (8usize, 97_928usize),
-            (32, 391_712),
-            (64, 783_424),
-            (255, 3_133_696),
-        ] {
+    fn selected_two_class_all_tiles_row_ledger_is_exact() {
+        for (tier, expected_rows) in [(64, 783_424), (255, 3_133_696)] {
             let geometry = crate::region_sidecar::selected_zk_block_geometry(tier).unwrap();
             assert_eq!(
                 geometry.auth_tiles * ZK_AUTH_RAW_SLICE_TILE_TRACE_ROWS,

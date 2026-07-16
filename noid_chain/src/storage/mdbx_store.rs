@@ -402,13 +402,10 @@ fn history_step_terminal_metadata(bytes: &[u8]) -> Option<(u64, [u8; 32], usize)
     ))
 }
 
-fn history_step_class_slot(user_transaction_count: usize) -> Option<usize> {
-    match crate::consensus::params::user_tx_class_tier(user_transaction_count)? {
-        8 => Some(0),
-        32 => Some(1),
-        64 => Some(2),
-        255 => Some(3),
-        _ => None,
+fn history_step_class_slot(user_page_count: usize) -> Option<usize> {
+    match crate::consensus::paged_spend::BlockProofClass::for_page_count(user_page_count)? {
+        crate::consensus::paged_spend::BlockProofClass::B64 => Some(0),
+        crate::consensus::paged_spend::BlockProofClass::B255 => Some(1),
     }
 }
 
@@ -1846,13 +1843,12 @@ impl MdbxStore {
                     "accepted bundle does not bind the committed header",
                 ));
             }
-            let user_transaction_count = tx_hashes.len().checked_sub(1).ok_or(
-                StoreError::Decode("accepted block is missing its coinbase tx hash"),
+            let user_page_count = tx_hashes.len().checked_sub(1).ok_or(StoreError::Decode(
+                "accepted block is missing its coinbase tx hash",
+            ))?;
+            let expected_class = history_step_class_slot(user_page_count).ok_or(
+                StoreError::Decode("accepted block page count has no canonical HistoryStep tier"),
             )?;
-            let expected_class =
-                history_step_class_slot(user_transaction_count).ok_or(StoreError::Decode(
-                    "accepted block transaction count has no canonical HistoryStep tier",
-                ))?;
             if !history_step_terminal_matches_class(
                 bundle.history_step_terminal_bytes(),
                 header.height,

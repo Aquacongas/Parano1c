@@ -1078,7 +1078,7 @@ pub fn prove_multi_deep_chain_walk<Ch: Challenger>(
     // prover. Checkpoints are independent; only their sumcheck messages are
     // aggregated. The retained payload is
     // `instances * 10 * 4 * 2^w_log * sizeof(F128)` at 66 rounds / spacing 8
-    // (20 MiB for the planned two-instance w_log=14 B8 group). A future wider
+    // (20 MiB for the planned two-instance w_log=14 small-class group). A future wider
     // ladder should stream/rebuild instances if that product becomes material.
     let mut layer_states: Vec<DescendingLayerStates> = s0_instances
         .iter()

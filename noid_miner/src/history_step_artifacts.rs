@@ -3,7 +3,7 @@
 
 //! Executable-embedded artifacts for the canonical `HistoryStep` class bank.
 //!
-//! An official node contains one pinned runtime-metadata artifact and four
+//! An official node contains one pinned runtime-metadata artifact and two
 //! build-authenticated canonical matrix leaves.  This module owns only the
 //! matrix boundary. Every [`HistoryStepMatrixSource`] call returns an
 //! authenticated compact lease. Packed runtime images are derived once per
@@ -64,21 +64,17 @@ const HISTORY_STEP_RUNTIME_METADATA_MIN_BYTES: usize = HISTORY_STEP_RUNTIME_META
     + HISTORY_STEP_RUNTIME_METADATA_TRAILER_BYTES;
 
 /// Keep the hot parent and one concurrent/terminal class without retaining
-/// the complete four-class bank in memory.
+/// the complete two-class bank in memory.
 const HISTORY_STEP_COMPACT_MATRIX_CACHE_CAPACITY: usize = 2;
 
 const HISTORY_STEP_MATRIX_FILE_NAMES: [&str; HISTORY_STEP_PACK_LEAF_COUNT] = [
     "history-step-c00.field-r1cs.zst",
     "history-step-c01.field-r1cs.zst",
-    "history-step-c02.field-r1cs.zst",
-    "history-step-c03.field-r1cs.zst",
 ];
 
 const HISTORY_STEP_RUNTIME_IMAGE_FILE_NAMES: [&str; HISTORY_STEP_PACK_LEAF_COUNT] = [
     "history-step-c00.packed-r1cs.zst",
     "history-step-c01.packed-r1cs.zst",
-    "history-step-c02.packed-r1cs.zst",
-    "history-step-c03.packed-r1cs.zst",
 ];
 
 pub fn history_step_matrix_file_name(class: CanonicalHistoryStepClassId) -> &'static str {
@@ -330,7 +326,7 @@ struct CachedHistoryStepMatrix {
     matrix: Arc<CompactFieldR1cs>,
 }
 
-/// Embedded source for the complete four-class matrix bank. Only two
+/// Embedded source for the complete two-class matrix bank. Only two
 /// authenticated compact relations are retained in memory at a time.
 ///
 /// The binary embeds canonical leaves only. The packed runtime layout is

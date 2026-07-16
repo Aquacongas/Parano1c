@@ -3,7 +3,7 @@
 
 //! Bitmap-driven action-compactor row/RSS gate.
 //!
-//! Defaults to B8. Use `NOID_ACTION_TIERS=8,32,64,255`; B255 intentionally
+//! Defaults to B64. Use `NOID_ACTION_TIERS=64,255`; B255 intentionally
 //! builds the real 4,096-row sorting network and may be expensive.
 
 use std::time::Instant;
@@ -19,7 +19,7 @@ use noid_recursive::acceptance::trace::action_surface::ActionRowTrace;
 use noid_recursive::acceptance::trace::{alloc_block, FieldR1csBuilder, LinExpr};
 
 fn requested_tiers() -> Vec<usize> {
-    let raw = std::env::var("NOID_ACTION_TIERS").unwrap_or_else(|_| "8".into());
+    let raw = std::env::var("NOID_ACTION_TIERS").unwrap_or_else(|_| "64".into());
     let tiers: Vec<_> = raw
         .split(',')
         .filter_map(|part| part.trim().parse().ok())
@@ -27,7 +27,7 @@ fn requested_tiers() -> Vec<usize> {
     assert!(!tiers.is_empty());
     assert!(tiers
         .iter()
-        .all(|tier| noid_chain::consensus::params::USER_TX_CLASS_TIERS.contains(tier)));
+        .all(|tier| noid_chain::consensus::params::BLOCK_PAGE_CLASS_TIERS.contains(tier)));
     tiers
 }
 
@@ -51,7 +51,7 @@ fn row(b: &mut FieldR1csBuilder, ordinal: usize, live: bool, is_mint: bool) -> A
 
 fn main() {
     println!("PARANOID bitmap action-compactor gate");
-    println!("NOID_ACTION_TIERS=8,32,64,255 selects class runs.\n");
+    println!("NOID_ACTION_TIERS=64,255 selects class runs.\n");
 
     for tier in requested_tiers() {
         let class = ShapeClass { tier };

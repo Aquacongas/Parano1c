@@ -356,7 +356,7 @@ impl HistoryStepRuntimeParts {
         }
         let mut direct_block_vks = Vec::with_capacity(HISTORY_STEP_TIER_SLOT_COUNT);
         for slot in 0..HISTORY_STEP_TIER_SLOT_COUNT {
-            let tier = noid_chain::consensus::params::USER_TX_CLASS_TIERS[slot];
+            let tier = noid_chain::consensus::params::BLOCK_PAGE_CLASS_TIERS[slot];
             direct_block_vks.push(BlockRegionSidecarVk::from_selected_registry_slices(
                 tier,
                 read_block_slices(&mut reader)?,

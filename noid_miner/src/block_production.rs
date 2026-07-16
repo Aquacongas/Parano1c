@@ -20,8 +20,6 @@ type PreparedStateCommit = noid_chain::consensus::template::PreparedBlockStateCo
 type LocallyProvedStateCommit = noid_chain::consensus::template::LocallyProvedBlockCommit;
 
 enum PreparedWitness {
-    B8(noid_block::PreparedHistoryStepWitness<8>),
-    B32(noid_block::PreparedHistoryStepWitness<32>),
     B64(noid_block::PreparedHistoryStepWitness<64>),
     B255(noid_block::PreparedHistoryStepWitness<255>),
 }
@@ -137,7 +135,7 @@ impl PreparedBlockAttempt {
             .len()
             .checked_add(authorization_weight)
             .ok_or_else(|| "prepared block byte weight overflow".to_string())?;
-        let user_transactions = authorization_proofs.len();
+        let user_pages = block.transactions.len().saturating_sub(1);
         let context = noid_block::HistoryStepPreparationContext {
             parent_header: &parent,
             tx_epoch_anchor_header: &tx_epoch_anchor_header,
@@ -148,50 +146,37 @@ impl PreparedBlockAttempt {
             asert_anchor: &asert_anchor,
             local_time,
         };
-        let witness = match noid_chain::consensus::params::user_tx_class_tier(user_transactions) {
-            Some(8) => noid_block::prepare_history_step_witness::<8>(
-                block,
-                context,
-                authorization_proofs,
-                ghost,
-                runtime,
-                parent_terminal.as_ref(),
-            )
-            .map(PreparedWitness::B8),
-            Some(32) => noid_block::prepare_history_step_witness::<32>(
-                block,
-                context,
-                authorization_proofs,
-                ghost,
-                runtime,
-                parent_terminal.as_ref(),
-            )
-            .map(PreparedWitness::B32),
-            Some(64) => noid_block::prepare_history_step_witness::<64>(
-                block,
-                context,
-                authorization_proofs,
-                ghost,
-                runtime,
-                parent_terminal.as_ref(),
-            )
-            .map(PreparedWitness::B64),
-            Some(255) => noid_block::prepare_history_step_witness::<255>(
-                block,
-                context,
-                authorization_proofs,
-                ghost,
-                runtime,
-                parent_terminal.as_ref(),
-            )
-            .map(PreparedWitness::B255),
-            _ => {
-                return Err(format!(
-                    "{user_transactions} user transactions do not select a HistoryStep class"
-                ));
+        let witness =
+            match noid_chain::consensus::paged_spend::BlockProofClass::for_page_count(user_pages) {
+                Some(noid_chain::consensus::paged_spend::BlockProofClass::B64) => {
+                    noid_block::prepare_history_step_witness::<64>(
+                        block,
+                        context,
+                        authorization_proofs,
+                        ghost,
+                        runtime,
+                        parent_terminal.as_ref(),
+                    )
+                    .map(PreparedWitness::B64)
+                }
+                Some(noid_chain::consensus::paged_spend::BlockProofClass::B255) => {
+                    noid_block::prepare_history_step_witness::<255>(
+                        block,
+                        context,
+                        authorization_proofs,
+                        ghost,
+                        runtime,
+                        parent_terminal.as_ref(),
+                    )
+                    .map(PreparedWitness::B255)
+                }
+                None => {
+                    return Err(format!(
+                        "{user_pages} physical pages do not select a HistoryStep class"
+                    ));
+                }
             }
-        }
-        .map_err(|error| error.to_string())?;
+            .map_err(|error| error.to_string())?;
 
         // The relation is nonce-free: finish the exact template (every native
         // check except PoW) and prove the complete HistoryStep before any
@@ -216,8 +201,6 @@ impl PreparedBlockAttempt {
             }};
         }
         let (block, terminal_bytes, end_accumulator) = match witness {
-            PreparedWitness::B8(witness) => finish_and_prove!(witness),
-            PreparedWitness::B32(witness) => finish_and_prove!(witness),
             PreparedWitness::B64(witness) => finish_and_prove!(witness),
             PreparedWitness::B255(witness) => finish_and_prove!(witness),
         };

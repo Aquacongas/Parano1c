@@ -136,7 +136,7 @@ cargo build --locked --release -p bench_prover \
   --bin noid_pack_pins
 
 CURRENT_STAGE="canonical matrix generation"
-printf '\n==> Generating HistoryStep runtime metadata and four canonical matrices (zstd level 19)\n'
+printf '\n==> Generating HistoryStep runtime metadata and two canonical matrices (zstd level 19)\n'
 NOID_ARTIFACT_ZSTD_LEVEL=19 \
   "$ROOT_DIR/target/release/noid_matrix_gen" "$PACK_STAGING"
 
@@ -146,8 +146,6 @@ expected_files=(
   history-step.runtime
   history-step-c00.field-r1cs.zst
   history-step-c01.field-r1cs.zst
-  history-step-c02.field-r1cs.zst
-  history-step-c03.field-r1cs.zst
 )
 for file_name in "${expected_files[@]}"; do
   artifact="$PACK_V1/$file_name"
@@ -158,14 +156,14 @@ done
 shopt -s nullglob
 matrix_leaves=("$PACK_V1"/*.field-r1cs.zst)
 shopt -u nullglob
-(( ${#matrix_leaves[@]} == 4 )) || \
-  die "expected exactly 4 matrix leaves, found ${#matrix_leaves[@]}"
+(( ${#matrix_leaves[@]} == 2 )) || \
+  die "expected exactly 2 matrix leaves, found ${#matrix_leaves[@]}"
 
 shopt -s nullglob dotglob
 pack_entries=("$PACK_V1"/*)
 shopt -u nullglob dotglob
-(( ${#pack_entries[@]} == 5 )) || \
-  die "expected exactly 5 entries in v1, found ${#pack_entries[@]}"
+(( ${#pack_entries[@]} == 3 )) || \
+  die "expected exactly 3 entries in v1, found ${#pack_entries[@]}"
 for artifact in "${pack_entries[@]}"; do
   [[ -f "$artifact" && ! -L "$artifact" ]] || \
     die "unexpected non-regular pack entry: $artifact"

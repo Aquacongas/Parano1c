@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Honest streaming freezer for the canonical sixteen-class HistoryStep bank.
+//! Honest streaming freezer for the canonical two-class HistoryStep bank.
 //!
 //! The provider replays one native-valid chain from genesis to obtain one
 //! exact parent checkpoint per tier, then forks one native-valid child from
@@ -29,8 +29,6 @@ use crate::acceptance::history_step_bank::{
 /// One consuming backbone witness. The variant is the compile-time Block tier;
 /// no runtime tier value can disagree with its relation type.
 pub enum HistoryStepFreezeInput {
-    B8(HistoryStepBlockInput<8>),
-    B32(HistoryStepBlockInput<32>),
     B64(HistoryStepBlockInput<64>),
     B255(HistoryStepBlockInput<255>),
 }
@@ -38,17 +36,13 @@ pub enum HistoryStepFreezeInput {
 impl HistoryStepFreezeInput {
     fn current_slot(&self) -> usize {
         match self {
-            Self::B8(_) => 0,
-            Self::B32(_) => 1,
-            Self::B64(_) => 2,
-            Self::B255(_) => 3,
+            Self::B64(_) => 0,
+            Self::B255(_) => 1,
         }
     }
 
     fn start_accumulator(&self) -> &ChainAccumulator {
         match self {
-            Self::B8(input) => input.start_accumulator(),
-            Self::B32(input) => input.start_accumulator(),
             Self::B64(input) => input.start_accumulator(),
             Self::B255(input) => input.start_accumulator(),
         }
@@ -56,8 +50,6 @@ impl HistoryStepFreezeInput {
 
     fn end_accumulator(&self) -> &ChainAccumulator {
         match self {
-            Self::B8(input) => input.end_accumulator(),
-            Self::B32(input) => input.end_accumulator(),
             Self::B64(input) => input.end_accumulator(),
             Self::B255(input) => input.end_accumulator(),
         }
@@ -74,18 +66,6 @@ pub trait HistoryStepFreezeInputProvider {
         &mut self,
         expected_start: &ChainAccumulator,
     ) -> Result<Option<HistoryStepFreezeInput>, Self::Error>;
-
-    fn b8(
-        &mut self,
-        class: CanonicalHistoryStepClassId,
-        expected_start: &ChainAccumulator,
-    ) -> Result<HistoryStepBlockInput<8>, Self::Error>;
-
-    fn b32(
-        &mut self,
-        class: CanonicalHistoryStepClassId,
-        expected_start: &ChainAccumulator,
-    ) -> Result<HistoryStepBlockInput<32>, Self::Error>;
 
     fn b64(
         &mut self,
@@ -278,8 +258,6 @@ fn prove_input(
     input: HistoryStepFreezeInput,
 ) -> Result<HistoryStepTerminal, HistoryStepError> {
     match input {
-        HistoryStepFreezeInput::B8(input) => prove_history_step(runtime, parent, input),
-        HistoryStepFreezeInput::B32(input) => prove_history_step(runtime, parent, input),
         HistoryStepFreezeInput::B64(input) => prove_history_step(runtime, parent, input),
         HistoryStepFreezeInput::B255(input) => prove_history_step(runtime, parent, input),
     }
@@ -303,8 +281,6 @@ fn assemble_input(
         };
     }
     match input {
-        HistoryStepFreezeInput::B8(input) => assemble!(input),
-        HistoryStepFreezeInput::B32(input) => assemble!(input),
         HistoryStepFreezeInput::B64(input) => assemble!(input),
         HistoryStepFreezeInput::B255(input) => assemble!(input),
     }
@@ -336,8 +312,6 @@ where
             let class =
                 CanonicalHistoryStepClassId::new(slot).expect("backbone tier slot is canonical");
             let vk = match input {
-                HistoryStepFreezeInput::B8(input) => derive_history_step_direct_block_vk(input),
-                HistoryStepFreezeInput::B32(input) => derive_history_step_direct_block_vk(input),
                 HistoryStepFreezeInput::B64(input) => derive_history_step_direct_block_vk(input),
                 HistoryStepFreezeInput::B255(input) => derive_history_step_direct_block_vk(input),
             }
@@ -414,10 +388,10 @@ where
     if checkpoints[slot].replace(tip).is_some() {
         return Err(HistoryStepFreezeError::Backbone);
     }
-    let [Some(b8), Some(b32), Some(b64), Some(b255)] = checkpoints else {
+    let [Some(b64), Some(b255)] = checkpoints else {
         return Err(HistoryStepFreezeError::Backbone);
     };
-    Ok([b8, b32, b64, b255])
+    Ok([b64, b255])
 }
 
 fn class_input<P, S>(
@@ -429,10 +403,8 @@ where
     P: HistoryStepFreezeInputProvider,
 {
     match class.current_slot() {
-        0 => provider.b8(class, start).map(HistoryStepFreezeInput::B8),
-        1 => provider.b32(class, start).map(HistoryStepFreezeInput::B32),
-        2 => provider.b64(class, start).map(HistoryStepFreezeInput::B64),
-        3 => provider
+        0 => provider.b64(class, start).map(HistoryStepFreezeInput::B64),
+        1 => provider
             .b255(class, start)
             .map(HistoryStepFreezeInput::B255),
         _ => unreachable!("canonical class current slot"),
@@ -459,7 +431,7 @@ where
         let class =
             CanonicalHistoryStepClassId::from_index(index).expect("fixed HistoryStep class index");
         // Every class shares one outer shape, so the parent tier must not
-        // affect the frozen matrix; freeze against the B8-tier checkpoint
+        // affect the frozen matrix; freeze against the B64-tier checkpoint
         // and let the independence gate verify the other tiers.
         let parent = &checkpoints[0];
         let input = class_input::<P, S::Error>(provider, class, parent.accumulator())?;
@@ -493,7 +465,7 @@ where
     Ok(digests)
 }
 
-/// Freeze all sixteen classes from honest native-valid witnesses. Bootstrap
+/// Freeze both launch classes from honest native-valid witnesses. Bootstrap
 /// proofs use provisional bank values only inside release tooling; the final
 /// pass rebuilds every matrix under the completed bank and rejects any digest
 /// or VK drift before returning release material.
@@ -509,7 +481,7 @@ where
     let mut digests = [[0u8; 32]; HISTORY_STEP_CLASS_COUNT];
     let mut known = [false; HISTORY_STEP_CLASS_COUNT];
 
-    // The banked parent envelope pins all four direct-Block VK digests into
+    // The banked parent envelope pins both direct-Block VK digests into
     // every class matrix, so replacing one provisional VK staleness-wipes
     // every matrix frozen before it. Discovery therefore runs twice: phase A
     // walks the backbone only until every provisional VK has been replaced
@@ -636,23 +608,25 @@ where
             let class = CanonicalHistoryStepClassId::from_index(index)
                 .expect("fixed HistoryStep class index");
             // Optional drift autopsy: rebuild the class under both parent
-            // flavors (the class-freeze B8 checkpoint vs the backbone's
+            // flavors (the class-freeze B64 checkpoint vs the backbone's
             // exact-tier parent) and print the first structural row
             // differences, so a residual parent-tier dependence names its
             // construct without a second freezer run.
             if index > 0 && std::env::var_os("NOID_DEBUG_DRIFT_DIFF").is_some() {
-                let build = |parent: &HistoryStepTerminal,
-                             provider: &mut P|
-                 -> Result<_, HistoryStepFreezeError<P::Error, S::Error>> {
-                    let input = class_input::<P, S::Error>(provider, class, parent.accumulator())?;
-                    assemble_input(&partial, Some(parent), input).map_err(|source| {
-                        HistoryStepFreezeError::relation(
-                            HistoryStepFreezeStage::CandidateClass,
-                            Some(class),
-                            source,
-                        )
-                    })
-                };
+                let build =
+                    |parent: &HistoryStepTerminal,
+                     provider: &mut P|
+                     -> Result<_, HistoryStepFreezeError<P::Error, S::Error>> {
+                        let input =
+                            class_input::<P, S::Error>(provider, class, parent.accumulator())?;
+                        assemble_input(&partial, Some(parent), input).map_err(|source| {
+                            HistoryStepFreezeError::relation(
+                                HistoryStepFreezeStage::CandidateClass,
+                                Some(class),
+                                source,
+                            )
+                        })
+                    };
                 let freeze_flavor = build(&checkpoints[0], provider)?;
                 let backbone_flavor = build(&checkpoints[index - 1], provider)?;
                 let freeze_matrix = freeze_flavor.matrix();

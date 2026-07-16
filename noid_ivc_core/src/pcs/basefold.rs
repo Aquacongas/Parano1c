@@ -1335,7 +1335,7 @@ mod security_configuration_tests {
 
     #[test]
     fn every_published_basefold_domain_rate_is_finite_length_checked() {
-        // Production recursive ladder: B8, B32/B64, B255/Link. Production
+        // Production recursive ladder: B64, B255/Link. Production
         // fixed helpers: checkpoint chunk core and receipt projection.
         let published = [
             ("recursive-m22", 17usize, 2usize, 125usize),

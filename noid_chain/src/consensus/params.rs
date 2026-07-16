@@ -62,14 +62,10 @@ pub const BLOCK_MAX_DISTINCT_SEGMENTS: usize = 256;
 // HistoryStep classes
 // ---------------------------------------------------------------------------
 
-/// Fixed-body user-transaction count tiers. Every HistoryStep-facing per-block
-/// structure is padded up to the smallest tier holding the block's user
-/// tx count, so the recursive relation sees a small fixed family of shapes
-/// instead of per-count structures. Every node can derive each class matrix
-/// locally. Blocks below the lowest tier (including coinbase-only blocks) pad
-/// up to it with protocol ghost transactions; the worst-case padding ratio is
-/// bounded by the largest adjacent-tier step (4x).
-pub const USER_TX_CLASS_TIERS: [usize; 4] = [8, 32, 64, 255];
+/// The two launch proof classes, indexed by physical PagedSpend pages.
+/// Coinbase-only through 64-page blocks use B64; 65 through 255 pages use
+/// B255. Logical groups/capsules never select the physical proof class.
+pub const BLOCK_PAGE_CLASS_TIERS: [usize; 2] = [64, 255];
 
 /// Smallest tier in `tiers` holding `count`, or None past the top tier.
 #[inline]
@@ -77,10 +73,10 @@ fn class_tier_for(tiers: &[usize], count: usize) -> Option<usize> {
     tiers.iter().copied().find(|&tier| tier >= count)
 }
 
-/// Proof class tier for a block's user transaction count.
+/// Proof class tier for a block's physical user-page count.
 #[inline]
-pub fn user_tx_class_tier(count: usize) -> Option<usize> {
-    class_tier_for(&USER_TX_CLASS_TIERS, count)
+pub fn block_page_class_tier(page_count: usize) -> Option<usize> {
+    class_tier_for(&BLOCK_PAGE_CLASS_TIERS, page_count)
 }
 
 /// Live-input (spend) capacity of a proof class: what the class's per-input
@@ -104,11 +100,11 @@ pub fn block_class_touched_capacity(user_tier: usize) -> usize {
     block_class_spend_capacity(user_tier) + block_class_output_capacity(user_tier) + 1
 }
 
-/// Spend capacity of the proof class holding a block with the given user-tx
-/// composition, or None past the tier tables (over consensus limits).
+/// Spend capacity of the proof class holding a block with the given physical
+/// page count, or None past the tier table.
 #[inline]
-pub fn block_class_spend_capacity_for_count(user_txs: usize) -> Option<usize> {
-    user_tx_class_tier(user_txs).map(block_class_spend_capacity)
+pub fn block_class_spend_capacity_for_page_count(page_count: usize) -> Option<usize> {
+    block_page_class_tier(page_count).map(block_class_spend_capacity)
 }
 
 /// Number of blocks for the transaction replay-protection epoch.
@@ -357,12 +353,13 @@ mod tests {
     }
 
     #[test]
-    fn history_step_user_classes_are_exact() {
-        assert_eq!(USER_TX_CLASS_TIERS, [8, 32, 64, 255]);
-        assert_eq!(user_tx_class_tier(0), Some(8));
-        assert_eq!(user_tx_class_tier(9), Some(32));
-        assert_eq!(user_tx_class_tier(255), Some(255));
-        assert_eq!(user_tx_class_tier(256), None);
+    fn history_step_page_classes_are_exact() {
+        assert_eq!(BLOCK_PAGE_CLASS_TIERS, [64, 255]);
+        assert_eq!(block_page_class_tier(0), Some(64));
+        assert_eq!(block_page_class_tier(64), Some(64));
+        assert_eq!(block_page_class_tier(65), Some(255));
+        assert_eq!(block_page_class_tier(255), Some(255));
+        assert_eq!(block_page_class_tier(256), None);
         assert_eq!(block_class_spend_capacity(255), BLOCK_MAX_LIVE_INPUTS);
         assert_eq!(block_class_output_capacity(255), BLOCK_MAX_USER_OUTPUTS);
         assert_eq!(block_class_touched_capacity(255), 1_531);

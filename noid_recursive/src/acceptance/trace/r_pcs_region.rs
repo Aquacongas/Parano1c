@@ -92,7 +92,7 @@ pub fn link_r_pcs_path_sidecar_purpose() -> [u8; 32] {
 
 const LINK_RECORDINGS_REC_PURPOSE_DOMAIN: &[u8] = b"NOID/REGION-SIDECAR/HISTORY-STEP-RECORDINGS/V1";
 /// Canonical role identifier for HistoryStep's recordings vertical (walk
-/// L-C): four possible predecessor Block-child transcripts followed by four
+/// L-C): two possible predecessor Block-child transcripts followed by two
 /// possible `[R]_prev` transcripts. Exactly one block in each bank is live.
 pub fn link_recordings_purpose() -> [u8; 32] {
     poseidon2b_hash_byte_slices(
@@ -124,7 +124,7 @@ struct TreeInfo {
     depth: usize,
 }
 
-/// Canonical PCS carrier shared by the four possible HistoryStep parent tiers.
+/// Canonical PCS carrier shared by the two possible HistoryStep parent tiers.
 /// One predecessor proof occupies the tile/path axis; group selection changes
 /// only witness data and never verifier topology.
 #[derive(Clone, Debug)]
@@ -140,8 +140,8 @@ impl HistoryStepPcsCarrierGeometry {
         self.groups.iter().map(Vec::len).max().unwrap_or(0)
     }
 
-    /// Exact L-A leaf schedule at each tree position.  A tier may omit a
-    /// trailing committed FRI tree (B8 does), in which case its tile carries a
+    /// Exact L-A leaf schedule at each tree position. A smaller tier may omit a
+    /// trailing committed FRI tree, in which case its tile carries a
     /// relation-valid ghost on that position; an existing tree may never
     /// change the lane count / leaf IV selected by the universal descriptor.
     fn leaf_lanes(&self) -> Result<Vec<usize>, RegionSidecarError> {
@@ -301,7 +301,7 @@ impl HistoryStepParentGeometry {
         child_layouts: Vec<DuplexLayout>,
         r_prev_layouts: Vec<DuplexLayout>,
     ) -> Result<Self, RegionSidecarError> {
-        let tier_count = noid_chain::consensus::params::USER_TX_CLASS_TIERS.len();
+        let tier_count = noid_chain::consensus::params::BLOCK_PAGE_CLASS_TIERS.len();
         if parent_params.len() != tier_count
             || child_layouts.len() != tier_count
             || r_prev_layouts.len() != tier_count
@@ -931,7 +931,7 @@ fn build_recording_free_link_assembly(
     })
 }
 
-/// Self-recursive HistoryStep columns over the universal four-tier parent
+/// Self-recursive HistoryStep columns over the universal two-tier parent
 /// geometry.  The only live proof role is the exact predecessor; walk L-C
 /// additionally carries that predecessor's nested Block-sidecar child chain
 /// and its complete enclosing `[R]_prev` chain.
@@ -1231,8 +1231,8 @@ mod tests {
     use noid_ivc_core::public_io::PublicIoSpec;
 
     #[test]
-    fn history_step_parent_geometry_has_four_tiers_and_eight_recordings() {
-        let params = [22usize, 23, 23, 24].map(|m| PcsParams {
+    fn history_step_parent_geometry_has_two_tiers_and_four_recordings() {
+        let params = [23usize, 24].map(|m| PcsParams {
             m: m + LOG_PACKING,
             log_inv_rate: 2,
             log_batch_size: 5,
@@ -1243,14 +1243,14 @@ mod tests {
             TranscriptOp::Squeeze(2),
         ]);
         let geometry =
-            HistoryStepParentGeometry::new(&params, vec![layout.clone(); 4], vec![layout; 4])
-                .expect("four-tier HistoryStep geometry");
+            HistoryStepParentGeometry::new(&params, vec![layout.clone(); 2], vec![layout; 2])
+                .expect("two-tier HistoryStep geometry");
         assert_eq!(geometry.carrier.proof_roles, 1);
-        assert_eq!(geometry.carrier.groups.len(), 4);
+        assert_eq!(geometry.carrier.groups.len(), 2);
         assert_eq!(geometry.carrier.n_queries, 125);
-        assert_eq!(geometry.recording_blocks().len(), 8);
-        assert_eq!(geometry.child_block_index(3), 3);
-        assert_eq!(geometry.r_prev_block_index(3), 7);
+        assert_eq!(geometry.recording_blocks().len(), 4);
+        assert_eq!(geometry.child_block_index(1), 1);
+        assert_eq!(geometry.r_prev_block_index(1), 3);
 
         let spec = PublicIoSpec {
             io_slice: WitnessSlice {

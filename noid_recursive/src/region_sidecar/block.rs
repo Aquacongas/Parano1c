@@ -88,10 +88,9 @@ pub(crate) struct SelectedZkBlockRegionVkSlices {
 
 /// Exact selected authorization geometry for one canonical block class.
 ///
-/// The four entries below are protocol certificates, not estimates.  Keeping
-/// them explicit makes it impossible for a lower class to silently inherit
-/// B255's 256 authorization tiles (and its RAM footprint), while the V4 VK
-/// validation still rejects every geometry outside the canonical ladder.
+/// The two entries below are protocol certificates, not estimates. Keeping
+/// them explicit prevents B64 from silently inheriting B255's 256
+/// authorization tiles and RAM footprint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SelectedZkBlockGeometry {
     pub tier: usize,
@@ -116,46 +115,6 @@ pub(crate) struct SelectedZkBlockGeometry {
 
 pub(crate) const fn selected_zk_block_geometry(tier: usize) -> Option<SelectedZkBlockGeometry> {
     let geometry = match tier {
-        8 => SelectedZkBlockGeometry {
-            tier: 8,
-            auth_tiles: 8,
-            tx_log: 3,
-            owner_w_log: 10,
-            main_w_log: 11,
-            wallet_a_w_log: 14,
-            wallet_b_w_log: 13,
-            exact_state_region_log: 9,
-            spine_cap_log: 1,
-            meta_a_w_log: 11,
-            meta_b_w_log: 14,
-            meta_b_block_log: 11,
-            touched_capacity: 81,
-            segment_capacity: 81,
-            paired_caps_per_block: [11, 11],
-            paired_bases: [0, 704],
-            tx_root_base: 1_408,
-            tx_root_paths_per_block: 32,
-        },
-        32 => SelectedZkBlockGeometry {
-            tier: 32,
-            auth_tiles: 32,
-            tx_log: 5,
-            owner_w_log: 12,
-            main_w_log: 13,
-            wallet_a_w_log: 16,
-            wallet_b_w_log: 15,
-            exact_state_region_log: 11,
-            spine_cap_log: 1,
-            meta_a_w_log: 13,
-            meta_b_w_log: 16,
-            meta_b_block_log: 11,
-            touched_capacity: 321,
-            segment_capacity: 256,
-            paired_caps_per_block: [11, 8],
-            paired_bases: [0, 704],
-            tx_root_base: 1_216,
-            tx_root_paths_per_block: 8,
-        },
         64 => SelectedZkBlockGeometry {
             tier: 64,
             auth_tiles: 64,
@@ -204,7 +163,7 @@ pub(crate) const fn selected_zk_block_geometry(tier: usize) -> Option<SelectedZk
 pub(crate) fn selected_zk_block_geometry_for_auth_tiles(
     auth_tiles: usize,
 ) -> Option<SelectedZkBlockGeometry> {
-    noid_chain::consensus::params::USER_TX_CLASS_TIERS
+    noid_chain::consensus::params::BLOCK_PAGE_CLASS_TIERS
         .into_iter()
         .filter_map(selected_zk_block_geometry)
         .find(|geometry| geometry.auth_tiles == auth_tiles)
@@ -435,7 +394,7 @@ impl BlockRegionSidecarVk {
         BLOCK_REGION_SELECTED_ZK_TRANSCRIPT_LABEL
     }
 
-    /// Exact four-class selected certificate over all six child roles,
+    /// Exact two-class selected certificate over all six child roles,
     /// layouts, domains and slices. Success does not by itself authorize
     /// proving: the Block builder must still bind every class tile and consume
     /// the resulting private typestate before a selected preparation can
@@ -450,7 +409,7 @@ impl BlockRegionSidecarVk {
             } => tx_log,
             _ => return Err(RegionSidecarError::UnsupportedVkShape),
         };
-        let geometry = noid_chain::consensus::params::USER_TX_CLASS_TIERS
+        let geometry = noid_chain::consensus::params::BLOCK_PAGE_CLASS_TIERS
             .into_iter()
             .filter_map(selected_zk_block_geometry)
             .find(|geometry| geometry.tx_log == tx_log)
@@ -984,7 +943,14 @@ impl<'a> BlockRegionProverPlan<'a> {
         ];
         let (walk, terminals) = prove_ragged_multi_deep_chain_walk(&s0, &groups, challenger);
         lap("six-child multi-walk", &mut t);
-        let [wallet_a_terminal, meta_a_terminal, wallet_b_terminal, meta_b_terminal, owner_c_terminal, main_c_terminal]: [_; 6] = terminals
+        let [
+            wallet_a_terminal,
+            meta_a_terminal,
+            wallet_b_terminal,
+            meta_b_terminal,
+            owner_c_terminal,
+            main_c_terminal,
+        ]: [_; 6] = terminals
             .try_into()
             .expect("six-child multi-walk terminal count");
         let (wallet_a, child_claims) = wallet_a_prefix.finish(&wallet_a_terminal, challenger)?;
@@ -1043,7 +1009,7 @@ impl<'a> BlockRegionProverPlan<'a> {
         Ok(proof)
     }
 
-    /// Banked four-tier twin of [`Self::prove_post_commit`]: the transcript
+    /// Banked two-tier twin of [`Self::prove_post_commit`]: the transcript
     /// and claim-stream mirror of
     /// [`verify_block_region_sidecar_banked_post_commit`].  Only the live
     /// tier's sidecar is actually proved; every dead tier deposits its fixed
@@ -1356,8 +1322,14 @@ fn verify_block_region_sidecar<Ch: Challenger>(
         vec![owner_c_prefix.group().clone()],
         vec![main_c_prefix.group().clone()],
     ];
-    let [wallet_a_terminal, meta_a_terminal, wallet_b_terminal, meta_b_terminal, owner_c_terminal, main_c_terminal]:
-        [_; 6] = verify_ragged_multi_deep_chain_walk(
+    let [
+        wallet_a_terminal,
+        meta_a_terminal,
+        wallet_b_terminal,
+        meta_b_terminal,
+        owner_c_terminal,
+        main_c_terminal,
+    ]: [_; 6] = verify_ragged_multi_deep_chain_walk(
         &block_walk_w_logs(vk),
         &groups,
         &proof.walk,
@@ -1518,7 +1490,7 @@ pub fn verify_block_region_sidecar_trace_post_commit<C: FsChannelOps>(
     Ok(())
 }
 
-/// Banked four-tier RECORDED-mode trace verifier: one recorded replay per
+/// Banked two-tier RECORDED-mode trace verifier: one recorded replay per
 /// candidate predecessor tier, so the caller's row structure is
 /// independent of the live tier.  Each replay runs on a union-recorder child
 /// channel, so its Fiat-Shamir traffic costs recorded schedule lanes instead
@@ -1568,12 +1540,10 @@ pub(crate) fn verify_block_region_sidecar_banked_trace_post_commit<C: FsChannelO
     }
     let selected_tail = (0..BLOCK_SIDECAR_CHILD_TAIL_LANES)
         .map(|lane| {
-            tails
-                .iter()
-                .zip(gates)
-                .fold(crate::acceptance::trace::LinExpr::zero(), |sum, (tail, gate)| {
-                    sum.add(&crate::acceptance::trace::mul(b, gate, &tail[lane]))
-                })
+            tails.iter().zip(gates).fold(
+                crate::acceptance::trace::LinExpr::zero(),
+                |sum, (tail, gate)| sum.add(&crate::acceptance::trace::mul(b, gate, &tail[lane])),
+            )
         })
         .collect::<Vec<_>>();
     context.observe_f128_slice(b, &selected_tail);
@@ -1601,7 +1571,7 @@ pub(crate) fn block_sidecar_post_commit_claim_count(
     Ok(context.claim_count())
 }
 
-/// Banked four-tier native twin of
+/// Banked two-tier native twin of
 /// [`verify_block_region_sidecar_banked_trace_post_commit`].  The live tier
 /// verifies through the ordinary seeded child chain; every dead tier
 /// contributes its fixed anchor-claim block (one anchor per claim its replay
@@ -1670,7 +1640,8 @@ pub(crate) fn verify_block_region_sidecar_banked_post_commit_layout_captured<Ch:
     let mut captured = None;
     for slot in 0..vks.len() {
         if slot == live_slot {
-            let mut child = LayoutRecordingChallenger::new(BLOCK_SIDECAR_CHILD_DOMAIN, layout.clone());
+            let mut child =
+                LayoutRecordingChallenger::new(BLOCK_SIDECAR_CHILD_DOMAIN, layout.clone());
             child.observe_f128(seed);
             let claims = verify_block_region_sidecar(
                 &vks[slot],
@@ -2062,9 +2033,9 @@ mod tests {
     }
 
     #[test]
-    fn selected_v5_registry_accepts_exactly_four_canonical_geometries() {
+    fn selected_v5_registry_accepts_exactly_two_canonical_geometries() {
         let mut digests = std::collections::BTreeSet::new();
-        for tier in [8usize, 32, 64, 255] {
+        for tier in [64usize, 255] {
             let geometry = selected_zk_block_geometry(tier).unwrap();
             let vk = selected_vk_fixture(tier);
             vk.validate_selected_zk_roles().unwrap();
@@ -2083,7 +2054,7 @@ mod tests {
 
     #[test]
     fn compact_selected_vk_slices_rehydrate_exact_identity() {
-        for tier in noid_chain::consensus::params::USER_TX_CLASS_TIERS {
+        for tier in noid_chain::consensus::params::BLOCK_PAGE_CLASS_TIERS {
             let original = selected_vk_fixture(tier);
             let slices = original
                 .selected_registry_slices()

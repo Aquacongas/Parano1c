@@ -7,10 +7,9 @@
 //!
 //! The fixture provider starts at the real genesis state, mines every header,
 //! verifies every wallet authorization and materializes every backbone state.
-//! It saves one exact parent boundary for B8/B32/B64/B255, then forks each of
-//! those four boundaries into every current tier.  Thus all sixteen matrices
-//! are assembled from native-valid block witnesses rather than shape-only or
-//! synthetic inputs.
+//! It saves the exact B64 and B255 parent boundaries, then forks native-valid
+//! children for both current classes. The two resulting matrices are assembled
+//! from native-valid block witnesses rather than shape-only or synthetic inputs.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read as _, Write as _};
