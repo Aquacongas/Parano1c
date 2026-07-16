@@ -1766,11 +1766,17 @@ impl<'a, C> FieldPostCommitTraceContext<'a, C> {
     /// expression's structure is fixed by the stream position — the walk
     /// term always references the (always built) variant walk — so the
     /// enclosing batch rows never encode which variant is live.
+    /// The anchor's coordinates are protocol constants (the IO slice's zero
+    /// point), but its VALUE is the envelope's `io[0]` — witness data that
+    /// differs between base and recursive predecessors — so the value arm
+    /// selects against the caller's `anchor_value` WIRE expression: baking
+    /// the native value would imprint it on the matrix.
     pub(crate) fn adopt_child_claims_banked<C2>(
         &mut self,
         b: &mut FieldR1csBuilder,
         child: FieldPostCommitTraceContext<'_, C2>,
         anchor: &pcs::QuirkyDirectClaim,
+        anchor_value: &LinExpr,
         gate: &LinExpr,
     ) {
         let claims = child.finish();
@@ -1781,22 +1787,21 @@ impl<'a, C> FieldPostCommitTraceContext<'a, C> {
                 anchor.x_rest.len(),
                 "banked claim point arity"
             );
-            let select = |b: &mut FieldR1csBuilder, walk: &LinExpr, anchor: F128| {
-                let anchor = LinExpr::constant(anchor);
-                let delta = mul(b, gate, &walk.add(&anchor));
+            let select = |b: &mut FieldR1csBuilder, walk: &LinExpr, anchor: &LinExpr| {
+                let delta = mul(b, gate, &walk.add(anchor));
                 anchor.add(&delta)
             };
-            let x_rest = claim
+            let x_rest: Vec<LinExpr> = claim
                 .x_rest
                 .iter()
                 .zip(anchor.x_rest.iter())
-                .map(|(coordinate, &value)| select(b, coordinate, value))
+                .map(|(coordinate, &value)| select(b, coordinate, &LinExpr::constant(value)))
                 .collect();
             let selected = QuirkyDirectClaimTrace {
-                z_skip: select(b, &claim.z_skip, anchor.z_skip),
+                z_skip: select(b, &claim.z_skip, &LinExpr::constant(anchor.z_skip)),
                 k_skip: anchor.k_skip,
                 x_rest,
-                value: select(b, &claim.value, anchor.value),
+                value: select(b, &claim.value, anchor_value),
             };
             self.claims.push(selected);
         }

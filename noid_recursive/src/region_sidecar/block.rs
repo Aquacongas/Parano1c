@@ -1538,6 +1538,7 @@ pub(crate) fn verify_block_region_sidecar_banked_trace_post_commit<C: FsChannelO
     live_slot: usize,
     live_proof: &BlockRegionSidecarProof,
     anchor: &QuirkyDirectClaim,
+    anchor_value: &crate::acceptance::trace::LinExpr,
 ) -> Result<Vec<RecordedChannel>, RegionSidecarError> {
     if vks.is_empty() || vks.len() != gates.len() || live_slot >= vks.len() {
         return Err(RegionSidecarError::BadVk);
@@ -1561,7 +1562,7 @@ pub(crate) fn verify_block_region_sidecar_banked_trace_post_commit<C: FsChannelO
         crate::acceptance::trace::with_pin_gate(gate, || {
             verify_block_region_sidecar_trace_post_commit(b, &mut child, vk, proof)
         })?;
-        context.adopt_child_claims_banked(b, child, anchor, gate);
+        context.adopt_child_claims_banked(b, child, anchor, anchor_value, gate);
         tails.push(recorder.sample_f128_vec(b, BLOCK_SIDECAR_CHILD_TAIL_LANES));
         recordings.push(recorder.finish());
     }
