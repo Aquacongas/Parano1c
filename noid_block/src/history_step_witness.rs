@@ -13,15 +13,12 @@ use noid_chain::sparse_merkle::{
 };
 use noid_chain::state::{ChainState, ExactFrontierError};
 use noid_chain::{
-    build_exact_action_surface_for_transactions_at_log_slots, compute_tx_root, Block, BlockHeader,
-    StateDeltaError,
+    build_exact_action_surface_for_transactions_at_log_slots, compute_tx_root,
+    validate_block_page_stream, Block, BlockHeader, StateDeltaError,
 };
 use noid_core::{Block128, TowerField};
 use noid_gkr::zk_authorization::ZkAuthorizationProof;
-use noid_gkr::{
-    canonical_authorization_statement_from_body, spine_inputs_from_body, MerklePathInputs,
-    OwnerAuthStatementError, SlotLeafInputs, MAX_MERKLE_DEPTH,
-};
+use noid_gkr::{spine_inputs_from_body, MerklePathInputs, SlotLeafInputs, MAX_MERKLE_DEPTH};
 use noid_poseidon2b::native::compress;
 use noid_recursive::acceptance::history_step::{
     prepare_history_step_authorizations, prepare_history_step_for_pow,
@@ -34,7 +31,6 @@ use noid_recursive::{
     ChainAccumulatorLocalBoundaryError, ExactStateStructuralFrontierInputs,
     HistoryStepBlockComponents,
 };
-use noid_tx::PublicLogicError;
 
 /// Native chain data that fixes one mining template to its current parent.
 ///
@@ -291,16 +287,19 @@ fn prepare_native_history_step<const TIER: usize>(
     validate_nonce_independent_block(&template, &context)?;
 
     let components = build_history_step_components(&template, context.parent_state)?;
+    let user_pages = components.tx_body_inputs.len().saturating_sub(1);
     let actual_tier =
-        noid_chain::consensus::params::user_tx_class_tier(components.authorization_inputs.len());
+        noid_chain::consensus::paged_spend::BlockProofClass::for_page_count(user_pages)
+            .map(|class| class.page_capacity());
     if actual_tier != Some(TIER) {
         return Err(HistoryStepWitnessError::WrongTier {
             expected: TIER,
             actual: actual_tier,
-            user_transactions: components.authorization_inputs.len(),
+            user_pages,
         });
     }
     let authorizations = prepare_history_step_authorizations::<TIER>(
+        user_pages,
         &components.authorization_inputs,
         live_authorization_proofs,
         ghost_authorization,
@@ -357,14 +356,9 @@ fn validate_nonce_independent_block(
     validate_block_resource_preflight(block)?;
     validate_mandatory_coinbase(block, context.parent_header)?;
     noid_chain::consensus::checks::validate_block_slot_conflicts(&block.transactions)?;
-    for (tx_index, transaction) in block.transactions.iter().enumerate() {
-        validate_tx_consensus(transaction)?;
-        if !transaction.body.is_coinbase {
-            noid_tx::validate_public_tx_logic(&transaction.body).map_err(|source| {
-                HistoryStepWitnessError::TransactionPublicLogic { tx_index, source }
-            })?;
-        }
-    }
+    validate_tx_consensus(&block.transactions[0])?;
+    validate_block_page_stream(&block.transactions)
+        .map_err(|error| ConsensusError::InvalidPagedSpend(error.to_string()))?;
     let parent_block_id = noid_chain::hash_block_header(context.parent_header);
     let user_epoch_anchor = if context
         .start_accumulator
@@ -397,25 +391,24 @@ fn build_history_step_components(
         .map(|transaction| spine_inputs_from_body(&transaction.body))
         .collect();
     let tx_body_hashes = body_hashes.iter().copied().map(digest_to_fields).collect();
-    let tx_root_inputs = tx_root_merkle_inputs(block, &body_hashes)?;
+    let stream = validate_block_page_stream(&block.transactions)
+        .map_err(|error| ConsensusError::InvalidPagedSpend(error.to_string()))?;
+    let logical_hashes = std::iter::once(body_hashes[0])
+        .chain(stream.groups.iter().map(|group| group.spend.logical_txid.0))
+        .collect::<Vec<_>>();
+    let tx_root_inputs = tx_root_merkle_inputs(block, &logical_hashes)?;
 
-    let mut authorization_inputs = Vec::with_capacity(block.transactions.len().saturating_sub(1));
-    for (tx_index, transaction) in block.transactions.iter().enumerate() {
-        if transaction.body.is_coinbase {
-            continue;
-        }
-        let statement = canonical_authorization_statement_from_body(
-            tx_index,
-            transaction.txid().as_fields(),
-            &transaction.body,
-        )
-        .map_err(|source| HistoryStepWitnessError::AuthorizationStatement { tx_index, source })?;
+    let mut authorization_inputs = Vec::with_capacity(stream.groups.len());
+    for (group_index, group) in stream.groups.iter().enumerate() {
+        let tx_index = group_index + 1;
+        let tx_body_hash = group.spend.logical_txid.as_fields();
+        let public =
+            noid_gkr::OwnerAuthPublicInputs::new(tx_body_hash, group.spend.input_owner.as_fields());
         authorization_inputs.push(AuthorizationComponentInput {
             block_index: 0,
-            tx_index: statement.tx_index,
-            tx_body_hash: statement.tx_body_hash,
-            live_input_count: statement.live_input_count,
-            public: statement.public,
+            tx_index,
+            tx_body_hash,
+            public,
         });
     }
 
@@ -529,19 +522,19 @@ fn slot_leaf_input(slot: noid_chain::SlotValue) -> SlotLeafInputs {
 
 fn tx_root_merkle_inputs(
     block: &Block,
-    body_hashes: &[[u8; 32]],
+    logical_hashes: &[[u8; 32]],
 ) -> Result<Vec<MerklePathInputs>, HistoryStepWitnessError> {
-    if body_hashes.len() != block.transactions.len() || body_hashes.is_empty() {
+    if logical_hashes.is_empty() {
         return Err(HistoryStepWitnessError::TransactionRootMismatch);
     }
     let leaf_capacity = noid_chain::tx_tree::TX_TREE_LEAVES;
     let depth = noid_chain::tx_tree::TX_TREE_DEPTH;
-    if body_hashes.len() > leaf_capacity || depth > MAX_MERKLE_DEPTH {
+    if logical_hashes.len() > leaf_capacity || depth > MAX_MERKLE_DEPTH {
         return Err(HistoryStepWitnessError::TransactionRootMismatch);
     }
 
     let mut levels = Vec::with_capacity(depth + 1);
-    let mut level = body_hashes.to_vec();
+    let mut level = logical_hashes.to_vec();
     level.resize(leaf_capacity, [0u8; 32]);
     levels.push(level.clone());
     while level.len() > 1 {
@@ -553,12 +546,12 @@ fn tx_root_merkle_inputs(
     }
 
     let root = levels[depth][0];
-    if noid_chain::tx_tree::bind_tx_count(root, body_hashes.len()) != block.header.tx_root {
+    if noid_chain::tx_tree::bind_tx_count(root, logical_hashes.len()) != block.header.tx_root {
         return Err(HistoryStepWitnessError::TransactionRootMismatch);
     }
     let expected_root = digest_to_fields(root);
-    let mut inputs = Vec::with_capacity(body_hashes.len());
-    for leaf_index in 0..body_hashes.len() {
+    let mut inputs = Vec::with_capacity(logical_hashes.len());
+    for leaf_index in 0..logical_hashes.len() {
         let mut siblings = [[Block128::ZERO; 2]; MAX_MERKLE_DEPTH];
         let mut directions = [false; MAX_MERKLE_DEPTH];
         let mut index = leaf_index;
@@ -592,19 +585,11 @@ pub enum HistoryStepWitnessError {
     WrongTier {
         expected: usize,
         actual: Option<usize>,
-        user_transactions: usize,
+        user_pages: usize,
     },
     StartBoundary(ChainAccumulatorLocalBoundaryError),
     ParentStateBoundary(&'static str),
     Consensus(ConsensusError),
-    TransactionPublicLogic {
-        tx_index: usize,
-        source: PublicLogicError,
-    },
-    AuthorizationStatement {
-        tx_index: usize,
-        source: OwnerAuthStatementError,
-    },
     Authorization(HistoryStepAuthorizationError),
     StateSurface(StateDeltaError),
     StateFrontier(ExactFrontierError),
@@ -678,23 +663,16 @@ impl std::fmt::Display for HistoryStepWitnessError {
             Self::WrongTier {
                 expected,
                 actual,
-                user_transactions,
+                user_pages,
             } => write!(
                 formatter,
-                "HistoryStep B{expected} cannot hold {user_transactions} user transactions (canonical tier {actual:?})",
+                "HistoryStep B{expected} cannot hold {user_pages} physical pages (canonical tier {actual:?})",
             ),
             Self::StartBoundary(source) => write!(formatter, "invalid HistoryStep start: {source}"),
             Self::ParentStateBoundary(field) => {
                 write!(formatter, "parent state {field} does not match its header")
             }
             Self::Consensus(source) => write!(formatter, "block consensus failed: {source}"),
-            Self::TransactionPublicLogic { tx_index, source } => {
-                write!(formatter, "transaction {tx_index} public logic failed: {source}")
-            }
-            Self::AuthorizationStatement { tx_index, source } => write!(
-                formatter,
-                "transaction {tx_index} authorization statement failed: {source}",
-            ),
             Self::Authorization(source) => {
                 write!(formatter, "HistoryStep authorization failed: {source}")
             }

@@ -3,8 +3,8 @@
 
 //! Checked block fee, burn, and coinbase arithmetic.
 //!
-//! Every user count comes from the exact selected bitmap expressions already
-//! returned by public arithmetic.  Parent occupancy selects the consensus
+//! Every logical-group count comes from the constrained START..END scanner,
+//! whose page totals come from the exact selected bitmap expressions. Parent occupancy selects the consensus
 //! pressure multiplier at the exact integer 50/75/90 percent boundaries;
 //! child depth selects emission.  All monetary additions and comparisons are
 //! unsigned tower-bit arithmetic.  In particular, no fee formula is evaluated
@@ -18,27 +18,27 @@ use noid_chain::consensus::params::{
 use noid_core::{hardware::flat_to_tower_u128, Block128};
 
 use super::exact_state::{StateDepthTrace, MAX_EXACT_STATE_DEPTH, MIN_EXACT_STATE_DEPTH};
-use super::public_arithmetic::UserPublicArithmeticTrace;
+use super::paged_spend::PagedSpendGroupTrace;
 use super::{
-    alloc_block, flat_const, mul, pin_eq, pin_zero, range_check_bits, FieldR1csBuilder, LinExpr,
-    Wire, F128,
+    alloc_block, const_block, flat_const, mul, pin_eq, pin_zero, range_check_bits,
+    FieldR1csBuilder, LinExpr, Wire, F128,
 };
 
 const U64_BITS: usize = 64;
 const MONEY_SUM_BITS: usize = 72;
-const SMALL_FEE_BITS: usize = 16;
+const SMALL_FEE_BITS: usize = 32;
 const MAX_CONSERVATIVE_MIN_FEE: u128 = MIN_FEE_BASE as u128
-    + FEE_PER_INPUT as u128 * noid_tx::TX_INPUTS as u128
-    + FEE_PER_OUTPUT as u128 * noid_tx::TX_OUTPUTS as u128
-    + STATE_GROWTH_FEE_BASE as u128 * 8 * noid_tx::TX_OUTPUTS as u128;
+    + FEE_PER_INPUT as u128 * noid_tx::MAX_PAGED_SPEND_INPUTS as u128
+    + FEE_PER_OUTPUT as u128 * noid_tx::MAX_PAGED_SPEND_OUTPUTS as u128
+    + STATE_GROWTH_FEE_BASE as u128 * 8 * noid_tx::MAX_PAGED_SPEND_OUTPUTS as u128;
 const MAX_BLOCK_COINBASE_CEILING: u128 =
     BLOCK_MAX_USER_TXS as u128 * u64::MAX as u128 + BASE_REWARD_MICRONOID as u128;
 const _: () = assert!(MAX_CONSERVATIVE_MIN_FEE < (1u128 << SMALL_FEE_BITS));
 const _: () = assert!(MAX_BLOCK_COINBASE_CEILING < (1u128 << MONEY_SUM_BITS));
 
-/// Fee facts proven for one physical user-body slot. Capacity ghosts have
-/// zero selected counts, minimum, burn, and claimable contribution.
-pub struct UserFeeArithmeticTrace {
+/// Fee facts proven for one logical PagedSpend group. Capacity ghosts have
+/// zero counts, minimum, burn, and claimable contribution.
+pub struct LogicalGroupFeeArithmeticTrace {
     pub live_input_count: LinExpr,
     pub live_output_count: LinExpr,
     pub minimum_fee: LinExpr,
@@ -52,7 +52,7 @@ pub struct UserFeeArithmeticTrace {
 /// tests can target the semantic handoff directly.
 pub struct BlockFeeArithmeticTrace {
     pub pressure_multiplier: LinExpr,
-    pub users: Vec<UserFeeArithmeticTrace>,
+    pub groups: Vec<LogicalGroupFeeArithmeticTrace>,
     pub claimable_fee_sum: LinExpr,
     pub block_reward: LinExpr,
     pub max_coinbase_value: LinExpr,
@@ -101,25 +101,6 @@ fn less_than_bits(b: &mut FieldR1csBuilder, lhs: &[LinExpr], rhs: &[LinExpr]) ->
         borrow = not_a_c.add(&borrow_eq);
     }
     borrow
-}
-
-fn eq_constant_bits(b: &mut FieldR1csBuilder, bits: &[LinExpr], constant: usize) -> LinExpr {
-    bits.iter()
-        .enumerate()
-        .fold(LinExpr::constant(F128::ONE), |eq, (bit, value)| {
-            let factor = if (constant >> bit) & 1 == 1 {
-                value.clone()
-            } else {
-                value.add_const(F128::ONE)
-            };
-            mul(b, &eq, &factor)
-        })
-}
-
-fn count_one_hot(b: &mut FieldR1csBuilder, bits: &[LinExpr], maximum: usize) -> Vec<LinExpr> {
-    (0..=maximum)
-        .map(|value| eq_constant_bits(b, bits, value))
-        .collect()
 }
 
 fn selected_constant_bits(selectors: &[LinExpr], constants: &[u64], width: usize) -> Vec<LinExpr> {
@@ -184,44 +165,117 @@ fn bind_pressure(
     (pressure, regions)
 }
 
-fn bind_user_fee(
+fn constant_product_bits(
     b: &mut FieldR1csBuilder,
-    user: &UserPublicArithmeticTrace,
-    pressure_regions: &[LinExpr; 4],
-) -> UserFeeArithmeticTrace {
-    let live_input_count = user.live_input_count.clone();
-    let live_output_count = user.live_output_count.clone();
-    let input_hot = count_one_hot(b, &user.live_input_count_bits, 8);
-    let output_hot = count_one_hot(b, &user.live_output_count_bits, 2);
+    value_bits: &[LinExpr],
+    constant: u64,
+    width: usize,
+) -> Vec<LinExpr> {
+    let mut product = vec![LinExpr::zero(); width];
+    let mut initialized = false;
+    for shift in 0..u64::BITS as usize {
+        if (constant >> shift) & 1 == 0 {
+            continue;
+        }
+        let mut term = vec![LinExpr::zero(); width];
+        for (bit, value) in value_bits.iter().enumerate() {
+            if bit + shift < width {
+                term[bit + shift] = value.clone();
+            }
+        }
+        if initialized {
+            product = checked_add_bits(b, &product, &term);
+        } else {
+            product = term;
+            initialized = true;
+        }
+    }
+    product
+}
 
-    let input_constants: Vec<u64> = (0..=8).map(|n| FEE_PER_INPUT * n).collect();
-    let output_constants: Vec<u64> = (0..=2).map(|n| FEE_PER_OUTPUT * n).collect();
-    let input_fee_bits = selected_constant_bits(&input_hot, &input_constants, SMALL_FEE_BITS);
-    let output_fee_bits = selected_constant_bits(&output_hot, &output_constants, SMALL_FEE_BITS);
+fn bind_group_fee(
+    b: &mut FieldR1csBuilder,
+    group: &PagedSpendGroupTrace,
+    pressure_regions: &[LinExpr; 4],
+) -> LogicalGroupFeeArithmeticTrace {
+    let live_input_count = group.live_input_count.clone();
+    let live_output_count = group.live_output_count.clone();
+    let input_bits_wires = range_check_bits(b, &live_input_count, 11);
+    let output_bits_wires = range_check_bits(b, &live_output_count, 9);
+    let input_cap = range_check_bits(
+        b,
+        &const_block(Block128::from(
+            (noid_tx::MAX_PAGED_SPEND_INPUTS + 1) as u128,
+        )),
+        11,
+    );
+    let output_cap = range_check_bits(
+        b,
+        &const_block(Block128::from(
+            (noid_tx::MAX_PAGED_SPEND_OUTPUTS + 1) as u128,
+        )),
+        9,
+    );
+    super::pin_lt_strict(b, &input_bits_wires, &input_cap);
+    super::pin_lt_strict(b, &output_bits_wires, &output_cap);
+    let input_bits = input_bits_wires
+        .iter()
+        .copied()
+        .map(LinExpr::from_wire)
+        .collect::<Vec<_>>();
+    let output_bits = output_bits_wires
+        .iter()
+        .copied()
+        .map(LinExpr::from_wire)
+        .collect::<Vec<_>>();
+    let input_fee_bits = constant_product_bits(b, &input_bits, FEE_PER_INPUT, SMALL_FEE_BITS);
+    let output_fee_bits = constant_product_bits(b, &output_bits, FEE_PER_OUTPUT, SMALL_FEE_BITS);
     let base_bits: Vec<LinExpr> = (0..SMALL_FEE_BITS)
         .map(|bit| {
             if (MIN_FEE_BASE >> bit) & 1 == 1 {
-                user.tx_live.clone()
+                group.live.clone()
             } else {
                 LinExpr::zero()
             }
         })
         .collect();
 
-    // max(0, no-ni) is only 0, 1, or 2 for Tx8x2. These three non-overlapping
-    // cases derive its exact positive one-hot form without subtraction.
-    let net_one = mul(b, &input_hot[0], &output_hot[1]).add(&mul(b, &input_hot[1], &output_hot[2]));
-    let net_two = mul(b, &input_hot[0], &output_hot[2]);
-    let pressure_values = [1u64, 2, 4, 8];
-    let mut burn_selectors = Vec::with_capacity(8);
-    let mut burn_constants = Vec::with_capacity(8);
-    for (region, pressure) in pressure_regions.iter().zip(pressure_values) {
-        burn_selectors.push(mul(b, &net_one, region));
-        burn_constants.push(STATE_GROWTH_FEE_BASE * pressure);
-        burn_selectors.push(mul(b, &net_two, region));
-        burn_constants.push(STATE_GROWTH_FEE_BASE * pressure * 2);
+    // net = max(0, outputs-inputs). The strict comparison is derived from the
+    // same count bits; the native net wire is constrained to zero on the
+    // non-growth arm and to `input + net = output` on the growth arm.
+    let mut input_wide = input_bits.clone();
+    input_wide.resize(11, LinExpr::zero());
+    let mut output_wide = output_bits.clone();
+    output_wide.resize(11, LinExpr::zero());
+    let is_growth = less_than_bits(b, &input_wide, &output_wide);
+    let input_native = tower_value(b, &live_input_count);
+    let output_native = tower_value(b, &live_output_count);
+    let net_native = output_native.saturating_sub(input_native);
+    let net = alloc_block(b, Block128::from(net_native));
+    let net_wires = range_check_bits(b, &net, 9);
+    let net_bits = net_wires
+        .iter()
+        .copied()
+        .map(LinExpr::from_wire)
+        .collect::<Vec<_>>();
+    let dead_net = mul(b, &is_growth.add_const(F128::ONE), &net);
+    pin_zero(b, &dead_net);
+    let mut net_wide = net_bits.clone();
+    net_wide.resize(11, LinExpr::zero());
+    let input_plus_net = reconstruct_bits(&checked_add_bits(b, &input_wide, &net_wide));
+    let bad_net = mul(b, &is_growth, &input_plus_net.add(&live_output_count));
+    pin_zero(b, &bad_net);
+
+    let base_burn = constant_product_bits(b, &net_bits, STATE_GROWTH_FEE_BASE, SMALL_FEE_BITS);
+    let mut burn_bits = vec![LinExpr::zero(); SMALL_FEE_BITS];
+    for (region_index, region) in pressure_regions.iter().enumerate() {
+        for bit in 0..SMALL_FEE_BITS {
+            if bit >= region_index {
+                burn_bits[bit] =
+                    burn_bits[bit].add(&mul(b, region, &base_burn[bit - region_index]));
+            }
+        }
     }
-    let burn_bits = selected_constant_bits(&burn_selectors, &burn_constants, SMALL_FEE_BITS);
     let burned_fee = reconstruct_bits(&burn_bits);
 
     let base_and_inputs = checked_add_bits(b, &base_bits, &input_fee_bits);
@@ -232,20 +286,15 @@ fn bind_user_fee(
     // Existing public-arithmetic fee bits are the sole fee decomposition.
     let mut minimum_wide = minimum_bits;
     minimum_wide.resize(U64_BITS, LinExpr::zero());
-    let fee_bits: Vec<LinExpr> = user
-        .fee
-        .bits
-        .iter()
-        .copied()
-        .map(LinExpr::from_wire)
-        .collect();
+    let fee_wires = range_check_bits(b, &group.fee, U64_BITS);
+    let fee_bits: Vec<LinExpr> = fee_wires.iter().copied().map(LinExpr::from_wire).collect();
     let fee_below_minimum = less_than_bits(b, &fee_bits, &minimum_wide);
     pin_zero(b, &fee_below_minimum);
 
     // claimable + burn = tx_live*fee, with a checked u64 carry chain. A ghost
     // therefore contributes exactly zero even if a standalone caller supplies
     // a nonzero canonical raw fee body behind tx_live=0.
-    let paid_native = tower_value(b, &user.paid_fee);
+    let paid_native = tower_value(b, &group.fee);
     let burn_native = tower_value(b, &burned_fee);
     let claimable_native = paid_native.checked_sub(burn_native).unwrap_or(0);
     let claimable_fee = alloc_block(b, Block128::from(claimable_native));
@@ -261,9 +310,9 @@ fn bind_user_fee(
     burn_wide.resize(U64_BITS, LinExpr::zero());
     let paid_reconstruction =
         reconstruct_bits(&checked_add_bits(b, &claimable_expr_bits, &burn_wide));
-    pin_eq(b, &paid_reconstruction, &user.paid_fee);
+    pin_eq(b, &paid_reconstruction, &group.fee);
 
-    UserFeeArithmeticTrace {
+    LogicalGroupFeeArithmeticTrace {
         live_input_count,
         live_output_count,
         minimum_fee,
@@ -277,7 +326,7 @@ fn bind_user_fee(
 /// `coinbase <= reward(child_depth) + claimable_sum`. Underclaiming is valid.
 pub fn bind_block_fee_arithmetic(
     b: &mut FieldR1csBuilder,
-    users: &[UserPublicArithmeticTrace],
+    groups: &[PagedSpendGroupTrace],
     parent_active_count: &LinExpr,
     parent_depth: &StateDepthTrace,
     child_depth: &StateDepthTrace,
@@ -286,13 +335,13 @@ pub fn bind_block_fee_arithmetic(
 ) -> BlockFeeArithmeticTrace {
     let (pressure_multiplier, pressure_regions) =
         bind_pressure(b, parent_active_count, parent_depth);
-    let users: Vec<UserFeeArithmeticTrace> = users
+    let groups: Vec<LogicalGroupFeeArithmeticTrace> = groups
         .iter()
-        .map(|user| bind_user_fee(b, user, &pressure_regions))
+        .map(|group| bind_group_fee(b, group, &pressure_regions))
         .collect();
 
     let mut aggregate_bits = vec![LinExpr::zero(); MONEY_SUM_BITS];
-    if let Some((first, rest)) = users.split_first() {
+    if let Some((first, rest)) = groups.split_first() {
         for (dst, bit) in aggregate_bits.iter_mut().zip(&first.claimable_bits) {
             *dst = LinExpr::from_wire(*bit);
         }
@@ -332,7 +381,7 @@ pub fn bind_block_fee_arithmetic(
 
     BlockFeeArithmeticTrace {
         pressure_multiplier,
-        users,
+        groups,
         claimable_fee_sum,
         block_reward,
         max_coinbase_value,
@@ -342,10 +391,6 @@ pub fn bind_block_fee_arithmetic(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acceptance::trace::action_surface::{bind_user_action_surface, LEAF_INPUT_OWNER};
-    use crate::acceptance::trace::public_arithmetic::bind_user_public_arithmetic;
-    use crate::acceptance::trace::tx_body_spine::SpineInputsTrace;
-    use noid_gkr::spine_statement::spine_inputs_from_body;
     use noid_ivc_core::field_r1cs::FieldR1cs;
     use noid_poseidon2b::primitives::Address;
     use noid_tx::{output_bitmap_bit, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS};
@@ -431,18 +476,37 @@ mod tests {
         let child_depth_value = alloc_block(&mut b, Block128::from(child_depth as u128));
         let parent_depth = StateDepthTrace::bind(&mut b, &parent_depth_value);
         let child_depth = StateDepthTrace::bind(&mut b, &child_depth_value);
-        let users: Vec<_> = bodies
+        let groups: Vec<_> = bodies
             .iter()
             .zip(liveness)
             .map(|(body, &is_live)| {
-                let native = spine_inputs_from_body(body);
-                let spine = SpineInputsTrace::alloc(&mut b, &native);
-                let owner = std::array::from_fn(|lane| {
-                    alloc_block(&mut b, native.leaves[LEAF_INPUT_OWNER][lane])
-                });
                 let live = alloc_block(&mut b, Block128::from(u128::from(is_live)));
-                let surface = bind_user_action_surface(&mut b, &spine, &live, &owner);
-                bind_user_public_arithmetic(&mut b, &spine, &surface)
+                PagedSpendGroupTrace {
+                    live,
+                    logical_txid: [LinExpr::zero(), LinExpr::zero()],
+                    input_owner: [LinExpr::zero(), LinExpr::zero()],
+                    fee: alloc_block(
+                        &mut b,
+                        Block128::from(if is_live { body.fee as u128 } else { 0 }),
+                    ),
+                    live_input_count: alloc_block(
+                        &mut b,
+                        Block128::from(if is_live {
+                            body.live_input_count() as u128
+                        } else {
+                            0
+                        }),
+                    ),
+                    live_output_count: alloc_block(
+                        &mut b,
+                        Block128::from(if is_live {
+                            body.live_output_count() as u128
+                        } else {
+                            0
+                        }),
+                    ),
+                    end_page: LinExpr::zero(),
+                }
             })
             .collect();
         let coinbase = alloc_block(&mut b, Block128::from(coinbase as u128));
@@ -451,7 +515,7 @@ mod tests {
             .expect("u64 bits");
         let trace = bind_block_fee_arithmetic(
             &mut b,
-            &users,
+            &groups,
             &parent_active,
             &parent_depth,
             &child_depth,
@@ -480,10 +544,10 @@ mod tests {
         let (r1cs, witness, trace) = build_case(&[body], active, depth, depth, coinbase);
         assert!(r1cs.satisfies(&witness));
         assert_eq!(value(&witness, &trace.pressure_multiplier), 8);
-        assert_eq!(value(&witness, &trace.users[0].minimum_fee), fee as u128);
-        assert_eq!(value(&witness, &trace.users[0].burned_fee), 20_000);
+        assert_eq!(value(&witness, &trace.groups[0].minimum_fee), fee as u128);
+        assert_eq!(value(&witness, &trace.groups[0].burned_fee), 20_000);
         assert_eq!(
-            value(&witness, &trace.users[0].claimable_fee),
+            value(&witness, &trace.groups[0].claimable_fee),
             claimable as u128
         );
         assert_eq!(value(&witness, &trace.claimable_fee_sum), claimable as u128);
@@ -629,9 +693,9 @@ mod tests {
         assert!(a.satisfies(&aw));
         assert!(c.satisfies(&cw));
         assert!(g.satisfies(&gw));
-        assert_eq!(value(&gw, &gt.users[0].minimum_fee), 0);
-        assert_eq!(value(&gw, &gt.users[0].burned_fee), 0);
-        assert_eq!(value(&gw, &gt.users[0].claimable_fee), 0);
+        assert_eq!(value(&gw, &gt.groups[0].minimum_fee), 0);
+        assert_eq!(value(&gw, &gt.groups[0].burned_fee), 0);
+        assert_eq!(value(&gw, &gt.groups[0].claimable_fee), 0);
         assert_eq!(a.useful_rows, c.useful_rows);
         assert_eq!(a.useful_rows, g.useful_rows);
         assert_eq!(a.a_0, c.a_0);

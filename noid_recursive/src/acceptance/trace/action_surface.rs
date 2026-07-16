@@ -5,9 +5,10 @@
 //!
 //! The final Tx8x2 spine exposes all 16 raw body-hash leaves as statement
 //! wires. This module makes the flags leaf the only in-trace liveness source,
-//! enforces the canonical zero form of dead entries, and binds the body-level
-//! input owner to the one-owner authorization address. Ordered actions and the
-//! exact-state overlay build on these wires in the next C' slice.
+//! enforces the canonical zero form of dead entries, and exposes PagedSpend
+//! START/END delimiters. The group scanner later binds the common input owner
+//! to the one logical authorization. Ordered actions and the exact-state
+//! overlay build on these wires in the next C' slice.
 
 use super::tx_body_spine::SpineInputsTrace;
 use super::{
@@ -24,7 +25,8 @@ pub use noid_tx::body_hash::{
 
 pub const INPUT_SELECTORS: usize = noid_tx::TX_INPUTS;
 pub const OUTPUT_SELECTORS: usize = noid_tx::TX_OUTPUTS;
-pub const VALIDITY_BITS: usize = INPUT_SELECTORS + OUTPUT_SELECTORS;
+pub const ACTION_VALIDITY_BITS: usize = INPUT_SELECTORS + OUTPUT_SELECTORS;
+pub const PAGE_VALIDITY_BITS: usize = ACTION_VALIDITY_BITS + 2;
 
 const _: () = assert!(LEAF_INPUT_BASE + INPUT_SELECTORS == LEAF_OUTPUT0_DATA);
 const _: () = assert!(LEAF_OUTPUT1_OWNER + 1 == LEAF_FLAGS);
@@ -67,6 +69,10 @@ pub struct ActionSurfaceTrace {
     pub tx_live: LinExpr,
     pub raw_inputs: [LinExpr; INPUT_SELECTORS],
     pub raw_outputs: [LinExpr; OUTPUT_SELECTORS],
+    /// PagedSpend group delimiters committed in validity bits 10 and 11.
+    /// They never become state actions; the block scanner consumes them.
+    pub start: LinExpr,
+    pub end: LinExpr,
     pub selected_inputs: [LinExpr; INPUT_SELECTORS],
     pub selected_outputs: [LinExpr; OUTPUT_SELECTORS],
     pub input_rows: [ActionRowTrace; INPUT_SELECTORS],
@@ -113,40 +119,30 @@ fn selected_row(
     }
 }
 
-/// Bind a Tx8x2 user body's validity bitmap, canonical dead entries,
-/// and mandatory one-owner address to already allocated spine statement
-/// wires. Coinbase has different semantic obligations and deliberately gets
-/// no permissive `Option<owner>` entry point here.
+/// Bind one physical page's validity bitmap and canonical dead entries to
+/// already allocated spine statement wires. Owner continuity and the one
+/// logical authorization are group-level PagedSpend obligations. Coinbase has
+/// a separate surface.
 pub fn bind_user_action_surface(
     b: &mut FieldR1csBuilder,
     spine: &SpineInputsTrace,
     tx_live: &LinExpr,
-    expected_owner: &[LinExpr; 2],
 ) -> ActionSurfaceTrace {
     // Capacity builds already constrain their shared liveness wires. Keeping
     // this local booleanity also makes the component sound in isolation.
     let tx_live_sq = mul(b, tx_live, tx_live);
     pin_eq(b, &tx_live_sq, tx_live);
 
-    // L15 = [validity_bitmap, is_coinbase]. A user transaction's bitmap has
-    // exactly ten little-endian bits, and its coinbase flag is zero.
-    let bits = range_check_bits(b, &spine.leaves[LEAF_FLAGS][0], VALIDITY_BITS);
+    // L15 = [validity_bitmap, is_coinbase]. A physical user page has ten
+    // action bits followed by the canonical START and END delimiters.
+    let bits = range_check_bits(b, &spine.leaves[LEAF_FLAGS][0], PAGE_VALIDITY_BITS);
     pin_zero(b, &spine.leaves[LEAF_FLAGS][1]);
-    let raw: [LinExpr; VALIDITY_BITS] = std::array::from_fn(|i| LinExpr::from_wire(bits[i]));
+    let raw: [LinExpr; PAGE_VALIDITY_BITS] = std::array::from_fn(|i| LinExpr::from_wire(bits[i]));
     let raw_inputs: [LinExpr; INPUT_SELECTORS] = std::array::from_fn(|i| raw[i].clone());
     let raw_outputs: [LinExpr; OUTPUT_SELECTORS] =
         std::array::from_fn(|i| raw[INPUT_SELECTORS + i].clone());
-
-    // L2 is the body-level input owner, committed exactly once and pinned
-    // directly to the one OwnerAuth statement; input records L3..L10 carry
-    // only slot/value data.
-    for lane in 0..2 {
-        pin_eq(
-            b,
-            &spine.leaves[LEAF_INPUT_OWNER][lane],
-            &expected_owner[lane],
-        );
-    }
+    let start = raw[ACTION_VALIDITY_BITS].clone();
+    let end = raw[ACTION_VALIDITY_BITS + 1].clone();
     for (index, live) in raw_inputs.iter().enumerate() {
         bind_dead_pair(b, live, &spine.leaves[LEAF_INPUT_BASE + index]);
     }
@@ -182,6 +178,8 @@ pub fn bind_user_action_surface(
         tx_live: tx_live.clone(),
         raw_inputs,
         raw_outputs,
+        start,
+        end,
         selected_inputs,
         selected_outputs,
         input_rows,
@@ -196,8 +194,9 @@ pub fn bind_coinbase_action_with_amount(
     b: &mut FieldR1csBuilder,
     spine: &SpineInputsTrace,
 ) -> CoinbaseActionTrace {
-    let bits = range_check_bits(b, &spine.leaves[LEAF_FLAGS][0], VALIDITY_BITS);
-    let bits: [LinExpr; VALIDITY_BITS] = std::array::from_fn(|i| LinExpr::from_wire(bits[i]));
+    let bits = range_check_bits(b, &spine.leaves[LEAF_FLAGS][0], ACTION_VALIDITY_BITS);
+    let bits: [LinExpr; ACTION_VALIDITY_BITS] =
+        std::array::from_fn(|i| LinExpr::from_wire(bits[i]));
     for input in &bits[..INPUT_SELECTORS] {
         pin_zero(b, input);
     }
@@ -335,17 +334,12 @@ mod tests {
         }
     }
 
-    fn relation_satisfies(
-        native: &SpineInputs,
-        expected_owner: [Block128; 2],
-        tx_live: Block128,
-    ) -> bool {
+    fn relation_satisfies(native: &SpineInputs, tx_live: Block128) -> bool {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut b = FieldR1csBuilder::new();
             let spine = SpineInputsTrace::alloc(&mut b, native);
-            let expected = std::array::from_fn(|i| alloc_block(&mut b, expected_owner[i]));
             let tx_live = alloc_block(&mut b, tx_live);
-            let _ = bind_user_action_surface(&mut b, &spine, &tx_live, &expected);
+            let _ = bind_user_action_surface(&mut b, &spine, &tx_live);
             let (r1cs, z) = b.build();
             r1cs.satisfies(&z)
         }))
@@ -369,10 +363,7 @@ mod tests {
         let native = spine_inputs_from_body(&body(owner));
         let mut b = FieldR1csBuilder::new();
         let spine = SpineInputsTrace::alloc(&mut b, &native);
-        let owner_fields = owner.as_fields();
-        let expected = std::array::from_fn(|i| alloc_block(&mut b, owner_fields[i]));
-        let surface =
-            bind_user_action_surface(&mut b, &spine, &const_block(Block128::ONE), &expected);
+        let surface = bind_user_action_surface(&mut b, &spine, &const_block(Block128::ONE));
         let (r1cs, z) = b.build();
         assert!(r1cs.satisfies(&z));
         assert_eq!(surface.raw_inputs[0].eval(&z), F128::ONE);
@@ -388,10 +379,7 @@ mod tests {
         let native = spine_inputs_from_body(&edge_body(owner));
         let mut b = FieldR1csBuilder::new();
         let spine = SpineInputsTrace::alloc(&mut b, &native);
-        let owner_fields = owner.as_fields();
-        let expected = std::array::from_fn(|i| alloc_block(&mut b, owner_fields[i]));
-        let surface =
-            bind_user_action_surface(&mut b, &spine, &const_block(Block128::ONE), &expected);
+        let surface = bind_user_action_surface(&mut b, &spine, &const_block(Block128::ONE));
         let (r1cs, z) = b.build();
         assert!(r1cs.satisfies(&z));
         assert_eq!(surface.raw_inputs[TX_INPUTS - 1].eval(&z), F128::ONE);
@@ -403,10 +391,9 @@ mod tests {
     }
 
     #[test]
-    fn owner_recombination_is_unsatisfied() {
+    fn page_surface_defers_owner_binding_to_paged_spend() {
         let native = spine_inputs_from_body(&body(Address([0x33; 32])));
-        let wrong_owner = Address([0x44; 32]).as_fields();
-        assert!(!relation_satisfies(&native, wrong_owner, Block128::ONE));
+        assert!(relation_satisfies(&native, Block128::ONE));
     }
 
     #[test]
@@ -416,11 +403,7 @@ mod tests {
         native
             .leaves
             .swap(LEAF_INPUT_BASE + TX_INPUTS - 1, LEAF_INPUT_BASE);
-        assert!(!relation_satisfies(
-            &native,
-            owner.as_fields(),
-            Block128::ONE
-        ));
+        assert!(!relation_satisfies(&native, Block128::ONE));
     }
 
     #[test]
@@ -429,23 +412,16 @@ mod tests {
         let mut native = spine_inputs_from_body(&edge_body(owner));
         native.leaves.swap(LEAF_OUTPUT1_DATA, LEAF_OUTPUT0_DATA);
         native.leaves.swap(LEAF_OUTPUT1_OWNER, LEAF_OUTPUT0_OWNER);
-        assert!(!relation_satisfies(
-            &native,
-            owner.as_fields(),
-            Block128::ONE
-        ));
+        assert!(!relation_satisfies(&native, Block128::ONE));
     }
 
     #[test]
     fn outer_inactive_gates_counts() {
         let owner = Address([0x33; 32]);
         let native = spine_inputs_from_body(&body(owner));
-        let owner_fields = owner.as_fields();
         let mut b = FieldR1csBuilder::new();
         let spine = SpineInputsTrace::alloc(&mut b, &native);
-        let expected = std::array::from_fn(|i| alloc_block(&mut b, owner_fields[i]));
-        let surface =
-            bind_user_action_surface(&mut b, &spine, &const_block(Block128::ZERO), &expected);
+        let surface = bind_user_action_surface(&mut b, &spine, &const_block(Block128::ZERO));
         let (r1cs, z) = b.build();
         assert!(r1cs.satisfies(&z));
         assert!(surface
@@ -460,8 +436,7 @@ mod tests {
         let owner = Address([0x33; 32]);
         let mut native = spine_inputs_from_body(&body(owner));
         native.leaves[LEAF_INPUT_BASE + 1][1] = Block128::ONE;
-        let owner_fields = owner.as_fields();
-        assert!(!relation_satisfies(&native, owner_fields, Block128::ONE));
+        assert!(!relation_satisfies(&native, Block128::ONE));
     }
 
     #[test]
@@ -469,11 +444,7 @@ mod tests {
         let owner = Address([0x33; 32]);
         let mut native = spine_inputs_from_body(&body(owner));
         native.leaves[LEAF_OUTPUT1_DATA][0] = Block128::ONE;
-        assert!(!relation_satisfies(
-            &native,
-            owner.as_fields(),
-            Block128::ONE
-        ));
+        assert!(!relation_satisfies(&native, Block128::ONE));
     }
 
     #[test]
@@ -481,11 +452,7 @@ mod tests {
         let owner = Address([0x33; 32]);
         let mut native = spine_inputs_from_body(&body(owner));
         native.leaves[LEAF_OUTPUT1_OWNER][1] = Block128::ONE;
-        assert!(!relation_satisfies(
-            &native,
-            owner.as_fields(),
-            Block128::ONE
-        ));
+        assert!(!relation_satisfies(&native, Block128::ONE));
     }
 
     #[test]
@@ -493,34 +460,22 @@ mod tests {
         let owner = Address([0x33; 32]);
         let mut native = spine_inputs_from_body(&body(owner));
         native.leaves[LEAF_FLAGS][1] = Block128::ONE;
-        assert!(!relation_satisfies(
-            &native,
-            owner.as_fields(),
-            Block128::ONE
-        ));
+        assert!(!relation_satisfies(&native, Block128::ONE));
     }
 
     #[test]
     fn unused_high_validity_bit_is_rejected() {
         let owner = Address([0x33; 32]);
         let mut native = spine_inputs_from_body(&body(owner));
-        native.leaves[LEAF_FLAGS][0] += Block128::from(1u128 << VALIDITY_BITS);
-        assert!(!relation_satisfies(
-            &native,
-            owner.as_fields(),
-            Block128::ONE
-        ));
+        native.leaves[LEAF_FLAGS][0] += Block128::from(1u128 << PAGE_VALIDITY_BITS);
+        assert!(!relation_satisfies(&native, Block128::ONE));
     }
 
     #[test]
     fn outer_liveness_must_be_boolean() {
         let owner = Address([0x33; 32]);
         let native = spine_inputs_from_body(&body(owner));
-        assert!(!relation_satisfies(
-            &native,
-            owner.as_fields(),
-            Block128::from(2u128)
-        ));
+        assert!(!relation_satisfies(&native, Block128::from(2u128)));
     }
 
     #[test]

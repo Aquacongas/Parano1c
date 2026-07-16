@@ -102,7 +102,6 @@ pub struct AuthorizationComponentInput {
     pub block_index: usize,
     pub tx_index: usize,
     pub tx_body_hash: [noid_core::Block128; 2],
-    pub live_input_count: u8,
     pub public: noid_gkr::OwnerAuthPublicInputs,
 }
 
@@ -184,12 +183,17 @@ pub fn prepare_history_step_ghost_authorization(
 }
 
 pub fn prepare_history_step_authorizations<const TIER: usize>(
+    user_page_count: usize,
     inputs: &[AuthorizationComponentInput],
     proofs: Vec<noid_gkr::zk_authorization::ZkAuthorizationProof>,
     ghost: &PreparedHistoryStepGhostAuthorization,
 ) -> Result<PreparedHistoryStepAuthorizations, HistoryStepAuthorizationError> {
+    let actual_tier =
+        noid_chain::consensus::paged_spend::BlockProofClass::for_page_count(user_page_count)
+            .map(|class| class.page_capacity());
     if crate::region_sidecar::selected_zk_block_geometry(TIER).is_none()
-        || noid_chain::consensus::params::user_tx_class_tier(inputs.len()) != Some(TIER)
+        || actual_tier != Some(TIER)
+        || inputs.len() > TIER
     {
         return Err(HistoryStepAuthorizationError::NonCanonicalTier);
     }
@@ -246,7 +250,10 @@ impl<const TIER: usize> HistoryStepBlockInput<TIER> {
                 actual: authorizations.inner.live_count(),
             });
         }
-        let actual_tier = noid_chain::consensus::params::user_tx_class_tier(live_authorizations);
+        let user_page_count = components.tx_body_inputs.len().saturating_sub(1);
+        let actual_tier =
+            noid_chain::consensus::paged_spend::BlockProofClass::for_page_count(user_page_count)
+                .map(|class| class.page_capacity());
         if actual_tier != Some(TIER) {
             return Err(HistoryStepInputError::WrongTier {
                 expected_tier: TIER,
@@ -255,7 +262,8 @@ impl<const TIER: usize> HistoryStepBlockInput<TIER> {
             });
         }
         if components.tx_body_inputs.len() != components.tx_body_hashes.len()
-            || components.tx_body_inputs.len() != live_authorizations + 1
+            || components.tx_body_inputs.is_empty()
+            || live_authorizations > user_page_count
             || components.tx_root_inputs.is_empty()
         {
             return Err(HistoryStepInputError::ComponentShape);

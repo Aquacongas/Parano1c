@@ -1,27 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Fixed-shape public arithmetic for one canonical Tx8x2 user body.
+//! Fixed-shape public arithmetic for one physical PagedSpend page.
 //!
 //! The body spine commits input value lanes as
 //! `amount | (creation_id << 64)`, while balance is ordinary unsigned integer
 //! arithmetic rather than addition in `F_{2^128}`.  This module splits every
 //! packed input exactly in the tower basis, range-checks all monetary lanes,
-//! and proves
-//!
-//! ```text
-//! sum(bitmap-live raw input amounts) =
-//!     sum(bitmap-live raw output amounts) + raw_fee
-//! ```
-//!
-//! from the raw rows already committed by the spine and the selectors produced
-//! by [`ActionSurfaceTrace`].  That surface proves every bitmap-dead raw record
-//! is zero and every selected selector is `tx_live * raw_selector`.  Because
-//! the same proven-boolean `tx_live` gates every row of one transaction, raw
-//! checked conservation implies selected conservation exactly: when it is
-//! zero both selected sides are zero, and when it is one they are the proven
-//! raw sides.  We therefore mux the final checked sums once instead of
-//! duplicating ten amount range checks and both integer-adder trees.
+//! Page-local arithmetic proves every amount range, packed input split,
+//! bitmap count and selected sum. Conservation is deliberately not asserted
+//! here: the PagedSpend scanner proves it once over the complete START..END
+//! group.
+//! Values come from the raw rows already committed by the spine and the
+//! selectors produced by [`ActionSurfaceTrace`]. That surface proves every
+//! bitmap-dead raw record is zero and every selected selector is
+//! `page_live * raw_selector`. We therefore mux each page's checked sums once
+//! and feed those exact expressions into the group accumulator.
 //!
 //! There is no witness-value branch: all eight input positions and both output
 //! positions instantiate the same constraints even when their bitmap bits or
@@ -29,9 +23,8 @@
 //! split at every physical position, while a tier-padding ghost returns zero
 //! selected sums and fee for later block arithmetic.
 //!
-//! The selected bitmap popcounts are derived once here and reused by both the
-//! authorization-count pin and fee arithmetic; neither downstream consumer
-//! allocates a second selected-input adder.
+//! The selected bitmap popcounts are derived once here and reused by the group
+//! scanner; no downstream consumer allocates a divergent page counter.
 
 use noid_core::{hardware::flat_to_tower_u128, Block128};
 
@@ -235,8 +228,8 @@ fn checked_sum_u64<const N: usize>(
     (acc, value)
 }
 
-/// Bind one Tx8x2 user's range and conservation predicate to the exact body
-/// spine and action-selector surface.
+/// Bind one physical page's ranges and selected sums to the exact body spine
+/// and action-selector surface. Group conservation is bound by PagedSpend.
 ///
 /// The exact outer liveness expression comes from `surface.tx_live`; it is the
 /// same wire that `bind_user_action_surface` proved boolean and used for every
@@ -288,7 +281,6 @@ pub fn bind_user_public_arithmetic(
     let fee_bits = widen_u64_bits(&fee, OUTPUT_PLUS_FEE_BITS);
     let output_plus_fee_bits = checked_add_bits(b, &output_bits, &fee_bits);
     let raw_output_plus_fee = reconstruct_bits(&output_plus_fee_bits);
-    pin_eq(b, &raw_input_sum, &raw_output_plus_fee);
 
     // One common boolean mux is exact selected semantics: action_surface has
     // already established selected_i = tx_live*raw_i and raw dead-zero.
@@ -296,7 +288,6 @@ pub fn bind_user_public_arithmetic(
     let output_sum = mul(b, &surface.tx_live, &raw_output_sum);
     let output_plus_fee = mul(b, &surface.tx_live, &raw_output_plus_fee);
     let paid_fee = mul(b, &surface.tx_live, &fee.value);
-    pin_eq(b, &input_sum, &output_plus_fee);
 
     UserPublicArithmeticTrace {
         tx_live: surface.tx_live.clone(),
@@ -324,7 +315,7 @@ pub fn bind_user_public_arithmetic(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acceptance::trace::action_surface::{bind_user_action_surface, LEAF_INPUT_OWNER};
+    use crate::acceptance::trace::action_surface::bind_user_action_surface;
     use crate::acceptance::trace::{alloc_block, F128};
     use noid_core::TowerField;
     use noid_gkr::{spine_statement::spine_inputs_from_body, SpineInputs};
@@ -418,10 +409,8 @@ mod tests {
     ) -> (FieldR1cs, Vec<F128>, UserPublicArithmeticTrace) {
         let mut b = FieldR1csBuilder::new();
         let spine = SpineInputsTrace::alloc(&mut b, native);
-        let expected_owner =
-            std::array::from_fn(|lane| alloc_block(&mut b, native.leaves[LEAF_INPUT_OWNER][lane]));
         let tx_live = alloc_block(&mut b, tx_live);
-        let surface = bind_user_action_surface(&mut b, &spine, &tx_live, &expected_owner);
+        let surface = bind_user_action_surface(&mut b, &spine, &tx_live);
         let arithmetic = bind_user_public_arithmetic(&mut b, &spine, &surface);
         let (r1cs, witness) = b.build();
         (r1cs, witness, arithmetic)
@@ -561,11 +550,11 @@ mod tests {
     }
 
     #[test]
-    fn inflation_and_wrong_fee_are_unsatisfied() {
+    fn page_arithmetic_defers_balance_and_fee_to_group_scanner() {
         let mut inflation = sparse_body();
         inflation.outputs[0].amount += 1;
         assert!(validate_public_tx_logic(&inflation).is_err());
-        assert!(!relation_satisfies(
+        assert!(relation_satisfies(
             &spine_inputs_from_body(&inflation),
             Block128::ONE
         ));
@@ -573,7 +562,7 @@ mod tests {
         let mut wrong_fee = sparse_body();
         wrong_fee.fee += 1;
         assert!(validate_public_tx_logic(&wrong_fee).is_err());
-        assert!(!relation_satisfies(
+        assert!(relation_satisfies(
             &spine_inputs_from_body(&wrong_fee),
             Block128::ONE
         ));
@@ -636,7 +625,7 @@ mod tests {
     }
 
     #[test]
-    fn balance_acceptance_matches_native_on_fixed_shape_cases() {
+    fn every_range_valid_page_shape_reaches_group_arithmetic() {
         let mut no_outputs = sparse_body();
         no_outputs.outputs = [TxOutput::dummy(); TX_OUTPUTS];
         no_outputs.inputs[0].amount = 7;
@@ -656,12 +645,8 @@ mod tests {
             wrong_fee,
         ];
         for (case, body) in cases.iter().enumerate() {
-            let native_accepts = validate_public_tx_logic(body).is_ok();
             let trace_accepts = relation_satisfies(&spine_inputs_from_body(body), Block128::ONE);
-            assert_eq!(
-                trace_accepts, native_accepts,
-                "public balance differential diverged at case {case}"
-            );
+            assert!(trace_accepts, "page arithmetic rejected case {case}");
         }
     }
 }

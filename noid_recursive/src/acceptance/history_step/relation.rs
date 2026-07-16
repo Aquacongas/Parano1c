@@ -1810,9 +1810,10 @@ fn prepare_history_step_assembly<const TIER: usize>(
     } = prepared;
     let envelope = envelope.proof();
     let parent_entry = bank.entry(selected_parent_class);
-    if noid_chain::consensus::params::user_tx_class_tier(
-        current.components.authorization_inputs.len(),
-    ) != Some(TIER)
+    let user_pages = current.components.tx_body_inputs.len().saturating_sub(1);
+    if noid_chain::consensus::paged_spend::BlockProofClass::for_page_count(user_pages)
+        .map(|class| class.page_capacity())
+        != Some(TIER)
     {
         return Err(HistoryStepError::InvalidClass);
     }

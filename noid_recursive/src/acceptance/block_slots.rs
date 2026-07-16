@@ -20,24 +20,24 @@
 //!   parent-tip, state/depth/counter and height wires; transaction epoch is
 //!   selected by a constrained `height mod 144` relation;
 //! - every tx-root Merkle path pins its root to the underlying universal
-//!   256-leaf Merkle root `M`, its leaf to the spine slot's tx-body hash, its
+//!   256-leaf Merkle root `M`, its leaf to coinbase or a complete PagedSpend
+//!   logical hash, its
 //!   direction bits to the
 //!   CONSTANT bits of its tx position, and the last real path pins its
 //!   right-hand siblings to the canonical zero-subtree digests (the padding
 //!   rim the native root reconstruction binds); a domain-separated
 //!   `TAG_TXROOT(M, tx_count)` wrapper then pins to the header `tx_root`;
-//! - each owner-auth slot pins its `tx_body_hash` to the spine hash of its
-//!   tx and discharges its wallet-PCS obligation; the authorization totals
-//!   are pinned to the per-slot counts AND to the claim's resource fields;
+//! - each owner-auth slot pins `(logical_txid, owner)` to the constrained
+//!   START..END group and discharges its wallet-PCS obligation;
 //! - production exact state derives a fixed-capacity paired local/upper walk
 //!   from the sibling-only structural carrier. Slot-sorted action leaves and
 //!   all 32 slot bits bind its entries/directions; local and segment chains
 //!   end at the parent/grown-parent and child header roots selected by the
 //!   header-bound dynamic depth.
-//! - each user's selected input/output amounts obey checked conservation; the
-//!   same selected bitmap bits drive minimum fee and deterministic burn under
-//!   parent occupancy, and the mandatory coinbase is bounded by child-depth
-//!   reward plus the checked 72-bit claimable-fee aggregate.
+//! - page-selected amounts accumulate into one checked group conservation
+//!   equation; those same group counts drive minimum fee and deterministic
+//!   burn, and the mandatory coinbase is bounded by child-depth reward plus
+//!   the checked 72-bit claimable-fee aggregate.
 //!
 //! NOT bound here (audited residue, each correctly scoped to another
 //! layer, none a hole in what this file claims):
@@ -73,7 +73,7 @@ use super::trace::action_compaction::{
     bind_mint_packed_values_body_order, compact_action_rows, CompactedActionTrace,
 };
 use super::trace::action_surface::{
-    bind_coinbase_action_with_amount, bind_user_action_surface, ActionRowTrace,
+    bind_coinbase_action_with_amount, bind_user_action_surface, ActionRowTrace, ActionSurfaceTrace,
 };
 use super::trace::exact_state::{
     bind_actions_to_exact_state_leaves, bind_exact_state_header_roots_dynamic,
@@ -81,6 +81,7 @@ use super::trace::exact_state::{
     PairedRootCellPair, StateDepthTrace,
 };
 use super::trace::fee_arithmetic::bind_block_fee_arithmetic;
+use super::trace::paged_spend::{bind_paged_spend_stream, PagedSpendGroupTrace};
 use super::trace::public_arithmetic::{bind_user_public_arithmetic, UserPublicArithmeticTrace};
 use super::trace::region_source_binding::{
     PairedExactStateCells, SpineInstanceRegion, SpineRegionData, TxRootPathRegion, TxRootRegionData,
@@ -197,25 +198,6 @@ mod selected_zk_capability_tests {
         assert!(!source.contains(&raw_constructor));
         let free_take = ["fn take_selected_zk_", "authorization_capability"].concat();
         assert!(!source.contains(&free_take));
-    }
-
-    #[test]
-    fn selected_declared_count_is_a_zero_row_canonical_bitmap_hint() {
-        for expected in 1u8..=noid_gkr::MAX_AUTHORIZATION_LIVE_INPUTS {
-            let mut body = noid_gkr::ghost_tx::ghost_tx_body();
-            let output_bits = body.validity_bitmap & !((1u16 << noid_tx::TX_INPUTS) - 1);
-            body.validity_bitmap = output_bits | ((1u16 << expected) - 1);
-            let native = noid_gkr::spine_statement::spine_inputs_from_body(&body);
-            let mut b = FieldR1csBuilder::new();
-            let spine = SpineInputsTrace::alloc(&mut b, &native);
-            let before = b.num_wires();
-            assert_eq!(selected_declared_live_input_count(&b, &spine), expected);
-            assert_eq!(
-                b.num_wires(),
-                before,
-                "native bitmap hint must not add rows"
-            );
-        }
     }
 
     #[test]
@@ -423,62 +405,20 @@ fn pin_u64_sum(b: &mut FieldR1csBuilder, terms: &[LinExpr]) -> LinExpr {
     }
 }
 
-fn append_user_action_surface(
+fn append_page_action_surface(
     b: &mut FieldR1csBuilder,
     spine: &SpineInputsTrace,
-    tx_live: &LinExpr,
-    expected_owner: &[LinExpr; 2],
-    declared_live_inputs: u8,
+    page_live: &LinExpr,
     candidates: &mut Vec<ActionRowTrace>,
     input_selectors: &mut Vec<LinExpr>,
     output_selectors: &mut Vec<LinExpr>,
-) -> UserPublicArithmeticTrace {
-    let surface = bind_user_action_surface(b, spine, tx_live, expected_owner);
+) -> (ActionSurfaceTrace, UserPublicArithmeticTrace) {
+    let surface = bind_user_action_surface(b, spine, page_live);
     let arithmetic = bind_user_public_arithmetic(b, spine, &surface);
-    let declared = alloc_declared_live_input_count(b, declared_live_inputs);
-    let selected_declared = mul(b, tx_live, &declared);
-    pin_eq(b, &arithmetic.live_input_count, &selected_declared);
     input_selectors.extend(surface.selected_inputs.iter().cloned());
     output_selectors.extend(surface.selected_outputs.iter().cloned());
     candidates.extend(surface.ordered_rows());
-    arithmetic
-}
-
-/// Recover only the native value hint for the existing fixed-shape declared
-/// input-count relation.  The hint adds no rows and carries no authority: the
-/// action surface range-checks the canonical L15 bitmap, public arithmetic
-/// recomputes its selected popcount, and `append_user_action_surface` pins that
-/// result to the freshly allocated 1..=8 count.
-fn selected_declared_live_input_count(b: &FieldR1csBuilder, spine: &SpineInputsTrace) -> u8 {
-    use noid_tx::body_hash::TX8X2_LEAF_FLAGS;
-
-    let flat = f128_to_u128(spine.leaves[TX8X2_LEAF_FLAGS][0].eval(b.values()));
-    let bitmap = flat_to_tower_u128(flat);
-    let input_mask = (1u128 << noid_tx::TX_INPUTS) - 1;
-    let count = (bitmap & input_mask).count_ones() as u8;
-    assert!(
-        (1..=noid_gkr::MAX_AUTHORIZATION_LIVE_INPUTS).contains(&count),
-        "selected user bitmap must contain 1..=8 live inputs"
-    );
-    count
-}
-
-/// Allocate the native authorization count and pin it to bitmap popcount in
-/// [`append_user_action_surface`]. Keep the relation class-fixed while
-/// enforcing the serialized boundary 1..=8.
-fn alloc_declared_live_input_count(b: &mut FieldR1csBuilder, count: u8) -> LinExpr {
-    assert!((1..=noid_gkr::MAX_AUTHORIZATION_LIVE_INPUTS).contains(&count));
-    const BITS: usize = 4;
-    let count = alloc_block(b, Block128::from(count as u128));
-    let count_bits = range_check_bits(b, &count, BITS);
-    let zero_bits = range_check_bits(b, &const_block(Block128::from(0u128)), BITS);
-    pin_lt_strict(b, &zero_bits, &count_bits);
-    let cap_plus_one = const_block(Block128::from(
-        noid_gkr::MAX_AUTHORIZATION_LIVE_INPUTS as u128 + 1,
-    ));
-    let cap_plus_one_bits = range_check_bits(b, &cap_plus_one, BITS);
-    pin_lt_strict(b, &count_bits, &cap_plus_one_bits);
-    count
+    (surface, arithmetic)
 }
 
 /// Bind the universal 256-leaf Merkle root and real transaction count to the
@@ -653,6 +593,7 @@ fn tx_root_region_capacity_data_from_wires(
 /// ghost-body constant and their liveness bit stays zero-valued (the
 /// USER_TX_COUNT sum is unchanged). Non-capacity builds keep the caller's
 /// tx count (the plural discharge asserts it is a power of two).
+#[cfg(test)]
 fn tier_auth_slot_count(tier_user_tx_capacity: Option<usize>, n_real_user: usize) -> usize {
     tier_user_tx_capacity.map_or(n_real_user, |tier| {
         super::shape::ShapeClass { tier }.authorization_capacity()
@@ -903,27 +844,17 @@ fn block_from_alias(b: &FieldR1csBuilder, expression: &LinExpr) -> Block128 {
 /// still-owned builder.
 fn mint_canonical_selected_zk_authorization_capability(
     b: &FieldR1csBuilder,
-    tx_hashes: &[[LinExpr; 2]],
-    spine_inputs: &[SpineInputsTrace],
-    live_bits: &[LinExpr],
+    groups: &[PagedSpendGroupTrace],
 ) -> CanonicalSelectedZkAuthorizationCapability {
-    use noid_tx::body_hash::TX8X2_LEAF_INPUT_OWNER;
-
-    const TX_DELTA: usize = 1;
-    let body_auth_slots = spine_inputs
-        .len()
-        .checked_sub(TX_DELTA)
-        .expect("selected class includes coinbase spine");
-    let auth_slots = live_bits.len();
+    let auth_slots = groups.len();
     let geometry = crate::region_sidecar::selected_zk_block_geometry_for_auth_tiles(auth_slots)
         .expect("selected authorization capacity is canonical");
+    let body_auth_slots = geometry.tier;
     assert_eq!(body_auth_slots, geometry.tier);
     assert_eq!(auth_slots, geometry.auth_tiles);
-
-    assert_eq!(tx_hashes.len(), TX_DELTA + body_auth_slots);
     if auth_slots > body_auth_slots {
         assert_eq!(geometry.tier, 255, "only B255 has an authorization PAD");
-        assert_eq!(live_bits[auth_slots - 1].eval(b.values()), F128::ZERO);
+        assert_eq!(groups[auth_slots - 1].live.eval(b.values()), F128::ZERO);
     }
 
     let ghost_body = noid_gkr::ghost_tx::ghost_tx_body();
@@ -936,16 +867,21 @@ fn mint_canonical_selected_zk_authorization_capability(
 
     let mut slots = Vec::with_capacity(auth_slots);
     for index in 0..body_auth_slots {
-        let body_index = index + TX_DELTA;
-        let tx_body_hash = tx_hashes[body_index].clone();
-        let expected_address = spine_inputs[body_index].leaves[TX8X2_LEAF_INPUT_OWNER].clone();
-        let live = live_bits[index].eval(b.values());
+        let group = &groups[index];
+        let live = group.live.eval(b.values());
         assert!(live == F128::ZERO || live == F128::ONE);
         let kind = if live == F128::ONE {
             CanonicalSelectedZkAuthorizationSlotKind::Live
         } else {
             CanonicalSelectedZkAuthorizationSlotKind::Ghost
         };
+        let dead = group.live.add_const(F128::ONE);
+        let tx_body_hash = std::array::from_fn(|lane| {
+            group.logical_txid[lane].add(&dead.scale(flat_of(ghost_hash[lane])))
+        });
+        let expected_address = std::array::from_fn(|lane| {
+            group.input_owner[lane].add(&dead.scale(flat_of(ghost_address[lane])))
+        });
         let native_statement = noid_gkr::zk_authorization::ZkAuthCapsuleOwnerStatement {
             tx_body_hash: std::array::from_fn(|lane| block_from_alias(b, &tx_body_hash[lane])),
             address: std::array::from_fn(|lane| block_from_alias(b, &expected_address[lane])),
@@ -956,7 +892,7 @@ fn mint_canonical_selected_zk_authorization_capability(
         slots.push(CanonicalSelectedZkAuthorizationSlot {
             tx_body_hash: Some(tx_body_hash),
             expected_address: Some(expected_address),
-            liveness: live_bits[index].clone(),
+            liveness: group.live.clone(),
             native_statement,
             kind,
         });
@@ -965,7 +901,7 @@ fn mint_canonical_selected_zk_authorization_capability(
         slots.push(CanonicalSelectedZkAuthorizationSlot {
             tx_body_hash: None,
             expected_address: None,
-            liveness: live_bits[auth_slots - 1].clone(),
+            liveness: groups[auth_slots - 1].live.clone(),
             native_statement: ghost_statement,
             kind: CanonicalSelectedZkAuthorizationSlotKind::Pad255,
         });
@@ -991,24 +927,53 @@ pub(in crate::acceptance) fn canonical_selected_zk_authorization_fixture_for_tie
     assert!(live_count <= body_auth_slots);
     let mut b = FieldR1csBuilder::new();
     let ghost_body = noid_gkr::ghost_tx::ghost_tx_body();
-    let ghost_spine = noid_gkr::spine_statement::spine_inputs_from_body(&ghost_body);
     let ghost_hash = noid_gkr::ghost_tx::ghost_tx_body_hash();
-    let spine_inputs = (0..=body_auth_slots)
-        .map(|_| SpineInputsTrace::alloc(&mut b, &ghost_spine))
+    let ghost_address = ghost_body.input_owner.as_fields();
+    let mut groups = (0..body_auth_slots)
+        .map(|index| {
+            let live = LinExpr::from_wire(b.alloc_bool(index < live_count));
+            PagedSpendGroupTrace {
+                live: live.clone(),
+                logical_txid: ghost_hash.map(|value| {
+                    alloc_block(
+                        &mut b,
+                        if index < live_count {
+                            value
+                        } else {
+                            Block128::from(0u128)
+                        },
+                    )
+                }),
+                input_owner: ghost_address.map(|value| {
+                    alloc_block(
+                        &mut b,
+                        if index < live_count {
+                            value
+                        } else {
+                            Block128::from(0u128)
+                        },
+                    )
+                }),
+                fee: LinExpr::zero(),
+                live_input_count: LinExpr::zero(),
+                live_output_count: LinExpr::zero(),
+                end_page: LinExpr::zero(),
+            }
+        })
         .collect::<Vec<_>>();
-    let tx_hashes = (0..=body_auth_slots)
-        .map(|_| ghost_hash.map(|value| alloc_block(&mut b, value)))
-        .collect::<Vec<_>>();
-    let live_bits = (0..geometry.auth_tiles)
-        .map(|index| LinExpr::from_wire(b.alloc_bool(index < live_count)))
-        .collect::<Vec<_>>();
+    if geometry.auth_tiles > body_auth_slots {
+        groups.push(PagedSpendGroupTrace {
+            live: LinExpr::zero(),
+            logical_txid: [LinExpr::zero(), LinExpr::zero()],
+            input_owner: [LinExpr::zero(), LinExpr::zero()],
+            fee: LinExpr::zero(),
+            live_input_count: LinExpr::zero(),
+            live_output_count: LinExpr::zero(),
+            end_page: LinExpr::zero(),
+        });
+    }
     let before_mint = b.num_wires();
-    let capability = mint_canonical_selected_zk_authorization_capability(
-        &b,
-        &tx_hashes,
-        &spine_inputs,
-        &live_bits,
-    );
+    let capability = mint_canonical_selected_zk_authorization_capability(&b, &groups);
     assert_eq!(b.num_wires(), before_mint, "capability mint added rows");
     (b, capability)
 }
@@ -1133,12 +1098,10 @@ pub struct BlockSlots {
     pub end_acc: AccumulatorWires,
     pub spine_inputs: Vec<SpineInputsTrace>,
     pub tx_hashes: Vec<[LinExpr; 2]>,
-    /// Selected production authenticates the transaction root in Meta-B; no
-    /// directed path carrier survives in the Block statement.
-    /// Per-authorization-slot liveness bits: real slots ONE, canonical ghost
-    /// suffix ZERO, plus the permanently dead B255 authorization pad. Boolean
-    /// and monotone; their integer sum pins USER_TX_COUNT.
-    pub live_bits: Vec<LinExpr>,
+    /// Physical page prefix driving body/action/exact-state geometry.
+    pub page_live_bits: Vec<LinExpr>,
+    /// Compacted logical-group prefix driving capsule and tx-root geometry.
+    pub authorization_live_bits: Vec<LinExpr>,
     /// Bitmap-derived, slot-sorted unique live action prefix. Its physical
     /// permutation source is canonical body order.
     pub compacted_actions: CompactedActionTrace,
@@ -1342,10 +1305,12 @@ fn build_selected_zk_block_slots_core(
         components.tx_body_inputs.len(),
         components.tx_body_hashes.len()
     );
+    let n_real_pages = components.tx_body_inputs.len().saturating_sub(1);
     assert_eq!(
-        noid_chain::consensus::params::user_tx_class_tier(components.authorization_inputs.len()),
+        noid_chain::consensus::paged_spend::BlockProofClass::for_page_count(n_real_pages)
+            .map(|class| class.page_capacity()),
         Some(tier),
-        "selected Block capacity must match its consensus class"
+        "selected Block capacity must match its physical page class"
     );
 
     let mut ledger = b.num_wires();
@@ -1389,13 +1354,7 @@ fn build_selected_zk_block_slots_core(
     // per-tx-slot structure below is class-fixed. `delta` = non-user txs
     // (the coinbase when present) — a class constant within a tier.
     let n_real_txs = components.tx_body_inputs.len();
-    let tx_delta = n_real_txs
-        .checked_sub(components.authorization_inputs.len())
-        .expect("every user tx is a spine instance");
-    assert_eq!(
-        tx_delta, 1,
-        "an accepted non-genesis block has exactly one mandatory coinbase"
-    );
+    let tx_delta = 1;
     let cap_txs = tier + tx_delta;
     assert!(
         !components.tx_body_inputs.is_empty(),
@@ -1429,40 +1388,25 @@ fn build_selected_zk_block_slots_core(
     ));
 
     crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: spine (tiles+tree data)");
-    // ---- Slot liveness (tier capacity): one witness bit per authorization
-    // slot — 1 for the real txs, 0 for the ghost padding. Boolean and
-    // MONOTONE (no live slot after a dead one), so the vector is determined
-    // by its integer sum, which pins to the claim's USER_TX_COUNT lane
-    // below. Every count that reaches a claim lane is gated by these bits,
-    // replacing the content-shaped const pins with class-fixed structure.
-    let n_real_user = components.authorization_inputs.len();
-    let n_auth_slots = tier_auth_slot_count(Some(tier), n_real_user);
-    let live_bits: Vec<LinExpr> = (0..n_auth_slots)
+    // ---- Physical page liveness. Page/action/exact-state geometry follows
+    // this prefix; logical authorization liveness is derived later by the
+    // START..END scanner and is intentionally a separate quantity.
+    let page_live_bits: Vec<LinExpr> = (0..tier)
         .map(|i| {
-            let v = Block128::from(if i < n_real_user { 1u128 } else { 0u128 });
+            let v = Block128::from(if i < n_real_pages { 1u128 } else { 0u128 });
             alloc_block(b, v)
         })
         .collect();
-    for wire in &live_bits {
+    for wire in &page_live_bits {
         let square = mul(b, wire, wire);
         pin_eq(b, &square, wire);
     }
-    for index in 0..n_auth_slots.saturating_sub(1) {
-        let not_previous = live_bits[index].add_const(F128::ONE);
-        let dead_then_live = mul(b, &live_bits[index + 1], &not_previous);
+    for index in 0..page_live_bits.len().saturating_sub(1) {
+        let not_previous = page_live_bits[index].add_const(F128::ONE);
+        let dead_then_live = mul(b, &page_live_bits[index + 1], &not_previous);
         pin_zero(b, &dead_then_live);
     }
     let body_user_slots = tier;
-    assert!(body_user_slots <= live_bits.len());
-    for auth_pad in &live_bits[body_user_slots..] {
-        // B255 has one power-of-two authorization PAD but only 255 body and
-        // action slots. It can never impersonate transaction 256.
-        pin_zero(b, auth_pad);
-    }
-    let body_live_bits = &live_bits[..body_user_slots];
-    let user_sum = pin_u64_sum(b, body_live_bits);
-    let tx_count = alloc_block(b, Block128::from(n_real_txs as u128));
-    pin_u64_successor(b, &user_sum, &tx_count);
 
     // Coinbase L0 = parent tip. In a capacity class every user slot gets the
     // same live/ghost gated relation; the non-capacity path pins all real L0s
@@ -1474,7 +1418,7 @@ fn build_selected_zk_block_slots_core(
         &spine_inputs,
         n_real_txs,
         tx_delta,
-        Some(body_live_bits),
+        Some(&page_live_bits),
     );
 
     // Canonical body-order action candidates. Coinbase has exactly one live
@@ -1500,37 +1444,6 @@ fn build_selected_zk_block_slots_core(
     let coinbase_amount_bits: [Wire; 64] = coinbase.amount_bits;
 
     crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: liveness bits");
-    // ---- tx_root component: paths for the REAL leaves, position-pinned.
-    // Region mode moves the path hashing onto the shared walk B (one
-    // TAG_COMPRESS leg): the entry/root closures ride the SAME statement
-    // wires (spine tx hashes / underlying universal Merkle root M) via cell pins, and the
-    // position + padding-rim bindings become const cell pins on the
-    // committed direction/sibling cells — the exact constants pinned below
-    // on the inline slot's statement wires.
-    assert!(
-        !components.tx_root_inputs.is_empty(),
-        "selected Block carries the canonical transaction root"
-    );
-    let tx_root_region_data = Some(tx_root_region_capacity_handoff(
-        b,
-        &components.tx_root_inputs,
-        &components.tx_body_hashes,
-        &tx_hashes,
-        body_live_bits,
-        tx_delta,
-    ));
-    let merkle_root = tx_root_region_data
-        .as_ref()
-        .expect("selected Meta-B transaction-root handoff")
-        .root_w
-        .clone();
-    let header_root = [
-        header.fields[hf::TX_ROOT].clone(),
-        header.fields[hf::TX_ROOT + 1].clone(),
-    ];
-    bind_tx_root_count_wrapper(b, &merkle_root, &tx_count, &header_root);
-
-    crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: tx-root");
     // ---- exact_state component + its statement anchors. The production
     // relation consumes the authoritative sibling frontier and derives the
     // fixed-capacity paired local/upper schedule.
@@ -1560,14 +1473,13 @@ fn build_selected_zk_block_slots_core(
     );
 
     crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: exact-state");
-    // ---- Canonical ZK AuthGKR / Binary BaseFold authorization. Public
-    // arithmetic is derived from the same body aliases and liveness wires that
-    // mint the private, non-transferable all-tiles capability.
-    use noid_tx::body_hash::TX8X2_LEAF_INPUT_OWNER;
-
+    // ---- Physical page arithmetic followed by the fixed PagedSpend scan.
+    // Pages keep the existing action/exact-state surface; only complete END
+    // records enter logical tx-root, fee and authorization slots.
     let geometry = crate::region_sidecar::selected_zk_block_geometry(tier)
         .expect("selected authorization tier is canonical");
     assert_eq!(body_user_slots, geometry.tier);
+    let n_auth_slots = geometry.auth_tiles;
     assert_eq!(n_auth_slots, geometry.auth_tiles);
     assert_eq!(tx_delta, 1, "selected body aliases begin after coinbase");
     assert_eq!(
@@ -1576,37 +1488,97 @@ fn build_selected_zk_block_slots_core(
         "selected authorization requires every canonical body spine"
     );
 
+    let mut page_surfaces = Vec::with_capacity(body_user_slots);
     let mut user_public_arithmetic = Vec::with_capacity(body_user_slots);
     for index in 0..body_user_slots {
         let body_index = index + tx_delta;
-        let declared_live_inputs = selected_declared_live_input_count(b, &spine_inputs[body_index]);
-        let expected_owner = spine_inputs[body_index].leaves[TX8X2_LEAF_INPUT_OWNER].clone();
-        user_public_arithmetic.push(append_user_action_surface(
+        let (surface, arithmetic) = append_page_action_surface(
             b,
             &spine_inputs[body_index],
-            &live_bits[index],
-            &expected_owner,
-            declared_live_inputs,
+            &page_live_bits[index],
             &mut action_candidates,
             &mut selected_input_bits,
             &mut selected_output_bits,
-        ));
+        );
+        page_surfaces.push(surface);
+        user_public_arithmetic.push(arithmetic);
     }
-    let canonical_authorization = mint_canonical_selected_zk_authorization_capability(
+    let paged_spend = bind_paged_spend_stream(
         b,
-        &tx_hashes,
-        &spine_inputs,
-        &live_bits,
+        &spine_inputs[tx_delta..],
+        &tx_hashes[tx_delta..],
+        &page_live_bits,
+        &page_surfaces,
+        &user_public_arithmetic,
     );
+    assert_eq!(paged_spend.groups.len(), n_auth_slots);
+    assert_eq!(
+        block_from_alias(b, &paged_spend.logical_count).0 as usize,
+        components.authorization_inputs.len(),
+        "native logical authorization count must equal the constrained END prefix"
+    );
+    let authorization_live_bits = paged_spend
+        .groups
+        .iter()
+        .map(|group| group.live.clone())
+        .collect::<Vec<_>>();
+    let tx_count = alloc_block(
+        b,
+        Block128::from((components.authorization_inputs.len() + 1) as u128),
+    );
+    pin_u64_successor(b, &paged_spend.logical_count, &tx_count);
+
+    // Coinbase plus compacted logical txids form the universal tx tree.
+    assert!(
+        !components.tx_root_inputs.is_empty(),
+        "selected Block carries the canonical logical transaction root"
+    );
+    let logical_hash_natives = std::iter::once(components.tx_body_hashes[0])
+        .chain(
+            components
+                .authorization_inputs
+                .iter()
+                .map(|input| input.tx_body_hash),
+        )
+        .collect::<Vec<_>>();
+    let mut logical_hash_wires = Vec::with_capacity(tier + tx_delta);
+    logical_hash_wires.push(tx_hashes[0].clone());
+    logical_hash_wires.extend(
+        paged_spend.groups[..tier]
+            .iter()
+            .map(|group| group.logical_txid.clone()),
+    );
+    let tx_root_region_data = Some(tx_root_region_capacity_handoff(
+        b,
+        &components.tx_root_inputs,
+        &logical_hash_natives,
+        &logical_hash_wires,
+        &authorization_live_bits[..tier],
+        tx_delta,
+    ));
+    let merkle_root = tx_root_region_data
+        .as_ref()
+        .expect("selected Meta-B logical tx-root handoff")
+        .root_w
+        .clone();
+    let header_root = [
+        header.fields[hf::TX_ROOT].clone(),
+        header.fields[hf::TX_ROOT + 1].clone(),
+    ];
+    bind_tx_root_count_wrapper(b, &merkle_root, &tx_count, &header_root);
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: PagedSpend+logical tx-root");
+
+    let canonical_authorization =
+        mint_canonical_selected_zk_authorization_capability(b, &paged_spend.groups);
     assert_eq!(
         user_public_arithmetic.len(),
         body_user_slots,
         "one public-arithmetic trace per physical user body slot"
     );
-    crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: per-tx auth+public arithmetic");
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: page arithmetic+logical auth");
     let _fee_arithmetic = bind_block_fee_arithmetic(
         b,
-        &user_public_arithmetic,
+        &paged_spend.groups[..tier],
         &start_acc.active_slot_count,
         &exact_state_depth.parent,
         &exact_state_depth.child,
@@ -1694,7 +1666,8 @@ fn build_selected_zk_block_slots_core(
         end_acc,
         spine_inputs,
         tx_hashes,
-        live_bits,
+        page_live_bits,
+        authorization_live_bits,
         compacted_actions,
         exact_state,
     };
