@@ -91,7 +91,7 @@ pub fn verify_paged_spend_authorization(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::paged_spend::{PAGEDSPEND_END_BIT, PAGEDSPEND_START_BIT};
+    use crate::paged_spend::{PAGED_SPEND_END_BIT, PAGED_SPEND_START_BIT};
     use noid_poseidon2b::primitives::{derive_address, Address};
     use noid_tx::{output_bitmap_bit, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS};
 
@@ -122,7 +122,7 @@ mod tests {
             input_owner: owner(bytes),
             inputs,
             outputs,
-            validity_bitmap: 1 | output_bitmap_bit(0) | PAGEDSPEND_START_BIT | PAGEDSPEND_END_BIT,
+            validity_bitmap: 1 | output_bitmap_bit(0) | PAGED_SPEND_START_BIT | PAGED_SPEND_END_BIT,
             is_coinbase: false,
         })
         .unwrap()]

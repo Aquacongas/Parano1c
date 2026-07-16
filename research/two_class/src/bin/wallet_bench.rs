@@ -18,8 +18,8 @@ use paranoid_two_class_research::{
         PagedSpendAuthorizationWitness,
     },
     paged_spend::{
-        hash_paged_spend, PagedSpendIntent, TxPage, MAX_PAGEDSPEND_INPUTS, PAGEDSPEND_END_BIT,
-        PAGEDSPEND_START_BIT,
+        hash_paged_spend, PagedSpendIntent, TxPage, MAX_PAGED_SPEND_INPUTS, PAGED_SPEND_END_BIT,
+        PAGED_SPEND_START_BIT,
     },
 };
 
@@ -89,7 +89,7 @@ fn percentile(mut values: Vec<Duration>, percentile: usize) -> Duration {
 }
 
 fn build_pages(input_count: usize, seed: u128) -> Vec<TxPage> {
-    assert!((1..=MAX_PAGEDSPEND_INPUTS).contains(&input_count));
+    assert!((1..=MAX_PAGED_SPEND_INPUTS).contains(&input_count));
     let secret = mk_secret(seed);
     let owner = derive_address(&secret);
     let fee = 5_000u64;
@@ -122,10 +122,10 @@ fn build_pages(input_count: usize, seed: u128) -> Vec<TxPage> {
                     owner,
                 };
                 bitmap |= output_bitmap_bit(0);
-                bitmap |= PAGEDSPEND_START_BIT;
+                bitmap |= PAGED_SPEND_START_BIT;
             }
             if page_index + 1 == page_count {
-                bitmap |= PAGEDSPEND_END_BIT;
+                bitmap |= PAGED_SPEND_END_BIT;
             }
             TxPage::new(TxBody {
                 epoch_anchor: [0xA5; 32],
@@ -163,8 +163,8 @@ fn run_sample(case: Case) -> Sample {
     let intent = PagedSpendIntent::new(pages.clone(), proof_bytes.clone())
         .expect("atomic PagedSpend intent");
     assert_eq!(intent.logical_txid(), logical_txid);
-    let intent_bytes = intent.encode().expect("encode PagedSpend intent");
-    let decoded = PagedSpendIntent::decode(&intent_bytes).expect("decode PagedSpend intent");
+    let intent_bytes = intent.to_bytes().expect("encode PagedSpend intent");
+    let decoded = PagedSpendIntent::from_bytes(&intent_bytes).expect("decode PagedSpend intent");
     verify_paged_spend_authorization(&decoded.pages, &bundle.proof)
         .expect("local PagedSpend admission verification");
     let admission = admission_started.elapsed();
