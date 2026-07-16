@@ -425,9 +425,14 @@ impl EmbeddedHistoryStepMatrixSource {
         Some(Arc::new(compact))
     }
 
-    /// Rebuild one packed image from the embedded canonical bytes with the
-    /// complete `CompactFieldR1cs::open` authentication, then persist it
-    /// best-effort into the runtime cache.
+    /// Rebuild one packed image from the embedded canonical bytes, then
+    /// persist it best-effort into the runtime cache.  The binary is the
+    /// trust root here: the release build already ran the complete
+    /// `CompactFieldR1cs::open` (including the structural Poseidon pass)
+    /// over exactly these bytes when it minted the seal, and anyone able to
+    /// swap the embedded leaves can swap the embedded pins beside them — so
+    /// the first run re-checks only the cheap structural framing instead of
+    /// re-hashing hundreds of megabytes.
     fn rebuild_from_canonical(
         &self,
         class: CanonicalHistoryStepClassId,
@@ -456,11 +461,15 @@ impl EmbeddedHistoryStepMatrixSource {
                 actual: canonical.len(),
             });
         }
-        let relation = CompactFieldR1cs::open(
-            canonical.into_boxed_slice(),
-            leaf.build_seal.shape(),
-            leaf.build_seal.statement_digest(),
-        )
+        // SAFETY: `canonical` is the exact decompressed embedded payload the
+        // release build paired with `build_seal` after running the complete
+        // `CompactFieldR1cs::open` over it.
+        let relation = unsafe {
+            CompactFieldR1cs::open_build_authenticated(
+                canonical.into_boxed_slice(),
+                leaf.build_seal,
+            )
+        }
         .map_err(|source| EmbeddedHistoryStepMatrixError::Matrix {
             class: class.index(),
             source,
