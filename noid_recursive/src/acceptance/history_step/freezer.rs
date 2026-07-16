@@ -633,10 +633,60 @@ where
     )?;
     for index in 0..HISTORY_STEP_CLASS_COUNT {
         if known[index] && candidate[index] != digests[index] {
-            return Err(HistoryStepFreezeError::MatrixDigest(
-                CanonicalHistoryStepClassId::from_index(index)
-                    .expect("fixed HistoryStep class index"),
-            ));
+            let class = CanonicalHistoryStepClassId::from_index(index)
+                .expect("fixed HistoryStep class index");
+            // Optional drift autopsy: rebuild the class under both parent
+            // flavors (the class-freeze B8 checkpoint vs the backbone's
+            // exact-tier parent) and print the first structural row
+            // differences, so a residual parent-tier dependence names its
+            // construct without a second freezer run.
+            if index > 0 && std::env::var_os("NOID_DEBUG_DRIFT_DIFF").is_some() {
+                let build = |parent: &HistoryStepTerminal,
+                             provider: &mut P|
+                 -> Result<_, HistoryStepFreezeError<P::Error, S::Error>> {
+                    let input = class_input::<P, S::Error>(provider, class, parent.accumulator())?;
+                    assemble_input(&partial, Some(parent), input).map_err(|source| {
+                        HistoryStepFreezeError::relation(
+                            HistoryStepFreezeStage::CandidateClass,
+                            Some(class),
+                            source,
+                        )
+                    })
+                };
+                let freeze_flavor = build(&checkpoints[0], provider)?;
+                let backbone_flavor = build(&checkpoints[index - 1], provider)?;
+                let freeze_matrix = freeze_flavor.matrix();
+                let backbone_matrix = backbone_flavor.matrix();
+                eprintln!(
+                    "[drift-diff] c{index:02}: freeze(slot-0 parent) rows={} vs backbone(slot-{} parent) rows={}",
+                    freeze_flavor.useful_rows(),
+                    index - 1,
+                    backbone_flavor.useful_rows(),
+                );
+                let rows = freeze_matrix.a_0.num_rows.min(backbone_matrix.a_0.num_rows);
+                let mut shown = 0usize;
+                for row in 0..rows {
+                    let a_freeze = freeze_matrix.a_0.row(row).collect::<Vec<_>>();
+                    let a_backbone = backbone_matrix.a_0.row(row).collect::<Vec<_>>();
+                    let b_freeze = freeze_matrix.b_0.row(row).collect::<Vec<_>>();
+                    let b_backbone = backbone_matrix.b_0.row(row).collect::<Vec<_>>();
+                    if a_freeze != a_backbone || b_freeze != b_backbone {
+                        eprintln!(
+                            "[drift-diff] row {row}:\n  A freeze:    {a_freeze:?}\n  A backbone:  {a_backbone:?}\n  B freeze:    {b_freeze:?}\n  B backbone:  {b_backbone:?}"
+                        );
+                        shown += 1;
+                        if shown >= 8 {
+                            break;
+                        }
+                    }
+                }
+                if shown == 0 {
+                    eprintln!(
+                        "[drift-diff] c{index:02}: no A/B row differences — drift is in row counts or value tables",
+                    );
+                }
+            }
+            return Err(HistoryStepFreezeError::MatrixDigest(class));
         }
     }
 
