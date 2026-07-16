@@ -149,7 +149,7 @@ mod selected_zk_capability_tests {
 
     #[test]
     fn selected_capability_uses_each_canonical_class_capacity() {
-        for tier in [8usize, 32, 64, 255] {
+        for tier in [64usize, 255] {
             let geometry = crate::region_sidecar::selected_zk_block_geometry(tier).unwrap();
             for live_count in [0usize, tier] {
                 let (b, capability) =
@@ -837,13 +837,13 @@ fn block_from_alias(b: &FieldR1csBuilder, expression: &LinExpr) -> Block128 {
     Block128::from(flat_to_tower_u128(flat))
 }
 
-/// Zero-row extraction of one exact selected-class statement surface. Body
-/// slots retain the original Block aliases. B255's PAD has no body, so this
-/// capability carries only its native protocol constants; the owning
-/// selected assembly later materializes and pins the four PAD wires in its
-/// still-owned builder.
+/// Extract one exact selected-class statement surface. Logical PagedSpend
+/// hashes/owners pass through compaction and live/ghost selection expressions,
+/// so every body slot is materialized into four canonical one-wire aliases
+/// before the transcript checker consumes it. B255's PAD has no body; its four
+/// protocol constants are materialized later by the selected assembly.
 fn mint_canonical_selected_zk_authorization_capability(
-    b: &FieldR1csBuilder,
+    b: &mut FieldR1csBuilder,
     groups: &[PagedSpendGroupTrace],
 ) -> CanonicalSelectedZkAuthorizationCapability {
     let auth_slots = groups.len();
@@ -876,12 +876,16 @@ fn mint_canonical_selected_zk_authorization_capability(
             CanonicalSelectedZkAuthorizationSlotKind::Ghost
         };
         let dead = group.live.add_const(F128::ONE);
-        let tx_body_hash = std::array::from_fn(|lane| {
+        let selected_tx_body_hash = std::array::from_fn(|lane| {
             group.logical_txid[lane].add(&dead.scale(flat_of(ghost_hash[lane])))
         });
-        let expected_address = std::array::from_fn(|lane| {
+        let selected_address = std::array::from_fn(|lane| {
             group.input_owner[lane].add(&dead.scale(flat_of(ghost_address[lane])))
         });
+        let tx_body_hash =
+            selected_tx_body_hash.map(|expression| LinExpr::from_wire(b.materialize(&expression)));
+        let expected_address =
+            selected_address.map(|expression| LinExpr::from_wire(b.materialize(&expression)));
         let native_statement = noid_gkr::zk_authorization::ZkAuthCapsuleOwnerStatement {
             tx_body_hash: std::array::from_fn(|lane| block_from_alias(b, &tx_body_hash[lane])),
             address: std::array::from_fn(|lane| block_from_alias(b, &expected_address[lane])),
@@ -973,8 +977,12 @@ pub(in crate::acceptance) fn canonical_selected_zk_authorization_fixture_for_tie
         });
     }
     let before_mint = b.num_wires();
-    let capability = mint_canonical_selected_zk_authorization_capability(&b, &groups);
-    assert_eq!(b.num_wires(), before_mint, "capability mint added rows");
+    let capability = mint_canonical_selected_zk_authorization_capability(&mut b, &groups);
+    assert_eq!(
+        b.num_wires() - before_mint,
+        4 * body_auth_slots,
+        "capability mint must materialize four aliases per body slot"
+    );
     (b, capability)
 }
 

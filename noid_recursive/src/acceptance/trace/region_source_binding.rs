@@ -270,7 +270,7 @@ pub fn auth_pcs_main_c_sidecar_purpose() -> [u8; 32] {
     auth_pcs_region_sidecar_purpose(b"main-c", DOMAIN_C)
 }
 
-// Selected-ZK column counts shared by all four canonical geometries. Domain
+// Selected-ZK column counts shared by both canonical geometries. Domain
 // logs and class capacities come from the exact V4 geometry certificate in
 // `region_sidecar::block`; lower tiers never allocate B255-sized columns.
 const SELECTED_ZK_REGION_QUERY_LOG: usize = 6;
@@ -1534,9 +1534,7 @@ mod selected_zk_common_allocator_tests {
     #[test]
     fn selected_lower_classes_keep_their_own_committed_domains() {
         for (tier, expected_cells, expected_span, class_m) in [
-            (8usize, 354_304usize, 362_496usize, 22usize),
-            (32, 1_417_216, 1_449_984, 23),
-            (64, 2_244_608, 2_244_608, 23),
+            (64usize, 2_244_608usize, 2_244_608usize, 23usize),
             (255, 7_536_640, 7_536_640, 24),
         ] {
             let geometry = crate::region_sidecar::selected_zk_block_geometry(tier).unwrap();

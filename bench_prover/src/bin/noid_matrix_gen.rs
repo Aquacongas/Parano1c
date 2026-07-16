@@ -273,8 +273,8 @@ fn main() {
     println!("PARANOID canonical HistoryStep v1 freezer");
     println!("  pack:          {}", version.display());
     println!("  rayon threads: {}", rayon::current_num_threads());
-    println!("  witnesses:     real genesis chain + four exact parent forks");
-    println!("  classes:       4 (one per current tier; uniform outer shape)");
+    println!("  witnesses:     real genesis chain + two exact parent checkpoints");
+    println!("  classes:       2 (B64/m23 and B255/m24)");
     println!("\nBuilding and exporting canonical matrices:");
 
     let started = Instant::now();

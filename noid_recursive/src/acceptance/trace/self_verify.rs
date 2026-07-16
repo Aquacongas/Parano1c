@@ -1668,26 +1668,6 @@ pub struct QuirkyDirectClaimTrace {
     pub value: LinExpr,
 }
 
-/// The canonical dead-variant anchor claim: the committed IO slice evaluated
-/// at the all-zero window point, which is exactly `io[0]` (the slice start
-/// has zero low index bits).  True for every honestly bound envelope, so
-/// banked verifier compositions can pad their claim stream with claims whose
-/// native lane values never depend on the disabled variant.
-pub fn io_anchor_claim(
-    spec: &noid_ivc_core::public_io::PublicIoSpec,
-    io0: F128,
-    total_vars: usize,
-) -> pcs::QuirkyDirectClaim {
-    let mut x_rest = vec![F128::ZERO; spec.io_slice.log2_len];
-    x_rest.extend(spec.io_slice.prefix_coords(total_vars));
-    pcs::QuirkyDirectClaim {
-        z_skip: F128::ZERO,
-        k_skip: 0,
-        x_rest,
-        value: io0,
-    }
-}
-
 /// Opaque recursive-trace capability for a causally post-commit auxiliary
 /// verifier. It delegates the exact enclosing FS channel and owns the claim
 /// sink appended to that proof's shared PCS replay.
@@ -1757,54 +1737,11 @@ impl<'a, C> FieldPostCommitTraceContext<'a, C> {
         Self::new(commitment_root, total_vars, channel)
     }
 
-    /// Drain a banked variant's child claims into this sink while keeping the
-    /// batch shape independent of which variant is live.  Every adopted
-    /// coordinate and value becomes the gate-selected expression
-    /// `anchor + gate·(walk − anchor)`: with the variant's one-hot gate at
-    /// one it IS the walk claim, at zero it collapses to the caller's anchor
-    /// claim (whose truth the shared batched opening enforces).  The
-    /// expression's structure is fixed by the stream position — the walk
-    /// term always references the (always built) variant walk — so the
-    /// enclosing batch rows never encode which variant is live.
-    /// The anchor's coordinates are protocol constants (the IO slice's zero
-    /// point), but its VALUE is the envelope's `io[0]` — witness data that
-    /// differs between base and recursive predecessors — so the value arm
-    /// selects against the caller's `anchor_value` WIRE expression: baking
-    /// the native value would imprint it on the matrix.
-    pub(crate) fn adopt_child_claims_banked<C2>(
-        &mut self,
-        b: &mut FieldR1csBuilder,
-        child: FieldPostCommitTraceContext<'_, C2>,
-        anchor: &pcs::QuirkyDirectClaim,
-        anchor_value: &LinExpr,
-        gate: &LinExpr,
-    ) {
-        let claims = child.finish();
-        for claim in claims {
-            debug_assert_eq!(claim.k_skip, anchor.k_skip, "banked claim skip window");
-            debug_assert_eq!(
-                claim.x_rest.len(),
-                anchor.x_rest.len(),
-                "banked claim point arity"
-            );
-            let select = |b: &mut FieldR1csBuilder, walk: &LinExpr, anchor: &LinExpr| {
-                let delta = mul(b, gate, &walk.add(anchor));
-                anchor.add(&delta)
-            };
-            let x_rest: Vec<LinExpr> = claim
-                .x_rest
-                .iter()
-                .zip(anchor.x_rest.iter())
-                .map(|(coordinate, &value)| select(b, coordinate, &LinExpr::constant(value)))
-                .collect();
-            let selected = QuirkyDirectClaimTrace {
-                z_skip: select(b, &claim.z_skip, &LinExpr::constant(anchor.z_skip)),
-                k_skip: anchor.k_skip,
-                x_rest,
-                value: select(b, &claim.value, anchor_value),
-            };
-            self.claims.push(selected);
-        }
+    /// Adopt one class-local child replay into the enclosing PCS batch.
+    /// HistoryStep instantiates both parent classes explicitly, so selection
+    /// happens at the verifier-arm gate rather than by rewriting claims.
+    pub(crate) fn adopt_child_claims<C2>(&mut self, child: FieldPostCommitTraceContext<'_, C2>) {
+        self.claims.extend(child.finish());
     }
 }
 

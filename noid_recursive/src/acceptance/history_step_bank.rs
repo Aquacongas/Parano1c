@@ -100,14 +100,18 @@ impl HistoryStepMatrixLease {
     }
 }
 
-/// One frozen outer Field dimension shared by every class. Uniformity is
-/// what collapses the class bank to the current tier: an m24 parent replay
-/// is the only replay, so no per-parent matrix variants exist. Smaller
-/// tiers pay the padded-domain commit until the Phase-3 authorization cut
-/// shrinks every tier into one smaller uniform shape.
-pub const HISTORY_STEP_UNIFORM_CLASS_M: usize = 24;
-pub const HISTORY_STEP_CURRENT_CLASS_MS: [usize; HISTORY_STEP_TIER_SLOT_COUNT] =
-    [HISTORY_STEP_UNIFORM_CLASS_M; HISTORY_STEP_TIER_SLOT_COUNT];
+/// Frozen outer dimensions selected solely by the current physical-page
+/// class. Both matrices contain the same two-arm B64/B255 parent selector, so
+/// parent shape changes witness data rather than the current matrix identity.
+pub const HISTORY_STEP_CURRENT_CLASS_MS: [usize; HISTORY_STEP_TIER_SLOT_COUNT] = [23, 24];
+
+const _: () = assert!(
+    HISTORY_STEP_CURRENT_CLASS_MS[0]
+        == noid_chain::consensus::paged_spend::BlockProofClass::B64.outer_m()
+        && HISTORY_STEP_CURRENT_CLASS_MS[1]
+            == noid_chain::consensus::paged_spend::BlockProofClass::B255.outer_m(),
+    "HistoryStep and consensus proof-class dimensions must match"
+);
 
 const HISTORY_STEP_BANK_POST_COMMIT_DOMAIN: &[u8] = b"NOID/HISTORY-STEP/BANK-POST-COMMIT/V1";
 const HISTORY_STEP_BANK_DIGEST_DOMAIN: &[u8] = b"NOID/HISTORY-STEP/CLASS-BANK/V1";
@@ -1418,6 +1422,12 @@ mod tests {
     #[test]
     fn validated_bank_pins_are_exact_and_ordered() {
         let bank = PinnedHistoryStepClassBank::validate(test_pins()).unwrap();
+        assert_eq!(
+            bank.entry(CanonicalHistoryStepClassId::new(0).unwrap())
+                .shape()
+                .m,
+            23
+        );
         let class = CanonicalHistoryStepClassId::new(1).unwrap();
         assert_eq!(bank.entry(class).shape().m, 24);
 

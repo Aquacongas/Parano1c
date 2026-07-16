@@ -220,14 +220,12 @@ impl HistoryStepPcsCarrierGeometry {
     }
 }
 
-/// One-role universal carrier for HistoryStep recursion.
+/// Two-role universal carrier for HistoryStep recursion.
 ///
-/// The four groups are the possible predecessor output tiers.  L-A/L-B carry
-/// exactly one active predecessor PCS proof, while L-C contains two banks in
-/// canonical tier order: the predecessor Block-sidecar child transcript and
-/// the enclosing HistoryStep `[R]_prev` transcript.  Exactly one block in
-/// each bank is live.  Padding is relation-valid universal geometry, not an
-/// omitted proof role.
+/// Both canonical predecessor shapes are always present in tier order. L-A
+/// and L-B carry the m23 and m24 PCS proof arms, while L-C carries both
+/// predecessor Block-child transcripts and both enclosing `[R]_prev`
+/// transcripts. The authenticated selector gates acceptance, never topology.
 #[derive(Clone, Debug)]
 pub(crate) struct HistoryStepParentGeometry {
     carrier: HistoryStepPcsCarrierGeometry,
@@ -273,7 +271,7 @@ impl HistoryStepParentGeometry {
             group_params: parent_params.to_vec(),
             groups,
             n_queries,
-            proof_roles: 1,
+            proof_roles: parent_params.len(),
         };
         carrier.leaf_lanes()?;
         carrier.path_carrier_depths()?;
@@ -315,16 +313,13 @@ impl HistoryStepParentGeometry {
         self.child_layouts.len()
     }
 
-    pub(crate) fn r_prev_layout(&self, slot: usize) -> Option<&DuplexLayout> {
-        self.r_prev_layouts.get(slot)
-    }
-
     #[cfg(test)]
     pub(crate) fn child_block_index(&self, slot: usize) -> usize {
         debug_assert!(slot < self.tier_count());
         slot
     }
 
+    #[cfg(test)]
     pub(crate) fn r_prev_block_index(&self, slot: usize) -> usize {
         debug_assert!(slot < self.tier_count());
         self.tier_count() + slot
@@ -350,11 +345,10 @@ impl HistoryStepParentGeometry {
 
     fn recording_union(
         &self,
-        active_slot: usize,
         children: &[LayoutRecordedChannel],
-        r_prev: &LayoutRecordedChannel,
+        r_prev: &[LayoutRecordedChannel],
     ) -> Result<DuplexUnion, RegionSidecarError> {
-        if children.len() != self.tier_count() {
+        if children.len() != self.tier_count() || r_prev.len() != self.tier_count() {
             return Err(RegionSidecarError::UnsupportedVkShape);
         }
         for (child, expected) in children.iter().zip(self.child_layouts.iter()) {
@@ -362,29 +356,22 @@ impl HistoryStepParentGeometry {
                 return Err(RegionSidecarError::UnsupportedVkShape);
             }
         }
-        // The banked parent envelope makes the outer transcript — and with it
-        // all four banked `[R]_prev` layouts — independent of the live parent
-        // tier, so the live recording always occupies (and is always pinned
-        // at) the slot-zero block: the matrix must not encode the tier.
-        let _ = active_slot;
-        let expected_r_prev = self.r_prev_layout(0).ok_or(RegionSidecarError::BadVk)?;
-        if &r_prev.layout != expected_r_prev || r_prev.data_flat.len() != expected_r_prev.n_data {
+        if r_prev
+            .iter()
+            .zip(self.r_prev_layouts.iter())
+            .any(|(recording, layout)| {
+                &recording.layout != layout || recording.data_flat.len() != layout.n_data
+            })
+        {
             return Err(RegionSidecarError::UnsupportedVkShape);
         }
-
-        let zero_data = self
-            .r_prev_layouts
-            .iter()
-            .map(|layout| vec![F128::ZERO; layout.n_data])
-            .collect::<Vec<_>>();
-        let mut specs = children
+        let specs = children
             .iter()
             .map(|child| (child.layout.clone(), child.data_flat.as_slice()))
             .chain(
-                self.r_prev_layouts
+                r_prev
                     .iter()
-                    .zip(zero_data.iter())
-                    .map(|(layout, zero)| (layout.clone(), zero.as_slice())),
+                    .map(|recording| (recording.layout.clone(), recording.data_flat.as_slice())),
             )
             .map(|(layout, data)| RecordingSpec {
                 layout,
@@ -392,7 +379,6 @@ impl HistoryStepParentGeometry {
                 data,
             })
             .collect::<Vec<_>>();
-        specs[self.r_prev_block_index(0)].data = &r_prev.data_flat;
         Ok(build_recording_only_duplex_union(&specs))
     }
 
@@ -931,10 +917,9 @@ fn build_recording_free_link_assembly(
     })
 }
 
-/// Self-recursive HistoryStep columns over the universal two-tier parent
-/// geometry.  The only live proof role is the exact predecessor; walk L-C
-/// additionally carries that predecessor's nested Block-sidecar child chain
-/// and its complete enclosing `[R]_prev` chain.
+/// Self-recursive HistoryStep columns over the universal two-arm parent
+/// geometry. Walk L-C carries each arm's nested Block-child transcript and
+/// complete enclosing `[R]_prev` chain in canonical class order.
 pub(crate) struct HistoryStepParentColumns {
     asm: RecordingFreeLinkAssembly,
     slices_a: [WitnessSlice; 6],
@@ -942,28 +927,22 @@ pub(crate) struct HistoryStepParentColumns {
     slices_rec: [WitnessSlice; 6],
     u_rec: DuplexUnion,
     child_scratches: Vec<LayoutRecordedChannel>,
-    r_prev_scratch: LayoutRecordedChannel,
-    r_prev_block: usize,
+    r_prev_scratches: Vec<LayoutRecordedChannel>,
     vk: LinkRegionSidecarVk,
 }
 
 pub(crate) fn prepare_history_step_parent_columns(
     b: &mut FieldR1csBuilder,
-    proof: &RPcsProof<'_>,
+    proofs: &[RPcsProof<'_>],
     geometry: &HistoryStepParentGeometry,
-    active_slot: usize,
     child_recordings: Vec<LayoutRecordedChannel>,
-    r_prev_recording: LayoutRecordedChannel,
+    r_prev_recordings: Vec<LayoutRecordedChannel>,
 ) -> Result<HistoryStepParentColumns, RegionSidecarError> {
-    if active_slot >= geometry.tier_count() {
+    if proofs.len() != geometry.tier_count() {
         return Err(RegionSidecarError::BadVk);
     }
-    let proofs = [RPcsProof {
-        native: proof.native,
-        params: proof.params,
-        commitment_root: proof.commitment_root,
-    }];
-    let asm = build_recording_free_link_assembly(&proofs, &geometry.carrier, &[active_slot])?;
+    let active_groups = (0..geometry.tier_count()).collect::<Vec<_>>();
+    let asm = build_recording_free_link_assembly(proofs, &geometry.carrier, &active_groups)?;
     let slices_a = std::array::from_fn(|column| {
         alloc_column_slice_values_only(b, &asm.u_a.committed[column], asm.u_a.w_log)
     });
@@ -974,7 +953,7 @@ pub(crate) fn prepare_history_step_parent_columns(
             alloc_column_slice_values_only(b, &asm.cb[column], asm.w_log_b)
         }
     });
-    let u_rec = geometry.recording_union(active_slot, &child_recordings, &r_prev_recording)?;
+    let u_rec = geometry.recording_union(&child_recordings, &r_prev_recordings)?;
     let slices_rec = std::array::from_fn(|column| {
         alloc_column_slice_values_only(b, &u_rec.committed[column], u_rec.w_log)
     });
@@ -1006,8 +985,7 @@ pub(crate) fn prepare_history_step_parent_columns(
         slices_rec,
         u_rec,
         child_scratches: child_recordings,
-        r_prev_scratch: r_prev_recording,
-        r_prev_block: geometry.r_prev_block_index(0),
+        r_prev_scratches: r_prev_recordings,
         vk,
     })
 }
@@ -1096,15 +1074,15 @@ fn pin_recording_block(
 }
 
 /// Self-recursive twin of [`finalize_r_pcs_history_step_region`].  Besides the
-/// predecessor PCS obligations it pins every banked child recording block and
-/// the live `[R]_prev` block; omitting the previous envelope's direct-Block
-/// child transcript is therefore structurally impossible.
+/// predecessor PCS obligations it pins both child recordings and both
+/// `[R]_prev` recordings; omitting either parent arm is structurally
+/// impossible.
 pub(crate) fn finalize_history_step_parent_region(
     b: &mut FieldR1csBuilder,
     columns: HistoryStepParentColumns,
-    obligations: &PcsWalkObligations,
+    obligations: &[PcsWalkObligations],
     recorded_children: &[FsRecordedChannel],
-    recorded_r_prev: &FsRecordedChannel,
+    recorded_r_prev: &[FsRecordedChannel],
 ) -> Result<HistoryStepParentRegionPreparation, RegionSidecarError> {
     let HistoryStepParentColumns {
         asm,
@@ -1113,77 +1091,79 @@ pub(crate) fn finalize_history_step_parent_region(
         slices_rec,
         u_rec,
         child_scratches,
-        r_prev_scratch,
-        r_prev_block,
+        r_prev_scratches,
         vk,
     } = columns;
-    if recorded_children.len() != child_scratches.len() {
+    if recorded_children.len() != child_scratches.len()
+        || recorded_r_prev.len() != r_prev_scratches.len()
+        || obligations.len() != asm.trees.len()
+    {
         return Err(RegionSidecarError::UnsupportedVkShape);
     }
-    if asm.trees.len() != 1 {
-        return Err(RegionSidecarError::UnsupportedVkShape);
-    }
-    let n_trees = asm.trees[0].len();
-    assert_eq!(
-        obligations.leaves.len(),
-        asm.n_queries * n_trees,
-        "HistoryStep parent leaf obligation count"
-    );
-    assert_eq!(
-        obligations.paths.len(),
-        obligations.leaves.len(),
-        "HistoryStep parent path/leaf pairing"
-    );
 
     let per_tile = 1usize << asm.u_a.block_log;
     let subchannel_slots = 1usize << asm.s_log;
     let path_block = 1usize << asm.block_log_b;
-    for query_index in 0..asm.n_queries {
-        let tile_offset = query_index * per_tile;
-        for tree_index in 0..n_trees {
-            let leaf = &obligations.leaves[query_index * n_trees + tree_index];
-            let positions = &asm.leaf_data_positions[tree_index];
-            assert_eq!(
-                leaf.lanes.len(),
-                positions.len(),
-                "HistoryStep parent leaf lanes"
-            );
-            for (wire, &(slot, lane)) in leaf.lanes.iter().zip(positions) {
-                pin_eq(b, wire, &slot_cell(&slices_a[lane], tile_offset + slot));
-            }
+    for (proof_index, (trees, obligations)) in asm.trees.iter().zip(obligations.iter()).enumerate()
+    {
+        let n_trees = trees.len();
+        assert_eq!(
+            obligations.leaves.len(),
+            asm.n_queries * n_trees,
+            "HistoryStep parent leaf obligation count"
+        );
+        assert_eq!(
+            obligations.paths.len(),
+            obligations.leaves.len(),
+            "HistoryStep parent path/leaf pairing"
+        );
+        for query_index in 0..asm.n_queries {
+            let block_index = proof_index * asm.n_queries + query_index;
+            let tile_offset = block_index * per_tile;
+            for tree_index in 0..n_trees {
+                let obligation_index = query_index * n_trees + tree_index;
+                let leaf = &obligations.leaves[obligation_index];
+                let positions = &asm.leaf_data_positions[tree_index];
+                assert_eq!(
+                    leaf.lanes.len(),
+                    positions.len(),
+                    "HistoryStep parent leaf lanes"
+                );
+                for (wire, &(slot, lane)) in leaf.lanes.iter().zip(positions) {
+                    pin_eq(b, wire, &slot_cell(&slices_a[lane], tile_offset + slot));
+                }
 
-            let obligation = &obligations.paths[query_index * n_trees + tree_index];
-            assert_eq!(
-                obligation.leaf,
-                query_index * n_trees + tree_index,
-                "HistoryStep parent leaf/path pairing"
-            );
-            let depth = asm.trees[0][tree_index].depth;
-            assert_eq!(obligation.dir_bits.len(), depth);
-            let digest_slot =
-                tile_offset + tree_index * subchannel_slots + asm.trees[0][tree_index].lanes / 2
-                    - 1;
-            let leg_slot = query_index * path_block + asm.leg_offsets[tree_index];
-            for lane in 0..2 {
-                let digest_wire =
-                    LinExpr::from_wire(b.alloc_f128(asm.digests[0][query_index][tree_index][lane]));
-                pin_eq(
-                    b,
-                    &digest_wire,
-                    &slot_cell(&slices_a[2 + lane], digest_slot),
+                let obligation = &obligations.paths[obligation_index];
+                assert_eq!(
+                    obligation.leaf, obligation_index,
+                    "HistoryStep parent leaf/path pairing"
                 );
-                pin_eq(b, &digest_wire, &slot_cell(&slices_b[4 + lane], leg_slot));
-            }
-            for (level, bit) in obligation.dir_bits.iter().enumerate() {
-                pin_eq(b, bit, &slot_cell(&slices_b[8], leg_slot + level));
-            }
-            let root_slot = leg_slot + depth;
-            for lane in 0..2 {
-                pin_eq(
-                    b,
-                    &slot_cell(&slices_b[4 + lane], root_slot),
-                    &obligation.root[lane],
-                );
+                let tree = trees[tree_index];
+                assert_eq!(obligation.dir_bits.len(), tree.depth);
+                let digest_slot = tile_offset + tree_index * subchannel_slots + tree.lanes / 2 - 1;
+                let leg_slot = block_index * path_block + asm.leg_offsets[tree_index];
+                for lane in 0..2 {
+                    let digest_wire = LinExpr::from_wire(
+                        b.alloc_f128(asm.digests[proof_index][query_index][tree_index][lane]),
+                    );
+                    pin_eq(
+                        b,
+                        &digest_wire,
+                        &slot_cell(&slices_a[2 + lane], digest_slot),
+                    );
+                    pin_eq(b, &digest_wire, &slot_cell(&slices_b[4 + lane], leg_slot));
+                }
+                for (level, bit) in obligation.dir_bits.iter().enumerate() {
+                    pin_eq(b, bit, &slot_cell(&slices_b[8], leg_slot + level));
+                }
+                let root_slot = leg_slot + tree.depth;
+                for lane in 0..2 {
+                    pin_eq(
+                        b,
+                        &slot_cell(&slices_b[4 + lane], root_slot),
+                        &obligation.root[lane],
+                    );
+                }
             }
         }
     }
@@ -1204,16 +1184,22 @@ pub(crate) fn finalize_history_step_parent_region(
             block,
         );
     }
-    pin_recording_block(
-        b,
-        "walk L-C HistoryStep [R]_prev",
-        &r_prev_scratch,
-        recorded_r_prev,
-        &vk,
-        &u_rec,
-        &slices_rec,
-        r_prev_block,
-    );
+    for (slot, (scratch, recorded)) in r_prev_scratches
+        .iter()
+        .zip(recorded_r_prev.iter())
+        .enumerate()
+    {
+        pin_recording_block(
+            b,
+            "walk L-C HistoryStep [R]_prev",
+            scratch,
+            recorded,
+            &vk,
+            &u_rec,
+            &slices_rec,
+            child_scratches.len() + slot,
+        );
+    }
 
     let input = LinkRegionProverInput::new(
         &vk,
@@ -1245,7 +1231,7 @@ mod tests {
         let geometry =
             HistoryStepParentGeometry::new(&params, vec![layout.clone(); 2], vec![layout; 2])
                 .expect("two-tier HistoryStep geometry");
-        assert_eq!(geometry.carrier.proof_roles, 1);
+        assert_eq!(geometry.carrier.proof_roles, 2);
         assert_eq!(geometry.carrier.groups.len(), 2);
         assert_eq!(geometry.carrier.n_queries, 125);
         assert_eq!(geometry.recording_blocks().len(), 4);
