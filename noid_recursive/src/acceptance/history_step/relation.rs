@@ -1533,46 +1533,6 @@ pub fn prove_built_history_step(
     validate_built_against_bank(runtime, built, &built.matrix)?;
     let bank = runtime.bank();
     let entry = bank.entry(built.class_id);
-    if std::env::var_os("NOID_DEBUG_SATISFY").is_some() {
-        if let HistoryStepMatrixLease::Resident(matrix) = &built.matrix {
-            let a = matrix.apply_a(&built.witness);
-            let b = matrix.apply_b(&built.witness);
-            let violated = a
-                .iter()
-                .zip(&b)
-                .zip(&built.witness)
-                .enumerate()
-                .filter(|(_, ((ai, bi), zi))| **ai * **bi != **zi)
-                .map(|(index, _)| index)
-                .take(12)
-                .collect::<Vec<_>>();
-            eprintln!(
-                "[debug-satisfy] class={} n={} useful={} first_violated={:?}",
-                built.class_id.index(),
-                built.witness.len(),
-                built.useful_rows,
-                violated,
-            );
-            for &row_index in &violated {
-                eprintln!("[debug-satisfy]  row {row_index}:");
-                for (name, row) in [
-                    ("A", matrix.a_0.row(row_index).collect::<Vec<_>>()),
-                    ("B", matrix.b_0.row(row_index).collect::<Vec<_>>()),
-                ] {
-                    for (col, coeff) in row {
-                        eprintln!(
-                            "[debug-satisfy]   {name}[col={col}] coeff={coeff:?} z={:?}",
-                            built.witness[col as usize],
-                        );
-                    }
-                }
-                eprintln!(
-                    "[debug-satisfy]   a_eval={:?} b_eval={:?} z_w={:?}",
-                    a[row_index], b[row_index], built.witness[row_index],
-                );
-            }
-        }
-    }
     let anchor = crate::acceptance::trace::self_verify::io_anchor_claim(
         bank.spec(),
         *built.io.first().ok_or(HistoryStepError::InvalidIo)?,
