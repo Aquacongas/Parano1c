@@ -131,6 +131,8 @@ pub enum ConsensusError {
     BadTxRoot,
     /// §16.10 — Two transactions claim the same input or output slot.
     SlotConflict,
+    /// User records do not form canonical complete PagedSpend groups.
+    InvalidPagedSpend(String),
     /// §16.11 — user `epoch_anchor` differs from the one current epoch id.
     BadEpochAnchor,
     /// §16.14 — LogicProof verification failed.
@@ -170,6 +172,7 @@ impl std::fmt::Display for ConsensusError {
             }
             Self::BadLogSlotsExpansion => write!(f, "BadLogSlotsExpansion"),
             Self::ShapeMismatch(msg) => write!(f, "ShapeMismatch: {msg}"),
+            Self::InvalidPagedSpend(msg) => write!(f, "InvalidPagedSpend: {msg}"),
             Self::BelowMinFee { required, actual } => {
                 write!(f, "BelowMinFee: required={required} actual={actual}")
             }

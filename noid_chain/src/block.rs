@@ -16,7 +16,7 @@
 
 use noid_poseidon2b::primitives::Digest;
 use noid_tx::wire::WireError;
-use noid_tx::Transaction;
+use noid_tx::{PagedSpendError, Transaction, TxPage};
 
 use crate::block_header::BlockHeader;
 use crate::state::{apply_tx_at, ApplyError, ChainState, StateTransition};
@@ -35,8 +35,27 @@ pub const BLOCK_MAX_TXS: usize = crate::consensus::params::BLOCK_MAX_TXS;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Block {
     pub header: BlockHeader,
+    /// Fixed public records: coinbase at index zero followed by an ordered
+    /// physical PagedSpend page stream. The legacy field name is retained to
+    /// avoid copying the block body through every exact-state consumer.
     pub transactions: Vec<Transaction>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockPageStreamError {
+    MissingCoinbase,
+    CoinbaseNotFirst,
+    MultipleCoinbase,
+    PagedSpend(crate::consensus::paged_spend::PagedSpendStreamError),
+}
+
+impl std::fmt::Display for BlockPageStreamError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl std::error::Error for BlockPageStreamError {}
 
 /// Errors surfaced by [`apply_block`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +68,8 @@ pub enum BlockApplyError {
     GenesisHasTransactions,
     /// Transaction body is not the canonical fixed construction.
     InvalidTxBody,
+    /// User records do not form one canonical PagedSpend stream.
+    InvalidPagedSpend,
     /// Two live actions in the block touch the same physical slot.
     SlotConflict,
     /// `header.state_root` disagrees with the post-apply chain root.
@@ -97,6 +118,8 @@ pub(crate) fn apply_block(
     if block.transactions.len() > BLOCK_MAX_TXS {
         return Err(BlockApplyError::TooManyTransactions);
     }
+    validate_block_page_stream(&block.transactions)
+        .map_err(|_| BlockApplyError::InvalidPagedSpend)?;
     crate::consensus::checks::validate_block_slot_conflicts(&block.transactions)
         .map_err(|_| BlockApplyError::SlotConflict)?;
     // Coinbase structure: at most one, must be first, zero inputs.
@@ -142,10 +165,12 @@ pub(crate) fn apply_block(
         snap.expand_one();
     }
 
-    for tx in &block.transactions {
-        tx.body
-            .validate_canonical()
-            .map_err(|_| BlockApplyError::InvalidTxBody)?;
+    for (index, tx) in block.transactions.iter().enumerate() {
+        if index == 0 {
+            tx.body
+                .validate_canonical()
+                .map_err(|_| BlockApplyError::InvalidTxBody)?;
+        }
 
         apply_tx_at(&mut snap, &tx.body, block.header.height).map_err(BlockApplyError::Tx)?;
     }
@@ -166,7 +191,10 @@ pub(crate) fn apply_block(
     if block.header.log_slots != snap.state.log_slots() as u32 {
         return Err(BlockApplyError::HeaderLogSlotsMismatch);
     }
-    if block.header.tx_root != compute_tx_root(&block.transactions) {
+    if block.header.tx_root
+        != try_compute_tx_root(&block.transactions)
+            .map_err(|_| BlockApplyError::InvalidPagedSpend)?
+    {
         return Err(BlockApplyError::HeaderTxRootMismatch);
     }
 
@@ -204,10 +232,15 @@ pub(crate) fn apply_state_delta(
 
     crate::consensus::checks::validate_block_slot_conflicts(&block.transactions)
         .map_err(|_| BlockApplyError::SlotConflict)?;
+    validate_block_page_stream(&block.transactions)
+        .map_err(|_| BlockApplyError::InvalidPagedSpend)?;
 
     // Sanity-guard: must be called only after full HistoryStep verification.
     // tx_root is still checked natively (cheap, doesn't require state reads).
-    if block.header.tx_root != compute_tx_root(&block.transactions) {
+    if block.header.tx_root
+        != try_compute_tx_root(&block.transactions)
+            .map_err(|_| BlockApplyError::InvalidPagedSpend)?
+    {
         return Err(BlockApplyError::HeaderTxRootMismatch);
     }
     let mut snap = state.clone();
@@ -339,13 +372,42 @@ pub fn apply_genesis_block(
     })
 }
 
-/// Compute the final count-bound universal 256-leaf transaction root.
+/// Validate coinbase placement and the complete physical user-page stream.
+pub fn validate_block_page_stream(
+    txs: &[Transaction],
+) -> Result<crate::consensus::paged_spend::PagedSpendStreamFacts, BlockPageStreamError> {
+    let Some(coinbase) = txs.first() else {
+        return Err(BlockPageStreamError::MissingCoinbase);
+    };
+    if !coinbase.body.is_coinbase {
+        return Err(BlockPageStreamError::CoinbaseNotFirst);
+    }
+    if txs[1..].iter().any(|tx| tx.body.is_coinbase) {
+        return Err(BlockPageStreamError::MultipleCoinbase);
+    }
+    crate::consensus::paged_spend::validate_paged_spend_transaction_stream(&txs[1..])
+        .map_err(BlockPageStreamError::PagedSpend)
+}
+
+/// Compute the final count-bound universal 256-leaf logical transaction root.
 ///
-/// Coinbase occupies leaf zero, users occupy leaves `1..=255`, and the suffix
-/// is zero. Genesis alone uses the zero root.
+/// Coinbase occupies leaf zero. Complete PagedSpend groups occupy the
+/// following leaves; continuation pages never get independent leaves.
+/// Genesis alone uses the zero root.
+pub fn try_compute_tx_root(txs: &[Transaction]) -> Result<Digest, BlockPageStreamError> {
+    if txs.is_empty() {
+        return Ok([0u8; 32]);
+    }
+    let stream = validate_block_page_stream(txs)?;
+    let hashes: Vec<_> = std::iter::once(txs[0].txid().0)
+        .chain(stream.groups.iter().map(|group| group.spend.logical_txid.0))
+        .collect();
+    Ok(crate::tx_tree::root_from_hashes(&hashes))
+}
+
+/// Infallible builder helper for an already-canonical block page stream.
 pub fn compute_tx_root(txs: &[Transaction]) -> Digest {
-    let hashes: Vec<_> = txs.iter().map(|tx| tx.txid().0).collect();
-    crate::tx_tree::root_from_hashes(&hashes)
+    try_compute_tx_root(txs).expect("compute_tx_root requires coinbase plus canonical PagedSpend")
 }
 
 // ---------------------------------------------------------------------------
@@ -355,7 +417,7 @@ pub fn compute_tx_root(txs: &[Transaction]) -> Digest {
 
 /// Canonical format marker for the packed-incarnation, secret-free public
 /// transaction representation.
-pub const BLOCK_WIRE_MARKER: u8 = 0xB2;
+pub const BLOCK_WIRE_MARKER: u8 = 0xB3;
 
 /// Byte offset of the semantic [`BlockHeader`] inside serialized [`Block`]
 /// bytes. The leading byte is the fixed construction marker.
@@ -420,11 +482,23 @@ impl Block {
             "transactions exceed BLOCK_MAX_TXS"
         );
 
+        if !self.transactions.is_empty() {
+            validate_block_page_stream(&self.transactions)
+                .expect("cannot encode a non-canonical block page stream");
+        }
+
         buf.push(BLOCK_WIRE_MARKER);
         self.header.encode(buf);
         put_u32(buf, self.transactions.len() as u32);
-        for tx in &self.transactions {
-            tx.encode(buf);
+        if let Some(coinbase) = self.transactions.first() {
+            coinbase.encode(buf);
+        }
+        for tx in self.transactions.iter().skip(1) {
+            TxPage {
+                body: tx.body.clone(),
+            }
+            .encode(buf)
+            .expect("validated block page stream has canonical page bodies");
         }
     }
 
@@ -445,8 +519,19 @@ impl Block {
             return Err(WireError::LengthOverflow);
         }
         let mut transactions = Vec::with_capacity(n);
-        for _ in 0..n {
-            transactions.push(Transaction::decode(src)?);
+        if n > 0 {
+            let coinbase = Transaction::decode(src)?;
+            if !coinbase.body.is_coinbase {
+                return Err(WireError::NonCanonicalBody);
+            }
+            transactions.push(coinbase);
+        }
+        for _ in 1..n {
+            let page = TxPage::decode(src).map_err(page_wire_error)?;
+            transactions.push(Transaction::new(page.body));
+        }
+        if n > 0 {
+            validate_block_page_stream(&transactions).map_err(|_| WireError::NonCanonicalBody)?;
         }
         Ok(Self {
             header,
@@ -464,11 +549,21 @@ impl Block {
     }
 }
 
+fn page_wire_error(error: PagedSpendError) -> WireError {
+    match error {
+        PagedSpendError::Wire(error) => error,
+        _ => WireError::NonCanonicalBody,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use noid_poseidon2b::primitives::Address;
-    use noid_tx::{output_bitmap_bit, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS};
+    use noid_tx::{
+        output_bitmap_bit, TxBody, TxInput, TxOutput, PAGED_SPEND_END_BIT, PAGED_SPEND_START_BIT,
+        TX_INPUTS, TX_OUTPUTS,
+    };
 
     fn user_tx() -> Transaction {
         user_tx_at(1, 2)
@@ -493,8 +588,26 @@ mod tests {
             input_owner: Address([1u8; 32]),
             inputs,
             outputs,
-            validity_bitmap: 1 | output_bitmap_bit(0),
+            validity_bitmap: 1 | output_bitmap_bit(0) | PAGED_SPEND_START_BIT | PAGED_SPEND_END_BIT,
             is_coinbase: false,
+        })
+    }
+
+    fn coinbase() -> Transaction {
+        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        outputs[0] = TxOutput {
+            slot_index: 200,
+            amount: 0,
+            owner: Address([9u8; 32]),
+        };
+        Transaction::new(TxBody {
+            epoch_anchor: [7u8; 32],
+            fee: 0,
+            input_owner: Address([0u8; 32]),
+            inputs: [TxInput::dummy(); TX_INPUTS],
+            outputs,
+            validity_bitmap: output_bitmap_bit(0),
+            is_coinbase: true,
         })
     }
 
@@ -516,7 +629,14 @@ mod tests {
         state
     }
 
-    fn block_for(state: &ChainState, txs: Vec<Transaction>) -> Block {
+    fn block_for(state: &ChainState, user_pages: Vec<Transaction>) -> Block {
+        let mut txs = Vec::with_capacity(user_pages.len() + 1);
+        let mut reward = coinbase();
+        reward.body.outputs[0].slot_index = (200..256)
+            .find(|slot| state.state.slot(*slot).is_empty())
+            .expect("test state has a free reward slot");
+        txs.push(reward);
+        txs.extend(user_pages);
         let mut dry = state.clone();
         for tx in &txs {
             apply_tx_at(&mut dry, &tx.body, 1).unwrap();
@@ -563,12 +683,12 @@ mod tests {
         let first = user_tx_at(1, 2);
         let second = user_tx_at(3, 1);
         let mut block = block_for(&state, vec![first.clone()]);
-        block.transactions = vec![first, second];
-        block.header.tx_root = compute_tx_root(&block.transactions);
+        block.transactions = vec![coinbase(), first, second];
+        block.header.tx_root = [0u8; 32];
 
         assert_eq!(
             apply_block(&mut state, &block),
-            Err(BlockApplyError::SlotConflict)
+            Err(BlockApplyError::InvalidPagedSpend)
         );
         assert_eq!(
             apply_state_delta(&mut state, &block),
@@ -591,8 +711,15 @@ mod tests {
 
     #[test]
     fn maximum_canonical_block_wire_is_exact() {
-        let tx = user_tx();
-        let txs = vec![tx; BLOCK_MAX_TXS];
+        let mut txs = vec![coinbase()];
+        txs.extend((0..255).map(|index| {
+            let input_slot = 1_000 + index as u32;
+            let output_slot = 2_000 + index as u32;
+            let mut tx = user_tx_at(input_slot, output_slot);
+            tx.body.inputs[0].creation_id = index as u64 + 1;
+            tx.body.epoch_anchor = [index as u8; 32];
+            tx
+        }));
         let block = Block {
             header: BlockHeader {
                 prev_block_hash: [0u8; 32],
@@ -616,6 +743,46 @@ mod tests {
             canonical_block_wire_len(BLOCK_MAX_TXS + 1),
             Err(WireError::LengthOverflow)
         );
+    }
+
+    #[test]
+    fn logical_root_compacts_continuation_pages() {
+        let mut first = user_tx_at(1, 20);
+        for (index, input) in first.body.inputs.iter_mut().enumerate() {
+            *input = TxInput {
+                slot_index: index as u32 + 1,
+                amount: 2,
+                creation_id: index as u64 + 1,
+            };
+        }
+        first.body.outputs[0].amount = 19;
+        first.body.validity_bitmap = 0x00ff | output_bitmap_bit(0) | PAGED_SPEND_START_BIT;
+        first.body.fee = 1;
+
+        let mut second = user_tx_at(2, 21);
+        second.body.inputs[0] = TxInput {
+            slot_index: 9,
+            amount: 4,
+            creation_id: 9,
+        };
+        second.body.outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        second.body.fee = 0;
+        second.body.validity_bitmap = 1 | PAGED_SPEND_END_BIT;
+        second.body.input_owner = first.body.input_owner;
+        second.body.epoch_anchor = first.body.epoch_anchor;
+
+        let txs = vec![coinbase(), first, second];
+        let stream = validate_block_page_stream(&txs).unwrap();
+        assert_eq!(stream.page_count, 2);
+        assert_eq!(stream.logical_count, 1);
+        let logical_root = compute_tx_root(&txs);
+        let physical_root =
+            crate::tx_tree::root_from_hashes(&txs.iter().map(|tx| tx.txid().0).collect::<Vec<_>>());
+        assert_ne!(logical_root, physical_root);
+
+        let mut changed = txs;
+        changed[2].body.inputs[0].creation_id ^= 1;
+        assert_ne!(compute_tx_root(&changed), logical_root);
     }
 
     #[test]

@@ -29,13 +29,12 @@
 
 use std::collections::BTreeSet;
 
-use crate::block::apply_block;
-use crate::block::Block;
+use crate::block::{apply_block, validate_block_page_stream, Block, BlockPageStreamError};
 use crate::block_header::BlockHeader;
 use crate::consensus::{
     checks::{validate_block_slot_conflicts, validate_tx_consensus},
     emission::max_coinbase_value_from_claimable_fee_sum,
-    fees::{claimable_fee_for_tx_body, required_fee_for_tx_body},
+    fees::fee_breakdown,
     header::{validate_header, validate_header_template, validate_header_timeless},
     params::{
         BLOCK_MAX_ACTIONS, BLOCK_MAX_DISTINCT_SEGMENTS, BLOCK_MAX_LIVE_INPUTS, BLOCK_MAX_TXS,
@@ -58,7 +57,8 @@ pub struct AnchorInfo {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BlockResourcePreflight {
-    pub user_tx_count: usize,
+    pub user_page_count: usize,
+    pub logical_tx_count: usize,
     pub live_input_count: usize,
     /// All live outputs, including coinbase.
     pub output_count: usize,
@@ -79,6 +79,53 @@ fn resource_limit(
     Err(ConsensusError::BlockResourceLimitExceeded { limit, actual, max })
 }
 
+fn page_stream_consensus_error(error: BlockPageStreamError) -> ConsensusError {
+    use crate::consensus::paged_spend::PagedSpendStreamError;
+    match error {
+        BlockPageStreamError::MissingCoinbase => ConsensusError::MissingCoinbase,
+        BlockPageStreamError::CoinbaseNotFirst => ConsensusError::CoinbaseNotFirst,
+        BlockPageStreamError::MultipleCoinbase => ConsensusError::MultipleCoinbase,
+        BlockPageStreamError::PagedSpend(PagedSpendStreamError::BlockPageLimit {
+            actual,
+            capacity,
+        }) => ConsensusError::BlockResourceLimitExceeded {
+            limit: "user_pages",
+            actual,
+            max: capacity,
+        },
+        BlockPageStreamError::PagedSpend(PagedSpendStreamError::TooManyGroups {
+            actual,
+            capacity,
+        }) => ConsensusError::BlockResourceLimitExceeded {
+            limit: "logical_txs",
+            actual,
+            max: capacity,
+        },
+        BlockPageStreamError::PagedSpend(PagedSpendStreamError::BlockInputLimit {
+            actual,
+            capacity,
+        }) => ConsensusError::BlockResourceLimitExceeded {
+            limit: "live_inputs",
+            actual,
+            max: capacity,
+        },
+        BlockPageStreamError::PagedSpend(PagedSpendStreamError::BlockOutputLimit {
+            actual,
+            capacity,
+        }) => ConsensusError::BlockResourceLimitExceeded {
+            limit: "user_outputs",
+            actual,
+            max: capacity,
+        },
+        BlockPageStreamError::PagedSpend(
+            PagedSpendStreamError::DuplicateInputSlot { .. }
+            | PagedSpendStreamError::DuplicateOutputSlot { .. }
+            | PagedSpendStreamError::InputOutputSlotOverlap { .. },
+        ) => ConsensusError::SlotConflict,
+        other => ConsensusError::InvalidPagedSpend(other.to_string()),
+    }
+}
+
 /// Count and bound the complete raw block resource surface before any
 /// segment-sized work, proof decode, or state clone.
 ///
@@ -97,13 +144,12 @@ pub fn validate_block_resource_preflight(
     }
     let slot_domain = 1u64 << block.header.log_slots;
 
-    let user_tx_count = block
-        .transactions
-        .iter()
-        .filter(|tx| !tx.body.is_coinbase)
-        .count();
-    if user_tx_count > BLOCK_MAX_USER_TXS {
-        return resource_limit("user_txs", user_tx_count, BLOCK_MAX_USER_TXS);
+    let stream =
+        validate_block_page_stream(&block.transactions).map_err(page_stream_consensus_error)?;
+    let user_page_count = usize::from(stream.page_count);
+    let logical_tx_count = usize::from(stream.logical_count);
+    if user_page_count > BLOCK_MAX_USER_TXS {
+        return resource_limit("user_pages", user_page_count, BLOCK_MAX_USER_TXS);
     }
 
     let mut live_input_count = 0usize;
@@ -160,7 +206,8 @@ pub fn validate_block_resource_preflight(
     };
 
     Ok(BlockResourcePreflight {
-        user_tx_count,
+        user_page_count,
+        logical_tx_count,
         live_input_count,
         output_count,
         action_count,
@@ -174,20 +221,23 @@ fn validate_fee_policy_and_claimable_fee_sum(
     block: &Block,
     parent: &BlockHeader,
 ) -> Result<u128, ConsensusError> {
+    let stream =
+        validate_block_page_stream(&block.transactions).map_err(page_stream_consensus_error)?;
     let mut claimable_fee_sum = 0u128;
-    for tx in block.transactions.iter().filter(|tx| !tx.body.is_coinbase) {
-        let required =
-            required_fee_for_tx_body(&tx.body, parent.active_slot_count, parent.log_slots);
-        let actual = tx.body.fee;
+    for group in stream.groups {
+        let breakdown = fee_breakdown(
+            u64::from(group.spend.live_inputs),
+            u64::from(group.spend.live_outputs),
+            parent.active_slot_count,
+            parent.log_slots,
+        );
+        let required = breakdown.required_total;
+        let actual = group.spend.fee;
         if actual < required {
             return Err(ConsensusError::BelowMinFee { required, actual });
         }
         claimable_fee_sum = claimable_fee_sum
-            .checked_add(u128::from(claimable_fee_for_tx_body(
-                &tx.body,
-                parent.active_slot_count,
-                parent.log_slots,
-            )))
+            .checked_add(u128::from(actual.saturating_sub(breakdown.burned)))
             .ok_or_else(|| ConsensusError::ShapeMismatch("claimable fee sum overflow".into()))?;
     }
     Ok(claimable_fee_sum)
@@ -355,10 +405,9 @@ fn validate_block_checks_inner(
         )?,
     }
     validate_mandatory_coinbase(block, parent)?;
+    validate_block_page_stream(&block.transactions).map_err(page_stream_consensus_error)?;
     validate_block_slot_conflicts(&block.transactions)?;
-    for tx in &block.transactions {
-        validate_tx_consensus(tx)?;
-    }
+    validate_tx_consensus(&block.transactions[0])?;
     let claimable_fee_sum = validate_fee_policy_and_claimable_fee_sum(block, parent)?;
     if let Some(cb) = block.transactions.first() {
         if cb.body.is_coinbase {
@@ -414,14 +463,15 @@ pub fn validate_block_consensus(
     validate_block_resource_preflight(block)?;
 
     validate_mandatory_coinbase(block, parent)?;
+    validate_block_page_stream(&block.transactions).map_err(page_stream_consensus_error)?;
 
     // --- Cross-tx slot conflict check (P.8, §16 invariants 4-5) ---
     validate_block_slot_conflicts(&block.transactions)?;
 
-    // --- Per-tx consensus checks (P.8) ---
-    for tx in &block.transactions {
-        validate_tx_consensus(tx)?;
-    }
+    // Coinbase retains the fixed-body predicate. User pages were checked as
+    // complete groups above; validating them independently would reject the
+    // START/END bits and group-wide balance by construction.
+    validate_tx_consensus(&block.transactions[0])?;
 
     let claimable_fee_sum = validate_fee_policy_and_claimable_fee_sum(block, parent)?;
 
@@ -456,6 +506,9 @@ pub fn validate_block_consensus(
             BlockApplyError::InvalidTxBody => {
                 ConsensusError::ShapeMismatch("invalid fixed transaction body".to_string())
             }
+            BlockApplyError::InvalidPagedSpend => {
+                ConsensusError::InvalidPagedSpend("invalid block page stream".to_string())
+            }
             BlockApplyError::HeaderStateRootMismatch => ConsensusError::BadStateRoot,
             BlockApplyError::HeaderTxRootMismatch => ConsensusError::BadTxRoot,
             _ => ConsensusError::ShapeMismatch(format!("{:?}", e)),
@@ -472,7 +525,8 @@ mod tests {
     use crate::consensus::pow::block_id;
     use noid_poseidon2b::primitives::Address;
     use noid_tx::{
-        output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS,
+        output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, PAGED_SPEND_END_BIT,
+        PAGED_SPEND_START_BIT, TX_INPUTS, TX_OUTPUTS,
     };
 
     fn header(height: u64) -> BlockHeader {
@@ -540,7 +594,7 @@ mod tests {
             input_owner: Address([1u8; 32]),
             inputs,
             outputs,
-            validity_bitmap: input_bits | output_bits,
+            validity_bitmap: input_bits | output_bits | PAGED_SPEND_START_BIT | PAGED_SPEND_END_BIT,
             is_coinbase: false,
         })
     }
@@ -555,7 +609,8 @@ mod tests {
             transactions,
         };
         let counts = validate_block_resource_preflight(&block).unwrap();
-        assert_eq!(counts.user_tx_count, 255);
+        assert_eq!(counts.user_page_count, 255);
+        assert_eq!(counts.logical_tx_count, 255);
         assert_eq!(counts.live_input_count, 1_020);
         assert_eq!(counts.output_count, 511);
         assert_eq!(counts.action_count, 1_531);
